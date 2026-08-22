@@ -23,6 +23,9 @@ use nix::{
 	sys::signal,
 	unistd::{Pid, getpgid},
 };
+use omp_core::{ArtifactDigest, Principal, Provenance, sf};
+use omp_e2e::support::{AllowAdmission, install_omp_binary_env, omp_binary};
+use omp_env::{EnvClient, ExecEvent, Invocation, InvocationEvent};
 use omp_envd::{
 	EnvServer, RegistryBridges,
 	exthost::{
@@ -30,9 +33,6 @@ use omp_envd::{
 	},
 	worker::{ExtHostConfig, ExtHostSpec, HostKey},
 };
-use omp_core::{ArtifactDigest, Principal, Provenance, sf};
-use omp_e2e::support::{AllowAdmission, install_omp_binary_env, omp_binary};
-use omp_env::{EnvClient, ExecEvent, Invocation, InvocationEvent};
 use omp_proto::{
 	SCHEMA_REV,
 	env::v1::{
@@ -169,9 +169,15 @@ impl LocalEnv {
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("environment state scratch directory");
 		let server = Arc::new(
-			EnvServer::open_local(root.path(), state.path(), registry, worker, RegistryBridges::default())
-				.await
-				.expect("open real local environment authority"),
+			EnvServer::open_local(
+				root.path(),
+				state.path(),
+				registry,
+				worker,
+				RegistryBridges::default(),
+			)
+			.await
+			.expect("open real local environment authority"),
 		);
 		let (client, transport) = EnvClient::in_process(64);
 		client.set_admitter(AllowAdmission);

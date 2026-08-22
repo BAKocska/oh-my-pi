@@ -4,9 +4,9 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use omp_agent::{
 	ContextFile, EagerTaskPolicy, HostInfoInput, Journal, ModelPromptInput, MutationPromptInput,
-	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptNamedInput,
-	PromptSchemeInput, PromptSettingsInput, PromptToolExampleInput, PromptToolInput,
-	RepositoryInput, PromptFacts,
+	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptFacts,
+	PromptNamedInput, PromptSchemeInput, PromptSettingsInput, PromptToolExampleInput,
+	PromptToolInput, RepositoryInput,
 };
 use omp_core::{Hash32, Str};
 use omp_env::{ClientError, EnvClient};
@@ -113,13 +113,15 @@ pub struct PromptSnapshot {
 	pub diagnostics: Arc<[PromptDiagnostic]>,
 }
 impl PromptSnapshot {
-	/// Builds the immutable template property bag beside the typed prompt pipeline.
+	/// Builds the immutable template property bag beside the typed prompt
+	/// pipeline.
 	///
-	/// Optional and empty-suppressed values are absent. Prompt-source paragraphs share one
-	/// canonical deduplication set in precedence order: custom prompt, append prompt, context
-	/// files, then rules.
+	/// Optional and empty-suppressed values are absent. Prompt-source paragraphs
+	/// share one canonical deduplication set in precedence order: custom
+	/// prompt, append prompt, context files, then rules.
 	pub fn props(&self) -> Props {
-		self.workspace
+		self
+			.workspace
 			.props()
 			.expect("frozen prompt tool metadata must be UTF-8")
 	}
@@ -352,10 +354,7 @@ fn warn_prep_fallback(step: &str) {
 }
 
 /// Creates the initial workspace input from already-frozen facets.
-#[allow(
-	clippy::too_many_arguments,
-	reason = "the helper makes every PromptFacts facet explicit"
-)]
+#[allow(clippy::too_many_arguments, reason = "the helper makes every PromptFacts facet explicit")]
 pub fn workspace_input(
 	cwd: impl Into<std::path::PathBuf>,
 	context_files: impl Into<Arc<[ContextFile]>>,

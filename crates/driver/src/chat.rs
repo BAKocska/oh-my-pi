@@ -25,16 +25,16 @@ use futures::StreamExt as _;
 use omp_agent::{
 	Agent, AgentKind, AgentNode, AgentSnapshot, AgentState, AgentStatus, AgentTree, Budget,
 	ChildKind, CompletionError, CompletionRequest, InProcTurnClient, Journal,
-	MAX_YIELD_SCHEMA_RETRIES, RegistryStatus, RpcTurnClient, SubagentDisposition, SubagentLifecycle,
-	SubagentProgressSnapshot, SubagentRunState, SubagentTerminalKind, SubagentTerminalStatus,
-	PromptFacts, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession as _,
+	MAX_YIELD_SCHEMA_RETRIES, PromptFacts, RegistryStatus, RpcTurnClient, SubagentDisposition,
+	SubagentLifecycle, SubagentProgressSnapshot, SubagentRunState, SubagentTerminalKind,
+	SubagentTerminalStatus, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession as _,
 	WorkspaceRootInput, WorkspaceRootsInput, YieldPayloadValidator, project_journal,
 	resolve_completion,
 };
 use omp_catalog::GrammarBits;
 use omp_core::{ExposeSecret as _, Str, sf};
 use omp_inference::{
-	Client, Registry as InferenceRegistry, ToolInputConstraint,
+	Client, Registry as InferenceRegistry, ToolDefinition, ToolGrammarSyntax, ToolInputConstraint,
 	answer::{AuthAnswer, AuthEvent, AuthPromptKind as InferenceAuthPromptKind, AuthResponse},
 	call::{AuthInput, AuthRequest, CallMeta, LoginRequest, Target},
 	error::{ErrorDetail, ErrorKind},
@@ -260,9 +260,6 @@ pub enum ChatError {
 	/// Typed settings projection failed while composing a session boundary.
 	#[error(transparent)]
 	Settings(#[from] omp_settings::manager::SettingsManagerError),
-	/// A live tool declaration could not be represented on the turn protocol.
-	#[error("tool {0} uses a grammar input unsupported by the turn protocol")]
-	GrammarTool(Str),
 	/// A tool schema could not be encoded for the turn protocol.
 	#[error("could not encode tool schema")]
 	ToolSchema(#[source] serde_json::Error),
@@ -1059,6 +1056,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	pub fn supervisor(&self) -> Arc<crate::subagent::supervisor::SessionSupervisor<C>> {
 		Arc::clone(&self.supervisor)
 	}
+
 	/// Returns the live delivery adapter for the Environment-owned durable
 	/// scheduler. The adapter owns no clocks or persistence.
 	pub fn schedule_delivery_backend(
@@ -1318,10 +1316,9 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				id: record.id.clone(),
 			})?;
 		let mut snapshot = context.state.snapshot().as_ref().clone();
-		snapshot.props.set(
-			omp_agent::prompt_keys::CWD,
-			workspace_root.to_string_lossy().into_owned(),
-		);
+		snapshot
+			.props
+			.set(omp_agent::prompt_keys::CWD, workspace_root.to_string_lossy().into_owned());
 		snapshot.turn.params.model = revival.model_role.to_string();
 		let grants = blob_store
 			.get(&revival.grant_snapshot_ref)
@@ -1792,15 +1789,17 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			}))
 		})?;
 		if node.parent.as_deref() != Some(caller.as_str()) {
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"AgentGone",
-				"subagent run is not owned by this caller",
-			)
-			.with_details(json!({
-				"ref": run_id,
-				"status": "aborted",
-				"transcript_url": format!("history://{id}"),
-			})));
+			return Err(
+				omp_envd::exthost::control::ControlProtocolError::new(
+					"AgentGone",
+					"subagent run is not owned by this caller",
+				)
+				.with_details(json!({
+					"ref": run_id,
+					"status": "aborted",
+					"transcript_url": format!("history://{id}"),
+				})),
+			);
 		}
 		let state = self
 			.parent
@@ -1820,15 +1819,14 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 					"expected_generation": expected,
 					"current_generation": current,
 				})),
-				error => omp_envd::exthost::control::ControlProtocolError::new(
-					"AgentGone",
-					error.to_string(),
-				)
-				.with_details(json!({
-					"ref": run_id,
-					"status": "aborted",
-					"transcript_url": format!("history://{id}"),
-				})),
+				error => {
+					omp_envd::exthost::control::ControlProtocolError::new("AgentGone", error.to_string())
+						.with_details(json!({
+							"ref": run_id,
+							"status": "aborted",
+							"transcript_url": format!("history://{id}"),
+						}))
+				},
 			})?;
 		Ok((Str::from(id), state))
 	}
@@ -1907,9 +1905,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			));
 		}
 		if let Some(schema) = application.get("schema").filter(|schema| !schema.is_null()) {
-			warnings.push(Value::String(format!(
-				"structured output validation reported {schema}"
-			)));
+			warnings.push(Value::String(format!("structured output validation reported {schema}")));
 		}
 		let worktree = application
 			.get("details")
@@ -2155,6 +2151,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			omp_agent::Receipt::Failed => "failed",
 		}
 	}
+
 	fn preflight_spec(
 		&self,
 		spec: &Value,
@@ -2170,11 +2167,13 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.and_then(Value::as_str)
 			.is_some_and(|task| !task.trim().is_empty())
 		{
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"SpawnDenied",
-				"subagent task must be non-empty",
-			)
-			.with_details(json!({"reason": "empty task", "field": "task"})));
+			return Err(
+				omp_envd::exthost::control::ControlProtocolError::new(
+					"SpawnDenied",
+					"subagent task must be non-empty",
+				)
+				.with_details(json!({"reason": "empty task", "field": "task"})),
+			);
 		}
 		let agent = spec.get("agent").and_then(Value::as_str).unwrap_or("task");
 		let context = self.parent.context.lock();
@@ -2184,11 +2183,13 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.find(|(name, _)| name.as_str().eq_ignore_ascii_case(agent))
 			.map(|(_, definition)| definition);
 		if definition.is_none() {
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"SpawnDenied",
-				format!("agent type {agent:?} is not available in this session"),
-			)
-			.with_details(json!({"reason": "unknown agent", "field": "agent"})));
+			return Err(
+				omp_envd::exthost::control::ControlProtocolError::new(
+					"SpawnDenied",
+					format!("agent type {agent:?} is not available in this session"),
+				)
+				.with_details(json!({"reason": "unknown agent", "field": "agent"})),
+			);
 		}
 		if context
 			.task_settings
@@ -2197,11 +2198,13 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.iter()
 			.any(|name| name.as_str().eq_ignore_ascii_case(agent))
 		{
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"SpawnDenied",
-				"requested agent is disabled by live task settings",
-			)
-			.with_details(json!({"reason": "disabled agent", "field": "agent"})));
+			return Err(
+				omp_envd::exthost::control::ControlProtocolError::new(
+					"SpawnDenied",
+					"requested agent is disabled by live task settings",
+				)
+				.with_details(json!({"reason": "disabled agent", "field": "agent"})),
+			);
 		}
 		if context
 			.state
@@ -2211,60 +2214,83 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.task_budget
 			.is_some_and(|budget| budget.remaining_tokens == Some(0))
 		{
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"SpawnDenied",
-				"hard turn token budget is exhausted",
-			)
-			.with_details(json!({"reason": "budget exhausted", "field": "budget"})));
+			return Err(
+				omp_envd::exthost::control::ControlProtocolError::new(
+					"SpawnDenied",
+					"hard turn token budget is exhausted",
+				)
+				.with_details(json!({"reason": "budget exhausted", "field": "budget"})),
+			);
 		}
 		for (field, unsupported) in [
-			("system_prompt", spec.get("system_prompt").is_some_and(|value| !value.is_null())),
+			(
+				"system_prompt",
+				spec
+					.get("system_prompt")
+					.is_some_and(|value| !value.is_null()),
+			),
 			("model", spec.get("model").is_some_and(|value| !value.is_null())),
 			(
 				"on_model_unavailable",
-				spec.get("on_model_unavailable")
+				spec
+					.get("on_model_unavailable")
 					.and_then(Value::as_str)
 					.is_some_and(|value| value != "fail"),
 			),
-			("allowed_devices", spec.get("allowed_devices").is_some_and(|value| !value.is_null())),
+			(
+				"allowed_devices",
+				spec
+					.get("allowed_devices")
+					.is_some_and(|value| !value.is_null()),
+			),
 			(
 				"disallowed_devices",
-				spec.get("disallowed_devices")
+				spec
+					.get("disallowed_devices")
 					.and_then(Value::as_array)
 					.is_some_and(|values| !values.is_empty()),
 			),
 			(
 				"isolation",
-				spec.get("isolation")
+				spec
+					.get("isolation")
 					.and_then(Value::as_str)
 					.is_some_and(|value| value != "clean"),
 			),
 			("cwd", spec.get("cwd").is_some_and(|value| !value.is_null())),
 			(
 				"env_vars",
-				spec.get("env_vars")
+				spec
+					.get("env_vars")
 					.and_then(Value::as_object)
 					.is_some_and(|values| !values.is_empty()),
 			),
 			("deadline", spec.get("deadline").is_some_and(|value| !value.is_null())),
 			(
 				"request_budget",
-				spec.get("request_budget").is_some_and(|value| !value.is_null()),
+				spec
+					.get("request_budget")
+					.is_some_and(|value| !value.is_null()),
 			),
 			("budget", spec.get("budget").is_some_and(|value| !value.is_null())),
 			(
 				"labels",
-				spec.get("labels")
+				spec
+					.get("labels")
 					.and_then(Value::as_object)
 					.is_some_and(|values| !values.is_empty()),
 			),
 		] {
 			if unsupported {
-				return Err(omp_envd::exthost::control::ControlProtocolError::new(
-					"SpawnDenied",
-					format!("subagent field {field:?} is not supported by the active child authority"),
-				)
-				.with_details(json!({"reason": "unsupported by child authority", "field": field})));
+				return Err(
+					omp_envd::exthost::control::ControlProtocolError::new(
+						"SpawnDenied",
+						format!(
+							"subagent field {field:?} is not supported by the active child authority"
+						),
+					)
+					.with_details(json!({"reason": "unsupported by child authority", "field": field})),
+				);
 			}
 		}
 		Ok(())
@@ -2325,14 +2351,16 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.and_then(|depth| u16::try_from(depth).ok())
 			.unwrap_or_else(|| self.parent.supervisor.limits().max_depth);
 		if parent_node.depth >= parent_max_depth {
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"DepthExceeded",
-				"spawning agent reached its effective depth ceiling",
-			)
-			.with_details(json!({
-				"depth": parent_node.depth,
-				"max_depth": parent_max_depth,
-			})));
+			return Err(
+				omp_envd::exthost::control::ControlProtocolError::new(
+					"DepthExceeded",
+					"spawning agent reached its effective depth ceiling",
+				)
+				.with_details(json!({
+					"depth": parent_node.depth,
+					"max_depth": parent_max_depth,
+				})),
+			);
 		}
 		let requested_depth = spec_object
 			.get("max_depth")
@@ -2367,11 +2395,13 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				"med" => "medium",
 				"hi" => "high",
 				_ => {
-					return Err(omp_envd::exthost::control::ControlProtocolError::new(
-						"SpawnDenied",
-						"subagent thinking level is invalid",
-					)
-					.with_details(json!({"reason": "invalid thinking level", "field": "thinking"})));
+					return Err(
+						omp_envd::exthost::control::ControlProtocolError::new(
+							"SpawnDenied",
+							"subagent thinking level is invalid",
+						)
+						.with_details(json!({"reason": "invalid thinking level", "field": "thinking"})),
+					);
 				},
 			};
 			bridge.insert("effort".to_owned(), Value::String(effort.to_owned()));
@@ -2405,7 +2435,9 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			)
 			.await;
 			if let Ok(value) = &result {
-				let _ = parent.supervisor.set_result(result_id.as_str(), value.clone());
+				let _ = parent
+					.supervisor
+					.set_result(result_id.as_str(), value.clone());
 			}
 			result
 		});
@@ -2482,15 +2514,17 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.and_then(Value::as_u64)
 			.unwrap_or(10_000);
 		if deadline_ms == 0 {
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"CompletionFailed",
-				"unbounded completion deadlines require an explicit host grant",
-			)
-			.with_details(json!({
-				"reason": "unbounded deadline is not granted",
-				"raw": null,
-				"usage": {},
-			})));
+			return Err(
+				omp_envd::exthost::control::ControlProtocolError::new(
+					"CompletionFailed",
+					"unbounded completion deadlines require an explicit host grant",
+				)
+				.with_details(json!({
+					"reason": "unbounded deadline is not granted",
+					"raw": null,
+					"usage": {},
+				})),
+			);
 		}
 		let started = Instant::now();
 		let request = omp_envd::eval::ParentSessionHost::completion(
@@ -2709,8 +2743,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 }
 
 #[async_trait]
-impl<C: TurnClient + Clone + Send + Sync + 'static>
-	omp_envd::schedules::ScheduleDeliveryBackend for ChatScheduleDelivery<C>
+impl<C: TurnClient + Clone + Send + Sync + 'static> omp_envd::schedules::ScheduleDeliveryBackend
+	for ChatScheduleDelivery<C>
 {
 	async fn settled_since_ms(
 		&self,
@@ -2731,18 +2765,20 @@ impl<C: TurnClient + Clone + Send + Sync + 'static>
 		&self,
 		request: &omp_envd::schedules::ScheduleDeliveryRequest,
 	) -> Result<omp_agent::scheduler::BudgetReservation, Str> {
-		if request.schedule.delivery.get("kind").and_then(Value::as_str) != Some("spawn") {
+		if request
+			.schedule
+			.delivery
+			.get("kind")
+			.and_then(Value::as_str)
+			!= Some("spawn")
+		{
 			return Ok(omp_agent::scheduler::BudgetReservation::default());
 		}
 		let soft_budget = u64::from(self.parent.task_settings().soft_request_budget);
 		let requests = if soft_budget == 0 {
 			u64::MAX
 		} else {
-			soft_budget
-				.saturating_mul(3)
-				.saturating_add(1)
-				/ 2
-				+ 5
+			soft_budget.saturating_mul(3).saturating_add(1) / 2 + 5
 		};
 		let cost_micros = if request
 			.schedule
@@ -2807,33 +2843,30 @@ impl<C: TurnClient + Clone + Send + Sync + 'static>
 						expects_reply: false,
 					})
 					.map_err(|error| Str::from(error.to_string()))?;
-				let receipt = deliveries.first().map_or("buffered", |delivery| {
-					match delivery.outcome {
-						omp_agent::Receipt::Injected => "delivered",
-						omp_agent::Receipt::Woken => "woken",
-						omp_agent::Receipt::Revived => "revived",
-						omp_agent::Receipt::Failed => "buffered",
-					}
-				});
+				let receipt =
+					deliveries
+						.first()
+						.map_or("buffered", |delivery| match delivery.outcome {
+							omp_agent::Receipt::Injected => "delivered",
+							omp_agent::Receipt::Woken => "woken",
+							omp_agent::Receipt::Revived => "revived",
+							omp_agent::Receipt::Failed => "buffered",
+						});
 				Ok(omp_envd::schedules::ScheduleDeliveryReceipt {
-					receipt: Str::new(receipt),
-					run_id: None,
+					receipt:     Str::new(receipt),
+					run_id:      None,
 					cost_micros: 0,
-					requests: 0,
+					requests:    0,
 				})
 			},
 			"spawn" => {
-				let stable_id =
-					sf!("schedule-{}-{}", request.schedule.id, request.at_ms);
+				let stable_id = sf!("schedule-{}-{}", request.schedule.id, request.at_ms);
 				if let Some(metadata) = self.parent.supervisor.resolved_metadata(stable_id.as_str()) {
 					return Ok(omp_envd::schedules::ScheduleDeliveryReceipt {
-						receipt: sf!("delivered"),
-						run_id: metadata
-							.get("run_id")
-							.and_then(Value::as_str)
-							.map(Str::new),
+						receipt:     sf!("delivered"),
+						run_id:      metadata.get("run_id").and_then(Value::as_str).map(Str::new),
 						cost_micros: 0,
-						requests: 0,
+						requests:    0,
 					});
 				}
 				let spec = request
@@ -2848,10 +2881,10 @@ impl<C: TurnClient + Clone + Send + Sync + 'static>
 					.await
 					.map_err(|error| Str::from(error.to_string()))?;
 				Ok(omp_envd::schedules::ScheduleDeliveryReceipt {
-					receipt: sf!("delivered"),
-					run_id: handle.get("run_id").and_then(Value::as_str).map(Str::new),
+					receipt:     sf!("delivered"),
+					run_id:      handle.get("run_id").and_then(Value::as_str).map(Str::new),
 					cost_micros: 0,
-					requests: 0,
+					requests:    0,
 				})
 			},
 			kind => Err(sf!("unknown schedule delivery kind {kind:?}")),
@@ -3021,7 +3054,9 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				let mut thread_preflight = if scope == "both" {
 					let mut preflight = arguments.clone();
 					preflight.insert("dry_run".to_owned(), Value::Bool(true));
-					self.host_request(&context, operation.as_str(), preflight).await?
+					self
+						.host_request(&context, operation.as_str(), preflight)
+						.await?
 				} else {
 					json!({
 						"head": arguments.get("to").and_then(Value::as_u64).unwrap_or(0),
@@ -3034,10 +3069,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				if dry_run || !workspace_preflight.conflicts.is_empty() {
 					if let Some(object) = thread_preflight.as_object_mut() {
 						object.insert("scope".to_owned(), Value::String(scope));
-						object.insert(
-							"restore".to_owned(),
-							Self::restore_json(workspace_preflight),
-						);
+						object.insert("restore".to_owned(), Self::restore_json(workspace_preflight));
 						object.insert("dry_run".to_owned(), Value::Bool(true));
 					}
 					return Ok(thread_preflight);
@@ -3065,13 +3097,13 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 								.parent
 								.env
 								.restore_workspace(omp_proto::env::v1::RestoreWorkspace {
-									snapshot_id: undo,
-									dry_run: false,
-									scope: "workspace".to_owned(),
-									paths: Vec::new(),
+									snapshot_id:         undo,
+									dry_run:             false,
+									scope:               "workspace".to_owned(),
+									paths:               Vec::new(),
 									expected_generation: 0,
-									wire_revision: omp_proto::SCHEMA_REV,
-									props: Default::default(),
+									wire_revision:       omp_proto::SCHEMA_REV,
+									props:               Default::default(),
 								})
 								.await;
 							return Err(error);
@@ -3131,11 +3163,13 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					if let Some(name) = spec.get("name").and_then(Value::as_str)
 						&& !names.insert(name.to_ascii_lowercase())
 					{
-						return Err(omp_envd::exthost::control::ControlProtocolError::new(
-							"SpawnDenied",
-							"subagent names must be unique within a batch",
-						)
-						.with_details(json!({"reason": "duplicate name", "field": "name"})));
+						return Err(
+							omp_envd::exthost::control::ControlProtocolError::new(
+								"SpawnDenied",
+								"subagent names must be unique within a batch",
+							)
+							.with_details(json!({"reason": "duplicate name", "field": "name"})),
+						);
 					}
 				}
 				let mut handles = Vec::with_capacity(specs.len());
@@ -3180,10 +3214,12 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 						let progress = state.progress();
 						let turns = state
 							.events()
-							.filter(|event| matches!(
-								event.event,
-								omp_agent::SubagentRunEventKind::Lifecycle(SubagentLifecycle::Running)
-							))
+							.filter(|event| {
+								matches!(
+									event.event,
+									omp_agent::SubagentRunEventKind::Lifecycle(SubagentLifecycle::Running)
+								)
+							})
 							.count();
 						let last_activity_ms = self
 							.parent
@@ -3230,7 +3266,10 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 							.filter(|reason| !reason.trim().is_empty())
 							.unwrap_or("cancelled by extension");
 						let grace = Duration::from_millis(
-							arguments.get("grace_ms").and_then(Value::as_u64).unwrap_or(500),
+							arguments
+								.get("grace_ms")
+								.and_then(Value::as_u64)
+								.unwrap_or(500),
 						);
 						self
 							.parent
@@ -3337,15 +3376,17 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					)
 				})?;
 				if node.parent.as_deref() != Some(caller.as_str()) {
-					return Err(omp_envd::exthost::control::ControlProtocolError::new(
-						"AgentGone",
-						"subagent is not owned by this caller",
-					)
-					.with_details(json!({
-						"ref": reference,
-						"status": "aborted",
-						"transcript_url": format!("history://{id}"),
-					})));
+					return Err(
+						omp_envd::exthost::control::ControlProtocolError::new(
+							"AgentGone",
+							"subagent is not owned by this caller",
+						)
+						.with_details(json!({
+							"ref": reference,
+							"status": "aborted",
+							"transcript_url": format!("history://{id}"),
+						})),
+					);
 				}
 				if operation == "omp.agents.revive" {
 					self
@@ -3397,22 +3438,14 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.parent
 					.supervisor
 					.metadata(caller.as_str())
-					.and_then(|metadata| {
-						metadata
-							.get("effective_max_depth")
-							.and_then(Value::as_u64)
-					})
+					.and_then(|metadata| metadata.get("effective_max_depth").and_then(Value::as_u64))
 					.and_then(|depth| u16::try_from(depth).ok())
 					.unwrap_or(limits.max_depth);
 				let running = limits.active;
 				let queued = limits.queued;
 				let max_concurrency = limits.max_concurrency;
 				let continuations = self
-					.host_request(
-						&context,
-						"omp.agents.continuations",
-						serde_json::Map::new(),
-					)
+					.host_request(&context, "omp.agents.continuations", serde_json::Map::new())
 					.await?;
 				let continuation_cap = continuations
 					.get("cap")
@@ -3423,9 +3456,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.and_then(Value::as_u64)
 					.unwrap_or(0);
 				let concurrency_available =
-					max_concurrency == 0
-						|| running < max_concurrency
-						|| queued < limits.max_queue;
+					max_concurrency == 0 || running < max_concurrency || queued < limits.max_queue;
 				Ok(json!({
 					"max_depth": max_depth,
 					"depth": depth,
@@ -3995,9 +4026,9 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 							})?;
 						parts.push(Part {
 							kind: Some(part::Kind::Blob(omp_proto::thread::v1::Blob {
-								hash: hash.into(),
-								mime: String::new(),
-								size: blob.get("size").and_then(Value::as_u64).unwrap_or(0),
+								hash:   hash.into(),
+								mime:   String::new(),
+								size:   blob.get("size").and_then(Value::as_u64).unwrap_or(0),
 								inline: Default::default(),
 								detail: omp_proto::thread::v1::blob::Detail::Auto as i32,
 							})),
@@ -4057,13 +4088,13 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			items.push(bridge_message(Role::System, system));
 		}
 		items.push(Item {
-			seq: 0,
+			seq:           0,
 			created_at_ms: now_ms(),
-			kind: Some(item::Kind::Message(Message {
-				role: i32::from(Role::User),
+			kind:          Some(item::Kind::Message(Message {
+				role:  i32::from(Role::User),
 				parts: user_parts,
 			})),
-			props: None,
+			props:         None,
 		});
 		let options = TurnOptions {
 			context_id: None,
@@ -4500,30 +4531,28 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			model.contains("codex") || model.contains("gpt-5")
 		};
 		let prompt_input = crate::subagent::prompt::SubagentPromptInput {
-				definition:        &definition,
-				shared_context:    None,
-				plan_path:         None,
-				plan_content:      None,
-				workspace_root:    &child_root,
-				output_schema:     request.output_schema.as_ref(),
-				self_name:         node.name.as_str(),
-				self_role:         definition.name.as_str(),
-				irc_enabled:       child_settings.max_recursion_depth == -1
-					|| i32::from(node.depth) < i32::from(child_settings.max_recursion_depth),
-				roster_generation: context.tree.roster_generation(),
-				peers:             &peers,
-				capabilities:      crate::subagent::prompt::ModelFamilyCapabilities {
-					codex_style,
-					parallel_tool_calls: true,
-					structured_yield: request.output_schema.is_some(),
-				},
-				plan_mode:         false,
-				eager:             task_settings.eager,
-			};
-		child_snapshot.props =
-			crate::subagent::prompt::props(&prompt_input, &parent_snapshot.props);
-		let system_prompt =
-			crate::subagent::prompt::compose(prompt_input, &parent_snapshot.props);
+			definition:        &definition,
+			shared_context:    None,
+			plan_path:         None,
+			plan_content:      None,
+			workspace_root:    &child_root,
+			output_schema:     request.output_schema.as_ref(),
+			self_name:         node.name.as_str(),
+			self_role:         definition.name.as_str(),
+			irc_enabled:       child_settings.max_recursion_depth == -1
+				|| i32::from(node.depth) < i32::from(child_settings.max_recursion_depth),
+			roster_generation: context.tree.roster_generation(),
+			peers:             &peers,
+			capabilities:      crate::subagent::prompt::ModelFamilyCapabilities {
+				codex_style,
+				parallel_tool_calls: true,
+				structured_yield: request.output_schema.is_some(),
+			},
+			plan_mode:         false,
+			eager:             task_settings.eager,
+		};
+		child_snapshot.props = crate::subagent::prompt::props(&prompt_input, &parent_snapshot.props);
+		let system_prompt = crate::subagent::prompt::compose(prompt_input, &parent_snapshot.props);
 		let blob_root = context
 			.sessions_dir
 			.parent()
@@ -5034,16 +5063,9 @@ impl crate::model_controls::ProviderControlBackend for ChatProviderControlBacken
 		}
 		let mut events =
 			vec![crate::model_controls::ProviderModelEvent::Reset { cursor: cursor.clone() }];
-		events.extend(
-			self
-				.models(None)
-				.await?
-				.into_iter()
-				.map(|card| crate::model_controls::ProviderModelEvent::Upsert {
-					cursor: cursor.clone(),
-					card,
-				}),
-		);
+		events.extend(self.models(None).await?.into_iter().map(|card| {
+			crate::model_controls::ProviderModelEvent::Upsert { cursor: cursor.clone(), card }
+		}));
 		Ok(events)
 	}
 
@@ -6086,6 +6108,37 @@ pub fn session_blueprint(
 		.map_err(Into::into)
 }
 
+fn protocol_tool_definition(tool: ToolDefinition) -> Result<inference_pb::ToolDef, ChatError> {
+	let input = match tool.input {
+		ToolInputConstraint::JsonSchema { parameters, strict } => {
+			let schema_json =
+				serde_json::to_vec(parameters.as_value()).map_err(ChatError::ToolSchema)?;
+			inference_pb::tool_def::Input::JsonSchema(inference_pb::tool_def::JsonSchema {
+				schema_json: schema_json.into(),
+				strict:      Some(strict),
+			})
+		},
+		ToolInputConstraint::Grammar(grammar) => {
+			let syntax = match grammar.syntax {
+				ToolGrammarSyntax::Lark => inference_pb::tool_def::grammar::Syntax::Lark,
+				ToolGrammarSyntax::Regex => inference_pb::tool_def::grammar::Syntax::Regex,
+				ToolGrammarSyntax::Ebnf => inference_pb::tool_def::grammar::Syntax::Ebnf,
+			};
+			inference_pb::tool_def::Input::Grammar(inference_pb::tool_def::Grammar {
+				syntax:     syntax as i32,
+				definition: grammar.definition.to_string(),
+			})
+		},
+	};
+	Ok(inference_pb::ToolDef {
+		name:        tool.name.to_string(),
+		description: tool
+			.description
+			.map_or_else(String::new, |value| value.to_string()),
+		input:       Some(input),
+	})
+}
+
 /// Projects a configured session blueprint into initial mutable agent state.
 pub fn agent_snapshot(
 	blueprint: &SessionBlueprint,
@@ -6103,7 +6156,7 @@ pub fn agent_snapshot(
 	} else {
 		registry.advertise(LoweringCaps {
 			strict_schema:  true,
-			grammar:        GrammarBits::LARK | GrammarBits::REGEX | GrammarBits::EBNF,
+			grammar:        GrammarBits::ALL,
 			maximum_tools:  None,
 			maximum_strict: None,
 		})?
@@ -6112,23 +6165,7 @@ pub fn agent_snapshot(
 	let mut tools = Vec::with_capacity(advertised.len());
 	for tool in advertised {
 		enabled_tools.push(tool.identity.name.clone());
-		let (schema_json, strict) = match tool.definition.input {
-			ToolInputConstraint::JsonSchema { parameters, strict } => {
-				(serde_json::to_vec(parameters.as_value()).map_err(ChatError::ToolSchema)?, strict)
-			},
-			ToolInputConstraint::Grammar(_) => {
-				return Err(ChatError::GrammarTool(tool.identity.name));
-			},
-		};
-		tools.push(inference_pb::ToolDef {
-			name:        tool.definition.name.to_string(),
-			description: tool
-				.definition
-				.description
-				.map_or_else(String::new, |value| value.to_string()),
-			schema_json: schema_json.into(),
-			strict:      Some(strict),
-		});
+		tools.push(protocol_tool_definition(tool.definition)?);
 	}
 	let session_id = blueprint
 		.options()
@@ -6891,5 +6928,32 @@ mod tests {
 						))
 			))
 		));
+	}
+}
+#[cfg(test)]
+mod protocol_tests {
+	use omp_inference::ToolGrammar;
+
+	use super::*;
+
+	#[test]
+	fn native_edit_lark_grammar_is_lossless_in_turn_protocol() {
+		const EDIT_GRAMMAR: &str =
+			"start: begin_patch op+ end_patch\ncontent_line: /[^§«»\\n][^\\n]*/ LF";
+		let tool = ToolDefinition {
+			name:        sf!("edit"),
+			description: Some(sf!("Sparse edit")),
+			input:       ToolInputConstraint::Grammar(ToolGrammar {
+				syntax:     ToolGrammarSyntax::Lark,
+				definition: Str::new_static(EDIT_GRAMMAR),
+			}),
+		};
+
+		let projected = protocol_tool_definition(tool).expect("edit grammar projects");
+		let Some(inference_pb::tool_def::Input::Grammar(grammar)) = projected.input else {
+			panic!("edit must remain a native grammar tool");
+		};
+		assert_eq!(grammar.syntax, inference_pb::tool_def::grammar::Syntax::Lark as i32);
+		assert_eq!(grammar.definition, EDIT_GRAMMAR);
 	}
 }

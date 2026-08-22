@@ -25,11 +25,12 @@ impl PromptGenerationStore {
 	///
 	/// A slot which has not yet been invalidated is at generation zero.
 	pub fn generation(&self, session_generation: u64, slot: SlotId) -> u64 {
-		self.generations
-		.lock()
-		.get(&(session_generation, slot))
-		.copied()
-		.unwrap_or(0)
+		self
+			.generations
+			.lock()
+			.get(&(session_generation, slot))
+			.copied()
+			.unwrap_or(0)
 	}
 
 	fn advance(
@@ -39,9 +40,9 @@ impl PromptGenerationStore {
 	) -> Result<u64, PromptInvalidationError> {
 		let mut generations = self.generations.lock();
 		let generation = generations.entry((session_generation, slot)).or_default();
-		let next = generation.checked_add(1).ok_or_else(|| {
-			PromptInvalidationError::Head("prompt-slot generation exhausted".into())
-		})?;
+		let next = generation
+			.checked_add(1)
+			.ok_or_else(|| PromptInvalidationError::Head("prompt-slot generation exhausted".into()))?;
 		*generation = next;
 		Ok(next)
 	}
@@ -52,9 +53,7 @@ impl PromptGenerationStore {
 			let mut relevant = generations.iter().filter(|((_, slot), _)| {
 				declarations
 					.iter()
-					.any(|declaration| {
-						declaration.slot == *slot && declaration.class as usize == class
-					})
+					.any(|declaration| declaration.slot == *slot && declaration.class as usize == class)
 			});
 			let Some((first_key, first_generation)) = relevant.next() else {
 				continue;
@@ -91,10 +90,7 @@ pub struct ProductionPromptHead {
 impl ProductionPromptHead {
 	/// Creates an authority over the declarations supplied to prompt assembly.
 	pub fn new(declarations: Vec<SlotDecl>) -> Self {
-		Self {
-			declarations: declarations.into(),
-			generations:  PromptGenerationStore::default(),
-		}
+		Self { declarations: declarations.into(), generations: PromptGenerationStore::default() }
 	}
 
 	/// Creates an authority from the sealed declarations admitted for extension
@@ -108,7 +104,8 @@ impl ProductionPromptHead {
 		let declarations = specs
 			.iter()
 			.flat_map(|spec| {
-				spec.manifest
+				spec
+					.manifest
 					.static_declarations()
 					.prompt_slots
 					.iter()
@@ -137,19 +134,15 @@ impl ProductionPromptHead {
 							.and_then(serde_json::Value::as_i64)
 							.and_then(|priority| i16::try_from(priority).ok())
 							.unwrap_or(0);
-						Some(SlotDecl {
-							slot,
-							class,
-							owner: spec.key.extension().clone(),
-							priority,
-						})
+						Some(SlotDecl { slot, class, owner: spec.key.extension().clone(), priority })
 					})
 			})
 			.collect();
 		Self::new(declarations)
 	}
 
-	/// Returns the shared generation store prompt assembly and cache keys consume.
+	/// Returns the shared generation store prompt assembly and cache keys
+	/// consume.
 	pub fn generation_store(&self) -> PromptGenerationStore {
 		self.generations.clone()
 	}
@@ -263,16 +256,11 @@ fn slot_class(class: &str) -> Option<SlotClass> {
 const fn extension_slot_class(slot: SlotId) -> SlotClass {
 	match slot {
 		SlotId::Runtime | SlotId::Workflow => SlotClass::Frozen,
-		SlotId::Policy
-		| SlotId::Skills
-		| SlotId::Rules
-		| SlotId::Guidance
-		| SlotId::Workspace => SlotClass::Stable,
+		SlotId::Policy | SlotId::Skills | SlotId::Rules | SlotId::Guidance | SlotId::Workspace => {
+			SlotClass::Stable
+		},
 		SlotId::Memory | SlotId::Standing => SlotClass::Epochal,
 		SlotId::Recall | SlotId::Status => SlotClass::Volatile,
-		SlotId::Conventions
-		| SlotId::Role
-		| SlotId::Tools
-		| SlotId::Delivery => SlotClass::Frozen,
+		SlotId::Conventions | SlotId::Role | SlotId::Tools | SlotId::Delivery => SlotClass::Frozen,
 	}
 }

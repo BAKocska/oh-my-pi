@@ -26,9 +26,19 @@ async fn accepted_invalidation_advances_the_consumed_generation() {
 	let generations = authority.generation_store();
 
 	assert_eq!(generations.generation(11, SlotId::Memory), 0);
-	assert_eq!(authority.invalidate("fixture.extension", 11, "memory").await, Ok(1));
+	assert_eq!(
+		authority
+			.invalidate("fixture.extension", 11, "memory")
+			.await,
+		Ok(1)
+	);
 	assert_eq!(generations.generation(11, SlotId::Memory), 1);
-	assert_eq!(authority.invalidate("fixture.extension", 11, "memory").await, Ok(2));
+	assert_eq!(
+		authority
+			.invalidate("fixture.extension", 11, "memory")
+			.await,
+		Ok(2)
+	);
 	assert_eq!(generations.generation(11, SlotId::Memory), 2);
 }
 
@@ -57,11 +67,15 @@ async fn declaration_rejections_are_typed_and_do_not_advance_generation() {
 	let generations = authority.generation_store();
 
 	assert_eq!(
-		authority.invalidate("fixture.extension", 11, "missing").await,
+		authority
+			.invalidate("fixture.extension", 11, "missing")
+			.await,
 		Err(PromptInvalidationError::UnknownSlot)
 	);
 	assert_eq!(
-		authority.invalidate("fixture.extension", 11, "runtime").await,
+		authority
+			.invalidate("fixture.extension", 11, "runtime")
+			.await,
 		Err(PromptInvalidationError::FrozenSlot)
 	);
 	assert_eq!(

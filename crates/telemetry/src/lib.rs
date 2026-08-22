@@ -140,23 +140,23 @@ pub mod authority {
 	#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 	pub struct DurableTelemetryRow {
 		/// Durable session containing the indexed frame.
-		pub session:       Str,
+		pub session:        Str,
 		/// Durable turn carried by the event, or zero for session-level events.
-		pub turn:          u64,
+		pub turn:           u64,
 		/// Exact byte offset in that session's append-only telemetry file.
-		pub offset:        u64,
+		pub offset:         u64,
 		/// Canonical indexed event kind.
-		pub kind:          Str,
+		pub kind:           Str,
 		/// Event observation time in Unix milliseconds.
 		pub occurred_at_ms: u64,
 		/// Whether transcript replay supplied this row.
-		pub backfilled:    bool,
+		pub backfilled:     bool,
 		/// Canonical payload decoded from the durable side file.
-		pub events:        Vec<Value>,
+		pub events:         Vec<Value>,
 		/// Named match binding, when the query step declared one.
-		pub bindings:      BTreeMap<Str, Value>,
+		pub bindings:       BTreeMap<Str, Value>,
 		/// Selected indexed or payload values.
-		pub values:        BTreeMap<Str, Value>,
+		pub values:         BTreeMap<Str, Value>,
 	}
 
 	/// Authoritative result envelope shared by durable query implementations.

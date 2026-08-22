@@ -3810,7 +3810,8 @@ mod tests {
 
 	/// Architecture proof, mirrors /tmp/ui-bench scenarios: steady-state
 	/// updates must be orders of magnitude cheaper than rebuilds. Run:
-	/// `cargo test -p omp-tui --release -- --ignored perf --nocapture`
+	/// `cargo nextest run -p omp-tui --release --run-ignored ignored-only
+	/// --no-capture -E 'test(perf)'`
 	#[test]
 	#[ignore = "release-mode perf smoke, run explicitly"]
 	fn perf_two_tier_updates() {
@@ -3854,7 +3855,8 @@ mod tests {
 	/// Presentation must scale with DAMAGE, not document size: one
 	/// counter tick on a 4x taller document (and a padded high-water
 	/// frame) presents in comparable time. Run with the perf smoke:
-	/// `cargo test -p omp-tui --release -- --ignored perf --nocapture`
+	/// `cargo nextest run -p omp-tui --release --run-ignored ignored-only
+	/// --no-capture -E 'test(perf)'`
 	#[test]
 	#[ignore = "release-mode perf smoke, run explicitly"]
 	fn perf_present_scales_with_damage() {

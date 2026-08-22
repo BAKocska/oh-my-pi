@@ -57,11 +57,11 @@ pub fn budget_allows(
 		.max_usd_per_firing_micros
 		.is_none_or(|limit| reservation.cost_micros <= limit)
 		&& budget
-		.max_requests_per_firing
-		.is_none_or(|limit| reservation.requests <= limit)
-		&& budget.max_usd_per_window_micros.is_none_or(|limit| {
-			used.cost_micros.saturating_add(reservation.cost_micros) <= limit
-		})
+			.max_requests_per_firing
+			.is_none_or(|limit| reservation.requests <= limit)
+		&& budget
+			.max_usd_per_window_micros
+			.is_none_or(|limit| used.cost_micros.saturating_add(reservation.cost_micros) <= limit)
 }
 
 /// Returns the first trigger occurrence strictly later than `after_ms`.
@@ -93,7 +93,11 @@ pub fn next_occurrence(
 			let mut ordinal = elapsed / interval + 1;
 			loop {
 				let base = origin
-					.checked_add(ordinal.checked_mul(interval).ok_or(PlannerError::DurationOverflow)?)
+					.checked_add(
+						ordinal
+							.checked_mul(interval)
+							.ok_or(PlannerError::DurationOverflow)?,
+					)
 					.ok_or(PlannerError::DurationOverflow)?;
 				let spread = duration_ms(*jitter)?;
 				let instant = base
@@ -102,7 +106,9 @@ pub fn next_occurrence(
 				if instant > after_ms {
 					return Ok(Some(instant));
 				}
-				ordinal = ordinal.checked_add(1).ok_or(PlannerError::DurationOverflow)?;
+				ordinal = ordinal
+					.checked_add(1)
+					.ok_or(PlannerError::DurationOverflow)?;
 			}
 		},
 		Trigger::Cron { expr, timezone } => next_cron(expr, timezone, after_ms),
@@ -164,18 +170,16 @@ fn next_cron(expr: &str, timezone: &str, after_ms: u64) -> Result<Option<u64>, P
 		if cron.matches(Civil::from_unix_seconds(local_seconds)) {
 			return Ok(Some(instant));
 		}
-		instant = instant.checked_add(quantum).ok_or(PlannerError::DurationOverflow)?;
+		instant = instant
+			.checked_add(quantum)
+			.ok_or(PlannerError::DurationOverflow)?;
 	}
 	Ok(None)
 }
 
 enum Zone {
 	Fixed(i32),
-	Transitions {
-		instants: Vec<i64>,
-		indexes:  Vec<u8>,
-		offsets:  Vec<i32>,
-	},
+	Transitions { instants: Vec<i64>, indexes: Vec<u8>, offsets: Vec<i32> },
 }
 
 impl Zone {
@@ -203,7 +207,9 @@ impl Zone {
 		}
 		if timezone.is_empty()
 			|| timezone.starts_with('/')
-			|| timezone.split('/').any(|part| matches!(part, "" | "." | ".."))
+			|| timezone
+				.split('/')
+				.any(|part| matches!(part, "" | "." | ".."))
 		{
 			return Err(PlannerError::UnsupportedTimezone(Str::from(timezone)));
 		}
@@ -260,7 +266,11 @@ fn parse_tzif(bytes: &[u8]) -> Option<Zone> {
 	for chunk in types.chunks_exact(6) {
 		offsets.push(i32::from_be_bytes(chunk[..4].try_into().ok()?));
 	}
-	if offsets.is_empty() || indexes.iter().any(|index| usize::from(*index) >= offsets.len()) {
+	if offsets.is_empty()
+		|| indexes
+			.iter()
+			.any(|index| usize::from(*index) >= offsets.len())
+	{
 		return None;
 	}
 	Some(Zone::Transitions { instants, indexes, offsets })
@@ -287,8 +297,8 @@ impl TzifHeader {
 				.ok()
 		};
 		Some(Self {
-			gmt_count: count(20)?,
-			std_count: count(24)?,
+			gmt_count:  count(20)?,
+			std_count:  count(24)?,
 			leap_count: count(28)?,
 			time_count: count(32)?,
 			type_count: count(36)?,
@@ -299,7 +309,8 @@ impl TzifHeader {
 	fn block_len(self, wide: bool) -> Option<usize> {
 		let time_width = if wide { 8 } else { 4 };
 		let leap_width = if wide { 12 } else { 8 };
-		self.time_count
+		self
+			.time_count
 			.checked_mul(time_width)?
 			.checked_add(self.time_count)?
 			.checked_add(self.type_count.checked_mul(6)?)?
@@ -332,7 +343,11 @@ impl Cron {
 		let at = |index: usize| fields[index];
 		let offset = usize::from(has_seconds);
 		Ok(Self {
-			seconds: if has_seconds { Field::parse(at(0), 0, 59)? } else { Field::only(0) },
+			seconds: if has_seconds {
+				Field::parse(at(0), 0, 59)?
+			} else {
+				Field::only(0)
+			},
 			minutes: Field::parse(at(offset), 0, 59)?,
 			hours: Field::parse(at(offset + 1), 0, 23)?,
 			days: Field::parse(at(offset + 2), 1, 31)?,
@@ -344,8 +359,8 @@ impl Cron {
 
 	fn matches(&self, value: Civil) -> bool {
 		let day_matches = self.days.contains(value.day);
-		let weekday_matches = self.weekdays.contains(value.weekday)
-			|| (value.weekday == 0 && self.weekdays.contains(7));
+		let weekday_matches =
+			self.weekdays.contains(value.weekday) || (value.weekday == 0 && self.weekdays.contains(7));
 		let calendar_matches = match (self.days.any, self.weekdays.any) {
 			(true, true) => true,
 			(true, false) => weekday_matches,
@@ -374,9 +389,9 @@ impl Field {
 	fn parse(source: &str, minimum: u8, maximum: u8) -> Result<Self, PlannerError> {
 		let mut bits = 0_u64;
 		for part in source.split(',') {
-			let (range, step) = part.split_once('/').map_or((part, 1), |(range, step)| {
-				(range, step.parse::<u8>().unwrap_or(0))
-			});
+			let (range, step) = part
+				.split_once('/')
+				.map_or((part, 1), |(range, step)| (range, step.parse::<u8>().unwrap_or(0)));
 			if step == 0 {
 				return Err(PlannerError::InvalidCron(Str::from(source)));
 			}
@@ -441,11 +456,11 @@ impl Civil {
 		let month = mp + if mp < 10 { 3 } else { -9 };
 		let _year = year + i64::from(month <= 2);
 		Self {
-			month: u8::try_from(month).unwrap_or(1),
-			day: u8::try_from(day).unwrap_or(1),
-			hour: u8::try_from(day_seconds / 3_600).unwrap_or(0),
-			minute: u8::try_from(day_seconds % 3_600 / 60).unwrap_or(0),
-			second: u8::try_from(day_seconds % 60).unwrap_or(0),
+			month:   u8::try_from(month).unwrap_or(1),
+			day:     u8::try_from(day).unwrap_or(1),
+			hour:    u8::try_from(day_seconds / 3_600).unwrap_or(0),
+			minute:  u8::try_from(day_seconds % 3_600 / 60).unwrap_or(0),
+			second:  u8::try_from(day_seconds % 60).unwrap_or(0),
 			weekday: u8::try_from((days + 4).rem_euclid(7)).unwrap_or(0),
 		}
 	}
@@ -459,8 +474,8 @@ mod tests {
 	fn aligned_interval_and_jitter_are_restart_stable() {
 		let trigger = Trigger::Every {
 			interval: Duration::from_secs(60),
-			jitter: Duration::from_secs(5),
-			align: true,
+			jitter:   Duration::from_secs(5),
+			align:    true,
 		};
 		let first = next_occurrence(&trigger, "a", 12_345, 60_000).unwrap();
 		assert_eq!(first, next_occurrence(&trigger, "a", 99_999, 60_000).unwrap());
@@ -475,7 +490,7 @@ mod tests {
 	#[test]
 	fn cron_resolves_iana_timezone_transitions() {
 		let trigger = Trigger::Cron {
-			expr: Str::from("0 0 * * *"),
+			expr:     Str::from("0 0 * * *"),
 			timezone: Str::from("America/New_York"),
 		};
 		assert_eq!(
@@ -489,8 +504,8 @@ mod tests {
 		let budget = ScheduleBudget {
 			max_usd_per_firing_micros: Some(100),
 			max_usd_per_window_micros: Some(1_000),
-			window: Duration::from_secs(60),
-			max_requests_per_firing: Some(2),
+			window:                    Duration::from_secs(60),
+			max_requests_per_firing:   Some(2),
 		};
 		assert!(budget_allows(
 			budget,

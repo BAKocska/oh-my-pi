@@ -277,7 +277,7 @@ pub async fn production_rpc_registry(
 ) -> Result<(Registry, AuthManager), RegistryError> {
 	production_assembly(data_dir, credential_store)
 		.await
-		.map(|(registry, _, _, auth, _, _)| (registry, auth))
+		.map(|(registry, _, _, auth, ..)| (registry, auth))
 }
 /// Invocation-owned inference values that must not enter agent or durable
 /// state.
@@ -291,17 +291,21 @@ pub struct InferenceSessionOverrides {
 	pub prompt_cache_affinity: Option<Str>,
 }
 
-/// Session-owned production inference authorities assembled from one credential owner.
+/// Session-owned production inference authorities assembled from one credential
+/// owner.
 pub struct ProductionInference {
 	/// Immutable registry used by direct chat and provider CONTROL projection.
 	pub registry:             Registry,
-	/// Cloneable route composition retained for atomic provider registry rebuilds.
+	/// Cloneable route composition retained for atomic provider registry
+	/// rebuilds.
 	pub builtins:             BuiltinConfig,
 	/// RPC facade sharing the registry's route services and conversation owner.
 	pub rpc:                  InferenceRpc,
-	/// Narrow GitHub URL credential projection over the canonical encrypted store.
+	/// Narrow GitHub URL credential projection over the canonical encrypted
+	/// store.
 	pub credential_authority: Arc<dyn omp_envd::github_url::CredentialAuthority>,
-	/// Authentication owner assembled into the registry's production route stack.
+	/// Authentication owner assembled into the registry's production route
+	/// stack.
 	pub auth_manager:         AuthManager,
 	/// Lifecycle CONTROL view of that exact authentication owner.
 	pub auth_control:         AuthControlHandle,
@@ -618,14 +622,7 @@ async fn production_assembly_for_session(
 		.build()?;
 	let authority: Arc<dyn omp_envd::github_url::CredentialAuthority> =
 		Arc::new(crate::auth_backend::GithubCredentialAuthority::new(stored));
-	Ok((
-		registry,
-		sessions,
-		authority,
-		exposed_auth_manager,
-		exposed_usage_manager,
-		builtins,
-	))
+	Ok((registry, sessions, authority, exposed_auth_manager, exposed_usage_manager, builtins))
 }
 
 /// Resolves the Antigravity client version without blocking assembly work:

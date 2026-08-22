@@ -77,7 +77,9 @@ pub enum SshCommand {
 
 /// Runs scoped writer and bounded native transport operations.
 pub async fn run(args: SshArgs) -> miette::Result<()> {
-	let user = omp_core::dirs::data_dir(None).into_diagnostic()?.join("hosts.toml");
+	let user = omp_core::dirs::data_dir(None)
+		.into_diagnostic()?
+		.join("hosts.toml");
 	let project = std::env::current_dir()
 		.into_diagnostic()?
 		.join(".omp/hosts.toml");

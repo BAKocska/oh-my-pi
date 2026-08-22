@@ -785,6 +785,7 @@ impl ProjectEnvironment {
 	pub fn eval_bridge(&self) -> Arc<eval::SessionBridgeHost> {
 		Arc::clone(&self.eval_bridge)
 	}
+
 	/// Binds one exact SDK session parent without enabling the compatibility
 	/// fallback used by legacy single-parent callers.
 	pub fn bind_eval_sdk_parent(
@@ -829,11 +830,10 @@ impl ProjectEnvironment {
 	{
 		self.lifecycle.server.extension_control_authority(identity)
 	}
+
 	/// Returns the live generation-fenced extension callback transport used by
 	/// provider, campaign, presentation, and verdict owners.
-	pub fn extension_callback_dispatcher(
-		&self,
-	) -> Arc<dyn exthost::dispatch::CallbackDispatcher> {
+	pub fn extension_callback_dispatcher(&self) -> Arc<dyn exthost::dispatch::CallbackDispatcher> {
 		self.lifecycle.server.extension_callback_dispatcher()
 	}
 
@@ -845,6 +845,7 @@ impl ProjectEnvironment {
 	) -> Option<exthost::ExtensionManifest> {
 		self.lifecycle.server.extension_control_manifest(identity)
 	}
+
 	/// Returns full frozen provider and campaign declarations for one exact
 	/// authenticated extension generation.
 	pub fn extension_registry_evidence(
@@ -884,6 +885,7 @@ impl ProjectEnvironment {
 	) -> worker::AgentsControlAuthorityBinding {
 		self.lifecycle.server.bind_agents_control_authority(factory)
 	}
+
 	/// Atomically binds every driver/app-owned CONTROL domain to one live chat
 	/// session until the returned generation-fenced lease is dropped or
 	/// superseded.
@@ -891,8 +893,12 @@ impl ProjectEnvironment {
 		&self,
 		factories: worker::ExternalDomainControlFactories,
 	) -> worker::ExternalDomainControlBinding {
-		self.lifecycle.server.bind_domain_control_factories(factories)
+		self
+			.lifecycle
+			.server
+			.bind_domain_control_factories(factories)
 	}
+
 	/// Atomically replaces the live chat parent and every driver/app-owned
 	/// CONTROL domain under one generation fence and one teardown lease.
 	pub fn bind_external_control_authorities(
@@ -919,6 +925,7 @@ impl ProjectEnvironment {
 	) -> Result<server::AgentControlBinding, EnvdError> {
 		self.lifecycle.server.bind_agent_control(sender)
 	}
+
 	/// Installs the project-lifetime backend which attaches or starts durable
 	/// Agent sessions for scheduled delivery.
 	///

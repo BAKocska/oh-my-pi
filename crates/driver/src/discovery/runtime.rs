@@ -6,22 +6,22 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use omp_catalog::{
 	CatalogOverlayBuilder, DiscoveryNormalizer, DiscoveryPollGate, DiscoveryPollKey, DiscoverySpec,
 	EvidenceConfidence, ModelOverlay, ModelPatch, OverlaySource, OverlayStore, ProvenanceKind,
 	ProvenanceSource, ScopedAlias,
 };
-use async_trait::async_trait;
 use omp_core::{Principal, Str, sf};
 use omp_envd::exthost::control::{ControlAuthorityFactory, ControlConnectionIdentity};
-use omp_proto::inference::v1 as pb;
-use serde_json::{Map, Value};
-use tonic::{Code, Status, transport::Channel};
 use omp_inference::discovery::{
 	DiscoveryCacheKey, DiscoveryHttpClient, DiscoveryProbe, DiscoveryStore, DiscoveryStoreError,
 	ProbeError, ProviderDiscoveryState, ProviderLifecycle,
 };
+use omp_proto::inference::v1 as pb;
+use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
+use tonic::{Code, Status, transport::Channel};
 
 use crate::chat::CampaignControlResolver;
 
@@ -48,7 +48,8 @@ pub struct SealedCampaignDeclaration {
 }
 
 impl SealedCampaignDeclaration {
-	/// Binds a verified declaration to its generation-fenced machine constructor.
+	/// Binds a verified declaration to its generation-fenced machine
+	/// constructor.
 	pub fn new<F>(
 		extension: impl Into<Str>,
 		host_generation: u64,
@@ -398,7 +399,12 @@ impl LocalProviderGatewayAuthority {
 		use crate::chat::ProviderApplicationOwner as _;
 		let registry = self.owner.registry();
 		pb::Cursor {
-			epoch: registry.catalog_revision().as_str().as_bytes().to_vec().into(),
+			epoch:      registry
+				.catalog_revision()
+				.as_str()
+				.as_bytes()
+				.to_vec()
+				.into(),
 			generation: registry.generation(),
 		}
 	}
@@ -417,15 +423,18 @@ impl LocalProviderGatewayAuthority {
 			return Err(Status::unauthenticated("provider caller identity is incomplete"));
 		}
 		Ok(ControlConnectionIdentity {
-			extension: caller.extension.into(),
-			principal: Principal::new(caller.principal_id.into(), caller.principal_display.into()),
-			artifact_digest: caller.artifact_digest.into(),
-			layer: caller.layer.into(),
-			tier: caller.tier.into(),
-			trust: caller.trust.into(),
-			host_generation: caller.host_generation,
+			extension:          caller.extension.into(),
+			principal:          Principal::new(
+				caller.principal_id.into(),
+				caller.principal_display.into(),
+			),
+			artifact_digest:    caller.artifact_digest.into(),
+			layer:              caller.layer.into(),
+			tier:               caller.tier.into(),
+			trust:              caller.trust.into(),
+			host_generation:    caller.host_generation,
 			session_generation: caller.session_generation,
-			capabilities: Arc::new(caller.capabilities.into_iter().map(Str::from).collect()),
+			capabilities:       Arc::new(caller.capabilities.into_iter().map(Str::from).collect()),
 		})
 	}
 
@@ -441,11 +450,7 @@ impl LocalProviderGatewayAuthority {
 	fn declaration(
 		request: pb::ProviderDeclarationRequest,
 	) -> Result<
-		(
-			ControlConnectionIdentity,
-			crate::model_controls::ProviderDeclarationDocument,
-			u64,
-		),
+		(ControlConnectionIdentity, crate::model_controls::ProviderDeclarationDocument, u64),
 		Status,
 	> {
 		if request.provider.is_empty() {
@@ -488,10 +493,12 @@ impl omp_serve::inference::ProviderGatewayAuthority for LocalProviderGatewayAuth
 		request: pb::WatchProviderCatalogRequest,
 	) -> Result<pb::WatchProviderCatalogResponse, Status> {
 		use crate::model_controls::ProviderControlBackend as _;
-		let since = request.since.map(|cursor| crate::model_controls::ProviderCatalogCursor {
-			epoch: cursor.epoch.to_vec().into_boxed_slice(),
-			generation: cursor.generation,
-		});
+		let since = request
+			.since
+			.map(|cursor| crate::model_controls::ProviderCatalogCursor {
+				epoch:      cursor.epoch.to_vec().into_boxed_slice(),
+				generation: cursor.generation,
+			});
 		let events = self
 			.backend
 			.watch_models(since)
@@ -526,7 +533,10 @@ impl omp_serve::inference::ProviderGatewayAuthority for LocalProviderGatewayAuth
 		let (caller, declaration, generation) = Self::declaration(request)?;
 		let _guard = self.serial.lock().await;
 		self.check_generation(generation)?;
-		self.owner.declare_provider(&caller, declaration).map_err(provider_status)?;
+		self
+			.owner
+			.declare_provider(&caller, declaration)
+			.map_err(provider_status)?;
 		Ok(pb::ProviderMutationResponse { cursor: Some(self.cursor()) })
 	}
 
@@ -538,7 +548,8 @@ impl omp_serve::inference::ProviderGatewayAuthority for LocalProviderGatewayAuth
 		let (caller, declaration, generation) = Self::declaration(request)?;
 		let _guard = self.serial.lock().await;
 		self.check_generation(generation)?;
-		self.owner
+		self
+			.owner
 			.replace_provider(&caller, declaration)
 			.await
 			.map_err(provider_status)?;
@@ -556,7 +567,8 @@ impl omp_serve::inference::ProviderGatewayAuthority for LocalProviderGatewayAuth
 		let caller = Self::caller(request.caller)?;
 		let _guard = self.serial.lock().await;
 		self.check_generation(request.expected_generation)?;
-		self.owner
+		self
+			.owner
 			.retract_provider(&caller, &request.provider)
 			.await
 			.map_err(provider_status)?;
@@ -596,9 +608,7 @@ impl LocalProviderGatewayAuthority {
 			));
 		}
 		if !session_only && operation == crate::model_controls::ProviderRequestKind::Realtime {
-			return Err(Status::invalid_argument(
-				"realtime endpoints must use MintProviderSession",
-			));
+			return Err(Status::invalid_argument("realtime endpoints must use MintProviderSession"));
 		}
 		let payload: Map<String, Value> = serde_json::from_slice(&request.payload_json)
 			.map_err(|error| Status::invalid_argument(format!("provider payload: {error}")))?;
@@ -606,14 +616,11 @@ impl LocalProviderGatewayAuthority {
 		self.check_generation(request.expected_generation)?;
 		let result = self
 			.owner
-			.provider_request(
-				&caller,
-				crate::model_controls::ProviderControlRequest {
-					provider: request.provider.into(),
-					operation,
-					payload,
-				},
-			)
+			.provider_request(&caller, crate::model_controls::ProviderControlRequest {
+				provider: request.provider.into(),
+				operation,
+				payload,
+			})
 			.await
 			.map_err(provider_status)?;
 		Ok(provider_result_to_pb(result))
@@ -646,17 +653,17 @@ impl RemoteProviderControlBackend {
 		response
 			.cursor
 			.map(|cursor| cursor.generation)
-			.ok_or_else(|| crate::model_controls::ProviderControlError::Request(
-				sf!("gateway omitted provider catalog cursor"),
-			))
+			.ok_or_else(|| {
+				crate::model_controls::ProviderControlError::Request(sf!(
+					"gateway omitted provider catalog cursor"
+				))
+			})
 	}
 }
 
 /// Constructs the connection-scoped provider CONTROL factory used in gateway
 /// mode.
-pub fn gateway_provider_control_factory(
-	channel: Channel,
-) -> Arc<dyn ControlAuthorityFactory> {
+pub fn gateway_provider_control_factory(channel: Channel) -> Arc<dyn ControlAuthorityFactory> {
 	let backend: Arc<dyn crate::model_controls::ProviderControlBackend> =
 		Arc::new(RemoteProviderControlBackend::new(channel));
 	Arc::new(crate::model_controls::ProviderControlAuthorityFactory::new(backend))
@@ -667,34 +674,46 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 	async fn models(
 		&self,
 		provider: Option<&str>,
-	) -> Result<Vec<crate::model_controls::ProviderModelCard>, crate::model_controls::ProviderControlError> {
+	) -> Result<
+		Vec<crate::model_controls::ProviderModelCard>,
+		crate::model_controls::ProviderControlError,
+	> {
 		let response = self
 			.client()
-			.provider_catalog(pb::ProviderCatalogRequest {
-				provider: provider.map(ToOwned::to_owned),
-			})
+			.provider_catalog(pb::ProviderCatalogRequest { provider: provider.map(ToOwned::to_owned) })
 			.await
 			.map_err(provider_error)?
 			.into_inner();
-		Ok(response.models.into_iter().map(provider_model_from_pb).collect())
+		Ok(response
+			.models
+			.into_iter()
+			.map(provider_model_from_pb)
+			.collect())
 	}
 
 	async fn watch_models(
 		&self,
 		since: Option<crate::model_controls::ProviderCatalogCursor>,
-	) -> Result<Vec<crate::model_controls::ProviderModelEvent>, crate::model_controls::ProviderControlError> {
+	) -> Result<
+		Vec<crate::model_controls::ProviderModelEvent>,
+		crate::model_controls::ProviderControlError,
+	> {
 		let response = self
 			.client()
 			.watch_provider_catalog(pb::WatchProviderCatalogRequest {
 				since: since.map(|cursor| pb::Cursor {
-					epoch: cursor.epoch.to_vec().into(),
+					epoch:      cursor.epoch.to_vec().into(),
 					generation: cursor.generation,
 				}),
 			})
 			.await
 			.map_err(provider_error)?
 			.into_inner();
-		response.events.into_iter().map(provider_event_from_pb).collect()
+		response
+			.events
+			.into_iter()
+			.map(provider_event_from_pb)
+			.collect()
 	}
 
 	async fn is_authenticated(
@@ -703,9 +722,7 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 	) -> Result<bool, crate::model_controls::ProviderControlError> {
 		Ok(self
 			.client()
-			.provider_authenticated(pb::ProviderAuthenticatedRequest {
-				provider: provider.to_owned(),
-			})
+			.provider_authenticated(pb::ProviderAuthenticatedRequest { provider: provider.to_owned() })
 			.await
 			.map_err(provider_error)?
 			.into_inner()
@@ -719,7 +736,11 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 	) -> Result<(), crate::model_controls::ProviderControlError> {
 		let generation = self.generation().await?;
 		let request = declaration_request(identity, declaration, generation)?;
-		self.client().replace_provider(request).await.map_err(provider_error)?;
+		self
+			.client()
+			.replace_provider(request)
+			.await
+			.map_err(provider_error)?;
 		Ok(())
 	}
 
@@ -732,8 +753,8 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 		self
 			.client()
 			.retract_provider(pb::RetractProviderRequest {
-				caller: Some(caller_to_pb(identity)),
-				provider: provider.to_owned(),
+				caller:              Some(caller_to_pb(identity)),
+				provider:            provider.to_owned(),
 				expected_generation: generation,
 			})
 			.await
@@ -745,7 +766,10 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 		&self,
 		identity: &ControlConnectionIdentity,
 		request: crate::model_controls::ProviderControlRequest,
-	) -> Result<crate::model_controls::ProviderControlResult, crate::model_controls::ProviderControlError> {
+	) -> Result<
+		crate::model_controls::ProviderControlResult,
+		crate::model_controls::ProviderControlError,
+	> {
 		let generation = self.generation().await?;
 		let realtime = request.operation == crate::model_controls::ProviderRequestKind::Realtime;
 		let request = operation_request(identity, request, generation)?;
@@ -762,16 +786,20 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 
 fn caller_to_pb(identity: &ControlConnectionIdentity) -> pb::ProviderCaller {
 	pb::ProviderCaller {
-		extension: identity.extension.to_string(),
-		artifact_digest: identity.artifact_digest.to_string(),
-		host_generation: identity.host_generation,
+		extension:          identity.extension.to_string(),
+		artifact_digest:    identity.artifact_digest.to_string(),
+		host_generation:    identity.host_generation,
 		session_generation: identity.session_generation,
-		principal_id: identity.principal.id().to_owned(),
-		principal_display: identity.principal.display().to_owned(),
-		layer: identity.layer.to_string(),
-		tier: identity.tier.to_string(),
-		trust: identity.trust.to_string(),
-		capabilities: identity.capabilities.iter().map(ToString::to_string).collect(),
+		principal_id:       identity.principal.id().to_owned(),
+		principal_display:  identity.principal.display().to_owned(),
+		layer:              identity.layer.to_string(),
+		tier:               identity.tier.to_string(),
+		trust:              identity.trust.to_string(),
+		capabilities:       identity
+			.capabilities
+			.iter()
+			.map(ToString::to_string)
+			.collect(),
 	}
 }
 
@@ -780,8 +808,9 @@ fn declaration_request(
 	declaration: crate::model_controls::ProviderDeclarationDocument,
 	expected_generation: u64,
 ) -> Result<pb::ProviderDeclarationRequest, crate::model_controls::ProviderControlError> {
-	let document_json = serde_json::to_vec(&declaration.document)
-		.map_err(|error| crate::model_controls::ProviderControlError::Request(error.to_string().into()))?;
+	let document_json = serde_json::to_vec(&declaration.document).map_err(|error| {
+		crate::model_controls::ProviderControlError::Request(error.to_string().into())
+	})?;
 	Ok(pb::ProviderDeclarationRequest {
 		caller: Some(caller_to_pb(identity)),
 		provider: declaration.provider.to_string(),
@@ -795,42 +824,50 @@ fn operation_request(
 	request: crate::model_controls::ProviderControlRequest,
 	expected_generation: u64,
 ) -> Result<pb::ProviderOperationRequest, crate::model_controls::ProviderControlError> {
-	let payload_json = serde_json::to_vec(&request.payload)
-		.map_err(|error| crate::model_controls::ProviderControlError::Request(error.to_string().into()))?;
+	let payload_json = serde_json::to_vec(&request.payload).map_err(|error| {
+		crate::model_controls::ProviderControlError::Request(error.to_string().into())
+	})?;
 	Ok(pb::ProviderOperationRequest {
 		caller: Some(caller_to_pb(identity)),
 		provider: request.provider.to_string(),
 		kind: match request.operation {
-			crate::model_controls::ProviderRequestKind::GenerateImage =>
-				pb::provider_operation_request::Kind::GenerateImage as i32,
-			crate::model_controls::ProviderRequestKind::Speak =>
-				pb::provider_operation_request::Kind::Speak as i32,
-			crate::model_controls::ProviderRequestKind::Transcribe =>
-				pb::provider_operation_request::Kind::Transcribe as i32,
-			crate::model_controls::ProviderRequestKind::Realtime =>
-				pb::provider_operation_request::Kind::Realtime as i32,
+			crate::model_controls::ProviderRequestKind::GenerateImage => {
+				pb::provider_operation_request::Kind::GenerateImage as i32
+			},
+			crate::model_controls::ProviderRequestKind::Speak => {
+				pb::provider_operation_request::Kind::Speak as i32
+			},
+			crate::model_controls::ProviderRequestKind::Transcribe => {
+				pb::provider_operation_request::Kind::Transcribe as i32
+			},
+			crate::model_controls::ProviderRequestKind::Realtime => {
+				pb::provider_operation_request::Kind::Realtime as i32
+			},
 		},
 		payload_json: payload_json.into(),
 		expected_generation,
 	})
 }
 
-fn provider_kind_from_pb(
-	kind: i32,
-) -> Result<crate::model_controls::ProviderRequestKind, Status> {
+fn provider_kind_from_pb(kind: i32) -> Result<crate::model_controls::ProviderRequestKind, Status> {
 	match pb::provider_operation_request::Kind::try_from(kind)
 		.unwrap_or(pb::provider_operation_request::Kind::Unspecified)
 	{
-		pb::provider_operation_request::Kind::GenerateImage =>
-			Ok(crate::model_controls::ProviderRequestKind::GenerateImage),
-		pb::provider_operation_request::Kind::Speak =>
-			Ok(crate::model_controls::ProviderRequestKind::Speak),
-		pb::provider_operation_request::Kind::Transcribe =>
-			Ok(crate::model_controls::ProviderRequestKind::Transcribe),
-		pb::provider_operation_request::Kind::Realtime =>
-			Ok(crate::model_controls::ProviderRequestKind::Realtime),
-		pb::provider_operation_request::Kind::Unspecified =>
-			Err(Status::invalid_argument("provider operation kind is required")),
+		pb::provider_operation_request::Kind::GenerateImage => {
+			Ok(crate::model_controls::ProviderRequestKind::GenerateImage)
+		},
+		pb::provider_operation_request::Kind::Speak => {
+			Ok(crate::model_controls::ProviderRequestKind::Speak)
+		},
+		pb::provider_operation_request::Kind::Transcribe => {
+			Ok(crate::model_controls::ProviderRequestKind::Transcribe)
+		},
+		pb::provider_operation_request::Kind::Realtime => {
+			Ok(crate::model_controls::ProviderRequestKind::Realtime)
+		},
+		pb::provider_operation_request::Kind::Unspecified => {
+			Err(Status::invalid_argument("provider operation kind is required"))
+		},
 	}
 }
 
@@ -851,8 +888,9 @@ fn provider_status(error: crate::model_controls::ProviderControlError) -> Status
 fn provider_error(status: Status) -> crate::model_controls::ProviderControlError {
 	use crate::model_controls::ProviderControlError;
 	match status.code() {
-		Code::PermissionDenied if status.message().contains("capability") =>
-			ProviderControlError::CapabilityDenied,
+		Code::PermissionDenied if status.message().contains("capability") => {
+			ProviderControlError::CapabilityDenied
+		},
 		Code::PermissionDenied => ProviderControlError::Authorization,
 		Code::AlreadyExists => ProviderControlError::Conflict,
 		Code::InvalidArgument => ProviderControlError::InvalidDeclaration(status.message().into()),
@@ -872,104 +910,154 @@ fn provider_event_to_pb(event: crate::model_controls::ProviderModelEvent) -> pb:
 	match event {
 		ProviderModelEvent::Upsert { cursor, card } => pb::ModelEvent {
 			cursor: Some(provider_cursor_to_pb(cursor)),
-			event: Some(pb::model_event::Event::Upserted(provider_model_to_pb(card))),
+			event:  Some(pb::model_event::Event::Upserted(provider_model_to_pb(card))),
 		},
 		ProviderModelEvent::Remove { cursor, id } => pb::ModelEvent {
 			cursor: Some(provider_cursor_to_pb(cursor)),
-			event: Some(pb::model_event::Event::RemovedId(id.to_string())),
+			event:  Some(pb::model_event::Event::RemovedId(id.to_string())),
 		},
 		ProviderModelEvent::Reset { cursor } => pb::ModelEvent {
 			cursor: Some(provider_cursor_to_pb(cursor)),
-			event: Some(pb::model_event::Event::Reset(pb::model_event::Reset {})),
+			event:  Some(pb::model_event::Event::Reset(pb::model_event::Reset {})),
 		},
 	}
 }
 
 fn provider_event_from_pb(
 	event: pb::ModelEvent,
-) -> Result<crate::model_controls::ProviderModelEvent, crate::model_controls::ProviderControlError> {
-	let cursor = event.cursor.ok_or_else(|| crate::model_controls::ProviderControlError::Request(
-		sf!("gateway omitted provider event cursor"),
-	))?;
+) -> Result<crate::model_controls::ProviderModelEvent, crate::model_controls::ProviderControlError>
+{
+	let cursor = event.cursor.ok_or_else(|| {
+		crate::model_controls::ProviderControlError::Request(sf!(
+			"gateway omitted provider event cursor"
+		))
+	})?;
 	let cursor = crate::model_controls::ProviderCatalogCursor {
-		epoch: cursor.epoch.to_vec().into_boxed_slice(),
+		epoch:      cursor.epoch.to_vec().into_boxed_slice(),
 		generation: cursor.generation,
 	};
 	match event.event {
-		Some(pb::model_event::Event::Upserted(card)) =>
+		Some(pb::model_event::Event::Upserted(card)) => {
 			Ok(crate::model_controls::ProviderModelEvent::Upsert {
 				cursor,
 				card: provider_model_from_pb(card),
-			}),
-		Some(pb::model_event::Event::RemovedId(id)) =>
-			Ok(crate::model_controls::ProviderModelEvent::Remove { cursor, id: id.into() }),
-		Some(pb::model_event::Event::Reset(_)) =>
-			Ok(crate::model_controls::ProviderModelEvent::Reset { cursor }),
-		None => Err(crate::model_controls::ProviderControlError::Request(
-			sf!("gateway omitted provider event"),
-		)),
+			})
+		},
+		Some(pb::model_event::Event::RemovedId(id)) => {
+			Ok(crate::model_controls::ProviderModelEvent::Remove { cursor, id: id.into() })
+		},
+		Some(pb::model_event::Event::Reset(_)) => {
+			Ok(crate::model_controls::ProviderModelEvent::Reset { cursor })
+		},
+		None => Err(crate::model_controls::ProviderControlError::Request(sf!(
+			"gateway omitted provider event"
+		))),
 	}
 }
 
 fn provider_model_to_pb(card: crate::model_controls::ProviderModelCard) -> pb::ModelCard {
 	pb::ModelCard {
-		id: card.id.to_string(),
-		provider: card.provider.to_string(),
-		model: card.model.to_string(),
-		name: card.name.to_string(),
-		family: card.family.map_or_else(String::new, |value| value.to_string()),
-		facets: card.facets.iter().map(|value| facet_from_str(value) as i32).collect(),
-		inputs: card.inputs.iter().map(|value| modality_from_str(value) as i32).collect(),
-		outputs: card.outputs.iter().map(|value| modality_from_str(value) as i32).collect(),
-		reasoning: card.reasoning,
-		efforts: card.efforts.iter().map(|value| effort_from_str(value) as i32).collect(),
-		context_window: card.context_window.unwrap_or(0),
+		id:                card.id.to_string(),
+		provider:          card.provider.to_string(),
+		model:             card.model.to_string(),
+		name:              card.name.to_string(),
+		family:            card
+			.family
+			.map_or_else(String::new, |value| value.to_string()),
+		facets:            card
+			.facets
+			.iter()
+			.map(|value| facet_from_str(value) as i32)
+			.collect(),
+		inputs:            card
+			.inputs
+			.iter()
+			.map(|value| modality_from_str(value) as i32)
+			.collect(),
+		outputs:           card
+			.outputs
+			.iter()
+			.map(|value| modality_from_str(value) as i32)
+			.collect(),
+		reasoning:         card.reasoning,
+		efforts:           card
+			.efforts
+			.iter()
+			.map(|value| effort_from_str(value) as i32)
+			.collect(),
+		context_window:    card.context_window.unwrap_or(0),
 		max_output_tokens: card.max_output_tokens.unwrap_or(0),
-		pricing: card.pricing.iter().map(|price| pb::Price {
-			unit: price_unit_from_str(&price.unit) as i32,
-			nanos_usd: price.nanos_usd,
-		}).collect(),
-		availability: availability_from_str(&card.availability) as i32,
-		source: i32::from(card.source),
-		blocked_until_ms: card.blocked_until_ms.unwrap_or(0),
-		deprecated: card.deprecated,
-		updated_at_ms: card.updated_at_ms.unwrap_or(0),
-		supports_tools: card.supports_tools,
-		props: None,
+		pricing:           card
+			.pricing
+			.iter()
+			.map(|price| pb::Price {
+				unit:      price_unit_from_str(&price.unit) as i32,
+				nanos_usd: price.nanos_usd,
+			})
+			.collect(),
+		availability:      availability_from_str(&card.availability) as i32,
+		source:            i32::from(card.source),
+		blocked_until_ms:  card.blocked_until_ms.unwrap_or(0),
+		deprecated:        card.deprecated,
+		updated_at_ms:     card.updated_at_ms.unwrap_or(0),
+		supports_tools:    card.supports_tools,
+		props:             None,
 	}
 }
 
 fn provider_model_from_pb(card: pb::ModelCard) -> crate::model_controls::ProviderModelCard {
 	crate::model_controls::ProviderModelCard {
-		id: card.id.into(),
-		provider: card.provider.into(),
-		model: card.model.into(),
-		name: card.name.into(),
-		family: (!card.family.is_empty()).then(|| card.family.into()),
-		facets: card.facets.into_iter().filter_map(|value| pb::Facet::try_from(value).ok())
-			.map(|value| facet_name(value).into()).collect(),
-		inputs: card.inputs.into_iter().filter_map(|value| pb::Modality::try_from(value).ok())
-			.map(|value| modality_name(value).into()).collect(),
-		outputs: card.outputs.into_iter().filter_map(|value| pb::Modality::try_from(value).ok())
-			.map(|value| modality_name(value).into()).collect(),
-		reasoning: card.reasoning,
-		efforts: card.efforts.into_iter().filter_map(|value| pb::Effort::try_from(value).ok())
-			.map(|value| effort_name(value).into()).collect(),
-		context_window: (card.context_window != 0).then_some(card.context_window),
+		id:                card.id.into(),
+		provider:          card.provider.into(),
+		model:             card.model.into(),
+		name:              card.name.into(),
+		family:            (!card.family.is_empty()).then(|| card.family.into()),
+		facets:            card
+			.facets
+			.into_iter()
+			.filter_map(|value| pb::Facet::try_from(value).ok())
+			.map(|value| facet_name(value).into())
+			.collect(),
+		inputs:            card
+			.inputs
+			.into_iter()
+			.filter_map(|value| pb::Modality::try_from(value).ok())
+			.map(|value| modality_name(value).into())
+			.collect(),
+		outputs:           card
+			.outputs
+			.into_iter()
+			.filter_map(|value| pb::Modality::try_from(value).ok())
+			.map(|value| modality_name(value).into())
+			.collect(),
+		reasoning:         card.reasoning,
+		efforts:           card
+			.efforts
+			.into_iter()
+			.filter_map(|value| pb::Effort::try_from(value).ok())
+			.map(|value| effort_name(value).into())
+			.collect(),
+		context_window:    (card.context_window != 0).then_some(card.context_window),
 		max_output_tokens: (card.max_output_tokens != 0).then_some(card.max_output_tokens),
-		pricing: card.pricing.into_iter().map(|price| crate::model_controls::ProviderPrice {
-			unit: pb::price::Unit::try_from(price.unit)
-				.map_or("unknown", price_unit_name).into(),
-			nanos_usd: price.nanos_usd,
-		}).collect(),
-		availability: pb::Availability::try_from(card.availability)
-			.map_or("unknown", availability_name).into(),
-		source: u8::try_from(card.source).unwrap_or(0),
-		blocked_until_ms: (card.blocked_until_ms != 0).then_some(card.blocked_until_ms),
-		deprecated: card.deprecated,
-		updated_at_ms: (card.updated_at_ms != 0).then_some(card.updated_at_ms),
-		supports_tools: card.supports_tools,
-		props: Map::new(),
+		pricing:           card
+			.pricing
+			.into_iter()
+			.map(|price| crate::model_controls::ProviderPrice {
+				unit:      pb::price::Unit::try_from(price.unit)
+					.map_or("unknown", price_unit_name)
+					.into(),
+				nanos_usd: price.nanos_usd,
+			})
+			.collect(),
+		availability:      pb::Availability::try_from(card.availability)
+			.map_or("unknown", availability_name)
+			.into(),
+		source:            u8::try_from(card.source).unwrap_or(0),
+		blocked_until_ms:  (card.blocked_until_ms != 0).then_some(card.blocked_until_ms),
+		deprecated:        card.deprecated,
+		updated_at_ms:     (card.updated_at_ms != 0).then_some(card.updated_at_ms),
+		supports_tools:    card.supports_tools,
+		props:             Map::new(),
 	}
 }
 
@@ -988,41 +1076,59 @@ fn facet_from_str(value: &str) -> pb::Facet {
 }
 fn facet_name(value: pb::Facet) -> &'static str {
 	match value {
-		pb::Facet::Chat => "chat", pb::Facet::Embed => "embed",
-		pb::Facet::ImageGen => "image_gen", pb::Facet::VideoGen => "video_gen",
-		pb::Facet::Speak => "speak", pb::Facet::Transcribe => "transcribe",
-		pb::Facet::Realtime => "realtime", pb::Facet::Search => "search",
+		pb::Facet::Chat => "chat",
+		pb::Facet::Embed => "embed",
+		pb::Facet::ImageGen => "image_gen",
+		pb::Facet::VideoGen => "video_gen",
+		pb::Facet::Speak => "speak",
+		pb::Facet::Transcribe => "transcribe",
+		pb::Facet::Realtime => "realtime",
+		pb::Facet::Search => "search",
 		pb::Facet::Unspecified => "unspecified",
 	}
 }
 fn modality_from_str(value: &str) -> pb::Modality {
 	match value {
-		"text" => pb::Modality::Text, "image" => pb::Modality::Image,
-		"audio" => pb::Modality::Audio, "video" => pb::Modality::Video,
-		"document" | "pdf" => pb::Modality::Pdf, _ => pb::Modality::Unspecified,
+		"text" => pb::Modality::Text,
+		"image" => pb::Modality::Image,
+		"audio" => pb::Modality::Audio,
+		"video" => pb::Modality::Video,
+		"document" | "pdf" => pb::Modality::Pdf,
+		_ => pb::Modality::Unspecified,
 	}
 }
 fn modality_name(value: pb::Modality) -> &'static str {
 	match value {
-		pb::Modality::Text => "text", pb::Modality::Image => "image",
-		pb::Modality::Audio => "audio", pb::Modality::Video => "video",
-		pb::Modality::Pdf => "document", pb::Modality::Unspecified => "unspecified",
+		pb::Modality::Text => "text",
+		pb::Modality::Image => "image",
+		pb::Modality::Audio => "audio",
+		pb::Modality::Video => "video",
+		pb::Modality::Pdf => "document",
+		pb::Modality::Unspecified => "unspecified",
 	}
 }
 fn effort_from_str(value: &str) -> pb::Effort {
 	match value {
-		"off" => pb::Effort::Off, "minimal" => pb::Effort::Minimal,
-		"low" => pb::Effort::Low, "medium" => pb::Effort::Medium,
-		"high" => pb::Effort::High, "max" => pb::Effort::Max,
-		"xhigh" => pb::Effort::Xhigh, _ => pb::Effort::Unspecified,
+		"off" => pb::Effort::Off,
+		"minimal" => pb::Effort::Minimal,
+		"low" => pb::Effort::Low,
+		"medium" => pb::Effort::Medium,
+		"high" => pb::Effort::High,
+		"max" => pb::Effort::Max,
+		"xhigh" => pb::Effort::Xhigh,
+		_ => pb::Effort::Unspecified,
 	}
 }
 fn effort_name(value: pb::Effort) -> &'static str {
 	match value {
-		pb::Effort::Off => "off", pb::Effort::Minimal => "minimal",
-		pb::Effort::Low => "low", pb::Effort::Medium => "medium",
-		pb::Effort::High => "high", pb::Effort::Max => "max",
-		pb::Effort::Xhigh => "xhigh", pb::Effort::Unspecified => "unspecified",
+		pb::Effort::Off => "off",
+		pb::Effort::Minimal => "minimal",
+		pb::Effort::Low => "low",
+		pb::Effort::Medium => "medium",
+		pb::Effort::High => "high",
+		pb::Effort::Max => "max",
+		pb::Effort::Xhigh => "xhigh",
+		pb::Effort::Unspecified => "unspecified",
 	}
 }
 fn availability_from_str(value: &str) -> pb::Availability {
@@ -1077,78 +1183,90 @@ fn provider_result_to_pb(
 ) -> pb::ProviderOperationResponse {
 	use crate::model_controls::ProviderControlResult;
 	let result = match result {
-		ProviderControlResult::Image { images, cost_nanos_usd } =>
-			pb::provider_operation_response::Result::Image(
-				pb::provider_operation_response::Image {
-					images: images.into_vec().into_iter().map(|blob| pb::ProviderBlob {
-						hash: blob.hash.to_string(), size: blob.size,
-					}).collect(),
-					cost_nanos_usd,
-				},
-			),
-		ProviderControlResult::Speech { audio, format, cost_nanos_usd } =>
-			pb::provider_operation_response::Result::Speech(
-				pb::provider_operation_response::Speech {
-					audio: Some(pb::ProviderBlob { hash: audio.hash.to_string(), size: audio.size }),
-					format: format.to_string(), cost_nanos_usd,
-				},
-			),
-		ProviderControlResult::Transcription { text, language, cost_nanos_usd } =>
+		ProviderControlResult::Image { images, cost_nanos_usd } => {
+			pb::provider_operation_response::Result::Image(pb::provider_operation_response::Image {
+				images: images
+					.into_vec()
+					.into_iter()
+					.map(|blob| pb::ProviderBlob { hash: blob.hash.to_string(), size: blob.size })
+					.collect(),
+				cost_nanos_usd,
+			})
+		},
+		ProviderControlResult::Speech { audio, format, cost_nanos_usd } => {
+			pb::provider_operation_response::Result::Speech(pb::provider_operation_response::Speech {
+				audio: Some(pb::ProviderBlob { hash: audio.hash.to_string(), size: audio.size }),
+				format: format.to_string(),
+				cost_nanos_usd,
+			})
+		},
+		ProviderControlResult::Transcription { text, language, cost_nanos_usd } => {
 			pb::provider_operation_response::Result::Transcription(
 				pb::provider_operation_response::Transcription {
-					text: text.to_string(), language: language.map(|value| value.to_string()),
+					text: text.to_string(),
+					language: language.map(|value| value.to_string()),
 					cost_nanos_usd,
 				},
-			),
-		ProviderControlResult::Realtime {
-			id, endpoint, credential, expires_at_ms, transport,
-		} => pb::provider_operation_response::Result::Realtime(
-			pb::provider_operation_response::Realtime {
-				id: id.to_string(), endpoint: endpoint.to_string(),
-				credential: credential.to_string(), expires_at_ms,
-				transport: transport.to_string(),
-			},
-		),
+			)
+		},
+		ProviderControlResult::Realtime { id, endpoint, credential, expires_at_ms, transport } => {
+			pb::provider_operation_response::Result::Realtime(
+				pb::provider_operation_response::Realtime {
+					id: id.to_string(),
+					endpoint: endpoint.to_string(),
+					credential: credential.to_string(),
+					expires_at_ms,
+					transport: transport.to_string(),
+				},
+			)
+		},
 	};
 	pb::ProviderOperationResponse { result: Some(result) }
 }
 
 fn provider_result_from_pb(
 	response: pb::ProviderOperationResponse,
-) -> Result<crate::model_controls::ProviderControlResult, crate::model_controls::ProviderControlError> {
+) -> Result<crate::model_controls::ProviderControlResult, crate::model_controls::ProviderControlError>
+{
 	use crate::model_controls::{ProviderBlobRef, ProviderControlError, ProviderControlResult};
 	match response.result {
-		Some(pb::provider_operation_response::Result::Image(image)) =>
+		Some(pb::provider_operation_response::Result::Image(image)) => {
 			Ok(ProviderControlResult::Image {
-				images: image.images.into_iter().map(|blob| ProviderBlobRef {
-					hash: blob.hash.into(), size: blob.size,
-				}).collect(),
+				images:         image
+					.images
+					.into_iter()
+					.map(|blob| ProviderBlobRef { hash: blob.hash.into(), size: blob.size })
+					.collect(),
 				cost_nanos_usd: image.cost_nanos_usd,
-			}),
-		Some(pb::provider_operation_response::Result::Speech(speech)) => {
-			let audio = speech.audio.ok_or_else(|| ProviderControlError::Request(
-				sf!("gateway omitted speech blob"),
-			))?;
-			Ok(ProviderControlResult::Speech {
-				audio: ProviderBlobRef { hash: audio.hash.into(), size: audio.size },
-				format: speech.format.into(), cost_nanos_usd: speech.cost_nanos_usd,
 			})
 		},
-		Some(pb::provider_operation_response::Result::Transcription(transcription)) =>
+		Some(pb::provider_operation_response::Result::Speech(speech)) => {
+			let audio = speech
+				.audio
+				.ok_or_else(|| ProviderControlError::Request(sf!("gateway omitted speech blob")))?;
+			Ok(ProviderControlResult::Speech {
+				audio:          ProviderBlobRef { hash: audio.hash.into(), size: audio.size },
+				format:         speech.format.into(),
+				cost_nanos_usd: speech.cost_nanos_usd,
+			})
+		},
+		Some(pb::provider_operation_response::Result::Transcription(transcription)) => {
 			Ok(ProviderControlResult::Transcription {
-				text: transcription.text.into(),
-				language: transcription.language.map(Into::into),
+				text:           transcription.text.into(),
+				language:       transcription.language.map(Into::into),
 				cost_nanos_usd: transcription.cost_nanos_usd,
-			}),
-		Some(pb::provider_operation_response::Result::Realtime(realtime)) =>
+			})
+		},
+		Some(pb::provider_operation_response::Result::Realtime(realtime)) => {
 			Ok(ProviderControlResult::Realtime {
-				id: realtime.id.into(), endpoint: realtime.endpoint.into(),
-				credential: realtime.credential.into(),
-				expires_at_ms: realtime.expires_at_ms, transport: realtime.transport.into(),
-			}),
-		None => Err(ProviderControlError::Request(sf!(
-			"gateway omitted provider operation result"
-		))),
+				id:            realtime.id.into(),
+				endpoint:      realtime.endpoint.into(),
+				credential:    realtime.credential.into(),
+				expires_at_ms: realtime.expires_at_ms,
+				transport:     realtime.transport.into(),
+			})
+		},
+		None => Err(ProviderControlError::Request(sf!("gateway omitted provider operation result"))),
 	}
 }
 

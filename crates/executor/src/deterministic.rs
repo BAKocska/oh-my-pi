@@ -18,12 +18,12 @@ pub(crate) struct Scheduler {
 }
 
 struct State {
-	runnable: VecDeque<Runnable>,
-	timers:   BinaryHeap<TimerEntry>,
-	now:      Duration,
+	runnable:   VecDeque<Runnable>,
+	timers:     BinaryHeap<TimerEntry>,
+	now:        Duration,
 	next_timer: u64,
-	rng:      SmallRng,
-	seed:     u64,
+	rng:        SmallRng,
+	seed:       u64,
 }
 
 struct TimerEntry {
@@ -100,7 +100,10 @@ impl Scheduler {
 			}
 			let runnable_count = state.runnable.len();
 			let index = state.rng.random_range(0..runnable_count);
-			state.runnable.remove(index).expect("runnable index is in bounds")
+			state
+				.runnable
+				.remove(index)
+				.expect("runnable index is in bounds")
 		};
 		runnable.run();
 		true
@@ -116,7 +119,11 @@ impl Scheduler {
 			state.now = state.now.saturating_add(duration);
 			let now = state.now;
 			let mut wakers = Vec::new();
-			while state.timers.peek().is_some_and(|timer| timer.deadline <= now) {
+			while state
+				.timers
+				.peek()
+				.is_some_and(|timer| timer.deadline <= now)
+			{
 				let timer = state.timers.pop().expect("peeked timer exists");
 				let mut timer_state = timer.state.lock();
 				if !timer_state.cancelled {
@@ -176,7 +183,9 @@ impl Future for Timer {
 		if register {
 			let sequence = scheduler.next_timer;
 			scheduler.next_timer = scheduler.next_timer.wrapping_add(1);
-			scheduler.timers.push(TimerEntry { deadline, sequence, state: timer_state });
+			scheduler
+				.timers
+				.push(TimerEntry { deadline, sequence, state: timer_state });
 		}
 		Poll::Pending
 	}

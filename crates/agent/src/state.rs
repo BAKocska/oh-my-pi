@@ -15,9 +15,7 @@ use tokio::sync::watch;
 
 use crate::{
 	InterruptedReasoningDialect, TurnOptions,
-	prompt::{
-		CanonicalPromptSource, PromptError, PromptSource, RenderedPrompt, render_prompt,
-	},
+	prompt::{CanonicalPromptSource, PromptError, PromptSource, RenderedPrompt, render_prompt},
 };
 
 /// Bounded loop-level retry policy for recoverable turn failures.

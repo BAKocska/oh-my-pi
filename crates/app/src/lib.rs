@@ -9,7 +9,8 @@ pub mod auth_cli;
 pub mod auth_gateway_cmd;
 pub mod bench_cmd;
 pub mod chat_cmd;
-/// Native chat surface, public so command-template prompt goldens can freeze its output.
+/// Native chat surface, public so command-template prompt goldens can freeze
+/// its output.
 #[doc(hidden)]
 pub mod chat_ui;
 pub mod claude_trace;

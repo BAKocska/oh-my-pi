@@ -76,7 +76,9 @@ pub fn revive_existing(
 	}
 	let roots = journal.workspace_roots(&log.header().cwd)?;
 	let primary_uri = roots.primary().to_string_lossy().into_owned();
-	snapshot.props.set(crate::prompt_keys::CWD, primary_uri.clone());
+	snapshot
+		.props
+		.set(crate::prompt_keys::CWD, primary_uri.clone());
 	let primary = map! { "canonical_uri" => primary_uri };
 	let additional = roots
 		.secondary()

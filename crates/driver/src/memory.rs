@@ -37,12 +37,7 @@ pub fn prompt_snapshot(
 	recall_query: Option<&str>,
 	token_budget: usize,
 ) -> omp_memory::Result<PromptMemoryInput> {
-	omp_envd::memory::prompt_snapshot(
-		runtime,
-		compacted_memory,
-		recall_query,
-		token_budget,
-	)
+	omp_envd::memory::prompt_snapshot(runtime, compacted_memory, recall_query, token_budget)
 }
 
 /// Mutable request inputs sampled into an immutable prompt-memory snapshot.

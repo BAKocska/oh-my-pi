@@ -23,6 +23,7 @@ service Gateway {
   // connection. This is the only pre-flight RPC.
   rpc Hello(HelloRequest) returns (HelloResponse);
 }
+
 // Bearer-authenticated HTTP forward proxy. Requests retain the closed native
 // path vocabulary so callers cannot select an arbitrary credential sink.
 service ForwardProxy {

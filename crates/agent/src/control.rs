@@ -541,13 +541,7 @@ impl ControlSender {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::SessionStateRootContent {
-				ts,
-				authority,
-				reference,
-				request,
-				reply,
-			})
+			.send(ControlCommand::SessionStateRootContent { ts, authority, reference, request, reply })
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -568,11 +562,7 @@ impl ControlSender {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::SessionStateContentIsRooted {
-				authority,
-				reference,
-				reply,
-			})
+			.send(ControlCommand::SessionStateContentIsRooted { authority, reference, reply })
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -972,13 +962,7 @@ fn handle_command(
 		ControlCommand::SessionStateWatch { authority, key, since, reply } => {
 			let _ = reply.send(journal.subscribe_session_state(&authority, key, since));
 		},
-		ControlCommand::SessionStateRootContent {
-			ts,
-			authority,
-			reference,
-			request,
-			reply,
-		} => {
+		ControlCommand::SessionStateRootContent { ts, authority, reference, request, reply } => {
 			let _ =
 				reply.send(journal.root_session_state_content(ts, &authority, reference, &request));
 		},

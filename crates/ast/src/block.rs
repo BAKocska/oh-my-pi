@@ -1051,7 +1051,8 @@ mod tests {
 	}
 
 	#[test]
-	#[ignore = "full repository sweep; run with `cargo test --release -p omp-ast -- --ignored`"]
+	#[ignore = "full repository sweep; run with `cargo nextest run --release -p omp-ast \
+	            --run-ignored ignored-only`"]
 	fn pruned_walk_matches_unpruned_on_full_repo_corpus() {
 		let files = repo_files(None);
 		assert!(files.len() > 500, "expected the whole corpus, got {}", files.len());

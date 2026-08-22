@@ -476,7 +476,7 @@ mod platform {
 	}
 
 	pub(super) fn emergency_restore(payloads: [&[u8]; 3]) {
-				let fd = TTY_FD.load(Ordering::Acquire);
+		let fd = TTY_FD.load(Ordering::Acquire);
 		if fd < 0 {
 			return;
 		}
@@ -533,7 +533,7 @@ mod platform {
 	}
 
 	pub(super) fn deactivate() {
-				RAW_VALID.store(false, Ordering::Release);
+		RAW_VALID.store(false, Ordering::Release);
 		TTY_FD.store(-1, Ordering::Release);
 	}
 
@@ -2390,20 +2390,16 @@ mod tests {
 		owned_notification_modes, platform, progress_state, reconcile_in_band_geometry,
 		rounded_cell_pixels,
 	};
-
 	use crate::{
 		Appearance, InputDecoder, InputEvent, Key, Mods, Mouse, MouseButton, MouseReport,
 		ProbeResults, Renderer, Size, TerminalResponse, escape::esc, paste::Pasted,
 	};
 
 	async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
-		futures_lite::future::or(
-			async move { Ok(future.await) },
-			async move {
-				async_io::Timer::after(duration).await;
-				Err(())
-			},
-		)
+		futures_lite::future::or(async move { Ok(future.await) }, async move {
+			async_io::Timer::after(duration).await;
+			Err(())
+		})
 		.await
 	}
 
@@ -2421,57 +2417,57 @@ mod tests {
 	#[test]
 	fn enhanced_paste_offer_replies_and_stages_the_payload() {
 		futures_lite::future::block_on(async {
-		let dir = std::env::temp_dir().join(format!("omp-tui-5522-{}", std::process::id()));
-		std::fs::create_dir_all(&dir).expect("temp dir");
-		let path = dir.join("tty");
-		std::fs::write(&path, b"").expect("tty file");
-		let tty = OpenOptions::new()
-			.read(true)
-			.write(true)
-			.open(&path)
-			.expect("tty opens");
-		let mut terminal = test_terminal(tty);
-		let mut renderer = Renderer::new(Vec::new());
-		let mime = base64::encode(b"text/plain").into_string();
+			let dir = std::env::temp_dir().join(format!("omp-tui-5522-{}", std::process::id()));
+			std::fs::create_dir_all(&dir).expect("temp dir");
+			let path = dir.join("tty");
+			std::fs::write(&path, b"").expect("tty file");
+			let tty = OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(&path)
+				.expect("tty opens");
+			let mut terminal = test_terminal(tty);
+			let mut renderer = Renderer::new(Vec::new());
+			let mime = base64::encode(b"text/plain").into_string();
 
-		// Unrelated OSC replies stay application input.
-		assert!(
-			!terminal
-				.handle_input_event(&osc("52;c;?"), &mut renderer)
-				.expect("io ok")
-		);
-		// Offer: OK opens the listing, DATA names text/plain, DONE elicits
-		// the read request instead of completing a paste.
-		for body in [
-			"5522;type=read:status=OK:pw=123".to_owned(),
-			format!("5522;type=read:status=DATA:mime={mime}"),
-			"5522;type=read:status=DONE".to_owned(),
-		] {
+			// Unrelated OSC replies stay application input.
 			assert!(
-				terminal
-					.handle_input_event(&osc(&body), &mut renderer)
+				!terminal
+					.handle_input_event(&osc("52;c;?"), &mut renderer)
 					.expect("io ok")
 			);
-		}
-		assert!(terminal.take_paste().is_none(), "listing DONE only requests the payload");
-		let request = std::fs::read_to_string(&path).expect("request written");
-		assert!(request.contains("pw=123"), "read request echoes the grant: {request:?}");
-		assert!(request.contains(&mime));
+			// Offer: OK opens the listing, DATA names text/plain, DONE elicits
+			// the read request instead of completing a paste.
+			for body in [
+				"5522;type=read:status=OK:pw=123".to_owned(),
+				format!("5522;type=read:status=DATA:mime={mime}"),
+				"5522;type=read:status=DONE".to_owned(),
+			] {
+				assert!(
+					terminal
+						.handle_input_event(&osc(&body), &mut renderer)
+						.expect("io ok")
+				);
+			}
+			assert!(terminal.take_paste().is_none(), "listing DONE only requests the payload");
+			let request = std::fs::read_to_string(&path).expect("request written");
+			assert!(request.contains("pw=123"), "read request echoes the grant: {request:?}");
+			assert!(request.contains(&mime));
 
-		// Payload chunk + DONE completes the paste.
-		let chunk = base64::encode(b"hello").into_string();
-		for body in [
-			format!("5522;type=read:status=DATA:mime={mime};{chunk}"),
-			"5522;type=read:status=DONE".to_owned(),
-		] {
-			assert!(
-				terminal
-					.handle_input_event(&osc(&body), &mut renderer)
-					.expect("io ok")
-			);
-		}
-		assert_eq!(terminal.take_paste(), Some(Pasted::Text("hello".into())));
-		std::fs::remove_dir_all(&dir).ok();
+			// Payload chunk + DONE completes the paste.
+			let chunk = base64::encode(b"hello").into_string();
+			for body in [
+				format!("5522;type=read:status=DATA:mime={mime};{chunk}"),
+				"5522;type=read:status=DONE".to_owned(),
+			] {
+				assert!(
+					terminal
+						.handle_input_event(&osc(&body), &mut renderer)
+						.expect("io ok")
+				);
+			}
+			assert_eq!(terminal.take_paste(), Some(Pasted::Text("hello".into())));
+			std::fs::remove_dir_all(&dir).ok();
 		});
 	}
 
@@ -2963,59 +2959,57 @@ mod tests {
 		cfmakeraw(&mut raw);
 		tcsetattr(&pty.slave, SetArg::TCSANOW, &raw).expect("PTY enters raw mode");
 		futures_lite::future::block_on(async {
-				let mut terminal = test_terminal_with_resize(File::from(pty.slave));
-				thread::spawn(|| {
-					thread::sleep(Duration::from_millis(30));
-					// SAFETY: delivering SIGWINCH to this process exercises the installed handler.
-					unsafe {
-						libc::raise(libc::SIGWINCH);
-					}
-				});
-				let started = Instant::now();
-				let event = timeout(Duration::from_secs(3), terminal.next())
-					.await
-					.expect("resize wakes the event loop")
-					.expect("resize event arrives");
-				assert_eq!(event, crate::pump::TerminalEvent::Resize);
-				assert!(started.elapsed() < Duration::from_millis(500));
-				assert!(terminal.resize_ready);
-				assert_eq!(terminal.take_resize().expect("resize size reads"), Some(Size::new(80, 24)));
-
+			let mut terminal = test_terminal_with_resize(File::from(pty.slave));
+			thread::spawn(|| {
+				thread::sleep(Duration::from_millis(30));
 				// SAFETY: delivering SIGWINCH to this process exercises the installed handler.
 				unsafe {
 					libc::raise(libc::SIGWINCH);
-					libc::raise(libc::SIGWINCH);
 				}
-				let event = timeout(Duration::from_secs(3), terminal.next())
-					.await
-					.expect("burst wakes the event loop")
-					.expect("burst resize arrives");
-				assert_eq!(event, crate::pump::TerminalEvent::Resize);
-				assert_eq!(
-					terminal.take_resize().expect("coalesced resize reads"),
-					Some(Size::new(80, 24))
-				);
-				// The watch coalesces the burst; at most resize echoes drain
-				// before the mailbox goes quiet.
-				while let Ok(event) =
-					timeout(Duration::from_millis(30), terminal.next()).await
-				{
-					assert_eq!(
-						event.expect("drained event decodes"),
-						crate::pump::TerminalEvent::Resize,
-						"only resize echoes remain queued"
-					);
-					let _ = terminal.take_resize();
-				}
-
-				write(&pty.master, b"x").expect("PTY accepts key");
-				let event = timeout(Duration::from_secs(1), terminal.next())
-					.await
-					.expect("key wakes the event loop")
-					.expect("key decodes");
-				assert_eq!(event, crate::pump::TerminalEvent::Input(InputEvent::Key(Key::Char('x'))));
-				platform::deactivate();
 			});
+			let started = Instant::now();
+			let event = timeout(Duration::from_secs(3), terminal.next())
+				.await
+				.expect("resize wakes the event loop")
+				.expect("resize event arrives");
+			assert_eq!(event, crate::pump::TerminalEvent::Resize);
+			assert!(started.elapsed() < Duration::from_millis(500));
+			assert!(terminal.resize_ready);
+			assert_eq!(terminal.take_resize().expect("resize size reads"), Some(Size::new(80, 24)));
+
+			// SAFETY: delivering SIGWINCH to this process exercises the installed handler.
+			unsafe {
+				libc::raise(libc::SIGWINCH);
+				libc::raise(libc::SIGWINCH);
+			}
+			let event = timeout(Duration::from_secs(3), terminal.next())
+				.await
+				.expect("burst wakes the event loop")
+				.expect("burst resize arrives");
+			assert_eq!(event, crate::pump::TerminalEvent::Resize);
+			assert_eq!(
+				terminal.take_resize().expect("coalesced resize reads"),
+				Some(Size::new(80, 24))
+			);
+			// The watch coalesces the burst; at most resize echoes drain
+			// before the mailbox goes quiet.
+			while let Ok(event) = timeout(Duration::from_millis(30), terminal.next()).await {
+				assert_eq!(
+					event.expect("drained event decodes"),
+					crate::pump::TerminalEvent::Resize,
+					"only resize echoes remain queued"
+				);
+				let _ = terminal.take_resize();
+			}
+
+			write(&pty.master, b"x").expect("PTY accepts key");
+			let event = timeout(Duration::from_secs(1), terminal.next())
+				.await
+				.expect("key wakes the event loop")
+				.expect("key decodes");
+			assert_eq!(event, crate::pump::TerminalEvent::Input(InputEvent::Key(Key::Char('x'))));
+			platform::deactivate();
+		});
 	}
 
 	/// Collects the next `count` input events, applying terminal responses
@@ -3051,272 +3045,278 @@ mod tests {
 	#[test]
 	fn probe_window_events_are_first_and_responses_surface() {
 		futures_lite::future::block_on(async {
-		let (reader, _writer) = pipe().expect("pipe opens");
-		let mut terminal = test_terminal_seeded(
-			File::from(reader),
-			esc!(
-				"k",
-				csi,
-				"<0;4;3M",
-				csi,
-				"200~pasted",
-				csi,
-				"201~",
-				csi,
-				"I",
-				osc,
-				"11;rgb:ffff/ffff/ffff",
-				bel,
-			)
-			.as_bytes(),
-		);
-		let mut renderer = Renderer::new(Vec::new());
-		let events = collect_inputs(&mut terminal, &mut renderer, 4).await;
-		assert_eq!(events, [
-			InputEvent::Key(Key::Char('k')),
-			InputEvent::Mouse(MouseReport {
-				kind:    Mouse::Click,
-				col:     3,
-				row:     2,
-				button:  MouseButton::Left,
-				mods:    Mods::default(),
-				pressed: true,
-			}),
-			InputEvent::Paste("pasted".into()),
-			InputEvent::Focus(true),
-		]);
-		// The trailing OSC 11 reply is the fifth queued event; apply it like
-		// a host event loop would.
-		let event = timeout(Duration::from_secs(1), terminal.next())
-			.await
-			.expect("response arrives")
-			.expect("response decodes");
-		let crate::pump::TerminalEvent::Input(InputEvent::Response(response)) = event else {
-			panic!("expected the trailing terminal response, got {event:?}");
-		};
-		terminal
-			.handle_response(&response, &mut renderer)
-			.expect("response applies");
-		assert_eq!(terminal.appearance(), Some(Appearance::Light));
+			let (reader, _writer) = pipe().expect("pipe opens");
+			let mut terminal = test_terminal_seeded(
+				File::from(reader),
+				esc!(
+					"k",
+					csi,
+					"<0;4;3M",
+					csi,
+					"200~pasted",
+					csi,
+					"201~",
+					csi,
+					"I",
+					osc,
+					"11;rgb:ffff/ffff/ffff",
+					bel,
+				)
+				.as_bytes(),
+			);
+			let mut renderer = Renderer::new(Vec::new());
+			let events = collect_inputs(&mut terminal, &mut renderer, 4).await;
+			assert_eq!(events, [
+				InputEvent::Key(Key::Char('k')),
+				InputEvent::Mouse(MouseReport {
+					kind:    Mouse::Click,
+					col:     3,
+					row:     2,
+					button:  MouseButton::Left,
+					mods:    Mods::default(),
+					pressed: true,
+				}),
+				InputEvent::Paste("pasted".into()),
+				InputEvent::Focus(true),
+			]);
+			// The trailing OSC 11 reply is the fifth queued event; apply it like
+			// a host event loop would.
+			let event = timeout(Duration::from_secs(1), terminal.next())
+				.await
+				.expect("response arrives")
+				.expect("response decodes");
+			let crate::pump::TerminalEvent::Input(InputEvent::Response(response)) = event else {
+				panic!("expected the trailing terminal response, got {event:?}");
+			};
+			terminal
+				.handle_response(&response, &mut renderer)
+				.expect("response applies");
+			assert_eq!(terminal.appearance(), Some(Appearance::Light));
 		});
 	}
 	#[test]
 	fn probe_window_partial_sequence_continues_in_live_pump() {
 		futures_lite::future::block_on(async {
-		let (reader, writer) = pipe().expect("pipe opens");
-		let mut terminal = test_terminal_seeded(File::from(reader), esc!(csi).as_bytes());
-		write(&writer, b"A").expect("pipe accepts sequence tail");
-		let mut renderer = Renderer::new(Vec::new());
-		let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
-		assert_eq!(events, [InputEvent::Key(Key::Up)]);
+			let (reader, writer) = pipe().expect("pipe opens");
+			let mut terminal = test_terminal_seeded(File::from(reader), esc!(csi).as_bytes());
+			write(&writer, b"A").expect("pipe accepts sequence tail");
+			let mut renderer = Renderer::new(Vec::new());
+			let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
+			assert_eq!(events, [InputEvent::Key(Key::Up)]);
 		});
 	}
 
 	#[test]
 	fn pump_joins_split_escape_sequence_into_one_key() {
 		futures_lite::future::block_on(async {
-		let (reader, writer) = pipe().expect("pipe opens");
-		let mut terminal = test_terminal(File::from(reader));
-		write(&writer, esc!(escape).as_bytes()).expect("pipe accepts escape");
-		// Inside the decoder's partial-hold window the tail joins the held
-		// escape into one decoded key.
-		async_io::Timer::after(Duration::from_millis(20)).await;
-		write(&writer, b"[A").expect("pipe accepts sequence tail");
-		let mut renderer = Renderer::new(Vec::new());
-		let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
-		assert_eq!(events, [InputEvent::Key(Key::Up)]);
+			let (reader, writer) = pipe().expect("pipe opens");
+			let mut terminal = test_terminal(File::from(reader));
+			write(&writer, esc!(escape).as_bytes()).expect("pipe accepts escape");
+			// Inside the decoder's partial-hold window the tail joins the held
+			// escape into one decoded key.
+			async_io::Timer::after(Duration::from_millis(20)).await;
+			write(&writer, b"[A").expect("pipe accepts sequence tail");
+			let mut renderer = Renderer::new(Vec::new());
+			let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
+			assert_eq!(events, [InputEvent::Key(Key::Up)]);
 		});
 	}
 
 	#[test]
 	fn pump_responses_surface_and_update_terminal_state() {
 		futures_lite::future::block_on(async {
-		let (reader, writer) = pipe().expect("pipe opens");
-		let mut terminal = test_terminal(File::from(reader));
-		write(
-			&writer,
-			esc!(osc, "11;rgb:ffff/ffff/ffff", bel, csi, "48;24;80;1600;800 t").as_bytes(),
-		)
-		.expect("pipe accepts terminal replies");
-		write(&writer, b"x").expect("pipe accepts trailing key");
-		let mut renderer = Renderer::new(Vec::new());
-		// Both replies surface as `Input(Response)` and apply through
-		// `handle_response` before the trailing key is collected.
-		let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
-		assert_eq!(events, [InputEvent::Key(Key::Char('x'))]);
-		assert_eq!(terminal.appearance(), Some(Appearance::Light));
-		assert_eq!(terminal.cell_pixel_size(), Some((10, 67)));
-		assert_eq!(terminal.take_resize().expect("resize is available"), Some(Size::new(80, 24)));
+			let (reader, writer) = pipe().expect("pipe opens");
+			let mut terminal = test_terminal(File::from(reader));
+			write(
+				&writer,
+				esc!(osc, "11;rgb:ffff/ffff/ffff", bel, csi, "48;24;80;1600;800 t").as_bytes(),
+			)
+			.expect("pipe accepts terminal replies");
+			write(&writer, b"x").expect("pipe accepts trailing key");
+			let mut renderer = Renderer::new(Vec::new());
+			// Both replies surface as `Input(Response)` and apply through
+			// `handle_response` before the trailing key is collected.
+			let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
+			assert_eq!(events, [InputEvent::Key(Key::Char('x'))]);
+			assert_eq!(terminal.appearance(), Some(Appearance::Light));
+			assert_eq!(terminal.cell_pixel_size(), Some((10, 67)));
+			assert_eq!(terminal.take_resize().expect("resize is available"), Some(Size::new(80, 24)));
 		});
 	}
 
 	#[test]
 	fn pump_timeout_tick_flushes_held_partial() {
 		futures_lite::future::block_on(async {
-		let (reader, writer) = pipe().expect("pipe opens");
-		let mut terminal = test_terminal(File::from(reader));
-		write(&writer, esc!(escape).as_bytes()).expect("pipe accepts escape");
-		// The actor's own decoder deadline releases the held escape; no
-		// host-side polling is involved.
-		let mut renderer = Renderer::new(Vec::new());
-		let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
-		assert_eq!(events, [InputEvent::Key(Key::Esc)]);
+			let (reader, writer) = pipe().expect("pipe opens");
+			let mut terminal = test_terminal(File::from(reader));
+			write(&writer, esc!(escape).as_bytes()).expect("pipe accepts escape");
+			// The actor's own decoder deadline releases the held escape; no
+			// host-side polling is involved.
+			let mut renderer = Renderer::new(Vec::new());
+			let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
+			assert_eq!(events, [InputEvent::Key(Key::Esc)]);
 		});
 	}
 	#[test]
 	fn appearance_callback_only_fires_on_a_classification_flip() {
 		futures_lite::future::block_on(async {
-		let (reader, writer) = pipe().expect("pipe opens");
-		drop(reader);
-		let mut terminal = test_terminal(File::from(writer));
-		let observed = Arc::new(Mutex::new(None));
-		let callback_observed = Arc::clone(&observed);
-		terminal.on_appearance_change(move |appearance| *callback_observed.lock() = Some(appearance));
-		let mut renderer = Renderer::new(Vec::new());
-		terminal
-			.handle_response(
-				&TerminalResponse::OscColor {
-					index: 11,
-					r:     u16::MAX,
-					g:     u16::MAX,
-					b:     u16::MAX,
-				},
-				&mut renderer,
-			)
-			.unwrap();
-		assert_eq!(terminal.appearance(), Some(Appearance::Light));
-		assert_eq!(*observed.lock(), Some(Appearance::Light));
-		*observed.lock() = None;
-		terminal
-			.handle_response(
-				&TerminalResponse::OscColor { index: 11, r: 0xeeee, g: 0xeeee, b: 0xeeee },
-				&mut renderer,
-			)
-			.unwrap();
-		assert_eq!(*observed.lock(), None);
+			let (reader, writer) = pipe().expect("pipe opens");
+			drop(reader);
+			let mut terminal = test_terminal(File::from(writer));
+			let observed = Arc::new(Mutex::new(None));
+			let callback_observed = Arc::clone(&observed);
+			terminal
+				.on_appearance_change(move |appearance| *callback_observed.lock() = Some(appearance));
+			let mut renderer = Renderer::new(Vec::new());
+			terminal
+				.handle_response(
+					&TerminalResponse::OscColor {
+						index: 11,
+						r:     u16::MAX,
+						g:     u16::MAX,
+						b:     u16::MAX,
+					},
+					&mut renderer,
+				)
+				.unwrap();
+			assert_eq!(terminal.appearance(), Some(Appearance::Light));
+			assert_eq!(*observed.lock(), Some(Appearance::Light));
+			*observed.lock() = None;
+			terminal
+				.handle_response(
+					&TerminalResponse::OscColor {
+						index: 11,
+						r:     0xeeee,
+						g:     0xeeee,
+						b:     0xeeee,
+					},
+					&mut renderer,
+				)
+				.unwrap();
+			assert_eq!(*observed.lock(), None);
 		});
 	}
 
 	#[test]
 	fn appearance_pushes_collapse_to_one_debounced_query() {
 		futures_lite::future::block_on(async {
-		let (reader, writer) = pipe().expect("pipe opens");
-		let mut terminal = test_terminal(File::from(writer));
-		let mut renderer = Renderer::new(Vec::new());
-		ACTIVE.store(true, Ordering::Release);
-		terminal
-			.handle_response(&TerminalResponse::AppearanceChanged(1), &mut renderer)
-			.unwrap();
-		thread::sleep(Duration::from_millis(10));
-		terminal
-			.handle_response(&TerminalResponse::AppearanceChanged(2), &mut renderer)
-			.unwrap();
-		thread::sleep(Duration::from_millis(120));
-		let mut bytes = [0; 64];
-		let count = read(&reader, &mut bytes).expect("query is written");
-		ACTIVE.store(false, Ordering::Release);
-		assert_eq!(&bytes[..count], OSC11_QUERY);
+			let (reader, writer) = pipe().expect("pipe opens");
+			let mut terminal = test_terminal(File::from(writer));
+			let mut renderer = Renderer::new(Vec::new());
+			ACTIVE.store(true, Ordering::Release);
+			terminal
+				.handle_response(&TerminalResponse::AppearanceChanged(1), &mut renderer)
+				.unwrap();
+			thread::sleep(Duration::from_millis(10));
+			terminal
+				.handle_response(&TerminalResponse::AppearanceChanged(2), &mut renderer)
+				.unwrap();
+			thread::sleep(Duration::from_millis(120));
+			let mut bytes = [0; 64];
+			let count = read(&reader, &mut bytes).expect("query is written");
+			ACTIVE.store(false, Ordering::Release);
+			assert_eq!(&bytes[..count], OSC11_QUERY);
 		});
 	}
 
 	#[test]
 	fn in_band_resize_derives_pixels_and_os_geometry_wins() {
 		futures_lite::future::block_on(async {
-		assert_eq!(rounded_cell_pixels(1000, 120), 8);
-		assert_eq!(rounded_cell_pixels(777, 80), 10);
-		let reported = Size::new(120, 40);
-		let os = Size::new(100, 30);
-		assert_eq!(reconcile_in_band_geometry(reported, Some(os)), os);
-		assert_eq!(reconcile_in_band_geometry(reported, Some(reported)), reported);
+			assert_eq!(rounded_cell_pixels(1000, 120), 8);
+			assert_eq!(rounded_cell_pixels(777, 80), 10);
+			let reported = Size::new(120, 40);
+			let os = Size::new(100, 30);
+			assert_eq!(reconcile_in_band_geometry(reported, Some(os)), os);
+			assert_eq!(reconcile_in_band_geometry(reported, Some(reported)), reported);
 
-		let (reader, writer) = pipe().expect("pipe opens");
-		drop(reader);
-		let mut terminal = test_terminal(File::from(writer));
-		let mut renderer = Renderer::new(Vec::new());
-		terminal
-			.handle_response(
-				&TerminalResponse::InBandResize { rows: 40, cols: 120, x_px: 1000, y_px: 800 },
-				&mut renderer,
-			)
-			.unwrap();
-		assert_eq!(terminal.in_band_size(), Some(reported));
+			let (reader, writer) = pipe().expect("pipe opens");
+			drop(reader);
+			let mut terminal = test_terminal(File::from(writer));
+			let mut renderer = Renderer::new(Vec::new());
+			terminal
+				.handle_response(
+					&TerminalResponse::InBandResize { rows: 40, cols: 120, x_px: 1000, y_px: 800 },
+					&mut renderer,
+				)
+				.unwrap();
+			assert_eq!(terminal.in_band_size(), Some(reported));
 		});
 	}
 
 	#[test]
 	fn staged_alt_sequences_split_interactive_and_resize_ownership() {
 		futures_lite::future::block_on(async {
-		let (reader, writer) = pipe().expect("pipe opens");
-		drop(reader);
-		let mut terminal = test_terminal(File::from(writer));
+			let (reader, writer) = pipe().expect("pipe opens");
+			drop(reader);
+			let mut terminal = test_terminal(File::from(writer));
 
-		// An interactive hold captures the mouse for its lifetime.
-		let enter = terminal
-			.stage_alt_enter(AltScreenUse::Interactive)
-			.expect("first entry stages");
-		assert_eq!(
-			enter.as_str(),
-			esc!(alt_screen, csi, ">5u", mouse_vt200, mouse_any_event, mouse_sgr)
-		);
-		assert!(
-			terminal
+			// An interactive hold captures the mouse for its lifetime.
+			let enter = terminal
 				.stage_alt_enter(AltScreenUse::Interactive)
-				.is_none(),
-			"entry while active is a no-op"
-		);
-		let leave = terminal.stage_alt_leave().expect("exit stages");
-		assert_eq!(
-			leave,
-			esc!(!mouse_sgr, !mouse_any_event, !mouse_vt200, kitty_keyboard_pop, !alt_screen)
-		);
-		assert!(terminal.stage_alt_leave().is_none(), "exit on the main screen is a no-op");
+				.expect("first entry stages");
+			assert_eq!(
+				enter.as_str(),
+				esc!(alt_screen, csi, ">5u", mouse_vt200, mouse_any_event, mouse_sgr)
+			);
+			assert!(
+				terminal
+					.stage_alt_enter(AltScreenUse::Interactive)
+					.is_none(),
+				"entry while active is a no-op"
+			);
+			let leave = terminal.stage_alt_leave().expect("exit stages");
+			assert_eq!(
+				leave,
+				esc!(!mouse_sgr, !mouse_any_event, !mouse_vt200, kitty_keyboard_pop, !alt_screen)
+			);
+			assert!(terminal.stage_alt_leave().is_none(), "exit on the main screen is a no-op");
 
-		// A resize borrow never touches mouse modes: motion reports would
-		// flood input mid-drag, and the exit stays symmetric.
-		let enter = terminal
-			.stage_alt_enter(AltScreenUse::Resize)
-			.expect("borrow stages");
-		assert_eq!(enter.as_str(), esc!(alt_screen, csi, ">5u"));
-		let leave = terminal.stage_alt_leave().expect("borrow exit stages");
-		assert_eq!(leave, esc!(kitty_keyboard_pop, !alt_screen));
+			// A resize borrow never touches mouse modes: motion reports would
+			// flood input mid-drag, and the exit stays symmetric.
+			let enter = terminal
+				.stage_alt_enter(AltScreenUse::Resize)
+				.expect("borrow stages");
+			assert_eq!(enter.as_str(), esc!(alt_screen, csi, ">5u"));
+			let leave = terminal.stage_alt_leave().expect("borrow exit stages");
+			assert_eq!(leave, esc!(kitty_keyboard_pop, !alt_screen));
 
-		// An overlay opening mid-drag upgrades the live borrow in place:
-		// mouse capture turns on without a buffer round-trip, and the
-		// upgraded exit turns it back off.
-		let _ = terminal
-			.stage_alt_enter(AltScreenUse::Resize)
-			.expect("borrow re-stages");
-		assert!(
-			terminal.stage_alt_enter(AltScreenUse::Resize).is_none(),
-			"borrow while active is a no-op"
-		);
-		let upgrade = terminal
-			.stage_alt_enter(AltScreenUse::Interactive)
-			.expect("mid-drag hold upgrades in place");
-		assert_eq!(upgrade.as_str(), esc!(mouse_vt200, mouse_any_event, mouse_sgr));
-		assert!(
-			terminal
+			// An overlay opening mid-drag upgrades the live borrow in place:
+			// mouse capture turns on without a buffer round-trip, and the
+			// upgraded exit turns it back off.
+			let _ = terminal
+				.stage_alt_enter(AltScreenUse::Resize)
+				.expect("borrow re-stages");
+			assert!(
+				terminal.stage_alt_enter(AltScreenUse::Resize).is_none(),
+				"borrow while active is a no-op"
+			);
+			let upgrade = terminal
 				.stage_alt_enter(AltScreenUse::Interactive)
-				.is_none(),
-			"an upgraded hold is already interactive"
-		);
-		let leave = terminal.stage_alt_leave().expect("upgraded exit stages");
-		assert_eq!(
-			leave,
-			esc!(!mouse_sgr, !mouse_any_event, !mouse_vt200, kitty_keyboard_pop, !alt_screen)
-		);
+				.expect("mid-drag hold upgrades in place");
+			assert_eq!(upgrade.as_str(), esc!(mouse_vt200, mouse_any_event, mouse_sgr));
+			assert!(
+				terminal
+					.stage_alt_enter(AltScreenUse::Interactive)
+					.is_none(),
+				"an upgraded hold is already interactive"
+			);
+			let leave = terminal.stage_alt_leave().expect("upgraded exit stages");
+			assert_eq!(
+				leave,
+				esc!(!mouse_sgr, !mouse_any_event, !mouse_vt200, kitty_keyboard_pop, !alt_screen)
+			);
 
-		// A session that owns the mouse inline never toggles tracking here.
-		terminal.keyboard = KeyboardMode::ModifyOtherKeys;
-		terminal.mouse = true;
-		assert_eq!(
-			terminal
-				.stage_alt_enter(AltScreenUse::Interactive)
-				.expect("re-entry stages")
-				.as_str(),
-			esc!(alt_screen)
-		);
-		assert_eq!(terminal.stage_alt_leave().expect("re-exit stages"), esc!(!alt_screen));
+			// A session that owns the mouse inline never toggles tracking here.
+			terminal.keyboard = KeyboardMode::ModifyOtherKeys;
+			terminal.mouse = true;
+			assert_eq!(
+				terminal
+					.stage_alt_enter(AltScreenUse::Interactive)
+					.expect("re-entry stages")
+					.as_str(),
+				esc!(alt_screen)
+			);
+			assert_eq!(terminal.stage_alt_leave().expect("re-exit stages"), esc!(!alt_screen));
 		});
 	}
 

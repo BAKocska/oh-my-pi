@@ -22,7 +22,7 @@ use omp_core::{
 };
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt},
-	inference::v1::{Value, ValueMap, value},
+	inference::v1::{ToolDef, Value, ValueMap, tool_def, value},
 	prost::Message,
 	thread::v1::{Blob, Part, part},
 	toolhost::v1::{
@@ -61,20 +61,19 @@ use crate::{
 	exthost::{
 		ActivationCause, ActivationEvent, ActivationTrigger, AvailabilityBatch, AvailabilitySink,
 		CallbackConcurrency, ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
-		ControlQuotaLedger, DeclarationSet, EventDeadline, ExtensionManifest,
-		GenerationFence, HostControlAuthorityFactory, LifecycleHost, RunningHost, RunningHostError,
-		ServiceBroker, ServiceCallId, ServiceConnection, ServiceKey, ServiceRequestMeta,
-		ServiceResponse, SpawnSpec, SpawnedHost, ToolDeclarationKey,
+		ControlQuotaLedger, DeclarationSet, EventDeadline, ExtensionManifest, GenerationFence,
+		HostControlAuthorityFactory, LifecycleHost, RunningHost, RunningHostError, ServiceBroker,
+		ServiceCallId, ServiceConnection, ServiceKey, ServiceRequestMeta, ServiceResponse, SpawnSpec,
+		SpawnedHost, ToolDeclarationKey,
 		control::{
 			ControlAuthoritySnapshot, ControlConnectionIdentity, ControlDispatch, ControlEffect,
 			ControlHandle, ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
-			ExternalJournalRequest,
-			JournalConnectionIdentity, JournalControl, JournalDispatch,
+			ExternalJournalRequest, JournalConnectionIdentity, JournalControl, JournalDispatch,
 		},
 		dispatch::CallbackDispatcher,
 		services::{
-			ServiceDispatch, ServiceDispatchBackend, ServiceMethodSchema, ServiceProviderDeclaration,
-			ServiceControlAuthorityFactory,
+			ServiceControlAuthorityFactory, ServiceDispatch, ServiceDispatchBackend,
+			ServiceMethodSchema, ServiceProviderDeclaration,
 		},
 	},
 	policy::{AuthorityTable, Grants},
@@ -279,11 +278,7 @@ impl ServiceDispatchBackend for ServiceRouter {
 		let (reply, response) = flume::bounded(1);
 		provider
 			.commands
-			.send_async(SupervisorCommand::ServiceDispatch {
-				request_id,
-				frame: wire,
-				reply,
-			})
+			.send_async(SupervisorCommand::ServiceDispatch { request_id, frame: wire, reply })
 			.await
 			.map_err(|_| sf!("service provider command channel closed"))?;
 		let result = tokio::time::timeout(deadline, response.recv_async())
@@ -291,8 +286,7 @@ impl ServiceDispatchBackend for ServiceRouter {
 			.map_err(|_| sf!("service call deadline elapsed"))?
 			.map_err(|_| sf!("service provider response channel closed"))?
 			.map_err(|error| Str::from(error.to_string()))?;
-		if result.caller_request_id != request_id
-			|| result.provider_generation != provider_generation
+		if result.caller_request_id != request_id || result.provider_generation != provider_generation
 		{
 			return Err(sf!("provider ServiceResult identity is stale"));
 		}
@@ -320,21 +314,21 @@ pub struct ExternalDomainControlFactories {
 	/// Audited trusted direct-filesystem owner.
 	pub direct_filesystem: Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Opaque credential and secret resolution owner.
-	pub credentials: Option<Arc<dyn ControlAuthorityFactory>>,
+	pub credentials:       Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Typed system-prompt contribution owner.
-	pub prompts:     Option<Arc<dyn ControlAuthorityFactory>>,
+	pub prompts:           Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Interactive UI compositor owner.
-	pub ui:          Option<Arc<dyn ControlAuthorityFactory>>,
+	pub ui:                Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Durable telemetry query/export owner.
-	pub telemetry:   Option<Arc<dyn ControlAuthorityFactory>>,
+	pub telemetry:         Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Verdict renderer and job-board owner.
-	pub verdicts:    Option<Arc<dyn ControlAuthorityFactory>>,
+	pub verdicts:          Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Inference provider mutation owner.
-	pub provider:    Option<Arc<dyn ControlAuthorityFactory>>,
+	pub provider:          Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Session/turn campaign owner.
-	pub campaigns:   Option<Arc<dyn ControlAuthorityFactory>>,
+	pub campaigns:         Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Inter-extension service broker owner.
-	pub services:    Option<Arc<dyn ControlAuthorityFactory>>,
+	pub services:          Option<Arc<dyn ControlAuthorityFactory>>,
 }
 
 struct DomainControlBinding {
@@ -353,10 +347,19 @@ impl DomainControlSlot {
 	}
 
 	pub(crate) fn snapshot(&self) -> Option<(u64, ExternalDomainControlFactories)> {
-		self.binding.lock().as_ref().map(|binding| (binding.id, binding.factories.clone()))
+		self
+			.binding
+			.lock()
+			.as_ref()
+			.map(|binding| (binding.id, binding.factories.clone()))
 	}
+
 	pub(crate) fn is_live(&self, id: u64) -> bool {
-		self.binding.lock().as_ref().is_some_and(|binding| binding.id == id)
+		self
+			.binding
+			.lock()
+			.as_ref()
+			.is_some_and(|binding| binding.id == id)
 	}
 
 	fn install(
@@ -379,7 +382,10 @@ pub struct ExternalDomainControlBinding {
 impl Drop for ExternalDomainControlBinding {
 	fn drop(&mut self) {
 		let mut binding = self.slot.binding.lock();
-		if binding.as_ref().is_some_and(|binding| binding.id == self.id) {
+		if binding
+			.as_ref()
+			.is_some_and(|binding| binding.id == self.id)
+		{
 			*binding = None;
 		}
 	}
@@ -395,8 +401,7 @@ pub struct ExternalControlAuthorityBinding {
 impl ExternalControlAuthorityBinding {
 	/// Keeps both component leases alive for the same replacement lifetime.
 	pub fn is_live(&self) -> bool {
-		self.agents.slot.is_live(self.agents.id)
-			&& self.domains.slot.is_live(self.domains.id)
+		self.agents.slot.is_live(self.agents.id) && self.domains.slot.is_live(self.domains.id)
 	}
 }
 
@@ -448,7 +453,7 @@ pub struct ExtHostConfig {
 	pub journal:            Option<JournalRuntime>,
 	/// Complete authority factory for dedicated JSON CONTROL connections.
 	control_authorities:    Option<Arc<HostControlAuthorityFactory>>,
-	registry_control:      Option<Arc<RegistryControlFactory>>,
+	registry_control:       Option<Arc<RegistryControlFactory>>,
 	/// Driver/app factories retained until the production router is composed.
 	domain_control:         Arc<DomainControlSlot>,
 	/// Late-bound, generation-fenced device availability destination.
@@ -512,16 +517,14 @@ impl ExtHostConfig {
 	pub fn bind_control_authorities(&mut self, factory: Arc<HostControlAuthorityFactory>) {
 		self.control_authorities = Some(factory);
 	}
+
 	pub(crate) fn bind_registry_control(&mut self, registry: Arc<RegistryControlFactory>) {
 		self.registry_control = Some(registry);
 	}
 
 	/// Installs driver/app-owned factories before production CONTROL
 	/// composition.
-	pub fn bind_domain_control_factories(
-		&mut self,
-		factories: ExternalDomainControlFactories,
-	) {
+	pub fn bind_domain_control_factories(&mut self, factories: ExternalDomainControlFactories) {
 		let slot = DomainControlSlot::new();
 		*slot.binding.lock() = Some(DomainControlBinding { id: 0, factories });
 		self.domain_control = slot;
@@ -1151,8 +1154,7 @@ fn missing_external_control_domains(
 	let declarations = manifest.static_declarations();
 	let mut missing = Vec::new();
 	let policy_declared = declarations.capability_grants.keys().any(|capability| {
-		capability.as_str().starts_with("policy")
-			|| capability.as_str().starts_with("approvals")
+		capability.as_str().starts_with("policy") || capability.as_str().starts_with("approvals")
 	});
 	if policy_declared && factories.policy.is_none() {
 		missing.push("policy");
@@ -1225,14 +1227,14 @@ struct PendingControlActivation {
 }
 
 struct FrozenControlLifecycleHost {
-	control:          ControlHandle,
-	extension:        Str,
-	session:          Str,
-	host_generation:  u64,
-	next_invocation:  u64,
-	identity:         Arc<ControlConnectionIdentity>,
-	manifest:         ExtensionManifest,
-	frozen_registry:  Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
+	control:         ControlHandle,
+	extension:       Str,
+	session:         Str,
+	host_generation: u64,
+	next_invocation: u64,
+	identity:        Arc<ControlConnectionIdentity>,
+	manifest:        ExtensionManifest,
+	frozen_registry: Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
 }
 
 impl FrozenControlLifecycleHost {
@@ -1243,9 +1245,7 @@ impl FrozenControlLifecycleHost {
 		host_generation: u64,
 		identity: Arc<ControlConnectionIdentity>,
 		manifest: ExtensionManifest,
-		frozen_registry: Arc<
-			Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>,
-		>,
+		frozen_registry: Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
 	) -> Self {
 		Self {
 			control,
@@ -1296,8 +1296,8 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 			operation: sf!("omp.lifecycle.freeze"),
 			arguments: serde_json::Map::new(),
 			authority: self.authority("freeze", InvocationPhase::Open, LifecyclePhase::Frozen),
-			policy: CallbackConcurrency::Serialized,
-			deadline: EventDeadline { at: std::time::Instant::now() + Duration::from_secs(10) },
+			policy:    CallbackConcurrency::Serialized,
+			deadline:  EventDeadline { at: std::time::Instant::now() + Duration::from_secs(10) },
 		};
 		async move {
 			let frozen = self
@@ -1760,6 +1760,7 @@ impl ExtHostSupervisor {
 		drop(binding);
 		AgentsControlAuthorityBinding { slot: Arc::clone(&self.agents_control), id }
 	}
+
 	/// Atomically installs every driver/app CONTROL owner for this session.
 	pub fn bind_domain_control_factories(
 		&self,
@@ -1767,6 +1768,7 @@ impl ExtHostSupervisor {
 	) -> ExternalDomainControlBinding {
 		self.domain_control.install(factories)
 	}
+
 	/// Atomically replaces Agents and every driver/app CONTROL domain.
 	pub fn bind_external_control_authorities(
 		&self,
@@ -1783,13 +1785,13 @@ impl ExtHostSupervisor {
 		drop(domains_binding);
 		drop(agents_binding);
 		ExternalControlAuthorityBinding {
-			agents: AgentsControlAuthorityBinding {
+			agents:  AgentsControlAuthorityBinding {
 				slot: Arc::clone(&self.agents_control),
-				id: agents_id,
+				id:   agents_id,
 			},
 			domains: ExternalDomainControlBinding {
 				slot: Arc::clone(&self.domain_control),
-				id: domains_id,
+				id:   domains_id,
 			},
 		}
 	}
@@ -1827,7 +1829,8 @@ impl ExtHostSupervisor {
 		&self,
 		identity: &ControlConnectionIdentity,
 	) -> Option<ExtensionManifest> {
-		self.control_activations
+		self
+			.control_activations
 			.iter()
 			.find(|activation| {
 				activation.identity.extension == identity.extension
@@ -1842,6 +1845,7 @@ impl ExtHostSupervisor {
 			})
 			.map(|activation| activation.manifest.clone())
 	}
+
 	/// Returns the full frozen runtime declaration projection for an exact
 	/// authenticated connection generation.
 	pub fn sealed_registry_evidence(
@@ -2533,11 +2537,11 @@ struct RegisteredHook(Str, Str);
 #[derive(Deserialize)]
 struct RegisteredRegistrySnapshot {
 	#[serde(default)]
-	tools:    Vec<RegisteredTool>,
+	tools:     Vec<RegisteredTool>,
 	#[serde(default)]
-	hooks:    Vec<RegisteredHook>,
+	hooks:     Vec<RegisteredHook>,
 	#[serde(default)]
-	services: Vec<RegisteredService>,
+	services:  Vec<RegisteredService>,
 	#[serde(default)]
 	providers: Vec<serde_json::Value>,
 	#[serde(default)]
@@ -2588,13 +2592,11 @@ pub struct SealedRegistryEvidence {
 	/// Full frozen runtime campaign declaration documents.
 	pub campaigns:  Arc<[serde_json::Value]>,
 }
-type CampaignEvidenceLookup = dyn Fn(
-		&ControlConnectionIdentity,
-	) -> Option<Arc<SealedRegistryEvidence>>
-	+ Send
-	+ Sync;
+type CampaignEvidenceLookup =
+	dyn Fn(&ControlConnectionIdentity) -> Option<Arc<SealedRegistryEvidence>> + Send + Sync;
 
-/// Resolves executable extension campaigns only from exact-generation FREEZE evidence.
+/// Resolves executable extension campaigns only from exact-generation FREEZE
+/// evidence.
 pub struct ExtensionCampaignResolver {
 	callbacks: Arc<dyn CallbackDispatcher>,
 	evidence:  Arc<CampaignEvidenceLookup>,
@@ -2619,7 +2621,8 @@ impl ExtensionCampaignResolver {
 		})
 	}
 
-	/// Resolves one declaration and constructs its exact-generation callback machine.
+	/// Resolves one declaration and constructs its exact-generation callback
+	/// machine.
 	pub fn resolve(
 		&self,
 		identity: &ControlConnectionIdentity,
@@ -2712,9 +2715,9 @@ struct FrozenCampaignDeclaration {
 
 impl FrozenCampaignDeclaration {
 	fn parse(document: &serde_json::Value) -> Result<Self, ControlProtocolError> {
-		let object = document.as_object().ok_or_else(|| {
-			frozen_declaration_error("sealed campaign manifest must be an object")
-		})?;
+		let object = document
+			.as_object()
+			.ok_or_else(|| frozen_declaration_error("sealed campaign manifest must be an object"))?;
 		let text = |name: &str| {
 			object
 				.get(name)
@@ -2785,7 +2788,9 @@ impl FrozenCampaignDeclaration {
 			});
 		}
 		let family_rev = match (
-			object.get("state_family").and_then(serde_json::Value::as_str),
+			object
+				.get("state_family")
+				.and_then(serde_json::Value::as_str),
 			object.get("state_rev").and_then(serde_json::Value::as_u64),
 		) {
 			(Some(family), Some(state_rev)) if !family.is_empty() && state_rev > 0 => {
@@ -2804,38 +2809,27 @@ impl FrozenCampaignDeclaration {
 				omp_agent::ExhaustPolicy::Settle
 			},
 			Some(serde_json::Value::String(value)) if value == "fault" => {
-				omp_agent::ExhaustPolicy::Fault {
-					detail: sf!("extension campaign {id} exhausted"),
-				}
+				omp_agent::ExhaustPolicy::Fault { detail: sf!("extension campaign {id} exhausted") }
 			},
 			_ => return Err(frozen_declaration_error("campaign exhaust policy is unsupported")),
 		};
-		Ok(Self {
-			id,
-			rev,
-			points,
-			scope,
-			family_rev,
-			on_failure,
-			claims: claims.into(),
-			exhaust,
-		})
+		Ok(Self { id, rev, points, scope, family_rev, on_failure, claims: claims.into(), exhaust })
 	}
 
 	fn spec(&self, _extension: &str) -> Result<omp_agent::CampaignSpec, ControlProtocolError> {
 		Ok(omp_agent::CampaignSpec {
-			id: self.id.clone(),
-			points: self.points,
+			id:         self.id.clone(),
+			points:     self.points,
 			precedence: 0,
-			ladder: None,
-			exhaust: self.exhaust.clone(),
-			scope: self.scope,
+			ladder:     None,
+			exhaust:    self.exhaust.clone(),
+			scope:      self.scope,
 			family_rev: self.family_rev.clone(),
-			when: None,
-			members: Arc::from([]),
-			claims: Arc::clone(&self.claims),
-			binds: Arc::from([]),
-			dwell_ms: None,
+			when:       None,
+			members:    Arc::from([]),
+			claims:     Arc::clone(&self.claims),
+			binds:      Arc::from([]),
+			dwell_ms:   None,
 		})
 	}
 }
@@ -2877,18 +2871,11 @@ impl ExtensionCampaignMachine {
 	}
 
 	fn bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
-		let encoded = value
-			.as_object()?
-			.get("$bytes")?
-			.as_str()?;
+		let encoded = value.as_object()?.get("$bytes")?.as_str()?;
 		omp_core::base64::decode(encoded).into_vec().ok()
 	}
 
-	fn verdict(
-		&self,
-		name: &str,
-		payload: &serde_json::Value,
-	) -> Result<omp_agent::Verdict, Str> {
+	fn verdict(&self, name: &str, payload: &serde_json::Value) -> Result<omp_agent::Verdict, Str> {
 		let text = |name: &str| {
 			payload
 				.get(name)
@@ -2936,11 +2923,9 @@ impl ExtensionCampaignMachine {
 				let patch = payload
 					.get("patch")
 					.ok_or_else(|| sf!("campaign patch omitted payload"))?;
-				Ok(omp_agent::Verdict::Patch(omp_agent::ContextPatch(
-					bytes::Bytes::from(serde_json::to_vec(patch).map_err(|error| {
-						Str::from(error.to_string())
-					})?),
-				)))
+				Ok(omp_agent::Verdict::Patch(omp_agent::ContextPatch(bytes::Bytes::from(
+					serde_json::to_vec(patch).map_err(|error| Str::from(error.to_string()))?,
+				))))
 			},
 			other => Err(sf!("unsupported extension campaign verdict {other}")),
 		}
@@ -2965,14 +2950,9 @@ impl omp_agent::CampaignMachine for ExtensionCampaignMachine {
 			Err(error) => return self.failed(error.to_string()),
 		};
 		let mut arguments = serde_json::Map::new();
-		arguments.insert(
-			"campaign".to_owned(),
-			serde_json::Value::String(self.campaign.to_string()),
-		);
-		arguments.insert(
-			"point".to_owned(),
-			serde_json::Value::String(Self::point_name(point).to_owned()),
-		);
+		arguments.insert("campaign".to_owned(), serde_json::Value::String(self.campaign.to_string()));
+		arguments
+			.insert("point".to_owned(), serde_json::Value::String(Self::point_name(point).to_owned()));
 		arguments.insert(
 			"event_payload".to_owned(),
 			serde_json::json!({"$bytes": omp_core::base64::encode(&event)}),
@@ -2988,48 +2968,46 @@ impl omp_agent::CampaignMachine for ExtensionCampaignMachine {
 		arguments.insert("campaign_rev".to_owned(), self.campaign_rev.into());
 		arguments.insert("event_rev".to_owned(), 1.into());
 		arguments.insert("host_generation".to_owned(), self.identity.host_generation.into());
-		arguments.insert(
-			"session_generation".to_owned(),
-			self.identity.session_generation.into(),
-		);
+		arguments.insert("session_generation".to_owned(), self.identity.session_generation.into());
 		let dispatch = ControlDispatch {
 			operation: sf!("omp.campaigns.react"),
 			arguments,
 			authority: ControlInvocationAuthority {
-				invocation: sf!(
+				invocation:        sf!(
 					"campaign:{}:{}:{}",
 					self.identity.extension,
 					self.identity.host_generation,
 					self.engagement
 				),
-				phase: InvocationPhase::EffectsAuthorized,
-				session: self.session.clone(),
-				turn: None,
-				event: Some(sf!(Self::point_name(point))),
-				call: context.invocation_id.map(Str::from),
-				device: None,
-				effects: Box::new([]),
-				place_kind: sf!("host"),
-				lifecycle: LifecyclePhase::Active,
-				roots: Box::new([]),
-				remote: false,
-				has_ui: false,
-				headless: true,
-				settings: serde_json::Map::new(),
-				secret_settings: Box::new([]),
-				data: None,
+				phase:             InvocationPhase::EffectsAuthorized,
+				session:           self.session.clone(),
+				turn:              None,
+				event:             Some(sf!(Self::point_name(point))),
+				call:              context.invocation_id.map(Str::from),
+				device:            None,
+				effects:           Box::new([]),
+				place_kind:        sf!("host"),
+				lifecycle:         LifecyclePhase::Active,
+				roots:             Box::new([]),
+				remote:            false,
+				has_ui:            false,
+				headless:          true,
+				settings:          serde_json::Map::new(),
+				secret_settings:   Box::new([]),
+				data:              None,
 				direct_filesystem: None,
 			},
 			policy: CallbackConcurrency::Serialized,
 			deadline: EventDeadline {
-				at: std::time::Instant::now()
-					+ crate::exthost::dispatch::CAMPAIGN_SUBMISSION_TIMEOUT,
+				at: std::time::Instant::now() + crate::exthost::dispatch::CAMPAIGN_SUBMISSION_TIMEOUT,
 			},
 		};
 		let Some(runtime) = self.runtime.clone() else {
 			return self.failed("campaign callback runtime is unavailable");
 		};
-		let callback = self.callbacks.dispatch(Arc::clone(&self.identity), dispatch);
+		let callback = self
+			.callbacks
+			.dispatch(Arc::clone(&self.identity), dispatch);
 		let result = if tokio::runtime::Handle::try_current().is_ok() {
 			tokio::task::block_in_place(|| runtime.block_on(callback))
 		} else {
@@ -3042,9 +3020,13 @@ impl omp_agent::CampaignMachine for ExtensionCampaignMachine {
 		let Some(object) = result.as_object() else {
 			return self.failed("campaign callback returned a non-object");
 		};
-		if object.get("campaign_rev").and_then(serde_json::Value::as_u64)
+		if object
+			.get("campaign_rev")
+			.and_then(serde_json::Value::as_u64)
 			!= Some(u64::from(self.campaign_rev))
-			|| object.get("engagement_id").and_then(serde_json::Value::as_str)
+			|| object
+				.get("engagement_id")
+				.and_then(serde_json::Value::as_str)
 				!= Some(self.engagement.as_str())
 		{
 			return self.failed("campaign callback returned stale correlation");
@@ -3115,26 +3097,30 @@ fn seal_frozen_control_evidence(
 	manifest: &ExtensionManifest,
 	payload: serde_json::Value,
 ) -> Result<SealedRegistryEvidence, ControlProtocolError> {
-	let root = payload.as_object().ok_or_else(|| {
-		frozen_declaration_error("FREEZE acknowledgment must be an object")
-	})?;
+	let root = payload
+		.as_object()
+		.ok_or_else(|| frozen_declaration_error("FREEZE acknowledgment must be an object"))?;
 	let campaigns = root
 		.get("campaigns")
 		.and_then(serde_json::Value::as_object)
 		.ok_or_else(|| {
 			frozen_declaration_error("FREEZE acknowledgment omitted the sealed campaign table")
 		})?;
-	if campaigns.get("generation").and_then(serde_json::Value::as_u64)
+	if campaigns
+		.get("generation")
+		.and_then(serde_json::Value::as_u64)
 		!= Some(identity.host_generation)
 	{
 		return Err(frozen_declaration_error(
 			"sealed campaign table belongs to another host generation",
 		));
 	}
-	if campaigns.get("table_rev").and_then(serde_json::Value::as_u64) != Some(1) {
-		return Err(frozen_declaration_error(
-			"sealed campaign table has an unsupported revision",
-		));
+	if campaigns
+		.get("table_rev")
+		.and_then(serde_json::Value::as_u64)
+		!= Some(1)
+	{
+		return Err(frozen_declaration_error("sealed campaign table has an unsupported revision"));
 	}
 	const POINT_TABLE: [&str; 9] = [
 		"context",
@@ -3173,8 +3159,7 @@ fn seal_frozen_control_evidence(
 						.all(|(actual, expected)| actual.as_str() == Some(*expected))
 			})
 	};
-	if !table_matches("point_table", &POINT_TABLE)
-		|| !table_matches("verdict_table", &VERDICT_TABLE)
+	if !table_matches("point_table", &POINT_TABLE) || !table_matches("verdict_table", &VERDICT_TABLE)
 	{
 		return Err(frozen_declaration_error(
 			"sealed campaign vocabulary differs from the host protocol",
@@ -3206,8 +3191,7 @@ fn seal_frozen_control_evidence(
 		.iter()
 		.map(|declaration| declaration.id.as_str())
 		.collect::<BTreeSet<_>>();
-	if runtime_campaign_ids != declared_campaign_ids
-		|| runtime_provider_ids != declared_provider_ids
+	if runtime_campaign_ids != declared_campaign_ids || runtime_provider_ids != declared_provider_ids
 	{
 		return Err(frozen_declaration_error(
 			"FREEZE declarations differ from the authenticated manifest",
@@ -3306,7 +3290,8 @@ pub fn seal_registry_evidence(
 		.collect::<BTreeSet<_>>();
 	let runtime_provider_ids = sealed_document_ids(&snapshot.providers)?;
 	let runtime_campaign_ids = sealed_document_ids(&snapshot.campaigns)?;
-	if declared_provider_ids != runtime_provider_ids || declared_campaign_ids != runtime_campaign_ids {
+	if declared_provider_ids != runtime_provider_ids || declared_campaign_ids != runtime_campaign_ids
+	{
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	let modules = std::iter::once(manifest.entry.as_str())
@@ -3320,28 +3305,28 @@ pub fn seal_registry_evidence(
 		return Err(SealedRegistryEvidenceError::SourceModule);
 	}
 	Ok(SealedRegistryEvidence {
-		identity: Arc::clone(identity),
-		session: None,
+		identity:   Arc::clone(identity),
+		session:    None,
 		provenance: manifest.provenance.clone(),
-		tools: snapshot
+		tools:      snapshot
 			.tools
 			.into_iter()
 			.map(|tool| SealedToolRegistration {
-				name: tool.name,
-				family: tool.family,
-				rev: tool.rev,
-				kind: tool.kind,
-				place: tool.place,
+				name:          tool.name,
+				family:        tool.family,
+				rev:           tool.rev,
+				kind:          tool.kind,
+				place:         tool.place,
 				source_module: tool.source_module,
 			})
 			.collect(),
-		hooks: snapshot
+		hooks:      snapshot
 			.hooks
 			.into_iter()
 			.map(|hook| SealedHookRegistration { event: hook.0, phase: hook.1 })
 			.collect(),
-		providers: snapshot.providers.into(),
-		campaigns: snapshot.campaigns.into(),
+		providers:  snapshot.providers.into(),
+		campaigns:  snapshot.campaigns.into(),
 	})
 }
 
@@ -5184,7 +5169,12 @@ fn validate_registrations(tools: &[ToolDecl]) -> Result<(), WorkerError> {
 				"registered tool name and revision must be nonempty",
 			)));
 		}
-		if serde_json::from_slice::<serde_json::Value>(&definition.schema_json).is_err() {
+		let Some(tool_def::Input::JsonSchema(json_schema)) = definition.input.as_ref() else {
+			return Err(WorkerError::Protocol(sf!(
+				"worker registered tool definition without a JSON Schema input",
+			)));
+		};
+		if serde_json::from_slice::<serde_json::Value>(&json_schema.schema_json).is_err() {
 			return Err(WorkerError::Protocol(Str::from(format!(
 				"worker registered invalid JSON Schema for {}",
 				definition.name
@@ -6206,11 +6196,13 @@ fn load_tools(
 				};
 				tools.push(PythonTool {
 					decl: ToolDecl {
-						definition: Some(omp_proto::inference::v1::ToolDef {
+						definition: Some(ToolDef {
 							name,
 							description: row.getattr("description")?.extract()?,
-							schema_json,
-							strict: row.getattr("strict")?.extract()?,
+							input: Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
+								schema_json,
+								strict: row.getattr("strict")?.extract()?,
+							})),
 						}),
 						rev,
 						constraint: None,
@@ -6309,11 +6301,13 @@ fn load_prelude(engine: &omp_py::Engine, _modules: &[Str]) -> Result<Vec<PythonT
 				let rev: u16 = definition.getattr(intern!(py, "rev"))?.extract()?;
 				tools.push(PythonTool {
 					decl:    ToolDecl {
-						definition: Some(omp_proto::inference::v1::ToolDef {
-							name: name.to_str()?.to_owned(),
+						definition: Some(ToolDef {
+							name:        name.to_str()?.to_owned(),
 							description: summary.clone(),
-							schema_json,
-							strict: Some(true),
+							input:       Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
+								schema_json,
+								strict: Some(true),
+							})),
 						}),
 						rev: format!("prelude.{rev}"),
 						extension_id: definition
@@ -6887,7 +6881,10 @@ async def worker_prelude_round_trip(patches, *, strategy: str = "sequential"):
 		let definition = decl.definition.as_ref().expect("prelude tool definition");
 		assert_eq!(definition.name, "worker_prelude_round_trip");
 		assert_eq!(definition.description, "Merge patches for the worker prelude contract.");
-		assert_eq!(definition.strict, Some(true));
+		let Some(tool_def::Input::JsonSchema(json_schema)) = definition.input.as_ref() else {
+			panic!("prelude helper uses JSON Schema input");
+		};
+		assert_eq!(json_schema.strict, Some(true));
 		assert_eq!(decl.rev, "prelude.1");
 		assert_eq!(decl.extension_id, "worker_prelude_contract");
 		assert_eq!(decl.summary, "Merge patches for the worker prelude contract.");
@@ -6907,7 +6904,7 @@ async def worker_prelude_round_trip(patches, *, strategy: str = "sequential"):
 		);
 		assert_eq!(decl.prelude_params[1].annotation.as_deref(), Some("str"));
 		let schema: serde_json::Value =
-			serde_json::from_slice(&definition.schema_json).expect("valid helper schema");
+			serde_json::from_slice(&json_schema.schema_json).expect("valid helper schema");
 		assert_eq!(
 			schema,
 			serde_json::json!({

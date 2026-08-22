@@ -31,11 +31,11 @@ use super::{
 };
 use crate::{
 	policy::{
-		PolicyAuditSink, PolicyControlFailure, PolicyControlOwner, SandboxPolicyRuntime,
-		InstalledSandboxProfile, PolicyScope, SandboxCapabilities, SandboxEnforcement,
-		SandboxMode, SandboxProfile,
+		InstalledSandboxProfile, PolicyAuditSink, PolicyControlFailure, PolicyControlOwner,
+		PolicyScope, SandboxCapabilities, SandboxEnforcement, SandboxMode, SandboxPolicyRuntime,
+		SandboxProfile,
 	},
-	worker_pool::{WorkerControlOwner, WorkerSupervisor, WorkerProcessAuthority},
+	worker_pool::{WorkerControlOwner, WorkerProcessAuthority, WorkerSupervisor},
 };
 
 /// Returns the sandbox facilities envd can truthfully advertise before a
@@ -45,13 +45,13 @@ use crate::{
 /// claiming facilities from the operating-system name alone.
 pub fn detected_sandbox_capabilities() -> SandboxCapabilities {
 	SandboxCapabilities {
-		backends: Vec::new(),
-		landlock_abi: None,
-		filesystem: false,
-		network: false,
+		backends:         Vec::new(),
+		landlock_abi:     None,
+		filesystem:       false,
+		network:          false,
 		domain_filtering: false,
-		resource_limits: false,
-		degraded: vec![Str::new_static(
+		resource_limits:  false,
+		degraded:         vec![Str::new_static(
 			"native sandbox enforcement is not installed by this envd process",
 		)],
 	}
@@ -126,6 +126,7 @@ impl AdmissionSandboxRuntime {
 			}
 		}
 	}
+
 	/// Expires contributions at the authoritative call/turn/session boundary.
 	pub fn expire_scope(&self, session: &str, scope: PolicyScope) {
 		let mut sessions = self.sessions.lock();
@@ -166,8 +167,7 @@ impl AdmissionSandboxRuntime {
 		if profile.mode == SandboxMode::Enforce
 			&& (!self.capabilities.filesystem
 				|| (!self.capabilities.network && profile.network.mode != "open")
-				|| (!self.capabilities.resource_limits
-					&& profile.resources != Default::default()))
+				|| (!self.capabilities.resource_limits && profile.resources != Default::default()))
 		{
 			return Err(PolicyControlFailure::EnforcementUnavailable(Str::new_static(
 				"active sandbox facilities cannot enforce the requested profile",
@@ -213,17 +213,14 @@ fn profile_narrows(narrow: &SandboxProfile, broad: &SandboxProfile) -> bool {
 		&& effect_narrows(
 			narrow.filesystem.read_default.as_str(),
 			broad.filesystem.read_default.as_str(),
-		)
-		&& effect_narrows(
-			narrow.filesystem.write_default.as_str(),
-			broad.filesystem.write_default.as_str(),
-		)
-		&& effect_narrows(
-			narrow.filesystem.exec_default.as_str(),
-			broad.filesystem.exec_default.as_str(),
-		)
-		&& (broad.filesystem.read_default == "allow"
-			|| subset(&narrow.filesystem.allow_read, &broad.filesystem.allow_read))
+		) && effect_narrows(
+		narrow.filesystem.write_default.as_str(),
+		broad.filesystem.write_default.as_str(),
+	) && effect_narrows(
+		narrow.filesystem.exec_default.as_str(),
+		broad.filesystem.exec_default.as_str(),
+	) && (broad.filesystem.read_default == "allow"
+		|| subset(&narrow.filesystem.allow_read, &broad.filesystem.allow_read))
 		&& (broad.filesystem.write_default == "allow"
 			|| subset(&narrow.filesystem.allow_write, &broad.filesystem.allow_write))
 		&& (broad.filesystem.exec_default == "allow"
@@ -231,8 +228,7 @@ fn profile_narrows(narrow: &SandboxProfile, broad: &SandboxProfile) -> bool {
 		&& superset(&narrow.filesystem.deny_read, &broad.filesystem.deny_read)
 		&& superset(&narrow.filesystem.deny_write, &broad.filesystem.deny_write)
 		&& superset(&narrow.filesystem.deny_exec, &broad.filesystem.deny_exec)
-		&& (broad.filesystem.tmpdir.is_none()
-			|| narrow.filesystem.tmpdir == broad.filesystem.tmpdir)
+		&& (broad.filesystem.tmpdir.is_none() || narrow.filesystem.tmpdir == broad.filesystem.tmpdir)
 		&& (!narrow.filesystem.follow_symlinks || broad.filesystem.follow_symlinks)
 		&& network(narrow.network.mode.as_str()) >= network(broad.network.mode.as_str())
 		&& (broad.network.mode == "open"
@@ -241,10 +237,7 @@ fn profile_narrows(narrow: &SandboxProfile, broad: &SandboxProfile) -> bool {
 		&& (broad.network.mode == "open"
 			|| subset(&narrow.network.allow_ports, &broad.network.allow_ports))
 		&& (!narrow.network.allow_localhost || broad.network.allow_localhost)
-		&& subset(
-			&narrow.network.allow_unix_sockets,
-			&broad.network.allow_unix_sockets,
-		)
+		&& subset(&narrow.network.allow_unix_sockets, &broad.network.allow_unix_sockets)
 		&& subset(&narrow.network.allow_mach_lookup, &broad.network.allow_mach_lookup)
 		&& effect_narrows(narrow.exec.default.as_str(), broad.exec.default.as_str())
 		&& (broad.exec.default == "allow" || subset(&narrow.exec.allow, &broad.exec.allow))
@@ -282,10 +275,7 @@ impl SandboxPolicyRuntime for AdmissionSandboxRuntime {
 			.ok_or(PolicyControlFailure::UnknownHandle)
 	}
 
-	async fn enforcement(
-		&self,
-		session: &str,
-	) -> Result<SandboxEnforcement, PolicyControlFailure> {
+	async fn enforcement(&self, session: &str) -> Result<SandboxEnforcement, PolicyControlFailure> {
 		self
 			.sessions
 			.lock()
@@ -309,10 +299,7 @@ impl SandboxPolicyRuntime for AdmissionSandboxRuntime {
 		if !profile_narrows(&profile, &session_state.effective) {
 			return Err(PolicyControlFailure::ProfileWidened);
 		}
-		let handle = Str::from(format!(
-			"sandbox-{}",
-			Ulid::generate()
-		));
+		let handle = Str::from(format!("sandbox-{}", Ulid::generate()));
 		session_state.contributions.push(SandboxContribution {
 			handle: handle.clone(),
 			owner: Str::from(owner),
@@ -320,7 +307,10 @@ impl SandboxPolicyRuntime for AdmissionSandboxRuntime {
 			scope,
 		});
 		session_state.effective = profile.clone();
-		self.handles.lock().insert(handle.clone(), Str::from(session));
+		self
+			.handles
+			.lock()
+			.insert(handle.clone(), Str::from(session));
 		Ok(InstalledSandboxProfile { handle_id: handle, profile })
 	}
 
@@ -338,9 +328,7 @@ impl SandboxPolicyRuntime for AdmissionSandboxRuntime {
 		let index = session
 			.contributions
 			.iter()
-			.position(|contribution| {
-				contribution.handle == handle_id && contribution.owner == owner
-			})
+			.position(|contribution| contribution.handle == handle_id && contribution.owner == owner)
 			.ok_or(PolicyControlFailure::UnknownHandle)?;
 		session.contributions.remove(index);
 		session.effective = session
@@ -453,14 +441,17 @@ fn pulled_json(pulled: omp_tool::Pulled) -> Result<Value, ParameterAuthorityErro
 		PulledKind::Complete(value) => value
 			.deserialize_into::<Value>()
 			.map_err(parameter_source_error)?,
-		PulledKind::Started(kind) => Value::String(match kind {
-			omp_tool::PulledValueKind::Null => "null",
-			omp_tool::PulledValueKind::Boolean => "boolean",
-			omp_tool::PulledValueKind::Number => "number",
-			omp_tool::PulledValueKind::String => "string",
-			omp_tool::PulledValueKind::Array => "array",
-			omp_tool::PulledValueKind::Object => "object",
-		}.to_owned()),
+		PulledKind::Started(kind) => Value::String(
+			match kind {
+				omp_tool::PulledValueKind::Null => "null",
+				omp_tool::PulledValueKind::Boolean => "boolean",
+				omp_tool::PulledValueKind::Number => "number",
+				omp_tool::PulledValueKind::String => "string",
+				omp_tool::PulledValueKind::Array => "array",
+				omp_tool::PulledValueKind::Object => "object",
+			}
+			.to_owned(),
+		),
 		PulledKind::Chunk { value, complete } => json!({"text": value, "complete": complete}),
 	};
 	Ok(json!({
@@ -508,9 +499,7 @@ async fn run_parameter_pull(
 			let mut path = parameter_path(&request.path);
 			if request.operation == ParameterOperation::ArrayNext {
 				path.push(ArgPath::Index(request.index.ok_or_else(|| {
-					ParameterAuthorityError::Invalid(Str::new_static(
-						"array_next requires index",
-					))
+					ParameterAuthorityError::Invalid(Str::new_static("array_next requires index"))
 				})?));
 			}
 			let pulled = {
@@ -595,7 +584,7 @@ impl ParameterSource for LiveParameterSource {
 
 /// Durable JSON-lines policy audit used immediately before approval mutation.
 pub struct DurablePolicyAuditSink {
-	path: PathBuf,
+	path:   PathBuf,
 	append: tokio::sync::Mutex<()>,
 }
 
@@ -614,29 +603,29 @@ impl PolicyAuditSink for DurablePolicyAuditSink {
 	) -> Result<(), PolicyControlFailure> {
 		#[derive(Serialize)]
 		struct Record<'a> {
-			kind: &'static str,
-			ts_ms: u64,
-			ticket_id: &'a Str,
+			kind:          &'static str,
+			ts_ms:         u64,
+			ticket_id:     &'a Str,
 			invocation_id: &'a Option<Str>,
-			state: &'static str,
-			decision: Option<Decision<'a>>,
+			state:         &'static str,
+			decision:      Option<Decision<'a>>,
 		}
 		#[derive(Serialize)]
 		struct Decision<'a> {
-			approved: bool,
-			scope: &'a Str,
-			source: &'static str,
+			approved:   bool,
+			scope:      &'a Str,
+			source:     &'static str,
 			decided_by: &'a Option<Str>,
-			reason: &'a Option<Str>,
-			audited: bool,
+			reason:     &'a Option<Str>,
+			audited:    bool,
 		}
 		let decision = ticket.decision.as_ref().map(|decision| Decision {
-			approved: decision.approved,
-			scope: &decision.scope,
-			source: decision.source.into(),
+			approved:   decision.approved,
+			scope:      &decision.scope,
+			source:     decision.source.into(),
 			decided_by: &decision.decided_by,
-			reason: &decision.reason,
-			audited: decision.audited,
+			reason:     &decision.reason,
+			audited:    decision.audited,
 		});
 		let record = Record {
 			kind: "approval_decided",
@@ -655,7 +644,7 @@ impl PolicyAuditSink for DurablePolicyAuditSink {
 /// Provenance-stamped durable journal for the exceptional direct-filesystem
 /// escape. Each append is flushed before the executor is called.
 pub struct DurableDirectFilesystemJournal {
-	path: PathBuf,
+	path:   PathBuf,
 	append: tokio::sync::Mutex<()>,
 }
 
@@ -675,43 +664,46 @@ impl DirectFilesystemJournal for DurableDirectFilesystemJournal {
 	) -> Result<Str, DirectFilesystemAuthorityError> {
 		#[derive(Serialize)]
 		struct Record<'a> {
-			kind: &'static str,
-			receipt: &'a str,
-			ts_ms: u64,
-			request_id: u64,
-			extension: &'a str,
-			artifact_digest: &'a str,
-			host_generation: u64,
+			kind:               &'static str,
+			receipt:            &'a str,
+			ts_ms:              u64,
+			request_id:         u64,
+			extension:          &'a str,
+			artifact_digest:    &'a str,
+			host_generation:    u64,
 			session_generation: u64,
-			invocation: Option<&'a str>,
-			operation: &'a str,
-			path: &'a Path,
-			payload_bytes: usize,
-			payload_digest: String,
-			grant_id: &'a str,
-			publisher: &'a str,
-			capability_digest: &'a str,
-			grant_generation: u64,
+			invocation:         Option<&'a str>,
+			operation:          &'a str,
+			path:               &'a Path,
+			payload_bytes:      usize,
+			payload_digest:     String,
+			grant_id:           &'a str,
+			publisher:          &'a str,
+			capability_digest:  &'a str,
+			grant_generation:   u64,
 		}
 		let receipt = Ulid::generate().to_string();
 		let record = Record {
-			kind: "direct_filesystem_request",
-			receipt: &receipt,
-			ts_ms: now_ms(),
-			request_id: context.request_id,
-			extension: context.connection.extension.as_str(),
-			artifact_digest: context.connection.artifact_digest.as_str(),
-			host_generation: context.connection.host_generation,
+			kind:               "direct_filesystem_request",
+			receipt:            &receipt,
+			ts_ms:              now_ms(),
+			request_id:         context.request_id,
+			extension:          context.connection.extension.as_str(),
+			artifact_digest:    context.connection.artifact_digest.as_str(),
+			host_generation:    context.connection.host_generation,
 			session_generation: context.connection.session_generation,
-			invocation: context.invocation.as_ref().map(|value| value.invocation.as_str()),
-			operation: request.operation.as_str(),
-			path: &request.path,
-			payload_bytes: request.data.len(),
-			payload_digest: blake3::hash(&request.data).to_hex().to_string(),
-			grant_id: request.grant.grant_id.as_str(),
-			publisher: request.grant.publisher.as_str(),
-			capability_digest: request.grant.capability_digest.as_str(),
-			grant_generation: request.grant.generation,
+			invocation:         context
+				.invocation
+				.as_ref()
+				.map(|value| value.invocation.as_str()),
+			operation:          request.operation.as_str(),
+			path:               &request.path,
+			payload_bytes:      request.data.len(),
+			payload_digest:     blake3::hash(&request.data).to_hex().to_string(),
+			grant_id:           request.grant.grant_id.as_str(),
+			publisher:          request.grant.publisher.as_str(),
+			capability_digest:  request.grant.capability_digest.as_str(),
+			grant_generation:   request.grant.generation,
 		};
 		append_json_line(&self.path, &self.append, &record)
 			.await
@@ -762,12 +754,13 @@ impl DirectFilesystemExecutor for HostDirectFilesystemExecutor {
 async fn execute_filesystem(
 	request: AuditedDirectFilesystemRequest,
 ) -> Result<DirectFilesystemOutput, DirectFilesystemAuthorityError> {
-	let failure = |error: std::io::Error| {
-		DirectFilesystemAuthorityError::Execute(Str::from(error.to_string()))
-	};
+	let failure =
+		|error: std::io::Error| DirectFilesystemAuthorityError::Execute(Str::from(error.to_string()));
 	match request.operation.as_str() {
 		"read" => {
-			let file = tokio::fs::File::open(&request.path).await.map_err(failure)?;
+			let file = tokio::fs::File::open(&request.path)
+				.await
+				.map_err(failure)?;
 			let size = file.metadata().await.map_err(failure)?.len();
 			if size > MAX_DIRECT_FILESYSTEM_BYTES as u64 {
 				return Err(DirectFilesystemAuthorityError::Execute(Str::new_static(
@@ -775,8 +768,11 @@ async fn execute_filesystem(
 				)));
 			}
 			let mut bytes = Vec::with_capacity(size as usize);
-			file.take((MAX_DIRECT_FILESYSTEM_BYTES + 1) as u64)
-				.read_to_end(&mut bytes).await.map_err(failure)?;
+			file
+				.take((MAX_DIRECT_FILESYSTEM_BYTES + 1) as u64)
+				.read_to_end(&mut bytes)
+				.await
+				.map_err(failure)?;
 			if bytes.len() > MAX_DIRECT_FILESYSTEM_BYTES {
 				return Err(DirectFilesystemAuthorityError::Execute(Str::new_static(
 					"file exceeds 1 MiB response ceiling",
@@ -790,13 +786,17 @@ async fn execute_filesystem(
 					"payload exceeds 1 MiB",
 				)));
 			}
-			let mut file = tokio::fs::File::create(&request.path).await.map_err(failure)?;
+			let mut file = tokio::fs::File::create(&request.path)
+				.await
+				.map_err(failure)?;
 			file.write_all(&request.data).await.map_err(failure)?;
 			file.sync_data().await.map_err(failure)?;
 			Ok(DirectFilesystemOutput::Applied)
 		},
 		"stat" => {
-			let metadata = tokio::fs::symlink_metadata(&request.path).await.map_err(failure)?;
+			let metadata = tokio::fs::symlink_metadata(&request.path)
+				.await
+				.map_err(failure)?;
 			Ok(DirectFilesystemOutput::Stat(filesystem_stat(&metadata)))
 		},
 		"list" => {
@@ -806,7 +806,8 @@ async fn execute_filesystem(
 			while let Some(entry) = directory.next_entry().await.map_err(failure)? {
 				let kind = entry.file_type().await.map_err(failure)?;
 				let path = entry.path().to_string_lossy().into_owned();
-				response_bytes = response_bytes.saturating_add(path.len().saturating_mul(6).saturating_add(64));
+				response_bytes =
+					response_bytes.saturating_add(path.len().saturating_mul(6).saturating_add(64));
 				if response_bytes > MAX_DIRECT_FILESYSTEM_BYTES {
 					return Err(DirectFilesystemAuthorityError::Execute(Str::new_static(
 						"directory listing exceeds 1 MiB response ceiling",
@@ -821,27 +822,33 @@ async fn execute_filesystem(
 			Ok(DirectFilesystemOutput::Entries(entries))
 		},
 		"mkdir" => {
-			tokio::fs::create_dir_all(&request.path).await.map_err(failure)?;
+			tokio::fs::create_dir_all(&request.path)
+				.await
+				.map_err(failure)?;
 			Ok(DirectFilesystemOutput::Applied)
 		},
 		"remove" => {
-			let metadata = tokio::fs::symlink_metadata(&request.path).await.map_err(failure)?;
+			let metadata = tokio::fs::symlink_metadata(&request.path)
+				.await
+				.map_err(failure)?;
 			if metadata.is_dir() {
-				tokio::fs::remove_dir_all(&request.path).await.map_err(failure)?;
+				tokio::fs::remove_dir_all(&request.path)
+					.await
+					.map_err(failure)?;
 			} else {
-				tokio::fs::remove_file(&request.path).await.map_err(failure)?;
+				tokio::fs::remove_file(&request.path)
+					.await
+					.map_err(failure)?;
 			}
 			Ok(DirectFilesystemOutput::Applied)
 		},
-		_ => Err(DirectFilesystemAuthorityError::Invalid(Str::new_static(
-			"unsupported operation",
-		))),
+		_ => Err(DirectFilesystemAuthorityError::Invalid(Str::new_static("unsupported operation"))),
 	}
 }
 
 fn filesystem_stat(metadata: &std::fs::Metadata) -> DirectFilesystemStat {
 	DirectFilesystemStat {
-		kind: Str::new_static(if metadata.file_type().is_symlink() {
+		kind:        Str::new_static(if metadata.file_type().is_symlink() {
 			"symlink"
 		} else if metadata.is_file() {
 			"file"
@@ -850,9 +857,9 @@ fn filesystem_stat(metadata: &std::fs::Metadata) -> DirectFilesystemStat {
 		} else {
 			"other"
 		}),
-		size: metadata.len(),
+		size:        metadata.len(),
 		modified_ms: metadata.modified().ok().and_then(epoch_ms),
-		readonly: metadata.permissions().readonly(),
+		readonly:    metadata.permissions().readonly(),
 	}
 }
 
@@ -869,7 +876,8 @@ fn file_kind(kind: &std::fs::FileType) -> &'static str {
 }
 
 fn epoch_ms(time: SystemTime) -> Option<u64> {
-	time.duration_since(UNIX_EPOCH)
+	time
+		.duration_since(UNIX_EPOCH)
 		.ok()
 		.and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
@@ -886,17 +894,17 @@ fn now_ms() -> u64 {
 /// exposed authoritative handles at their actual activation boundaries.
 pub struct EnvdHostOwnerBackends {
 	/// Live sandbox admission state.
-	pub sandbox: Arc<AdmissionSandboxRuntime>,
+	pub sandbox:                   Arc<AdmissionSandboxRuntime>,
 	/// Sole invocation argument-cursor registry.
-	pub parameters: Arc<LiveParameterSource>,
+	pub parameters:                Arc<LiveParameterSource>,
 	/// Named-worker route and process registry.
-	pub workers: Arc<WorkerSupervisor>,
+	pub workers:                   Arc<WorkerSupervisor>,
 	/// Policy CONTROL factory.
-	pub policy_factory: Arc<dyn ControlAuthorityFactory>,
+	pub policy_factory:            Arc<dyn ControlAuthorityFactory>,
 	/// Parameter CONTROL factory.
-	pub parameter_factory: Arc<dyn ControlAuthorityFactory>,
+	pub parameter_factory:         Arc<dyn ControlAuthorityFactory>,
 	/// Worker CONTROL factory.
-	pub worker_factory: Arc<dyn ControlAuthorityFactory>,
+	pub worker_factory:            Arc<dyn ControlAuthorityFactory>,
 	/// Audited direct-filesystem CONTROL factory.
 	pub direct_filesystem_factory: Arc<dyn ControlAuthorityFactory>,
 }
@@ -904,10 +912,7 @@ pub struct EnvdHostOwnerBackends {
 impl EnvdHostOwnerBackends {
 	/// Constructs the production bundle with envd's canonical worker ceilings
 	/// and fail-closed detected sandbox facilities.
-	pub fn production(
-		data_dir: &Path,
-		approvals: Arc<omp_agent::ApprovalBook>,
-	) -> Self {
+	pub fn production(data_dir: &Path, approvals: Arc<omp_agent::ApprovalBook>) -> Self {
 		Self::new(
 			data_dir,
 			detected_sandbox_capabilities(),
@@ -927,16 +932,11 @@ impl EnvdHostOwnerBackends {
 	) -> Self {
 		let sandbox = Arc::new(AdmissionSandboxRuntime::new(capabilities));
 		let parameters = Arc::new(LiveParameterSource::default());
-		let workers = Arc::new(WorkerSupervisor::new(
-			worker_layer_ceiling,
-			worker_spawn_ceiling,
-		));
-		let policy_audit = Arc::new(DurablePolicyAuditSink::new(
-			data_dir.join("policy-control.jsonl"),
-		));
-		let filesystem_journal = Arc::new(DurableDirectFilesystemJournal::new(
-			data_dir.join("direct-filesystem.jsonl"),
-		));
+		let workers = Arc::new(WorkerSupervisor::new(worker_layer_ceiling, worker_spawn_ceiling));
+		let policy_audit =
+			Arc::new(DurablePolicyAuditSink::new(data_dir.join("policy-control.jsonl")));
+		let filesystem_journal =
+			Arc::new(DurableDirectFilesystemJournal::new(data_dir.join("direct-filesystem.jsonl")));
 		let policy_factory = policy_control_factory(
 			sandbox.clone() as Arc<dyn SandboxPolicyRuntime>,
 			approvals,

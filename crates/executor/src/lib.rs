@@ -42,7 +42,8 @@ impl Executor {
 		Self { inner: Arc::new(Inner::Pool(pool::Pool::new(workers))) }
 	}
 
-	/// Creates a seeded, single-thread deterministic scheduler with virtual time.
+	/// Creates a seeded, single-thread deterministic scheduler with virtual
+	/// time.
 	#[must_use]
 	pub fn deterministic(seed: u64) -> (Self, DeterministicHandle) {
 		let scheduler = deterministic::Scheduler::new(seed);
@@ -111,13 +112,10 @@ impl Executor {
 		future: F,
 	) -> impl Future<Output = Result<F::Output, Elapsed>> {
 		let timer = self.timer(after);
-		futures_lite::future::or(
-			async move { Ok(future.await) },
-			async move {
-				timer.await;
-				Err(Elapsed)
-			},
-		)
+		futures_lite::future::or(async move { Ok(future.await) }, async move {
+			timer.await;
+			Err(Elapsed)
+		})
 	}
 
 	/// Runs a main-thread future to completion.
@@ -195,7 +193,9 @@ impl Stream for Interval {
 
 	fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		match &mut self.inner {
-			IntervalInner::Pool(timer) => Pin::new(timer).poll_next(context).map(|item| item.map(|_| ())),
+			IntervalInner::Pool(timer) => Pin::new(timer)
+				.poll_next(context)
+				.map(|item| item.map(|_| ())),
 			IntervalInner::Deterministic { scheduler, period, timer } => {
 				if Pin::new(&mut *timer).poll(context).is_pending() {
 					return Poll::Pending;
@@ -224,10 +224,7 @@ impl Wake for RootWake {
 	}
 }
 
-fn deterministic_block_on<F: Future>(
-	scheduler: &deterministic::Scheduler,
-	future: F,
-) -> F::Output {
+fn deterministic_block_on<F: Future>(scheduler: &deterministic::Scheduler, future: F) -> F::Output {
 	let wake = Arc::new(RootWake(AtomicBool::new(true)));
 	let waker = Waker::from(Arc::clone(&wake));
 	let mut context = Context::from_waker(&waker);
@@ -270,7 +267,9 @@ mod tests {
 		}
 		handle.run_until_parked();
 		handle.advance_clock(Duration::from_millis(1));
-		Arc::try_unwrap(log).expect("tasks released log").into_inner()
+		Arc::try_unwrap(log)
+			.expect("tasks released log")
+			.into_inner()
 	}
 
 	#[test]

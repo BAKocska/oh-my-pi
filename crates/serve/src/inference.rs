@@ -31,8 +31,8 @@ use omp_inference::{
 		NativeRequest, NativeResponseFraming, NegotiationPolicy, OpaqueJson, RawJson,
 		RealtimeModality, RealtimeRequest, Role, Sampling, SearchRecency, SearchRequest,
 		SessionRequest, Setting, SpeechRequest, Target, TimestampGranularity, TokenizeRequest,
-		ToolChoice, ToolDefinition, ToolInputConstraint, TranscriptionRequest, TruncationPolicy,
-		UsageRequest, UsageScope, VideoRequest,
+		ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
+		TranscriptionRequest, TruncationPolicy, UsageRequest, UsageScope, VideoRequest,
 	},
 	error::{Error, ErrorDetail, ErrorKind, aggregate_search_failures, search_provider_failure},
 	event::{
@@ -207,10 +207,7 @@ impl InferenceRpc {
 	}
 
 	/// Installs the application's live provider owner on the gateway surface.
-	pub fn with_provider_authority(
-		mut self,
-		authority: Arc<dyn ProviderGatewayAuthority>,
-	) -> Self {
+	pub fn with_provider_authority(mut self, authority: Arc<dyn ProviderGatewayAuthority>) -> Self {
 		self.provider_authority = Some(authority);
 		self
 	}
@@ -1539,7 +1536,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::ProviderCatalogRequest>,
 	) -> Result<Response<pb::ProviderCatalogResponse>, Status> {
 		Ok(Response::new(
-			self.provider_authority()?.catalog(request.into_inner()).await?,
+			self
+				.provider_authority()?
+				.catalog(request.into_inner())
+				.await?,
 		))
 	}
 
@@ -1548,7 +1548,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::WatchProviderCatalogRequest>,
 	) -> Result<Response<pb::WatchProviderCatalogResponse>, Status> {
 		Ok(Response::new(
-			self.provider_authority()?.watch_catalog(request.into_inner()).await?,
+			self
+				.provider_authority()?
+				.watch_catalog(request.into_inner())
+				.await?,
 		))
 	}
 
@@ -1557,7 +1560,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::ProviderAuthenticatedRequest>,
 	) -> Result<Response<pb::ProviderAuthenticatedResponse>, Status> {
 		Ok(Response::new(
-			self.provider_authority()?.authenticated(request.into_inner()).await?,
+			self
+				.provider_authority()?
+				.authenticated(request.into_inner())
+				.await?,
 		))
 	}
 
@@ -1566,7 +1572,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::ProviderDeclarationRequest>,
 	) -> Result<Response<pb::ProviderMutationResponse>, Status> {
 		Ok(Response::new(
-			self.provider_authority()?.declare(request.into_inner()).await?,
+			self
+				.provider_authority()?
+				.declare(request.into_inner())
+				.await?,
 		))
 	}
 
@@ -1575,7 +1584,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::ProviderDeclarationRequest>,
 	) -> Result<Response<pb::ProviderMutationResponse>, Status> {
 		Ok(Response::new(
-			self.provider_authority()?.replace(request.into_inner()).await?,
+			self
+				.provider_authority()?
+				.replace(request.into_inner())
+				.await?,
 		))
 	}
 
@@ -1584,7 +1596,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::RetractProviderRequest>,
 	) -> Result<Response<pb::ProviderMutationResponse>, Status> {
 		Ok(Response::new(
-			self.provider_authority()?.retract(request.into_inner()).await?,
+			self
+				.provider_authority()?
+				.retract(request.into_inner())
+				.await?,
 		))
 	}
 
@@ -1593,7 +1608,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::ProviderOperationRequest>,
 	) -> Result<Response<pb::ProviderOperationResponse>, Status> {
 		Ok(Response::new(
-			self.provider_authority()?.request(request.into_inner()).await?,
+			self
+				.provider_authority()?
+				.request(request.into_inner())
+				.await?,
 		))
 	}
 
@@ -1602,7 +1620,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::ProviderOperationRequest>,
 	) -> Result<Response<pb::ProviderOperationResponse>, Status> {
 		Ok(Response::new(
-			self.provider_authority()?.mint_session(request.into_inner()).await?,
+			self
+				.provider_authority()?
+				.mint_session(request.into_inner())
+				.await?,
 		))
 	}
 }
@@ -2057,22 +2078,44 @@ fn tool_definition(tool: &pb::ToolDef) -> Result<ToolDefinition, Status> {
 	if tool.name.is_empty() {
 		return Err(Status::invalid_argument("ToolDef.name is required"));
 	}
-	Ok(ToolDefinition {
-		name:        tool.name.as_str().into(),
-		description: (!tool.description.is_empty()).then(|| tool.description.as_str().into()),
-		input:       ToolInputConstraint::JsonSchema {
-			parameters: opaque_json(&tool.schema_json, "ToolDef.schema_json")?,
-			strict:     tool.strict.unwrap_or(false),
+	let input = match tool.input.as_ref() {
+		Some(pb::tool_def::Input::JsonSchema(schema)) => ToolInputConstraint::JsonSchema {
+			parameters: opaque_json(&schema.schema_json, "ToolDef.json_schema.schema_json")?,
+			strict:     schema.strict.unwrap_or(false),
 		},
+		Some(pb::tool_def::Input::Grammar(grammar)) => {
+			let syntax = match pb::tool_def::grammar::Syntax::try_from(grammar.syntax) {
+				Ok(pb::tool_def::grammar::Syntax::Lark) => ToolGrammarSyntax::Lark,
+				Ok(pb::tool_def::grammar::Syntax::Regex) => ToolGrammarSyntax::Regex,
+				Ok(pb::tool_def::grammar::Syntax::Ebnf) => ToolGrammarSyntax::Ebnf,
+				Ok(pb::tool_def::grammar::Syntax::Unspecified) | Err(_) => {
+					return Err(Status::invalid_argument(
+						"ToolDef.grammar.syntax must be LARK, REGEX, or EBNF",
+					));
+				},
+			};
+			ToolInputConstraint::Grammar(ToolGrammar {
+				syntax,
+				definition: grammar.definition.as_str().into(),
+			})
+		},
+		None => return Err(Status::invalid_argument("ToolDef.input is required")),
+	};
+	Ok(ToolDefinition {
+		name: tool.name.as_str().into(),
+		description: (!tool.description.is_empty()).then(|| tool.description.as_str().into()),
+		input,
 	})
 }
 
 /// Lowers proto chat parameters into a canonical [`ChatRequest`].
 ///
 /// `params.tools` is the explicit tool selection: named tools resolve to their
-/// live registry definitions, and an empty list advertises no tools at all —
-/// callers such as tool-incapable models and the eval completion bridge rely
-/// on an empty list meaning "none", never "everything".
+/// live registry definitions, and an empty list advertises no tools at all.
+/// The registry projection preserves every canonical input constraint; caller
+/// bodies never replace the live executable declarations. Callers such as
+/// tool-incapable models and the eval completion bridge rely on an empty list
+/// meaning "none", never "everything".
 fn chat_request(
 	messages: Vec<Message>,
 	params: &pb::ChatParams,
@@ -2093,8 +2136,8 @@ fn chat_request(
 	} else {
 		tool_registry
 			.advertise(LoweringCaps {
-				strict_schema:  false,
-				grammar:        GrammarBits::empty(),
+				strict_schema:  true,
+				grammar:        GrammarBits::ALL,
 				maximum_tools:  None,
 				maximum_strict: None,
 			})
@@ -3546,8 +3589,160 @@ mod tests {
 		error::{ErrorPhase, RetryAction},
 		receipt::{ExecutionReceipt, ReasonId, RecoveryKind, RecoveryRecord},
 	};
+	use omp_tool::{
+		Claims, Constraint, Effects, Ev, GrammarSyntax, IncomingParams, Part, Precedence,
+		Presentation, PromptCaps, Rev, Tool, ToolSpec,
+	};
 
 	use super::*;
+
+	struct GrammarFixture {
+		spec: ToolSpec,
+	}
+
+	impl Tool for GrammarFixture {
+		type Fault = serde_json::Value;
+		type Params = serde_json::Value;
+		type Payload = serde_json::Value;
+		type Update = serde_json::Value;
+
+		fn spec(&self) -> &ToolSpec {
+			&self.spec
+		}
+
+		fn call<'c>(
+			&'c self,
+			_params: IncomingParams<'c>,
+		) -> impl futures::Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
+			futures::stream::empty()
+		}
+
+		fn prompt(
+			&self,
+			_view: Result<&Self::Payload, &Self::Fault>,
+			_caps: &PromptCaps,
+		) -> Vec<Part> {
+			Vec::new()
+		}
+	}
+
+	fn grammar_tool(
+		name: &str,
+		syntax: pb::tool_def::grammar::Syntax,
+		definition: &'static str,
+	) -> pb::ToolDef {
+		pb::ToolDef {
+			name:        name.to_owned(),
+			description: String::new(),
+			input:       Some(pb::tool_def::Input::Grammar(pb::tool_def::Grammar {
+				syntax:     syntax as i32,
+				definition: definition.to_owned(),
+			})),
+		}
+	}
+
+	#[test]
+	fn chat_request_keeps_live_edit_style_grammar_native() {
+		const LIVE_EDIT_GRAMMAR: &str =
+			"start: begin_patch op+ end_patch\ncontent_line: /[^§«»\\n][^\\n]*/ LF";
+		let mut registry = ToolRegistry::new();
+		registry
+			.register(
+				GrammarFixture {
+					spec: ToolSpec {
+						name:            sf!("edit"),
+						rev:             Rev { family: sf!("hl"), n: 1 },
+						description:     sf!("Sparse edit"),
+						schema:          Bytes::from_static(br#"{"type":"object"}"#),
+						constraint:      Constraint::Grammar {
+							syntax:         GrammarSyntax::Lark,
+							definition:     Str::new_static(LIVE_EDIT_GRAMMAR),
+							priority:       100,
+							on_unsupported: pb::Fallback::Unspecified,
+						},
+						effects:         Effects::empty(),
+						projection_code: [0; 32],
+					},
+				},
+				Presentation::Slot,
+				Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None },
+			)
+			.expect("grammar fixture registers");
+		let params = pb::ChatParams {
+			tools: vec![grammar_tool("edit", pb::tool_def::grammar::Syntax::Lark, "stale: CALLER")],
+			..Default::default()
+		};
+
+		let request = chat_request(Vec::new(), &params, &registry).expect("chat request projects");
+		let [tool] = request.tools.as_ref() else {
+			panic!("one live tool");
+		};
+		let ToolInputConstraint::Grammar(grammar) = &tool.input else {
+			panic!("edit must remain a native grammar tool");
+		};
+		assert_eq!(grammar.syntax, ToolGrammarSyntax::Lark);
+		assert_eq!(grammar.definition, LIVE_EDIT_GRAMMAR);
+	}
+
+	#[test]
+	fn tool_def_grammar_projection_preserves_supported_syntax_and_definition() {
+		let cases = [
+			(
+				pb::tool_def::grammar::Syntax::Lark,
+				ToolGrammarSyntax::Lark,
+				"start: WORD\n%import common.WORD",
+			),
+			(pb::tool_def::grammar::Syntax::Regex, ToolGrammarSyntax::Regex, r"^(yes|no)\s+\d+$"),
+			(pb::tool_def::grammar::Syntax::Ebnf, ToolGrammarSyntax::Ebnf, r#"root = "yes" | "no";"#),
+		];
+		for (wire_syntax, expected_syntax, definition) in cases {
+			let projected = tool_definition(&grammar_tool("constrained", wire_syntax, definition))
+				.expect("valid grammar");
+			let ToolInputConstraint::Grammar(grammar) = projected.input else {
+				panic!("grammar input must remain freeform");
+			};
+			assert_eq!(grammar.syntax, expected_syntax);
+			assert_eq!(grammar.definition, definition);
+		}
+	}
+
+	#[test]
+	fn tool_def_rejects_unspecified_unknown_and_missing_input() {
+		for syntax in [pb::tool_def::grammar::Syntax::Unspecified as i32, i32::MAX] {
+			let mut tool =
+				grammar_tool("constrained", pb::tool_def::grammar::Syntax::Lark, "start: WORD");
+			let Some(pb::tool_def::Input::Grammar(grammar)) = tool.input.as_mut() else {
+				unreachable!();
+			};
+			grammar.syntax = syntax;
+			let error = tool_definition(&tool).expect_err("invalid grammar syntax");
+			assert_eq!(error.code(), tonic::Code::InvalidArgument);
+		}
+		let error =
+			tool_definition(&pb::ToolDef { name: "missing".to_owned(), ..Default::default() })
+				.expect_err("missing input");
+		assert_eq!(error.code(), tonic::Code::InvalidArgument);
+	}
+
+	#[test]
+	fn tool_def_json_schema_projection_preserves_schema_and_strict_behavior() {
+		for (strict, expected) in [(None, false), (Some(false), false), (Some(true), true)] {
+			let tool = pb::ToolDef {
+				name:        "json".to_owned(),
+				description: String::new(),
+				input:       Some(pb::tool_def::Input::JsonSchema(pb::tool_def::JsonSchema {
+					schema_json: Bytes::from_static(br#"{"type":"object"}"#),
+					strict,
+				})),
+			};
+			let projected = tool_definition(&tool).expect("valid JSON Schema");
+			let ToolInputConstraint::JsonSchema { parameters, strict } = projected.input else {
+				panic!("JSON Schema input must remain structured");
+			};
+			assert_eq!(parameters.as_value(), &serde_json::json!({"type": "object"}));
+			assert_eq!(strict, expected);
+		}
+	}
 
 	#[test]
 	fn model_card_exposes_gateway_discovery_metadata() {

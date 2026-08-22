@@ -19,14 +19,16 @@ fn engine() -> &'static Engine {
 	&ENGINE
 }
 
-/// Compiles one user-authored command template with the approved helper vocabulary.
+/// Compiles one user-authored command template with the approved helper
+/// vocabulary.
 pub fn compile(template: &str) -> miette::Result<Template> {
 	engine()
 		.compile_owned(Str::new_static("command"), template)
 		.map_err(|error| miette::miette!("command template compilation failed: {error}"))
 }
 
-/// Reports whether a compiled command template consumes raw or tokenized arguments.
+/// Reports whether a compiled command template consumes raw or tokenized
+/// arguments.
 pub fn references_arguments(template: &Template) -> bool {
 	template
 		.referenced_keys()
@@ -62,7 +64,9 @@ mod tests {
 	fn renders_only_the_native_helper_vocabulary() {
 		let words = [sf!("one"), sf!("two")];
 		let rendered = render(
-			"{{ args }}|{{ arguments | join(\",\") }}|{% if arguments %}yes{% else %}no{% endif %}|{% codeblock \"rs\" %}fn main() {}{% endcodeblock %}|{% xml \"note\" %}{{ \"<ok>\" | escape_xml }}{% endxml %}",
+			"{{ args }}|{{ arguments | join(\",\") }}|{% if arguments %}yes{% else %}no{% endif \
+			 %}|{% codeblock \"rs\" %}fn main() {}{% endcodeblock %}|{% xml \"note\" %}{{ \"<ok>\" | \
+			 escape_xml }}{% endxml %}",
 			TemplateArguments { raw: "\"one\" two", words: &words },
 		)
 		.expect("render");

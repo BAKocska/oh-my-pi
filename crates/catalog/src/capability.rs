@@ -250,6 +250,8 @@ impl StructuredOutputBits {
 bitset!(/// Supported grammar constraint languages.
 	GrammarBits, u8);
 impl GrammarBits {
+	/// Every grammar constraint language represented by the catalog.
+	pub const ALL: Self = Self::LARK.union(Self::REGEX).union(Self::EBNF);
 	/// EBNF grammar constraints.
 	pub const EBNF: Self = Self(1 << 2);
 	/// Lark grammar constraints.

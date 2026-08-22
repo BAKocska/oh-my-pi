@@ -114,7 +114,9 @@ fn sealed_python_provider_lowers_into_resolvable_runtime_records() {
 	assert_eq!(records.models[0].wire_ids[0].1.as_str(), "chat-one");
 	assert_eq!(records.models[0].pricing.components[0].nanos_usd, 250_000_000);
 
-	let rebuilt = base.with_runtime_provider(&records).expect("validated catalog swap");
+	let rebuilt = base
+		.with_runtime_provider(&records)
+		.expect("validated catalog swap");
 	let provider = omp_catalog::ProviderId::from("acme");
 	let model = omp_catalog::ModelKey::from("acme/chat-one");
 	assert!(rebuilt.provider(&provider).is_some());

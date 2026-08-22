@@ -391,6 +391,7 @@ message GetUsageRequest {
   // Bypass the broker cache and refetch upstream now.
   bool refresh = 3;
 }
+
 // Controls an upstream per-credential health probe.
 message ProbeCredentialsRequest {
   // Empty probes every provider with configured credentials.

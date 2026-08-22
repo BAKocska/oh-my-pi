@@ -1930,11 +1930,11 @@ impl HostControlAuthorityFactory {
 			.bind(identity)
 			.map_err(|error| error.in_domain("effects"))?;
 		let effect_owner = Arc::new(DomainEffectAuthority {
-			registry: registry_effect.expect("registry domain was bound"),
-			ui: ui_effect.expect("UI domain was bound"),
+			registry:  registry_effect.expect("registry domain was bound"),
+			ui:        ui_effect.expect("UI domain was bound"),
 			telemetry: telemetry_effect.expect("telemetry domain was bound"),
-			provider: provider_effect.expect("provider domain was bound"),
-			fallback: effect_owner,
+			provider:  provider_effect.expect("provider domain was bound"),
+			fallback:  effect_owner,
 		});
 		Ok(Arc::new(CompositeControlAuthority::new(domains, effect_owner)))
 	}

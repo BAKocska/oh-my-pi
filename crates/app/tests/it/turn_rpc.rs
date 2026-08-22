@@ -720,10 +720,12 @@ fn canonical_history_uses_only_live_definitions_and_lifts_deterministically() {
 		tools: vec![pb::ToolDef {
 			name:        "history_law".to_owned(),
 			description: "stale caller definition".to_owned(),
-			schema_json: Bytes::from_static(
-				br#"{"type":"object","properties":{"hl1_only":{"type":"string"}}}"#,
-			),
-			strict:      Some(true),
+			input:       Some(pb::tool_def::Input::JsonSchema(pb::tool_def::JsonSchema {
+				schema_json: Bytes::from_static(
+					br#"{"type":"object","properties":{"hl1_only":{"type":"string"}}}"#,
+				),
+				strict:      Some(true),
+			})),
 		}],
 		..Default::default()
 	};

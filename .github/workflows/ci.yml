@@ -108,6 +108,8 @@ jobs:
 
       - name: Install native build tools
         run: brew install lld uv zstd
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Cache embedded Python
         id: python-cache
@@ -144,17 +146,21 @@ jobs:
         run: cargo clippy --workspace --locked
 
       - name: Test workspace
-        run: cargo test --workspace --exclude omp-e2e --locked
+        run: cargo nextest run --profile ci --workspace --exclude omp-e2e --locked
+      # nextest cannot run doctests; omp has them in 25+ modules, so they need
+      # their own libtest pass or the coverage silently disappears.
+      - name: Test doctests
+        run: cargo test --doc --workspace --exclude omp-e2e --locked
 
       - name: Gate frozen Python examples
         run: python3 scripts/check-python-examples.py
 
       - name: Compile acceptance proofs
-        run: cargo test -p omp-e2e --tests --no-run --locked
+        run: cargo nextest run -p omp-e2e --tests --no-run --locked
 
       - name: Run acceptance proofs P1-P6
         run: |
-          cargo test -p omp-e2e --locked \
+          cargo nextest run --profile ci -p omp-e2e --locked \
             --test p1_doc_race \
             --test p2_cancel_matrix \
             --test p3_detached_jobs \
@@ -165,10 +171,10 @@ jobs:
       - name: Run terminal proof P7
         env:
           TERM: xterm-256color
-        run: cargo test -p omp-e2e --test p7_tui --locked
+        run: cargo nextest run --profile ci -p omp-e2e --test p7_tui --locked
 
       - name: Validate P8 baseline contract
-        run: cargo test -p omp-e2e --test p8_baselines --locked
+        run: cargo nextest run --profile ci -p omp-e2e --test p8_baselines --locked
 
       - name: Record P8 baseline
         continue-on-error: true
@@ -237,4 +243,4 @@ jobs:
       - name: Run terminal proof P7 on Linux PTY
         env:
           TERM: xterm-256color
-        run: cargo test -p omp-e2e --test p7_tui --locked
+        run: cargo nextest run --profile ci -p omp-e2e --test p7_tui --locked

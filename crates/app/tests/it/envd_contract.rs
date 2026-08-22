@@ -9,6 +9,10 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
+use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
+use omp_env::{
+	Admitter, BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent,
+};
 use omp_envd::{
 	EnvServer, RegistryBridges,
 	exec::{ExecEvent as HostExecEvent, ExecHost},
@@ -17,10 +21,6 @@ use omp_envd::{
 	},
 	worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
 	workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
-};
-use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
-use omp_env::{
-	Admitter, BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent,
 };
 use omp_proto::{
 	SCHEMA_REV,
@@ -477,8 +477,8 @@ impl Harness {
 				worker,
 				RegistryBridges::default(),
 			)
-				.await
-				.expect("real local environment host"),
+			.await
+			.expect("real local environment host"),
 		);
 		let (client, transport) = EnvClient::in_process(64);
 		client.set_admitter(AllowAdmission);

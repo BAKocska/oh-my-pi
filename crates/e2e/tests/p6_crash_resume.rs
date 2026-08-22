@@ -38,7 +38,6 @@ use omp_app::{
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
 };
-use omp_envd::{EnvServer, RegistryBridges, worker::ExtHostConfig};
 use omp_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
@@ -48,6 +47,7 @@ use omp_e2e::support::{
 	AllowAdmission, Scratch, ScriptedGateway, install_omp_binary_env, omp_binary,
 };
 use omp_env::EnvClient;
+use omp_envd::{EnvServer, RegistryBridges, worker::ExtHostConfig};
 use omp_inference::{
 	Answer, Error as InferenceError, Registry as InferenceRegistry,
 	call::Call,

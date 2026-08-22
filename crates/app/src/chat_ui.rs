@@ -429,7 +429,10 @@ pub mod presentation_authority {
 				PresentationCallbackKind::Renderer => Some(RENDER_CALLBACK_DEADLINE),
 				PresentationCallbackKind::Action => None,
 			};
-			let invocation = context.invocation.cloned().ok_or(PresentationAuthorityError::Phase)?;
+			let invocation = context
+				.invocation
+				.cloned()
+				.ok_or(PresentationAuthorityError::Phase)?;
 			let dispatch = self
 				.callbacks
 				.dispatch(self.identity.clone(), invocation, callback);
@@ -1013,15 +1016,15 @@ fn handle_presentation_dispatch(
 			result.map(|()| PresentationResponse::Ack)
 		},
 		PresentationOperation::Request(request) => match request {
-			PresentationRequest::Presentation => Ok(PresentationResponse::Presentation(
-				serde_json::json!({
+			PresentationRequest::Presentation => {
+				Ok(PresentationResponse::Presentation(serde_json::json!({
 					"kind": "chat",
 					"session": state.session_id.as_str(),
 					"model": state.model.as_str(),
 					"workspace": state.workspace_root.as_str(),
 					"interactive": true,
-				}),
-			)),
+				})))
+			},
 			PresentationRequest::Icons { prefix } => {
 				let icons = omp_tui::Icon::from_name(prefix.as_str())
 					.map(|icon| vec![Str::new(icon.name())])
@@ -3674,8 +3677,9 @@ where
 									const REMOTE_IMAGE_MAX_BYTES: u64 = 24 * 1024 * 1024;
 									let source = source.to_string();
 									let metadata_path = source.clone();
-									let Ok(metadata) =
-										executor.unblock(move || std::fs::metadata(metadata_path)).await
+									let Ok(metadata) = executor
+										.unblock(move || std::fs::metadata(metadata_path))
+										.await
 									else {
 										send_backend(
 											backend,
@@ -3697,7 +3701,8 @@ where
 									let mime_type = image::ImageFormat::from_path(source.as_str())
 										.map(|format| format.to_mime_type())
 										.unwrap_or("application/octet-stream");
-									let Ok(data) = executor.unblock(move || std::fs::read(source)).await else {
+									let Ok(data) = executor.unblock(move || std::fs::read(source)).await
+									else {
 										send_backend(
 											backend,
 											BackendEvent::Error(sf!(
@@ -3979,15 +3984,15 @@ where
 				},
 				Ok(ChatCommand::Theme(args)) => {
 					match load_theme_preview(executor, state, args.as_str()).await {
-					Ok(theme) => {
-						send_backend(backend, BackendEvent::ThemePreview(theme));
-						send_backend(
-							backend,
-							BackendEvent::Notice(sf!(
-								"Theme preview active for this session; settings were not changed.",
-							)),
-						);
-					},
+						Ok(theme) => {
+							send_backend(backend, BackendEvent::ThemePreview(theme));
+							send_backend(
+								backend,
+								BackendEvent::Notice(sf!(
+									"Theme preview active for this session; settings were not changed.",
+								)),
+							);
+						},
 						Err(error) => send_backend(
 							backend,
 							BackendEvent::Error(sf!("Could not preview theme: {error}")),

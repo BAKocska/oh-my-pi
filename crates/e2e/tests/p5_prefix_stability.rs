@@ -6,10 +6,9 @@ use std::{collections::BTreeMap, future::Future, num::NonZeroUsize, sync::Arc, t
 use bytes::Bytes;
 use futures::{FutureExt as _, Stream};
 use omp_agent::{
-	Agent, AgentSnapshot, AgentState, ContextFile, InProcTurnClient, Journal, TurnClient, TurnId,
-	TurnInput, TurnOptions, PromptFacts,
+	Agent, AgentSnapshot, AgentState, ContextFile, InProcTurnClient, Journal, PromptFacts,
+	TurnClient, TurnId, TurnInput, TurnOptions,
 };
-use omp_serve::inference::InferenceRpc;
 use omp_catalog::{
 	CompiledCatalog,
 	snapshot::{Catalog, SnapshotProvenance},
@@ -42,6 +41,7 @@ use omp_inference::{
 	},
 };
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread};
+use omp_serve::inference::InferenceRpc;
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{
 	CapsBase, Claims, Constraint, Effects, Ev, IncomingParams, ModelClass, Part, Precedence,
@@ -201,8 +201,10 @@ fn tool_def(revision: u16) -> pb::ToolDef {
 	pb::ToolDef {
 		name:        "probe".to_owned(),
 		description: format!("prefix probe revision {revision}"),
-		schema_json: tool_schema(revision),
-		strict:      None,
+		input:       Some(pb::tool_def::Input::JsonSchema(pb::tool_def::JsonSchema {
+			schema_json: tool_schema(revision),
+			strict:      None,
+		})),
 	}
 }
 
@@ -421,12 +423,10 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 		provider_reset:  false,
 		stream_watchdog: omp_agent::StreamWatchdog::default(),
 	};
-	let props = PromptFacts::new(
-		scratch.project(),
-		Arc::<[ContextFile]>::from([context_file(&prompt_path)]),
-	)
-	.props()
-	.expect("prefix-stability prompt facts");
+	let props =
+		PromptFacts::new(scratch.project(), Arc::<[ContextFile]>::from([context_file(&prompt_path)]))
+			.props()
+			.expect("prefix-stability prompt facts");
 	let state = AgentState::new(AgentSnapshot::new(options, props, Arc::clone(&tools_v1)));
 	let (env, _env_transport) = omp_env::EnvClient::in_process(4);
 	let mut agent = Agent::new(client, env, state.clone(), journal(&scratch), CapsBase {

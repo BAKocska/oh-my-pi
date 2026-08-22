@@ -8,18 +8,18 @@
 //!
 //! use omp_tui::{AppOptions, Ui};
 //!
- //! fn main() -> io::Result<()> {
- //! 	let executor = omp_executor::Executor::new(None);
- //! 	executor.clone().block_on(async move {
- //! 		let mut app = AppOptions::new()
- //! 			.start(executor, |env| Ui::from_markup("hello", env.viewport.width, env.ctx).unwrap())
- //! 			.await?;
-//! 	while let Some(event) = app.next().await? {
-//! 		let _ = event;
-//! 	}
- //! 		Ok(())
- //! 	})
- //! }
+//! fn main() -> io::Result<()> {
+//! 	let executor = omp_executor::Executor::new(None);
+//! 	executor.clone().block_on(async move {
+//! 		let mut app = AppOptions::new()
+//! 			.start(executor, |env| Ui::from_markup("hello", env.viewport.width, env.ctx).unwrap())
+//! 			.await?;
+//! 		while let Some(event) = app.next().await? {
+//! 			let _ = event;
+//! 		}
+//! 		Ok(())
+//! 	})
+//! }
 //! ```
 //!
 //! [`UiHandle`] queues mutations from synchronous threads or asynchronous
@@ -152,8 +152,8 @@ impl ClipboardGate {
 /// Off-thread image decoder used by asynchronous UI hosts.
 #[derive(Clone)]
 pub struct ImageLoader {
-	tx: flume::Sender<Msg>,
-	rx: flume::Receiver<Msg>,
+	tx:       flume::Sender<Msg>,
+	rx:       flume::Receiver<Msg>,
 	executor: omp_executor::Executor,
 }
 
@@ -174,13 +174,14 @@ impl ImageLoader {
 		prepare_kitty: bool,
 	) {
 		let tx = self.tx.clone();
-		self.executor
+		self
+			.executor
 			.unblock(move || {
-			if prepare_kitty {
-				let _ = crate::imagereg::prepare_png(&source);
-			}
-			let state = crate::components::decode_source(&source, width, height, trim);
-			let _ = tx.send(Msg::ImageDecoded { slot, state });
+				if prepare_kitty {
+					let _ = crate::imagereg::prepare_png(&source);
+				}
+				let state = crate::components::decode_source(&source, width, height, trim);
+				let _ = tx.send(Msg::ImageDecoded { slot, state });
 			})
 			.detach();
 	}
@@ -986,7 +987,8 @@ impl App {
 		let rx = crate::paste::spawn_clipboard_read(scope);
 		let raw = scope == ClipboardRead::Text;
 		let tx = self.tx.clone();
-		self.executor
+		self
+			.executor
 			.spawn(async move {
 				let clipboard = rx.await.unwrap_or(None);
 				let _ = tx.send(Msg::Pasted { generation, raw, clipboard });
@@ -1216,7 +1218,11 @@ enum Wakeup {
 /// Sleeps until `at`; `None` is a disabled select branch.
 async fn deadline(executor: &omp_executor::Executor, at: Option<Instant>) {
 	match at {
-		Some(at) => executor.timer(at.saturating_duration_since(Instant::now())).await,
+		Some(at) => {
+			executor
+				.timer(at.saturating_duration_since(Instant::now()))
+				.await
+		},
 		None => std::future::pending().await,
 	}
 }
@@ -1290,18 +1296,20 @@ mod tests {
 		}
 		let executor = omp_executor::Executor::new(None);
 		executor.clone().block_on(async {
-				let mut app = AppOptions::new()
-					.hold_alt()
-					.start(executor.clone(), |env| {
-						Ui::from_markup("<text>inline</text>", env.viewport.width, env.ctx).unwrap()
-					})
-					.await
-					.expect("helper app starts on the override device");
-				executor.timer(Duration::from_millis(250)).await;
-				app.hold_alt(false);
-				let _ = executor.timeout(Duration::from_millis(200), app.next()).await;
-				drop(app);
-			});
+			let mut app = AppOptions::new()
+				.hold_alt()
+				.start(executor.clone(), |env| {
+					Ui::from_markup("<text>inline</text>", env.viewport.width, env.ctx).unwrap()
+				})
+				.await
+				.expect("helper app starts on the override device");
+			executor.timer(Duration::from_millis(250)).await;
+			app.hold_alt(false);
+			let _ = executor
+				.timeout(Duration::from_millis(200), app.next())
+				.await;
+			drop(app);
+		});
 	}
 
 	/// An `AppOptions::hold_alt()` start with no overlay paints frame one on
@@ -1535,7 +1543,8 @@ mod tests {
 		loader: &'a ImageLoader,
 		ui: &'a mut Ui,
 	) {
-		let message = executor.timeout(Duration::from_secs(5), loader.rx.recv_async())
+		let message = executor
+			.timeout(Duration::from_secs(5), loader.rx.recv_async())
 			.await
 			.expect("image decode completes")
 			.expect("image bus remains connected");
@@ -1549,50 +1558,52 @@ mod tests {
 	fn image_decode_delivers_without_blocking_initial_layout() {
 		let executor = omp_executor::Executor::new(None);
 		executor.clone().block_on(async {
-		let dir = std::env::temp_dir().join(format!("omp-tui-runtime-image-{}", std::process::id()));
-		std::fs::create_dir_all(&dir).unwrap();
-		let path = dir.join("async.ppm");
-		let mut ppm = b"P6\n4 4\n255\n".to_vec();
-		for y in 0..4 {
-			for _ in 0..4 {
-				ppm.extend(if y < 2 { [255, 0, 0] } else { [0, 0, 255] });
+			let dir =
+				std::env::temp_dir().join(format!("omp-tui-runtime-image-{}", std::process::id()));
+			std::fs::create_dir_all(&dir).unwrap();
+			let path = dir.join("async.ppm");
+			let mut ppm = b"P6\n4 4\n255\n".to_vec();
+			for y in 0..4 {
+				for _ in 0..4 {
+					ppm.extend(if y < 2 { [255, 0, 0] } else { [0, 0, 255] });
+				}
 			}
-		}
-		std::fs::write(&path, ppm).unwrap();
+			std::fs::write(&path, ppm).unwrap();
 
-		let loader = ImageLoader::new(executor.clone());
-		let ctx = UiContext { loader: Some(loader.clone()), ..UiContext::default() };
-		let mut ui = Ui::from_markup(format!("<img src={} w=4/>", path.display()), 10, ctx).unwrap();
-		let initial_rows = (0..ui.height())
-			.map(|row| frame_row_text(ui.frame(), row))
-			.collect::<Vec<_>>();
-		assert_eq!(ui.height(), 3, "loading uses the fixed box placeholder");
-		assert!(initial_rows[0].contains('┌'));
-		assert!(!initial_rows.iter().any(|row| row.contains('▀')));
+			let loader = ImageLoader::new(executor.clone());
+			let ctx = UiContext { loader: Some(loader.clone()), ..UiContext::default() };
+			let mut ui =
+				Ui::from_markup(format!("<img src={} w=4/>", path.display()), 10, ctx).unwrap();
+			let initial_rows = (0..ui.height())
+				.map(|row| frame_row_text(ui.frame(), row))
+				.collect::<Vec<_>>();
+			assert_eq!(ui.height(), 3, "loading uses the fixed box placeholder");
+			assert!(initial_rows[0].contains('┌'));
+			assert!(!initial_rows.iter().any(|row| row.contains('▀')));
 
-		receive_image(&executor, &loader, &mut ui).await;
-		assert_eq!(ui.height(), 2, "4px source relayouts to two half-block rows");
-		assert!((0..ui.height()).any(|row| frame_row_text(ui.frame(), row).contains('▀')));
+			receive_image(&executor, &loader, &mut ui).await;
+			assert_eq!(ui.height(), 2, "4px source relayouts to two half-block rows");
+			assert!((0..ui.height()).any(|row| frame_row_text(ui.frame(), row).contains('▀')));
 
-		let elements = Elements::builder()
-			.with("logo", |_: &str, props: Props, _: Vec<Cached>| {
-				let source = props.str_of(Prop::Src).map_or("", |value| value.as_str());
-				Box::new(Img::new().with_str(Prop::Src, source).with(Prop::W, 4_u16))
-					as Box<dyn Component>
-			})
-			.build();
-		let custom_loader = ImageLoader::new(executor.clone());
-		let mut custom_ctx = UiContext { elements, ..UiContext::default() };
-		custom_ctx.loader = Some(custom_loader.clone());
-		let mut custom_ui =
-			Ui::from_markup(format!("<logo src={}/>", path.display()), 10, custom_ctx).unwrap();
-		receive_image(&executor, &custom_loader, &mut custom_ui).await;
-		assert!(
-			(0..custom_ui.height()).any(|row| frame_row_text(custom_ui.frame(), row).contains('▀'))
-		);
+			let elements = Elements::builder()
+				.with("logo", |_: &str, props: Props, _: Vec<Cached>| {
+					let source = props.str_of(Prop::Src).map_or("", |value| value.as_str());
+					Box::new(Img::new().with_str(Prop::Src, source).with(Prop::W, 4_u16))
+						as Box<dyn Component>
+				})
+				.build();
+			let custom_loader = ImageLoader::new(executor.clone());
+			let mut custom_ctx = UiContext { elements, ..UiContext::default() };
+			custom_ctx.loader = Some(custom_loader.clone());
+			let mut custom_ui =
+				Ui::from_markup(format!("<logo src={}/>", path.display()), 10, custom_ctx).unwrap();
+			receive_image(&executor, &custom_loader, &mut custom_ui).await;
+			assert!(
+				(0..custom_ui.height()).any(|row| frame_row_text(custom_ui.frame(), row).contains('▀'))
+			);
 
-		std::fs::remove_file(path).unwrap();
-		std::fs::remove_dir(dir).unwrap();
+			std::fs::remove_file(path).unwrap();
+			std::fs::remove_dir(dir).unwrap();
 		});
 	}
 

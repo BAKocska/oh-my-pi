@@ -4,13 +4,32 @@ package omp.identity.v1;
 
 // Stable, versioned identifiers shared across process and crate boundaries.
 // Opaque values are compared byte-for-byte and are never interpreted by peers.
-message SessionId { bytes value = 1; }
-message ItemId { bytes value = 1; }
-message ToolId { string name = 1; string revision = 2; }
-message DeviceId { string name = 1; string revision = 2; }
-message GenerationId { bytes epoch = 1; uint64 sequence = 2; }
-message RevisionId { bytes authority = 1; uint64 sequence = 2; bytes digest = 3; }
-message EffectId { bytes value = 1; }
+message SessionId {
+  bytes value = 1;
+}
+message ItemId {
+  bytes value = 1;
+}
+message ToolId {
+  string name = 1;
+  string revision = 2;
+}
+message DeviceId {
+  string name = 1;
+  string revision = 2;
+}
+message GenerationId {
+  bytes epoch = 1;
+  uint64 sequence = 2;
+}
+message RevisionId {
+  bytes authority = 1;
+  uint64 sequence = 2;
+  bytes digest = 3;
+}
+message EffectId {
+  bytes value = 1;
+}
 
 // Correlates an effect with the durable session/item and exact tool/device
 // declaration that authorized it.

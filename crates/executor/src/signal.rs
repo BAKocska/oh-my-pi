@@ -18,8 +18,12 @@ const SIGNAL_SLOTS: usize = 128;
 static WRITERS: [AtomicI32; SIGNAL_SLOTS] = [const { AtomicI32::new(-1) }; SIGNAL_SLOTS];
 
 extern "C" fn signal_handler(number: nix::libc::c_int) {
-	let Ok(index) = usize::try_from(number) else { return };
-	let Some(writer) = WRITERS.get(index) else { return };
+	let Ok(index) = usize::try_from(number) else {
+		return;
+	};
+	let Some(writer) = WRITERS.get(index) else {
+		return;
+	};
 	let writer = writer.load(Ordering::Relaxed);
 	if writer < 0 {
 		return;
@@ -55,24 +59,24 @@ impl Signals {
 		assert!(!signals.is_empty(), "at least one signal is required");
 		let (reader, writer) = pipe().expect("failed to create signal self-pipe");
 		let writer_fd = raw_fd(&writer);
-		let action = SigAction::new(
-			SigHandler::Handler(signal_handler),
-			SaFlags::SA_RESTART,
-			SigSet::empty(),
-		);
+		let action =
+			SigAction::new(SigHandler::Handler(signal_handler), SaFlags::SA_RESTART, SigSet::empty());
 		let mut old = Vec::with_capacity(signals.len());
 		for &signal in signals {
 			let index = signal as usize;
-			let slot = WRITERS.get(index).expect("signal number exceeds self-pipe slots");
-			slot.compare_exchange(-1, writer_fd, Ordering::AcqRel, Ordering::Acquire)
+			let slot = WRITERS
+				.get(index)
+				.expect("signal number exceeds self-pipe slots");
+			slot
+				.compare_exchange(-1, writer_fd, Ordering::AcqRel, Ordering::Acquire)
 				.expect("signal already owned by another Signals stream");
 			// SAFETY: `action` uses an async-signal-safe handler with C ABI.
 			let previous = unsafe { nix::sys::signal::sigaction(signal, &action) }
 				.expect("failed to install signal handler");
 			old.push((signal, previous));
 		}
-		let reader = async_io::Async::new(File::from(reader))
-			.expect("failed to register signal self-pipe");
+		let reader =
+			async_io::Async::new(File::from(reader)).expect("failed to register signal self-pipe");
 		Self { reader, writers: vec![writer], old, pending: VecDeque::new() }
 	}
 }
@@ -131,19 +135,10 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 		if status_flags < 0
 			|| descriptor_flags < 0
 			|| unsafe {
-				nix::libc::fcntl(
-					descriptor,
-					nix::libc::F_SETFL,
-					status_flags | nix::libc::O_NONBLOCK,
-				)
-			} < 0
-			|| unsafe {
-				nix::libc::fcntl(
-					descriptor,
-					nix::libc::F_SETFD,
-					descriptor_flags | nix::libc::FD_CLOEXEC,
-				)
-			} < 0
+				nix::libc::fcntl(descriptor, nix::libc::F_SETFL, status_flags | nix::libc::O_NONBLOCK)
+			} < 0 || unsafe {
+			nix::libc::fcntl(descriptor, nix::libc::F_SETFD, descriptor_flags | nix::libc::FD_CLOEXEC)
+		} < 0
 		{
 			let error = io::Error::last_os_error();
 			// SAFETY: both descriptors remain owned by this function on failure.

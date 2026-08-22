@@ -36,8 +36,8 @@ use omp_secrets::{
 	rule::{SecretKind, SecretMode, SecretRule},
 };
 use serde_json::{Map, Value, json};
-use tonic::{Request, metadata::MetadataValue, transport::Channel};
 use tokio_util::sync::CancellationToken;
+use tonic::{Request, metadata::MetadataValue, transport::Channel};
 use zeroize::Zeroizing;
 
 /// Composes provider and MCP leasing over the one encrypted credential store.
@@ -401,9 +401,7 @@ impl ControlAuthority for CredentialSecretControlAuthority {
 					.metadata(&account)
 					.map_err(store_control_error)?
 					.and_then(|metadata| metadata.expires_at_ms)
-					.map_or(expires_at_ms, |credential_expiry| {
-						expires_at_ms.min(credential_expiry)
-					});
+					.map_or(expires_at_ms, |credential_expiry| expires_at_ms.min(credential_expiry));
 				let scoped = self
 					.control
 					.mint_scoped_token(&account, &ScopedCredentialGrant {
@@ -630,7 +628,11 @@ impl ControlAuthorityFactory for GatewayCredentialSecretControlFactory {
 		&self,
 		identity: Arc<ControlConnectionIdentity>,
 	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
-		let grant = self.grants.get(&identity.extension).cloned().unwrap_or_default();
+		let grant = self
+			.grants
+			.get(&identity.extension)
+			.cloned()
+			.unwrap_or_default();
 		let masking = SecretMaskingAuthority::new(
 			identity.extension.clone(),
 			identity.host_generation,
@@ -764,7 +766,9 @@ impl ControlAuthority for GatewayCredentialSecretControlAuthority {
 				.map(Value::String)
 				.map_err(secret_control_error);
 		}
-		self.remote_request(context, operation.as_str(), &arguments).await
+		self
+			.remote_request(context, operation.as_str(), &arguments)
+			.await
 	}
 
 	async fn effect(
@@ -830,7 +834,7 @@ impl GatewayCredentialSecretControlAuthority {
 			.clone()
 			.list_credentials(self.authenticated(ListCredentialsRequest {
 				provider: provider.to_owned(),
-				states: Vec::new(),
+				states:   Vec::new(),
 			})?)
 			.await
 			.map_err(remote_control_error)
@@ -878,7 +882,8 @@ impl GatewayCredentialSecretControlAuthority {
 		let mut client = self.client.clone();
 		match operation {
 			"omp.creds.list" => Ok(Value::Array(
-				self.list(&provider)
+				self
+					.list(&provider)
 					.await?
 					.into_iter()
 					.map(remote_metadata_value)
@@ -917,16 +922,20 @@ impl GatewayCredentialSecretControlAuthority {
 					.map(unseal_string)
 					.transpose()?;
 				client
-					.import_o_auth(self.authenticated(ImportOAuthRequest {
-						provider,
-						refresh_token: refresh_token.expose_secret().to_owned(),
-						access_token: access_token
-							.as_ref()
-							.map_or_else(String::new, |token| token.expose_secret().to_owned()),
-						expires_at_ms: optional_u64(arguments, "expires_at_ms")?.unwrap_or_default(),
-						identity: optional_str(arguments, "identity").unwrap_or_default().to_owned(),
-						props: None,
-					})?)
+					.import_o_auth(
+						self.authenticated(ImportOAuthRequest {
+							provider,
+							refresh_token: refresh_token.expose_secret().to_owned(),
+							access_token: access_token
+								.as_ref()
+								.map_or_else(String::new, |token| token.expose_secret().to_owned()),
+							expires_at_ms: optional_u64(arguments, "expires_at_ms")?.unwrap_or_default(),
+							identity: optional_str(arguments, "identity")
+								.unwrap_or_default()
+								.to_owned(),
+							props: None,
+						})?,
+					)
 					.await
 					.map_err(remote_control_error)
 					.map(|response| remote_metadata_value(response.into_inner()))
@@ -969,14 +978,18 @@ impl GatewayCredentialSecretControlAuthority {
 			"omp.creds.report_block" => {
 				let id = self.selected_credential_id(&provider, arguments).await?;
 				client
-					.report_block(self.authenticated(ReportBlockRequest {
-						id,
-						block: Some(Block {
-							scope: optional_str(arguments, "scope").unwrap_or("shared").to_owned(),
-							provider_key: String::new(),
-							until_ms: required_u64(arguments, "until_ms")?,
-						}),
-					})?)
+					.report_block(
+						self.authenticated(ReportBlockRequest {
+							id,
+							block: Some(Block {
+								scope:        optional_str(arguments, "scope")
+									.unwrap_or("shared")
+									.to_owned(),
+								provider_key: String::new(),
+								until_ms:     required_u64(arguments, "until_ms")?,
+							}),
+						})?,
+					)
 					.await
 					.map_err(remote_control_error)?;
 				Ok(Value::Null)
@@ -1028,8 +1041,7 @@ fn remote_metadata_value(metadata: omp_proto::omp::auth::v1::CredentialMeta) -> 
 		omp_proto::omp::auth::v1::credential_meta::Kind::Aws => "aws",
 		omp_proto::omp::auth::v1::credential_meta::Kind::Unspecified => "unspecified",
 	};
-	let disabled =
-		metadata.state() == omp_proto::omp::auth::v1::credential_meta::State::Disabled;
+	let disabled = metadata.state() == omp_proto::omp::auth::v1::credential_meta::State::Disabled;
 	json!({
 		"id": metadata.id,
 		"provider": metadata.provider,

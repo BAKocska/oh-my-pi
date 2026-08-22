@@ -1129,7 +1129,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--api-key"
 			| "--system-prompt"
 			| "--append-system-prompt"
-			);
+	);
 	if consumes_value {
 		return Some(!inline);
 	}
@@ -1155,7 +1155,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--no-skills"
 			| "--no-rules"
 			| "--no-title"
-			)
+	)
 	.then_some(false)
 }
 
@@ -2138,7 +2138,9 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			.await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
-		Command::Render(args) => crate::render_cmd::run(args, &omp_core::dirs::data_dir(None).into_diagnostic()?),
+		Command::Render(args) => {
+			crate::render_cmd::run(args, &omp_core::dirs::data_dir(None).into_diagnostic()?)
+		},
 		Command::Rpc(args) | Command::RpcUi(args) => crate::rpc_mode::run(args).await,
 		Command::Acp(args) => crate::acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
@@ -2156,7 +2158,9 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Registry(args) => crate::update_cmd::registry(args),
 		Command::Share(args) => crate::share_cmd::run(args).await,
 		Command::Models(args) => crate::models_cmd::run(&args).await,
-		Command::Worktree(args) => crate::worktree_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args),
+		Command::Worktree(args) => {
+			crate::worktree_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args)
+		},
 		Command::Stats(args) => crate::stats_cmd::run(args).await,
 		Command::Gc(args) => crate::gc_cmd::run(args),
 		Command::Gallery(args) => crate::gallery_cmd::run(args),

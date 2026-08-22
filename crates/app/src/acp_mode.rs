@@ -262,9 +262,8 @@ impl omp_tools::ask::AskPresenter for AcpAskPresenter {
 		questions: &'p [omp_tools::ask::Question],
 	) -> Pin<
 		Box<
-			dyn Future<
-					Output = Result<omp_tools::ask::Presentation, omp_tools::ask::Fault>,
-				> + Send
+			dyn Future<Output = Result<omp_tools::ask::Presentation, omp_tools::ask::Fault>>
+				+ Send
 				+ 'p,
 		>,
 	> {
@@ -1812,7 +1811,13 @@ impl Runtime {
 			return Err(miette!("unknown model `{model}`"));
 		}
 		let session = self.session(&session_id)?;
-		session.headless.lock().await.set_model(model).await.into_diagnostic()?;
+		session
+			.headless
+			.lock()
+			.await
+			.set_model(model)
+			.await
+			.into_diagnostic()?;
 		session.meta.lock().model = model.to_owned();
 		self.update(&session_id, json!({"sessionUpdate":"config_option_update","configOptions":[{"id":"model","currentValue":model}]}))?;
 		Ok(json!({}))

@@ -115,11 +115,8 @@ impl AskPresenter for UiRequestPresenter {
 			let mut answers = Vec::with_capacity(questions.len());
 			for question in questions {
 				let (reply, result) = flume::bounded(1);
-				let request = AskRequest {
-					request: dialog_request(question),
-					question: question.clone(),
-					reply,
-				};
+				let request =
+					AskRequest { request: dialog_request(question), question: question.clone(), reply };
 				sender
 					.send(request)
 					.map_err(|_| presenter_fault("interactive UI disconnected"))?;
@@ -307,7 +304,10 @@ mod tests {
 	#[tokio::test(flavor = "current_thread")]
 	async fn presenter_uses_headless_policy_without_bound_host() {
 		*ACTIVE.lock() = None;
-		let result = UiRequestPresenter.present(&[question(false)]).await.unwrap();
+		let result = UiRequestPresenter
+			.present(&[question(false)])
+			.await
+			.unwrap();
 		assert!(result.headless);
 		assert_eq!(result.answers[0].selected, ["Rust"]);
 	}

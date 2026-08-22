@@ -433,6 +433,6 @@ If a refrozen corpus file is also a source-lock input, rebuild the generator whi
 ```sh
 ./target/debug/examples/generate_snapshot
 python3 fixtures/llm-oracle/validate.py --self-test
-cargo test -p omp-catalog --lib taxonomy
-cargo test -p omp-catalog --test compat_cascade
+cargo nextest run -p omp-catalog --lib taxonomy
+cargo nextest run -p omp-catalog --test compat_cascade
 ```

@@ -148,6 +148,7 @@ impl ActorLibei {
 		};
 		Ok((context, PortalSession { session }, targets))
 	}
+
 	pub(crate) fn close(mut self, runtime: &tokio::runtime::Runtime) {
 		if let Some(portal) = self.portal_session.take() {
 			close_session(runtime, &portal.session);

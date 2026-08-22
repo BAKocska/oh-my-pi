@@ -15,8 +15,8 @@ use std::{
 };
 
 use omp_agent::{
-	FiringOutcome, 	MissedRunPolicy, ScheduleBudget, ScheduleDelivery as AgentDelivery, ScheduleScope, Trigger,
-	UpgradePolicy,
+	FiringOutcome, MissedRunPolicy, ScheduleBudget, ScheduleDelivery as AgentDelivery,
+	ScheduleScope, Trigger, UpgradePolicy,
 	scheduler::{
 		BudgetReservation, BudgetUsage, MAX_BACKFILL_RECOVERY, budget_allows, next_occurrence,
 	},
@@ -71,29 +71,29 @@ pub struct ScheduleRow {
 	/// Pinned declaration artifact digest.
 	pub artifact_digest:    Str,
 	/// Pinned or automatic artifact upgrade policy.
-	pub upgrade:             Str,
+	pub upgrade:            Str,
 	/// Skip, coalesce, or backfill recovery policy.
-	pub missed:              Str,
+	pub missed:             Str,
 	/// Optional hard unattended-work budget.
-	pub budget:              Value,
+	pub budget:             Value,
 	/// Skip or queue overlap policy.
-	pub overlap:             Str,
+	pub overlap:            Str,
 	/// Durable declaration timestamp.
-	pub created_ms:          u64,
+	pub created_ms:         u64,
 	/// Next nominal occurrence.
-	pub next_ms:             Option<u64>,
+	pub next_ms:            Option<u64>,
 	/// Latest completed nominal occurrence.
-	pub last_ms:             Option<u64>,
+	pub last_ms:            Option<u64>,
 	/// Completed non-duplicate firing count.
-	pub fire_count:          u64,
+	pub fire_count:         u64,
 	/// Missed or overlap-skipped occurrence count.
-	pub miss_count:          u64,
+	pub miss_count:         u64,
 	/// Declaration replacement generation.
-	pub generation:          u64,
+	pub generation:         u64,
 	/// Creating extension-host generation.
-	pub host_generation:     u64,
+	pub host_generation:    u64,
 	/// Creating Agent-session generation.
-	pub session_generation:  u64,
+	pub session_generation: u64,
 }
 
 /// Stable request passed to the host delivery owner.
@@ -142,10 +142,7 @@ pub trait ScheduleDeliveryBackend: Send + Sync + 'static {
 	}
 
 	/// Returns a conservative reservation before any unattended work starts.
-	async fn estimate(
-		&self,
-		request: &ScheduleDeliveryRequest,
-	) -> Result<BudgetReservation, Str>;
+	async fn estimate(&self, request: &ScheduleDeliveryRequest) -> Result<BudgetReservation, Str>;
 
 	/// Starts, attaches, or injects through the existing Agent control surface.
 	async fn deliver(
@@ -213,7 +210,8 @@ impl DurableScheduleHandle {
 		arguments: Map<String, Value>,
 	) -> Result<Value, DurableScheduleError> {
 		let (reply, response) = flume::bounded(1);
-		self.commands
+		self
+			.commands
 			.send_async(Command::Request {
 				expected_generation: self.generation,
 				caller,
@@ -223,7 +221,10 @@ impl DurableScheduleHandle {
 			})
 			.await
 			.map_err(|_| DurableScheduleError::Closed)?;
-		response.recv_async().await.map_err(|_| DurableScheduleError::Closed)?
+		response
+			.recv_async()
+			.await
+			.map_err(|_| DurableScheduleError::Closed)?
 	}
 
 	/// Replaces the host delivery owner without replacing durable state.
@@ -232,15 +233,15 @@ impl DurableScheduleHandle {
 		backend: Arc<dyn ScheduleDeliveryBackend>,
 	) -> Result<(), DurableScheduleError> {
 		let (reply, response) = flume::bounded(1);
-		self.commands
-			.send_async(Command::BindDelivery {
-				expected_generation: self.generation,
-				backend,
-				reply,
-			})
+		self
+			.commands
+			.send_async(Command::BindDelivery { expected_generation: self.generation, backend, reply })
 			.await
 			.map_err(|_| DurableScheduleError::Closed)?;
-		response.recv_async().await.map_err(|_| DurableScheduleError::Closed)?
+		response
+			.recv_async()
+			.await
+			.map_err(|_| DurableScheduleError::Closed)?
 	}
 
 	/// Processes every occurrence due through `now_ms`.
@@ -249,7 +250,8 @@ impl DurableScheduleHandle {
 	/// owned wall-clock loop.
 	pub async fn process_due(&self, now_ms: u64) -> Result<(), DurableScheduleError> {
 		let (reply, response) = flume::bounded(1);
-		self.commands
+		self
+			.commands
 			.send_async(Command::ProcessDue {
 				expected_generation: self.generation,
 				now_ms,
@@ -258,20 +260,25 @@ impl DurableScheduleHandle {
 			})
 			.await
 			.map_err(|_| DurableScheduleError::Closed)?;
-		response.recv_async().await.map_err(|_| DurableScheduleError::Closed)?
+		response
+			.recv_async()
+			.await
+			.map_err(|_| DurableScheduleError::Closed)?
 	}
+
 	/// Durably removes every session-scoped declaration when its owning Agent
 	/// session lease ends. Project declarations are intentionally untouched.
 	pub async fn expire_session(&self) -> Result<(), DurableScheduleError> {
 		let (reply, response) = flume::bounded(1);
-		self.commands
-			.send_async(Command::ExpireSession {
-				expected_generation: self.generation,
-				reply,
-			})
+		self
+			.commands
+			.send_async(Command::ExpireSession { expected_generation: self.generation, reply })
 			.await
 			.map_err(|_| DurableScheduleError::Closed)?;
-		response.recv_async().await.map_err(|_| DurableScheduleError::Closed)?
+		response
+			.recv_async()
+			.await
+			.map_err(|_| DurableScheduleError::Closed)?
 	}
 }
 
@@ -310,13 +317,7 @@ fn open_scheduler(
 	let projection = journal.replay()?;
 	let (commands, receiver) = flume::unbounded();
 	let handle = DurableScheduleHandle { commands: commands.clone(), generation };
-	let mut owner = Owner {
-		journal,
-		projection,
-		generation,
-		backend,
-		busy_until: BTreeMap::new(),
-	};
+	let mut owner = Owner { journal, projection, generation, backend, busy_until: BTreeMap::new() };
 	tokio::spawn(async move {
 		if owner.backend.is_some() {
 			let _ = owner.process_due(now_ms(), true).await;
@@ -339,7 +340,9 @@ fn open_scheduler(
 					},
 				}
 			} else {
-				let Ok(command) = receiver.recv_async().await else { break };
+				let Ok(command) = receiver.recv_async().await else {
+					break;
+				};
 				owner.handle(command).await;
 			}
 		}
@@ -350,25 +353,25 @@ fn open_scheduler(
 enum Command {
 	Request {
 		expected_generation: u64,
-		caller: ScheduleCaller,
-		operation: Str,
-		arguments: Map<String, Value>,
-		reply: flume::Sender<Result<Value, DurableScheduleError>>,
+		caller:              ScheduleCaller,
+		operation:           Str,
+		arguments:           Map<String, Value>,
+		reply:               flume::Sender<Result<Value, DurableScheduleError>>,
 	},
 	BindDelivery {
 		expected_generation: u64,
-		backend: Arc<dyn ScheduleDeliveryBackend>,
-		reply: flume::Sender<Result<(), DurableScheduleError>>,
+		backend:             Arc<dyn ScheduleDeliveryBackend>,
+		reply:               flume::Sender<Result<(), DurableScheduleError>>,
 	},
 	ProcessDue {
 		expected_generation: u64,
-		now_ms: u64,
-		recovering: bool,
-		reply: Option<flume::Sender<Result<(), DurableScheduleError>>>,
+		now_ms:              u64,
+		recovering:          bool,
+		reply:               Option<flume::Sender<Result<(), DurableScheduleError>>>,
 	},
 	ExpireSession {
 		expected_generation: u64,
-		reply: flume::Sender<Result<(), DurableScheduleError>>,
+		reply:               flume::Sender<Result<(), DurableScheduleError>>,
 	},
 }
 
@@ -476,7 +479,7 @@ impl Owner {
 				Ok(Value::String(result.receipt.to_string()))
 			},
 			_ => Err(DurableScheduleError::Invalid {
-				field: "operation",
+				field:  "operation",
 				reason: sf!("unsupported scheduler operation {operation}"),
 			}),
 		}
@@ -495,7 +498,10 @@ impl Owner {
 		let delivery = arguments.get("delivery").cloned().unwrap_or(Value::Null);
 		let parsed_trigger = parse_trigger(&trigger)?;
 		let parsed_delivery = parse_delivery(&delivery)?;
-		let scope = arguments.get("scope").and_then(Value::as_str).unwrap_or("session");
+		let scope = arguments
+			.get("scope")
+			.and_then(Value::as_str)
+			.unwrap_or("session");
 		let parsed_scope = parse_scope(scope)?;
 		let budget = arguments.get("budget").cloned().unwrap_or(Value::Null);
 		let parsed_budget = parse_budget(&budget)?;
@@ -511,15 +517,23 @@ impl Owner {
 				budget.max_usd_per_firing_micros.is_none()
 					&& budget.max_usd_per_window_micros.is_none()
 					&& budget.max_requests_per_firing.is_none()
-			})
-		{
+			}) {
 			return Err(invalid("budget", "project spawn budget must contain a hard limit"));
 		}
-		let missed = arguments.get("missed").and_then(Value::as_str).unwrap_or("coalesce");
+		let missed = arguments
+			.get("missed")
+			.and_then(Value::as_str)
+			.unwrap_or("coalesce");
 		parse_missed(missed)?;
-		let upgrade = arguments.get("upgrade").and_then(Value::as_str).unwrap_or("pinned");
+		let upgrade = arguments
+			.get("upgrade")
+			.and_then(Value::as_str)
+			.unwrap_or("pinned");
 		parse_upgrade(upgrade)?;
-		let overlap = arguments.get("overlap").and_then(Value::as_str).unwrap_or("skip");
+		let overlap = arguments
+			.get("overlap")
+			.and_then(Value::as_str)
+			.unwrap_or("skip");
 		if !matches!(overlap, "skip" | "queue") {
 			return Err(invalid("overlap", "expected skip or queue"));
 		}
@@ -559,7 +573,9 @@ impl Owner {
 			last_ms: existing.as_ref().and_then(|row| row.last_ms),
 			fire_count: existing.as_ref().map_or(0, |row| row.fire_count),
 			miss_count: existing.as_ref().map_or(0, |row| row.miss_count),
-			generation: existing.as_ref().map_or(1, |row| row.generation.saturating_add(1)),
+			generation: existing
+				.as_ref()
+				.map_or(1, |row| row.generation.saturating_add(1)),
 			host_generation: caller.host_generation,
 			session_generation: caller.session_generation,
 		};
@@ -601,7 +617,9 @@ impl Owner {
 					&& self.can_read(caller, row)
 			})
 			.map(|row| row.id.clone());
-		let Some(id) = id else { return Ok(Value::Bool(false)) };
+		let Some(id) = id else {
+			return Ok(Value::Bool(false));
+		};
 		self.append(Event::Delete { id })?;
 		Ok(Value::Bool(true))
 	}
@@ -628,7 +646,8 @@ impl Owner {
 			.and_then(|value| usize::try_from(value).ok())
 			.unwrap_or(DEFAULT_HISTORY_LIMIT);
 		Ok(Value::Array(
-			self.projection
+			self
+				.projection
 				.history
 				.get(id)
 				.into_iter()
@@ -674,7 +693,11 @@ impl Owner {
 		caller: &ScheduleCaller,
 		id: &str,
 	) -> Result<&'a ScheduleRow, DurableScheduleError> {
-		let row = self.projection.rows.get(id).ok_or(DurableScheduleError::NotFound)?;
+		let row = self
+			.projection
+			.rows
+			.get(id)
+			.ok_or(DurableScheduleError::NotFound)?;
 		if self.can_read(caller, row) {
 			Ok(row)
 		} else {
@@ -686,11 +709,7 @@ impl Owner {
 		row.owner == caller.owner && row.extension_owner == caller.extension_owner
 	}
 
-	async fn process_due(
-		&mut self,
-		now: u64,
-		recovering: bool,
-	) -> Result<(), DurableScheduleError> {
+	async fn process_due(&mut self, now: u64, recovering: bool) -> Result<(), DurableScheduleError> {
 		let pending: Vec<_> = self.projection.pending.values().cloned().collect();
 		for firing in pending {
 			let schedule_id = firing.schedule_id.clone();
@@ -701,9 +720,8 @@ impl Owner {
 				&& row.next_ms == Some(at_ms)
 			{
 				let trigger = parse_trigger(&row.trigger)?;
-				row.next_ms =
-					next_occurrence(&trigger, row.id.as_str(), row.created_ms, at_ms)
-						.map_err(|error| invalid("trigger", error.to_string()))?;
+				row.next_ms = next_occurrence(&trigger, row.id.as_str(), row.created_ms, at_ms)
+					.map_err(|error| invalid("trigger", error.to_string()))?;
 				if matches!(trigger, Trigger::At { .. }) {
 					row.enabled = false;
 				}
@@ -718,7 +736,9 @@ impl Owner {
 			.map(|row| row.id.clone())
 			.collect();
 		for id in ids {
-			self.process_schedule_due(id.as_str(), now, recovering).await?;
+			self
+				.process_schedule_due(id.as_str(), now, recovering)
+				.await?;
 		}
 		Ok(())
 	}
@@ -729,14 +749,18 @@ impl Owner {
 		now: u64,
 		recovering: bool,
 	) -> Result<(), DurableScheduleError> {
-		let mut row = self.projection.rows.get(id).cloned().ok_or(DurableScheduleError::NotFound)?;
+		let mut row = self
+			.projection
+			.rows
+			.get(id)
+			.cloned()
+			.ok_or(DurableScheduleError::NotFound)?;
 		let trigger = parse_trigger(&row.trigger)?;
 		if let Trigger::AfterIdle { idle } = &trigger {
-			let backend = self
-				.backend
-				.as_ref()
-				.map(Arc::clone)
-				.ok_or_else(|| DurableScheduleError::Delivery(Str::from("delivery owner is absent")))?;
+			let backend =
+				self.backend.as_ref().map(Arc::clone).ok_or_else(|| {
+					DurableScheduleError::Delivery(Str::from("delivery owner is absent"))
+				})?;
 			let settled_since = backend
 				.settled_since_ms(&row)
 				.await
@@ -760,12 +784,16 @@ impl Owner {
 			row.next_ms = target;
 		}
 		let mut due = Vec::new();
-		let Some(mut cursor) = row.next_ms else { return Ok(()) };
+		let Some(mut cursor) = row.next_ms else {
+			return Ok(());
+		};
 		while cursor <= now && due.len() < MAX_RECOVERED_OCCURRENCES {
 			due.push(cursor);
 			let Some(next) = next_occurrence(&trigger, id, row.created_ms, cursor)
 				.map_err(|error| invalid("trigger", error.to_string()))?
-			else { break };
+			else {
+				break;
+			};
 			cursor = next;
 		}
 		if due.len() == MAX_RECOVERED_OCCURRENCES && cursor <= now {
@@ -795,8 +823,8 @@ impl Owner {
 				journaled_skips = journaled_skips.saturating_add(1);
 			}
 		}
-		let missed_context = recovering
-			|| matches!(&trigger, Trigger::At { epoch_ms } if *epoch_ms < row.created_ms);
+		let missed_context =
+			recovering || matches!(&trigger, Trigger::At { epoch_ms } if *epoch_ms < row.created_ms);
 		if missed_context {
 			match parse_missed(row.missed.as_str())? {
 				MissedRunPolicy::Skip => {
@@ -845,12 +873,18 @@ impl Owner {
 			.get(id)
 			.cloned()
 			.unwrap_or_else(|| row.clone());
-		updated.miss_count = updated.miss_count.saturating_add(skipped.saturating_sub(journaled_skips));
+		updated.miss_count = updated
+			.miss_count
+			.saturating_add(skipped.saturating_sub(journaled_skips));
 		updated.next_ms = next_occurrence(&trigger, id, row.created_ms, *due.last().unwrap_or(&now))
 			.map_err(|error| invalid("trigger", error.to_string()))?;
 		if let Trigger::AfterIdle { idle } = &trigger {
 			updated.next_ms = Some(
-				now.saturating_add(u64::try_from(idle.as_millis()).unwrap_or(u64::MAX).max(1_000)),
+				now.saturating_add(
+					u64::try_from(idle.as_millis())
+						.unwrap_or(u64::MAX)
+						.max(1_000),
+				),
 			);
 		}
 		if matches!(trigger, Trigger::At { .. }) {
@@ -863,6 +897,7 @@ impl Owner {
 		}
 		Ok(())
 	}
+
 	fn skip_occurrence(
 		&mut self,
 		row: &ScheduleRow,
@@ -876,13 +911,7 @@ impl Owner {
 		}
 		let intent = FiringRecord::intent(row, key, at_ms, now, self.generation);
 		self.append(Event::FiringIntent { firing: intent.clone() })?;
-		let outcome = intent.finished(
-			FiringOutcome::Skipped,
-			None,
-			Some(Str::from(detail)),
-			0,
-			0,
-		);
+		let outcome = intent.finished(FiringOutcome::Skipped, None, Some(Str::from(detail)), 0, 0);
 		self.append(Event::FiringOutcome { firing: outcome })
 	}
 
@@ -913,7 +942,10 @@ impl Owner {
 				self.generation,
 			);
 			self.append(Event::FiringOutcome { firing })?;
-			return Ok(FireResult { receipt: Str::from("delivered"), outcome: FiringOutcome::Duplicate });
+			return Ok(FireResult {
+				receipt: Str::from("delivered"),
+				outcome: FiringOutcome::Duplicate,
+			});
 		}
 		let firing = FiringRecord::intent(&row, key, at_ms, now, self.generation);
 		self.append(Event::FiringIntent { firing: firing.clone() })?;
@@ -925,10 +957,22 @@ impl Owner {
 		firing: FiringRecord,
 		now: u64,
 	) -> Result<FireResult, DurableScheduleError> {
-		if self.projection.completed.contains(firing.idempotency_key.as_str()) {
-			return Ok(FireResult { receipt: Str::from("delivered"), outcome: FiringOutcome::Duplicate });
+		if self
+			.projection
+			.completed
+			.contains(firing.idempotency_key.as_str())
+		{
+			return Ok(FireResult {
+				receipt: Str::from("delivered"),
+				outcome: FiringOutcome::Duplicate,
+			});
 		}
-		let Some(row) = self.projection.rows.get(firing.schedule_id.as_str()).cloned() else {
+		let Some(row) = self
+			.projection
+			.rows
+			.get(firing.schedule_id.as_str())
+			.cloned()
+		else {
 			let outcome = firing.finished(
 				FiringOutcome::Failed,
 				None,
@@ -951,11 +995,11 @@ impl Owner {
 			return Ok(FireResult { receipt: Str::from("failed"), outcome: FiringOutcome::Skipped });
 		}
 		let request = ScheduleDeliveryRequest {
-			schedule: row.clone(),
-			idempotency_key: firing.idempotency_key.clone(),
-			at_ms: firing.at_ms,
+			schedule:             row.clone(),
+			idempotency_key:      firing.idempotency_key.clone(),
+			at_ms:                firing.at_ms,
 			scheduler_generation: self.generation,
-			schedule_generation: row.generation,
+			schedule_generation:  row.generation,
 		};
 		let Some(backend) = self.backend.as_ref().map(Arc::clone) else {
 			return Err(DurableScheduleError::Delivery(Str::from(
@@ -972,10 +1016,9 @@ impl Owner {
 		};
 		if let Some(budget) = parse_budget(&row.budget)? {
 			let window_ms = u64::try_from(budget.window.as_millis()).unwrap_or(u64::MAX);
-			let usage = self.projection.budget_usage(
-				row.id.as_str(),
-				now.saturating_sub(window_ms),
-			);
+			let usage = self
+				.projection
+				.budget_usage(row.id.as_str(), now.saturating_sub(window_ms));
 			if !budget_allows(budget, usage, reservation) {
 				let outcome = firing.finished(
 					FiringOutcome::BudgetRefused,
@@ -1051,13 +1094,7 @@ struct FiringRecord {
 }
 
 impl FiringRecord {
-	fn intent(
-		row: &ScheduleRow,
-		key: Str,
-		at_ms: u64,
-		now: u64,
-		scheduler_generation: u64,
-	) -> Self {
+	fn intent(row: &ScheduleRow, key: Str, at_ms: u64, now: u64, scheduler_generation: u64) -> Self {
 		Self {
 			schedule_id: row.id.clone(),
 			idempotency_key: key,
@@ -1089,8 +1126,13 @@ impl FiringRecord {
 		requests: u64,
 		scheduler_generation: u64,
 	) -> Self {
-		Self::intent(row, key, at_ms, now, scheduler_generation)
-			.finished(outcome, run_id, detail, cost_micros, requests)
+		Self::intent(row, key, at_ms, now, scheduler_generation).finished(
+			outcome,
+			run_id,
+			detail,
+			cost_micros,
+			requests,
+		)
 	}
 
 	fn finished(
@@ -1163,14 +1205,19 @@ impl Projection {
 					if let Some(row) = self.rows.get_mut(firing.schedule_id.as_str()) {
 						row.fire_count = row.fire_count.saturating_add(1);
 						row.last_ms = Some(
-							row.last_ms.map_or(firing.at_ms, |last| last.max(firing.at_ms)),
+							row.last_ms
+								.map_or(firing.at_ms, |last| last.max(firing.at_ms)),
 						);
 						if firing.outcome.as_deref() == Some("skipped") {
 							row.miss_count = row.miss_count.saturating_add(1);
 						}
 					}
 				}
-				self.history.entry(firing.schedule_id.clone()).or_default().push(firing);
+				self
+					.history
+					.entry(firing.schedule_id.clone())
+					.or_default()
+					.push(firing);
 			},
 		}
 	}
@@ -1179,7 +1226,8 @@ impl Projection {
 		if !self.pending.is_empty() {
 			return Some(0);
 		}
-		self.rows
+		self
+			.rows
 			.values()
 			.filter(|row| row.enabled)
 			.filter_map(|row| row.next_ms)
@@ -1187,14 +1235,15 @@ impl Projection {
 	}
 
 	fn budget_usage(&self, schedule_id: &str, since_ms: u64) -> BudgetUsage {
-		self.history
+		self
+			.history
 			.get(schedule_id)
 			.into_iter()
 			.flatten()
 			.filter(|firing| firing.completed_ms >= since_ms)
 			.fold(BudgetUsage::default(), |usage, firing| BudgetUsage {
 				cost_micros: usage.cost_micros.saturating_add(firing.cost_micros),
-				requests: usage.requests.saturating_add(firing.requests),
+				requests:    usage.requests.saturating_add(firing.requests),
 			})
 	}
 }
@@ -1230,11 +1279,9 @@ impl ScheduleJournal {
 	fn bump_generation(&mut self) -> Result<u64, DurableScheduleError> {
 		let transaction = self.connection.transaction()?;
 		let current = transaction
-			.query_row(
-				"SELECT value FROM schedule_meta WHERE key = 'owner_generation'",
-				[],
-				|row| row.get::<_, u64>(0),
-			)
+			.query_row("SELECT value FROM schedule_meta WHERE key = 'owner_generation'", [], |row| {
+				row.get::<_, u64>(0)
+			})
 			.optional()?
 			.unwrap_or(0);
 		let next = current.saturating_add(1);
@@ -1246,6 +1293,7 @@ impl ScheduleJournal {
 		transaction.commit()?;
 		Ok(next)
 	}
+
 	fn active_generation(&self) -> Result<u64, DurableScheduleError> {
 		Ok(self.connection.query_row(
 			"SELECT value FROM schedule_meta WHERE key = 'owner_generation'",
@@ -1275,10 +1323,7 @@ impl ScheduleJournal {
 			|row| row.get::<_, u64>(0),
 		)?;
 		if active != generation {
-			return Err(DurableScheduleError::StaleGeneration {
-				expected: generation,
-				active,
-			});
+			return Err(DurableScheduleError::StaleGeneration { expected: generation, active });
 		}
 		transaction.execute(
 			"INSERT INTO schedule_journal(owner_generation, written_ms, event_json)
@@ -1304,7 +1349,9 @@ fn initial_occurrence(
 }
 
 fn parse_trigger(value: &Value) -> Result<Trigger, DurableScheduleError> {
-	let object = value.as_object().ok_or_else(|| invalid("trigger", "expected object"))?;
+	let object = value
+		.as_object()
+		.ok_or_else(|| invalid("trigger", "expected object"))?;
 	match object.get("kind").and_then(Value::as_str) {
 		Some("at") => Ok(Trigger::At { epoch_ms: required_u64(object, "epoch_ms", "trigger")? }),
 		Some("every") => {
@@ -1314,29 +1361,43 @@ fn parse_trigger(value: &Value) -> Result<Trigger, DurableScheduleError> {
 			}
 			Ok(Trigger::Every {
 				interval: Duration::from_millis(interval),
-				jitter: Duration::from_millis(object.get("jitter_ms").and_then(Value::as_u64).unwrap_or(0)),
-				align: object.get("align").and_then(Value::as_bool).unwrap_or(false),
+				jitter:   Duration::from_millis(
+					object.get("jitter_ms").and_then(Value::as_u64).unwrap_or(0),
+				),
+				align:    object
+					.get("align")
+					.and_then(Value::as_bool)
+					.unwrap_or(false),
 			})
 		},
 		Some("after_idle") => Ok(Trigger::AfterIdle {
 			idle: Duration::from_millis(required_u64(object, "idle_ms", "trigger")?),
 		}),
 		Some("cron") => Ok(Trigger::Cron {
-			expr: Str::from(required_object_string(object, "expr", "trigger")?),
-			timezone: Str::from(object.get("timezone").and_then(Value::as_str).unwrap_or("UTC")),
+			expr:     Str::from(required_object_string(object, "expr", "trigger")?),
+			timezone: Str::from(
+				object
+					.get("timezone")
+					.and_then(Value::as_str)
+					.unwrap_or("UTC"),
+			),
 		}),
 		_ => Err(invalid("trigger", "unknown trigger kind")),
 	}
 }
 
 fn parse_delivery(value: &Value) -> Result<AgentDelivery, DurableScheduleError> {
-	let object = value.as_object().ok_or_else(|| invalid("delivery", "expected object"))?;
+	let object = value
+		.as_object()
+		.ok_or_else(|| invalid("delivery", "expected object"))?;
 	match object.get("kind").and_then(Value::as_str) {
 		Some("inject") => Ok(AgentDelivery::Inject {
 			prompt: Str::from(required_object_string(object, "prompt", "delivery")?),
 		}),
 		Some("spawn") => {
-			let spec = object.get("spec").ok_or_else(|| invalid("delivery", "spawn spec is required"))?;
+			let spec = object
+				.get("spec")
+				.ok_or_else(|| invalid("delivery", "spawn spec is required"))?;
 			let spec_id = spec
 				.as_object()
 				.and_then(|spec| spec.get("id").or_else(|| spec.get("name")))
@@ -1352,7 +1413,9 @@ fn parse_budget(value: &Value) -> Result<Option<ScheduleBudget>, DurableSchedule
 	if value.is_null() {
 		return Ok(None);
 	}
-	let object = value.as_object().ok_or_else(|| invalid("budget", "expected object"))?;
+	let object = value
+		.as_object()
+		.ok_or_else(|| invalid("budget", "expected object"))?;
 	let window_ms = object.get("window_ms").and_then(Value::as_u64).unwrap_or(0);
 	let max_usd_per_firing_micros = optional_usd_micros(object, "max_usd_per_firing")?;
 	let max_usd_per_window_micros = optional_usd_micros(object, "max_usd_per_window")?;
@@ -1379,7 +1442,9 @@ fn optional_usd_micros(
 	object: &Map<String, Value>,
 	name: &'static str,
 ) -> Result<Option<u64>, DurableScheduleError> {
-	let Some(value) = object.get(name) else { return Ok(None) };
+	let Some(value) = object.get(name) else {
+		return Ok(None);
+	};
 	if value.is_null() {
 		return Ok(None);
 	}

@@ -6,8 +6,7 @@ use std::{
 	ops::ControlFlow,
 	path::{Path, PathBuf},
 	sync::{
-		Arc,
-		Weak,
+		Arc, Weak,
 		atomic::{AtomicU8, AtomicU64, Ordering},
 	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
@@ -718,17 +717,18 @@ impl DeclaredExternalDomain {
 	fn declared(self, manifest: &super::exthost::ExtensionManifest) -> bool {
 		let declarations = manifest.static_declarations();
 		match self {
-			Self::Policy => manifest
-				.static_declarations()
-				.capability_grants
-				.keys()
-				.any(|capability| {
-					capability.as_str().starts_with("policy") || capability.as_str().starts_with("approvals")
-				}),
-			Self::Parameters => manifest.declarations.tools().next().is_some(),
-			Self::Workers => {
-				!declarations.workers.is_empty() || !declarations.placement.is_empty()
+			Self::Policy => {
+				manifest
+					.static_declarations()
+					.capability_grants
+					.keys()
+					.any(|capability| {
+						capability.as_str().starts_with("policy")
+							|| capability.as_str().starts_with("approvals")
+					})
 			},
+			Self::Parameters => manifest.declarations.tools().next().is_some(),
+			Self::Workers => !declarations.workers.is_empty() || !declarations.placement.is_empty(),
 			Self::DirectFilesystem => manifest
 				.declarations
 				.permits(super::exthost::lifecycle::EscapeCapability::DirectFilesystem),
@@ -772,6 +772,7 @@ impl DeclaredExternalDomain {
 			Self::Services => "services",
 		}
 	}
+
 	fn factory(
 		self,
 		factories: &super::worker::ExternalDomainControlFactories,
@@ -933,9 +934,7 @@ impl ControlAuthorityFactory for CompositeControlFactory {
 			owners.push(owner.bind(Arc::clone(&identity))?);
 		}
 		let effects = Arc::new(UndeclaredControlAuthority);
-		Ok(Arc::new(
-			super::exthost::control::CompositeControlAuthority::new(owners, effects),
-		))
+		Ok(Arc::new(super::exthost::control::CompositeControlAuthority::new(owners, effects)))
 	}
 }
 
@@ -1620,30 +1619,27 @@ fn production_control_authorities(
 		.iter()
 		.flat_map(|extension| extension.manifest.declarations.hooks())
 		.map(|hook| {
-			(
-				hook.event.clone(),
-				HookEventPolicy {
-					revision: 1,
-					timeout: Duration::from_secs(30),
-					on_failure: HookFailurePolicy::Defer,
-					default: serde_json::Value::Null,
-					composition: BTreeMap::new(),
-				},
-			)
+			(hook.event.clone(), HookEventPolicy {
+				revision:    1,
+				timeout:     Duration::from_secs(30),
+				on_failure:  HookFailurePolicy::Defer,
+				default:     serde_json::Value::Null,
+				composition: BTreeMap::new(),
+			})
 		})
 		.collect();
 	let hooks: Arc<dyn ControlAuthorityFactory> =
 		HookControlFactory::new(Arc::clone(&registry_owner), callbacks.clone(), hook_policies);
 	let registry_factory: Arc<dyn ControlAuthorityFactory> = registry_owner.clone();
 	let envd: Arc<dyn ControlAuthorityFactory> = Arc::new(ProductionEnvdControlFactory {
-		state_dir: state_dir.to_path_buf(),
+		state_dir:  state_dir.to_path_buf(),
 		session_id: session_id.clone(),
-		telemetry: Arc::clone(telemetry),
-		intents: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
-		manifests: Arc::clone(&manifests),
+		telemetry:  Arc::clone(telemetry),
+		intents:    Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+		manifests:  Arc::clone(&manifests),
 		registries: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
-		registry: Arc::clone(&registry_owner),
-		resources: Arc::clone(&resources),
+		registry:   Arc::clone(&registry_owner),
+		resources:  Arc::clone(&resources),
 	});
 	let registry = RegistryControlAuthorities::new(registry_factory, devices, hooks);
 	let provenances = Arc::new(
@@ -2105,7 +2101,10 @@ impl EnvServer {
 			previews,
 			sessions_index,
 			journal_external,
-			workers: Arc::new(WorkerSupervisor::new(DEFAULT_WORKER_LAYER_CEILING, DEFAULT_MAX_CONCURRENT_SPAWNS)),
+			workers: Arc::new(WorkerSupervisor::new(
+				DEFAULT_WORKER_LAYER_CEILING,
+				DEFAULT_MAX_CONCURRENT_SPAWNS,
+			)),
 			authority,
 			repository_revision: AtomicU64::new(0),
 			process_store: super::process_store::ProcessStore::new(
@@ -2205,9 +2204,11 @@ impl EnvServer {
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
-		control_bindings.callbacks.bind(Arc::new(WeakExtensionCallbackDispatcher {
-			supervisor: Arc::downgrade(&ext_hosts),
-		}));
+		control_bindings
+			.callbacks
+			.bind(Arc::new(WeakExtensionCallbackDispatcher {
+				supervisor: Arc::downgrade(&ext_hosts),
+			}));
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
@@ -2384,9 +2385,11 @@ impl EnvServer {
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
-		control_bindings.callbacks.bind(Arc::new(WeakExtensionCallbackDispatcher {
-			supervisor: Arc::downgrade(&ext_hosts),
-		}));
+		control_bindings
+			.callbacks
+			.bind(Arc::new(WeakExtensionCallbackDispatcher {
+				supervisor: Arc::downgrade(&ext_hosts),
+			}));
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
@@ -2570,15 +2573,15 @@ impl EnvServer {
 	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
 		self.ext_hosts.control_authority(identity)
 	}
+
 	/// Returns the generation-fenced callback transport shared by provider,
 	/// campaign, presentation, and verdict backends.
 	pub fn extension_callback_dispatcher(
 		&self,
 	) -> Arc<dyn super::exthost::dispatch::CallbackDispatcher> {
-		Arc::new(WeakExtensionCallbackDispatcher {
-			supervisor: Arc::downgrade(&self.ext_hosts),
-		})
+		Arc::new(WeakExtensionCallbackDispatcher { supervisor: Arc::downgrade(&self.ext_hosts) })
 	}
+
 	/// Returns the sealed deployment manifest for an exact live CONTROL
 	/// connection generation.
 	pub fn extension_control_manifest(
@@ -2587,6 +2590,7 @@ impl EnvServer {
 	) -> Option<super::exthost::ExtensionManifest> {
 		self.ext_hosts.control_manifest(identity)
 	}
+
 	/// Returns the full frozen runtime provider/campaign declaration projection
 	/// for an exact authenticated connection generation.
 	pub fn extension_registry_evidence(
@@ -2680,6 +2684,7 @@ impl EnvServer {
 	) -> crate::worker::AgentsControlAuthorityBinding {
 		self.ext_hosts.bind_agents_control_authority(factory)
 	}
+
 	/// Atomically installs and generation-fences the driver/app CONTROL domain
 	/// bundle. Dropping the returned lease revokes only this exact binding.
 	pub fn bind_domain_control_factories(
@@ -2689,6 +2694,7 @@ impl EnvServer {
 		factories.services = Some(self.ext_hosts.service_control_factory());
 		self.ext_hosts.bind_domain_control_factories(factories)
 	}
+
 	/// Atomically installs Agents and all driver/app CONTROL owners under one
 	/// replacement/revocation lease.
 	pub fn bind_external_control_authorities(
@@ -2697,7 +2703,9 @@ impl EnvServer {
 		mut domains: super::worker::ExternalDomainControlFactories,
 	) -> super::worker::ExternalControlAuthorityBinding {
 		domains.services = Some(self.ext_hosts.service_control_factory());
-		self.ext_hosts.bind_external_control_authorities(agents, domains)
+		self
+			.ext_hosts
+			.bind_external_control_authorities(agents, domains)
 	}
 
 	/// Binds the active Agent Journal mailbox to authenticated extension
@@ -2733,6 +2741,7 @@ impl EnvServer {
 			.bind_observer(super::staged_preview::observer(sender));
 		Ok(AgentControlBinding { server: Arc::clone(self), id })
 	}
+
 	/// Installs the project-lifetime owner for durable scheduled Agent
 	/// delivery. The backend is retained by envd independently of any chat UI.
 	pub(crate) async fn bind_schedule_delivery(
@@ -9654,10 +9663,15 @@ mod tests {
 		))
 		.await
 		.expect("empty extension supervisor");
-		let memory_runtime =
-			start_memory_runtime(&HostSettings::default(), state.path(), workspace.root(), &sf!("test-session"), &exec)
-				.await
-				.expect("memory runtime");
+		let memory_runtime = start_memory_runtime(
+			&HostSettings::default(),
+			state.path(),
+			workspace.root(),
+			&sf!("test-session"),
+			&exec,
+		)
+		.await
+		.expect("memory runtime");
 		let mcp = McpService::open(state.path().join("mcp-cache.sqlite3")).expect("MCP service");
 		let mcp_manager = McpManager::new(
 			Arc::clone(&mcp),

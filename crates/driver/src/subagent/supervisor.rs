@@ -11,8 +11,9 @@ use std::{
 use omp_agent::{
 	AbortHandle, Agent, AgentError, AgentEvent, AgentNode, AgentRunSummary, AgentStatus, AgentTree,
 	AgentTreeLimits, Interrupt, InterruptClass, InterruptSource, JobBoard, MailboxSender,
-	SubagentActivity, SubagentActivityKind, SubagentDisposition, SubagentLifecycle, SubagentRunState,
-	SubagentProgressSnapshot, SubagentStateError, SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId,
+	SubagentActivity, SubagentActivityKind, SubagentDisposition, SubagentLifecycle,
+	SubagentProgressSnapshot, SubagentRunState, SubagentStateError, SubagentTerminalKind,
+	SubagentTerminalStatus, TurnClient, TurnId,
 };
 use omp_core::{Str, sf};
 use omp_proto::{
@@ -130,6 +131,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 	pub fn parent_jobs(&self) -> Option<Arc<JobBoard>> {
 		self.parent_jobs.read().clone()
 	}
+
 	/// Returns a coherent snapshot of configured admission limits and current
 	/// occupancy.
 	pub fn limits(&self) -> AgentTreeLimits {
@@ -153,7 +155,9 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			return Some(Str::new(stable));
 		}
 		let node = self.tree.named(stable)?;
-		children.contains_key(node.id.as_str()).then(|| node.id.clone())
+		children
+			.contains_key(node.id.as_str())
+			.then(|| node.id.clone())
 	}
 
 	/// Returns retained handle metadata rewritten for the current generation.
@@ -348,6 +352,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		}
 		Ok(())
 	}
+
 	/// Requests cooperative cancellation with the caller's reason, then
 	/// escalates to the generation abort handle after the courtesy grace.
 	pub async fn cancel_with_grace(
@@ -364,26 +369,20 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 				.get(id)
 				.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::new(id) })?;
 			*child.cancel_reason.write() = Some(reason.clone());
-			(
-				Arc::clone(&child.state),
-				child.mailbox.read().clone(),
-				Arc::clone(&child.abort),
-			)
+			(Arc::clone(&child.state), child.mailbox.read().clone(), Arc::clone(&child.abort))
 		};
 		if let Some(mailbox) = mailbox {
 			let _ = mailbox.try_enqueue(Interrupt {
-				class: InterruptClass::Immediate,
-				item: system_item(reason),
+				class:  InterruptClass::Immediate,
+				item:   system_item(reason),
 				source: InterruptSource::Producer(sf!("cancel")),
 			});
 		}
 		if !grace.is_zero() {
 			tokio::time::sleep(grace).await;
 		}
-		if !matches!(
-			state.lifecycle(),
-			SubagentLifecycle::Settled | SubagentLifecycle::Parked
-		) && let Some(abort) = abort.read().as_ref()
+		if !matches!(state.lifecycle(), SubagentLifecycle::Settled | SubagentLifecycle::Parked)
+			&& let Some(abort) = abort.read().as_ref()
 		{
 			abort.abort();
 		}
@@ -422,6 +421,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			.get(id)
 			.and_then(|child| child.metadata.read().clone())
 	}
+
 	/// Retains the completed public result emitted by the child application.
 	pub fn set_result(&self, id: &str, result: serde_json::Value) -> Result<(), SupervisorError> {
 		let children = self.children.read();
@@ -484,6 +484,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			.get(id)
 			.map(|child| Arc::clone(&child.state))
 	}
+
 	/// Aggregates the latest retained progress for one child and every
 	/// descendant using the authoritative tree lineage.
 	pub fn subtree_progress(&self, id: &str) -> Option<SubagentProgressSnapshot> {
@@ -493,7 +494,9 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		for node in self.tree.roster() {
 			let mut current = Some(Arc::clone(node));
 			let included = loop {
-				let Some(candidate) = current else { break false };
+				let Some(candidate) = current else {
+					break false;
+				};
 				if candidate.id == id {
 					break true;
 				}
@@ -542,6 +545,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		}
 		Ok(state)
 	}
+
 	/// Cold-reconstructs a parked child and returns its new fenced generation.
 	pub async fn revive(&self, reference: &str) -> Result<u64, SupervisorError> {
 		let id = self
@@ -573,6 +577,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		self.state_at_generation(id, generation)?;
 		self.park(id).await
 	}
+
 	/// Relinquishes structural supervision without cancelling the generation.
 	///
 	/// A running actor finishes its current generation before processing the
@@ -583,10 +588,8 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		generation: u64,
 	) -> Result<(), SupervisorError> {
 		let state = self.state_at_generation(id, generation)?;
-		let active = !matches!(
-			state.lifecycle(),
-			SubagentLifecycle::Settled | SubagentLifecycle::Parked
-		);
+		let active =
+			!matches!(state.lifecycle(), SubagentLifecycle::Settled | SubagentLifecycle::Parked);
 		let child = self
 			.children
 			.write()
@@ -675,15 +678,8 @@ async fn child_loop<C: TurnClient + Clone + Send + 'static>(
 				let _ = command.reply.send(result);
 			},
 			ChildCommand::Revive(reply) => {
-				let result = revive_child(
-					&node,
-					&state,
-					&mut runtime,
-					reviver.as_ref(),
-					&abort,
-					&mailbox,
-				)
-				.await;
+				let result =
+					revive_child(&node, &state, &mut runtime, reviver.as_ref(), &abort, &mailbox).await;
 				let _ = reply.send(result);
 			},
 			ChildCommand::Park(reason, reply) => {
@@ -726,7 +722,7 @@ async fn revive_child<C: TurnClient + Clone + Send + 'static>(
 ) -> Result<u64, SupervisorError> {
 	if state.lifecycle() != SubagentLifecycle::Parked {
 		return Err(SupervisorError::NotParked {
-			id: node.id.clone(),
+			id:        node.id.clone(),
 			lifecycle: state.lifecycle(),
 		});
 	}

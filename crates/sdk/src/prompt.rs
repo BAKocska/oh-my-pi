@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use omp_agent::{
-	PromptError, PromptOut, PromptPatchSet, RenderedPrompt, SlotAssembler, SlotClass, SlotDecl,
-	SlotId, SlotRegistration, SlotSource, Props,
+	PromptError, PromptOut, PromptPatchSet, Props, RenderedPrompt, SlotAssembler, SlotClass,
+	SlotDecl, SlotId, SlotRegistration, SlotSource,
 };
 use omp_core::Str;
 use thiserror::Error;
@@ -30,11 +30,7 @@ pub struct PromptContribution {
 struct TextContribution(Str);
 
 impl SlotSource for TextContribution {
-	fn render(
-		&self,
-		_workspace: &Props,
-		out: &mut dyn PromptOut,
-	) -> Result<(), PromptError> {
+	fn render(&self, _workspace: &Props, out: &mut dyn PromptOut) -> Result<(), PromptError> {
 		out.write_str(&self.0);
 		Ok(())
 	}

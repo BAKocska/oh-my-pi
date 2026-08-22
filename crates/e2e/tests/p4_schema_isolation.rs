@@ -464,8 +464,10 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 				.description
 				.as_ref()
 				.map_or_else(String::new, ToString::to_string),
-			schema_json: Bytes::copy_from_slice(&advertised_schema),
-			strict:      Some(strict),
+			input:       Some(pb::tool_def::Input::JsonSchema(pb::tool_def::JsonSchema {
+				schema_json: Bytes::copy_from_slice(&advertised_schema),
+				strict:      Some(strict),
+			})),
 		}],
 		..Default::default()
 	};

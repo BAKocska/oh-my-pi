@@ -11,13 +11,12 @@ use std::{
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
 use omp_core::{Str, encoding::hex};
-use ring::digest::{SHA256, digest};
-use serde::Serialize;
-
 use omp_ext::{
 	index::{IndexArtifact, IndexExtension, IndexRelease, SignedIndex},
 	trust::{KeysFile, verify_artifact_signature},
 };
+use ring::digest::{SHA256, digest};
+use serde::Serialize;
 
 use crate::cli::{RegistryArgs, UpdateArgs};
 

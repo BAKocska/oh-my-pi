@@ -85,6 +85,7 @@ impl DraftStore {
 #[cfg(test)]
 mod tests {
 	use std::collections::BTreeSet;
+
 	use omp_core::Str;
 	use tempfile::tempdir;
 

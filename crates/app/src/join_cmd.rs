@@ -42,14 +42,15 @@ pub async fn run(executor: Executor, args: JoinArgs) -> miette::Result<()> {
 	let outcome = match joined {
 		Ok(_) => {
 			let mut updates = replica.subscribe();
-			executor.timeout(SNAPSHOT_TIMEOUT, async {
-				while !updates.borrow().ready {
-					updates.changed().await.into_diagnostic()?;
-				}
-				Ok::<(), miette::Report>(())
-			})
-			.await
-			.map_err(|_| miette::miette!("timed out waiting for the collaboration snapshot"))??;
+			executor
+				.timeout(SNAPSHOT_TIMEOUT, async {
+					while !updates.borrow().ready {
+						updates.changed().await.into_diagnostic()?;
+					}
+					Ok::<(), miette::Report>(())
+				})
+				.await
+				.map_err(|_| miette::miette!("timed out waiting for the collaboration snapshot"))??;
 			crate::chat_ui::run_guest(
 				executor.clone(),
 				replica,
@@ -71,7 +72,8 @@ pub async fn run(executor: Executor, args: JoinArgs) -> miette::Result<()> {
 	}
 	drop(collab);
 	replica_shutdown.stop().await;
-	if executor.timeout(SHUTDOWN_TIMEOUT, &mut owner_task)
+	if executor
+		.timeout(SHUTDOWN_TIMEOUT, &mut owner_task)
 		.await
 		.is_err()
 	{

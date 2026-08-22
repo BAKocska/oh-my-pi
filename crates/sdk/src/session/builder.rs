@@ -6,7 +6,7 @@ use std::{
 	time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use omp_agent::{PromptHash, PromptFacts, RenderedPrompt};
+use omp_agent::{PromptFacts, PromptHash, RenderedPrompt};
 use omp_catalog::{CandidateProvenance, Catalog, TransportKind};
 use omp_core::{Hash32, Str, sf};
 use omp_inference::transport::http::{HttpTransport, PreconnectLaunch};
@@ -454,10 +454,7 @@ impl SessionBuilder {
 		if let Some(callback) = self.callbacks.system_prompt.clone() {
 			compiler = compiler.callback(callback);
 		}
-		let prompt = compiler.compile(
-			&workspace
-				.props()
-				.map_err(PromptPatchError::from)?)?;
+		let prompt = compiler.compile(&workspace.props().map_err(PromptPatchError::from)?)?;
 		let shape = session_shape(
 			&options,
 			&roots,

@@ -365,7 +365,7 @@ message ControlEvent {
     ReceiptMsg receipt = 5;
     MessageMsg message = 6;
     SpawnLimitsMsg spawn_limits = 7;
-SessionDeltaMsg session_delta = 8;
+    SessionDeltaMsg session_delta = 8;
   }
   omp.inference.v1.ValueMap props = 15;
 }

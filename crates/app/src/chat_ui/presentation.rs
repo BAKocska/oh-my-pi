@@ -1,8 +1,10 @@
-//! Data-only production bridge between extension presentation authorities and an attached UI.
+//! Data-only production bridge between extension presentation authorities and
+//! an attached UI.
 //!
-//! The bridge deliberately carries typed presentation values rather than terminal handles. An
-//! attachment is generation-scoped: replacing or dropping it fails every correlated waiter, and
-//! dropping a request future removes its reply slot.
+//! The bridge deliberately carries typed presentation values rather than
+//! terminal handles. An attachment is generation-scoped: replacing or dropping
+//! it fails every correlated waiter, and dropping a request future removes its
+//! reply slot.
 
 use std::{
 	collections::BTreeMap,
@@ -57,10 +59,12 @@ struct BridgeInner {
 	state:    Mutex<BridgeState>,
 }
 
-/// Cloneable presentation client installed before the interactive renderer attaches.
+/// Cloneable presentation client installed before the interactive renderer
+/// attaches.
 ///
-/// It is safe to put this object in per-connection authority factories. A later call to
-/// [`Self::attach`] atomically replaces the old surface and tears down its outstanding dialogs.
+/// It is safe to put this object in per-connection authority factories. A later
+/// call to [`Self::attach`] atomically replaces the old surface and tears down
+/// its outstanding dialogs.
 #[derive(Clone)]
 pub struct PresentationBridge {
 	inner: Arc<BridgeInner>,
@@ -76,15 +80,16 @@ impl PresentationBridge {
 				capacity,
 				state: Mutex::new(BridgeState {
 					generation: 0,
-					next_id: 1,
-					sender: None,
-					pending: BTreeMap::new(),
+					next_id:    1,
+					sender:     None,
+					pending:    BTreeMap::new(),
 				}),
 			}),
 		}
 	}
 
-	/// Attaches the real UI actor, cancelling every request owned by an older surface.
+	/// Attaches the real UI actor, cancelling every request owned by an older
+	/// surface.
 	#[must_use]
 	pub fn attach(&self) -> PresentationEndpoint {
 		let (sender, receiver) = flume::bounded(self.inner.capacity);
@@ -106,7 +111,10 @@ impl PresentationBridge {
 	) -> Result<PresentationResponse, PresentationAuthorityError> {
 		let (id, generation, sender, receiver) = {
 			let mut state = self.inner.state.lock();
-			let sender = state.sender.clone().ok_or(PresentationAuthorityError::Unavailable)?;
+			let sender = state
+				.sender
+				.clone()
+				.ok_or(PresentationAuthorityError::Unavailable)?;
 			let id = state.next_id;
 			state.next_id = state.next_id.wrapping_add(1).max(1);
 			let generation = state.generation;
@@ -123,7 +131,9 @@ impl PresentationBridge {
 			guard.remove();
 			return Err(PresentationAuthorityError::Unavailable);
 		}
-		let result = receiver.await.map_err(|_| PresentationAuthorityError::Unavailable)?;
+		let result = receiver
+			.await
+			.map_err(|_| PresentationAuthorityError::Unavailable)?;
 		guard.disarm();
 		result
 	}
@@ -172,13 +182,17 @@ impl PresentationEndpoint {
 		self.receiver.recv_async().await
 	}
 
-	/// Completes one exact request. Stale attachments and duplicate replies are rejected.
+	/// Completes one exact request. Stale attachments and duplicate replies are
+	/// rejected.
 	pub fn complete(
 		&self,
 		id: u64,
 		result: PresentationResult,
 	) -> Result<(), PresentationAuthorityError> {
-		let inner = self.inner.upgrade().ok_or(PresentationAuthorityError::Unavailable)?;
+		let inner = self
+			.inner
+			.upgrade()
+			.ok_or(PresentationAuthorityError::Unavailable)?;
 		let reply = {
 			let mut state = inner.state.lock();
 			if state.generation != self.generation {
@@ -188,7 +202,9 @@ impl PresentationEndpoint {
 				PresentationAuthorityError::Owner(sf!("unknown presentation request {id}"))
 			})?
 		};
-		reply.send(result).map_err(|_| PresentationAuthorityError::Cancelled)
+		reply
+			.send(result)
+			.map_err(|_| PresentationAuthorityError::Cancelled)
 	}
 
 	/// Acknowledges a successful effect.
@@ -199,7 +215,9 @@ impl PresentationEndpoint {
 
 impl Drop for PresentationEndpoint {
 	fn drop(&mut self) {
-		let Some(inner) = self.inner.upgrade() else { return };
+		let Some(inner) = self.inner.upgrade() else {
+			return;
+		};
 		let pending = {
 			let mut state = inner.state.lock();
 			if state.generation != self.generation {
@@ -248,11 +266,11 @@ fn fail_pending(
 }
 
 /// Boxed callback result used by the production registry.
-pub type PresentationCallbackFuture = Pin<
-	Box<dyn Future<Output = Result<Value, PresentationAuthorityError>> + Send + 'static>,
->;
+pub type PresentationCallbackFuture =
+	Pin<Box<dyn Future<Output = Result<Value, PresentationAuthorityError>> + Send + 'static>>;
 
-/// One exact extension callback body. It receives JSON only and cannot acquire a terminal.
+/// One exact extension callback body. It receives JSON only and cannot acquire
+/// a terminal.
 pub trait PresentationCallbackHandler: Send + Sync + 'static {
 	/// Executes the registered callback.
 	fn call(&self, arguments: Value) -> PresentationCallbackFuture;
@@ -283,8 +301,8 @@ struct CallbackInner {
 	state:    Mutex<CallbackState>,
 }
 
-/// Exact-generation callback registry used for completions, renderers, commands, shortcuts, and
-/// activation handlers.
+/// Exact-generation callback registry used for completions, renderers,
+/// commands, shortcuts, and activation handlers.
 #[derive(Clone)]
 pub struct PresentationCallbackRegistry {
 	inner: Arc<CallbackInner>,
@@ -299,7 +317,7 @@ impl PresentationCallbackRegistry {
 				identity,
 				state: Mutex::new(CallbackState {
 					next_registration: 1,
-					entries: BTreeMap::new(),
+					entries:           BTreeMap::new(),
 				}),
 			}),
 		}
@@ -319,10 +337,9 @@ impl PresentationCallbackRegistry {
 			let mut state = self.inner.state.lock();
 			let registration = state.next_registration;
 			state.next_registration = state.next_registration.wrapping_add(1).max(1);
-			state.entries.insert((class, operation.clone()), CallbackEntry {
-				registration,
-				handler,
-			});
+			state
+				.entries
+				.insert((class, operation.clone()), CallbackEntry { registration, handler });
 			registration
 		};
 		PresentationCallbackRegistration {
@@ -398,7 +415,8 @@ impl PresentationCallbackDispatcher for PresentationCallbackRegistry {
 	}
 }
 
-/// CONTROL-backed dispatcher which forwards callbacks to the exact live extension worker.
+/// CONTROL-backed dispatcher which forwards callbacks to the exact live
+/// extension worker.
 pub struct ControlPresentationCallbackDispatcher {
 	target:     Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
 	dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
@@ -436,30 +454,30 @@ impl PresentationCallbackDispatcher for ControlPresentationCallbackDispatcher {
 			value => serde_json::Map::from_iter([("value".to_owned(), value)]),
 		};
 		let timeout = match callback.kind {
-			PresentationCallbackKind::Completion => super::presentation_authority::COMPLETION_CALLBACK_DEADLINE,
-			PresentationCallbackKind::Renderer => super::presentation_authority::RENDER_CALLBACK_DEADLINE,
+			PresentationCallbackKind::Completion => {
+				super::presentation_authority::COMPLETION_CALLBACK_DEADLINE
+			},
+			PresentationCallbackKind::Renderer => {
+				super::presentation_authority::RENDER_CALLBACK_DEADLINE
+			},
 			PresentationCallbackKind::Action => std::time::Duration::from_secs(365 * 24 * 60 * 60),
 		};
 		self
 			.dispatcher
-			.dispatch(
-				self.target.clone(),
-				omp_envd::exthost::control::ControlDispatch {
-					operation: callback.operation,
-					arguments,
-					authority: invocation,
-					policy: omp_envd::exthost::CallbackConcurrency::Serialized,
-					deadline: omp_envd::exthost::EventDeadline {
-						at: std::time::Instant::now() + timeout,
-					},
-				},
-			)
+			.dispatch(self.target.clone(), omp_envd::exthost::control::ControlDispatch {
+				operation: callback.operation,
+				arguments,
+				authority: invocation,
+				policy: omp_envd::exthost::CallbackConcurrency::Serialized,
+				deadline: omp_envd::exthost::EventDeadline { at: std::time::Instant::now() + timeout },
+			})
 			.await
 			.map_err(|error| PresentationAuthorityError::Owner(Str::new(error.to_string())))
 	}
 }
 
-/// Drop guard for one exact callback registration. Replacing a callback makes an older guard inert.
+/// Drop guard for one exact callback registration. Replacing a callback makes
+/// an older guard inert.
 pub struct PresentationCallbackRegistration {
 	inner:        Weak<CallbackInner>,
 	class:        u8,
@@ -469,7 +487,9 @@ pub struct PresentationCallbackRegistration {
 
 impl Drop for PresentationCallbackRegistration {
 	fn drop(&mut self) {
-		let Some(inner) = self.inner.upgrade() else { return };
+		let Some(inner) = self.inner.upgrade() else {
+			return;
+		};
 		let mut state = inner.state.lock();
 		let key = (self.class, self.operation.clone());
 		if state
@@ -497,12 +517,12 @@ mod tests {
 
 	fn identity() -> Arc<PresentationIdentity> {
 		Arc::new(PresentationIdentity {
-			principal: Str::new_static("principal"),
-			extension: Str::new_static("ui"),
-			artifact_digest: Str::new_static("digest"),
-			host_generation: 1,
+			principal:          Str::new_static("principal"),
+			extension:          Str::new_static("ui"),
+			artifact_digest:    Str::new_static("digest"),
+			host_generation:    1,
 			session_generation: 1,
-			capabilities: Arc::new(BTreeSet::new()),
+			capabilities:       Arc::new(BTreeSet::new()),
 		})
 	}
 

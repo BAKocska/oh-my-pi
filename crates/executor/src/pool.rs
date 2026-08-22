@@ -17,9 +17,7 @@ impl Pool {
 			let executor = Arc::clone(&executor);
 			std::thread::Builder::new()
 				.name(format!("omp-core-{index}"))
-				.spawn(move || {
-					async_io::block_on(executor.run(std::future::pending::<()>()))
-				})
+				.spawn(move || async_io::block_on(executor.run(std::future::pending::<()>())))
 				.expect("failed to spawn omp core executor worker");
 		}
 		Self { executor }

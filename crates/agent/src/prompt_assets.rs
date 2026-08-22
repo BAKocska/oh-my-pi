@@ -140,10 +140,10 @@ pub struct PromptAsset {
 macro_rules! asset {
 	($id:ident, $family:ident, $slot:ident, $class:ident, $path:literal) => {
 		PromptAsset {
-			id: PromptAssetId::$id,
-			family: PromptAssetFamily::$family,
-			slot: SlotId::$slot,
-			class: SlotClass::$class,
+			id:      PromptAssetId::$id,
+			family:  PromptAssetFamily::$family,
+			slot:    SlotId::$slot,
+			class:   SlotClass::$class,
 			content: include_str!($path),
 		}
 	};
@@ -152,15 +152,45 @@ macro_rules! asset {
 const ASSETS: [PromptAsset; 32] = [
 	asset!(PersonalityDefault, Personality, Runtime, Stable, "../prompts/personality/default.md"),
 	asset!(PersonalityFriendly, Personality, Runtime, Stable, "../prompts/personality/friendly.md"),
-	asset!(PersonalityPragmatic, Personality, Runtime, Stable, "../prompts/personality/pragmatic.md"),
+	asset!(
+		PersonalityPragmatic,
+		Personality,
+		Runtime,
+		Stable,
+		"../prompts/personality/pragmatic.md"
+	),
 	asset!(AutoContinue, Lifecycle, Status, Volatile, "../prompts/lifecycle/auto-continue.md"),
 	asset!(UserInterjection, Steering, Status, Volatile, "../prompts/steering/user-interjection.md"),
 	asset!(ParentIrc, Steering, Status, Volatile, "../prompts/steering/parent-irc.md"),
 	asset!(EmptyStopRetry, Recovery, Status, Volatile, "../prompts/recovery/empty-stop-retry.md"),
-	asset!(UnexpectedStopRetry, Recovery, Status, Volatile, "../prompts/recovery/unexpected-stop-retry.md"),
-	asset!(ToolCallLoopRedirect, Recovery, Status, Volatile, "../prompts/recovery/tool-call-loop-redirect.md"),
-	asset!(ThinkingLoopRedirect, Recovery, Status, Volatile, "../prompts/recovery/thinking-loop-redirect.md"),
-	asset!(GeminiToolCallReminder, Recovery, Status, Volatile, "../prompts/recovery/gemini-tool-call-reminder.md"),
+	asset!(
+		UnexpectedStopRetry,
+		Recovery,
+		Status,
+		Volatile,
+		"../prompts/recovery/unexpected-stop-retry.md"
+	),
+	asset!(
+		ToolCallLoopRedirect,
+		Recovery,
+		Status,
+		Volatile,
+		"../prompts/recovery/tool-call-loop-redirect.md"
+	),
+	asset!(
+		ThinkingLoopRedirect,
+		Recovery,
+		Status,
+		Volatile,
+		"../prompts/recovery/thinking-loop-redirect.md"
+	),
+	asset!(
+		GeminiToolCallReminder,
+		Recovery,
+		Status,
+		Volatile,
+		"../prompts/recovery/gemini-tool-call-reminder.md"
+	),
 	asset!(TitleSystem, Title, Guidance, Stable, "../prompts/title/system.md"),
 	asset!(AgentScout, Agent, Role, Frozen, "../prompts/roles/scout.md"),
 	asset!(AgentReviewer, Agent, Role, Frozen, "../prompts/roles/reviewer.md"),
@@ -196,8 +226,7 @@ pub fn prompt_assets() -> impl ExactSizeIterator<Item = &'static PromptAsset> + 
 
 /// Returns the lazily compiled scribe template for one catalog asset.
 pub fn prompt_template(id: PromptAssetId) -> &'static Template {
-	static TEMPLATES: [OnceLock<Template>; ASSETS.len()] =
-		[const { OnceLock::new() }; ASSETS.len()];
+	static TEMPLATES: [OnceLock<Template>; ASSETS.len()] = [const { OnceLock::new() }; ASSETS.len()];
 	TEMPLATES[id as usize].get_or_init(|| {
 		let asset = prompt_asset(id);
 		crate::prompt_engine::engine()
@@ -208,15 +237,38 @@ pub fn prompt_template(id: PromptAssetId) -> &'static Template {
 
 fn asset_name(id: PromptAssetId) -> &'static str {
 	const NAMES: [&str; 32] = [
-		"personality/default", "personality/friendly", "personality/pragmatic",
-		"lifecycle/auto-continue", "steering/user-interjection", "steering/parent-irc",
-		"recovery/empty-stop-retry", "recovery/unexpected-stop-retry",
-		"recovery/tool-call-loop-redirect", "recovery/thinking-loop-redirect",
-		"recovery/gemini-tool-call-reminder", "title/system", "roles/scout", "roles/reviewer",
-		"roles/security-reviewer", "roles/task", "roles/librarian", "roles/designer", "roles/init",
-		"modes/plan", "modes/prewalk", "modes/goal", "modes/vibe", "modes/memory-pipeline",
-		"modes/advisor", "modes/autoresearch", "modes/security-audit", "modes/bench",
-		"modes/review", "modes/cleanse", "modes/compress", "modes/live-collab",
+		"personality/default",
+		"personality/friendly",
+		"personality/pragmatic",
+		"lifecycle/auto-continue",
+		"steering/user-interjection",
+		"steering/parent-irc",
+		"recovery/empty-stop-retry",
+		"recovery/unexpected-stop-retry",
+		"recovery/tool-call-loop-redirect",
+		"recovery/thinking-loop-redirect",
+		"recovery/gemini-tool-call-reminder",
+		"title/system",
+		"roles/scout",
+		"roles/reviewer",
+		"roles/security-reviewer",
+		"roles/task",
+		"roles/librarian",
+		"roles/designer",
+		"roles/init",
+		"modes/plan",
+		"modes/prewalk",
+		"modes/goal",
+		"modes/vibe",
+		"modes/memory-pipeline",
+		"modes/advisor",
+		"modes/autoresearch",
+		"modes/security-audit",
+		"modes/bench",
+		"modes/review",
+		"modes/cleanse",
+		"modes/compress",
+		"modes/live-collab",
 	];
 	NAMES[id as usize]
 }
@@ -282,7 +334,10 @@ mod tests {
 
 	#[test]
 	fn catalog_templates_parse_and_reference_registered_keys() {
-		let keys = crate::prompt_keys::ALL.iter().copied().collect::<HashSet<_>>();
+		let keys = crate::prompt_keys::ALL
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>();
 		for asset in prompt_assets().filter(|asset| asset.id != PromptAssetId::ModeCompress) {
 			let template = prompt_template(asset.id);
 			for key in template.referenced_keys() {

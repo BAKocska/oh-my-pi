@@ -358,14 +358,39 @@ message ResponsesInclude {
 }
 
 message ToolDef {
+  // Structured tool input constrained by JSON Schema.
+  message JsonSchema {
+    // JSON Schema; dialect normalizers reshape per flavor (strict allowlists,
+    // CCA stripping, GBNF conversion) at the edge.
+    bytes schema_json = 1;
+    // Presence is significant: absent preserves the provider default, while
+    // explicit false disables strict enforcement.
+    optional bool strict = 2;
+  }
+  // Freeform tool input constrained by a grammar definition.
+  message Grammar {
+    // Supported grammar language.
+    enum Syntax {
+      SYNTAX_UNSPECIFIED = 0;
+      SYNTAX_LARK = 1;
+      SYNTAX_REGEX = 2;
+      SYNTAX_EBNF = 3;
+    }
+    // Grammar language; unspecified is invalid at the serving edge.
+    Syntax syntax = 1;
+    // Complete grammar definition.
+    string definition = 2;
+  }
+
+  // Stable tool name.
   string name = 1;
+  // Human-readable tool purpose.
   string description = 2;
-  // JSON Schema; dialect normalizers reshape per flavor (strict allowlists,
-  // CCA stripping, GBNF conversion) at the edge.
-  bytes schema_json = 3;
-  // Presence is significant: absent preserves the provider default, while
-  // explicit false disables strict enforcement.
-  optional bool strict = 4;
+  // Complete input constraint.
+  oneof input {
+    JsonSchema json_schema = 3;
+    Grammar grammar = 4;
+  }
 }
 
 message ToolChoice {

@@ -166,8 +166,12 @@ fn libei_not_initialized() -> DesktopError {
 	DesktopError::input_failed("libei actor is not initialized")
 }
 
-pub(super) fn ax_init() -> CoreResult<()> { request(Command::AxInit) }
-pub(super) fn ax_windows() -> CoreResult<Vec<DesktopWindow>> { request(Command::AxWindows) }
+pub(super) fn ax_init() -> CoreResult<()> {
+	request(Command::AxInit)
+}
+pub(super) fn ax_windows() -> CoreResult<Vec<DesktopWindow>> {
+	request(Command::AxWindows)
+}
 pub(super) fn ax_window_root(window: DesktopWindow) -> CoreResult<AxHandle> {
 	request(|reply| Command::AxWindowRoot(window, reply))
 }
@@ -199,8 +203,12 @@ pub(super) fn ax_attributes(object: ObjectRefOwned) -> CoreResult<Vec<(String, S
 	request(|reply| Command::AxAttributes(object, reply))
 }
 #[cfg(feature = "wayland-pipewire")]
-pub(super) fn capture() -> CoreResult<RgbaImage> { request(Command::Capture) }
-pub(super) fn libei_init() -> CoreResult<()> { request(Command::LibeiInit) }
+pub(super) fn capture() -> CoreResult<RgbaImage> {
+	request(Command::Capture)
+}
+pub(super) fn libei_init() -> CoreResult<()> {
+	request(Command::LibeiInit)
+}
 pub(super) fn libei_pointer(event: PointerEvent) -> CoreResult<()> {
 	request(|reply| Command::LibeiPointer(event, reply))
 }

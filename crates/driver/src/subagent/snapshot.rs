@@ -3,7 +3,7 @@
 use std::{path::Path, sync::Arc};
 
 use omp_agent::{AgentDefinition, AgentSnapshot};
-use omp_core::{Str};
+use omp_core::Str;
 use omp_envd::eval::spawn::SpawnEffort;
 use omp_proto::inference::v1::{Effort, Reasoning};
 
@@ -67,10 +67,9 @@ pub struct ChildSnapshotOptions<'a> {
 /// Clones a parent runtime snapshot while applying only child attenuation.
 pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>) -> AgentSnapshot {
 	let mut child = parent.clone();
-	child.props.set(
-		omp_agent::prompt_keys::CWD,
-		options.cwd.to_string_lossy().into_owned(),
-	);
+	child
+		.props
+		.set(omp_agent::prompt_keys::CWD, options.cwd.to_string_lossy().into_owned());
 	if let Some(omp_scribe::Value::List(files)) =
 		child.props.get(omp_agent::prompt_keys::CONTEXT_FILES)
 	{
@@ -128,10 +127,9 @@ pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>)
 		.cloned()
 		.collect::<Vec<_>>();
 	child.enabled_tools = Arc::from(enabled);
-	child.props.set(
-		omp_agent::prompt_keys::TOOLS,
-		child.enabled_tools.iter().cloned().collect::<Vec<_>>(),
-	);
+	child
+		.props
+		.set(omp_agent::prompt_keys::TOOLS, child.enabled_tools.iter().cloned().collect::<Vec<_>>());
 	child
 		.turn
 		.params

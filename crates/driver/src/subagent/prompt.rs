@@ -4,14 +4,18 @@ use std::{path::Path, sync::LazyLock};
 
 use omp_agent::{AgentDefinition, AgentNode};
 use omp_core::Str;
-use omp_scribe::{Engine, Error as ScribeError, HelperError, Props, Template, Value as ScribeValue, map};
+use omp_scribe::{
+	Engine, Error as ScribeError, HelperError, Props, Template, Value as ScribeValue, map,
+};
 use serde_json::Value;
 
 use super::settings::TaskEagerMode;
-/// Returns the driver-side prompt engine with schema-domain functions installed.
+/// Returns the driver-side prompt engine with schema-domain functions
+/// installed.
 ///
-/// This engine is intentionally independent from the agent engine: helper validation happens
-/// against the exact registry used to compile driver-owned subagent templates.
+/// This engine is intentionally independent from the agent engine: helper
+/// validation happens against the exact registry used to compile driver-owned
+/// subagent templates.
 pub fn engine() -> &'static Engine {
 	static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
 		let mut engine = Engine::new();
@@ -26,9 +30,7 @@ pub fn engine() -> &'static Engine {
 		});
 		engine.add_function("yield_schema", |args| {
 			let schema = schema_argument("yield_schema", args)?;
-			Ok(ScribeValue::from(crate::prompt_templates::schema::render(
-				&schema,
-			)))
+			Ok(ScribeValue::from(crate::prompt_templates::schema::render(&schema)))
 		});
 		engine
 	});
@@ -37,10 +39,7 @@ pub fn engine() -> &'static Engine {
 fn system_template() -> &'static Template {
 	static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
 		engine()
-			.compile(
-				"subagent/system",
-				include_str!("../../../agent/prompts/subagent/system.md"),
-			)
+			.compile("subagent/system", include_str!("../../../agent/prompts/subagent/system.md"))
 			.expect("embedded subagent system template")
 	});
 	&TEMPLATE
@@ -48,10 +47,10 @@ fn system_template() -> &'static Template {
 
 fn schema_argument(name: &'static str, args: &[ScribeValue]) -> Result<Value, ScribeError> {
 	if args.len() != 1 {
-		return Err(ScribeError::helper(
-			name,
-			HelperError::Arity { expected: 1, got: args.len() },
-		));
+		return Err(ScribeError::helper(name, HelperError::Arity {
+			expected: 1,
+			got:      args.len(),
+		}));
 	}
 	serde_json::to_value(&args[0]).map_err(|source| ScribeError::helper(name, source))
 }
@@ -117,25 +116,27 @@ pub fn props(input: &SubagentPromptInput<'_>, parent: &Props) -> Props {
 	patch.set("agent_name", input.definition.name.clone());
 	patch.set("agent_description", input.definition.description.clone());
 	patch.set("agent_prompt", input.definition.prompt.clone());
-	if let Some(context) = input.shared_context.map(str::trim).filter(|context| !context.is_empty()) {
+	if let Some(context) = input
+		.shared_context
+		.map(str::trim)
+		.filter(|context| !context.is_empty())
+	{
 		patch.set("shared_context", context.to_owned());
 	}
 	if let Some(path) = input.plan_path {
 		patch.set("plan_path", path.to_string_lossy().into_owned());
 	}
-	if let Some(plan) = input.plan_content.map(str::trim).filter(|plan| !plan.is_empty()) {
+	if let Some(plan) = input
+		.plan_content
+		.map(str::trim)
+		.filter(|plan| !plan.is_empty())
+	{
 		patch.set("plan_content", plan.to_owned());
 	}
-	patch.set(
-		"workspace_root",
-		input.workspace_root.to_string_lossy().into_owned(),
-	);
+	patch.set("workspace_root", input.workspace_root.to_string_lossy().into_owned());
 	if let Some(schema) = input.output_schema {
 		patch.set("output_schema", ScribeValue::from(schema));
-		patch.set(
-			"output_schema_ts",
-			crate::prompt_templates::schema::render(schema),
-		);
+		patch.set("output_schema_ts", crate::prompt_templates::schema::render(schema));
 	}
 	patch.set("self_name", input.self_name.to_owned());
 	patch.set("self_role", input.self_role.to_owned());
@@ -156,23 +157,17 @@ pub fn props(input: &SubagentPromptInput<'_>, parent: &Props) -> Props {
 			})
 			.collect::<Vec<_>>(),
 	);
-	patch.set(
-		"caps",
-		map! {
-			"codex_style" => input.capabilities.codex_style,
-			"parallel_tool_calls" => input.capabilities.parallel_tool_calls,
-			"structured_yield" => input.capabilities.structured_yield,
-		},
-	);
+	patch.set("caps", map! {
+		"codex_style" => input.capabilities.codex_style,
+		"parallel_tool_calls" => input.capabilities.parallel_tool_calls,
+		"structured_yield" => input.capabilities.structured_yield,
+	});
 	patch.set("plan_mode", input.plan_mode);
-	patch.set(
-		"eager",
-		match input.eager {
-			TaskEagerMode::Default => "default",
-			TaskEagerMode::Preferred => "preferred",
-			TaskEagerMode::Always => "always",
-		},
-	);
+	patch.set("eager", match input.eager {
+		TaskEagerMode::Default => "default",
+		TaskEagerMode::Preferred => "preferred",
+		TaskEagerMode::Always => "always",
+	});
 	parent.overlay(&patch)
 }
 
@@ -204,7 +199,10 @@ mod tests {
 
 	#[test]
 	fn subagent_template_parses_and_uses_registered_keys() {
-		let keys = omp_agent::prompt_keys::ALL.iter().copied().collect::<HashSet<_>>();
+		let keys = omp_agent::prompt_keys::ALL
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>();
 		for key in system_template().referenced_keys() {
 			assert!(keys.contains(key), "subagent template references unregistered key {key}");
 		}

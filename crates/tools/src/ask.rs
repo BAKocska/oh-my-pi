@@ -1,11 +1,6 @@
 //! Interactive question selection with a host-provided presentation seam.
 
-use std::{
-	fmt,
-	future::Future,
-	pin::Pin,
-	sync::Arc,
-};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -471,10 +466,8 @@ mod tests {
 			.expect("ask invocation remains live");
 
 		let events = ask.call(params).collect::<Vec<_>>().await;
-		let [Ev::Done(ToolTerminal::Done {
-			result: Ok(Payload { answers, headless }),
-			..
-		})] = events.as_slice()
+		let [Ev::Done(ToolTerminal::Done { result: Ok(Payload { answers, headless }), .. })] =
+			events.as_slice()
 		else {
 			panic!("expected successful async ask result: {events:?}");
 		};

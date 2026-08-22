@@ -7,9 +7,7 @@
 use std::{pin::Pin, sync::Arc, time::Duration};
 
 use futures::Future;
-use omp_agent::{
-	AgentEvent, ContextView, EventBus, PatchOp, PromptError, PromptPatchSet, Props,
-};
+use omp_agent::{AgentEvent, ContextView, EventBus, PatchOp, PromptError, PromptPatchSet, Props};
 pub use omp_core::SecretString;
 use omp_core::Str;
 use omp_inference::auth::{AuthRejection, CredentialSource};

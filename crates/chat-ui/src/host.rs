@@ -2150,7 +2150,11 @@ fn chat_deadline(chat: &Chat) -> Option<Instant> {
 
 async fn deadline(executor: &Executor, at: Option<Instant>) {
 	match at {
-		Some(at) => executor.timer(at.saturating_duration_since(Instant::now())).await,
+		Some(at) => {
+			executor
+				.timer(at.saturating_duration_since(Instant::now()))
+				.await
+		},
 		None => std::future::pending().await,
 	}
 }

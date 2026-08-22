@@ -10,6 +10,7 @@ use std::{
 use omp_catalog::{ModelKey, snapshot::Catalog};
 use omp_core::{Duration, Hash32, InvocationPhase, LifecyclePhase, Str, sf};
 use omp_proto::{
+	inference::v1::tool_def,
 	prost::Message as _,
 	toolhost::v1::{
 		GrammarSyntax as WorkerGrammarSyntax, PreludeParamKind, ToolDecl, tool_constraint,
@@ -2451,11 +2452,14 @@ fn worker_spec(declaration: &ToolDecl) -> Result<ToolSpec, EnvdError> {
 	if declaration.extension_id.is_empty() {
 		return Err(worker_declaration_error("worker tool declaration has no extension id"));
 	}
+	let Some(tool_def::Input::JsonSchema(json_schema)) = definition.input.as_ref() else {
+		return Err(worker_declaration_error("worker tool definition requires a JSON Schema input"));
+	};
 	Ok(ToolSpec {
 		name:            Str::from(definition.name.as_str()),
 		rev:             worker_revision(declaration)?,
 		description:     Str::from(definition.description.as_str()),
-		schema:          definition.schema_json.clone(),
+		schema:          json_schema.schema_json.clone(),
 		constraint:      worker_constraint(declaration)?,
 		projection_code: worker_projection_code(declaration),
 		effects:         declaration
@@ -2484,7 +2488,11 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 		let strict = declaration
 			.definition
 			.as_ref()
-			.and_then(|definition| definition.strict)
+			.and_then(|definition| definition.input.as_ref())
+			.and_then(|input| match input {
+				tool_def::Input::JsonSchema(schema) => schema.strict,
+				tool_def::Input::Grammar(_) => None,
+			})
 			.unwrap_or(false);
 		return Ok(if strict {
 			Constraint::Schema {

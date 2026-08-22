@@ -2,9 +2,7 @@
 
 use std::path::Path;
 
-use omp_agent::{
-	AgentDefinition, PromptFacts, PromptSource, Props, render_compaction_summary,
-};
+use omp_agent::{AgentDefinition, PromptFacts, PromptSource, Props, render_compaction_summary};
 use omp_app::chat_ui::template::{TemplateArguments, render as render_command};
 use omp_core::sf;
 use omp_driver::subagent::{
@@ -18,7 +16,8 @@ use serde_json::json;
 fn definition() -> AgentDefinition {
 	AgentDefinition::parse_markdown(
 		"golden",
-		"---\ndescription: Golden specialist\ntools: [read, yield]\n---\n# Specialist\n\nComplete only the delegated target.",
+		"---\ndescription: Golden specialist\ntools: [read, yield]\n---\n# Specialist\n\nComplete \
+		 only the delegated target.",
 	)
 	.expect("golden definition")
 }
@@ -26,22 +25,25 @@ fn definition() -> AgentDefinition {
 #[test]
 fn subagent_minimal_prompt() {
 	let definition = definition();
-	let prompt = compose(SubagentPromptInput {
-		definition: &definition,
-		shared_context: None,
-		plan_path: None,
-		plan_content: None,
-		workspace_root: Path::new("/workspace"),
-		output_schema: None,
-		self_name: "Golden",
-		self_role: "task",
-		irc_enabled: false,
-		roster_generation: 0,
-		peers: &[],
-		capabilities: ModelFamilyCapabilities::default(),
-		plan_mode: false,
-		eager: TaskEagerMode::Default,
-	}, &Props::new());
+	let prompt = compose(
+		SubagentPromptInput {
+			definition:        &definition,
+			shared_context:    None,
+			plan_path:         None,
+			plan_content:      None,
+			workspace_root:    Path::new("/workspace"),
+			output_schema:     None,
+			self_name:         "Golden",
+			self_role:         "task",
+			irc_enabled:       false,
+			roster_generation: 0,
+			peers:             &[],
+			capabilities:      ModelFamilyCapabilities::default(),
+			plan_mode:         false,
+			eager:             TaskEagerMode::Default,
+		},
+		&Props::new(),
+	);
 	insta::assert_snapshot!("subagent_minimal", prompt);
 }
 
@@ -52,20 +54,20 @@ fn subagent_props_inherit_parent_secrets_policy() {
 	facts.settings.secrets_enabled = true;
 	let parent = facts.props().expect("parent props");
 	let input = SubagentPromptInput {
-		definition: &definition,
-		shared_context: None,
-		plan_path: None,
-		plan_content: None,
-		workspace_root: Path::new("/workspace"),
-		output_schema: None,
-		self_name: "Golden",
-		self_role: "task",
-		irc_enabled: false,
+		definition:        &definition,
+		shared_context:    None,
+		plan_path:         None,
+		plan_content:      None,
+		workspace_root:    Path::new("/workspace"),
+		output_schema:     None,
+		self_name:         "Golden",
+		self_role:         "task",
+		irc_enabled:       false,
 		roster_generation: 0,
-		peers: &[],
-		capabilities: ModelFamilyCapabilities::default(),
-		plan_mode: false,
-		eager: TaskEagerMode::Default,
+		peers:             &[],
+		capabilities:      ModelFamilyCapabilities::default(),
+		plan_mode:         false,
+		eager:             TaskEagerMode::Default,
 	};
 	let child = child_props(&input, &parent);
 	let items = omp_agent::CanonicalPromptSource
@@ -87,7 +89,12 @@ fn subagent_full_matrix() {
 	let peers = [
 		PromptPeer { name: "Golden", role: "task", status: "running", activity: "editing" },
 		PromptPeer { name: "Scout", role: "scout", status: "idle", activity: "" },
-		PromptPeer { name: "Reviewer", role: "reviewer", status: "parked", activity: "reviewing" },
+		PromptPeer {
+			name:     "Reviewer",
+			role:     "reviewer",
+			status:   "parked",
+			activity: "reviewing",
+		},
 	];
 	let schema = json!({
 		"type": "object",
@@ -98,27 +105,32 @@ fn subagent_full_matrix() {
 		for parallel_tool_calls in [false, true] {
 			for structured_yield in [false, true] {
 				for plan_mode in [false, true] {
-					for eager in [TaskEagerMode::Default, TaskEagerMode::Preferred, TaskEagerMode::Always] {
-						let prompt = compose(SubagentPromptInput {
-							definition: &definition,
-							shared_context: Some("Shared batch contract.\n\nPreserve ownership."),
-							plan_path: Some(Path::new("/workspace/CPLAN.md")),
-							plan_content: Some("# Plan\n\n1. Inspect.\n2. Implement."),
-							workspace_root: Path::new("/workspace/.worktrees/golden"),
-							output_schema: Some(&schema),
-							self_name: "Golden",
-							self_role: "task",
-							irc_enabled: true,
-							roster_generation: 42,
-							peers: &peers,
-							capabilities: ModelFamilyCapabilities {
-								codex_style,
-								parallel_tool_calls,
-								structured_yield,
+					for eager in
+						[TaskEagerMode::Default, TaskEagerMode::Preferred, TaskEagerMode::Always]
+					{
+						let prompt = compose(
+							SubagentPromptInput {
+								definition: &definition,
+								shared_context: Some("Shared batch contract.\n\nPreserve ownership."),
+								plan_path: Some(Path::new("/workspace/CPLAN.md")),
+								plan_content: Some("# Plan\n\n1. Inspect.\n2. Implement."),
+								workspace_root: Path::new("/workspace/.worktrees/golden"),
+								output_schema: Some(&schema),
+								self_name: "Golden",
+								self_role: "task",
+								irc_enabled: true,
+								roster_generation: 42,
+								peers: &peers,
+								capabilities: ModelFamilyCapabilities {
+									codex_style,
+									parallel_tool_calls,
+									structured_yield,
+								},
+								plan_mode,
+								eager,
 							},
-							plan_mode,
-							eager,
-						}, &Props::new());
+							&Props::new(),
+						);
 						let name = format!(
 							"subagent_full_codex_{codex_style}_parallel_{parallel_tool_calls}_yield_{structured_yield}_plan_{plan_mode}_eager_{eager}"
 						);
@@ -172,23 +184,14 @@ fn native_command_helper_matrix() {
 	let arguments = TemplateArguments { raw: "one \"two words\" three", words: &words };
 	let cases = [
 		("args_raw", "{{ args }}"),
-		(
-			"args_indexed",
-			"{{ arguments[0] }}|{{ arguments[1] }}|{{ arguments[9] | default(\"\") }}",
-		),
+		("args_indexed", "{{ arguments[0] }}|{{ arguments[1] }}|{{ arguments[9] | default(\"\") }}"),
 		("list", "{{ arguments | bullets }}"),
 		("join", "{{ arguments | join(\",\") }}"),
 		("when_true", "{% if arguments %}yes{% else %}no{% endif %}"),
 		("when_else", "{% if missing %}yes{% else %}no{% endif %}"),
 		("table", "{{ table(arguments) }}"),
-		(
-			"codeblock",
-			"{% codeblock \"rust\" %}fn main() {}{% endcodeblock %}",
-		),
-		(
-			"xml",
-			"{% xml \"note\" %}{{ \"<ok & safe>\" | escape_xml }}{% endxml %}",
-		),
+		("codeblock", "{% codeblock \"rust\" %}fn main() {}{% endcodeblock %}"),
+		("xml", "{% xml \"note\" %}{{ \"<ok & safe>\" | escape_xml }}{% endxml %}"),
 	];
 	for (name, template) in cases {
 		let rendered = render_command(template, arguments).expect("command template render");
@@ -214,6 +217,8 @@ fn driver_schema_helpers_are_registered() {
 			"required": ["answer"]
 		})),
 	);
-	let rendered = template.render_str(engine, &props).expect("schema helper render");
+	let rendered = template
+		.render_str(engine, &props)
+		.expect("schema helper render");
 	insta::assert_snapshot!("driver_schema_helpers", rendered);
 }

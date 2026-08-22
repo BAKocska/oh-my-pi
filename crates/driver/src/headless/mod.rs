@@ -209,17 +209,17 @@ impl HeadlessSession {
 			credential_authority,
 			..
 		} = crate::registry::production_inference_for_session(
-				&data_dir,
-				Arc::clone(&registry),
-				Some(&root),
-				crate::registry::InferenceSessionOverrides {
-					provider:              options.credential_provider,
-					api_key:               options.api_key,
-					prompt_cache_affinity: options.prompt_cache_affinity,
-				},
-			)
-			.await
-			.map_err(composition)?;
+			&data_dir,
+			Arc::clone(&registry),
+			Some(&root),
+			crate::registry::InferenceSessionOverrides {
+				provider:              options.credential_provider,
+				api_key:               options.api_key,
+				prompt_cache_affinity: options.prompt_cache_affinity,
+			},
+		)
+		.await
+		.map_err(composition)?;
 		let _ = search.bind(inference.clone());
 		let _ = environment.github_credentials().bind(credential_authority);
 		let client = InProcTurnClient::new(inference)
@@ -370,18 +370,12 @@ impl HeadlessSession {
 	}
 
 	/// Binds or clears the session-scoped ACP terminal execution capability.
-	pub fn bind_acp_exec(
-		&self,
-		backend: Option<Arc<dyn omp_envd::tool_shell::AcpExecBackend>>,
-	) {
+	pub fn bind_acp_exec(&self, backend: Option<Arc<dyn omp_envd::tool_shell::AcpExecBackend>>) {
 		self._environment.bind_acp_exec(backend);
 	}
 
 	/// Binds or clears the session-scoped ACP document capability.
-	pub fn bind_acp_documents(
-		&self,
-		backend: Option<Arc<dyn omp_envd::docs::AcpDocumentBackend>>,
-	) {
+	pub fn bind_acp_documents(&self, backend: Option<Arc<dyn omp_envd::docs::AcpDocumentBackend>>) {
 		self._environment.bind_acp_documents(backend);
 	}
 

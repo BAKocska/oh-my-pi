@@ -1772,19 +1772,20 @@ impl AgentTree {
 	pub fn roster_generation(&self) -> u64 {
 		self.roster_generation.load(Ordering::Acquire)
 	}
+
 	/// Returns one coherent snapshot of configured limits and live admission
 	/// occupancy.
 	pub fn limits(&self) -> AgentTreeLimits {
 		let state = self.concurrency.state.lock();
 		AgentTreeLimits {
-			max_depth: self.max_depth,
+			max_depth:       self.max_depth,
 			max_concurrency: state.limit,
-			active: state.active,
-			queued: state
+			active:          state.active,
+			queued:          state
 				.waiters
 				.iter()
 				.fold(0_usize, |total, waiter| total.saturating_add(waiter.units)),
-			max_queue: self.concurrency.max_queue,
+			max_queue:       self.concurrency.max_queue,
 		}
 	}
 

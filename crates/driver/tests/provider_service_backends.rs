@@ -83,12 +83,8 @@ fn campaign_resolver_uses_only_the_sealed_owner_generation() {
 
 	let mut spec = omp_agent::plan_regime_spec();
 	spec.id = sf!("dev.example.campaign");
-	let declaration = SealedCampaignDeclaration::new(
-		"consumer.extension",
-		7,
-		11,
-		Arc::new(spec),
-		|state| {
+	let declaration =
+		SealedCampaignDeclaration::new("consumer.extension", 7, 11, Arc::new(spec), |state| {
 			let mut machine = omp_agent::RegimeMachine;
 			if let Some(state) = state {
 				machine.restore(state).map_err(|_| {
@@ -99,8 +95,7 @@ fn campaign_resolver_uses_only_the_sealed_owner_generation() {
 				})?;
 			}
 			Ok(Box::new(machine) as Box<dyn omp_agent::CampaignMachine>)
-		},
-	);
+		});
 	let resolver = SealedCampaignControlResolver::new([declaration]).expect("sealed resolver");
 	let identity = identity();
 	let (resolved, machine) = resolver
@@ -157,7 +152,9 @@ async fn service_backend_enforces_sealed_input_and_result_schemas() {
 	broker
 		.publish_manifest(provider.clone(), ServiceManifest::new([service.clone()], []))
 		.expect("provider manifest");
-	broker.activate_provider(&caller, 7, []).expect("consumer generation");
+	broker
+		.activate_provider(&caller, 7, [])
+		.expect("consumer generation");
 	broker
 		.activate_provider_declarations(&provider, 13, [ServiceProviderDeclaration {
 			service: service.clone(),

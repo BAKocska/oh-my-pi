@@ -1,49 +1,109 @@
 //! Verifies the protobuf JSON representation of byte fields.
 
 use bytes::Bytes;
-use omp_proto::omp::{
-	document::v1::{DocumentEvent, DocumentTarget, document_target},
-	inference::v1::ToolDef,
-	telemetry::v1::ToolCall,
+use omp_proto::{
+	omp::{
+		document::v1::{DocumentEvent, DocumentTarget, document_target},
+		inference::v1::{ToolDef, tool_def},
+		telemetry::v1::ToolCall,
+	},
+	prost::Message as _,
 };
 use serde_json::{Value, json};
 
 #[test]
-fn plain_utf8_and_empty_bytes_are_json_strings() {
+fn plain_utf8_and_empty_schema_bytes_are_json_strings() {
 	let schema = Bytes::from_static(br#"{"type":"object"}"#);
-	let tool = ToolDef { schema_json: schema.clone(), ..Default::default() };
+	let tool = ToolDef {
+		input: Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
+			schema_json: schema.clone(),
+			strict:      None,
+		})),
+		..Default::default()
+	};
 	let value = serde_json::to_value(&tool).unwrap();
-	assert_eq!(value["schema_json"], json!(r#"{"type":"object"}"#));
-	assert_eq!(
-		serde_json::from_value::<ToolDef>(value)
-			.unwrap()
-			.schema_json,
-		schema
-	);
+	assert_eq!(value["input"]["JsonSchema"]["schema_json"], json!(r#"{"type":"object"}"#));
+	let decoded = serde_json::from_value::<ToolDef>(value).unwrap();
+	let Some(tool_def::Input::JsonSchema(decoded)) = decoded.input else {
+		panic!("JSON Schema input");
+	};
+	assert_eq!(decoded.schema_json, schema);
+	assert_eq!(decoded.strict, None);
 
-	let empty = ToolDef::default();
+	let empty = ToolDef {
+		input: Some(tool_def::Input::JsonSchema(tool_def::JsonSchema::default())),
+		..Default::default()
+	};
 	let value = serde_json::to_value(&empty).unwrap();
-	assert_eq!(value["schema_json"], json!(""));
-	assert!(
-		serde_json::from_value::<ToolDef>(value)
-			.unwrap()
-			.schema_json
-			.is_empty()
-	);
+	assert_eq!(value["input"]["JsonSchema"]["schema_json"], json!(""));
+	let decoded = serde_json::from_value::<ToolDef>(value).unwrap();
+	let Some(tool_def::Input::JsonSchema(decoded)) = decoded.input else {
+		panic!("JSON Schema input");
+	};
+	assert!(decoded.schema_json.is_empty());
 }
 
 #[test]
-fn binary_and_reserved_prefix_use_base64() {
-	for bytes in [Bytes::from_static(&[0xff, 0x00]), Bytes::from_static(b"b64:literal")] {
-		let tool = ToolDef { schema_json: bytes.clone(), ..Default::default() };
+fn json_schema_strict_presence_survives_json_roundtrip() {
+	for strict in [None, Some(false), Some(true)] {
+		let tool = ToolDef {
+			input: Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
+				schema_json: Bytes::from_static(b"{}"),
+				strict,
+			})),
+			..Default::default()
+		};
 		let value = serde_json::to_value(&tool).unwrap();
-		assert!(value["schema_json"].as_str().unwrap().starts_with("b64:"));
-		assert_eq!(
-			serde_json::from_value::<ToolDef>(value)
+		assert_eq!(value["input"]["JsonSchema"]["strict"], strict.map_or(Value::Null, Value::Bool));
+		let decoded = serde_json::from_value::<ToolDef>(value).unwrap();
+		let Some(tool_def::Input::JsonSchema(decoded)) = decoded.input else {
+			panic!("JSON Schema input");
+		};
+		assert_eq!(decoded.strict, strict);
+	}
+}
+
+#[test]
+fn grammar_tool_survives_binary_protocol_roundtrip_losslessly() {
+	const EDIT_LARK: &str = "start: begin_patch op+ end_patch\ncontent_line: /[^§«»\\n][^\\n]*/ LF";
+	let tool = ToolDef {
+		name:        "edit".to_owned(),
+		description: "Sparse edit".to_owned(),
+		input:       Some(tool_def::Input::Grammar(tool_def::Grammar {
+			syntax:     tool_def::grammar::Syntax::Lark as i32,
+			definition: EDIT_LARK.to_owned(),
+		})),
+	};
+	let decoded = ToolDef::decode(tool.encode_to_vec().as_slice()).expect("ToolDef decodes");
+	let Some(tool_def::Input::Grammar(grammar)) = decoded.input else {
+		panic!("grammar input");
+	};
+	assert_eq!(grammar.syntax, tool_def::grammar::Syntax::Lark as i32);
+	assert_eq!(grammar.definition, EDIT_LARK);
+}
+
+#[test]
+fn binary_and_reserved_schema_prefix_use_base64() {
+	for bytes in [Bytes::from_static(&[0xff, 0x00]), Bytes::from_static(b"b64:literal")] {
+		let tool = ToolDef {
+			input: Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
+				schema_json: bytes.clone(),
+				strict:      None,
+			})),
+			..Default::default()
+		};
+		let value = serde_json::to_value(&tool).unwrap();
+		assert!(
+			value["input"]["JsonSchema"]["schema_json"]
+				.as_str()
 				.unwrap()
-				.schema_json,
-			bytes
+				.starts_with("b64:")
 		);
+		let decoded = serde_json::from_value::<ToolDef>(value).unwrap();
+		let Some(tool_def::Input::JsonSchema(decoded)) = decoded.input else {
+			panic!("JSON Schema input");
+		};
+		assert_eq!(decoded.schema_json, bytes);
 	}
 }
 

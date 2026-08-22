@@ -4,9 +4,7 @@ use omp_core::{ArtifactDigest, Point, Principal, Provenance, Str, sf};
 use omp_envd::{
 	exthost::{
 		CallbackConcurrency,
-		control::{
-			ControlConnectionIdentity, ControlDispatch, ControlProtocolError,
-		},
+		control::{ControlConnectionIdentity, ControlDispatch, ControlProtocolError},
 		dispatch::CallbackDispatcher,
 	},
 	worker::{ExtensionCampaignResolver, SealedRegistryEvidence},
@@ -51,15 +49,15 @@ impl CallbackDispatcher for RecordingCallbacks {
 
 fn identity(host_generation: u64) -> Arc<ControlConnectionIdentity> {
 	Arc::new(ControlConnectionIdentity {
-		extension:          sf!("fixture.extension"),
-		principal:          Principal::new(sf!("fixture"), sf!("Fixture")),
-		artifact_digest:    sf!("sha256:fixture"),
-		layer:              sf!("project"),
-		tier:               sf!("trusted"),
-		trust:              sf!("trusted"),
+		extension: sf!("fixture.extension"),
+		principal: Principal::new(sf!("fixture"), sf!("Fixture")),
+		artifact_digest: sf!("sha256:fixture"),
+		layer: sf!("project"),
+		tier: sf!("trusted"),
+		trust: sf!("trusted"),
 		host_generation,
 		session_generation: 11,
-		capabilities:       Arc::new(BTreeSet::new()),
+		capabilities: Arc::new(BTreeSet::new()),
 	})
 }
 

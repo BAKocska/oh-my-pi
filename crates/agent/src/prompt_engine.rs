@@ -19,8 +19,8 @@ macro_rules! system_template {
 
 /// Returns the process-wide agent-side prompt engine.
 ///
-/// Agent templates use only scribe builtins. Domain helpers are registered on the independent
-/// driver-side engine before its templates are compiled.
+/// Agent templates use only scribe builtins. Domain helpers are registered on
+/// the independent driver-side engine before its templates are compiled.
 pub fn engine() -> &'static Engine {
 	static ENGINE: LazyLock<Engine> = LazyLock::new(Engine::new);
 	&ENGINE
@@ -31,11 +31,7 @@ system_template!(runtime, "system/runtime", "../prompts/system/runtime.md");
 system_template!(tool_policy, "system/tool-policy", "../prompts/system/tool-policy.md");
 system_template!(workflow, "system/workflow", "../prompts/system/workflow.md");
 system_template!(delivery, "system/delivery", "../prompts/system/delivery.md");
-system_template!(
-	computer_safety,
-	"system/computer-safety",
-	"../prompts/system/computer-safety.md"
-);
+system_template!(computer_safety, "system/computer-safety", "../prompts/system/computer-safety.md");
 system_template!(project, "system/project", "../prompts/system/project.md");
 system_template!(active_repo, "system/active-repo", "../prompts/system/active-repo.md");
 system_template!(
@@ -70,7 +66,10 @@ mod tests {
 	}
 	#[test]
 	fn embedded_templates_parse_and_use_registered_keys() {
-		let legal = crate::prompt_keys::ALL.iter().copied().collect::<std::collections::HashSet<_>>();
+		let legal = crate::prompt_keys::ALL
+			.iter()
+			.copied()
+			.collect::<std::collections::HashSet<_>>();
 		for template in super::system_templates() {
 			for key in template.referenced_keys() {
 				assert!(

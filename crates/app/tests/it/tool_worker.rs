@@ -24,6 +24,7 @@ use omp_envd::{
 };
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt, InterruptClass},
+	inference::v1::tool_def,
 	prost::Message as _,
 	thread::v1::{Blob, Part, part},
 	toolhost::v1::{
@@ -625,9 +626,12 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 	let definition = declaration.definition.as_ref().expect("py_eval definition");
 	assert_eq!(definition.name, "py_eval");
 	assert_eq!(declaration.rev, "1");
-	assert_eq!(definition.strict, Some(true));
+	let Some(tool_def::Input::JsonSchema(json_schema)) = definition.input.as_ref() else {
+		panic!("py_eval uses JSON Schema input");
+	};
+	assert_eq!(json_schema.strict, Some(true));
 	assert_eq!(
-		serde_json::from_slice::<Value>(&definition.schema_json).expect("py_eval schema JSON"),
+		serde_json::from_slice::<Value>(&json_schema.schema_json).expect("py_eval schema JSON"),
 		json!({
 			"type": "object",
 			"properties": { "code": { "type": "string", "minLength": 1 } },

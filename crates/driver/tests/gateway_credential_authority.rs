@@ -1,9 +1,10 @@
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	sync::Arc,
+};
 
 use omp_core::{Principal, SecretString, sf};
-use omp_driver::auth_backend::{
-	CredentialControlGrant, gateway_credential_control_factory,
-};
+use omp_driver::auth_backend::{CredentialControlGrant, gateway_credential_control_factory};
 use omp_envd::exthost::control::{
 	ControlAuthorityFactory as _, ControlConnectionIdentity, ControlRequestContext,
 };
@@ -26,14 +27,20 @@ fn identity(host_generation: u64) -> Arc<ControlConnectionIdentity> {
 }
 
 fn arguments(provider: &str) -> Map<String, Value> {
-	json!({"provider": provider, "id": 7}).as_object().unwrap().clone()
+	json!({"provider": provider, "id": 7})
+		.as_object()
+		.unwrap()
+		.clone()
 }
 
 fn factory(reveal: &[&str]) -> omp_driver::auth_backend::GatewayCredentialSecretControlFactory {
-	let reveal = reveal.iter().map(|value| omp_core::Str::new(*value)).collect::<Vec<_>>();
+	let reveal = reveal
+		.iter()
+		.map(|value| omp_core::Str::new(*value))
+		.collect::<Vec<_>>();
 	let grant = CredentialControlGrant {
-		grants: CredentialGrants {
-			allow: CredentialScope::new(Arc::from([sf!("openai")])),
+		grants:    CredentialGrants {
+			allow:  CredentialScope::new(Arc::from([sf!("openai")])),
 			import: CredentialScope::default(),
 			reveal: CredentialScope::new(reveal.into()),
 		},
@@ -51,12 +58,10 @@ fn factory(reveal: &[&str]) -> omp_driver::auth_backend::GatewayCredentialSecret
 #[test]
 fn reveal_scope_is_independent_and_provider_exact() {
 	let connection = identity(5);
-	let authority = factory(&["openai"]).bind(Arc::clone(&connection)).expect("authority");
-	let context = ControlRequestContext {
-		connection,
-		request_id: 41,
-		invocation: None,
-	};
+	let authority = factory(&["openai"])
+		.bind(Arc::clone(&connection))
+		.expect("authority");
+	let context = ControlRequestContext { connection, request_id: 41, invocation: None };
 	authority
 		.authorize(&context, "omp.creds.reveal", &arguments("openai"))
 		.expect("exact reveal grant");
@@ -69,7 +74,9 @@ fn reveal_scope_is_independent_and_provider_exact() {
 #[tokio::test]
 async fn unauthorized_reveal_is_refused_before_remote_exposure() {
 	let connection = identity(5);
-	let authority = factory(&[]).bind(Arc::clone(&connection)).expect("authority");
+	let authority = factory(&[])
+		.bind(Arc::clone(&connection))
+		.expect("authority");
 	let error = authority
 		.request(
 			ControlRequestContext { connection, request_id: 42, invocation: None },
@@ -85,11 +92,7 @@ async fn unauthorized_reveal_is_refused_before_remote_exposure() {
 fn reveal_is_fenced_to_the_bound_host_and_session_identity() {
 	let bound = identity(5);
 	let authority = factory(&["openai"]).bind(bound).expect("authority");
-	let stale = ControlRequestContext {
-		connection: identity(6),
-		request_id: 43,
-		invocation: None,
-	};
+	let stale = ControlRequestContext { connection: identity(6), request_id: 43, invocation: None };
 	let error = authority
 		.authorize(&stale, "omp.creds.reveal", &arguments("openai"))
 		.expect_err("replaced host generation must be refused");

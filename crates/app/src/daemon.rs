@@ -629,10 +629,7 @@ impl DaemonHandle {
 			.ok_or(DaemonError::MissingDataDirectory)?;
 		std::fs::create_dir_all(&data_dir).map_err(DaemonError::PrepareState)?;
 		let omp_driver::registry::ProductionInference {
-			registry,
-			rpc: inference,
-			auth_control,
-			..
+			registry, rpc: inference, auth_control, ..
 		} = omp_driver::registry::production_inference(&data_dir, tool_registry, None).await?;
 		Self::start_rpc(config, data_dir, registry, inference, Some(auth_control)).await
 	}

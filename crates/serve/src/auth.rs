@@ -104,20 +104,20 @@ impl AuthRpc {
 			})
 			.collect();
 		Ok(pb::CredentialMeta {
-			id:             wire_account_id(&account.account),
-			provider:       account.provider.as_str().to_owned(),
-			kind:           kind as i32,
-			identity:       account.principal.as_str().to_owned(),
-			state:          if account.enabled {
+			id: wire_account_id(&account.account),
+			provider: account.provider.as_str().to_owned(),
+			kind: kind as i32,
+			identity: account.principal.as_str().to_owned(),
+			state: if account.enabled {
 				pb::credential_meta::State::Active as i32
 			} else {
 				pb::credential_meta::State::Disabled as i32
 			},
 			blocks,
 			disabled_cause: String::new(),
-			expires_at_ms:  metadata.expires_at_ms.unwrap_or_default(),
-			created_at_ms:  metadata.created_at_ms,
-			updated_at_ms:  metadata.updated_at_ms,
+			expires_at_ms: metadata.expires_at_ms.unwrap_or_default(),
+			created_at_ms: metadata.created_at_ms,
+			updated_at_ms: metadata.updated_at_ms,
 		})
 	}
 
@@ -244,17 +244,14 @@ impl pb::auth_server::Auth for AuthRpc {
 	) -> Result<Response<pb::ListCredentialsResponse>, Status> {
 		let request = request.into_inner();
 		if let Some(control) = &self.control {
-			let requested = (!request.provider.is_empty())
-				.then(|| ProviderId::from(request.provider.as_str()));
+			let requested =
+				(!request.provider.is_empty()).then(|| ProviderId::from(request.provider.as_str()));
 			let credentials = control
 				.accounts(requested.as_ref().map(|provider| &**provider))
 				.into_iter()
 				.map(|account| self.control_meta(account))
 				.collect::<Result<Vec<_>, _>>()?;
-			return Ok(Response::new(pb::ListCredentialsResponse {
-				credentials,
-				cursor: None,
-			}));
+			return Ok(Response::new(pb::ListCredentialsResponse { credentials, cursor: None }));
 		}
 		let provider = self.provider_for(Some(&request.provider))?;
 		let answer = self
@@ -418,6 +415,7 @@ impl pb::auth_server::Auth for AuthRpc {
 			.await?;
 		Ok(Response::new(pb::DeleteCredentialResponse {}))
 	}
+
 	async fn reveal_credential(
 		&self,
 		request: Request<pb::RevealCredentialRequest>,
@@ -698,7 +696,9 @@ fn account_meta(account: AccountSummary) -> Result<pb::CredentialMeta, Status> {
 fn parse_account_id(account: &AccountId<str>) -> Result<u64, Status> {
 	Ok(wire_account_id(account))
 }
-fn reveal_audit(request: pb::RevealCredentialRequest) -> omp_inference::auth::AuditedCredentialReveal {
+fn reveal_audit(
+	request: pb::RevealCredentialRequest,
+) -> omp_inference::auth::AuditedCredentialReveal {
 	omp_inference::auth::AuditedCredentialReveal {
 		extension:          request.extension.into(),
 		caller_principal:   request.caller_principal.into(),
@@ -987,20 +987,19 @@ mod tests {
 		receipt::ExecutionReceipt,
 	};
 
-	use super::{error_class, pb};
-	use super::reveal_audit;
+	use super::{error_class, pb, reveal_audit};
 
 	#[test]
 	fn reveal_rpc_preserves_authenticated_audit_evidence() {
 		let audit = reveal_audit(pb::RevealCredentialRequest {
-			id: 7,
-			provider: "openai".to_owned(),
-			extension: "fixture.extension".to_owned(),
-			caller_principal: "principal".to_owned(),
-			host_generation: 11,
+			id:                 7,
+			provider:           "openai".to_owned(),
+			extension:          "fixture.extension".to_owned(),
+			caller_principal:   "principal".to_owned(),
+			host_generation:    11,
 			session_generation: 13,
-			request_id: 17,
-			reason: "extension_control_reveal".to_owned(),
+			request_id:         17,
+			reason:             "extension_control_reveal".to_owned(),
 		});
 		assert_eq!(audit.extension.as_str(), "fixture.extension");
 		assert_eq!(audit.caller_principal.as_str(), "principal");

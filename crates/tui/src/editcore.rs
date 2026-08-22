@@ -2373,16 +2373,16 @@ impl SlashCommands {
 			if score > 0 {
 				let hint = argument_inline_hint(&arg.value, partial, arg.usage.as_ref());
 				ranked.push((score, Suggestion {
-					value:       if arg.usage.is_some() {
+					value: if arg.usage.is_some() {
 						sf!("{} ", arg.value)
 					} else {
 						arg.value.clone()
 					},
-					display:     SuggestionDisplay::Text(arg.value.clone()),
+					display: SuggestionDisplay::Text(arg.value.clone()),
 					description: Some(arg.description.clone()),
-					icon:        None,
+					icon: None,
 					hint,
-					category:    Some(sf!("Arguments")),
+					category: Some(sf!("Arguments")),
 					match_spans: fuzzy_match_spans(&arg.value, &query),
 				}));
 			}
@@ -2402,13 +2402,11 @@ fn argument_inline_hint(value: &str, partial: &str, usage: Option<&Str>) -> Opti
 	if partial.is_empty() {
 		return None;
 	}
-	let remaining = value
-		.get(partial.len()..)
-		.filter(|_| {
-			value
-				.get(..partial.len())
-				.is_some_and(|prefix| prefix.eq_ignore_ascii_case(partial))
-		});
+	let remaining = value.get(partial.len()..).filter(|_| {
+		value
+			.get(..partial.len())
+			.is_some_and(|prefix| prefix.eq_ignore_ascii_case(partial))
+	});
 	match (remaining, usage) {
 		(Some(""), Some(usage)) => Some(usage.clone()),
 		(Some(""), None) => None,

@@ -10,8 +10,7 @@ use std::sync::{
 use omp_agent::{
 	AgentState, CachedContribution, CampaignEntry, CampaignEntryStatus, CampaignStack, Continuation,
 	ContinuationPolicy, ContinuationSource, LoopSignal, PromptError, PromptSlotSource, PromptSource,
-	SLOT_TABLE, SlotAssembler, SlotClaim, SlotClass, SlotDecl, SlotId, SlotRegistration,
-	Props,
+	Props, SLOT_TABLE, SlotAssembler, SlotClaim, SlotClass, SlotDecl, SlotId, SlotRegistration,
 };
 use omp_core::{Str, sf};
 /// One visible campaign-slot holder projected by the driver.

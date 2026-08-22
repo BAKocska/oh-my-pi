@@ -4,8 +4,8 @@
 //! Process ownership remains in [`crate::worker::ExtHostSupervisor`].
 //! Children are spawned lazily at a declared surface's first reach.
 
-pub mod cancel;
 pub mod backends;
+pub mod cancel;
 pub mod context;
 pub mod control;
 pub mod dispatch;

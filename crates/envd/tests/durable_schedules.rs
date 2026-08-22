@@ -31,10 +31,7 @@ impl Delivery {
 
 #[async_trait::async_trait]
 impl ScheduleDeliveryBackend for Delivery {
-	async fn estimate(
-		&self,
-		_request: &ScheduleDeliveryRequest,
-	) -> Result<BudgetReservation, Str> {
+	async fn estimate(&self, _request: &ScheduleDeliveryRequest) -> Result<BudgetReservation, Str> {
 		Ok(self.reservation)
 	}
 
@@ -48,21 +45,21 @@ impl ScheduleDeliveryBackend for Delivery {
 			state.effects += 1;
 		}
 		Ok(ScheduleDeliveryReceipt {
-			receipt: Str::from("delivered"),
-			run_id: None,
+			receipt:     Str::from("delivered"),
+			run_id:      None,
 			cost_micros: self.reservation.cost_micros,
-			requests: self.reservation.requests,
+			requests:    self.reservation.requests,
 		})
 	}
 }
 
 fn caller() -> ScheduleCaller {
 	ScheduleCaller {
-		owner: Str::from("session-1"),
-		extension_owner: Str::from("extension-1"),
-		principal: Str::from("principal-1"),
-		artifact_digest: Str::from("artifact-1"),
-		host_generation: 1,
+		owner:              Str::from("session-1"),
+		extension_owner:    Str::from("extension-1"),
+		principal:          Str::from("principal-1"),
+		artifact_digest:    Str::from("artifact-1"),
+		host_generation:    1,
 		session_generation: 1,
 	}
 }
@@ -106,10 +103,7 @@ async fn schedule_id(
 		.to_owned()
 }
 
-async fn history(
-	handle: &omp_envd::schedules::DurableScheduleHandle,
-	id: &str,
-) -> Vec<Value> {
+async fn history(handle: &omp_envd::schedules::DurableScheduleHandle, id: &str) -> Vec<Value> {
 	handle
 		.request(
 			caller(),
@@ -131,19 +125,15 @@ async fn project_schedule_recovers_after_session_exit_and_deduplicates_restart()
 	let handle = open_durable_scheduler_manual(&path, delivery.clone()).expect("open scheduler");
 	let id = schedule_id(
 		&handle,
-		at_schedule(
-			"persisted",
-			"coalesce",
-			"project",
-			json!({"kind": "inject", "prompt": "wake"}),
-		),
+		at_schedule("persisted", "coalesce", "project", json!({"kind": "inject", "prompt": "wake"})),
 	)
 	.await;
 	handle.expire_session().await.expect("session exit");
 	drop(handle);
 	tokio::task::yield_now().await;
 
-	let restarted = open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
+	let restarted =
+		open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
 	let rows = history(&restarted, &id).await;
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0].get("outcome").and_then(Value::as_str), Some("injected"));
@@ -170,16 +160,10 @@ async fn owned_clock_fires_without_a_chat_timer() {
 		.as_millis()
 		.try_into()
 		.expect("epoch millis");
-	let mut arguments = at_schedule(
-		"clock",
-		"coalesce",
-		"project",
-		json!({"kind": "inject", "prompt": "clock"}),
-	);
-	arguments.insert(
-		"trigger".to_owned(),
-		json!({"kind": "at", "epoch_ms": at_ms.saturating_add(25)}),
-	);
+	let mut arguments =
+		at_schedule("clock", "coalesce", "project", json!({"kind": "inject", "prompt": "clock"}));
+	arguments
+		.insert("trigger".to_owned(), json!({"kind": "at", "epoch_ms": at_ms.saturating_add(25)}));
 	let id = schedule_id(&handle, arguments).await;
 	tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 	let rows = history(&handle, &id).await;
@@ -196,12 +180,7 @@ async fn pending_intent_replay_uses_idempotency_key_without_repeating_effect() {
 	let handle = open_durable_scheduler_manual(&path, delivery.clone()).expect("open scheduler");
 	let id = schedule_id(
 		&handle,
-		at_schedule(
-			"ambiguous",
-			"coalesce",
-			"project",
-			json!({"kind": "inject", "prompt": "once"}),
-		),
+		at_schedule("ambiguous", "coalesce", "project", json!({"kind": "inject", "prompt": "once"})),
 	)
 	.await;
 	drop(handle);
@@ -240,7 +219,8 @@ async fn pending_intent_replay_uses_idempotency_key_without_repeating_effect() {
 		.expect("append ambiguous intent");
 	drop(connection);
 
-	let restarted = open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
+	let restarted =
+		open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
 	let rows = history(&restarted, &id).await;
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0].get("outcome").and_then(Value::as_str), Some("injected"));
@@ -257,12 +237,7 @@ async fn recovery_honors_skip_and_hard_budget_refusal() {
 	let handle = open_durable_scheduler_manual(&path, delivery.clone()).expect("open scheduler");
 	let skipped = schedule_id(
 		&handle,
-		at_schedule(
-			"skip",
-			"skip",
-			"project",
-			json!({"kind": "inject", "prompt": "skip"}),
-		),
+		at_schedule("skip", "skip", "project", json!({"kind": "inject", "prompt": "skip"})),
 	)
 	.await;
 	let mut refused_args = at_schedule(
@@ -284,23 +259,17 @@ async fn recovery_honors_skip_and_hard_budget_refusal() {
 	drop(handle);
 	tokio::task::yield_now().await;
 
-	let restarted = open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
+	let restarted =
+		open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
 	assert!(history(&restarted, &skipped).await.is_empty());
 	let skipped_info = restarted
-		.request(
-			caller(),
-			"omp.agents.schedule.info",
-			object(json!({"schedule_id": skipped})),
-		)
+		.request(caller(), "omp.agents.schedule.info", object(json!({"schedule_id": skipped})))
 		.await
 		.expect("skip info");
 	assert_eq!(skipped_info.get("miss_count").and_then(Value::as_u64), Some(1));
 	let refused_history = history(&restarted, &refused).await;
 	assert_eq!(refused_history.len(), 1);
-	assert_eq!(
-		refused_history[0].get("outcome").and_then(Value::as_str),
-		Some("budget_refused")
-	);
+	assert_eq!(refused_history[0].get("outcome").and_then(Value::as_str), Some("budget_refused"));
 	assert_eq!(delivery.state.lock().expect("state").effects, 0);
 }
 #[tokio::test]
@@ -314,13 +283,11 @@ async fn coalesce_backfill_and_overlap_are_projected_durably() {
 	drop(handle);
 	tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
-	let restarted = open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
+	let restarted =
+		open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
 	let coalesced_history = history(&restarted, &coalesced).await;
 	assert_eq!(coalesced_history.len(), 1);
-	assert_eq!(
-		coalesced_history[0].get("outcome").and_then(Value::as_str),
-		Some("injected")
-	);
+	assert_eq!(coalesced_history[0].get("outcome").and_then(Value::as_str), Some("injected"));
 	let backfilled_history = history(&restarted, &backfilled).await;
 	assert!(
 		(2..=33).contains(&backfilled_history.len()),

@@ -43,11 +43,11 @@ use super::{
 		ExternalJournalRequest, JournalConnectionIdentity, artifact_rows, journal_rows, session_rows,
 		usage_rows,
 	},
-	worker::ExternalJournalCall,
 	schedules::{
 		DurableScheduleError, DurableScheduleHandle, ScheduleCaller, ScheduleDeliveryBackend,
 		open_durable_scheduler_unbound,
 	},
+	worker::ExternalJournalCall,
 };
 
 #[derive(Clone)]
@@ -102,14 +102,12 @@ impl ExternalJournalActor {
 		let sessions_dir = state_dir.join("sessions");
 		let artifact_meta = ArtifactMetadataStore::open(blobs.store())
 			.map_err(|error| super::server::EnvdError::Blob(Str::from(error.to_string())))?;
-		let schedules =
-			open_durable_scheduler_unbound(&state_dir.join("agent-schedules.sqlite")).map_err(
-				|error| {
-					super::server::EnvdError::Worker(super::worker::WorkerError::Protocol(
-						Str::from(error.to_string()),
-					))
-				},
-			)?;
+		let schedules = open_durable_scheduler_unbound(&state_dir.join("agent-schedules.sqlite"))
+			.map_err(|error| {
+				super::server::EnvdError::Worker(super::worker::WorkerError::Protocol(Str::from(
+					error.to_string(),
+				)))
+			})?;
 		let (sender, receiver) = flume::unbounded::<ExternalJournalCall>();
 		let agent = Arc::new(Mutex::new(None));
 		let actor_agent = Arc::clone(&agent);
@@ -213,11 +211,15 @@ impl ExternalJournalActor {
 		&self,
 		backend: Arc<dyn ScheduleDeliveryBackend>,
 	) -> Result<(), super::server::EnvdError> {
-		self.schedules.bind_delivery(backend).await.map_err(|error| {
-			super::server::EnvdError::Worker(super::worker::WorkerError::Protocol(Str::from(
-				error.to_string(),
-			)))
-		})
+		self
+			.schedules
+			.bind_delivery(backend)
+			.await
+			.map_err(|error| {
+				super::server::EnvdError::Worker(super::worker::WorkerError::Protocol(Str::from(
+					error.to_string(),
+				)))
+			})
 	}
 
 	pub(crate) fn unbind_agent(&self, id: u64) {
@@ -331,6 +333,7 @@ impl PersistenceControlOwner {
 		)
 		.map_err(protocol_error)
 	}
+
 	fn schedule_caller(
 		&self,
 		context: &ControlRequestContext,
@@ -362,7 +365,8 @@ impl PersistenceControlOwner {
 		arguments: Map<String, Value>,
 	) -> Result<Value, ControlProtocolError> {
 		let caller = self.schedule_caller(&context)?;
-		self.actor
+		self
+			.actor
 			.schedules
 			.request(caller, operation, arguments)
 			.await
@@ -1639,7 +1643,8 @@ fn schedule_protocol_error(error: DurableScheduleError) -> ControlProtocolError 
 		| DurableScheduleError::NotOwned
 		| DurableScheduleError::Invalid { .. } => ("ScheduleRejected", false),
 	};
-	ControlProtocolError::new(code, error.to_string()).retryable(retryable)
+	ControlProtocolError::new(code, error.to_string())
+		.retryable(retryable)
 		.with_details(details)
 }
 

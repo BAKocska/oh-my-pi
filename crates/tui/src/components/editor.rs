@@ -2203,9 +2203,11 @@ mod tests {
 	#[test]
 	fn pi_composer_uses_right_border_as_scrollbar_track() {
 		let ui = Ui::from_root(
-			EditorPane::new()
-				.composer_style(ComposerStyle::Pi)
-				.with(Prop::Value, "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty"),
+			EditorPane::new().composer_style(ComposerStyle::Pi).with(
+				Prop::Value,
+				"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\\
+				 nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty",
+			),
 			20,
 			UiContext::default(),
 		);

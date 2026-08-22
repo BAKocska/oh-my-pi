@@ -9,21 +9,22 @@ use omp_app::chat_ui::presentation_authority::{
 	PresentationCallbackDispatcher, PresentationClient, PresentationEffect, PresentationIdentity,
 	PresentationRequest, PresentationResponse,
 };
+use omp_e2e::{
+	Context as _, Result,
+	support::{AllowAdmission, DEFAULT_TIMEOUT, Scratch, within},
+};
 use omp_env::EnvClient;
 use omp_envd::{
 	EnvServer, RegistryBridges,
-	exthost::{UiControlAuthority, control::{ControlAuthority, ControlAuthorityFactory}},
+	exthost::{
+		UiControlAuthority,
+		control::{ControlAuthority, ControlAuthorityFactory},
+	},
 	worker::ExtHostConfig,
 };
-use omp_proto::{
-	SCHEMA_REV,
-	env::v1::ClientHello,
-};
+use omp_proto::{SCHEMA_REV, env::v1::ClientHello};
 use omp_tool::Registry;
 use tokio::task::JoinHandle;
-
-use omp_e2e::{Context as _, Result};
-use omp_e2e::support::{AllowAdmission, DEFAULT_TIMEOUT, Scratch, within};
 
 /// Real local Environment plus its owned Python extension-host process tree.
 pub struct ExtensionHarness {
@@ -33,8 +34,8 @@ pub struct ExtensionHarness {
 }
 
 impl ExtensionHarness {
-	/// Starts envd in process while extension and worker entrypoints re-enter the
-	/// production `omp_e2e_host` child executable.
+	/// Starts envd in process while extension and worker entrypoints re-enter
+	/// the production `omp_e2e_host` child executable.
 	pub async fn spawn(scratch: &Scratch, config: ExtHostConfig) -> Result<Self> {
 		let server = Arc::new(
 			EnvServer::open_local(
@@ -95,23 +96,24 @@ impl Drop for ExtensionHarness {
 /// CONTROL adapter and returns its observable effect stream.
 pub fn recording_ui_factory() -> (Arc<dyn ControlAuthorityFactory>, Receiver<PresentationEffect>) {
 	let (effects, received) = flume::unbounded();
-	let factory: Arc<dyn ControlAuthorityFactory> = Arc::new(move |identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>| {
-		let presentation_identity = Arc::new(PresentationIdentity {
-			principal:          identity.principal.id().into(),
-			extension:          identity.extension.clone(),
-			artifact_digest:    identity.artifact_digest.clone(),
-			host_generation:    identity.host_generation,
-			session_generation: identity.session_generation,
-			capabilities:       Arc::clone(&identity.capabilities),
+	let factory: Arc<dyn ControlAuthorityFactory> =
+		Arc::new(move |identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>| {
+			let presentation_identity = Arc::new(PresentationIdentity {
+				principal:          identity.principal.id().into(),
+				extension:          identity.extension.clone(),
+				artifact_digest:    identity.artifact_digest.clone(),
+				host_generation:    identity.host_generation,
+				session_generation: identity.session_generation,
+				capabilities:       Arc::clone(&identity.capabilities),
+			});
+			let owner = Arc::new(PresentationAuthority::new(
+				omp_executor::Executor::new(None),
+				presentation_identity,
+				Arc::new(RecordingPresentationClient { effects: effects.clone() }),
+				Arc::new(UnusedPresentationCallbacks),
+			));
+			Ok(Arc::new(UiControlAuthority::new(identity, owner)) as Arc<dyn ControlAuthority>)
 		});
-		let owner = Arc::new(PresentationAuthority::new(
-			omp_executor::Executor::new(None),
-			presentation_identity,
-			Arc::new(RecordingPresentationClient { effects: effects.clone() }),
-			Arc::new(UnusedPresentationCallbacks),
-		));
-		Ok(Arc::new(UiControlAuthority::new(identity, owner)) as Arc<dyn ControlAuthority>)
-	});
 	(factory, received)
 }
 
@@ -126,7 +128,8 @@ impl PresentationClient for RecordingPresentationClient {
 		_identity: Arc<PresentationIdentity>,
 		effect: PresentationEffect,
 	) -> Result<(), PresentationAuthorityError> {
-		self.effects
+		self
+			.effects
 			.send(effect)
 			.map_err(|_| PresentationAuthorityError::Unavailable)
 	}

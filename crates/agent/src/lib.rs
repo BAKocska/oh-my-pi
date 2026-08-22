@@ -41,9 +41,9 @@ mod oneshot;
 mod phases;
 mod project;
 mod prompt;
+pub mod prompt_assets;
 pub mod prompt_engine;
 pub mod prompt_keys;
-pub mod prompt_assets;
 mod read_only_policy;
 mod revival;
 mod schedule;
@@ -169,6 +169,7 @@ pub use omp_proto::{
 	},
 	thread::v1::{Item, Thread},
 };
+pub use omp_scribe::Props;
 pub use oneshot::{
 	Completion, CompletionError, CompletionRequest, resolve_completion, select_choice,
 };
@@ -177,24 +178,22 @@ pub use phases::{
 	RestartReason,
 };
 pub use project::{
-	ProjectionError, project_journal, project_thread_history, tool_result_item,
-	tool_result_item_canonical_parts, truncate_item_for_persistence,
-	render_compaction_summary,
+	ProjectionError, project_journal, project_thread_history, render_compaction_summary,
+	tool_result_item, tool_result_item_canonical_parts, truncate_item_for_persistence,
 };
 pub use prompt::{
 	ActiveRepositoryInput, BandHash, CachedContribution, CanonicalPromptSource, ContextFile,
 	ConventionsPromptSource, DeliveryPromptSource, EagerTaskPolicy, HostInfoInput, ModelPromptInput,
 	MutationPromptInput, Personality, PolicyPromptSource, ProjectPromptSource,
-	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptError, PromptHash,
-	PromptFacts, PromptMemoryInput, PromptMemorySlotInput, PromptNamedInput, PromptOut, PromptPatchSet,
-	PromptSchemeInput, PromptSettingsInput, PromptSlotSource, PromptSource, PromptToolExampleInput,
-	PromptToolInput, RenderedPrompt, RepositoryInput, RolePromptSource, RuntimePromptSource,
-	SECURITY_REVIEW_INSTRUCTION_V1, SlotAssembler, SlotClass, SlotDecl, SlotId, SlotPatch,
-	SlotRegistration, SlotSource, ToolInventoryMode, VcsIdentity, VolatilePrompt,
+	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptError, PromptFacts,
+	PromptHash, PromptMemoryInput, PromptMemorySlotInput, PromptNamedInput, PromptOut,
+	PromptPatchSet, PromptSchemeInput, PromptSettingsInput, PromptSlotSource, PromptSource,
+	PromptToolExampleInput, PromptToolInput, RenderedPrompt, RepositoryInput, RolePromptSource,
+	RuntimePromptSource, SECURITY_REVIEW_INSTRUCTION_V1, SlotAssembler, SlotClass, SlotDecl, SlotId,
+	SlotPatch, SlotRegistration, SlotSource, ToolInventoryMode, VcsIdentity, VolatilePrompt,
 	VolatilePromptJournal, WorkflowPromptSource, WorkspacePromptSource, WorkspaceRootInput,
 	WorkspaceRootsInput, WorkspaceTreeInput, render_prompt,
 };
-pub use omp_scribe::Props;
 pub use read_only_policy::is_read_only_agent;
 pub use revival::{RevivalError, RevivedSession, revive, revive_existing};
 pub use schedule::{
@@ -210,8 +209,8 @@ pub use subagent::{
 };
 pub use tree::{
 	AgentAuxiliary, AgentDefinition, AgentDefinitionError, AgentKind, AgentModelPurpose, AgentNode,
-	AgentStatus, AgentTree, AgentTreeLimits, AssembledYield, Budget, BudgetCeiling, BudgetExceeded, BudgetRemainder,
-	DEFAULT_MAX_ADMISSION_QUEUE, DEFAULT_MAX_CONCURRENCY, EffectsOperation,
+	AgentStatus, AgentTree, AgentTreeLimits, AssembledYield, Budget, BudgetCeiling, BudgetExceeded,
+	BudgetRemainder, DEFAULT_MAX_ADMISSION_QUEUE, DEFAULT_MAX_CONCURRENCY, EffectsOperation,
 	MAX_YIELD_SCHEMA_RETRIES, OutputSchemaResolution, OutputSchemaSource, SpawnPermit, SpawnPolicy,
 	SpawnRefusal, TreeStatistics, Usage, YieldAssembler, YieldAssemblyError, YieldPayload,
 	YieldPayloadError, YieldPayloadValidator, enforce_minimum_phase, resolve_output_schema,

@@ -8,9 +8,13 @@ mod extension;
 use std::time::Duration;
 
 use bytes::Bytes;
+use extension::{ExtensionHarness, recording_ui_factory};
 use omp_agent::HookPhase;
 use omp_core::{ArtifactDigest, Principal, Provenance, sf};
-use omp_e2e::{Context as _, Result, error, support::{DEFAULT_TIMEOUT, Scratch, install_omp_binary_env, omp_binary, within}};
+use omp_e2e::{
+	Context as _, Result, error,
+	support::{DEFAULT_TIMEOUT, Scratch, install_omp_binary_env, omp_binary, within},
+};
 use omp_env::{Invocation, InvocationEvent};
 use omp_envd::{
 	exthost::{
@@ -27,8 +31,6 @@ use omp_proto::{
 };
 use omp_tool::CallOutcome;
 use serde_json::{Value, json};
-
-use extension::{ExtensionHarness, recording_ui_factory};
 
 const MODULE: &str = "p9_extension_control";
 const SESSION: &str = "p9-extension-control-session";
@@ -151,7 +153,12 @@ async def extension_block(params, ctx):
     await asyncio.Event().wait()
 "#;
 
-fn extension_config(scratch: &Scratch) -> Result<(ExtHostConfig, flume::Receiver<omp_app::chat_ui::presentation_authority::PresentationEffect>)> {
+fn extension_config(
+	scratch: &Scratch,
+) -> Result<(
+	ExtHostConfig,
+	flume::Receiver<omp_app::chat_ui::presentation_authority::PresentationEffect>,
+)> {
 	install_omp_binary_env().context("exposing worker-capable e2e host")?;
 	let mut config = ExtHostConfig::new(
 		omp_binary().context("resolving worker-capable e2e host")?,
@@ -231,7 +238,9 @@ async fn open_invocation(
 		}),
 	)
 	.await??;
-	match within("accepting Python extension invocation", DEFAULT_TIMEOUT, invocation.next_event()).await?? {
+	match within("accepting Python extension invocation", DEFAULT_TIMEOUT, invocation.next_event())
+		.await??
+	{
 		Some(InvocationEvent::Accepted(_)) => {},
 		other => return Err(error(format!("extension invocation was not accepted: {other:?}"))),
 	}
@@ -251,7 +260,9 @@ async fn open_invocation(
 
 async fn terminal(invocation: &mut Invocation) -> Result<Verdict> {
 	loop {
-		match within("waiting for Python extension verdict", DEFAULT_TIMEOUT, invocation.next_event()).await?? {
+		match within("waiting for Python extension verdict", DEFAULT_TIMEOUT, invocation.next_event())
+			.await??
+		{
 			Some(InvocationEvent::Verdict(verdict)) => return Ok(verdict),
 			Some(InvocationEvent::Update(_)) => {},
 			Some(other) => return Err(error(format!("unexpected extension event: {other:?}"))),
@@ -288,21 +299,40 @@ async fn p9_python_extension_exercises_joined_control_and_data_authorities() -> 
 	)
 	.await?;
 	let verdict = terminal(&mut proof).await?;
-	assert!(!verdict.is_error, "joined Python device faulted: {}", String::from_utf8_lossy(&verdict.json));
-	let CallOutcome::Ok(details) = serde_json::from_slice::<CallOutcome<Value, Value>>(&verdict.json)? else {
+	assert!(
+		!verdict.is_error,
+		"joined Python device faulted: {}",
+		String::from_utf8_lossy(&verdict.json)
+	);
+	let CallOutcome::Ok(details) =
+		serde_json::from_slice::<CallOutcome<Value, Value>>(&verdict.json)?
+	else {
 		return Err(error("joined Python device returned a non-success outcome"));
 	};
 	assert_eq!(details["journal_message"], "joined");
-	assert!(details["entry_id"].as_str().is_some_and(|id| id.starts_with(SESSION)));
+	assert!(
+		details["entry_id"]
+			.as_str()
+			.is_some_and(|id| id.starts_with(SESSION))
+	);
 	assert_eq!(details["artifact_text"], "artifact:joined");
-	assert!(details["artifact_id"].as_str().is_some_and(|id| !id.is_empty()));
-	assert_eq!(details["decision"], json!({
-		"kind": "deny",
-		"reason": "reviewed by Python extension",
-		"code": "E2E_REVIEW",
-	}));
+	assert!(
+		details["artifact_id"]
+			.as_str()
+			.is_some_and(|id| !id.is_empty())
+	);
+	assert_eq!(
+		details["decision"],
+		json!({
+			"kind": "deny",
+			"reason": "reviewed by Python extension",
+			"code": "E2E_REVIEW",
+		})
+	);
 
-	let effect = within("observing authoritative UI effect", DEFAULT_TIMEOUT, ui_effects.recv_async()).await??;
+	let effect =
+		within("observing authoritative UI effect", DEFAULT_TIMEOUT, ui_effects.recv_async())
+			.await??;
 	assert_eq!(effect.kind, "submit");
 	assert_eq!(effect.body["text"], "extension authority is live");
 	let started = scratch.project().join("extension-block-started");
@@ -326,7 +356,10 @@ async fn p9_python_extension_exercises_joined_control_and_data_authorities() -> 
 	blocked.guard().cancel();
 	let cancelled = terminal(&mut blocked).await?;
 	let outcome: CallOutcome<Value, Value> = serde_json::from_slice(&cancelled.json)?;
-	assert!(matches!(outcome, CallOutcome::Aborted { .. }), "in-flight Python call did not cancel: {outcome:?}");
+	assert!(
+		matches!(outcome, CallOutcome::Aborted { .. }),
+		"in-flight Python call did not cancel: {outcome:?}"
+	);
 
 	harness.shutdown().await;
 	Ok(())

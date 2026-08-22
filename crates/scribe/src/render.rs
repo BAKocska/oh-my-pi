@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use omp_core::{Str};
+use omp_core::Str;
 use smallvec::SmallVec;
 
 use crate::{
@@ -75,7 +75,8 @@ impl Engine {
 		Template::compile(self, Str::new_static(name), Str::new_static(source))
 	}
 
-	/// Compiles a runtime-supplied template from an owned name and copied source.
+	/// Compiles a runtime-supplied template from an owned name and copied
+	/// source.
 	pub fn compile_owned(&self, name: Str, source: &str) -> Result<Template, Error> {
 		Template::compile(self, name, Str::new(source))
 	}

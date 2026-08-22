@@ -16,18 +16,20 @@ impl RouteComposer for UnusedComposer {
 		&self,
 		_catalog: &omp_catalog::snapshot::Catalog,
 		_route: &omp_catalog::RouteDef,
-	) -> Result<omp_inference::layer::stack::RouteProviderService, omp_inference::RouteUnavailable> {
+	) -> Result<omp_inference::layer::stack::RouteProviderService, omp_inference::RouteUnavailable>
+	{
 		panic!("stale and unauthenticated requests never compose a route")
 	}
 }
 
 fn authority() -> Arc<dyn omp_serve::inference::ProviderGatewayAuthority> {
 	let catalog = Arc::new(omp_catalog::snapshot::Catalog::embedded().clone());
-	let registry = omp_inference::Registry::builder(catalog).build().expect("registry");
-	let blobs = omp_storage::blob::BlobStore::open(
-		tempfile::tempdir().expect("temporary blob root").keep(),
-	)
-	.expect("blob store");
+	let registry = omp_inference::Registry::builder(catalog)
+		.build()
+		.expect("registry");
+	let blobs =
+		omp_storage::blob::BlobStore::open(tempfile::tempdir().expect("temporary blob root").keep())
+			.expect("blob store");
 	gateway_provider_rpc_authority(Arc::new(ProductionProviderApplicationOwner::new(
 		registry,
 		BuiltinConfig::new(Arc::new(UnusedComposer)),
@@ -46,20 +48,20 @@ async fn provider_mutations_refuse_stale_catalog_and_incomplete_identity() {
 
 	let stale = authority
 		.declare(pb::ProviderDeclarationRequest {
-			caller: Some(pb::ProviderCaller {
-				extension: "dev.example.provider".into(),
-				artifact_digest: "sha256:fixture".into(),
-				host_generation: 7,
+			caller:              Some(pb::ProviderCaller {
+				extension:          "dev.example.provider".into(),
+				artifact_digest:    "sha256:fixture".into(),
+				host_generation:    7,
 				session_generation: 11,
-				principal_id: "principal".into(),
-				principal_display: "Principal".into(),
-				layer: "user".into(),
-				tier: "trusted".into(),
-				trust: "trusted".into(),
-				capabilities: vec!["provider".into()],
+				principal_id:       "principal".into(),
+				principal_display:  "Principal".into(),
+				layer:              "user".into(),
+				tier:               "trusted".into(),
+				trust:              "trusted".into(),
+				capabilities:       vec!["provider".into()],
 			}),
-			provider: "acme".into(),
-			document_json: b"{}".to_vec().into(),
+			provider:            "acme".into(),
+			document_json:       b"{}".to_vec().into(),
 			expected_generation: generation.saturating_add(1),
 		})
 		.await
@@ -68,19 +70,19 @@ async fn provider_mutations_refuse_stale_catalog_and_incomplete_identity() {
 
 	let unauthenticated = authority
 		.retract(pb::RetractProviderRequest {
-			caller: Some(pb::ProviderCaller {
-				extension: "dev.example.provider".into(),
-				artifact_digest: String::new(),
-				host_generation: 7,
+			caller:              Some(pb::ProviderCaller {
+				extension:          "dev.example.provider".into(),
+				artifact_digest:    String::new(),
+				host_generation:    7,
 				session_generation: 11,
-				principal_id: "principal".into(),
-				principal_display: "Principal".into(),
-				layer: "user".into(),
-				tier: "trusted".into(),
-				trust: "trusted".into(),
-				capabilities: vec!["provider".into()],
+				principal_id:       "principal".into(),
+				principal_display:  "Principal".into(),
+				layer:              "user".into(),
+				tier:               "trusted".into(),
+				trust:              "trusted".into(),
+				capabilities:       vec!["provider".into()],
 			}),
-			provider: "acme".into(),
+			provider:            "acme".into(),
 			expected_generation: generation,
 		})
 		.await

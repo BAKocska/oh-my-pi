@@ -23,18 +23,19 @@ use omp_scribe::{
 };
 use omp_storage::state::StateScope;
 use omp_tool::{Authority, CostClass, Durability, OperationSpec};
-use crate::env_types;
 use parking_lot::{Mutex, RwLock};
 use pyo3::{
 	Bound, Py, PyAny, PyErr, PyResult, Python, create_exception,
-	sync::OnceLockExt,
 	exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError},
 	pyclass, pyfunction, pymethods, pymodule,
+	sync::OnceLockExt,
 	types::{
 		PyAnyMethods, PyBool, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyFloat, PyInt, PyList,
 		PyListMethods, PyString, PyTuple, PyTupleMethods, PyTypeMethods,
 	},
 };
+
+use crate::env_types;
 
 create_exception!(_omp, OmpError, PyException, "Base class for omp runtime failures.");
 create_exception!(_omp, HostDisconnected, OmpError, "The host CONTROL channel disconnected.");
@@ -1105,17 +1106,19 @@ fn client_error(py: Python<'_>, error: ClientError) -> PyErr {
 
 fn process_started(py: Python<'_>, value: &env_pb::ProcessStarted) -> PyResult<Py<PyAny>> {
 	Ok(Py::new(py, env_types::StartedProcess {
-		name: env_types::any(py, &value.name)?,
+		name:       env_types::any(py, &value.name)?,
 		generation: env_types::any(py, value.generation)?,
-		endpoint: env_types::any(py, value.endpoint.as_deref())?,
-	})?.into_any())
+		endpoint:   env_types::any(py, value.endpoint.as_deref())?,
+	})?
+	.into_any())
 }
 
 fn revision_value(py: Python<'_>, value: Option<&document_pb::Revision>) -> PyResult<Py<PyAny>> {
 	let Some(value) = value else {
 		return Ok(py.None());
 	};
-	Ok(Py::new(py, env_types::Revision::new(value.sequence, value.content_hash.to_vec()))?.into_any())
+	Ok(Py::new(py, env_types::Revision::new(value.sequence, value.content_hash.to_vec()))?
+		.into_any())
 }
 
 fn argument_revision(
@@ -1206,7 +1209,8 @@ fn path_metadata(py: Python<'_>, value: &document_pb::PathMetadata) -> PyResult<
 			.and_then(|module| module.getattr("FileKind"))
 			.expect("omp.env.FileKind must exist while decoding DATA responses");
 		["REGULAR_FILE", "DIRECTORY", "SYMLINK", "OTHER"].map(|name| {
-			kind.getattr(name)
+			kind
+				.getattr(name)
 				.expect("omp.env.FileKind member must exist")
 				.unbind()
 		})
@@ -1218,7 +1222,9 @@ fn path_metadata(py: Python<'_>, value: &document_pb::PathMetadata) -> PyResult<
 		_ => 3,
 	};
 	let kind = members[index].clone_ref(py);
-	let (read_only, executable) = value.permissions.as_ref()
+	let (read_only, executable) = value
+		.permissions
+		.as_ref()
 		.map(|permissions| (permissions.read_only, permissions.executable))
 		.unwrap_or((None, None));
 	Ok(Py::new(py, env_types::PathMeta {
@@ -1227,10 +1233,17 @@ fn path_metadata(py: Python<'_>, value: &document_pb::PathMetadata) -> PyResult<
 		byte_length: value.byte_length,
 		read_only,
 		executable,
-		modified: value.modified_time_unix_nanos.map(|value| value as f64 / 1_000_000_000.0),
-		accessed: value.accessed_time_unix_nanos.map(|value| value as f64 / 1_000_000_000.0),
-		created: value.created_time_unix_nanos.map(|value| value as f64 / 1_000_000_000.0),
-	})?.into_any())
+		modified: value
+			.modified_time_unix_nanos
+			.map(|value| value as f64 / 1_000_000_000.0),
+		accessed: value
+			.accessed_time_unix_nanos
+			.map(|value| value as f64 / 1_000_000_000.0),
+		created: value
+			.created_time_unix_nanos
+			.map(|value| value as f64 / 1_000_000_000.0),
+	})?
+	.into_any())
 }
 
 fn exec_status(py: Python<'_>, value: &env_pb::ExecStatusMsg) -> PyResult<Py<PyAny>> {
@@ -1680,6 +1693,7 @@ impl PyEnvironmentBackend {
 			values.remove(&key);
 		}
 	}
+
 	fn forward_request(
 		&self,
 		py: Python<'_>,
@@ -1937,10 +1951,7 @@ impl PyEnvironmentBackend {
 		for operation in operations.try_iter()? {
 			let operation = operation?;
 			let (kind, values) = if let Ok(tuple) = operation.cast::<PyTuple>() {
-				(
-					tuple.get_item(0)?.extract::<String>()?,
-					tuple.get_item(1)?.cast_into::<PyDict>()?,
-				)
+				(tuple.get_item(0)?.extract::<String>()?, tuple.get_item(1)?.cast_into::<PyDict>()?)
 			} else {
 				let kind = operation.getattr("kind")?.extract::<String>()?;
 				let values = PyDict::new(operation.py());
@@ -4181,7 +4192,6 @@ mod _omp {
 		PySecretUse, PyStateScope, PyWorkspaceUri, StaleGeneration, TemplateError, operation_spec,
 		resources,
 	};
-
 	#[pymodule_export]
 	use crate::env_types::{
 		BlobStat, Completed, CopyResult, DirEntry, DocEvent, Entry, EnvInfo, Exit, HttpResponse,

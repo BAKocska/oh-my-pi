@@ -47,17 +47,14 @@ pub fn credential_control_grants(
 				.cloned()
 				.collect::<Vec<_>>()
 				.into();
-			(
-				extension.key.extension().clone(),
-				crate::auth_backend::CredentialControlGrant {
-					grants: CredentialGrants {
-						allow: CredentialScope::new(allow),
-						import: CredentialScope::new(import),
-						reveal: CredentialScope::new(reveal),
-					},
-					providers,
+			(extension.key.extension().clone(), crate::auth_backend::CredentialControlGrant {
+				grants: CredentialGrants {
+					allow:  CredentialScope::new(allow),
+					import: CredentialScope::new(import),
+					reveal: CredentialScope::new(reveal),
 				},
-			)
+				providers,
+			})
 		})
 		.collect()
 }

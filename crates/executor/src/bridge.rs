@@ -77,7 +77,10 @@ impl<T> Future for BridgeTask<T> {
 	type Output = T;
 
 	fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-		let handle = self.handle.as_mut().expect("polled BridgeTask after completion");
+		let handle = self
+			.handle
+			.as_mut()
+			.expect("polled BridgeTask after completion");
 		match Pin::new(handle).poll(context) {
 			Poll::Ready(Ok(output)) => {
 				self.handle.take();

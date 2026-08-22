@@ -141,9 +141,15 @@ impl BenchEnvironment {
 
 		let boot_at = Instant::now();
 		let server = Arc::new(
-			EnvServer::open_local(site.path(), state.path(), Registry::new(), config, RegistryBridges::default())
-				.await
-				.context("boot production environment topology")?,
+			EnvServer::open_local(
+				site.path(),
+				state.path(),
+				Registry::new(),
+				config,
+				RegistryBridges::default(),
+			)
+			.await
+			.context("boot production environment topology")?,
 		);
 		let boot = boot_at.elapsed();
 		let (client, transport) = EnvClient::in_process(64);

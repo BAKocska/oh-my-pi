@@ -749,6 +749,5 @@ mod tests {
 		.await
 		.expect("prompt head accepts owned mutable slot");
 		assert_eq!(generation, Value::from(4));
-
 	}
 }

@@ -12,8 +12,8 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use nix::{sys::stat::Mode, unistd::mkfifo};
 use omp_agent::{
-	Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnClient, TurnId,
-	TurnInput, TurnOptions, TurnSession, PromptFacts,
+	Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, PromptFacts,
+	TurnClient, TurnId, TurnInput, TurnOptions, TurnSession,
 };
 use omp_core::{Str, sf};
 use omp_e2e::support::{

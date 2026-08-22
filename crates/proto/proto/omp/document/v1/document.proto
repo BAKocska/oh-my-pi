@@ -1004,6 +1004,7 @@ message DapEvent {
   string event = 3;
   bytes body_json = 4;
 }
+
 // Identifies a bounded unsolicited-event stream whose continuity was lost.
 enum EventStreamKind {
   EVENT_STREAM_KIND_UNSPECIFIED = 0;
@@ -1162,10 +1163,10 @@ message ClientFrame {
     SummarizeDocumentRequest summarize_document = 22;
     AcquireWorkspaceLeaseRequest acquire_workspace_lease = 23;
     ReleaseWorkspaceLeaseRequest release_workspace_lease = 24;
-      DapLaunchRequest dap_launch = 25;
+    DapLaunchRequest dap_launch = 25;
     DapAttachRequest dap_attach = 26;
     DapActionRequest dap_action = 27;
-}
+  }
 }
 
 message ServerFrame {
@@ -1211,9 +1212,9 @@ message ServerFrame {
     EventStreamError event_stream_error = 26;
     AcquireWorkspaceLeaseResponse workspace_lease_acquired = 27;
     ReleaseWorkspaceLeaseResponse workspace_lease_released = 28;
-      DapSessionResponse dap_session = 29;
+    DapSessionResponse dap_session = 29;
     DapActionResponse dap_action = 30;
     DapOutput dap_output = 31;
     DapEvent dap_event = 32;
-}
+  }
 }

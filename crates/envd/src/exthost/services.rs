@@ -839,19 +839,14 @@ impl ServiceControlAuthority {
 		schema: &ServiceMethodSchema,
 		result: Value,
 	) -> Result<Value, ControlProtocolError> {
-		validate_schema(
-			&schema.result_schema,
-			&result,
-			true,
-			ToolAssemblyLimits::default(),
-		)
-		.map_err(|issue| {
-			ControlProtocolError::new(
-				"ServiceResultSchemaError",
-				"provider result violates the sealed method schema",
-			)
-			.with_details(json!({"path": issue.path.as_str(), "rule": issue.rule}))
-		})?;
+		validate_schema(&schema.result_schema, &result, true, ToolAssemblyLimits::default())
+			.map_err(|issue| {
+				ControlProtocolError::new(
+					"ServiceResultSchemaError",
+					"provider result violates the sealed method schema",
+				)
+				.with_details(json!({"path": issue.path.as_str(), "rule": issue.rule}))
+			})?;
 		Ok(result)
 	}
 

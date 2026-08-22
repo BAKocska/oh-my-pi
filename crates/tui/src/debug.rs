@@ -784,67 +784,70 @@ mod server {
 		fn pending_query_replies_follow_stable_client_ids() {
 			let executor = omp_executor::Executor::new(None);
 			executor.clone().block_on(async move {
-			let ingress = crate::pump::publish_ingress_for_test();
-			let (responses_tx, responses_rx) = flume::unbounded();
+				let ingress = crate::pump::publish_ingress_for_test();
+				let (responses_tx, responses_rx) = flume::unbounded();
 
-			let path =
-				std::env::temp_dir().join(format!("omp-tui-debug-idtest-{}.sock", std::process::id()));
-			let _ = std::fs::remove_file(&path);
-			let listener = std::os::unix::net::UnixListener::bind(&path).expect("test socket binds");
-			listener
-				.set_nonblocking(true)
-				.expect("nonblocking listener");
-			let listener = async_io::Async::new(listener).expect("listener registers");
-			let mut server = DebugServer::new(listener);
-			let serve =
-				executor.spawn(async move { serve_loop(&mut server, responses_rx).await });
+				let path = std::env::temp_dir()
+					.join(format!("omp-tui-debug-idtest-{}.sock", std::process::id()));
+				let _ = std::fs::remove_file(&path);
+				let listener =
+					std::os::unix::net::UnixListener::bind(&path).expect("test socket binds");
+				listener
+					.set_nonblocking(true)
+					.expect("nonblocking listener");
+				let listener = async_io::Async::new(listener).expect("listener registers");
+				let mut server = DebugServer::new(listener);
+				let serve = executor.spawn(async move { serve_loop(&mut server, responses_rx).await });
 
-			// Client A parks a retained query (id 1), then disconnects.
-			let mut first = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
-				.await
-				.expect("first client connects");
-			first
-				.write_all(b"{\"op\":\"tree\"}\n")
-				.await
-				.expect("query sends");
-			executor.timeout(Duration::from_secs(1), ingress.recv_async())
-				.await
-				.expect("query reaches the ingress")
-				.expect("ingress lives");
-			drop(first);
+				// Client A parks a retained query (id 1), then disconnects.
+				let mut first = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
+					.await
+					.expect("first client connects");
+				first
+					.write_all(b"{\"op\":\"tree\"}\n")
+					.await
+					.expect("query sends");
+				executor
+					.timeout(Duration::from_secs(1), ingress.recv_async())
+					.await
+					.expect("query reaches the ingress")
+					.expect("ingress lives");
+				drop(first);
 
-			// Client B lands on the compacted slot an index token would
-			// still name and gets its own answer.
-			let second = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
-				.await
-				.expect("second client connects");
-			let mut second = BufReader::new(second);
-			second
-				.get_mut()
-				.write_all(b"{\"op\":\"keys\",\"keys\":\"x\"}\n")
-				.await
-				.expect("injection sends");
-			let mut line = String::new();
-			executor.timeout(Duration::from_secs(1), second.read_line(&mut line))
-				.await
-				.expect("injection is acknowledged")
-				.expect("ack line reads");
-			assert!(line.contains("\"injected\""), "unexpected ack: {line:?}");
+				// Client B lands on the compacted slot an index token would
+				// still name and gets its own answer.
+				let second = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
+					.await
+					.expect("second client connects");
+				let mut second = BufReader::new(second);
+				second
+					.get_mut()
+					.write_all(b"{\"op\":\"keys\",\"keys\":\"x\"}\n")
+					.await
+					.expect("injection sends");
+				let mut line = String::new();
+				executor
+					.timeout(Duration::from_secs(1), second.read_line(&mut line))
+					.await
+					.expect("injection is acknowledged")
+					.expect("ack line reads");
+				assert!(line.contains("\"injected\""), "unexpected ack: {line:?}");
 
-			// The host reply for the dead client is dropped, not rerouted.
-			responses_tx
-				.send((1, serde_json::json!({ "leak": "wrong-client", "ok": true })))
-				.expect("reply channel lives");
-			line.clear();
-			let stray =
-				executor.timeout(Duration::from_millis(200), second.read_line(&mut line)).await;
-			assert!(
-				stray.is_err() || line.is_empty(),
-				"reply for a disconnected client reached the survivor: {line:?}"
-			);
+				// The host reply for the dead client is dropped, not rerouted.
+				responses_tx
+					.send((1, serde_json::json!({ "leak": "wrong-client", "ok": true })))
+					.expect("reply channel lives");
+				line.clear();
+				let stray = executor
+					.timeout(Duration::from_millis(200), second.read_line(&mut line))
+					.await;
+				assert!(
+					stray.is_err() || line.is_empty(),
+					"reply for a disconnected client reached the survivor: {line:?}"
+				);
 
-			drop(serve);
-			let _ = std::fs::remove_file(&path);
+				drop(serve);
+				let _ = std::fs::remove_file(&path);
 			});
 		}
 	}

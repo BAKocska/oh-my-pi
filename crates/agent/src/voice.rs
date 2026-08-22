@@ -51,14 +51,9 @@ pub fn render_live_instructions(first_name: &str, username: &str) -> Str {
 			.expect("embedded voice instructions template")
 	});
 	let mut props = Props::new();
-	props.set(
-		crate::prompt_keys::FIRST_NAME,
-		first_name.trim().chars().take(64).collect::<String>(),
-	);
-	props.set(
-		crate::prompt_keys::USERNAME,
-		username.trim().chars().take(64).collect::<String>(),
-	);
+	props
+		.set(crate::prompt_keys::FIRST_NAME, first_name.trim().chars().take(64).collect::<String>());
+	props.set(crate::prompt_keys::USERNAME, username.trim().chars().take(64).collect::<String>());
 	TEMPLATE
 		.render_str(crate::prompt_engine::engine(), &props)
 		.expect("typed voice props satisfy embedded template")

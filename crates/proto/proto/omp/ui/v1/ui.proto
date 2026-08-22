@@ -10,6 +10,7 @@ message Tml {
   bytes source = 1;
   uint64 hash = 2;
 }
+
 // Exact identity of one retained presentation frame. Hosts key frame state by
 // all three fields; kind-only and revision-only fallback are forbidden.
 message RetainedFrameKey {
@@ -270,7 +271,7 @@ message UiDispatch {
     CompletionQuery completion = 3;
     RenderRequest render = 4;
     OverlayEvent overlay = 5;
-  FrameActionFired frame_action = 6;
+    FrameActionFired frame_action = 6;
   }
   omp.inference.v1.ValueMap props = 15;
 }

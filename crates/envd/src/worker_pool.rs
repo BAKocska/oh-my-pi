@@ -301,16 +301,16 @@ impl Default for RestartBackoff {
 /// In-process named-worker routing state.
 #[derive(Debug)]
 pub struct WorkerSupervisor {
-	workers:       Mutex<BTreeMap<Str, WorkerRoute>>,
-	processes:     Mutex<BTreeMap<(Str, u64), SupervisedWorkerProcess>>,
+	workers:         Mutex<BTreeMap<Str, WorkerRoute>>,
+	processes:       Mutex<BTreeMap<(Str, u64), SupervisedWorkerProcess>>,
 	process_changed: tokio::sync::Notify,
-	layer_live:    AtomicU64,
-	layer_ceiling: u64,
-	spawn_live:    AtomicU64,
-	spawn_ceiling: u64,
-	stale_frames:  AtomicU64,
-	terminate_tx:  Sender<(Str, u64)>,
-	terminate_rx:  Receiver<(Str, u64)>,
+	layer_live:      AtomicU64,
+	layer_ceiling:   u64,
+	spawn_live:      AtomicU64,
+	spawn_ceiling:   u64,
+	stale_frames:    AtomicU64,
+	terminate_tx:    Sender<(Str, u64)>,
+	terminate_rx:    Receiver<(Str, u64)>,
 }
 
 impl WorkerSupervisor {

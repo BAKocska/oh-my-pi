@@ -6,6 +6,12 @@
 use std::{path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
+use omp_core::{ArtifactDigest, Principal, Provenance, sf};
+use omp_e2e::{
+	Context as _, Result, error,
+	support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, omp_binary, within},
+};
+use omp_env::{Admitter, EnvClient, InvocationEvent};
 use omp_envd::{
 	EnvServer, RegistryBridges,
 	exthost::{
@@ -13,12 +19,6 @@ use omp_envd::{
 	},
 	worker::{ExtHostConfig, ExtHostSpec, HostKey},
 };
-use omp_core::{ArtifactDigest, Principal, Provenance, sf};
-use omp_e2e::{
-	Context as _, Result, error,
-	support::{DEFAULT_TIMEOUT, EnvHarness, Scratch, omp_binary, within},
-};
-use omp_env::{Admitter, EnvClient, InvocationEvent};
 use omp_proto::{
 	SCHEMA_REV,
 	env::v1::{Admission, AdmitInvocation, ClientHello, CreateWorktree, InvokeTool},

@@ -5,8 +5,8 @@ use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_envd::{
 	ProjectEnvironment, RegistryBridges,
 	exthost::{
-		ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
-		ExternalDomainControlFactories, ExtensionManifest,
+		ControlAuthority, ControlAuthorityFactory, ControlCompositionError, ExtensionManifest,
+		ExternalDomainControlFactories,
 		control::{
 			ControlConnectionIdentity, ControlEffect, ControlProtocolError, ControlRequestContext,
 		},
@@ -25,11 +25,7 @@ impl ControlAuthorityFactory for TaggedFactory {
 		&self,
 		identity: Arc<ControlConnectionIdentity>,
 	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
-		Ok(Arc::new(TaggedAuthority {
-			identity,
-			operation: self.operation,
-			tag: self.tag,
-		}))
+		Ok(Arc::new(TaggedAuthority { identity, operation: self.operation, tag: self.tag }))
 	}
 }
 
@@ -86,19 +82,19 @@ fn factory(operation: &'static str, tag: &'static str) -> Arc<dyn ControlAuthori
 
 fn factories(generation: &'static str) -> ExternalDomainControlFactories {
 	ExternalDomainControlFactories {
-		policy: Some(factory("omp.policy.capabilities", generation)),
-		parameters: Some(factory("omp.params.args", generation)),
-		workers: Some(factory("omp.workers.list", generation)),
+		policy:            Some(factory("omp.policy.capabilities", generation)),
+		parameters:        Some(factory("omp.params.args", generation)),
+		workers:           Some(factory("omp.workers.list", generation)),
 		direct_filesystem: Some(factory("omp.direct_filesystem.request", generation)),
-		credentials: Some(factory("omp.creds.list", generation)),
-		prompts: Some(factory("omp.prompts.invalidate", generation)),
-		ui: Some(factory("omp.ui.presentation", generation)),
-		telemetry: Some(factory("omp.telemetry.query", generation)),
-		verdicts: Some(factory("omp.jobs.register", generation)),
-		provider: Some(factory("omp.provider.models", generation)),
-		campaigns: Some(factory("omp.campaigns.active", generation)),
+		credentials:       Some(factory("omp.creds.list", generation)),
+		prompts:           Some(factory("omp.prompts.invalidate", generation)),
+		ui:                Some(factory("omp.ui.presentation", generation)),
+		telemetry:         Some(factory("omp.telemetry.query", generation)),
+		verdicts:          Some(factory("omp.jobs.register", generation)),
+		provider:          Some(factory("omp.provider.models", generation)),
+		campaigns:         Some(factory("omp.campaigns.active", generation)),
 		// Envd replaces this sentinel with its own sole live service broker/router.
-		services: Some(factory("omp.services.connect", "must-be-overridden-by-envd")),
+		services:          Some(factory("omp.services.connect", "must-be-overridden-by-envd")),
 	}
 }
 
@@ -181,22 +177,14 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		"omp.campaigns.active",
 	] {
 		let value = authority
-			.request(
-				context.clone(),
-				Str::new(operation),
-				serde_json::Map::new(),
-			)
+			.request(context.clone(), Str::new(operation), serde_json::Map::new())
 			.await
 			.unwrap_or_else(|error| panic!("{operation} did not reach its owner: {error}"));
 		assert_eq!(value, Value::String("session-one".to_owned()));
 	}
 
 	let service = authority
-		.request(
-			context.clone(),
-			sf!("omp.services.connect"),
-			serde_json::Map::new(),
-		)
+		.request(context.clone(), sf!("omp.services.connect"), serde_json::Map::new())
 		.await
 		.expect_err("the real service broker validates its service key");
 	assert_ne!(service.message.as_str(), "must-be-overridden-by-envd");
@@ -217,7 +205,7 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		.expect("replacement control connection");
 	let value = replacement
 		.request(
-						ControlRequestContext {
+			ControlRequestContext {
 				connection: Arc::clone(&connection),
 				request_id: 2,
 				invocation: None,

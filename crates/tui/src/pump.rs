@@ -16,7 +16,7 @@
 //! - Keymap edits arrive as actor commands ([`Pump::set_keymap`]) and apply
 //!   before the next decoded chord.
 //!
- //! The byte source is an [`async_io::Async`] wherever the platform can poll the
+//! The byte source is an [`async_io::Async`] wherever the platform can poll the
 //! terminal handle (Linux and other non-macOS Unix, plus every pipe or pty
 //! in tests); macOS `/dev/tty` and Windows `CONIN$` are not readiness-
 //! pollable, so those bridge through a minimal reader thread whose only job
@@ -278,17 +278,15 @@ pub fn spawn(
 
 	let (source, bridge) = input.into_source()?;
 	#[cfg(unix)]
-	let resize = watch_resize.then(|| {
-		omp_executor::signal::Signals::new(&[omp_executor::signal::Signal::SIGWINCH])
-	});
+	let resize = watch_resize
+		.then(|| omp_executor::signal::Signals::new(&[omp_executor::signal::Signal::SIGWINCH]));
 	#[cfg(windows)]
 	let resize = ();
 
 	let mut events = Vec::new();
 	decoder.feed(preserved, std::time::Instant::now(), &mut events);
 
-	let task =
-		executor.spawn(actor(source, decoder, events, events_tx, ctl_rx, resize, resize_tx));
+	let task = executor.spawn(actor(source, decoder, events, events_tx, ctl_rx, resize, resize_tx));
 	Ok(PumpChannels {
 		pump:   Pump { task: Some(task), bridge, ctl: ctl_tx },
 		events: events_rx,

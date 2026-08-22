@@ -6,15 +6,13 @@ use omp_core::{InvocationPhase, Str};
 use omp_driver::stats_api::{
 	telemetry_backend::TelemetryIndexQuery,
 	verdict_authority::{
-		DurableJobRegistrar, JobRegistration, PromptProjectionDispatcher, PromptProjectionRequest, VerdictAuthority,
-		VerdictAuthorityError, VerdictAuthorityIdentity, VerdictCallContext,
+		DurableJobRegistrar, JobRegistration, PromptProjectionDispatcher, PromptProjectionRequest,
+		VerdictAuthority, VerdictAuthorityError, VerdictAuthorityIdentity, VerdictCallContext,
 	},
 };
 use omp_env::EnvClient;
 use omp_storage::telemetry_index::TelemetryIndex;
-use omp_telemetry::authority::{
-	DurableTelemetryQuery, TelemetryAuthorityIdentity,
-};
+use omp_telemetry::authority::{DurableTelemetryQuery, TelemetryAuthorityIdentity};
 use omp_tool::ArtifactLifetime;
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -33,9 +31,8 @@ fn telemetry_identity(installed_at_ms: u64) -> TelemetryAuthorityIdentity {
 #[test]
 fn durable_query_reads_real_indexed_frames_and_applies_install_floor() {
 	let root = tempdir().unwrap();
-	let index = Arc::new(
-		TelemetryIndex::open(root.path(), &root.path().join("telemetry.sqlite")).unwrap(),
-	);
+	let index =
+		Arc::new(TelemetryIndex::open(root.path(), &root.path().join("telemetry.sqlite")).unwrap());
 	index
 		.append(
 			"session-a",
@@ -79,13 +76,7 @@ fn durable_query_reads_real_indexed_frames_and_applies_install_floor() {
 	assert_eq!(result["floored"], true);
 
 	let metrics = query
-		.rev_metrics(
-			&telemetry_identity(0),
-			"edit",
-			Some("hl"),
-			None,
-			"session",
-		)
+		.rev_metrics(&telemetry_identity(0), "edit", Some("hl"), None, "session")
 		.unwrap();
 	assert_eq!(metrics[0]["rev"]["n"], 3);
 	assert_eq!(metrics[0]["calls"], 1);
@@ -123,24 +114,24 @@ impl PromptProjectionDispatcher for UnusedProjection {
 
 fn verdict_identity() -> Arc<VerdictAuthorityIdentity> {
 	Arc::new(VerdictAuthorityIdentity {
-		principal: Str::new_static("principal"),
-		extension: Str::new_static("verdicts"),
-		artifact_digest: Str::new_static("digest"),
-		host_generation: 1,
+		principal:          Str::new_static("principal"),
+		extension:          Str::new_static("verdicts"),
+		artifact_digest:    Str::new_static("digest"),
+		host_generation:    1,
 		session_generation: 1,
-		session: Str::new_static("session-a"),
-		capabilities: Arc::new(BTreeSet::new()),
+		session:            Str::new_static("session-a"),
+		capabilities:       Arc::new(BTreeSet::new()),
 	})
 }
 
 fn registration(description: &'static str) -> JobRegistration {
 	JobRegistration {
-		id: Str::new_static("durable-job"),
-		owner_name: Str::new_static("worker"),
+		id:               Str::new_static("durable-job"),
+		owner_name:       Str::new_static("worker"),
 		owner_generation: 7,
-		description: Str::new_static(description),
-		media_type: Some(Str::new_static("application/json")),
-		lifetime: ArtifactLifetime::Durable,
+		description:      Str::new_static(description),
+		media_type:       Some(Str::new_static("application/json")),
+		lifetime:         ArtifactLifetime::Durable,
 	}
 }
 
@@ -151,9 +142,9 @@ async fn verdict_registration_is_idempotent_across_authority_reconstruction() {
 	let board = JobBoard::new(env, mailbox.sender());
 	let identity = verdict_identity();
 	let context = VerdictCallContext {
-		identity: identity.as_ref(),
-		phase: InvocationPhase::EffectsAuthorized,
-		cancelled: false,
+		identity:   identity.as_ref(),
+		phase:      InvocationPhase::EffectsAuthorized,
+		cancelled:  false,
 		invocation: None,
 	};
 	let first = VerdictAuthority::new(
@@ -162,7 +153,10 @@ async fn verdict_registration_is_idempotent_across_authority_reconstruction() {
 		Arc::new(BoardRegistrar(board.clone())),
 		Arc::new(UnusedProjection),
 	);
-	let first_job = first.register_job(context, registration("report")).await.unwrap();
+	let first_job = first
+		.register_job(context, registration("report"))
+		.await
+		.unwrap();
 
 	let reconstructed = VerdictAuthority::new(
 		identity.clone(),
@@ -177,7 +171,9 @@ async fn verdict_registration_is_idempotent_across_authority_reconstruction() {
 	assert_eq!(repeated.id, first_job.id);
 	assert_eq!(board.snapshot().len(), 1);
 	assert_eq!(
-		reconstructed.register_job(context, registration("different")).await,
+		reconstructed
+			.register_job(context, registration("different"))
+			.await,
 		Err(VerdictAuthorityError::JobConflict(Str::new_static("durable-job")))
 	);
 }

@@ -1,4 +1,10 @@
-use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::{Duration, Instant}};
+use std::{
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
+	time::{Duration, Instant},
+};
 
 use futures::{Stream, stream};
 use omp_agent::{
@@ -46,22 +52,21 @@ struct CountingReviver(Arc<AtomicUsize>);
 impl ChildReviver<NeverTurnClient> for CountingReviver {
 	fn revive(&self) -> RevivalFuture<NeverTurnClient> {
 		self.0.fetch_add(1, Ordering::SeqCst);
-		Box::pin(async {
-			Err(SupervisorError::RevivalFailed { id: sf!("cold-child") })
-		})
+		Box::pin(async { Err(SupervisorError::RevivalFailed { id: sf!("cold-child") }) })
 	}
 }
 
 fn child(tree: &AgentTree, id: &str, name: &str, session: &str) -> Arc<omp_agent::AgentNode> {
-	tree.register(
-		Str::from(id),
-		Str::from(name),
-		AgentKind::Subagent,
-		None,
-		Str::from(session),
-		Budget::default(),
-	)
-	.expect("register child")
+	tree
+		.register(
+			Str::from(id),
+			Str::from(name),
+			AgentKind::Subagent,
+			None,
+			Str::from(session),
+			Budget::default(),
+		)
+		.expect("register child")
 }
 
 #[tokio::test]
@@ -77,17 +82,18 @@ async fn supervisor_resolves_names_invokes_cold_reviver_and_releases_ownership()
 		.expect("register parked identity");
 
 	assert_eq!(supervisor.resolve("NamedChild").as_deref(), Some("cold-child"));
-	assert_eq!(
-		supervisor.resolve("agent://cold-child#0").as_deref(),
-		Some("cold-child")
-	);
+	assert_eq!(supervisor.resolve("agent://cold-child#0").as_deref(), Some("cold-child"));
 	assert!(matches!(
 		supervisor.revive("NamedChild").await,
 		Err(SupervisorError::RevivalFailed { .. })
 	));
 	assert_eq!(calls.load(Ordering::SeqCst), 1, "revive must invoke the cold factory");
 
-	let generation = supervisor.state("cold-child").expect("retained state").generation().0;
+	let generation = supervisor
+		.state("cold-child")
+		.expect("retained state")
+		.generation()
+		.0;
 	supervisor
 		.release_at_generation("cold-child", generation)
 		.await
@@ -156,10 +162,22 @@ fn project_registry_roster_contains_peers_from_every_session() {
 	let second_tree = AgentTree::new(2, 1, 1);
 	let first = child(&first_tree, "first", "First", "session-a");
 	let second = child(&second_tree, "second", "Second", "session-b");
-	broker.register(&first, Mailbox::new().sender()).expect("first peer");
-	broker.register(&second, Mailbox::new().sender()).expect("second peer");
+	broker
+		.register(&first, Mailbox::new().sender())
+		.expect("first peer");
+	broker
+		.register(&second, Mailbox::new().sender())
+		.expect("second peer");
 
 	let roster = broker.registry().roster(false);
-	assert!(roster.iter().any(|record| record.id == "first" && record.session == "session-a"));
-	assert!(roster.iter().any(|record| record.id == "second" && record.session == "session-b"));
+	assert!(
+		roster
+			.iter()
+			.any(|record| record.id == "first" && record.session == "session-a")
+	);
+	assert!(
+		roster
+			.iter()
+			.any(|record| record.id == "second" && record.session == "session-b")
+	);
 }

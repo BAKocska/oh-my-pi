@@ -21,10 +21,12 @@ impl ActorAx {
 			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI runtime: {err}")))?;
 		Ok(Self { rt, connection: None })
 	}
+
 	pub(super) fn init(&mut self) -> CoreResult<()> {
 		if self.connection.is_none() {
 			self.connection = Some(
-				self.rt
+				self
+					.rt
 					.block_on(atspi::AccessibilityConnection::new())
 					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI connection: {err}")))?,
 			);
@@ -32,10 +34,15 @@ impl ActorAx {
 		Ok(())
 	}
 
-	pub(super) const fn runtime(&self) -> &Runtime { &self.rt }
+	pub(super) const fn runtime(&self) -> &Runtime {
+		&self.rt
+	}
 
 	fn connection(&self) -> &atspi::AccessibilityConnection {
-		self.connection.as_ref().expect("AT-SPI actor initialized before use")
+		self
+			.connection
+			.as_ref()
+			.expect("AT-SPI actor initialized before use")
 	}
 
 	const fn object(h: &AxHandle) -> &ObjectRefOwned {

@@ -16,7 +16,7 @@ use omp_envd::{
 use serde_json::Value;
 
 struct TaggedFactory {
-	operation: &'static str,
+	operation:  &'static str,
 	generation: &'static str,
 }
 
@@ -34,8 +34,8 @@ impl ControlAuthorityFactory for TaggedFactory {
 }
 
 struct TaggedAuthority {
-	identity: Arc<ControlConnectionIdentity>,
-	operation: &'static str,
+	identity:   Arc<ControlConnectionIdentity>,
+	operation:  &'static str,
 	generation: &'static str,
 }
 
@@ -80,40 +80,37 @@ impl ControlAuthority for TaggedAuthority {
 	}
 }
 
-fn factory(
-	operation: &'static str,
-	generation: &'static str,
-) -> Arc<dyn ControlAuthorityFactory> {
+fn factory(operation: &'static str, generation: &'static str) -> Arc<dyn ControlAuthorityFactory> {
 	Arc::new(TaggedFactory { operation, generation })
 }
 
 fn factories(generation: &'static str) -> SessionControlFactories {
 	SessionControlFactories {
-		policy: factory("omp.policy.capabilities", generation),
-		parameters: factory("omp.params.args", generation),
-		workers: factory("omp.workers.list", generation),
+		policy:            factory("omp.policy.capabilities", generation),
+		parameters:        factory("omp.params.args", generation),
+		workers:           factory("omp.workers.list", generation),
 		direct_filesystem: factory("omp.direct_filesystem.request", generation),
-		credentials: factory("omp.creds.list", generation),
-		prompts: factory("omp.prompts.invalidate", generation),
-		ui: factory("omp.ui.presentation", generation),
-		telemetry: factory("omp.telemetry.query", generation),
-		verdicts: factory("omp.jobs.register", generation),
-		provider: factory("omp.provider.models", generation),
-		campaigns: factory("omp.campaigns.active", generation),
+		credentials:       factory("omp.creds.list", generation),
+		prompts:           factory("omp.prompts.invalidate", generation),
+		ui:                factory("omp.ui.presentation", generation),
+		telemetry:         factory("omp.telemetry.query", generation),
+		verdicts:          factory("omp.jobs.register", generation),
+		provider:          factory("omp.provider.models", generation),
+		campaigns:         factory("omp.campaigns.active", generation),
 	}
 }
 
 fn identity() -> Arc<ControlConnectionIdentity> {
 	Arc::new(ControlConnectionIdentity {
-		extension: sf!("fixture.extension"),
-		principal: Principal::new(sf!("fixture"), sf!("Fixture")),
-		artifact_digest: sf!("sha256:fixture"),
-		layer: sf!("workspace"),
-		tier: sf!("trusted"),
-		trust: sf!("trusted"),
-		host_generation: 7,
+		extension:          sf!("fixture.extension"),
+		principal:          Principal::new(sf!("fixture"), sf!("Fixture")),
+		artifact_digest:    sf!("sha256:fixture"),
+		layer:              sf!("workspace"),
+		tier:               sf!("trusted"),
+		trust:              sf!("trusted"),
+		host_generation:    7,
 		session_generation: 11,
-		capabilities: Arc::new(BTreeSet::new()),
+		capabilities:       Arc::new(BTreeSet::new()),
 	})
 }
 
@@ -134,18 +131,14 @@ fn extension() -> ExtHostSpec {
 }
 
 async fn request(
-		authority: &Arc<dyn ControlAuthority>,
+	authority: &Arc<dyn ControlAuthority>,
 	connection: &Arc<ControlConnectionIdentity>,
 	request_id: u64,
 	operation: &'static str,
 ) -> Result<Value, ControlProtocolError> {
 	authority
 		.request(
-			ControlRequestContext {
-				connection: Arc::clone(connection),
-				request_id,
-				invocation: None,
-			},
+			ControlRequestContext { connection: Arc::clone(connection), request_id, invocation: None },
 			Str::new_static(operation),
 			serde_json::Map::new(),
 		)
@@ -173,10 +166,8 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 	.await
 	.expect("embedded environment");
 
-	let first = factories("session-one").bind(
-		&environment,
-		factory("omp.agents.list", "session-one"),
-	);
+	let first =
+		factories("session-one").bind(&environment, factory("omp.agents.list", "session-one"));
 	assert!(first.is_live());
 	let connection = identity();
 	let stale_authority = environment
@@ -204,10 +195,8 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 		);
 	}
 
-	let replacement = factories("session-two").bind(
-		&environment,
-		factory("omp.agents.list", "session-two"),
-	);
+	let replacement =
+		factories("session-two").bind(&environment, factory("omp.agents.list", "session-two"));
 	assert!(replacement.is_live());
 	assert!(!first.is_live());
 	drop(first);

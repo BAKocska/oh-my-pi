@@ -3,7 +3,7 @@
 use std::{
 	collections::HashSet,
 	fmt::{self, Write as _},
-	path::{PathBuf},
+	path::PathBuf,
 	sync::Arc,
 };
 
@@ -445,10 +445,11 @@ pub struct PromptMemoryInput {
 	/// Per-turn volatile recall.
 	pub recall:   PromptMemorySlotInput,
 }
-/// Typed composition-boundary facts used to build one immutable prompt property bag.
+/// Typed composition-boundary facts used to build one immutable prompt property
+/// bag.
 ///
-/// Runtime snapshots retain only the derived [`Props`]; this carrier never enters the agent
-/// loop or prompt renderer.
+/// Runtime snapshots retain only the derived [`Props`]; this carrier never
+/// enters the agent loop or prompt renderer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PromptFacts {
 	/// Current workspace directory captured by the host.
@@ -467,7 +468,8 @@ pub struct PromptFacts {
 	pub directory_context: Arc<[Str]>,
 	/// Bounded per-root directory trees.
 	pub workspace_trees:   Arc<[WorkspaceTreeInput]>,
-	/// Nested active repository when the session directory itself is outside Git.
+	/// Nested active repository when the session directory itself is outside
+	/// Git.
 	pub active_repository: Option<ActiveRepositoryInput>,
 	/// Ordered standing rules.
 	pub rules:             Arc<[PromptNamedInput]>,
@@ -494,41 +496,34 @@ impl PromptFacts {
 		self.vcs = Some(vcs);
 		self
 	}
+
 	/// Derives the immutable template property bag consumed by prompt renderers.
 	pub fn props(&self) -> Result<Props, PromptError> {
 		let mut props = Props::new();
 		props.set(crate::prompt_keys::CWD, self.cwd.to_string_lossy().into_owned());
 		if let Some(vcs) = &self.vcs {
-			props.set(
-				crate::prompt_keys::VCS,
-				map! {
-					"root" => vcs.root.to_string_lossy().into_owned(),
-					"head" => vcs.head.clone(),
-				},
-			);
+			props.set(crate::prompt_keys::VCS, map! {
+				"root" => vcs.root.to_string_lossy().into_owned(),
+				"head" => vcs.head.clone(),
+			});
 		}
-		props.set(
-			crate::prompt_keys::HOST,
-			map! {
-				"os" => self.host.os.clone(),
-				"distro" => "",
-				"kernel" => self.host.kernel.clone(),
-				"arch" => self.host.architecture.clone(),
-				"cpu" => self.host.cpu.clone(),
-				"terminal" => self.host.terminal.clone(),
-				"gpus" => self.host.gpus.iter().cloned().collect::<Vec<_>>(),
-			},
-		);
-		props.set(
-			crate::prompt_keys::MODEL,
-			map! {
-				"identifier" => self.model.identifier.clone(),
-				"codex_task_policy" => self.model.codex_task_policy,
-			},
-		);
+		props.set(crate::prompt_keys::HOST, map! {
+			"os" => self.host.os.clone(),
+			"distro" => "",
+			"kernel" => self.host.kernel.clone(),
+			"arch" => self.host.architecture.clone(),
+			"cpu" => self.host.cpu.clone(),
+			"terminal" => self.host.terminal.clone(),
+			"gpus" => self.host.gpus.iter().cloned().collect::<Vec<_>>(),
+		});
+		props.set(crate::prompt_keys::MODEL, map! {
+			"identifier" => self.model.identifier.clone(),
+			"codex_task_policy" => self.model.codex_task_policy,
+		});
 		props.set(
 			crate::prompt_keys::REPOSITORIES,
-			self.repositories
+			self
+				.repositories
 				.iter()
 				.map(|repository| {
 					map! {
@@ -554,14 +549,12 @@ impl PromptFacts {
 		if let Some(primary) = &self.roots.primary {
 			root_fields.push(("primary", root_value(primary)));
 		}
-		props.set(
-			crate::prompt_keys::ROOTS,
-			root_fields.into_iter().collect::<Value>(),
-		);
+		props.set(crate::prompt_keys::ROOTS, root_fields.into_iter().collect::<Value>());
 		let primary = self.roots.primary.as_ref().map(|root| &root.canonical_uri);
 		props.set(
 			crate::prompt_keys::ADDITIONAL_ROOTS,
-			self.roots
+			self
+				.roots
 				.roots
 				.iter()
 				.filter(|root| primary != Some(&root.canonical_uri))
@@ -596,7 +589,8 @@ impl PromptFacts {
 		}
 		props.set(
 			crate::prompt_keys::CONTEXT_FILES,
-			self.context_files
+			self
+				.context_files
 				.iter()
 				.filter_map(|file| {
 					let source = String::from_utf8_lossy(&file.content);
@@ -622,7 +616,8 @@ impl PromptFacts {
 		);
 		props.set(
 			crate::prompt_keys::WORKSPACE_TREES,
-			self.workspace_trees
+			self
+				.workspace_trees
 				.iter()
 				.map(|tree| {
 					map! {
@@ -635,7 +630,8 @@ impl PromptFacts {
 		);
 		props.set(
 			crate::prompt_keys::SKILLS,
-			self.skills
+			self
+				.skills
 				.iter()
 				.map(|skill| {
 					map! { "name" => skill.id.clone(), "description" => skill.content.clone() }
@@ -644,7 +640,8 @@ impl PromptFacts {
 		);
 		props.set(
 			crate::prompt_keys::RULES,
-			self.rules
+			self
+				.rules
 				.iter()
 				.filter_map(|rule| {
 					let description = dedupe_prompt_source(rule.content.as_str(), &mut seen);
@@ -656,6 +653,7 @@ impl PromptFacts {
 		self.set_settings_props(&mut props)?;
 		Ok(props)
 	}
+
 	fn set_settings_props(&self, props: &mut Props) -> Result<(), PromptError> {
 		let personality = self
 			.settings
@@ -676,15 +674,9 @@ impl PromptFacts {
 			props.set(crate::prompt_keys::PERSONALITY, personality);
 		}
 		props.set(crate::prompt_keys::RENDER_MERMAID, self.settings.render_mermaid);
-		props.set(
-			crate::prompt_keys::INCLUDE_WORKSTATION,
-			self.settings.include_workstation,
-		);
+		props.set(crate::prompt_keys::INCLUDE_WORKSTATION, self.settings.include_workstation);
 		props.set(crate::prompt_keys::INCLUDE_MODEL, self.settings.include_model);
-		props.set(
-			crate::prompt_keys::INCLUDE_WORKSPACE_TREE,
-			self.settings.include_workspace_tree,
-		);
+		props.set(crate::prompt_keys::INCLUDE_WORKSPACE_TREE, self.settings.include_workspace_tree);
 		props.set(crate::prompt_keys::INCLUDE_SKILLS, self.settings.include_skills);
 		props.set(crate::prompt_keys::SECRETS_ENABLED, self.settings.secrets_enabled);
 		props.set(crate::prompt_keys::NULL_PROMPT, self.settings.null_prompt);
@@ -712,8 +704,7 @@ impl PromptFacts {
 			.schemes
 			.iter()
 			.filter(|scheme| {
-				(scheme.readable || scheme.mintable)
-					&& ALLOWED_SCHEMES.contains(&scheme.name.as_str())
+				(scheme.readable || scheme.mintable) && ALLOWED_SCHEMES.contains(&scheme.name.as_str())
 			})
 			.collect::<Vec<_>>();
 		props.set(
@@ -731,10 +722,8 @@ impl PromptFacts {
 				})
 				.collect::<Vec<_>>(),
 		);
-		props.set(
-			crate::prompt_keys::SCHEME_SELECTORS,
-			schemes.iter().any(|scheme| scheme.selectors),
-		);
+		props
+			.set(crate::prompt_keys::SCHEME_SELECTORS, schemes.iter().any(|scheme| scheme.selectors));
 		props.set(crate::prompt_keys::COMPUTER, self.capabilities.computer);
 		if let Some(guidance) = self.capabilities.device_guidance.clone() {
 			props.set(crate::prompt_keys::DEVICE_GUIDANCE, guidance);
@@ -743,35 +732,34 @@ impl PromptFacts {
 			props.set(crate::prompt_keys::AUTO_QA_GUIDANCE, guidance);
 		}
 		let delegation = &self.capabilities.delegation;
-		props.set(
-			crate::prompt_keys::DELEGATION,
-			map! {
-				"enabled" => delegation.enabled,
-				"eager" => delegation.eager.to_string(),
-				"batch" => delegation.batch,
-				"concurrency" => delegation.concurrency,
-				"queued" => delegation.queued,
-				"scout_available" => delegation.scout_available,
-				"coordination" => delegation.coordination,
-			},
-		);
+		props.set(crate::prompt_keys::DELEGATION, map! {
+			"enabled" => delegation.enabled,
+			"eager" => delegation.eager.to_string(),
+			"batch" => delegation.batch,
+			"concurrency" => delegation.concurrency,
+			"queued" => delegation.queued,
+			"scout_available" => delegation.scout_available,
+			"coordination" => delegation.coordination,
+		});
 		let mutations = &self.capabilities.mutations;
-		props.set(
-			crate::prompt_keys::MUTATIONS,
-			map! {
-				"format_on_write" => mutations.format_on_write,
-				"fetch" => mutations.fetch,
-				"editor" => mutations.editor,
-				"escalation" => mutations.escalation,
-			},
-		);
+		props.set(crate::prompt_keys::MUTATIONS, map! {
+			"format_on_write" => mutations.format_on_write,
+			"fetch" => mutations.fetch,
+			"editor" => mutations.editor,
+			"escalation" => mutations.escalation,
+		});
 		let has_available = |name: &str| {
 			self.capabilities.tools.iter().any(|tool| tool.name == name)
-				|| self.capabilities.devices.iter().any(|device| device.name == name)
+				|| self
+					.capabilities
+					.devices
+					.iter()
+					.any(|device| device.name == name)
 		};
 		props.set(
 			crate::prompt_keys::EDIT_HASHLINE,
-			self.capabilities
+			self
+				.capabilities
 				.tools
 				.iter()
 				.any(|tool| tool.name == "edit" && tool.revision.family == "hl"),
@@ -780,16 +768,17 @@ impl PromptFacts {
 			crate::prompt_keys::EDIT_APPLY_PATCH,
 			has_available("apply_patch")
 				|| self.capabilities.tools.iter().any(|tool| {
-					tool.name == "edit"
-						&& matches!(tool.revision.family.as_str(), "patch" | "unified")
+					tool.name == "edit" && matches!(tool.revision.family.as_str(), "patch" | "unified")
 				}),
 		);
 		props.set(
 			crate::prompt_keys::EDIT_SLOPPY,
 			has_available("sloppy")
-				|| self.capabilities.tools.iter().any(|tool| {
-					tool.name == "edit" && tool.revision.family.as_str() == "sloppy"
-				}),
+				|| self
+					.capabilities
+					.tools
+					.iter()
+					.any(|tool| tool.name == "edit" && tool.revision.family.as_str() == "sloppy"),
 		);
 		let memory = [
 			("memory", self.memory.memory.content.clone()),
@@ -833,7 +822,8 @@ fn dedupe_prompt_source(content: &str, seen: &mut HashSet<String>) -> String {
 	out
 }
 
-/// Renders the algorithmic frozen tool inventory inserted into the template bag.
+/// Renders the algorithmic frozen tool inventory inserted into the template
+/// bag.
 pub fn render_tool_inventory_prop(facts: &PromptFacts) -> Result<Str, PromptError> {
 	let mut out = String::new();
 	if facts.capabilities.tools.is_empty() {
@@ -1021,8 +1011,7 @@ impl PromptOut for String {
 /// Synchronous source of one registered prompt contribution.
 pub trait SlotSource: Send + Sync + 'static {
 	/// Renders this source from immutable workspace input.
-	fn render(&self, workspace: &Props, out: &mut dyn PromptOut)
-	-> Result<(), PromptError>;
+	fn render(&self, workspace: &Props, out: &mut dyn PromptOut) -> Result<(), PromptError>;
 }
 
 /// Immutable bytes pulled from an extension at activation or invalidation time.
@@ -1042,11 +1031,7 @@ impl CachedContribution {
 }
 
 impl SlotSource for CachedContribution {
-	fn render(
-		&self,
-		_workspace: &Props,
-		out: &mut dyn PromptOut,
-	) -> Result<(), PromptError> {
+	fn render(&self, _workspace: &Props, out: &mut dyn PromptOut) -> Result<(), PromptError> {
 		out.write_str(self.bytes.as_str());
 		Ok(())
 	}
@@ -1084,11 +1069,7 @@ impl PromptSlotSource {
 }
 
 impl SlotSource for PromptSlotSource {
-	fn render(
-		&self,
-		_workspace: &Props,
-		out: &mut dyn PromptOut,
-	) -> Result<(), PromptError> {
+	fn render(&self, _workspace: &Props, out: &mut dyn PromptOut) -> Result<(), PromptError> {
 		let asset = crate::prompt_assets::prompt_slot_asset(self.slot.as_str())
 			.ok_or_else(|| PromptError::UnknownPromptSlot { slot: self.slot.clone() })?;
 		out.write_str(asset.content);
@@ -1486,10 +1467,10 @@ macro_rules! template_prompt_source {
 			/// Wraps this built-in source in its canonical slot.
 			pub fn registration(self) -> SlotRegistration {
 				SlotRegistration {
-					decl: SlotDecl {
-						slot: $slot,
-						class: $class,
-						owner: sf!($owner),
+					decl:   SlotDecl {
+						slot:     $slot,
+						class:    $class,
+						owner:    sf!($owner),
 						priority: 0,
 					},
 					source: Arc::new(self),
@@ -1498,11 +1479,7 @@ macro_rules! template_prompt_source {
 		}
 
 		impl SlotSource for $source {
-			fn render(
-				&self,
-				props: &Props,
-				out: &mut dyn PromptOut,
-			) -> Result<(), PromptError> {
+			fn render(&self, props: &Props, out: &mut dyn PromptOut) -> Result<(), PromptError> {
 				let rendered = $template().render_str(crate::prompt_engine::engine(), props)?;
 				out.write_str(&rendered);
 				Ok(())
@@ -1554,10 +1531,10 @@ impl RuntimePromptSource {
 	/// Wraps conditional runtime policy in the stable runtime slot.
 	pub fn registration(self) -> SlotRegistration {
 		SlotRegistration {
-			decl: SlotDecl {
-				slot: SlotId::Runtime,
-				class: SlotClass::Stable,
-				owner: sf!("omp.runtime"),
+			decl:   SlotDecl {
+				slot:     SlotId::Runtime,
+				class:    SlotClass::Stable,
+				owner:    sf!("omp.runtime"),
 				priority: 0,
 			},
 			source: Arc::new(self),
@@ -1582,10 +1559,10 @@ impl ProjectPromptSource {
 	/// Wraps project/workstation context in the stable workspace slot.
 	pub fn registration(self) -> SlotRegistration {
 		SlotRegistration {
-			decl: SlotDecl {
-				slot: SlotId::Workspace,
-				class: SlotClass::Stable,
-				owner: sf!("omp.project"),
+			decl:   SlotDecl {
+				slot:     SlotId::Workspace,
+				class:    SlotClass::Stable,
+				owner:    sf!("omp.project"),
 				priority: 0,
 			},
 			source: Arc::new(self),
@@ -1609,7 +1586,10 @@ pub struct CanonicalPromptSource;
 
 impl CanonicalPromptSource {
 	fn candidate(props: &Props) -> Result<(Vec<Item>, [BandHash; 4]), PromptError> {
-		if props.get(crate::prompt_keys::NULL_PROMPT).is_some_and(omp_scribe::Value::is_truthy) {
+		if props
+			.get(crate::prompt_keys::NULL_PROMPT)
+			.is_some_and(omp_scribe::Value::is_truthy)
+		{
 			return Ok((Vec::new(), [hash_band(&[]); 4]));
 		}
 
@@ -1640,9 +1620,13 @@ impl CanonicalPromptSource {
 		}
 		crate::prompt_engine::delivery().render(engine, props, &mut system)?;
 
-		let project = crate::prompt_engine::project().render_str(engine, props)?.to_string();
+		let project = crate::prompt_engine::project()
+			.render_str(engine, props)?
+			.to_string();
 		let active = if props.get(crate::prompt_keys::ACTIVE_REPOSITORY).is_some() {
-			crate::prompt_engine::active_repo().render_str(engine, props)?.to_string()
+			crate::prompt_engine::active_repo()
+				.render_str(engine, props)?
+				.to_string()
 		} else {
 			String::new()
 		};
@@ -1650,7 +1634,9 @@ impl CanonicalPromptSource {
 			.get(crate::prompt_keys::COMPUTER)
 			.is_some_and(omp_scribe::Value::is_truthy);
 		let safety = if computer {
-			crate::prompt_engine::computer_safety().render_str(engine, props)?.to_string()
+			crate::prompt_engine::computer_safety()
+				.render_str(engine, props)?
+				.to_string()
 		} else {
 			String::new()
 		};

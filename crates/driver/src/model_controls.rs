@@ -6,11 +6,9 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::StreamExt as _;
-use parking_lot::Mutex;
-
-use async_trait::async_trait;
 use omp_catalog::{ModelKey, ThinkingEffort};
 use omp_core::{InvocationPhase, LifecyclePhase, Str, sf};
 use omp_envd::exthost::control::{
@@ -18,6 +16,7 @@ use omp_envd::exthost::control::{
 	ControlEffect, ControlProtocolError, ControlRequestContext,
 };
 use omp_storage::blob::{BlobRef, BlobStore};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -396,7 +395,7 @@ impl ProductionProviderApplicationOwner {
 			blobs,
 			state: Mutex::new(ProviderApplicationState {
 				declarations: BTreeMap::new(),
-				realtime: BTreeMap::new(),
+				realtime:     BTreeMap::new(),
 			}),
 		}
 	}
@@ -477,14 +476,15 @@ impl ProductionProviderApplicationOwner {
 		identity: &ControlConnectionIdentity,
 		provider: &str,
 	) -> Result<&'a OwnedProviderDeclaration, ProviderControlError> {
-		let declaration =
-			state.declarations.get(provider).ok_or(ProviderControlError::NotFound)?;
+		let declaration = state
+			.declarations
+			.get(provider)
+			.ok_or(ProviderControlError::NotFound)?;
 		if declaration.owner != ProviderOwnerStamp::from_identity(identity) {
 			return Err(ProviderControlError::Authorization);
 		}
 		Ok(declaration)
 	}
-
 
 	async fn dispatch(
 		&self,
@@ -504,12 +504,7 @@ impl ProductionProviderApplicationOwner {
 					.records
 					.models
 					.iter()
-					.any(|model| {
-						model
-							.capabilities
-							.operations
-							.contains_kind(operation_kind)
-					});
+					.any(|model| model.capabilities.operations.contains_kind(operation_kind));
 			if !declared {
 				return Err(ProviderControlError::CapabilityDenied);
 			}
@@ -521,8 +516,7 @@ impl ProductionProviderApplicationOwner {
 			.get("format")
 			.and_then(Value::as_str)
 			.map(Str::from);
-		let (target, operation) =
-			lower_control_request(&registry, &self.blobs, &provider, request)?;
+		let (target, operation) = lower_control_request(&registry, &self.blobs, &provider, request)?;
 		let meta = omp_inference::CallMeta {
 			id: omp_inference::RequestId::from(format!(
 				"provider-control-{}",
@@ -539,14 +533,13 @@ impl ProductionProviderApplicationOwner {
 				extension: identity.extension.clone(),
 			},
 		);
-		let answer = omp_inference::router::execute_registry_call(
-			registry,
-			call,
-			Duration::from_secs(30),
-		)
-		.await
-		.map_err(provider_inference_error)?;
-		self.settle_answer(operation_kind, speech_format, answer).await
+		let answer =
+			omp_inference::router::execute_registry_call(registry, call, Duration::from_secs(30))
+				.await
+				.map_err(provider_inference_error)?;
+		self
+			.settle_answer(operation_kind, speech_format, answer)
+			.await
 	}
 
 	async fn settle_answer(
@@ -582,10 +575,7 @@ impl ProductionProviderApplicationOwner {
 				if let Some(settled) = completed_cost {
 					cost_nanos_usd = settled;
 				}
-				Ok(ProviderControlResult::Image {
-					images: images.into_boxed_slice(),
-					cost_nanos_usd,
-				})
+				Ok(ProviderControlResult::Image { images: images.into_boxed_slice(), cost_nanos_usd })
 			},
 			omp_inference::AnswerBody::Speech(mut stream) => {
 				let mut bytes = BytesMut::new();
@@ -637,10 +627,11 @@ impl ProductionProviderApplicationOwner {
 			omp_inference::AnswerBody::Realtime(session) => {
 				let id = Str::from(omp_core::Ulid::generate().to_string());
 				let credential = Str::from(omp_core::Ulid::generate().to_string());
-				self.state.lock().realtime.insert(id.clone(), RealtimeLease {
-					credential: credential.clone(),
-					session,
-				});
+				self
+					.state
+					.lock()
+					.realtime
+					.insert(id.clone(), RealtimeLease { credential: credential.clone(), session });
 				let expires_at_ms = SystemTime::now()
 					.duration_since(SystemTime::UNIX_EPOCH)
 					.unwrap_or_default()
@@ -696,10 +687,7 @@ impl ProductionProviderApplicationOwner {
 			.blobs
 			.put(&bytes)
 			.map_err(|error| ProviderControlError::Request(Str::from(error.to_string())))?;
-		Ok(ProviderBlobRef {
-			hash: Str::from(stored.to_hex().as_str()),
-			size: stored.size,
-		})
+		Ok(ProviderBlobRef { hash: Str::from(stored.to_hex().as_str()), size: stored.size })
 	}
 }
 
@@ -765,20 +753,20 @@ impl crate::chat::ProviderApplicationOwner for ProductionProviderApplicationOwne
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProviderSpec {
-	id:   String,
-	name: String,
+	id:                 String,
+	name:               String,
 	#[serde(default)]
-	routes: Vec<RawRouteSpec>,
+	routes:             Vec<RawRouteSpec>,
 	#[serde(default)]
-	models: Vec<RawModelSpec>,
+	models:             Vec<RawModelSpec>,
 	#[serde(default)]
-	management: RawManagementSpec,
+	management:         RawManagementSpec,
 	#[serde(default = "concrete_mapping")]
-	mapping: Value,
+	mapping:            Value,
 	#[serde(default)]
-	aliases: Vec<Value>,
+	aliases:            Vec<Value>,
 	#[serde(default)]
-	model_overlays: Vec<Value>,
+	model_overlays:     Vec<Value>,
 	#[serde(default)]
 	discovery_defaults: Option<Value>,
 }
@@ -791,41 +779,41 @@ fn concrete_mapping() -> Value {
 #[serde(deny_unknown_fields)]
 struct RawManagementSpec {
 	#[serde(default)]
-	operations: BTreeSet<String>,
+	operations:        BTreeSet<String>,
 	#[serde(default)]
 	multiple_accounts: bool,
 	#[serde(default)]
-	refresh: bool,
+	refresh:           bool,
 	#[serde(default)]
-	principal_quota: bool,
+	principal_quota:   bool,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRouteSpec {
-	id: String,
-	base_url: String,
-	api: String,
+	id:            String,
+	base_url:      String,
+	api:           String,
 	#[serde(default = "default_http")]
-	transport: String,
+	transport:     String,
 	#[serde(default)]
-	auth: RawAuthSpec,
+	auth:          RawAuthSpec,
 	#[serde(default)]
-	headers: BTreeMap<String, String>,
+	headers:       BTreeMap<String, String>,
 	#[serde(default)]
-	region: Option<String>,
+	region:        Option<String>,
 	#[serde(default)]
-	discovery: Option<Value>,
+	discovery:     Option<Value>,
 	#[serde(default)]
-	trust: RawTrustDomain,
+	trust:         RawTrustDomain,
 	#[serde(default)]
-	limits: RawRouteLimits,
+	limits:        RawRouteLimits,
 	#[serde(default)]
-	compat: Value,
+	compat:        Value,
 	#[serde(default = "default_codec_profile")]
 	codec_profile: String,
 	#[serde(default)]
-	priority: Option<u32>,
+	priority:      Option<u32>,
 }
 
 fn default_http() -> String {
@@ -840,44 +828,44 @@ fn default_codec_profile() -> String {
 #[serde(deny_unknown_fields)]
 struct RawAuthSpec {
 	#[serde(default = "default_auth_mode")]
-	mode: String,
+	mode:          String,
 	#[serde(default = "default_auth_header")]
-	header: Option<String>,
+	header:        Option<String>,
 	#[serde(default = "default_auth_prefix")]
-	prefix: Option<String>,
+	prefix:        Option<String>,
 	#[serde(default)]
-	query: Option<String>,
+	query:         Option<String>,
 	#[serde(default)]
-	scopes: Vec<String>,
+	scopes:        Vec<String>,
 	#[serde(default)]
-	audience: Option<String>,
+	audience:      Option<String>,
 	#[serde(default = "default_account_scope")]
 	account_scope: String,
 	#[serde(default)]
-	sources: Vec<RawCredentialSource>,
+	sources:       Vec<RawCredentialSource>,
 	#[serde(default)]
-	oauth: Option<Value>,
+	oauth:         Option<Value>,
 	#[serde(default)]
-	signing: Option<Value>,
+	signing:       Option<Value>,
 }
 
 impl Default for RawAuthSpec {
 	fn default() -> Self {
 		Self {
-			mode: default_auth_mode(),
-			header: default_auth_header(),
-			prefix: default_auth_prefix(),
-			query: None,
-			scopes: Vec::new(),
-			audience: None,
+			mode:          default_auth_mode(),
+			header:        default_auth_header(),
+			prefix:        default_auth_prefix(),
+			query:         None,
+			scopes:        Vec::new(),
+			audience:      None,
 			account_scope: default_account_scope(),
-			sources: vec![RawCredentialSource {
-				kind: "stored".to_owned(),
+			sources:       vec![RawCredentialSource {
+				kind:          "stored".to_owned(),
 				ordered_names: Vec::new(),
-				options: Map::new(),
+				options:       Map::new(),
 			}],
-			oauth: None,
-			signing: None,
+			oauth:         None,
+			signing:       None,
 		}
 	}
 }
@@ -901,20 +889,20 @@ fn default_account_scope() -> String {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCredentialSource {
-	kind: String,
+	kind:          String,
 	#[serde(default)]
 	ordered_names: Vec<String>,
 	#[serde(default)]
-	options: Map<String, Value>,
+	options:       Map<String, Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTrustDomain {
 	#[serde(default)]
-	origin: String,
+	origin:          String,
 	#[serde(default = "default_redirect_trust")]
-	redirects: String,
+	redirects:       String,
 	#[serde(default)]
 	allow_plaintext: bool,
 }
@@ -922,8 +910,8 @@ struct RawTrustDomain {
 impl Default for RawTrustDomain {
 	fn default() -> Self {
 		Self {
-			origin: String::new(),
-			redirects: default_redirect_trust(),
+			origin:          String::new(),
+			redirects:       default_redirect_trust(),
 			allow_plaintext: false,
 		}
 	}
@@ -937,13 +925,13 @@ fn default_redirect_trust() -> String {
 #[serde(deny_unknown_fields)]
 struct RawRouteLimits {
 	#[serde(default)]
-	operations: Option<BTreeSet<String>>,
+	operations:             Option<BTreeSet<String>>,
 	#[serde(default)]
-	max_context_tokens: Option<u64>,
+	max_context_tokens:     Option<u64>,
 	#[serde(default)]
-	max_output_tokens: Option<u64>,
+	max_output_tokens:      Option<u64>,
 	#[serde(default)]
-	disable_server_state: bool,
+	disable_server_state:   bool,
 	#[serde(default)]
 	disable_prompt_caching: bool,
 }
@@ -1016,25 +1004,25 @@ fn default_model_operations() -> BTreeSet<String> {
 #[serde(deny_unknown_fields)]
 struct RawCost {
 	#[serde(default)]
-	input: Value,
+	input:        Value,
 	#[serde(default)]
-	output: Value,
+	output:       Value,
 	#[serde(default)]
-	cache_read: Value,
+	cache_read:   Value,
 	#[serde(default)]
-	cache_write: Value,
+	cache_write:  Value,
 	#[serde(default)]
-	image: Value,
+	image:        Value,
 	#[serde(default)]
 	video_second: Value,
 	#[serde(default)]
 	audio_second: Value,
 	#[serde(default)]
-	char_input: Value,
+	char_input:   Value,
 	#[serde(default)]
-	request: Value,
+	request:      Value,
 	#[serde(default)]
-	tiers: Vec<Value>,
+	tiers:        Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1048,11 +1036,11 @@ struct RawDimensions {
 #[serde(deny_unknown_fields)]
 struct RawImageCaps {
 	#[serde(default)]
-	features: BTreeSet<String>,
+	features:       BTreeSet<String>,
 	#[serde(default)]
-	sizes: Vec<RawDimensions>,
+	sizes:          Vec<RawDimensions>,
 	#[serde(default)]
-	formats: BTreeSet<String>,
+	formats:        BTreeSet<String>,
 	#[serde(default)]
 	max_references: Option<u16>,
 }
@@ -1061,11 +1049,11 @@ struct RawImageCaps {
 #[serde(deny_unknown_fields)]
 struct RawSpeechCaps {
 	#[serde(default)]
-	features: BTreeSet<String>,
+	features:        BTreeSet<String>,
 	#[serde(default)]
-	voices: Vec<String>,
+	voices:          Vec<String>,
 	#[serde(default)]
-	formats: BTreeSet<String>,
+	formats:         BTreeSet<String>,
 	#[serde(default)]
 	sample_rates_hz: Vec<u32>,
 }
@@ -1074,9 +1062,9 @@ struct RawSpeechCaps {
 #[serde(deny_unknown_fields)]
 struct RawTranscriptionCaps {
 	#[serde(default)]
-	features: BTreeSet<String>,
+	features:     BTreeSet<String>,
 	#[serde(default)]
-	formats: BTreeSet<String>,
+	formats:      BTreeSet<String>,
 	#[serde(default)]
 	max_duration: Option<Value>,
 }
@@ -1085,9 +1073,9 @@ struct RawTranscriptionCaps {
 #[serde(deny_unknown_fields)]
 struct RawRealtimeCaps {
 	#[serde(default)]
-	features: BTreeSet<String>,
+	features:   BTreeSet<String>,
 	#[serde(default)]
-	voices: Vec<String>,
+	voices:     Vec<String>,
 	#[serde(default)]
 	transports: BTreeSet<String>,
 }
@@ -1134,13 +1122,13 @@ pub fn lower_provider_declaration(
 			return Err(invalid_declaration("route identity is invalid or duplicated"));
 		}
 		if raw_route.discovery.is_some() {
-			return Err(invalid_declaration(
-				"runtime discovery requires a Core-owned projector",
-			));
+			return Err(invalid_declaration("runtime discovery requires a Core-owned projector"));
 		}
-		if raw_route.compat.as_object().is_some_and(|compat| {
-			compat.values().any(|value| !value.is_null())
-		}) {
+		if raw_route
+			.compat
+			.as_object()
+			.is_some_and(|compat| compat.values().any(|value| !value.is_null()))
+		{
 			return Err(invalid_declaration(
 				"runtime compatibility flags must use a compiled Core route",
 			));
@@ -1153,7 +1141,8 @@ pub fn lower_provider_declaration(
 			empty_headers.clone()
 		} else {
 			validate_headers(&raw_route.headers)?;
-			base.header_profiles()
+			base
+				.header_profiles()
 				.iter()
 				.find(|profile| {
 					profile.headers.len() == raw_route.headers.len()
@@ -1166,13 +1155,10 @@ pub fn lower_provider_declaration(
 				})
 				.map(|profile| profile.id.clone())
 				.ok_or_else(|| {
-					invalid_declaration(
-						"runtime static headers must match a sealed Core header profile",
-					)
+					invalid_declaration("runtime static headers must match a sealed Core header profile")
 				})?
 		};
-		let route_id =
-			omp_catalog::RouteId::from(format!("{}/{}", raw.id, raw_route.id).as_str());
+		let route_id = omp_catalog::RouteId::from(format!("{}/{}", raw.id, raw_route.id).as_str());
 		let auth = compile_auth(&raw.id, &raw_route.id, &raw_route.auth)?;
 		provider_auth.push(auth.id.clone());
 		let template_route = base
@@ -1185,12 +1171,12 @@ pub fn lower_provider_declaration(
 			.ok_or_else(|| invalid_declaration("provider codec template has no owner"))?;
 		provider_wire_policy.get_or_insert_with(|| template_provider.wire_policy.clone());
 		let mut limits = omp_catalog::RouteRestrictions {
-			operations: None,
+			operations:             None,
 			maximum_context_tokens: raw_route.limits.max_context_tokens,
-			maximum_output_tokens: raw_route.limits.max_output_tokens,
-			disable_server_state: raw_route.limits.disable_server_state,
+			maximum_output_tokens:  raw_route.limits.max_output_tokens,
+			disable_server_state:   raw_route.limits.disable_server_state,
 			disable_prompt_caching: raw_route.limits.disable_prompt_caching,
-			disable_strict_tools: false,
+			disable_strict_tools:   false,
 		};
 		if let Some(operations) = &raw_route.limits.operations {
 			limits.operations = Some(compile_operations(operations, codec)?);
@@ -1203,7 +1189,7 @@ pub fn lower_provider_declaration(
 			transport,
 			endpoint: omp_catalog::provider::EndpointSpec {
 				base_url: Str::from(raw_route.base_url.as_str()),
-				region: raw_route.region.as_deref().map(Str::from),
+				region:   raw_route.region.as_deref().map(Str::from),
 			},
 			auth: auth.id.clone(),
 			headers: header_id,
@@ -1307,10 +1293,10 @@ pub fn lower_provider_declaration(
 			routes: model_routes.into_boxed_slice(),
 			capabilities,
 			limits: omp_catalog::ModelLimits {
-				context_window: raw_model.context_window,
-				maximum_input_tokens: raw_model.max_input_tokens,
+				context_window:        raw_model.context_window,
+				maximum_input_tokens:  raw_model.max_input_tokens,
 				maximum_output_tokens: raw_model.max_output_tokens,
-				maximum_batch: raw_model.max_batch,
+				maximum_batch:         raw_model.max_batch,
 			},
 			thinking: None,
 			thinking_routing: omp_catalog::ThinkingRouting::default(),
@@ -1319,16 +1305,16 @@ pub fn lower_provider_declaration(
 			pricing: compile_pricing(&raw_model.cost)?,
 			availability: omp_catalog::ModelAvailability::Available,
 			provenance: omp_catalog::ModelProvenance {
-				sources: Box::new([omp_catalog::ProvenanceSource {
-					kind: omp_catalog::ProvenanceKind::Configured,
-					origin: declaration.provider.clone(),
-					revision: None,
-					confidence: omp_catalog::EvidenceConfidence::Declared,
+				sources:          Box::new([omp_catalog::ProvenanceSource {
+					kind:           omp_catalog::ProvenanceKind::Configured,
+					origin:         declaration.provider.clone(),
+					revision:       None,
+					confidence:     omp_catalog::EvidenceConfidence::Declared,
 					observed_at_ms: None,
 				}]),
-				updated_at_ms: None,
+				updated_at_ms:    None,
 				blocked_until_ms: None,
-				deprecated: false,
+				deprecated:       false,
 			},
 			context_promotion_target: None,
 			compaction_model: None,
@@ -1339,25 +1325,25 @@ pub fn lower_provider_declaration(
 	}
 	let management_operations = compile_operations_for_management(&raw.management.operations)?;
 	Ok(omp_catalog::RuntimeProviderRecords {
-		provider: omp_catalog::ProviderDef {
+		provider:    omp_catalog::ProviderDef {
 			id: provider_id,
 			name: Str::from(raw.name),
 			auth: provider_auth.into_boxed_slice(),
 			management: omp_catalog::ManagementCapabilities {
-				operations: management_operations,
+				operations:        management_operations,
 				multiple_accounts: raw.management.multiple_accounts,
-				refresh: raw.management.refresh,
-				principal_quota: raw.management.principal_quota,
+				refresh:           raw.management.refresh,
+				principal_quota:   raw.management.principal_quota,
 			},
 			routes: routes.iter().map(|route| route.id.clone()).collect(),
 			wire_policy,
 			discovery_defaults: None,
 			mapping: omp_catalog::RegistryMapping::Concrete,
 		},
-		auth_specs: auth_specs.into_boxed_slice(),
+		auth_specs:  auth_specs.into_boxed_slice(),
 		oauth_specs: Box::new([]),
-		routes: routes.into_boxed_slice(),
-		models: models.into_boxed_slice(),
+		routes:      routes.into_boxed_slice(),
+		models:      models.into_boxed_slice(),
 	})
 }
 fn invalid_declaration(message: impl Into<Str>) -> ProviderControlError {
@@ -1412,24 +1398,20 @@ fn api_codec(api: &str) -> Option<&'static str> {
 	}
 }
 
-fn parse_transport(
-	value: &str,
-) -> Result<omp_catalog::TransportKind, ProviderControlError> {
+fn parse_transport(value: &str) -> Result<omp_catalog::TransportKind, ProviderControlError> {
 	match value {
 		"http" => Ok(omp_catalog::TransportKind::Http),
 		"websocket" => Ok(omp_catalog::TransportKind::Websocket),
 		"aws_event_stream" => Ok(omp_catalog::TransportKind::AwsEventStream),
 		"connect" => Ok(omp_catalog::TransportKind::Connect),
-		"webrtc" | "local" => Err(invalid_declaration(
-			"runtime provider transport is not application-composed",
-		)),
+		"webrtc" | "local" => {
+			Err(invalid_declaration("runtime provider transport is not application-composed"))
+		},
 		_ => Err(invalid_declaration("provider transport is invalid")),
 	}
 }
 
-fn parse_codec_profile(
-	value: &str,
-) -> Result<omp_catalog::CodecProfile, ProviderControlError> {
+fn parse_codec_profile(value: &str) -> Result<omp_catalog::CodecProfile, ProviderControlError> {
 	match value {
 		"standard" => Ok(omp_catalog::CodecProfile::Standard),
 		"google-cca-gemini-cli" => Ok(omp_catalog::CodecProfile::GoogleCcaGeminiCli),
@@ -1445,9 +1427,7 @@ fn compile_trust(
 	let url = url::Url::parse(&route.base_url)
 		.map_err(|_| invalid_declaration("route base URL is invalid"))?;
 	let scheme = url.scheme();
-	if transport != omp_catalog::TransportKind::Websocket
-		&& !matches!(scheme, "https" | "http")
-	{
+	if transport != omp_catalog::TransportKind::Websocket && !matches!(scheme, "https" | "http") {
 		return Err(invalid_declaration("HTTP route has a non-HTTP URL"));
 	}
 	if transport == omp_catalog::TransportKind::Websocket
@@ -1468,18 +1448,14 @@ fn compile_trust(
 		));
 	}
 	if route.trust.allow_plaintext && !loopback {
-		return Err(invalid_declaration(
-			"plaintext trust cannot be widened beyond loopback",
-		));
+		return Err(invalid_declaration("plaintext trust cannot be widened beyond loopback"));
 	}
 	let origin = url.origin().ascii_serialization();
 	if origin == "null" {
 		return Err(invalid_declaration("route URL has no tuple origin"));
 	}
 	if !route.trust.origin.is_empty() && route.trust.origin != origin {
-		return Err(invalid_declaration(
-			"route URL is outside its declared trust origin",
-		));
+		return Err(invalid_declaration("route URL is outside its declared trust origin"));
 	}
 	let redirects = match route.trust.redirects.as_str() {
 		"deny" => omp_catalog::RedirectTrust::Deny,
@@ -1503,7 +1479,8 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), ProviderCo
 		if parsed == http::header::AUTHORIZATION
 			|| parsed == http::header::COOKIE
 			|| parsed == http::header::PROXY_AUTHORIZATION
-			|| parsed == http::header::SET_COOKIE {
+			|| parsed == http::header::SET_COOKIE
+		{
 			return Err(invalid_declaration(
 				"credential-bearing headers cannot be static provider data",
 			));
@@ -1561,20 +1538,16 @@ fn compile_auth(
 			"stored" => Ok(omp_catalog::CredentialSourceSpec::Stored),
 			"session" => Ok(omp_catalog::CredentialSourceSpec::Session),
 			"aws_chain" => Ok(omp_catalog::CredentialSourceSpec::AwsChain),
-			_ => Err(invalid_declaration(
-				"credential source is malformed or not application-composed",
-			)),
+			_ => {
+				Err(invalid_declaration("credential source is malformed or not application-composed"))
+			},
 		})
 		.collect::<Result<Vec<_>, _>>()?;
 	if kind == omp_catalog::AuthSpecKind::None && !sources.is_empty() {
-		return Err(invalid_declaration(
-			"unauthenticated routes cannot declare credential sources",
-		));
+		return Err(invalid_declaration("unauthenticated routes cannot declare credential sources"));
 	}
 	if kind != omp_catalog::AuthSpecKind::None && sources.is_empty() {
-		return Err(invalid_declaration(
-			"authenticated routes require a credential source",
-		));
+		return Err(invalid_declaration("authenticated routes require a credential source"));
 	}
 	if raw.sources.iter().any(|source| !source.options.is_empty()) {
 		return Err(invalid_declaration(
@@ -1588,7 +1561,11 @@ fn compile_auth(
 		query_parameter: raw.query.as_deref().map(Str::from),
 		prefix: raw.prefix.as_deref().map(Str::from),
 		sealed_body: None,
-		scopes: raw.scopes.iter().map(|scope| Str::from(scope.as_str())).collect(),
+		scopes: raw
+			.scopes
+			.iter()
+			.map(|scope| Str::from(scope.as_str()))
+			.collect(),
 		audience: raw.audience.as_deref().map(Str::from),
 		account_scope,
 		credential_sources: sources.into_boxed_slice(),
@@ -1624,8 +1601,8 @@ fn supported_operations(codec: &str) -> Vec<omp_catalog::OperationKind> {
 	match codec {
 		"openai-chat" => vec![Chat, Embed, GenerateImage, Speak, Transcribe, Realtime],
 		"openai-responses" | "anthropic" | "gemini" => vec![Chat, CountTokens],
-		"openai-codex" | "bedrock-converse" | "google-cca" | "ollama" | "gitlab"
-		| "cursor" | "devin" => vec![Chat, DiscoverModels],
+		"openai-codex" | "bedrock-converse" | "google-cca" | "ollama" | "gitlab" | "cursor"
+		| "devin" => vec![Chat, DiscoverModels],
 		"openai-embedding" => vec![Embed],
 		codec if codec.starts_with("search-") => vec![Search],
 		_ => Vec::new(),
@@ -1636,7 +1613,10 @@ fn intersect_operations(
 	left: Vec<omp_catalog::OperationKind>,
 	right: Vec<omp_catalog::OperationKind>,
 ) -> Vec<omp_catalog::OperationKind> {
-	left.into_iter().filter(|kind| right.contains(kind)).collect()
+	left
+		.into_iter()
+		.filter(|kind| right.contains(kind))
+		.collect()
 }
 
 fn compile_operations(
@@ -1696,11 +1676,13 @@ fn compile_model_capabilities(
 	raw: &RawModelSpec,
 	operations: omp_catalog::OperationBits,
 ) -> Result<omp_catalog::ModelCapabilities, ProviderControlError> {
-	use omp_catalog::OperationKind;
-	use omp_catalog::capability::{
-		AudioFormatBits, ImageCapabilities, ImageFeatureBits, ModalityBits,
-		RealtimeCapabilities, RealtimeFeatureBits, SpeechCapabilities, SpeechFeatureBits,
-		TranscriptionCapabilities, TranscriptionFeatureBits,
+	use omp_catalog::{
+		OperationKind,
+		capability::{
+			AudioFormatBits, ImageCapabilities, ImageFeatureBits, ModalityBits, RealtimeCapabilities,
+			RealtimeFeatureBits, SpeechCapabilities, SpeechFeatureBits, TranscriptionCapabilities,
+			TranscriptionFeatureBits,
+		},
 	};
 	let seed = base
 		.models()
@@ -1740,7 +1722,7 @@ fn compile_model_capabilities(
 			.find_map(|model| model.capabilities.search)
 			.or_else(|| {
 				Some(omp_catalog::capability::SearchCapabilities {
-					features: omp_catalog::capability::SearchFeatureBits::empty(),
+					features:        omp_catalog::capability::SearchFeatureBits::empty(),
 					maximum_results: None,
 				})
 			});
@@ -1838,9 +1820,7 @@ fn compile_model_capabilities(
 				"timestamps" => TranscriptionFeatureBits::WORD_TIMESTAMPS,
 				"language_hint" => TranscriptionFeatureBits::LANGUAGE_DETECTION,
 				_ => {
-					return Err(invalid_declaration(
-						"transcription capability feature is invalid",
-					));
+					return Err(invalid_declaration("transcription capability feature is invalid"));
 				},
 			});
 		}
@@ -1929,9 +1909,7 @@ fn audio_format_bits(
 fn compile_pricing(raw: &RawCost) -> Result<omp_catalog::Pricing, ProviderControlError> {
 	use omp_catalog::{Price, PriceUnit};
 	if !raw.tiers.is_empty() {
-		return Err(invalid_declaration(
-			"runtime price tiers require a compiled catalog policy",
-		));
+		return Err(invalid_declaration("runtime price tiers require a compiled catalog policy"));
 	}
 	let values = [
 		(PriceUnit::MtokInput, &raw.input),
@@ -1966,7 +1944,8 @@ fn decimal_nanos(value: &Value) -> Result<u64, ProviderControlError> {
 		return Err(invalid_declaration("price must be a plain non-negative decimal"));
 	}
 	let (whole, fraction) = text.split_once('.').unwrap_or((&text, ""));
-	if fraction.len() > 9 || !whole.bytes().all(|byte| byte.is_ascii_digit())
+	if fraction.len() > 9
+		|| !whole.bytes().all(|byte| byte.is_ascii_digit())
 		|| !fraction.bytes().all(|byte| byte.is_ascii_digit())
 	{
 		return Err(invalid_declaration("price exceeds nano-USD precision"));
@@ -2009,10 +1988,7 @@ fn lower_control_request(
 	};
 	match request.operation {
 		ProviderRequestKind::GenerateImage => {
-			require_payload_keys(
-				&request.payload,
-				&["prompt", "dimensions", "format", "count"],
-			)?;
+			require_payload_keys(&request.payload, &["prompt", "dimensions", "format", "count"])?;
 			let prompt = required_string(&request.payload, "prompt")?;
 			let dimensions = request
 				.payload
@@ -2052,11 +2028,8 @@ fn lower_control_request(
 		},
 		ProviderRequestKind::Speak => {
 			require_payload_keys(&request.payload, &["model", "text", "voice", "format"])?;
-			let model = provider_model_key(
-				registry,
-				provider,
-				required_string(&request.payload, "model")?,
-			)?;
+			let model =
+				provider_model_key(registry, provider, required_string(&request.payload, "model")?)?;
 			let format = request
 				.payload
 				.get("format")
@@ -2079,64 +2052,56 @@ fn lower_control_request(
 		},
 		ProviderRequestKind::Transcribe => {
 			require_payload_keys(&request.payload, &["model", "audio", "language"])?;
-			let model = provider_model_key(
-				registry,
-				provider,
-				required_string(&request.payload, "model")?,
-			)?;
+			let model =
+				provider_model_key(registry, provider, required_string(&request.payload, "model")?)?;
 			let reference = request
 				.payload
 				.get("audio")
 				.and_then(Value::as_object)
 				.ok_or_else(|| {
-					invalid_request(
-						"transcription audio must be an application-owned blob reference",
-					)
+					invalid_request("transcription audio must be an application-owned blob reference")
 				})?;
 			let hash = required_string(reference, "hash")?;
 			let size = reference
 				.get("size")
 				.and_then(Value::as_u64)
 				.ok_or_else(|| invalid_request("transcription blob size is required"))?;
-			let reference = BlobRef::parse_hex(hash, size)
-				.map_err(|error| invalid_request(error.to_string()))?;
+			let reference =
+				BlobRef::parse_hex(hash, size).map_err(|error| invalid_request(error.to_string()))?;
 			let bytes = blobs
 				.get(&reference)
 				.map_err(|error| invalid_request(error.to_string()))?;
 			Ok((
 				omp_inference::Target::Provider { provider: provider.clone(), model },
 				omp_inference::OperationCall::Transcribe(Arc::new(TranscriptionRequest {
-					audio: omp_inference::MediaInput::Bytes {
+					audio:                omp_inference::MediaInput::Bytes {
 						media_type: sf!("application/octet-stream"),
-						data: bytes,
+						data:       bytes,
 					},
-					language: request
+					language:             request
 						.payload
 						.get("language")
 						.and_then(Value::as_str)
 						.map(Str::from),
 					translate_to_english: false,
-					diarization: Setting::Unset,
-					timestamps: Setting::Unset,
-					prompt: None,
-					negotiation: NegotiationPolicy::default(),
+					diarization:          Setting::Unset,
+					timestamps:           Setting::Unset,
+					prompt:               None,
+					negotiation:          NegotiationPolicy::default(),
 				})),
 			))
 		},
 		ProviderRequestKind::Realtime => {
-			require_payload_keys(
-				&request.payload,
-				&[
-					"instructions",
-					"modalities",
-					"voice",
-					"input_audio",
-					"output_audio",
-					"turn_detection",
-					"tools",
-					"negotiation",
-				],
-			)?;
+			require_payload_keys(&request.payload, &[
+				"instructions",
+				"modalities",
+				"voice",
+				"input_audio",
+				"output_audio",
+				"turn_detection",
+				"tools",
+				"negotiation",
+			])?;
 			let modalities = request
 				.payload
 				.get("modalities")
@@ -2160,9 +2125,7 @@ fn lower_control_request(
 				.and_then(Value::as_array)
 				.is_some_and(|tools| !tools.is_empty())
 			{
-				return Err(invalid_request(
-					"realtime tool names require Core-owned tool definitions",
-				));
+				return Err(invalid_request("realtime tool names require Core-owned tool definitions"));
 			}
 			let input_audio = parse_audio_setting(request.payload.get("input_audio"))?;
 			let output_audio = parse_audio_setting(request.payload.get("output_audio"))?;
@@ -2171,9 +2134,12 @@ fn lower_control_request(
 				.get("turn_detection")
 				.and_then(Value::as_object)
 				.is_some_and(|setting| {
-					setting.get("kind").and_then(Value::as_str).unwrap_or("unset") != "unset"
-				})
-			{
+					setting
+						.get("kind")
+						.and_then(Value::as_str)
+						.unwrap_or("unset")
+						!= "unset"
+				}) {
 				return Err(invalid_request(
 					"realtime turn detection requires a sealed transport policy",
 				));
@@ -2187,7 +2153,11 @@ fn lower_control_request(
 						.and_then(Value::as_str)
 						.map(Str::from),
 					modalities: modalities.into(),
-					voice: request.payload.get("voice").and_then(Value::as_str).map(Str::from),
+					voice: request
+						.payload
+						.get("voice")
+						.and_then(Value::as_str)
+						.map(Str::from),
 					input_audio,
 					output_audio,
 					turn_detection: Setting::Unset,
@@ -2237,10 +2207,7 @@ fn required_string<'a>(
 		.ok_or_else(|| invalid_request(format!("{key} is required")))
 }
 
-fn required_u32(
-	payload: &Map<String, Value>,
-	key: &str,
-) -> Result<u32, ProviderControlError> {
+fn required_u32(payload: &Map<String, Value>, key: &str) -> Result<u32, ProviderControlError> {
 	payload
 		.get(key)
 		.and_then(Value::as_u64)
@@ -2253,7 +2220,9 @@ fn invalid_request(message: impl Into<Str>) -> ProviderControlError {
 	ProviderControlError::Request(message.into())
 }
 
-fn parse_image_format(value: &str) -> Result<omp_inference::call::ImageFormat, ProviderControlError> {
+fn parse_image_format(
+	value: &str,
+) -> Result<omp_inference::call::ImageFormat, ProviderControlError> {
 	match value {
 		"png" => Ok(omp_inference::call::ImageFormat::Png),
 		"jpeg" => Ok(omp_inference::call::ImageFormat::Jpeg),
@@ -2262,7 +2231,9 @@ fn parse_image_format(value: &str) -> Result<omp_inference::call::ImageFormat, P
 	}
 }
 
-fn parse_audio_format(value: &str) -> Result<omp_inference::call::AudioFormat, ProviderControlError> {
+fn parse_audio_format(
+	value: &str,
+) -> Result<omp_inference::call::AudioFormat, ProviderControlError> {
 	use omp_inference::call::AudioFormat;
 	match value {
 		"pcm16" => Ok(AudioFormat::Pcm16),
@@ -2284,7 +2255,11 @@ fn parse_audio_setting(
 	let Some(setting) = value.and_then(Value::as_object) else {
 		return Ok(Setting::Unset);
 	};
-	match setting.get("kind").and_then(Value::as_str).unwrap_or("unset") {
+	match setting
+		.get("kind")
+		.and_then(Value::as_str)
+		.unwrap_or("unset")
+	{
 		"unset" => Ok(Setting::Unset),
 		"require" => Ok(Setting::Require(parse_audio_format(
 			setting
@@ -2302,9 +2277,7 @@ fn parse_audio_setting(
 	}
 }
 
-fn receipt_cost_nanos(
-	cost: omp_inference::Cost,
-) -> Result<u64, ProviderControlError> {
+fn receipt_cost_nanos(cost: omp_inference::Cost) -> Result<u64, ProviderControlError> {
 	if cost.micro_usd < 0 {
 		return Err(invalid_request("provider returned a negative media cost"));
 	}
@@ -2397,10 +2370,9 @@ impl ProviderControlAuthority {
 			ProviderControlError::InvalidDeclaration(message) => {
 				ControlProtocolError::new("InvalidProvider", message)
 			},
-			ProviderControlError::CapabilityDenied => ControlProtocolError::new(
-				"CapabilityDenied",
-				"provider capability is not declared",
-			),
+			ProviderControlError::CapabilityDenied => {
+				ControlProtocolError::new("CapabilityDenied", "provider capability is not declared")
+			},
 			ProviderControlError::NotFound => {
 				ControlProtocolError::new("TargetNotFound", "provider resource is not found")
 			},
