@@ -4495,6 +4495,17 @@ mod tests {
 			),
 			false,
 		);
+		host
+			.tree()
+			.register(
+				sf!("parent-session"),
+				sf!("Main"),
+				AgentKind::Main,
+				None,
+				sf!("parent-session"),
+				Budget::default(),
+			)
+			.expect("root registration");
 
 		let completion = crate::envd::eval::ParentSessionHost::completion(
 			&host,

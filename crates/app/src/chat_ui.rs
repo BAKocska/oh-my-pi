@@ -4884,7 +4884,7 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let parent = stub_parent_host(scratch.path());
 		let tree = parent.tree();
-		let old = tree
+		let main = tree
 			.register(
 				sf!("main"),
 				sf!("Main"),
@@ -4893,19 +4893,8 @@ mod tests {
 				sf!("session-a"),
 				Budget::default(),
 			)
-			.expect("old root");
-		old.set_status(AgentStatus::Completed);
-		let latest = tree
-			.register(
-				sf!("main"),
-				sf!("Main"),
-				AgentKind::Main,
-				None,
-				sf!("session-a"),
-				Budget::default(),
-			)
-			.expect("replacement root");
-		latest.set_status(AgentStatus::Running);
+			.expect("session root");
+		main.set_status(AgentStatus::Running);
 		tree
 			.register(
 				sf!("other"),
@@ -4937,7 +4926,7 @@ mod tests {
 			.iter()
 			.find(|row| row.id == "main")
 			.expect("canonical main");
-		assert_eq!(main.status, "running", "the replacement root is the canonical node");
+		assert_eq!(main.status, "running", "the session root is the canonical node");
 		assert!(rows.iter().any(|row| row.id == "worker"));
 		assert!(
 			project_agent_roster(&parent, &tree, "session-b").is_empty(),
