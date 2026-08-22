@@ -44,6 +44,10 @@ use super::{
 		usage_rows,
 	},
 	worker::ExternalJournalCall,
+	schedules::{
+		DurableScheduleError, DurableScheduleHandle, ScheduleCaller, ScheduleDeliveryBackend,
+		open_durable_scheduler_unbound,
+	},
 };
 
 #[derive(Clone)]
@@ -68,6 +72,7 @@ pub struct ExternalJournalActor {
 	project_path:  Str,
 	state_dir:     PathBuf,
 	sessions_dir:  PathBuf,
+	schedules:     DurableScheduleHandle,
 }
 
 impl ExternalJournalActor {
@@ -97,6 +102,14 @@ impl ExternalJournalActor {
 		let sessions_dir = state_dir.join("sessions");
 		let artifact_meta = ArtifactMetadataStore::open(blobs.store())
 			.map_err(|error| super::server::EnvdError::Blob(Str::from(error.to_string())))?;
+		let schedules =
+			open_durable_scheduler_unbound(&state_dir.join("agent-schedules.sqlite")).map_err(
+				|error| {
+					super::server::EnvdError::Worker(super::worker::WorkerError::Protocol(
+						Str::from(error.to_string()),
+					))
+				},
+			)?;
 		let (sender, receiver) = flume::unbounded::<ExternalJournalCall>();
 		let agent = Arc::new(Mutex::new(None));
 		let actor_agent = Arc::clone(&agent);
@@ -150,6 +163,7 @@ impl ExternalJournalActor {
 			project_path: actor_project_path,
 			state_dir,
 			sessions_dir,
+			schedules,
 		})
 	}
 
@@ -188,11 +202,34 @@ impl ExternalJournalActor {
 		Ok(())
 	}
 
-	/// Releases a binding only when it is still owned by `id`.
+	/// Returns the project-owned durable schedule authority.
+	pub(crate) fn schedules(&self) -> DurableScheduleHandle {
+		self.schedules.clone()
+	}
+
+	/// Installs the host owner that attaches or starts agents for scheduled
+	/// delivery.
+	pub(crate) async fn bind_schedule_delivery(
+		&self,
+		backend: Arc<dyn ScheduleDeliveryBackend>,
+	) -> Result<(), super::server::EnvdError> {
+		self.schedules.bind_delivery(backend).await.map_err(|error| {
+			super::server::EnvdError::Worker(super::worker::WorkerError::Protocol(Str::from(
+				error.to_string(),
+			)))
+		})
+	}
+
 	pub(crate) fn unbind_agent(&self, id: u64) {
 		let mut agent = self.agent.lock();
 		if agent.as_ref().is_some_and(|binding| binding.id == id) {
 			*agent = None;
+			let schedules = self.schedules.clone();
+			tokio::spawn(async move {
+				if let Err(error) = schedules.expire_session().await {
+					tracing::warn!(%error, "session schedule expiration failed");
+				}
+			});
 		}
 	}
 }
@@ -294,6 +331,43 @@ impl PersistenceControlOwner {
 		)
 		.map_err(protocol_error)
 	}
+	fn schedule_caller(
+		&self,
+		context: &ControlRequestContext,
+	) -> Result<ScheduleCaller, ControlProtocolError> {
+		let owner = context
+			.invocation
+			.as_ref()
+			.map(|invocation| invocation.session.clone())
+			.ok_or_else(|| {
+				ControlProtocolError::new(
+					"PhaseConflict",
+					"schedule operation requires a live Agent invocation",
+				)
+			})?;
+		Ok(ScheduleCaller {
+			owner,
+			extension_owner: context.connection.extension.clone(),
+			principal: Str::from(context.connection.principal.id()),
+			artifact_digest: context.connection.artifact_digest.clone(),
+			host_generation: context.connection.host_generation,
+			session_generation: context.connection.session_generation,
+		})
+	}
+
+	async fn schedule_request(
+		&self,
+		context: ControlRequestContext,
+		operation: Str,
+		arguments: Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		let caller = self.schedule_caller(&context)?;
+		self.actor
+			.schedules
+			.request(caller, operation, arguments)
+			.await
+			.map_err(schedule_protocol_error)
+	}
 }
 
 #[async_trait::async_trait]
@@ -305,6 +379,9 @@ impl ControlAuthority for PersistenceControlOwner {
 			|| operation == "omp.state_dir"
 			|| operation.starts_with("omp.sessions.")
 			|| operation.starts_with("omp.artifacts.")
+			|| operation.starts_with("omp.agents.schedule")
+			|| operation == "omp.agents.schedules"
+			|| operation == "omp.agents.unschedule"
 	}
 
 	fn authorize(
@@ -329,6 +406,12 @@ impl ControlAuthority for PersistenceControlOwner {
 			return self.context.request(context, operation, arguments).await;
 		}
 		self.validate(&context)?;
+		if operation.as_str().starts_with("omp.agents.schedule")
+			|| operation.as_str() == "omp.agents.schedules"
+			|| operation.as_str() == "omp.agents.unschedule"
+		{
+			return self.schedule_request(context, operation, arguments).await;
+		}
 		match operation.as_str() {
 			"omp.journal.append"
 			| "omp.journal.append_many"
@@ -1536,6 +1619,28 @@ fn protocol_error(message: impl std::fmt::Display) -> ControlProtocolError {
 		.split_once(':')
 		.map_or("PersistenceError", |(code, _)| code);
 	ControlProtocolError::new(Str::from(code), Str::from(message))
+}
+fn schedule_protocol_error(error: DurableScheduleError) -> ControlProtocolError {
+	let details = match &error {
+		DurableScheduleError::Invalid { field, reason } => {
+			json!({"field": field, "reason": reason})
+		},
+		DurableScheduleError::NotFound => json!({"reason": "schedule was not found"}),
+		DurableScheduleError::NotOwned => json!({"reason": "schedule is not owned by caller"}),
+		_ => Value::Null,
+	};
+	let (code, retryable) = match &error {
+		DurableScheduleError::StaleGeneration { .. } => ("StaleGeneration", true),
+		DurableScheduleError::Closed | DurableScheduleError::Delivery(_) => {
+			("ScheduleUnavailable", true)
+		},
+		DurableScheduleError::Storage(_) => ("ScheduleUnavailable", false),
+		DurableScheduleError::NotFound
+		| DurableScheduleError::NotOwned
+		| DurableScheduleError::Invalid { .. } => ("ScheduleRejected", false),
+	};
+	ControlProtocolError::new(code, error.to_string()).retryable(retryable)
+		.with_details(details)
 }
 
 fn parse_entry_id(value: &str) -> Result<(&str, u64), ControlProtocolError> {

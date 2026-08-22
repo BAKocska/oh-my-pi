@@ -7,6 +7,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
+		Weak,
 		atomic::{AtomicU8, AtomicU64, Ordering},
 	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
@@ -74,7 +75,10 @@ use super::{
 		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, JournalRuntime, OpenToolCall,
 		WorkerError, WorkerEvent, WorkerOutcomeKind,
 	},
-	worker_pool::{WorkerKey, WorkerRoute, WorkerSupervisor, WorkerUnavailable},
+	worker_pool::{
+		DEFAULT_MAX_CONCURRENT_SPAWNS, DEFAULT_WORKER_LAYER_CEILING, WorkerKey, WorkerRoute,
+		WorkerSupervisor, WorkerUnavailable,
+	},
 	workspace::{
 		WorkspaceError, WorkspaceHost, WorkspaceOperationError, WorkspaceOperations,
 		WorkspaceSearchCase, WorkspaceSearchOptions,
@@ -89,8 +93,15 @@ use crate::{
 		PolicyControlAuthorities, PresentationControlAuthorities, ProviderControlAuthorities,
 		RegistryAvailabilitySink, RegistryControlAuthorities,
 		control::{
-			ControlConnectionIdentity, ControlEffect, ControlProtocolError, ControlRequestContext,
+			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlProtocolError,
+			ControlRequestContext,
 		},
+		dispatch::{CallbackDispatcher, CallbackDispatcherSlot},
+	},
+	tools::{
+		DeviceCatalogObserver, DeviceControlFactory, DeviceInvocationAdmission,
+		DynamicDeviceCatalogEntry, HookControlFactory, HookEventPolicy, HookFailurePolicy,
+		RegistryControlFactory,
 	},
 };
 
@@ -102,8 +113,6 @@ const PRELUDE_CALL_DEADLINE: Duration = Duration::from_secs(600);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const NATIVE_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const INVOCATION_RESPONSE_SEND_GRACE: Duration = Duration::from_millis(250);
-const WORKER_LAYER_CEILING: u64 = 8;
-const MAX_CONCURRENT_SPAWNS: u64 = 4;
 const MAX_RESOURCE_URI_BYTES: usize = 8 * 1024;
 const MAX_RESOURCE_READ_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESOURCE_LIST_BYTES: usize = 2 * 1024 * 1024;
@@ -664,6 +673,346 @@ type ProductionResolverTable =
 struct ProductionControlBindings {
 	factory:   Arc<HostControlAuthorityFactory>,
 	resources: Arc<std::sync::OnceLock<Arc<ProductionResolverTable>>>,
+	callbacks: Arc<super::exthost::dispatch::CallbackDispatcherSlot>,
+	registry:  Arc<RegistryControlFactory>,
+}
+
+struct WeakExtensionCallbackDispatcher {
+	supervisor: Weak<ExtHostSupervisor>,
+}
+
+#[async_trait::async_trait]
+impl CallbackDispatcher for WeakExtensionCallbackDispatcher {
+	async fn dispatch(
+		&self,
+		target: Arc<ControlConnectionIdentity>,
+		dispatch: ControlDispatch,
+	) -> Result<serde_json::Value, ControlProtocolError> {
+		let supervisor = self.supervisor.upgrade().ok_or_else(|| {
+			ControlProtocolError::new(
+				"CallbackUnavailable",
+				"extension callback supervisor is no longer active",
+			)
+		})?;
+		CallbackDispatcher::dispatch(supervisor.as_ref(), target, dispatch).await
+	}
+}
+
+#[derive(Clone, Copy)]
+enum DeclaredExternalDomain {
+	Policy,
+	Parameters,
+	Workers,
+	DirectFilesystem,
+	Credentials,
+	Prompts,
+	Ui,
+	Telemetry,
+	Verdicts,
+	Provider,
+	Campaigns,
+	Services,
+}
+
+impl DeclaredExternalDomain {
+	fn declared(self, manifest: &super::exthost::ExtensionManifest) -> bool {
+		let declarations = manifest.static_declarations();
+		match self {
+			Self::Policy => manifest
+				.static_declarations()
+				.capability_grants
+				.keys()
+				.any(|capability| {
+					capability.as_str().starts_with("policy") || capability.as_str().starts_with("approvals")
+				}),
+			Self::Parameters => manifest.declarations.tools().next().is_some(),
+			Self::Workers => {
+				!declarations.workers.is_empty() || !declarations.placement.is_empty()
+			},
+			Self::DirectFilesystem => manifest
+				.declarations
+				.permits(super::exthost::lifecycle::EscapeCapability::DirectFilesystem),
+			Self::Credentials => {
+				!declarations.credentials.is_empty() || !declarations.secrets.is_empty()
+			},
+			Self::Prompts => !declarations.prompt_slots.is_empty(),
+			Self::Ui => {
+				!declarations.ui.commands.is_empty()
+					|| !declarations.ui.shortcuts.is_empty()
+					|| !declarations.ui.message_renderers.is_empty()
+					|| !declarations.ui.completions.is_empty()
+			},
+			Self::Telemetry => {
+				!declarations.telemetry.subscriptions.is_empty()
+					|| !declarations.telemetry.exports.is_empty()
+			},
+			Self::Verdicts => !declarations.ui.verdict_renderers.is_empty(),
+			Self::Provider => !declarations.providers.is_empty(),
+			Self::Campaigns => !declarations.campaigns.is_empty(),
+			Self::Services => {
+				manifest.services.provides().next().is_some()
+					|| manifest.services.requires().next().is_some()
+			},
+		}
+	}
+
+	const fn name(self) -> &'static str {
+		match self {
+			Self::Policy => "policy",
+			Self::Parameters => "parameters",
+			Self::Workers => "workers",
+			Self::DirectFilesystem => "direct-filesystem",
+			Self::Credentials => "credentials",
+			Self::Prompts => "prompts",
+			Self::Ui => "ui",
+			Self::Telemetry => "telemetry",
+			Self::Verdicts => "verdicts",
+			Self::Provider => "provider",
+			Self::Campaigns => "campaigns",
+			Self::Services => "services",
+		}
+	}
+	fn factory(
+		self,
+		factories: &super::worker::ExternalDomainControlFactories,
+	) -> Option<Arc<dyn ControlAuthorityFactory>> {
+		match self {
+			Self::Policy => factories.policy.clone(),
+			Self::Parameters => factories.parameters.clone(),
+			Self::Workers => factories.workers.clone(),
+			Self::DirectFilesystem => factories.direct_filesystem.clone(),
+			Self::Credentials => factories.credentials.clone(),
+			Self::Prompts => factories.prompts.clone(),
+			Self::Ui => factories.ui.clone(),
+			Self::Telemetry => factories.telemetry.clone(),
+			Self::Verdicts => factories.verdicts.clone(),
+			Self::Provider => factories.provider.clone(),
+			Self::Campaigns => factories.campaigns.clone(),
+			Self::Services => factories.services.clone(),
+		}
+	}
+}
+
+struct ManifestGatedControlFactory {
+	domain:    DeclaredExternalDomain,
+	manifests: Arc<BTreeMap<(Str, Str, Str), super::exthost::ExtensionManifest>>,
+	slot:      Arc<super::worker::DomainControlSlot>,
+}
+
+impl ControlAuthorityFactory for ManifestGatedControlFactory {
+	fn bind(
+		&self,
+		identity: Arc<ControlConnectionIdentity>,
+	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
+		let manifest = self
+			.manifests
+			.get(&(identity.layer.clone(), identity.tier.clone(), identity.extension.clone()))
+			.ok_or_else(|| {
+				ControlCompositionError::unavailable(
+					self.domain.name(),
+					"authenticated extension has no deployment manifest",
+				)
+			})?;
+		if !self.domain.declared(manifest) {
+			return Ok(Arc::new(UndeclaredControlAuthority));
+		}
+		Ok(Arc::new(LateBoundControlAuthority {
+			domain: self.domain,
+			identity,
+			slot: Arc::clone(&self.slot),
+			bound: parking_lot::Mutex::new(None),
+		}))
+	}
+}
+
+struct LateBoundControlAuthority {
+	domain:   DeclaredExternalDomain,
+	identity: Arc<ControlConnectionIdentity>,
+	slot:     Arc<super::worker::DomainControlSlot>,
+	bound:    parking_lot::Mutex<Option<(u64, Arc<dyn ControlAuthority>)>>,
+}
+
+impl LateBoundControlAuthority {
+	fn owner(&self) -> Result<(u64, Arc<dyn ControlAuthority>), ControlProtocolError> {
+		let (id, factories) = self.slot.snapshot().ok_or_else(|| {
+			ControlProtocolError::new(
+				"AccessDenied",
+				sf!("no active {} CONTROL lease authorizes this session", self.domain.name()),
+			)
+		})?;
+		if let Some((bound_id, owner)) = self.bound.lock().as_ref() {
+			if *bound_id == id {
+				return Ok((id, Arc::clone(owner)));
+			}
+			return Err(ControlProtocolError::new(
+				"StaleGeneration",
+				"the driver/app CONTROL lease replaced this connection's authority",
+			));
+		}
+		let factory = self.domain.factory(&factories).ok_or_else(|| {
+			ControlProtocolError::new(
+				"AccessDenied",
+				sf!("the active CONTROL lease does not grant {}", self.domain.name()),
+			)
+		})?;
+		let owner = factory.bind(Arc::clone(&self.identity)).map_err(|error| {
+			ControlProtocolError::new("AuthorityBindingFailed", Str::from(error.to_string()))
+		})?;
+		if !self.slot.is_live(id) {
+			return Err(ControlProtocolError::new(
+				"StaleGeneration",
+				"the driver/app CONTROL lease changed while binding",
+			));
+		}
+		*self.bound.lock() = Some((id, Arc::clone(&owner)));
+		Ok((id, owner))
+	}
+}
+
+#[async_trait::async_trait]
+impl ControlAuthority for LateBoundControlAuthority {
+	fn handles(&self, _operation: &str) -> bool {
+		true
+	}
+
+	fn authorize(
+		&self,
+		context: &ControlRequestContext,
+		operation: &str,
+		arguments: &serde_json::Map<String, serde_json::Value>,
+	) -> Result<(), ControlProtocolError> {
+		let (_, owner) = self.owner()?;
+		owner.authorize(context, operation, arguments)
+	}
+
+	async fn request(
+		&self,
+		context: ControlRequestContext,
+		operation: Str,
+		arguments: serde_json::Map<String, serde_json::Value>,
+	) -> Result<serde_json::Value, ControlProtocolError> {
+		let (id, owner) = self.owner()?;
+		let result = owner.request(context, operation, arguments).await;
+		if !self.slot.is_live(id) {
+			return Err(ControlProtocolError::new(
+				"StaleGeneration",
+				"the driver/app CONTROL lease changed during the request",
+			));
+		}
+		result
+	}
+
+	async fn effect(
+		&self,
+		context: ControlRequestContext,
+		effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
+		let (id, owner) = self.owner()?;
+		let result = owner.effect(context, effect).await;
+		if !self.slot.is_live(id) {
+			return Err(ControlProtocolError::new(
+				"StaleGeneration",
+				"the driver/app CONTROL lease changed during the effect",
+			));
+		}
+		result
+	}
+}
+
+struct CompositeControlFactory {
+	owners: Box<[Arc<dyn ControlAuthorityFactory>]>,
+}
+
+impl ControlAuthorityFactory for CompositeControlFactory {
+	fn bind(
+		&self,
+		identity: Arc<ControlConnectionIdentity>,
+	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
+		let mut owners = Vec::with_capacity(self.owners.len());
+		for owner in &self.owners {
+			owners.push(owner.bind(Arc::clone(&identity))?);
+		}
+		let effects = Arc::new(UndeclaredControlAuthority);
+		Ok(Arc::new(
+			super::exthost::control::CompositeControlAuthority::new(owners, effects),
+		))
+	}
+}
+
+struct UndeclaredControlAuthority;
+
+#[async_trait::async_trait]
+impl ControlAuthority for UndeclaredControlAuthority {
+	fn handles(&self, _operation: &str) -> bool {
+		false
+	}
+
+	fn authorize(
+		&self,
+		_context: &ControlRequestContext,
+		_operation: &str,
+		_arguments: &serde_json::Map<String, serde_json::Value>,
+	) -> Result<(), ControlProtocolError> {
+		Err(ControlProtocolError::new(
+			"UndeclaredOperation",
+			"the extension manifest does not declare this CONTROL domain",
+		))
+	}
+
+	async fn request(
+		&self,
+		_context: ControlRequestContext,
+		_operation: Str,
+		_arguments: serde_json::Map<String, serde_json::Value>,
+	) -> Result<serde_json::Value, ControlProtocolError> {
+		Err(ControlProtocolError::new(
+			"UndeclaredOperation",
+			"the extension manifest does not declare this CONTROL domain",
+		))
+	}
+
+	async fn effect(
+		&self,
+		_context: ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
+		Err(ControlProtocolError::new(
+			"UndeclaredOperation",
+			"the extension manifest does not declare this CONTROL domain",
+		))
+	}
+}
+
+#[derive(Default)]
+struct ProductionDeviceCatalogObserver;
+
+impl DeviceCatalogObserver for ProductionDeviceCatalogObserver {
+	fn catalog_changed(&self, epoch: u64, catalog: Arc<[DynamicDeviceCatalogEntry]>) {
+		tracing::debug!(epoch, entries = catalog.len(), "dynamic device catalog changed");
+	}
+}
+
+struct ProductionDeviceInvocationAdmission;
+
+#[async_trait::async_trait]
+impl DeviceInvocationAdmission for ProductionDeviceInvocationAdmission {
+	async fn admit(
+		&self,
+		caller: &ControlRequestContext,
+		target: &DynamicDeviceCatalogEntry,
+		_arguments: &serde_json::Map<String, serde_json::Value>,
+	) -> Result<(), ControlProtocolError> {
+		if caller.connection.extension == target.claimant
+			|| caller.connection.capabilities.contains("devices.invoke")
+		{
+			Ok(())
+		} else {
+			Err(ControlProtocolError::new(
+				"AccessDenied",
+				"cross-extension device invocation requires devices.invoke",
+			))
+		}
+	}
 }
 
 struct ProductionEnvdControlFactory {
@@ -673,6 +1022,7 @@ struct ProductionEnvdControlFactory {
 	intents:    Arc<parking_lot::Mutex<BTreeMap<(Str, Str, Str, Str), serde_json::Value>>>,
 	manifests:  Arc<BTreeMap<(Str, Str, Str), super::exthost::ExtensionManifest>>,
 	registries: Arc<parking_lot::Mutex<BTreeMap<(Str, Str, Str), serde_json::Value>>>,
+	registry:   Arc<RegistryControlFactory>,
 	resources:  Arc<std::sync::OnceLock<Arc<ProductionResolverTable>>>,
 }
 
@@ -693,6 +1043,7 @@ impl ControlAuthorityFactory for ProductionEnvdControlFactory {
 			intents: Arc::clone(&self.intents),
 			manifest,
 			registries: Arc::clone(&self.registries),
+			registry: Arc::clone(&self.registry),
 			resources: Arc::clone(&self.resources),
 		}))
 	}
@@ -706,6 +1057,7 @@ struct ProductionEnvdControlAuthority {
 	intents:    Arc<parking_lot::Mutex<BTreeMap<(Str, Str, Str, Str), serde_json::Value>>>,
 	manifest:   Option<super::exthost::ExtensionManifest>,
 	registries: Arc<parking_lot::Mutex<BTreeMap<(Str, Str, Str), serde_json::Value>>>,
+	registry:   Arc<RegistryControlFactory>,
 	resources:  Arc<std::sync::OnceLock<Arc<ProductionResolverTable>>>,
 }
 
@@ -720,22 +1072,12 @@ impl ProductionEnvdControlAuthority {
 			))
 		}
 	}
-
-	fn unavailable(operation: &str) -> ControlProtocolError {
-		ControlProtocolError::new(
-			"ControlOwnerUnavailable",
-			sf!("the production Environment has no active owner for {operation}"),
-		)
-		.retryable(true)
-	}
 }
 
 #[async_trait::async_trait]
 impl ControlAuthority for ProductionEnvdControlAuthority {
 	fn handles(&self, operation: &str) -> bool {
-		operation.starts_with("omp.")
-			&& !operation.starts_with("omp.agents.")
-			&& !operation.starts_with("omp.mcp.")
+		matches!(operation, "omp.state_dir" | "omp.urls.read")
 	}
 
 	fn authorize(
@@ -801,7 +1143,10 @@ impl ControlAuthority for ProductionEnvdControlAuthority {
 					"$bytes": omp_core::base64::encode(read.as_ref())
 				}))
 			},
-			operation => Err(Self::unavailable(operation)),
+			operation => Err(ControlProtocolError::new(
+				"InvalidOperation",
+				sf!("auxiliary CONTROL owner does not handle {operation}"),
+			)),
 		}
 	}
 
@@ -1037,6 +1382,7 @@ impl ControlAuthority for ProductionEnvdControlAuthority {
 						"frozen extension tools differ from the admitted manifest",
 					));
 				}
+				self.registry.publish(&context, &payload)?;
 				self.registries.lock().insert(
 					(
 						self.identity.layer.clone(),
@@ -1047,7 +1393,10 @@ impl ControlAuthority for ProductionEnvdControlAuthority {
 				);
 				Ok(())
 			},
-			ControlEffect::Ui(_) => Err(Self::unavailable("UI effect")),
+			ControlEffect::Ui(_) => Err(ControlProtocolError::new(
+				"InvalidEffect",
+				"auxiliary CONTROL owner accepts only logs and internal observations",
+			)),
 		}
 	}
 }
@@ -1241,33 +1590,62 @@ fn production_control_authorities(
 	mcp: &Arc<McpService>,
 	extensions: &[ExtHostSpec],
 	journal_external: &ExternalJournalActor,
+	domain_control: Arc<super::worker::DomainControlSlot>,
 ) -> ProductionControlBindings {
 	let resources = Arc::new(std::sync::OnceLock::new());
-	let envd: Arc<dyn ControlAuthorityFactory> = Arc::new(ProductionEnvdControlFactory {
-		state_dir:  state_dir.to_path_buf(),
-		session_id: session_id.clone(),
-		telemetry:  Arc::clone(telemetry),
-		intents:    Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
-		manifests:  Arc::new(
-			extensions
-				.iter()
-				.map(|extension| {
+	let manifests = Arc::new(
+		extensions
+			.iter()
+			.map(|extension| {
+				(
 					(
-						(
-							extension.key.layer().clone(),
-							extension.key.tier().clone(),
-							extension.key.extension().clone(),
-						),
-						extension.manifest.clone(),
-					)
-				})
-				.collect(),
-		),
+						extension.key.layer().clone(),
+						extension.key.tier().clone(),
+						extension.key.extension().clone(),
+					),
+					extension.manifest.clone(),
+				)
+			})
+			.collect::<BTreeMap<_, _>>(),
+	);
+	let registry_owner = RegistryControlFactory::new(manifests.as_ref().clone());
+	let callbacks = CallbackDispatcherSlot::new();
+	let devices: Arc<dyn ControlAuthorityFactory> = DeviceControlFactory::new(
+		Arc::clone(&registry_owner),
+		callbacks.clone(),
+		Arc::new(ProductionDeviceCatalogObserver),
+		Arc::new(ProductionDeviceInvocationAdmission),
+	);
+	let hook_policies = extensions
+		.iter()
+		.flat_map(|extension| extension.manifest.declarations.hooks())
+		.map(|hook| {
+			(
+				hook.event.clone(),
+				HookEventPolicy {
+					revision: 1,
+					timeout: Duration::from_secs(30),
+					on_failure: HookFailurePolicy::Defer,
+					default: serde_json::Value::Null,
+					composition: BTreeMap::new(),
+				},
+			)
+		})
+		.collect();
+	let hooks: Arc<dyn ControlAuthorityFactory> =
+		HookControlFactory::new(Arc::clone(&registry_owner), callbacks.clone(), hook_policies);
+	let registry_factory: Arc<dyn ControlAuthorityFactory> = registry_owner.clone();
+	let envd: Arc<dyn ControlAuthorityFactory> = Arc::new(ProductionEnvdControlFactory {
+		state_dir: state_dir.to_path_buf(),
+		session_id: session_id.clone(),
+		telemetry: Arc::clone(telemetry),
+		intents: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+		manifests: Arc::clone(&manifests),
 		registries: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
-		resources:  Arc::clone(&resources),
+		registry: Arc::clone(&registry_owner),
+		resources: Arc::clone(&resources),
 	});
-	let registry =
-		RegistryControlAuthorities::new(Arc::clone(&envd), Arc::clone(&envd), Arc::clone(&envd));
+	let registry = RegistryControlAuthorities::new(registry_factory, devices, hooks);
 	let provenances = Arc::new(
 		extensions
 			.iter()
@@ -1286,26 +1664,46 @@ fn production_control_authorities(
 	let persistent: Arc<dyn ControlAuthorityFactory> = Arc::new(
 		super::journal_runtime::PersistenceControlFactory::new(journal_external.clone(), provenances),
 	);
+	let gated = |domain| -> Arc<dyn ControlAuthorityFactory> {
+		Arc::new(ManifestGatedControlFactory {
+			domain,
+			manifests: Arc::clone(&manifests),
+			slot: Arc::clone(&domain_control),
+		})
+	};
+	let policy_owner = gated(DeclaredExternalDomain::Policy);
+	let parameters = gated(DeclaredExternalDomain::Parameters);
+	let workers = gated(DeclaredExternalDomain::Workers);
+	let direct_filesystem = gated(DeclaredExternalDomain::DirectFilesystem);
+	let credentials = gated(DeclaredExternalDomain::Credentials);
+	let prompts = gated(DeclaredExternalDomain::Prompts);
+	let ui = gated(DeclaredExternalDomain::Ui);
+	let telemetry_owner = gated(DeclaredExternalDomain::Telemetry);
+	let verdicts = gated(DeclaredExternalDomain::Verdicts);
+	let provider_owner = gated(DeclaredExternalDomain::Provider);
+	let campaigns = gated(DeclaredExternalDomain::Campaigns);
+	let services = gated(DeclaredExternalDomain::Services);
+	let auxiliary: Arc<dyn ControlAuthorityFactory> = Arc::new(CompositeControlFactory {
+		owners: vec![Arc::clone(&envd), parameters, workers, direct_filesystem].into_boxed_slice(),
+	});
 	let persistence = PersistenceControlAuthorities::new(
 		Arc::clone(&persistent),
 		Arc::clone(&persistent),
 		Arc::clone(&persistent),
 		Arc::clone(&persistent),
 		persistent,
-		Arc::clone(&envd),
+		credentials,
 	);
-	let policy = PolicyControlAuthorities::new(Arc::clone(&envd), Arc::clone(&envd));
-	let presentation =
-		PresentationControlAuthorities::new(Arc::clone(&envd), Arc::clone(&envd), Arc::clone(&envd));
-	let provider =
-		ProviderControlAuthorities::new(Arc::clone(&envd), Arc::clone(&envd), Arc::clone(&envd));
+	let policy = PolicyControlAuthorities::new(policy_owner, prompts);
+	let presentation = PresentationControlAuthorities::new(ui, telemetry_owner, verdicts);
+	let provider = ProviderControlAuthorities::new(provider_owner, campaigns, services);
 	let envd = EnvdControlAuthorities::new(
 		registry,
 		persistence,
 		policy,
 		presentation,
 		provider,
-		Arc::clone(&envd),
+		auxiliary,
 		envd,
 	);
 	let external = ExternalControlAuthorities::new(
@@ -1315,6 +1713,8 @@ fn production_control_authorities(
 	ProductionControlBindings {
 		factory: Arc::new(HostControlAuthorityFactory::new(envd, external)),
 		resources,
+		callbacks,
+		registry: registry_owner,
 	}
 }
 
@@ -1705,7 +2105,7 @@ impl EnvServer {
 			previews,
 			sessions_index,
 			journal_external,
-			workers: Arc::new(WorkerSupervisor::new(WORKER_LAYER_CEILING, MAX_CONCURRENT_SPAWNS)),
+			workers: Arc::new(WorkerSupervisor::new(DEFAULT_WORKER_LAYER_CEILING, DEFAULT_MAX_CONCURRENT_SPAWNS)),
 			authority,
 			repository_revision: AtomicU64::new(0),
 			process_store: super::process_store::ProcessStore::new(
@@ -1800,9 +2200,14 @@ impl EnvServer {
 			&mcp,
 			&ext_host_config.extensions,
 			&journal_external,
+			ext_host_config.domain_control_factories(),
 		);
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
+		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
+		control_bindings.callbacks.bind(Arc::new(WeakExtensionCallbackDispatcher {
+			supervisor: Arc::downgrade(&ext_hosts),
+		}));
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
@@ -1974,9 +2379,14 @@ impl EnvServer {
 			&mcp,
 			&ext_host_config.extensions,
 			&journal_external,
+			ext_host_config.domain_control_factories(),
 		);
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
+		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
+		control_bindings.callbacks.bind(Arc::new(WeakExtensionCallbackDispatcher {
+			supervisor: Arc::downgrade(&ext_hosts),
+		}));
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
@@ -2160,6 +2570,31 @@ impl EnvServer {
 	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
 		self.ext_hosts.control_authority(identity)
 	}
+	/// Returns the generation-fenced callback transport shared by provider,
+	/// campaign, presentation, and verdict backends.
+	pub fn extension_callback_dispatcher(
+		&self,
+	) -> Arc<dyn super::exthost::dispatch::CallbackDispatcher> {
+		Arc::new(WeakExtensionCallbackDispatcher {
+			supervisor: Arc::downgrade(&self.ext_hosts),
+		})
+	}
+	/// Returns the sealed deployment manifest for an exact live CONTROL
+	/// connection generation.
+	pub fn extension_control_manifest(
+		&self,
+		identity: &ControlConnectionIdentity,
+	) -> Option<super::exthost::ExtensionManifest> {
+		self.ext_hosts.control_manifest(identity)
+	}
+	/// Returns the full frozen runtime provider/campaign declaration projection
+	/// for an exact authenticated connection generation.
+	pub fn extension_registry_evidence(
+		&self,
+		identity: &ControlConnectionIdentity,
+	) -> Option<Arc<super::worker::SealedRegistryEvidence>> {
+		self.ext_hosts.sealed_registry_evidence(identity)
+	}
 
 	/// Constructs one generation-fenced MCP CONTROL resolver for a host
 	/// connection.
@@ -2245,6 +2680,25 @@ impl EnvServer {
 	) -> crate::worker::AgentsControlAuthorityBinding {
 		self.ext_hosts.bind_agents_control_authority(factory)
 	}
+	/// Atomically installs and generation-fences the driver/app CONTROL domain
+	/// bundle. Dropping the returned lease revokes only this exact binding.
+	pub fn bind_domain_control_factories(
+		&self,
+		mut factories: super::worker::ExternalDomainControlFactories,
+	) -> super::worker::ExternalDomainControlBinding {
+		factories.services = Some(self.ext_hosts.service_control_factory());
+		self.ext_hosts.bind_domain_control_factories(factories)
+	}
+	/// Atomically installs Agents and all driver/app CONTROL owners under one
+	/// replacement/revocation lease.
+	pub fn bind_external_control_authorities(
+		&self,
+		agents: Arc<dyn ControlAuthorityFactory>,
+		mut domains: super::worker::ExternalDomainControlFactories,
+	) -> super::worker::ExternalControlAuthorityBinding {
+		domains.services = Some(self.ext_hosts.service_control_factory());
+		self.ext_hosts.bind_external_control_authorities(agents, domains)
+	}
 
 	/// Binds the active Agent Journal mailbox to authenticated extension
 	/// CONTROL until the returned lease is dropped.
@@ -2278,6 +2732,14 @@ impl EnvServer {
 			.previews
 			.bind_observer(super::staged_preview::observer(sender));
 		Ok(AgentControlBinding { server: Arc::clone(self), id })
+	}
+	/// Installs the project-lifetime owner for durable scheduled Agent
+	/// delivery. The backend is retained by envd independently of any chat UI.
+	pub(crate) async fn bind_schedule_delivery(
+		&self,
+		backend: Arc<dyn super::schedules::ScheduleDeliveryBackend>,
+	) -> Result<(), EnvdError> {
+		self.journal_external.bind_schedule_delivery(backend).await
 	}
 
 	fn release_agent_control(&self, id: u64) {
@@ -9193,9 +9655,17 @@ mod tests {
 		.await
 		.expect("empty extension supervisor");
 		let memory_runtime =
-			start_memory_runtime(state.path(), workspace.root(), &sf!("test-session"), &exec)
+			start_memory_runtime(&HostSettings::default(), state.path(), workspace.root(), &sf!("test-session"), &exec)
 				.await
 				.expect("memory runtime");
+		let mcp = McpService::open(state.path().join("mcp-cache.sqlite3")).expect("MCP service");
+		let mcp_manager = McpManager::new(
+			Arc::clone(&mcp),
+			Arc::new(ProductionConnector::new(workspace.root().to_path_buf())),
+			Arc::from([hello.root_uri.clone()]),
+			state.path().join("mcp-local"),
+		);
+		mcp.bind_manager(&mcp_manager);
 		let server = Arc::new(EnvServer::new(
 			ServerIdentity {
 				workspace_id:   hello.workspace_id,
@@ -9209,7 +9679,8 @@ mod tests {
 			exec,
 			AcpExecSlot::default(),
 			workspace.clone(),
-			McpService::open(state.path().join("mcp-cache.sqlite3")).expect("MCP service"),
+			mcp,
+			mcp_manager,
 			Arc::new(omp_tools::read::resolver::ResolverTable::default()),
 			memory_runtime,
 			super::super::lsp_settings::LspSettings::default(),
@@ -9222,7 +9693,7 @@ mod tests {
 			workspace_ops,
 			Arc::new(ext_hosts),
 			Arc::new(SessionBridgeHost::new()),
-			Arc::new(super::memory::ReflectionBridgeHost::new()),
+			Arc::new(crate::memory::ReflectionBridgeHost::new()),
 			omp_tools::eval::EvalSessionControl::default(),
 			Arc::new(crate::search_backend::SearchBridgeHost::new(None)),
 			Arc::new(crate::github_url::GithubCredentialBridge::new()),
@@ -9803,40 +10274,33 @@ mod tests {
 		.await
 		.expect("stale socket file did not become free");
 	}
-	#[tokio::test(start_paused = true)]
+	#[tokio::test]
 	async fn idle_wait_requires_one_continuous_quiet_window() {
+		let window = Duration::from_millis(30);
 		let (env_tx, env_rx) = tokio::sync::watch::channel(1);
 		let (docs_tx, docs_rx) = tokio::sync::watch::channel(2);
-		let busy = tokio::spawn(wait_idle(env_rx, docs_rx, 1, Duration::from_secs(10)));
-		tokio::task::yield_now().await;
-		tokio::time::advance(Duration::from_secs(20)).await;
-		tokio::task::yield_now().await;
+		let busy = tokio::spawn(wait_idle(env_rx, docs_rx, 1, window));
+		tokio::time::sleep(Duration::from_millis(5)).await;
 		assert!(!busy.is_finished(), "busy environment was considered idle");
 		env_tx.send_replace(0);
-		tokio::time::advance(Duration::from_secs(20)).await;
-		tokio::task::yield_now().await;
+		tokio::time::sleep(Duration::from_millis(5)).await;
 		assert!(!busy.is_finished(), "external document client was considered idle");
 		docs_tx.send_replace(1);
-		tokio::task::yield_now().await;
-		tokio::time::advance(Duration::from_secs(9)).await;
-		tokio::task::yield_now().await;
+		tokio::time::sleep(Duration::from_millis(15)).await;
 		assert!(!busy.is_finished(), "idle wait resolved before its full window");
-		tokio::time::advance(Duration::from_secs(1)).await;
+		tokio::time::sleep(Duration::from_millis(20)).await;
 		busy.await.expect("idle wait task");
 
 		let (env_tx, env_rx) = tokio::sync::watch::channel(0);
 		let (_docs_tx, docs_rx) = tokio::sync::watch::channel(1);
-		let reset = tokio::spawn(wait_idle(env_rx, docs_rx, 1, Duration::from_secs(10)));
-		tokio::task::yield_now().await;
-		tokio::time::advance(Duration::from_secs(9)).await;
+		let reset = tokio::spawn(wait_idle(env_rx, docs_rx, 1, window));
+		tokio::time::sleep(Duration::from_millis(15)).await;
 		env_tx.send_replace(1);
 		tokio::task::yield_now().await;
 		env_tx.send_replace(0);
-		tokio::task::yield_now().await;
-		tokio::time::advance(Duration::from_secs(9)).await;
-		tokio::task::yield_now().await;
+		tokio::time::sleep(Duration::from_millis(20)).await;
 		assert!(!reset.is_finished(), "activity did not reset the idle window");
-		tokio::time::advance(Duration::from_secs(1)).await;
+		tokio::time::sleep(Duration::from_millis(15)).await;
 		reset.await.expect("reset idle wait task");
 	}
 

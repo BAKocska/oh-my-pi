@@ -1246,6 +1246,18 @@ async def dynamic_mount(*specs: CommandMountSpec) -> tuple[str, ...]:
     if any(name in _command_handlers for name in names):
         raise ValueError("dynamic command name collides with a registered command")
 
+    wire_commands = [
+        {
+            "name": spec.name,
+            "aliases": list(spec.aliases),
+            "description": spec.description,
+            "args": _wire(spec.args),
+            "hint": spec.hint,
+            "dynamic_completions": spec.arg_completions is not None,
+        }
+        for spec in specs
+    ]
+
     from .. import _control_backend, _control_request
     from .._errors import NotWiredError
 
@@ -1253,22 +1265,13 @@ async def dynamic_mount(*specs: CommandMountSpec) -> tuple[str, ...]:
         raise NotWiredError("omp.ui.dynamic_mount")
     mounted = await _control_request(
         "omp.ui.dynamic_mount",
-        commands=[
-            {
-                "name": spec.name,
-                "aliases": list(spec.aliases),
-                "description": spec.description,
-                "args": _wire(spec.args),
-                "hint": spec.hint,
-                "dynamic_completions": spec.arg_completions is not None,
-            }
-            for spec in specs
-        ],
+        commands=wire_commands,
     )
     if (
         not isinstance(mounted, (tuple, list))
         or len(mounted) != len(specs)
         or any(not isinstance(name, str) for name in mounted)
+        or tuple(mounted) != names
     ):
         raise TypeError("omp.ui.dynamic_mount returned invalid command names")
     for spec in specs:

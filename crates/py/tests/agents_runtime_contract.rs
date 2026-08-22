@@ -63,6 +63,13 @@ class RecordingControl:
             return None
         if operation == "omp.agents.result":
             return None
+        if operation == "omp.agents.wait":
+            return {"run_id": "run-1", "session_id": "child-session", "name": "Scout",
+                    "status": "completed", "text": "done", "data": None, "fault": None,
+                    "usage": USAGE, "subtree_usage": USAGE, "turns": 2,
+                    "model": "test/model", "model_fallback": False, "warnings": [],
+                    "output_url": "agent://child", "transcript_url": "history://child",
+                    "worktree": None}
         if operation == "omp.agents.continuations":
             return {"consecutive": 1, "total": 2, "cap": 8, "last_ms": 3,
                     "refusals": 0, "owner": "ext"}
@@ -79,6 +86,8 @@ class RecordingControl:
                      "last_activity_ms": 9, "usage": USAGE, "output_url": "agent://child",
                      "transcript_url": "history://child"}]
         if operation == "omp.agents.send":
+            if arguments["to"] == "Timeout":
+                return None
             return {"id": "m1", "from": "Main", "to": arguments["to"],
                     "text": "reply", "mode": "aside", "reply_to": "q1",
                     "sent_ms": 4, "session_id": "s1"} if arguments["await_reply"] else "delivered"
@@ -107,6 +116,17 @@ class RecordingControl:
                     "undo_snapshot_id": "undo", "dry_run": arguments["dry_run"]}
         if operation == "omp.agents.schedule":
             return {"id": "schedule-1", "name": arguments["name"]}
+        if operation == "omp.agents.schedule.info":
+            return {"id": "schedule-1", "name": "Heartbeat",
+                    "trigger": {"kind": "every", "interval_ms": 30000,
+                                "jitter_ms": 0, "align": False},
+                    "delivery": {"kind": "inject", "prompt": "wake",
+                                 "mode": "next_turn", "visible": False},
+                    "scope": "session", "enabled": True, "owner": "ext",
+                    "principal": "user", "artifact_digest": "sha256:test",
+                    "upgrade": "pinned", "missed": "coalesce", "budget": None,
+                    "overlap": "skip", "created_ms": 1, "next_ms": 30001,
+                    "last_ms": None, "fire_count": 0, "miss_count": 0}
         if operation == "omp.agents.schedules":
             return []
         if operation == "omp.agents.unschedule":
@@ -127,6 +147,20 @@ async def contract():
     op, args = backend.calls[-1]
     assert op == "omp.agents.completion" and args["deadline_ms"] == 2000
     assert "default" not in args
+    await omp.agents.completion(
+        (
+            omp.Part.text("inspect"),
+            omp.Part.blob(omp.BlobRef(bytes.fromhex("11" * 32), 7), alt="image"),
+        ),
+        role="vision",
+    )
+    op, args = backend.calls[-1]
+    assert op == "omp.agents.completion"
+    assert args["prompt"][1] == {
+        "kind": "blob",
+        "blob": {"hash": "11" * 32, "size": 7},
+        "alt": "image",
+    }
 
     spec = omp.agents.SubagentSpec(
         task="inspect", name="Scout", max_depth=0,
@@ -143,7 +177,11 @@ async def contract():
     assert (await handle.progress()).activity == "reading"
     assert await handle.steer("continue") is omp.agents.Receipt.DELIVERED
     assert await handle.result() is None
+    await handle.cancel(reason="contract")
+    assert (await handle.wait()).text == "done"
     await handle.release()
+    assert (await omp.agents.get("Scout")).name == "Scout"
+    assert (await omp.agents.revive("agent://child")).run_id == "run-1"
 
     handles = await omp.agents.spawn_all((spec, spec))
     assert len(handles) == 2 and handles[1].run_id == "run-1"
@@ -157,6 +195,12 @@ async def contract():
     assert await omp.agents.send("Scout", "hello") is omp.agents.Receipt.DELIVERED
     reply = await omp.agents.send("Scout", "question", await_reply=True)
     assert reply.text == "reply" and reply.reply_to == "q1"
+    try:
+        await omp.agents.send("Timeout", "question", await_reply=True)
+    except asyncio.TimeoutError:
+        pass
+    else:
+        raise AssertionError("awaited send must surface a missing reply as TimeoutError")
     assert (await omp.agents.broadcast("hello"))["Scout"] is omp.agents.Receipt.WOKEN
     assert await omp.agents.inbox() == [] and await omp.agents.wait_for() is None
     assert (await omp.agents.peers())[0].name == "Scout"
@@ -181,6 +225,7 @@ async def contract():
     await schedule.pause()
     await schedule.resume()
     assert await schedule.fire_now() is omp.agents.Receipt.DELIVERED
+    assert (await schedule.info()).enabled
     assert await schedule.history() == []
     await schedule.delete()
     assert await omp.agents.schedules() == []

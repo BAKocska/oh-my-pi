@@ -44,24 +44,24 @@ pub trait AcpExecBackend: Send + Sync {
 }
 
 /// One ACP terminal request after shell session option resolution.
-pub(crate) struct AcpExecRequest {
+pub struct AcpExecRequest {
 	/// Shell command line to execute.
-	pub(crate) command:    Str,
+	pub command:    Str,
 	/// Resolved local working-directory path, when one was requested.
-	pub(crate) cwd:        Option<Str>,
+	pub cwd:        Option<Str>,
 	/// Resolved environment additions for the command.
-	pub(crate) env:        BTreeMap<Str, Str>,
+	pub env:        BTreeMap<Str, Str>,
 	/// Optional command timeout in milliseconds.
-	pub(crate) timeout_ms: Option<u64>,
+	pub timeout_ms: Option<u64>,
 }
 
 /// ACP terminal event handle consumed through the ordinary shell resource
 /// contract.
-pub(crate) struct AcpExecRun {
+pub struct AcpExecRun {
 	/// Ordered execution events produced by the editor-owned terminal.
-	pub(crate) events: flume::Receiver<Result<RunEvent, Fault>>,
+	pub events: flume::Receiver<Result<RunEvent, Fault>>,
 	/// Cancellation handle for the editor-owned terminal.
-	pub(crate) cancel: tokio_util::sync::CancellationToken,
+	pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Late-bound ACP backend capability shared with one Environment registry.

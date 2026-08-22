@@ -295,7 +295,7 @@ def __omp_timeout_resume__():
 				py,
 				&globals,
 				r#"
-import contextlib, inspect, io
+import inspect, pydoc
 
 __omp_install_prelude_helpers__([
     {
@@ -321,11 +321,9 @@ __omp_install_prelude_helpers__([
 
 assert str(inspect.signature(merge_patches)) == "(patches, *, strategy='sequential')"
 assert merge_patches.__doc__ == "Merge patches using the requested strategy."
-_help = io.StringIO()
-with contextlib.redirect_stdout(_help):
-    help(merge_patches)
-assert "merge_patches(patches, *, strategy='sequential')" in _help.getvalue()
-assert "Merge patches using the requested strategy." in _help.getvalue()
+_help = pydoc.render_doc(merge_patches, renderer=pydoc.plaintext)
+assert "merge_patches(patches, *, strategy='sequential')" in _help
+assert "Merge patches using the requested strategy." in _help
 assert merge_patches(["a"]) == {
     "patches": ["a"],
     "strategy": "sequential",

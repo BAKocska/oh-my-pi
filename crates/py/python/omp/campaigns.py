@@ -241,7 +241,7 @@ class EngageRequest:
  
  
 @dataclass(frozen=True, slots=True)
-class Deny(Verdict):
+class CampaignDeny(Verdict):
     """Veto the current attempt without latching."""
 
     reason: str
@@ -312,7 +312,7 @@ CampaignVerdict: TypeAlias = (
     | Inject
     | Patch
     | Hold
-    | Deny
+    | CampaignDeny
     | Continue
     | Force
     | Cut
@@ -764,7 +764,7 @@ def _verdict_name(verdict: Verdict | Done[Any]) -> str:
         Inject: "inject",
         Patch: "patch",
         Hold: "hold",
-        Deny: "deny",
+        CampaignDeny: "deny",
         Continue: "continue",
         Force: "force",
         Cut: "cut",
@@ -810,7 +810,7 @@ __all__ = (
     "Continue",
     "Cut",    "ActiveCampaign",
 
-    "Deny",
+    "CampaignDeny",
     "Escalate",
     "Exhaust",
     "Exhausted",

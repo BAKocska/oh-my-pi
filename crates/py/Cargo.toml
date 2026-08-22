@@ -12,11 +12,21 @@ description = "Self-contained embedded CPython runtime with frozen standard-libr
 name = "omp-demo"
 path = "src/bin/demo.rs"
 
+[[bin]]
+name = "stubgen"
+path = "src/bin/stubgen.rs"
+required-features = ["inspect"]
+
+[features]
+default = []
+inspect = ["pyo3/experimental-inspect", "dep:pyo3-introspection"]
+
 [lints]
 workspace = true
 
 [dependencies]
-pyo3 = { workspace = true }
+pyo3 = { workspace = true, features = ["multiple-pymethods"] }
+pyo3-introspection = { version = "0.29.2", optional = true }
 omp-core = { workspace = true }
 omp-env = { workspace = true }
 omp-tool = { workspace = true }

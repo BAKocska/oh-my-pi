@@ -13,6 +13,7 @@ from typing import Literal, TypeAlias
 from _omp import (
     AgentUrl,
     ArtifactUrl,
+    BlobRef,
     Duration,
     EnvPath,
     HistoryUrl,
@@ -184,6 +185,8 @@ def _wire(value: object) -> object:
         return value
     if isinstance(value, Duration):
         return _duration_ms(value)
+    if isinstance(value, BlobRef):
+        return {"hash": value.hex, "size": value.size}
     if isinstance(value, StrEnum):
         return value.value
     if isinstance(value, (AgentUrl, ArtifactUrl, EnvPath, HistoryUrl, WorkspaceUri)):
@@ -278,7 +281,7 @@ def _usage(value: object) -> Usage:
         cache_write_tokens=int(row.get("cache_write_tokens", 0)),
         requests=int(row.get("requests", 0)),
         cost_usd=float(row.get("cost_usd", 0.0)),
-        wall=_duration(row.get("wall_ms", row.get("wall", 0))),
+        wall=_duration(row.get("wall_ms", 0)),
     )
 
 
@@ -391,11 +394,11 @@ async def continuations() -> ContinuationLedger:
     """Read the current recursive continuation ledger."""
     row = _mapping(await _request("omp.agents.continuations"), "continuations")
     return ContinuationLedger(
-        consecutive=int(row.get("consecutive", 0)),
-        total=int(row.get("total", 0)),
-        cap=int(row.get("cap", 0)),
-        last_ms=int(row.get("last_ms", 0)),
-        refusals=int(row.get("refusals", 0)),
+        consecutive=int(row["consecutive"]),
+        total=int(row["total"]),
+        cap=int(row["cap"]),
+        last_ms=int(row["last_ms"]),
+        refusals=int(row["refusals"]),
         owner=None if row.get("owner") is None else str(row["owner"]),
     )
 
@@ -419,11 +422,11 @@ async def loop_signal() -> LoopSignal:
     """Read the Core's current conservative loop-stall signal."""
     row = _mapping(await _request("omp.agents.loop_signal"), "loop signal")
     return LoopSignal(
-        repeats=int(row.get("repeats", 0)),
-        digest=str(row.get("digest", "")),
-        no_progress_turns=int(row.get("no_progress_turns", 0)),
-        empty_output_retries=int(row.get("empty_output_retries", 0)),
-        stalled=bool(row.get("stalled", False)),
+        repeats=int(row["repeats"]),
+        digest=str(row["digest"]),
+        no_progress_turns=int(row["no_progress_turns"]),
+        empty_output_retries=int(row["empty_output_retries"]),
+        stalled=bool(row["stalled"]),
     )
 
 
@@ -676,20 +679,20 @@ def _result(value: object) -> SubagentResult:
         session_id=str(row["session_id"]),
         name=str(row["name"]),
         status=RunStatus(str(row["status"])),
-        text=str(row.get("text", "")),
-        data=row.get("data"),
-        fault=row.get("fault"),
-        usage=_usage(row.get("usage", {})),
-        subtree_usage=_usage(row.get("subtree_usage", {})),
-        turns=int(row.get("turns", 0)),
-        model=str(row.get("model", "")),
-        model_fallback=bool(row.get("model_fallback", False)),
+        text=str(row["text"]),
+        data=row["data"],
+        fault=row["fault"],
+        usage=_usage(row["usage"]),
+        subtree_usage=_usage(row["subtree_usage"]),
+        turns=int(row["turns"]),
+        model=str(row["model"]),
+        model_fallback=bool(row["model_fallback"]),
         warnings=tuple(
-            str(item) for item in _rows(row.get("warnings", ()), "subagent warnings")
+            str(item) for item in _rows(row["warnings"], "subagent warnings")
         ),
         output_url=AgentUrl(str(row["output_url"])),
         transcript_url=HistoryUrl(str(row["transcript_url"])),
-        worktree=_worktree(row.get("worktree")),
+        worktree=_worktree(row["worktree"]),
     )
 
 
@@ -697,15 +700,15 @@ def _progress(value: object) -> Progress:
     row = _mapping(value, "subagent progress")
     return Progress(
         status=RunStatus(str(row["status"])),
-        turns=int(row.get("turns", 0)),
-        requests=int(row.get("requests", 0)),
-        tool_calls=int(row.get("tool_calls", 0)),
-        context_tokens=int(row.get("context_tokens", 0)),
-        context_window=int(row.get("context_window", 0)),
-        usage=_usage(row.get("usage", {})),
-        activity=str(row.get("activity", "")),
-        model=str(row.get("model", "")),
-        last_activity_ms=int(row.get("last_activity_ms", 0)),
+        turns=int(row["turns"]),
+        requests=int(row["requests"]),
+        tool_calls=int(row["tool_calls"]),
+        context_tokens=int(row["context_tokens"]),
+        context_window=int(row["context_window"]),
+        usage=_usage(row["usage"]),
+        activity=str(row["activity"]),
+        model=str(row["model"]),
+        last_activity_ms=int(row["last_activity_ms"]),
     )
 
 
@@ -760,10 +763,9 @@ class SubagentHandle:
 
     async def status(self) -> RunStatus:
         """Read the child's current lifecycle state."""
-        response = await _request("omp.agents.status", run_id=self.run_id)
-        if isinstance(response, Mapping):
-            response = response.get("status")
-        return RunStatus(str(response))
+        return RunStatus(
+            str(await _request("omp.agents.status", run_id=self.run_id))
+        )
 
     async def progress(self) -> Progress:
         """Read a sanitized progress snapshot."""
@@ -775,12 +777,16 @@ class SubagentHandle:
         """Post a message into the child's mailbox."""
         if not text:
             raise ValueError("steer text must be non-empty")
-        response = await _request(
-            "omp.agents.steer", run_id=self.run_id, text=text, mode=mode.value
+        return Receipt(
+            str(
+                await _request(
+                    "omp.agents.steer",
+                    run_id=self.run_id,
+                    text=text,
+                    mode=mode.value,
+                )
+            )
         )
-        if isinstance(response, Mapping):
-            response = response.get("receipt")
-        return Receipt(str(response))
 
     async def cancel(
         self,
@@ -798,11 +804,20 @@ class SubagentHandle:
 
     async def wait(self, *, timeout: Duration | None = None) -> SubagentResult:
         """Wait for a terminal child result."""
-        response = await _request(
-            "omp.agents.wait",
-            run_id=self.run_id,
-            timeout_ms=_duration_ms(timeout),
-        )
+        try:
+            response = await _request(
+                "omp.agents.wait",
+                run_id=self.run_id,
+                timeout_ms=_duration_ms(timeout),
+            )
+        except Exception as error:
+            if getattr(error, "code", None) in {
+                "deadline_exceeded",
+                "DeadlineExceeded",
+                "TimeoutError",
+            }:
+                raise asyncio.TimeoutError from error
+            raise
         return _result(response)
 
     async def result(self) -> SubagentResult | None:
@@ -826,19 +841,16 @@ class SubagentHandle:
             await self.cancel()
 
 
-def _handle(value: object, fallback_spec: SubagentSpec | None = None) -> SubagentHandle:
+def _handle(value: object) -> SubagentHandle:
     row = _mapping(value, "subagent handle")
-    spec_value = row.get("spec")
-    resolved_spec = fallback_spec if spec_value is None else _spec(spec_value)
-    if resolved_spec is None:
-        raise TypeError("subagent handle response omitted spec")
+    resolved_spec = _spec(row["spec"])
     return SubagentHandle(
         run_id=str(row["run_id"]),
         session_id=str(row["session_id"]),
         name=str(row["name"]),
-        agent=str(row.get("agent", resolved_spec.agent)),
-        depth=int(row.get("depth", 0)),
-        effective_max_depth=int(row.get("effective_max_depth", resolved_spec.max_depth)),
+        agent=str(row["agent"]),
+        depth=int(row["depth"]),
+        effective_max_depth=int(row["effective_max_depth"]),
         spec=resolved_spec,
         worktree_path=None
         if row.get("worktree_path") is None
@@ -852,10 +864,7 @@ async def spawn(spec: SubagentSpec) -> SubagentHandle:
     """Admit and start one child agent."""
     if not isinstance(spec, SubagentSpec):
         raise TypeError("spec must be SubagentSpec")
-    return _handle(
-        await _request("omp.agents.spawn", spec=_spec_wire(spec)),
-        fallback_spec=spec,
-    )
+    return _handle(await _request("omp.agents.spawn", spec=_spec_wire(spec)))
 
 
 async def spawn_all(specs: Sequence[SubagentSpec]) -> _builtins.list[SubagentHandle]:
@@ -874,7 +883,7 @@ async def spawn_all(specs: Sequence[SubagentSpec]) -> _builtins.list[SubagentHan
     )
     if len(response) != len(frozen):
         raise TypeError("spawn_all response cardinality does not match request")
-    return [_handle(row, fallback_spec=spec) for row, spec in zip(response, frozen)]
+    return [_handle(row) for row in response]
 
 
 class AgentKind(StrEnum):
@@ -933,12 +942,12 @@ def _agent_ref(value: object) -> AgentRef:
         name=str(row["name"]),
         kind=AgentKind(str(row["kind"])),
         status=AgentStatus(str(row["status"])),
-        agent=str(row.get("agent", row.get("definition", ""))),
+        agent=str(row["agent"]),
         parent=None if row.get("parent") is None else str(row["parent"]),
-        depth=int(row.get("depth", 0)),
-        activity=str(row.get("activity", "")),
-        last_activity_ms=int(row.get("last_activity_ms", 0)),
-        usage=_usage(row.get("usage", {})),
+        depth=int(row["depth"]),
+        activity=str(row["activity"]),
+        last_activity_ms=int(row["last_activity_ms"]),
+        usage=_usage(row["usage"]),
         output_url=AgentUrl(str(row["output_url"])),
         transcript_url=HistoryUrl(str(row["transcript_url"])),
     )
@@ -961,18 +970,18 @@ async def revive(ref: str) -> SubagentHandle:
 async def limits() -> SpawnLimits:
     """Read current child-spawn ceilings."""
     row = _mapping(await _request("omp.agents.limits"), "spawn limits")
-    current_depth = int(row.get("depth", 0))
+    current_depth = int(row["depth"])
     global depth
     depth = current_depth
     return SpawnLimits(
-        max_depth=int(row.get("max_depth", 0)),
+        max_depth=int(row["max_depth"]),
         depth=current_depth,
-        max_concurrency=int(row.get("max_concurrency", 0)),
-        running=int(row.get("running", 0)),
-        queued=int(row.get("queued", 0)),
-        continuation_cap=int(row.get("continuation_cap", 0)),
-        continuations_used=int(row.get("continuations_used", 0)),
-        spawn_allowed=bool(row.get("spawn_allowed", False)),
+        max_concurrency=int(row["max_concurrency"]),
+        running=int(row["running"]),
+        queued=int(row["queued"]),
+        continuation_cap=int(row["continuation_cap"]),
+        continuations_used=int(row["continuations_used"]),
+        spawn_allowed=bool(row["spawn_allowed"]),
     )
 
 
@@ -996,21 +1005,17 @@ def _message(value: object) -> Message:
     row = _mapping(value, "agent message")
     return Message(
         id=str(row["id"]),
-        from_=str(row.get("from_", row.get("from", ""))),
+        from_=str(row["from"]),
         to=str(row["to"]),
-        text=str(row.get("text", row.get("message", ""))),
-        mode=DeliveryMode(str(row.get("mode", DeliveryMode.ASIDE.value))),
-        reply_to=None
-        if row.get("reply_to", row.get("replyTo")) is None
-        else str(row.get("reply_to", row.get("replyTo"))),
-        sent_ms=int(row.get("sent_ms", row.get("sentMs", 0))),
-        session_id=str(row.get("session_id", row.get("sessionId", ""))),
+        text=str(row["text"]),
+        mode=DeliveryMode(str(row["mode"])),
+        reply_to=None if row.get("reply_to") is None else str(row["reply_to"]),
+        sent_ms=int(row["sent_ms"]),
+        session_id=str(row["session_id"]),
     )
 
 
 def _receipt(value: object) -> Receipt:
-    if isinstance(value, Mapping):
-        value = value.get("receipt", value.get("outcome"))
     return Receipt(str(value))
 
 
@@ -1026,16 +1031,29 @@ async def send(
     """Send a message to an addressable agent."""
     if not to:
         raise ValueError("message recipient must be non-empty")
-    response = await _request(
-        "omp.agents.send",
-        to=to,
-        text=text,
-        mode=mode.value,
-        reply_to=reply_to,
-        await_reply=await_reply,
-        timeout_ms=_duration_ms(timeout),
-    )
-    return _message(response) if await_reply else _receipt(response)
+    try:
+        response = await _request(
+            "omp.agents.send",
+            to=to,
+            text=text,
+            mode=mode.value,
+            reply_to=reply_to,
+            await_reply=await_reply,
+            timeout_ms=_duration_ms(timeout),
+        )
+    except Exception as error:
+        if await_reply and getattr(error, "code", None) in {
+            "deadline_exceeded",
+            "DeadlineExceeded",
+            "TimeoutError",
+        }:
+            raise asyncio.TimeoutError from error
+        raise
+    if await_reply:
+        if response is None:
+            raise asyncio.TimeoutError
+        return _message(response)
+    return _receipt(response)
 
 
 async def broadcast(
@@ -1193,17 +1211,16 @@ def _conflict(value: object) -> Conflict:
 def _restore_report(value: object) -> RestoreReport:
     row = _mapping(value, "restore report")
     return RestoreReport(
-        from_generation=int(row.get("from_generation", 0)),
-        to_generation=int(row.get("to_generation", 0)),
-        written=int(row.get("written", 0)),
-        deleted=int(row.get("deleted", 0)),
-        unchanged=int(row.get("unchanged", 0)),
+        from_generation=int(row["from_generation"]),
+        to_generation=int(row["to_generation"]),
+        written=int(row["written"]),
+        deleted=int(row["deleted"]),
+        unchanged=int(row["unchanged"]),
         conflicts=tuple(
-            _conflict(item)
-            for item in _rows(row.get("conflicts", ()), "restore conflicts")
+            _conflict(item) for item in _rows(row["conflicts"], "restore conflicts")
         ),
         undo_snapshot_id=str(row["undo_snapshot_id"]),
-        dry_run=bool(row.get("dry_run", False)),
+        dry_run=bool(row["dry_run"]),
     )
 
 
@@ -1217,9 +1234,9 @@ def _snapshot(value: object) -> Snapshot:
         root=WorkspaceUri(str(row["root"])),
         parent=None if row.get("parent") is None else str(row["parent"]),
         tree_hash=str(row["tree_hash"]),
-        entry_count=int(row.get("entry_count", 0)),
-        bytes=int(row.get("bytes", 0)),
-        partial=bool(row.get("partial", False)),
+        entry_count=int(row["entry_count"]),
+        bytes=int(row["bytes"]),
+        partial=bool(row["partial"]),
     )
 
 
@@ -1233,8 +1250,8 @@ async def rewind_targets() -> _builtins.list[RewindTarget]:
         RewindTarget(
             event=int(row["event"]),
             keep=None if row.get("keep") is None else int(row["keep"]),
-            text=str(row.get("text", "")),
-            ts_ms=int(row.get("ts_ms", 0)),
+            text=str(row["text"]),
+            ts_ms=int(row["ts_ms"]),
             snapshot_id=None
             if row.get("snapshot_id") is None
             else str(row["snapshot_id"]),
@@ -1263,13 +1280,13 @@ async def rewind(
         "rewind report",
     )
     return RewindReport(
-        head=int(row.get("head", 0)),
-        dropped_items=int(row.get("dropped_items", 0)),
-        scope=RestoreScope(str(row.get("scope", scope.value))),
+        head=int(row["head"]),
+        dropped_items=int(row["dropped_items"]),
+        scope=RestoreScope(str(row["scope"])),
         restore=None
         if row.get("restore") is None
         else _restore_report(row["restore"]),
-        dry_run=bool(row.get("dry_run", dry_run)),
+        dry_run=bool(row["dry_run"]),
     )
 
 
@@ -1517,7 +1534,7 @@ def _schedule_budget(value: object | None) -> ScheduleBudget | None:
         max_usd_per_window=None
         if row.get("max_usd_per_window") is None
         else float(row["max_usd_per_window"]),
-        window=_duration(row.get("window_ms", row.get("window", 2_592_000_000))),
+        window=_duration(row["window_ms"]),
         max_requests_per_firing=None
         if row.get("max_requests_per_firing") is None
         else int(row["max_requests_per_firing"]),
@@ -1532,19 +1549,19 @@ def _schedule(value: object) -> Schedule:
         trigger=_trigger(row["trigger"]),
         delivery=_delivery(row["delivery"]),
         scope=ScheduleScope(str(row["scope"])),
-        enabled=bool(row.get("enabled", False)),
-        owner=str(row.get("owner", "")),
-        principal=str(row.get("principal", "")),
-        artifact_digest=str(row.get("artifact_digest", "")),
-        upgrade=UpgradePolicy(str(row.get("upgrade", UpgradePolicy.PINNED.value))),
-        missed=MissedRunPolicy(str(row.get("missed", MissedRunPolicy.COALESCE.value))),
-        budget=_schedule_budget(row.get("budget")),
-        overlap=str(row.get("overlap", "skip")),
-        created_ms=int(row.get("created_ms", 0)),
+        enabled=bool(row["enabled"]),
+        owner=str(row["owner"]),
+        principal=str(row["principal"]),
+        artifact_digest=str(row["artifact_digest"]),
+        upgrade=UpgradePolicy(str(row["upgrade"])),
+        missed=MissedRunPolicy(str(row["missed"])),
+        budget=_schedule_budget(row["budget"]),
+        overlap=str(row["overlap"]),
+        created_ms=int(row["created_ms"]),
         next_ms=None if row.get("next_ms") is None else int(row["next_ms"]),
         last_ms=None if row.get("last_ms") is None else int(row["last_ms"]),
-        fire_count=int(row.get("fire_count", 0)),
-        miss_count=int(row.get("miss_count", 0)),
+        fire_count=int(row["fire_count"]),
+        miss_count=int(row["miss_count"]),
     )
 
 
@@ -1554,10 +1571,10 @@ def _firing(value: object) -> Firing:
         schedule_id=str(row["schedule_id"]),
         idempotency_key=str(row["idempotency_key"]),
         at_ms=int(row["at_ms"]),
-        late_ms=int(row.get("late_ms", 0)),
+        late_ms=int(row["late_ms"]),
         outcome=str(row["outcome"]),
-        artifact_digest=str(row.get("artifact_digest", "")),
-        principal=str(row.get("principal", "")),
+        artifact_digest=str(row["artifact_digest"]),
+        principal=str(row["principal"]),
         run_id=None if row.get("run_id") is None else str(row["run_id"]),
         detail=None if row.get("detail") is None else str(row["detail"]),
     )

@@ -5,6 +5,7 @@
 //! Children are spawned lazily at a declared surface's first reach.
 
 pub mod cancel;
+pub mod backends;
 pub mod context;
 pub mod control;
 pub mod dispatch;
@@ -64,4 +65,8 @@ pub use spawn::{
 	run_ext_host_entry,
 };
 
-pub use crate::worker::{ControlHostStartError, ExtHostSupervisor, HostKey};
+pub use crate::worker::{
+	ControlHostStartError, ExtHostSupervisor, ExtensionCampaignResolver,
+	ExternalControlAuthorityBinding, ExternalDomainControlBinding, ExternalDomainControlFactories,
+	HostKey,
+};

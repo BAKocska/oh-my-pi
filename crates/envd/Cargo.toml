@@ -92,6 +92,8 @@ omp-ar = { workspace = true }
 flate2 = { workspace = true }
 
 [dev-dependencies]
+http-body-util = { workspace = true }
+hyper-util = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

@@ -40,6 +40,8 @@ async def expect_raises_async(error_type, awaitable):
 
 
 # Importability and public export closure.
+assert "prelude" in omp.__all__
+assert callable(omp.prelude)
 for name in omp.__all__:
     getattr(omp, name)
 for suffix in (
@@ -260,7 +262,10 @@ schema_error = expect_raises(
 )
 assert schema_error.expected == "acme.surface-campaign@2"
 assert schema_error.actual == "acme.surface-campaign@1"
-handoff = omp.Deny("readonly", engage=omp.EngageRequest("surface-campaign"))
+handoff = omp.CampaignDeny("readonly", engage=omp.EngageRequest("surface-campaign"))
+assert omp.Deny is omp.hooks.Deny
+assert omp.CampaignDeny is omp.campaigns.CampaignDeny
+assert omp.Deny is not omp.CampaignDeny
 assert handoff.engage.campaign == "surface-campaign"
 
 
@@ -601,7 +606,7 @@ class FrozenControlHost:
             if action in {"get", "info"}:
                 return self._worker(arguments.get("generation", 1))
         if operation == "omp.ui.dynamic_mount":
-            return tuple(spec.name for spec in arguments["commands"])
+            return tuple(command["name"] for command in arguments["commands"])
         if operation == "omp.ui.overlay_events":
             return [
                 {
@@ -1477,34 +1482,56 @@ class FrozenDataHost:
     def __init__(self):
         self.calls = []
 
-    async def request(self, operation, arguments):
-        self.calls.append((operation, arguments))
-        if operation == "omp.env.worktree":
-            return {
-                "id": "surface-worktree",
-                "root": "workspace",
-                "base": "main",
-                "generation": 7,
-            }
-        if operation in {"omp.env.http.get", "omp.env.http.post", "omp.env.http.put"}:
-            return {
-                "status": 200,
-                "headers": {"content-type": "application/json"},
-                "body": b'{"ok":true}',
-                "final_url": arguments["url"],
-            }
-        if operation == "omp.env.Process.restart":
-            return {"name": "p", "generation": 8, "endpoint": "unix://p-8"}
-        if operation == "omp.env.blobs.get":
-            return b"artifact dat"
+    async def worktree(self):
+        self.calls.append(("worktree",))
+        return omp.env.WorktreeInfo(
+            "surface-worktree", omp.EnvPath("workspace"), "main", 7,
+        )
+
+    async def http_request(self, method, url, **options):
+        self.calls.append(("http_request", method, url, options))
+        return omp.env.HttpResponse(
+            200, {"content-type": "application/json"}, b'{"ok":true}', url,
+        )
+
+    async def process_restart(self, name, generation):
+        self.calls.append(("process_restart", name, generation))
+        return omp.env.StartedProcess("p", 8, "unix://p-8")
+
+    async def process_info(self, name, generation):
+        self.calls.append(("process_info", name, generation))
         return process_info
+
+    def process_output(self, name, generation, after=0):
+        self.calls.append(("process_output", name, generation, after))
+        return ()
+
+    def process_states(self, name, generation):
+        self.calls.append(("process_states", name, generation))
+        return ()
+
+    async def process_send(self, name, generation, data):
+        self.calls.append(("process_send", name, generation, data))
+
+    async def process_send_secret(self, name, generation, secret_name, value):
+        self.calls.append(("process_send_secret", name, generation, secret_name, value))
+
+    async def process_signal(self, name, generation, signal):
+        self.calls.append(("process_signal", name, generation, signal))
+
+    async def process_stop(self, name, generation, **options):
+        self.calls.append(("process_stop", name, generation, options))
+        return process_info
+
+    async def run_stdin(self, run, data):
+        self.calls.append(("run_stdin", run, data))
+
+    async def blobs_get(self, ref, offset=0, length=None):
+        self.calls.append(("blobs_get", ref, offset, length))
+        return b"artifact dat"
 
     def process_endpoint(self, name, generation):
         return f"unix://{name}-{generation}"
-
-    def stream(self, operation, arguments):
-        self.calls.append((operation, arguments))
-        return ()
 
 async def exercise_process_fence(backend):
     restarted = await process.restart()
@@ -1546,21 +1573,13 @@ assert process.endpoint == "unix://p-7"
 worktree = asyncio.run(omp.env.worktree())
 assert worktree.id == "surface-worktree" and worktree.generation == 7
 asyncio.run(exercise_process_fence(data_host))
-process_operations = {
-    operation for operation, _ in data_host.calls
-    if operation.startswith("omp.env.Process.")
-}
+process_operations = {call[0] for call in data_host.calls if call[0].startswith("process_")}
 assert process_operations == {
-    "omp.env.Process.restart", "omp.env.Process.info", "omp.env.Process.output",
-    "omp.env.Process.states", "omp.env.Process.send", "omp.env.Process.send_secret",
-    "omp.env.Process.signal", "omp.env.Process.stop",
+    "process_restart", "process_info", "process_output", "process_states",
+    "process_send", "process_send_secret", "process_signal", "process_stop",
 }
-assert all(
-    arguments["generation"] == 7
-    for operation, arguments in data_host.calls
-    if operation.startswith("omp.env.Process.")
-)
-assert ("omp.env.Run.stdin", {"run": b"run", "data": b"x"}) in data_host.calls
+assert all(call[2] == 7 for call in data_host.calls if call[0] in process_operations)
+assert ("run_stdin", b"run", b"x") in data_host.calls
 
 # Secrets: typed declarations and Core-owned masking use the installed authority.
 assert omp.secrets is not None
@@ -1592,7 +1611,7 @@ path_meta = omp.env.PathMeta(
 assert path_meta.kind is omp.env.FileKind.DIRECTORY
 assert asyncio.run(omp.env.worktree()) == worktree
 
-@omp.entry_kind("acme.surface-entry", rev="1", spill=False)
+@omp.entry_kind("acme.surface-entry", rev="surface.1", spill=False)
 @dataclasses.dataclass(frozen=True, slots=True)
 class SurfaceEntry:
     value: int
@@ -1930,14 +1949,10 @@ http_put = asyncio.run(
     )
 )
 assert (http_get.status, http_post.status, http_put.status) == (200, 200, 200)
-http_calls = [
-    call for call in data_host.calls if call[0].startswith("omp.env.http.")
-]
-assert [operation for operation, _ in http_calls[-3:]] == [
-    "omp.env.http.get", "omp.env.http.post", "omp.env.http.put",
-]
-assert http_calls[-2][1]["body"] == b"{}"
-assert http_calls[-1][1]["timeout"] == omp.Duration("2s")
+http_calls = [call for call in data_host.calls if call[0] == "http_request"]
+assert [call[1] for call in http_calls[-3:]] == ["GET", "POST", "PUT"]
+assert http_calls[-2][3]["body"] == b"{}"
+assert http_calls[-1][3]["timeout"] == omp.Duration("2s")
 
 # Round 5 devices: child declarations, synchronous snapshots, and slot budget.
 @surface_device.subtool("inspect/detail")
@@ -2247,7 +2262,15 @@ assert dynamic_spec.hint == "/foreign-prompt <topic>"
 assert dynamic_spec.arg_completions is complete_dynamic
 assert asyncio.run(omp.ui.dynamic_mount(dynamic_spec)) == ("foreign-prompt",)
 assert frozen_host.calls[-1] == (
-    "omp.ui.dynamic_mount", {"commands": (dynamic_spec,)}
+    "omp.ui.dynamic_mount",
+    {"commands": [{
+        "name": "foreign-prompt",
+        "aliases": ["fp"],
+        "description": "Imported prompt",
+        "args": [{"name": "topic", "description": "Prompt topic", "usage": "<topic>"}],
+        "hint": "/foreign-prompt <topic>",
+        "dynamic_completions": True,
+    }]},
 )
 assert omp.ui._command_handlers["foreign-prompt"] is invoke_dynamic
 
@@ -2520,12 +2543,8 @@ expect_raises(
     ValueError,
     lambda: asyncio.run(omp.env.http_get("https://example.test", redirects=11)),
 )
-assert tuple(field.name for field in dataclasses.fields(omp.env.HttpResponse)) == (
-    "status",
-    "headers",
-    "body",
-    "final_url",
-)
+assert not dataclasses.is_dataclass(omp.env.HttpResponse)
+assert all(hasattr(response, name) for name in ("status", "headers", "body", "final_url"))
 
 # The durable call outcome is a closed, public four-arm union.
 argument_issue = {"path": ("query",), "expected": "a non-empty string"}
@@ -2575,12 +2594,10 @@ assert {
 artifact_bytes = asyncio.run(omp.artifacts.get(artifact_ref))
 assert artifact_bytes == b"artifact dat"
 assert data_host.calls[-1] == (
-    "omp.env.blobs.get",
-    {
-        "ref": omp.BlobRef(bytes.fromhex("11" * 32), 12),
-        "offset": 0,
-        "length": None,
-    },
+    "blobs_get",
+    omp.BlobRef(bytes.fromhex("11" * 32), 12),
+    0,
+    None,
 )
 omp.env._reset_backend(data_tokens)
 asyncio.run(

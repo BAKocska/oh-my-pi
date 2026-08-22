@@ -1907,10 +1907,21 @@ impl HostControlAuthorityFactory {
 			(ControlDomain::Mcp, "mcp", &self.external.mcp),
 		];
 		let mut domains = Vec::<Arc<dyn ControlAuthority>>::with_capacity(factories.len());
+		let mut registry_effect = None;
+		let mut ui_effect = None;
+		let mut telemetry_effect = None;
+		let mut provider_effect = None;
 		for (domain, name, factory) in factories {
 			let authority = factory
 				.bind(Arc::clone(&identity))
 				.map_err(|error| error.in_domain(name))?;
+			match domain {
+				ControlDomain::Registry => registry_effect = Some(Arc::clone(&authority)),
+				ControlDomain::Ui => ui_effect = Some(Arc::clone(&authority)),
+				ControlDomain::Telemetry => telemetry_effect = Some(Arc::clone(&authority)),
+				ControlDomain::Provider => provider_effect = Some(Arc::clone(&authority)),
+				_ => {},
+			}
 			domains.push(Arc::new(RoutedControlAuthority { domain, authority }));
 		}
 		let effect_owner = self
@@ -1918,7 +1929,67 @@ impl HostControlAuthorityFactory {
 			.effects
 			.bind(identity)
 			.map_err(|error| error.in_domain("effects"))?;
+		let effect_owner = Arc::new(DomainEffectAuthority {
+			registry: registry_effect.expect("registry domain was bound"),
+			ui: ui_effect.expect("UI domain was bound"),
+			telemetry: telemetry_effect.expect("telemetry domain was bound"),
+			provider: provider_effect.expect("provider domain was bound"),
+			fallback: effect_owner,
+		});
 		Ok(Arc::new(CompositeControlAuthority::new(domains, effect_owner)))
+	}
+}
+struct DomainEffectAuthority {
+	registry:  Arc<dyn ControlAuthority>,
+	ui:        Arc<dyn ControlAuthority>,
+	telemetry: Arc<dyn ControlAuthority>,
+	provider:  Arc<dyn ControlAuthority>,
+	fallback:  Arc<dyn ControlAuthority>,
+}
+
+#[async_trait]
+impl ControlAuthority for DomainEffectAuthority {
+	fn handles(&self, _operation: &str) -> bool {
+		false
+	}
+
+	fn authorize(
+		&self,
+		_context: &ControlRequestContext,
+		_operation: &str,
+		_arguments: &serde_json::Map<String, Value>,
+	) -> Result<(), ControlProtocolError> {
+		Err(ControlProtocolError::new(
+			"InvalidOperation",
+			"the CONTROL effect router accepts effects only",
+		))
+	}
+
+	async fn request(
+		&self,
+		_context: ControlRequestContext,
+		_operation: Str,
+		_arguments: serde_json::Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		Err(ControlProtocolError::new(
+			"InvalidOperation",
+			"the CONTROL effect router accepts effects only",
+		))
+	}
+
+	async fn effect(
+		&self,
+		context: ControlRequestContext,
+		effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
+		let owner = match &effect {
+			ControlEffect::Registry(_) => &self.registry,
+			ControlEffect::Ui(_) => &self.ui,
+			ControlEffect::Instrument(_) => &self.telemetry,
+			ControlEffect::Intent(_) => &self.provider,
+			ControlEffect::Log(_) => &self.fallback,
+		};
+		owner.effect(context, effect).await
 	}
 }
 

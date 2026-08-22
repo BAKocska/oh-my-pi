@@ -505,7 +505,8 @@ fn authorize_identity(
 	context: &ControlRequestContext,
 ) -> Result<(), ControlProtocolError> {
 	let actual = &context.connection;
-	if expected.principal != actual.principal
+	if expected.extension != actual.extension
+		|| expected.principal != actual.principal
 		|| expected.artifact_digest != actual.artifact_digest
 		|| expected.layer != actual.layer
 		|| expected.tier != actual.tier

@@ -298,7 +298,7 @@ assert omp.prompt(omp.Ok(ContractPayload()), caps) == [omp.TextPart("real projec
 assert verdicts._dispatch_prompt(
     "ui_telemetry_contract_device", "contract", 1, omp.Ok(ContractPayload()), caps
 ) == [omp.TextPart("real projection")]
-assert {name for name, _ in ui_callbacks} == {"completion", "shortcut", "command"}
+assert {entry[0] for entry in ui_callbacks} == {"completion", "shortcut", "command"}
 assert {operation for operation, _ in backend.calls} >= {
     "omp.ui.presentation", "omp.ui.confirm", "omp.telemetry.query",
     "omp.telemetry.export.stats", "omp.telemetry.span.open",

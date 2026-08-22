@@ -37,7 +37,7 @@ async def review(event, ctx):
     assert isinstance(event, omp.ToolCallEvent)
     assert isinstance(event.target, omp.DeviceCall)
     assert ctx.extension == "acme/devices-hooks"
-    return omp.Deny("blocked by subscribed review", code="ACME_POLICY")
+    return hook_module.Deny("blocked by subscribed review", code="ACME_POLICY")
 
 registry.freeze()
 
@@ -360,7 +360,7 @@ async def exercise():
     }
 
     composed = await omp.hooks.dispatch_hook("tool_call", payload)
-    assert composed == omp.Deny(
+    assert composed == hook_module.Deny(
         "composed denial", fatal=False, code="COMPOSED"
     )
 

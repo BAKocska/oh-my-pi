@@ -19,6 +19,7 @@ use serde_json::{Map, Value, json};
 
 fn identity(generation: u64) -> Arc<ControlConnectionIdentity> {
 	Arc::new(ControlConnectionIdentity {
+		extension:          Str::new_static("extension"),
 		principal:          Principal::new(Str::new_static("principal"), Str::new_static("User")),
 		artifact_digest:    Str::new_static("artifact"),
 		layer:              Str::new_static("project"),

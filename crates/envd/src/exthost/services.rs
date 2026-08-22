@@ -10,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use omp_core::{CowBytes, Duration, DurationUnit, LifecyclePhase, SparseMap, Str, sf};
+use omp_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -777,6 +778,83 @@ impl ServiceControlAuthority {
 		}
 	}
 
+	fn validate_method_input(
+		schema: &ServiceMethodSchema,
+		args: &[Value],
+		kwargs: &Map<String, Value>,
+	) -> Result<(), ControlProtocolError> {
+		let Some(properties) = schema
+			.input_schema
+			.get("properties")
+			.and_then(Value::as_object)
+		else {
+			return validate_schema(
+				&schema.input_schema,
+				&Value::Object(kwargs.clone()),
+				false,
+				ToolAssemblyLimits::default(),
+			)
+			.map_err(|issue| {
+				ControlProtocolError::new(
+					"InvalidServiceArguments",
+					"service arguments violate the sealed method schema",
+				)
+				.with_details(json!({"path": issue.path.as_str(), "rule": issue.rule}))
+			});
+		};
+		if args.len() > properties.len() {
+			return Err(ControlProtocolError::new(
+				"InvalidServiceArguments",
+				"service call supplies more positional arguments than the sealed method",
+			));
+		}
+		let mut input = Map::new();
+		for ((name, _), value) in properties.iter().zip(args) {
+			input.insert(name.clone(), value.clone());
+		}
+		for (name, value) in kwargs {
+			if input.insert(name.clone(), value.clone()).is_some() {
+				return Err(ControlProtocolError::new(
+					"InvalidServiceArguments",
+					"service argument was supplied both positionally and by name",
+				));
+			}
+		}
+		validate_schema(
+			&schema.input_schema,
+			&Value::Object(input),
+			true,
+			ToolAssemblyLimits::default(),
+		)
+		.map_err(|issue| {
+			ControlProtocolError::new(
+				"InvalidServiceArguments",
+				"service arguments violate the sealed method schema",
+			)
+			.with_details(json!({"path": issue.path.as_str(), "rule": issue.rule}))
+		})
+	}
+
+	fn validate_method_result(
+		schema: &ServiceMethodSchema,
+		result: Value,
+	) -> Result<Value, ControlProtocolError> {
+		validate_schema(
+			&schema.result_schema,
+			&result,
+			true,
+			ToolAssemblyLimits::default(),
+		)
+		.map_err(|issue| {
+			ControlProtocolError::new(
+				"ServiceResultSchemaError",
+				"provider result violates the sealed method schema",
+			)
+			.with_details(json!({"path": issue.path.as_str(), "rule": issue.rule}))
+		})?;
+		Ok(result)
+	}
+
 	async fn route(&self, service: ServiceKey) -> Result<ServiceRoute, ControlProtocolError> {
 		let connection = self
 			.broker
@@ -874,23 +952,28 @@ impl ControlAuthority for ServiceControlAuthority {
 			.lock()
 			.methods(&route)
 			.map_err(Self::service_error)?;
-		if !methods.iter().any(|schema| schema.name.as_str() == method) {
-			return Err(ControlProtocolError::new(
-				"InvalidServiceMethod",
-				"the method is absent from the sealed service declaration",
-			));
-		}
+		let schema = methods
+			.iter()
+			.find(|schema| schema.name.as_str() == method)
+			.cloned()
+			.ok_or_else(|| {
+				ControlProtocolError::new(
+					"InvalidServiceMethod",
+					"the method is absent from the sealed service declaration",
+				)
+			})?;
 		let args = arguments.get("args").cloned().unwrap_or_else(|| json!([]));
 		let kwargs = arguments
 			.get("kwargs")
 			.cloned()
 			.unwrap_or_else(|| json!({}));
-		if !args.is_array() || !kwargs.is_object() {
+		let (Some(args_values), Some(kwargs_values)) = (args.as_array(), kwargs.as_object()) else {
 			return Err(ControlProtocolError::new(
 				"InvalidServiceArguments",
 				"service args and kwargs must be an array and object",
 			));
-		}
+		};
+		Self::validate_method_input(&schema, args_values, kwargs_values)?;
 		let payload =
 			serde_json::to_vec(&json!({"args": args, "kwargs": kwargs})).map_err(|error| {
 				ControlProtocolError::new(
@@ -927,12 +1010,13 @@ impl ControlAuthority for ServiceControlAuthority {
 				ControlProtocolError::new("ResourceUnavailable", message).retryable(true)
 			},
 		})?;
-		serde_json::from_slice(encoded.as_ref()).map_err(|error| {
+		let result = serde_json::from_slice(encoded.as_ref()).map_err(|error| {
 			ControlProtocolError::new(
 				"ServiceResultCodecError",
 				sf!("provider returned malformed JSON: {error}"),
 			)
-		})
+		})?;
+		Self::validate_method_result(&schema, result)
 	}
 
 	async fn effect(

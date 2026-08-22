@@ -28,6 +28,10 @@ pub const MAX_TUNNEL_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_TUNNEL_BUFFERS: usize = 64;
 /// Largest individual tunnel buffer accepted by the supervisor.
 pub const MAX_TUNNEL_BUFFER_BYTES: usize = 256 * 1024;
+/// Production per-layer live named-worker ceiling.
+pub const DEFAULT_WORKER_LAYER_CEILING: u64 = 8;
+/// Production concurrent named-worker spawn ceiling.
+pub const DEFAULT_MAX_CONCURRENT_SPAWNS: u64 = 4;
 
 /// A decoded worker tunnel frame that preserves its received byte ownership.
 #[derive(Clone)]
@@ -298,6 +302,8 @@ impl Default for RestartBackoff {
 #[derive(Debug)]
 pub struct WorkerSupervisor {
 	workers:       Mutex<BTreeMap<Str, WorkerRoute>>,
+	processes:     Mutex<BTreeMap<(Str, u64), SupervisedWorkerProcess>>,
+	process_changed: tokio::sync::Notify,
 	layer_live:    AtomicU64,
 	layer_ceiling: u64,
 	spawn_live:    AtomicU64,
@@ -313,6 +319,8 @@ impl WorkerSupervisor {
 		let (terminate_tx, terminate_rx) = flume::unbounded();
 		Self {
 			workers: Mutex::new(BTreeMap::new()),
+			processes: Mutex::new(BTreeMap::new()),
+			process_changed: tokio::sync::Notify::new(),
 			layer_live: AtomicU64::new(0),
 			layer_ceiling,
 			spawn_live: AtomicU64::new(0),
@@ -370,6 +378,14 @@ impl WorkerSupervisor {
 			return false;
 		}
 		workers.remove(name);
+		if self
+			.processes
+			.lock()
+			.remove(&(Str::from(name), generation))
+			.is_some()
+		{
+			self.process_changed.notify_waiters();
+		}
 		self.layer_live.fetch_sub(1, Ordering::AcqRel);
 		true
 	}
@@ -446,6 +462,14 @@ impl WorkerSupervisor {
 			return false;
 		}
 		workers.remove(name);
+		if self
+			.processes
+			.lock()
+			.remove(&(Str::from(name), generation))
+			.is_some()
+		{
+			self.process_changed.notify_waiters();
+		}
 		self.layer_live.fetch_sub(1, Ordering::AcqRel);
 		true
 	}
@@ -539,6 +563,75 @@ pub struct WorkerSessionEndpoint {
 	pub authkey:    Option<bytes::Bytes>,
 }
 
+/// Process-owned state published into the named-worker supervisor.
+///
+/// The process launcher is the only producer. CONTROL reads and removes these
+/// generation-fenced records instead of maintaining a second worker index.
+#[derive(Clone, Debug)]
+pub struct SupervisedWorkerProcess {
+	/// Exact live observation.
+	pub observation: WorkerObservation,
+	/// Authenticated endpoint minted by that process, when it supports sessions.
+	pub endpoint:    Option<WorkerSessionEndpoint>,
+	/// Process-lifetime cancellation owned by the existing launcher.
+	pub cancel:      CancellationToken,
+	/// Completion signal cancelled by the launcher after process exit.
+	pub terminated:  CancellationToken,
+}
+
+impl WorkerSupervisor {
+	/// Publishes one process-launch result into the authoritative route.
+	pub fn publish_process(
+		&self,
+		route: &WorkerRoute,
+		process: SupervisedWorkerProcess,
+	) -> Result<(), WorkerUnavailable> {
+		if self
+			.route_scoped(
+				route.key.extension.as_str(),
+				route.key.name.as_str(),
+				route.key.site.as_str(),
+			)
+			.is_none_or(|current| current.generation != route.generation)
+			|| process.observation.name != route.key.name
+			|| process.observation.generation != route.generation
+			|| process
+				.endpoint
+				.as_ref()
+				.is_some_and(|endpoint| endpoint.generation != route.generation)
+		{
+			return Err(WorkerUnavailable::StaleGeneration);
+		}
+		self
+			.processes
+			.lock()
+			.insert((route.key.name.clone(), route.generation), process);
+		self.process_changed.notify_waiters();
+		Ok(())
+	}
+
+	/// Removes one exact process record after the launcher has terminated it.
+	pub fn retire_process(&self, route: &WorkerRoute) -> bool {
+		let removed = self
+			.processes
+			.lock()
+			.remove(&(route.key.name.clone(), route.generation))
+			.is_some();
+		if removed {
+			self.process_changed.notify_waiters();
+		}
+		removed
+	}
+
+	fn process(&self, route: &WorkerRoute) -> Option<SupervisedWorkerProcess> {
+		self
+			.processes
+			.lock()
+			.get(&(route.key.name.clone(), route.generation))
+			.cloned()
+	}
+}
+
 /// Typed worker owner rejection.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum WorkerControlFailure {
@@ -612,6 +705,101 @@ pub trait WorkerProcessAuthority: Send + Sync + 'static {
 		route: &WorkerRoute,
 		cancel: CancellationToken,
 	) -> Result<WorkerSessionEndpoint, WorkerControlFailure>;
+}
+
+#[async_trait]
+impl WorkerProcessAuthority for WorkerSupervisor {
+	async fn ensure(
+		&self,
+		route: &WorkerRoute,
+		cancel: CancellationToken,
+	) -> Result<WorkerObservation, WorkerControlFailure> {
+		if cancel.is_cancelled() {
+			return Err(WorkerControlFailure::Process(Str::new_static("worker request cancelled")));
+		}
+		self
+			.process(route)
+			.map(|process| process.observation)
+			.ok_or(WorkerControlFailure::Evicted)
+	}
+
+	async fn observe(&self, route: &WorkerRoute) -> Result<WorkerObservation, WorkerControlFailure> {
+		self
+			.process(route)
+			.map(|process| process.observation)
+			.ok_or(WorkerControlFailure::Evicted)
+	}
+
+	async fn warm(
+		&self,
+		route: &WorkerRoute,
+		cancel: CancellationToken,
+	) -> Result<WorkerObservation, WorkerControlFailure> {
+		loop {
+			let changed = self.process_changed.notified();
+			let observation = self.observe(route).await?;
+			if observation.state == "ready" {
+				return Ok(observation);
+			}
+			if let Some(fault) = observation.fault {
+				return Err(WorkerControlFailure::Process(fault));
+			}
+			tokio::select! {
+				() = changed => {},
+				() = cancel.cancelled() => {
+					return Err(WorkerControlFailure::Process(Str::new_static(
+						"worker request cancelled",
+					)));
+				},
+			}
+		}
+	}
+
+	async fn stop(
+		&self,
+		route: &WorkerRoute,
+		grace: Duration,
+		cancel: CancellationToken,
+	) -> Result<(), WorkerControlFailure> {
+		if cancel.is_cancelled() {
+			return Err(WorkerControlFailure::Process(Str::new_static("worker request cancelled")));
+		}
+		let process = self.process(route).ok_or(WorkerControlFailure::Evicted)?;
+		process.cancel.cancel();
+		tokio::select! {
+			() = process.terminated.cancelled() => {},
+			() = tokio::time::sleep(grace) => {},
+			() = cancel.cancelled() => {
+				return Err(WorkerControlFailure::Process(Str::new_static(
+					"worker request cancelled",
+				)));
+			},
+		}
+		if self.retire_process(route) {
+			Ok(())
+		} else {
+			Err(WorkerControlFailure::Evicted)
+		}
+	}
+
+	async fn session(
+		&self,
+		route: &WorkerRoute,
+		cancel: CancellationToken,
+	) -> Result<WorkerSessionEndpoint, WorkerControlFailure> {
+		if cancel.is_cancelled() {
+			return Err(WorkerControlFailure::Process(Str::new_static("worker request cancelled")));
+		}
+		self
+			.process(route)
+			.ok_or(WorkerControlFailure::Evicted)?
+			.endpoint
+			.ok_or_else(|| {
+				WorkerControlFailure::Process(Str::new_static(
+					"worker does not expose an authenticated session endpoint",
+				))
+			})
+	}
 }
 
 /// Authoritative named-worker CONTROL owner for one extension connection.

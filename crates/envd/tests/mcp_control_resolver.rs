@@ -170,13 +170,13 @@ async fn extension_scoped_mount_projects_lists_invokes_and_removes() {
 	);
 	service.bind_manager(&manager);
 	let cancellation = CancellationToken::new();
-	let identity = identity("fixture.extension", &["env.net"]);
+	let owner_identity = identity("fixture.extension", &["env.net"]);
 	let resolver = Arc::new(ManagerControlMountResolver::new(
 		Arc::clone(&manager),
-		Arc::clone(&identity),
+		Arc::clone(&owner_identity),
 		cancellation.clone(),
 	));
-	let control = McpControl::new(Arc::clone(&manager), resolver, identity);
+	let control = McpControl::new(Arc::clone(&manager), resolver, owner_identity);
 
 	let mounted = control
 		.dispatch_with_cancel(

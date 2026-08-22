@@ -798,11 +798,19 @@ def _scope_from_wire(invocation: str, authority: Mapping[str, Any]) -> _scope.Sc
     )
 
 
-def _freeze_registry_ack() -> None:
-    """Acknowledge FREEZE after bootstrap has already sealed the registry."""
+def _freeze_registry_ack() -> dict[str, object]:
+    """Seal declarations and return the authoritative host publication tables."""
     registry = importlib.import_module("omp._registry").registry
     if not registry.sealed:
         registry.freeze()
+    campaigns = importlib.import_module("omp.campaigns")
+    provider = importlib.import_module("omp.provider")
+    return {
+        "campaigns": campaigns._sealed_campaign_declaration(
+            _scope.current().generation
+        ),
+        "providers": list(provider._sealed_provider_declarations()),
+    }
 
 
 async def _dispatch_lifecycle_activate(

@@ -5,7 +5,7 @@ use std::{
 	collections::BTreeMap,
 	hash::{Hash, Hasher},
 	str::FromStr,
-	sync::{Arc, LazyLock},
+	sync::{Arc, LazyLock, OnceLock},
 };
 
 use omp_core::{
@@ -23,16 +23,17 @@ use omp_scribe::{
 };
 use omp_storage::state::StateScope;
 use omp_tool::{Authority, CostClass, Durability, OperationSpec};
+use crate::env_types;
 use parking_lot::{Mutex, RwLock};
 use pyo3::{
 	Bound, Py, PyAny, PyErr, PyResult, Python, create_exception,
+	sync::OnceLockExt,
 	exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError},
 	pyclass, pyfunction, pymethods, pymodule,
 	types::{
 		PyAnyMethods, PyBool, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyFloat, PyInt, PyList,
-		PyListMethods, PyModule, PyModuleMethods, PyString, PyTuple, PyTupleMethods, PyTypeMethods,
+		PyListMethods, PyString, PyTuple, PyTupleMethods, PyTypeMethods,
 	},
-	wrap_pyfunction,
 };
 
 create_exception!(_omp, OmpError, PyException, "Base class for omp runtime failures.");
@@ -150,7 +151,7 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
 /// Immutable Python duration retaining its explicit source unit.
 #[pyclass(name = "Duration", frozen, module = "_omp", from_py_object)]
 #[derive(Clone, Debug)]
-struct PyDuration(Duration);
+pub(crate) struct PyDuration(pub(crate) Duration);
 
 #[pymethods]
 impl PyDuration {
@@ -700,7 +701,7 @@ typed_location!(PyWorkspaceUri, "WorkspaceUri", WorkspaceUri);
 #[pyclass(name = "EnvPath", frozen, module = "_omp", from_py_object)]
 /// A path in the workspace Environment filesystem namespace.
 #[derive(Clone, Debug)]
-struct PyEnvPath(EnvPath);
+pub(crate) struct PyEnvPath(pub(crate) EnvPath);
 
 #[pymethods]
 impl PyEnvPath {
@@ -871,7 +872,7 @@ fn path_uri(path: &str) -> PyResult<String> {
 #[pyclass(name = "BlobRef", frozen, module = "_omp", from_py_object)]
 /// A content-addressed reference in one Environment blob store.
 #[derive(Clone, Debug)]
-struct PyBlobRef {
+pub(crate) struct PyBlobRef {
 	hash: [u8; 32],
 	size: u64,
 }
@@ -1103,21 +1104,18 @@ fn client_error(py: Python<'_>, error: ClientError) -> PyErr {
 }
 
 fn process_started(py: Python<'_>, value: &env_pb::ProcessStarted) -> PyResult<Py<PyAny>> {
-	let result = PyDict::new(py);
-	result.set_item("name", &value.name)?;
-	result.set_item("generation", value.generation)?;
-	result.set_item("endpoint", value.endpoint.as_deref())?;
-	Ok(result.unbind().into_any())
+	Ok(Py::new(py, env_types::StartedProcess {
+		name: env_types::any(py, &value.name)?,
+		generation: env_types::any(py, value.generation)?,
+		endpoint: env_types::any(py, value.endpoint.as_deref())?,
+	})?.into_any())
 }
 
 fn revision_value(py: Python<'_>, value: Option<&document_pb::Revision>) -> PyResult<Py<PyAny>> {
 	let Some(value) = value else {
 		return Ok(py.None());
 	};
-	let result = PyDict::new(py);
-	result.set_item("sequence", value.sequence)?;
-	result.set_item("content_hash", PyBytes::new(py, &value.content_hash))?;
-	Ok(result.unbind().into_any())
+	Ok(Py::new(py, env_types::Revision::new(value.sequence, value.content_hash.to_vec()))?.into_any())
 }
 
 fn argument_revision(
@@ -1201,42 +1199,38 @@ fn path_value(py: Python<'_>, uri: &str) -> PyResult<Py<PyEnvPath>> {
 }
 
 fn path_metadata(py: Python<'_>, value: &document_pb::PathMetadata) -> PyResult<Py<PyAny>> {
-	let result = PyDict::new(py);
-	result.set_item("path", path_value(py, &value.uri)?)?;
-	let kind = match document_pb::FileKind::try_from(value.kind) {
-		Ok(document_pb::FileKind::RegularFile) => "regular_file",
-		Ok(document_pb::FileKind::Directory) => "directory",
-		Ok(document_pb::FileKind::SymbolicLink) => "symlink",
-		_ => "other",
+	static FILE_KIND_MEMBERS: OnceLock<[Py<PyAny>; 4]> = OnceLock::new();
+	let members = FILE_KIND_MEMBERS.get_or_init_py_attached(py, || {
+		let kind = py
+			.import("omp.env")
+			.and_then(|module| module.getattr("FileKind"))
+			.expect("omp.env.FileKind must exist while decoding DATA responses");
+		["REGULAR_FILE", "DIRECTORY", "SYMLINK", "OTHER"].map(|name| {
+			kind.getattr(name)
+				.expect("omp.env.FileKind member must exist")
+				.unbind()
+		})
+	});
+	let index = match document_pb::FileKind::try_from(value.kind) {
+		Ok(document_pb::FileKind::RegularFile) => 0,
+		Ok(document_pb::FileKind::Directory) => 1,
+		Ok(document_pb::FileKind::SymbolicLink) => 2,
+		_ => 3,
 	};
-	result.set_item("kind", kind)?;
-	result.set_item("byte_length", value.byte_length)?;
-	if let Some(permissions) = &value.permissions {
-		result.set_item("read_only", permissions.read_only)?;
-		result.set_item("executable", permissions.executable)?;
-	} else {
-		result.set_item("read_only", py.None())?;
-		result.set_item("executable", py.None())?;
-	}
-	result.set_item(
-		"modified",
-		value
-			.modified_time_unix_nanos
-			.map(|value| value as f64 / 1_000_000_000.0),
-	)?;
-	result.set_item(
-		"accessed",
-		value
-			.accessed_time_unix_nanos
-			.map(|value| value as f64 / 1_000_000_000.0),
-	)?;
-	result.set_item(
-		"created",
-		value
-			.created_time_unix_nanos
-			.map(|value| value as f64 / 1_000_000_000.0),
-	)?;
-	Ok(result.unbind().into_any())
+	let kind = members[index].clone_ref(py);
+	let (read_only, executable) = value.permissions.as_ref()
+		.map(|permissions| (permissions.read_only, permissions.executable))
+		.unwrap_or((None, None));
+	Ok(Py::new(py, env_types::PathMeta {
+		path: path_value(py, &value.uri)?,
+		kind,
+		byte_length: value.byte_length,
+		read_only,
+		executable,
+		modified: value.modified_time_unix_nanos.map(|value| value as f64 / 1_000_000_000.0),
+		accessed: value.accessed_time_unix_nanos.map(|value| value as f64 / 1_000_000_000.0),
+		created: value.created_time_unix_nanos.map(|value| value as f64 / 1_000_000_000.0),
+	})?.into_any())
 }
 
 fn exec_status(py: Python<'_>, value: &env_pb::ExecStatusMsg) -> PyResult<Py<PyAny>> {
@@ -1686,6 +1680,57 @@ impl PyEnvironmentBackend {
 			values.remove(&key);
 		}
 	}
+	fn forward_request(
+		&self,
+		py: Python<'_>,
+		operation: &str,
+		names: &[&str],
+		args: &Bound<'_, PyTuple>,
+		kwargs: Option<&Bound<'_, PyDict>>,
+	) -> PyResult<Py<PyAny>> {
+		if args.len() > names.len() {
+			return Err(PyTypeError::new_err(format!(
+				"{operation} takes at most {} positional arguments",
+				names.len()
+			)));
+		}
+		let arguments = PyDict::new(py);
+		if let Some(kwargs) = kwargs {
+			for (key, value) in kwargs {
+				arguments.set_item(key, value)?;
+			}
+		}
+		for (index, value) in args.iter().enumerate() {
+			arguments.set_item(names[index], value)?;
+		}
+		self.request(py, operation, &arguments)
+	}
+
+	fn forward_stream(
+		&self,
+		py: Python<'_>,
+		operation: &str,
+		names: &[&str],
+		args: &Bound<'_, PyTuple>,
+		kwargs: Option<&Bound<'_, PyDict>>,
+	) -> PyResult<Py<PyAny>> {
+		if args.len() > names.len() {
+			return Err(PyTypeError::new_err(format!(
+				"{operation} takes at most {} positional arguments",
+				names.len()
+			)));
+		}
+		let arguments = PyDict::new(py);
+		if let Some(kwargs) = kwargs {
+			for (key, value) in kwargs {
+				arguments.set_item(key, value)?;
+			}
+		}
+		for (index, value) in args.iter().enumerate() {
+			arguments.set_item(names[index], value)?;
+		}
+		self.stream(py, operation, &arguments)
+	}
 
 	fn start_process_request(
 		&self,
@@ -1891,9 +1936,24 @@ impl PyEnvironmentBackend {
 			.ok_or_else(|| PyTypeError::new_err("operations are required"))?;
 		for operation in operations.try_iter()? {
 			let operation = operation?;
-			let tuple = operation.cast::<PyTuple>()?;
-			let kind = tuple.get_item(0)?.extract::<String>()?;
-			let values = tuple.get_item(1)?.cast_into::<PyDict>()?;
+			let (kind, values) = if let Ok(tuple) = operation.cast::<PyTuple>() {
+				(
+					tuple.get_item(0)?.extract::<String>()?,
+					tuple.get_item(1)?.cast_into::<PyDict>()?,
+				)
+			} else {
+				let kind = operation.getattr("kind")?.extract::<String>()?;
+				let values = PyDict::new(operation.py());
+				for name in ["lease", "ops", "path", "content", "destination", "format"] {
+					if operation.hasattr(name)? {
+						let value = operation.getattr(name)?;
+						if !value.is_none() {
+							values.set_item(name, value)?;
+						}
+					}
+				}
+				(kind, values)
+			};
 			let format_policy = match values
 				.get_item("format")?
 				.map(|value| value.extract::<String>())
@@ -3840,6 +3900,7 @@ impl PyEnvironmentBackend {
 		Ok(Py::new(py, PyEnvironmentStream { stream: Mutex::new(Some(stream)) })?.into_any())
 	}
 }
+include!("env_backend.rs");
 
 #[pyfunction]
 #[cfg(unix)]
@@ -4050,7 +4111,7 @@ impl PyScribeTemplate {
 	#[pyo3(signature = (source, *, name = "template"))]
 	fn new(source: &str, name: &str) -> PyResult<Self> {
 		SCRIBE_ENGINE
-			.compile_source(name, source)
+			.compile_owned(Str::new(name), source)
 			.map(Self)
 			.map_err(template_error)
 	}
@@ -4107,57 +4168,26 @@ pub fn register() {
 }
 
 #[pymodule(gil_used = false)]
-fn _omp(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
-	module.add_class::<PyDuration>()?;
-	module.add_class::<PySecret>()?;
-	module.add_class::<PySecretUse>()?;
-	module.add_class::<PyInvocationPhase>()?;
-	module.add_class::<PyLifecyclePhase>()?;
-	module.add_class::<PyDurability>()?;
-	module.add_class::<PyActivateReason>()?;
-	module.add_class::<PyRestartReason>()?;
-	module.add_class::<PyStateScope>()?;
-	module.add_class::<PyCostClass>()?;
-	module.add_class::<PyAuthority>()?;
-	module.add_class::<PyOperationSpec>()?;
-	module.add_class::<PyEnvPath>()?;
-	module.add_class::<PyClientPath>()?;
-	module.add_class::<PyBlobRef>()?;
-	module.add_class::<PyArtifactUrl>()?;
-	module.add_class::<PyHistoryUrl>()?;
-	module.add_class::<PyAgentUrl>()?;
-	module.add_class::<PyWorkspaceUri>()?;
-	module.add_class::<PyPrincipal>()?;
-	module.add_class::<PyQuotaStatus>()?;
-	module.add_class::<PyResourceReceipt>()?;
-	module.add_class::<PyControlHandle>()?;
-	module.add_class::<PyEnvironmentBackend>()?;
-	module.add_class::<PyEnvironmentStream>()?;
-	module.add_class::<PyBlobUpload>()?;
-	module.add_class::<PyCancellation>()?;
-	module.add_class::<PyScribeTemplate>()?;
-	module.add_function(wrap_pyfunction!(_scribe_canonicalize, module)?)?;
-	module.add_function(wrap_pyfunction!(_interrupt, module)?)?;
-	module.add_function(wrap_pyfunction!(_thread_id, module)?)?;
-	module.add_function(wrap_pyfunction!(operation_spec, module)?)?;
-	module.add_function(wrap_pyfunction!(resources, module)?)?;
-	module.add_function(wrap_pyfunction!(_principal_from_host, module)?)?;
-	module.add_function(wrap_pyfunction!(_open_environment_scope, module)?)?;
-	module.add_function(wrap_pyfunction!(_local_path_string, module)?)?;
-	module.add_function(wrap_pyfunction!(_runtime_metadata, module)?)?;
+mod _omp {
+	#[pymodule_export]
+	use super::{
+		_interrupt, _local_path_string, _open_environment_scope, _phase_legality_matrix,
+		_principal_from_host, _runtime_metadata, _scheme_snapshot, _scribe_canonicalize, _thread_id,
+		EnvUnavailable, HostDisconnected, OmpError, PlacementError, PyActivateReason, PyAgentUrl,
+		PyArtifactUrl, PyAuthority, PyBlobRef, PyBlobUpload, PyCancellation, PyClientPath,
+		PyControlHandle, PyCostClass, PyDurability, PyDuration, PyEnvPath, PyEnvironmentBackend,
+		PyEnvironmentStream, PyHistoryUrl, PyInvocationPhase, PyLifecyclePhase, PyOperationSpec,
+		PyPrincipal, PyQuotaStatus, PyResourceReceipt, PyRestartReason, PyScribeTemplate, PySecret,
+		PySecretUse, PyStateScope, PyWorkspaceUri, StaleGeneration, TemplateError, operation_spec,
+		resources,
+	};
 
-	module.add_function(wrap_pyfunction!(_phase_legality_matrix, module)?)?;
-	macro_rules! add_exception {
-		($name:ident) => {
-			module.add(stringify!($name), py.get_type::<$name>())?;
-		};
-	}
-	add_exception!(OmpError);
-	add_exception!(HostDisconnected);
-	add_exception!(EnvUnavailable);
-	add_exception!(PlacementError);
-	module.add_function(wrap_pyfunction!(_scheme_snapshot, module)?)?;
-	add_exception!(StaleGeneration);
-	add_exception!(TemplateError);
-	Ok(())
+	#[pymodule_export]
+	use crate::env_types::{
+		BlobStat, Completed, CopyResult, DirEntry, DocEvent, Entry, EnvInfo, Exit, HttpResponse,
+		LspBinding, LspBindingEvent, LspError, LspEvent, LspReply, Match, OpenedDoc, OpenedSession,
+		Output, PathMeta, ProcessInfo, ProcessOutput, Revision, StartedProcess, StartedRun, Summary,
+		SummarySegment, SummaryUnavailable, SymlinkTarget, SyncPolicy, TxnOutcome, TxnReceipt,
+		WorktreeInfo,
+	};
 }

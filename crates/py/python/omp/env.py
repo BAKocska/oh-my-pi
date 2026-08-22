@@ -13,7 +13,7 @@ import inspect
 import json
 import os
 from collections.abc import AsyncIterator, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -294,7 +294,7 @@ class WorktreeInfo:
 
 async def worktree() -> WorktreeInfo | None:
     """Return current worktree topology through the capability-gated host arm."""
-    result = await _request("omp.env.worktree")
+    result = await _call("worktree")
     if result is None or isinstance(result, WorktreeInfo):
         return result
     if not isinstance(result, Mapping):
@@ -771,12 +771,17 @@ def _env_path(value: EnvPath, argument: str = "path") -> EnvPath:
     return value
 
 
-async def _request(operation: str, /, **arguments: Any) -> Any:
+async def _call(name: str, /, *args: Any, **kwargs: Any) -> Any:
     backend = _snapshot_backend()
-    request = backend.request
-    if inspect.iscoroutinefunction(request):
-        return await request(operation, arguments)
-    result = await asyncio.to_thread(request, operation, arguments)
+    method = getattr(backend, name, None)
+    if method is None:
+        raise Unsupported(f"the Environment backend does not implement {name}")
+    if inspect.iscoroutinefunction(method):
+        return await method(*args, **kwargs)
+    result = await asyncio.to_thread(method, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
     if inspect.isawaitable(result):
         return await result
     return result
@@ -789,13 +794,15 @@ def _next_stream_item(iterator: Any) -> Any:
     return next(iterator, _STREAM_END)
 
 
-async def _stream(operation: str, /, **arguments: Any) -> AsyncIterator[Any]:
+async def _stream(name: str, /, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
     backend = _snapshot_backend()
-    stream = backend.stream
-    if inspect.iscoroutinefunction(stream):
-        source = await stream(operation, arguments)
+    method = getattr(backend, name, None)
+    if method is None:
+        raise Unsupported(f"the Environment backend does not implement {name}")
+    if inspect.iscoroutinefunction(method):
+        source = await method(*args, **kwargs)
     else:
-        source = await asyncio.to_thread(stream, operation, arguments)
+        source = await asyncio.to_thread(method, *args, **kwargs)
     if hasattr(source, "__aiter__"):
         async for item in source:
             yield item
@@ -815,7 +822,7 @@ async def _stream(operation: str, /, **arguments: Any) -> AsyncIterator[Any]:
 
 async def _read_bytes(path: EnvPath) -> bytes:
     path = _env_path(path)
-    value = await _request("omp.env.docs.read_bytes", path=path)
+    value = await _call("docs_read_bytes", path=path)
     if type(value) is not bytes:
         raise TypeError("Environment read_bytes backend must return bytes")
     return value
@@ -851,7 +858,7 @@ class Doc:
 
     async def read_bytes(self, *, revision: Any = None) -> bytes:
         """Read this lease at its head or an explicitly pinned revision."""
-        return await _request("omp.env.docs.Doc.read_bytes", lease=self._lease, revision=revision)
+        return await _call("doc_read_bytes", lease=self._lease, revision=revision)
 
     async def read(self, *, revision: Any = None, encoding: str = "utf-8") -> str:
         """Read and decode this lease."""
@@ -859,16 +866,14 @@ class Doc:
 
     async def lines(self, start: int, end: int, *, revision: Any = None) -> list[str]:
         """Read a zero-based half-open line range."""
-        return await _request(
-            "omp.env.docs.Doc.lines", lease=self._lease, start=start, end=end, revision=revision
-        )
+        return await _call("doc_lines", lease=self._lease, start=start, end=end, revision=revision)
 
     async def dry_run(
         self, ops: Any, *, format: Format = Format.OFF
     ) -> EditPlan:
         """Resolve a document mutation without committing it."""
-        return await _request(
-            "omp.env.docs.Doc.dry_run",
+        return await _call(
+            "doc_dry_run",
             lease=self._lease,
             ops=ops,
             format=format,
@@ -876,15 +881,15 @@ class Doc:
 
     async def edit(self, edits: Iterable[Any], **options: Any) -> Any:
         """Commit ordered, non-overlapping edits against this lease."""
-        return await _request("omp.env.docs.Doc.edit", lease=self._lease, edits=tuple(edits), **options)
+        return await _call("doc_edit", lease=self._lease, edits=tuple(edits), **options)
 
     async def write(self, data: str | bytes, **options: Any) -> Any:
         """Replace the document contents revisionally."""
-        return await _request("omp.env.docs.Doc.write", lease=self._lease, data=data, **options)
+        return await _call("doc_write", lease=self._lease, data=data, **options)
 
     async def hashline(self, patch: str, **options: Any) -> Any:
         """Apply one hashline patch through the document actor."""
-        return await _request("omp.env.docs.Doc.hashline", lease=self._lease, patch=patch, **options)
+        return await _call("doc_hashline", lease=self._lease, patch=patch, **options)
 
     async def summary(
         self, options: SummaryOptions | None = None
@@ -892,9 +897,7 @@ class Doc:
         """Return a bounded structural summary at the current revision."""
         if options is not None and not isinstance(options, SummaryOptions):
             raise TypeError("options must be an omp.env.SummaryOptions or None")
-        result = await _request(
-            "omp.env.docs.Doc.summary", lease=self._lease, options=options
-        )
+        result = await _call("doc_summary", lease=self._lease, options=options)
         if isinstance(result, (Summary, SummaryUnavailable)):
             return result
         if not isinstance(result, Mapping):
@@ -913,21 +916,21 @@ class Doc:
 
     async def refresh(self) -> Any:
         """Refresh and return the current committed revision."""
-        self.revision = await _request("omp.env.docs.Doc.refresh", lease=self._lease)
+        self.revision = await _call("doc_refresh", lease=self._lease)
         return self.revision
 
     async def close(self) -> None:
         """Close the lease idempotently."""
         lease, self._lease = self._lease, None
         if lease is not None:
-            await _request("omp.env.docs.Doc.close", lease=lease)
+            await _call("doc_close", lease=lease)
 
     def events(self) -> AsyncIterator[DocEvent]:
         """Yield ordered document events until close or stream loss."""
         return self._events()
 
     async def _events(self) -> AsyncIterator[DocEvent]:
-        async for value in _stream("omp.env.docs.Doc.events", lease=self._lease):
+        async for value in _stream("doc_events", lease=self._lease):
             if isinstance(value, DocEvent):
                 yield value
                 continue
@@ -946,6 +949,43 @@ class Doc:
         await self.close()
 
 
+@dataclass(frozen=True, slots=True)
+class _TxnEdit:
+    lease: bytes
+    ops: tuple[Any, ...]
+    format: Any = None
+    kind: str = field(default="edit", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _TxnCreate:
+    path: EnvPath
+    content: str | bytes
+    format: Any = None
+    kind: str = field(default="create", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _TxnWrite:
+    lease: bytes
+    content: str | bytes
+    format: Any = None
+    kind: str = field(default="write", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _TxnMove:
+    lease: bytes
+    destination: EnvPath
+    kind: str = field(default="move", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _TxnDelete:
+    lease: bytes
+    kind: str = field(default="delete", init=False)
+
+
 class Txn:
     """Invocation-scoped ordered document transaction."""
 
@@ -953,43 +993,40 @@ class Txn:
 
     def __init__(self, txn_id: bytes | None = None) -> None:
         self.id = txn_id
-        self._operations: list[tuple[str, dict[str, Any]]] = []
+        self._operations: list[_TxnEdit | _TxnCreate | _TxnWrite | _TxnMove | _TxnDelete] = []
         self._committed = False
 
     def edit(self, doc: Doc, ops: Iterable[Any], **options: Any) -> None:
         """Queue a revisioned edit."""
-        self._operations.append(("edit", {"lease": doc._lease, "ops": tuple(ops), **options}))
+        self._operations.append(_TxnEdit(doc._lease, tuple(ops), options.get("format")))
 
     def create(self, path: EnvPath, content: str | bytes, **options: Any) -> None:
         """Queue a document creation."""
         self._operations.append(
-            ("create", {"path": _env_path(path), "content": content, **options})
+            _TxnCreate(_env_path(path), content, options.get("format"))
         )
 
     def write(self, doc: Doc, content: str | bytes, **options: Any) -> None:
         """Queue a whole-document replacement."""
         self._operations.append(
-            ("write", {"lease": doc._lease, "content": content, **options})
+            _TxnWrite(doc._lease, content, options.get("format"))
         )
 
     def move(self, doc: Doc, destination: EnvPath, **options: Any) -> None:
         """Queue a document move."""
-        self._operations.append(
-            ("move", {"lease": doc._lease, "destination": _env_path(destination), **options})
-        )
+        del options
+        self._operations.append(_TxnMove(doc._lease, _env_path(destination)))
 
     def delete(self, doc: Doc) -> None:
         """Queue a document deletion."""
-        self._operations.append(("delete", {"lease": doc._lease}))
+        self._operations.append(_TxnDelete(doc._lease))
 
     async def commit(self) -> Any:
         """Commit once and return the retained terminal transaction outcome."""
         if self._committed:
             raise PreconditionFailed("a Txn handle can commit only once")
         self._committed = True
-        return await _request(
-            "omp.env.Txn.commit", txn_id=self.id, operations=tuple(self._operations)
-        )
+        return await _call("txn_commit", txn_id=self.id, operations=tuple(self._operations))
 
     async def __aenter__(self) -> Txn:
         return self
@@ -1005,12 +1042,10 @@ class _Docs:
     async def open(self, path: EnvPath, *, language: str | None = None, create: bool = False) -> Doc:
         """Open a document and return a server-owned lease."""
         path = _env_path(path)
-        result = await _request("omp.env.docs.open", path=path, language=language, create=create)
-        if isinstance(result, Doc):
-            return result
-        if not isinstance(result, Mapping) or "lease" not in result:
+        result = await _call("docs_open", path=path, language=language, create=create)
+        if not isinstance(result, OpenedDoc):
             raise TypeError("document backend returned an invalid open receipt")
-        return Doc(result["lease"], path, _as_revision(result.get("revision")))
+        return Doc(result.lease, path, result.revision)
 
     def transaction(self, *, txn_id: bytes | None = None) -> Txn:
         """Create an atomic document transaction handle."""
@@ -1035,22 +1070,20 @@ class _Fs:
     async def stat(self, path: EnvPath) -> PathMeta:
         """Stat a path while following symbolic links."""
         return _as_path_meta(
-            await _request("omp.env.fs.stat", path=_env_path(path))
+            await _call("fs_stat", path=_env_path(path))
         )
 
     async def lstat(self, path: EnvPath) -> PathMeta:
         """Stat a path without following its final symbolic link."""
         return _as_path_meta(
-            await _request("omp.env.fs.lstat", path=_env_path(path))
+            await _call("fs_lstat", path=_env_path(path))
         )
 
     async def list_dir(
         self, path: EnvPath, *, follow: bool = False
     ) -> list[DirEntry]:
         """List immediate children with unfollowed metadata by default."""
-        values = await _request(
-            "omp.env.fs.list_dir", path=_env_path(path), follow=follow
-        )
+        values = await _call("fs_list_dir", path=_env_path(path), follow=follow)
         return [
             value
             if isinstance(value, DirEntry)
@@ -1060,7 +1093,7 @@ class _Fs:
 
     async def read_link(self, path: EnvPath) -> SymlinkTarget:
         """Read a symbolic-link target and whether its on-disk form was relative."""
-        value = await _request("omp.env.fs.read_link", path=_env_path(path))
+        value = await _call("fs_read_link", path=_env_path(path))
         if isinstance(value, SymlinkTarget):
             return value
         if isinstance(value, Mapping):
@@ -1069,7 +1102,7 @@ class _Fs:
 
     async def canonicalize(self, path: EnvPath) -> EnvPath:
         """Resolve a path in the Environment namespace."""
-        value = await _request("omp.env.fs.canonicalize", path=_env_path(path))
+        value = await _call("fs_canonicalize", path=_env_path(path))
         return _env_path(value, "canonical path")
 
     async def mkdir(
@@ -1077,12 +1110,9 @@ class _Fs:
     ) -> PathMeta:
         """Create a directory and return its metadata."""
         return _as_path_meta(
-            await _request(
-                "omp.env.fs.mkdir",
-                path=_env_path(path),
-                parents=parents,
-                exist_ok=exist_ok,
-            )
+            await _call("fs_mkdir", path=_env_path(path),
+            parents=parents,
+            exist_ok=exist_ok,)
         )
 
     async def remove(
@@ -1093,12 +1123,9 @@ class _Fs:
         revision: Revision | None = None,
     ) -> None:
         """Remove a path, optionally fenced by a document revision."""
-        await _request(
-            "omp.env.fs.remove",
-            path=_env_path(path),
-            recursive=recursive,
-            revision=revision,
-        )
+        await _call("fs_remove", path=_env_path(path),
+        recursive=recursive,
+        revision=revision,)
 
     async def rename(
         self,
@@ -1113,14 +1140,11 @@ class _Fs:
         if not isinstance(overwrite, Overwrite):
             raise TypeError("overwrite must be an omp.env.Overwrite")
         return _as_path_meta(
-            await _request(
-                "omp.env.fs.rename",
-                src=_env_path(src, "src"),
-                dest=_env_path(dest, "dest"),
-                overwrite=overwrite,
-                src_revision=src_revision,
-                dest_revision=dest_revision,
-            )
+            await _call("fs_rename", src=_env_path(src, "src"),
+            dest=_env_path(dest, "dest"),
+            overwrite=overwrite,
+            src_revision=src_revision,
+            dest_revision=dest_revision,)
         )
 
     async def copy(
@@ -1135,14 +1159,11 @@ class _Fs:
         """Copy one non-directory entry."""
         if not isinstance(overwrite, Overwrite):
             raise TypeError("overwrite must be an omp.env.Overwrite")
-        value = await _request(
-            "omp.env.fs.copy",
-            src=_env_path(src, "src"),
-            dest=_env_path(dest, "dest"),
-            follow=follow,
-            overwrite=overwrite,
-            dest_revision=dest_revision,
-        )
+        value = await _call("fs_copy", src=_env_path(src, "src"),
+        dest=_env_path(dest, "dest"),
+        follow=follow,
+        overwrite=overwrite,
+        dest_revision=dest_revision,)
         if isinstance(value, CopyResult):
             return value
         if isinstance(value, Mapping):
@@ -1164,14 +1185,11 @@ class _Fs:
         if not isinstance(overwrite, Overwrite):
             raise TypeError("overwrite must be an omp.env.Overwrite")
         return _as_path_meta(
-            await _request(
-                "omp.env.fs.symlink",
-                target=_env_path(target, "target"),
-                link=_env_path(link, "link"),
-                kind=kind,
-                relative=relative,
-                overwrite=overwrite,
-            )
+            await _call("fs_symlink", target=_env_path(target, "target"),
+            link=_env_path(link, "link"),
+            kind=kind,
+            relative=relative,
+            overwrite=overwrite,)
         )
 
     async def hard_link(
@@ -1186,13 +1204,10 @@ class _Fs:
         if not isinstance(overwrite, Overwrite):
             raise TypeError("overwrite must be an omp.env.Overwrite")
         return _as_path_meta(
-            await _request(
-                "omp.env.fs.hard_link",
-                src=_env_path(src, "src"),
-                link=_env_path(link, "link"),
-                follow=follow,
-                overwrite=overwrite,
-            )
+            await _call("fs_hard_link", src=_env_path(src, "src"),
+            link=_env_path(link, "link"),
+            follow=follow,
+            overwrite=overwrite,)
         )
 
     async def chmod(
@@ -1206,14 +1221,11 @@ class _Fs:
     ) -> PathMeta:
         """Update portable permission properties."""
         return _as_path_meta(
-            await _request(
-                "omp.env.fs.chmod",
-                path=_env_path(path),
-                read_only=read_only,
-                executable=executable,
-                follow=follow,
-                revision=revision,
-            )
+            await _call("fs_chmod", path=_env_path(path),
+            read_only=read_only,
+            executable=executable,
+            follow=follow,
+            revision=revision,)
         )
 
 
@@ -1360,7 +1372,7 @@ class _Lsp:
 
     async def bindings(self, path: EnvPath) -> list[LspBinding]:
         """Return servers currently bound to a path."""
-        values = await _request("omp.env.lsp.bindings", path=_env_path(path))
+        values = await _call("lsp_bindings", path=_env_path(path))
         return [_as_lsp_binding(value) for value in values]
 
     async def request(
@@ -1382,15 +1394,12 @@ class _Lsp:
             raise TypeError("doc must be an omp.env.Doc or None")
         if not isinstance(on_stale, LspStale):
             raise TypeError("on_stale must be an omp.env.LspStale")
-        result = await _request(
-            "omp.env.lsp.request",
-            server=server,
-            method=method,
-            params=params,
-            doc=doc,
-            on_stale=on_stale,
-            timeout=timeout,
-        )
+        result = await _call("lsp_request", server=server,
+        method=method,
+        params=params,
+        doc=doc,
+        on_stale=on_stale,
+        timeout=timeout,)
         if isinstance(result, Mapping) and "revision" in result:
             revision = _as_revision(result["revision"])
             _lsp_last_revision.set(revision)
@@ -1413,10 +1422,10 @@ class _Lsp:
             raise TypeError("server must be an LspBinding.server_id bytes value")
         if not isinstance(method, str) or not method:
             raise ValueError("method must be a non-empty str")
-        await _request("omp.env.lsp.notify", server=server, method=method, params=params)
+        await _call("lsp_notify", server=server, method=method, params=params)
 
     async def _events(self) -> AsyncIterator[LspEvent | LspBindingEvent]:
-        async for value in _stream("omp.env.lsp.events"):
+        async for value in _stream("lsp_events"):
             if isinstance(value, (LspEvent, LspBindingEvent)):
                 yield value
                 continue
@@ -1451,23 +1460,23 @@ class Run:
 
     async def wait(self) -> Completed:
         """Drain output and return the terminal completion receipt."""
-        return _as_completed(await _request("omp.env.Run.wait", run=self.id))
+        return _as_completed(await _call("run_wait", run=self.id))
 
     async def stdin(self, data: bytes) -> None:
         """Write bytes to stdin or the PTY master."""
-        await _request("omp.env.Run.stdin", run=self.id, data=data)
+        await _call("run_stdin", run=self.id, data=data)
 
     async def eof(self) -> None:
         """Close command stdin."""
-        await _request("omp.env.Run.eof", run=self.id)
+        await _call("run_eof", run=self.id)
 
     async def signal(self, signal: str) -> None:
         """Signal the Environment-owned process group."""
-        await _request("omp.env.Run.signal", run=self.id, signal=signal)
+        await _call("run_signal", run=self.id, signal=signal)
 
     async def resize(self, rows: int, columns: int) -> None:
         """Resize the command PTY."""
-        await _request("omp.env.Run.resize", run=self.id, rows=rows, columns=columns)
+        await _call("run_resize", run=self.id, rows=rows, columns=columns)
 
     def cancel(self) -> None:
         """Request non-blocking structural command teardown."""
@@ -1475,7 +1484,7 @@ class Run:
 
     async def detach(self, name: str) -> None:
         """Relinquish the guard to an Environment-owned named job."""
-        await _request("omp.env.Run.detach", run=self.id, name=name)
+        await _call("run_detach", run=self.id, name=name)
 
 
 class Session:
@@ -1490,18 +1499,16 @@ class Session:
 
     async def run(self, script: str, **options: Any) -> Run:
         """Start one serialized command in this session."""
-        result = await _request(
-            "omp.env.Session.run", session=self.id, script=script, **options
-        )
-        if isinstance(result, Run):
-            return result
-        return Run(result["id"])
+        result = await _call("session_run", session=self.id, script=script, **options)
+        if not isinstance(result, StartedRun):
+            raise TypeError("session backend returned an invalid run receipt")
+        return Run(result.id)
 
     async def close(self) -> None:
         """Close this session idempotently."""
         if not self._closed:
             self._closed = True
-            await _request("omp.env.Session.close", session=self.id)
+            await _call("session_close", session=self.id)
 
     async def __aenter__(self) -> Session:
         return self
@@ -1575,7 +1582,7 @@ def _as_completed(value: Any) -> Completed:
 
 
 async def _run_events(run_id: bytes) -> AsyncIterator[Output | Exit]:
-    async for value in _stream("omp.env.Run.events", run=run_id):
+    async for value in _stream("run_events", run=run_id):
         if isinstance(value, (Output, Exit)):
             yield value
         elif isinstance(value, Mapping) and "status" in value:
@@ -1748,9 +1755,9 @@ async def _http_request(
         raise ValueError("redirects must be between 0 and 10")
     if type(body) is not bytes:
         raise TypeError("HTTP request body must be bytes")
-    result = await _request(
-        operation,
-        method=method,
+    result = await _call(
+        "http_request",
+        method,
         url=url,
         body=body,
         headers=headers,
@@ -1877,18 +1884,13 @@ class Process:
     async def info(self) -> ProcessInfo:
         """Return the current generation snapshot."""
         return _as_process_info(
-            await _request(
-                "omp.env.Process.info", name=self.name, generation=self.generation
-            )
+            await _call("process_info", name=self.name, generation=self.generation)
         )
 
     async def _output(self, after: int) -> AsyncIterator[ProcessOutput]:
-        async for value in _stream(
-            "omp.env.Process.output",
-            name=self.name,
-            generation=self.generation,
-            after=after,
-        ):
+        async for value in _stream("process_output", name=self.name,
+        generation=self.generation,
+        after=after,):
             yield _as_process_output(value)
 
     def output(self, *, after: int = 0) -> AsyncIterator[ProcessOutput]:
@@ -1896,9 +1898,7 @@ class Process:
         return self._output(after)
 
     async def _states(self) -> AsyncIterator[ProcessInfo]:
-        async for value in _stream(
-            "omp.env.Process.states", name=self.name, generation=self.generation
-        ):
+        async for value in _stream("process_states", name=self.name, generation=self.generation):
             yield _as_process_info(value)
 
     def states(self) -> AsyncIterator[ProcessInfo]:
@@ -1907,25 +1907,19 @@ class Process:
 
     async def send(self, data: bytes) -> None:
         """Send bytes to process stdin."""
-        await _request(
-            "omp.env.Process.send",
-            name=self.name,
-            generation=self.generation,
-            data=data,
-        )
+        await _call("process_send", name=self.name,
+        generation=self.generation,
+        data=data,)
 
     async def eof(self) -> None:
         """Close process stdin."""
-        await _request(
-            "omp.env.Process.eof",
-            name=self.name,
-            generation=self.generation,
-        )
+        await _call("process_eof", name=self.name,
+        generation=self.generation,)
 
     async def send_secret(self, name: str, value: str) -> None:
         """Inject a scoped secret without exposing it through argv or environment."""
-        await _request(
-            "omp.env.Process.send_secret",
+        await _call(
+            "process_send_secret",
             name=self.name,
             generation=self.generation,
             secret_name=name,
@@ -1934,36 +1928,24 @@ class Process:
 
     async def signal(self, signal: str) -> None:
         """Signal the Environment-owned process group."""
-        await _request(
-            "omp.env.Process.signal",
-            name=self.name,
-            generation=self.generation,
-            signal=signal,
-        )
+        await _call("process_signal", name=self.name,
+        generation=self.generation,
+        signal=signal,)
 
     async def stop(self, **options: Any) -> ProcessInfo:
         """Stop the process tree and return its terminal state."""
         return _as_process_info(
-            await _request(
-                "omp.env.Process.stop",
-                name=self.name,
-                generation=self.generation,
-                **options,
-            )
+            await _call("process_stop", name=self.name,
+            generation=self.generation,
+            **options,)
         )
 
     async def restart(self) -> Process:
         """Restart from the retained launch spec and return the next generation."""
-        result = await _request(
-            "omp.env.Process.restart", name=self.name, generation=self.generation
-        )
-        return (
-            result
-            if isinstance(result, Process)
-            else Process(
-                result["name"], result["generation"], result.get("endpoint")
-            )
-        )
+        result = await _call("process_restart", name=self.name, generation=self.generation)
+        if not isinstance(result, StartedProcess):
+            raise TypeError("process backend returned an invalid restart receipt")
+        return Process(result.name, result.generation, result.endpoint)
 
 
 class BlobWriter:
@@ -1977,12 +1959,12 @@ class BlobWriter:
 
     async def write(self, chunk: bytes) -> None:
         """Append one ordered byte chunk."""
-        await _request("omp.env.BlobWriter.write", upload=self._upload, chunk=chunk)
+        await _call("blob_write", upload=self._upload, chunk=chunk)
 
     async def commit(self) -> BlobRef:
         """Commit staged chunks and return their content identity."""
         self._committed = True
-        return await _request("omp.env.BlobWriter.commit", upload=self._upload)
+        return await _call("blob_commit", upload=self._upload)
 
     def abort(self) -> None:
         """Abandon staged chunks without making content visible."""
@@ -2004,10 +1986,10 @@ class _Sh:
         cwd = options.get("cwd")
         if cwd is not None:
             options["cwd"] = _env_path(cwd, "cwd")
-        result = _snapshot_backend().session(options)
-        if isinstance(result, Session):
-            return result
-        return Session(result["id"], result["cwd"])
+        result = _snapshot_backend().session_open(**options)
+        if not isinstance(result, OpenedSession):
+            raise TypeError("session backend returned an invalid open receipt")
+        return Session(result.id, result.cwd)
 
     async def run(self, script: str, **options: Any) -> Completed:
         """Run a command and collect its bounded completion receipt."""
@@ -2037,19 +2019,19 @@ class _Proc:
         cwd = options.get("cwd")
         if cwd is not None:
             options["cwd"] = _env_path(cwd, "cwd")
-        result = await _request("omp.env.proc.start", name=name, script=script, **options)
-        return (
-            result
-            if isinstance(result, Process)
-            else Process(result["name"], result["generation"], result.get("endpoint"))
-        )
+        result = await _call("proc_start", name=name, script=script, **options)
+        if not isinstance(result, StartedProcess):
+            raise TypeError("process backend returned an invalid start receipt")
+        return Process(result.name, result.generation, result.endpoint)
 
     async def adopt(self, name: str) -> Process | None:
         """Adopt a live named process if present."""
-        result = await _request("omp.env.proc.adopt", name=name)
-        if result is None or isinstance(result, Process):
-            return result
-        return Process(result["name"], result["generation"], result.get("endpoint"))
+        result = await _call("proc_adopt", name=name)
+        if result is None:
+            return None
+        if not isinstance(result, StartedProcess):
+            raise TypeError("process backend returned an invalid adopt receipt")
+        return Process(result.name, result.generation, result.endpoint)
 
     async def ensure(
         self,
@@ -2071,27 +2053,20 @@ class _Proc:
             ready, (ReadyLog, ReadyTcp, ReadyPing, ReadyAll)
         ):
             raise TypeError("ready must be an omp.env.Ready value or None")
-        result = await _request(
-            "omp.env.proc.ensure",
-            name=name,
-            script=script,
-            cwd=cwd,
-            env=env,
-            pty=pty,
-            restart=restart,
-            ready=ready,
-        )
-        return (
-            result
-            if isinstance(result, Process)
-            else Process(
-                result["name"], result["generation"], result.get("endpoint")
-            )
-        )
+        result = await _call("proc_ensure", name=name,
+        script=script,
+        cwd=cwd,
+        env=env,
+        pty=pty,
+        restart=restart,
+        ready=ready,)
+        if not isinstance(result, StartedProcess):
+            raise TypeError("process backend returned an invalid ensure receipt")
+        return Process(result.name, result.generation, result.endpoint)
 
     async def list(self) -> list[ProcessInfo]:
         """List named processes visible to this connection."""
-        values = await _request("omp.env.proc.list")
+        values = await _call("proc_list")
         return [_as_process_info(value) for value in values]
 
 
@@ -2100,8 +2075,10 @@ class _Blobs:
 
     async def put(self, data: Any) -> BlobRef:
         """Store bytes or an iterable/async iterable of byte chunks."""
-        if type(data) is bytes or isinstance(data, EnvPath):
-            return await _request("omp.env.blobs.put", data=data)
+        if type(data) is bytes:
+            return await _call("blobs_put_bytes", data=data)
+        if isinstance(data, EnvPath):
+            return await _call("blobs_put_path", data=data)
         writer = self.writer()
         try:
             if hasattr(data, "__aiter__"):
@@ -2126,7 +2103,7 @@ class _Blobs:
 
     async def get(self, ref: BlobRef, *, offset: int = 0, length: int | None = None) -> bytes:
         """Fetch a blob or byte range as one bytes object."""
-        value = await _request("omp.env.blobs.get", ref=ref, offset=offset, length=length)
+        value = await _call("blobs_get", ref=ref, offset=offset, length=length)
         if type(value) is not bytes:
             raise TypeError("blob backend must return bytes")
         return value
@@ -2135,16 +2112,16 @@ class _Blobs:
         self, ref: BlobRef, *, offset: int = 0, length: int | None = None
     ) -> AsyncIterator[bytes]:
         """Stream a blob without materializing the full payload."""
-        return _stream("omp.env.blobs.stream", ref=ref, offset=offset, length=length)
+        return _stream("blobs_stream", ref=ref, offset=offset, length=length)
 
     async def stat(self, ref: BlobRef) -> BlobStat:
         """Return blob presence and stored size."""
-        result = await _request("omp.env.blobs.stat", ref=ref)
+        result = await _call("blobs_stat", ref=ref)
         return result if isinstance(result, BlobStat) else BlobStat(**result)
 
     async def delete(self, ref: BlobRef) -> bool:
         """Delete a blob and report whether it existed."""
-        return await _request("omp.env.blobs.delete", ref=ref)
+        return await _call("blobs_delete", ref=ref)
 
 
 class _Find:
@@ -2155,21 +2132,21 @@ class _Find:
         root = options.get("root")
         if root is not None:
             options["root"] = _env_path(root, "root")
-        return await _request("omp.env.find.files", **options)
+        return await _call("find_files", **options)
 
     def walk(self, **options: Any) -> AsyncIterator[Entry]:
         """Stream workspace entries lazily."""
         root = options.get("root")
         if root is not None:
             options["root"] = _env_path(root, "root")
-        return _stream("omp.env.find.walk", **options)
+        return _stream("find_walk", **options)
 
     async def grep(self, pattern: str | bytes, **options: Any) -> list[Match]:
         """Search workspace contents under the server-side walker."""
         root = options.get("root")
         if root is not None:
             options["root"] = _env_path(root, "root")
-        return await _request("omp.env.find.grep", pattern=pattern, **options)
+        return await _call("find_grep", pattern=pattern, **options)
 
 
 docs = _Docs()
@@ -2181,7 +2158,45 @@ blobs = _Blobs()
 find = _Find()
 
 
+# DATA-plane response values are native frozen pyclasses. Import them only
+# after request-side enums are initialized because Rust caches their members.
+from _omp import (
+    BlobStat,
+    Completed,
+    CopyResult,
+    DirEntry,
+    DocEvent,
+    Entry,
+    EnvInfo,
+    Exit,
+    HttpResponse,
+    LspBinding,
+    LspBindingEvent,
+    LspEvent,
+    Match,
+    OpenedDoc,
+    OpenedSession,
+    Output,
+    PathMeta,
+    ProcessInfo,
+    ProcessOutput,
+    Revision,
+    Summary,
+    SummarySegment,
+    SummaryUnavailable,
+    SymlinkTarget,
+    SyncPolicy,
+    StartedProcess,
+    StartedRun,
+    TxnOutcome,
+    TxnReceipt,
+    WorktreeInfo,
+)
+
+
 __all__ = (
+
+
     "AlreadyExists",
     "BlobStat",
     "BlobWriter",
@@ -2263,8 +2278,14 @@ __all__ = (
     "SyncKind",
     "SyncPolicy",
     "TimedOut",
-    "Unsupported",
+    "Unsupported",    "OpenedDoc",
+    "OpenedSession",
+    "StartedProcess",
+    "StartedRun",
+
     "Txn",
+    "TxnOutcome",
+    "TxnReceipt",
     "WorktreeInfo",
     "blobs",
     "direct_filesystem",

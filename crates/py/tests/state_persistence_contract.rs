@@ -61,7 +61,7 @@ def session_row(session_id="session-a", title="Primary"):
 
 def artifact_ref():
     return {
-        "id": "a1",
+        "id": "1",
         "hash": HASH,
         "media_type": "text/plain",
         "byte_len": 5,
@@ -71,7 +71,7 @@ def artifact_ref():
 def artifact_stat():
     return {
         "ref": artifact_ref(),
-        "url": "artifact://a1",
+        "url": "artifact://1",
         "media_type": "text/plain",
         "byte_len": 5,
         "description": "sample",
@@ -212,10 +212,10 @@ assert omp.secrets.is_masked(masked)
 async def exercise():
     blob = omp.BlobRef(bytes.fromhex(HASH), 5)
     ref = await artifacts.adopt(blob, media_type="text/plain")
-    assert ref.id == "a1"
+    assert ref.id == "1"
     metadata = await artifacts.stat(ref)
     assert metadata.reachable_from[0] == omp.EntryId("session-a", 4)
-    assert (await artifacts.list())[0].url == omp.ArtifactUrl("artifact://a1")
+    assert (await artifacts.list())[0].url == omp.ArtifactUrl("artifact://1")
     await artifacts.pin(ref, omp.ArtifactLifetime.SESSION)
 
     metadata_rows = await creds.list("acme")
@@ -241,7 +241,7 @@ async def exercise():
     assert report.total.duration == omp.Duration("5ms")
     entries = [entry async for entry in sessions.journal("session-a", since=omp.EntryId("session-a", 1))]
     assert entries[0].raw == b'{"answer":42}'
-    assert entries[0].artifact.id == "a1"
+    assert entries[0].artifact.id == "1"
     try:
         await sessions.delete("session-a")
     except omp.PermissionDenied:

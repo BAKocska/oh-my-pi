@@ -23,20 +23,21 @@ class Backend:
     def __init__(self):
         self.calls = []
 
-    async def request(self, operation, arguments):
-        self.calls.append((operation, arguments))
-        if operation == "omp.env.worktree":
-            return {"id": "wt", "root": "file:///workspace/wt", "base": "base", "generation": 4}
-        if operation == "omp.env.Process.restart":
-            return {"name": arguments["name"], "generation": arguments["generation"] + 1,
-                    "endpoint": "tcp://127.0.0.1:9000"}
-        if operation == "omp.env.http.get":
-            return {"status": 200, "headers": {}, "body": b"ok", "final_url": arguments["url"]}
-        raise AssertionError(operation)
+    async def worktree(self):
+        self.calls.append(("worktree",))
+        return omp.env.WorktreeInfo("wt", omp.EnvPath("file:///workspace/wt"), "base", 4)
 
-    def stream(self, operation, arguments):
-        self.calls.append((operation, arguments))
-        return ()
+    async def process_restart(self, name, generation):
+        self.calls.append(("process_restart", name, generation))
+        return omp.env.StartedProcess(name, generation + 1, "tcp://127.0.0.1:9000")
+
+    async def http_request(self, method, url, **options):
+        self.calls.append(("http_request", method, url, options))
+        return omp.env.HttpResponse(200, {}, b"ok", url)
+
+    async def fs_stat(self, path):
+        self.calls.append(("fs_stat", path))
+        return omp.env.PathMeta(path, omp.env.FileKind.DIRECTORY, 0)
 
 backend = Backend()
 receipt = omp.env.EnvInfo(
@@ -44,7 +45,7 @@ receipt = omp.env.EnvInfo(
     server_epoch=b"epoch", server_version="test", server_build="build",
     schema_rev=1,
     capabilities=frozenset({omp.env.Capability.WORKTREE, omp.env.Capability.PROCESS,
-                            omp.env.Capability.NET}), remote=False,
+                            omp.env.Capability.NET, omp.env.Capability.FS_READ}), remote=False,
 )
 tokens = omp.env._install_backend(backend, receipt)
 
@@ -56,6 +57,9 @@ async def exercise():
     assert process.endpoint == "tcp://127.0.0.1:9000"
     response = await omp.env.http_get("https://example.test")
     assert response.status == 200 and response.body == b"ok"
+    meta = await omp.env.fs.stat(omp.EnvPath("file:///workspace"))
+    assert isinstance(meta, omp.env.PathMeta)
+    assert meta.kind is omp.env.FileKind.DIRECTORY
 
 asyncio.run(exercise())
 omp.env._reset_backend(tokens)

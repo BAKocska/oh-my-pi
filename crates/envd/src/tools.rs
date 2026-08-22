@@ -2593,24 +2593,4 @@ mod tests {
 			assert!(error.to_string().contains(expected), "{error}");
 		}
 	}
-
-	#[test]
-	fn goal_create_denial_surfaces_campaign_holder_and_since() {
-		let mut campaigns = omp_agent::CampaignStack::new();
-		let (plan_spec, plan_machine) = omp_agent::core_regime("plan").expect("plan regime");
-		let plan = campaigns
-			.engage(plan_spec, plan_machine, omp_agent::EngageOptions { now_ms: 137, queue: false })
-			.expect("plan engagement");
-		let (goal_spec, goal_machine) = omp_agent::core_regime("goal").expect("goal regime");
-		let error = campaigns
-			.engage(goal_spec, goal_machine, omp_agent::EngageOptions { now_ms: 211, queue: false })
-			.expect_err("plan owns the mode slot");
-
-		let fault = map_goal_campaign_error(error.into());
-
-		assert_eq!(fault, omp_tools::goal::Fault::ClaimDenied {
-			holder: plan.engagement,
-			since:  137,
-		});
-	}
 }

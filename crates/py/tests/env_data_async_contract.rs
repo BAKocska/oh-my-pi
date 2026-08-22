@@ -34,19 +34,19 @@ class Backend:
         self.chunks = []
         self.aborted = False
 
-    def stream(self, operation, arguments):
-        self.calls.append((operation, arguments))
-        if operation == "omp.env.blobs.stream":
-            stream = Stream([b"a", b"b"])
-        elif operation == "omp.env.docs.Doc.events":
-            stream = Stream([{
-                "sequence": 4, "kind": "committed",
-                "revision": {"sequence": 2, "content_hash": b"new"},
-                "previous_revision": {"sequence": 1, "content_hash": b"old"},
-                "txn_id": b"txn", "invalidated_txn_ids": (), "previous_path": None,
-            }])
-        else:
-            raise AssertionError(operation)
+    def blobs_stream(self, ref, offset=0, length=None):
+        self.calls.append(("blobs_stream", ref, offset, length))
+        stream = Stream([b"a", b"b"])
+        self.streams.append(stream)
+        return stream
+
+    def doc_events(self, lease):
+        self.calls.append(("doc_events", lease))
+        stream = Stream([omp.env.DocEvent(
+            4, omp.env.DocEventKind.COMMITTED,
+            omp.env.Revision(2, b"new"), omp.env.Revision(1, b"old"),
+            b"txn", (), None,
+        )])
         self.streams.append(stream)
         return stream
 
@@ -57,15 +57,15 @@ class Backend:
         assert upload is self.upload
         self.aborted = True
 
-    async def request(self, operation, arguments):
-        self.calls.append((operation, arguments))
-        if operation == "omp.env.BlobWriter.write":
-            assert arguments["upload"] is self.upload
-            self.chunks.append(arguments["chunk"])
-            return None
-        if operation == "omp.env.BlobWriter.commit":
-            return omp.BlobRef(bytes.fromhex("00" * 32), sum(map(len, self.chunks)))
-        raise AssertionError(operation)
+    async def blob_write(self, upload, chunk):
+        self.calls.append(("blob_write", upload, chunk))
+        assert upload is self.upload
+        self.chunks.append(chunk)
+
+    async def blob_commit(self, upload):
+        self.calls.append(("blob_commit", upload))
+        assert upload is self.upload
+        return omp.BlobRef(bytes.fromhex("00" * 32), sum(map(len, self.chunks)))
 
 backend = Backend()
 receipt = omp.env.EnvInfo(

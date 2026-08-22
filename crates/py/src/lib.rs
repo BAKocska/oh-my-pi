@@ -28,6 +28,7 @@
 //! to its own binaries; downstream crates need it in their own build script.
 
 mod bindings;
+mod env_types;
 pub mod interrupt;
 
 use std::{

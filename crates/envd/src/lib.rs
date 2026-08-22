@@ -33,6 +33,7 @@ pub mod process_log;
 pub mod process_store;
 pub mod recovery;
 mod resource_materializer;
+pub mod schedules;
 pub mod search_backend;
 mod server;
 pub mod shell_profile;
@@ -216,7 +217,7 @@ async fn connect_presence_owner(
 }
 
 /// Copies session-local artifacts into the replacement session root.
-pub(crate) fn migrate_session_artifacts(
+pub fn migrate_session_artifacts(
 	sessions_dir: &Path,
 	source_session: &str,
 	destination_session: &str,
@@ -784,6 +785,15 @@ impl ProjectEnvironment {
 	pub fn eval_bridge(&self) -> Arc<eval::SessionBridgeHost> {
 		Arc::clone(&self.eval_bridge)
 	}
+	/// Binds one exact SDK session parent without enabling the compatibility
+	/// fallback used by legacy single-parent callers.
+	pub fn bind_eval_sdk_parent(
+		&self,
+		owner: Str,
+		parent: Arc<dyn eval::ParentSessionHost>,
+	) -> Result<impl Drop + use<>, eval::BridgeHostError> {
+		self.eval_bridge.bind_sdk_parent(owner, parent)
+	}
 
 	/// Returns the late-bound memory reflection bridge.
 	pub fn reflection_bridge(&self) -> Arc<memory::ReflectionBridgeHost> {
@@ -819,6 +829,40 @@ impl ProjectEnvironment {
 	{
 		self.lifecycle.server.extension_control_authority(identity)
 	}
+	/// Returns the live generation-fenced extension callback transport used by
+	/// provider, campaign, presentation, and verdict owners.
+	pub fn extension_callback_dispatcher(
+		&self,
+	) -> Arc<dyn exthost::dispatch::CallbackDispatcher> {
+		self.lifecycle.server.extension_callback_dispatcher()
+	}
+
+	/// Returns the sealed deployment manifest only when every authenticated
+	/// connection and generation fact exactly matches the live activation.
+	pub fn extension_control_manifest(
+		&self,
+		identity: &exthost::control::ControlConnectionIdentity,
+	) -> Option<exthost::ExtensionManifest> {
+		self.lifecycle.server.extension_control_manifest(identity)
+	}
+	/// Returns full frozen provider and campaign declarations for one exact
+	/// authenticated extension generation.
+	pub fn extension_registry_evidence(
+		&self,
+		identity: &exthost::control::ControlConnectionIdentity,
+	) -> Option<Arc<worker::SealedRegistryEvidence>> {
+		self.lifecycle.server.extension_registry_evidence(identity)
+	}
+
+	/// Returns the live resolver over exact-generation campaign declarations
+	/// retained from extension FREEZE acknowledgments.
+	pub fn extension_campaign_resolver(&self) -> Arc<worker::ExtensionCampaignResolver> {
+		let server = Arc::clone(&self.lifecycle.server);
+		let callbacks = server.extension_callback_dispatcher();
+		worker::ExtensionCampaignResolver::new(callbacks, move |identity| {
+			server.extension_registry_evidence(identity)
+		})
+	}
 
 	/// Constructs extension-scoped MCP CONTROL over this active Environment.
 	pub fn mcp_control(
@@ -840,6 +884,27 @@ impl ProjectEnvironment {
 	) -> worker::AgentsControlAuthorityBinding {
 		self.lifecycle.server.bind_agents_control_authority(factory)
 	}
+	/// Atomically binds every driver/app-owned CONTROL domain to one live chat
+	/// session until the returned generation-fenced lease is dropped or
+	/// superseded.
+	pub fn bind_domain_control_factories(
+		&self,
+		factories: worker::ExternalDomainControlFactories,
+	) -> worker::ExternalDomainControlBinding {
+		self.lifecycle.server.bind_domain_control_factories(factories)
+	}
+	/// Atomically replaces the live chat parent and every driver/app-owned
+	/// CONTROL domain under one generation fence and one teardown lease.
+	pub fn bind_external_control_authorities(
+		&self,
+		agents: Arc<dyn exthost::control::ControlAuthorityFactory>,
+		domains: worker::ExternalDomainControlFactories,
+	) -> worker::ExternalControlAuthorityBinding {
+		self
+			.lifecycle
+			.server
+			.bind_external_control_authorities(agents, domains)
+	}
 
 	/// Binds authenticated extension CONTROL to the active Agent Journal until
 	/// the returned sole-owner lease is dropped.
@@ -853,6 +918,19 @@ impl ProjectEnvironment {
 		sender: omp_agent::control::ControlSender,
 	) -> Result<server::AgentControlBinding, EnvdError> {
 		self.lifecycle.server.bind_agent_control(sender)
+	}
+	/// Installs the project-lifetime backend which attaches or starts durable
+	/// Agent sessions for scheduled delivery.
+	///
+	/// # Errors
+	///
+	/// Returns an environment protocol failure if the durable scheduler owner
+	/// has stopped or was generation-fenced by a replacement environment.
+	pub async fn bind_schedule_delivery(
+		&self,
+		backend: Arc<dyn schedules::ScheduleDeliveryBackend>,
+	) -> Result<(), EnvdError> {
+		self.lifecycle.server.bind_schedule_delivery(backend).await
 	}
 
 	/// Binds extension device availability notifications to the active turn.

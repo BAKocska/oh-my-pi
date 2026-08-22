@@ -1661,7 +1661,7 @@ mod tests {
 				PreludeParamStub {
 					name:         sf!("options"),
 					kind:         PreludeParamKind::KeywordOnly,
-					default_json: Some(sf!(r#"[null,{"ready":false}]"#)),
+					default_json: Some(Str::from(r#"[null,{"ready":false}]"#)),
 					annotation:   None,
 				},
 			],
