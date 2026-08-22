@@ -1,0 +1,49 @@
+---
+source: crates/shell-engine/src/parser/tokenizer.rs
+expression: "vec![(\"pipeline\",\n\"printf '%s\\\\n' one | grep one |& sed 's/one/two/' && echo done\",\nflat_shell_segments(\"printf '%s\\\\n' one | grep one |& sed 's/one/two/' && echo done\"),),\n(\"comments\", \"cat file |\\\\n# keep pipe pending\\\\ngrep needle; echo ok\",\nflat_shell_segments(\"cat file |\\\\n# keep pipe pending\\\\ngrep needle; echo ok\"),),\n(\"redirects\", \"echo x >out 2>&1; cat <&0\",\nflat_shell_segments(\"echo x >out 2>&1; cat <&0\"),),\n(\"conservative\", \"echo $(pwd)\", flat_shell_segments(\"echo $(pwd)\")),]"
+---
+[
+  ("pipeline", "printf \'%s\\n\' one | grep one |& sed \'s/one/two/\' && echo done", [
+    FlatShellCommandSegment(
+      text: "printf \'%s\\n\' one",
+      piped_stdin: false,
+    ),
+    FlatShellCommandSegment(
+      text: "grep one",
+      piped_stdin: true,
+    ),
+    FlatShellCommandSegment(
+      text: "sed \'s/one/two/\'",
+      piped_stdin: true,
+    ),
+    FlatShellCommandSegment(
+      text: "echo done",
+      piped_stdin: false,
+    ),
+  ]),
+  ("comments", "cat file |\\n# keep pipe pending\\ngrep needle; echo ok", [
+    FlatShellCommandSegment(
+      text: "cat file",
+      piped_stdin: false,
+    ),
+    FlatShellCommandSegment(
+      text: "\\n# keep pipe pending\\ngrep needle",
+      piped_stdin: true,
+    ),
+    FlatShellCommandSegment(
+      text: "echo ok",
+      piped_stdin: false,
+    ),
+  ]),
+  ("redirects", "echo x >out 2>&1; cat <&0", [
+    FlatShellCommandSegment(
+      text: "echo x >out 2>&1",
+      piped_stdin: false,
+    ),
+    FlatShellCommandSegment(
+      text: "cat <&0",
+      piped_stdin: false,
+    ),
+  ]),
+  ("conservative", "echo $(pwd)", []),
+]

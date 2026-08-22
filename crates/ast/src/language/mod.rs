@@ -347,6 +347,35 @@ macro_rules! define_support_langs {
 			pub fn from_path(path: &Path) -> Option<Self> {
 				from_extension(path)
 			}
+			/// Syntax-highlighter identifier for this parsed language.
+			pub const fn highlight_id(self) -> &'static str {
+				self.canonical_name()
+			}
+
+			/// LSP `textDocument/didOpen` identifier for this language and path.
+			///
+			/// The path distinguishes dialect extensions such as TSX/JSX and
+			/// Terraform from their shared parser language.
+			pub fn lsp_id(self, path: &Path) -> &'static str {
+				let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+				match self {
+					Self::Tsx => "typescriptreact",
+					Self::JavaScript if extension.eq_ignore_ascii_case("jsx") => "javascriptreact",
+					Self::Bash => "shellscript",
+					Self::Hcl if extension.eq_ignore_ascii_case("tf") => "terraform",
+					Self::Make if path.file_name().and_then(|value| value.to_str()).is_some_and(|name| {
+						name.eq_ignore_ascii_case("makefile") || name.eq_ignore_ascii_case("gnumakefile")
+					}) => "makefile",
+					Self::ObjC
+					| Self::Solidity
+					| Self::Odin
+					| Self::Starlark
+					| Self::Verilog
+					| Self::Diff
+					| Self::Just => "plaintext",
+					_ => self.canonical_name(),
+				}
+			}
 
 			/// Returns every accepted alias in sorted order.
 			pub fn sorted_aliases() -> &'static [&'static str] {
@@ -483,6 +512,45 @@ impl fmt::Display for SupportLang {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "{self:?}")
 	}
+}
+
+/// Highlight and language-server identifiers inferred from one path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LanguageIds {
+	/// Syntax-highlighter identifier.
+	pub highlight: &'static str,
+	/// LSP `textDocument/didOpen` identifier.
+	pub lsp:       &'static str,
+}
+
+/// Infers separate highlighter and LSP identifiers from a path.
+///
+/// `.env` and `.env.*` are presentation-only text formats and therefore do
+/// not pretend to have an AST parser.
+#[must_use]
+pub fn language_ids_from_path(path: &Path) -> Option<LanguageIds> {
+	let name = path.file_name()?.to_str()?;
+	if name.eq_ignore_ascii_case(".env")
+		|| name
+			.get(..5)
+			.is_some_and(|prefix| prefix.eq_ignore_ascii_case(".env."))
+	{
+		return Some(LanguageIds { highlight: "env", lsp: "plaintext" });
+	}
+	let language = SupportLang::from_path(path)?;
+	Some(LanguageIds { highlight: language.highlight_id(), lsp: language.lsp_id(path) })
+}
+
+/// Returns the syntax-highlighter identifier inferred from `path`.
+#[must_use]
+pub fn highlight_language_id(path: &Path) -> Option<&'static str> {
+	language_ids_from_path(path).map(|ids| ids.highlight)
+}
+
+/// Returns the LSP language identifier, falling back to `plaintext`.
+#[must_use]
+pub fn lsp_language_id(path: &Path) -> &'static str {
+	language_ids_from_path(path).map_or("plaintext", |ids| ids.lsp)
 }
 
 // ── Dispatch macro ──────────────────────────────────────────────────────
@@ -671,6 +739,27 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
 	let name = path.file_name()?.to_str()?;
 	if name == "Makefile" || name == "makefile" || name == "GNUmakefile" {
 		return Some(SupportLang::Make);
+	}
+	#[cfg(test)]
+	mod language_id_tests {
+		use super::*;
+
+		#[test]
+		fn path_ids_keep_highlight_and_lsp_dialects_separate() {
+			assert_eq!(
+				language_ids_from_path(Path::new("view.tsx")),
+				Some(LanguageIds { highlight: "tsx", lsp: "typescriptreact" })
+			);
+			assert_eq!(
+				language_ids_from_path(Path::new("view.jsx")),
+				Some(LanguageIds { highlight: "javascript", lsp: "javascriptreact" })
+			);
+			assert_eq!(
+				language_ids_from_path(Path::new(".env.production")),
+				Some(LanguageIds { highlight: "env", lsp: "plaintext" })
+			);
+			assert_eq!(lsp_language_id(Path::new("unknown.bin")), "plaintext");
+		}
 	}
 	if name == "Justfile" || name == "justfile" {
 		return Some(SupportLang::Just);

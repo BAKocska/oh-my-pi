@@ -43,6 +43,16 @@ pub enum Token {
 	Word(Str, SourceSpan),
 }
 
+/// One top-level command segment retained with its original spelling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct FlatShellCommandSegment<'a> {
+	/// Original segment text with quoting and escaping preserved.
+	pub text:        &'a str,
+	/// Whether this stage consumes the previous stage through `|` or `|&`.
+	pub piped_stdin: bool,
+}
+
 impl Token {
 	/// Returns the string value of the token.
 	pub fn to_str(&self) -> &str {
@@ -444,6 +454,152 @@ impl TokenParseState {
 
 		Ok(Some(result))
 	}
+}
+
+/// Extracts conservative top-level command segments for admission consumers.
+///
+/// The scanner retains original text and marks only `|`/`|&` successors as
+/// consuming piped stdin. It returns an empty list for grouping, expansion,
+/// heredoc, malformed quote, or dangling-escape syntax whose execution context
+/// cannot be represented by a flat segment list.
+#[must_use]
+pub fn flat_shell_segments(command: &str) -> Vec<FlatShellCommandSegment<'_>> {
+	let bytes = command.as_bytes();
+	let mut segments = Vec::new();
+	let mut segment_start = 0_usize;
+	let mut in_single = false;
+	let mut in_double = false;
+	let mut at_word_start = true;
+	let mut current_piped = false;
+	let mut index = 0_usize;
+
+	while index < bytes.len() {
+		let byte = bytes[index];
+		if in_single {
+			if byte == b'\'' {
+				in_single = false;
+			}
+			index += 1;
+			continue;
+		}
+		if in_double {
+			if byte == b'\\' {
+				if index + 1 >= bytes.len() {
+					return Vec::new();
+				}
+				index += 2;
+				continue;
+			}
+			if byte == b'"' {
+				in_double = false;
+				index += 1;
+				continue;
+			}
+			if byte == b'`' || (byte == b'$' && bytes.get(index + 1) == Some(&b'(')) {
+				return Vec::new();
+			}
+			index += 1;
+			continue;
+		}
+
+		match byte {
+			b'\'' => {
+				in_single = true;
+				at_word_start = false;
+				index += 1;
+				continue;
+			},
+			b'"' => {
+				in_double = true;
+				at_word_start = false;
+				index += 1;
+				continue;
+			},
+			b'\\' => {
+				if index + 1 >= bytes.len() {
+					return Vec::new();
+				}
+				index += 2;
+				at_word_start = false;
+				continue;
+			},
+			b'`' | b'(' | b')' => return Vec::new(),
+			b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => return Vec::new(),
+			b'<' if bytes.get(index + 1) == Some(&b'<') => return Vec::new(),
+			b'{' | b'}'
+				if at_word_start
+					&& bytes
+						.get(index + 1)
+						.is_none_or(|next| matches!(next, b' ' | b'\t' | b'\n' | b';')) =>
+			{
+				return Vec::new();
+			},
+			b'#' if at_word_start => {
+				let pushed =
+					push_flat_segment(command, segment_start, index, current_piped, &mut segments);
+				let Some(relative_newline) = command[index + 1..].find('\n') else {
+					return segments;
+				};
+				let newline = index + 1 + relative_newline;
+				index = newline + 1;
+				segment_start = index;
+				at_word_start = true;
+				if pushed {
+					current_piped = false;
+				}
+				continue;
+			},
+			_ => {},
+		}
+
+		let redirection_operator_character = match byte {
+			b'|' => index > 0 && bytes[index - 1] == b'>',
+			b'&' => {
+				(index > 0 && matches!(bytes[index - 1], b'>' | b'<'))
+					|| bytes.get(index + 1) == Some(&b'>')
+			},
+			_ => false,
+		};
+		if matches!(byte, b'\n' | b';' | b'|' | b'&') && !redirection_operator_character {
+			let pushed =
+				push_flat_segment(command, segment_start, index, current_piped, &mut segments);
+			let doubled = matches!(byte, b'|' | b'&') && bytes.get(index + 1) == Some(&byte);
+			let pipe_stderr = byte == b'|' && bytes.get(index + 1) == Some(&b'&');
+			if doubled || pipe_stderr {
+				index += 1;
+			}
+			if pushed || byte != b'\n' {
+				current_piped = byte == b'|' && !doubled;
+			}
+			segment_start = index + 1;
+			at_word_start = true;
+			index += 1;
+			continue;
+		}
+		at_word_start = matches!(byte, b' ' | b'\t');
+		index += 1;
+	}
+
+	if in_single || in_double {
+		return Vec::new();
+	}
+	push_flat_segment(command, segment_start, command.len(), current_piped, &mut segments);
+	segments
+}
+
+fn push_flat_segment<'a>(
+	command: &'a str,
+	start: usize,
+	end: usize,
+	piped_stdin: bool,
+	segments: &mut Vec<FlatShellCommandSegment<'a>>,
+) -> bool {
+	let text = command[start..end].trim();
+	if text.is_empty() {
+		return false;
+	}
+	segments.push(FlatShellCommandSegment { text, piped_stdin });
+	true
 }
 
 /// Break the given input shell script string into tokens, returning the tokens.
@@ -1308,6 +1464,28 @@ mod tests {
 
 	fn test_tokenizer(input: &str) -> Result<TokenizerResult<'_>> {
 		Ok(TokenizerResult { input, result: tokenize_str(input)? })
+	}
+
+	#[test]
+	fn flat_operator_segments_snapshot() {
+		assert_ron_snapshot!(vec![
+			(
+				"pipeline",
+				"printf '%s\\n' one | grep one |& sed 's/one/two/' && echo done",
+				flat_shell_segments("printf '%s\\n' one | grep one |& sed 's/one/two/' && echo done"),
+			),
+			(
+				"comments",
+				"cat file |\\n# keep pipe pending\\ngrep needle; echo ok",
+				flat_shell_segments("cat file |\\n# keep pipe pending\\ngrep needle; echo ok"),
+			),
+			(
+				"redirects",
+				"echo x >out 2>&1; cat <&0",
+				flat_shell_segments("echo x >out 2>&1; cat <&0"),
+			),
+			("conservative", "echo $(pwd)", flat_shell_segments("echo $(pwd)")),
+		]);
 	}
 
 	#[test]
