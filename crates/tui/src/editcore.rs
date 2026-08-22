@@ -2234,11 +2234,9 @@ impl SlashCommands {
 	pub fn new(commands: impl Into<Box<[Command]>>) -> Self {
 		Self { commands: commands.into(), usage: None }
 	}
+
 	/// Ranks equally matching command names by their persisted invocation count.
-	pub fn with_usage(
-		mut self,
-		usage: impl Fn(&str) -> u64 + Send + Sync + 'static,
-	) -> Self {
+	pub fn with_usage(mut self, usage: impl Fn(&str) -> u64 + Send + Sync + 'static) -> Self {
 		self.usage = Some(Arc::new(usage));
 		self
 	}
@@ -2298,10 +2296,12 @@ impl SlashCommands {
 					Suggestion {
 						value:       sf!("/{selected_name} "),
 						display:     SuggestionDisplay::Text(selected_name.clone()),
-						description: Some(command.status.as_ref().map_or_else(
-							|| command.description.clone(),
-							|status| status(),
-						)),
+						description: Some(
+							command
+								.status
+								.as_ref()
+								.map_or_else(|| command.description.clone(), |status| status()),
+						),
 						icon:        command.icon,
 						hint:        command.hint.clone(),
 						category:    Some(sf!("Commands")),
@@ -2311,22 +2311,18 @@ impl SlashCommands {
 			}
 		}
 		if !expand_skills && skill_count > 0 && SKILL_NAMESPACE.starts_with(&query) {
-			ranked.push((
-				command_score(&query, SKILL_NAMESPACE),
-				0,
-				Suggestion {
-					value:       sf!("/skill:"),
-					display:     SuggestionDisplay::Text(sf!("skill:")),
-					description: Some(sf!(
-						"{skill_count} skill{}",
-						if skill_count == 1 { "" } else { "s" }
-					)),
-					icon:        skill_icon,
-					hint:        None,
-					category:    Some(sf!("Commands")),
-					match_spans: fuzzy_match_spans(SKILL_NAMESPACE, &query),
-				},
-			));
+			ranked.push((command_score(&query, SKILL_NAMESPACE), 0, Suggestion {
+				value:       sf!("/skill:"),
+				display:     SuggestionDisplay::Text(sf!("skill:")),
+				description: Some(sf!(
+					"{skill_count} skill{}",
+					if skill_count == 1 { "" } else { "s" }
+				)),
+				icon:        skill_icon,
+				hint:        None,
+				category:    Some(sf!("Commands")),
+				match_spans: fuzzy_match_spans(SKILL_NAMESPACE, &query),
+			}));
 		}
 		ranked.sort_by_key(|(score, usage, _)| (Reverse(*score), Reverse(*usage)));
 		let items = ranked
@@ -2800,7 +2796,8 @@ mod tests {
 		usage.insert("settings", 4_u64);
 		let mut editor = Editor::new(EditorOptions::default());
 		editor.set_completion(Box::new(
-			SlashCommands::new(palette()).with_usage(move |name| usage.get(name).copied().unwrap_or(0)),
+			SlashCommands::new(palette())
+				.with_usage(move |name| usage.get(name).copied().unwrap_or(0)),
 		));
 		type_text(&mut editor, "/se");
 		let picker = editor.picker().expect("command candidates open");
@@ -2819,7 +2816,10 @@ mod tests {
 		type_text(&mut editor, "/");
 		let picker = editor.picker().expect("namespace candidates open");
 		assert!(
-			picker.suggestions.iter().any(|item| item.value() == "/skill:"),
+			picker
+				.suggestions
+				.iter()
+				.any(|item| item.value() == "/skill:"),
 			"collapsed namespace is offered"
 		);
 		assert!(
@@ -2840,7 +2840,12 @@ mod tests {
 				.collect::<Vec<_>>(),
 			["/skill:review ", "/skill:test "]
 		);
-		assert!(picker.suggestions.iter().all(|item| item.icon() == Some(Icon::Skill)));
+		assert!(
+			picker
+				.suggestions
+				.iter()
+				.all(|item| item.icon() == Some(Icon::Skill))
+		);
 	}
 
 	#[test]

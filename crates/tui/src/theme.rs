@@ -110,12 +110,12 @@ enum ColorValue {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ThemePatch {
-	fg:        Option<String>,
-	accent:    Option<String>,
-	info:      Option<String>,
-	ok:        Option<String>,
-	warn:      Option<String>,
-	err:       Option<String>,
+	fg:          Option<String>,
+	accent:      Option<String>,
+	info:        Option<String>,
+	ok:          Option<String>,
+	warn:        Option<String>,
+	err:         Option<String>,
 	muted:       Option<String>,
 	border:      Option<String>,
 	code_border: Option<String>,
@@ -198,9 +198,10 @@ fn apply_rich(
 		.and_then(|value| value.get("pageBg"))
 		.and_then(|value| match value {
 			serde_json::Value::String(source) => Some(ColorValue::Text(source.clone())),
-			serde_json::Value::Number(index) => {
-				index.as_u64().and_then(|index| u16::try_from(index).ok()).map(ColorValue::Index)
-			},
+			serde_json::Value::Number(index) => index
+				.as_u64()
+				.and_then(|index| u16::try_from(index).ok())
+				.map(ColorValue::Index),
 			_ => None,
 		})
 		.as_ref()
@@ -256,7 +257,11 @@ fn color_contrast(left: Color, right: Color) -> Option<f64> {
 	};
 	let left = relative_luminance([left_red, left_green, left_blue]);
 	let right = relative_luminance([right_red, right_green, right_blue]);
-	let (lighter, darker) = if left > right { (left, right) } else { (right, left) };
+	let (lighter, darker) = if left > right {
+		(left, right)
+	} else {
+		(right, left)
+	};
 	Some((lighter + 0.05) / (darker + 0.05))
 }
 
@@ -269,13 +274,12 @@ fn legible_fence_border(
 	if color_contrast(border, background).is_none_or(|ratio| ratio >= MIN_FENCE_CONTRAST) {
 		return border;
 	}
-	let target = if color_contrast(muted, background)
-		.is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST)
-	{
-		muted
-	} else {
-		foreground
-	};
+	let target =
+		if color_contrast(muted, background).is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST) {
+			muted
+		} else {
+			foreground
+		};
 	let (Color::Rgb(red, green, blue), Color::Rgb(to_red, to_green, to_blue)) = (border, target)
 	else {
 		return target;
@@ -284,11 +288,8 @@ fn legible_fence_border(
 		let blend = |from: u8, to: u8| {
 			((u16::from(from) * (255 - step) + u16::from(to) * step + 127) / 255) as u8
 		};
-		let candidate =
-			Color::Rgb(blend(red, to_red), blend(green, to_green), blend(blue, to_blue));
-		if color_contrast(candidate, background)
-			.is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST)
-		{
+		let candidate = Color::Rgb(blend(red, to_red), blend(green, to_green), blend(blue, to_blue));
+		if color_contrast(candidate, background).is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST) {
 			return candidate;
 		}
 	}
@@ -489,10 +490,7 @@ mod tests {
 				}
 				let background = Color::parse(background).expect("page background");
 				let ratio = color_contrast(resolved, background).expect("RGB colors");
-				assert!(
-					ratio >= MIN_FENCE_CONTRAST,
-					"{name} fence border contrast was {ratio:.3}:1"
-				);
+				assert!(ratio >= MIN_FENCE_CONTRAST, "{name} fence border contrast was {ratio:.3}:1");
 			}
 		}
 	}

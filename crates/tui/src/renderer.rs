@@ -324,47 +324,47 @@ impl RegisteredImage {
 /// retained physical screen model composes the raw previous frame with its
 /// stored viewport layers.
 pub struct Renderer<W: Write> {
-	writer:                  W,
-	previous:                Option<Frame>,
-	layers:                  SmallVec<StoredLayer, 4>,
-	layer_scratch:           SmallVec<StoredLayer, 4>,
+	writer:               W,
+	previous:             Option<Frame>,
+	layers:               SmallVec<StoredLayer, 4>,
+	layer_scratch:        SmallVec<StoredLayer, 4>,
 	/// Throwaway-screen baseline retained separately from normal-buffer history.
-	preview_previous:        Option<Frame>,
-	preview_layers:          SmallVec<StoredLayer, 4>,
-	preview_window:          Option<Window>,
-	preview_cursor:          Option<ScreenCursor>,
+	preview_previous:     Option<Frame>,
+	preview_layers:       SmallVec<StoredLayer, 4>,
+	preview_window:       Option<Window>,
+	preview_cursor:       Option<ScreenCursor>,
 	/// Reused ANSI cell-diff assembly buffer for steady-state paints.
-	paint_scratch:           String,
+	paint_scratch:        String,
 	/// Reused terminal output assembly buffer for steady-state paints.
-	output_scratch:          String,
-	viewport_height:         u16,
-	window_top:              u16,
-	committed_rows:          u16,
-	stable_rows:             u16,
-	width_epoch:             Option<WidthEpoch>,
-	width_epoch_capture:     Option<WidthEpochCapture>,
-	epoch_commits:           SmallVec<EpochCommit, 8>,
-	next_epoch:              u32,
-	cursor:                  Option<ScreenCursor>,
-	poisoned:                bool,
-	output_state:            OutputState,
-	backlog:                 OutputBacklogGuard,
+	output_scratch:       String,
+	viewport_height:      u16,
+	window_top:           u16,
+	committed_rows:       u16,
+	stable_rows:          u16,
+	width_epoch:          Option<WidthEpoch>,
+	width_epoch_capture:  Option<WidthEpochCapture>,
+	epoch_commits:        SmallVec<EpochCommit, 8>,
+	next_epoch:           u32,
+	cursor:               Option<ScreenCursor>,
+	poisoned:             bool,
+	output_state:         OutputState,
+	backlog:              OutputBacklogGuard,
 	#[cfg(any(windows, target_os = "linux"))]
-	conpty_hosted:           bool,
-	images:                  BTreeMap<u32, RegisteredImage>,
-	alt_screen:              bool,
-	graphics:                Graphics,
-	cell_pixel_width:        u16,
-	cell_pixel_height:       u16,
-	tmux_passthrough:        bool,
-	resize_in_place:         bool,
-	resize_scrollback:       ResizeScrollbackMode,
-	mux_pushed_rows:         u16,
-	mux_push_seam:           u16,
-	sync_output:             bool,
-	screen_to_scrollback:    bool,
-	hyperlinks:              bool,
-	margin_scrollback:       bool,
+	conpty_hosted:        bool,
+	images:               BTreeMap<u32, RegisteredImage>,
+	alt_screen:           bool,
+	graphics:             Graphics,
+	cell_pixel_width:     u16,
+	cell_pixel_height:    u16,
+	tmux_passthrough:     bool,
+	resize_in_place:      bool,
+	resize_scrollback:    ResizeScrollbackMode,
+	mux_pushed_rows:      u16,
+	mux_push_seam:        u16,
+	sync_output:          bool,
+	screen_to_scrollback: bool,
+	hyperlinks:           bool,
+	margin_scrollback:    bool,
 }
 
 impl<W: Write> Renderer<W> {
@@ -1321,6 +1321,7 @@ impl<W: Write> Renderer<W> {
 	pub const fn committed_rows(&self) -> u16 {
 		self.committed_rows
 	}
+
 	/// Lowest document row at which a transcript tail may be removed in place.
 	///
 	/// During a width epoch the frame-coordinate seam, rather than the native
@@ -1889,7 +1890,8 @@ impl<W: Write> Renderer<W> {
 		output.push_str(HIDE_CURSOR);
 		output.push_str(leading_sequence);
 		output.push_str(RESET_STYLE);
-		if copy_screen_to_scrollback && self.screen_to_scrollback && clear_sequence == CLEAR_VIEWPORT {
+		if copy_screen_to_scrollback && self.screen_to_scrollback && clear_sequence == CLEAR_VIEWPORT
+		{
 			output.push_str(SCREEN_TO_SCROLLBACK);
 		}
 		output.push_str(clear_sequence);

@@ -1417,10 +1417,7 @@ mod tests {
 	fn apc_sequences_occupy_zero_cells() {
 		assert_eq!(cell_width("\x1b_Ga=p,U=1,i=7,p=7,c=9,r=4\x1b\\"), 0);
 		assert_eq!(cell_width("x\x1b_cursor-marker\x07y"), 2);
-		assert_eq!(
-			cell_width("\x1b_Ga=p,i=1\x1b\\a\x1b_Ga=p,i=2\x1b\\b"),
-			2,
-		);
+		assert_eq!(cell_width("\x1b_Ga=p,i=1\x1b\\a\x1b_Ga=p,i=2\x1b\\b"), 2,);
 	}
 
 	#[test]

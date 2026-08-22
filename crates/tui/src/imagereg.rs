@@ -33,18 +33,18 @@ pub struct InternedImage {
 struct Registry {
 	/// Source URI or path → interned entry; failures cache as `None` so
 	/// missing sources are probed once, not every rebuild.
-	by_source: HashMap<Str, Option<InternedImage>>,
-	by_id:     HashMap<u32, CowBytes<'static>>,
+	by_source:  HashMap<Str, Option<InternedImage>>,
+	by_id:      HashMap<u32, CowBytes<'static>>,
 	converting: HashSet<Str>,
-	allocated: u32,
+	allocated:  u32,
 }
 
 static IMAGES: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
 
 /// Interns a PNG filesystem path or packaged `asset://login/<provider>`
 /// source, returning its stable terminal image ID and pixel dimensions.
-/// Non-PNG sources return `None` until [`prepare_png`] converts and caches them off
-/// the paint path. Unreadable sources are negatively cached.
+/// Non-PNG sources return `None` until [`prepare_png`] converts and caches them
+/// off the paint path. Unreadable sources are negatively cached.
 pub fn intern(source: &str) -> Option<InternedImage> {
 	let mut registry = IMAGES.lock();
 	if let Some(cached) = registry.by_source.get(source) {
@@ -57,8 +57,9 @@ pub fn intern(source: &str) -> Option<InternedImage> {
 		registry.by_source.insert(Str::new(source), None);
 		return None;
 	};
-	// Kitty transmissions are sent as `f=100`: PNG only. Leave other formats uncached so the
-	// component's existing off-thread loader can claim and convert them.
+	// Kitty transmissions are sent as `f=100`: PNG only. Leave other formats
+	// uncached so the component's existing off-thread loader can claim and convert
+	// them.
 	if !is_png(&png) {
 		return None;
 	}
@@ -90,10 +91,12 @@ fn is_png(bytes: &[u8]) -> bool {
 	bytes.starts_with(b"\x89PNG\r\n\x1a\n")
 }
 
-/// Returns a cached PNG form of `source`, converting supported non-PNG formats exactly once.
+/// Returns a cached PNG form of `source`, converting supported non-PNG formats
+/// exactly once.
 ///
-/// Async hosts run this through the component's off-thread decode loader. Its normal completion delivery
-/// invalidates the component and repaints the newly interned Kitty image.
+/// Async hosts run this through the component's off-thread decode loader. Its
+/// normal completion delivery invalidates the component and repaints the newly
+/// interned Kitty image.
 pub(crate) fn prepare_png(source: &str) -> Option<CowBytes<'static>> {
 	{
 		let mut registry = IMAGES.lock();

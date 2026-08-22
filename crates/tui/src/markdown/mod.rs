@@ -1712,11 +1712,8 @@ mod tests {
 	#[test]
 	fn fence_info_row_uses_dedicated_theme_border() {
 		let fence = Color::Rgb(0x61, 0x6e, 0x88);
-		let theme = Theme {
-			border: Color::Rgb(0x43, 0x4c, 0x5e),
-			code_border: fence,
-			..Theme::default()
-		};
+		let theme =
+			Theme { border: Color::Rgb(0x43, 0x4c, 0x5e), code_border: fence, ..Theme::default() };
 		let rendered = rendered("```rust\nlet value = 1;\n```", 80, &MdTheme::from_theme(&theme));
 		assert_eq!(rendered.row_text(0), "```rust");
 		assert!(

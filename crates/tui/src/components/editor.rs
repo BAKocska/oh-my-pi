@@ -364,6 +364,7 @@ impl EditInput {
 				.max(1),
 		)
 	}
+
 	fn picker_icon_width(&self, ctx: &UiContext) -> u16 {
 		self
 			.editor
@@ -483,7 +484,8 @@ impl EditInput {
 				continue;
 			}
 			let first_end = prefix_byte_at_width(description, description_width);
-			pc.frame.put(description_x, row, &description[..first_end], style);
+			pc.frame
+				.put(description_x, row, &description[..first_end], style);
 			let rest = description[first_end..].trim_start();
 			if rest.is_empty() {
 				continue;
@@ -503,7 +505,8 @@ impl EditInput {
 			}
 			let continuation = super::hr::truncate_to_width(rest, description_width);
 			let continuation_row = y.saturating_add(offset);
-			pc.frame.put(description_x, continuation_row, continuation.text, style);
+			pc.frame
+				.put(description_x, continuation_row, continuation.text, style);
 			if continuation.ellipsis {
 				pc.frame.put(
 					description_x.saturating_add(continuation.width.saturating_sub(1)),
@@ -587,7 +590,9 @@ impl Component for EditInput {
 			.saturating_add(chrome.top_rows)
 			.saturating_add(chrome.bottom_rows)
 			.min(18);
-		composer.saturating_add(self.picker_height(ctx, width)).min(18)
+		composer
+			.saturating_add(self.picker_height(ctx, width))
+			.min(18)
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
@@ -2039,6 +2044,7 @@ impl<T: ExternalEditorTerminal + ?Sized> Drop for ExternalEditorSuspension<'_, T
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::editcore::Command;
 	#[test]
 	fn external_editor_command_is_shell_worded_without_operators() {
 		assert_eq!(
@@ -2458,11 +2464,7 @@ mod tests {
 			.collect::<Vec<_>>();
 			let pane = EditorPane::new()
 				.completion(Box::new(crate::SlashCommands::new(commands.into_boxed_slice())));
-			let mut ui = Ui::from_root(
-				pane,
-				80,
-				UiContext { charset, ..UiContext::default() },
-			);
+			let mut ui = Ui::from_root(pane, 80, UiContext { charset, ..UiContext::default() });
 			ui.focus_first();
 			ui.handle_key(Key::Char('/'));
 			let mut renderer = crate::Renderer::new(Vec::new());
@@ -2482,7 +2484,10 @@ mod tests {
 			.into_iter()
 			.zip(glyphs)
 			{
-				let row = rows.iter().find(|row| row.contains(name)).expect("command row");
+				let row = rows
+					.iter()
+					.find(|row| row.contains(name))
+					.expect("command row");
 				assert!(row.contains(glyph), "{charset:?} row did not use catalog glyph: {row}");
 				let at = row.find(name).expect("label offset");
 				columns.push(cell_width(&row[..at]));
@@ -2493,9 +2498,9 @@ mod tests {
 
 	#[test]
 	fn slash_completion_description_is_capped_at_two_rows_with_ellipsis() {
-		let description = "Plan and execute non-trivial architectural improvements to the \
-			codebase while preserving behavior, validating invariants, and documenting every \
-			important tradeoff long past the available popup space.";
+		let description = "Plan and execute non-trivial architectural improvements to the codebase \
+		                   while preserving behavior, validating invariants, and documenting every \
+		                   important tradeoff long past the available popup space.";
 		let command = Command::new("improve-architecture", description, &[]);
 		let pane = EditorPane::new()
 			.completion(Box::new(crate::SlashCommands::new(vec![command].into_boxed_slice())));
@@ -2511,7 +2516,12 @@ mod tests {
 			.iter()
 			.position(|row| row.contains("improve-architecture"))
 			.expect("command row");
-		assert!(rows.get(command_row + 1).is_some_and(|row| row.contains('…')), "{rows:?}");
+		assert!(
+			rows
+				.get(command_row + 1)
+				.is_some_and(|row| row.contains('…')),
+			"{rows:?}"
+		);
 		assert!(!rows.iter().any(|row| row.contains("available popup space")));
 	}
 

@@ -152,7 +152,14 @@ impl Img {
 		let width = self.requested_width(available);
 		let trim = self.props.flag(Prop::Trim);
 		if let Some(loader) = &ctx.loader {
-			loader.request(self.slot, source.to_str(), width, self.props.h(), trim, ctx.graphics == Graphics::KittyPlaceholders);
+			loader.request(
+				self.slot,
+				source.to_str(),
+				width,
+				self.props.h(),
+				trim,
+				ctx.graphics == Graphics::KittyPlaceholders,
+			);
 			self.state.phase = Load::Loading;
 			self.state.width = width;
 			self.state.rows = 3;

@@ -377,59 +377,59 @@ impl Appearance {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
 	/// Default foreground.
-	pub fg:        Color,
+	pub fg:          Color,
 	/// Primary interactive accent (focus, active controls, links).
-	pub accent:    Color,
+	pub accent:      Color,
 	/// Informational values.
-	pub info:      Color,
+	pub info:        Color,
 	/// Success / enabled.
-	pub ok:        Color,
+	pub ok:          Color,
 	/// Caution / modified.
-	pub warn:      Color,
+	pub warn:        Color,
 	/// Errors / destructive.
-	pub err:       Color,
+	pub err:         Color,
 	/// De-emphasized chrome and hints.
-	pub muted:     Color,
+	pub muted:       Color,
 	/// Container borders and rules; dimmer than `fg`, brighter than `surface`.
-	pub border:    Color,
+	pub border:      Color,
 	/// Markdown code-fence rows, kept legible against the theme page background.
 	pub code_border: Color,
 	/// Neutral chip / button fill.
-	pub surface:   Color,
+	pub surface:     Color,
 	/// Hover row tint.
-	pub hover:     Color,
+	pub hover:       Color,
 	/// Text-selection background tint.
-	pub selection: Color,
+	pub selection:   Color,
 	/// Drop-shadow tint painted under lifted (elevated) surfaces.
-	pub shadow:    Color,
+	pub shadow:      Color,
 	/// Elevated panel fill (composer, overlay cards); darker than `surface`.
-	pub panel:     Color,
+	pub panel:       Color,
 	/// Secondary accent (cost figures, alternate roles); distinct from
 	/// `accent` without carrying ok/warn/err semantics.
-	pub secondary: Color,
+	pub secondary:   Color,
 	/// Text painted on top of accent/warn fills.
-	pub contrast:  Color,
+	pub contrast:    Color,
 }
 
 impl Default for Theme {
 	fn default() -> Self {
 		Self {
-			fg:        Color::Rgb(0xc8, 0xcc, 0xd4),
-			accent:    Color::Rgb(0x61, 0xaf, 0xef),
-			info:      Color::Rgb(0x56, 0xb6, 0xc2),
-			ok:        Color::Rgb(0x98, 0xc3, 0x79),
-			warn:      Color::Rgb(0xe5, 0xc0, 0x7b),
-			err:       Color::Rgb(0xe0, 0x6c, 0x75),
-			muted:     Color::Rgb(0x5c, 0x63, 0x70),
-			border:    Color::Rgb(0x45, 0x4b, 0x58),
+			fg:          Color::Rgb(0xc8, 0xcc, 0xd4),
+			accent:      Color::Rgb(0x61, 0xaf, 0xef),
+			info:        Color::Rgb(0x56, 0xb6, 0xc2),
+			ok:          Color::Rgb(0x98, 0xc3, 0x79),
+			warn:        Color::Rgb(0xe5, 0xc0, 0x7b),
+			err:         Color::Rgb(0xe0, 0x6c, 0x75),
+			muted:       Color::Rgb(0x5c, 0x63, 0x70),
+			border:      Color::Rgb(0x45, 0x4b, 0x58),
 			code_border: Color::Rgb(0x5c, 0x63, 0x70),
-			surface:   Color::Rgb(0x3a, 0x3f, 0x4b),
-			hover:     Color::Rgb(0x2c, 0x31, 0x3a),
-			selection: Color::Rgb(0x36, 0x4c, 0x61),
-			shadow:    Color::Rgb(0x05, 0x07, 0x0c),
-			panel:     Color::Rgb(0x0c, 0x0f, 0x12),
-			secondary: Color::Rgb(0xab, 0x77, 0xe6),
-			contrast:  Color::Rgb(0x10, 0x12, 0x16),
+			surface:     Color::Rgb(0x3a, 0x3f, 0x4b),
+			hover:       Color::Rgb(0x2c, 0x31, 0x3a),
+			selection:   Color::Rgb(0x36, 0x4c, 0x61),
+			shadow:      Color::Rgb(0x05, 0x07, 0x0c),
+			panel:       Color::Rgb(0x0c, 0x0f, 0x12),
+			secondary:   Color::Rgb(0xab, 0x77, 0xe6),
+			contrast:    Color::Rgb(0x10, 0x12, 0x16),
 		}
 	}
 }
@@ -438,22 +438,22 @@ impl Theme {
 	/// Quantizes every semantic token for terminals without truecolor.
 	pub const fn quantized_256(self) -> Self {
 		Self {
-			fg:        self.fg.quantized_256(),
-			accent:    self.accent.quantized_256(),
-			info:      self.info.quantized_256(),
-			ok:        self.ok.quantized_256(),
-			warn:      self.warn.quantized_256(),
-			err:       self.err.quantized_256(),
-			muted:     self.muted.quantized_256(),
-			border:    self.border.quantized_256(),
+			fg:          self.fg.quantized_256(),
+			accent:      self.accent.quantized_256(),
+			info:        self.info.quantized_256(),
+			ok:          self.ok.quantized_256(),
+			warn:        self.warn.quantized_256(),
+			err:         self.err.quantized_256(),
+			muted:       self.muted.quantized_256(),
+			border:      self.border.quantized_256(),
 			code_border: self.code_border.quantized_256(),
-			surface:   self.surface.quantized_256(),
-			hover:     self.hover.quantized_256(),
-			selection: self.selection.quantized_256(),
-			shadow:    self.shadow.quantized_256(),
-			panel:     self.panel.quantized_256(),
-			secondary: self.secondary.quantized_256(),
-			contrast:  self.contrast.quantized_256(),
+			surface:     self.surface.quantized_256(),
+			hover:       self.hover.quantized_256(),
+			selection:   self.selection.quantized_256(),
+			shadow:      self.shadow.quantized_256(),
+			panel:       self.panel.quantized_256(),
+			secondary:   self.secondary.quantized_256(),
+			contrast:    self.contrast.quantized_256(),
 		}
 	}
 
@@ -461,40 +461,40 @@ impl Theme {
 	pub const fn for_appearance(appearance: Appearance) -> Self {
 		match appearance {
 			Appearance::Dark => Self {
-				fg:        Color::Rgb(0xc8, 0xcc, 0xd4),
-				accent:    Color::Rgb(0x61, 0xaf, 0xef),
-				info:      Color::Rgb(0x56, 0xb6, 0xc2),
-				ok:        Color::Rgb(0x98, 0xc3, 0x79),
-				warn:      Color::Rgb(0xe5, 0xc0, 0x7b),
-				err:       Color::Rgb(0xe0, 0x6c, 0x75),
-				muted:     Color::Rgb(0x5c, 0x63, 0x70),
-				border:    Color::Rgb(0x45, 0x4b, 0x58),
+				fg:          Color::Rgb(0xc8, 0xcc, 0xd4),
+				accent:      Color::Rgb(0x61, 0xaf, 0xef),
+				info:        Color::Rgb(0x56, 0xb6, 0xc2),
+				ok:          Color::Rgb(0x98, 0xc3, 0x79),
+				warn:        Color::Rgb(0xe5, 0xc0, 0x7b),
+				err:         Color::Rgb(0xe0, 0x6c, 0x75),
+				muted:       Color::Rgb(0x5c, 0x63, 0x70),
+				border:      Color::Rgb(0x45, 0x4b, 0x58),
 				code_border: Color::Rgb(0x5c, 0x63, 0x70),
-				surface:   Color::Rgb(0x3a, 0x3f, 0x4b),
-				hover:     Color::Rgb(0x2c, 0x31, 0x3a),
-				selection: Color::Rgb(0x36, 0x4c, 0x61),
-				shadow:    Color::Rgb(0x05, 0x07, 0x0c),
-				panel:     Color::Rgb(0x0c, 0x0f, 0x12),
-				secondary: Color::Rgb(0xab, 0x77, 0xe6),
-				contrast:  Color::Rgb(0x10, 0x12, 0x16),
+				surface:     Color::Rgb(0x3a, 0x3f, 0x4b),
+				hover:       Color::Rgb(0x2c, 0x31, 0x3a),
+				selection:   Color::Rgb(0x36, 0x4c, 0x61),
+				shadow:      Color::Rgb(0x05, 0x07, 0x0c),
+				panel:       Color::Rgb(0x0c, 0x0f, 0x12),
+				secondary:   Color::Rgb(0xab, 0x77, 0xe6),
+				contrast:    Color::Rgb(0x10, 0x12, 0x16),
 			},
 			Appearance::Light => Self {
-				fg:        Color::Rgb(0x24, 0x28, 0x30),
-				accent:    Color::Rgb(0x00, 0x5f, 0xaf),
-				info:      Color::Rgb(0x00, 0x72, 0x7d),
-				ok:        Color::Rgb(0x3f, 0x70, 0x19),
-				warn:      Color::Rgb(0x8a, 0x5a, 0x00),
-				err:       Color::Rgb(0xb0, 0x24, 0x32),
-				muted:     Color::Rgb(0x6b, 0x70, 0x78),
-				border:    Color::Rgb(0xd0, 0xd7, 0xde),
+				fg:          Color::Rgb(0x24, 0x28, 0x30),
+				accent:      Color::Rgb(0x00, 0x5f, 0xaf),
+				info:        Color::Rgb(0x00, 0x72, 0x7d),
+				ok:          Color::Rgb(0x3f, 0x70, 0x19),
+				warn:        Color::Rgb(0x8a, 0x5a, 0x00),
+				err:         Color::Rgb(0xb0, 0x24, 0x32),
+				muted:       Color::Rgb(0x6b, 0x70, 0x78),
+				border:      Color::Rgb(0xd0, 0xd7, 0xde),
 				code_border: Color::Rgb(0x6b, 0x70, 0x78),
-				surface:   Color::Rgb(0xe2, 0xe5, 0xea),
-				hover:     Color::Rgb(0xed, 0xef, 0xf2),
-				selection: Color::Rgb(0xc2, 0xda, 0xed),
-				shadow:    Color::Rgb(0xb8, 0xbd, 0xc7),
-				panel:     Color::Rgb(0xee, 0xf0, 0xf3),
-				secondary: Color::Rgb(0x6f, 0x42, 0xc1),
-				contrast:  Color::Rgb(0xff, 0xff, 0xff),
+				surface:     Color::Rgb(0xe2, 0xe5, 0xea),
+				hover:       Color::Rgb(0xed, 0xef, 0xf2),
+				selection:   Color::Rgb(0xc2, 0xda, 0xed),
+				shadow:      Color::Rgb(0xb8, 0xbd, 0xc7),
+				panel:       Color::Rgb(0xee, 0xf0, 0xf3),
+				secondary:   Color::Rgb(0x6f, 0x42, 0xc1),
+				contrast:    Color::Rgb(0xff, 0xff, 0xff),
 			},
 		}
 	}
@@ -627,7 +627,8 @@ impl UiContext {
 	}
 
 	/// Applies the detected terminal's capabilities: graphics tier, color
-	/// depth, glyph charset, Compatibility Jamo policy, and background appearance.
+	/// depth, glyph charset, Compatibility Jamo policy, and background
+	/// appearance.
 	///
 	/// Capability values are `0` for platform default, `1` for narrow, and `2`
 	/// for wide.
