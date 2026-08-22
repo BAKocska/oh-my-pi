@@ -261,6 +261,8 @@ class McpConnectingBlock extends ChatBlock {
 	}
 }
 
+type McpTestOutcome = "succeeded" | "cancelled" | "failed";
+
 /**
  * Live "(esc to cancel)" hint for an in-flight `/mcp test`. Unlike a static
  * transcript line, the hint retires its Esc affordance the moment the test
@@ -269,6 +271,7 @@ class McpConnectingBlock extends ChatBlock {
  */
 export class McpTestHintBlock extends ChatBlock {
 	readonly #text: Text;
+	#settled = false;
 
 	constructor(private readonly serverName: string) {
 		super();
@@ -277,9 +280,17 @@ export class McpTestHintBlock extends ChatBlock {
 		this.addChild(this.#text);
 	}
 
-	/** Drop the Esc affordance and freeze the line once the test settles. */
-	settle(): void {
-		this.#text.setText(theme.fg("muted", `Testing connection to "${this.serverName}"...`));
+	/** Render and freeze the terminal test outcome, ignoring duplicate settlement. */
+	settle(outcome: McpTestOutcome): void {
+		if (this.#settled) return;
+		this.#settled = true;
+		const text =
+			outcome === "succeeded"
+				? `Tested connection to "${this.serverName}".`
+				: outcome === "cancelled"
+					? `Cancelled connection test for "${this.serverName}".`
+					: `Connection test for "${this.serverName}" failed.`;
+		this.#text.setText(theme.fg("muted", text));
 		this.finish();
 	}
 }
@@ -1599,6 +1610,9 @@ export class MCPCommandController {
 
 		const abortController = new AbortController();
 		let settled = false;
+		let connection: MCPServerConnection | undefined;
+		let hint: McpTestHintBlock | undefined;
+		let outcome: McpTestOutcome = "succeeded";
 		const handleEscape = (): void => {
 			if (settled) {
 				// Ownership is retained across the settling frame only to absorb a
@@ -1609,6 +1623,9 @@ export class MCPCommandController {
 				this.ctx.showStatus(`MCP test for "${name}" already finished`);
 				return;
 			}
+			// Retire the live affordance synchronously. The connection/auth stack
+			// may take another event-loop turn to reject from the abort signal.
+			hint?.settle("cancelled");
 			abortController.abort();
 		};
 
@@ -1617,12 +1634,10 @@ export class MCPCommandController {
 		// agent-turn abort while the command is already running.
 		this.ctx.mcpTestEscapeHandlers.add(handleEscape);
 
-		let connection: MCPServerConnection | undefined;
 		// The live hint owns the on-screen "(esc to cancel)" affordance and retires
 		// it on settle; the grace window below only applies once it is shown, so a
 		// pre-hint failure releases Esc immediately rather than swallowing it for a
 		// prompt the user never saw.
-		let hint: McpTestHintBlock | undefined;
 		try {
 			const found = await this.#resolveServerForAuth(name);
 
@@ -1638,6 +1653,15 @@ export class MCPCommandController {
 			if (config.enabled === false) {
 				this.ctx.mcpTestEscapeHandlers.delete(handleEscape);
 				this.ctx.showError(`Server "${name}" is disabled. Run /mcp enable ${name} first.`);
+				return;
+			}
+
+			// Esc may have been consumed during the awaited lookup, before a hint
+			// existed. Stop here instead of publishing a cancellation affordance
+			// whose ownership is already gone.
+			if (abortController.signal.aborted) {
+				this.ctx.mcpTestEscapeHandlers.delete(handleEscape);
+				this.ctx.showStatus(`Cancelled MCP test for "${name}"`);
 				return;
 			}
 
@@ -1681,10 +1705,12 @@ export class MCPCommandController {
 			await this.#syncManagerConnection(name, config);
 			this.#showMessage(lines.join("\n"));
 		} catch (error) {
+			outcome = "cancelled";
 			if (abortController.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
 				this.ctx.showStatus(`Cancelled MCP test for "${name}"`);
 				return;
 			}
+			outcome = "failed";
 
 			const errorMsg = error instanceof Error ? error.message : String(error);
 
@@ -1707,7 +1733,7 @@ export class MCPCommandController {
 			settled = true;
 			// Retire the hint's Esc affordance the instant the test settles so
 			// scrollback stops advertising a cancellation Esc no longer performs.
-			hint?.settle();
+			hint?.settle(outcome);
 			if (this.ctx.mcpTestEscapeHandlers.has(handleEscape)) {
 				if (hint) {
 					const timer = setTimeout(() => {

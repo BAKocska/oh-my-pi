@@ -4,7 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
 import * as mcpConfigWriter from "@oh-my-pi/pi-coding-agent/mcp/config-writer";
-import { MCPCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
+import type { MCPConfigFile, MCPServerConnection } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import {
+	MCPCommandController,
+	McpTestHintBlock,
+} from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { getConfigRootDir, getProjectDir, removeWithRetries, setAgentDir, setProjectDir } from "@oh-my-pi/pi-utils";
 
@@ -125,6 +129,121 @@ describe("interactive /mcp test", () => {
 		expect(listTools).toHaveBeenCalledWith(connection, expect.objectContaining({ signal: expect.any(AbortSignal) }));
 		expect(disconnectServer).toHaveBeenCalledWith(connection);
 		expect(requestRender).toHaveBeenCalled();
+	});
+
+	it("retires the live hint immediately when a pending test is cancelled", async () => {
+		const connectToServer = vi.spyOn(mcpClient, "connectToServer").mockImplementation((_name, _config, options) => {
+			const { promise, reject } = Promise.withResolvers<MCPServerConnection>();
+			const signal = options?.signal;
+			if (!signal) return promise;
+			const abort = () => {
+				const error = new Error("aborted");
+				error.name = "AbortError";
+				reject(error);
+			};
+			if (signal.aborted) {
+				abort();
+			} else {
+				signal.addEventListener("abort", abort, { once: true });
+			}
+			return promise;
+		});
+		vi.spyOn(mcpClient, "disconnectServer").mockResolvedValue();
+		const { promise: lookup, resolve: resolveLookup } = Promise.withResolvers<MCPConfigFile>();
+		vi.spyOn(mcpConfigWriter, "readMCPConfigFile").mockReturnValue(lookup);
+		const showStatus = vi.fn();
+		const requestRender = vi.fn();
+		let hint: McpTestHintBlock | undefined;
+		const { promise: hintPresented, resolve: resolveHintPresented } = Promise.withResolvers<void>();
+		const mcpTestEscapeHandlers = new Set<() => void>();
+		const controller = new MCPCommandController({
+			mcpTestEscapeHandlers,
+			chatContainer: { addChild: vi.fn() },
+			present: (content: unknown) => {
+				if (!(content instanceof McpTestHintBlock)) return;
+				hint = content;
+				content.mount({ requestRender });
+				resolveHintPresented();
+			},
+			presentCommandOutput: vi.fn(),
+			ui: { requestRender },
+			editor: {},
+			showError: vi.fn(),
+			showStatus,
+			session: { refreshMCPTools: vi.fn() },
+			mcpManager: {
+				prepareConfig: vi.fn(async config => config),
+				getConnectionStatus: vi.fn(() => "connected"),
+			},
+		} as never);
+
+		const pending = controller.handle("/mcp test github");
+		expect(mcpTestEscapeHandlers).toHaveLength(1);
+		resolveLookup({
+			mcpServers: { github: { type: "stdio", command: "github-mcp-server", args: ["serve"] } },
+		});
+		await hintPresented;
+		if (!hint) throw new Error("MCP test hint was not presented");
+		expect(hint.isTranscriptBlockFinalized()).toBe(false);
+
+		const owners = [...mcpTestEscapeHandlers];
+		mcpTestEscapeHandlers.clear();
+		for (const owner of owners) owner();
+
+		// Cancellation rewrites and freezes the hint synchronously, before the
+		// connection stack finishes unwinding from the abort.
+		const cancelledHint = hint.render(80).join("\n");
+		expect(cancelledHint).toContain('Cancelled connection test for "github".');
+		expect(cancelledHint).not.toContain("(esc to cancel)");
+		expect(hint.isTranscriptBlockFinalized()).toBe(true);
+
+		await pending;
+		expect(showStatus).toHaveBeenCalledWith('Cancelled MCP test for "github"');
+		expect(showStatus).not.toHaveBeenCalledWith('MCP test for "github" already finished');
+		expect(mcpTestEscapeHandlers).toHaveLength(0);
+		expect(connectToServer).toHaveBeenCalledTimes(1);
+	});
+
+	it("cancels during the awaited lookup without publishing an Esc hint", async () => {
+		const { promise: lookup, resolve } = Promise.withResolvers<MCPConfigFile>();
+		vi.spyOn(mcpConfigWriter, "readMCPConfigFile").mockReturnValue(lookup);
+		const connectToServer = vi.spyOn(mcpClient, "connectToServer");
+		const present = vi.fn();
+		const showStatus = vi.fn();
+		const mcpTestEscapeHandlers = new Set<() => void>();
+		const controller = new MCPCommandController({
+			mcpTestEscapeHandlers,
+			chatContainer: { addChild: vi.fn() },
+			present,
+			presentCommandOutput: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			editor: {},
+			showError: vi.fn(),
+			showStatus,
+			session: { refreshMCPTools: vi.fn() },
+			mcpManager: {
+				getServerConfig: vi.fn(() => undefined),
+				getSource: vi.fn(() => undefined),
+				prepareConfig: vi.fn(async config => config),
+				getConnectionStatus: vi.fn(() => "connected"),
+			},
+		} as never);
+
+		const pending = controller.handle("/mcp test github");
+		expect(mcpTestEscapeHandlers).toHaveLength(1);
+
+		const owners = [...mcpTestEscapeHandlers];
+		mcpTestEscapeHandlers.clear();
+		for (const owner of owners) owner();
+		resolve({
+			mcpServers: { github: { type: "stdio", command: "github-mcp-server", args: ["serve"] } },
+		});
+		await pending;
+
+		expect(present).not.toHaveBeenCalled();
+		expect(connectToServer).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith('Cancelled MCP test for "github"');
+		expect(mcpTestEscapeHandlers).toHaveLength(0);
 	});
 
 	it("claims Esc ownership before the awaited server lookup", async () => {
