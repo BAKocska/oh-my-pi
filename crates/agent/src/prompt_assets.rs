@@ -266,7 +266,7 @@ pub fn render_empty_stop_retry(out: &mut String, retry_count: usize, max_retries
 	write!(out, "{retry_count}").expect("writing to String cannot fail");
 	out.push_str(between);
 	write!(out, "{max_retries}").expect("writing to String cannot fail");
-	out.push_str(after_max);
+	out.push_str(after_max.trim_end());
 }
 /// Renders one parent-agent steering notice into an existing buffer.
 pub fn render_parent_irc(out: &mut String, from: &str, message: &str) {

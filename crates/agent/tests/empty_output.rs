@@ -198,16 +198,12 @@ fn input_texts(input: &TurnInput) -> Vec<&str> {
 	};
 	items
 		.iter()
-		.filter_map(|item| match item.kind.as_ref() {
-			Some(thread::item::Kind::Message(message)) => {
-				message
-					.parts
-					.iter()
-					.find_map(|part| match part.kind.as_ref() {
-						Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
-						_ => None,
-					})
-			},
+		.flat_map(|item| match item.kind.as_ref() {
+			Some(thread::item::Kind::Message(message)) => message.parts.as_slice(),
+			_ => &[],
+		})
+		.filter_map(|part| match part.kind.as_ref() {
+			Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
 			_ => None,
 		})
 		.collect()
