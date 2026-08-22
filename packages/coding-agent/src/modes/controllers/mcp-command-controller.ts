@@ -1587,9 +1587,7 @@ export class MCPCommandController {
 		const retireHint = (): void => {
 			if (!hintLoader) return;
 			hintLoader.stop();
-			// Remove only our own child so a concurrent agent turn's loading
-			// animation, which shares this container, survives.
-			this.ctx.statusContainer.removeChild(hintLoader);
+			this.ctx.mcpTestHintContainer.removeChild(hintLoader);
 			hintLoader = undefined;
 			this.ctx.ui.requestRender();
 		};
@@ -1651,7 +1649,7 @@ export class MCPCommandController {
 				`Testing connection to "${name}"... (esc to cancel)`,
 				theme.spinnerFrames,
 			);
-			this.ctx.statusContainer.addChild(hintLoader);
+			this.ctx.mcpTestHintContainer.addChild(hintLoader);
 			this.ctx.ui.requestRender();
 			hintShown = true;
 

@@ -16,7 +16,7 @@ const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 type Renderable = { render: (width: number) => readonly string[] };
 
 /**
- * Minimal stand-in for the anchored `statusContainer`: records live children
+ * Minimal stand-in for the anchored `mcpTestHintContainer`: records live children
  * (present after add, gone after remove) and every child ever added, and
  * resolves {@link firstAdd} the first time the `/mcp test` hint is anchored.
  */
@@ -111,7 +111,7 @@ describe("interactive /mcp test", () => {
 		const controller = new MCPCommandController({
 			mcpTestEscapeHandlers,
 			chatContainer: { addChild: vi.fn() },
-			statusContainer: status,
+			mcpTestHintContainer: status,
 			present: vi.fn(),
 			presentCommandOutput: (content: unknown) => {
 				const items = Array.isArray(content) ? content : [content];
@@ -188,7 +188,7 @@ describe("interactive /mcp test", () => {
 		const controller = new MCPCommandController({
 			mcpTestEscapeHandlers,
 			chatContainer: { addChild: vi.fn() },
-			statusContainer: status,
+			mcpTestHintContainer: status,
 			present: vi.fn(),
 			presentCommandOutput: vi.fn(),
 			ui: fakeUi(),
@@ -238,7 +238,7 @@ describe("interactive /mcp test", () => {
 		const controller = new MCPCommandController({
 			mcpTestEscapeHandlers,
 			chatContainer: { addChild: vi.fn() },
-			statusContainer: status,
+			mcpTestHintContainer: status,
 			present: vi.fn(),
 			presentCommandOutput: vi.fn(),
 			ui: fakeUi(),
@@ -288,7 +288,7 @@ describe("interactive /mcp test", () => {
 			chatContainer: { addChild: vi.fn() },
 			present: vi.fn(),
 			presentCommandOutput: vi.fn(),
-			statusContainer: createStatusContainer(),
+			mcpTestHintContainer: createStatusContainer(),
 			ui: fakeUi(),
 			editor: {},
 			showError: vi.fn(),

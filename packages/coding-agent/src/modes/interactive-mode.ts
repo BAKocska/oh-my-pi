@@ -529,6 +529,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	chatContainer: TranscriptContainer;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
+	/**
+	 * Dedicated anchored surface for the `/mcp test` "(esc to cancel)" hint.
+	 * Kept separate from {@link statusContainer} because the agent loading
+	 * lifecycle (`ensureLoadingAnimation`, agent-end/retry/compaction teardown)
+	 * calls `statusContainer.disposeChildren()`, which would silently drop the
+	 * hint while its Esc ownership is still armed (#9310). Owned solely by the
+	 * running test, so no status clear touches it.
+	 */
+	mcpTestHintContainer: Container;
 	todoContainer: Container;
 	subagentContainer: Container;
 	btwContainer: Container;
@@ -827,6 +836,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
 		this.statusContainer = new AnchoredLiveContainer();
+		this.mcpTestHintContainer = new AnchoredLiveContainer();
 		this.todoContainer = new AnchoredLiveContainer();
 		this.subagentContainer = new AnchoredLiveContainer();
 		this.btwContainer = new AnchoredLiveContainer();
@@ -1118,6 +1128,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// HUDs, just above the editor's hook-widget top margin — so it reads next to
 		// the prompt while keeping the one-line gap above the editor.
 		this.ui.addChild(this.statusContainer);
+		this.ui.addChild(this.mcpTestHintContainer);
 		this.ui.addChild(this.attachmentChipsContainer);
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);

@@ -108,6 +108,8 @@ export interface InteractiveModeContext {
 	chatContainer: TranscriptContainer;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
+	/** Dedicated anchored surface owning the `/mcp test` "(esc to cancel)" hint, isolated from status lifecycle clears. */
+	mcpTestHintContainer: Container;
 	todoContainer: Container;
 	subagentContainer: Container;
 	btwContainer: Container;
