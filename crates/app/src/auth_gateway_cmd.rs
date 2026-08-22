@@ -25,7 +25,7 @@ const TOKEN_FILE: &str = "auth-gateway.token";
 
 /// Starts, rotates, and health-checks the gateway without owning credentials.
 pub async fn run(args: AuthGatewayArgs) -> miette::Result<()> {
-	let data_dir = crate::cli::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
 	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command {
 		AuthGatewayCommand::Serve { bind, no_auth } => {
@@ -55,10 +55,10 @@ pub async fn run(args: AuthGatewayArgs) -> miette::Result<()> {
 					token: &'a str,
 					path:  &'a Path,
 				}
-				serde_json::to_writer(
-					std::io::stdout().lock(),
-					&TokenOutput { token: &token, path: &path },
-				)
+				serde_json::to_writer(std::io::stdout().lock(), &TokenOutput {
+					token: &token,
+					path:  &path,
+				})
 				.into_diagnostic()?;
 				println!();
 			} else {
@@ -114,22 +114,15 @@ async fn status(data_dir: &Path, bind: SocketAddr, json: bool) -> miette::Result
 	Ok(())
 }
 
-async fn check(
-	data_dir: &Path,
-	bind: SocketAddr,
-	strict: bool,
-	json: bool,
-) -> miette::Result<()> {
+async fn check(data_dir: &Path, bind: SocketAddr, strict: bool, json: bool) -> miette::Result<()> {
 	let token = read_token(data_dir)?;
 	let channel = LocalEndpoint::tcp(bind)
 		.connect()
 		.await
 		.into_diagnostic()
 		.wrap_err_with(|| format!("could not connect to tcp://{bind}"))?;
-	let request = authenticated(
-		ProbeCredentialsRequest { provider: String::new(), strict },
-		&token,
-	)?;
+	let request =
+		authenticated(ProbeCredentialsRequest { provider: String::new(), strict }, &token)?;
 	let response = AuthClient::new(channel)
 		.probe_credentials(request)
 		.await
@@ -151,11 +144,7 @@ async fn check(
 				.map_or_else(|| "-".to_owned(), |status| status.to_string());
 			println!(
 				"{status:4} provider={} credential={} http={} latency={}ms error_class={}",
-				health.provider,
-				health.credential_id,
-				http,
-				health.latency_ms,
-				health.error_class,
+				health.provider, health.credential_id, http, health.latency_ms, health.error_class,
 			);
 		}
 		println!(

@@ -14,8 +14,8 @@ pub fn run(args: TtsrArgs) -> miette::Result<()> {
 	let root = args
 		.root
 		.unwrap_or(std::env::current_dir().into_diagnostic()?);
-	let content = crate::discovery::active_content_snapshots(&root);
-	let (mut registry, diagnostics) = crate::rulebook::ttsr_registry(content.rules.as_ref());
+	let content = omp_driver::discovery::active_content_snapshots(&root);
+	let (mut registry, diagnostics) = omp_driver::rulebook::ttsr_registry(content.rules.as_ref());
 	for diagnostic in diagnostics {
 		eprintln!("warning: {diagnostic}");
 	}

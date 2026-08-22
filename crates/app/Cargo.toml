@@ -24,35 +24,25 @@ required-features = ["claude-trace"]
 [features]
 default = ["local-applefm", "local-embedding", "local-text", "local-stt", "local-tts"]
 claude-trace = []
-local = ["omp-llm-inference/local"]
-local-applefm = ["local", "omp-llm-inference/local-applefm"]
-local-embedding = ["local", "omp-llm-inference/local-embedding"]
-local-text = ["local", "omp-llm-inference/local-text"]
-local-stt = ["local", "omp-llm-inference/local-stt"]
-local-tts = ["local", "omp-llm-inference/local-tts"]
+local = ["omp-inference/local"]
+local-applefm = ["local", "omp-inference/local-applefm"]
+local-embedding = ["local", "omp-inference/local-embedding"]
+local-text = ["local", "omp-inference/local-text"]
+local-stt = ["local", "omp-inference/local-stt"]
+local-tts = ["local", "omp-inference/local-tts"]
 
 [dependencies]
 arc-swap = { workspace = true }
-async-stream.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
-bytecount.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 ring = { workspace = true }
-encoding_rs = { workspace = true }
 flume.workspace = true
 futures.workspace = true
-globset.workspace = true
 smallvec.workspace = true
 flate2.workspace = true
-http.workspace = true
-http-body-util.workspace = true
-hyper.workspace = true
-hyper-util = { workspace = true, features = ["tokio"] }
-im = { workspace = true }
-itertools.workspace = true
 libc.workspace = true
 image.workspace = true
 indicatif.workspace = true
@@ -63,25 +53,22 @@ omp-ar = { workspace = true }
 omp-chat-ui.workspace = true
 omp-collab.workspace = true
 omp-core.workspace = true
-omp-docserver.workspace = true
-omp-desktop.workspace = true
-omp-env.workspace = true
+omp-driver.workspace = true
+omp-env = { workspace = true }
+omp-envd = { workspace = true }
+omp-ext.workspace = true
 omp-gui.workspace = true
 omp-grep.workspace = true
 omp-hashline.workspace = true
-omp-llm-catalog.workspace = true
-omp-llm-inference.workspace = true
-omp-memory.workspace = true
-omp-webview.workspace = true
-omp-oauth.workspace = true
+omp-catalog.workspace = true
+omp-inference.workspace = true
+omp-serve.workspace = true
 omp-proto = { workspace = true, features = ["tonic"] }
 omp-py.workspace = true
 omp-rpc.workspace = true
 omp-sdk.workspace = true
 omp-settings.workspace = true
-omp-secrets.workspace = true
 omp-storage.workspace = true
-omp-shell-engine.workspace = true
 omp-telemetry.workspace = true
 omp-tool.workspace = true
 omp-tui.workspace = true
@@ -92,13 +79,8 @@ omp-walker.workspace = true
 jiff.workspace = true
 nix.workspace = true
 parking_lot.workspace = true
-pyo3.workspace = true
 rusqlite.workspace = true
-russh.workspace = true
-russh-sftp.workspace = true
-schemars.workspace = true
 wreq.workspace = true
-prost.workspace = true
 regex.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -108,11 +90,9 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
-tower.workspace = true
 rand.workspace = true
 tracing.workspace = true
 url.workspace = true
-xutf.workspace = true
 zeroize.workspace = true
 strum = { workspace = true }
 toml = { workspace = true }
@@ -124,7 +104,7 @@ windows-sys.workspace = true
 [dev-dependencies]
 ctor.workspace = true
 flume = { workspace = true }
-omp-llm-inference = { workspace = true, features = ["test-support"] }
+omp-inference = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tonic-health.workspace = true

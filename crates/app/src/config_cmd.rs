@@ -7,18 +7,17 @@ use std::{
 };
 
 use miette::IntoDiagnostic as _;
-use omp_settings::FieldDescriptor;
+use omp_envd::mcp::{
+	config::McpServerConfig,
+	config_store::{McpConfigStore, set_server_enabled},
+};
+use omp_settings::{
+	FieldDescriptor,
+	manager::{MutationScope, SettingsManager, SettingsPaths},
+};
 use serde::Serialize;
 
-use crate::{
-	cli::{ConfigCommand, ConfigScope, McpConfigCommand, McpConfigScope},
-	discovery::native::{NativeDirectories, native_directories},
-	envd::mcp::{
-		config::McpServerConfig,
-		config_store::{McpConfigStore, set_server_enabled},
-	},
-	settings::manager::{MutationScope, SettingsManager, SettingsPaths},
-};
+use crate::cli::{ConfigCommand, ConfigScope, McpConfigCommand, McpConfigScope};
 
 /// Runs a reflected settings operation against the active native roots.
 pub fn run(data_dir: &Path, command: &ConfigCommand) -> miette::Result<()> {
@@ -69,7 +68,7 @@ fn init_xdg(data_dir: &Path, json: bool) -> miette::Result<()> {
 		.filter(|value| !value.is_empty())
 		.map(PathBuf::from)
 		.ok_or_else(|| miette::miette!("HOME must be set for config init-xdg"))?;
-	let mut roots = native_directories(&home);
+	let mut roots = omp_core::dirs::native_directories(&home);
 	roots.data = data_dir.to_path_buf();
 	for root in [&roots.data, &roots.state, &roots.cache] {
 		fs::create_dir_all(root).into_diagnostic()?;
@@ -276,7 +275,7 @@ fn redacted_server(server: &McpServerConfig) -> serde_json::Value {
 		&& let Some(raw) = url.as_str()
 	{
 		*url =
-			serde_json::Value::String(crate::envd::mcp::json_rpc::redact_url_for_log(raw).to_string());
+			serde_json::Value::String(omp_envd::mcp::json_rpc::redact_url_for_log(raw).to_string());
 	}
 	for map_name in ["env", "headers"] {
 		if let Some(values) = value
@@ -399,8 +398,9 @@ fn render_value(value: &toml::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+	use omp_driver::settings::Settings;
+
 	use super::*;
-	use crate::settings::Settings;
 
 	#[test]
 	fn reflected_mutations_validate_and_persist() {

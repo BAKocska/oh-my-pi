@@ -7,17 +7,14 @@ use std::{
 };
 
 use miette::{IntoDiagnostic as _, miette};
+use omp_driver::{stats_api::StatsApi, stats_server};
 use omp_storage::index::SessionIndex;
 
-use crate::{
-	cli::{StatsArgs, StatsCommand},
-	stats_api::StatsApi,
-	stats_server,
-};
+use crate::cli::{StatsArgs, StatsCommand};
 
 /// Runs a statistics CLI operation against the authoritative write-time index.
 pub async fn run(args: StatsArgs) -> miette::Result<()> {
-	let state_dir = args.state_dir.unwrap_or(crate::cli::data_dir(None)?);
+	let state_dir = args.state_dir.unwrap_or(omp_core::dirs::data_dir(None)?);
 	std::fs::create_dir_all(&state_dir).into_diagnostic()?;
 	let index = Arc::new(
 		SessionIndex::open_authoritative_reader(state_dir.join("sessions.sqlite3"))
@@ -64,7 +61,7 @@ pub async fn run(args: StatsArgs) -> miette::Result<()> {
 			let url = format!("http://{display_host}:{}", address.port());
 			println!("Dashboard available at: {url}");
 			if !no_open {
-				crate::open::open_path(&url);
+				omp_core::open::open_path(&url);
 			}
 			tokio::signal::ctrl_c().await.into_diagnostic()?;
 			server.shutdown().await;

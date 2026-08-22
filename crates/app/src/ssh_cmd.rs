@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand, ValueEnum};
 use miette::IntoDiagnostic as _;
 use omp_core::Str;
-
-use crate::envd::ssh::{AuthPolicy, HostConfig, HostStore, SshService};
+use omp_envd::ssh::{AuthPolicy, HostConfig, HostStore, SshService};
 
 /// Native SSH command options.
 #[derive(Clone, Debug, Args)]
@@ -78,7 +77,7 @@ pub enum SshCommand {
 
 /// Runs scoped writer and bounded native transport operations.
 pub async fn run(args: SshArgs) -> miette::Result<()> {
-	let user = crate::cli::data_dir(None)?.join("hosts.toml");
+	let user = omp_core::dirs::data_dir(None)?.join("hosts.toml");
 	let project = std::env::current_dir()
 		.into_diagnostic()?
 		.join(".omp/hosts.toml");

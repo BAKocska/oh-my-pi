@@ -213,10 +213,7 @@ fn select<'a>(index: &'a SignedIndex, package: &str, target: &str) -> miette::Re
 		.releases
 		.iter()
 		.filter(|release| release.attested && !release.yanked)
-		.filter_map(|release| {
-			target_artifact(release, target)
-				.map(|artifact| (release, artifact))
-		})
+		.filter_map(|release| target_artifact(release, target).map(|artifact| (release, artifact)))
 		.max_by(|(left, _), (right, _)| {
 			compare_versions(left.version.as_str(), right.version.as_str())
 		})
@@ -242,7 +239,7 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 	if selected.artifact.size > MAX_ASSET_BYTES {
 		return Err(miette!("signed update asset exceeds the 256 MiB safety ceiling"));
 	}
-	let data_dir = crate::cli::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None)?;
 	let cache = if let Some(cache) =
 		std::env::var_os("OMP_CACHE_DIR").filter(|value| !value.is_empty())
 	{
@@ -252,7 +249,7 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 			.filter(|value| !value.is_empty())
 			.map(PathBuf::from)
 			.ok_or_else(|| miette!("HOME or OMP_CACHE_DIR must be set for native update staging"))?;
-		crate::discovery::native::native_directories(&home).cache
+		omp_core::dirs::native_directories(&home).cache
 	}
 	.join("updates");
 	fs::create_dir_all(&cache).into_diagnostic()?;
@@ -292,12 +289,7 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 	keys
 		.write(&data_dir.join("ext/keys.toml"))
 		.into_diagnostic()?;
-	atomic_replace(
-		&staged,
-		&destination,
-		&backup,
-		selected.release.version.as_str(),
-	)?;
+	atomic_replace(&staged, &destination, &backup, selected.release.version.as_str())?;
 	retire_renamed_source(&current, &destination, &attempt)?;
 	Ok(())
 }
@@ -399,19 +391,13 @@ fn classify_rename_failure(error: &std::io::Error) -> RenameFailureKind {
 	}
 }
 
-fn update_artifact_paths(
-	destination: &Path,
-	attempt: &str,
-) -> miette::Result<(PathBuf, PathBuf)> {
+fn update_artifact_paths(destination: &Path, attempt: &str) -> miette::Result<(PathBuf, PathBuf)> {
 	let file = destination
 		.file_name()
 		.ok_or_else(|| miette!("update destination has no filename"))?
 		.to_string_lossy();
 	let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-	Ok((
-		parent.join(format!("{file}.{attempt}.new")),
-		parent.join(format!("{file}.{attempt}.bak")),
-	))
+	Ok((parent.join(format!("{file}.{attempt}.new")), parent.join(format!("{file}.{attempt}.bak"))))
 }
 
 fn atomic_replace(
@@ -425,8 +411,8 @@ fn atomic_replace(
 		if let Err(error) = fs::rename(destination, backup) {
 			return match classify_rename_failure(&error) {
 				RenameFailureKind::Denied => Err(miette!(
-					"running omp executable could not be renamed; the existing installation was \
-					 left untouched"
+					"running omp executable could not be renamed; the existing installation was left \
+					 untouched"
 				)),
 				RenameFailureKind::Other => Err(error).into_diagnostic(),
 			};
@@ -505,8 +491,7 @@ fn is_update_artifact_name(name: &str) -> bool {
 					&& numeric
 						.split('.')
 						.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-			})
-		{
+			}) {
 			return true;
 		}
 	}
@@ -637,13 +622,13 @@ mod tests {
 
 	fn artifact(target: &'static str, file: &'static str) -> IndexArtifact {
 		IndexArtifact {
-			target: Str::new_static(target),
-			url: format!("https://releases.example/{file}"),
-			file: Str::new_static(file),
-			tag: Str::new_static("native"),
-			size: 1,
-			blake3: Str::new_static("b3:00"),
-			sha256: Str::new_static("sha256:00"),
+			target:    Str::new_static(target),
+			url:       format!("https://releases.example/{file}"),
+			file:      Str::new_static(file),
+			tag:       Str::new_static("native"),
+			size:      1,
+			blake3:    Str::new_static("b3:00"),
+			sha256:    Str::new_static("sha256:00"),
 			signature: Str::new_static("signature"),
 		}
 	}
@@ -652,13 +637,13 @@ mod tests {
 	fn windows_release_selects_its_attested_target_asset() {
 		let windows = "x86_64-pc-windows-msvc";
 		let release = IndexRelease {
-			version: Str::new_static("18.0.0"),
-			manifest_digest: Str::new_static("b3:manifest"),
+			version:           Str::new_static("18.0.0"),
+			manifest_digest:   Str::new_static("b3:manifest"),
 			capability_digest: Str::new_static("b3:capabilities"),
-			attested: true,
-			yanked: false,
-			shadows: Vec::new(),
-			artifacts: vec![
+			attested:          true,
+			yanked:            false,
+			shadows:           Vec::new(),
+			artifacts:         vec![
 				artifact("aarch64-apple-darwin", "omp-darwin"),
 				artifact(windows, "omp.exe"),
 			],
@@ -671,10 +656,7 @@ mod tests {
 		let portable = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
 		assert_eq!(classify_rename_failure(&portable), RenameFailureKind::Denied);
 		let windows_sharing_violation = std::io::Error::from_raw_os_error(32);
-		assert_eq!(
-			classify_rename_failure(&windows_sharing_violation),
-			RenameFailureKind::Denied
-		);
+		assert_eq!(classify_rename_failure(&windows_sharing_violation), RenameFailureKind::Denied);
 		let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
 		assert_eq!(classify_rename_failure(&missing), RenameFailureKind::Other);
 	}
@@ -715,10 +697,7 @@ mod tests {
 		write_executable(&staged, b"#!/bin/sh\necho 'omp 18.0.0'\n").unwrap();
 		atomic_replace(&staged, &destination, &backup, "18.0.0").unwrap();
 		assert!(!backup.exists());
-		assert_eq!(
-			fs::read_to_string(destination).unwrap(),
-			"#!/bin/sh\necho 'omp 18.0.0'\n"
-		);
+		assert_eq!(fs::read_to_string(destination).unwrap(), "#!/bin/sh\necho 'omp 18.0.0'\n");
 	}
 
 	#[cfg(unix)]

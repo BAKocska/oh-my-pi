@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use omp_app::envd::{
+use omp_core::sf;
+use omp_envd::{
 	policy::{
 		AuthorityTable, DataAuthority, Grants, PolicyError, QuotaAccount, require_sandbox_enforcement,
 	},
 	worker::HostKey,
 };
-use omp_core::sf;
 
 fn host() -> HostKey {
 	HostKey::new("workspace", "sandboxed", "dev.example.policy")

@@ -59,7 +59,8 @@ pub fn run(args: GalleryArgs) -> miette::Result<()> {
 		.fixtures
 		.iter()
 		.filter(|fixture| {
-			args.tool
+			args
+				.tool
 				.as_ref()
 				.is_none_or(|tool| tool.as_str() == fixture.identity.name.as_str())
 		})
@@ -85,7 +86,9 @@ pub fn run(args: GalleryArgs) -> miette::Result<()> {
 				let rendered = chat.render(Size::new(width, 18));
 				let png = omp_tui::frame_png(rendered.frame).into_diagnostic()?;
 				let state_name = state.to_string();
-				let path = args.out.join(format!("{}-{state_name}.png", fixture.identity.name));
+				let path = args
+					.out
+					.join(format!("{}-{state_name}.png", fixture.identity.name));
 				std::fs::write(&path, png).into_diagnostic()?;
 				println!("{}", path.display());
 			} else {
@@ -139,12 +142,7 @@ fn fixture_chat<'a>(
 	} else {
 		format!("{}.{}", fixture.identity.rev.family, fixture.identity.rev.n)
 	};
-	chat.tool_started(
-		"gallery",
-		fixture.identity.name.as_str(),
-		&revision,
-		fixture.title,
-	);
+	chat.tool_started("gallery", fixture.identity.name.as_str(), &revision, fixture.title);
 	match state {
 		GalleryState::Streaming | GalleryState::Progress => chat.tool_view("gallery", view),
 		GalleryState::Success => chat.tool_finished("gallery", true, view),

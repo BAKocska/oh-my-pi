@@ -17,12 +17,12 @@ use omp_app::{
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
 };
-use omp_core::{Str, sf};
-use omp_llm_catalog::{
+use omp_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
 };
-use omp_llm_inference::{
+use omp_core::{Str, sf};
+use omp_inference::{
 	Answer, Error as InferenceError, ErrorKind, ErrorPhase, Registry, RetryAction,
 	call::{Call, OpaqueJson},
 	event::{
@@ -701,7 +701,7 @@ fn historical_outcome() -> pb::Outcome {
 	}
 }
 
-fn provider_schema_bytes(request: &omp_llm_inference::call::ChatRequest) -> Vec<u8> {
+fn provider_schema_bytes(request: &omp_inference::call::ChatRequest) -> Vec<u8> {
 	let [definition] = request.tools.as_ref() else {
 		panic!("provider request must advertise only the live definition")
 	};

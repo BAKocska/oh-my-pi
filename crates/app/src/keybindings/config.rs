@@ -7,9 +7,8 @@ use std::{
 };
 
 use omp_core::Str;
+use omp_settings::io::atomic_replace;
 use serde::{Deserialize, Serialize};
-
-use crate::settings::io::atomic_replace;
 
 /// A named keybinding profile with action-to-chord mappings.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -462,7 +461,7 @@ pub enum KeybindingsConfigError {
 	Encode(#[from] toml::ser::Error),
 	/// Atomic persistence failed.
 	#[error(transparent)]
-	Persist(#[from] crate::settings::io::SettingsIoError),
+	Persist(#[from] omp_settings::io::SettingsIoError),
 	/// A legacy source backup failed.
 	#[error("failed to back up keybindings source {path} to {backup}")]
 	Backup {

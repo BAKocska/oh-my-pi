@@ -188,20 +188,30 @@ fn translate_edit(args: &Map<String, Value>) -> Result<Value, BridgeError> {
 		(
 			"old".into(),
 			Value::String(
-				string(
-					args,
-					&["old", "search", "old_string", "old_str", "old_text", "oldString", "oldText"],
-				)?
+				string(args, &[
+					"old",
+					"search",
+					"old_string",
+					"old_str",
+					"old_text",
+					"oldString",
+					"oldText",
+				])?
 				.to_owned(),
 			),
 		),
 		(
 			"new".into(),
 			Value::String(
-				string(
-					args,
-					&["new", "replace", "new_string", "new_str", "new_text", "newString", "newText"],
-				)?
+				string(args, &[
+					"new",
+					"replace",
+					"new_string",
+					"new_str",
+					"new_text",
+					"newString",
+					"newText",
+				])?
 				.to_owned(),
 			),
 		),

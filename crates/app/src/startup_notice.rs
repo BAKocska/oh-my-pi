@@ -109,7 +109,7 @@ pub fn show_once(
 	if !eligibility.allows(std::io::stderr().is_terminal()) {
 		return Ok(());
 	}
-	if crate::settings::current(data_dir)
+	if omp_driver::settings::current(data_dir)
 		.ok()
 		.is_some_and(|settings| settings.updates.check_on_startup)
 	{

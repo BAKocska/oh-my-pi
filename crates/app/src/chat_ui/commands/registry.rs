@@ -312,11 +312,15 @@ impl CommandRoster {
 	pub fn completions(&self) -> Vec<omp_tui::Command> {
 		self.completions_for(CommandRole::Owner)
 	}
+
 	/// Resolves submitted slash input to its winning canonical declaration name.
 	pub fn command_usage_name(&self, text: &str) -> Option<Str> {
 		let token = text.trim().strip_prefix('/')?.split_whitespace().next()?;
 		let index = self.spellings.get(token)?;
-		self.commands.get(*index).map(|command| command.name.clone())
+		self
+			.commands
+			.get(*index)
+			.map(|command| command.name.clone())
 	}
 
 	/// Slash completion entries filtered for the collaboration role.

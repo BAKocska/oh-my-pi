@@ -38,9 +38,13 @@ impl Drop for GcLock {
 
 /// Runs dry by default; destructive work requires `--apply`.
 pub fn run(args: GcArgs) -> miette::Result<()> {
-	let data_dir = crate::cli::data_dir(args.data_dir)?;
-	let sessions_dir = args.sessions_dir.unwrap_or_else(|| data_dir.join("sessions"));
-	let index_path = args.index.unwrap_or_else(|| sessions_dir.join("sessions.sqlite3"));
+	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
+	let sessions_dir = args
+		.sessions_dir
+		.unwrap_or_else(|| data_dir.join("sessions"));
+	let index_path = args
+		.index
+		.unwrap_or_else(|| sessions_dir.join("sessions.sqlite3"));
 	let _lock = acquire_lock(&data_dir.join("gc.lock"))?;
 	let index = SessionIndex::open(&index_path).into_diagnostic()?;
 	let page = index
@@ -86,7 +90,11 @@ pub fn run(args: GcArgs) -> miette::Result<()> {
 				)?);
 			}
 		}
-		let mode = if args.apply { MaintenanceMode::Apply } else { MaintenanceMode::DryRun };
+		let mode = if args.apply {
+			MaintenanceMode::Apply
+		} else {
+			MaintenanceMode::DryRun
+		};
 		for plan in &plans {
 			if let Some(retained) = &plan.retained {
 				let report = index
@@ -146,8 +154,8 @@ pub fn run(args: GcArgs) -> miette::Result<()> {
 		println!("{}", serde_json::to_string_pretty(&report).into_diagnostic()?);
 	} else {
 		println!(
-			"{}: {} archive candidate(s), {} lineage-protected, {} lineage row(s) transferred, \
-			 {} collision(s), {} blob(s) reclaimed ({} bytes)",
+			"{}: {} archive candidate(s), {} lineage-protected, {} lineage row(s) transferred, {} \
+			 collision(s), {} blob(s) reclaimed ({} bytes)",
 			if args.apply { "applied" } else { "dry run" },
 			candidates.len(),
 			ambiguous_lineage,
@@ -191,15 +199,17 @@ fn archive_plans(
 		families.entry(root).or_default().push(session.id.clone());
 	}
 
-	let mut plans = Vec::with_capacity(families.len().saturating_add(usize::from(!standalone.is_empty())));
+	let mut plans = Vec::with_capacity(
+		families
+			.len()
+			.saturating_add(usize::from(!standalone.is_empty())),
+	);
 	if !standalone.is_empty() {
 		plans.push(ArchivePlan { retained: None, archived: standalone });
 	}
 	for (root, archived) in families {
 		let retained = sessions.iter().enumerate().find_map(|(index, session)| {
-			if tentative.contains(&session.id)
-				|| lineage_root(index, sessions, &by_id) != Some(root)
-			{
+			if tentative.contains(&session.id) || lineage_root(index, sessions, &by_id) != Some(root) {
 				return None;
 			}
 			Some(session.id.clone())
@@ -238,7 +248,9 @@ fn add_lineage_report(target: &mut LineageTransferReport, source: LineageTransfe
 	add_transfer_count(&mut target.model_performance, source.model_performance);
 	add_transfer_count(&mut target.entry_kinds, source.entry_kinds);
 	add_transfer_count(&mut target.prompts_fts, source.prompts_fts);
-	target.archived_sessions = target.archived_sessions.saturating_add(source.archived_sessions);
+	target.archived_sessions = target
+		.archived_sessions
+		.saturating_add(source.archived_sessions);
 }
 
 fn add_transfer_count(target: &mut TransferCount, source: TransferCount) {
@@ -262,10 +274,8 @@ fn archive_session_files(
 	}
 	let temporary = destination.with_extension(format!("gz.tmp-{}", std::process::id()));
 	let mut input = File::open(&source).into_diagnostic()?;
-	let mut encoder = GzEncoder::new(
-		File::create(&temporary).into_diagnostic()?,
-		Compression::default(),
-	);
+	let mut encoder =
+		GzEncoder::new(File::create(&temporary).into_diagnostic()?, Compression::default());
 	std::io::copy(&mut input, &mut encoder).into_diagnostic()?;
 	let output = encoder.finish().into_diagnostic()?;
 	output.sync_all().into_diagnostic()?;
@@ -282,7 +292,9 @@ fn optimize_index(path: &Path) -> miette::Result<()> {
 	connection
 		.execute("INSERT INTO prompts_fts(prompts_fts) VALUES('optimize')", [])
 		.into_diagnostic()?;
-	connection.execute_batch("PRAGMA optimize;").into_diagnostic()?;
+	connection
+		.execute_batch("PRAGMA optimize;")
+		.into_diagnostic()?;
 	Ok(())
 }
 

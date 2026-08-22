@@ -6,9 +6,9 @@ use std::{
 };
 
 use miette::{IntoDiagnostic as _, miette};
+use omp_catalog::{DiscoveredModel, ModelSpec, OperationBits, ProviderId, snapshot::Catalog};
 use omp_core::Str;
-use omp_llm_catalog::{DiscoveredModel, ModelSpec, OperationBits, ProviderId, snapshot::Catalog};
-use omp_llm_inference::{
+use omp_inference::{
 	Client,
 	call::{CallMeta, DiscoveryRequest, Target},
 	discovery::{DiscoveryCacheKey, DiscoveryStore},
@@ -34,11 +34,11 @@ pub async fn run(args: &crate::cli::ModelsArgs) -> miette::Result<()> {
 }
 
 async fn refresh() -> miette::Result<()> {
-	let data_dir = crate::cli::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None)?;
 	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
-	let credentials =
-		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?;
-	let registry = crate::daemon::production_registry(&data_dir, credentials)
+	let credentials = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
+		.into_diagnostic()?;
+	let registry = omp_driver::registry::production_registry(&data_dir, credentials)
 		.await
 		.into_diagnostic()?;
 	let catalog = registry.catalog();
@@ -66,7 +66,7 @@ async fn refresh() -> miette::Result<()> {
 		let mut rows = Vec::new();
 		for route in provider_routes {
 			let planner =
-				omp_llm_inference::router::Router::new(registry.clone(), Duration::from_secs(30));
+				omp_inference::router::Router::new(registry.clone(), Duration::from_secs(30));
 			let meta = CallMeta {
 				id:       RequestId::from(format!("omp-model-refresh-{}", provider.as_str())),
 				target:   Target::ProviderService(provider.clone()),
@@ -126,7 +126,7 @@ async fn refresh() -> miette::Result<()> {
 fn discovered(
 	model: &ModelSpec,
 	provider: &ProviderId<str>,
-	route: &omp_llm_catalog::RouteId<str>,
+	route: &omp_catalog::RouteId<str>,
 	now_ms: u64,
 ) -> Option<DiscoveredModel> {
 	let wire_model = model

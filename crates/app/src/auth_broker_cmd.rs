@@ -7,12 +7,9 @@ use std::{
 };
 
 use miette::{IntoDiagnostic as _, miette};
+use omp_catalog::{ProviderId, provider::OAuthFlowSpec};
 use omp_core::SecretString;
-use omp_llm_catalog::{
-	ProviderId,
-	provider::OAuthFlowSpec,
-};
-use omp_llm_inference::{
+use omp_inference::{
 	account::{AccountRecord, AccountStateStore},
 	auth::{CredentialOrigin, OAuthCredentialImport},
 	call::AccountRoutingContext,
@@ -20,8 +17,8 @@ use omp_llm_inference::{
 };
 use ring::rand::{SecureRandom as _, SystemRandom};
 use serde::Deserialize;
-use zeroize::Zeroizing;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use zeroize::Zeroizing;
 
 use crate::{
 	cli::{AuthBrokerArgs, AuthBrokerCommand, AuthCommand},
@@ -50,12 +47,12 @@ struct ImportPlan {
 	refresh:    SecretString,
 	expires_at: SystemTime,
 	disabled:   bool,
-	routes:     BTreeSet<omp_llm_catalog::RouteId>,
+	routes:     BTreeSet<omp_catalog::RouteId>,
 }
 
 /// Executes one combined credential-authority operation.
 pub async fn run(args: AuthBrokerArgs) -> miette::Result<()> {
-	let data_dir = crate::cli::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
 	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command {
 		AuthBrokerCommand::Serve { endpoint } => {
@@ -69,19 +66,14 @@ pub async fn run(args: AuthBrokerArgs) -> miette::Result<()> {
 			if let Some(alias) = via {
 				remote_login(&data_dir, provider.as_str(), alias.as_str(), dry_run).await
 			} else {
-				crate::auth_backend::run(
-					data_dir.join("credentials.db"),
-					AuthCommand::Login { provider },
-				)
-				.await
+				crate::auth_cli::run(data_dir.join("credentials.db"), AuthCommand::Login { provider })
+					.await
 			}
 		},
 		AuthBrokerCommand::Logout { provider } => logout(&data_dir, provider.as_str()).await,
 		AuthBrokerCommand::List => {
-			crate::auth_backend::run(data_dir.join("credentials.db"), AuthCommand::List {
-				provider: None,
-			})
-			.await
+			crate::auth_cli::run(data_dir.join("credentials.db"), AuthCommand::List { provider: None })
+				.await
 		},
 		AuthBrokerCommand::Import { path, provider, include_disabled, dry_run } => {
 			import(&data_dir, &path, provider.as_deref(), include_disabled, dry_run)
@@ -118,9 +110,7 @@ async fn remote_login(
 	let command = format!("omp auth-broker login {}", shell_quote(provider));
 	if dry_run {
 		if let Some(port) = callback_port {
-			println!(
-				"native ssh {alias}: forward 127.0.0.1:{port} to 127.0.0.1:{port}; {command}"
-			);
+			println!("native ssh {alias}: forward 127.0.0.1:{port} to 127.0.0.1:{port}; {command}");
 		} else {
 			println!("native ssh {alias}: interactive paste-code login; {command}");
 		}
@@ -162,15 +152,15 @@ async fn remote_login(
 			},
 			event = channel.next_event() => {
 				match event.into_diagnostic()? {
-					Some(crate::envd::ssh::InteractiveEvent::Stdout(bytes)) => {
+					Some(omp_envd::ssh::InteractiveEvent::Stdout(bytes)) => {
 						stdout.write_all(bytes.as_ref()).await.into_diagnostic()?;
 						stdout.flush().await.into_diagnostic()?;
 					},
-					Some(crate::envd::ssh::InteractiveEvent::Stderr(bytes)) => {
+					Some(omp_envd::ssh::InteractiveEvent::Stderr(bytes)) => {
 						stderr.write_all(bytes.as_ref()).await.into_diagnostic()?;
 						stderr.flush().await.into_diagnostic()?;
 					},
-					Some(crate::envd::ssh::InteractiveEvent::ExitStatus(status)) => break status,
+					Some(omp_envd::ssh::InteractiveEvent::ExitStatus(status)) => break status,
 					None => return Err(miette!("remote authentication channel closed")),
 				}
 			},
@@ -198,8 +188,8 @@ async fn remote_login(
 }
 
 fn oauth_callback_port(provider: &str) -> miette::Result<Option<u16>> {
-	let catalog = omp_llm_catalog::snapshot::Catalog::try_embedded()
-		.map_err(|error| miette!(error.to_string()))?;
+	let catalog =
+		omp_catalog::snapshot::Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
 	let provider = catalog
 		.providers()
 		.iter()
@@ -248,7 +238,7 @@ async fn logout(data_dir: &Path, provider: &str) -> miette::Result<()> {
 		return Err(miette!("provider `{provider}` has no stored accounts"));
 	}
 	for account in accounts {
-		crate::auth_backend::run(data_dir.join("credentials.db"), AuthCommand::Logout {
+		crate::auth_cli::run(data_dir.join("credentials.db"), AuthCommand::Logout {
 			account: account.into_inner(),
 		})
 		.await?;
@@ -263,8 +253,8 @@ fn import(
 	include_disabled: bool,
 	dry_run: bool,
 ) -> miette::Result<()> {
-	let catalog = omp_llm_catalog::snapshot::Catalog::try_embedded()
-		.map_err(|error| miette!(error.to_string()))?;
+	let catalog =
+		omp_catalog::snapshot::Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
 	let plans = load_import_plan(path, override_provider, include_disabled, &catalog)?;
 	if plans.is_empty() {
 		println!("No importable credentials in {}.", path.display());
@@ -284,8 +274,8 @@ fn import(
 		return Ok(());
 	}
 
-	let credentials =
-		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?;
+	let credentials = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
+		.into_diagnostic()?;
 	let state = AccountStateStore::open(data_dir.join("credentials.db")).into_diagnostic()?;
 	let imported_at = SystemTime::now();
 	for plan in plans {
@@ -302,13 +292,13 @@ fn import(
 			.into_diagnostic()?;
 		state
 			.upsert_account(&AccountRecord {
-				account: plan.account,
-				principal: plan.principal.clone(),
-				provider: plan.provider.clone(),
-				routes: plan.routes,
-				enabled: !plan.disabled,
+				account:               plan.account,
+				principal:             plan.principal.clone(),
+				provider:              plan.provider.clone(),
+				routes:                plan.routes,
+				enabled:               !plan.disabled,
 				credential_generation: metadata.generation,
-				routing: AccountRoutingContext::default(),
+				routing:               AccountRoutingContext::default(),
 			})
 			.into_diagnostic()?;
 		println!(
@@ -326,7 +316,7 @@ fn load_import_plan(
 	path: &Path,
 	override_provider: Option<&str>,
 	include_disabled: bool,
-	catalog: &omp_llm_catalog::snapshot::Catalog,
+	catalog: &omp_catalog::snapshot::Catalog,
 ) -> miette::Result<Vec<ImportPlan>> {
 	let mut sources = if path.is_dir() {
 		std::fs::read_dir(path)
@@ -390,7 +380,12 @@ fn load_import_plan(
 			.email
 			.as_deref()
 			.filter(|identity| !identity.is_empty())
-			.or_else(|| record.account_id.as_deref().filter(|identity| !identity.is_empty()))
+			.or_else(|| {
+				record
+					.account_id
+					.as_deref()
+					.filter(|identity| !identity.is_empty())
+			})
 			.unwrap_or("imported");
 		let principal = PrincipalId::from(identity);
 		let account = AccountId::from(format!("{provider}:{principal}"));
@@ -454,8 +449,8 @@ fn resolve_cli_proxy_provider(
 }
 
 fn migrate(data_dir: &Path, dry_run: bool) -> miette::Result<()> {
-	let store =
-		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?;
+	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
+		.into_diagnostic()?;
 	let count = if dry_run {
 		store.list_metadata().into_diagnostic()?.len()
 	} else {
@@ -466,8 +461,8 @@ fn migrate(data_dir: &Path, dry_run: bool) -> miette::Result<()> {
 }
 
 fn status(data_dir: &Path) -> miette::Result<()> {
-	let store =
-		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?;
+	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
+		.into_diagnostic()?;
 	let accounts = store.list_metadata().into_diagnostic()?.len();
 	let token = data_dir.join("auth-broker.token").is_file();
 	println!(

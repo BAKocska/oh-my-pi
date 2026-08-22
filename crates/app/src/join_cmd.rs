@@ -3,10 +3,7 @@
 use std::{io::IsTerminal as _, sync::Arc, time::Duration};
 
 use miette::IntoDiagnostic as _;
-use omp_collab::{
-	guest::GuestRelayPump,
-	link::CollabLink,
-};
+use omp_collab::{guest::GuestRelayPump, link::CollabLink};
 use omp_core::Str;
 use omp_tool::Registry;
 
@@ -25,20 +22,16 @@ pub async fn run(args: JoinArgs) -> miette::Result<()> {
 	}
 	let link_text = args.link.trim();
 	let link = CollabLink::parse(link_text.as_str()).into_diagnostic()?;
-	let data_dir = crate::cli::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None)?;
 	let local_cwd = std::env::current_dir().into_diagnostic()?;
-	let settings = crate::settings::current(&data_dir).into_diagnostic()?;
+	let settings = omp_driver::settings::current(&data_dir).into_diagnostic()?;
 	let display_name = settings.collab.resolved_display_name();
 
-	let (pump, replica) = GuestRelayPump::new(
-		data_dir.join("collab"),
-		local_cwd,
-		crate::chat_ui::now_ms(),
-	);
+	let (pump, replica) =
+		GuestRelayPump::new(data_dir.join("collab"), local_cwd, crate::chat_ui::now_ms());
 	let replica_shutdown = replica.clone();
 	let mut pump_task = tokio::spawn(pump.run());
-	let (authority, collab) =
-		CollabSessionAuthority::with_guest_replica(Some(replica.clone()));
+	let (authority, collab) = CollabSessionAuthority::with_guest_replica(Some(replica.clone()));
 	let mut owner_task = spawn_session_owner(authority);
 
 	let joined = collab
@@ -68,9 +61,10 @@ pub async fn run(args: JoinArgs) -> miette::Result<()> {
 		Err(error) => Err(error),
 	};
 
-	if collab.presence().is_some_and(|facts| {
-		facts.role() == omp_collab::presence::CollabRole::Guest
-	}) {
+	if collab
+		.presence()
+		.is_some_and(|facts| facts.role() == omp_collab::presence::CollabRole::Guest)
+	{
 		let _ = collab.request(CollabOwnerCommand::Leave).await;
 	}
 	drop(collab);

@@ -3,16 +3,16 @@
 use std::{future::Future, time::Duration};
 
 use bytes::Bytes;
-use omp_app::envd::{
-	blobs::BlobHost,
-	docs::DocumentHost,
-	exec::{ExecEvent, ExecHost, ProcessEvent},
-	workspace::{WorkspaceHost, WorkspaceOperations},
-};
 use omp_core::Str;
 use omp_docserver::{
 	Environment, ServerConfig,
 	connection::{ConnectionConfig, serve_connection},
+};
+use omp_envd::{
+	blobs::BlobHost,
+	docs::DocumentHost,
+	exec::{ExecEvent, ExecHost, ProcessEvent},
+	workspace::{WorkspaceHost, WorkspaceOperationError, WorkspaceOperations},
 };
 use omp_proto::env::v1::{
 	AttachOutput, ConflictReason, CreateWorktree, DestroyWorktree, ExecRequest, MergeMode,
@@ -58,11 +58,21 @@ async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 	let (operations, external) = operations(&root, &state).await;
 	let cancel = CancellationToken::new();
 
+	assert!(matches!(
+		operations.snapshot(&SnapshotWorkspace { wire_revision: 0, ..Default::default() }, &cancel),
+		Err(WorkspaceOperationError::WireRevision)
+	));
 	let snapshot = operations
-		.snapshot(&SnapshotWorkspace::default(), &cancel)
+		.snapshot(
+			&SnapshotWorkspace { wire_revision: omp_proto::SCHEMA_REV, ..Default::default() },
+			&cancel,
+		)
 		.expect("snapshot");
 	let duplicate = operations
-		.snapshot(&SnapshotWorkspace::default(), &cancel)
+		.snapshot(
+			&SnapshotWorkspace { wire_revision: omp_proto::SCHEMA_REV, ..Default::default() },
+			&cancel,
+		)
 		.expect("duplicate snapshot");
 	assert_eq!(snapshot.snapshot_id, duplicate.snapshot_id);
 	assert_eq!(snapshot.manifest_hash.as_ref(), duplicate.manifest_hash.as_ref());
@@ -80,6 +90,7 @@ async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 		&RestoreWorkspace {
 			snapshot_id: snapshot.snapshot_id.clone(),
 			dry_run: true,
+			wire_revision: omp_proto::SCHEMA_REV,
 			..Default::default()
 		},
 		&cancel,
@@ -95,7 +106,11 @@ async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 	assert_eq!(std::fs::read(root.path().join("tracked.txt")).unwrap(), b"after\n");
 
 	let restored = within(operations.restore(
-		&RestoreWorkspace { snapshot_id: snapshot.snapshot_id, ..Default::default() },
+		&RestoreWorkspace {
+			snapshot_id: snapshot.snapshot_id,
+			wire_revision: omp_proto::SCHEMA_REV,
+			..Default::default()
+		},
 		&cancel,
 	))
 	.await
@@ -116,7 +131,11 @@ async fn snapshot_rejects_parent_escape_and_observes_cancellation() {
 	assert!(
 		operations
 			.snapshot(
-				&SnapshotWorkspace { paths: vec!["../outside".to_owned()], ..Default::default() },
+				&SnapshotWorkspace {
+					paths: vec!["../outside".to_owned()],
+					wire_revision: omp_proto::SCHEMA_REV,
+					..Default::default()
+				},
 				&cancel,
 			)
 			.is_err()
@@ -124,7 +143,10 @@ async fn snapshot_rejects_parent_escape_and_observes_cancellation() {
 	cancel.cancel();
 	assert!(
 		operations
-			.snapshot(&SnapshotWorkspace::default(), &cancel)
+			.snapshot(
+				&SnapshotWorkspace { wire_revision: omp_proto::SCHEMA_REV, ..Default::default() },
+				&cancel
+			)
 			.is_err()
 	);
 }

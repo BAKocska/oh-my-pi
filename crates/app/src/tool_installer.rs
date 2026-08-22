@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use futures::StreamExt as _;
 use omp_core::Str;
-use omp_llm_inference::local::{
+use omp_inference::local::{
 	ArtifactError, ArtifactFetchRequest, ArtifactFetcher as _, SystemArtifactFetcher,
 };
 use thiserror::Error;

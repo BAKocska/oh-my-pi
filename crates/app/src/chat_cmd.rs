@@ -1,0 +1,1183 @@
+//! Interactive terminal and GUI host for durable project chat.
+
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use miette::IntoDiagnostic as _;
+use omp_agent::{
+	Agent, AgentKind, AgentState, AgentStatus, Budget, InProcTurnClient, RpcTurnClient, TurnClient,
+};
+use omp_core::{Str, sf};
+use omp_driver::{
+	chat::{
+		AgentsControlAuthority, CHAT_CAPS_BASE, ChatAuthWorker, ChatError as DriverChatError,
+		ChatParentHost, ChatScope, EphemeralSessions, LaunchToolSelection, Session, SessionOpen,
+		agent_snapshot, apply_launch_tool_selection, canonical_project, ensure_state_directory,
+		fallback_model_selector, interrupted_reasoning_dialect, model_context_window,
+		model_selector_is_selectable, now_ms, open_session, resolve_model_provider,
+		resolve_model_selector, resume_choices, session_blueprint, strict_session_id,
+		thinking_effort,
+	},
+	hub as hub_backend,
+};
+use omp_inference::Registry as InferenceRegistry;
+use omp_proto::{
+	inference::v1 as inference_pb,
+	thread::v1::{item, part},
+};
+use omp_sdk::SessionBlueprint;
+use omp_storage::{index::SessionIndex, transcript::SessionId};
+
+use crate::{
+	chat_ui::{self, ChatUiSession},
+	cli::ChatArgs,
+};
+/// Failures owned by the interactive presentation boundary.
+#[derive(Debug, thiserror::Error)]
+enum ChatError {
+	/// Driver-owned durable session composition failed.
+	#[error(transparent)]
+	Driver(#[from] DriverChatError),
+	/// Owner-local draft persistence failed.
+	#[error(transparent)]
+	Draft(#[from] crate::session_manager::DraftError),
+	/// Session-local secret transformation failed.
+	#[error(transparent)]
+	Secrets(#[from] omp_driver::secrets::session::SecretSessionError),
+	/// Typed settings projection failed.
+	#[error(transparent)]
+	Settings(#[from] omp_settings::manager::SettingsManagerError),
+	/// Owner-local session discovery failed.
+	#[error(transparent)]
+	SessionResolve(#[from] omp_driver::session_state::SessionResolveError),
+	/// Process-global parked session discovery failed.
+	#[error(transparent)]
+	AgentRegistry(#[from] omp_agent::RegistryError),
+	/// Session artifact metadata failed.
+	#[error(transparent)]
+	Artifact(#[from] omp_storage::gc::Error),
+	/// Campaign lifecycle mutation failed.
+	#[error(transparent)]
+	Campaign(#[from] omp_agent::AgentError),
+	/// Environment authority binding failed.
+	#[error(transparent)]
+	Environment(#[from] omp_envd::EnvdError),
+	/// Session index mutation failed.
+	#[error(transparent)]
+	SessionIndex(#[from] omp_storage::index::Error),
+	/// Interactive terminal or GUI host failed.
+	#[error("interactive chat shell failed: {0}")]
+	Ui(miette::Report),
+}
+fn presentation_resize_scrollback(
+	mode: omp_driver::settings::ResizeScrollbackMode,
+) -> omp_tui::ResizeScrollbackMode {
+	match mode {
+		omp_driver::settings::ResizeScrollbackMode::Append => omp_tui::ResizeScrollbackMode::Append,
+		omp_driver::settings::ResizeScrollbackMode::Rebuild => omp_tui::ResizeScrollbackMode::Rebuild,
+		omp_driver::settings::ResizeScrollbackMode::Preserve => {
+			omp_tui::ResizeScrollbackMode::Preserve
+		},
+	}
+}
+
+/// Initial surface selected by the command boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChatStart {
+	/// Open the inline transcript and composer immediately.
+	Session,
+	/// Open the alternate-screen session index before the transcript.
+	SessionIndex,
+}
+/// Presentation selected for the interactive project-chat session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChatPresentation {
+	/// Render through the inline terminal host.
+	Terminal,
+	/// Render through the native GPU window host.
+	Gui,
+}
+
+/// Runs one interactive durable project-chat session.
+#[cfg(any(unix, windows))]
+#[expect(
+	clippy::future_not_send,
+	reason = "the interactive chat future owns a thread-confined terminal scene"
+)]
+pub(crate) async fn run(
+	args: ChatArgs,
+	mut start: ChatStart,
+	presentation: ChatPresentation,
+) -> miette::Result<()> {
+	use miette::{Context as _, IntoDiagnostic as _};
+	let launch_root = canonical_project(&args.project).map_err(|e| miette::miette!(e))?;
+	let data_dir = omp_core::dirs::data_dir(None)?;
+	let mut root = launch_root.clone();
+	let mut selected_sessions_dir = None;
+	let mut selected_index_path = None;
+	let mut picked_resume = None;
+	let mut resume_moved = false;
+	if start == ChatStart::SessionIndex {
+		let Some(selection) = crate::pickers::pick_session(&data_dir, args.session_dir.as_deref())
+			.await
+			.map_err(|error| miette::miette!(error))?
+		else {
+			return Ok(());
+		};
+		picked_resume = Some(selection.session.id.0.clone());
+		selected_sessions_dir = Some(selection.sessions_dir);
+		selected_index_path = Some(selection.database_path);
+		start = ChatStart::Session;
+		let recorded_root = PathBuf::from(selection.session.project.as_str());
+		if recorded_root.is_dir() {
+			root = canonical_project(&recorded_root).map_err(|error| miette::miette!(error))?;
+		} else {
+			let choices = [
+				omp_chat_ui::ListRow {
+					key:    sf!("move"),
+					label:  sf!("Move session"),
+					detail: Str::from(launch_root.to_string_lossy().as_ref()),
+				},
+				omp_chat_ui::ListRow {
+					key:    sf!("cancel"),
+					label:  sf!("Cancel"),
+					detail: sf!("Keep the journal unchanged"),
+				},
+			];
+			if crate::pickers::run_list("Project missing", &choices)
+				.await
+				.map_err(|error| miette::miette!(error))?
+				!= Some(0)
+			{
+				return Ok(());
+			}
+			resume_moved = true;
+			eprintln!(
+				"Session project `{}` no longer exists; moving future workspace access to `{}`.",
+				recorded_root.display(),
+				launch_root.display()
+			);
+		}
+	}
+	let catalog = omp_catalog::snapshot::Catalog::try_embedded().map_err(|e| miette::miette!(e))?;
+	let settings =
+		omp_driver::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
+	let security_enabled = settings.security.enabled;
+	let roles = omp_driver::discovery::roles::resolve_launch_roles(
+		catalog,
+		args.model.as_deref(),
+		args.smol.as_deref(),
+		args.slow.as_deref(),
+		args.plan.as_deref(),
+	)
+	.map_err(|error| miette::miette!(error))?;
+	for selector in args
+		.models
+		.as_ref()
+		.into_iter()
+		.flat_map(|selectors| selectors.0.iter())
+	{
+		resolve_model_selector(catalog, selector).map_err(|error| miette::miette!(error))?;
+	}
+	for root in &args.add_dir {
+		std::fs::canonicalize(root)
+			.into_diagnostic()
+			.wrap_err_with(|| {
+				format!("additional workspace root `{}` is unavailable", root.display())
+			})?;
+	}
+	let plan_selection = roles
+		.plan
+		.as_ref()
+		.map(|model| {
+			omp_driver::plan::ModelSelection::resolved(model.as_str(), roles.plan_thinking.as_deref())
+		})
+		.transpose()
+		.map_err(|error| miette::miette!(error))?;
+	let interrupt_grace = settings.runtime_durations().interrupt_grace;
+	let auto_thinking = settings.auto_thinking;
+	let power_mode = omp_driver::power::configured(&data_dir).into_diagnostic()?;
+	let explicit_model = roles
+		.primary
+		.as_ref()
+		.map(|model| Str::from(model.as_str()))
+		.or_else(|| args.model.clone());
+	let model = match explicit_model
+		.clone()
+		.or_else(|| settings.default_model.map(Str::from))
+	{
+		Some(model) => model,
+		None => crate::wizard::run(&data_dir, catalog)
+			.await?
+			.ok_or_else(|| miette::miette!("no model configured — run `omp` again to finish setup"))?,
+	};
+	let model = match resolve_model_selector(catalog, model.as_str()) {
+		Ok(model) => model,
+		Err(error) if explicit_model.is_none() => {
+			let fallback = fallback_model_selector(catalog).ok_or_else(|| miette::miette!(error))?;
+			eprintln!(
+				"Saved model `{}` is unavailable; using `{}` for this session without changing the \
+				 saved preference.",
+				model, fallback
+			);
+			fallback
+		},
+		Err(error) => return Err(miette::miette!(error).into()),
+	};
+	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
+		return Err(miette::miette!(
+			"--api-key requires a model to be specified via --model or --models"
+		));
+	}
+	let credential_provider = args
+		.api_key
+		.as_ref()
+		.map(|_| resolve_model_provider(catalog, model.as_str(), args.provider.as_deref()))
+		.transpose()
+		.map_err(|error| miette::miette!(error))?;
+	let state_dir =
+		omp_env::project_state::directory(&data_dir, &root).map_err(|e| miette::miette!(e))?;
+	ensure_state_directory(&state_dir).map_err(|e| miette::miette!(e))?;
+	let ephemeral_sessions = if args.no_session {
+		Some(EphemeralSessions::create().map_err(|error| miette::miette!(error))?)
+	} else {
+		None
+	};
+	let sessions_dir = if let Some(ephemeral) = &ephemeral_sessions {
+		ephemeral.path().to_owned()
+	} else if let Some(selected) = selected_sessions_dir {
+		selected
+	} else if let Some(configured) = args.session_dir.as_deref() {
+		ensure_state_directory(configured).map_err(|error| miette::miette!(error))?;
+		std::fs::canonicalize(configured).into_diagnostic()?
+	} else {
+		state_dir.join("sessions")
+	};
+	ensure_state_directory(&sessions_dir).map_err(|e| miette::miette!(e))?;
+	let requested_resume = picked_resume.or_else(|| args.resume.clone());
+	let env_socket = omp_env::project_state::environment_socket(&state_dir);
+	let document_socket = omp_env::project_state::document_socket(&state_dir);
+	let search_bridge = Arc::new(omp_driver::bridges::InferenceBridge::default());
+	let goal_control = omp_driver::bridges::AgentGoalControl::default();
+	let bridges =
+		omp_driver::bridges::builtin(&root, Arc::clone(&search_bridge), goal_control.clone(), None);
+	let bridges =
+		omp_envd::RegistryBridges { ask_presenter: Some(omp_chat_ui::ask::presenter()), ..bridges };
+	let environment = omp_envd::ProjectEnvironment::connect_or_start(
+		&root,
+		&state_dir,
+		&env_socket,
+		&document_socket,
+		args.py_eval,
+		&args.trusted_extensions,
+		interrupt_grace,
+		bridges,
+	)
+	.await
+	.map_err(|e| miette::miette!(e))?;
+	let session_index = if let Some(database) = selected_index_path {
+		Arc::new(
+			SessionIndex::open(database)
+				.map_err(|error| miette::miette!(DriverChatError::SessionIndex(error)))?,
+		)
+	} else if args.session_dir.is_some() && !args.no_session {
+		Arc::new(
+			SessionIndex::open(sessions_dir.join("sessions.sqlite3"))
+				.map_err(|error| miette::miette!(DriverChatError::SessionIndex(error)))?,
+		)
+	} else {
+		environment.sessions_index()
+	};
+	let breadcrumbs = omp_driver::session_state::TerminalBreadcrumbs::new(&data_dir)
+		.map_err(|error| miette::miette!(error))?;
+	let terminal_id = omp_tui::ttyid::terminal_id();
+	let resume = if let Some(resume) = requested_resume {
+		if strict_session_id(&resume).is_ok() {
+			Some(resume)
+		} else {
+			let root_text = root.to_string_lossy();
+			let page = session_index
+				.list(&omp_storage::index::SessionFilter {
+					project: Some(Str::from(root_text.as_ref())),
+					limit: 200,
+					..Default::default()
+				})
+				.map_err(|error| miette::miette!(error))?;
+			Some(
+				omp_driver::session_state::resolve_session_selector(&page.sessions, resume.as_str())
+					.map_err(|error| miette::miette!(error))?
+					.0,
+			)
+		}
+	} else if let Some(selector) = args.continue_session.as_deref() {
+		if selector == "@terminal" {
+			breadcrumbs
+				.read(terminal_id.as_str())
+				.map_err(|error| miette::miette!(error))?
+				.map(|session| session.0)
+		} else {
+			let root_text = root.to_string_lossy();
+			let page = session_index
+				.list(&omp_storage::index::SessionFilter {
+					project: Some(Str::from(root_text.as_ref())),
+					limit: 200,
+					..Default::default()
+				})
+				.map_err(|error| miette::miette!(error))?;
+			Some(
+				omp_driver::session_state::resolve_session_selector(&page.sessions, selector)
+					.map_err(|error| miette::miette!(error))?
+					.0,
+			)
+		}
+	} else {
+		None
+	};
+	let fork = if let Some(selector) = args.fork.as_ref() {
+		if strict_session_id(selector).is_ok() {
+			Some(selector.clone())
+		} else {
+			let root_text = root.to_string_lossy();
+			let page = session_index
+				.list(&omp_storage::index::SessionFilter {
+					project: Some(Str::from(root_text.as_ref())),
+					limit: 200,
+					..Default::default()
+				})
+				.map_err(|error| miette::miette!(error))?;
+			Some(
+				omp_driver::session_state::resolve_session_selector(&page.sessions, selector.as_str())
+					.map_err(|error| miette::miette!(error))?
+					.0,
+			)
+		}
+	} else {
+		None
+	};
+	let eval_bridge = environment.eval_bridge();
+	let eval_control = environment.eval_control();
+
+	let registry = environment.registry();
+	let session_open = if args.no_session {
+		SessionOpen::Ephemeral
+	} else if let Some(source) = fork.as_ref() {
+		SessionOpen::Fork(source)
+	} else if let Some(source) = resume.as_ref() {
+		if resume_moved {
+			SessionOpen::ResumeMoved(source)
+		} else {
+			SessionOpen::Resume(source)
+		}
+	} else {
+		SessionOpen::New
+	};
+	let mut session = open_session(
+		&root,
+		&sessions_dir,
+		session_open,
+		registry.as_ref(),
+		(!args.no_session).then(|| Arc::clone(&session_index)),
+	)
+	.map_err(|e| miette::miette!(e))?;
+	if matches!(session_open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_)) {
+		let pending_turn = session.journal.pending_turn().is_some();
+		let pending_jobs = session.journal.pending_jobs().count();
+		if pending_turn || pending_jobs != 0 {
+			eprintln!(
+				"Warning: resumed session has {} pending tool call(s){}.",
+				pending_jobs,
+				if pending_turn {
+					" and an interrupted turn"
+				} else {
+					""
+				}
+			);
+		}
+	}
+	let blueprint = session_blueprint(
+		model.as_str(),
+		catalog,
+		&root,
+		&args.add_dir,
+		&session.id,
+		Arc::clone(&registry),
+	)
+	.map_err(|error| miette::miette!(error))?;
+	let mut snapshot =
+		agent_snapshot(&blueprint, catalog).map_err(|error| miette::miette!(error))?;
+	let home = std::env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
+	let prompt_settings = omp_driver::prompt_prep::settings::PromptSettings::default()
+		.with_cli(&args.prompt_settings)
+		.resolve_inputs(&root, &home)
+		.map_err(|error| miette::miette!(error))?;
+	snapshot.workspace.settings = prompt_settings.into();
+	snapshot.workspace.model = omp_agent::ModelPromptInput {
+		identifier:        model.clone(),
+		codex_task_policy: omp_driver::task::prompt_policy::uses_codex_task_prompt(model.as_str()),
+	};
+	if let Some(level) = args.thinking {
+		let effort = thinking_effort(level.into(), auto_thinking);
+		snapshot.turn.params.thinking =
+			Some(inference_pb::Reasoning { effort: effort as i32, ..Default::default() });
+	}
+	if resume.is_some() {
+		let path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
+		let Session { id, journal, initial_items: _ } = session;
+		let revived = omp_agent::revive_existing(&path, journal, snapshot)
+			.map_err(|error| miette::miette!(error))?;
+		session = Session { id, journal: revived.journal, initial_items: revived.live_items };
+		snapshot = revived.snapshot;
+		if let Some(model) = revived.model_override
+			&& !model.fallback
+		{
+			snapshot.turn.params.model = format!("{}/{}", model.model.provider.0, model.model.model.0);
+		}
+		if !model_selector_is_selectable(catalog, &snapshot.turn.params.model) {
+			let saved = snapshot.turn.params.model.clone();
+			let fallback = fallback_model_selector(catalog)
+				.ok_or_else(|| miette::miette!("no selectable model is available to resume"))?;
+			snapshot.turn.params.model = fallback.as_str().to_owned();
+			eprintln!(
+				"Session model `{saved}` is unavailable; resumed with `{fallback}` without changing \
+				 the session pin."
+			);
+		}
+	}
+	snapshot.reasoning_dialect = interrupted_reasoning_dialect(catalog, &snapshot.turn.params.model);
+	snapshot.workspace.model.identifier = Str::new(&snapshot.turn.params.model);
+	snapshot.workspace.model.codex_task_policy =
+		omp_driver::task::prompt_policy::uses_codex_task_prompt(&snapshot.turn.params.model);
+	let invocation_grant = apply_launch_tool_selection(
+		&mut snapshot,
+		LaunchToolSelection {
+			tools:    args.tools.as_ref().map(|tools| tools.0.as_slice()),
+			no_tools: args.no_tools,
+			no_lsp:   args.no_lsp,
+			no_pty:   args.no_pty,
+		},
+		registry.as_ref(),
+	)
+	.map_err(|error| miette::miette!(error))?;
+	let env = environment.client().with_invocation_grant(invocation_grant);
+	let settings_manager = omp_settings::manager::SettingsManager::open(
+		omp_settings::manager::SettingsPaths::discover(&data_dir, Some(&root)),
+	)
+	.map_err(|error| miette::miette!(error))?;
+	let configured_autolearn = settings_manager
+		.snapshot()
+		.project::<omp_driver::settings::Settings>()
+		.map_err(|error| miette::miette!(error))?
+		.get()
+		.autolearn;
+	let manage_skill_available = registry
+		.devices()
+		.any(|device| device.name.as_str() == "manage_skill");
+	let autolearn = omp_agent::AutolearnSettings {
+		enabled:        configured_autolearn.enabled && manage_skill_available,
+		auto_continue:  configured_autolearn.auto_continue,
+		min_tool_calls: configured_autolearn.min_tool_calls,
+	};
+	let active_content = omp_driver::discovery::active_content_snapshots(&root);
+	for warning in active_content.warnings.iter() {
+		eprintln!("Extension load warning: {warning}");
+	}
+	let prompt_rules = if args.no_rules {
+		Arc::from([])
+	} else {
+		omp_driver::rulebook::prompt_inputs(&active_content.rules)
+	};
+	let prompt_skills = if args.no_skills {
+		Arc::from([])
+	} else {
+		let discovered = omp_driver::skills::prompt_inputs(&active_content.skills);
+		match args.skills.as_ref() {
+			Some(selected) => discovered
+				.iter()
+				.filter(|skill| selected.0.iter().any(|selector| selector == &skill.id))
+				.cloned()
+				.collect::<Vec<_>>()
+				.into(),
+			None => discovered,
+		}
+	};
+	let context_roots = std::iter::once(&root)
+		.chain(args.add_dir.iter())
+		.map(|path| omp_driver::discovery::context::GrantedContextRoot {
+			root:  path.clone(),
+			start: path.clone(),
+		})
+		.collect::<Vec<_>>();
+	let context = omp_driver::discovery::context::discover(
+		&context_roots,
+		&omp_driver::discovery::context::ContextDiscoveryOptions::default(),
+	);
+	snapshot.workspace.context_files = omp_driver::discovery::context::prompt_files(&context);
+	snapshot.workspace = omp_driver::prompt_prep::PromptSnapshot::freeze(
+		snapshot.workspace.clone(),
+		registry.as_ref(),
+		Some(&snapshot.enabled_tools),
+		Arc::from([]),
+		Default::default(),
+		Default::default(),
+		Default::default(),
+		prompt_rules,
+		prompt_skills,
+		Arc::from([]),
+	)
+	.workspace;
+	let prepared =
+		omp_driver::prompt_prep::prepare_environment_inputs_bounded(&env, &session.journal, &root)
+			.await;
+	snapshot.workspace.host = prepared.host;
+	snapshot.workspace.roots = prepared.roots;
+	let state = AgentState::new(snapshot);
+	let initial_campaign = args.plan_mode.then_some("plan");
+
+	if let Some(endpoint) = args.gateway {
+		if args.api_key.is_some() || args.prompt_cache_key.is_some() {
+			return Err(miette::miette!(
+				"--api-key and --prompt-cache-key require in-process inference"
+			));
+		}
+		let channel = endpoint
+			.connect()
+			.await
+			.into_diagnostic()
+			.wrap_err_with(|| format!("could not connect to {endpoint}"))?;
+		environment
+			.search_bridge()
+			.bind_remote(channel.clone())
+			.into_diagnostic()?;
+		Box::pin(run_ui(
+			RpcTurnClient::new(channel),
+			&environment,
+			env,
+			state,
+			autolearn,
+			session,
+			blueprint,
+			Arc::clone(&eval_bridge),
+			eval_control.clone(),
+			None,
+			goal_control.clone(),
+			data_dir.clone(),
+			power_mode,
+			initial_campaign,
+			plan_selection,
+			security_enabled,
+			!args.no_title,
+			presentation_resize_scrollback(settings.tui.resize_scrollback),
+			ChatScope {
+				catalog,
+				root: &root,
+				sessions_dir: &sessions_dir,
+				session_index: Arc::clone(&session_index),
+				registry,
+				persist_sessions: !args.no_session,
+			},
+			start,
+			presentation,
+		))
+		.await
+		.into_diagnostic()?;
+	} else {
+		let (inference_registry, inference, credential_authority) =
+			omp_driver::registry::production_inference_for_session(
+				&data_dir,
+				Arc::clone(&registry),
+				Some(&root),
+				omp_driver::registry::InferenceSessionOverrides {
+					provider:              credential_provider,
+					api_key:               args.api_key.clone(),
+					prompt_cache_affinity: args.prompt_cache_key.clone(),
+				},
+			)
+			.await
+			.into_diagnostic()?;
+		search_bridge
+			.bind(inference.clone())
+			.map_err(|_| miette::miette!("workspace search inference is already bound"))?;
+		environment
+			.github_credentials()
+			.bind(credential_authority)
+			.map_err(|_| miette::miette!("GitHub credential authority is already bound"))?;
+		let client = InProcTurnClient::new(inference)
+			.await
+			.map_err(ChatError::from)
+			.into_diagnostic()?;
+		Box::pin(run_ui(
+			client,
+			&environment,
+			env,
+			state,
+			autolearn,
+			session,
+			blueprint,
+			eval_bridge,
+			eval_control,
+			Some(inference_registry),
+			goal_control,
+			data_dir,
+			power_mode,
+			initial_campaign,
+			plan_selection,
+			security_enabled,
+			!args.no_title,
+			presentation_resize_scrollback(settings.tui.resize_scrollback),
+			ChatScope {
+				catalog,
+				root: &root,
+				sessions_dir: &sessions_dir,
+				session_index: Arc::clone(&session_index),
+				registry,
+				persist_sessions: !args.no_session,
+			},
+			start,
+			presentation,
+		))
+		.await
+		.into_diagnostic()?;
+	}
+
+	// `environment` is deliberately retained until the agent and UI have been
+	// dropped. Its Drop implementation only stops authorities this process
+	// autostarted; it does not further affect any joined or draining daemon.
+	drop(environment);
+	Ok(())
+}
+
+/// Reports the platform limitation before touching project state.
+#[cfg(not(any(unix, windows)))]
+pub(crate) async fn run(
+	_args: ChatArgs,
+	_start: ChatStart,
+	_presentation: ChatPresentation,
+) -> miette::Result<()> {
+	use miette::IntoDiagnostic as _;
+	Err(DriverChatError::UnsupportedPlatform).into_diagnostic()
+}
+
+fn bind_goal_todo_context(
+	events: omp_agent::EventSubscription,
+	modes: std::sync::Weak<omp_driver::modes::CampaignHandle>,
+) {
+	drop(tokio::spawn(async move {
+		while let Ok(event) = events.recv().await {
+			let omp_agent::AgentEvent::ToolFinished { item, .. } = event.as_ref() else {
+				continue;
+			};
+			let Some(item::Kind::ToolResult(result)) = item.kind.as_ref() else {
+				continue;
+			};
+			if result.name != "todo" || result.is_error {
+				continue;
+			}
+			let mut rendered = String::new();
+			for part in &result.parts {
+				if let Some(part::Kind::Text(text)) = part.kind.as_ref() {
+					if !rendered.is_empty() {
+						rendered.push('\n');
+					}
+					rendered.push_str(text);
+				}
+			}
+			let Some(modes) = modes.upgrade() else {
+				break;
+			};
+			modes.set_goal_todo_context(
+				(!rendered.trim().is_empty()).then(|| Str::new(rendered.trim())),
+			);
+		}
+	}));
+}
+
+#[expect(
+	clippy::future_not_send,
+	reason = "the designed terminal host remains confined to its event-loop thread"
+)]
+async fn run_ui<C: TurnClient + Clone + Send + 'static>(
+	client: C,
+	environment: &omp_envd::ProjectEnvironment,
+	env: omp_env::EnvClient,
+	mut state: AgentState,
+	autolearn: omp_agent::AutolearnSettings,
+	mut session: Session,
+	mut blueprint: SessionBlueprint,
+	eval_bridge: Arc<omp_envd::eval::SessionBridgeHost>,
+	eval_control: omp_tools::eval::EvalSessionControl,
+	auth_registry: Option<InferenceRegistry>,
+	goal_control: omp_driver::bridges::AgentGoalControl,
+	data_dir: PathBuf,
+	power_mode: omp_driver::power::SleepPrevention,
+	initial_campaign: Option<&'static str>,
+	plan_selection: Option<omp_driver::plan::ModelSelection>,
+	security_enabled: bool,
+	title_enabled: bool,
+	resize_scrollback: omp_tui::ResizeScrollbackMode,
+	scope: ChatScope<'_>,
+	mut start: ChatStart,
+	presentation: ChatPresentation,
+) -> Result<(), ChatError> {
+	let memory_source = Arc::new(omp_driver::memory::RuntimePromptMemorySource::new(
+		environment.memory_runtime(),
+		usize::MAX,
+	));
+	let memory_prompt = omp_driver::memory::prompt_snapshot(
+		environment.memory_runtime().as_ref(),
+		None,
+		None,
+		usize::MAX,
+	)
+	.map_err(DriverChatError::from)?;
+	state.update(|snapshot| snapshot.workspace.memory = memory_prompt);
+	let parent = Arc::new(ChatParentHost::new(
+		client.clone(),
+		env.clone(),
+		state.clone(),
+		session.id.clone(),
+		scope.sessions_dir.to_path_buf(),
+		scope.root.to_path_buf(),
+		Arc::clone(&scope.session_index),
+		security_enabled,
+	));
+	let mut agents_control_session = parent.session_id();
+	let mut _agents_control_binding = environment
+		.bind_agents_control_authority(AgentsControlAuthority::factory(Arc::clone(&parent)));
+	parent.start_idle_parking();
+	let _eval_parent_binding = eval_bridge
+		.bind_sdk_parent(parent.session_id(), parent.clone())
+		.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
+	environment
+		.reflection_bridge()
+		.bind(parent.clone())
+		.map_err(DriverChatError::from)?;
+	let cold_agents = scope.sessions_dir.join("eval-agents");
+	if cold_agents.is_dir() {
+		omp_agent::AgentRegistry::global().discover_transcripts(&cold_agents)?;
+	}
+	let auth = auth_registry.map(ChatAuthWorker::start);
+	let drafts = crate::session_manager::DraftStore::new(&data_dir)?;
+	let breadcrumbs = omp_driver::session_state::TerminalBreadcrumbs::new(&data_dir)?;
+	let terminal_id = omp_tui::ttyid::terminal_id();
+	loop {
+		if scope.persist_sessions {
+			breadcrumbs.restamp(terminal_id.as_str(), &SessionId(session.id.clone()))?;
+		}
+		parent.update(state.clone(), session.id.clone());
+		if parent.session_id() != agents_control_session {
+			_agents_control_binding = environment
+				.bind_agents_control_authority(AgentsControlAuthority::factory(Arc::clone(&parent)));
+			agents_control_session = parent.session_id();
+		}
+		let session_root = scope.sessions_dir.join(session.id.as_str());
+		ensure_state_directory(&session_root)?;
+		ensure_state_directory(&session_root.join("local"))?;
+		let context_window = {
+			let current = state.snapshot();
+			model_context_window(scope.catalog, &current.turn.params.model)
+		};
+		let Session { id, journal, initial_items } = session;
+		let current_id = id.clone();
+		let content = omp_driver::discovery::active_content_snapshots(scope.root);
+		let (ttsr, ttsr_diagnostics) = omp_driver::rulebook::ttsr_registry(content.rules.as_ref());
+		for error in ttsr_diagnostics {
+			tracing::warn!(%error, "TTSR rule condition was rejected");
+		}
+		let mut agent =
+			Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
+		parent.bind_host_control(id.clone(), agent.host_control());
+		if omp_driver::settings::current(&data_dir)?.secrets.enabled {
+			let secrets = omp_driver::secrets::session::SecretSessionSnapshot::build(
+				0,
+				&data_dir.join("secrets.toml"),
+				&scope.root.join(".omp/secrets.toml"),
+				std::iter::empty(),
+			)?;
+			agent.set_secret_obfuscator(secrets.transform_handle());
+		}
+		agent.set_autolearn(omp_agent::AutolearnSettings {
+			enabled:        false,
+			auto_continue:  false,
+			min_tool_calls: autolearn.min_tool_calls,
+		});
+		agent.set_ttsr_registry(ttsr);
+		agent.set_prompt_memory_source(memory_source.clone());
+		blueprint.configure_agent(&mut agent);
+		match omp_driver::registry::production_redemption_authority(&data_dir) {
+			Ok(Some(authority)) => agent.set_redemption_authority(authority),
+			Ok(None) => {},
+			Err(error) => {
+				tracing::warn!(%error, "codex redemption authority was not constructed");
+			},
+		}
+		parent.bind_parent_jobs(Arc::clone(agent.jobs()));
+		let blob_store = omp_storage::blob::BlobStore::open(&data_dir)?;
+		let artifact_catalog =
+			Arc::new(parking_lot::Mutex::new(omp_storage::gc::ArtifactCatalog::open(&blob_store)?));
+		agent.set_artifact_catalog(Arc::clone(&artifact_catalog));
+		agent.set_blob_store(blob_store.clone());
+		let capture_rx =
+			omp_inference::transport::global_provider_capture().subscribe(Some(id.as_str()));
+		let capture_store = blob_store;
+		let capture_catalog = Arc::clone(&artifact_catalog);
+		let capture_session = SessionId(id.clone());
+		let capture_task = tokio::spawn(async move {
+			while let Ok(frame) = capture_rx.recv_async().await {
+				let body = serde_json::json!({
+					"sequence": frame.sequence,
+					"event": frame.event,
+					"payload": frame.payload,
+				})
+				.to_string();
+				let Ok(reference) = capture_store.put(body.as_bytes()) else {
+					continue;
+				};
+				let _ = capture_catalog.lock().adopt(
+					&capture_session,
+					reference.hash.into_bytes(),
+					Some(reference.size),
+					omp_tool::ArtifactLifetime::Session,
+				);
+			}
+		});
+		agent.set_run_activity(omp_driver::power::PowerActivity::new(power_mode));
+		let autolearn_campaign = autolearn
+			.enabled
+			.then(|| omp_driver::autolearn::AutolearnCampaign::new(autolearn));
+		let mut recovered_autolearn = false;
+		agent.recover_campaigns(
+			|spec_id| {
+				if let Some(core) = omp_agent::core_regime(spec_id) {
+					return Some(core);
+				}
+				let Some((spec, machine, _)) = autolearn_campaign.as_ref() else {
+					return None;
+				};
+				if spec_id != omp_driver::autolearn::AUTOLEARN_CAMPAIGN_ID || recovered_autolearn {
+					return None;
+				}
+				recovered_autolearn = true;
+				Some((
+					Arc::clone(spec),
+					Box::new(machine.clone()) as Box<dyn omp_agent::CampaignMachine>,
+				))
+			},
+			now_ms(),
+		)?;
+		if let Some((spec, machine, _)) = autolearn_campaign.as_ref()
+			&& !agent
+				.arbiter()
+				.campaigns()
+				.entries()
+				.iter()
+				.any(|entry| entry.spec_id == omp_driver::autolearn::AUTOLEARN_CAMPAIGN_ID)
+		{
+			let _ = agent.engage_campaign(
+				Arc::clone(spec),
+				Box::new(machine.clone()),
+				omp_agent::EngageOptions { now_ms: now_ms(), queue: false },
+			)?;
+		}
+		let autolearn_task = autolearn_campaign.as_ref().map(|(_, _, handle)| {
+			let events = agent.events().subscribe_lossless();
+			let handle = handle.clone();
+			tokio::spawn(async move {
+				while let Ok(event) = events.recv().await {
+					handle.observe(event.as_ref());
+				}
+			})
+		});
+		if let Some(spec_id) = initial_campaign
+			&& agent
+				.arbiter()
+				.campaigns()
+				.slots()
+				.owner(&omp_agent::SlotClaim::Mode)
+				.is_none()
+		{
+			let (spec, machine) =
+				omp_agent::core_regime(spec_id).expect("startup names a built-in regime");
+			let _ = agent.engage_campaign(spec, machine, omp_agent::EngageOptions {
+				now_ms: now_ms(),
+				queue:  false,
+			})?;
+		}
+		let modes = Arc::new(omp_driver::modes::CampaignHandle::new());
+		modes.sync_campaigns(agent.arbiter().campaigns());
+		bind_goal_todo_context(agent.events().subscribe_lossless(), Arc::downgrade(&modes));
+		modes.bind_plan_selection(state.clone(), plan_selection.clone());
+		parent.bind_campaigns(Arc::clone(&modes));
+		let _goal_binding = goal_control.bind(Arc::clone(&modes), agent.control());
+		state.update(|snapshot| {
+			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
+		});
+		agent.set_continuation_source(modes.clone());
+		let _control_binding = environment.bind_agent_control(agent.control())?;
+		environment.bind_device_availability(agent.mailbox());
+		let tree = parent.tree();
+		let root_budget = state
+			.snapshot()
+			.turn
+			.params
+			.task_budget
+			.and_then(|budget| budget.remaining_tokens)
+			.map_or_else(Budget::default, |remaining| Budget {
+				max_output_tokens: Some(remaining),
+				..Budget::default()
+			});
+		let node = tree
+			.register(id.clone(), sf!("Main"), AgentKind::Main, None, id.clone(), root_budget)
+			.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
+		node.set_status(AgentStatus::Running);
+		let broker = parent.broker();
+		let inbox = broker
+			.register(&node, agent.mailbox())
+			.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
+		let inbox = hub_backend::share_inbox(inbox);
+		parent.bind_inbox(id.clone(), Arc::clone(&inbox));
+		parent.recover_parked_children().await;
+		let _hub = hub_backend::attach(Arc::new(hub_backend::ChatHubBackend::new(
+			broker,
+			inbox,
+			Arc::clone(agent.jobs()),
+			env.clone(),
+			id.clone(),
+			id.clone(),
+			Some(agent.events().clone()),
+			Some(parent.supervisor()),
+		)));
+		let _vibe = omp_driver::vibe::attach_chat(Arc::clone(&parent), Arc::clone(&modes));
+		let initial_draft = if scope.persist_sessions {
+			drafts
+				.consume(&SessionId(current_id.clone()))?
+				.unwrap_or_default()
+		} else {
+			String::new()
+		};
+		let approval_book = Arc::new(omp_agent::ApprovalBook::new());
+		let (_approval_route, approval_inbox) =
+			omp_agent::ApprovalRoute::new(Arc::clone(&approval_book));
+		let (replica_pump, replica) = omp_collab::guest::GuestRelayPump::new(
+			data_dir.join("collab"),
+			scope.root.to_path_buf(),
+			now_ms(),
+		);
+		let replica_shutdown = replica.clone();
+		let mut replica_task = tokio::spawn(replica_pump.run());
+		let (collab_authority, collab) =
+			omp_driver::collab::session::CollabSessionAuthority::with_guest_replica(Some(replica));
+		let mut collab_task = omp_driver::collab::session::spawn_session_owner(collab_authority);
+		let title = scope
+			.session_index
+			.subagent_tree(&SessionId(id.clone()))?
+			.into_iter()
+			.next()
+			.map_or_else(omp_driver::session_title::SessionTitleState::default, |session| {
+				omp_driver::session_title::SessionTitleState {
+					title:  session.title,
+					source: session.title_source,
+				}
+			});
+		let outcome = chat_ui::run(
+			agent,
+			ChatUiSession { session_id: id, initial_items, context_window, title },
+			Arc::clone(&scope.registry),
+			parent.tree(),
+			Arc::clone(&parent),
+			Some(collab),
+			modes,
+			auth.as_ref().map(|worker| worker.ui().clone()),
+			data_dir.clone(),
+			Arc::clone(&scope.session_index),
+			scope.root.to_path_buf(),
+			session_root.join("local"),
+			security_enabled,
+			title_enabled,
+			resize_scrollback,
+			vec![
+				content
+					.commands
+					.iter()
+					.cloned()
+					.map(crate::chat_ui::input::CommandContribution::from)
+					.collect(),
+			],
+			content.skills,
+			Some(approval_inbox),
+			{
+				let sessions_dir = scope.sessions_dir.to_path_buf();
+				let root = scope.root.to_path_buf();
+				let current_id = current_id.clone();
+				move || resume_choices(&sessions_dir, &root, Some(&current_id)).into_diagnostic()
+			},
+			matches!(start, ChatStart::SessionIndex),
+			Str::from(initial_draft),
+			presentation,
+		)
+		.await;
+		replica_shutdown.stop().await;
+		if tokio::time::timeout(Duration::from_secs(3), &mut replica_task)
+			.await
+			.is_err()
+		{
+			replica_task.abort();
+			let _ = replica_task.await;
+		}
+		if let Some(task) = autolearn_task {
+			task.abort();
+			let _ = task.await;
+		}
+		capture_task.abort();
+		let _ = capture_task.await;
+		if tokio::time::timeout(Duration::from_secs(3), &mut collab_task)
+			.await
+			.is_err()
+		{
+			collab_task.abort();
+			let _ = collab_task.await;
+		}
+		let outcome = outcome.map_err(ChatError::Ui)?;
+		if scope.persist_sessions {
+			drafts.save(&SessionId(current_id.clone()), outcome.draft.as_str())?;
+		}
+		start = ChatStart::Session;
+		match outcome.exit {
+			omp_chat_ui::host::HostExit::Quit => break,
+			omp_chat_ui::host::HostExit::Suspend => {
+				#[cfg(unix)]
+				if let Err(error) = nix::sys::signal::kill(
+					nix::unistd::Pid::from_raw(0),
+					nix::sys::signal::Signal::SIGSTOP,
+				) {
+					tracing::warn!(%error, "failed to suspend process group");
+				}
+				eval_control.request_reset();
+				let model = state.snapshot().turn.params.model.clone();
+				let prompt_workspace = state.snapshot().workspace.clone();
+				session = open_session(
+					scope.root,
+					scope.sessions_dir,
+					SessionOpen::Resume(&current_id),
+					scope.registry.as_ref(),
+					scope
+						.persist_sessions
+						.then(|| Arc::clone(&scope.session_index)),
+				)?;
+				let additional_roots = blueprint.options().additional_roots.clone();
+				blueprint = session_blueprint(
+					&model,
+					scope.catalog,
+					scope.root,
+					&additional_roots,
+					&session.id,
+					Arc::clone(&scope.registry),
+				)?;
+				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
+				next.workspace = prompt_workspace;
+				next.workspace.model.identifier = Str::new(&model);
+				state = AgentState::new(next);
+			},
+			omp_chat_ui::host::HostExit::Resume(id) => {
+				eval_control.request_reset();
+				let model = state.snapshot().turn.params.model.clone();
+				let prompt_workspace = state.snapshot().workspace.clone();
+				session = open_session(
+					scope.root,
+					scope.sessions_dir,
+					SessionOpen::Resume(&id),
+					scope.registry.as_ref(),
+					scope
+						.persist_sessions
+						.then(|| Arc::clone(&scope.session_index)),
+				)?;
+				omp_envd::migrate_session_artifacts(
+					scope.sessions_dir,
+					current_id.as_str(),
+					session.id.as_str(),
+				)
+				.map_err(|source| DriverChatError::ProjectState {
+					path: scope.sessions_dir.to_owned(),
+					source,
+				})?;
+				let additional_roots = blueprint.options().additional_roots.clone();
+				blueprint = session_blueprint(
+					&model,
+					scope.catalog,
+					scope.root,
+					&additional_roots,
+					&session.id,
+					Arc::clone(&scope.registry),
+				)?;
+				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
+				next.workspace = prompt_workspace;
+				next.workspace.model.identifier = Str::new(&model);
+				state = AgentState::new(next);
+			},
+			omp_chat_ui::host::HostExit::NewSession => {
+				eval_control.request_reset();
+				let model = state.snapshot().turn.params.model.clone();
+				let prompt_workspace = state.snapshot().workspace.clone();
+				session = open_session(
+					scope.root,
+					scope.sessions_dir,
+					if scope.persist_sessions {
+						SessionOpen::New
+					} else {
+						SessionOpen::Ephemeral
+					},
+					scope.registry.as_ref(),
+					scope
+						.persist_sessions
+						.then(|| Arc::clone(&scope.session_index)),
+				)?;
+				omp_envd::migrate_session_artifacts(
+					scope.sessions_dir,
+					current_id.as_str(),
+					session.id.as_str(),
+				)
+				.map_err(|source| DriverChatError::ProjectState {
+					path: scope.sessions_dir.to_owned(),
+					source,
+				})?;
+				let additional_roots = blueprint.options().additional_roots.clone();
+				blueprint = session_blueprint(
+					&model,
+					scope.catalog,
+					scope.root,
+					&additional_roots,
+					&session.id,
+					Arc::clone(&scope.registry),
+				)?;
+				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
+				next.workspace = prompt_workspace;
+				next.workspace.model.identifier = Str::new(&model);
+				state = AgentState::new(next);
+			},
+		}
+	}
+	if let Some(auth) = auth {
+		auth.shutdown().await;
+	}
+	Ok(())
+}
+
+/// Resolves the catalog streaming watchdog for one model's primary route.
+///
+/// Absent providers, routes, or policies leave both bounds unset, which
+/// disables the loop's stream watchdog entirely.
+pub(crate) fn model_stream_watchdog(
+	catalog: &omp_catalog::snapshot::Catalog,
+	model: &str,
+) -> omp_agent::StreamWatchdog {
+	let watchdog = catalog
+		.model(omp_catalog::ModelKey::from_ref(model))
+		.or_else(|| catalog.resolve_alias(model))
+		.and_then(|spec| spec.routes.first())
+		.and_then(|route| catalog.route(route))
+		.and_then(|route| catalog.provider(&route.provider))
+		.and_then(|provider| catalog.wire_policy(&provider.wire_policy))
+		.and_then(|policy| policy.streaming.watchdog);
+	watchdog.map_or_else(omp_agent::StreamWatchdog::default, |watchdog| omp_agent::StreamWatchdog {
+		first_event_ms: watchdog.first_event_ms,
+		idle_ms:        watchdog.idle_ms,
+	})
+}

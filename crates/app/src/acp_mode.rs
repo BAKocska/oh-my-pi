@@ -19,9 +19,18 @@ use omp_agent::{
 	ApprovalSource, ApprovalSpec, EventProvenance, EventSubscription, EventVisibility, PlanState,
 	RunSettlement,
 };
+use omp_catalog::{ModelKey, ThinkingEffort, clamp_thinking_effort};
 use omp_core::{CowBytes, Hash32, Str, ToolPath, sf};
-use omp_llm_catalog::{ModelKey, ThinkingEffort, clamp_thinking_effort};
-use omp_llm_inference::call::{ContentPart, MediaInput};
+use omp_driver::{
+	headless::{HeadlessSession, HeadlessSessionOptions},
+	plan::PlanArtifactStore,
+};
+use omp_envd::{
+	docs::AcpDocumentBackend,
+	exthost::lifecycle::{HeadlessLifecycleKind, HeadlessLifecycleSubscription},
+	tool_shell::{AcpExecBackend, AcpExecRequest, AcpExecRun},
+};
+use omp_inference::call::{ContentPart, MediaInput};
 use omp_proto::{
 	env::v1 as env_wire,
 	inference::v1::{self as inference_wire, Effort, Reasoning, part_start, value},
@@ -43,14 +52,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	chat_ui::commands::registry::{CommandRole, CommandRoster, CommandSurface},
-	cli::{AcpArgs, data_dir, turn_id},
-	envd::{
-		docs::AcpDocumentBackend,
-		tool_shell::{AcpExecBackend, AcpExecRequest, AcpExecRun},
-	},
-	exthost::lifecycle::{HeadlessLifecycleKind, HeadlessLifecycleSubscription},
-	headless::{HeadlessSession, HeadlessSessionOptions},
-	plan::PlanArtifactStore,
+	cli::{AcpArgs, turn_id},
 };
 
 const CANCEL_CLEANUP: Duration = Duration::from_secs(2);
@@ -72,14 +74,14 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 		eprintln!("warning: `omp acp` expects newline-delimited JSON on stdin");
 	}
 	let root = std::fs::canonicalize(&args.project).into_diagnostic()?;
-	let data_dir = data_dir(None)?;
-	let state_dir = crate::project_state::directory(&data_dir, &root).into_diagnostic()?;
+	let data_dir = omp_core::dirs::data_dir(None)?;
+	let state_dir = omp_env::project_state::directory(&data_dir, &root).into_diagnostic()?;
 	std::fs::create_dir_all(state_dir.join("sessions")).into_diagnostic()?;
 	let index = Arc::new(SessionIndex::open(state_dir.join("sessions.sqlite3")).into_diagnostic()?);
 	let local_root = state_dir.join("local");
 	std::fs::create_dir_all(&local_root).into_diagnostic()?;
-	let content = crate::discovery::active_content_snapshots(&root);
-	let configured_model = crate::settings::current(&data_dir)
+	let content = omp_driver::discovery::active_content_snapshots(&root);
+	let configured_model = omp_driver::settings::current(&data_dir)
 		.into_diagnostic()?
 		.default_model
 		.map(Str::from);
@@ -87,7 +89,7 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 		.model
 		.or(configured_model)
 		.ok_or_else(|| miette!("acp mode requires --model or config.default_model"))?;
-	let catalog = omp_llm_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
+	let catalog = omp_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
 	let models = catalog
 		.models()
 		.iter()
@@ -206,7 +208,7 @@ struct State {
 	root:                    PathBuf,
 	local_root:              PathBuf,
 	index:                   Arc<SessionIndex>,
-	content:                 crate::discovery::ActiveContentSnapshots,
+	content:                 omp_driver::discovery::ActiveContentSnapshots,
 	sessions:                HashMap<Str, Arc<AcpSession>>,
 	active:                  HashMap<Str, CancellationToken>,
 	approvals:               ApprovalBook,
@@ -259,7 +261,10 @@ impl omp_tools::ask::AskPresenter for AcpAskPresenter {
 		&self,
 		questions: &[omp_tools::ask::Question],
 	) -> Result<omp_tools::ask::Presentation, omp_tools::ask::Fault> {
-		let runtime = self.runtime.upgrade().ok_or_else(|| ask_fault("ACP peer disconnected"))?;
+		let runtime = self
+			.runtime
+			.upgrade()
+			.ok_or_else(|| ask_fault("ACP peer disconnected"))?;
 		let params = ask_elicitation_params(&self.session_id, questions);
 		let handle = tokio::runtime::Handle::current();
 		let response = tokio::task::block_in_place(|| {
@@ -1474,7 +1479,7 @@ impl Runtime {
 	fn reload_commands(&self, session_id: &Str) -> miette::Result<()> {
 		let (commands, generation) = {
 			let mut state = self.state.lock();
-			state.content = crate::discovery::active_content_snapshots(&state.root);
+			state.content = omp_driver::discovery::active_content_snapshots(&state.root);
 			state.command_generation = state.command_generation.wrapping_add(1).max(1);
 			(available_commands(&state.content, state.command_generation), state.command_generation)
 		};
@@ -1586,7 +1591,7 @@ impl Runtime {
 	}
 
 	async fn speech_models(&self) -> miette::Result<Value> {
-		use omp_llm_inference::local::{
+		use omp_inference::local::{
 			ArtifactStore, LocalCancellation,
 			speech_catalog::{SpeechArtifactManifests, SpeechCatalog},
 		};
@@ -1601,7 +1606,7 @@ impl Runtime {
 	}
 
 	fn list_extensions(&self) -> miette::Result<Value> {
-		use crate::ext::lock::InstalledRecord;
+		use omp_ext::lock::InstalledRecord;
 		let state = self.state.lock();
 		let client_path = state.data_dir.join("ext/installed.toml");
 		let workspace_path = state.root.join(".omp/installed.toml");
@@ -1618,7 +1623,7 @@ impl Runtime {
 	}
 
 	fn toggle_extension(&self, params: &Map<String, Value>) -> miette::Result<Value> {
-		use crate::ext::{lock::InstalledRecord, upgrade::set_enabled};
+		use omp_ext::{lock::InstalledRecord, upgrade::set_enabled};
 		let id = required_text(params, "id")?;
 		let enabled = params
 			.get("enabled")
@@ -1972,16 +1977,16 @@ impl Runtime {
 		session_id: &Str,
 		text: &str,
 	) -> miette::Result<Option<AcpPromptIntercept>> {
-		if let Some(invocation) = crate::skills::parse_invocation(text) {
+		if let Some(invocation) = omp_driver::skills::parse_invocation(text) {
 			let skill = {
 				let state = self.state.lock();
 				state.content.skills.get(invocation.name.as_str()).cloned()
 			}
 			.ok_or_else(|| miette!("unknown skill `{}`", invocation.name))?;
-			let rendered = crate::skills::render_invocation(
+			let rendered = omp_driver::skills::render_invocation(
 				&skill,
 				invocation.args.as_str(),
-				crate::skills::SkillInvocationKind::User,
+				omp_driver::skills::SkillInvocationKind::User,
 			);
 			self.command_output(session_id, sf!("Skill `{}` loaded for this turn.", skill.name))?;
 			return Ok(Some(AcpPromptIntercept::Prompt(rendered)));
@@ -2256,8 +2261,7 @@ impl Runtime {
 	) -> miette::Result<(&'static str, Option<Str>)> {
 		let headless = session.headless.lock().await;
 		let interrupt = headless.interrupt_handle();
-		let retry =
-			headless.retry_last_turn(omp_agent::TurnId::new(format!("retry-{}", turn_id())));
+		let retry = headless.retry_last_turn(omp_agent::TurnId::new(format!("retry-{}", turn_id())));
 		tokio::pin!(retry);
 		let mut interrupted = false;
 		let result = loop {
@@ -2299,10 +2303,8 @@ impl Runtime {
 	) -> miette::Result<(&'static str, Option<Str>)> {
 		let headless = session.headless.lock().await;
 		let interrupt = headless.interrupt_handle();
-		let handoff = headless.compact_manual(omp_agent::ManualCompactionRequest {
-			mode: None,
-			focus: instructions,
-		});
+		let handoff = headless
+			.compact_manual(omp_agent::ManualCompactionRequest { mode: None, focus: instructions });
 		tokio::pin!(handoff);
 		let mut interrupted = false;
 		let result = loop {
@@ -2324,10 +2326,7 @@ impl Runtime {
 			return Ok(("cancelled", None));
 		}
 		Ok(match result {
-			Ok(_) => (
-				"end_turn",
-				Some(sf!("Context handed off and compacted in place.")),
-			),
+			Ok(_) => ("end_turn", Some(sf!("Context handed off and compacted in place."))),
 			Err(error) => ("end_turn", Some(sf!("Handoff failed: {error}"))),
 		})
 	}
@@ -2999,7 +2998,7 @@ fn scoped_mcp_prefix(session_id: &str) -> String {
 }
 
 fn available_commands(
-	content: &crate::discovery::ActiveContentSnapshots,
+	content: &omp_driver::discovery::ActiveContentSnapshots,
 	generation: u64,
 ) -> Vec<Value> {
 	let mut commands = CommandRoster::builtins()
@@ -3065,7 +3064,7 @@ fn clamp_thinking_level(model: &str, requested: &str) -> miette::Result<&'static
 	let requested = requested
 		.parse::<ThinkingEffort>()
 		.map_err(|_| miette!("unknown thinking level `{requested}`"))?;
-	let catalog = omp_llm_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
+	let catalog = omp_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
 	let model = catalog
 		.model(ModelKey::from_ref(model))
 		.ok_or_else(|| miette!("unknown model `{model}`"))?;
@@ -3164,7 +3163,7 @@ fn ask_answers(
 					.iter()
 					.any(|option| option.label.as_str() == candidate)
 			};
-			let mut selected = if question.multi {
+			let mut selected: Vec<Str> = if question.multi {
 				content
 					.get(&key)
 					.and_then(Value::as_array)
@@ -3363,14 +3362,14 @@ mod tests {
 				header:      Some(sf!("Choose one")),
 				options:     vec![
 					omp_tools::ask::OptionItem {
-						label: sf!("A"),
+						label:       sf!("A"),
 						description: Some(sf!("Faster")),
-						preview: None,
+						preview:     None,
 					},
 					omp_tools::ask::OptionItem {
-						label: sf!("B"),
+						label:       sf!("B"),
 						description: Some(sf!("Safer")),
-						preview: None,
+						preview:     None,
 					},
 				],
 				multi:       false,
@@ -3382,14 +3381,14 @@ mod tests {
 				header:      None,
 				options:     vec![
 					omp_tools::ask::OptionItem {
-						label: sf!("auth"),
+						label:       sf!("auth"),
 						description: None,
-						preview: None,
+						preview:     None,
 					},
 					omp_tools::ask::OptionItem {
-						label: sf!("search"),
+						label:       sf!("search"),
 						description: None,
-						preview: None,
+						preview:     None,
 					},
 				],
 				multi:       true,

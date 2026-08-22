@@ -3,7 +3,7 @@
 use std::{cell::Cell, sync::Arc, time::Duration};
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_llm_inference::local::{
+use omp_inference::local::{
 	ArtifactStore, LocalCancellation, MemoryPool, SystemArtifactFetcher,
 	speech_catalog::{DEFAULT_KOKORO_VOICE, SpeechArtifactManifests},
 	tts::{KokoroAdapter, KokoroConfig, KokoroDevice, SynthesisOptions},
@@ -16,7 +16,7 @@ pub async fn run(args: SayArgs) -> miette::Result<()> {
 	if !args.speed.is_finite() || args.speed <= 0.0 {
 		return Err(miette!("--speed must be a finite positive number"));
 	}
-	let data_dir = crate::cli::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
 	let text = match (args.text, args.file) {
 		(Some(text), None) => text,
 		(None, Some(path)) => omp_core::Str::from(std::fs::read_to_string(path).into_diagnostic()?),

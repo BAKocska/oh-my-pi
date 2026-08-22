@@ -41,9 +41,9 @@ fn sizes() {
 		omp_proto::env::v1::AdmitInvocation,
 		omp_proto::thread::v1::Item,
 		omp_proto::inference::v1::TurnError,
-		omp_app::exthost::services::ServiceError,
-		omp_app::exthost::services::ServiceKey,
-		omp_app::envd::worker::HostKey,
-		omp_app::exthost::control::JournalControlError,
+		omp_envd::exthost::services::ServiceError,
+		omp_envd::exthost::services::ServiceKey,
+		omp_envd::worker::HostKey,
+		omp_envd::exthost::control::JournalControlError,
 	);
 }

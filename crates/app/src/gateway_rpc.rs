@@ -4,9 +4,8 @@ use omp_proto::{
 	gateway::v1::{ForwardRequest, forward_proxy_server::ForwardProxy},
 	inference::v1::{NativeChunk, inference_server::Inference},
 };
+use omp_serve::inference::InferenceRpc;
 use tonic::{Request, Response, Status};
-
-use crate::rpc_adapter::InferenceRpc;
 
 /// Credential-free forward-proxy surface backed by the canonical inference RPC.
 #[derive(Clone)]
@@ -49,15 +48,14 @@ mod tests {
 
 	use super::NativeChunk;
 
-
 	#[test]
 	fn forward_response_schema_has_no_credential_header_surface() {
 		let chunk = NativeChunk {
-			status: 200,
-			media_type: "application/json".to_owned(),
+			status:              200,
+			media_type:          "application/json".to_owned(),
 			provider_request_id: "request-1".to_owned(),
-			data: Bytes::from_static(b"{}"),
-			r#final: true,
+			data:                Bytes::from_static(b"{}"),
+			r#final:             true,
 		};
 		let value = serde_json::to_value(chunk).expect("serialize native chunk");
 		let object = value.as_object().expect("chunk object");

@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, stream};
 use miette::{IntoDiagnostic as _, miette};
+use omp_catalog::ModelKey;
 use omp_core::Str;
-use omp_llm_catalog::ModelKey;
-use omp_llm_inference::{
+use omp_inference::{
 	Client,
 	call::{CallMeta, Target},
 	event::ChatEvent,
@@ -35,10 +35,10 @@ pub async fn run(args: BenchArgs) -> miette::Result<()> {
 	if args.runs == 0 || args.par == 0 || args.max_tokens == 0 {
 		return Err(miette!("--runs, --par, and --max-tokens must be greater than zero"));
 	}
-	let data_dir = crate::cli::data_dir(args.data_dir)?;
-	let store =
-		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?;
-	let registry = crate::daemon::production_registry(&data_dir, store)
+	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
+	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
+		.into_diagnostic()?;
+	let registry = omp_driver::registry::production_registry(&data_dir, store)
 		.await
 		.into_diagnostic()?;
 	let model = ModelKey::from(args.model);
@@ -77,13 +77,13 @@ pub async fn run(args: BenchArgs) -> miette::Result<()> {
 }
 
 async fn sample(
-	registry: omp_llm_inference::Registry,
+	registry: omp_inference::Registry,
 	model: ModelKey,
 	prompt: Str,
 	max_tokens: u64,
 	run: u32,
 ) -> miette::Result<Sample> {
-	let planner = omp_llm_inference::router::Router::new(registry.clone(), Duration::from_secs(30));
+	let planner = omp_inference::router::Router::new(registry.clone(), Duration::from_secs(30));
 	let meta = CallMeta {
 		id:       RequestId::from(format!("omp-bench-{run}")),
 		target:   Target::Model(model),

@@ -7,9 +7,9 @@ use std::{
 };
 
 use miette::{IntoDiagnostic as _, miette};
+use omp_catalog::{ModelKey, snapshot::Catalog};
 use omp_core::Str;
-use omp_llm_catalog::{ModelKey, snapshot::Catalog};
-use omp_llm_inference::account::{
+use omp_inference::account::{
 	AccountPool, AccountSelectionRequest, AccountStateStore, RotationPolicy,
 };
 use serde_json::json;
@@ -22,7 +22,7 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 	if args.count == 0 || args.concurrency == 0 {
 		return Err(miette!("--count and --concurrency must be greater than zero"));
 	}
-	let data_dir = crate::cli::data_dir(args.data_dir.clone())?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir.clone())?;
 	let catalog = Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
 	let model = args
 		.model

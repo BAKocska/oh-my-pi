@@ -43,12 +43,13 @@ pub fn resolve_prompt_slots(
 	append: Option<&str>,
 ) -> miette::Result<PromptSlots> {
 	let (system, explicit_append) =
-		crate::prompt_input::resolve_system_inputs(cwd, home, system, append)
+		omp_driver::prompt_input::resolve_system_inputs(cwd, home, system, append)
 			.map_err(|error| miette::miette!(error))?;
 	let append = if explicit_append.is_some() {
 		explicit_append
 	} else {
-		crate::prompt_input::discover_prompt_file(cwd, home, "APPEND_SYSTEM.md").into_diagnostic()?
+		omp_driver::prompt_input::discover_prompt_file(cwd, home, "APPEND_SYSTEM.md")
+			.into_diagnostic()?
 	};
 	Ok(PromptSlots { system, append })
 }

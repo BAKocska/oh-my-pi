@@ -1,23 +1,9 @@
 //! Bootstrap-time extraction of profile and shell-alias flags.
 
-use std::{ffi::OsString, sync::OnceLock};
+use std::ffi::OsString;
 
 use omp_core::Str;
 use thiserror::Error;
-
-static SELECTED_PROFILE: OnceLock<Option<Str>> = OnceLock::new();
-
-/// Publishes the bootstrap profile without mutating process environment.
-pub fn select(profile: Option<Str>) {
-	let _ = SELECTED_PROFILE.set(profile);
-}
-
-/// Returns the bootstrap-selected profile, including the environment fallback.
-pub fn selected() -> Option<&'static str> {
-	SELECTED_PROFILE
-		.get()
-		.and_then(|profile| profile.as_deref())
-}
 
 /// Internal boundary marker preserving optional/string argument ownership.
 pub const PROFILE_BOUNDARY: &str = "--omp-profile-boundary";

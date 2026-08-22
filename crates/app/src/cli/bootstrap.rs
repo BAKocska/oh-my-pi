@@ -8,10 +8,9 @@ use std::{
 };
 
 use omp_core::Str;
+use omp_ext::config::{CliCollision, CliContribution, CliContributionSet, CliValueKind};
 use serde::Deserialize;
 use thiserror::Error;
-
-use crate::ext::config::{CliCollision, CliContribution, CliContributionSet, CliValueKind};
 
 /// One typed value delivered to an extension activation sink.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,7 +241,7 @@ mod tests {
 			kind,
 			default: None,
 			shadow_builtin: false,
-			sink: crate::ext::config::CliValueSink { key: Str::new(name) },
+			sink: omp_ext::config::CliValueSink { key: Str::new(name) },
 		}
 	}
 }

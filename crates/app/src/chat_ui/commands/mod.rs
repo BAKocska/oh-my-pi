@@ -508,7 +508,7 @@ pub trait FlowCommandHost {
 					 journal, and private artifact spill; do not create a scan coordinator, database, \
 					 SARIF, comparison, validation workflow, bundle, cloud client, or security:// \
 					 resource.",
-					crate::security_review::profile::PROFILE_ID
+					omp_driver::security_review::profile::PROFILE_ID
 				)),
 				provenance: CommandProvenance::builtin(),
 			}))
@@ -518,8 +518,12 @@ pub trait FlowCommandHost {
 
 /// Complete command host assembled from capability-scoped interfaces.
 pub trait CommandHost:
-	ShellCommandHost + SessionCommandHost + ModelCommandHost + ConfigCommandHost + FlowCommandHost
- + Send
+	ShellCommandHost
+	+ SessionCommandHost
+	+ ModelCommandHost
+	+ ConfigCommandHost
+	+ FlowCommandHost
+	+ Send
 {
 }
 

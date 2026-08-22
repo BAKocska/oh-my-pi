@@ -3,13 +3,14 @@
 use std::{path::Path, time::Duration};
 
 use miette::{IntoDiagnostic as _, miette};
+use omp_catalog::{ProviderDef, ProviderId, provider::AuthSpecKind, snapshot::Catalog};
 use omp_chat_ui::{
 	OverlayPanel, panel_divider,
 	provider_picker::{ProviderCard, provider_card_grid},
 };
 use omp_core::{IntoStr, Str, sf};
-use omp_llm_catalog::{ProviderDef, ProviderId, provider::AuthSpecKind, snapshot::Catalog};
-use omp_llm_inference::{
+use omp_driver::chat::ChatAuthWorker;
+use omp_inference::{
 	Client, Registry as InferenceRegistry,
 	answer::{AccountState, AuthAnswer},
 	call::{AuthRequest, CallMeta, Target},
@@ -23,12 +24,8 @@ use omp_tui::{
 	shader::Eclipse,
 };
 
-use crate::{
-	chat::ChatAuthWorker,
-	chat_ui::{
-		AuthPromptKind, CREDENTIAL_STORAGE_LOCKED_MESSAGE, ChatAuthEvent, auth_input,
-		prompt_masks_input,
-	},
+use crate::chat_ui::{
+	AuthPromptKind, CREDENTIAL_STORAGE_LOCKED_MESSAGE, ChatAuthEvent, auth_input, prompt_masks_input,
 };
 
 const STATUS_ID: &str = "wizard-status";
@@ -70,9 +67,9 @@ enum AuthLocation {
 #[expect(clippy::future_not_send, reason = "the setup wizard owns a thread-confined omp_tui::App")]
 pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<Str>> {
 	std::fs::create_dir_all(data_dir).into_diagnostic()?;
-	let store =
-		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?;
-	let registry = crate::daemon::production_registry(data_dir, store)
+	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
+		.into_diagnostic()?;
+	let registry = omp_driver::registry::production_registry(data_dir, store)
 		.await
 		.into_diagnostic()?;
 	let has_account = has_active_account(&registry).await?;
@@ -179,12 +176,12 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(AppEvent::Changed { id, value })
 					if id.as_str() == MODEL_SELECT_ID && step == Step::Model =>
 				{
-					crate::settings::manager::SettingsManager::open(
-						crate::settings::manager::SettingsPaths::discover(data_dir, None),
+					omp_settings::manager::SettingsManager::open(
+						omp_settings::manager::SettingsPaths::discover(data_dir, None),
 					)
 					.into_diagnostic()?
 					.set(
-						crate::settings::manager::MutationScope::Global,
+						omp_settings::manager::MutationScope::Global,
 						"default_model",
 						value.as_str(),
 					)
@@ -415,7 +412,7 @@ fn open_setup_provider_step(ui: &mut Ui, catalog: &Catalog) {
 /// Opens the model picker, scoped to `provider`'s models when it names any;
 /// falls back to the full catalog for providers without model entries.
 fn open_setup_model_step(ui: &mut Ui, catalog: &Catalog, current: &str, provider: Option<&str>) {
-	let mut scoped: Vec<&omp_llm_inference::ModelSpec> = match provider {
+	let mut scoped: Vec<&omp_inference::ModelSpec> = match provider {
 		Some(provider) => catalog
 			.models()
 			.iter()

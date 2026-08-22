@@ -1,10 +1,10 @@
 use omp_core::Str;
-
-use super::{CollabRequest, ParsedFlags, command, parse_flags};
-use crate::{
+use omp_driver::{
 	collab::session::{CollabCommandResult, CollabOwnerCommand, HostOptions},
 	settings::CollabSettings,
 };
+
+use super::{CollabRequest, ParsedFlags, command, parse_flags};
 
 command!(collab, 700, "collab", [], "Host or inspect live collaboration", [Session], true, typed("[start|view|status|stop] [--relay URL] [--web-url URL]", ["start", "view", "status", "stop", "--relay", "--web-url"], parse_collab) => |host, request| host.collab(request));
 command!(join, 710, "join", [], "Join a live collaboration", [Session], true, required("<link>") => |host, link| host.join_collab(link));

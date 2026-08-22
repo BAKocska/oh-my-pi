@@ -302,6 +302,18 @@ pub struct CommandContribution {
 	/// Optional prompt template dispatched when this command is submitted.
 	pub template:    Option<Str>,
 }
+impl From<omp_driver::discovery::CommandContribution> for CommandContribution {
+	fn from(value: omp_driver::discovery::CommandContribution) -> Self {
+		Self {
+			name:        value.name,
+			aliases:     value.aliases.into_iter().collect(),
+			description: value.description,
+			hint:        value.hint,
+			origin:      value.origin,
+			template:    value.template,
+		}
+	}
+}
 
 const INIT_WORKFLOW_TEMPLATE: &str = r#"Use parallel `task` research agents for independent slices of the repository: core source, tests, configuration/build, and scripts/documentation. Synthesize their findings into one AGENTS.md.
 
@@ -355,7 +367,8 @@ impl From<CommandContribution> for AvailableCommand {
 pub struct CommandRoster {
 	available: Vec<AvailableCommand>,
 }
-/// Process-local slash-command counts backed by the authoritative session index.
+/// Process-local slash-command counts backed by the authoritative session
+/// index.
 pub struct CommandUsage {
 	index:  Arc<SessionIndex>,
 	counts: RwLock<BTreeMap<Str, u64>>,
@@ -406,15 +419,16 @@ impl CommandRoster {
 	pub fn parse_input(&self, text: &str) -> Result<ChatCommand, InputError> {
 		parse_input(text, &self.available)
 	}
-	/// Resolves submitted slash input to the canonical name used for frequency ranking.
+
+	/// Resolves submitted slash input to the canonical name used for frequency
+	/// ranking.
 	pub fn command_usage_name(&self, text: &str) -> Option<Str> {
 		let parsed = parse_slash(text)?;
 		self
 			.available
 			.iter()
 			.find(|command| {
-				command.name == parsed.name
-					|| command.aliases.iter().any(|alias| alias == parsed.name)
+				command.name == parsed.name || command.aliases.iter().any(|alias| alias == parsed.name)
 			})
 			.map(|command| command.name.clone())
 	}
@@ -703,7 +717,7 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		text:   Str::from(text),
 		budget: budget.clone(),
 	};
-	if let Some(skill) = crate::skills::parse_invocation(&text) {
+	if let Some(skill) = omp_driver::skills::parse_invocation(&text) {
 		return Ok(ChatCommand::Skill { name: skill.name, args: skill.args, budget });
 	}
 	let Some(parsed) = parse_slash(&text) else {
@@ -1138,13 +1152,22 @@ mod tests {
 		let session = AvailableCommand { name: sf!("resume"), ..builtin.clone() };
 		let mcp = AvailableCommand { name: sf!("mcp"), ..builtin.clone() };
 		let prompt = AvailableCommand {
-			name: sf!("prompt"), origin: sf!("project"), builtin: false, ..builtin.clone()
+			name: sf!("prompt"),
+			origin: sf!("project"),
+			builtin: false,
+			..builtin.clone()
 		};
 		let extension = AvailableCommand {
-			name: sf!("extension"), origin: sf!("extension"), builtin: false, ..builtin.clone()
+			name: sf!("extension"),
+			origin: sf!("extension"),
+			builtin: false,
+			..builtin.clone()
 		};
 		let skill = AvailableCommand {
-			name: sf!("skill:rust"), origin: sf!("skill"), builtin: false, ..builtin.clone()
+			name: sf!("skill:rust"),
+			origin: sf!("skill"),
+			builtin: false,
+			..builtin.clone()
 		};
 		assert_eq!(command_icon(&builtin), Icon::SlashCommand);
 		assert_eq!(command_icon(&session), Icon::Session);

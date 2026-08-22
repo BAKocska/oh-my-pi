@@ -3,9 +3,9 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
+use omp_catalog::OperationKind;
 use omp_core::sf;
-use omp_llm_catalog::OperationKind;
-use omp_llm_inference::{
+use omp_inference::{
 	Client,
 	auth::{CredentialStore, HeadlessKeySource, KeyId},
 	call::{
@@ -18,7 +18,7 @@ use omp_llm_inference::{
 };
 
 fn credential_store(path: &Path) -> Arc<CredentialStore> {
-	omp_app::daemon::open_credential_store_with_key_source(
+	omp_driver::registry::open_credential_store_with_key_source(
 		path,
 		Arc::new(HeadlessKeySource::new(KeyId::new("stock-sdk-smoke"), [0x32; 32])),
 	)
@@ -65,7 +65,7 @@ fn chat_request() -> ChatRequest {
 async fn typed_chat_and_discovery_plan_through_the_production_registry() {
 	let state = tempfile::tempdir().expect("temporary state");
 	let store = credential_store(&state.path().join("credentials.db"));
-	let registry = omp_app::daemon::production_registry(state.path(), store)
+	let registry = omp_driver::registry::production_registry(state.path(), store)
 		.await
 		.expect("production registry");
 	let chat_model = registry

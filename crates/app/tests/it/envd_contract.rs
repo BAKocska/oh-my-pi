@@ -320,6 +320,16 @@ impl Tool for CooperativeInterruptTool {
 	}
 }
 
+const PRELUDE_HELPER_EXTENSION_MODULE: &str = "envd_prelude_helper";
+
+const PRELUDE_HELPER_EXTENSION: &str = r#"
+import omp
+
+@omp.prelude
+def helper_echo(value):
+    return {"value": value}
+"#;
+
 const WORKER_CANCEL_EXTENSION: &str = r#"
 import ctypes
 import os
@@ -431,6 +441,8 @@ fn extension_worker(module: &str, python_site: Option<PathBuf>) -> ExtHostConfig
 	let key = HostKey::new("workspace", "trusted", module);
 	let manifest = if module == PY_EVAL_MODULE {
 		ExtensionManifest::py_eval(test_provenance(&key), [])
+	} else if module == PRELUDE_HELPER_EXTENSION_MODULE {
+		test_manifest(&key, module, [ToolDeclarationKey::new("helper_echo", "prelude", 1)])
 	} else {
 		test_manifest(&key, module, [
 			ToolDeclarationKey::new("worker_block", "r", 1),
@@ -708,7 +720,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 	let advertised = registry
 		.advertise(LoweringCaps {
 			strict_schema:  true,
-			grammar:        omp_llm_catalog::GrammarBits::empty(),
+			grammar:        omp_catalog::GrammarBits::empty(),
 			maximum_tools:  None,
 			maximum_strict: None,
 		})
@@ -1728,7 +1740,7 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 		.registry()
 		.advertise(LoweringCaps {
 			strict_schema:  true,
-			grammar:        omp_llm_catalog::GrammarBits::empty(),
+			grammar:        omp_catalog::GrammarBits::empty(),
 			maximum_tools:  None,
 			maximum_strict: None,
 		})
@@ -1823,7 +1835,7 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 	let advertised = registry
 		.advertise(LoweringCaps {
 			strict_schema:  true,
-			grammar:        omp_llm_catalog::GrammarBits::empty(),
+			grammar:        omp_catalog::GrammarBits::empty(),
 			maximum_tools:  None,
 			maximum_strict: None,
 		})
@@ -1842,6 +1854,55 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 			.await;
 	assert!(!verdict.is_error, "python worker route returned an error");
 }
+#[tokio::test]
+async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
+	let site = tempfile::tempdir().expect("prelude helper extension scratch");
+	std::fs::write(
+		site
+			.path()
+			.join(format!("{PRELUDE_HELPER_EXTENSION_MODULE}.py")),
+		PRELUDE_HELPER_EXTENSION,
+	)
+	.expect("write prelude helper extension");
+	let worker = extension_worker(PRELUDE_HELPER_EXTENSION_MODULE, Some(site.path().to_owned()));
+	let harness = Harness::start_with_worker(Registry::new(), worker).await;
+	let registry = harness.server.registry();
+
+	assert!(
+		registry.live_identity("helper_echo").is_none(),
+		"prelude helper entered the tool registry"
+	);
+	let advertised = registry
+		.advertise(LoweringCaps {
+			strict_schema:  true,
+			grammar:        omp_catalog::GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
+		})
+		.expect("advertise registry with prelude helper");
+	assert_eq!(advertised.len(), 21);
+
+	let verdict = invoke_builtin(
+		harness.client(),
+		"eval-prelude-helper",
+		"eval",
+		"1",
+		json!({
+			"language": "py",
+			"code": "helper_echo(value=7)",
+		}),
+	)
+	.await;
+	assert!(!verdict.is_error, "prelude helper eval returned an error");
+	let verdict: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+		serde_json::from_slice(&verdict.json).expect("typed prelude helper eval verdict");
+	let CallOutcome::Ok(payload) = verdict else {
+		panic!("prelude helper eval returned a resource fault");
+	};
+	assert_eq!(payload.status.outcome, omp_tools::eval::CellOutcome::Complete);
+	assert_eq!(payload.result.and_then(|result| result.json), Some(json!({"value": 7})));
+}
+
 #[tokio::test]
 async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_terminals() {
 	let scratch = tempfile::tempdir().expect("streaming native scratch");

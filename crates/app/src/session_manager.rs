@@ -2,12 +2,11 @@
 //! replication.
 
 use std::{
-	collections::BTreeSet,
 	io,
 	path::{Path, PathBuf},
 };
 
-use omp_core::{Str, encoding::hex};
+use omp_core::encoding::hex;
 use omp_storage::{atomic, transcript::SessionId};
 use thiserror::Error;
 
@@ -21,73 +20,7 @@ pub enum DraftError {
 	#[error("failed to publish session draft")]
 	Atomic(#[from] atomic::Error),
 }
-/// Durable owner-local session pin persistence failure.
-#[derive(Debug, Error)]
-pub enum PinError {
-	/// Pin file access failed.
-	#[error("session pin I/O failed")]
-	Io(#[from] io::Error),
-	/// Pin metadata encoding failed.
-	#[error("failed to encode session pin metadata")]
-	Json(#[from] serde_json::Error),
-	/// Atomic pin publication failed.
-	#[error("failed to publish session pins")]
-	Atomic(#[from] atomic::Error),
-}
-
-/// Project-local pinned session identities stored beside the session journals.
-pub struct PinStore {
-	path: PathBuf,
-}
-
-impl PinStore {
-	/// Opens the pin file belonging to `sessions_dir`.
-	pub fn new(sessions_dir: &Path) -> Self {
-		Self { path: sessions_dir.join("session-pins.json") }
-	}
-
-	/// Loads the complete deterministic pin set.
-	///
-	/// Missing or corrupt metadata degrades to an empty set so a stale UI file
-	/// cannot prevent session discovery.
-	pub fn load(&self) -> Result<BTreeSet<Str>, PinError> {
-		let bytes = match std::fs::read(&self.path) {
-			Ok(bytes) => bytes,
-			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-			Err(error) => return Err(error.into()),
-		};
-		let pins: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-			tracing::warn!(
-				path = %self.path.display(),
-				%error,
-				"ignoring corrupt session pin metadata"
-			);
-			Vec::new()
-		});
-		Ok(pins.into_iter().filter_map(|pin| match pin {
-			serde_json::Value::String(id) => Some(Str::from(id)),
-			_ => None,
-		})
-		.collect())
-	}
-
-	/// Toggles one session and atomically persists the complete set.
-	///
-	/// Returns `true` when the session is pinned after the mutation.
-	pub fn toggle(&self, session: &SessionId) -> Result<bool, PinError> {
-		let mut pins = self.load()?;
-		let pinned = if pins.remove(session.0.as_str()) {
-			false
-		} else {
-			pins.insert(session.0.clone());
-			true
-		};
-		let bytes = serde_json::to_vec_pretty(&pins)?;
-		atomic::commit(&self.path, &bytes, || true)?;
-		Ok(pinned)
-	}
-}
-
+pub use omp_driver::chat::{PinError, PinStore};
 /// Private, owner-local unsent composer buffers keyed by session identity.
 pub struct DraftStore {
 	directory: PathBuf,
@@ -187,8 +120,12 @@ mod tests {
 	#[test]
 	fn corrupt_pin_metadata_does_not_break_session_listing() {
 		let temp = tempdir().expect("tempdir");
-		std::fs::write(temp.path().join("session-pins.json"), b"{broken")
-			.expect("corrupt fixture");
-		assert!(PinStore::new(temp.path()).load().expect("recover pins").is_empty());
+		std::fs::write(temp.path().join("session-pins.json"), b"{broken").expect("corrupt fixture");
+		assert!(
+			PinStore::new(temp.path())
+				.load()
+				.expect("recover pins")
+				.is_empty()
+		);
 	}
 }

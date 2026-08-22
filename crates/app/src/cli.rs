@@ -19,10 +19,10 @@ use omp_core::{SecretString, Str};
 fn parse_cli_secret(value: &str) -> Result<SecretString, std::convert::Infallible> {
 	Ok(SecretString::from(value))
 }
-use omp_llm_catalog::{ModelKey, compile::compile_oracle};
+use omp_catalog::{ModelKey, compile::compile_oracle};
 #[cfg(feature = "local-applefm")]
-use omp_llm_inference::local::applefm::{AppleFm, AppleFmEvent, AppleFmOptions};
-use omp_llm_inference::{
+use omp_inference::local::applefm::{AppleFm, AppleFmEvent, AppleFmOptions};
+use omp_inference::{
 	Client,
 	call::{
 		CallMeta, ChatRequest, ContentPart, Message, NegotiationPolicy, Role, Sampling, Setting,
@@ -40,7 +40,7 @@ use crate::{
 };
 
 /// Validated reasoning effort accepted by launch-shaped commands.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
 pub enum ThinkingLevel {
 	/// Disable provider reasoning.
@@ -61,6 +61,22 @@ pub enum ThinkingLevel {
 	Max,
 	/// Leave effort selection to the provider.
 	Auto,
+}
+
+impl From<ThinkingLevel> for omp_driver::chat::ThinkingLevel {
+	fn from(value: ThinkingLevel) -> Self {
+		match value {
+			ThinkingLevel::Off => Self::Off,
+			ThinkingLevel::Minimal => Self::Minimal,
+			ThinkingLevel::Low => Self::Low,
+			ThinkingLevel::Medium => Self::Medium,
+			ThinkingLevel::High => Self::High,
+			ThinkingLevel::Extreme => Self::Extreme,
+			ThinkingLevel::XHigh => Self::XHigh,
+			ThinkingLevel::Max => Self::Max,
+			ThinkingLevel::Auto => Self::Auto,
+		}
+	}
 }
 
 impl FromStr for ThinkingLevel {
@@ -285,7 +301,7 @@ pub struct OmpCli {
 		value_parser = trusted_extension_path,
 		conflicts_with_all = ["ext", "ext_only", "no_ext"]
 	)]
-	pub trusted_extension: Vec<crate::envd::site::TrustedModule>,
+	pub trusted_extension: Vec<omp_envd::site::TrustedModule>,
 	/// Suppress all configured extensions for this invocation.
 	#[arg(
 		long = "no-ext",
@@ -353,7 +369,7 @@ pub enum StatsCommand {
 		#[arg(long, default_value = "127.0.0.1")]
 		host:       String,
 		/// TCP port; zero requests an ephemeral port.
-		#[arg(long, default_value_t = crate::stats_server::DEFAULT_PORT)]
+		#[arg(long, default_value_t = omp_driver::stats_server::DEFAULT_PORT)]
 		port:       u16,
 		/// Bearer token required for non-loopback service access.
 		#[arg(long)]
@@ -1182,6 +1198,19 @@ pub struct EnvdArgs {
 	#[arg(long, value_name = "SECONDS", default_value_t = 900)]
 	pub idle_timeout:     u64,
 }
+impl EnvdArgs {
+	fn into_config(self) -> omp_envd::EnvdConfig {
+		omp_envd::EnvdConfig {
+			root:             self.root,
+			socket:           self.socket,
+			docserver_socket: self.docserver_socket,
+			state_dir:        self.state_dir,
+			py_eval:          self.py_eval,
+			idle_timeout:     self.idle_timeout,
+		}
+	}
+}
+
 /// Typed prompt overrides shared by launch-shaped commands.
 #[derive(Clone, Debug, Default, Args)]
 pub struct PromptArgs {
@@ -1339,7 +1368,7 @@ pub struct ChatArgs {
 	pub py_eval:            bool,
 	/// Deployment-authenticated exact modules admitted by the CLI boundary.
 	#[arg(skip)]
-	pub trusted_extensions: Vec<crate::envd::worker::ExtHostSpec>,
+	pub trusted_extensions: Vec<omp_envd::worker::ExtHostSpec>,
 	/// Typed prompt settings and invocation overrides.
 	#[command(flatten)]
 	pub prompt_settings:    PromptArgs,
@@ -2005,12 +2034,12 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 	}
 }
 
-fn chat_start(args: &mut ChatArgs) -> crate::chat::ChatStart {
+fn chat_start(args: &mut ChatArgs) -> crate::chat_cmd::ChatStart {
 	if args.resume.as_deref() == Some("__omp_picker__") {
 		args.resume = None;
-		crate::chat::ChatStart::SessionIndex
+		crate::chat_cmd::ChatStart::SessionIndex
 	} else {
-		crate::chat::ChatStart::Session
+		crate::chat_cmd::ChatStart::Session
 	}
 }
 
@@ -2023,7 +2052,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 	crate::startup_notice::stop_watchdog();
 	if let Some(journal) = cli.export.as_deref() {
 		let output = journal.with_extension("html");
-		let exported = crate::export::export_session(journal, &output).into_diagnostic()?;
+		let exported = omp_driver::export::export_session(journal, &output).into_diagnostic()?;
 		println!("Exported to: {}", exported.display());
 		return Ok(());
 	}
@@ -2066,12 +2095,20 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 	}
 	match command {
 		Command::Serve(args) => serve(args).await,
-		Command::Envd(args) => crate::envd::run(args).await,
+		Command::Envd(args) => {
+			let bridges = omp_driver::bridges::builtin(
+				&args.root,
+				Arc::new(omp_driver::bridges::InferenceBridge::default()),
+				omp_driver::bridges::AgentGoalControl::default(),
+				None,
+			);
+			omp_envd::run(args.into_config(), bridges).await
+		},
 		Command::Chat(mut args) => {
 			args.trusted_extensions = trusted_extensions;
 			let start = chat_start(&mut args);
 			crate::startup_notice::show_once(
-				&data_dir(None)?,
+				&omp_core::dirs::data_dir(None)?,
 				args.model.as_ref(),
 				args.thinking.map(<&'static str>::from),
 				crate::startup_notice::Eligibility {
@@ -2083,19 +2120,19 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 				},
 			)
 			.into_diagnostic()?;
-			Box::pin(crate::chat::run(
+			Box::pin(crate::chat_cmd::run(
 				args,
 				start,
 				if gui {
-					crate::chat::ChatPresentation::Gui
+					crate::chat_cmd::ChatPresentation::Gui
 				} else {
-					crate::chat::ChatPresentation::Terminal
+					crate::chat_cmd::ChatPresentation::Terminal
 				},
 			))
 			.await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
-		Command::Render(args) => crate::render_cmd::run(args, &data_dir(None)?),
+		Command::Render(args) => crate::render_cmd::run(args, &omp_core::dirs::data_dir(None)?),
 		Command::Rpc(args) | Command::RpcUi(args) => crate::rpc_mode::run(args).await,
 		Command::Acp(args) => crate::acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
@@ -2106,12 +2143,14 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		},
 		Command::Local(LocalArgs { command: LocalCommand::Infer(args) }) => local_infer(args).await,
 		Command::Ext(args) => crate::ext_cli::run(args).await,
-		Command::Config(args) => crate::config_cmd::run(&data_dir(None)?, &args.command),
+		Command::Config(args) => {
+			crate::config_cmd::run(&omp_core::dirs::data_dir(None)?, &args.command)
+		},
 		Command::Update(args) => crate::update_cmd::run(args).await,
 		Command::Registry(args) => crate::update_cmd::registry(args),
 		Command::Share(args) => crate::share_cmd::run(args).await,
 		Command::Models(args) => crate::models_cmd::run(&args).await,
-		Command::Worktree(args) => crate::worktree_cmd::run(&data_dir(None)?, &args),
+		Command::Worktree(args) => crate::worktree_cmd::run(&omp_core::dirs::data_dir(None)?, &args),
 		Command::Stats(args) => crate::stats_cmd::run(args).await,
 		Command::Gc(args) => crate::gc_cmd::run(args),
 		Command::Gallery(args) => crate::gallery_cmd::run(args),
@@ -2126,7 +2165,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Ssh(args) => crate::ssh_cmd::run(args).await,
 		Command::Ttsr(args) => crate::ttsr_cmd::run(args),
 		Command::Cleanse(args) => {
-			crate::cleanse::production::run_command(crate::cleanse::CleanseArgs {
+			crate::cleanse_cmd::run(omp_driver::cleanse::CleanseArgs {
 				agents:  args.agents,
 				model:   args.model,
 				tests:   args.tests,
@@ -2141,7 +2180,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		},
 		Command::Complete { kind, prefix } => crate::complete_cmd::run(kind, &prefix),
 		Command::Compress(args) => {
-			crate::compress::production::run_command(crate::compress::CompressArgs {
+			crate::compress_cmd::run(omp_driver::compress::CompressArgs {
 				files:       args.files,
 				model:       args.model,
 				rounds:      args.rounds,
@@ -2163,7 +2202,7 @@ pub fn parse_from_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Om
 	use clap::error::ErrorKind;
 	let profile = profile_bootstrap::extract(arguments)
 		.map_err(|error| clap::Error::raw(ErrorKind::InvalidValue, error.to_string()))?;
-	profile_bootstrap::select(profile.profile.clone());
+	omp_core::dirs::set_selected_profile(profile.profile.clone());
 	if let Some(message) = routing::redirect(&profile.arguments) {
 		return Err(clap::Error::raw(ErrorKind::InvalidSubcommand, message.to_string()));
 	}
@@ -2329,8 +2368,8 @@ fn is_command(argument: &OsString) -> bool {
 		.any(|entry| entry.name == argument || entry.aliases.contains(&argument.as_ref()))
 }
 
-fn trusted_extension_path(value: &str) -> Result<crate::envd::site::TrustedModule, String> {
-	crate::envd::site::validate_trusted_module(Path::new(value)).map_err(|error| error.to_string())
+fn trusted_extension_path(value: &str) -> Result<omp_envd::site::TrustedModule, String> {
+	omp_envd::site::validate_trusted_module(Path::new(value)).map_err(|error| error.to_string())
 }
 
 /// Converts one exact operator-approved module into the deployment-owned
@@ -2341,12 +2380,10 @@ fn trusted_extension_path(value: &str) -> Result<crate::envd::site::TrustedModul
 /// inter-extension services, and CONTROL quota classes stay empty because pi
 /// supplies no deployment-owned metadata for those sets. Python registration
 /// is never promoted into an authenticated manifest.
-pub fn trusted_extension(
-	module: crate::envd::site::TrustedModule,
-) -> crate::envd::worker::ExtHostSpec {
+pub fn trusted_extension(module: omp_envd::site::TrustedModule) -> omp_envd::worker::ExtHostSpec {
 	let encoded = omp_core::encoding::hex::encode_n(module.artifact_digest.as_bytes());
 	let extension_id = Str::from(format!("trusted.{}.{}", module.module, &encoded[..16],));
-	let key = crate::envd::worker::HostKey::new("invocation", "trusted", extension_id.clone());
+	let key = omp_envd::worker::HostKey::new("invocation", "trusted", extension_id.clone());
 	let provenance = omp_core::Provenance::new(
 		Str::new_static("operator-cli"),
 		extension_id,
@@ -2356,16 +2393,16 @@ pub fn trusted_extension(
 		Str::new_static("trusted"),
 		1,
 	);
-	let manifest = crate::exthost::ExtensionManifest::new(
+	let manifest = omp_envd::exthost::ExtensionManifest::new(
 		provenance,
 		module.module,
 		[],
-		crate::exthost::DeclarationSet::default(),
-		crate::exthost::ServiceManifest::default(),
+		omp_envd::exthost::DeclarationSet::default(),
+		omp_envd::exthost::ServiceManifest::default(),
 		[],
-		[crate::exthost::ActivationTrigger::FirstReach],
+		[omp_envd::exthost::ActivationTrigger::FirstReach],
 	);
-	let mut extension = crate::envd::worker::ExtHostSpec::new(key, manifest);
+	let mut extension = omp_envd::worker::ExtHostSpec::new(key, manifest);
 	extension.python_site = module.path.parent().map(Path::to_path_buf);
 	extension.entry_path = Some(module.path);
 	extension
@@ -2387,14 +2424,14 @@ async fn serve(args: ServeArgs) -> miette::Result<()> {
 }
 
 async fn infer(args: InferArgs) -> miette::Result<()> {
-	let data_dir = data_dir(None)?;
-	let store =
-		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?;
-	let registry = crate::daemon::production_registry(&data_dir, store)
+	let data_dir = omp_core::dirs::data_dir(None)?;
+	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
+		.into_diagnostic()?;
+	let registry = omp_driver::registry::production_registry(&data_dir, store)
 		.await
 		.into_diagnostic()?;
 	let planner =
-		omp_llm_inference::router::Router::new(registry.clone(), std::time::Duration::from_secs(30));
+		omp_inference::router::Router::new(registry.clone(), std::time::Duration::from_secs(30));
 	let meta = CallMeta {
 		id:       RequestId::from(turn_id()),
 		target:   Target::Model(ModelKey::from(args.model)),
@@ -2482,24 +2519,8 @@ pub(crate) fn turn_id() -> String {
 }
 
 async fn auth(args: AuthArgs) -> miette::Result<()> {
-	let data = data_dir(args.data_dir)?;
-	crate::auth_backend::run(data.join("credentials.db"), args.command).await
-}
-
-pub(crate) fn data_dir(explicit: Option<PathBuf>) -> miette::Result<PathBuf> {
-	if let Some(path) = explicit {
-		return Ok(path);
-	}
-	let base = if let Some(path) = std::env::var_os("OMP_DATA_DIR").filter(|value| !value.is_empty())
-	{
-		PathBuf::from(path)
-	} else {
-		let home =
-			std::env::var_os("HOME").ok_or_else(|| miette!("HOME or OMP_DATA_DIR must be set"))?;
-		crate::discovery::native::native_directories(&PathBuf::from(home)).data
-	};
-	Ok(crate::cli::profile_bootstrap::selected()
-		.map_or(base.clone(), |profile| base.join("profiles").join(profile)))
+	let data = omp_core::dirs::data_dir(args.data_dir)?;
+	crate::auth_cli::run(data.join("credentials.db"), args.command).await
 }
 
 fn catalog_import(args: &CatalogImportArgs) -> miette::Result<()> {
@@ -2789,7 +2810,7 @@ mod tests {
 		let path = directory.path().join("policy.py");
 		std::fs::write(&path, b"activated = True\n").unwrap();
 
-		let extension = trusted_extension(crate::envd::site::validate_trusted_module(&path).unwrap());
+		let extension = trusted_extension(omp_envd::site::validate_trusted_module(&path).unwrap());
 		assert_eq!(extension.manifest.entry, "policy");
 		assert!(extension.manifest.declaration_modules.is_empty());
 		assert_eq!(extension.manifest.declarations.tools().len(), 0);
@@ -2800,7 +2821,7 @@ mod tests {
 		assert!(extension.manifest.resource_limits.is_empty());
 		assert_eq!(
 			extension.manifest.activation_triggers,
-			[crate::exthost::ActivationTrigger::FirstReach]
+			[omp_envd::exthost::ActivationTrigger::FirstReach]
 				.into_iter()
 				.collect(),
 		);
@@ -3119,10 +3140,10 @@ mod tests {
 	#[test]
 	fn session_index_is_explicit_while_chat_starts_inline() {
 		let mut chat = ChatArgs::default_interactive();
-		assert_eq!(chat_start(&mut chat), crate::chat::ChatStart::Session);
+		assert_eq!(chat_start(&mut chat), crate::chat_cmd::ChatStart::Session);
 		let mut picker =
 			ChatArgs { resume: Some(sf!("__omp_picker__")), ..ChatArgs::default_interactive() };
-		assert_eq!(chat_start(&mut picker), crate::chat::ChatStart::SessionIndex);
+		assert_eq!(chat_start(&mut picker), crate::chat_cmd::ChatStart::SessionIndex);
 		assert!(picker.resume.is_none());
 	}
 

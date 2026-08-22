@@ -72,47 +72,9 @@ pub struct WorktreeRow {
 	record_path:     Option<PathBuf>,
 }
 
-/// Resolves the project-specific worktree root used by the Environment.
-pub(crate) fn project_worktree_root(state_dir: &Path) -> io::Result<PathBuf> {
-	let data_dir = data_dir_from_project_state(state_dir);
-	let base = configured_base(&data_dir)?;
-	let project_key = state_dir
-		.file_name()
-		.filter(|name| !name.is_empty())
-		.map_or_else(
-			|| {
-				omp_core::Hash32::sum(state_dir.as_os_str().as_encoded_bytes())
-					.to_hex()
-					.to_string()
-			},
-			|name| name.to_string_lossy().into_owned(),
-		);
-	Ok(base.join(project_key))
-}
-
-fn data_dir_from_project_state(state_dir: &Path) -> PathBuf {
-	state_dir
-		.parent()
-		.filter(|parent| parent.file_name().is_some_and(|name| name == "projects"))
-		.and_then(Path::parent)
-		.map_or_else(|| state_dir.to_path_buf(), Path::to_path_buf)
-}
-
 fn configured_base(data_dir: &Path) -> io::Result<PathBuf> {
-	if let Some(path) = std::env::var_os("OMP_WORKTREE_DIR").filter(|value| !value.is_empty()) {
-		return Ok(PathBuf::from(path));
-	}
-	Ok(
-		match crate::settings::current(data_dir)
-			.map_err(io::Error::other)?
-			.worktree
-			.base
-		{
-			Some(path) if path.is_absolute() => path,
-			Some(path) => data_dir.join(path),
-			None => data_dir.join("worktrees"),
-		},
-	)
+	let settings = omp_driver::settings::current(data_dir).map_err(io::Error::other)?;
+	Ok(omp_env::project_state::worktree_base(data_dir, settings.worktree.base.as_deref()))
 }
 
 pub(crate) fn run(data_dir: &Path, args: &WorktreeArgs) -> miette::Result<()> {

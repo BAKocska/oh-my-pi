@@ -3,15 +3,15 @@
 use std::{future::Future, sync::mpsc, time::Duration};
 
 use bytes::Bytes;
-use omp_app::envd::{
-	blobs::BlobHost,
-	docs::DocumentHost,
-	workspace::{WorkspaceError, WorkspaceHost},
-};
 use omp_core::{Hash32, Str, sf};
 use omp_docserver::{
 	Environment, ServerConfig,
 	connection::{ConnectionConfig, PROTOCOL_MAJOR, PROTOCOL_MINOR, serve_connection},
+};
+use omp_envd::{
+	blobs::BlobHost,
+	docs::DocumentHost,
+	workspace::{WorkspaceError, WorkspaceHost},
 };
 use omp_proto::{blob::v1 as blob_pb, document::v1 as document_pb};
 use tempfile::TempDir;

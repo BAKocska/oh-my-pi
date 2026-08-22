@@ -3,11 +3,9 @@
 use std::{path::Path, sync::Arc};
 
 use clap::Parser as _;
-use omp_app::{
-	cli::OmpCli,
-	daemon::{open_credential_store_with_key_source, production_registry},
-};
-use omp_llm_inference::auth::{CredentialStore, HeadlessKeySource, KeyId};
+use omp_app::cli::OmpCli;
+use omp_driver::registry::{open_credential_store_with_key_source, production_registry};
+use omp_inference::auth::{CredentialStore, HeadlessKeySource, KeyId};
 
 fn credential_store(path: &Path) -> Arc<CredentialStore> {
 	open_credential_store_with_key_source(

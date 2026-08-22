@@ -1,4 +1,5 @@
-//! Headless durable-session replay through the production transcript projection and chat scene.
+//! Headless durable-session replay through the production transcript projection
+//! and chat scene.
 
 use std::{
 	io::{self, Write as _},
@@ -21,22 +22,22 @@ pub struct RenderArgs {
 	pub session: Option<Str>,
 	/// Render width in terminal columns.
 	#[arg(long, short = 'w')]
-	pub width: Option<u16>,
+	pub width:   Option<u16>,
 	/// Viewport height in terminal rows.
 	#[arg(long)]
-	pub height: Option<u16>,
+	pub height:  Option<u16>,
 	/// Print phase timings and emitted byte counts to standard error.
 	#[arg(long, short = 't')]
-	pub timing: bool,
+	pub timing:  bool,
 	/// Benchmark this many extra full clear-and-repaint passes.
 	#[arg(long, value_name = "N")]
 	pub repaint: Option<u32>,
 	/// Strip ANSI styling from transcript output.
 	#[arg(long)]
-	pub plain: bool,
+	pub plain:   bool,
 	/// Suppress transcript output for timing-only runs.
 	#[arg(long, short = 'q')]
-	pub quiet: bool,
+	pub quiet:   bool,
 }
 
 struct RenderOutput {
@@ -70,7 +71,8 @@ impl io::Write for CountingWriter {
 	}
 }
 
-/// Replays one session, writes its materialized transcript, and optionally reports phase costs.
+/// Replays one session, writes its materialized transcript, and optionally
+/// reports phase costs.
 pub fn run(args: RenderArgs, data_dir: &Path) -> miette::Result<()> {
 	if args.width == Some(0) {
 		return Err(miette!("--width must be greater than zero"));
@@ -85,7 +87,9 @@ pub fn run(args: RenderArgs, data_dir: &Path) -> miette::Result<()> {
 	let output = render_session(&args, data_dir, &cwd)?;
 	if !args.quiet {
 		let mut stdout = std::io::stdout().lock();
-		stdout.write_all(output.transcript.as_bytes()).into_diagnostic()?;
+		stdout
+			.write_all(output.transcript.as_bytes())
+			.into_diagnostic()?;
 		if !output.transcript.ends_with('\n') {
 			stdout.write_all(b"\n").into_diagnostic()?;
 		}
@@ -110,13 +114,9 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 	let gallery = omp_tools::gallery::builtin_renderer_gallery();
 	omp_tools::register_builtin_renderers(registry.render_registry_mut(), gallery.identities)
 		.into_diagnostic()?;
-	let projection = omp_agent::project_journal(
-		&log,
-		&live,
-		&registry,
-		&crate::chat::CHAT_CAPS_BASE,
-	)
-	.into_diagnostic()?;
+	let projection =
+		omp_agent::project_journal(&log, &live, &registry, &omp_driver::chat::CHAT_CAPS_BASE)
+			.into_diagnostic()?;
 	let project = project_start.elapsed();
 
 	let replay_start = Instant::now();
@@ -181,10 +181,10 @@ fn resolve_target(selector: Option<&str>, data_dir: &Path, cwd: &Path) -> miette
 	}
 
 	let root = std::fs::canonicalize(cwd).into_diagnostic()?;
-	let sessions_dir = crate::project_state::directory(data_dir, &root)
+	let sessions_dir = omp_env::project_state::directory(data_dir, &root)
 		.into_diagnostic()?
 		.join("sessions");
-	let choices = crate::chat::resume_choices(&sessions_dir, &root, None).into_diagnostic()?;
+	let choices = omp_driver::chat::resume_choices(&sessions_dir, &root, None).into_diagnostic()?;
 	let id = match selector {
 		Some(selector) => resolve_choice(selector, &choices)?,
 		None => choices
@@ -204,7 +204,9 @@ fn resolve_choice(selector: &str, choices: &[crate::chat_ui::ResumeChoice]) -> m
 	if let Some(choice) = choices.iter().find(|choice| choice.id == selector) {
 		return Ok(choice.id.clone());
 	}
-	let mut matches = choices.iter().filter(|choice| choice.id.starts_with(selector));
+	let mut matches = choices
+		.iter()
+		.filter(|choice| choice.id.starts_with(selector));
 	let first = matches
 		.next()
 		.ok_or_else(|| miette!("session \"{selector}\" not found"))?;
@@ -220,10 +222,7 @@ fn materialize(frame: &Frame, rows: u16, plain: bool) -> String {
 		let width = frame.size().width;
 		let end = (0..width)
 			.rfind(|x| {
-				!matches!(
-					frame.cell(*x, y).content(),
-					CellContent::Blank | CellContent::Continuation
-				)
+				!matches!(frame.cell(*x, y).content(), CellContent::Blank | CellContent::Continuation)
 			})
 			.map_or(0, |x| x.saturating_add(1));
 		let mut line = String::new();
@@ -332,24 +331,23 @@ mod tests {
 			cwd:     root.clone(),
 		})
 		.expect("fixture journal");
-		for (seq, role, text) in [
-			(0, Role::User, "hello fixture"),
-			(1, Role::Assistant, "hello back"),
-		] {
+		for (seq, role, text) in
+			[(0, Role::User, "hello fixture"), (1, Role::Assistant, "hello back")]
+		{
 			writer
 				.append(&Event {
 					ts:   seq + 2,
 					kind: Kind::Item(ItemRecord {
-						item: Item {
+						item:        Item {
 							seq,
 							created_at_ms: seq + 2,
 							kind: Some(item::Kind::Message(Message {
-								role: i32::from(role),
+								role:  i32::from(role),
 								parts: vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
 							})),
 							props: None,
 						},
-						turn_id: None,
+						turn_id:     None,
 						prompt_hash: None,
 					}),
 				})
@@ -358,12 +356,12 @@ mod tests {
 		drop(writer);
 		let args = RenderArgs {
 			session: Some(Str::from(path.to_string_lossy().as_ref())),
-			width: Some(80),
-			height: Some(24),
-			timing: true,
+			width:   Some(80),
+			height:  Some(24),
+			timing:  true,
 			repaint: Some(1),
-			plain: true,
-			quiet: false,
+			plain:   true,
+			quiet:   false,
 		};
 		let first = render_session(&args, scratch.path(), &root).expect("first replay");
 		let second = render_session(&args, scratch.path(), &root).expect("second replay");

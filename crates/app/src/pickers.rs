@@ -7,13 +7,12 @@ use std::{
 
 use omp_chat_ui::{ListPicker, ListRow, PickerEvent};
 use omp_core::Str;
+use omp_driver::cleanse::{Checker, TargetChoice};
 use omp_storage::index::{SessionFilter, SessionIndex, SessionInfo};
 use omp_tui::{
 	Frame, InputEvent, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext,
 };
 use thiserror::Error;
-
-use crate::cleanse::{Checker, TargetChoice};
 
 /// A session selected before project-scoped authorities are started.
 #[derive(Clone, Debug)]
@@ -38,9 +37,7 @@ pub(crate) enum PickerError {
 ///
 /// Non-interactive invocations deterministically select every discovered
 /// checker instead of attempting to enter the alternate screen.
-pub(crate) async fn pick_cleanse_target(
-	checkers: &[Checker],
-) -> Result<TargetChoice, PickerError> {
+pub(crate) async fn pick_cleanse_target(checkers: &[Checker]) -> Result<TargetChoice, PickerError> {
 	if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
 		return Ok(TargetChoice::All);
 	}

@@ -15,9 +15,9 @@ use std::{
 use flume::{Receiver, Sender};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
+use omp_catalog::{ModelKey, ProviderId};
 use omp_core::{ExposeSecret as _, SecretString, Str, sf};
-use omp_llm_catalog::{ModelKey, ProviderId};
-use omp_llm_inference::{
+use omp_inference::{
 	Client, Registry,
 	answer::{AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthPromptKind, AuthSession},
 	auth::manager::AuthManager,
@@ -77,7 +77,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	// embedding client before this process starts.
 
 	let data = data_dir(None)?;
-	let configured_model = crate::settings::current(&data)
+	let configured_model = omp_driver::settings::current(&data)
 		.into_diagnostic()?
 		.default_model
 		.map(Str::from);
@@ -86,8 +86,8 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		.or(configured_model)
 		.ok_or_else(|| miette!("rpc mode requires --model or config.default_model"))?;
 	let store =
-		crate::daemon::open_credential_store(data.join("credentials.db")).into_diagnostic()?;
-	let (registry, auth) = crate::daemon::production_rpc_registry(&data, store)
+		omp_driver::registry::open_credential_store(data.join("credentials.db")).into_diagnostic()?;
+	let (registry, auth) = omp_driver::registry::production_rpc_registry(&data, store)
 		.await
 		.into_diagnostic()?;
 	let models = registry
@@ -132,7 +132,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	emit(&output_tx, ready)?;
 
 	let host_resources = Arc::new(HostResourceBroker::new(output_tx.clone()));
-	crate::envd::tool_url::host::bind(&host_resources)
+	omp_envd::tool_url::host::bind(&host_resources)
 		.map_err(|_| miette!("RPC host URI resolver is already bound"))?;
 	let runtime = Arc::new(Runtime {
 		registry,
@@ -172,7 +172,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		state.pending_extension_ui.clear();
 	}
 	runtime.host_resources.shutdown("RPC client disconnected")?;
-	crate::envd::tool_url::host::unbind(&runtime.host_resources);
+	omp_envd::tool_url::host::unbind(&runtime.host_resources);
 	runtime.shutdown.shutdown().await;
 	let read_result = reader.await.into_diagnostic()?;
 	drop(runtime);
@@ -1123,7 +1123,7 @@ impl Runtime {
 	}
 
 	fn expand_skill(&self, text: &str) -> Result<Option<String>, CommandError> {
-		let Some(invocation) = crate::skills::parse_invocation(text) else {
+		let Some(invocation) = omp_driver::skills::parse_invocation(text) else {
 			return Ok(None);
 		};
 		let skill = self
@@ -1136,10 +1136,10 @@ impl Runtime {
 			.ok_or_else(|| {
 				CommandError::new("skill_not_found", format!("unknown skill `{}`", invocation.name))
 			})?;
-		let rendered = crate::skills::render_invocation(
+		let rendered = omp_driver::skills::render_invocation(
 			&skill,
 			invocation.args.as_str(),
-			crate::skills::SkillInvocationKind::User,
+			omp_driver::skills::SkillInvocationKind::User,
 		);
 		self
 			.notify(json!({
@@ -1156,7 +1156,7 @@ impl Runtime {
 		let (root, generation) = {
 			let mut state = self.state.lock();
 			state.command_generation = state.command_generation.wrapping_add(1).max(1);
-			state.content = crate::discovery::active_content_snapshots(&state.project);
+			state.content = omp_driver::discovery::active_content_snapshots(&state.project);
 			(state.project.clone(), state.command_generation)
 		};
 		*self.commands.lock() = rpc_command_roster(&root, generation);
@@ -1297,7 +1297,7 @@ impl Runtime {
 			.notify(json!({ "type": "agent_start", "sessionId": session_id }))
 			.map_err(CommandError::transport)?;
 		let planner =
-			omp_llm_inference::router::Router::new(self.registry.clone(), Duration::from_secs(30));
+			omp_inference::router::Router::new(self.registry.clone(), Duration::from_secs(30));
 		let meta = CallMeta {
 			id:       InferenceRequestId::from(turn_id()),
 			target:   Target::Model(ModelKey::from(model)),
@@ -2815,7 +2815,7 @@ struct ServerState {
 	pending_extension_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
 	subscription:         Subscription,
 	command_generation:   u64,
-	content:              crate::discovery::ActiveContentSnapshots,
+	content:              omp_driver::discovery::ActiveContentSnapshots,
 	subagents:            HashMap<String, SubagentSnapshot>,
 	transcript_lru:       VecDeque<(String, u64)>,
 }
@@ -2830,7 +2830,7 @@ impl ServerState {
 		session_dir: Option<PathBuf>,
 	) -> Self {
 		let id = new_id("session");
-		let content = crate::discovery::active_content_snapshots(&project);
+		let content = omp_driver::discovery::active_content_snapshots(&project);
 		let mut sessions = HashMap::new();
 		sessions.insert(id.clone(), Session::new(id.clone(), None));
 		Self {
@@ -3115,7 +3115,7 @@ fn rpc_command_roster(root: &Path, generation: u64) -> crate::chat_ui::commands:
 		},
 		input::CommandContribution,
 	};
-	let content = crate::discovery::active_content_snapshots(root);
+	let content = omp_driver::discovery::active_content_snapshots(root);
 	let generations = content
 		.commands
 		.iter()

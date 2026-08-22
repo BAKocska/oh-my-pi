@@ -5,7 +5,7 @@ use std::{cell::Cell, io::IsTerminal as _, str::FromStr as _};
 use miette::{IntoDiagnostic as _, miette};
 use omp_chat_ui::ListRow;
 use omp_core::Str;
-use omp_llm_inference::local::{
+use omp_inference::local::{
 	ArtifactStore, LocalCancellation, SystemArtifactFetcher,
 	artifact::ArtifactCacheStatus,
 	speech_catalog::{STT_PRESETS, SpeechArtifactManifests, SpeechCatalog, SttPreset},
@@ -16,11 +16,11 @@ use crate::cli::{SetupArgs, SetupCommand};
 
 /// Executes one standalone setup flow.
 pub async fn run(args: SetupArgs) -> miette::Result<()> {
-	let data_dir = crate::cli::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
 	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command.unwrap_or(SetupCommand::Wizard) {
 		SetupCommand::Wizard => {
-			let catalog = omp_llm_catalog::snapshot::Catalog::try_embedded()
+			let catalog = omp_catalog::snapshot::Catalog::try_embedded()
 				.map_err(|error| miette!(error.to_string()))?;
 			crate::wizard::run(&data_dir, catalog).await?;
 			Ok(())

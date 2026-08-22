@@ -17,7 +17,7 @@ pub struct PromptResult {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConsumedResult {
 	/// Optional user-visible status. `None` is a deliberately silent success.
-	pub status: Option<Str>,
+	pub status:        Option<Str>,
 	/// Whether the command scheduled a real agent turn after returning.
 	pub agent_invoked: bool,
 }
@@ -32,6 +32,7 @@ impl ConsumedResult {
 	pub fn status(status: impl Into<Str>) -> Self {
 		Self { status: Some(status.into()), agent_invoked: false }
 	}
+
 	/// Creates a consumed result for scheduled agent work.
 	pub fn agent(status: impl Into<Str>) -> Self {
 		Self { status: Some(status.into()), agent_invoked: true }

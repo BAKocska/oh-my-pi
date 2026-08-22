@@ -1,11 +1,9 @@
 //! Cross-session AutoQA grievance inventory, cleanup, and manual delivery.
 
-use std::{sync::Arc};
+use std::sync::Arc;
 
 use miette::{IntoDiagnostic as _, Result, miette};
-use omp_storage::telemetry_index::{
-	IssueDeleteSelector, IssueInventoryFilter, TelemetryIndex,
-};
+use omp_storage::telemetry_index::{IssueDeleteSelector, IssueInventoryFilter, TelemetryIndex};
 use serde_json::json;
 
 use crate::cli::{GrievanceAction, GrievancesArgs};
@@ -17,13 +15,9 @@ use crate::cli::{GrievanceAction, GrievancesArgs};
 /// Returns a typed storage, credential, transport, or serialization failure.
 pub async fn run(args: GrievancesArgs) -> Result<()> {
 	if args.action == GrievanceAction::Clean {
-		IssueDeleteSelector {
-			id:     args.id.clone(),
-			device: args.tool.clone(),
-			all:    args.all,
-		}
-		.validate()
-		.into_diagnostic()?;
+		IssueDeleteSelector { id: args.id.clone(), device: args.tool.clone(), all: args.all }
+			.validate()
+			.into_diagnostic()?;
 	}
 	let Some(index) = open_index()? else {
 		if args.json {
@@ -48,10 +42,7 @@ pub async fn run(args: GrievancesArgs) -> Result<()> {
 
 fn list(index: &TelemetryIndex, args: &GrievancesArgs) -> Result<()> {
 	let findings = index
-		.issue_inventory(&IssueInventoryFilter {
-			device: args.tool.clone(),
-			limit:  args.limit,
-		})
+		.issue_inventory(&IssueInventoryFilter { device: args.tool.clone(), limit: args.limit })
 		.into_diagnostic()?;
 	if args.json {
 		let rows = findings
@@ -108,14 +99,16 @@ fn clean(index: &TelemetryIndex, args: &GrievancesArgs) -> Result<()> {
 }
 
 async fn push(index: &TelemetryIndex, json_output: bool) -> Result<()> {
-	let data_dir = crate::cli::data_dir(None)?;
-	let credentials = crate::daemon::open_credential_store(data_dir.join("credentials.db"))
+	let data_dir = omp_core::dirs::data_dir(None)?;
+	let credentials = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;
-	let authority: Arc<dyn crate::auth_backend::CredentialAuthority> =
-		Arc::new(crate::auth_backend::combined_authority(credentials));
-	let bridge = crate::envd::github_url::GithubCredentialBridge::new();
-	bridge.bind(authority).map_err(|_| miette!("AutoQA credential authority was already bound"))?;
-	let result = crate::telemetry_upload::manual_push(index, &bridge)
+	let authority: Arc<dyn omp_envd::github_url::CredentialAuthority> =
+		Arc::new(omp_driver::auth_backend::github_authority(credentials));
+	let bridge = omp_envd::github_url::GithubCredentialBridge::new();
+	bridge
+		.bind(authority)
+		.map_err(|_| miette!("AutoQA credential authority was already bound"))?;
+	let result = omp_driver::telemetry_upload::manual_push(index, &bridge)
 		.await
 		.into_diagnostic()?;
 	if json_output {
@@ -137,9 +130,9 @@ async fn push(index: &TelemetryIndex, json_output: bool) -> Result<()> {
 }
 
 fn open_index() -> Result<Option<TelemetryIndex>> {
-	let data_dir = crate::cli::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None)?;
 	let project = std::fs::canonicalize(".").into_diagnostic()?;
-	let state_dir = crate::project_state::directory(&data_dir, &project).into_diagnostic()?;
+	let state_dir = omp_env::project_state::directory(&data_dir, &project).into_diagnostic()?;
 	let database = state_dir.join("telemetry.sqlite3");
 	if !database.exists() {
 		return Ok(None);

@@ -47,7 +47,7 @@ pub async fn run() -> miette::Result<()> {
 }
 
 fn probe_inference() -> ProbeResult {
-	match omp_llm_catalog::snapshot::Catalog::try_embedded() {
+	match omp_catalog::snapshot::Catalog::try_embedded() {
 		Ok(catalog) if !catalog.models().is_empty() => passed("inference"),
 		Ok(_) => failed("inference", "embedded catalog contains no models"),
 		Err(error) => failed("inference", &error.to_string()),

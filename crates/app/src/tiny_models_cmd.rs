@@ -3,7 +3,7 @@
 use std::{cell::Cell, collections::BTreeMap, path::PathBuf};
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_llm_inference::local::{
+use omp_inference::local::{
 	ArtifactStore, LocalCancellation, SystemArtifactFetcher,
 	artifact::ArtifactCacheState,
 	tiny_catalog::{MEMORY_MODELS, TITLE_MODELS, TinyModelSpec},
@@ -16,7 +16,7 @@ use crate::cli::{TinyModelsArgs, TinyModelsCommand};
 pub async fn run(args: TinyModelsArgs) -> miette::Result<()> {
 	let root = args
 		.cache_dir
-		.unwrap_or(crate::cli::data_dir(None)?.join("models"));
+		.unwrap_or(omp_core::dirs::data_dir(None)?.join("models"));
 	std::fs::create_dir_all(&root).into_diagnostic()?;
 	let store = ArtifactStore::open(&root).into_diagnostic()?;
 	let models = unique_models();

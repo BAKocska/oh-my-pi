@@ -11,7 +11,9 @@ use bytes::Bytes;
 use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{AgentEvent, AgentRunSummary, EventSubscription, PlanState, RunSettlement};
 use omp_core::{Hash32, Str};
-use omp_llm_inference::call::{ContentPart, MediaInput};
+use omp_driver::headless::{HeadlessSession, HeadlessSessionOptions, finalize::FinalizerBudget};
+use omp_envd::exthost::lifecycle::{HeadlessLifecycleKind, HeadlessLifecycleSubscription};
+use omp_inference::call::{ContentPart, MediaInput};
 use omp_proto::{
 	inference::v1::{self as inference_pb, part_start},
 	thread::v1::{self as thread, Blob, Item, Message, Part, Role, item, part},
@@ -20,8 +22,6 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::{
 	cli::{PrintArgs, data_dir, turn_id},
-	exthost::lifecycle::{HeadlessLifecycleKind, HeadlessLifecycleSubscription},
-	headless::{HeadlessSession, HeadlessSessionOptions, finalize::FinalizerBudget},
 	usage_error::CliUsageError,
 };
 
@@ -44,10 +44,9 @@ enum PrintTurnError {
 pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	let data_dir = data_dir(None)?;
 	let settings =
-		crate::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
-	let catalog =
-		omp_llm_catalog::snapshot::Catalog::try_embedded().map_err(|error| miette!(error))?;
-	let roles = crate::discovery::roles::resolve_launch_roles(
+		omp_driver::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
+	let catalog = omp_catalog::snapshot::Catalog::try_embedded().map_err(|error| miette!(error))?;
+	let roles = omp_driver::discovery::roles::resolve_launch_roles(
 		catalog,
 		args.model.as_deref(),
 		args.smol.as_deref(),
@@ -61,7 +60,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		.into_iter()
 		.flat_map(|selectors| selectors.0.iter())
 	{
-		omp_llm_catalog::select_model(
+		omp_catalog::select_model(
 			catalog.models(),
 			catalog.routes(),
 			catalog.aliases(),
@@ -81,16 +80,14 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		.or_else(|| settings.default_model.clone().map(Str::from))
 		.ok_or_else(|| miette!("print mode requires --model or config.default_model"))?;
 	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
-		return Err(miette!(
-			"--api-key requires a model to be specified via --model or --models"
-		));
+		return Err(miette!("--api-key requires a model to be specified via --model or --models"));
 	}
-	let model = crate::chat::resolve_model_selector(catalog, model.as_str())
+	let model = omp_driver::chat::resolve_model_selector(catalog, model.as_str())
 		.map_err(|error| miette!(error))?;
 	let credential_provider = args
 		.api_key
 		.as_ref()
-		.map(|_| crate::chat::resolve_model_provider(catalog, model.as_str(), None))
+		.map(|_| omp_driver::chat::resolve_model_provider(catalog, model.as_str(), None))
 		.transpose()
 		.map_err(|error| miette!(error))?;
 	let initial = initial_parts(&args.prompt, settings.images.auto_resize).await?;
@@ -259,7 +256,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 }
 
 fn startup_plan_ignored(
-	settings: &crate::settings::Settings,
+	settings: &omp_driver::settings::Settings,
 	fresh: bool,
 	plan_yolo: bool,
 ) -> bool {
@@ -457,7 +454,7 @@ async fn emit_warning(
 }
 
 async fn emit_finalizer_report(
-	report: crate::headless::finalize::FinalizerReport,
+	report: omp_driver::headless::finalize::FinalizerReport,
 	stderr: &mut tokio::io::Stderr,
 ) -> miette::Result<()> {
 	for phase in &report.timed_out {
@@ -725,7 +722,7 @@ fn discover_system_prompt() -> miette::Result<Option<Str>> {
 }
 
 fn discover_system_prompt_from(cwd: &Path, home: &Path) -> miette::Result<Option<Str>> {
-	let roots = crate::discovery::native::discover_roots(cwd, home, 32);
+	let roots = omp_driver::discovery::native::discover_roots(cwd, home, 32);
 	let candidates = roots
 		.project
 		.iter()
@@ -761,7 +758,7 @@ mod tests {
 	use super::*;
 	#[test]
 	fn print_suppresses_only_fresh_startup_plan_without_yolo() {
-		let mut settings = crate::settings::Settings::default();
+		let mut settings = omp_driver::settings::Settings::default();
 		settings.plan.enabled = true;
 		settings.plan.default_on_startup = true;
 		assert!(startup_plan_ignored(&settings, true, false));

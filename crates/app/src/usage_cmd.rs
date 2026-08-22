@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_llm_catalog::ProviderId;
-use omp_llm_inference::{
+use omp_catalog::ProviderId;
+use omp_inference::{
 	account::AccountStateStore,
 	answer::{UsageQuantity, UsageReport},
 	call::{UsageRequest, UsageScope},
@@ -19,7 +19,7 @@ pub async fn run(args: UsageArgs) -> miette::Result<()> {
 	if args.account.is_some() && args.provider.is_some() {
 		return Err(miette!("--account and --provider are mutually exclusive"));
 	}
-	let data_dir = crate::cli::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
 	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
 	let store = AccountStateStore::open(data_dir.join("credentials.db")).into_diagnostic()?;
 	let provider = args.provider.map(ProviderId::from);
@@ -76,7 +76,7 @@ pub async fn run(args: UsageArgs) -> miette::Result<()> {
 			}));
 		}
 	}
-	let manager = crate::daemon::production_usage_manager(&data_dir)
+	let manager = omp_driver::registry::production_usage_manager(&data_dir)
 		.await
 		.into_diagnostic()?;
 	for record in &records {

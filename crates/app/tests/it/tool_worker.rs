@@ -10,18 +10,18 @@ use std::{
 
 use bytes::Bytes;
 use nix::{errno::Errno, sys::signal, unistd::Pid};
-use omp_app::{
-	envd::worker::{
-		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, OpenToolCall, PY_EVAL_MODULE,
-		WorkerAbortKind, WorkerCompletion, WorkerError, WorkerEvent, WorkerInvocation,
-		WorkerOutcomeKind,
-	},
+use omp_core::{ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, sf};
+use omp_envd::{
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 		control::{ControlError, HostRequestMap},
 	},
+	worker::{
+		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, OpenToolCall, PY_EVAL_MODULE,
+		WorkerAbortKind, WorkerCompletion, WorkerError, WorkerEvent, WorkerInvocation,
+		WorkerOutcomeKind,
+	},
 };
-use omp_core::{ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, sf};
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt, InterruptClass},
 	prost::Message as _,
@@ -300,7 +300,7 @@ fn control_mapping_fences_stale_frames_and_one_pull_slot() {
 #[test]
 fn worker_connection_rejects_nested_counts_before_decode() {
 	let mut child = Command::new(env!("CARGO_BIN_EXE_omp"))
-		.arg(omp_app::envd::worker::WORKER_ARG)
+		.arg(omp_envd::worker::WORKER_ARG)
 		.env_remove("OMP_PY_MODULES")
 		.env("OMP_EXT_LAYER", "workspace")
 		.env("OMP_EXT_TIER", "trusted")
@@ -384,7 +384,7 @@ async fn trusted_cli_module_is_loaded_and_activated_from_its_exact_file() {
 	.expect("write trusted extension module");
 
 	let extension = omp_app::cli::trusted_extension(
-		omp_app::envd::validate_trusted_module(&module).expect("validate trusted module"),
+		omp_envd::validate_trusted_module(&module).expect("validate trusted module"),
 	);
 	assert!(extension.manifest.declarations.tools().next().is_none());
 	assert!(extension.manifest.services.provides().next().is_none());

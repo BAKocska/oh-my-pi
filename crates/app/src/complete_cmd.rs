@@ -23,7 +23,7 @@ pub fn run(kind: CompletionKind, prefix: &str) -> miette::Result<()> {
 }
 
 fn models(prefix: &str) -> miette::Result<()> {
-	let catalog = omp_llm_catalog::snapshot::Catalog::try_embedded()
+	let catalog = omp_catalog::snapshot::Catalog::try_embedded()
 		.map_err(|error| miette::miette!(error.to_string()))?;
 	let needle = prefix.to_ascii_lowercase();
 	let mut rows = Vec::new();
@@ -40,9 +40,9 @@ fn models(prefix: &str) -> miette::Result<()> {
 }
 
 fn sessions(prefix: &str) -> miette::Result<()> {
-	let data = crate::cli::data_dir(None)?;
+	let data = omp_core::dirs::data_dir(None)?;
 	let project = std::fs::canonicalize(".").into_diagnostic()?;
-	let state = crate::project_state::directory(&data, &project).into_diagnostic()?;
+	let state = omp_env::project_state::directory(&data, &project).into_diagnostic()?;
 	let path = state.join("sessions.sqlite3");
 	if !Path::new(&path).is_file() {
 		return Ok(());

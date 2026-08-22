@@ -50,13 +50,11 @@ impl LocalEndpoint {
 			Self::Local(path) => omp_rpc::uds::connect(path)
 				.await
 				.map_err(EndpointConnectError::Local),
-			Self::Tcp(address) => {
-				tonic::transport::Endpoint::from_shared(format!("http://{address}"))
-					.map_err(EndpointConnectError::Uri)?
-					.connect()
-					.await
-					.map_err(EndpointConnectError::Tcp)
-			},
+			Self::Tcp(address) => tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+				.map_err(EndpointConnectError::Uri)?
+				.connect()
+				.await
+				.map_err(EndpointConnectError::Tcp),
 		}
 	}
 }
@@ -140,7 +138,6 @@ mod tests {
 	use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 	use super::LocalEndpoint;
-
 
 	#[test]
 	fn tcp_uri_round_trips_as_typed_endpoint() {

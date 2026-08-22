@@ -1,4 +1,5 @@
 //! `omp ext` command parsing and extension-backend dispatch.
+pub mod materialize;
 
 use std::{
 	fs,
@@ -9,8 +10,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, miette};
 use omp_core::Str;
 use omp_env::{BundleFile, pack_bundle, unpack_bundle};
-
-use crate::ext::{
+use omp_ext::{
 	Layer as BackendLayer,
 	config::{ExtensionEnvironment, SourceSpec},
 	doctor::{CredentialHealth, DoctorRequest, DoctorSeverity, RuntimeHealth, diagnose},
@@ -570,9 +570,9 @@ pub struct ExtWhereArgs {
 /// Dispatches a parsed extension command to its dedicated backend seam.
 pub async fn run(args: ExtArgs) -> miette::Result<()> {
 	let ExtArgs { data_dir, project, command, .. } = args;
-	let data_dir = crate::cli::data_dir(data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(data_dir)?;
 	let state = StatePaths::new(&data_dir, &project);
-	let settings = crate::settings::current(&data_dir).map_err(|error| miette!("{error}"))?;
+	let settings = omp_driver::settings::current(&data_dir).map_err(|error| miette!("{error}"))?;
 	let _environment = ExtensionEnvironment::from_environment();
 	settings
 		.extension_scopes(None)
@@ -773,17 +773,14 @@ async fn resolve(args: ExtResolveArgs) -> miette::Result<()> {
 
 async fn upgrade(state: &StatePaths, args: ExtUpgradeArgs) -> miette::Result<()> {
 	if let Some(generation) = args.rollback {
-		let previous = crate::ext::upgrade::load_generation(
-			&state.generations,
-			&generation,
-			BackendLayer::Client,
-		)
-		.map_err(|error| miette!("{error}"))?;
+		let previous =
+			omp_ext::upgrade::load_generation(&state.generations, &generation, BackendLayer::Client)
+				.map_err(|error| miette!("{error}"))?;
 		if args.dry_run {
 			println!("would roll back to {generation}");
 			return Ok(());
 		}
-		crate::ext::upgrade::commit_generation(
+		omp_ext::upgrade::commit_generation(
 			&state.client_lock,
 			&state.client_installed,
 			&state.generations,
@@ -1254,8 +1251,8 @@ fn install_index_source(
 	if args.no_lock {
 		installed.write(&state.client_installed).into_diagnostic()?;
 	} else {
-		let generation = crate::ext::upgrade::Generation { lock, installed: installed.clone() };
-		crate::ext::upgrade::commit_generation(
+		let generation = omp_ext::upgrade::Generation { lock, installed: installed.clone() };
+		omp_ext::upgrade::commit_generation(
 			&state.client_lock,
 			&state.client_installed,
 			&state.generations,
@@ -1300,10 +1297,10 @@ fn upsert_installed(installed: &mut InstalledRecord, replacement: InstalledExten
 		.sort_by(|left, right| left.id.cmp(&right.id));
 }
 
-const fn tier(value: Tier) -> crate::ext::TrustTier {
+const fn tier(value: Tier) -> omp_ext::TrustTier {
 	match value {
-		Tier::Trusted => crate::ext::TrustTier::Trusted,
-		Tier::Sandboxed => crate::ext::TrustTier::Sandboxed,
+		Tier::Trusted => omp_ext::TrustTier::Trusted,
+		Tier::Sandboxed => omp_ext::TrustTier::Sandboxed,
 	}
 }
 

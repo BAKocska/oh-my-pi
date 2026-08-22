@@ -3,9 +3,7 @@
 use std::sync::Arc;
 
 use miette::{IntoDiagnostic as _, miette};
-
-use crate::{
-	cli::ShareArgs,
+use omp_driver::{
 	export::SessionTree,
 	secrets::session::SecretSessionSnapshot,
 	settings::{ExportSettings, ShareStore},
@@ -14,10 +12,12 @@ use crate::{
 	},
 };
 
+use crate::cli::ShareArgs;
+
 /// Selects a live journal projection, irreversibly redacts it, seals it, and
 /// uploads only ciphertext to the configured share store.
 pub async fn run(args: ShareArgs) -> miette::Result<()> {
-	let data_dir = crate::cli::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None)?;
 	let journal = match args.journal {
 		Some(path) => path,
 		None => {
@@ -33,7 +33,7 @@ pub async fn run(args: ShareArgs) -> miette::Result<()> {
 	let tree = SessionTree::load(&journal).map_err(|error| miette!("{error}"))?;
 	let value = serde_json::to_value(tree).into_diagnostic()?;
 	let project = std::env::current_dir().into_diagnostic()?;
-	let configured = crate::settings::current(&data_dir).map_err(|error| miette!("{error}"))?;
+	let configured = omp_driver::settings::current(&data_dir).map_err(|error| miette!("{error}"))?;
 	let secrets = SecretSessionSnapshot::build(
 		0,
 		&data_dir.join("secrets.toml"),
@@ -51,9 +51,10 @@ pub async fn run(args: ShareArgs) -> miette::Result<()> {
 	);
 	let sealed = seal(&projection).map_err(|error| miette!("{error}"))?;
 	let server = args.server.as_ref().unwrap_or(&configured.share.server_url);
-	let credentials = Arc::new(crate::envd::github_url::GithubCredentialBridge::new());
-	let authority = Arc::new(crate::auth_backend::combined_authority(
-		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?,
+	let credentials = Arc::new(omp_envd::github_url::GithubCredentialBridge::new());
+	let authority = Arc::new(omp_driver::auth_backend::github_authority(
+		omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
+			.into_diagnostic()?,
 	));
 	credentials
 		.bind(authority)
