@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Esc still aborting the running agent turn after a `/mcp test` settled: the Esc dispatcher now consumes test ownership on the first press, the `(esc to cancel)` hint retires its affordance once the test settles instead of lingering in scrollback, and a trailing press during the grace window reports the finished test rather than silently swallowing the input ([#9310](https://github.com/can1357/oh-my-pi/issues/9310)).
+
 ## [17.4.4] - 2026-08-22
 
 ### Added

@@ -443,7 +443,7 @@ describe("InputController escape behavior", () => {
 		expect(spies.abort).not.toHaveBeenCalled();
 	});
 
-	it("keeps every overlapping /mcp test cancellable before aborting the stream", () => {
+	it("cancels every overlapping /mcp test in one press, then hands Esc back to the stream", () => {
 		const { ctx, editor, spies } = createContext();
 		mutableSessionState(ctx).isStreaming = true;
 		const firstTestEscapeHandler = vi.fn();
@@ -455,16 +455,19 @@ describe("InputController escape behavior", () => {
 		controller.setupKeyHandlers();
 		editor.onEscape?.();
 
+		// One press cancels every overlapping test and consumes their ownership,
+		// so no stale registration survives to steal a later Esc (#9310).
 		expect(firstTestEscapeHandler).toHaveBeenCalledTimes(1);
 		expect(latestTestEscapeHandler).toHaveBeenCalledTimes(1);
+		expect(ctx.mcpTestEscapeHandlers.size).toBe(0);
 		expect(spies.abort).not.toHaveBeenCalled();
 
-		ctx.mcpTestEscapeHandlers.delete(latestTestEscapeHandler);
+		// With ownership consumed, the next press reaches the running stream
+		// instead of re-firing already-settled test handlers.
 		editor.onEscape?.();
-
-		expect(firstTestEscapeHandler).toHaveBeenCalledTimes(2);
+		expect(firstTestEscapeHandler).toHaveBeenCalledTimes(1);
 		expect(latestTestEscapeHandler).toHaveBeenCalledTimes(1);
-		expect(spies.abort).not.toHaveBeenCalled();
+		expect(spies.abort).toHaveBeenCalledWith({ reason: USER_INTERRUPT_LABEL });
 	});
 
 	it("dismisses an active /btw panel before aborting the main stream", () => {

@@ -313,9 +313,15 @@ export class InputController {
 		}
 		this.ctx.editor.onEscape = () => {
 			// `/mcp test` advertises Esc until each owner's post-settlement grace expires.
-			// Cancel every overlapping test before any main-turn or side-channel action.
+			// Cancel every overlapping test before any main-turn or side-channel action,
+			// consuming ownership as we dispatch: snapshot then clear so a used
+			// cancellation never leaves a stale registration that later steals Esc
+			// from an unrelated agent turn (#9310). Each owner decides whether it
+			// aborts a live test or reports an already-settled one.
 			if (this.ctx.mcpTestEscapeHandlers.size > 0) {
-				for (const handler of this.ctx.mcpTestEscapeHandlers) handler();
+				const owners = [...this.ctx.mcpTestEscapeHandlers];
+				this.ctx.mcpTestEscapeHandlers.clear();
+				for (const handler of owners) handler();
 				return;
 			}
 

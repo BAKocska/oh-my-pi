@@ -262,6 +262,29 @@ class McpConnectingBlock extends ChatBlock {
 }
 
 /**
+ * Live "(esc to cancel)" hint for an in-flight `/mcp test`. Unlike a static
+ * transcript line, the hint retires its Esc affordance the moment the test
+ * settles ({@link settle}) so scrollback never keeps advertising a cancellation
+ * that Esc no longer performs (#9310).
+ */
+export class McpTestHintBlock extends ChatBlock {
+	readonly #text: Text;
+
+	constructor(private readonly serverName: string) {
+		super();
+		this.addChild(new Spacer(1));
+		this.#text = new Text(theme.fg("muted", `Testing connection to "${serverName}"... (esc to cancel)`), 1, 0);
+		this.addChild(this.#text);
+	}
+
+	/** Drop the Esc affordance and freeze the line once the test settles. */
+	settle(): void {
+		this.#text.setText(theme.fg("muted", `Testing connection to "${this.serverName}"...`));
+		this.finish();
+	}
+}
+
+/**
  * Outcome of {@link MCPCommandController}'s OAuth handler.
  *
  * `credentialId` is deterministic per server URL when the URL was supplied, so
@@ -1575,7 +1598,19 @@ export class MCPCommandController {
 		}
 
 		const abortController = new AbortController();
-		const handleEscape = (): void => abortController.abort();
+		let settled = false;
+		const handleEscape = (): void => {
+			if (settled) {
+				// Ownership is retained across the settling frame only to absorb a
+				// trailing Esc; the controller is already done, so aborting it would
+				// be a silent no-op. Report the finished test instead — the dispatcher
+				// has already consumed ownership, so the next Esc reaches the agent
+				// turn (#9310).
+				this.ctx.showStatus(`MCP test for "${name}" already finished`);
+				return;
+			}
+			abortController.abort();
+		};
 
 		// Claim Esc before the first await: a slow `#resolveServerForAuth()` (e.g.
 		// config on a network filesystem) must not let Esc fall through to the
@@ -1583,10 +1618,11 @@ export class MCPCommandController {
 		this.ctx.mcpTestEscapeHandlers.add(handleEscape);
 
 		let connection: MCPServerConnection | undefined;
-		// The grace window only applies once the "(esc to cancel)" hint is on
-		// screen; a pre-hint failure must release Esc immediately so it is not
-		// swallowed for a prompt the user never saw.
-		let hintShown = false;
+		// The live hint owns the on-screen "(esc to cancel)" affordance and retires
+		// it on settle; the grace window below only applies once it is shown, so a
+		// pre-hint failure releases Esc immediately rather than swallowing it for a
+		// prompt the user never saw.
+		let hint: McpTestHintBlock | undefined;
 		try {
 			const found = await this.#resolveServerForAuth(name);
 
@@ -1605,10 +1641,8 @@ export class MCPCommandController {
 				return;
 			}
 
-			this.#showMessage(
-				["", theme.fg("muted", `Testing connection to "${name}"... (esc to cancel)`), ""].join("\n"),
-			);
-			hintShown = true;
+			hint = new McpTestHintBlock(name);
+			this.ctx.present(hint);
 
 			// Resolve auth config if needed
 			let resolvedConfig: MCPServerConfig;
@@ -1670,8 +1704,12 @@ export class MCPCommandController {
 
 			this.ctx.showError(`Failed to connect to "${name}": ${errorMsg}${helpText}`);
 		} finally {
+			settled = true;
+			// Retire the hint's Esc affordance the instant the test settles so
+			// scrollback stops advertising a cancellation Esc no longer performs.
+			hint?.settle();
 			if (this.ctx.mcpTestEscapeHandlers.has(handleEscape)) {
-				if (hintShown) {
+				if (hint) {
 					const timer = setTimeout(() => {
 						this.ctx.mcpTestEscapeHandlers.delete(handleEscape);
 					}, MCP_TEST_ESCAPE_GRACE_MS);
