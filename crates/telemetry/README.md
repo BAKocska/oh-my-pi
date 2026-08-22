@@ -5,7 +5,7 @@
 ## Structure
 
 - `attrs` and `semconv` define the telemetry vocabulary, span names, enum values, and provider normalization.
-- `span` and `content` manage span lifecycles and opt-in content capture.
+- `span` and `content` manage span lifecycles and policy-bounded, always-masked content capture.
 - `metrics` and `collector` define instruments and aggregate data for each run.
 - `config`, `export`, and `redact` handle configuration, OTLP setup, and sensitive-data scrubbing.
 

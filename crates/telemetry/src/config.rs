@@ -3,8 +3,7 @@
 //! This is the Rust mapping of pi's `AgentTelemetryConfig`:
 //! `tracer` → [`TelemetryConfig::tracer`], `tracerName` →
 //! [`TelemetryConfig::tracer_name`], `captureMessageContent` →
-//! [`TelemetryConfig::capture_message_content`], `secrets.enabled` →
-//! [`TelemetryConfig::redact_sensitive_credentials`], `attributes` →
+//! [`TelemetryConfig::capture_message_content`], `attributes` →
 //! [`TelemetryConfig::attributes`], `resolveAttributes` →
 //! [`TelemetryConfig::resolve_attributes`], `agent` →
 //! [`TelemetryConfig::agent`], `conversationId` →
@@ -33,14 +32,14 @@ use std::{
 };
 
 use omp_core::{Str, sf};
-use opentelemetry::{KeyValue, Value, global::BoxedTracer, trace::Span as _};
+use opentelemetry::{Array, KeyValue, StringValue, Value, global::BoxedTracer, trace::Span as _};
 use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
 
 use crate::{
 	collector::{RunCoverage, RunSummary},
 	content::{self, RequestContent, ResponseContent},
-	redact::configure_credential_redaction,
+	redact::redact_sensitive_credentials,
 	semconv::{self, CaptureMode},
 	span::Span,
 };
@@ -306,76 +305,65 @@ pub type WarningHook = Arc<dyn Fn(&TelemetryWarning) -> HookResult + Send + Sync
 #[derive(Clone)]
 pub struct TelemetryConfig {
 	/// Explicit tracer override; otherwise the global tracer is resolved lazily.
-	pub tracer: Option<Arc<BoxedTracer>>,
+	pub tracer:                  Option<Arc<BoxedTracer>>,
 	/// Tracer-name override.
-	pub tracer_name: Str,
+	pub tracer_name:             Str,
 	/// Message-content capture policy.
 	pub capture_message_content: CaptureMode,
-	/// Host-facing mirror of the process-global credential-redaction switch.
-	///
-	/// The process-global redactor is the source of truth consulted by content
-	/// capture. This field is off by default, matching `secrets.enabled` in
-	/// `pi`. Use [`Self::set_credential_redaction`] rather than assigning it
-	/// directly, so the global switch changes too. Constructing another default
-	/// config does **not** turn redaction back off. With capture enabled and
-	/// redaction off, prompt content and embedded credentials are exported
-	/// verbatim.
-	pub redact_sensitive_credentials: bool,
 	/// Static attributes merged onto every span.
-	pub attributes: Arc<[KeyValue]>,
+	pub attributes:              Arc<[KeyValue]>,
 	/// Dynamic attributes resolved once for each span.
-	pub resolve_attributes: Option<AttributeResolver>,
+	pub resolve_attributes:      Option<AttributeResolver>,
 	/// Agent identity stamped on agent spans and propagated to children.
-	pub agent: Option<TelemetryAgentIdentity>,
+	pub agent:                   Option<TelemetryAgentIdentity>,
 	/// Explicit conversation identifier.
-	pub conversation_id: Option<Str>,
+	pub conversation_id:         Option<Str>,
 	/// Per-step cost estimator override.
-	pub cost_estimator: Option<CostEstimator>,
+	pub cost_estimator:          Option<CostEstimator>,
 	/// Cost-delta lifecycle callback.
-	pub on_cost_delta: Option<CostDeltaHook>,
+	pub on_cost_delta:           Option<CostDeltaHook>,
 	/// Chat-usage lifecycle callback.
-	pub on_chat_usage: Option<ChatUsageHook>,
+	pub on_chat_usage:           Option<ChatUsageHook>,
 	/// Provider-name normalization override.
-	pub normalize_provider: Option<NameNormalizer>,
+	pub normalize_provider:      Option<NameNormalizer>,
 	/// Agent-name normalization override.
-	pub normalize_agent_name: Option<NameNormalizer>,
+	pub normalize_agent_name:    Option<NameNormalizer>,
 	/// Bounded content serializer overrides.
-	pub content_serializer: TelemetryContentSerializer,
+	pub content_serializer:      TelemetryContentSerializer,
 	/// Span-start lifecycle callback.
-	pub on_span_start: Option<SpanHook>,
+	pub on_span_start:           Option<SpanHook>,
 	/// Span-end lifecycle callback.
-	pub on_span_end: Option<SpanHook>,
+	pub on_span_end:             Option<SpanHook>,
 	/// Run-end lifecycle callback.
-	pub on_run_end: Option<RunEndHook>,
+	pub on_run_end:              Option<RunEndHook>,
 	/// Receiver for non-fatal telemetry failures.
-	pub on_telemetry_warning: Option<WarningHook>,
+	pub on_telemetry_warning:    Option<WarningHook>,
 }
 
 impl Default for TelemetryConfig {
 	fn default() -> Self {
 		Self {
-			tracer: None,
-			tracer_name: sf!(DEFAULT_TRACER_NAME),
+			tracer:                  None,
+			tracer_name:             sf!(DEFAULT_TRACER_NAME),
 			capture_message_content: CaptureMode::from_env_value(
 				std::env::var("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
 					.ok()
 					.as_deref(),
 			),
-			redact_sensitive_credentials: false,
-			attributes: Arc::from([]),
-			resolve_attributes: None,
-			agent: None,
-			conversation_id: None,
-			cost_estimator: None,
-			on_cost_delta: None,
-			on_chat_usage: None,
-			normalize_provider: None,
-			normalize_agent_name: None,
-			content_serializer: TelemetryContentSerializer::default(),
-			on_span_start: None,
-			on_span_end: None,
-			on_run_end: None,
-			on_telemetry_warning: None,
+			attributes:              Arc::from([]),
+			resolve_attributes:      None,
+			agent:                   None,
+			conversation_id:         None,
+			cost_estimator:          None,
+			on_cost_delta:           None,
+			on_chat_usage:           None,
+			normalize_provider:      None,
+			normalize_agent_name:    None,
+			content_serializer:      TelemetryContentSerializer::default(),
+			on_span_start:           None,
+			on_span_end:             None,
+			on_run_end:              None,
+			on_telemetry_warning:    None,
 		}
 	}
 }
@@ -396,28 +384,23 @@ impl TelemetryConfig {
 			.unwrap_or_else(|| Arc::new(opentelemetry::global::tracer(self.tracer_name.to_string())))
 	}
 
-	/// Updates the host-facing flag and the process-global capture redactor.
-	///
-	/// The global redactor remains authoritative across all config instances:
-	/// constructing a second default config does not reset a prior opt-in.
-	/// Redaction is fail-open; disabling it preserves captured content verbatim.
-	pub fn set_credential_redaction(&mut self, enabled: bool) {
-		self.redact_sensitive_credentials = enabled;
-		configure_credential_redaction(enabled);
-	}
-
 	/// Resolves static and dynamic attributes in pi's merge order.
 	#[must_use]
 	pub fn attributes_for_span(
 		&self,
 		context: &TelemetryAttributeContext<'_>,
 	) -> TelemetryAttributes {
-		let mut attributes = self.attributes.iter().cloned().collect();
+		let mut attributes: TelemetryAttributes = self
+			.attributes
+			.iter()
+			.cloned()
+			.map(redact_attribute)
+			.collect();
 		let Some(resolver) = &self.resolve_attributes else {
 			return attributes;
 		};
 		match invoke(&**resolver, context) {
-			Ok(dynamic) => attributes.extend(dynamic),
+			Ok(dynamic) => attributes.extend(dynamic.into_iter().map(redact_attribute)),
 			Err(error) => self.warn(
 				TelemetryWarningCode::ResolveAttributesFailed,
 				"resolveAttributes failed; ignoring dynamic telemetry attributes",
@@ -645,7 +628,7 @@ impl TelemetryConfig {
 
 	fn serialized_result(&self, result: Result<Option<Str>, Str>) -> Option<Str> {
 		match result {
-			Ok(value) => value,
+			Ok(value) => value.map(|value| Str::from(redact_sensitive_credentials(value.as_str()))),
 			Err(error) => {
 				self.warn(
 					TelemetryWarningCode::ContentSerializerFailed,
@@ -665,7 +648,7 @@ impl TelemetryConfig {
 	) -> Option<Str> {
 		if let Some(serializer) = serializer {
 			return match invoke(&**serializer, value) {
-				Ok(value) => value,
+				Ok(value) => value.map(|value| Str::from(redact_sensitive_credentials(value.as_str()))),
 				Err(error) => {
 					self.warn(
 						TelemetryWarningCode::ContentSerializerFailed,
@@ -688,9 +671,29 @@ impl TelemetryConfig {
 	}
 
 	fn warn(&self, code: TelemetryWarningCode, message: &'static str, error: Str) {
-		let warning = TelemetryWarning { code, message: sf!(message), error: Some(error) };
+		let warning = TelemetryWarning {
+			code,
+			message: sf!(message),
+			error: Some(Str::from(redact_sensitive_credentials(error.as_str()))),
+		};
 		self.telemetry_warning(&warning);
 	}
+}
+
+fn redact_attribute(attribute: KeyValue) -> KeyValue {
+	let value = match attribute.value {
+		Value::String(value) => {
+			Value::String(StringValue::from(redact_sensitive_credentials(value.as_str())))
+		},
+		Value::Array(Array::String(values)) => Value::Array(Array::String(
+			values
+				.into_iter()
+				.map(|value| StringValue::from(redact_sensitive_credentials(value.as_str())))
+				.collect(),
+		)),
+		value => value,
+	};
+	KeyValue::new(attribute.key, value)
 }
 
 fn invoke<A, T>(hook: &(impl Fn(A) -> HookResult<T> + ?Sized), argument: A) -> Result<T, Str> {
@@ -759,11 +762,6 @@ mod tests {
 	fn config_is_send_sync() {
 		fn assert_send_sync<T: Send + Sync>() {}
 		assert_send_sync::<TelemetryConfig>();
-	}
-
-	#[test]
-	fn credential_redaction_is_off_by_default() {
-		assert!(!TelemetryConfig::default().redact_sensitive_credentials);
 	}
 
 	#[test]

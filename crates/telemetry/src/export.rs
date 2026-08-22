@@ -32,6 +32,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{
 	collector::{RunCoverage, RunSummary},
+	redact::redact_sensitive_credentials,
 	semconv::{CaptureMode, ExportProtocol, METER_NAME},
 };
 
@@ -806,7 +807,27 @@ fn emit_record(
 	record.set_observed_timestamp(SystemTime::now());
 	record.set_severity_number(level.severity());
 	record.set_severity_text(level.text());
-	record.set_body(AnyValue::from(body.to_owned()));
-	record.add_attributes(attributes);
+	record.set_body(redact_any_value(AnyValue::from(body.to_owned())));
+	record.add_attributes(attributes.into_iter().map(|(key, value)| {
+		(Key::new(redact_sensitive_credentials(key.as_str())), redact_any_value(value))
+	}));
 	logger.emit(record);
+}
+
+fn redact_any_value(value: AnyValue) -> AnyValue {
+	match value {
+		AnyValue::String(value) => AnyValue::from(redact_sensitive_credentials(value.as_str())),
+		AnyValue::ListAny(values) => {
+			AnyValue::ListAny(Box::new(values.into_iter().map(redact_any_value).collect()))
+		},
+		AnyValue::Map(values) => AnyValue::Map(Box::new(
+			values
+				.into_iter()
+				.map(|(key, value)| {
+					(Key::new(redact_sensitive_credentials(key.as_str())), redact_any_value(value))
+				})
+				.collect(),
+		)),
+		value => value,
+	}
 }

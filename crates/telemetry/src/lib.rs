@@ -12,7 +12,8 @@
 //! Layering mirrors the original split:
 //! - [`attrs`] / [`semconv`] — the constant vocabulary (attribute keys, span
 //!   names, enum values, provider normalization).
-//! - [`span`] / [`content`] — span lifecycle and opt-in content capture.
+//! - [`span`] / [`content`] — span lifecycle and policy-bounded, always-masked
+//!   content capture.
 //! - [`metrics`] / [`collector`] — instruments and per-run aggregation.
 //! - [`export`] / [`redact`] — OTLP bootstrap, configuration, and scrubbing.
 

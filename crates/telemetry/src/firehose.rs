@@ -227,6 +227,15 @@ pub struct SessionStart {
 	pub registry_hash: Str,
 }
 
+/// First provider-dispatch latency for one constructed session.
+#[derive(Clone, Debug, Default)]
+pub struct SessionDispatch {
+	/// Shared event metadata.
+	pub envelope:   Envelope,
+	/// Milliseconds from session construction to first provider dispatch.
+	pub latency_ms: u64,
+}
+
 /// Session-end facts.
 #[derive(Clone, Debug, Default)]
 pub struct SessionEnd {
@@ -424,6 +433,8 @@ pub struct HostWarning {
 pub enum Event {
 	/// A session begins or resumes.
 	SessionStart(Box<SessionStart>),
+	/// The session reaches its first provider dispatch.
+	SessionDispatch(SessionDispatch),
 	/// A session ends.
 	SessionEnd(Box<SessionEnd>),
 	/// A turn is admitted.
@@ -458,6 +469,7 @@ impl Event {
 	pub const fn kind(&self) -> Kind {
 		match self {
 			Self::SessionStart(_) => Kind::SessionStart,
+			Self::SessionDispatch(_) => Kind::SessionDispatch,
 			Self::SessionEnd(_) => Kind::SessionEnd,
 			Self::TurnStart(_) => Kind::TurnStart,
 			Self::TurnEnd(_) => Kind::TurnEnd,

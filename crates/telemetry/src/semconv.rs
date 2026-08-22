@@ -62,6 +62,7 @@ vocab! {
 	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 	pub enum Kind("firehose event kind", "Returns the byte-exact firehose event kind.") {
 		SessionStart => "session_start",
+		SessionDispatch => "session_dispatch",
 		SessionEnd => "session_end",
 		TurnStart => "turn_start",
 		TurnEnd => "turn_end",

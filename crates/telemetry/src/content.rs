@@ -1,21 +1,13 @@
-//! Opt-in capture and bounded serialization of `GenAI` message content.
+//! Bounded serialization of `GenAI` message content.
 //!
 //! Summary capture deliberately follows the JavaScript implementation's limits.
 //! In particular, text length is measured in UTF-16 code units (`String.length`
 //! in JavaScript), not UTF-8 bytes. Truncation keeps a valid Rust UTF-8 prefix;
 //! a boundary that bisects a surrogate pair is therefore rounded down.
 //!
-//! The process-global switch in [`crate::redact`] is the source of truth that
-//! this capture boundary consults. Hosts set it through
-//! [`crate::config::TelemetryConfig::set_credential_redaction`].
-//!
-//! Credential redaction is deliberately opt-in, matching `pi`'s
-//! `secrets.enabled` setting. With content capture enabled and redaction
-//! disabled, prompts (including embedded credentials) reach the telemetry
-//! collector verbatim. This sharp edge is why capture defaults to
-//! [`CaptureMode::None`]. Redaction is applied to each summarized string before
-//! its UTF-16 length bound, and again at final JSON serialization to cover
-//! unbounded full capture.
+//! Credential masking is mandatory and cannot be disabled by capture policy.
+//! It is applied to each summarized string before its UTF-16 length bound, and
+//! again at final JSON serialization to cover full capture.
 
 use opentelemetry::KeyValue;
 use serde_json::{Map, Value, json};
@@ -411,7 +403,6 @@ mod tests {
 	use serde_json::{Value, json};
 
 	use super::*;
-	use crate::config::TelemetryConfig;
 
 	fn attribute_json(attributes: &[KeyValue], key: &str) -> Value {
 		let value = attributes
@@ -582,13 +573,9 @@ mod tests {
 		);
 	}
 
-	fn run_redaction_test_isolated(test_name: &str, enabled: Option<bool>) -> bool {
+	fn run_redaction_test_isolated(test_name: &str) -> bool {
 		const CHILD_ENV: &str = "OMP_TELEMETRY_REDACTION_TEST_CHILD";
 		if std::env::var_os(CHILD_ENV).is_some() {
-			if let Some(enabled) = enabled {
-				let mut config = TelemetryConfig::default();
-				config.set_credential_redaction(enabled);
-			}
 			return false;
 		}
 		let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -612,7 +599,6 @@ mod tests {
 	fn captured_messages_and_tool_arguments_scrub_every_token_family() {
 		if run_redaction_test_isolated(
 			"content::tests::captured_messages_and_tool_arguments_scrub_every_token_family",
-			Some(true),
 		) {
 			return;
 		}
@@ -649,10 +635,7 @@ mod tests {
 
 	#[test]
 	fn redaction_precedes_text_truncation() {
-		if run_redaction_test_isolated(
-			"content::tests::redaction_precedes_text_truncation",
-			Some(true),
-		) {
+		if run_redaction_test_isolated("content::tests::redaction_precedes_text_truncation") {
 			return;
 		}
 		let prefix = "x".repeat(MAX_TELEMETRY_TEXT_CHARS - 11);
@@ -672,7 +655,6 @@ mod tests {
 	fn token_resemblances_remain_in_captured_content() {
 		if run_redaction_test_isolated(
 			"content::tests::token_resemblances_remain_in_captured_content",
-			Some(true),
 		) {
 			return;
 		}
@@ -694,10 +676,7 @@ mod tests {
 
 	#[test]
 	fn captured_content_is_redacted_by_default() {
-		if run_redaction_test_isolated(
-			"content::tests::captured_content_is_redacted_by_default",
-			None,
-		) {
+		if run_redaction_test_isolated("content::tests::captured_content_is_redacted_by_default") {
 			return;
 		}
 		let token = format!("gho_{}", "A".repeat(36));
