@@ -19,6 +19,7 @@ use crate::{
 	},
 	catalog::OperationKind,
 	error::{Error, ErrorDetail, ErrorKind},
+	operation::parallel_extract::{ParallelExtractRequest, ParallelExtractResult},
 	plan::{ExecutionPlan, Planner},
 	receipt::{ExecutionReceipt, ReasonId},
 };
@@ -84,6 +85,13 @@ impl_operation!(SpeechRequest, Speak, Speak, Speech, AudioStream);
 impl_operation!(TranscriptionRequest, Transcribe, Transcribe, Transcript, TranscriptStream);
 impl_operation!(RealtimeRequest, Realtime, Realtime, Realtime, RealtimeSession);
 impl_operation!(SearchRequest, Search, Search, Search, SearchResults);
+impl_operation!(
+	ParallelExtractRequest,
+	Extract,
+	ParallelExtract,
+	ParallelExtract,
+	ParallelExtractResult
+);
 impl_operation!(UsageRequest, Usage, Usage, Usage, Box<UsageReport>);
 impl_operation!(DiscoveryRequest, DiscoverModels, DiscoverModels, Models, ModelDiscoveryPage);
 impl_operation!(AuthRequest, Auth, Auth, Auth, AuthAnswer);

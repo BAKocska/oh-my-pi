@@ -224,9 +224,6 @@ pub struct GooglePart {
 	/// Marks text as model reasoning.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub thought:               Option<bool>,
-	/// Opaque provider continuation proof.
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub thought_signature:     Option<Str>,
 	/// Inline media.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub inline_data:           Option<GoogleInlineData>,
@@ -236,6 +233,9 @@ pub struct GooglePart {
 	/// Model function invocation.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub function_call:         Option<GoogleFunctionCall>,
+	/// Opaque provider continuation proof.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub thought_signature:     Option<Str>,
 	/// Function result supplied by the caller.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub function_response:     Option<GoogleFunctionResponse>,
@@ -3844,6 +3844,7 @@ mod tests {
 		let options = GoogleRequestOptions {
 			response_modalities: vec!["TEXT".into()],
 			proof_scope: Some(GoogleProofScope { provider, codec: codec_id }),
+			inline_tool_descriptors: InlineToolDescriptorsMode::Off,
 			..Default::default()
 		};
 		let projection = GeminiCodec::vertex(Some(GoogleThinkingPolicy::Level))

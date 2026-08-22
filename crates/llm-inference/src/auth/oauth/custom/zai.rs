@@ -298,6 +298,7 @@ async fn post_json(
 	body: SecretString,
 ) -> Result<OAuthHttpResponse, OAuthError> {
 	headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+	headers.insert(http::header::ACCEPT, HeaderValue::from_static("application/json"));
 	let response = http
 		.execute(OAuthHttpRequest::new(Method::POST, url, headers, Some(body))?)
 		.await?;
@@ -330,6 +331,7 @@ fn bearer_headers(token: &SecretString) -> Result<HeaderMap, OAuthError> {
 	authorization.set_sensitive(true);
 	let mut headers = HeaderMap::new();
 	headers.insert(AUTHORIZATION, authorization);
+	headers.insert(http::header::ACCEPT, HeaderValue::from_static("application/json"));
 	Ok(headers)
 }
 

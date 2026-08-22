@@ -730,6 +730,7 @@ pub struct AuthManager {
 	store:    Arc<CredentialStore>,
 	broker:   CredentialBroker,
 	accounts: AccountPool,
+	affinity: Option<CredentialAffinityResolver>,
 	login:    Arc<BTreeMap<AuthMethodKey, Vec<Arc<dyn AuthLoginEngine>>>>,
 	refresh:  Arc<dyn AuthRefreshEngine>,
 	sessions: Arc<Mutex<BTreeMap<LoginSessionId, Sender<AuthResponse>>>>,
@@ -764,10 +765,34 @@ impl AuthManager {
 			store,
 			broker,
 			accounts,
+			affinity: None,
 			login: Arc::new(login),
 			refresh,
 			sessions: Arc::new(Mutex::new(BTreeMap::new())),
 		})
+	}
+
+	/// Installs the credential-authority-owned opaque affinity resolver.
+	pub fn with_affinity_resolver(mut self, resolver: CredentialAffinityResolver) -> Self {
+		self.affinity = Some(resolver);
+		self
+	}
+
+	/// Resolves a restored journal digest to one exact live account.
+	///
+	/// # Errors
+	/// Returns `NotFound` when no resolver was installed or no live account
+	/// matches, and `Ambiguous` when identity evidence is not unique.
+	pub fn resolve_affinity(
+		&self,
+		provider: &omp_llm_catalog::ProviderId<str>,
+		affinity: &CredentialAffinityDigest,
+	) -> Result<AccountRecord, CredentialAffinityError> {
+		self
+			.affinity
+			.as_ref()
+			.ok_or(CredentialAffinityError::NotFound)?
+			.resolve(&self.accounts, provider, affinity)
 	}
 
 	/// Executes one route-independent authentication operation.
@@ -947,6 +972,11 @@ fn required_login_methods(
 			if spec.kind == AuthSpecKind::None {
 				continue;
 			}
+			if spec.kind == AuthSpecKind::Basic {
+				// RFC 7617 pairs are leased from declared environment names; no
+				// interactive login engine exists or is required.
+				continue;
+			}
 			required.insert(AuthMethodKey::from(
 				auth_method(catalog, spec)
 					.map_err(|_| AuthManagerBuildError::UnknownAuthSpec(id.clone()))?,
@@ -969,6 +999,7 @@ fn auth_method(
 	match spec.kind {
 		AuthSpecKind::None => Err(auth_unavailable()),
 		AuthSpecKind::ApiKey | AuthSpecKind::Bearer => Ok(AuthMethod::ApiKey),
+		AuthSpecKind::Basic => Err(auth_unavailable()),
 		AuthSpecKind::AzureAd | AuthSpecKind::GithubApp => Ok(AuthMethod::SessionToken),
 		AuthSpecKind::GcpAdc => Ok(AuthMethod::ApplicationDefault),
 		AuthSpecKind::AwsSigv4 => Ok(AuthMethod::AwsCredentialChain),

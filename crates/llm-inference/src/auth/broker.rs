@@ -95,6 +95,7 @@ impl EngineKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BrokerSource {
 	Environment(Box<[Str]>),
+	BasicEnvironment { username_names: Box<[Str]>, password_names: Box<[Str]> },
 	Engine(EngineKind),
 }
 
@@ -151,6 +152,19 @@ impl CredentialBroker {
 						}
 						BrokerSource::Environment(ordered_names.clone())
 					},
+					CatalogSource::BasicEnvironment { username_names, password_names } => {
+						if username_names.is_empty()
+							|| password_names.is_empty()
+							|| username_names.iter().any(|name| !name.starts_with("OMP_"))
+							|| password_names.iter().any(|name| !name.starts_with("OMP_"))
+						{
+							return Err(CredentialBrokerError::InvalidEnvironment(auth.id.clone()));
+						}
+						BrokerSource::BasicEnvironment {
+							username_names: username_names.clone(),
+							password_names: password_names.clone(),
+						}
+					},
 					CatalogSource::Stored => BrokerSource::Engine(EngineKind::Stored),
 					CatalogSource::ApplicationDefault { .. } => {
 						BrokerSource::Engine(EngineKind::ApplicationDefault)
@@ -205,6 +219,7 @@ impl CredentialBroker {
 			let meta = LeaseMeta { account, principal, generation: 0, expires_at: None };
 			let lease = match kind {
 				CredentialKind::ApiKey => CredentialLease::api_key(meta, secret),
+				CredentialKind::Basic => return Err(CredentialError::InvalidSource),
 				CredentialKind::Bearer => CredentialLease::bearer(meta, secret),
 				CredentialKind::SessionToken => CredentialLease::session_token(meta, secret),
 				CredentialKind::AwsSigV4 => return Err(CredentialError::InvalidSource),
@@ -212,6 +227,31 @@ impl CredentialBroker {
 			return Ok(lease.with_source_tag(sf!(ENVIRONMENT_TAG)));
 		}
 		Err(CredentialError::Unavailable)
+	}
+
+	fn basic_environment_lease(
+		&self,
+		username_names: &[Str],
+		password_names: &[Str],
+		need: &CredentialNeed,
+	) -> Result<CredentialLease, CredentialError> {
+		let mut read_first = |names: &[Str]| {
+			for name in names {
+				if let Some(secret) = self.environment.read(name)? {
+					return Ok(secret);
+				}
+			}
+			Err(CredentialError::Unavailable)
+		};
+		let username = read_first(username_names)?;
+		let password = read_first(password_names)?;
+		let account = need.account.clone().ok_or(CredentialError::InvalidSource)?;
+		let principal = need
+			.principal
+			.clone()
+			.ok_or(CredentialError::InvalidSource)?;
+		let meta = LeaseMeta { account, principal, generation: 0, expires_at: None };
+		Ok(CredentialLease::basic(meta, username, password).with_source_tag(sf!(ENVIRONMENT_TAG)))
 	}
 
 	fn validate_lease(
@@ -264,6 +304,9 @@ impl CredentialSource for CredentialBroker {
 			for source in &plan.sources {
 				let result = match source {
 					BrokerSource::Environment(names) => self.environment_lease(names, &need, plan.kind),
+					BrokerSource::BasicEnvironment { username_names, password_names } => {
+						self.basic_environment_lease(username_names, password_names, &need)
+					},
 					BrokerSource::Engine(kind) => match self.engine(*kind) {
 						Some(engine) => engine
 							.lease(need.clone())
@@ -315,6 +358,7 @@ const fn credential_kind(kind: AuthSpecKind) -> Option<CredentialKind> {
 	match kind {
 		AuthSpecKind::None => None,
 		AuthSpecKind::ApiKey => Some(CredentialKind::ApiKey),
+		AuthSpecKind::Basic => Some(CredentialKind::Basic),
 		AuthSpecKind::Bearer
 		| AuthSpecKind::Oauth
 		| AuthSpecKind::GcpAdc

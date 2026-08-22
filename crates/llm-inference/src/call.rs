@@ -19,6 +19,7 @@ use crate::{
 		AccountId, ConversationId, LoginSessionId, OrganizationId, PrincipalId, ProjectId, RegionId,
 		RequestId, Revision, TenantId, ToolCallId, TurnId,
 	},
+	operation::parallel_extract::ParallelExtractRequest,
 	plan::ExecutionPlan,
 	receipt::ExecutionBudget,
 };
@@ -290,6 +291,8 @@ pub enum OperationCall {
 	Realtime(Arc<RealtimeRequest>),
 	/// Standalone ranked search.
 	Search(Arc<SearchRequest>),
+	/// Bounded Parallel document extraction.
+	ParallelExtract(Arc<ParallelExtractRequest>),
 	/// Account-scoped usage and quota query.
 	Usage(Arc<UsageRequest>),
 	/// Runtime model discovery.
@@ -316,6 +319,7 @@ impl OperationCall {
 			Self::Transcribe(_) => OperationKind::Transcribe,
 			Self::Realtime(_) => OperationKind::Realtime,
 			Self::Search(_) => OperationKind::Search,
+			Self::ParallelExtract(_) => OperationKind::Extract,
 			Self::Usage(_) => OperationKind::Usage,
 			Self::DiscoverModels(_) => OperationKind::DiscoverModels,
 			Self::Auth(_) => OperationKind::Auth,

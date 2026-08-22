@@ -539,6 +539,7 @@ const fn expected_kind(operation: OperationKind) -> AnswerKind {
 		OperationKind::Transcribe => AnswerKind::Transcript,
 		OperationKind::Realtime => AnswerKind::Realtime,
 		OperationKind::Search => AnswerKind::Search,
+		OperationKind::Extract => AnswerKind::ParallelExtract,
 		OperationKind::Usage => AnswerKind::Usage,
 		OperationKind::DiscoverModels => AnswerKind::Models,
 		OperationKind::Auth => AnswerKind::Auth,

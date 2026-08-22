@@ -37,6 +37,7 @@ use crate::{
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::ChatEvent,
 	id::RequestId,
+	operation::parallel_extract::ParallelExtractResult,
 	receipt::{AttemptReceipt, ExecutionBudget, ExecutionReceipt, ReasonId},
 };
 
@@ -299,6 +300,11 @@ impl FakeScript {
 		Self::answer(OperationKind::Search, FakeAnswer::Search(answer))
 	}
 
+	/// Scripts an exact Parallel extraction result.
+	pub fn parallel_extract(answer: ParallelExtractResult) -> Self {
+		Self::answer(OperationKind::Extract, FakeAnswer::ParallelExtract(answer))
+	}
+
 	/// Scripts an exact account usage report.
 	pub fn usage(answer: UsageReport) -> Self {
 		Self::answer(OperationKind::Usage, FakeAnswer::Usage(Box::new(answer)))
@@ -427,6 +433,8 @@ pub enum FakeAnswer {
 	Realtime(RealtimeSession),
 	/// Ranked search results.
 	Search(SearchResults),
+	/// Lossless Parallel extraction result.
+	ParallelExtract(ParallelExtractResult),
 	/// Account usage report, boxed because the lossless provider payload is
 	/// intentionally wider than this scripted-answer enum's other variants.
 	Usage(Box<UsageReport>),
@@ -452,6 +460,7 @@ impl FakeAnswer {
 			Self::Transcript(_) => AnswerKind::Transcript,
 			Self::Realtime(_) => AnswerKind::Realtime,
 			Self::Search(_) => AnswerKind::Search,
+			Self::ParallelExtract(_) => AnswerKind::ParallelExtract,
 			Self::Usage(_) => AnswerKind::Usage,
 			Self::Models(_) => AnswerKind::Models,
 			Self::Auth(_) => AnswerKind::Auth,
@@ -474,6 +483,7 @@ impl FakeAnswer {
 			Self::Transcript(items) => AnswerBody::Transcript(Box::pin(stream::iter(items))),
 			Self::Realtime(value) => AnswerBody::Realtime(value),
 			Self::Search(value) => AnswerBody::Search(value),
+			Self::ParallelExtract(value) => AnswerBody::ParallelExtract(value),
 			Self::Usage(value) => AnswerBody::Usage(value),
 			Self::Models(value) => AnswerBody::Models(value),
 			Self::Auth(value) => AnswerBody::Auth(value),
@@ -618,6 +628,15 @@ pub enum CapturedOperation {
 		/// Maximum requested rows.
 		max_results:     u32,
 	},
+	/// Parallel extraction input shape; URLs and objective are excluded.
+	ParallelExtract {
+		/// Number of requested URLs.
+		urls:           usize,
+		/// Number of excerpt-focus queries.
+		search_queries: usize,
+		/// Whether complete content was requested.
+		full_content:   bool,
+	},
 	/// Account usage query shape.
 	Usage {
 		/// Whether a provider restriction exists.
@@ -735,6 +754,11 @@ impl CapturedOperation {
 				exclude_domains: request.exclude_domains.len(),
 				max_results:     request.max_results,
 			},
+			OperationCall::ParallelExtract(request) => Self::ParallelExtract {
+				urls:           request.urls.len(),
+				search_queries: request.search_queries.len(),
+				full_content:   request.full_content,
+			},
 			OperationCall::Usage(request) => Self::Usage {
 				has_provider: request.provider.is_some(),
 				has_account:  request.account.is_some(),
@@ -786,6 +810,7 @@ const fn expected_answer_kind(operation: OperationKind) -> AnswerKind {
 		OperationKind::Transcribe => AnswerKind::Transcript,
 		OperationKind::Realtime => AnswerKind::Realtime,
 		OperationKind::Search => AnswerKind::Search,
+		OperationKind::Extract => AnswerKind::ParallelExtract,
 		OperationKind::Usage => AnswerKind::Usage,
 		OperationKind::DiscoverModels => AnswerKind::Models,
 		OperationKind::Auth => AnswerKind::Auth,

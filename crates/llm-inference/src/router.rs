@@ -443,15 +443,32 @@ impl Router {
 		if !authorized.iter().any(|model| model == primary) {
 			authorized.push(primary.to_owned());
 		}
+		let context_promotion = self
+			.registry
+			.catalog()
+			.model(primary)
+			.and_then(|model| model.context_promotion_target.clone());
+		if let Some(promotion) = context_promotion.as_ref()
+			&& !authorized.contains(promotion)
+		{
+			authorized.push(promotion.clone());
+		}
 		for model in request.selection.fallback_models.iter() {
 			if !authorized.contains(model) {
 				authorized.push(model.clone());
 			}
 		}
-		let authorized_scope = FallbackScope {
-			primary:  Some(primary.to_owned()),
-			explicit: request.selection.fallback_models.clone(),
-		};
+		let mut explicit_fallbacks = Vec::new();
+		if let Some(promotion) = context_promotion {
+			explicit_fallbacks.push(promotion);
+		}
+		for model in request.selection.fallback_models.iter() {
+			if !explicit_fallbacks.contains(model) {
+				explicit_fallbacks.push(model.clone());
+			}
+		}
+		let authorized_scope =
+			FallbackScope { primary: Some(primary.to_owned()), explicit: explicit_fallbacks.into() };
 		let mut last_error = None;
 		let mut eligible = Vec::new();
 		for model in &authorized {
@@ -978,6 +995,7 @@ fn operation_policy(operation: &OperationCall) -> PlanningPolicy {
 		OperationCall::CountTokens(_)
 		| OperationCall::Tokenize(_)
 		| OperationCall::Detokenize(_)
+		| OperationCall::ParallelExtract(_)
 		| OperationCall::Usage(_)
 		| OperationCall::DiscoverModels(_)
 		| OperationCall::Auth(_)
@@ -1332,7 +1350,7 @@ fn route_contract_error(route: &RouteId<str>, reason: &'static str) -> Error {
 mod tests {
 	use super::*;
 
-	const OPERATIONS: [OperationKind; 15] = [
+	const OPERATIONS: [OperationKind; 16] = [
 		OperationKind::Chat,
 		OperationKind::CountTokens,
 		OperationKind::Tokenize,
@@ -1344,6 +1362,7 @@ mod tests {
 		OperationKind::Transcribe,
 		OperationKind::Realtime,
 		OperationKind::Search,
+		OperationKind::Extract,
 		OperationKind::Usage,
 		OperationKind::DiscoverModels,
 		OperationKind::Auth,
@@ -1351,7 +1370,7 @@ mod tests {
 	];
 
 	#[test]
-	fn provider_and_route_service_targets_obey_all_fifteen_catalog_operation_bits() {
+	fn provider_and_route_service_targets_obey_all_sixteen_catalog_operation_bits() {
 		let route = RouteId::from("selected");
 		let other = RouteId::from("other");
 		for operation in OPERATIONS {

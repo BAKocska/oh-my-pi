@@ -4,7 +4,7 @@
 //! receives bounded bytes and metadata and never imports, constructs, or owns
 //! an embedded browser engine or page handle.
 
-use std::{future::Future, time::Duration};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use omp_core::Str;
 
@@ -99,6 +99,13 @@ pub enum BrowserFetchError {
 	Navigation,
 }
 
+/// Future returned by the application-owned browser boundary.
+///
+/// This allocation occurs once per challenged network navigation at the
+/// dynamic application/inference boundary.
+pub type BrowserFetchFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<BrowserFetchResponse, BrowserFetchError>> + Send + 'a>>;
+
 /// Supervised browser-daemon client supplied by the application.
 pub trait BrowserFetch: Send + Sync + 'static {
 	/// Navigates one page. Cancellation must close its page before resolving.
@@ -106,5 +113,5 @@ pub trait BrowserFetch: Send + Sync + 'static {
 		&self,
 		request: BrowserFetchRequest,
 		cancellation: Cancellation,
-	) -> impl Future<Output = Result<BrowserFetchResponse, BrowserFetchError>> + Send + '_;
+	) -> BrowserFetchFuture<'_>;
 }

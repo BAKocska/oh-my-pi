@@ -62,6 +62,7 @@ pub mod search_ecosia;
 pub mod search_exa;
 pub mod search_firecrawl;
 pub mod search_google;
+pub mod search_hosted;
 pub mod search_jina;
 mod search_json;
 pub mod search_kagi;
@@ -796,6 +797,11 @@ pub trait Decoder: Send {
 	/// Completes the stream, flushing partial state or returning a typed
 	/// truncation error.
 	fn finish(&mut self, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error>;
+	/// Resets state for one browser-backed replay after this decoder identified
+	/// a credential-free navigation challenge.
+	fn prepare_browser_retry(&mut self) -> bool {
+		false
+	}
 
 	/// Returns whether this ordinary decoder owns a live provider response path.
 	fn supports_control(&self) -> bool {
@@ -1055,7 +1061,11 @@ mod tests {
 			"search-startpage" => openai_chat::join_uri(base, "/sp/search"),
 			"search-jina" | "search-tinyfish" => Str::new(base),
 			"search-searxng" => openai_chat::join_uri(base, "/search"),
+			"search-kimi" | "search-synthetic" | "search-zai" => {
+				openai_chat::join_uri(base, "/chat/completions")
+			},
 			"search-parallel" => openai_chat::join_uri(base, "/v1beta/search"),
+			"parallel-extract" => openai_chat::join_uri(base, "/v1beta/extract"),
 			"search-perplexity" => openai_chat::join_uri(base, "/chat/completions"),
 			unknown => panic!("embedded route uses unaudited codec {unknown}"),
 		}

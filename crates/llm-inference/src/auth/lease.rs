@@ -1,6 +1,6 @@
 //! Opaque credential leases and innermost request mutation.
 
-use std::{fmt, sync::Arc, time::SystemTime};
+use std::{fmt, io::Write as _, sync::Arc, time::SystemTime};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -36,6 +36,8 @@ pub struct LeaseMeta {
 pub enum CredentialKind {
 	/// Provider API key.
 	ApiKey,
+	/// RFC 7617 username and password pair.
+	Basic,
 	/// OAuth or application-default bearer token.
 	Bearer,
 	/// Provider session token.
@@ -47,6 +49,7 @@ pub enum CredentialKind {
 #[derive(Clone)]
 enum LeaseMaterial {
 	ApiKey(SecretString),
+	Basic { username: SecretString, password: SecretString },
 	Bearer(SecretString),
 	SessionToken(SecretString),
 	Aws(AwsCredential),
@@ -56,6 +59,7 @@ impl LeaseMaterial {
 	const fn kind(&self) -> CredentialKind {
 		match self {
 			Self::ApiKey(_) => CredentialKind::ApiKey,
+			Self::Basic { .. } => CredentialKind::Basic,
 			Self::Bearer(_) => CredentialKind::Bearer,
 			Self::SessionToken(_) => CredentialKind::SessionToken,
 			Self::Aws(_) => CredentialKind::AwsSigV4,
@@ -65,6 +69,10 @@ impl LeaseMaterial {
 	const fn scalar(&self) -> Result<&SecretString, CredentialApplyError> {
 		match self {
 			Self::ApiKey(value) | Self::Bearer(value) | Self::SessionToken(value) => Ok(value),
+			Self::Basic { .. } => Err(CredentialApplyError::WrongKind {
+				expected: CredentialKind::ApiKey,
+				actual:   CredentialKind::Basic,
+			}),
 			Self::Aws(_) => Err(CredentialApplyError::WrongKind {
 				expected: CredentialKind::Bearer,
 				actual:   CredentialKind::AwsSigV4,
@@ -112,6 +120,18 @@ impl CredentialLease {
 	pub fn api_key(meta: LeaseMeta, secret: SecretString) -> Self {
 		Self {
 			inner:             Arc::new(LeaseInner { meta, material: LeaseMaterial::ApiKey(secret) }),
+			source_tag:        None,
+			endpoint_override: None,
+		}
+	}
+
+	/// Constructs an RFC 7617 lease from independently acquired secrets.
+	pub fn basic(meta: LeaseMeta, username: SecretString, password: SecretString) -> Self {
+		Self {
+			inner:             Arc::new(LeaseInner {
+				meta,
+				material: LeaseMaterial::Basic { username, password },
+			}),
 			source_tag:        None,
 			endpoint_override: None,
 		}
@@ -199,6 +219,9 @@ impl CredentialLease {
 			Some(secret) => {
 				let material = match kind {
 					CredentialKind::ApiKey => LeaseMaterial::ApiKey(secret),
+					CredentialKind::Basic => {
+						return Self { inner, source_tag, endpoint_override: None };
+					},
 					CredentialKind::Bearer => LeaseMaterial::Bearer(secret),
 					CredentialKind::SessionToken => LeaseMaterial::SessionToken(secret),
 					CredentialKind::AwsSigV4 => {
@@ -230,6 +253,7 @@ impl CredentialLease {
 		let expected = match spec {
 			AuthSpec::None => None,
 			AuthSpec::ApiKey { .. } => Some(CredentialKind::ApiKey),
+			AuthSpec::Basic { .. } => Some(CredentialKind::Basic),
 			AuthSpec::Bearer { .. }
 			| AuthSpec::OAuthPkce(_)
 			| AuthSpec::OAuthDevice(_)
@@ -260,6 +284,47 @@ impl CredentialLease {
 			Zeroizing::new(Vec::with_capacity(placement.prefix.len() + secret.expose_secret().len()));
 		joined.extend_from_slice(placement.prefix.as_bytes());
 		joined.extend_from_slice(secret.expose_secret().as_bytes());
+		let mut value =
+			HeaderValue::from_bytes(&joined).map_err(|_| CredentialApplyError::InvalidHeader)?;
+		value.set_sensitive(true);
+		headers.insert(name, value);
+		Ok(())
+	}
+
+	fn apply_basic(
+		&self,
+		placement: &HeaderPlacement,
+		headers: &mut HeaderMap,
+	) -> Result<(), CredentialApplyError> {
+		let LeaseMaterial::Basic { username, password } = &self.inner.material else {
+			return Err(CredentialApplyError::WrongKind {
+				expected: CredentialKind::Basic,
+				actual:   self.kind(),
+			});
+		};
+		if username.expose_secret().contains(':') {
+			return Err(CredentialApplyError::InvalidBasicUsername);
+		}
+		let mut plain = Zeroizing::new(Vec::with_capacity(
+			username.expose_secret().len() + password.expose_secret().len() + 1,
+		));
+		plain.extend_from_slice(username.expose_secret().as_bytes());
+		plain.push(b':');
+		plain.extend_from_slice(password.expose_secret().as_bytes());
+		let encoded_len = plain.len().div_ceil(3) * 4;
+		let mut joined = Zeroizing::new(Vec::with_capacity(placement.prefix.len() + encoded_len));
+		joined.extend_from_slice(placement.prefix.as_bytes());
+		{
+			let mut writer = omp_core::encoding::base64::encode_writer(&mut *joined);
+			writer
+				.write_all(&plain)
+				.map_err(|_| CredentialApplyError::InvalidHeader)?;
+			writer
+				.into_inner()
+				.map_err(|_| CredentialApplyError::InvalidHeader)?;
+		}
+		let name = HeaderName::from_bytes(placement.name.as_bytes())
+			.map_err(|_| CredentialApplyError::InvalidHeader)?;
 		let mut value =
 			HeaderValue::from_bytes(&joined).map_err(|_| CredentialApplyError::InvalidHeader)?;
 		value.set_sensitive(true);
@@ -325,6 +390,7 @@ impl CredentialLease {
 			| AuthSpec::SessionToken(super::spec::SessionTokenSpec { placement, .. }) => {
 				self.apply_key_placement(placement, request)
 			},
+			AuthSpec::Basic { placement, .. } => self.apply_basic(placement, request.headers_mut()),
 			AuthSpec::OAuthPkce(value) => self.apply_key_placement(&value.client.placement, request),
 			AuthSpec::OAuthDevice(value) => self.apply_key_placement(&value.client.placement, request),
 			AuthSpec::OAuthPaste(value) => self.apply_key_placement(&value.client.placement, request),
@@ -372,6 +438,8 @@ pub enum AuthScheme {
 	None,
 	/// API key header or deferred query placement.
 	ApiKey,
+	/// RFC 7617 basic authentication.
+	Basic,
 	/// OAuth access token.
 	OAuth,
 	/// Application-default access token.
@@ -387,6 +455,7 @@ impl AuthScheme {
 		match spec {
 			AuthSpec::None => Self::None,
 			AuthSpec::ApiKey { .. } => Self::ApiKey,
+			AuthSpec::Basic { .. } => Self::Basic,
 			AuthSpec::Bearer { scheme: super::spec::BearerScheme::OAuth, .. }
 			| AuthSpec::OAuthPkce(_)
 			| AuthSpec::OAuthDevice(_)
@@ -671,6 +740,9 @@ pub enum CredentialApplyError {
 	/// Catalog header name, prefix, or secret bytes are not valid HTTP.
 	#[error("credential could not be represented as a sensitive header")]
 	InvalidHeader,
+	/// RFC 7617 usernames may not contain the user/password delimiter.
+	#[error("basic-auth username contains a colon")]
+	InvalidBasicUsername,
 	/// Query placement could not produce a valid final URI.
 	#[error("credential could not be represented as a sensitive query")]
 	InvalidQuery,

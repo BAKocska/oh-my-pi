@@ -50,6 +50,7 @@ use crate::{
 		search_exa::ExaSearchCodec,
 		search_firecrawl::FirecrawlSearchCodec,
 		search_google::GoogleSearchCodec,
+		search_hosted::{KimiSearchCodec, SyntheticSearchCodec, ZaiSearchCodec},
 		search_jina::JinaSearchCodec,
 		search_kagi::KagiSearchCodec,
 		search_mojeek::MojeekSearchCodec,
@@ -80,7 +81,7 @@ use crate::{
 	},
 	operation::{
 		discovery::CatalogDiscoveryProjector, embedding::NormalizationSupport,
-		usage::UsageServiceConfig,
+		parallel_extract::ParallelExtractCodec, usage::UsageServiceConfig,
 	},
 	receipt::{ExecutionReceipt, ReasonId},
 	registry::RouteUnavailable,
@@ -687,6 +688,15 @@ fn codec_binding(
 		("search-google", CodecProfile::Standard) => {
 			(Arc::new(GoogleSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
 		},
+		("search-kimi", CodecProfile::Standard) => {
+			(Arc::new(KimiSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-zai", CodecProfile::Standard) => {
+			(Arc::new(ZaiSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-synthetic", CodecProfile::Standard) => {
+			(Arc::new(SyntheticSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
 		("search-kagi", CodecProfile::Standard) => {
 			(Arc::new(KagiSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
 		},
@@ -695,6 +705,9 @@ fn codec_binding(
 		},
 		("search-parallel", CodecProfile::Standard) => {
 			(Arc::new(ParallelSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("parallel-extract", CodecProfile::Standard) => {
+			(Arc::new(ParallelExtractCodec), operation_bits(&[OperationKind::Extract]), None, false)
 		},
 		("search-perplexity", CodecProfile::Standard) => {
 			(Arc::new(PerplexitySearchCodec), operation_bits(&[OperationKind::Search]), None, false)
@@ -761,7 +774,7 @@ fn discovery_codec(
 	Ok(Some(codec))
 }
 
-const OPERATION_COUNT: usize = OperationKind::Native as usize + 1;
+const OPERATION_COUNT: usize = OperationKind::Extract as usize + 1;
 const OPERATIONS: [OperationKind; OPERATION_COUNT] = [
 	OperationKind::Chat,
 	OperationKind::CountTokens,
@@ -778,6 +791,7 @@ const OPERATIONS: [OperationKind; OPERATION_COUNT] = [
 	OperationKind::DiscoverModels,
 	OperationKind::Auth,
 	OperationKind::Native,
+	OperationKind::Extract,
 ];
 
 fn advertised_operations(catalog: &Catalog, route: &RouteDef) -> OperationBits {
@@ -923,6 +937,7 @@ fn scheme_for_credential(
 		matches!(
 			(kind, scheme),
 			(crate::auth::CredentialKind::ApiKey, crate::auth::AuthScheme::ApiKey)
+				| (crate::auth::CredentialKind::Basic, crate::auth::AuthScheme::Basic)
 				| (
 					crate::auth::CredentialKind::Bearer,
 					crate::auth::AuthScheme::OAuth | crate::auth::AuthScheme::ApplicationDefault,

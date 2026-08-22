@@ -42,6 +42,9 @@ use crate::{
 	transport::{
 		ConnectDecoder, EventStreamDecoder, Frame, FramingError, FramingProtocol, NdjsonDecoder,
 		RawChunkFramer, SseDecoder,
+		browser::{
+			BrowserFetch, BrowserFetchError, BrowserFetchRequest, BrowserHeader, MAX_BROWSER_DEADLINE,
+		},
 		cassette::{CapturedFrame, capture_frame, is_commit_candidate},
 	},
 };
@@ -143,6 +146,7 @@ pub struct HttpTransport {
 	inner:        Option<PooledClient>,
 	ready_permit: bool,
 	captures:     Arc<Mutex<Vec<HttpCaptureRecord>>>,
+	browser:      Option<Arc<dyn BrowserFetch>>,
 }
 
 impl Clone for HttpTransport {
@@ -151,6 +155,7 @@ impl Clone for HttpTransport {
 			inner:        self.inner.clone(),
 			ready_permit: false,
 			captures:     Arc::clone(&self.captures),
+			browser:      self.browser.clone(),
 		}
 	}
 }
@@ -168,7 +173,15 @@ impl HttpTransport {
 			inner:        Some(pooled_client()),
 			ready_permit: false,
 			captures:     Arc::new(Mutex::new(Vec::new())),
+			browser:      None,
 		}
+	}
+
+	/// Installs the application-owned browser escalation boundary used only by
+	/// credential-free decoders that explicitly request one replay.
+	pub fn with_browser_fetch(mut self, browser: impl BrowserFetch) -> Self {
+		self.browser = Some(Arc::new(browser));
+		self
 	}
 
 	/// Starts a best-effort credential-free preconnect on the same process-wide
@@ -258,11 +271,12 @@ impl Service<TransportRequest> for HttpTransport {
 			self.inner = Some(client.clone());
 		}
 		let captures = Arc::clone(&self.captures);
+		let browser = self.browser.clone();
 		async move {
 			let client = client.ok_or_else(|| {
 				protocol_error(ErrorPhase::Readiness, false, "call-without-readiness")
 			})?;
-			execute(client, request, captures).await
+			execute(client, request, captures, browser).await
 		}
 	}
 }
@@ -271,9 +285,11 @@ async fn execute(
 	client: PooledClient,
 	mut transport: TransportRequest,
 	captures: Arc<Mutex<Vec<HttpCaptureRecord>>>,
+	browser: Option<Arc<dyn BrowserFetch>>,
 ) -> Result<HandshakenResponse, Error> {
 	let started = Instant::now();
 	let attempt = transport.attempt.clone();
+	let browser_retry = browser_retry_request(&transport, browser);
 	let mut body_attempt = transport.encoded.body.begin_attempt();
 	let mut evidence = body_attempt.evidence_handle();
 	let deadline = tokio::time::Instant::now() + attempt.timeout;
@@ -524,6 +540,7 @@ async fn execute(
 		provider_request_id.clone(),
 		deadline,
 		started,
+		browser_retry,
 	);
 	let mut event_stream: RawEventStream = Box::pin(event_stream);
 	let mut preamble = VecDeque::new();
@@ -869,6 +886,56 @@ fn sanitize_provider_message(message: &str) -> Option<Str> {
 	(!sanitized.is_empty()).then(|| Str::new(sanitized))
 }
 
+fn browser_retry_request(
+	transport: &TransportRequest,
+	browser: Option<Arc<dyn BrowserFetch>>,
+) -> Option<(Arc<dyn BrowserFetch>, BrowserFetchRequest)> {
+	let browser = browser?;
+	if transport.credentials.is_some()
+		|| transport.encoded.operation != crate::catalog::OperationKind::Search
+		|| transport.encoded.method != RequestMethod::Get
+		|| transport.encoded.framing != FramingProtocol::Raw
+	{
+		return None;
+	}
+	let max_bytes = usize::try_from(transport.encoded.bounds.response)
+		.ok()?
+		.min(crate::transport::browser::MAX_BROWSER_BODY_BYTES);
+	let deadline = transport.attempt.timeout.min(MAX_BROWSER_DEADLINE);
+	if max_bytes == 0 || deadline.is_zero() {
+		return None;
+	}
+	let headers = transport
+		.encoded
+		.headers
+		.iter()
+		.map(|header| BrowserHeader { name: header.name.clone(), value: header.value.clone() })
+		.collect::<Vec<_>>()
+		.into_boxed_slice();
+	Some((browser, BrowserFetchRequest {
+		url: transport.encoded.uri.clone(),
+		headers,
+		max_bytes,
+		deadline,
+	}))
+}
+
+fn browser_fetch_error(error: BrowserFetchError) -> Error {
+	match error {
+		BrowserFetchError::Cancelled => cancelled(false),
+		BrowserFetchError::TimedOut => deadline_exceeded(false),
+		BrowserFetchError::Unavailable | BrowserFetchError::Navigation => {
+			connectivity(ErrorPhase::Handshake, false, "browser-fetch-unavailable")
+		},
+		BrowserFetchError::InvalidUrl
+		| BrowserFetchError::InvalidLimit
+		| BrowserFetchError::InvalidDeadline
+		| BrowserFetchError::ResponseTooLarge => {
+			protocol_error(ErrorPhase::Handshake, false, "browser-fetch-contract")
+		},
+	}
+}
+
 fn decode_stream(
 	mut incoming: Incoming,
 	protocol: FramingProtocol,
@@ -884,6 +951,7 @@ fn decode_stream(
 	provider_request_id: Option<Str>,
 	deadline: tokio::time::Instant,
 	started: Instant,
+	browser_retry: Option<(Arc<dyn BrowserFetch>, BrowserFetchRequest)>,
 ) -> impl Stream<Item = Result<RawEvent, Error>> + Send + 'static {
 	async_stream::stream! {
 		let mut guard = CancelOnDrop::new(cancel.clone());
@@ -950,7 +1018,50 @@ fn decode_stream(
 						}
 					},
 					Err(error) => {
-						yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+						let Some((browser, request)) =
+							browser_retry.filter(|_| !emitted && decoder.prepare_browser_retry())
+						else {
+							yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+							guard.disarm();
+							break;
+						};
+						let response = match browser.fetch(request, cancel.clone()).await {
+							Ok(response) => response,
+							Err(failure) => {
+								yield Err(record_failure(browser_fetch_error(failure), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+								guard.disarm();
+								break;
+							},
+						};
+						let frame = Frame::Raw(response.body);
+						capture_http_frame(&capture, ordinal, &frame, &mut capture_remaining);
+						let mut retried_events = VecDeque::new();
+						if let Err(error) =
+							decoder.push(frame, &mut |event| retried_events.push_back(event))
+						{
+							yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+							guard.disarm();
+							break;
+						}
+						if let Err(error) =
+							decoder.finish(&mut |event| retried_events.push_back(event))
+						{
+							yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+							guard.disarm();
+							break;
+						}
+						for event in retried_events {
+							match event {
+								RawEvent::Failure(error) => {
+									yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+									return;
+								},
+								event => {
+									emitted |= is_commit_candidate(&event);
+									yield Ok(event);
+								},
+							}
+						}
 					},
 				}
 				guard.disarm();

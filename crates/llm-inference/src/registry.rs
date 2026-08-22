@@ -599,7 +599,21 @@ async fn dispatch_preplanned(
 			Err(mut error) => {
 				attribute_error(&mut error, &plan.provider, &plan.route, &layered.payload.id);
 				let has_next = index < candidates.len();
-				if fallback_is_safe(&error, has_next) {
+				let context_promotion = !error.committed
+					&& error.kind == ErrorKind::ContextOverflow
+					&& plan.model.as_ref().is_some_and(|model| {
+						registry
+							.catalog()
+							.model(model)
+							.and_then(|model| model.context_promotion_target.as_ref())
+							.zip(
+								candidates
+									.get(index)
+									.and_then(|candidate| candidate.model.as_ref()),
+							)
+							.is_some_and(|(target, next)| target == next)
+					});
+				if context_promotion || fallback_is_safe(&error, has_next) {
 					layered.context.merge_receipt(error.receipt());
 					hide_attempts_since(&layered.context, attempt_start);
 					continue;

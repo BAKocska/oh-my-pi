@@ -23,9 +23,12 @@ use crate::{
 	error::Error,
 	event::{ChatEvent, WorkflowResponse},
 	id::{AccountId, GenerationHandle, LoginSessionId, PrincipalId, RequestId, ToolCallId},
-	operation::job::{
-		JobCancelError, JobCancelHandle, JobCancellationReceipt, JobCheckpoint, JobCheckpointHandle,
-		JobRef,
+	operation::{
+		job::{
+			JobCancelError, JobCancelHandle, JobCancellationReceipt, JobCheckpoint,
+			JobCheckpointHandle, JobRef,
+		},
+		parallel_extract::ParallelExtractResult,
 	},
 	receipt::{Cost, ExecutionReceipt, Usage, UsageSource},
 };
@@ -257,6 +260,8 @@ pub enum AnswerBody {
 	Realtime(RealtimeSession),
 	/// Ranked standalone search results.
 	Search(SearchResults),
+	/// Lossless bounded Parallel extraction result.
+	ParallelExtract(ParallelExtractResult),
 	/// Account-scoped provider usage payload, boxed because its lossless,
 	/// provider-defined window report is intentionally wider than this enum's
 	/// other response bodies.
@@ -284,6 +289,7 @@ impl AnswerBody {
 			Self::Transcript(_) => AnswerKind::Transcript,
 			Self::Realtime(_) => AnswerKind::Realtime,
 			Self::Search(_) => AnswerKind::Search,
+			Self::ParallelExtract(_) => AnswerKind::ParallelExtract,
 			Self::Usage(_) => AnswerKind::Usage,
 			Self::Models(_) => AnswerKind::Models,
 			Self::Auth(_) => AnswerKind::Auth,
@@ -317,6 +323,8 @@ pub enum AnswerKind {
 	Realtime,
 	/// Search results.
 	Search,
+	/// Parallel extraction result.
+	ParallelExtract,
 	/// Usage report.
 	Usage,
 	/// Discovered models.

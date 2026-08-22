@@ -531,7 +531,7 @@ impl Codec for OpenAiChatCodec {
 	}
 }
 
-pub(super) fn join_uri(base: &str, path: &str) -> Str {
+pub(crate) fn join_uri(base: &str, path: &str) -> Str {
 	let mut uri = String::with_capacity(base.len() + path.len() + 1);
 	uri.push_str(base.trim_end_matches('/'));
 	if !path.starts_with('/') {

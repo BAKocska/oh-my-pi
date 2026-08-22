@@ -21,7 +21,9 @@ use crate::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageResetCredit, UsageResetCredits,
 		UsageStatus, UsageUnit, UsageWindow, UsageWindowKind,
 	},
-	auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse},
+	auth::{
+		CredentialNeed, CredentialSource as _, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse,
+	},
 	catalog::ProviderId,
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
@@ -554,6 +556,96 @@ impl CodexRedemptionCoordinator {
 impl Default for CodexRedemptionCoordinator {
 	fn default() -> Self {
 		Self::new(Duration::from_secs(60))
+	}
+}
+
+/// Production saved-reset redemption service over the shared credential
+/// broker and account pool.
+///
+/// Owns the session-local [`CodexRedemptionCoordinator`] and leases the Codex
+/// access token per attempt, so tokens never escape this crate. The app
+/// adapts this onto the agent's `RedemptionAuthority` boundary.
+pub struct CodexRedemption {
+	auth:        crate::catalog::AuthSpecId,
+	provider:    ProviderId,
+	broker:      crate::auth::CredentialBroker,
+	accounts:    crate::account::AccountPool,
+	http:        Arc<dyn OAuthHttpClient>,
+	coordinator: tokio::sync::Mutex<CodexRedemptionCoordinator>,
+}
+
+impl CodexRedemption {
+	/// Builds the service when the catalog carries an `openai-codex` route.
+	///
+	/// Returns `None` when the provider is absent so hosts without Codex skip
+	/// registration entirely.
+	pub fn from_catalog(
+		catalog: &omp_llm_catalog::snapshot::Catalog,
+		broker: crate::auth::CredentialBroker,
+		accounts: crate::account::AccountPool,
+		http: Arc<dyn OAuthHttpClient>,
+	) -> Option<Self> {
+		let provider = ProviderId::from(PROVIDER);
+		let route = catalog
+			.routes()
+			.iter()
+			.find(|route| route.provider.as_str() == PROVIDER)?;
+		Some(Self {
+			auth: route.auth.clone(),
+			provider,
+			broker,
+			accounts,
+			http,
+			coordinator: tokio::sync::Mutex::new(CodexRedemptionCoordinator::default()),
+		})
+	}
+
+	/// Attempts one saved-reset redemption; `true` means a credit was consumed.
+	pub async fn redeem(&self, reason: CodexRedemptionReason) -> bool {
+		let record = self
+			.accounts
+			.accounts()
+			.into_iter()
+			.find(|record| record.enabled && record.provider == self.provider);
+		let (account, principal) = match record {
+			Some(record) => (record.account, record.principal),
+			None => return false,
+		};
+		let Ok(lease) = self
+			.broker
+			.lease(CredentialNeed {
+				spec:        self.auth.clone(),
+				account:     Some(account),
+				principal:   Some(principal),
+				valid_after: SystemTime::now(),
+			})
+			.await
+		else {
+			return false;
+		};
+		let Some(token) = lease.scalar_secret() else {
+			return false;
+		};
+		let (account_id, _) = parse_codex_jwt_identity(token.expose_secret());
+		let mut coordinator = self.coordinator.lock().await;
+		matches!(
+			coordinator
+				.redeem(
+					reason,
+					token.expose_secret(),
+					account_id.as_deref(),
+					self.http.as_ref(),
+					Instant::now(),
+				)
+				.await,
+			Ok(Some(CodexResetConsumeResult { ok: true, .. }))
+		)
+	}
+
+	/// Records that provider-native history was reseeded, opening the next
+	/// per-history redemption window.
+	pub async fn history_reseeded(&self) {
+		self.coordinator.lock().await.post_compaction_reset();
 	}
 }
 

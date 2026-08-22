@@ -1,12 +1,33 @@
 //! Parallel `/v1beta/extract` request and response projection.
 
-use omp_core::Str;
+use bytes::{Bytes, BytesMut};
+use omp_core::{Str, sf};
+use omp_llm_catalog::OperationKind;
 use serde::{Deserialize, Serialize};
+
+use crate::{
+	answer::AnswerBody,
+	body::BodySource,
+	call::OperationCall,
+	codec::{
+		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawEvent,
+		RequestHeader, RequestMethod, SizeBounds,
+	},
+	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
+	receipt::{ExecutionReceipt, ReasonId},
+	transport::{Frame, FramingProtocol},
+};
 
 /// Maximum URLs accepted by one extraction request.
 pub const MAX_URLS: usize = 20;
 /// Parallel extract beta resource.
 pub const EXTRACT_PATH: &str = "/v1beta/extract";
+/// Stable catalog codec identifier for Parallel extraction.
+pub const CODEC_ID: &str = "parallel-extract";
+/// Maximum encoded extraction request.
+pub const MAX_REQUEST_BYTES: u64 = 256 * 1024;
+/// Maximum extraction response.
+pub const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Bounded extraction request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -145,4 +166,123 @@ pub fn decode_parallel_extract(
 	bytes: &[u8],
 ) -> Result<ParallelExtractResult, ParallelExtractError> {
 	serde_json::from_slice(bytes).map_err(|_| ParallelExtractError::MalformedResponse)
+}
+/// Parallel `/v1beta/extract` request/response codec.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParallelExtractCodec;
+
+impl ParallelExtractCodec {
+	/// Returns the stable catalog codec identifier.
+	pub const fn id(self) -> &'static str {
+		CODEC_ID
+	}
+}
+
+impl Codec for ParallelExtractCodec {
+	fn encode(
+		&self,
+		context: &EncodeContext<'_>,
+		operation: &OperationCall,
+	) -> Result<EncodedRequest, Error> {
+		let OperationCall::ParallelExtract(request) = operation else {
+			return Err(codec_error("parallel_extract_operation_required"));
+		};
+		request
+			.validate()
+			.map_err(|_| encoding_error("parallel_extract_request_invalid"))?;
+		let body = serde_json::to_vec(request.as_ref())
+			.map_err(|_| encoding_error("parallel_extract_request_serialization_failed"))?;
+		if body.len() as u64 > MAX_REQUEST_BYTES {
+			return Err(encoding_error("parallel_extract_request_too_large"));
+		}
+		Ok(EncodedRequest::new(
+			OperationKind::Extract,
+			RequestMethod::Post,
+			crate::codec::openai_chat::join_uri(
+				context.route.endpoint.base_url.as_str(),
+				EXTRACT_PATH,
+			),
+			Box::new([
+				RequestHeader { name: sf!("accept"), value: sf!("application/json") },
+				RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+			]),
+			BodySource::Bytes(Bytes::from(body)),
+			FramingProtocol::Raw,
+			SizeBounds {
+				request_body: MAX_REQUEST_BYTES,
+				frame:        MAX_RESPONSE_BYTES,
+				response:     MAX_RESPONSE_BYTES,
+			},
+		))
+	}
+
+	fn decoder(&self, context: &DecodeContext<'_>) -> Result<DecoderState, Error> {
+		if context.operation != OperationKind::Extract
+			|| !matches!(context.operation_call, OperationCall::ParallelExtract(_))
+			|| context.framing != FramingProtocol::Raw
+		{
+			return Err(codec_error("parallel_extract_decode_context_mismatch"));
+		}
+		Ok(Box::new(ParallelExtractDecoder { bytes: BytesMut::new(), finished: false }))
+	}
+}
+
+struct ParallelExtractDecoder {
+	bytes:    BytesMut,
+	finished: bool,
+}
+
+impl Decoder for ParallelExtractDecoder {
+	fn push(&mut self, frame: Frame, _emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		let Frame::Raw(bytes) = frame else {
+			return Err(protocol_error("parallel_extract_unexpected_frame"));
+		};
+		if self.finished || self.bytes.len().saturating_add(bytes.len()) > MAX_RESPONSE_BYTES as usize
+		{
+			return Err(protocol_error("parallel_extract_response_too_large_or_finished"));
+		}
+		self.bytes.extend_from_slice(&bytes);
+		Ok(())
+	}
+
+	fn finish(&mut self, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		if self.finished {
+			return Ok(());
+		}
+		self.finished = true;
+		let result = decode_parallel_extract(&self.bytes)
+			.map_err(|_| protocol_error("parallel_extract_response_malformed"))?;
+		emit(RawEvent::Answer(AnswerBody::ParallelExtract(result)));
+		Ok(())
+	}
+}
+
+fn codec_error(reason: &'static str) -> Error {
+	Error::new(
+		ErrorKind::CodecMismatch,
+		ErrorPhase::Encoding,
+		RetryAction::Never,
+		ExecutionReceipt::default(),
+	)
+	.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
+}
+
+fn encoding_error(reason: &'static str) -> Error {
+	Error::new(
+		ErrorKind::InvalidRequest,
+		ErrorPhase::Encoding,
+		RetryAction::Never,
+		ExecutionReceipt::default(),
+	)
+	.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
+}
+
+fn protocol_error(reason: &'static str) -> Error {
+	Error::new(
+		ErrorKind::ProviderContractMismatch,
+		ErrorPhase::Streaming,
+		RetryAction::ReselectRoute,
+		ExecutionReceipt::default(),
+	)
+	.detail(ErrorDetail::protocol(ReasonId(sf!(reason))))
 }

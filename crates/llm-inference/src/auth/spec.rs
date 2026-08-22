@@ -18,6 +18,14 @@ pub enum AuthSpec {
 		/// Request location for the resolved key.
 		placement: KeyPlacement,
 	},
+	/// RFC 7617 basic authentication acquired as two independently named
+	/// secrets.
+	Basic {
+		/// Declarative username/password sources.
+		sources:   Vec<CredentialSourceSpec>,
+		/// Authorization header placement.
+		placement: HeaderPlacement,
+	},
 	/// A bearer token acquired from declared sources in exact catalog order.
 	Bearer {
 		/// Sources tried in exact catalog order.
@@ -62,6 +70,10 @@ impl AuthSpec {
 				validate_sources(sources)?;
 				placement.validate()
 			},
+			Self::Basic { sources, placement } => {
+				validate_sources(sources)?;
+				placement.validate()
+			},
 			Self::OAuthPkce(spec) => spec.validate(),
 			Self::OAuthDevice(spec) => spec.validate(),
 			Self::OAuthPaste(spec) => spec.validate(),
@@ -92,6 +104,12 @@ impl AuthSpec {
 			AuthSpecKind::ApiKey => Self::ApiKey {
 				sources:   require_sources(convert_sources(spec)?)?,
 				placement: placement()?,
+			},
+			AuthSpecKind::Basic => {
+				let KeyPlacement::Header(placement) = placement()? else {
+					return Err(CatalogAuthSpecError::MissingOrAmbiguousPlacement);
+				};
+				Self::Basic { sources: require_sources(convert_sources(spec)?)?, placement }
 			},
 			AuthSpecKind::Bearer | AuthSpecKind::AzureAd | AuthSpecKind::GithubApp => Self::Bearer {
 				sources:   require_sources(convert_sources(spec)?)?,
@@ -225,6 +243,12 @@ fn convert_source(
 	match source {
 		CatalogSource::Environment { ordered_names } => {
 			Ok(CredentialSourceSpec::Environment { variables: ordered_names.to_vec() })
+		},
+		CatalogSource::BasicEnvironment { username_names, password_names } => {
+			Ok(CredentialSourceSpec::BasicEnvironment {
+				username_variables: username_names.to_vec(),
+				password_variables: password_names.to_vec(),
+			})
 		},
 		CatalogSource::Stored => Ok(CredentialSourceSpec::Stored { profile: None }),
 		CatalogSource::AwsChain => Ok(CredentialSourceSpec::AwsChain { profile: None }),
@@ -408,6 +432,14 @@ pub enum CredentialSourceSpec {
 	Environment {
 		/// Names checked in exact order.
 		variables: Vec<Str>,
+	},
+	/// Read an RFC 7617 username and password from independent environment
+	/// lookup orders.
+	BasicEnvironment {
+		/// Username names checked in exact order.
+		username_variables: Vec<Str>,
+		/// Password names checked in exact order.
+		password_variables: Vec<Str>,
 	},
 	/// Ask the caller over an interactive login session.
 	Interactive,
@@ -887,6 +919,18 @@ fn validate_sources(sources: &[CredentialSourceSpec]) -> Result<(), AuthSpecErro
 	for source in sources {
 		if let CredentialSourceSpec::Environment { variables } = source
 			&& (variables.is_empty() || variables.iter().any(|name| !name.starts_with("OMP_")))
+		{
+			return Err(AuthSpecError::InvalidEnvironmentSource);
+		}
+		if let CredentialSourceSpec::BasicEnvironment { username_variables, password_variables } =
+			source && (username_variables.is_empty()
+			|| password_variables.is_empty()
+			|| username_variables
+				.iter()
+				.any(|name| !name.starts_with("OMP_"))
+			|| password_variables
+				.iter()
+				.any(|name| !name.starts_with("OMP_")))
 		{
 			return Err(AuthSpecError::InvalidEnvironmentSource);
 		}

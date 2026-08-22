@@ -75,7 +75,11 @@ impl Codec for ScraperSearchCodec {
 		if context.operation != OperationKind::Search || context.framing != FramingProtocol::Raw {
 			return Err(error(ErrorKind::CodecMismatch, "scraper_search_decode_context_invalid"));
 		}
-		Ok(Box::new(ScraperDecoder { buffer: BytesMut::new(), finished: false }))
+		Ok(Box::new(ScraperDecoder {
+			buffer:        BytesMut::new(),
+			finished:      false,
+			browser_retry: false,
+		}))
 	}
 }
 fn navigation_headers(style: ScraperStyle) -> Box<[RequestHeader]> {
@@ -98,8 +102,9 @@ fn navigation_headers(style: ScraperStyle) -> Box<[RequestHeader]> {
 	])
 }
 struct ScraperDecoder {
-	buffer:   BytesMut,
-	finished: bool,
+	buffer:        BytesMut,
+	finished:      bool,
+	browser_retry: bool,
 }
 impl Decoder for ScraperDecoder {
 	fn push(&mut self, frame: Frame, _emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
@@ -125,6 +130,7 @@ impl Decoder for ScraperDecoder {
 			error(ErrorKind::ProviderContractMismatch, "scraper_search_response_not_utf8")
 		})?;
 		if challenged(html) {
+			self.browser_retry = true;
 			return Err(error(
 				ErrorKind::RouteUnavailable,
 				"scraper_search_browser_escalation_required",
@@ -141,6 +147,16 @@ impl Decoder for ScraperDecoder {
 			metadata: Default::default(),
 		})));
 		Ok(())
+	}
+
+	fn prepare_browser_retry(&mut self) -> bool {
+		if !self.browser_retry {
+			return false;
+		}
+		self.buffer.clear();
+		self.finished = false;
+		self.browser_retry = false;
+		true
 	}
 }
 fn challenged(html: &str) -> bool {
