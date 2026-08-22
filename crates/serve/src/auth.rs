@@ -12,14 +12,15 @@ use std::{
 };
 
 use futures::{Stream, StreamExt as _};
-use omp_core::SecretString;
-use omp_llm_catalog::ProviderId;
-use omp_llm_inference::{
+use omp_catalog::ProviderId;
+use omp_core::{Secret, SecretString};
+use omp_inference::{
 	Client, Error as InferenceError, ErrorKind, Registry,
 	answer::{
 		AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthSession, UsageQuantity, UsageReport,
 		UsageStatus, UsageUnit, UsageWindowKind,
 	},
+	auth::{AuthControlHandle, CredentialControlWrite, OAuthControlImport},
 	call::{
 		AuthInput, AuthMethod, AuthRequest, CallMeta, LoginRequest, Target, UsageRequest, UsageScope,
 	},
@@ -40,12 +41,84 @@ type AuthEventStream =
 pub struct AuthRpc {
 	registry: Registry,
 	flows:    Arc<Mutex<BTreeMap<String, AuthSession>>>,
+	control:  Option<AuthControlHandle>,
 }
 
 impl AuthRpc {
 	/// Wraps one immutable comprehensive registry.
 	pub fn new(registry: Registry) -> Self {
-		Self { registry, flows: Arc::new(Mutex::new(BTreeMap::new())) }
+		Self { registry, flows: Arc::new(Mutex::new(BTreeMap::new())), control: None }
+	}
+
+	/// Binds the same live auth manager used by route execution to lifecycle
+	/// RPC.
+	pub fn with_control(registry: Registry, control: AuthControlHandle) -> Self {
+		Self { registry, flows: Arc::new(Mutex::new(BTreeMap::new())), control: Some(control) }
+	}
+
+	fn control(&self) -> Result<&AuthControlHandle, Status> {
+		self
+			.control
+			.as_ref()
+			.ok_or_else(|| Status::failed_precondition("auth lifecycle owner is not bound"))
+	}
+
+	fn control_account(&self, id: u64) -> Result<AccountId, Status> {
+		let matches = self
+			.control()?
+			.accounts(None)
+			.into_iter()
+			.filter(|account| wire_account_id(&account.account) == id)
+			.map(|account| account.account)
+			.collect::<Vec<_>>();
+		match matches.as_slice() {
+			[account] => Ok(account.clone()),
+			[] => Err(Status::not_found("credential not found")),
+			_ => Err(Status::failed_precondition("credential id collision")),
+		}
+	}
+
+	fn control_meta(
+		&self,
+		account: omp_inference::account::AccountRecord,
+	) -> Result<pb::CredentialMeta, Status> {
+		let metadata = self
+			.control()?
+			.metadata(&account.account)
+			.map_err(store_status)?
+			.ok_or_else(|| Status::not_found("credential not found"))?;
+		let kind = match metadata.kind.as_str() {
+			"api_key" | "api-key" => pb::credential_meta::Kind::ApiKey,
+			"oauth" | "oauth-renewable-v1" | "bearer" => pb::credential_meta::Kind::Oauth,
+			"aws" => pb::credential_meta::Kind::Aws,
+			_ => pb::credential_meta::Kind::Unspecified,
+		};
+		let blocks = self
+			.control()?
+			.blocks(&account.account)
+			.into_iter()
+			.map(|(scope, until_ms)| pb::Block {
+				scope: scope.to_string(),
+				provider_key: String::new(),
+				until_ms,
+			})
+			.collect();
+		Ok(pb::CredentialMeta {
+			id:             wire_account_id(&account.account),
+			provider:       account.provider.as_str().to_owned(),
+			kind:           kind as i32,
+			identity:       account.principal.as_str().to_owned(),
+			state:          if account.enabled {
+				pb::credential_meta::State::Active as i32
+			} else {
+				pb::credential_meta::State::Disabled as i32
+			},
+			blocks,
+			disabled_cause: String::new(),
+			expires_at_ms:  metadata.expires_at_ms.unwrap_or_default(),
+			created_at_ms:  metadata.created_at_ms,
+			updated_at_ms:  metadata.updated_at_ms,
+		})
 	}
 
 	fn provider_for(&self, requested: Option<&str>) -> Result<ProviderId, Status> {
@@ -60,13 +133,13 @@ impl AuthRpc {
 			.find(|provider| {
 				provider
 					.management
-					.supports(omp_llm_catalog::OperationKind::Auth)
+					.supports(omp_catalog::OperationKind::Auth)
 			})
 			.map(|provider| provider.id.clone())
 			.ok_or_else(|| Status::failed_precondition("no constructed route supports authentication"))
 	}
 
-	fn client(&self, provider: ProviderId) -> Client<omp_llm_inference::ProviderService, Router> {
+	fn client(&self, provider: ProviderId) -> Client<omp_inference::ProviderService, Router> {
 		let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 		Client::new(
 			self.registry.service(),
@@ -98,8 +171,22 @@ impl AuthRpc {
 		account: u64,
 		refresh: bool,
 	) -> Result<pb::CredentialMeta, Status> {
-		let provider = self.provider_for(None)?;
-		let account = AccountId::from(account.to_string());
+		let account = if self.control.is_some() {
+			self.control_account(account)?
+		} else {
+			AccountId::from(account.to_string())
+		};
+		let provider = self
+			.control
+			.as_ref()
+			.and_then(|control| {
+				control
+					.accounts(None)
+					.into_iter()
+					.find(|record| record.account == account)
+					.map(|record| record.provider)
+			})
+			.map_or_else(|| self.provider_for(None), Ok)?;
 		let operation = if refresh {
 			AuthRequest::Refresh { account }
 		} else {
@@ -127,9 +214,9 @@ impl AuthRpc {
 		let result = self
 			.client(provider.clone())
 			.execute(UsageRequest {
-				provider: Some(provider.clone()),
-				account: Some(account.account),
-				scope: UsageScope::All,
+				provider:    Some(provider.clone()),
+				account:     Some(account.account),
+				scope:       UsageScope::All,
 				allow_stale: !strict,
 			})
 			.await;
@@ -220,7 +307,7 @@ impl pb::auth_server::Auth for AuthRpc {
 		};
 		let session = LoginSessionId::from(request.flow_id.as_str());
 		responses
-			.send_async(omp_llm_inference::answer::AuthResponse {
+			.send_async(omp_inference::answer::AuthResponse {
 				session,
 				input: AuthInput::AuthorizationCode(SecretString::from(request.code)),
 			})
@@ -265,7 +352,7 @@ impl pb::auth_server::Auth for AuthRpc {
 		};
 		session
 			.responses
-			.send_async(omp_llm_inference::answer::AuthResponse {
+			.send_async(omp_inference::answer::AuthResponse {
 				session: session.id.clone(),
 				input:   AuthInput::ApiKey(SecretString::from(request.api_key)),
 			})
@@ -318,37 +405,112 @@ impl pb::auth_server::Auth for AuthRpc {
 
 	async fn put_aws_credential(
 		&self,
-		_request: Request<pb::PutAwsCredentialRequest>,
+		request: Request<pb::PutAwsCredentialRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
-		Err(not_available("direct AWS secret ingress"))
+		let request = request.into_inner();
+		let provider = ProviderId::from(request.provider.as_str());
+		let principal = omp_inference::PrincipalId::from(request.identity.as_str());
+		let mut material = Vec::with_capacity(
+			request.access_key_id.len()
+				+ request.secret_access_key.len()
+				+ request.session_token.len()
+				+ 16,
+		);
+		for field in [request.access_key_id, request.secret_access_key, request.session_token] {
+			material.extend_from_slice(&(field.len() as u64).to_le_bytes());
+			material.extend_from_slice(&field);
+		}
+		let (_, account) = self
+			.control()?
+			.store(CredentialControlWrite {
+				provider,
+				principal,
+				identity: Some(request.identity.into()),
+				kind: "aws".into(),
+				secret: Secret::new(material),
+				expires_at_ms: None,
+			})
+			.map_err(store_status)?;
+		Ok(Response::new(self.control_meta(account)?))
 	}
 
 	async fn import_o_auth(
 		&self,
-		_request: Request<pb::ImportOAuthRequest>,
+		request: Request<pb::ImportOAuthRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
-		Err(not_available("OAuth token import"))
+		let request = request.into_inner();
+		let provider = ProviderId::from(request.provider.as_str());
+		let identity = (!request.identity.is_empty()).then(|| request.identity.into());
+		let principal = omp_inference::PrincipalId::from(
+			identity
+				.as_ref()
+				.map_or(provider.as_str(), omp_core::Str::as_str),
+		);
+		let (_, account) = self
+			.control()?
+			.import_oauth(OAuthControlImport {
+				provider,
+				principal,
+				identity,
+				access_token: (!request.access_token.is_empty())
+					.then(|| SecretString::from(request.access_token)),
+				refresh_token: SecretString::from(request.refresh_token),
+				expires_at_ms: (request.expires_at_ms != 0).then_some(request.expires_at_ms),
+			})
+			.map_err(store_status)?;
+		Ok(Response::new(self.control_meta(account)?))
 	}
 
 	async fn disable_credential(
 		&self,
-		_request: Request<pb::DisableCredentialRequest>,
+		request: Request<pb::DisableCredentialRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
-		Err(not_available("administrative credential disable"))
+		let request = request.into_inner();
+		let account = self.control_account(request.id)?;
+		let record = self
+			.control()?
+			.set_enabled(&account, false)
+			.map_err(store_status)?;
+		let mut metadata = self.control_meta(record)?;
+		metadata.disabled_cause = request.cause;
+		Ok(Response::new(metadata))
 	}
 
 	async fn enable_credential(
 		&self,
-		_request: Request<pb::EnableCredentialRequest>,
+		request: Request<pb::EnableCredentialRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
-		Err(not_available("administrative credential enable"))
+		let account = self.control_account(request.into_inner().id)?;
+		let record = self
+			.control()?
+			.set_enabled(&account, true)
+			.map_err(store_status)?;
+		Ok(Response::new(self.control_meta(record)?))
 	}
 
 	async fn report_block(
 		&self,
-		_request: Request<pb::ReportBlockRequest>,
+		request: Request<pb::ReportBlockRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
-		Err(not_available("client-reported credential blocks"))
+		let request = request.into_inner();
+		let account = self.control_account(request.id)?;
+		let block = request
+			.block
+			.ok_or_else(|| Status::invalid_argument("credential block is missing"))?;
+		let until = std::time::UNIX_EPOCH
+			.checked_add(Duration::from_millis(block.until_ms))
+			.ok_or_else(|| Status::invalid_argument("credential block time is invalid"))?;
+		self
+			.control()?
+			.report_block(&account, block.scope, until)
+			.map_err(store_status)?;
+		let record = self
+			.control()?
+			.accounts(None)
+			.into_iter()
+			.find(|record| record.account == account)
+			.ok_or_else(|| Status::not_found("credential not found"))?;
+		Ok(Response::new(self.control_meta(record)?))
 	}
 
 	async fn clear_blocks(
@@ -415,7 +577,7 @@ impl pb::auth_server::Auth for AuthRpc {
 }
 
 async fn await_account(
-	events: flume::Receiver<Result<AuthEvent, omp_llm_inference::Error>>,
+	events: flume::Receiver<Result<AuthEvent, omp_inference::Error>>,
 ) -> Result<AccountSummary, Status> {
 	while let Ok(event) = events.recv_async().await {
 		if let AuthEvent::Complete(account) = event.map_err(inference_status)? {
@@ -473,11 +635,33 @@ fn account_meta(account: AccountSummary) -> Result<pb::CredentialMeta, Status> {
 }
 
 fn parse_account_id(account: &AccountId<str>) -> Result<u64, Status> {
-	account.as_str().parse().map_err(|_| {
-		Status::failed_precondition(
-			"account identity cannot be represented by the retained numeric auth RPC schema",
-		)
-	})
+	Ok(wire_account_id(account))
+}
+fn store_status(error: omp_inference::auth::StoreError) -> Status {
+	match error {
+		omp_inference::auth::StoreError::NotFound => Status::not_found(error.to_string()),
+		omp_inference::auth::StoreError::GenerationConflict
+		| omp_inference::auth::StoreError::RevealAuditConflict => Status::aborted(error.to_string()),
+		omp_inference::auth::StoreError::InvalidRevealAudit => {
+			Status::permission_denied(error.to_string())
+		},
+		_ => Status::internal(error.to_string()),
+	}
+}
+
+fn wire_account_id(account: &AccountId<str>) -> u64 {
+	if let Ok(id) = account.as_str().parse() {
+		return id;
+	}
+	let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+	for byte in b"omp/auth/control-id/v1"
+		.iter()
+		.chain(account.as_str().as_bytes())
+	{
+		hash ^= u64::from(*byte);
+		hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+	}
+	hash
 }
 
 fn usage_report(report: UsageReport) -> pb::UsageReport {
@@ -719,19 +903,18 @@ fn not_available(capability: &str) -> Status {
 		"{capability} is not exposed by any constructed canonical auth operation"
 	))
 }
-fn inference_status(error: omp_llm_inference::Error) -> Status {
+fn inference_status(error: omp_inference::Error) -> Status {
 	Status::failed_precondition(error.to_string())
 }
 #[cfg(test)]
 mod tests {
-	use omp_llm_inference::{
+	use omp_inference::{
 		Error, ErrorKind,
 		error::{ErrorPhase, RetryAction},
 		receipt::ExecutionReceipt,
 	};
 
 	use super::{error_class, pb};
-
 
 	#[test]
 	fn credential_probe_failures_keep_typed_http_health() {
@@ -742,9 +925,6 @@ mod tests {
 			ExecutionReceipt::default(),
 		)
 		.status(Some(401));
-		assert_eq!(
-			error_class(&error),
-			pb::credential_health::ErrorClass::Authentication,
-		);
+		assert_eq!(error_class(&error), pb::credential_health::ErrorClass::Authentication,);
 	}
 }

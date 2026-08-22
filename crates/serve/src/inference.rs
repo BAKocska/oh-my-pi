@@ -11,12 +11,12 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt as _, stream};
 use im::OrdMap;
 use omp_agent::{empty_stop, project_thread_history};
-use omp_core::{Str, encoding::hex, sf};
-use omp_llm_catalog::{
+use omp_catalog::{
 	Availability, GrammarBits, ModalityBits, ModelAvailability, ModelKey, ModelSpec, OperationKind,
 	ProviderDef, ProviderId,
 };
-use omp_llm_inference::{
+use omp_core::{Str, encoding::hex, sf};
+use omp_inference::{
 	Client, Registry,
 	answer::{
 		Artifact, ArtifactBody, AudioChunk, ChatControl, ChatControlError, GenerationEvent,
@@ -73,16 +73,16 @@ pub type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 's
 /// OMP RPC schema.
 #[derive(Clone)]
 pub struct InferenceRpc {
-	registry:            Registry,
-	tool_registry:       Arc<ToolRegistry>,
-	sessions:            ConversationSessionPlanner,
-	epoch:               Arc<[u8]>,
-	provider_sessions:   bool,
-	test_live_responses: Option<flume::Sender<WorkflowResponse>>,
-	contexts:            Arc<Mutex<BTreeMap<String, RpcContext>>>,
-	generations:         Arc<Mutex<BTreeMap<String, RpcGeneration>>>,
-	search_settings:     Arc<omp_llm_inference::search_settings::WebSearchSettings>,
-	session_provider:    Option<ProviderId>,
+	registry:              Registry,
+	tool_registry:         Arc<ToolRegistry>,
+	sessions:              ConversationSessionPlanner,
+	epoch:                 Arc<[u8]>,
+	provider_sessions:     bool,
+	test_live_responses:   Option<flume::Sender<WorkflowResponse>>,
+	contexts:              Arc<Mutex<BTreeMap<String, RpcContext>>>,
+	generations:           Arc<Mutex<BTreeMap<String, RpcGeneration>>>,
+	search_settings:       Arc<omp_inference::search_settings::WebSearchSettings>,
+	session_provider:      Option<ProviderId>,
 	prompt_cache_affinity: Option<Str>,
 }
 
@@ -170,11 +170,12 @@ impl InferenceRpc {
 	/// Replaces web-search routing settings for this immutable RPC facade.
 	pub fn with_search_settings(
 		mut self,
-		settings: omp_llm_inference::search_settings::WebSearchSettings,
+		settings: omp_inference::search_settings::WebSearchSettings,
 	) -> Self {
 		self.search_settings = Arc::new(settings);
 		self
 	}
+
 	/// Applies invocation-scoped routing and prompt-cache affinity.
 	///
 	/// These values live only on this RPC facade and are never projected into
@@ -242,7 +243,7 @@ impl InferenceRpc {
 				if let Some(provider) = &self.session_provider {
 					return Ok(Target::Provider {
 						provider: provider.clone(),
-						model: spec.key.clone(),
+						model:    spec.key.clone(),
 					});
 				}
 				return Ok(Target::Model(spec.key.clone()));
@@ -250,7 +251,7 @@ impl InferenceRpc {
 			if let Some(provider) = &self.session_provider {
 				return Ok(Target::Provider {
 					provider: provider.clone(),
-					model: ModelKey::from(selector),
+					model:    ModelKey::from(selector),
 				});
 			}
 			return Ok(Target::Model(ModelKey::from(selector)));
@@ -271,7 +272,7 @@ impl InferenceRpc {
 		&self,
 		target: Target,
 		request: RequestId,
-	) -> Client<omp_llm_inference::ProviderService, Router> {
+	) -> Client<omp_inference::ProviderService, Router> {
 		self.client_with_deadline(target, request, None)
 	}
 
@@ -280,7 +281,7 @@ impl InferenceRpc {
 		target: Target,
 		request: RequestId,
 		deadline: Option<Instant>,
-	) -> Client<omp_llm_inference::ProviderService, Router> {
+	) -> Client<omp_inference::ProviderService, Router> {
 		Client::new(
 			self.registry.service(),
 			Router::new(self.registry.clone(), Duration::from_secs(30)),
@@ -299,7 +300,7 @@ impl InferenceRpc {
 		target: Target,
 		request: RequestId,
 		session: Option<SessionRequest>,
-	) -> Client<omp_llm_inference::ProviderService, Router> {
+	) -> Client<omp_inference::ProviderService, Router> {
 		Client::new(
 			self.registry.service(),
 			Router::new(self.registry.clone(), Duration::from_secs(30)),
@@ -974,12 +975,12 @@ impl pb::inference_server::Inference for InferenceRpc {
 		let format = match pb::AudioEncoding::try_from(request.encoding)
 			.unwrap_or(pb::AudioEncoding::Unspecified)
 		{
-			pb::AudioEncoding::Mp3 => Setting::Prefer(omp_llm_inference::call::AudioFormat::Mp3),
-			pb::AudioEncoding::Pcm16 => Setting::Prefer(omp_llm_inference::call::AudioFormat::Pcm16),
-			pb::AudioEncoding::Wav => Setting::Prefer(omp_llm_inference::call::AudioFormat::Wav),
-			pb::AudioEncoding::Opus => Setting::Prefer(omp_llm_inference::call::AudioFormat::Opus),
-			pb::AudioEncoding::Aac => Setting::Prefer(omp_llm_inference::call::AudioFormat::Aac),
-			pb::AudioEncoding::Flac => Setting::Prefer(omp_llm_inference::call::AudioFormat::Flac),
+			pb::AudioEncoding::Mp3 => Setting::Prefer(omp_inference::call::AudioFormat::Mp3),
+			pb::AudioEncoding::Pcm16 => Setting::Prefer(omp_inference::call::AudioFormat::Pcm16),
+			pb::AudioEncoding::Wav => Setting::Prefer(omp_inference::call::AudioFormat::Wav),
+			pb::AudioEncoding::Opus => Setting::Prefer(omp_inference::call::AudioFormat::Opus),
+			pb::AudioEncoding::Aac => Setting::Prefer(omp_inference::call::AudioFormat::Aac),
+			pb::AudioEncoding::Flac => Setting::Prefer(omp_inference::call::AudioFormat::Flac),
 			pb::AudioEncoding::Unspecified => Setting::Unset,
 		};
 		let operation = SpeechRequest {
@@ -1680,7 +1681,7 @@ fn inference_turn_error(error: Error) -> pb::TurnEvent {
 		detail
 	};
 	let retry_after_ms = match error.action {
-		omp_llm_inference::RetryAction::SameRoute { after } => {
+		omp_inference::RetryAction::SameRoute { after } => {
 			after.as_millis().try_into().unwrap_or(u64::MAX)
 		},
 		_ => 0,
@@ -1748,14 +1749,14 @@ fn empty_stop_diagnostic(error: &Error) -> pb::Diagnostic {
 	}
 }
 
-fn conversation_status(error: omp_llm_inference::session::ConversationError) -> Status {
+fn conversation_status(error: omp_inference::session::ConversationError) -> Status {
 	match error {
-		omp_llm_inference::session::ConversationError::RevisionConflict { .. }
-		| omp_llm_inference::session::ConversationError::TurnConflict(_) => {
+		omp_inference::session::ConversationError::RevisionConflict { .. }
+		| omp_inference::session::ConversationError::TurnConflict(_) => {
 			Status::aborted(error.to_string())
 		},
-		omp_llm_inference::session::ConversationError::UnknownConversation(_)
-		| omp_llm_inference::session::ConversationError::UnknownRevision(_) => {
+		omp_inference::session::ConversationError::UnknownConversation(_)
+		| omp_inference::session::ConversationError::UnknownRevision(_) => {
 			Status::not_found(error.to_string())
 		},
 		_ => Status::internal(error.to_string()),
@@ -1796,7 +1797,7 @@ pub fn project_provider_turn_for_test(
 	thread: &thread_pb::Thread,
 	params: &pb::ChatParams,
 	tool_registry: &ToolRegistry,
-) -> Result<(thread_pb::Thread, omp_llm_inference::call::ChatRequest), Status> {
+) -> Result<(thread_pb::Thread, omp_inference::call::ChatRequest), Status> {
 	let projected = project_thread_history(thread, tool_registry, &RPC_HISTORY_CAPS_BASE)
 		.map_err(|error| Status::invalid_argument(error.to_string()))?;
 	let request = chat_request(thread_messages(&projected)?, params, tool_registry)?;
@@ -1885,13 +1886,13 @@ fn content_part(part: &thread_pb::Part) -> Result<ContentPart, Status> {
 
 fn tool_result_part(
 	part: &thread_pb::Part,
-) -> Result<omp_llm_inference::call::ToolResultContent, Status> {
+) -> Result<omp_inference::call::ToolResultContent, Status> {
 	match part.kind.as_ref() {
 		Some(thread_pb::part::Kind::Text(text)) => {
-			Ok(omp_llm_inference::call::ToolResultContent::Text(text.as_str().into()))
+			Ok(omp_inference::call::ToolResultContent::Text(text.as_str().into()))
 		},
 		Some(thread_pb::part::Kind::Blob(blob)) => {
-			Ok(omp_llm_inference::call::ToolResultContent::Document(media_input(blob)?))
+			Ok(omp_inference::call::ToolResultContent::Document(media_input(blob)?))
 		},
 		_ => Err(Status::invalid_argument(
 			"tool result contains a part that has no canonical projection",
@@ -1913,7 +1914,7 @@ fn media_input(blob: &thread_pb::Blob) -> Result<MediaInput, Status> {
 		return Err(Status::invalid_argument("Blob requires inline bytes or a content hash"));
 	}
 	let id = hex::encode(&blob.hash).into_string();
-	Ok(MediaInput::Stored(omp_llm_inference::answer::ArtifactRef {
+	Ok(MediaInput::Stored(omp_inference::answer::ArtifactRef {
 		store:    sf!("omp-rpc-blobs"),
 		id:       id.as_str().into(),
 		revision: id.as_str().into(),
@@ -1950,7 +1951,7 @@ fn chat_request(
 	messages: Vec<Message>,
 	params: &pb::ChatParams,
 	tool_registry: &ToolRegistry,
-) -> Result<omp_llm_inference::call::ChatRequest, Status> {
+) -> Result<omp_inference::call::ChatRequest, Status> {
 	if let Some(tool) = params
 		.tools
 		.iter()
@@ -2020,7 +2021,7 @@ fn chat_request(
 			presence_penalty:   sampling.presence_penalty.map(|value| value as f32),
 			frequency_penalty:  sampling.frequency_penalty.map(|value| value as f32),
 		});
-	Ok(omp_llm_inference::call::ChatRequest {
+	Ok(omp_inference::call::ChatRequest {
 		messages: messages.into(),
 		tools: tools.into(),
 		hosted_tools: Arc::from([]),
@@ -2046,7 +2047,7 @@ fn configured_search_providers(name: &str) -> Vec<ProviderId> {
 		"perplexity" => {
 			&["perplexity-cookie", "perplexity", "perplexity-openrouter", "perplexity-anonymous"]
 		},
-		_ => &[omp_llm_inference::search_settings::catalog_provider_name(name)],
+		_ => &[omp_inference::search_settings::catalog_provider_name(name)],
 	};
 	names.iter().map(|name| ProviderId::from(*name)).collect()
 }
@@ -2078,7 +2079,7 @@ fn proto_usage(usage: Usage) -> pb::Usage {
 }
 
 fn tokenizer_provenance(
-	provenance: omp_llm_inference::answer::TokenizerProvenance,
+	provenance: omp_inference::answer::TokenizerProvenance,
 ) -> pb::TokenizerProvenance {
 	pb::TokenizerProvenance {
 		tokenizer: provenance.tokenizer.as_str().to_owned(),
@@ -2476,7 +2477,7 @@ fn invoke_timeout(invocation_id: &str) -> pb::TurnEvent {
 }
 
 fn turn_events(
-	mut events: omp_llm_inference::answer::ChatStream,
+	mut events: omp_inference::answer::ChatStream,
 	mut incoming: tonic::Streaming<pb::TurnFrame>,
 	contexts: Arc<Mutex<BTreeMap<String, RpcContext>>>,
 	sessions: ConversationSessionPlanner,
@@ -2775,7 +2776,7 @@ fn turn_events(
 }
 
 fn image_events(
-	mut events: omp_llm_inference::answer::GenerationStream<ImageArtifact>,
+	mut events: omp_inference::answer::GenerationStream<ImageArtifact>,
 ) -> impl Stream<Item = Result<pb::ImageEvent, Status>> + Send + 'static {
 	async_stream::try_stream! {
 		let mut images = Vec::new();
@@ -2874,7 +2875,7 @@ fn speak_event(chunk: AudioChunk) -> pb::SpeakEvent {
 }
 
 fn search_response(answer: SearchResults) -> pb::SearchResponse {
-	let omp_llm_inference::answer::SearchResults { results, answer, usage, metadata } = answer;
+	let omp_inference::answer::SearchResults { results, answer, usage, metadata } = answer;
 	let engine = metadata
 		.provider
 		.as_ref()
@@ -3295,7 +3296,7 @@ const fn video_dimensions(resolution: i32, aspect_ratio: i32) -> Setting<Dimensi
 }
 
 async fn run_generation(
-	mut session: omp_llm_inference::answer::GenerationSession<VideoArtifact>,
+	mut session: omp_inference::answer::GenerationSession<VideoArtifact>,
 	status: Arc<Mutex<pb::GenerationStatus>>,
 	updates: tokio::sync::broadcast::Sender<pb::GenerationStatus>,
 	cancel: flume::Receiver<
@@ -3414,7 +3415,7 @@ fn system_time_ms(time: SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
-	use omp_llm_inference::{
+	use omp_inference::{
 		RouteId,
 		error::{ErrorPhase, RetryAction},
 		receipt::{ExecutionReceipt, ReasonId, RecoveryKind, RecoveryRecord},
@@ -3424,7 +3425,7 @@ mod tests {
 
 	#[test]
 	fn model_card_exposes_gateway_discovery_metadata() {
-		let mut model = omp_llm_catalog::snapshot::Catalog::embedded()
+		let mut model = omp_catalog::snapshot::Catalog::embedded()
 			.models()
 			.iter()
 			.find(|model| model.capabilities.chat.is_some())
@@ -3559,7 +3560,7 @@ mod tests {
 	}
 
 	fn empty_stop_receipt(classification: &str, billed_output: u64) -> ExecutionReceipt {
-		use omp_llm_inference::{
+		use omp_inference::{
 			body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
 			receipt::{AttemptOutcome, AttemptReceipt, ProviderEvidence},
 		};
