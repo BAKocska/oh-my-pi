@@ -13,9 +13,9 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, StreamExt, executor::block_on};
+use omp_catalog::GrammarBits;
 use omp_core::{Hash32, Str, sf};
-use omp_llm_catalog::GrammarBits;
-use omp_llm_inference::{Adjustment, ToolGrammarSyntax};
+use omp_inference::{Adjustment, ToolGrammarSyntax};
 use omp_tool::{
 	Abort, AbortKind, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry,
 	ArgSpecRegistryError, ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails,

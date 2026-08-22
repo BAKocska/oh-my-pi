@@ -12,9 +12,9 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
+use omp_catalog::GrammarBits;
 use omp_core::{Hash32, SparseMap, Str, hash32::Hasher, sf};
-use omp_llm_catalog::GrammarBits;
-use omp_llm_inference::{
+use omp_inference::{
 	Adjustment, FeatureId, OpaqueJson, ReasonId, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
 	ToolInputConstraint,
 };
@@ -325,25 +325,31 @@ impl<T> Clone for RegistryLeaf<T> {
 /// One owner-qualified leaf in a published catalog snapshot.
 pub struct PublishedLeaf<T> {
 	/// Authenticated dynamic owner.
-	pub owner: LeafOwner,
+	pub owner:   LeafOwner,
 	/// Canonical leaf name.
-	pub name:  Str,
+	pub name:    Str,
 	/// Semantic tool revision.
-	pub rev:   Rev,
+	pub rev:     Rev,
 	/// Effective declaration and binding digest.
-	pub code:  Hash32,
+	pub code:    Hash32,
+	/// Current authoritative reachability.
+	pub mounted: bool,
+	/// Reason supplied by the owner for an unavailable leaf.
+	pub reason:  Option<Str>,
 	/// Owner-specific runtime implementation.
-	pub value: Arc<T>,
+	pub value:   Arc<T>,
 }
 
 impl<T> Clone for PublishedLeaf<T> {
 	fn clone(&self) -> Self {
 		Self {
-			owner: self.owner.clone(),
-			name:  self.name.clone(),
-			rev:   self.rev.clone(),
-			code:  self.code,
-			value: Arc::clone(&self.value),
+			owner:   self.owner.clone(),
+			name:    self.name.clone(),
+			rev:     self.rev.clone(),
+			code:    self.code,
+			mounted: self.mounted,
+			reason:  self.reason.clone(),
+			value:   Arc::clone(&self.value),
 		}
 	}
 }
@@ -383,22 +389,42 @@ pub enum LeafReplacementError {
 	/// A replacement reused one fence for a different effective leaf set.
 	#[error("dynamic leaf replacement changed without advancing its owner fence")]
 	ConflictingVersion,
+	/// An availability mutation did not name the exact active manager
+	/// generation.
+	#[error("dynamic leaf availability generation mismatch: expected {expected}, got {actual}")]
+	Generation {
+		/// Current active manager generation.
+		expected: u64,
+		/// Submitted manager generation.
+		actual:   u64,
+	},
+	/// An availability mutation named a leaf not owned by this live owner.
+	#[error("dynamic leaf availability named unknown leaf {0}")]
+	UnknownName(Str),
+	/// One availability batch repeated a canonical leaf name.
+	#[error("dynamic leaf availability contains a duplicate canonical name")]
+	DuplicateAvailability,
+	/// A reachable leaf cannot retain an unavailable reason.
+	#[error("mounted dynamic leaf cannot carry an unavailable reason")]
+	MountedWithReason,
 }
 
 struct LeafCatalogState<T> {
-	epoch:      u64,
-	fences:     BTreeMap<LeafOwner, LeafVersion>,
-	live:       BTreeMap<(LeafOwner, Str), RegistryLeaf<T>>,
-	historical: BTreeMap<(LeafOwner, Str, Rev), Arc<T>>,
+	epoch:        u64,
+	fences:       BTreeMap<LeafOwner, LeafVersion>,
+	live:         BTreeMap<(LeafOwner, Str), RegistryLeaf<T>>,
+	availability: BTreeMap<(LeafOwner, Str), (bool, Option<Str>)>,
+	historical:   BTreeMap<(LeafOwner, Str, Rev), Arc<T>>,
 }
 
 impl<T> Default for LeafCatalogState<T> {
 	fn default() -> Self {
 		Self {
-			epoch:      0,
-			fences:     BTreeMap::new(),
-			live:       BTreeMap::new(),
-			historical: BTreeMap::new(),
+			epoch:        0,
+			fences:       BTreeMap::new(),
+			live:         BTreeMap::new(),
+			availability: BTreeMap::new(),
+			historical:   BTreeMap::new(),
 		}
 	}
 }
@@ -477,7 +503,14 @@ impl<T> LeafReplacementRegistry<T> {
 		}
 
 		state.live.retain(|(leaf_owner, _), _| leaf_owner != &owner);
+		state.availability.retain(|(leaf_owner, name), _| {
+			leaf_owner != &owner || leaves.iter().any(|leaf| &leaf.name == name)
+		});
 		for leaf in leaves {
+			state
+				.availability
+				.entry((owner.clone(), leaf.name.clone()))
+				.or_insert((true, None));
 			state
 				.historical
 				.insert((owner.clone(), leaf.name.clone(), leaf.rev.clone()), Arc::clone(&leaf.value));
@@ -496,11 +529,19 @@ impl<T> LeafReplacementRegistry<T> {
 			.live
 			.iter()
 			.map(|((owner, _), leaf)| PublishedLeaf {
-				owner: owner.clone(),
-				name:  leaf.name.clone(),
-				rev:   leaf.rev.clone(),
-				code:  leaf.code,
-				value: Arc::clone(&leaf.value),
+				owner:   owner.clone(),
+				name:    leaf.name.clone(),
+				rev:     leaf.rev.clone(),
+				code:    leaf.code,
+				mounted: state
+					.availability
+					.get(&(owner.clone(), leaf.name.clone()))
+					.is_some_and(|(mounted, _)| *mounted),
+				reason:  state
+					.availability
+					.get(&(owner.clone(), leaf.name.clone()))
+					.and_then(|(_, reason)| reason.clone()),
+				value:   Arc::clone(&leaf.value),
 			})
 			.collect::<Vec<_>>();
 		leaves.sort_by(|left, right| {
@@ -516,6 +557,130 @@ impl<T> LeafReplacementRegistry<T> {
 	/// Returns the current published catalog epoch.
 	pub fn epoch(&self) -> u64 {
 		self.state.read().epoch
+	}
+
+	/// Applies one atomic availability batch for an exact owner generation.
+	///
+	/// Registration and availability are deliberately independent: replacing
+	/// definitions retains reachability for unchanged names, while this method
+	/// never creates, replaces, or removes an implementation binding.
+	pub fn set_availability(
+		&self,
+		owner: &LeafOwner,
+		manager_generation: u64,
+		deltas: &[AvailabilityDelta],
+	) -> Result<u64, LeafReplacementError> {
+		let mut names = BTreeSet::new();
+		for delta in deltas {
+			if !names.insert(delta.name.clone()) {
+				return Err(LeafReplacementError::DuplicateAvailability);
+			}
+			if delta.mounted && delta.reason.is_some() {
+				return Err(LeafReplacementError::MountedWithReason);
+			}
+		}
+		let mut state = self.state.write();
+		let expected = state
+			.fences
+			.get(owner)
+			.map_or(manager_generation, |version| version.manager_generation);
+		if expected != manager_generation {
+			return Err(LeafReplacementError::Generation { expected, actual: manager_generation });
+		}
+		for delta in deltas {
+			if !state
+				.live
+				.contains_key(&(owner.clone(), delta.name.clone()))
+			{
+				return Err(LeafReplacementError::UnknownName(delta.name.clone()));
+			}
+		}
+		let mut changed = false;
+		for delta in deltas {
+			let next = (delta.mounted, delta.reason.clone());
+			let current = state
+				.availability
+				.get_mut(&(owner.clone(), delta.name.clone()))
+				.expect("validated live leaf has availability state");
+			if *current != next {
+				*current = next;
+				changed = true;
+			}
+		}
+		if changed {
+			state.epoch = state.epoch.saturating_add(1);
+		}
+		Ok(state.epoch)
+	}
+
+	/// Resolves one current mounted binding for an exact authenticated owner.
+	pub fn resolve(&self, owner: &LeafOwner, name: &str) -> Option<PublishedLeaf<T>> {
+		let state = self.state.read();
+		let key = (owner.clone(), Str::new(name));
+		let leaf = state.live.get(&key)?;
+		let (mounted, _) = state.availability.get(&key)?;
+		if !mounted {
+			return None;
+		}
+		Some(PublishedLeaf {
+			owner:   owner.clone(),
+			name:    leaf.name.clone(),
+			rev:     leaf.rev.clone(),
+			code:    leaf.code,
+			mounted: true,
+			reason:  None,
+			value:   Arc::clone(&leaf.value),
+		})
+	}
+
+	/// Applies one atomic cross-owner availability transition for an exact
+	/// manager generation and publishes at most one catalog epoch.
+	pub fn set_availability_many(
+		&self,
+		manager_generation: u64,
+		deltas: &[(LeafOwner, AvailabilityDelta)],
+	) -> Result<u64, LeafReplacementError> {
+		let mut keys = BTreeSet::new();
+		for (owner, delta) in deltas {
+			if !keys.insert((owner.clone(), delta.name.clone())) {
+				return Err(LeafReplacementError::DuplicateAvailability);
+			}
+			if delta.mounted && delta.reason.is_some() {
+				return Err(LeafReplacementError::MountedWithReason);
+			}
+		}
+		let mut state = self.state.write();
+		for (owner, delta) in deltas {
+			let expected = state
+				.fences
+				.get(owner)
+				.map_or(manager_generation, |version| version.manager_generation);
+			if expected != manager_generation {
+				return Err(LeafReplacementError::Generation { expected, actual: manager_generation });
+			}
+			if !state
+				.live
+				.contains_key(&(owner.clone(), delta.name.clone()))
+			{
+				return Err(LeafReplacementError::UnknownName(delta.name.clone()));
+			}
+		}
+		let mut changed = false;
+		for (owner, delta) in deltas {
+			let next = (delta.mounted, delta.reason.clone());
+			let current = state
+				.availability
+				.get_mut(&(owner.clone(), delta.name.clone()))
+				.expect("validated live leaf has availability state");
+			if *current != next {
+				*current = next;
+				changed = true;
+			}
+		}
+		if changed {
+			state.epoch = state.epoch.saturating_add(1);
+		}
+		Ok(state.epoch)
 	}
 
 	/// Resolves a retained historical owner/name/revision implementation.

@@ -1,5 +1,6 @@
 use std::{
 	collections::HashMap,
+	io,
 	path::Path,
 	sync::{
 		Arc, LazyLock, Weak,
@@ -8,8 +9,12 @@ use std::{
 };
 
 use bytes::Bytes;
+#[cfg(unix)]
+use bytes::BytesMut;
 use flume::{Receiver, Sender};
 use omp_core::{EnvPath, Hash32, Str, sf};
+#[cfg(unix)]
+use omp_proto::prost::Message as _;
 use omp_proto::{
 	blob::v1::{
 		Chunk, DeleteRequest, DeleteResponse, GetRequest, PutResponse, StatRequest, StatResponse,
@@ -24,21 +29,28 @@ use omp_proto::{
 	env::v1::{
 		self as env_wire, Admission, AdmitInvocation, ArgText, ArgsCommitted, AttachOutput,
 		BlobGetComplete, CancelRequest, ClientFrame, ClientHello, CloseSessionRequest,
-		CloseSessionResponse, CommitBlobPut, CreateWorktree, DataEvent, DataRequest, DataResponse,
-		DestroyWorktree, EventStreamError, EventStreamKind, ExecRequest, ExecStarted, ExitEvent,
+		CloseSessionResponse, CommitBlobPut, CreateWorktree, CurrentWorktree, CurrentWorktreeResult,
+		DataEvent, DataRequest, DataResponse, DestroyWorktree, DetachExec, EventStreamError,
+		EventStreamKind, ExecRequest, ExecStarted, ExitEvent, GetProcess, HttpRequest, HttpResponse,
 		Interrupt, InvocationScope, InvokeAccepted, InvokeTool, ListProcesses, MaterializeSite,
 		MergeWorktree, OpenSessionRequest, OpenSessionResponse, OutputAttached, OutputFrame,
-		PresenceRegistered, PresenceReleased, ProcessCommandAccepted, ProcessList, ProcessOutput,
-		ProcessStarted, ProcessStateEvent, ProtocolError, ProtocolErrorCode, RegisterPresence,
-		ReleasePresence, Retire, SearchComplete, SearchMatchMsg, SearchRequest, SendInput,
-		ServerFrame, ServerHello, SignalProcess, SignalRequest, SiteMaterialized, StartProcess,
-		StdinFrame, StopProcess, Update, Verdict, WalkComplete, WalkEntry, WalkRequest,
-		WorktreeResult, cancel_request, client_frame, data_event, data_request, data_response,
-		document_op, document_result, server_frame, worktree_op,
+		PresenceRegistered, PresenceReleased, ProcessCommandAccepted, ProcessInfo, ProcessList,
+		ProcessOutput, ProcessStarted, ProcessStateEvent, ProtocolError, ProtocolErrorCode,
+		RegisterPresence, ReleasePresence, RestartProcess, Retire, SearchComplete, SearchMatchMsg,
+		SearchRequest, SendInput, ServerFrame, ServerHello, SignalProcess, SignalRequest,
+		SiteMaterialized, StartProcess, StdinFrame, StopProcess, Update, Verdict, WalkComplete,
+		WalkEntry, WalkRequest, WorktreeResult, cancel_request, client_frame, data_event,
+		data_request, data_response, document_op, document_result, server_frame, worktree_op,
 	},
 };
 use parking_lot::Mutex;
 use thiserror::Error;
+#[cfg(unix)]
+use tokio::{
+	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+	net::UnixStream,
+	task::AbortHandle,
+};
 use url::Url;
 
 use crate::{admit::Admitter, guard::RunGuard};
@@ -64,6 +76,9 @@ pub enum ClientError {
 	/// The worker-scoped surface excludes this operation family.
 	#[error("operation is unavailable on an invocation-scoped environment client")]
 	ScopedOperationDenied,
+	/// A UDS connection or framed transport could not be established.
+	#[error("environment transport error: {0}")]
+	Transport(#[from] io::Error),
 	/// A typed environment path could not be resolved to a valid file URI.
 	#[error("invalid environment path URI: {0}")]
 	InvalidEnvPath(Str),
@@ -394,15 +409,16 @@ impl ActiveExecControl {
 	}
 }
 struct ClientInner {
-	outgoing:     Sender<ClientFrame>,
-	pending:      Mutex<HashMap<u64, Sender<ServerFrame>>>,
-	hello_waiter: Mutex<Option<Sender<ServerFrame>>>,
-	info:         Mutex<Option<ServerHello>>,
-	events:       Receiver<ServerFrame>,
-	next_id:      AtomicU64,
-	cancel:       Sender<u64>,
-	lease_close:  Sender<LeaseClose>,
-	admitter:     Mutex<Option<Arc<dyn AdmissionDispatcher>>>,
+	outgoing:       Sender<ClientFrame>,
+	pending:        Mutex<HashMap<u64, Sender<ServerFrame>>>,
+	request_scopes: Mutex<HashMap<u64, InvocationScope>>,
+	hello_waiter:   Mutex<Option<Sender<ServerFrame>>>,
+	info:           Mutex<Option<ServerHello>>,
+	events:         Receiver<ServerFrame>,
+	next_id:        AtomicU64,
+	cancel:         Sender<u64>,
+	lease_close:    Sender<LeaseClose>,
+	admitter:       Mutex<Option<Arc<dyn AdmissionDispatcher>>>,
 }
 
 trait AdmissionDispatcher: Send + Sync {
@@ -473,8 +489,8 @@ pub struct Invocation {
 	client: EnvClient,
 	id:     Str,
 	grant:  InvocationGrant,
-	stream: RequestStream,
 	guard:  Option<RunGuard>,
+	stream: RequestStream,
 }
 
 /// A typed event on a tool invocation stream.
@@ -495,8 +511,8 @@ pub enum InvocationEvent {
 pub struct ExecRun {
 	client: EnvClient,
 	scope:  Option<DataScope>,
-	stream: RequestStream,
 	guard:  Option<RunGuard>,
+	stream: RequestStream,
 }
 
 /// A typed event on an exec request stream.
@@ -558,6 +574,31 @@ pub struct WorkerEnvClient {
 	client:           EnvClient,
 	scope:            DataScope,
 	last_transaction: Arc<Mutex<Option<TransactionId>>>,
+}
+/// An extension-host connection permanently bound to one invocation scope.
+///
+/// Construction performs the sole connection handshake before hiding the
+/// underlying [`EnvClient`]. Every subsequently exposed operation carries the
+/// immutable scope; tool invocation, handshake, admission, shutdown, and
+/// server-retirement frames are not representable through this surface.
+#[derive(Clone, Debug)]
+pub struct ExtensionEnvClient {
+	worker:     WorkerEnvClient,
+	#[cfg(unix)]
+	_transport: Arc<ExtensionTransport>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ExtensionTransport {
+	bridge: AbortHandle,
+}
+
+#[cfg(unix)]
+impl Drop for ExtensionTransport {
+	fn drop(&mut self) {
+		self.bridge.abort();
+	}
 }
 
 /// The epoch-qualified identity of a document transaction.
@@ -730,6 +771,7 @@ impl EnvClient {
 		let inner = Arc::new(ClientInner {
 			outgoing: outgoing.clone(),
 			pending: Mutex::new(HashMap::new()),
+			request_scopes: Mutex::new(HashMap::new()),
 			hello_waiter: Mutex::new(None),
 			info: Mutex::new(None),
 			events,
@@ -740,7 +782,8 @@ impl EnvClient {
 		});
 		let router = Arc::downgrade(&inner);
 		let _ = std::thread::spawn(move || route_responses(router, incoming, events_tx));
-		let _ = std::thread::spawn(move || route_cancellations(cancellations, outgoing));
+		let canceller = Arc::downgrade(&inner);
+		let _ = std::thread::spawn(move || route_cancellations(canceller, cancellations));
 		let closer = Arc::downgrade(&inner);
 		let _ = std::thread::spawn(move || route_lease_closes(closer, lease_closes));
 		Self { inner, grant: InvocationGrant::unrestricted() }
@@ -950,6 +993,48 @@ impl EnvClient {
 		match response.body {
 			Some(data_response::Body::WorkspaceRoots(result)) => Ok(result),
 			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceRootSet" }),
+		}
+	}
+
+	/// Captures a generation-fenced workspace snapshot.
+	pub async fn snapshot_workspace(
+		&self,
+		request: env_wire::SnapshotWorkspace,
+	) -> Result<env_wire::WorkspaceSnapshot, ClientError> {
+		let result = self
+			.workspace_request(env_wire::workspace_op::Op::Snapshot(request))
+			.await?;
+		match result.result {
+			Some(env_wire::workspace_result::Result::Snapshot(snapshot)) => Ok(snapshot),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceSnapshot" }),
+		}
+	}
+
+	/// Lists retained workspace snapshots.
+	pub async fn list_workspace_snapshots(
+		&self,
+		request: env_wire::ListWorkspaceSnapshots,
+	) -> Result<env_wire::WorkspaceSnapshotList, ClientError> {
+		let result = self
+			.workspace_request(env_wire::workspace_op::Op::List(request))
+			.await?;
+		match result.result {
+			Some(env_wire::workspace_result::Result::List(list)) => Ok(list),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceSnapshotList" }),
+		}
+	}
+
+	/// Restores or dry-runs one generation-fenced workspace snapshot.
+	pub async fn restore_workspace(
+		&self,
+		request: env_wire::RestoreWorkspace,
+	) -> Result<env_wire::WorkspaceRestored, ClientError> {
+		let result = self
+			.workspace_request(env_wire::workspace_op::Op::Restore(request))
+			.await?;
+		match result.result {
+			Some(env_wire::workspace_result::Result::Restored(restored)) => Ok(restored),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceRestored" }),
 		}
 	}
 
@@ -1169,6 +1254,25 @@ impl EnvClient {
 		match response.body {
 			Some(data_response::Body::Mcp(result)) => Ok(result),
 			_ => Err(ClientError::UnexpectedResponse { expected: "McpResult" }),
+		}
+	}
+
+	async fn workspace_request(
+		&self,
+		op: env_wire::workspace_op::Op,
+	) -> Result<env_wire::WorkspaceResult, ClientError> {
+		let response = self
+			.data_request_owned(DataRequest {
+				body: Some(data_request::Body::Workspace(env_wire::WorkspaceOp {
+					op:    Some(op),
+					props: None,
+				})),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::Workspace(result)) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceResult" }),
 		}
 	}
 
@@ -1407,7 +1511,11 @@ impl EnvClient {
 	) -> Result<(RequestStream, RunGuard), ClientError> {
 		let request_id = self.allocate_request_id()?;
 		let stream = self.register(request_id);
-		let guard = RunGuard::new(request_id, self.inner.cancel.clone());
+		let cancel = scope
+			.clone()
+			.map(|scope| scoped_cancel_sender(Arc::downgrade(&self.inner), scope))
+			.unwrap_or_else(|| self.inner.cancel.clone());
+		let guard = RunGuard::new(request_id, cancel);
 		if self.send_wire(request_id, body, scope).await.is_err() {
 			stream.unregister();
 			guard.relinquish();
@@ -1439,12 +1547,23 @@ impl EnvClient {
 		body: client_frame::Body,
 		scope: Option<InvocationScope>,
 	) -> Result<(), ClientError> {
-		self
+		if let Some(scope) = scope.as_ref() {
+			self
+				.inner
+				.request_scopes
+				.lock()
+				.insert(request_id, scope.clone());
+		}
+		let result = self
 			.inner
 			.outgoing
 			.send_async(ClientFrame { request_id, body: Some(body), scope, ..ClientFrame::default() })
 			.await
-			.map_err(|_| ClientError::TransportClosed)
+			.map_err(|_| ClientError::TransportClosed);
+		if result.is_err() {
+			self.inner.request_scopes.lock().remove(&request_id);
+		}
+		result
 	}
 
 	async fn open_session_scoped(
@@ -1531,6 +1650,407 @@ impl EnvClient {
 			.next_id
 			.try_update(Ordering::Relaxed, Ordering::Relaxed, |request_id| request_id.checked_add(1))
 			.map_err(|_| ClientError::RequestIdExhausted)
+	}
+}
+
+/// Operations available to an extension host after its one-time handshake.
+impl ExtensionEnvClient {
+	/// Connects to an environment UDS, starts its framing task, completes the
+	/// handshake, and permanently installs `scope` on the returned client.
+	#[cfg(unix)]
+	pub async fn connect_uds(
+		path: impl AsRef<Path>,
+		hello: &ClientHello,
+		scope: DataScope,
+	) -> Result<Self, ClientError> {
+		let stream = UnixStream::connect(path).await?;
+		let (outgoing, requests) = flume::bounded(64);
+		let (responses, incoming) = flume::bounded(64);
+		let client = EnvClient::from_channels(outgoing, incoming);
+		let bridge = tokio::spawn(bridge_extension_frames(stream, requests, responses));
+		let transport = Arc::new(ExtensionTransport { bridge: bridge.abort_handle() });
+		client.hello(hello.clone()).await?;
+		Ok(Self { worker: client.worker_scope(scope), _transport: transport })
+	}
+
+	/// Returns the immutable invocation authority stamped on every operation.
+	pub const fn scope(&self) -> &DataScope {
+		self.worker.scope()
+	}
+
+	/// Returns the server handshake completed during construction.
+	pub fn info(&self) -> Option<ServerHello> {
+		self.worker.info()
+	}
+
+	/// Performs one extension-authorized DATA request.
+	///
+	/// Authorization remains server-owned. This broader host surface permits
+	/// DATA arms unavailable to a worker while still making non-DATA protocol
+	/// and lifecycle frames impossible to construct.
+	pub async fn request(&self, request: DataRequest) -> Result<DataResponse, ClientError> {
+		match self
+			.worker
+			.client
+			.one_shot(client_frame::Body::Data(request), Some(self.scope()))
+			.await?
+		{
+			server_frame::Body::Data(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "DataResponse" }),
+		}
+	}
+
+	/// Opens one cancellable extension-authorized DATA stream.
+	pub async fn stream(&self, request: DataRequest) -> Result<DataStream, ClientError> {
+		let stream = self
+			.worker
+			.client
+			.open(client_frame::Body::Data(request), Some(self.scope()))
+			.await?;
+		Ok(DataStream { stream })
+	}
+
+	/// Opens a connection-owned document lease.
+	pub async fn open_document(
+		&self,
+		path: &EnvPath,
+		language_id: Option<&str>,
+	) -> Result<DocumentLease, ClientError> {
+		self.worker.open_document(path, language_id).await
+	}
+
+	/// Reads a revision or selection from an owned document lease.
+	pub async fn read_document(
+		&self,
+		lease: &DocumentLease,
+		revision: Option<Revision>,
+		selection: Option<ReadSelection>,
+	) -> Result<DocumentRead, ClientError> {
+		self.worker.read_document(lease, revision, selection).await
+	}
+
+	/// Commits an idempotent document transaction.
+	pub async fn commit_transaction(
+		&self,
+		request: CommitTransactionRequest,
+	) -> Result<TransactionOutcome, ClientError> {
+		self.worker.commit_transaction(request).await
+	}
+
+	/// Subscribes to LSP bindings and registry events for a document lease.
+	pub async fn lsp_events(&self, lease: &DocumentLease) -> Result<LspEvents, ClientError> {
+		self.worker.lsp_events(lease).await
+	}
+
+	/// Starts a streaming workspace walk.
+	pub async fn walk(
+		&self,
+		root: &EnvPath,
+		request: WalkRequest,
+	) -> Result<WalkStream, ClientError> {
+		self.worker.walk(root, request).await
+	}
+
+	/// Starts a streaming workspace search.
+	pub async fn search(
+		&self,
+		root: &EnvPath,
+		request: SearchRequest,
+	) -> Result<SearchStream, ClientError> {
+		self.worker.search(root, request).await
+	}
+
+	/// Resolves the primary worktree for this scoped extension invocation.
+	pub async fn current_worktree(
+		&self,
+		request: CurrentWorktree,
+	) -> Result<CurrentWorktreeResult, ClientError> {
+		let response = self
+			.request(DataRequest {
+				body: Some(data_request::Body::Worktree(env_wire::WorktreeOp {
+					op: Some(worktree_op::Op::Current(request)),
+					..Default::default()
+				})),
+				..Default::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::Worktree(result)) => result
+				.current
+				.ok_or(ClientError::UnexpectedResponse { expected: "CurrentWorktreeResult" }),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorktreeResult" }),
+		}
+	}
+
+	/// Captures a generation-fenced workspace snapshot.
+	pub async fn snapshot_workspace(
+		&self,
+		request: env_wire::SnapshotWorkspace,
+	) -> Result<env_wire::WorkspaceSnapshot, ClientError> {
+		let result = self
+			.extension_workspace_request(env_wire::workspace_op::Op::Snapshot(request))
+			.await?;
+		match result.result {
+			Some(env_wire::workspace_result::Result::Snapshot(snapshot)) => Ok(snapshot),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceSnapshot" }),
+		}
+	}
+
+	/// Lists retained workspace snapshots.
+	pub async fn list_workspace_snapshots(
+		&self,
+		request: env_wire::ListWorkspaceSnapshots,
+	) -> Result<env_wire::WorkspaceSnapshotList, ClientError> {
+		let result = self
+			.extension_workspace_request(env_wire::workspace_op::Op::List(request))
+			.await?;
+		match result.result {
+			Some(env_wire::workspace_result::Result::List(list)) => Ok(list),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceSnapshotList" }),
+		}
+	}
+
+	/// Restores or dry-runs one generation-fenced workspace snapshot.
+	pub async fn restore_workspace(
+		&self,
+		request: env_wire::RestoreWorkspace,
+	) -> Result<env_wire::WorkspaceRestored, ClientError> {
+		let result = self
+			.extension_workspace_request(env_wire::workspace_op::Op::Restore(request))
+			.await?;
+		match result.result {
+			Some(env_wire::workspace_result::Result::Restored(restored)) => Ok(restored),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceRestored" }),
+		}
+	}
+
+	/// Opens a scoped exec session.
+	pub async fn open_session(
+		&self,
+		cwd: &EnvPath,
+		request: OpenSessionRequest,
+	) -> Result<OpenSessionResponse, ClientError> {
+		self.worker.open_session(cwd, request).await
+	}
+
+	/// Closes a scoped exec session.
+	pub async fn close_session(
+		&self,
+		request: CloseSessionRequest,
+	) -> Result<CloseSessionResponse, ClientError> {
+		self.worker.close_session(request).await
+	}
+
+	/// Starts one guarded command in a scoped exec session.
+	pub async fn exec(&self, request: ExecRequest) -> Result<ExecRun, ClientError> {
+		self.worker.exec(request).await
+	}
+
+	/// Transfers one live scoped exec generation to a named Environment process.
+	///
+	/// The guard remains armed until the server acknowledges ownership. After
+	/// acknowledgement the correlated exec stream is finished locally without
+	/// emitting a cancellation frame.
+	pub async fn detach_exec(
+		&self,
+		run: ExecRun,
+		exec: Bytes,
+		name: String,
+	) -> Result<ProcessStarted, ClientError> {
+		let response = self
+			.request(DataRequest {
+				body:  Some(data_request::Body::DetachExec(DetachExec {
+					exec,
+					name,
+					props: Default::default(),
+				})),
+				props: Default::default(),
+			})
+			.await?;
+		let Some(data_response::Body::DetachedExec(started)) = response.body else {
+			return Err(ClientError::UnexpectedResponse { expected: "ProcessStarted" });
+		};
+		let mut stream = run.relinquish();
+		stream.finish();
+		Ok(started)
+	}
+
+	/// Starts a scoped server-owned named process.
+	pub async fn start_process(
+		&self,
+		cwd: &EnvPath,
+		mut request: StartProcess,
+	) -> Result<ProcessStarted, ClientError> {
+		request.spec.get_or_insert_default().cwd_uri = self.worker.client.path_uri(cwd)?;
+		match self
+			.worker
+			.client
+			.one_shot(client_frame::Body::StartProcess(request), Some(self.scope()))
+			.await?
+		{
+			server_frame::Body::ProcessStarted(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ProcessStarted" }),
+		}
+	}
+
+	/// Lists named processes visible to this invocation.
+	pub async fn list_processes(&self, request: ListProcesses) -> Result<ProcessList, ClientError> {
+		match self
+			.worker
+			.client
+			.one_shot(client_frame::Body::ListProcesses(request), Some(self.scope()))
+			.await?
+		{
+			server_frame::Body::ProcessList(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ProcessList" }),
+		}
+	}
+
+	/// Reads one exact named-process generation.
+	pub async fn process_info(&self, request: GetProcess) -> Result<ProcessInfo, ClientError> {
+		match self
+			.worker
+			.client
+			.one_shot(client_frame::Body::GetProcess(request), Some(self.scope()))
+			.await?
+		{
+			server_frame::Body::ProcessInfo(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ProcessInfo" }),
+		}
+	}
+
+	/// Restarts one exact named-process generation.
+	pub async fn restart_process(
+		&self,
+		request: RestartProcess,
+	) -> Result<ProcessStarted, ClientError> {
+		match self
+			.worker
+			.client
+			.one_shot(client_frame::Body::RestartProcess(request), Some(self.scope()))
+			.await?
+		{
+			server_frame::Body::ProcessRestarted(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ProcessStarted" }),
+		}
+	}
+
+	/// Attaches to ordered output and state events for a named process.
+	pub async fn attach_output(
+		&self,
+		request: AttachOutput,
+	) -> Result<ProcessAttachment, ClientError> {
+		let stream = self
+			.worker
+			.client
+			.open(client_frame::Body::AttachOutput(request), Some(self.scope()))
+			.await?;
+		Ok(ProcessAttachment { stream })
+	}
+
+	/// Sends bytes or EOF to a named-process generation.
+	pub async fn send_process_input(
+		&self,
+		request: SendInput,
+	) -> Result<ProcessCommandAccepted, ClientError> {
+		self
+			.process_command(client_frame::Body::SendInput(request))
+			.await
+	}
+
+	/// Sends a signal to a named-process generation.
+	pub async fn signal_process(
+		&self,
+		request: SignalProcess,
+	) -> Result<ProcessCommandAccepted, ClientError> {
+		self
+			.process_command(client_frame::Body::SignalProcess(request))
+			.await
+	}
+
+	/// Stops a named-process generation.
+	pub async fn stop_process(
+		&self,
+		request: StopProcess,
+	) -> Result<ProcessCommandAccepted, ClientError> {
+		self
+			.process_command(client_frame::Body::StopProcess(request))
+			.await
+	}
+
+	/// Checks whether a scoped content-addressed blob is present.
+	pub async fn blob_stat(&self, request: StatRequest) -> Result<StatResponse, ClientError> {
+		self.worker.blob_stat(request).await
+	}
+
+	/// Starts a scoped streaming blob download.
+	pub async fn blob_get(&self, request: GetRequest) -> Result<BlobDownload, ClientError> {
+		self.worker.blob_get(request).await
+	}
+
+	/// Starts a scoped streaming blob upload.
+	pub fn blob_put(&self) -> Result<BlobUpload, ClientError> {
+		self.worker.blob_put()
+	}
+
+	/// Deletes one scoped content-addressed blob.
+	pub async fn blob_delete(&self, request: DeleteRequest) -> Result<DeleteResponse, ClientError> {
+		match self
+			.worker
+			.client
+			.one_shot(client_frame::Body::BlobDelete(request), Some(self.scope()))
+			.await?
+		{
+			server_frame::Body::BlobDeleted(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "DeleteResponse" }),
+		}
+	}
+
+	/// Performs one scoped HTTP request through the environment authority.
+	pub async fn http(&self, request: HttpRequest) -> Result<HttpResponse, ClientError> {
+		match self
+			.worker
+			.client
+			.one_shot(client_frame::Body::HttpRequest(request), Some(self.scope()))
+			.await?
+		{
+			server_frame::Body::HttpResponse(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "HttpResponse" }),
+		}
+	}
+
+	async fn process_command(
+		&self,
+		body: client_frame::Body,
+	) -> Result<ProcessCommandAccepted, ClientError> {
+		match self
+			.worker
+			.client
+			.one_shot(body, Some(self.scope()))
+			.await?
+		{
+			server_frame::Body::ProcessCommandAccepted(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ProcessCommandAccepted" }),
+		}
+	}
+
+	async fn extension_workspace_request(
+		&self,
+		op: env_wire::workspace_op::Op,
+	) -> Result<env_wire::WorkspaceResult, ClientError> {
+		let response = self
+			.request(DataRequest {
+				body: Some(data_request::Body::Workspace(env_wire::WorkspaceOp {
+					op:    Some(op),
+					props: None,
+				})),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::Workspace(result)) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceResult" }),
+		}
 	}
 }
 
@@ -2179,7 +2699,16 @@ impl RequestStream {
 	/// own an ordinary long-lived request can cancel it explicitly here.
 	pub fn cancel(mut self) {
 		if let Some(client) = self.client.upgrade() {
-			let _ = client.cancel.try_send(self.request_id);
+			let scope = client.request_scopes.lock().get(&self.request_id).cloned();
+			let _ = client.outgoing.try_send(ClientFrame {
+				request_id: 0,
+				body: Some(client_frame::Body::Cancel(CancelRequest {
+					target: Some(cancel_request::Target::TargetRequestId(self.request_id)),
+					..CancelRequest::default()
+				})),
+				scope,
+				..ClientFrame::default()
+			});
 		}
 		self.finish();
 	}
@@ -2191,7 +2720,7 @@ impl RequestStream {
 
 	fn unregister(&self) {
 		if let Some(client) = self.client.upgrade() {
-			client.pending.lock().remove(&self.request_id);
+			client.request_scopes.lock().remove(&self.request_id);
 		}
 	}
 }
@@ -2995,20 +3524,47 @@ fn route_responses(
 	}
 }
 
-fn route_cancellations(cancellations: Receiver<u64>, outgoing: Sender<ClientFrame>) {
+fn route_cancellations(client: Weak<ClientInner>, cancellations: Receiver<u64>) {
 	while let Ok(request_id) = cancellations.recv() {
+		let Some(client) = client.upgrade() else {
+			break;
+		};
 		let frame = ClientFrame {
 			request_id: 0,
 			body: Some(client_frame::Body::Cancel(CancelRequest {
 				target: Some(cancel_request::Target::TargetRequestId(request_id)),
 				..CancelRequest::default()
 			})),
+			scope: client.request_scopes.lock().get(&request_id).cloned(),
 			..ClientFrame::default()
 		};
-		if outgoing.send(frame).is_err() {
+		if client.outgoing.send(frame).is_err() {
 			break;
 		}
 	}
+}
+fn scoped_cancel_sender(client: Weak<ClientInner>, scope: InvocationScope) -> Sender<u64> {
+	let (sender, cancellations) = flume::unbounded();
+	let _ = std::thread::spawn(move || {
+		while let Ok(request_id) = cancellations.recv() {
+			let Some(client) = client.upgrade() else {
+				break;
+			};
+			let frame = ClientFrame {
+				request_id: 0,
+				body: Some(client_frame::Body::Cancel(CancelRequest {
+					target: Some(cancel_request::Target::TargetRequestId(request_id)),
+					..CancelRequest::default()
+				})),
+				scope: Some(scope.clone()),
+				..ClientFrame::default()
+			};
+			if client.outgoing.send(frame).is_err() {
+				break;
+			}
+		}
+	});
+	sender
 }
 
 fn route_lease_closes(client: Weak<ClientInner>, closes: Receiver<LeaseClose>) {
@@ -3038,4 +3594,84 @@ fn route_lease_closes(client: Weak<ClientInner>, closes: Receiver<LeaseClose>) {
 			break;
 		}
 	}
+}
+#[cfg(unix)]
+const EXTENSION_FRAME_LIMIT: usize = 64 * 1024 * 1024;
+
+#[cfg(unix)]
+async fn bridge_extension_frames<S>(
+	stream: S,
+	requests: Receiver<ClientFrame>,
+	responses: Sender<ServerFrame>,
+) -> io::Result<()>
+where
+	S: AsyncRead + AsyncWrite + Unpin,
+{
+	let (mut reader, mut writer) = tokio::io::split(stream);
+	let write = async {
+		let mut encoded = BytesMut::new();
+		while let Ok(frame) = requests.recv_async().await {
+			if frame.encoded_len() > EXTENSION_FRAME_LIMIT {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"environment client frame exceeds limit",
+				));
+			}
+			encoded.clear();
+			frame
+				.encode_length_delimited(&mut encoded)
+				.map_err(io::Error::other)?;
+			writer.write_all(&encoded).await?;
+			writer.flush().await?;
+		}
+		Ok(())
+	};
+	let read = async {
+		let mut payload = BytesMut::new();
+		while let Some(length) = read_extension_frame_length(&mut reader).await? {
+			if length > EXTENSION_FRAME_LIMIT {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"environment server frame exceeds limit",
+				));
+			}
+			payload.resize(length, 0);
+			reader.read_exact(&mut payload).await?;
+			let frame = ServerFrame::decode(&payload[..]).map_err(io::Error::other)?;
+			if responses.send_async(frame).await.is_err() {
+				return Ok(());
+			}
+		}
+		Ok(())
+	};
+	tokio::select! {
+		result = write => result,
+		result = read => result,
+	}
+}
+
+#[cfg(unix)]
+async fn read_extension_frame_length<R: AsyncRead + Unpin>(
+	reader: &mut R,
+) -> io::Result<Option<usize>> {
+	let mut value = 0_u64;
+	for shift in (0..70).step_by(7) {
+		let byte = match reader.read_u8().await {
+			Ok(byte) => byte,
+			Err(error) if error.kind() == io::ErrorKind::UnexpectedEof && shift == 0 => {
+				return Ok(None);
+			},
+			Err(error) => return Err(error),
+		};
+		if shift == 63 && byte > 1 {
+			return Err(io::Error::new(io::ErrorKind::InvalidData, "frame length overflow"));
+		}
+		value |= u64::from(byte & 0x7f) << shift;
+		if byte & 0x80 == 0 {
+			return usize::try_from(value)
+				.map(Some)
+				.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame length overflow"));
+		}
+	}
+	Err(io::Error::new(io::ErrorKind::InvalidData, "invalid frame length"))
 }

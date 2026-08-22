@@ -6,9 +6,11 @@
 //! behind the environment service in both in-process and remote deployments.
 
 mod admit;
+pub mod build_id;
 mod bundle;
 mod client;
 mod guard;
+pub mod project_state;
 #[cfg(windows)]
 pub mod windows;
 
@@ -20,12 +22,20 @@ pub use bundle::{
 pub use client::{
 	ActiveExecControl, BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, DapStream,
 	DapStreamEvent, DataScope, DataStream, DataStreamItem, DocumentEvents, DocumentLease,
-	DocumentRead, EnvClient, ExecEvent, ExecRun, InProcessEnvTransport, Invocation, InvocationEvent,
-	InvocationGrant, LspEvents, LspStreamEvent, McpSubscription, McpSubscriptionEvent,
-	ProcessAttachment, ProcessAttachmentEvent, RequestStream, ResourceCompletionEvent,
-	ResourceCompletionStream, SearchEvent, SearchStream, StreamLost, TransactionId,
-	TransactionOutcome, WalkEvent, WalkStream, WorkerEnvClient,
+	DocumentRead, EnvClient, ExecEvent, ExecRun, ExtensionEnvClient, InProcessEnvTransport,
+	Invocation, InvocationEvent, InvocationGrant, LspEvents, LspStreamEvent, McpSubscription,
+	McpSubscriptionEvent, ProcessAttachment, ProcessAttachmentEvent, RequestStream,
+	ResourceCompletionEvent, ResourceCompletionStream, SearchEvent, SearchStream, StreamLost,
+	TransactionId, TransactionOutcome, WalkEvent, WalkStream, WorkerEnvClient,
 };
 pub use guard::{RunGuard, WorkerLease};
+/// Generated blob protocol messages accepted by scoped blob operations.
+pub use omp_proto::blob::v1 as blob_frame;
+/// Generated document protocol messages accepted by DATA document operations.
+pub use omp_proto::document::v1 as document_frame;
 /// Generated `omp.env.v1` wire frames used at transport boundaries.
 pub use omp_proto::env::v1 as frame;
+/// Protobuf codec trait used by UDS framing consumers.
+pub use omp_proto::prost;
+/// Wire schema revision required by extension-host requests.
+pub const SCHEMA_REV: u32 = omp_proto::SCHEMA_REV;

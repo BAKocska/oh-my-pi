@@ -18,8 +18,8 @@ bytes = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
 omp-core = { workspace = true }
-omp-llm-catalog = { workspace = true }
-omp-llm-inference = { workspace = true }
+omp-catalog = { workspace = true }
+omp-inference = { workspace = true }
 omp-slopjson = { workspace = true }
 parking_lot = { workspace = true }
 omp-proto = { workspace = true }
