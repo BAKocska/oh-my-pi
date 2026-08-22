@@ -7,6 +7,7 @@ use candle_nn::{self as nn, VarBuilder};
 
 use crate::{
 	albert::CustomAlbert,
+	catalog::{ModelRegistration, REGISTRATION},
 	config::ModelConfig,
 	istftnet::{Decoder, SynthesisMode},
 	modules::{ProsodyPredictor, TextEncoder},
@@ -23,6 +24,11 @@ pub struct KModel {
 }
 
 impl KModel {
+	/// Returns the stable model/voice registration implemented by this engine.
+	pub const fn registration() -> &'static ModelRegistration {
+		&REGISTRATION
+	}
+
 	/// Load model weights from a `VarBuilder` (typically backed by safetensors).
 	pub fn load(config: &ModelConfig, vb: VarBuilder) -> Result<Self> {
 		let bert = CustomAlbert::load(&config.plbert, config.n_token, vb.pp("bert"))?;

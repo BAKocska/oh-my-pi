@@ -15,6 +15,8 @@ use thiserror::Error;
 pub mod audio;
 pub mod coordinator;
 mod device;
+#[cfg(feature = "realtime-media")]
+pub mod live;
 
 /// Direction of a native audio device operation.
 #[derive(Clone, Copy, Debug, Display, Eq, IntoStaticStr, PartialEq)]
@@ -64,6 +66,20 @@ pub enum VoiceError {
 		#[source]
 		source: Arc<io::Error>,
 	},
+	/// The realtime media peer failed to initialize or process media.
+	#[error("realtime voice transport failed: {source}")]
+	RealtimeTransport {
+		/// Typed transport diagnostic.
+		#[source]
+		source: Arc<io::Error>,
+	},
+	/// Live voice could not acquire the shared microphone/TTS authority.
+	#[error(transparent)]
+	Coordinator {
+		/// Typed ownership-policy failure.
+		#[from]
+		source: coordinator::CoordinatorError,
+	},
 }
 
 impl VoiceError {
@@ -71,6 +87,12 @@ impl VoiceError {
 
 	pub(crate) fn backend(message: String) -> Self {
 		Self::Backend { source: Arc::new(io::Error::other(message)) }
+	}
+}
+#[cfg(feature = "realtime-media")]
+impl From<String> for VoiceError {
+	fn from(message: String) -> Self {
+		Self::RealtimeTransport { source: Arc::new(io::Error::other(message)) }
 	}
 }
 

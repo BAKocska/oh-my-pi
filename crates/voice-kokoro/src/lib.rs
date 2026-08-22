@@ -16,6 +16,8 @@
 pub mod albert;
 /// Bidirectional LSTM layers used by the duration predictor.
 pub mod bilstm;
+/// Stable Kokoro-82M model and voice registration.
+pub mod catalog;
 /// Model configuration deserialized from Kokoro checkpoint metadata.
 pub mod config;
 pub mod istftnet;

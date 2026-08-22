@@ -15,12 +15,13 @@ readme = "README.md"
 [features]
 default = ["native-audio"]
 native-audio = ["dep:libc", "dep:windows-sys"]
-realtime-media = ["dep:audiopus_sys", "dep:opus", "dep:webrtc"]
+realtime-media = ["dep:audiopus_sys", "dep:bytes",  "dep:opus", "dep:webrtc"]
 
 [lints]
 workspace = true
 
 [dependencies]
+bytes = { workspace = true, optional = true }
 flume.workspace = true
 parking_lot.workspace = true
 strum.workspace = true
