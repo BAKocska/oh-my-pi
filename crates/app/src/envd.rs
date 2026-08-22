@@ -732,6 +732,13 @@ impl ProjectEnvironment {
 	pub(crate) fn bind_acp_documents(&self, backend: Option<Arc<dyn docs::AcpDocumentBackend>>) {
 		self.lifecycle.server.bind_acp_documents(backend);
 	}
+	/// Replaces the ask presenter for this environment composition.
+	pub(crate) fn bind_ask_presenter(
+		&self,
+		presenter: Arc<dyn omp_tools::ask::AskPresenter>,
+	) {
+		self.lifecycle.server.bind_ask_presenter(presenter);
+	}
 
 	/// Binds or clears the durable approval authority for Environment
 	/// fallbacks.

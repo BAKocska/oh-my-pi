@@ -279,10 +279,15 @@ impl McpOAuth {
 			client_name: "OMP MCP client",
 		})
 		.await?;
-		let mut scopes = protected.map_or_else(Vec::new, |metadata| metadata.scopes.into_vec());
-		scopes.extend(attempt.challenge.scopes.iter().cloned());
-		scopes.sort_unstable();
-		scopes.dedup();
+		let scopes = preferred_authorization_scopes(
+			protected
+				.as_ref()
+				.map_or(&[][..], |metadata| metadata.scopes.as_ref()),
+			attempt.challenge.scopes.as_ref(),
+			discovered
+				.as_ref()
+				.map_or(&[][..], |metadata| metadata.scopes_supported.as_ref()),
+		);
 		let resource = configured_auth
 			.and_then(|auth| auth.resource.as_deref())
 			.or(attempt.challenge.resource.as_deref());
@@ -484,6 +489,25 @@ pub enum OAuthFlowError {
 	#[error(transparent)]
 	CredentialApply(#[from] omp_llm_inference::auth::CredentialApplyError),
 }
+fn preferred_authorization_scopes(
+	protected: &[Str],
+	challenge: &[Str],
+	authorization_server: &[Str],
+) -> Vec<Str> {
+	// Resource and RFC 6750 challenge scopes describe this grant; the
+	// authorization-server list is only a broad fallback catalogue.
+	let source = if !protected.is_empty() {
+		protected
+	} else if !challenge.is_empty() {
+		challenge
+	} else {
+		authorization_server
+	};
+	let mut scopes = source.to_vec();
+	scopes.sort_unstable();
+	scopes.dedup();
+	scopes
+}
 
 impl OAuthFlowError {
 	/// Classifies whether retained refresh material remains eligible for retry.
@@ -517,5 +541,41 @@ impl OAuthFlowError {
 			| Self::Credential(_)
 			| Self::CredentialApply(_) => OAuthFailureClass::Transient,
 		}
+	}
+}
+#[cfg(test)]
+mod tests {
+	use omp_core::Str;
+
+	use super::preferred_authorization_scopes;
+
+	#[test]
+	fn protected_and_challenge_scopes_precede_authorization_server_catalogue() {
+		let protected = [Str::from("offline_access"), Str::from("genie")];
+		let challenge = [Str::from("challenge.read")];
+		let catalogue = [
+			Str::from("email"),
+			Str::from("openid"),
+			Str::from("profile"),
+			Str::from("workspace"),
+		];
+
+		assert_eq!(
+			preferred_authorization_scopes(&protected, &challenge, &catalogue),
+			vec![Str::from("genie"), Str::from("offline_access")],
+		);
+		assert_eq!(
+			preferred_authorization_scopes(&[], &challenge, &catalogue),
+			vec![Str::from("challenge.read")],
+		);
+		assert_eq!(
+			preferred_authorization_scopes(&[], &[], &catalogue),
+			vec![
+				Str::from("email"),
+				Str::from("openid"),
+				Str::from("profile"),
+				Str::from("workspace"),
+			],
+		);
 	}
 }

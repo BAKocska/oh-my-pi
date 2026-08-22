@@ -4,15 +4,19 @@
 use std::ffi::CString;
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
+	ffi::OsString,
 	fs::{self, File},
 	io::{self, Cursor, Read, Write},
 	ops::ControlFlow,
 	path::{Component, Path, PathBuf},
+	process::Command,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
 };
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt as _;
 #[cfg(target_os = "linux")]
 use std::{fs::OpenOptions, os::fd::AsRawFd as _};
 
@@ -38,6 +42,52 @@ const MANIFEST_MAGIC: &[u8; 7] = b"OMPWS2\0";
 const DIFF_MAGIC: &[u8; 8] = b"OMPWSD1\0";
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum untracked content admitted before an isolation baseline snapshot.
+pub const ISOLATION_BASELINE_MAX_UNTRACKED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Typed refusal for an isolation baseline whose untracked content is too large.
+#[derive(Debug, Error)]
+#[error(
+	"working tree at {root:?} carries {content_bytes} bytes of untracked content, over the \
+	 {limit_bytes}-byte isolation snapshot budget; commit or gitignore the bulk, or set \
+	 `task.isolation.mode: none`"
+)]
+pub struct IsolationBaselineTooLargeError {
+	/// Repository whose isolation baseline was refused.
+	pub root:          PathBuf,
+	/// Untracked bytes observed through link-preserving metadata.
+	pub content_bytes: u64,
+	/// Configured hard ceiling.
+	pub limit_bytes:   u64,
+}
+
+/// Failure while sizing untracked content ahead of an isolation snapshot.
+#[derive(Debug, Error)]
+pub enum IsolationBaselinePreflightError {
+	/// Git could not be started.
+	#[error("could not enumerate untracked files with git")]
+	GitIo(#[source] io::Error),
+	/// Git rejected the untracked-file query.
+	#[error("git untracked-file query exited with {code:?}: {stderr}")]
+	GitExit {
+		/// Process exit code, absent when terminated by signal.
+		code:   Option<i32>,
+		/// Bounded command diagnostic.
+		stderr: Str,
+	},
+	/// Git emitted a path which cannot be represented on this platform.
+	#[error("git emitted an unrepresentable untracked path")]
+	UnrepresentablePath,
+	/// Link-preserving metadata failed for one untracked entry.
+	#[error("could not size untracked entry {path:?}")]
+	Metadata {
+		/// Entry which could not be sized.
+		path: PathBuf,
+		/// Filesystem failure.
+		#[source]
+		source: io::Error,
+	},
+}
 
 /// Snapshot, restore, or isolated-worktree failure.
 #[derive(Debug, Error)]
@@ -69,6 +119,12 @@ pub enum WorkspaceOperationError {
 	/// A worktree registry record was malformed.
 	#[error("invalid worktree registry record: {0}")]
 	InvalidWorktreeRecord(Str),
+	/// Isolation baseline sizing failed before snapshot capture.
+	#[error(transparent)]
+	IsolationPreflight(#[from] IsolationBaselinePreflightError),
+	/// Untracked content exceeded the isolation snapshot budget.
+	#[error(transparent)]
+	IsolationBaselineTooLarge(#[from] IsolationBaselineTooLargeError),
 }
 
 /// Result of merging an isolated worktree without invoking a VCS subprocess.
@@ -173,6 +229,102 @@ struct Manifest {
 	entries:  BTreeMap<Str, ManifestEntry>,
 }
 
+fn untracked_paths(root: &Path) -> Result<Vec<PathBuf>, IsolationBaselinePreflightError> {
+	if !root.join(".git").exists() {
+		return Ok(Vec::new());
+	}
+	let output = Command::new("git")
+		.args([
+			"--no-optional-locks",
+			"-c",
+			"core.fsmonitor=false",
+			"-c",
+			"core.untrackedCache=false",
+			"-C",
+		])
+		.arg(root)
+		.args(["ls-files", "--others", "--exclude-standard", "-z"])
+		.output()
+		.map_err(IsolationBaselinePreflightError::GitIo)?;
+	if !output.status.success() {
+		return Err(IsolationBaselinePreflightError::GitExit {
+			code:   output.status.code(),
+			stderr: bounded_command_stderr(&output.stderr),
+		});
+	}
+	output
+		.stdout
+		.split(|byte| *byte == 0)
+		.filter(|path| !path.is_empty())
+		.map(platform_path)
+		.collect()
+}
+
+fn bounded_command_stderr(bytes: &[u8]) -> Str {
+	const MAX_BYTES: usize = 4 * 1024;
+	let bytes = &bytes[..bytes.len().min(MAX_BYTES)];
+	Str::from(String::from_utf8_lossy(bytes).trim())
+}
+
+#[cfg(unix)]
+fn platform_path(bytes: &[u8]) -> Result<PathBuf, IsolationBaselinePreflightError> {
+	Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn platform_path(bytes: &[u8]) -> Result<PathBuf, IsolationBaselinePreflightError> {
+	String::from_utf8(bytes.to_vec())
+		.map(OsString::from)
+		.map(PathBuf::from)
+		.map_err(|_| IsolationBaselinePreflightError::UnrepresentablePath)
+}
+
+fn untracked_entry_bytes(path: &Path) -> Result<u64, IsolationBaselinePreflightError> {
+	let metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+		Err(source) => {
+			return Err(IsolationBaselinePreflightError::Metadata {
+				path: path.to_path_buf(),
+				source,
+			});
+		},
+	};
+	let file_type = metadata.file_type();
+	Ok(if file_type.is_file() || file_type.is_symlink() {
+		metadata.len()
+	} else {
+		0
+	})
+}
+
+fn prepare_isolation_baseline<T, I, P, S, C>(
+	root: &Path,
+	untracked: I,
+	mut size: S,
+	capture: C,
+) -> Result<T, WorkspaceOperationError>
+where
+	I: IntoIterator<Item = P>,
+	P: AsRef<Path>,
+	S: FnMut(&Path) -> Result<u64, IsolationBaselinePreflightError>,
+	C: FnOnce() -> Result<T, WorkspaceOperationError>,
+{
+	let mut content_bytes = 0_u64;
+	for relative in untracked {
+		content_bytes = content_bytes.saturating_add(size(&root.join(relative))?);
+		if content_bytes > ISOLATION_BASELINE_MAX_UNTRACKED_BYTES {
+			return Err(IsolationBaselineTooLargeError {
+				root: root.to_path_buf(),
+				content_bytes,
+				limit_bytes: ISOLATION_BASELINE_MAX_UNTRACKED_BYTES,
+			}
+			.into());
+		}
+	}
+	capture()
+}
+
 impl WorkspaceOperations {
 	/// Opens persistent workspace operations beneath an environment-private
 	/// state root.
@@ -273,7 +425,14 @@ impl WorkspaceOperations {
 		cancel: &CancellationToken,
 	) -> Result<pb::WorktreeInfo, WorkspaceOperationError> {
 		validate_worktree_name(&request.name)?;
-		let snapshot = self.snapshot_at(self.inner.workspace.root(), &request.paths, cancel)?;
+		let root = self.inner.workspace.root();
+		let untracked = untracked_paths(root)?;
+		let snapshot = prepare_isolation_baseline(
+			root,
+			untracked,
+			untracked_entry_bytes,
+			|| self.snapshot_at(root, &request.paths, cancel),
+		)?;
 		if request
 			.base
 			.as_deref()
@@ -1352,5 +1511,53 @@ fn hardlink_copy_fallback(source: &Path, destination: &Path) -> io::Result<()> {
 		fs::rename(temporary, destination)
 	} else {
 		fs::copy(source, destination).map(|_| ())
+	}
+}
+#[cfg(test)]
+mod tests {
+	use std::cell::Cell;
+
+	use super::*;
+
+	#[test]
+	fn oversized_untracked_content_is_typed_and_prevents_snapshot_capture() {
+		let captured = Cell::new(false);
+		let error = prepare_isolation_baseline(
+			Path::new("/workspace"),
+			["large.bin"],
+			|_| Ok(ISOLATION_BASELINE_MAX_UNTRACKED_BYTES + 1),
+			|| {
+				captured.set(true);
+				Ok(())
+			},
+		)
+		.expect_err("oversized baseline");
+		let WorkspaceOperationError::IsolationBaselineTooLarge(error) = error else {
+			panic!("expected typed isolation baseline budget error");
+		};
+		assert_eq!(error.content_bytes, ISOLATION_BASELINE_MAX_UNTRACKED_BYTES + 1);
+		assert!(!captured.get());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn untracked_symlink_is_sized_as_the_link_not_its_target() {
+		use std::os::unix::fs::symlink;
+
+		let tree = tempfile::tempdir().expect("tree");
+		let target = tree.path().join("target.bin");
+		File::create(&target)
+			.and_then(|file| file.set_len(ISOLATION_BASELINE_MAX_UNTRACKED_BYTES + 1))
+			.expect("sparse target");
+		let link = tree.path().join("large-link.bin");
+		symlink(&target, &link).expect("symlink");
+
+		let link_bytes = untracked_entry_bytes(&link).expect("link size");
+		assert_eq!(link_bytes, fs::symlink_metadata(&link).expect("link metadata").len());
+		assert!(link_bytes < ISOLATION_BASELINE_MAX_UNTRACKED_BYTES);
+		assert!(
+			fs::metadata(&link).expect("target metadata").len()
+				> ISOLATION_BASELINE_MAX_UNTRACKED_BYTES
+		);
 	}
 }

@@ -397,6 +397,7 @@ fn advisor_item(advice: PendingAdvice) -> Item {
 
 #[derive(Clone, Debug)]
 struct AdvisorBudgetState {
+	selectors:      Vec<Str>,
 	candidate:      usize,
 	attempts:       u32,
 	cooldown_until: Option<Instant>,
@@ -406,6 +407,7 @@ struct AdvisorBudgetState {
 /// Per-advisor retry budget manager owned by production composition.
 pub struct AdvisorRetryManager {
 	chain:              AdvisorFallbackChain,
+	owned_chains:       BTreeMap<Str, AdvisorFallbackChain>,
 	attempts_per_model: u32,
 	initial_backoff:    Duration,
 	max_backoff:        Duration,
@@ -425,6 +427,7 @@ impl AdvisorRetryManager {
 		}
 		Ok(Self {
 			chain,
+			owned_chains: BTreeMap::new(),
 			attempts_per_model,
 			initial_backoff,
 			max_backoff: max_backoff.max(initial_backoff),
@@ -432,12 +435,28 @@ impl AdvisorRetryManager {
 		})
 	}
 
+	/// Installs chains owned by selectors that can occur at the end of the
+	/// primary advisor chain.
+	///
+	/// When an advisor exhausts the pinned chain on such a selector, that
+	/// selector's own chain is appended once. Existing selectors are skipped, so
+	/// mutually-referential chains remain finite.
+	pub fn with_owned_chains(
+		mut self,
+		chains: BTreeMap<Str, AdvisorFallbackChain>,
+	) -> Self {
+		self.owned_chains = chains;
+		self
+	}
+
 	/// Selects the next permitted attempt for one stable advisor id.
 	pub fn next(&mut self, advisor_id: &str, now: Instant) -> AdvisorRetryDecision {
+		let initial = self.chain.selectors().to_vec();
 		let state = self
 			.states
 			.entry(Str::new(advisor_id))
 			.or_insert(AdvisorBudgetState {
+				selectors:      initial,
 				candidate:      0,
 				attempts:       0,
 				cooldown_until: None,
@@ -452,7 +471,7 @@ impl AdvisorRetryManager {
 			}
 			state.cooldown_until = None;
 		}
-		let Some(selector) = self.chain.selectors().get(state.candidate) else {
+		let Some(selector) = state.selectors.get(state.candidate) else {
 			return AdvisorRetryDecision::Exhausted;
 		};
 		AdvisorRetryDecision::Attempt {
@@ -468,10 +487,12 @@ impl AdvisorRetryManager {
 		class: AdvisorFailureClass,
 		now: Instant,
 	) -> AdvisorRetryDecision {
+		let initial = self.chain.selectors().to_vec();
 		let state = self
 			.states
 			.entry(Str::new(advisor_id))
 			.or_insert(AdvisorBudgetState {
+				selectors:      initial,
 				candidate:      0,
 				attempts:       0,
 				cooldown_until: None,
@@ -483,7 +504,7 @@ impl AdvisorRetryManager {
 				AdvisorRetryDecision::QuotaLatched
 			},
 			AdvisorFailureClass::Permanent => {
-				state.candidate = self.chain.selectors().len();
+				state.candidate = state.selectors.len();
 				AdvisorRetryDecision::Permanent
 			},
 			AdvisorFailureClass::Transient => {
@@ -492,7 +513,17 @@ impl AdvisorRetryManager {
 					state.candidate = state.candidate.saturating_add(1);
 					state.attempts = 0;
 				}
-				if state.candidate >= self.chain.selectors().len() {
+				if state.candidate >= state.selectors.len()
+					&& let Some(current) = state.selectors.last()
+					&& let Some(chain) = self.owned_chains.get(current)
+				{
+					for selector in chain.selectors() {
+						if !state.selectors.contains(selector) {
+							state.selectors.push(selector.clone());
+						}
+					}
+				}
+				if state.candidate >= state.selectors.len() {
 					return AdvisorRetryDecision::Exhausted;
 				}
 				let exponent = state.attempts.min(31);
@@ -562,5 +593,57 @@ mod tests {
 			campaign.react(Point::Idle, &PointCx { now_ms: 125, ..PointCx::default() }).verdicts.as_slice(),
 			[Verdict::Inject(items)] if items.len() == 1
 		));
+	}
+	#[test]
+	fn advisor_retry_reaches_chain_owned_by_last_fallback() {
+		let primary = AdvisorFallbackChain::new([
+			Str::new_static("provider/a"),
+			Str::new_static("provider/b"),
+		])
+		.expect("primary chain");
+		let owned = AdvisorFallbackChain::new([
+			Str::new_static("provider/b"),
+			Str::new_static("provider/c"),
+		])
+		.expect("fallback-owned chain");
+		let mut manager = AdvisorRetryManager::new(
+			primary,
+			1,
+			Duration::ZERO,
+			Duration::ZERO,
+		)
+		.expect("retry manager")
+		.with_owned_chains(BTreeMap::from([(Str::new_static("provider/b"), owned)]));
+		let now = Instant::now();
+
+		assert_eq!(
+			manager.next("watchdog", now),
+			AdvisorRetryDecision::Attempt {
+				selector: Str::new_static("provider/a"),
+				attempt:  1,
+			}
+		);
+		assert!(matches!(
+			manager.record_failure("watchdog", AdvisorFailureClass::Transient, now),
+			AdvisorRetryDecision::Cooldown { .. }
+		));
+		assert_eq!(
+			manager.next("watchdog", now),
+			AdvisorRetryDecision::Attempt {
+				selector: Str::new_static("provider/b"),
+				attempt:  1,
+			}
+		);
+		assert!(matches!(
+			manager.record_failure("watchdog", AdvisorFailureClass::Transient, now),
+			AdvisorRetryDecision::Cooldown { .. }
+		));
+		assert_eq!(
+			manager.next("watchdog", now),
+			AdvisorRetryDecision::Attempt {
+				selector: Str::new_static("provider/c"),
+				attempt:  1,
+			}
+		);
 	}
 }

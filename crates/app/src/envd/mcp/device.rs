@@ -3,6 +3,7 @@
 
 use bytes::Bytes;
 use omp_core::{Hash32, Str};
+use omp_secrets::replacement::bun_wyhash;
 use omp_tool::Rev;
 use serde::Serialize;
 use serde_json::Value;
@@ -110,12 +111,7 @@ fn leaf(
 		hasher.update(documentation.as_bytes());
 	}
 	Ok(McpLeafDefinition {
-		name:            Str::new(format!(
-			"mcp__{}__{}__{}",
-			safe_name(server),
-			kind,
-			safe_name(name)
-		)),
+		name:            Str::from(minted_name(server, kind, name)),
 		kind:            Str::from(kind),
 		rev:             revision.clone(),
 		code:            hasher.finalize(),
@@ -124,17 +120,53 @@ fn leaf(
 	})
 }
 
-fn safe_name(value: &str) -> String {
-	value
-		.chars()
-		.map(|character| {
-			if character.is_ascii_alphanumeric() || character == '_' {
-				character
-			} else {
-				'_'
-			}
-		})
-		.collect()
+fn push_safe_name(output: &mut String, value: &str) {
+	output.extend(value.chars().map(|character| {
+		if character.is_ascii_alphanumeric() || character == '_' {
+			character
+		} else {
+			'_'
+		}
+	}));
+}
+
+const MAX_MCP_TOOL_NAME_LENGTH: usize = 64;
+const MCP_TOOL_NAME_HASH_LENGTH: usize = 8;
+
+fn minted_name(server: &str, kind: &str, name: &str) -> String {
+	let mut full = String::with_capacity(9 + server.len() + kind.len() + name.len());
+	full.push_str("mcp__");
+	push_safe_name(&mut full, server);
+	full.push_str("__");
+	full.push_str(kind);
+	full.push_str("__");
+	push_safe_name(&mut full, name);
+	if full.len() <= MAX_MCP_TOOL_NAME_LENGTH {
+		return full;
+	}
+	let hash = bun_wyhash(full.as_bytes());
+	let mut encoded = [0_u8; 13];
+	let hash = base36(hash, &mut encoded);
+	let hash = &hash[..MCP_TOOL_NAME_HASH_LENGTH.min(hash.len())];
+	let mut capped = full;
+	capped.truncate(MAX_MCP_TOOL_NAME_LENGTH - hash.len() - 1);
+	capped.push('_');
+	capped.push_str(hash);
+	capped
+}
+
+fn base36(mut value: u64, encoded: &mut [u8; 13]) -> &str {
+	const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+	let mut cursor = encoded.len();
+	loop {
+		cursor -= 1;
+		encoded[cursor] = DIGITS[(value % 36) as usize];
+		value /= 36;
+		if value == 0 {
+			break;
+		}
+	}
+	std::str::from_utf8(&encoded[cursor..]).expect("base-36 alphabet is UTF-8")
 }
 
 /// Dynamic device projection failure.
@@ -146,4 +178,49 @@ pub enum DeviceError {
 	/// Advertised definition is missing a required stable name.
 	#[error("MCP advertised definition is malformed")]
 	MalformedDefinition,
+}
+#[cfg(test)]
+mod tests {
+	use super::minted_name;
+
+	#[test]
+	fn minted_names_cap_with_bun_hash_suffix() {
+		let first = minted_name(
+			"chrome-devtools-mcp",
+			"tool",
+			"chrome_devtools_performance_analyze_insight",
+		);
+		let repeated = minted_name(
+			"chrome-devtools-mcp",
+			"tool",
+			"chrome_devtools_performance_analyze_insight",
+		);
+		let distinct = minted_name(
+			"chrome-devtools-mcp",
+			"tool",
+			"chrome_devtools_performance_analyze_something_else_entirely",
+		);
+
+		assert_eq!(
+			first,
+			"mcp__chrome_devtools_mcp__tool__chrome_devtools_perform_wnr94qdc"
+		);
+		assert_eq!(first.len(), 64);
+		assert_eq!(first, repeated);
+		assert_ne!(first, distinct);
+		assert_eq!(distinct.len(), 64);
+		assert!(
+			first
+				.bytes()
+				.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+		);
+	}
+
+	#[test]
+	fn minted_names_within_limit_are_unchanged() {
+		assert_eq!(
+			minted_name("puppeteer", "tool", "screenshot"),
+			"mcp__puppeteer__tool__screenshot"
+		);
+	}
 }

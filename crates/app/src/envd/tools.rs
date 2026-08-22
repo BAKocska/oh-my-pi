@@ -11,6 +11,7 @@ use std::{
 };
 
 use omp_core::{Duration, Hash32, Str, sf};
+use omp_llm_catalog::{ModelKey, snapshot::Catalog};
 use omp_proto::{
 	prost::Message as _,
 	toolhost::v1::{GrammarSyntax as WorkerGrammarSyntax, ToolDecl, tool_constraint},
@@ -65,6 +66,34 @@ pub(super) fn pty_denied() -> bool {
 	PTY_DENIED.try_with(|denied| *denied).unwrap_or(false)
 }
 
+fn configured_model_edit_revision(
+	data_dir: &std::path::Path,
+	project_root: &std::path::Path,
+) -> Result<Option<Rev>, EnvdError> {
+	let manager = crate::settings::manager::SettingsManager::open(
+		crate::settings::manager::SettingsPaths::discover(data_dir, Some(project_root)),
+	)
+	.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let snapshot = manager.snapshot();
+	let settings = snapshot
+		.project::<crate::settings::Settings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let Some(selector) = settings.get().default_model.clone() else {
+		return Ok(None);
+	};
+	let catalog = Catalog::embedded();
+	let model = catalog
+		.model(ModelKey::from_ref(&selector))
+		.or_else(|| catalog.resolve_alias(&selector));
+	let Some(revision) = model.and_then(|model| model.edit_revision.as_deref()) else {
+		return Ok(None);
+	};
+	revision
+		.parse::<Rev>()
+		.map(Some)
+		.map_err(|error| EnvdError::EditDialect(error.to_string().into()))
+}
+
 /// Builds the complete registry shared by environment dispatch and the agent.
 ///
 /// Resource adapters are cloned into their typed executors. Worker declarations
@@ -104,10 +133,13 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 		AgentGoalControl,
 		Arc<SearchBridgeHost>,
 		Arc<super::github_url::GithubCredentialBridge>,
+		omp_tools::ask::PresenterSlot,
 	),
 	EnvdError,
 > {
 	let previews = omp_tools::staging::PreviewRegistry::new();
+	let ask_presenter =
+		omp_tools::ask::PresenterSlot::new(omp_chat_ui::ask::presenter());
 	registry.protect_core_claims([
 		"read",
 		"write",
@@ -288,17 +320,13 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 		ssh,
 		vault,
 	);
-	let edit_pin = tool_settings
-		.edit_dialect
-		.as_deref()
-		.map(str::parse::<Rev>)
-		.transpose()
-		.map_err(|error| EnvdError::EditDialect(error.to_string().into()))?;
 	let environment_edit_dialect = std::env::var("OMP_EDIT_DIALECT").ok();
 	let force_hashline = std::env::var_os("OMP_STRICT_EDIT_MODE").is_some();
+	let model_edit_revision = configured_model_edit_revision(state_dir, workspace.root())?;
 	let selected_edit = resolve_edit_revision(EditRevisionCandidates {
 		environment: environment_edit_dialect.as_deref(),
-		pin: edit_pin.as_ref(),
+		model_rule: model_edit_revision.as_ref(),
+		setting: tool_settings.edit_dialect.as_deref(),
 		force_hashline,
 		..EditRevisionCandidates::default()
 	})
@@ -519,7 +547,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 	if tool_settings.enabled("ask") {
 		registry.register(
 			omp_tools::ask::tool_with_vocalizer(
-				omp_chat_ui::ask::presenter(),
+				Arc::new(ask_presenter.clone()),
 				media_devices::ask_vocalizer(Arc::clone(&search_bridge)),
 			),
 			Presentation::Slot,
@@ -694,6 +722,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 		goal_control,
 		search_bridge,
 		github_credentials,
+		ask_presenter,
 	))
 }
 #[derive(Clone)]

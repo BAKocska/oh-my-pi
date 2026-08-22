@@ -62,7 +62,10 @@ pub fn translate(frame: &str, arguments: &Value) -> Result<DynDispatch, BridgeEr
 	let args = arguments
 		.as_object()
 		.ok_or_else(|| BridgeError::Invalid(sf!("arguments must be an object")))?;
-	let (device, mut translated) = match frame {
+	if let Some(replace) = cursor_replace_arguments(frame, args) {
+		return Ok(dyn_dispatch("edit", translate_edit(replace)?));
+	}
+	let (device, translated) = match frame {
 		"read" | "piRead" => ("read", translate_read(args)?),
 		"ls" | "piLs" => ("read", translate_list(args)?),
 		"grep" | "piGrep" => ("grep", translate_grep(args)?),
@@ -75,11 +78,15 @@ pub fn translate(frame: &str, arguments: &Value) -> Result<DynDispatch, BridgeEr
 		"mcp" | "piMcp" | "mcpResource" => ("mcp", Value::Object(args.clone())),
 		other => return Err(BridgeError::Unsupported(Str::from(other))),
 	};
+	Ok(dyn_dispatch(device, translated))
+}
+
+fn dyn_dispatch(device: &str, mut translated: Value) -> DynDispatch {
 	let object = translated
 		.as_object_mut()
 		.expect("translations return objects");
 	object.insert("do_".into(), Value::String(format!("invoke/{device}")));
-	Ok(DynDispatch { tool: sf!("dyn"), arguments: translated })
+	DynDispatch { tool: sf!("dyn"), arguments: translated }
 }
 
 /// Translates a frame and enforces mutation policy before returning a write
@@ -91,7 +98,10 @@ pub fn translate_checked(
 	policy: WritePolicy,
 ) -> Result<DynDispatch, BridgeError> {
 	let mut call = translate(frame, arguments)?;
-	if matches!(frame, "write" | "piWrite" | "delete" | "piEdit") {
+	if matches!(
+		call.arguments.get("do_").and_then(Value::as_str),
+		Some("invoke/write" | "invoke/edit")
+	) {
 		let raw = call
 			.arguments
 			.get("path")
@@ -173,9 +183,79 @@ fn translate_edit(args: &Map<String, Value>) -> Result<Value, BridgeError> {
 	if let Some(edits) = args.get("edits") {
 		return Ok(json!({"path": path_arg(args)?, "edits": edits}));
 	}
-	Ok(
-		json!({"path": path_arg(args)?, "old": string(args, &["old", "search"])? , "new": string(args, &["new", "replace"])?}),
-	)
+	let mut out = Map::from_iter([
+		("path".into(), Value::String(path_arg(args)?.to_owned())),
+		(
+			"old".into(),
+			Value::String(
+				string(
+					args,
+					&["old", "search", "old_string", "old_str", "old_text", "oldString", "oldText"],
+				)?
+				.to_owned(),
+			),
+		),
+		(
+			"new".into(),
+			Value::String(
+				string(
+					args,
+					&["new", "replace", "new_string", "new_str", "new_text", "newString", "newText"],
+				)?
+				.to_owned(),
+			),
+		),
+	]);
+	if let Some(replace_all) = args
+		.get("replace_all")
+		.or_else(|| args.get("replaceAll"))
+		.and_then(Value::as_bool)
+	{
+		out.insert("replace_all".into(), Value::Bool(replace_all));
+	}
+	Ok(Value::Object(out))
+}
+
+const CURSOR_REPLACE_NAMES: [&str; 6] =
+	["StrReplace", "str_replace", "strReplace", "SearchReplace", "search_replace", "Edit"];
+
+fn cursor_replace_arguments<'a>(
+	frame: &str,
+	args: &'a Map<String, Value>,
+) -> Option<&'a Map<String, Value>> {
+	if CURSOR_REPLACE_NAMES.contains(&frame) {
+		return Some(args);
+	}
+	if !matches!(frame, "mcp" | "piMcp") {
+		return None;
+	}
+	let name = ["toolName", "tool_name", "name"]
+		.into_iter()
+		.find_map(|key| args.get(key).and_then(Value::as_str))?;
+	let payload = args
+		.get("args")
+		.or_else(|| args.get("arguments"))
+		.and_then(Value::as_object)
+		.unwrap_or(args);
+	if CURSOR_REPLACE_NAMES.contains(&name) {
+		return Some(payload);
+	}
+	if name != "edit"
+		|| payload
+			.get("input")
+			.or_else(|| payload.get("_input"))
+			.and_then(Value::as_str)
+			.is_some()
+	{
+		return None;
+	}
+	let has_old = ["old_string", "old_str", "old_text", "oldString", "oldText"]
+		.into_iter()
+		.any(|key| payload.get(key).and_then(Value::as_str).is_some());
+	let has_new = ["new_string", "new_str", "new_text", "newString", "newText"]
+		.into_iter()
+		.any(|key| payload.get(key).and_then(Value::as_str).is_some());
+	(has_old && has_new).then_some(payload)
 }
 
 fn translate_find(args: &Map<String, Value>) -> Result<Value, BridgeError> {
@@ -371,6 +451,47 @@ mod tests {
 		let call = translate("piRead", &json!({"path":"a","start":2,"lines":3})).unwrap();
 		assert_eq!(call.tool.as_str(), "dyn");
 		assert_eq!(call.arguments["do_"], "invoke/read");
+	}
+	#[test]
+	fn cursor_str_replace_variants_project_onto_replace_edit() {
+		for name in CURSOR_REPLACE_NAMES {
+			let call = translate(
+				name,
+				&json!({
+					"path": "src/lib.rs",
+					"old_string": "before",
+					"new_string": "after",
+					"replace_all": true
+				}),
+			)
+			.unwrap();
+			assert_eq!(call.arguments["do_"], "invoke/edit", "{name}");
+			assert_eq!(call.arguments["path"], "src/lib.rs", "{name}");
+			assert_eq!(call.arguments["old"], "before", "{name}");
+			assert_eq!(call.arguments["new"], "after", "{name}");
+			assert_eq!(call.arguments["replace_all"], true, "{name}");
+		}
+	}
+	#[test]
+	fn cursor_mcp_replace_shape_uses_replace_but_hashline_stays_mcp() {
+		let call = translate(
+			"mcp",
+			&json!({
+				"tool_name": "edit",
+				"args": {"path":"src/lib.rs","old_text":"a","newText":"b"}
+			}),
+		)
+		.unwrap();
+		assert_eq!(call.arguments["do_"], "invoke/edit");
+		assert_eq!(call.arguments["old"], "a");
+		assert_eq!(call.arguments["new"], "b");
+
+		let call = translate(
+			"mcp",
+			&json!({"tool_name":"edit","args":{"path":"src/lib.rs","input":"hashline"}}),
+		)
+		.unwrap();
+		assert_eq!(call.arguments["do_"], "invoke/mcp");
 	}
 	#[test]
 	fn streaming_retains_partial_escape() {

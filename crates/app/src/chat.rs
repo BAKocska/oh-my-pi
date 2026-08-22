@@ -129,6 +129,9 @@ pub enum ChatError {
 	/// Owner-local draft persistence failed.
 	#[error(transparent)]
 	Draft(#[from] crate::session_manager::DraftError),
+	/// Owner-local session pin metadata failed.
+	#[error(transparent)]
+	Pin(#[from] crate::session_manager::PinError),
 	/// Cross-process loop revival failed.
 	#[error(transparent)]
 	Revival(#[from] omp_agent::RevivalError),
@@ -1300,6 +1303,10 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	) -> Result<omp_agent::AgentRunSummary, crate::envd::eval::BridgeHostError> {
 		let mut budget = self.context.lock().state.subscribe();
 		let _ = self.broker.set_idle(id, false);
+		let before = self
+			.supervisor
+			.state(id)
+			.map(|state| (state.generation(), state.progress().output_tokens));
 		let run = self.supervisor.run(id, items, turn_id);
 		tokio::pin!(run);
 		loop {
@@ -1313,7 +1320,28 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 								{
 									let _ = self.broker.registry().set_terminal(id, terminal);
 								}
-			return result.map_err(|error| {
+								let output_tokens = self.supervisor.state(id).map_or(0, |state| {
+									let after = state.progress().output_tokens;
+									before.map_or(after, |(generation, output)| {
+										if state.generation() == generation {
+											after.saturating_sub(output)
+										} else {
+											after
+										}
+									})
+								});
+								self.context.lock().state.update(|snapshot| {
+									if let Some(remaining) = snapshot
+										.turn
+										.params
+										.task_budget
+										.as_mut()
+										.and_then(|budget| budget.remaining_tokens.as_mut())
+									{
+										*remaining = remaining.saturating_sub(output_tokens);
+									}
+								});
+								return result.map_err(|error| {
 									crate::envd::eval::BridgeHostError::message(error.to_string())
 								});
 							},
@@ -1342,14 +1370,6 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		strict: bool,
 		mut summary: omp_agent::AgentRunSummary,
 	) -> Result<(String, Option<Value>, Option<Value>), crate::envd::eval::BridgeHostError> {
-		if let Some(outcome) = summary.outcome.as_ref() {
-			self
-				.context
-				.lock()
-				.tree
-				.debit_outcome(id, outcome)
-				.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
-		}
 		let Some(schema) = schema else {
 			let text = summary
 				.outcome
@@ -2810,6 +2830,8 @@ pub(crate) async fn run(
 			);
 		}
 	}
+	snapshot.reasoning_dialect =
+		interrupted_reasoning_dialect(catalog, &snapshot.turn.params.model);
 	snapshot.workspace.model.identifier = Str::new(&snapshot.turn.params.model);
 	snapshot.workspace.model.codex_task_policy =
 		crate::task::prompt_policy::uses_codex_task_prompt(&snapshot.turn.params.model);
@@ -3326,10 +3348,12 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			modes,
 			auth.as_ref().map(|worker| worker.ui().clone()),
 			data_dir.clone(),
+			Arc::clone(&scope.session_index),
 			scope.root.to_path_buf(),
 			session_root.join("local"),
 			security_enabled,
 			title_enabled,
+			settings.tui.resize_scrollback,
 			vec![content.commands.to_vec()],
 			content.skills,
 			Some(approval_inbox),
@@ -3532,6 +3556,27 @@ fn model_rejects_tools(catalog: &omp_llm_catalog::snapshot::Catalog, model: &str
 		.or_else(|| catalog.resolve_alias(model))
 		.and_then(|spec| spec.capabilities.chat.as_ref())
 		.is_some_and(|chat| chat.tools.is_unsupported())
+}
+
+/// Resolves the interrupted-reasoning continuity dialect from typed catalog policy.
+pub(crate) fn interrupted_reasoning_dialect(
+	catalog: &omp_llm_catalog::snapshot::Catalog,
+	model: &str,
+) -> omp_agent::InterruptedReasoningDialect {
+	let anthropic = catalog
+		.model(omp_llm_catalog::ModelKey::from_ref(model))
+		.or_else(|| catalog.resolve_alias(model))
+		.and_then(|model| model.thinking.as_ref())
+		.and_then(|thinking| catalog.thinking_policy(thinking))
+		.is_some_and(|policy| {
+			policy.reasoning.wire_format
+				== Some(omp_llm_catalog::ReasoningWireFormat::Anthropic)
+		});
+	if anthropic {
+		omp_agent::InterruptedReasoningDialect::Anthropic
+	} else {
+		omp_agent::InterruptedReasoningDialect::Other
+	}
 }
 
 fn model_selector_is_selectable(
@@ -3907,11 +3952,13 @@ fn create_indexed_fork(
 	Ok(journal)
 }
 
-fn resume_choices(
+/// Lists project-local resumable sessions with durable pins ahead of recency.
+pub(crate) fn resume_choices(
 	sessions_dir: &Path,
 	root: &Path,
 	current_id: Option<&Str>,
 ) -> Result<Vec<ResumeChoice>, ChatError> {
+	let pins = crate::session_manager::PinStore::new(sessions_dir).load()?;
 	let entries = std::fs::read_dir(sessions_dir)
 		.map_err(|source| ChatError::ProjectState { path: sessions_dir.to_owned(), source })?;
 	let mut choices = Vec::new();
@@ -3956,10 +4003,15 @@ fn resume_choices(
 		} else {
 			sf!("{age} · {id}")
 		};
-		choices.push((modified, ResumeChoice { id, label, detail }));
+		choices.push((!pins.contains(&id), std::cmp::Reverse(modified), ResumeChoice {
+			id,
+			label,
+			detail,
+			pinned: pins.contains(&id),
+		}));
 	}
-	choices.sort_unstable_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-	Ok(choices.into_iter().map(|(_, choice)| choice).collect())
+	choices.sort_by_key(|(unpinned, modified, _)| (*unpinned, *modified));
+	Ok(choices.into_iter().map(|(_, _, choice)| choice).collect())
 }
 
 /// Streamed session-journal probe results consumed by the resume picker.
@@ -4179,6 +4231,7 @@ pub(crate) fn agent_snapshot(
 		..TurnOptions::default()
 	};
 	let mut snapshot = AgentSnapshot::new(turn, blueprint.workspace().clone(), Arc::clone(registry));
+	snapshot.reasoning_dialect = interrupted_reasoning_dialect(catalog, model);
 	snapshot.workspace = crate::prompt_prep::PromptSnapshot::freeze(
 		snapshot.workspace.clone(),
 		registry,
@@ -4649,6 +4702,17 @@ mod tests {
 			.expect("title-named session");
 		assert_eq!(titled.label, "Renamed");
 		assert!(titled.detail.starts_with("current · "));
+		let pinned = SessionId(prompt_id.clone());
+		assert!(
+			crate::session_manager::PinStore::new(&sessions_dir)
+				.toggle(&pinned)
+				.expect("pin prompt session")
+		);
+		let ordered = resume_choices(&sessions_dir, &root, Some(&titled_id))
+			.expect("ordered sessions");
+		assert_eq!(ordered[0].id, prompt_id);
+		assert!(ordered[0].pinned);
+		assert!(!ordered[1].pinned);
 	}
 
 	#[test]

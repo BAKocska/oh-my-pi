@@ -527,6 +527,7 @@ pub struct EnvServer {
 	sites:               SiteMaterializer,
 	materializations:    ResourceMaterializer,
 	registry:            Arc<Registry>,
+	ask_presenter:       omp_tools::ask::PresenterSlot,
 	workspace_ops:       WorkspaceOperations,
 	ext_hosts:           Arc<ExtHostSupervisor>,
 	eval_bridge:         Arc<SessionBridgeHost>,
@@ -857,6 +858,7 @@ impl EnvServer {
 		sites: SiteMaterializer,
 		materializations: ResourceMaterializer,
 		registry: Arc<Registry>,
+		ask_presenter: omp_tools::ask::PresenterSlot,
 		workspace_ops: WorkspaceOperations,
 		ext_hosts: Arc<ExtHostSupervisor>,
 		eval_bridge: Arc<SessionBridgeHost>,
@@ -903,6 +905,7 @@ impl EnvServer {
 			sites,
 			materializations,
 			registry,
+			ask_presenter,
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
@@ -1021,6 +1024,7 @@ impl EnvServer {
 			goal_control,
 			search_bridge,
 			github_credentials,
+			ask_presenter,
 		) = production_registry(
 			&documents,
 			&blobs,
@@ -1066,6 +1070,7 @@ impl EnvServer {
 			sites,
 			materializations,
 			registry,
+			ask_presenter,
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
@@ -1166,6 +1171,7 @@ impl EnvServer {
 			goal_control,
 			search_bridge,
 			github_credentials,
+			ask_presenter,
 		) = production_registry(
 			&documents,
 			&blobs,
@@ -1211,6 +1217,7 @@ impl EnvServer {
 			sites,
 			materializations,
 			registry,
+			ask_presenter,
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
@@ -1302,6 +1309,10 @@ impl EnvServer {
 	/// Returns the exact registry shared by this server's dispatch paths.
 	pub fn registry(&self) -> Arc<Registry> {
 		Arc::clone(&self.registry)
+	}
+	/// Replaces the ask presenter for this environment composition.
+	pub(crate) fn bind_ask_presenter(&self, presenter: Arc<dyn omp_tools::ask::AskPresenter>) {
+		self.ask_presenter.bind(presenter);
 	}
 	/// Returns the project document authority shared by standalone commands.
 	pub(crate) const fn documents(&self) -> &DocumentHost {

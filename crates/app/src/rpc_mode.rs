@@ -948,7 +948,9 @@ impl Runtime {
 							.map_err(CommandError::transport)?;
 						Ok(json!({ "invoked": true, "command": true }))
 					},
-					CommandIntercept::Consumed => Ok(json!({ "invoked": false, "command": true })),
+					CommandIntercept::Consumed(agent_invoked) => {
+						Ok(json!({ "invoked": agent_invoked, "command": true }))
+					},
 					CommandIntercept::Exit => {
 						let _ = self.abort(false, None)?;
 						Ok(json!({ "invoked": false, "command": true, "exit": true }))
@@ -1057,6 +1059,7 @@ impl Runtime {
 				Ok(CommandIntercept::Prompt(prompt.text.to_string()))
 			},
 			DispatchResult::Handled(CommandResult::Consumed(result)) => {
+				let agent_invoked = result.agent_invoked;
 				if let Some(status) = result.status {
 					self
 						.notify(json!({
@@ -1067,7 +1070,7 @@ impl Runtime {
 						}))
 						.map_err(CommandError::transport)?;
 				}
-				Ok(CommandIntercept::Consumed)
+				Ok(CommandIntercept::Consumed(agent_invoked))
 			},
 			DispatchResult::Handled(CommandResult::Exit) => Ok(CommandIntercept::Exit),
 		}
@@ -2476,13 +2479,17 @@ impl crate::chat_ui::commands::SessionCommandHost for RpcCommandHost {
 				.iter()
 				.rev()
 				.find(|message| message.role == "user")
-				.map(|message| message.content.clone())
-				.ok_or_else(|| miette!("session has no user prompt to retry"))?;
+				.map(|message| message.content.clone());
+			let Some(prompt) = prompt else {
+				return Ok(crate::chat_ui::commands::CommandResult::Consumed(
+					crate::chat_ui::commands::ConsumedResult::status("Nothing to retry."),
+				));
+			};
 			runtime
 				.submit_prompt(prompt, "prompt")
 				.map_err(|error| miette!(error.message))?;
 			Ok(crate::chat_ui::commands::CommandResult::Consumed(
-				crate::chat_ui::commands::ConsumedResult::status("Retry started."),
+				crate::chat_ui::commands::ConsumedResult::agent("Retry started."),
 			))
 		})
 	}
@@ -2524,6 +2531,32 @@ impl crate::chat_ui::commands::SessionCommandHost for RpcCommandHost {
 		_request: crate::chat_ui::commands::WorkspaceRequest,
 	) -> crate::chat_ui::commands::CommandFuture<'_> {
 		unavailable_command("workspace")
+	}
+
+	fn handoff(&mut self, instructions: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			let mut params = Map::new();
+			if let Some(instructions) = instructions {
+				params.insert("customInstructions".into(), json!(instructions));
+			}
+			let owner = runtime.clone();
+			runtime.shutdown.spawn(async move {
+				let status = match owner.handoff(&params) {
+					Ok(_) => Str::new_static("Context handed off and compacted in place."),
+					Err(error) => sf!("Handoff failed: {}", error.message),
+				};
+				let _ = owner.notify(json!({
+					"type":"command_output",
+					"stream":"stdout",
+					"content":status,
+					"generation":0,
+				}));
+			});
+			Ok(crate::chat_ui::commands::CommandResult::Consumed(
+				crate::chat_ui::commands::ConsumedResult::silent(),
+			))
+		})
 	}
 }
 
@@ -2745,7 +2778,7 @@ struct ConfigState {
 enum CommandIntercept {
 	Passthrough,
 	Prompt(String),
-	Consumed,
+	Consumed(bool),
 	Exit,
 }
 
