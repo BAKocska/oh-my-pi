@@ -1,0 +1,7 @@
+---
+source: crates/app/tests/subagent_prompt_golden.rs
+expression: rendered
+---
+<note>
+&lt;ok &amp; safe&gt;
+</note>

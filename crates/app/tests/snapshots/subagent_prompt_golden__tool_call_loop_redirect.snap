@@ -1,0 +1,12 @@
+---
+source: crates/app/tests/subagent_prompt_golden.rs
+expression: loop_redirect
+---
+<system-interrupt reason="tool_call_loop_detected">
+You called `the same tool` 4 consecutive times with identical arguments:
+`arguments: path=src/lib.rs; result: unchanged`
+
+Last result (truncated): `See the immediately preceding tool result.`
+
+NEVER call `the same tool` with those arguments again this turn. Use different arguments, choose another tool, or summarize findings and yield if complete.
+</system-interrupt>

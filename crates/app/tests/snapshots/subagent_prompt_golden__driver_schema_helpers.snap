@@ -1,0 +1,10 @@
+---
+source: crates/app/tests/subagent_prompt_golden.rs
+expression: rendered
+---
+type ResultData = { answer: string };
+---
+type ResultData = { answer: string };
+type YieldEnvelope =
+  | { result: { data: ResultData } }
+  | { result: { error: string } };

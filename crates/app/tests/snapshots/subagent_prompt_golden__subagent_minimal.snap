@@ -1,0 +1,12 @@
+---
+source: crates/app/tests/subagent_prompt_golden.rs
+expression: prompt
+---
+Golden specialist
+
+# Specialist
+
+Complete only the delegated target.
+
+# Runtime
+Workspace root: `/workspace`

@@ -1,0 +1,9 @@
+---
+source: crates/app/tests/subagent_prompt_golden.rs
+expression: parent_irc
+---
+Current interruptible wait interrupted: IRC message from parent agent `Parent`.
+
+Parent IRC message:
+
+Finish the exact assigned slice.

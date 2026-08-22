@@ -1,0 +1,12 @@
+---
+source: crates/app/tests/subagent_prompt_golden.rs
+expression: "render_compaction_summary(\"Portable state.\\n\\nNext action.\", Some(\"remote\"))"
+---
+Prior model work/tool state available.
+MUST build on prior work; NEVER duplicate prior work.
+
+<summary>
+Portable state.
+
+Next action.
+</summary>
