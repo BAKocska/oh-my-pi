@@ -54,6 +54,11 @@ pub use session::{
 	SessionRevivalRequest, SessionRuntime, SubsystemToggles, ThinkingCeiling, ThinkingDiagnostic,
 	WorkspaceRootDescriptor,
 };
-pub use tools::{BuiltinToolIdentity, ToolRegistryBuilder, builtin_tool_identities};
+pub use tools::{
+	AutoLearnCaptureDrainError, AutoLearnCaptureError, AutoLearnCaptureExecutor,
+	AutoLearnCaptureHandle, AutoLearnCaptureRequest, AutoLearnCaptureRunner,
+	AutoLearnCaptureSnapshot, BuiltinToolIdentity, CustomToolDefinitionError, ToolRegistryBuilder,
+	builtin_tool_identities, custom_tool_to_definition,
+};
 pub use url::Url;
 pub use workspace::{FormattedWorkspaceTree, WorkspaceTreeBuilder, WorkspaceTreeError};
