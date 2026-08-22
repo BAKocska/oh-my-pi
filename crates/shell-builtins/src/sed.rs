@@ -6503,7 +6503,6 @@ pub mod fast_io {
 		///////////////////////////////
 		// Unit tests for write_chunk()
 		///////////////////////////////
-
 		fn new_for_test() -> (OutputBuffer, std::fs::File) {
 			let file = tempfile().unwrap();
 			let buf = OutputBuffer {

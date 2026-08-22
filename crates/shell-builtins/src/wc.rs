@@ -283,7 +283,6 @@ mod utf8 {
 	/// `uu_wc` used to depend on that crate.
 	/// The author archived the repository <https://github.com/SimonSapin/rust-utf8>.
 	/// They suggested incorporating the source directly into `uu_wc` <https://github.com/uutils/coreutils/issues/4289>.
-
 	#[derive(Debug, Copy, Clone)]
 	pub struct Incomplete {
 		pub buffer:     [u8; 4],
