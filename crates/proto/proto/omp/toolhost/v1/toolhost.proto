@@ -365,10 +365,30 @@ message LifecycleWorkerEnvelope {
     ServiceCall service_call = 3;
     ResourceQuery resource_query = 4;
     ServiceResult service_result = 5;
+  DeclareSecretRules declare_secret_rules = 6;
   }
   omp.inference.v1.ValueMap props = 15;
 }
 
+// Bounded extension-owned secret declarations. Core validates lengths/counts and
+// seals the set during activation. Environment names and values are deliberately
+// absent: env secret discovery is a Core-only authority.
+message SecretRuleDeclaration {
+  string kind = 1;
+  string mode = 2;
+  string content = 3;
+  optional string replacement = 4;
+  optional string flags = 5;
+  optional string friendly_name = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message DeclareSecretRules {
+  string extension_id = 1;
+  uint64 activation_generation = 2;
+  repeated SecretRuleDeclaration rules = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
 // Streaming-argument forwarding and pull cursor.
 message PullRequest {
   string call_id = 1;
@@ -482,6 +502,50 @@ enum HookEventId {
   HOOK_EVENT_EXTENSION_LOAD = 55;
   HOOK_EVENT_EXTENSION_UNLOAD = 56;
   HOOK_EVENT_HOST_RECONNECT = 57;
+  HOOK_EVENT_TTSR_TRIGGERED = 58;
+  HOOK_EVENT_TODO_REMINDER = 59;
+  HOOK_EVENT_RETRY_START = 60;
+  HOOK_EVENT_RETRY_END = 61;
+  HOOK_EVENT_FALLBACK_APPLIED = 62;
+  HOOK_EVENT_FALLBACK_SUCCEEDED = 63;
+}
+
+// Revision 1 payloads for authoritative observational lifecycle events.
+// Producers truncate strings before dispatch: ids <= 128 bytes, rule/model/reason
+// fields <= 512 bytes, and reminder/matched fields <= 4096 bytes.
+message LifecycleEventContext {
+  string session_id = 1;
+  string turn_id = 2;
+  uint64 sequence = 3;
+}
+
+message TtsrTriggeredEventV1 {
+  LifecycleEventContext context = 1;
+  string rule = 2;
+  string matched = 3;
+  bool interrupted = 4;
+}
+
+message TodoReminderEventV1 {
+  LifecycleEventContext context = 1;
+  uint32 pending = 2;
+  string reminder = 3;
+}
+
+message RetryLifecycleEventV1 {
+  LifecycleEventContext context = 1;
+  uint32 attempt = 2;
+  uint32 maximum = 3;
+  uint64 delay_ms = 4;
+  string reason = 5;
+  optional string outcome = 6;
+}
+
+message FallbackLifecycleEventV1 {
+  LifecycleEventContext context = 1;
+  string source_model = 2;
+  string target_model = 3;
+  string reason = 4;
 }
 message When {
   repeated string names = 1;
@@ -530,6 +594,7 @@ message Reply {
 message Notify {
   HookEventId event_id = 1;
   bytes payload = 2;
+  uint32 event_rev = 3;
   omp.inference.v1.ValueMap props = 15;
 }
 message HookDecision {
@@ -649,10 +714,27 @@ message ProjectionWorkerEnvelope {
   omp.inference.v1.ValueMap props = 15;
 }
 
+// Raw terminal input is exceptional: Core emits frames only while an admitted,
+// durably granted extension owns the focus lease. Payloads are capped at 4096
+// bytes and headless hosts reject subscriptions.
+message RawTerminalInputSubscribe {
+  string focus_token = 1;
+  uint32 max_frame_bytes = 2;
+}
+message RawTerminalInputCancel {
+  string focus_token = 1;
+}
+message RawTerminalInputFrame {
+  uint64 sequence = 1;
+  bytes data = 2;
+  string focus_token = 3;
+}
+
 message UiHostEnvelope {
   oneof body {
     omp.ui.v1.UiResponse response = 1;
     omp.ui.v1.UiDispatch dispatch = 2;
+    RawTerminalInputFrame raw_terminal_input = 3;
   }
   omp.inference.v1.ValueMap props = 15;
 }
@@ -662,6 +744,8 @@ message UiWorkerEnvelope {
     omp.ui.v1.UiEffect effect = 2;
     omp.ui.v1.UiRequest request = 3;
     omp.ui.v1.UiDispatchResult dispatch_result = 4;
+    RawTerminalInputSubscribe raw_terminal_input_subscribe = 5;
+    RawTerminalInputCancel raw_terminal_input_cancel = 6;
   }
   omp.inference.v1.ValueMap props = 15;
 }
@@ -1032,15 +1116,37 @@ message JournalHostEnvelope {
   omp.inference.v1.ValueMap props = 15;
 }
 
+// Trusted direct filesystem escape. This never aliases an ordinary Environment
+// request: Core validates the durable grant id, capability digest, extension,
+// generation, operation, path, and 1 MiB payload bound, then appends an audit
+// receipt before dispatch.
+message DirectFilesystemRequest {
+  string operation = 1;
+  string absolute_path = 2;
+  bytes data = 3;
+  string grant_id = 4;
+  bytes capability_digest = 5;
+  uint64 generation = 6;
+}
+message DirectFilesystemResult {
+  bytes data = 1;
+  optional ProtocolError error = 2;
+  string audit_receipt = 3;
+}
+
 message ControlHostEnvelope {
   oneof body {
     omp.control.v1.ControlResponse response = 1;
     omp.control.v1.ControlEvent event = 2;
+    DirectFilesystemResult direct_filesystem = 3;
   }
   omp.inference.v1.ValueMap props = 15;
 }
 message ControlWorkerEnvelope {
-  omp.control.v1.ControlRequest request = 1;
+  oneof body {
+    omp.control.v1.ControlRequest request = 1;
+    DirectFilesystemRequest direct_filesystem = 2;
+  }
   omp.inference.v1.ValueMap props = 15;
 }
 

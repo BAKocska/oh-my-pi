@@ -706,6 +706,38 @@ message CommitTransactionRequest {
   repeated DocumentMutation operations = 2;
 }
 
+enum DiagnosticSeverity {
+  DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+  DIAGNOSTIC_SEVERITY_ERROR = 1;
+  DIAGNOSTIC_SEVERITY_WARNING = 2;
+  DIAGNOSTIC_SEVERITY_INFORMATION = 3;
+  DIAGNOSTIC_SEVERITY_HINT = 4;
+}
+
+message CommittedDiagnostic {
+  ByteRange range = 1;
+  DiagnosticSeverity severity = 2;
+  string code = 3;
+  string source = 4;
+  string message = 5;
+}
+
+message CommittedDiagnosticBatch {
+  DocumentRef document = 1;
+  Revision committed_revision = 2;
+  repeated CommittedDiagnostic diagnostics = 3;
+  bool complete = 4;
+  uint32 omitted = 5;
+}
+
+message ClientFormatDrift {
+  Revision submitted_revision = 1;
+  Revision committed_revision = 2;
+  bool client_formatted = 3;
+  bool server_formatted = 4;
+  bool bytes_changed_after_client_format = 5;
+  bytes committed_content_hash = 6;
+}
 message OperationResult {
   uint32 operation_index = 1;
   DocumentHead head = 2;
@@ -715,6 +747,8 @@ message OperationResult {
   repeated ByteRange changed_ranges = 5;
   // Populated for a successful move.
   string previous_uri = 6;
+  CommittedDiagnosticBatch diagnostics = 7;
+  ClientFormatDrift format_drift = 8;
 }
 
 message TransactionCommitted {
@@ -906,6 +940,70 @@ message LspBindingEvent {
   DocumentRef document = 3;
 }
 
+enum DapCapability {
+  DAP_CAPABILITY_UNSPECIFIED = 0;
+  DAP_CAPABILITY_READ = 1;
+  DAP_CAPABILITY_EXECUTE = 2;
+}
+
+message DapSessionRef {
+  bytes session_id = 1;
+  uint64 generation = 2;
+  uint64 revision = 3;
+}
+
+message DapLaunchRequest {
+  string adapter = 1;
+  string workspace_uri = 2;
+  bytes configuration_json = 3;
+  repeated DapCapability capabilities = 4;
+  uint32 max_event_bytes = 5;
+}
+
+message DapAttachRequest {
+  string adapter = 1;
+  string workspace_uri = 2;
+  bytes configuration_json = 3;
+  repeated DapCapability capabilities = 4;
+  uint32 max_event_bytes = 5;
+}
+
+message DapSessionResponse {
+  DapSessionRef session = 1;
+  repeated DapCapability granted_capabilities = 2;
+  bytes adapter_capabilities_json = 3;
+}
+
+message DapActionRequest {
+  DapSessionRef session = 1;
+  uint64 expected_revision = 2;
+  DapCapability required_capability = 3;
+  string command = 4;
+  bytes arguments_json = 5;
+  uint32 max_response_bytes = 6;
+}
+
+message DapActionResponse {
+  DapSessionRef session = 1;
+  bool success = 2;
+  bytes body_json = 3;
+  string message = 4;
+}
+
+message DapOutput {
+  DapSessionRef session = 1;
+  uint64 sequence = 2;
+  string category = 3;
+  bytes output = 4;
+  bool truncated = 5;
+}
+
+message DapEvent {
+  DapSessionRef session = 1;
+  uint64 sequence = 2;
+  string event = 3;
+  bytes body_json = 4;
+}
 // Identifies a bounded unsolicited-event stream whose continuity was lost.
 enum EventStreamKind {
   EVENT_STREAM_KIND_UNSPECIFIED = 0;
@@ -1064,7 +1162,10 @@ message ClientFrame {
     SummarizeDocumentRequest summarize_document = 22;
     AcquireWorkspaceLeaseRequest acquire_workspace_lease = 23;
     ReleaseWorkspaceLeaseRequest release_workspace_lease = 24;
-  }
+      DapLaunchRequest dap_launch = 25;
+    DapAttachRequest dap_attach = 26;
+    DapActionRequest dap_action = 27;
+}
 }
 
 message ServerFrame {
@@ -1110,5 +1211,9 @@ message ServerFrame {
     EventStreamError event_stream_error = 26;
     AcquireWorkspaceLeaseResponse workspace_lease_acquired = 27;
     ReleaseWorkspaceLeaseResponse workspace_lease_released = 28;
-  }
+      DapSessionResponse dap_session = 29;
+    DapActionResponse dap_action = 30;
+    DapOutput dap_output = 31;
+    DapEvent dap_event = 32;
+}
 }

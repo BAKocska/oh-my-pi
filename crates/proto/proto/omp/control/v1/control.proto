@@ -251,6 +251,71 @@ message RewindReportMsg {
   omp.inference.v1.ValueMap props = 15;
 }
 
+// Read-only snapshot fence over one daemon-owned v4 journal.
+message SessionSnapshotRequest {
+  string session_id = 1;
+  optional uint64 if_revision = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message SessionSnapshotMsg {
+  string session_id = 1;
+  uint64 revision = 2;
+  // Exact canonical v4 JSONL bytes; clients may cache but never ingest bytes.
+  bytes journal = 3;
+  bytes integrity = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message SessionDeltaRequest {
+  string session_id = 1;
+  uint64 after_revision = 2;
+  uint32 maximum_entries = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message SessionJournalEntryMsg {
+  uint64 revision = 1;
+  // Exact canonical event line returned by authority, without a trailing LF.
+  bytes event_json = 2;
+}
+
+message SessionDeltaMsg {
+  string session_id = 1;
+  uint64 base_revision = 2;
+  uint64 head_revision = 3;
+  repeated SessionJournalEntryMsg entries = 4;
+  bool has_more = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message SessionIngestRequest {
+  uint64 request_id = 1;
+  string idempotency_key = 2;
+  uint64 host_generation = 3;
+  uint64 session_generation = 4;
+  string session_id = 5;
+  uint64 expected_revision = 6;
+  // Clients submit structured content; only the daemon encodes journal bytes.
+  omp.thread.v1.Item item = 7;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+enum SessionIngestRefusal {
+  SESSION_INGEST_REFUSAL_UNSPECIFIED = 0;
+  SESSION_INGEST_REFUSAL_CONFLICT = 1;
+  SESSION_INGEST_REFUSAL_UNKNOWN_SESSION = 2;
+  SESSION_INGEST_REFUSAL_INVALID_ITEM = 3;
+  SESSION_INGEST_REFUSAL_WRITER_HALTED = 4;
+}
+
+message SessionIngestResultMsg {
+  string session_id = 1;
+  uint64 revision = 2;
+  optional SessionIngestRefusal refusal = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
 message ControlRequest {
   oneof body {
     SpawnAgent spawn_agent = 1;
@@ -263,6 +328,9 @@ message ControlRequest {
     SendMessage send_message = 8;
     InboxDrain inbox_drain = 9;
     RewindRequest rewind = 10;
+    SessionSnapshotRequest session_snapshot = 11;
+    SessionDeltaRequest session_delta = 12;
+    SessionIngestRequest session_ingest = 13;
   }
   InvocationPhase invocation_phase = 14;
   omp.inference.v1.ValueMap props = 15;
@@ -280,6 +348,9 @@ message ControlResponse {
     MessageMsg message = 8;
     RewindReportMsg rewind_report = 9;
     SpawnRefusal spawn_refusal = 10;
+    SessionSnapshotMsg session_snapshot = 12;
+    SessionDeltaMsg session_delta = 13;
+    SessionIngestResultMsg session_ingest = 14;
   }
   optional string error = 11;
   omp.inference.v1.ValueMap props = 15;
@@ -294,6 +365,7 @@ message ControlEvent {
     ReceiptMsg receipt = 5;
     MessageMsg message = 6;
     SpawnLimitsMsg spawn_limits = 7;
+SessionDeltaMsg session_delta = 8;
   }
   omp.inference.v1.ValueMap props = 15;
 }

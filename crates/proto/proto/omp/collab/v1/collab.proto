@@ -1,0 +1,286 @@
+syntax = "proto3";
+
+package omp.collab.v1;
+
+import "omp/inference/v1/common.proto";
+import "omp/thread/v1/thread.proto";
+
+// OMP-only relay envelope. Routing metadata is cleartext; only sealed_frame is
+// encrypted. Revision changes are explicit and never negotiate a legacy wire.
+message RelayEnvelope {
+  uint32 protocol_revision = 1;
+  uint32 peer_id = 2;
+  bytes sealed_frame = 3;
+}
+
+message RelayControl {
+  oneof kind {
+    PeerJoined peer_joined = 1;
+    PeerLeft peer_left = 2;
+    RoomClosed room_closed = 3;
+    RelayError error = 4;
+  }
+}
+
+message PeerJoined { uint32 peer_id = 1; }
+message PeerLeft { uint32 peer_id = 1; }
+message RoomClosed {
+  uint32 code = 1;
+  string reason = 2;
+}
+message RelayError {
+  uint32 code = 1;
+  string message = 2;
+}
+
+message CollabFrame {
+  uint32 protocol_revision = 1;
+  uint64 sequence = 2;
+  uint64 timestamp_ms = 3;
+  oneof payload {
+    Hello hello = 10;
+    Welcome welcome = 11;
+    Bye bye = 12;
+    ErrorMessage error = 13;
+    SnapshotChunk snapshot_chunk = 20;
+    JournalRecord journal_record = 21;
+    StreamEvent event = 22;
+    SessionStateUpdate state = 23;
+    RegistrySnapshot agents = 24;
+    PromptRequest prompt = 30;
+    AbortRequest abort = 31;
+    AgentCommand agent_command = 32;
+    UiResponse ui_response = 33;
+    TranscriptRequest transcript_request = 34;
+    UiRequest ui_request = 40;
+    UiRequestEnd ui_request_end = 41;
+    TranscriptChunk transcript = 42;
+    BusEvent bus_event = 43;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message Hello {
+  uint32 protocol_revision = 1;
+  string display_name = 2;
+  optional bytes write_token = 3;
+  string client_version = 4;
+}
+message Welcome {
+  uint32 protocol_revision = 1;
+  SessionHeader header = 2;
+  SessionStateUpdate initial_state = 3;
+  RegistrySnapshot initial_agents = 4;
+  uint32 total_entry_count = 5;
+  bool read_only = 6;
+}
+message SessionHeader {
+  string session_id = 1;
+  string title = 2;
+  uint64 created_at_ms = 3;
+  string host_cwd = 4;
+}
+message Bye { string reason = 1; }
+message ErrorMessage {
+  string code = 1;
+  string message = 2;
+}
+
+message SnapshotChunk {
+  repeated JournalRecord entries = 1;
+  bool final = 2;
+}
+message JournalRecord {
+  string entry_id = 1;
+  optional string parent_id = 2;
+  uint64 timestamp_ms = 3;
+  oneof record {
+    omp.thread.v1.Item thread_item = 4;
+    CompactionRecord compaction = 5;
+    ModelChangeRecord model_change = 6;
+    ThinkingLevelChangeRecord thinking_change = 7;
+    CustomRecord custom = 8;
+  }
+}
+message CompactionRecord {
+  string summary = 1;
+  optional string short_summary = 2;
+  string first_kept_entry_id = 3;
+  uint64 tokens_before = 4;
+}
+message ModelChangeRecord {
+  string model_id = 1;
+  string provider = 2;
+  optional string role = 3;
+}
+message ThinkingLevelChangeRecord { optional string thinking_level = 1; }
+message CustomRecord {
+  string custom_type = 1;
+  bytes payload_json = 2;
+  bool display = 3;
+}
+
+message StreamEvent {
+  enum EventType {
+    EVENT_TYPE_UNSPECIFIED = 0;
+    EVENT_TYPE_AGENT_START = 1;
+    EVENT_TYPE_AGENT_END = 2;
+    EVENT_TYPE_TURN_START = 3;
+    EVENT_TYPE_TURN_END = 4;
+    EVENT_TYPE_MESSAGE_START = 5;
+    EVENT_TYPE_MESSAGE_UPDATE = 6;
+    EVENT_TYPE_MESSAGE_END = 7;
+    EVENT_TYPE_TOOL_START = 8;
+    EVENT_TYPE_TOOL_UPDATE = 9;
+    EVENT_TYPE_TOOL_END = 10;
+    EVENT_TYPE_NOTICE = 11;
+    EVENT_TYPE_AUTO_COMPACTION_START = 12;
+    EVENT_TYPE_AUTO_COMPACTION_END = 13;
+    EVENT_TYPE_AUTO_RETRY_START = 14;
+    EVENT_TYPE_AUTO_RETRY_END = 15;
+  }
+  EventType event_type = 1;
+  optional omp.thread.v1.Item item = 2;
+  optional ToolExecution tool = 3;
+  optional Notice notice = 4;
+}
+message ToolExecution {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  bytes args_json = 3;
+  optional string intent = 4;
+  bytes partial_result_json = 5;
+  bytes final_result_json = 6;
+  bool is_error = 7;
+}
+message Notice {
+  enum Level {
+    LEVEL_INFO = 0;
+    LEVEL_WARNING = 1;
+    LEVEL_ERROR = 2;
+  }
+  Level level = 1;
+  string message = 2;
+  string source = 3;
+}
+
+message SessionStateUpdate {
+  bool is_streaming = 1;
+  bool is_aborting = 2;
+  uint32 queued_message_count = 3;
+  string session_name = 4;
+  string host_cwd = 5;
+  optional ModelMetadata model = 6;
+  optional string thinking_level = 7;
+  optional ContextUsage context_usage = 8;
+  repeated Participant participants = 9;
+}
+message ModelMetadata {
+  string id = 1;
+  string name = 2;
+  string provider = 3;
+  uint32 context_window = 4;
+}
+message ContextUsage {
+  uint64 tokens = 1;
+  uint64 context_window = 2;
+  float percent = 3;
+}
+message Participant {
+  string display_name = 1;
+  bool is_host = 2;
+  bool read_only = 3;
+  uint32 peer_id = 4;
+}
+message RegistrySnapshot { repeated AgentSummary agents = 1; }
+message AgentSummary {
+  enum Kind {
+    KIND_MAIN = 0;
+    KIND_SUB = 1;
+  }
+  enum Status {
+    STATUS_RUNNING = 0;
+    STATUS_IDLE = 1;
+    STATUS_PARKED = 2;
+    STATUS_ABORTED = 3;
+  }
+  string id = 1;
+  string display_name = 2;
+  Kind kind = 3;
+  optional string parent_id = 4;
+  Status status = 5;
+  bool has_session_file = 6;
+  uint64 created_at_ms = 7;
+  uint64 last_activity_ms = 8;
+}
+
+message PromptRequest {
+  string text = 1;
+  repeated ImageAttachment images = 2;
+}
+message ImageAttachment {
+  bytes data = 1;
+  string mime_type = 2;
+}
+message AbortRequest { string reason = 1; }
+message AgentCommand {
+  enum Command {
+    COMMAND_CHAT = 0;
+    COMMAND_KILL = 1;
+    COMMAND_REVIVE = 2;
+  }
+  Command command = 1;
+  string agent_id = 2;
+  optional string text = 3;
+}
+
+message UiRequest {
+  uint32 request_id = 1;
+  string title = 2;
+  oneof spec {
+    SelectSpec select = 3;
+    EditorSpec editor = 4;
+  }
+}
+message SelectSpec {
+  enum Marker {
+    MARKER_RADIO = 0;
+    MARKER_CHECKBOX = 1;
+  }
+  repeated SelectOption options = 1;
+  uint32 initial_index = 2;
+  Marker marker = 3;
+  repeated uint32 checked_indices = 4;
+  uint32 markable_count = 5;
+  optional string help_text = 6;
+}
+message SelectOption {
+  string label = 1;
+  optional string description = 2;
+}
+message EditorSpec { optional string prefill = 1; }
+message UiRequestEnd { uint32 request_id = 1; }
+message UiResponse {
+  uint32 request_id = 1;
+  optional string value = 2;
+}
+message TranscriptRequest {
+  uint32 request_id = 1;
+  string agent_id = 2;
+  uint64 from_byte = 3;
+}
+message TranscriptChunk {
+  uint32 request_id = 1;
+  bytes text_utf8 = 2;
+  uint64 new_size = 3;
+  optional string error = 4;
+}
+message BusEvent {
+  enum Channel {
+    CHANNEL_UNSPECIFIED = 0;
+    CHANNEL_TASK_SUBAGENT_PROGRESS = 1;
+    CHANNEL_TASK_SUBAGENT_LIFECYCLE = 2;
+  }
+  Channel channel = 1;
+  bytes data_json = 2;
+}

@@ -15,7 +15,7 @@ import "omp/inference/v1/common.proto";
 
 message SearchRequest {
   string query = 1;
-  // Max results; 0 = engine default.
+  // Max results returned to the caller; 0 = engine default.
   uint32 limit = 2;
   Recency recency = 3;
   // ISO dates "YYYY-MM-DD"; empty = unbounded.
@@ -59,6 +59,12 @@ message SearchRequest {
   // "perplexity/search_context_size", "parallel/mode"). Integers remain exact
   // for budgets and vendor ids.
   ValueMap props = 15;
+  // Maximum synthesis output tokens; 0 = provider default.
+  uint32 max_tokens = 16;
+  // Synthesis sampling temperature; absent = provider default.
+  optional double temperature = 17;
+  // Provider retrieval count when distinct from returned `limit`; 0 = provider default.
+  uint32 num_search_results = 18;
 }
 
 message SearchResponse {
@@ -77,6 +83,12 @@ message SearchResponse {
   Usage usage = 8;
   Cost cost = 9;
   repeated Unsupported unsupported = 10;
+  // Opaque account identity used by the serving attempt.
+  string account = 11;
+  // UI-safe credential mode label; never credential material.
+  string auth_mode = 12;
+  // Failed attempts preceding success, or every attempt in an aggregate failure.
+  repeated Failure failures = 13;
 
   message Source {
     string url = 1;
@@ -95,6 +107,23 @@ message SearchResponse {
     // Byte offsets into `answer`, when the engine anchors citations.
     optional uint32 start = 4;
     optional uint32 end = 5;
+  }
+
+  message Failure {
+    string provider = 1;
+    Kind kind = 2;
+    optional uint32 status = 3;
+    string code = 4;
+
+    enum Kind {
+      KIND_UNSPECIFIED = 0;
+      KIND_AUTHENTICATION = 1;
+      KIND_QUOTA = 2;
+      KIND_MODEL_NOT_FOUND = 3;
+      KIND_TRANSPORT = 4;
+      KIND_TIMEOUT = 5;
+      KIND_PROVIDER = 6;
+    }
   }
 
   ValueMap props = 15;

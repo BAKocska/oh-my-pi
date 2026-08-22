@@ -10,6 +10,51 @@ message Tml {
   bytes source = 1;
   uint64 hash = 2;
 }
+// Exact identity of one retained presentation frame. Hosts key frame state by
+// all three fields; kind-only and revision-only fallback are forbidden.
+message RetainedFrameKey {
+  string kind = 1;
+  string rev = 2;
+  string stable_id = 3;
+}
+
+// One action declared by a retained frame. Correlation is stable for the
+// lifetime of the exact frame key and is echoed by FrameActionFired.
+message RetainedFrameAction {
+  string name = 1;
+  string correlation = 2;
+  omp.inference.v1.ValueMap args = 3;
+}
+
+// Typed retained presentation state with deterministic generic TML fallback.
+// Payload interpretation belongs exclusively to the exact (kind, rev) owner.
+message RetainedFrame {
+  RetainedFrameKey key = 1;
+  bytes payload = 2;
+  optional Tml fallback = 3;
+  repeated RetainedFrameAction actions = 4;
+}
+
+// Removes the exact retained frame key.
+message RemoveRetainedFrame {
+  RetainedFrameKey key = 1;
+}
+
+// One ordered retained-frame mutation.
+message RetainedFrameEnvelope {
+  oneof mutation {
+    RetainedFrame upsert = 1;
+    RemoveRetainedFrame remove = 2;
+  }
+}
+
+// Action routed back to the exact retained frame that declared it.
+message FrameActionFired {
+  RetainedFrameKey key = 1;
+  string name = 2;
+  string correlation = 3;
+  omp.inference.v1.ValueMap args = 4;
+}
 
 enum SlotPlacement {
   SLOT_PLACEMENT_UNSPECIFIED = 0;
@@ -225,6 +270,7 @@ message UiDispatch {
     CompletionQuery completion = 3;
     RenderRequest render = 4;
     OverlayEvent overlay = 5;
+  FrameActionFired frame_action = 6;
   }
   omp.inference.v1.ValueMap props = 15;
 }

@@ -43,10 +43,55 @@ pub mod bytes_text;
 ///
 /// This is bumped for every wire-visible schema change and is the revision
 /// compared by the `omp.gateway.v1.Hello` handshake.
-pub const SCHEMA_REV: u32 = 7;
+pub const SCHEMA_REV: u32 = 9;
 
 /// Generated packages under the protobuf `omp` namespace.
 pub mod omp {
+	/// Types generated from `omp.identity.v1`: shared durable wire identities.
+	pub mod identity {
+		/// Version 1.
+		pub mod v1 {
+			#![allow(
+				missing_docs,
+				clippy::pedantic,
+				clippy::nursery,
+				reason = "prost/tonic output is machine-generated and cannot follow handwritten \
+				          documentation and style conventions"
+			)]
+			#![allow(
+				clippy::allow_attributes_without_reason,
+				reason = "prost/tonic emits compatibility allow attributes without Rust reason \
+				          metadata"
+			)]
+			include!(concat!(env!("OUT_DIR"), "/omp.identity.v1.rs"));
+		}
+	}
+
+	/// Types generated from `omp.collab.v1`: encrypted collaboration relay
+	/// frames.
+	pub mod collab {
+		/// Version 1.
+		pub mod v1 {
+			#![allow(
+				missing_docs,
+				clippy::pedantic,
+				clippy::nursery,
+				reason = "prost/tonic output is machine-generated and cannot follow handwritten \
+				          documentation and style conventions"
+			)]
+			#![allow(
+				clippy::allow_attributes_without_reason,
+				reason = "prost/tonic emits compatibility allow attributes without Rust reason \
+				          metadata"
+			)]
+			#![allow(
+				clippy::large_enum_variant,
+				reason = "prost maps protobuf oneofs directly to enums; boxing would change the \
+				          generated Rust API"
+			)]
+			include!(concat!(env!("OUT_DIR"), "/omp.collab.v1.rs"));
+		}
+	}
 	/// Types generated from `omp.thread.v1`: the canonical conversation AST.
 	pub mod thread {
 		/// Version 1.
@@ -351,5 +396,6 @@ pub mod omp {
 }
 
 pub use omp::{
-	auth, blob, control, document, env, gateway, inference, policy, telemetry, thread, toolhost, ui,
+	auth, blob, collab, control, document, env, gateway, identity, inference, policy, telemetry,
+	thread, toolhost, ui,
 };
