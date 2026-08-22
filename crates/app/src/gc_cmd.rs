@@ -38,7 +38,7 @@ impl Drop for GcLock {
 
 /// Runs dry by default; destructive work requires `--apply`.
 pub fn run(args: GcArgs) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
 	let sessions_dir = args
 		.sessions_dir
 		.unwrap_or_else(|| data_dir.join("sessions"));

@@ -1,7 +1,7 @@
 //! Daemon-scoped discovery refresh coordination and catalog publication.
 
 use std::{
-	collections::BTreeSet,
+	collections::{BTreeMap, BTreeSet},
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -11,12 +11,145 @@ use omp_catalog::{
 	EvidenceConfidence, ModelOverlay, ModelPatch, OverlaySource, OverlayStore, ProvenanceKind,
 	ProvenanceSource, ScopedAlias,
 };
-use omp_core::{Str, sf};
+use async_trait::async_trait;
+use omp_core::{Principal, Str, sf};
+use omp_envd::exthost::control::{ControlAuthorityFactory, ControlConnectionIdentity};
+use omp_proto::inference::v1 as pb;
+use serde_json::{Map, Value};
+use tonic::{Code, Status, transport::Channel};
 use omp_inference::discovery::{
 	DiscoveryCacheKey, DiscoveryHttpClient, DiscoveryProbe, DiscoveryStore, DiscoveryStoreError,
 	ProbeError, ProviderDiscoveryState, ProviderLifecycle,
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::chat::CampaignControlResolver;
+
+type CampaignMachineConstructor = dyn Fn(
+		Option<&str>,
+	) -> Result<
+		Box<dyn omp_agent::CampaignMachine>,
+		omp_envd::exthost::control::ControlProtocolError,
+	> + Send
+	+ Sync;
+
+/// One callback constructor bound to a declaration accepted at FREEZE.
+#[derive(Clone)]
+pub struct SealedCampaignDeclaration {
+	/// Authenticated extension which owns this declaration.
+	pub extension:          Str,
+	/// Child generation whose frozen table supplied the declaration.
+	pub host_generation:    u64,
+	/// Session generation whose agent owner may engage it.
+	pub session_generation: u64,
+	/// Immutable Core campaign policy lowered from the sealed manifest.
+	pub spec:               Arc<omp_agent::CampaignSpec>,
+	constructor:            Arc<CampaignMachineConstructor>,
+}
+
+impl SealedCampaignDeclaration {
+	/// Binds a verified declaration to its generation-fenced machine constructor.
+	pub fn new<F>(
+		extension: impl Into<Str>,
+		host_generation: u64,
+		session_generation: u64,
+		spec: Arc<omp_agent::CampaignSpec>,
+		constructor: F,
+	) -> Self
+	where
+		F: Fn(
+				Option<&str>,
+			) -> Result<
+				Box<dyn omp_agent::CampaignMachine>,
+				omp_envd::exthost::control::ControlProtocolError,
+			> + Send
+			+ Sync
+			+ 'static,
+	{
+		Self {
+			extension: extension.into(),
+			host_generation,
+			session_generation,
+			spec,
+			constructor: Arc::new(constructor),
+		}
+	}
+}
+
+/// Resolver over the exact campaign declaration generation retained at FREEZE.
+///
+/// Machine constructors are admitted together with their immutable specs; a
+/// child request can select only by declaration id and can never supply an
+/// executable campaign machine.
+pub struct SealedCampaignControlResolver {
+	declarations: BTreeMap<Str, SealedCampaignDeclaration>,
+}
+
+impl SealedCampaignControlResolver {
+	/// Seals one deterministic declaration table.
+	pub fn new(
+		declarations: impl IntoIterator<Item = SealedCampaignDeclaration>,
+	) -> Result<Self, omp_envd::exthost::control::ControlProtocolError> {
+		let mut table = BTreeMap::new();
+		for declaration in declarations {
+			if declaration.spec.id.is_empty()
+				|| declaration.host_generation == 0
+				|| declaration.session_generation == 0
+				|| table
+					.insert(declaration.spec.id.clone(), declaration)
+					.is_some()
+			{
+				return Err(omp_envd::exthost::control::ControlProtocolError::new(
+					"InvalidCampaignDeclaration",
+					"sealed campaign declarations contain an invalid or duplicate identity",
+				));
+			}
+		}
+		Ok(Self { declarations: table })
+	}
+}
+
+impl CampaignControlResolver for SealedCampaignControlResolver {
+	fn resolve(
+		&self,
+		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
+		campaign: &str,
+		state: Option<&str>,
+	) -> Result<
+		(Arc<omp_agent::CampaignSpec>, Box<dyn omp_agent::CampaignMachine>),
+		omp_envd::exthost::control::ControlProtocolError,
+	> {
+		let declaration = self.declarations.get(campaign).ok_or_else(|| {
+			omp_envd::exthost::control::ControlProtocolError::new(
+				"TargetNotFound",
+				"campaign is absent from the sealed declaration table",
+			)
+		})?;
+		if declaration.extension != identity.extension {
+			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				"AuthorizationError",
+				"campaign declaration belongs to another extension",
+			));
+		}
+		if declaration.host_generation != identity.host_generation
+			|| declaration.session_generation != identity.session_generation
+		{
+			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				"StaleGeneration",
+				"campaign declaration belongs to a replaced host or session generation",
+			));
+		}
+		let machine = (declaration.constructor)(state)?;
+		Ok((Arc::clone(&declaration.spec), machine))
+	}
+
+	fn owner(&self, campaign: &str) -> Option<Str> {
+		self
+			.declarations
+			.get(campaign)
+			.map(|declaration| declaration.extension.clone())
+	}
+}
 
 /// One daemon-wide discovery coordinator shared by every attached session.
 pub struct DiscoveryRuntime {
@@ -241,9 +374,786 @@ pub enum DiscoveryRuntimeError {
 	Store(#[from] DiscoveryStoreError),
 }
 
+/// Server-side bridge from the gateway protocol to the one authoritative
+/// provider application owner.
+pub struct LocalProviderGatewayAuthority {
+	owner:   Arc<crate::model_controls::ProductionProviderApplicationOwner>,
+	backend: crate::chat::ChatProviderControlBackend,
+	serial:  tokio::sync::Mutex<()>,
+}
+
+/// Publishes a local provider owner on `InferenceRpc`.
+pub fn gateway_provider_rpc_authority(
+	owner: Arc<crate::model_controls::ProductionProviderApplicationOwner>,
+) -> Arc<dyn omp_serve::inference::ProviderGatewayAuthority> {
+	Arc::new(LocalProviderGatewayAuthority {
+		backend: crate::chat::ChatProviderControlBackend::new(owner.clone()),
+		owner,
+		serial: tokio::sync::Mutex::new(()),
+	})
+}
+
+impl LocalProviderGatewayAuthority {
+	fn cursor(&self) -> pb::Cursor {
+		use crate::chat::ProviderApplicationOwner as _;
+		let registry = self.owner.registry();
+		pb::Cursor {
+			epoch: registry.catalog_revision().as_str().as_bytes().to_vec().into(),
+			generation: registry.generation(),
+		}
+	}
+
+	fn caller(caller: Option<pb::ProviderCaller>) -> Result<ControlConnectionIdentity, Status> {
+		let caller = caller.ok_or_else(|| Status::unauthenticated("provider caller is required"))?;
+		if caller.extension.is_empty()
+			|| caller.artifact_digest.is_empty()
+			|| caller.principal_id.is_empty()
+			|| caller.layer.is_empty()
+			|| caller.tier.is_empty()
+			|| caller.trust.is_empty()
+			|| caller.host_generation == 0
+			|| caller.session_generation == 0
+		{
+			return Err(Status::unauthenticated("provider caller identity is incomplete"));
+		}
+		Ok(ControlConnectionIdentity {
+			extension: caller.extension.into(),
+			principal: Principal::new(caller.principal_id.into(), caller.principal_display.into()),
+			artifact_digest: caller.artifact_digest.into(),
+			layer: caller.layer.into(),
+			tier: caller.tier.into(),
+			trust: caller.trust.into(),
+			host_generation: caller.host_generation,
+			session_generation: caller.session_generation,
+			capabilities: Arc::new(caller.capabilities.into_iter().map(Str::from).collect()),
+		})
+	}
+
+	fn check_generation(&self, expected: u64) -> Result<(), Status> {
+		use crate::chat::ProviderApplicationOwner as _;
+		if self.owner.registry().generation() == expected {
+			Ok(())
+		} else {
+			Err(Status::aborted("provider catalog generation is stale"))
+		}
+	}
+
+	fn declaration(
+		request: pb::ProviderDeclarationRequest,
+	) -> Result<
+		(
+			ControlConnectionIdentity,
+			crate::model_controls::ProviderDeclarationDocument,
+			u64,
+		),
+		Status,
+	> {
+		if request.provider.is_empty() {
+			return Err(Status::invalid_argument("provider is required"));
+		}
+		let caller = Self::caller(request.caller)?;
+		let document = serde_json::from_slice(&request.document_json)
+			.map_err(|error| Status::invalid_argument(format!("provider declaration: {error}")))?;
+		Ok((
+			caller,
+			crate::model_controls::ProviderDeclarationDocument {
+				provider: request.provider.into(),
+				document,
+			},
+			request.expected_generation,
+		))
+	}
+}
+
+#[async_trait]
+impl omp_serve::inference::ProviderGatewayAuthority for LocalProviderGatewayAuthority {
+	async fn catalog(
+		&self,
+		request: pb::ProviderCatalogRequest,
+	) -> Result<pb::ProviderCatalogResponse, Status> {
+		use crate::model_controls::ProviderControlBackend as _;
+		let models = self
+			.backend
+			.models(request.provider.as_deref())
+			.await
+			.map_err(provider_status)?
+			.into_iter()
+			.map(provider_model_to_pb)
+			.collect();
+		Ok(pb::ProviderCatalogResponse { models, cursor: Some(self.cursor()) })
+	}
+
+	async fn watch_catalog(
+		&self,
+		request: pb::WatchProviderCatalogRequest,
+	) -> Result<pb::WatchProviderCatalogResponse, Status> {
+		use crate::model_controls::ProviderControlBackend as _;
+		let since = request.since.map(|cursor| crate::model_controls::ProviderCatalogCursor {
+			epoch: cursor.epoch.to_vec().into_boxed_slice(),
+			generation: cursor.generation,
+		});
+		let events = self
+			.backend
+			.watch_models(since)
+			.await
+			.map_err(provider_status)?
+			.into_iter()
+			.map(provider_event_to_pb)
+			.collect();
+		Ok(pb::WatchProviderCatalogResponse { events })
+	}
+
+	async fn authenticated(
+		&self,
+		request: pb::ProviderAuthenticatedRequest,
+	) -> Result<pb::ProviderAuthenticatedResponse, Status> {
+		use crate::model_controls::ProviderControlBackend as _;
+		if request.provider.is_empty() {
+			return Err(Status::invalid_argument("provider is required"));
+		}
+		let authenticated = self
+			.backend
+			.is_authenticated(&request.provider)
+			.await
+			.map_err(provider_status)?;
+		Ok(pb::ProviderAuthenticatedResponse { authenticated })
+	}
+
+	async fn declare(
+		&self,
+		request: pb::ProviderDeclarationRequest,
+	) -> Result<pb::ProviderMutationResponse, Status> {
+		let (caller, declaration, generation) = Self::declaration(request)?;
+		let _guard = self.serial.lock().await;
+		self.check_generation(generation)?;
+		self.owner.declare_provider(&caller, declaration).map_err(provider_status)?;
+		Ok(pb::ProviderMutationResponse { cursor: Some(self.cursor()) })
+	}
+
+	async fn replace(
+		&self,
+		request: pb::ProviderDeclarationRequest,
+	) -> Result<pb::ProviderMutationResponse, Status> {
+		use crate::chat::ProviderApplicationOwner as _;
+		let (caller, declaration, generation) = Self::declaration(request)?;
+		let _guard = self.serial.lock().await;
+		self.check_generation(generation)?;
+		self.owner
+			.replace_provider(&caller, declaration)
+			.await
+			.map_err(provider_status)?;
+		Ok(pb::ProviderMutationResponse { cursor: Some(self.cursor()) })
+	}
+
+	async fn retract(
+		&self,
+		request: pb::RetractProviderRequest,
+	) -> Result<pb::ProviderMutationResponse, Status> {
+		use crate::chat::ProviderApplicationOwner as _;
+		if request.provider.is_empty() {
+			return Err(Status::invalid_argument("provider is required"));
+		}
+		let caller = Self::caller(request.caller)?;
+		let _guard = self.serial.lock().await;
+		self.check_generation(request.expected_generation)?;
+		self.owner
+			.retract_provider(&caller, &request.provider)
+			.await
+			.map_err(provider_status)?;
+		Ok(pb::ProviderMutationResponse { cursor: Some(self.cursor()) })
+	}
+
+	async fn request(
+		&self,
+		request: pb::ProviderOperationRequest,
+	) -> Result<pb::ProviderOperationResponse, Status> {
+		self.execute(request, false).await
+	}
+
+	async fn mint_session(
+		&self,
+		request: pb::ProviderOperationRequest,
+	) -> Result<pb::ProviderOperationResponse, Status> {
+		self.execute(request, true).await
+	}
+}
+
+impl LocalProviderGatewayAuthority {
+	async fn execute(
+		&self,
+		request: pb::ProviderOperationRequest,
+		session_only: bool,
+	) -> Result<pb::ProviderOperationResponse, Status> {
+		use crate::chat::ProviderApplicationOwner as _;
+		let caller = Self::caller(request.caller)?;
+		if request.provider.is_empty() {
+			return Err(Status::invalid_argument("provider is required"));
+		}
+		let operation = provider_kind_from_pb(request.kind)?;
+		if session_only && operation != crate::model_controls::ProviderRequestKind::Realtime {
+			return Err(Status::invalid_argument(
+				"MintProviderSession requires a realtime provider operation",
+			));
+		}
+		if !session_only && operation == crate::model_controls::ProviderRequestKind::Realtime {
+			return Err(Status::invalid_argument(
+				"realtime endpoints must use MintProviderSession",
+			));
+		}
+		let payload: Map<String, Value> = serde_json::from_slice(&request.payload_json)
+			.map_err(|error| Status::invalid_argument(format!("provider payload: {error}")))?;
+		let _guard = self.serial.lock().await;
+		self.check_generation(request.expected_generation)?;
+		let result = self
+			.owner
+			.provider_request(
+				&caller,
+				crate::model_controls::ProviderControlRequest {
+					provider: request.provider.into(),
+					operation,
+					payload,
+				},
+			)
+			.await
+			.map_err(provider_status)?;
+		Ok(provider_result_to_pb(result))
+	}
+}
+
+/// Authenticated gateway adapter implementing the same provider backend used by
+/// local CONTROL composition. It never constructs or mutates a local registry.
+#[derive(Clone)]
+pub struct RemoteProviderControlBackend {
+	channel: Channel,
+}
+
+impl RemoteProviderControlBackend {
+	pub fn new(channel: Channel) -> Self {
+		Self { channel }
+	}
+
+	fn client(&self) -> pb::inference_client::InferenceClient<Channel> {
+		pb::inference_client::InferenceClient::new(self.channel.clone())
+	}
+
+	async fn generation(&self) -> Result<u64, crate::model_controls::ProviderControlError> {
+		let response = self
+			.client()
+			.provider_catalog(pb::ProviderCatalogRequest { provider: None })
+			.await
+			.map_err(provider_error)?
+			.into_inner();
+		response
+			.cursor
+			.map(|cursor| cursor.generation)
+			.ok_or_else(|| crate::model_controls::ProviderControlError::Request(
+				sf!("gateway omitted provider catalog cursor"),
+			))
+	}
+}
+
+/// Constructs the connection-scoped provider CONTROL factory used in gateway
+/// mode.
+pub fn gateway_provider_control_factory(
+	channel: Channel,
+) -> Arc<dyn ControlAuthorityFactory> {
+	let backend: Arc<dyn crate::model_controls::ProviderControlBackend> =
+		Arc::new(RemoteProviderControlBackend::new(channel));
+	Arc::new(crate::model_controls::ProviderControlAuthorityFactory::new(backend))
+}
+
+#[async_trait]
+impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBackend {
+	async fn models(
+		&self,
+		provider: Option<&str>,
+	) -> Result<Vec<crate::model_controls::ProviderModelCard>, crate::model_controls::ProviderControlError> {
+		let response = self
+			.client()
+			.provider_catalog(pb::ProviderCatalogRequest {
+				provider: provider.map(ToOwned::to_owned),
+			})
+			.await
+			.map_err(provider_error)?
+			.into_inner();
+		Ok(response.models.into_iter().map(provider_model_from_pb).collect())
+	}
+
+	async fn watch_models(
+		&self,
+		since: Option<crate::model_controls::ProviderCatalogCursor>,
+	) -> Result<Vec<crate::model_controls::ProviderModelEvent>, crate::model_controls::ProviderControlError> {
+		let response = self
+			.client()
+			.watch_provider_catalog(pb::WatchProviderCatalogRequest {
+				since: since.map(|cursor| pb::Cursor {
+					epoch: cursor.epoch.to_vec().into(),
+					generation: cursor.generation,
+				}),
+			})
+			.await
+			.map_err(provider_error)?
+			.into_inner();
+		response.events.into_iter().map(provider_event_from_pb).collect()
+	}
+
+	async fn is_authenticated(
+		&self,
+		provider: &str,
+	) -> Result<bool, crate::model_controls::ProviderControlError> {
+		Ok(self
+			.client()
+			.provider_authenticated(pb::ProviderAuthenticatedRequest {
+				provider: provider.to_owned(),
+			})
+			.await
+			.map_err(provider_error)?
+			.into_inner()
+			.authenticated)
+	}
+
+	async fn replace(
+		&self,
+		identity: &ControlConnectionIdentity,
+		declaration: crate::model_controls::ProviderDeclarationDocument,
+	) -> Result<(), crate::model_controls::ProviderControlError> {
+		let generation = self.generation().await?;
+		let request = declaration_request(identity, declaration, generation)?;
+		self.client().replace_provider(request).await.map_err(provider_error)?;
+		Ok(())
+	}
+
+	async fn retract(
+		&self,
+		identity: &ControlConnectionIdentity,
+		provider: &str,
+	) -> Result<(), crate::model_controls::ProviderControlError> {
+		let generation = self.generation().await?;
+		self
+			.client()
+			.retract_provider(pb::RetractProviderRequest {
+				caller: Some(caller_to_pb(identity)),
+				provider: provider.to_owned(),
+				expected_generation: generation,
+			})
+			.await
+			.map_err(provider_error)?;
+		Ok(())
+	}
+
+	async fn request(
+		&self,
+		identity: &ControlConnectionIdentity,
+		request: crate::model_controls::ProviderControlRequest,
+	) -> Result<crate::model_controls::ProviderControlResult, crate::model_controls::ProviderControlError> {
+		let generation = self.generation().await?;
+		let realtime = request.operation == crate::model_controls::ProviderRequestKind::Realtime;
+		let request = operation_request(identity, request, generation)?;
+		let response = if realtime {
+			self.client().mint_provider_session(request).await
+		} else {
+			self.client().execute_provider_request(request).await
+		}
+		.map_err(provider_error)?
+		.into_inner();
+		provider_result_from_pb(response)
+	}
+}
+
+fn caller_to_pb(identity: &ControlConnectionIdentity) -> pb::ProviderCaller {
+	pb::ProviderCaller {
+		extension: identity.extension.to_string(),
+		artifact_digest: identity.artifact_digest.to_string(),
+		host_generation: identity.host_generation,
+		session_generation: identity.session_generation,
+		principal_id: identity.principal.id().to_owned(),
+		principal_display: identity.principal.display().to_owned(),
+		layer: identity.layer.to_string(),
+		tier: identity.tier.to_string(),
+		trust: identity.trust.to_string(),
+		capabilities: identity.capabilities.iter().map(ToString::to_string).collect(),
+	}
+}
+
+fn declaration_request(
+	identity: &ControlConnectionIdentity,
+	declaration: crate::model_controls::ProviderDeclarationDocument,
+	expected_generation: u64,
+) -> Result<pb::ProviderDeclarationRequest, crate::model_controls::ProviderControlError> {
+	let document_json = serde_json::to_vec(&declaration.document)
+		.map_err(|error| crate::model_controls::ProviderControlError::Request(error.to_string().into()))?;
+	Ok(pb::ProviderDeclarationRequest {
+		caller: Some(caller_to_pb(identity)),
+		provider: declaration.provider.to_string(),
+		document_json: document_json.into(),
+		expected_generation,
+	})
+}
+
+fn operation_request(
+	identity: &ControlConnectionIdentity,
+	request: crate::model_controls::ProviderControlRequest,
+	expected_generation: u64,
+) -> Result<pb::ProviderOperationRequest, crate::model_controls::ProviderControlError> {
+	let payload_json = serde_json::to_vec(&request.payload)
+		.map_err(|error| crate::model_controls::ProviderControlError::Request(error.to_string().into()))?;
+	Ok(pb::ProviderOperationRequest {
+		caller: Some(caller_to_pb(identity)),
+		provider: request.provider.to_string(),
+		kind: match request.operation {
+			crate::model_controls::ProviderRequestKind::GenerateImage =>
+				pb::provider_operation_request::Kind::GenerateImage as i32,
+			crate::model_controls::ProviderRequestKind::Speak =>
+				pb::provider_operation_request::Kind::Speak as i32,
+			crate::model_controls::ProviderRequestKind::Transcribe =>
+				pb::provider_operation_request::Kind::Transcribe as i32,
+			crate::model_controls::ProviderRequestKind::Realtime =>
+				pb::provider_operation_request::Kind::Realtime as i32,
+		},
+		payload_json: payload_json.into(),
+		expected_generation,
+	})
+}
+
+fn provider_kind_from_pb(
+	kind: i32,
+) -> Result<crate::model_controls::ProviderRequestKind, Status> {
+	match pb::provider_operation_request::Kind::try_from(kind)
+		.unwrap_or(pb::provider_operation_request::Kind::Unspecified)
+	{
+		pb::provider_operation_request::Kind::GenerateImage =>
+			Ok(crate::model_controls::ProviderRequestKind::GenerateImage),
+		pb::provider_operation_request::Kind::Speak =>
+			Ok(crate::model_controls::ProviderRequestKind::Speak),
+		pb::provider_operation_request::Kind::Transcribe =>
+			Ok(crate::model_controls::ProviderRequestKind::Transcribe),
+		pb::provider_operation_request::Kind::Realtime =>
+			Ok(crate::model_controls::ProviderRequestKind::Realtime),
+		pb::provider_operation_request::Kind::Unspecified =>
+			Err(Status::invalid_argument("provider operation kind is required")),
+	}
+}
+
+fn provider_status(error: crate::model_controls::ProviderControlError) -> Status {
+	use crate::model_controls::ProviderControlError;
+	match error {
+		ProviderControlError::Authorization => Status::permission_denied(error.to_string()),
+		ProviderControlError::Conflict => Status::already_exists(error.to_string()),
+		ProviderControlError::InvalidDeclaration(_) => Status::invalid_argument(error.to_string()),
+		ProviderControlError::CapabilityDenied => Status::permission_denied(error.to_string()),
+		ProviderControlError::NotFound => Status::not_found(error.to_string()),
+		ProviderControlError::Unauthenticated => Status::unauthenticated(error.to_string()),
+		ProviderControlError::StaleGeneration => Status::aborted(error.to_string()),
+		ProviderControlError::Request(_) => Status::internal(error.to_string()),
+	}
+}
+
+fn provider_error(status: Status) -> crate::model_controls::ProviderControlError {
+	use crate::model_controls::ProviderControlError;
+	match status.code() {
+		Code::PermissionDenied if status.message().contains("capability") =>
+			ProviderControlError::CapabilityDenied,
+		Code::PermissionDenied => ProviderControlError::Authorization,
+		Code::AlreadyExists => ProviderControlError::Conflict,
+		Code::InvalidArgument => ProviderControlError::InvalidDeclaration(status.message().into()),
+		Code::NotFound => ProviderControlError::NotFound,
+		Code::Unauthenticated => ProviderControlError::Unauthenticated,
+		Code::Aborted => ProviderControlError::StaleGeneration,
+		_ => ProviderControlError::Request(status.message().into()),
+	}
+}
+
+fn provider_cursor_to_pb(cursor: crate::model_controls::ProviderCatalogCursor) -> pb::Cursor {
+	pb::Cursor { epoch: cursor.epoch.to_vec().into(), generation: cursor.generation }
+}
+
+fn provider_event_to_pb(event: crate::model_controls::ProviderModelEvent) -> pb::ModelEvent {
+	use crate::model_controls::ProviderModelEvent;
+	match event {
+		ProviderModelEvent::Upsert { cursor, card } => pb::ModelEvent {
+			cursor: Some(provider_cursor_to_pb(cursor)),
+			event: Some(pb::model_event::Event::Upserted(provider_model_to_pb(card))),
+		},
+		ProviderModelEvent::Remove { cursor, id } => pb::ModelEvent {
+			cursor: Some(provider_cursor_to_pb(cursor)),
+			event: Some(pb::model_event::Event::RemovedId(id.to_string())),
+		},
+		ProviderModelEvent::Reset { cursor } => pb::ModelEvent {
+			cursor: Some(provider_cursor_to_pb(cursor)),
+			event: Some(pb::model_event::Event::Reset(pb::model_event::Reset {})),
+		},
+	}
+}
+
+fn provider_event_from_pb(
+	event: pb::ModelEvent,
+) -> Result<crate::model_controls::ProviderModelEvent, crate::model_controls::ProviderControlError> {
+	let cursor = event.cursor.ok_or_else(|| crate::model_controls::ProviderControlError::Request(
+		sf!("gateway omitted provider event cursor"),
+	))?;
+	let cursor = crate::model_controls::ProviderCatalogCursor {
+		epoch: cursor.epoch.to_vec().into_boxed_slice(),
+		generation: cursor.generation,
+	};
+	match event.event {
+		Some(pb::model_event::Event::Upserted(card)) =>
+			Ok(crate::model_controls::ProviderModelEvent::Upsert {
+				cursor,
+				card: provider_model_from_pb(card),
+			}),
+		Some(pb::model_event::Event::RemovedId(id)) =>
+			Ok(crate::model_controls::ProviderModelEvent::Remove { cursor, id: id.into() }),
+		Some(pb::model_event::Event::Reset(_)) =>
+			Ok(crate::model_controls::ProviderModelEvent::Reset { cursor }),
+		None => Err(crate::model_controls::ProviderControlError::Request(
+			sf!("gateway omitted provider event"),
+		)),
+	}
+}
+
+fn provider_model_to_pb(card: crate::model_controls::ProviderModelCard) -> pb::ModelCard {
+	pb::ModelCard {
+		id: card.id.to_string(),
+		provider: card.provider.to_string(),
+		model: card.model.to_string(),
+		name: card.name.to_string(),
+		family: card.family.map_or_else(String::new, |value| value.to_string()),
+		facets: card.facets.iter().map(|value| facet_from_str(value) as i32).collect(),
+		inputs: card.inputs.iter().map(|value| modality_from_str(value) as i32).collect(),
+		outputs: card.outputs.iter().map(|value| modality_from_str(value) as i32).collect(),
+		reasoning: card.reasoning,
+		efforts: card.efforts.iter().map(|value| effort_from_str(value) as i32).collect(),
+		context_window: card.context_window.unwrap_or(0),
+		max_output_tokens: card.max_output_tokens.unwrap_or(0),
+		pricing: card.pricing.iter().map(|price| pb::Price {
+			unit: price_unit_from_str(&price.unit) as i32,
+			nanos_usd: price.nanos_usd,
+		}).collect(),
+		availability: availability_from_str(&card.availability) as i32,
+		source: i32::from(card.source),
+		blocked_until_ms: card.blocked_until_ms.unwrap_or(0),
+		deprecated: card.deprecated,
+		updated_at_ms: card.updated_at_ms.unwrap_or(0),
+		supports_tools: card.supports_tools,
+		props: None,
+	}
+}
+
+fn provider_model_from_pb(card: pb::ModelCard) -> crate::model_controls::ProviderModelCard {
+	crate::model_controls::ProviderModelCard {
+		id: card.id.into(),
+		provider: card.provider.into(),
+		model: card.model.into(),
+		name: card.name.into(),
+		family: (!card.family.is_empty()).then(|| card.family.into()),
+		facets: card.facets.into_iter().filter_map(|value| pb::Facet::try_from(value).ok())
+			.map(|value| facet_name(value).into()).collect(),
+		inputs: card.inputs.into_iter().filter_map(|value| pb::Modality::try_from(value).ok())
+			.map(|value| modality_name(value).into()).collect(),
+		outputs: card.outputs.into_iter().filter_map(|value| pb::Modality::try_from(value).ok())
+			.map(|value| modality_name(value).into()).collect(),
+		reasoning: card.reasoning,
+		efforts: card.efforts.into_iter().filter_map(|value| pb::Effort::try_from(value).ok())
+			.map(|value| effort_name(value).into()).collect(),
+		context_window: (card.context_window != 0).then_some(card.context_window),
+		max_output_tokens: (card.max_output_tokens != 0).then_some(card.max_output_tokens),
+		pricing: card.pricing.into_iter().map(|price| crate::model_controls::ProviderPrice {
+			unit: pb::price::Unit::try_from(price.unit)
+				.map_or("unknown", price_unit_name).into(),
+			nanos_usd: price.nanos_usd,
+		}).collect(),
+		availability: pb::Availability::try_from(card.availability)
+			.map_or("unknown", availability_name).into(),
+		source: u8::try_from(card.source).unwrap_or(0),
+		blocked_until_ms: (card.blocked_until_ms != 0).then_some(card.blocked_until_ms),
+		deprecated: card.deprecated,
+		updated_at_ms: (card.updated_at_ms != 0).then_some(card.updated_at_ms),
+		supports_tools: card.supports_tools,
+		props: Map::new(),
+	}
+}
+
+fn facet_from_str(value: &str) -> pb::Facet {
+	match value {
+		"chat" => pb::Facet::Chat,
+		"embed" => pb::Facet::Embed,
+		"image_gen" => pb::Facet::ImageGen,
+		"video_gen" => pb::Facet::VideoGen,
+		"speak" => pb::Facet::Speak,
+		"transcribe" => pb::Facet::Transcribe,
+		"realtime" => pb::Facet::Realtime,
+		"search" => pb::Facet::Search,
+		_ => pb::Facet::Unspecified,
+	}
+}
+fn facet_name(value: pb::Facet) -> &'static str {
+	match value {
+		pb::Facet::Chat => "chat", pb::Facet::Embed => "embed",
+		pb::Facet::ImageGen => "image_gen", pb::Facet::VideoGen => "video_gen",
+		pb::Facet::Speak => "speak", pb::Facet::Transcribe => "transcribe",
+		pb::Facet::Realtime => "realtime", pb::Facet::Search => "search",
+		pb::Facet::Unspecified => "unspecified",
+	}
+}
+fn modality_from_str(value: &str) -> pb::Modality {
+	match value {
+		"text" => pb::Modality::Text, "image" => pb::Modality::Image,
+		"audio" => pb::Modality::Audio, "video" => pb::Modality::Video,
+		"document" | "pdf" => pb::Modality::Pdf, _ => pb::Modality::Unspecified,
+	}
+}
+fn modality_name(value: pb::Modality) -> &'static str {
+	match value {
+		pb::Modality::Text => "text", pb::Modality::Image => "image",
+		pb::Modality::Audio => "audio", pb::Modality::Video => "video",
+		pb::Modality::Pdf => "document", pb::Modality::Unspecified => "unspecified",
+	}
+}
+fn effort_from_str(value: &str) -> pb::Effort {
+	match value {
+		"off" => pb::Effort::Off, "minimal" => pb::Effort::Minimal,
+		"low" => pb::Effort::Low, "medium" => pb::Effort::Medium,
+		"high" => pb::Effort::High, "max" => pb::Effort::Max,
+		"xhigh" => pb::Effort::Xhigh, _ => pb::Effort::Unspecified,
+	}
+}
+fn effort_name(value: pb::Effort) -> &'static str {
+	match value {
+		pb::Effort::Off => "off", pb::Effort::Minimal => "minimal",
+		pb::Effort::Low => "low", pb::Effort::Medium => "medium",
+		pb::Effort::High => "high", pb::Effort::Max => "max",
+		pb::Effort::Xhigh => "xhigh", pb::Effort::Unspecified => "unspecified",
+	}
+}
+fn availability_from_str(value: &str) -> pb::Availability {
+	match value {
+		"available" => pb::Availability::Available,
+		"login_required" => pb::Availability::LoginRequired,
+		"blocked" => pb::Availability::Blocked,
+		"disabled" => pb::Availability::Disabled,
+		_ => pb::Availability::Unspecified,
+	}
+}
+fn availability_name(value: pb::Availability) -> &'static str {
+	match value {
+		pb::Availability::Available => "available",
+		pb::Availability::LoginRequired => "login_required",
+		pb::Availability::Blocked => "blocked",
+		pb::Availability::Disabled => "disabled",
+		pb::Availability::Unspecified => "unspecified",
+	}
+}
+fn price_unit_from_str(value: &str) -> pb::price::Unit {
+	match value {
+		"mtok_input" => pb::price::Unit::MtokInput,
+		"mtok_output" => pb::price::Unit::MtokOutput,
+		"mtok_cache_read" => pb::price::Unit::MtokCacheRead,
+		"mtok_cache_write" => pb::price::Unit::MtokCacheWrite,
+		"image" => pb::price::Unit::Image,
+		"video_second" => pb::price::Unit::VideoSecond,
+		"audio_second" => pb::price::Unit::AudioSecond,
+		"mchar_input" => pb::price::Unit::McharInput,
+		"request" => pb::price::Unit::Request,
+		_ => pb::price::Unit::Unspecified,
+	}
+}
+fn price_unit_name(value: pb::price::Unit) -> &'static str {
+	match value {
+		pb::price::Unit::MtokInput => "mtok_input",
+		pb::price::Unit::MtokOutput => "mtok_output",
+		pb::price::Unit::MtokCacheRead => "mtok_cache_read",
+		pb::price::Unit::MtokCacheWrite => "mtok_cache_write",
+		pb::price::Unit::Image => "image",
+		pb::price::Unit::VideoSecond => "video_second",
+		pb::price::Unit::AudioSecond => "audio_second",
+		pb::price::Unit::McharInput => "mchar_input",
+		pb::price::Unit::Request => "request",
+		pb::price::Unit::Unspecified => "unknown",
+	}
+}
+
+fn provider_result_to_pb(
+	result: crate::model_controls::ProviderControlResult,
+) -> pb::ProviderOperationResponse {
+	use crate::model_controls::ProviderControlResult;
+	let result = match result {
+		ProviderControlResult::Image { images, cost_nanos_usd } =>
+			pb::provider_operation_response::Result::Image(
+				pb::provider_operation_response::Image {
+					images: images.into_vec().into_iter().map(|blob| pb::ProviderBlob {
+						hash: blob.hash.to_string(), size: blob.size,
+					}).collect(),
+					cost_nanos_usd,
+				},
+			),
+		ProviderControlResult::Speech { audio, format, cost_nanos_usd } =>
+			pb::provider_operation_response::Result::Speech(
+				pb::provider_operation_response::Speech {
+					audio: Some(pb::ProviderBlob { hash: audio.hash.to_string(), size: audio.size }),
+					format: format.to_string(), cost_nanos_usd,
+				},
+			),
+		ProviderControlResult::Transcription { text, language, cost_nanos_usd } =>
+			pb::provider_operation_response::Result::Transcription(
+				pb::provider_operation_response::Transcription {
+					text: text.to_string(), language: language.map(|value| value.to_string()),
+					cost_nanos_usd,
+				},
+			),
+		ProviderControlResult::Realtime {
+			id, endpoint, credential, expires_at_ms, transport,
+		} => pb::provider_operation_response::Result::Realtime(
+			pb::provider_operation_response::Realtime {
+				id: id.to_string(), endpoint: endpoint.to_string(),
+				credential: credential.to_string(), expires_at_ms,
+				transport: transport.to_string(),
+			},
+		),
+	};
+	pb::ProviderOperationResponse { result: Some(result) }
+}
+
+fn provider_result_from_pb(
+	response: pb::ProviderOperationResponse,
+) -> Result<crate::model_controls::ProviderControlResult, crate::model_controls::ProviderControlError> {
+	use crate::model_controls::{ProviderBlobRef, ProviderControlError, ProviderControlResult};
+	match response.result {
+		Some(pb::provider_operation_response::Result::Image(image)) =>
+			Ok(ProviderControlResult::Image {
+				images: image.images.into_iter().map(|blob| ProviderBlobRef {
+					hash: blob.hash.into(), size: blob.size,
+				}).collect(),
+				cost_nanos_usd: image.cost_nanos_usd,
+			}),
+		Some(pb::provider_operation_response::Result::Speech(speech)) => {
+			let audio = speech.audio.ok_or_else(|| ProviderControlError::Request(
+				sf!("gateway omitted speech blob"),
+			))?;
+			Ok(ProviderControlResult::Speech {
+				audio: ProviderBlobRef { hash: audio.hash.into(), size: audio.size },
+				format: speech.format.into(), cost_nanos_usd: speech.cost_nanos_usd,
+			})
+		},
+		Some(pb::provider_operation_response::Result::Transcription(transcription)) =>
+			Ok(ProviderControlResult::Transcription {
+				text: transcription.text.into(),
+				language: transcription.language.map(Into::into),
+				cost_nanos_usd: transcription.cost_nanos_usd,
+			}),
+		Some(pb::provider_operation_response::Result::Realtime(realtime)) =>
+			Ok(ProviderControlResult::Realtime {
+				id: realtime.id.into(), endpoint: realtime.endpoint.into(),
+				credential: realtime.credential.into(),
+				expires_at_ms: realtime.expires_at_ms, transport: realtime.transport.into(),
+			}),
+		None => Err(ProviderControlError::Request(sf!(
+			"gateway omitted provider operation result"
+		))),
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	#[test]
 	use omp_catalog::{
 		ContextStrategy, DiscoveredModel, DiscoveryDefaults, ModelAvailability, OperationBits,
 		Pricing, RouteId, WireModelId, WirePolicyId,

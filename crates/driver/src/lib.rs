@@ -22,6 +22,7 @@ pub mod model_controls;
 pub mod modes;
 pub mod plan;
 pub mod power;
+pub mod prompt_head;
 pub mod prompt_input;
 pub mod prompt_prep;
 pub mod prompt_templates;

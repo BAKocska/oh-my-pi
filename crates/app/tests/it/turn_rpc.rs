@@ -127,7 +127,7 @@ fn scripted_registry(
 	database: &std::path::Path,
 ) -> (Registry, ConversationSessionPlanner, FakeProvider, String) {
 	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../../llm-catalog/data/catalog.normalized.json"))
+		serde_json::from_str(include_str!("../../../catalog/data/catalog.normalized.json"))
 			.expect("normalized catalog");
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {
@@ -730,7 +730,7 @@ fn canonical_history_uses_only_live_definitions_and_lifts_deterministically() {
 
 	let without_lift = history_registry(false);
 	let (data, data_request) =
-		omp_app::rpc_adapter::project_provider_turn_for_test(&thread, &params, &without_lift)
+		omp_serve::inference::project_provider_turn_for_test(&thread, &params, &without_lift)
 			.expect("unliftable history remains projectable as transcript data");
 	assert_eq!(
 		data.encode_to_vec(),
@@ -746,10 +746,10 @@ fn canonical_history_uses_only_live_definitions_and_lifts_deterministically() {
 
 	let with_lift = history_registry(true);
 	let (first, first_request) =
-		omp_app::rpc_adapter::project_provider_turn_for_test(&thread, &params, &with_lift)
+		omp_serve::inference::project_provider_turn_for_test(&thread, &params, &with_lift)
 			.expect("complete lift projects history");
 	let (second, second_request) =
-		omp_app::rpc_adapter::project_provider_turn_for_test(&thread, &params, &with_lift)
+		omp_serve::inference::project_provider_turn_for_test(&thread, &params, &with_lift)
 			.expect("repeated complete lift projects history");
 	assert_eq!(
 		first.encode_to_vec(),
@@ -791,7 +791,7 @@ fn canonical_history_uses_only_live_definitions_and_lifts_deterministically() {
 		"historical schema bytes must not enter the provider request"
 	);
 	let empty_registry = omp_tool::Registry::new();
-	let error = omp_app::rpc_adapter::project_provider_turn_for_test(
+	let error = omp_serve::inference::project_provider_turn_for_test(
 		&thread_pb::Thread::default(),
 		&params,
 		&empty_registry,
@@ -803,7 +803,7 @@ fn canonical_history_uses_only_live_definitions_and_lifts_deterministically() {
 #[test]
 fn empty_tool_selection_advertises_no_tools() {
 	let registry = history_registry(true);
-	let (_, request) = omp_app::rpc_adapter::project_provider_turn_for_test(
+	let (_, request) = omp_serve::inference::project_provider_turn_for_test(
 		&thread_pb::Thread::default(),
 		&pb::ChatParams::default(),
 		&registry,

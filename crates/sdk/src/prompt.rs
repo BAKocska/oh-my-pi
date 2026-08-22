@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use omp_agent::{
 	PromptError, PromptOut, PromptPatchSet, RenderedPrompt, SlotAssembler, SlotClass, SlotDecl,
-	SlotId, SlotRegistration, SlotSource, WorkspaceInput,
+	SlotId, SlotRegistration, SlotSource, Props,
 };
 use omp_core::Str;
 use thiserror::Error;
@@ -32,7 +32,7 @@ struct TextContribution(Str);
 impl SlotSource for TextContribution {
 	fn render(
 		&self,
-		_workspace: &WorkspaceInput,
+		_workspace: &Props,
 		out: &mut dyn PromptOut,
 	) -> Result<(), PromptError> {
 		out.write_str(&self.0);
@@ -77,7 +77,7 @@ impl PromptCompiler {
 	}
 
 	/// Compiles canonical items and their prompt hash.
-	pub fn compile(&self, workspace: &WorkspaceInput) -> Result<RenderedPrompt, PromptPatchError> {
+	pub fn compile(&self, workspace: &Props) -> Result<RenderedPrompt, PromptPatchError> {
 		let registrations = self
 			.contributions
 			.iter()

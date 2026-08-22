@@ -16,7 +16,7 @@ use crate::cli::{TinyModelsArgs, TinyModelsCommand};
 pub async fn run(args: TinyModelsArgs) -> miette::Result<()> {
 	let root = args
 		.cache_dir
-		.unwrap_or(omp_core::dirs::data_dir(None)?.join("models"));
+		.unwrap_or(omp_core::dirs::data_dir(None).into_diagnostic()?.join("models"));
 	std::fs::create_dir_all(&root).into_diagnostic()?;
 	let store = ArtifactStore::open(&root).into_diagnostic()?;
 	let models = unique_models();

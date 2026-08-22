@@ -628,9 +628,13 @@ impl DaemonHandle {
 			.clone()
 			.ok_or(DaemonError::MissingDataDirectory)?;
 		std::fs::create_dir_all(&data_dir).map_err(DaemonError::PrepareState)?;
-		let (registry, inference, _authority) =
-			omp_driver::registry::production_inference(&data_dir, tool_registry, None).await?;
-		Self::start_rpc(config, data_dir, registry, inference).await
+		let omp_driver::registry::ProductionInference {
+			registry,
+			rpc: inference,
+			auth_control,
+			..
+		} = omp_driver::registry::production_inference(&data_dir, tool_registry, None).await?;
+		Self::start_rpc(config, data_dir, registry, inference, Some(auth_control)).await
 	}
 
 	/// Starts the production RPC service set around a deterministic test
@@ -650,7 +654,7 @@ impl DaemonHandle {
 		std::fs::create_dir_all(&data_dir).map_err(DaemonError::PrepareState)?;
 		let inference =
 			InferenceRpc::new_for_test(registry.clone(), sessions, tool_registry, live_responses);
-		Self::start_rpc(config, data_dir, registry, inference).await
+		Self::start_rpc(config, data_dir, registry, inference, None).await
 	}
 
 	async fn start_rpc(
@@ -658,6 +662,7 @@ impl DaemonHandle {
 		data_dir: PathBuf,
 		registry: Registry,
 		inference: InferenceRpc,
+		auth_control: Option<omp_inference::auth::AuthControlHandle>,
 	) -> Result<Self, DaemonError> {
 		let routes = registry
 			.catalog()
@@ -669,6 +674,10 @@ impl DaemonHandle {
 		let bearer_token_file = config.bearer_token_file;
 		let (shutdown, mut rpc_shutdown) = watch::channel(false);
 		let blobs = Arc::new(BlobStore::open(&data_dir)?);
+		let auth_rpc = auth_control.map_or_else(
+			|| AuthRpc::new(registry.clone()),
+			|control| AuthRpc::with_control(registry.clone(), control),
+		);
 		let hello = || {
 			omp_rpc::HelloService::new(env!("CARGO_PKG_VERSION"), vec![
 				sf!("auth"),
@@ -684,7 +693,7 @@ impl DaemonHandle {
 				let inference_service = InferenceServer::new(inference.clone());
 				let gateway = GatewayServer::new(hello());
 				let forward = ForwardProxyServer::new(GatewayRpc::new(inference.clone()));
-				let auth = AuthServer::new(AuthRpc::new(registry.clone()));
+				let auth = AuthServer::new(auth_rpc.clone());
 				let blobs = BlobServer::new(BlobRpc::new(blobs.clone()));
 				let task = tokio::spawn(async move {
 					Server::builder()
@@ -725,7 +734,7 @@ impl DaemonHandle {
 						bearer_interceptor(auth_state.clone()),
 					);
 					let auth = AuthServer::with_interceptor(
-						AuthRpc::new(registry.clone()),
+						auth_rpc.clone(),
 						bearer_interceptor(auth_state.clone()),
 					);
 					let blobs = BlobServer::with_interceptor(
@@ -749,7 +758,7 @@ impl DaemonHandle {
 					let inference_service = InferenceServer::new(inference.clone());
 					let gateway = GatewayServer::new(hello());
 					let forward = ForwardProxyServer::new(GatewayRpc::new(inference.clone()));
-					let auth = AuthServer::new(AuthRpc::new(registry.clone()));
+					let auth = AuthServer::new(auth_rpc.clone());
 					let blobs = BlobServer::new(BlobRpc::new(blobs.clone()));
 					let task = tokio::spawn(async move {
 						Server::builder()

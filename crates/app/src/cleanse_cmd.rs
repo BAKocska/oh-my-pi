@@ -45,7 +45,7 @@ impl CleansePresentation for TerminalCleansePresentation {
 /// Runs the driver-owned cleanse workflow through terminal pickers.
 pub async fn run(args: CleanseArgs) -> miette::Result<()> {
 	let root = std::env::current_dir().into_diagnostic()?;
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let host = ProductionCleanseHost::open(root, data_dir, Arc::new(TerminalCleansePresentation))
 		.into_diagnostic()?;
 	let cancel = CancellationToken::new();

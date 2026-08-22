@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures::{Stream, stream};
 use omp_agent::{
 	AgentKind, AgentSnapshot, AgentState, AgentTree, Broker, Budget, DeliveryMode, InvokeFrame,
-	Mailbox, PeerMessage, TurnClient, TurnInput, TurnOptions, TurnSession, WorkspaceInput,
+	Mailbox, PeerMessage, TurnClient, TurnInput, TurnOptions, TurnSession, PromptFacts,
 };
 use omp_core::{Principal, Str, sf};
 use omp_driver::{
@@ -205,7 +205,9 @@ fn parent(
 	std::fs::create_dir_all(&sessions).expect("session directory");
 	let state = AgentState::new(AgentSnapshot::new(
 		TurnOptions::default(),
-		WorkspaceInput::new(&root, Arc::from([])),
+		PromptFacts::new(&root, Arc::from([]))
+			.props()
+			.expect("prompt props"),
 		Arc::new(omp_tool::Registry::new()),
 	));
 	let (env, _transport) = omp_env::EnvClient::in_process(1);

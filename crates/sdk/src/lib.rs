@@ -31,7 +31,7 @@ pub use model::{
 };
 pub use omp_agent::{
 	AgentEvent, Anchor, ContextView, InheritPosition, Item, PatchOp, PromptError, PromptHash,
-	PromptPatchSet, RenderedPrompt, SlotClass, SlotId, SlotPatch, Thread, WorkspaceInput,
+	PromptPatchSet, RenderedPrompt, SlotClass, SlotId, SlotPatch, Thread, Props,
 };
 pub use omp_catalog::{
 	AuthSpecId, Catalog, ModelKey, ModelRole, ProviderId, RouteId, SelectedModel,

@@ -21,7 +21,7 @@ use omp_proto::{
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::{
-	cli::{PrintArgs, data_dir, turn_id},
+	cli::{PrintArgs, turn_id},
 	usage_error::CliUsageError,
 };
 
@@ -42,7 +42,7 @@ enum PrintTurnError {
 
 /// Runs prompts through the durable headless agent loop.
 pub async fn run(args: PrintArgs) -> miette::Result<()> {
-	let data_dir = data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let settings =
 		omp_driver::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
 	let catalog = omp_catalog::snapshot::Catalog::try_embedded().map_err(|error| miette!(error))?;
@@ -120,7 +120,8 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		prompt_cache_affinity: args.prompt_cache_key.clone(),
 		session_generation: 1,
 	})
-	.await?;
+	.await
+	.into_diagnostic()?;
 	let fresh = session.initial_items().is_empty();
 	let startup_plan_ignored = startup_plan_ignored(&settings, fresh, args.plan_yolo);
 	let mut stderr = tokio::io::stderr();

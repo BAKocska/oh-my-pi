@@ -6,11 +6,12 @@ use omp_agent::{
 	ContextFile, EagerTaskPolicy, HostInfoInput, Journal, ModelPromptInput, MutationPromptInput,
 	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptNamedInput,
 	PromptSchemeInput, PromptSettingsInput, PromptToolExampleInput, PromptToolInput,
-	RepositoryInput, WorkspaceInput,
+	RepositoryInput, PromptFacts,
 };
 use omp_core::{Hash32, Str};
 use omp_env::{ClientError, EnvClient};
 use omp_proto::{SCHEMA_REV, env::v1 as pb};
+use omp_scribe::{Props, Value, map};
 use omp_tool::Registry;
 use thiserror::Error;
 
@@ -95,7 +96,7 @@ pub enum PromptDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptSnapshot {
 	/// Workspace, root, host, repository, model, capability, and settings facts.
-	pub workspace:   WorkspaceInput,
+	pub workspace:   PromptFacts,
 	/// Policy-resolved tool registry identities.
 	pub registry:    RegistryPromptInput,
 	/// Internal URL scheme capabilities.
@@ -111,8 +112,18 @@ pub struct PromptSnapshot {
 	/// Structured preparation diagnostics.
 	pub diagnostics: Arc<[PromptDiagnostic]>,
 }
-
 impl PromptSnapshot {
+	/// Builds the immutable template property bag beside the typed prompt pipeline.
+	///
+	/// Optional and empty-suppressed values are absent. Prompt-source paragraphs share one
+	/// canonical deduplication set in precedence order: custom prompt, append prompt, context
+	/// files, then rules.
+	pub fn props(&self) -> Props {
+		self.workspace
+			.props()
+			.expect("frozen prompt tool metadata must be UTF-8")
+	}
+
 	/// Freezes every caller-owned input and derives the capability projection
 	/// from the same exact selected registry and scheme snapshots.
 	#[allow(
@@ -120,7 +131,7 @@ impl PromptSnapshot {
 		reason = "the constructor names the required immutable prompt snapshot facets"
 	)]
 	pub fn freeze(
-		mut workspace: WorkspaceInput,
+		mut workspace: PromptFacts,
 		registry: &Registry,
 		selected_tools: Option<&[Str]>,
 		schemes: impl Into<Arc<[SchemePromptInput]>>,
@@ -343,7 +354,7 @@ fn warn_prep_fallback(step: &str) {
 /// Creates the initial workspace input from already-frozen facets.
 #[allow(
 	clippy::too_many_arguments,
-	reason = "the helper makes every WorkspaceInput facet explicit"
+	reason = "the helper makes every PromptFacts facet explicit"
 )]
 pub fn workspace_input(
 	cwd: impl Into<std::path::PathBuf>,
@@ -352,8 +363,8 @@ pub fn workspace_input(
 	repositories: impl Into<Arc<[RepositoryInput]>>,
 	model: ModelPromptInput,
 	settings: PromptSettingsInput,
-) -> WorkspaceInput {
-	WorkspaceInput {
+) -> PromptFacts {
+	PromptFacts {
 		cwd: cwd.into(),
 		vcs: None,
 		context_files: context_files.into(),
@@ -371,7 +382,7 @@ pub fn workspace_input(
 ///
 /// This projection performs no filesystem, process, registry, or model I/O.
 pub fn apply_discovery_snapshots(
-	workspace: &mut WorkspaceInput,
+	workspace: &mut PromptFacts,
 	context: &crate::discovery::context::ContextSnapshot,
 	project: &crate::discovery::project::ProjectSnapshot,
 	content: &crate::discovery::ActiveContentSnapshots,
@@ -457,7 +468,7 @@ mod tests {
 
 	#[test]
 	fn prompt_snapshot_freezes_every_input_facet() {
-		let workspace = WorkspaceInput {
+		let workspace = PromptFacts {
 			cwd: "/workspace".into(),
 			model: ModelPromptInput {
 				identifier:        Str::from("provider/model"),
@@ -513,5 +524,15 @@ mod tests {
 		assert_eq!(snapshot.rules[0].content, "frozen");
 		assert_eq!(snapshot.delegation.queued, 1);
 		assert_eq!(snapshot.clone(), snapshot);
+		let props = snapshot.props();
+		assert_eq!(props.get("cwd").and_then(Value::as_str), Some("/workspace"));
+		assert_eq!(
+			props.get("model"),
+			Some(&map! {
+				"identifier" => "provider/model".to_owned(),
+				"codex_task_policy" => true,
+			})
+		);
+		assert!(props.get("custom_prompt").is_none());
 	}
 }

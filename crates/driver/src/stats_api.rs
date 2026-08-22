@@ -21,11 +21,344 @@ use omp_storage::{
 };
 use serde_json::{Value, json};
 use smallvec::SmallVec;
+/// Production historical telemetry backend over the append-only side file and its SQLite index.
+pub mod telemetry_backend {
+	use std::{
+		collections::{BTreeMap, BTreeSet},
+		fs::File,
+		io::{Read as _, Seek as _, SeekFrom},
+		sync::Arc,
+		time::Instant,
+	};
+
+	use omp_core::Str;
+	use omp_storage::telemetry_index::{QueryGuard, TelemetryIndex};
+	use omp_telemetry::authority::{
+		DurableTelemetryQuery, DurableTelemetryRow, DurableTelemetryRows, TelemetryAuthorityError,
+		TelemetryAuthorityIdentity,
+	};
+	use serde_json::{Value, json};
+
+	const QUERY_LIMIT_MAX: usize = 10_000;
+	const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
+	/// Real-index query adapter. The session inventory defines project scope;
+	/// its first entry is the active session used by session scope.
+	pub struct TelemetryIndexQuery {
+		indexes: Arc<BTreeMap<Str, Arc<TelemetryIndex>>>,
+		active:  Str,
+	}
+
+	impl TelemetryIndexQuery {
+		#[must_use]
+		pub fn new(index: Arc<TelemetryIndex>, session: impl Into<Str>) -> Self {
+			let active = session.into();
+			Self {
+				indexes: Arc::new(BTreeMap::from([(active.clone(), index)])),
+				active,
+			}
+		}
+
+		pub fn with_sessions(
+			active: impl Into<Str>,
+			sessions: impl IntoIterator<Item = (Str, Arc<TelemetryIndex>)>,
+		) -> Result<Self, TelemetryAuthorityError> {
+			let active = active.into();
+			let indexes: BTreeMap<_, _> = sessions.into_iter().collect();
+			if !indexes.contains_key(active.as_str()) {
+				return Err(invalid("telemetry query requires a session"));
+			}
+			Ok(Self { indexes: Arc::new(indexes), active })
+		}
+
+		fn scan(
+			&self,
+			identity: &TelemetryAuthorityIdentity,
+			spec: &QuerySpec,
+		) -> Result<DurableTelemetryRows, TelemetryAuthorityError> {
+			let started = Instant::now();
+			let sessions: Vec<_> = if spec.scope == "session" {
+				self.indexes.get_key_value(self.active.as_str()).into_iter().collect()
+			} else {
+				self.indexes.iter().collect()
+			};
+			let mut selected = Vec::new();
+			let mut scanned_events = 0usize;
+			let mut floored = false;
+			let mut backfilled = false;
+			for (session, index) in &sessions {
+				if !spec.sessions.is_empty() && !spec.sessions.contains(session.as_str()) {
+					continue;
+				}
+				let guard = QueryGuard::new();
+				let result = index
+					.query(session.as_str(), None, None, &guard)
+					.map_err(owner)?;
+				scanned_events = scanned_events.saturating_add(result.rows.len());
+				for row in result.rows {
+					if row.occurred_at_ms < identity.installed_at_ms {
+						floored = true;
+						continue;
+					}
+					if row.occurred_at_ms < spec.since
+						|| spec.until.is_some_and(|until| row.occurred_at_ms > until)
+						|| spec.cursor.is_some_and(|cursor| row.offset.0 <= cursor)
+						|| !spec.kinds.is_empty() && !spec.kinds.contains(row.kind.as_str())
+					{
+						continue;
+					}
+					let mut file = File::open(index.side_path()).map_err(owner)?;
+					let event = read_event(&mut file, row.offset.0)?;
+					if !spec
+						.predicates
+						.iter()
+						.all(|(path, expected)| value_at(&event, path).is_some_and(|v| v == expected))
+					{
+						continue;
+					}
+					let mut bindings = BTreeMap::new();
+					if let Some(name) = &spec.binding {
+						bindings.insert(name.clone(), event.clone());
+					}
+					let mut values = BTreeMap::from([
+						(Str::new_static("offset"), Value::from(row.offset.0)),
+						(Str::new_static("kind"), Value::String(row.kind.to_string())),
+						(
+							Str::new_static("occurred_at_ms"),
+							Value::from(row.occurred_at_ms),
+						),
+					]);
+					for path in &spec.select {
+						if let Some(value) = value_at(&event, path) {
+							values.insert(path.clone(), value.clone());
+						}
+					}
+					backfilled |= row.backfilled;
+					selected.push(DurableTelemetryRow {
+						session: row.session_id,
+						turn: event.get("turn").and_then(Value::as_u64).unwrap_or(0),
+						offset: row.offset.0,
+						kind: row.kind,
+						occurred_at_ms: row.occurred_at_ms,
+						backfilled: row.backfilled,
+						events: vec![event],
+						bindings,
+						values,
+					});
+				}
+			}
+			selected.sort_by_key(|row| (row.occurred_at_ms, row.offset));
+			let total = selected.len();
+			let truncated = total > spec.limit;
+			selected.truncate(spec.limit);
+			let cursor = truncated
+				.then(|| selected.last().map(|row| Str::new(row.offset.to_string())))
+				.flatten();
+			Ok(DurableTelemetryRows {
+				rows: selected,
+				total,
+				cursor,
+				truncated,
+				scanned_sessions: sessions.len(),
+				scanned_events,
+				backfilled,
+				floored,
+				elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+			})
+		}
+	}
+
+	impl DurableTelemetryQuery for TelemetryIndexQuery {
+		fn query(
+			&self,
+			identity: &TelemetryAuthorityIdentity,
+			query: &Value,
+		) -> Result<Value, TelemetryAuthorityError> {
+			self.scan(identity, &QuerySpec::parse(query)?)?.into_value()
+		}
+
+		fn rev_metrics(
+			&self,
+			identity: &TelemetryAuthorityIdentity,
+			tool: &str,
+			family: Option<&str>,
+			since: Option<&Value>,
+			scope: &str,
+		) -> Result<Value, TelemetryAuthorityError> {
+			if tool.is_empty() {
+				return Err(invalid("tool must be non-empty"));
+			}
+			let spec = QuerySpec {
+				scope: parse_scope(scope)?,
+				sessions: BTreeSet::new(),
+				kinds: BTreeSet::new(),
+				predicates: vec![(Str::new_static("tool"), Value::String(tool.to_owned()))],
+				binding: None,
+				select: Vec::new(),
+				since: since.map(parse_time).transpose()?.unwrap_or(identity.installed_at_ms),
+				until: None,
+				cursor: None,
+				limit: usize::MAX,
+			};
+			let mut grouped = BTreeMap::<(Str, u64), (u64, u64, BTreeSet<Str>, u64, u64)>::new();
+			for row in self.scan(identity, &spec)?.rows {
+				let Some((rev_family, rev_n)) = revision(&row.events[0]) else { continue };
+				if family.is_some_and(|family| family != rev_family.as_str()) {
+					continue;
+				}
+				let metric = grouped
+					.entry((rev_family, rev_n))
+					.or_insert((row.occurred_at_ms, row.occurred_at_ms, BTreeSet::new(), 0, 0));
+				metric.0 = metric.0.min(row.occurred_at_ms);
+				metric.1 = metric.1.max(row.occurred_at_ms);
+				metric.2.insert(row.session);
+				metric.3 += 1;
+				if row.events[0].get("status").and_then(Value::as_str).unwrap_or("ok") == "ok" {
+					metric.4 += 1;
+				}
+			}
+			let mut rows: Vec<_> = grouped
+				.into_iter()
+				.map(|((family, n), (first, last, sessions, calls, ok))| json!({
+					"rev": { "family": family, "n": n },
+					"first_seen_ms": first, "last_seen_ms": last,
+					"sessions": sessions.len(), "calls": calls, "ok": ok,
+					"faults": calls - ok, "blocked": 0, "timeouts": 0, "aborted": 0,
+					"skipped": 0, "postcondition_rejected": 0, "abandoned": 0,
+					"fault_codes": {}, "repaired_calls": 0, "repair_paths": {},
+					"retry_rate": 0.0, "p50_latency_ms": 0.0, "p95_latency_ms": 0.0,
+					"p99_latency_ms": 0.0, "p50_speculation_ms": 0.0,
+					"p50_prompt_bytes": 0.0, "p95_prompt_bytes": 0.0,
+					"spills": 0, "issues": 0
+				}))
+				.collect();
+			rows.sort_by_key(|row| std::cmp::Reverse(row["rev"]["n"].as_u64().unwrap_or(0)));
+			Ok(Value::Array(rows))
+		}
+	}
+
+	struct QuerySpec {
+		scope:      &'static str,
+		sessions:   BTreeSet<Str>,
+		kinds:      BTreeSet<Str>,
+		predicates: Vec<(Str, Value)>,
+		binding:    Option<Str>,
+		select:     Vec<Str>,
+		since:      u64,
+		until:      Option<u64>,
+		cursor:     Option<u64>,
+		limit:      usize,
+	}
+
+	impl QuerySpec {
+		fn parse(value: &Value) -> Result<Self, TelemetryAuthorityError> {
+			let object = value.as_object().ok_or_else(|| invalid("query must be an object"))?;
+			let steps = object
+				.get("match")
+				.and_then(Value::as_array)
+				.filter(|steps| steps.len() == 1)
+				.ok_or_else(|| invalid("query requires exactly one match step"))?;
+			let step = steps[0].as_object().ok_or_else(|| invalid("match step must be an object"))?;
+			let mut predicates = Vec::new();
+			for field in ["tool", "target", "rev"] {
+				if let Some(value) = step.get(field).filter(|value| !value.is_null()) {
+					predicates.push((Str::new_static(field), value.clone()));
+				}
+			}
+			if let Some(where_) = step.get("where").and_then(Value::as_object) {
+				for (path, predicate) in where_ {
+					let value = predicate
+						.as_object()
+						.filter(|p| p.get("op").and_then(Value::as_str) == Some("eq"))
+						.and_then(|p| p.get("value"))
+						.ok_or_else(|| invalid("only exact telemetry predicates are supported"))?;
+					predicates.push((Str::new(path), value.clone()));
+				}
+			}
+			let limit_u64 = object.get("limit").and_then(Value::as_u64).unwrap_or(1_000);
+			let limit = usize::try_from(limit_u64).map_err(|_| invalid("query limit is too large"))?;
+			if !(1..=QUERY_LIMIT_MAX).contains(&limit) {
+				return Err(invalid("query limit must be in 1..=10000"));
+			}
+			Ok(Self {
+				scope: parse_scope(object.get("scope").and_then(Value::as_str).unwrap_or("project"))?,
+				sessions: strings(object.get("sessions"), "sessions")?,
+				kinds: strings(step.get("kinds"), "kinds")?,
+				predicates,
+				binding: step.get("name").and_then(Value::as_str).map(Str::new),
+				select: strings(object.get("select"), "select")?.into_iter().collect(),
+				since: object.get("since").filter(|v| !v.is_null()).map(parse_time).transpose()?.unwrap_or(0),
+				until: object.get("until").filter(|v| !v.is_null()).map(parse_time).transpose()?,
+				cursor: object.get("cursor").and_then(Value::as_str).map(|v| v.parse().map_err(|_| invalid("invalid cursor"))).transpose()?,
+				limit,
+			})
+		}
+	}
+
+	fn strings(value: Option<&Value>, name: &str) -> Result<BTreeSet<Str>, TelemetryAuthorityError> {
+		let Some(value) = value else { return Ok(BTreeSet::new()) };
+		value
+			.as_array()
+			.ok_or_else(|| invalid(format!("{name} must be an array")))?
+			.iter()
+			.map(|value| value.as_str().map(Str::new).ok_or_else(|| invalid(format!("{name} entries must be strings"))))
+			.collect()
+	}
+
+	fn read_event(file: &mut File, offset: u64) -> Result<Value, TelemetryAuthorityError> {
+		file.seek(SeekFrom::Start(offset)).map_err(owner)?;
+		let mut length = [0; 4];
+		file.read_exact(&mut length).map_err(owner)?;
+		let length = u32::from_le_bytes(length) as usize;
+		if length > MAX_EVENT_BYTES {
+			return Err(invalid("telemetry frame exceeds 16 MiB"));
+		}
+		let mut body = vec![0; length];
+		file.read_exact(&mut body).map_err(owner)?;
+		serde_json::from_slice(&body).map_err(owner)
+	}
+
+	fn value_at<'a>(event: &'a Value, path: &str) -> Option<&'a Value> {
+		path.split('.').try_fold(event, |value, part| value.get(part))
+	}
+
+	fn revision(event: &Value) -> Option<(Str, u64)> {
+		let revision = event.get("rev")?;
+		if let Some(value) = revision.as_str() {
+			let (family, n) = value.rsplit_once('@')?;
+			return Some((Str::new(family), n.parse().ok()?));
+		}
+		Some((
+			Str::new(revision.get("family")?.as_str()?),
+			revision.get("n")?.as_u64()?,
+		))
+	}
+
+	fn parse_time(value: &Value) -> Result<u64, TelemetryAuthorityError> {
+		value.as_u64().or_else(|| value.as_str()?.parse().ok()).ok_or_else(|| invalid("time must be Unix milliseconds"))
+	}
+
+	fn parse_scope(scope: &str) -> Result<&'static str, TelemetryAuthorityError> {
+		match scope {
+			"session" => Ok("session"),
+			"project" => Ok("project"),
+			_ => Err(invalid("scope must be session or project")),
+		}
+	}
+
+	fn invalid(message: impl Into<Str>) -> TelemetryAuthorityError {
+		TelemetryAuthorityError::Invalid(message.into())
+	}
+
+	fn owner(error: impl std::fmt::Display) -> TelemetryAuthorityError {
+		TelemetryAuthorityError::Owner(Str::new(error.to_string()))
+	}
+}
 
 /// Host-owned verdict projection and detached-job authority.
 pub mod verdict_authority {
 	use std::{
-		collections::{BTreeMap, BTreeSet},
+		collections::{BTreeSet},
 		sync::Arc,
 		time::Duration,
 	};
@@ -36,8 +369,7 @@ pub mod verdict_authority {
 	use omp_tool::{
 		ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef, JobStatus,
 	};
-	use parking_lot::Mutex;
-	use serde::{Deserialize, Serialize};
+		use serde::{Deserialize, Serialize};
 	use serde_json::Value;
 	use thiserror::Error;
 
@@ -72,6 +404,8 @@ pub mod verdict_authority {
 		pub phase:     InvocationPhase,
 		/// Whether cancellation has already won.
 		pub cancelled: bool,
+		/// Exact host-issued callback authority, when projection calls back into Python.
+		pub invocation: Option<&'a omp_envd::exthost::control::ControlInvocationAuthority>,
 	}
 
 	/// Structured verdict owner failure.
@@ -150,6 +484,45 @@ pub mod verdict_authority {
 		}
 	}
 
+	/// Agent-owned durable registration boundary. Implementations must journal
+	/// the descriptor before attaching it to the live board.
+	#[async_trait]
+	pub trait DurableJobRegistrar: Send + Sync + 'static {
+		/// Persists and installs one exact descriptor idempotently.
+		async fn register(&self, job: JobRef) -> Result<JobRef, VerdictAuthorityError>;
+	}
+
+	/// Production registrar routed to the sole mutable Agent/journal owner.
+	pub struct AgentDurableJobRegistrar {
+		control: omp_agent::AgentHostControl,
+	}
+
+	impl AgentDurableJobRegistrar {
+		/// Binds the cloneable Agent actor control handle.
+		#[must_use]
+		pub fn new(control: omp_agent::AgentHostControl) -> Self {
+			Self { control }
+		}
+	}
+
+	#[async_trait]
+	impl DurableJobRegistrar for AgentDurableJobRegistrar {
+		async fn register(&self, job: JobRef) -> Result<JobRef, VerdictAuthorityError> {
+			let value = serde_json::to_value(&job)
+				.map_err(|error| VerdictAuthorityError::JobAdmission(Str::new(error.to_string())))?;
+			let result = self
+				.control
+				.request(
+					"omp.jobs.register",
+					serde_json::Map::from_iter([("job".to_owned(), value)]),
+				)
+				.await
+				.map_err(VerdictAuthorityError::JobAdmission)?;
+			serde_json::from_value(result)
+				.map_err(|error| VerdictAuthorityError::JobAdmission(Str::new(error.to_string())))
+		}
+	}
+
 	/// Pure prompt projection request sent back to the declaring extension.
 	#[derive(Clone, Debug, Serialize)]
 	pub struct PromptProjectionRequest {
@@ -168,21 +541,80 @@ pub mod verdict_authority {
 	/// Callback transport used by Core to invoke the extension projector.
 	#[async_trait]
 	pub trait PromptProjectionDispatcher: Send + Sync + 'static {
-		/// Dispatches `omp.verdicts.project` to the exact authenticated worker
-		/// generation and returns canonical projected parts.
+		/// Dispatches to the exact authenticated worker generation.
 		async fn project(
 			&self,
 			identity: Arc<VerdictAuthorityIdentity>,
+			invocation: omp_envd::exthost::control::ControlInvocationAuthority,
 			request: PromptProjectionRequest,
 		) -> Result<Value, VerdictAuthorityError>;
 	}
 
+	/// CONTROL-backed projection dispatcher for the exact authenticated worker.
+	pub struct ControlPromptProjectionDispatcher {
+		target:     Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
+		dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
+	}
+
+	impl ControlPromptProjectionDispatcher {
+		/// Binds a live supervisor callback dispatcher to one worker generation.
+		#[must_use]
+		pub fn new(
+			target: Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
+			dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
+		) -> Self {
+			Self { target, dispatcher }
+		}
+	}
+
+	#[async_trait]
+	impl PromptProjectionDispatcher for ControlPromptProjectionDispatcher {
+		async fn project(
+			&self,
+			identity: Arc<VerdictAuthorityIdentity>,
+			invocation: omp_envd::exthost::control::ControlInvocationAuthority,
+			request: PromptProjectionRequest,
+		) -> Result<Value, VerdictAuthorityError> {
+			if self.target.principal.id() != identity.principal.as_str()
+				|| self.target.extension != identity.extension
+				|| self.target.artifact_digest != identity.artifact_digest
+				|| self.target.host_generation != identity.host_generation
+				|| self.target.session_generation != identity.session_generation
+			{
+				return Err(VerdictAuthorityError::Identity);
+			}
+			let Value::Object(arguments) = serde_json::to_value(request)
+				.map_err(|error| VerdictAuthorityError::Projection(Str::new(error.to_string())))?
+			else {
+				return Err(VerdictAuthorityError::Projection(Str::new_static(
+					"projection request did not serialize as an object",
+				)));
+			};
+			self
+				.dispatcher
+				.dispatch(
+					self.target.clone(),
+					omp_envd::exthost::control::ControlDispatch {
+						operation: Str::new_static("omp.verdicts.project"),
+						arguments,
+						authority: invocation,
+						policy: omp_envd::exthost::CallbackConcurrency::Serialized,
+						deadline: omp_envd::exthost::EventDeadline {
+							at: std::time::Instant::now() + PROMPT_PROJECTION_DEADLINE,
+						},
+					},
+				)
+				.await
+				.map_err(|error| VerdictAuthorityError::Projection(Str::new(error.to_string())))
+		}
+	}
+
 	/// Identity-fenced owner for durable detached jobs and prompt projections.
 	pub struct VerdictAuthority {
-		identity:      Arc<VerdictAuthorityIdentity>,
-		jobs:          JobBoard,
-		dispatcher:    Arc<dyn PromptProjectionDispatcher>,
-		registrations: Mutex<BTreeMap<Str, (JobRegistration, JobRef)>>,
+		identity:   Arc<VerdictAuthorityIdentity>,
+		jobs:       JobBoard,
+		registrar:  Arc<dyn DurableJobRegistrar>,
+		dispatcher: Arc<dyn PromptProjectionDispatcher>,
 	}
 
 	impl VerdictAuthority {
@@ -190,9 +622,10 @@ pub mod verdict_authority {
 		pub fn new(
 			identity: Arc<VerdictAuthorityIdentity>,
 			jobs: JobBoard,
+			registrar: Arc<dyn DurableJobRegistrar>,
 			dispatcher: Arc<dyn PromptProjectionDispatcher>,
 		) -> Self {
-			Self { identity, jobs, dispatcher, registrations: Mutex::new(BTreeMap::new()) }
+			Self { identity, jobs, registrar, dispatcher }
 		}
 
 		fn authorize(&self, context: VerdictCallContext<'_>) -> Result<(), VerdictAuthorityError> {
@@ -213,36 +646,29 @@ pub mod verdict_authority {
 
 		/// Idempotently installs one Environment-owned descriptor on the
 		/// authoritative session job board.
-		pub fn register_job(
+		pub async fn register_job(
 			&self,
 			context: VerdictCallContext<'_>,
 			registration: JobRegistration,
 		) -> Result<JobRef, VerdictAuthorityError> {
 			self.authorize(context)?;
-			let mut registrations = self.registrations.lock();
-			if let Some((existing_registration, existing)) =
-				registrations.get(registration.id.as_str()).cloned()
+			let job = registration.into_job(self.identity.session.clone())?;
+			if let Some(existing) = self
+				.jobs
+				.snapshot()
+				.into_iter()
+				.find(|existing| existing.id == job.id)
 			{
-				return if existing_registration == registration {
+				return if same_registration(&existing, &job) {
 					Ok(existing)
 				} else {
-					Err(VerdictAuthorityError::JobConflict(registration.id))
+					Err(VerdictAuthorityError::JobConflict(job.id))
 				};
 			}
-			let registration_key = registration.clone();
-			let job = registration.into_job(self.identity.session.clone())?;
-			match self.jobs.try_register(job.clone()) {
-				Ok(true) => {
-					registrations.insert(job.id.clone(), (registration_key, job.clone()));
-					Ok(job)
-				},
-				Ok(false) => Err(VerdictAuthorityError::JobConflict(job.id)),
-				Err(error) => Err(VerdictAuthorityError::JobAdmission(Str::new(error.to_string()))),
-			}
+			self.registrar.register(job).await
 		}
 
-		/// Dispatches one exact-revision prompt projection under the
-		/// non-negotiable host deadline.
+		/// Dispatches one exact-revision prompt projection under the host deadline.
 		pub async fn project_prompt(
 			&self,
 			context: VerdictCallContext<'_>,
@@ -262,9 +688,12 @@ pub mod verdict_authority {
 					"projection requires an exact device wire name",
 				)));
 			}
+			let invocation = context.invocation.cloned().ok_or(VerdictAuthorityError::Phase)?;
 			tokio::time::timeout(
 				PROMPT_PROJECTION_DEADLINE,
-				self.dispatcher.project(self.identity.clone(), request),
+				self
+					.dispatcher
+					.project(self.identity.clone(), invocation, request),
 			)
 			.await
 			.map_err(|_| VerdictAuthorityError::ProjectionTimeout)?
@@ -355,9 +784,10 @@ pub mod verdict_authority {
 				identity: self.identity.as_ref(),
 				phase,
 				cancelled: phase.is_terminal(),
+				invocation: context.invocation.as_ref(),
 			};
 			let job =
-				VerdictAuthority::register_job(self, call, registration).map_err(control_error)?;
+				VerdictAuthority::register_job(self, call, registration).await.map_err(control_error)?;
 			let (owner_name, owner_generation) = match &job.owner {
 				JobOwner::NamedProcess { name, generation } => (name.as_str(), *generation),
 				JobOwner::AgentLoop { .. } => {
@@ -393,6 +823,15 @@ pub mod verdict_authority {
 			VerdictAuthorityError::Projection(_) => "ProjectionFailed",
 		};
 		omp_envd::exthost::control::ControlProtocolError::new(code, error.to_string())
+	}
+
+	fn same_registration(left: &JobRef, right: &JobRef) -> bool {
+		left.id == right.id
+			&& left.owner == right.owner
+			&& left.artifact == right.artifact
+			&& left.metadata.kind == right.metadata.kind
+			&& left.metadata.label == right.metadata.label
+			&& left.metadata.owner_session == right.metadata.owner_session
 	}
 
 	fn now_ms() -> u64 {

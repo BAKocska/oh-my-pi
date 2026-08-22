@@ -410,7 +410,7 @@ static BACKEND: LazyLock<RwLock<Option<Arc<dyn VibeBackend>>>> =
 
 /// Restores the preceding chat-scoped vibe backend when dropped.
 #[must_use]
-pub(crate) struct Attachment {
+pub struct Attachment {
 	previous: Option<Arc<dyn VibeBackend>>,
 }
 
@@ -955,7 +955,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> VibeBackend for ChatVibe
 }
 
 /// Attaches the vibe device to one chat session.
-pub(crate) fn attach_chat<C: omp_agent::TurnClient + Clone + Send + 'static>(
+pub fn attach_chat<C: omp_agent::TurnClient + Clone + Send + 'static>(
 	parent: Arc<ChatParentHost<C>>,
 	modes: Arc<CampaignHandle>,
 ) -> Attachment {

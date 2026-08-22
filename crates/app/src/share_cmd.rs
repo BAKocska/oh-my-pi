@@ -17,7 +17,7 @@ use crate::cli::ShareArgs;
 /// Selects a live journal projection, irreversibly redacts it, seals it, and
 /// uploads only ciphertext to the configured share store.
 pub async fn run(args: ShareArgs) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let journal = match args.journal {
 		Some(path) => path,
 		None => {

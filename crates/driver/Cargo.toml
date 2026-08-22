@@ -26,7 +26,6 @@ bytes = { workspace = true }
 flate2 = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
-handlebars = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http = { workspace = true }
@@ -37,6 +36,7 @@ omp-agent = { workspace = true }
 omp-ar = { workspace = true }
 omp-collab = { workspace = true }
 omp-core = { workspace = true }
+omp-scribe = { workspace = true }
 omp-docserver = { workspace = true }
 omp-env = { workspace = true }
 omp-envd = { workspace = true }

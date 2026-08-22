@@ -8,7 +8,7 @@ use std::{pin::Pin, sync::Arc, time::Duration};
 
 use futures::Future;
 use omp_agent::{
-	AgentEvent, ContextView, EventBus, PatchOp, PromptError, PromptPatchSet, WorkspaceInput,
+	AgentEvent, ContextView, EventBus, PatchOp, PromptError, PromptPatchSet, Props,
 };
 pub use omp_core::SecretString;
 use omp_core::Str;
@@ -257,7 +257,7 @@ impl CredentialSource for SdkCredentialSource {
 /// workspace and rejects drift. The returned patch set has already enforced
 /// its byte-expansion ceiling.
 pub type SystemPromptCallback =
-	Arc<dyn Fn(&WorkspaceInput) -> Result<PromptPatchSet, PromptError> + Send + Sync + 'static>;
+	Arc<dyn Fn(&Props) -> Result<PromptPatchSet, PromptError> + Send + Sync + 'static>;
 
 /// Stable-id context projection callback.
 pub type ContextPatchHandler = Arc<

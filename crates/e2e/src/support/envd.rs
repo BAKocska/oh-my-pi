@@ -9,7 +9,7 @@ use std::{
 
 use bytes::BytesMut;
 use omp_env::{Admitter, BlobDownloadEvent, EnvClient};
-use omp_envd::{EnvServer, worker::ExtHostConfig};
+use omp_envd::{EnvServer, RegistryBridges, worker::ExtHostConfig};
 use omp_proto::{
 	SCHEMA_REV,
 	blob::v1::GetRequest,
@@ -75,6 +75,7 @@ impl EnvHarness {
 				scratch.state(),
 				Registry::new(),
 				ext_host_config,
+				RegistryBridges::default(),
 			)
 			.await
 			.context("opening local environment authority")?,

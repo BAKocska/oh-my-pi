@@ -16,7 +16,7 @@ use crate::cli::{SetupArgs, SetupCommand};
 
 /// Executes one standalone setup flow.
 pub async fn run(args: SetupArgs) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
 	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command.unwrap_or(SetupCommand::Wizard) {
 		SetupCommand::Wizard => {

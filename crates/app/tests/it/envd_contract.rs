@@ -9,16 +9,14 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
-use omp_app::{
-	envd::{
-		EnvServer,
-		exec::{ExecEvent as HostExecEvent, ExecHost},
-		worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
-		workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
-	},
+use omp_envd::{
+	EnvServer,
+	exec::{ExecEvent as HostExecEvent, ExecHost},
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
+	worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
+	workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
 };
 use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_env::{
@@ -35,8 +33,7 @@ use omp_proto::{
 };
 use omp_tool::{
 	Abort, CallOutcome, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams, LoweringCaps,
-	ParamError, Part, Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute,
-	ToolSpec, ToolTerminal,
+	Part, Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute, ToolSpec,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -117,9 +114,9 @@ impl Tool for EffectTool {
 			match params.whole::<Value>().await {
 				Ok(value) => {
 					std::fs::write(&self.marker, b"committed").expect("write effect marker");
-					yield Ev::Done(ToolTerminal::Done { result: Ok(value), useless: true });
+					yield Ev::Done(omp_tool::ToolTerminal::Done { result: Ok(value), useless: true });
 				},
-				Err(error) => yield Ev::Done(ToolTerminal::Done {
+				Err(error) => yield Ev::Done(omp_tool::ToolTerminal::Done {
 					result: Err(json!({"error": error.to_string()})),
 					useless: false,
 				}),
@@ -197,7 +194,7 @@ impl Tool for StreamingTool {
 			}
 			std::fs::write(&self.effect, path.as_bytes()).expect("record committed effect");
 			tokio::time::sleep(Duration::from_millis(100)).await;
-			yield Ev::Done(ToolTerminal::Done {
+			yield Ev::Done(omp_tool::ToolTerminal::Done {
 				result: Ok(json!({"path": path})),
 				useless: false,
 			});
@@ -302,12 +299,12 @@ impl Tool for CooperativeInterruptTool {
 				return;
 			}
 			yield Ev::Update(json!({"state": "waiting"}));
-			let interrupted: Result<(), ParamError> = params
+			let interrupted: Result<(), omp_tool::ParamError> = params
 				.interruptable()
 				.pull(|_| async { std::future::pending().await })
 				.await;
 			match interrupted {
-				Err(ParamError::Interrupted(interrupt)) => {
+				Err(omp_tool::ParamError::Interrupted(interrupt)) => {
 					yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
 				},
 				_ => yield Ev::Aborted(Abort::MissingOutcome),

@@ -452,18 +452,16 @@ impl CommandRoster {
 				CommandImplementation::Prompt(template) => {
 					let words = super::super::input::tokenize_args(args)
 						.map_err(|error| miette::miette!("{error}"))?;
-					let rendered = super::super::template::render(
-						template,
-						super::super::template::TemplateArguments { raw: args, words: &words },
-					)?;
-					let fallback = if template.contains("{{args")
-						|| template.contains("{{list")
-						|| template.contains("{{join")
-					{
+					let compiled = super::super::template::compile(template)?;
+					let fallback = if super::super::template::references_arguments(&compiled) {
 						""
 					} else {
 						args
 					};
+					let rendered = super::super::template::render_compiled(
+						&compiled,
+						super::super::template::TemplateArguments { raw: args, words: &words },
+					)?;
 					CommandResult::Prompt(PromptResult {
 						text:       Str::from(super::super::input::expand_arguments_with_fallback(
 							rendered.as_str(),

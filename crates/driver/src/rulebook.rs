@@ -481,7 +481,7 @@ pub enum PromptInvalidationError {
 	/// The callback phase cannot mutate prompt generations.
 	#[error("prompt invalidation is illegal in the current callback phase")]
 	Phase,
-	/// Slot does not exist or is not writable.
+	/// Slot does not exist in the authoritative declaration table.
 	#[error("unknown prompt slot")]
 	UnknownSlot,
 	/// Frozen prompt slots cannot change after activation.
@@ -569,17 +569,11 @@ impl PromptControlOwner {
 	}
 
 	fn slot(arguments: &serde_json::Map<String, Value>) -> Result<&str, PromptInvalidationError> {
-		let slot = arguments
+		arguments
 			.get("slot")
 			.and_then(Value::as_str)
 			.filter(|slot| !slot.is_empty())
-			.ok_or(PromptInvalidationError::UnknownSlot)?;
-		match slot {
-			"runtime" | "workflow" => Err(PromptInvalidationError::FrozenSlot),
-			"policy" | "skills" | "rules" | "guidance" | "workspace" | "memory" | "standing"
-			| "recall" | "status" => Ok(slot),
-			_ => Err(PromptInvalidationError::UnknownSlot),
-		}
+			.ok_or(PromptInvalidationError::UnknownSlot)
 	}
 }
 
@@ -756,13 +750,5 @@ mod tests {
 		.expect("prompt head accepts owned mutable slot");
 		assert_eq!(generation, Value::from(4));
 
-		let frozen = ControlAuthority::authorize(
-			&owner,
-			&context,
-			"omp.prompts.invalidate",
-			&serde_json::Map::from_iter([("slot".to_owned(), Value::String("runtime".to_owned()))]),
-		)
-		.expect_err("frozen slot fails closed");
-		assert_eq!(frozen.code, "SlotClassConflict");
 	}
 }

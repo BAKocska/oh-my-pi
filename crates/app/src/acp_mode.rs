@@ -74,7 +74,7 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 		eprintln!("warning: `omp acp` expects newline-delimited JSON on stdin");
 	}
 	let root = std::fs::canonicalize(&args.project).into_diagnostic()?;
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let state_dir = omp_env::project_state::directory(&data_dir, &root).into_diagnostic()?;
 	std::fs::create_dir_all(state_dir.join("sessions")).into_diagnostic()?;
 	let index = Arc::new(SessionIndex::open(state_dir.join("sessions.sqlite3")).into_diagnostic()?);
@@ -257,30 +257,36 @@ struct AcpAskPresenter {
 }
 
 impl omp_tools::ask::AskPresenter for AcpAskPresenter {
-	fn present(
-		&self,
-		questions: &[omp_tools::ask::Question],
-	) -> Result<omp_tools::ask::Presentation, omp_tools::ask::Fault> {
-		let runtime = self
-			.runtime
-			.upgrade()
-			.ok_or_else(|| ask_fault("ACP peer disconnected"))?;
-		let params = ask_elicitation_params(&self.session_id, questions);
-		let handle = tokio::runtime::Handle::current();
-		let response = tokio::task::block_in_place(|| {
-			handle.block_on(runtime.peer_request("session/unstable_createElicitation", params))
-		})
-		.map_err(|error| omp_tools::ask::Fault::Presenter {
-			message: Str::from(error.to_string()),
-		})?;
-		let accepted = response.get("action").and_then(Value::as_str) == Some("accept");
-		let content = response.get("content").and_then(Value::as_object);
-		if !accepted || content.is_none() {
-			return Err(ask_fault("Ask dialog was dismissed"));
-		}
-		Ok(omp_tools::ask::Presentation {
-			answers:  ask_answers(questions, content.expect("checked form content")),
-			headless: false,
+	fn present<'p>(
+		&'p self,
+		questions: &'p [omp_tools::ask::Question],
+	) -> Pin<
+		Box<
+			dyn Future<
+					Output = Result<omp_tools::ask::Presentation, omp_tools::ask::Fault>,
+				> + Send
+				+ 'p,
+		>,
+	> {
+		let runtime = self.runtime.upgrade();
+		Box::pin(async move {
+			let runtime = runtime.ok_or_else(|| ask_fault("ACP peer disconnected"))?;
+			let params = ask_elicitation_params(&self.session_id, questions);
+			let response = runtime
+				.peer_request("session/unstable_createElicitation", params)
+				.await
+				.map_err(|error| omp_tools::ask::Fault::Presenter {
+					message: Str::from(error.to_string()),
+				})?;
+			let accepted = response.get("action").and_then(Value::as_str) == Some("accept");
+			let content = response.get("content").and_then(Value::as_object);
+			if !accepted || content.is_none() {
+				return Err(ask_fault("Ask dialog was dismissed"));
+			}
+			Ok(omp_tools::ask::Presentation {
+				answers:  ask_answers(questions, content.expect("checked form content")),
+				headless: false,
+			})
 		})
 	}
 }
@@ -1196,7 +1202,8 @@ impl Runtime {
 			prompt_cache_affinity: None,
 			session_generation: generation,
 		})
-		.await?;
+		.await
+		.into_diagnostic()?;
 		if mode == "plan" {
 			headless.publish(AgentEvent::PlanStateChanged {
 				from:               PlanState::Inactive,
@@ -1426,7 +1433,8 @@ impl Runtime {
 							.lock()
 							.await
 							.set_title(Str::from(title.title.as_str()))
-							.await?;
+							.await
+							.into_diagnostic()?;
 						session.meta.lock().title = Some(Str::from(title.title.as_str()));
 						json!({"sessionUpdate":"session_info_update","title":title.title})
 					},
@@ -1804,7 +1812,7 @@ impl Runtime {
 			return Err(miette!("unknown model `{model}`"));
 		}
 		let session = self.session(&session_id)?;
-		session.headless.lock().await.set_model(model).await?;
+		session.headless.lock().await.set_model(model).await.into_diagnostic()?;
 		session.meta.lock().model = model.to_owned();
 		self.update(&session_id, json!({"sessionUpdate":"config_option_update","configOptions":[{"id":"model","currentValue":model}]}))?;
 		Ok(json!({}))
@@ -2161,7 +2169,8 @@ impl Runtime {
 				.lock()
 				.await
 				.set_title(title.clone())
-				.await?;
+				.await
+				.into_diagnostic()?;
 			session.meta.lock().title = Some(title);
 		}
 		let runtime = Arc::clone(self);

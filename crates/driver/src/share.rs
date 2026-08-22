@@ -196,7 +196,7 @@ pub struct DirectShareStore {
 
 impl DirectShareStore {
 	/// Constructs the production store from a validated HTTP(S) share base.
-	pub(crate) fn new(
+	pub fn new(
 		http_base: &str,
 		credentials: std::sync::Arc<GithubCredentialBridge>,
 	) -> Result<Self, ShareError> {

@@ -14,13 +14,12 @@ use omp_core::{Str, encoding::hex};
 use ring::digest::{SHA256, digest};
 use serde::Serialize;
 
-use crate::{
-	cli::{RegistryArgs, UpdateArgs},
-	ext::{
-		index::{IndexArtifact, IndexExtension, IndexRelease, SignedIndex},
-		trust::{KeysFile, verify_artifact_signature},
-	},
+use omp_ext::{
+	index::{IndexArtifact, IndexExtension, IndexRelease, SignedIndex},
+	trust::{KeysFile, verify_artifact_signature},
 };
+
+use crate::cli::{RegistryArgs, UpdateArgs};
 
 const CORE_PACKAGE: &str = "omp-cli";
 const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
@@ -184,7 +183,7 @@ fn load_index(index: Option<&Path>, key: Option<&Path>) -> miette::Result<(Signe
 	let key = configured_path(key, "OMP_RELEASE_INDEX_KEY", "release index key")?;
 	let key = fs::read_to_string(key).into_diagnostic()?;
 	let key = key.trim().to_owned();
-	let index = SignedIndex::read(&index, &key).map_err(|error| miette!("{error}"))?;
+	let index = SignedIndex::read(&index, &key).into_diagnostic()?;
 	Ok((index, key))
 }
 
@@ -225,7 +224,7 @@ fn select<'a>(index: &'a SignedIndex, package: &str, target: &str) -> miette::Re
 		release.capability_digest.as_str(),
 		artifact.signature.as_str(),
 	)
-	.map_err(|error| miette!("{error}"))?;
+	.into_diagnostic()?;
 	Ok(Selected { issued_at: &index.issued_at, extension, release, artifact })
 }
 fn target_artifact<'a>(release: &'a IndexRelease, target: &str) -> Option<&'a IndexArtifact> {
@@ -239,7 +238,7 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 	if selected.artifact.size > MAX_ASSET_BYTES {
 		return Err(miette!("signed update asset exceeds the 256 MiB safety ceiling"));
 	}
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let cache = if let Some(cache) =
 		std::env::var_os("OMP_CACHE_DIR").filter(|value| !value.is_empty())
 	{

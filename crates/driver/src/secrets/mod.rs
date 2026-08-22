@@ -1,18 +1,67 @@
 //! Process-level secret policy and composition.
 
-/// Global/project rule loading.
-pub mod config;
-/// Credential-shaped environment collection.
-pub mod env;
-pub mod key;
-/// Immutable per-session snapshot composition.
 use std::{collections::BTreeMap, sync::Arc};
 
 use omp_core::Str;
 use omp_inference::auth::AuthControlHandle;
 use omp_secrets::SecretMaskingAuthority;
 
+/// Global/project rule loading.
+pub mod config;
+/// Credential-shaped environment collection.
+pub mod env;
+pub mod key;
+/// Immutable per-session snapshot composition.
 pub mod session;
+
+/// Lowers deployment-admitted credential scopes into the exact Core-side
+/// grants consumed by the credential CONTROL factory.
+pub fn credential_control_grants(
+	extensions: &[omp_envd::worker::ExtHostSpec],
+) -> BTreeMap<Str, crate::auth_backend::CredentialControlGrant> {
+	use omp_inference::auth::{CredentialGrants, CredentialScope};
+
+	fn scope(value: Option<&serde_json::Value>) -> Arc<[Str]> {
+		match value {
+			Some(serde_json::Value::String(value)) => Arc::from([Str::new(value)]),
+			Some(serde_json::Value::Array(values)) => values
+				.iter()
+				.filter_map(serde_json::Value::as_str)
+				.map(Str::new)
+				.collect::<Vec<_>>()
+				.into(),
+			_ => Arc::from([]),
+		}
+	}
+
+	extensions
+		.iter()
+		.map(|extension| {
+			let declarations = extension.manifest.static_declarations();
+			let allow = scope(declarations.capability_grants.get("credentials.allow"));
+			let import = scope(declarations.capability_grants.get("credentials.import"));
+			let reveal = scope(declarations.capability_grants.get("credentials.reveal"));
+			let providers = allow
+				.iter()
+				.filter(|provider| !provider.contains('*') && !provider.contains('?'))
+				.cloned()
+				.collect::<Vec<_>>()
+				.into();
+			(
+				extension.key.extension().clone(),
+				crate::auth_backend::CredentialControlGrant {
+					grants: CredentialGrants {
+						allow: CredentialScope::new(allow),
+						import: CredentialScope::new(import),
+						reveal: CredentialScope::new(reveal),
+					},
+					providers,
+				},
+			)
+		})
+		.collect()
+}
+
 /// Builds one Core-owned masking authority over the immutable session rules.
 pub fn core_secret_masking_authority(
 	snapshot: &session::SecretSessionSnapshot,

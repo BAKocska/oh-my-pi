@@ -35,7 +35,7 @@ pub async fn run(args: BenchArgs) -> miette::Result<()> {
 	if args.runs == 0 || args.par == 0 || args.max_tokens == 0 {
 		return Err(miette!("--runs, --par, and --max-tokens must be greater than zero"));
 	}
-	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
 	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;
 	let registry = omp_driver::registry::production_registry(&data_dir, store)

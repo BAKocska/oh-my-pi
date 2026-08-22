@@ -11,7 +11,7 @@ use omp_agent::{
 	AgentState, CachedContribution, CampaignEntry, CampaignEntryStatus, CampaignStack, Continuation,
 	ContinuationPolicy, ContinuationSource, LoopSignal, PromptError, PromptSlotSource, PromptSource,
 	SLOT_TABLE, SlotAssembler, SlotClaim, SlotClass, SlotDecl, SlotId, SlotRegistration,
-	WorkspaceInput,
+	Props,
 };
 use omp_core::{Str, sf};
 /// One visible campaign-slot holder projected by the driver.
@@ -232,7 +232,7 @@ struct ModeAwarePromptSource {
 }
 
 impl PromptSource for ModeAwarePromptSource {
-	fn render(&self, workspace: &WorkspaceInput) -> Result<Vec<Item>, PromptError> {
+	fn render(&self, workspace: &Props) -> Result<Vec<Item>, PromptError> {
 		let mut items = self.base.render(workspace)?;
 		let mut registrations = Vec::new();
 		if let Some(slot) = self.modes.mode_holder() {

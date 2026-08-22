@@ -20,7 +20,7 @@ use omp_core::{
 use omp_e2e::{Context as _, Result, error};
 use omp_env::{Admitter, EnvClient, InvocationEvent};
 use omp_envd::{
-	EnvServer,
+	EnvServer, RegistryBridges,
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
@@ -141,7 +141,7 @@ impl BenchEnvironment {
 
 		let boot_at = Instant::now();
 		let server = Arc::new(
-			EnvServer::open_local(site.path(), state.path(), Registry::new(), config)
+			EnvServer::open_local(site.path(), state.path(), Registry::new(), config, RegistryBridges::default())
 				.await
 				.context("boot production environment topology")?,
 		);

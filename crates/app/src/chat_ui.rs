@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod input;
+pub mod presentation;
 pub mod template;
 
 use std::{
@@ -41,6 +42,7 @@ use omp_driver::{
 	modes::{CampaignHandle, Goal, GoalStatus, GoalUsage},
 	settings::Settings,
 };
+use omp_executor::Executor;
 use omp_inference::{call::AuthInput, id::TurnId};
 use omp_proto::{
 	env::v1::{
@@ -70,6 +72,7 @@ use omp_tui::{
 	components::{AttachmentContent, KeywordAccent},
 	detect,
 };
+use serde_json::Value;
 
 use crate::chat_ui::{
 	commands::{
@@ -93,6 +96,7 @@ pub mod presentation_authority {
 
 	use async_trait::async_trait;
 	use omp_core::{InvocationPhase, Str};
+	use omp_executor::Executor;
 	use parking_lot::Mutex;
 	use serde::{Deserialize, Serialize};
 	use serde_json::Value;
@@ -122,6 +126,7 @@ pub mod presentation_authority {
 		pub phase:      Option<InvocationPhase>,
 		pub cancelled:  bool,
 		pub request_id: u64,
+		pub invocation: Option<&'a omp_envd::exthost::control::ControlInvocationAuthority>,
 	}
 
 	/// Data-only presentation effect. Terminal handles cannot cross this seam.
@@ -222,6 +227,7 @@ pub mod presentation_authority {
 		async fn dispatch(
 			&self,
 			identity: Arc<PresentationIdentity>,
+			invocation: omp_envd::exthost::control::ControlInvocationAuthority,
 			callback: PresentationCallback,
 		) -> Result<Value, PresentationAuthorityError>;
 	}
@@ -247,6 +253,7 @@ pub mod presentation_authority {
 
 	/// Identity-fenced UI owner retaining effects and dialog correlations.
 	pub struct PresentationAuthority {
+		executor:  Executor,
 		identity:  Arc<PresentationIdentity>,
 		client:    Arc<dyn PresentationClient>,
 		callbacks: Arc<dyn PresentationCallbackDispatcher>,
@@ -255,11 +262,12 @@ pub mod presentation_authority {
 
 	impl PresentationAuthority {
 		pub fn new(
+			executor: Executor,
 			identity: Arc<PresentationIdentity>,
 			client: Arc<dyn PresentationClient>,
 			callbacks: Arc<dyn PresentationCallbackDispatcher>,
 		) -> Self {
-			Self { identity, client, callbacks, state: Mutex::new(State::default()) }
+			Self { executor, identity, client, callbacks, state: Mutex::new(State::default()) }
 		}
 
 		fn authorize(
@@ -421,9 +429,12 @@ pub mod presentation_authority {
 				PresentationCallbackKind::Renderer => Some(RENDER_CALLBACK_DEADLINE),
 				PresentationCallbackKind::Action => None,
 			};
-			let dispatch = self.callbacks.dispatch(self.identity.clone(), callback);
+			let invocation = context.invocation.cloned().ok_or(PresentationAuthorityError::Phase)?;
+			let dispatch = self
+				.callbacks
+				.dispatch(self.identity.clone(), invocation, callback);
 			match deadline {
-				Some(deadline) => match tokio::time::timeout(deadline, dispatch).await {
+				Some(deadline) => match self.executor.timeout(deadline, dispatch).await {
 					Ok(Ok(value)) => Ok(value),
 					Ok(Err(_)) | Err(_) if kind == PresentationCallbackKind::Completion => {
 						Ok(Value::Array(Vec::new()))
@@ -499,6 +510,7 @@ pub mod presentation_authority {
 					.as_ref()
 					.is_some_and(|invocation| invocation.phase.is_terminal()),
 				request_id: context.request_id,
+				invocation: context.invocation.as_ref(),
 			};
 			let response = PresentationAuthority::request(self, call, request)
 				.await
@@ -556,6 +568,7 @@ pub mod presentation_authority {
 					.as_ref()
 					.is_some_and(|invocation| invocation.phase.is_terminal()),
 				request_id: context.request_id,
+				invocation: context.invocation.as_ref(),
 			};
 			PresentationAuthority::effect(self, call, effect)
 				.await
@@ -944,6 +957,97 @@ struct BridgeState {
 	skills: Arc<omp_driver::skills::SkillSnapshot>,
 	approvals: HashMap<Str, ApprovalRequest>,
 }
+async fn next_presentation_dispatch(
+	endpoint: &mut Option<presentation::PresentationEndpoint>,
+) -> presentation::PresentationDispatch {
+	if let Some(attached) = endpoint.as_ref()
+		&& let Ok(dispatch) = attached.recv().await
+	{
+		return dispatch;
+	}
+	*endpoint = None;
+	pending().await
+}
+
+fn handle_presentation_dispatch(
+	endpoint: &presentation::PresentationEndpoint,
+	dispatch: presentation::PresentationDispatch,
+	backend: &flume::Sender<BackendEvent>,
+	state: &BridgeState,
+) {
+	use presentation::PresentationOperation;
+	use presentation_authority::{
+		PresentationAuthorityError, PresentationRequest, PresentationResponse,
+	};
+
+	let result = match dispatch.operation {
+		PresentationOperation::Effect(effect) => {
+			let result = match effect.kind.as_str() {
+				"notify" => effect
+					.body
+					.get("message")
+					.or_else(|| effect.body.get("text"))
+					.and_then(Value::as_str)
+					.map(|message| send_backend(backend, BackendEvent::Notice(Str::new(message))))
+					.ok_or_else(|| {
+						PresentationAuthorityError::Owner(Str::new_static(
+							"notify effect requires message text",
+						))
+					}),
+				"set_title" => effect
+					.body
+					.get("title")
+					.or_else(|| effect.body.get("text"))
+					.and_then(Value::as_str)
+					.map(|title| send_backend(backend, BackendEvent::SessionTitle(Str::new(title))))
+					.ok_or_else(|| {
+						PresentationAuthorityError::Owner(Str::new_static(
+							"set_title effect requires title text",
+						))
+					}),
+				_ => Err(PresentationAuthorityError::Owner(sf!(
+					"presentation effect `{}` is not supported by the chat renderer",
+					effect.kind
+				))),
+			};
+			result.map(|()| PresentationResponse::Ack)
+		},
+		PresentationOperation::Request(request) => match request {
+			PresentationRequest::Presentation => Ok(PresentationResponse::Presentation(
+				serde_json::json!({
+					"kind": "chat",
+					"session": state.session_id.as_str(),
+					"model": state.model.as_str(),
+					"workspace": state.workspace_root.as_str(),
+					"interactive": true,
+				}),
+			)),
+			PresentationRequest::Icons { prefix } => {
+				let icons = omp_tui::Icon::from_name(prefix.as_str())
+					.map(|icon| vec![Str::new(icon.name())])
+					.unwrap_or_default();
+				Ok(PresentationResponse::Icons(icons))
+			},
+			PresentationRequest::DynamicMount { commands } => {
+				let names = commands
+					.into_iter()
+					.filter_map(|command| {
+						command
+							.as_object()
+							.and_then(|command| command.get("name"))
+							.and_then(Value::as_str)
+							.map(Str::new)
+					})
+					.collect();
+				Ok(PresentationResponse::DynamicMount(names))
+			},
+			other => Err(PresentationAuthorityError::Owner(sf!(
+				"presentation request `{other:?}` requires a renderer surface not installed in chat",
+			))),
+		},
+	};
+	let _ = endpoint.complete(dispatch.id, result);
+}
 
 fn subscribe_chat_events(bus: &omp_agent::EventBus) -> omp_agent::EventSubscription {
 	bus.subscribe_lossless()
@@ -1076,6 +1180,7 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 }
 
 pub async fn run<C, R>(
+	executor: Executor,
 	mut agent: Agent<C>,
 	session: ChatUiSession,
 	registry: Arc<Registry>,
@@ -1098,6 +1203,7 @@ pub async fn run<C, R>(
 	welcome: bool,
 	initial_draft: Str,
 	presentation: crate::chat_cmd::ChatPresentation,
+	presentation_endpoint: Option<presentation::PresentationEndpoint>,
 ) -> miette::Result<omp_chat_ui::host::HostOutcome>
 where
 	C: TurnClient + Clone + Send + 'static,
@@ -1142,8 +1248,7 @@ where
 		.into_diagnostic()?;
 	let session_id = session.session_id.clone();
 	let mut roster_events = tree.watch_roster();
-	let mut roster_tick = tokio::time::interval(Duration::from_millis(100));
-	roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	let mut roster_tick = executor.interval(Duration::from_millis(100));
 	let agent_state = agent.state().clone();
 	let abort = agent.abort_handle();
 	let startup_pending = startup_recovery_needed(
@@ -1159,7 +1264,7 @@ where
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
 	let (maintenance_tx, maintenance_rx) = flume::unbounded::<MaintenanceEvent>();
 	let maintenance_registry = Arc::clone(&registry);
-	let mut agent_task = tokio::spawn(async move {
+	let mut agent_task = executor.spawn(async move {
 		if startup_pending {
 			let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
 			let ack = match agent.submit(Vec::new(), turn_id).await {
@@ -1367,12 +1472,23 @@ where
 	let mut last_roster = project_agent_roster(&parent, &tree, &session_id);
 	send_backend(&backend_tx, BackendEvent::AgentRoster(last_roster.clone()));
 
+	let bridge_executor = executor.clone();
 	let bridge = async move {
+		let mut presentation_endpoint = presentation_endpoint;
 		loop {
 			tokio::select! {
+										dispatch = next_presentation_dispatch(&mut presentation_endpoint) => {
+											handle_presentation_dispatch(
+												presentation_endpoint.as_ref().expect("dispatch requires endpoint"),
+												dispatch,
+												&backend_tx,
+												&state,
+											);
+										},
 										intent = intent_rx.recv_async() => {
 											let Ok(intent) = intent else { break };
 											if handle_intent(
+												&bridge_executor,
 												intent,
 												&backend_tx,
 												&ui_tx,
@@ -1568,7 +1684,7 @@ where
 											let generation = *roster_events.borrow_and_update();
 											bus.publish(AgentEvent::RosterChanged { generation });
 										},
-										_ = roster_tick.tick() => {
+										_ = roster_tick.next() => {
 											if project_agent_roster(&parent, &tree, &session_id) != last_roster {
 												bus.publish(AgentEvent::RosterChanged {
 													generation: tree.roster_generation(),
@@ -1603,6 +1719,7 @@ where
 	) = match presentation {
 		crate::chat_cmd::ChatPresentation::Terminal => {
 			let host = omp_chat_ui::host::run_with_draft(
+				executor.clone(),
 				chat_scene(&chat_seed, &ctx),
 				ctx,
 				backend_rx,
@@ -1615,6 +1732,7 @@ where
 		},
 		crate::chat_cmd::ChatPresentation::Gui => {
 			let (host_result, bridge_result) = crate::gui::run(
+				&executor,
 				move |ctx| {
 					omp_chat_ui::host::RetainedChat::new(
 						chat_scene(&chat_seed, ctx),
@@ -1630,12 +1748,12 @@ where
 			(Ok(host_result), bridge_result)
 		},
 	};
-	if tokio::time::timeout(Duration::from_secs(3), &mut agent_task)
+	if executor
+		.timeout(Duration::from_secs(3), &mut agent_task)
 		.await
 		.is_err()
 	{
-		agent_task.abort();
-		let _ = agent_task.await;
+		drop(agent_task);
 	}
 	bridge_result?;
 	host_result
@@ -1644,6 +1762,7 @@ where
 /// Runs a standalone collaboration composer backed only by the durable guest
 /// transcript projection and the host-authorized prompt forwarding handle.
 pub async fn run_guest(
+	executor: Executor,
 	replica: omp_collab::guest::GuestReplicaHandle,
 	collab: omp_driver::collab::session::CollabCommandHandle,
 	registry: Arc<Registry>,
@@ -1676,6 +1795,7 @@ pub async fn run_guest(
 	send_backend(&backend_tx, BackendEvent::Status(guest_status(&collab)));
 	let mut presence = collab.subscribe_presence();
 
+	let bridge_executor = executor.clone();
 	let bridge = async {
 		loop {
 			tokio::select! {
@@ -1699,7 +1819,10 @@ pub async fn run_guest(
 											},
 											AttachmentContent::Image { source, .. } => {
 												const REMOTE_IMAGE_MAX_BYTES: u64 = 24 * 1024 * 1024;
-												let metadata = tokio::fs::metadata(source.as_str())
+												let source = source.to_string();
+												let metadata_path = source.clone();
+												let metadata = bridge_executor
+													.unblock(move || std::fs::metadata(metadata_path))
 													.await
 													.into_diagnostic()?;
 												if metadata.len() > REMOTE_IMAGE_MAX_BYTES {
@@ -1711,12 +1834,13 @@ pub async fn run_guest(
 													);
 													continue;
 												}
-												let data = tokio::fs::read(source.as_str())
-													.await
-													.into_diagnostic()?;
 												let mime_type = image::ImageFormat::from_path(source.as_str())
 													.map(|format| format.to_mime_type())
 													.unwrap_or("application/octet-stream");
+												let data = bridge_executor
+													.unblock(move || std::fs::read(source))
+													.await
+													.into_diagnostic()?;
 												images.push(omp_driver::collab::session::RemoteImage {
 													data: Bytes::from(data),
 													mime_type: Str::new_static(mime_type),
@@ -1819,6 +1943,7 @@ pub async fn run_guest(
 	};
 
 	let host = omp_chat_ui::host::run_with_draft(
+		executor,
 		chat,
 		ctx,
 		backend_rx,
@@ -2216,6 +2341,7 @@ fn shake_notice(outcome: &omp_agent::ManualShakeOutcome) -> Str {
 }
 
 struct LiveCommandHost<'a, R> {
+	executor:      &'a Executor,
 	backend:       &'a flume::Sender<BackendEvent>,
 	commands_tx:   &'a flume::Sender<UiCmd>,
 	abort:         &'a omp_agent::AbortHandle,
@@ -2942,10 +3068,10 @@ where
 					return Ok(CommandResult::Consumed(ConsumedResult::status("No todos to copy.")));
 				}
 				let markdown = view.rendered.clone();
-				let copied =
-					tokio::task::spawn_blocking(move || omp_tui::paste::write_clipboard_text(&markdown))
-						.await
-						.into_diagnostic()?;
+				let copied = self
+					.executor
+					.unblock(move || omp_tui::paste::write_clipboard_text(&markdown))
+					.await;
 				if !copied {
 					return Err(miette::miette!("system clipboard is unavailable"));
 				}
@@ -3505,6 +3631,7 @@ async fn maybe_generate_session_title<C>(
 }
 
 async fn handle_intent<C, R>(
+	executor: &Executor,
 	intent: Intent,
 	backend: &flume::Sender<BackendEvent>,
 	commands_tx: &flume::Sender<UiCmd>,
@@ -3545,7 +3672,11 @@ where
 								},
 								AttachmentContent::Image { source, .. } => {
 									const REMOTE_IMAGE_MAX_BYTES: u64 = 24 * 1024 * 1024;
-									let Ok(metadata) = tokio::fs::metadata(source.as_str()).await else {
+									let source = source.to_string();
+									let metadata_path = source.clone();
+									let Ok(metadata) =
+										executor.unblock(move || std::fs::metadata(metadata_path)).await
+									else {
 										send_backend(
 											backend,
 											BackendEvent::Error(sf!(
@@ -3563,7 +3694,10 @@ where
 										);
 										return Ok(false);
 									}
-									let Ok(data) = tokio::fs::read(source.as_str()).await else {
+									let mime_type = image::ImageFormat::from_path(source.as_str())
+										.map(|format| format.to_mime_type())
+										.unwrap_or("application/octet-stream");
+									let Ok(data) = executor.unblock(move || std::fs::read(source)).await else {
 										send_backend(
 											backend,
 											BackendEvent::Error(sf!(
@@ -3572,9 +3706,6 @@ where
 										);
 										return Ok(false);
 									};
-									let mime_type = image::ImageFormat::from_path(source.as_str())
-										.map(|format| format.to_mime_type())
-										.unwrap_or("application/octet-stream");
 									images.push(omp_driver::collab::session::RemoteImage {
 										data:      bytes::Bytes::from(data),
 										mime_type: Str::new_static(mime_type),
@@ -3665,6 +3796,7 @@ where
 				let _ = state.command_usage.record(name.as_str(), now_ms());
 			}
 			let mut command_host = LiveCommandHost {
+				executor,
 				backend,
 				commands_tx,
 				abort,
@@ -3845,7 +3977,8 @@ where
 				Ok(ChatCommand::Settings) => {
 					send_backend(backend, BackendEvent::SettingsSchema(setting_rows(&state.settings)));
 				},
-				Ok(ChatCommand::Theme(args)) => match load_theme_preview(state, args.as_str()).await {
+				Ok(ChatCommand::Theme(args)) => {
+					match load_theme_preview(executor, state, args.as_str()).await {
 					Ok(theme) => {
 						send_backend(backend, BackendEvent::ThemePreview(theme));
 						send_backend(
@@ -3855,10 +3988,11 @@ where
 							)),
 						);
 					},
-					Err(error) => send_backend(
-						backend,
-						BackendEvent::Error(sf!("Could not preview theme: {error}")),
-					),
+						Err(error) => send_backend(
+							backend,
+							BackendEvent::Error(sf!("Could not preview theme: {error}")),
+						),
+					}
 				},
 				Ok(ChatCommand::Live) => {
 					state.live_enabled = !state.live_enabled;
@@ -4749,7 +4883,11 @@ fn handle_login(
 	}
 }
 
-async fn load_theme_preview(state: &mut BridgeState, args: &str) -> miette::Result<omp_tui::Theme> {
+async fn load_theme_preview(
+	executor: &Executor,
+	state: &mut BridgeState,
+	args: &str,
+) -> miette::Result<omp_tui::Theme> {
 	let mut parts: Vec<_> = args.split_whitespace().collect();
 	let quantized = parts.last().is_some_and(|part| *part == "256");
 	if quantized {
@@ -4759,7 +4897,10 @@ async fn load_theme_preview(state: &mut BridgeState, args: &str) -> miette::Resu
 	if path.is_empty() {
 		return Err(miette::miette!("theme preview requires an Environment path"));
 	}
-	let bytes = tokio::fs::read(&path).await.into_diagnostic()?;
+	let bytes = executor
+		.unblock(move || std::fs::read(path))
+		.await
+		.into_diagnostic()?;
 	let source = std::str::from_utf8(&bytes).into_diagnostic()?;
 	let revision = state.theme_revision.saturating_add(1);
 	state
@@ -6191,7 +6332,9 @@ mod tests {
 		let registry = Arc::new(omp_tool::Registry::new());
 		let snapshot = omp_agent::AgentSnapshot::new(
 			omp_agent::TurnOptions::default(),
-			omp_agent::WorkspaceInput::new(scratch, Arc::from([])),
+			omp_agent::PromptFacts::new(scratch, Arc::from([]))
+				.props()
+				.expect("scratch path produces prompt props"),
 			registry,
 		);
 		let state = omp_agent::AgentState::new(snapshot);
@@ -6294,7 +6437,14 @@ mod tests {
 		assert!(message.contains("since 41"));
 	}
 
-	fn test_bridge_state() -> BridgeState {
+	fn test_bridge_state(scratch: &std::path::Path) -> BridgeState {
+		let command_usage = Arc::new(
+			CommandUsage::load(Arc::new(
+				omp_storage::index::SessionIndex::open(scratch.join("sessions.sqlite3"))
+					.expect("session index"),
+			))
+			.expect("command usage"),
+		);
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
 			model: "test/model".to_owned(),
@@ -6341,6 +6491,7 @@ mod tests {
 			vision_override: None,
 			settings: Settings::default(),
 			commands: CommandRoster::new(Vec::new()),
+			command_usage,
 			typed_commands: commands::CommandRoster::builtins(),
 			skills: Default::default(),
 			approvals: HashMap::new(),
@@ -6359,8 +6510,9 @@ mod tests {
 
 	#[test]
 	fn active_turn_text_and_submit_errors_project_into_visible_transcript_rows() {
+		let scratch = tempfile::tempdir().expect("scratch directory");
 		let (tx, rx) = flume::unbounded();
-		let mut state = test_bridge_state();
+		let mut state = test_bridge_state(scratch.path());
 		let modes = CampaignHandle::new();
 		let registry = Registry::new();
 		let bus = omp_agent::EventBus::new();

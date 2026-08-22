@@ -34,7 +34,7 @@ pub async fn run(args: &crate::cli::ModelsArgs) -> miette::Result<()> {
 }
 
 async fn refresh() -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
 	let credentials = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;

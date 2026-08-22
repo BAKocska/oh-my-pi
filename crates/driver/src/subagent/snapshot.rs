@@ -3,7 +3,7 @@
 use std::{path::Path, sync::Arc};
 
 use omp_agent::{AgentDefinition, AgentSnapshot};
-use omp_core::{Str, sf};
+use omp_core::{Str};
 use omp_envd::eval::spawn::SpawnEffort;
 use omp_proto::inference::v1::{Effort, Reasoning};
 
@@ -67,18 +67,43 @@ pub struct ChildSnapshotOptions<'a> {
 /// Clones a parent runtime snapshot while applying only child attenuation.
 pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>) -> AgentSnapshot {
 	let mut child = parent.clone();
-	child.workspace.cwd = options.cwd.to_path_buf();
-	child.workspace.context_files = Arc::from(
-		child
-			.workspace
-			.context_files
-			.iter()
-			.filter(|context| context_applies(&context.path, options.cwd))
-			.cloned()
-			.collect::<Vec<_>>(),
+	child.props.set(
+		omp_agent::prompt_keys::CWD,
+		options.cwd.to_string_lossy().into_owned(),
 	);
+	if let Some(omp_scribe::Value::List(files)) =
+		child.props.get(omp_agent::prompt_keys::CONTEXT_FILES)
+	{
+		let filtered = files
+			.iter()
+			.filter(|entry| {
+				let omp_scribe::Value::Map(entry) = entry else {
+					return false;
+				};
+				entry
+					.get(omp_agent::prompt_keys::PATH)
+					.and_then(omp_scribe::Value::as_str)
+					.is_some_and(|path| context_applies(Path::new(path), options.cwd))
+			})
+			.cloned()
+			.collect::<omp_scribe::Value>();
+		child
+			.props
+			.set(omp_agent::prompt_keys::CONTEXT_FILES, filtered);
+	}
 	if let Some(model) = options.selected_model {
 		child.turn.params.model = strip_effort_suffix(model).to_owned();
+		let mut fields = match child.props.get(omp_agent::prompt_keys::MODEL) {
+			Some(omp_scribe::Value::Map(fields)) => fields.clone(),
+			_ => Default::default(),
+		};
+		fields.insert(
+			Str::new_static(omp_agent::prompt_keys::IDENTIFIER),
+			omp_scribe::Value::from(child.turn.params.model.clone()),
+		);
+		child
+			.props
+			.set(omp_agent::prompt_keys::MODEL, omp_scribe::Value::Map(fields));
 	}
 	if let Some(role) = options.inference_role {
 		let meta = child.turn.params.meta.get_or_insert_default();
@@ -103,6 +128,10 @@ pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>)
 		.cloned()
 		.collect::<Vec<_>>();
 	child.enabled_tools = Arc::from(enabled);
+	child.props.set(
+		omp_agent::prompt_keys::TOOLS,
+		child.enabled_tools.iter().cloned().collect::<Vec<_>>(),
+	);
 	child
 		.turn
 		.params

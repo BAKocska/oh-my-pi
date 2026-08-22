@@ -21,8 +21,8 @@ use omp_inference::{
 		AccountPool, AccountStateStore, AccountStateStoreError, RefreshCoordinator, RefreshPolicy,
 	},
 	auth::{
-		AlibabaTokenPlanLoginEngine, AlibabaTokenPlanShaper, AuthLoginEngine, AuthManager,
-		AuthManagerBuildError, CredentialAcquisitionLoginEngine,
+		AlibabaTokenPlanLoginEngine, AlibabaTokenPlanShaper, AuthControlHandle, AuthLoginEngine,
+		AuthManager, AuthManagerBuildError, CredentialAcquisitionLoginEngine,
 		CredentialAcquisitionLoginEngineError, CredentialAffinityResolver, CredentialBroker,
 		CredentialBrokerEngines, CredentialShaperRegistry, CredentialStore, FileCredentialKeySource,
 		FileKeyError, GithubCopilotShaper, KeyError, KeySource, OAuthCustomDispatcher,
@@ -230,7 +230,7 @@ pub async fn production_usage_manager(
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	production_assembly(data_dir, credential_store)
 		.await
-		.map(|(_, _, _, _, usage)| usage)
+		.map(|(_, _, _, _, usage, _)| usage)
 }
 
 /// Builds the production Codex saved-reset redemption authority, when the
@@ -277,7 +277,7 @@ pub async fn production_rpc_registry(
 ) -> Result<(Registry, AuthManager), RegistryError> {
 	production_assembly(data_dir, credential_store)
 		.await
-		.map(|(registry, _, _, auth, _)| (registry, auth))
+		.map(|(registry, _, _, auth, _, _)| (registry, auth))
 }
 /// Invocation-owned inference values that must not enter agent or durable
 /// state.
@@ -291,20 +291,28 @@ pub struct InferenceSessionOverrides {
 	pub prompt_cache_affinity: Option<Str>,
 }
 
-/// Builds the production inference RPC authority used by both the standalone
-/// gateway and in-process chat turns.
-///
-/// Keeping this seam in the driver ensures credentials, provider routing, and
-/// provider-session state are assembled exactly once for every application
-/// surface.
+/// Session-owned production inference authorities assembled from one credential owner.
+pub struct ProductionInference {
+	/// Immutable registry used by direct chat and provider CONTROL projection.
+	pub registry:             Registry,
+	/// Cloneable route composition retained for atomic provider registry rebuilds.
+	pub builtins:             BuiltinConfig,
+	/// RPC facade sharing the registry's route services and conversation owner.
+	pub rpc:                  InferenceRpc,
+	/// Narrow GitHub URL credential projection over the canonical encrypted store.
+	pub credential_authority: Arc<dyn omp_envd::github_url::CredentialAuthority>,
+	/// Authentication owner assembled into the registry's production route stack.
+	pub auth_manager:         AuthManager,
+	/// Lifecycle CONTROL view of that exact authentication owner.
+	pub auth_control:         AuthControlHandle,
+}
+
+/// Builds the production inference RPC authority used by the gateway and chat.
 pub async fn production_inference(
 	data_dir: &Path,
 	tool_registry: Arc<omp_tool::Registry>,
 	project_root: Option<&Path>,
-) -> Result<
-	(Registry, InferenceRpc, Arc<dyn omp_envd::github_url::CredentialAuthority>),
-	RegistryError,
-> {
+) -> Result<ProductionInference, RegistryError> {
 	production_inference_for_session(
 		data_dir,
 		tool_registry,
@@ -320,10 +328,7 @@ pub async fn production_inference_for_session(
 	tool_registry: Arc<omp_tool::Registry>,
 	project_root: Option<&Path>,
 	overrides: InferenceSessionOverrides,
-) -> Result<
-	(Registry, InferenceRpc, Arc<dyn omp_envd::github_url::CredentialAuthority>),
-	RegistryError,
-> {
+) -> Result<ProductionInference, RegistryError> {
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	let provider = overrides.provider.clone();
 	let invocation_key = match (provider.as_ref(), overrides.api_key) {
@@ -337,7 +342,7 @@ pub async fn production_inference_for_session(
 			))));
 		},
 	};
-	let (registry, sessions, authority, ..) =
+	let (registry, sessions, authority, auth_manager, _, builtins) =
 		production_assembly_for_session(data_dir, credential_store, invocation_key).await?;
 	let settings = omp_settings::manager::SettingsManager::open(
 		omp_settings::manager::SettingsPaths::discover(data_dir, project_root),
@@ -347,10 +352,18 @@ pub async fn production_inference_for_session(
 		.project::<omp_inference::search_settings::WebSearchSettings>()?
 		.get()
 		.clone();
-	let inference = InferenceRpc::new(registry.clone(), sessions, tool_registry)
+	let rpc = InferenceRpc::new(registry.clone(), sessions, tool_registry)
 		.with_session_overrides(provider, overrides.prompt_cache_affinity)
 		.with_search_settings(search_settings);
-	Ok((registry, inference, authority))
+	let auth_control = auth_manager.control_handle();
+	Ok(ProductionInference {
+		registry,
+		builtins,
+		rpc,
+		credential_authority: authority,
+		auth_manager,
+		auth_control,
+	})
 }
 
 async fn production_assembly(
@@ -363,6 +376,7 @@ async fn production_assembly(
 		Arc<dyn omp_envd::github_url::CredentialAuthority>,
 		AuthManager,
 		ConsoleUsageManager,
+		BuiltinConfig,
 	),
 	RegistryError,
 > {
@@ -380,6 +394,7 @@ async fn production_assembly_for_session(
 		Arc<dyn omp_envd::github_url::CredentialAuthority>,
 		AuthManager,
 		ConsoleUsageManager,
+		BuiltinConfig,
 	),
 	RegistryError,
 > {
@@ -597,12 +612,20 @@ async fn production_assembly_for_session(
 			},
 		}
 	};
+	let builtins = BuiltinConfig::production(dependencies);
 	let registry = Registry::builder(catalog)
-		.with_builtins(BuiltinConfig::production(dependencies))?
+		.with_builtins(builtins.clone())?
 		.build()?;
 	let authority: Arc<dyn omp_envd::github_url::CredentialAuthority> =
 		Arc::new(crate::auth_backend::GithubCredentialAuthority::new(stored));
-	Ok((registry, sessions, authority, exposed_auth_manager, exposed_usage_manager))
+	Ok((
+		registry,
+		sessions,
+		authority,
+		exposed_auth_manager,
+		exposed_usage_manager,
+		builtins,
+	))
 }
 
 /// Resolves the Antigravity client version without blocking assembly work:

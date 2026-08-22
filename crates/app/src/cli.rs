@@ -1129,8 +1129,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--api-key"
 			| "--system-prompt"
 			| "--append-system-prompt"
-			| "--follow-up"
-	);
+			);
 	if consumes_value {
 		return Some(!inline);
 	}
@@ -1156,8 +1155,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--no-skills"
 			| "--no-rules"
 			| "--no-title"
-			| "--acp-terminal-auth"
-	)
+			)
 	.then_some(false)
 }
 
@@ -2043,12 +2041,19 @@ fn chat_start(args: &mut ChatArgs) -> crate::chat_cmd::ChatStart {
 	}
 }
 
+/// Parses the process arguments and dispatches the selected operation.
+pub async fn run() -> miette::Result<()> {
+	let cli = parse_from_os(std::env::args_os()).into_diagnostic()?;
+	dispatch(cli).await
+}
+
 /// Dispatches one parsed command to its production implementation.
 #[expect(
 	clippy::future_not_send,
 	reason = "chat dispatch preserves the thread-confined omp_tui::App future"
 )]
 pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
+	let executor = omp_executor::Executor::new(None);
 	crate::startup_notice::stop_watchdog();
 	if let Some(journal) = cli.export.as_deref() {
 		let output = journal.with_extension("html");
@@ -2108,7 +2113,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			args.trusted_extensions = trusted_extensions;
 			let start = chat_start(&mut args);
 			crate::startup_notice::show_once(
-				&omp_core::dirs::data_dir(None)?,
+				&omp_core::dirs::data_dir(None).into_diagnostic()?,
 				args.model.as_ref(),
 				args.thinking.map(<&'static str>::from),
 				crate::startup_notice::Eligibility {
@@ -2121,6 +2126,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			)
 			.into_diagnostic()?;
 			Box::pin(crate::chat_cmd::run(
+				executor.clone(),
 				args,
 				start,
 				if gui {
@@ -2132,11 +2138,11 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			.await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
-		Command::Render(args) => crate::render_cmd::run(args, &omp_core::dirs::data_dir(None)?),
+		Command::Render(args) => crate::render_cmd::run(args, &omp_core::dirs::data_dir(None).into_diagnostic()?),
 		Command::Rpc(args) | Command::RpcUi(args) => crate::rpc_mode::run(args).await,
 		Command::Acp(args) => crate::acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
-		Command::Join(args) => crate::join_cmd::run(args).await,
+		Command::Join(args) => crate::join_cmd::run(executor, args).await,
 		Command::Auth(args) => auth(args).await,
 		Command::Catalog(CatalogArgs { command: CatalogCommand::Import(args) }) => {
 			catalog_import(&args)
@@ -2144,13 +2150,13 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Local(LocalArgs { command: LocalCommand::Infer(args) }) => local_infer(args).await,
 		Command::Ext(args) => crate::ext_cli::run(args).await,
 		Command::Config(args) => {
-			crate::config_cmd::run(&omp_core::dirs::data_dir(None)?, &args.command)
+			crate::config_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args.command)
 		},
 		Command::Update(args) => crate::update_cmd::run(args).await,
 		Command::Registry(args) => crate::update_cmd::registry(args),
 		Command::Share(args) => crate::share_cmd::run(args).await,
 		Command::Models(args) => crate::models_cmd::run(&args).await,
-		Command::Worktree(args) => crate::worktree_cmd::run(&omp_core::dirs::data_dir(None)?, &args),
+		Command::Worktree(args) => crate::worktree_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args),
 		Command::Stats(args) => crate::stats_cmd::run(args).await,
 		Command::Gc(args) => crate::gc_cmd::run(args),
 		Command::Gallery(args) => crate::gallery_cmd::run(args),
@@ -2424,7 +2430,7 @@ async fn serve(args: ServeArgs) -> miette::Result<()> {
 }
 
 async fn infer(args: InferArgs) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;
 	let registry = omp_driver::registry::production_registry(&data_dir, store)
@@ -2519,7 +2525,7 @@ pub(crate) fn turn_id() -> String {
 }
 
 async fn auth(args: AuthArgs) -> miette::Result<()> {
-	let data = omp_core::dirs::data_dir(args.data_dir)?;
+	let data = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
 	crate::auth_cli::run(data.join("credentials.db"), args.command).await
 }
 

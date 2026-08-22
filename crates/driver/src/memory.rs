@@ -26,6 +26,24 @@ pub type ChatMemory = MemoryRuntime;
 pub fn chat_memory(session: &str) -> Option<Arc<ChatMemory>> {
 	omp_memory::RuntimeRegistry::lookup(session)
 }
+/// Freezes one runtime's bounded memory contributions into prompt input.
+///
+/// # Errors
+///
+/// Fails when the runtime cannot read its active memory banks.
+pub fn prompt_snapshot(
+	runtime: &MemoryRuntime,
+	compacted_memory: Option<&str>,
+	recall_query: Option<&str>,
+	token_budget: usize,
+) -> omp_memory::Result<PromptMemoryInput> {
+	omp_envd::memory::prompt_snapshot(
+		runtime,
+		compacted_memory,
+		recall_query,
+		token_budget,
+	)
+}
 
 /// Mutable request inputs sampled into an immutable prompt-memory snapshot.
 #[derive(Default)]
@@ -55,7 +73,7 @@ impl RuntimePromptMemorySource {
 impl omp_agent::PromptMemorySnapshotSource for RuntimePromptMemorySource {
 	fn snapshot(&self, query: omp_agent::PromptMemoryQuery<'_>) -> PromptMemoryInput {
 		let request = self.request.read();
-		omp_envd::memory::prompt_snapshot(
+		prompt_snapshot(
 			self.runtime.as_ref(),
 			request.compacted.as_deref(),
 			Some(query.user_text()),

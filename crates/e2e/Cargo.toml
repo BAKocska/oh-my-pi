@@ -33,6 +33,7 @@ test = false
 
 [dependencies]
 async-stream = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
@@ -44,6 +45,7 @@ omp-core = { workspace = true }
 omp-docserver = { workspace = true }
 omp-env = { workspace = true }
 omp-envd = { workspace = true }
+omp-ext = { workspace = true }
 omp-hashline = { workspace = true }
 omp-catalog = { workspace = true }
 omp-inference = { workspace = true, features = ["test-support"] }

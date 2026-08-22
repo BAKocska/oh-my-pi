@@ -296,7 +296,7 @@ fn scripted_registry(
 	response_gate: Option<Gate>,
 ) -> Result<(Registry, FakeProvider, Str, Arc<Catalog>)> {
 	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../../llm-catalog/data/catalog.normalized.json"))
+		serde_json::from_str(include_str!("../../../catalog/data/catalog.normalized.json"))
 			.context("decoding normalized test catalog")?;
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {

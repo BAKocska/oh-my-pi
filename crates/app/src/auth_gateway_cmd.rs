@@ -25,7 +25,7 @@ const TOKEN_FILE: &str = "auth-gateway.token";
 
 /// Starts, rotates, and health-checks the gateway without owning credentials.
 pub async fn run(args: AuthGatewayArgs) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(args.data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
 	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command {
 		AuthGatewayCommand::Serve { bind, no_auth } => {

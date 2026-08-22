@@ -6,7 +6,7 @@ use std::{
 	time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use omp_agent::{PromptHash, RenderedPrompt, WorkspaceInput};
+use omp_agent::{PromptHash, PromptFacts, RenderedPrompt};
 use omp_catalog::{CandidateProvenance, Catalog, TransportKind};
 use omp_core::{Hash32, Str, sf};
 use omp_inference::transport::http::{HttpTransport, PreconnectLaunch};
@@ -49,7 +49,7 @@ pub struct SessionBlueprint {
 	roots: Box<[WorkspaceRootDescriptor]>,
 	model_plan: ModelPlan,
 	prompt: RenderedPrompt,
-	workspace: WorkspaceInput,
+	workspace: PromptFacts,
 	registry: Arc<Registry>,
 	callbacks: CallbackSet,
 	shape: Hash32,
@@ -82,7 +82,7 @@ impl SessionBlueprint {
 	}
 
 	/// Returns the immutable prompt/workspace authority snapshot.
-	pub const fn workspace(&self) -> &WorkspaceInput {
+	pub const fn prompt_facts(&self) -> &PromptFacts {
 		&self.workspace
 	}
 
@@ -372,7 +372,7 @@ impl SessionBuilder {
 	pub fn build(
 		self,
 		catalog: &Catalog,
-		workspace: &WorkspaceInput,
+		workspace: &PromptFacts,
 	) -> Result<SessionBlueprint, SessionBuildError> {
 		let mut options = self.options;
 		let session_id = options
@@ -454,7 +454,10 @@ impl SessionBuilder {
 		if let Some(callback) = self.callbacks.system_prompt.clone() {
 			compiler = compiler.callback(callback);
 		}
-		let prompt = compiler.compile(workspace)?;
+		let prompt = compiler.compile(
+			&workspace
+				.props()
+				.map_err(PromptPatchError::from)?)?;
 		let shape = session_shape(
 			&options,
 			&roots,

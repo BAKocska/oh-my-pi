@@ -20,14 +20,23 @@ use omp_inference::{
 		OAuthControlImport, ScopedCredentialGrant,
 	},
 };
-use omp_proto::env::v1::{
-	CloseSessionRequest, ExecOutcome, ExecRequest, OpenSessionRequest, OutputChannel, Script,
+use omp_proto::{
+	env::v1::{
+		CloseSessionRequest, ExecOutcome, ExecRequest, OpenSessionRequest, OutputChannel, Script,
+	},
+	omp::auth::v1::{
+		Block, DeleteCredentialRequest, DisableCredentialRequest, EnableCredentialRequest,
+		ImportOAuthRequest, ListCredentialsRequest, MintScopedTokenRequest, PutApiKeyRequest,
+		RefreshCredentialRequest, ReportBlockRequest, RevealCredentialRequest,
+		auth_client::AuthClient,
+	},
 };
 use omp_secrets::{
 	SecretMaskingAuthority,
 	rule::{SecretKind, SecretMode, SecretRule},
 };
 use serde_json::{Map, Value, json};
+use tonic::{Request, metadata::MetadataValue, transport::Channel};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -571,6 +580,480 @@ impl CredentialSecretControlAuthority {
 			"blocks": blocks,
 		}))
 	}
+}
+
+/// Authenticated gateway-backed credential and local masking CONTROL factory.
+#[derive(Clone)]
+pub struct GatewayCredentialSecretControlFactory {
+	channel:         Channel,
+	bearer_token:    Option<Arc<SecretString>>,
+	grants:          Arc<BTreeMap<Str, CredentialControlGrant>>,
+	base_rules:      Arc<[SecretRule]>,
+	placeholder_key: Arc<str>,
+}
+
+/// Constructs the credential authority used by gateway-mode application
+/// composition.
+pub fn gateway_credential_control_factory(
+	channel: Channel,
+	bearer_token: Option<SecretString>,
+	grants: BTreeMap<Str, CredentialControlGrant>,
+	base_rules: Arc<[SecretRule]>,
+	placeholder_key: impl Into<Arc<str>>,
+) -> GatewayCredentialSecretControlFactory {
+	GatewayCredentialSecretControlFactory {
+		channel,
+		bearer_token: bearer_token.map(Arc::new),
+		grants: Arc::new(grants),
+		base_rules,
+		placeholder_key: placeholder_key.into(),
+	}
+}
+/// Composes a gateway channel and the current masking snapshot into the
+/// session CONTROL factory.
+pub fn gateway_credential_secret_control_factory(
+	channel: Channel,
+	grants: BTreeMap<Str, CredentialControlGrant>,
+	snapshot: &crate::secrets::session::SecretSessionSnapshot,
+) -> GatewayCredentialSecretControlFactory {
+	gateway_credential_control_factory(
+		channel,
+		None,
+		grants,
+		Arc::from(snapshot.rules().to_vec()),
+		Arc::<str>::from(crate::secrets::key::placeholder_key()),
+	)
+}
+
+impl ControlAuthorityFactory for GatewayCredentialSecretControlFactory {
+	fn bind(
+		&self,
+		identity: Arc<ControlConnectionIdentity>,
+	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
+		let grant = self.grants.get(&identity.extension).cloned().unwrap_or_default();
+		let masking = SecretMaskingAuthority::new(
+			identity.extension.clone(),
+			identity.host_generation,
+			self.base_rules.iter().cloned(),
+			self.placeholder_key.as_ref(),
+		)
+		.map_err(|error| {
+			ControlCompositionError::unavailable("credentials", Str::from(error.to_string()))
+		})?;
+		Ok(Arc::new(GatewayCredentialSecretControlAuthority {
+			identity,
+			client: AuthClient::new(self.channel.clone()),
+			bearer_token: self.bearer_token.clone(),
+			grant,
+			masking,
+		}))
+	}
+}
+
+struct GatewayCredentialSecretControlAuthority {
+	identity:     Arc<ControlConnectionIdentity>,
+	client:       AuthClient<Channel>,
+	bearer_token: Option<Arc<SecretString>>,
+	grant:        CredentialControlGrant,
+	masking:      SecretMaskingAuthority,
+}
+
+#[async_trait::async_trait]
+impl ControlAuthority for GatewayCredentialSecretControlAuthority {
+	fn handles(&self, operation: &str) -> bool {
+		matches!(
+			operation,
+			"omp.creds.list"
+				| "omp.creds.store"
+				| "omp.creds.refresh"
+				| "omp.creds.clear"
+				| "omp.creds.disable"
+				| "omp.creds.enable"
+				| "omp.creds.report_block"
+				| "omp.creds.usage"
+				| "omp.creds.mint_scoped"
+				| "omp.creds.import_oauth"
+				| "omp.creds.reveal"
+				| "omp.secrets.declare"
+				| "omp.secrets.mask"
+		)
+	}
+
+	fn authorize(
+		&self,
+		context: &ControlRequestContext,
+		operation: &str,
+		arguments: &Map<String, Value>,
+	) -> Result<(), ControlProtocolError> {
+		self.validate_connection(context)?;
+		if !self.handles(operation) {
+			return Err(control_error("InvalidOperation", "credential operation is not supported"));
+		}
+		if operation == "omp.secrets.declare" {
+			if context.invocation.is_some() {
+				return Err(control_error(
+					"InvalidPhase",
+					"secret declarations are accepted only before callback activation",
+				));
+			}
+			return Ok(());
+		}
+		if let Some(invocation) = &context.invocation {
+			let minimum = if matches!(
+				operation,
+				"omp.creds.store"
+					| "omp.creds.refresh"
+					| "omp.creds.clear"
+					| "omp.creds.disable"
+					| "omp.creds.enable"
+					| "omp.creds.report_block"
+					| "omp.creds.mint_scoped"
+					| "omp.creds.import_oauth"
+					| "omp.creds.reveal"
+			) {
+				InvocationPhase::EffectsAuthorized
+			} else {
+				InvocationPhase::Admitted
+			};
+			if !invocation.phase.allows_operation(minimum) {
+				return Err(control_error("InvalidPhase", "credential operation is not allowed now"));
+			}
+		}
+		if operation.starts_with("omp.creds.") {
+			let provider = self.provider(arguments)?;
+			let scope = if operation == "omp.creds.import_oauth" {
+				&self.grant.grants.import
+			} else if operation == "omp.creds.reveal" {
+				&self.grant.grants.reveal
+			} else {
+				&self.grant.grants.allow
+			};
+			scope
+				.enforce(provider)
+				.map_err(|_| control_error("PermissionError", "credential provider is not granted"))?;
+		}
+		Ok(())
+	}
+
+	async fn request(
+		&self,
+		context: ControlRequestContext,
+		operation: Str,
+		arguments: Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		self.authorize(&context, operation.as_str(), &arguments)?;
+		if operation == "omp.secrets.declare" {
+			self
+				.masking
+				.declare(
+					context.connection.extension.as_str(),
+					context.connection.host_generation,
+					parse_secret_rule(&arguments)?,
+				)
+				.map_err(secret_control_error)?;
+			return Ok(Value::Null);
+		}
+		if operation == "omp.secrets.mask" {
+			return self
+				.masking
+				.mask(
+					context.connection.extension.as_str(),
+					context.connection.host_generation,
+					required_str(&arguments, "text")?,
+				)
+				.map(Value::String)
+				.map_err(secret_control_error);
+		}
+		self.remote_request(context, operation.as_str(), &arguments).await
+	}
+
+	async fn effect(
+		&self,
+		context: ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
+		self.validate_connection(&context)?;
+		Err(control_error("InvalidOperation", "credential authority does not accept effects"))
+	}
+}
+
+impl GatewayCredentialSecretControlAuthority {
+	fn validate_connection(
+		&self,
+		context: &ControlRequestContext,
+	) -> Result<(), ControlProtocolError> {
+		if same_control_identity(&self.identity, &context.connection) {
+			Ok(())
+		} else {
+			Err(control_error(
+				"StaleGeneration",
+				"credential authority belongs to a replaced CONTROL connection",
+			))
+		}
+	}
+
+	fn provider<'a>(
+		&'a self,
+		arguments: &'a Map<String, Value>,
+	) -> Result<&'a str, ControlProtocolError> {
+		if let Some(provider) = optional_str(arguments, "provider") {
+			return Ok(provider);
+		}
+		match self.grant.providers.as_ref() {
+			[provider] => Ok(provider.as_str()),
+			[] => Err(control_error("PermissionError", "no credential provider is granted")),
+			_ => Err(control_error(
+				"InvalidProvider",
+				"provider is required when multiple credential providers are granted",
+			)),
+		}
+	}
+
+	fn authenticated<T>(&self, message: T) -> Result<Request<T>, ControlProtocolError> {
+		let mut request = Request::new(message);
+		if let Some(token) = &self.bearer_token {
+			let encoded = Zeroizing::new(format!("Bearer {}", token.expose_secret()));
+			let mut value = MetadataValue::try_from(encoded.as_str())
+				.map_err(|_| control_error("AuthenticationError", "gateway bearer token is invalid"))?;
+			value.set_sensitive(true);
+			request.metadata_mut().insert("authorization", value);
+		}
+		Ok(request)
+	}
+
+	async fn list(
+		&self,
+		provider: &str,
+	) -> Result<Vec<omp_proto::omp::auth::v1::CredentialMeta>, ControlProtocolError> {
+		self
+			.client
+			.clone()
+			.list_credentials(self.authenticated(ListCredentialsRequest {
+				provider: provider.to_owned(),
+				states: Vec::new(),
+			})?)
+			.await
+			.map_err(remote_control_error)
+			.map(|response| response.into_inner().credentials)
+	}
+
+	async fn selected_credential_id(
+		&self,
+		provider: &str,
+		arguments: &Map<String, Value>,
+	) -> Result<u64, ControlProtocolError> {
+		let requested = arguments
+			.get("id")
+			.filter(|value| !value.is_null())
+			.map(|value| {
+				value
+					.as_u64()
+					.ok_or_else(|| control_error("InvalidCredential", "credential id is invalid"))
+			})
+			.transpose()?;
+		let mut matches = self
+			.list(provider)
+			.await?
+			.into_iter()
+			.filter(|credential| requested.is_none_or(|id| credential.id == id));
+		let first = matches
+			.next()
+			.ok_or_else(|| control_error("CredentialNotFound", "credential was not found"))?;
+		if matches.next().is_some() {
+			return Err(control_error(
+				"AmbiguousCredential",
+				"credential selector matched more than one account",
+			));
+		}
+		Ok(first.id)
+	}
+
+	async fn remote_request(
+		&self,
+		context: ControlRequestContext,
+		operation: &str,
+		arguments: &Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		let provider = self.provider(arguments)?.to_owned();
+		let mut client = self.client.clone();
+		match operation {
+			"omp.creds.list" => Ok(Value::Array(
+				self.list(&provider)
+					.await?
+					.into_iter()
+					.map(remote_metadata_value)
+					.collect(),
+			)),
+			"omp.creds.store" => {
+				let credential = required_object(arguments, "cred")?;
+				if !matches!(required_str(credential, "kind")?, "api_key" | "api-key") {
+					return Err(control_error(
+						"InvalidCredential",
+						"gateway credential store accepts API keys; use import_oauth for OAuth",
+					));
+				}
+				let api_key = unseal_string(
+					credential
+						.get("secret")
+						.ok_or_else(|| control_error("InvalidCredential", "secret is missing"))?,
+				)?;
+				client
+					.put_api_key(self.authenticated(PutApiKeyRequest {
+						provider,
+						api_key: api_key.expose_secret().to_owned(),
+					})?)
+					.await
+					.map_err(remote_control_error)
+					.map(|response| remote_metadata_value(response.into_inner()))
+			},
+			"omp.creds.import_oauth" => {
+				let refresh_token =
+					unseal_string(arguments.get("refresh_token").ok_or_else(|| {
+						control_error("InvalidCredential", "refresh_token is missing")
+					})?)?;
+				let access_token = arguments
+					.get("access_token")
+					.filter(|value| !value.is_null())
+					.map(unseal_string)
+					.transpose()?;
+				client
+					.import_o_auth(self.authenticated(ImportOAuthRequest {
+						provider,
+						refresh_token: refresh_token.expose_secret().to_owned(),
+						access_token: access_token
+							.as_ref()
+							.map_or_else(String::new, |token| token.expose_secret().to_owned()),
+						expires_at_ms: optional_u64(arguments, "expires_at_ms")?.unwrap_or_default(),
+						identity: optional_str(arguments, "identity").unwrap_or_default().to_owned(),
+						props: None,
+					})?)
+					.await
+					.map_err(remote_control_error)
+					.map(|response| remote_metadata_value(response.into_inner()))
+			},
+			"omp.creds.refresh" => {
+				let id = self.selected_credential_id(&provider, arguments).await?;
+				client
+					.refresh_credential(self.authenticated(RefreshCredentialRequest { id })?)
+					.await
+					.map_err(remote_control_error)
+					.map(|response| remote_metadata_value(response.into_inner()))
+			},
+			"omp.creds.clear" => {
+				let id = self.selected_credential_id(&provider, arguments).await?;
+				client
+					.delete_credential(self.authenticated(DeleteCredentialRequest { id })?)
+					.await
+					.map_err(remote_control_error)?;
+				Ok(Value::Null)
+			},
+			"omp.creds.disable" => {
+				let id = self.selected_credential_id(&provider, arguments).await?;
+				client
+					.disable_credential(self.authenticated(DisableCredentialRequest {
+						id,
+						cause: required_str(arguments, "cause")?.to_owned(),
+					})?)
+					.await
+					.map_err(remote_control_error)
+					.map(|response| remote_metadata_value(response.into_inner()))
+			},
+			"omp.creds.enable" => {
+				let id = self.selected_credential_id(&provider, arguments).await?;
+				client
+					.enable_credential(self.authenticated(EnableCredentialRequest { id })?)
+					.await
+					.map_err(remote_control_error)
+					.map(|response| remote_metadata_value(response.into_inner()))
+			},
+			"omp.creds.report_block" => {
+				let id = self.selected_credential_id(&provider, arguments).await?;
+				client
+					.report_block(self.authenticated(ReportBlockRequest {
+						id,
+						block: Some(Block {
+							scope: optional_str(arguments, "scope").unwrap_or("shared").to_owned(),
+							provider_key: String::new(),
+							until_ms: required_u64(arguments, "until_ms")?,
+						}),
+					})?)
+					.await
+					.map_err(remote_control_error)?;
+				Ok(Value::Null)
+			},
+			"omp.creds.usage" => Ok(Value::Null),
+			"omp.creds.mint_scoped" => {
+				let response = client
+					.mint_scoped_token(self.authenticated(MintScopedTokenRequest {
+						provider,
+						facet: required_str(arguments, "facet")?.to_owned(),
+						session_id: context.connection.session_generation.to_string(),
+					})?)
+					.await
+					.map_err(remote_control_error)?
+					.into_inner();
+				Ok(json!({"token": response.token, "expires_at_ms": response.expires_at_ms}))
+			},
+			"omp.creds.reveal" => {
+				let id = self.selected_credential_id(&provider, arguments).await?;
+				let response = client
+					.reveal_credential(self.authenticated(RevealCredentialRequest {
+						id,
+						provider,
+						extension: context.connection.extension.to_string(),
+						caller_principal: context.connection.principal.id().to_owned(),
+						host_generation: context.connection.host_generation,
+						session_generation: context.connection.session_generation,
+						request_id: context.request_id,
+						reason: "extension_control_reveal".to_owned(),
+					})?)
+					.await
+					.map_err(remote_control_error)?
+					.into_inner();
+				let secret = Zeroizing::new(response.secret.to_vec());
+				Ok(json!({
+					"encoding": "base64",
+					"data": omp_core::base64::encode(secret.as_slice()).into_string(),
+				}))
+			},
+			_ => Err(control_error("InvalidOperation", "credential operation is not supported")),
+		}
+	}
+}
+
+fn remote_metadata_value(metadata: omp_proto::omp::auth::v1::CredentialMeta) -> Value {
+	let kind = match metadata.kind() {
+		omp_proto::omp::auth::v1::credential_meta::Kind::ApiKey => "api_key",
+		omp_proto::omp::auth::v1::credential_meta::Kind::Oauth => "oauth",
+		omp_proto::omp::auth::v1::credential_meta::Kind::Aws => "aws",
+		omp_proto::omp::auth::v1::credential_meta::Kind::Unspecified => "unspecified",
+	};
+	let disabled =
+		metadata.state() == omp_proto::omp::auth::v1::credential_meta::State::Disabled;
+	json!({
+		"id": metadata.id,
+		"provider": metadata.provider,
+		"identity": metadata.identity,
+		"kind": kind,
+		"expires_at_ms": (metadata.expires_at_ms != 0).then_some(metadata.expires_at_ms),
+		"disabled": disabled,
+		"disabled_cause": (!metadata.disabled_cause.is_empty()).then_some(metadata.disabled_cause),
+		"state": if disabled { "disabled" } else { "active" },
+		"blocks": metadata.blocks.into_iter().map(|block| {
+			json!({"scope": block.scope, "until_ms": block.until_ms})
+		}).collect::<Vec<_>>(),
+	})
+}
+
+fn remote_control_error(error: tonic::Status) -> ControlProtocolError {
+	let code = match error.code() {
+		tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => "PermissionError",
+		tonic::Code::NotFound => "CredentialNotFound",
+		tonic::Code::Aborted => "GenerationConflict",
+		tonic::Code::InvalidArgument => "InvalidCredential",
+		_ => "CredentialOperationFailed",
+	};
+	control_error(code, error.message())
 }
 
 fn parse_secret_rule(arguments: &Map<String, Value>) -> Result<SecretRule, ControlProtocolError> {

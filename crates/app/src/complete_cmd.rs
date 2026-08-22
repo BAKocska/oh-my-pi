@@ -40,7 +40,7 @@ fn models(prefix: &str) -> miette::Result<()> {
 }
 
 fn sessions(prefix: &str) -> miette::Result<()> {
-	let data = omp_core::dirs::data_dir(None)?;
+	let data = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let project = std::fs::canonicalize(".").into_diagnostic()?;
 	let state = omp_env::project_state::directory(&data, &project).into_diagnostic()?;
 	let path = state.join("sessions.sqlite3");

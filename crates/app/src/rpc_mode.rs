@@ -55,7 +55,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::{RpcArgs, data_dir, turn_id};
+use crate::cli::{RpcArgs, turn_id};
 
 const DEFAULT_PAGE_MESSAGES: usize = 100;
 const MAX_PAGE_MESSAGES: usize = 256;
@@ -76,7 +76,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	// RPC stdout is protocol-only; process notifications are suppressed by the
 	// embedding client before this process starts.
 
-	let data = data_dir(None)?;
+	let data = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let configured_model = omp_driver::settings::current(&data)
 		.into_diagnostic()?
 		.default_model
@@ -132,7 +132,8 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	emit(&output_tx, ready)?;
 
 	let host_resources = Arc::new(HostResourceBroker::new(output_tx.clone()));
-	omp_envd::tool_url::host::bind(&host_resources)
+	let host_resources_authority: Arc<dyn omp_envd::HostResources> = host_resources.clone();
+	omp_envd::tool_url::host::bind(&host_resources_authority)
 		.map_err(|_| miette!("RPC host URI resolver is already bound"))?;
 	let runtime = Arc::new(Runtime {
 		registry,
@@ -172,7 +173,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		state.pending_extension_ui.clear();
 	}
 	runtime.host_resources.shutdown("RPC client disconnected")?;
-	omp_envd::tool_url::host::unbind(&runtime.host_resources);
+	omp_envd::tool_url::host::unbind(&host_resources_authority);
 	runtime.shutdown.shutdown().await;
 	let read_result = reader.await.into_diagnostic()?;
 	drop(runtime);
@@ -627,6 +628,23 @@ impl HostResourceBroker {
 			target_id,
 		};
 		emit(&self.output, serde_json::to_value(frame).into_diagnostic()?)
+	}
+}
+
+#[async_trait::async_trait]
+impl omp_envd::HostResources for HostResourceBroker {
+	async fn resolve_read(&self, url: &str) -> Result<omp_envd::HostResourceResult, Str> {
+		let result = HostResourceBroker::resolve_read(self, url).await?;
+		Ok(omp_envd::HostResourceResult { content: result.content, notes: result.notes })
+	}
+
+	async fn resolve_write(
+		&self,
+		url: &str,
+		content: String,
+	) -> Result<omp_envd::HostResourceResult, Str> {
+		let result = HostResourceBroker::resolve_write(self, url, content).await?;
+		Ok(omp_envd::HostResourceResult { content: result.content, notes: result.notes })
 	}
 }
 
@@ -3108,18 +3126,15 @@ fn message_page(
 }
 
 fn rpc_command_roster(root: &Path, generation: u64) -> crate::chat_ui::commands::CommandRoster {
-	use crate::chat_ui::{
-		commands::{
-			CommandDeclaration, CommandGeneration, CommandImplementation, CommandProvenance,
-			CommandSourceKind, CommandSurface, ShadowPolicy,
-		},
-		input::CommandContribution,
+	use crate::chat_ui::commands::{
+		CommandDeclaration, CommandGeneration, CommandImplementation, CommandProvenance,
+		CommandSourceKind, CommandSurface, ShadowPolicy,
 	};
 	let content = omp_driver::discovery::active_content_snapshots(root);
 	let generations = content
 		.commands
 		.iter()
-		.filter_map(|command: &CommandContribution| {
+		.filter_map(|command| {
 			let template = command.template.clone()?;
 			let provenance = CommandProvenance {
 				source: sf!("{}:{}", command.origin, command.name),

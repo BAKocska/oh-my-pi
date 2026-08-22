@@ -9,7 +9,9 @@ pub mod auth_cli;
 pub mod auth_gateway_cmd;
 pub mod bench_cmd;
 pub mod chat_cmd;
-mod chat_ui;
+/// Native chat surface, public so command-template prompt goldens can freeze its output.
+#[doc(hidden)]
+pub mod chat_ui;
 pub mod claude_trace;
 pub mod cleanse_cmd;
 pub mod cli;
@@ -64,6 +66,22 @@ pub mod wizard;
 pub mod worktree_cmd;
 
 pub use miette::{IntoDiagnostic, Report, Result};
+
+impl From<&cli::PromptArgs> for omp_driver::prompt_prep::settings::PromptOverrides {
+	fn from(args: &cli::PromptArgs) -> Self {
+		Self {
+			personality:             args.personality,
+			include_model_in_prompt: args.include_model_in_prompt,
+			include_workstation:     args.include_workstation,
+			include_workspace_tree:  args.include_workspace_tree,
+			render_mermaid:          args.render_mermaid,
+			skills_enabled:          args.skills_enabled,
+			custom_prompt:           args.custom_prompt.clone(),
+			append_prompt:           args.append_prompt.clone(),
+			null_prompt:             args.null_prompt,
+		}
+	}
+}
 
 /// Parses process arguments and runs the selected production operation.
 pub async fn run() -> Result<()> {

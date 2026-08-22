@@ -16,6 +16,18 @@ pub use domains::{
 	TtsrInterruptMode, TtsrSettings, TuiSettings,
 };
 pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
+impl crate::prompt_prep::settings::PromptSettings {
+	/// Applies CLI overrides supplied through a composition-layer conversion.
+	///
+	/// The owning application implements the conversion for its CLI argument
+	/// type, keeping command-line parsing out of the driver crate.
+	pub fn with_cli<'a, T>(self, cli: &'a T) -> Self
+	where
+		crate::prompt_prep::settings::PromptOverrides: From<&'a T>,
+	{
+		self.with_overrides(&crate::prompt_prep::settings::PromptOverrides::from(cli))
+	}
+}
 use omp_tool::DEFAULT_INTERRUPT_GRACE;
 use serde::{
 	Deserialize, Deserializer, Serialize, Serializer,

@@ -203,8 +203,12 @@ impl HeadlessSession {
 			min_tool_calls: settings.autolearn.min_tool_calls,
 		};
 		let state = AgentState::new(snapshot);
-		let (inference_registry, inference, credential_authority) =
-			crate::registry::production_inference_for_session(
+		let crate::registry::ProductionInference {
+			registry: inference_registry,
+			rpc: inference,
+			credential_authority,
+			..
+		} = crate::registry::production_inference_for_session(
 				&data_dir,
 				Arc::clone(&registry),
 				Some(&root),
@@ -366,7 +370,7 @@ impl HeadlessSession {
 	}
 
 	/// Binds or clears the session-scoped ACP terminal execution capability.
-	pub(crate) fn bind_acp_exec(
+	pub fn bind_acp_exec(
 		&self,
 		backend: Option<Arc<dyn omp_envd::tool_shell::AcpExecBackend>>,
 	) {
@@ -374,7 +378,7 @@ impl HeadlessSession {
 	}
 
 	/// Binds or clears the session-scoped ACP document capability.
-	pub(crate) fn bind_acp_documents(
+	pub fn bind_acp_documents(
 		&self,
 		backend: Option<Arc<dyn omp_envd::docs::AcpDocumentBackend>>,
 	) {
@@ -382,12 +386,12 @@ impl HeadlessSession {
 	}
 
 	/// Replaces the session environment's ask presentation bridge.
-	pub(crate) fn bind_ask_presenter(&self, presenter: Arc<dyn omp_tools::ask::AskPresenter>) {
+	pub fn bind_ask_presenter(&self, presenter: Arc<dyn omp_tools::ask::AskPresenter>) {
 		self._environment.bind_ask_presenter(presenter);
 	}
 
 	/// Binds or clears the durable approval authority.
-	pub(crate) fn bind_approval_authority(
+	pub fn bind_approval_authority(
 		&self,
 		book: Option<Arc<ApprovalBook>>,
 		route: Option<ApprovalRoute>,

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::{FutureExt as _, Stream};
 use omp_agent::{
 	Agent, AgentSnapshot, AgentState, ContextFile, InProcTurnClient, Journal, TurnClient, TurnId,
-	TurnInput, TurnOptions, WorkspaceInput,
+	TurnInput, TurnOptions, Props,
 };
 use omp_app::rpc_adapter::InferenceRpc;
 use omp_catalog::{
@@ -421,7 +421,7 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 		provider_reset:  false,
 		stream_watchdog: omp_agent::StreamWatchdog::default(),
 	};
-	let workspace = WorkspaceInput::new(
+	let workspace = Props::new(
 		scratch.project(),
 		Arc::<[ContextFile]>::from([context_file(&prompt_path)]),
 	);

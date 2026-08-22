@@ -13,7 +13,7 @@ use futures::StreamExt as _;
 use nix::{sys::stat::Mode, unistd::mkfifo};
 use omp_agent::{
 	Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnClient, TurnId,
-	TurnInput, TurnOptions, TurnSession, WorkspaceInput,
+	TurnInput, TurnOptions, TurnSession, Props,
 };
 use omp_core::{Str, sf};
 use omp_e2e::support::{
@@ -165,7 +165,7 @@ fn state(root: &Path, registry: Arc<Registry>) -> AgentState {
 	let turn = TurnOptions { context_id: Some(sf!("p3-context")), ..Default::default() };
 	let snapshot = AgentSnapshot {
 		enabled_tools: Arc::from([sf!("shell")]),
-		..AgentSnapshot::new(turn, WorkspaceInput::new(root, Arc::from([])), registry)
+		..AgentSnapshot::new(turn, Props::new(root, Arc::from([])), registry)
 	};
 	AgentState::new(snapshot)
 }

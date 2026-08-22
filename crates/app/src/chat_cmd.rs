@@ -7,6 +7,7 @@ use omp_agent::{
 	Agent, AgentKind, AgentState, AgentStatus, Budget, InProcTurnClient, RpcTurnClient, TurnClient,
 };
 use omp_core::{Str, sf};
+use omp_envd::exthost::control::ControlAuthorityFactory;
 use omp_driver::{
 	chat::{
 		AgentsControlAuthority, CHAT_CAPS_BASE, ChatAuthWorker, ChatError as DriverChatError,
@@ -31,9 +32,245 @@ use crate::{
 	chat_ui::{self, ChatUiSession},
 	cli::ChatArgs,
 };
+
+/// Complete app-owned CONTROL factory bundle for one production chat session.
+///
+/// Keeping every field required makes it impossible for a session entry point
+/// to accidentally activate an extension host with a silently absent domain.
+#[doc(hidden)]
+pub struct SessionControlFactories {
+	/// Policy mutation and approval decisions.
+	pub policy:            Arc<dyn ControlAuthorityFactory>,
+	/// Invocation parameter cursors.
+	pub parameters:        Arc<dyn ControlAuthorityFactory>,
+	/// Named worker placement and process ownership.
+	pub workers:           Arc<dyn ControlAuthorityFactory>,
+	/// Audited trusted direct-filesystem operations.
+	pub direct_filesystem: Arc<dyn ControlAuthorityFactory>,
+	/// Credential and secret resolution.
+	pub credentials:       Arc<dyn ControlAuthorityFactory>,
+	/// Typed prompt-head invalidation.
+	pub prompts:           Arc<dyn ControlAuthorityFactory>,
+	/// Interactive presentation composition.
+	pub ui:                Arc<dyn ControlAuthorityFactory>,
+	/// Durable telemetry query and export.
+	pub telemetry:         Arc<dyn ControlAuthorityFactory>,
+	/// Verdict projection and durable job registration.
+	pub verdicts:          Arc<dyn ControlAuthorityFactory>,
+	/// Inference provider declaration and request ownership.
+	pub provider:          Arc<dyn ControlAuthorityFactory>,
+	/// Session and turn campaign ownership.
+	pub campaigns:         Arc<dyn ControlAuthorityFactory>,
+}
+
+impl SessionControlFactories {
+	/// Atomically replaces agents and every app-owned domain under one lease.
+	#[must_use]
+	pub fn bind(
+		self,
+		environment: &omp_envd::ProjectEnvironment,
+		agents: Arc<dyn ControlAuthorityFactory>,
+	) -> omp_envd::exthost::ExternalControlAuthorityBinding {
+		environment.bind_external_control_authorities(
+			agents,
+			omp_envd::exthost::ExternalDomainControlFactories {
+				policy: Some(self.policy),
+				parameters: Some(self.parameters),
+				workers: Some(self.workers),
+				direct_filesystem: Some(self.direct_filesystem),
+				credentials: Some(self.credentials),
+				prompts: Some(self.prompts),
+				ui: Some(self.ui),
+				telemetry: Some(self.telemetry),
+				verdicts: Some(self.verdicts),
+				provider: Some(self.provider),
+				campaigns: Some(self.campaigns),
+				services: None,
+			},
+		)
+	}
+}
+
+fn presentation_control_factory(
+	executor: omp_executor::Executor,
+	bridge: Arc<crate::chat_ui::presentation::PresentationBridge>,
+	dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	Arc::new(
+		move |identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>| {
+			let presentation_identity =
+				Arc::new(crate::chat_ui::presentation_authority::PresentationIdentity {
+					principal: Str::new(identity.principal.id()),
+					extension: identity.extension.clone(),
+					artifact_digest: identity.artifact_digest.clone(),
+					host_generation: identity.host_generation,
+					session_generation: identity.session_generation,
+					capabilities: identity.capabilities.clone(),
+				});
+			let callbacks = Arc::new(
+				crate::chat_ui::presentation::ControlPresentationCallbackDispatcher::new(
+					Arc::clone(&identity),
+					Arc::clone(&dispatcher),
+				),
+			);
+			let owner = Arc::new(
+				crate::chat_ui::presentation_authority::PresentationAuthority::new(
+					executor.clone(),
+					presentation_identity,
+					bridge.clone(),
+					callbacks,
+				),
+			);
+			Ok(Arc::new(omp_envd::exthost::UiControlAuthority::new(identity, owner))
+				as Arc<dyn omp_envd::exthost::control::ControlAuthority>)
+		},
+	)
+}
+
+fn telemetry_control_factory(
+	query: Arc<dyn omp_telemetry::authority::DurableTelemetryQuery>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	Arc::new(
+		move |identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>| {
+			Ok(Arc::new(omp_envd::exthost::TelemetryControlAuthority::new(
+				identity,
+				now_ms(),
+				Arc::clone(&query),
+			)) as Arc<dyn omp_envd::exthost::control::ControlAuthority>)
+		},
+	)
+}
+
+fn prompt_control_factory(
+	head: Arc<dyn omp_driver::rulebook::PromptHeadAuthority>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	Arc::new(
+		move |identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>| {
+			Ok(Arc::new(omp_driver::rulebook::PromptControlOwner::new(
+				identity,
+				Arc::clone(&head),
+			)) as Arc<dyn omp_envd::exthost::control::ControlAuthority>)
+		},
+	)
+}
+
+fn verdict_control_factory(
+	session: Str,
+	jobs: omp_agent::JobBoard,
+	control: omp_agent::AgentHostControl,
+	dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	Arc::new(
+		move |identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>| {
+			let verdict_identity =
+				Arc::new(omp_driver::stats_api::verdict_authority::VerdictAuthorityIdentity {
+					principal: Str::new(identity.principal.id()),
+					extension: identity.extension.clone(),
+					artifact_digest: identity.artifact_digest.clone(),
+					host_generation: identity.host_generation,
+					session_generation: identity.session_generation,
+					session: session.clone(),
+					capabilities: identity.capabilities.clone(),
+				});
+			let registrar = Arc::new(
+				omp_driver::stats_api::verdict_authority::AgentDurableJobRegistrar::new(
+					control.clone(),
+				),
+			);
+			let projection = Arc::new(
+				omp_driver::stats_api::verdict_authority::ControlPromptProjectionDispatcher::new(
+					Arc::clone(&identity),
+					Arc::clone(&dispatcher),
+				),
+			);
+			let owner = Arc::new(
+				omp_driver::stats_api::verdict_authority::VerdictAuthority::new(
+					verdict_identity,
+					jobs.clone(),
+					registrar,
+					projection,
+				),
+			);
+			Ok(Arc::new(omp_envd::exthost::VerdictControlAuthority::new(identity, owner))
+				as Arc<dyn omp_envd::exthost::control::ControlAuthority>)
+		},
+	)
+}
+
+fn provider_control_factory(
+	registry: omp_inference::Registry,
+	builtins: omp_inference::layer::stack::BuiltinConfig,
+	blobs: omp_storage::blob::BlobStore,
+) -> Arc<dyn ControlAuthorityFactory> {
+	let owner = Arc::new(
+		omp_driver::model_controls::ProductionProviderApplicationOwner::new(
+			registry, builtins, blobs,
+		),
+	);
+	let backend = Arc::new(omp_driver::chat::ChatProviderControlBackend::new(owner));
+	Arc::new(omp_driver::model_controls::ProviderControlAuthorityFactory::new(
+		backend,
+	))
+}
+
+struct SessionCampaignResolver(Arc<omp_envd::worker::ExtensionCampaignResolver>);
+
+impl omp_driver::chat::CampaignControlResolver for SessionCampaignResolver {
+	fn resolve(
+		&self,
+		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
+		campaign: &str,
+		state: Option<&str>,
+	) -> Result<
+		(Arc<omp_agent::CampaignSpec>, Box<dyn omp_agent::CampaignMachine>),
+		omp_envd::exthost::control::ControlProtocolError,
+	> {
+		self.0.resolve(identity, campaign, state)
+	}
+
+	fn owner(&self, campaign: &str) -> Option<Str> {
+		self.0.owner(campaign)
+	}
+}
+
+fn campaign_control_factory(
+	control: omp_agent::ControlSender,
+	resolver: Arc<omp_envd::worker::ExtensionCampaignResolver>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	let backend = Arc::new(omp_driver::chat::AgentCampaignControlBackend::new(
+		control,
+		Arc::new(SessionCampaignResolver(resolver)),
+	));
+	Arc::new(omp_driver::chat::CampaignControlAuthorityFactory::new(backend))
+}
+
+fn replace_model_props(mut props: omp_scribe::Props, model: &str) -> omp_scribe::Props {
+	let mut fields = match props.get(omp_agent::prompt_keys::MODEL) {
+		Some(omp_scribe::Value::Map(fields)) => fields.clone(),
+		_ => std::iter::empty::<(Str, omp_scribe::Value)>().collect(),
+	};
+	fields.insert(
+		Str::new_static("identifier"),
+		omp_scribe::Value::from(Str::new(model)),
+	);
+	fields.insert(
+		Str::new_static("codex_task_policy"),
+		omp_scribe::Value::from(
+			omp_driver::task::prompt_policy::uses_codex_task_prompt(model),
+		),
+	);
+	props.set(
+		omp_agent::prompt_keys::MODEL,
+		omp_scribe::Value::Map(fields),
+	);
+	props
+}
 /// Failures owned by the interactive presentation boundary.
 #[derive(Debug, thiserror::Error)]
 enum ChatError {
+	/// Live agent composition failed.
+	#[error(transparent)]
+	Agent(#[from] omp_agent::Error),
 	/// Driver-owned durable session composition failed.
 	#[error(transparent)]
 	Driver(#[from] DriverChatError),
@@ -55,12 +292,21 @@ enum ChatError {
 	/// Session artifact metadata failed.
 	#[error(transparent)]
 	Artifact(#[from] omp_storage::gc::Error),
+	/// Session blob storage failed.
+	#[error(transparent)]
+	Blob(#[from] omp_storage::blob::Error),
+	/// Durable session telemetry index failed.
+	#[error(transparent)]
+	Telemetry(#[from] omp_storage::telemetry_index::QueryError),
 	/// Campaign lifecycle mutation failed.
 	#[error(transparent)]
 	Campaign(#[from] omp_agent::AgentError),
 	/// Environment authority binding failed.
 	#[error(transparent)]
 	Environment(#[from] omp_envd::EnvdError),
+	/// A production session entry omitted a required CONTROL owner.
+	#[error("required production CONTROL authority `{0}` was not composed")]
+	MissingAuthority(&'static str),
 	/// Session index mutation failed.
 	#[error(transparent)]
 	SessionIndex(#[from] omp_storage::index::Error),
@@ -104,13 +350,14 @@ pub(crate) enum ChatPresentation {
 	reason = "the interactive chat future owns a thread-confined terminal scene"
 )]
 pub(crate) async fn run(
+	executor: omp_executor::Executor,
 	args: ChatArgs,
 	mut start: ChatStart,
 	presentation: ChatPresentation,
 ) -> miette::Result<()> {
 	use miette::{Context as _, IntoDiagnostic as _};
 	let launch_root = canonical_project(&args.project).map_err(|e| miette::miette!(e))?;
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let mut root = launch_root.clone();
 	let mut selected_sessions_dir = None;
 	let mut selected_index_path = None;
@@ -262,6 +509,11 @@ pub(crate) async fn run(
 		omp_driver::bridges::builtin(&root, Arc::clone(&search_bridge), goal_control.clone(), None);
 	let bridges =
 		omp_envd::RegistryBridges { ask_presenter: Some(omp_chat_ui::ask::presenter()), ..bridges };
+	let prompt_head = Arc::new(
+		omp_driver::prompt_head::ProductionPromptHead::from_extension_specs(
+			&args.trusted_extensions,
+		),
+	);
 	let environment = omp_envd::ProjectEnvironment::connect_or_start(
 		&root,
 		&state_dir,
@@ -274,6 +526,8 @@ pub(crate) async fn run(
 	)
 	.await
 	.map_err(|e| miette::miette!(e))?;
+	let credential_control_grants =
+		omp_driver::secrets::credential_control_grants(&args.trusted_extensions);
 	let session_index = if let Some(database) = selected_index_path {
 		Arc::new(
 			SessionIndex::open(database)
@@ -353,7 +607,6 @@ pub(crate) async fn run(
 	} else {
 		None
 	};
-	let eval_bridge = environment.eval_bridge();
 	let eval_control = environment.eval_control();
 
 	let registry = environment.registry();
@@ -404,13 +657,14 @@ pub(crate) async fn run(
 	.map_err(|error| miette::miette!(error))?;
 	let mut snapshot =
 		agent_snapshot(&blueprint, catalog).map_err(|error| miette::miette!(error))?;
+	let mut prompt_facts = blueprint.prompt_facts().clone();
 	let home = std::env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
 	let prompt_settings = omp_driver::prompt_prep::settings::PromptSettings::default()
 		.with_cli(&args.prompt_settings)
 		.resolve_inputs(&root, &home)
 		.map_err(|error| miette::miette!(error))?;
-	snapshot.workspace.settings = prompt_settings.into();
-	snapshot.workspace.model = omp_agent::ModelPromptInput {
+	prompt_facts.settings = prompt_settings.into();
+	prompt_facts.model = omp_agent::ModelPromptInput {
 		identifier:        model.clone(),
 		codex_task_policy: omp_driver::task::prompt_policy::uses_codex_task_prompt(model.as_str()),
 	};
@@ -443,8 +697,8 @@ pub(crate) async fn run(
 		}
 	}
 	snapshot.reasoning_dialect = interrupted_reasoning_dialect(catalog, &snapshot.turn.params.model);
-	snapshot.workspace.model.identifier = Str::new(&snapshot.turn.params.model);
-	snapshot.workspace.model.codex_task_policy =
+	prompt_facts.model.identifier = Str::new(&snapshot.turn.params.model);
+	prompt_facts.model.codex_task_policy =
 		omp_driver::task::prompt_policy::uses_codex_task_prompt(&snapshot.turn.params.model);
 	let invocation_grant = apply_launch_tool_selection(
 		&mut snapshot,
@@ -510,9 +764,9 @@ pub(crate) async fn run(
 		&context_roots,
 		&omp_driver::discovery::context::ContextDiscoveryOptions::default(),
 	);
-	snapshot.workspace.context_files = omp_driver::discovery::context::prompt_files(&context);
-	snapshot.workspace = omp_driver::prompt_prep::PromptSnapshot::freeze(
-		snapshot.workspace.clone(),
+	prompt_facts.context_files = omp_driver::discovery::context::prompt_files(&context);
+	let prepared_prompt = omp_driver::prompt_prep::PromptSnapshot::freeze(
+		prompt_facts,
 		registry.as_ref(),
 		Some(&snapshot.enabled_tools),
 		Arc::from([]),
@@ -522,13 +776,16 @@ pub(crate) async fn run(
 		prompt_rules,
 		prompt_skills,
 		Arc::from([]),
-	)
-	.workspace;
+	);
+	let mut prompt_facts = prepared_prompt.workspace;
 	let prepared =
 		omp_driver::prompt_prep::prepare_environment_inputs_bounded(&env, &session.journal, &root)
 			.await;
-	snapshot.workspace.host = prepared.host;
-	snapshot.workspace.roots = prepared.roots;
+	prompt_facts.host = prepared.host;
+	prompt_facts.roots = prepared.roots;
+	snapshot.props = prompt_facts
+		.props()
+		.map_err(|error| miette::miette!(error))?;
 	let state = AgentState::new(snapshot);
 	let initial_campaign = args.plan_mode.then_some("plan");
 
@@ -548,18 +805,29 @@ pub(crate) async fn run(
 			.bind_remote(channel.clone())
 			.into_diagnostic()?;
 		Box::pin(run_ui(
-			RpcTurnClient::new(channel),
+			executor.clone(),
+						RpcTurnClient::new(channel.clone()),
 			&environment,
 			env,
 			state,
 			autolearn,
 			session,
 			blueprint,
-			Arc::clone(&eval_bridge),
 			eval_control.clone(),
 			None,
 			goal_control.clone(),
+			None,
+			Some(channel.clone()),
+			Some(
+				omp_driver::discovery::runtime::gateway_provider_control_factory(
+					channel.clone(),
+				),
+			),
+			None,
+			credential_control_grants,
+			Arc::clone(&prompt_head),
 			data_dir.clone(),
+			state_dir.clone(),
 			power_mode,
 			initial_campaign,
 			plan_selection,
@@ -580,19 +848,25 @@ pub(crate) async fn run(
 		.await
 		.into_diagnostic()?;
 	} else {
-		let (inference_registry, inference, credential_authority) =
-			omp_driver::registry::production_inference_for_session(
-				&data_dir,
-				Arc::clone(&registry),
-				Some(&root),
-				omp_driver::registry::InferenceSessionOverrides {
-					provider:              credential_provider,
-					api_key:               args.api_key.clone(),
-					prompt_cache_affinity: args.prompt_cache_key.clone(),
-				},
-			)
-			.await
-			.into_diagnostic()?;
+		let omp_driver::registry::ProductionInference {
+			registry: inference_registry,
+			rpc: inference,
+			credential_authority,
+			auth_control,
+			builtins,
+			..
+		} = omp_driver::registry::production_inference_for_session(
+			&data_dir,
+			Arc::clone(&registry),
+			Some(&root),
+			omp_driver::registry::InferenceSessionOverrides {
+				provider:              credential_provider,
+				api_key:               args.api_key.clone(),
+				prompt_cache_affinity: args.prompt_cache_key.clone(),
+			},
+		)
+		.await
+		.into_diagnostic()?;
 		search_bridge
 			.bind(inference.clone())
 			.map_err(|_| miette::miette!("workspace search inference is already bound"))?;
@@ -605,6 +879,7 @@ pub(crate) async fn run(
 			.map_err(ChatError::from)
 			.into_diagnostic()?;
 		Box::pin(run_ui(
+			executor,
 			client,
 			&environment,
 			env,
@@ -612,11 +887,17 @@ pub(crate) async fn run(
 			autolearn,
 			session,
 			blueprint,
-			eval_bridge,
 			eval_control,
 			Some(inference_registry),
 			goal_control,
+			Some(auth_control),
+			None,
+			None,
+			Some(builtins),
+			credential_control_grants,
+			prompt_head,
 			data_dir,
+			state_dir,
 			power_mode,
 			initial_campaign,
 			plan_selection,
@@ -648,6 +929,7 @@ pub(crate) async fn run(
 /// Reports the platform limitation before touching project state.
 #[cfg(not(any(unix, windows)))]
 pub(crate) async fn run(
+	_executor: omp_executor::Executor,
 	_args: ChatArgs,
 	_start: ChatStart,
 	_presentation: ChatPresentation,
@@ -694,7 +976,8 @@ fn bind_goal_todo_context(
 	clippy::future_not_send,
 	reason = "the designed terminal host remains confined to its event-loop thread"
 )]
-async fn run_ui<C: TurnClient + Clone + Send + 'static>(
+async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
+	executor: omp_executor::Executor,
 	client: C,
 	environment: &omp_envd::ProjectEnvironment,
 	env: omp_env::EnvClient,
@@ -702,11 +985,20 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 	autolearn: omp_agent::AutolearnSettings,
 	mut session: Session,
 	mut blueprint: SessionBlueprint,
-	eval_bridge: Arc<omp_envd::eval::SessionBridgeHost>,
 	eval_control: omp_tools::eval::EvalSessionControl,
 	auth_registry: Option<InferenceRegistry>,
 	goal_control: omp_driver::bridges::AgentGoalControl,
+	auth_control: Option<omp_inference::auth::AuthControlHandle>,
+	gateway_channel: Option<tonic::transport::Channel>,
+	gateway_provider_factory: Option<Arc<dyn ControlAuthorityFactory>>,
+	provider_builtins: Option<omp_inference::layer::stack::BuiltinConfig>,
+	credential_control_grants: std::collections::BTreeMap<
+		Str,
+		omp_driver::auth_backend::CredentialControlGrant,
+	>,
+	prompt_head: Arc<omp_driver::prompt_head::ProductionPromptHead>,
 	data_dir: PathBuf,
+	state_dir: PathBuf,
 	power_mode: omp_driver::power::SleepPrevention,
 	initial_campaign: Option<&'static str>,
 	plan_selection: Option<omp_driver::plan::ModelSelection>,
@@ -728,7 +1020,19 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		usize::MAX,
 	)
 	.map_err(DriverChatError::from)?;
-	state.update(|snapshot| snapshot.workspace.memory = memory_prompt);
+	state.update(|snapshot| {
+		let values = [
+			("memory", memory_prompt.memory.content.clone()),
+			("standing", memory_prompt.standing.content.clone()),
+			("recall", memory_prompt.recall.content.clone()),
+		]
+		.into_iter()
+		.filter_map(|(name, content)| {
+			content.map(|content| (name, omp_scribe::Value::from(content)))
+		})
+		.collect::<omp_scribe::Value>();
+		snapshot.props.set(omp_agent::prompt_keys::MEMORY, values);
+	});
 	let parent = Arc::new(ChatParentHost::new(
 		client.clone(),
 		env.clone(),
@@ -739,12 +1043,15 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		Arc::clone(&scope.session_index),
 		security_enabled,
 	));
-	let mut agents_control_session = parent.session_id();
-	let mut _agents_control_binding = environment
-		.bind_agents_control_authority(AgentsControlAuthority::factory(Arc::clone(&parent)));
+	environment
+		.bind_schedule_delivery(parent.schedule_delivery_backend())
+		.await?;
+	let mut _external_control_binding: Option<
+		omp_envd::exthost::ExternalControlAuthorityBinding,
+	> = None;
 	parent.start_idle_parking();
-	let _eval_parent_binding = eval_bridge
-		.bind_sdk_parent(parent.session_id(), parent.clone())
+	let _eval_parent_binding = environment
+		.bind_eval_sdk_parent(parent.session_id(), parent.clone())
 		.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
 	environment
 		.reflection_bridge()
@@ -754,7 +1061,10 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 	if cold_agents.is_dir() {
 		omp_agent::AgentRegistry::global().discover_transcripts(&cold_agents)?;
 	}
+	let provider_registry = auth_registry.clone();
 	let auth = auth_registry.map(ChatAuthWorker::start);
+	let presentation_bridge = Arc::new(crate::chat_ui::presentation::PresentationBridge::new(64));
+	let extension_callbacks = environment.extension_callback_dispatcher();
 	let drafts = crate::session_manager::DraftStore::new(&data_dir)?;
 	let breadcrumbs = omp_driver::session_state::TerminalBreadcrumbs::new(&data_dir)?;
 	let terminal_id = omp_tui::ttyid::terminal_id();
@@ -763,14 +1073,22 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			breadcrumbs.restamp(terminal_id.as_str(), &SessionId(session.id.clone()))?;
 		}
 		parent.update(state.clone(), session.id.clone());
-		if parent.session_id() != agents_control_session {
-			_agents_control_binding = environment
-				.bind_agents_control_authority(AgentsControlAuthority::factory(Arc::clone(&parent)));
-			agents_control_session = parent.session_id();
-		}
+		let approval_book = Arc::new(omp_agent::ApprovalBook::new());
+		state.update(|snapshot| {
+			snapshot.prompt_source =
+				prompt_head.wrap_prompt_source(Arc::clone(&snapshot.prompt_source));
+		});
 		let session_root = scope.sessions_dir.join(session.id.as_str());
 		ensure_state_directory(&session_root)?;
 		ensure_state_directory(&session_root.join("local"))?;
+		let host_backends = omp_envd::exthost::backends::EnvdHostOwnerBackends::production(
+			&session_root.join("control"),
+			Arc::clone(&approval_book),
+		);
+		let telemetry_index = Arc::new(omp_storage::telemetry_index::TelemetryIndex::open(
+			&state_dir.join("telemetry"),
+			&state_dir.join("telemetry.sqlite3"),
+		)?);
 		let context_window = {
 			let current = state.snapshot();
 			model_context_window(scope.catalog, &current.turn.params.model)
@@ -785,13 +1103,13 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		let mut agent =
 			Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
 		parent.bind_host_control(id.clone(), agent.host_control());
+		let secrets = omp_driver::secrets::session::SecretSessionSnapshot::build(
+			0,
+			&data_dir.join("secrets.toml"),
+			&scope.root.join(".omp/secrets.toml"),
+			std::iter::empty(),
+		)?;
 		if omp_driver::settings::current(&data_dir)?.secrets.enabled {
-			let secrets = omp_driver::secrets::session::SecretSessionSnapshot::build(
-				0,
-				&data_dir.join("secrets.toml"),
-				&scope.root.join(".omp/secrets.toml"),
-				std::iter::empty(),
-			)?;
 			agent.set_secret_obfuscator(secrets.transform_handle());
 		}
 		agent.set_autolearn(omp_agent::AutolearnSettings {
@@ -815,6 +1133,55 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			Arc::new(parking_lot::Mutex::new(omp_storage::gc::ArtifactCatalog::open(&blob_store)?));
 		agent.set_artifact_catalog(Arc::clone(&artifact_catalog));
 		agent.set_blob_store(blob_store.clone());
+		let credential_factory = if let Some(control) = auth_control.as_ref() {
+			Arc::new(omp_driver::secrets::credential_secret_control_factory(
+				control.clone(),
+				credential_control_grants.clone(),
+				&secrets,
+			)) as Arc<dyn ControlAuthorityFactory>
+		} else {
+			let channel = gateway_channel
+				.as_ref()
+				.ok_or(ChatError::MissingAuthority("credentials"))?;
+			Arc::new(
+				omp_driver::auth_backend::gateway_credential_secret_control_factory(
+					channel.clone(),
+					credential_control_grants.clone(),
+					&secrets,
+				),
+			) as Arc<dyn ControlAuthorityFactory>
+		};
+		let prompt_factory = prompt_control_factory(prompt_head.clone());
+		let presentation_factory = presentation_control_factory(
+			executor.clone(),
+			Arc::clone(&presentation_bridge),
+			Arc::clone(&extension_callbacks),
+		);
+		let telemetry_query = Arc::new(
+			omp_driver::stats_api::telemetry_backend::TelemetryIndexQuery::new(
+				Arc::clone(&telemetry_index),
+				id.clone(),
+			),
+		);
+		let telemetry_factory = telemetry_control_factory(telemetry_query);
+		let verdict_factory = verdict_control_factory(
+			id.clone(),
+			agent.jobs().as_ref().clone(),
+			agent.host_control(),
+			Arc::clone(&extension_callbacks),
+		);
+		let provider_factory = gateway_provider_factory.clone().or_else(|| {
+			provider_registry
+				.as_ref()
+				.zip(provider_builtins.as_ref())
+				.map(|(registry, builtins)| {
+					provider_control_factory(
+						registry.clone(),
+						builtins.clone(),
+						blob_store.clone(),
+					)
+				})
+		});
 		let capture_rx =
 			omp_inference::transport::global_provider_capture().subscribe(Some(id.as_str()));
 		let capture_store = blob_store;
@@ -911,6 +1278,31 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
 		});
 		agent.set_continuation_source(modes.clone());
+		let campaign_factory = campaign_control_factory(
+			agent.control(),
+			environment.extension_campaign_resolver(),
+		);
+		let provider_factory =
+			provider_factory.ok_or(ChatError::MissingAuthority("provider"))?;
+		_external_control_binding = Some(
+			SessionControlFactories {
+				policy: host_backends.policy_factory,
+				parameters: host_backends.parameter_factory,
+				workers: host_backends.worker_factory,
+				direct_filesystem: host_backends.direct_filesystem_factory,
+				credentials: credential_factory,
+				prompts: prompt_factory,
+				ui: presentation_factory,
+				telemetry: telemetry_factory,
+				verdicts: verdict_factory,
+				provider: provider_factory,
+				campaigns: campaign_factory,
+			}
+			.bind(
+				environment,
+				AgentsControlAuthority::factory(Arc::clone(&parent)),
+			),
+		);
 		let _control_binding = environment.bind_agent_control(agent.control())?;
 		environment.bind_device_availability(agent.mailbox());
 		let tree = parent.tree();
@@ -953,7 +1345,6 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		} else {
 			String::new()
 		};
-		let approval_book = Arc::new(omp_agent::ApprovalBook::new());
 		let (_approval_route, approval_inbox) =
 			omp_agent::ApprovalRoute::new(Arc::clone(&approval_book));
 		let (replica_pump, replica) = omp_collab::guest::GuestRelayPump::new(
@@ -978,6 +1369,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 				}
 			});
 		let outcome = chat_ui::run(
+			executor.clone(),
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window, title },
 			Arc::clone(&scope.registry),
@@ -1012,6 +1404,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			matches!(start, ChatStart::SessionIndex),
 			Str::from(initial_draft),
 			presentation,
+			Some(presentation_bridge.attach()),
 		)
 		.await;
 		replica_shutdown.stop().await;
@@ -1052,7 +1445,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 				}
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
-				let prompt_workspace = state.snapshot().workspace.clone();
+				let prompt_props = state.snapshot().props.clone();
 				session = open_session(
 					scope.root,
 					scope.sessions_dir,
@@ -1072,14 +1465,13 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 					Arc::clone(&scope.registry),
 				)?;
 				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
-				next.workspace = prompt_workspace;
-				next.workspace.model.identifier = Str::new(&model);
+				next.props = replace_model_props(prompt_props, &model);
 				state = AgentState::new(next);
 			},
 			omp_chat_ui::host::HostExit::Resume(id) => {
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
-				let prompt_workspace = state.snapshot().workspace.clone();
+				let prompt_props = state.snapshot().props.clone();
 				session = open_session(
 					scope.root,
 					scope.sessions_dir,
@@ -1108,14 +1500,13 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 					Arc::clone(&scope.registry),
 				)?;
 				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
-				next.workspace = prompt_workspace;
-				next.workspace.model.identifier = Str::new(&model);
+				next.props = replace_model_props(prompt_props, &model);
 				state = AgentState::new(next);
 			},
 			omp_chat_ui::host::HostExit::NewSession => {
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
-				let prompt_workspace = state.snapshot().workspace.clone();
+				let prompt_props = state.snapshot().props.clone();
 				session = open_session(
 					scope.root,
 					scope.sessions_dir,
@@ -1148,8 +1539,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 					Arc::clone(&scope.registry),
 				)?;
 				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
-				next.workspace = prompt_workspace;
-				next.workspace.model.identifier = Str::new(&model);
+				next.props = replace_model_props(prompt_props, &model);
 				state = AgentState::new(next);
 			},
 		}

@@ -99,7 +99,7 @@ fn clean(index: &TelemetryIndex, args: &GrievancesArgs) -> Result<()> {
 }
 
 async fn push(index: &TelemetryIndex, json_output: bool) -> Result<()> {
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let credentials = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;
 	let authority: Arc<dyn omp_envd::github_url::CredentialAuthority> =
@@ -130,7 +130,7 @@ async fn push(index: &TelemetryIndex, json_output: bool) -> Result<()> {
 }
 
 fn open_index() -> Result<Option<TelemetryIndex>> {
-	let data_dir = omp_core::dirs::data_dir(None)?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let project = std::fs::canonicalize(".").into_diagnostic()?;
 	let state_dir = omp_env::project_state::directory(&data_dir, &project).into_diagnostic()?;
 	let database = state_dir.join("telemetry.sqlite3");

@@ -2,68 +2,56 @@
 
 use std::{cell::RefCell, future::Future, rc::Rc, time::Duration};
 
-use futures::{executor::LocalPool, task::LocalSpawnExt};
 use omp_chat_ui::host::{HostExit, HostOutcome, RetainedChat, RetainedChatEffect};
+use omp_executor::Executor;
 use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
 use omp_tui::{Key, MouseReport, Size, UiContext};
 
 /// Runs one production chat scene in a single native GPU window.
 pub(crate) fn run<F>(
+	executor: &Executor,
 	build: impl FnOnce(&UiContext) -> RetainedChat,
 	bridge: F,
 ) -> (HostOutcome, miette::Result<()>)
 where
-	F: Future<Output = miette::Result<()>> + 'static,
+	F: Future<Output = miette::Result<()>> + Send + 'static,
 {
 	let build = Rc::new(RefCell::new(Some(build)));
 	let outcome = Rc::new(RefCell::new(None));
 	let (result_tx, result_rx) = flume::bounded(1);
-	let pool = LocalPool::new();
-	pool
-		.spawner()
-		.spawn_local(async move {
-			let _ = result_tx.send(bridge.await);
-		})
-		.expect("local GUI bridge executor accepted one task");
-	let pool = Rc::new(RefCell::new(pool));
+	let bridge_task = executor.spawn(async move {
+		let _ = result_tx.send(bridge.await);
+	});
 	omp_gui::run(HostConfig { multiplex: false, ..HostConfig::default() }, {
 		let build = Rc::clone(&build);
 		let outcome = Rc::clone(&outcome);
-		let pool = Rc::clone(&pool);
 		move |ctx| {
 			let build = build
 				.borrow_mut()
 				.take()
 				.expect("single-scene GUI host requested another chat scene");
-			GuiScene::new(build(ctx), Rc::clone(&outcome), Rc::clone(&pool))
+			GuiScene::new(build(ctx), Rc::clone(&outcome))
 		}
 	});
 	let outcome = outcome
 		.borrow_mut()
 		.take()
 		.expect("closed GUI scene must report a chat outcome");
-	let bridge = pool.borrow_mut().run_until(async move {
-		result_rx
-			.recv_async()
-			.await
-			.expect("GUI bridge must complete after its scene drops")
-	});
+	let bridge = result_rx
+		.recv()
+		.expect("GUI bridge must complete after its scene drops");
+	drop(bridge_task);
 	(outcome, bridge)
 }
 
 struct GuiScene {
-	chat:        RetainedChat,
-	outcome:     Rc<RefCell<Option<HostOutcome>>>,
-	bridge_pool: Rc<RefCell<LocalPool>>,
+	chat:    RetainedChat,
+	outcome: Rc<RefCell<Option<HostOutcome>>>,
 }
 
 impl GuiScene {
-	fn new(
-		chat: RetainedChat,
-		outcome: Rc<RefCell<Option<HostOutcome>>>,
-		bridge_pool: Rc<RefCell<LocalPool>>,
-	) -> Self {
-		Self { chat, outcome, bridge_pool }
+	fn new(chat: RetainedChat, outcome: Rc<RefCell<Option<HostOutcome>>>) -> Self {
+		Self { chat, outcome }
 	}
 
 	fn apply(&mut self, effect: RetainedChatEffect) -> Effect {
@@ -124,7 +112,6 @@ impl Scene for GuiScene {
 	}
 
 	fn poll(&mut self) -> Effect {
-		self.bridge_pool.borrow_mut().run_until_stalled();
 		let effect = self.chat.poll();
 		self.apply(effect)
 	}
@@ -154,8 +141,7 @@ mod tests {
 			Default::default(),
 		);
 		let outcome = Rc::new(RefCell::new(None));
-		let mut scene =
-			GuiScene::new(chat, Rc::clone(&outcome), Rc::new(RefCell::new(LocalPool::new())));
+		let mut scene = GuiScene::new(chat, Rc::clone(&outcome));
 		events
 			.send(BackendEvent::NewSessionRequested)
 			.expect("retained chat receiver remains connected");

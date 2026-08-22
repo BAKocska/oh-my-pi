@@ -22,7 +22,7 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 	if args.count == 0 || args.concurrency == 0 {
 		return Err(miette!("--count and --concurrency must be greater than zero"));
 	}
-	let data_dir = omp_core::dirs::data_dir(args.data_dir.clone())?;
+	let data_dir = omp_core::dirs::data_dir(args.data_dir.clone()).into_diagnostic()?;
 	let catalog = Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
 	let model = args
 		.model

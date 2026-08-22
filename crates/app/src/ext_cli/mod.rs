@@ -570,7 +570,7 @@ pub struct ExtWhereArgs {
 /// Dispatches a parsed extension command to its dedicated backend seam.
 pub async fn run(args: ExtArgs) -> miette::Result<()> {
 	let ExtArgs { data_dir, project, command, .. } = args;
-	let data_dir = omp_core::dirs::data_dir(data_dir)?;
+	let data_dir = omp_core::dirs::data_dir(data_dir).into_diagnostic()?;
 	let state = StatePaths::new(&data_dir, &project);
 	let settings = omp_driver::settings::current(&data_dir).map_err(|error| miette!("{error}"))?;
 	let _environment = ExtensionEnvironment::from_environment();

@@ -66,6 +66,7 @@ enum AuthLocation {
 /// completed inside this retained terminal host before it is dropped.
 #[expect(clippy::future_not_send, reason = "the setup wizard owns a thread-confined omp_tui::App")]
 pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<Str>> {
+	let executor = omp_executor::Executor::new(None);
 	std::fs::create_dir_all(data_dir).into_diagnostic()?;
 	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;
@@ -79,7 +80,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 	let mut app = AppOptions::new()
 		.hold_alt()
 		.keep_on_cancel()
-		.start(|env| {
+		.start(executor, |env: omp_tui::AppEnv| {
 			Ui::from_root(
 				Shader::new(Eclipse::default()).size(env.viewport.width, env.viewport.height),
 				env.viewport.width,

@@ -922,31 +922,6 @@ pub(crate) fn expand_arguments_with_fallback(
 	let mut at = 0;
 	let mut substituted = false;
 	while at < bytes.len() {
-		if template[at..].starts_with("{{args}}") {
-			substituted = true;
-			expanded.push_str(&joined);
-			at += "{{args}}".len();
-			continue;
-		}
-		if template[at..].starts_with("{{arguments}}") {
-			substituted = true;
-			expanded.push_str(&joined);
-			at += "{{arguments}}".len();
-			continue;
-		}
-		if let Some(rest) = template[at..].strip_prefix("{{arg ")
-			&& let Some(close) = rest.find("}}")
-			&& let Ok(index) = rest[..close].trim().parse::<usize>()
-		{
-			substituted = true;
-			if index > 0
-				&& let Some(value) = args.get(index - 1)
-			{
-				expanded.push_str(value);
-			}
-			at += "{{arg ".len() + close + 2;
-			continue;
-		}
 		if bytes[at] != b'$' {
 			let ch = template[at..]
 				.chars()
@@ -1293,14 +1268,11 @@ mod tests {
 	}
 
 	#[test]
-	fn handlebars_arguments_expand_once_and_suppress_fallback() {
+	fn shell_arguments_expand_once_and_suppress_fallback() {
 		let args = [sf!("one"), sf!("$1")];
-		assert_eq!(
-			expand_arguments("{{args}} | {{arguments}} | {{arg 2}}", &args),
-			"one $1 | one $1 | $1"
-		);
+		assert_eq!(expand_arguments("$ARGUMENTS | $2", &args), "one $1 | $1");
 		assert_eq!(expand_arguments("no placeholder", &args), "no placeholder one $1");
-		assert_eq!(expand_arguments("missing={{arg 9}}", &args), "missing=");
+		assert_eq!(expand_arguments("missing=$9", &args), "missing=");
 	}
 	#[test]
 	fn embedded_init_is_a_native_prompt_workflow() {

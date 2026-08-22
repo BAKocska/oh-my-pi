@@ -9,8 +9,8 @@ pub(crate) fn chat_hub_tool() -> impl omp_tool::Tool {
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	fs::{File, OpenOptions},
-	io::{self, BufRead as _, BufReader, Write as _},
+	fs::File,
+	io::{self, BufRead as _, BufReader},
 	path::{Path, PathBuf},
 	pin::Pin,
 	sync::{
@@ -27,7 +27,7 @@ use omp_agent::{
 	ChildKind, CompletionError, CompletionRequest, InProcTurnClient, Journal,
 	MAX_YIELD_SCHEMA_RETRIES, RegistryStatus, RpcTurnClient, SubagentDisposition, SubagentLifecycle,
 	SubagentProgressSnapshot, SubagentRunState, SubagentTerminalKind, SubagentTerminalStatus,
-	TurnClient, TurnId, TurnInput, TurnOptions, TurnSession as _, WorkspaceInput,
+	PromptFacts, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession as _,
 	WorkspaceRootInput, WorkspaceRootsInput, YieldPayloadValidator, project_journal,
 	resolve_completion,
 };
@@ -772,51 +772,6 @@ pub struct ChatParentHost<C: TurnClient + Clone + Send + 'static> {
 	revival:    Mutex<BTreeMap<Str, flume::Sender<omp_agent::RevivalRequest>>>,
 	inboxes:    Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
 	controls:   Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
-	schedules:  Mutex<ScheduleStore>,
-}
-#[derive(Default)]
-struct ScheduleStore {
-	rows:    BTreeMap<Str, Value>,
-	history: BTreeMap<Str, Vec<Value>>,
-}
-impl ScheduleStore {
-	fn load(paths: &[PathBuf]) -> Self {
-		let mut store = Self::default();
-		for path in paths {
-			let Ok(file) = File::open(path) else { continue };
-			for line in BufReader::new(file).lines().map_while(Result::ok) {
-				let Ok(event) = serde_json::from_str::<Value>(&line) else {
-					continue;
-				};
-				let Some(op) = event.get("op").and_then(Value::as_str) else {
-					continue;
-				};
-				match op {
-					"upsert" => {
-						if let Some(row) = event.get("row").cloned()
-							&& let Some(id) = row.get("id").and_then(Value::as_str)
-						{
-							store.rows.insert(Str::from(id), row);
-						}
-					},
-					"delete" => {
-						if let Some(id) = event.get("id").and_then(Value::as_str) {
-							store.rows.remove(id);
-						}
-					},
-					"firing" => {
-						if let Some(row) = event.get("row").cloned()
-							&& let Some(id) = row.get("schedule_id").and_then(Value::as_str)
-						{
-							store.history.entry(Str::from(id)).or_default().push(row);
-						}
-					},
-					_ => {},
-				}
-			}
-		}
-		store
-	}
 }
 struct ProductionChildReviver<C: TurnClient + Clone + Send + 'static> {
 	client:         C,
@@ -1004,12 +959,6 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		}
 		let supervisor =
 			Arc::new(crate::subagent::supervisor::SessionSupervisor::new(Arc::clone(&tree)));
-		let schedule_paths = [
-			sessions_dir
-				.join(session_id.as_str())
-				.join("agent-schedules.jsonl"),
-			sessions_dir.join("project-agent-schedules.jsonl"),
-		];
 		Self {
 			client,
 			env,
@@ -1032,64 +981,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			revival: Mutex::new(BTreeMap::new()),
 			inboxes: Arc::new(Mutex::new(BTreeMap::new())),
 			controls: Arc::new(Mutex::new(BTreeMap::new())),
-			schedules: Mutex::new(ScheduleStore::load(&schedule_paths)),
 		}
-	}
-
-	fn schedule_path(&self, scope: &str) -> PathBuf {
-		let context = self.context.lock();
-		if scope == "project" {
-			context.sessions_dir.join("project-agent-schedules.jsonl")
-		} else {
-			context
-				.sessions_dir
-				.join(context.session_id.as_str())
-				.join("agent-schedules.jsonl")
-		}
-	}
-
-	fn append_schedule_event(
-		&self,
-		scope: &str,
-		event: &Value,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
-		let path = self.schedule_path(scope);
-		if let Some(parent) = path.parent() {
-			std::fs::create_dir_all(parent).map_err(|error| {
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"ScheduleRejected",
-					error.to_string(),
-				)
-			})?;
-		}
-		let mut file = OpenOptions::new()
-			.create(true)
-			.append(true)
-			.open(path)
-			.map_err(|error| {
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"ScheduleRejected",
-					error.to_string(),
-				)
-			})?;
-		serde_json::to_writer(&mut file, event).map_err(|error| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"ScheduleRejected",
-				error.to_string(),
-			)
-		})?;
-		file.write_all(b"\n").map_err(|error| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"ScheduleRejected",
-				error.to_string(),
-			)
-		})?;
-		file.sync_data().map_err(|error| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"ScheduleRejected",
-				error.to_string(),
-			)
-		})
 	}
 
 	/// Binds the main agent inbox used by the hub presentation.
@@ -1166,6 +1058,16 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	/// Returns the session child supervisor for hub attachment.
 	pub fn supervisor(&self) -> Arc<crate::subagent::supervisor::SessionSupervisor<C>> {
 		Arc::clone(&self.supervisor)
+	}
+	/// Returns the live delivery adapter for the Environment-owned durable
+	/// scheduler. The adapter owns no clocks or persistence.
+	pub fn schedule_delivery_backend(
+		self: &Arc<Self>,
+	) -> Arc<dyn omp_envd::schedules::ScheduleDeliveryBackend>
+	where
+		C: Sync,
+	{
+		Arc::new(ChatScheduleDelivery { parent: Arc::clone(self) })
 	}
 
 	/// Returns the current durable session identity.
@@ -1416,7 +1318,10 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				id: record.id.clone(),
 			})?;
 		let mut snapshot = context.state.snapshot().as_ref().clone();
-		snapshot.workspace.cwd = workspace_root.clone();
+		snapshot.props.set(
+			omp_agent::prompt_keys::CWD,
+			workspace_root.to_string_lossy().into_owned(),
+		);
 		snapshot.turn.params.model = revival.model_role.to_string();
 		let grants = blob_store
 			.get(&revival.grant_snapshot_ref)
@@ -1799,6 +1704,9 @@ pub struct AgentsControlAuthority<C: TurnClient + Clone + Send + 'static> {
 	expected_session_id: Str,
 	parent:              Arc<ChatParentHost<C>>,
 }
+struct ChatScheduleDelivery<C: TurnClient + Clone + Send + 'static> {
+	parent: Arc<ChatParentHost<C>>,
+}
 
 impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 	pub fn new(parent: Arc<ChatParentHost<C>>) -> Self {
@@ -1850,15 +1758,17 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 	) -> Result<(&str, u64), omp_envd::exthost::control::ControlProtocolError> {
 		let (id, generation) = run_id.rsplit_once('#').ok_or_else(|| {
 			omp_envd::exthost::control::ControlProtocolError::new(
-				"UnknownRun",
+				"AgentGone",
 				"invalid or stale subagent run handle",
 			)
+			.with_details(json!({"ref": run_id, "status": "aborted", "transcript_url": ""}))
 		})?;
 		let generation = generation.parse::<u64>().map_err(|_| {
 			omp_envd::exthost::control::ControlProtocolError::new(
-				"UnknownRun",
+				"AgentGone",
 				"invalid or stale subagent run handle",
 			)
+			.with_details(json!({"ref": run_id, "status": "aborted", "transcript_url": ""}))
 		})?;
 		Ok((id, generation))
 	}
@@ -1872,32 +1782,62 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		let (id, generation) = Self::split_run_id(run_id)?;
 		let node = self.parent.tree().node(id).ok_or_else(|| {
 			omp_envd::exthost::control::ControlProtocolError::new(
-				"UnknownRun",
+				"AgentGone",
 				"subagent run was not found",
 			)
+			.with_details(json!({
+				"ref": run_id,
+				"status": "aborted",
+				"transcript_url": format!("history://{id}"),
+			}))
 		})?;
 		if node.parent.as_deref() != Some(caller.as_str()) {
 			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"UnknownRun",
+				"AgentGone",
 				"subagent run is not owned by this caller",
-			));
+			)
+			.with_details(json!({
+				"ref": run_id,
+				"status": "aborted",
+				"transcript_url": format!("history://{id}"),
+			})));
 		}
 		let state = self
 			.parent
 			.supervisor
 			.state_at_generation(id, generation)
-			.map_err(|error| {
-				omp_envd::exthost::control::ControlProtocolError::new("UnknownRun", error.to_string())
+			.map_err(|error| match error {
+				crate::subagent::supervisor::SupervisorError::StaleGeneration {
+					expected,
+					current,
+					..
+				} => omp_envd::exthost::control::ControlProtocolError::new(
+					"StaleGeneration",
+					format!("subagent generation {expected} is stale; current generation is {current}"),
+				)
+				.with_details(json!({
+					"ref": run_id,
+					"expected_generation": expected,
+					"current_generation": current,
+				})),
+				error => omp_envd::exthost::control::ControlProtocolError::new(
+					"AgentGone",
+					error.to_string(),
+				)
+				.with_details(json!({
+					"ref": run_id,
+					"status": "aborted",
+					"transcript_url": format!("history://{id}"),
+				})),
 			})?;
 		Ok((Str::from(id), state))
 	}
 
 	fn run_status(state: &SubagentRunState) -> &'static str {
 		match state.lifecycle() {
-			SubagentLifecycle::Created | SubagentLifecycle::Starting => "starting",
+			SubagentLifecycle::Created | SubagentLifecycle::Starting => "pending",
 			SubagentLifecycle::Running => "running",
-			SubagentLifecycle::Waiting => "waiting",
-			SubagentLifecycle::Parked => "completed",
+			SubagentLifecycle::Waiting | SubagentLifecycle::Parked => "settled",
 			SubagentLifecycle::Settled => match state.terminal().map(|terminal| terminal.kind) {
 				Some(SubagentTerminalKind::Succeeded) => "completed",
 				Some(SubagentTerminalKind::Cancelled) => "cancelled",
@@ -1911,33 +1851,158 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 
 	fn result_json(&self, id: &str, state: &SubagentRunState) -> Option<Value> {
 		let terminal = state.terminal()?;
-		let metadata = self.parent.supervisor.metadata(id).unwrap_or(Value::Null);
+		let metadata = self.parent.supervisor.metadata(id)?;
+		let application = match self.parent.supervisor.result(id) {
+			Some(result) => result,
+			None if terminal.kind == SubagentTerminalKind::Succeeded => return None,
+			None => Value::Null,
+		};
 		let name = metadata.get("name").and_then(Value::as_str).unwrap_or(id);
 		let progress = state.progress();
+		let direct = self.parent.tree().statistics(id, false).unwrap_or_default();
+		let subtree = self
+			.parent
+			.supervisor
+			.subtree_progress(id)
+			.unwrap_or_else(|| progress.clone());
+		let turns = state
+			.events()
+			.filter(|event| {
+				matches!(
+					event.event,
+					omp_agent::SubagentRunEventKind::Lifecycle(SubagentLifecycle::Running)
+				)
+			})
+			.count();
+		let data = application.get("data").cloned().unwrap_or(Value::Null);
+		let serving_model = application
+			.get("servingModel")
+			.or_else(|| application.get("serving_model"))
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.or(progress.serving_model);
+		let requested_model = metadata
+			.get("spec")
+			.and_then(|spec| spec.get("model"))
+			.and_then(Value::as_str);
+		let model_fallback = application
+			.get("modelFallback")
+			.or_else(|| application.get("model_fallback"))
+			.and_then(Value::as_bool)
+			.unwrap_or_else(|| {
+				requested_model.is_some_and(|requested| {
+					serving_model
+						.as_deref()
+						.is_some_and(|serving| serving != requested)
+				})
+			});
+		let mut warnings = application
+			.get("warnings")
+			.and_then(Value::as_array)
+			.cloned()
+			.unwrap_or_default();
+		if terminal.disposition.truncated {
+			warnings.push(Value::String(
+				"caller-visible output was truncated; use output_url for the full artifact".to_owned(),
+			));
+		}
+		if let Some(schema) = application.get("schema").filter(|schema| !schema.is_null()) {
+			warnings.push(Value::String(format!(
+				"structured output validation reported {schema}"
+			)));
+		}
+		let worktree = application
+			.get("details")
+			.and_then(Value::as_object)
+			.filter(|details| details.get("isolated").and_then(Value::as_bool) == Some(true))
+			.map(|details| {
+				let outcome = details.get("disposition").and_then(Value::as_object);
+				let merge = metadata
+					.get("spec")
+					.and_then(|spec| spec.get("merge"))
+					.and_then(Value::as_str)
+					.unwrap_or("none");
+				json!({
+					"path": details
+						.get("root")
+						.or_else(|| details.get("worktree"))
+						.and_then(Value::as_str)
+						.unwrap_or_default(),
+					"merge": merge,
+					"applied": merge == "patch"
+						&& outcome
+							.and_then(|outcome| outcome.get("status"))
+							.and_then(Value::as_str) == Some("ready"),
+					"branch": outcome
+						.and_then(|outcome| outcome.get("branch"))
+						.cloned()
+						.unwrap_or(Value::Null),
+					"patch_url": outcome
+						.and_then(|outcome| outcome.get("artifact"))
+						.cloned()
+						.unwrap_or(Value::Null),
+					"conflicts": outcome
+						.and_then(|outcome| outcome.get("conflicts"))
+						.and_then(Value::as_array)
+						.map(|conflicts| Value::Array(
+							conflicts
+								.iter()
+								.filter_map(|conflict| conflict.get("path").cloned())
+								.collect()
+						))
+						.unwrap_or_else(|| Value::Array(Vec::new())),
+				})
+			})
+			.unwrap_or(Value::Null);
+		let cancellation_reason = self.parent.supervisor.cancellation_reason(id);
+		let fault_reason =
+			cancellation_reason.unwrap_or_else(|| Str::from(terminal.kind.to_string()));
 		Some(json!({
 			"run_id": format!("{id}#{}", state.generation().0),
 			"session_id": self.parent.session_id(),
 			"name": name,
 			"status": Self::run_status(state),
-			"text": terminal.disposition.preview.unwrap_or(terminal.summary),
-			"data": null,
-			"fault": if terminal.kind == SubagentTerminalKind::Succeeded { Value::Null } else {
-				json!({"reason": terminal.kind.to_string()})
+			"text": application
+				.get("text")
+				.and_then(Value::as_str)
+				.map(Str::new)
+				.or(terminal.disposition.preview)
+				.unwrap_or(terminal.summary),
+			"data": data,
+			"fault": if terminal.kind == SubagentTerminalKind::Succeeded {
+				Value::Null
+			} else {
+				json!({
+					"reason": fault_reason,
+				})
 			},
 			"usage": {
 				"input_tokens": progress.input_tokens,
+				"cached_input_tokens": direct.usage.cache_read_tokens,
 				"output_tokens": progress.output_tokens,
+				"reasoning_tokens": direct.usage.reasoning_tokens.unwrap_or_default(),
+				"cache_write_tokens": direct.usage.cache_write_tokens,
 				"requests": progress.requests,
 				"cost_usd": progress.cost_micros as f64 / 1_000_000.0,
+				"wall_ms": 0,
 			},
-			"subtree_usage": {},
-			"turns": 1,
-			"model": progress.serving_model.unwrap_or_default(),
-			"model_fallback": false,
-			"warnings": [],
+			"subtree_usage": {
+				"input_tokens": subtree.input_tokens,
+				"cached_input_tokens": 0,
+				"output_tokens": subtree.output_tokens,
+				"reasoning_tokens": 0,
+				"cache_write_tokens": 0,
+				"requests": subtree.requests,
+				"cost_usd": subtree.cost_micros as f64 / 1_000_000.0,
+				"wall_ms": 0,
+			},
+			"turns": turns,
+			"model": serving_model.unwrap_or_default(),
+			"model_fallback": model_fallback,
+			"warnings": warnings,
 			"output_url": format!("agent://{id}"),
 			"transcript_url": format!("history://{id}"),
-			"worktree": null,
+			"worktree": worktree,
 		}))
 	}
 
@@ -1959,6 +2024,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.unwrap_or(true);
 		let kind_filter = arguments.get("kind").and_then(Value::as_str);
 		let status_filter = arguments.get("status").and_then(Value::as_str);
+		let project_scope =
+			peers_only && arguments.get("scope").and_then(Value::as_str) == Some("project");
 		Value::Array(
 			self
 				.parent
@@ -1966,7 +2033,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				.registry()
 				.roster(!peers_only)
 				.into_iter()
-				.filter(|record| record.session == self.expected_session_id)
+				.filter(|record| project_scope || record.session == self.expected_session_id)
 				.filter(|record| include_parked || record.status != RegistryStatus::Parked)
 				.filter_map(|record| {
 					let kind = match record.kind {
@@ -2088,12 +2155,137 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			omp_agent::Receipt::Failed => "failed",
 		}
 	}
+	fn preflight_spec(
+		&self,
+		spec: &Value,
+	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+		let spec = spec.as_object().ok_or_else(|| {
+			omp_envd::exthost::control::ControlProtocolError::new(
+				"SpawnDenied",
+				"subagent spec must be an object",
+			)
+		})?;
+		if !spec
+			.get("task")
+			.and_then(Value::as_str)
+			.is_some_and(|task| !task.trim().is_empty())
+		{
+			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				"SpawnDenied",
+				"subagent task must be non-empty",
+			)
+			.with_details(json!({"reason": "empty task", "field": "task"})));
+		}
+		let agent = spec.get("agent").and_then(Value::as_str).unwrap_or("task");
+		let context = self.parent.context.lock();
+		let definition = context
+			.definitions
+			.iter()
+			.find(|(name, _)| name.as_str().eq_ignore_ascii_case(agent))
+			.map(|(_, definition)| definition);
+		if definition.is_none() {
+			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				"SpawnDenied",
+				format!("agent type {agent:?} is not available in this session"),
+			)
+			.with_details(json!({"reason": "unknown agent", "field": "agent"})));
+		}
+		if context
+			.task_settings
+			.snapshot()
+			.disabled_agents
+			.iter()
+			.any(|name| name.as_str().eq_ignore_ascii_case(agent))
+		{
+			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				"SpawnDenied",
+				"requested agent is disabled by live task settings",
+			)
+			.with_details(json!({"reason": "disabled agent", "field": "agent"})));
+		}
+		if context
+			.state
+			.snapshot()
+			.turn
+			.params
+			.task_budget
+			.is_some_and(|budget| budget.remaining_tokens == Some(0))
+		{
+			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				"SpawnDenied",
+				"hard turn token budget is exhausted",
+			)
+			.with_details(json!({"reason": "budget exhausted", "field": "budget"})));
+		}
+		for (field, unsupported) in [
+			("system_prompt", spec.get("system_prompt").is_some_and(|value| !value.is_null())),
+			("model", spec.get("model").is_some_and(|value| !value.is_null())),
+			(
+				"on_model_unavailable",
+				spec.get("on_model_unavailable")
+					.and_then(Value::as_str)
+					.is_some_and(|value| value != "fail"),
+			),
+			("allowed_devices", spec.get("allowed_devices").is_some_and(|value| !value.is_null())),
+			(
+				"disallowed_devices",
+				spec.get("disallowed_devices")
+					.and_then(Value::as_array)
+					.is_some_and(|values| !values.is_empty()),
+			),
+			(
+				"isolation",
+				spec.get("isolation")
+					.and_then(Value::as_str)
+					.is_some_and(|value| value != "clean"),
+			),
+			("cwd", spec.get("cwd").is_some_and(|value| !value.is_null())),
+			(
+				"env_vars",
+				spec.get("env_vars")
+					.and_then(Value::as_object)
+					.is_some_and(|values| !values.is_empty()),
+			),
+			("deadline", spec.get("deadline").is_some_and(|value| !value.is_null())),
+			(
+				"request_budget",
+				spec.get("request_budget").is_some_and(|value| !value.is_null()),
+			),
+			("budget", spec.get("budget").is_some_and(|value| !value.is_null())),
+			(
+				"labels",
+				spec.get("labels")
+					.and_then(Value::as_object)
+					.is_some_and(|values| !values.is_empty()),
+			),
+		] {
+			if unsupported {
+				return Err(omp_envd::exthost::control::ControlProtocolError::new(
+					"SpawnDenied",
+					format!("subagent field {field:?} is not supported by the active child authority"),
+				)
+				.with_details(json!({"reason": "unsupported by child authority", "field": field})));
+			}
+		}
+		Ok(())
+	}
 
 	async fn spawn_one(
 		&self,
 		context: &omp_envd::exthost::control::ControlRequestContext,
 		spec: Value,
 	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+		let caller = Self::caller(context)?;
+		self.spawn_one_for(caller, None, spec).await
+	}
+
+	async fn spawn_one_for(
+		&self,
+		caller: Str,
+		stable_id: Option<Str>,
+		spec: Value,
+	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+		self.preflight_spec(&spec)?;
 		let spec_object = spec.as_object().ok_or_else(|| {
 			omp_envd::exthost::control::ControlProtocolError::new(
 				"SpawnDenied",
@@ -2114,8 +2306,46 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				.with_details(json!({"reason": "empty task", "field": "task"})),
 			);
 		}
-		let caller = Self::caller(context)?;
-		let id = Str::from(omp_core::Ulid::generate().to_string());
+		let parent_node = self.parent.tree().node(caller.as_str()).ok_or_else(|| {
+			omp_envd::exthost::control::ControlProtocolError::new(
+				"AgentGone",
+				"spawning agent is no longer registered",
+			)
+			.with_details(json!({
+				"ref": caller,
+				"status": "aborted",
+				"transcript_url": format!("history://{caller}"),
+			}))
+		})?;
+		let parent_max_depth = self
+			.parent
+			.supervisor
+			.metadata(caller.as_str())
+			.and_then(|metadata| metadata.get("effective_max_depth").and_then(Value::as_u64))
+			.and_then(|depth| u16::try_from(depth).ok())
+			.unwrap_or_else(|| self.parent.supervisor.limits().max_depth);
+		if parent_node.depth >= parent_max_depth {
+			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				"DepthExceeded",
+				"spawning agent reached its effective depth ceiling",
+			)
+			.with_details(json!({
+				"depth": parent_node.depth,
+				"max_depth": parent_max_depth,
+			})));
+		}
+		let requested_depth = spec_object
+			.get("max_depth")
+			.and_then(Value::as_u64)
+			.and_then(|depth| u16::try_from(depth).ok())
+			.ok_or_else(|| {
+				omp_envd::exthost::control::ControlProtocolError::new(
+					"SpawnDenied",
+					"subagent max_depth must be a non-negative 16-bit integer",
+				)
+				.with_details(json!({"reason": "invalid depth", "field": "max_depth"}))
+			})?;
+		let id = stable_id.unwrap_or_else(|| Str::from(omp_core::Ulid::generate().to_string()));
 		let mut bridge = serde_json::Map::new();
 		bridge.insert("prompt".to_owned(), Value::String(task.to_owned()));
 		bridge.insert("stableId".to_owned(), Value::String(id.to_string()));
@@ -2125,11 +2355,26 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			("agent", "agent"),
 			("output_schema", "outputSchema"),
 			("schema_mode", "schemaMode"),
-			("thinking", "effort"),
 		] {
 			if let Some(value) = spec_object.get(source) {
 				bridge.insert(target.to_owned(), value.clone());
 			}
+		}
+		if let Some(thinking) = spec_object.get("thinking").and_then(Value::as_str) {
+			let effort = match thinking {
+				"off" => "minimal",
+				"lo" => "low",
+				"med" => "medium",
+				"hi" => "high",
+				_ => {
+					return Err(omp_envd::exthost::control::ControlProtocolError::new(
+						"SpawnDenied",
+						"subagent thinking level is invalid",
+					)
+					.with_details(json!({"reason": "invalid thinking level", "field": "thinking"})));
+				},
+			};
+			bridge.insert("effort".to_owned(), Value::String(effort.to_owned()));
 		}
 		let worktree = spec_object
 			.get("worktree")
@@ -2151,13 +2396,18 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		}
 		let parent = Arc::clone(&self.parent);
 		let child_id = id.clone();
+		let result_id = child_id.clone();
 		let mut task = tokio::spawn(async move {
-			omp_envd::eval::ParentSessionHost::agent(
+			let result = omp_envd::eval::ParentSessionHost::agent(
 				parent.as_ref(),
 				Value::Object(bridge),
 				&omp_envd::eval::NoopBridgeProgress,
 			)
-			.await
+			.await;
+			if let Ok(value) = &result {
+				let _ = parent.supervisor.set_result(result_id.as_str(), value.clone());
+			}
+			result
 		});
 		let admitted = loop {
 			if let Some(state) = self.parent.supervisor.state(child_id.as_str()) {
@@ -2193,7 +2443,9 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			"name": node.name,
 			"agent": spec_object.get("agent").and_then(Value::as_str).unwrap_or("task"),
 			"depth": node.depth,
-			"effective_max_depth": spec_object.get("max_depth").and_then(Value::as_u64).unwrap_or(1),
+			"effective_max_depth": self.parent.supervisor.limits().max_depth.min(
+				node.depth.saturating_add(requested_depth)
+			),
 			"spec": spec,
 			"worktree_path": null,
 			"output_url": format!("agent://{id}"),
@@ -2209,235 +2461,10 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		Ok(handle)
 	}
 
-	fn schedule_next(trigger: &Value, now: u64) -> Option<u64> {
-		match trigger.get("kind").and_then(Value::as_str) {
-			Some("at") => trigger.get("epoch_ms").and_then(Value::as_u64),
-			Some("every") => trigger
-				.get("interval_ms")
-				.and_then(Value::as_u64)
-				.filter(|interval| *interval != 0)
-				.map(|interval| now.saturating_add(interval)),
-			Some("after_idle") => trigger
-				.get("idle_ms")
-				.and_then(Value::as_u64)
-				.map(|idle| now.saturating_add(idle)),
-			_ => None,
-		}
-	}
-
-	fn own_schedule<'a>(
-		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
-		id: &str,
-		store: &'a ScheduleStore,
-	) -> Result<&'a Value, omp_envd::exthost::control::ControlProtocolError> {
-		let caller = Self::caller(context)?;
-		let row = store.rows.get(id).ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"ScheduleRejected",
-				"schedule was not found",
-			)
-		})?;
-		if row.get("owner").and_then(Value::as_str) != Some(caller.as_str())
-			|| row.get("extension_owner").and_then(Value::as_str)
-				!= Some(context.connection.extension.as_str())
-		{
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"ScheduleRejected",
-				"schedule is not owned by this caller",
-			));
-		}
-		Ok(row)
-	}
-
-	async fn fire_schedule(
-		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
-		id: &str,
-		at_ms: u64,
-	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
-		self.ensure_current()?;
-		let row = {
-			let store = self.parent.schedules.lock();
-			self.own_schedule(context, id, &store)?.clone()
-		};
-		if !row.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
-			return Ok(Value::String("failed".to_owned()));
-		}
-		let key = format!("{id}:{at_ms}");
-		if self
-			.parent
-			.schedules
-			.lock()
-			.history
-			.get(id)
-			.is_some_and(|history| {
-				history.iter().any(|firing| {
-					firing.get("idempotency_key").and_then(Value::as_str) == Some(key.as_str())
-				})
-			}) {
-			return Ok(Value::String("delivered".to_owned()));
-		}
-		let scope = row
-			.get("scope")
-			.and_then(Value::as_str)
-			.unwrap_or("session");
-		self.parent.append_schedule_event(
-			scope,
-			&json!({
-				"op": "firing_intent",
-				"schedule_id": id,
-				"idempotency_key": key,
-				"at_ms": at_ms,
-			}),
-		)?;
-		let mut run_id = None;
-		let (outcome, detail) =
-			match row
-				.get("delivery")
-				.and_then(Value::as_object)
-				.and_then(|delivery| {
-					delivery
-						.get("kind")
-						.and_then(Value::as_str)
-						.map(|kind| (kind, delivery))
-				}) {
-				Some(("inject", delivery)) => {
-					let mut arguments = serde_json::Map::new();
-					arguments.insert(
-						"text".to_owned(),
-						delivery
-							.get("prompt")
-							.cloned()
-							.unwrap_or(Value::String(String::new())),
-					);
-					if let Some(mode) = delivery.get("mode") {
-						arguments.insert("mode".to_owned(), mode.clone());
-					}
-					let owner = Str::from(row.get("owner").and_then(Value::as_str).unwrap_or_default());
-					match self.route_message(context, &arguments, owner) {
-						Ok(_) => ("injected", None),
-						Err(error) => ("failed", Some(error.to_string())),
-					}
-				},
-				Some(("spawn", delivery)) => {
-					match self
-						.spawn_one(context, delivery.get("spec").cloned().unwrap_or(Value::Null))
-						.await
-					{
-						Ok(handle) => {
-							run_id = handle
-								.get("run_id")
-								.and_then(Value::as_str)
-								.map(str::to_owned);
-							("spawned", None)
-						},
-						Err(error) => ("failed", Some(error.to_string())),
-					}
-				},
-				_ => ("failed", Some("unknown schedule delivery".to_owned())),
-			};
-		let firing = json!({
-			"schedule_id": id,
-			"idempotency_key": key,
-			"at_ms": at_ms,
-			"late_ms": now_ms().saturating_sub(at_ms),
-			"outcome": outcome,
-			"artifact_digest": row.get("artifact_digest").cloned().unwrap_or(Value::Null),
-			"principal": row.get("principal").cloned().unwrap_or(Value::Null),
-			"run_id": run_id,
-			"detail": detail,
-		});
-		self
-			.parent
-			.append_schedule_event(scope, &json!({"op": "firing", "row": firing}))?;
-		{
-			let mut store = self.parent.schedules.lock();
-			store.history.entry(Str::from(id)).or_default().push(firing);
-			if let Some(row) = store.rows.get_mut(id)
-				&& let Some(object) = row.as_object_mut()
-			{
-				let count = object
-					.get("fire_count")
-					.and_then(Value::as_u64)
-					.unwrap_or(0);
-				object.insert("fire_count".to_owned(), Value::from(count.saturating_add(1)));
-				object.insert("last_ms".to_owned(), Value::from(at_ms));
-				let next = object
-					.get("trigger")
-					.and_then(|trigger| Self::schedule_next(trigger, now_ms()));
-				object.insert("next_ms".to_owned(), next.map_or(Value::Null, Value::from));
-				self
-					.parent
-					.append_schedule_event(scope, &json!({"op": "upsert", "row": row}))?;
-			}
-		}
-		Ok(Value::String(
-			if outcome == "failed" {
-				"failed"
-			} else {
-				"delivered"
-			}
-			.to_owned(),
-		))
-	}
-
-	fn arm_schedule(
-		parent: Arc<ChatParentHost<C>>,
-		expected_session_id: Str,
-		context: omp_envd::exthost::control::ControlRequestContext,
-		id: Str,
-		at_ms: u64,
-	) {
-		tokio::spawn(async move {
-			tokio::time::sleep(Duration::from_millis(at_ms.saturating_sub(now_ms()))).await;
-			let authority = Self {
-				expected_session_id: expected_session_id.clone(),
-				parent:              Arc::clone(&parent),
-			};
-			if authority
-				.fire_schedule(&context, id.as_str(), at_ms)
-				.await
-				.is_err()
-			{
-				return;
-			}
-			let next = parent
-				.schedules
-				.lock()
-				.rows
-				.get(id.as_str())
-				.filter(|row| row.get("enabled").and_then(Value::as_bool).unwrap_or(false))
-				.and_then(|row| row.get("next_ms").and_then(Value::as_u64));
-			if let Some(next) = next {
-				Self::arm_schedule(parent, expected_session_id, context, id, next);
-			}
-		});
-	}
-
 	async fn completion(
 		&self,
 		arguments: serde_json::Map<String, Value>,
 	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
-		if arguments.get("scope").and_then(Value::as_str) == Some("session") {
-			return Err(Self::unavailable(
-				"omp.agents.completion",
-				"session-lifetime inference guard",
-			));
-		}
-		if !arguments
-			.get("labels")
-			.and_then(Value::as_object)
-			.is_none_or(serde_json::Map::is_empty)
-		{
-			return Err(Self::unavailable(
-				"omp.agents.completion",
-				"extension-attributed telemetry sink",
-			));
-		}
-		if !arguments.get("prompt").is_some_and(Value::is_string) {
-			return Err(Self::unavailable("omp.agents.completion", "typed media completion bridge"));
-		}
 		let mut bridge = arguments.clone();
 		if bridge.get("schema").is_some_and(Value::is_null) {
 			bridge.remove("schema");
@@ -2455,10 +2482,15 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.and_then(Value::as_u64)
 			.unwrap_or(10_000);
 		if deadline_ms == 0 {
-			return Err(Self::unavailable(
-				"omp.agents.completion",
-				"unbounded inference deadline grant",
-			));
+			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				"CompletionFailed",
+				"unbounded completion deadlines require an explicit host grant",
+			)
+			.with_details(json!({
+				"reason": "unbounded deadline is not granted",
+				"raw": null,
+				"usage": {},
+			})));
 		}
 		let started = Instant::now();
 		let request = omp_envd::eval::ParentSessionHost::completion(
@@ -2677,6 +2709,157 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 }
 
 #[async_trait]
+impl<C: TurnClient + Clone + Send + Sync + 'static>
+	omp_envd::schedules::ScheduleDeliveryBackend for ChatScheduleDelivery<C>
+{
+	async fn settled_since_ms(
+		&self,
+		row: &omp_envd::schedules::ScheduleRow,
+	) -> Result<Option<u64>, Str> {
+		Ok(self
+			.parent
+			.broker
+			.registry()
+			.record(row.owner.as_str())
+			.filter(|(record, _)| {
+				matches!(record.status, RegistryStatus::Idle | RegistryStatus::Parked)
+			})
+			.map(|(record, _)| record.last_activity_ms))
+	}
+
+	async fn estimate(
+		&self,
+		request: &omp_envd::schedules::ScheduleDeliveryRequest,
+	) -> Result<omp_agent::scheduler::BudgetReservation, Str> {
+		if request.schedule.delivery.get("kind").and_then(Value::as_str) != Some("spawn") {
+			return Ok(omp_agent::scheduler::BudgetReservation::default());
+		}
+		let soft_budget = u64::from(self.parent.task_settings().soft_request_budget);
+		let requests = if soft_budget == 0 {
+			u64::MAX
+		} else {
+			soft_budget
+				.saturating_mul(3)
+				.saturating_add(1)
+				/ 2
+				+ 5
+		};
+		let cost_micros = if request
+			.schedule
+			.budget
+			.get("max_usd_per_firing")
+			.is_some_and(|value| !value.is_null())
+			|| request
+				.schedule
+				.budget
+				.get("max_usd_per_window")
+				.is_some_and(|value| !value.is_null())
+		{
+			u64::MAX
+		} else {
+			0
+		};
+		Ok(omp_agent::scheduler::BudgetReservation { cost_micros, requests })
+	}
+
+	async fn deliver(
+		&self,
+		request: omp_envd::schedules::ScheduleDeliveryRequest,
+	) -> Result<omp_envd::schedules::ScheduleDeliveryReceipt, Str> {
+		let kind = request
+			.schedule
+			.delivery
+			.get("kind")
+			.and_then(Value::as_str)
+			.ok_or_else(|| sf!("schedule delivery kind is missing"))?;
+		match kind {
+			"inject" => {
+				let prompt = request
+					.schedule
+					.delivery
+					.get("prompt")
+					.and_then(Value::as_str)
+					.ok_or_else(|| sf!("schedule inject prompt is missing"))?;
+				let mode = match request
+					.schedule
+					.delivery
+					.get("mode")
+					.and_then(Value::as_str)
+					.unwrap_or("aside")
+				{
+					"aside" => omp_agent::DeliveryMode::Aside,
+					"steer" => omp_agent::DeliveryMode::Steer,
+					"next_turn" => omp_agent::DeliveryMode::NextTurn,
+					mode => return Err(sf!("invalid schedule delivery mode {mode:?}")),
+				};
+				let deliveries = self
+					.parent
+					.broker
+					.route(omp_agent::PeerMessage {
+						id: request.idempotency_key,
+						from: request.schedule.owner.clone(),
+						to: request.schedule.owner,
+						text: Str::new(prompt),
+						mode,
+						reply_to: None,
+						sent_ms: now_ms(),
+						session_id: self.parent.session_id(),
+						expects_reply: false,
+					})
+					.map_err(|error| Str::from(error.to_string()))?;
+				let receipt = deliveries.first().map_or("buffered", |delivery| {
+					match delivery.outcome {
+						omp_agent::Receipt::Injected => "delivered",
+						omp_agent::Receipt::Woken => "woken",
+						omp_agent::Receipt::Revived => "revived",
+						omp_agent::Receipt::Failed => "buffered",
+					}
+				});
+				Ok(omp_envd::schedules::ScheduleDeliveryReceipt {
+					receipt: Str::new(receipt),
+					run_id: None,
+					cost_micros: 0,
+					requests: 0,
+				})
+			},
+			"spawn" => {
+				let stable_id =
+					sf!("schedule-{}-{}", request.schedule.id, request.at_ms);
+				if let Some(metadata) = self.parent.supervisor.resolved_metadata(stable_id.as_str()) {
+					return Ok(omp_envd::schedules::ScheduleDeliveryReceipt {
+						receipt: sf!("delivered"),
+						run_id: metadata
+							.get("run_id")
+							.and_then(Value::as_str)
+							.map(Str::new),
+						cost_micros: 0,
+						requests: 0,
+					});
+				}
+				let spec = request
+					.schedule
+					.delivery
+					.get("spec")
+					.cloned()
+					.ok_or_else(|| sf!("schedule spawn spec is missing"))?;
+				let authority = AgentsControlAuthority::new(Arc::clone(&self.parent));
+				let handle = authority
+					.spawn_one_for(request.schedule.owner, Some(stable_id), spec)
+					.await
+					.map_err(|error| Str::from(error.to_string()))?;
+				Ok(omp_envd::schedules::ScheduleDeliveryReceipt {
+					receipt: sf!("delivered"),
+					run_id: handle.get("run_id").and_then(Value::as_str).map(Str::new),
+					cost_micros: 0,
+					requests: 0,
+				})
+			},
+			kind => Err(sf!("unknown schedule delivery kind {kind:?}")),
+		}
+	}
+}
+
+#[async_trait]
 impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::ControlAuthority
 	for AgentsControlAuthority<C>
 {
@@ -2711,15 +2894,6 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				| "omp.agents.snapshot"
 				| "omp.agents.snapshots"
 				| "omp.agents.restore"
-				| "omp.agents.schedule"
-				| "omp.agents.schedules"
-				| "omp.agents.unschedule"
-				| "omp.agents.schedule.pause"
-				| "omp.agents.schedule.resume"
-				| "omp.agents.schedule.delete"
-				| "omp.agents.schedule.fire_now"
-				| "omp.agents.schedule.info"
-				| "omp.agents.schedule.history"
 		)
 	}
 
@@ -2760,11 +2934,12 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				Self::require_capability(context, "subagents")?;
 				Self::require_effects_authorized(context)
 			},
-			"omp.agents.schedule" => {
-				Self::require_capability(context, "schedules")?;
-				Self::require_effects_authorized(context)
-			},
 			"omp.agents.broadcast"
+				if arguments.get("scope").and_then(Value::as_str) == Some("project") =>
+			{
+				Self::require_capability(context, "messaging:project")
+			},
+			"omp.agents.peers"
 				if arguments.get("scope").and_then(Value::as_str) == Some("project") =>
 			{
 				Self::require_capability(context, "messaging:project")
@@ -2808,57 +2983,113 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.get("dry_run")
 					.and_then(Value::as_bool)
 					.unwrap_or(false);
-				let restore = if scope != "thread" {
-					let snapshot_id = arguments
-						.get("snapshot_id")
-						.and_then(Value::as_str)
-						.ok_or_else(|| {
-							omp_envd::exthost::control::ControlProtocolError::new(
-								"SnapshotUnsupported",
-								"workspace rewind requires snapshot_id",
-							)
-						})?;
-					Some(
-						self
-							.parent
-							.env
-							.restore_workspace(omp_proto::env::v1::RestoreWorkspace {
-								snapshot_id: snapshot_id.to_owned(),
-								dry_run,
-								scope: "workspace".to_owned(),
-								paths: Vec::new(),
-								expected_generation: 0,
-								wire_revision: omp_proto::SCHEMA_REV,
-								props: Default::default(),
-							})
-							.await
-							.map_err(|error| {
-								omp_envd::exthost::control::ControlProtocolError::new(
-									"SnapshotUnsupported",
-									error.to_string(),
-								)
-							})?,
-					)
-				} else {
-					None
+				if scope == "thread" {
+					return self
+						.host_request(&context, operation.as_str(), arguments)
+						.await;
+				}
+				let snapshot_id = arguments
+					.get("snapshot_id")
+					.and_then(Value::as_str)
+					.ok_or_else(|| {
+						omp_envd::exthost::control::ControlProtocolError::new(
+							"SnapshotUnsupported",
+							"workspace rewind requires snapshot_id",
+						)
+					})?
+					.to_owned();
+				let restore_request = |dry_run| omp_proto::env::v1::RestoreWorkspace {
+					snapshot_id: snapshot_id.clone(),
+					dry_run,
+					scope: "workspace".to_owned(),
+					paths: Vec::new(),
+					expected_generation: 0,
+					wire_revision: omp_proto::SCHEMA_REV,
+					props: Default::default(),
 				};
-				let mut thread = if scope == "workspace" {
+				let workspace_preflight = self
+					.parent
+					.env
+					.restore_workspace(restore_request(true))
+					.await
+					.map_err(|error| {
+						omp_envd::exthost::control::ControlProtocolError::new(
+							"SnapshotUnsupported",
+							error.to_string(),
+						)
+					})?;
+				let mut thread_preflight = if scope == "both" {
+					let mut preflight = arguments.clone();
+					preflight.insert("dry_run".to_owned(), Value::Bool(true));
+					self.host_request(&context, operation.as_str(), preflight).await?
+				} else {
 					json!({
 						"head": arguments.get("to").and_then(Value::as_u64).unwrap_or(0),
 						"dropped_items": 0,
 						"scope": scope,
 						"restore": null,
-						"dry_run": dry_run,
+						"dry_run": true,
 					})
-				} else {
-					self
+				};
+				if dry_run || !workspace_preflight.conflicts.is_empty() {
+					if let Some(object) = thread_preflight.as_object_mut() {
+						object.insert("scope".to_owned(), Value::String(scope));
+						object.insert(
+							"restore".to_owned(),
+							Self::restore_json(workspace_preflight),
+						);
+						object.insert("dry_run".to_owned(), Value::Bool(true));
+					}
+					return Ok(thread_preflight);
+				}
+				let restored = self
+					.parent
+					.env
+					.restore_workspace(restore_request(false))
+					.await
+					.map_err(|error| {
+						omp_envd::exthost::control::ControlProtocolError::new(
+							"SnapshotUnsupported",
+							error.to_string(),
+						)
+					})?;
+				let undo = restored.undo_snapshot_id.clone();
+				let mut thread = if scope == "both" {
+					match self
 						.host_request(&context, operation.as_str(), arguments)
-						.await?
+						.await
+					{
+						Ok(thread) => thread,
+						Err(error) => {
+							let _ = self
+								.parent
+								.env
+								.restore_workspace(omp_proto::env::v1::RestoreWorkspace {
+									snapshot_id: undo,
+									dry_run: false,
+									scope: "workspace".to_owned(),
+									paths: Vec::new(),
+									expected_generation: 0,
+									wire_revision: omp_proto::SCHEMA_REV,
+									props: Default::default(),
+								})
+								.await;
+							return Err(error);
+						},
+					}
+				} else {
+					json!({
+						"head": arguments.get("to").and_then(Value::as_u64).unwrap_or(0),
+						"dropped_items": 0,
+						"scope": scope,
+						"restore": null,
+						"dry_run": false,
+					})
 				};
 				if let Some(object) = thread.as_object_mut() {
-					object.insert("scope".to_owned(), Value::String(scope.to_owned()));
-					object.insert("restore".to_owned(), restore.map_or(Value::Null, Self::restore_json));
-					object.insert("dry_run".to_owned(), Value::Bool(dry_run));
+					object.insert("scope".to_owned(), Value::String(scope));
+					object.insert("restore".to_owned(), Self::restore_json(restored));
+					object.insert("dry_run".to_owned(), Value::Bool(false));
 				}
 				Ok(thread)
 			},
@@ -2884,6 +3115,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				if specs.is_empty() {
 					return Ok(Value::Array(Vec::new()));
 				}
+				let mut names = BTreeSet::new();
 				for spec in specs {
 					if !spec
 						.get("task")
@@ -2895,10 +3127,33 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 							"every subagent spec requires a non-empty task",
 						));
 					}
+					self.preflight_spec(spec)?;
+					if let Some(name) = spec.get("name").and_then(Value::as_str)
+						&& !names.insert(name.to_ascii_lowercase())
+					{
+						return Err(omp_envd::exthost::control::ControlProtocolError::new(
+							"SpawnDenied",
+							"subagent names must be unique within a batch",
+						)
+						.with_details(json!({"reason": "duplicate name", "field": "name"})));
+					}
 				}
 				let mut handles = Vec::with_capacity(specs.len());
 				for spec in specs {
-					handles.push(self.spawn_one(&context, spec.clone()).await?);
+					match self.spawn_one(&context, spec.clone()).await {
+						Ok(handle) => handles.push(handle),
+						Err(error) => {
+							for handle in &handles {
+								if let Some(run_id) = handle.get("run_id").and_then(Value::as_str)
+									&& let Ok((id, _)) = Self::split_run_id(run_id)
+								{
+									let _ = self.parent.supervisor.teardown(id).await;
+									self.parent.broker.unregister(id);
+								}
+							}
+							return Err(error);
+						},
+					}
 				}
 				Ok(Value::Array(handles))
 			},
@@ -2923,22 +3178,39 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					"omp.agents.status" => Ok(Value::String(Self::run_status(&state).to_owned())),
 					"omp.agents.progress" => {
 						let progress = state.progress();
+						let turns = state
+							.events()
+							.filter(|event| matches!(
+								event.event,
+								omp_agent::SubagentRunEventKind::Lifecycle(SubagentLifecycle::Running)
+							))
+							.count();
+						let last_activity_ms = self
+							.parent
+							.broker
+							.registry()
+							.record(id.as_str())
+							.map_or(0, |(record, _)| record.last_activity_ms);
 						Ok(json!({
 							"status": Self::run_status(&state),
-							"turns": 1,
+							"turns": turns,
 							"requests": progress.requests,
 							"tool_calls": progress.tool_calls,
 							"context_tokens": progress.context_tokens,
-							"context_window": 0,
+							"context_window": progress.context_tokens,
 							"usage": {
 								"input_tokens": progress.input_tokens,
+								"cached_input_tokens": 0,
 								"output_tokens": progress.output_tokens,
+								"reasoning_tokens": 0,
+								"cache_write_tokens": 0,
 								"requests": progress.requests,
 								"cost_usd": progress.cost_micros as f64 / 1_000_000.0,
+								"wall_ms": 0,
 							},
 							"activity": progress.activity,
 							"model": progress.serving_model.unwrap_or_default(),
-							"last_activity_ms": now_ms(),
+							"last_activity_ms": last_activity_ms,
 						}))
 					},
 					"omp.agents.steer" => {
@@ -2952,15 +3224,29 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					},
 					"omp.agents.cancel" => {
 						let (_, generation) = Self::split_run_id(run_id)?;
+						let reason = arguments
+							.get("reason")
+							.and_then(Value::as_str)
+							.filter(|reason| !reason.trim().is_empty())
+							.unwrap_or("cancelled by extension");
+						let grace = Duration::from_millis(
+							arguments.get("grace_ms").and_then(Value::as_u64).unwrap_or(500),
+						);
 						self
 							.parent
 							.supervisor
-							.cancel_at_generation(id.as_str(), generation)
+							.cancel_with_grace(id.as_str(), generation, Str::new(reason), grace)
+							.await
 							.map_err(|error| {
 								omp_envd::exthost::control::ControlProtocolError::new(
-									"UnknownRun",
+									"AgentGone",
 									error.to_string(),
 								)
+								.with_details(json!({
+									"ref": run_id,
+									"status": Self::run_status(&state),
+									"transcript_url": format!("history://{id}"),
+								}))
 							})?;
 						Ok(Value::Null)
 					},
@@ -2990,60 +3276,111 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 							Ok(wait.await)
 						}
 					},
-					"omp.agents.release" => Ok(Value::Null),
+					"omp.agents.release" => {
+						let (_, generation) = Self::split_run_id(run_id)?;
+						self
+							.parent
+							.supervisor
+							.release_at_generation(id.as_str(), generation)
+							.await
+							.map_err(|error| {
+								omp_envd::exthost::control::ControlProtocolError::new(
+									"AgentGone",
+									error.to_string(),
+								)
+								.with_details(json!({
+									"ref": run_id,
+									"status": Self::run_status(&state),
+									"transcript_url": format!("history://{id}"),
+								}))
+							})?;
+						Ok(Value::Null)
+					},
 					_ => unreachable!(),
 				}
 			},
-			"omp.agents.get" | "omp.agents.revive" => {
+			operation @ ("omp.agents.get" | "omp.agents.revive") => {
 				let caller = Self::caller(&context)?;
 				let reference = arguments
 					.get("ref")
 					.and_then(Value::as_str)
-					.unwrap_or_default();
-				let id = reference
-					.strip_prefix("agent://")
-					.unwrap_or(reference)
-					.split('#')
-					.next()
-					.unwrap_or_default();
-				let node = self.parent.tree().node(id).ok_or_else(|| {
+					.filter(|reference| !reference.is_empty())
+					.ok_or_else(|| {
+						omp_envd::exthost::control::ControlProtocolError::new(
+							"AgentGone",
+							"subagent reference is required",
+						)
+						.with_details(json!({
+							"ref": "",
+							"status": "aborted",
+							"transcript_url": "",
+						}))
+					})?;
+				let id = self.parent.supervisor.resolve(reference).ok_or_else(|| {
 					omp_envd::exthost::control::ControlProtocolError::new(
-						"UnknownRun",
+						"AgentGone",
 						"subagent was not found",
+					)
+					.with_details(json!({
+						"ref": reference,
+						"status": "aborted",
+						"transcript_url": format!(
+							"history://{}",
+							reference.strip_prefix("agent://").unwrap_or(reference)
+						),
+					}))
+				})?;
+				let node = self.parent.tree().node(id.as_str()).ok_or_else(|| {
+					omp_envd::exthost::control::ControlProtocolError::new(
+						"AgentGone",
+						"subagent roster identity is no longer retained",
 					)
 				})?;
 				if node.parent.as_deref() != Some(caller.as_str()) {
 					return Err(omp_envd::exthost::control::ControlProtocolError::new(
-						"UnknownRun",
+						"AgentGone",
 						"subagent is not owned by this caller",
-					));
-				}
-				let state = self.parent.supervisor.state(id).ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
-						"UnknownRun",
-						"subagent state was not found",
 					)
-				})?;
-				let mut handle = self.parent.supervisor.metadata(id).unwrap_or_else(|| {
-					json!({
-						"name": node.name,
-						"agent": node.definition.clone().unwrap_or_else(|| sf!("task")),
-						"depth": node.depth,
-						"effective_max_depth": 1,
-						"spec": {
-							"task": "",
-							"agent": node.definition.clone().unwrap_or_else(|| sf!("task")),
-						},
-						"worktree_path": null,
-						"output_url": format!("agent://{id}"),
+					.with_details(json!({
+						"ref": reference,
+						"status": "aborted",
 						"transcript_url": format!("history://{id}"),
-					})
-				});
+					})));
+				}
+				if operation == "omp.agents.revive" {
+					self
+						.parent
+						.supervisor
+						.revive(id.as_str())
+						.await
+						.map_err(|error| {
+							omp_envd::exthost::control::ControlProtocolError::new(
+								"AgentGone",
+								error.to_string(),
+							)
+							.with_details(json!({
+								"ref": reference,
+								"status": "aborted",
+								"transcript_url": format!("history://{id}"),
+							}))
+						})?;
+				}
+				let mut handle = self
+					.parent
+					.supervisor
+					.resolved_metadata(id.as_str())
+					.ok_or_else(|| {
+						omp_envd::exthost::control::ControlProtocolError::new(
+							"AgentGone",
+							"subagent handle metadata is no longer retained",
+						)
+						.with_details(json!({
+							"ref": reference,
+							"status": "aborted",
+							"transcript_url": format!("history://{id}"),
+						}))
+					})?;
 				if let Some(handle) = handle.as_object_mut() {
-					handle.insert(
-						"run_id".to_owned(),
-						Value::String(format!("{id}#{}", state.generation().0)),
-					);
 					handle.insert(
 						"session_id".to_owned(),
 						Value::String(self.parent.session_id().to_string()),
@@ -3055,21 +3392,49 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				let caller = Self::caller(&context)?;
 				let tree = self.parent.tree();
 				let depth = tree.node(caller.as_str()).map_or(0, |node| node.depth);
-				let roster = tree.roster().collect::<Vec<_>>();
-				let running = roster
-					.iter()
-					.filter(|node| node.status() == AgentStatus::Running)
-					.count();
-				let max_concurrency = tree.max_concurrency();
+				let limits = self.parent.supervisor.limits();
+				let max_depth = self
+					.parent
+					.supervisor
+					.metadata(caller.as_str())
+					.and_then(|metadata| {
+						metadata
+							.get("effective_max_depth")
+							.and_then(Value::as_u64)
+					})
+					.and_then(|depth| u16::try_from(depth).ok())
+					.unwrap_or(limits.max_depth);
+				let running = limits.active;
+				let queued = limits.queued;
+				let max_concurrency = limits.max_concurrency;
+				let continuations = self
+					.host_request(
+						&context,
+						"omp.agents.continuations",
+						serde_json::Map::new(),
+					)
+					.await?;
+				let continuation_cap = continuations
+					.get("cap")
+					.and_then(Value::as_u64)
+					.unwrap_or(0);
+				let continuations_used = continuations
+					.get("total")
+					.and_then(Value::as_u64)
+					.unwrap_or(0);
+				let concurrency_available =
+					max_concurrency == 0
+						|| running < max_concurrency
+						|| queued < limits.max_queue;
 				Ok(json!({
-					"max_depth": 8,
+					"max_depth": max_depth,
 					"depth": depth,
 					"max_concurrency": max_concurrency,
 					"running": running,
-					"queued": 0,
-					"continuation_cap": 0,
-					"continuations_used": 0,
-					"spawn_allowed": depth < 8 && running < max_concurrency,
+					"queued": queued,
+					"continuation_cap": continuation_cap,
+					"continuations_used": continuations_used,
+					"spawn_allowed": depth < max_depth && concurrency_available,
 				}))
 			},
 			"omp.agents.list" => Ok(self.roster(&arguments, false)),
@@ -3317,263 +3682,6 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 						)
 					})?;
 				Ok(Self::restore_json(restored))
-			},
-			operation
-				if operation.starts_with("omp.agents.schedule")
-					|| operation == "omp.agents.schedules"
-					|| operation == "omp.agents.unschedule" =>
-			{
-				match operation {
-					"omp.agents.schedule" => {
-						let caller = Self::caller(&context)?;
-						let name = arguments
-							.get("name")
-							.and_then(Value::as_str)
-							.unwrap_or_default();
-						if name.is_empty() {
-							return Err(
-								omp_envd::exthost::control::ControlProtocolError::new(
-									"ScheduleRejected",
-									"schedule name must be non-empty",
-								)
-								.with_details(json!({"reason": "empty name", "field": "name"})),
-							);
-						}
-						let trigger = arguments.get("trigger").cloned().unwrap_or(Value::Null);
-						let delivery = arguments.get("delivery").cloned().unwrap_or(Value::Null);
-						if trigger.get("kind").and_then(Value::as_str) == Some("every")
-							&& trigger.get("interval_ms").and_then(Value::as_u64) == Some(0)
-						{
-							return Err(
-								omp_envd::exthost::control::ControlProtocolError::new(
-									"ScheduleRejected",
-									"schedule interval must be non-zero",
-								)
-								.with_details(json!({"reason": "zero interval", "field": "trigger"})),
-							);
-						}
-						let scope = arguments
-							.get("scope")
-							.and_then(Value::as_str)
-							.unwrap_or("session");
-						if scope == "project"
-							&& delivery.get("kind").and_then(Value::as_str) == Some("spawn")
-							&& arguments.get("budget").is_none_or(Value::is_null)
-						{
-							return Err(
-								omp_envd::exthost::control::ControlProtocolError::new(
-									"ScheduleRejected",
-									"project spawn schedules require a hard budget",
-								)
-								.with_details(
-									json!({"reason": "missing project spawn budget", "field": "budget"}),
-								),
-							);
-						}
-						let now = now_ms();
-						let mut store = self.parent.schedules.lock();
-						let existing = store
-							.rows
-							.values()
-							.find(|row| {
-								row.get("owner").and_then(Value::as_str) == Some(caller.as_str())
-									&& row.get("extension_owner").and_then(Value::as_str)
-										== Some(context.connection.extension.as_str())
-									&& row.get("name").and_then(Value::as_str) == Some(name)
-							})
-							.cloned();
-						let id = existing
-							.as_ref()
-							.and_then(|row| row.get("id"))
-							.and_then(Value::as_str)
-							.map_or_else(|| Str::from(omp_core::Ulid::generate().to_string()), Str::from);
-						let created_ms = existing
-							.as_ref()
-							.and_then(|row| row.get("created_ms"))
-							.and_then(Value::as_u64)
-							.unwrap_or(now);
-						let next_ms = Self::schedule_next(&trigger, now);
-						let row = json!({
-							"id": id,
-							"name": name,
-							"trigger": trigger,
-							"delivery": delivery,
-							"scope": scope,
-							"enabled": true,
-							"owner": caller,
-							"extension_owner": context.connection.extension,
-							"principal": context.connection.principal.id(),
-							"artifact_digest": context.connection.artifact_digest,
-							"upgrade": arguments.get("upgrade").and_then(Value::as_str).unwrap_or("pinned"),
-							"missed": arguments.get("missed").and_then(Value::as_str).unwrap_or("coalesce"),
-							"budget": arguments.get("budget").cloned().unwrap_or(Value::Null),
-							"overlap": arguments.get("overlap").and_then(Value::as_str).unwrap_or("skip"),
-							"created_ms": created_ms,
-							"next_ms": next_ms,
-							"last_ms": existing.as_ref().and_then(|row| row.get("last_ms")).cloned().unwrap_or(Value::Null),
-							"fire_count": existing.as_ref().and_then(|row| row.get("fire_count")).and_then(Value::as_u64).unwrap_or(0),
-							"miss_count": existing.as_ref().and_then(|row| row.get("miss_count")).and_then(Value::as_u64).unwrap_or(0),
-						});
-						self
-							.parent
-							.append_schedule_event(scope, &json!({"op": "upsert", "row": row}))?;
-						store.rows.insert(id.clone(), row);
-						drop(store);
-						if let Some(next_ms) = next_ms {
-							Self::arm_schedule(
-								Arc::clone(&self.parent),
-								self.expected_session_id.clone(),
-								context.clone(),
-								id.clone(),
-								next_ms,
-							);
-						}
-						Ok(json!({"id": id, "name": name}))
-					},
-					"omp.agents.schedules" => {
-						let caller = Self::caller(&context)?;
-						let scope = arguments.get("scope").and_then(Value::as_str);
-						let owner = arguments.get("owner").and_then(Value::as_str);
-						let store = self.parent.schedules.lock();
-						Ok(Value::Array(
-							store
-								.rows
-								.values()
-								.filter(|row| {
-									row.get("extension_owner").and_then(Value::as_str)
-										== Some(context.connection.extension.as_str())
-										&& row.get("owner").and_then(Value::as_str) == Some(caller.as_str())
-										&& scope.is_none_or(|scope| {
-											row.get("scope").and_then(Value::as_str) == Some(scope)
-										}) && owner.is_none_or(|owner| {
-										row.get("owner").and_then(Value::as_str) == Some(owner)
-									})
-								})
-								.cloned()
-								.collect(),
-						))
-					},
-					"omp.agents.unschedule" => {
-						let caller = Self::caller(&context)?;
-						let reference = arguments
-							.get("name_or_id")
-							.and_then(Value::as_str)
-							.unwrap_or_default();
-						let mut store = self.parent.schedules.lock();
-						let id = store
-							.rows
-							.iter()
-							.find(|(id, row)| {
-								(id.as_str() == reference
-									|| row.get("name").and_then(Value::as_str) == Some(reference))
-									&& row.get("owner").and_then(Value::as_str) == Some(caller.as_str())
-									&& row.get("extension_owner").and_then(Value::as_str)
-										== Some(context.connection.extension.as_str())
-							})
-							.map(|(id, _)| id.clone());
-						let Some(id) = id else {
-							return Ok(Value::Bool(false));
-						};
-						let row = store
-							.rows
-							.remove(id.as_str())
-							.expect("located schedule exists");
-						let scope = row
-							.get("scope")
-							.and_then(Value::as_str)
-							.unwrap_or("session");
-						self
-							.parent
-							.append_schedule_event(scope, &json!({"op": "delete", "id": id}))?;
-						Ok(Value::Bool(true))
-					},
-					"omp.agents.schedule.info" => {
-						let id = arguments
-							.get("schedule_id")
-							.and_then(Value::as_str)
-							.unwrap_or_default();
-						let store = self.parent.schedules.lock();
-						Ok(self.own_schedule(&context, id, &store)?.clone())
-					},
-					"omp.agents.schedule.history" => {
-						let id = arguments
-							.get("schedule_id")
-							.and_then(Value::as_str)
-							.unwrap_or_default();
-						let store = self.parent.schedules.lock();
-						self.own_schedule(&context, id, &store)?;
-						let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-						Ok(Value::Array(
-							store
-								.history
-								.get(id)
-								.into_iter()
-								.flatten()
-								.rev()
-								.take(limit)
-								.cloned()
-								.collect(),
-						))
-					},
-					"omp.agents.schedule.fire_now" => {
-						let id = arguments
-							.get("schedule_id")
-							.and_then(Value::as_str)
-							.unwrap_or_default();
-						self.fire_schedule(&context, id, now_ms()).await
-					},
-					"omp.agents.schedule.pause" | "omp.agents.schedule.resume" => {
-						let id = arguments
-							.get("schedule_id")
-							.and_then(Value::as_str)
-							.unwrap_or_default();
-						let mut store = self.parent.schedules.lock();
-						let mut row = self.own_schedule(&context, id, &store)?.clone();
-						row.as_object_mut()
-							.expect("schedule row is an object")
-							.insert("enabled".to_owned(), Value::Bool(operation.ends_with("resume")));
-						let scope = row
-							.get("scope")
-							.and_then(Value::as_str)
-							.unwrap_or("session");
-						self
-							.parent
-							.append_schedule_event(scope, &json!({"op": "upsert", "row": row}))?;
-						let next = row.get("next_ms").and_then(Value::as_u64);
-						store.rows.insert(Str::from(id), row);
-						drop(store);
-						if operation.ends_with("resume")
-							&& let Some(next) = next
-						{
-							Self::arm_schedule(
-								Arc::clone(&self.parent),
-								self.expected_session_id.clone(),
-								context.clone(),
-								Str::from(id),
-								next,
-							);
-						}
-						Ok(Value::Null)
-					},
-					"omp.agents.schedule.delete" => {
-						let id = arguments
-							.get("schedule_id")
-							.and_then(Value::as_str)
-							.unwrap_or_default();
-						let mut store = self.parent.schedules.lock();
-						let row = self.own_schedule(&context, id, &store)?.clone();
-						let scope = row
-							.get("scope")
-							.and_then(Value::as_str)
-							.unwrap_or("session");
-						self
-							.parent
-							.append_schedule_event(scope, &json!({"op": "delete", "id": id}))?;
-						store.rows.remove(id);
-						Ok(Value::Null)
-					},
-					_ => unreachable!(),
-				}
 			},
 			operation => Err(Self::unavailable(operation, "Core agent-tree service")),
 		}
@@ -3844,9 +3952,71 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			default: args.get("default").and_then(Value::as_str).map(Str::from),
 			max_usd_micros: None,
 		};
-		let prompt = args.get("prompt").and_then(Value::as_str).ok_or_else(|| {
+		let prompt = args.get("prompt").ok_or_else(|| {
 			omp_envd::eval::BridgeHostError::message("completion prompt is required")
 		})?;
+		let user_parts = if let Some(text) = prompt.as_str() {
+			vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }]
+		} else {
+			let rows = prompt.as_array().ok_or_else(|| {
+				omp_envd::eval::BridgeHostError::message(
+					"completion prompt must be text or typed media parts",
+				)
+			})?;
+			let mut parts = Vec::with_capacity(rows.len());
+			for row in rows {
+				match row.get("kind").and_then(Value::as_str) {
+					Some("text") => parts.push(Part {
+						kind: Some(part::Kind::Text(
+							row.get("text")
+								.and_then(Value::as_str)
+								.unwrap_or_default()
+								.to_owned(),
+						)),
+					}),
+					Some("blob") => {
+						let blob = row.get("blob").and_then(Value::as_object).ok_or_else(|| {
+							omp_envd::eval::BridgeHostError::message(
+								"completion blob part omitted its blob reference",
+							)
+						})?;
+						let hash = blob
+							.get("hash")
+							.and_then(Value::as_str)
+							.ok_or_else(|| {
+								omp_envd::eval::BridgeHostError::message(
+									"completion blob reference omitted its hash",
+								)
+							})
+							.and_then(|hash| {
+								omp_core::hex::decode(hash).into_vec().map_err(|error| {
+									omp_envd::eval::BridgeHostError::message(error.to_string())
+								})
+							})?;
+						parts.push(Part {
+							kind: Some(part::Kind::Blob(omp_proto::thread::v1::Blob {
+								hash: hash.into(),
+								mime: String::new(),
+								size: blob.get("size").and_then(Value::as_u64).unwrap_or(0),
+								inline: Default::default(),
+								detail: omp_proto::thread::v1::blob::Detail::Auto as i32,
+							})),
+						});
+						if let Some(alt) = row.get("alt").and_then(Value::as_str)
+							&& !alt.is_empty()
+						{
+							parts.push(Part { kind: Some(part::Kind::Text(alt.to_owned())) });
+						}
+					},
+					_ => {
+						return Err(omp_envd::eval::BridgeHostError::message(
+							"completion prompt contains an unknown typed part",
+						));
+					},
+				}
+			}
+			parts
+		};
 		let context = self.context.lock().clone();
 		let snapshot = context.state.snapshot();
 		let mut params = snapshot.turn.params.clone();
@@ -3886,7 +4056,15 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 		if let Some(system) = args.get("system").and_then(Value::as_str) {
 			items.push(bridge_message(Role::System, system));
 		}
-		items.push(bridge_message(Role::User, prompt));
+		items.push(Item {
+			seq: 0,
+			created_at_ms: now_ms(),
+			kind: Some(item::Kind::Message(Message {
+				role: i32::from(Role::User),
+				parts: user_parts,
+			})),
+			props: None,
+		});
 		let options = TurnOptions {
 			context_id: None,
 			params,
@@ -4277,7 +4455,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			.as_ref()
 			.unwrap_or(task_settings.as_ref());
 
-		let child_snapshot = crate::subagent::snapshot::child_snapshot(
+		let mut child_snapshot = crate::subagent::snapshot::child_snapshot(
 			parent_snapshot.as_ref(),
 			crate::subagent::snapshot::ChildSnapshotOptions {
 				definition: &definition,
@@ -4321,8 +4499,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			let model = model.to_ascii_lowercase();
 			model.contains("codex") || model.contains("gpt-5")
 		};
-		let system_prompt =
-			crate::subagent::prompt::compose(crate::subagent::prompt::SubagentPromptInput {
+		let prompt_input = crate::subagent::prompt::SubagentPromptInput {
 				definition:        &definition,
 				shared_context:    None,
 				plan_path:         None,
@@ -4342,7 +4519,11 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				},
 				plan_mode:         false,
 				eager:             task_settings.eager,
-			});
+			};
+		child_snapshot.props =
+			crate::subagent::prompt::props(&prompt_input, &parent_snapshot.props);
+		let system_prompt =
+			crate::subagent::prompt::compose(prompt_input, &parent_snapshot.props);
 		let blob_root = context
 			.sessions_dir
 			.parent()
@@ -5878,7 +6059,7 @@ pub fn session_blueprint(
 		.into_boxed_slice();
 	options.identity.id = Some(session_id.clone());
 	options.model_selectors = Box::new([Str::new(model)]);
-	let mut workspace = WorkspaceInput::new(root, Arc::from([]));
+	let mut workspace = PromptFacts::new(root, Arc::from([]));
 	let mut roots = Vec::with_capacity(options.additional_roots.len() + 1);
 	for (index, path) in std::iter::once(&options.cwd)
 		.chain(options.additional_roots.iter())
@@ -5965,10 +6146,8 @@ pub fn agent_snapshot(
 		stream_watchdog: model_stream_watchdog(catalog, model),
 		..TurnOptions::default()
 	};
-	let mut snapshot = AgentSnapshot::new(turn, blueprint.workspace().clone(), Arc::clone(registry));
-	snapshot.reasoning_dialect = interrupted_reasoning_dialect(catalog, model);
-	snapshot.workspace = crate::prompt_prep::PromptSnapshot::freeze(
-		snapshot.workspace.clone(),
+	let prepared = crate::prompt_prep::PromptSnapshot::freeze(
+		blueprint.prompt_facts().clone(),
 		registry,
 		Some(&enabled_tools),
 		Arc::from([]),
@@ -5978,8 +6157,9 @@ pub fn agent_snapshot(
 		Arc::from([]),
 		Arc::from([]),
 		Arc::from([]),
-	)
-	.workspace;
+	);
+	let mut snapshot = AgentSnapshot::new(turn, prepared.props(), Arc::clone(registry));
+	snapshot.reasoning_dialect = interrupted_reasoning_dialect(catalog, model);
 	snapshot.enabled_tools = enabled_tools.into();
 	Ok(snapshot)
 }
@@ -6596,7 +6776,9 @@ mod tests {
 		let registry = Arc::new(Registry::new());
 		let mut snapshot = AgentSnapshot::new(
 			TurnOptions::default(),
-			WorkspaceInput::new(&root, Arc::from([])),
+			PromptFacts::new(&root, Arc::from([]))
+				.props()
+				.expect("test prompt facts"),
 			registry,
 		);
 		snapshot.enabled_tools = Arc::from([sf!("eval")]);

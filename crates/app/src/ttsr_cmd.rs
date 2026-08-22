@@ -130,7 +130,7 @@ fn scan(
 		.gitignore(!no_gitignore)
 		.hidden(true)
 		.collect_file_candidates()
-		.map_err(|error| miette!(error.to_string()))?;
+		.map_err(|error| miette!(error))?;
 	let mut rows = Vec::new();
 	for candidate in candidates {
 		if candidate.size.is_some_and(|size| size > max_bytes as f64) {

@@ -10,9 +10,9 @@ use std::{
 
 use omp_agent::{
 	AbortHandle, Agent, AgentError, AgentEvent, AgentNode, AgentRunSummary, AgentStatus, AgentTree,
-	Interrupt, InterruptClass, InterruptSource, JobBoard, SubagentActivity, SubagentActivityKind,
-	SubagentDisposition, SubagentLifecycle, SubagentRunState, SubagentStateError,
-	SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId,
+	AgentTreeLimits, Interrupt, InterruptClass, InterruptSource, JobBoard, MailboxSender,
+	SubagentActivity, SubagentActivityKind, SubagentDisposition, SubagentLifecycle, SubagentRunState,
+	SubagentProgressSnapshot, SubagentStateError, SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId,
 };
 use omp_core::{Str, sf};
 use omp_proto::{
@@ -66,10 +66,13 @@ impl<C: TurnClient + Clone> SupervisedRuntime<C> {
 }
 
 struct ChildHandle {
-	commands: flume::Sender<ChildCommand>,
-	abort:    Arc<RwLock<Option<AbortHandle>>>,
-	state:    Arc<SubagentRunState>,
-	metadata: RwLock<Option<serde_json::Value>>,
+	commands:      flume::Sender<ChildCommand>,
+	abort:         Arc<RwLock<Option<AbortHandle>>>,
+	mailbox:       Arc<RwLock<Option<MailboxSender>>>,
+	state:         Arc<SubagentRunState>,
+	metadata:      RwLock<Option<serde_json::Value>>,
+	result:        RwLock<Option<serde_json::Value>>,
+	cancel_reason: RwLock<Option<Str>>,
 }
 
 struct RunCommand {
@@ -81,6 +84,7 @@ struct RunCommand {
 
 enum ChildCommand {
 	Run(RunCommand),
+	Revive(flume::Sender<Result<u64, SupervisorError>>),
 	Park(ParkReason, flume::Sender<Result<(), SupervisorError>>),
 	Teardown(flume::Sender<()>),
 }
@@ -126,6 +130,46 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 	pub fn parent_jobs(&self) -> Option<Arc<JobBoard>> {
 		self.parent_jobs.read().clone()
 	}
+	/// Returns a coherent snapshot of configured admission limits and current
+	/// occupancy.
+	pub fn limits(&self) -> AgentTreeLimits {
+		let mut limits = self.tree.limits();
+		let configured = self.settings.read().max_recursion_depth;
+		if configured >= 0 {
+			limits.max_depth = limits
+				.max_depth
+				.min(u16::try_from(configured).unwrap_or_default());
+		}
+		limits
+	}
+
+	/// Resolves a stable id, `agent://` URL, generation handle, or
+	/// case-insensitive session-local name to a supervised identity.
+	pub fn resolve(&self, reference: &str) -> Option<Str> {
+		let reference = reference.strip_prefix("agent://").unwrap_or(reference);
+		let stable = reference.rsplit_once('#').map_or(reference, |(id, _)| id);
+		let children = self.children.read();
+		if children.contains_key(stable) {
+			return Some(Str::new(stable));
+		}
+		let node = self.tree.named(stable)?;
+		children.contains_key(node.id.as_str()).then(|| node.id.clone())
+	}
+
+	/// Returns retained handle metadata rewritten for the current generation.
+	pub fn resolved_metadata(&self, reference: &str) -> Option<serde_json::Value> {
+		let id = self.resolve(reference)?;
+		let child = self.children.read();
+		let child = child.get(id.as_str())?;
+		let mut metadata = child.metadata.read().clone()?;
+		if let Some(object) = metadata.as_object_mut() {
+			object.insert(
+				"run_id".to_owned(),
+				serde_json::Value::String(format!("{id}#{}", child.state.generation().0)),
+			);
+		}
+		Some(metadata)
+	}
 
 	/// Registers and starts ownership of one configured child loop.
 	pub fn register(
@@ -141,6 +185,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		}
 		let state = Arc::new(SubagentRunState::new(id.clone()));
 		let abort = Arc::new(RwLock::new(Some(runtime.agent.abort_handle())));
+		let mailbox = Arc::new(RwLock::new(Some(runtime.agent.mailbox())));
 		let (commands, receiver) = flume::unbounded();
 		let tree = Arc::clone(&self.tree);
 		let loop_state = Arc::clone(&state);
@@ -150,14 +195,18 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			Some(runtime),
 			reviver,
 			Arc::clone(&abort),
+			Arc::clone(&mailbox),
 			loop_state,
 			receiver,
 		));
 		children.insert(id, ChildHandle {
 			commands,
 			abort,
+			mailbox,
 			state: Arc::clone(&state),
 			metadata: RwLock::new(None),
+			result: RwLock::new(None),
+			cancel_reason: RwLock::new(None),
 		});
 		Ok(state)
 	}
@@ -178,6 +227,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		state.transition(SubagentLifecycle::Settled)?;
 		state.transition(SubagentLifecycle::Parked)?;
 		let abort = Arc::new(RwLock::new(None));
+		let mailbox = Arc::new(RwLock::new(None));
 		let (commands, receiver) = flume::unbounded();
 		let tree = Arc::clone(&self.tree);
 		let loop_state = Arc::clone(&state);
@@ -187,14 +237,18 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			None,
 			Some(reviver),
 			Arc::clone(&abort),
+			Arc::clone(&mailbox),
 			loop_state,
 			receiver,
 		));
 		children.insert(id, ChildHandle {
 			commands,
 			abort,
+			mailbox,
 			state: Arc::clone(&state),
 			metadata: RwLock::new(None),
+			result: RwLock::new(None),
+			cancel_reason: RwLock::new(None),
 		});
 		Ok(state)
 	}
@@ -294,6 +348,57 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		}
 		Ok(())
 	}
+	/// Requests cooperative cancellation with the caller's reason, then
+	/// escalates to the generation abort handle after the courtesy grace.
+	pub async fn cancel_with_grace(
+		&self,
+		id: &str,
+		generation: u64,
+		reason: Str,
+		grace: Duration,
+	) -> Result<(), SupervisorError> {
+		self.state_at_generation(id, generation)?;
+		let (state, mailbox, abort) = {
+			let children = self.children.read();
+			let child = children
+				.get(id)
+				.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::new(id) })?;
+			*child.cancel_reason.write() = Some(reason.clone());
+			(
+				Arc::clone(&child.state),
+				child.mailbox.read().clone(),
+				Arc::clone(&child.abort),
+			)
+		};
+		if let Some(mailbox) = mailbox {
+			let _ = mailbox.try_enqueue(Interrupt {
+				class: InterruptClass::Immediate,
+				item: system_item(reason),
+				source: InterruptSource::Producer(sf!("cancel")),
+			});
+		}
+		if !grace.is_zero() {
+			tokio::time::sleep(grace).await;
+		}
+		if !matches!(
+			state.lifecycle(),
+			SubagentLifecycle::Settled | SubagentLifecycle::Parked
+		) && let Some(abort) = abort.read().as_ref()
+		{
+			abort.abort();
+		}
+		Ok(())
+	}
+
+	/// Returns the authoritative cancellation reason recorded for the current
+	/// retained generation.
+	pub fn cancellation_reason(&self, id: &str) -> Option<Str> {
+		self
+			.children
+			.read()
+			.get(id)
+			.and_then(|child| child.cancel_reason.read().clone())
+	}
 
 	/// Installs the durable public handle projection after admission.
 	pub fn set_metadata(
@@ -316,6 +421,24 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			.read()
 			.get(id)
 			.and_then(|child| child.metadata.read().clone())
+	}
+	/// Retains the completed public result emitted by the child application.
+	pub fn set_result(&self, id: &str, result: serde_json::Value) -> Result<(), SupervisorError> {
+		let children = self.children.read();
+		let child = children
+			.get(id)
+			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::from(id) })?;
+		*child.result.write() = Some(result);
+		Ok(())
+	}
+
+	/// Returns the completed application result for the current generation.
+	pub fn result(&self, id: &str) -> Option<serde_json::Value> {
+		self
+			.children
+			.read()
+			.get(id)
+			.and_then(|child| child.result.read().clone())
 	}
 
 	/// Cancels only the generation named by an opaque CONTROL handle.
@@ -361,6 +484,40 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			.get(id)
 			.map(|child| Arc::clone(&child.state))
 	}
+	/// Aggregates the latest retained progress for one child and every
+	/// descendant using the authoritative tree lineage.
+	pub fn subtree_progress(&self, id: &str) -> Option<SubagentProgressSnapshot> {
+		self.tree.node(id)?;
+		let children = self.children.read();
+		let mut total = SubagentProgressSnapshot::default();
+		for node in self.tree.roster() {
+			let mut current = Some(Arc::clone(node));
+			let included = loop {
+				let Some(candidate) = current else { break false };
+				if candidate.id == id {
+					break true;
+				}
+				current = candidate
+					.parent
+					.as_ref()
+					.and_then(|parent| self.tree.node(parent));
+			};
+			if !included {
+				continue;
+			}
+			let Some(state) = children.get(node.id.as_str()) else {
+				continue;
+			};
+			let progress = state.state.progress();
+			total.requests = total.requests.saturating_add(progress.requests);
+			total.tool_calls = total.tool_calls.saturating_add(progress.tool_calls);
+			total.input_tokens = total.input_tokens.saturating_add(progress.input_tokens);
+			total.output_tokens = total.output_tokens.saturating_add(progress.output_tokens);
+			total.cost_micros = total.cost_micros.saturating_add(progress.cost_micros);
+			total.context_tokens = total.context_tokens.max(progress.context_tokens);
+		}
+		Some(total)
+	}
 
 	/// Returns retained state only when the caller's run generation is current.
 	///
@@ -385,6 +542,27 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		}
 		Ok(state)
 	}
+	/// Cold-reconstructs a parked child and returns its new fenced generation.
+	pub async fn revive(&self, reference: &str) -> Result<u64, SupervisorError> {
+		let id = self
+			.resolve(reference)
+			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::new(reference) })?;
+		let commands = self
+			.children
+			.read()
+			.get(id.as_str())
+			.map(|child| child.commands.clone())
+			.ok_or_else(|| SupervisorError::UnknownAgent { id: id.clone() })?;
+		let (reply, response) = flume::bounded(1);
+		commands
+			.send_async(ChildCommand::Revive(reply))
+			.await
+			.map_err(|_| SupervisorError::Stopped { id: id.clone() })?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| SupervisorError::Stopped { id })?
+	}
 
 	/// Releases live resources only when the caller still owns this generation.
 	pub async fn park_at_generation(
@@ -394,6 +572,43 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 	) -> Result<(), SupervisorError> {
 		self.state_at_generation(id, generation)?;
 		self.park(id).await
+	}
+	/// Relinquishes structural supervision without cancelling the generation.
+	///
+	/// A running actor finishes its current generation before processing the
+	/// queued teardown; the caller returns as soon as ownership is transferred.
+	pub async fn release_at_generation(
+		&self,
+		id: &str,
+		generation: u64,
+	) -> Result<(), SupervisorError> {
+		let state = self.state_at_generation(id, generation)?;
+		let active = !matches!(
+			state.lifecycle(),
+			SubagentLifecycle::Settled | SubagentLifecycle::Parked
+		);
+		let child = self
+			.children
+			.write()
+			.remove(id)
+			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::new(id) })?;
+		let (reply, response) = flume::bounded(1);
+		child
+			.commands
+			.send_async(ChildCommand::Teardown(reply))
+			.await
+			.map_err(|_| SupervisorError::Stopped { id: Str::new(id) })?;
+		if active {
+			tokio::spawn(async move {
+				let _ = response.recv_async().await;
+			});
+			Ok(())
+		} else {
+			response
+				.recv_async()
+				.await
+				.map_err(|_| SupervisorError::Stopped { id: Str::new(id) })
+		}
 	}
 
 	/// Cancels and tears down one live actor at session shutdown.
@@ -437,6 +652,7 @@ async fn child_loop<C: TurnClient + Clone + Send + 'static>(
 	mut runtime: Option<SupervisedRuntime<C>>,
 	reviver: Option<Arc<dyn ChildReviver<C>>>,
 	abort: Arc<RwLock<Option<AbortHandle>>>,
+	mailbox: Arc<RwLock<Option<MailboxSender>>>,
 	state: Arc<SubagentRunState>,
 	commands: flume::Receiver<ChildCommand>,
 ) {
@@ -450,12 +666,25 @@ async fn child_loop<C: TurnClient + Clone + Send + 'static>(
 					&mut runtime,
 					reviver.as_ref(),
 					&abort,
+					&mailbox,
 					command.items,
 					command.turn_id,
 					&command.settings,
 				)
 				.await;
 				let _ = command.reply.send(result);
+			},
+			ChildCommand::Revive(reply) => {
+				let result = revive_child(
+					&node,
+					&state,
+					&mut runtime,
+					reviver.as_ref(),
+					&abort,
+					&mailbox,
+				)
+				.await;
+				let _ = reply.send(result);
 			},
 			ChildCommand::Park(reason, reply) => {
 				let result = if reviver.is_none() {
@@ -468,6 +697,8 @@ async fn child_loop<C: TurnClient + Clone + Send + 'static>(
 					});
 					journaled.and_then(|()| {
 						runtime = None;
+						*abort.write() = None;
+						*mailbox.write() = None;
 						node.set_status(AgentStatus::Settled);
 						state
 							.transition(SubagentLifecycle::Parked)
@@ -485,6 +716,39 @@ async fn child_loop<C: TurnClient + Clone + Send + 'static>(
 	}
 }
 
+async fn revive_child<C: TurnClient + Clone + Send + 'static>(
+	node: &AgentNode,
+	state: &SubagentRunState,
+	runtime: &mut Option<SupervisedRuntime<C>>,
+	reviver: Option<&Arc<dyn ChildReviver<C>>>,
+	abort: &RwLock<Option<AbortHandle>>,
+	mailbox: &RwLock<Option<MailboxSender>>,
+) -> Result<u64, SupervisorError> {
+	if state.lifecycle() != SubagentLifecycle::Parked {
+		return Err(SupervisorError::NotParked {
+			id: node.id.clone(),
+			lifecycle: state.lifecycle(),
+		});
+	}
+	let factory =
+		reviver.ok_or_else(|| SupervisorError::RevivalUnavailable { id: node.id.clone() })?;
+	state.begin_generation()?;
+	let mut restored = match factory.revive().await {
+		Ok(restored) => restored,
+		Err(error) => {
+			state.transition(SubagentLifecycle::Settled)?;
+			return Err(error);
+		},
+	};
+	record_lifecycle(&mut restored, state, &node.id, "reopen", None)?;
+	*abort.write() = Some(restored.agent.abort_handle());
+	*mailbox.write() = Some(restored.agent.mailbox());
+	*runtime = Some(restored);
+	state.transition(SubagentLifecycle::Settled)?;
+	node.set_status(AgentStatus::Settled);
+	Ok(state.generation().0)
+}
+
 async fn run_child<C: TurnClient + Clone + Send + 'static>(
 	node: &AgentNode,
 	tree: &AgentTree,
@@ -492,6 +756,7 @@ async fn run_child<C: TurnClient + Clone + Send + 'static>(
 	runtime: &mut Option<SupervisedRuntime<C>>,
 	reviver: Option<&Arc<dyn ChildReviver<C>>>,
 	abort: &RwLock<Option<AbortHandle>>,
+	mailbox: &RwLock<Option<MailboxSender>>,
 	items: Vec<Item>,
 	turn_id: TurnId,
 	settings: &TaskSettings,
@@ -515,6 +780,13 @@ async fn run_child<C: TurnClient + Clone + Send + 'static>(
 				.expect("reviver produced a live runtime")
 				.agent
 				.abort_handle(),
+		);
+		*mailbox.write() = Some(
+			runtime
+				.as_ref()
+				.expect("reviver produced a live runtime")
+				.agent
+				.mailbox(),
 		);
 	}
 	let runtime = runtime
@@ -960,6 +1232,14 @@ pub enum SupervisorError {
 	NotIdle {
 		/// Stable ID.
 		id: Str,
+	},
+	/// Only a memory-parked identity can be cold revived.
+	#[error("subagent {id} cannot be revived from lifecycle {lifecycle}")]
+	NotParked {
+		/// Stable ID.
+		id:        Str,
+		/// Current lifecycle.
+		lifecycle: SubagentLifecycle,
 	},
 	/// Memory parking is unavailable without an equivalent cold reviver.
 	#[error("subagent {id} has no cold-revival factory")]
