@@ -11,8 +11,12 @@ pub mod block;
 pub mod clipboard;
 /// Compact post-edit diff previews.
 pub mod diff_preview;
+/// Codex apply-patch envelope parsing.
+pub mod foreign_patch;
 /// Hashline sigils, display helpers, and compatible snapshot tags.
 pub mod format;
+/// Packaged constrained-decoding grammars.
+pub mod grammars;
 /// Patch-envelope and file-section splitting.
 pub mod input;
 /// Repeated no-op escalation.
@@ -27,6 +31,8 @@ pub mod parser;
 pub mod recovery;
 /// Exact and fuzzy replacement.
 pub mod replace;
+/// Pure sloppy edit parsing and transformation.
+pub mod sloppy;
 /// Collision-aware retained read snapshots.
 pub mod snapshots;
 /// Syntax probes for conservative edit repair.
@@ -35,6 +41,8 @@ pub mod syntax;
 pub mod tokenizer;
 /// Shared domain, edit, and diagnostic types.
 pub mod types;
+/// Unified-hunk parsing and transformation.
+pub mod unified_hunk;
 
 pub use apply::{
 	ApplyError, ApplyMode, ApplyOptions, ApplyResult, ByteEdit, apply_edits, apply_parsed_patch,

@@ -1,0 +1,16 @@
+start: begin_patch? section+ end_patch?
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+section: header op+
+header: "[" PATH "]" LF
+PATH: /[^\]\n]+/
+op: match_header match_line+ rewrite?
+match_header: "«" ALL? LF
+ALL: "*"
+rewrite: rewrite_sep rewrite_line*
+rewrite_sep: "»" LF
+rewrite_line: content_line | blank_line
+match_line: content_line | blank_line
+content_line: /[^«»\n][^\n]*/ LF
+blank_line: LF
+%import common.LF
