@@ -35,9 +35,10 @@ use serde_json::{Value, value::RawValue};
 use thiserror::Error;
 
 use crate::{
-	AgentRegistry, BatchError, CompactionCoordinator, CompactionMethodOrder, CompactionTier,
+	AgentRegistry, BatchError, CompactionCancellation, CompactionCoordinator,
+	CompactionMethodOrder, CompactionTier,
 	Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode, ManualCompactionOutcome,
-	ManualCompactionRequest, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError,
+	ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError,
 	PromptMemoryQuery, PromptMemorySnapshotSource, SnapcompactPreparation, TtsrMatch, TtsrRegistry,
 	TtsrSource, TurnClient, TurnInput, TurnSession, YieldPayload, YieldPayloadError,
 	YieldPayloadValidator,
@@ -277,6 +278,9 @@ pub enum AgentError {
 	/// A required-deadline campaign hold expired or was aborted.
 	#[error(transparent)]
 	CampaignHold(#[from] crate::HoldError),
+	/// Manual compaction was cancelled before its history rewrite committed.
+	#[error(transparent)]
+	CompactionCancelled(#[from] CompactionCancellation),
 	/// Arbiter stream or outcome violated the canonical turn contract.
 	#[error("arbiter turn protocol violation: {0}")]
 	Protocol(&'static str),
@@ -709,16 +713,63 @@ impl<C: TurnClient> Agent<C> {
 	///
 	/// Elided source is put in the app-injected blob authority before its live
 	/// prompt part is replaced, so every placeholder remains recoverable.
-	pub fn shake_manual(&mut self, tier: CompactionTier) -> Result<ManualShakeOutcome, AgentError> {
-		if !matches!(tier, CompactionTier::Elide | CompactionTier::DropMedia) {
-			return Err(AgentError::Protocol("unsupported /shake tier"));
-		}
+	pub fn shake_manual(&mut self, mode: ManualShakeMode) -> Result<ManualShakeOutcome, AgentError> {
 		if self.journal.pending_turn().is_some() {
 			return Err(AgentError::Protocol("cannot shake while a turn is pending"));
 		}
 		let prompt_hash = self
 			.prompt_hash
 			.ok_or(AgentError::Protocol("cannot shake before the prompt is assembled"))?;
+		let live_events = self.journal.live_item_events()?;
+		let mut items = self.journal.items_at(&live_events)?;
+		if items.is_empty() {
+			return Err(AgentError::Protocol("nothing to shake"));
+		}
+		if mode == ManualShakeMode::Thinking {
+			let mut replaced_regions = 0_u64;
+			let mut removed_bytes = 0_u64;
+			for item in &mut items {
+				let Some(thread::item::Kind::Message(message)) = item.kind.as_mut() else {
+					continue;
+				};
+				if message.role != i32::from(thread::Role::Assistant) {
+					continue;
+				}
+				let mut kept = Vec::with_capacity(message.parts.len());
+				for part in std::mem::take(&mut message.parts) {
+					if matches!(part.kind, Some(thread::part::Kind::Thinking(_))) {
+						replaced_regions = replaced_regions.saturating_add(1);
+						removed_bytes = removed_bytes.saturating_add(
+							u64::try_from(serde_json::to_vec(&part)?.len()).unwrap_or(u64::MAX),
+						);
+					} else {
+						kept.push(part);
+					}
+				}
+				message.parts = kept;
+			}
+			if replaced_regions == 0 {
+				return Err(AgentError::Protocol("no thinking blocks found in this session"));
+			}
+			let rewritten = self
+				.journal
+				.rewrite_prompt_head(now_ms(), prompt_hash, &items, &[])?;
+			self.context = None;
+			self.prompt_hash = None;
+			self.prompt_head_events.clone_from(&rewritten);
+			self.last_toolset_hash = None;
+			return Ok(ManualShakeOutcome {
+				mode,
+				replaced_regions,
+				removed_bytes,
+				event: rewritten.last().copied().unwrap_or_default(),
+			});
+		}
+		let tier = match mode {
+			ManualShakeMode::Elide => CompactionTier::Elide,
+			ManualShakeMode::DropMedia => CompactionTier::DropMedia,
+			ManualShakeMode::Thinking => unreachable!("thinking returned after its rewrite"),
+		};
 		let store = self
 			.blob_store
 			.as_ref()
@@ -727,11 +778,6 @@ impl<C: TurnClient> Agent<C> {
 			.artifact_catalog
 			.as_ref()
 			.ok_or(AgentError::Protocol("shake artifact catalog is not configured"))?;
-		let live_events = self.journal.live_item_events()?;
-		let mut items = self.journal.items_at(&live_events)?;
-		if items.is_empty() {
-			return Err(AgentError::Protocol("nothing to shake"));
-		}
 		const PROTECTED_TAIL_BYTES: usize = 16_000;
 		let mut tail_bytes = 0usize;
 		let mut protected_start = items.len();
@@ -764,7 +810,7 @@ impl<C: TurnClient> Agent<C> {
 		self.context = None;
 		self.prompt_head_events.clone_from(&rewritten);
 		Ok(ManualShakeOutcome {
-			tier,
+			mode,
 			replaced_regions,
 			removed_bytes,
 			event: rewritten.last().copied().unwrap_or_default(),
@@ -785,6 +831,7 @@ impl<C: TurnClient> Agent<C> {
 		if self.journal.pending_turn().is_some() {
 			return Err(AgentError::Protocol("cannot compact while a turn is pending"));
 		}
+		self.abort_rx.mark_unchanged();
 		let decision = self
 			.compaction
 			.begin_manual(request, &CompactionMethodOrder::default());
@@ -837,11 +884,16 @@ impl<C: TurnClient> Agent<C> {
 
 		let compact = if mode == ManualCompactionMode::Snapcompact {
 			let source = serde_json::to_string(&live_items[..prefix_end])?;
+			let source = omp_snapcompact::archive::elide_data_urls(
+				&source,
+				omp_snapcompact::archive::DataUrlContext::Source,
+			)
+			.into_owned();
 			let model = self.state.snapshot().turn.params.model.clone();
 			let preparation = SnapcompactPreparation {
 				text: Str::from(source),
 				source_tokens,
-				provider: None,
+				provider: model.split_once('/').map(|(provider, _)| Str::new(provider)),
 				api: None,
 				model_id: Some(Str::from(model)),
 				existing_images: 0,
@@ -905,16 +957,31 @@ impl<C: TurnClient> Agent<C> {
 			let registry = Arc::new(ToolRegistry::new());
 			drop(snapshot);
 			let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
-			let result = self
-				.drive_session(
+			let mut abort_rx = self.abort_rx.clone();
+			let result = {
+				let session = self.drive_session(
 					turn_id,
 					TurnInput::Full(thread),
 					&options,
 					registry,
 					Arc::from([]),
 					false,
-				)
-				.await?;
+				);
+				tokio::pin!(session);
+				tokio::select! {
+					biased;
+					changed = abort_rx.changed() => {
+						changed.map_err(|_| AgentError::Protocol("compaction abort signal closed"))?;
+						None
+					},
+					result = &mut session => Some(result),
+				}
+			};
+			let Some(result) = result else {
+				self.abort_rx.mark_unchanged();
+				return Err(CompactionCancellation::UserInterrupt.into());
+			};
+			let result = result?;
 			let DriveSessionResult::Complete(outcome, _) = result else {
 				return Err(AgentError::Protocol("hidden compaction stream was interrupted"));
 			};
@@ -1008,6 +1075,35 @@ impl<C: TurnClient> Agent<C> {
 			previous = Some(event);
 		}
 		Ok(targets)
+	}
+	
+	/// Rewinds to and resubmits the latest live user turn.
+	///
+	/// Returns `None` when the transcript has no retryable user turn. The
+	/// returned items are the fresh rewind projection used to rebuild callers'
+	/// transcript views.
+	pub async fn retry_last_turn(
+		&mut self,
+		turn_id: TurnId,
+	) -> Result<Option<(Vec<Item>, Str, AgentRunSummary)>, AgentError> {
+		let Some(target) = self.rewind_targets()?.pop() else {
+			return Ok(None);
+		};
+		let text = target.text;
+		let items = self.rewind(target.keep)?;
+		let item = Item {
+			seq:           0,
+			created_at_ms: now_ms(),
+			kind:          Some(thread::item::Kind::Message(thread::Message {
+				role:  i32::from(thread::Role::User),
+				parts: vec![thread::Part {
+					kind: Some(thread::part::Kind::Text(text.to_string())),
+				}],
+			})),
+			props:         None,
+		};
+		let summary = self.submit([item], turn_id).await?;
+		Ok(Some((items, text, summary)))
 	}
 
 	/// Submits caller-authored canonical items and runs every tool follow-up.
@@ -2085,7 +2181,10 @@ impl<C: TurnClient> Agent<C> {
 							let _ = crate::inject_first_turn_metadata(&mut thread, &date, &cwd);
 						}
 						if std::mem::take(&mut self.pending_reasoning_demotion) {
-							let _ = crate::demote_interrupted_reasoning(&mut thread);
+							let _ = crate::demote_interrupted_reasoning(
+								&mut thread,
+								snapshot.reasoning_dialect,
+							);
 						}
 						TurnInput::Full(thread)
 					},
@@ -3939,6 +4038,132 @@ mod tests {
 		std::fs::remove_file(path).expect("remove journal");
 	}
 
+	#[tokio::test]
+	async fn manual_compaction_abort_preserves_provenance_and_allows_follow_up() {
+		let (mut journal, path) = test_journal("compact-abort-cleanup");
+		for (ts, (role, text)) in [
+			(1, (thread::Role::User, "first request")),
+			(2, (thread::Role::Assistant, "first answer")),
+			(3, (thread::Role::User, "second request")),
+		] {
+			journal
+				.append_optimistic(ts, message(role, text), None)
+				.expect("append compact source");
+		}
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([
+				pending_text_script(),
+				outcome_script(end_outcome("replacement answer")),
+			]))),
+			opened:  Arc::clone(&opened),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent = Agent::new(
+			client,
+			env,
+			AgentState::new(crate::AgentSnapshot::default()),
+			journal,
+			test_caps(),
+		);
+		let abort = agent.abort_handle();
+		let aborting = async {
+			wait_for_opened(&opened, 1).await;
+			abort.abort();
+		};
+		let (compaction, ()) = tokio::join!(
+			agent.compact_manual(ManualCompactionRequest {
+				mode: Some(ManualCompactionMode::Soft),
+				focus: None,
+			}),
+			aborting,
+		);
+		assert!(matches!(
+			compaction,
+			Err(AgentError::CompactionCancelled(CompactionCancellation::UserInterrupt))
+		));
+	
+		let follow_up = agent
+			.submit(
+				[message(thread::Role::User, "replacement prompt")],
+				TurnId::new("post-compact-abort"),
+			)
+			.await
+			.expect("replacement waits for cancellation cleanup and runs");
+		assert!(!follow_up.interrupted);
+		assert_eq!(opened.lock().len(), 2);
+		drop(agent);
+		std::fs::remove_file(path).expect("remove journal");
+	}
+	
+	#[test]
+	fn thinking_shake_drops_plain_and_redacted_blocks_and_invalidates_prompt_state() {
+		let (mut journal, path) = test_journal("shake-thinking");
+		let prompt_hash = PromptHash::from([7; 32]);
+		let assistant = Item {
+			kind: Some(thread::item::Kind::Message(thread::Message {
+				role:  i32::from(thread::Role::Assistant),
+				parts: vec![
+					thread::Part {
+						kind: Some(thread::part::Kind::Thinking(thread::Thinking {
+							text:      "plain reasoning".to_owned(),
+							signature: Bytes::new(),
+							redacted:  false,
+						})),
+					},
+					thread::Part {
+						kind: Some(thread::part::Kind::Thinking(thread::Thinking {
+							text:      String::new(),
+							signature: Bytes::from_static(b"opaque"),
+							redacted:  true,
+						})),
+					},
+					thread::Part {
+						kind: Some(thread::part::Kind::Text("visible answer".to_owned())),
+					},
+				],
+			})),
+			..Item::default()
+		};
+		journal
+			.append_optimistic(1, message(thread::Role::User, "request"), Some(prompt_hash))
+			.expect("append user prompt");
+		journal
+			.append_optimistic(2, assistant, Some(prompt_hash))
+			.expect("append assistant answer");
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::new())),
+			opened:  Arc::new(Mutex::new(Vec::new())),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent = Agent::new(
+			client,
+			env,
+			AgentState::new(crate::AgentSnapshot::default()),
+			journal,
+			test_caps(),
+		);
+		let outcome = agent
+			.shake_manual(ManualShakeMode::Thinking)
+			.expect("thinking shake rewrites history");
+		assert_eq!(outcome.replaced_regions, 2);
+		assert!(agent.context.is_none());
+		assert!(agent.prompt_hash.is_none());
+		let events = agent.journal.live_item_events().expect("live item events");
+		let items = agent.journal.items_at(&events).expect("rewritten items");
+		assert!(items.iter().all(|item| {
+			let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+				return true;
+			};
+			message
+				.parts
+				.iter()
+				.all(|part| !matches!(part.kind, Some(thread::part::Kind::Thinking(_))))
+		}));
+		drop(agent);
+		std::fs::remove_file(path).expect("remove journal");
+	}
+	
 	#[tokio::test]
 	async fn caller_abort_settles_pending_stream_and_allows_follow_up() {
 		let (journal, path) = test_journal("stream-abort");

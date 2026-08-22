@@ -49,10 +49,11 @@ pub struct QueuedAdvice {
 
 #[derive(Debug, Default)]
 struct QueueState {
-	mid_turn: bool,
-	highest:  HashMap<Str, AdviceSeverity>,
-	ready:    Vec<QueuedAdvice>,
-	deferred: Vec<QueuedAdvice>,
+	mid_turn:       bool,
+	delivered:      HashMap<Str, AdviceSeverity>,
+	ready:          Vec<QueuedAdvice>,
+	deferred:       Vec<QueuedAdvice>,
+	deferred_index: HashMap<Str, usize>,
 }
 
 /// Session-scoped queue enforcing escalation-only duplicate delivery.
@@ -67,10 +68,23 @@ impl AdvisorAdviceQueue {
 	/// Clearing the boundary promotes deferred notes in their original order.
 	pub fn set_mid_turn(&self, mid_turn: bool) {
 		let mut state = self.state.lock();
+		let was_mid_turn = state.mid_turn;
 		state.mid_turn = mid_turn;
-		if !mid_turn {
+		if was_mid_turn && !mid_turn {
 			let deferred = std::mem::take(&mut state.deferred);
-			state.ready.extend(deferred);
+			state.deferred_index.clear();
+			for queued in deferred {
+				let key = normalize_advice(queued.note.as_str());
+				if state
+					.delivered
+					.get(&key)
+					.is_some_and(|highest| *highest >= queued.severity)
+				{
+					continue;
+				}
+				state.delivered.insert(key, queued.severity);
+				state.ready.push(queued);
+			}
 		}
 	}
 
@@ -83,21 +97,29 @@ impl AdvisorAdviceQueue {
 		let key = normalize_advice(note);
 		let mut state = self.state.lock();
 		if state
-			.highest
+			.delivered
 			.get(&key)
 			.is_some_and(|highest| *highest >= severity)
 		{
 			return AdviceAdmission::Suppressed;
 		}
-		state.highest.insert(key, severity);
-		let queued = QueuedAdvice { note: Str::new(note), severity };
-		if state.mid_turn {
-			state.deferred.push(queued);
-			AdviceAdmission::Deferred
-		} else {
-			state.ready.push(queued);
-			AdviceAdmission::Ready
+		if severity == AdviceSeverity::Blocker || !state.mid_turn {
+			state.delivered.insert(key, severity);
+			state.ready.push(QueuedAdvice { note: Str::new(note), severity });
+			return AdviceAdmission::Ready;
 		}
+		if let Some(index) = state.deferred_index.get(&key).copied() {
+			let pending = &mut state.deferred[index];
+			if severity <= pending.severity {
+				return AdviceAdmission::Suppressed;
+			}
+			pending.severity = severity;
+			return AdviceAdmission::Deferred;
+		}
+		let index = state.deferred.len();
+		state.deferred.push(QueuedAdvice { note: Str::new(note), severity });
+		state.deferred_index.insert(key, index);
+		AdviceAdmission::Deferred
 	}
 
 	/// Drains notes ready for primary-loop delivery.
@@ -201,6 +223,11 @@ impl Tool for AdviseTool {
 
 	fn prompt(&self, view: Result<&AdvisePayload, &AdviseFault>, _: &PromptCaps) -> Vec<Part> {
 		let text = match view {
+			Ok(payload) if payload.admission == "deferred" => sf!(
+				"Deferred — primary is mid-turn; this note will be delivered automatically when \
+				 the turn completes. Do not re-raise the same point."
+			),
+			Ok(payload) if payload.admission == "suppressed" => sf!("Duplicate advice ignored."),
 			Ok(_) => sf!("Recorded."),
 			Err(AdviseFault::EmptyNote) => sf!("Advice note must not be empty."),
 		};
@@ -235,5 +262,112 @@ fn protocol_issue(message: Str) -> ArgIssue {
 		kind:     ArgIssueKind::Protocol,
 		example:  Some(sf!(r#"{{"note":"Concrete issue","severity":"concern"}}"#)),
 		found:    Some(message),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use omp_tool::{Dialect, ModelClass};
+
+	#[test]
+	fn deferred_notes_dedupe_escalate_in_place_and_flush_oldest_first() {
+		let queue = AdvisorAdviceQueue::default();
+		queue.set_mid_turn(true);
+		assert_eq!(
+			queue.submit("First issue.", AdviceSeverity::Nit),
+			AdviceAdmission::Deferred
+		);
+		assert_eq!(
+			queue.submit("Second issue.", AdviceSeverity::Concern),
+			AdviceAdmission::Deferred
+		);
+		assert_eq!(
+			queue.submit("First   issue.", AdviceSeverity::Concern),
+			AdviceAdmission::Deferred
+		);
+		assert_eq!(
+			queue.submit("First issue.", AdviceSeverity::Nit),
+			AdviceAdmission::Suppressed
+		);
+		assert!(queue.drain_ready().is_empty());
+
+		queue.set_mid_turn(false);
+		assert_eq!(
+			queue.drain_ready(),
+			[
+				QueuedAdvice {
+					note:     Str::new_static("First issue."),
+					severity: AdviceSeverity::Concern,
+				},
+				QueuedAdvice {
+					note:     Str::new_static("Second issue."),
+					severity: AdviceSeverity::Concern,
+				},
+			]
+		);
+	}
+
+	#[test]
+	fn blocker_bypasses_mid_turn_and_suppresses_lower_deferred_copy() {
+		let queue = AdvisorAdviceQueue::default();
+		queue.set_mid_turn(true);
+		assert_eq!(
+			queue.submit("Unsafe operation.", AdviceSeverity::Concern),
+			AdviceAdmission::Deferred
+		);
+		assert_eq!(
+			queue.submit("Unsafe operation.", AdviceSeverity::Blocker),
+			AdviceAdmission::Ready
+		);
+		assert_eq!(
+			queue.drain_ready(),
+			[QueuedAdvice {
+				note:     Str::new_static("Unsafe operation."),
+				severity: AdviceSeverity::Blocker,
+			}]
+		);
+		queue.set_mid_turn(false);
+		assert!(queue.drain_ready().is_empty());
+	}
+
+	#[test]
+	fn delivered_note_accepts_only_a_later_escalation() {
+		let queue = AdvisorAdviceQueue::default();
+		assert_eq!(
+			queue.submit("Regression risk.", AdviceSeverity::Nit),
+			AdviceAdmission::Ready
+		);
+		let _ = queue.drain_ready();
+		assert_eq!(
+			queue.submit("Regression risk.", AdviceSeverity::Nit),
+			AdviceAdmission::Suppressed
+		);
+		assert_eq!(
+			queue.submit("Regression risk.", AdviceSeverity::Concern),
+			AdviceAdmission::Ready
+		);
+	}
+
+	#[test]
+	fn deferred_tool_prompt_states_that_delivery_is_automatic() {
+		let queue = AdvisorAdviceQueue::default();
+		let tool = tool(queue);
+		let payload = AdvisePayload { admission: sf!("deferred") };
+		let parts = tool.prompt(
+			Ok(&payload),
+			&PromptCaps {
+				maximum_parts:      1,
+				maximum_text_bytes: 512,
+				media:              false,
+				dialect:            Dialect::default(),
+				model_class:        ModelClass::default(),
+			},
+		);
+		assert!(matches!(
+			parts.as_slice(),
+			[Part::Text { text }] if text.contains("Deferred")
+				&& text.contains("delivered automatically")
+		));
 	}
 }

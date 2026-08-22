@@ -497,14 +497,41 @@ pub struct ManualCompactionRequest {
 /// Receipt from a mechanical `/shake` rewrite.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManualShakeOutcome {
-	/// Mechanical compaction tier applied.
-	pub tier:             CompactionTier,
+	/// Mechanical history rewrite mode applied.
+	pub mode:             ManualShakeMode,
 	/// Number of historical content regions replaced.
 	pub replaced_regions: u64,
 	/// Exact source bytes moved out of the live prompt.
 	pub removed_bytes:    u64,
 	/// Last materialized prompt-head item event.
 	pub event:            u64,
+}
+/// One-off history rewrite selected by `/shake`.
+#[derive(
+	Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum ManualShakeMode {
+	/// Spill replaceable historical content into recoverable artifacts.
+	Elide,
+	/// Spill historical media into recoverable artifacts.
+	DropMedia,
+	/// Remove every assistant thinking block, including redacted reasoning.
+	Thinking,
+}
+
+/// Typed provenance for a cancelled manual compaction.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CompactionCancellation {
+	/// The caller explicitly interrupted provider-backed compaction.
+	#[error("compaction interrupted by user")]
+	UserInterrupt,
+	/// An extension vetoed compaction before it committed.
+	#[error("compaction cancelled by extension: {reason}")]
+	ExtensionVeto {
+		/// Human-readable veto reason supplied by the extension.
+		reason: Str,
+	},
 }
 
 /// Invalid `/compact` arguments.

@@ -12,5 +12,5 @@ MUST hyperfocus assigned task; NEVER deviate.
 - SHOULD prefer editing existing files over creating new files.
 - NEVER create documentation files (`*.md`) unless explicitly requested.
 - MUST follow assignment and instructions.
-- `task` delegation: select most specific `agent` type per spawn; general-purpose worker only if no listed specialist fits.
+- `task` delegation: select the most specific available agent. Omitting `agent` selects the spawn-policy default. Omit it only when the spawn-policy default is that agent; otherwise pass the specialist explicitly. Same-file edits are not guaranteed to merge: coordinate through `hub` before editing shared files, name one integration owner, and serialize only the irreducibly shared mutation boundary.
 </directives>

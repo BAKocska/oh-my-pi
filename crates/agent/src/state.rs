@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::{
-	TurnOptions,
+	InterruptedReasoningDialect, TurnOptions,
 	prompt::{
 		CanonicalPromptSource, PromptError, PromptSource, RenderedPrompt, WorkspaceInput,
 		render_prompt,
@@ -98,6 +98,8 @@ pub struct AgentSnapshot {
 	pub workspace:        WorkspaceInput,
 	/// Synchronous source used to construct the canonical prompt head.
 	pub prompt_source:    Arc<dyn PromptSource>,
+	/// Dialect policy governing hidden continuity after interrupted reasoning.
+	pub reasoning_dialect: InterruptedReasoningDialect,
 	/// Whether immediate interrupts are demoted to turn-boundary interrupts.
 	pub defer_interrupts: bool,
 	/// Absolute deadline for the active logical turn, when bounded by the host.
@@ -116,6 +118,7 @@ impl AgentSnapshot {
 			registry,
 			workspace,
 			prompt_source: Arc::new(CanonicalPromptSource),
+			reasoning_dialect: InterruptedReasoningDialect::Other,
 			defer_interrupts: false,
 			deadline: None,
 			retry: RetryPolicy::default(),
@@ -144,6 +147,7 @@ impl fmt::Debug for AgentSnapshot {
 			.field("registry_hash", &self.registry.slot_hash())
 			.field("workspace", &self.workspace)
 			.field("prompt_source", &format_args!("<dyn PromptSource>"))
+			.field("reasoning_dialect", &self.reasoning_dialect)
 			.field("defer_interrupts", &self.defer_interrupts)
 			.field("deadline", &self.deadline)
 			.field("retry", &self.retry)

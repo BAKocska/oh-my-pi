@@ -12,6 +12,20 @@ use omp_tool::{
 };
 use serde::Deserialize;
 use thiserror::Error;
+const COMPACTION_SUMMARY_CONTEXT: &str =
+	"Prior model work/tool state available.\nMUST build on prior work; NEVER duplicate prior \
+	 work.\n\n<summary>\n{{summary}}\n</summary>\n";
+const HANDOFF_SUMMARY_CONTEXT: &str =
+	include_str!("../prompts/compaction/handoff-summary-context.md");
+
+fn render_compaction_summary(summary: &str, method: Option<&str>) -> String {
+	let template = if method == Some("handoff") {
+		HANDOFF_SUMMARY_CONTEXT
+	} else {
+		COMPACTION_SUMMARY_CONTEXT
+	};
+	template.replace("{{summary}}", summary)
+}
 
 /// Canonical thread projection failure.
 #[derive(Debug, Error)]
@@ -167,9 +181,9 @@ pub fn project_journal(
 				positions.insert(index, position);
 				items.push(item);
 			},
-			Kind::Compact { summary, snapcompact, .. } => {
+			Kind::Compact { summary, method, snapcompact, .. } => {
 				let mut parts = vec![thread_pb::Part {
-					kind: Some(thread_pb::part::Kind::Text(summary.to_string())),
+					kind: Some(thread_pb::part::Kind::Text(render_compaction_summary(summary, method.as_deref()))),
 				}];
 				if let Some(archive) = snapcompact {
 					parts.extend(archive.frames.iter().map(|reference| thread_pb::Part {
@@ -592,9 +606,26 @@ mod tests {
 	};
 	use omp_tool::{CapsBase, ModelClass, TOOL_REV_PROP};
 
-	use super::project_journal;
+	use super::{project_journal, render_compaction_summary};
 
 	static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+	
+	#[test]
+	fn handoff_compaction_uses_successor_memory_framing() {
+		let rendered = render_compaction_summary("## Next Steps\nRun the focused test.", Some("handoff"));
+		assert!(rendered.contains("<handoff>"));
+		assert!(rendered.contains("prior instance"));
+		assert!(rendered.contains("NEVER write another handoff document"));
+		assert!(!rendered.contains("<summary>"));
+	}
+	
+	#[test]
+	fn ordinary_compaction_keeps_summary_framing() {
+		let rendered = render_compaction_summary("portable state", Some("remote"));
+		assert!(rendered.contains("<summary>"));
+		assert!(rendered.contains("portable state"));
+		assert!(!rendered.contains("<handoff>"));
+	}
 
 	#[test]
 	fn user_blob_survives_projection_when_tool_media_is_disabled() {

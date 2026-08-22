@@ -331,7 +331,12 @@ pub fn external_thinking_for_model(capabilities: &omp_llm_inference::ModelCapabi
 /// The provider never receives a modified signed reasoning block. Plaintext is
 /// preserved in a neutral note so the next turn can continue without exposing
 /// the note in ordinary transcript presentation.
-pub fn demote_interrupted_reasoning(thread: &mut Thread) -> bool {
+/// Anthropic-dialect targets omit the continuity note because replaying the
+/// model's reasoning as user text is rejected by that dialect.
+pub fn demote_interrupted_reasoning(
+	thread: &mut Thread,
+	dialect: InterruptedReasoningDialect,
+) -> bool {
 	let Some(message) = thread
 		.items
 		.iter_mut()
@@ -365,6 +370,9 @@ pub fn demote_interrupted_reasoning(thread: &mut Thread) -> bool {
 	if reasoning.is_empty() {
 		return false;
 	}
+	if dialect == InterruptedReasoningDialect::Anthropic {
+		return true;
+	}
 	let text = sf!("You were saying this but I interrupted you:\n```\n{}\n```", reasoning.as_str());
 	thread.items.push(Item {
 		seq:           0,
@@ -381,6 +389,15 @@ pub fn demote_interrupted_reasoning(thread: &mut Thread) -> bool {
 		}),
 	});
 	true
+}
+/// Dialect policy for interrupted assistant reasoning continuity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InterruptedReasoningDialect {
+	/// Ordinary dialects accept a hidden user-shaped continuity quote.
+	#[default]
+	Other,
+	/// Anthropic reasoning classifiers reject model reasoning replayed as user text.
+	Anthropic,
 }
 
 /// Injects stable first-turn date and working-directory metadata once.
@@ -793,7 +810,10 @@ mod tests {
 				props:         None,
 			}],
 		};
-		assert!(demote_interrupted_reasoning(&mut thread));
+		assert!(demote_interrupted_reasoning(
+			&mut thread,
+			InterruptedReasoningDialect::Other,
+		));
 		let assistant = match thread.items[0].kind.as_ref().unwrap() {
 			thread::item::Kind::Message(message) => message,
 			_ => unreachable!(),
@@ -813,6 +833,40 @@ mod tests {
 				.fields
 				.contains_key("omp/hidden-continuity")
 		);
+	}
+	
+	#[test]
+	fn anthropic_dialect_drops_reasoning_without_hidden_continuity() {
+		let mut thread = Thread {
+			items: vec![Item {
+				kind: Some(thread::item::Kind::Message(thread::Message {
+					role:  i32::from(thread::Role::Assistant),
+					parts: vec![
+						thread::Part {
+							kind: Some(thread::part::Kind::Thinking(thread::Thinking {
+								text:      "private reasoning".to_owned(),
+								signature: vec![9].into(),
+								redacted:  false,
+							})),
+						},
+						thread::Part {
+							kind: Some(thread::part::Kind::Text("partial answer".to_owned())),
+						},
+					],
+				})),
+				..Item::default()
+			}],
+		};
+		assert!(demote_interrupted_reasoning(
+			&mut thread,
+			InterruptedReasoningDialect::Anthropic,
+		));
+		assert_eq!(thread.items.len(), 1);
+		let Some(thread::item::Kind::Message(message)) = thread.items[0].kind.as_ref() else {
+			panic!("assistant message remains");
+		};
+		assert_eq!(message.parts.len(), 1);
+		assert!(matches!(message.parts[0].kind, Some(thread::part::Kind::Text(_))));
 	}
 
 	#[test]

@@ -1,6 +1,6 @@
 //! Retained subagent run state and lifecycle events.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use omp_core::{AppendVec, Str};
 use parking_lot::Mutex;
@@ -264,6 +264,7 @@ pub struct SubagentRunState {
 	generation: AtomicU64,
 	sequence:   AtomicU64,
 	lifecycle:  AtomicU8,
+	yield_committed: AtomicBool,
 	progress:   Mutex<SubagentProgressSnapshot>,
 	terminal:   Mutex<Option<SubagentTerminalStatus>>,
 	events:     AppendVec<SubagentRunEvent>,
@@ -277,6 +278,7 @@ impl SubagentRunState {
 			generation: AtomicU64::new(0),
 			sequence: AtomicU64::new(0),
 			lifecycle: AtomicU8::new(SubagentLifecycle::Created as u8),
+			yield_committed: AtomicBool::new(false),
 			progress: Mutex::new(SubagentProgressSnapshot::default()),
 			terminal: Mutex::new(None),
 			events: AppendVec::new(),
@@ -309,6 +311,16 @@ impl SubagentRunState {
 	pub fn terminal(&self) -> Option<SubagentTerminalStatus> {
 		self.terminal.lock().clone()
 	}
+	
+	/// Records that this generation committed a terminal `yield` call.
+	pub fn commit_yield(&self) {
+		self.yield_committed.store(true, Ordering::Release);
+	}
+	
+	/// Whether this generation committed a terminal `yield` call.
+	pub fn yield_committed(&self) -> bool {
+		self.yield_committed.load(Ordering::Acquire)
+	}
 
 	/// Iterates all retained events in publication order.
 	pub fn events(&self) -> impl Iterator<Item = &SubagentRunEvent> {
@@ -328,6 +340,7 @@ impl SubagentRunState {
 		let activity = activity.bounded();
 		let mut progress = self.progress.lock();
 		progress.activity = activity.detail.clone();
+		let usage_receipt = matches!(activity.kind, Some(SubagentActivityKind::Usage));
 		match activity.kind {
 			Some(SubagentActivityKind::Request) => {
 				progress.requests = progress.requests.saturating_add(1);
@@ -337,9 +350,21 @@ impl SubagentRunState {
 			},
 			_ => {},
 		}
-		progress.input_tokens = progress.input_tokens.max(activity.input_tokens);
-		progress.output_tokens = progress.output_tokens.max(activity.output_tokens);
-		progress.cost_micros = progress.cost_micros.max(activity.cost_micros);
+		progress.input_tokens = if usage_receipt {
+			progress.input_tokens.saturating_add(activity.input_tokens)
+		} else {
+			progress.input_tokens.max(activity.input_tokens)
+		};
+		progress.output_tokens = if usage_receipt {
+			progress.output_tokens.saturating_add(activity.output_tokens)
+		} else {
+			progress.output_tokens.max(activity.output_tokens)
+		};
+		progress.cost_micros = if usage_receipt {
+			progress.cost_micros.saturating_add(activity.cost_micros)
+		} else {
+			progress.cost_micros.max(activity.cost_micros)
+		};
 		progress.context_tokens = progress.context_tokens.max(activity.context_tokens);
 		if activity.serving_model.is_some() {
 			progress.serving_model.clone_from(&activity.serving_model);
@@ -397,6 +422,7 @@ impl SubagentRunState {
 			.generation
 			.fetch_add(1, Ordering::AcqRel)
 			.wrapping_add(1);
+		self.yield_committed.store(false, Ordering::Release);
 		*self.progress.lock() = SubagentProgressSnapshot::default();
 		*self.terminal.lock() = None;
 		self
@@ -509,5 +535,22 @@ mod tests {
 			.unwrap();
 		assert!(state.progress().activity.len() <= MAX_PROGRESS_ACTIVITY_BYTES);
 		assert!(state.progress().truncated);
+	}
+	
+	#[test]
+	fn usage_receipts_accumulate_across_a_generation() {
+		let state = SubagentRunState::new(sf!("agent-usage"));
+		state.transition(SubagentLifecycle::Starting).unwrap();
+		state.transition(SubagentLifecycle::Running).unwrap();
+		for output_tokens in [1_234, 2_345] {
+			state
+				.record_activity(SubagentActivity {
+					kind: Some(SubagentActivityKind::Usage),
+					output_tokens,
+					..SubagentActivity::default()
+				})
+				.unwrap();
+		}
+		assert_eq!(state.progress().output_tokens, 3_579);
 	}
 }

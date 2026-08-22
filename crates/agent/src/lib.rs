@@ -91,12 +91,12 @@ pub use campaign::{
 };
 pub use compact::{
 	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionBoundary, CompactionCoordinator,
-	CompactionDecision, CompactionEvent, CompactionHysteresis, CompactionMethodOrder,
+	CompactionCancellation, CompactionDecision, CompactionEvent, CompactionHysteresis, CompactionMethodOrder,
 	CompactionReason, CompactionResolution, CompactionSpeculationOptions, CompactionTier,
 	CompactionVerdict, ContextUsage, ContextUsageBreakdown, CustomSummary, DelegateCompaction,
 	IDLE_PRUNE_AFTER, ItemUsage, LosslessPlan, LosslessReceipt, ManualCompactionDecision,
 	ManualCompactionError, ManualCompactionMode, ManualCompactionOutcome, ManualCompactionRequest,
-	ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionItem, RemoteCheckpoint,
+	ManualShakeMode, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionItem, RemoteCheckpoint,
 	SNAPCOMPACT_TIER, SPECULATION_LEAD_FRACTION, SPECULATION_LEAD_MAX_TOKENS,
 	SPECULATION_LEAD_MIN_TOKENS, SnapcompactOutcome, SnapcompactPreparation, SpeculationRequest,
 	SpeculationResult, SpeculationSnapshot, SpeculationState, SupersededCompaction,
@@ -106,7 +106,7 @@ pub use compact::{
 };
 pub use context::{
 	Anchor, ContextProjection, ContextSnapshot, ContextSnapshotError, ContextView, InheritPosition,
-	MessageKind, MessageRef, PatchOp, PatchOutcome, PatchRejected, RefFlags, apply_patches,
+	InterruptedReasoningDialect, MessageKind, MessageRef, PatchOp, PatchOutcome, PatchRejected, RefFlags, apply_patches,
 	demote_interrupted_reasoning, external_thinking_for_model, inject_first_turn_metadata,
 	project_context,
 };

@@ -1883,6 +1883,16 @@ fn render_delegation_policy(workspace: &WorkspaceInput, out: &mut String) {
 		return;
 	}
 	out.push_str("\n# Delegation\n");
+	out.push_str(
+		"- Agent typing: pick each task's most specific available agent. Omitting `agent` selects the \
+		 spawn-policy default. Omit it when that default is the best fit; otherwise pass the \
+		 specialist explicitly.\n- \
+		 Overlap: parallelize independent ownership. Same-file edits are not guaranteed to merge. \
+		 Name one integration owner and serialize only the irreducibly shared mutation boundary.\n",
+	);
+	if policy.coordination {
+		out.push_str("- Have siblings coordinate through `hub` before editing shared files.\n");
+	}
 	if workspace.model.codex_task_policy {
 		match policy.eager {
 			EagerTaskPolicy::Off => out.push_str(
@@ -2602,6 +2612,12 @@ mod tests {
 		assert!(system.contains("namespace functions"));
 		assert!(system.contains("type read = (_:"));
 		assert!(system.contains("# Delegation"));
+		assert!(system.contains("most specific available agent"));
+		assert!(system.contains("Omitting `agent` selects the spawn-policy default"));
+		assert!(system.contains("Same-file edits are not guaranteed to merge"));
+		assert!(system.contains("coordinate through `hub` before editing shared files"));
+		assert!(!system.contains("general-purpose worker"));
+		assert!(!system.contains("default worker"));
 		assert!(system.contains("docs/<path>"));
 		assert!(!system.contains("xd://"));
 		assert_eq!(item_text(&first[1]), COMPUTER_SAFETY_PROMPT);
