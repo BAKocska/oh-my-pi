@@ -160,15 +160,6 @@ pub struct DispositionSettled {
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum JournalFact {
-	/// Enable, disable, or clear session-local mode.
-	Control {
-		/// New control state.
-		mode:  ControlMode,
-		/// Current goal when enabling or disabling.
-		goal:  Option<Str>,
-		/// Millisecond timestamp.
-		at_ms: i64,
-	},
 	/// Create a new durable experiment session.
 	SessionOpened {
 		/// Stable SQLite projection id allocated by the journal owner.
@@ -247,23 +238,11 @@ pub enum JournalFact {
 	},
 }
 
-/// Slash-command control state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlMode {
-	/// Enable autoresearch.
-	On,
-	/// Disable autoresearch without deleting history.
-	Off,
-	/// Clear the active autoresearch session.
-	Clear,
-}
-
 /// Reconstructed session-local runtime state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeState {
-	/// Whether hidden continuation is enabled.
-	pub enabled:      bool,
+	/// Durable campaign engagement restored by the Agent journal.
+	pub engagement:   Option<Str>,
 	/// Current user goal.
 	pub goal:         Option<Str>,
 	/// Active session projection.

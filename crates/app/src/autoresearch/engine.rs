@@ -2,6 +2,10 @@
 
 use std::{error::Error as StdError, future::Future, time::Duration};
 
+use omp_agent::{
+	CampaignEntry, CampaignEntryStatus, ClaimOutcome, EngageReceipt,
+	control::{ControlError, ControlSender},
+};
 use omp_core::{Str, sf};
 use tokio_util::sync::CancellationToken;
 
@@ -10,8 +14,8 @@ use super::{
 	helpers::{infer_metric_unit, mad_confidence, parse_asi_lines, parse_metric_lines},
 	storage::{JournalAppender, RecordError, Storage, StorageError},
 	types::{
-		Asi, ControlMode, DashboardMode, DispositionIntent, DispositionSettled, ExperimentStatus,
-		JournalFact, MetricDirection, Metrics, RunCompletion, RunStart, RuntimeState, SessionConfig,
+		Asi, DashboardMode, DispositionIntent, DispositionSettled, ExperimentStatus, JournalFact,
+		MetricDirection, Metrics, RunCompletion, RunStart, RuntimeState, SessionConfig,
 	},
 };
 use crate::envd::vcs::git::mutation::{GitMutation, IsolationCommit};
@@ -20,6 +24,8 @@ use crate::envd::vcs::git::mutation::{GitMutation, IsolationCommit};
 pub const HARNESS: &str = "./autoresearch.sh";
 /// Pi's default per-run timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+const CAMPAIGN_ID: &str = "autoresearch";
 
 /// Streaming harness outcome supplied by Environment process authority.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,6 +42,52 @@ pub struct HarnessOutput {
 	pub benchmark_uri:   Str,
 	/// Exact artifact byte length.
 	pub benchmark_bytes: u64,
+}
+
+/// Campaign authority used by the autoresearch engine.
+///
+/// Production uses [`ControlSender`], keeping all slot arbitration and durable
+/// lifecycle transitions on the Agent's sole mutable owner.
+pub trait AutoresearchCampaigns: Send + Sync {
+	/// Returns active and queued durable campaign entries.
+	fn active_campaigns(
+		&self,
+	) -> impl Future<Output = Result<Vec<CampaignEntry>, ControlError>> + Send;
+
+	/// Engages the built-in autoresearch regime without queueing.
+	fn engage_autoresearch(
+		&self,
+	) -> impl Future<Output = Result<EngageReceipt, ControlError>> + Send;
+
+	/// Disengages a live autoresearch campaign after its transaction settles.
+	fn disengage_autoresearch(
+		&self,
+		engagement: Str,
+	) -> impl Future<Output = Result<bool, ControlError>> + Send;
+
+	/// Cuts a killed autoresearch campaign without applying dwell.
+	fn cut_autoresearch(
+		&self,
+		engagement: Str,
+	) -> impl Future<Output = Result<bool, ControlError>> + Send;
+}
+
+impl AutoresearchCampaigns for ControlSender {
+	async fn active_campaigns(&self) -> Result<Vec<CampaignEntry>, ControlError> {
+		ControlSender::active_campaigns(self).await
+	}
+
+	async fn engage_autoresearch(&self) -> Result<EngageReceipt, ControlError> {
+		self.engage_regime("autoresearch", false).await
+	}
+
+	async fn disengage_autoresearch(&self, engagement: Str) -> Result<bool, ControlError> {
+		self.disengage_campaign(engagement).await
+	}
+
+	async fn cut_autoresearch(&self, engagement: Str) -> Result<bool, ControlError> {
+		self.cut_campaign(engagement).await
+	}
 }
 
 /// Runtime operations delegated to production Environment and artifact owners.
@@ -144,6 +196,9 @@ pub enum EngineError<H: StdError + 'static, J: StdError + 'static> {
 	/// Isolation mutation or crash recovery failed.
 	#[error(transparent)]
 	Git(#[from] GitError<H>),
+	/// Campaign CONTROL or arbitration failed.
+	#[error("autoresearch campaign transition failed")]
+	Campaign(#[source] ControlError),
 	/// A tool was called without an active, branch-matching session.
 	#[error("no active autoresearch session for the current branch")]
 	Inactive,
@@ -165,18 +220,20 @@ pub enum EngineError<H: StdError + 'static, J: StdError + 'static> {
 }
 
 /// Journal-first autoresearch owner.
-pub struct Engine<'a, H, J> {
-	host:     &'a H,
-	journal:  &'a mut J,
-	storage:  &'a mut Storage,
-	mutation: Option<&'a GitMutation>,
-	runtime:  RuntimeState,
+pub struct Engine<'a, H, J, C = ControlSender> {
+	host:      &'a H,
+	journal:   &'a mut J,
+	storage:   &'a mut Storage,
+	mutation:  Option<&'a GitMutation>,
+	campaigns: &'a C,
+	runtime:   RuntimeState,
 }
 
-impl<'a, H, J> Engine<'a, H, J>
+impl<'a, H, J, C> Engine<'a, H, J, C>
 where
 	H: AutoresearchHost,
 	J: JournalAppender,
+	C: AutoresearchCampaigns,
 {
 	/// Creates one owner and reconstructs its query-backed runtime state.
 	pub fn new(
@@ -184,8 +241,9 @@ where
 		journal: &'a mut J,
 		storage: &'a mut Storage,
 		mutation: Option<&'a GitMutation>,
+		campaigns: &'a C,
 	) -> Self {
-		Self { host, journal, storage, mutation, runtime: RuntimeState::default() }
+		Self { host, journal, storage, mutation, campaigns, runtime: RuntimeState::default() }
 	}
 
 	/// Returns the reconstructed runtime state.
@@ -201,7 +259,8 @@ where
 		unisolated: bool,
 		cancel: &CancellationToken,
 	) -> Result<Str, EngineError<H::Error, J::Error>> {
-		let isolation = ensure_isolation(
+		let newly_engaged = self.ensure_campaign().await?;
+		let isolation = match ensure_isolation(
 			Some(self.host),
 			self.mutation,
 			goal.as_deref(),
@@ -209,10 +268,16 @@ where
 			unisolated,
 			cancel,
 		)
-		.await?;
-		let at_ms = self.host.now_ms();
-		self.record(&JournalFact::Control { mode: ControlMode::On, goal: goal.clone(), at_ms })?;
-		self.runtime.enabled = true;
+		.await
+		{
+			Ok(isolation) => isolation,
+			Err(error) => {
+				if newly_engaged {
+					let _ = self.release_campaign().await;
+				}
+				return Err(error.into());
+			},
+		};
 		self.runtime.goal = goal.clone();
 		self.runtime.resume_armed = true;
 		Ok(Str::from(format!(
@@ -243,12 +308,18 @@ where
 		params: InitExperiment,
 		cancel: &CancellationToken,
 	) -> Result<i64, EngineError<H::Error, J::Error>> {
-		self
+		let newly_engaged = self.ensure_campaign().await?;
+		if let Err(error) = self
 			.host
 			.validate_harness(params.primary_metric.as_str(), cancel)
 			.await
-			.map_err(EngineError::Host)?;
-		let isolation = ensure_isolation(
+		{
+			if newly_engaged {
+				let _ = self.release_campaign().await;
+			}
+			return Err(EngineError::Host(error));
+		}
+		let isolation = match ensure_isolation(
 			Some(self.host),
 			self.mutation,
 			params.goal.as_deref(),
@@ -256,7 +327,16 @@ where
 			params.unisolated,
 			cancel,
 		)
-		.await?;
+		.await
+		{
+			Ok(isolation) => isolation,
+			Err(error) => {
+				if newly_engaged {
+					let _ = self.release_campaign().await;
+				}
+				return Err(error.into());
+			},
+		};
 
 		let branch = isolation.branch.clone();
 		let existing = self.storage.active_session(branch.as_deref())?;
@@ -343,12 +423,6 @@ where
 			JournalFact::SessionOpened { id, config: config.clone(), at_ms }
 		};
 		self.record(&fact)?;
-		self.record(&JournalFact::Control {
-			mode: ControlMode::On,
-			goal: config.goal.clone(),
-			at_ms,
-		})?;
-		self.runtime.enabled = true;
 		self.runtime.goal = config.goal.clone();
 		self.runtime.session = Some(config);
 		self.runtime.resume_armed = true;
@@ -491,7 +565,7 @@ where
 				.segment_run_count(session.id, session.config.segment)?
 				>= limit
 		{
-			self.disable()?;
+			self.disable().await?;
 		}
 		Ok(settled)
 	}
@@ -508,14 +582,23 @@ where
 		self.record(&JournalFact::NotesUpdated { id, notes, at_ms: self.host.now_ms() })
 	}
 
-	/// Disables hidden continuation while retaining experiment history.
-	pub fn disable(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
-		self.record(&JournalFact::Control {
-			mode:  ControlMode::Off,
-			goal:  self.runtime.goal.clone(),
-			at_ms: self.host.now_ms(),
-		})?;
-		self.runtime.enabled = false;
+	/// Disengages autoresearch while retaining experiment history.
+	pub async fn disable(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
+		self.release_campaign().await?;
+		self.runtime.resume_armed = false;
+		Ok(())
+	}
+
+	/// Cuts a killed loop immediately while retaining experiment history.
+	pub async fn kill(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
+		if let Some(engagement) = self.runtime.engagement.clone() {
+			self
+				.campaigns
+				.cut_autoresearch(engagement)
+				.await
+				.map_err(EngineError::Campaign)?;
+		}
+		self.runtime.engagement = None;
 		self.runtime.resume_armed = false;
 		Ok(())
 	}
@@ -544,11 +627,7 @@ where
 				at_ms: self.host.now_ms(),
 			})?;
 		}
-		self.record(&JournalFact::Control {
-			mode:  ControlMode::Clear,
-			goal:  None,
-			at_ms: self.host.now_ms(),
-		})?;
+		self.release_campaign().await?;
 		self.runtime = RuntimeState::default();
 		Ok(())
 	}
@@ -564,10 +643,9 @@ where
 			.current_branch(cancel)
 			.await
 			.map_err(EngineError::Host)?;
-		if let Some(control) = self.storage.control()? {
-			self.runtime.enabled = control.mode == ControlMode::On;
-			self.runtime.goal = control.goal;
-			self.runtime.resume_armed = self.runtime.enabled;
+		self.restore_campaign().await?;
+		if self.runtime.engagement.is_none() {
+			return Ok(());
 		}
 		if let Some(intent) = self.storage.pending_disposition(branch.as_deref())? {
 			let commit = self.execute_intent(&intent, true, cancel).await?;
@@ -606,14 +684,14 @@ where
 			self.runtime.pending_run = self.storage.pending_run(session.id)?.map(|run| run.id);
 			self.runtime.goal = session.config.goal.clone();
 			self.runtime.session = Some(session.config);
-			self.runtime.resume_armed = self.runtime.enabled;
+			self.runtime.resume_armed = self.runtime.engagement.is_some();
 		}
 		Ok(())
 	}
 
 	/// Hidden continuation prompt admitted only after the parent settles.
 	pub fn continuation_prompt(&mut self, parent_settled: bool) -> Option<Str> {
-		if !parent_settled || !self.runtime.enabled || !self.runtime.resume_armed {
+		if !parent_settled || self.runtime.engagement.is_none() || !self.runtime.resume_armed {
 			return None;
 		}
 		self.runtime.resume_armed = false;
@@ -674,11 +752,47 @@ where
 		Ok(None)
 	}
 
+	async fn ensure_campaign(&mut self) -> Result<bool, EngineError<H::Error, J::Error>> {
+		if self.runtime.engagement.is_some() {
+			return Ok(false);
+		}
+		let (engagement, newly_engaged) = acquire_campaign(self.campaigns)
+			.await
+			.map_err(EngineError::Campaign)?;
+		self.runtime.engagement = Some(engagement);
+		Ok(newly_engaged)
+	}
+
+	async fn restore_campaign(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
+		self.runtime.engagement = revived_engagement(
+			self
+				.campaigns
+				.active_campaigns()
+				.await
+				.map_err(EngineError::Campaign)?,
+		);
+		self.runtime.resume_armed = self.runtime.engagement.is_some();
+		Ok(())
+	}
+
+	async fn release_campaign(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
+		let Some(engagement) = self.runtime.engagement.clone() else {
+			return Ok(());
+		};
+		self
+			.campaigns
+			.disengage_autoresearch(engagement)
+			.await
+			.map_err(EngineError::Campaign)?;
+		self.runtime.engagement = None;
+		Ok(())
+	}
+
 	async fn branch_gated_session(
 		&self,
 		cancel: &CancellationToken,
 	) -> Result<super::storage::ProjectedSession, EngineError<H::Error, J::Error>> {
-		if !self.runtime.enabled {
+		if self.runtime.engagement.is_none() {
 			return Err(EngineError::Inactive);
 		}
 		let branch = self
@@ -698,6 +812,30 @@ where
 	}
 }
 
+async fn acquire_campaign(
+	campaigns: &impl AutoresearchCampaigns,
+) -> Result<(Str, bool), ControlError> {
+	if let Some(engagement) = revived_engagement(campaigns.active_campaigns().await?) {
+		return Ok((engagement, false));
+	}
+	let receipt = campaigns.engage_autoresearch().await?;
+	debug_assert_eq!(
+		receipt.outcome,
+		ClaimOutcome::Granted,
+		"non-queued engagement either grants or returns a typed claim error"
+	);
+	Ok((receipt.engagement, true))
+}
+
+fn revived_engagement(entries: Vec<CampaignEntry>) -> Option<Str> {
+	entries
+		.into_iter()
+		.find(|entry| {
+			entry.spec_id.as_str() == CAMPAIGN_ID && entry.status == CampaignEntryStatus::Engaged
+		})
+		.map(|entry| entry.engagement)
+}
+
 fn dedupe(values: Vec<Str>) -> Vec<Str> {
 	let mut output = Vec::new();
 	for value in values {
@@ -708,4 +846,85 @@ fn dedupe(values: Vec<Str>) -> Vec<Str> {
 		output.push(Str::from(value));
 	}
 	output
+}
+
+#[cfg(test)]
+mod tests {
+	use parking_lot::Mutex;
+
+	use super::*;
+
+	struct CampaignHarness {
+		stack:  Mutex<omp_agent::CampaignStack>,
+		now_ms: u64,
+	}
+
+	impl CampaignHarness {
+		fn new(now_ms: u64) -> Self {
+			Self { stack: Mutex::new(omp_agent::CampaignStack::new()), now_ms }
+		}
+
+		fn engage(&self, spec_id: &str) -> Result<EngageReceipt, omp_agent::EngageError> {
+			let (spec, machine) = omp_agent::core_regime(spec_id).expect("core regime");
+			self
+				.stack
+				.lock()
+				.engage(spec, machine, omp_agent::EngageOptions { now_ms: self.now_ms, queue: false })
+		}
+	}
+
+	impl AutoresearchCampaigns for CampaignHarness {
+		async fn active_campaigns(&self) -> Result<Vec<CampaignEntry>, ControlError> {
+			Ok(self.stack.lock().entries())
+		}
+
+		async fn engage_autoresearch(&self) -> Result<EngageReceipt, ControlError> {
+			self.engage(CAMPAIGN_ID).map_err(ControlError::from)
+		}
+
+		async fn disengage_autoresearch(&self, engagement: Str) -> Result<bool, ControlError> {
+			self
+				.stack
+				.lock()
+				.disengage(engagement.as_str(), self.now_ms)
+				.map_err(ControlError::from)
+		}
+
+		async fn cut_autoresearch(&self, engagement: Str) -> Result<bool, ControlError> {
+			Ok(self.stack.lock().cut(engagement.as_str()))
+		}
+	}
+
+	#[tokio::test]
+	async fn autoresearch_denial_preserves_plan_holder_facts() {
+		let campaigns = CampaignHarness::new(41);
+		let plan = campaigns.engage("plan").expect("plan engagement");
+
+		let error = acquire_campaign(&campaigns)
+			.await
+			.expect_err("plan claims mode and worktree");
+
+		assert!(matches!(
+			error,
+			ControlError::CampaignEngage(omp_agent::EngageError::Claim {
+				outcome: ClaimOutcome::Denied { holder, since: 41 },
+				..
+			}) if holder == plan.engagement
+		));
+	}
+
+	#[tokio::test]
+	async fn autoresearch_revival_reuses_durable_engagement() {
+		let campaigns = CampaignHarness::new(73);
+		let first = acquire_campaign(&campaigns)
+			.await
+			.expect("initial engagement");
+		assert!(first.1);
+
+		let revived = acquire_campaign(&campaigns)
+			.await
+			.expect("revived engagement");
+		assert_eq!(revived, (first.0, false));
+		assert_eq!(campaigns.active_campaigns().await.expect("entries").len(), 1);
+	}
 }

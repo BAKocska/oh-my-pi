@@ -18,9 +18,7 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use super::{
 	helpers::Measurement,
-	types::{
-		ControlMode, DispositionIntent, ExperimentStatus, JournalFact, RunCompletion, SessionConfig,
-	},
+	types::{DispositionIntent, ExperimentStatus, JournalFact, RunCompletion, SessionConfig},
 };
 
 const SCHEMA_VERSION: i64 = 1;
@@ -33,12 +31,6 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS projection_entries (
 	journal_seq INTEGER PRIMARY KEY,
 	kind TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS control_state (
-	singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-	mode TEXT NOT NULL,
-	goal TEXT,
-	at_ms INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
 	id INTEGER PRIMARY KEY,
@@ -270,7 +262,7 @@ impl Storage {
 		let tx = self.connection.transaction()?;
 		tx.execute_batch(
 			"DELETE FROM artifacts; DELETE FROM runs; DELETE FROM sessions; DELETE FROM \
-			 control_state; DELETE FROM projection_entries;",
+			 projection_entries;",
 		)?;
 		tx.commit()?;
 		for (sequence, fact) in facts {
@@ -299,24 +291,6 @@ impl Storage {
 			.optional()?;
 		row.map(|(id, json)| Ok(ProjectedSession { id, config: serde_json::from_str(&json)? }))
 			.transpose()
-	}
-
-	/// Returns the latest journal-projected slash control state.
-	pub fn control(&self) -> Result<Option<ProjectedControl>, StorageError> {
-		let row = self
-			.connection
-			.query_row("SELECT mode,goal FROM control_state WHERE singleton=1", [], |row| {
-				Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-			})
-			.optional()?;
-		Ok(row.map(|(mode, goal)| ProjectedControl {
-			mode: match mode.as_str() {
-				"on" => ControlMode::On,
-				"off" => ControlMode::Off,
-				_ => ControlMode::Clear,
-			},
-			goal: goal.map(Str::from),
-		}))
 	}
 
 	/// Returns the newest unsettled disposition on the current branch.
@@ -490,15 +464,6 @@ pub struct ProjectedSession {
 	/// Complete session configuration.
 	pub config: SessionConfig,
 }
-/// Latest session-local autoresearch mode projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProjectedControl {
-	/// Latest control operation.
-	pub mode: ControlMode,
-	/// Goal carried by the operation.
-	pub goal: Option<Str>,
-}
-
 fn encode_project_key(path: &OsStr) -> String {
 	let text = path.to_string_lossy();
 	let text = text.trim_start_matches(['/', '\\']);
@@ -517,7 +482,6 @@ fn encode_project_key(path: &OsStr) -> String {
 
 fn fact_kind(fact: &JournalFact) -> &'static str {
 	match fact {
-		JournalFact::Control { .. } => "control",
 		JournalFact::SessionOpened { .. } => "session_opened",
 		JournalFact::SessionUpdated { .. } => "session_updated",
 		JournalFact::SessionClosed { .. } => "session_closed",
@@ -534,14 +498,6 @@ fn fact_kind(fact: &JournalFact) -> &'static str {
 
 fn project_fact(tx: &Transaction<'_>, fact: &JournalFact) -> Result<(), StorageError> {
 	match fact {
-		JournalFact::Control { mode, goal, at_ms } => {
-			tx.execute(
-				"INSERT INTO control_state(singleton,mode,goal,at_ms) VALUES(1,?1,?2,?3) ON \
-				 CONFLICT(singleton) DO UPDATE SET \
-				 mode=excluded.mode,goal=excluded.goal,at_ms=excluded.at_ms",
-				params![control_mode(*mode), goal.as_deref(), at_ms],
-			)?;
-		},
 		JournalFact::SessionOpened { id, config, at_ms } => {
 			upsert_session(tx, *id, config, *at_ms, true)?
 		},
@@ -716,14 +672,6 @@ fn status(status: super::types::ExperimentStatus) -> &'static str {
 		super::types::ExperimentStatus::Discard => "discard",
 		super::types::ExperimentStatus::Crash => "crash",
 		super::types::ExperimentStatus::ChecksFailed => "checks_failed",
-	}
-}
-
-fn control_mode(mode: ControlMode) -> &'static str {
-	match mode {
-		ControlMode::On => "on",
-		ControlMode::Off => "off",
-		ControlMode::Clear => "clear",
 	}
 }
 
