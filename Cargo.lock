@@ -6597,6 +6597,7 @@ dependencies = [
  "omp-telemetry",
  "omp-tool",
  "parking_lot",
+ "proptest",
  "regex",
  "schemars",
  "serde",
