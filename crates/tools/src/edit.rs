@@ -287,49 +287,55 @@ impl EditSnapshotStore for NoSnapshotStore {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SectionPayload {
 	/// Authored source path.
-	pub path:               Str,
+	pub path:                 Str,
 	/// Canonical source path used for duplicate and snapshot checks.
-	pub canonical_path:     Str,
+	pub canonical_path:       Str,
 	/// Operation performed by this section.
-	pub op:                 SectionOp,
+	pub op:                   SectionOp,
 	/// Move destination when `op` is [`SectionOp::Move`].
-	pub move_dest:          Option<Str>,
+	pub move_dest:            Option<Str>,
 	/// Pinned document base revision.
-	pub old_revision:       Str,
+	pub old_revision:         Str,
 	/// Committed target revision, absent after deletion.
-	pub new_revision:       Option<Str>,
+	pub new_revision:         Option<Str>,
 	/// Sequence of applied operations.
-	pub applied_ops:        Vec<AppliedOp>,
+	pub applied_ops:          Vec<AppliedOp>,
 	/// Concrete edits sufficient to lift this outcome into another dialect.
 	#[serde(default)]
-	pub resolved_edits:     Vec<ResolvedEdit>,
+	pub resolved_edits:       Vec<ResolvedEdit>,
 	/// Whether the document host rebased the committed transition.
-	pub rebased:            bool,
+	pub rebased:              bool,
 	/// Exact pre-edit bytes when retained inline.
-	pub before:             Bytes,
+	pub before:               Bytes,
 	/// Blob identity of exact pre-edit bytes when the inline budget was
 	/// exceeded.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub before_blob:        Option<omp_tool::BlobRef>,
+	pub before_blob:          Option<omp_tool::BlobRef>,
 	/// Exact post-edit bytes when retained inline, empty after deletion or
 	/// spill.
-	pub after:              Bytes,
+	pub after:                Bytes,
 	/// Blob identity of exact post-edit bytes when the inline budget was
 	/// exceeded.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub after_blob:         Option<omp_tool::BlobRef>,
+	pub after_blob:           Option<omp_tool::BlobRef>,
 	/// Hashline header for the resulting file, absent after deletion.
-	pub header:             Option<Str>,
+	pub header:               Option<Str>,
 	/// Complete numbered diff.
-	pub diff:               Str,
+	pub diff:                 Str,
 	/// Compact current-file preview.
-	pub preview:            Str,
+	pub preview:              Str,
 	/// First changed source line when known.
-	pub first_changed_line: Option<usize>,
+	pub first_changed_line:   Option<usize>,
 	/// Syntax-aware block resolutions.
-	pub block_resolutions:  Vec<ResolvedBlock>,
+	pub block_resolutions:    Vec<ResolvedBlock>,
 	/// Parser and application warnings in authored order.
-	pub warnings:           Vec<Str>,
+	pub warnings:             Vec<Str>,
+	/// Revision-bound LSP diagnostics for this committed section.
+	#[serde(default)]
+	pub diagnostics:          Vec<EditDiagnostic>,
+	/// Whether the diagnostic batch reached quiescence inline.
+	#[serde(default)]
+	pub diagnostics_complete: bool,
 }
 
 /// Durable successful multi-file transaction truth.
@@ -378,6 +384,8 @@ pub struct PrepareRequest {
 	/// Whether this dialect may operate against the current document without a
 	/// displayed snapshot tag.
 	pub allow_unpinned: bool,
+	/// Whether a missing final path may be leased for a create operation.
+	pub allow_missing:  bool,
 }
 
 /// Borrowed view exposed by an opaque, revision-pinned prepared lease.
@@ -392,6 +400,10 @@ pub trait EditPrepared: Send + Sync {
 	fn base_revision(&self) -> &Str;
 	/// Exact bytes at the pinned live revision.
 	fn base_bytes(&self) -> &Bytes;
+	/// Whether the pinned base revision names a present document.
+	fn exists(&self) -> bool {
+		true
+	}
 	/// Non-fatal preparation diagnostics such as tag-based path recovery.
 	fn warnings(&self) -> &[Str] {
 		&[]
@@ -433,15 +445,48 @@ pub struct EditProposal {
 	pub format_policy: FormatPolicy,
 }
 
+/// Severity of one revision-bound LSP diagnostic.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditDiagnosticSeverity {
+	/// Error diagnostic.
+	Error,
+	/// Warning diagnostic.
+	Warning,
+	/// Informational diagnostic.
+	Information,
+	/// Hint diagnostic.
+	Hint,
+}
+
+/// One LSP diagnostic proven to belong to the committed document revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EditDiagnostic {
+	/// Committed byte range when the LSP position could be converted.
+	pub range:    Option<std::ops::Range<u64>>,
+	/// Diagnostic severity.
+	pub severity: EditDiagnosticSeverity,
+	/// Optional provider code.
+	pub code:     Str,
+	/// LSP source name.
+	pub source:   Str,
+	/// Human-readable diagnostic.
+	pub message:  Str,
+}
+
 /// Resource-owned commit result for one authored section.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedSection {
 	/// Committed target revision, absent after deletion.
-	pub new_revision: Option<Str>,
+	pub new_revision:         Option<Str>,
 	/// Whether the resource rebased this section.
-	pub rebased:      bool,
+	pub rebased:              bool,
 	/// Exact committed view bytes after formatting, absent after deletion.
-	pub content:      Option<Bytes>,
+	pub content:              Option<Bytes>,
+	/// Revision-bound LSP diagnostics collected during the commit window.
+	pub diagnostics:          Vec<EditDiagnostic>,
+	/// Whether the LSP stream reached quiescence inside the inline deadline.
+	pub diagnostics_complete: bool,
 }
 
 /// Structured successful response from the atomic transaction owner.
@@ -634,256 +679,257 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
 		stream! {
-			let Params { input } = match params.whole::<Params>().await {
-				Ok(params) => params,
-				Err(error) => { yield param_event(error); return; },
-			};
-
-			if input.trim().is_empty() {
-				yield done_fault(Fault::invalid("No hashline sections found in input."));
-				return;
-			}
-
-			let patch = match Patch::parse_default(&input) {
-				Ok(patch) if !patch.sections.is_empty() => patch,
-				Ok(_) => {
-					yield done_fault(Fault::invalid("No hashline sections found in input."));
-					return;
-				},
-				Err(error) => {
-					yield Ev::Args(ArgIssue {
-						path: vec![ArgPath::Key(sf!("input"))],
-						expected: sf!("complete hashline input beginning with [PATH#TAG]"),
-						kind: ArgIssueKind::Malformed,
-						example: Some(sf!("[src/a.rs#1A2B]\nPUT 1.=1:\n+replacement")),
-						found: Some(error.to_string().into()),
-					});
-					return;
-				},
-			};
-
-			let mut parsed_sections = Vec::with_capacity(patch.sections.len());
-			for mut section in patch.sections {
-				let normalized = normalize_target(&section.path, None, HostPaths::current());
-				let mut canonical_recovery = normalized.recovery_notice();
-				section.path = normalized.canonical;
-				let mut parsed = match section.parse() {
-					Ok(parsed) => parsed,
-					Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
-				};
-				if let Some(FileOp::Move { dest }) = &mut parsed.file_op {
-					let normalized = normalize_target(dest, None, HostPaths::current());
-					if let Some(notice) = normalized.recovery_notice() {
-						canonical_recovery = Some(match canonical_recovery {
-							Some(existing) => sf!("{existing}\n{notice}"),
-							None => notice,
-						});
-					}
-					*dest = normalized.canonical;
-				}
-				let anchors = match section.collect_anchor_lines() {
-					Ok(anchors) => anchors,
-					Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
-				};
-				let request = PrepareRequest {
-					path: section.path.clone(),
-					file_hash: section.file_hash.clone(),
-					anchor_lines: anchors,
-					allow_unpinned: false,
-				};
-				let prepared = match self.documents.prepare(request).await {
-					Ok(prepared) => prepared,
-					Err(fault) => { yield done_fault(fault); return; },
-				};
-				if let Some(previous) = parsed_sections.iter().find(|entry: &&PreparedWork<D::Prepared>| entry.prepared.path() == prepared.path()) {
-					yield done_fault(Fault::invalid(format!(
-						"Multiple hashline sections resolve to the same file ({} and {}). Merge their ops under one header before applying.",
-						previous.section_path, section.path
-					)));
-					return;
-				}
-				parsed_sections.push(PreparedWork {
-					section_path: prepared.display_path().clone(),
-					file_hash: section.file_hash,
-					parsed,
-					prepared,
-					canonical_recovery,
-				});
-			}
-
-			let mut clipboard = self.documents.start_clipboard_batch();
-			let mut proposals = Vec::with_capacity(parsed_sections.len());
-			let mut projections = Vec::with_capacity(parsed_sections.len());
-			for work in &parsed_sections {
-				let applied = match apply_parsed_patch(
-					work.prepared.authored_bytes().clone(), &work.parsed, &mut clipboard,
-					ApplyOptions { mode: ApplyMode::Strict, path: Some(work.prepared.path()) },
-				) {
-					Ok(applied) => applied,
-					Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
-				};
-
-				let after = if work.prepared.authored_bytes() == work.prepared.base_bytes() {
-					applied.bytes.clone()
-				} else if applied.edits.is_empty() {
-					let message = stale_message(work, true);
-					yield done_fault(Fault::stale(message));
-					return;
-				} else {
-					let recovery_edits = match recovery_edits(&applied.edits) {
-						Ok(edits) => edits,
-						Err(fault) => { yield done_fault(fault); return; },
+					let Params { input } = match params.whole::<Params>().await {
+						Ok(params) => params,
+						Err(error) => { yield param_event(error); return; },
 					};
-					if let Ok(recovered) = recover_exact(work.prepared.authored_bytes(), work.prepared.base_bytes(), &recovery_edits) { recovered.content().clone() } else {
-								  yield done_fault(Fault::stale(stale_message(work, true)));
-								  return;
-							  }
-				};
 
-				let action = match &work.parsed.file_op {
-					Some(FileOp::Rem) => EditAction::Delete,
-					Some(FileOp::Move { dest }) => EditAction::Move {
-						destination: dest.clone(), content: after.clone(),
-					},
-					None => EditAction::Write { content: after.clone() },
-				};
-				proposals.push(EditProposal {
-					action, base_revision: work.prepared.base_revision().clone(),
-					stale_policy: StalePolicy::RebaseNonOverlapping, format_policy: self.format_policy,
-				});
-				projections.push(ProjectionWork {
-					after,
-					applied_ops: op_details(&work.parsed.edits),
-					first_changed_line: applied.first_changed_line,
-					block_resolutions: applied.block_resolutions.into_iter().map(|resolution| ResolvedBlock {
-						anchor_line: resolution.anchor_line, start: resolution.start, end: resolution.end,
-						operation: Str::new_static(resolution.mode.into()),
-					}).collect(),
-					warnings: work.canonical_recovery.iter().cloned()
-						.chain(work.prepared.warnings().iter().cloned())
-						.chain(work.parsed.diagnostics.iter().map(|warning| warning.message.clone()))
-						.chain(applied.warnings.iter().map(|warning| Str::from(warning.to_string()))).collect(),
-				});
-			}
+					if input.trim().is_empty() {
+						yield done_fault(Fault::invalid("No hashline sections found in input."));
+						return;
+					}
 
-			let mut preview = String::new();
-			let mut added_lines = 0;
-			let mut removed_lines = 0;
-			for (work, projection) in parsed_sections.iter().zip(&projections) {
-				let Ok(diff) = numbered_diff(
-					work.prepared.base_bytes(),
-					&projection.after,
-					Some(std::path::Path::new(work.section_path.as_str())),
-				) else {
-					continue;
-				};
-				let compact =
-					build_compact_diff_preview(diff.text.as_str(), CompactDiffOptions::default());
-				if !preview.is_empty() && !compact.preview.is_empty() {
-					preview.push('\n');
-				}
-				preview.push_str(compact.preview.as_str());
-				added_lines += compact.added_lines;
-				removed_lines += compact.removed_lines;
-			}
-			yield Ev::Update(EditUpdate {
-				applied_ops: projections.iter().map(|projection| projection.applied_ops.len()).sum(),
-				preview: preview.into(),
-				added_lines,
-				removed_lines,
-			});
-
-			match params.committed().await {
-				Ok(_) => {},
-				Err(error) => { yield commit_event(error); return; },
-			}
-
-			let noop_index = parsed_sections.iter().zip(&projections).position(|(work, projection)| {
-				work.parsed.file_op.is_none() && work.prepared.base_bytes() == &projection.after
-			});
-			if parsed_sections.len() == 1 && noop_index.is_some() {
-				let work = &parsed_sections[0];
-				let noop = self.documents.record_noop(
-					work.prepared.path(), &work.section_path,
-					Bytes::copy_from_slice(input.as_bytes()),
-				);
-				if noop.escalate {
-					yield done_fault(Fault::invalid(noop.diagnostic));
-				} else {
-					let payload = match build_payload(
-						&self.snapshots,
-						&parsed_sections,
-						&projections,
-						None,
-					).await {
-						Ok(payload) => payload,
-						Err(fault) => {
-							yield Ev::Aborted(Abort::EffectsUnknown {
-								reason: snapshot_fault_reason(fault),
+					let patch = match Patch::parse_default(&input) {
+						Ok(patch) if !patch.sections.is_empty() => patch,
+						Ok(_) => {
+							yield done_fault(Fault::invalid("No hashline sections found in input."));
+							return;
+						},
+						Err(error) => {
+							yield Ev::Args(ArgIssue {
+								path: vec![ArgPath::Key(sf!("input"))],
+								expected: sf!("complete hashline input beginning with [PATH#TAG]"),
+								kind: ArgIssueKind::Malformed,
+								example: Some(sf!("[src/a.rs#1A2B]\nPUT 1.=1:\n+replacement")),
+								found: Some(error.to_string().into()),
 							});
 							return;
 						},
 					};
-					yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: true });
-				}
-				return;
-			}
-			if let Some(index) = noop_index {
-				let work = &parsed_sections[index];
-				let noop = self.documents.record_noop(
-					work.prepared.path(), &work.section_path,
-					Bytes::copy_from_slice(input.as_bytes()),
-				);
-				yield done_fault(Fault::invalid(noop.diagnostic));
-				return;
-			}
 
-			let result = {
-				let prepared =
-					parsed_sections.iter_mut().map(|work| &mut work.prepared).collect();
-				let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
-				let interrupt = params.next_interrupt().fuse();
-				pin_mut!(commit, interrupt);
-				let result = select_biased! {
-					result = commit => Some(result),
-					interrupted = interrupt => {
-						yield Ev::Aborted(match interrupted {
-							Ok(value) => Abort::EffectsUnknown { reason: value.reason },
-							Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
-							Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
+					let mut parsed_sections = Vec::with_capacity(patch.sections.len());
+					for mut section in patch.sections {
+						let normalized = normalize_target(&section.path, None, HostPaths::current());
+						let mut canonical_recovery = normalized.recovery_notice();
+						section.path = normalized.canonical;
+						let mut parsed = match section.parse() {
+							Ok(parsed) => parsed,
+							Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+						};
+						if let Some(FileOp::Move { dest }) = &mut parsed.file_op {
+							let normalized = normalize_target(dest, None, HostPaths::current());
+							if let Some(notice) = normalized.recovery_notice() {
+								canonical_recovery = Some(match canonical_recovery {
+									Some(existing) => sf!("{existing}\n{notice}"),
+									None => notice,
+								});
+							}
+							*dest = normalized.canonical;
+						}
+						let anchors = match section.collect_anchor_lines() {
+							Ok(anchors) => anchors,
+							Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+						};
+						let request = PrepareRequest {
+							path: section.path.clone(),
+							file_hash: section.file_hash.clone(),
+							anchor_lines: anchors,
+							allow_unpinned: false,
+											allow_missing: false,
+		};
+						let prepared = match self.documents.prepare(request).await {
+							Ok(prepared) => prepared,
+							Err(fault) => { yield done_fault(fault); return; },
+						};
+						if let Some(previous) = parsed_sections.iter().find(|entry: &&PreparedWork<D::Prepared>| entry.prepared.path() == prepared.path()) {
+							yield done_fault(Fault::invalid(format!(
+								"Multiple hashline sections resolve to the same file ({} and {}). Merge their ops under one header before applying.",
+								previous.section_path, section.path
+							)));
+							return;
+						}
+						parsed_sections.push(PreparedWork {
+							section_path: prepared.display_path().clone(),
+							file_hash: section.file_hash,
+							parsed,
+							prepared,
+							canonical_recovery,
 						});
-						None
-					},
-				};
-				result
-			};
-			let Some(result) = result else { return; };
-			match result {
-				Ok(result) if result.sections.len() == parsed_sections.len() => {
+					}
+
+					let mut clipboard = self.documents.start_clipboard_batch();
+					let mut proposals = Vec::with_capacity(parsed_sections.len());
+					let mut projections = Vec::with_capacity(parsed_sections.len());
 					for work in &parsed_sections {
-						self.documents.reset_noop(work.prepared.path());
-					}
-					let payload = match build_payload(
-						&self.snapshots,
-						&parsed_sections,
-						&projections,
-						Some(&result.sections),
-					).await {
-						Ok(payload) => payload,
-						Err(fault) => {
-							yield Ev::Aborted(Abort::EffectsUnknown {
-								reason: snapshot_fault_reason(fault),
-							});
+						let applied = match apply_parsed_patch(
+							work.prepared.authored_bytes().clone(), &work.parsed, &mut clipboard,
+							ApplyOptions { mode: ApplyMode::Strict, path: Some(work.prepared.path()) },
+						) {
+							Ok(applied) => applied,
+							Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+						};
+
+						let after = if work.prepared.authored_bytes() == work.prepared.base_bytes() {
+							applied.bytes.clone()
+						} else if applied.edits.is_empty() {
+							let message = stale_message(work, true);
+							yield done_fault(Fault::stale(message));
 							return;
-						},
+						} else {
+							let recovery_edits = match recovery_edits(&applied.edits) {
+								Ok(edits) => edits,
+								Err(fault) => { yield done_fault(fault); return; },
+							};
+							if let Ok(recovered) = recover_exact(work.prepared.authored_bytes(), work.prepared.base_bytes(), &recovery_edits) { recovered.content().clone() } else {
+										  yield done_fault(Fault::stale(stale_message(work, true)));
+										  return;
+									  }
+						};
+
+						let action = match &work.parsed.file_op {
+							Some(FileOp::Rem) => EditAction::Delete,
+							Some(FileOp::Move { dest }) => EditAction::Move {
+								destination: dest.clone(), content: after.clone(),
+							},
+							None => EditAction::Write { content: after.clone() },
+						};
+						proposals.push(EditProposal {
+							action, base_revision: work.prepared.base_revision().clone(),
+							stale_policy: StalePolicy::RebaseNonOverlapping, format_policy: self.format_policy,
+						});
+						projections.push(ProjectionWork {
+							after,
+							applied_ops: op_details(&work.parsed.edits),
+							first_changed_line: applied.first_changed_line,
+							block_resolutions: applied.block_resolutions.into_iter().map(|resolution| ResolvedBlock {
+								anchor_line: resolution.anchor_line, start: resolution.start, end: resolution.end,
+								operation: Str::new_static(resolution.mode.into()),
+							}).collect(),
+							warnings: work.canonical_recovery.iter().cloned()
+								.chain(work.prepared.warnings().iter().cloned())
+								.chain(work.parsed.diagnostics.iter().map(|warning| warning.message.clone()))
+								.chain(applied.warnings.iter().map(|warning| Str::from(warning.to_string()))).collect(),
+						});
+					}
+
+					let mut preview = String::new();
+					let mut added_lines = 0;
+					let mut removed_lines = 0;
+					for (work, projection) in parsed_sections.iter().zip(&projections) {
+						let Ok(diff) = numbered_diff(
+							work.prepared.base_bytes(),
+							&projection.after,
+							Some(std::path::Path::new(work.section_path.as_str())),
+						) else {
+							continue;
+						};
+						let compact =
+							build_compact_diff_preview(diff.text.as_str(), CompactDiffOptions::default());
+						if !preview.is_empty() && !compact.preview.is_empty() {
+							preview.push('\n');
+						}
+						preview.push_str(compact.preview.as_str());
+						added_lines += compact.added_lines;
+						removed_lines += compact.removed_lines;
+					}
+					yield Ev::Update(EditUpdate {
+						applied_ops: projections.iter().map(|projection| projection.applied_ops.len()).sum(),
+						preview: preview.into(),
+						added_lines,
+						removed_lines,
+					});
+
+					match params.committed().await {
+						Ok(_) => {},
+						Err(error) => { yield commit_event(error); return; },
+					}
+
+					let noop_index = parsed_sections.iter().zip(&projections).position(|(work, projection)| {
+						work.parsed.file_op.is_none() && work.prepared.base_bytes() == &projection.after
+					});
+					if parsed_sections.len() == 1 && noop_index.is_some() {
+						let work = &parsed_sections[0];
+						let noop = self.documents.record_noop(
+							work.prepared.path(), &work.section_path,
+							Bytes::copy_from_slice(input.as_bytes()),
+						);
+						if noop.escalate {
+							yield done_fault(Fault::invalid(noop.diagnostic));
+						} else {
+							let payload = match build_payload(
+								&self.snapshots,
+								&parsed_sections,
+								&projections,
+								None,
+							).await {
+								Ok(payload) => payload,
+								Err(fault) => {
+									yield Ev::Aborted(Abort::EffectsUnknown {
+										reason: snapshot_fault_reason(fault),
+									});
+									return;
+								},
+							};
+							yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: true });
+						}
+						return;
+					}
+					if let Some(index) = noop_index {
+						let work = &parsed_sections[index];
+						let noop = self.documents.record_noop(
+							work.prepared.path(), &work.section_path,
+							Bytes::copy_from_slice(input.as_bytes()),
+						);
+						yield done_fault(Fault::invalid(noop.diagnostic));
+						return;
+					}
+
+					let result = {
+						let prepared =
+							parsed_sections.iter_mut().map(|work| &mut work.prepared).collect();
+						let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
+						let interrupt = params.next_interrupt().fuse();
+						pin_mut!(commit, interrupt);
+						let result = select_biased! {
+							result = commit => Some(result),
+							interrupted = interrupt => {
+								yield Ev::Aborted(match interrupted {
+									Ok(value) => Abort::EffectsUnknown { reason: value.reason },
+									Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
+									Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
+								});
+								None
+							},
+						};
+						result
 					};
-					yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: false });
-				},
-				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
-				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
-				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
-			}
-		}
+					let Some(result) = result else { return; };
+					match result {
+						Ok(result) if result.sections.len() == parsed_sections.len() => {
+							for work in &parsed_sections {
+								self.documents.reset_noop(work.prepared.path());
+							}
+							let payload = match build_payload(
+								&self.snapshots,
+								&parsed_sections,
+								&projections,
+								Some(&result.sections),
+							).await {
+								Ok(payload) => payload,
+								Err(fault) => {
+									yield Ev::Aborted(Abort::EffectsUnknown {
+										reason: snapshot_fault_reason(fault),
+									});
+									return;
+								},
+							};
+							yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: false });
+						},
+						Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
+						Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
+						Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
+					}
+				}
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, caps: &PromptCaps) -> Vec<Part> {
@@ -1098,6 +1144,9 @@ async fn build_payload<P: EditPrepared, S: EditSnapshotStore>(
 			first_changed_line: projection.first_changed_line,
 			block_resolutions: projection.block_resolutions.clone(),
 			warnings: projection.warnings.clone(),
+			diagnostics: committed_section
+				.map_or_else(Vec::new, |section| section.diagnostics.clone()),
+			diagnostics_complete: committed_section.is_none_or(|section| section.diagnostics_complete),
 		});
 	}
 	Ok(Payload { sections })
@@ -1304,36 +1353,38 @@ mod tests {
 		let before = Bytes::from_static(b"one\ntwo\n");
 		let payload = Payload {
 			sections: vec![SectionPayload {
-				path:               "a.txt".into(),
-				canonical_path:     "a.txt".into(),
-				op:                 SectionOp::Update,
-				move_dest:          None,
-				old_revision:       "r1".into(),
-				new_revision:       Some("r2".into()),
-				applied_ops:        vec![AppliedOp {
+				path:                 "a.txt".into(),
+				canonical_path:       "a.txt".into(),
+				op:                   SectionOp::Update,
+				move_dest:            None,
+				old_revision:         "r1".into(),
+				new_revision:         Some("r2".into()),
+				applied_ops:          vec![AppliedOp {
 					kind:       "replace".into(),
 					patch_line: 2,
 					index:      0,
 				}],
-				resolved_edits:     vec![ResolvedEdit {
+				resolved_edits:       vec![ResolvedEdit {
 					start: 2,
 					end:   2,
 					body:  vec!["TWO".into()],
 				}],
-				rebased:            false,
-				before:             before.clone(),
-				before_blob:        None,
-				after:              Bytes::from_static(b"one\nTWO\n"),
-				after_blob:         None,
-				header:             Some(format_hashline_header(
+				rebased:              false,
+				before:               before.clone(),
+				before_blob:          None,
+				after:                Bytes::from_static(b"one\nTWO\n"),
+				after_blob:           None,
+				header:               Some(format_hashline_header(
 					"a.txt",
 					&compute_snapshot_tag(b"one\nTWO\n"),
 				)),
-				diff:               Str::default(),
-				preview:            Str::default(),
-				first_changed_line: Some(2),
-				block_resolutions:  Vec::new(),
-				warnings:           Vec::new(),
+				diff:                 Str::default(),
+				preview:              Str::default(),
+				first_changed_line:   Some(2),
+				block_resolutions:    Vec::new(),
+				warnings:             Vec::new(),
+				diagnostics:          Vec::new(),
+				diagnostics_complete: true,
 			}],
 		};
 		let args = ReplaceParams {

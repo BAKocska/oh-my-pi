@@ -637,9 +637,13 @@ pub enum ConflictReplacement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConflictSplice {
 	/// Complete post-splice UTF-8 document.
-	pub text:  Str,
+	pub text:             Str,
 	/// One-based marker range replaced in the current document.
-	pub range: (usize, usize),
+	pub range:            (usize, usize),
+	/// Leading replacement lines dropped as an adjacent-context echo.
+	pub trimmed_leading:  usize,
+	/// Trailing replacement lines dropped as an adjacent-context echo.
+	pub trimmed_trailing: usize,
 }
 
 /// Parses exact side directives while preserving all custom text verbatim.
@@ -652,6 +656,118 @@ pub fn parse_replacement(content: Str) -> ConflictReplacement {
 		"@both" => ConflictReplacement::Both,
 		_ => ConflictReplacement::Custom(content),
 	}
+}
+
+/// Parses a token-only `conflict://*` per-ID directive block.
+///
+/// Returns `None` when no line is directive-shaped, selecting uniform bulk
+/// replacement mode. A partial directive block is rejected rather than being
+/// pasted literally into every conflict.
+pub fn parse_bulk_directives(
+	content: &str,
+) -> Result<Option<HashMap<usize, ConflictReplacement>>, Fault> {
+	let mut directives = HashMap::new();
+	let mut stray = Vec::new();
+	let mut saw_directive = false;
+	for raw in content.lines() {
+		let line = raw.trim();
+		if line.is_empty() {
+			continue;
+		}
+		let Some((head, value)) = line.split_once(|character| matches!(character, ':' | '=')) else {
+			stray.push(Str::new(line));
+			continue;
+		};
+		let Some(id) = head
+			.trim()
+			.strip_prefix('#')
+			.unwrap_or(head.trim())
+			.parse::<usize>()
+			.ok()
+			.filter(|id| *id > 0)
+		else {
+			stray.push(Str::new(line));
+			continue;
+		};
+		let replacement = match value.trim() {
+			"@ours" => ConflictReplacement::Ours,
+			"@base" => ConflictReplacement::Base,
+			"@theirs" => ConflictReplacement::Theirs,
+			"@both" => ConflictReplacement::Both,
+			_ => {
+				stray.push(Str::new(line));
+				continue;
+			},
+		};
+		saw_directive = true;
+		if directives.insert(id, replacement).is_some() {
+			return Err(Fault::Invalid {
+				message: sf!("Bulk directive lists conflict #{id} more than once"),
+			});
+		}
+	}
+	if !saw_directive {
+		return Ok(None);
+	}
+	if let Some(first) = stray.first() {
+		return Err(Fault::Invalid {
+			message: sf!(
+				"Malformed conflict://* directive block; expected one '<id>: @side' per line (first \
+				 invalid line: {first})"
+			),
+		});
+	}
+	Ok(Some(directives))
+}
+
+/// Applies every selected registration for one file in memory.
+///
+/// The caller commits `text` once, so any stale/ambiguous/base failure
+/// leaves the file unchanged. Duplicate registrations of a block already
+/// resolved earlier in this pass are retained in `resolved_ids` and removed
+/// together.
+pub fn splice_registered_bulk(
+	current: &str,
+	entries: &[(RegisteredConflict, ConflictReplacement)],
+) -> Result<BulkConflictSplice, Fault> {
+	let mut ordered = entries.to_vec();
+	ordered.sort_unstable_by(|left, right| right.0.block.start_line.cmp(&left.0.block.start_line));
+	let mut text = Str::new(current);
+	let mut resolved_ids = Vec::with_capacity(ordered.len());
+	let mut resolved_blocks = Vec::with_capacity(ordered.len());
+	let mut echo_trimmed = 0usize;
+	for (entry, replacement) in ordered {
+		match splice_registered(&text, &entry, &replacement) {
+			Ok(splice) => {
+				text = splice.text;
+				echo_trimmed = echo_trimmed
+					.saturating_add(splice.trimmed_leading)
+					.saturating_add(splice.trimmed_trailing);
+				resolved_blocks.push(entry.block.clone());
+				resolved_ids.push(entry.id);
+			},
+			Err(_)
+				if resolved_blocks
+					.iter()
+					.any(|block| same_conflict(block, &entry.block)) =>
+			{
+				resolved_ids.push(entry.id);
+			},
+			Err(error) => return Err(error),
+		}
+	}
+	Ok(BulkConflictSplice { text, resolved_ids, echo_trimmed })
+}
+
+/// Complete preflighted text and registrations for one bulk-conflict file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BulkConflictSplice {
+	/// Complete post-splice UTF-8 document.
+	pub text:         Str,
+	/// Every live or stale-duplicate registration resolved by this text.
+	pub resolved_ids: Vec<usize>,
+	/// Total adjacent-context echo lines removed.
+	pub echo_trimmed: usize,
 }
 
 /// Applies one registered splice to current bytes without clobbering drift.
@@ -690,6 +806,13 @@ pub fn splice_registered(
 	while replacement_text.ends_with('\n') {
 		replacement_text.pop();
 	}
+	let mut replacement_lines = replacement_text
+		.split('\n')
+		.map(|line| line.trim_end_matches('\r').to_owned())
+		.collect::<Vec<_>>();
+	let (trimmed_leading, trimmed_trailing) =
+		trim_boundary_echo(&mut replacement_lines, current, &range, selected);
+	replacement_text = replacement_lines.join("\n");
 	if had_line_ending && !replacement_text.is_empty() {
 		replacement_text.push('\n');
 	}
@@ -697,7 +820,79 @@ pub fn splice_registered(
 	output.push_str(&current[..range.start]);
 	output.push_str(&replacement_text);
 	output.push_str(&current[range.end..]);
-	Ok(ConflictSplice { text: Str::new(output), range: (selected.start_line, selected.end_line) })
+	Ok(ConflictSplice {
+		text: Str::new(output),
+		range: (selected.start_line, selected.end_line),
+		trimmed_leading,
+		trimmed_trailing,
+	})
+}
+
+const MAX_ECHO_LINES: usize = 12;
+
+fn trim_boundary_echo(
+	replacement: &mut Vec<String>,
+	current: &str,
+	range: &std::ops::Range<usize>,
+	block: &ConflictBlock,
+) -> (usize, usize) {
+	if replacement.len() <= 1 {
+		return (0, 0);
+	}
+	let expected_balance = {
+		let ours = delimiter_balance(&block.ours_lines);
+		(ours == delimiter_balance(&block.theirs_lines)).then_some(ours)
+	};
+	let justified = |lines: &[String], without: &[String]| {
+		expected_balance.is_some_and(|expected| {
+			delimiter_balance(lines) != expected && delimiter_balance(without) == expected
+		})
+	};
+	let after = current[range.end..]
+		.lines()
+		.take(MAX_ECHO_LINES)
+		.map(|line| line.trim_end_matches('\r').to_owned())
+		.collect::<Vec<_>>();
+	let mut trimmed_trailing = 0;
+	for count in (1..=after.len().min(replacement.len().saturating_sub(1))).rev() {
+		let start = replacement.len() - count;
+		if replacement[start..] == after[..count]
+			&& (count >= 2 || justified(replacement, &replacement[..start]))
+		{
+			replacement.truncate(start);
+			trimmed_trailing = count;
+			break;
+		}
+	}
+	let before_all = current[..range.start]
+		.lines()
+		.rev()
+		.take(MAX_ECHO_LINES)
+		.map(|line| line.trim_end_matches('\r').to_owned())
+		.collect::<Vec<_>>();
+	let before = before_all.into_iter().rev().collect::<Vec<_>>();
+	let mut trimmed_leading = 0;
+	for count in (1..=before.len().min(replacement.len().saturating_sub(1))).rev() {
+		let start = before.len() - count;
+		if replacement[..count] == before[start..]
+			&& (count >= 2 || justified(replacement, &replacement[count..]))
+		{
+			replacement.drain(..count);
+			trimmed_leading = count;
+			break;
+		}
+	}
+	(trimmed_leading, trimmed_trailing)
+}
+
+fn delimiter_balance(lines: &[String]) -> i32 {
+	lines.iter().fold(0, |balance, line| {
+		line.bytes().fold(balance, |balance, byte| match byte {
+			b'{' | b'(' | b'[' => balance + 1,
+			b'}' | b')' | b']' => balance - 1,
+			_ => balance,
+		})
+	})
 }
 
 fn render_registered(entry: &RegisteredConflict, scope: ConflictScope) -> String {

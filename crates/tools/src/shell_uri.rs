@@ -88,7 +88,7 @@ pub fn scan(input: &str) -> Vec<Occurrence> {
 			found.push(Occurrence {
 				range: cursor..end,
 				uri:   Str::new(&input[cursor..end]),
-				quote: if substitution_depth != 0 {
+				quote: if substitution_depth != 0 && quote == QuoteContext::Unquoted {
 					QuoteContext::Substitution
 				} else {
 					quote
@@ -116,12 +116,36 @@ pub fn replace(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
 		}
 		output.push_str(&input[copied..occurrence.range.start]);
 		match occurrence.quote {
-			QuoteContext::Double | QuoteContext::Substitution => {
-				push_double_escaped(&mut output, path)
+			QuoteContext::Double => push_double_escaped(&mut output, path),
+			QuoteContext::Unquoted | QuoteContext::Substitution => {
+				push_single_quoted(&mut output, path)
 			},
-			QuoteContext::Unquoted => push_single_quoted(&mut output, path),
 			QuoteContext::Single => unreachable!("single quotes are skipped"),
 		}
+		copied = occurrence.range.end;
+	}
+	if copied == 0 {
+		return Str::new(input);
+	}
+	output.push_str(&input[copied..]);
+	Str::new(output)
+}
+
+/// Replaces materialized URIs as raw path values outside shell source text.
+///
+/// Environment values and the dedicated `cwd` parameter are transported as
+/// data, so shell quoting there would become part of the path.
+#[must_use]
+pub fn replace_plain(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
+	let occurrences = scan(input);
+	let mut output = String::with_capacity(input.len());
+	let mut copied = 0;
+	for occurrence in occurrences {
+		let Some(path) = paths.get(&occurrence.uri) else {
+			continue;
+		};
+		output.push_str(&input[copied..occurrence.range.start]);
+		output.push_str(path);
 		copied = occurrence.range.end;
 	}
 	if copied == 0 {
@@ -184,7 +208,7 @@ mod tests {
 
 	use omp_core::Str;
 
-	use super::{QuoteContext, replace, scan};
+	use super::{QuoteContext, replace, replace_plain, scan};
 
 	#[test]
 	fn scans_command_substitution_and_quotes_without_false_suffixes() {
@@ -199,5 +223,10 @@ mod tests {
 	fn replacement_quotes_environment_paths_and_preserves_literals() {
 		let paths = BTreeMap::from([(Str::new("local://x"), Str::new("/tmp/a b"))]);
 		assert_eq!(replace("cat local://x 'local://x'", &paths), "cat '/tmp/a b' 'local://x'");
+	}
+	#[test]
+	fn data_replacement_does_not_embed_shell_quotes() {
+		let paths = BTreeMap::from([(Str::new("local://x"), Str::new("/tmp/a b"))]);
+		assert_eq!(replace_plain("local://x", &paths), "/tmp/a b");
 	}
 }

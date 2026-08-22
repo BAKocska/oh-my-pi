@@ -192,117 +192,202 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
 		stream! {
-			let FreeformEditParams { input } = match params.whole::<FreeformEditParams>().await {
-				Ok(params) => params,
-				Err(error) => { yield param_event(error); return; },
-			};
-			let operations = match parse_operations(self.kind, &input) {
-				Ok(operations) if !operations.is_empty() => operations,
-				Ok(_) => { yield done_fault(Fault::invalid("No edit operations found.")); return; },
-				Err(error) => { yield done_fault(Fault::invalid(error)); return; },
-			};
-			let mut works = Vec::with_capacity(operations.len());
-			for mut op in operations {
-				let normalized = normalize_target(op.path(), None, HostPaths::current());
-				match &mut op {
-					AuthoredOperation::Foreign(ForeignPatchFile::Add { path, .. })
-					| AuthoredOperation::Foreign(ForeignPatchFile::Delete { path })
-					| AuthoredOperation::Foreign(ForeignPatchFile::Update { path, .. })
-					| AuthoredOperation::Sloppy { path, .. } => *path = normalized.canonical,
-				}
-				let prepared = match self.documents.prepare(PrepareRequest {
-					path: Str::new(op.path()),
-					file_hash: None,
-					anchor_lines: Vec::new(),
-					allow_unpinned: true,
-				}).await {
-					Ok(prepared) => prepared,
-					Err(fault) => { yield done_fault(fault); return; },
-				};
-				if works.iter().any(|work: &Work<D::Prepared>| work.prepared.path() == prepared.path()) {
-					yield done_fault(Fault::invalid("Multiple operations resolve to the same file; merge repeated sloppy sections or use one apply-patch file hunk."));
-					return;
-				}
-				works.push(Work { op, prepared });
-			}
+					let FreeformEditParams { input } = match params.whole::<FreeformEditParams>().await {
+						Ok(params) => params,
+						Err(error) => { yield param_event(error); return; },
+					};
+					let operations = match parse_operations(self.kind, &input) {
+						Ok(operations) if !operations.is_empty() => operations,
+						Ok(_) => { yield done_fault(Fault::invalid("No edit operations found.")); return; },
+						Err(error) => { yield done_fault(Fault::invalid(error)); return; },
+					};
+					let mut works = Vec::with_capacity(operations.len());
+					for mut op in operations {
+						let normalized = normalize_target(op.path(), None, HostPaths::current());
+						match &mut op {
+							AuthoredOperation::Foreign(ForeignPatchFile::Add { path, .. })
+							| AuthoredOperation::Foreign(ForeignPatchFile::Delete { path })
+							| AuthoredOperation::Foreign(ForeignPatchFile::Update { path, .. })
+							| AuthoredOperation::Sloppy { path, .. } => *path = normalized.canonical,
+						}
+						let prepared = match self.documents.prepare(PrepareRequest {
+							path: Str::new(op.path()),
+							file_hash: None,
+							anchor_lines: Vec::new(),
+							allow_unpinned: true,
+											allow_missing: matches!(
+								op,
+								AuthoredOperation::Foreign(ForeignPatchFile::Add { .. })
+							),
+		}).await {
+							Ok(prepared) => prepared,
+							Err(fault) => { yield done_fault(fault); return; },
+						};
+						if works.iter().any(|work: &Work<D::Prepared>| work.prepared.path() == prepared.path()) {
+							yield done_fault(Fault::invalid("Multiple operations resolve to the same file; merge repeated sloppy sections or use one apply-patch file hunk."));
+							return;
+						}
+						works.push(Work { op, prepared });
+					}
 
-			let mut proposals = Vec::with_capacity(works.len());
-			let mut projections = Vec::with_capacity(works.len());
-			for work in &works {
-				let source = match std::str::from_utf8(work.prepared.authored_bytes()) {
-					Ok(source) => source,
-					Err(_) => { yield done_fault(Fault::invalid("edit dialect requires UTF-8 text")); return; },
-				};
-				let (after, operation, move_dest) = match &work.op {
-					AuthoredOperation::Sloppy { input, .. } => match apply_sloppy(source, input) {
-						Ok(after) => (Some(Bytes::from(after)), SectionOp::Update, None),
-						Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
-					},
-					AuthoredOperation::Foreign(operation) => match apply_file_operation(Some(source), operation, false) {
-						Ok(after) => {
-							let section_op = match operation {
-								ForeignPatchFile::Delete { .. } => SectionOp::Delete,
-								ForeignPatchFile::Update { move_to: Some(_), .. } => SectionOp::Move,
-								ForeignPatchFile::Add { .. } | ForeignPatchFile::Update { .. } => SectionOp::Update,
+					let mut proposals = Vec::with_capacity(works.len());
+					let mut projections = Vec::with_capacity(works.len());
+					for work in &works {
+						let source = match std::str::from_utf8(work.prepared.authored_bytes()) {
+							Ok(source) => source,
+							Err(_) => { yield done_fault(Fault::invalid("edit dialect requires UTF-8 text")); return; },
+						};
+						let (after, operation, move_dest) = match &work.op {
+							AuthoredOperation::Sloppy { input, .. } => match apply_sloppy(source, input) {
+								Ok(after) => (Some(Bytes::from(after)), SectionOp::Update, None),
+								Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+							},
+							AuthoredOperation::Foreign(operation) => match apply_file_operation(
+								work.prepared.exists().then_some(source),
+								operation,
+								false,
+							) {
+								Ok(after) => {
+									let section_op = match operation {
+										ForeignPatchFile::Delete { .. } => SectionOp::Delete,
+										ForeignPatchFile::Update { move_to: Some(_), .. } => SectionOp::Move,
+										ForeignPatchFile::Add { .. } | ForeignPatchFile::Update { .. } => SectionOp::Update,
+									};
+									let move_dest = match operation { ForeignPatchFile::Update { move_to, .. } => move_to.clone(), _ => None };
+									(after.map(Bytes::from), section_op, move_dest)
+								},
+								Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+							},
+						};
+						let action = match (operation, after.clone(), move_dest.clone()) {
+							(SectionOp::Delete, _, _) => EditAction::Delete,
+							(SectionOp::Move, Some(content), Some(destination)) => EditAction::Move { destination, content },
+							(_, Some(content), _) => EditAction::Write { content },
+							_ => { yield done_fault(Fault::invalid("invalid edit operation state")); return; },
+						};
+						proposals.push(EditProposal {
+							action: action.clone(),
+							base_revision: work.prepared.base_revision().clone(),
+							stale_policy: StalePolicy::RebaseNonOverlapping,
+							format_policy: self.format_policy,
+						});
+						let resolved = after.as_ref().map_or_else(Vec::new, |after| vec![ResolvedEdit {
+							start: 1,
+							end: source.lines().count().max(1),
+							body: String::from_utf8_lossy(after).lines().map(Str::new).collect(),
+						}]);
+						projections.push(Projection { after,  operation, move_dest, resolved });
+					}
+
+					let (preview, added_lines, removed_lines) = preview(&works, &projections);
+					yield Ev::Update(EditUpdate { applied_ops: projections.len(), preview, added_lines, removed_lines });
+					match params.committed().await {
+						Ok(_) => {},
+						Err(error) => { yield commit_event(error); return; },
+					}
+					if self.kind == FreeformKind::ApplyPatch {
+						let clipboard = self.documents.start_clipboard_batch();
+						let mut committed = Vec::with_capacity(works.len());
+						for index in 0..works.len() {
+							let prior = committed_paths(&works, committed.len());
+							let current_path = works[index].prepared.display_path().clone();
+							let commit = self.documents.commit(
+								vec![&mut works[index].prepared],
+								vec![proposals[index].clone()],
+								clipboard.clone(),
+							).fuse();
+							let interrupt = params.next_interrupt().fuse();
+							pin_mut!(commit, interrupt);
+							let result = select_biased! {
+								result = commit => Some(result),
+								interrupted = interrupt => {
+									yield Ev::Aborted(match interrupted {
+										Ok(value) => Abort::EffectsUnknown {
+											reason: partial_interrupt_reason(prior.as_str(), &value.reason),
+										},
+										Err(InterruptWaitError::Closed) => Abort::EffectsUnknown {
+											reason: partial_interrupt_reason(
+												prior.as_str(),
+												"invocation owner disappeared during transaction",
+											),
+										},
+										Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown {
+											reason: partial_interrupt_reason(prior.as_str(), &reason),
+										},
+									});
+									None
+								},
 							};
-							let move_dest = match operation { ForeignPatchFile::Update { move_to, .. } => move_to.clone(), _ => None };
-							(after.map(Bytes::from), section_op, move_dest)
-						},
-						Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
-					},
-				};
-				let action = match (operation, after.clone(), move_dest.clone()) {
-					(SectionOp::Delete, _, _) => EditAction::Delete,
-					(SectionOp::Move, Some(content), Some(destination)) => EditAction::Move { destination, content },
-					(_, Some(content), _) => EditAction::Write { content },
-					_ => { yield done_fault(Fault::invalid("invalid edit operation state")); return; },
-				};
-				proposals.push(EditProposal {
-					action: action.clone(),
-					base_revision: work.prepared.base_revision().clone(),
-					stale_policy: StalePolicy::RebaseNonOverlapping,
-					format_policy: self.format_policy,
-				});
-				let resolved = after.as_ref().map_or_else(Vec::new, |after| vec![ResolvedEdit {
-					start: 1,
-					end: source.lines().count().max(1),
-					body: String::from_utf8_lossy(after).lines().map(Str::new).collect(),
-				}]);
-				projections.push(Projection { after,  operation, move_dest, resolved });
-			}
+							let Some(result) = result else { return; };
+							match result {
+								Ok(mut result) if result.sections.len() == 1 => {
+									committed.push(result.sections.remove(0));
+								},
+								Ok(_) => {
+									yield Ev::Aborted(Abort::EffectsUnknown {
+										reason: partial_interrupt_reason(
+											prior.as_str(),
+											"document transaction returned the wrong section count",
+										),
+									});
+									return;
+								},
+								Err(EditCommitError::Rejected(fault)) if committed.is_empty() => {
+									yield done_fault(fault);
+									return;
+								},
+								Err(EditCommitError::Rejected(fault)) => {
+									yield done_fault(Fault::invalid(format!(
+										"apply-patch partially committed {prior}; stopped before {current_path} \
+										 after the first per-file failure: {}",
+										super::rejection_text(&fault),
+									)));
+									return;
+								},
+								Err(EditCommitError::EffectsUnknown { reason }) => {
+									yield Ev::Aborted(Abort::EffectsUnknown {
+										reason: partial_interrupt_reason(prior.as_str(), &reason),
+									});
+									return;
+								},
+							}
+						}
+						for work in &works {
+							self.documents.reset_noop(work.prepared.path());
+						}
+						yield Ev::Done(ToolTerminal::Done {
+							result: Ok(payload(&works, &projections, &committed)),
+							useless: false,
+						});
+						return;
+					}
 
-			let (preview, added_lines, removed_lines) = preview(&works, &projections);
-			yield Ev::Update(EditUpdate { applied_ops: projections.len(), preview, added_lines, removed_lines });
-			match params.committed().await {
-				Ok(_) => {},
-				Err(error) => { yield commit_event(error); return; },
-			}
-			let result = {
-				let clipboard = self.documents.start_clipboard_batch();
-				let prepared = works.iter_mut().map(|work| &mut work.prepared).collect();
-				let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
-				let interrupt = params.next_interrupt().fuse();
-				pin_mut!(commit, interrupt);
-				select_biased! {
-					result = commit => Some(result),
-					interrupted = interrupt => { yield Ev::Aborted(match interrupted {
-						Ok(value) => Abort::EffectsUnknown { reason: value.reason },
-						Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
-						Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
-					}); None },
+					let result = {
+						let clipboard = self.documents.start_clipboard_batch();
+						let prepared = works.iter_mut().map(|work| &mut work.prepared).collect();
+						let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
+						let interrupt = params.next_interrupt().fuse();
+						pin_mut!(commit, interrupt);
+						select_biased! {
+							result = commit => Some(result),
+							interrupted = interrupt => { yield Ev::Aborted(match interrupted {
+								Ok(value) => Abort::EffectsUnknown { reason: value.reason },
+								Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
+								Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
+							}); None },
+						}
+					};
+					let Some(result) = result else { return; };
+					match result {
+						Ok(result) if result.sections.len() == works.len() => {
+							for work in &works { self.documents.reset_noop(work.prepared.path()); }
+							yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, &result.sections)), useless: false });
+						},
+						Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
+						Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
+						Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
+					}
 				}
-			};
-			let Some(result) = result else { return; };
-			match result {
-				Ok(result) if result.sections.len() == works.len() => {
-					for work in &works { self.documents.reset_noop(work.prepared.path()); }
-					yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, &result.sections)), useless: false });
-				},
-				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
-				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
-				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
-			}
-		}
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, caps: &PromptCaps) -> Vec<Part> {
@@ -321,6 +406,29 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 			},
 		}
 		out.finish()
+	}
+}
+
+fn committed_paths<P: EditPrepared>(works: &[Work<P>], count: usize) -> Str {
+	let mut paths = String::new();
+	for (index, work) in works.iter().take(count).enumerate() {
+		if index > 0 {
+			paths.push_str(", ");
+		}
+		paths.push_str(work.prepared.display_path());
+	}
+	if paths.is_empty() {
+		sf!("no prior files")
+	} else {
+		Str::new(paths)
+	}
+}
+
+fn partial_interrupt_reason(committed: &str, reason: &str) -> Str {
+	if committed == "no prior files" {
+		Str::new(reason)
+	} else {
+		sf!("apply-patch committed {committed} before interruption: {reason}")
 	}
 }
 
@@ -433,6 +541,8 @@ fn payload<P: EditPrepared>(
 					first_changed_line: Some(1),
 					block_resolutions: Vec::new(),
 					warnings: work.prepared.warnings().to_vec(),
+					diagnostics: committed.diagnostics.clone(),
+					diagnostics_complete: committed.diagnostics_complete,
 				}
 			})
 			.collect(),

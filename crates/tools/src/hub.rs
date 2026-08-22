@@ -97,93 +97,96 @@ pub struct Ready {
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Operation to perform.
-	pub op:          Op,
+	pub op:                   Op,
 	/// Peer recipient or `all`.
 	#[schemars(with = "Option<String>")]
-	pub to:          Option<Str>,
+	pub to:                   Option<Str>,
 	/// Peer message body.
 	#[schemars(with = "Option<String>")]
-	pub message:     Option<Str>,
+	pub message:              Option<Str>,
 	/// Prior peer message ID being answered.
 	#[serde(rename = "replyTo")]
 	#[schemars(with = "Option<String>")]
-	pub reply_to:    Option<Str>,
+	pub reply_to:             Option<Str>,
 	/// Block for the recipient's threaded reply.
 	#[serde(rename = "await", default)]
-	pub await_reply: bool,
+	pub await_reply:          bool,
 	/// Only accept a peer message from this sender.
 	#[serde(rename = "from")]
 	#[schemars(with = "Option<String>")]
-	pub from_peer:   Option<Str>,
+	pub from_peer:            Option<Str>,
 	/// Job IDs selected for wait or cancellation.
 	#[schemars(with = "Option<Vec<String>>")]
-	pub ids:         Option<Vec<Str>>,
+	pub ids:                  Option<Vec<Str>>,
 	/// Explicit timeout in milliseconds; zero means infinite.
 	#[serde(rename = "timeoutMs")]
-	pub timeout_ms:  Option<u64>,
+	pub timeout_ms:           Option<u64>,
 	/// Inspect inbox without consuming it.
 	#[serde(default)]
-	pub peek:        bool,
+	pub peek:                 bool,
 	/// Stable process name.
 	#[schemars(with = "Option<String>")]
-	pub name:        Option<Str>,
+	pub name:                 Option<Str>,
 	/// Process executable.
 	#[schemars(with = "Option<String>")]
-	pub application: Option<Str>,
+	pub application:          Option<Str>,
 	/// Process argv.
 	#[schemars(with = "Option<Vec<String>>")]
-	pub args:        Option<Vec<Str>>,
+	pub args:                 Option<Vec<Str>>,
 	/// Process environment.
 	#[schemars(with = "Option<std::collections::BTreeMap<String, String>>")]
-	pub env:         Option<std::collections::BTreeMap<Str, Str>>,
+	pub env:                  Option<std::collections::BTreeMap<Str, Str>>,
 	/// Process working directory.
 	#[schemars(with = "Option<String>")]
-	pub cwd:         Option<Str>,
+	pub cwd:                  Option<Str>,
 	/// Allocate an interactive PTY.
-	pub pty:         Option<bool>,
+	pub pty:                  Option<bool>,
 	/// Readiness criteria.
-	pub ready:       Option<Ready>,
+	pub ready:                Option<Ready>,
 	/// Automatic restart policy.
-	pub restart:     Option<RestartPolicy>,
+	pub restart:              Option<RestartPolicy>,
 	/// Keep the process beyond the last session handle.
 	#[serde(default)]
-	pub persist:     bool,
+	pub persist:              bool,
 	/// Keep the process beyond environment shutdown; implies persist and
 	/// disables PTY.
 	#[serde(default)]
-	pub detached:    bool,
+	pub detached:             bool,
 	/// Log line limit.
-	pub lines:       Option<u16>,
+	pub lines:                Option<u16>,
 	/// Return logs from the beginning.
 	#[serde(default)]
-	pub head:        bool,
+	pub head:                 bool,
 	/// Regex log filter.
 	#[schemars(with = "Option<String>")]
-	pub grep:        Option<Str>,
+	pub grep:                 Option<Str>,
 	/// Output sequence cursor.
-	pub cursor:      Option<u64>,
+	pub cursor:               Option<u64>,
 	/// Follow output after the current cursor.
 	#[serde(default)]
-	pub follow:      bool,
+	pub follow:               bool,
+	/// Reconstruct PTY output as terminal screen rows instead of raw log bytes.
+	#[serde(rename = "renderTerminalRows", default)]
+	pub render_terminal_rows: bool,
 	/// Process lifecycle target (`ready` or `exit`).
 	#[serde(rename = "for")]
 	#[schemars(with = "Option<String>")]
-	pub wait_for:    Option<Str>,
+	pub wait_for:             Option<Str>,
 	/// Output regex taking precedence over lifecycle target.
 	#[schemars(with = "Option<String>")]
-	pub pattern:     Option<Str>,
+	pub pattern:              Option<Str>,
 	/// Process stdin text.
 	#[schemars(with = "Option<String>")]
-	pub text:        Option<Str>,
+	pub text:                 Option<Str>,
 	/// Append Enter after process stdin text.
-	pub enter:       Option<bool>,
+	pub enter:                Option<bool>,
 	/// Named control keys.
 	#[schemars(with = "Option<Vec<String>>")]
-	pub keys:        Option<Vec<Str>>,
+	pub keys:                 Option<Vec<Str>>,
 	/// OS process-group signal.
-	pub signal:      Option<Signal>,
+	pub signal:               Option<Signal>,
 	/// Process-operation timeout in seconds.
-	pub timeout:     Option<f64>,
+	pub timeout:              Option<f64>,
 }
 
 /// Validated hub request handed to the app-owned broker/process composition.
@@ -542,6 +545,7 @@ mod tests {
 			grep: None,
 			cursor: None,
 			follow: false,
+			render_terminal_rows: false,
 			wait_for: None,
 			pattern: None,
 			text: None,

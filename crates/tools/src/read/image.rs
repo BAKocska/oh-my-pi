@@ -185,6 +185,9 @@ pub enum ImageFault {
 		/// Maximum accepted byte count.
 		max_bytes: usize,
 	},
+	/// A WebP image required by an STB-backed model could not be decoded and
+	/// converted to PNG.
+	WebpConversionFailed,
 }
 
 impl ImageFault {
@@ -198,6 +201,7 @@ impl ImageFault {
 				format_bytes(bytes),
 				format_bytes(max_bytes)
 			),
+			Self::WebpConversionFailed => sf!("WebP image could not be converted for this model."),
 		}
 	}
 }
@@ -326,6 +330,60 @@ pub fn process_image_with_policy(
 		return Ok(Some(cached));
 	}
 	let processed = unchanged_image(input, metadata, false);
+	IMAGE_CACHE.lock().insert(cache_key, &processed);
+	Ok(Some(processed))
+}
+
+/// Projects an image for an STB-backed model, converting WebP input to PNG.
+///
+/// Non-WebP inputs retain the ordinary resize policy. The conversion is
+/// request-specific and does not depend on the process-wide `OMP_NO_WEBP`
+/// override.
+pub fn process_image_for_stb(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault> {
+	if input.len() > MAX_IMAGE_INPUT_BYTES {
+		return Err(ImageFault::TooLarge {
+			bytes:     input.len(),
+			max_bytes: MAX_IMAGE_INPUT_BYTES,
+		});
+	}
+	let Some(metadata) = sniff_metadata(&input[..input.len().min(IMAGE_METADATA_HEADER_BYTES)])
+	else {
+		return Ok(None);
+	};
+	if metadata.kind != ImageKind::WebP {
+		return process_image(input);
+	}
+	let cache_key =
+		ImageCacheKey { digest: Hash32::sum(&input), auto_resize: false, exclude_webp: true };
+	if let Some(cached) = IMAGE_CACHE.lock().get(cache_key) {
+		return Ok(Some(cached));
+	}
+	let (image, was_animated) =
+		decode_image(&input, ImageKind::WebP).map_err(|_| ImageFault::WebpConversionFailed)?;
+	let width = image.width();
+	let height = image.height();
+	let channels = image.color().channel_count();
+	let has_alpha = image.color().has_alpha();
+	let encoded = encode_png(&image).map_err(|_| ImageFault::WebpConversionFailed)?;
+	let processed = ProcessedImage {
+		bytes: encoded.len(),
+		data: Bytes::from(encoded),
+		media_type: sf!(ImageKind::Png.media_type()),
+		original_width: Some(width),
+		original_height: Some(height),
+		width: Some(width),
+		height: Some(height),
+		was_resized: false,
+		was_animated,
+		animation_preserved: false,
+		description: image_description(
+			ImageKind::Png.media_type(),
+			Some((width, height)),
+			Some(channels),
+			Some(has_alpha),
+			None,
+		),
+	};
 	IMAGE_CACHE.lock().insert(cache_key, &processed);
 	Ok(Some(processed))
 }

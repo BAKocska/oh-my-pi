@@ -131,133 +131,134 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
 		stream! {
-			let replace_params = match params.whole::<ReplaceParams>().await {
-				Ok(params) => params,
-				Err(error) => { yield param_event(error); return; },
-			};
-			if replace_params.edits.is_empty() {
-				yield done_fault(Fault::invalid("No replacement operations found in edits."));
-				return;
-			}
-			let journal_input = if let Ok(input) = serde_json::to_vec(&replace_params) { Bytes::from(input) } else { yield done_fault(Fault::invalid("Replacement arguments could not be journaled.")); return; };
-			let mut works = Vec::with_capacity(replace_params.edits.len());
-			for op in replace_params.edits {
-				let prepared = match self.documents.prepare(PrepareRequest {
-					path: op.path.clone(),
-					file_hash: None,
-					anchor_lines: Vec::new(),
-					allow_unpinned: true,
-				}).await {
-					Ok(prepared) => prepared,
-					Err(fault) => { yield done_fault(fault); return; },
-				};
-				if works.iter().any(|work: &Work<D::Prepared>| work.prepared.path() == prepared.path()) {
-					yield done_fault(Fault::invalid("Multiple replacement operations resolve to the same file; combine their context into one operation."));
-					return;
-				}
-				works.push(Work { op, prepared });
-			}
-
-			let mut proposals = Vec::with_capacity(works.len());
-			let mut projections = Vec::with_capacity(works.len());
-			for work in &works {
-				let result = apply_replace(work.prepared.authored_bytes(), &work.op.old, &work.op.new, ReplaceOptions {
-					replace_all: work.op.replace_all,
-					allow_fuzzy: work.op.allow_fuzzy,
-					threshold: work.op.threshold.unwrap_or(omp_hashline::replace::DEFAULT_FUZZY_THRESHOLD),
-				});
-				let (after, resolved, recovery_edits) = match result {
-					Ok(result) => {
-						let resolved = result.edits.iter().map(|edit| ResolvedEdit {
-							start: line_at(work.prepared.authored_bytes(), edit.start),
-							end: line_at_end(work.prepared.authored_bytes(), edit.start, edit.end),
-							body: replacement_body(&edit.replacement),
-						}).collect();
-						let byte_edits = result
-							.edits
-							.iter()
-							.map(|edit| omp_hashline::ByteEdit {
-								start: edit.start,
-								end: edit.end,
-								replacement: edit.replacement.clone(),
-							})
-							.collect::<Vec<_>>();
-						let recovery_edits = match recovery_edits(&byte_edits) {
-							Ok(edits) => edits,
+					let replace_params = match params.whole::<ReplaceParams>().await {
+						Ok(params) => params,
+						Err(error) => { yield param_event(error); return; },
+					};
+					if replace_params.edits.is_empty() {
+						yield done_fault(Fault::invalid("No replacement operations found in edits."));
+						return;
+					}
+					let journal_input = if let Ok(input) = serde_json::to_vec(&replace_params) { Bytes::from(input) } else { yield done_fault(Fault::invalid("Replacement arguments could not be journaled.")); return; };
+					let mut works = Vec::with_capacity(replace_params.edits.len());
+					for op in replace_params.edits {
+						let prepared = match self.documents.prepare(PrepareRequest {
+							path: op.path.clone(),
+							file_hash: None,
+							anchor_lines: Vec::new(),
+							allow_unpinned: true,
+											allow_missing: false,
+		}).await {
+							Ok(prepared) => prepared,
 							Err(fault) => { yield done_fault(fault); return; },
 						};
-						(result.final_bytes, resolved, recovery_edits)
-					},
-					Err(ReplaceError::NoChanges) => {
-						(work.prepared.authored_bytes().clone(), Vec::new(), Vec::new())
-					},
-					Err(error) => { yield done_fault(Fault::invalid(replacement_error(error))); return; },
-				};
-				let after = if work.prepared.authored_bytes() == work.prepared.base_bytes() {
-					after
-				} else if recovery_edits.is_empty() {
-					yield done_fault(Fault::stale("The source snapshot changed before this replacement could be applied; re-read the document."));
-					return;
-				} else if let Ok(recovered) = recover_exact(work.prepared.authored_bytes(), work.prepared.base_bytes(), &recovery_edits) { recovered.content().clone() } else { yield done_fault(Fault::stale("The source snapshot changed and the replacement overlaps intervening edits; re-read the document.")); return; };
-				proposals.push(EditProposal {
-					action: EditAction::Write { content: after.clone() },
-					base_revision: work.prepared.base_revision().clone(),
-					stale_policy: StalePolicy::RebaseNonOverlapping,
-					format_policy: self.format_policy,
-				});
-				projections.push(Projection { after, resolved });
-			}
+						if works.iter().any(|work: &Work<D::Prepared>| work.prepared.path() == prepared.path()) {
+							yield done_fault(Fault::invalid("Multiple replacement operations resolve to the same file; combine their context into one operation."));
+							return;
+						}
+						works.push(Work { op, prepared });
+					}
 
-			let mut preview = String::new();
-			let mut added_lines = 0;
-			let mut removed_lines = 0;
-			for (work, projection) in works.iter().zip(&projections) {
-				if let Ok(diff) = numbered_diff(work.prepared.base_bytes(), &projection.after, Some(std::path::Path::new(work.prepared.display_path().as_str()))) {
-					let compact = build_compact_diff_preview(&diff.text, CompactDiffOptions::default());
-					if !preview.is_empty() && !compact.preview.is_empty() { preview.push('\n'); }
-					preview.push_str(&compact.preview);
-					added_lines += compact.added_lines;
-					removed_lines += compact.removed_lines;
+					let mut proposals = Vec::with_capacity(works.len());
+					let mut projections = Vec::with_capacity(works.len());
+					for work in &works {
+						let result = apply_replace(work.prepared.authored_bytes(), &work.op.old, &work.op.new, ReplaceOptions {
+							replace_all: work.op.replace_all,
+							allow_fuzzy: work.op.allow_fuzzy,
+							threshold: work.op.threshold.unwrap_or(omp_hashline::replace::DEFAULT_FUZZY_THRESHOLD),
+						});
+						let (after, resolved, recovery_edits) = match result {
+							Ok(result) => {
+								let resolved = result.edits.iter().map(|edit| ResolvedEdit {
+									start: line_at(work.prepared.authored_bytes(), edit.start),
+									end: line_at_end(work.prepared.authored_bytes(), edit.start, edit.end),
+									body: replacement_body(&edit.replacement),
+								}).collect();
+								let byte_edits = result
+									.edits
+									.iter()
+									.map(|edit| omp_hashline::ByteEdit {
+										start: edit.start,
+										end: edit.end,
+										replacement: edit.replacement.clone(),
+									})
+									.collect::<Vec<_>>();
+								let recovery_edits = match recovery_edits(&byte_edits) {
+									Ok(edits) => edits,
+									Err(fault) => { yield done_fault(fault); return; },
+								};
+								(result.final_bytes, resolved, recovery_edits)
+							},
+							Err(ReplaceError::NoChanges) => {
+								(work.prepared.authored_bytes().clone(), Vec::new(), Vec::new())
+							},
+							Err(error) => { yield done_fault(Fault::invalid(replacement_error(error))); return; },
+						};
+						let after = if work.prepared.authored_bytes() == work.prepared.base_bytes() {
+							after
+						} else if recovery_edits.is_empty() {
+							yield done_fault(Fault::stale("The source snapshot changed before this replacement could be applied; re-read the document."));
+							return;
+						} else if let Ok(recovered) = recover_exact(work.prepared.authored_bytes(), work.prepared.base_bytes(), &recovery_edits) { recovered.content().clone() } else { yield done_fault(Fault::stale("The source snapshot changed and the replacement overlaps intervening edits; re-read the document.")); return; };
+						proposals.push(EditProposal {
+							action: EditAction::Write { content: after.clone() },
+							base_revision: work.prepared.base_revision().clone(),
+							stale_policy: StalePolicy::RebaseNonOverlapping,
+							format_policy: self.format_policy,
+						});
+						projections.push(Projection { after, resolved });
+					}
+
+					let mut preview = String::new();
+					let mut added_lines = 0;
+					let mut removed_lines = 0;
+					for (work, projection) in works.iter().zip(&projections) {
+						if let Ok(diff) = numbered_diff(work.prepared.base_bytes(), &projection.after, Some(std::path::Path::new(work.prepared.display_path().as_str()))) {
+							let compact = build_compact_diff_preview(&diff.text, CompactDiffOptions::default());
+							if !preview.is_empty() && !compact.preview.is_empty() { preview.push('\n'); }
+							preview.push_str(&compact.preview);
+							added_lines += compact.added_lines;
+							removed_lines += compact.removed_lines;
+						}
+					}
+					yield Ev::Update(EditUpdate { applied_ops: projections.iter().map(|projection| projection.resolved.len()).sum(), preview: preview.into(), added_lines, removed_lines });
+					match params.committed().await {
+						Ok(_) => {},
+						Err(error) => { yield commit_event(error); return; },
+					}
+					if let Some(index) = works.iter().zip(&projections).position(|(work, projection)| work.prepared.base_bytes() == &projection.after) {
+						let work = &works[index];
+						let NoopResult { diagnostic, escalate } = self.documents.record_noop(work.prepared.path(), work.prepared.display_path(), journal_input);
+						if escalate || works.len() != 1 { yield done_fault(Fault::invalid(diagnostic)); return; }
+						yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, None)), useless: true });
+						return;
+					}
+					let result = {
+						let clipboard = self.documents.start_clipboard_batch();
+						let prepared = works.iter_mut().map(|work| &mut work.prepared).collect();
+						let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
+						let interrupt = params.next_interrupt().fuse();
+						pin_mut!(commit, interrupt);
+						select_biased! {
+							result = commit => Some(result),
+							interrupted = interrupt => { yield Ev::Aborted(match interrupted {
+								Ok(value) => Abort::EffectsUnknown { reason: value.reason },
+								Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
+								Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
+							}); None },
+						}
+					};
+					let Some(result) = result else { return; };
+					match result {
+						Ok(result) if result.sections.len() == works.len() => {
+							for work in &works { self.documents.reset_noop(work.prepared.path()); }
+							yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, Some(&result.sections))), useless: false });
+						},
+						Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
+						Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
+						Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
+					}
 				}
-			}
-			yield Ev::Update(EditUpdate { applied_ops: projections.iter().map(|projection| projection.resolved.len()).sum(), preview: preview.into(), added_lines, removed_lines });
-			match params.committed().await {
-				Ok(_) => {},
-				Err(error) => { yield commit_event(error); return; },
-			}
-			if let Some(index) = works.iter().zip(&projections).position(|(work, projection)| work.prepared.base_bytes() == &projection.after) {
-				let work = &works[index];
-				let NoopResult { diagnostic, escalate } = self.documents.record_noop(work.prepared.path(), work.prepared.display_path(), journal_input);
-				if escalate || works.len() != 1 { yield done_fault(Fault::invalid(diagnostic)); return; }
-				yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, None)), useless: true });
-				return;
-			}
-			let result = {
-				let clipboard = self.documents.start_clipboard_batch();
-				let prepared = works.iter_mut().map(|work| &mut work.prepared).collect();
-				let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
-				let interrupt = params.next_interrupt().fuse();
-				pin_mut!(commit, interrupt);
-				select_biased! {
-					result = commit => Some(result),
-					interrupted = interrupt => { yield Ev::Aborted(match interrupted {
-						Ok(value) => Abort::EffectsUnknown { reason: value.reason },
-						Err(InterruptWaitError::Closed) => Abort::EffectsUnknown { reason: sf!("invocation owner disappeared during transaction") },
-						Err(InterruptWaitError::Protocol(reason)) => Abort::EffectsUnknown { reason },
-					}); None },
-				}
-			};
-			let Some(result) = result else { return; };
-			match result {
-				Ok(result) if result.sections.len() == works.len() => {
-					for work in &works { self.documents.reset_noop(work.prepared.path()); }
-					yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, Some(&result.sections))), useless: false });
-				},
-				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
-				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
-				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
-			}
-		}
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, caps: &PromptCaps) -> Vec<Part> {
@@ -351,6 +352,8 @@ fn payload<P: EditPrepared>(
 					first_changed_line: projection.resolved.first().map(|edit| edit.start),
 					block_resolutions: Vec::new(),
 					warnings: Vec::new(),
+					diagnostics: committed.map_or_else(Vec::new, |section| section.diagnostics.clone()),
+					diagnostics_complete: committed.is_none_or(|section| section.diagnostics_complete),
 				}
 			})
 			.collect(),

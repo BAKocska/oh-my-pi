@@ -122,14 +122,17 @@ impl EditDocuments for Fake {
 		let sections = proposals
 			.iter()
 			.map(|proposal| CommittedSection {
-				new_revision: (!matches!(proposal.action, EditAction::Delete)).then(|| "r2".into()),
-				rebased:      false,
-				content:      match &proposal.action {
+				new_revision:         (!matches!(proposal.action, EditAction::Delete))
+					.then(|| "r2".into()),
+				rebased:              false,
+				content:              match &proposal.action {
 					EditAction::Write { content } | EditAction::Move { content, .. } => {
 						Some(content.clone())
 					},
 					EditAction::Delete => None,
 				},
+				diagnostics:          Vec::new(),
+				diagnostics_complete: true,
 			})
 			.collect();
 		self.state.lock().commits.extend(proposals);

@@ -736,6 +736,28 @@ fn render_edit_payload(payload: &crate::edit::Payload) -> Str {
 		}
 		output.push_str("</text></row><diff>");
 		push_text(&mut output, &section.diff);
+		for (index, diagnostic) in section.diagnostics.iter().enumerate() {
+			if !section.diff.is_empty() || index > 0 {
+				output.push('\n');
+			}
+			output.push_str("! ");
+			if !diagnostic.source.is_empty() {
+				push_text(&mut output, &diagnostic.source);
+				if !diagnostic.code.is_empty() {
+					output.push('[');
+					push_text(&mut output, &diagnostic.code);
+					output.push(']');
+				}
+				output.push_str(": ");
+			}
+			push_text(&mut output, &diagnostic.message);
+		}
+		if !section.diagnostics_complete {
+			if !section.diff.is_empty() || !section.diagnostics.is_empty() {
+				output.push('\n');
+			}
+			output.push_str("! Additional LSP diagnostics are still settling");
+		}
 		output.push_str("</diff>");
 	}
 	output.push_str("</col>");

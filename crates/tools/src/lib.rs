@@ -118,6 +118,8 @@ pub mod memory;
 pub mod memory_edit;
 /// Pi-compatible reads across local and special sources.
 pub mod read;
+/// Review finding parsing and priority normalization.
+pub mod review;
 /// Persistent-session shell execution.
 pub mod shell;
 /// Pre-authorization guidance for shell intents served by dedicated tools.
