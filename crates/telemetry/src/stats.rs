@@ -66,6 +66,62 @@ pub struct UsageWindowSnapshot {
 	pub window_label:  Option<Str>,
 	/// Used fraction at this observation, when reported.
 	pub used_fraction: Option<f64>,
+	/// Observation timestamp in epoch milliseconds.
+	pub observed_at:   u64,
+	/// Provider-authoritative reset timestamp in epoch milliseconds.
+	pub resets_at:     Option<u64>,
+	/// Explicit quota-exhaustion evidence.
+	pub exhausted:     bool,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageWindowAnalytics {
+	pub resets:             u64,
+	pub exhaustion_count:   u64,
+	pub peak_curve:         Vec<(u64, f64)>,
+	pub estimated_capacity: Option<f64>,
+	pub ideal_accounts:     Option<u64>,
+}
+
+/// Derives bounded quota analytics from one stable limit's chronological
+/// observations.
+#[must_use]
+pub fn analyze_usage_window(
+	group: &UsageWindowGroup<'_>,
+	curve_points: usize,
+) -> UsageWindowAnalytics {
+	let mut snapshots = group.snapshots.clone();
+	snapshots.sort_by_key(|snapshot| snapshot.observed_at);
+	let resets = snapshots
+		.windows(2)
+		.filter(|pair| {
+			pair[1].resets_at != pair[0].resets_at
+				|| matches!((pair[0].used_fraction, pair[1].used_fraction), (Some(a), Some(b)) if b < a)
+		})
+		.count() as u64;
+	let exhaustion_count = snapshots
+		.iter()
+		.filter(|snapshot| snapshot.exhausted)
+		.count() as u64;
+	let points = curve_points.max(1);
+	let bucket = snapshots.len().div_ceil(points).max(1);
+	let peak_curve = snapshots
+		.chunks(bucket)
+		.filter_map(|chunk| {
+			let peak = chunk
+				.iter()
+				.filter_map(|snapshot| snapshot.used_fraction)
+				.reduce(f64::max)?;
+			Some((chunk.last()?.observed_at, peak))
+		})
+		.collect();
+	let estimated_capacity = snapshots
+		.iter()
+		.filter_map(|snapshot| snapshot.used_fraction)
+		.filter(|fraction| fraction.is_finite() && *fraction > 0.0)
+		.map(|fraction| 1.0 / fraction)
+		.reduce(f64::max);
+	let ideal_accounts = estimated_capacity.map(f64::ceil).map(|value| value as u64);
+	UsageWindowAnalytics { resets, exhaustion_count, peak_curve, estimated_capacity, ideal_accounts }
 }
 
 /// Stable grouping key for one provider-defined usage limit.
@@ -175,6 +231,9 @@ mod tests {
 				label:         "Claude 7 Day".into(),
 				window_label:  Some("7 Day".into()),
 				used_fraction: Some(0.2),
+				observed_at:   0,
+				resets_at:     None,
+				exhausted:     false,
 			},
 			UsageWindowSnapshot {
 				provider:      "anthropic".into(),
@@ -182,6 +241,9 @@ mod tests {
 				label:         "Claude 7 Day (Fable)".into(),
 				window_label:  Some("7 Day".into()),
 				used_fraction: Some(0.6),
+				observed_at:   0,
+				resets_at:     None,
+				exhausted:     false,
 			},
 		];
 		let groups = group_usage_windows_by_limit_id(&snapshots);

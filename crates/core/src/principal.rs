@@ -11,7 +11,113 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
 
-use crate::{Str, hex};
+use crate::{Hash32, Str, hex};
+
+/// Authorization tier derived from a timing-safe collaboration credential
+/// check.
+#[derive(
+	Clone, Copy, Debug, Eq, Hash, PartialEq, strum::Display, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum CredentialTier {
+	/// The peer may observe public collaboration state but cannot mutate it.
+	ReadOnly,
+	/// The peer presented the room's writable credential.
+	FullAccess,
+}
+
+/// Authenticated collaboration peer stamped onto every admitted remote
+/// mutation.
+///
+/// The room credential itself is never retained. `token_digest` is an
+/// audit-linkage digest of the accepted token and is absent for read-only
+/// peers. The handle is Arc-backed because it crosses the Core, Environment,
+/// approval, and journal boundaries with every remote operation.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct RemotePrincipal(Arc<RemotePrincipalData>);
+
+#[derive(Eq, Hash, PartialEq)]
+struct RemotePrincipalData {
+	peer_id:         u32,
+	display_name:    Str,
+	credential_tier: CredentialTier,
+	room_id:         Str,
+	token_digest:    Option<Hash32>,
+}
+
+const _: () =
+	assert!(std::mem::size_of::<RemotePrincipal>() <= 16, "RemotePrincipal must remain clone-cheap");
+
+impl RemotePrincipal {
+	/// Creates a principal from host-authenticated relay and credential facts.
+	#[must_use]
+	pub fn new(
+		peer_id: u32,
+		display_name: Str,
+		credential_tier: CredentialTier,
+		room_id: Str,
+		token_digest: Option<Hash32>,
+	) -> Self {
+		Self(Arc::new(RemotePrincipalData {
+			peer_id,
+			display_name,
+			credential_tier,
+			room_id,
+			token_digest,
+		}))
+	}
+
+	/// Returns the relay-assigned peer identifier.
+	#[must_use]
+	pub fn peer_id(&self) -> u32 {
+		self.0.peer_id
+	}
+
+	/// Returns the sanitized, human-readable peer name.
+	#[must_use]
+	pub fn display_name(&self) -> &str {
+		self.0.display_name.as_str()
+	}
+
+	/// Returns the host-verified collaboration credential tier.
+	#[must_use]
+	pub fn credential_tier(&self) -> CredentialTier {
+		self.0.credential_tier
+	}
+
+	/// Returns the stable room identifier.
+	#[must_use]
+	pub fn room_id(&self) -> &str {
+		self.0.room_id.as_str()
+	}
+
+	/// Returns the accepted write-token digest used for audit linkage.
+	#[must_use]
+	pub fn token_digest(&self) -> Option<Hash32> {
+		self.0.token_digest
+	}
+
+	/// Returns whether this peer may submit host mutations.
+	#[must_use]
+	pub fn may_mutate(&self) -> bool {
+		matches!(self.0.credential_tier, CredentialTier::FullAccess)
+	}
+}
+
+impl fmt::Debug for RemotePrincipal {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("RemotePrincipal")
+			.field("peer_id", &self.0.peer_id)
+			.field("display_name", &self.0.display_name)
+			.field("credential_tier", &self.0.credential_tier)
+			.field("room_id", &"[redacted]")
+			.field("token_digest", &self.0.token_digest.map(|_| "[redacted]"))
+			.finish()
+	}
+}
+
+/// The authenticated person acting through an omp daemon.
 
 /// The authenticated person acting through an omp daemon.
 ///

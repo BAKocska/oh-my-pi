@@ -56,6 +56,9 @@ pub enum Error {
 	/// The embedding worker request exceeded its deadline and was hard-reaped.
 	#[error("embedding worker request timed out")]
 	EmbeddingTimeout,
+	/// Auxiliary memory completion failed before producing a usable outcome.
+	#[error("memory auxiliary completion failed")]
+	AuxiliaryCompletion,
 	/// A configured embedding model is not supported by the worker.
 	#[error("embedding model is unsupported")]
 	UnsupportedEmbeddingModel,

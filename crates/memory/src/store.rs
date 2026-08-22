@@ -85,6 +85,17 @@ pub struct NewMemory<'a> {
 }
 
 /// One periodic-retention window committed atomically with its cursor.
+/// Result of a scoped mutable-memory edit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditResult {
+	/// A mutable row was changed.
+	Changed,
+	/// No row with the supplied id exists in this bank.
+	NotFound,
+	/// The id names an immutable extracted fact.
+	ImmutableFact,
+}
+
 pub struct RetainedWindow<'a> {
 	/// Session journal identity.
 	pub session_id:                 &'a str,
@@ -229,6 +240,113 @@ impl BankStore {
 		}
 		transaction.commit()?;
 		Ok(id)
+	}
+
+	/// Atomically saves a retained transcript suffix and advances its restart
+	/// Replaces working-memory content and/or importance.
+	pub fn update_working(
+		&self,
+		id: &str,
+		content: Option<&str>,
+		importance: Option<f64>,
+	) -> Result<EditResult> {
+		if !valid_memory_id(id) {
+			return Err(Error::InvalidIdentifier);
+		}
+		if content.is_none() && importance.is_none() {
+			return Err(Error::InvalidIdentifier);
+		}
+		let content = content.map(str::trim);
+		if content == Some("") || importance.is_some_and(|value| !value.is_finite()) {
+			return Err(Error::InvalidIdentifier);
+		}
+		let mut connection = self.connection()?;
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		if transaction
+			.query_row("SELECT 1 FROM facts WHERE fact_id = ?1", [id], |_| Ok(()))
+			.optional()?
+			.is_some()
+		{
+			return Ok(EditResult::ImmutableFact);
+		}
+		let changed = transaction.execute(
+			"UPDATE working_memory SET content = COALESCE(?2, content), embed_text = COALESCE(?2, \
+			 embed_text), importance = COALESCE(?3, importance) WHERE id = ?1",
+			params![id, content, importance.map(|value| value.clamp(0.0, 1.0))],
+		)?;
+		if changed == 0 {
+			return Ok(EditResult::NotFound);
+		}
+		transaction.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", [id])?;
+		transaction.execute(
+			"DELETE FROM memory_links WHERE source_memory_id = ?1 OR target_memory_id = ?1",
+			[id],
+		)?;
+		bump_durable(&transaction)?;
+		transaction.commit()?;
+		Ok(EditResult::Changed)
+	}
+
+	/// Permanently deletes one working-memory row.
+	pub fn forget_working(&self, id: &str) -> Result<EditResult> {
+		if !valid_memory_id(id) {
+			return Err(Error::InvalidIdentifier);
+		}
+		let mut connection = self.connection()?;
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		if transaction
+			.query_row("SELECT 1 FROM facts WHERE fact_id = ?1", [id], |_| Ok(()))
+			.optional()?
+			.is_some()
+		{
+			return Ok(EditResult::ImmutableFact);
+		}
+		let changed = transaction.execute("DELETE FROM working_memory WHERE id = ?1", [id])?;
+		if changed == 0 {
+			return Ok(EditResult::NotFound);
+		}
+		transaction.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", [id])?;
+		transaction.execute(
+			"DELETE FROM memory_links WHERE source_memory_id = ?1 OR target_memory_id = ?1",
+			[id],
+		)?;
+		bump_durable(&transaction)?;
+		transaction.commit()?;
+		Ok(EditResult::Changed)
+	}
+
+	/// Softly supersedes one working or episodic memory.
+	pub fn invalidate(&self, id: &str, replacement_id: Option<&str>) -> Result<EditResult> {
+		if !valid_memory_id(id)
+			|| replacement_id.is_some_and(|replacement| !valid_memory_id(replacement))
+		{
+			return Err(Error::InvalidIdentifier);
+		}
+		let mut connection = self.connection()?;
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		if transaction
+			.query_row("SELECT 1 FROM facts WHERE fact_id = ?1", [id], |_| Ok(()))
+			.optional()?
+			.is_some()
+		{
+			return Ok(EditResult::ImmutableFact);
+		}
+		let mut changed = transaction.execute(
+			"UPDATE working_memory SET superseded_by = COALESCE(?2, id) WHERE id = ?1",
+			params![id, replacement_id],
+		)?;
+		if changed == 0 {
+			changed = transaction.execute(
+				"UPDATE episodic_memory SET superseded_by = COALESCE(?2, id) WHERE id = ?1",
+				params![id, replacement_id],
+			)?;
+		}
+		if changed == 0 {
+			return Ok(EditResult::NotFound);
+		}
+		bump_durable(&transaction)?;
+		transaction.commit()?;
+		Ok(EditResult::Changed)
 	}
 
 	/// Atomically saves a retained transcript suffix and advances its restart
