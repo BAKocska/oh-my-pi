@@ -10,10 +10,10 @@ use futures::{Stream, StreamExt as _};
 use omp_agent::{
 	Journal, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession, project_journal,
 };
+use omp_catalog::GrammarBits;
 use omp_core::{Str, sf};
 use omp_e2e::support::{DEFAULT_TIMEOUT, Scratch, ScriptedGateway, within};
-use omp_llm_catalog::GrammarBits;
-use omp_llm_inference::{
+use omp_inference::{
 	call::{ChatRequest, ContentPart, ToolResultContent},
 	event::{ChatEvent, Completion, FinishReason},
 	provider::fake::FakeScript,

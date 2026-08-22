@@ -117,7 +117,7 @@
     "source": "archive/llm-legacy/llm-catalog/providers.toml via archive/llm-legacy/llm-catalog/src/provider.rs::load_providers"
   },
   "normalized_catalog": {
-    "model_count": 4225,
+    "model_count": 4177,
     "models_by_provider": {
       "agnes": 2,
       "agnes-plan": 2,
@@ -136,7 +136,7 @@
       "cohere": 7,
       "coreweave": 34,
       "crofai": 9,
-      "cursor": 104,
+      "cursor": 56,
       "deepinfra": 1,
       "deepseek": 2,
       "devin": 1,
@@ -205,7 +205,7 @@
       "model"
     ],
     "source": "archive/llm-legacy/llm-catalog/src/models.rs::load_catalog_zstd",
-    "unique_identity_count": 4225
+    "unique_identity_count": 4177
   },
   "raw_catalog": {
     "provider_key_count": 80,

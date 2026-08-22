@@ -70,7 +70,7 @@ fn recovered_cursor_and_devin_schemas_are_wire_compatible() {
 	verify_provider(
 		"cursor",
 		&cursor_recovered,
-		&omp_llm_inference::codec::cursor::descriptor_set().expect("replacement Cursor descriptors"),
+		&omp_inference::codec::cursor::descriptor_set().expect("replacement Cursor descriptors"),
 		&fixture.providers.cursor,
 	);
 
@@ -87,7 +87,7 @@ fn recovered_cursor_and_devin_schemas_are_wire_compatible() {
 	verify_provider(
 		"devin",
 		&devin_recovered,
-		&omp_llm_inference::codec::devin::descriptor_set().expect("replacement Devin descriptors"),
+		&omp_inference::codec::devin::descriptor_set().expect("replacement Devin descriptors"),
 		&fixture.providers.devin,
 	);
 }

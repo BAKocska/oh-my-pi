@@ -15,7 +15,6 @@ use omp_agent::{
 	Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnClient, TurnId,
 	TurnInput, TurnOptions, TurnSession, WorkspaceInput,
 };
-use omp_app::envd::{EnvServer, worker::ExtHostConfig};
 use omp_core::{Str, sf};
 use omp_e2e::support::{
 	AllowAdmission, Gate, Scratch, ScriptedGateway, ScriptedStep, ScriptedTurn, ScriptedTurnClient,
@@ -23,7 +22,8 @@ use omp_e2e::support::{
 	user_item,
 };
 use omp_env::{BlobDownloadEvent, EnvClient, ProcessAttachmentEvent};
-use omp_llm_inference::{
+use omp_envd::{EnvServer, worker::ExtHostConfig};
+use omp_inference::{
 	event::{BlockKind, ChatEvent, Completion, FinishReason},
 	provider::fake::FakeScript,
 	receipt::{ExecutionReceipt, Usage},

@@ -1,7 +1,7 @@
 //! Transport framing conformance tests.
 
 use bytes::Bytes;
-use omp_llm_inference::transport::{
+use omp_inference::transport::{
 	ConnectDecoder, ConnectEnvelope, ConnectEnvelopeKind, CrcScope, EventStreamDecoder,
 	EventStreamHeaderValue, EventStreamMessage, Frame, FramingError, FramingProtocol, NdjsonDecoder,
 	RawChunkFramer, SseDecoder, SseEvent, WebSocketDecoder, WebSocketFragment, WebSocketMessage,
@@ -426,7 +426,7 @@ fn websocket_invalid_utf8_and_truncated_fragment_are_typed() {
 		invalid.push(Bytes::from_static(b"\x81\x01\xff")),
 		Err(FramingError::InvalidUtf8 {
 			protocol: FramingProtocol::WebSocket,
-			field:    omp_llm_inference::transport::Utf8Field::WebSocketText,
+			field:    omp_inference::transport::Utf8Field::WebSocketText,
 		})
 	);
 

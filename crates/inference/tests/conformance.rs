@@ -16,11 +16,11 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt as _, stream};
-use omp_core::{Str, sf};
-use omp_llm_catalog::{
+use omp_catalog::{
 	Catalog, CodecId, ModelKey, OperationKind, PolicyModel, ProviderId, RouteId, WireTarget,
 };
-use omp_llm_inference::{
+use omp_core::{Str, sf};
+use omp_inference::{
 	AccountId, GenerationHandle, PrincipalId, ProjectId, RequestId,
 	account::{
 		AccountPool, AccountRecord, AccountSelectionRequest, ProcessRefreshRole, QuotaObservation,
@@ -103,7 +103,7 @@ fn answer(body: AnswerBody) -> Answer {
 	Answer { meta: response_meta(), receipt: ExecutionReceipt::default(), body }
 }
 
-fn empty_stream<T: Send + 'static>() -> omp_llm_inference::answer::OutputStream<T> {
+fn empty_stream<T: Send + 'static>() -> omp_inference::answer::OutputStream<T> {
 	Box::pin(stream::empty())
 }
 
@@ -432,7 +432,7 @@ fn forced_tool_and_structured_output_never_leak_provisional_events() {
 		call:  ToolCall {
 			id:        ToolCallId::from("call-fixture"),
 			name:      sf!("lookup"),
-			arguments: omp_llm_inference::call::OpaqueJson::new(serde_json::json!({"q":"rust"})),
+			arguments: omp_inference::call::OpaqueJson::new(serde_json::json!({"q":"rust"})),
 		},
 	};
 	assert_eq!(
@@ -522,10 +522,10 @@ async fn consumed_one_shot_suppresses_every_automatic_action_and_factories_are_f
 
 	let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 	let factory_opens = Arc::clone(&opens);
-	let factory = omp_llm_inference::body::BodyFactoryHandle::new(move || {
+	let factory = omp_inference::body::BodyFactoryHandle::new(move || {
 		let ordinal = factory_opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		async move {
-			let body: omp_llm_inference::body::ByteStream =
+			let body: omp_inference::body::ByteStream =
 				Box::pin(stream::iter([Ok(Bytes::from(ordinal.to_string()))]));
 			Ok(body)
 		}
@@ -669,7 +669,7 @@ fn native_wire_surface_is_a_closed_method_path_allowlist() {
 					method,
 					path,
 					&bytes,
-					omp_llm_inference::call::NativeResponseFraming::Json,
+					omp_inference::call::NativeResponseFraming::Json,
 					1024 * 1024
 				)
 				.is_ok(),
@@ -1078,8 +1078,8 @@ fn every_real_codec_constructs_fresh_attempt_decoder_state_offline() {
 		let second = codec
 			.decoder(&context)
 			.unwrap_or_else(|error| panic!("{name} second decoder: {error:?}"));
-		let first_ptr = (&*first as *const dyn omp_llm_inference::codec::Decoder) as *const ();
-		let second_ptr = (&*second as *const dyn omp_llm_inference::codec::Decoder) as *const ();
+		let first_ptr = (&*first as *const dyn omp_inference::codec::Decoder) as *const ();
+		let second_ptr = (&*second as *const dyn omp_inference::codec::Decoder) as *const ();
 		assert_ne!(first_ptr, second_ptr, "{name} reused decoder state");
 	}
 	let first = OmpNativeDecoder::new();

@@ -8,7 +8,7 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use omp_llm_inference::{
+use omp_inference::{
 	AccountId, PrincipalId,
 	account::{
 		CredentialFreshness, PersistentRefreshLease, RefreshLeaseAcquire, RefreshLeaseRequest,

@@ -39,16 +39,16 @@ use omp_app::{
 	endpoint::LocalEndpoint,
 	envd::{EnvServer, worker::ExtHostConfig},
 };
+use omp_catalog::{
+	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
+	snapshot::{Catalog, SnapshotProvenance},
+};
 use omp_core::{Str, sf};
 use omp_e2e::support::{
 	AllowAdmission, Scratch, ScriptedGateway, install_omp_binary_env, omp_binary,
 };
 use omp_env::EnvClient;
-use omp_llm_catalog::{
-	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
-	snapshot::{Catalog, SnapshotProvenance},
-};
-use omp_llm_inference::{
+use omp_inference::{
 	Answer, Error as InferenceError, Registry as InferenceRegistry,
 	call::Call,
 	event::{BlockKind, ChatEvent, Completion, FinishReason, WorkflowResponse},
@@ -531,7 +531,7 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 		.expect("project parent")
 		.join("binary-home/data");
 	let state_dir =
-		omp_app::project_state::directory(&data_dir, &project).expect("project state directory");
+		omp_env::project_state::directory(&data_dir, &project).expect("project state directory");
 	let sessions = state_dir.join("sessions");
 	fs::create_dir_all(&sessions).expect("create chat session directory");
 	fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755))
@@ -863,7 +863,7 @@ impl ChatPty {
 			.parent()
 			.expect("project parent")
 			.join("binary-home");
-		let envd_log = omp_app::project_state::directory(&home.join("data"), project)
+		let envd_log = omp_env::project_state::directory(&home.join("data"), project)
 			.expect("binary chat project state")
 			.join("envd.log");
 		fs::create_dir_all(&home).expect("create binary chat home");

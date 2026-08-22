@@ -10,13 +10,13 @@ use omp_agent::{
 	TurnInput, TurnOptions, WorkspaceInput,
 };
 use omp_app::rpc_adapter::InferenceRpc;
-use omp_core::{Ulid, sf};
-use omp_e2e::support::{Scratch, user_item, within};
-use omp_llm_catalog::{
+use omp_catalog::{
 	CompiledCatalog,
 	snapshot::{Catalog, SnapshotProvenance},
 };
-use omp_llm_inference::{
+use omp_core::{Ulid, sf};
+use omp_e2e::support::{Scratch, user_item, within};
+use omp_inference::{
 	AccountSummary, Error, ErrorKind, ErrorPhase, ExecutionReceipt, Registry, RetryAction,
 	account::AccountPool,
 	answer::AuthSession,
@@ -133,14 +133,14 @@ impl AuthLoginEngine for UnusedLogin {
 		self.0
 	}
 
-	fn supports(&self, _provider: &omp_llm_catalog::ProviderId<str>) -> bool {
+	fn supports(&self, _provider: &omp_catalog::ProviderId<str>) -> bool {
 		true
 	}
 
 	fn begin(
 		&self,
 		_request: LoginRequest,
-		_spec: omp_llm_catalog::AuthSpecId,
+		_spec: omp_catalog::AuthSpecId,
 	) -> futures::future::BoxFuture<'_, Result<AuthSession, Error>> {
 		async { Err(unused_auth_error()) }.boxed()
 	}
@@ -151,7 +151,7 @@ struct UnusedRefresh;
 impl AuthRefreshEngine for UnusedRefresh {
 	fn refresh(
 		&self,
-		_account: omp_llm_inference::AccountId,
+		_account: omp_inference::AccountId,
 	) -> futures::future::BoxFuture<'_, Result<AccountSummary, Error>> {
 		async { Err(unused_auth_error()) }.boxed()
 	}
@@ -316,7 +316,7 @@ async fn gateway(
 		AdmissionController::new(8, 8),
 		Duration::from_secs(2),
 		Arc::new(BTreeMap::new()),
-		Arc::new(omp_llm_inference::auth::CredentialShaperRegistry::new()),
+		Arc::new(omp_inference::auth::CredentialShaperRegistry::new()),
 	)
 	.with_local_routes([(
 		ROUTE.into(),

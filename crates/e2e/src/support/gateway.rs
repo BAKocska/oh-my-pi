@@ -13,12 +13,12 @@ use omp_app::{
 	daemon::{DaemonConfig, DaemonError, DaemonHandle},
 	endpoint::LocalEndpoint,
 };
-use omp_core::{Str, sf};
-use omp_llm_catalog::{
+use omp_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
 };
-use omp_llm_inference::{
+use omp_core::{Str, sf};
+use omp_inference::{
 	Answer, Error as InferenceError, Registry,
 	call::Call,
 	event::WorkflowResponse,

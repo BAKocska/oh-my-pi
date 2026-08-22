@@ -11,8 +11,8 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use omp_llm_catalog::{ProviderId, RouteId};
-use omp_llm_inference::{
+use omp_catalog::{ProviderId, RouteId};
+use omp_inference::{
 	AccountId, AccountRoutingContext, OrganizationId, PrincipalId, ProjectId, RegionId, TenantId,
 	account::{
 		AccountAffinity, AccountPool, AccountRecord, AccountRegistrationError,
@@ -399,7 +399,7 @@ fn durable_account_state_survives_reopen_and_account_removal() {
 					updated_at: at(102),
 				})
 				.unwrap_err(),
-			omp_llm_inference::account::AccountStateStoreError::IdentityConflict,
+			omp_inference::account::AccountStateStoreError::IdentityConflict,
 		);
 		pool
 			.save_affinity(AccountAffinity {
@@ -569,7 +569,7 @@ fn forbidden_rotation_retains_partial_candidate_evidence() {
 	pool.upsert(record("a", "principal-a", &route)).unwrap();
 	pool.upsert(record("b", "principal-b", &route)).unwrap();
 	pool
-		.cooldown(AccountId::new("a"), at(200), omp_llm_inference::account::CooldownReason::Health)
+		.cooldown(AccountId::new("a"), at(200), omp_inference::account::CooldownReason::Health)
 		.unwrap();
 	let mut request = selection_request(&route, at(100));
 	request.previous_account = Some(AccountId::new("a"));

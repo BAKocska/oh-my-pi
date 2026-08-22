@@ -6,8 +6,8 @@ use std::{
 	time::Duration,
 };
 
-use omp_app::envd::docs::DocumentHost;
 use omp_docserver::daemon::{self, ServeOptions, Transport};
+use omp_envd::docs::DocumentHost;
 use tokio::{net::UnixStream, task::JoinHandle};
 
 use super::{DEFAULT_TIMEOUT, within};

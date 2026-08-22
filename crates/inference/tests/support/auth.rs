@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use futures::{FutureExt as _, future::BoxFuture};
-use omp_llm_catalog::{AuthSpecId, Catalog};
-use omp_llm_inference::{
+use omp_catalog::{AuthSpecId, Catalog};
+use omp_inference::{
 	AccountId,
 	account::AccountPool,
 	answer::{AccountSummary, AuthSession},
@@ -23,7 +23,7 @@ impl AuthLoginEngine for UnusedLogin {
 		self.0
 	}
 
-	fn supports(&self, _provider: &omp_llm_catalog::ProviderId<str>) -> bool {
+	fn supports(&self, _provider: &omp_catalog::ProviderId<str>) -> bool {
 		true
 	}
 

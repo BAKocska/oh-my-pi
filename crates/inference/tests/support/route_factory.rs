@@ -8,9 +8,9 @@ use std::{
 	time::SystemTime,
 };
 
+use omp_catalog::{OperationKind, provider::RouteDef, snapshot::Catalog};
 use omp_core::sf;
-use omp_llm_catalog::{OperationKind, provider::RouteDef, snapshot::Catalog};
-use omp_llm_inference::{
+use omp_inference::{
 	answer::{Answer, AnswerBody, ResponseMeta},
 	call::{Call, OperationCall},
 	error::Error,
@@ -27,7 +27,7 @@ use tower::Service;
 pub struct RouteProbe {
 	pub readiness_polls: Arc<AtomicUsize>,
 	pub calls:           Arc<AtomicUsize>,
-	pub called_routes:   Arc<Mutex<Vec<omp_llm_catalog::RouteId>>>,
+	pub called_routes:   Arc<Mutex<Vec<omp_catalog::RouteId>>>,
 }
 
 impl RouteComposer for RouteProbe {
@@ -56,8 +56,8 @@ impl RouteStackFactory for RouteProbe {
 
 #[derive(Clone)]
 struct CountingRoute {
-	provider: omp_llm_catalog::ProviderId,
-	route:    omp_llm_catalog::RouteId,
+	provider: omp_catalog::ProviderId,
+	route:    omp_catalog::RouteId,
 	probe:    RouteProbe,
 }
 
@@ -86,14 +86,14 @@ impl Service<LayerCall<Call>> for CountingRoute {
 			provider_request_id: Some(sf!("route-probe")),
 			created_at:          SystemTime::UNIX_EPOCH,
 		};
-		let body = AnswerBody::Chat(omp_llm_inference::answer::ChatStream::ordinary(Box::pin(
+		let body = AnswerBody::Chat(omp_inference::answer::ChatStream::ordinary(Box::pin(
 			futures::stream::empty(),
 		)));
 		ready(Ok(Answer { meta, receipt: context.receipt(), body }))
 	}
 }
 
-pub const fn supports_chat(model: &omp_llm_catalog::ModelSpec) -> bool {
+pub const fn supports_chat(model: &omp_catalog::ModelSpec) -> bool {
 	model
 		.capabilities
 		.operations

@@ -8,8 +8,8 @@ use std::{
 };
 
 use bytes::BytesMut;
-use omp_app::envd::{EnvServer, worker::ExtHostConfig};
 use omp_env::{Admitter, BlobDownloadEvent, EnvClient};
+use omp_envd::{EnvServer, worker::ExtHostConfig};
 use omp_proto::{
 	SCHEMA_REV,
 	blob::v1::GetRequest,
@@ -52,7 +52,7 @@ pub struct EnvHarness {
 	client:      EnvClient,
 	socket:      PathBuf,
 	shutdown:    CancellationToken,
-	server_task: Option<JoinHandle<Result<(), omp_app::envd::EnvdError>>>,
+	server_task: Option<JoinHandle<Result<(), omp_envd::EnvdError>>>,
 	client_task: Option<JoinHandle<io::Result<()>>>,
 	server:      Arc<EnvServer>,
 }

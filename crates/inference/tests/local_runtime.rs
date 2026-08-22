@@ -12,8 +12,8 @@ use std::{
 };
 
 #[cfg(feature = "local-applefm")]
-use omp_llm_inference::local::applefm::{AppleFm, AppleFmFeatureEvidence, AppleFmSupportState};
-use omp_llm_inference::local::{
+use omp_inference::local::applefm::{AppleFm, AppleFmFeatureEvidence, AppleFmSupportState};
+use omp_inference::local::{
 	ArtifactSpec, ArtifactStore, LocalCancellation, LocalErrorKind, LocalRuntime, MemoryPool,
 };
 use sha2::{Digest, Sha256};
@@ -58,7 +58,7 @@ fn memory_reservations_and_failed_loads_release_capacity() {
 	assert_eq!(memory.used(), 0);
 
 	let runtime = LocalRuntime::<()>::new(
-		|| Err(omp_llm_inference::local::LocalError::new(LocalErrorKind::Backend, "load failed")),
+		|| Err(omp_inference::local::LocalError::new(LocalErrorKind::Backend, "load failed")),
 		Arc::clone(&memory),
 		64,
 		1,

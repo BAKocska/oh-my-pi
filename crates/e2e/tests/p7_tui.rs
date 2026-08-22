@@ -36,12 +36,12 @@ use omp_app::{
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
 };
-use omp_core::{Str, sf};
-use omp_llm_catalog::{
+use omp_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
 };
-use omp_llm_inference::{
+use omp_core::{Str, sf};
+use omp_inference::{
 	Answer, Error as InferenceError, Registry,
 	answer::{AnswerBody, ChatStream},
 	call::{Call, ContentPart, OpaqueJson, OperationCall},
@@ -875,7 +875,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
 	)
 	.expect("use standard project metadata permissions");
-	let state_dir = omp_app::project_state::directory(&scratch.path().join("home/data"), &project)
+	let state_dir = omp_env::project_state::directory(&scratch.path().join("home/data"), &project)
 		.expect("project state directory");
 	std::fs::create_dir_all(&state_dir).expect("create project state directory");
 	std::fs::set_permissions(
@@ -883,7 +883,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
 	)
 	.expect("use standard project state permissions");
-	let docserver_socket = omp_app::project_state::document_socket(&state_dir);
+	let docserver_socket = omp_env::project_state::document_socket(&state_dir);
 	let docserver =
 		omp_e2e::support::DocServerTask::spawn(project.clone(), docserver_socket.clone(), Vec::new())
 			.await

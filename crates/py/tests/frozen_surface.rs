@@ -11,8 +11,10 @@ fn frozen_surface_contract() {
 				c_str!(
 					r#"
 import asyncio
+import base64
 import dataclasses
 import importlib
+import json
 import typing
 
 import omp
@@ -45,6 +47,7 @@ for suffix in (
     "env", "ui", "hooks", "events", "prompts", "packages",
     "campaigns",
     "sessions", "journal", "artifacts", "index", "diagnostics", "urls", "devices",
+    "scribe",
 ):
     module = importlib.import_module(f"omp.{suffix}")
     for name in module.__all__:
@@ -171,6 +174,11 @@ registry_module.configure_manifest(
             "decorated-ui-renderer",
             "verdict_renderer",
             "__decorated_ui__@ui.1",
+        ),
+        executable_declaration(
+            "surface-verdict-renderer",
+            "verdict_renderer",
+            "surface_device@.1",
         ),
         executable_declaration(
             "discovery-provider", "provider", "discovery-test"
@@ -311,8 +319,109 @@ assert three_turn_verdicts == ["continue", "continue", "force"]
 assert three_turn_declaration.state.decode(three_turn_state) == ThreeTurnState(3)
 
 
-class CampaignBackend:
+class FrozenControlHost:
+    def __init__(self):
+        self.calls = []
+        self.effects = []
+        self.secret_rules = []
+
+    def effect(self, effect):
+        self.effects.append(effect)
+
+    def tier_of(self, target):
+        return {
+            "core": "read",
+            "device": "write",
+            "mcp": "privileged",
+        }.get(target["kind"])
+
+    def current_session(self):
+        return self._session_row("surface-session")
+
+    def declare_secret(self, rule):
+        json.dumps(rule)
+        self.secret_rules.append(rule)
+
+    def mask_secret(self, text):
+        return text.replace("TOKEN", "$$CRED_SURFACEVALUE$$")
+
+    @staticmethod
+    def _usage():
+        return {
+            "input_tokens": 11,
+            "cached_input_tokens": 2,
+            "output_tokens": 7,
+            "reasoning_tokens": 3,
+            "cache_write_tokens": 1,
+            "requests": 1,
+            "cost_usd": 0.02,
+            "wall_ms": 25,
+        }
+
+    @staticmethod
+    def _agent(spec=None):
+        return {
+            "run_id": "run-1",
+            "session_id": "child-session",
+            "name": "Surface",
+            "agent": "task",
+            "depth": 1,
+            "effective_max_depth": 0,
+            "spec": spec or {"task": "t", "agent": "task"},
+            "worktree_path": None,
+            "output_url": "agent://surface",
+            "transcript_url": "history://surface",
+        }
+
+    @staticmethod
+    def _session_row(session_id, title="Surface"):
+        return {
+            "id": session_id,
+            "title": title,
+            "title_source": "user",
+            "cwd": "/workspace",
+            "project": "/workspace",
+            "created_ms": 10,
+            "updated_ms": 20,
+            "status": "complete",
+            "kind": "interactive",
+            "parent": None,
+            "entries": 1,
+            "turns": 1,
+            "usage": {
+                "input": 5, "output": 7, "cache_read": 2, "cache_write": 1,
+                "reasoning": 3, "premium_requests": 0, "context": 20,
+                "total": 15, "accuracy": "exact", "detail": {},
+            },
+            "cost": {
+                "nanos_usd": 42, "estimated": False,
+                "input_nanos_usd": 17, "output_nanos_usd": 25,
+            },
+            "models": ["acme/model"],
+            "remote": False,
+        }
+
+    @staticmethod
+    def _worker(generation):
+        return {
+            "name": "surface-worker",
+            "generation": generation,
+            "state": "ready",
+            "site": {"kind": "env", "process": None, "ready": None},
+            "pid": 17,
+            "spawned_at_ms": 100,
+            "last_call_at_ms": None,
+            "calls": 2,
+            "in_flight": 0,
+            "code_cached": 1,
+            "enforced": [],
+            "fault": None,
+        }
+
     async def request(self, operation, arguments):
+        self.calls.append((operation, arguments))
+        if operation not in {"omp.ui.dynamic_mount", "omp.jobs.register"}:
+            json.dumps(arguments, allow_nan=False)
         if operation == "omp.campaigns.engage":
             return {
                 "id": "eng-1",
@@ -329,17 +438,242 @@ class CampaignBackend:
             }]
         if operation == "omp.campaigns.disengage":
             return arguments["engagement"] == "eng-1"
-        raise AssertionError(operation)
+        if operation == "omp.telemetry.export.stats":
+            return {
+                "sent": 8, "dropped": 1, "failures": 0, "queue_depth": 2,
+                "last_flush_ms": 9, "last_error": None, "backoff_ms": 0,
+            }
+        if operation == "omp.telemetry.query":
+            return {
+                "rows": [{
+                    "events": [], "bindings": {}, "session": "s", "turn": 0,
+                    "values": {"rev": "edit@hl.3"},
+                }],
+                "total": 1, "cursor": None, "truncated": False,
+                "scanned_sessions": 1, "scanned_events": 1,
+                "backfilled": False, "floored": False, "elapsed_ms": 1,
+            }
+        if operation == "omp.agents.completion":
+            return {
+                "text": "allow", "choice": None, "data": None,
+                "usage": self._usage(), "model": "test/model", "fell_back": False,
+            }
+        if operation == "omp.agents.spawn":
+            return self._agent(arguments["spec"])
+        if operation == "omp.agents.send":
+            return "delivered"
+        if operation == "omp.agents.rewind":
+            return {
+                "head": 3, "dropped_items": 2, "scope": arguments["scope"],
+                "restore": None, "dry_run": arguments["dry_run"],
+            }
+        if operation == "omp.agents.schedule":
+            return {"id": "schedule-1", "name": arguments["name"]}
+        if operation == "omp.context.compact":
+            return {
+                "schema": "omp.context.compact.v1",
+                "result": {
+                    "preparation_id": "compact-1",
+                    "tiers_run": ["prune", "local"],
+                    "from_extension": None,
+                    "tokens_before": 90,
+                    "tokens_after": 40,
+                    "first_kept_id": "item-4",
+                    "epoch": 8,
+                    "summary_bytes": 20,
+                    "warning": None,
+                },
+            }
+        if operation == "omp.context.view":
+            return {
+                "schema": "omp.context.view.v1",
+                "result": {
+                    "session_id": "surface-session",
+                    "turn_id": "surface-turn",
+                    "model": "test/model",
+                    "provider": "test",
+                    "epoch": 7,
+                    "messages": [],
+                    "usage": {
+                        "total_tokens": 10,
+                        "context_window": 100,
+                        "reserve_tokens": 10,
+                        "usable_tokens": 90,
+                        "fraction": 1 / 9,
+                        "prompt_head_tokens": 1,
+                        "device_catalog_tokens": 2,
+                        "message_tokens": 7,
+                        "catalog_notice_tokens": 0,
+                        "media_tokens": 0,
+                        "compaction_epoch": 7,
+                        "threshold_fraction": 0.8,
+                        "in_flight": False,
+                    },
+                    "prompt_hash": "deadbeef",
+                    "reset_event": None,
+                },
+            }
+        if operation == "omp.context.epoch":
+            return {"schema": "omp.context.epoch.v1", "result": 7}
+        if operation == "omp.journal.append":
+            return {
+                "schema": "omp.journal.append.v1",
+                "result": {"session": "surface-session", "index": 1},
+            }
+        if operation == "omp.journal.latest":
+            return {"schema": "omp.journal.latest.v1", "result": None}
+        if operation == "omp.journal.entries":
+            return {"schema": "omp.journal.entries.v1", "result": []}
+        if operation == "omp.hooks.dispatch":
+            return {"kind": "deny", "reason": "host composed", "fatal": False,
+                    "code": "SURFACE"}
+        if operation == "omp.creds.usage":
+            return {
+                "windows": [{"id": "requests", "used": 2, "limit": 10,
+                             "fraction": "0.2", "unit": "requests"}],
+                "plan": "surface",
+            }
+        if operation in {"omp.provider.retract", "omp.provider.replace"}:
+            return None
+        if operation == "omp.provider.models":
+            return [catalog_card]
+        if operation == "omp.provider.watch_models":
+            return [
+                catalog_event,
+                {
+                    "cursor": {"epoch": b"catalog-epoch", "generation": 8},
+                    "removed_id": catalog_card.id,
+                },
+            ]
+        if operation == "omp.provider.request":
+            requested = arguments["operation"]
+            if requested == "generate_image":
+                return {
+                    "images": [{"hash": "00" * 32, "size": 3}],
+                    "cost_nanos_usd": 17,
+                }
+            if requested == "speak":
+                return {
+                    "audio": {"hash": "00" * 32, "size": 3},
+                    "format": "mp3",
+                    "cost_nanos_usd": 11,
+                }
+            if requested == "transcribe":
+                return {"text": "hello", "language": "en", "cost_nanos_usd": 13}
+            if requested == "realtime":
+                return {
+                    "id": "rtc-surface",
+                    "endpoint": {"id": "endpoint-surface"},
+                    "credential": {"id": "credential-surface"},
+                    "expires_at_ms": 2_000_000_000_000,
+                    "transport": "webrtc",
+                }
+        if operation == "omp.sessions.get":
+            return self._session_row(arguments["session_id"])
+        if operation == "omp.sessions.lineage":
+            return [{"id": arguments["session_id"], "parent": None, "at": 1}]
+        if operation in {"omp.sessions.resume", "omp.sessions.rename"}:
+            return self._session_row(
+                arguments["session_id"], arguments.get("title", "Surface")
+            )
+        if operation == "omp.sessions.delete":
+            raise omp.PermissionDenied("deletion requires host approval")
+        if operation == "omp.policy.pending":
+            return [{
+                "ticket_id": "ticket-1",
+                "invocation_id": "call-1",
+                "reasons": [{
+                    "title": "Run command", "body": "Review execution",
+                    "subject": "echo ok",
+                }],
+                "state": "pending",
+                "decision": None,
+                "created_at": 1.5,
+            }]
+        if operation == "omp.policy.decide":
+            return None
+        if operation == "omp.prompts.invalidate":
+            return 4
+        if operation.startswith("omp.workers."):
+            action = operation.rsplit(".", 1)[1]
+            if action == "restart":
+                return self._worker(2)
+            if action in {"get", "info"}:
+                return self._worker(arguments.get("generation", 1))
+        if operation == "omp.ui.dynamic_mount":
+            return tuple(spec.name for spec in arguments["commands"])
+        if operation == "omp.ui.overlay_events":
+            return [
+                {
+                    "kind": "highlighted", "id": "threads",
+                    "value": "thread-2", "values": {"threads": "thread-2"},
+                },
+                {"kind": "cancel", "values": {}},
+            ]
+        if operation == "omp.devices.invoke":
+            return {"value": arguments["args"]["value"], "admitted": True}
+        if operation == "omp.jobs.register":
+            return job_ref
+        if operation == "omp.artifacts.stat":
+            return {
+                "ref": {
+                    "id": artifact_ref.id, "hash": artifact_ref.hash,
+                    "media_type": artifact_ref.media_type,
+                    "byte_len": artifact_ref.byte_len,
+                },
+                "url": str(artifact_ref.url),
+                "media_type": artifact_ref.media_type,
+                "byte_len": artifact_ref.byte_len,
+                "description": "surface artifact",
+                "lifetime": "session",
+                "created_ms": 30,
+                "source": "extension:acme-ext",
+                "reachable_from": [],
+                "lines": 1,
+            }
+        if operation == "omp.mcp.mount":
+            return {
+                "catalog_epoch": 9,
+                "devices": [{
+                    "name": "surface_echo", "family": "mcp", "rev": 1,
+                    "server": "surface",
+                    "definition": {
+                        "name": "echo", "description": "Echo",
+                        "inputSchema": {"type": "object"},
+                    },
+                    "documentation": "Surface server",
+                }],
+            }
+        if operation == "omp.mcp.invoke":
+            return {
+                "content": [{"type": "text", "text": "echo"}],
+                "structured_content": {"value": arguments["arguments"]["value"]},
+                "meta": None, "is_error": False, "truncated": False,
+                "dispatch_certainty": 2, "retry_count": 0,
+                "auth_retried": False, "effects_unknown": False,
+            }
+        if operation == "omp.mcp.unmount":
+            return {"removed": True}
+        if operation == "omp.params.args":
+            return {"value": {"query": "needle"}, "phase": "ARGS_FINALIZED"}
+        if operation == "omp.params.raw":
+            return '{"query":"needle"}'
+        if operation == "omp.params.committed":
+            return {"value": '{"query":"needle"}', "phase": "EFFECTS_AUTHORIZED"}
+        if operation == "omp.urls.read":
+            return "authoritative surface"
+        raise AssertionError(f"unexpected CONTROL operation: {operation}")
 
 
-campaign_backend_token = omp._control_backend.set(CampaignBackend())
-try:
-    engaged = asyncio.run(omp.campaigns.engage("surface-campaign", state=surface_state))
-    assert engaged.state == surface_state
-    assert asyncio.run(omp.campaigns.active()) == (engaged,)
-    assert asyncio.run(omp.campaigns.disengage("eng-1"))
-finally:
-    omp._control_backend.reset(campaign_backend_token)
+frozen_host = FrozenControlHost()
+omp._install_control_backend(frozen_host)
+engaged = asyncio.run(omp.campaigns.engage("surface-campaign", state=surface_state))
+assert engaged.state == surface_state
+assert asyncio.run(omp.campaigns.active()) == (engaged,)
+assert asyncio.run(omp.campaigns.disengage("eng-1"))
+assert frozen_host.calls[-1] == (
+    "omp.campaigns.disengage", {"engagement": "eng-1"}
+)
 
 
 mode_claim_error = expect_raises(
@@ -706,9 +1040,10 @@ expect_raises(
     ),
 )
 export_handle = telemetry.export(telemetry.OtlpTarget(endpoint="https://x"))
-asyncio.run(expect_raises_async(omp.NotWiredError, export_handle.stats()))
+export_stats = asyncio.run(export_handle.stats())
+assert export_stats.sent == 8 and export_stats.queue_depth == 2
 
-# Agents values, validation, unwired host arms, and real local timer behavior.
+# Agents values, validation, authoritative host requests, and real local timer behavior.
 assert [field.name for field in dataclasses.fields(omp.agents.Usage)] == [
     "input_tokens",
     "cached_input_tokens",
@@ -732,11 +1067,13 @@ assert "history://r" in str(
 
 
 async def agents_contract():
-    await expect_raises_async(omp.NotWiredError, omp.agents.spawn(spec))
-    await expect_raises_async(
-        omp.NotWiredError, omp.agents.send("peer", "message")
-    )
-    await expect_raises_async(omp.NotWiredError, omp.agents.rewind(None))
+    handle = await omp.agents.spawn(spec)
+    assert handle.output_url.uri == "agent://surface"
+    assert frozen_host.calls[-1][0] == "omp.agents.spawn"
+    receipt = await omp.agents.send("peer", "message")
+    assert receipt is omp.agents.Receipt.DELIVERED
+    rewind = await omp.agents.rewind(None)
+    assert rewind.head == 3 and rewind.dropped_items == 2
 
     fired = asyncio.Event()
     firings = 0
@@ -756,7 +1093,11 @@ async def agents_contract():
 asyncio.run(agents_contract())
 
 # Context and compaction values.
-asyncio.run(expect_raises_async(omp.NotWiredError, omp.context.compact()))
+compacted = asyncio.run(
+    omp.context.compact(tier=omp.CompactionTier.LOCAL, focus="facts")
+)
+assert compacted.epoch == 8 and compacted.tokens_before == 90
+assert frozen_host.calls[-1][1]["focus"] == "facts"
 assert omp.CustomSummary(summary="s", first_kept_id="m1").summary == "s"
 assert issubclass(omp.CompactionBusy, omp.OmpError)
 expect_raises(LookupError, omp.Context.current)
@@ -834,7 +1175,11 @@ assert provider_module.ErrorKind.RATE_LIMITED.value == "rate_limited"
 assert omp.env.DocEventKind.WATCH_RESCANNED.value == "watch_rescanned"
 spill = omp.Spill(b"payload", media_type="text/plain")
 assert spill.value == b"payload" and spill.media_type == "text/plain"
-asyncio.run(expect_raises_async(omp.OmpError, omp.workers.restart("missing")))
+restarted_worker = asyncio.run(omp.workers.restart("surface-worker"))
+assert restarted_worker.generation == 2
+assert frozen_host.calls[-1] == (
+    "omp.workers.restart", {"name": "surface-worker", "grace": 5.0}
+)
 
 # Streaming device frames: typed progress and terminal results round-trip.
 update = omp.Update(stage="running")
@@ -861,7 +1206,13 @@ def parse_search(query, response):
     return (search_result,)
 assert usage_projection.__omp_hooks__[-1].phase == "domain"
 assert parse_search.__omp_hooks__[-1].phase == "domain"
-asyncio.run(expect_raises_async(omp.NotWiredError, omp.hooks.dispatch_hook("search_parse")))
+composed_hook = asyncio.run(
+    omp.hooks.dispatch_hook("tool_call", {"call_id": "surface-call"})
+)
+assert composed_hook == omp.Deny(
+    "host composed", fatal=False, code="SURFACE"
+)
+assert frozen_host.calls[-1][1]["event"] == "tool_call"
 
 # Telemetry queries and session lifecycle payloads are typed host-owned values.
 telemetry_module = importlib.import_module("omp.telemetry")
@@ -906,7 +1257,9 @@ session_end = telemetry_module.SessionEnd(
     faults=0, issues=0,
 )
 assert envelope.session == session_start.session == turn_start.session == turn_end.session == session_end.session
-asyncio.run(expect_raises_async(omp.NotWiredError, telemetry_module.query(telemetry_query)))
+queried = asyncio.run(telemetry_module.query(telemetry_query))
+assert queried.rows[0]["rev"] == "edit@hl.3"
+assert frozen_host.calls[-1][0] == "omp.telemetry.query"
 
 # Credentials: manifest-scoped host arms expose typed metadata and scoped tokens.
 creds_module = importlib.import_module("omp.creds")
@@ -919,7 +1272,9 @@ credential_meta = omp.CredentialMeta(1, "example", None, omp.CredentialKind.API_
 scoped_token = omp.ScopedToken("scoped", 123)
 assert credential_meta.kind.value == "api_key"
 assert scoped_token.token == "scoped" and scoped_token.expires_at_ms == 123
-asyncio.run(expect_raises_async(omp.NotWiredError, omp.creds.usage()))
+credential_usage = asyncio.run(omp.creds.usage())
+assert credential_usage.plan == "surface"
+assert str(credential_usage.windows[0].fraction) == "0.2"
 
 # UI commands, transcript activation, and renderer collisions.
 async def complete_managed(query, ctx):
@@ -1071,12 +1426,15 @@ discovery_provider = omp.ProviderSpec(
 )
 discovery_handle = omp.provider(discovery_provider)
 assert discovery_handle.id == "discovery-test"
-asyncio.run(expect_raises_async(omp.NotWiredError, discovery_handle.retract()))
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError, discovery_handle.replace(discovery_provider)
-    )
+asyncio.run(discovery_handle.retract())
+asyncio.run(discovery_handle.replace(discovery_provider))
+assert frozen_host.calls[-2] == (
+    "omp.provider.retract", {"provider": "discovery-test"}
 )
+replace_operation, replace_arguments = frozen_host.calls[-1]
+assert replace_operation == "omp.provider.replace"
+assert replace_arguments["provider"] == "discovery-test"
+assert replace_arguments["spec"]["id"] == "discovery-test"
 @omp.hook("models_discover", provider="discovery-test")
 def discover_models(query, ctx):
     return page
@@ -1112,21 +1470,37 @@ asyncio.run(
         TypeError, omp.env.proc.ensure("invalid-ready", "true", ready=object())
     )
 )
-asyncio.run(expect_raises_async(omp.NotWiredError, omp.env.http_get("https://example.test")))
 process = omp.env.Process("p", 7)
-expect_raises(omp.NotWiredError, lambda: process.endpoint)
-asyncio.run(expect_raises_async(omp.NotWiredError, process.restart()))
 assert hasattr(omp.env.Run, "stdin") and not hasattr(omp.env.Run, "write")
 
-class ProcessProbeBackend:
+class FrozenDataHost:
     def __init__(self):
         self.calls = []
 
     async def request(self, operation, arguments):
         self.calls.append((operation, arguments))
+        if operation == "omp.env.worktree":
+            return {
+                "id": "surface-worktree",
+                "root": "workspace",
+                "base": "main",
+                "generation": 7,
+            }
+        if operation in {"omp.env.http.get", "omp.env.http.post", "omp.env.http.put"}:
+            return {
+                "status": 200,
+                "headers": {"content-type": "application/json"},
+                "body": b'{"ok":true}',
+                "final_url": arguments["url"],
+            }
         if operation == "omp.env.Process.restart":
-            return {"name": "p", "generation": 8}
+            return {"name": "p", "generation": 8, "endpoint": "unix://p-8"}
+        if operation == "omp.env.blobs.get":
+            return b"artifact dat"
         return process_info
+
+    def process_endpoint(self, name, generation):
+        return f"unix://{name}-{generation}"
 
     def stream(self, operation, arguments):
         self.calls.append((operation, arguments))
@@ -1146,12 +1520,34 @@ async def exercise_process_fence(backend):
     await process.stop(grace=omp.Duration("1s"))
     await omp.env.Run(b"run").stdin(b"x")
 
-process_backend = ProcessProbeBackend()
-process_binding = omp.env._binding.set((process_backend, None))
-asyncio.run(exercise_process_fence(process_backend))
-omp.env._binding.reset(process_binding)
+data_host = FrozenDataHost()
+data_tokens = omp.env._install_backend(
+    data_host,
+    omp.env.EnvInfo(
+        workspace_id=b"surface-workspace",
+        root=omp.EnvPath("workspace"),
+        server_epoch=b"surface-epoch",
+        server_version="1.0.0",
+        server_build="frozen-surface",
+        schema_rev=1,
+        capabilities=frozenset({
+            omp.env.Capability.BLOB,
+            omp.env.Capability.NET,
+            omp.env.Capability.PROCESS,
+            omp.env.Capability.WORKTREE,
+        }),
+        remote=False,
+    ),
+)
+http_response = asyncio.run(omp.env.http_get("https://example.test"))
+assert omp.env.info().server_epoch == b"surface-epoch"
+assert http_response.json() == {"ok": True}
+assert process.endpoint == "unix://p-7"
+worktree = asyncio.run(omp.env.worktree())
+assert worktree.id == "surface-worktree" and worktree.generation == 7
+asyncio.run(exercise_process_fence(data_host))
 process_operations = {
-    operation for operation, _ in process_backend.calls
+    operation for operation, _ in data_host.calls
     if operation.startswith("omp.env.Process.")
 }
 assert process_operations == {
@@ -1161,12 +1557,12 @@ assert process_operations == {
 }
 assert all(
     arguments["generation"] == 7
-    for operation, arguments in process_backend.calls
+    for operation, arguments in data_host.calls
     if operation.startswith("omp.env.Process.")
 )
-assert ("omp.env.Run.stdin", {"run": b"run", "data": b"x"}) in process_backend.calls
+assert ("omp.env.Run.stdin", {"run": b"run", "data": b"x"}) in data_host.calls
 
-# Secrets: typed declarations and Core-owned masking fail closed without host arms.
+# Secrets: typed declarations and Core-owned masking use the installed authority.
 assert omp.secrets is not None
 secret_rule = omp.SecretRule(
     "TOKEN", kind=omp.SecretKind.ENV, mode=omp.SecretMode.REDACT,
@@ -1175,8 +1571,11 @@ secret_rule = omp.SecretRule(
 assert secret_rule.pattern == "TOKEN" and secret_rule.replacement == "[secret]"
 assert tuple(member.value for member in omp.SecretKind) == ("literal", "regex", "env")
 assert tuple(member.value for member in omp.SecretMode) == ("obfuscate", "redact")
-expect_raises(omp.NotWiredError, lambda: omp.secrets.declare(secret_rule))
-expect_raises(omp.NotWiredError, lambda: omp.secrets.mask("TOKEN"))
+omp.secrets.declare(secret_rule)
+assert frozen_host.secret_rules[-1]["content"] == "TOKEN"
+masked_secret = omp.secrets.mask("TOKEN")
+assert masked_secret == "$$CRED_SURFACEVALUE$$"
+assert omp.secrets.is_masked(masked_secret)
 
 # Residual closures: catalog, Environment values, journal projections, and URL reads.
 devices_module = importlib.import_module("omp.devices")
@@ -1191,12 +1590,36 @@ path_meta = omp.env.PathMeta(
     omp.EnvPath("src"), omp.env.FileKind.DIRECTORY, 0,
 )
 assert path_meta.kind is omp.env.FileKind.DIRECTORY
-asyncio.run(expect_raises_async(omp.NotWiredError, omp.env.worktree()))
-expect_raises(omp.NotWiredError, lambda: omp.journal.latest("missing"))
-expect_raises(
-    omp.NotWiredError,
-    lambda: omp.journal.fold("missing", lambda state, _entry: state, 0),
+assert asyncio.run(omp.env.worktree()) == worktree
+
+@omp.entry_kind("acme.surface-entry", rev="1", spill=False)
+@dataclasses.dataclass(frozen=True, slots=True)
+class SurfaceEntry:
+    value: int
+
+async def journal_contract():
+    projected = await omp.context.view()
+    assert projected.epoch == 7 and projected.usage.usable_tokens == 90
+    async with omp.context.lane(strict_epoch=True):
+        appended = await omp.journal.append(
+            SurfaceEntry(3), idempotency_key="surface-append"
+        )
+    assert appended == omp.EntryId("surface-session", 1)
+    assert await omp.journal.latest(SurfaceEntry) is None
+    total, watermark = await omp.journal.fold(
+        SurfaceEntry, lambda state, entry: state + entry.value.value, 0
+    )
+    assert total == 0 and watermark is None
+
+asyncio.run(journal_contract())
+append_request = next(
+    arguments for operation, arguments in frozen_host.calls
+    if operation == "omp.journal.append"
 )
+assert append_request["idempotency_key"] == "surface-append"
+assert append_request["expected_context_epoch"] == 7
+assert append_request["entry"]["kind"] == "acme.surface-entry"
+assert json.loads(append_request["entry"]["data"]) == {"value": 3}
 assert asyncio.iscoroutinefunction(omp.urls.read)
 
 # Turn inference selection: thinking patches and scope-backed route/effort.
@@ -1259,14 +1682,19 @@ expect_raises(
     dataclasses.FrozenInstanceError,
     lambda: setattr(session_link, "parent", None),
 )
-for session_call in (
-    omp.sessions.get("missing"),
-    omp.sessions.lineage("missing"),
-    omp.sessions.resume("missing"),
-    omp.sessions.rename("missing", "New title"),
-    omp.sessions.delete("missing"),
-):
-    asyncio.run(expect_raises_async(omp.NotWiredError, session_call))
+assert omp.sessions.current().id == "surface-session"
+session_info = asyncio.run(omp.sessions.get("surface-session"))
+assert session_info.id == "surface-session" and session_info.usage.reasoning == 3
+lineage = asyncio.run(omp.sessions.lineage("surface-session"))
+assert lineage == (omp.SessionLink("surface-session", None, 1),)
+assert asyncio.run(omp.sessions.resume("surface-session")).id == "surface-session"
+renamed = asyncio.run(omp.sessions.rename("surface-session", "New title"))
+assert renamed.title == "New title"
+asyncio.run(
+    expect_raises_async(
+        omp.PermissionDenied, omp.sessions.delete("surface-session")
+    )
+)
 
 # Schedules: payload-bearing delivery and schedule attribution.
 schedule_trigger = omp.agents.Every(
@@ -1287,12 +1715,14 @@ assert schedule_delivery.prompt == "poll chat replies"
 assert "schedule_id" in {
 	field.name for field in dataclasses.fields(omp.BeforeAgentStartEvent)
 }
-asyncio.run(
-	expect_raises_async(
-		omp.NotWiredError,
-		omp.agents.schedule("chat-poll", schedule_trigger, schedule_delivery),
-	)
+scheduled = asyncio.run(
+    omp.agents.schedule("chat-poll", schedule_trigger, schedule_delivery)
 )
+assert scheduled.id == "schedule-1"
+schedule_request = frozen_host.calls[-1]
+assert schedule_request[0] == "omp.agents.schedule"
+assert schedule_request[1]["trigger"]["interval_ms"] == 60_000
+assert schedule_request[1]["delivery"]["kind"] == "inject"
 # Approvals: frozen external registration and idempotent late resolution.
 @omp.approver(
     "test-approver",
@@ -1313,12 +1743,27 @@ approval_decision = omp.ApprovalDecision(
     False, omp.PolicyScope.ONCE, omp.ApprovalSource.EXTERNAL,
     "test-approver", "denied", False,
 )
-asyncio.run(expect_raises_async(omp.NotWiredError, omp.policy.pending()))
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError, omp.policy.decide("ticket-1", approval_decision)
+pending_tickets = asyncio.run(omp.policy.pending())
+assert pending_tickets[0].ticket_id == "ticket-1"
+asyncio.run(omp.policy.decide("ticket-1", approval_decision))
+first_decision_request = frozen_host.calls[-1]
+assert first_decision_request[1]["decision"]["source"] == "external"
+asyncio.run(omp.policy.decide("ticket-1", approval_decision))
+assert frozen_host.calls[-1] == first_decision_request
+assert omp.tier_of(omp.CoreTool("read", "1", {})) is omp.Tier.READ
+assert asyncio.run(omp.prompts.invalidate("memory")) == 4
+
+authority_token = omp._control_backend.set(None)
+try:
+    asyncio.run(
+        expect_raises_async(omp.NotWiredError, omp.policy.pending())
     )
-)
+    expect_raises(
+        omp.PolicyError,
+        lambda: omp.tier_of(omp.CoreTool("read", "1", {})),
+    )
+finally:
+    omp._control_backend.reset(authority_token)
 
 # Provider catalog: overlays, successor rotation, ADC, refresh, and image requests.
 image_dimensions = omp.Dimensions(1024, 1024)
@@ -1391,12 +1836,17 @@ async def refresh_provider(req, ctx):
     return None
 
 assert refresh_provider.__omp_hooks__[-1].phase == "domain"
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        overlay_handle.request(omp.Operation.GENERATE_IMAGE, image_request),
-    )
+generated_image = asyncio.run(
+    overlay_handle.request(omp.Operation.GENERATE_IMAGE, image_request)
 )
+assert generated_image.cost_nanos_usd == 17
+assert generated_image.images == (omp.BlobRef(bytes(32), 3),)
+provider_request = frozen_host.calls[-1]
+assert provider_request[0] == "omp.provider.request"
+assert provider_request[1]["operation"] == "generate_image"
+assert provider_request[1]["request"]["dimensions"] == {
+    "width": 1024, "height": 1024,
+}
 
 # UI residuals: clipboard effects, frozen shortcuts, and host-fed overlay events.
 assert omp.shortcut is omp.ui.shortcut
@@ -1420,11 +1870,10 @@ assert shortcut_definition.description == "Cut composer text"
 assert shortcut_definition.when == frozenset({omp.ui.Phase.IDLE})
 assert shortcut_definition.handler is copy_cut_shortcut
 
-clipboard_effects = []
-omp.ui._install_effect_sink(clipboard_effects.append)
+effect_count = len(frozen_host.effects)
+omp._install_control_backend(frozen_host)
 omp.ui.set_clipboard("copied text")
-omp.ui._install_effect_sink(None)
-assert clipboard_effects == [
+assert frozen_host.effects[effect_count:] == [
     {"kind": "set_clipboard", "body": {"text": "copied text"}}
 ]
 
@@ -1445,62 +1894,50 @@ highlighted_event = omp.ui.OverlayEvent(
 )
 assert highlighted_event.query is None
 
-async def overlay_event_request(kind, **body):
-    assert kind == "overlay_events" and body == {"id": "side-chat"}
-    async def host_events():
-        yield highlighted_event
-        yield {"kind": "cancel", "values": {}}
-    return host_events()
-
 async def collect_overlay_events():
     handle = omp.ui.OverlayHandle("side-chat")
     return [event async for event in handle.events()]
 
-original_ui_request = omp.ui._request
-omp.ui._request = overlay_event_request
-try:
-    overlay_events = asyncio.run(collect_overlay_events())
-finally:
-    omp.ui._request = original_ui_request
+overlay_events = asyncio.run(collect_overlay_events())
 assert overlay_events == [
     highlighted_event,
     omp.ui.OverlayEvent(omp.ui.EventKind.CANCEL),
 ]
 
-# Env HTTP: scoped GET, POST, and PUT host arms remain explicit when unwired.
+# Env HTTP: scoped GET, POST, and PUT host arms preserve request semantics.
 assert {"http_get", "http_post", "http_put"} <= set(omp.env.__all__)
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        omp.env.http_get(
-            "https://example.test",
-            timeout=omp.Duration("2s"),
-            headers={"accept": "application/json"},
-        ),
+http_get = asyncio.run(
+    omp.env.http_get(
+        "https://example.test",
+        timeout=omp.Duration("2s"),
+        headers={"accept": "application/json"},
     )
 )
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        omp.env.http_post(
-            "https://example.test",
-            body=b"{}",
-            headers={"content-type": "application/json"},
-            timeout=omp.Duration("2s"),
-        ),
+http_post = asyncio.run(
+    omp.env.http_post(
+        "https://example.test",
+        body=b"{}",
+        headers={"content-type": "application/json"},
+        timeout=omp.Duration("2s"),
     )
 )
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        omp.env.http_put(
-            "https://example.test",
-            body=b"{}",
-            headers={"content-type": "application/json"},
-            timeout=omp.Duration("2s"),
-        ),
+http_put = asyncio.run(
+    omp.env.http_put(
+        "https://example.test",
+        body=b"{}",
+        headers={"content-type": "application/json"},
+        timeout=omp.Duration("2s"),
     )
 )
+assert (http_get.status, http_post.status, http_put.status) == (200, 200, 200)
+http_calls = [
+    call for call in data_host.calls if call[0].startswith("omp.env.http.")
+]
+assert [operation for operation, _ in http_calls[-3:]] == [
+    "omp.env.http.get", "omp.env.http.post", "omp.env.http.put",
+]
+assert http_calls[-2][1]["body"] == b"{}"
+assert http_calls[-1][1]["timeout"] == omp.Duration("2s")
 
 # Round 5 devices: child declarations, synchronous snapshots, and slot budget.
 @surface_device.subtool("inspect/detail")
@@ -1560,37 +1997,13 @@ assert catalog_card.pricing[0].unit is omp.PriceUnit.MTOK_INPUT
 catalog_cursor = omp.Cursor(epoch=b"catalog-epoch", generation=7)
 catalog_event = omp.ModelEvent(cursor=catalog_cursor, upserted=catalog_card)
 assert catalog_event.upserted is catalog_card
-asyncio.run(
-    expect_raises_async(omp.NotWiredError, omp.models())
-)
-
-async def collect_unwired_model_events():
-    return [event async for event in omp.watch_models(catalog_cursor)]
-
-asyncio.run(
-    expect_raises_async(omp.NotWiredError, collect_unwired_model_events())
-)
-
-async def catalog_control_request(operation, **arguments):
-    assert operation == "omp.provider.watch_models"
-    assert arguments == {"since": catalog_cursor}
-    async def host_model_events():
-        yield catalog_event
-        yield {
-            "cursor": {"epoch": b"catalog-epoch", "generation": 8},
-            "removed_id": catalog_card.id,
-        }
-    return host_model_events()
+resolved_models = asyncio.run(omp.models())
+assert resolved_models == (catalog_card,)
 
 async def collect_model_events():
-    return [event async for event in omp.WatchModels(catalog_cursor)]
+    return [event async for event in omp.watch_models(catalog_cursor)]
 
-original_provider_control_request = provider_module._provider_control_request
-provider_module._provider_control_request = catalog_control_request
-try:
-    catalog_events = asyncio.run(collect_model_events())
-finally:
-    provider_module._provider_control_request = original_provider_control_request
+catalog_events = asyncio.run(collect_model_events())
 assert catalog_events == [
     catalog_event,
     omp.ModelEvent(
@@ -1622,6 +2035,35 @@ assert decorated_registration.function is decorated_ui_renderer
 assert decorated_registration.decorates is True
 assert decorated_registration.reduce is None
 assert decorated_ui_renderer.__omp_renderer_decorates__ is True
+@omp.renderer("surface_device", rev=1)
+def surface_verdict_renderer(view, ctx):
+    assert isinstance(view.verdict, omp.Ok)
+    return omp.ui.text(f"{view.verdict.payload['value']}@{ctx.width}")
+
+surface_verdict = omp.ui._dispatch_renderer(
+    "surface_device",
+    "",
+    1,
+    {
+        "call_id": "surface-verdict",
+        "updates": [],
+        "state": None,
+        "verdict": {"kind": "ok", "value": {"value": 3}},
+        "elapsed": "1ms",
+        "phase": "OPEN",
+    },
+    {
+        "width": 80,
+        "charset": "unicode",
+        "appearance": "dark",
+        "graphics": "cells",
+        "hyperlinks": False,
+        "focused": False,
+        "collapsed": False,
+        "place": "transcript",
+    },
+)
+assert surface_verdict == omp.ui.text("3@80")
 
 # Round 5 telemetry: prompt slot facts, request timings/content, and coalescing survive freeze.
 slot_fingerprint = telemetry_module.PromptSlotFingerprint(
@@ -1764,28 +2206,23 @@ assert bare_definition.spec is bare_spec and bare_definition.implementation is N
 assert (bare_definition.priority, bare_definition.extends, bare_definition.replaces) == (
     0, None, None,
 )
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        bare_handle.request(omp.Operation.SPEAK, speech_request),
-    )
+spoken = asyncio.run(
+    bare_handle.request(omp.Operation.SPEAK, speech_request)
 )
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        bare_handle.request(omp.Operation.TRANSCRIBE, transcription_request),
-    )
+transcribed = asyncio.run(
+    bare_handle.request(omp.Operation.TRANSCRIBE, transcription_request)
 )
+assert spoken.audio == omp.BlobRef(bytes(32), 3)
+assert transcribed.text == "hello" and transcribed.language == "en"
 completion_parts = (
     omp.Part.text("describe the image"),
     omp.Part.blob(media_blob, alt="image"),
 )
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        omp.agents.completion(completion_parts, role="vision"),
-    )
+vision_completion = asyncio.run(
+    omp.agents.completion(completion_parts, role="vision")
 )
+assert vision_completion.text == "allow"
+assert frozen_host.calls[-1][1]["role"] == "vision"
 asyncio.run(
     expect_raises_async(TypeError, omp.agents.completion((object(),), role="vision"))
 )
@@ -1808,37 +2245,29 @@ assert dynamic_spec.aliases == ("fp",)
 assert dynamic_spec.args == (omp.ui.Arg("topic", "Prompt topic", "<topic>"),)
 assert dynamic_spec.hint == "/foreign-prompt <topic>"
 assert dynamic_spec.arg_completions is complete_dynamic
-asyncio.run(
-    expect_raises_async(omp.NotWiredError, omp.ui.dynamic_mount(dynamic_spec))
+assert asyncio.run(omp.ui.dynamic_mount(dynamic_spec)) == ("foreign-prompt",)
+assert frozen_host.calls[-1] == (
+    "omp.ui.dynamic_mount", {"commands": (dynamic_spec,)}
 )
-class DynamicCommandBackend:
-    def __init__(self):
-        self.calls = []
-    async def request(self, operation, arguments):
-        self.calls.append((operation, arguments))
-        return tuple(spec.name for spec in arguments["commands"])
-dynamic_backend = DynamicCommandBackend()
-dynamic_control_token = omp._control_backend.set(dynamic_backend)
-try:
-    assert asyncio.run(omp.ui.dynamic_mount(dynamic_spec)) == ("foreign-prompt",)
-finally:
-    omp._control_backend.reset(dynamic_control_token)
-assert dynamic_backend.calls == [
-    ("omp.ui.dynamic_mount", {"commands": (dynamic_spec,)})
-]
 assert omp.ui._command_handlers["foreign-prompt"] is invoke_dynamic
 
 # R-invoke: host composition opens a fresh, independently gated call.
 assert asyncio.iscoroutinefunction(omp.devices.invoke)
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        omp.devices.invoke(
-            "notes/append",
-            {"value": "draft"},
-            deadline=omp.Duration("2s"),
-        ),
+nested_invocation = asyncio.run(
+    omp.devices.invoke(
+        "notes/append",
+        {"value": "draft"},
+        deadline=omp.Duration("2s"),
     )
+)
+assert nested_invocation == {"value": "draft", "admitted": True}
+assert frozen_host.calls[-1] == (
+    "omp.devices.invoke",
+    {
+        "path": "notes/append",
+        "args": {"value": "draft"},
+        "deadline": "2s",
+    },
 )
 
 # Round 6 renderer inputs carry copied, read-only presentation state.
@@ -1946,31 +2375,12 @@ async def detached_frames():
 	yield omp.Update(stage="walking")
 	yield omp.Done("settled")
 
-asyncio.run(
-	expect_raises_async(
-		omp.NotWiredError,
-		omp.jobs.register(detached_frames(), ctx),
-	)
-)
-class JobBoardBackend:
-	def __init__(self):
-		self.calls = []
-	async def request(self, operation, arguments):
-		self.calls.append((operation, arguments))
-		return job_ref
-job_board_backend = JobBoardBackend()
-job_board_token = omp._control_backend.set(job_board_backend)
 registered_frames = detached_frames()
-try:
-	assert asyncio.run(omp.jobs.register(registered_frames, ctx)) is job_ref
-finally:
-	omp._control_backend.reset(job_board_token)
-assert job_board_backend.calls == [
-	(
-		"omp.jobs.register",
-		{"frames": registered_frames, "context": ctx},
-	)
-]
+assert asyncio.run(omp.jobs.register(registered_frames, ctx)) is job_ref
+assert frozen_host.calls[-1] == (
+    "omp.jobs.register",
+    {"frames": registered_frames, "context": ctx},
+)
 
 # Round 6 router: decorated and mounted routes freeze their own projections.
 surface_route_effects = omp.Effects(documents=omp.DocEffects(read=True))
@@ -2090,12 +2500,12 @@ asyncio.run(
         bare_handle.request(omp.Operation.REALTIME, speech_request),
     )
 )
-asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        bare_handle.request(omp.Operation.REALTIME, realtime_request),
-    )
+established_realtime = asyncio.run(
+    bare_handle.request(omp.Operation.REALTIME, realtime_request)
 )
+assert established_realtime.id == "rtc-surface"
+assert established_realtime.endpoint.id == "endpoint-surface"
+assert established_realtime.transport is omp.Transport.WEBRTC
 
 # Env HTTP redirects are bounded per verb and every response identifies its final URL.
 assert all(
@@ -2137,7 +2547,7 @@ expect_raises(
 # Artifact references are typed throughout the public journal and namespace.
 artifact_ref = omp.ArtifactRef(
     id="7",
-    hash="blake3-report",
+    hash="11" * 32,
     media_type="text/plain",
     byte_len=12,
 )
@@ -2162,11 +2572,19 @@ assert {
     "pin",
     "url",
 }.issubset(omp.artifacts.__all__)
+artifact_bytes = asyncio.run(omp.artifacts.get(artifact_ref))
+assert artifact_bytes == b"artifact dat"
+assert data_host.calls[-1] == (
+    "omp.env.blobs.get",
+    {
+        "ref": omp.BlobRef(bytes.fromhex("11" * 32), 12),
+        "offset": 0,
+        "length": None,
+    },
+)
+omp.env._reset_backend(data_tokens)
 asyncio.run(
-    expect_raises_async(
-        omp.NotWiredError,
-        omp.artifacts.get(artifact_ref),
-    )
+    expect_raises_async(omp.env.EnvUnavailable, omp.env.worktree())
 )
 
 # Catalog notices remain message tokens and expose their ruled explanatory echo.
@@ -2216,6 +2634,82 @@ assert dict(content_row.metadata) == {
     "name": "review",
     "description": "Review a change.",
 }
+# Auxiliary CONTROL surfaces share the same request authority and typed decoding.
+@omp.params
+class SurfaceParams:
+    query: str
+
+async def auxiliary_control_contract():
+    mounted = await omp.mcp.mount(
+        omp.mcp.McpMount(
+            server="surface",
+            transport=omp.mcp.Http("https://example.test/mcp"),
+            precedence=omp.Precedence.ENHANCEMENT,
+        )
+    )
+    assert len(mounted) == 1 and mounted[0].rev == 1
+    invoked = await mounted[0](value="roundtrip")
+    assert invoked["structured_content"] == {"value": "roundtrip"}
+    assert frozen_host.calls[-1] == (
+        "omp.mcp.invoke",
+        {
+            "server": "surface",
+            "tool": "echo",
+            "arguments": {"value": "roundtrip"},
+        },
+    )
+    await omp.mcp.unmount("surface")
+
+    cursor = omp.IncomingParams(
+        name="surface",
+        rev=omp.Rev("mcp", 1),
+        invocation_id="surface-call",
+        shape=SurfaceParams,
+    )
+    assert await cursor.args() == SurfaceParams("needle")
+    assert await cursor.raw() == '{"query":"needle"}'
+    assert await cursor.committed() == '{"query":"needle"}'
+    assert cursor.is_authorized
+    args_call = next(
+        call for call in frozen_host.calls if call[0] == "omp.params.args"
+    )
+    assert args_call == (
+        "omp.params.args",
+        {
+            "invocation_id": "surface-call",
+            "interruptible": False,
+            "expected": "SurfaceParams",
+        },
+    )
+
+    urls_module = importlib.import_module("omp.urls")
+    old_snapshot = (
+        urls_module._scheme_source,
+        urls_module._scheme_hash,
+        urls_module._scheme_cache,
+    )
+    try:
+        urls_module._bind_scheme_source(
+            lambda: (
+                b"frozen-surface",
+                ((
+                    urls_module.Scheme.FILE,
+                    urls_module.SchemeInfo(True, False, True, "files"),
+                ),),
+            )
+        )
+        assert await omp.urls.read("notes.txt", "1-2") == "authoritative surface"
+        assert frozen_host.calls[-1] == (
+            "omp.urls.read", {"url": "notes.txt:1-2"}
+        )
+    finally:
+        (
+            urls_module._scheme_source,
+            urls_module._scheme_hash,
+            urls_module._scheme_cache,
+        ) = old_snapshot
+
+asyncio.run(auxiliary_control_contract())
 
 # Projection hooks can drop whole result parts without discarding typed verdicts.
 drop_parts = omp.DropParts(

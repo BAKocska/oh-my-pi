@@ -14,20 +14,18 @@ use std::{
 
 use bytes::Bytes;
 use futures::future::join_all;
-use omp_app::{
-	envd::{
-		EnvServer,
-		worker::{ExtHostConfig, ExtHostSpec, HostKey, WORKER_ARG},
-	},
-	exthost::{
-		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
-	},
-};
 use omp_core::{
 	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str, sf,
 };
 use omp_e2e::{Context as _, Result, error};
 use omp_env::{Admitter, EnvClient, InvocationEvent};
+use omp_envd::{
+	EnvServer,
+	exthost::{
+		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
+	},
+	worker::{ExtHostConfig, ExtHostSpec, HostKey, WORKER_ARG},
+};
 use omp_proto::{
 	SCHEMA_REV,
 	env::v1::{Admission, AdmitInvocation, ClientHello, InvokeTool},
@@ -222,7 +220,7 @@ fn main() -> ExitCode {
 		.nth(1)
 		.is_some_and(|argument| argument == WORKER_ARG)
 	{
-		return match omp_app::envd::run_py_worker_entry() {
+		return match omp_envd::worker::run_py_worker_entry() {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(error) => {
 				eprintln!("pooling Python worker: {error}");

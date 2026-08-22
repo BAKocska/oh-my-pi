@@ -6,9 +6,9 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
 	if std::env::args_os()
 		.nth(1)
-		.is_some_and(|arg| arg == omp_app::exthost::EXT_HOST_ARG)
+		.is_some_and(|arg| arg == omp_envd::exthost::EXT_HOST_ARG)
 	{
-		return match omp_app::exthost::run_ext_host_entry() {
+		return match omp_envd::exthost::run_ext_host_entry() {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(error) => {
 				eprintln!("omp e2e extension host: {error}");
@@ -18,9 +18,9 @@ async fn main() -> ExitCode {
 	}
 	if std::env::args_os()
 		.nth(1)
-		.is_some_and(|arg| arg == omp_app::envd::worker::WORKER_ARG)
+		.is_some_and(|arg| arg == omp_envd::worker::WORKER_ARG)
 	{
-		return match omp_app::envd::run_py_worker_entry() {
+		return match omp_envd::worker::run_py_worker_entry() {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(error) => {
 				eprintln!("omp e2e Python worker: {error}");

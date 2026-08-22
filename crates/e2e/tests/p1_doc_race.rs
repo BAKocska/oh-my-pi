@@ -17,7 +17,6 @@ use std::{
 
 use bytes::Bytes;
 use omp_agent::{Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnId};
-use omp_app::envd::docs::{DocumentHost, DocumentLease};
 use omp_core::{Str, sf};
 use omp_e2e::{
 	Context as _, Error, Result, error,
@@ -27,6 +26,7 @@ use omp_e2e::{
 	},
 };
 use omp_env::{EnvClient, InvocationEvent};
+use omp_envd::docs::{DocumentHost, DocumentLease};
 use omp_hashline::compute_snapshot_tag;
 use omp_proto::{
 	document::v1 as document, env::v1::InvokeTool, inference::v1 as inference, thread::v1 as thread,
