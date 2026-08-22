@@ -1,0 +1,37 @@
+# nextest runs every test in its own process and schedules them in parallel
+# across the whole workspace, so anything that relied on `cargo test`'s
+# one-binary-at-a-time execution has to declare that here.
+#
+# Doctests are NOT run by nextest (upstream limitation: they have no stable
+# libtest-json interface). The `just test` / CI recipes pair every nextest
+# invocation with `cargo test --doc`; omp has doctests in 25+ modules under
+# crates/core, crates/shell-*, and crates/slopjson, so dropping that step
+# silently deletes real coverage.
+
+[profile.default]
+# Print each failure when it happens and again in the final summary — a run
+# that fails early in a long workspace sweep should not need scrollback.
+failure-output = "immediate-final"
+# Report every failing test in one pass instead of stopping at the first.
+fail-fast = false
+
+[profile.ci]
+failure-output = "immediate-final"
+fail-fast = false
+# No retries: a flaky acceptance proof is a bug we want to see, not paper over.
+retries = 0
+# Nothing in the unit/integration tier should take a minute; kill runaways
+# rather than letting a hung PTY test burn the job's wall clock.
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+# The e2e acceptance proofs (P1-P8) drive real PTYs, spawn daemons, and bind
+# sockets. They were written against `cargo test`, which runs one test binary
+# at a time; under nextest they would otherwise race each other.
+[[profile.default.overrides]]
+filter = 'package(omp-e2e)'
+threads-required = "num-cpus"
+
+[[profile.ci.overrides]]
+filter = 'package(omp-e2e)'
+threads-required = "num-cpus"
+slow-timeout = { period = "120s", terminate-after = 5 }

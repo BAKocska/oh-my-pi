@@ -457,6 +457,12 @@ generated inputs.
   NEVER redesign nightly-dependent APIs around stable.
 - Cargo for Rust; Bun for JS/TS (never Node/npm/pnpm/yarn); `uv` for Python
   (never pip).
+- Tests run under `cargo nextest run` (config: `.config/nextest.toml`), never
+  bare `cargo test`. nextest does NOT run doctests, so every recipe pairs it
+  with `cargo test --doc`; omp has doctests in 25+ modules (`crates/core`,
+  `crates/shell-*`, `crates/slopjson`). Adding a nextest call without the
+  doctest half silently drops that coverage. Prefer `just test` /
+  `just test-pkg <crate>`, which already run both.
 - Protobuf: `protox`; no system `protoc`.
 - Workspace env vars `OMP_*` only: `OMP_TUI_DEBUG`, `OMP_TTY`, `OMP_PY_SITE`.
   `PYO3_CONFIG_FILE` = required upstream pyo3 exception.

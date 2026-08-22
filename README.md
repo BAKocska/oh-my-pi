@@ -115,8 +115,33 @@ Pinned nightly toolchain via `rust-toolchain.toml`; edition 2024, hard-tab
 formatting (`cargo fmt`), workspace lint policy in the root `Cargo.toml`.
 
 ```sh
-cargo build            # or: cargo check / cargo test
+cargo build            # or: cargo check
+just test              # nextest + doctests, workspace minus e2e
 ```
+
+Tests run under [cargo-nextest](https://nexte.st) (`just test`, `just test-pkg
+<crate>`, `just e2e`). nextest gives each test its own process and a real
+parallel scheduler, but it **does not run doctests** — every recipe therefore
+pairs `cargo nextest run` with a `cargo test --doc` pass. Invoke `cargo test`
+directly only for doctests; otherwise use the recipes so both halves run.
+Profiles beyond the defaults:
+
+| Profile | Use |
+| --- | --- |
+| `dev` | Default. Line tables for workspace crates, no debuginfo for deps. |
+| `release` | Shipping build: `opt-level = 2`, thin LTO, 1 codegen unit, stripped. |
+| `release-dev` | Same codegen as `release` across 16 units, so a one-crate edit does not re-optimize everything. |
+| `release-profiling` | `release` with symbols kept, for `perf`/`samply`/Instruments. |
+
+```sh
+cargo build --profile release-dev
+```
+
+`.cargo/config.toml` also sets `embed-metadata = false`, which keeps crate
+metadata in `.rmeta` rather than duplicating it into every rlib — measured
+196 MB → 130 MB of `target/` on a reqwest-sized graph at identical build
+times. It needs the pinned nightly, and its accepted spelling is coupled to
+the toolchain version.
 
 The embedded-Python crate (`crates/py`) needs a one-time fetch before it
 builds:

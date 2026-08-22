@@ -127,17 +127,20 @@ gen-py-stubs:
 # Run every workspace unit/integration test except the e2e suite.
 [group('test')]
 test:
-    cargo test --workspace --exclude omp-e2e --locked
+    cargo nextest run --workspace --exclude omp-e2e --locked
+    cargo test --doc --workspace --exclude omp-e2e --locked
 
 # Run every workspace test, e2e included (slow; prefer `just e2e` alone so failures are easy to attribute).
 [group('test')]
 test-all:
-    cargo test --workspace --locked
+    cargo nextest run --workspace --locked
+    cargo test --doc --workspace --locked
 
 # Run tests for a single crate, e.g. `just test-pkg omp-hashline`.
 [group('test')]
 test-pkg pkg:
-    cargo test -p {{ pkg }} --locked
+    cargo nextest run -p {{ pkg }} --locked
+    cargo test --doc -p {{ pkg }} --locked
 
 # ---------------------------------------------------------------------------
 # E2E acceptance suite (crates/e2e, joined-system proofs P1-P8)
@@ -146,12 +149,12 @@ test-pkg pkg:
 # Compile every acceptance proof without running them.
 [group('e2e')]
 e2e-build:
-    cargo test -p omp-e2e --tests --no-run --locked
+    cargo nextest run -p omp-e2e --tests --no-run --locked
 
 # Run proofs P1-P6: doc race, cancel matrix, detached jobs, schema isolation, prefix stability, crash/resume.
 [group('e2e')]
 e2e-core:
-    cargo test -p omp-e2e --locked \
+    cargo nextest run -p omp-e2e --locked \
         --test p1_doc_race \
         --test p2_cancel_matrix \
         --test p3_detached_jobs \
@@ -162,12 +165,12 @@ e2e-core:
 # Run proof P7: real-PTY terminal UI lifecycle.
 [group('e2e')]
 e2e-p7:
-    TERM=xterm-256color cargo test -p omp-e2e --test p7_tui --locked
+    TERM=xterm-256color cargo nextest run -p omp-e2e --test p7_tui --locked
 
 # Validate the P8 performance-baseline metric schema/contract (non-gating).
 [group('e2e')]
 e2e-p8:
-    cargo test -p omp-e2e --test p8_baselines --locked
+    cargo nextest run -p omp-e2e --test p8_baselines --locked
 
 # Record a fresh P8 performance-baseline artifact.
 [group('e2e')]
@@ -178,7 +181,7 @@ e2e-baseline:
 # Run every P1-P8 proof plus the tool-sources check, in CI order.
 [group('e2e')]
 e2e: e2e-build e2e-core e2e-p7 e2e-p8
-    cargo test -p omp-e2e --test tool_sources --locked
+    cargo nextest run -p omp-e2e --test tool_sources --locked
 
 # ---------------------------------------------------------------------------
 # LLM catalog & compat cascade (crates/llm-catalog)
@@ -197,8 +200,8 @@ catalog-oracle:
 # Run the taxonomy and compat-cascade test suites.
 [group('catalog')]
 catalog-test:
-    cargo test -p omp-llm-catalog --lib taxonomy
-    cargo test -p omp-llm-catalog --test compat_cascade
+    cargo nextest run -p omp-llm-catalog --lib taxonomy
+    cargo nextest run -p omp-llm-catalog --test compat_cascade
 
 # ---------------------------------------------------------------------------
 # Run & explore

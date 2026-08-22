@@ -14,3 +14,11 @@ PYO3_CONFIG_FILE = { value = "vendor/python/pyo3-config.txt", relative = true }
 # lld links them several times faster. Same shim the release tree uses.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=--ld-path=/opt/homebrew/bin/ld64.lld"]
+# Store each crate's metadata only in its .rmeta instead of duplicating it into
+# every rlib. Measured on a reqwest-sized graph: 196 MB -> 130 MB target dir at
+# identical build times. Requires the pinned nightly (rust-toolchain.toml).
+# The accepted spelling is toolchain-coupled: cargo took `"DoNotEmbed"` before
+# ~2026-08 and a bare boolean after. This matches nightly-2026-08-08; if you
+# bump rust-toolchain.toml backwards, switch to `"DoNotEmbed"`.
+[unstable]
+embed-metadata = false
