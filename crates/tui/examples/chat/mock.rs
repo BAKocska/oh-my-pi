@@ -112,6 +112,11 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 					"Ctrl+P models · Ctrl+K commands · Ctrl+B sidebar · Esc Esc rewind",
 				)));
 			},
+			Intent::AgentSteer { .. } | Intent::AgentRevive { .. } | Intent::AgentKill { .. } => {},
+			Intent::PtyInput { .. }
+			| Intent::PtyResize { .. }
+			| Intent::PtyKill { .. }
+			| Intent::Approval { .. } => {},
 			Intent::Quit => break,
 		}
 	}
@@ -148,6 +153,7 @@ async fn stream_turn(
 	let _ = events.send(BackendEvent::ToolStarted {
 		id:    tool.clone(),
 		name:  sf!("shell"),
+		rev:   sf!("r0"),
 		title: sf!("Inspect chat scene"),
 	});
 	for chunk in ["reading scene modules\n", "checking damage ranges\n", "done\n"] {

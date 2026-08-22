@@ -232,7 +232,13 @@ pub enum EventProjection<'a> {
 	/// One canonical thread item used for message and tool-outcome counts.
 	ThreadItem {
 		/// Durable item, counted exactly once at its physical journal event.
-		item: &'a thread_pb::Item,
+		item:    &'a thread_pb::Item,
+		/// Owner-private user prompt text admitted to FTS, when this is a user
+		/// message.
+		prompt:  Option<&'a str>,
+		/// Monotonic context position when this item is a durable message
+		/// boundary.
+		context: Option<ContextPosition>,
 	},
 	/// The event is an inference receipt with canonical rich accounting.
 	TurnReceipt {
@@ -575,6 +581,19 @@ pub struct ModelPerformanceSample {
 	pub duration_ms:   Option<u64>,
 	/// Output token count.
 	pub output_tokens: u64,
+}
+
+/// Bounded recency-decayed model performance projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelPerformanceEstimate {
+	/// Weighted time to first token.
+	pub ttft_ms:       Option<u64>,
+	/// Weighted total request duration.
+	pub duration_ms:   Option<u64>,
+	/// Weighted output token count.
+	pub output_tokens: u64,
+	/// Samples admitted from the trailing 90-day window.
+	pub samples:       u32,
 }
 
 /// One parser-produced record admitted only through explicit legacy repair.
@@ -1018,6 +1037,73 @@ impl SessionIndex {
 		Ok(samples)
 	}
 
+	/// Computes a bounded integer exponential-decay estimate over the trailing
+	/// 90-day sample window.
+	pub fn model_performance_estimate(
+		&self,
+		provider: &str,
+		model: &str,
+		now_ms: u64,
+	) -> Result<Option<ModelPerformanceEstimate>, Error> {
+		const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+		const WINDOW_MS: u64 = 90 * DAY_MS;
+		let samples =
+			self.model_performance(provider, model, now_ms.saturating_sub(WINDOW_MS), 4_096)?;
+		if samples.is_empty() {
+			return Ok(None);
+		}
+		let mut total_weight = 0_u128;
+		let mut output = 0_u128;
+		let mut ttft = (0_u128, 0_u128);
+		let mut duration = (0_u128, 0_u128);
+		for sample in &samples {
+			let age_weeks = now_ms.saturating_sub(sample.ts_ms) / (7 * DAY_MS);
+			let shift = u32::try_from(age_weeks.min(12)).expect("bounded decay shift");
+			let weight = u128::from(1_u16 << (12 - shift));
+			total_weight = total_weight.saturating_add(weight);
+			output = output.saturating_add(u128::from(sample.output_tokens) * weight);
+			if let Some(value) = sample.ttft_ms {
+				ttft.0 = ttft.0.saturating_add(u128::from(value) * weight);
+				ttft.1 = ttft.1.saturating_add(weight);
+			}
+			if let Some(value) = sample.duration_ms {
+				duration.0 = duration.0.saturating_add(u128::from(value) * weight);
+				duration.1 = duration.1.saturating_add(weight);
+			}
+		}
+		let weighted = |sum: u128, weight: u128| {
+			(weight != 0).then(|| u64::try_from(sum / weight).unwrap_or(u64::MAX))
+		};
+		Ok(Some(ModelPerformanceEstimate {
+			ttft_ms:       weighted(ttft.0, ttft.1),
+			duration_ms:   weighted(duration.0, duration.1),
+			output_tokens: weighted(output, total_weight).unwrap_or_default(),
+			samples:       u32::try_from(samples.len()).expect("query limit fits u32"),
+		}))
+	}
+
+	/// Backfills at most `limit` legacy receipt samples from the bounded
+	/// trailing 90-day window. Existing samples are left untouched.
+	pub fn backfill_model_performance(&self, now_ms: u64, limit: u32) -> Result<u64, Error> {
+		self.require_writer()?;
+		const NINETY_DAYS_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
+		let since_ms = now_ms.saturating_sub(NINETY_DAYS_MS);
+		let connection = self.connection.lock();
+		let changed = connection.execute(
+			"INSERT OR IGNORE INTO model_performance(
+			 session_id, event_index, ts_ms, provider, model, ttft_ms, duration_ms, output_tokens
+			 )
+			 SELECT session_id, event_index, ts_ms, provider, model, NULL, duration_ms,
+			        output_tokens
+			 FROM receipts
+			 WHERE ts_ms >= ?1
+			 ORDER BY ts_ms DESC
+			 LIMIT ?2",
+			params![sql_u64(since_ms, "since_ms")?, i64::from(limit)],
+		)?;
+		Ok(u64::try_from(changed).expect("SQLite changed-row count fits u64"))
+	}
+
 	const fn require_writer(&self) -> Result<(), Error> {
 		match (self.authority, self.writable) {
 			(IndexAuthority::Authoritative, true) => Ok(()),
@@ -1161,25 +1247,27 @@ fn index_event_inner(
 			)?;
 		},
 		EventProjection::Context { anchor, revision, epoch } => {
-			let changed = transaction.execute(
-				"UPDATE sessions SET context_anchor = ?2, context_revision = ?3,
-				 compaction_epoch = ?4
-				 WHERE id = ?1 AND context_revision <= ?3 AND compaction_epoch <= ?4",
-				params![
-					event.session.0.as_str(),
-					anchor
-						.map(|anchor| sql_u64(anchor, "context_anchor"))
-						.transpose()?,
-					sql_u64(revision, "context_revision")?,
-					sql_u64(epoch, "compaction_epoch")?,
-				],
-			)?;
-			if changed != 1 {
-				return Err(Error::NonMonotonicWatermark);
-			}
+			update_context_position(transaction, event.session, ContextPosition {
+				anchor,
+				revision,
+				epoch,
+			})?;
 		},
-		EventProjection::ThreadItem { item } => {
+		EventProjection::ThreadItem { item, prompt, context } => {
 			insert_item_outcome(transaction, event, position, item)?;
+			if let Some(prompt) = prompt {
+				transaction.execute(
+					"INSERT INTO prompts_fts(session_id, event_index, prompt) VALUES (?1, ?2, ?3)",
+					params![
+						event.session.0.as_str(),
+						sql_u64(position.event_index, "event_index")?,
+						prompt,
+					],
+				)?;
+			}
+			if let Some(context) = context {
+				update_context_position(transaction, event.session, context)?;
+			}
 		},
 		EventProjection::TurnReceipt { outcome, failed } => {
 			insert_receipt(transaction, event, position, outcome, failed)?;
@@ -1219,6 +1307,31 @@ fn index_event_inner(
 				<&'static str>::from(status)
 			])?;
 		},
+	}
+	Ok(())
+}
+
+fn update_context_position(
+	transaction: &Transaction<'_>,
+	session: &SessionId,
+	context: ContextPosition,
+) -> Result<(), Error> {
+	let changed = transaction.execute(
+		"UPDATE sessions SET context_anchor = ?2, context_revision = ?3,
+		 compaction_epoch = ?4
+		 WHERE id = ?1 AND context_revision <= ?3 AND compaction_epoch <= ?4",
+		params![
+			session.0.as_str(),
+			context
+				.anchor
+				.map(|anchor| sql_u64(anchor, "context_anchor"))
+				.transpose()?,
+			sql_u64(context.revision, "context_revision")?,
+			sql_u64(context.epoch, "compaction_epoch")?,
+		],
+	)?;
+	if changed != 1 {
+		return Err(Error::NonMonotonicWatermark);
 	}
 	Ok(())
 }

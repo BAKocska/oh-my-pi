@@ -21,6 +21,7 @@ pub mod patch;
 mod raweq;
 pub mod reader;
 pub mod replay;
+pub mod replica;
 pub mod types;
 pub mod writer;
 

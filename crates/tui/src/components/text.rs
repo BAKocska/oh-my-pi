@@ -62,6 +62,13 @@ impl TextLeaf {
 		self.with(prop, value)
 	}
 
+	/// Sets one arbitrary custom property beside the typed ones.
+	pub fn with_custom(mut self, name: impl IntoStr, value: impl Into<PropValue>) -> Self {
+		self.props = self.props.with_custom(name, value);
+		self.version = self.version.wrapping_add(1);
+		self
+	}
+
 	/// Appends plain text content.
 	pub fn text(mut self, text: impl IntoStr) -> Self {
 		append(&mut self.text, text.into_str());

@@ -34,6 +34,19 @@ pub enum Error {
 
 /// Writes `bytes`, synchronizes them, checks `guard`, and atomically renames.
 pub fn commit(path: &Path, bytes: &[u8], guard: impl FnOnce() -> bool) -> Result<(), Error> {
+	commit_with(path, guard, |file| file.write_all(bytes))
+}
+
+/// Streams a replacement file, synchronizes it, checks `guard`, and atomically
+/// renames.
+///
+/// The writer avoids assembling a second full-size in-memory copy for large
+/// durable snapshots. A failed writer or guard leaves the destination intact.
+pub fn commit_with(
+	path: &Path,
+	guard: impl FnOnce() -> bool,
+	write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<(), Error> {
 	let parent = path.parent().ok_or(Error::MissingParent)?;
 	let name = path
 		.file_name()
@@ -41,7 +54,7 @@ pub fn commit(path: &Path, bytes: &[u8], guard: impl FnOnce() -> bool) -> Result
 		.to_string_lossy();
 	let nonce = omp_core::Ulid::generate();
 	let temporary = parent.join(format!(".{name}.{nonce}.tmp"));
-	let result = commit_inner(path, &temporary, bytes, guard);
+	let result = commit_inner(path, &temporary, guard, write);
 	if result.is_err() {
 		match std::fs::remove_file(&temporary) {
 			Ok(()) => {},
@@ -55,17 +68,15 @@ pub fn commit(path: &Path, bytes: &[u8], guard: impl FnOnce() -> bool) -> Result
 fn commit_inner(
 	path: &Path,
 	temporary: &Path,
-	bytes: &[u8],
 	guard: impl FnOnce() -> bool,
+	write: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> Result<(), Error> {
 	let mut file = OpenOptions::new()
 		.write(true)
 		.create_new(true)
 		.open(temporary)
 		.map_err(|source| Error::Io { path: path.to_owned(), source })?;
-	file
-		.write_all(bytes)
-		.map_err(|source| Error::Io { path: path.to_owned(), source })?;
+	write(&mut file).map_err(|source| Error::Io { path: path.to_owned(), source })?;
 	file
 		.sync_all()
 		.map_err(|source| Error::Io { path: path.to_owned(), source })?;

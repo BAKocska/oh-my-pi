@@ -1156,6 +1156,19 @@ impl Attachments {
 		attachment
 	}
 
+	/// Clones visible attachment descriptors without mutating the staged queue.
+	#[must_use]
+	pub fn snapshot(&self) -> Vec<Attachment> {
+		self
+			.state
+			.borrow()
+			.staged
+			.iter()
+			.filter(|staged| !staged.hidden)
+			.map(|staged| staged.attachment.clone())
+			.collect()
+	}
+
 	/// Drains the whole queue, restarting marker numbering, and returns
 	/// the visible attachments in marker order. Hidden descriptors — whose
 	/// inline references the user deleted — are discarded, never handed to

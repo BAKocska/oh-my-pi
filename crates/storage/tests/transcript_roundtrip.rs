@@ -122,6 +122,8 @@ fn every_kind() -> Vec<Event> {
 				agent:         Some(text("worker")),
 				output_schema: Some(raw(r#"{ "required" : ["x"], "type":"object" }"#)),
 				revival:       Some(ChildSessionInit {
+					display_name:        Str::default(),
+					parent_id:           Str::default(),
 					definition:          sf!("reviewer"),
 					depth:               2,
 					prompt_ref:          blob(2, 80),
@@ -195,6 +197,7 @@ fn every_kind() -> Vec<Event> {
 		Event {
 			ts:   7,
 			kind: Kind::Compact {
+				snapcompact:   None,
 				summary:       text("summary"),
 				short:         Some(text("short")),
 				first_kept:    2,
@@ -742,6 +745,7 @@ fn forward_fold_applies_rewind_reset_and_compact() {
 		.append(&Event {
 			ts:   8,
 			kind: Kind::Compact {
+				snapcompact:   None,
 				summary:       text("summary"),
 				short:         None,
 				first_kept:    5,
@@ -776,6 +780,7 @@ fn reusable_live_set_matches_live_vectors_for_navigation_and_rewrite() {
 		.append(&Event {
 			ts:   5,
 			kind: Kind::Compact {
+				snapcompact:   None,
 				summary:       text("summary"),
 				short:         None,
 				first_kept:    3,

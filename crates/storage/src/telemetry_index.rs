@@ -6,7 +6,7 @@
 
 use std::{
 	fs::{File, OpenOptions},
-	io::{self, Write as _},
+	io::{self, Read as _, Seek as _, SeekFrom, Write as _},
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
@@ -52,17 +52,39 @@ pub struct TelemetryQueryResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredIssue {
 	/// Stable issue identifier.
-	pub id:            Str,
+	pub id:                 Str,
 	/// Session that filed the issue.
-	pub session_id:    Str,
+	pub session_id:         Str,
 	/// Device that produced the reported result.
-	pub device:        Str,
+	pub device:             Str,
 	/// Committed device revision, if the target has one.
-	pub rev:           Option<Str>,
+	pub rev:                Option<Str>,
 	/// User consent disposition.
-	pub consent:       Str,
+	pub consent:            Str,
 	/// Creation timestamp in Unix milliseconds.
-	pub created_at_ms: u64,
+	pub created_at_ms:      u64,
+	/// Payload frame offset in the private telemetry side file.
+	pub payload_offset:     u64,
+	/// Exact payload byte length.
+	pub payload_len:        u32,
+	/// UI-bound target revision accepted for upload.
+	pub consent_revision:   Option<Str>,
+	/// Completed upload attempts.
+	pub attempt_count:      u32,
+	/// Earliest next upload attempt.
+	pub next_attempt_at_ms: u64,
+	/// Whether delivery reached a terminal state.
+	pub terminal:           bool,
+	/// Remote idempotent acknowledgement.
+	pub remote_ack:         Option<Str>,
+}
+/// One consented issue and its redacted private payload ready for delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingIssue {
+	/// Durable upload row.
+	pub issue:   StoredIssue,
+	/// Exact payload bytes referenced by the row.
+	pub payload: Vec<u8>,
 }
 
 /// A cancellation guard for a core-side query.
@@ -254,9 +276,32 @@ impl TelemetryIndex {
 				device TEXT NOT NULL,
 				rev TEXT,
 				consent TEXT NOT NULL,
-				created_at_ms INTEGER NOT NULL
+				created_at_ms INTEGER NOT NULL,
+				payload_offset INTEGER NOT NULL DEFAULT 0,
+				payload_len INTEGER NOT NULL DEFAULT 0,
+				consent_revision TEXT,
+				attempt_count INTEGER NOT NULL DEFAULT 0,
+				next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+				terminal INTEGER NOT NULL DEFAULT 0,
+				remote_ack TEXT
 			);",
 		)?;
+		for (name, declaration) in [
+			("payload_offset", "INTEGER NOT NULL DEFAULT 0"),
+			("payload_len", "INTEGER NOT NULL DEFAULT 0"),
+			("consent_revision", "TEXT"),
+			("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+			("next_attempt_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+			("terminal", "INTEGER NOT NULL DEFAULT 0"),
+			("remote_ack", "TEXT"),
+		] {
+			let statement = format!("ALTER TABLE telemetry_issues ADD COLUMN {name} {declaration}");
+			if let Err(error) = database.execute(&statement, [])
+				&& !error.to_string().contains("duplicate column name")
+			{
+				return Err(QueryError::Sql(error));
+			}
+		}
 		Ok(Self {
 			database: Mutex::new(database),
 			side_file: Mutex::new(side_file),
@@ -385,53 +430,142 @@ impl TelemetryIndex {
 		Ok(result)
 	}
 
-	/// Stores an `AutoQA` issue in the audit-tier issue table.
-	///
-	/// # Errors
-	/// Returns a SQLite error when the durable issue row cannot be written.
+	/// Stores an `AutoQA` issue in the audit-tier issue table exactly once.
 	pub fn store_issue(&self, issue: &StoredIssue) -> Result<(), QueryError> {
 		self.database.lock().execute(
-			"INSERT OR REPLACE INTO telemetry_issues(id, session_id, device, rev, consent, \
-			 created_at_ms)
-			 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+			"INSERT OR IGNORE INTO telemetry_issues(id, session_id, device, rev, consent, \
+			 created_at_ms, payload_offset, payload_len, consent_revision, attempt_count, \
+			 next_attempt_at_ms, terminal, remote_ack)
+			 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
 			params![
 				issue.id.as_str(),
 				issue.session_id.as_str(),
 				issue.device.as_str(),
-				issue.rev.as_ref().map(|rev| rev.as_str()),
+				issue.rev.as_ref().map(Str::as_str),
 				issue.consent.as_str(),
 				issue.created_at_ms,
+				issue.payload_offset,
+				issue.payload_len,
+				issue.consent_revision.as_ref().map(Str::as_str),
+				issue.attempt_count,
+				issue.next_attempt_at_ms,
+				issue.terminal,
+				issue.remote_ack.as_ref().map(Str::as_str),
 			],
 		)?;
 		Ok(())
 	}
 
 	/// Reads a durable `AutoQA` issue by identifier.
-	///
-	/// # Errors
-	/// Returns a SQLite error when the issue table cannot be queried.
 	pub fn issue(&self, id: &str) -> Result<Option<StoredIssue>, QueryError> {
 		self
 			.database
 			.lock()
 			.query_row(
-				"SELECT id, session_id, device, rev, consent, created_at_ms FROM telemetry_issues \
-				 WHERE id = ?1",
+				"SELECT id, session_id, device, rev, consent, created_at_ms, payload_offset, \
+				 payload_len, consent_revision, attempt_count, next_attempt_at_ms, terminal, \
+				 remote_ack FROM telemetry_issues WHERE id = ?1",
 				params![id],
-				|row| {
-					Ok(StoredIssue {
-						id:            Str::from(row.get::<_, String>(0)?),
-						session_id:    Str::from(row.get::<_, String>(1)?),
-						device:        Str::from(row.get::<_, String>(2)?),
-						rev:           row.get::<_, Option<String>>(3)?.map(Str::from),
-						consent:       Str::from(row.get::<_, String>(4)?),
-						created_at_ms: row.get(5)?,
-					})
-				},
+				stored_issue_row,
 			)
 			.optional()
 			.map_err(QueryError::from)
 	}
+
+	/// Grants upload consent only when the UI-confirmed target revision still
+	/// matches the filed issue.
+	pub fn consent_upload(&self, id: &str, revision: &str, now_ms: u64) -> Result<bool, QueryError> {
+		let changed = self.database.lock().execute(
+			"UPDATE telemetry_issues SET consent = 'upload', consent_revision = ?2, \
+			 next_attempt_at_ms = ?3 WHERE id = ?1 AND rev = ?2 AND terminal = 0",
+			params![id, revision, now_ms],
+		)?;
+		Ok(changed == 1)
+	}
+
+	/// Returns bounded consented rows due for upload with exact payload bytes.
+	pub fn pending_uploads(
+		&self,
+		now_ms: u64,
+		limit: usize,
+	) -> Result<Vec<PendingIssue>, QueryError> {
+		let issues = {
+			let database = self.database.lock();
+			let mut statement = database.prepare(
+				"SELECT id, session_id, device, rev, consent, created_at_ms, payload_offset, \
+				 payload_len, consent_revision, attempt_count, next_attempt_at_ms, terminal, \
+				 remote_ack FROM telemetry_issues WHERE consent = 'upload' AND terminal = 0 AND \
+				 remote_ack IS NULL AND next_attempt_at_ms <= ?1 ORDER BY created_at_ms, id LIMIT ?2",
+			)?;
+			let rows = statement.query_map(params![now_ms, limit], stored_issue_row)?;
+			rows.collect::<Result<Vec<_>, _>>()?
+		};
+		let mut pending = Vec::with_capacity(issues.len());
+		for issue in issues {
+			let payload = self.read_payload(issue.payload_offset, issue.payload_len)?;
+			pending.push(PendingIssue { issue, payload });
+		}
+		Ok(pending)
+	}
+
+	/// Records one retryable delivery failure and its bounded next attempt.
+	pub fn record_upload_failure(
+		&self,
+		id: &str,
+		next_attempt_at_ms: u64,
+	) -> Result<(), QueryError> {
+		self.database.lock().execute(
+			"UPDATE telemetry_issues SET attempt_count = attempt_count + 1, next_attempt_at_ms = ?2 \
+			 WHERE id = ?1 AND terminal = 0",
+			params![id, next_attempt_at_ms],
+		)?;
+		Ok(())
+	}
+
+	/// Atomically records the sole remote acknowledgement and terminal state.
+	pub fn acknowledge_upload(&self, id: &str, acknowledgement: &str) -> Result<bool, QueryError> {
+		let changed = self.database.lock().execute(
+			"UPDATE telemetry_issues SET remote_ack = ?2, terminal = 1, attempt_count = \
+			 attempt_count + 1 WHERE id = ?1 AND remote_ack IS NULL AND terminal = 0",
+			params![id, acknowledgement],
+		)?;
+		Ok(changed == 1)
+	}
+
+	/// Marks an issue terminally local-only or rejected so it can never send.
+	pub fn reject_upload(&self, id: &str) -> Result<(), QueryError> {
+		self.database.lock().execute(
+			"UPDATE telemetry_issues SET consent = 'local_only', terminal = 1 WHERE id = ?1",
+			params![id],
+		)?;
+		Ok(())
+	}
+
+	fn read_payload(&self, offset: u64, length: u32) -> Result<Vec<u8>, QueryError> {
+		let mut file = File::open(&self.side_path)?;
+		file.seek(SeekFrom::Start(offset.saturating_add(4)))?;
+		let mut payload = vec![0; length as usize];
+		file.read_exact(&mut payload)?;
+		Ok(payload)
+	}
+}
+
+fn stored_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIssue> {
+	Ok(StoredIssue {
+		id:                 Str::from(row.get::<_, String>(0)?),
+		session_id:         Str::from(row.get::<_, String>(1)?),
+		device:             Str::from(row.get::<_, String>(2)?),
+		rev:                row.get::<_, Option<String>>(3)?.map(Str::from),
+		consent:            Str::from(row.get::<_, String>(4)?),
+		created_at_ms:      row.get(5)?,
+		payload_offset:     row.get(6)?,
+		payload_len:        row.get(7)?,
+		consent_revision:   row.get::<_, Option<String>>(8)?.map(Str::from),
+		attempt_count:      row.get(9)?,
+		next_attempt_at_ms: row.get(10)?,
+		terminal:           row.get::<_, i64>(11)? != 0,
+		remote_ack:         row.get::<_, Option<String>>(12)?.map(Str::from),
+	})
 }
 
 #[cfg(test)]

@@ -24,6 +24,21 @@ macro_rules! record_id {
 			/// The identifier text.
 			pub Str,
 		);
+
+		impl $name {
+			/// Borrows the identifier as text.
+			#[inline]
+			#[must_use]
+			pub fn as_str(&self) -> &str {
+				self.0.as_str()
+			}
+		}
+
+		impl ::std::fmt::Display for $name {
+			fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+				f.write_str(self.0.as_str())
+			}
+		}
 	};
 }
 

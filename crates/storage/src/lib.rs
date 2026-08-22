@@ -8,6 +8,7 @@
 //!   blocks, provider-native residue lives in replay capsules, large payloads
 //!   live in the blob store behind typed [`blob::BlobRef`]s.
 
+pub mod analytics;
 pub mod atomic;
 pub mod backend;
 pub mod blob;

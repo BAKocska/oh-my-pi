@@ -465,6 +465,13 @@ pub struct ChildWorkspaceIdentity {
 /// Secret-free child initialization facts required for cross-process revival.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChildSessionInit {
+	/// Durable human-facing alias reserved across process restarts.
+	#[serde(default, skip_serializing_if = "str_is_empty")]
+	pub display_name:        Str,
+	/// Stable owning parent identity, independent of the legacy `Init.agent`
+	/// field.
+	#[serde(default, skip_serializing_if = "str_is_empty")]
+	pub parent_id:           Str,
 	/// Resolved agent definition identity.
 	pub definition:          Str,
 	/// Child depth beneath the main session.
@@ -485,6 +492,10 @@ pub struct ChildSessionInit {
 	pub workspace:           ChildWorkspaceIdentity,
 	/// Actual serving model most recently attributed to the child.
 	pub serving_model:       Option<ModelRef>,
+}
+
+fn str_is_empty(value: &Str) -> bool {
+	value.is_empty()
 }
 
 /// Durable child lifecycle publication linked to its initialization entry.

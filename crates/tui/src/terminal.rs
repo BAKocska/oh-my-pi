@@ -16,6 +16,7 @@ use omp_core::{Str, base64, sf};
 use smallvec::SmallVec;
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
+use xutf::IntoAnsiStripped as _;
 
 const STDERR_CAPTURE_CAPACITY: usize = 64 * 1024;
 
@@ -76,6 +77,9 @@ mod platform {
 
 	use super::{CapturedStderr, RESIZE_GENERATION, emergency_restore_inner};
 	use crate::Size;
+	pub(super) const fn set_title(_: &str) -> io::Result<()> {
+		Ok(())
+	}
 
 	static TTY_FD: AtomicI32 = AtomicI32::new(-1);
 	static RAW_VALID: AtomicBool = AtomicBool::new(false);
@@ -639,13 +643,28 @@ mod platform {
 			CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
 			ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
 			GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents, GetStdHandle, INPUT_RECORD,
-			ReadConsoleInputW, STD_ERROR_HANDLE, SetConsoleCtrlHandler, SetConsoleMode, SetStdHandle,
-			WriteConsoleA,
+			ReadConsoleInputW, STD_ERROR_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
+			SetConsoleTitleW, SetStdHandle, WriteConsoleA,
 		},
 	};
+	use xutf::IntoAnsiStripped as _;
 
 	use super::{CapturedStderr, emergency_restore_inner};
 	use crate::Size;
+
+	pub(super) fn set_title(title: &str) -> io::Result<()> {
+		let mut title = title
+			.to_owned()
+			.into_ansi_stripped()
+			.encode_utf16()
+			.filter(|unit| *unit >= 0x20 && *unit != 0x7f)
+			.collect::<Vec<_>>();
+		title.push(0);
+		if unsafe { SetConsoleTitleW(title.as_ptr()) } == 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(())
+	}
 	static INPUT_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 	static OUTPUT_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 	static INPUT_MODE: AtomicU32 = AtomicU32::new(0);
@@ -2059,7 +2078,15 @@ impl Terminal {
 	/// without a title stack safely ignore those operations.
 	pub fn set_title(&mut self, title: &str) -> io::Result<()> {
 		let sequence = compose_title(title);
+		platform::set_title(title)?;
 		terminal_write_all(&mut self.tty, &sequence)?;
+		self.tty.flush()
+	}
+
+	/// Delivers one structured attention notification through the negotiated
+	/// terminal protocol and platform fallback.
+	pub fn notify(&mut self, notification: &crate::notify::Notification) -> io::Result<()> {
+		crate::notify::notify(&mut self.tty, &self.caps, notification)?;
 		self.tty.flush()
 	}
 
@@ -2265,7 +2292,12 @@ fn compose_leave(
 fn compose_title(title: &str) -> SmallVec<u8, 128> {
 	let mut sequence = SmallVec::new();
 	sequence.extend_from_slice(esc!(osc, "0;").as_bytes());
-	for character in title.chars().filter(|character| !character.is_control()) {
+	for character in title
+		.to_owned()
+		.into_ansi_stripped()
+		.chars()
+		.filter(|character| !character.is_control())
+	{
 		let mut bytes = [0; 4];
 		sequence.extend_from_slice(character.encode_utf8(&mut bytes).as_bytes());
 	}
@@ -2907,7 +2939,7 @@ mod tests {
 	fn title_and_progress_sequences_are_sanitized_and_exact() {
 		assert_eq!(
 			compose_title(esc!("omp", osc, "2;bad", bel, " title")).as_slice(),
-			esc!(osc, "0;omp]2;bad title", bel).as_bytes()
+			esc!(osc, "0;omp title", bel).as_bytes()
 		);
 		assert!(
 			compose_enter(KeyboardMode::Kitty(esc!(csi, ">5u")), None, 0, 0, false, false)

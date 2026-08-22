@@ -1,4 +1,4 @@
-//! Structured desktop notifications for terminal and Linux D-Bus sinks.
+//! Structured desktop notifications for terminal and native platform sinks.
 
 use std::{
 	ffi::{OsStr, OsString},
@@ -135,7 +135,7 @@ impl From<&NotificationSound> for &'static str {
 ///
 /// OSC 99 carries every field. OSC 9 and unconfirmed OSC 99 collapse the title
 /// and body to one line, while the bell protocol can additionally fan out to a
-/// Linux freedesktop notification daemon.
+/// native desktop notification center.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Notification {
 	/// Optional notification title.
@@ -272,6 +272,7 @@ pub fn notify(
 trait System {
 	fn var(&self, name: &str) -> Option<OsString>;
 	fn is_linux(&self) -> bool;
+	fn is_macos(&self) -> bool;
 	fn path_exists(&self, path: &Path) -> bool;
 	fn find_program(&self, name: &str) -> Option<PathBuf>;
 	fn spawn(&self, argv: &[OsString]) -> io::Result<()>;
@@ -286,6 +287,10 @@ impl System for RealSystem {
 
 	fn is_linux(&self) -> bool {
 		cfg!(target_os = "linux")
+	}
+
+	fn is_macos(&self) -> bool {
+		cfg!(target_os = "macos")
 	}
 
 	fn path_exists(&self, path: &Path) -> bool {
@@ -337,7 +342,7 @@ fn notify_with_system(
 	}
 
 	if caps.notify == NotifyProtocol::Bell {
-		deliver_linux_fallback(notification, system);
+		deliver_desktop_fallback(notification, system);
 	}
 	Ok(())
 }
@@ -512,6 +517,10 @@ fn base64_utf8(value: &str) -> String {
 }
 
 fn deliver_linux_fallback(notification: &Notification, system: &impl System) {
+	if system.is_macos() {
+		deliver_macos_fallback(notification, system);
+		return;
+	}
 	if !system.is_linux()
 		|| system.var("OMP_NO_DESKTOP_NOTIFY").as_deref() == Some(OsStr::new("1"))
 		|| !has_desktop_session(system)
@@ -557,6 +566,31 @@ fn deliver_linux_fallback(notification: &Notification, system: &impl System) {
 	let _ = system.spawn(&argv);
 }
 
+fn deliver_desktop_fallback(notification: &Notification, system: &impl System) {
+	deliver_linux_fallback(notification, system);
+}
+
+fn deliver_macos_fallback(notification: &Notification, system: &impl System) {
+	if system.var("OMP_NO_DESKTOP_NOTIFY").as_deref() == Some(OsStr::new("1")) {
+		return;
+	}
+	let Some(program) = system.find_program("osascript") else {
+		return;
+	};
+	let (title, body, _) = resolved_fields(notification);
+	let argv = [
+		program.into_os_string(),
+		OsString::from("-e"),
+		OsString::from(
+			"on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run",
+		),
+		OsString::from("--"),
+		OsString::from(title),
+		OsString::from(body),
+	];
+	let _ = system.spawn(&argv);
+}
+
 fn has_desktop_session(system: &impl System) -> bool {
 	if env_present(system, "DBUS_SESSION_BUS_ADDRESS") {
 		return true;
@@ -597,6 +631,7 @@ mod tests {
 	struct MockSystem {
 		env:      HashMap<String, OsString>,
 		linux:    bool,
+		macos:    bool,
 		existing: HashSet<PathBuf>,
 		programs: HashMap<String, PathBuf>,
 		spawns:   RefCell<Vec<Vec<OsString>>>,
@@ -609,6 +644,10 @@ mod tests {
 
 		fn is_linux(&self) -> bool {
 			self.linux
+		}
+
+		fn is_macos(&self) -> bool {
+			self.macos
 		}
 
 		fn path_exists(&self, path: &Path) -> bool {
