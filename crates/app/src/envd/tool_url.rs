@@ -245,6 +245,7 @@ impl Resolve for UrlResolver {
 	) -> Result<CowBytes<'static>, Fault> {
 		match self {
 			Self::Host(resolver) => resolver.read(resource, selector).await,
+			Self::Artifact(resolver) => resolver.read(resource, selector).await,
 			Self::Attachment(resolver) => resolver.read(resource, selector).await,
 			Self::Agent(resolver) | Self::History(resolver) => resolver.read(resource, selector).await,
 			Self::Issue(resolver) | Self::Pr(resolver) => resolver.read(resource, selector).await,

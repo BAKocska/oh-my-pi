@@ -2231,7 +2231,7 @@ mod tests {
 		std::fs::create_dir_all(&outside).expect("outside");
 		std::fs::write(outside.join("secret"), b"secret").expect("outside file");
 		symlink(&outside, root.join("link")).expect("symlink");
-		assert!(ensure_canonical_containment(&root, &root.join("link/secret")).is_err());
+		assert!(ensure_canonical_containment(&root, &root.join("link/secret"), false).is_err());
 	}
 
 	#[test]

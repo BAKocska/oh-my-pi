@@ -538,10 +538,10 @@ impl LspControl for DocumentLspControl {
 					.documents
 					.rename(
 						pb::RenamePathRequest {
-							source_uri:           uri.to_string(),
-							destination_uri:      destination.to_string(),
-							overwrite:            pb::DestinationOverwritePolicy::FailIfExists as i32,
-							source_revision:      source_revision,
+							source_uri: uri.to_string(),
+							destination_uri: destination.to_string(),
+							overwrite: pb::DestinationOverwritePolicy::FailIfExists as i32,
+							source_revision,
 							destination_revision: None,
 						},
 						&cancel,

@@ -29,7 +29,7 @@ mod search_backend;
 mod server;
 pub mod shell_profile;
 pub(crate) mod site;
-mod ssh;
+pub(crate) mod ssh;
 mod tool_debug;
 mod tool_document;
 mod tool_lsp;
