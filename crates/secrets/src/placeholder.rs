@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+	collections::{HashMap, HashSet},
+	ops::Range,
+};
 
 use hmac::{Hmac, Mac as _};
 use omp_core::Str;
@@ -166,6 +169,99 @@ fn valid_base_and_hint(value: &str) -> bool {
 			.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 		&& hint.is_none_or(|hint| matches!(hint, "U" | "L" | "C" | "M"))
 }
+fn valid_placeholder(placeholder: &str) -> bool {
+	let Some(body) = placeholder
+		.strip_prefix("$$")
+		.and_then(|body| body.strip_suffix("$$"))
+	else {
+		return false;
+	};
+	let value = body.split_once('_').map_or(body, |(label, value)| {
+		if label.is_empty()
+			|| !label
+				.bytes()
+				.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+		{
+			return "";
+		}
+		value
+	});
+	valid_base_and_hint(value)
+}
+
+/// Scanner over syntactically complete keyed placeholders in arbitrary text.
+///
+/// A rejected candidate resumes at its closing delimiter because that same
+/// delimiter may open an immediately adjacent valid placeholder.
+#[derive(Clone, Debug)]
+pub struct PlaceholderScanner<'a> {
+	text:   &'a str,
+	cursor: usize,
+}
+
+impl<'a> PlaceholderScanner<'a> {
+	/// Creates a scanner over one complete message.
+	#[must_use]
+	pub const fn new(text: &'a str) -> Self {
+		Self { text, cursor: 0 }
+	}
+}
+
+impl<'a> Iterator for PlaceholderScanner<'a> {
+	type Item = (Range<usize>, &'a str);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		while self.cursor < self.text.len() {
+			let start = self.cursor + self.text[self.cursor..].find("$$")?;
+			let body_start = start + 2;
+			let Some(relative_end) = self.text[body_start..].find("$$") else {
+				self.cursor = self.text.len();
+				return None;
+			};
+			let end = body_start + relative_end + 2;
+			let candidate = &self.text[start..end];
+			if valid_placeholder(candidate) {
+				self.cursor = end;
+				return Some((start..end, candidate));
+			}
+			self.cursor = end - 2;
+		}
+		None
+	}
+}
+
+/// Restores complete placeholders across one message, recursively rescanning
+/// only when a restored entry is declared recursive.
+#[must_use]
+pub fn deobfuscate_placeholders(
+	text: &str,
+	mut lookup: impl FnMut(&str) -> Option<PlaceholderEntry>,
+) -> String {
+	if !text.contains("$$") {
+		return text.to_owned();
+	}
+	let mut current = text.to_owned();
+	loop {
+		let mut output = String::with_capacity(current.len());
+		let mut cursor = 0;
+		let mut recursive = false;
+		for (range, placeholder) in PlaceholderScanner::new(&current) {
+			output.push_str(&current[cursor..range.start]);
+			if let Some(entry) = lookup(placeholder) {
+				output.push_str(entry.secret.as_str());
+				recursive |= entry.recursive;
+			} else {
+				output.push_str(placeholder);
+			}
+			cursor = range.end;
+		}
+		output.push_str(&current[cursor..]);
+		if output == current || !recursive || !output.contains("$$") {
+			return output;
+		}
+		current = output;
+	}
+}
 
 /// One reversible placeholder registration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,6 +355,12 @@ impl PlaceholderRegistry {
 				.as_deref()
 				.and_then(|alias| self.entries.get(alias))
 		})
+	}
+
+	/// Restores registered placeholders across one complete message.
+	#[must_use]
+	pub fn deobfuscate(&self, text: &str) -> String {
+		deobfuscate_placeholders(text, |placeholder| self.lookup(placeholder).cloned())
 	}
 }
 

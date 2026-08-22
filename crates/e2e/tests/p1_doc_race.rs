@@ -370,7 +370,7 @@ async fn next_edit_payload(
 	within("successful edit tool result", TEST_TIMEOUT, async {
 		loop {
 			let event = events.recv().await?;
-			let AgentEvent::ToolFinished { call_id: completed, item } = event.as_ref() else {
+			let AgentEvent::ToolFinished { call_id: completed, item, .. } = event.as_ref() else {
 				continue;
 			};
 			if completed.as_str() != call_id {

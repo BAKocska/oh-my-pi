@@ -6,8 +6,8 @@ use omp_core::Str;
 
 use crate::{
 	placeholder::{
-		PlaceholderEntry, PlaceholderRegistry, placeholder_without_friendly_name,
-		sanitize_for_collision_check,
+		PlaceholderEntry, PlaceholderRegistry, deobfuscate_placeholders,
+		placeholder_without_friendly_name, sanitize_for_collision_check,
 	},
 	replacement::{
 		RegexMatchContext, ensure_distinct_replacement, generate_deterministic_replacement,
@@ -277,36 +277,7 @@ impl SecretObfuscator {
 	/// Restores only keyed placeholders minted by this session snapshot.
 	#[must_use]
 	pub fn deobfuscate(&self, text: &str) -> String {
-		if !text.contains("$$") {
-			return text.to_owned();
-		}
-		let mut current = text.to_owned();
-		loop {
-			let mut output = String::with_capacity(current.len());
-			let mut cursor = 0;
-			let mut recurse = false;
-			while let Some(relative_start) = current[cursor..].find("$$") {
-				let start = cursor + relative_start;
-				output.push_str(&current[cursor..start]);
-				let Some(relative_end) = current[start + 2..].find("$$") else {
-					break;
-				};
-				let end = start + 2 + relative_end + 2;
-				let token = &current[start..end];
-				if let Some(entry) = self.lookup_placeholder(token) {
-					output.push_str(entry.secret.as_str());
-					recurse |= entry.recursive;
-				} else {
-					output.push_str(token);
-				}
-				cursor = end;
-			}
-			output.push_str(&current[cursor..]);
-			if output == current || !recurse || !output.contains("$$") {
-				return output;
-			}
-			current = output;
-		}
+		deobfuscate_placeholders(text, |placeholder| self.lookup_placeholder(placeholder).cloned())
 	}
 }
 

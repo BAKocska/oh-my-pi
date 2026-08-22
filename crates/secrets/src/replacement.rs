@@ -43,7 +43,10 @@ pub fn generate_deterministic_replacement(secret: &str) -> String {
 	output
 }
 
-fn bun_wyhash(input: &[u8]) -> u64 {
+/// Computes Bun-compatible Wyhash used by deterministic secret-safe
+/// fingerprints.
+#[must_use]
+pub fn bun_wyhash(input: &[u8]) -> u64 {
 	const SECRET: [u64; 4] =
 		[0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db, 0x8ebc_6af0_9c88_c6e3, 0x5899_65cc_7537_4cc3];
 	let initial = mix(SECRET[0], SECRET[1]);
@@ -249,8 +252,17 @@ pub fn regex_replacement(
 	if deterministic != value && !regex_rematches_in_context(&deterministic, regex, context) {
 		return deterministic;
 	}
-	find_non_matching_replacement(value, regex, context)
-		.unwrap_or_else(|| build_keyed_replacement_run(key, value.encode_utf16().count()))
+	find_non_matching_replacement(value, regex, context).unwrap_or_else(|| {
+		let length = value.encode_utf16().count();
+		if length <= 2 {
+			build_keyed_replacement_run(key, length)
+		} else {
+			let mut replacement = String::with_capacity(length);
+			replacement.push_str("ZZ");
+			replacement.push_str(&build_keyed_replacement_run(key, length - 2));
+			replacement
+		}
+	})
 }
 
 /// Reports whether a default regex replacement cannot safely distinguish a 1–2
