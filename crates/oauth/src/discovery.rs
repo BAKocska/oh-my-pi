@@ -301,10 +301,7 @@ mod tests {
 		.expect("bearer challenge is discovered");
 		let expected_scopes = [Str::from("genie"), Str::from("offline_access")];
 
-		assert_eq!(
-			challenge.scopes.as_ref(),
-			expected_scopes.as_slice(),
-		);
+		assert_eq!(challenge.scopes.as_ref(), expected_scopes.as_slice(),);
 		assert_eq!(
 			challenge.resource_metadata.as_deref(),
 			Some("https://example.com/.well-known/oauth-protected-resource"),
