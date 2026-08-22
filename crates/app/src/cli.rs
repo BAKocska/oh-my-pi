@@ -2506,7 +2506,7 @@ mod tests {
 			"--include-workstation",
 			"--include-workspace-tree",
 			"--render-mermaid=false",
-			"--skills=false",
+			"--skills-enabled=false",
 			"--system-prompt=SYSTEM.md",
 			"--append-prompt=extra",
 			"--null-prompt",
