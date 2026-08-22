@@ -366,11 +366,11 @@ pub fn normalize_pcre_inline_flags(pattern: &str) -> String {
 	else {
 		return pattern.to_owned();
 	};
-	let flags = &pattern[2..flags_end - 1];
+	let flags = &pattern[2..flags_end];
 	if flags.is_empty() || !flags.bytes().all(|byte| matches!(byte, b'i' | b'm' | b's')) {
 		return pattern.to_owned();
 	}
-	format!("(?{flags}:{})", &pattern[flags_end..])
+	format!("(?{flags}:{})", &pattern[flags_end + 1..])
 }
 
 fn dedupe(values: &mut Vec<Str>) {
