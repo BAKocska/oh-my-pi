@@ -11,7 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::future::join_all;
-use omp_core::{IntoStr, Str, StrMut, sf};
+use omp_core::{IntoStr, Str, StrMut, ToolPath, sf};
 use omp_env::{ClientError, EnvClient, Invocation, InvocationEvent};
 use omp_proto::{
 	env::v1::{Admission, AdmitInvocation, InvokeTool, Verdict as EnvVerdict},
@@ -28,7 +28,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, watch};
 
 use crate::{
-	events::{AgentEvent, EventBus},
+	events::{AgentEvent, EventBus, EventProvenance, EventVisibility},
 	project::{tool_result_item, tool_result_item_canonical_parts},
 };
 
@@ -738,6 +738,14 @@ impl SpeculativeCall {
 				props:         Some(props),
 			})
 			.await?;
+		events.publish(AgentEvent::ToolObserved {
+			call_id:            call_id.clone(),
+			path:               ToolPath::new(identity.name.clone()).ok(),
+			identity:           identity.clone(),
+			visibility:         EventVisibility::User,
+			provenance:         EventProvenance::Model,
+			session_generation: events.session_generation(),
+		});
 		events.publish(AgentEvent::ToolOpened {
 			call_id: call_id.clone(),
 			name:    identity.name.clone(),

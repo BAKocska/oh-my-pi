@@ -14,9 +14,9 @@ use omp_storage::{
 	index::{EventProjection, IndexedEvent, IndexedWriteError, JournalPosition, SessionIndex},
 	transcript::{
 		self, AmendPatch, ApprovalDecided, ApprovalTicketFiled, Event, Header, HookOutcome,
-		ItemRecord, JobRegistered, JobSettled, Kind, Log, PolicyDecision, PromptRewriteCommit,
-		PromptRewriteIntent, PromptRewriteStage, Reader, RefreshState, RequestAudit,
-		ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
+		ItemRecord, JobRegistered, JobSettled, Kind, Log, ModelChange, Patch, Pin, PolicyDecision,
+		PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, Reader, RefreshState,
+		RequestAudit, ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
 		event::Custom,
 		msg::Content,
 		writer::{AppendManyError, IndexRun, JournalError as WriterError},
@@ -29,8 +29,14 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
-	journal_kinds::{EntryKindDecl, EntryKindError, EntryKindRegistry},
+	events::EventBus,
+	journal_kinds::{
+		CHECKPOINT_KIND, CORE_EXTENSION, CORE_REVISION, EntryKindDecl, EntryKindError,
+		EntryKindRegistry, REWIND_REPORT_KIND, TTSR_INJECTION_KIND, core_checkpoint_declarations,
+		core_ttsr_declaration,
+	},
 	prompt::PromptHash,
+	ttsr::TtsrSource,
 };
 type ActivePrompt = (Hash32, Vec<u64>);
 type PendingItem = (u64, Item, Option<Hash32>);
@@ -48,6 +54,10 @@ struct CachedReader {
 impl CachedReader {
 	fn open(path: &Path) -> Result<Self, transcript::Error> {
 		Ok(Self { transcript: Reader::open(path)?, writer_stale: false })
+	}
+
+	fn pending(path: &Path, header: Header) -> Self {
+		Self { transcript: Reader::pending(path, header), writer_stale: false }
 	}
 
 	fn refresh_projection(&mut self) -> Result<(), transcript::Error> {
@@ -72,6 +82,77 @@ impl AsRef<transcript::LiveSet> for JournalLog<'_> {
 	}
 }
 
+/// Durable child-session semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildKind {
+	/// A lineage child whose context is resolved from the parent checkpoint.
+	Branch {
+		/// Physical parent checkpoint inherited by the child.
+		checkpoint: u64,
+	},
+	/// A self-contained child seeded from the parent's current live projection.
+	Fork,
+}
+
+/// Append-only projection of workspace roots recorded by a session journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceRoots {
+	primary:   PathBuf,
+	secondary: Arc<[PathBuf]>,
+}
+
+impl WorkspaceRoots {
+	/// Returns the current primary root after future-only moves are folded.
+	#[must_use]
+	pub fn primary(&self) -> &Path {
+		&self.primary
+	}
+
+	/// Returns ordered secondary roots after all durable mutations are folded.
+	#[must_use]
+	pub fn secondary(&self) -> &[PathBuf] {
+		&self.secondary
+	}
+
+	/// Iterates the primary root followed by ordered secondary roots.
+	pub fn iter(&self) -> impl Iterator<Item = &Path> + Clone {
+		std::iter::once(self.primary.as_path()).chain(self.secondary.iter().map(PathBuf::as_path))
+	}
+}
+
+fn fold_workspace_roots<'a>(
+	primary: &Path,
+	events: impl IntoIterator<Item = &'a Kind>,
+) -> WorkspaceRoots {
+	let mut current_primary = primary.to_owned();
+	let mut secondary = Vec::new();
+	for kind in events {
+		match kind {
+			Kind::MoveRoot { root } => {
+				if root != &current_primary {
+					if !secondary.contains(&current_primary) {
+						secondary.push(current_primary);
+					}
+					secondary.retain(|dir| dir != root);
+					current_primary = root.clone();
+				}
+			},
+			Kind::AddDirs { dirs } => {
+				for dir in dirs {
+					if dir != &current_primary && !secondary.contains(dir) {
+						secondary.push(dir.clone());
+					}
+				}
+			},
+			Kind::RemoveDirs { dirs } => {
+				secondary.retain(|dir| !dirs.contains(dir));
+			},
+			_ => {},
+		}
+	}
+	WorkspaceRoots { primary: current_primary, secondary: secondary.into() }
+}
+
 /// Durable textual summary that replaces a live context prefix.
 ///
 /// `summary` is deliberately text rather than provider-native bytes so a
@@ -93,6 +174,8 @@ pub struct Compact {
 	pub method:        Option<Str>,
 	/// Optional user-visible compaction warning.
 	pub warning:       Option<Str>,
+	/// Durable bitmap archive, when this boundary used Snapcompact.
+	pub snapcompact:   Option<transcript::SnapcompactArchive>,
 	/// Ordered extension-summary losers recorded without their summary bytes.
 	pub superseded:    Vec<transcript::SupersededCompaction>,
 }
@@ -459,6 +542,16 @@ pub enum JournalError {
 	/// Canonical recovery-result construction failed.
 	#[error(transparent)]
 	Projection(#[from] crate::ProjectionError),
+	/// A requested checkpoint does not exist in the parent journal.
+	#[error("journal event index {index} does not exist")]
+	InvalidEventIndex {
+		/// Missing physical event index.
+		index: u64,
+	},
+	/// A context or provider transition was requested while a durable turn was
+	/// still pending.
+	#[error("cannot transition session state while a turn is pending")]
+	TransitionWhilePending,
 	/// Rewind was requested while a durable turn was still pending.
 	#[error("cannot rewind while a turn is pending")]
 	RewindWhilePending,
@@ -505,8 +598,8 @@ pub struct Journal {
 impl Journal {
 	/// Creates an empty transcript-v4 journal.
 	pub fn create(path: &Path, header: &Header) -> Result<Self, JournalError> {
-		let writer = Writer::create(path, header)?;
-		let reader = Mutex::new(CachedReader::open(path)?);
+		let writer = Writer::create_lazy(path, header)?;
+		let reader = Mutex::new(CachedReader::pending(path, header.clone()));
 		Ok(Self {
 			path: path.to_owned(),
 			writer,
@@ -793,6 +886,12 @@ impl Journal {
 		Ok(JournalLog(reader))
 	}
 
+	/// Returns the durable session identity owned by this journal.
+	#[must_use]
+	pub const fn session_id(&self) -> &transcript::SessionId {
+		&self.session_id
+	}
+
 	fn prepare_append(&mut self) -> Result<u64, JournalError> {
 		if self.halted {
 			return Err(JournalError::Halted);
@@ -825,6 +924,27 @@ impl Journal {
 		Ok(())
 	}
 
+	fn append_events(&mut self, events: &[Event]) -> Result<Vec<u64>, JournalError> {
+		let expected = self.prepare_append()?;
+		match self.writer.append_atomic(events) {
+			Ok(indexes) => {
+				self.refresh_after_append(expected, events.len())?;
+				Ok(indexes.into_vec())
+			},
+			Err(WriterError::RolledBack { source }) => {
+				self.reader.get_mut().transcript.refresh()?;
+				Err(JournalError::Storage(source))
+			},
+			Err(WriterError::Indeterminate(indeterminate)) => {
+				self.halt_session();
+				Err(JournalError::JournalIndeterminate(indeterminate))
+			},
+			Err(WriterError::TooManyEntries { entries, maximum }) => {
+				Err(JournalError::AtomicTooLarge { entries, maximum })
+			},
+		}
+	}
+
 	fn append(&mut self, event: &Event) -> Result<u64, JournalError> {
 		let expected = self.prepare_append()?;
 		match self.writer.append_atomic(std::slice::from_ref(event)) {
@@ -844,6 +964,95 @@ impl Journal {
 				Err(JournalError::AtomicTooLarge { entries, maximum })
 			},
 		}
+	}
+
+	/// Atomically creates a branch or fork child with ruled lineage semantics.
+	pub fn create_child(
+		&self,
+		path: &Path,
+		header: &transcript::Header,
+		ts: u64,
+		kind: ChildKind,
+	) -> Result<Self, JournalError> {
+		let mut events = Vec::new();
+		let at = match kind {
+			ChildKind::Branch { checkpoint } => {
+				let log = self.load()?;
+				if log.get(checkpoint).is_none() {
+					return Err(JournalError::InvalidEventIndex { index: checkpoint });
+				}
+				Some(checkpoint)
+			},
+			ChildKind::Fork => None,
+		};
+		events.push(Event { ts, kind: Kind::ForkedFrom { session: self.session_id.clone(), at } });
+		if kind == ChildKind::Fork {
+			for item in self.items_at(&self.live_item_events()?)? {
+				events.push(Event {
+					ts,
+					kind: Kind::Item(ItemRecord { item, turn_id: None, prompt_hash: None }),
+				});
+			}
+		}
+		let mut child = Self::create(path, header)?;
+		child.append_events(&events)?;
+		Ok(child)
+	}
+
+	/// Appends a branch summary only while its source checkpoint still exists.
+	pub fn branch_summary(&mut self, ts: u64, from: u64, summary: Str) -> Result<u64, JournalError> {
+		let log = self.load()?;
+		if log.get(from).is_none() {
+			return Err(JournalError::InvalidEventIndex { index: from });
+		}
+		drop(log);
+		self.append(&Event { ts, kind: Kind::Branch { from, summary } })
+	}
+
+	/// Atomically creates a handoff child containing parent lineage and a
+	/// structured summary instead of copying the parent's live projection.
+	///
+	/// `checkpoint` and `compaction_epoch` are validated by the coordinator
+	/// before this journal-owner operation. The checkpoint is checked again
+	/// here so a stale parent event can never be recorded as current lineage.
+	pub fn create_handoff_child(
+		&self,
+		path: &Path,
+		header: &transcript::Header,
+		ts: u64,
+		checkpoint: u64,
+		mut compact: Compact,
+	) -> Result<Self, JournalError> {
+		let log = self.load()?;
+		if log.get(checkpoint).is_none() {
+			return Err(JournalError::InvalidEventIndex { index: checkpoint });
+		}
+		drop(log);
+		compact.first_kept = 0;
+		compact.method = Some(sf!("handoff"));
+		let events = [
+			Event {
+				ts,
+				kind: Kind::ForkedFrom { session: self.session_id.clone(), at: Some(checkpoint) },
+			},
+			Event {
+				ts,
+				kind: Kind::Compact {
+					summary:       compact.summary,
+					short:         compact.short,
+					first_kept:    compact.first_kept,
+					tokens_before: compact.tokens_before,
+					tokens_after:  compact.tokens_after,
+					method:        compact.method,
+					warning:       compact.warning,
+					superseded:    compact.superseded,
+					snapcompact:   compact.snapcompact,
+				},
+			},
+		];
+		let mut child = Self::create(path, header)?;
+		child.append_events(&events)?;
+		Ok(child)
 	}
 
 	/// Attaches the authoritative write-time sessions index for this journal.
@@ -909,6 +1118,91 @@ impl Journal {
 			});
 		}
 		Ok(appended.index)
+	}
+
+	/// Appends and write-time-indexes a title, then publishes the accepted
+	/// title through the host event bus. A failed journal/index write emits no
+	/// observable title transition.
+	pub fn append_title_and_publish(
+		&mut self,
+		ts: u64,
+		title: Str,
+		source: transcript::TitleSource,
+		events: &EventBus,
+	) -> Result<u64, JournalError> {
+		let index = self.append_title(ts, title.clone(), source)?;
+		events.title_changed(title, source);
+		Ok(index)
+	}
+
+	/// Changes the primary workspace root for future entries only.
+	///
+	/// The immutable header remains the historical creation root.
+	pub fn move_workspace_root(&mut self, ts: u64, root: PathBuf) -> Result<u64, JournalError> {
+		self.append(&Event { ts, kind: Kind::MoveRoot { root } })
+	}
+
+	/// Appends ordered secondary workspace roots to the session.
+	///
+	/// Canonicalization and Environment-grant validation belong to the app
+	/// boundary. Replay preserves the exact accepted ordering.
+	pub fn append_workspace_dirs(
+		&mut self,
+		ts: u64,
+		dirs: impl Into<Vec<PathBuf>>,
+	) -> Result<u64, JournalError> {
+		self.append(&Event { ts, kind: Kind::AddDirs { dirs: dirs.into() } })
+	}
+
+	/// Appends a durable removal of secondary workspace roots.
+	///
+	/// Projection always preserves the primary root, even if an old or corrupt
+	/// caller records it in this event.
+	pub fn remove_workspace_dirs(
+		&mut self,
+		ts: u64,
+		dirs: impl Into<Vec<PathBuf>>,
+	) -> Result<u64, JournalError> {
+		self.append(&Event { ts, kind: Kind::RemoveDirs { dirs: dirs.into() } })
+	}
+
+	/// Atomically replaces secondary workspace roots in one journal commit.
+	pub fn replace_workspace_dirs(
+		&mut self,
+		ts: u64,
+		remove: impl Into<Vec<PathBuf>>,
+		add: impl Into<Vec<PathBuf>>,
+	) -> Result<Vec<u64>, JournalError> {
+		let remove = remove.into();
+		let add = add.into();
+		let mut events =
+			Vec::with_capacity(usize::from(!remove.is_empty()) + usize::from(!add.is_empty()));
+		if !remove.is_empty() {
+			events.push(Event { ts, kind: Kind::RemoveDirs { dirs: remove } });
+		}
+		if !add.is_empty() {
+			events.push(Event { ts, kind: Kind::AddDirs { dirs: add } });
+		}
+		if events.is_empty() {
+			return Ok(Vec::new());
+		}
+		self.append_events(&events)
+	}
+
+	/// Folds every physical root mutation in append order.
+	///
+	/// Rewinds and context resets do not erase workspace authority history.
+	pub fn workspace_roots(&self, primary: &Path) -> Result<WorkspaceRoots, JournalError> {
+		let log = self.load()?;
+		Ok(fold_workspace_roots(
+			primary,
+			(0..u64::try_from(log.len()).expect("journal length fits u64")).filter_map(|index| {
+				match log.get(index) {
+					Some(transcript::Entry::Ok(event)) => Some(&event.kind),
+					Some(transcript::Entry::Tombstone(_)) | None => None,
+				}
+			}),
+		))
 	}
 
 	/// Replaces the host/session generation fence accepted by this owner.
@@ -1843,16 +2137,32 @@ impl Journal {
 		prompt_hash: Option<PromptHash>,
 	) -> Result<u64, JournalError> {
 		item.seq = 0;
-		let index = self.append(&Event {
+		crate::project::truncate_item_for_persistence(&mut item);
+		let event = Event {
 			ts,
 			kind: Kind::Item(ItemRecord {
 				item,
 				turn_id: None,
 				prompt_hash: prompt_hash.map(PromptHash::digest),
 			}),
-		})?;
+		};
+		let Kind::Item(record) = &event.kind else {
+			unreachable!("constructed item event");
+		};
+		let appended = self.append_indexed_event(
+			ts,
+			"item",
+			EventProjection::ThreadItem { item: &record.item },
+			&event,
+		)?;
 		self.item_count = self.item_count.saturating_add(1);
-		Ok(index)
+		if let Some(source) = appended.index_error {
+			return Err(JournalError::SessionIndexAfterJournal {
+				event_index: appended.index,
+				source,
+			});
+		}
+		Ok(appended.index)
 	}
 
 	/// Stages one canonical input under the logical turn that must submit it.
@@ -1864,15 +2174,26 @@ impl Journal {
 		prompt_hash: Option<PromptHash>,
 	) -> Result<u64, JournalError> {
 		item.seq = 0;
+		crate::project::truncate_item_for_persistence(&mut item);
 		let turn_id = Str::new(turn_id);
-		let index = self.append(&Event {
+		let event = Event {
 			ts,
 			kind: Kind::TurnInput(TurnInputItem {
 				turn_id: turn_id.clone(),
 				item,
 				prompt_hash: prompt_hash.map(PromptHash::digest),
 			}),
-		})?;
+		};
+		let Kind::TurnInput(input) = &event.kind else {
+			unreachable!("constructed turn-input event");
+		};
+		let appended = self.append_indexed_event(
+			ts,
+			"turn_input",
+			EventProjection::ThreadItem { item: &input.item },
+			&event,
+		)?;
+		let index = appended.index;
 		self.item_count = self.item_count.saturating_add(1);
 		if let Some((_, events)) = self
 			.pending_inputs
@@ -1882,6 +2203,9 @@ impl Journal {
 			events.push(index);
 		} else {
 			self.pending_inputs.push_back((turn_id, vec![index]));
+		}
+		if let Some(source) = appended.index_error {
+			return Err(JournalError::SessionIndexAfterJournal { event_index: index, source });
 		}
 		Ok(index)
 	}
@@ -2052,48 +2376,95 @@ impl Journal {
 		Ok(index)
 	}
 
-	/// Appends one invisible Core-authored checkpoint marker.
-	///
-	/// The returned physical index is the stable token accepted by rewind.
-	pub fn checkpoint(&mut self, ts: u64, label: Str, request_id: Str) -> Result<u64, JournalError> {
+	/// Appends one invisible Core-authored exploration checkpoint marker.
+	pub fn checkpoint(
+		&mut self,
+		ts: u64,
+		token: &str,
+		goal: &str,
+		started_at: u64,
+	) -> Result<u64, JournalError> {
 		#[derive(Serialize)]
 		struct Checkpoint<'a> {
-			label: &'a str,
+			token:      &'a str,
+			goal:       &'a str,
+			started_at: u64,
 		}
 
-		const KIND: &str = "dev.omp.core.checkpoint";
-		const EXTENSION: &str = "dev.omp.core";
-		self.declare_entry_kinds(EXTENSION, vec![
-			EntryKindDecl::parse(KIND, "core.1", false, false, None)
-				.expect("static checkpoint revision is valid"),
-		])?;
-		let data = serde_json::value::to_raw_value(&Checkpoint { label: label.as_str() })
-			.map_err(transcript::Error::from)?;
-		let stamp = JournalRequestStamp {
-			idempotency_key: request_id.clone(),
-			request_id,
-			host_generation: self.generations.host,
-			session_generation: self.generations.session,
-		};
-		let author = JournalAuthor {
-			principal:  Principal::new(sf!("omp.core"), sf!("OMP Core")),
-			provenance: Provenance::new(
-				sf!("omp"),
-				sf!(EXTENSION),
-				sf!(env!("CARGO_PKG_VERSION")),
-				ArtifactDigest::new([0; 32]),
-				sf!("core"),
-				sf!("builtin"),
-				0,
-			),
-		};
+		self.append_core_checkpoint_entry(
+			ts,
+			token,
+			CHECKPOINT_KIND,
+			serde_json::value::to_raw_value(&Checkpoint { token, goal, started_at })
+				.map_err(transcript::Error::from)?,
+		)
+	}
+
+	/// Appends the durable replacement summary after an exploration rewind.
+	pub fn rewind_report(
+		&mut self,
+		token: &str,
+		goal: &str,
+		report: &str,
+		started_at: u64,
+		rewound_at: u64,
+	) -> Result<u64, JournalError> {
+		#[derive(Serialize)]
+		struct RewindReport<'a> {
+			token:      &'a str,
+			goal:       &'a str,
+			report:     &'a str,
+			started_at: u64,
+			rewound_at: u64,
+		}
+
+		self.append_core_checkpoint_entry(
+			rewound_at,
+			token,
+			REWIND_REPORT_KIND,
+			serde_json::value::to_raw_value(&RewindReport {
+				token,
+				goal,
+				report,
+				started_at,
+				rewound_at,
+			})
+			.map_err(transcript::Error::from)?,
+		)
+	}
+
+	fn append_core_checkpoint_entry(
+		&mut self,
+		ts: u64,
+		token: &str,
+		kind: &'static str,
+		data: Box<RawValue>,
+	) -> Result<u64, JournalError> {
+		self.declare_entry_kinds(CORE_EXTENSION, core_checkpoint_declarations())?;
+		let request_id = sf!("{kind}-{token}");
 		let reply = self.handle_request(JournalRequest {
 			ts,
-			stamp,
-			author,
+			stamp: JournalRequestStamp {
+				idempotency_key: request_id.clone(),
+				request_id,
+				host_generation: self.generations.host,
+				session_generation: self.generations.session,
+			},
+			author: JournalAuthor {
+				principal:  Principal::new(sf!("omp.core"), sf!("OMP Core")),
+				provenance: Provenance::new(
+					sf!("omp"),
+					sf!(CORE_EXTENSION),
+					sf!(env!("CARGO_PKG_VERSION")),
+					ArtifactDigest::new([0; 32]),
+					sf!("core"),
+					sf!("builtin"),
+					0,
+				),
+			},
 			operation: JournalOperation::Append(PendingCustomEntry {
-				kind:    sf!(KIND),
-				rev:     sf!("core.1"),
+				kind:    sf!(kind),
+				rev:     sf!(CORE_REVISION),
 				data:    Some(data),
 				context: None,
 				display: Some(false),
@@ -2102,13 +2473,106 @@ impl Journal {
 		Ok(*reply
 			.indexes
 			.first()
-			.expect("single checkpoint append returns one payload index"))
+			.expect("single core checkpoint append returns one payload index"))
 	}
 
-	/// Moves the live chain point to `to`, or to the transcript root.
+	/// Appends an in-place context reset boundary without changing session
+	/// identity or audit history.
+	pub fn reset(&mut self, ts: u64) -> Result<u64, JournalError> {
+		if self.pending_turn().is_some() {
+			return Err(JournalError::TransitionWhilePending);
+		}
+		self.append(&Event { ts, kind: Kind::Reset })
+	}
+
+	/// Requests a fresh provider-native session while preserving the canonical
+	/// context and session identity.
+	pub fn provider_reset(&mut self, ts: u64) -> Result<u64, JournalError> {
+		if self.pending_turn().is_some() {
+			return Err(JournalError::TransitionWhilePending);
+		}
+		self.append(&Event { ts, kind: Kind::ProviderReset })
+	}
+
+	/// Appends a session-only effective model override.
 	///
-	/// Rewinding is rejected while a started turn lacks a terminal receipt.
-	pub fn rewind(&mut self, ts: u64, to: Option<u64>) -> Result<u64, JournalError> {
+	/// Durable `/model` preferences stay in settings and must never call this
+	/// method. Ctrl-P, role cycling, and `/switch` use it so revival can restore
+	/// the effective model without rewriting preferences.
+	pub fn model_override(&mut self, ts: u64, model: ModelChange) -> Result<u64, JournalError> {
+		if self.pending_turn().is_some() {
+			return Err(JournalError::TransitionWhilePending);
+		}
+		self.append(&Event {
+			ts,
+			kind: Kind::Infer {
+				thinking: Patch::Unchanged,
+				model:    Patch::Set(model),
+				tier:     Patch::Unchanged,
+				cred_pin: Patch::Unchanged,
+			},
+		})
+	}
+
+	/// Appends opaque credential-affinity evidence without account identity.
+	pub fn credential_affinity(
+		&mut self,
+		ts: u64,
+		provider: transcript::ProviderId,
+		affinity: &omp_llm_inference::session::CredentialAffinityDigest,
+	) -> Result<u64, JournalError> {
+		self.append(&Event {
+			ts,
+			kind: Kind::Infer {
+				thinking: Patch::Unchanged,
+				model:    Patch::Unchanged,
+				tier:     Patch::Unchanged,
+				cred_pin: Patch::Set(Pin { provider, affinity: Str::new(affinity.as_str()) }),
+			},
+		})
+	}
+
+	/// Restores the latest live session-only model override.
+	pub fn effective_model_override(&self) -> Result<Option<ModelChange>, JournalError> {
+		let mut reader = self.reader.lock();
+		reader.refresh_projection()?;
+		Ok(reader
+			.transcript
+			.live()
+			.iter()
+			.fold(None, |current, index| match reader.transcript.log().get(index) {
+				Some(transcript::Entry::Ok(event)) => match &event.kind {
+					Kind::Infer { model: Patch::Set(model), .. } => Some(model.clone()),
+					Kind::Infer { model: Patch::Clear, .. } => None,
+					_ => current,
+				},
+				_ => current,
+			}))
+	}
+
+	/// Restores the latest live opaque credential affinity.
+	pub fn effective_credential_affinity(&self) -> Result<Option<Pin>, JournalError> {
+		let mut reader = self.reader.lock();
+		reader.refresh_projection()?;
+		Ok(reader
+			.transcript
+			.live()
+			.iter()
+			.fold(None, |current, index| match reader.transcript.log().get(index) {
+				Some(transcript::Entry::Ok(event)) => match &event.kind {
+					Kind::Infer { cred_pin: Patch::Set(pin), .. } => Some(pin.clone()),
+					Kind::Infer { cred_pin: Patch::Clear, .. } => None,
+					_ => current,
+				},
+				_ => current,
+			}))
+	}
+
+	/// Appends an explicit live-chain truncation to `to`, or to the transcript
+	/// root.
+	///
+	/// Truncation is rejected while a started turn lacks a terminal receipt.
+	pub fn truncate_to(&mut self, ts: u64, to: Option<u64>) -> Result<u64, JournalError> {
 		if self.pending_turn().is_some() {
 			return Err(JournalError::RewindWhilePending);
 		}
@@ -2117,9 +2581,9 @@ impl Journal {
 
 	/// Replaces the live context prefix with a durable textual summary.
 	///
-	/// Like [`Self::rewind`], compaction is rejected while a started turn lacks
-	/// a terminal receipt, preventing an authorized batch from being stranded
-	/// outside the resulting live chain.
+	/// Like [`Self::truncate_to`], compaction is rejected while a started turn
+	/// lacks a terminal receipt, preventing an authorized batch from being
+	/// stranded outside the resulting live chain.
 	pub fn compact(&mut self, ts: u64, compact: Compact) -> Result<u64, JournalError> {
 		if self.pending_turn().is_some() {
 			return Err(JournalError::CompactWhilePending);
@@ -2135,6 +2599,7 @@ impl Journal {
 				method:        compact.method,
 				warning:       compact.warning,
 				superseded:    compact.superseded,
+				snapcompact:   compact.snapcompact,
 			},
 		})
 	}
@@ -2199,8 +2664,11 @@ impl Journal {
 		&mut self,
 		ts: u64,
 		turn_id: &str,
-		outcome: Outcome,
+		mut outcome: Outcome,
 	) -> Result<(TurnReceipt, bool), JournalError> {
+		for item in &mut outcome.output {
+			crate::project::truncate_item_for_persistence(item);
+		}
 		if let Some(receipt) = self.receipts.get(turn_id) {
 			if receipt.outcome != outcome {
 				return Err(JournalError::TurnReplayMismatch(Str::new(turn_id)));
@@ -2231,14 +2699,24 @@ impl Journal {
 				}
 				continue;
 			}
-			let index = self.append(&Event {
+			let event = Event {
 				ts,
 				kind: Kind::Item(ItemRecord {
 					item: item.clone(),
 					turn_id: Some(turn_id.clone()),
 					prompt_hash,
 				}),
-			})?;
+			};
+			let Kind::Item(record) = &event.kind else {
+				unreachable!("constructed gateway item event");
+			};
+			let appended = self.append_indexed_event(
+				ts,
+				"item",
+				EventProjection::ThreadItem { item: &record.item },
+				&event,
+			)?;
+			let index = appended.index;
 			item_events.push(index);
 			self.item_count = self.item_count.saturating_add(1);
 			self
@@ -2246,6 +2724,9 @@ impl Journal {
 				.entry(turn_id.clone())
 				.or_default()
 				.push((index, item.clone(), prompt_hash));
+			if let Some(source) = appended.index_error {
+				return Err(JournalError::SessionIndexAfterJournal { event_index: index, source });
+			}
 		}
 		if mismatch || replayed < existing.len() {
 			return Err(JournalError::TurnReplayMismatch(turn_id));
@@ -2278,6 +2759,69 @@ impl Journal {
 			return Err(JournalError::SessionIndexAfterJournal { event_index: receipt_event, source });
 		}
 		Ok((receipt, false))
+	}
+
+	/// Appends one invisible core TTSR injection with its model-context
+	/// projection.
+	pub fn append_ttsr_injection(
+		&mut self,
+		ts: u64,
+		turn_id: &str,
+		source: TtsrSource,
+		rules: &[Str],
+		content: &str,
+	) -> Result<u64, JournalError> {
+		#[derive(Serialize)]
+		struct TtsrInjection<'a> {
+			turn_id: &'a str,
+			source:  &'static str,
+			rules:   &'a [Str],
+			content: &'a str,
+		}
+
+		self.declare_entry_kinds(CORE_EXTENSION, [core_ttsr_declaration()])?;
+		let digest = Hash32::sum(content.as_bytes());
+		let request_id = sf!("ttsr-{}-{}", turn_id, digest);
+		let reply = self.handle_request(JournalRequest {
+			ts,
+			stamp: JournalRequestStamp {
+				idempotency_key: request_id.clone(),
+				request_id,
+				host_generation: self.generations.host,
+				session_generation: self.generations.session,
+			},
+			author: JournalAuthor {
+				principal:  Principal::new(sf!("omp.core"), sf!("OMP Core")),
+				provenance: Provenance::new(
+					sf!("omp"),
+					sf!(CORE_EXTENSION),
+					sf!(env!("CARGO_PKG_VERSION")),
+					ArtifactDigest::new([0; 32]),
+					sf!("core"),
+					sf!("builtin"),
+					0,
+				),
+			},
+			operation: JournalOperation::Append(PendingCustomEntry {
+				kind:    sf!(TTSR_INJECTION_KIND),
+				rev:     sf!(CORE_REVISION),
+				data:    Some(
+					serde_json::value::to_raw_value(&TtsrInjection {
+						turn_id,
+						source: <&'static str>::from(source),
+						rules,
+						content,
+					})
+					.map_err(transcript::Error::from)?,
+				),
+				context: None,
+				display: Some(false),
+			}),
+		})?;
+		Ok(*reply
+			.indexes
+			.first()
+			.expect("single TTSR injection append returns one payload index"))
 	}
 
 	/// Durably authorizes one committed tool batch before any effect may start.
@@ -2847,6 +3391,90 @@ mod tests {
 			})),
 			..Default::default()
 		}
+	}
+
+	#[test]
+	fn reset_fresh_and_child_lineage_round_trip() {
+		let parent_path = path("lifecycle-parent");
+		let mut parent = Journal::create(&parent_path, &header()).expect("create parent");
+		parent
+			.append_optimistic(2, message("before"), None)
+			.expect("append item");
+		parent.provider_reset(3).expect("provider reset");
+		parent.reset(4).expect("reset");
+		parent
+			.append_optimistic(5, message("after"), None)
+			.expect("append live item");
+
+		let branch_path = path("lifecycle-branch");
+		let mut branch_header = header();
+		branch_header.id = SessionId(sf!("branch-child"));
+		let branch = parent
+			.create_child(&branch_path, &branch_header, 6, ChildKind::Branch { checkpoint: 0 })
+			.expect("create branch");
+		assert!(
+			branch
+				.live_item_events()
+				.expect("branch live items")
+				.is_empty()
+		);
+
+		let fork_path = path("lifecycle-fork");
+		let mut fork_header = header();
+		fork_header.id = SessionId(sf!("fork-child"));
+		let fork = parent
+			.create_child(&fork_path, &fork_header, 7, ChildKind::Fork)
+			.expect("create fork");
+		assert_eq!(
+			fork
+				.items_at(&fork.live_item_events().expect("fork events"))
+				.expect("fork items"),
+			vec![message("after")]
+		);
+
+		drop((parent, branch, fork));
+		let log = transcript::load(&parent_path).expect("reload parent");
+		assert!(matches!(log.get(1), Some(Entry::Ok(event)) if event.kind == Kind::ProviderReset));
+		assert!(matches!(log.get(2), Some(Entry::Ok(event)) if event.kind == Kind::Reset));
+		for path in [parent_path, branch_path, fork_path] {
+			std::fs::remove_file(path).expect("remove journal");
+		}
+	}
+
+	#[test]
+	fn workspace_root_mutations_fold_and_replay_without_removing_primary() {
+		let path = path("workspace-roots");
+		let primary = PathBuf::from("/workspace");
+		let secondary_a = PathBuf::from("/workspace-a");
+		let secondary_b = PathBuf::from("/workspace-b");
+		let mut journal = Journal::create(&path, &header()).expect("create journal");
+		journal
+			.append_workspace_dirs(2, vec![
+				secondary_a.clone(),
+				primary.clone(),
+				secondary_b.clone(),
+				secondary_a.clone(),
+			])
+			.expect("append roots");
+		journal
+			.remove_workspace_dirs(3, vec![primary.clone(), secondary_a.clone()])
+			.expect("remove roots");
+
+		assert_eq!(journal.workspace_roots(&primary).expect("project roots"), WorkspaceRoots {
+			primary:   primary.clone(),
+			secondary: vec![secondary_b.clone()].into(),
+		});
+
+		drop(journal);
+		let reopened = Journal::open(&path).expect("reopen root journal");
+		assert_eq!(
+			reopened
+				.workspace_roots(&primary)
+				.expect("replay roots")
+				.secondary(),
+			[secondary_b]
+		);
+		let _ = std::fs::remove_file(path);
 	}
 
 	fn outcome() -> Outcome {
@@ -3480,6 +4108,7 @@ mod tests {
 		let job = |id: &'static str| JobRef {
 			id:       sf!(id),
 			owner:    JobOwner::NamedProcess { name: sf!(id), generation: 1 },
+			metadata: std::sync::Arc::default(),
 			artifact: ExpectedArtifact {
 				description: sf!("artifact"),
 				media_type:  Some(sf!("text/plain")),
@@ -3657,7 +4286,7 @@ mod tests {
 			.expect("start pending turn");
 		assert_eq!(journal.live_item_events().expect("project pending journal"), vec![input]);
 		assert!(journal.pending_turn().is_some());
-		assert!(matches!(journal.rewind(4, None), Err(JournalError::RewindWhilePending)));
+		assert!(matches!(journal.truncate_to(4, None), Err(JournalError::RewindWhilePending)));
 		assert!(matches!(
 			journal.compact(4, Compact {
 				summary:       sf!("summary"),
@@ -3667,6 +4296,7 @@ mod tests {
 				tokens_after:  Some(20),
 				method:        Some(sf!("remote")),
 				warning:       None,
+				snapcompact:   None,
 				superseded:    Vec::new(),
 			}),
 			Err(JournalError::CompactWhilePending)

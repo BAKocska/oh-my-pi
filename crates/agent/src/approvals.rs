@@ -2,7 +2,11 @@
 
 use std::{
 	collections::BTreeMap,
-	sync::atomic::{AtomicU64, Ordering},
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::Duration,
 };
 
 use omp_core::{Str, sf};
@@ -179,6 +183,149 @@ pub struct ApprovalBook {
 	next_id:       AtomicU64,
 	tickets:       Mutex<BTreeMap<Str, ApprovalTicket>>,
 	by_invocation: Mutex<BTreeMap<Str, Str>>,
+}
+
+/// Awaitable host dispatch for durable approval tickets.
+///
+/// Each request owns a one-shot response. Dropping the host inbox, dropping a
+/// received request without answering, or timing out resolves through the
+/// ticket's declared policy instead of leaving the invocation suspended.
+#[derive(Clone)]
+pub struct ApprovalRoute {
+	book: Arc<ApprovalBook>,
+	tx:   flume::Sender<ApprovalRequest>,
+}
+
+/// Host-facing receiving half of an [`ApprovalRoute`].
+pub struct ApprovalInbox {
+	rx: flume::Receiver<ApprovalRequest>,
+}
+
+/// One pending approval delivered to a host.
+pub struct ApprovalRequest {
+	/// Durable ticket awaiting a decision.
+	pub ticket: ApprovalTicket,
+	reply:      tokio::sync::oneshot::Sender<ApprovalDecision>,
+}
+
+impl ApprovalRequest {
+	/// Answers this request. The route's durable first-decision rule remains
+	/// authoritative if a timeout or another host has already settled it.
+	pub fn respond(self, decision: ApprovalDecision) -> Result<(), ApprovalDecision> {
+		self.reply.send(decision)
+	}
+}
+
+impl ApprovalInbox {
+	/// Receives the next pending approval request.
+	pub async fn recv(&self) -> Result<ApprovalRequest, flume::RecvError> {
+		self.rx.recv_async().await
+	}
+
+	/// Attempts to receive a pending request without waiting.
+	pub fn try_recv(&self) -> Result<ApprovalRequest, flume::TryRecvError> {
+		self.rx.try_recv()
+	}
+}
+
+impl ApprovalRoute {
+	/// Creates a route and its single host inbox.
+	#[must_use]
+	pub fn new(book: Arc<ApprovalBook>) -> (Self, ApprovalInbox) {
+		let (tx, rx) = flume::unbounded();
+		(Self { book, tx }, ApprovalInbox { rx })
+	}
+
+	/// Files, dispatches, and awaits one durable approval ticket.
+	///
+	/// Cancellation withdraws the pending ticket. An unreachable host denies
+	/// by default and only approves when every merged requirement explicitly
+	/// declares a fail-open unreachable policy. Timeout defaults are honored
+	/// only when every requirement supplies the same default.
+	pub async fn request(
+		&self,
+		invocation_id: Option<Str>,
+		reasons: Vec<ApprovalSpec>,
+		created_at_ms: u64,
+	) -> ApprovalTicket {
+		let ticket = self.book.file(invocation_id, reasons, created_at_ms);
+		if ticket.state != TicketState::Pending {
+			return ticket;
+		}
+		let _guard = self
+			.book
+			.guard(ticket.ticket_id.as_str())
+			.expect("newly filed approval ticket exists");
+		let (reply, response) = tokio::sync::oneshot::channel();
+		let timeout_ms = ticket
+			.reasons
+			.iter()
+			.map(|reason| reason.timeout_ms)
+			.filter(|timeout| *timeout != 0)
+			.min();
+		if self
+			.tx
+			.send(ApprovalRequest { ticket: ticket.clone(), reply })
+			.is_err()
+		{
+			return self.resolve_unreachable(&ticket, "approval host disconnected");
+		}
+		let decision = match timeout_ms {
+			Some(timeout_ms) => {
+				match tokio::time::timeout(Duration::from_millis(timeout_ms), response).await {
+					Ok(Ok(decision)) => decision,
+					Ok(Err(_)) => {
+						return self.resolve_unreachable(&ticket, "approval host became unreachable");
+					},
+					Err(_) => timeout_decision(&ticket),
+				}
+			},
+			None => match response.await {
+				Ok(decision) => decision,
+				Err(_) => {
+					return self.resolve_unreachable(&ticket, "approval host became unreachable");
+				},
+			},
+		};
+		self
+			.book
+			.decide(ticket.ticket_id.as_str(), decision)
+			.expect("dispatched approval ticket exists")
+	}
+
+	fn resolve_unreachable(&self, ticket: &ApprovalTicket, reason: &'static str) -> ApprovalTicket {
+		let approved = !ticket.reasons.is_empty()
+			&& ticket
+				.reasons
+				.iter()
+				.all(|spec| matches!(spec.unreachable.as_str(), "allow" | "approve" | "fail_open"));
+		let decision = ApprovalDecision {
+			approved,
+			scope: sf!("once"),
+			source: ApprovalSource::Unavailable,
+			decided_by: None,
+			reason: Some(sf!(reason)),
+			audited: approved,
+		};
+		self
+			.book
+			.decide(ticket.ticket_id.as_str(), decision)
+			.expect("dispatched approval ticket exists")
+	}
+}
+
+fn timeout_decision(ticket: &ApprovalTicket) -> ApprovalDecision {
+	let mut defaults = ticket.reasons.iter().map(|reason| reason.default);
+	let first = defaults.next().flatten();
+	let approved = first.is_some() && defaults.all(|value| value == first) && first == Some(true);
+	ApprovalDecision {
+		approved,
+		scope: sf!("once"),
+		source: ApprovalSource::Timeout,
+		decided_by: None,
+		reason: Some(sf!("approval request timed out")),
+		audited: approved,
+	}
 }
 /// Invocation-owned guard that withdraws an unanswered ticket on drop.
 pub struct ApprovalGuard<'a> {
@@ -372,7 +519,11 @@ impl Default for ApprovalBook {
 
 #[cfg(test)]
 mod tests {
-	use super::{ApprovalBook, ApprovalDecision, ApprovalSource, ApprovalSpec, TicketState};
+	use std::sync::Arc;
+
+	use super::{
+		ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalSource, ApprovalSpec, TicketState,
+	};
 	fn spec() -> ApprovalSpec {
 		ApprovalSpec {
 			title:         sf!("Run"),
@@ -425,5 +576,41 @@ mod tests {
 			let _guard = book.guard(ticket.ticket_id.as_str()).unwrap();
 		}
 		assert!(book.pending().is_empty());
+	}
+
+	#[tokio::test]
+	async fn route_suspends_then_resumes_with_first_decision() {
+		let book = Arc::new(ApprovalBook::new());
+		let (route, inbox) = ApprovalRoute::new(Arc::clone(&book));
+		let request = route.request(Some(sf!("routed")), vec![spec()], 1);
+		let answer = async {
+			let pending = inbox.recv().await.unwrap();
+			pending
+				.respond(ApprovalDecision {
+					approved:   true,
+					scope:      sf!("once"),
+					source:     ApprovalSource::User,
+					decided_by: None,
+					reason:     None,
+					audited:    false,
+				})
+				.unwrap();
+		};
+		let (ticket, ()) = tokio::join!(request, answer);
+		assert_eq!(ticket.state, TicketState::Decided);
+		assert!(ticket.decision.unwrap().approved);
+		assert!(book.pending().is_empty());
+	}
+
+	#[tokio::test]
+	async fn route_fails_closed_when_host_is_lost() {
+		let book = Arc::new(ApprovalBook::new());
+		let (route, inbox) = ApprovalRoute::new(book);
+		drop(inbox);
+		let ticket = route.request(Some(sf!("lost")), vec![spec()], 1).await;
+		let decision = ticket.decision.unwrap();
+		assert!(!decision.approved);
+		assert_eq!(decision.source, ApprovalSource::Unavailable);
+		assert!(decision.reason.unwrap().contains("disconnected"));
 	}
 }

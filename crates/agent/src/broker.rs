@@ -3,10 +3,13 @@
 use std::{
 	collections::{HashMap, VecDeque},
 	fs,
-	io::BufRead as _,
+	io::{BufRead as _, Read as _},
 	path::{Path, PathBuf},
-	sync::{Arc, LazyLock, Weak},
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	sync::{
+		Arc, LazyLock, Weak,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use omp_core::Str;
@@ -19,6 +22,15 @@ use crate::{AgentKind, AgentNode, Interrupt, InterruptClass, InterruptSource, Ma
 
 const MAILBOX_CAPACITY: usize = 100;
 const ACTIVITY_MAX_CHARS: usize = 80;
+const DISCOVERY_DIAGNOSTIC_CAPACITY: usize = 128;
+const DELIVERY_DEDUP_CAPACITY: usize = 1_024;
+const PREFIX_MAX_LINES: usize = 64;
+const PREFIX_MAX_BYTES: usize = 256 * 1_024;
+const TASK_SUMMARY_MAX_CHARS: usize = 160;
+const QUERY_MAX_BYTES: usize = 4 * 1_024 * 1_024;
+const QUERY_MAX_CHARS: usize = 4_096;
+const QUERY_MAX_DEPTH: usize = 64;
+const QUERY_MAX_DURATION: Duration = Duration::from_millis(100);
 
 /// Delivery boundary requested by a peer message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString)]
@@ -55,10 +67,36 @@ pub enum RegistryStatus {
 	Running = 0,
 	/// A live in-memory session is waiting for work.
 	Idle    = 1,
-	/// The session is disposed but its transcript can revive it.
+	/// Live resources were evicted; the durable journal can restart the loop.
 	Parked  = 2,
-	/// A tombstone permanently prevents revival.
-	Aborted = 3,
+}
+
+/// Classification for a bounded transcript-prefix discovery diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum DiscoveryDiagnosticKind {
+	/// The v4 header or a prefix event was malformed.
+	Corrupt,
+	/// The bounded prefix ended before durable child initialization appeared.
+	Incomplete,
+}
+
+/// A retained diagnostic for an on-disk journal that could not be registered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveryDiagnostic {
+	/// Journal path that was inspected.
+	pub path: PathBuf,
+	/// Stable machine-readable classification.
+	pub kind: DiscoveryDiagnosticKind,
+}
+
+/// Generation-fenced request to detach one idle live runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParkLease {
+	/// Parked durable registry projection.
+	pub record:   AgentRecord,
+	/// Revision that must still match before live resources are detached.
+	pub revision: u64,
 }
 
 /// Historical, non-secret metrics retained after an agent parks.
@@ -80,6 +118,9 @@ pub struct AgentHistory {
 	pub patch_path:    Option<PathBuf>,
 	/// Preserved branch name.
 	pub branch:        Option<Str>,
+	/// Historical terminal outcome; cancellation and failure never destroy
+	/// identity.
+	pub terminal:      Option<crate::SubagentTerminalStatus>,
 }
 
 /// Clone-cheap process-global roster projection.
@@ -107,8 +148,10 @@ pub struct AgentRecord {
 	pub transcript:       Option<PathBuf>,
 	/// Agent definition name used to create the session.
 	pub definition:       Option<Str>,
-	/// Effective model selector, including an explicit thinking suffix.
+	/// Requested model role or selector retained from child initialization.
 	pub model:            Option<Str>,
+	/// Actual serving model most recently observed in the bounded prefix.
+	pub serving_model:    Option<Str>,
 	/// Normalized task summary for historical rosters.
 	pub task:             Option<Str>,
 	/// Historical execution and merge facts.
@@ -131,28 +174,45 @@ pub enum RegistryError {
 		/// Current revision.
 		actual:   u64,
 	},
-	/// A tombstoned id cannot be registered or revived.
-	#[error("agent {0} is aborted and cannot be revived")]
-	Tombstoned(Str),
+	/// A recovered display alias remains reserved by another stable identity.
+	#[error("agent display name remains reserved: {0}")]
+	NameReserved(Str),
 	/// The requested agent or history artifact does not exist.
 	#[error("agent resource was not found: {0}")]
 	ResourceNotFound(Str),
+	/// Agent output was not valid JSON.
+	#[error("agent output is not valid JSON")]
+	InvalidJson(#[source] serde_json::Error),
+	/// The jq program could not be loaded or compiled.
+	#[error("agent output query is invalid")]
+	InvalidQuery,
+	/// The jq program exceeded its query, input, output, depth, or time bound.
+	#[error("agent output query exceeded a safety limit")]
+	QueryLimit,
+	/// The jq program emitted no value.
+	#[error("agent output query emitted no value")]
+	QueryEmpty,
+	/// The jq program emitted more than one value.
+	#[error("agent output query emitted more than one value")]
+	QueryMultiple,
 	/// A transcript or artifact could not be read.
 	#[error("agent resource I/O failed: {0}")]
 	Io(#[from] std::io::Error),
 }
 
 struct RegistryEntry {
-	record:   AgentRecord,
-	revision: u64,
+	record:       AgentRecord,
+	revision:     u64,
+	live_history: Option<Arc<[u8]>>,
 }
 
 struct RegistryInner {
-	records:    Mutex<HashMap<Str, RegistryEntry>>,
-	generation: tokio::sync::watch::Sender<u64>,
+	records:     Mutex<HashMap<Str, RegistryEntry>>,
+	diagnostics: Mutex<VecDeque<DiscoveryDiagnostic>>,
+	generation:  tokio::sync::watch::Sender<u64>,
 }
 
-/// Process-global CAS registry for live, parked, and aborted agents.
+/// Process-global CAS registry for live, parked, and disk-recovered agents.
 #[derive(Clone)]
 pub struct AgentRegistry {
 	inner: Arc<RegistryInner>,
@@ -177,7 +237,13 @@ impl AgentRegistry {
 	#[must_use]
 	pub fn new() -> Self {
 		let (generation, _) = tokio::sync::watch::channel(0_u64);
-		Self { inner: Arc::new(RegistryInner { records: Mutex::new(HashMap::new()), generation }) }
+		Self {
+			inner: Arc::new(RegistryInner {
+				records: Mutex::new(HashMap::new()),
+				diagnostics: Mutex::new(VecDeque::with_capacity(DISCOVERY_DIAGNOSTIC_CAPACITY)),
+				generation,
+			}),
+		}
 	}
 
 	/// Subscribes to every registration, lifecycle, activity, and history
@@ -201,13 +267,15 @@ impl AgentRegistry {
 		expected: Option<u64>,
 	) -> Result<u64, RegistryError> {
 		let mut records = self.inner.records.lock();
-		match records.get(&record.id) {
-			Some(entry) if entry.record.status == RegistryStatus::Aborted => {
-				return Err(RegistryError::Tombstoned(record.id));
-			},
+		let existing_key = records
+			.keys()
+			.find(|id| id.as_str().eq_ignore_ascii_case(record.id.as_str()))
+			.cloned();
+		let previous = existing_key.as_ref().and_then(|id| records.get(id));
+		match previous {
 			Some(entry) if expected != Some(entry.revision) => {
 				return Err(RegistryError::Revision {
-					id:       record.id,
+					id:       entry.record.id.clone(),
 					expected: expected.unwrap_or(0),
 					actual:   entry.revision,
 				});
@@ -215,19 +283,29 @@ impl AgentRegistry {
 			None if expected.is_some() => return Err(RegistryError::NotFound(record.id)),
 			_ => {},
 		}
+		if records.iter().any(|(id, entry)| {
+			existing_key.as_ref() != Some(id)
+				&& entry
+					.record
+					.name
+					.as_str()
+					.eq_ignore_ascii_case(record.name.as_str())
+		}) {
+			return Err(RegistryError::NameReserved(record.name));
+		}
+		let key = existing_key.unwrap_or_else(|| record.id.clone());
+		record.id = key.clone();
 		record.activity = sanitize_activity(record.activity.as_str());
-		record.last_activity_ms = now_ms();
-		let revision = records
-			.get(&record.id)
-			.map_or(1, |entry| entry.revision.saturating_add(1));
-		records.insert(record.id.clone(), RegistryEntry { record, revision });
+		let previous = records.get(&key);
+		let revision = previous.map_or(1, |entry| entry.revision.saturating_add(1));
+		let live_history = previous.and_then(|entry| entry.live_history.clone());
+		records.insert(key, RegistryEntry { record, revision, live_history });
 		drop(records);
 		self.bump_generation();
 		Ok(revision)
 	}
 
-	/// Registers a live tree node, replacing only a non-aborted prior
-	/// generation.
+	/// Registers a live tree node while preserving its durable identity.
 	pub fn register_node(
 		&self,
 		node: &AgentNode,
@@ -249,6 +327,7 @@ impl AgentRegistry {
 				transcript,
 				definition: None,
 				model: None,
+				serving_model: None,
 				task: None,
 				history: AgentHistory::default(),
 			},
@@ -292,9 +371,6 @@ impl AgentRegistry {
 		status: RegistryStatus,
 	) -> Result<u64, RegistryError> {
 		self.update(id, expected, |record| {
-			if record.status == RegistryStatus::Aborted && status != RegistryStatus::Aborted {
-				return Err(RegistryError::Tombstoned(record.id.clone()));
-			}
 			record.status = status;
 			Ok(())
 		})
@@ -327,9 +403,21 @@ impl AgentRegistry {
 		})
 	}
 
+	/// Retains a terminal generation outcome without changing durable identity.
+	pub fn set_terminal(
+		&self,
+		id: &str,
+		terminal: crate::SubagentTerminalStatus,
+	) -> Result<u64, RegistryError> {
+		self.update(id, None, |record| {
+			record.history.terminal = Some(terminal.bounded());
+			Ok(())
+		})
+	}
+
 	/// Parks idle records whose TTL elapsed and returns records whose owners
 	/// should dispose their live sessions.
-	pub fn park_expired(&self, now: u64, ttl: Duration) -> Vec<AgentRecord> {
+	pub fn park_expired(&self, now: u64, ttl: Duration) -> Vec<ParkLease> {
 		if ttl.is_zero() {
 			return Vec::new();
 		}
@@ -343,7 +431,7 @@ impl AgentRegistry {
 				entry.record.status = RegistryStatus::Parked;
 				entry.record.last_activity_ms = now;
 				entry.revision = entry.revision.saturating_add(1);
-				parked.push(entry.record.clone());
+				parked.push(ParkLease { record: entry.record.clone(), revision: entry.revision });
 			}
 		}
 		drop(records);
@@ -353,62 +441,95 @@ impl AgentRegistry {
 		parked
 	}
 
-	/// Writes a transcript-adjacent tombstone and permanently aborts an agent.
-	pub fn abort(&self, id: &str) -> Result<u64, RegistryError> {
-		let transcript = self.record(id).and_then(|(record, _)| record.transcript);
-		if let Some(path) = transcript {
-			fs::write(tombstone_path(&path), id.as_bytes())?;
-		}
-		self.set_status(id, None, RegistryStatus::Aborted)
-	}
-
-	/// Imports valid transcript headers as parked records. Corrupt files,
-	/// header-only files, and explicit tombstones are skipped.
+	/// Imports bounded valid transcript prefixes as parked records.
+	///
+	/// Malformed and incomplete journals remain untouched and are exposed
+	/// through [`Self::discovery_diagnostics`].
 	pub fn discover_transcripts(&self, directory: &Path) -> Result<usize, RegistryError> {
 		let mut imported = 0;
 		for entry in fs::read_dir(directory)? {
 			let path = entry?.path();
-			if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl")
-				|| tombstone_path(&path).exists()
-			{
+			if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
 				continue;
 			}
-			let Some(record) = cold_record(&path)? else {
-				continue;
-			};
-			let expected = self.revision(record.id.as_str());
-			if self.compare_and_register(record, expected).is_ok() {
-				imported += 1;
+			match cold_record(&path)? {
+				ColdScan::Record(record) => {
+					let expected = self.revision(record.id.as_str());
+					if self.compare_and_register(record, expected).is_ok() {
+						imported += 1;
+					}
+				},
+				ColdScan::Skipped(kind) => self.record_discovery_diagnostic(path, kind),
 			}
 		}
 		Ok(imported)
 	}
 
+	/// Returns retained bounded-prefix diagnostics, oldest first.
+	#[must_use]
+	pub fn discovery_diagnostics(&self) -> Vec<DiscoveryDiagnostic> {
+		self.inner.diagnostics.lock().iter().cloned().collect()
+	}
+
 	/// Resolves `agent://<id>` or `agent://<id>/<child>` to immutable artifact
 	/// bytes. Child names become dot-separated artifact stems.
 	pub fn resolve_agent(&self, resource: &str) -> Result<Vec<u8>, RegistryError> {
+		Ok(fs::read(self.agent_path(resource)?)?)
+	}
+
+	/// Resolves an output and applies one bounded jq-compatible expression.
+	pub fn resolve_agent_query(
+		&self,
+		resource: &str,
+		query: &str,
+	) -> Result<Vec<u8>, RegistryError> {
+		let path = self.agent_path(resource)?;
+		if fs::metadata(&path)?.len() > QUERY_MAX_BYTES as u64 {
+			return Err(RegistryError::QueryLimit);
+		}
+		let bytes = fs::read(path)?;
+		bounded_json_query(&bytes, query)
+	}
+
+	fn agent_path(&self, resource: &str) -> Result<PathBuf, RegistryError> {
 		let resource = resource.trim_start_matches('/');
 		let (id, child) = resource.split_once('/').unwrap_or((resource, ""));
 		let (record, _) = self
 			.record(id)
 			.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(id)))?;
-		let path = if child.is_empty() {
-			record.history.output_path
-		} else {
-			let child = child.replace('/', ".");
-			if !valid_artifact_component(&child) {
-				return Err(RegistryError::ResourceNotFound(Str::new(resource)));
-			}
-			let parent = record
+		if child.is_empty() {
+			return record
 				.history
 				.output_path
-				.as_ref()
-				.and_then(|path| path.parent())
-				.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(resource)))?;
-			Some(parent.join(format!("{}.{}.md", record.id, child)))
+				.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(resource)));
 		}
-		.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(resource)))?;
-		Ok(fs::read(path)?)
+		let child = child.replace('/', ".");
+		if !valid_artifact_component(&child) {
+			return Err(RegistryError::ResourceNotFound(Str::new(resource)));
+		}
+		let parent = record
+			.history
+			.output_path
+			.as_ref()
+			.and_then(|path| path.parent())
+			.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(resource)))?;
+		Ok(parent.join(format!("{}.{}.md", record.id, child)))
+	}
+
+	/// Replaces the live in-memory transcript projection for one session.
+	///
+	/// Returns whether a matching live registry entry was present.
+	#[must_use]
+	pub fn set_live_history(&self, session: &str, history: Vec<u8>) -> bool {
+		let mut records = self.inner.records.lock();
+		let Some(entry) = records
+			.values_mut()
+			.find(|entry| entry.record.session == session || entry.record.id == session)
+		else {
+			return false;
+		};
+		entry.live_history = Some(Arc::from(history));
+		true
 	}
 
 	/// Resolves `history://` to a roster index and `history://<id>` to immutable
@@ -418,36 +539,56 @@ impl AgentRegistry {
 		if id.is_empty() {
 			return Ok(self.history_index().into_bytes());
 		}
-		let (record, _) = self
-			.record(id)
-			.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(id)))?;
-		let path = record
-			.transcript
-			.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(id)))?;
+		let (live_history, path) = {
+			let records = self.inner.records.lock();
+			let (_, entry) = find_record(&records, id)
+				.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(id)))?;
+			(entry.live_history.clone(), entry.record.transcript.clone())
+		};
+		if let Some(history) = live_history {
+			return Ok(history.to_vec());
+		}
+		let path = path.ok_or_else(|| RegistryError::ResourceNotFound(Str::new(id)))?;
 		Ok(fs::read(path)?)
 	}
 
 	/// Renders the live/parked/disk transcript index used by `history://`.
 	#[must_use]
 	pub fn history_index(&self) -> String {
-		let mut output =
-			String::from("| id | name | kind | status | parent | model | last active |\n");
-		output.push_str("|---|---|---|---|---|---|---:|\n");
+		let mut output = String::from(
+			"| id | name | kind | status | parent/depth | definition | model → serving | task | last \
+			 active |\n",
+		);
+		output.push_str("|---|---|---|---|---|---|---|---|---:|\n");
 		let now = now_ms();
 		for record in self.roster(false) {
 			let age = now.saturating_sub(record.last_activity_ms) / 1_000;
 			output.push_str(&format!(
-				"| {} | {} | {} | {} | {} | {} | {}s |\n",
+				"| {} | {} | {} | {} | {}/{} | {} | {} → {} | {} | {}s |\n",
 				record.id,
 				record.name,
 				record.kind,
 				record.status,
 				record.parent.as_deref().unwrap_or("-"),
+				record.depth,
+				record.definition.as_deref().unwrap_or("-"),
 				record.model.as_deref().unwrap_or("-"),
+				record.serving_model.as_deref().unwrap_or("-"),
+				record.task.as_deref().unwrap_or("-"),
 				age,
 			));
 		}
 		output
+	}
+
+	fn record_discovery_diagnostic(&self, path: PathBuf, kind: DiscoveryDiagnosticKind) {
+		let mut diagnostics = self.inner.diagnostics.lock();
+		if diagnostics.len() == DISCOVERY_DIAGNOSTIC_CAPACITY {
+			diagnostics.pop_front();
+		}
+		diagnostics.push_back(DiscoveryDiagnostic { path, kind });
+		drop(diagnostics);
+		self.bump_generation();
 	}
 
 	fn revision(&self, id: &str) -> Option<u64> {
@@ -493,30 +634,56 @@ impl AgentRegistry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerMessage {
 	/// Stable message identity.
-	pub id:         Str,
+	pub id:            Str,
 	/// Stable sender agent identity.
-	pub from:       Str,
+	pub from:          Str,
 	/// Address supplied by the sender.
-	pub to:         Str,
+	pub to:            Str,
 	/// Plain-prose coordination text.
-	pub text:       Str,
+	pub text:          Str,
 	/// Delivery boundary.
-	pub mode:       DeliveryMode,
+	pub mode:          DeliveryMode,
 	/// Optional prior message being answered.
-	pub reply_to:   Option<Str>,
+	pub reply_to:      Option<Str>,
 	/// Sender wall-clock timestamp.
-	pub sent_ms:    u64,
+	pub sent_ms:       u64,
 	/// Sender session identity.
-	pub session_id: Str,
+	pub session_id:    Str,
+	/// Whether the sender is synchronously awaiting a reply.
+	pub expects_reply: bool,
+}
+
+/// One message leg's stable delivery state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryReceipt {
+	/// Resolved recipient identity or unresolved requested address.
+	pub to:          Str,
+	/// How the message reached the recipient.
+	pub outcome:     Receipt,
+	/// Read-only journal pointer supplied when a known recipient cannot run.
+	pub history_uri: Option<Str>,
+}
+
+/// Routed event published once for a non-deduplicated delivery leg.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutedEvent {
+	/// Message with its stable id and exact visible body.
+	pub message:       PeerMessage,
+	/// Result for the resolved delivery leg.
+	pub delivery:      DeliveryReceipt,
+	/// Whether the main UI should show this body as a display-only observation.
+	pub relay_to_main: bool,
 }
 
 /// A message accepted by a cold-revival owner.
 #[derive(Clone, Debug)]
 pub struct RevivalRequest {
 	/// Parked recipient identity.
-	pub recipient: Str,
+	pub recipient:         Str,
+	/// Registry revision that selected this parked generation.
+	pub registry_revision: u64,
 	/// First message to inject after reconstruction.
-	pub message:   PeerMessage,
+	pub message:           PeerMessage,
 }
 
 /// Broker routing failure independent of per-recipient receipts.
@@ -527,16 +694,26 @@ pub enum BrokerError {
 	EmptyAddress,
 }
 
+struct WaitFilter {
+	generation: u64,
+	sender:     Option<Str>,
+	reply_to:   Option<Str>,
+}
+
 struct InboxState {
-	queue:  Mutex<VecDeque<PeerMessage>>,
-	notify: tokio::sync::Notify,
+	queue:       Mutex<VecDeque<PeerMessage>>,
+	waiter:      Mutex<Option<WaitFilter>>,
+	next_waiter: AtomicU64,
+	notify:      tokio::sync::Notify,
 }
 
 impl InboxState {
 	fn new() -> Self {
 		Self {
-			queue:  Mutex::new(VecDeque::with_capacity(MAILBOX_CAPACITY)),
-			notify: Default::default(),
+			queue:       Mutex::new(VecDeque::with_capacity(MAILBOX_CAPACITY)),
+			waiter:      Mutex::new(None),
+			next_waiter: AtomicU64::new(1),
+			notify:      Default::default(),
 		}
 	}
 
@@ -548,6 +725,37 @@ impl InboxState {
 		queue.push_back(message);
 		drop(queue);
 		self.notify.notify_waiters();
+	}
+
+	fn register_waiter(
+		self: &Arc<Self>,
+		sender: Option<&str>,
+		reply_to: Option<&str>,
+	) -> WaitRegistration {
+		let generation = self.next_waiter.fetch_add(1, Ordering::Relaxed);
+		*self.waiter.lock() = Some(WaitFilter {
+			generation,
+			sender: sender.map(Str::new),
+			reply_to: reply_to.map(Str::new),
+		});
+		WaitRegistration { state: Arc::clone(self), generation }
+	}
+
+	fn deliver_waiter(&self, message: &PeerMessage) -> bool {
+		let matches = self.waiter.lock().as_ref().is_some_and(|waiter| {
+			waiter
+				.sender
+				.as_deref()
+				.is_none_or(|sender| sender.eq_ignore_ascii_case(message.from.as_str()))
+				&& waiter
+					.reply_to
+					.as_deref()
+					.is_none_or(|reply| message.reply_to.as_deref() == Some(reply))
+		});
+		if matches {
+			self.push(message.clone());
+		}
+		matches
 	}
 
 	fn matching(&self, sender: Option<&str>, reply_to: Option<&str>) -> Option<PeerMessage> {
@@ -569,18 +777,76 @@ impl InboxState {
 	}
 }
 
+struct WaitRegistration {
+	state:      Arc<InboxState>,
+	generation: u64,
+}
+
+impl Drop for WaitRegistration {
+	fn drop(&mut self) {
+		let mut waiter = self.state.waiter.lock();
+		if waiter
+			.as_ref()
+			.is_some_and(|waiter| waiter.generation == self.generation)
+		{
+			*waiter = None;
+		}
+	}
+}
+
 struct RegisteredNode {
-	name:    Str,
-	session: Str,
-	mailbox: Option<MailboxSender>,
-	inbox:   Arc<InboxState>,
-	revival: Option<flume::Sender<RevivalRequest>>,
-	idle:    bool,
+	name:            Str,
+	session:         Str,
+	mailbox:         Option<MailboxSender>,
+	inbox:           Arc<InboxState>,
+	revival:         Option<flume::Sender<RevivalRequest>>,
+	revival_pending: bool,
+	idle:            bool,
+}
+
+struct DeliveryCache {
+	entries: HashMap<(Str, Str), DeliveryReceipt>,
+	order:   VecDeque<(Str, Str)>,
+}
+
+impl DeliveryCache {
+	fn new() -> Self {
+		Self {
+			entries: HashMap::with_capacity(DELIVERY_DEDUP_CAPACITY),
+			order:   VecDeque::with_capacity(DELIVERY_DEDUP_CAPACITY),
+		}
+	}
+
+	fn get(&self, message: &str, recipient: &str) -> Option<DeliveryReceipt> {
+		self
+			.entries
+			.iter()
+			.find(|((cached_message, cached_recipient), _)| {
+				cached_message == message && cached_recipient.eq_ignore_ascii_case(recipient)
+			})
+			.map(|(_, delivery)| delivery.clone())
+	}
+
+	fn insert(&mut self, message: &str, delivery: DeliveryReceipt) {
+		let key = (Str::new(message), delivery.to.clone());
+		if self.entries.contains_key(&key) {
+			return;
+		}
+		if self.order.len() == DELIVERY_DEDUP_CAPACITY
+			&& let Some(expired) = self.order.pop_front()
+		{
+			self.entries.remove(&expired);
+		}
+		self.order.push_back(key.clone());
+		self.entries.insert(key, delivery);
+	}
 }
 
 struct BrokerInner {
 	project:    Str,
 	nodes:      Mutex<HashMap<Str, RegisteredNode>>,
+	deliveries: Mutex<DeliveryCache>,
+	events:     tokio::sync::broadcast::Sender<RoutedEvent>,
 	generation: tokio::sync::watch::Sender<u64>,
 	registry:   AgentRegistry,
 }
@@ -602,10 +868,13 @@ impl Broker {
 	#[must_use]
 	pub fn with_registry(project: Str, registry: AgentRegistry) -> Self {
 		let (generation, _) = tokio::sync::watch::channel(0_u64);
+		let (events, _) = tokio::sync::broadcast::channel(MAILBOX_CAPACITY);
 		Self {
 			inner: Arc::new(BrokerInner {
 				project,
 				nodes: Mutex::new(HashMap::new()),
+				deliveries: Mutex::new(DeliveryCache::new()),
+				events,
 				generation,
 				registry,
 			}),
@@ -616,6 +885,12 @@ impl Broker {
 	#[must_use]
 	pub fn registry(&self) -> &AgentRegistry {
 		&self.inner.registry
+	}
+
+	/// Subscribes to message-id-bearing delivery events.
+	#[must_use]
+	pub fn subscribe_routes(&self) -> tokio::sync::broadcast::Receiver<RoutedEvent> {
+		self.inner.events.subscribe()
 	}
 
 	/// Registers a messageable live node and returns its bounded inbox.
@@ -634,12 +909,13 @@ impl Broker {
 			.nodes
 			.lock()
 			.insert(node.id.clone(), RegisteredNode {
-				name:    node.name.clone(),
-				session: node.session.clone(),
-				mailbox: Some(mailbox),
-				inbox:   Arc::clone(&inbox),
-				revival: None,
-				idle:    true,
+				name:            node.name.clone(),
+				session:         node.session.clone(),
+				mailbox:         Some(mailbox),
+				inbox:           Arc::clone(&inbox),
+				revival:         None,
+				revival_pending: false,
+				idle:            true,
 			});
 		self.bump_generation();
 		Ok(BrokerInbox {
@@ -664,12 +940,13 @@ impl Broker {
 			.registry
 			.compare_and_register(record.clone(), expected)?;
 		self.inner.nodes.lock().insert(record.id, RegisteredNode {
-			name:    record.name,
-			session: record.session,
-			mailbox: None,
-			inbox:   Arc::new(InboxState::new()),
-			revival: Some(revival),
-			idle:    true,
+			name:            record.name,
+			session:         record.session,
+			mailbox:         None,
+			inbox:           Arc::new(InboxState::new()),
+			revival:         Some(revival),
+			revival_pending: false,
+			idle:            true,
 		});
 		self.bump_generation();
 		Ok(())
@@ -679,12 +956,18 @@ impl Broker {
 	pub fn attach_live(
 		&self,
 		id: &str,
+		expected_revision: u64,
 		mailbox: MailboxSender,
 	) -> Result<BrokerInbox, RegistryError> {
 		let mut nodes = self.inner.nodes.lock();
 		let (_, node) =
 			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
+		self
+			.inner
+			.registry
+			.set_status(id, Some(expected_revision), RegistryStatus::Idle)?;
 		node.mailbox = Some(mailbox);
+		node.revival_pending = false;
 		node.idle = true;
 		let state = Arc::clone(&node.inbox);
 		let owner = nodes
@@ -693,10 +976,6 @@ impl Broker {
 			.cloned()
 			.ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
 		drop(nodes);
-		self
-			.inner
-			.registry
-			.set_status(id, None, RegistryStatus::Idle)?;
 		self.bump_generation();
 		Ok(BrokerInbox {
 			owner,
@@ -723,17 +1002,18 @@ impl Broker {
 	}
 
 	/// Marks a live session parked and detaches its mailbox.
-	pub fn park(&self, id: &str) -> Result<(), RegistryError> {
+	pub fn park(&self, id: &str, expected_revision: u64) -> Result<(), RegistryError> {
 		let mut nodes = self.inner.nodes.lock();
 		let (_, node) =
 			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
-		node.mailbox = None;
-		node.idle = true;
-		drop(nodes);
 		self
 			.inner
 			.registry
-			.set_status(id, None, RegistryStatus::Parked)?;
+			.set_status(id, Some(expected_revision), RegistryStatus::Parked)?;
+		node.mailbox = None;
+		node.revival_pending = false;
+		node.idle = true;
+		drop(nodes);
 		self.bump_generation();
 		Ok(())
 	}
@@ -758,75 +1038,156 @@ impl Broker {
 	}
 
 	/// Routes one message to every address match without waiting for recipient
-	/// turns. Each match produces exactly one receipt.
-	pub fn send(&self, message: PeerMessage) -> Result<SmallVec<Receipt, 4>, BrokerError> {
+	/// turns. Each match publishes exactly one message-id-bearing event.
+	pub fn route(&self, message: PeerMessage) -> Result<SmallVec<DeliveryReceipt, 4>, BrokerError> {
 		if message.to.is_empty() {
 			return Err(BrokerError::EmptyAddress);
 		}
-		let mut receipts = SmallVec::new();
+		let mut deliveries = SmallVec::new();
 		let mut lifecycle = SmallVec::<(Str, RegistryStatus), 4>::new();
+		let mut events = SmallVec::<RoutedEvent, 4>::new();
 		let mut nodes = self.inner.nodes.lock();
+		let sender_is_main = self
+			.inner
+			.registry
+			.record(message.from.as_str())
+			.is_some_and(|(record, _)| record.kind == AgentKind::Main);
+		let broadcast_has_main = is_broadcast(message.to.as_str())
+			&& nodes.iter().any(|(id, node)| {
+				matches_address(&self.inner.project, &message.to, id, node)
+					&& self
+						.inner
+						.registry
+						.record(id)
+						.is_some_and(|(record, _)| record.kind == AgentKind::Main)
+			});
 		for (id, node) in nodes
 			.iter_mut()
 			.filter(|(id, node)| matches_address(&self.inner.project, &message.to, id, node))
 		{
-			if self
-				.inner
-				.registry
-				.record(id)
-				.is_some_and(|(record, _)| record.status == RegistryStatus::Aborted)
-			{
-				receipts.push(Receipt::Failed);
+			if let Some(cached) = self.inner.deliveries.lock().get(message.id.as_str(), id) {
+				deliveries.push(cached);
 				continue;
 			}
-			if let Some(mailbox) = node.mailbox.as_ref() {
+			let outcome = if node.inbox.deliver_waiter(&message) {
+				Receipt::Injected
+			} else if let Some(mailbox) = node.mailbox.as_ref() {
 				let interrupt = Interrupt {
 					class:  class(message.mode),
 					item:   peer_item(&message),
 					source: InterruptSource::Peer { from: message.from.clone() },
 				};
 				if mailbox.try_enqueue(interrupt).is_ok() {
-					node.inbox.push(message.clone());
-					receipts.push(if node.idle {
+					if node.idle {
 						Receipt::Woken
 					} else {
 						Receipt::Injected
-					});
-					lifecycle.push((
-						id.clone(),
-						if node.idle {
-							RegistryStatus::Idle
-						} else {
-							RegistryStatus::Running
-						},
-					));
-					continue;
+					}
+				} else {
+					node.mailbox = None;
+					node.inbox.push(message.clone());
+					Receipt::Failed
 				}
-				node.mailbox = None;
-			}
-			if node.revival.as_ref().is_some_and(|revival| {
-				revival
-					.try_send(RevivalRequest { recipient: id.clone(), message: message.clone() })
-					.is_ok()
+			} else if node.revival_pending {
+				node.inbox.push(message.clone());
+				Receipt::Revived
+			} else if node.revival.as_ref().is_some_and(|revival| {
+				self
+					.inner
+					.registry
+					.record(id)
+					.is_some_and(|(_, registry_revision)| {
+						revival
+							.try_send(RevivalRequest {
+								recipient: id.clone(),
+								registry_revision,
+								message: message.clone(),
+							})
+							.is_ok()
+					})
 			}) {
-				node.inbox.push(message.clone());
-				receipts.push(Receipt::Revived);
-				lifecycle.push((id.clone(), RegistryStatus::Running));
+				node.revival_pending = true;
+				Receipt::Revived
 			} else {
-				// A failed handoff remains available to inbox/wait, bounded by
-				// the same FIFO cap. It is never injected a second time.
 				node.inbox.push(message.clone());
-				receipts.push(Receipt::Failed);
+				Receipt::Failed
+			};
+			if outcome != Receipt::Failed && outcome != Receipt::Revived {
+				lifecycle.push((
+					id.clone(),
+					if outcome == Receipt::Woken || !node.idle {
+						RegistryStatus::Running
+					} else {
+						RegistryStatus::Idle
+					},
+				));
 			}
+			let history_uri = (outcome == Receipt::Failed)
+				.then(|| history_uri(&self.inner.registry, id))
+				.flatten();
+			let delivery = DeliveryReceipt { to: id.clone(), outcome, history_uri };
+			self
+				.inner
+				.deliveries
+				.lock()
+				.insert(message.id.as_str(), delivery.clone());
+			let recipient_is_main = self
+				.inner
+				.registry
+				.record(id)
+				.is_some_and(|(record, _)| record.kind == AgentKind::Main);
+			events.push(RoutedEvent {
+				message:       message.clone(),
+				delivery:      delivery.clone(),
+				relay_to_main: outcome != Receipt::Failed
+					&& !sender_is_main
+					&& !recipient_is_main
+					&& !broadcast_has_main,
+			});
+			deliveries.push(delivery);
 		}
 		drop(nodes);
 		for (id, status) in lifecycle {
 			let _ = self.inner.registry.set_status(id.as_str(), None, status);
 		}
-		if receipts.is_empty() {
-			receipts.push(Receipt::Failed);
+		if deliveries.is_empty() {
+			let history_uri = history_uri(&self.inner.registry, message.to.as_str());
+			let delivery =
+				DeliveryReceipt { to: message.to.clone(), outcome: Receipt::Failed, history_uri };
+			let cached = self
+				.inner
+				.deliveries
+				.lock()
+				.get(message.id.as_str(), delivery.to.as_str());
+			if let Some(cached) = cached {
+				deliveries.push(cached);
+			} else {
+				self
+					.inner
+					.deliveries
+					.lock()
+					.insert(message.id.as_str(), delivery.clone());
+				events.push(RoutedEvent {
+					message:       message.clone(),
+					delivery:      delivery.clone(),
+					relay_to_main: false,
+				});
+				deliveries.push(delivery);
+			}
 		}
-		Ok(receipts)
+		for event in events {
+			let _ = self.inner.events.send(event);
+		}
+		Ok(deliveries)
+	}
+
+	/// Routes a message and returns its compact outcome vocabulary.
+	pub fn send(&self, message: PeerMessage) -> Result<SmallVec<Receipt, 4>, BrokerError> {
+		Ok(self
+			.route(message)?
+			.into_iter()
+			.map(|delivery| delivery.outcome)
+			.collect())
 	}
 
 	/// Drains or peeks at one agent's bounded FIFO inbox.
@@ -909,6 +1270,10 @@ impl BrokerInbox {
 		reply_to: Option<&str>,
 		timeout: Option<Duration>,
 	) -> Result<Option<PeerMessage>, WaitError> {
+		if let Some(message) = self.state.matching(sender, reply_to) {
+			return Ok(Some(message));
+		}
+		let _registration = self.state.register_waiter(sender, reply_to);
 		let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
 		loop {
 			let notified = self.state.notify.notified();
@@ -968,9 +1333,10 @@ fn find_record<'a>(
 	records: &'a HashMap<Str, RegistryEntry>,
 	id: &str,
 ) -> Option<(&'a Str, &'a RegistryEntry)> {
-	records
-		.iter()
-		.find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(id))
+	records.iter().find(|(candidate, entry)| {
+		candidate.as_str().eq_ignore_ascii_case(id)
+			|| entry.record.name.as_str().eq_ignore_ascii_case(id)
+	})
 }
 
 fn find_node<'a>(
@@ -991,6 +1357,10 @@ fn find_node_mut<'a>(
 		.find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(id))
 }
 
+fn is_broadcast(address: &str) -> bool {
+	address == "all" || address == "project:all" || address.starts_with("session:")
+}
+
 fn matches_address(project: &str, address: &str, id: &str, node: &RegisteredNode) -> bool {
 	address.eq_ignore_ascii_case(id)
 		|| address.eq_ignore_ascii_case(node.name.as_str())
@@ -1004,20 +1374,16 @@ fn matches_address(project: &str, address: &str, id: &str, node: &RegisteredNode
 fn peer_is_live(broker: &BrokerInner, owner: &str, sender: Option<&str>) -> bool {
 	let nodes = broker.nodes.lock();
 	match sender {
-		Some(sender) => find_node(&nodes, sender).is_some_and(|(id, _)| {
-			broker
-				.registry
-				.record(id)
-				.is_some_and(|(record, _)| record.status != RegistryStatus::Aborted)
-		}),
-		None => nodes.iter().any(|(id, _)| {
-			id.as_str() != owner
-				&& broker
-					.registry
-					.record(id)
-					.is_some_and(|(record, _)| record.status != RegistryStatus::Aborted)
-		}),
+		Some(sender) => find_node(&nodes, sender).is_some(),
+		None => nodes.keys().any(|id| id.as_str() != owner),
 	}
+}
+
+fn history_uri(registry: &AgentRegistry, id: &str) -> Option<Str> {
+	registry
+		.record(id)
+		.filter(|(record, _)| record.transcript.is_some())
+		.map(|(record, _)| omp_core::sf!("history://{}", record.id))
 }
 
 const fn class(mode: DeliveryMode) -> InterruptClass {
@@ -1067,46 +1433,300 @@ fn sanitize_activity(activity: &str) -> Str {
 	Str::new(sanitized.trim())
 }
 
-fn tombstone_path(transcript: &Path) -> PathBuf {
-	let mut value = transcript.as_os_str().to_os_string();
-	value.push(".tombstone");
-	PathBuf::from(value)
+enum ColdScan {
+	Record(AgentRecord),
+	Skipped(DiscoveryDiagnosticKind),
 }
 
-fn cold_record(path: &Path) -> Result<Option<AgentRecord>, RegistryError> {
+fn cold_record(path: &Path) -> Result<ColdScan, RegistryError> {
+	use omp_storage::transcript::{Kind, Msg, Patch, UserBlock};
+
 	let file = fs::File::open(path)?;
-	let mut lines = std::io::BufReader::new(file).lines();
-	let Some(header) = lines.next().transpose()? else {
-		return Ok(None);
-	};
-	let Ok(header) = omp_storage::transcript::read_header(header.as_bytes()) else {
-		return Ok(None);
-	};
-	// A header without at least one durable event is not a resumable agent.
-	if lines.next().transpose()?.is_none() {
-		return Ok(None);
+	let mut reader =
+		std::io::BufReader::new(file).take(u64::try_from(PREFIX_MAX_BYTES).unwrap_or(u64::MAX));
+	let mut line = String::new();
+	if reader.read_line(&mut line)? == 0 {
+		return Ok(ColdScan::Skipped(DiscoveryDiagnosticKind::Incomplete));
 	}
+	let Ok(header) = omp_storage::transcript::read_header(line.as_bytes()) else {
+		return Ok(ColdScan::Skipped(if reader.limit() == 0 {
+			DiscoveryDiagnosticKind::Incomplete
+		} else {
+			DiscoveryDiagnosticKind::Corrupt
+		}));
+	};
+
+	let mut definition = None;
+	let mut parent = None;
+	let mut depth = 1;
+	let mut model = None;
+	let mut serving_model = None;
+	let mut task = None;
+	let mut history = AgentHistory::default();
+	let mut last_activity_ms = header.created;
+	let mut saw_revival = false;
+
+	for _ in 0..PREFIX_MAX_LINES {
+		line.clear();
+		if reader.read_line(&mut line)? == 0 {
+			break;
+		}
+		let Ok(event) = omp_storage::transcript::read_line(line.as_bytes()) else {
+			return Ok(ColdScan::Skipped(if reader.limit() == 0 {
+				DiscoveryDiagnosticKind::Incomplete
+			} else {
+				DiscoveryDiagnosticKind::Corrupt
+			}));
+		};
+		last_activity_ms = last_activity_ms.max(event.ts);
+		match event.kind {
+			Kind::Init { agent, revival: Some(revival), .. } => {
+				saw_revival = true;
+				parent = agent;
+				depth = revival.depth;
+				definition = Some(revival.definition);
+				model = Some(revival.model_role);
+				serving_model = revival.serving_model.as_ref().map(model_label);
+			},
+			Kind::Msg(Msg::User { content, synthetic: false, .. }) if task.is_none() => {
+				task = content.into_iter().find_map(|block| match block {
+					UserBlock::Text { text } if !text.trim().is_empty() => {
+						Some(normalize_task_summary(text.as_str()))
+					},
+					UserBlock::Text { .. } | UserBlock::Image { .. } => None,
+				});
+			},
+			Kind::Item(record) if task.is_none() => {
+				task = task_summary_from_item(&record.item);
+			},
+			Kind::TurnInput(input) if task.is_none() => {
+				task = task_summary_from_item(&input.item);
+			},
+			Kind::Msg(Msg::Assistant { model: served, usage, timing, .. }) => {
+				history.requests = history.requests.saturating_add(1);
+				history.input_tokens = history
+					.input_tokens
+					.saturating_add(usage.input)
+					.saturating_add(usage.cache_read);
+				history.output_tokens = history.output_tokens.saturating_add(usage.output);
+				history.duration_ms = history.duration_ms.saturating_add(timing.duration_ms);
+				serving_model = Some(model_label(&served));
+			},
+			Kind::Infer { model: Patch::Set(change), .. } => {
+				model = Some(model_label(&change.model));
+			},
+			Kind::ChildLifecycle(lifecycle) if lifecycle.child_id == header.id.0 => {
+				if let Some(kind) = lifecycle
+					.terminal_status
+					.as_deref()
+					.and_then(|status| status.parse().ok())
+				{
+					history.terminal = Some(crate::SubagentTerminalStatus {
+						kind,
+						summary: lifecycle.terminal_status.unwrap_or_default(),
+						disposition: crate::SubagentDisposition::default(),
+					});
+				}
+			},
+			Kind::EntryUndecodable(_) => {
+				return Ok(ColdScan::Skipped(DiscoveryDiagnosticKind::Corrupt));
+			},
+			_ => {},
+		}
+	}
+	if !saw_revival {
+		return Ok(ColdScan::Skipped(DiscoveryDiagnosticKind::Incomplete));
+	}
+
 	let id = header.id.0.clone();
 	let name = path
 		.file_stem()
 		.and_then(std::ffi::OsStr::to_str)
 		.map_or_else(|| id.clone(), Str::new);
-	Ok(Some(AgentRecord {
+	Ok(ColdScan::Record(AgentRecord {
 		id,
 		name,
 		kind: AgentKind::Subagent,
-		parent: None,
+		parent,
 		session: header.id.0,
-		depth: 1,
+		depth,
 		status: RegistryStatus::Parked,
 		activity: Default::default(),
-		last_activity_ms: header.created,
+		last_activity_ms,
 		transcript: Some(path.to_path_buf()),
-		definition: None,
-		model: None,
-		task: None,
-		history: AgentHistory::default(),
+		definition,
+		model,
+		serving_model,
+		task,
+		history,
 	}))
+}
+
+fn task_summary_from_item(item: &Item) -> Option<Str> {
+	let item::Kind::Message(message) = item.kind.as_ref()? else {
+		return None;
+	};
+	if message.role != Role::User as i32 {
+		return None;
+	}
+	message
+		.parts
+		.iter()
+		.find_map(|part| match part.kind.as_ref()? {
+			part::Kind::Text(text) if !text.trim().is_empty() => Some(normalize_task_summary(text)),
+			_ => None,
+		})
+}
+
+fn model_label(model: &omp_storage::transcript::ModelRef) -> Str {
+	omp_core::sf!("{}/{}", model.provider.0, model.model.0)
+}
+
+fn normalize_task_summary(task: &str) -> Str {
+	let mut summary = String::with_capacity(task.len().min(TASK_SUMMARY_MAX_CHARS));
+	for character in task.chars().take(TASK_SUMMARY_MAX_CHARS) {
+		if character == '\n' || character == '\r' || character.is_control() {
+			if !summary.ends_with(' ') {
+				summary.push(' ');
+			}
+		} else {
+			summary.push(character);
+		}
+	}
+	Str::new(summary.trim())
+}
+
+fn bounded_json_query(bytes: &[u8], query: &str) -> Result<Vec<u8>, RegistryError> {
+	use hifijson::token::Lex as _;
+	use jaq_core::{
+		Ctx, RcIter,
+		compile::Compiler,
+		load::{Arena, File, Loader},
+	};
+	use jaq_json::Val;
+
+	if bytes.len() > QUERY_MAX_BYTES
+		|| query.chars().count() > QUERY_MAX_CHARS
+		|| !query_is_safe(query)
+	{
+		return Err(RegistryError::QueryLimit);
+	}
+	serde_json::from_slice::<serde_json::Value>(bytes).map_err(RegistryError::InvalidJson)?;
+	let arena = Arena::default();
+	let loader = Loader::new(jaq_std::defs().chain(jaq_json::defs()));
+	let modules = loader
+		.load(&arena, File { path: (), code: query })
+		.map_err(|_| RegistryError::InvalidQuery)?;
+	let filter = Compiler::default()
+		.with_funs(jaq_std::funs().chain(jaq_json::funs()))
+		.compile(modules)
+		.map_err(|_| RegistryError::InvalidQuery)?;
+
+	let mut lexer = hifijson::SliceLexer::new(bytes);
+	let token = lexer
+		.ws_token()
+		.expect("serde-validated JSON has one token");
+	let input = Val::parse(token, &mut lexer).map_err(|_| RegistryError::QueryLimit)?;
+	let empty = Box::new(core::iter::empty()) as Box<dyn Iterator<Item = Result<Val, String>>>;
+	let inputs = RcIter::new(empty);
+	let ctx = Ctx::new(Vec::new(), &inputs);
+	let started = Instant::now();
+	let mut values = filter.run((ctx, input));
+	let first = values
+		.next()
+		.ok_or(RegistryError::QueryEmpty)?
+		.map_err(|_| RegistryError::InvalidQuery)?;
+	if started.elapsed() > QUERY_MAX_DURATION {
+		return Err(RegistryError::QueryLimit);
+	}
+	if values.next().is_some() {
+		return Err(RegistryError::QueryMultiple);
+	}
+	let output = first.to_string().into_bytes();
+	if output.len() > QUERY_MAX_BYTES || started.elapsed() > QUERY_MAX_DURATION {
+		return Err(RegistryError::QueryLimit);
+	}
+	let value =
+		serde_json::from_slice::<serde_json::Value>(&output).map_err(RegistryError::InvalidJson)?;
+	if json_depth(&value, 0) > QUERY_MAX_DEPTH {
+		return Err(RegistryError::QueryLimit);
+	}
+	Ok(output)
+}
+
+fn query_is_safe(query: &str) -> bool {
+	const DENIED: &[&str] = &[
+		"debug",
+		"env",
+		"foreach",
+		"gsub",
+		"halt",
+		"halt_error",
+		"input",
+		"inputs",
+		"match",
+		"range",
+		"recurse",
+		"reduce",
+		"repeat",
+		"scan",
+		"stderr",
+		"sub",
+		"test",
+		"until",
+		"while",
+	];
+	let mut quoted = false;
+	let mut escaped = false;
+	let mut field = false;
+	let mut previous = None;
+	let mut token = String::new();
+	for character in query.chars().chain(core::iter::once(' ')) {
+		if quoted {
+			if escaped {
+				escaped = false;
+			} else if character == '\\' {
+				escaped = true;
+			} else if character == '"' {
+				quoted = false;
+			}
+			continue;
+		}
+		if character == '"' {
+			quoted = true;
+			token.clear();
+		} else if character.is_ascii_alphanumeric() || character == '_' {
+			if token.is_empty() {
+				field = previous == Some('.');
+			}
+			token.push(character);
+		} else {
+			if !field && DENIED.contains(&token.as_str()) {
+				return false;
+			}
+			token.clear();
+			if !character.is_whitespace() {
+				previous = Some(character);
+			}
+		}
+	}
+	!quoted
+}
+
+fn json_depth(value: &serde_json::Value, depth: usize) -> usize {
+	match value {
+		serde_json::Value::Array(values) => values
+			.iter()
+			.map(|value| json_depth(value, depth.saturating_add(1)))
+			.max()
+			.unwrap_or(depth),
+		serde_json::Value::Object(values) => values
+			.values()
+			.map(|value| json_depth(value, depth.saturating_add(1)))
+			.max()
+			.unwrap_or(depth),
+		_ => depth,
+	}
 }
 
 fn valid_artifact_component(value: &str) -> bool {
@@ -1138,19 +1758,20 @@ mod tests {
 
 	fn message(from: &str, to: &str, index: usize) -> PeerMessage {
 		PeerMessage {
-			id:         sf!("message-{index}"),
-			from:       from.into(),
-			to:         to.into(),
-			text:       sf!("body-{index}"),
-			mode:       DeliveryMode::Aside,
-			reply_to:   None,
-			sent_ms:    now_ms(),
-			session_id: "session".into(),
+			id:            sf!("message-{index}"),
+			from:          from.into(),
+			to:            to.into(),
+			text:          sf!("body-{index}"),
+			mode:          DeliveryMode::Aside,
+			reply_to:      None,
+			sent_ms:       now_ms(),
+			session_id:    "session".into(),
+			expects_reply: false,
 		}
 	}
 
 	#[test]
-	fn registry_cas_ttl_and_tombstones_are_monotonic() {
+	fn registry_cas_ttl_and_parking_preserve_identity() {
 		let registry = AgentRegistry::new();
 		let tree = AgentTree::standard(2);
 		let node = node(&tree, "worker", "Worker");
@@ -1163,12 +1784,18 @@ mod tests {
 		));
 		let parked = registry.park_expired(now_ms() + 10_000, Duration::from_secs(1));
 		assert_eq!(parked.len(), 1);
-		assert_eq!(parked[0].status, RegistryStatus::Parked);
-		registry.abort("worker").expect("abort");
-		assert!(matches!(
-			registry.register_node(&node, RegistryStatus::Idle, None),
-			Err(RegistryError::Tombstoned(_))
-		));
+		assert_eq!(parked[0].record.status, RegistryStatus::Parked);
+		registry
+			.register_node(&node, RegistryStatus::Idle, None)
+			.expect("revive parked identity");
+		assert_eq!(
+			registry
+				.record("Worker")
+				.expect("alias remains reserved")
+				.0
+				.id,
+			node.id
+		);
 	}
 
 	#[test]
@@ -1221,7 +1848,7 @@ mod tests {
 			.expect("message");
 		assert_eq!(matched.id.as_str(), "message-1");
 		assert_eq!(inbox.inbox(true)[0].id.as_str(), "message-0");
-		registry.abort("peer").expect("abort");
+		broker.unregister("peer");
 		assert_eq!(
 			inbox
 				.wait_for_timeout(Some("peer"), None, Some(Duration::from_secs(1)))

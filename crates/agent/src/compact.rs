@@ -23,6 +23,10 @@ use crate::{
 /// The band is agent-owned: extensions observe the triggering usage, never the
 /// suppression state, so they cannot create a compact-on-every-turn loop.
 pub const COMPACTION_RECOVERY_BAND: f64 = 0.8;
+/// Prompt-cache suffix retained verbatim during lossless pruning.
+pub const PROMPT_CACHE_WARM_SUFFIX_TOKENS: u64 = 8_192;
+/// Idle duration after which lossless pruning is reconsidered.
+pub const IDLE_PRUNE_AFTER: std::time::Duration = std::time::Duration::from_secs(90 * 60);
 
 /// Context rescue rungs available to the ordered ladder.
 ///
@@ -54,6 +58,8 @@ pub enum CompactionTier {
 	Elide,
 	/// Produce an immediate portable summary from a local snapshot.
 	Local,
+	/// Render discarded history into bounded bitmap frames.
+	Snapcompact,
 	/// Request provider-native context management with replay checkpointing.
 	Remote,
 	/// Generate a handoff summary and continue from it in the same session.
@@ -62,8 +68,15 @@ pub enum CompactionTier {
 
 impl CompactionTier {
 	/// The implemented rescue ladder in execution order.
-	pub const ALL: [Self; 6] =
-		[Self::Prune, Self::DropMedia, Self::Elide, Self::Local, Self::Remote, Self::Handoff];
+	pub const ALL: [Self; 7] = [
+		Self::Prune,
+		Self::DropMedia,
+		Self::Elide,
+		Self::Snapcompact,
+		Self::Local,
+		Self::Remote,
+		Self::Handoff,
+	];
 
 	/// Returns whether this rung preserves all non-targeted projection items.
 	#[must_use]
@@ -79,6 +92,7 @@ impl CompactionTier {
 			Self::DropMedia => "drop_media",
 			Self::Elide => "elide",
 			Self::Local => "local",
+			Self::Snapcompact => "snapcompact",
 			Self::Remote => "remote",
 			Self::Handoff => "handoff",
 		}
@@ -107,7 +121,7 @@ pub fn speculation_lead_tokens(threshold_tokens: u64) -> u64 {
 /// order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompactionMethodOrder {
-	tiers: SmallVec<CompactionTier, 6>,
+	tiers: SmallVec<CompactionTier, 7>,
 }
 
 impl Default for CompactionMethodOrder {
@@ -156,7 +170,7 @@ impl CompactionMethodOrder {
 		for &tier in &self.tiers {
 			match tier {
 				CompactionTier::Prune | CompactionTier::DropMedia | CompactionTier::Elide => {},
-				CompactionTier::Local => return None,
+				CompactionTier::Local | CompactionTier::Snapcompact => return None,
 				CompactionTier::Remote | CompactionTier::Handoff => return Some(tier),
 			}
 		}
@@ -466,8 +480,233 @@ impl CompactionCoordinator {
 	}
 }
 
-/// Reserved textual name for the out-of-scope snapcompact tier.
-pub const SNAPCOMPACT_RESERVED_TIER: &str = "SNAPCOMPACT";
+/// One-off method selected by `/compact`.
+#[derive(
+	Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum ManualCompactionMode {
+	/// Summarize locally with the active model.
+	Soft,
+	/// Try provider-native compaction, then a local summary.
+	Remote,
+	/// Archive history into local bitmap frames.
+	Snapcompact,
+}
+
+/// Parsed one-off compaction request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ManualCompactionRequest {
+	/// Optional one-off mode; absent means configured preference order.
+	pub mode:  Option<ManualCompactionMode>,
+	/// Optional user focus text for summary-producing modes.
+	pub focus: Option<Str>,
+}
+
+/// Invalid `/compact` arguments.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ManualCompactionError {
+	/// Bitmap compaction has no summarizer and cannot consume focus text.
+	#[error(
+		"/compact snapcompact does not take focus instructions (it archives history without an LLM \
+		 summary)"
+	)]
+	SnapcompactFocus,
+}
+
+impl ManualCompactionRequest {
+	/// Parses the text following `/compact`, preserving legacy bare-focus input.
+	pub fn parse(arguments: &str) -> Result<Self, ManualCompactionError> {
+		let trimmed = arguments.trim();
+		if trimmed.is_empty() {
+			return Ok(Self::default());
+		}
+		let split = trimmed.find(char::is_whitespace);
+		let (first, tail) =
+			split.map_or((trimmed, ""), |index| (&trimmed[..index], trimmed[index..].trim()));
+		let mode = first.parse::<ManualCompactionMode>().ok();
+		if mode == Some(ManualCompactionMode::Snapcompact) && !tail.is_empty() {
+			return Err(ManualCompactionError::SnapcompactFocus);
+		}
+		if mode.is_some() {
+			return Ok(Self { mode, focus: (!tail.is_empty()).then(|| Str::from(tail)) });
+		}
+		Ok(Self { mode: None, focus: Some(Str::from(trimmed)) })
+	}
+
+	/// Resolves the one-off method order without mutating durable settings.
+	#[must_use]
+	pub fn method_order(&self, configured: &CompactionMethodOrder) -> CompactionMethodOrder {
+		match self.mode {
+			None => configured.clone(),
+			Some(ManualCompactionMode::Soft) => {
+				CompactionMethodOrder::resolve(&[CompactionTier::Local])
+			},
+			Some(ManualCompactionMode::Remote) => {
+				CompactionMethodOrder::resolve(&[CompactionTier::Remote, CompactionTier::Local])
+			},
+			Some(ManualCompactionMode::Snapcompact) => {
+				CompactionMethodOrder::resolve(&[CompactionTier::Snapcompact])
+			},
+		}
+	}
+}
+
+/// Prepared bitmap compaction detached from mutable journal state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapcompactPreparation {
+	/// Normalized oldest-to-newest history selected for imaging.
+	pub text:            Str,
+	/// Active-tokenizer measurement for `text`.
+	pub source_tokens:   u64,
+	/// Provider id used for image-count policy.
+	pub provider:        Option<Str>,
+	/// Wire API used for image billing.
+	pub api:             Option<Str>,
+	/// Reader model used for geometry selection.
+	pub model_id:        Option<Str>,
+	/// Images already occupying the rebuilt request.
+	pub existing_images: usize,
+	/// First durable event retained verbatim after the archive.
+	pub first_kept:      u64,
+	/// Complete live context usage before imaging.
+	pub tokens_before:   u64,
+}
+
+/// Completed bitmap archive ready for blob persistence and one journal commit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapcompactOutcome {
+	/// Rendered frames and measured savings.
+	pub archive: omp_snapcompact::archive::Archive,
+	/// Textual journal boundary committed with the frame blob references.
+	pub compact: Compact,
+}
+
+/// Runs the pure renderer against an immutable compaction preparation.
+///
+/// PNG frames remain byte values in this result; the journal owner must spill
+/// each through its `BlobStore` before committing `compact`, preventing base64
+/// request payloads from becoming transcript truth.
+pub fn execute_snapcompact(
+	preparation: &SnapcompactPreparation,
+) -> Result<SnapcompactOutcome, omp_snapcompact::archive::ArchiveError> {
+	let archive = omp_snapcompact::archive::render_archive(
+		preparation.text.as_str(),
+		preparation.source_tokens,
+		omp_snapcompact::archive::ShapeTarget {
+			api:      preparation.api.as_deref(),
+			model_id: preparation.model_id.as_deref(),
+		},
+		preparation.provider.as_deref(),
+		preparation.existing_images,
+	)?;
+	let frame_count = archive.frames.len();
+	let tokens_after = archive.savings.image_tokens.saturating_add(
+		preparation
+			.tokens_before
+			.saturating_sub(preparation.source_tokens),
+	);
+	Ok(SnapcompactOutcome {
+		archive,
+		compact: Compact {
+			summary:       sf!(
+				"Earlier conversation archived in {frame_count} Snapcompact frame{}.",
+				if frame_count == 1 { "" } else { "s" }
+			),
+			short:         Some(sf!(
+				"{frame_count} bitmap frame{}",
+				if frame_count == 1 { "" } else { "s" }
+			)),
+			first_kept:    preparation.first_kept,
+			tokens_before: preparation.tokens_before,
+			tokens_after:  Some(tokens_after),
+			method:        Some(sf!("snapcompact")),
+			warning:       None,
+			superseded:    Vec::new(),
+			snapcompact:   None,
+		},
+	})
+}
+
+/// Observable result of one committed manual compaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualCompactionOutcome {
+	/// Method that produced the durable boundary.
+	pub method:        ManualCompactionMode,
+	/// Physical compact event index.
+	pub event:         u64,
+	/// Context token estimate before compaction.
+	pub tokens_before: u64,
+	/// Context token estimate after compaction.
+	pub tokens_after:  u64,
+	/// Number of durable Snapcompact PNG frames.
+	pub frame_count:   usize,
+}
+
+/// Work selected when a manual request takes ownership of the coordinator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualCompactionDecision {
+	/// Ordered methods for this invocation.
+	pub order:      CompactionMethodOrder,
+	/// User summary focus, if present.
+	pub focus:      Option<Str>,
+	/// Detached speculation run that must be aborted before execution.
+	pub cancel_run: Option<u64>,
+}
+
+impl CompactionCoordinator {
+	/// Starts one manual run through the same cancellation and ordering
+	/// authority as automatic, mid-turn, idle, and speculative compaction.
+	pub fn begin_manual(
+		&mut self,
+		request: ManualCompactionRequest,
+		configured: &CompactionMethodOrder,
+	) -> ManualCompactionDecision {
+		ManualCompactionDecision {
+			order:      request.method_order(configured),
+			focus:      request.focus,
+			cancel_run: self.cancel_speculation(),
+		}
+	}
+}
+
+/// Classifies coordinator maintenance boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactionBoundary {
+	/// A completed turn crossed the configured threshold.
+	Automatic,
+	/// A streaming turn needs room before it can continue.
+	MidTurn,
+	/// The session became idle at the supplied instant.
+	Idle {
+		/// Time elapsed since the last activity.
+		elapsed: std::time::Duration,
+	},
+}
+
+/// Returns the ladder reason when a boundary should run maintenance.
+///
+/// Idle maintenance is deliberately lossless and begins only after ninety
+/// minutes. Threshold and mid-turn boundaries retain their distinct durable
+/// reasons while sharing the coordinator.
+#[must_use]
+pub fn boundary_reason(
+	boundary: CompactionBoundary,
+	usage: ContextUsage,
+) -> Option<CompactionReason> {
+	match boundary {
+		CompactionBoundary::Automatic => usage
+			.over_threshold()
+			.then_some(CompactionReason::Threshold),
+		CompactionBoundary::MidTurn => Some(CompactionReason::MidTurn),
+		CompactionBoundary::Idle { elapsed } => {
+			(elapsed >= IDLE_PRUNE_AFTER).then_some(CompactionReason::Idle)
+		},
+	}
+}
+
+/// Stable textual name for the bitmap archive tier.
+pub const SNAPCOMPACT_TIER: &str = "SNAPCOMPACT";
 
 /// The current context budget used to decide whether compaction is necessary.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -646,19 +885,72 @@ pub struct LosslessPlan {
 	pub prune:      Vec<u64>,
 	/// Historical events whose blob-backed parts are eligible for `DROP_MEDIA`.
 	pub drop_media: Vec<u64>,
+	/// Exact receipt for the selected lossless amendments.
+	pub receipt:    LosslessReceipt,
+}
+
+/// Exact accounting for one lossless pruning plan.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LosslessReceipt {
+	/// Provider tokens removed by useless or superseded results.
+	pub pruned_tokens:       u64,
+	/// Exact serialized bytes removed by useless or superseded results.
+	pub pruned_bytes:        u64,
+	/// Provider tokens retained in the protected prompt-cache suffix.
+	pub warm_suffix_tokens:  u64,
+	/// First event protected by the warm suffix, if any.
+	pub warm_suffix_event:   Option<u64>,
+	/// Number of blob-backed media parts selected for removal.
+	pub dropped_media_parts: u64,
 }
 
 /// Plans lossless `PRUNE` and `DROP_MEDIA` work without mutating the
 /// projection.
 #[must_use]
 pub fn plan_lossless(items: &[ProjectionItem]) -> LosslessPlan {
+	plan_lossless_with_warm_suffix(items, PROMPT_CACHE_WARM_SUFFIX_TOKENS)
+}
+
+/// Plans lossless work while protecting the newest tokenizer-measured suffix.
+///
+/// Items are ordered oldest to newest. The complete item that crosses
+/// `warm_suffix_tokens` is retained, so the protected suffix never undershoots
+/// the configured prompt-cache budget.
+#[must_use]
+pub fn plan_lossless_with_warm_suffix(
+	items: &[ProjectionItem],
+	warm_suffix_tokens: u64,
+) -> LosslessPlan {
+	let mut protected_start = items.len();
+	let mut protected_tokens = 0_u64;
+	for (index, item) in items.iter().enumerate().rev() {
+		if protected_tokens >= warm_suffix_tokens {
+			break;
+		}
+		protected_start = index;
+		protected_tokens = protected_tokens.saturating_add(item.usage.provider_tokens);
+	}
 	let mut plan = LosslessPlan::default();
-	for item in items {
+	plan.receipt.warm_suffix_tokens = protected_tokens;
+	plan.receipt.warm_suffix_event = items.get(protected_start).map(|item| item.event);
+	for item in &items[..protected_start] {
 		if item.useless || item.superseded {
 			plan.prune.push(item.event);
+			plan.receipt.pruned_tokens = plan
+				.receipt
+				.pruned_tokens
+				.saturating_add(item.usage.provider_tokens);
+			plan.receipt.pruned_bytes = plan
+				.receipt
+				.pruned_bytes
+				.saturating_add(item.usage.byte_len);
 		}
 		if item.media_parts != 0 {
 			plan.drop_media.push(item.event);
+			plan.receipt.dropped_media_parts = plan
+				.receipt
+				.dropped_media_parts
+				.saturating_add(u64::from(item.media_parts));
 		}
 	}
 	plan
@@ -866,6 +1158,7 @@ impl DomainReturn for Option<CompactionVerdict> {
 					method: None,
 					warning,
 					superseded: Vec::new(),
+					snapcompact: None,
 				},
 				details,
 				preserve,
@@ -1140,6 +1433,7 @@ mod tests {
 				method:        None,
 				warning:       None,
 				superseded:    Vec::new(),
+				snapcompact:   None,
 			},
 		}
 	}
@@ -1410,6 +1704,7 @@ mod tests {
 					method: None,
 					warning: None,
 					superseded: Vec::new(),
+					snapcompact: None,
 				},
 				details:  None,
 				preserve: None,

@@ -19,6 +19,9 @@ use omp_proto::{
 	thread::v1::Thread,
 };
 
+/// Internal turn property carrying a one-shot provider-reset hint.
+pub const PROVIDER_RESET_PROP: &str = "omp/session-provider-reset";
+
 /// The canonical conversation input for one logical turn.
 #[derive(Clone, Debug)]
 pub enum TurnInput {
@@ -35,13 +38,15 @@ pub struct TurnOptions {
 	///
 	/// Leaving this absent makes the full turn stateless. Incremental turns take
 	/// their context identity from [`TurnInput::Delta`].
-	pub context_id: Option<Str>,
+	pub context_id:     Option<Str>,
 	/// Canonical chat parameters, including model, tools, and sampling controls.
-	pub params:     ChatParams,
+	pub params:         ChatParams,
 	/// In-turn invocation capability advertised to the gateway.
-	pub executor:   Option<Executor>,
+	pub executor:       Option<Executor>,
 	/// Namespaced turn-level extension properties.
-	pub props:      Option<ValueMap>,
+	pub props:          Option<ValueMap>,
+	/// Discard provider-native affinity for this one successful turn.
+	pub provider_reset: bool,
 }
 
 /// A client response frame for a live server-initiated invocation.
@@ -271,7 +276,7 @@ pub trait TurnSession: Send {
 }
 
 pub fn open_frame(
-	turn_id: &TurnId,
+	turn_id: &TurnId<str>,
 	input: TurnInput,
 	options: &TurnOptions,
 ) -> Result<TurnFrame, Error> {
@@ -295,13 +300,22 @@ pub fn open_frame(
 			delta:   Some(delta),
 		}),
 	};
+	let mut props = options.props.clone();
+	if options.provider_reset {
+		props
+			.get_or_insert_default()
+			.fields
+			.insert(PROVIDER_RESET_PROP.to_owned(), pb::Value {
+				kind: Some(pb::value::Kind::Bool(true)),
+			});
+	}
 	Ok(TurnFrame {
 		frame: Some(pb::turn_frame::Frame::Open(pb::TurnRequest {
-			turn_id:  turn_id.as_str().to_owned(),
-			input:    Some(input),
-			params:   Some(options.params.clone()),
+			turn_id: turn_id.as_str().to_owned(),
+			input: Some(input),
+			params: Some(options.params.clone()),
 			executor: options.executor.clone(),
-			props:    options.props.clone(),
+			props,
 		})),
 	})
 }

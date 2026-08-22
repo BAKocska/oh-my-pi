@@ -5,11 +5,12 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use omp_core::{SparseMap, SparseSet, Str, encoding::hex};
 use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
-use omp_storage::transcript::{AmendPatch, Entry, Kind, LiveSet, Log};
+use omp_storage::transcript::{AmendPatch, Entry, Kind, LiveSet, Log, truncate_persisted_text};
 use omp_tool::{
 	Abort, CallOutcome, CapsBase, Part as ToolPart, ProjectedCall, PromptCaps, RecordedCallOwned,
 	Registry as ToolRegistry, Rev, TOOL_REV_PROP, ToolIdentity,
 };
+use serde::Deserialize;
 use thiserror::Error;
 
 /// Canonical thread projection failure.
@@ -41,7 +42,69 @@ pub enum ProjectionError {
 	MissingRevision,
 }
 
-/// Projects the live append-only journal chain into one canonical thread.
+/// Applies the one-time durable string bound to a canonical thread item.
+///
+/// Provider-signed thinking/tool blocks remain exact. Calling this on a
+/// replayed persisted item is byte-stable because the visible notice fits under
+/// the cap.
+pub fn truncate_item_for_persistence(item: &mut thread_pb::Item) {
+	let Some(kind) = &mut item.kind else {
+		return;
+	};
+	match kind {
+		thread_pb::item::Kind::Message(message) => {
+			truncate_parts_for_persistence(&mut message.parts);
+		},
+		thread_pb::item::Kind::ToolCall(call) => {
+			if call.thought_signature.is_empty()
+				&& let Ok(arguments) = std::str::from_utf8(&call.args_json)
+			{
+				let bounded = truncate_persisted_text(arguments);
+				if bounded.as_str() != arguments {
+					call.args_json = bounded.as_bytes().to_vec().into();
+				}
+			}
+		},
+		thread_pb::item::Kind::ToolResult(result) => {
+			truncate_parts_for_persistence(&mut result.parts);
+		},
+	}
+}
+
+fn truncate_parts_for_persistence(parts: &mut [thread_pb::Part]) {
+	for part in parts {
+		let Some(kind) = &mut part.kind else {
+			continue;
+		};
+		match kind {
+			thread_pb::part::Kind::Text(text) => {
+				let bounded = truncate_persisted_text(text);
+				if bounded.as_str() != text {
+					*text = bounded.as_str().to_owned();
+				}
+			},
+			thread_pb::part::Kind::Thinking(thinking) if thinking.signature.is_empty() => {
+				let bounded = truncate_persisted_text(&thinking.text);
+				if bounded.as_str() != thinking.text {
+					thinking.text = bounded.as_str().to_owned();
+				}
+			},
+			thread_pb::part::Kind::Fallback(fallback) => {
+				let from = truncate_persisted_text(&fallback.from_model);
+				let to = truncate_persisted_text(&fallback.to_model);
+				if from.as_str() != fallback.from_model {
+					fallback.from_model = from.as_str().to_owned();
+				}
+				if to.as_str() != fallback.to_model {
+					fallback.to_model = to.as_str().to_owned();
+				}
+			},
+			thread_pb::part::Kind::Thinking(_)
+			| thread_pb::part::Kind::Blob(_)
+			| thread_pb::part::Kind::ServerTool(_) => {},
+		}
+	}
+}
 ///
 /// Rewinds are already resolved in `live`. Sequence amendments update only the
 /// working copy; original item events remain untouched.
@@ -103,6 +166,56 @@ pub fn project_journal(
 				}
 				positions.insert(index, position);
 				items.push(item);
+			},
+			Kind::Compact { summary, snapcompact, .. } => {
+				let mut parts = vec![thread_pb::Part {
+					kind: Some(thread_pb::part::Kind::Text(summary.to_string())),
+				}];
+				if let Some(archive) = snapcompact {
+					parts.extend(archive.frames.iter().map(|reference| thread_pb::Part {
+						kind: Some(thread_pb::part::Kind::Blob(thread_pb::Blob {
+							hash:   Bytes::copy_from_slice(reference.hash.as_bytes()),
+							mime:   "image/png".to_owned(),
+							size:   reference.size,
+							inline: Bytes::new(),
+							detail: thread_pb::blob::Detail::Auto as i32,
+						})),
+					}));
+				}
+				positions.insert(index, items.len());
+				items.push(thread_pb::Item {
+					created_at_ms: event.ts,
+					kind: Some(thread_pb::item::Kind::Message(thread_pb::Message {
+						role: thread_pb::Role::User as i32,
+						parts,
+					})),
+					..Default::default()
+				});
+			},
+			Kind::Custom(custom) if custom.kind() == crate::journal_kinds::REWIND_REPORT_KIND => {
+				#[derive(Deserialize)]
+				struct RewindReport<'a> {
+					#[serde(borrow)]
+					report: &'a str,
+				}
+				let Some(data) = custom.data() else {
+					continue;
+				};
+				let report: RewindReport<'_> = serde_json::from_str(data.get())?;
+				items.push(thread_pb::Item {
+					created_at_ms: event.ts,
+					kind: Some(thread_pb::item::Kind::Message(thread_pb::Message {
+						role:  thread_pb::Role::User as i32,
+						parts: vec![thread_pb::Part {
+							kind: Some(thread_pb::part::Kind::Text(format!(
+								"Checkpoint called and rewound. Report retained below. Need explore again \
+								 → new `checkpoint`.\n\nReport:\n{}",
+								report.report
+							))),
+						}],
+					})),
+					..Default::default()
+				});
 			},
 			Kind::Amend { target, patch } => {
 				let amendment = amendments.get_or_insert(*target, ItemAmendment::default());

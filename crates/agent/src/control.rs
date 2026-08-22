@@ -16,8 +16,9 @@ use std::{
 use omp_core::{Str, sf};
 use omp_storage::{
 	state::{DurableRequest, StateAuthority, StateRevision},
-	transcript::InvocationTransition,
+	transcript::{InvocationTransition, ModelChange, TitleSource},
 };
+use parking_lot::Mutex;
 use serde_json::value::RawValue;
 use thiserror::Error;
 
@@ -27,18 +28,21 @@ use crate::{
 		SessionStateValue, SessionStateWatchEvent,
 	},
 	journal_kinds::EntryKindDecl,
+	r#loop::{ActiveCheckpoint, CheckpointState},
 };
 
 /// A cloneable sender for authenticated extension CONTROL operations.
 #[derive(Clone)]
 pub struct ControlSender {
-	commands:     flume::Sender<ControlCommand>,
-	next_receipt: Arc<AtomicU64>,
+	commands:         flume::Sender<ControlCommand>,
+	next_receipt:     Arc<AtomicU64>,
+	checkpoint_state: Arc<Mutex<CheckpointState>>,
 }
 
 /// The receive half retained by the sole mutable journal owner.
 pub struct ControlMailbox {
-	commands: flume::Receiver<ControlCommand>,
+	commands:         flume::Receiver<ControlCommand>,
+	checkpoint_state: Arc<Mutex<CheckpointState>>,
 }
 
 /// Failure to deliver or execute a journal-owner CONTROL operation.
@@ -50,23 +54,56 @@ pub enum ControlError {
 	/// The journal rejected the authenticated operation.
 	#[error(transparent)]
 	Journal(#[from] JournalError),
+	/// A second checkpoint was requested before the active one settled.
+	#[error("checkpoint already active")]
+	CheckpointAlreadyActive,
+	/// Rewind was requested before any checkpoint was created.
+	#[error("no active checkpoint")]
+	NoActiveCheckpoint,
+	/// Rewind was repeated after the active checkpoint completed.
+	#[error("checkpoint already completed; continue from the retained rewind report")]
+	CheckpointAlreadyCompleted,
+	/// The opaque token was not issued by this active session.
+	#[error("checkpoint token does not belong to the active session")]
+	WrongCheckpointToken,
+	/// A rewind report contained no findings.
+	#[error("rewind report must not be empty")]
+	EmptyRewindReport,
+	/// A rewind for the active checkpoint is already queued.
+	#[error("rewind already scheduled for the active checkpoint")]
+	RewindAlreadyScheduled,
+}
+
+/// Authoritative acknowledgement that a checkpoint became active.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointAck {
+	/// Opaque session-owned checkpoint token.
+	pub token:      Str,
+	/// Checkpoint creation time in epoch milliseconds.
+	pub started_at: u64,
 }
 
 /// Authoritative acknowledgement that a rewind entered the boundary queue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewindAck {
-	/// Requested live journal head.
-	pub target:  u64,
+	/// Opaque token accepted for the queued rewind.
+	pub token:   Str,
 	/// Agent-issued command identifier.
 	pub receipt: Str,
 }
 
 /// A rewind command surfaced to the agent loop for boundary execution.
 pub struct ScheduledRewind {
-	/// Durable journal event index to rewind to.
-	pub target: u64,
-	/// Caller-declared rewind scope label.
-	pub scope:  Str,
+	/// Opaque session-owned checkpoint token.
+	pub token:      Str,
+	/// Durable journal event index resolved from the active checkpoint.
+	pub target:     u64,
+	/// Findings retained after discarded exploration.
+	pub report:     Str,
+	/// Exploration goal retained for recovery guidance.
+	pub goal:       Str,
+	/// Checkpoint creation time in epoch milliseconds.
+	pub started_at: u64,
 }
 
 /// Result of receiving one typed CONTROL command.
@@ -93,28 +130,105 @@ type JournalReplyResult<T> = Result<T, JournalError>;
 #[must_use]
 pub fn channel() -> (ControlSender, ControlMailbox) {
 	let (commands, receiver) = flume::unbounded();
-	(ControlSender { commands, next_receipt: Arc::new(AtomicU64::new(1)) }, ControlMailbox {
-		commands: receiver,
-	})
+	let checkpoint_state = Arc::new(Mutex::new(CheckpointState::default()));
+	(
+		ControlSender {
+			commands,
+			next_receipt: Arc::new(AtomicU64::new(1)),
+			checkpoint_state: Arc::clone(&checkpoint_state),
+		},
+		ControlMailbox { commands: receiver, checkpoint_state },
+	)
 }
 
 impl ControlSender {
-	/// Appends a Core-authored labeled checkpoint and returns its durable token.
+	pub(crate) fn checkpoint_state(&self) -> Arc<Mutex<CheckpointState>> {
+		Arc::clone(&self.checkpoint_state)
+	}
+
+	/// Appends an in-place reset boundary through the sole journal owner.
 	///
 	/// # Errors
-	pub async fn checkpoint(&self, label: Str) -> Result<u64, ControlError> {
-		let sequence = self.next_receipt.fetch_add(1, Ordering::Relaxed);
-		let request_id = sf!("checkpoint-{sequence}");
+	/// Returns a closed-owner or typed journal transition failure.
+	pub async fn reset(&self, ts: u64) -> Result<u64, ControlError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Checkpoint { label, request_id, reply })
+			.send(ControlCommand::Reset { ts, reply })
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
 			.await
 			.map_err(|_| ControlError::Closed)?
 			.map_err(ControlError::from)
+	}
+
+	/// Appends a provider-reset hint through the sole journal owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner or typed journal transition failure.
+	pub async fn provider_reset(&self, ts: u64) -> Result<u64, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::ProviderReset { ts, reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
+	/// Appends a user-assigned durable session title through the journal owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner or typed journal transition failure.
+	pub async fn set_title(&self, ts: u64, title: Str) -> Result<u64, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::SetTitle { ts, title, reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
+	/// Appends a session-only effective model override through the journal
+	/// owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner or typed journal transition failure.
+	pub async fn model_override(&self, ts: u64, model: ModelChange) -> Result<u64, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::ModelOverride { ts, model, reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
+	/// Appends a Core-authored exploration checkpoint and returns its opaque
+	/// session token.
+	///
+	/// # Errors
+	pub async fn checkpoint(&self, goal: Str) -> Result<CheckpointAck, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Checkpoint { goal, reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
 	}
 
 	/// Requests one authenticated journal operation and awaits its assigned
@@ -290,18 +404,18 @@ impl ControlSender {
 	///
 	/// # Errors
 	/// Returns [`ControlError::Closed`] if the agent loop stopped receiving.
-	pub async fn schedule_rewind(&self, target: u64, scope: Str) -> Result<RewindAck, ControlError> {
+	pub async fn schedule_rewind(&self, token: Str, report: Str) -> Result<RewindAck, ControlError> {
 		let sequence = self.next_receipt.fetch_add(1, Ordering::Relaxed);
 		let receipt = sf!("rewind-{sequence}");
 		let (ack, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Rewind { target, scope, receipt: receipt.clone(), ack })
+			.send(ControlCommand::Rewind { token, report, receipt: receipt.clone(), ack })
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
 			.await
-			.map_err(|_| ControlError::Closed)
+			.map_err(|_| ControlError::Closed)?
 	}
 }
 
@@ -314,7 +428,7 @@ impl ControlMailbox {
 		let Ok(command) = self.commands.recv_async().await else {
 			return ControlMailboxEvent::Closed;
 		};
-		handle_command(journal, command)
+		handle_command(journal, command, &self.checkpoint_state)
 	}
 
 	/// Drains at most `limit` commands already waiting at an agent-loop mailbox
@@ -333,7 +447,9 @@ impl ControlMailbox {
 			let Ok(command) = self.commands.try_recv() else {
 				break;
 			};
-			if let ControlMailboxEvent::Rewind(rewind) = handle_command(journal, command) {
+			if let ControlMailboxEvent::Rewind(rewind) =
+				handle_command(journal, command, &self.checkpoint_state)
+			{
 				surfaced.push_back(rewind);
 			}
 			handled += 1;
@@ -343,10 +459,27 @@ impl ControlMailbox {
 }
 
 pub(crate) enum ControlCommand {
+	Reset {
+		ts:    u64,
+		reply: flume::Sender<JournalReplyResult<u64>>,
+	},
+	ProviderReset {
+		ts:    u64,
+		reply: flume::Sender<JournalReplyResult<u64>>,
+	},
+	ModelOverride {
+		ts:    u64,
+		model: ModelChange,
+		reply: flume::Sender<JournalReplyResult<u64>>,
+	},
+	SetTitle {
+		ts:    u64,
+		title: Str,
+		reply: flume::Sender<JournalReplyResult<u64>>,
+	},
 	Checkpoint {
-		label:      Str,
-		request_id: Str,
-		reply:      flume::Sender<JournalReplyResult<u64>>,
+		goal:  Str,
+		reply: flume::Sender<Result<CheckpointAck, ControlError>>,
 	},
 	Journal {
 		request: JournalRequest,
@@ -387,17 +520,54 @@ pub(crate) enum ControlCommand {
 		reply:      flume::Sender<JournalReplyResult<u64>>,
 	},
 	Rewind {
-		target:  u64,
-		scope:   Str,
+		token:   Str,
+		report:  Str,
 		receipt: Str,
-		ack:     flume::Sender<RewindAck>,
+		ack:     flume::Sender<Result<RewindAck, ControlError>>,
 	},
 }
 
-fn handle_command(journal: &mut Journal, command: ControlCommand) -> ControlMailboxEvent {
+fn handle_command(
+	journal: &mut Journal,
+	command: ControlCommand,
+	checkpoint_state: &Mutex<CheckpointState>,
+) -> ControlMailboxEvent {
 	match command {
-		ControlCommand::Checkpoint { label, request_id, reply } => {
-			let _ = reply.send(journal.checkpoint(crate::r#loop::now_ms(), label, request_id));
+		ControlCommand::Reset { ts, reply } => {
+			let _ = reply.send(journal.reset(ts));
+		},
+		ControlCommand::ProviderReset { ts, reply } => {
+			let _ = reply.send(journal.provider_reset(ts));
+		},
+		ControlCommand::ModelOverride { ts, model, reply } => {
+			let _ = reply.send(journal.model_override(ts, model));
+		},
+		ControlCommand::SetTitle { ts, title, reply } => {
+			let _ = reply.send(journal.append_title(ts, title, TitleSource::User));
+		},
+		ControlCommand::Checkpoint { goal, reply } => {
+			let mut state = checkpoint_state.lock();
+			if state.active.is_some() {
+				let _ = reply.send(Err(ControlError::CheckpointAlreadyActive));
+			} else {
+				let token = Str::from(omp_core::Ulid::generate().to_string());
+				let started_at = crate::r#loop::now_ms();
+				match journal.checkpoint(started_at, token.as_str(), goal.as_str(), started_at) {
+					Ok(event) => {
+						state.active = Some(ActiveCheckpoint {
+							opaque_token: token.clone(),
+							event,
+							goal,
+							started_at,
+						});
+						state.rewind_scheduled = false;
+						let _ = reply.send(Ok(CheckpointAck { token, started_at }));
+					},
+					Err(error) => {
+						let _ = reply.send(Err(ControlError::Journal(error)));
+					},
+				}
+			}
 		},
 		ControlCommand::Journal { request, reply } => {
 			let _ = reply.send(journal.handle_request(request));
@@ -437,9 +607,39 @@ fn handle_command(journal: &mut Journal, command: ControlCommand) -> ControlMail
 		ControlCommand::InvocationTransition { ts, transition, reply } => {
 			let _ = reply.send(journal.record_invocation_transition(ts, transition));
 		},
-		ControlCommand::Rewind { target, scope, receipt, ack } => {
-			let _ = ack.send(RewindAck { target, receipt });
-			return ControlMailboxEvent::Rewind(ScheduledRewind { target, scope });
+		ControlCommand::Rewind { token, report, receipt, ack } => {
+			let mut state = checkpoint_state.lock();
+			let Some(active) = state.active.clone() else {
+				let error = if state.last_completed.is_some() {
+					ControlError::CheckpointAlreadyCompleted
+				} else {
+					ControlError::NoActiveCheckpoint
+				};
+				let _ = ack.send(Err(error));
+				return ControlMailboxEvent::JournalHandled;
+			};
+			if token != active.opaque_token {
+				let _ = ack.send(Err(ControlError::WrongCheckpointToken));
+				return ControlMailboxEvent::JournalHandled;
+			}
+			let report = Str::new(report.trim());
+			if report.is_empty() {
+				let _ = ack.send(Err(ControlError::EmptyRewindReport));
+				return ControlMailboxEvent::JournalHandled;
+			}
+			if state.rewind_scheduled {
+				let _ = ack.send(Err(ControlError::RewindAlreadyScheduled));
+				return ControlMailboxEvent::JournalHandled;
+			}
+			state.rewind_scheduled = true;
+			let _ = ack.send(Ok(RewindAck { token: token.clone(), receipt }));
+			return ControlMailboxEvent::Rewind(ScheduledRewind {
+				token,
+				target: active.event,
+				report,
+				goal: active.goal,
+				started_at: active.started_at,
+			});
 		},
 	}
 	ControlMailboxEvent::JournalHandled

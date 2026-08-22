@@ -5,6 +5,25 @@ use std::{collections::HashMap, fmt};
 use omp_core::{IntoStr, Str};
 use omp_tool::{Rev, RevParseError};
 use thiserror::Error;
+pub(crate) const CORE_EXTENSION: &str = "dev.omp.core";
+pub(crate) const CHECKPOINT_KIND: &str = "dev.omp.core.checkpoint";
+pub(crate) const REWIND_REPORT_KIND: &str = "dev.omp.core.rewind-report";
+pub(crate) const TTSR_INJECTION_KIND: &str = "dev.omp.core.ttsr-injection";
+pub(crate) const CORE_REVISION: &str = "core.1";
+
+pub(crate) fn core_ttsr_declaration() -> EntryKindDecl {
+	EntryKindDecl::parse(TTSR_INJECTION_KIND, CORE_REVISION, false, false, None)
+		.expect("static TTSR injection revision is valid")
+}
+
+pub(crate) fn core_checkpoint_declarations() -> Vec<EntryKindDecl> {
+	vec![
+		EntryKindDecl::parse(CHECKPOINT_KIND, CORE_REVISION, false, false, None)
+			.expect("static checkpoint revision is valid"),
+		EntryKindDecl::parse(REWIND_REPORT_KIND, CORE_REVISION, false, false, None)
+			.expect("static rewind-report revision is valid"),
+	]
+}
 
 /// Statically dispatched migration hook for a declared entry kind.
 ///

@@ -7,9 +7,118 @@
 use std::collections::{HashMap, HashSet};
 
 use omp_core::{Str, sf};
-use omp_proto::thread::v1::{self as thread, Item, Thread};
+use omp_proto::{
+	inference::v1 as inference,
+	thread::v1::{self as thread, Item, Thread},
+};
 use smallvec::SmallVec;
 use thiserror::Error;
+
+/// One immutable, reconciled view of request-context usage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextSnapshot {
+	/// Stable turn identity shared by every measurement.
+	pub turn_id:             Str,
+	/// Projection revision measured by the tokenizer.
+	pub projection_revision: u64,
+	/// Model context-window ceiling.
+	pub window_tokens:       u64,
+	/// Complete request input at this anchor.
+	pub input_tokens:        u64,
+	/// System-prompt tokens, or `None` when unavailable.
+	pub system_tokens:       Option<u64>,
+	/// Conversation-message tokens, or `None` when unavailable.
+	pub message_tokens:      Option<u64>,
+	/// Tool declaration/result tokens, or `None` when unavailable.
+	pub tool_tokens:         Option<u64>,
+	/// Reserved runtime-buffer tokens, or `None` when unavailable.
+	pub buffer_tokens:       Option<u64>,
+	/// Input not attributable to an available category.
+	pub unclassified_tokens: u64,
+	/// Unused context-window capacity.
+	pub slack_tokens:        u64,
+	/// Tokens avoided by Snapcompact, or `None` when unavailable.
+	pub snapcompact_savings: Option<u64>,
+}
+
+impl ContextSnapshot {
+	/// Constructs a snapshot only when its single anchor and totals reconcile.
+	pub fn from_receipt(
+		receipt: &omp_llm_inference::receipt::ContextUsageReceipt,
+	) -> Result<Self, ContextSnapshotError> {
+		let turn_id = receipt
+			.turn_id
+			.clone()
+			.ok_or(ContextSnapshotError::MissingAnchor)?;
+		let projection_revision = receipt
+			.projection_revision
+			.ok_or(ContextSnapshotError::MissingAnchor)?;
+		let window_tokens = receipt
+			.window_tokens
+			.ok_or(ContextSnapshotError::MissingTotal)?;
+		let input_tokens = receipt
+			.input_tokens
+			.ok_or(ContextSnapshotError::MissingTotal)?;
+		if input_tokens > window_tokens {
+			return Err(ContextSnapshotError::InputExceedsWindow { input_tokens, window_tokens });
+		}
+		let categorized_tokens = [
+			receipt.system_tokens,
+			receipt.message_tokens,
+			receipt.tool_tokens,
+			receipt.buffer_tokens,
+		]
+		.into_iter()
+		.flatten()
+		.fold(0_u64, u64::saturating_add);
+		if categorized_tokens > input_tokens {
+			return Err(ContextSnapshotError::CategoriesExceedInput {
+				categorized_tokens,
+				input_tokens,
+			});
+		}
+		Ok(Self {
+			turn_id,
+			projection_revision,
+			window_tokens,
+			input_tokens,
+			system_tokens: receipt.system_tokens,
+			message_tokens: receipt.message_tokens,
+			tool_tokens: receipt.tool_tokens,
+			buffer_tokens: receipt.buffer_tokens,
+			unclassified_tokens: input_tokens - categorized_tokens,
+			slack_tokens: window_tokens - input_tokens,
+			snapcompact_savings: receipt.snapcompact_savings,
+		})
+	}
+}
+
+/// Invalid or incomplete anchored context accounting.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ContextSnapshotError {
+	/// Turn identity or projection revision is absent.
+	#[error("context accounting anchor is unavailable")]
+	MissingAnchor,
+	/// Window or complete input total is absent.
+	#[error("context accounting total is unavailable")]
+	MissingTotal,
+	/// Complete input exceeds the model window.
+	#[error("context input tokens {input_tokens} exceed window {window_tokens}")]
+	InputExceedsWindow {
+		/// Measured request input.
+		input_tokens:  u64,
+		/// Model context window.
+		window_tokens: u64,
+	},
+	/// Independently measured categories exceed complete input.
+	#[error("context categories total {categorized_tokens} exceeds input {input_tokens}")]
+	CategoriesExceedInput {
+		/// Sum of available category measurements.
+		categorized_tokens: u64,
+		/// Complete measured request input.
+		input_tokens:       u64,
+	},
+}
 
 /// Compact flags describing an item without transferring its body.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -188,6 +297,120 @@ pub enum ContextProjection {
 		/// Body-free metadata visible to handlers.
 		view:   ContextView,
 	},
+}
+
+/// Resolves whether a model should receive the external thinking tool.
+///
+/// Native reasoning wins. Explicitly unsupported reasoning activates the tool;
+/// unknown capability evidence does not silently change the tool surface.
+#[must_use]
+pub fn external_thinking_for_model(capabilities: &omp_llm_inference::ModelCapabilities) -> bool {
+	capabilities
+		.chat
+		.as_ref()
+		.is_some_and(|chat| matches!(chat.reasoning, omp_llm_inference::Availability::Unsupported))
+}
+
+/// Removes replay-unsafe reasoning from an interrupted assistant tail and
+/// appends a hidden user-shaped continuity note.
+///
+/// The provider never receives a modified signed reasoning block. Plaintext is
+/// preserved in a neutral note so the next turn can continue without exposing
+/// the note in ordinary transcript presentation.
+#[must_use]
+pub fn demote_interrupted_reasoning(thread: &mut Thread) -> bool {
+	let Some(message) = thread
+		.items
+		.iter_mut()
+		.rev()
+		.find_map(|item| match item.kind.as_mut() {
+			Some(thread::item::Kind::Message(message))
+				if thread::Role::try_from(message.role) == Ok(thread::Role::Assistant) =>
+			{
+				Some(message)
+			},
+			_ => None,
+		})
+	else {
+		return false;
+	};
+	let mut reasoning = Str::default();
+	let mut kept = Vec::with_capacity(message.parts.len());
+	for part in message.parts.drain(..) {
+		match part.kind {
+			Some(thread::part::Kind::Thinking(thinking)) if !thinking.text.trim().is_empty() => {
+				if !reasoning.is_empty() {
+					reasoning = sf!("{}\n{}", reasoning.as_str(), thinking.text);
+				} else {
+					reasoning = Str::new(thinking.text);
+				}
+			},
+			_ => kept.push(part),
+		}
+	}
+	message.parts = kept;
+	if reasoning.is_empty() {
+		return false;
+	}
+	let text = sf!("You were saying this but I interrupted you:\n```\n{}\n```", reasoning.as_str());
+	thread.items.push(Item {
+		seq:           0,
+		created_at_ms: 0,
+		kind:          Some(thread::item::Kind::Message(thread::Message {
+			role:  thread::Role::User as i32,
+			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.into())) }],
+		})),
+		props:         Some(inference::ValueMap {
+			fields: std::collections::BTreeMap::from([(
+				"omp/hidden-continuity".to_owned(),
+				inference::Value { kind: Some(inference::value::Kind::Bool(true)) },
+			)]),
+		}),
+	});
+	true
+}
+
+/// Injects stable first-turn date and working-directory metadata once.
+///
+/// Callers pass preformatted values from the session snapshot; this function
+/// never consults ambient time or process cwd, so replay bytes remain stable.
+#[must_use]
+pub fn inject_first_turn_metadata(thread: &mut Thread, date: &str, cwd: &str) -> bool {
+	if thread.items.iter().any(|item| {
+		item
+			.props
+			.as_ref()
+			.and_then(|props| props.fields.get("omp/session-metadata"))
+			.and_then(|value| value.kind.as_ref())
+			.is_some_and(|kind| matches!(kind, inference::value::Kind::Bool(true)))
+	}) {
+		return false;
+	}
+	let Some(item) = thread.items.iter_mut().find(|item| {
+		matches!(
+			item.kind.as_ref(),
+			Some(thread::item::Kind::Message(message))
+				if thread::Role::try_from(message.role) == Ok(thread::Role::User)
+		)
+	}) else {
+		return false;
+	};
+	let Some(thread::item::Kind::Message(message)) = item.kind.as_mut() else {
+		return false;
+	};
+	message.parts.insert(0, thread::Part {
+		kind: Some(thread::part::Kind::Text(
+			sf!("<session-context date=\"{date}\" cwd=\"{cwd}\">").into(),
+		)),
+	});
+	item
+		.props
+		.get_or_insert_default()
+		.fields
+		.insert("omp/session-metadata".to_owned(), inference::Value {
+			kind: Some(inference::value::Kind::Bool(true)),
+		});
+	true
 }
 
 /// Builds the body-free view only when at least one projection handler is
@@ -536,6 +759,58 @@ mod tests {
 				_ => "",
 			})
 			.collect()
+	}
+
+	#[test]
+	fn interrupted_reasoning_becomes_hidden_continuity_without_signature() {
+		let mut thread = Thread {
+			items: vec![Item {
+				seq:           1,
+				created_at_ms: 1,
+				kind:          Some(thread::item::Kind::Message(thread::Message {
+					role:  thread::Role::Assistant as i32,
+					parts: vec![
+						thread::Part {
+							kind: Some(thread::part::Kind::Thinking(thread::Thinking {
+								text:      "inspect the failure".to_owned(),
+								signature: vec![7].into(),
+								redacted:  false,
+							})),
+						},
+						thread::Part { kind: Some(thread::part::Kind::Text("partial".to_owned())) },
+					],
+				})),
+				props:         None,
+			}],
+		};
+		assert!(demote_interrupted_reasoning(&mut thread));
+		let assistant = match thread.items[0].kind.as_ref().unwrap() {
+			thread::item::Kind::Message(message) => message,
+			_ => unreachable!(),
+		};
+		assert!(
+			assistant
+				.parts
+				.iter()
+				.all(|part| !matches!(part.kind, Some(thread::part::Kind::Thinking(_))))
+		);
+		let hidden = thread.items.last().unwrap();
+		assert!(
+			hidden
+				.props
+				.as_ref()
+				.unwrap()
+				.fields
+				.contains_key("omp/hidden-continuity")
+		);
+	}
+
+	#[test]
+	fn first_turn_metadata_is_stable_and_idempotent() {
+		let mut thread = Thread { items: vec![item("hello")] };
+		assert!(inject_first_turn_metadata(&mut thread, "2026-08-22", "/work/omp"));
+		assert!(!inject_first_turn_metadata(&mut thread, "tomorrow", "/elsewhere"));
+		assert_eq!(texts(&thread)[0], "<session-context date=\"2026-08-22\" cwd=\"/work/omp\">");
 	}
 
 	#[test]

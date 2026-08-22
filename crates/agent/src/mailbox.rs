@@ -3,7 +3,17 @@
 use std::collections::VecDeque;
 
 use omp_core::{Str, sf};
-use omp_proto::thread::v1::Item;
+use omp_proto::{
+	inference::v1 as inference,
+	thread::v1::{self as thread, Item},
+};
+
+/// Durable item property identifying a deferred-diagnostics document.
+pub const DEFERRED_DIAGNOSTIC_DOCUMENT_PROP: &str = "omp/deferred-diagnostic-document";
+/// Durable item property fencing the document revision of deferred diagnostics.
+pub const DEFERRED_DIAGNOSTIC_REVISION_PROP: &str = "omp/deferred-diagnostic-revision";
+/// Durable item property fencing the language-server generation.
+pub const DEFERRED_DIAGNOSTIC_GENERATION_PROP: &str = "omp/deferred-diagnostic-generation";
 
 /// Earliest loop point at which an interrupt may be observed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +80,15 @@ pub enum InterruptSource {
 		/// Stable sender identity.
 		from: Str,
 	},
+	/// Revision-fenced diagnostics completed after the inline write budget.
+	DeferredDiagnostics {
+		/// Stable document identity supplied by document authority.
+		document:          Str,
+		/// Exact committed document revision.
+		revision:          u64,
+		/// Language-server generation that produced the diagnostics.
+		server_generation: u64,
+	},
 	/// Named producer without a more specific structured source.
 	Producer(Str),
 }
@@ -95,6 +114,197 @@ pub fn device_availability_interrupt(item: Item) -> Interrupt {
 		class: InterruptClass::TurnBoundary,
 		item,
 		source: InterruptSource::Producer(sf!("device availability")),
+	}
+}
+
+/// Builds a durable, revision-fenced deferred-diagnostics delivery.
+///
+/// Attribution is copied into item properties before enqueue, so journal replay
+/// preserves the source and fences even though the live mailbox source is not
+/// itself persisted. Delivery is a system item restricted to a turn boundary
+/// and therefore cannot split or reorder an already emitted tool batch.
+#[must_use]
+pub fn deferred_diagnostics_interrupt(
+	text: Str,
+	document: Str,
+	revision: u64,
+	server_generation: u64,
+) -> Interrupt {
+	let mut props = inference::ValueMap::default();
+	props
+		.fields
+		.insert(DEFERRED_DIAGNOSTIC_DOCUMENT_PROP.to_owned(), inference::Value {
+			kind: Some(inference::value::Kind::String(document.to_string())),
+		});
+	props
+		.fields
+		.insert(DEFERRED_DIAGNOSTIC_REVISION_PROP.to_owned(), inference::Value {
+			kind: Some(inference::value::Kind::Uint(revision)),
+		});
+	props
+		.fields
+		.insert(DEFERRED_DIAGNOSTIC_GENERATION_PROP.to_owned(), inference::Value {
+			kind: Some(inference::value::Kind::Uint(server_generation)),
+		});
+	let item = Item {
+		seq:           0,
+		created_at_ms: 0,
+		kind:          Some(thread::item::Kind::Message(thread::Message {
+			role:  thread::Role::System as i32,
+			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
+		})),
+		props:         Some(props),
+	};
+	Interrupt {
+		class: InterruptClass::TurnBoundary,
+		item,
+		source: InterruptSource::DeferredDiagnostics { document, revision, server_generation },
+	}
+}
+
+/// Deferred local effect selected by the interactive composer.
+#[derive(
+	Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum DeferredCommandKind {
+	/// Environment-mediated shell command.
+	Shell,
+	/// Environment-mediated evaluator cell.
+	Eval,
+}
+
+/// Whether an evaluator cell may receive the active conversation context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum DeferredContext {
+	/// Exclude conversation context (`$$`).
+	Excluded,
+	/// Include the active context (`$`).
+	Included,
+}
+
+/// One ordered shell/eval item queued while a turn is active.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct DeferredCommand {
+	/// Stable producer identity used by durable settlement.
+	pub id:      Str,
+	/// Monotonic queue order assigned at enqueue.
+	pub order:   u64,
+	/// Effect family.
+	pub kind:    DeferredCommandKind,
+	/// Source text without the local execution prefix.
+	pub source:  Str,
+	/// Evaluator context policy; shell items always use `Excluded`.
+	pub context: DeferredContext,
+}
+
+/// Terminal classification projected durably after a deferred command starts.
+#[derive(
+	Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum DeferredSettlementStatus {
+	/// The Environment operation completed successfully.
+	Succeeded,
+	/// The Environment operation returned a typed failure.
+	Failed,
+	/// The user cancelled after execution started.
+	Cancelled,
+}
+
+/// Durable, non-context settlement projection for one started local command.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct DeferredSettlement {
+	/// Stable command identity.
+	pub id:             Str,
+	/// Original queue order.
+	pub order:          u64,
+	/// Effect family.
+	pub kind:           DeferredCommandKind,
+	/// Terminal status.
+	pub status:         DeferredSettlementStatus,
+	/// Bounded user-visible output preview.
+	pub output_preview: Str,
+	/// Environment artifact URI containing full output, when spilled.
+	pub artifact:       Option<Str>,
+	/// Journal-clock start timestamp.
+	pub started_at_ms:  u64,
+	/// Journal-clock settlement timestamp.
+	pub settled_at_ms:  u64,
+}
+
+/// Ordered, UI-observable deferred-command queue.
+///
+/// Taking an item does not mark it started: callers may restore it at the front
+/// if cancellation wins before Environment admission. Once admission begins,
+/// only a [`DeferredSettlement`] may return it to transcript projection.
+#[derive(Default)]
+pub struct DeferredCommands {
+	next_order: u64,
+	pending:    VecDeque<DeferredCommand>,
+}
+
+impl DeferredCommands {
+	/// Creates an empty queue.
+	#[must_use]
+	pub const fn new() -> Self {
+		Self { next_order: 0, pending: VecDeque::new() }
+	}
+
+	/// Enqueues one command at the FIFO tail and returns its assigned order.
+	pub fn enqueue(
+		&mut self,
+		id: Str,
+		kind: DeferredCommandKind,
+		source: Str,
+		context: DeferredContext,
+	) -> u64 {
+		let order = self.next_order;
+		self.next_order = self.next_order.saturating_add(1);
+		self.pending.push_back(DeferredCommand {
+			id,
+			order,
+			kind,
+			source,
+			context: if kind == DeferredCommandKind::Shell {
+				DeferredContext::Excluded
+			} else {
+				context
+			},
+		});
+		order
+	}
+
+	/// Takes the oldest command for a start attempt.
+	pub fn take_next(&mut self) -> Option<DeferredCommand> {
+		self.pending.pop_front()
+	}
+
+	/// Restores a command whose start attempt lost to cancellation.
+	pub fn restore_before_start(&mut self, command: DeferredCommand) {
+		self.pending.push_front(command);
+	}
+
+	/// Dequeues the newest unstarted item back into the composer.
+	pub fn take_newest_unstarted(&mut self) -> Option<DeferredCommand> {
+		self.pending.pop_back()
+	}
+
+	/// Returns pending commands in exact execution order.
+	pub fn pending(&self) -> impl ExactSizeIterator<Item = &DeferredCommand> {
+		self.pending.iter()
+	}
+
+	/// Returns the unstarted command count.
+	#[must_use]
+	pub fn len(&self) -> usize {
+		self.pending.len()
+	}
+
+	/// Reports whether no commands await admission.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.pending.is_empty()
 	}
 }
 
@@ -153,9 +363,12 @@ impl Mailbox {
 	/// Cancelling this future leaves the channel unchanged. Once it completes,
 	/// the received value remains owned by the mailbox until a matching drain.
 	pub async fn wait(&mut self) -> Result<(), flume::RecvError> {
-		let interrupt = self.rx.recv_async().await?;
-		self.push_back(interrupt);
-		Ok(())
+		loop {
+			let interrupt = self.rx.recv_async().await?;
+			if self.push_back(interrupt) {
+				return Ok(());
+			}
+		}
 	}
 
 	/// Drains every interrupt eligible at `point` in class-precedence order.
@@ -225,8 +438,45 @@ impl Mailbox {
 		}
 	}
 
-	fn push_back(&mut self, interrupt: Interrupt) {
+	fn push_back(&mut self, interrupt: Interrupt) -> bool {
+		let InterruptSource::DeferredDiagnostics { document, revision, server_generation } =
+			&interrupt.source
+		else {
+			self.backlog.push_back(interrupt);
+			return true;
+		};
+
+		let stale = self.backlog.iter().any(|queued| {
+			let InterruptSource::DeferredDiagnostics {
+				document: queued_document,
+				revision: queued_revision,
+				server_generation: queued_generation,
+			} = &queued.source
+			else {
+				return false;
+			};
+			queued_document == document
+				&& (*queued_generation > *server_generation
+					|| (*queued_generation == *server_generation && *queued_revision >= *revision))
+		});
+		if stale {
+			return false;
+		}
+		self.backlog.retain(|queued| {
+			let InterruptSource::DeferredDiagnostics {
+				document: queued_document,
+				revision: queued_revision,
+				server_generation: queued_generation,
+			} = &queued.source
+			else {
+				return true;
+			};
+			queued_document != document
+				|| *queued_generation > *server_generation
+				|| (*queued_generation == *server_generation && *queued_revision > *revision)
+		});
 		self.backlog.push_back(interrupt);
+		true
 	}
 
 	fn demote_immediate(&mut self) {
@@ -254,6 +504,31 @@ mod tests {
 			})),
 			props:         None,
 		}
+	}
+
+	#[test]
+	fn deferred_commands_restore_before_start_and_dequeue_newest() {
+		let mut commands = DeferredCommands::new();
+		commands.enqueue(
+			sf!("shell"),
+			DeferredCommandKind::Shell,
+			sf!("git status"),
+			DeferredContext::Included,
+		);
+		commands.enqueue(
+			sf!("eval"),
+			DeferredCommandKind::Eval,
+			sf!("display(1)"),
+			DeferredContext::Included,
+		);
+		let first = commands.take_next().expect("oldest command");
+		assert_eq!(first.id, "shell");
+		assert_eq!(first.context, DeferredContext::Excluded);
+		commands.restore_before_start(first);
+		assert_eq!(commands.pending().next().map(|item| item.id.as_str()), Some("shell"));
+		let newest = commands.take_newest_unstarted().expect("newest command");
+		assert_eq!(newest.id, "eval");
+		assert_eq!(commands.len(), 1);
 	}
 
 	#[test]

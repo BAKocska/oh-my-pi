@@ -1,17 +1,18 @@
 //! Session agent roster, recursive budget authority, and concurrency permits.
 
 use std::{
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, HashMap, HashSet, VecDeque},
 	future::Future,
 	sync::{
-		Arc,
-		atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+		Arc, Weak,
+		atomic::{AtomicU8, AtomicU64, Ordering},
 	},
 	time::Instant,
 };
 
-use omp_core::{AppendVec, InvocationPhase, Str};
+use omp_core::{AppendVec, Hash32, InvocationPhase, Str};
 use omp_llm_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
+use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use thiserror::Error;
@@ -205,6 +206,255 @@ fn parse_container_string(encoded: &str) -> Option<Value> {
 	serde_json::from_str(encoded).ok()
 }
 
+/// Source which supplied a subagent's effective output schema.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum OutputSchemaSource {
+	/// The spawn caller supplied the schema.
+	Caller,
+	/// The selected agent definition supplied the schema.
+	Frontmatter,
+	/// The parent session supplied the schema.
+	Session,
+	/// No schema applies.
+	None,
+}
+
+/// Effective schema selected before a child is scheduled.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputSchemaResolution {
+	/// Normalized JSON Schema, when any source supplied one.
+	pub schema:          Option<Value>,
+	/// Winning source.
+	pub source:          OutputSchemaSource,
+	/// Whether a caller schema replaced definition frontmatter.
+	pub overrides_agent: bool,
+}
+
+/// Resolves schemas in caller → definition frontmatter → session order.
+#[must_use]
+pub fn resolve_output_schema(
+	caller: Option<&Value>,
+	frontmatter: Option<&Value>,
+	session: Option<&Value>,
+) -> OutputSchemaResolution {
+	if let Some(schema) = caller {
+		return OutputSchemaResolution {
+			schema:          Some(schema.clone()),
+			source:          OutputSchemaSource::Caller,
+			overrides_agent: frontmatter.is_some(),
+		};
+	}
+	if let Some(schema) = frontmatter {
+		return OutputSchemaResolution {
+			schema:          Some(schema.clone()),
+			source:          OutputSchemaSource::Frontmatter,
+			overrides_agent: false,
+		};
+	}
+	if let Some(schema) = session {
+		return OutputSchemaResolution {
+			schema:          Some(schema.clone()),
+			source:          OutputSchemaSource::Session,
+			overrides_agent: false,
+		};
+	}
+	OutputSchemaResolution {
+		schema:          None,
+		source:          OutputSchemaSource::None,
+		overrides_agent: false,
+	}
+}
+
+/// Failure while folding incremental yield paths.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum YieldAssemblyError {
+	/// An incremental path was empty or contained a blank component.
+	#[error("incremental yield path must contain non-empty components")]
+	InvalidPath,
+	/// A nested section attempted to descend through an existing scalar or
+	/// array.
+	#[error("incremental yield path collides with a non-object at {path}")]
+	ObjectCollision {
+		/// JSON Pointer-like collision location.
+		path: Str,
+	},
+}
+
+/// Final folded yield result.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AssembledYield {
+	/// Explicit terminal data or assembled incremental sections.
+	pub data:              Option<Value>,
+	/// Explicit terminal error.
+	pub error:             Option<Str>,
+	/// Whether a data-less terminal used the last assistant turn.
+	pub raw_text:          bool,
+	/// Whether no usable data was supplied.
+	pub missing_data:      bool,
+	/// Whether permissive schema handling accepted invalid data.
+	pub schema_overridden: bool,
+}
+
+/// Path-aware accumulator for a subagent generation's yield calls.
+#[derive(Clone, Debug, Default)]
+pub struct YieldAssembler {
+	schema: Option<Value>,
+	items:  Vec<YieldPayload>,
+}
+
+impl YieldAssembler {
+	/// Creates an empty assembler using the effective schema for array hints.
+	#[must_use]
+	pub const fn new(schema: Option<Value>) -> Self {
+		Self { schema, items: Vec::new() }
+	}
+
+	/// Retains one validated yield call in model-issued order.
+	pub fn push(&mut self, payload: YieldPayload) {
+		self.items.push(payload);
+	}
+
+	/// Folds explicit terminal data or incremental sections into one payload.
+	pub fn finish(
+		&self,
+		last_assistant: Option<&str>,
+	) -> Result<AssembledYield, YieldAssemblyError> {
+		let terminal = self.items.iter().rev().find(|item| !item.incremental);
+		if let Some(terminal) = terminal {
+			if terminal.error.is_some() || terminal.data.is_some() {
+				return Ok(AssembledYield {
+					data:              terminal.data.clone(),
+					error:             terminal.error.clone(),
+					raw_text:          false,
+					missing_data:      terminal.error.is_none() && terminal.data.is_none(),
+					schema_overridden: terminal.schema_overridden,
+				});
+			}
+		}
+
+		let mut sections = serde_json::Map::new();
+		let mut has_sections = false;
+		let mut schema_overridden = false;
+		let mut missing_data = false;
+		for item in self.items.iter().filter(|item| item.incremental) {
+			schema_overridden |= item.schema_overridden;
+			let path = item
+				.kind
+				.as_ref()
+				.and_then(Value::as_array)
+				.ok_or(YieldAssemblyError::InvalidPath)?
+				.iter()
+				.map(|part| part.as_str().map(str::trim).filter(|part| !part.is_empty()))
+				.collect::<Option<Vec<_>>>()
+				.ok_or(YieldAssemblyError::InvalidPath)?;
+			let value = item.data.clone().or_else(|| {
+				item
+					.use_last_turn
+					.then(|| last_assistant.map_or(Value::Null, |text| Value::String(text.to_owned())))
+			});
+			let Some(value) = value else {
+				missing_data = true;
+				continue;
+			};
+			missing_data |= value.is_null();
+			append_yield_path(&mut sections, &path, value, self.schema.as_ref())?;
+			has_sections = true;
+		}
+		if has_sections {
+			return Ok(AssembledYield {
+				data: Some(Value::Object(sections)),
+				error: None,
+				raw_text: false,
+				missing_data,
+				schema_overridden,
+			});
+		}
+
+		let Some(terminal) = terminal else {
+			return Ok(AssembledYield { missing_data: true, ..AssembledYield::default() });
+		};
+		let data = terminal
+			.use_last_turn
+			.then(|| last_assistant.map(|text| Value::String(text.to_owned())))
+			.flatten();
+		Ok(AssembledYield {
+			raw_text: data.is_some(),
+			missing_data: data.is_none(),
+			data,
+			error: None,
+			schema_overridden: terminal.schema_overridden,
+		})
+	}
+}
+
+fn append_yield_path(
+	root: &mut serde_json::Map<String, Value>,
+	path: &[&str],
+	value: Value,
+	schema: Option<&Value>,
+) -> Result<(), YieldAssemblyError> {
+	let (leaf, parents) = path.split_last().ok_or(YieldAssemblyError::InvalidPath)?;
+	let mut current = root;
+	for (index, component) in parents.iter().enumerate() {
+		let entry = current
+			.entry((*component).to_owned())
+			.or_insert_with(|| Value::Object(serde_json::Map::new()));
+		let Value::Object(next) = entry else {
+			return Err(YieldAssemblyError::ObjectCollision {
+				path: Str::from(format!("/{}", path[..=index].join("/"))),
+			});
+		};
+		current = next;
+	}
+	let force_array = schema_path_is_array(schema, path);
+	match current.entry((*leaf).to_owned()) {
+		serde_json::map::Entry::Vacant(entry) => {
+			entry.insert(if force_array {
+				Value::Array(vec![value])
+			} else {
+				value
+			});
+		},
+		serde_json::map::Entry::Occupied(mut entry) => match entry.get_mut() {
+			Value::Array(values) => values.push(value),
+			existing if !existing.is_object() => {
+				let first = std::mem::replace(existing, Value::Null);
+				*existing = Value::Array(vec![first, value]);
+			},
+			_ => {
+				return Err(YieldAssemblyError::ObjectCollision {
+					path: Str::from(format!("/{}", path.join("/"))),
+				});
+			},
+		},
+	}
+	Ok(())
+}
+
+fn schema_path_is_array(mut schema: Option<&Value>, path: &[&str]) -> bool {
+	for component in path {
+		schema = schema
+			.and_then(Value::as_object)
+			.and_then(|object| {
+				object
+					.get("properties")
+					.or_else(|| object.get("optionalProperties"))
+			})
+			.and_then(Value::as_object)
+			.and_then(|properties| properties.get(*component));
+	}
+	schema.is_some_and(|schema| {
+		schema.get("elements").is_some()
+			|| schema.get("type").is_some_and(|kind| {
+				kind == "array"
+					|| kind
+						.as_array()
+						.is_some_and(|kinds| kinds.iter().any(|kind| kind == "array"))
+			})
+	})
+}
+
 /// CONTROL operation whose generated metadata requires effects authorization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
 #[strum(serialize_all = "snake_case")]
@@ -325,33 +575,70 @@ impl SpawnPolicy {
 	}
 }
 
+/// Model-selection purpose for one inherited agent chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentModelPurpose {
+	/// Ordinary agent turn.
+	Agent,
+	/// Prewalk planning pass.
+	Prewalk,
+	/// Passive advisor call.
+	Advisor,
+}
+
+/// Optional prewalk or advisor activation declared by an agent definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentAuxiliary {
+	/// Enable the session-default role.
+	Default,
+	/// Enable a specific model selector or role.
+	Model(Str),
+}
+
 /// Static agent definition loaded through the discovery manifest table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentDefinition {
 	/// Stable discovery key, normally the file stem.
-	pub name:           Str,
+	pub name:            Str,
 	/// Human-readable description used by dynamic task schemas.
-	pub description:    Str,
+	pub description:     Str,
 	/// Exact child tool vocabulary. An empty list inherits the caller toolset.
-	pub tools:          Box<[Str]>,
+	pub tools:           Box<[Str]>,
 	/// Child-spawn capability and whitelist.
-	pub spawns:         SpawnPolicy,
+	pub spawns:          SpawnPolicy,
 	/// Optional role or exact model selector.
-	pub model:          Option<Str>,
+	pub model:           Option<Str>,
+	/// Optional prewalk-specific selector.
+	pub prewalk_model:   Option<Str>,
+	/// Ordered advisor selector chain.
+	pub advisor_models:  Box<[Str]>,
 	/// Optional typed thinking level name.
-	pub thinking_level: Option<Str>,
+	pub thinking_level:  Option<Str>,
+	/// Optional prewalk activation or selector.
+	pub prewalk:         Option<AgentAuxiliary>,
+	/// Optional advisor activation or selector.
+	pub advisor:         Option<AgentAuxiliary>,
+	/// Skills injected before the first delegated turn and restored on revival.
+	pub autoload_skills: Box<[Str]>,
+	/// Whether structural read summaries remain enabled for this definition.
+	pub read_summarize:  Option<bool>,
+	/// Definition-owned output schema, normalized from YAML frontmatter.
+	pub output_schema:   Option<Value>,
 	/// Whether execution must block the caller.
-	pub blocking:       bool,
+	pub blocking:        bool,
 	/// Markdown body appended to the spawned system prompt.
-	pub prompt:         Str,
+	pub prompt:          Str,
 }
 
 /// Malformed agent discovery frontmatter.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum AgentDefinitionError {
 	/// The markdown document lacks a complete frontmatter fence.
 	#[error("agent definition frontmatter is missing or unterminated")]
 	MissingFrontmatter,
+	/// YAML frontmatter could not be decoded.
+	#[error("agent definition frontmatter is malformed")]
+	Yaml(#[source] serde_yaml::Error),
 	/// A supported field had an invalid value.
 	#[error("invalid agent frontmatter field {0}")]
 	InvalidField(&'static str),
@@ -372,46 +659,101 @@ impl AgentDefinition {
 			return Err(AgentDefinitionError::MissingFrontmatter);
 		};
 		let prompt = prompt.strip_prefix('\n').unwrap_or(prompt);
-		let mut description = Default::default();
-		let mut tools = Box::<[Str]>::default();
-		let mut spawns = SpawnPolicy::Disabled;
-		let mut model = None;
-		let mut thinking_level = None;
-		let mut blocking = false;
-		for raw in frontmatter.lines() {
-			let line = raw.trim();
-			if line.is_empty() || line.starts_with('#') {
-				continue;
-			}
-			let Some((key, value)) = line.split_once(':') else {
-				return Err(AgentDefinitionError::InvalidField("frontmatter"));
-			};
-			let value = value.trim();
-			match key.trim() {
-				"description" => description = Str::new(unquote(value)),
-				"tools" => tools = parse_string_list("tools", value)?.into_boxed_slice(),
-				"spawns" => spawns = parse_spawn_policy(value)?,
-				"model" if !value.is_empty() => model = Some(Str::new(unquote(value))),
-				"thinkingLevel" | "thinking_level" if !value.is_empty() => {
-					thinking_level = Some(Str::new(unquote(value)));
-				},
-				"blocking" => {
-					blocking =
-						parse_bool(value).ok_or(AgentDefinitionError::InvalidField("blocking"))?;
-				},
-				_ => {},
-			}
+		let document: serde_yaml::Value =
+			serde_yaml::from_str(frontmatter).map_err(AgentDefinitionError::Yaml)?;
+		let fields = document
+			.as_mapping()
+			.ok_or(AgentDefinitionError::InvalidField("frontmatter"))?;
+		let description = yaml_string(fields, &["description"])?.unwrap_or_default();
+		let mut tools = yaml_string_list(fields, &["tools"], "tools")?;
+		if !tools.is_empty() && !tools.iter().any(|tool| tool == "yield") {
+			tools.push(Str::new_static("yield"));
 		}
+		let spawns =
+			if yaml_get(fields, &["spawns"]).is_none() && tools.iter().any(|tool| tool == "task") {
+				SpawnPolicy::Any
+			} else {
+				yaml_spawn_policy(fields)?
+			};
+		let tools = tools.into_boxed_slice();
+		let model = yaml_string(fields, &["model"])?;
+		let prewalk_model = yaml_string(fields, &["prewalkModel", "prewalk_model"])?;
+		let advisor_models =
+			yaml_string_list(fields, &["advisorModels", "advisor_models"], "advisorModels")?
+				.into_boxed_slice();
+		let thinking_level =
+			yaml_string(fields, &["thinkingLevel", "thinking-level", "thinking_level"])?;
+		let prewalk = yaml_auxiliary(fields, &["prewalk"], "prewalk")?;
+		let advisor = yaml_auxiliary(fields, &["advisor"], "advisor")?;
+		let autoload_skills = yaml_string_list(
+			fields,
+			&["autoloadSkills", "autoload-skills", "autoload_skills"],
+			"autoloadSkills",
+		)?
+		.into_boxed_slice();
+		let read_summarize = yaml_bool(
+			fields,
+			&["readSummarize", "read-summarize", "read_summarize"],
+			"readSummarize",
+		)?;
+		let output_schema = yaml_get(fields, &["output", "outputSchema", "output_schema"])
+			.map(|value| serde_yaml::from_value(value.clone()).map_err(AgentDefinitionError::Yaml))
+			.transpose()?;
+		let blocking = yaml_bool(fields, &["blocking"], "blocking")?.unwrap_or(false);
 		Ok(Self {
 			name,
 			description,
 			tools,
 			spawns,
 			model,
+			prewalk_model,
+			advisor_models,
 			thinking_level,
+			prewalk,
+			advisor,
+			autoload_skills,
+			read_summarize,
+			output_schema,
 			blocking,
 			prompt: Str::new(prompt),
 		})
+	}
+
+	/// Builds an ordered inherited selector chain for the requested agent
+	/// purpose.
+	///
+	/// The caller feeds this chain into the catalog's ordinary candidate
+	/// planner, ensuring agent, prewalk, and advisor selection use identical
+	/// glob/role/fallback semantics.
+	#[must_use]
+	pub fn effective_model_chain<'a>(
+		&'a self,
+		overrides: &'a BTreeMap<Str, Str>,
+		purpose: AgentModelPurpose,
+		parent: Option<&'a str>,
+		session: Option<&'a str>,
+	) -> Vec<&'a str> {
+		let mut chain = Vec::new();
+		match purpose {
+			AgentModelPurpose::Agent => {},
+			AgentModelPurpose::Prewalk => {
+				if let Some(model) = self.prewalk_model.as_deref() {
+					chain.push(model);
+				}
+			},
+			AgentModelPurpose::Advisor => chain.extend(self.advisor_models.iter().map(Str::as_str)),
+		}
+		if let Some(model) = self.effective_model(overrides)
+			&& !chain.contains(&model)
+		{
+			chain.push(model);
+		}
+		for inherited in [parent, session].into_iter().flatten() {
+			if !chain.contains(&inherited) {
+				chain.push(inherited);
+			}
+		}
+		chain
 	}
 
 	/// Resolves a configured per-agent override ahead of frontmatter.
@@ -422,6 +764,112 @@ impl AgentDefinition {
 			.find(|(name, _)| name.as_str().eq_ignore_ascii_case(self.name.as_str()))
 			.map(|(_, model)| model.as_str())
 			.or(self.model.as_deref())
+	}
+}
+
+fn yaml_get<'a>(fields: &'a serde_yaml::Mapping, keys: &[&str]) -> Option<&'a serde_yaml::Value> {
+	keys
+		.iter()
+		.find_map(|key| fields.get(serde_yaml::Value::String((*key).to_owned())))
+}
+
+fn yaml_string(
+	fields: &serde_yaml::Mapping,
+	keys: &[&'static str],
+) -> Result<Option<Str>, AgentDefinitionError> {
+	let Some(value) = yaml_get(fields, keys) else {
+		return Ok(None);
+	};
+	match value {
+		serde_yaml::Value::Null => Ok(None),
+		serde_yaml::Value::String(value) => {
+			let value = value.trim();
+			Ok((!value.is_empty()).then(|| Str::new(value)))
+		},
+		serde_yaml::Value::Sequence(values) => values
+			.first()
+			.and_then(serde_yaml::Value::as_str)
+			.map(|value| Some(Str::new(value.trim())))
+			.ok_or(AgentDefinitionError::InvalidField(keys[0])),
+		_ => Err(AgentDefinitionError::InvalidField(keys[0])),
+	}
+}
+
+fn yaml_string_list(
+	fields: &serde_yaml::Mapping,
+	keys: &[&'static str],
+	field: &'static str,
+) -> Result<Vec<Str>, AgentDefinitionError> {
+	let Some(value) = yaml_get(fields, keys) else {
+		return Ok(Vec::new());
+	};
+	match value {
+		serde_yaml::Value::Null => Ok(Vec::new()),
+		serde_yaml::Value::String(value) => parse_string_list(field, value),
+		serde_yaml::Value::Sequence(values) => values
+			.iter()
+			.map(|value| {
+				value
+					.as_str()
+					.map(str::trim)
+					.filter(|value| !value.is_empty())
+					.map(Str::new)
+					.ok_or(AgentDefinitionError::InvalidField(field))
+			})
+			.collect(),
+		_ => Err(AgentDefinitionError::InvalidField(field)),
+	}
+}
+
+fn yaml_bool(
+	fields: &serde_yaml::Mapping,
+	keys: &[&'static str],
+	field: &'static str,
+) -> Result<Option<bool>, AgentDefinitionError> {
+	let Some(value) = yaml_get(fields, keys) else {
+		return Ok(None);
+	};
+	value
+		.as_bool()
+		.map(Some)
+		.ok_or(AgentDefinitionError::InvalidField(field))
+}
+
+fn yaml_auxiliary(
+	fields: &serde_yaml::Mapping,
+	keys: &[&'static str],
+	field: &'static str,
+) -> Result<Option<AgentAuxiliary>, AgentDefinitionError> {
+	let Some(value) = yaml_get(fields, keys) else {
+		return Ok(None);
+	};
+	match value {
+		serde_yaml::Value::Null | serde_yaml::Value::Bool(false) => Ok(None),
+		serde_yaml::Value::Bool(true) => Ok(Some(AgentAuxiliary::Default)),
+		serde_yaml::Value::String(model) if !model.trim().is_empty() => {
+			Ok(Some(AgentAuxiliary::Model(Str::new(model.trim()))))
+		},
+		_ => Err(AgentDefinitionError::InvalidField(field)),
+	}
+}
+
+fn yaml_spawn_policy(fields: &serde_yaml::Mapping) -> Result<SpawnPolicy, AgentDefinitionError> {
+	let Some(value) = yaml_get(fields, &["spawns"]) else {
+		return Ok(SpawnPolicy::Disabled);
+	};
+	match value {
+		serde_yaml::Value::Bool(true) => Ok(SpawnPolicy::Any),
+		serde_yaml::Value::Bool(false) | serde_yaml::Value::Null => Ok(SpawnPolicy::Disabled),
+		serde_yaml::Value::String(value) => parse_spawn_policy(value),
+		serde_yaml::Value::Sequence(_) => {
+			let allowed = yaml_string_list(fields, &["spawns"], "spawns")?;
+			if allowed.is_empty() {
+				Ok(SpawnPolicy::Disabled)
+			} else {
+				Ok(SpawnPolicy::Only(allowed.into_boxed_slice()))
+			}
+		},
+		_ => Err(AgentDefinitionError::InvalidField("spawns")),
 	}
 }
 
@@ -461,14 +909,6 @@ fn parse_string_list(field: &'static str, value: &str) -> Result<Vec<Str>, Agent
 	}
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
-	match unquote(value) {
-		"true" => Some(true),
-		"false" => Some(false),
-		_ => None,
-	}
-}
-
 fn unquote(value: &str) -> &str {
 	value
 		.strip_prefix('"')
@@ -501,6 +941,195 @@ impl Usage {
 			input_tokens:  self.input_tokens.saturating_add(right.input_tokens),
 			output_tokens: self.output_tokens.saturating_add(right.output_tokens),
 			usd_micros:    self.usd_micros.saturating_add(right.usd_micros),
+		}
+	}
+}
+
+/// Exact observable statistics recorded directly against durable receipts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TreeStatistics {
+	/// User message items committed in outcomes.
+	pub user_messages:      u64,
+	/// Assistant message items committed in outcomes.
+	pub assistant_messages: u64,
+	/// System message items committed in outcomes.
+	pub system_messages:    u64,
+	/// Tool calls committed in outcomes.
+	pub tool_calls:         u64,
+	/// Tool results committed in outcomes.
+	pub tool_results:       u64,
+	/// Tool results whose canonical outcome is an error.
+	pub tool_errors:        u64,
+	/// Canonical inference usage, including optional provider fields.
+	pub usage:              pb::Usage,
+	/// Canonical cost, including every component field.
+	pub cost:               pb::Cost,
+	/// Distinct durable receipts.
+	pub requests:           u64,
+}
+
+impl TreeStatistics {
+	fn add_outcome(&mut self, outcome: &pb::Outcome) {
+		for item in &outcome.output {
+			match item.kind.as_ref() {
+				Some(thread_pb::item::Kind::Message(message)) => {
+					match thread_pb::Role::try_from(message.role).unwrap_or(thread_pb::Role::Unspecified)
+					{
+						thread_pb::Role::User => {
+							self.user_messages = self.user_messages.saturating_add(1);
+						},
+						thread_pb::Role::Assistant => {
+							self.assistant_messages = self.assistant_messages.saturating_add(1);
+						},
+						thread_pb::Role::System => {
+							self.system_messages = self.system_messages.saturating_add(1);
+						},
+						thread_pb::Role::Unspecified => {},
+					}
+				},
+				Some(thread_pb::item::Kind::ToolCall(_)) => {
+					self.tool_calls = self.tool_calls.saturating_add(1);
+				},
+				Some(thread_pb::item::Kind::ToolResult(result)) => {
+					self.tool_results = self.tool_results.saturating_add(1);
+					self.tool_errors = self.tool_errors.saturating_add(u64::from(result.is_error));
+				},
+				None => {},
+			}
+		}
+		if let Some(usage) = outcome.usage.as_ref() {
+			merge_usage(&mut self.usage, usage);
+		}
+		if let Some(cost) = outcome.cost.as_ref() {
+			merge_cost(&mut self.cost, cost);
+		}
+		self.requests = self.requests.saturating_add(1);
+	}
+
+	fn saturating_add(&mut self, source: &Self) {
+		self.user_messages = self.user_messages.saturating_add(source.user_messages);
+		self.assistant_messages = self
+			.assistant_messages
+			.saturating_add(source.assistant_messages);
+		self.system_messages = self.system_messages.saturating_add(source.system_messages);
+		self.tool_calls = self.tool_calls.saturating_add(source.tool_calls);
+		self.tool_results = self.tool_results.saturating_add(source.tool_results);
+		self.tool_errors = self.tool_errors.saturating_add(source.tool_errors);
+		merge_usage(&mut self.usage, &source.usage);
+		merge_cost(&mut self.cost, &source.cost);
+		self.requests = self.requests.saturating_add(source.requests);
+	}
+}
+
+fn merge_usage(target: &mut pb::Usage, source: &pb::Usage) {
+	target.input_tokens = target.input_tokens.saturating_add(source.input_tokens);
+	target.output_tokens = target.output_tokens.saturating_add(source.output_tokens);
+	target.cache_read_tokens = target
+		.cache_read_tokens
+		.saturating_add(source.cache_read_tokens);
+	target.cache_write_tokens = target
+		.cache_write_tokens
+		.saturating_add(source.cache_write_tokens);
+	target.accuracy = match (target.accuracy, source.accuracy) {
+		(0, right) => right,
+		(left, 0) => left,
+		(left, right) if left == right => left,
+		_ => pb::usage::Accuracy::Mixed as i32,
+	};
+	merge_usage_detail(&mut target.detail, source.detail.as_ref());
+	target.total_tokens = sum_optional(target.total_tokens, source.total_tokens);
+	target.context_tokens = sum_optional(target.context_tokens, source.context_tokens);
+	merge_orchestration(&mut target.orchestration, source.orchestration.as_ref());
+	target.premium_requests = sum_optional(target.premium_requests, source.premium_requests);
+	target.reasoning_tokens = sum_optional(target.reasoning_tokens, source.reasoning_tokens);
+	merge_cache_ttl(&mut target.cache_ttl, source.cache_ttl.as_ref());
+	merge_server_tools(&mut target.server_tools, source.server_tools.as_ref());
+}
+
+const fn sum_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+	match (left, right) {
+		(None, None) => None,
+		(Some(left), Some(right)) => Some(left.saturating_add(right)),
+		(Some(value), None) | (None, Some(value)) => Some(value),
+	}
+}
+
+fn merge_orchestration(
+	target: &mut Option<pb::OrchestrationUsage>,
+	source: Option<&pb::OrchestrationUsage>,
+) {
+	let Some(source) = source else {
+		return;
+	};
+	let target = target.get_or_insert_with(pb::OrchestrationUsage::default);
+	target.input_tokens = sum_optional(target.input_tokens, source.input_tokens);
+	target.cache_read_tokens = sum_optional(target.cache_read_tokens, source.cache_read_tokens);
+	target.output_tokens = sum_optional(target.output_tokens, source.output_tokens);
+}
+
+fn merge_cache_ttl(target: &mut Option<pb::CacheTtlUsage>, source: Option<&pb::CacheTtlUsage>) {
+	let Some(source) = source else {
+		return;
+	};
+	let target = target.get_or_insert_with(pb::CacheTtlUsage::default);
+	target.ephemeral_5m_tokens =
+		sum_optional(target.ephemeral_5m_tokens, source.ephemeral_5m_tokens);
+	target.ephemeral_1h_tokens =
+		sum_optional(target.ephemeral_1h_tokens, source.ephemeral_1h_tokens);
+}
+
+fn merge_server_tools(
+	target: &mut Option<pb::ServerToolUsage>,
+	source: Option<&pb::ServerToolUsage>,
+) {
+	let Some(source) = source else {
+		return;
+	};
+	let target = target.get_or_insert_with(pb::ServerToolUsage::default);
+	target.web_search_requests =
+		sum_optional(target.web_search_requests, source.web_search_requests);
+	target.web_fetch_requests = sum_optional(target.web_fetch_requests, source.web_fetch_requests);
+}
+
+fn merge_cost(target: &mut pb::Cost, source: &pb::Cost) {
+	target.nanos_usd = target.nanos_usd.saturating_add(source.nanos_usd);
+	target.estimated |= source.estimated;
+	target.input_nanos_usd = sum_optional(target.input_nanos_usd, source.input_nanos_usd);
+	target.output_nanos_usd = sum_optional(target.output_nanos_usd, source.output_nanos_usd);
+	target.cache_read_nanos_usd =
+		sum_optional(target.cache_read_nanos_usd, source.cache_read_nanos_usd);
+	target.cache_write_nanos_usd =
+		sum_optional(target.cache_write_nanos_usd, source.cache_write_nanos_usd);
+}
+
+fn merge_usage_detail(target: &mut Option<pb::ValueMap>, source: Option<&pb::ValueMap>) {
+	let Some(source) = source else {
+		return;
+	};
+	let target = target.get_or_insert_with(pb::ValueMap::default);
+	for (key, incoming) in &source.fields {
+		use std::collections::btree_map::Entry;
+		match target.fields.entry(key.clone()) {
+			Entry::Vacant(entry) => {
+				entry.insert(incoming.clone());
+			},
+			Entry::Occupied(mut entry) => {
+				let merged = match (entry.get().kind.as_ref(), incoming.kind.as_ref()) {
+					(Some(pb::value::Kind::Int(left)), Some(pb::value::Kind::Int(right))) => {
+						left.checked_add(*right).map(pb::value::Kind::Int)
+					},
+					(Some(pb::value::Kind::Uint(left)), Some(pb::value::Kind::Uint(right))) => {
+						left.checked_add(*right).map(pb::value::Kind::Uint)
+					},
+					_ if entry.get() == incoming => continue,
+					_ => None,
+				};
+				if let Some(kind) = merged {
+					entry.get_mut().kind = Some(kind);
+				} else {
+					entry.remove();
+				}
+			},
 		}
 	}
 }
@@ -563,9 +1192,11 @@ pub struct BudgetRemainder {
 
 #[derive(Debug)]
 struct BudgetAccount {
-	budget:      Budget,
-	usage:       Usage,
-	admitted_at: Instant,
+	budget:       Budget,
+	usage:        Usage,
+	direct_stats: TreeStatistics,
+	receipt_ids:  HashSet<Hash32>,
+	admitted_at:  Instant,
 }
 
 impl BudgetAccount {
@@ -638,20 +1269,22 @@ impl BudgetAccount {
 /// One roster node retained for the life of its session.
 pub struct AgentNode {
 	/// Stable agent identity.
-	pub id:      Str,
+	pub id:         Str,
 	/// Session-unique display and routing name.
-	pub name:    Str,
+	pub name:       Str,
+	/// Resolved definition identity used for recursion prevention.
+	pub definition: Option<Str>,
 	/// Whether this is the root or a spawned child.
-	pub kind:    AgentKind,
+	pub kind:       AgentKind,
 	/// Parent identity, absent only for the root.
-	pub parent:  Option<Str>,
+	pub parent:     Option<Str>,
 	/// Tree depth, with root at zero.
-	pub depth:   u16,
+	pub depth:      u16,
 	/// Session identity owning this journal.
-	pub session: Str,
-	status:      AtomicU8,
-	activity:    Mutex<Str>,
-	budget:      Mutex<BudgetAccount>,
+	pub session:    Str,
+	status:         AtomicU8,
+	activity:       Mutex<Str>,
+	budget:         Mutex<BudgetAccount>,
 }
 
 impl AgentNode {
@@ -677,10 +1310,16 @@ impl AgentNode {
 		self.activity.lock().clone()
 	}
 
-	/// Returns direct durable-receipt usage for this node.
+	/// Returns subtree usage used by this node's inherited budget.
 	#[must_use]
 	pub fn usage(&self) -> Usage {
 		self.budget.lock().usage
+	}
+
+	/// Returns statistics from receipts directly owned by this node.
+	#[must_use]
+	pub fn direct_statistics(&self) -> TreeStatistics {
+		self.budget.lock().direct_stats.clone()
 	}
 }
 
@@ -690,6 +1329,15 @@ pub enum SpawnRefusal {
 	/// The requested parent was absent or terminal.
 	#[error("parent agent is unavailable")]
 	ParentGone,
+	/// A durable identity was already registered.
+	#[error("agent identity is already registered")]
+	DuplicateIdentity,
+	/// A definition attempted to spawn itself.
+	#[error("an agent cannot recursively spawn its own resolved definition")]
+	SelfRecursion,
+	/// A caller display name was invalid.
+	#[error(transparent)]
+	InvalidName(#[from] crate::name::AgentNameError),
 	/// The requested child would exceed the tree depth ceiling.
 	#[error("agent depth ceiling exceeded")]
 	DepthExceeded,
@@ -734,36 +1382,195 @@ pub struct BudgetExceeded {
 	pub ceiling: BudgetCeiling,
 }
 
-/// RAII reservation for a complete spawn wave or an active agent turn.
+/// One queued concurrency acquisition.
+struct ConcurrencyWaiter {
+	ticket: u64,
+	units:  usize,
+	wake:   Arc<tokio::sync::Notify>,
+}
+
+struct ConcurrencyState {
+	limit:       usize,
+	active:      usize,
+	next_ticket: u64,
+	waiters:     VecDeque<ConcurrencyWaiter>,
+}
+
+/// Race-safe, session-scoped resizable concurrency authority.
 ///
-/// Dropping it releases every held permit. A waiter must call
+/// A zero limit is genuinely unlimited. Shrinking never revokes active runs;
+/// it only delays later acquisitions until the active count falls below the
+/// new ceiling.
+struct ConcurrencyController {
+	state:     Mutex<ConcurrencyState>,
+	max_queue: usize,
+}
+
+impl ConcurrencyController {
+	fn new(limit: usize, max_queue: usize) -> Arc<Self> {
+		Arc::new(Self {
+			state: Mutex::new(ConcurrencyState {
+				limit,
+				active: 0,
+				next_ticket: 0,
+				waiters: VecDeque::new(),
+			}),
+			max_queue,
+		})
+	}
+
+	async fn acquire(self: &Arc<Self>, units: usize) -> Result<(), SpawnRefusal> {
+		if units == 0 {
+			return Err(self.refusal());
+		}
+		let (ticket, wake) = {
+			let mut state = self.state.lock();
+			if state.limit != 0 && units > state.limit {
+				return Err(refusal_from(&state));
+			}
+			if state.waiters.is_empty()
+				&& (state.limit == 0 || state.active.saturating_add(units) <= state.limit)
+			{
+				state.active = state.active.saturating_add(units);
+				return Ok(());
+			}
+			let queued = state
+				.waiters
+				.iter()
+				.fold(0_usize, |total, waiter| total.saturating_add(waiter.units));
+			if queued.saturating_add(units) > self.max_queue {
+				return Err(refusal_from(&state));
+			}
+			let ticket = state.next_ticket;
+			state.next_ticket = state.next_ticket.wrapping_add(1);
+			let wake = Arc::new(tokio::sync::Notify::new());
+			state
+				.waiters
+				.push_back(ConcurrencyWaiter { ticket, units, wake: Arc::clone(&wake) });
+			(ticket, wake)
+		};
+		let mut registration =
+			WaitRegistration { controller: Arc::downgrade(self), ticket: Some(ticket) };
+		loop {
+			let notified = wake.notified();
+			{
+				let mut state = self.state.lock();
+				let position = state
+					.waiters
+					.iter()
+					.position(|waiter| waiter.ticket == ticket);
+				let Some(position) = position else {
+					continue;
+				};
+				let may_run = state.limit == 0
+					|| (position == 0 && state.active.saturating_add(units) <= state.limit);
+				if may_run {
+					state.waiters.remove(position);
+					state.active = state.active.saturating_add(units);
+					registration.ticket = None;
+					wake_waiters(&state);
+					return Ok(());
+				}
+			}
+			notified.await;
+		}
+	}
+
+	fn release(&self, units: usize) {
+		let mut state = self.state.lock();
+		state.active = state.active.saturating_sub(units);
+		wake_waiters(&state);
+	}
+
+	fn resize(&self, limit: usize) {
+		let mut state = self.state.lock();
+		state.limit = limit;
+		wake_waiters(&state);
+	}
+
+	fn limit(&self) -> usize {
+		self.state.lock().limit
+	}
+
+	fn refusal(&self) -> SpawnRefusal {
+		refusal_from(&self.state.lock())
+	}
+
+	fn cancel(&self, ticket: u64) {
+		let mut state = self.state.lock();
+		if let Some(position) = state
+			.waiters
+			.iter()
+			.position(|waiter| waiter.ticket == ticket)
+		{
+			state.waiters.remove(position);
+			wake_waiters(&state);
+		}
+	}
+}
+
+fn refusal_from(state: &ConcurrencyState) -> SpawnRefusal {
+	SpawnRefusal::ConcurrencyExhausted {
+		running:         state.active,
+		queued:          state
+			.waiters
+			.iter()
+			.fold(0_usize, |total, waiter| total.saturating_add(waiter.units)),
+		max_concurrency: state.limit,
+	}
+}
+
+fn wake_waiters(state: &ConcurrencyState) {
+	for waiter in &state.waiters {
+		waiter.wake.notify_one();
+		if state.limit != 0 {
+			break;
+		}
+	}
+}
+
+struct WaitRegistration {
+	controller: Weak<ConcurrencyController>,
+	ticket:     Option<u64>,
+}
+
+impl Drop for WaitRegistration {
+	fn drop(&mut self) {
+		if let (Some(controller), Some(ticket)) = (self.controller.upgrade(), self.ticket) {
+			controller.cancel(ticket);
+		}
+	}
+}
+
+/// RAII reservation for active agent runs.
+///
+/// Dropping it releases every held unit. A waiter must call
 /// [`Self::release_for_wait`] before awaiting a child and [`Self::reacquire`]
 /// afterwards; this is the release-while-waiting accounting rule.
 pub struct SpawnPermit {
-	semaphore: Arc<tokio::sync::Semaphore>,
-	held:      Option<tokio::sync::OwnedSemaphorePermit>,
-	units:     u32,
+	controller: Arc<ConcurrencyController>,
+	held:       bool,
+	units:      usize,
 }
 
 impl SpawnPermit {
 	/// Releases this agent's active-turn capacity before waiting on a child.
 	pub fn release_for_wait(&mut self) {
-		let _ = self.held.take();
+		if self.held {
+			self.controller.release(self.units);
+			self.held = false;
+		}
 	}
 
 	/// Re-acquires the same capacity after a child wait completes.
-	///
-	/// # Panics
-	/// Panics only when an internal semaphore is closed, which this tree never
-	/// does.
 	pub async fn reacquire(&mut self) {
-		if self.held.is_none() {
-			self.held = Some(
-				Arc::clone(&self.semaphore)
-					.acquire_many_owned(self.units)
-					.await
-					.expect("agent tree semaphore is never closed"),
-			);
+		if !self.held {
+			self
+				.controller
+				.acquire(self.units)
+				.await
+				.expect("a previously admitted run remains admissible");
+			self.held = true;
 		}
 	}
 
@@ -777,8 +1584,14 @@ impl SpawnPermit {
 
 	/// Returns how many concurrency units this reservation represents.
 	#[must_use]
-	pub const fn units(&self) -> u32 {
+	pub const fn units(&self) -> usize {
 		self.units
+	}
+}
+
+impl Drop for SpawnPermit {
+	fn drop(&mut self) {
+		self.release_for_wait();
 	}
 }
 
@@ -787,11 +1600,9 @@ pub struct AgentTree {
 	nodes:             AppendVec<Arc<AgentNode>>,
 	by_id:             RwLock<HashMap<Str, usize>>,
 	by_name:           RwLock<HashMap<Str, usize>>,
-	permits:           Arc<tokio::sync::Semaphore>,
+	names:             crate::name::AgentNameAllocator,
+	concurrency:       Arc<ConcurrencyController>,
 	max_depth:         u16,
-	max_concurrency:   usize,
-	max_queue:         usize,
-	queued:            AtomicUsize,
 	roster_generation: AtomicU64,
 	roster_watch:      tokio::sync::watch::Sender<u64>,
 }
@@ -801,17 +1612,14 @@ impl AgentTree {
 	/// ceilings.
 	#[must_use]
 	pub fn new(max_depth: u16, max_concurrency: usize, max_queue: usize) -> Self {
-		let max_concurrency = max_concurrency.max(1);
 		let (roster_watch, _) = tokio::sync::watch::channel(0_u64);
 		Self {
 			nodes: AppendVec::new(),
 			by_id: RwLock::new(HashMap::new()),
 			by_name: RwLock::new(HashMap::new()),
-			permits: Arc::new(tokio::sync::Semaphore::new(max_concurrency)),
+			names: crate::name::AgentNameAllocator::new(),
+			concurrency: ConcurrencyController::new(max_concurrency, max_queue),
 			max_depth,
-			max_concurrency,
-			max_queue,
-			queued: AtomicUsize::new(0),
 			roster_generation: AtomicU64::new(0),
 			roster_watch,
 		}
@@ -823,7 +1631,7 @@ impl AgentTree {
 		Self::new(max_depth, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_ADMISSION_QUEUE)
 	}
 
-	/// Adds a root or admitted child to the append-only roster.
+	/// Adds a root or already-resolved node to the append-only roster.
 	pub fn register(
 		&self,
 		id: Str,
@@ -833,12 +1641,76 @@ impl AgentTree {
 		session: Str,
 		budget: Budget,
 	) -> Result<Arc<AgentNode>, SpawnRefusal> {
+		self.names.reserve(name.as_str());
+		self.register_node(id, name, None, kind, parent, session, budget)
+	}
+
+	/// Resolves a child display name and atomically blocks self-recursion by
+	/// definition identity before publishing the node.
+	pub fn register_child(
+		&self,
+		id: Str,
+		requested_name: Option<&str>,
+		definition: &AgentDefinition,
+		parent: Str,
+		session: Str,
+		budget: Budget,
+	) -> Result<Arc<AgentNode>, SpawnRefusal> {
+		let parent_node = self.node(parent.as_str()).ok_or(SpawnRefusal::ParentGone)?;
+		if parent_node.status().terminal() {
+			return Err(SpawnRefusal::ParentGone);
+		}
+		if parent_node
+			.definition
+			.as_ref()
+			.is_some_and(|parent_definition| {
+				parent_definition
+					.as_str()
+					.eq_ignore_ascii_case(definition.name.as_str())
+			}) {
+			return Err(SpawnRefusal::SelfRecursion);
+		}
+		let name =
+			self
+				.names
+				.allocate(id.as_str(), Some(parent_node.name.as_str()), requested_name)?;
+		self.register_node(
+			id,
+			name,
+			Some(definition.name.clone()),
+			AgentKind::Subagent,
+			Some(parent),
+			session,
+			budget,
+		)
+	}
+
+	/// Reserves a recovered artifact or journal stem before later allocation.
+	pub fn reserve_historical_name(&self, name: &str) {
+		self.names.reserve(name);
+	}
+
+	fn register_node(
+		&self,
+		id: Str,
+		name: Str,
+		definition: Option<Str>,
+		kind: AgentKind,
+		parent: Option<Str>,
+		session: Str,
+		budget: Budget,
+	) -> Result<Arc<AgentNode>, SpawnRefusal> {
+		if self.by_id.read().contains_key(&id) {
+			return Err(SpawnRefusal::DuplicateIdentity);
+		}
 		let depth = match parent.as_ref() {
-			Some(parent) => self
-				.node(parent)
-				.ok_or(SpawnRefusal::ParentGone)?
-				.depth
-				.saturating_add(1),
+			Some(parent) => {
+				let parent = self.node(parent).ok_or(SpawnRefusal::ParentGone)?;
+				if parent.status().terminal() && kind == AgentKind::Subagent {
+					return Err(SpawnRefusal::ParentGone);
+				}
+				parent.depth.saturating_add(1)
+			},
 			None => 0,
 		};
 		if depth > self.max_depth {
@@ -847,6 +1719,7 @@ impl AgentTree {
 		let node = Arc::new(AgentNode {
 			id: id.clone(),
 			name: name.clone(),
+			definition,
 			kind,
 			parent,
 			depth,
@@ -856,12 +1729,17 @@ impl AgentTree {
 			budget: Mutex::new(BudgetAccount {
 				budget,
 				usage: Usage::default(),
+				direct_stats: TreeStatistics::default(),
+				receipt_ids: HashSet::new(),
 				admitted_at: Instant::now(),
 			}),
 		});
 		let index = self.nodes.push(Arc::clone(&node));
 		self.by_id.write().insert(id, index);
-		self.by_name.write().insert(name, index);
+		self
+			.by_name
+			.write()
+			.insert(Str::from(name.as_str().to_ascii_lowercase()), index);
 		self.publish_roster_change();
 		Ok(node)
 	}
@@ -876,7 +1754,8 @@ impl AgentTree {
 	/// Returns a node by session-local name without scanning the roster.
 	#[must_use]
 	pub fn named(&self, name: &str) -> Option<Arc<AgentNode>> {
-		let index = *self.by_name.read().get(name)?;
+		let folded = name.to_ascii_lowercase();
+		let index = *self.by_name.read().get(folded.as_str())?;
 		self.nodes.get(index).cloned()
 	}
 
@@ -900,29 +1779,19 @@ impl AgentTree {
 		self.roster_generation.load(Ordering::Acquire)
 	}
 
-	/// Reserves an entire spawn wave, queuing it as one unit when saturated.
+	/// Reserves capacity for active agent runs.
 	///
-	/// A queue overflow refuses the whole wave before any member can start.
+	/// Callers should acquire one unit per run. Queue overflow refuses the
+	/// request before it can start.
 	pub async fn admit(&self, count: usize) -> Result<SpawnPermit, SpawnRefusal> {
-		let count = u32::try_from(count).unwrap_or(u32::MAX);
-		let slots = usize::try_from(count).unwrap_or(usize::MAX);
-		if count == 0 || slots > self.max_concurrency {
-			return Err(self.concurrency_refusal());
+		if count != 1 {
+			return Err(self.concurrency.refusal());
 		}
-		let queued = self.queued.fetch_add(slots, Ordering::AcqRel);
-		if queued.saturating_add(slots) > self.max_queue {
-			self.queued.fetch_sub(slots, Ordering::AcqRel);
-			return Err(self.concurrency_refusal());
-		}
-		let permit = Arc::clone(&self.permits)
-			.acquire_many_owned(count)
-			.await
-			.expect("agent tree semaphore is never closed");
-		self.queued.fetch_sub(slots, Ordering::AcqRel);
+		self.concurrency.acquire(count).await?;
 		Ok(SpawnPermit {
-			semaphore: Arc::clone(&self.permits),
-			held:      Some(permit),
-			units:     count,
+			controller: Arc::clone(&self.concurrency),
+			held:       true,
+			units:      count,
 		})
 	}
 
@@ -961,6 +1830,94 @@ impl AgentTree {
 		Ok(())
 	}
 
+	/// Debits one canonical durable outcome exactly once and records every usage
+	/// and cost field on the owning node.
+	///
+	/// The canonical encoded outcome is its replay-stable identity. Replaying an
+	/// identical receipt on the same node is accepted as an idempotent no-op.
+	pub fn debit_outcome(
+		&self,
+		node_id: &str,
+		outcome: &pb::Outcome,
+	) -> Result<bool, BudgetExceeded> {
+		let mut lineage = Vec::new();
+		let mut current = self
+			.node(node_id)
+			.ok_or(BudgetExceeded { ceiling: BudgetCeiling::Requests })?;
+		loop {
+			lineage.push(Arc::clone(&current));
+			let Some(parent) = current.parent.as_ref() else {
+				break;
+			};
+			current = self
+				.node(parent)
+				.ok_or(BudgetExceeded { ceiling: BudgetCeiling::Requests })?;
+		}
+		lineage.reverse();
+		let mut accounts = lineage
+			.iter()
+			.map(|node| node.budget.lock())
+			.collect::<Vec<_>>();
+		let Some(owner) = accounts.last() else {
+			return Err(BudgetExceeded { ceiling: BudgetCeiling::Requests });
+		};
+		let receipt_id = Hash32::sum(outcome.encode_to_vec());
+		if owner.receipt_ids.contains(&receipt_id) {
+			return Ok(false);
+		}
+		let usage = outcome.usage.as_ref();
+		let cost = outcome.cost.as_ref();
+		let budget_usage = Usage {
+			requests:      1,
+			input_tokens:  usage.map_or(0, |usage| usage.input_tokens),
+			output_tokens: usage.map_or(0, |usage| usage.output_tokens),
+			usd_micros:    cost.map_or(0, |cost| cost.nanos_usd.saturating_add(999) / 1_000),
+		};
+		for account in &accounts {
+			account
+				.permits(budget_usage)
+				.map_err(|ceiling| BudgetExceeded { ceiling })?;
+		}
+		for account in &mut accounts {
+			account.usage = account.usage.saturating_add(budget_usage);
+		}
+		let Some(owner) = accounts.last_mut() else {
+			return Err(BudgetExceeded { ceiling: BudgetCeiling::Requests });
+		};
+		owner.direct_stats.add_outcome(outcome);
+		owner.receipt_ids.insert(receipt_id);
+		Ok(true)
+	}
+
+	/// Returns direct or recursively rolled-up receipt statistics.
+	///
+	/// Recursive aggregation walks direct node receipts rather than adding the
+	/// already inherited budget totals, so each descendant contributes once.
+	#[must_use]
+	pub fn statistics(&self, node_id: &str, recursive: bool) -> Option<TreeStatistics> {
+		let root = self.node(node_id)?;
+		if !recursive {
+			return Some(root.direct_statistics());
+		}
+		let mut total = TreeStatistics::default();
+		for candidate in self.roster() {
+			let mut current = Some(Arc::clone(candidate));
+			let include = loop {
+				let Some(node) = current else {
+					break false;
+				};
+				if node.id == root.id {
+					break true;
+				}
+				current = node.parent.as_ref().and_then(|parent| self.node(parent));
+			};
+			if include {
+				total.saturating_add(&candidate.direct_statistics());
+			}
+		}
+		Some(total)
+	}
+
 	/// Clamps a child's requested budget against every ancestor's unspent
 	/// remainder.
 	pub fn clamp_budget(&self, parent_id: &str, requested: Budget) -> Result<Budget, SpawnRefusal> {
@@ -976,20 +1933,18 @@ impl AgentTree {
 		Ok(effective)
 	}
 
-	/// Returns the tree-wide concurrency ceiling.
+	/// Returns the live tree-wide concurrency ceiling (`0` means unlimited).
 	#[must_use]
-	pub const fn max_concurrency(&self) -> usize {
-		self.max_concurrency
+	pub fn max_concurrency(&self) -> usize {
+		self.concurrency.limit()
 	}
 
-	fn concurrency_refusal(&self) -> SpawnRefusal {
-		SpawnRefusal::ConcurrencyExhausted {
-			running:         self
-				.max_concurrency
-				.saturating_sub(self.permits.available_permits()),
-			queued:          self.queued.load(Ordering::Acquire),
-			max_concurrency: self.max_concurrency,
-		}
+	/// Applies a new concurrency ceiling without replacing the controller.
+	///
+	/// Active runs keep their permits while a shrink is applied. New runs
+	/// observe the new ceiling immediately.
+	pub fn resize_concurrency(&self, max_concurrency: usize) {
+		self.concurrency.resize(max_concurrency);
 	}
 
 	fn publish_roster_change(&self) {
@@ -1016,6 +1971,57 @@ mod tests {
 				drop(tree.admit(1).await.unwrap());
 			})
 			.await;
+	}
+
+	#[tokio::test]
+	async fn zero_concurrency_is_unlimited() {
+		let tree = AgentTree::new(2, 0, 2);
+		let first = tree.admit(1).await.unwrap();
+		let second = tree.admit(1).await.unwrap();
+		assert_eq!(tree.max_concurrency(), 0);
+		assert_eq!(first.units(), 1);
+		assert_eq!(second.units(), 1);
+	}
+
+	#[tokio::test]
+	async fn resize_applies_under_load_without_revoking_active_runs() {
+		let tree = Arc::new(AgentTree::new(2, 2, 4));
+		let first = tree.admit(1).await.unwrap();
+		let second = tree.admit(1).await.unwrap();
+		tree.resize_concurrency(1);
+		let waiting_tree = Arc::clone(&tree);
+		let waiter = tokio::spawn(async move { waiting_tree.admit(1).await.unwrap() });
+		tokio::task::yield_now().await;
+		assert!(!waiter.is_finished());
+		drop(first);
+		tokio::task::yield_now().await;
+		assert!(!waiter.is_finished());
+		drop(second);
+		let third = waiter.await.unwrap();
+		assert_eq!(third.units(), 1);
+		tree.resize_concurrency(0);
+		let fourth = tree.admit(1).await.unwrap();
+		let fifth = tree.admit(1).await.unwrap();
+		drop((third, fourth, fifth));
+	}
+
+	#[tokio::test]
+	async fn cancelled_waiter_does_not_consume_capacity_or_block_the_queue() {
+		let tree = Arc::new(AgentTree::new(2, 1, 4));
+		let active = tree.admit(1).await.unwrap();
+		let cancelled_tree = Arc::clone(&tree);
+		let cancelled = tokio::spawn(async move { cancelled_tree.admit(1).await });
+		tokio::task::yield_now().await;
+		cancelled.abort();
+		assert!(matches!(cancelled.await, Err(error) if error.is_cancelled()));
+
+		let next_tree = Arc::clone(&tree);
+		let next = tokio::spawn(async move { next_tree.admit(1).await.unwrap() });
+		tokio::task::yield_now().await;
+		assert!(!next.is_finished());
+		drop(active);
+		let permit = next.await.unwrap();
+		assert_eq!(permit.units(), 1);
 	}
 
 	#[test]

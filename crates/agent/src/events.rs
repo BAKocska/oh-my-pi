@@ -6,10 +6,11 @@ use std::sync::{
 };
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Str, ToolPath};
 use omp_llm_inference::TurnId;
 use omp_proto::{inference::v1::TurnEvent, thread::v1::Item};
-use omp_tool::Rev;
+use omp_storage::transcript::TitleSource;
+use omp_tool::{Rev, ToolIdentity};
 use parking_lot::Mutex;
 
 use crate::state::AgentSnapshot;
@@ -26,6 +27,77 @@ pub enum AgentPhase {
 	Turning,
 	/// Executing a committed batch of tool calls.
 	ToolBatch,
+}
+
+/// Host-visible run state used by terminal titles and retained UI.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[repr(u8)]
+pub enum AgentRunState {
+	/// No turn is currently active.
+	#[default]
+	Idle,
+	/// A turn or tool batch is making progress.
+	Working,
+	/// The run stopped and needs user attention.
+	Attention,
+}
+
+impl AgentRunState {
+	const fn encode(self) -> u8 {
+		self as u8
+	}
+
+	const fn decode(encoded: u8) -> Self {
+		match encoded {
+			1 => Self::Working,
+			2 => Self::Attention,
+			_ => Self::Idle,
+		}
+	}
+}
+
+/// Visibility assigned by the loop to a host-observable event.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[repr(u8)]
+pub enum EventVisibility {
+	/// User-facing turn activity.
+	#[default]
+	User,
+	/// Runtime coordination that headless hosts must not project as
+	/// conversation.
+	Internal,
+}
+
+/// Typed origin of one host-observable event.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[repr(u8)]
+pub enum EventProvenance {
+	/// Authored by the model in the active turn.
+	#[default]
+	Model,
+	/// Emitted by the core loop itself.
+	Runtime,
+	/// Emitted by a supervised extension.
+	Extension,
+	/// Emitted by a child agent.
+	Subagent,
+}
+
+/// Typed planning state projected to protocol hosts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[repr(u8)]
+pub enum PlanState {
+	/// Planning is inactive.
+	#[default]
+	Inactive,
+	/// Planning is active and mutations remain prohibited.
+	Active,
+	/// Planning is active with one explicitly authorized transition.
+	Yolo,
 }
 
 impl AgentPhase {
@@ -48,11 +120,40 @@ impl AgentPhase {
 	}
 }
 
+/// Display-only peer traffic projected to the main session UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerRelayObservation {
+	/// Stable message id used for end-to-end deduplication.
+	pub id:      Str,
+	/// Stable sender identity.
+	pub from:    Str,
+	/// Resolved recipient identity.
+	pub to:      Str,
+	/// Exact peer-visible body.
+	pub text:    Str,
+	/// Delivery state shown beside the body.
+	pub outcome: crate::Receipt,
+}
+
 /// One immutable observation emitted by the agent loop.
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
 	/// A newly published authoritative agent snapshot.
 	Snapshot(Arc<AgentSnapshot>),
+	/// The sole journal writer committed a new session title.
+	TitleChanged {
+		/// Accepted title.
+		title:  Str,
+		/// Authority that assigned it.
+		source: TitleSource,
+	},
+	/// Terminal/UI run-state transition.
+	RunStateChanged {
+		/// State exited.
+		from: AgentRunState,
+		/// State entered.
+		to:   AgentRunState,
+	},
 	/// A lifecycle transition between loop phases.
 	PhaseChanged {
 		/// Phase exited by the loop.
@@ -66,12 +167,39 @@ pub enum AgentEvent {
 		/// Monotonic generation returned by `AgentTree::roster_generation`.
 		generation: u64,
 	},
+	/// Display-only peer message; never appended to the model journal.
+	PeerRelay(Arc<PeerRelayObservation>),
 	/// An inference event, preserved without lossy adaptation.
 	Turn {
 		/// Logical turn that emitted the event.
 		turn_id: TurnId,
 		/// Canonical turn protocol event.
 		event:   Box<TurnEvent>,
+	},
+	/// Typed metadata for a tool invocation. This precedes `ToolOpened` for the
+	/// same call in every loop-produced stream.
+	ToolObserved {
+		/// Stable call identifier.
+		call_id:            Str,
+		/// Exact selected tool revision.
+		identity:           ToolIdentity,
+		/// Typed device/sub-tool path when the model-facing name is a valid path.
+		path:               Option<ToolPath>,
+		/// Host presentation visibility.
+		visibility:         EventVisibility,
+		/// Authenticated event origin.
+		provenance:         EventProvenance,
+		/// Active session incarnation.
+		session_generation: u64,
+	},
+	/// A typed planning-state transition.
+	PlanStateChanged {
+		/// Previous state.
+		from:               PlanState,
+		/// New state.
+		to:                 PlanState,
+		/// Active session incarnation.
+		session_generation: u64,
 	},
 	/// A speculative tool invocation was opened.
 	ToolOpened {
@@ -138,9 +266,11 @@ struct Subscribers {
 
 #[derive(Debug, Default)]
 struct EventBusInner {
-	subscribers:   Mutex<Subscribers>,
-	dropped_lossy: AtomicU64,
-	phase:         AtomicU8,
+	subscribers:        Mutex<Subscribers>,
+	dropped_lossy:      AtomicU64,
+	phase:              AtomicU8,
+	run_state:          AtomicU8,
+	session_generation: AtomicU64,
 }
 
 /// Cloneable ordered fan-out for immutable shared agent events.
@@ -211,12 +341,59 @@ impl EventBus {
 	/// snapshot.
 	pub fn transition(&self, from: AgentPhase, to: AgentPhase) -> Arc<AgentEvent> {
 		self.inner.phase.store(to.encode(), Ordering::Release);
+		let run_state = if matches!(to, AgentPhase::Idle) {
+			AgentRunState::Idle
+		} else {
+			AgentRunState::Working
+		};
+		if self.run_state() != run_state {
+			self.run_transition(run_state);
+		}
 		self.publish(AgentEvent::PhaseChanged { from, to })
 	}
 
 	/// Returns the latest phase without subscribing or allocating.
 	pub fn phase(&self) -> AgentPhase {
 		AgentPhase::decode(self.inner.phase.load(Ordering::Acquire))
+	}
+
+	/// Publishes a title only after the journal/index owner accepted it.
+	pub fn title_changed(&self, title: Str, source: TitleSource) -> Arc<AgentEvent> {
+		self.publish(AgentEvent::TitleChanged { title, source })
+	}
+
+	/// Updates and publishes the terminal/UI run state.
+	pub fn run_transition(&self, to: AgentRunState) -> Arc<AgentEvent> {
+		let from = AgentRunState::decode(self.inner.run_state.swap(to.encode(), Ordering::AcqRel));
+		self.publish(AgentEvent::RunStateChanged { from, to })
+	}
+
+	/// Returns the latest terminal/UI run state.
+	pub fn run_state(&self) -> AgentRunState {
+		AgentRunState::decode(self.inner.run_state.load(Ordering::Acquire))
+	}
+
+	/// Replaces the session-generation stamp attached to subsequent typed
+	/// observations.
+	pub fn set_session_generation(&self, generation: u64) {
+		self
+			.inner
+			.session_generation
+			.store(generation, Ordering::Release);
+	}
+
+	/// Returns the generation stamped onto newly published typed observations.
+	pub fn session_generation(&self) -> u64 {
+		self.inner.session_generation.load(Ordering::Acquire)
+	}
+
+	/// Publishes a typed planning-state transition.
+	pub fn plan_transition(&self, from: PlanState, to: PlanState) -> Arc<AgentEvent> {
+		self.publish(AgentEvent::PlanStateChanged {
+			from,
+			to,
+			session_generation: self.session_generation(),
+		})
 	}
 
 	/// Returns the cumulative number of events dropped by all lossy subscribers.
@@ -287,7 +464,7 @@ impl LossyEventSubscription {
 
 #[cfg(test)]
 mod tests {
-	use super::{AgentEvent, AgentPhase, EventBus};
+	use super::{AgentEvent, AgentPhase, EventBus, PlanState};
 
 	#[test]
 	fn phase_snapshot_tracks_transitions_across_clones() {
@@ -310,5 +487,27 @@ mod tests {
 
 		bus.transition(AgentPhase::Projecting, AgentPhase::Turning);
 		assert_eq!(clone.phase(), AgentPhase::Turning);
+	}
+
+	#[test]
+	fn plan_events_preserve_order_and_session_generation() {
+		let bus = EventBus::new();
+		bus.set_session_generation(17);
+		let events = bus.subscribe_lossless();
+		bus.plan_transition(PlanState::Inactive, PlanState::Active);
+		bus.plan_transition(PlanState::Active, PlanState::Yolo);
+
+		let first = events.try_recv().expect("first plan event");
+		let second = events.try_recv().expect("second plan event");
+		assert!(matches!(first.as_ref(), AgentEvent::PlanStateChanged {
+			from:               PlanState::Inactive,
+			to:                 PlanState::Active,
+			session_generation: 17,
+		}));
+		assert!(matches!(second.as_ref(), AgentEvent::PlanStateChanged {
+			from:               PlanState::Active,
+			to:                 PlanState::Yolo,
+			session_generation: 17,
+		}));
 	}
 }

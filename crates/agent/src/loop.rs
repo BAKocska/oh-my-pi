@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
+	fmt::Write as _,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,21 +13,30 @@ use omp_env::EnvClient;
 use omp_llm_inference::TurnId;
 use omp_proto::{
 	inference::v1::{self as pb, ContextRef, Outcome, ThreadDelta},
-	thread::v1::{self as thread, Item},
+	thread::v1::{self as thread, Item, Thread},
 };
-use omp_storage::transcript::{CallId, InvocationTransition};
+use omp_secrets::{json::deobfuscate_json, obfuscator::SecretObfuscator};
+use omp_storage::{
+	blob::BlobStore,
+	transcript::{CallId, Entry, InvocationTransition, Kind, SnapcompactArchive},
+};
 use omp_telemetry::firehose::{
 	Branch, BranchOp, Envelope, Event as FirehoseEvent, Firehose, ModelAttempt, ModelRequest,
 	ProviderError, ToolCall as FirehoseToolCall, TurnEnd as FirehoseTurnEnd,
 	TurnStart as FirehoseTurnStart,
 };
 use omp_tool::{CapsBase, Registry as ToolRegistry, ToolIdentity};
+use parking_lot::Mutex;
+use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 use thiserror::Error;
 
 use crate::{
-	BatchError, Journal, JournalError, Mailbox, MailboxSender, ProjectionError, PromptError,
-	TurnClient, TurnInput, TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	AgentRegistry, BatchError, CompactionCoordinator, CompactionMethodOrder, Journal, JournalError,
+	Mailbox, MailboxSender, ManualCompactionMode, ManualCompactionOutcome, ManualCompactionRequest,
+	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptError, SnapcompactPreparation,
+	TtsrMatch, TtsrMatchContext, TtsrRegistry, TtsrSource, TurnClient, TurnInput, TurnSession,
+	YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	batch::{
 		ExecutionModeHandle, InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest,
 		SpeculativeCall, ToolBatch,
@@ -57,6 +67,26 @@ const EMPTY_OUTPUT_RETRY_DETAIL: &str =
 	"Assistant returned no final output after retry cap; try switching models";
 const CONTROL_DRAIN_LIMIT: usize = 32;
 
+/// Typed settlement of one complete caller submission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[repr(u8)]
+pub enum RunSettlement {
+	/// The assistant completed normally.
+	Success,
+	/// The assistant completed with non-fatal diagnostics.
+	Warning,
+	/// The caller explicitly aborted the submission.
+	CallerAbort,
+	/// Compaction replaced the active context and intentionally produced no
+	/// user-visible answer.
+	SilentCompactionTransition,
+	/// The provider exhausted the output-token budget.
+	MaxTokens,
+	/// The submission ended in a terminal protocol or provider fault.
+	TerminalFault,
+}
+
 /// Terminal result of one complete caller submission, including tool
 /// follow-ups.
 #[derive(Clone, Debug)]
@@ -68,9 +98,52 @@ pub struct AgentRunSummary {
 	pub committed_turns: u32,
 	/// Whether the submission stopped on a caller abort.
 	pub interrupted:     bool,
+	/// Typed terminal classification for host exit and presentation policy.
+	pub settlement:      RunSettlement,
+	final_assistant:     Option<Str>,
 }
 
 impl AgentRunSummary {
+	/// Projects a committed outcome into the authoritative typed settlement.
+	#[must_use]
+	pub fn settled(outcome: Outcome, committed_turns: u32, interrupted: bool) -> Self {
+		run_summary(Some(outcome), committed_turns, interrupted)
+	}
+
+	/// Constructs the typed terminal-fault projection used when `submit`
+	/// returns an error before committing an outcome.
+	#[must_use]
+	pub const fn terminal_fault() -> Self {
+		Self {
+			outcome:         None,
+			committed_turns: 0,
+			interrupted:     false,
+			settlement:      RunSettlement::TerminalFault,
+			final_assistant: None,
+		}
+	}
+
+	/// Constructs an intentional silent compaction transition.
+	#[must_use]
+	pub fn silent_compaction_transition(outcome: Option<Outcome>, committed_turns: u32) -> Self {
+		let final_assistant = outcome.as_ref().and_then(authoritative_assistant);
+		Self {
+			outcome,
+			committed_turns,
+			interrupted: false,
+			settlement: RunSettlement::SilentCompactionTransition,
+			final_assistant,
+		}
+	}
+
+	/// Returns the authoritative assistant text projected from the last
+	/// committed outcome.
+	#[must_use]
+	pub fn final_assistant(&self) -> Option<&str> {
+		self.final_assistant.as_deref()
+	}
+
+	/// Extracts and verbatim-validates the terminal `yield` call from the last
 	/// Extracts and verbatim-validates the terminal `yield` call from the last
 	/// subagent turn.
 	///
@@ -99,6 +172,163 @@ impl AgentRunSummary {
 		Ok(payload)
 	}
 }
+
+fn run_summary(
+	outcome: Option<Outcome>,
+	committed_turns: u32,
+	interrupted: bool,
+) -> AgentRunSummary {
+	let final_assistant = outcome.as_ref().and_then(authoritative_assistant);
+	let settlement = if interrupted {
+		RunSettlement::CallerAbort
+	} else if let Some(outcome) = &outcome {
+		match outcome.stop() {
+			pb::StopReason::StopEndTurn
+				if outcome.diagnostics.is_empty() && outcome.unsupported.is_empty() =>
+			{
+				RunSettlement::Success
+			},
+			pb::StopReason::StopEndTurn => RunSettlement::Warning,
+			pb::StopReason::StopMaxTokens => RunSettlement::MaxTokens,
+			pb::StopReason::StopToolUse => RunSettlement::Warning,
+			pb::StopReason::StopUnspecified | pb::StopReason::StopContentFilter => {
+				RunSettlement::TerminalFault
+			},
+		}
+	} else {
+		RunSettlement::TerminalFault
+	};
+	AgentRunSummary { outcome, committed_turns, interrupted, settlement, final_assistant }
+}
+
+fn authoritative_assistant(outcome: &Outcome) -> Option<Str> {
+	let message = outcome.output.iter().rev().find_map(|item| {
+		let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+			return None;
+		};
+		(message.role() == thread::Role::Assistant).then_some(message)
+	})?;
+	let mut text = String::new();
+	for part in &message.parts {
+		if let Some(thread::part::Kind::Text(value)) = part.kind.as_ref() {
+			text.push_str(value);
+		}
+	}
+	(!text.is_empty()).then(|| Str::from(text))
+}
+
+fn compaction_instruction(text: Str) -> Item {
+	Item {
+		created_at_ms: now_ms(),
+		kind: Some(thread::item::Kind::Message(thread::Message {
+			role:  thread::Role::User as i32,
+			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
+		})),
+		..Default::default()
+	}
+}
+fn append_checkpoint_reminder(input: &mut TurnInput) {
+	let reminder = crate::prompt::checkpoint_active_reminder();
+	match input {
+		TurnInput::Full(thread) => thread.items.push(reminder),
+		TurnInput::Delta(_, delta) => delta.append.push(reminder),
+	}
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) struct ActiveCheckpoint {
+	pub(crate) opaque_token: Str,
+	pub(crate) event:        u64,
+	pub(crate) goal:         Str,
+	pub(crate) started_at:   u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) struct CompletedCheckpoint {
+	pub(crate) opaque_token: Str,
+	pub(crate) goal:         Str,
+	pub(crate) report:       Str,
+	pub(crate) started_at:   u64,
+	pub(crate) rewound_at:   u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CheckpointState {
+	pub(crate) active:           Option<ActiveCheckpoint>,
+	pub(crate) last_completed:   Option<CompletedCheckpoint>,
+	pub(crate) rewind_scheduled: bool,
+}
+
+fn recover_checkpoint_state(journal: &Journal) -> Result<CheckpointState, JournalError> {
+	#[derive(Deserialize)]
+	struct CheckpointRecord {
+		token:      Str,
+		goal:       Str,
+		started_at: u64,
+	}
+	#[derive(Deserialize)]
+	struct RewindRecord {
+		token:      Str,
+		goal:       Str,
+		report:     Str,
+		started_at: u64,
+		rewound_at: u64,
+	}
+
+	let log = journal.load()?;
+	let mut state = CheckpointState::default();
+	for index in log.as_ref().iter() {
+		let Some(Entry::Ok(event)) = log.get(index) else {
+			continue;
+		};
+		let Kind::Custom(custom) = &event.kind else {
+			continue;
+		};
+		match custom.kind() {
+			crate::journal_kinds::CHECKPOINT_KIND => {
+				let Some(data) = custom.data() else {
+					continue;
+				};
+				let Ok(record) = serde_json::from_str::<CheckpointRecord>(data.get()) else {
+					continue;
+				};
+				state.active = Some(ActiveCheckpoint {
+					opaque_token: record.token,
+					event:        index,
+					goal:         record.goal,
+					started_at:   record.started_at,
+				});
+				state.rewind_scheduled = false;
+			},
+			crate::journal_kinds::REWIND_REPORT_KIND => {
+				let Some(data) = custom.data() else {
+					continue;
+				};
+				let Ok(record) = serde_json::from_str::<RewindRecord>(data.get()) else {
+					continue;
+				};
+				if state
+					.active
+					.as_ref()
+					.is_some_and(|active| active.opaque_token == record.token)
+				{
+					state.active = None;
+				}
+				state.last_completed = Some(CompletedCheckpoint {
+					opaque_token: record.token,
+					goal:         record.goal,
+					report:       record.report,
+					started_at:   record.started_at,
+					rewound_at:   record.rewound_at,
+				});
+				state.rewind_scheduled = false;
+			},
+			_ => {},
+		}
+	}
+	Ok(state)
+}
+
 /// A live user message that can be rewound and edited.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewindTarget {
@@ -120,9 +350,18 @@ pub enum AgentError {
 	/// Canonical thread projection failed.
 	#[error(transparent)]
 	Projection(#[from] ProjectionError),
+	/// Snapcompact framing or savings admission failed.
+	#[error(transparent)]
+	Snapcompact(#[from] omp_snapcompact::archive::ArchiveError),
+	/// Durable blob placement failed before a journal commit.
+	#[error(transparent)]
+	Blob(#[from] omp_storage::blob::Error),
 	/// Deterministic prompt rendering failed.
 	#[error(transparent)]
 	Prompt(#[from] PromptError),
+	/// Live history serialization failed.
+	#[error(transparent)]
+	LiveHistory(#[from] serde_json::Error),
 	/// Gateway turn failed.
 	#[error(transparent)]
 	Turn(#[from] TurnError),
@@ -168,6 +407,52 @@ impl AbortHandle {
 	}
 }
 
+/// Host activity assertion scoped to an active inference/tool run.
+pub trait RunActivity: Send + Sync + 'static {
+	/// Acquires the host activity assertion.
+	fn enter(&self);
+	/// Releases the host activity assertion.
+	fn exit(&self);
+}
+
+struct RunActivityGuard(Arc<dyn RunActivity>);
+
+type TurnCompletion =
+	(Outcome, BTreeMap<Str, SpeculativeCall>, Option<String>, Arc<crate::AgentSnapshot>, Arc<[Str]>);
+
+enum RunTurnResult {
+	Complete(TurnCompletion),
+	Ttsr(TtsrTrigger),
+}
+
+struct TtsrTrigger {
+	matches: Vec<TtsrMatch>,
+	source:  TtsrSource,
+}
+
+struct DeferredTtsr {
+	matched: TtsrMatch,
+	source:  TtsrSource,
+}
+
+struct TtsrPartState {
+	source:     TtsrSource,
+	tool_name:  Option<Str>,
+	stream_key: Str,
+	arguments:  String,
+}
+
+enum DriveSessionResult {
+	Complete(Outcome, BTreeMap<Str, SpeculativeCall>),
+	Ttsr(TtsrTrigger),
+}
+
+impl Drop for RunActivityGuard {
+	fn drop(&mut self) {
+		self.0.exit();
+	}
+}
+
 /// Durable agent loop composed from transport-neutral Phase 1 foundations.
 pub struct Agent<C: TurnClient> {
 	client: C,
@@ -182,6 +467,7 @@ pub struct Agent<C: TurnClient> {
 	invocation_fact_rx: flume::Receiver<InvocationAdmissionFact>,
 	control_tx: ControlSender,
 	control_mailbox: ControlMailbox,
+	checkpoint_state: Arc<Mutex<CheckpointState>>,
 	pending_rewinds: VecDeque<ScheduledRewind>,
 	mailbox: Mailbox,
 	jobs: Arc<JobBoard>,
@@ -200,6 +486,12 @@ pub struct Agent<C: TurnClient> {
 	loop_signal: LoopSignal,
 	last_toolset_hash: Option<Hash32>,
 	firehose: Arc<Firehose>,
+	run_activity: Option<Arc<dyn RunActivity>>,
+	secret_obfuscator: Option<Arc<Mutex<SecretObfuscator>>>,
+	compaction: CompactionCoordinator,
+	blob_store: Option<BlobStore>,
+	ttsr: Option<TtsrRegistry>,
+	deferred_ttsr: Vec<DeferredTtsr>,
 }
 
 impl<C: TurnClient> Agent<C> {
@@ -218,6 +510,7 @@ impl<C: TurnClient> Agent<C> {
 		let (hook_bus, hook_requests) = InvocationHookBus::channel();
 		let (invocation_fact_tx, invocation_fact_rx) = flume::unbounded();
 		let (control_tx, control_mailbox) = crate::control::channel();
+		let checkpoint_state = control_tx.checkpoint_state();
 		let mut context = None;
 		let mut prompt_hash = None;
 		let mut prompt_head_events = Vec::new();
@@ -252,6 +545,9 @@ impl<C: TurnClient> Agent<C> {
 			prompt_hash = Some(hash.into());
 			prompt_head_events = head_events.to_vec();
 		}
+		if let Ok(recovered) = recover_checkpoint_state(&journal) {
+			*checkpoint_state.lock() = recovered;
+		}
 		Self {
 			client,
 			env,
@@ -265,6 +561,7 @@ impl<C: TurnClient> Agent<C> {
 			invocation_fact_rx,
 			control_tx,
 			control_mailbox,
+			checkpoint_state,
 			pending_rewinds: VecDeque::new(),
 			mailbox,
 			jobs,
@@ -283,6 +580,12 @@ impl<C: TurnClient> Agent<C> {
 			loop_signal: LoopSignal::default(),
 			firehose: Arc::new(Firehose::new()),
 			last_toolset_hash,
+			run_activity: None,
+			secret_obfuscator: None,
+			compaction: CompactionCoordinator::default(),
+			blob_store: None,
+			ttsr: None,
+			deferred_ttsr: Vec::new(),
 		}
 	}
 
@@ -299,6 +602,13 @@ impl<C: TurnClient> Agent<C> {
 	/// Returns a producer for asynchronous steering and settlement items.
 	pub fn mailbox(&self) -> MailboxSender {
 		self.mailbox.sender()
+	}
+
+	/// Returns the environment authority used for out-of-band live execution
+	/// control.
+	#[must_use]
+	pub fn environment(&self) -> EnvClient {
+		self.env.clone()
 	}
 
 	/// Returns the CONTROL-side receiver for invocation hook handoffs.
@@ -352,6 +662,12 @@ impl<C: TurnClient> Agent<C> {
 		self.firehose = firehose;
 	}
 
+	/// Installs the session-local secret transform used only for model-authored
+	/// tool arguments.
+	pub fn set_secret_obfuscator(&mut self, obfuscator: Arc<Mutex<SecretObfuscator>>) {
+		self.secret_obfuscator = Some(obfuscator);
+	}
+
 	/// Returns the shared non-blocking telemetry fan-out handle.
 	#[must_use]
 	pub fn firehose(&self) -> Arc<Firehose> {
@@ -373,10 +689,194 @@ impl<C: TurnClient> Agent<C> {
 		&self.journal
 	}
 
+	/// Installs the app-owned content-addressed store used by durable bitmap
+	/// compaction. The app is the DI boundary; agent code never opens host
+	/// paths.
+	pub fn set_blob_store(&mut self, blob_store: BlobStore) {
+		self.blob_store = Some(blob_store);
+	}
+
+	/// Executes and durably commits a one-off manual compaction.
+	///
+	/// Local and remote modes use an isolated model-driven summarization turn.
+	/// Remote mode requests the provider's compaction behavior first and falls
+	/// back to the same portable summary contract. Snapcompact renders locally,
+	/// puts source and PNG bytes into the injected `BlobStore`, then appends the
+	/// only journal reference after every put succeeds.
+	pub async fn compact_manual(
+		&mut self,
+		request: ManualCompactionRequest,
+	) -> Result<ManualCompactionOutcome, AgentError> {
+		if self.journal.pending_turn().is_some() {
+			return Err(AgentError::Protocol("cannot compact while a turn is pending"));
+		}
+		let decision = self
+			.compaction
+			.begin_manual(request, &CompactionMethodOrder::default());
+		let method = decision
+			.order
+			.as_slice()
+			.first()
+			.copied()
+			.ok_or(AgentError::Protocol("manual compaction has no available method"))?;
+		let live_events = self.journal.live_item_events()?;
+		let live_items = self.journal.items_at(&live_events)?;
+		if live_items.len() < 2 {
+			return Err(AgentError::Protocol("nothing to compact"));
+		}
+		let item_bytes = live_items
+			.iter()
+			.map(serde_json::to_vec)
+			.collect::<Result<Vec<_>, _>>()?;
+		let mut suffix_bytes = 0usize;
+		let mut prefix_end = live_items.len();
+		for (index, bytes) in item_bytes.iter().enumerate().rev() {
+			if suffix_bytes >= (PROMPT_CACHE_WARM_SUFFIX_TOKENS as usize).saturating_mul(4) {
+				break;
+			}
+			prefix_end = index;
+			suffix_bytes = suffix_bytes.saturating_add(bytes.len());
+		}
+		if prefix_end == 0 {
+			prefix_end = live_items.len() - 1;
+			suffix_bytes = item_bytes[prefix_end].len();
+		}
+		let first_kept = live_events[prefix_end];
+		let prefix_bytes = item_bytes[..prefix_end]
+			.iter()
+			.fold(0usize, |sum, bytes| sum.saturating_add(bytes.len()));
+		let total_bytes = prefix_bytes.saturating_add(suffix_bytes);
+		let tokens_before = u64::try_from(total_bytes.div_ceil(4)).unwrap_or(u64::MAX);
+		let source_tokens = u64::try_from(prefix_bytes.div_ceil(4)).unwrap_or(u64::MAX);
+		let mode = match method {
+			crate::CompactionTier::Local => ManualCompactionMode::Soft,
+			crate::CompactionTier::Remote => ManualCompactionMode::Remote,
+			crate::CompactionTier::Snapcompact => ManualCompactionMode::Snapcompact,
+			crate::CompactionTier::Prune
+			| crate::CompactionTier::DropMedia
+			| crate::CompactionTier::Elide
+			| crate::CompactionTier::Handoff => {
+				return Err(AgentError::Protocol("unsupported manual compaction method"));
+			},
+		};
+
+		let compact = if mode == ManualCompactionMode::Snapcompact {
+			let source = serde_json::to_string(&live_items[..prefix_end])?;
+			let model = self.state.snapshot().turn.params.model.clone();
+			let preparation = SnapcompactPreparation {
+				text: Str::from(source),
+				source_tokens,
+				provider: None,
+				api: None,
+				model_id: Some(Str::from(model)),
+				existing_images: 0,
+				first_kept,
+				tokens_before,
+			};
+			let mut rendered = crate::execute_snapcompact(&preparation)?;
+			let store = self
+				.blob_store
+				.as_ref()
+				.ok_or(AgentError::Protocol("snapcompact blob store is not configured"))?;
+			let source_ref = store.put(preparation.text.as_bytes())?;
+			let mut frame_refs = Vec::with_capacity(rendered.archive.frames.len());
+			for frame in &rendered.archive.frames {
+				frame_refs.push(store.put(&frame.png)?);
+			}
+			let shape = rendered.archive.frames.first().map_or_else(
+				|| sf!("empty"),
+				|frame| {
+					sf!(
+						"{}:{}x{}:{}:{}",
+						frame.shape.font,
+						frame.shape.cell_width,
+						frame.shape.cell_height,
+						frame.shape.variant,
+						frame.shape.frame_size
+					)
+				},
+			);
+			rendered.compact.snapcompact = Some(SnapcompactArchive {
+				source: source_ref,
+				frames: frame_refs,
+				source_tokens: rendered.archive.savings.source_tokens,
+				image_tokens: rendered.archive.savings.image_tokens,
+				png_bytes: u64::try_from(rendered.archive.savings.png_bytes).unwrap_or(u64::MAX),
+				truncated_chars: u64::try_from(rendered.archive.truncated_chars).unwrap_or(u64::MAX),
+				shape,
+			});
+			rendered.compact
+		} else {
+			let mut thread = Thread { items: live_items[..prefix_end].to_vec(), ..Default::default() };
+			let focus = decision.focus.as_deref().unwrap_or(
+				"Preserve decisions, completed work, open tasks, paths, commands, errors, and \
+				 constraints.",
+			);
+			let remote = mode == ManualCompactionMode::Remote;
+			let instruction = if remote {
+				sf!(
+					"Produce a portable provider-compaction summary of the preceding conversation. \
+					 Focus: {focus}"
+				)
+			} else {
+				sf!("Summarize the preceding conversation for context continuation. Focus: {focus}")
+			};
+			thread.items.push(compaction_instruction(instruction));
+			let snapshot = self.state.snapshot();
+			let mut options = snapshot.turn.clone();
+			options.context_id = None;
+			options.executor = None;
+			options.params.tools.clear();
+			let registry = Arc::new(ToolRegistry::new());
+			drop(snapshot);
+			let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
+			let result = self
+				.drive_session(
+					turn_id,
+					TurnInput::Full(thread),
+					&options,
+					registry,
+					Arc::from([]),
+					false,
+				)
+				.await?;
+			let DriveSessionResult::Complete(outcome, _) = result else {
+				return Err(AgentError::Protocol("hidden compaction stream was interrupted"));
+			};
+			let summary = authoritative_assistant(&outcome)
+				.ok_or(AgentError::Protocol("compaction summarizer returned no text"))?;
+			let summary_tokens = u64::try_from(summary.len().div_ceil(4)).unwrap_or(u64::MAX);
+			crate::journal::Compact {
+				summary,
+				short: None,
+				first_kept,
+				tokens_before,
+				tokens_after: Some(
+					summary_tokens
+						.saturating_add(u64::try_from(suffix_bytes.div_ceil(4)).unwrap_or(u64::MAX)),
+				),
+				method: Some(Str::from(mode.to_string())),
+				warning: None,
+				snapcompact: None,
+				superseded: Vec::new(),
+			}
+		};
+		let tokens_after = compact.tokens_after.unwrap_or(tokens_before);
+		let frame_count = compact
+			.snapcompact
+			.as_ref()
+			.map_or(0, |archive| archive.frames.len());
+		let event = self.journal.compact(now_ms(), compact)?;
+		self.context = None;
+		self.prompt_hash = None;
+		self.prompt_head_events.clear();
+		Ok(ManualCompactionOutcome { method: mode, event, tokens_before, tokens_after, frame_count })
+	}
+
 	/// Rewinds the durable session to a live prefix and returns the fresh
 	/// projection.
 	pub fn rewind(&mut self, to: Option<u64>) -> Result<Vec<Item>, AgentError> {
-		let event = self.journal.rewind(now_ms(), to)?;
+		let event = self.journal.truncate_to(now_ms(), to)?;
 		self.firehose.publish(FirehoseEvent::Branch(Branch {
 			envelope:   telemetry_envelope(),
 			op:         Some(BranchOp::Switch),
@@ -388,6 +888,7 @@ impl<C: TurnClient> Agent<C> {
 		self.prompt_hash = None;
 		self.prompt_head_events.clear();
 		self.last_toolset_hash = None;
+		*self.checkpoint_state.lock() = recover_checkpoint_state(&self.journal)?;
 		let journal = self.journal.load()?;
 		let projected = project_journal(
 			&journal,
@@ -520,6 +1021,7 @@ impl<C: TurnClient> Agent<C> {
 			}
 			(pending_indexes, root_turn_id)
 		};
+		self.publish_live_history()?;
 		let mut committed_turns = 0_u32;
 		let mut last_outcome = None;
 		let mut empty_output_retries = if continuing_recovery {
@@ -538,9 +1040,27 @@ impl<C: TurnClient> Agent<C> {
 			let turn = self.run_turn(turn_id.clone(), pending_indexes).await;
 			let (outcome, mut speculative, submitted_context_id, snapshot, enabled_tools) = match turn
 			{
-				Ok(turn) => {
+				Ok(RunTurnResult::Complete(turn)) => {
 					empty_output_retries = 0;
 					turn
+				},
+				Ok(RunTurnResult::Ttsr(trigger)) => {
+					self
+						.journal
+						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Continue)?;
+					self.context = None;
+					let next_turn_id = follow_up_id(&turn_id, committed_turns);
+					let reminder_text = ttsr_reminder_text(&trigger.matches);
+					let reminder = ttsr_reminder_item(reminder_text.clone());
+					self.record_ttsr_injection(
+						turn_id.as_str(),
+						trigger.source,
+						&trigger.matches,
+						reminder_text.as_str(),
+					)?;
+					pending_indexes = self.append_pending(&next_turn_id, [reminder])?;
+					turn_id = next_turn_id;
+					continue;
 				},
 				Err(AgentError::Interrupted) => {
 					self
@@ -567,11 +1087,7 @@ impl<C: TurnClient> Agent<C> {
 					if self.control_serviced_during_turn {
 						return Err(AgentError::Interrupted);
 					}
-					return Ok(AgentRunSummary {
-						outcome: last_outcome,
-						committed_turns,
-						interrupted: true,
-					});
+					return Ok(run_summary(last_outcome, committed_turns, true));
 				},
 				Err(AgentError::Turn(TurnError::Terminal(mut error)))
 					if pb::turn_error::Kind::try_from(error.kind)
@@ -618,6 +1134,7 @@ impl<C: TurnClient> Agent<C> {
 			});
 
 			self.events.publish(AgentEvent::Snapshot(snapshot.clone()));
+			self.publish_live_history()?;
 			self.drain_control();
 			let mut immediate = self
 				.mailbox
@@ -642,7 +1159,11 @@ impl<C: TurnClient> Agent<C> {
 				}
 				tokio::task::yield_now().await;
 				self.drain_invocation_facts()?;
-				let calls = match committed_calls(&outcome.output, &mut speculative) {
+				let calls = match committed_calls(
+					&outcome.output,
+					&mut speculative,
+					self.secret_obfuscator.as_ref(),
+				) {
 					Ok(calls) => calls,
 					Err(error) => {
 						immediate.append(&mut boundary);
@@ -764,16 +1285,15 @@ impl<C: TurnClient> Agent<C> {
 						}
 					}
 				}
+				if let Some(reminder) = self.take_deferred_ttsr(turn_id.as_str())? {
+					next.insert(0, reminder);
+				}
 				self
 					.loop_signal
 					.observe(call_digest, made_environment_effect, empty_output_retries);
 				if self.execute_scheduled_rewinds()? {
 					self.transition(AgentPhase::Idle);
-					return Ok(AgentRunSummary {
-						outcome: Some(outcome),
-						committed_turns,
-						interrupted: false,
-					});
+					return Ok(run_summary(Some(outcome), committed_turns, false));
 				}
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
 				pending_indexes = self.append_pending(&next_turn_id, next)?;
@@ -793,11 +1313,7 @@ impl<C: TurnClient> Agent<C> {
 						continue;
 					}
 					self.transition(AgentPhase::Idle);
-					return Ok(AgentRunSummary {
-						outcome: Some(outcome),
-						committed_turns,
-						interrupted: true,
-					});
+					return Ok(run_summary(Some(outcome), committed_turns, true));
 				}
 				last_outcome = Some(outcome);
 				turn_id = next_turn_id;
@@ -809,16 +1325,20 @@ impl<C: TurnClient> Agent<C> {
 			self.drain_control();
 			if self.execute_scheduled_rewinds()? {
 				self.transition(AgentPhase::Idle);
-				return Ok(AgentRunSummary {
-					outcome: Some(outcome),
-					committed_turns,
-					interrupted: false,
-				});
+				return Ok(run_summary(Some(outcome), committed_turns, false));
 			}
 			let mut idle = self
 				.mailbox
 				.drain(DrainPoint::Idle, snapshot.defer_interrupts);
 			boundary.append(&mut idle);
+			if let Some(reminder) = self.take_deferred_ttsr(turn_id.as_str())? {
+				let next_turn_id = follow_up_id(&turn_id, committed_turns);
+				pending_indexes = self.append_pending(&next_turn_id, [reminder])?;
+				pending_indexes.extend(self.stage_interrupts(&next_turn_id, boundary)?);
+				last_outcome = Some(outcome);
+				turn_id = next_turn_id;
+				continue;
+			}
 			if !boundary.is_empty() {
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
 				pending_indexes = self.stage_interrupts(&next_turn_id, boundary)?;
@@ -854,12 +1374,21 @@ impl<C: TurnClient> Agent<C> {
 					turn:     u64::from(committed_turns),
 					outcome:  None,
 				})));
-			return Ok(AgentRunSummary {
-				outcome: Some(outcome),
-				committed_turns,
-				interrupted: false,
-			});
+			return Ok(run_summary(Some(outcome), committed_turns, false));
 		}
+	}
+
+	/// Publishes the current canonical live item projection for `history://`.
+	fn publish_live_history(&self) -> Result<(), AgentError> {
+		let events = self.journal.live_item_events()?;
+		let items = self.journal.items_at(&events)?;
+		let mut bytes = Vec::new();
+		for item in items {
+			serde_json::to_writer(&mut bytes, &item)?;
+			bytes.push(b'\n');
+		}
+		let _ = AgentRegistry::global().set_live_history(self.journal.session_id().0.as_str(), bytes);
+		Ok(())
 	}
 
 	/// Publishes post-hoc inference facts without participating in durable
@@ -901,7 +1430,7 @@ impl<C: TurnClient> Agent<C> {
 
 	fn append_pending(
 		&mut self,
-		turn_id: &TurnId,
+		turn_id: &TurnId<str>,
 		items: impl IntoIterator<Item = Item>,
 	) -> Result<Vec<u64>, AgentError> {
 		let ts = now_ms();
@@ -919,7 +1448,7 @@ impl<C: TurnClient> Agent<C> {
 	/// Runs the settled-boundary domain hook and converts an accepted decision
 	/// into a normal mailbox interrupt so `defer_interrupts` remains
 	/// authoritative.
-	async fn settled_continuation(&mut self, turn_id: &TurnId) -> Option<crate::Interrupt> {
+	async fn settled_continuation(&mut self, turn_id: &TurnId<str>) -> Option<crate::Interrupt> {
 		let now = now_ms();
 		let (mut candidate, mut policy) = self
 			.continuation_source
@@ -951,7 +1480,7 @@ impl<C: TurnClient> Agent<C> {
 
 	fn stage_interrupts(
 		&mut self,
-		turn_id: &TurnId,
+		turn_id: &TurnId<str>,
 		interrupts: impl IntoIterator<Item = crate::Interrupt>,
 	) -> Result<Vec<u64>, AgentError> {
 		let ts = now_ms();
@@ -974,21 +1503,27 @@ impl<C: TurnClient> Agent<C> {
 		Ok(indexes)
 	}
 
+	/// Installs the compiled stream-rule generation used by subsequent turns.
+	pub fn set_ttsr_registry(&mut self, registry: TtsrRegistry) {
+		self.ttsr = Some(registry);
+		self.deferred_ttsr.clear();
+	}
+
+	/// Installs a host activity assertion acquired only while a turn is active.
+	pub fn set_run_activity(&mut self, activity: Arc<dyn RunActivity>) {
+		self.run_activity = Some(activity);
+	}
+
 	async fn run_turn(
 		&mut self,
 		turn_id: TurnId,
 		pending: Vec<u64>,
-	) -> Result<
-		(
-			Outcome,
-			BTreeMap<Str, SpeculativeCall>,
-			Option<String>,
-			Arc<crate::AgentSnapshot>,
-			Arc<[Str]>,
-		),
-		AgentError,
-	> {
+	) -> Result<RunTurnResult, AgentError> {
 		self.control_serviced_during_turn = false;
+		let _activity = self.run_activity.as_ref().map(|activity| {
+			activity.enter();
+			RunActivityGuard(Arc::clone(activity))
+		});
 		let snapshot = self.state.snapshot();
 		let durable = self
 			.journal
@@ -1092,10 +1627,11 @@ impl<C: TurnClient> Agent<C> {
 		let frozen_options = durable.as_ref().map_or_else(
 			|| snapshot.turn.clone(),
 			|start| crate::TurnOptions {
-				context_id: start.options.context_id.clone(),
-				params:     start.options.params.clone(),
-				executor:   start.options.executor.clone(),
-				props:      start.options.props.clone(),
+				context_id:     start.options.context_id.clone(),
+				params:         start.options.params.clone(),
+				executor:       start.options.executor.clone(),
+				props:          start.options.props.clone(),
+				provider_reset: snapshot.turn.provider_reset,
 			},
 		);
 		let lifted_reseed = if changed_toolset {
@@ -1139,6 +1675,11 @@ impl<C: TurnClient> Agent<C> {
 				};
 				TurnInput::Delta(held, ThreadDelta { truncate_to, append })
 			};
+			let mut provider_input = input.clone();
+			let reminder_appended = self.checkpoint_state.lock().active.is_some();
+			if reminder_appended {
+				append_checkpoint_reminder(&mut provider_input);
+			}
 			let start = TurnStart {
 				turn_id: turn_id.as_str().to_str(),
 				item_events: input_events.clone(),
@@ -1160,7 +1701,7 @@ impl<C: TurnClient> Agent<C> {
 					props:      frozen_options.props.clone(),
 				},
 			};
-			let expected_head = match &input {
+			let expected_head = match &provider_input {
 				TurnInput::Delta(context, delta) => {
 					let expected = context
 						.expected
@@ -1188,21 +1729,22 @@ impl<C: TurnClient> Agent<C> {
 			self.journal.start_turn(now_ms(), start)?;
 			self.transition(AgentPhase::Turning);
 			attempts = attempts.saturating_add(1);
-			let submitted_context_id = match &input {
+			let submitted_context_id = match &provider_input {
 				TurnInput::Full(_) => frozen_options.context_id.as_ref().map(ToString::to_string),
 				TurnInput::Delta(context, _) => Some(context.context_id.clone()),
 			};
-			let stateful = matches!(&input, TurnInput::Delta(..))
-				|| matches!(&input, TurnInput::Full(_) if frozen_options.context_id.is_some());
+			let stateful = matches!(&provider_input, TurnInput::Delta(..))
+				|| matches!(&provider_input, TurnInput::Full(_) if frozen_options.context_id.is_some());
 
 			let selected = {
 				let mut abort_rx = self.abort_rx.clone();
 				let session = self.drive_session(
 					turn_id.clone(),
-					input,
+					provider_input,
 					&frozen_options,
 					Arc::clone(&snapshot.registry),
 					Arc::clone(&frozen_enabled_tools),
+					true,
 				);
 				tokio::pin!(session);
 				tokio::select! {
@@ -1214,7 +1756,7 @@ impl<C: TurnClient> Agent<C> {
 			self.drain_invocation_facts()?;
 			let session_result = selected?;
 			match session_result {
-				Ok((outcome, speculative)) => {
+				Ok(DriveSessionResult::Complete(outcome, speculative)) => {
 					validate_outcome(&outcome)?;
 					if stateful && outcome.revision.is_none() {
 						return Err(AgentError::Protocol("stateful outcome missing revision"));
@@ -1237,16 +1779,31 @@ impl<C: TurnClient> Agent<C> {
 						turn_id.as_str(),
 						outcome.clone(),
 					)?;
+					if frozen_options.provider_reset {
+						self
+							.state
+							.update(|snapshot| snapshot.turn.provider_reset = false);
+					}
 					self.record_committed_invocations(&outcome, &speculative, &receipt)?;
-					self.patch_input_sequences(&sequence_targets, &outcome)?;
+					self.patch_input_sequences(
+						&sequence_targets,
+						u64::from(reminder_appended),
+						&outcome,
+					)?;
 					self.last_toolset_hash = Some(toolset_hash);
-					return Ok((
+					if let Some(ttsr) = self.ttsr.as_mut() {
+						ttsr.advance_message();
+					}
+					return Ok(RunTurnResult::Complete((
 						outcome,
 						speculative,
 						submitted_context_id,
 						snapshot.clone(),
 						Arc::clone(&frozen_enabled_tools),
-					));
+					)));
+				},
+				Ok(DriveSessionResult::Ttsr(trigger)) => {
+					return Ok(RunTurnResult::Ttsr(trigger));
 				},
 				Err(TurnError::Conflict(error)) => {
 					if attempts >= latest.retry.max_attempts().get() {
@@ -1298,6 +1855,99 @@ impl<C: TurnClient> Agent<C> {
 		}
 	}
 
+	fn check_ttsr_delta(
+		ttsr: &mut Option<TtsrRegistry>,
+		deferred_ttsr: &mut Vec<DeferredTtsr>,
+		state: &mut TtsrPartState,
+		fragment: &str,
+	) -> Option<TtsrTrigger> {
+		let ttsr = ttsr.as_mut()?;
+		let mut paths = Vec::new();
+		let mut snapshot = None;
+		if state.source == TtsrSource::Tool {
+			state.arguments.push_str(fragment);
+			let parsed = omp_slopjson::parse_streaming(state.arguments.as_str());
+			collect_ttsr_paths(&parsed, &mut paths);
+			snapshot = Some(tool_matcher_snapshot(&parsed, state.arguments.as_str()));
+		}
+		let path_refs = paths.iter().map(Str::as_str).collect::<Vec<_>>();
+		let context = TtsrMatchContext {
+			source:     state.source,
+			tool_name:  state.tool_name.as_ref().map(Str::as_str),
+			file_paths: path_refs.as_slice(),
+			stream_key: Some(state.stream_key.as_str()),
+		};
+		let mut matches = if let Some(snapshot) = snapshot.as_deref() {
+			ttsr.check_snapshot(snapshot, context).into_vec()
+		} else {
+			ttsr.check_delta(fragment, context).into_vec()
+		};
+		if let Some(snapshot) = snapshot.as_deref()
+			&& ttsr.has_ast_rules()
+			&& let Ok(ast_matches) = ttsr.check_ast_snapshot(snapshot, context)
+		{
+			for matched in ast_matches {
+				if !matches.iter().any(|present| present.name == matched.name) {
+					matches.push(matched);
+				}
+			}
+		}
+		if matches.is_empty() {
+			return None;
+		}
+		if matches
+			.iter()
+			.any(|matched| matched.interrupt_mode.interrupts(state.source))
+		{
+			return Some(TtsrTrigger { matches, source: state.source });
+		}
+		for matched in matches {
+			if deferred_ttsr
+				.iter()
+				.any(|present| present.matched.name == matched.name)
+			{
+				continue;
+			}
+			deferred_ttsr.push(DeferredTtsr { matched, source: state.source });
+		}
+		None
+	}
+
+	fn record_ttsr_injection(
+		&mut self,
+		turn_id: &str,
+		source: TtsrSource,
+		matches: &[TtsrMatch],
+		content: &str,
+	) -> Result<(), AgentError> {
+		let names = matches
+			.iter()
+			.map(|matched| matched.name.clone())
+			.collect::<Vec<_>>();
+		self
+			.journal
+			.append_ttsr_injection(now_ms(), turn_id, source, &names, content)?;
+		if let Some(ttsr) = self.ttsr.as_mut() {
+			ttsr.mark_injected(names.iter().map(Str::as_str));
+		}
+		Ok(())
+	}
+
+	fn take_deferred_ttsr(&mut self, turn_id: &str) -> Result<Option<Item>, AgentError> {
+		if self.deferred_ttsr.is_empty() {
+			return Ok(None);
+		}
+		let deferred = std::mem::take(&mut self.deferred_ttsr);
+		let source = deferred[0].source;
+		let matches = deferred
+			.into_iter()
+			.map(|entry| entry.matched)
+			.collect::<Vec<_>>();
+		let text = ttsr_reminder_text(&matches);
+		self.record_ttsr_injection(turn_id, source, &matches, text.as_str())?;
+		Ok(Some(ttsr_reminder_item(text)))
+	}
+
 	async fn drive_session(
 		&mut self,
 		turn_id: TurnId,
@@ -1305,7 +1955,8 @@ impl<C: TurnClient> Agent<C> {
 		options: &crate::TurnOptions,
 		registry: Arc<ToolRegistry>,
 		enabled_tools: Arc<[Str]>,
-	) -> Result<(Outcome, BTreeMap<Str, SpeculativeCall>), TurnError> {
+		enforce_ttsr: bool,
+	) -> Result<DriveSessionResult, TurnError> {
 		let opening = self.client.turn(turn_id.clone(), input, options);
 		tokio::pin!(opening);
 		let mut session = loop {
@@ -1327,8 +1978,12 @@ impl<C: TurnClient> Agent<C> {
 			self.caps,
 			runtime_duration(INTERRUPT_GRACE),
 		);
+		if enforce_ttsr && let Some(ttsr) = self.ttsr.as_mut() {
+			ttsr.reset_streams();
+		}
 		let mut speculative = BTreeMap::new();
 		let mut part_calls: BTreeMap<u32, Str> = BTreeMap::new();
+		let mut ttsr_parts: BTreeMap<u32, TtsrPartState> = BTreeMap::new();
 		loop {
 			let event = if duplex.is_empty() {
 				let mut events = session.events();
@@ -1388,11 +2043,27 @@ impl<C: TurnClient> Agent<C> {
 			});
 			match event.event {
 				Some(pb::turn_event::Event::Outcome(outcome)) => {
-					return Ok((outcome, speculative));
+					return Ok(DriveSessionResult::Complete(outcome, speculative));
 				},
-				Some(pb::turn_event::Event::PartStart(part))
-					if part.kind() == pb::part_start::Kind::ToolCall =>
-				{
+				Some(pb::turn_event::Event::PartStart(part)) => {
+					let source = match part.kind() {
+						pb::part_start::Kind::Text => Some(TtsrSource::Text),
+						pb::part_start::Kind::Thinking => Some(TtsrSource::Thinking),
+						pb::part_start::Kind::ToolCall => Some(TtsrSource::Tool),
+						pb::part_start::Kind::Unspecified => None,
+					};
+					if enforce_ttsr && let Some(source) = source {
+						ttsr_parts.insert(part.index, TtsrPartState {
+							source,
+							tool_name: (source == TtsrSource::Tool)
+								.then(|| Str::new(part.tool_name.as_str())),
+							stream_key: sf!("part:{}:{}", part.index, source),
+							arguments: String::new(),
+						});
+					}
+					if part.kind() != pb::part_start::Kind::ToolCall {
+						continue;
+					}
 					if !enabled_tools
 						.iter()
 						.any(|name| name.as_str() == part.tool_name)
@@ -1439,9 +2110,18 @@ impl<C: TurnClient> Agent<C> {
 					part_calls.insert(part.index, call_id);
 				},
 				Some(pb::turn_event::Event::PartDelta(part)) => {
+					let fragment = std::str::from_utf8(&part.chunk)
+						.map_err(|_| TurnError::Protocol("stream fragment is not UTF-8"))?;
+					if let Some(state) = ttsr_parts.get_mut(&part.index)
+						&& let Some(trigger) = Self::check_ttsr_delta(
+							&mut self.ttsr,
+							&mut self.deferred_ttsr,
+							state,
+							fragment,
+						) {
+						return Ok(DriveSessionResult::Ttsr(trigger));
+					}
 					if let Some(call_id) = part_calls.get(&part.index) {
-						let fragment = std::str::from_utf8(&part.chunk)
-							.map_err(|_| TurnError::Protocol("tool argument fragment is not UTF-8"))?;
 						speculative
 							.get_mut(call_id)
 							.expect("part call owns speculation")
@@ -1452,6 +2132,7 @@ impl<C: TurnClient> Agent<C> {
 				},
 				Some(pb::turn_event::Event::PartEnd(part)) => {
 					part_calls.remove(&part.index);
+					ttsr_parts.remove(&part.index);
 				},
 				Some(pb::turn_event::Event::Invoke(invoke)) => duplex.start(invoke),
 				Some(pb::turn_event::Event::InvokeCancel(cancel)) => {
@@ -1500,7 +2181,8 @@ impl<C: TurnClient> Agent<C> {
 				self.invocation_fact_tx.clone(),
 				maximum_effects,
 			)?;
-			let fragment = std::str::from_utf8(&call.args_json)
+			let restored = restored_argument_bytes(&call.args_json, self.secret_obfuscator.as_ref())?;
+			let fragment = std::str::from_utf8(&restored)
 				.map_err(|_| AgentError::Protocol("tool arguments are not UTF-8"))?;
 			opened.relay_fragment(fragment.to_str()).await?;
 			speculative.insert(call.id.as_str().to_str(), opened);
@@ -1518,9 +2200,18 @@ impl<C: TurnClient> Agent<C> {
 
 	fn execute_scheduled_rewinds(&mut self) -> Result<bool, AgentError> {
 		let mut executed = false;
-		while let Some(ScheduledRewind { target, scope }) = self.pending_rewinds.pop_front() {
-			drop(scope);
+		while let Some(ScheduledRewind { token, target, report, goal, started_at }) =
+			self.pending_rewinds.pop_front()
+		{
 			self.rewind(Some(target))?;
+			let rewound_at = now_ms();
+			self.journal.rewind_report(
+				token.as_str(),
+				goal.as_str(),
+				report.as_str(),
+				started_at,
+				rewound_at,
+			)?;
 			if !self.jobs.is_empty() {
 				self.journal.append_optimistic(
 					now_ms(),
@@ -1528,6 +2219,22 @@ impl<C: TurnClient> Agent<C> {
 					self.prompt_hash,
 				)?;
 			}
+			let mut state = self.checkpoint_state.lock();
+			if state
+				.active
+				.as_ref()
+				.is_some_and(|active| active.opaque_token == token)
+			{
+				state.active = None;
+				state.last_completed = Some(CompletedCheckpoint {
+					opaque_token: token,
+					goal,
+					report,
+					started_at,
+					rewound_at,
+				});
+			}
+			state.rewind_scheduled = false;
 			executed = true;
 		}
 		Ok(executed)
@@ -1536,6 +2243,7 @@ impl<C: TurnClient> Agent<C> {
 	fn patch_input_sequences(
 		&mut self,
 		inputs: &[u64],
+		transient_inputs: u64,
 		outcome: &Outcome,
 	) -> Result<(), AgentError> {
 		let Some(revision) = outcome.revision.as_ref() else {
@@ -1548,10 +2256,12 @@ impl<C: TurnClient> Agent<C> {
 			.checked_sub(output_len)
 			.ok_or(AgentError::Protocol("outcome exceeds revision"))?
 			+ 1;
+		let input_count = u64::try_from(inputs.len())
+			.map_err(|_| AgentError::Protocol("input too large"))?
+			.checked_add(transient_inputs)
+			.ok_or(AgentError::Protocol("input count overflow"))?;
 		let first_input = first_output
-			.checked_sub(
-				u64::try_from(inputs.len()).map_err(|_| AgentError::Protocol("input too large"))?,
-			)
+			.checked_sub(input_count)
 			.ok_or(AgentError::Protocol("input exceeds revision"))?;
 		for (offset, target) in inputs.iter().enumerate() {
 			self.journal.amend_seq(
@@ -1565,7 +2275,8 @@ impl<C: TurnClient> Agent<C> {
 
 	fn drain_invocation_facts(&mut self) -> Result<(), AgentError> {
 		while let Ok(fact) = self.invocation_fact_rx.try_recv() {
-			let requested = canonical_raw(fact.raw.as_bytes())?;
+			let requested =
+				restore_canonical_raw(fact.raw.as_bytes(), self.secret_obfuscator.as_ref())?;
 			let patch = (!fact.admission.args_patch.is_empty())
 				.then(|| canonical_raw(&fact.admission.args_patch))
 				.transpose()?;
@@ -1631,7 +2342,7 @@ impl<C: TurnClient> Agent<C> {
 			let opened = speculative
 				.get(call.id.as_str())
 				.ok_or(AgentError::Protocol("committed tool lacked speculation"))?;
-			let requested = canonical_raw(&call.args_json)?;
+			let requested = restore_canonical_raw(&call.args_json, self.secret_obfuscator.as_ref())?;
 			let admission = opened.admission();
 			let patch = admission
 				.filter(|value| !value.args_patch.is_empty())
@@ -1728,6 +2439,27 @@ const fn empty_invocation_transition(
 	}
 }
 
+fn restore_canonical_raw(
+	bytes: &[u8],
+	secret_obfuscator: Option<&Arc<Mutex<SecretObfuscator>>>,
+) -> Result<Box<RawValue>, AgentError> {
+	let mut value = serde_json::from_slice::<Value>(bytes)
+		.map_err(|_| AgentError::Protocol("tool arguments are not one JSON document"))?;
+	if let Some(obfuscator) = secret_obfuscator {
+		deobfuscate_json(&mut value, &obfuscator.lock());
+	}
+	serde_json::value::to_raw_value(&value)
+		.map_err(|_| AgentError::Protocol("tool arguments cannot be canonicalized"))
+}
+
+fn restored_argument_bytes(
+	bytes: &[u8],
+	secret_obfuscator: Option<&Arc<Mutex<SecretObfuscator>>>,
+) -> Result<bytes::Bytes, AgentError> {
+	let restored = restore_canonical_raw(bytes, secret_obfuscator)?;
+	Ok(bytes::Bytes::copy_from_slice(restored.get().as_bytes()))
+}
+
 fn canonical_raw(bytes: &[u8]) -> Result<Box<RawValue>, AgentError> {
 	let value = serde_json::from_slice::<Value>(bytes)
 		.map_err(|_| AgentError::Protocol("invocation arguments are not one JSON document"))?;
@@ -1773,6 +2505,7 @@ fn apply_merge_patch(target: &mut Value, patch: Value) {
 fn committed_calls(
 	output: &[Item],
 	speculative: &mut BTreeMap<Str, SpeculativeCall>,
+	secret_obfuscator: Option<&Arc<Mutex<SecretObfuscator>>>,
 ) -> Result<Vec<crate::CommittedCall>, AgentError> {
 	let mut committed = Vec::new();
 	for item in output {
@@ -1798,7 +2531,7 @@ fn committed_calls(
 		if committed_rev != opened.identity().rev.to_string() {
 			return Err(AgentError::Protocol("committed tool revision changed"));
 		}
-		committed.push(opened.commit(call.args_json.clone()));
+		committed.push(opened.commit(restored_argument_bytes(&call.args_json, secret_obfuscator)?));
 	}
 	Ok(committed)
 }
@@ -1869,6 +2602,9 @@ fn interrupt_reason(source: &crate::mailbox::InterruptSource) -> Str {
 		crate::mailbox::InterruptSource::Peer { from } => {
 			format!("peer {} steered", from.as_str()).to_str()
 		},
+		crate::mailbox::InterruptSource::DeferredDiagnostics { document, revision, .. } => {
+			format!("deferred diagnostics for {} at revision {}", document.as_str(), revision).to_str()
+		},
 		crate::mailbox::InterruptSource::Producer(name) => name.clone(),
 	}
 }
@@ -1889,6 +2625,112 @@ fn tool_call_digest(items: &[Item]) -> Option<Str> {
 	(calls != 0).then(|| Str::new(hasher.finalize().to_string()))
 }
 
+fn collect_ttsr_paths(value: &omp_slopjson::Value, paths: &mut Vec<Str>) {
+	match value {
+		omp_slopjson::Value::Object(object) => {
+			for (key, value) in object.iter() {
+				let normalized = key.to_ascii_lowercase();
+				let path_field = normalized == "path"
+					|| normalized == "file"
+					|| normalized.ends_with("_path")
+					|| normalized.ends_with("path");
+				if path_field {
+					if let Some(path) = value.as_str()
+						&& !path.is_empty()
+						&& !paths.iter().any(|present| present == path)
+					{
+						paths.push(Str::new(path));
+					}
+				}
+				if normalized == "paths" || normalized == "files" {
+					for path in value.as_array().unwrap_or_default() {
+						if let Some(path) = path.as_str()
+							&& !path.is_empty()
+							&& !paths.iter().any(|present| present == path)
+						{
+							paths.push(Str::new(path));
+						}
+					}
+				}
+				collect_ttsr_paths(value, paths);
+			}
+		},
+		omp_slopjson::Value::Array(values) => {
+			for value in values {
+				collect_ttsr_paths(value, paths);
+			}
+		},
+		_ => {},
+	}
+}
+
+fn tool_matcher_snapshot(value: &omp_slopjson::Value, fallback: &str) -> String {
+	let mut snapshot = String::new();
+	collect_ttsr_source(value, None, &mut snapshot);
+	if snapshot.is_empty() {
+		snapshot.push_str(fallback);
+	}
+	snapshot
+}
+
+fn collect_ttsr_source(value: &omp_slopjson::Value, field: Option<&str>, output: &mut String) {
+	match value {
+		omp_slopjson::Value::String(text)
+			if field.is_some_and(|field| {
+				matches!(
+					field,
+					"content"
+						| "text" | "new"
+						| "new_text" | "newtext"
+						| "replacement"
+						| "patch" | "code"
+				)
+			}) =>
+		{
+			if !output.is_empty() {
+				output.push('\n');
+			}
+			output.push_str(text);
+		},
+		omp_slopjson::Value::Object(object) => {
+			for (key, value) in object.iter() {
+				let normalized = key.to_ascii_lowercase();
+				collect_ttsr_source(value, Some(normalized.as_str()), output);
+			}
+		},
+		omp_slopjson::Value::Array(values) => {
+			for value in values {
+				collect_ttsr_source(value, field, output);
+			}
+		},
+		_ => {},
+	}
+}
+
+fn ttsr_reminder_text(matches: &[TtsrMatch]) -> String {
+	let mut text = String::from(
+		"<system-injection>\nThe previous generation was interrupted by the following stream rules. \
+		 Correct the output before continuing.\n",
+	);
+	for matched in matches {
+		let _ = writeln!(text, "\nRule `{}`:\n{}", matched.name.as_str(), matched.content.as_str());
+	}
+	text.push_str("</system-injection>");
+	text
+}
+
+fn ttsr_reminder_item(text: String) -> Item {
+	Item {
+		seq:           0,
+		created_at_ms: now_ms(),
+		kind:          Some(thread::item::Kind::Message(thread::Message {
+			role:  thread::Role::User as i32,
+			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+		})),
+		props:         None,
+	}
+}
+
 fn continuation_item() -> Item {
 	Item {
 		seq:           0,
@@ -1896,11 +2738,14 @@ fn continuation_item() -> Item {
 		kind:          Some(thread::item::Kind::Message(thread::Message {
 			role:  thread::Role::User as i32,
 			parts: vec![thread::Part {
-				kind: Some(thread::part::Kind::Text(
-					"<system-injection>\nA settled-boundary continuation was accepted. Continue the \
-					 task.\n</system-injection>"
-						.to_owned(),
-				)),
+				kind: Some(thread::part::Kind::Text(format!(
+					"<system-injection>\n{}\n</system-injection>",
+					crate::prompt_assets::prompt_asset(
+						crate::prompt_assets::PromptAssetId::AutoContinue,
+					)
+					.content
+					.trim(),
+				))),
 			}],
 		})),
 		props:         None,
@@ -1931,10 +2776,11 @@ fn duplex_turn_error(error: DuplexError) -> TurnError {
 	})
 }
 fn empty_output_retry_item(attempt: u8) -> Item {
-	let text = format!(
-		"<system-injection>\nStopped without actionable output; task incomplete. Continue with a \
-		 user-visible final answer or the next required tool call.\nAttempt \
-		 #{attempt}/{EMPTY_OUTPUT_RETRY_CAP}\n</system-injection>"
+	let mut text = String::new();
+	crate::prompt_assets::render_empty_stop_retry(
+		&mut text,
+		usize::from(attempt),
+		usize::from(EMPTY_OUTPUT_RETRY_CAP),
 	);
 	Item {
 		seq:           0,
@@ -1981,7 +2827,7 @@ fn empty_output_cap_detail(error: &pb::TurnError) -> String {
 	}
 }
 
-fn follow_up_id(_root: &TurnId, _ordinal: u32) -> TurnId {
+fn follow_up_id(_root: &TurnId<str>, _ordinal: u32) -> TurnId {
 	TurnId::new(omp_core::Ulid::generate().to_string())
 }
 
@@ -2297,14 +3143,20 @@ mod tests {
 		let (env, _transport) = EnvClient::in_process(1);
 		let mut agent = Agent::new(client, env, state, journal, test_caps());
 
-		let (_, _, _, _, resumed_tools) = agent
+		let RunTurnResult::Complete((_, _, _, _, resumed_tools)) = agent
 			.run_turn(TurnId::new("durable-turn"), Vec::new())
 			.await
-			.expect("resume durable turn");
-		let (_, _, _, _, fresh_tools) = agent
+			.expect("resume durable turn")
+		else {
+			panic!("durable turn must complete");
+		};
+		let RunTurnResult::Complete((_, _, _, _, fresh_tools)) = agent
 			.run_turn(TurnId::new("fresh-turn"), Vec::new())
 			.await
-			.expect("run fresh turn");
+			.expect("run fresh turn")
+		else {
+			panic!("fresh turn must complete");
+		};
 
 		assert_eq!(resumed_tools.as_ref(), &[sf!("old")]);
 		assert_eq!(fresh_tools.as_ref(), &[sf!("new")]);
@@ -2711,6 +3563,13 @@ mod tests {
 			.await
 			.expect("checkpoint task")
 			.expect("checkpoint command");
+		let checkpoint_event = agent
+			.checkpoint_state
+			.lock()
+			.active
+			.as_ref()
+			.expect("active checkpoint")
+			.event;
 
 		let events = agent.events().subscribe_lossless();
 		let abort = agent.abort_handle();
@@ -2720,10 +3579,10 @@ mod tests {
 				if matches!(event.as_ref(), AgentEvent::PhaseChanged { to: AgentPhase::ToolBatch, .. })
 				{
 					let ack = control
-						.schedule_rewind(checkpoint, sf!("thread"))
+						.schedule_rewind(checkpoint.token.clone(), sf!("thread"))
 						.await
 						.expect("schedule rewind");
-					assert_eq!(ack.target, checkpoint);
+					assert_eq!(ack.token, checkpoint.token);
 					abort.abort();
 					break ack;
 				}
@@ -2737,7 +3596,7 @@ mod tests {
 			scheduling,
 		);
 		let summary = summary.expect("rewind boundary summary");
-		assert_eq!(ack.target, checkpoint);
+		assert_eq!(ack.token, checkpoint.token);
 		assert_eq!(summary.committed_turns, 1);
 
 		let log = agent.journal.load().expect("load rewind journal");
@@ -2758,7 +3617,7 @@ mod tests {
 			}
 		}
 		assert_eq!(rewinds.len(), 1, "rewind outcome is journaled exactly once");
-		assert_eq!(rewinds[0].1, Some(checkpoint));
+		assert_eq!(rewinds[0].1, Some(checkpoint_event));
 		assert!(
 			settled.is_some_and(|settled| settled < rewinds[0].0),
 			"rewind executes only after tool settlement is journaled"
@@ -2777,6 +3636,25 @@ mod tests {
 	}
 
 	#[test]
+	fn run_summary_classifies_terminal_outcomes_and_projects_assistant() {
+		let success = AgentRunSummary::settled(end_outcome("done"), 1, false);
+		assert_eq!(success.settlement, RunSettlement::Success);
+		assert_eq!(success.final_assistant(), Some("done"));
+
+		let maximum = AgentRunSummary::settled(
+			Outcome { stop: pb::StopReason::StopMaxTokens as i32, ..Outcome::default() },
+			1,
+			false,
+		);
+		assert_eq!(maximum.settlement, RunSettlement::MaxTokens);
+		assert_eq!(
+			AgentRunSummary::silent_compaction_transition(None, 1).settlement,
+			RunSettlement::SilentCompactionTransition
+		);
+		assert_eq!(AgentRunSummary::terminal_fault().settlement, RunSettlement::TerminalFault);
+	}
+
+	#[test]
 	fn run_summary_extracts_yield_arguments_verbatim() {
 		let call = thread::ToolCall {
 			id: sf!("yield-call").to_string(),
@@ -2786,17 +3664,18 @@ mod tests {
 			),
 			..thread::ToolCall::default()
 		};
-		let summary = AgentRunSummary {
-			outcome:         Some(Outcome {
+		let summary = run_summary(
+			Some(Outcome {
 				output: vec![Item {
 					kind: Some(thread::item::Kind::ToolCall(call)),
 					..Item::default()
 				}],
+				stop: pb::StopReason::StopEndTurn as i32,
 				..Outcome::default()
 			}),
-			committed_turns: 1,
-			interrupted:     false,
-		};
+			1,
+			false,
+		);
 		let schema = serde_json::json!({
 			"type": "object",
 			"properties": {"summary": {"type": "string"}},
@@ -2809,5 +3688,29 @@ mod tests {
 			Err(YieldPayloadError::SchemaViolation { path, rule: "type" })
 				if path.as_str() == "/summary"
 		));
+	}
+	#[test]
+	fn restores_nested_model_arguments_without_changing_operator_values() {
+		let rule = omp_secrets::rule::SecretRule::new(
+			omp_secrets::rule::SecretKind::Plain,
+			omp_secrets::rule::SecretMode::Obfuscate,
+			"model-secret",
+			None,
+			None,
+			None,
+		)
+		.expect("rule");
+		let mut obfuscator = SecretObfuscator::new(vec![rule], "K".repeat(43));
+		let placeholder = obfuscator.obfuscate("model-secret");
+		let arguments = serde_json::to_vec(&serde_json::json!({
+			"nested": [placeholder],
+			"operator_literal": "model-secret"
+		}))
+		.expect("arguments");
+		let obfuscator = Arc::new(Mutex::new(obfuscator));
+		let restored = restored_argument_bytes(&arguments, Some(&obfuscator)).expect("restore");
+		let value: Value = serde_json::from_slice(&restored).expect("json");
+		assert_eq!(value["nested"][0], "model-secret");
+		assert_eq!(value["operator_literal"], "model-secret");
 	}
 }
