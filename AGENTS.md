@@ -194,6 +194,16 @@ a real path? no → default type right; don't churn.
   3. per-frame/per-key/per-line/per-cell paths — format on state change and
      cache, or format into a stack `ArrayStr<N>`; paint re-slices, never
      re-formats. Errors NEVER go through formatters (see errors bullet).
+- Branded string ids (`omp_core::string_id!`): bare `Id` (= `Id<Str>`) is the
+  owned form for storage — fields, map keys, moves. Explicit `Id<str>` is the
+  borrowed query form (`Id::from_ref`, a zero-cost `#[repr(transparent)]`
+  cast). Lookup/query fns take `&Id<str>`, NEVER `impl AsRef<Id<str>>`; raw
+  string callers pass `Id::from_ref(text)`. An owned `&Id` dereferences to
+  `&Id<str>`, so callers holding stored ids pass `&id`. Minting an owned id at
+  a query site just to borrow it = reviewer-reject. Same rule for ANY
+  newtype-over-string lookup API: a query path allocates nothing. New id
+  newtypes MUST use the shared macro, never a local copy.
+
 ### Type Size Discipline (CRITICAL)
 `clippy::result_large_err|large_enum_variant|large_stack_arrays|large_futures`
 = measurement (our type is fat), not a request to add a pointer.

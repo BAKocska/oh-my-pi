@@ -58,9 +58,24 @@ proto-lint:
 clippy:
     cargo clippy --workspace --locked
 
+# Warn (never fails) on lock-wrapped map/set state (`Mutex<HashMap<…>>` etc.); prefer
+# `dashmap::DashMap`/`DashSet` or another concurrent structure. clippy's `disallowed-types`
+# matches type paths only (no generic args), so this can't live in clippy.toml.
+[group('format & lint')]
+lint-locked-maps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    matches=$(grep -rnE --include='*.rs' \
+        '(Mutex|RwLock)<[[:space:]]*((std|indexmap|im|omp_core)::([a-z_]+::)*)?((Fx)?Hash|BTree|Index|Sparse)(Map|Set)<' \
+        crates || true)
+    if [[ -n "$matches" ]]; then
+        echo "warning: lock-wrapped map/set state — prefer dashmap::DashMap/DashSet or another concurrent structure:"
+        echo "$matches"
+    fi
+
 # Run every formatter-check and linter this repo defines.
 [group('format & lint')]
-lint: fmt-check clippy proto-lint
+lint: fmt-check clippy proto-lint lint-locked-maps
 
 # ---------------------------------------------------------------------------
 # Build & check
