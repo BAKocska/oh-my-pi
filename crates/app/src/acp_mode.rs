@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, HashMap},
+	future::Future,
 	io::IsTerminal as _,
 	path::{Path, PathBuf},
 	pin::Pin,
@@ -14,8 +15,9 @@ use bytes::Bytes;
 use flume::{Receiver, Sender};
 use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{
-	AgentEvent, AgentRunSummary, ApprovalBook, ApprovalDecision, ApprovalSource, ApprovalSpec,
-	EventProvenance, EventSubscription, EventVisibility, PlanState, RunSettlement,
+	AgentEvent, AgentRunSummary, ApprovalBook, ApprovalDecision, ApprovalInbox, ApprovalRequest,
+	ApprovalSource, ApprovalSpec, EventProvenance, EventSubscription, EventVisibility, PlanState,
+	RunSettlement,
 };
 use omp_core::{CowBytes, Hash32, Str, ToolPath, sf};
 use omp_llm_catalog::{ModelKey, ThinkingEffort, clamp_thinking_effort};
@@ -24,6 +26,7 @@ use omp_proto::{
 	env::v1 as env_wire,
 	inference::v1::{self as inference_wire, Effort, Reasoning, part_start, value},
 	thread::v1::{self as thread, Blob, Item, Message, Part, Role, item, part},
+	ui::v1::{ui_effect, ui_request},
 };
 use omp_storage::index::{SessionFilter, SessionIndex};
 use omp_tool::{Presentation, ToolIdentity};
@@ -41,14 +44,25 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	chat_ui::commands::registry::{CommandRole, CommandRoster, CommandSurface},
 	cli::{AcpArgs, data_dir, turn_id},
-	envd::tool_shell::{AcpExecBackend, AcpExecRequest, AcpExecRun},
+	envd::{
+		docs::AcpDocumentBackend,
+		tool_shell::{AcpExecBackend, AcpExecRequest, AcpExecRun},
+	},
+	exthost::lifecycle::{HeadlessLifecycleKind, HeadlessLifecycleSubscription},
 	headless::{HeadlessSession, HeadlessSessionOptions},
+	plan::PlanArtifactStore,
 };
 
 const CANCEL_CLEANUP: Duration = Duration::from_secs(2);
 const DELIVERY_DRAIN_PASSES: usize = 8;
 const DELIVERY_DRAIN_BATCH: usize = 256;
 const EMBEDDED_TEXT_LIMIT: usize = 4_000;
+
+enum AcpPromptIntercept {
+	Prompt(Str),
+	Consumed,
+	Exit,
+}
 
 /// Runs ACP using stdin for NDJSON requests and stdout for NDJSON responses.
 pub async fn run(args: AcpArgs) -> miette::Result<()> {
@@ -60,6 +74,9 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 	let state_dir = crate::project_state::directory(&data_dir, &root).into_diagnostic()?;
 	std::fs::create_dir_all(state_dir.join("sessions")).into_diagnostic()?;
 	let index = Arc::new(SessionIndex::open(state_dir.join("sessions.sqlite3")).into_diagnostic()?);
+	let local_root = state_dir.join("local");
+	std::fs::create_dir_all(&local_root).into_diagnostic()?;
+	let content = crate::discovery::active_content_snapshots(&root);
 	let configured_model = crate::settings::current(&data_dir)
 		.into_diagnostic()?
 		.default_model
@@ -82,7 +99,9 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 			initialized: false,
 			data_dir,
 			root,
+			local_root,
 			index,
+			content,
 			sessions: HashMap::new(),
 			active: HashMap::new(),
 			approvals: ApprovalBook::new(),
@@ -95,6 +114,7 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 			next_peer_request: 1,
 			pending_peer: HashMap::new(),
 			next_session_generation: 1,
+			command_generation: 1,
 		}),
 	});
 	let result = read_ndjson(Arc::clone(&runtime)).await;
@@ -182,7 +202,9 @@ struct State {
 	initialized:             bool,
 	data_dir:                PathBuf,
 	root:                    PathBuf,
+	local_root:              PathBuf,
 	index:                   Arc<SessionIndex>,
+	content:                 crate::discovery::ActiveContentSnapshots,
 	sessions:                HashMap<Str, Arc<AcpSession>>,
 	active:                  HashMap<Str, CancellationToken>,
 	approvals:               ApprovalBook,
@@ -195,6 +217,7 @@ struct State {
 	next_peer_request:       u64,
 	pending_peer:            HashMap<u64, oneshot::Sender<Result<Value, Value>>>,
 	next_session_generation: u64,
+	command_generation:      u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -214,6 +237,70 @@ struct AcpSession {
 	terminal_backend: AcpTerminalBackend,
 	capabilities:     PeerCapabilities,
 	root:             PathBuf,
+	forwarders:       Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
+struct AcpDocumentBridge {
+	runtime:    Weak<Runtime>,
+	session_id: Str,
+}
+
+impl AcpDocumentBackend for AcpDocumentBridge {
+	fn read_text(
+		&self,
+		absolute_path: Str,
+	) -> Pin<Box<dyn Future<Output = miette::Result<Str>> + Send + '_>> {
+		Box::pin(async move {
+			let runtime = self
+				.runtime
+				.upgrade()
+				.ok_or_else(|| miette!("ACP peer disconnected"))?;
+			let value = runtime
+				.peer_operation(&self.session_id, &RemoteOperation::ReadText {
+					path:  absolute_path,
+					line:  None,
+					limit: None,
+				})
+				.await?;
+			value
+				.get("content")
+				.and_then(Value::as_str)
+				.map(Str::from)
+				.ok_or_else(|| miette!("ACP read response has no UTF-8 content"))
+		})
+	}
+
+	fn write_text(
+		&self,
+		absolute_path: Str,
+		content: Str,
+	) -> Pin<Box<dyn Future<Output = miette::Result<Str>> + Send + '_>> {
+		Box::pin(async move {
+			let runtime = self
+				.runtime
+				.upgrade()
+				.ok_or_else(|| miette!("ACP peer disconnected"))?;
+			runtime
+				.peer_operation(&self.session_id, &RemoteOperation::WriteText {
+					path: absolute_path.clone(),
+					content,
+				})
+				.await?;
+			let value = runtime
+				.peer_operation(&self.session_id, &RemoteOperation::ReadText {
+					path:  absolute_path,
+					line:  None,
+					limit: None,
+				})
+				.await?;
+			value
+				.get("content")
+				.and_then(Value::as_str)
+				.map(Str::from)
+				.ok_or_else(|| miette!("ACP write read-back has no UTF-8 content"))
+		})
+	}
 }
 
 struct AcpSessionMeta {
@@ -229,11 +316,16 @@ struct AcpSessionMeta {
 
 impl AcpSession {
 	async fn close_adapters(&self) -> miette::Result<()> {
+		for task in self.forwarders.lock().drain(..) {
+			task.abort();
+		}
 		let _update = self.mcp_update.lock().await;
 		self.terminal_backend.close_all().await;
 		let (client, mut mounts) = {
 			let headless = self.headless.lock().await;
 			headless.bind_acp_exec(None);
+			headless.bind_acp_documents(None);
+			headless.bind_approval_authority(None, None);
 			(headless.env().clone(), self.meta.lock().mcp_mounts.clone())
 		};
 		mounts.clear(&client).await?;
@@ -633,6 +725,7 @@ struct AcpEventMapper {
 	assistant_text:      String,
 	terminal_fault_seen: bool,
 	registry:            Option<Arc<omp_tool::Registry>>,
+	usage:               Option<Value>,
 }
 
 struct AcpToolState {
@@ -715,7 +808,7 @@ impl AcpEventMapper {
 					.unwrap_or_else(|_| Value::String(String::from_utf8_lossy(raw).into_owned()));
 				vec![tool_update(call_id, "in_progress", output, root)]
 			},
-			AgentEvent::ToolFinished { call_id, item } => {
+			AgentEvent::ToolFinished { call_id, item, .. } => {
 				let tool = self.tools.remove(call_id);
 				if tool.as_ref().is_some_and(|tool| !visible_tool(tool)) {
 					return Vec::new();
@@ -781,9 +874,13 @@ impl AcpEventMapper {
 				match self.parts.get(&delta.index) {
 					Some(part_start::Kind::Text) => {
 						self.assistant_text.push_str(&text);
-						vec![json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}})]
+						vec![
+							json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}),
+						]
 					},
-					Some(part_start::Kind::Thinking) => vec![json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":text}})],
+					Some(part_start::Kind::Thinking) => vec![
+						json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":text}}),
+					],
 					_ => Vec::new(),
 				}
 			},
@@ -791,17 +888,19 @@ impl AcpEventMapper {
 				self.parts.remove(&end.index);
 				Vec::new()
 			},
-			Some(inference_wire::turn_event::Event::Outcome(outcome)) => outcome
-				.usage
-				.as_ref()
-				.map(|usage| vec![json!({
-					"sessionUpdate":"usage_update",
-					"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"cache_read_tokens":usage.cache_read_tokens,"cache_write_tokens":usage.cache_write_tokens,"total_tokens":usage.total_tokens},
-				})])
-				.unwrap_or_default(),
+			Some(inference_wire::turn_event::Event::Outcome(outcome)) => {
+				let Some(usage) = outcome.usage.as_ref() else {
+					return Vec::new();
+				};
+				let usage = json!({"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"cache_read_tokens":usage.cache_read_tokens,"cache_write_tokens":usage.cache_write_tokens,"total_tokens":usage.total_tokens});
+				self.usage = Some(usage.clone());
+				vec![json!({"sessionUpdate":"usage_update","usage":usage})]
+			},
 			Some(inference_wire::turn_event::Event::Error(error)) => {
 				self.terminal_fault_seen = true;
-				vec![json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":bounded_text(&error.detail)},"error":true})]
+				vec![
+					json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":bounded_text(&error.detail)},"error":true}),
+				]
 			},
 			_ => Vec::new(),
 		}
@@ -876,6 +975,19 @@ impl Runtime {
 			"session/configure_mcp_servers" => self.configure_mcp_servers(&params).await,
 			"session/elicitation" => self.elicit(&params).await,
 			"session/approve" => self.approve(&params),
+			"session/propose_plan" => self.propose_plan(&params).await,
+			"session/reload_extensions" => {
+				let session_id = Str::from(required_text(&params, "sessionId")?);
+				self.reload_commands(&session_id)?;
+				Ok(json!({"generation":self.state.lock().command_generation}))
+			},
+			"speech.models.list" => self.speech_models().await,
+			"_omp/sessions/listAll" => self.list_all_sessions(&params),
+			"_omp/projects/list" => self.list_projects(),
+			"_omp/chats/byCwd" => self.list_chats_by_cwd(&params),
+			"_omp/usage" => self.usage(&params),
+			"_omp/extensions" => self.list_extensions(),
+			"_omp/extensions/toggle" => self.toggle_extension(&params),
 			_ => Err(miette!("unknown ACP method `{method}`")),
 		};
 		if let Some(id) = id {
@@ -1056,6 +1168,12 @@ impl Runtime {
 		let events = headless
 			.take_events()
 			.expect("ACP session owns its lossless event stream");
+		let approvals = headless
+			.take_approval_inbox()
+			.expect("ACP session owns its approval inbox");
+		let lifecycle = headless
+			.take_lifecycle_events()
+			.expect("ACP session owns its extension lifecycle stream");
 		let mut mounts = SessionMcpMountSet::default();
 		let mcp_servers = params
 			.get("mcpServers")
@@ -1070,6 +1188,14 @@ impl Runtime {
 			capabilities
 				.terminal
 				.then(|| Arc::new(terminal_backend.clone()) as Arc<dyn AcpExecBackend>),
+		);
+		headless.bind_acp_documents(
+			(capabilities.read_text_file || capabilities.write_text_file).then(|| {
+				Arc::new(AcpDocumentBridge {
+					runtime:    Arc::downgrade(self),
+					session_id: session_id.clone(),
+				}) as Arc<dyn AcpDocumentBackend>
+			}),
 		);
 		let session = Arc::new(AcpSession {
 			headless: tokio::sync::Mutex::new(headless),
@@ -1089,10 +1215,230 @@ impl Runtime {
 			terminal_backend,
 			capabilities,
 			root,
+			forwarders: Mutex::new(Vec::new()),
 		});
 		let response = session_config_response(&session_id, &session.meta.lock(), &models, &mounted);
-		self.state.lock().sessions.insert(session_id, session);
+		self
+			.state
+			.lock()
+			.sessions
+			.insert(session_id.clone(), Arc::clone(&session));
+		self.spawn_session_forwarders(session_id, session, approvals, lifecycle);
 		Ok(response)
+	}
+
+	fn spawn_session_forwarders(
+		self: &Arc<Self>,
+		session_id: Str,
+		session: Arc<AcpSession>,
+		approvals: ApprovalInbox,
+		lifecycle: HeadlessLifecycleSubscription,
+	) {
+		let runtime = Arc::downgrade(self);
+		let approval_session = session_id.clone();
+		let approval_task = tokio::spawn(async move {
+			while let Ok(request) = approvals.recv().await {
+				let Some(runtime) = runtime.upgrade() else {
+					break;
+				};
+				let decision = runtime.forward_approval(&approval_session, &request).await;
+				let _ = request.respond(decision);
+			}
+		});
+		let runtime = Arc::downgrade(self);
+		let lifecycle_session = session_id;
+		let lifecycle_owner = Arc::clone(&session);
+		let lifecycle_task = tokio::spawn(async move {
+			while let Ok(event) = lifecycle.recv().await {
+				let Some(runtime) = runtime.upgrade() else {
+					break;
+				};
+				if let Err(error) = runtime
+					.forward_lifecycle(&lifecycle_session, &lifecycle_owner, &event.kind)
+					.await
+				{
+					tracing::warn!(%error, "ACP extension lifecycle forwarding failed");
+				}
+			}
+		});
+		session
+			.forwarders
+			.lock()
+			.extend([approval_task, lifecycle_task]);
+	}
+
+	async fn forward_approval(
+		&self,
+		session_id: &Str,
+		request: &ApprovalRequest,
+	) -> ApprovalDecision {
+		let title = request
+			.ticket
+			.reasons
+			.first()
+			.map_or("Tool permission", |reason| reason.title.as_str());
+		let body = request
+			.ticket
+			.reasons
+			.iter()
+			.map(|reason| reason.body.as_str())
+			.collect::<Vec<_>>()
+			.join("\n\n");
+		let subject = request
+			.ticket
+			.reasons
+			.first()
+			.map(|reason| reason.subject.as_str());
+		let tool_call_id = request
+			.ticket
+			.invocation_id
+			.as_deref()
+			.unwrap_or(request.ticket.ticket_id.as_str());
+		let mut tool_call = json!({
+			"toolCallId":tool_call_id,
+			"title":title,
+			"status":"pending",
+			"rawInput":{"subject":subject,"reason":body},
+		});
+		if let Some(path) = subject.filter(|value| Path::new(value).is_absolute()) {
+			tool_call["locations"] = json!([{"path":path}]);
+		}
+		let response = self
+			.peer_request(
+				"session/request_permission",
+				json!({
+					"sessionId":session_id,
+					"toolCall":tool_call,
+					"options":[
+						{"optionId":"allow_once","name":"Allow once","kind":"allow_once"},
+						{"optionId":"allow_always","name":"Always allow","kind":"allow_always"},
+						{"optionId":"reject_once","name":"Reject once","kind":"reject_once"},
+						{"optionId":"reject_always","name":"Always reject","kind":"reject_always"}
+					]
+				}),
+			)
+			.await;
+		let option = response
+			.as_ref()
+			.ok()
+			.and_then(|value| value.pointer("/outcome/optionId"))
+			.and_then(Value::as_str);
+		let approved = matches!(option, Some("allow_once" | "allow_always"));
+		let scope = if matches!(option, Some("allow_always" | "reject_always")) {
+			sf!("always")
+		} else {
+			sf!("once")
+		};
+		ApprovalDecision {
+			approved,
+			scope,
+			source: if response.is_ok() {
+				ApprovalSource::External
+			} else {
+				ApprovalSource::Unavailable
+			},
+			decided_by: None,
+			reason: response
+				.err()
+				.map(|_| sf!("ACP permission peer unavailable")),
+			audited: true,
+		}
+	}
+
+	async fn forward_lifecycle(
+		&self,
+		session_id: &Str,
+		session: &AcpSession,
+		kind: &HeadlessLifecycleKind,
+	) -> miette::Result<()> {
+		match kind {
+			HeadlessLifecycleKind::Activated(event) => self.update(
+				session_id,
+				json!({"sessionUpdate":"extension_generation_update","generation":event.generation}),
+			),
+			HeadlessLifecycleKind::CommandRosterInvalidated => self.reload_commands(session_id),
+			HeadlessLifecycleKind::ExtensionError { extension, error } => self.update(
+				session_id,
+				json!({"sessionUpdate":"extension_error","extension":extension,"message":error.to_string()}),
+			),
+			HeadlessLifecycleKind::UiEffect(effect) => {
+				let update = match effect.kind.as_ref() {
+					Some(ui_effect::Kind::SetStatus(status)) => {
+						json!({"sessionUpdate":"extension_status","content":status.content.as_ref().map(|content|String::from_utf8_lossy(&content.source).into_owned())})
+					},
+					Some(ui_effect::Kind::SetWorking(working)) => {
+						json!({"sessionUpdate":"extension_working","working":working.working,"label":working.label})
+					},
+					Some(ui_effect::Kind::Notify(notify)) => {
+						json!({"sessionUpdate":"extension_notification","message":notify.message,"level":notify.level,"durationMs":notify.duration_ms})
+					},
+					Some(ui_effect::Kind::SetTitle(title)) => {
+						session
+							.headless
+							.lock()
+							.await
+							.set_title(Str::from(title.title.as_str()))
+							.await?;
+						session.meta.lock().title = Some(Str::from(title.title.as_str()));
+						json!({"sessionUpdate":"session_info_update","title":title.title})
+					},
+					Some(ui_effect::Kind::SetProgress(progress)) => {
+						json!({"sessionUpdate":"extension_progress","fraction":progress.fraction,"label":progress.label})
+					},
+					Some(ui_effect::Kind::OpenUrl(open)) => {
+						json!({"sessionUpdate":"extension_open_url","url":open.url})
+					},
+					Some(_) | None => {
+						json!({"sessionUpdate":"extension_ui_effect","supported":false})
+					},
+				};
+				self.update(session_id, update)
+			},
+			HeadlessLifecycleKind::UiRequest(request) => {
+				let Some(ui_request::Kind::Dialog(dialog)) = request.kind.as_ref() else {
+					return self.update(
+						session_id,
+						json!({"sessionUpdate":"extension_ui_request","supported":false,"ownerInvocation":request.owner_invocation}),
+					);
+				};
+				let content = dialog
+					.content
+					.as_ref()
+					.map(|content| String::from_utf8_lossy(&content.source).into_owned())
+					.unwrap_or_default();
+				if !session.capabilities.elicitation {
+					return self.update(
+						session_id,
+						json!({"sessionUpdate":"extension_ui_response","ownerInvocation":request.owner_invocation,"cancelled":true}),
+					);
+				}
+				let response = self
+					.peer_request("session/unstable_createElicitation", json!({
+						"sessionId":session_id,
+						"mode":"form",
+						"message":content,
+						"requestedSchema":{"type":"object","properties":{"value":{"type":"string","title":dialog.title,"enum":dialog.choices}},"required":["value"]}
+					}))
+					.await?;
+				self.update(
+					session_id,
+					json!({"sessionUpdate":"extension_ui_response","ownerInvocation":request.owner_invocation,"response":response}),
+				)
+			},
+		}
+	}
+
+	fn reload_commands(&self, session_id: &Str) -> miette::Result<()> {
+		let (commands, generation) = {
+			let mut state = self.state.lock();
+			state.content = crate::discovery::active_content_snapshots(&state.root);
+			state.command_generation = state.command_generation.wrapping_add(1).max(1);
+			(available_commands(&state.content, state.command_generation), state.command_generation)
+		};
+		self.update(
+			session_id,
+			json!({"sessionUpdate":"available_commands_update","availableCommands":commands,"generation":generation}),
+		)
 	}
 
 	fn list_sessions(&self, params: &Map<String, Value>) -> miette::Result<Value> {
@@ -1113,6 +1459,211 @@ impl Runtime {
 		Ok(
 			json!({"sessions":page.sessions.into_iter().map(|row| json!({"sessionId":row.id.0,"title":row.title,"cwd":row.cwd,"createdAt":row.created_ms,"updatedAt":row.updated_ms,"parentSessionId":row.parent.map(|id|id.0)})).collect::<Vec<_>>() }),
 		)
+	}
+
+	fn list_all_sessions(&self, params: &Map<String, Value>) -> miette::Result<Value> {
+		let state = self.state.lock();
+		let limit = params
+			.get("limit")
+			.and_then(Value::as_u64)
+			.unwrap_or(1_000)
+			.clamp(1, 5_000) as u32;
+		let page = state
+			.index
+			.list(&SessionFilter { limit, ..SessionFilter::default() })
+			.into_diagnostic()?;
+		let total = page.sessions.len();
+		Ok(json!({
+			"total":total,
+			"sessions":page.sessions.into_iter().map(|row|json!({
+				"sessionId":row.id.0,
+				"title":row.title,
+				"cwd":row.cwd,
+				"createdAt":row.created_ms,
+				"updatedAt":row.updated_ms,
+				"parentSessionId":row.parent.map(|id|id.0),
+			})).collect::<Vec<_>>()
+		}))
+	}
+
+	fn list_projects(&self) -> miette::Result<Value> {
+		let state = self.state.lock();
+		let session_count = state
+			.index
+			.list(&SessionFilter {
+				project: Some(Str::from(state.root.to_string_lossy().as_ref())),
+				limit: 5_000,
+				..SessionFilter::default()
+			})
+			.into_diagnostic()?
+			.sessions
+			.len();
+		Ok(json!({"projects":[{
+			"path":state.root,
+			"name":state.root.file_name().and_then(|name|name.to_str()),
+			"sessionCount":session_count
+		}]}))
+	}
+
+	fn list_chats_by_cwd(&self, params: &Map<String, Value>) -> miette::Result<Value> {
+		let cwd = params
+			.get("cwd")
+			.and_then(Value::as_str)
+			.map(PathBuf::from)
+			.unwrap_or_else(|| self.state.lock().root.clone());
+		let state = self.state.lock();
+		let page = state
+			.index
+			.list(&SessionFilter {
+				project: Some(Str::from(cwd.to_string_lossy().as_ref())),
+				limit: params
+					.get("limit")
+					.and_then(Value::as_u64)
+					.unwrap_or(1_000)
+					.clamp(1, 5_000) as u32,
+				..SessionFilter::default()
+			})
+			.into_diagnostic()?;
+		Ok(json!({"cwd":cwd,"chats":page.sessions.into_iter().map(|row|json!({
+			"sessionId":row.id.0,
+			"title":row.title,
+			"updatedAt":row.updated_ms
+		})).collect::<Vec<_>>()}))
+	}
+
+	fn usage(&self, params: &Map<String, Value>) -> miette::Result<Value> {
+		let session_id = required_text(params, "sessionId")?;
+		Ok(self
+			.session(session_id)?
+			.mapper
+			.lock()
+			.usage
+			.clone()
+			.unwrap_or_else(|| json!({"input_tokens":0,"output_tokens":0,"total_tokens":0})))
+	}
+
+	async fn speech_models(&self) -> miette::Result<Value> {
+		use omp_llm_inference::local::{
+			ArtifactStore, LocalCancellation,
+			speech_catalog::{SpeechArtifactManifests, SpeechCatalog},
+		};
+		let root = self.state.lock().data_dir.join("models");
+		std::fs::create_dir_all(&root).into_diagnostic()?;
+		let store = ArtifactStore::open(&root).into_diagnostic()?;
+		let manifests = SpeechArtifactManifests::pi_parity().into_diagnostic()?;
+		let snapshot = SpeechCatalog
+			.snapshot(&store, &manifests, &LocalCancellation::new())
+			.into_diagnostic()?;
+		serde_json::to_value(snapshot).into_diagnostic()
+	}
+
+	fn list_extensions(&self) -> miette::Result<Value> {
+		use crate::ext::lock::InstalledRecord;
+		let state = self.state.lock();
+		let client_path = state.data_dir.join("ext/installed.toml");
+		let workspace_path = state.root.join(".omp/installed.toml");
+		let client = InstalledRecord::read(&client_path).map_err(|error| miette!("{error}"))?;
+		let workspace = InstalledRecord::read(&workspace_path).map_err(|error| miette!("{error}"))?;
+		Ok(json!({
+			"generation":state.command_generation,
+			"extensions":client.extensions.into_iter().map(|entry|json!({
+				"id":entry.id,"enabled":entry.enabled,"scope":"user"
+			})).chain(workspace.extensions.into_iter().map(|entry|json!({
+				"id":entry.id,"enabled":entry.enabled,"scope":"project"
+			}))).collect::<Vec<_>>()
+		}))
+	}
+
+	fn toggle_extension(&self, params: &Map<String, Value>) -> miette::Result<Value> {
+		use crate::ext::{lock::InstalledRecord, upgrade::set_enabled};
+		let id = required_text(params, "id")?;
+		let enabled = params
+			.get("enabled")
+			.and_then(Value::as_bool)
+			.ok_or_else(|| miette!("missing boolean `enabled`"))?;
+		let scope = params
+			.get("scope")
+			.and_then(Value::as_str)
+			.unwrap_or("user");
+		let path = {
+			let state = self.state.lock();
+			match scope {
+				"user" => state.data_dir.join("ext/installed.toml"),
+				"project" => state.root.join(".omp/installed.toml"),
+				_ => return Err(miette!("extension scope must be user or project")),
+			}
+		};
+		let mut installed = InstalledRecord::read(&path).map_err(|error| miette!("{error}"))?;
+		set_enabled(&mut installed, id, enabled).map_err(|error| miette!("{error}"))?;
+		installed.write(&path).into_diagnostic()?;
+		let sessions = self
+			.state
+			.lock()
+			.sessions
+			.keys()
+			.cloned()
+			.collect::<Vec<_>>();
+		for session_id in sessions {
+			self.reload_commands(&session_id)?;
+		}
+		Ok(json!({"id":id,"enabled":enabled,"scope":scope}))
+	}
+
+	async fn propose_plan(&self, params: &Map<String, Value>) -> miette::Result<Value> {
+		let session_id = Str::from(required_text(params, "sessionId")?);
+		let supplied_title = params.get("title").and_then(Value::as_str);
+		let session = self.session(&session_id)?;
+		let plan_state = session
+			.headless
+			.lock()
+			.await
+			.modes()
+			.plan()
+			.filter(|state| state.enabled)
+			.ok_or_else(|| miette!("plan mode is not active"))?;
+		let local_root = self.state.lock().local_root.clone();
+		let artifact = PlanArtifactStore::new(local_root)
+			.resolve(supplied_title, plan_state.artifact.as_str())
+			.map_err(|error| miette!("{error}"))?;
+		let response = if session.capabilities.elicitation {
+			self.peer_request("session/unstable_createElicitation", json!({
+				"sessionId":session_id,
+				"mode":"form",
+				"message":artifact.content,
+				"requestedSchema":{"type":"object","properties":{"decision":{"type":"string","title":artifact.title,"enum":["execute","refine"]}},"required":["decision"]}
+			})).await.ok()
+		} else {
+			None
+		};
+		let execute = response
+			.as_ref()
+			.and_then(|value| value.pointer("/content/decision"))
+			.and_then(Value::as_str)
+			.map_or(!session.capabilities.elicitation, |decision| decision == "execute");
+		{
+			let headless = session.headless.lock().await;
+			headless
+				.modes()
+				.set_plan_artifact(artifact.url.clone())
+				.map_err(|error| miette!("{error}"))?;
+			if execute {
+				headless.modes().exit_plan();
+			}
+		}
+		if execute {
+			session.meta.lock().mode = "default".into();
+			self.update(
+				&session_id,
+				json!({"sessionUpdate":"current_mode_update","currentModeId":"default"}),
+			)?;
+		}
+		Ok(json!({
+			"approved":execute,
+			"decision":if execute {"execute"} else {"refine"},
+			"planFilePath":artifact.url,
+			"title":artifact.title,
+			"planExists":true
+		}))
 	}
 
 	async fn close_session(&self, params: &Map<String, Value>) -> miette::Result<Value> {
@@ -1361,6 +1912,113 @@ impl Runtime {
 		Ok(json!({"approved":approved}))
 	}
 
+	async fn intercept_prompt(
+		&self,
+		session_id: &Str,
+		text: &str,
+	) -> miette::Result<Option<AcpPromptIntercept>> {
+		if let Some(invocation) = crate::skills::parse_invocation(text) {
+			let skill = {
+				let state = self.state.lock();
+				state.content.skills.get(invocation.name.as_str()).cloned()
+			}
+			.ok_or_else(|| miette!("unknown skill `{}`", invocation.name))?;
+			let rendered = crate::skills::render_invocation(
+				&skill,
+				invocation.args.as_str(),
+				crate::skills::SkillInvocationKind::User,
+			);
+			self.command_output(session_id, sf!("Skill `{}` loaded for this turn.", skill.name))?;
+			return Ok(Some(AcpPromptIntercept::Prompt(rendered)));
+		}
+		let Some(command) = text.strip_prefix('/') else {
+			return Ok(None);
+		};
+		if command.is_empty() || command.starts_with('/') {
+			return Ok(None);
+		}
+		let split = command.find(char::is_whitespace).unwrap_or(command.len());
+		let name = &command[..split];
+		let args = command[split..].trim();
+		match name {
+			"help" => {
+				let output = {
+					let state = self.state.lock();
+					serde_json::to_string_pretty(&available_commands(
+						&state.content,
+						state.command_generation,
+					))
+					.into_diagnostic()?
+				};
+				self.command_output(session_id, Str::from(output))?;
+				return Ok(Some(AcpPromptIntercept::Consumed));
+			},
+			"reload-plugins" => {
+				self.reload_commands(session_id)?;
+				self.command_output(session_id, sf!("Extensions and commands reloaded."))?;
+				return Ok(Some(AcpPromptIntercept::Consumed));
+			},
+			"usage" => {
+				let usage = self
+					.session(session_id)?
+					.mapper
+					.lock()
+					.usage
+					.clone()
+					.unwrap_or_else(|| json!({"input_tokens":0,"output_tokens":0,"total_tokens":0}));
+				self.command_output(session_id, Str::from(usage.to_string()))?;
+				return Ok(Some(AcpPromptIntercept::Consumed));
+			},
+			"model" if !args.is_empty() => {
+				let mut params = Map::new();
+				params.insert("sessionId".into(), json!(session_id));
+				params.insert("modelId".into(), json!(args));
+				self.set_model(&params).await?;
+				self.command_output(session_id, sf!("Model changed to {args}."))?;
+				return Ok(Some(AcpPromptIntercept::Consumed));
+			},
+			"plan" => {
+				let mode = if matches!(args, "off" | "exit" | "default") {
+					"default"
+				} else {
+					"plan"
+				};
+				let mut params = Map::new();
+				params.insert("sessionId".into(), json!(session_id));
+				params.insert("modeId".into(), json!(mode));
+				self.set_mode(&params).await?;
+				self.command_output(session_id, sf!("Mode changed to {mode}."))?;
+				return Ok(Some(AcpPromptIntercept::Consumed));
+			},
+			"quit" | "exit" => return Ok(Some(AcpPromptIntercept::Exit)),
+			_ => {},
+		}
+		let template = {
+			let state = self.state.lock();
+			state
+				.content
+				.commands
+				.iter()
+				.find(|command| command.name.as_str() == name)
+				.and_then(|command| command.template.clone())
+		};
+		let Some(template) = template else {
+			return Ok(None);
+		};
+		let expanded = template
+			.replace("{{args}}", args)
+			.replace("$ARGUMENTS", args);
+		self.command_output(session_id, sf!("Command /{name} expanded."))?;
+		Ok(Some(AcpPromptIntercept::Prompt(Str::from(expanded))))
+	}
+
+	fn command_output(&self, session_id: &Str, content: Str) -> miette::Result<()> {
+		self.update(
+			session_id,
+			json!({"sessionUpdate":"command_output","stream":"stdout","content":content,"status":"completed"}),
+		)
+	}
+
 	async fn start_prompt(
 		self: &Arc<Self>,
 		request_id: Value,
@@ -1371,9 +2029,31 @@ impl Runtime {
 			.get("prompt")
 			.or_else(|| params.get("content"))
 			.ok_or_else(|| miette!("missing prompt content"))?;
-		let (parts, _) = convert_blocks(blocks)?;
+		let (mut parts, _) = convert_blocks(blocks)?;
 		if parts.is_empty() {
 			return Err(miette!("prompt contains no supported content"));
+		}
+		if parts.len() == 1
+			&& let ContentPart::Text { text, .. } = &parts[0]
+			&& let Some(intercept) = self.intercept_prompt(&session_id, text.as_str()).await?
+		{
+			match intercept {
+				AcpPromptIntercept::Prompt(prompt) => {
+					parts = vec![ContentPart::Text { text: prompt, proof: None }];
+				},
+				AcpPromptIntercept::Consumed => {
+					self.respond(request_id, json!({"stopReason":"end_turn","command":true}))?;
+					return Ok(());
+				},
+				AcpPromptIntercept::Exit => {
+					let _ = self.close_session(&params).await;
+					self.respond(
+						request_id,
+						json!({"stopReason":"end_turn","command":true,"exit":true}),
+					)?;
+					return Ok(());
+				},
+			}
 		}
 		let proposed_title = parts.iter().find_map(|part| match part {
 			ContentPart::Text { text, .. } if !text.trim().is_empty() => {
@@ -1509,7 +2189,7 @@ impl Runtime {
 		self.update(session_id, json!({"sessionUpdate":"config_option_update","configOptions":config_options(&meta,&state.models)}))?;
 		self.update(
 			session_id,
-			json!({"sessionUpdate":"available_commands_update","availableCommands":available_commands()}),
+			json!({"sessionUpdate":"available_commands_update","availableCommands":available_commands(&state.content,state.command_generation),"generation":state.command_generation}),
 		)?;
 		self.update(session_id, json!({
 			"sessionUpdate":"capabilities_update",
@@ -2079,12 +2759,42 @@ fn scoped_mcp_prefix(session_id: &str) -> String {
 	format!("acp-{session}-")
 }
 
-fn available_commands() -> Vec<Value> {
-	CommandRoster::builtins()
+fn available_commands(
+	content: &crate::discovery::ActiveContentSnapshots,
+	generation: u64,
+) -> Vec<Value> {
+	let mut commands = CommandRoster::builtins()
 		.advertised(CommandSurface::Acp, CommandRole::Owner, true, |_| true)
 		.into_iter()
-		.map(|command| json!({"name":command.name,"description":command.description,"input":command.argument_hint}))
-		.collect()
+		.map(|command| {
+			json!({
+				"name":command.name,
+				"description":command.description,
+				"input":command.argument_hint,
+				"source":command.provenance.source,
+				"generation":command.provenance.generation,
+			})
+		})
+		.collect::<Vec<_>>();
+	commands.extend(content.commands.iter().map(|command| {
+		json!({
+			"name":command.name,
+			"description":command.description,
+			"input":{"hint":command.hint},
+			"source":command.origin,
+			"generation":generation,
+		})
+	}));
+	commands.extend(content.skills.visible().map(|skill| {
+		json!({
+			"name":format!("skill:{}",skill.name),
+			"description":skill.description,
+			"input":{"hint":"[arguments]"},
+			"source":skill.source,
+			"generation":generation,
+		})
+	}));
+	commands
 }
 
 fn session_config_response(

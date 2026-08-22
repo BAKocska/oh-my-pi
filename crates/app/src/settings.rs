@@ -13,6 +13,13 @@ pub mod subscription;
 use omp_agent::{CompactionMethodOrder, CompactionTier};
 use omp_core::{Duration, DurationError, Str, sf};
 use omp_llm_inference::{Difficulty, DifficultyBackend};
+mod domains;
+pub use domains::{
+	AppearanceSettings, CompletionSettings, DisplaySettings, ErrorNotificationSettings,
+	HyperlinkMode, InteractionSettings, LifecycleSettings, NotifyToggle, RootDisplaySettings,
+	ShareSettings, ShareStore, ShimmerMode, TitleSettings, TtsrContextMode, TtsrInterruptMode,
+	TtsrSettings, TuiSettings,
+};
 pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
 use omp_tool::DEFAULT_INTERRUPT_GRACE;
 use omp_tui::components::ComposerStyle;
@@ -279,12 +286,23 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		secret:      false,
 	},
 	omp_settings::FieldDescriptor {
-		path:        "images.auto_resize",
+		path:        "images.autoResize",
 		label:       "Auto-resize images",
 		description: "Resize large prompt images to 2000x2000 while preserving format.",
 		kind:        omp_settings::SettingKind::Boolean,
 		scopes:      PERSISTED_SCOPES,
 		order:       81,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "images.describeForTextModels",
+		label:       "Describe images for text models",
+		description: "Describe attached images when the selected model lacks vision support.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       82,
 		options:     None,
 		condition:   None,
 		secret:      false,
@@ -552,15 +570,19 @@ pub struct ComposerSettings {
 
 /// Prompt image attachment policy.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ImageSettings {
 	/// Resize dimensions above the provider-compatible ceiling.
 	#[serde(default = "default_true")]
-	pub auto_resize: bool,
+	pub auto_resize:              bool,
+	/// Describe images through a vision-capable model when the selected model
+	/// cannot consume them.
+	pub describe_for_text_models: bool,
 }
 
 impl Default for ImageSettings {
 	fn default() -> Self {
-		Self { auto_resize: true }
+		Self { auto_resize: true, describe_for_text_models: true }
 	}
 }
 
@@ -752,6 +774,39 @@ pub struct Settings {
 	/// Interactive composer appearance.
 	#[serde(default)]
 	pub composer:      ComposerSettings,
+	/// Terminal display and rendering behavior.
+	#[serde(default)]
+	pub display:       DisplaySettings,
+	/// Pi-compatible TUI rendering and input settings.
+	#[serde(default)]
+	pub tui:           TuiSettings,
+	/// Root-level Pi-compatible display switches.
+	#[serde(flatten)]
+	pub root_display:  RootDisplaySettings,
+	/// Theme, status-line, and icon choices.
+	#[serde(default)]
+	pub appearance:    AppearanceSettings,
+	/// Notifications, voice, loops, and input behavior.
+	#[serde(default)]
+	pub interaction:   InteractionSettings,
+	/// Successful-turn notification policy.
+	#[serde(default)]
+	pub completion:    CompletionSettings,
+	/// Failed-turn notification policy.
+	#[serde(default)]
+	pub error:         ErrorNotificationSettings,
+	/// Time-traveling stream-rule policy.
+	#[serde(default)]
+	pub ttsr:          TtsrSettings,
+	/// Miscellaneous startup, retention, and workspace policy.
+	#[serde(default)]
+	pub lifecycle:     LifecycleSettings,
+	/// Encrypted session-sharing endpoint and backing store.
+	#[serde(default)]
+	pub share:         ShareSettings,
+	/// Session title generation policy.
+	#[serde(default)]
+	pub title:         TitleSettings,
 	/// Client-scope extension overlay.
 	#[serde(default)]
 	pub extensions:    ExtensionOverlay,

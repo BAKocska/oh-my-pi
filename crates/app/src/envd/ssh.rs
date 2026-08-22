@@ -14,7 +14,7 @@ use russh::{
 	keys::{HashAlg, load_secret_key},
 };
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 const DEFAULT_READ_LIMIT: usize = 8 * 1024 * 1024;
@@ -24,7 +24,7 @@ const DEFAULT_EXEC_LIMIT: usize = 1024 * 1024;
 const MAX_TIMEOUT_SECS: u64 = 120;
 
 /// A configured native SSH host.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
 	/// DNS name or numeric address.
@@ -51,7 +51,7 @@ const fn default_timeout() -> u64 {
 }
 
 /// Explicit SSH authentication policy. Passwords are intentionally unsupported.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthPolicy {
 	/// Use identities from the native SSH agent protocol.
@@ -61,7 +61,7 @@ pub enum AuthPolicy {
 	Key { path: PathBuf },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct HostFile {
 	#[serde(default)]
@@ -106,6 +106,33 @@ impl HostStore {
 	pub fn aliases(&self) -> Vec<Str> {
 		self.hosts.read().keys().cloned().collect()
 	}
+
+	/// Atomically inserts or replaces one validated host in this scoped store.
+	pub fn upsert(&self, path: &Path, alias: Str, host: HostConfig) -> Result<(), SshError> {
+		validate_alias(alias.as_str())?;
+		validate_host(&host)?;
+		let mut hosts = self.hosts.write();
+		hosts.insert(alias, host);
+		persist_hosts(path, &hosts)
+	}
+
+	/// Atomically removes one host from this scoped store.
+	pub fn remove(&self, path: &Path, alias: &str) -> Result<bool, SshError> {
+		validate_alias(alias)?;
+		let mut hosts = self.hosts.write();
+		let removed = hosts.remove(alias).is_some();
+		if removed {
+			persist_hosts(path, &hosts)?;
+		}
+		Ok(removed)
+	}
+}
+
+fn persist_hosts(path: &Path, hosts: &BTreeMap<Str, HostConfig>) -> Result<(), SshError> {
+	let body = toml::to_string_pretty(&HostFile { hosts: hosts.clone() })
+		.map_err(|source| SshError::ConfigEncode { path: path.to_path_buf(), source })?;
+	crate::settings::io::atomic_replace(path, &body)
+		.map_err(|source| SshError::ConfigWrite { path: path.to_path_buf(), source })
 }
 
 fn validate_alias(alias: &str) -> Result<(), SshError> {
@@ -437,6 +464,18 @@ pub enum SshError {
 		path:   PathBuf,
 		#[source]
 		source: toml::de::Error,
+	},
+	#[error("cannot encode SSH host configuration {path}")]
+	ConfigEncode {
+		path:   PathBuf,
+		#[source]
+		source: toml::ser::Error,
+	},
+	#[error("cannot atomically write SSH host configuration {path}")]
+	ConfigWrite {
+		path:   PathBuf,
+		#[source]
+		source: crate::settings::io::SettingsIoError,
 	},
 	#[error("invalid configured SSH alias {alias}")]
 	InvalidAlias { alias: Str },

@@ -1,6 +1,10 @@
 //! Deterministic account-pool selection simulation and opt-in live benchmark.
 
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{
+	collections::{BTreeMap, hash_map::DefaultHasher},
+	hash::{Hash as _, Hasher as _},
+	time::SystemTime,
+};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_core::Str;
@@ -49,19 +53,22 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 	let mut counts = BTreeMap::<String, u32>::new();
 	let mut receipts = Vec::with_capacity(args.count as usize);
 	for sample in 0..args.count {
-		let previous = (sample != 0).then(|| {
-			accounts[(sample as usize - 1) % accounts.len()]
-				.account
-				.clone()
-		});
+		// pi samples a fresh randomized session id for every attempt. Feed the
+		// same distribution into the canonical pool by making the hashed
+		// session bucket the preferred preceding account.
+		let session_id = crate::cli::turn_id();
+		let mut hasher = DefaultHasher::new();
+		session_id.hash(&mut hasher);
+		let bucket = usize::try_from(hasher.finish()).unwrap_or_default() % accounts.len();
+		let preferred = accounts[bucket].account.clone();
 		let selection = pool
 			.select(&AccountSelectionRequest {
 				provider:           provider.clone(),
 				route:              route.clone(),
 				affinity:           None,
-				previous_account:   previous,
+				previous_account:   Some(preferred),
 				previous_principal: None,
-				rotate:             sample != 0,
+				rotate:             false,
 				rotation:           RotationPolicy::default(),
 				now:                SystemTime::now(),
 			})
@@ -71,6 +78,7 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 			.or_default() += 1;
 		receipts.push(json!({
 			"sample": sample,
+			"sessionId": session_id,
 			"account": mask(selection.record.account.as_str()),
 			"candidateCount": selection.receipt.candidates.len(),
 		}));

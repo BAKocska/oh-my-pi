@@ -533,6 +533,22 @@ impl ProjectEnvironment {
 		self.lifecycle.server.bind_acp_exec(backend);
 	}
 
+	/// Binds or clears the editor-owned document backend for this environment
+	/// composition.
+	pub(crate) fn bind_acp_documents(&self, backend: Option<Arc<dyn docs::AcpDocumentBackend>>) {
+		self.lifecycle.server.bind_acp_documents(backend);
+	}
+
+	/// Binds or clears the durable approval authority for Environment
+	/// fallbacks.
+	pub(crate) fn bind_approval_authority(
+		&self,
+		book: Option<Arc<omp_agent::ApprovalBook>>,
+		route: Option<omp_agent::ApprovalRoute>,
+	) {
+		self.lifecycle.server.bind_approval_authority(book, route);
+	}
+
 	/// Returns the session's sole Off/Mnemopi runtime.
 
 	pub(crate) fn memory_runtime(&self) -> Arc<omp_memory::MemoryRuntime> {

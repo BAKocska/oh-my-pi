@@ -17,6 +17,10 @@ use omp_proto::env::v1::{
 use omp_tool::{BlobRef, JobOwner};
 use omp_tools::{
 	auto_background::DetachedJob,
+	read::{
+		resolver::{ResolverTable, Scheme},
+		selector::parse_uri,
+	},
 	shell::{
 		DetachRequest, ExecOutcome, ExecStatus, Fault, OutputChannel, RunEvent, RunRequest, Session,
 		SessionOptions, ShellExec, ShellRun, Update,
@@ -26,6 +30,7 @@ use omp_tools::{
 use super::{
 	exec::{ExecError, ExecEvent, ExecHost, ExecRun},
 	exec_settings::{DirenvMode, ShellProfile, ShellSettings},
+	tool_url::UrlResolver,
 };
 
 /// Session-scoped ACP terminal execution selected ahead of local shell
@@ -81,6 +86,7 @@ impl AcpExecSlot {
 pub struct ShellExecHost {
 	host:         ExecHost,
 	cwd_uri:      Str,
+	resolvers:    Arc<ResolverTable<UrlResolver>>,
 	settings:     ShellSettings,
 	acp:          AcpExecSlot,
 	acp_routing:  bool,
@@ -99,6 +105,7 @@ impl ShellExecHost {
 	pub(crate) fn new(
 		host: ExecHost,
 		cwd_uri: Str,
+		resolvers: Arc<ResolverTable<UrlResolver>>,
 		settings: ShellSettings,
 		acp: AcpExecSlot,
 		acp_routing: bool,
@@ -106,6 +113,7 @@ impl ShellExecHost {
 		Self {
 			host,
 			cwd_uri,
+			resolvers,
 			settings,
 			acp,
 			acp_routing,
@@ -211,7 +219,71 @@ impl ShellExecHost {
 		rendered
 	}
 
-	fn resolve_cwd(&self, requested: Option<&str>) -> Result<Str, Fault> {
+	async fn expand_internal_uris(&self, input: &str, shell_source: bool) -> Result<Str, Fault> {
+		let mut paths = BTreeMap::new();
+		for occurrence in omp_tools::shell_uri::scan(input) {
+			if occurrence.quote == omp_tools::shell_uri::QuoteContext::Single
+				|| paths.contains_key(&occurrence.uri)
+			{
+				continue;
+			}
+			let parsed = parse_uri(occurrence.uri.as_str())
+				.map_err(|_| Fault::Resource {
+					operation: sf!("materialize"),
+					message:   sf!("invalid internal resource URI: {}", occurrence.uri),
+				})?
+				.ok_or_else(|| Fault::Resource {
+					operation: sf!("materialize"),
+					message:   sf!("internal resource URI is missing a scheme"),
+				})?;
+			if parsed.scheme == Scheme::Unknown {
+				continue;
+			}
+			let Some(resolved) = self.resolvers.path(parsed.scheme, parsed.resource).await else {
+				continue;
+			};
+			let resolved = resolved.map_err(|_| Fault::Resource {
+				operation: sf!("materialize"),
+				message:   sf!("internal resource has no materializable path: {}", occurrence.uri),
+			})?;
+			let Some(path_uri) = resolved.canonical_path_uri else {
+				continue;
+			};
+			let path = url::Url::parse(path_uri.as_str())
+				.ok()
+				.and_then(|uri| uri.to_file_path().ok())
+				.ok_or_else(|| Fault::Resource {
+					operation: sf!("materialize"),
+					message:   sf!("internal resource path is not a local file URI"),
+				})?;
+			paths.insert(occurrence.uri, Str::from(path.to_string_lossy().as_ref()));
+		}
+		Ok(if shell_source {
+			omp_tools::shell_uri::replace(input, &paths)
+		} else {
+			omp_tools::shell_uri::replace_plain(input, &paths)
+		})
+	}
+
+	async fn expand_environment(
+		&self,
+		environment: BTreeMap<Str, Str>,
+	) -> Result<BTreeMap<Str, Str>, Fault> {
+		let mut expanded = BTreeMap::new();
+		for (name, value) in environment {
+			expanded.insert(name, self.expand_internal_uris(value.as_str(), false).await?);
+		}
+		Ok(expanded)
+	}
+
+	async fn resolve_cwd(&self, requested: Option<&str>) -> Result<Str, Fault> {
+		let expanded;
+		let requested = if let Some(value) = requested {
+			expanded = self.expand_internal_uris(value, false).await?;
+			Some(expanded.as_str())
+		} else {
+			None
+		};
 		let root = url::Url::parse(&self.cwd_uri)
 			.map_err(|error| cwd_fault(format!("workspace root URI is invalid: {error}")))?;
 		let root_path = root
@@ -490,9 +562,11 @@ impl ShellExec for ShellExecHost {
 	type Run = SelectedShellRun;
 
 	async fn open_session(&self, options: SessionOptions) -> Result<Session, Fault> {
-		let cwd_uri = self.resolve_cwd(options.cwd.as_deref())?;
+		let cwd_uri = self.resolve_cwd(options.cwd.as_deref()).await?;
 		let pty = options.pty;
-		let environment = self.environment(&cwd_uri, options.env, pty).await;
+		let environment = self
+			.environment(&cwd_uri, self.expand_environment(options.env).await?, pty)
+			.await;
 		if self.acp_routing && self.acp.backend().is_some() && !pty {
 			let cwd = url::Url::parse(&cwd_uri)
 				.ok()
@@ -547,6 +621,9 @@ impl ShellExec for ShellExecHost {
 		session: &'a Session,
 		request: RunRequest,
 	) -> Result<Self::Run, Fault> {
+		let command = self
+			.expand_internal_uris(request.command.as_str(), true)
+			.await?;
 		let acp_options = self.acp_sessions.lock().get(&session.id).cloned();
 		if let Some(options) = acp_options {
 			let backend = self.acp.backend().ok_or_else(|| Fault::Resource {
@@ -556,9 +633,9 @@ impl ShellExec for ShellExecHost {
 			return backend
 				.run(AcpExecRequest {
 					command:    if options.command_prefix.is_empty() {
-						request.command
+						command
 					} else {
-						sf!("{}{}", options.command_prefix, request.command)
+						sf!("{}{}", options.command_prefix, command)
 					},
 					cwd:        options.cwd,
 					env:        options.env,
@@ -572,7 +649,7 @@ impl ShellExec for ShellExecHost {
 			.exec(
 				ExecRequest {
 					session: session.id.clone(),
-					source: Some(Script { text: request.command.to_string(), ..Default::default() }),
+					source: Some(Script { text: command.to_string(), ..Default::default() }),
 					..Default::default()
 				},
 				request.timeout_ms.map(Duration::from_millis),
@@ -585,16 +662,21 @@ impl ShellExec for ShellExecHost {
 	}
 
 	async fn detach(&self, request: DetachRequest) -> Result<DetachedJob, Fault> {
-		let cwd_uri = self.resolve_cwd(request.options.cwd.as_deref())?;
+		let cwd_uri = self.resolve_cwd(request.options.cwd.as_deref()).await?;
 		let pty = request.options.pty;
-		let environment = self.environment(&cwd_uri, request.options.env, pty).await;
+		let environment = self
+			.environment(&cwd_uri, self.expand_environment(request.options.env).await?, pty)
+			.await;
+		let command = self
+			.expand_internal_uris(request.command.as_str(), true)
+			.await?;
 		let started = self
 			.host
 			.start_process(StartProcess {
 				name: request.name.to_string(),
 				spec: Some(ProcessSpec {
 					source: Some(Script {
-						text: self.detached_command(&request.command).await,
+						text: self.detached_command(&command).await,
 						..Default::default()
 					}),
 					cwd_uri: cwd_uri.to_string(),

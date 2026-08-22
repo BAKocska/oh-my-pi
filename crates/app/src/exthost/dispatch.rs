@@ -9,9 +9,9 @@ use std::{
 use omp_agent::JournalCustomEntry;
 use omp_core::{CowBytes, SparseMap, Str};
 use omp_proto::toolhost::v1::{
-	Dispatch as HookDispatch, HookEventId, HookHostEnvelope, LifecycleEventContext,
-	TtsrTriggeredEventV1, WorkerFrame, hook_host_envelope, lifecycle_worker_envelope,
-	ui_worker_envelope, worker_frame,
+	Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId, HookHostEnvelope,
+	LifecycleEventContext, RetryLifecycleEventV1, TodoReminderEventV1, TtsrTriggeredEventV1,
+	WorkerFrame, hook_host_envelope, lifecycle_worker_envelope, ui_worker_envelope, worker_frame,
 };
 use parking_lot::Mutex;
 use prost::Message;
@@ -187,6 +187,90 @@ pub fn ttsr_event_from_journal(
 		revision: 1,
 		payload:  CowBytes::from(event.encode_to_vec()),
 	}))
+}
+
+/// Emits the revision-1 todo reminder contract from the authoritative todo
+/// projection.
+pub fn todo_reminder_event(
+	context: LifecycleEventContext,
+	pending: u32,
+	reminder: Str,
+) -> Result<LifecycleEvent, LifecycleEventError> {
+	let event = TodoReminderEventV1 {
+		context: Some(context),
+		pending,
+		reminder: bounded_event_text(reminder, MAX_EVENT_TEXT_BYTES),
+	};
+	lifecycle_event(HookEventId::HookEventTodoReminder, event)
+}
+
+/// Emits one revision-1 inference retry transition.
+pub fn retry_event(
+	context: LifecycleEventContext,
+	started: bool,
+	attempt: u32,
+	maximum: u32,
+	delay_ms: u64,
+	reason: Str,
+	outcome: Option<Str>,
+) -> Result<LifecycleEvent, LifecycleEventError> {
+	let event = RetryLifecycleEventV1 {
+		context: Some(context),
+		attempt,
+		maximum,
+		delay_ms,
+		reason: bounded_event_text(reason, 512),
+		outcome: outcome.map(|value| bounded_event_text(value, 512)),
+	};
+	lifecycle_event(
+		if started {
+			HookEventId::HookEventRetryStart
+		} else {
+			HookEventId::HookEventRetryEnd
+		},
+		event,
+	)
+}
+
+/// Emits one revision-1 inference fallback transition.
+pub fn fallback_event(
+	context: LifecycleEventContext,
+	succeeded: bool,
+	source_model: Str,
+	target_model: Str,
+	reason: Str,
+) -> Result<LifecycleEvent, LifecycleEventError> {
+	let event = FallbackLifecycleEventV1 {
+		context:      Some(context),
+		source_model: bounded_event_text(source_model, 512),
+		target_model: bounded_event_text(target_model, 512),
+		reason:       bounded_event_text(reason, 512),
+	};
+	lifecycle_event(
+		if succeeded {
+			HookEventId::HookEventFallbackSucceeded
+		} else {
+			HookEventId::HookEventFallbackApplied
+		},
+		event,
+	)
+}
+
+fn lifecycle_event(
+	id: HookEventId,
+	payload: impl Message,
+) -> Result<LifecycleEvent, LifecycleEventError> {
+	let payload = CowBytes::from(payload.encode_to_vec());
+	if payload.len() > MAX_LIFECYCLE_EVENT_BYTES {
+		return Err(LifecycleEventError::PayloadTooLarge);
+	}
+	Ok(LifecycleEvent { id, revision: 1, payload })
+}
+
+fn bounded_event_text(value: Str, limit: usize) -> String {
+	let mut value = value.to_string();
+	value.truncate(value.floor_char_boundary(limit));
+	value
 }
 
 /// Invocation bytes awaiting host dispatch.

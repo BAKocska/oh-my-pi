@@ -252,7 +252,7 @@ pub const COMMANDS: &[CommandSpec] = &[
 	},
 	CommandSpec {
 		name:        "agents",
-		aliases:     &["tree"],
+		aliases:     &[],
 		description: "Open the live agent hierarchy",
 		usage:       "",
 		subcommands: &[],

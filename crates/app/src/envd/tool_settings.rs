@@ -47,6 +47,31 @@ pub struct ToolSettings {
 	/// Authoritative per-tool approval policy overrides.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
 	pub approval:             BTreeMap<Str, ApprovalPolicy>,
+	/// Permit fuzzy edit matching when exact anchors are unavailable.
+	pub edit_fuzzy:           bool,
+	/// Require files to have been read before mutation.
+	pub edit_require_seen:    bool,
+	/// Refuse generated-file edits unless explicitly requested.
+	pub edit_guard_generated: bool,
+	/// Maximum bytes returned by one read call before spill/summarization.
+	pub read_max_bytes:       u64,
+	/// Summarize supported oversized documents.
+	pub read_summarize:       bool,
+	/// Include source line numbers in text reads.
+	pub read_line_numbers:    bool,
+	/// Default context lines around grep matches.
+	pub grep_context_lines:   u16,
+	/// Named eval interpreter command overrides.
+	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
+	pub eval_interpreters:    BTreeMap<Str, Str>,
+	/// Bytes retained inline before tool output spills.
+	pub output_spill_bytes:   u64,
+	/// Hard byte ceiling for one materialized tool output.
+	pub output_max_bytes:     u64,
+	/// Include tool-intent decisions in diagnostic tracing.
+	pub intent_tracing:       bool,
+	/// Maximum repeated equivalent tool calls before the loop guard trips.
+	pub loop_guard_limit:     u32,
 }
 
 impl Default for ToolSettings {
@@ -64,6 +89,18 @@ impl Default for ToolSettings {
 			diagnostic_dedup:     true,
 			approval_mode:        ApprovalMode::Yolo,
 			approval:             BTreeMap::new(),
+			edit_fuzzy:           true,
+			edit_require_seen:    true,
+			edit_guard_generated: true,
+			read_max_bytes:       1024 * 1024,
+			read_summarize:       true,
+			read_line_numbers:    true,
+			grep_context_lines:   2,
+			eval_interpreters:    BTreeMap::new(),
+			output_spill_bytes:   64 * 1024,
+			output_max_bytes:     16 * 1024 * 1024,
+			intent_tracing:       false,
+			loop_guard_limit:     8,
 		}
 	}
 }
@@ -153,6 +190,90 @@ impl SettingsDomain for ToolSettings {
 			condition:   None,
 			secret:      false,
 		},
+		field(
+			"tools.edit_fuzzy",
+			"Fuzzy Edit",
+			"Permit fuzzy edit anchor matching.",
+			SettingKind::Boolean,
+			60,
+		),
+		field(
+			"tools.edit_require_seen",
+			"Seen-line Edit Guard",
+			"Require a prior read before mutation.",
+			SettingKind::Boolean,
+			70,
+		),
+		field(
+			"tools.edit_guard_generated",
+			"Generated-file Guard",
+			"Refuse incidental generated-file edits.",
+			SettingKind::Boolean,
+			80,
+		),
+		field(
+			"tools.read_max_bytes",
+			"Read Byte Limit",
+			"Maximum bytes returned by one read call.",
+			SettingKind::Integer,
+			90,
+		),
+		field(
+			"tools.read_summarize",
+			"Read Summarization",
+			"Summarize supported oversized documents.",
+			SettingKind::Boolean,
+			100,
+		),
+		field(
+			"tools.read_line_numbers",
+			"Read Line Numbers",
+			"Include line numbers in text reads.",
+			SettingKind::Boolean,
+			110,
+		),
+		field(
+			"tools.grep_context_lines",
+			"Grep Context",
+			"Default context lines around matches.",
+			SettingKind::Integer,
+			140,
+		),
+		field(
+			"tools.eval_interpreters",
+			"Eval Interpreters",
+			"Named eval interpreter overrides.",
+			SettingKind::Table,
+			150,
+		),
+		field(
+			"tools.output_spill_bytes",
+			"Output Spill Threshold",
+			"Bytes retained inline before spill.",
+			SettingKind::Integer,
+			160,
+		),
+		field(
+			"tools.output_max_bytes",
+			"Output Byte Limit",
+			"Hard materialized output ceiling.",
+			SettingKind::Integer,
+			170,
+		),
+		field(
+			"tools.intent_tracing",
+			"Intent Tracing",
+			"Trace tool intent decisions.",
+			SettingKind::Boolean,
+			200,
+		),
+		field(
+			"tools.loop_guard_limit",
+			"Loop Guard",
+			"Repeated equivalent calls before interruption.",
+			SettingKind::Integer,
+			210,
+		),
 	];
 
 	fn validate(&self) -> Result<(), ValidationError> {
@@ -161,10 +282,34 @@ impl SettingsDomain for ToolSettings {
 			.keys()
 			.chain(self.enabled.keys())
 			.any(|name| name.trim().is_empty())
+			|| self.read_max_bytes == 0
+			|| self.output_spill_bytes == 0
+			|| self.output_max_bytes < self.output_spill_bytes
+			|| self.loop_guard_limit == 0
 		{
 			return Err(ValidationError::DomainInvariant { domain: Self::DOMAIN });
 		}
 		Ok(())
+	}
+}
+
+const fn field(
+	path: &'static str,
+	label: &'static str,
+	description: &'static str,
+	kind: SettingKind,
+	order: u16,
+) -> FieldDescriptor {
+	FieldDescriptor {
+		path,
+		label,
+		description,
+		kind,
+		scopes: PERSISTED,
+		order,
+		options: None,
+		condition: None,
+		secret: false,
 	}
 }
 

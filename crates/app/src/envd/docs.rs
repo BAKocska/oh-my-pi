@@ -2,7 +2,10 @@
 
 use std::{
 	collections::HashMap,
+	fmt,
+	future::Future,
 	path::Path,
+	pin::Pin,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -22,6 +25,50 @@ use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
+/// Editor-client document authority installed for an ACP session.
+///
+/// The boxed futures are confined to this cold dynamic RPC boundary; ordinary
+/// document and tool calls remain statically dispatched.
+pub(crate) trait AcpDocumentBackend: Send + Sync {
+	/// Reads the editor's exact current UTF-8 buffer for an absolute path.
+	fn read_text(
+		&self,
+		absolute_path: Str,
+	) -> Pin<Box<dyn Future<Output = miette::Result<Str>> + Send + '_>>;
+
+	/// Writes the editor buffer and returns its authoritative read-back after
+	/// any client format-on-save hook.
+	fn write_text(
+		&self,
+		absolute_path: Str,
+		content: Str,
+	) -> Pin<Box<dyn Future<Output = miette::Result<Str>> + Send + '_>>;
+}
+
+/// Late-bound ACP document capability shared by every tool adapter using one
+/// document connection.
+#[derive(Clone, Default)]
+pub(crate) struct AcpDocumentSlot(Arc<RwLock<Option<Arc<dyn AcpDocumentBackend>>>>);
+
+impl fmt::Debug for AcpDocumentSlot {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("AcpDocumentSlot")
+			.field("bound", &self.0.read().is_some())
+			.finish()
+	}
+}
+
+impl AcpDocumentSlot {
+	/// Replaces the active editor-client authority.
+	pub(crate) fn bind(&self, backend: Option<Arc<dyn AcpDocumentBackend>>) {
+		*self.0.write() = backend;
+	}
+
+	fn backend(&self) -> Option<Arc<dyn AcpDocumentBackend>> {
+		self.0.read().clone()
+	}
+}
 
 /// Metadata established by the document protocol hello exchange.
 #[derive(Clone, Debug)]
@@ -240,6 +287,7 @@ pub enum DocumentError {
 struct Inner {
 	hello:                    DocumentHello,
 	resource_mutations:       RwLock<Option<ResourceMutationServices>>,
+	acp_documents:            AcpDocumentSlot,
 	writer:                   flume::Sender<pb::ClientFrame>,
 	pending:                  Arc<Mutex<HashMap<u64, flume::Sender<pb::ServerFrame>>>>,
 	document_events:          Arc<Mutex<DocumentEventSubscribers>>,
@@ -268,6 +316,27 @@ pub struct DocumentHost {
 }
 
 impl DocumentHost {
+	/// Binds or clears the editor-owned document authority.
+	pub(crate) fn bind_acp_documents(&self, backend: Option<Arc<dyn AcpDocumentBackend>>) {
+		self.inner.acp_documents.bind(backend);
+	}
+
+	/// Reads the current editor buffer when an ACP document authority is live.
+	pub(crate) async fn read_acp_text(&self, absolute_path: Str) -> Option<miette::Result<Str>> {
+		let backend = self.inner.acp_documents.backend()?;
+		Some(backend.read_text(absolute_path).await)
+	}
+
+	/// Writes through the current editor and returns its formatted read-back.
+	pub(crate) async fn write_acp_text(
+		&self,
+		absolute_path: Str,
+		content: Str,
+	) -> Option<miette::Result<Str>> {
+		let backend = self.inner.acp_documents.backend()?;
+		Some(backend.write_text(absolute_path, content).await)
+	}
+
 	/// Installs the app-owned capability-checked internal resource writers.
 	pub(super) fn set_resource_mutations(&self, services: ResourceMutationServices) {
 		*self.inner.resource_mutations.write() = Some(services);
@@ -337,6 +406,7 @@ impl DocumentHost {
 		let inner = Arc::new(Inner {
 			hello,
 			resource_mutations: RwLock::new(None),
+			acp_documents: AcpDocumentSlot::default(),
 			writer: write_tx,
 			pending: Arc::new(Mutex::new(HashMap::new())),
 			document_events: Arc::new(Mutex::new(HashMap::new())),

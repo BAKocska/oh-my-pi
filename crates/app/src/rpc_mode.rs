@@ -15,7 +15,7 @@ use std::{
 use flume::{Receiver, Sender};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::{ExposeSecret as _, SecretString, Str};
+use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use omp_llm_catalog::{ModelKey, ProviderId};
 use omp_llm_inference::{
 	Client, Registry,
@@ -35,14 +35,14 @@ use omp_rpc::{
 		encode_json_v1, encode_json_v2,
 	},
 	protocol::{
-		ExtensionUiResponse, HostToolCall, HostToolCancel, HostToolDefinition, HostToolResult,
-		HostToolUpdate, HostUriCancel, HostUriOperation, HostUriRequest, HostUriResult,
-		HostUriScheme, MAX_HOST_URI_DESCRIPTION_BYTES, MAX_HOST_URI_NOTE_BYTES, MAX_HOST_URI_NOTES,
-		MAX_HOST_URI_SCHEME_BYTES, MAX_HOST_URI_SCHEMES, OAuthProvider, PROTOCOL_V1, PROTOCOL_V2,
-		ReadyFrame, RequestId, RpcAuthAccount, RpcAuthAnswerFrame, RpcAuthEvent, RpcAuthEventFrame,
-		RpcAuthInputKind, RpcAuthMethod, RpcAuthPromptKind, RpcAuthTerminalFrame,
-		RpcAuthTerminalOutcome, RpcErrorCode, RpcRequest, RpcResponse, RpcTurnOutcome,
-		SubagentMessages,
+		ExtensionUiRequest, ExtensionUiResponse, HostToolCall, HostToolCancel, HostToolDefinition,
+		HostToolResult, HostToolUpdate, HostUriCancel, HostUriOperation, HostUriRequest,
+		HostUriResult, HostUriScheme, MAX_HOST_URI_DESCRIPTION_BYTES, MAX_HOST_URI_NOTE_BYTES,
+		MAX_HOST_URI_NOTES, MAX_HOST_URI_SCHEME_BYTES, MAX_HOST_URI_SCHEMES, OAuthProvider,
+		PROTOCOL_V1, PROTOCOL_V2, ReadyFrame, RequestId, RpcAuthAccount, RpcAuthAnswerFrame,
+		RpcAuthEvent, RpcAuthEventFrame, RpcAuthInputKind, RpcAuthMethod, RpcAuthPromptKind,
+		RpcAuthTerminalFrame, RpcAuthTerminalOutcome, RpcErrorCode, RpcRequest, RpcResponse,
+		RpcTurnOutcome, SubagentMessages,
 	},
 };
 use parking_lot::Mutex;
@@ -51,6 +51,7 @@ use serde_json::{Map, Value, json};
 use tokio::{
 	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
 	process::Command,
+	sync::oneshot,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -136,7 +137,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	let runtime = Arc::new(Runtime {
 		registry,
 		auth,
-		commands: crate::chat_ui::commands::CommandRoster::builtins(),
+		commands: Mutex::new(rpc_command_roster(&args.project, 1)),
 		output: output_tx.clone(),
 		host_resources,
 		shutdown: ShutdownCoordinator::default(),
@@ -168,6 +169,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		for pending in state.pending_auth.values() {
 			pending.cancellation.cancel();
 		}
+		state.pending_extension_ui.clear();
 	}
 	runtime.host_resources.shutdown("RPC client disconnected")?;
 	crate::envd::tool_url::host::unbind(&runtime.host_resources);
@@ -679,7 +681,7 @@ impl ShutdownCoordinator {
 struct Runtime {
 	registry:       Registry,
 	auth:           AuthManager,
-	commands:       crate::chat_ui::commands::CommandRoster,
+	commands:       Mutex<crate::chat_ui::commands::CommandRoster>,
 	output:         Sender<Value>,
 	host_resources: Arc<HostResourceBroker>,
 	shutdown:       ShutdownCoordinator,
@@ -743,12 +745,18 @@ impl Runtime {
 						);
 					},
 				};
-				self.send_error(
-					Some(RequestId::new(response.id)),
-					"extension_ui_response",
-					"extension_ui_not_pending",
-					"no extension UI request is awaiting this response",
-				)
+				let pending = self.state.lock().pending_extension_ui.remove(&response.id);
+				if let Some(pending) = pending {
+					let _ = pending.send(response);
+					Ok(())
+				} else {
+					self.send_error(
+						Some(RequestId::new(response.id)),
+						"extension_ui_response",
+						"extension_ui_not_pending",
+						"no extension UI request is awaiting this response",
+					)
+				}
 			},
 			Some("host_tool_update" | "host_tool_result" | "host_tool_cancel") => {
 				self.handle_side_channel(value)
@@ -918,6 +926,7 @@ impl Runtime {
 				let text = text(params, "message")
 					.or_else(|_| text(params, "text"))?
 					.to_owned();
+				let text = self.expand_skill(&text)?.unwrap_or(text);
 				let behavior = params
 					.get("streamingBehavior")
 					.and_then(Value::as_str)
@@ -1018,6 +1027,9 @@ impl Runtime {
 			"get_subagents" => self.get_subagents(),
 			"get_subagent_messages" => self.get_subagent_messages(params).await,
 			"get_available_commands" => Ok(self.available_commands_value()),
+			"reload_extensions" => self.reload_extensions(),
+			"extension_ui_request" => self.forward_extension_ui(params).await,
+			"extension_error" => self.notify_extension_error(params),
 			"bash" | "abort_bash" => Err(CommandError::new(
 				"invalid_request",
 				"shell commands must be dispatched through the asynchronous command path",
@@ -1031,9 +1043,9 @@ impl Runtime {
 		text: &str,
 	) -> Result<CommandIntercept, CommandError> {
 		use crate::chat_ui::commands::{CommandResult, CommandSurface, DispatchResult};
-		let mut host = RpcCommandHost { runtime: self.clone(), roster: self.commands.clone() };
-		let dispatched = self
-			.commands
+		let roster = self.commands.lock().clone();
+		let mut host = RpcCommandHost { runtime: self.clone(), roster: roster.clone() };
+		let dispatched = roster
 			.dispatch(text, CommandSurface::Text, &mut host)
 			.await
 			.map_err(|error| CommandError::new("command_failed", error.to_string()))?;
@@ -1061,8 +1073,9 @@ impl Runtime {
 
 	fn available_commands_value(&self) -> Value {
 		use crate::chat_ui::commands::{CommandCapability, CommandRole, CommandSurface};
-		let commands = self
+		let mut commands = self
 			.commands
+			.lock()
 			.advertised(CommandSurface::Text, CommandRole::Owner, true, |capability| {
 				matches!(capability, CommandCapability::Session)
 			})
@@ -1077,6 +1090,16 @@ impl Runtime {
 				})
 			})
 			.collect::<Vec<_>>();
+		let state = self.state.lock();
+		commands.extend(state.content.skills.visible().map(|skill| {
+			json!({
+				"name":format!("skill:{}",skill.name),
+				"description":skill.description,
+				"argumentHint":"[arguments]",
+				"source":skill.source,
+				"generation":state.command_generation,
+			})
+		}));
 		let generation = commands
 			.iter()
 			.filter_map(|command| command.get("generation").and_then(Value::as_u64))
@@ -1092,6 +1115,118 @@ impl Runtime {
 			.expect("available command projection is an object")
 			.insert("type".into(), Value::String("available_commands_update".into()));
 		self.notify(frame)
+	}
+
+	fn expand_skill(&self, text: &str) -> Result<Option<String>, CommandError> {
+		let Some(invocation) = crate::skills::parse_invocation(text) else {
+			return Ok(None);
+		};
+		let skill = self
+			.state
+			.lock()
+			.content
+			.skills
+			.get(invocation.name.as_str())
+			.cloned()
+			.ok_or_else(|| {
+				CommandError::new("skill_not_found", format!("unknown skill `{}`", invocation.name))
+			})?;
+		let rendered = crate::skills::render_invocation(
+			&skill,
+			invocation.args.as_str(),
+			crate::skills::SkillInvocationKind::User,
+		);
+		self
+			.notify(json!({
+				"type":"command_output",
+				"stream":"stdout",
+				"content":format!("Skill `{}` loaded for this turn.",skill.name),
+				"generation":self.state.lock().command_generation,
+			}))
+			.map_err(CommandError::transport)?;
+		Ok(Some(rendered.to_string()))
+	}
+
+	fn reload_extensions(&self) -> Result<Value, CommandError> {
+		let (root, generation) = {
+			let mut state = self.state.lock();
+			state.command_generation = state.command_generation.wrapping_add(1).max(1);
+			state.content = crate::discovery::active_content_snapshots(&state.project);
+			(state.project.clone(), state.command_generation)
+		};
+		*self.commands.lock() = rpc_command_roster(&root, generation);
+		let (skills, commands) = {
+			let state = self.state.lock();
+			(state.content.skills.all().len(), state.content.commands.len())
+		};
+		self
+			.notify(json!({
+				"type":"extension_generation_update",
+				"generation":generation,
+				"capabilities":{"skills":skills,"commands":commands}
+			}))
+			.map_err(CommandError::transport)?;
+		self
+			.notify_available_commands()
+			.map_err(CommandError::transport)?;
+		Ok(json!({"generation":generation}))
+	}
+
+	async fn forward_extension_ui(
+		&self,
+		params: &Map<String, Value>,
+	) -> Result<Value, CommandError> {
+		let method = text(params, "method")?.to_owned();
+		let id = params
+			.get("id")
+			.and_then(Value::as_str)
+			.map_or_else(|| new_id("extension-ui"), str::to_owned);
+		let mut fields = params.clone();
+		fields.remove("id");
+		fields.remove("method");
+		fields.remove("type");
+		let request =
+			ExtensionUiRequest { kind: "extension_ui_request".into(), id: id.clone(), method, fields };
+		let (reply, response) = oneshot::channel();
+		{
+			let mut state = self.state.lock();
+			match state.pending_extension_ui.entry(id.clone()) {
+				std::collections::hash_map::Entry::Vacant(entry) => {
+					entry.insert(reply);
+				},
+				std::collections::hash_map::Entry::Occupied(_) => {
+					return Err(CommandError::new(
+						"extension_ui_duplicate",
+						format!("extension UI request `{id}` is already pending"),
+					));
+				},
+			}
+		}
+		if let Err(error) = self.notify(serde_json::to_value(request).map_err(CommandError::json)?) {
+			self.state.lock().pending_extension_ui.remove(&id);
+			return Err(CommandError::transport(error));
+		}
+		let response = response.await.map_err(|_| {
+			CommandError::new(
+				"extension_ui_disconnected",
+				"RPC client disconnected before answering the extension UI request",
+			)
+		})?;
+		Ok(Value::Object(response.fields))
+	}
+
+	fn notify_extension_error(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let extension = text(params, "extension")?;
+		let message = text(params, "message")?;
+		self
+			.notify(json!({
+				"type":"extension_error",
+				"extension":extension,
+				"message":message,
+				"generation":self.state.lock().command_generation,
+			}))
+			.map_err(CommandError::transport)?;
+		Ok(json!({"notified":true}))
 	}
 
 	fn submit_prompt(self: &Arc<Self>, message: String, behavior: &str) -> Result<(), CommandError> {
@@ -1887,7 +2022,7 @@ impl Runtime {
 			.get("toolCallId")
 			.and_then(Value::as_str)
 			.map_or_else(|| new_id("call"), str::to_owned);
-		{
+		let subagent_started = {
 			let mut state = self.state.lock();
 			if !state.host_tools.contains_key(name) {
 				return Err(CommandError::new(
@@ -1895,13 +2030,40 @@ impl Runtime {
 					format!("host tool `{name}` is not registered"),
 				));
 			}
+			let subagent_id = matches!(name, "task" | "agent").then(|| invocation_id.clone());
+			let started = subagent_id.as_ref().map(|id| {
+				let snapshot = SubagentSnapshot {
+					id:              id.clone(),
+					index:           u64::try_from(state.subagents.len()).unwrap_or(u64::MAX),
+					status:          "running".into(),
+					task:            arguments
+						.get("task")
+						.and_then(Value::as_str)
+						.map(str::to_owned),
+					assignment:      arguments
+						.get("prompt")
+						.or_else(|| arguments.get("assignment"))
+						.and_then(Value::as_str)
+						.map(str::to_owned),
+					progress:        None,
+					transcript_path: arguments
+						.get("sessionFile")
+						.and_then(Value::as_str)
+						.map(PathBuf::from),
+				};
+				state.subagents.insert(id.clone(), snapshot.clone());
+				(!matches!(state.subscription, Subscription::Off))
+					.then(|| json!({"type":"subagent_lifecycle","event":"started","subagent":snapshot}))
+			});
 			state
 				.pending_host_tools
 				.insert(invocation_id.clone(), PendingHostTool {
-					name:    name.to_owned(),
+					name: name.to_owned(),
 					updates: Vec::new(),
+					subagent_id,
 				});
-		}
+			started.flatten()
+		};
 		let frame = HostToolCall {
 			kind: "host_tool_call".into(),
 			id: invocation_id.clone(),
@@ -1912,6 +2074,9 @@ impl Runtime {
 		self
 			.notify(serde_json::to_value(frame).map_err(CommandError::json)?)
 			.map_err(CommandError::transport)?;
+		if let Some(started) = subagent_started {
+			self.notify(started).map_err(CommandError::transport)?;
+		}
 		Ok(json!({ "id": invocation_id, "toolCallId": tool_call_id }))
 	}
 
@@ -1939,7 +2104,7 @@ impl Runtime {
 				return self.send_error(None, &kind, "invalid_request", error.to_string());
 			},
 		};
-		let event = {
+		let (event, subagent_event) = {
 			let mut state = self.state.lock();
 			match frame {
 				HostSideChannel::Update(update) => {
@@ -1953,12 +2118,37 @@ impl Runtime {
 						);
 					};
 					pending.updates.push(update.partial_result.clone());
-					json!({
-						"type": "host_tool_progress",
-						"invocationId": update.id,
-						"name": pending.name,
-						"update": update.partial_result,
-					})
+					let name = pending.name.clone();
+					let subagent_id = pending.subagent_id.clone();
+					let subscription = state.subscription;
+					let subagent_event = subagent_id.and_then(|id| {
+						let snapshot = state.subagents.get_mut(&id)?;
+						snapshot.progress = Some(update.partial_result.clone());
+						match subscription {
+							Subscription::Off => None,
+							Subscription::Progress => Some(json!({
+								"type":"subagent_progress",
+								"subagentId":id,
+								"progress":update.partial_result,
+								"snapshot":snapshot,
+							})),
+							Subscription::Events => Some(json!({
+								"type":"subagent_event",
+								"subagentId":id,
+								"event":update.partial_result,
+								"snapshot":snapshot,
+							})),
+						}
+					});
+					(
+						json!({
+							"type": "host_tool_progress",
+							"invocationId": update.id,
+							"name": name,
+							"update": update.partial_result,
+						}),
+						subagent_event,
+					)
 				},
 				HostSideChannel::Result(result) => {
 					let Some(pending) = state.pending_host_tools.remove(&result.id) else {
@@ -1970,14 +2160,34 @@ impl Runtime {
 							format!("host tool invocation `{}` is not pending", result.id),
 						);
 					};
-					json!({
-						"type": "host_tool_complete",
-						"invocationId": result.id,
-						"name": pending.name,
-						"updates": pending.updates,
-						"result": result.result,
-						"isError": result.is_error,
-					})
+					let subscription = state.subscription;
+					let subagent_event = pending.subagent_id.and_then(|id| {
+						let snapshot = state.subagents.get_mut(&id)?;
+						snapshot.status = if result.is_error {
+							"failed".into()
+						} else {
+							"completed".into()
+						};
+						(!matches!(subscription, Subscription::Off)).then(|| {
+							json!({
+								"type":"subagent_lifecycle",
+								"event":snapshot.status,
+								"subagent":snapshot,
+								"result":result.result.clone(),
+							})
+						})
+					});
+					(
+						json!({
+							"type": "host_tool_complete",
+							"invocationId": result.id,
+							"name": pending.name,
+							"updates": pending.updates,
+							"result": result.result,
+							"isError": result.is_error,
+						}),
+						subagent_event,
+					)
 				},
 				HostSideChannel::Cancel(cancel) => {
 					let Some(pending) = state.pending_host_tools.remove(&cancel.target_id) else {
@@ -1989,15 +2199,34 @@ impl Runtime {
 							format!("host tool invocation `{}` is not pending", cancel.target_id),
 						);
 					};
-					json!({
-						"type": "host_tool_cancelled",
-						"invocationId": cancel.target_id,
-						"name": pending.name,
-					})
+					let subscription = state.subscription;
+					let subagent_event = pending.subagent_id.and_then(|id| {
+						let snapshot = state.subagents.get_mut(&id)?;
+						snapshot.status = "cancelled".into();
+						(!matches!(subscription, Subscription::Off)).then(|| {
+							json!({
+								"type":"subagent_lifecycle",
+								"event":"cancelled",
+								"subagent":snapshot,
+							})
+						})
+					});
+					(
+						json!({
+							"type": "host_tool_cancelled",
+							"invocationId": cancel.target_id,
+							"name": pending.name,
+						}),
+						subagent_event,
+					)
 				},
 			}
 		};
-		self.notify(event)
+		self.notify(event)?;
+		if let Some(event) = subagent_event {
+			self.notify(event)?;
+		}
+		Ok(())
 	}
 
 	fn set_subscription(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
@@ -2535,22 +2764,25 @@ enum HostSideChannel {
 }
 
 struct ServerState {
-	current:            String,
-	sessions:           HashMap<String, Session>,
-	active:             Option<CancellationToken>,
-	active_bash:        Option<ActiveBash>,
-	queue:              VecDeque<String>,
-	config:             ConfigState,
-	models:             Vec<String>,
-	providers:          Vec<OAuthProvider>,
-	project:            PathBuf,
-	session_dir:        Option<PathBuf>,
-	host_tools:         BTreeMap<String, Value>,
-	pending_host_tools: HashMap<String, PendingHostTool>,
-	pending_auth:       HashMap<String, PendingAuth>,
-	subscription:       Subscription,
-	subagents:          HashMap<String, SubagentSnapshot>,
-	transcript_lru:     VecDeque<(String, u64)>,
+	current:              String,
+	sessions:             HashMap<String, Session>,
+	active:               Option<CancellationToken>,
+	active_bash:          Option<ActiveBash>,
+	queue:                VecDeque<String>,
+	config:               ConfigState,
+	models:               Vec<String>,
+	providers:            Vec<OAuthProvider>,
+	project:              PathBuf,
+	session_dir:          Option<PathBuf>,
+	host_tools:           BTreeMap<String, Value>,
+	pending_host_tools:   HashMap<String, PendingHostTool>,
+	pending_auth:         HashMap<String, PendingAuth>,
+	pending_extension_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
+	subscription:         Subscription,
+	command_generation:   u64,
+	content:              crate::discovery::ActiveContentSnapshots,
+	subagents:            HashMap<String, SubagentSnapshot>,
+	transcript_lru:       VecDeque<(String, u64)>,
 }
 
 impl ServerState {
@@ -2563,6 +2795,7 @@ impl ServerState {
 		session_dir: Option<PathBuf>,
 	) -> Self {
 		let id = new_id("session");
+		let content = crate::discovery::active_content_snapshots(&project);
 		let mut sessions = HashMap::new();
 		sessions.insert(id.clone(), Session::new(id.clone(), None));
 		Self {
@@ -2590,7 +2823,10 @@ impl ServerState {
 			host_tools: BTreeMap::new(),
 			pending_host_tools: HashMap::new(),
 			pending_auth: HashMap::new(),
+			pending_extension_ui: HashMap::new(),
 			subscription: Subscription::Off,
+			command_generation: 1,
+			content,
 			subagents: HashMap::new(),
 			transcript_lru: VecDeque::new(),
 		}
@@ -2620,8 +2856,9 @@ impl ServerState {
 }
 
 struct PendingHostTool {
-	name:    String,
-	updates: Vec<Value>,
+	name:        String,
+	updates:     Vec<Value>,
+	subagent_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -2832,6 +3069,49 @@ fn message_page(
 	};
 	Ok(
 		json!({ "sessionId": session.id, "messages": messages, "nextCursor": cursor, "bytes": bytes }),
+	)
+}
+
+fn rpc_command_roster(root: &Path, generation: u64) -> crate::chat_ui::commands::CommandRoster {
+	use crate::chat_ui::{
+		commands::{
+			CommandDeclaration, CommandGeneration, CommandImplementation, CommandProvenance,
+			CommandSourceKind, CommandSurface, ShadowPolicy,
+		},
+		input::CommandContribution,
+	};
+	let content = crate::discovery::active_content_snapshots(root);
+	let generations = content
+		.commands
+		.iter()
+		.filter_map(|command: &CommandContribution| {
+			let template = command.template.clone()?;
+			let provenance = CommandProvenance {
+				source: sf!("{}:{}", command.origin, command.name),
+				label: command.origin.clone(),
+				kind: CommandSourceKind::Markdown,
+				generation,
+			};
+			let declaration = CommandDeclaration {
+				order:           0,
+				name:            command.name.clone(),
+				aliases:         command.aliases.iter().cloned().collect::<Vec<_>>().into(),
+				description:     command.description.clone(),
+				argument_hint:   command.hint.clone(),
+				hints:           Arc::from([]),
+				capabilities:    Arc::from([]),
+				surfaces:        Arc::from([CommandSurface::Text, CommandSurface::Acp]),
+				guest_visible:   false,
+				acp_description: None,
+				provenance:      provenance.clone(),
+				implementation:  CommandImplementation::Prompt(template),
+			};
+			Some(CommandGeneration { provenance, declarations: Arc::from([declaration]) })
+		})
+		.collect::<Vec<_>>();
+	crate::chat_ui::commands::CommandRoster::with_contributions(
+		generations,
+		&ShadowPolicy::default(),
 	)
 }
 
@@ -3138,6 +3418,10 @@ const fn supported_commands() -> &'static [&'static str] {
 		"set_subagent_subscription",
 		"get_subagents",
 		"get_subagent_messages",
+		"get_available_commands",
+		"reload_extensions",
+		"extension_ui_request",
+		"extension_error",
 	]
 }
 

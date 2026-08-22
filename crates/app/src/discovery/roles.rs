@@ -13,13 +13,15 @@ const ROLE_SCHEMA: &str = "2";
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LaunchRoles {
 	/// Primary model when explicitly overridden.
-	pub primary: Option<ModelKey>,
+	pub primary:       Option<ModelKey>,
 	/// Fast/low-cost model.
-	pub smol:    Option<ModelKey>,
+	pub smol:          Option<ModelKey>,
 	/// Deep-reasoning model.
-	pub slow:    Option<ModelKey>,
+	pub slow:          Option<ModelKey>,
 	/// Planning model.
-	pub plan:    Option<ModelKey>,
+	pub plan:          Option<ModelKey>,
+	/// Planning selector's explicit thinking annotation.
+	pub plan_thinking: Option<Str>,
 }
 
 /// Resolves role selectors through the catalog authority. CLI values override
@@ -32,7 +34,7 @@ pub fn resolve_launch_roles(
 	slow: Option<&str>,
 	plan: Option<&str>,
 ) -> Result<LaunchRoles, SelectionError> {
-	let resolve = |cli: Option<&str>, variable: &str| -> Result<Option<ModelKey>, SelectionError> {
+	let resolve_selected = |cli: Option<&str>, variable: &str| {
 		let environment = std::env::var(variable).ok();
 		let Some(selector) = cli.or(environment.as_deref()) else {
 			return Ok(None);
@@ -45,13 +47,18 @@ pub fn resolve_launch_roles(
 			&Default::default(),
 			selector,
 		)
-		.map(|selected| Some(selected.model))
+		.map(Some)
 	};
+	let primary = resolve_selected(primary, "OMP_DEFAULT_MODEL")?;
+	let smol = resolve_selected(smol, "OMP_SMOL_MODEL")?;
+	let slow = resolve_selected(slow, "OMP_SLOW_MODEL")?;
+	let plan = resolve_selected(plan, "OMP_PLAN_MODEL")?;
 	Ok(LaunchRoles {
-		primary: resolve(primary, "OMP_DEFAULT_MODEL")?,
-		smol:    resolve(smol, "OMP_SMOL_MODEL")?,
-		slow:    resolve(slow, "OMP_SLOW_MODEL")?,
-		plan:    resolve(plan, "OMP_PLAN_MODEL")?,
+		primary:       primary.map(|selected| selected.model),
+		smol:          smol.map(|selected| selected.model),
+		slow:          slow.map(|selected| selected.model),
+		plan_thinking: plan.as_ref().and_then(|selected| selected.thinking.clone()),
+		plan:          plan.map(|selected| selected.model),
 	})
 }
 /// Failure while validating or durably saving a role assignment.

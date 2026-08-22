@@ -11,6 +11,7 @@ use http::{
 	},
 };
 use omp_proto::env::v1 as pb;
+use strum::Display;
 use thiserror::Error;
 
 use super::worker_pool::MAX_TUNNEL_BUFFER_BYTES;
@@ -120,14 +121,68 @@ pub enum HttpEgressError {
 	TimedOut,
 	#[error("HTTP egress response exceeds the bounded frame limit")]
 	ResponseTooLarge,
+	#[error(
+		"HTTP egress cannot use the SOCKS proxy configured by {variable}; unset {variable} or \
+		 configure an HTTP proxy"
+	)]
+	UnsupportedSocksProxy {
+		/// Highest-precedence proxy environment variable selecting SOCKS.
+		variable: ProxyVariable,
+		/// Original transport failure.
+		#[source]
+		source:   wreq::Error,
+	},
 	#[error("HTTP egress transport failed: {0}")]
 	Transport(String),
 }
 
 impl HttpEgressError {
 	fn transport(error: wreq::Error) -> Self {
-		Self::Transport(error.to_string())
+		let diagnostic = error.to_string();
+		let proxy_failure = {
+			let diagnostic = diagnostic.to_ascii_lowercase();
+			diagnostic.contains("socks") || diagnostic.contains("proxy")
+		};
+		if proxy_failure && let Some(variable) = configured_socks_proxy() {
+			return Self::UnsupportedSocksProxy { variable, source: error };
+		}
+		Self::Transport(diagnostic)
 	}
+}
+/// Proxy environment variables in the same precedence order used by HTTP
+/// clients for HTTPS destinations.
+#[derive(Clone, Copy, Debug, Eq, Display, PartialEq)]
+pub enum ProxyVariable {
+	/// HTTPS-specific proxy.
+	#[strum(to_string = "HTTPS_PROXY")]
+	Https,
+	/// Protocol-independent proxy.
+	#[strum(to_string = "ALL_PROXY")]
+	All,
+	/// HTTP-specific proxy.
+	#[strum(to_string = "HTTP_PROXY")]
+	Http,
+}
+
+fn configured_socks_proxy() -> Option<ProxyVariable> {
+	[
+		("HTTPS_PROXY", ProxyVariable::Https),
+		("ALL_PROXY", ProxyVariable::All),
+		("HTTP_PROXY", ProxyVariable::Http),
+	]
+	.into_iter()
+	.find_map(|(name, variable)| {
+		let value = std::env::var_os(name)?;
+		value
+			.to_str()
+			.is_some_and(|value| {
+				let value = value.trim();
+				value
+					.get(..5)
+					.is_some_and(|scheme| scheme.eq_ignore_ascii_case("socks"))
+			})
+			.then_some(variable)
+	})
 }
 
 fn parse_method(method: &str) -> Result<Method, HttpEgressError> {

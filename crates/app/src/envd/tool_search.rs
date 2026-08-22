@@ -124,16 +124,16 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 		async move {
 			if !request.path.as_str().split(';').any(|target| {
 				target.trim().to_ascii_lowercase().starts_with("ssh://")
-					|| target.trim().to_ascii_lowercase().starts_with("vault://")
+					|| target.trim().to_ascii_lowercase().starts_with("memory://")
 			}) {
 				return None;
 			}
-			Some(remote_glob(&resolvers, request).await)
+			Some(resource_glob(&resolvers, request).await)
 		}
 	}
 }
 
-async fn remote_glob(
+async fn resource_glob(
 	resolvers: &ResolverTable<super::tool_url::UrlResolver>,
 	request: glob::WalkRequest,
 ) -> Result<WalkResult, glob::Fault> {
@@ -150,14 +150,16 @@ async fn remote_glob(
 		let parsed = parse_uri(target)
 			.map_err(|error| glob::Fault::Workspace { message: Str::new(error.to_string()) })?
 			.ok_or_else(|| glob::Fault::UnsupportedScheme { scheme: Str::new_static("file") })?;
-		if !matches!(parsed.scheme, Scheme::Ssh | Scheme::Vault) {
+		if !matches!(parsed.scheme, Scheme::Ssh | Scheme::Vault | Scheme::Memory) {
 			return Err(glob::Fault::UnsupportedScheme {
 				scheme: Str::new(parsed.raw_scheme.to_ascii_lowercase()),
 			});
 		}
 		if parsed.selector_text.is_some() || parsed.query.is_some() {
 			return Err(glob::Fault::Workspace {
-				message: Str::new_static("remote glob targets do not accept read selectors or queries"),
+				message: Str::new_static(
+					"resource glob targets do not accept read selectors or queries",
+				),
 			});
 		}
 		let resource = parsed.resource;

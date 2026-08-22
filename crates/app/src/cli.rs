@@ -36,7 +36,8 @@ use crate::{
 };
 
 /// Validated reasoning effort accepted by launch-shaped commands.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum ThinkingLevel {
 	/// Disable provider reasoning.
 	Off,
@@ -291,6 +292,10 @@ pub struct OmpCli {
 	/// Suppress the workspace extension layer for this invocation.
 	#[arg(long = "no-workspace-ext", global = true)]
 	pub no_workspace_ext:  bool,
+	/// Export one durable session journal to a self-contained HTML file and
+	/// exit.
+	#[arg(long, global = true, value_name = "SESSION_JSONL")]
+	pub export:            Option<PathBuf>,
 	/// Operation to run. Defaults to interactive project chat.
 	#[command(subcommand)]
 	pub command:           Option<Command>,
@@ -549,13 +554,19 @@ pub enum SetupCommand {
 #[derive(Clone, Debug, Args)]
 pub struct SayArgs {
 	/// Text to synthesize.
-	pub text:            Str,
+	pub text:            Option<Str>,
+	/// Read text from a UTF-8 file instead of the positional argument.
+	#[arg(long, value_name = "PATH", conflicts_with = "text")]
+	pub file:            Option<PathBuf>,
 	/// Override the profile data directory containing model assets.
 	#[arg(long, value_name = "PATH")]
 	pub data_dir:        Option<PathBuf>,
 	/// Kokoro voice identifier.
 	#[arg(long)]
 	pub voice:           Option<String>,
+	/// Stable local TTS model identifier.
+	#[arg(long)]
+	pub model:           Option<String>,
 	/// Speaking-rate multiplier.
 	#[arg(long, default_value_t = 1.0)]
 	pub speed:           f32,
@@ -567,7 +578,7 @@ pub struct SayArgs {
 	pub deterministic:   bool,
 	/// Atomically write PCM16 WAV instead of playing through the default
 	/// speaker.
-	#[arg(long, short = 'o', value_name = "WAV")]
+	#[arg(long = "out", visible_alias = "output", short = 'o', value_name = "WAV")]
 	pub output:          Option<PathBuf>,
 }
 
@@ -737,7 +748,7 @@ pub struct ShareArgs {
 	pub journal:   Option<PathBuf>,
 	/// HTTPS blob-store endpoint accepting the sealed envelope.
 	#[arg(long, value_name = "URL")]
-	pub server:    Str,
+	pub server:    Option<Str>,
 	/// Browser viewer base URL.
 	#[arg(long, value_name = "URL", default_value = "https://omp.dev/share")]
 	pub viewer:    Str,
@@ -809,6 +820,8 @@ pub enum Command {
 	Say(SayArgs),
 	/// Run the native grep engine as a standalone operator.
 	Grep(GrepArgs),
+	/// Manage scoped native SSH hosts and run bounded client operations.
+	Ssh(crate::ssh_cmd::SshArgs),
 	/// Inspect and test active Time-Traveling Stream Rules.
 	Ttsr(TtsrArgs),
 	/// Generate a static shell completion script.
@@ -931,6 +944,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "setup", aliases: &[] },
 	CommandSpec { name: "say", aliases: &[] },
 	CommandSpec { name: "grep", aliases: &[] },
+	CommandSpec { name: "ssh", aliases: &[] },
 	CommandSpec { name: "ttsr", aliases: &[] },
 	CommandSpec { name: "completions", aliases: &[] },
 	CommandSpec { name: "__complete", aliases: &[] },
@@ -955,6 +969,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 	let consumes_value = matches!(
 		name,
 		"--cwd"
+			| "--export"
 			| "--ext"
 			| "--ext-only"
 			| "--trusted-extension"
@@ -1783,6 +1798,7 @@ enum DispatchTarget {
 	Setup,
 	Say,
 	Grep,
+	Ssh,
 	Ttsr,
 	Completions,
 	Complete,
@@ -1822,6 +1838,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Setup(_)) => DispatchTarget::Setup,
 		Some(Command::Say(_)) => DispatchTarget::Say,
 		Some(Command::Grep(_)) => DispatchTarget::Grep,
+		Some(Command::Ssh(_)) => DispatchTarget::Ssh,
 		Some(Command::Ttsr(_)) => DispatchTarget::Ttsr,
 		Some(Command::Completions { .. }) => DispatchTarget::Completions,
 		Some(Command::Complete { .. }) => DispatchTarget::Complete,
@@ -1845,6 +1862,12 @@ fn chat_start(args: &mut ChatArgs) -> crate::chat::ChatStart {
 	reason = "chat dispatch preserves the thread-confined omp_tui::App future"
 )]
 pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
+	if let Some(journal) = cli.export.as_deref() {
+		let output = journal.with_extension("html");
+		let exported = crate::export::export_session(journal, &output).into_diagnostic()?;
+		println!("Exported to: {}", exported.display());
+		return Ok(());
+	}
 	if cli.smoke_test {
 		return crate::smoke_test::run().await;
 	}
@@ -1880,12 +1903,13 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			crate::startup_notice::show_once(
 				&data_dir(None)?,
 				args.model.as_ref(),
+				args.thinking.map(<&'static str>::from),
 				crate::startup_notice::Eligibility {
 					resume: args.resume.is_some()
 						|| args.continue_session.is_some()
 						|| args.fork.is_some(),
 					quiet:  false,
-					timing: false,
+					timing: std::env::var_os("OMP_TIMING").is_some(),
 				},
 			)
 			.into_diagnostic()?;
@@ -1916,6 +1940,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Setup(args) => crate::setup_cmd::run(args).await,
 		Command::Say(args) => crate::say_cmd::run(args).await,
 		Command::Grep(args) => crate::grep_cmd::run(args),
+		Command::Ssh(args) => crate::ssh_cmd::run(args).await,
 		Command::Ttsr(args) => crate::ttsr_cmd::run(args),
 		Command::Completions { shell } => {
 			let bytes = crate::completions::script(shell.into());

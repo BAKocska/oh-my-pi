@@ -156,8 +156,12 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 		builtin_device_claims(),
 	)?;
 	for device in [
-		media_devices::image_gen(Arc::clone(&search_bridge), blobs.clone()),
-		media_devices::tts(Arc::clone(&search_bridge), blobs.clone()),
+		media_devices::image_gen(
+			Arc::clone(&search_bridge),
+			blobs.clone(),
+			workspace.root().to_path_buf(),
+		),
+		media_devices::tts(Arc::clone(&search_bridge), blobs.clone(), workspace.root().to_path_buf()),
 	] {
 		registry.register(device, Presentation::Device, builtin_device_claims())?;
 	}
@@ -422,7 +426,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 			.and_then(|duration| duration.to_std().ok())
 			.unwrap_or_else(|| std::time::Duration::from_secs(300));
 		registry.register(
-			omp_tools::lsp::tool(DocumentLspControl::new(documents.clone()), maximum),
+			omp_tools::lsp::tool(DocumentLspControl::new(documents.clone(), exec.clone()), maximum),
 			Presentation::Slot,
 			core_claims(),
 		)?;
@@ -497,7 +501,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 		registry.register(
 			omp_tools::ask::tool_with_vocalizer(
 				omp_chat_ui::ask::presenter(),
-				media_devices::ask_vocalizer(),
+				media_devices::ask_vocalizer(Arc::clone(&search_bridge)),
 			),
 			Presentation::Slot,
 			core_claims(),
@@ -573,6 +577,7 @@ pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>
 			ShellExecHost::new(
 				exec.clone(),
 				root_uri.clone(),
+				Arc::clone(&resolvers),
 				shell_settings.clone(),
 				acp_exec,
 				acp_settings.routing != AcpRouting::Never,

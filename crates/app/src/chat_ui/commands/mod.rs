@@ -1,5 +1,6 @@
 //! Structural slash-command router and capability-scoped host contracts.
 
+mod advisor;
 pub(crate) mod collab;
 mod config;
 pub mod context;
@@ -16,8 +17,10 @@ mod review;
 mod security;
 mod session;
 mod share;
+mod ssh;
+mod utility;
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use omp_agent::ManualCompactionRequest;
 use omp_core::{Str, sf};
@@ -62,6 +65,114 @@ pub enum WorkspaceRequest {
 /// Parsed command-line flags with optional values.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ParsedFlags(pub Vec<(Str, Option<Str>)>);
+/// Parsed advisor watchdog operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdvisorRequest {
+	/// Toggle the current advisor state.
+	Toggle,
+	/// Set advisor enablement explicitly.
+	SetEnabled(bool),
+	/// Show advisor state and budget.
+	Status,
+	/// Copy the raw advisor transcript projection.
+	DumpRaw,
+	/// Apply advisor settings expressed in the native command grammar.
+	Configure(Str),
+}
+
+/// Parsed version-history view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangelogRequest {
+	/// Show the latest release entries.
+	Recent,
+	/// Show complete bundled version history.
+	Full,
+}
+
+/// Parsed desktop automation override.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputerRequest {
+	/// Enable desktop automation for the session.
+	On,
+	/// Disable desktop automation for the session.
+	Off,
+	/// Follow model and host capabilities.
+	Auto,
+	/// Show the effective override and permissions.
+	Status,
+	/// Run permission diagnostics.
+	Diagnose,
+}
+
+/// Parsed image-tool exposure override.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisionRequest {
+	/// Expose image inspection.
+	On,
+	/// Hide image inspection.
+	Off,
+	/// Follow model capabilities.
+	Auto,
+	/// Show effective image-tool exposure.
+	Status,
+}
+
+/// Parsed utility command operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UtilityRequest {
+	/// Render bundled version history.
+	Changelog(ChangelogRequest),
+	/// List active and disabled tools.
+	Tools,
+	/// Open the native extension dashboard.
+	Extensions,
+	/// Control desktop automation.
+	Computer(ComputerRequest),
+	/// Control image-tool delegation.
+	Vision(VisionRequest),
+}
+
+/// Parsed branch creation operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchRequest {
+	/// Optional durable checkpoint selector.
+	pub checkpoint: Option<Str>,
+}
+
+/// Parsed native SSH host operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SshRequest {
+	/// List effective declarations using project-over-user precedence, with an
+	/// optional scope filter.
+	List(Option<ConfigScope>),
+	/// Add or replace one scoped host declaration.
+	Add {
+		/// Host alias.
+		alias:    Str,
+		/// Address or DNS name.
+		host:     Str,
+		/// Remote user.
+		user:     Str,
+		/// Validated TCP port.
+		port:     u16,
+		/// Pinned SHA-256 host-key fingerprint.
+		host_key: Str,
+		/// Optional unencrypted private-key path; omission uses the native SSH
+		/// agent.
+		key:      Option<PathBuf>,
+		/// Writable declaration scope.
+		scope:    ConfigScope,
+	},
+	/// Remove one scoped declaration.
+	Remove {
+		/// Host alias.
+		alias: Str,
+		/// Writable declaration scope.
+		scope: ConfigScope,
+	},
+	/// Render native SSH help.
+	Help,
+}
 
 /// Shell-scoped command capabilities.
 pub trait ShellCommandHost {
@@ -95,6 +206,30 @@ pub trait SessionCommandHost {
 	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_>;
 	/// Execute a structured workspace operation.
 	fn workspace(&mut self, request: WorkspaceRequest) -> CommandFuture<'_>;
+	/// Summarize the live conversation into a new independent session.
+	fn handoff(&mut self, instructions: Option<Str>) -> CommandFuture<'_> {
+		let _ = instructions;
+		Box::pin(async { Err(miette::miette!("session handoff is unavailable")) })
+	}
+	/// Create a lineage child at an optional durable checkpoint.
+	fn branch(&mut self, request: BranchRequest) -> CommandFuture<'_> {
+		let _ = request;
+		Box::pin(async { Err(miette::miette!("session branching is unavailable")) })
+	}
+	/// Fork the current live projection into an independent session.
+	fn fork(&mut self, title: Option<Str>) -> CommandFuture<'_> {
+		let _ = title;
+		Box::pin(async { Err(miette::miette!("session forking is unavailable")) })
+	}
+	/// Render durable branch lineage.
+	fn branch_tree(&mut self) -> CommandFuture<'_> {
+		Box::pin(async { Err(miette::miette!("session branch navigation is unavailable")) })
+	}
+	/// Open a named inspector or the inspector selector.
+	fn debug(&mut self, inspector: Option<Str>) -> CommandFuture<'_> {
+		let _ = inspector;
+		Box::pin(async { Err(miette::miette!("session inspection is unavailable")) })
+	}
 }
 
 /// Model-scoped command capabilities.
@@ -276,6 +411,21 @@ pub trait FlowCommandHost {
 	fn omfg(&mut self, instruction: Str) -> CommandFuture<'_>;
 	/// Start or stop realtime voice.
 	fn live(&mut self, args: Str) -> CommandFuture<'_>;
+	/// Control the synthetic advisor watchdog.
+	fn advisor(&mut self, request: AdvisorRequest) -> CommandFuture<'_> {
+		let _ = request;
+		Box::pin(async { Err(miette::miette!("advisor control is unavailable")) })
+	}
+	/// Execute a utility, capability-inspection, or device-mode operation.
+	fn utility(&mut self, request: UtilityRequest) -> CommandFuture<'_> {
+		let _ = request;
+		Box::pin(async { Err(miette::miette!("utility command is unavailable")) })
+	}
+	/// Manage native scoped SSH host declarations.
+	fn ssh(&mut self, request: SshRequest) -> CommandFuture<'_> {
+		let _ = request;
+		Box::pin(async { Err(miette::miette!("SSH host management is unavailable")) })
+	}
 	/// Manage Environment-owned MCP declarations and lifecycle.
 	fn mcp(&mut self, request: McpRequest) -> CommandFuture<'_>;
 	/// Inspect or maintain the session's Mnemopi authority.

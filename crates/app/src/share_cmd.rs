@@ -8,8 +8,10 @@ use crate::{
 	cli::ShareArgs,
 	export::SessionTree,
 	secrets::session::SecretSessionSnapshot,
-	settings::ExportSettings,
-	share::{DirectShareStore, ShareProjection, ShareStoreKind, seal, upload},
+	settings::{ExportSettings, ShareStore},
+	share::{
+		DirectShareStore, HTTP_MAX_SEALED_BYTES, ShareProjection, ShareStoreKind, seal, upload,
+	},
 };
 
 /// Selects a live journal projection, irreversibly redacts it, seals it, and
@@ -39,20 +41,30 @@ pub async fn run(args: ShareArgs) -> miette::Result<()> {
 		std::iter::empty(),
 	)
 	.map_err(|error| miette!("{error}"))?;
-	let projection = ShareProjection::materialize(
+	let projection = ShareProjection::materialize_bounded(
 		value,
 		ExportSettings {
 			share_redact_secrets: configured.export.share_redact_secrets && !args.no_redact,
 		},
 		&secrets,
+		HTTP_MAX_SEALED_BYTES.saturating_sub(64 * 1024),
 	);
 	let sealed = seal(&projection).map_err(|error| miette!("{error}"))?;
+	let server = args.server.as_ref().unwrap_or(&configured.share.server_url);
 	let credentials = Arc::new(crate::envd::github_url::GithubCredentialBridge::new());
-	let store = DirectShareStore::new(args.server.as_str(), credentials)
-		.map_err(|error| miette!("{error}"))?;
-	let result = upload(&store, ShareStoreKind::Http, &sealed, args.viewer.as_str())
-		.await
-		.map_err(|error| miette!("{error}"))?;
+	let store =
+		DirectShareStore::new(server.as_str(), credentials).map_err(|error| miette!("{error}"))?;
+	let result = upload(
+		&store,
+		match configured.share.store {
+			ShareStore::Http => ShareStoreKind::Http,
+			ShareStore::Gist => ShareStoreKind::Gist,
+		},
+		&sealed,
+		args.viewer.as_str(),
+	)
+	.await
+	.map_err(|error| miette!("{error}"))?;
 	println!("{}", result.url);
 	Ok(())
 }

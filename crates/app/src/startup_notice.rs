@@ -53,7 +53,12 @@ struct Release<'a> {
 ///
 /// Ineligible invocations neither print nor advance the seen-version marker, so
 /// a later fresh interactive launch can still present the release notes.
-pub fn show_once(data_dir: &Path, model: Option<&Str>, eligibility: Eligibility) -> io::Result<()> {
+pub fn show_once(
+	data_dir: &Path,
+	model: Option<&Str>,
+	thinking: Option<&str>,
+	eligibility: Eligibility,
+) -> io::Result<()> {
 	if !eligibility.allows(std::io::stderr().is_terminal()) {
 		return Ok(());
 	}
@@ -77,7 +82,11 @@ pub fn show_once(data_dir: &Path, model: Option<&Str>, eligibility: Eligibility)
 		eprintln!("What's new in {}: {}", release.version, summarize(release.body));
 	}
 	if let Some(model) = model {
-		eprintln!("Model scope: {model}");
+		if let Some(thinking) = thinking {
+			eprintln!("Model scope: {model} · thinking {thinking}");
+		} else {
+			eprintln!("Model scope: {model}");
+		}
 	}
 	fs::create_dir_all(data_dir)?;
 	fs::write(data_dir.join(NOTICE_VERSION_FILE), env!("CARGO_PKG_VERSION"))

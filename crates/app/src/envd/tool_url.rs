@@ -2,6 +2,8 @@
 
 #[path = "tool_url/artifact.rs"]
 mod artifact;
+#[path = "tool_url/attachment.rs"]
+mod attachment;
 #[path = "tool_url/docs.rs"]
 mod docs;
 #[path = "tool_url/host.rs"]
@@ -108,6 +110,27 @@ impl Resolve for RegistryResolver {
 		select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
 	}
 
+	async fn path(&self, resource: &str) -> Result<Option<Str>, Fault> {
+		if !matches!(self.resource, RegistryResource::Agent) || resource.contains('/') {
+			return Ok(None);
+		}
+		let (record, _) = AgentRegistry::global()
+			.record(resource.trim_matches('/'))
+			.ok_or_else(|| Fault::Source {
+				message: Str::new_static("Agent resource was not found."),
+			})?;
+		let Some(path) = record.history.output_path else {
+			return Ok(None);
+		};
+		let path = std::fs::canonicalize(path).map_err(|_| Fault::Source {
+			message: Str::new_static("Agent output path was not found."),
+		})?;
+		let uri = url::Url::from_file_path(path).map_err(|()| Fault::Invalid {
+			message: Str::new_static("Agent output path cannot be represented as a file URI."),
+		})?;
+		Ok(Some(Str::from(uri.to_string())))
+	}
+
 	async fn list(
 		&self,
 		resource: &str,
@@ -184,6 +207,8 @@ pub(super) enum UrlResolver {
 	Host(host::HostUriResolver),
 	/// Session artifacts by ordinal or durable digest.
 	Artifact(artifact::ArtifactUrlResolver),
+	/// Images from the latest projected user message.
+	Attachment(attachment::AttachmentUrlResolver),
 	/// Agent output and child artifacts.
 	Agent(RegistryResolver),
 	/// Read-only agent transcript index and bodies.
@@ -220,7 +245,7 @@ impl Resolve for UrlResolver {
 	) -> Result<CowBytes<'static>, Fault> {
 		match self {
 			Self::Host(resolver) => resolver.read(resource, selector).await,
-			Self::Artifact(resolver) => resolver.read(resource, selector).await,
+			Self::Attachment(resolver) => resolver.read(resource, selector).await,
 			Self::Agent(resolver) | Self::History(resolver) => resolver.read(resource, selector).await,
 			Self::Issue(resolver) | Self::Pr(resolver) => resolver.read(resource, selector).await,
 			Self::Local(resolver) => resolver.read(resource, selector).await,
@@ -268,6 +293,9 @@ impl Resolve for UrlResolver {
 				message: Str::new_static("Host resources do not support listing."),
 			}),
 			Self::Artifact(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Attachment(_) => Err(Fault::Invalid {
+				message: Str::new_static("Attachment resources cannot be listed."),
+			}),
 			Self::Agent(resolver) | Self::History(resolver) => {
 				resolver.list(resource, max_entries, max_bytes).await
 			},
@@ -297,8 +325,10 @@ impl Resolve for UrlResolver {
 			Self::Host(_) => Err(Fault::Invalid {
 				message: Str::new_static("Host resources have no local materializable path."),
 			}),
-			Self::Artifact(resolver) => resolver.path(resource).await,
+			Self::Agent(resolver) => resolver.path(resource).await,
 			Self::Local(resolver) => resolver.path(resource).await,
+			Self::Skill(resolver) => resolver.path(resource).await,
+			Self::Rule(resolver) => resolver.path(resource).await,
 			Self::Ssh(_) | Self::Vault(_) => Err(Fault::Invalid {
 				message: Str::new_static(
 					"Remote and vault resources have no local materializable path.",
@@ -319,7 +349,7 @@ impl Resolve for UrlResolver {
 		max_results: usize,
 	) -> Result<Vec<ResourceCompletion>, Fault> {
 		match self {
-			Self::Host(_) => Ok(Vec::new()),
+			Self::Host(_) | Self::Attachment(_) => Ok(Vec::new()),
 			Self::Artifact(resolver) => resolver.complete(query, max_results).await,
 			Self::Agent(resolver) | Self::History(resolver) => {
 				resolver.complete(query, max_results).await
@@ -415,6 +445,15 @@ pub(super) fn production_url_resolvers(
 		.expect("pr URL resolver is unique");
 	builder
 		.register(
+			SchemeEntry::new(Scheme::Attachment, true, false, "latest user image attachments"),
+			UrlResolver::Attachment(attachment::AttachmentUrlResolver::new(
+				blob_store.clone(),
+				session_id,
+			)),
+		)
+		.expect("attachment URL resolver is unique");
+	builder
+		.register(
 			SchemeEntry::new(
 				Scheme::Artifact,
 				true,
@@ -440,7 +479,7 @@ pub(super) fn production_url_resolvers(
 	builder
 		.register(
 			SchemeEntry::new(Scheme::Skill, true, false, "active installed skills")
-				.with_capabilities(true, false, true)
+				.with_capabilities(true, true, true)
 				.with_whole_body(true),
 			UrlResolver::Skill(skills),
 		)
@@ -448,7 +487,7 @@ pub(super) fn production_url_resolvers(
 	builder
 		.register(
 			SchemeEntry::new(Scheme::Rule, true, false, "active installed rules")
-				.with_capabilities(true, false, true)
+				.with_capabilities(true, true, true)
 				.with_whole_body(true),
 			UrlResolver::Rule(rules),
 		)
@@ -456,7 +495,7 @@ pub(super) fn production_url_resolvers(
 	builder
 		.register(
 			SchemeEntry::new(Scheme::Agent, true, false, "settled agent output and child artifacts")
-				.with_capabilities(true, false, true),
+				.with_capabilities(true, true, true),
 			UrlResolver::Agent(RegistryResolver::new(RegistryResource::Agent)),
 		)
 		.expect("agent URL resolver is unique");

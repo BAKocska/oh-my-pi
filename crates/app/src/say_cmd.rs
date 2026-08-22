@@ -1,10 +1,10 @@
 //! Standalone Kokoro sentence synthesis with speaker or atomic WAV output.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{cell::Cell, sync::Arc, time::Duration};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_llm_inference::local::{
-	ArtifactStore, LocalCancellation, MemoryPool,
+	ArtifactStore, LocalCancellation, MemoryPool, SystemArtifactFetcher,
 	speech_catalog::{DEFAULT_KOKORO_VOICE, SpeechArtifactManifests},
 	tts::{KokoroAdapter, KokoroConfig, KokoroDevice, SynthesisOptions},
 };
@@ -17,11 +17,40 @@ pub async fn run(args: SayArgs) -> miette::Result<()> {
 		return Err(miette!("--speed must be a finite positive number"));
 	}
 	let data_dir = crate::cli::data_dir(args.data_dir)?;
+	let text = match (args.text, args.file) {
+		(Some(text), None) => text,
+		(None, Some(path)) => omp_core::Str::from(std::fs::read_to_string(path).into_diagnostic()?),
+		(None, None) => return Err(miette!("provide text or --file PATH")),
+		(Some(_), Some(_)) => return Err(miette!("text and --file cannot be used together")),
+	};
+	if text.trim().is_empty() {
+		return Err(miette!("speech input is empty"));
+	}
+	let model = args.model.as_deref().unwrap_or("kokoro");
+	if model != "kokoro" {
+		return Err(miette!("unknown local TTS model `{model}`; available: kokoro"));
+	}
 	let root = data_dir.join("models");
 	std::fs::create_dir_all(&root).into_diagnostic()?;
 	let store = ArtifactStore::open(&root).into_diagnostic()?;
 	let artifacts = SpeechArtifactManifests::pi_parity().into_diagnostic()?;
 	let cancel = LocalCancellation::new();
+	let manifest = artifacts.kokoro_manifest();
+	let total = manifest.total_bytes().into_diagnostic()?;
+	let progress = crate::progress_reporter::ProgressReporter::bounded(
+		total,
+		"downloading kokoro".to_owned(),
+		false,
+	);
+	let prior = Cell::new(0_u64);
+	store
+		.acquire(manifest, &SystemArtifactFetcher::new(), &cancel, |update| {
+			let current = update.downloaded_bytes;
+			progress.advance(current.saturating_sub(prior.replace(current)));
+		})
+		.await
+		.into_diagnostic()?;
+	progress.finish();
 	let config = KokoroConfig::from_verified_artifacts(
 		&store,
 		&artifacts,
@@ -42,7 +71,7 @@ pub async fn run(args: SayArgs) -> miette::Result<()> {
 	};
 	if let Some(path) = args.output {
 		let output = adapter
-			.synthesize(args.text.as_str(), &voice, options, &cancel)
+			.synthesize(text.as_str(), &voice, options, &cancel)
 			.into_diagnostic()?;
 		write_wav_atomic(&path, output.sample_rate, &output.samples)?;
 		println!("wrote {} samples to {}", output.samples.len(), path.display());
@@ -52,7 +81,7 @@ pub async fn run(args: SayArgs) -> miette::Result<()> {
 	let writer = playback.writer().into_diagnostic()?;
 	let mut playback_error = None;
 	let receipt = adapter
-		.synthesize_streaming(args.text.as_str(), &voice, options, &cancel, |chunk, _| {
+		.synthesize_streaming(text.as_str(), &voice, options, &cancel, |chunk, _| {
 			match writer.write(chunk) {
 				Ok(()) => true,
 				Err(error) => {
@@ -81,32 +110,12 @@ const fn device() -> KokoroDevice {
 	}
 }
 
-fn write_wav_atomic(path: &Path, sample_rate: u32, samples: &[f32]) -> miette::Result<()> {
-	let sample_bytes = samples
-		.len()
-		.checked_mul(2)
-		.and_then(|bytes| u32::try_from(bytes).ok())
-		.ok_or_else(|| miette!("WAV output exceeds RIFF size limits"))?;
-	let riff_bytes = sample_bytes
-		.checked_add(36)
-		.ok_or_else(|| miette!("WAV output exceeds RIFF size limits"))?;
-	let mut wav = Vec::with_capacity(sample_bytes as usize + 44);
-	wav.extend_from_slice(b"RIFF");
-	wav.extend_from_slice(&riff_bytes.to_le_bytes());
-	wav.extend_from_slice(b"WAVEfmt ");
-	wav.extend_from_slice(&16_u32.to_le_bytes());
-	wav.extend_from_slice(&1_u16.to_le_bytes());
-	wav.extend_from_slice(&1_u16.to_le_bytes());
-	wav.extend_from_slice(&sample_rate.to_le_bytes());
-	wav.extend_from_slice(&sample_rate.saturating_mul(2).to_le_bytes());
-	wav.extend_from_slice(&2_u16.to_le_bytes());
-	wav.extend_from_slice(&16_u16.to_le_bytes());
-	wav.extend_from_slice(b"data");
-	wav.extend_from_slice(&sample_bytes.to_le_bytes());
-	for sample in samples {
-		let pcm = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-		wav.extend_from_slice(&pcm.to_le_bytes());
-	}
+fn write_wav_atomic(
+	path: &std::path::Path,
+	sample_rate: u32,
+	samples: &[f32],
+) -> miette::Result<()> {
+	let wav = omp_voice::wav::encode_wav(samples, sample_rate).into_diagnostic()?;
 	if let Some(parent) = path
 		.parent()
 		.filter(|parent| !parent.as_os_str().is_empty())

@@ -3,7 +3,7 @@ pub mod input;
 pub mod template;
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{HashMap, HashSet, VecDeque},
 	future::pending,
 	path::PathBuf,
 	sync::{
@@ -239,6 +239,10 @@ enum UiCmd {
 		request: omp_agent::ManualCompactionRequest,
 		reply:   flume::Sender<Result<omp_agent::ManualCompactionOutcome, String>>,
 	},
+	Shake {
+		tier:  omp_agent::CompactionTier,
+		reply: flume::Sender<Result<omp_agent::ManualShakeOutcome, String>>,
+	},
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,12 +382,47 @@ impl CompletionSource for ProjectCompletionSource {
 	}
 }
 
-const INTERNAL_URI_SCHEMES: &[&str] =
-	&["local://", "artifact://", "agent://", "history://", "mcp://", "skill://", "rule://"];
+const INTERNAL_URI_SCHEMES: &[&str] = &[
+	"local://",
+	"artifact://",
+	"agent://",
+	"history://",
+	"mcp://",
+	"memory://",
+	"skill://",
+	"rule://",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InspectImageMode {
+	On,
+	Off,
+}
+
+fn model_accepts_images(model: &str) -> bool {
+	resolve_model(Catalog::embedded(), model)
+		.and_then(|model| model.capabilities.chat.as_ref())
+		.is_some_and(|chat| {
+			matches!(
+				chat.image_input,
+				omp_llm_catalog::Availability::Native(_)
+					| omp_llm_catalog::Availability::Emulated { .. }
+			)
+		})
+}
+
+fn inspect_image_enabled(state: &BridgeState) -> bool {
+	match state.vision_override {
+		None => !model_accepts_images(&state.model),
+		Some(InspectImageMode::On) => true,
+		Some(InspectImageMode::Off) => false,
+	}
+}
 
 struct BridgeState {
 	model:             String,
 	session_id:        Str,
+	local_root:        PathBuf,
 	collab:            Option<crate::collab::session::CollabCommandHandle>,
 	environment:       omp_env::EnvClient,
 	memory:            Option<Arc<omp_memory::MemoryRuntime>>,
@@ -398,6 +437,8 @@ struct BridgeState {
 	context_snapshot:  Option<omp_agent::ContextSnapshot>,
 	cost_nanos:        u64,
 	queued:            usize,
+	queued_prompts:    VecDeque<omp_chat_ui::QueuedPrompt>,
+	stt_enabled:       bool,
 	jobs:              HashSet<Str>,
 	attempt:           u32,
 	turn_started:      Option<Instant>,
@@ -411,10 +452,12 @@ struct BridgeState {
 	pending_auth_kind: Option<AuthPromptKind>,
 	live_enabled:      bool,
 	live_activity:     ActivityWaveform,
+	token_rate:        Option<omp_chat_ui::status_line::TokenRateMeter>,
 	tokens_per_second: Option<u64>,
 	thinking:          Option<Str>,
 	session_accent:    Str,
 	replaying_turn:    bool,
+	vision_override:   Option<InspectImageMode>,
 	settings:          Settings,
 	commands:          CommandRoster,
 	typed_commands:    commands::CommandRoster,
@@ -498,6 +541,7 @@ pub async fn run<'a, C, R>(
 	auth: Option<&'a ChatAuth>,
 	data_dir: PathBuf,
 	workspace_root: PathBuf,
+	local_root: PathBuf,
 	security_enabled: bool,
 	command_sources: Vec<Vec<CommandContribution>>,
 	skills: Arc<crate::skills::SkillSnapshot>,
@@ -618,6 +662,10 @@ where
 						.map_err(|error| error.to_string());
 					let _ = reply.send(result);
 				},
+				UiCmd::Shake { tier, reply } => {
+					let result = agent.shake_manual(tier).map_err(|error| error.to_string());
+					let _ = reply.send(result);
+				},
 			}
 		}
 	});
@@ -666,6 +714,7 @@ where
 	let mut state = BridgeState {
 		model,
 		session_id: session_id.clone(),
+		local_root,
 		collab,
 		environment,
 		memory: omp_memory::RuntimeRegistry::lookup(&session_id),
@@ -680,6 +729,8 @@ where
 		context_snapshot: None,
 		cost_nanos: 0,
 		queued: 0,
+		queued_prompts: VecDeque::new(),
+		stt_enabled: false,
 		jobs: HashSet::new(),
 		attempt: 0,
 		turn_started: startup_pending.then(Instant::now),
@@ -692,11 +743,13 @@ where
 		rewind_targets: Vec::new(),
 		live_enabled: false,
 		live_activity: ActivityWaveform::new(),
+		token_rate: None,
 		tokens_per_second: None,
 		thinking,
 		session_accent: session_id.clone(),
 		pending_auth_kind: None,
 		replaying_turn: false,
+		vision_override: None,
 		settings: crate::settings::current(&data_dir).into_diagnostic()?,
 		commands,
 		typed_commands,
@@ -761,6 +814,7 @@ where
 											state.submit_pending = false;
 											state.turn_started = None;
 											state.queued = 0;
+											state.queued_prompts.clear();
 											if ack.interrupted && ack.committed_turns == 0
 												&& let Some(prompt) = state.pending_prompt.take()
 											{
@@ -942,12 +996,7 @@ fn handle_goal_command(backend: &flume::Sender<BackendEvent>, modes: &ExecutionM
 		.map_or((args, ""), |(op, rest)| (op, rest.trim()));
 	let result = match op {
 		"" => {
-			send_backend(
-				backend,
-				BackendEvent::Notice(sf!(
-					"Use `/goal set <objective> [token-budget]` to start an autonomous goal.",
-				)),
-			);
+			send_backend(backend, BackendEvent::OpenGuidedGoal);
 			return;
 		},
 		"status" => {
@@ -1303,7 +1352,7 @@ where
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
 {
 	fn settings(&mut self) -> CommandFuture<'_> {
-		send_backend(self.backend, BackendEvent::SettingsSchema(setting_rows()));
+		send_backend(self.backend, BackendEvent::SettingsSchema(setting_rows(&self.state.settings)));
 		silent_command()
 	}
 
@@ -1323,6 +1372,149 @@ where
 	fn logout(&mut self, _: Option<Str>) -> CommandFuture<'_> {
 		self.unavailable("Provider logout requires an attached account authority.")
 	}
+}
+
+fn setting_rows(settings: &Settings) -> Vec<omp_chat_ui::SettingRow> {
+	let document =
+		toml::Value::try_from(settings).unwrap_or_else(|_| toml::Value::Table(toml::Table::new()));
+	omp_settings::registered_domains()
+		.into_iter()
+		.flat_map(|domain| {
+			let document = &document;
+			domain.fields.iter().map(move |field| {
+				let kind: &'static str = field.kind.into();
+				let value = (!field.secret)
+					.then(|| toml_value_at(document, field.path))
+					.flatten()
+					.map(toml_setting_value);
+				let options = match field.kind {
+					omp_settings::SettingKind::Enum(options) => {
+						options.iter().copied().map(Str::new).collect()
+					},
+					_ => Vec::new(),
+				};
+				let visible = field.condition.is_none_or(|condition| {
+					toml_value_at(document, condition.field)
+						.is_some_and(|value| toml_setting_value(value).as_str() == condition.equals)
+				});
+				omp_chat_ui::SettingRow {
+					panel: sf!("interaction"),
+					domain: sf!(domain.name),
+					path: sf!(field.path),
+					label: sf!(field.label),
+					description: sf!(field.description),
+					kind: sf!(kind),
+					secret: field.secret,
+					value,
+					options,
+					visible,
+				}
+			})
+		})
+		.collect()
+}
+
+fn toml_value_at<'a>(document: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
+	path
+		.split('.')
+		.try_fold(document, |value, segment| value.get(segment))
+}
+
+fn toml_setting_value(value: &toml::Value) -> Str {
+	match value {
+		toml::Value::String(value) => Str::new(value),
+		_ => Str::from(value.to_string()),
+	}
+}
+fn apply_setting_changes(
+	settings: &mut Settings,
+	changes: &[omp_chat_ui::SettingChange],
+) -> miette::Result<()> {
+	let mut document = toml::Value::try_from(&*settings).into_diagnostic()?;
+	let domains = omp_settings::registered_domains();
+	for change in changes {
+		let field = domains
+			.iter()
+			.flat_map(|domain| domain.fields)
+			.find(|field| field.path == change.path.as_str())
+			.ok_or_else(|| miette::miette!("unknown setting `{}`", change.path))?;
+		let raw = match &change.value {
+			serde_json::Value::String(value) => value.clone(),
+			value => value.to_string(),
+		};
+		let value = field.parse(&raw).into_diagnostic()?;
+		set_toml_value(&mut document, field.path, value)?;
+	}
+	*settings = document.try_into().into_diagnostic()?;
+	Ok(())
+}
+
+fn set_toml_value(
+	document: &mut toml::Value,
+	path: &str,
+	value: toml::Value,
+) -> miette::Result<()> {
+	let mut segments = path.split('.').peekable();
+	let mut cursor = document;
+	while let Some(segment) = segments.next() {
+		if segments.peek().is_none() {
+			let table = cursor
+				.as_table_mut()
+				.ok_or_else(|| miette::miette!("setting parent for `{path}` is not a table"))?;
+			table.insert(segment.to_owned(), value);
+			return Ok(());
+		}
+		let table = cursor
+			.as_table_mut()
+			.ok_or_else(|| miette::miette!("setting parent for `{path}` is not a table"))?;
+		cursor = table
+			.entry(segment)
+			.or_insert_with(|| toml::Value::Table(toml::Table::new()));
+	}
+	Err(miette::miette!("setting path is empty"))
+}
+
+fn set_interactive_thinking(agent_state: &AgentState, state: &mut BridgeState, cycle: bool) {
+	use omp_proto::inference::v1::{Effort, Reasoning};
+
+	const LEVELS: [Effort; 7] = [
+		Effort::Off,
+		Effort::Minimal,
+		Effort::Low,
+		Effort::Medium,
+		Effort::High,
+		Effort::Xhigh,
+		Effort::Max,
+	];
+	let current = agent_state
+		.snapshot()
+		.turn
+		.params
+		.thinking
+		.as_ref()
+		.and_then(|reasoning| Effort::try_from(reasoning.effort).ok())
+		.unwrap_or(Effort::Off);
+	let next = if cycle {
+		let at = LEVELS
+			.iter()
+			.position(|effort| *effort == current)
+			.unwrap_or(0);
+		LEVELS[(at + 1) % LEVELS.len()]
+	} else if current == Effort::Off {
+		Effort::Medium
+	} else {
+		Effort::Off
+	};
+	agent_state.update(|snapshot| {
+		snapshot.turn.params.thinking =
+			Some(Reasoning { effort: next as i32, ..Reasoning::default() });
+	});
+	state.thinking = Some(Str::from(
+		next
+			.as_str_name()
+			.trim_start_matches("EFFORT_")
+			.to_ascii_lowercase(),
+	));
 }
 
 async fn mutate_mcp(
@@ -1528,8 +1720,31 @@ where
 		})
 	}
 
-	fn shake(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Context shake is not attached to this interactive session.")
+	fn shake(&mut self, args: Str) -> CommandFuture<'_> {
+		let tier = match args.trim() {
+			"" | "elide" => omp_agent::CompactionTier::Elide,
+			"drop-media" | "images" => omp_agent::CompactionTier::DropMedia,
+			_ => {
+				return self.unavailable("usage: /shake [elide|drop-media]");
+			},
+		};
+		Box::pin(async move {
+			let (reply, outcome) = flume::bounded(1);
+			self
+				.commands_tx
+				.send_async(UiCmd::Shake { tier, reply })
+				.await
+				.into_diagnostic()?;
+			match outcome.recv_async().await.into_diagnostic()? {
+				Ok(outcome) => Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+					"Shook context with {}: {} regions, {} bytes reclaimed.",
+					outcome.tier,
+					outcome.replaced_regions,
+					outcome.removed_bytes,
+				)))),
+				Err(error) => Ok(CommandResult::Consumed(ConsumedResult::status(error))),
+			}
+		})
 	}
 
 	fn usage(&mut self, _: Str) -> CommandFuture<'_> {
@@ -1599,7 +1814,20 @@ where
 	}
 
 	fn plan_review(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Plan review is not attached to this interactive session.")
+		let Some(plan) = self.modes.plan() else {
+			return self.unavailable("Plan mode has no active artifact.");
+		};
+		let store = crate::plan::PlanArtifactStore::new(self.state.local_root.clone());
+		match store.resolve(None, plan.artifact.as_str()) {
+			Ok(artifact) => {
+				send_backend(self.backend, BackendEvent::OpenPlanReview { content: artifact.content });
+				silent_command()
+			},
+			Err(error) => {
+				send_backend(self.backend, BackendEvent::Error(Str::new(error.to_string())));
+				silent_command()
+			},
+		}
 	}
 
 	fn guided_goal(&mut self, args: Str) -> CommandFuture<'_> {
@@ -1644,6 +1872,38 @@ where
 		self.state.live_enabled = !self.state.live_enabled;
 		send_status(self.backend, self.state, self.bus, self.dropped);
 		silent_command()
+	}
+
+	fn utility(&mut self, request: commands::UtilityRequest) -> CommandFuture<'_> {
+		let commands::UtilityRequest::Vision(request) = request else {
+			return self.unavailable("This utility is not attached to the interactive session.");
+		};
+		self.state.vision_override = match request {
+			commands::VisionRequest::On => Some(InspectImageMode::On),
+			commands::VisionRequest::Off => Some(InspectImageMode::Off),
+			commands::VisionRequest::Auto => None,
+			commands::VisionRequest::Status => self.state.vision_override,
+		};
+		let override_label = match self.state.vision_override {
+			Some(InspectImageMode::On) => "on",
+			Some(InspectImageMode::Off) => "off",
+			None => "auto",
+		};
+		let effective = if inspect_image_enabled(self.state) {
+			"enabled"
+		} else {
+			"disabled"
+		};
+		let capability = if model_accepts_images(&self.state.model) {
+			"native image input"
+		} else {
+			"text-only image input"
+		};
+		let status = sf!(
+			"inspect_image {effective} · override {override_label} · {capability} · model {}",
+			self.state.model
+		);
+		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
 	}
 
 	fn collab(&mut self, request: commands::CollabRequest) -> CommandFuture<'_> {
@@ -1705,6 +1965,155 @@ where
 		})
 	}
 
+	fn export(&mut self, request: commands::ExportRequest) -> CommandFuture<'_> {
+		let backend = self.backend;
+		let workspace = std::path::PathBuf::from(self.state.workspace_root.as_str());
+		let state_dir = crate::project_state::directory(self.data_dir, &workspace);
+		let journal = state_dir
+			.join("sessions")
+			.join(format!("{}.jsonl", self.state.session_id));
+		let export_theme = self
+			.state
+			.theme_watcher
+			.palette(self.state.appearance, true)
+			.unwrap_or_default();
+		Box::pin(async move {
+			let tree = crate::export::SessionTree::load(&journal)
+				.map_err(|error| miette::miette!("{error}"))?;
+			match request {
+				commands::ExportRequest::Html(path) => {
+					let output = path.map_or_else(
+						|| workspace.join(format!("omp-session-{}.html", tree.id)),
+						|path| {
+							let path = std::path::PathBuf::from(path.as_str());
+							if path.is_absolute() {
+								path
+							} else {
+								workspace.join(path)
+							}
+						},
+					);
+					let html = crate::export::render_html_with_theme(&tree, export_theme)
+						.map_err(|error| miette::miette!("{error}"))?;
+					std::fs::write(&output, html).into_diagnostic()?;
+					Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+						"Exported self-contained HTML to {}",
+						output.display()
+					))))
+				},
+				commands::ExportRequest::Dump { requests } => {
+					if requests {
+						return Err(miette::miette!(
+							"request sidecars are unavailable; use `/debug raw-stream` for the bounded \
+							 redacted provider capture"
+						));
+					}
+					let dump = serde_json::to_string_pretty(&tree).into_diagnostic()?;
+					send_backend(backend, BackendEvent::CopyToClipboard(Str::new(dump)));
+					Ok(CommandResult::Consumed(ConsumedResult::status("Copied sanitized session dump.")))
+				},
+				commands::ExportRequest::Copy(selection) => {
+					let markdown = crate::export::render_markdown(&tree);
+					let copied = if selection.trim().is_empty() {
+						markdown
+					} else {
+						markdown
+							.lines()
+							.filter(|line| line.contains(selection.as_str()))
+							.collect::<Vec<_>>()
+							.join("\n")
+					};
+					if copied.is_empty() {
+						return Err(miette::miette!("no transcript text matched the selection"));
+					}
+					send_backend(backend, BackendEvent::CopyToClipboard(Str::new(copied)));
+					Ok(CommandResult::Consumed(ConsumedResult::status("Copied transcript text.")))
+				},
+			}
+		})
+	}
+
+	fn share(&mut self, args: Str) -> CommandFuture<'_> {
+		let backend = self.backend;
+		let workspace = std::path::PathBuf::from(self.state.workspace_root.as_str());
+		let state_dir = crate::project_state::directory(self.data_dir, &workspace);
+		let journal = state_dir
+			.join("sessions")
+			.join(format!("{}.jsonl", self.state.session_id));
+		let data_dir = self.data_dir.to_owned();
+		let export_settings = self.state.settings.export;
+		let share_settings = self.state.settings.share.clone();
+		Box::pin(async move {
+			let mut no_redact = false;
+			let mut selected = match share_settings.store {
+				crate::settings::ShareStore::Http => crate::share::ShareStoreKind::Http,
+				crate::settings::ShareStore::Gist => crate::share::ShareStoreKind::Gist,
+			};
+			let words =
+				input::tokenize_args(args.as_str()).map_err(|error| miette::miette!("{error}"))?;
+			let mut words = words.iter();
+			while let Some(word) = words.next() {
+				match word.as_str() {
+					"--no-redact" => no_redact = true,
+					"--store" => {
+						selected = match words.next().map(Str::as_str) {
+							Some("http") => crate::share::ShareStoreKind::Http,
+							Some("gist") => crate::share::ShareStoreKind::Gist,
+							Some("auto") => selected,
+							_ => {
+								return Err(miette::miette!(
+									"usage: /share [--no-redact] [--store auto|http|gist]"
+								));
+							},
+						};
+					},
+					_ => {
+						return Err(miette::miette!(
+							"usage: /share [--no-redact] [--store auto|http|gist]"
+						));
+					},
+				}
+			}
+			let tree = crate::export::SessionTree::load(&journal)
+				.map_err(|error| miette::miette!("{error}"))?;
+			let value = serde_json::to_value(tree).into_diagnostic()?;
+			let secrets = crate::secrets::session::SecretSessionSnapshot::build(
+				0,
+				&data_dir.join("secrets.toml"),
+				&workspace.join(".omp/secrets.toml"),
+				std::iter::empty(),
+			)
+			.map_err(|error| miette::miette!("{error}"))?;
+			let projection = crate::share::ShareProjection::materialize_bounded(
+				value,
+				crate::settings::ExportSettings {
+					share_redact_secrets: export_settings.share_redact_secrets && !no_redact,
+				},
+				&secrets,
+				crate::share::HTTP_MAX_SEALED_BYTES.saturating_sub(64 * 1024),
+			);
+			let sealed =
+				crate::share::seal(&projection).map_err(|error| miette::miette!("{error}"))?;
+			let credentials = Arc::new(crate::envd::github_url::GithubCredentialBridge::new());
+			let store =
+				crate::share::DirectShareStore::new(share_settings.server_url.as_str(), credentials)
+					.map_err(|error| miette::miette!("{error}"))?;
+			let result =
+				crate::share::upload(&store, selected, &sealed, share_settings.server_url.as_str())
+					.await
+					.map_err(|error| miette::miette!("{error}"))?;
+			send_backend(backend, BackendEvent::CopyToClipboard(result.url.clone()));
+			Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+				"Encrypted share link copied ({})",
+				match result.store {
+					crate::share::ShareStoreKind::Http => "HTTP",
+					crate::share::ShareStoreKind::Gist => "Gist",
+					crate::share::ShareStoreKind::Extension => "extension",
+				}
+			))))
+		})
+	}
+
 	fn memory(&mut self, args: Str) -> CommandFuture<'_> {
 		let Some(runtime) = self.state.memory.clone() else {
 			return self.unavailable("Memory authority is not attached to this session.");
@@ -1712,7 +2121,12 @@ where
 		Box::pin(async move {
 			let operation = args.trim();
 			let value = match operation.as_str() {
-				"" | "view" => serde_json::to_value(runtime.status()).into_diagnostic()?,
+				"" | "view" => serde_json::to_value(
+					runtime
+						.prompt_snapshot(None, None, usize::MAX)
+						.into_diagnostic()?,
+				)
+				.into_diagnostic()?,
 				"stats" => {
 					serde_json::to_value(runtime.stats().into_diagnostic()?).into_diagnostic()?
 				},
@@ -1723,12 +2137,18 @@ where
 					runtime.clear().into_diagnostic()?;
 					serde_json::json!({"cleared": true, "generation": runtime.generation()})
 				},
+				"reset" => {
+					runtime.clear().into_diagnostic()?;
+					serde_json::json!({"reset": true, "generation": runtime.generation()})
+				},
 				"enqueue" => {
 					let promoted = runtime.enqueue().into_diagnostic()?;
 					serde_json::json!({"promoted": promoted, "generation": runtime.generation()})
 				},
 				_ => {
-					return Err(miette::miette!("usage: /memory view|stats|diagnose|clear|enqueue",));
+					return Err(miette::miette!(
+						"usage: /memory view|stats|diagnose|clear|reset|enqueue",
+					));
 				},
 			};
 			let rendered = serde_json::to_string_pretty(&value).into_diagnostic()?;
@@ -2221,10 +2641,18 @@ where
 					}
 					send_backend(
 						backend,
-						BackendEvent::Notice(sf!(if state.live_enabled {
-							"Live activity waveform enabled."
+						if state.live_enabled {
+							BackendEvent::LiveVoiceStarted
 						} else {
-							"Live activity waveform disabled."
+							BackendEvent::LiveVoiceStopped
+						},
+					);
+					send_backend(
+						backend,
+						BackendEvent::Notice(sf!(if state.live_enabled {
+							"Live voice started. Space mutes; Escape or Ctrl+C closes."
+						} else {
+							"Live voice stopped."
 						})),
 					);
 					send_status(backend, state, bus, dropped);
@@ -2281,11 +2709,15 @@ where
 					};
 					if delivered {
 						send_backend(backend, BackendEvent::UserReplayed {
-							text: Str::from(text),
+							text: Str::new(text.as_str()),
 							chips,
 						});
 						if active {
 							state.queued = state.queued.saturating_add(1);
+							state.queued_prompts.push_back(omp_chat_ui::QueuedPrompt {
+								text: Str::from(text),
+								attachments,
+							});
 						} else {
 							state.turn_started.get_or_insert_with(Instant::now);
 						}
@@ -2319,6 +2751,10 @@ where
 							text:        prompt_text.clone(),
 							attachments: attachments.clone(),
 						});
+						let queued_prompt = active.then(|| omp_chat_ui::QueuedPrompt {
+							text:        prompt_text.clone(),
+							attachments: attachments.clone(),
+						});
 						let mut item = *item;
 						let chips = lower_attachments(&mut item, attachments, |message| {
 							send_backend(backend, BackendEvent::Error(message));
@@ -2347,6 +2783,9 @@ where
 							send_backend(backend, BackendEvent::UserReplayed { text: prompt_text, chips });
 							if active {
 								state.queued = state.queued.saturating_add(1);
+								if let Some(prompt) = queued_prompt {
+									state.queued_prompts.push_back(prompt);
+								}
 							} else {
 								state.turn_started.get_or_insert_with(Instant::now);
 								state.pending_prompt = pending_prompt;
@@ -2370,6 +2809,121 @@ where
 				let _ = modes.flush_projection().await;
 				abort.abort();
 			}
+		},
+		Intent::SetGoal { objective, token_budget } => {
+			match modes.set_goal(objective, token_budget, now_ms()) {
+				Ok(goal) => {
+					send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
+				},
+				Err(error) => {
+					send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+				},
+			}
+		},
+		Intent::Dequeue => {
+			let removed = mailbox.take_unstarted_producers().await.unwrap_or(0);
+			let restored = removed.min(state.queued_prompts.len());
+			let prompts = state.queued_prompts.drain(..restored).collect::<Vec<_>>();
+			state.queued = state.queued.saturating_sub(restored);
+			if prompts.is_empty() {
+				send_backend(backend, BackendEvent::Notice(sf!("No queued messages to restore.")));
+			} else {
+				send_backend(backend, BackendEvent::QueuedPromptsRestored(prompts));
+				send_backend(
+					backend,
+					BackendEvent::Notice(sf!(
+						"Restored {restored} queued message{} to the editor.",
+						if restored == 1 { "" } else { "s" },
+					)),
+				);
+			}
+		},
+		Intent::Retry => {
+			if chat_active(state.submit_pending, bus.phase()) {
+				send_backend(backend, BackendEvent::Notice(sf!("Wait for the active turn to finish.")));
+			} else {
+				let (reply_tx, reply_rx) = flume::bounded(1);
+				if commands_tx
+					.send_async(UiCmd::Retry { reply: reply_tx })
+					.await
+					.is_ok() && let Ok(Ok((items, text))) = reply_rx.recv_async().await
+				{
+					state.tools.clear();
+					send_backend(backend, BackendEvent::HistoryCleared);
+					replay_items(backend, &items, &mut state.tools, &mut state.part_serial, registry);
+					send_backend(backend, BackendEvent::UserReplayed { text, chips: Vec::new() });
+				}
+			}
+		},
+		Intent::CycleModel { backward } => {
+			let rows = model_rows(Catalog::embedded());
+			if !rows.is_empty() {
+				let current = current_model_index(Catalog::embedded(), &state.model);
+				let next = if backward {
+					(current + rows.len() - 1) % rows.len()
+				} else {
+					(current + 1) % rows.len()
+				};
+				switch_model(
+					backend,
+					agent_state,
+					data_dir,
+					rows[next].key.as_str(),
+					state,
+					control,
+					false,
+				)
+				.await;
+			}
+		},
+		Intent::ToggleThinking => {
+			set_interactive_thinking(agent_state, state, false);
+			send_status(backend, state, bus, dropped);
+		},
+		Intent::CycleThinking => {
+			set_interactive_thinking(agent_state, state, true);
+			send_status(backend, state, bus, dropped);
+		},
+		Intent::TogglePlan => {
+			handle_plan_command(backend, modes, "toggle");
+		},
+		Intent::ToggleLive => {
+			state.live_enabled = !state.live_enabled;
+			send_status(backend, state, bus, dropped);
+		},
+		Intent::ToggleStt => {
+			state.stt_enabled = !state.stt_enabled;
+			send_backend(
+				backend,
+				BackendEvent::Notice(sf!(if state.stt_enabled {
+					"Speech-to-text capture enabled."
+				} else {
+					"Speech-to-text capture disabled."
+				})),
+			);
+		},
+		Intent::Suspend | Intent::ResetDisplay => {},
+		Intent::ApplySettings { changes, commit } => {
+			apply_setting_changes(&mut state.settings, &changes)?;
+			if commit {
+				let encoded = toml::to_string_pretty(&state.settings).into_diagnostic()?;
+				crate::settings::io::atomic_replace(&data_dir.join("config.toml"), &encoded)
+					.into_diagnostic()?;
+				send_backend(backend, BackendEvent::Notice(sf!("Settings saved.")));
+			}
+		},
+		Intent::Select { purpose, key } => match purpose {
+			omp_chat_ui::SelectionPurpose::Copy => {
+				send_backend(backend, BackendEvent::CopyToClipboard(key));
+			},
+			omp_chat_ui::SelectionPurpose::Hook
+			| omp_chat_ui::SelectionPurpose::Advisor
+			| omp_chat_ui::SelectionPurpose::History => {
+				send_backend(backend, BackendEvent::PromptDropped {
+					text:        key,
+					attachments: Vec::new(),
+				});
+			},
 		},
 		Intent::AgentSteer { id, prompt } => {
 			let facts = parent.agent_hub_facts(state.session_id.as_str());
@@ -2981,6 +3535,8 @@ fn handle_agent_event(
 		AgentEvent::Turn { turn_id, event } => match &event.event {
 			Some(Event::Accepted(accepted)) => {
 				state.replaying_turn = accepted.replay;
+				state.token_rate = (!accepted.replay)
+					.then(|| omp_chat_ui::status_line::TokenRateMeter::start(Instant::now()));
 				state.tokens_per_second = None;
 				modes.begin_streaming();
 			},
@@ -2997,6 +3553,7 @@ fn handle_agent_event(
 					state.replaying_turn = false;
 				}
 				state.queued = 0;
+				state.queued_prompts.clear();
 				state.model.clone_from(&outcome.model);
 				state.context_window = resolve_model(Catalog::embedded(), &outcome.model)
 					.and_then(|spec| spec.limits.context_window);
@@ -3041,12 +3598,10 @@ fn handle_agent_event(
 					}
 				}
 				if let Some(usage) = &outcome.usage {
-					state.tokens_per_second = state.turn_started.and_then(|started| {
-						let elapsed = Instant::now()
-							.saturating_duration_since(started)
-							.as_secs_f64();
-						(elapsed > 0.0).then(|| (usage.output_tokens as f64 / elapsed).round() as u64)
-					});
+					if let Some(rate) = state.token_rate.as_mut() {
+						rate.finalize(usage.output_tokens);
+						state.tokens_per_second = rate.rate(Instant::now());
+					}
 					let _ = modes.checkpoint_goal_usage(
 						GoalUsage {
 							input_tokens:        usage.input_tokens,
@@ -3128,6 +3683,10 @@ fn handle_agent_event(
 				if let Some(id) = state.active_parts.get(&delta.index)
 					&& let Ok(fragment) = std::str::from_utf8(&delta.chunk)
 				{
+					if let Some(rate) = state.token_rate.as_mut() {
+						rate.observe_fragment(fragment);
+						state.tokens_per_second = rate.rate(Instant::now());
+					}
 					send_backend(backend, BackendEvent::AssistantDelta {
 						id:   id.clone(),
 						text: Str::from(fragment),
@@ -3209,7 +3768,16 @@ fn handle_agent_event(
 				send_backend(backend, BackendEvent::ToolView { id: call_id.clone(), view });
 			}
 		},
-		AgentEvent::ToolFinished { call_id, item } => {
+		AgentEvent::ToolFinished { call_id, item, usage } => {
+			let _ = modes.checkpoint_goal_usage(
+				GoalUsage {
+					input_tokens:        usage.input_tokens,
+					cache_write_tokens:  usage.cache_write_tokens,
+					cached_input_tokens: usage.cache_read_tokens,
+					output_tokens:       usage.output_tokens,
+				},
+				now_ms(),
+			);
 			if state.active_ptys.remove(call_id.as_str()).is_some() {
 				send_backend(backend, BackendEvent::PtyFinished {
 					id:        call_id.clone(),
@@ -3918,8 +4486,10 @@ where
 				.unwrap_or_default();
 			let transcript = facts
 				.transcript_preview
-				.or(facts.assignment)
+				.or(facts.assignment.clone())
 				.unwrap_or_default();
+			let progress = facts.progress.clone().unwrap_or_default();
+			let terminal = facts.terminal.clone();
 			AgentRow {
 				id: facts.id,
 				name: facts.name,
@@ -3932,6 +4502,19 @@ where
 				model: facts.model,
 				serving_model: facts.serving_model,
 				transcript,
+				assignment: facts.assignment,
+				requests: progress.requests,
+				tool_calls: progress.tool_calls,
+				context_tokens: progress.context_tokens,
+				cost_micros: progress.cost_micros,
+				terminal_kind: terminal
+					.as_ref()
+					.map(|terminal| Str::from(terminal.kind.to_string())),
+				terminal_summary: terminal.as_ref().map(|terminal| terminal.summary.clone()),
+				artifact_uri: terminal
+					.as_ref()
+					.and_then(|terminal| terminal.disposition.artifact_uri.clone()),
+				frozen: false,
 				can_steer: facts.capabilities.steer,
 				can_revive: facts.capabilities.revive,
 				can_kill: facts.capabilities.kill,
@@ -4380,6 +4963,7 @@ mod tests {
 		BridgeState {
 			model: "test/model".to_owned(),
 			environment,
+			local_root: std::env::temp_dir(),
 			session_id: sf!("test-session"),
 			collab: None,
 			memory: None,
@@ -4394,6 +4978,8 @@ mod tests {
 			context_snapshot: None,
 			cost_nanos: 0,
 			queued: 0,
+			queued_prompts: VecDeque::new(),
+			stt_enabled: false,
 			jobs: HashSet::new(),
 			attempt: 0,
 			turn_started: None,
@@ -4407,10 +4993,12 @@ mod tests {
 			pending_auth_kind: None,
 			live_enabled: false,
 			live_activity: ActivityWaveform::new(),
+			token_rate: None,
 			tokens_per_second: None,
 			thinking: None,
 			session_accent: sf!("test"),
 			replaying_turn: false,
+			vision_override: None,
 			settings: Settings::default(),
 			commands: CommandRoster::new(Vec::new()),
 			typed_commands: commands::CommandRoster::builtins(),

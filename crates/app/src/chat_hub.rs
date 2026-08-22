@@ -28,6 +28,158 @@ use serde_json::json;
 
 static ROUTER: LazyLock<HubRouter<ChatHubBackend>> = LazyLock::new(HubRouter::new);
 const DEFAULT_ROUTE: &str = "*";
+const HUB_TERMINAL_COLUMNS: usize = 120;
+const HUB_TERMINAL_ROWS: usize = 40;
+
+#[derive(Default)]
+enum TerminalParseState {
+	#[default]
+	Text,
+	Escape,
+	Csi(String),
+	Osc,
+	OscEscape,
+}
+
+struct TerminalRowReplay {
+	cells:  Vec<Vec<char>>,
+	row:    usize,
+	column: usize,
+	state:  TerminalParseState,
+}
+
+impl TerminalRowReplay {
+	fn new() -> Self {
+		Self {
+			cells:  vec![vec![' '; HUB_TERMINAL_COLUMNS]; HUB_TERMINAL_ROWS],
+			row:    0,
+			column: 0,
+			state:  TerminalParseState::Text,
+		}
+	}
+
+	fn process(&mut self, data: &[u8]) {
+		for character in String::from_utf8_lossy(data).chars() {
+			let state = std::mem::take(&mut self.state);
+			match state {
+				TerminalParseState::Text => self.text(character),
+				TerminalParseState::Escape if character == '[' => {
+					self.state = TerminalParseState::Csi(String::new());
+				},
+				TerminalParseState::Escape if character == ']' => {
+					self.state = TerminalParseState::Osc;
+				},
+				TerminalParseState::Escape => {},
+				TerminalParseState::Csi(parameters) if ('\u{40}'..='\u{7e}').contains(&character) => {
+					self.csi(&parameters, character);
+				},
+				TerminalParseState::Csi(mut parameters) => {
+					if parameters.len() < 64 {
+						parameters.push(character);
+					}
+					self.state = TerminalParseState::Csi(parameters);
+				},
+				TerminalParseState::Osc if character == '\u{7}' => {},
+				TerminalParseState::Osc if character == '\u{1b}' => {
+					self.state = TerminalParseState::OscEscape;
+				},
+				TerminalParseState::Osc => self.state = TerminalParseState::Osc,
+				TerminalParseState::OscEscape if character == '\\' => {},
+				TerminalParseState::OscEscape => self.state = TerminalParseState::Osc,
+			}
+		}
+	}
+
+	fn text(&mut self, character: char) {
+		match character {
+			'\u{1b}' => self.state = TerminalParseState::Escape,
+			'\r' => self.column = 0,
+			'\n' => self.newline(),
+			'\u{8}' => self.column = self.column.saturating_sub(1),
+			'\t' => self.column = (self.column + 8).min(HUB_TERMINAL_COLUMNS) & !7,
+			character if character.is_control() => {},
+			character => {
+				let width = xutf::width_char(character);
+				if width == 0 {
+					return;
+				}
+				if self.column >= HUB_TERMINAL_COLUMNS {
+					self.newline();
+				}
+				self.cells[self.row][self.column] = character;
+				for offset in 1..width {
+					if self.column + offset < HUB_TERMINAL_COLUMNS {
+						self.cells[self.row][self.column + offset] = '\0';
+					}
+				}
+				self.column = (self.column + width).min(HUB_TERMINAL_COLUMNS);
+			},
+		}
+	}
+
+	fn newline(&mut self) {
+		self.column = 0;
+		if self.row + 1 < HUB_TERMINAL_ROWS {
+			self.row += 1;
+		} else {
+			self.cells.rotate_left(1);
+			self.cells[HUB_TERMINAL_ROWS - 1].fill(' ');
+		}
+	}
+
+	fn csi(&mut self, parameters: &str, command: char) {
+		let mut values = parameters
+			.trim_start_matches('?')
+			.split(';')
+			.map(|value| value.parse::<usize>().unwrap_or(0));
+		let first = values.next().unwrap_or(0);
+		let amount = first.max(1);
+		match command {
+			'A' => self.row = self.row.saturating_sub(amount),
+			'B' => self.row = (self.row + amount).min(HUB_TERMINAL_ROWS - 1),
+			'C' => self.column = (self.column + amount).min(HUB_TERMINAL_COLUMNS),
+			'D' => self.column = self.column.saturating_sub(amount),
+			'G' => self.column = amount.saturating_sub(1).min(HUB_TERMINAL_COLUMNS - 1),
+			'd' => self.row = amount.saturating_sub(1).min(HUB_TERMINAL_ROWS - 1),
+			'H' | 'f' => {
+				self.row = amount.saturating_sub(1).min(HUB_TERMINAL_ROWS - 1);
+				self.column = values
+					.next()
+					.unwrap_or(1)
+					.saturating_sub(1)
+					.min(HUB_TERMINAL_COLUMNS - 1);
+			},
+			'J' if first == 2 || first == 3 => {
+				for row in &mut self.cells {
+					row.fill(' ');
+				}
+				self.row = 0;
+				self.column = 0;
+			},
+			'K' if first == 1 => {
+				let end = self.column.min(HUB_TERMINAL_COLUMNS - 1);
+				self.cells[self.row][..=end].fill(' ');
+			},
+			'K' if first == 2 => self.cells[self.row].fill(' '),
+			'K' => self.cells[self.row][self.column..].fill(' '),
+			_ => {},
+		}
+	}
+
+	fn into_lines(self) -> Vec<String> {
+		self
+			.cells
+			.into_iter()
+			.map(|row| {
+				row.into_iter()
+					.filter(|character| *character != '\0')
+					.collect::<String>()
+					.trim_end()
+					.to_owned()
+			})
+			.collect()
+	}
+}
 
 /// Produces the one process-global hub tool registered in the env registry.
 pub fn tool() -> impl Tool {
@@ -629,16 +781,18 @@ impl ChatHubBackend {
 				after_sequence: params.cursor.unwrap_or(0),
 				generation,
 				max_bytes: 2 * 1024 * 1024,
-				terminal_text: false,
-				terminal_columns: 0,
-				terminal_rows: 0,
+				terminal_text: params.render_terminal_rows,
+				terminal_columns: u32::from(params.render_terminal_rows) * HUB_TERMINAL_COLUMNS as u32,
+				terminal_rows: u32::from(params.render_terminal_rows) * HUB_TERMINAL_ROWS as u32,
 				props: None,
 			})
 			.await
 			.map_err(|error| fault(error.to_string()))?;
 		let limit = usize::from(params.lines.unwrap_or(100));
 		let mut lines = Vec::new();
+		let mut terminal_bytes = Vec::new();
 		let mut cursor = params.cursor.unwrap_or(0);
+		let mut timed_out = false;
 		let idle = if params.follow {
 			StdDuration::from_secs_f64(params.timeout.unwrap_or(30.0))
 		} else {
@@ -648,30 +802,57 @@ impl ChatHubBackend {
 			match tokio::time::timeout(idle, attachment.next_event()).await {
 				Ok(Ok(Some(ProcessAttachmentEvent::Output(output)))) => {
 					cursor = cursor.max(output.sequence);
-					for line in String::from_utf8_lossy(&output.data).lines() {
-						if params
-							.grep
-							.as_deref()
-							.is_none_or(|pattern| line.contains(pattern))
-						{
-							lines.push(line.to_owned());
+					if params.render_terminal_rows {
+						terminal_bytes.extend_from_slice(&output.data);
+					} else {
+						for line in String::from_utf8_lossy(&output.data).lines() {
+							if params
+								.grep
+								.as_deref()
+								.is_none_or(|pattern| line.contains(pattern))
+							{
+								lines.push(line.to_owned());
+							}
 						}
 					}
-					if params.follow && !lines.is_empty() {
+					if params.follow && (!lines.is_empty() || !terminal_bytes.is_empty()) {
 						break;
 					}
 				},
-				Ok(Ok(Some(ProcessAttachmentEvent::State(_)) | None)) | Err(_) => break,
+				Ok(Ok(Some(ProcessAttachmentEvent::State(_)) | None)) => break,
+				Err(_) => {
+					timed_out = params.follow;
+					break;
+				},
 				Ok(Ok(Some(ProcessAttachmentEvent::Attached(_)))) => {},
 				Ok(Err(error)) => return Err(fault(error.to_string())),
 			}
+		}
+		if params.render_terminal_rows {
+			let mut replay = TerminalRowReplay::new();
+			replay.process(&terminal_bytes);
+			lines = replay
+				.into_lines()
+				.into_iter()
+				.filter(|line| {
+					params
+						.grep
+						.as_deref()
+						.is_none_or(|pattern| line.contains(pattern))
+				})
+				.collect();
 		}
 		if !params.head && lines.len() > limit {
 			lines.drain(..lines.len() - limit);
 		} else {
 			lines.truncate(limit);
 		}
-		Self::response(json!({ "name": name, "lines": lines, "cursor": cursor }))
+		Self::response(json!({
+			"name": name,
+			"lines": lines,
+			"cursor": cursor,
+			"timedOut": timed_out,
+		}))
 	}
 
 	async fn process_send(&self, params: &Params) -> Result<Response, Fault> {
@@ -1006,4 +1187,17 @@ fn now_ms() -> u64 {
 
 fn fault(message: impl Into<Str>) -> Fault {
 	Fault { message: message.into() }
+}
+#[cfg(test)]
+mod tests {
+	use super::TerminalRowReplay;
+
+	#[test]
+	fn terminal_row_replay_applies_cursor_motion_and_carriage_return() {
+		let mut replay = TerminalRowReplay::new();
+		replay.process(b"one\rTWO\nthree\x1b[1A\rX");
+		let lines = replay.into_lines();
+		assert_eq!(lines[0], "XWO");
+		assert_eq!(lines[1], "three");
+	}
 }

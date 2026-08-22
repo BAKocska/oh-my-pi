@@ -1,5 +1,7 @@
 //! Compaction retention predicate for canonical plan reads.
 
+use std::collections::BTreeSet;
+
 use omp_core::Str;
 
 use super::{artifacts::canonical_url, state::DEFAULT_PLAN_URL};
@@ -27,6 +29,33 @@ impl PlanReadProtection {
 	#[must_use]
 	pub fn retains(&self, tool: &str, path: &str) -> bool {
 		tool == "read" && (targets(path, DEFAULT_PLAN_URL) || targets(path, self.active.as_str()))
+	}
+}
+
+/// Event-index projection consumed by
+/// `omp_agent::plan_lossless_with_warm_suffix`.
+#[derive(Clone, Debug, Default)]
+pub struct PlanReadRetention {
+	events: BTreeSet<u64>,
+}
+
+impl PlanReadRetention {
+	/// Records one projected tool result when it reads the active plan.
+	pub fn observe(&mut self, event: u64, protection: &PlanReadProtection, tool: &str, path: &str) {
+		if protection.retains(tool, path) {
+			self.events.insert(event);
+		}
+	}
+
+	/// Forgets an event after its branch is no longer reachable.
+	pub fn remove(&mut self, event: u64) {
+		self.events.remove(&event);
+	}
+
+	/// Returns the zero-allocation predicate passed through prune, shake, and
+	/// asynchronous lossless compaction planning.
+	pub fn predicate(&self) -> impl Fn(u64) -> bool + '_ {
+		|event| self.events.contains(&event)
 	}
 }
 

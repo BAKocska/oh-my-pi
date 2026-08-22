@@ -11,7 +11,7 @@ use super::{
 	diff::{DiffOptions, FileDiff, GitDiff},
 	lock,
 	repo::Repository,
-	runner::{GitRunError, GitRunOptions, GitRunOutput, GitRunner},
+	runner::{GitDeadline, GitRunError, GitRunOptions, GitRunOutput, GitRunner},
 };
 
 /// A validated subset of one file's diff hunks.
@@ -265,6 +265,74 @@ pub enum WriteTreeOutcome {
 	Conflict(GitRunOutput),
 	/// Git rejected the operation for another reason.
 	Rejected(GitRunOutput),
+}
+/// Result of cloning a repository, including whether the shallow transport
+/// needed the compatibility fallback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CloneOutcome {
+	/// `git clone --depth=1` completed.
+	Shallow(GitRunOutput),
+	/// Shallow clone was rejected and an ordinary clone completed.
+	Full {
+		/// Exact shallow-clone rejection retained for diagnostics.
+		shallow_rejection: GitRunOutput,
+		/// Exact successful full-clone output.
+		output:            GitRunOutput,
+	},
+	/// Both shallow and ordinary clone attempts were rejected.
+	Rejected {
+		/// Exact shallow-clone rejection.
+		shallow_rejection: GitRunOutput,
+		/// Exact full-clone rejection.
+		full_rejection:    GitRunOutput,
+	},
+}
+
+/// Exact identity and timestamp flags for one low-level commit creation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CommitOptions<'a> {
+	/// Git-compatible `Name <email>` author identity.
+	pub author:      Option<&'a str>,
+	/// Git-compatible author and committer date.
+	pub date:        Option<&'a str>,
+	/// Permit creation when the index tree equals `HEAD`.
+	pub allow_empty: bool,
+}
+
+/// Lease protection accepted by one push.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PushOptions<'a> {
+	/// Optional `refname[:expected]` value for `--force-with-lease`.
+	pub force_with_lease: Option<&'a str>,
+}
+
+/// Clones `remote` into `target`, preferring a one-commit shallow transfer.
+///
+/// Some servers reject shallow negotiation. Git removes a newly-created
+/// destination after a failed clone; only then is the ordinary compatibility
+/// attempt made against the same exact target.
+pub async fn clone_repository(
+	runner: &GitRunner,
+	cwd: &Path,
+	remote: &str,
+	target: &str,
+	cancel: &CancellationToken,
+) -> Result<CloneOutcome, MutationError> {
+	let options = GitRunOptions { deadline: GitDeadline::Network, ..Default::default() };
+	let shallow = runner
+		.run(cwd, &["clone", "--depth=1", "--no-tags", "--", remote, target], options, cancel)
+		.await?;
+	if shallow.exit_code == 0 {
+		return Ok(CloneOutcome::Shallow(shallow));
+	}
+	let full = runner
+		.run(cwd, &["clone", "--no-tags", "--", remote, target], options, cancel)
+		.await?;
+	if full.exit_code == 0 {
+		Ok(CloneOutcome::Full { shallow_rejection: shallow, output: full })
+	} else {
+		Ok(CloneOutcome::Rejected { shallow_rejection: shallow, full_rejection: full })
+	}
 }
 
 /// Low-level mutation facade for named repository consumers.
@@ -694,6 +762,53 @@ impl GitMutation {
 		}
 	}
 
+	/// Creates one commit from the current index using exact stdin message
+	/// bytes and caller-selected identity/date flags.
+	pub async fn create_commit(
+		&self,
+		message: &[u8],
+		options: CommitOptions<'_>,
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		let _guard = lock::write(&self.repository, cancel).await?;
+		let mut argv = Vec::with_capacity(8);
+		argv.extend(["commit", "--file=-"]);
+		if let Some(author) = options.author {
+			argv.extend(["--author", author]);
+		}
+		if let Some(date) = options.date {
+			argv.extend(["--date", date]);
+		}
+		if options.allow_empty {
+			argv.push("--allow-empty");
+		}
+		self.mutation(&argv, Some(message), cancel).await
+	}
+
+	/// Pushes exact refspecs without following tags and with optional
+	/// force-with-lease protection.
+	pub async fn push(
+		&self,
+		remote: &str,
+		refspecs: &[&str],
+		options: PushOptions<'_>,
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		let _guard = lock::write(&self.repository, cancel).await?;
+		let mut argv = Vec::with_capacity(refspecs.len() + 5);
+		argv.extend(["push", "--no-follow-tags"]);
+		let lease_flag = options
+			.force_with_lease
+			.filter(|lease| !lease.is_empty())
+			.map(|lease| format!("--force-with-lease={lease}"));
+		if options.force_with_lease.is_some() {
+			argv.push(lease_flag.as_deref().unwrap_or("--force-with-lease"));
+		}
+		argv.push(remote);
+		argv.extend_from_slice(refspecs);
+		self.network_mutation(&argv, cancel).await
+	}
+
 	fn cwd(&self) -> &Path {
 		&self.repository.worktree_root
 	}
@@ -744,6 +859,30 @@ impl GitMutation {
 		cancel: &CancellationToken,
 	) -> Result<MutationOutcome, MutationError> {
 		let output = self.invoke(argv, input, cancel).await?;
+		if output.exit_code == 0 {
+			return Ok(MutationOutcome::Applied(output));
+		}
+		if self.has_unmerged(cancel).await? {
+			Ok(MutationOutcome::Conflict(output))
+		} else {
+			Ok(MutationOutcome::Rejected(output))
+		}
+	}
+
+	async fn network_mutation(
+		&self,
+		argv: &[&str],
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		let output = self
+			.runner
+			.run(
+				self.cwd(),
+				argv,
+				GitRunOptions { deadline: GitDeadline::Network, ..Default::default() },
+				cancel,
+			)
+			.await?;
 		if output.exit_code == 0 {
 			return Ok(MutationOutcome::Applied(output));
 		}

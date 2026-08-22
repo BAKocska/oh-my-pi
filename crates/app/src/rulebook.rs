@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	fs,
 	path::PathBuf,
 	sync::Arc,
 };
@@ -399,6 +400,20 @@ impl Resolve for RuleResolver {
 			);
 		}
 		Ok(CowBytes::from(output))
+	}
+
+	async fn path(&self, resource: &str) -> Result<Option<Str>, Fault> {
+		let name = resource.trim_matches('/');
+		let rule = self.snapshot.get(name).ok_or_else(|| Fault::Source {
+			message: Str::from(format!("rule resource not found: {name}")),
+		})?;
+		let path = fs::canonicalize(&rule.declaration.path).map_err(|_| Fault::Source {
+			message: Str::from(format!("rule resource not found: {name}")),
+		})?;
+		let uri = url::Url::from_file_path(path).map_err(|()| Fault::Invalid {
+			message: Str::from("rule path cannot be represented as a file URI"),
+		})?;
+		Ok(Some(Str::from(uri.to_string())))
 	}
 
 	async fn list(

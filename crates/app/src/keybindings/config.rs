@@ -68,6 +68,31 @@ pub struct ResolvedKeybindings {
 	pub conflicts: Vec<KeybindingConflict>,
 }
 
+impl ResolvedKeybindings {
+	/// Iterates configured chords, or platform fallbacks when the action has no
+	/// explicit effective binding.
+	pub fn chords_for<'a>(
+		&'a self,
+		action: &'a str,
+		platform: super::KeyPlatform,
+	) -> impl Iterator<Item = &'a str> + Clone {
+		let configured = self
+			.bindings
+			.get(action)
+			.map(Vec::as_slice)
+			.unwrap_or_default();
+		let fallback = if configured.is_empty() {
+			super::fallback_chords(action, platform)
+		} else {
+			&[]
+		};
+		configured
+			.iter()
+			.map(Str::as_str)
+			.chain(fallback.iter().copied())
+	}
+}
+
 const LEGACY_ACTION_IDS: &[(&str, &str)] = &[
 	("interrupt", "app.interrupt"),
 	("cycleThinkingLevel", "app.thinking.cycle"),
@@ -93,6 +118,69 @@ const LEGACY_ACTION_IDS: &[(&str, &str)] = &[
 	("selectConfirm", "tui.select.confirm"),
 	("selectCancel", "tui.select.cancel"),
 ];
+
+/// TUI primitives available to every keybinding profile.
+pub const TUI_ACTION_IDS: &[&str] = &[
+	"tui.editor.cursor_up",
+	"tui.editor.cursor_down",
+	"tui.editor.copy",
+	"tui.editor.cut",
+	"tui.input.submit",
+	"tui.input.paste",
+	"tui.input.paste_raw",
+	"tui.select.up",
+	"tui.select.down",
+	"tui.select.confirm",
+	"tui.select.cancel",
+];
+
+/// Application actions merged with the TUI primitive registry.
+pub const APP_ACTION_IDS: &[&str] = &[
+	"app.interrupt",
+	"app.thinking.cycle",
+	"app.thinking.toggle",
+	"app.model.cycle_forward",
+	"app.model.cycle_backward",
+	"app.model.select",
+	"app.tools.toggle_tree",
+	"app.editor.external",
+	"app.message.follow_up",
+	"app.retry",
+	"app.message.dequeue",
+	"app.clipboard.paste_image",
+	"app.clipboard.paste_raw",
+	"app.copy",
+	"app.plan.toggle",
+	"app.voice.toggle",
+	"app.voice.live_toggle",
+	"app.session.new",
+	"app.session.fork",
+	"app.session.resume",
+	"app.session.observe",
+	"app.session.rename",
+	"app.session.delete",
+	"app.session.fold",
+	"app.session.unfold",
+	"app.session.toggle_path",
+	"app.session.toggle_sort",
+	"app.agent_hub",
+];
+
+/// Iterates the single merged application/TUI action authority.
+pub fn action_ids() -> impl Iterator<Item = &'static str> + Clone {
+	TUI_ACTION_IDS.iter().chain(APP_ACTION_IDS).copied()
+}
+
+/// Migrates a legacy action id and verifies it against the merged registry.
+pub fn canonical_action_id(action: &str) -> Option<&str> {
+	let canonical = LEGACY_ACTION_IDS
+		.iter()
+		.find_map(|(legacy, canonical)| (*legacy == action).then_some(*canonical))
+		.unwrap_or(action);
+	action_ids()
+		.any(|known| known == canonical)
+		.then_some(canonical)
+}
 
 impl KeybindingsConfig {
 	/// Resolves profile inheritance, migrates legacy action names, validates
@@ -142,10 +230,9 @@ impl KeybindingsConfig {
 			self.resolve_into(parent, visiting, output)?;
 		}
 		for (raw_action, raw_chords) in &profile.bindings {
-			let action = LEGACY_ACTION_IDS
-				.iter()
-				.find_map(|(legacy, canonical)| (*legacy == raw_action.as_str()).then_some(*canonical))
-				.unwrap_or(raw_action);
+			let action = canonical_action_id(raw_action).ok_or_else(|| {
+				KeybindingsConfigError::UnknownAction { action: raw_action.to_string() }
+			})?;
 			let chords = raw_chords
 				.iter()
 				.map(|chord| normalize_chord(chord))
@@ -393,6 +480,10 @@ pub enum KeybindingsConfigError {
 	/// Profile inheritance contains a cycle.
 	#[error("keybinding profile inheritance cycle at {profile}")]
 	ProfileCycle { profile: String },
+	/// A chord has invalid modifiers, key spelling, or duplicate modifiers.
+	/// An action id is not present in either the application or TUI registry.
+	#[error("unknown keybinding action {action}")]
+	UnknownAction { action: String },
 	/// A chord has invalid modifiers, key spelling, or duplicate modifiers.
 	#[error("invalid keybinding chord {chord}")]
 	InvalidChord { chord: String },

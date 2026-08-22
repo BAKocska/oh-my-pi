@@ -95,6 +95,18 @@ pub fn resolve_system_inputs(
 	let append = resolve_prompt_input(append)?;
 	Ok((custom, append))
 }
+/// Resolves the title-generation system prompt with project-over-user
+/// `TITLE_SYSTEM.md` precedence and the embedded native prompt as fallback.
+pub fn resolve_title_system_prompt(cwd: &Path, home: &Path) -> Result<Str, PromptInputError> {
+	Ok(discover_prompt_file(cwd, home, "TITLE_SYSTEM.md")?.unwrap_or_else(|| {
+		Str::new_static(
+			omp_agent::prompt_assets::prompt_asset(
+				omp_agent::prompt_assets::PromptAssetId::TitleSystem,
+			)
+			.content,
+		)
+	}))
+}
 
 fn tolerant_literal_error(error: &io::Error) -> bool {
 	error.kind() == io::ErrorKind::NotFound || matches!(error.raw_os_error(), Some(36 | 63))
@@ -125,6 +137,24 @@ mod tests {
 				.expect("system discovery")
 				.as_deref(),
 			Some("project")
+		);
+		assert_eq!(
+			resolve_title_system_prompt(&project, &home)
+				.expect("embedded title prompt fallback")
+				.as_str(),
+			omp_agent::prompt_assets::prompt_asset(
+				omp_agent::prompt_assets::PromptAssetId::TitleSystem,
+			)
+			.content
+		);
+
+		std::fs::write(project.join(".omp/TITLE_SYSTEM.md"), "project title")
+			.expect("project title system prompt");
+		assert_eq!(
+			resolve_title_system_prompt(&project, &home)
+				.expect("project title prompt")
+				.as_str(),
+			"project title"
 		);
 	}
 }

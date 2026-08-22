@@ -14,10 +14,6 @@ use omp_storage::transcript::TitleSource;
 /// the first available assignment; it must not issue one request per role.
 pub const ONLINE_TITLE_ROLE_CHAIN: [&str; 3] = ["tiny", "commit", "smol"];
 
-#[cfg(feature = "local-text")]
-const TITLE_SYSTEM_PROMPT: &str = "Name the user's task in 3-7 words. Use sentence case and \
-                                   preserve names. Reply only with <title>the title</title>. \
-                                   Reply <title/> when there is no concrete task.";
 const FILLER: &[&str] = &[
 	"hi",
 	"hii",
@@ -102,6 +98,7 @@ pub trait OnlineTitleCompletion: Send + Sync {
 	fn complete_title<'a>(
 		&'a self,
 		roles: &'static [&'static str],
+		system_prompt: &'a str,
 		input: &'a str,
 	) -> Pin<Box<dyn Future<Output = Result<Option<Str>, Str>> + Send + 'a>>;
 }
@@ -135,6 +132,41 @@ impl SessionTitleState {
 		self.source = Some(TitleSource::Assistant);
 		true
 	}
+
+	/// Runs the online tiny→commit→smol lane when this state admits automatic
+	/// generation, then projects its accepted assistant title.
+	pub async fn generate_online(
+		&mut self,
+		completion: &dyn OnlineTitleCompletion,
+		input: &str,
+		system_prompt: &str,
+		replanned: bool,
+	) -> bool {
+		if !self.should_generate(input, replanned) {
+			return false;
+		}
+		generate_online_title(completion, input, system_prompt)
+			.await
+			.is_some_and(|title| self.accept_generated(title))
+	}
+
+	/// Runs the configured local tiny-text adapter when this state admits
+	/// automatic generation, then projects its accepted assistant title.
+	#[cfg(feature = "local-text")]
+	pub fn generate_local(
+		&mut self,
+		adapter: &TextAdapter,
+		input: &str,
+		system_prompt: &str,
+		replanned: bool,
+		cancel: &LocalCancellation,
+	) -> bool {
+		if !self.should_generate(input, replanned) {
+			return false;
+		}
+		generate_local_title(adapter, input, system_prompt, cancel)
+			.is_some_and(|title| self.accept_generated(title))
+	}
 }
 
 /// Runs the landed local tiny-text adapter with bounded title options.
@@ -142,15 +174,17 @@ impl SessionTitleState {
 pub fn generate_local_title(
 	adapter: &TextAdapter,
 	input: &str,
+	system_prompt: &str,
 	cancel: &LocalCancellation,
 ) -> Option<Str> {
 	if is_low_signal_title_input(input) {
 		return None;
 	}
-	let messages = [
-		ChatMessage { role: ChatRole::System, content: Str::new_static(TITLE_SYSTEM_PROMPT) },
-		ChatMessage { role: ChatRole::User, content: Str::new(input) },
-	];
+	let messages =
+		[ChatMessage { role: ChatRole::System, content: Str::new(system_prompt) }, ChatMessage {
+			role:    ChatRole::User,
+			content: Str::new(input),
+		}];
 	let generated = adapter
 		.generate(&messages, GenerationOptions::title(), cancel, |_| true)
 		.ok()?;
@@ -161,12 +195,13 @@ pub fn generate_local_title(
 pub async fn generate_online_title(
 	completion: &dyn OnlineTitleCompletion,
 	input: &str,
+	system_prompt: &str,
 ) -> Option<Str> {
 	if is_low_signal_title_input(input) {
 		return None;
 	}
 	completion
-		.complete_title(&ONLINE_TITLE_ROLE_CHAIN, input)
+		.complete_title(&ONLINE_TITLE_ROLE_CHAIN, system_prompt, input)
 		.await
 		.ok()
 		.flatten()

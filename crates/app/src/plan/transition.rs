@@ -2,6 +2,7 @@
 
 use omp_agent::AgentState;
 use omp_core::Str;
+use omp_llm_catalog::{SelectionError, ThinkingEffort};
 use omp_proto::inference::v1::Reasoning;
 use parking_lot::Mutex;
 
@@ -15,6 +16,22 @@ pub struct ModelSelection {
 }
 
 impl ModelSelection {
+	/// Builds a transition selection from a catalog-resolved model and retained
+	/// thinking annotation.
+	pub fn resolved(model: impl Into<Str>, thinking: Option<&str>) -> Result<Self, SelectionError> {
+		let thinking = match thinking {
+			None => None,
+			Some("auto") => Some(Reasoning::default()),
+			Some(value) => {
+				let effort = value
+					.parse::<ThinkingEffort>()
+					.map_err(|_| SelectionError::Invalid(Str::new(value)))?;
+				Some(Reasoning { effort: catalog_effort(effort) as i32, ..Reasoning::default() })
+			},
+		};
+		Ok(Self { model: model.into(), thinking })
+	}
+
 	/// Captures the effective coding selection from an agent snapshot.
 	#[must_use]
 	pub fn capture(state: &AgentState) -> Self {
@@ -114,6 +131,18 @@ fn queue_or_apply(
 	} else {
 		state.pending = None;
 		apply_if_changed(agent, &target)
+	}
+}
+
+const fn catalog_effort(effort: ThinkingEffort) -> omp_proto::inference::v1::Effort {
+	match effort {
+		ThinkingEffort::Off => omp_proto::inference::v1::Effort::Off,
+		ThinkingEffort::Minimal => omp_proto::inference::v1::Effort::Minimal,
+		ThinkingEffort::Low => omp_proto::inference::v1::Effort::Low,
+		ThinkingEffort::Medium => omp_proto::inference::v1::Effort::Medium,
+		ThinkingEffort::High => omp_proto::inference::v1::Effort::High,
+		ThinkingEffort::XHigh => omp_proto::inference::v1::Effort::Xhigh,
+		ThinkingEffort::Max => omp_proto::inference::v1::Effort::Max,
 	}
 }
 

@@ -9,11 +9,12 @@ use std::{
 		Arc,
 		atomic::{AtomicU8, AtomicU64, Ordering},
 	},
-	time::Duration,
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
+use omp_agent::{ApprovalBook, ApprovalRoute, ApprovalSpec, TicketState};
 use omp_core::{Hash32, Str, sf};
 use omp_env::{EnvClient, InProcessEnvTransport};
 use omp_proto::{
@@ -509,6 +510,7 @@ pub struct EnvServer {
 	_document_authority: Option<DocumentAuthority>,
 	exec:                ExecHost,
 	acp_exec:            AcpExecSlot,
+	approvals:           ApprovalAuthoritySlot,
 	http_egress:         HttpEgressHost,
 	workspace:           WorkspaceHost,
 	mcp:                 Arc<McpService>,
@@ -640,6 +642,98 @@ enum PrivilegedDispatchError {
 	Invalid(&'static str),
 	#[error(transparent)]
 	Mutation(#[from] PrivilegedMutationFault),
+}
+#[derive(Clone)]
+struct ApprovalAuthority {
+	book:  Arc<ApprovalBook>,
+	route: ApprovalRoute,
+}
+
+#[derive(Clone, Default)]
+struct ApprovalAuthoritySlot(Arc<parking_lot::RwLock<Option<ApprovalAuthority>>>);
+
+impl ApprovalAuthoritySlot {
+	fn bind(&self, book: Option<Arc<ApprovalBook>>, route: Option<ApprovalRoute>) {
+		*self.0.write() = book
+			.zip(route)
+			.map(|(book, route)| ApprovalAuthority { book, route });
+	}
+
+	async fn approve_privileged(
+		&self,
+		ticket: &[u8],
+		invocation_id: &Str,
+		target: &str,
+		kind: &'static str,
+	) -> bool {
+		let Some(authority) = self.0.read().clone() else {
+			return false;
+		};
+		let ticket = if ticket.is_empty() {
+			authority
+				.route
+				.request(
+					Some(invocation_id.clone()),
+					vec![ApprovalSpec {
+						title:         sf!("Privileged file mutation"),
+						body:          sf!(
+							"Approve {kind} after ordinary document mutation was refused by filesystem \
+							 permissions."
+						),
+						subject:       Str::new(target),
+						kind:          sf!("privileged_write"),
+						scopes:        vec![sf!("once")],
+						default:       Some(false),
+						route:         sf!("local"),
+						approver:      None,
+						timeout_ms:    120_000,
+						unreachable:   sf!("fail_closed"),
+						require_human: true,
+						pattern:       None,
+						evidence:      vec![sf!("filesystem permission fallback")],
+					}],
+					now_epoch_ms(),
+				)
+				.await
+		} else {
+			let Ok(ticket_id) = std::str::from_utf8(ticket) else {
+				return false;
+			};
+			let Some(ticket) = authority.book.ticket(ticket_id) else {
+				return false;
+			};
+			ticket
+		};
+		if ticket.state != TicketState::Decided
+			|| ticket.invocation_id.as_ref() != Some(invocation_id)
+			|| !ticket
+				.decision
+				.as_ref()
+				.is_some_and(|decision| decision.approved)
+			|| !ticket
+				.reasons
+				.iter()
+				.any(|reason| reason.kind == "privileged_write" && reason.subject == target)
+		{
+			return false;
+		}
+		let timeout = ticket
+			.reasons
+			.iter()
+			.filter_map(|reason| (reason.timeout_ms != 0).then_some(reason.timeout_ms))
+			.min()
+			.unwrap_or(120_000);
+		now_epoch_ms() <= ticket.created_at_ms.saturating_add(timeout)
+	}
+}
+
+fn now_epoch_ms() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX)
 }
 
 fn privileged_presence(value: i32) -> Result<bool, PrivilegedDispatchError> {
@@ -789,6 +883,7 @@ impl EnvServer {
 			_document_authority: document_authority,
 			exec,
 			acp_exec,
+			approvals: ApprovalAuthoritySlot::default(),
 			http_egress: HttpEgressHost::new(),
 			workspace,
 			mcp,
@@ -1206,6 +1301,23 @@ impl EnvServer {
 	/// Binds or clears the session-scoped ACP terminal execution capability.
 	pub(crate) fn bind_acp_exec(&self, backend: Option<Arc<dyn AcpExecBackend>>) {
 		self.acp_exec.bind(backend);
+	}
+
+	/// Binds or clears the session-scoped ACP document authority.
+	pub(crate) fn bind_acp_documents(
+		&self,
+		backend: Option<Arc<dyn super::docs::AcpDocumentBackend>>,
+	) {
+		self.documents.bind_acp_documents(backend);
+	}
+
+	/// Binds the live durable approval authority used by Environment fallbacks.
+	pub(crate) fn bind_approval_authority(
+		&self,
+		book: Option<Arc<ApprovalBook>>,
+		route: Option<ApprovalRoute>,
+	) {
+		self.approvals.bind(book, route);
 	}
 
 	/// Returns the session bridge binding retained by this environment.
@@ -3002,7 +3114,6 @@ impl EnvServer {
 				.session
 				.as_ref()
 				.is_some_and(|session| !session.value.is_empty())
-			&& !request.approval_ticket.is_empty()
 			&& request
 				.effect
 				.as_ref()
@@ -3044,6 +3155,29 @@ impl EnvServer {
 					return;
 				},
 			};
+		let kind = match &mutation {
+			pb::privileged_mutation_intent::Mutation::Write(_) => "write",
+			pb::privileged_mutation_intent::Mutation::Unlink(_) => "unlink",
+		};
+		if !self
+			.approvals
+			.approve_privileged(
+				&request.approval_ticket,
+				&Str::from(request.invocation_id.as_str()),
+				&canonical_uri,
+				kind,
+			)
+			.await
+		{
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::PermissionDenied,
+				"privileged mutation approval ticket is absent, denied, expired, or inauthentic",
+			)
+			.await;
+			return;
+		}
 		let root = self.workspace.root().to_path_buf();
 		let operation = tokio::task::spawn_blocking(move || match mutation {
 			pb::privileged_mutation_intent::Mutation::Write(intent) => {
@@ -7016,6 +7150,7 @@ async fn send_http_error(
 		HttpEgressError::InvalidArgument(_) => pb::ProtocolErrorCode::InvalidArgument,
 		HttpEgressError::TimedOut => pb::ProtocolErrorCode::DeadlineExceeded,
 		HttpEgressError::ResponseTooLarge => pb::ProtocolErrorCode::ResourceExhausted,
+		HttpEgressError::UnsupportedSocksProxy { .. } => pb::ProtocolErrorCode::Internal,
 		HttpEgressError::Transport(_) => pb::ProtocolErrorCode::Internal,
 	};
 	send_error(responses, request_id, code, &error.to_string()).await;

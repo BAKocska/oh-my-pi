@@ -119,6 +119,9 @@ pub enum ChatError {
 	/// Durable compaction blob placement could not be initialized.
 	#[error(transparent)]
 	Blob(#[from] omp_storage::blob::Error),
+	/// Session artifact metadata authority could not be initialized.
+	#[error(transparent)]
+	Artifact(#[from] omp_storage::gc::Error),
 	/// Owner-local session discovery state failed.
 	#[error(transparent)]
 	SessionResolve(#[from] crate::project_state::SessionResolveError),
@@ -144,6 +147,12 @@ pub enum ChatError {
 	/// The in-process turn authority could not be constructed.
 	#[error(transparent)]
 	TurnClient(#[from] omp_agent::Error),
+	/// Typed settings projection failed while composing a session boundary.
+	#[error(transparent)]
+	Settings(#[from] crate::settings::manager::SettingsManagerError),
+	/// The session-local secret transform could not be assembled.
+	#[error(transparent)]
+	Secrets(#[from] crate::secrets::session::SecretSessionError),
 	/// A live tool declaration could not be represented on the turn protocol.
 	#[error("tool {0} uses a grammar input unsupported by the turn protocol")]
 	GrammarTool(Str),
@@ -565,6 +574,7 @@ struct ChatParentContext {
 	definitions:   Arc<BTreeMap<Str, omp_agent::AgentDefinition>>,
 	tree:          Arc<AgentTree>,
 	task_settings: crate::subagent::settings::LiveTaskSettings,
+	modes:         Option<Arc<crate::modes::ExecutionModes>>,
 }
 /// Core-backed facts consumed by the retained agent-hub presentation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -806,6 +816,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 					Arc::new(crate::subagent::settings::TaskSettings::default()),
 					Arc::clone(&tree),
 				),
+				modes: None,
 				tree,
 			}),
 			revival: Mutex::new(BTreeMap::new()),
@@ -820,6 +831,26 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	) {
 		self.supervisor.apply_settings(Arc::clone(&settings));
 		self.context.lock().task_settings.apply(settings);
+	}
+
+	fn bind_execution_modes(&self, modes: Arc<crate::modes::ExecutionModes>) {
+		self.context.lock().modes = Some(modes);
+	}
+
+	fn approved_plan_reference(&self) -> Option<crate::plan::OverallPlanReference> {
+		let context = self.context.lock();
+		let state = context.modes.as_ref()?.plan()?;
+		if state.enabled {
+			return None;
+		}
+		let store = crate::plan::PlanArtifactStore::new(
+			context
+				.sessions_dir
+				.join(context.session_id.as_str())
+				.join("local"),
+		);
+		let artifact = store.resolve(None, state.artifact.as_str()).ok()?;
+		crate::plan::OverallPlanReference::resolve(&state, &artifact).ok()
 	}
 
 	fn bind_parent_jobs(&self, jobs: Arc<omp_agent::JobBoard>) {
@@ -1218,6 +1249,31 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				);
 			}
 		}
+	}
+
+	/// Starts the session-owned idle loop parking scheduler.
+	///
+	/// The broker registry is the idle-time authority. Each lease carries the
+	/// exact generation revision that `bind_parked_transport` preserves while
+	/// the supervisor releases the live loop resources.
+	pub(crate) fn start_idle_parking(self: &Arc<Self>) {
+		let parent = Arc::downgrade(self);
+		drop(tokio::spawn(async move {
+			let mut tick = tokio::time::interval(Duration::from_secs(1));
+			tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			loop {
+				tick.tick().await;
+				let Some(parent) = parent.upgrade() else {
+					return;
+				};
+				let ttl_ms = parent.task_settings().agent_idle_ttl_ms;
+				if ttl_ms != 0 {
+					parent
+						.park_expired_children(Duration::from_millis(ttl_ms))
+						.await;
+				}
+			}
+		}));
 	}
 
 	async fn run_eval_agent(
@@ -1704,6 +1760,14 @@ impl<C: TurnClient + Clone + Send + 'static> crate::envd::eval::ParentSessionHos
 	) -> Result<Value, crate::envd::eval::BridgeHostError> {
 		let mut request = crate::envd::eval::spawn::SpawnRequestV1::from_bridge_args(&args)
 			.map_err(|error| crate::envd::eval::BridgeHostError::message(error.to_string()))?;
+		if let Some(plan) = self.approved_plan_reference() {
+			request.prompt = sf!(
+				"{}\n\nApproved overall plan: {}. Read and follow only this approved plan reference; \
+				 do not consume drafts.",
+				request.prompt,
+				plan.artifact
+			);
+		}
 		let prompt = request.prompt.as_str();
 		let kind = request.agent.as_str();
 		let context = self.context.lock().clone();
@@ -2034,7 +2098,8 @@ impl<C: TurnClient + Clone + Send + 'static> crate::envd::eval::ParentSessionHos
 				output_schema:     request.output_schema.as_ref(),
 				self_name:         node.name.as_str(),
 				self_role:         definition.name.as_str(),
-				irc_enabled:       true,
+				irc_enabled:       child_settings.max_recursion_depth == -1
+					|| i32::from(node.depth) < i32::from(child_settings.max_recursion_depth),
 				roster_generation: context.tree.roster_generation(),
 				peers:             &peers,
 				capabilities:      crate::subagent::prompt::ModelFamilyCapabilities {
@@ -2419,7 +2484,11 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 	let plan_selection = roles
 		.plan
 		.as_ref()
-		.map(|model| crate::plan::ModelSelection { model: model.as_str().into(), thinking: None });
+		.map(|model| {
+			crate::plan::ModelSelection::resolved(model.as_str(), roles.plan_thinking.as_deref())
+		})
+		.transpose()
+		.map_err(|error| miette::miette!(error))?;
 	let interrupt_grace = settings.runtime_durations().interrupt_grace;
 	let auto_thinking = settings.auto_thinking;
 	let power_mode = crate::power::configured(&data_dir).into_diagnostic()?;
@@ -2675,8 +2744,25 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 		min_tool_calls: configured_autolearn.min_tool_calls,
 	};
 	let active_content = crate::discovery::active_content_snapshots(&root);
-	let prompt_rules = crate::rulebook::prompt_inputs(&active_content.rules);
-	let prompt_skills = crate::skills::prompt_inputs(&active_content.skills);
+	let prompt_rules = if args.no_rules {
+		Arc::from([])
+	} else {
+		crate::rulebook::prompt_inputs(&active_content.rules)
+	};
+	let prompt_skills = if args.no_skills {
+		Arc::from([])
+	} else {
+		let discovered = crate::skills::prompt_inputs(&active_content.skills);
+		match args.skills.as_ref() {
+			Some(selected) => discovered
+				.iter()
+				.filter(|skill| selected.0.iter().any(|selector| selector == &skill.id))
+				.cloned()
+				.collect::<Vec<_>>()
+				.into(),
+			None => discovered,
+		}
+	};
 	let context_roots = std::iter::once(&root)
 		.chain(args.add_dir.iter())
 		.map(|path| crate::discovery::context::GrantedContextRoot {
@@ -2813,6 +2899,40 @@ pub(crate) async fn run(_args: ChatArgs, _start: ChatStart) -> miette::Result<()
 	Err(ChatError::UnsupportedPlatform).into_diagnostic()
 }
 
+fn bind_goal_todo_context(
+	events: omp_agent::EventSubscription,
+	modes: std::sync::Weak<crate::modes::ExecutionModes>,
+) {
+	drop(tokio::spawn(async move {
+		while let Ok(event) = events.recv().await {
+			let omp_agent::AgentEvent::ToolFinished { item, .. } = event.as_ref() else {
+				continue;
+			};
+			let Some(item::Kind::ToolResult(result)) = item.kind.as_ref() else {
+				continue;
+			};
+			if result.name != "todo" || result.is_error {
+				continue;
+			}
+			let mut rendered = String::new();
+			for part in &result.parts {
+				if let Some(part::Kind::Text(text)) = part.kind.as_ref() {
+					if !rendered.is_empty() {
+						rendered.push('\n');
+					}
+					rendered.push_str(text);
+				}
+			}
+			let Some(modes) = modes.upgrade() else {
+				break;
+			};
+			modes.set_goal_todo_context(
+				(!rendered.trim().is_empty()).then(|| Str::new(rendered.trim())),
+			);
+		}
+	}));
+}
+
 #[expect(
 	clippy::future_not_send,
 	reason = "the designed terminal host remains confined to its event-loop thread"
@@ -2857,6 +2977,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		Arc::clone(&scope.session_index),
 		security_enabled,
 	));
+	parent.start_idle_parking();
 	let _eval_parent_binding = eval_bridge
 		.bind_sdk_parent(parent.session_id(), parent.clone())
 		.map_err(|error| ChatError::EvalBridge(Str::from(error.to_string())))?;
@@ -2890,12 +3011,49 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		}
 		let mut agent =
 			Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
+		if crate::settings::current(&data_dir)?.secrets.enabled {
+			let secrets = crate::secrets::session::SecretSessionSnapshot::build(
+				0,
+				&data_dir.join("secrets.toml"),
+				&scope.root.join(".omp/secrets.toml"),
+				std::iter::empty(),
+			)?;
+			agent.set_secret_obfuscator(secrets.transform_handle());
+		}
 		agent.set_autolearn(autolearn);
 		agent.set_ttsr_registry(ttsr);
 		agent.set_prompt_memory_source(memory_source.clone());
 		blueprint.configure_agent(&mut agent);
 		parent.bind_parent_jobs(Arc::clone(agent.jobs()));
-		agent.set_blob_store(omp_storage::blob::BlobStore::open(&data_dir)?);
+		let blob_store = omp_storage::blob::BlobStore::open(&data_dir)?;
+		let artifact_catalog =
+			Arc::new(parking_lot::Mutex::new(omp_storage::gc::ArtifactCatalog::open(&blob_store)?));
+		agent.set_artifact_catalog(Arc::clone(&artifact_catalog));
+		agent.set_blob_store(blob_store.clone());
+		let capture_rx =
+			omp_llm_inference::transport::global_provider_capture().subscribe(Some(id.as_str()));
+		let capture_store = blob_store;
+		let capture_catalog = Arc::clone(&artifact_catalog);
+		let capture_session = SessionId(id.clone());
+		let capture_task = tokio::spawn(async move {
+			while let Ok(frame) = capture_rx.recv_async().await {
+				let body = serde_json::json!({
+					"sequence": frame.sequence,
+					"event": frame.event,
+					"payload": frame.payload,
+				})
+				.to_string();
+				let Ok(reference) = capture_store.put(body.as_bytes()) else {
+					continue;
+				};
+				let _ = capture_catalog.lock().adopt(
+					&capture_session,
+					reference.hash.into_bytes(),
+					Some(reference.size),
+					omp_tool::ArtifactLifetime::Session,
+				);
+			}
+		});
 		agent.set_run_activity(crate::power::PowerActivity::new(power_mode));
 		let (mode_store, projection) = crate::modes::persistence::ModePersistence::open(
 			agent.journal(),
@@ -2911,8 +3069,10 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			agent.execution_mode(),
 			projection.unwrap_or_default(),
 		));
+		bind_goal_todo_context(agent.events().subscribe_lossless(), Arc::downgrade(&modes));
 		modes.attach_persistence(mode_store);
 		modes.bind_plan_selection(state.clone(), plan_selection.clone());
+		parent.bind_execution_modes(Arc::clone(&modes));
 		match initial_mode {
 			crate::modes::ActiveMode::Plan if !restored_plan => modes.enter_plan(false)?,
 			crate::modes::ActiveMode::Prewalk => modes.arm_prewalk()?,
@@ -2979,6 +3139,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			auth.as_ref().map(|worker| &worker.ui),
 			data_dir.clone(),
 			scope.root.to_path_buf(),
+			session_root.join("local"),
 			security_enabled,
 			vec![content.commands.to_vec()],
 			content.skills,
@@ -2988,6 +3149,8 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			Str::from(initial_draft),
 		)
 		.await;
+		capture_task.abort();
+		let _ = capture_task.await;
 		if tokio::time::timeout(Duration::from_secs(3), &mut collab_task)
 			.await
 			.is_err()
@@ -3002,6 +3165,40 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		start = ChatStart::Session;
 		match outcome.exit {
 			omp_chat_ui::host::HostExit::Quit => break,
+			omp_chat_ui::host::HostExit::Suspend => {
+				#[cfg(unix)]
+				if let Err(error) = nix::sys::signal::kill(
+					nix::unistd::Pid::from_raw(0),
+					nix::sys::signal::Signal::SIGSTOP,
+				) {
+					tracing::warn!(%error, "failed to suspend process group");
+				}
+							eval_control.request_reset();
+				let model = state.snapshot().turn.params.model.clone();
+				let prompt_workspace = state.snapshot().workspace.clone();
+				session = open_session(
+					scope.root,
+					scope.sessions_dir,
+					SessionOpen::Resume(&current_id),
+					scope.registry.as_ref(),
+					scope
+						.persist_sessions
+						.then(|| Arc::clone(&scope.session_index)),
+				)?;
+				let additional_roots = blueprint.options().additional_roots.clone();
+				blueprint = session_blueprint(
+					&model,
+					scope.catalog,
+					scope.root,
+					&additional_roots,
+					&session.id,
+					Arc::clone(&scope.registry),
+				)?;
+				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
+				next.workspace = prompt_workspace;
+				next.workspace.model.identifier = Str::new(&model);
+				state = AgentState::new(next);
+},
 			omp_chat_ui::host::HostExit::Resume(id) => {
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();

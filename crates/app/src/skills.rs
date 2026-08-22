@@ -283,6 +283,40 @@ impl SkillResolver {
 	pub fn new(snapshot: Arc<SkillSnapshot>) -> Self {
 		Self { snapshot, lines: LineOffsetCache::default() }
 	}
+
+	fn resolve_entry<'a>(&'a self, resource: &'a str) -> Option<(&'a ActiveSkill, Option<&'a str>)> {
+		let resource = resource.trim_matches('/');
+		self
+			.snapshot
+			.all()
+			.iter()
+			.filter_map(|skill| {
+				if resource == skill.name {
+					Some((skill, None))
+				} else {
+					resource
+						.strip_prefix(skill.name.as_str())
+						.and_then(|nested| nested.strip_prefix('/'))
+						.map(|nested| (skill, Some(nested)))
+				}
+			})
+			.max_by_key(|(skill, _)| skill.name.len())
+	}
+
+	fn nested_path(&self, skill: &ActiveSkill, nested: &str) -> Result<PathBuf, Fault> {
+		let boundary = skill.contain_root.as_deref().unwrap_or(&skill.base_dir);
+		let root = fs::canonicalize(boundary).map_err(|_| Fault::Source {
+			message: Str::from("skill containment root was not found"),
+		})?;
+		let path = fs::canonicalize(root.join(nested))
+			.map_err(|_| Fault::Source { message: Str::from("skill resource was not found") })?;
+		if !path.starts_with(&root) {
+			return Err(Fault::Invalid {
+				message: Str::from("skill resource escapes its containRoot"),
+			});
+		}
+		Ok(path)
+	}
 }
 
 impl Resolve for SkillResolver {
@@ -292,21 +326,12 @@ impl Resolve for SkillResolver {
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
 		let resource = resource.trim_matches('/');
-		let (name, nested) = resource
-			.split_once('/')
-			.map_or((resource, None), |(name, nested)| (name, Some(nested)));
-		let skill = self.snapshot.get(name).ok_or_else(|| Fault::Source {
+		let (skill, nested) = self.resolve_entry(resource).ok_or_else(|| Fault::Source {
 			message: Str::from(format!("skill resource not found: {resource}")),
 		})?;
 		let bytes = if let Some(nested) = nested {
-			let boundary = skill.contain_root.as_deref().unwrap_or(&skill.base_dir);
-			let root = fs::canonicalize(boundary).map_err(|_| Fault::Source {
-				message: Str::from(format!("skill resource not found: {resource}")),
-			})?;
-			let path = fs::canonicalize(root.join(nested)).map_err(|_| Fault::Source {
-				message: Str::from(format!("skill resource not found: {resource}")),
-			})?;
-			if !path.starts_with(&root) || !path.is_file() {
+			let path = self.nested_path(skill, nested)?;
+			if !path.is_file() {
 				return Err(Fault::Invalid {
 					message: Str::from("skill resource escapes its containRoot"),
 				});
@@ -326,6 +351,27 @@ impl Resolve for SkillResolver {
 			CowBytes::from(skill.body.as_bytes().to_vec())
 		};
 		select_snapshot_bytes(&self.lines, resource, bytes, selector)
+	}
+
+	async fn path(&self, resource: &str) -> Result<Option<Str>, Fault> {
+		let (skill, nested) = self.resolve_entry(resource).ok_or_else(|| Fault::Source {
+			message: Str::from(format!("skill resource not found: {resource}")),
+		})?;
+		let path = match nested {
+			Some(nested) => self.nested_path(skill, nested)?,
+			None => fs::canonicalize(&skill.path).map_err(|_| Fault::Source {
+				message: Str::from(format!("skill resource not found: {resource}")),
+			})?,
+		};
+		let uri = if path.is_dir() {
+			url::Url::from_directory_path(path)
+		} else {
+			url::Url::from_file_path(path)
+		}
+		.map_err(|()| Fault::Invalid {
+			message: Str::from("skill path cannot be represented as a file URI"),
+		})?;
+		Ok(Some(Str::from(uri.to_string())))
 	}
 
 	async fn list(

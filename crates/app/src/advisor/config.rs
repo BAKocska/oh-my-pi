@@ -12,6 +12,7 @@ use omp_agent::advisor::{
 	merge_watchdog_rules, parse_watchdog_yaml,
 };
 use omp_core::{Str, StrMut};
+use omp_llm_catalog::{ModelRole, SelectedModel, SelectionError, select_model, snapshot::Catalog};
 use parking_lot::Mutex;
 use rand::RngExt as _;
 
@@ -96,6 +97,26 @@ pub struct AdvisorSchedule {
 	/// Shared WATCHDOG and standing-project context.
 	pub shared_prompt: Option<Str>,
 }
+/// One scheduled advisor after catalog role/model resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedScheduledAdvisor {
+	/// Tool and stable-session scheduling facts.
+	pub scheduled: ScheduledAdvisor,
+	/// Exact catalog identity with thinking/upstream annotations retained.
+	pub selection: SelectedModel,
+}
+
+/// Advisor schedule whose every model selector passed through catalog
+/// authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedAdvisorSchedule {
+	/// Enabled advisors in stable roster order.
+	pub advisors:      Arc<[ResolvedScheduledAdvisor]>,
+	/// Unknown tool grants preserved from base scheduling.
+	pub warnings:      Arc<[AdvisorRuleWarning]>,
+	/// Shared WATCHDOG and standing-project context.
+	pub shared_prompt: Option<Str>,
+}
 
 impl AdvisorConfigSnapshot {
 	/// Resolves enabled advisors against the session's actual built-in tools.
@@ -131,6 +152,38 @@ impl AdvisorConfigSnapshot {
 			warnings:      warnings.into(),
 			shared_prompt: self.shared_prompt(),
 		}
+	}
+
+	/// Resolves every scheduled selector through the same catalog role/model
+	/// authority used by launch composition.
+	pub fn schedule_resolved(
+		&self,
+		primary_session: &str,
+		available_tools: &[Str],
+		provider_sessions: &AdvisorProviderSessions,
+		catalog: &Catalog,
+		roles: &[ModelRole],
+		mru: &BTreeMap<(omp_llm_catalog::ProviderId, omp_llm_catalog::ModelKey), u64>,
+	) -> Result<ResolvedAdvisorSchedule, SelectionError> {
+		let schedule = self.schedule(primary_session, available_tools, provider_sessions);
+		let mut advisors = Vec::with_capacity(schedule.advisors.len());
+		for scheduled in schedule.advisors.iter() {
+			let selector = scheduled.rule.model.as_deref().unwrap_or("@advisor");
+			let selection = select_model(
+				catalog.models(),
+				catalog.routes(),
+				catalog.aliases(),
+				roles,
+				mru,
+				selector,
+			)?;
+			advisors.push(ResolvedScheduledAdvisor { scheduled: scheduled.clone(), selection });
+		}
+		Ok(ResolvedAdvisorSchedule {
+			advisors:      advisors.into(),
+			warnings:      schedule.warnings,
+			shared_prompt: schedule.shared_prompt,
+		})
 	}
 
 	fn shared_prompt(&self) -> Option<Str> {

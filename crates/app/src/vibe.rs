@@ -1,13 +1,13 @@
 //! Goal-directed swarm orchestration exposed as one dynamic device.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, VecDeque},
 	fmt,
 	sync::{
 		Arc, LazyLock, Weak,
 		atomic::{AtomicBool, Ordering},
 	},
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::stream;
@@ -57,6 +57,252 @@ pub enum WorkerTier {
 	/// General-purpose implementation and analysis.
 	#[default]
 	Good,
+}
+
+/// The five operations accepted by the single vibe device.
+/// One completed action in a worker's current-turn activity trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VibeActivityTrace {
+	/// Epoch-millisecond activity time.
+	pub at_ms:   u64,
+	/// One-line activity label.
+	pub summary: Str,
+}
+
+/// Live per-worker screen projected into TV-wall presentation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VibeScreenSnapshot {
+	/// Stable worker id.
+	pub id:               Str,
+	/// Roster label.
+	pub label:            Str,
+	/// Worker tier.
+	pub tier:             WorkerTier,
+	/// Lifecycle state.
+	pub state:            Str,
+	/// Completed turns.
+	pub turns:            u64,
+	/// In-flight turn start.
+	pub turn_started_ms:  Option<u64>,
+	/// Gist of the message starting the current turn.
+	pub turn_message:     Option<Str>,
+	/// Current tool label.
+	pub current_tool:     Option<Str>,
+	/// Oldest-to-newest bounded activity tail.
+	pub trace:            Arc<[VibeActivityTrace]>,
+	/// Oldest-to-newest streamed output tail.
+	pub output_tail:      Arc<[Str]>,
+	/// Latest activity time.
+	pub last_activity_ms: u64,
+	/// Output tokens attributed to this worker.
+	pub output_tokens:    u64,
+}
+
+/// One dynamically sized TV-wall cell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VibeTvWallFrame {
+	/// Worker shown by this cell.
+	pub screen: Str,
+	/// Zero-based wall row.
+	pub row:    u16,
+	/// Zero-based wall column.
+	pub column: u16,
+	/// Width allocated to this cell.
+	pub width:  u16,
+}
+
+/// Aggregate monitor projection for the current swarm.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VibeMonitorSnapshot {
+	/// Spawn-order live screens.
+	pub screens:           Arc<[VibeScreenSnapshot]>,
+	/// Aggregate output throughput since monitoring began.
+	pub tokens_per_second: f64,
+}
+
+#[derive(Clone, Debug)]
+struct LiveVibeScreen {
+	snapshot:    VibeScreenSnapshot,
+	trace:       VecDeque<VibeActivityTrace>,
+	output_tail: VecDeque<Str>,
+}
+
+/// Bounded swarm monitor used by retained status and TV-wall surfaces.
+#[derive(Debug)]
+pub struct VibeSwarmMonitor {
+	screens: BTreeMap<Str, LiveVibeScreen>,
+	order:   Vec<Str>,
+	started: Instant,
+}
+
+impl VibeSwarmMonitor {
+	const OUTPUT_CAP: usize = 12;
+	const TRACE_CAP: usize = 40;
+
+	/// Creates an empty monitor.
+	#[must_use]
+	pub fn new() -> Self {
+		Self { screens: BTreeMap::new(), order: Vec::new(), started: Instant::now() }
+	}
+
+	/// Registers or restarts one worker screen.
+	pub fn begin_turn(&mut self, id: Str, label: Str, tier: WorkerTier, message: &str) {
+		let now = now_ms();
+		let screen = self.screens.entry(id.clone()).or_insert_with(|| {
+			self.order.push(id.clone());
+			LiveVibeScreen {
+				snapshot:    VibeScreenSnapshot {
+					id,
+					label,
+					tier,
+					state: sf!("running"),
+					turns: 0,
+					turn_started_ms: Some(now),
+					turn_message: Some(one_line(message, 120)),
+					current_tool: None,
+					trace: Arc::from([]),
+					output_tail: Arc::from([]),
+					last_activity_ms: now,
+					output_tokens: 0,
+				},
+				trace:       VecDeque::new(),
+				output_tail: VecDeque::new(),
+			}
+		});
+		screen.snapshot.state = sf!("running");
+		screen.snapshot.turn_started_ms = Some(now);
+		screen.snapshot.turn_message = Some(one_line(message, 120));
+		screen.snapshot.last_activity_ms = now;
+		screen
+			.trace
+			.push_back(VibeActivityTrace { at_ms: now, summary: sf!("turn started") });
+	}
+
+	/// Records one tool or lifecycle activity.
+	pub fn record_activity(&mut self, id: &str, summary: &str) {
+		let Some(screen) = self.screens.get_mut(id) else {
+			return;
+		};
+		let at_ms = now_ms();
+		screen
+			.trace
+			.push_back(VibeActivityTrace { at_ms, summary: one_line(summary, 120) });
+		while screen.trace.len() > Self::TRACE_CAP {
+			screen.trace.pop_front();
+		}
+		screen.snapshot.last_activity_ms = at_ms;
+	}
+
+	/// Replaces the current tool label without formatting during paint.
+	pub fn set_current_tool(&mut self, id: &str, tool: Option<Str>) {
+		let Some(screen) = self.screens.get_mut(id) else {
+			return;
+		};
+		screen.snapshot.current_tool = tool;
+		screen.snapshot.last_activity_ms = now_ms();
+	}
+
+	/// Appends a sanitized streamed output line.
+	pub fn push_output(&mut self, id: &str, text: &str) {
+		let Some(screen) = self.screens.get_mut(id) else {
+			return;
+		};
+		for line in text.lines().filter(|line| !line.trim().is_empty()) {
+			screen.output_tail.push_back(one_line(line, 120));
+			while screen.output_tail.len() > Self::OUTPUT_CAP {
+				screen.output_tail.pop_front();
+			}
+		}
+		screen.snapshot.last_activity_ms = now_ms();
+	}
+
+	/// Adds output-token usage for aggregate throughput.
+	pub fn record_usage(&mut self, id: &str, output_tokens: u64) {
+		if let Some(screen) = self.screens.get_mut(id) {
+			screen.snapshot.output_tokens =
+				screen.snapshot.output_tokens.saturating_add(output_tokens);
+		}
+	}
+
+	/// Settles one worker screen.
+	pub fn settle(&mut self, id: &str, failed: bool) {
+		let Some(screen) = self.screens.get_mut(id) else {
+			return;
+		};
+		screen.snapshot.state = if failed { sf!("failed") } else { sf!("idle") };
+		screen.snapshot.turn_started_ms = None;
+		screen.snapshot.current_tool = None;
+		screen.snapshot.turns = screen.snapshot.turns.saturating_add(1);
+		screen.snapshot.last_activity_ms = now_ms();
+	}
+
+	/// Returns a spawn-order snapshot and aggregate output throughput.
+	#[must_use]
+	pub fn snapshot(&self, now: Instant) -> VibeMonitorSnapshot {
+		let screens = self
+			.order
+			.iter()
+			.filter_map(|id| self.screens.get(id))
+			.map(|live| {
+				let mut screen = live.snapshot.clone();
+				screen.trace = live.trace.iter().cloned().collect::<Vec<_>>().into();
+				screen.output_tail = live.output_tail.iter().cloned().collect::<Vec<_>>().into();
+				screen
+			})
+			.collect::<Vec<_>>();
+		let tokens = screens
+			.iter()
+			.map(|screen| screen.output_tokens)
+			.sum::<u64>();
+		let elapsed = now.saturating_duration_since(self.started).as_secs_f64();
+		VibeMonitorSnapshot {
+			screens:           screens.into(),
+			tokens_per_second: if elapsed > 0.0 {
+				tokens as f64 / elapsed
+			} else {
+				0.0
+			},
+		}
+	}
+
+	/// Computes dynamic TV-wall cells for the supplied viewport width.
+	#[must_use]
+	pub fn tv_wall_frames(&self, viewport_width: u16) -> Vec<VibeTvWallFrame> {
+		let count = self.order.len();
+		if count == 0 {
+			return Vec::new();
+		}
+		let columns = ((count as f64).sqrt().ceil() as u16)
+			.min(count as u16)
+			.max(1);
+		let width = (viewport_width / columns).max(1);
+		self
+			.order
+			.iter()
+			.enumerate()
+			.map(|(index, id)| VibeTvWallFrame {
+				screen: id.clone(),
+				row: u16::try_from(index).unwrap_or(u16::MAX) / columns,
+				column: u16::try_from(index).unwrap_or(u16::MAX) % columns,
+				width,
+			})
+			.collect()
+	}
+}
+
+impl Default for VibeSwarmMonitor {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+fn one_line(text: &str, max_chars: usize) -> Str {
+	let mut output = text.split_whitespace().collect::<Vec<_>>().join(" ");
+	let cutoff = output.char_indices().nth(max_chars).map(|(index, _)| index);
+	if let Some(cutoff) = cutoff {
+		output.truncate(cutoff);
+	}
+	Str::new(output)
 }
 
 /// The five operations accepted by the single vibe device.
@@ -290,6 +536,7 @@ pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + Send + 'sta
 	parent:      Arc<ChatParentHost<C>>,
 	modes:       Arc<ExecutionModes>,
 	workers:     Arc<Mutex<BTreeMap<Str, Worker>>>,
+	monitor:     Arc<Mutex<VibeSwarmMonitor>>,
 	seen_active: AtomicBool,
 }
 
@@ -301,6 +548,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 			parent,
 			modes,
 			workers: Arc::new(Mutex::new(BTreeMap::new())),
+			monitor: Arc::new(Mutex::new(VibeSwarmMonitor::new())),
 			seen_active: AtomicBool::new(false),
 		});
 		Self::start_scheduler(Arc::downgrade(&backend));
@@ -357,6 +605,12 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 				outcome:    None,
 				notify:     Arc::new(Notify::new()),
 			});
+			self.monitor.lock().begin_turn(
+				id.clone(),
+				label.clone(),
+				entry.tier,
+				entry.brief.as_str(),
+			);
 			if let Err(error) = self.launch_turn(id.clone(), label.clone(), entry.tier, entry.brief, 1)
 			{
 				self.workers.lock().remove(&id);
@@ -398,6 +652,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 		}
 		let parent = Arc::clone(&self.parent);
 		let workers = Arc::clone(&self.workers);
+		let monitor = Arc::clone(&self.monitor);
 		drop(tokio::spawn(async move {
 			let kind = match tier {
 				WorkerTier::Fast => "sonic",
@@ -420,6 +675,11 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 				Err(error) => WorkerOutcome::Failed(Str::from(error.to_string())),
 			};
 			let delivery = delivery_text(&id, &outcome);
+			{
+				let mut monitor = monitor.lock();
+				monitor.push_output(id.as_str(), delivery.as_str());
+				monitor.settle(id.as_str(), matches!(outcome, WorkerOutcome::Failed(_)));
+			}
 			let _ = board.settle(job_id.as_str(), system_item(delivery));
 			let mut workers = workers.lock();
 			let Some(worker) = workers.get_mut(&id) else {
@@ -463,7 +723,33 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 				"generation": worker.generation,
 			}));
 		}
-		Ok(json!({ "workers": rows }))
+		drop(workers);
+		let monitor = self.monitor.lock().snapshot(Instant::now());
+		let screens = monitor
+			.screens
+			.iter()
+			.map(|screen| {
+				json!({
+					"id": screen.id,
+					"label": screen.label,
+					"tier": screen.tier,
+					"state": screen.state,
+					"turns": screen.turns,
+					"turn_started_ms": screen.turn_started_ms,
+					"turn_message": screen.turn_message,
+					"current_tool": screen.current_tool,
+					"trace": screen.trace.iter().map(|entry| entry.summary.as_str()).collect::<Vec<_>>(),
+					"output_tail": screen.output_tail,
+					"last_activity_ms": screen.last_activity_ms,
+					"output_tokens": screen.output_tokens,
+				})
+			})
+			.collect::<Vec<_>>();
+		Ok(json!({
+			"workers": rows,
+			"screens": screens,
+			"tokens_per_second": monitor.tokens_per_second,
+		}))
 	}
 
 	async fn steer(&self, id: Str, message: Str) -> Result<Value, Fault> {
@@ -508,6 +794,10 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 			worker.outcome = None;
 			(worker.label.clone(), worker.tier, worker.generation)
 		};
+		self
+			.monitor
+			.lock()
+			.begin_turn(id.clone(), label.clone(), tier, message.as_str());
 		if let Err(error) = self.launch_turn(id.clone(), label, tier, message, generation) {
 			if let Some(worker) = self.workers.lock().get_mut(&id) {
 				worker.running = false;

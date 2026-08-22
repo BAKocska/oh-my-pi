@@ -2,10 +2,14 @@
 
 use std::{
 	borrow::Cow,
+	fs,
 	future::{Future, ready},
 	io,
 	path::{Component, Path, PathBuf},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,6 +25,7 @@ use omp_storage::document_cache::{DocumentCache, DocumentCacheKey};
 use omp_tools::read::{
 	DirectoryEntry, DirectorySource, Fault, ReadLease, ReadSources, SNAPSHOT_MAX_BYTES,
 	SnapshotRecord, SourceKind, SourceStat,
+	markit::Conversion,
 	web::types::{
 		CachedDocument, DocumentCacheLocation, DocumentCacheRequest, HttpClient, HttpRequest,
 		HttpResponse, MAX_BYTES, USER_AGENTS, WebError,
@@ -40,7 +45,87 @@ use super::{
 const MAX_REDIRECTS: usize = 20;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+use thiserror::Error;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+static MEDIA_COMMIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Failure while committing one extracted document-media directory.
+#[derive(Debug, Error)]
+pub enum DocumentMediaCommitError {
+	/// The destination already exists and cannot be atomically replaced as an
+	/// unrelated caller-owned directory.
+	#[error("document media destination already exists")]
+	DestinationExists,
+	/// A storage commit failed.
+	#[error("document media file commit failed")]
+	Atomic(#[from] omp_storage::atomic::Error),
+	/// Directory creation, cleanup, or rename failed.
+	#[error("document media directory transaction failed")]
+	Io(#[from] io::Error),
+}
+
+/// Atomically commits extracted DOCX/PPTX media and rewrites image
+/// placeholders to the committed local paths.
+///
+/// The destination must not exist: callers select a fresh conversion-owned
+/// directory, preventing this transaction from deleting unrelated files.
+pub fn commit_document_media(
+	destination: &Path,
+	conversion: &mut Conversion,
+) -> Result<(), DocumentMediaCommitError> {
+	if conversion.attachments.is_empty() {
+		return Ok(());
+	}
+	if destination.exists() {
+		return Err(DocumentMediaCommitError::DestinationExists);
+	}
+	let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+	fs::create_dir_all(parent)?;
+	let sequence = MEDIA_COMMIT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+	let stage = parent.join(format!(".omp-document-media-{sequence:016x}.tmp"));
+	if stage.exists() {
+		fs::remove_dir_all(&stage)?;
+	}
+	fs::create_dir(&stage)?;
+	let committed = (|| {
+		for attachment in &conversion.attachments {
+			omp_storage::atomic::commit(
+				&stage.join(attachment.name.as_str()),
+				&attachment.bytes,
+				|| true,
+			)?;
+		}
+		fs::rename(&stage, destination)?;
+		Ok::<_, DocumentMediaCommitError>(())
+	})();
+	if let Err(error) = committed {
+		let _ = fs::remove_dir_all(&stage);
+		return Err(error);
+	}
+	rewrite_document_media_links(destination, conversion);
+	Ok(())
+}
+
+fn rewrite_document_media_links(destination: &Path, conversion: &mut Conversion) {
+	let mut text = conversion.text.to_string();
+	let mut cursor = 0;
+	let mut attachment_index = 0_usize;
+	while let Some(start) = text[cursor..].find("<!-- image") {
+		let start = cursor + start;
+		let Some(end) = text[start..].find("-->") else {
+			break;
+		};
+		let end = start + end + 3;
+		let attachment = &conversion.attachments
+			[attachment_index.min(conversion.attachments.len().saturating_sub(1))];
+		let link = destination.join(attachment.name.as_str());
+		let replacement = format!("![{}]({})", attachment.name, link.display());
+		text.replace_range(start..end, &replacement);
+		cursor = start + replacement.len();
+		attachment_index = attachment_index.saturating_add(1);
+	}
+	conversion.text = Str::new(text);
+}
 
 #[derive(Clone)]
 struct SystemHttpClient {
@@ -623,6 +708,23 @@ impl ReadSources for ReadSourceAdapter {
 	}
 
 	async fn open(&self, path: Str) -> Result<Self::Lease, Fault> {
+		let acp_path = utf8_path(&resolve_authored_path(self.workspace.root(), &path))?;
+		if let Some(result) = self.documents.read_acp_text(acp_path.clone()).await {
+			match result {
+				Ok(text) => {
+					let bytes = Bytes::copy_from_slice(text.as_bytes());
+					let revision = Str::from(format!("acp:{}", Hash32::sum(&bytes).to_hex()));
+					return Ok(ReadDocumentLease {
+						backing: ReadLeaseBacking::File(bytes),
+						revision,
+						canonical_path: acp_path,
+					});
+				},
+				Err(error) => {
+					tracing::debug!(%error, path = %acp_path, "ACP document read fell back to document authority");
+				},
+			}
+		}
 		let stat = self.stat_path(&path).await?;
 		let canonical = Path::new(stat.canonical_path.as_str());
 		let Ok(relative) = canonical.strip_prefix(self.workspace.root()) else {

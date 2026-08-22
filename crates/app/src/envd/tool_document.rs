@@ -19,18 +19,20 @@ use omp_proto::document::v1 as pb;
 use omp_tool::BlobRef;
 use omp_tools::{
 	edit::{
-		CommitResult, CommittedSection, Conflict, EditAction, EditCommitError, EditDocuments,
-		EditPrepared, EditProposal, EditSnapshotStore, Fault as EditFault, FormatPolicy, NoopResult,
-		PrepareRequest, RejectionReason, SnapshotFault, StalePolicy,
+		CommitResult, CommittedSection, Conflict, EditAction, EditCommitError, EditDiagnostic,
+		EditDiagnosticSeverity, EditDocuments, EditPrepared, EditProposal, EditSnapshotStore,
+		Fault as EditFault, FormatPolicy, NoopResult, PrepareRequest, RejectionReason, SnapshotFault,
+		StalePolicy,
 	},
 	read::{
 		Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES,
-		conflicts::splice_registered,
+		conflicts::{splice_registered, splice_registered_bulk},
 		mutation::{MutationCapability, ResourceMutationReceipt, ResourceMutationRequest},
 	},
 	write::{
-		ConflictSpliceRequest, ConflictSpliceResult, Fault as WriteFault, PlainWriteRequest,
-		PlainWriteResult, SpecialWriteControl, WriteCommitError, WriteDisposition, WriteDocuments,
+		ConflictBulkFileRequest, ConflictBulkFileResult, ConflictSpliceRequest, ConflictSpliceResult,
+		Fault as WriteFault, PlainWriteRequest, PlainWriteResult, SpecialWriteControl,
+		WriteCommitError, WriteDisposition, WriteDocuments,
 	},
 };
 use parking_lot::Mutex;
@@ -182,6 +184,7 @@ pub struct PreparedDocument {
 	base_bytes:     Bytes,
 	authored_bytes: Bytes,
 	raw_base_bytes: Bytes,
+	exists:         bool,
 	notebook:       bool,
 	warnings:       Vec<Str>,
 }
@@ -232,6 +235,10 @@ impl EditPrepared for PreparedDocument {
 		&self.base_bytes
 	}
 
+	fn exists(&self) -> bool {
+		self.exists
+	}
+
 	fn warnings(&self) -> &[Str] {
 		&self.warnings
 	}
@@ -252,18 +259,19 @@ impl EditDocuments for DocumentHost {
 				request.path, request.path
 			)));
 		}
-		let (resolved, warnings, display_path) = match resolve_document(self, &request.path) {
-			Ok(resolved) => (resolved, Vec::new(), request.path.clone()),
-			Err(error) => {
-				let Some(tag) = request.file_hash.as_deref() else {
-					return Err(edit_invalid(error));
-				};
-				match recover_edit_path(self, &request.path, tag) {
-					Some(recovered) => recovered,
-					None => return Err(edit_invalid(error)),
-				}
-			},
-		};
+		let (resolved, warnings, display_path) =
+			match resolve_document_for_prepare(self, &request.path, request.allow_missing) {
+				Ok(resolved) => (resolved, Vec::new(), request.path.clone()),
+				Err(error) => {
+					let Some(tag) = request.file_hash.as_deref() else {
+						return Err(edit_invalid(error));
+					};
+					match recover_edit_path(self, &request.path, tag) {
+						Some(recovered) => recovered,
+						None => return Err(edit_invalid(error)),
+					}
+				},
+			};
 		let lease = Self::open(self, resolved.uri, None, &CancellationToken::new())
 			.await
 			.map_err(|error| edit_invalid(error.to_string()))?;
@@ -271,6 +279,10 @@ impl EditDocuments for DocumentHost {
 			return Err(edit_invalid("hashline edits require a text document"));
 		}
 		let base_revision = revision_identity(lease.head()).map_err(edit_invalid)?;
+		let exists = lease.head().presence == pb::DocumentPresence::Present as i32;
+		if !exists && !request.allow_missing {
+			return Err(edit_invalid(format!("document does not exist: {}", request.path)));
+		}
 		let canonical_path = document_path(lease.head()).map_err(edit_invalid)?;
 		let raw_base_bytes = read_whole(self, &lease)
 			.await
@@ -319,6 +331,7 @@ impl EditDocuments for DocumentHost {
 			base_bytes,
 			authored_bytes,
 			raw_base_bytes,
+			exists,
 			notebook,
 			warnings,
 		})
@@ -483,7 +496,14 @@ impl EditDocuments for DocumentHost {
 				persisted[section_index] = Some(content.clone());
 				(Some(revision), Some(content))
 			};
-			sections.push(CommittedSection { new_revision, rebased: operation.rebased, content });
+			let (diagnostics, diagnostics_complete) = committed_diagnostics(operation);
+			sections.push(CommittedSection {
+				new_revision,
+				rebased: operation.rebased,
+				content,
+				diagnostics,
+				diagnostics_complete,
+			});
 		}
 
 		let mut snapshots = self.snapshot_store().lock();
@@ -766,6 +786,14 @@ async fn read_committed_view(
 }
 
 fn resolve_document(host: &DocumentHost, input: &str) -> Result<ResolvedDocument, String> {
+	resolve_document_for_prepare(host, input, false)
+}
+
+fn resolve_document_for_prepare(
+	host: &DocumentHost,
+	input: &str,
+	allow_missing: bool,
+) -> Result<ResolvedDocument, String> {
 	let root_url = Url::parse(host.hello().root_uri.as_str())
 		.map_err(|error| format!("document workspace root is not a valid URI: {error}"))?;
 	if root_url.scheme() != "file" {
@@ -794,7 +822,7 @@ fn resolve_document(host: &DocumentHost, input: &str) -> Result<ResolvedDocument
 	if candidate == root_path || !candidate.starts_with(&root_path) {
 		return Err("document path escapes or names the workspace root".into());
 	}
-	ensure_canonical_containment(&root_path, &candidate)?;
+	ensure_canonical_containment(&root_path, &candidate, allow_missing)?;
 	let uri = match preserve_uri {
 		Some(uri) => uri,
 		None => Url::from_file_path(&candidate)
@@ -960,11 +988,28 @@ fn resolve_move_destination(
 		.ok_or_else(|| "move destination path is not valid UTF-8".to_owned())?;
 	Ok(ResolvedDestination { uri: uri.as_str().into(), path })
 }
-fn ensure_canonical_containment(root: &Path, candidate: &Path) -> Result<(), String> {
+fn ensure_canonical_containment(
+	root: &Path,
+	candidate: &Path,
+	allow_missing: bool,
+) -> Result<(), String> {
 	let canonical_root = std::fs::canonicalize(root)
 		.map_err(|error| format!("cannot canonicalize document workspace root: {error}"))?;
-	let canonical_candidate = std::fs::canonicalize(candidate)
-		.map_err(|error| format!("cannot canonicalize document path: {error}"))?;
+	let canonical_candidate = match std::fs::canonicalize(candidate) {
+		Ok(candidate) => candidate,
+		Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+			let parent = candidate
+				.parent()
+				.ok_or_else(|| "document create target has no parent directory".to_owned())?;
+			let parent = std::fs::canonicalize(parent)
+				.map_err(|error| format!("cannot canonicalize document create parent: {error}"))?;
+			if !parent.starts_with(&canonical_root) {
+				return Err("document create target escapes the canonical workspace root".into());
+			}
+			return Ok(());
+		},
+		Err(error) => return Err(format!("cannot canonicalize document path: {error}")),
+	};
 	if canonical_candidate == canonical_root || !canonical_candidate.starts_with(&canonical_root) {
 		return Err("document path escapes the canonical workspace root".into());
 	}
@@ -1025,6 +1070,33 @@ fn revision_identity(head: &pb::DocumentHead) -> Result<Str, String> {
 		.try_into()
 		.map_err(|_| "document revision hash is not 32 bytes".to_owned())?;
 	Ok(sf!("{}:{}", revision.sequence, hex::encode_n(hash).as_str()))
+}
+
+fn committed_diagnostics(operation: &pb::OperationResult) -> (Vec<EditDiagnostic>, bool) {
+	let Some(batch) = operation.diagnostics.as_ref() else {
+		return (Vec::new(), false);
+	};
+	let diagnostics = batch
+		.diagnostics
+		.iter()
+		.map(|diagnostic| EditDiagnostic {
+			range:    diagnostic
+				.range
+				.as_ref()
+				.map(|range| range.start..range.end),
+			severity: match pb::DiagnosticSeverity::try_from(diagnostic.severity) {
+				Ok(pb::DiagnosticSeverity::Error) => EditDiagnosticSeverity::Error,
+				Ok(pb::DiagnosticSeverity::Warning) => EditDiagnosticSeverity::Warning,
+				Ok(pb::DiagnosticSeverity::Hint) => EditDiagnosticSeverity::Hint,
+				Ok(pb::DiagnosticSeverity::Information | pb::DiagnosticSeverity::Unspecified)
+				| Err(_) => EditDiagnosticSeverity::Information,
+			},
+			code:     Str::from(diagnostic.code.as_str()),
+			source:   Str::from(diagnostic.source.as_str()),
+			message:  Str::from(diagnostic.message.as_str()),
+		})
+		.collect();
+	(diagnostics, batch.complete)
 }
 
 fn validate_committed_metadata(
@@ -1550,6 +1622,34 @@ impl WriteDocuments for DocumentHost {
 			.map_err(|error| write_rejected(error.to_string()))?;
 
 		let content = Bytes::copy_from_slice(request.content.as_bytes());
+		let absolute_path = Str::from(resolved.path.to_string_lossy().into_owned());
+		if let Some(result) = self
+			.write_acp_text(absolute_path.clone(), request.content.clone())
+			.await
+		{
+			let formatted = result
+				.map_err(|error| write_rejected(format!("ACP document write failed: {error}")))?;
+			let content = Bytes::copy_from_slice(formatted.as_bytes());
+			omp_walker::invalidate_path(&resolved.path);
+			let snapshot_tag = record_write_snapshot(
+				self,
+				absolute_path.clone(),
+				RevisionToken::new(Hash32::sum(&content).as_bytes()),
+				content.clone(),
+			);
+			return Ok(PlainWriteResult {
+				resolved_path: absolute_path,
+				display_path: resolved.display_path,
+				byte_len: u64::try_from(content.len()).unwrap_or(u64::MAX),
+				disposition: if existed {
+					WriteDisposition::Overwrote
+				} else {
+					WriteDisposition::Created
+				},
+				made_executable: false,
+				snapshot_tag,
+			});
+		}
 		if !resolved.use_document_host {
 			atomic_write_plain(&resolved.path, &content).map_err(write_rejected)?;
 			let resolved_path = Str::from(resolved.path.to_string_lossy().into_owned());
@@ -1670,6 +1770,13 @@ impl WriteDocuments for DocumentHost {
 		request: ConflictSpliceRequest,
 	) -> Result<Option<ConflictSpliceResult>, WriteCommitError> {
 		splice_conflict_document(self, request).await.map(Some)
+	}
+
+	async fn splice_conflict_file(
+		&self,
+		request: ConflictBulkFileRequest,
+	) -> Result<Option<ConflictBulkFileResult>, WriteCommitError> {
+		splice_conflict_file_document(self, request).await.map(Some)
 	}
 
 	async fn write_archive_member(
@@ -1893,32 +2000,81 @@ async fn splice_conflict_document(
 	host: &DocumentHost,
 	request: ConflictSpliceRequest,
 ) -> Result<ConflictSpliceResult, WriteCommitError> {
-	let resolved = resolve_document(host, &request.entry.display_path).map_err(write_rejected)?;
+	let (lease, current) = open_conflict_document(host, &request.entry.display_path).await?;
+	let splice = splice_registered(&current, &request.entry, &request.replacement)
+		.map_err(|fault| write_rejected(fault.message().to_string()))?;
+	let content = Bytes::copy_from_slice(splice.text.as_bytes());
+	let write = commit_conflict_content(host, &lease, request.entry.display_path, content).await?;
+	Ok(ConflictSpliceResult {
+		write,
+		range: splice.range,
+		echo_trimmed: splice.trimmed_leading + splice.trimmed_trailing,
+	})
+}
+
+async fn splice_conflict_file_document(
+	host: &DocumentHost,
+	request: ConflictBulkFileRequest,
+) -> Result<ConflictBulkFileResult, WriteCommitError> {
+	if request.entries.is_empty()
+		|| request
+			.entries
+			.iter()
+			.any(|(entry, _)| entry.display_path != request.display_path)
+	{
+		return Err(write_rejected(
+			"bulk conflict file request must contain one path's registered entries",
+		));
+	}
+	let (lease, current) = open_conflict_document(host, &request.display_path).await?;
+	let splice = splice_registered_bulk(&current, &request.entries)
+		.map_err(|fault| write_rejected(fault.message().to_string()))?;
+	let content = Bytes::copy_from_slice(splice.text.as_bytes());
+	let write = commit_conflict_content(host, &lease, request.display_path, content).await?;
+	Ok(ConflictBulkFileResult {
+		write,
+		resolved_ids: splice.resolved_ids,
+		echo_trimmed: splice.echo_trimmed,
+	})
+}
+
+async fn open_conflict_document(
+	host: &DocumentHost,
+	display_path: &str,
+) -> Result<(DocumentLease, String), WriteCommitError> {
+	let resolved = resolve_document(host, display_path).map_err(write_rejected)?;
 	let lease = DocumentHost::open(host, resolved.uri, None, &CancellationToken::new())
 		.await
 		.map_err(|error| write_rejected(error.to_string()))?;
 	if pb::DocumentKind::try_from(lease.head().kind) != Ok(pb::DocumentKind::Text) {
 		return Err(write_rejected("conflict splices require a UTF-8 text document"));
 	}
+	let current = read_whole(host, &lease)
+		.await
+		.map_err(|error| write_rejected(error.to_string()))?;
+	let current = std::str::from_utf8(&current)
+		.map_err(|_| write_rejected("conflict splices require a UTF-8 text document"))?
+		.to_owned();
+	Ok((lease, current))
+}
+
+async fn commit_conflict_content(
+	host: &DocumentHost,
+	lease: &DocumentLease,
+	display_path: Str,
+	content: Bytes,
+) -> Result<PlainWriteResult, WriteCommitError> {
 	let revision = lease
 		.head()
 		.revision
 		.clone()
 		.ok_or_else(|| write_rejected("document head omitted its revision"))?;
-	let current = read_whole(host, &lease)
-		.await
-		.map_err(|error| write_rejected(error.to_string()))?;
-	let current_text = std::str::from_utf8(&current)
-		.map_err(|_| write_rejected("conflict splices require a UTF-8 text document"))?;
-	let splice = splice_registered(current_text, &request.entry, &request.replacement)
-		.map_err(|fault| write_rejected(fault.message().to_string()))?;
-	let content = Bytes::copy_from_slice(splice.text.as_bytes());
 	let transaction_id = transaction_id(host.hello().server_epoch.as_ref());
 	let response = host
 		.commit_transaction(
 			transaction_id.clone(),
 			vec![pb::DocumentMutation {
-				document:  Some(lease_target(&lease)),
+				document:  Some(lease_target(lease)),
 				operation: Some(pb::document_mutation::Operation::Text(pb::TextMutation {
 					base_revision: Some(revision),
 					change:        Some(pb::text_mutation::Change::ProposedContent(content.clone())),
@@ -1988,16 +2144,13 @@ async fn splice_conflict_document(
 		RevisionToken::new(committed_revision.as_bytes()),
 		content.clone(),
 	);
-	Ok(ConflictSpliceResult {
-		write: PlainWriteResult {
-			resolved_path,
-			display_path: request.entry.display_path,
-			byte_len: u64::try_from(content.len()).unwrap_or(u64::MAX),
-			disposition: WriteDisposition::Overwrote,
-			made_executable: false,
-			snapshot_tag,
-		},
-		range: splice.range,
+	Ok(PlainWriteResult {
+		resolved_path,
+		display_path,
+		byte_len: u64::try_from(content.len()).unwrap_or(u64::MAX),
+		disposition: WriteDisposition::Overwrote,
+		made_executable: false,
+		snapshot_tag,
 	})
 }
 
@@ -2499,6 +2652,7 @@ mod tests {
 			base_bytes: Bytes::from_static(b"old\n"),
 			authored_bytes: Bytes::from_static(b"old\n"),
 			raw_base_bytes: Bytes::from_static(b"old\n"),
+			exists: true,
 			notebook: false,
 			warnings: Vec::new(),
 		}

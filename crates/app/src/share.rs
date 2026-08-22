@@ -43,6 +43,41 @@ pub const HTTP_MAX_SEALED_BYTES: usize = 1_000_000;
 pub const GIST_MAX_SEALED_BYTES: usize = 5_000_000;
 const STORE_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const GITHUB_GIST_API: &str = "https://api.github.com/gists";
+/// Self-contained zero-knowledge viewer loader. The blob location comes from
+/// `?source=` while the AES key is read only from the URL fragment.
+pub const SHARE_LOADER_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OMP encrypted session</title><style>
+:root{color-scheme:light dark}body{font:15px system-ui;max-width:72rem;margin:3rem auto;padding:0 1rem}
+#error{color:#d33;white-space:pre-wrap}pre{white-space:pre-wrap;overflow-wrap:anywhere}
+</style></head><body><p id="status">Decrypting private session…</p><pre id="error"></pre><main id="viewer"></main>
+<script type="module">
+const status=document.querySelector('#status'),error=document.querySelector('#error'),viewer=document.querySelector('#viewer');
+const fail=message=>{status.hidden=true;error.textContent=message instanceof Error?message.message:String(message)};
+const decode=value=>{value=value.replace(/-/g,'+').replace(/_/g,'/');value+='='.repeat((4-value.length%4)%4);
+ return Uint8Array.from(atob(value),character=>character.charCodeAt(0))};
+try {
+ if(!globalThis.crypto?.subtle) throw new Error('This browser does not support WebCrypto.');
+ if(typeof DecompressionStream==='undefined') throw new Error('This browser does not support gzip decompression.');
+ const source=new URL(location.href).searchParams.get('source');
+ const fragment=location.hash.slice(1);
+ if(!source||!fragment) throw new Error('The encrypted share link is incomplete.');
+ const keyBytes=decode(fragment); if(keyBytes.length!==32) throw new Error('The share key is invalid.');
+ history.replaceState(null,'',location.pathname+location.search);
+ const response=await fetch(source,{credentials:'omit',referrerPolicy:'no-referrer'});
+ if(!response.ok) throw new Error(`Encrypted share download failed (${response.status}).`);
+ const envelope=await response.json();
+ if(envelope.version!==1||!Array.isArray(envelope.nonce)||!Array.isArray(envelope.ciphertext))
+   throw new Error('The encrypted share envelope is unsupported.');
+ const key=await crypto.subtle.importKey('raw',keyBytes,{name:'AES-GCM'},false,['decrypt']);
+ const plaintext=await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(envelope.nonce),
+   additionalData:Uint8Array.of(envelope.version),tagLength:128},key,new Uint8Array(envelope.ciphertext));
+ keyBytes.fill(0);
+ const decompressed=new Response(new Blob([plaintext]).stream().pipeThrough(new DecompressionStream('gzip')));
+ const session=await decompressed.json();
+ status.hidden=true; const pre=document.createElement('pre');pre.textContent=JSON.stringify(session,null,2);viewer.append(pre);
+} catch(cause) { fail(cause); }
+</script></body></html>"#;
 const GIST_FILENAME: &str = "session.ompshare.txt";
 
 /// Share projection, sealing, or store failure.
@@ -448,6 +483,132 @@ impl ShareProjection {
 			redact_value(&mut snapshot, &mut redactor);
 		}
 		Self(snapshot)
+	}
+
+	/// Applies the leakage policy and progressively trims the projection to a
+	/// deterministic serialization budget.
+	#[must_use]
+	pub fn materialize_bounded(
+		snapshot: Value,
+		policy: ExportSettings,
+		secrets: &SecretSessionSnapshot,
+		max_json_bytes: usize,
+	) -> Self {
+		let mut projection = Self::materialize(snapshot, policy, secrets);
+		projection.trim_to_budget(max_json_bytes);
+		projection
+	}
+
+	/// Progressively removes high-weight share-only material, caps text, then
+	/// prunes oldest conversation entries until the serialized payload fits.
+	pub fn trim_to_budget(&mut self, max_json_bytes: usize) {
+		strip_opaque_payloads(&mut self.0);
+		if serialized_len(&self.0) <= max_json_bytes {
+			return;
+		}
+		strip_inline_images(&mut self.0);
+		for cap in [64 * 1024, 16 * 1024, 4 * 1024] {
+			if serialized_len(&self.0) <= max_json_bytes {
+				return;
+			}
+			cap_strings(&mut self.0, cap);
+		}
+		while serialized_len(&self.0) > max_json_bytes && prune_oldest_entry(&mut self.0) {}
+	}
+}
+
+fn serialized_len(value: &Value) -> usize {
+	serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn strip_opaque_payloads(value: &mut Value) {
+	match value {
+		Value::Array(values) => values.iter_mut().for_each(strip_opaque_payloads),
+		Value::Object(object) => {
+			object.retain(|key, _| {
+				!matches!(
+					key.as_str(),
+					"raw"
+						| "opaque" | "signature"
+						| "provider_metadata"
+						| "providerMetadata"
+						| "replay_capsule"
+						| "replayCapsule"
+						| "encrypted_content"
+						| "encryptedContent"
+				)
+			});
+			object.values_mut().for_each(strip_opaque_payloads);
+		},
+		Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
+	}
+}
+
+fn strip_inline_images(value: &mut Value) {
+	match value {
+		Value::String(text) if text.starts_with("data:image/") => {
+			*text = "[inline image removed from share]".to_owned();
+		},
+		Value::Array(values) => values.iter_mut().for_each(strip_inline_images),
+		Value::Object(object) => {
+			let image = object
+				.get("mime")
+				.or_else(|| object.get("mime_type"))
+				.or_else(|| object.get("media_type"))
+				.and_then(Value::as_str)
+				.is_some_and(|mime| mime.starts_with("image/"));
+			if image {
+				for key in ["data", "bytes", "base64", "payload", "content"] {
+					if object.contains_key(key) {
+						object.insert(
+							key.to_owned(),
+							Value::String("[inline image removed from share]".to_owned()),
+						);
+					}
+				}
+			}
+			object.values_mut().for_each(strip_inline_images);
+		},
+		Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
+	}
+}
+
+fn cap_strings(value: &mut Value, cap: usize) {
+	match value {
+		Value::String(text) if text.len() > cap => {
+			let mut end = cap.min(text.len());
+			while !text.is_char_boundary(end) {
+				end -= 1;
+			}
+			let removed = text.len().saturating_sub(end);
+			text.truncate(end);
+			text.push_str("\n… [");
+			text.push_str(&removed.to_string());
+			text.push_str(" bytes removed from share]");
+		},
+		Value::Array(values) => values.iter_mut().for_each(|value| cap_strings(value, cap)),
+		Value::Object(object) => object
+			.values_mut()
+			.for_each(|value| cap_strings(value, cap)),
+		Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
+	}
+}
+
+fn prune_oldest_entry(value: &mut Value) -> bool {
+	match value {
+		Value::Object(object) => {
+			for key in ["entries", "messages", "conversation"] {
+				if let Some(Value::Array(entries)) = object.get_mut(key)
+					&& entries.len() > 1
+				{
+					entries.remove(0);
+					return true;
+				}
+			}
+			object.values_mut().any(prune_oldest_entry)
+		},
+		Value::Array(values) => values.iter_mut().any(prune_oldest_entry),
+		Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
 	}
 }
 
