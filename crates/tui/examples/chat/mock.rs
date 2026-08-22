@@ -14,14 +14,20 @@ use omp_chat_ui::{
 };
 use omp_core::{Str, sf};
 
-pub fn start() -> (Receiver<BackendEvent>, Sender<Intent>) {
+pub fn start(executor: &omp_executor::Executor) -> (Receiver<BackendEvent>, Sender<Intent>) {
 	let (event_tx, event_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
-	tokio::spawn(run(event_tx, intent_rx));
+	executor
+		.spawn(run(executor.clone(), event_tx, intent_rx))
+		.detach();
 	(event_rx, intent_tx)
 }
 
-async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
+async fn run(
+	executor: omp_executor::Executor,
+	events: Sender<BackendEvent>,
+	intents: Receiver<Intent>,
+) {
 	let models = models();
 	let generation = Arc::new(AtomicU64::new(0));
 	let mut model = 0_usize;
@@ -45,9 +51,12 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				let events = events.clone();
 				let generation = Arc::clone(&generation);
 				let model_name = models[model].name.clone();
-				tokio::spawn(async move {
-					stream_turn(events, generation, turn, model_name).await;
-				});
+				let stream_executor = executor.clone();
+				executor
+					.spawn(async move {
+						stream_turn(stream_executor, events, generation, turn, model_name).await;
+					})
+					.detach();
 			},
 			Intent::Abort => {
 				generation.fetch_add(1, Ordering::SeqCst);
@@ -119,6 +128,7 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 }
 
 async fn stream_turn(
+	executor: omp_executor::Executor,
 	events: Sender<BackendEvent>,
 	generation: Arc<AtomicU64>,
 	turn: u64,
@@ -141,7 +151,7 @@ async fn stream_turn(
 		}
 		let _ =
 			events.send(BackendEvent::AssistantDelta { id: assistant.clone(), text: sf!(delta) });
-		tokio::time::sleep(Duration::from_millis(180)).await;
+		executor.timer(Duration::from_millis(180)).await;
 	}
 	if !active() {
 		return;
@@ -157,7 +167,7 @@ async fn stream_turn(
 			return;
 		}
 		let _ = events.send(BackendEvent::ToolOutput { id: tool.clone(), chunk: sf!(chunk) });
-		tokio::time::sleep(Duration::from_millis(160)).await;
+		executor.timer(Duration::from_millis(160)).await;
 	}
 	if !active() {
 		return;
@@ -223,6 +233,7 @@ fn providers() -> Vec<SessionRow> {
 		id:     Str::from(id),
 		label:  Str::from(label),
 		detail: Str::from(detail),
+		pinned: false,
 	})
 	.collect()
 }
@@ -238,6 +249,7 @@ fn sessions() -> Vec<SessionRow> {
 		id:     Str::from(id),
 		label:  Str::from(label),
 		detail: Str::from(detail),
+		pinned: false,
 	})
 	.collect()
 }

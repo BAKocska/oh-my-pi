@@ -38,8 +38,12 @@ fn modified(path: &Path) -> Option<std::time::SystemTime> {
 		.ok()
 }
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
+	let executor = omp_executor::Executor::new(None);
+	executor.clone().block_on(run(executor))
+}
+
+async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 	let path = std::env::args()
 		.nth(1)
 		.unwrap_or_else(|| "example.tml".into());
@@ -48,7 +52,7 @@ async fn main() -> io::Result<()> {
 	let mut ctx = None;
 	let mut app = AppOptions::new()
 		.quit([Key::Ctrl('c'), Key::Char('q'), Key::Esc])
-		.start(|env| {
+		.start(executor.clone(), |env| {
 			let ui = build(&source, env.viewport.width, &env.ctx);
 			ctx = Some(env.ctx);
 			ui
@@ -57,22 +61,25 @@ async fn main() -> io::Result<()> {
 	let ctx = ctx.expect("start ran the builder");
 
 	let handle = app.handle();
-	tokio::spawn(async move {
-		let mut seen = modified(path.as_ref());
-		loop {
-			tokio::time::sleep(Duration::from_millis(150)).await;
-			let stamp = modified(path.as_ref());
-			if stamp == seen {
-				continue;
+	let watcher_executor = executor.clone();
+	executor
+		.spawn(async move {
+			let mut seen = modified(path.as_ref());
+			loop {
+				watcher_executor.timer(Duration::from_millis(150)).await;
+				let stamp = modified(path.as_ref());
+				if stamp == seen {
+					continue;
+				}
+				seen = stamp;
+				let Ok(source) = std::fs::read_to_string(&path) else {
+					continue;
+				};
+				let ctx = ctx.clone();
+				handle.update(move |ui| *ui = build(&source, ui.frame().size().width, &ctx));
 			}
-			seen = stamp;
-			let Ok(source) = std::fs::read_to_string(&path) else {
-				continue;
-			};
-			let ctx = ctx.clone();
-			handle.update(move |ui| *ui = build(&source, ui.frame().size().width, &ctx));
-		}
-	});
+		})
+		.detach();
 
 	while app.next().await?.is_some() {}
 	Ok(())

@@ -62,7 +62,7 @@ mod platform {
 		fs::{File, OpenOptions},
 		io,
 		mem::MaybeUninit,
-		os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
+		os::fd::{AsRawFd as _, FromRawFd as _, RawFd},
 		sync::atomic::{AtomicBool, AtomicI32, Ordering},
 		time::{Duration, Instant},
 	};
@@ -75,7 +75,7 @@ mod platform {
 		},
 	};
 
-	use super::{CapturedStderr, RESIZE_GENERATION, emergency_restore_inner};
+	use super::{CapturedStderr, emergency_restore_inner};
 	use crate::Size;
 	pub(super) const fn set_title(_: &str) -> io::Result<()> {
 		Ok(())
@@ -85,7 +85,6 @@ mod platform {
 	static RAW_VALID: AtomicBool = AtomicBool::new(false);
 	static SAVED_STDERR_FD: AtomicI32 = AtomicI32::new(-1);
 
-	static RESIZE_PIPE_FDS: (AtomicI32, AtomicI32) = (AtomicI32::new(-1), AtomicI32::new(-1));
 	struct SavedTermios(UnsafeCell<MaybeUninit<libc::termios>>);
 
 	// Only the active terminal writes this slot before publishing RAW_VALID.
@@ -283,53 +282,6 @@ mod platform {
 		}
 		Ok(())
 	}
-	pub(super) fn activate_resize_pipe() -> io::Result<()> {
-		let mut descriptors = [-1; 2];
-		// SAFETY: `descriptors` is a writable two-element buffer for `pipe`.
-		if unsafe { libc::pipe(descriptors.as_mut_ptr()) } != 0 {
-			return Err(io::Error::last_os_error());
-		}
-		if let Err(error) = configure_pipe(descriptors[0], descriptors[1]) {
-			// SAFETY: both descriptors were returned by `pipe` and remain owned here.
-			unsafe {
-				libc::close(descriptors[0]);
-				libc::close(descriptors[1]);
-			}
-			return Err(error);
-		}
-		RESIZE_PIPE_FDS.0.store(descriptors[0], Ordering::Release);
-		RESIZE_PIPE_FDS.1.store(descriptors[1], Ordering::Release);
-		Ok(())
-	}
-	pub(super) fn resize_pipe_reader() -> io::Result<OwnedFd> {
-		let reader = RESIZE_PIPE_FDS.0.load(Ordering::Acquire);
-		if reader < 0 {
-			return Err(io::Error::new(io::ErrorKind::NotConnected, "resize pipe is inactive"));
-		}
-		// SAFETY: `reader` is live while the resize pipe is active.
-		let duplicate = unsafe { libc::fcntl(reader, libc::F_DUPFD_CLOEXEC, 0) };
-		if duplicate < 0 {
-			return Err(io::Error::last_os_error());
-		}
-		// SAFETY: `F_DUPFD_CLOEXEC` returned a fresh descriptor owned by the caller.
-		Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
-	}
-
-	fn close_resize_pipe() {
-		let writer = RESIZE_PIPE_FDS.1.swap(-1, Ordering::AcqRel);
-		let reader = RESIZE_PIPE_FDS.0.swap(-1, Ordering::AcqRel);
-		// SAFETY: swapped descriptors are no longer published and are owned for
-		// closure.
-		unsafe {
-			if writer >= 0 {
-				libc::close(writer);
-			}
-			if reader >= 0 {
-				libc::close(reader);
-			}
-		}
-	}
-
 	fn restore_stderr() -> io::Result<()> {
 		loop {
 			let saved = SAVED_STDERR_FD.load(Ordering::Acquire);
@@ -503,36 +455,14 @@ mod platform {
 			SaFlags::SA_RESTART,
 			SigSet::empty(),
 		);
-		let resize = SigAction::new(
-			SigHandler::Handler(resize_signal_handler),
-			SaFlags::SA_RESTART,
-			SigSet::empty(),
-		);
 		// SAFETY: handlers and actions are fully initialized and installed process-wide
 		// once.
 		unsafe {
 			signal::sigaction(Signal::SIGINT, &fatal).map_err(|error| error as i32)?;
 			signal::sigaction(Signal::SIGTERM, &fatal).map_err(|error| error as i32)?;
 			signal::sigaction(Signal::SIGHUP, &fatal).map_err(|error| error as i32)?;
-			signal::sigaction(Signal::SIGWINCH, &resize).map_err(|error| error as i32)?;
 		}
 		Ok(())
-	}
-
-	/// Wakes resize listeners over the self-pipe; async-signal-safe.
-	pub(super) fn notify_resize_pipe() {
-		let fd = RESIZE_PIPE_FDS.1.load(Ordering::Acquire);
-		if fd >= 0 {
-			// SAFETY: the self-pipe writer is nonblocking and signal-handler safe.
-			unsafe {
-				libc::write(fd, b"r".as_ptr().cast(), 1);
-			}
-		}
-	}
-
-	extern "C" fn resize_signal_handler(_: libc::c_int) {
-		RESIZE_GENERATION.fetch_add(1, Ordering::Relaxed);
-		notify_resize_pipe();
 	}
 
 	extern "C" fn fatal_signal_handler(signal_number: libc::c_int) {
@@ -546,8 +476,7 @@ mod platform {
 	}
 
 	pub(super) fn emergency_restore(payloads: [&[u8]; 3]) {
-		close_resize_pipe();
-		let fd = TTY_FD.load(Ordering::Acquire);
+				let fd = TTY_FD.load(Ordering::Acquire);
 		if fd < 0 {
 			return;
 		}
@@ -604,8 +533,7 @@ mod platform {
 	}
 
 	pub(super) fn deactivate() {
-		close_resize_pipe();
-		RAW_VALID.store(false, Ordering::Release);
+				RAW_VALID.store(false, Ordering::Release);
 		TTY_FD.store(-1, Ordering::Release);
 	}
 
@@ -884,10 +812,6 @@ mod platform {
 		Ok(Size::new(columns, rows))
 	}
 
-	pub(super) const fn activate_resize_pipe() -> io::Result<()> {
-		Ok(())
-	}
-
 	pub(super) fn drain(
 		_: &File,
 		state: &State,
@@ -983,12 +907,14 @@ pub fn alt_screen_active() -> bool {
 /// Emulates a SIGWINCH delivery for the `OMP_TUI_DEBUG` `resize` op.
 ///
 /// A harness resizing an `OMP_TTY` override device cannot reach the process
-/// with a real signal; bumping the resize generation and waking the pipe
-/// fires every host's normal geometry recheck instead.
+/// with a real signal, so the event is injected through the live actor.
 pub fn simulate_resize_signal() {
+	record_resize_signal();
+	let _ = crate::pump::send_event(crate::pump::TerminalEvent::Resize);
+}
+
+pub(crate) fn record_resize_signal() {
 	RESIZE_GENERATION.fetch_add(1, Ordering::Relaxed);
-	#[cfg(unix)]
-	platform::notify_resize_pipe();
 }
 
 use crate::{
@@ -1335,7 +1261,10 @@ pub struct Terminal {
 impl Terminal {
 	/// Takes ownership of the controlling terminal and emits one
 	/// capability-aware entry batch.
-	pub fn enter(mut options: TerminalOptions) -> io::Result<Self> {
+	pub fn enter(
+		executor: omp_executor::Executor,
+		mut options: TerminalOptions,
+	) -> io::Result<Self> {
 		ensure_restore_hooks()?;
 		let (caps, probe) = match options.caps {
 			Some(caps) => (caps, std::mem::take(&mut options.probe)),
@@ -1353,10 +1282,6 @@ impl Terminal {
 				io::ErrorKind::AlreadyExists,
 				"another Terminal already owns the controlling terminal",
 			));
-		}
-		if let Err(error) = platform::activate_resize_pipe() {
-			deactivate_emergency_state();
-			return Err(error);
 		}
 		// Debug server thread: started here so every host kind serves
 		// `OMP_TUI_DEBUG`; the socket binds before the thread spawns so a
@@ -1410,15 +1335,7 @@ impl Terminal {
 		// Event actor: an async task owns the decoder, the input handle,
 		// and the resize self-pipe, and publishes decoded events on the
 		let channels = match Self::acquire_input().and_then(|input| {
-			crate::pump::spawn(
-				input,
-				decoder,
-				&probe.preserved_input,
-				#[cfg(unix)]
-				platform::resize_pipe_reader().ok(),
-				#[cfg(windows)]
-				None,
-			)
+			crate::pump::spawn(&executor, input, decoder, &probe.preserved_input, true)
 		}) {
 			Ok(channels) => channels,
 			Err(error) => {
@@ -2442,6 +2359,7 @@ fn deactivate_emergency_state() {
 mod tests {
 	use std::{
 		fs::{File, OpenOptions},
+		future::Future,
 		mem::MaybeUninit,
 		os::fd::AsRawFd as _,
 		process::{Command, Output},
@@ -2472,10 +2390,22 @@ mod tests {
 		owned_notification_modes, platform, progress_state, reconcile_in_band_geometry,
 		rounded_cell_pixels,
 	};
+
 	use crate::{
 		Appearance, InputDecoder, InputEvent, Key, Mods, Mouse, MouseButton, MouseReport,
 		ProbeResults, Renderer, Size, TerminalResponse, escape::esc, paste::Pasted,
 	};
+
+	async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
+		futures_lite::future::or(
+			async move { Ok(future.await) },
+			async move {
+				async_io::Timer::after(duration).await;
+				Err(())
+			},
+		)
+		.await
+	}
 
 	fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 		haystack
@@ -2488,8 +2418,9 @@ mod tests {
 		InputEvent::Response(TerminalResponse::Osc(body.into()))
 	}
 
-	#[tokio::test]
-	async fn enhanced_paste_offer_replies_and_stages_the_payload() {
+	#[test]
+	fn enhanced_paste_offer_replies_and_stages_the_payload() {
+		futures_lite::future::block_on(async {
 		let dir = std::env::temp_dir().join(format!("omp-tui-5522-{}", std::process::id()));
 		std::fs::create_dir_all(&dir).expect("temp dir");
 		let path = dir.join("tty");
@@ -2541,6 +2472,7 @@ mod tests {
 		}
 		assert_eq!(terminal.take_paste(), Some(Pasted::Text("hello".into())));
 		std::fs::remove_dir_all(&dir).ok();
+		});
 	}
 
 	#[derive(Default)]
@@ -2886,11 +2818,6 @@ mod tests {
 
 	#[test]
 	fn stderr_guard_subprocess() {
-		let runtime = tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("test runtime builds");
-		let _guard = runtime.enter();
 		match std::env::var("OMP_TUI_STDERR_GUARD_CASE").as_deref() {
 			Ok("leave") => {
 				let before = stderr_stat();
@@ -3030,18 +2957,13 @@ mod tests {
 			return;
 		}
 		ensure_restore_hooks().expect("signal handlers install");
-		platform::activate_resize_pipe().expect("resize pipe opens");
 		let window = Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
 		let pty = openpty(Some(&window), None).expect("PTY opens");
 		let mut raw = tcgetattr(&pty.slave).expect("PTY attributes read");
 		cfmakeraw(&mut raw);
 		tcsetattr(&pty.slave, SetArg::TCSANOW, &raw).expect("PTY enters raw mode");
-		tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("test runtime builds")
-			.block_on(async {
-				let mut terminal = test_terminal(File::from(pty.slave));
+		futures_lite::future::block_on(async {
+				let mut terminal = test_terminal_with_resize(File::from(pty.slave));
 				thread::spawn(|| {
 					thread::sleep(Duration::from_millis(30));
 					// SAFETY: delivering SIGWINCH to this process exercises the installed handler.
@@ -3050,7 +2972,7 @@ mod tests {
 					}
 				});
 				let started = Instant::now();
-				let event = tokio::time::timeout(Duration::from_secs(3), terminal.next())
+				let event = timeout(Duration::from_secs(3), terminal.next())
 					.await
 					.expect("resize wakes the event loop")
 					.expect("resize event arrives");
@@ -3064,7 +2986,7 @@ mod tests {
 					libc::raise(libc::SIGWINCH);
 					libc::raise(libc::SIGWINCH);
 				}
-				let event = tokio::time::timeout(Duration::from_secs(3), terminal.next())
+				let event = timeout(Duration::from_secs(3), terminal.next())
 					.await
 					.expect("burst wakes the event loop")
 					.expect("burst resize arrives");
@@ -3076,7 +2998,7 @@ mod tests {
 				// The watch coalesces the burst; at most resize echoes drain
 				// before the mailbox goes quiet.
 				while let Ok(event) =
-					tokio::time::timeout(Duration::from_millis(30), terminal.next()).await
+					timeout(Duration::from_millis(30), terminal.next()).await
 				{
 					assert_eq!(
 						event.expect("drained event decodes"),
@@ -3087,7 +3009,7 @@ mod tests {
 				}
 
 				write(&pty.master, b"x").expect("PTY accepts key");
-				let event = tokio::time::timeout(Duration::from_secs(1), terminal.next())
+				let event = timeout(Duration::from_secs(1), terminal.next())
 					.await
 					.expect("key wakes the event loop")
 					.expect("key decodes");
@@ -3105,7 +3027,7 @@ mod tests {
 	) -> Vec<InputEvent> {
 		let mut events = Vec::new();
 		while events.len() < count {
-			let event = tokio::time::timeout(Duration::from_secs(1), terminal.next())
+			let event = timeout(Duration::from_secs(1), terminal.next())
 				.await
 				.expect("event arrives")
 				.expect("event decodes");
@@ -3126,8 +3048,9 @@ mod tests {
 		events
 	}
 
-	#[tokio::test]
-	async fn probe_window_events_are_first_and_responses_surface() {
+	#[test]
+	fn probe_window_events_are_first_and_responses_surface() {
+		futures_lite::future::block_on(async {
 		let (reader, _writer) = pipe().expect("pipe opens");
 		let mut terminal = test_terminal_seeded(
 			File::from(reader),
@@ -3164,7 +3087,7 @@ mod tests {
 		]);
 		// The trailing OSC 11 reply is the fifth queued event; apply it like
 		// a host event loop would.
-		let event = tokio::time::timeout(Duration::from_secs(1), terminal.next())
+		let event = timeout(Duration::from_secs(1), terminal.next())
 			.await
 			.expect("response arrives")
 			.expect("response decodes");
@@ -3175,33 +3098,39 @@ mod tests {
 			.handle_response(&response, &mut renderer)
 			.expect("response applies");
 		assert_eq!(terminal.appearance(), Some(Appearance::Light));
+		});
 	}
-	#[tokio::test]
-	async fn probe_window_partial_sequence_continues_in_live_pump() {
+	#[test]
+	fn probe_window_partial_sequence_continues_in_live_pump() {
+		futures_lite::future::block_on(async {
 		let (reader, writer) = pipe().expect("pipe opens");
 		let mut terminal = test_terminal_seeded(File::from(reader), esc!(csi).as_bytes());
 		write(&writer, b"A").expect("pipe accepts sequence tail");
 		let mut renderer = Renderer::new(Vec::new());
 		let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
 		assert_eq!(events, [InputEvent::Key(Key::Up)]);
+		});
 	}
 
-	#[tokio::test]
-	async fn pump_joins_split_escape_sequence_into_one_key() {
+	#[test]
+	fn pump_joins_split_escape_sequence_into_one_key() {
+		futures_lite::future::block_on(async {
 		let (reader, writer) = pipe().expect("pipe opens");
 		let mut terminal = test_terminal(File::from(reader));
 		write(&writer, esc!(escape).as_bytes()).expect("pipe accepts escape");
 		// Inside the decoder's partial-hold window the tail joins the held
 		// escape into one decoded key.
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		async_io::Timer::after(Duration::from_millis(20)).await;
 		write(&writer, b"[A").expect("pipe accepts sequence tail");
 		let mut renderer = Renderer::new(Vec::new());
 		let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
 		assert_eq!(events, [InputEvent::Key(Key::Up)]);
+		});
 	}
 
-	#[tokio::test]
-	async fn pump_responses_surface_and_update_terminal_state() {
+	#[test]
+	fn pump_responses_surface_and_update_terminal_state() {
+		futures_lite::future::block_on(async {
 		let (reader, writer) = pipe().expect("pipe opens");
 		let mut terminal = test_terminal(File::from(reader));
 		write(
@@ -3218,10 +3147,12 @@ mod tests {
 		assert_eq!(terminal.appearance(), Some(Appearance::Light));
 		assert_eq!(terminal.cell_pixel_size(), Some((10, 67)));
 		assert_eq!(terminal.take_resize().expect("resize is available"), Some(Size::new(80, 24)));
+		});
 	}
 
-	#[tokio::test]
-	async fn pump_timeout_tick_flushes_held_partial() {
+	#[test]
+	fn pump_timeout_tick_flushes_held_partial() {
+		futures_lite::future::block_on(async {
 		let (reader, writer) = pipe().expect("pipe opens");
 		let mut terminal = test_terminal(File::from(reader));
 		write(&writer, esc!(escape).as_bytes()).expect("pipe accepts escape");
@@ -3230,9 +3161,11 @@ mod tests {
 		let mut renderer = Renderer::new(Vec::new());
 		let events = collect_inputs(&mut terminal, &mut renderer, 1).await;
 		assert_eq!(events, [InputEvent::Key(Key::Esc)]);
+		});
 	}
-	#[tokio::test]
-	async fn appearance_callback_only_fires_on_a_classification_flip() {
+	#[test]
+	fn appearance_callback_only_fires_on_a_classification_flip() {
+		futures_lite::future::block_on(async {
 		let (reader, writer) = pipe().expect("pipe opens");
 		drop(reader);
 		let mut terminal = test_terminal(File::from(writer));
@@ -3261,10 +3194,12 @@ mod tests {
 			)
 			.unwrap();
 		assert_eq!(*observed.lock(), None);
+		});
 	}
 
-	#[tokio::test]
-	async fn appearance_pushes_collapse_to_one_debounced_query() {
+	#[test]
+	fn appearance_pushes_collapse_to_one_debounced_query() {
+		futures_lite::future::block_on(async {
 		let (reader, writer) = pipe().expect("pipe opens");
 		let mut terminal = test_terminal(File::from(writer));
 		let mut renderer = Renderer::new(Vec::new());
@@ -3281,10 +3216,12 @@ mod tests {
 		let count = read(&reader, &mut bytes).expect("query is written");
 		ACTIVE.store(false, Ordering::Release);
 		assert_eq!(&bytes[..count], OSC11_QUERY);
+		});
 	}
 
-	#[tokio::test]
-	async fn in_band_resize_derives_pixels_and_os_geometry_wins() {
+	#[test]
+	fn in_band_resize_derives_pixels_and_os_geometry_wins() {
+		futures_lite::future::block_on(async {
 		assert_eq!(rounded_cell_pixels(1000, 120), 8);
 		assert_eq!(rounded_cell_pixels(777, 80), 10);
 		let reported = Size::new(120, 40);
@@ -3303,10 +3240,12 @@ mod tests {
 			)
 			.unwrap();
 		assert_eq!(terminal.in_band_size(), Some(reported));
+		});
 	}
 
-	#[tokio::test]
-	async fn staged_alt_sequences_split_interactive_and_resize_ownership() {
+	#[test]
+	fn staged_alt_sequences_split_interactive_and_resize_ownership() {
+		futures_lite::future::block_on(async {
 		let (reader, writer) = pipe().expect("pipe opens");
 		drop(reader);
 		let mut terminal = test_terminal(File::from(writer));
@@ -3378,31 +3317,41 @@ mod tests {
 			esc!(alt_screen)
 		);
 		assert_eq!(terminal.stage_alt_leave().expect("re-exit stages"), esc!(!alt_screen));
+		});
 	}
 
-	/// Terminal over an arbitrary readable handle with a live event actor;
-	/// call inside a tokio runtime.
+	/// Terminal over an arbitrary readable handle with a live event actor.
 	fn test_terminal(tty: File) -> Terminal {
 		test_terminal_seeded(tty, b"")
+	}
+
+	fn test_terminal_with_resize(tty: File) -> Terminal {
+		test_terminal_seeded_resize(tty, b"", true)
 	}
 
 	/// [`test_terminal`] with `preserved` bytes seeding the actor's decoder,
 	/// mirroring capability-negotiation carry-over.
 	fn test_terminal_seeded(tty: File, preserved: &[u8]) -> Terminal {
+		test_terminal_seeded_resize(tty, preserved, false)
+	}
+
+	fn test_terminal_seeded_resize(tty: File, preserved: &[u8], watch_resize: bool) -> Terminal {
 		let source = tty.try_clone().expect("test tty clones");
 		let channels = match crate::pump::spawn(
+			&omp_executor::Executor::new(None),
 			crate::pump::Input::Pollable(source),
 			InputDecoder::new(),
 			preserved,
-			platform::resize_pipe_reader().ok(),
+			watch_resize,
 		) {
 			Ok(channels) => channels,
 			// `/dev/null` and friends are not readiness-pollable; bridge.
 			Err(_) => crate::pump::spawn(
+				&omp_executor::Executor::new(None),
 				crate::pump::Input::Bridged(tty.try_clone().expect("test tty clones")),
 				InputDecoder::new(),
 				preserved,
-				platform::resize_pipe_reader().ok(),
+				watch_resize,
 			)
 			.expect("bridged test actor spawns"),
 		};

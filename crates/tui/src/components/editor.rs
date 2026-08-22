@@ -2205,10 +2205,12 @@ mod tests {
 		let ui = Ui::from_root(
 			EditorPane::new()
 				.composer_style(ComposerStyle::Pi)
-				.with(Prop::Value, "one\ntwo\nthree\nfour\nfive\nsix"),
+				.with(Prop::Value, "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty"),
 			20,
 			UiContext::default(),
 		);
+		// The composer correctly grows for six lines; overflow (and therefore
+		// a thumb) starts only once content exceeds its 18-row height cap.
 		assert!(
 			(1..5).any(|row| frame_row_text(ui.frame(), row).ends_with('█')),
 			"overflowing pi input should paint a thumb in its right border",
@@ -2956,13 +2958,22 @@ mod tests {
 			UiContext::default(),
 		);
 		ui.focus_first();
-		let base = ui.height();
 		let big = (0..12)
 			.map(|n| format!("line{n}"))
 			.collect::<Vec<_>>()
 			.join("\n");
 		ui.handle_paste_raw(&big);
-		assert_eq!(ui.height(), base, "no chip card band appears");
+		// The old base-height expectation confused “no chip band” with
+		// “single-line”; inline multiline content must still grow the editor.
+		assert_eq!(
+			ui.height(),
+			14,
+			"verbatim multiline text grows the inline editor without adding the seven-row chip band"
+		);
+		assert!(
+			editor_pane(&ui).attachments.is_empty(),
+			"raw paste must not stage chip-card content"
+		);
 		assert_eq!(
 			ui.values().get("composer").and_then(Value::as_str),
 			Some(big.as_str()),

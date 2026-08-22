@@ -188,17 +188,22 @@ fn forced_from_args(caps: &TerminalCaps) -> Option<Graphics> {
 	forced
 }
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
+	let executor = omp_executor::Executor::new(None);
+	executor.clone().block_on(run(executor))
+}
+
+async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 	let mut app = AppOptions::new()
 		.mouse()
 		.probe(Duration::from_millis(150))
 		.graphics_with(forced_from_args)
-		.start(|env| build_ui(env.viewport, env.ctx))
+		.start(executor.clone(), |env| build_ui(env.viewport, env.ctx))
 		.await?;
 	if app.caps().graphics != Graphics::Cells {
 		for (index, provider) in PROVIDERS.iter().enumerate() {
-			let png = tokio::fs::read(format!("{ASSET_DIR}/{}.png", provider.id)).await?;
+			let path = format!("{ASSET_DIR}/{}.png", provider.id);
+			let png = executor.unblock(move || std::fs::read(path)).await?;
 			app.renderer_mut().register_image(
 				u32::try_from(index + 1).expect("provider count fits image IDs"),
 				png,

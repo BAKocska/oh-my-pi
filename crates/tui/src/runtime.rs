@@ -8,23 +8,28 @@
 //!
 //! use omp_tui::{AppOptions, Ui};
 //!
-//! #[tokio::main]
-//! async fn main() -> io::Result<()> {
-//! 	let mut app = AppOptions::new()
-//! 		.start(|env| Ui::from_markup("hello", env.viewport.width, env.ctx).unwrap())
-//! 		.await?;
+ //! fn main() -> io::Result<()> {
+ //! 	let executor = omp_executor::Executor::new(None);
+ //! 	executor.clone().block_on(async move {
+ //! 		let mut app = AppOptions::new()
+ //! 			.start(executor, |env| Ui::from_markup("hello", env.viewport.width, env.ctx).unwrap())
+ //! 			.await?;
 //! 	while let Some(event) = app.next().await? {
 //! 		let _ = event;
 //! 	}
-//! 	Ok(())
-//! }
+ //! 		Ok(())
+ //! 	})
+ //! }
 //! ```
 //!
 //! [`UiHandle`] queues mutations from synchronous threads or asynchronous
 //! tasks. Immediate-mode hosts instead drive [`Terminal::next`] with their
 //! own `tokio::select!`; `examples/chat` is the reference.
 
-use std::{fmt, io, time::Duration};
+use std::{
+	fmt, io,
+	time::{Duration, Instant},
+};
 
 use omp_core::{IntoStr, Str};
 use smallvec::SmallVec;
@@ -79,13 +84,13 @@ struct ClipboardGate {
 
 struct InFlightRead {
 	generation: u64,
-	deadline:   tokio::time::Instant,
+	deadline:   Instant,
 }
 
 impl ClipboardGate {
 	/// Claims the gate for one read, returning its generation tag; `None`
 	/// while another read is still in flight.
-	fn begin(&mut self, now: tokio::time::Instant) -> Option<u64> {
+	fn begin(&mut self, now: Instant) -> Option<u64> {
 		if self.in_flight.is_some() {
 			return None;
 		}
@@ -131,7 +136,7 @@ impl ClipboardGate {
 	}
 
 	/// The in-flight read's expiry instant, when one is running.
-	fn deadline(&self) -> Option<tokio::time::Instant> {
+	fn deadline(&self) -> Option<Instant> {
 		self.in_flight.as_ref().map(|read| read.deadline)
 	}
 
@@ -149,17 +154,14 @@ impl ClipboardGate {
 pub struct ImageLoader {
 	tx: flume::Sender<Msg>,
 	rx: flume::Receiver<Msg>,
-	rt: tokio::runtime::Handle,
+	executor: omp_executor::Executor,
 }
 
 impl ImageLoader {
-	/// Creates a loader attached to the current tokio runtime.
-	///
-	/// # Panics
-	/// Panics outside a tokio runtime.
-	pub fn new() -> Self {
+	/// Creates a loader attached to `executor`.
+	pub fn new(executor: omp_executor::Executor) -> Self {
 		let (tx, rx) = flume::unbounded();
-		Self { tx, rx, rt: tokio::runtime::Handle::current() }
+		Self { tx, rx, executor }
 	}
 
 	pub(crate) fn request(
@@ -172,19 +174,15 @@ impl ImageLoader {
 		prepare_kitty: bool,
 	) {
 		let tx = self.tx.clone();
-		let _task = self.rt.spawn_blocking(move || {
+		self.executor
+			.unblock(move || {
 			if prepare_kitty {
 				let _ = crate::imagereg::prepare_png(&source);
 			}
 			let state = crate::components::decode_source(&source, width, height, trim);
 			let _ = tx.send(Msg::ImageDecoded { slot, state });
-		});
-	}
-}
-
-impl Default for ImageLoader {
-	fn default() -> Self {
-		Self::new()
+			})
+			.detach();
 	}
 }
 
@@ -344,11 +342,15 @@ impl AppOptions {
 	/// # Errors
 	///
 	/// Propagates terminal, input, capability, and renderer failures.
-	pub async fn start(self, build: impl FnOnce(AppEnv) -> Ui + Send) -> io::Result<App> {
+	pub async fn start(
+		self,
+		executor: omp_executor::Executor,
+		build: impl FnOnce(AppEnv) -> Ui + Send,
+	) -> io::Result<App> {
 		let Self { probe, graphics, cursor_style, quit, hotkeys, quit_on_cancel, mouse, hold_alt } =
 			self;
 		let (base, probe) = match probe {
-			Some(timeout) => negotiate_async(timeout).await,
+			Some(timeout) => negotiate_async(&executor, timeout).await,
 			None => (detect(), ProbeResults::default()),
 		};
 		let forced = graphics.and_then(|forced| forced(&base));
@@ -357,10 +359,10 @@ impl AppOptions {
 		if let Some(style) = cursor_style {
 			terminal_options = terminal_options.cursor_style(style);
 		}
-		let mut terminal = Terminal::enter(terminal_options)?;
+		let mut terminal = Terminal::enter(executor.clone(), terminal_options)?;
 		let viewport = terminal.size()?;
 
-		let loader = ImageLoader::new();
+		let loader = ImageLoader::new(executor.clone());
 		let msgs = loader.rx.clone();
 		let tx = loader.tx.clone();
 		let mut ctx = UiContext::default().with_terminal_caps(&caps);
@@ -381,8 +383,9 @@ impl AppOptions {
 			renderer.rebuild(ui.frame().clone(), viewport.height, 0, "")?
 		};
 		ui.clear_damage();
-		let now = tokio::time::Instant::now();
+		let now = Instant::now();
 		Ok(App {
+			executor,
 			ui,
 			renderer,
 			msgs,
@@ -497,19 +500,20 @@ pub enum AppEvent {
 
 /// Running retained-UI terminal host.
 pub struct App {
+	executor:       omp_executor::Executor,
 	ui:             Ui,
 	renderer:       Renderer<TtyOut>,
 	msgs:           flume::Receiver<Msg>,
 	tx:             flume::Sender<Msg>,
 	cancel:         CancellationToken,
-	epoch:          tokio::time::Instant,
+	epoch:          Instant,
 	caps:           TerminalCaps,
 	viewport:       Size,
 	quit:           SmallVec<Key, 4>,
 	hotkeys:        SmallVec<Key, 4>,
 	quit_on_cancel: bool,
-	resize_wait:    Option<tokio::time::Instant>,
-	resize_settle:  Option<tokio::time::Instant>,
+	resize_wait:    Option<Instant>,
+	resize_settle:  Option<Instant>,
 	resize_alt:     bool,
 	alt_hold:       bool,
 	hold_request:   bool,
@@ -768,10 +772,10 @@ impl App {
 				() = self.cancel.cancelled() => Wakeup::Cancelled,
 				message = self.msgs.recv_async() => Wakeup::Message(message),
 				event = self.terminal.next() => Wakeup::Event(event),
-				() = deadline(wake) => Wakeup::Animation,
-				() = deadline(self.clipboard.deadline()) => Wakeup::ClipboardExpired,
-				() = deadline(self.resize_wait) => Wakeup::ResizeCheck,
-				() = deadline(self.resize_settle) => Wakeup::ResizeSettle,
+				() = deadline(&self.executor, wake) => Wakeup::Animation,
+				() = deadline(&self.executor, self.clipboard.deadline()) => Wakeup::ClipboardExpired,
+				() = deadline(&self.executor, self.resize_wait) => Wakeup::ResizeCheck,
+				() = deadline(&self.executor, self.resize_settle) => Wakeup::ResizeSettle,
 			};
 
 			match wakeup {
@@ -793,7 +797,7 @@ impl App {
 				Wakeup::Message(Err(_)) => {},
 				Wakeup::Event(event) => match event? {
 					TerminalEvent::Resize => {
-						self.resize_wait = Some(tokio::time::Instant::now());
+						self.resize_wait = Some(Instant::now());
 					},
 					TerminalEvent::Debug(query) => self.answer_debug(query),
 					TerminalEvent::Effect(_) => {},
@@ -807,7 +811,7 @@ impl App {
 							.handle_input_event(&event, &mut self.renderer)?
 						{
 							if in_band_resize {
-								self.resize_wait = Some(tokio::time::Instant::now());
+								self.resize_wait = Some(Instant::now());
 							}
 							if let Some(event) = self.sync_appearance() {
 								return Ok(Some(event));
@@ -836,7 +840,7 @@ impl App {
 				Wakeup::ClipboardExpired => self.clipboard.expire(),
 				Wakeup::ResizeCheck => {
 					self.resize_wait = None;
-					let now = tokio::time::Instant::now();
+					let now = Instant::now();
 					let consumed = match self.terminal.take_resize()? {
 						// A same-size report outside a drag is an echo — some
 						// terminals re-report geometry whenever the alternate
@@ -976,16 +980,18 @@ impl App {
 	/// never spawned) settles the gate immediately so queued input is not
 	/// held until the deadline.
 	fn begin_clipboard_read(&mut self, scope: ClipboardRead) {
-		let Some(generation) = self.clipboard.begin(tokio::time::Instant::now()) else {
+		let Some(generation) = self.clipboard.begin(Instant::now()) else {
 			return;
 		};
 		let rx = crate::paste::spawn_clipboard_read(scope);
 		let raw = scope == ClipboardRead::Text;
 		let tx = self.tx.clone();
-		tokio::spawn(async move {
-			let clipboard = rx.await.unwrap_or(None);
-			let _ = tx.send(Msg::Pasted { generation, raw, clipboard });
-		});
+		self.executor
+			.spawn(async move {
+				let clipboard = rx.await.unwrap_or(None);
+				let _ = tx.send(Msg::Pasted { generation, raw, clipboard });
+			})
+			.detach();
 	}
 
 	/// Routes one decoded input event into the retained tree, mapping the
@@ -1045,7 +1051,7 @@ impl App {
 	/// Shared by the SIGWINCH-driven recheck and the `OMP_TUI_DEBUG` `resize`
 	/// op, which bypasses [`Terminal::take_resize`] because no resize signal
 	/// reaches an `OMP_TTY` override device.
-	fn begin_resize(&mut self, viewport: Size, now: tokio::time::Instant) -> io::Result<()> {
+	fn begin_resize(&mut self, viewport: Size, now: Instant) -> io::Result<()> {
 		let width_changed = viewport.width != self.viewport.width;
 		self.viewport = viewport;
 		if self.alt_hold {
@@ -1208,16 +1214,16 @@ enum Wakeup {
 }
 
 /// Sleeps until `at`; `None` is a disabled select branch.
-async fn deadline(at: Option<tokio::time::Instant>) {
+async fn deadline(executor: &omp_executor::Executor, at: Option<Instant>) {
 	match at {
-		Some(at) => tokio::time::sleep_until(at).await,
+		Some(at) => executor.timer(at.saturating_duration_since(Instant::now())).await,
 		None => std::future::pending().await,
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::time::Duration;
+	use std::time::{Duration, Instant};
 
 	/// Flag routing the re-executed test binary into the PTY helper below.
 	#[cfg(unix)]
@@ -1232,7 +1238,7 @@ mod tests {
 		use crate::{InputEvent, Key};
 
 		let mut gate = ClipboardGate::default();
-		let now = tokio::time::Instant::now();
+		let now = Instant::now();
 		let generation = gate.begin(now).expect("gate idle");
 		assert_eq!(gate.begin(now), None, "one read at a time");
 		let quit = [Key::Ctrl('c')];
@@ -1260,7 +1266,7 @@ mod tests {
 		use crate::{InputEvent, Key};
 
 		let mut gate = ClipboardGate::default();
-		let now = tokio::time::Instant::now();
+		let now = Instant::now();
 		let first = gate.begin(now).expect("gate idle");
 		assert_eq!(gate.admit(InputEvent::Key(Key::Enter), &[]), None);
 		gate.expire();
@@ -1282,21 +1288,18 @@ mod tests {
 		if std::env::var_os(HOLD_HELPER_FLAG).is_none() {
 			return;
 		}
-		tokio::runtime::Builder::new_multi_thread()
-			.enable_all()
-			.build()
-			.expect("helper runtime builds")
-			.block_on(async {
+		let executor = omp_executor::Executor::new(None);
+		executor.clone().block_on(async {
 				let mut app = AppOptions::new()
 					.hold_alt()
-					.start(|env| {
+					.start(executor.clone(), |env| {
 						Ui::from_markup("<text>inline</text>", env.viewport.width, env.ctx).unwrap()
 					})
 					.await
 					.expect("helper app starts on the override device");
-				tokio::time::sleep(Duration::from_millis(250)).await;
+				executor.timer(Duration::from_millis(250)).await;
 				app.hold_alt(false);
-				let _ = tokio::time::timeout(Duration::from_millis(200), app.next()).await;
+				let _ = executor.timeout(Duration::from_millis(200), app.next()).await;
 				drop(app);
 			});
 	}
@@ -1527,8 +1530,12 @@ mod tests {
 		reason = "this helper runs only in current-thread Tokio tests with thread-confined UI \
 		          components"
 	)]
-	async fn receive_image<'a>(loader: &'a ImageLoader, ui: &'a mut Ui) {
-		let message = tokio::time::timeout(Duration::from_secs(5), loader.rx.recv_async())
+	async fn receive_image<'a>(
+		executor: &omp_executor::Executor,
+		loader: &'a ImageLoader,
+		ui: &'a mut Ui,
+	) {
+		let message = executor.timeout(Duration::from_secs(5), loader.rx.recv_async())
 			.await
 			.expect("image decode completes")
 			.expect("image bus remains connected");
@@ -1538,8 +1545,10 @@ mod tests {
 		assert!(ui.deliver_image(slot, state));
 	}
 
-	#[tokio::test(flavor = "current_thread")]
-	async fn image_decode_delivers_without_blocking_initial_layout() {
+	#[test]
+	fn image_decode_delivers_without_blocking_initial_layout() {
+		let executor = omp_executor::Executor::new(None);
+		executor.clone().block_on(async {
 		let dir = std::env::temp_dir().join(format!("omp-tui-runtime-image-{}", std::process::id()));
 		std::fs::create_dir_all(&dir).unwrap();
 		let path = dir.join("async.ppm");
@@ -1551,7 +1560,7 @@ mod tests {
 		}
 		std::fs::write(&path, ppm).unwrap();
 
-		let loader = ImageLoader::new();
+		let loader = ImageLoader::new(executor.clone());
 		let ctx = UiContext { loader: Some(loader.clone()), ..UiContext::default() };
 		let mut ui = Ui::from_markup(format!("<img src={} w=4/>", path.display()), 10, ctx).unwrap();
 		let initial_rows = (0..ui.height())
@@ -1561,7 +1570,7 @@ mod tests {
 		assert!(initial_rows[0].contains('┌'));
 		assert!(!initial_rows.iter().any(|row| row.contains('▀')));
 
-		receive_image(&loader, &mut ui).await;
+		receive_image(&executor, &loader, &mut ui).await;
 		assert_eq!(ui.height(), 2, "4px source relayouts to two half-block rows");
 		assert!((0..ui.height()).any(|row| frame_row_text(ui.frame(), row).contains('▀')));
 
@@ -1572,18 +1581,19 @@ mod tests {
 					as Box<dyn Component>
 			})
 			.build();
-		let custom_loader = ImageLoader::new();
+		let custom_loader = ImageLoader::new(executor.clone());
 		let mut custom_ctx = UiContext { elements, ..UiContext::default() };
 		custom_ctx.loader = Some(custom_loader.clone());
 		let mut custom_ui =
 			Ui::from_markup(format!("<logo src={}/>", path.display()), 10, custom_ctx).unwrap();
-		receive_image(&custom_loader, &mut custom_ui).await;
+		receive_image(&executor, &custom_loader, &mut custom_ui).await;
 		assert!(
 			(0..custom_ui.height()).any(|row| frame_row_text(custom_ui.frame(), row).contains('▀'))
 		);
 
 		std::fs::remove_file(path).unwrap();
 		std::fs::remove_dir(dir).unwrap();
+		});
 	}
 
 	#[test]

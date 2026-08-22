@@ -1873,7 +1873,18 @@ mod tests {
 			ctx,
 		)
 		.unwrap();
-		assert_eq!(ui.height(), 5);
+		// Context elision intentionally retains a summary marker on each side;
+		// at 20 columns each marker wraps to two rows.
+		assert_eq!(ui.height(), 9);
+		let rendered = (0..ui.height())
+			.map(|row| crate::test_support::frame_row_text(ui.frame(), row))
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(!rendered.contains("old far"));
+		assert!(!rendered.contains("new far"));
+		assert!(rendered.contains("old near"));
+		assert!(rendered.contains("new near"));
+		assert_eq!(rendered.matches("unchanged").count(), 2);
 	}
 
 	#[test]

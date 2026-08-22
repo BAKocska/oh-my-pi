@@ -2371,6 +2371,7 @@ impl SlashCommands {
 		{
 			let score = command_score(&query, &arg.value.to_ascii_lowercase());
 			if score > 0 {
+				let hint = argument_inline_hint(&arg.value, partial, arg.usage.as_ref());
 				ranked.push((score, Suggestion {
 					value:       if arg.usage.is_some() {
 						sf!("{} ", arg.value)
@@ -2380,7 +2381,7 @@ impl SlashCommands {
 					display:     SuggestionDisplay::Text(arg.value.clone()),
 					description: Some(arg.description.clone()),
 					icon:        None,
-					hint:        arg.usage.clone(),
+					hint,
 					category:    Some(sf!("Arguments")),
 					match_spans: fuzzy_match_spans(&arg.value, &query),
 				}));
@@ -2392,6 +2393,28 @@ impl SlashCommands {
 			.map(|(_, suggestion)| suggestion)
 			.collect::<SuggestionList>();
 		(!items.is_empty()).then_some(Suggestions { prefix_start, items })
+	}
+}
+
+/// Ghosts the untyped suffix of the selected argument before its post-accept
+/// usage. A bare command keeps its command-level hint instead.
+fn argument_inline_hint(value: &str, partial: &str, usage: Option<&Str>) -> Option<Str> {
+	if partial.is_empty() {
+		return None;
+	}
+	let remaining = value
+		.get(partial.len()..)
+		.filter(|_| {
+			value
+				.get(..partial.len())
+				.is_some_and(|prefix| prefix.eq_ignore_ascii_case(partial))
+		});
+	match (remaining, usage) {
+		(Some(""), Some(usage)) => Some(usage.clone()),
+		(Some(""), None) => None,
+		(Some(remaining), Some(usage)) => Some(sf!("{remaining} {usage}")),
+		(Some(remaining), None) => Some(Str::new(remaining)),
+		(None, usage) => usage.cloned(),
 	}
 }
 

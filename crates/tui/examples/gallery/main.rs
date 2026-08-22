@@ -93,18 +93,22 @@ struct Layers {
 	help:   Option<OverlayId>,
 }
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
+	let executor = omp_executor::Executor::new(None);
+	executor.clone().block_on(run(executor))
+}
+
+async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 	let mut app = AppOptions::new()
 		.mouse()
 		.quit([Key::Ctrl('c'), Key::Ctrl('q')])
-		.start(|env| build_ui(env.viewport, env.ctx))
+		.start(executor.clone(), |env| build_ui(env.viewport, env.ctx))
 		.await?;
 
 	let mut synced = String::new();
 	let mut lab = anim::Lab::new();
 	let mut layers = Layers::default();
-	let mut next_step = tokio::time::Instant::now() + anim::AUTOPLAY_STEP;
+	let mut next_step = std::time::Instant::now() + anim::AUTOPLAY_STEP;
 
 	loop {
 		let event = tokio::select! {
@@ -112,7 +116,7 @@ async fn main() -> io::Result<()> {
 				Some(event) => event,
 				None => break,
 			},
-			() = tokio::time::sleep_until(next_step) => {
+			() = executor.timer(next_step.saturating_duration_since(std::time::Instant::now())) => {
 				if lab.autoplay && active_tab(app.ui()) == "Anim" {
 					lab.advance(app.ui_mut());
 				}

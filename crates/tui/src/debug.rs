@@ -488,9 +488,12 @@ pub(crate) fn ensure_server() -> std::io::Result<()> {
 
 #[cfg(unix)]
 mod server {
-	use std::{io, path::PathBuf, task::Poll, time::Duration};
-
-	use tokio::net::{UnixListener, UnixStream};
+	use std::{
+		io::{self, Read as _, Write as _},
+		path::PathBuf,
+		task::Poll,
+		time::{Duration, Instant},
+	};
 
 	use super::{
 		DEBUG_ENV, DebugQuery, DebugRequest, RESPONSES, TerminalEvent, direct_response, parse_request,
@@ -502,7 +505,7 @@ mod server {
 	const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 	/// Binds the socket and starts the `omp-tui-debug` thread running the
-	/// async serve loop on a dedicated current-thread runtime.
+	/// async serve loop.
 	///
 	/// Binding happens on the caller so a set-but-unbindable path is a loud
 	/// error rather than a silently missing socket.
@@ -522,13 +525,8 @@ mod server {
 		std::thread::Builder::new()
 			.name("omp-tui-debug".into())
 			.spawn(move || {
-				let runtime = tokio::runtime::Builder::new_current_thread()
-					.enable_io()
-					.enable_time()
-					.build()
-					.expect("debug server runtime builds");
-				runtime.block_on(async move {
-					let Ok(listener) = UnixListener::from_std(listener) else {
+				async_io::block_on(async move {
+					let Ok(listener) = async_io::Async::new(listener) else {
 						return;
 					};
 					let mut server = DebugServer::new(listener);
@@ -542,7 +540,7 @@ mod server {
 	struct PendingQuery {
 		id:      u64,
 		client:  u64,
-		expires: tokio::time::Instant,
+		expires: Instant,
 	}
 
 	/// Answers requests forever.
@@ -579,7 +577,7 @@ mod server {
 								pending.push(PendingQuery {
 									id,
 									client,
-									expires: tokio::time::Instant::now() + QUERY_TIMEOUT,
+									expires: Instant::now() + QUERY_TIMEOUT,
 								});
 							} else {
 								server.respond(client, &serde_json::json!({
@@ -600,7 +598,7 @@ mod server {
 					}
 				},
 				() = expire(expiry) => {
-					let now = tokio::time::Instant::now();
+					let now = Instant::now();
 					let mut index = 0;
 					while index < pending.len() {
 						if pending[index].expires <= now {
@@ -619,16 +617,18 @@ mod server {
 	}
 
 	/// Sleeps until the earliest pending expiry; pending forever without one.
-	async fn expire(at: Option<tokio::time::Instant>) {
+	async fn expire(at: Option<Instant>) {
 		match at {
-			Some(at) => tokio::time::sleep_until(at).await,
+			Some(at) => {
+				async_io::Timer::at(at).await;
+			},
 			None => std::future::pending().await,
 		}
 	}
 
 	/// Line-framed JSON server owned by the debug thread.
 	struct DebugServer {
-		listener:  UnixListener,
+		listener:  async_io::Async<std::os::unix::net::UnixListener>,
 		conns:     Vec<Conn>,
 		next_conn: u64,
 	}
@@ -637,7 +637,7 @@ mod server {
 		/// Stable client id; survives [`DebugServer::recv`]'s compaction of
 		/// dead connections, so pending queries can hold it across calls.
 		id:     u64,
-		stream: UnixStream,
+		stream: async_io::Async<std::os::unix::net::UnixStream>,
 		buf:    Vec<u8>,
 		out:    Vec<u8>,
 		dead:   bool,
@@ -656,7 +656,7 @@ mod server {
 		fn fill(&mut self) {
 			let mut bytes = [0_u8; 4096];
 			loop {
-				match self.stream.try_read(&mut bytes) {
+				match self.stream.get_ref().read(&mut bytes) {
 					Ok(0) => {
 						self.dead = true;
 						return;
@@ -675,7 +675,7 @@ mod server {
 		/// the rest flushes when [`DebugServer::recv`] sees it writable.
 		fn flush(&mut self) {
 			while !self.out.is_empty() {
-				match self.stream.try_write(&self.out) {
+				match self.stream.get_ref().write(&self.out) {
 					Ok(0) => {
 						self.dead = true;
 						return;
@@ -694,7 +694,7 @@ mod server {
 	}
 
 	impl DebugServer {
-		const fn new(listener: UnixListener) -> Self {
+		const fn new(listener: async_io::Async<std::os::unix::net::UnixListener>) -> Self {
 			Self { listener, conns: Vec::new(), next_conn: 1 }
 		}
 
@@ -757,8 +757,8 @@ mod server {
 	async fn ready(conns: &[Conn]) -> usize {
 		std::future::poll_fn(|cx| {
 			for (index, conn) in conns.iter().enumerate() {
-				if conn.stream.poll_read_ready(cx).is_ready()
-					|| (!conn.out.is_empty() && conn.stream.poll_write_ready(cx).is_ready())
+				if conn.stream.poll_readable(cx).is_ready()
+					|| (!conn.out.is_empty() && conn.stream.poll_writable(cx).is_ready())
 				{
 					return Poll::Ready(index);
 				}
@@ -772,7 +772,7 @@ mod server {
 	mod tests {
 		use std::time::Duration;
 
-		use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+		use futures_lite::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
 		use super::{DebugServer, serve_loop};
 
@@ -780,8 +780,10 @@ mod server {
 		/// parks a retained query and dies, client B occupies A's compacted
 		/// slot, and the late host reply for A has to be dropped rather
 		/// than delivered to B.
-		#[tokio::test]
-		async fn pending_query_replies_follow_stable_client_ids() {
+		#[test]
+		fn pending_query_replies_follow_stable_client_ids() {
+			let executor = omp_executor::Executor::new(None);
+			executor.clone().block_on(async move {
 			let ingress = crate::pump::publish_ingress_for_test();
 			let (responses_tx, responses_rx) = flume::unbounded();
 
@@ -792,19 +794,20 @@ mod server {
 			listener
 				.set_nonblocking(true)
 				.expect("nonblocking listener");
-			let listener = tokio::net::UnixListener::from_std(listener).expect("listener registers");
+			let listener = async_io::Async::new(listener).expect("listener registers");
 			let mut server = DebugServer::new(listener);
-			let serve = tokio::spawn(async move { serve_loop(&mut server, responses_rx).await });
+			let serve =
+				executor.spawn(async move { serve_loop(&mut server, responses_rx).await });
 
 			// Client A parks a retained query (id 1), then disconnects.
-			let mut first = tokio::net::UnixStream::connect(&path)
+			let mut first = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
 				.await
 				.expect("first client connects");
 			first
 				.write_all(b"{\"op\":\"tree\"}\n")
 				.await
 				.expect("query sends");
-			tokio::time::timeout(Duration::from_secs(1), ingress.recv_async())
+			executor.timeout(Duration::from_secs(1), ingress.recv_async())
 				.await
 				.expect("query reaches the ingress")
 				.expect("ingress lives");
@@ -812,7 +815,7 @@ mod server {
 
 			// Client B lands on the compacted slot an index token would
 			// still name and gets its own answer.
-			let second = tokio::net::UnixStream::connect(&path)
+			let second = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
 				.await
 				.expect("second client connects");
 			let mut second = BufReader::new(second);
@@ -822,7 +825,7 @@ mod server {
 				.await
 				.expect("injection sends");
 			let mut line = String::new();
-			tokio::time::timeout(Duration::from_secs(1), second.read_line(&mut line))
+			executor.timeout(Duration::from_secs(1), second.read_line(&mut line))
 				.await
 				.expect("injection is acknowledged")
 				.expect("ack line reads");
@@ -834,14 +837,15 @@ mod server {
 				.expect("reply channel lives");
 			line.clear();
 			let stray =
-				tokio::time::timeout(Duration::from_millis(200), second.read_line(&mut line)).await;
+				executor.timeout(Duration::from_millis(200), second.read_line(&mut line)).await;
 			assert!(
 				stray.is_err() || line.is_empty(),
 				"reply for a disconnected client reached the survivor: {line:?}"
 			);
 
-			serve.abort();
+			drop(serve);
 			let _ = std::fs::remove_file(&path);
+			});
 		}
 	}
 }
