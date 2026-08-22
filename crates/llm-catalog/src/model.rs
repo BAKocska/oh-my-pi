@@ -230,6 +230,10 @@ pub struct ModelSpec {
 	pub provenance: ModelProvenance,
 	/// Normalized model selected when the current context must be promoted.
 	pub context_promotion_target: Option<ModelKey>,
+	/// Model selected for local context compaction.
+	pub compaction_model: Option<ModelKey>,
+	/// Preferred edit-tool contract revision for this model.
+	pub edit_revision: Option<Str>,
 	/// Optional provider-side context compaction contract.
 	pub remote_compaction: Option<ModelRemoteCompaction>,
 	/// Premium quota multiplier at millionth precision.
@@ -259,6 +263,10 @@ pub struct PolicyModel {
 	pub availability: ModelAvailability,
 	/// Auditable source and lifecycle facts.
 	pub provenance: ModelProvenance,
+	/// Model selected for local context compaction.
+	pub compaction_model: Option<ModelKey>,
+	/// Preferred edit-tool contract revision for this model.
+	pub edit_revision: Option<Str>,
 	/// Premium quota multiplier at millionth precision.
 	pub premium_multiplier_millionths: Option<PremiumMultiplier>,
 }
@@ -276,6 +284,8 @@ impl From<&ModelSpec> for PolicyModel {
 			pricing: model.pricing.clone(),
 			availability: model.availability,
 			provenance: model.provenance.clone(),
+			compaction_model: model.compaction_model.clone(),
+			edit_revision: model.edit_revision.clone(),
 			premium_multiplier_millionths: model.premium_multiplier_millionths,
 		}
 	}

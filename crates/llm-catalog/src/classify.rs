@@ -210,7 +210,7 @@ fn classify_ranks(
 fn ranks_in_class(
 	taxonomy: &Taxonomy,
 	phase: ClassificationPhase,
-	class: &ClassId,
+	class: &ClassId<str>,
 	model: &str,
 ) -> (Option<FamilyId>, Option<SemVer>) {
 	match taxonomy.ranks_in_class(class, model) {
@@ -268,7 +268,7 @@ mod tests {
 			});
 			assert_eq!(product.logical_model.as_str(), "moonshotai/kimi-k2-thinking");
 			assert_eq!(product.class.as_str(), "kimi");
-			assert_eq!(product.family.as_ref().map(FamilyId::as_str), Some("k2-thinking"));
+			assert_eq!(product.family.as_ref().map(|family| family.as_str()), Some("k2-thinking"));
 			assert_eq!(product.effort, None);
 			assert!(!product.thinking_variant);
 			assert_eq!(product.evidence.method, ClassificationMethod::ExactOverride);
@@ -290,7 +290,7 @@ mod tests {
 				model,
 				observed_at_ms: None,
 			});
-			assert_eq!(product.family.as_ref().map(FamilyId::as_str), Some(family));
+			assert_eq!(product.family.as_ref().map(|family| family.as_str()), Some(family));
 			assert_eq!(product.evidence.method, ClassificationMethod::ExactOverride);
 		}
 	}
@@ -305,7 +305,13 @@ mod tests {
 	#[test]
 	fn openai_o_series_family_accepts_only_admitted_spellings() {
 		for model in ["o1", "o1-mini", "o1.2", "o3", "o3-mini", "o3.2", "o4", "o4-mini", "o4.2"] {
-			assert_eq!(compiler(model).family.as_ref().map(FamilyId::as_str), Some("o-series"));
+			assert_eq!(
+				compiler(model)
+					.family
+					.as_ref()
+					.map(|family| family.as_str()),
+				Some("o-series")
+			);
 		}
 		for model in ["openai/omni-realtime", "openai/orbit", "openai/o5-mini"] {
 			assert_eq!(compiler(model).family, None);

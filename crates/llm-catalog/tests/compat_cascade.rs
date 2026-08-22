@@ -413,7 +413,7 @@ fn compiled_catalog_carries_cascade_overlay_policies() {
 	let catalog = Catalog::decode(CATALOG_POSTCARD).expect("compiled catalog snapshot decodes");
 
 	let nvidia_qwen = catalog
-		.model(&ModelKey::from("nvidia/qwen/qwen3-next-80b-a3b-thinking"))
+		.model(ModelKey::from_ref("nvidia/qwen/qwen3-next-80b-a3b-thinking"))
 		.expect("frozen nvidia qwen model is compiled");
 	let wire_policy = catalog
 		.wire_policy(&nvidia_qwen.wire_policy)
@@ -425,7 +425,7 @@ fn compiled_catalog_carries_cascade_overlay_policies() {
 	);
 
 	let cursor_gpt = catalog
-		.model(&ModelKey::from("cursor/gpt-5.1"))
+		.model(ModelKey::from_ref("cursor/gpt-5.1"))
 		.expect("frozen cursor gpt-5.1 model is compiled");
 	let thinking_policy = catalog
 		.thinking_policy(
@@ -442,7 +442,7 @@ fn compiled_catalog_carries_cascade_overlay_policies() {
 	);
 
 	let linkup = catalog
-		.model(&ModelKey::from("nanogpt/linkup-research"))
+		.model(ModelKey::from_ref("nanogpt/linkup-research"))
 		.expect("collapsed Nanogpt Linkup model is compiled");
 	let thinking_policy = catalog
 		.thinking_policy(

@@ -396,6 +396,8 @@ impl NormalizedDiscovery {
 				pricing: Some(model.pricing),
 				availability: Some(model.availability),
 				context_promotion_target: Some(model.context_promotion_target),
+				compaction_model: Some(model.compaction_model),
+				edit_revision: Some(model.edit_revision),
 				remote_compaction: Some(model.remote_compaction),
 				premium_multiplier_millionths: Some(model.premium_multiplier_millionths),
 				updated_at_ms: Some(model.provenance.updated_at_ms),
@@ -505,6 +507,8 @@ impl DiscoveryNormalizer {
 					deprecated:       row.deprecated.unwrap_or(false),
 				},
 				context_promotion_target: None,
+				compaction_model: None,
+				edit_revision: None,
 				remote_compaction: None,
 				premium_multiplier_millionths: None,
 			},
@@ -616,6 +620,7 @@ const fn unknown_chat_capabilities() -> ChatCapabilities {
 		text_verbosity:    Availability::Unknown,
 		reasoning:         Availability::Unknown,
 		input_modalities:  Availability::Unknown,
+		image_input:       Availability::Unknown,
 		hosted_tools:      Availability::Unknown,
 		prompt_caching:    Availability::Unknown,
 		service_tiers:     Availability::Unknown,
@@ -957,6 +962,7 @@ mod tests {
 			text_verbosity:    Availability::Unknown,
 			reasoning:         Availability::Unknown,
 			input_modalities:  Availability::Unknown,
+			image_input:       Availability::Unknown,
 			hosted_tools:      Availability::Unknown,
 			prompt_caching:    Availability::Unknown,
 			service_tiers:     Availability::Unknown,
@@ -993,6 +999,7 @@ mod tests {
 			text_verbosity:    Availability::Unknown,
 			reasoning:         Availability::Unknown,
 			input_modalities:  Availability::Unknown,
+			image_input:       Availability::Unknown,
 			hosted_tools:      Availability::Unknown,
 			prompt_caching:    Availability::Unknown,
 			service_tiers:     Availability::Unknown,
@@ -1016,7 +1023,7 @@ mod tests {
 				.model
 				.routes
 				.iter()
-				.map(RouteId::as_str)
+				.map(|route| route.as_str())
 				.collect::<Vec<_>>(),
 			["a-route", "z-route"]
 		);

@@ -23,6 +23,8 @@ pub enum OverlaySource {
 	Bundled,
 	/// Explicit user configuration.
 	UserConfig,
+	/// Restart-recovered discovery disk cache.
+	DiskCache,
 	/// Runtime model discovery.
 	Discovery,
 	/// One extension's catalog declaration.
@@ -554,8 +556,9 @@ mod tests {
 
 	#[test]
 	fn higher_priority_wins_but_loser_is_retained_as_evidence() {
+		let provider = ProviderId::new("provider");
 		let active = ProviderDeclarations::new([declaration("low", 1), declaration("high", 2)])
-			.activate(&ProviderId::from("provider"))
+			.activate(&provider)
 			.unwrap()
 			.unwrap();
 		assert_eq!(active.overlays.overlays()[0].source.origin, "high");
@@ -564,8 +567,9 @@ mod tests {
 
 	#[test]
 	fn equal_priority_unrelated_declarations_name_both_identities() {
+		let provider = ProviderId::new("provider");
 		let error = ProviderDeclarations::new([declaration("first", 1), declaration("second", 1)])
-			.activate(&ProviderId::from("provider"))
+			.activate(&provider)
 			.unwrap_err();
 		assert!(matches!(
 			error,
@@ -579,8 +583,9 @@ mod tests {
 		let base = declaration("base", 0);
 		let mut extension = declaration("extension", 0);
 		extension.extends = Some("provider".into());
+		let provider = ProviderId::new("provider");
 		let active = ProviderDeclarations::new([base, extension])
-			.activate(&ProviderId::from("provider"))
+			.activate(&provider)
 			.unwrap()
 			.unwrap();
 		assert_eq!(
@@ -603,8 +608,9 @@ mod tests {
 			extension_id: "base".to_str(),
 		});
 		replacement.available = false;
+		let provider = ProviderId::new("provider");
 		let active = ProviderDeclarations::new([base, replacement])
-			.activate(&ProviderId::from("provider"))
+			.activate(&provider)
 			.unwrap()
 			.unwrap();
 		assert_eq!(active.overlays.overlays()[0].source.origin, "base");
@@ -617,8 +623,9 @@ mod tests {
 			publisher:    "publisher".to_str(),
 			extension_id: "base".to_str(),
 		});
+		let provider = ProviderId::new("provider");
 		let active = ProviderDeclarations::new([base, replacement])
-			.activate(&ProviderId::from("provider"))
+			.activate(&provider)
 			.unwrap()
 			.unwrap();
 		assert_eq!(active.overlays.overlays()[0].source.origin, "replacement");

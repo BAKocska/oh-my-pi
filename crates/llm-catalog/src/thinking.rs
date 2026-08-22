@@ -53,6 +53,46 @@ pub enum ThinkingEffort {
 	Max,
 }
 
+/// Stable display metadata for one portable reasoning effort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThinkingEffortMetadata {
+	/// Canonical effort value.
+	pub effort:      ThinkingEffort,
+	/// Compact picker/status label.
+	pub label:       &'static str,
+	/// Stable budget-oriented description.
+	pub description: &'static str,
+}
+
+impl ThinkingEffort {
+	/// Returns allocation-free picker and status metadata.
+	#[must_use]
+	pub const fn metadata(self) -> ThinkingEffortMetadata {
+		let (label, description) = match self {
+			Self::Off => ("off", "No reasoning"),
+			Self::Minimal => ("min", "Very brief reasoning (~1k tokens)"),
+			Self::Low => ("low", "Light reasoning (~2k tokens)"),
+			Self::Medium => ("medium", "Moderate reasoning (~8k tokens)"),
+			Self::High => ("high", "Deep reasoning (~16k tokens)"),
+			Self::XHigh => ("xhigh", "Extended reasoning (~32k tokens)"),
+			Self::Max => ("max", "Maximum reasoning the model supports"),
+		};
+		ThinkingEffortMetadata { effort: self, label, description }
+	}
+}
+
+/// Coarse model-relative effort selector used by delegated tasks.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, Hash, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+pub enum ThinkingEffortSelector {
+	/// Lowest supported effort.
+	Lo,
+	/// Lower-middle supported effort.
+	Med,
+	/// Highest supported effort.
+	Hi,
+}
+
 /// Provider-native control used to select reasoning intensity.
 #[derive(
 	Clone,
@@ -243,6 +283,84 @@ pub struct ThinkingRouting {
 	pub reasoning_mode: Option<ReasoningMode>,
 }
 
+/// Clamps an effort to both a configured ceiling and the model's advertised
+/// ceiling.
+///
+/// Unsupported intermediate levels clamp downward to the greatest
+/// model-supported effort. `Off` remains available unless the model requires
+/// reasoning.
+#[must_use]
+pub fn clamp_thinking_effort(
+	policy: &ThinkingPolicy,
+	requested: Option<ThinkingEffort>,
+	configured_ceiling: Option<ThinkingEffort>,
+) -> Option<ThinkingEffort> {
+	let requested = requested.or(policy.default_level)?;
+	let model_ceiling = policy
+		.efforts
+		.last()
+		.copied()
+		.unwrap_or(ThinkingEffort::Off);
+	let ceiling = configured_ceiling.map_or(model_ceiling, |ceiling| ceiling.min(model_ceiling));
+	if requested == ThinkingEffort::Off {
+		return Some(ThinkingEffort::Off);
+	}
+	let bounded = requested.min(ceiling);
+	let mut floor = None;
+	let mut clamped = None;
+	for effort in policy.efforts.iter().copied() {
+		if effort > ceiling {
+			break;
+		}
+		floor.get_or_insert(effort);
+		if effort <= bounded {
+			clamped = Some(effort);
+		}
+	}
+	clamped.or(floor)
+}
+
+/// Resolves `lo`, `med`, or `hi` against a model ladder and optional ceiling.
+///
+/// The median of an even-sized ladder is the lower middle. A ceiling below the
+/// model floor has no compatible selection.
+#[must_use]
+pub fn resolve_thinking_selector(
+	policy: &ThinkingPolicy,
+	selector: ThinkingEffortSelector,
+	configured_ceiling: Option<ThinkingEffort>,
+) -> Option<ThinkingEffort> {
+	let model_ceiling = policy.efforts.last().copied()?;
+	let ceiling = configured_ceiling.map_or(model_ceiling, |value| value.min(model_ceiling));
+	let count = policy
+		.efforts
+		.iter()
+		.take_while(|effort| **effort <= ceiling)
+		.count();
+	if count == 0 {
+		return None;
+	}
+	let index = match selector {
+		ThinkingEffortSelector::Lo => 0,
+		ThinkingEffortSelector::Med => (count - 1) / 2,
+		ThinkingEffortSelector::Hi => count - 1,
+	};
+	policy.efforts.get(index).copied()
+}
+
+/// Reports whether a controllable ladder has an effort at or below a ceiling.
+///
+/// An absent policy represents an uncontrollable ladder and is compatible
+/// because no effort can be forwarded.
+#[must_use]
+pub fn thinking_ceiling_compatible(
+	policy: Option<&ThinkingPolicy>,
+	ceiling: ThinkingEffort,
+) -> bool {
+	policy.is_none_or(|policy| policy.efforts.iter().any(|effort| *effort <= ceiling))
+}
+
+/// Model-specific effort spelling and opaque wire-model routing.
 impl ThinkingRouting {
 	/// Validates that every native spelling override refers to an advertised
 	/// effort or off.
@@ -261,11 +379,13 @@ impl ThinkingRouting {
 		&self,
 		policy: &ThinkingPolicy,
 		requested: Option<ThinkingEffort>,
-		default_wire_model: &WireModelId,
+		default_wire_model: &WireModelId<str>,
 	) -> Result<ThinkingSelection, ThinkingSelectionError> {
 		self.validate(policy)?;
 		let effort = match requested.or(policy.default_level) {
-			Some(effort) => effort,
+			Some(ThinkingEffort::Off) => ThinkingEffort::Off,
+			Some(effort) => clamp_thinking_effort(policy, Some(effort), None)
+				.ok_or(ThinkingSelectionError::UnsupportedEffort(effort))?,
 			None if policy.requires_effort == Some(true) => {
 				return Err(ThinkingSelectionError::RequiredEffortMissing);
 			},
@@ -291,8 +411,7 @@ impl ThinkingRouting {
 		let wire_model = self
 			.effort_routing
 			.get(&effort)
-			.unwrap_or(default_wire_model)
-			.clone();
+			.map_or_else(|| default_wire_model.to_owned(), Clone::clone);
 		Ok(ThinkingSelection {
 			effort,
 			wire_effort,
@@ -411,7 +530,7 @@ impl ThinkingPolicyTable {
 
 	/// Gets an interned profile by identifier.
 	#[must_use]
-	pub fn get(&self, id: &ThinkingPolicyId) -> Option<&ThinkingPolicy> {
+	pub fn get(&self, id: &ThinkingPolicyId<str>) -> Option<&ThinkingPolicy> {
 		self.entries.get(id)
 	}
 
@@ -497,7 +616,7 @@ mod tests {
 			.effort_routing
 			.insert(ThinkingEffort::Low, "model-low".into());
 		let selection = routing
-			.resolve(&policy, None, &WireModelId::from("model-default"))
+			.resolve(&policy, None, WireModelId::from_ref("model-default"))
 			.expect("default effort resolves");
 		assert_eq!(selection.effort, ThinkingEffort::Low);
 		assert_eq!(selection.native_effort.as_deref(), Some("low-native"));
@@ -505,7 +624,7 @@ mod tests {
 		assert_eq!(selection.wire_model, "model-low");
 
 		let off = routing
-			.resolve(&policy, Some(ThinkingEffort::Off), &WireModelId::from("model-default"))
+			.resolve(&policy, Some(ThinkingEffort::Off), WireModelId::from_ref("model-default"))
 			.expect("off resolves when effort is optional");
 		assert!(off.suppress_when_off);
 		assert_eq!(off.wire_model, "model-default");
@@ -533,7 +652,7 @@ mod tests {
 			.effort_routing
 			.insert(ThinkingEffort::Medium, "gemini-3.7-flash-medium".into());
 		let aliased = routing
-			.resolve(&policy, Some(ThinkingEffort::Minimal), &WireModelId::from("gemini-3.7-flash"))
+			.resolve(&policy, Some(ThinkingEffort::Minimal), WireModelId::from_ref("gemini-3.7-flash"))
 			.expect("minimal resolves");
 		assert_eq!(aliased.effort, ThinkingEffort::Minimal);
 		assert_eq!(aliased.wire_effort, ThinkingEffort::Low);
@@ -548,8 +667,26 @@ mod tests {
 			.effort_routing
 			.insert(ThinkingEffort::Low, "gemini-3.7-flash-low".into());
 		let selection = unaliased
-			.resolve(&policy, Some(ThinkingEffort::Minimal), &WireModelId::from("gemini-3.7-flash"))
+			.resolve(&policy, Some(ThinkingEffort::Minimal), WireModelId::from_ref("gemini-3.7-flash"))
 			.expect("minimal resolves");
 		assert_eq!(selection.wire_effort, ThinkingEffort::Minimal);
+	}
+
+	#[test]
+	fn every_over_ceiling_effort_clamps_down_at_the_policy_boundary() {
+		let policy = ThinkingPolicy::new(ThinkingMode::Effort, [
+			ThinkingEffort::Low,
+			ThinkingEffort::Medium,
+			ThinkingEffort::High,
+		])
+		.expect("policy");
+		assert_eq!(
+			clamp_thinking_effort(&policy, Some(ThinkingEffort::Max), Some(ThinkingEffort::Medium)),
+			Some(ThinkingEffort::Medium)
+		);
+		assert_eq!(
+			clamp_thinking_effort(&policy, Some(ThinkingEffort::XHigh), None),
+			Some(ThinkingEffort::High)
+		);
 	}
 }

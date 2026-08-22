@@ -11,7 +11,8 @@ use smallvec::SmallVec;
 use crate::{
 	capability::{
 		AudioFormatBits, Availability, ChatCapabilities, DimensionRange, EmbeddingCapabilities,
-		EmbeddingFormatBits, EmbeddingInputBits, ImageCapabilities, ImageFeatureBits, ModalityBits,
+		EmbeddingFormatBits, EmbeddingInputBits, ImageCapabilities, ImageDecoderFamily,
+		ImageFeatureBits, ImageInputCapabilities, ImageInputFormatBits, ModalityBits,
 		ModelCapabilities, OperationBits, OperationKind, RealtimeCapabilities, RealtimeFeatureBits,
 		SearchCapabilities, SearchFeatureBits, SpeechCapabilities, SpeechFeatureBits,
 		TokenizationCapabilities, TokenizationFeatureBits, ToolCapabilities, ToolFeatureBits,
@@ -216,6 +217,9 @@ pub struct SourceModelRecord {
 	/// Declared output modalities.
 	#[serde(default)]
 	pub output: Vec<SourceModality>,
+	/// Declared chat image decoder family.
+	#[serde(default)]
+	pub image_input_decoder: Option<ImageDecoderFamily>,
 	/// Typed pricing.
 	#[serde(default)]
 	pub cost: SourceCost,
@@ -252,6 +256,9 @@ pub struct SourceModelRecord {
 	/// Apply-patch wire spelling.
 	#[serde(default)]
 	pub apply_patch_tool_type: Option<Str>,
+	/// Preferred edit-tool contract revision.
+	#[serde(default)]
+	pub edit_revision: Option<Str>,
 	/// Context promotion target.
 	#[serde(default)]
 	pub context_promotion_target: Option<Str>,
@@ -494,6 +501,15 @@ pub struct SourceWirePolicy {
 	pub thinking_tool_choice_conflict: Option<Str>,
 	/// Cache-control format.
 	pub cache_control_format: Option<Str>,
+	/// Bedrock prompt-cache checkpoint mode.
+	#[serde(alias = "promptCacheMode")]
+	pub prompt_cache_mode: Option<Str>,
+	/// Bedrock minimum tokens for explicit prompt caching.
+	#[serde(alias = "promptCacheMinimumTokens")]
+	pub prompt_cache_minimum_tokens: Option<u64>,
+	/// Bedrock maximum explicit prompt-cache checkpoints.
+	#[serde(alias = "promptCacheMaxCheckpoints")]
+	pub prompt_cache_max_checkpoints: Option<u8>,
 	/// Image encoding.
 	pub image_encoding_format: Option<Str>,
 	/// Stop-sequence support.
@@ -3484,6 +3500,8 @@ fn compile_models(
 						Str::from(format!("{provider}/{target}"))
 					})
 				}),
+				compaction_model: None,
+				edit_revision: first.1.edit_revision.clone(),
 				remote_compaction: first.1.remote_compaction.as_ref().map(|source| {
 					ModelRemoteCompaction {
 						enabled:              source.enabled,
@@ -3602,6 +3620,14 @@ fn compile_wire_policy(
 		parse_policy(source.thinking_tool_choice_conflict.as_deref(), policy.tool.thinking_conflict)?;
 	policy.cache.control_format =
 		parse_policy(source.cache_control_format.as_deref(), policy.cache.control_format)?;
+	policy.cache.prompt_cache_mode =
+		parse_policy(source.prompt_cache_mode.as_deref(), policy.cache.prompt_cache_mode)?;
+	policy.cache.minimum_tokens = source
+		.prompt_cache_minimum_tokens
+		.or(policy.cache.minimum_tokens);
+	policy.cache.maximum_checkpoints = source
+		.prompt_cache_max_checkpoints
+		.or(policy.cache.maximum_checkpoints);
 	policy.image.encoding =
 		parse_policy(source.image_encoding_format.as_deref(), policy.image.encoding)?;
 	policy.structured.stop_sequences = source.stop_sequences.or(policy.structured.stop_sequences);
@@ -4133,6 +4159,22 @@ fn conservative_capabilities(
 				Availability::Unknown
 			} else {
 				Availability::Native(modalities(&row.input))
+			},
+			image_input:       if !row.input.contains(&SourceModality::Image) {
+				if row.input.is_empty() {
+					Availability::Unknown
+				} else {
+					Availability::Unsupported
+				}
+			} else {
+				let decoder = row
+					.image_input_decoder
+					.unwrap_or(ImageDecoderFamily::Native);
+				let formats = match decoder {
+					ImageDecoderFamily::Native => ImageInputFormatBits::ALL,
+					ImageDecoderFamily::Stb => ImageInputFormatBits::STB,
+				};
+				Availability::Native(ImageInputCapabilities { formats, decoder })
 			},
 			tools:             match row.supports_tools {
 				Some(true) => Availability::Native(ToolCapabilities {

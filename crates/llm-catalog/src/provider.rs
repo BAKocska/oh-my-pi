@@ -703,6 +703,8 @@ pub struct RouteRestrictions {
 	pub disable_server_state:   bool,
 	/// Whether prompt caching is disabled on this route.
 	pub disable_prompt_caching: bool,
+	/// Whether strict tool schemas are disabled on this route.
+	pub disable_strict_tools:   bool,
 }
 
 /// Codex-family connection preference captured as route data.

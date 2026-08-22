@@ -598,7 +598,7 @@ impl Taxonomy {
 	/// Returns [`TaxonomyError`] when equally ranked product-family rules match.
 	pub fn ranks_in_class(
 		&self,
-		class: &ClassId,
+		class: &ClassId<str>,
 		model: &str,
 	) -> Result<(Option<FamilyId>, Option<SemVer>), TaxonomyError> {
 		let Some(class) = self
@@ -1381,7 +1381,7 @@ mod tests {
 	#[test]
 	fn ranks_can_be_resolved_within_a_preselected_class() {
 		let ranks = taxonomy()
-			.ranks_in_class(&ClassId::new("anthropic"), "claude-opus-4-1-20250805")
+			.ranks_in_class(ClassId::from_ref("anthropic"), "claude-opus-4-1-20250805")
 			.unwrap();
 		assert_eq!(ranks, (Some(FamilyId::new("opus")), Some(semver!(4.1))));
 	}

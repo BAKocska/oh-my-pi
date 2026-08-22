@@ -366,6 +366,55 @@ impl ModalityBits {
 	pub const VIDEO: Self = Self(1 << 3);
 }
 
+bitset!(/// Image encodings accepted by chat input decoders.
+	ImageInputFormatBits, u8);
+impl ImageInputFormatBits {
+	/// Every canonical image input encoding.
+	pub const ALL: Self = Self(Self::PNG.0 | Self::JPEG.0 | Self::GIF.0 | Self::WEBP.0);
+	/// GIF image input.
+	pub const GIF: Self = Self(1 << 2);
+	/// JPEG image input.
+	pub const JPEG: Self = Self(1 << 1);
+	/// PNG image input.
+	pub const PNG: Self = Self(1 << 0);
+	/// Formats decoded by `stb_image` builds used by local model servers.
+	pub const STB: Self = Self(Self::PNG.0 | Self::JPEG.0 | Self::GIF.0);
+	/// WebP image input.
+	pub const WEBP: Self = Self(1 << 3);
+}
+
+/// Image decoder family at the selected model boundary.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Display,
+	EnumString,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	PartialEq,
+	Serialize,
+	Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive, const_into_str)]
+pub enum ImageDecoderFamily {
+	/// Provider-native decoder with all declared canonical formats.
+	Native,
+	/// `stb_image`-compatible decoder without WebP support.
+	Stb,
+}
+
+/// Accepted chat image formats and decoder behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImageInputCapabilities {
+	/// Accepted encoded image formats.
+	pub formats: ImageInputFormatBits,
+	/// Decoder family determining compatibility behavior.
+	pub decoder: ImageDecoderFamily,
+}
+
 bitset!(/// Hosted tools callable inside chat generation.
 	HostedToolBits, u8);
 impl HostedToolBits {
@@ -620,6 +669,9 @@ pub struct ChatCapabilities {
 	pub reasoning:         Availability<ReasoningCapabilities>,
 	/// Media and document inputs accepted by chat.
 	pub input_modalities:  Availability<ModalityBits>,
+	/// Encoded image inputs accepted by the chat decoder.
+	#[serde(default = "unknown_image_input")]
+	pub image_input:       Availability<ImageInputCapabilities>,
 	/// Provider-hosted tools callable inside chat.
 	pub hosted_tools:      Availability<HostedToolBits>,
 	/// Prompt cache and retention behavior.
@@ -636,6 +688,10 @@ pub struct ChatCapabilities {
 	pub server_state:      Availability<ServerStateCapabilities>,
 	/// Token-level probability output.
 	pub logprobs:          Availability<LogProbabilityCapabilities>,
+}
+
+fn unknown_image_input() -> Availability<ImageInputCapabilities> {
+	Availability::Unknown
 }
 
 /// Selectable embedding dimension bounds.
@@ -899,6 +955,14 @@ pub struct ModelCapabilities {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn stb_image_input_formats_exclude_webp() {
+		assert!(ImageInputFormatBits::STB.contains(ImageInputFormatBits::PNG));
+		assert!(ImageInputFormatBits::STB.contains(ImageInputFormatBits::JPEG));
+		assert!(ImageInputFormatBits::STB.contains(ImageInputFormatBits::GIF));
+		assert!(!ImageInputFormatBits::STB.contains(ImageInputFormatBits::WEBP));
+		assert!(ImageInputFormatBits::ALL.contains(ImageInputFormatBits::WEBP));
+	}
 
 	#[test]
 	fn child_tier_inherits_concrete_parent_family_intent() {

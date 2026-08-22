@@ -4,8 +4,12 @@
 //! loose selector into an exact provider/model pair, then the constraint
 //! resolver remains the only authority that makes a route usable.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+	borrow::Cow,
+	collections::{BTreeMap, BTreeSet},
+};
 
+use globset::{GlobBuilder, GlobMatcher};
 use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,9 +20,24 @@ use crate::{CatalogAlias, ModelAvailability, ModelKey, ModelSpec, ProviderId, Ro
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelRole {
 	/// Stable role identifier without its leading `@`.
-	pub id:        Str,
+	pub id:            Str,
 	/// Ordered selectors; the first usable match wins.
-	pub selectors: Box<[Str]>,
+	pub selectors:     Box<[Str]>,
+	/// Picker display label.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub display_name:  Option<Str>,
+	/// Picker color token.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub color:         Option<Str>,
+	/// Whether picker listings hide this role. Direct selectors remain valid.
+	#[serde(default)]
+	pub hidden:        bool,
+	/// Stable picker/cycle order. Roles without an explicit order sort after it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cycle_order:   Option<u32>,
+	/// Provider preference applied while ranking this role's candidates.
+	#[serde(default)]
+	pub provider_rank: Box<[ProviderId]>,
 }
 impl ModelRole {
 	/// Creates a single-selector role assignment with an optional explicit
@@ -39,7 +58,15 @@ impl ModelRole {
 			return Err(SelectionError::Invalid(id));
 		}
 		let selector = role_assignment_selector(selector, thinking)?;
-		Ok(Self { id, selectors: Box::new([selector]) })
+		Ok(Self {
+			id,
+			selectors: Box::new([selector]),
+			display_name: None,
+			color: None,
+			hidden: false,
+			cycle_order: None,
+			provider_rank: Box::new([]),
+		})
 	}
 }
 
@@ -131,6 +158,96 @@ pub struct SelectedModel {
 	pub thinking: Option<Str>,
 	/// Route requested by the selector, if any.
 	pub route:    Option<RouteId>,
+}
+
+/// Why an ordered selector candidate exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateProvenance {
+	/// A concrete catalog model matched the selector.
+	Catalog,
+	/// An exact configured selector has no discovery/catalog row yet.
+	ConfiguredDeclared,
+}
+
+/// One credential-blind ordered candidate. Authentication is deliberately
+/// deferred to inference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionCandidate {
+	/// Selector retained exactly enough to avoid mutating a durable pin.
+	pub selector:   Str,
+	/// Concrete catalog selection, absent for a configured-but-undiscovered
+	/// declaration.
+	pub selected:   Option<SelectedModel>,
+	/// Availability provenance.
+	pub provenance: CandidateProvenance,
+}
+
+/// A compiled path-scoped `enabledModels` allowlist.
+#[derive(Clone, Debug)]
+pub struct ModelScope {
+	patterns: Box<[(Str, GlobMatcher)]>,
+}
+
+impl ModelScope {
+	/// Compiles case-insensitive glob patterns once. Patterns match both full
+	/// provider/model selectors and bare logical model ids.
+	pub fn compile(patterns: &[Str]) -> Result<Self, SelectionError> {
+		let mut compiled = Vec::with_capacity(patterns.len());
+		for pattern in patterns {
+			let base = scope_pattern_base(pattern);
+			let glob = GlobBuilder::new(base)
+				.case_insensitive(true)
+				.literal_separator(false)
+				.build()
+				.map_err(|_| SelectionError::Invalid(pattern.clone()))?;
+			compiled.push((Str::new(base), glob.compile_matcher()));
+		}
+		Ok(Self { patterns: compiled.into_boxed_slice() })
+	}
+
+	/// Reports whether a full provider/model identity is enabled.
+	#[must_use]
+	pub fn allows(&self, provider: &ProviderId<str>, model: &ModelKey<str>) -> bool {
+		if self.patterns.is_empty() {
+			return true;
+		}
+		let bare = logical_id(model);
+		let full = if model.as_str().contains('/') {
+			model.as_str()
+		} else {
+			bare
+		};
+		self.patterns.iter().any(|(_, pattern)| {
+			pattern.is_match(full)
+				|| pattern.is_match(bare)
+				|| pattern.is_match(format!("{provider}/{bare}"))
+		})
+	}
+
+	/// Returns configured patterns that did not match a concrete model. Exact
+	/// provider/model declarations remain selectable and fail only when
+	/// invoked.
+	#[must_use]
+	pub fn synthetic_declarations(&self, models: &[ModelSpec], routes: &[RouteDef]) -> Vec<Str> {
+		self
+			.patterns
+			.iter()
+			.filter(|(source, _)| !contains_glob_meta(source) && source.contains('/'))
+			.filter(|(_, pattern)| {
+				!models.iter().any(|model| {
+					model.routes.iter().any(|route| {
+						routes
+							.iter()
+							.find(|candidate| candidate.id == *route)
+							.is_some_and(|route| {
+								pattern.is_match(format!("{}/{}", route.provider, logical_id(&model.key)))
+							})
+					})
+				})
+			})
+			.map(|(source, _)| source.clone())
+			.collect()
+	}
 }
 
 /// Initial-selection inputs, already collected by the CLI/settings boundary.
@@ -247,10 +364,14 @@ fn select_inner(
 	selector: &str,
 	visiting: &mut BTreeSet<Str>,
 ) -> Result<SelectedModel, SelectionError> {
+	if selector == "*" {
+		return select_inner(models, routes, aliases, roles, mru, "@default", visiting);
+	}
 	if let Some(role) = selector
 		.strip_prefix('@')
 		.or_else(|| selector.strip_prefix("pi/"))
 	{
+		let role = if role == "*" { "default" } else { role };
 		if role.contains('/') || role.contains(':') {
 			return Err(SelectionError::Invalid(Str::new(selector)));
 		}
@@ -261,11 +382,29 @@ fn select_inner(
 			.iter()
 			.find(|candidate| candidate.id == role)
 			.ok_or_else(|| SelectionError::UnknownRole(Str::new(role)))?;
-		let result = found
-			.selectors
-			.iter()
-			.find_map(|pattern| {
-				select_inner(models, routes, aliases, roles, mru, pattern, visiting).ok()
+		if found.selectors.is_empty() {
+			let selected = match role {
+				"smol" | "tiny" | "task" => find_smol(models, routes, mru),
+				"slow" | "plan" | "advisor" => find_slow(models, routes, mru),
+				_ => pick_default(models, routes, mru),
+			};
+			visiting.remove(role);
+			return selected.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
+		}
+		let preferred = found.provider_rank.iter().find_map(|provider| {
+			found.selectors.iter().find_map(|pattern| {
+				if pattern.starts_with('@') || pattern.contains('/') {
+					return None;
+				}
+				let qualified = format!("{provider}/{pattern}");
+				select_inner(models, routes, aliases, roles, mru, &qualified, visiting).ok()
+			})
+		});
+		let result = preferred
+			.or_else(|| {
+				found.selectors.iter().find_map(|pattern| {
+					select_inner(models, routes, aliases, roles, mru, pattern, visiting).ok()
+				})
 			})
 			.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
 		visiting.remove(role);
@@ -273,13 +412,22 @@ fn select_inner(
 	}
 	let parsed = parse_selector(selector)?;
 	// Guard `:max`/`:auto`: catalog literals win over suffix interpretation.
-	let literal = ModelKey::from(selector);
 	if matches!(parsed.thinking.as_deref(), Some("max" | "auto"))
 		&& models
 			.iter()
-			.any(|model| model.key == literal || logical_id(&model.key) == selector)
+			.any(|model| model.key == selector || logical_id(&model.key) == selector)
 	{
-		return choose(models, routes, mru, selector, None, None, None, &literal, selector);
+		return choose(
+			models,
+			routes,
+			mru,
+			selector,
+			None,
+			None,
+			None,
+			ModelKey::from_ref(selector),
+			selector,
+		);
 	}
 	let (provider, id) = parsed
 		.model
@@ -291,9 +439,9 @@ fn select_inner(
 	// Catalog keys are `provider/logical` composites; a provider-qualified
 	// selector reconstructs the composite while a bare selector matches the
 	// logical portion exactly (see `choose`).
-	let exact = match provider {
-		Some(provider) => ModelKey::new(format!("{provider}/{id}")),
-		None => ModelKey::from(id),
+	let exact: Cow<'_, ModelKey<str>> = match provider {
+		Some(provider) => Cow::Owned(ModelKey::new(format!("{provider}/{id}"))),
+		None => Cow::Borrowed(ModelKey::from_ref(id)),
 	};
 	if let Ok(found) = choose(
 		models,
@@ -301,9 +449,9 @@ fn select_inner(
 		mru,
 		id,
 		provider,
-		parsed.route.as_ref(),
+		parsed.route.as_ref().map(|route| &**route),
 		parsed.upstream.clone(),
-		&exact,
+		exact.as_ref(),
 		selector,
 	) {
 		return Ok(with_annotations(found, parsed));
@@ -316,22 +464,39 @@ fn select_inner(
 			mru,
 			alias.target.as_str(),
 			None,
-			parsed.route.as_ref(),
+			parsed.route.as_ref().map(|route| &**route),
 			parsed.upstream.clone(),
 			&alias.target,
 			selector,
 		) {
 		return Ok(with_annotations(found, parsed));
 	}
-	let mut matches = candidates(models, routes, provider, id, parsed.route.as_ref());
+	let mut matches =
+		candidates(models, routes, provider, id, parsed.route.as_ref().map(|route| &**route));
 	if matches.is_empty() && provider.is_some() {
 		matches = candidates(models, routes, provider, id, None);
 	}
 	if matches.is_empty() {
-		matches = candidates(models, routes, provider, id, parsed.route.as_ref());
+		matches =
+			candidates(models, routes, provider, id, parsed.route.as_ref().map(|route| &**route));
 	}
 	matches.retain(|(_, model)| model.key.as_str().contains(id));
-	choose_candidates(matches, routes, mru, parsed, selector)
+	match choose_candidates(matches, routes, mru, parsed.clone(), selector) {
+		Ok(selected) => Ok(selected),
+		Err(error) => {
+			if provider != Some("openrouter") {
+				return Err(error);
+			}
+			let Some(undated) = strip_openrouter_date_suffix(id) else {
+				return Err(error);
+			};
+			let fallback = match provider {
+				Some(provider) => format!("{provider}/{undated}"),
+				None => undated.to_owned(),
+			};
+			select_inner(models, routes, aliases, roles, mru, &fallback, visiting)
+		},
+	}
 }
 
 fn with_annotations(mut selected: SelectedModel, parsed: ParsedSelector) -> SelectedModel {
@@ -347,24 +512,26 @@ fn choose(
 	mru: &BTreeMap<(ProviderId, ModelKey), u64>,
 	_id: &str,
 	provider: Option<&str>,
-	route: Option<&RouteId>,
+	route: Option<&RouteId<str>>,
 	upstream: Option<Str>,
-	exact: &ModelKey,
+	exact: &ModelKey<str>,
 	original: &str,
 ) -> Result<SelectedModel, SelectionError> {
 	let candidates = candidates(models, routes, provider, exact.as_str(), route)
 		.into_iter()
-		.filter(|(_, model)| model.key == *exact || logical_id(&model.key) == exact.as_str())
+		.filter(|(_, model)| {
+			model.key.as_str() == exact.as_str() || logical_id(&model.key) == exact.as_str()
+		})
 		.collect();
 	choose_candidates(
 		candidates,
 		routes,
 		mru,
 		ParsedSelector {
-			model: exact.clone().into_inner(),
+			model: Str::new(exact.as_str()),
 			upstream,
 			thinking: None,
-			route: route.cloned(),
+			route: route.map(ToOwned::to_owned),
 		},
 		original,
 	)
@@ -375,7 +542,7 @@ fn candidates<'a>(
 	routes: &'a [RouteDef],
 	provider: Option<&str>,
 	_id: &str,
-	route: Option<&RouteId>,
+	route: Option<&RouteId<str>>,
 ) -> Vec<(ProviderId, &'a ModelSpec)> {
 	models
 		.iter()
@@ -386,7 +553,7 @@ fn candidates<'a>(
 				.filter_map(|id| routes.iter().find(|candidate| candidate.id == *id))
 				.find(|candidate| {
 					provider.is_none_or(|wanted| candidate.provider == wanted)
-						&& route.is_none_or(|wanted| candidate.id == *wanted)
+						&& route.is_none_or(|wanted| candidate.id.as_str() == wanted.as_str())
 				})?;
 			Some((route.provider.clone(), model))
 		})
@@ -395,7 +562,7 @@ fn candidates<'a>(
 }
 
 /// The key's logical portion, without its provider prefix.
-fn logical_id(key: &ModelKey) -> &str {
+fn logical_id(key: &ModelKey<str>) -> &str {
 	key.as_str()
 		.split_once('/')
 		.map_or(key.as_str(), |(_, rest)| rest)
@@ -576,6 +743,145 @@ pub fn find_slow(
 	.or_else(|| pick_default(models, routes, mru))
 }
 
+/// Builds deterministic known roles from built-ins and configured metadata.
+#[must_use]
+pub fn known_roles(configured: &[ModelRole]) -> Vec<ModelRole> {
+	let mut roles = configured.to_vec();
+	for id in BUILTIN_ROLE_IDS {
+		if roles.iter().all(|role| role.id != *id) {
+			roles.push(ModelRole {
+				id:            Str::new(id),
+				selectors:     Box::new([]),
+				display_name:  None,
+				color:         None,
+				hidden:        false,
+				cycle_order:   None,
+				provider_rank: Box::new([]),
+			});
+		}
+	}
+	roles.sort_by(|left, right| {
+		left
+			.cycle_order
+			.unwrap_or(u32::MAX)
+			.cmp(&right.cycle_order.unwrap_or(u32::MAX))
+			.then_with(|| left.id.cmp(&right.id))
+	});
+	roles
+}
+
+/// Returns roles visible in picker/cycle order. Hidden roles remain valid to
+/// direct selection.
+pub fn visible_roles(roles: &[ModelRole]) -> Vec<&ModelRole> {
+	let mut visible = roles.iter().filter(|role| !role.hidden).collect::<Vec<_>>();
+	visible.sort_by(|left, right| {
+		left
+			.cycle_order
+			.unwrap_or(u32::MAX)
+			.cmp(&right.cycle_order.unwrap_or(u32::MAX))
+			.then_with(|| left.id.cmp(&right.id))
+	});
+	visible
+}
+
+/// Resolves comma- and array-based selector chains without consulting
+/// credential state.
+///
+/// Configured exact provider/model declarations that are absent from discovery
+/// are retained as synthetic candidates so the call boundary, rather than the
+/// picker, reports transport failure.
+pub fn candidate_plan(
+	models: &[ModelSpec],
+	routes: &[RouteDef],
+	aliases: &[CatalogAlias],
+	roles: &[ModelRole],
+	mru: &BTreeMap<(ProviderId, ModelKey), u64>,
+	selectors: &[Str],
+	scope: Option<&ModelScope>,
+) -> Result<Vec<SelectionCandidate>, SelectionError> {
+	let mut plan = Vec::new();
+	for selector in selectors
+		.iter()
+		.flat_map(|chain| chain.as_str().split(','))
+		.map(str::trim)
+		.filter(|selector| !selector.is_empty())
+	{
+		match select_model(models, routes, aliases, roles, mru, selector) {
+			Ok(selected)
+				if scope.is_none_or(|scope| scope.allows(&selected.provider, &selected.model)) =>
+			{
+				if plan
+					.iter()
+					.all(|candidate: &SelectionCandidate| candidate.selected.as_ref() != Some(&selected))
+				{
+					plan.push(SelectionCandidate {
+						selector:   Str::new(selector),
+						selected:   Some(selected),
+						provenance: CandidateProvenance::Catalog,
+					});
+				}
+			},
+			Ok(_) => {},
+			Err(SelectionError::NotFound(_))
+				if exact_declared_selector(selector)
+					&& scope.is_none_or(|scope| {
+						let (provider, model) = selector.split_once('/').expect("checked exact selector");
+						scope.allows(ProviderId::from_ref(provider), ModelKey::from_ref(model))
+					}) =>
+			{
+				plan.push(SelectionCandidate {
+					selector:   Str::new(selector),
+					selected:   None,
+					provenance: CandidateProvenance::ConfiguredDeclared,
+				});
+			},
+			Err(error) => return Err(error),
+		}
+	}
+	if plan.is_empty() {
+		return Err(SelectionError::NotFound(
+			selectors
+				.first()
+				.cloned()
+				.unwrap_or_else(|| Str::new_static("default")),
+		));
+	}
+	Ok(plan)
+}
+
+fn exact_declared_selector(selector: &str) -> bool {
+	let Some((provider, model)) = selector.split_once('/') else {
+		return false;
+	};
+	!provider.is_empty()
+		&& !model.is_empty()
+		&& !contains_glob_meta(selector)
+		&& !selector.starts_with('@')
+}
+
+fn scope_pattern_base(pattern: &str) -> &str {
+	let pattern = pattern.trim();
+	let Some((base, suffix)) = pattern.rsplit_once(':') else {
+		return pattern;
+	};
+	if is_thinking_level(suffix) {
+		base
+	} else {
+		pattern
+	}
+}
+
+fn contains_glob_meta(pattern: &str) -> bool {
+	pattern
+		.bytes()
+		.any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+fn strip_openrouter_date_suffix(model: &str) -> Option<&str> {
+	let (base, suffix) = model.rsplit_once('-')?;
+	(suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(base)
+}
+
 fn is_thinking_level(value: &str) -> bool {
 	matches!(value, "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "auto")
 }
@@ -596,7 +902,7 @@ mod tests {
 			assert_eq!(parsed.model.as_str(), model);
 			assert_eq!(parsed.upstream.as_deref(), upstream);
 			assert_eq!(parsed.thinking.as_deref(), thinking);
-			assert_eq!(parsed.route.as_deref(), route);
+			assert_eq!(parsed.route.as_ref().map(|route| route.as_str()), route);
 		}
 		for invalid in ["", "@upstream", "gpt@", "gpt::high"] {
 			assert!(parse_selector(invalid).is_err(), "{invalid}");
@@ -682,5 +988,36 @@ mod tests {
 			assert_eq!(selected.provider.as_str(), provider, "{selector}");
 			assert_eq!(selected.model, model.key, "{selector}");
 		}
+	}
+
+	#[test]
+	fn enabled_scope_retains_exact_offline_declarations() {
+		let scope = ModelScope::compile(&[Str::new_static("custom/offline-model")]).expect("scope");
+		assert_eq!(scope.synthetic_declarations(&[], &[]), vec![Str::new_static(
+			"custom/offline-model"
+		)]);
+		let plan = candidate_plan(
+			&[],
+			&[],
+			&[],
+			&[],
+			&BTreeMap::new(),
+			&[Str::new_static("custom/offline-model")],
+			Some(&scope),
+		)
+		.expect("declared candidate");
+		assert_eq!(plan[0].provenance, CandidateProvenance::ConfiguredDeclared);
+		assert!(plan[0].selected.is_none());
+	}
+
+	#[test]
+	fn date_suffix_and_known_role_order_are_deterministic() {
+		assert_eq!(strip_openrouter_date_suffix("gpt-5-20260822"), Some("gpt-5"));
+		assert_eq!(strip_openrouter_date_suffix("gpt-5-latest"), None);
+		let mut role = ModelRole::assignment("custom", "provider/model", None).expect("role");
+		role.cycle_order = Some(1);
+		let roles = known_roles(&[role]);
+		assert_eq!(roles[0].id.as_str(), "custom");
+		assert!(roles.iter().any(|role| role.id == "default"));
 	}
 }

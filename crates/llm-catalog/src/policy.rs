@@ -50,6 +50,16 @@ policy_enum!(/// API-version suffix for compatible audio endpoints.
 		V2025_04_01Preview,
 	}
 );
+policy_enum!(/// Bedrock prompt-cache checkpoint mode.
+	PromptCacheMode {
+		/// Do not send checkpoints.
+		None,
+		/// Provider-managed automatic caching.
+		Automatic,
+		/// Emit explicit cachePoint blocks.
+		Explicit,
+	}
+);
 policy_enum!(/// Prompt-cache marker representation.
 	CacheControlFormat {
 		/// No explicit cache markers.
@@ -502,6 +512,12 @@ pub struct CachePolicy {
 	pub control_format:          Option<CacheControlFormat>,
 	/// Whether long retention controls are accepted.
 	pub supports_long_retention: Option<bool>,
+	/// Bedrock checkpoint policy.
+	pub prompt_cache_mode:       Option<PromptCacheMode>,
+	/// Minimum tokens before explicit checkpoints are useful.
+	pub minimum_tokens:          Option<u64>,
+	/// Maximum explicit checkpoints accepted by the route.
+	pub maximum_checkpoints:     Option<u8>,
 }
 
 /// Output limits, storage, and response continuation policy.
@@ -649,7 +665,13 @@ impl WirePolicy {
 				leaked_healer: None,
 				loop_guard: None,
 			},
-			cache:      CachePolicy { control_format: None, supports_long_retention: None },
+			cache:      CachePolicy {
+				control_format:          None,
+				supports_long_retention: None,
+				prompt_cache_mode:       None,
+				minimum_tokens:          None,
+				maximum_checkpoints:     None,
+			},
 			context:    ContextPolicy {
 				max_tokens_field:           None,
 				max_output_tokens:          None,
@@ -732,7 +754,7 @@ impl WirePolicyTable {
 
 	/// Gets an interned policy by identifier.
 	#[must_use]
-	pub fn get(&self, id: &WirePolicyId) -> Option<&WirePolicy> {
+	pub fn get(&self, id: &WirePolicyId<str>) -> Option<&WirePolicy> {
 		self.entries.get(id)
 	}
 

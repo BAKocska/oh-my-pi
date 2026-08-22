@@ -1,6 +1,6 @@
 //! Validated, indexed access to the checked-in binary catalog snapshot.
 
-use std::sync::LazyLock;
+use std::{fs, path::Path, sync::LazyLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,7 @@ const MAGIC: &[u8; 8] = b"OMPLLCAT";
 const SCHEMA_VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 32 + 32 + 32;
 const EMBEDDED_BYTES: &[u8] = include_bytes!("../data/catalog.postcard");
+const OVERLAY_CACHE_SCHEMA: u32 = 1;
 
 static EMBEDDED: LazyLock<Result<Catalog, SnapshotError>> = LazyLock::new(load_embedded);
 
@@ -60,6 +61,67 @@ struct SnapshotPayload {
 	model_index:         Box<[u32]>,
 	wire_policy_ids:     Box<[WirePolicyId]>,
 	thinking_policy_ids: Box<[ThinkingPolicyId]>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedOverlaySnapshot {
+	schema:  u32,
+	overlay: crate::CatalogOverlay,
+}
+
+/// Writes one complete credential-blind discovery overlay for restart recovery.
+pub fn write_discovery_overlay_cache(
+	path: &Path,
+	overlay: &crate::CatalogOverlay,
+) -> Result<(), OverlayCacheError> {
+	let encoded = serde_json::to_vec(&CachedOverlaySnapshot {
+		schema:  OVERLAY_CACHE_SCHEMA,
+		overlay: overlay.clone(),
+	})?;
+	let parent = path.parent().unwrap_or_else(|| Path::new("."));
+	fs::create_dir_all(parent)?;
+	let name = path
+		.file_name()
+		.and_then(|name| name.to_str())
+		.unwrap_or("catalog-cache");
+	let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+	fs::write(&temporary, encoded)?;
+	if let Err(source) = fs::rename(&temporary, path) {
+		let _ = fs::remove_file(&temporary);
+		return Err(OverlayCacheError::Io(source));
+	}
+	Ok(())
+}
+
+/// Loads a credential-blind discovery overlay, rejecting unsupported cache
+/// schemas.
+pub fn read_discovery_overlay_cache(
+	path: &Path,
+) -> Result<Option<crate::CatalogOverlay>, OverlayCacheError> {
+	let encoded = match fs::read(path) {
+		Ok(encoded) => encoded,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.into()),
+	};
+	let cached: CachedOverlaySnapshot = serde_json::from_slice(&encoded)?;
+	if cached.schema != OVERLAY_CACHE_SCHEMA {
+		return Err(OverlayCacheError::UnsupportedSchema(cached.schema));
+	}
+	Ok(Some(cached.overlay))
+}
+
+/// Discovery overlay cache failure.
+#[derive(Debug, thiserror::Error)]
+pub enum OverlayCacheError {
+	/// Filesystem operation failed.
+	#[error(transparent)]
+	Io(#[from] std::io::Error),
+	/// The cache body was malformed.
+	#[error(transparent)]
+	Json(#[from] serde_json::Error),
+	/// The cache schema is newer or older than this runtime.
+	#[error("unsupported discovery overlay cache schema {0}")]
+	UnsupportedSchema(u32),
 }
 
 /// Failure to generate deterministic snapshot artifacts.
@@ -361,11 +423,11 @@ impl Catalog {
 
 	/// Looks up one provider by exact stable identifier.
 	#[must_use]
-	pub fn provider(&self, id: &ProviderId) -> Option<&ProviderDef> {
+	pub fn provider(&self, id: &ProviderId<str>) -> Option<&ProviderDef> {
 		self
 			.compiled
 			.providers
-			.binary_search_by(|record| record.id.cmp(id))
+			.binary_search_by(|record| record.id.as_str().cmp(id.as_str()))
 			.ok()
 			.map(|index| &self.compiled.providers[index])
 	}
@@ -374,36 +436,40 @@ impl Catalog {
 	#[must_use]
 	pub fn discovery_defaults(
 		&self,
-		id: &ProviderId,
+		id: &ProviderId<str>,
 	) -> Option<&crate::discover::DiscoveryDefaults> {
 		self.provider(id)?.discovery_defaults.as_ref()
 	}
 
 	/// Looks up one route by exact stable identifier.
 	#[must_use]
-	pub fn route(&self, id: &RouteId) -> Option<&RouteDef> {
+	pub fn route(&self, id: &RouteId<str>) -> Option<&RouteDef> {
 		self
 			.compiled
 			.routes
-			.binary_search_by(|record| record.id.cmp(id))
+			.binary_search_by(|record| record.id.as_str().cmp(id.as_str()))
 			.ok()
 			.map(|index| &self.compiled.routes[index])
 	}
 
 	/// Looks up one model by exact normalized key.
 	#[must_use]
-	pub fn model(&self, key: &ModelKey) -> Option<&ModelSpec> {
+	pub fn model(&self, key: &ModelKey<str>) -> Option<&ModelSpec> {
 		let index = self.model_position(key)?;
 		Some(&self.compiled.models[index])
 	}
 
 	/// Looks up a model only when it is exposed by the requested provider.
 	#[must_use]
-	pub fn model_for_provider(&self, provider: &ProviderId, key: &ModelKey) -> Option<&ModelSpec> {
+	pub fn model_for_provider(
+		&self,
+		provider: &ProviderId<str>,
+		key: &ModelKey<str>,
+	) -> Option<&ModelSpec> {
 		let provider_index = self
 			.compiled
 			.providers
-			.binary_search_by(|record| record.id.cmp(provider))
+			.binary_search_by(|record| record.id.as_str().cmp(provider.as_str()))
 			.ok()?;
 		let model_index = self.model_position(key)?;
 		let pair = (u32::try_from(provider_index).ok()?, u32::try_from(model_index).ok()?);
@@ -414,10 +480,15 @@ impl Catalog {
 			.map(|_| &self.compiled.models[model_index])
 	}
 
-	fn model_position(&self, key: &ModelKey) -> Option<usize> {
+	fn model_position(&self, key: &ModelKey<str>) -> Option<usize> {
 		let position = self
 			.model_index
-			.binary_search_by(|index| self.compiled.models[*index as usize].key.cmp(key))
+			.binary_search_by(|index| {
+				self.compiled.models[*index as usize]
+					.key
+					.as_str()
+					.cmp(key.as_str())
+			})
 			.ok()?;
 		usize::try_from(self.model_index[position]).ok()
 	}
@@ -435,59 +506,65 @@ impl Catalog {
 
 	/// Looks up an interned authentication specification.
 	#[must_use]
-	pub fn auth_spec(&self, id: &AuthSpecId) -> Option<&AuthSpec> {
+	pub fn auth_spec(&self, id: &AuthSpecId<str>) -> Option<&AuthSpec> {
 		self
 			.compiled
 			.auth_specs
-			.binary_search_by(|record| record.id.cmp(id))
+			.binary_search_by(|record| record.id.as_str().cmp(id.as_str()))
 			.ok()
 			.map(|index| &self.compiled.auth_specs[index])
 	}
 
 	/// Looks up an interned public OAuth flow specification.
 	#[must_use]
-	pub fn oauth_spec(&self, id: &OAuthSpecId) -> Option<&OAuthSpec> {
+	pub fn oauth_spec(&self, id: &OAuthSpecId<str>) -> Option<&OAuthSpec> {
 		self
 			.compiled
 			.oauth_specs
-			.binary_search_by(|record| record.id.cmp(id))
+			.binary_search_by(|record| record.id.as_str().cmp(id.as_str()))
 			.ok()
 			.map(|index| &self.compiled.oauth_specs[index])
 	}
 
 	/// Looks up an interned safe header profile.
 	#[must_use]
-	pub fn header_profile(&self, id: &HeaderProfileId) -> Option<&HeaderProfile> {
+	pub fn header_profile(&self, id: &HeaderProfileId<str>) -> Option<&HeaderProfile> {
 		self
 			.compiled
 			.header_profiles
-			.binary_search_by(|record| record.id.cmp(id))
+			.binary_search_by(|record| record.id.as_str().cmp(id.as_str()))
 			.ok()
 			.map(|index| &self.compiled.header_profiles[index])
 	}
 
 	/// Looks up an interned discovery specification.
 	#[must_use]
-	pub fn discovery_spec(&self, id: &DiscoverySpecId) -> Option<&DiscoverySpec> {
+	pub fn discovery_spec(&self, id: &DiscoverySpecId<str>) -> Option<&DiscoverySpec> {
 		self
 			.compiled
 			.discovery_specs
-			.binary_search_by(|record| record.id.cmp(id))
+			.binary_search_by(|record| record.id.as_str().cmp(id.as_str()))
 			.ok()
 			.map(|index| &self.compiled.discovery_specs[index])
 	}
 
 	/// Looks up an interned wire policy without re-hashing it.
 	#[must_use]
-	pub fn wire_policy(&self, id: &WirePolicyId) -> Option<&WirePolicy> {
-		let index = self.wire_policy_ids.binary_search(id).ok()?;
+	pub fn wire_policy(&self, id: &WirePolicyId<str>) -> Option<&WirePolicy> {
+		let index = self
+			.wire_policy_ids
+			.binary_search_by(|candidate| candidate.as_str().cmp(id.as_str()))
+			.ok()?;
 		Some(&self.compiled.wire_policies[index])
 	}
 
 	/// Looks up an interned thinking policy without re-hashing it.
 	#[must_use]
-	pub fn thinking_policy(&self, id: &ThinkingPolicyId) -> Option<&ThinkingPolicy> {
-		let index = self.thinking_policy_ids.binary_search(id).ok()?;
+	pub fn thinking_policy(&self, id: &ThinkingPolicyId<str>) -> Option<&ThinkingPolicy> {
+		let index = self
+			.thinking_policy_ids
+			.binary_search_by(|candidate| candidate.as_str().cmp(id.as_str()))
+			.ok()?;
 		Some(&self.compiled.thinking_policies[index])
 	}
 }
@@ -719,7 +796,7 @@ mod tests {
 		}
 		assert!(
 			catalog
-				.discovery_defaults(&ProviderId::from("missing-provider"))
+				.discovery_defaults(ProviderId::from_ref("missing-provider"))
 				.is_none()
 		);
 	}

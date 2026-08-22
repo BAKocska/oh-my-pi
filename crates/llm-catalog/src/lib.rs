@@ -17,6 +17,7 @@ pub mod pricing;
 pub mod provider;
 pub mod resolve;
 pub mod selection;
+pub mod settings;
 pub mod snapshot;
 pub mod taxonomy;
 pub mod thinking;

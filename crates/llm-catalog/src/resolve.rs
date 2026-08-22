@@ -122,6 +122,10 @@ pub enum ModelField {
 	Availability,
 	/// Context-promotion target.
 	ContextPromotionTarget,
+	/// Local compaction model.
+	CompactionModel,
+	/// Preferred edit-tool contract revision.
+	EditRevision,
 	/// Remote compaction contract.
 	RemoteCompaction,
 	/// Premium quota multiplier.
@@ -150,6 +154,8 @@ pub enum RouteField {
 	Headers,
 	/// Discovery specification.
 	Discovery,
+	/// Strict tool-schema disablement.
+	StrictTools,
 	/// Route capability restrictions.
 	CapabilityLimits,
 	/// Endpoint trust boundary.
@@ -196,6 +202,10 @@ pub struct ModelPatch {
 	pub availability: Option<ModelAvailability>,
 	/// `Some(None)` explicitly clears context promotion.
 	pub context_promotion_target: Option<Option<ModelKey>>,
+	/// `Some(None)` explicitly clears the local compaction model.
+	pub compaction_model: Option<Option<ModelKey>>,
+	/// `Some(None)` explicitly clears the preferred edit-tool revision.
+	pub edit_revision: Option<Option<Str>>,
 	/// `Some(None)` explicitly clears remote compaction.
 	pub remote_compaction: Option<Option<ModelRemoteCompaction>>,
 	/// `Some(None)` explicitly clears the premium multiplier.
@@ -223,23 +233,25 @@ pub struct ModelOverlay {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoutePatch {
 	/// Replacement codec.
-	pub codec:             Option<CodecId>,
+	pub codec:                Option<CodecId>,
 	/// Replacement transport.
-	pub transport:         Option<TransportKind>,
+	pub transport:            Option<TransportKind>,
 	/// Replacement endpoint.
-	pub endpoint:          Option<crate::EndpointSpec>,
+	pub endpoint:             Option<crate::EndpointSpec>,
 	/// Replacement authentication specification.
-	pub auth:              Option<AuthSpecId>,
+	pub auth:                 Option<AuthSpecId>,
 	/// Replacement header profile.
-	pub headers:           Option<crate::HeaderProfileId>,
+	pub headers:              Option<crate::HeaderProfileId>,
 	/// `Some(None)` explicitly disables discovery.
-	pub discovery:         Option<Option<crate::DiscoverySpecId>>,
+	pub discovery:            Option<Option<crate::DiscoverySpecId>>,
+	/// Whether strict tool schemas are disabled on this route.
+	pub disable_strict_tools: Option<bool>,
 	/// Replacement route restrictions.
-	pub capability_limits: Option<RouteRestrictions>,
+	pub capability_limits:    Option<RouteRestrictions>,
 	/// Replacement trust boundary.
-	pub trust_domain:      Option<TrustDomain>,
+	pub trust_domain:         Option<TrustDomain>,
 	/// `Some(None)` explicitly clears priority.
-	pub priority:          Option<Option<u32>>,
+	pub priority:             Option<Option<u32>>,
 }
 
 /// A route addition or partial replacement in one overlay layer.
@@ -462,12 +474,34 @@ impl<'a> CatalogResolver<'a> {
 					validate_overlay(overlay, UnsafeTrustScope::ALL)?;
 					self.overlays.push(overlay.clone());
 				},
+				OverlaySource::DiskCache => self.add_disk_cache(overlay.clone())?,
 				OverlaySource::Discovery => self.add_discovery(overlay.clone())?,
 				OverlaySource::UserConfig | OverlaySource::Extension { .. } => {
 					self.add_user(overlay.clone(), scope)?;
 				},
 			}
 		}
+		Ok(())
+	}
+
+	/// Adds a restart-recovered discovery cache below live discovery and user
+	/// configuration.
+	pub fn add_disk_cache(&mut self, overlay: CatalogOverlay) -> Result<(), ResolveError> {
+		if overlay.source.kind != ProvenanceKind::Discovered {
+			return Err(ResolveError::WrongOverlayKind {
+				expected: ProvenanceKind::Discovered,
+				actual:   overlay.source.kind,
+			});
+		}
+		validate_overlay(&overlay, UnsafeTrustScope::NONE)?;
+		let index = self
+			.overlays
+			.iter()
+			.position(|existing| {
+				matches!(existing.source.kind, ProvenanceKind::Discovered | ProvenanceKind::Configured)
+			})
+			.unwrap_or(self.overlays.len());
+		self.overlays.insert(index, overlay);
 		Ok(())
 	}
 
@@ -729,11 +763,11 @@ fn validate_overlay(overlay: &CatalogOverlay, scope: UnsafeTrustScope) -> Result
 	Ok(())
 }
 
-fn model_has_provider(model: &ModelSpec, provider: &ProviderId, routes: &[RouteDef]) -> bool {
+fn model_has_provider(model: &ModelSpec, provider: &ProviderId<str>, routes: &[RouteDef]) -> bool {
 	model.routes.iter().any(|route_id| {
 		routes
 			.iter()
-			.any(|route| route.id == *route_id && route.provider == *provider)
+			.any(|route| route.id == *route_id && route.provider.as_str() == provider.as_str())
 	})
 }
 
@@ -752,6 +786,8 @@ fn all_model_sources(source: ProvenanceSource) -> BTreeMap<ModelField, Provenanc
 		ModelField::Pricing,
 		ModelField::Availability,
 		ModelField::ContextPromotionTarget,
+		ModelField::CompactionModel,
+		ModelField::EditRevision,
 		ModelField::RemoteCompaction,
 		ModelField::PremiumMultiplier,
 		ModelField::UpdatedAt,
@@ -771,6 +807,7 @@ fn all_route_sources(source: ProvenanceSource) -> BTreeMap<RouteField, Provenanc
 		RouteField::Auth,
 		RouteField::Headers,
 		RouteField::Discovery,
+		RouteField::StrictTools,
 		RouteField::CapabilityLimits,
 		RouteField::TrustDomain,
 		RouteField::Priority,
@@ -815,6 +852,8 @@ fn apply_model_patch(
 		source,
 		sources
 	);
+	patch_field!(patch, model, compaction_model, ModelField::CompactionModel, source, sources);
+	patch_field!(patch, model, edit_revision, ModelField::EditRevision, source, sources);
 	patch_field!(patch, model, remote_compaction, ModelField::RemoteCompaction, source, sources);
 	patch_field!(
 		patch,
@@ -860,6 +899,10 @@ fn apply_route_patch(
 	patch_field!(patch, route, auth, RouteField::Auth, source, sources);
 	patch_field!(patch, route, headers, RouteField::Headers, source, sources);
 	patch_field!(patch, route, discovery, RouteField::Discovery, source, sources);
+	if let Some(disabled) = patch.disable_strict_tools {
+		route.capability_limits.disable_strict_tools = disabled;
+		sources.insert(RouteField::StrictTools, source.clone());
+	}
 	patch_field!(patch, route, capability_limits, RouteField::CapabilityLimits, source, sources);
 	patch_field!(patch, route, trust_domain, RouteField::TrustDomain, source, sources);
 	patch_field!(patch, route, priority, RouteField::Priority, source, sources);
@@ -1111,6 +1154,7 @@ mod tests {
 				text_verbosity:    Availability::Unknown,
 				reasoning:         Availability::Unknown,
 				input_modalities:  Availability::Unknown,
+				image_input:       Availability::Unknown,
 				hosted_tools:      Availability::Unknown,
 				prompt_caching:    Availability::Unknown,
 				service_tiers:     Availability::Unknown,
@@ -1166,6 +1210,8 @@ mod tests {
 				deprecated:       false,
 			},
 			context_promotion_target: None,
+			compaction_model: None,
+			edit_revision: None,
 			remote_compaction: None,
 			premium_multiplier_millionths: None,
 		}
@@ -1249,7 +1295,7 @@ mod tests {
 		assert_eq!(routes[0].priority, Some(1));
 		assert_eq!(resolved.routes[0].priority, Some(3));
 		assert_eq!(
-			resolved.provenance.routes[&RouteId::from("r")][&RouteField::Priority].origin,
+			resolved.provenance.routes[RouteId::from_ref("r")][&RouteField::Priority].origin,
 			"user"
 		);
 	}
