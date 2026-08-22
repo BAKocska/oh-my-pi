@@ -67,6 +67,7 @@ fn file_write_effects() -> Effects {
 		}),
 		exec:      None,
 		inference: None,
+		desktop:   None,
 		subagents: 0,
 	}
 }

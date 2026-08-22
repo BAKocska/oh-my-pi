@@ -11,7 +11,7 @@ pub mod migrate;
 pub mod subscription;
 
 use omp_agent::{CompactionMethodOrder, CompactionTier};
-use omp_core::{Duration, DurationError};
+use omp_core::{Duration, DurationError, Str, sf};
 use omp_llm_inference::{Difficulty, DifficultyBackend};
 pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
 use omp_tool::DEFAULT_INTERRUPT_GRACE;
@@ -194,6 +194,28 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		secret:      false,
 	},
 	omp_settings::FieldDescriptor {
+		path:        "autolearn.auto_continue",
+		label:       "Auto-run learning capture",
+		description: "Run one private managed-skill/lesson capture after a substantive turn.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       57,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "autolearn.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "autolearn.min_tool_calls",
+		label:       "Automatic learning tool threshold",
+		description: "Minimum settled tool executions required in one primary turn.",
+		kind:        omp_settings::SettingKind::Integer,
+		scopes:      PERSISTED_SCOPES,
+		order:       58,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "autolearn.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
 		path:        "plan.enabled",
 		label:       "Plan mode",
 		description: "Enable the planning execution mode.",
@@ -285,6 +307,62 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		kind:        omp_settings::SettingKind::Boolean,
 		scopes:      PERSISTED_SCOPES,
 		order:       83,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "security.enabled",
+		label:       "Local security review",
+		description: "Register the restricted local security reviewer and command.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       84,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "collab.relayUrl",
+		label:       "Collaboration relay",
+		description: "OMP-v1 relay origin used by live collaboration rooms.",
+		kind:        omp_settings::SettingKind::String,
+		scopes:      PERSISTED_SCOPES,
+		order:       85,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "collab.webUrl",
+		label:       "Collaboration web UI",
+		description: "Optional browser UI origin used for fragment-only room links.",
+		kind:        omp_settings::SettingKind::String,
+		scopes:      PERSISTED_SCOPES,
+		order:       86,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "collab.displayName",
+		label:       "Collaboration display name",
+		description: "Name shown to live room participants; defaults to the OS username.",
+		kind:        omp_settings::SettingKind::String,
+		scopes:      PERSISTED_SCOPES,
+		order:       87,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "updates.checkOnStartup",
+		label:       "Startup update check",
+		description: "Read the signed core release registry in the background at interactive \
+		              startup.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       88,
 		options:     None,
 		condition:   None,
 		secret:      false,
@@ -494,6 +572,15 @@ pub struct SecretsSettings {
 	pub enabled: bool,
 }
 
+/// Default-off registration policy for the minimal local reviewer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SecuritySettings {
+	/// Whether the reviewer profile, prompt contribution, and slash command are
+	/// registered.
+	#[serde(default)]
+	pub enabled: bool,
+}
+
 /// Irreversible export-boundary policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExportSettings {
@@ -506,6 +593,127 @@ impl Default for ExportSettings {
 	fn default() -> Self {
 		Self { share_redact_secrets: true }
 	}
+}
+/// Read-only core release-notice preferences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateSettings {
+	/// Whether interactive startup may inspect locally configured signed release
+	/// metadata in a background thread.
+	#[serde(default = "default_true", rename = "checkOnStartup")]
+	pub check_on_startup: bool,
+}
+
+impl Default for UpdateSettings {
+	fn default() -> Self {
+		Self { check_on_startup: true }
+	}
+}
+/// Live collaboration identity and endpoint settings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollabSettings {
+	/// OMP-v1 relay origin.
+	#[serde(default = "default_collab_relay_url", rename = "relayUrl")]
+	pub relay_url:    String,
+	/// Optional browser UI origin. Empty derives an HTTP(S) origin from the
+	/// relay.
+	#[serde(default, rename = "webUrl")]
+	pub web_url:      String,
+	/// Optional user-facing participant name.
+	#[serde(default, rename = "displayName")]
+	pub display_name: String,
+}
+
+impl Default for CollabSettings {
+	fn default() -> Self {
+		Self {
+			relay_url:    default_collab_relay_url(),
+			web_url:      String::new(),
+			display_name: String::new(),
+		}
+	}
+}
+
+impl CollabSettings {
+	/// Validates and normalizes the relay origin.
+	pub fn relay_endpoint(
+		&self,
+	) -> Result<omp_collab::link::RelayEndpoint, omp_collab::link::EndpointError> {
+		omp_collab::link::RelayEndpoint::parse(&self.relay_url)
+	}
+
+	/// Validates the configured browser origin or derives it from the relay.
+	pub fn web_endpoint(
+		&self,
+	) -> Result<omp_collab::link::WebEndpoint, omp_collab::link::EndpointError> {
+		let relay = self.relay_endpoint()?;
+		if self.web_url.trim().is_empty() {
+			Ok(omp_collab::link::WebEndpoint::from_relay(&relay))
+		} else {
+			omp_collab::link::WebEndpoint::parse(&self.web_url)
+		}
+	}
+
+	/// Resolves a trimmed participant name as setting → OS account →
+	/// `anonymous`.
+	#[must_use]
+	pub fn resolved_display_name(&self) -> Str {
+		let os_name = os_username();
+		resolve_collab_display_name(&self.display_name, os_name.as_deref())
+	}
+}
+
+fn resolve_collab_display_name(configured: &str, os_name: Option<&str>) -> Str {
+	let configured = configured.trim();
+	if !configured.is_empty() {
+		return Str::from(configured);
+	}
+	os_name
+		.map(str::trim)
+		.filter(|name| !name.is_empty())
+		.map_or_else(|| sf!("anonymous"), Str::from)
+}
+
+fn default_collab_relay_url() -> String {
+	omp_collab::link::DEFAULT_RELAY_URL.to_owned()
+}
+
+#[cfg(unix)]
+fn os_username() -> Option<String> {
+	use std::{ffi::CStr, mem::MaybeUninit, ptr};
+
+	let mut account = MaybeUninit::<libc::passwd>::uninit();
+	let mut resolved = ptr::null_mut();
+	let mut buffer = vec![0_u8; 16 * 1024];
+	// SAFETY: `account`, `resolved`, and the writable buffer live through the
+	// call. A non-null result points into `account`/`buffer` and is consumed
+	// before either is dropped.
+	let status = unsafe {
+		libc::getpwuid_r(
+			libc::geteuid(),
+			account.as_mut_ptr(),
+			buffer.as_mut_ptr().cast(),
+			buffer.len(),
+			&mut resolved,
+		)
+	};
+	if status != 0 || resolved.is_null() {
+		return None;
+	}
+	// SAFETY: successful `getpwuid_r` initialized `account` and its `pw_name`
+	// points at a NUL-terminated string within the live buffer.
+	let account = unsafe { account.assume_init() };
+	let name = unsafe { CStr::from_ptr(account.pw_name) };
+	name.to_str().ok().map(ToOwned::to_owned)
+}
+
+#[cfg(windows)]
+fn os_username() -> Option<String> {
+	std::env::var("USERNAME").ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_username() -> Option<String> {
+	std::env::var("USER").ok()
 }
 
 /// Persisted client-scope preferences under `<data_dir>/config.toml`.
@@ -553,9 +761,18 @@ pub struct Settings {
 	/// Reversible provider-bound secret policy.
 	#[serde(default)]
 	pub secrets:       SecretsSettings,
+	/// Default-off local security-review registration.
+	#[serde(default)]
+	pub security:      SecuritySettings,
 	/// Irreversible export-boundary policy.
 	#[serde(default)]
 	pub export:        ExportSettings,
+	/// Read-only signed core release checks.
+	#[serde(default)]
+	pub updates:       UpdateSettings,
+	/// Live collaboration endpoints and participant identity.
+	#[serde(default)]
+	pub collab:        CollabSettings,
 }
 
 impl omp_settings::SettingsDomain for Settings {
@@ -571,6 +788,8 @@ impl omp_settings::SettingsDomain for Settings {
 			|| self.extensions.validate(Scope::Client).is_err()
 			|| !(0.0..=1.0).contains(&self.compaction.threshold_fraction)
 			|| self.compaction.threshold_fraction == 0.0
+			|| self.collab.relay_endpoint().is_err()
+			|| self.collab.web_endpoint().is_err()
 		{
 			return Err(omp_settings::ValidationError::DomainInvariant { domain: Self::DOMAIN });
 		}
@@ -747,6 +966,45 @@ mod tests {
 		assert_eq!(settings.runtime_durations().interrupt_grace.to_string(), "150ms");
 	}
 
+	#[test]
+	fn collab_settings_parse_camel_case_and_trim_identity() {
+		let settings: Settings = toml::from_str(
+			"[collab]\nrelayUrl = \"https://relay.example\"\nwebUrl = \
+			 \"https://collab.example\"\ndisplayName = \"  Ada  \"",
+		)
+		.expect("collab settings parse");
+		assert_eq!(
+			settings
+				.collab
+				.relay_endpoint()
+				.expect("relay")
+				.as_url()
+				.scheme(),
+			"wss"
+		);
+		assert_eq!(settings.collab.resolved_display_name().as_str(), "Ada");
+		assert!(omp_settings::SettingsDomain::validate(&settings).is_ok());
+	}
+
+	#[test]
+	fn collab_display_name_precedence_is_deterministic() {
+		assert_eq!(
+			resolve_collab_display_name(" configured ", Some("os-user")).as_str(),
+			"configured"
+		);
+		assert_eq!(resolve_collab_display_name(" ", Some(" os-user ")).as_str(), "os-user");
+		assert_eq!(resolve_collab_display_name("", None).as_str(), "anonymous");
+		assert_eq!(resolve_collab_display_name("", Some(" ")).as_str(), "anonymous");
+	}
+	#[test]
+	fn collab_insecure_endpoints_are_loopback_only() {
+		let mut settings = Settings::default();
+		settings.collab.relay_url = "ws://relay.example".to_owned();
+		assert!(omp_settings::SettingsDomain::validate(&settings).is_err());
+		settings.collab.relay_url = "ws://localhost:9070".to_owned();
+		settings.collab.web_url = "http://127.0.0.1:9071".to_owned();
+		assert!(omp_settings::SettingsDomain::validate(&settings).is_ok());
+	}
 	#[test]
 	fn corrupt_settings_are_quarantined_with_diagnostics() {
 		let data_dir = tempfile::tempdir().expect("create temporary data directory");

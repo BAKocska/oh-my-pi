@@ -3,7 +3,7 @@
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::{
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	fs::{self, File},
 	io::{self, Cursor, Read, Write},
 	ops::ControlFlow,
@@ -76,7 +76,8 @@ pub enum WorkspaceOperationError {
 pub struct WorktreeMerge {
 	/// Current worktree identity and generation.
 	pub worktree:  pb::WorktreeInfo,
-	/// Content-addressed manifest-diff artifact produced by `patch` strategy.
+	/// Content-addressed manifest-diff artifact preserved for patch and branch
+	/// recovery.
 	pub artifact:  Option<BlobId>,
 	/// Internal branch metadata produced by `branch` strategy.
 	pub branch:    Option<Str>,
@@ -165,6 +166,7 @@ struct ManifestEntry {
 	hash: [u8; 32],
 }
 
+#[derive(Clone)]
 struct Manifest {
 	prefixes: Vec<Str>,
 	entries:  BTreeMap<Str, ManifestEntry>,
@@ -369,9 +371,9 @@ impl WorkspaceOperations {
 		worktree_info(&record)
 	}
 
-	/// Emits a manifest diff artifact or records internal branch metadata for a
-	/// worktree.
-	pub fn merge_worktree(
+	/// Applies a three-way manifest merge or records internal branch metadata,
+	/// always preserving a content-addressed recovery artifact.
+	pub async fn merge_worktree(
 		&self,
 		request: &pb::MergeWorktree,
 		cancel: &CancellationToken,
@@ -389,33 +391,75 @@ impl WorkspaceOperations {
 		let base = self.load_manifest(record.base.as_str())?;
 		let current = self.load_manifest(&current_snapshot.snapshot_id)?;
 		let mode = pb::MergeMode::try_from(request.mode).unwrap_or(pb::MergeMode::Unspecified);
-		let (artifact, branch) = match mode {
-			pb::MergeMode::Patch => (Some(self.write_manifest_diff(&base, &current, cancel)?), None),
-			pb::MergeMode::Branch => {
-				let branch = Str::from(format!("omp/agent/{}", record.id));
-				if !request.dry_run {
-					record.branch = Some(branch.clone());
-					fs::write(
-						self
-							.inner
-							.worktree_root
-							.join(".branches")
-							.join(record.id.as_str()),
-						current_snapshot.snapshot_id.as_bytes(),
-					)?;
-					self.write_worktree_record(&record)?;
-					self.inner.worktrees.lock().insert(key, record.clone());
-				}
-				(None, Some(branch))
-			},
-			pb::MergeMode::None | pb::MergeMode::Unspecified => (None, record.branch.clone()),
+		if matches!(mode, pb::MergeMode::None | pb::MergeMode::Unspecified) {
+			return Ok(WorktreeMerge {
+				worktree:  worktree_info(&record)?,
+				artifact:  None,
+				branch:    record.branch,
+				conflicts: Vec::new(),
+			});
+		}
+		let artifact = Some(self.write_manifest_diff(&base, &current, cancel)?);
+		let parent_snapshot = self.snapshot_at(self.inner.workspace.root(), &[], cancel)?;
+		let parent = self.load_manifest(&parent_snapshot.snapshot_id)?;
+		let (target, mut conflicts) = merge_target(&base, &parent, &current);
+		let branch = if mode == pb::MergeMode::Branch {
+			let branch = Str::from(format!("omp/agent/{}", record.id));
+			if !request.dry_run {
+				record.branch = Some(branch.clone());
+				fs::write(
+					self
+						.inner
+						.worktree_root
+						.join(".branches")
+						.join(record.id.as_str()),
+					current_snapshot.snapshot_id.as_bytes(),
+				)?;
+				self.write_worktree_record(&record)?;
+				self.inner.worktrees.lock().insert(key, record.clone());
+			}
+			Some(branch)
+		} else {
+			record.branch.clone()
 		};
-		Ok(WorktreeMerge {
-			worktree: worktree_info(&record)?,
-			artifact,
-			branch,
-			conflicts: Vec::new(),
-		})
+		if mode == pb::MergeMode::Patch && conflicts.is_empty() {
+			conflicts = self
+				.apply_merge_target(&target, &parent, request.dry_run, cancel)
+				.await?;
+		}
+		Ok(WorktreeMerge { worktree: worktree_info(&record)?, artifact, branch, conflicts })
+	}
+
+	async fn apply_merge_target(
+		&self,
+		target: &Manifest,
+		parent: &Manifest,
+		dry_run: bool,
+		cancel: &CancellationToken,
+	) -> Result<Vec<pb::WorkspaceConflict>, WorkspaceOperationError> {
+		let plans = self.plan_restore(target, parent, cancel).await?;
+		let (workspace_lease, mut conflicts) =
+			self.acquire_restore_lease(&plans, dry_run, cancel).await?;
+		if dry_run || !conflicts.is_empty() || plans.is_empty() {
+			return Ok(conflicts);
+		}
+		let Some(workspace_lease) = workspace_lease else {
+			return Err(WorkspaceOperationError::InvalidGeneration(sf!(
+				"document authority omitted an uncontested workspace lease",
+			)));
+		};
+		for plan in plans {
+			if cancel.is_cancelled() {
+				return Err(WorkspaceError::Cancelled.into());
+			}
+			let path = plan.path().clone();
+			if let Err(failure) = self.apply_restore_plan(plan, cancel).await {
+				conflicts.push(workspace_conflict(path, failure.reason, None));
+				break;
+			}
+		}
+		drop(workspace_lease);
+		Ok(conflicts)
 	}
 
 	fn snapshot_at(
@@ -820,6 +864,43 @@ impl WorkspaceOperations {
 		}
 		Ok(())
 	}
+}
+
+fn merge_target(
+	base: &Manifest,
+	parent: &Manifest,
+	child: &Manifest,
+) -> (Manifest, Vec<pb::WorkspaceConflict>) {
+	let paths = base
+		.entries
+		.keys()
+		.chain(child.entries.keys())
+		.cloned()
+		.collect::<BTreeSet<_>>();
+	let mut target = parent.clone();
+	let mut conflicts = Vec::new();
+	for path in paths {
+		let baseline = base.entries.get(&path);
+		let isolated = child.entries.get(&path);
+		if isolated == baseline {
+			continue;
+		}
+		let current = parent.entries.get(&path);
+		if current != baseline && current != isolated {
+			conflicts.push(workspace_conflict(
+				path,
+				pb::ConflictReason::PathChanged,
+				Some(sf!("parent and isolated workspace both changed relative to baseline")),
+			));
+			continue;
+		}
+		if let Some(entry) = isolated {
+			target.entries.insert(path, entry.clone());
+		} else {
+			target.entries.remove(&path);
+		}
+	}
+	(target, conflicts)
 }
 
 fn load_worktree_records(

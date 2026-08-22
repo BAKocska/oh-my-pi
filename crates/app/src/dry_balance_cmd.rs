@@ -1,0 +1,120 @@
+//! Deterministic account-pool selection simulation and opt-in live benchmark.
+
+use std::{collections::BTreeMap, time::SystemTime};
+
+use miette::{IntoDiagnostic as _, miette};
+use omp_core::Str;
+use omp_llm_catalog::{ModelKey, snapshot::Catalog};
+use omp_llm_inference::account::{
+	AccountPool, AccountSelectionRequest, AccountStateStore, RotationPolicy,
+};
+use serde_json::json;
+
+use crate::cli::{BenchArgs, DryBalanceArgs};
+
+/// Simulates the canonical account pool and optionally benchmarks through its
+/// normal credential/receipt path.
+pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
+	if args.count == 0 || args.concurrency == 0 {
+		return Err(miette!("--count and --concurrency must be greater than zero"));
+	}
+	let data_dir = crate::cli::data_dir(args.data_dir.clone())?;
+	let catalog = Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
+	let model = args
+		.model
+		.as_ref()
+		.map_or_else(|| catalog.models().first(), |key| catalog.model(&ModelKey::from(key.clone())))
+		.ok_or_else(|| miette!("model catalog is empty or the selected model is unknown"))?;
+	let route = model
+		.routes
+		.first()
+		.cloned()
+		.ok_or_else(|| miette!("selected model has no eligible route"))?;
+	let provider = catalog
+		.route(&route)
+		.map(|route| route.provider.clone())
+		.ok_or_else(|| miette!("selected model route is absent from the catalog"))?;
+	let pool = AccountPool::with_store(std::sync::Arc::new(
+		AccountStateStore::open(data_dir.join("credentials.db")).into_diagnostic()?,
+	))
+	.into_diagnostic()?;
+	let accounts = pool
+		.accounts()
+		.into_iter()
+		.filter(|account| account.provider == provider && account.routes.contains(&route))
+		.collect::<Vec<_>>();
+	if accounts.is_empty() {
+		return Err(miette!("provider `{}` has no eligible stored accounts", provider.as_str()));
+	}
+	let mut counts = BTreeMap::<String, u32>::new();
+	let mut receipts = Vec::with_capacity(args.count as usize);
+	for sample in 0..args.count {
+		let previous = (sample != 0).then(|| {
+			accounts[(sample as usize - 1) % accounts.len()]
+				.account
+				.clone()
+		});
+		let selection = pool
+			.select(&AccountSelectionRequest {
+				provider:           provider.clone(),
+				route:              route.clone(),
+				affinity:           None,
+				previous_account:   previous,
+				previous_principal: None,
+				rotate:             sample != 0,
+				rotation:           RotationPolicy::default(),
+				now:                SystemTime::now(),
+			})
+			.map_err(|error| miette!(error.to_string()))?;
+		*counts
+			.entry(selection.record.account.as_str().to_owned())
+			.or_default() += 1;
+		receipts.push(json!({
+			"sample": sample,
+			"account": mask(selection.record.account.as_str()),
+			"candidateCount": selection.receipt.candidates.len(),
+		}));
+	}
+	if args.json {
+		println!(
+			"{}",
+			serde_json::to_string_pretty(&json!({
+				"model": model.key,
+				"provider": provider,
+				"route": route,
+				"counts": counts.into_iter().map(|(account, count)| (mask(&account), count)).collect::<BTreeMap<_, _>>(),
+				"receipts": receipts,
+			}))
+			.into_diagnostic()?
+		);
+	} else {
+		for (account, count) in counts {
+			println!("{} {count}", mask(&account));
+		}
+	}
+	if args.bench {
+		crate::bench_cmd::run(BenchArgs {
+			model:      model.key.as_str().into(),
+			data_dir:   args.data_dir,
+			runs:       args.count,
+			max_tokens: 512,
+			prompt:     Str::new_static("Reply with the word ready."),
+			par:        args.concurrency,
+			json:       args.json,
+		})
+		.await?;
+	}
+	Ok(())
+}
+
+fn mask(value: &str) -> String {
+	let chars = value.chars().collect::<Vec<_>>();
+	if chars.len() <= 8 {
+		return "********".to_owned();
+	}
+	format!(
+		"{}…{}",
+		chars[..4].iter().collect::<String>(),
+		chars[chars.len() - 4..].iter().collect::<String>(),
+	)
+}

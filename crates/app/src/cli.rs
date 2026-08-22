@@ -315,6 +315,438 @@ pub struct OmpCli {
 }
 
 /// Production application commands.
+/// Statistics dashboard and JSON query options.
+#[derive(Clone, Debug, Args)]
+pub struct StatsArgs {
+	/// Override the profile state directory containing `sessions.sqlite3`.
+	#[arg(long, value_name = "PATH")]
+	pub state_dir: Option<PathBuf>,
+	/// Statistics operation; omitted prints a concise 30-day summary.
+	#[command(subcommand)]
+	pub command:   Option<StatsCommand>,
+}
+
+/// Statistics service operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum StatsCommand {
+	/// Print a concise summary from the authoritative write-time index.
+	Summary {
+		/// Time range: 24h, 7d, 30d, 90d, or all.
+		#[arg(long)]
+		range: Option<String>,
+	},
+	/// Serve the embedded read-only dashboard and versioned REST API.
+	Serve {
+		/// IP address to bind; non-loopback addresses require authentication.
+		#[arg(long, default_value = "127.0.0.1")]
+		host:       String,
+		/// TCP port; zero requests an ephemeral port.
+		#[arg(long, default_value_t = crate::stats_server::DEFAULT_PORT)]
+		port:       u16,
+		/// Bearer token required for non-loopback service access.
+		#[arg(long)]
+		auth_token: Option<String>,
+		/// Do not open the dashboard in the default browser.
+		#[arg(long)]
+		no_open:    bool,
+	},
+	/// Print the API overview envelope as JSON.
+	Json {
+		/// Time range: 24h, 7d, 30d, 90d, or all.
+		#[arg(long, default_value = "30d")]
+		range: String,
+	},
+	/// Serialize a manual write-time index synchronization checkpoint.
+	Sync,
+}
+
+/// Lock-safe storage maintenance options.
+#[derive(Clone, Debug, Args)]
+pub struct GcArgs {
+	/// Override the profile data directory.
+	#[arg(long, value_name = "PATH")]
+	pub data_dir:                Option<PathBuf>,
+	/// Override the session-journal directory.
+	#[arg(long, value_name = "PATH")]
+	pub sessions_dir:            Option<PathBuf>,
+	/// Override the authoritative sessions index.
+	#[arg(long, value_name = "SQLITE")]
+	pub index:                   Option<PathBuf>,
+	/// Apply destructive operations; omission is a dry run.
+	#[arg(long)]
+	pub apply:                   bool,
+	/// Gzip cold journals and move their artifact directories.
+	#[arg(long)]
+	pub archive:                 bool,
+	/// Minimum inactive age in days for cold archives.
+	#[arg(long, default_value_t = 30)]
+	pub cold_archive_after_days: u64,
+	/// Protect this many newest sessions globally.
+	#[arg(long, default_value_t = 20)]
+	pub retain_newest_global:    usize,
+	/// Protect this many newest sessions per working directory.
+	#[arg(long, default_value_t = 3)]
+	pub retain_newest_per_cwd:   usize,
+	/// Blob put-before-journal grace period.
+	#[arg(long, default_value_t = 300)]
+	pub min_age_seconds:         u64,
+	/// Truncate SQLite WAL files after maintenance.
+	#[arg(long)]
+	pub wal:                     bool,
+	/// Emit machine-readable JSON.
+	#[arg(long)]
+	pub json:                    bool,
+}
+
+/// Durable quota-history options.
+#[derive(Clone, Debug, Args)]
+pub struct UsageArgs {
+	/// Override the profile data directory containing `credentials.db`.
+	#[arg(long, value_name = "PATH")]
+	pub data_dir:   Option<PathBuf>,
+	/// Restrict snapshots to one provider.
+	#[arg(long)]
+	pub provider:   Option<Str>,
+	/// Restrict snapshots to one opaque account identifier.
+	#[arg(long)]
+	pub account:    Option<Str>,
+	/// Explicitly invalidate matching durable usage observations.
+	#[arg(long)]
+	pub invalidate: bool,
+	/// Emit machine-readable JSON.
+	#[arg(long)]
+	pub json:       bool,
+}
+
+/// Normal inference benchmark options.
+#[derive(Clone, Debug, Args)]
+pub struct BenchArgs {
+	/// Model key routed through the production inference registry.
+	pub model:      Str,
+	/// Override the profile data directory containing credentials.
+	#[arg(long, value_name = "PATH")]
+	pub data_dir:   Option<PathBuf>,
+	/// Number of measured requests.
+	#[arg(long, default_value_t = 10)]
+	pub runs:       u32,
+	/// Maximum output tokens per request.
+	#[arg(long, default_value_t = 512)]
+	pub max_tokens: u64,
+	/// Benchmark prompt.
+	#[arg(long, default_value = "Reply with one concise sentence about deterministic systems.")]
+	pub prompt:     Str,
+	/// Maximum concurrent requests.
+	#[arg(long, default_value_t = 4)]
+	pub par:        usize,
+	/// Emit machine-readable JSON.
+	#[arg(long)]
+	pub json:       bool,
+}
+
+/// Deterministic OAuth account-pool simulation options.
+#[derive(Clone, Debug, Args)]
+pub struct DryBalanceArgs {
+	/// Optional model selector; defaults to the first catalog model.
+	pub model:       Option<Str>,
+	/// Override the profile data directory containing credentials.
+	#[arg(long, value_name = "PATH")]
+	pub data_dir:    Option<PathBuf>,
+	/// Number of selection samples.
+	#[arg(long, default_value_t = 100)]
+	pub count:       u32,
+	/// Maximum live benchmark concurrency.
+	#[arg(long, default_value_t = 32)]
+	pub concurrency: usize,
+	/// Send live completion requests after the simulation.
+	#[arg(long)]
+	pub bench:       bool,
+	/// Emit machine-readable JSON.
+	#[arg(long)]
+	pub json:        bool,
+}
+
+/// Verified local tiny-model operator options.
+#[derive(Clone, Debug, Args)]
+pub struct TinyModelsArgs {
+	/// Override the verified local-model cache root.
+	#[arg(long, value_name = "PATH")]
+	pub cache_dir: Option<PathBuf>,
+	/// Tiny-model operation; omitted lists the catalog.
+	#[command(subcommand)]
+	pub command:   Option<TinyModelsCommand>,
+}
+
+/// Tiny-model catalog operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum TinyModelsCommand {
+	/// List declared title and Mnemopi-only assets.
+	List {
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json: bool,
+	},
+	/// Verify one model or every declared model.
+	Verify {
+		/// Stable model identifier.
+		model: Option<String>,
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json:  bool,
+	},
+	/// Download one model or `all`, verify it, and atomically install it.
+	Download {
+		/// Stable model identifier or `all`.
+		#[arg(default_value = "all")]
+		model: String,
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json:  bool,
+		/// Suppress transient progress.
+		#[arg(long)]
+		quiet: bool,
+	},
+}
+
+/// Standalone onboarding and local-runtime setup options.
+#[derive(Clone, Debug, Args)]
+pub struct SetupArgs {
+	/// Override the profile data directory.
+	#[arg(long, value_name = "PATH")]
+	pub data_dir: Option<PathBuf>,
+	/// Setup operation; omitted runs onboarding.
+	#[command(subcommand)]
+	pub command:  Option<SetupCommand>,
+}
+
+/// Standalone setup operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum SetupCommand {
+	/// Run provider/model onboarding.
+	Wizard,
+	/// Validate the supervised embedded Python runtime.
+	Python {
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json: bool,
+	},
+	/// Inspect or download local STT/TTS assets.
+	Speech {
+		/// STT preset (`fast`, `balanced`, `turbo`, `parakeet`) or `kokoro`.
+		model: Option<String>,
+		/// Check every speech artifact without downloading.
+		#[arg(long, short = 'c')]
+		check: bool,
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json:  bool,
+		/// Suppress transient progress.
+		#[arg(long)]
+		quiet: bool,
+	},
+}
+
+/// Standalone Kokoro synthesis options.
+#[derive(Clone, Debug, Args)]
+pub struct SayArgs {
+	/// Text to synthesize.
+	pub text:            Str,
+	/// Override the profile data directory containing model assets.
+	#[arg(long, value_name = "PATH")]
+	pub data_dir:        Option<PathBuf>,
+	/// Kokoro voice identifier.
+	#[arg(long)]
+	pub voice:           Option<String>,
+	/// Speaking-rate multiplier.
+	#[arg(long, default_value_t = 1.0)]
+	pub speed:           f32,
+	/// Maximum approximate characters per synthesis pass.
+	#[arg(long, default_value_t = 400)]
+	pub max_chunk_chars: usize,
+	/// Remove decoder noise for repeatable output.
+	#[arg(long)]
+	pub deterministic:   bool,
+	/// Atomically write PCM16 WAV instead of playing through the default
+	/// speaker.
+	#[arg(long, short = 'o', value_name = "WAV")]
+	pub output:          Option<PathBuf>,
+}
+
+/// Standalone native grep options.
+#[derive(Clone, Debug, Args)]
+pub struct GrepArgs {
+	/// Rust/PCRE2 regular expression.
+	pub pattern:      Str,
+	/// File or directory to search.
+	#[arg(default_value = ".")]
+	pub path:         PathBuf,
+	/// Recursive file glob.
+	#[arg(short = 'g', long)]
+	pub glob:         Option<Str>,
+	/// Maximum returned matches.
+	#[arg(short = 'l', long, default_value_t = 20)]
+	pub limit:        u32,
+	/// Context lines before and after each match.
+	#[arg(short = 'C', long, default_value_t = 2)]
+	pub context:      u32,
+	/// Return matching file names only.
+	#[arg(short = 'f', long, conflicts_with = "count")]
+	pub files:        bool,
+	/// Return match counts per file.
+	#[arg(short = 'c', long)]
+	pub count:        bool,
+	/// Match without regard to ASCII case.
+	#[arg(short = 'i', long)]
+	pub ignore_case:  bool,
+	/// Enable multiline matching.
+	#[arg(long)]
+	pub multiline:    bool,
+	/// Include dot-prefixed paths.
+	#[arg(long, default_value_t = true)]
+	pub hidden:       bool,
+	/// Ignore repository ignore files.
+	#[arg(long)]
+	pub no_gitignore: bool,
+	/// Operation deadline in milliseconds.
+	#[arg(long)]
+	pub timeout_ms:   Option<u32>,
+	/// Emit machine-readable JSON.
+	#[arg(long)]
+	pub json:         bool,
+}
+
+/// Stream category used by standalone TTSR matching.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum TtsrSourceArg {
+	/// Assistant visible text.
+	#[default]
+	Text,
+	/// Assistant reasoning text.
+	Thinking,
+	/// Tool snapshot text.
+	Tool,
+}
+
+/// Standalone TTSR options.
+#[derive(Clone, Debug, Args)]
+pub struct TtsrArgs {
+	/// Workspace root used for rule discovery.
+	#[arg(long, value_name = "PATH")]
+	pub root:    Option<PathBuf>,
+	/// TTSR operation; omitted lists active rules.
+	#[command(subcommand)]
+	pub command: Option<TtsrCommand>,
+}
+
+/// TTSR inspection and matching operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum TtsrCommand {
+	/// List active rules.
+	List {
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json: bool,
+	},
+	/// Test a snippet, file, or standard input.
+	Test {
+		/// Inline snippet; omit with `--file -` to read standard input.
+		snippet: Option<String>,
+		/// File to inspect, or `-` for standard input.
+		#[arg(long, short = 'f')]
+		file:    Option<PathBuf>,
+		/// Restrict reported matches to one rule name.
+		#[arg(long, short = 'r')]
+		rule:    Option<String>,
+		/// Stream category.
+		#[arg(long, value_enum, default_value_t)]
+		source:  TtsrSourceArg,
+		/// Tool name for tool-stream matching.
+		#[arg(long, default_value = "edit")]
+		tool:    String,
+		/// Candidate path used by glob and AST-language matching.
+		#[arg(long, short = 'p')]
+		path:    Option<String>,
+		/// Include matched reminder content.
+		#[arg(long, short = 'v')]
+		verbose: bool,
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json:    bool,
+	},
+	/// Scan a directory with native walker ignore semantics.
+	Scan {
+		/// Directory to scan.
+		#[arg(default_value = ".")]
+		directory:    PathBuf,
+		/// Restrict reported matches to one rule name.
+		#[arg(long, short = 'r')]
+		rule:         Option<String>,
+		/// Ignore repository ignore files.
+		#[arg(long)]
+		no_gitignore: bool,
+		/// Maximum bytes read from any candidate.
+		#[arg(long, default_value_t = 4 * 1024 * 1024)]
+		max_bytes:    u64,
+		/// Emit machine-readable JSON.
+		#[arg(long)]
+		json:         bool,
+	},
+}
+
+/// Core updater options.
+#[derive(Clone, Debug, Args)]
+pub struct UpdateArgs {
+	/// Only report whether a newer signed release is available.
+	#[arg(long)]
+	pub check:     bool,
+	/// Reinstall even when the selected release matches this binary.
+	#[arg(long)]
+	pub force:     bool,
+	/// Upgrade extensions instead; equivalent to `omp ext upgrade`.
+	#[arg(long)]
+	pub plugins:   bool,
+	/// Signed package-index snapshot. Defaults to `OMP_RELEASE_INDEX`.
+	#[arg(long, value_name = "JSON")]
+	pub index:     Option<PathBuf>,
+	/// Ed25519 index authority key file. Defaults to `OMP_RELEASE_INDEX_KEY`.
+	#[arg(long, value_name = "KEY")]
+	pub index_key: Option<PathBuf>,
+}
+
+/// Read-only signed package registry options.
+#[derive(Clone, Debug, Args)]
+pub struct RegistryArgs {
+	/// Signed package-index snapshot. Defaults to `OMP_RELEASE_INDEX`.
+	#[arg(long, value_name = "JSON")]
+	pub index:     Option<PathBuf>,
+	/// Ed25519 index authority key file. Defaults to `OMP_RELEASE_INDEX_KEY`.
+	#[arg(long, value_name = "KEY")]
+	pub index_key: Option<PathBuf>,
+	/// Package identity to inspect.
+	#[arg(long, default_value = "omp-cli")]
+	pub package:   Str,
+	/// Emit machine-readable JSON.
+	#[arg(long)]
+	pub json:      bool,
+}
+
+/// Encrypted transcript sharing options.
+#[derive(Clone, Debug, Args)]
+pub struct ShareArgs {
+	/// Durable session journal. Omit to choose from the native session index.
+	#[arg(value_name = "SESSION_JSONL")]
+	pub journal:   Option<PathBuf>,
+	/// HTTPS blob-store endpoint accepting the sealed envelope.
+	#[arg(long, value_name = "URL")]
+	pub server:    Str,
+	/// Browser viewer base URL.
+	#[arg(long, value_name = "URL", default_value = "https://omp.dev/share")]
+	pub viewer:    Str,
+	/// Disable irreversible secret redaction.
+	#[arg(long)]
+	pub no_redact: bool,
+}
+
+/// Production application commands.
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
 	/// Start the inference gateway on a platform-native local endpoint.
@@ -338,9 +770,6 @@ pub enum Command {
 	Infer(InferArgs),
 	/// Manage provider credentials.
 	Auth(AuthArgs),
-	/// Import a Claude Code or Codex JSONL session into transcript-v4 storage.
-	#[command(name = "import-session")]
-	ImportSession(ImportSessionArgs),
 	/// Manage generated model-catalog data.
 	Catalog(CatalogArgs),
 	/// Run hardware-accelerated local inference.
@@ -349,11 +778,39 @@ pub enum Command {
 	Ext(crate::ext_cli::ExtArgs),
 	/// Inspect or update the schema-validated application configuration.
 	Config(ConfigArgs),
+	/// Check or install a signed native OMP release.
+	Update(UpdateArgs),
+	/// Inspect the signed native package registry and platform assets.
+	Registry(RegistryArgs),
+	/// Redact, encrypt, and upload a durable transcript projection.
+	Share(ShareArgs),
 	/// Inspect models from the validated embedded catalog.
 	#[command(alias = "model")]
 	Models(ModelsArgs),
 	/// Inspect or clear Environment-owned worktrees.
 	Worktree(WorktreeArgs),
+	/// Inspect usage statistics or serve the embedded dashboard.
+	Stats(StatsArgs),
+	/// Inspect or apply lock-safe session and blob maintenance.
+	Gc(GcArgs),
+	/// Inspect or invalidate durable provider quota observations.
+	Usage(UsageArgs),
+	/// Benchmark model TTFT, throughput, concurrency, and cold/warm cache pairs.
+	Bench(BenchArgs),
+	/// Simulate account selection and optionally run a live balance benchmark.
+	#[command(name = "dry-balance")]
+	DryBalance(DryBalanceArgs),
+	/// Manage verified local title and Mnemopi assets.
+	#[command(name = "tiny-models")]
+	TinyModels(TinyModelsArgs),
+	/// Run onboarding, Python checks, or speech asset setup.
+	Setup(SetupArgs),
+	/// Synthesize text with local Kokoro and play or export it.
+	Say(SayArgs),
+	/// Run the native grep engine as a standalone operator.
+	Grep(GrepArgs),
+	/// Inspect and test active Time-Traveling Stream Rules.
+	Ttsr(TtsrArgs),
 	/// Generate a static shell completion script.
 	Completions {
 		/// Target shell.
@@ -374,6 +831,9 @@ pub enum Command {
 	/// backend lands.
 	#[command(name = "auth-broker")]
 	AuthBroker(AuthBrokerArgs),
+	/// Operate the credential-injecting inference gateway.
+	#[command(name = "auth-gateway")]
+	AuthGateway(AuthGatewayArgs),
 }
 
 /// Shell completion target.
@@ -395,25 +855,6 @@ impl From<CompletionShell> for Shell {
 			CompletionShell::Fish => Self::Fish,
 		}
 	}
-}
-
-/// Foreign transcript import options.
-#[derive(Clone, Debug, Args)]
-pub struct ImportSessionArgs {
-	/// Claude Code or Codex JSONL file.
-	pub path:   PathBuf,
-	/// Source transcript dialect.
-	#[arg(long, value_enum)]
-	pub format: ImportSessionFormat,
-}
-
-/// Foreign transcript dialect selected at the CLI boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum ImportSessionFormat {
-	/// Claude Code session JSONL.
-	ClaudeCode,
-	/// Codex rollout JSONL.
-	Codex,
 }
 
 /// Inspect and prune Environment-owned isolated worktrees.
@@ -471,13 +912,26 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "acp", aliases: &[] },
 	CommandSpec { name: "auth", aliases: &[] },
 	CommandSpec { name: "auth-broker", aliases: &[] },
+	CommandSpec { name: "auth-gateway", aliases: &[] },
 	CommandSpec { name: "catalog", aliases: &[] },
 	CommandSpec { name: "local", aliases: &[] },
 	CommandSpec { name: "ext", aliases: &[] },
 	CommandSpec { name: "config", aliases: &[] },
+	CommandSpec { name: "update", aliases: &[] },
+	CommandSpec { name: "registry", aliases: &[] },
+	CommandSpec { name: "share", aliases: &[] },
 	CommandSpec { name: "models", aliases: &["model"] },
-	CommandSpec { name: "import-session", aliases: &[] },
 	CommandSpec { name: "worktree", aliases: &[] },
+	CommandSpec { name: "stats", aliases: &[] },
+	CommandSpec { name: "gc", aliases: &[] },
+	CommandSpec { name: "usage", aliases: &[] },
+	CommandSpec { name: "bench", aliases: &[] },
+	CommandSpec { name: "dry-balance", aliases: &[] },
+	CommandSpec { name: "tiny-models", aliases: &[] },
+	CommandSpec { name: "setup", aliases: &[] },
+	CommandSpec { name: "say", aliases: &[] },
+	CommandSpec { name: "grep", aliases: &[] },
+	CommandSpec { name: "ttsr", aliases: &[] },
 	CommandSpec { name: "completions", aliases: &[] },
 	CommandSpec { name: "__complete", aliases: &[] },
 ];
@@ -1050,6 +1504,14 @@ pub enum McpConfigCommand {
 /// Schema-validated settings operations.
 #[derive(Clone, Debug, Subcommand)]
 pub enum ConfigCommand {
+	/// Initialize canonical XDG roots and migrate recognized legacy storage
+	/// without replacing existing destinations.
+	#[command(name = "init-xdg")]
+	InitXdg {
+		/// Emit a machine-readable migration report.
+		#[arg(long)]
+		json: bool,
+	},
 	/// List schema keys, types, and effective values.
 	List {
 		/// Emit structured JSON.
@@ -1138,22 +1600,32 @@ pub enum ModelsCommand {
 	Refresh,
 }
 
-/// Auth-broker command tree retained for a future broker backend.
+/// Combined provider/MCP credential-broker command tree.
 #[derive(Clone, Debug, Args)]
 pub struct AuthBrokerArgs {
+	/// Override the profile data directory containing broker state.
+	#[arg(long, value_name = "PATH")]
+	pub data_dir: Option<PathBuf>,
 	/// Broker operation.
 	#[command(subcommand)]
-	pub command: AuthBrokerCommand,
+	pub command:  AuthBrokerCommand,
 }
 
-/// Named broker operations that fail structurally when no broker backend
-/// exists.
+/// Combined provider/MCP credential-broker operations.
 #[derive(Clone, Debug, Subcommand)]
 pub enum AuthBrokerCommand {
-	/// Start the local broker service.
-	Serve,
-	/// Print or rotate the broker token.
-	Token,
+	/// Start the owner-local broker service.
+	Serve {
+		/// Platform-local socket or named-pipe endpoint.
+		#[arg(long, value_name = "LOCAL_ENDPOINT")]
+		endpoint: LocalEndpoint,
+	},
+	/// Print or rotate the owner-only broker token.
+	Token {
+		/// Replace the current bearer token.
+		#[arg(long)]
+		regenerate: bool,
+	},
 	/// Begin OAuth login for one provider.
 	Login {
 		/// Provider identifier.
@@ -1171,10 +1643,57 @@ pub enum AuthBrokerCommand {
 		/// Credential export path.
 		path: PathBuf,
 	},
-	/// Migrate local credentials to the broker.
-	Migrate,
+	/// Apply store migrations and rotate every credential under the active key.
+	Migrate {
+		/// Report the number of credentials that would be re-encrypted.
+		#[arg(long)]
+		dry_run: bool,
+	},
 	/// Inspect broker health.
 	Status,
+}
+
+/// Credential-injecting inference gateway options.
+#[derive(Clone, Debug, Args)]
+pub struct AuthGatewayArgs {
+	/// Override the profile data directory containing gateway state.
+	#[arg(long, value_name = "PATH")]
+	pub data_dir: Option<PathBuf>,
+	/// Gateway operation.
+	#[command(subcommand)]
+	pub command:  AuthGatewayCommand,
+}
+
+/// Credential-injecting gateway operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum AuthGatewayCommand {
+	/// Start the gateway over an owner-local socket or named pipe.
+	Serve {
+		/// Platform-local socket or named-pipe endpoint.
+		#[arg(long, value_name = "LOCAL_ENDPOINT")]
+		endpoint: LocalEndpoint,
+	},
+	/// Print or rotate the gateway bearer token.
+	Token {
+		/// Replace the current bearer token.
+		#[arg(long)]
+		regenerate: bool,
+	},
+	/// Query the versioned gateway health handshake.
+	Status {
+		/// Platform-local socket or named-pipe endpoint.
+		#[arg(long, value_name = "LOCAL_ENDPOINT")]
+		endpoint: LocalEndpoint,
+	},
+	/// Check gateway health, optionally failing on an unavailable endpoint.
+	Check {
+		/// Platform-local socket or named-pipe endpoint.
+		#[arg(long, value_name = "LOCAL_ENDPOINT")]
+		endpoint: LocalEndpoint,
+		/// Return an error when the gateway is unhealthy.
+		#[arg(long)]
+		strict:   bool,
+	},
 }
 
 /// Model-catalog command tree.
@@ -1244,14 +1763,27 @@ enum DispatchTarget {
 	Acp,
 	Infer,
 	Auth,
-	ImportSession,
 	CatalogImport,
 	LocalInfer,
 	Ext,
 	Config,
+	Update,
+	Registry,
+	Share,
 	Models,
 	AuthBroker,
+	AuthGateway,
 	Worktree,
+	Stats,
+	Gc,
+	Usage,
+	Bench,
+	DryBalance,
+	TinyModels,
+	Setup,
+	Say,
+	Grep,
+	Ttsr,
 	Completions,
 	Complete,
 }
@@ -1268,7 +1800,6 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Envd(_)) => DispatchTarget::Envd,
 		Some(Command::Infer(_)) => DispatchTarget::Infer,
 		Some(Command::Auth(_)) => DispatchTarget::Auth,
-		Some(Command::ImportSession(_)) => DispatchTarget::ImportSession,
 		Some(Command::Catalog(CatalogArgs { command: CatalogCommand::Import(_) })) => {
 			DispatchTarget::CatalogImport
 		},
@@ -1277,11 +1808,25 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		},
 		Some(Command::Ext(_)) => DispatchTarget::Ext,
 		Some(Command::Config(_)) => DispatchTarget::Config,
+		Some(Command::Update(_)) => DispatchTarget::Update,
+		Some(Command::Registry(_)) => DispatchTarget::Registry,
+		Some(Command::Share(_)) => DispatchTarget::Share,
 		Some(Command::Models(_)) => DispatchTarget::Models,
 		Some(Command::Worktree(_)) => DispatchTarget::Worktree,
+		Some(Command::Stats(_)) => DispatchTarget::Stats,
+		Some(Command::Gc(_)) => DispatchTarget::Gc,
+		Some(Command::Usage(_)) => DispatchTarget::Usage,
+		Some(Command::Bench(_)) => DispatchTarget::Bench,
+		Some(Command::DryBalance(_)) => DispatchTarget::DryBalance,
+		Some(Command::TinyModels(_)) => DispatchTarget::TinyModels,
+		Some(Command::Setup(_)) => DispatchTarget::Setup,
+		Some(Command::Say(_)) => DispatchTarget::Say,
+		Some(Command::Grep(_)) => DispatchTarget::Grep,
+		Some(Command::Ttsr(_)) => DispatchTarget::Ttsr,
 		Some(Command::Completions { .. }) => DispatchTarget::Completions,
 		Some(Command::Complete { .. }) => DispatchTarget::Complete,
 		Some(Command::AuthBroker(_)) => DispatchTarget::AuthBroker,
+		Some(Command::AuthGateway(_)) => DispatchTarget::AuthGateway,
 	}
 }
 
@@ -1332,8 +1877,18 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Envd(args) => crate::envd::run(args).await,
 		Command::Chat(mut args) => {
 			let start = chat_start(&mut args);
-			crate::startup_notice::show_once(&data_dir(None)?, args.model.as_ref())
-				.into_diagnostic()?;
+			crate::startup_notice::show_once(
+				&data_dir(None)?,
+				args.model.as_ref(),
+				crate::startup_notice::Eligibility {
+					resume: args.resume.is_some()
+						|| args.continue_session.is_some()
+						|| args.fork.is_some(),
+					quiet:  false,
+					timing: false,
+				},
+			)
+			.into_diagnostic()?;
 			Box::pin(crate::chat::run(args, start)).await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
@@ -1341,31 +1896,34 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Acp(args) => crate::acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
 		Command::Auth(args) => auth(args).await,
-		Command::ImportSession(args) => crate::session_import::run(
-			&data_dir(None)?,
-			&std::env::current_dir().into_diagnostic()?,
-			&args,
-		),
 		Command::Catalog(CatalogArgs { command: CatalogCommand::Import(args) }) => {
 			catalog_import(&args)
 		},
 		Command::Local(LocalArgs { command: LocalCommand::Infer(args) }) => local_infer(args).await,
 		Command::Ext(args) => crate::ext_cli::run(args).await,
 		Command::Config(args) => crate::config_cmd::run(&data_dir(None)?, &args.command),
-		Command::Models(args) => crate::models_cmd::run(&args),
+		Command::Update(args) => crate::update_cmd::run(args).await,
+		Command::Registry(args) => crate::update_cmd::registry(args),
+		Command::Share(args) => crate::share_cmd::run(args).await,
+		Command::Models(args) => crate::models_cmd::run(&args).await,
 		Command::Worktree(args) => crate::worktree_cmd::run(&data_dir(None)?, &args),
+		Command::Stats(args) => crate::stats_cmd::run(args).await,
+		Command::Gc(args) => crate::gc_cmd::run(args),
+		Command::Usage(args) => crate::usage_cmd::run(args),
+		Command::Bench(args) => crate::bench_cmd::run(args).await,
+		Command::DryBalance(args) => crate::dry_balance_cmd::run(args).await,
+		Command::TinyModels(args) => crate::tiny_models_cmd::run(args).await,
+		Command::Setup(args) => crate::setup_cmd::run(args).await,
+		Command::Say(args) => crate::say_cmd::run(args).await,
+		Command::Grep(args) => crate::grep_cmd::run(args),
+		Command::Ttsr(args) => crate::ttsr_cmd::run(args),
 		Command::Completions { shell } => {
 			let bytes = crate::completions::script(shell.into());
 			std::io::Write::write_all(&mut std::io::stdout(), &bytes).into_diagnostic()
 		},
 		Command::Complete { kind, prefix } => crate::complete_cmd::run(kind, &prefix),
-		Command::AuthBroker(args) => Err(
-			crate::usage_error::CliUsageError::new(format!(
-				"auth-broker {:?} is unavailable: this build has no auth-broker backend",
-				args.command,
-			))
-			.into(),
-		),
+		Command::AuthBroker(args) => crate::auth_broker_cmd::run(args).await,
+		Command::AuthGateway(args) => crate::auth_gateway_cmd::run(args).await,
 	}
 }
 
@@ -1665,12 +2223,13 @@ pub(crate) fn data_dir(explicit: Option<PathBuf>) -> miette::Result<PathBuf> {
 	if let Some(path) = explicit {
 		return Ok(path);
 	}
-	let base = if let Some(path) = std::env::var_os("OMP_DATA_DIR") {
+	let base = if let Some(path) = std::env::var_os("OMP_DATA_DIR").filter(|value| !value.is_empty())
+	{
 		PathBuf::from(path)
 	} else {
 		let home =
 			std::env::var_os("HOME").ok_or_else(|| miette!("HOME or OMP_DATA_DIR must be set"))?;
-		PathBuf::from(home).join(".local/share/omp")
+		crate::discovery::native::native_directories(&PathBuf::from(home)).data
 	};
 	Ok(crate::cli::profile_bootstrap::selected()
 		.map_or(base.clone(), |profile| base.join("profiles").join(profile)))
@@ -2157,6 +2716,10 @@ mod tests {
 	#[test]
 	fn parses_config_models_and_broker_registry_entries() {
 		assert!(matches!(
+			parse(&["omp", "config", "init-xdg", "--json"]).command,
+			Some(Command::Config(ConfigArgs { command: ConfigCommand::InitXdg { json: true } }))
+		));
+		assert!(matches!(
 			parse(&["omp", "config", "set", "default_model", "provider/model"]).command,
 			Some(Command::Config(_))
 		));
@@ -2165,21 +2728,20 @@ mod tests {
 			Some(Command::Models(_))
 		));
 		assert!(matches!(
+			parse(&["omp", "update", "--check"]).command,
+			Some(Command::Update(UpdateArgs { check: true, .. }))
+		));
+		assert!(matches!(
+			parse(&["omp", "registry", "--json"]).command,
+			Some(Command::Registry(RegistryArgs { json: true, .. }))
+		));
+		assert!(matches!(
+			parse(&["omp", "share", "--server", "https://share.example"]).command,
+			Some(Command::Share(_))
+		));
+		assert!(matches!(
 			parse(&["omp", "auth-broker", "status"]).command,
 			Some(Command::AuthBroker(_))
-		));
-	}
-
-	#[test]
-	fn parses_foreign_session_import_dialect() {
-		let command =
-			parse(&["omp", "import-session", "--format", "claude-code", "session.jsonl"]).command;
-		assert!(matches!(
-			command,
-			Some(Command::ImportSession(ImportSessionArgs {
-				format: ImportSessionFormat::ClaudeCode,
-				..
-			}))
 		));
 	}
 

@@ -3,6 +3,7 @@
 
 use std::sync::OnceLock;
 
+use futures::StreamExt as _;
 use omp_core::{Str, sf};
 use omp_proto::inference::v1 as pb;
 use omp_tools::web_search::{BackendError, SearchBackend};
@@ -56,6 +57,109 @@ impl SearchBridgeHost {
 			.inference
 			.set(SearchFacade::Remote(pb::inference_client::InferenceClient::new(channel)))
 			.map_err(|_| SearchBindingError::AlreadyBound)
+	}
+
+	/// Routes one image generation/edit through the already-bound inference
+	/// facade and returns the final artifact blobs.
+	pub(crate) async fn generate_image(
+		&self,
+		request: pb::GenerateImageRequest,
+	) -> Result<Vec<omp_proto::thread::v1::Blob>, BackendError> {
+		let inference = self.inference.get().ok_or_else(unbound_media)?;
+		match inference {
+			SearchFacade::Local(inference) => {
+				let response = <InferenceRpc as pb::inference_server::Inference>::generate_image(
+					inference,
+					tonic::Request::new(request),
+				)
+				.await
+				.map_err(media_status)?;
+				collect_images(response.into_inner()).await
+			},
+			SearchFacade::Remote(client) => {
+				let mut client = client.clone();
+				let response = client
+					.generate_image(tonic::Request::new(request))
+					.await
+					.map_err(media_status)?;
+				collect_images(response.into_inner()).await
+			},
+		}
+	}
+
+	/// Routes speech synthesis and concatenates encoded chunks in wire order.
+	pub(crate) async fn speak(&self, request: pb::SpeakRequest) -> Result<Vec<u8>, BackendError> {
+		let inference = self.inference.get().ok_or_else(unbound_media)?;
+		match inference {
+			SearchFacade::Local(inference) => {
+				let response = <InferenceRpc as pb::inference_server::Inference>::speak(
+					inference,
+					tonic::Request::new(request),
+				)
+				.await
+				.map_err(media_status)?;
+				collect_audio(response.into_inner()).await
+			},
+			SearchFacade::Remote(client) => {
+				let mut client = client.clone();
+				let response = client
+					.speak(tonic::Request::new(request))
+					.await
+					.map_err(media_status)?;
+				collect_audio(response.into_inner()).await
+			},
+		}
+	}
+}
+async fn collect_images<S>(mut events: S) -> Result<Vec<omp_proto::thread::v1::Blob>, BackendError>
+where
+	S: futures::Stream<Item = Result<pb::ImageEvent, tonic::Status>> + Unpin,
+{
+	while let Some(event) = events.next().await {
+		let event = event.map_err(media_status)?;
+		if let Some(pb::image_event::Event::Done(done)) = event.event {
+			return Ok(done.images);
+		}
+	}
+	Err(BackendError {
+		code:    sf!("media_stream_incomplete"),
+		message: sf!("image generation ended without a final artifact"),
+	})
+}
+
+async fn collect_audio<S>(mut events: S) -> Result<Vec<u8>, BackendError>
+where
+	S: futures::Stream<Item = Result<pb::SpeakEvent, tonic::Status>> + Unpin,
+{
+	let mut audio = Vec::new();
+	while let Some(event) = events.next().await {
+		match event.map_err(media_status)?.event {
+			Some(pb::speak_event::Event::Chunk(chunk)) => audio.extend_from_slice(&chunk.audio),
+			Some(pb::speak_event::Event::Done(done)) => {
+				if let Some(blob) = done.audio {
+					audio.extend_from_slice(&blob.inline);
+				}
+				return Ok(audio);
+			},
+			None => {},
+		}
+	}
+	Err(BackendError {
+		code:    sf!("media_stream_incomplete"),
+		message: sf!("speech synthesis ended without a final receipt"),
+	})
+}
+fn unbound_media() -> BackendError {
+	BackendError {
+		code:    sf!("backend_unbound"),
+		message: sf!("media inference is unavailable before inference startup completes"),
+	}
+}
+
+fn media_status(status: tonic::Status) -> BackendError {
+	BackendError {
+		code:    Str::new(status.code().to_string()),
+		message: sf!("the inference media request failed"),
 	}
 }
 

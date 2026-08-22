@@ -3,23 +3,29 @@
 use std::{
 	collections::BTreeMap,
 	fmt,
-	sync::{Arc, LazyLock},
-	time::{SystemTime, UNIX_EPOCH},
+	sync::{
+		Arc, LazyLock, Weak,
+		atomic::{AtomicBool, Ordering},
+	},
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
-use omp_agent::AgentStatus;
+use omp_agent::{AgentStatus, RegistryStatus};
 use omp_core::{Str, sf};
+use omp_proto::thread::v1::{Item, Message, Part as ThreadPart, Role, item, part};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, IncomingParams, ParamError,
-	Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, ArtifactLifetime, CommitError, Constraint, Effects, Ev,
+	ExpectedArtifact, IncomingParams, JobKind, JobMetadata, JobOwner, JobRef, ParamError, Part,
+	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use parking_lot::{Mutex, RwLock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 use crate::{
 	chat::ChatParentHost,
@@ -263,26 +269,67 @@ impl Tool for Vibe {
 	}
 }
 
+#[derive(Clone)]
+enum WorkerOutcome {
+	Done(Value),
+	Failed(Str),
+}
+
 struct Worker {
-	label:   Str,
-	handle:  Option<tokio::task::JoinHandle<Result<Value, Fault>>>,
-	result:  Option<Value>,
-	stopped: bool,
+	label:      Str,
+	tier:       WorkerTier,
+	generation: u64,
+	running:    bool,
+	stopped:    bool,
+	outcome:    Option<WorkerOutcome>,
+	notify:     Arc<Notify>,
 }
 
-/// Chat-scoped wave runner backed by the existing `omp.agents` parent-session
-/// seam.
-pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + 'static> {
-	parent:  Arc<ChatParentHost<C>>,
-	modes:   Arc<ExecutionModes>,
-	workers: Mutex<BTreeMap<Str, Worker>>,
+/// Chat-scoped wave runner backed by durable registered agent loops.
+pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + Send + 'static> {
+	parent:      Arc<ChatParentHost<C>>,
+	modes:       Arc<ExecutionModes>,
+	workers:     Arc<Mutex<BTreeMap<Str, Worker>>>,
+	seen_active: AtomicBool,
 }
 
-impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
-	/// Creates a wave runner for one interactive chat.
+impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
+	/// Creates a wave runner and its app-owned TTL/mode-exit scheduler.
 	#[must_use]
-	pub(crate) const fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<ExecutionModes>) -> Self {
-		Self { parent, modes, workers: Mutex::new(BTreeMap::new()) }
+	pub(crate) fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<ExecutionModes>) -> Arc<Self> {
+		let backend = Arc::new(Self {
+			parent,
+			modes,
+			workers: Arc::new(Mutex::new(BTreeMap::new())),
+			seen_active: AtomicBool::new(false),
+		});
+		Self::start_scheduler(Arc::downgrade(&backend));
+		backend
+	}
+
+	fn start_scheduler(backend: Weak<Self>) {
+		drop(tokio::spawn(async move {
+			let mut tick = tokio::time::interval(Duration::from_secs(1));
+			tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			loop {
+				tick.tick().await;
+				let Some(backend) = backend.upgrade() else {
+					break;
+				};
+				if backend.modes.active() == ActiveMode::Vibe {
+					backend.seen_active.store(true, Ordering::Release);
+					let ttl_ms = backend.parent.task_settings().agent_idle_ttl_ms;
+					if ttl_ms != 0 {
+						backend
+							.parent
+							.park_expired_children(Duration::from_millis(ttl_ms))
+							.await;
+					}
+				} else if backend.seen_active.swap(false, Ordering::AcqRel) {
+					backend.release_scope().await;
+				}
+			}
+		}));
 	}
 
 	fn selected_ids(&self, ids: &[Str]) -> Vec<Str> {
@@ -294,41 +341,99 @@ impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
 	}
 
 	async fn spawn(&self, wave: Vec<WaveEntry>) -> Result<Value, Fault> {
+		if self.parent.job_board().is_none() {
+			return Err(Fault::new("vibe requires the session async job manager"));
+		}
 		let mut launched = Vec::with_capacity(wave.len());
 		for entry in wave {
 			let id = Str::from(omp_core::Ulid::generate().to_string());
 			let label = entry.label.unwrap_or_else(|| id.clone());
-			let parent = Arc::clone(&self.parent);
-			let prompt = entry.brief;
-			let kind = match entry.tier {
-				WorkerTier::Fast => "sonic",
-				WorkerTier::Good => "task",
-			};
-			let child_id = id.clone();
-			let child_label = label.clone();
-			let handle = tokio::spawn(async move {
-				parent
-					.agent(
-						json!({
-							"prompt": prompt,
-							"agent": kind,
-							"label": child_label,
-							"_id": child_id,
-						}),
-						&crate::envd::eval::NoopBridgeProgress,
-					)
-					.await
-					.map_err(|error| Fault::new(error.to_string()))
-			});
 			self.workers.lock().insert(id.clone(), Worker {
-				label:   label.clone(),
-				handle:  Some(handle),
-				result:  None,
-				stopped: false,
+				label:      label.clone(),
+				tier:       entry.tier,
+				generation: 1,
+				running:    true,
+				stopped:    false,
+				outcome:    None,
+				notify:     Arc::new(Notify::new()),
 			});
+			if let Err(error) = self.launch_turn(id.clone(), label.clone(), entry.tier, entry.brief, 1)
+			{
+				self.workers.lock().remove(&id);
+				return Err(error);
+			}
 			launched.push(json!({ "id": id, "label": label, "status": "running" }));
 		}
 		Ok(json!({ "wave": launched }))
+	}
+
+	fn launch_turn(
+		&self,
+		id: Str,
+		label: Str,
+		tier: WorkerTier,
+		prompt: Str,
+		generation: u64,
+	) -> Result<(), Fault> {
+		let board = self
+			.parent
+			.job_board()
+			.ok_or_else(|| Fault::new("vibe requires the session async job manager"))?;
+		let job_id = board.next_id();
+		let job = JobRef {
+			id:       job_id.clone(),
+			owner:    JobOwner::AgentLoop { agent_id: id.clone() },
+			metadata: Arc::new(JobMetadata::running(JobKind::Task, sf!("vibe:{}", label), now_ms())),
+			artifact: ExpectedArtifact {
+				description: sf!("durable vibe worker result"),
+				media_type:  Some(sf!("application/vnd.omp.vibe-result+json")),
+				lifetime:    ArtifactLifetime::Durable,
+			},
+		};
+		if !board
+			.try_register(job)
+			.map_err(|error| Fault::new(format!("vibe job admission failed: {error}")))?
+		{
+			return Err(Fault::new("vibe job identifier collision"));
+		}
+		let parent = Arc::clone(&self.parent);
+		let workers = Arc::clone(&self.workers);
+		drop(tokio::spawn(async move {
+			let kind = match tier {
+				WorkerTier::Fast => "sonic",
+				WorkerTier::Good => "task",
+			};
+			let mut args = json!({
+				"prompt": prompt,
+				"agent": kind,
+				"stableId": id,
+				"enableLsp": true,
+			});
+			if valid_worker_name(label.as_str()) {
+				args["name"] = json!(label);
+			}
+			let result = parent
+				.agent(args, &crate::envd::eval::NoopBridgeProgress)
+				.await;
+			let outcome = match result {
+				Ok(value) => WorkerOutcome::Done(value),
+				Err(error) => WorkerOutcome::Failed(Str::from(error.to_string())),
+			};
+			let delivery = delivery_text(&id, &outcome);
+			let _ = board.settle(job_id.as_str(), system_item(delivery));
+			let mut workers = workers.lock();
+			let Some(worker) = workers.get_mut(&id) else {
+				return;
+			};
+			if worker.generation != generation {
+				return;
+			}
+			worker.running = false;
+			worker.stopped = false;
+			worker.outcome = Some(outcome);
+			worker.notify.notify_waiters();
+		}));
+		Ok(())
 	}
 
 	fn status(&self, ids: &[Str]) -> Result<Value, Fault> {
@@ -341,120 +446,210 @@ impl<C: omp_agent::TurnClient + Clone + 'static> ChatVibeBackend<C> {
 				.ok_or_else(|| Fault::new(format!("unknown vibe worker: {id}")))?;
 			let status = if worker.stopped {
 				"stopped"
-			} else if worker.result.is_some() {
-				"collected"
-			} else if worker
-				.handle
-				.as_ref()
-				.is_some_and(tokio::task::JoinHandle::is_finished)
-			{
-				"settled"
-			} else {
+			} else if worker.running {
 				"running"
+			} else {
+				match worker.outcome.as_ref() {
+					Some(WorkerOutcome::Done(_)) => "idle",
+					Some(WorkerOutcome::Failed(_)) => "failed",
+					None => "parked",
+				}
 			};
-			rows.push(json!({ "id": id, "label": worker.label, "status": status }));
+			rows.push(json!({
+				"id": id,
+				"label": worker.label,
+				"tier": worker.tier,
+				"status": status,
+				"generation": worker.generation,
+			}));
 		}
 		Ok(json!({ "workers": rows }))
 	}
 
 	async fn steer(&self, id: Str, message: Str) -> Result<Value, Fault> {
-		if !self.workers.lock().contains_key(&id) {
-			return Err(Fault::new(format!("unknown vibe worker: {id}")));
+		let running = self
+			.workers
+			.lock()
+			.get(&id)
+			.map(|worker| worker.running)
+			.ok_or_else(|| Fault::new(format!("unknown vibe worker: {id}")))?;
+		if running && self.parent.child_registry_status(id.as_str()) == Some(RegistryStatus::Running)
+		{
+			let session_id = self.parent.session_id();
+			let receipts = self
+				.parent
+				.broker()
+				.send(omp_agent::PeerMessage {
+					id: Str::from(omp_core::Ulid::generate().to_string()),
+					from: session_id.clone(),
+					to: id.clone(),
+					text: message,
+					mode: omp_agent::DeliveryMode::Steer,
+					reply_to: None,
+					sent_ms: now_ms(),
+					session_id,
+					expects_reply: false,
+				})
+				.map_err(|error| Fault::new(error.to_string()))?;
+			return Ok(json!({
+				"id": id,
+				"receipts": receipts.iter().map(ToString::to_string).collect::<Vec<_>>(),
+			}));
 		}
-		let session_id = self.parent.session_id();
-		let receipts = self
-			.parent
-			.broker()
-			.send(omp_agent::PeerMessage {
-				id: Str::from(omp_core::Ulid::generate().to_string()),
-				from: session_id.clone(),
-				to: id.clone(),
-				text: message,
-				mode: omp_agent::DeliveryMode::Steer,
-				reply_to: None,
-				sent_ms: SystemTime::now()
-					.duration_since(UNIX_EPOCH)
-					.map_or(0, |duration| duration.as_millis() as u64),
-				session_id,
-				expects_reply: false,
-			})
-			.map_err(|error| Fault::new(error.to_string()))?;
-		Ok(json!({
-			"id": id,
-			"receipts": receipts.iter().map(ToString::to_string).collect::<Vec<_>>(),
-		}))
+
+		let (label, tier, generation) = {
+			let mut workers = self.workers.lock();
+			let worker = workers
+				.get_mut(&id)
+				.ok_or_else(|| Fault::new(format!("unknown vibe worker: {id}")))?;
+			worker.generation = worker.generation.saturating_add(1);
+			worker.running = true;
+			worker.stopped = false;
+			worker.outcome = None;
+			(worker.label.clone(), worker.tier, worker.generation)
+		};
+		if let Err(error) = self.launch_turn(id.clone(), label, tier, message, generation) {
+			if let Some(worker) = self.workers.lock().get_mut(&id) {
+				worker.running = false;
+				worker.outcome = Some(WorkerOutcome::Failed(error.message.clone()));
+				worker.notify.notify_waiters();
+			}
+			return Err(error);
+		}
+		Ok(json!({ "id": id, "status": "running", "generation": generation }))
 	}
 
 	async fn collect(&self, ids: &[Str], timeout_ms: Option<u64>) -> Result<Value, Fault> {
 		let ids = self.selected_ids(ids);
 		let mut rows = Vec::with_capacity(ids.len());
 		for id in ids {
-			let (cached, mut handle) = {
-				let mut workers = self.workers.lock();
+			let notify = {
+				let workers = self.workers.lock();
 				let worker = workers
-					.get_mut(&id)
+					.get(&id)
 					.ok_or_else(|| Fault::new(format!("unknown vibe worker: {id}")))?;
-				(worker.result.clone(), worker.handle.take())
+				worker.notify.clone()
 			};
-			if let Some(result) = cached {
-				rows.push(json!({ "id": id, "result": result }));
-				continue;
-			}
-			let Some(mut task) = handle.take() else {
-				return Err(Fault::new(format!("vibe worker {id} has no collectable result")));
-			};
-			let joined = if let Some(limit) = timeout_ms {
-				if let Ok(result) =
-					tokio::time::timeout(std::time::Duration::from_millis(limit), &mut task).await
-				{
-					result
+			let notified = notify.notified();
+			let waiting = self
+				.workers
+				.lock()
+				.get(&id)
+				.is_some_and(|worker| worker.running);
+			if waiting {
+				if let Some(limit) = timeout_ms {
+					if tokio::time::timeout(Duration::from_millis(limit), notified)
+						.await
+						.is_err()
+					{
+						rows.push(json!({ "id": id, "status": "running" }));
+						continue;
+					}
 				} else {
-					self
-						.workers
-						.lock()
-						.get_mut(&id)
-						.expect("selected worker remains registered")
-						.handle = Some(task);
-					rows.push(json!({ "id": id, "status": "running" }));
-					continue;
+					notified.await;
 				}
-			} else {
-				task.await
-			};
-			let result = joined
-				.map_err(|error| Fault::new(format!("vibe worker {id} failed to join: {error}")))??;
-			if let Some(worker) = self.workers.lock().get_mut(&id) {
-				worker.result = Some(result.clone());
 			}
-			rows.push(json!({ "id": id, "result": result }));
+			let workers = self.workers.lock();
+			let worker = workers
+				.get(&id)
+				.ok_or_else(|| Fault::new(format!("unknown vibe worker: {id}")))?;
+			match worker.outcome.as_ref() {
+				Some(WorkerOutcome::Done(value)) => {
+					rows.push(json!({ "id": id, "result": value }));
+				},
+				Some(WorkerOutcome::Failed(error)) => {
+					rows.push(json!({ "id": id, "error": error }));
+				},
+				None => rows.push(json!({
+					"id": id,
+					"status": if worker.stopped { "stopped" } else { "parked" },
+				})),
+			}
 		}
 		Ok(json!({ "workers": rows }))
 	}
 
-	fn stop(&self, ids: &[Str]) -> Result<Value, Fault> {
+	async fn stop(&self, ids: &[Str]) -> Result<Value, Fault> {
 		let ids = self.selected_ids(ids);
 		let tree = self.parent.tree();
-		let mut stopped = Vec::with_capacity(ids.len());
-		let mut workers = self.workers.lock();
-		for id in ids {
+		for id in &ids {
+			let mut workers = self.workers.lock();
 			let worker = workers
-				.get_mut(&id)
+				.get_mut(id)
 				.ok_or_else(|| Fault::new(format!("unknown vibe worker: {id}")))?;
-			if let Some(task) = worker.handle.take() {
-				task.abort();
-			}
+			worker.generation = worker.generation.saturating_add(1);
+			worker.running = false;
 			worker.stopped = true;
+			worker.outcome = None;
+			worker.notify.notify_waiters();
+			drop(workers);
+			self.parent.cancel_child(id.as_str());
 			if let Some(node) = tree.node(id.as_str()) {
 				node.set_status(AgentStatus::Cancelled);
 			}
-			stopped.push(id);
 		}
-		Ok(json!({ "stopped": stopped }))
+		let release = async {
+			for id in &ids {
+				self.parent.release_child(id.as_str()).await;
+			}
+		};
+		let _ = tokio::time::timeout(Duration::from_secs(5), release).await;
+		Ok(json!({ "stopped": ids }))
+	}
+
+	async fn release_scope(&self) {
+		let ids = self.selected_ids(&[]);
+		let _ = self.stop(&ids).await;
 	}
 }
 
+fn delivery_text(id: &str, outcome: &WorkerOutcome) -> Str {
+	let (status, text) = match outcome {
+		WorkerOutcome::Done(value) => (
+			"settled",
+			value
+				.get("text")
+				.and_then(Value::as_str)
+				.map_or_else(|| value.to_string(), str::to_owned),
+		),
+		WorkerOutcome::Failed(error) => ("failed", error.to_string()),
+	};
+	let mut preview = text.chars().take(6_000).collect::<String>();
+	if text.chars().count() > 6_000 {
+		preview.push_str("\n[preview truncated]");
+	}
+	Str::from(format!("Vibe worker {id} {status}:\n{preview}\n\nFull output: agent://{id}"))
+}
+
+fn valid_worker_name(name: &str) -> bool {
+	if name.len() > 32 {
+		return false;
+	}
+	let mut bytes = name.bytes();
+	bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+		&& bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn system_item(text: Str) -> Item {
+	Item {
+		seq:           0,
+		created_at_ms: now_ms(),
+		kind:          Some(item::Kind::Message(Message {
+			role:  i32::from(Role::System),
+			parts: vec![ThreadPart { kind: Some(part::Kind::Text(text.to_string())) }],
+		})),
+		props:         None,
+	}
+}
+
+fn now_ms() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |duration| duration.as_millis() as u64)
+}
+
 #[async_trait]
-impl<C: omp_agent::TurnClient + Clone + 'static> VibeBackend for ChatVibeBackend<C> {
+impl<C: omp_agent::TurnClient + Clone + Send + 'static> VibeBackend for ChatVibeBackend<C> {
 	async fn execute(&self, params: Params) -> Result<Value, Fault> {
 		if self.modes.active() != ActiveMode::Vibe {
 			return Err(Fault::new("vibe device requires /vibe on"));
@@ -471,17 +666,17 @@ impl<C: omp_agent::TurnClient + Clone + 'static> VibeBackend for ChatVibeBackend
 					.await
 			},
 			Operation::Collect => self.collect(&params.ids, params.timeout_ms).await,
-			Operation::Stop => self.stop(&params.ids),
+			Operation::Stop => self.stop(&params.ids).await,
 		}
 	}
 }
 
 /// Attaches the vibe device to one chat session.
-pub(crate) fn attach_chat<C: omp_agent::TurnClient + Clone + 'static>(
+pub(crate) fn attach_chat<C: omp_agent::TurnClient + Clone + Send + 'static>(
 	parent: Arc<ChatParentHost<C>>,
 	modes: Arc<ExecutionModes>,
 ) -> Attachment {
-	attach(Arc::new(ChatVibeBackend::new(parent, modes)))
+	attach(ChatVibeBackend::new(parent, modes))
 }
 
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {

@@ -40,6 +40,8 @@ const PERSONALITY_OPTIONS: &[SettingOption] = &[
 pub struct PromptSettings {
 	/// Communication style rendered into the prompt.
 	pub personality:             Personality,
+	/// Resolved user-level `PERSONALITY.md` override.
+	pub personality_override:    Option<Str>,
 	/// Surface the active provider-qualified model identifier.
 	pub include_model_in_prompt: bool,
 	/// Include bounded Environment workstation facts.
@@ -62,6 +64,7 @@ impl Default for PromptSettings {
 	fn default() -> Self {
 		Self {
 			personality:             Personality::Default,
+			personality_override:    None,
 			include_model_in_prompt: true,
 			include_workstation:     true,
 			include_workspace_tree:  false,
@@ -108,12 +111,37 @@ impl PromptSettings {
 			|| std::env::var("NULL_PROMPT").is_ok_and(|value| value.eq_ignore_ascii_case("true"));
 		self
 	}
+
+	/// Resolves file-or-inline customization and project-over-user `SYSTEM.md`
+	/// discovery before the immutable settings projection is published.
+	pub fn resolve_inputs(
+		mut self,
+		cwd: &std::path::Path,
+		home: &std::path::Path,
+	) -> Result<Self, crate::prompt_input::PromptInputError> {
+		let (custom, append) = crate::prompt_input::resolve_system_inputs(
+			cwd,
+			home,
+			self.custom_prompt.as_deref(),
+			self.append_prompt.as_deref(),
+		)?;
+		self.custom_prompt = custom;
+		self.append_prompt = append;
+		if self.personality != Personality::None {
+			self.personality_override =
+				crate::prompt_input::discover_user_prompt_file(cwd, home, "PERSONALITY.md")?;
+		} else {
+			self.personality_override = None;
+		}
+		Ok(self)
+	}
 }
 
 impl From<PromptSettings> for PromptSettingsInput {
 	fn from(settings: PromptSettings) -> Self {
 		Self {
 			personality:            settings.personality,
+			personality_override:   settings.personality_override,
 			include_model:          settings.include_model_in_prompt,
 			include_workstation:    settings.include_workstation,
 			include_workspace_tree: settings.include_workspace_tree,

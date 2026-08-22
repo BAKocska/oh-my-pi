@@ -1,6 +1,6 @@
 //! Immutable prompt-input preparation at the application composition boundary.
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use omp_agent::{
 	ContextFile, EagerTaskPolicy, HostInfoInput, Journal, ModelPromptInput, MutationPromptInput,
@@ -20,6 +20,7 @@ use crate::workspace_roots::{WorkspaceRootDiagnostic, WorkspaceRootError, Worksp
 pub mod settings;
 
 const HOST_FIELD_BYTES: u32 = 4 * 1024;
+const PROMPT_PREP_DEADLINE: Duration = Duration::from_millis(5_000);
 
 /// Immutable policy-resolved registry catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,7 +133,21 @@ impl PromptSnapshot {
 	) -> Self {
 		let registry = freeze_registry(registry, selected_tools);
 		let schemes = schemes.into();
-		let rules = rules.into();
+		let rules: Arc<[PromptNamedInput]> = rules.into();
+		let mut rules = rules.to_vec();
+		let available = |name: &str| {
+			registry.tools.iter().any(|tool| tool.name.as_str() == name)
+				|| registry
+					.devices
+					.iter()
+					.any(|device| device.name.as_str() == name)
+		};
+		if let Some(guidance) =
+			omp_agent::standing_guidance(available("manage_skill"), available("learn"))
+		{
+			rules.push(guidance);
+		}
+		let rules: Arc<[PromptNamedInput]> = rules.into();
 		let skills = skills.into();
 		workspace.model.codex_task_policy |= delegation.codex;
 		workspace.settings.render_mermaid &= ui.mermaid;
@@ -235,6 +250,94 @@ pub async fn prepare_environment_inputs(
 		.collect::<Vec<_>>()
 		.into();
 	Ok(EnvironmentPromptInputs { host: host.into(), roots: roots.roots, diagnostics })
+}
+
+/// Retrieves environment prompt facets concurrently under the shared
+/// five-second preparation deadline.
+///
+/// Timed-out requests are detached rather than aborted so Environment-owned
+/// caches may warm for the next snapshot. The current snapshot is frozen with
+/// deterministic empty fallbacks and structured diagnostics.
+pub async fn prepare_environment_inputs_bounded(
+	env: &EnvClient,
+	journal: &Journal,
+	primary: &Path,
+) -> EnvironmentPromptInputs {
+	let host_env = env.clone();
+	let roots_env = env.clone();
+	let mut host_task = tokio::spawn(async move {
+		host_env
+			.host_info(pb::HostInfoRequest {
+				wire_revision:   SCHEMA_REV,
+				max_field_bytes: HOST_FIELD_BYTES,
+			})
+			.await
+	});
+	let mut roots_task = tokio::spawn(async move {
+		roots_env
+			.workspace_roots(pb::WorkspaceRootSetRequest { wire_revision: SCHEMA_REV })
+			.await
+	});
+	let deadline = tokio::time::Instant::now() + PROMPT_PREP_DEADLINE;
+	let mut diagnostics = Vec::new();
+
+	let host = match tokio::time::timeout_at(deadline, &mut host_task).await {
+		Ok(Ok(Ok(host))) => host.into(),
+		Ok(Ok(Err(_))) | Ok(Err(_)) => {
+			warn_prep_fallback("host");
+			diagnostics.push(PromptDiagnostic::SourceUnavailable(omp_core::sf!("host")));
+			HostInfoInput::default()
+		},
+		Err(_) => {
+			warn_prep_timeout("host");
+			diagnostics.push(PromptDiagnostic::SourceUnavailable(omp_core::sf!("timeout:host")));
+			HostInfoInput::default()
+		},
+	};
+	let roots = match tokio::time::timeout_at(deadline, &mut roots_task).await {
+		Ok(Ok(Ok(roots))) => match WorkspaceRootGuard::from_environment(roots)
+			.and_then(|guard| guard.snapshot(journal, primary))
+		{
+			Ok(snapshot) => {
+				diagnostics.extend(
+					snapshot
+						.diagnostics
+						.iter()
+						.cloned()
+						.map(PromptDiagnostic::WorkspaceRoot),
+				);
+				snapshot.roots
+			},
+			Err(_) => {
+				warn_prep_fallback("workspace-roots");
+				diagnostics.push(PromptDiagnostic::SourceUnavailable(omp_core::sf!("workspace-roots")));
+				Default::default()
+			},
+		},
+		Ok(Ok(Err(_))) | Ok(Err(_)) => {
+			warn_prep_fallback("workspace-roots");
+			diagnostics.push(PromptDiagnostic::SourceUnavailable(omp_core::sf!("workspace-roots")));
+			Default::default()
+		},
+		Err(_) => {
+			warn_prep_timeout("workspace-roots");
+			diagnostics
+				.push(PromptDiagnostic::SourceUnavailable(omp_core::sf!("timeout:workspace-roots")));
+			Default::default()
+		},
+	};
+	EnvironmentPromptInputs { host, roots, diagnostics: diagnostics.into() }
+}
+
+fn warn_prep_timeout(step: &str) {
+	eprintln!(
+		"Warning: system prompt preparation step `{step}` timed out after 5000ms; using minimal \
+		 fallback."
+	);
+}
+
+fn warn_prep_fallback(step: &str) {
+	eprintln!("Warning: system prompt preparation step `{step}` failed; using minimal fallback.");
 }
 
 /// Creates the initial workspace input from already-frozen facets.

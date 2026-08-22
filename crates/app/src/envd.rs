@@ -2,17 +2,21 @@
 
 mod admission;
 pub mod blobs;
+pub mod browser_fetch;
+mod computer;
 mod direnv;
 pub mod docs;
 pub mod document_cache;
 pub(crate) mod eval;
 pub mod exec;
 pub(crate) mod exec_settings;
-mod github_url;
+mod github;
+pub(crate) mod github_url;
 pub(crate) mod host_info;
 mod http_egress;
 mod journal_runtime;
 pub(crate) mod lsp_settings;
+mod managed_skills;
 pub(crate) mod mcp;
 mod media_devices;
 pub mod policy;
@@ -26,12 +30,13 @@ mod server;
 pub mod shell_profile;
 pub(crate) mod site;
 mod ssh;
+mod tool_debug;
 mod tool_document;
 mod tool_lsp;
 mod tool_read_sources;
 mod tool_search;
 pub(crate) mod tool_settings;
-mod tool_shell;
+pub(crate) mod tool_shell;
 pub(crate) mod tool_url;
 mod tools;
 mod vault;
@@ -97,6 +102,7 @@ pub(crate) struct ProjectEnvironment {
 	pub(crate) client:   EnvClient,
 	pub(crate) registry: Arc<Registry>,
 	eval_bridge:         Arc<eval::SessionBridgeHost>,
+	reflection_bridge:   Arc<crate::memory::ReflectionBridgeHost>,
 	eval_control:        omp_tools::eval::EvalSessionControl,
 	search_bridge:       Arc<search_backend::SearchBridgeHost>,
 	github_credentials:  Arc<github_url::GithubCredentialBridge>,
@@ -325,6 +331,7 @@ impl ProjectEnvironment {
 		let server = Arc::new(server);
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();
+		let reflection_bridge = server.reflection_bridge();
 		let eval_control = server.eval_control();
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
@@ -342,6 +349,7 @@ impl ProjectEnvironment {
 			client,
 			registry,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			search_bridge,
 			github_credentials,
@@ -372,6 +380,7 @@ impl ProjectEnvironment {
 		let server = Arc::new(server);
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();
+		let reflection_bridge = server.reflection_bridge();
 		let eval_control = server.eval_control();
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
@@ -404,6 +413,7 @@ impl ProjectEnvironment {
 			client,
 			registry,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			search_bridge,
 			github_credentials,
@@ -435,6 +445,7 @@ impl ProjectEnvironment {
 		let server = Arc::new(server);
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();
+		let reflection_bridge = server.reflection_bridge();
 		let eval_control = server.eval_control();
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
@@ -462,6 +473,7 @@ impl ProjectEnvironment {
 			client,
 			registry,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			search_bridge,
 			github_credentials,
@@ -478,6 +490,7 @@ impl ProjectEnvironment {
 			Arc::new(EnvServer::open_local(root, state_dir, Registry::new(), worker_config).await?);
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();
+		let reflection_bridge = server.reflection_bridge();
 		let eval_control = server.eval_control();
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
@@ -495,6 +508,7 @@ impl ProjectEnvironment {
 			client,
 			registry,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			search_bridge,
 			github_credentials,
@@ -513,9 +527,26 @@ impl ProjectEnvironment {
 		Arc::clone(&self.registry)
 	}
 
+	/// Binds or clears the editor-owned terminal backend for this environment
+	/// composition.
+	pub(crate) fn bind_acp_exec(&self, backend: Option<Arc<dyn tool_shell::AcpExecBackend>>) {
+		self.lifecycle.server.bind_acp_exec(backend);
+	}
+
+	/// Returns the session's sole Off/Mnemopi runtime.
+
+	pub(crate) fn memory_runtime(&self) -> Arc<omp_memory::MemoryRuntime> {
+		self.lifecycle.server.memory_runtime()
+	}
+
 	#[must_use]
 	pub(crate) fn eval_bridge(&self) -> Arc<eval::SessionBridgeHost> {
 		Arc::clone(&self.eval_bridge)
+	}
+
+	/// Returns the late-bound memory reflection bridge.
+	pub(crate) fn reflection_bridge(&self) -> Arc<crate::memory::ReflectionBridgeHost> {
+		Arc::clone(&self.reflection_bridge)
 	}
 
 	#[must_use]

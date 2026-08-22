@@ -33,7 +33,7 @@ pub(crate) struct GithubCredentialBridge {
 
 impl GithubCredentialBridge {
 	#[must_use]
-	pub(super) const fn new() -> Self {
+	pub(crate) const fn new() -> Self {
 		Self { authority: OnceLock::new() }
 	}
 
@@ -44,14 +44,18 @@ impl GithubCredentialBridge {
 		self.authority.set(authority)
 	}
 
-	async fn lease(&self) -> Result<Option<CredentialLease>, Fault> {
+	pub(crate) async fn lease(&self) -> Result<Option<CredentialLease>, Fault> {
+		self.lease_for("github").await
+	}
+
+	pub(crate) async fn lease_for(&self, spec: &str) -> Result<Option<CredentialLease>, Fault> {
 		let Some(authority) = self.authority.get() else {
 			return Ok(None);
 		};
 		match authority
 			.provider_lease(CredentialNeed {
-				spec:        AuthSpecId::from(sf!("github")),
-				account:     Some(AccountId::from("github:environment")),
+				spec:        AuthSpecId::from(Str::new(spec)),
+				account:     Some(AccountId::from(sf!("{spec}:environment"))),
 				principal:   Some(PrincipalId::from("environment")),
 				valid_after: SystemTime::now(),
 			})
@@ -59,7 +63,7 @@ impl GithubCredentialBridge {
 		{
 			Ok(lease) => Ok(Some(lease)),
 			Err(CredentialError::Unavailable) => Ok(None),
-			Err(_) => Err(Fault::Source { message: sf!("GitHub credential lease failed.") }),
+			Err(_) => Err(Fault::Source { message: sf!("credential lease failed.") }),
 		}
 	}
 }
@@ -589,7 +593,7 @@ fn render_diff(text: &str, mode: &DiffMode, repo: &str, number: u64) -> Result<V
 	}
 	Ok(out.into_bytes())
 }
-fn infer_repo(root: &Path) -> Result<Str, Fault> {
+pub(super) fn infer_repo(root: &Path) -> Result<Str, Fault> {
 	let config = std::fs::read_to_string(root.join(".git/config"))
 		.map_err(|_| invalid("Cannot infer GitHub repo; use owner/repo explicitly."))?;
 	let url = config

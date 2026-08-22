@@ -19,7 +19,6 @@ static BUNDLED: LazyLock<Arc<BTreeMap<Str, AgentDefinition>>> = LazyLock::new(||
 		("sonic", SONIC, PromptAssetId::AgentTask),
 		("designer", DESIGNER, PromptAssetId::AgentDesigner),
 		("reviewer", REVIEWER, PromptAssetId::AgentReviewer),
-		("security-reviewer", SECURITY_REVIEWER, PromptAssetId::AgentSecurityReviewer),
 		("librarian", LIBRARIAN, PromptAssetId::AgentLibrarian),
 	];
 	Arc::new(
@@ -38,7 +37,7 @@ static BUNDLED: LazyLock<Arc<BTreeMap<Str, AgentDefinition>>> = LazyLock::new(||
 /// Returns the complete native catalog using project → user → extension →
 /// bundled precedence.
 #[must_use]
-pub fn discover(root: &Path) -> Arc<BTreeMap<Str, AgentDefinition>> {
+pub fn discover(root: &Path, security_enabled: bool) -> Arc<BTreeMap<Str, AgentDefinition>> {
 	let home = std::env::var_os("HOME").map(PathBuf::from);
 	let extensions = extension_roots(root, home.as_deref());
 	let declarations =
@@ -50,6 +49,16 @@ pub fn discover(root: &Path) -> Arc<BTreeMap<Str, AgentDefinition>> {
 	let mut definitions = BUNDLED.as_ref().clone();
 	for (name, definition) in discovery.definitions.into_iter().rev() {
 		definitions.insert(name, definition);
+	}
+	definitions.retain(|name, _| {
+		!name
+			.as_str()
+			.eq_ignore_ascii_case(crate::security_review::profile::PROFILE_ID)
+	});
+	if security_enabled {
+		let definition = crate::security_review::profile::definition();
+		debug_assert!(crate::security_review::profile::is_canonical(&definition));
+		definitions.insert(Str::new_static(crate::security_review::profile::PROFILE_ID), definition);
 	}
 	Arc::new(definitions)
 }
@@ -135,20 +144,6 @@ output:
 ---
 "#;
 
-const SECURITY_REVIEWER: &str = r#"---
-name: security-reviewer
-description: Read-only security specialist for evidence-backed repository vulnerability discovery
-tools: [read, grep, glob, lsp, ast_grep]
-output:
-  type: object
-  required: [coverage_summary]
-  properties:
-    coverage_summary: { type: string }
-    findings: { type: array, items: { type: object } }
-    reviewed_paths: { type: array, items: { type: string } }
----
-"#;
-
 const LIBRARIAN: &str = r#"---
 name: librarian
 description: Researches external libraries and APIs by reading source code. Returns definitive, source-verified answers.
@@ -168,3 +163,24 @@ output:
     caveats: { type: array, items: { type: string } }
 ---
 "#;
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn security_setting_solely_owns_canonical_profile_registration() {
+		let root = tempfile::tempdir().unwrap();
+		let disabled = discover(root.path(), false);
+		assert!(disabled.keys().all(|name| {
+			!name
+				.as_str()
+				.eq_ignore_ascii_case(crate::security_review::profile::PROFILE_ID)
+		}));
+
+		let enabled = discover(root.path(), true);
+		let profile = enabled
+			.get(crate::security_review::profile::PROFILE_ID)
+			.expect("enabled security reviewer");
+		assert!(crate::security_review::profile::is_canonical(profile));
+	}
+}

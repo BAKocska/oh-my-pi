@@ -31,6 +31,12 @@ impl RoomId {
 		Ok(Self(bytes))
 	}
 
+	/// Imports an exact-width room identifier decoded from an OMP link.
+	#[must_use]
+	pub const fn from_bytes(bytes: [u8; ROOM_ID_BYTES]) -> Self {
+		Self(bytes)
+	}
+
 	/// Returns the fixed-size identifier bytes.
 	#[must_use]
 	pub const fn as_bytes(&self) -> &[u8; ROOM_ID_BYTES] {

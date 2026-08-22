@@ -526,7 +526,7 @@ fn document_cache_key(
 		request.source_digest,
 		request.converter,
 		request.converter_version,
-		&serde_json::Value::Object(Default::default()),
+		&serde_json::json!({ "options_digest": request.options_digest }),
 	)
 }
 

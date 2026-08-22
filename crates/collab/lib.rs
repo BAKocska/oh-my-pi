@@ -3,7 +3,10 @@
 
 pub mod codec;
 pub mod crypto;
+pub mod guest;
+pub mod host;
 pub mod link;
+pub mod presence;
 pub mod relay;
 pub mod replication;
 

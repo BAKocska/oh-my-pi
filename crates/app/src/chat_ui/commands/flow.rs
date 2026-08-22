@@ -8,7 +8,7 @@ command!(usage, 430, "usage", [], "Show or reset durable usage", [Context], fals
 command!(stats, 440, "stats", [], "Open the local usage dashboard", [Context], false, flags("[--host HOST] [--port PORT]", ["--host", "--port"]) => |host, flags| host.stats(flags));
 command!(plan, 450, "plan", [], "Control planning mode", [Execution], false, raw("[args]", []) => |host, args| host.plan(args));
 command!(vibe, 451, "vibe", [], "Control director/worker mode", [Execution], false, raw("[on|off|status]", ["on", "off", "status"]) => |host, args| host.vibe(args));
-command!(todo, 452, "todo", [], "Inspect or update session tasks", [Session], false, raw("[subcommand]", ["show", "append", "start", "done", "drop"]) => |host, args| host.todo(args));
+command!(todo, 452, "todo", [], "Inspect or update session tasks", [Session], false, raw("[subcommand]", ["show", "edit", "copy", "export", "import",  "append", "start", "done", "drop", "rm", "help"]) => |host, args| host.todo(args));
 command!(plan_review, 460, "plan-review", [], "Review the current plan", [Execution], false, raw("[args]", []) => |host, args| host.plan_review(args));
 command!(goal, 470, "goal", ["guided-goal"], "Start or control a guided goal", [Execution], false, raw("[goal]", []) => |host, args| host.guided_goal(args));
 command!(loop_command, 480, "loop", [], "Configure bounded continuation", [Execution], false, raw("[args]", []) => |host, args| host.loop_command(args));

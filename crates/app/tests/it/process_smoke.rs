@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc};
 
 use clap::Parser as _;
 use omp_app::{
-	cli::{Command, OmpCli},
+	cli::OmpCli,
 	daemon::{open_credential_store_with_key_source, production_registry},
 };
 use omp_llm_inference::auth::{CredentialStore, HeadlessKeySource, KeyId};
@@ -61,30 +61,7 @@ fn all_executable_command_paths_parse_with_omp_names() {
 		vec!["omp", "local", "infer", "--prompt", "hello"],
 	] {
 		let parsed = OmpCli::try_parse_from(args).expect("OMP command parses");
-		match parsed.command {
-			Some(
-				Command::Serve(_)
-				| Command::Envd(_)
-				| Command::Infer(_)
-				| Command::Auth(_)
-				| Command::Catalog(_)
-				| Command::Local(_)
-				| Command::Chat(_)
-				| Command::Ext(_)
-				| Command::Print(_)
-				| Command::Config(_)
-				| Command::Models(_)
-				| Command::AuthBroker(_)
-				| Command::Rpc(_)
-				| Command::RpcUi(_)
-				| Command::Acp(_)
-				| Command::ImportSession(_)
-				| Command::Worktree(_)
-				| Command::Completions { .. }
-				| Command::Complete { .. },
-			) => {},
-			None => panic!("explicit subcommands must parse to Some"),
-		}
+		assert!(parsed.command.is_some(), "explicit subcommands must parse to Some");
 	}
 }
 

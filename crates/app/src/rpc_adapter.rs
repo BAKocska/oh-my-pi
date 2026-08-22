@@ -1083,8 +1083,12 @@ impl pb::inference_server::Inference for InferenceRpc {
 				Status::invalid_argument("SearchRequest.before must be a valid date")
 			})?);
 		}
-		let provider =
-			(!request.engine.is_empty()).then(|| ProviderId::from(request.engine.as_str()));
+		let provider_chain =
+			(!request.engine.is_empty()).then(|| configured_search_providers(request.engine.as_str()));
+		let provider = provider_chain
+			.as_ref()
+			.and_then(|providers| providers.first())
+			.cloned();
 		let timeout = if request.timeout_ms == 0 {
 			Duration::from_secs(u64::from(self.search_settings.timeout_seconds))
 		} else {
@@ -1098,13 +1102,13 @@ impl pb::inference_server::Inference for InferenceRpc {
 			.search_settings
 			.exclusions
 			.iter()
-			.map(|provider| ProviderId::from(provider.as_str()))
+			.flat_map(|provider| configured_search_providers(provider.as_str()))
 			.collect::<Vec<_>>();
 		let provider_order = self
 			.search_settings
 			.order
 			.iter()
-			.map(|provider| ProviderId::from(provider.as_str()))
+			.flat_map(|provider| configured_search_providers(provider.as_str()))
 			.filter(|provider| !excluded_providers.contains(provider))
 			.collect::<Vec<_>>();
 		let operation = SearchRequest {
@@ -1136,16 +1140,19 @@ impl pb::inference_server::Inference for InferenceRpc {
 			provider_order: provider_order.clone().into(),
 			excluded_providers: excluded_providers.into(),
 			attempt_timeout: timeout,
+			endpoint_override: self.search_settings.searxng_endpoint.clone(),
+			perplexity_responses: self.search_settings.perplexity_responses,
 			synthesize_answer: Setting::Prefer(true),
 			negotiation: NegotiationPolicy::default(),
 		};
-		let providers = provider.map_or(provider_order, |provider| vec![provider]);
+		let providers = provider_chain.unwrap_or(provider_order);
 		if providers.is_empty() {
 			return Err(Status::failed_precondition(
 				"web search provider order is empty after exclusions",
 			));
 		}
 		let explicit = operation.provider.is_some();
+		let explicit_family = explicit && providers.len() > 1;
 		let mut failures = Vec::new();
 		for (index, provider) in providers.iter().enumerate() {
 			let mut client = self.client_with_deadline(
@@ -1164,7 +1171,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 					return Ok(Response::new(search_response(answer)));
 				},
 				Err(error) => {
-					let has_next = !explicit && index + 1 < providers.len();
+					let has_next = (!explicit || explicit_family) && index + 1 < providers.len();
 					let can_fallback = has_next
 						&& error
 							.receipt()
@@ -2006,6 +2013,16 @@ fn chat_request(
 	})
 }
 
+fn configured_search_providers(name: &str) -> Vec<ProviderId> {
+	let names: &[&str] = match name {
+		"perplexity" => {
+			&["perplexity-cookie", "perplexity", "perplexity-openrouter", "perplexity-anonymous"]
+		},
+		_ => &[omp_llm_inference::search_settings::catalog_provider_name(name)],
+	};
+	names.iter().map(|name| ProviderId::from(*name)).collect()
+}
+
 fn proto_usage(usage: Usage) -> pb::Usage {
 	pb::Usage {
 		input_tokens:       usage.input_tokens,
@@ -2153,6 +2170,58 @@ fn build_turn_outcome(
 			non_message_tokens:             0,
 			history_rewrite_tokens_removed: None,
 			last_message_timestamp_ms:      None,
+			system_tokens:                  completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.system_tokens),
+			message_tokens:                 completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.message_tokens),
+			skill_tokens:                   completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.skill_tokens),
+			tool_tokens:                    completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.tool_tokens),
+			buffer_tokens:                  completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.buffer_tokens),
+			unclassified_tokens:            None,
+			window_tokens:                  completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.window_tokens),
+			slack_tokens:                   None,
+			snapcompact_savings:            completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.snapcompact_savings),
+			prompt_anchor:                  completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.prompt_anchor),
+			context_revision:               completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.context_revision),
+			compaction_epoch:               completion
+				.receipt
+				.context
+				.as_ref()
+				.and_then(|value| value.compaction_epoch),
 		}),
 		props: None,
 	}
@@ -3407,6 +3476,18 @@ mod tests {
 				non_message_tokens:             0,
 				history_rewrite_tokens_removed: None,
 				last_message_timestamp_ms:      None,
+				system_tokens:                  None,
+				message_tokens:                 None,
+				skill_tokens:                   None,
+				tool_tokens:                    None,
+				buffer_tokens:                  None,
+				unclassified_tokens:            None,
+				window_tokens:                  None,
+				slack_tokens:                   None,
+				snapcompact_savings:            None,
+				prompt_anchor:                  None,
+				context_revision:               None,
+				compaction_epoch:               None,
 			})
 		);
 	}

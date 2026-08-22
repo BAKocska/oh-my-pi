@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use omp_core::Str;
 use serde::Deserialize;
 use thiserror::Error;
+use xutf::graphemes_str;
 
 use super::manifest::CommandPayload;
 
@@ -49,6 +50,9 @@ pub enum SlashCommandError {
 	/// YAML frontmatter was malformed.
 	#[error("slash command frontmatter is malformed")]
 	Yaml(#[source] serde_yaml::Error),
+	/// YAML frontmatter was opened but not terminated.
+	#[error("slash command frontmatter is not terminated")]
+	UnterminatedFrontmatter,
 	/// Command body and frontmatter had no usable description.
 	#[error("slash command has no description")]
 	MissingDescription,
@@ -68,7 +72,7 @@ pub fn parse_markdown(
 ) -> Result<CommandPayload, SlashCommandError> {
 	let (frontmatter, body) = if let Some(rest) = markdown.strip_prefix("---\n") {
 		let Some((frontmatter, body)) = rest.split_once("\n---") else {
-			return Err(SlashCommandError::MissingDescription);
+			return Err(SlashCommandError::UnterminatedFrontmatter);
 		};
 		(
 			Some(serde_yaml::from_str::<Frontmatter>(frontmatter).map_err(SlashCommandError::Yaml)?),
@@ -88,7 +92,20 @@ pub fn parse_markdown(
 		})
 		.filter(|description| !description.as_str().is_empty())
 		.ok_or(SlashCommandError::MissingDescription)?;
+	let description = bounded_description(description.as_str());
 	Ok(CommandPayload { name, path, description, content: Str::new(body) })
+}
+
+fn bounded_description(description: &str) -> Str {
+	const MAX_GRAPHEMES: usize = 160;
+	let mut end = description.len();
+	let mut graphemes = graphemes_str(description);
+	if graphemes.by_ref().take(MAX_GRAPHEMES).count() == MAX_GRAPHEMES {
+		if let Some(extra) = graphemes.next() {
+			end = extra.as_ptr() as usize - description.as_ptr() as usize;
+		}
+	}
+	Str::new(description[..end].trim_end())
 }
 
 /// Merges complete file declarations over embedded templates. File order is

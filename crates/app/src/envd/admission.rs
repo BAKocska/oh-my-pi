@@ -107,6 +107,7 @@ impl ApprovalTier {
 				.inference
 				.as_ref()
 				.is_some_and(|effect| !effect.is_empty())
+			|| effects.desktop.as_ref().is_some_and(|effect| effect.input)
 		{
 			Self::Exec
 		} else if effects
@@ -547,7 +548,9 @@ mod tests {
 	use bytes::Bytes;
 	use omp_core::sf;
 	use omp_proto::policy::v1::{EffectEnvelope, ExecEffects};
-	use omp_tool::{DocEffects, Effects, ExecEffects as ToolExecEffects, InferenceEffects, Usd};
+	use omp_tool::{
+		DesktopEffects, DocEffects, Effects, ExecEffects as ToolExecEffects, InferenceEffects, Usd,
+	};
 
 	use super::{
 		AdmissionDecision, AdmissionGate, ApprovalMode, ApprovalPolicy, ApprovalSource, ApprovalTier,
@@ -596,6 +599,22 @@ mod tests {
 			..Effects::empty()
 		};
 
+		let desktop_read = Effects {
+			desktop: Some(DesktopEffects {
+				capture:       true,
+				accessibility: true,
+				input:         false,
+			}),
+			..Effects::empty()
+		};
+		let desktop_input = Effects {
+			desktop: Some(DesktopEffects {
+				capture:       false,
+				accessibility: false,
+				input:         true,
+			}),
+			..Effects::empty()
+		};
 		let read_decision = resolve_approval("read-1", "read", &read, ApprovalMode::AlwaysAsk, None);
 		assert_eq!(read_decision.tier, ApprovalTier::Read);
 		assert_eq!(read_decision.policy, ApprovalPolicy::Allow);
@@ -612,6 +631,8 @@ mod tests {
 		let exec_prompt = resolve_approval("eval-1", "eval", &exec, ApprovalMode::Write, None);
 		assert_eq!(exec_prompt.tier, ApprovalTier::Exec);
 		assert_eq!(exec_prompt.policy, ApprovalPolicy::Prompt);
+		assert_eq!(ApprovalTier::from_effects(&desktop_read), ApprovalTier::Read);
+		assert_eq!(ApprovalTier::from_effects(&desktop_input), ApprovalTier::Exec);
 	}
 
 	#[test]

@@ -2,9 +2,12 @@ use std::{
 	collections::BTreeMap,
 	future::{self, Future},
 	path::Path,
+	pin::Pin,
+	sync::Arc,
 	time::Duration,
 };
 
+use bytes::Bytes;
 use omp_core::{CowBytes, Str, encoding::hex, sf};
 use omp_proto::env::v1::{
 	EnvironmentDelta, ExecOutcome as EnvExecOutcome, ExecRequest, OpenSessionRequest,
@@ -25,19 +28,89 @@ use super::{
 	exec_settings::{DirenvMode, ShellProfile, ShellSettings},
 };
 
+/// Session-scoped ACP terminal execution selected ahead of local shell
+/// placement when a capable editor peer is attached.
+pub(crate) trait AcpExecBackend: Send + Sync {
+	/// Starts a foreground command and exposes its ordinary shell event stream.
+	fn run(
+		&self,
+		request: AcpExecRequest,
+	) -> Pin<Box<dyn Future<Output = Result<AcpExecRun, Fault>> + Send + '_>>;
+}
+
+/// One ACP terminal request after shell session option resolution.
+pub(crate) struct AcpExecRequest {
+	/// Shell command line to execute.
+	pub(crate) command:    Str,
+	/// Resolved local working-directory path, when one was requested.
+	pub(crate) cwd:        Option<Str>,
+	/// Resolved environment additions for the command.
+	pub(crate) env:        BTreeMap<Str, Str>,
+	/// Optional command timeout in milliseconds.
+	pub(crate) timeout_ms: Option<u64>,
+}
+
+/// ACP terminal event handle consumed through the ordinary shell resource
+/// contract.
+pub(crate) struct AcpExecRun {
+	/// Ordered execution events produced by the editor-owned terminal.
+	pub(crate) events: flume::Receiver<Result<RunEvent, Fault>>,
+	/// Cancellation handle for the editor-owned terminal.
+	pub(crate) cancel: tokio_util::sync::CancellationToken,
+}
+
+/// Late-bound ACP backend capability shared with one Environment registry.
+#[derive(Clone, Default)]
+pub(crate) struct AcpExecSlot {
+	backend: Arc<parking_lot::RwLock<Option<Arc<dyn AcpExecBackend>>>>,
+}
+
+impl AcpExecSlot {
+	/// Replaces the session capability currently available to shell calls.
+	pub(crate) fn bind(&self, backend: Option<Arc<dyn AcpExecBackend>>) {
+		*self.backend.write() = backend;
+	}
+
+	fn backend(&self) -> Option<Arc<dyn AcpExecBackend>> {
+		self.backend.read().clone()
+	}
+}
+
 /// Shell resource adapter backed by the app-owned execution host.
 #[derive(Clone)]
 pub struct ShellExecHost {
-	host:     ExecHost,
-	cwd_uri:  Str,
-	settings: ShellSettings,
+	host:         ExecHost,
+	cwd_uri:      Str,
+	settings:     ShellSettings,
+	acp:          AcpExecSlot,
+	acp_routing:  bool,
+	acp_sessions: Arc<parking_lot::Mutex<BTreeMap<Bytes, AcpSessionOptions>>>,
+}
+#[derive(Clone)]
+struct AcpSessionOptions {
+	cwd:            Option<Str>,
+	env:            BTreeMap<Str, Str>,
+	command_prefix: Str,
 }
 
 impl ShellExecHost {
 	/// Binds shell execution to the workspace root URI used for sessions and
 	/// detached processes.
-	pub(crate) const fn new(host: ExecHost, cwd_uri: Str, settings: ShellSettings) -> Self {
-		Self { host, cwd_uri, settings }
+	pub(crate) fn new(
+		host: ExecHost,
+		cwd_uri: Str,
+		settings: ShellSettings,
+		acp: AcpExecSlot,
+		acp_routing: bool,
+	) -> Self {
+		Self {
+			host,
+			cwd_uri,
+			settings,
+			acp,
+			acp_routing,
+			acp_sessions: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+		}
 	}
 }
 impl ShellExecHost {
@@ -170,6 +243,35 @@ impl ShellExecHost {
 		Ok(Str::from(uri.to_string()))
 	}
 
+	async fn acp_command_prefix(&self, unset: &[String]) -> Str {
+		let profile = self.shell_profile().await;
+		let mut prefix = String::new();
+		#[cfg(not(windows))]
+		{
+			let names = unset
+				.iter()
+				.filter(|name| valid_env_name(name))
+				.map(String::as_str)
+				.collect::<Vec<_>>();
+			if !names.is_empty() {
+				prefix.push_str("unset -v ");
+				prefix.push_str(&names.join(" "));
+				prefix.push_str("; ");
+			}
+		}
+		#[cfg(windows)]
+		for name in unset.iter().filter(|name| valid_env_name(name)) {
+			prefix.push_str("set \"");
+			prefix.push_str(name);
+			prefix.push_str("=\" && ");
+		}
+		if !profile.command_prefix.is_empty() {
+			prefix.push_str(&profile.command_prefix);
+			prefix.push(' ');
+		}
+		Str::from(prefix)
+	}
+
 	async fn environment(
 		&self,
 		cwd_uri: &str,
@@ -286,6 +388,14 @@ fn shell_word(word: &str) -> String {
 	format!("'{}'", word.replace('\'', "'\\''"))
 }
 
+fn valid_env_name(name: &str) -> bool {
+	let mut bytes = name.bytes();
+	bytes
+		.next()
+		.is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+		&& bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
 fn named_process(started: omp_proto::env::v1::ProcessStarted) -> DetachedJob {
 	let id = sf!("{}#{}", started.name, started.generation);
 	DetachedJob {
@@ -301,7 +411,7 @@ fn cwd_fault(message: impl Into<Str>) -> Fault {
 	Fault::Resource { operation: sf!("cwd"), message: message.into() }
 }
 /// Foreground shell run retaining the concrete host's process-tree guard.
-pub struct HostShellRun {
+pub(crate) struct HostShellRun {
 	host: ExecHost,
 	run:  ExecRun,
 }
@@ -330,13 +440,77 @@ impl ShellRun for HostShellRun {
 	}
 }
 
+/// Foreground run selected from the capability-advertised ACP backend or the
+/// normal Environment host.
+pub struct SelectedShellRun {
+	kind: SelectedShellRunKind,
+}
+
+enum SelectedShellRunKind {
+	Host(HostShellRun),
+	Acp(AcpExecRun),
+}
+
+impl ShellRun for SelectedShellRun {
+	async fn next_event(&mut self) -> Result<Option<RunEvent>, Fault> {
+		match &mut self.kind {
+			SelectedShellRunKind::Host(run) => run.next_event().await,
+			SelectedShellRunKind::Acp(run) => match run.events.recv_async().await {
+				Ok(event) => event.map(Some),
+				Err(_) => Ok(None),
+			},
+		}
+	}
+
+	fn cancel(&self) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
+		match &self.kind {
+			SelectedShellRunKind::Host(run) => run.run.cancel(),
+			SelectedShellRunKind::Acp(run) => run.cancel.cancel(),
+		}
+		future::ready(Ok(()))
+	}
+
+	fn detach(&self, name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
+		match &self.kind {
+			SelectedShellRunKind::Host(run) => future::ready(
+				run.host
+					.detach_exec(run.run.id(), &name)
+					.map(named_process)
+					.map_err(|error| resource_fault("detach_running", error)),
+			),
+			SelectedShellRunKind::Acp(_) => future::ready(Err(Fault::Resource {
+				operation: sf!("detach_running"),
+				message:   sf!("ACP terminal runs remain foreground-owned by the editor"),
+			})),
+		}
+	}
+}
+
 impl ShellExec for ShellExecHost {
-	type Run = HostShellRun;
+	type Run = SelectedShellRun;
 
 	async fn open_session(&self, options: SessionOptions) -> Result<Session, Fault> {
 		let cwd_uri = self.resolve_cwd(options.cwd.as_deref())?;
 		let pty = options.pty;
 		let environment = self.environment(&cwd_uri, options.env, pty).await;
+		if self.acp_routing && self.acp.backend().is_some() && !pty {
+			let cwd = url::Url::parse(&cwd_uri)
+				.ok()
+				.and_then(|uri| uri.to_file_path().ok())
+				.map(|path| Str::from(path.to_string_lossy().as_ref()));
+			let env = environment
+				.set
+				.iter()
+				.map(|(name, value)| (Str::from(name.as_str()), Str::from(value.as_str())))
+				.collect();
+			let command_prefix = self.acp_command_prefix(&environment.unset).await;
+			let id = Bytes::from(format!("acp:{}", omp_core::Ulid::generate()));
+			self
+				.acp_sessions
+				.lock()
+				.insert(id.clone(), AcpSessionOptions { cwd, env, command_prefix });
+			return Ok(Session { id });
+		}
 		let opened = self
 			.host
 			.open_session(OpenSessionRequest {
@@ -356,6 +530,9 @@ impl ShellExec for ShellExecHost {
 		&self,
 		session: &Session,
 	) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
+		if self.acp_sessions.lock().remove(&session.id).is_some() {
+			return future::ready(Ok(()));
+		}
 		future::ready(
 			self
 				.host
@@ -370,6 +547,26 @@ impl ShellExec for ShellExecHost {
 		session: &'a Session,
 		request: RunRequest,
 	) -> Result<Self::Run, Fault> {
+		let acp_options = self.acp_sessions.lock().get(&session.id).cloned();
+		if let Some(options) = acp_options {
+			let backend = self.acp.backend().ok_or_else(|| Fault::Resource {
+				operation: sf!("run"),
+				message:   sf!("ACP terminal backend disconnected"),
+			})?;
+			return backend
+				.run(AcpExecRequest {
+					command:    if options.command_prefix.is_empty() {
+						request.command
+					} else {
+						sf!("{}{}", options.command_prefix, request.command)
+					},
+					cwd:        options.cwd,
+					env:        options.env,
+					timeout_ms: request.timeout_ms,
+				})
+				.await
+				.map(|run| SelectedShellRun { kind: SelectedShellRunKind::Acp(run) });
+		}
 		let (_, run) = self
 			.host
 			.exec(
@@ -382,7 +579,9 @@ impl ShellExec for ShellExecHost {
 			)
 			.await
 			.map_err(|error| resource_fault("run", error))?;
-		Ok(HostShellRun { host: self.host.clone(), run })
+		Ok(SelectedShellRun {
+			kind: SelectedShellRunKind::Host(HostShellRun { host: self.host.clone(), run }),
+		})
 	}
 
 	async fn detach(&self, request: DetachRequest) -> Result<DetachedJob, Fault> {

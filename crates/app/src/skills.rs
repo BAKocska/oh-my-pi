@@ -4,7 +4,7 @@
 pub mod managed;
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	fs,
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -105,6 +105,8 @@ impl SkillSnapshot {
 	/// Freezes already parsed declarations, useful for custom/managed sources.
 	#[must_use]
 	pub fn from_skills(mut skills: Vec<ActiveSkill>) -> Self {
+		let mut claimed = BTreeSet::new();
+		skills.retain(|skill| claimed.insert(skill.name.clone()));
 		skills.sort_by(|left, right| {
 			left
 				.name

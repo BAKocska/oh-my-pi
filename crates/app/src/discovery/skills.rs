@@ -276,7 +276,15 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 		{
 			continue;
 		}
+		let managed_source = source.id.as_str() == crate::skills::managed::PROVIDER_ID;
 		for path in skill_files(source, &mut output.warnings) {
+			if managed_source && !managed_path_safe(&path) {
+				output.warnings.push(SkillWarning {
+					path,
+					message: Str::from("managed skill path is linked, oversized, or not a regular file"),
+				});
+				continue;
+			}
 			let canonical =
 				match contained_existing(source.contain_root.as_deref().unwrap_or(&source.root), &path)
 				{
@@ -323,6 +331,19 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 				});
 				continue;
 			}
+			let managed = managed_source;
+			if managed && !crate::skills::managed::is_valid_name(name) {
+				output.warnings.push(SkillWarning {
+					path:    canonical,
+					message: Str::from("managed skill name is not exact kebab-case"),
+				});
+				continue;
+			}
+			let managed_description = managed.then(|| {
+				crate::skills::managed::sanitize_description(
+					header.description.as_deref().unwrap_or_default(),
+				)
+			});
 			if source.require_description
 				&& header
 					.description
@@ -331,6 +352,9 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 					.filter(|v| !v.is_empty())
 					.is_none()
 			{
+				continue;
+			}
+			if managed_description.as_ref().is_some_and(Str::is_empty) {
 				continue;
 			}
 			if settings.disabled_skills.contains(name)
@@ -355,7 +379,7 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 				continue;
 			}
 			names.insert(key.clone(), canonical.clone());
-			let payload = SkillPayload {
+			let mut payload = SkillPayload {
 				name:         key.clone(),
 				path:         canonical.clone(),
 				content:      Str::from(content),
@@ -370,6 +394,9 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 				},
 				contain_root: source.contain_root.clone(),
 			};
+			if let Some(description) = managed_description {
+				payload.frontmatter.description = Some(description);
+			}
 			let mut provenance = SourceProvenance::native(source.id.clone(), canonical, source.scope);
 			provenance.read_only = source.read_only;
 			output.declarations.push(DiscoveredCapability::keyed(
@@ -449,6 +476,36 @@ pub fn safe_skill_name(name: &str) -> bool {
 		&& name
 			.bytes()
 			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn managed_path_safe(path: &Path) -> bool {
+	let Ok(file) = fs::symlink_metadata(path) else {
+		return false;
+	};
+	let Some(directory) = path.parent() else {
+		return false;
+	};
+	let Ok(directory) = fs::symlink_metadata(directory) else {
+		return false;
+	};
+	!file.file_type().is_symlink()
+		&& file.is_file()
+		&& file.len() <= crate::skills::managed::MAX_SKILL_BYTES as u64
+		&& managed_link_count(&file) == 1
+		&& !directory.file_type().is_symlink()
+		&& directory.is_dir()
+}
+
+#[cfg(unix)]
+fn managed_link_count(metadata: &fs::Metadata) -> u64 {
+	use std::os::unix::fs::MetadataExt as _;
+	metadata.nlink()
+}
+
+#[cfg(windows)]
+fn managed_link_count(metadata: &fs::Metadata) -> u64 {
+	use std::os::windows::fs::MetadataExt as _;
+	u64::from(metadata.number_of_links())
 }
 
 /// Small allocation-free wildcard matcher used for configuration globs.

@@ -130,7 +130,7 @@ async fn snapshot_rejects_parent_escape_and_observes_cancellation() {
 }
 
 #[tokio::test]
-async fn worktree_isolation_persists_and_emits_patch_or_branch_without_git_worktree() {
+async fn worktree_isolation_applies_clean_patch_and_preserves_conflict_recovery() {
 	let root = TempDir::new().expect("workspace");
 	let state = TempDir::new().expect("state");
 	std::fs::write(root.path().join("tracked.txt"), b"parent\n").expect("fixture");
@@ -162,9 +162,12 @@ async fn worktree_isolation_persists_and_emits_patch_or_branch_without_git_workt
 			},
 			&cancel,
 		)
+		.await
 		.expect("patch disposition");
 	assert!(patch.artifact.is_some());
 	assert!(patch.branch.is_none());
+	assert!(patch.conflicts.is_empty());
+	assert_eq!(std::fs::read(root.path().join("tracked.txt")).unwrap(), b"child\n");
 	let branch = reopened
 		.merge_worktree(
 			&MergeWorktree {
@@ -174,8 +177,65 @@ async fn worktree_isolation_persists_and_emits_patch_or_branch_without_git_workt
 			},
 			&cancel,
 		)
+		.await
 		.expect("branch disposition");
+	assert!(branch.artifact.is_some());
 	assert_eq!(branch.branch.as_deref(), Some(format!("omp/agent/{}", created.id).as_str()));
+
+	let conflicting = reopened
+		.create_worktree(
+			&CreateWorktree { name: "conflict".to_owned(), ..Default::default() },
+			&cancel,
+		)
+		.expect("conflicting worktree");
+	let conflicting_root = url::Url::parse(&conflicting.root_uri)
+		.expect("conflicting root URI")
+		.to_file_path()
+		.expect("conflicting file URI");
+	std::fs::write(conflicting_root.join("tracked.txt"), b"isolated\n")
+		.expect("isolated conflicting mutation");
+	std::fs::write(root.path().join("tracked.txt"), b"parent-diverged\n")
+		.expect("parent conflicting mutation");
+	let conflict = reopened
+		.merge_worktree(
+			&MergeWorktree {
+				id: conflicting.id.clone(),
+				mode: MergeMode::Patch as i32,
+				..Default::default()
+			},
+			&cancel,
+		)
+		.await
+		.expect("conflict disposition");
+	assert!(conflict.artifact.is_some());
+	assert_eq!(conflict.conflicts.len(), 1);
+	assert_eq!(conflict.conflicts[0].path, "tracked.txt");
+	assert_eq!(std::fs::read(root.path().join("tracked.txt")).unwrap(), b"parent-diverged\n");
+	let conflict_branch = reopened
+		.merge_worktree(
+			&MergeWorktree {
+				id: conflicting.id.clone(),
+				mode: MergeMode::Branch as i32,
+				..Default::default()
+			},
+			&cancel,
+		)
+		.await
+		.expect("conflict branch disposition");
+	assert!(conflict_branch.artifact.is_some());
+	assert_eq!(
+		conflict_branch.branch.as_deref(),
+		Some(format!("omp/agent/{}", conflicting.id).as_str())
+	);
+	assert_eq!(conflict_branch.conflicts.len(), 1);
+	reopened
+		.destroy_worktree(
+			&DestroyWorktree { id: conflicting.id, force: true, ..Default::default() },
+			&cancel,
+		)
+		.expect("destroy conflicting worktree");
+	assert!(!conflicting_root.exists());
+
 	reopened
 		.destroy_worktree(
 			&DestroyWorktree { id: created.id, force: true, ..Default::default() },

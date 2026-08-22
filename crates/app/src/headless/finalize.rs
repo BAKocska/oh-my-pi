@@ -58,7 +58,7 @@ impl FinalizerBudget {
 }
 
 type FinalizerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-type FinalizerAction = Box<dyn FnOnce() -> FinalizerFuture + Send + 'static>;
+type FinalizerAction = Box<dyn FnOnce() -> FinalizerFuture + Send + Sync + 'static>;
 
 /// Result of best-effort ordered finalization.
 #[derive(Debug, Default)]
@@ -91,7 +91,7 @@ impl HeadlessFinalizerHandle {
 	/// Registers the advisor catch-up action.
 	pub fn set_advisor<F, Fut>(&mut self, action: F)
 	where
-		F: FnOnce() -> Fut + Send + 'static,
+		F: FnOnce() -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = ()> + Send + 'static,
 	{
 		self.advisor = Some(Box::new(|| Box::pin(action())));
@@ -100,7 +100,7 @@ impl HeadlessFinalizerHandle {
 	/// Registers the enabled Mnemopi consolidation action.
 	pub fn set_mnemopi<F, Fut>(&mut self, action: F)
 	where
-		F: FnOnce() -> Fut + Send + 'static,
+		F: FnOnce() -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = ()> + Send + 'static,
 	{
 		self.mnemopi = Some(Box::new(|| Box::pin(action())));
@@ -109,7 +109,7 @@ impl HeadlessFinalizerHandle {
 	/// Registers the telemetry drain action.
 	pub fn set_telemetry<F, Fut>(&mut self, action: F)
 	where
-		F: FnOnce() -> Fut + Send + 'static,
+		F: FnOnce() -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = ()> + Send + 'static,
 	{
 		self.telemetry = Some(Box::new(|| Box::pin(action())));

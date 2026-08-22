@@ -31,7 +31,7 @@ use std::{
 	fmt,
 	path::{Path, PathBuf},
 	sync::{
-		Arc,
+		Arc, Weak,
 		atomic::{AtomicU64, Ordering},
 	},
 };
@@ -161,6 +161,7 @@ pub struct McpLeafDefinition {
 pub struct McpService {
 	state:            RwLock<State>,
 	config_paths:     RwLock<Option<McpConfigPaths>>,
+	manager:          RwLock<Option<Weak<manager::McpManager>>>,
 	leaves:           LeafReplacementRegistry<McpLeaf>,
 	cache:            Arc<McpDefinitionCache>,
 	definition_epoch: AtomicU64,
@@ -178,6 +179,7 @@ impl McpService {
 				subscribers: BTreeMap::new(),
 			}),
 			config_paths:     RwLock::new(None),
+			manager:          RwLock::new(None),
 			leaves:           LeafReplacementRegistry::new(),
 			cache:            Arc::new(McpDefinitionCache::open(cache_path)?),
 			definition_epoch: AtomicU64::new(0),
@@ -194,6 +196,12 @@ impl McpService {
 		});
 	}
 
+	/// Binds the supervisor which owns live transports for successful config
+	/// mutations.
+	pub fn bind_manager(&self, manager: &Arc<manager::McpManager>) {
+		*self.manager.write() = Some(Arc::downgrade(manager));
+	}
+
 	/// Executes one finite native MCP configuration RPC.
 	pub async fn config(
 		&self,
@@ -204,9 +212,35 @@ impl McpService {
 			.read()
 			.clone()
 			.ok_or(McpServiceError::InvalidRequest)?;
-		tokio::task::spawn_blocking(move || config_request(paths, request))
+		let action = pb::McpConfigAction::try_from(request.action)
+			.map_err(|_| McpServiceError::InvalidRequest)?;
+		let refresh_paths = paths.clone();
+		let result = tokio::task::spawn_blocking(move || config_request(paths, request))
 			.await
-			.map_err(|_| McpServiceError::InvalidRequest)?
+			.map_err(|_| McpServiceError::InvalidRequest)??;
+		let manager = self.manager.read().as_ref().and_then(Weak::upgrade);
+		if matches!(
+			action,
+			pb::McpConfigAction::Add
+				| pb::McpConfigAction::Update
+				| pb::McpConfigAction::Remove
+				| pb::McpConfigAction::Enable
+				| pb::McpConfigAction::Disable
+		) && let Some(manager) = manager
+		{
+			let snapshot = tokio::task::spawn_blocking(move || {
+				config_request(refresh_paths, pb::McpConfigRequest {
+					action: pb::McpConfigAction::List as i32,
+					scope: pb::McpConfigScope::Unspecified as i32,
+					wire_revision: omp_proto::SCHEMA_REV,
+					..pb::McpConfigRequest::default()
+				})
+			})
+			.await
+			.map_err(|_| McpServiceError::InvalidRequest)??;
+			manager.replace_config_entries(snapshot.entries).await;
+		}
+		Ok(result)
 	}
 
 	/// Borrows the environment's one persistent definition cache.

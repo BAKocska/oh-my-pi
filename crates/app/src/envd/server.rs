@@ -61,6 +61,7 @@ use super::{
 	resource_materializer::{MaterializationError, ResourceMaterializer},
 	site::{SiteError, SiteMaterializer, record_modules},
 	tool_document::{PrivilegedMutationFault, privileged_unlink, privileged_write},
+	tool_shell::{AcpExecBackend, AcpExecSlot},
 	tools::production_registry,
 	vcs::{
 		self, RepositoryAvailability, SnapshotError,
@@ -507,6 +508,7 @@ pub struct EnvServer {
 	documents:           DocumentHost,
 	_document_authority: Option<DocumentAuthority>,
 	exec:                ExecHost,
+	acp_exec:            AcpExecSlot,
 	http_egress:         HttpEgressHost,
 	workspace:           WorkspaceHost,
 	mcp:                 Arc<McpService>,
@@ -523,6 +525,7 @@ pub struct EnvServer {
 	workspace_ops:       WorkspaceOperations,
 	ext_hosts:           Arc<ExtHostSupervisor>,
 	eval_bridge:         Arc<SessionBridgeHost>,
+	reflection_bridge:   Arc<crate::memory::ReflectionBridgeHost>,
 	eval_control:        omp_tools::eval::EvalSessionControl,
 	search_bridge:       Arc<super::search_backend::SearchBridgeHost>,
 	github_credentials:  Arc<super::github_url::GithubCredentialBridge>,
@@ -539,7 +542,10 @@ pub struct EnvServer {
 fn execution_settings(
 	data_dir: &Path,
 	project_root: &Path,
-) -> Result<(crate::settings::ToolSettings, ShellSettings, AcpSettings), EnvdError> {
+) -> Result<
+	(crate::settings::ToolSettings, ShellSettings, AcpSettings, crate::settings::AutolearnSettings),
+	EnvdError,
+> {
 	let manager = crate::settings::manager::SettingsManager::open(
 		crate::settings::manager::SettingsPaths::discover(data_dir, Some(project_root)),
 	)
@@ -560,7 +566,12 @@ fn execution_settings(
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
 		.get()
 		.clone();
-	Ok((tool, shell, acp))
+	let autolearn = snapshot
+		.project::<crate::settings::Settings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+		.get()
+		.autolearn;
+	Ok((tool, shell, acp, autolearn))
 }
 
 async fn start_memory_runtime(
@@ -738,6 +749,7 @@ impl EnvServer {
 		documents: DocumentHost,
 		document_authority: Option<DocumentAuthority>,
 		exec: ExecHost,
+		acp_exec: AcpExecSlot,
 		workspace: WorkspaceHost,
 		mcp: Arc<McpService>,
 		resources: Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
@@ -750,6 +762,7 @@ impl EnvServer {
 		workspace_ops: WorkspaceOperations,
 		ext_hosts: Arc<ExtHostSupervisor>,
 		eval_bridge: Arc<SessionBridgeHost>,
+		reflection_bridge: Arc<crate::memory::ReflectionBridgeHost>,
 		eval_control: omp_tools::eval::EvalSessionControl,
 		search_bridge: Arc<super::search_backend::SearchBridgeHost>,
 		github_credentials: Arc<super::github_url::GithubCredentialBridge>,
@@ -769,11 +782,13 @@ impl EnvServer {
 			Arc::from([identity.root_uri.clone()]),
 			state_dir.join("local"),
 		);
+		mcp.bind_manager(&mcp_manager);
 		Self {
 			identity,
 			documents,
 			_document_authority: document_authority,
 			exec,
+			acp_exec,
 			http_egress: HttpEgressHost::new(),
 			workspace,
 			mcp,
@@ -790,6 +805,7 @@ impl EnvServer {
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			search_bridge,
 			github_credentials,
@@ -886,13 +902,15 @@ impl EnvServer {
 			blobs.clone(),
 			crate::worktree_cmd::project_worktree_root(state_dir)?,
 		)?;
-		let (tool_settings, shell_settings, acp_settings) =
+		let (tool_settings, shell_settings, acp_settings, autolearn_settings) =
 			execution_settings(state_dir, workspace.root())?;
 		let memory_runtime =
 			start_memory_runtime(state_dir, workspace.root(), &session_id, &exec).await?;
+		let acp_exec = AcpExecSlot::default();
 		let (
 			registry,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			checkpoint_control,
 			resources,
@@ -908,6 +926,7 @@ impl EnvServer {
 			Arc::clone(&github_cache),
 			&mcp,
 			&workspace,
+			memory_runtime.runtime(),
 			&telemetry,
 			&hello.root_uri,
 			ext_hosts.as_ref(),
@@ -915,6 +934,8 @@ impl EnvServer {
 			&tool_settings,
 			&shell_settings,
 			&acp_settings,
+			acp_exec.clone(),
+			&autolearn_settings,
 			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
 			omp_tool::ToolsPolicy::Auto,
 			registry,
@@ -931,6 +952,7 @@ impl EnvServer {
 			documents,
 			None,
 			exec,
+			acp_exec,
 			workspace,
 			mcp,
 			resources,
@@ -943,6 +965,7 @@ impl EnvServer {
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			search_bridge,
 			github_credentials,
@@ -1022,13 +1045,15 @@ impl EnvServer {
 			blobs.clone(),
 			crate::worktree_cmd::project_worktree_root(state_dir)?,
 		)?;
-		let (tool_settings, shell_settings, acp_settings) =
+		let (tool_settings, shell_settings, acp_settings, autolearn_settings) =
 			execution_settings(state_dir, workspace.root())?;
 		let memory_runtime =
 			start_memory_runtime(state_dir, workspace.root(), &session_id, &exec).await?;
+		let acp_exec = AcpExecSlot::default();
 		let (
 			registry,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			checkpoint_control,
 			resources,
@@ -1044,6 +1069,7 @@ impl EnvServer {
 			Arc::clone(&github_cache),
 			&mcp,
 			&workspace,
+			memory_runtime.runtime(),
 			&telemetry,
 			&hello.root_uri,
 			ext_hosts.as_ref(),
@@ -1051,6 +1077,8 @@ impl EnvServer {
 			&tool_settings,
 			&shell_settings,
 			&acp_settings,
+			acp_exec.clone(),
+			&autolearn_settings,
 			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
 			omp_tool::ToolsPolicy::Auto,
 			registry,
@@ -1067,6 +1095,7 @@ impl EnvServer {
 			documents,
 			document_authority,
 			exec,
+			acp_exec,
 			workspace,
 			mcp,
 			resources,
@@ -1079,6 +1108,7 @@ impl EnvServer {
 			workspace_ops,
 			ext_hosts,
 			eval_bridge,
+			reflection_bridge,
 			eval_control,
 			search_bridge,
 			github_credentials,
@@ -1168,9 +1198,24 @@ impl EnvServer {
 		Arc::clone(&self.registry)
 	}
 
+	/// Returns the session's sole Off/Mnemopi runtime.
+	pub(crate) fn memory_runtime(&self) -> Arc<omp_memory::MemoryRuntime> {
+		Arc::clone(self._memory_runtime.runtime())
+	}
+
+	/// Binds or clears the session-scoped ACP terminal execution capability.
+	pub(crate) fn bind_acp_exec(&self, backend: Option<Arc<dyn AcpExecBackend>>) {
+		self.acp_exec.bind(backend);
+	}
+
 	/// Returns the session bridge binding retained by this environment.
 	pub(crate) fn eval_bridge(&self) -> Arc<SessionBridgeHost> {
 		Arc::clone(&self.eval_bridge)
+	}
+
+	/// Returns the late-bound memory reflection bridge.
+	pub(crate) fn reflection_bridge(&self) -> Arc<crate::memory::ReflectionBridgeHost> {
+		Arc::clone(&self.reflection_bridge)
 	}
 
 	pub(crate) fn eval_control(&self) -> omp_tools::eval::EvalSessionControl {
@@ -3727,6 +3772,7 @@ impl EnvServer {
 			Op::Merge(request) => self
 				.workspace_ops
 				.merge_worktree(&request, &cancel)
+				.await
 				.map(|merge| pb::WorktreeResult {
 					worktree:      Some(merge.worktree),
 					conflicts:     merge.conflicts,
@@ -7781,6 +7827,10 @@ mod tests {
 		))
 		.await
 		.expect("empty extension supervisor");
+		let memory_runtime =
+			start_memory_runtime(state.path(), workspace.root(), &sf!("test-session"), &exec)
+				.await
+				.expect("memory runtime");
 		let server = Arc::new(EnvServer::new(
 			ServerIdentity {
 				workspace_id:   hello.workspace_id,
@@ -7792,9 +7842,11 @@ mod tests {
 			documents,
 			None,
 			exec,
+			AcpExecSlot::default(),
 			workspace.clone(),
 			McpService::open(state.path().join("mcp-cache.sqlite3")).expect("MCP service"),
 			Arc::new(omp_tools::read::resolver::ResolverTable::default()),
+			memory_runtime,
 			super::super::lsp_settings::LspSettings::default(),
 			blobs.clone(),
 			SiteMaterializer::open(state.path().join("ext"), blobs.store().clone())
@@ -7804,7 +7856,10 @@ mod tests {
 			workspace_ops,
 			Arc::new(ext_hosts),
 			Arc::new(SessionBridgeHost::new()),
+			Arc::new(crate::memory::ReflectionBridgeHost::new()),
 			omp_tools::eval::EvalSessionControl::default(),
+			Arc::new(crate::envd::search_backend::SearchBridgeHost::new()),
+			Arc::new(crate::envd::github_url::GithubCredentialBridge::new()),
 			crate::envd::tools::AgentCheckpointControl::default(),
 			crate::envd::tools::AgentGoalControl::default(),
 			sessions_index,

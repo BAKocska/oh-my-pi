@@ -226,9 +226,23 @@ impl CommandRoster {
 		generations: impl IntoIterator<Item = CommandGeneration>,
 		policy: &ShadowPolicy,
 	) -> Self {
+		Self::with_contributions_filtered(generations, policy, |declaration| {
+			declaration.name != "security"
+		})
+	}
+
+	/// Builds inventory declarations while omitting disabled builtins before
+	/// help, completion, advertisement, and dispatch indexes are derived.
+	#[must_use]
+	pub fn with_contributions_filtered(
+		generations: impl IntoIterator<Item = CommandGeneration>,
+		policy: &ShadowPolicy,
+		include_builtin: impl Fn(&CommandDeclaration) -> bool,
+	) -> Self {
 		let mut builtins: Vec<_> = inventory::iter::<BuiltinRegistration>
 			.into_iter()
 			.map(|registration| (registration.declaration)())
+			.filter(include_builtin)
 			.collect();
 		builtins.sort_unstable_by_key(|declaration| declaration.order);
 		Self::build(builtins, generations, policy)
@@ -264,7 +278,13 @@ impl CommandRoster {
 
 		let mut winners = Vec::<CommandDeclaration>::with_capacity(commands.len());
 		let mut spellings = HashMap::<Str, usize>::new();
-		for declaration in commands {
+		for mut declaration in commands {
+			declaration.guest_visible =
+				omp_collab::guest::guest_command_allowed(declaration.name.as_str())
+					|| declaration
+						.aliases
+						.iter()
+						.any(|alias| omp_collab::guest::guest_command_allowed(alias.as_str()));
 			if spellings.contains_key(&declaration.name) {
 				continue;
 			}
@@ -281,10 +301,17 @@ impl CommandRoster {
 	/// Slash completion entries derived from the winning roster.
 	#[must_use]
 	pub fn completions(&self) -> Vec<omp_tui::Command> {
+		self.completions_for(CommandRole::Owner)
+	}
+
+	/// Slash completion entries filtered for the collaboration role.
+	#[must_use]
+	pub fn completions_for(&self, role: CommandRole) -> Vec<omp_tui::Command> {
 		use smallvec::SmallVec;
 		self
 			.commands
 			.iter()
+			.filter(|declaration| role == CommandRole::Owner || declaration.guest_visible)
 			.map(|declaration| {
 				let aliases: SmallVec<&str, 2> = declaration.aliases.iter().map(Str::as_str).collect();
 				let mut command = omp_tui::Command::new(
@@ -405,10 +432,30 @@ impl CommandRoster {
 				CommandImplementation::Handler(handler) => {
 					handler(host, args, &declaration.provenance).await?
 				},
-				CommandImplementation::Prompt(template) => CommandResult::Prompt(PromptResult {
-					text:       Str::from(template.replace("$ARGUMENTS", args)),
-					provenance: declaration.provenance.clone(),
-				}),
+				CommandImplementation::Prompt(template) => {
+					let words = super::super::input::tokenize_args(args)
+						.map_err(|error| miette::miette!("{error}"))?;
+					let rendered = super::super::template::render(
+						template,
+						super::super::template::TemplateArguments { raw: args, words: &words },
+					)?;
+					let fallback = if template.contains("{{args")
+						|| template.contains("{{list")
+						|| template.contains("{{join")
+					{
+						""
+					} else {
+						args
+					};
+					CommandResult::Prompt(PromptResult {
+						text:       Str::from(super::super::input::expand_arguments_with_fallback(
+							rendered.as_str(),
+							&words,
+							fallback,
+						)),
+						provenance: declaration.provenance.clone(),
+					})
+				},
 			};
 			Ok(DispatchResult::Handled(result))
 		})

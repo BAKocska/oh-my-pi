@@ -118,6 +118,17 @@ impl Grants {
 		{
 			grants.extend(["env.exec", "env.dap.read", "env.dap.execute", "env.blob"]);
 		}
+		if let Some(desktop) = &envelope.desktop {
+			if desktop.capture {
+				grants.extend(["env.desktop.capture", "env.blob"]);
+			}
+			if desktop.accessibility {
+				grants.push("env.desktop.accessibility");
+			}
+			if desktop.input {
+				grants.push("env.desktop.input");
+			}
+		}
 		Self::supported(grants)
 	}
 }

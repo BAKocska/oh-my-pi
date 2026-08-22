@@ -455,7 +455,8 @@ mod tests {
 	#[test]
 	fn every_helper_shape_uses_the_same_validated_item_contract() {
 		for mode in [SpawnMode::Agent, SpawnMode::Parallel, SpawnMode::Pipeline] {
-			let batch = SpawnBatchV1 { revision: 1, mode, items: vec![request(Some("Worker"))] };
+			let batch =
+				SpawnBatchV1 { revision: 1, mode, context: None, items: vec![request(Some("Worker"))] };
 			batch.validate().unwrap();
 		}
 	}

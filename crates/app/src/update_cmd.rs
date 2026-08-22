@@ -1,0 +1,534 @@
+//! Signed native package-registry inspection and rollback-safe self-update.
+
+use std::{
+	fs::{self, OpenOptions},
+	io::Write as _,
+	path::{Path, PathBuf},
+	process::Command,
+};
+
+use futures::StreamExt as _;
+use miette::{IntoDiagnostic as _, miette};
+use omp_core::{Str, encoding::hex};
+use ring::digest::{SHA256, digest};
+use serde::Serialize;
+
+use crate::{
+	cli::{RegistryArgs, UpdateArgs},
+	ext::{
+		index::{IndexArtifact, IndexExtension, IndexRelease, SignedIndex},
+		trust::{KeysFile, verify_artifact_signature},
+	},
+};
+
+const CORE_PACKAGE: &str = "omp-cli";
+const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InstallManager {
+	Native,
+	Npm,
+	Homebrew,
+	Mise,
+	Nix,
+}
+
+#[derive(Serialize)]
+struct RegistryView<'a> {
+	package:  &'a str,
+	target:   String,
+	manager:  InstallManager,
+	releases: Vec<ReleaseView<'a>>,
+}
+
+#[derive(Serialize)]
+struct ReleaseView<'a> {
+	version:  &'a str,
+	attested: bool,
+	yanked:   bool,
+	assets:   Vec<AssetView<'a>>,
+}
+
+#[derive(Serialize)]
+struct AssetView<'a> {
+	target: &'a str,
+	file:   &'a str,
+	size:   u64,
+	sha256: &'a str,
+}
+
+struct Selected<'a> {
+	issued_at: &'a Str,
+	extension: &'a IndexExtension,
+	release:   &'a IndexRelease,
+	artifact:  &'a IndexArtifact,
+}
+
+struct UpdateLock(PathBuf);
+
+impl Drop for UpdateLock {
+	fn drop(&mut self) {
+		let _ = fs::remove_file(&self.0);
+	}
+}
+
+/// Runs the signed core updater or explicitly delegates extension upgrades.
+pub async fn run(args: UpdateArgs) -> miette::Result<()> {
+	if args.plugins {
+		if args.check || args.force || args.index.is_some() || args.index_key.is_some() {
+			return Err(miette!(
+				"--plugins is exactly `omp ext upgrade` and cannot be combined with core update \
+				 options"
+			));
+		}
+		return upgrade_extensions().await;
+	}
+	let (index, _) = load_index(args.index.as_deref(), args.index_key.as_deref())?;
+	let target = platform_target();
+	let selected = select(&index, CORE_PACKAGE, &target)?;
+	let manager = classify_installation(&std::env::current_exe().into_diagnostic()?);
+	let current = env!("CARGO_PKG_VERSION");
+	let newer = compare_versions(selected.release.version.as_str(), current).is_gt();
+	if args.check || (!newer && !args.force) {
+		println!(
+			"current={current}\tlatest={}\ttarget={target}\tmanager={manager:?}\\
+			 tupdate_available={newer}",
+			selected.release.version
+		);
+		return Ok(());
+	}
+	if manager != InstallManager::Native {
+		return Err(miette!("{}", manager_instruction(manager)));
+	}
+	let version = selected.release.version.clone();
+	install(selected).await?;
+	println!("updated omp to {version} ({target})");
+	Ok(())
+}
+
+/// Inspects the verified package registry without mutating locks or TOFU pins.
+pub fn registry(args: RegistryArgs) -> miette::Result<()> {
+	let (index, _) = load_index(args.index.as_deref(), args.index_key.as_deref())?;
+	let target = platform_target();
+	let package = index
+		.extensions
+		.iter()
+		.find(|package| package.id == args.package)
+		.ok_or_else(|| miette!("signed registry has no package `{}`", args.package))?;
+	let manager = classify_installation(&std::env::current_exe().into_diagnostic()?);
+	let view = RegistryView {
+		package: package.id.as_str(),
+		target,
+		manager,
+		releases: package
+			.releases
+			.iter()
+			.map(|release| ReleaseView {
+				version:  release.version.as_str(),
+				attested: release.attested,
+				yanked:   release.yanked,
+				assets:   release
+					.artifacts
+					.iter()
+					.map(|asset| AssetView {
+						target: asset.target.as_str(),
+						file:   asset.file.as_str(),
+						size:   asset.size,
+						sha256: asset.sha256.as_str(),
+					})
+					.collect(),
+			})
+			.collect(),
+	};
+	if args.json {
+		println!("{}", serde_json::to_string_pretty(&view).into_diagnostic()?);
+	} else {
+		println!("package\t{}", view.package);
+		println!("target\t{}", view.target);
+		println!("manager\t{:?}", view.manager);
+		for release in &view.releases {
+			for asset in &release.assets {
+				println!(
+					"{}\t{}\t{}\t{}\tattested={}\tyanked={}",
+					release.version,
+					asset.target,
+					asset.file,
+					asset.sha256,
+					release.attested,
+					release.yanked
+				);
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Returns a newer signed core release configured for this platform.
+///
+/// This path is intentionally read-only: it does not download artifacts,
+/// mutate TOFU pins, refresh extension indexes, or write a seen marker.
+#[must_use]
+pub fn startup_available() -> Option<Str> {
+	let (index, _) = load_index(None, None).ok()?;
+	let target = platform_target();
+	let selected = select(&index, CORE_PACKAGE, &target).ok()?;
+	compare_versions(selected.release.version.as_str(), env!("CARGO_PKG_VERSION"))
+		.is_gt()
+		.then(|| selected.release.version.clone())
+}
+
+fn load_index(index: Option<&Path>, key: Option<&Path>) -> miette::Result<(SignedIndex, String)> {
+	let index = configured_path(index, "OMP_RELEASE_INDEX", "signed release index")?;
+	let key = configured_path(key, "OMP_RELEASE_INDEX_KEY", "release index key")?;
+	let key = fs::read_to_string(key).into_diagnostic()?;
+	let key = key.trim().to_owned();
+	let index = SignedIndex::read(&index, &key).map_err(|error| miette!("{error}"))?;
+	Ok((index, key))
+}
+
+fn configured_path(
+	explicit: Option<&Path>,
+	variable: &str,
+	label: &str,
+) -> miette::Result<PathBuf> {
+	explicit
+		.map(Path::to_path_buf)
+		.or_else(|| {
+			std::env::var_os(variable)
+				.filter(|value| !value.is_empty())
+				.map(PathBuf::from)
+		})
+		.ok_or_else(|| miette!("{label} is required; pass its option or set {variable}"))
+}
+
+fn select<'a>(index: &'a SignedIndex, package: &str, target: &str) -> miette::Result<Selected<'a>> {
+	let extension = index
+		.extensions
+		.iter()
+		.find(|extension| extension.id.as_str() == package)
+		.ok_or_else(|| miette!("signed registry has no package `{package}`"))?;
+	let (release, artifact) = extension
+		.releases
+		.iter()
+		.filter(|release| release.attested && !release.yanked)
+		.filter_map(|release| {
+			release
+				.artifacts
+				.iter()
+				.find(|artifact| artifact.target.as_str() == target)
+				.map(|artifact| (release, artifact))
+		})
+		.max_by(|(left, _), (right, _)| {
+			compare_versions(left.version.as_str(), right.version.as_str())
+		})
+		.ok_or_else(|| miette!("signed registry has no attested `{target}` asset for `{package}`"))?;
+	verify_artifact_signature(
+		extension.publisher_key.as_str(),
+		artifact.blake3.as_str(),
+		artifact.sha256.as_str(),
+		release.capability_digest.as_str(),
+		artifact.signature.as_str(),
+	)
+	.map_err(|error| miette!("{error}"))?;
+	Ok(Selected { issued_at: &index.issued_at, extension, release, artifact })
+}
+
+async fn install(selected: Selected<'_>) -> miette::Result<()> {
+	if selected.artifact.size > MAX_ASSET_BYTES {
+		return Err(miette!("signed update asset exceeds the 256 MiB safety ceiling"));
+	}
+	let data_dir = crate::cli::data_dir(None)?;
+	let cache = if let Some(cache) =
+		std::env::var_os("OMP_CACHE_DIR").filter(|value| !value.is_empty())
+	{
+		PathBuf::from(cache)
+	} else {
+		let home = std::env::var_os("HOME")
+			.filter(|value| !value.is_empty())
+			.map(PathBuf::from)
+			.ok_or_else(|| miette!("HOME or OMP_CACHE_DIR must be set for native update staging"))?;
+		crate::discovery::native::native_directories(&home).cache
+	}
+	.join("updates");
+	fs::create_dir_all(&cache).into_diagnostic()?;
+	let lock_path = cache.join("update.lock");
+	OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&lock_path)
+		.map_err(|error| miette!("another updater owns {}: {error}", lock_path.display()))?;
+	let _lock = UpdateLock(lock_path);
+	let bytes = fetch_asset(selected.artifact).await?;
+	verify_bytes(&bytes, selected.artifact)?;
+	let executable = extract_executable(&bytes, selected.artifact.file.as_str())?;
+	let current = std::env::current_exe().into_diagnostic()?;
+	let destination = renamed_destination(&current);
+	let install_dir = destination.parent().unwrap_or_else(|| Path::new("."));
+	prune_stale(install_dir)?;
+	let staged = install_dir.join(format!("omp-{}.staged", std::process::id()));
+	write_executable(&staged, &executable)?;
+	let mut keys =
+		KeysFile::read(&data_dir.join("ext/keys.toml")).map_err(|error| miette!("{error}"))?;
+	keys
+		.verify_or_pin(
+			&selected.extension.id,
+			&selected.extension.publisher_key,
+			&selected.release.version,
+			selected.issued_at,
+			None,
+		)
+		.map_err(|error| miette!("{error}"))?;
+	keys
+		.write(&data_dir.join("ext/keys.toml"))
+		.into_diagnostic()?;
+	atomic_replace(&staged, &destination, selected.release.version.as_str())?;
+	#[cfg(not(windows))]
+	if destination != current {
+		fs::remove_file(current).into_diagnostic()?;
+	}
+	Ok(())
+}
+
+async fn fetch_asset(asset: &IndexArtifact) -> miette::Result<Vec<u8>> {
+	if let Some(path) = asset.url.strip_prefix("file://") {
+		return fs::read(path).into_diagnostic();
+	}
+	if !asset.url.starts_with("https://") {
+		return Err(miette!("signed update asset URL must use HTTPS"));
+	}
+	let response = wreq::Client::new()
+		.get(&asset.url)
+		.send()
+		.await
+		.into_diagnostic()?;
+	if !response.status().is_success() {
+		return Err(miette!("update download returned HTTP {}", response.status()));
+	}
+	let mut bytes = Vec::with_capacity(usize::try_from(asset.size).unwrap_or_default());
+	let mut stream = response.bytes_stream();
+	while let Some(chunk) = stream.next().await {
+		let chunk = chunk.into_diagnostic()?;
+		if bytes.len().saturating_add(chunk.len())
+			> usize::try_from(MAX_ASSET_BYTES).unwrap_or(usize::MAX)
+		{
+			return Err(miette!("update download exceeded the 256 MiB safety ceiling"));
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+	Ok(bytes)
+}
+
+fn verify_bytes(bytes: &[u8], asset: &IndexArtifact) -> miette::Result<()> {
+	if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != asset.size {
+		return Err(miette!("update asset size differs from signed registry metadata"));
+	}
+	let sha256 = format!("sha256:{}", hex::encode(digest(&SHA256, bytes).as_ref()));
+	if sha256 != asset.sha256.as_str() {
+		return Err(miette!("update asset SHA-256 differs from signed registry metadata"));
+	}
+	let blake3 = format!("b3:{}", blake3::hash(bytes).to_hex());
+	if blake3 != asset.blake3.as_str() {
+		return Err(miette!("update asset BLAKE3 differs from signed registry metadata"));
+	}
+	Ok(())
+}
+
+fn extract_executable(bytes: &[u8], filename: &str) -> miette::Result<Vec<u8>> {
+	if matches!(filename, "omp" | "omp.exe") {
+		return Ok(bytes.to_vec());
+	}
+	let files =
+		omp_ar::unpack(bytes).map_err(|error| miette!("update archive is invalid: {error}"))?;
+	let executable_name = if cfg!(windows) { "omp.exe" } else { "omp" };
+	let mut matches = files.into_iter().filter(|(path, _)| {
+		Path::new(path.as_str())
+			.file_name()
+			.is_some_and(|name| name == executable_name)
+	});
+	let (_, executable) = matches
+		.next()
+		.ok_or_else(|| miette!("update archive contains no `{executable_name}` executable"))?;
+	if matches.next().is_some() {
+		return Err(miette!("update archive contains multiple `{executable_name}` executables"));
+	}
+	Ok(executable)
+}
+
+fn write_executable(path: &Path, bytes: &[u8]) -> miette::Result<()> {
+	let mut file = OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(path)
+		.into_diagnostic()?;
+	file.write_all(bytes).into_diagnostic()?;
+	file.sync_all().into_diagnostic()?;
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt as _;
+		fs::set_permissions(path, fs::Permissions::from_mode(0o755)).into_diagnostic()?;
+	}
+	Ok(())
+}
+
+fn atomic_replace(staged: &Path, destination: &Path, expected_version: &str) -> miette::Result<()> {
+	let backup = destination.with_extension(format!("backup-{}", std::process::id()));
+	let had_destination = destination.exists();
+	if had_destination {
+		fs::rename(destination, &backup).into_diagnostic()?;
+	}
+	if let Err(error) = fs::rename(staged, destination) {
+		if had_destination {
+			let _ = fs::rename(&backup, destination);
+		}
+		return Err(error).into_diagnostic();
+	}
+	let verified = Command::new(destination)
+		.arg("--version")
+		.output()
+		.ok()
+		.filter(|output| output.status.success())
+		.is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains(expected_version));
+	if !verified {
+		let failed = destination.with_extension("failed-update");
+		let _ = fs::rename(destination, &failed);
+		if had_destination {
+			fs::rename(&backup, destination).into_diagnostic()?;
+		}
+		let _ = fs::remove_file(failed);
+		return Err(miette!("installed omp failed version verification; previous binary restored"));
+	}
+	if had_destination {
+		fs::remove_file(backup).into_diagnostic()?;
+	}
+	Ok(())
+}
+
+fn renamed_destination(current: &Path) -> PathBuf {
+	if current
+		.file_stem()
+		.and_then(|name| name.to_str())
+		.is_some_and(|name| matches!(name, "pi" | "oh-my-pi"))
+	{
+		return current.with_file_name(if cfg!(windows) { "omp.exe" } else { "omp" });
+	}
+	current.to_path_buf()
+}
+
+fn prune_stale(cache: &Path) -> miette::Result<()> {
+	for entry in fs::read_dir(cache).into_diagnostic()? {
+		let entry = entry.into_diagnostic()?;
+		let name = entry.file_name();
+		let name = name.to_string_lossy();
+		if (name.starts_with("omp-") && name.ends_with(".staged")) || name.contains(".backup-") {
+			let _ = fs::remove_file(entry.path());
+		}
+	}
+	Ok(())
+}
+
+fn classify_installation(executable: &Path) -> InstallManager {
+	if let Some(value) = std::env::var_os("OMP_INSTALL_MANAGER") {
+		return match value.to_string_lossy().to_ascii_lowercase().as_str() {
+			"npm" => InstallManager::Npm,
+			"homebrew" | "brew" => InstallManager::Homebrew,
+			"mise" => InstallManager::Mise,
+			"nix" => InstallManager::Nix,
+			_ => InstallManager::Native,
+		};
+	}
+	let path = executable.to_string_lossy().to_ascii_lowercase();
+	if path.contains("/nix/store/") {
+		InstallManager::Nix
+	} else if path.contains("/.local/share/mise/") || path.contains("/.mise/") {
+		InstallManager::Mise
+	} else if path.contains("/cellar/") || path.contains("/homebrew/") || path.contains("linuxbrew")
+	{
+		InstallManager::Homebrew
+	} else if path.contains("node_modules") || path.contains("/npm/") {
+		InstallManager::Npm
+	} else {
+		InstallManager::Native
+	}
+}
+
+const fn manager_instruction(manager: InstallManager) -> &'static str {
+	match manager {
+		InstallManager::Native => "native installation can update in place",
+		InstallManager::Npm => "npm owns this installation; run `npm update -g @oh-my-pi/omp`",
+		InstallManager::Homebrew => "Homebrew owns this installation; run `brew upgrade omp`",
+		InstallManager::Mise => "Mise owns this installation; run `mise upgrade omp`",
+		InstallManager::Nix => "Nix owns this installation; update the pinned Nix input",
+	}
+}
+
+fn platform_target() -> String {
+	let arch = match std::env::consts::ARCH {
+		"x86_64" => "x86_64",
+		"aarch64" => "aarch64",
+		other => other,
+	};
+	match std::env::consts::OS {
+		"macos" => format!("{arch}-apple-darwin"),
+		"windows" => format!("{arch}-pc-windows-msvc"),
+		"linux" if cfg!(target_env = "musl") => format!("{arch}-unknown-linux-musl"),
+		"linux" => format!("{arch}-unknown-linux-gnu"),
+		other => format!("{arch}-unknown-{other}"),
+	}
+}
+
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+	let mut left = left.trim_start_matches('v').split(['.', '-', '+']);
+	let mut right = right.trim_start_matches('v').split(['.', '-', '+']);
+	loop {
+		match (left.next(), right.next()) {
+			(None, None) => return std::cmp::Ordering::Equal,
+			(Some(_), None) => return std::cmp::Ordering::Greater,
+			(None, Some(_)) => return std::cmp::Ordering::Less,
+			(Some(left), Some(right)) => {
+				let ordering = match (left.parse::<u64>(), right.parse::<u64>()) {
+					(Ok(left), Ok(right)) => left.cmp(&right),
+					_ => left.cmp(right),
+				};
+				if !ordering.is_eq() {
+					return ordering;
+				}
+			},
+		}
+	}
+}
+
+async fn upgrade_extensions() -> miette::Result<()> {
+	use crate::ext_cli::{ExtArgs, ExtCommand, ExtUpgradeArgs, Scope};
+	crate::ext_cli::run(ExtArgs {
+		project:       PathBuf::from("."),
+		data_dir:      None,
+		store:         None,
+		cache:         None,
+		index:         Vec::new(),
+		index_keys:    None,
+		offline:       false,
+		locked:        false,
+		exclude_newer: None,
+		disable:       Vec::new(),
+		grant:         None,
+		allow_build:   false,
+		sign_key:      None,
+		uv:            None,
+		targets:       Vec::new(),
+		trace:         false,
+		env_socket:    None,
+		layer:         None,
+		scope:         Scope::User,
+		json:          false,
+		verbose:       false,
+		command:       ExtCommand::Upgrade(ExtUpgradeArgs {
+			ids: Vec::new(),
+			to: None,
+			dry_run: false,
+			allow_capability_widening: false,
+			rollback: None,
+		}),
+	})
+	.await
+}

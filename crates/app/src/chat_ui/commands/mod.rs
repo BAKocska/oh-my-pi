@@ -1,12 +1,21 @@
 //! Structural slash-command router and capability-scoped host contracts.
 
+pub(crate) mod collab;
 mod config;
 pub mod context;
+mod export;
+mod extensions;
 mod flow;
+mod green;
+mod mcp;
+mod memory;
 mod model;
 pub mod registry;
 pub mod result;
+mod review;
+mod security;
 mod session;
+mod share;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -111,6 +120,123 @@ pub trait ConfigCommandHost {
 }
 
 /// Context and execution-flow command capabilities.
+/// Writable MCP configuration scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigScope {
+	/// User profile configuration.
+	User,
+	/// Current project configuration.
+	Project,
+}
+
+/// Parsed `/mcp` operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpRequest {
+	/// List effective servers and lifecycle state.
+	List,
+	/// Add one validated server declaration.
+	Add {
+		/// Writable target scope.
+		scope:       ConfigScope,
+		/// Server identity.
+		name:        Str,
+		/// Exact JSON declaration.
+		server_json: Str,
+	},
+	/// Remove one server.
+	Remove(Str),
+	/// Enable one server.
+	Enable(Str),
+	/// Disable one server.
+	Disable(Str),
+	/// Test one live server.
+	Test(Str),
+	/// Restart one live server at its current definition epoch.
+	Reconnect(Str),
+	/// Replace the managed OAuth credential for one server.
+	Reauth(Str),
+	/// Remove the managed credential for one server.
+	Unauth(Str),
+	/// Render native MCP help.
+	Help,
+}
+
+/// Parsed live collaboration operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollabRequest {
+	/// Show collaboration state and participants.
+	Status,
+	/// Show the current link and participant roster.
+	View,
+	/// Start hosting with optional relay and web URLs.
+	Start(ParsedFlags),
+	/// Stop hosting the current collaboration.
+	Stop,
+}
+
+/// Parsed transcript export operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExportRequest {
+	/// Write a styled HTML transcript.
+	Html(Option<Str>),
+	/// Copy a transcript dump, optionally with request JSON sidecars.
+	Dump { requests: bool },
+	/// Copy a transcript selection, code block, or last command.
+	Copy(Str),
+}
+
+/// Parsed extension marketplace or plugin operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtensionRequest {
+	/// Operate on signed extension indexes and installations.
+	Marketplace(MarketplaceRequest),
+	/// List or change installed extension enablement.
+	Plugins(PluginRequest),
+	/// Rediscover and atomically replace the active extension generation.
+	Reload,
+}
+/// Parsed signed-extension marketplace operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MarketplaceRequest {
+	/// List configured indexes.
+	List,
+	/// Add an index source.
+	Add(Str),
+	/// Remove an index.
+	Remove(Str),
+	/// Refresh one index or all indexes.
+	Update(Option<Str>),
+	/// Discover packages, optionally in one index.
+	Discover(Option<Str>),
+	/// Install one signed package.
+	Install { spec: Str, scope: ConfigScope, force: bool },
+	/// Uninstall one signed package.
+	Uninstall { spec: Str, scope: ConfigScope },
+	/// List installed marketplace packages.
+	Installed,
+	/// Upgrade one package or every installed package.
+	Upgrade { spec: Option<Str>, scope: ConfigScope },
+	/// Render marketplace help.
+	Help,
+}
+
+/// Parsed installed-extension operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PluginRequest {
+	/// List effective extensions and shadowing state.
+	List,
+	/// Enable one extension.
+	Enable(Str),
+	/// Disable one extension.
+	Disable(Str),
+}
+/// Parsed local security workflow operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecurityRequest {
+	/// Launch one ordinary restricted reviewer child over the workspace or a
+	/// bounded relative path.
+	Review(Option<Str>),
+}
 pub trait FlowCommandHost {
 	/// Return the latest complete anchored context snapshot.
 	fn context(&mut self) -> CommandFuture<'_>;
@@ -150,6 +276,93 @@ pub trait FlowCommandHost {
 	fn omfg(&mut self, instruction: Str) -> CommandFuture<'_>;
 	/// Start or stop realtime voice.
 	fn live(&mut self, args: Str) -> CommandFuture<'_>;
+	/// Manage Environment-owned MCP declarations and lifecycle.
+	fn mcp(&mut self, request: McpRequest) -> CommandFuture<'_>;
+	/// Inspect or maintain the session's Mnemopi authority.
+	fn memory(&mut self, args: Str) -> CommandFuture<'_>;
+	/// Host or inspect a live collaboration.
+	fn collab(&mut self, request: CollabRequest) -> CommandFuture<'_> {
+		let _ = request;
+		Box::pin(async { Err(miette::miette!("collaboration is unavailable")) })
+	}
+	/// Join a live collaboration link.
+	fn join_collab(&mut self, link: Str) -> CommandFuture<'_> {
+		let _ = link;
+		Box::pin(async { Err(miette::miette!("collaboration is unavailable")) })
+	}
+	/// Leave the active collaboration.
+	fn leave_collab(&mut self) -> CommandFuture<'_> {
+		Box::pin(async { Err(miette::miette!("collaboration is unavailable")) })
+	}
+	/// Export or copy transcript material.
+	fn export(&mut self, request: ExportRequest) -> CommandFuture<'_> {
+		let _ = request;
+		Box::pin(async { Err(miette::miette!("transcript export is unavailable")) })
+	}
+	/// Create an encrypted, redacted share link.
+	fn share(&mut self, args: Str) -> CommandFuture<'_> {
+		let _ = args;
+		Box::pin(async { Err(miette::miette!("sharing is unavailable")) })
+	}
+	/// Manage native signed extensions.
+	fn extensions(&mut self, request: ExtensionRequest) -> CommandFuture<'_> {
+		let _ = request;
+		Box::pin(async { Err(miette::miette!("extension management is unavailable")) })
+	}
+	/// Synthesize a bounded CI-remediation turn.
+	fn green(&mut self, target: Option<Str>) -> CommandFuture<'_> {
+		Box::pin(async move {
+			let target = target.as_deref().unwrap_or("the current branch");
+			Ok(CommandResult::Prompt(PromptResult {
+				text:       Str::from(format!(
+					"Make {target} green. Gather branch status and failing CI evidence only through \
+					 the Environment git authority and direct GitHub resources; do not invoke git, gh, \
+					 or a shell. Ignore successful jobs. Diagnose the smallest root-cause fix, \
+					 implement it, and run only the checks covering the failure. Keep the evidence set \
+					 bounded and report the final verification."
+				)),
+				provenance: CommandProvenance::builtin(),
+			}))
+		})
+	}
+	/// Synthesize a bounded native git/GitHub review turn.
+	fn review(&mut self, target: Option<Str>) -> CommandFuture<'_> {
+		Box::pin(async move {
+			let target = target.as_deref().unwrap_or("uncommitted work");
+			Ok(CommandResult::Prompt(PromptResult {
+				text:       Str::from(format!(
+					"Review {target}. Resolve git evidence only through the Environment VCS authority \
+					 and resolve pull requests through pr:// resources; do not invoke git, gh, jj, or \
+					 a shell. Exclude lockfiles, generated or minified files, and binary changes. Size \
+					 reviewer fan-out to the remaining files. Report only actionable correctness, \
+					 security, and maintainability findings with file and line evidence, ranked by \
+					 severity; say explicitly when none remain."
+				)),
+				provenance: CommandProvenance::builtin(),
+			}))
+		})
+	}
+	/// Execute one local-only immutable security workflow operation.
+	fn security(&mut self, _request: SecurityRequest) -> CommandFuture<'_> {
+		let SecurityRequest::Review(path) = _request;
+		Box::pin(async move {
+			let target = path.as_deref().unwrap_or(".");
+			Ok(CommandResult::Prompt(PromptResult {
+				text:       Str::from(format!(
+					"Launch exactly one ordinary local child agent to review `{target}`. Use the `{}` \
+					 profile, its strict result JSON schema with strict schema mode, LSP enabled, and \
+					 no isolated worktree. Do not grant exec, mutation, network, web, MCP, extension, \
+					 raw-environment, or credential access. Return the child `agent://` handle and \
+					 `details.artifact` reference. Reuse ordinary child job status, cancellation, \
+					 journal, and private artifact spill; do not create a scan coordinator, database, \
+					 SARIF, comparison, validation workflow, bundle, cloud client, or security:// \
+					 resource.",
+					crate::security_review::profile::PROFILE_ID
+				)),
+				provenance: CommandProvenance::builtin(),
+			}))
+		})
+	}
 }
 
 /// Complete command host assembled from capability-scoped interfaces.

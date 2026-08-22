@@ -40,6 +40,7 @@ fn core_effect_envelope_maps_to_exact_worker_data_bounds() {
 			props:    Default::default(),
 		}),
 		inference: None,
+		desktop:   None,
 		subagents: 0,
 		props:     Default::default(),
 	};

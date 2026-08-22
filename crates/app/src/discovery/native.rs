@@ -10,15 +10,55 @@ use omp_walker::WalkRequest;
 use serde::Deserialize;
 
 use super::{
+	containment::contained_existing,
 	manifest::{
 		CapabilityPayload, DiscoveredCapability, ExtensionPayload, HookPayload, HookPhase,
 		InstructionPayload, PromptPayload, PythonWorkerDeclaration, SettingsPayload,
 		SourceProvenance, SourceScope, SystemPromptPayload, ToolHandlerDeclaration, ToolPayload,
 	},
 	mcp_ssh::{parse_mcp_file, parse_ssh_file},
+	packages::{self, ExtensionRootMode},
 	rules::{self, RuleSource},
 	skills::{self, SkillDiscoverySettings, SkillSource},
 };
+use crate::ext::lock::InstalledRecord;
+
+/// Canonical native storage roots. Configuration remains in the native
+/// `OMP_CONFIG_DIR`/`~/.omp` authority; mutable application data is split by
+/// XDG purpose so caches can be discarded without losing durable state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDirectories {
+	/// Durable application data.
+	pub data:  PathBuf,
+	/// Durable runtime state.
+	pub state: PathBuf,
+	/// Re-creatable downloaded and derived data.
+	pub cache: PathBuf,
+}
+
+/// Resolves the canonical native data, state, and cache roots.
+///
+/// Explicit OMP variables win. Otherwise the corresponding XDG variable is
+/// used, followed by the XDG home-relative default.
+#[must_use]
+pub fn native_directories(home: &Path) -> NativeDirectories {
+	fn root(omp: &str, xdg: &str, fallback: &Path) -> PathBuf {
+		env::var_os(omp)
+			.filter(|value| !value.is_empty())
+			.map(PathBuf::from)
+			.or_else(|| {
+				env::var_os(xdg)
+					.filter(|value| !value.is_empty())
+					.map(|value| PathBuf::from(value).join("omp"))
+			})
+			.unwrap_or_else(|| fallback.join("omp"))
+	}
+	NativeDirectories {
+		data:  root("OMP_DATA_DIR", "XDG_DATA_HOME", &home.join(".local/share")),
+		state: root("OMP_STATE_DIR", "XDG_STATE_HOME", &home.join(".local/state")),
+		cache: root("OMP_CACHE_DIR", "XDG_CACHE_HOME", &home.join(".cache")),
+	}
+}
 
 /// A native OMP configuration root.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,8 +271,32 @@ pub fn discover_capabilities(
 	});
 
 	let mut output = NativeDiscovery::default();
+	let install_records = roots
+		.iter()
+		.map(|(root, _)| root.join("installed.toml"))
+		.collect::<Vec<_>>();
 	for (root, scope) in roots {
 		load_root(&root, scope, &mut output);
+	}
+	let mut extension_roots = std::collections::BTreeSet::new();
+	for installed_path in install_records {
+		let installed = match InstalledRecord::read(&installed_path) {
+			Ok(installed) => installed,
+			Err(error) => {
+				output.warnings.push(Str::from(format!(
+					"ignored native extension record {}: {error}",
+					installed_path.display()
+				)));
+				continue;
+			},
+		};
+		let packages = packages::discover(&installed, &[], ExtensionRootMode::Merge);
+		output.warnings.extend(packages.warnings);
+		for extension in packages.roots {
+			if extension_roots.insert(extension.path.clone()) {
+				load_root(&extension.path, SourceScope::Package, &mut output);
+			}
+		}
 	}
 	for path in standalone_agents {
 		let Ok(content) = fs::read_to_string(&path) else {
@@ -444,22 +508,36 @@ fn load_markdown_dir(
 	scope: SourceScope,
 	output: &mut NativeDiscovery,
 ) {
-	for path in scan_capability_dir(&root.join(directory))
-		.into_iter()
-		.filter(|path| {
-			path
-				.extension()
-				.is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-		}) {
+	let capability_root = root.join(directory);
+	let paths = if matches!(kind, CapabilityFileKind::Command) {
+		scan_command_dir(&capability_root)
+	} else {
+		scan_capability_dir(&capability_root)
+	};
+	for path in paths.into_iter().filter(|path| {
+		path
+			.extension()
+			.is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+	}) {
 		let Ok(content) = fs::read_to_string(&path) else {
 			continue;
 		};
-		let name = Str::from(
-			path
-				.file_stem()
-				.and_then(|name| name.to_str())
-				.unwrap_or("declaration"),
-		);
+		let name = if matches!(kind, CapabilityFileKind::Command) {
+			let Some(name) = command_name(&capability_root, &path) else {
+				output
+					.warnings
+					.push(Str::from(format!("ignored invalid command path {}", path.display())));
+				continue;
+			};
+			name
+		} else {
+			Str::from(
+				path
+					.file_stem()
+					.and_then(|name| name.to_str())
+					.unwrap_or("declaration"),
+			)
+		};
 		let payload = match kind {
 			CapabilityFileKind::Prompt => CapabilityPayload::Prompts(PromptPayload {
 				name:    name.clone(),
@@ -473,11 +551,17 @@ fn load_markdown_dir(
 				apply_to: None,
 			}),
 			CapabilityFileKind::Command => {
-				let Ok(command) =
-					super::slash_commands::parse_markdown(name.clone(), path.clone(), &content)
-				else {
-					continue;
-				};
+				let command =
+					match super::slash_commands::parse_markdown(name.clone(), path.clone(), &content) {
+						Ok(command) => command,
+						Err(error) => {
+							output.warnings.push(Str::from(format!(
+								"ignored /{name} from {}: {error}",
+								path.display(),
+							)));
+							continue;
+						},
+					};
 				CapabilityPayload::SlashCommands(command)
 			},
 		};
@@ -487,6 +571,44 @@ fn load_markdown_dir(
 			SourceProvenance::native(source_id.clone(), path, scope),
 		));
 	}
+}
+
+fn scan_command_dir(root: &Path) -> Vec<PathBuf> {
+	WalkRequest::new(root)
+		.hidden(false)
+		.gitignore(true)
+		.skip_git(true)
+		.depth(1, 16)
+		.limit(1_024)
+		.collect_files()
+		.unwrap_or_default()
+		.into_iter()
+		.map(|entry| entry.absolute_path(root))
+		.filter(|path| contained_existing(root, path).is_ok())
+		.collect()
+}
+
+fn command_name(root: &Path, path: &Path) -> Option<Str> {
+	let relative = path.strip_prefix(root).ok()?;
+	let count = relative.components().count();
+	let mut name = String::new();
+	for (index, component) in relative.components().enumerate() {
+		let component = component.as_os_str().to_str()?;
+		let component = if index + 1 == count {
+			component.strip_suffix(".md")?
+		} else {
+			component
+		};
+		if component.is_empty() || component.starts_with('.') || component.contains(['/', '\\', ':'])
+		{
+			return None;
+		}
+		if !name.is_empty() {
+			name.push(':');
+		}
+		name.push_str(component);
+	}
+	(!name.is_empty()).then(|| Str::from(name))
 }
 
 fn load_hooks(root: &Path, source_id: Str, scope: SourceScope, output: &mut NativeDiscovery) {
@@ -680,5 +802,31 @@ mod tests {
 		fs::create_dir(root.join("nested")).expect("nested");
 		fs::write(root.join("nested/child.md"), "x").expect("child");
 		assert_eq!(scan_capability_dir(root), vec![root.join("kept.md")]);
+	}
+	#[test]
+	fn nested_command_paths_become_colon_names_and_parse_failures_warn() {
+		let tree = tempfile::tempdir().expect("tree");
+		let root = tree.path().join(".omp");
+		fs::create_dir_all(root.join("commands/git")).expect("commands");
+		fs::write(
+			root.join("commands/git/commit.md"),
+			"---\ndescription: Commit staged changes\n---\nReview and commit $ARGUMENTS",
+		)
+		.expect("command");
+		fs::write(root.join("commands/broken.md"), "---\ndescription: broken").expect("broken");
+		let mut output = NativeDiscovery::default();
+		load_root(&root, SourceScope::Project, &mut output);
+		assert!(output.declarations.iter().any(|declaration| {
+			matches!(
+				&declaration.payload,
+				CapabilityPayload::SlashCommands(command) if command.name == "git:commit"
+			)
+		}));
+		assert!(
+			output
+				.warnings
+				.iter()
+				.any(|warning| warning.contains("/broken"))
+		);
 	}
 }

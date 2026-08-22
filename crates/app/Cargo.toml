@@ -38,9 +38,13 @@ ring = { workspace = true }
 encoding_rs = { workspace = true }
 flume.workspace = true
 futures.workspace = true
+globset.workspace = true
 smallvec.workspace = true
 flate2.workspace = true
 http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["tokio"] }
 im = { workspace = true }
 itertools.workspace = true
 libc.workspace = true
@@ -51,14 +55,17 @@ miette = { workspace = true }
 omp-agent.workspace = true
 omp-ar = { workspace = true }
 omp-chat-ui.workspace = true
+omp-collab.workspace = true
 omp-core.workspace = true
 omp-docserver.workspace = true
+omp-desktop.workspace = true
 omp-env.workspace = true
 omp-grep.workspace = true
 omp-hashline.workspace = true
 omp-llm-catalog.workspace = true
 omp-llm-inference.workspace = true
 omp-memory.workspace = true
+omp-webview.workspace = true
 omp-oauth.workspace = true
 omp-proto = { workspace = true, features = ["tonic"] }
 omp-py.workspace = true
@@ -87,6 +94,7 @@ prost.workspace = true
 regex.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+handlebars.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -106,9 +114,6 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 flume = { workspace = true }
-http-body-util.workspace = true
-hyper.workspace = true
-hyper-util = { workspace = true, features = ["tokio"] }
 omp-llm-inference = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

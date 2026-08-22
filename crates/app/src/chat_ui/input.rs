@@ -244,6 +244,13 @@ pub const COMMANDS: &[CommandSpec] = &[
 		subcommands: &[],
 	},
 	CommandSpec {
+		name:        "theme",
+		aliases:     &[],
+		description: "Preview a JSON theme without committing settings",
+		usage:       "<environment-path> [256]",
+		subcommands: &[],
+	},
+	CommandSpec {
 		name:        "agents",
 		aliases:     &["tree"],
 		description: "Open the live agent hierarchy",
@@ -288,6 +295,30 @@ pub struct CommandContribution {
 	pub origin:      Str,
 	/// Optional prompt template dispatched when this command is submitted.
 	pub template:    Option<Str>,
+}
+
+const INIT_WORKFLOW_TEMPLATE: &str = r#"Use parallel `task` research agents for independent slices of the repository: core source, tests, configuration/build, and scripts/documentation. Synthesize their findings into one AGENTS.md.
+
+The document MUST:
+- be titled "Repository Guidelines" and use Markdown headings;
+- concisely explain project purpose, architecture and data flow, key directories, development commands, code conventions, important files, runtime/tooling preferences, and testing/QA;
+- include useful commands, paths, naming patterns, and architecture-specific guidance;
+- omit facts that are obvious from the directory tree.
+
+After analysis, write AGENTS.md to the project root."#;
+
+/// Returns native workflow templates used only when no discovered command
+/// claims the same name.
+#[must_use]
+pub fn embedded_workflow_commands() -> [CommandContribution; 1] {
+	[CommandContribution {
+		name:        sf!("init"),
+		aliases:     SmallVec::new(),
+		description: sf!("Generate AGENTS.md for the current codebase"),
+		hint:        None,
+		origin:      sf!("Bundled OMP workflow"),
+		template:    Some(sf!(INIT_WORKFLOW_TEMPLATE)),
+	}]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -492,6 +523,8 @@ pub enum ChatCommand {
 	Jobs,
 	/// Open settings.
 	Settings,
+	/// Preview a JSON theme read through the Environment.
+	Theme(Str),
 	/// Open the agent hierarchy.
 	Agents,
 	/// Pause the interactive host.
@@ -652,6 +685,8 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		"fresh" => ChatCommand::Fresh,
 		"jobs" => ChatCommand::Jobs,
 		"settings" => ChatCommand::Settings,
+		"theme" if !parsed.args.is_empty() => ChatCommand::Theme(Str::from(parsed.args)),
+		"theme" => return Err(InputError::MissingArgument { command: sf!("theme") }),
 		"agents" => ChatCommand::Agents,
 		"pause" => ChatCommand::Pause,
 		"live" => ChatCommand::Live,
@@ -804,13 +839,42 @@ pub fn expand_arguments(template: &str, args: &[Str]) -> String {
 	expand_arguments_with_fallback(template, args, &joined)
 }
 
-fn expand_arguments_with_fallback(template: &str, args: &[Str], fallback: &str) -> String {
+pub(crate) fn expand_arguments_with_fallback(
+	template: &str,
+	args: &[Str],
+	fallback: &str,
+) -> String {
 	let joined = args.iter().map(Str::as_str).collect::<Vec<_>>().join(" ");
 	let mut expanded = String::with_capacity(template.len().saturating_add(joined.len()));
 	let bytes = template.as_bytes();
 	let mut at = 0;
 	let mut substituted = false;
 	while at < bytes.len() {
+		if template[at..].starts_with("{{args}}") {
+			substituted = true;
+			expanded.push_str(&joined);
+			at += "{{args}}".len();
+			continue;
+		}
+		if template[at..].starts_with("{{arguments}}") {
+			substituted = true;
+			expanded.push_str(&joined);
+			at += "{{arguments}}".len();
+			continue;
+		}
+		if let Some(rest) = template[at..].strip_prefix("{{arg ")
+			&& let Some(close) = rest.find("}}")
+			&& let Ok(index) = rest[..close].trim().parse::<usize>()
+		{
+			substituted = true;
+			if index > 0
+				&& let Some(value) = args.get(index - 1)
+			{
+				expanded.push_str(value);
+			}
+			at += "{{arg ".len() + close + 2;
+			continue;
+		}
 		if bytes[at] != b'$' {
 			let ch = template[at..]
 				.chars()
@@ -1085,6 +1149,29 @@ mod tests {
 			expand_arguments("$@[2] literal=$@[x] recursive=$1", &[sf!("$@"), sf!("b")]),
 			"b literal=$@ b[x] recursive=$@"
 		);
+	}
+
+	#[test]
+	fn handlebars_arguments_expand_once_and_suppress_fallback() {
+		let args = [sf!("one"), sf!("$1")];
+		assert_eq!(
+			expand_arguments("{{args}} | {{arguments}} | {{arg 2}}", &args),
+			"one $1 | one $1 | $1"
+		);
+		assert_eq!(expand_arguments("no placeholder", &args), "no placeholder one $1");
+		assert_eq!(expand_arguments("missing={{arg 9}}", &args), "missing=");
+	}
+	#[test]
+	fn embedded_init_is_a_native_prompt_workflow() {
+		let roster = CommandRoster::new(vec![embedded_workflow_commands().into()]);
+		let ChatCommand::Submit { text, .. } = roster
+			.parse_input("/init focus on release tooling")
+			.unwrap()
+		else {
+			panic!("embedded workflow did not submit a prompt");
+		};
+		assert!(text.starts_with("Use parallel `task` research agents"));
+		assert!(text.ends_with("focus on release tooling"));
 	}
 
 	#[test]

@@ -2446,6 +2446,17 @@ impl crate::chat_ui::commands::FlowCommandHost for RpcCommandHost {
 	fn live(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
 		unavailable_command("live")
 	}
+
+	fn mcp(
+		&mut self,
+		_request: crate::chat_ui::commands::McpRequest,
+	) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("mcp")
+	}
+
+	fn memory(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+		unavailable_command("memory")
+	}
 }
 
 #[derive(Debug, Deserialize)]

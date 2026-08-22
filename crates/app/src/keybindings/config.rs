@@ -1,7 +1,7 @@
 //! Canonical TOML keybinding decoding and one-way legacy import.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	fs, io,
 	path::{Path, PathBuf},
 };
@@ -49,6 +49,160 @@ pub struct LoadedKeybindings {
 	pub config: KeybindingsConfig,
 	/// Source used for this load/import.
 	pub source: KeybindingsSource,
+}
+/// A duplicate chord in the effective profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeybindingConflict {
+	/// Normalized chord claimed by multiple actions.
+	pub chord:   Str,
+	/// Canonical action ids claiming the chord.
+	pub actions: Vec<Str>,
+}
+
+/// Fully inherited and validated bindings for one profile.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedKeybindings {
+	/// Canonical action ids and normalized chords.
+	pub bindings:  BTreeMap<Str, Vec<Str>>,
+	/// Ambiguous chords in the effective profile.
+	pub conflicts: Vec<KeybindingConflict>,
+}
+
+const LEGACY_ACTION_IDS: &[(&str, &str)] = &[
+	("interrupt", "app.interrupt"),
+	("cycleThinkingLevel", "app.thinking.cycle"),
+	("toggleThinking", "app.thinking.toggle"),
+	("cycleModelForward", "app.model.cycle_forward"),
+	("cycleModelBackward", "app.model.cycle_backward"),
+	("selectModel", "app.model.select"),
+	("externalEditor", "app.editor.external"),
+	("followUp", "app.message.follow_up"),
+	("retry", "app.retry"),
+	("dequeue", "app.message.dequeue"),
+	("pasteImage", "app.clipboard.paste_image"),
+	("newSession", "app.session.new"),
+	("fork", "app.session.fork"),
+	("resume", "app.session.resume"),
+	("observeSessions", "app.session.observe"),
+	("togglePlanMode", "app.plan.toggle"),
+	("cursorUp", "tui.editor.cursor_up"),
+	("cursorDown", "tui.editor.cursor_down"),
+	("submit", "tui.input.submit"),
+	("selectUp", "tui.select.up"),
+	("selectDown", "tui.select.down"),
+	("selectConfirm", "tui.select.confirm"),
+	("selectCancel", "tui.select.cancel"),
+];
+
+impl KeybindingsConfig {
+	/// Resolves profile inheritance, migrates legacy action names, validates
+	/// chords, and reports ambiguous effective bindings.
+	pub fn resolve(
+		&self,
+		profile: Option<&str>,
+	) -> Result<ResolvedKeybindings, KeybindingsConfigError> {
+		let profile = profile
+			.or(self.active.as_deref())
+			.ok_or(KeybindingsConfigError::NoActiveProfile)?;
+		let mut visiting = BTreeSet::new();
+		let mut bindings = BTreeMap::new();
+		self.resolve_into(profile, &mut visiting, &mut bindings)?;
+		let mut claims = BTreeMap::<Str, Vec<Str>>::new();
+		for (action, chords) in &bindings {
+			for chord in chords {
+				claims
+					.entry(chord.clone())
+					.or_default()
+					.push(action.clone());
+			}
+		}
+		let conflicts = claims
+			.into_iter()
+			.filter_map(|(chord, actions)| {
+				(actions.len() > 1).then_some(KeybindingConflict { chord, actions })
+			})
+			.collect();
+		Ok(ResolvedKeybindings { bindings, conflicts })
+	}
+
+	fn resolve_into(
+		&self,
+		name: &str,
+		visiting: &mut BTreeSet<Str>,
+		output: &mut BTreeMap<Str, Vec<Str>>,
+	) -> Result<(), KeybindingsConfigError> {
+		if !visiting.insert(Str::new(name)) {
+			return Err(KeybindingsConfigError::ProfileCycle { profile: name.to_owned() });
+		}
+		let profile = self
+			.profiles
+			.get(name)
+			.ok_or_else(|| KeybindingsConfigError::UnknownProfile { profile: name.to_owned() })?;
+		if let Some(parent) = profile.extends.as_deref() {
+			self.resolve_into(parent, visiting, output)?;
+		}
+		for (raw_action, raw_chords) in &profile.bindings {
+			let action = LEGACY_ACTION_IDS
+				.iter()
+				.find_map(|(legacy, canonical)| (*legacy == raw_action.as_str()).then_some(*canonical))
+				.unwrap_or(raw_action);
+			let chords = raw_chords
+				.iter()
+				.map(|chord| normalize_chord(chord))
+				.collect::<Result<Vec<_>, _>>()?;
+			output.insert(Str::new(action), chords);
+		}
+		visiting.remove(name);
+		Ok(())
+	}
+}
+
+/// Validates and canonicalizes a `modifier+key` chord.
+pub fn normalize_chord(chord: &str) -> Result<Str, KeybindingsConfigError> {
+	let parts = chord.split('+').map(str::trim).collect::<Vec<_>>();
+	if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+		return Err(KeybindingsConfigError::InvalidChord { chord: chord.to_owned() });
+	}
+	let key = parts[parts.len() - 1].to_ascii_lowercase();
+	if key.len() > 1
+		&& !matches!(
+			key.as_str(),
+			"enter"
+				| "escape"
+				| "tab" | "space"
+				| "backspace"
+				| "delete"
+				| "up" | "down"
+				| "left" | "right"
+				| "home" | "end"
+				| "pageup"
+				| "pagedown"
+		) && !key.strip_prefix('f').is_some_and(|number| {
+		number
+			.parse::<u8>()
+			.is_ok_and(|number| (1..=24).contains(&number))
+	}) {
+		return Err(KeybindingsConfigError::InvalidChord { chord: chord.to_owned() });
+	}
+	let mut modifiers = BTreeSet::new();
+	for modifier in &parts[..parts.len() - 1] {
+		let normalized = match modifier.to_ascii_lowercase().as_str() {
+			"control" => "ctrl",
+			"command" | "cmd" | "meta" => "super",
+			"option" => "alt",
+			"ctrl" => "ctrl",
+			"alt" => "alt",
+			"shift" => "shift",
+			"super" => "super",
+			_ => return Err(KeybindingsConfigError::InvalidChord { chord: chord.to_owned() }),
+		};
+		if !modifiers.insert(normalized) {
+			return Err(KeybindingsConfigError::InvalidChord { chord: chord.to_owned() });
+		}
+	}
+	let mut normalized = modifiers.into_iter().collect::<Vec<_>>();
+	normalized.push(&key);
+	Ok(Str::new(normalized.join("+")))
 }
 
 /// Decodes the only live format, native TOML.
@@ -151,6 +305,42 @@ mod tests {
 		let native = load(&directory.path().join("keybindings.toml")).expect("native");
 		assert!(matches!(native.source, KeybindingsSource::NativeToml(_)));
 	}
+	#[test]
+	fn profile_inheritance_normalizes_chords_and_reports_conflicts() {
+		let config = KeybindingsConfig {
+			active:   Some(Str::new_static("work")),
+			profiles: BTreeMap::from([
+				(Str::new_static("base"), KeybindingProfile {
+					extends:  None,
+					bindings: BTreeMap::from([(Str::new_static("submit"), vec![Str::new_static(
+						"Control+Enter",
+					)])]),
+				}),
+				(Str::new_static("work"), KeybindingProfile {
+					extends:  Some(Str::new_static("base")),
+					bindings: BTreeMap::from([(Str::new_static("retry"), vec![Str::new_static(
+						"ctrl+enter",
+					)])]),
+				}),
+			]),
+		};
+		let resolved = config.resolve(None).expect("resolve");
+		assert_eq!(resolved.bindings["tui.input.submit"], vec![Str::new_static("ctrl+enter")]);
+		assert_eq!(resolved.conflicts.len(), 1);
+	}
+
+	#[test]
+	fn profile_cycles_and_invalid_chords_are_rejected() {
+		let config = KeybindingsConfig {
+			active:   Some(Str::new_static("loop")),
+			profiles: BTreeMap::from([(Str::new_static("loop"), KeybindingProfile {
+				extends:  Some(Str::new_static("loop")),
+				bindings: BTreeMap::new(),
+			})]),
+		};
+		assert!(matches!(config.resolve(None), Err(KeybindingsConfigError::ProfileCycle { .. })));
+		assert!(normalize_chord("ctrl+ctrl+x").is_err());
+	}
 }
 
 /// Native keybinding configuration failure.
@@ -194,4 +384,16 @@ pub enum KeybindingsConfigError {
 		#[source]
 		source: io::Error,
 	},
+	/// No profile was explicitly requested or selected.
+	#[error("no active keybinding profile is selected")]
+	NoActiveProfile,
+	/// A selected or inherited profile does not exist.
+	#[error("unknown keybinding profile {profile}")]
+	UnknownProfile { profile: String },
+	/// Profile inheritance contains a cycle.
+	#[error("keybinding profile inheritance cycle at {profile}")]
+	ProfileCycle { profile: String },
+	/// A chord has invalid modifiers, key spelling, or duplicate modifiers.
+	#[error("invalid keybinding chord {chord}")]
+	InvalidChord { chord: String },
 }

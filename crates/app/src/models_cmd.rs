@@ -1,14 +1,25 @@
-//! Read-only model catalog commands over the validated embedded registry.
+//! Model catalog commands with inference-routed runtime discovery refresh.
 
-use miette::miette;
-use omp_llm_catalog::{ModelSpec, snapshot::Catalog};
+use std::{
+	collections::BTreeMap,
+	time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use crate::usage_error::CliUsageError;
+use miette::{IntoDiagnostic as _, miette};
+use omp_core::Str;
+use omp_llm_catalog::{DiscoveredModel, ModelSpec, OperationBits, ProviderId, snapshot::Catalog};
+use omp_llm_inference::{
+	Client,
+	call::{CallMeta, DiscoveryRequest, Target},
+	discovery::DiscoveryStore,
+	id::RequestId,
+	receipt::ExecutionBudget,
+};
 
-/// Runs a model catalog operation. Remote refresh is intentionally explicit:
-/// this binary currently ships only the verified immutable snapshot and has no
-/// provider-discovery refresh backend to invoke.
-pub fn run(args: &crate::cli::ModelsArgs) -> miette::Result<()> {
+/// Runs a model catalog operation. Refresh travels through the same inference
+/// routes and credentials used at call time, then atomically updates only the
+/// runtime discovery cache.
+pub async fn run(args: &crate::cli::ModelsArgs) -> miette::Result<()> {
 	let catalog = Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
 	match args.command.as_ref() {
 		None => print_rows(&select(catalog, args.filter.as_deref(), args.role), args.json),
@@ -18,13 +29,122 @@ pub fn run(args: &crate::cli::ModelsArgs) -> miette::Result<()> {
 		Some(crate::cli::ModelsCommand::Find { pattern, json }) => {
 			print_rows(&select(catalog, Some(pattern), None), *json)
 		},
-		Some(crate::cli::ModelsCommand::Refresh) => Err(
-			CliUsageError::new(
-				"model refresh is unavailable: no provider discovery backend is configured",
-			)
-			.into(),
-		),
+		Some(crate::cli::ModelsCommand::Refresh) => refresh().await,
 	}
+}
+
+async fn refresh() -> miette::Result<()> {
+	let data_dir = crate::cli::data_dir(None)?;
+	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
+	let credentials =
+		crate::daemon::open_credential_store(data_dir.join("credentials.db")).into_diagnostic()?;
+	let registry = crate::daemon::production_registry(&data_dir, credentials)
+		.await
+		.into_diagnostic()?;
+	let catalog = registry.catalog();
+	let mut routes = BTreeMap::<ProviderId, Vec<_>>::new();
+	for route in catalog
+		.routes()
+		.iter()
+		.filter(|route| route.discovery.is_some())
+	{
+		routes
+			.entry(route.provider.clone())
+			.or_default()
+			.push(route.id.clone());
+	}
+	let store = DiscoveryStore::open(&data_dir.join("models.db")).into_diagnostic()?;
+	let now_ms = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.into_diagnostic()?
+		.as_millis()
+		.try_into()
+		.map_err(|_| miette!("system clock exceeds discovery timestamp range"))?;
+	let mut refreshed = 0_usize;
+	let mut failures = Vec::new();
+	for (provider, provider_routes) in routes {
+		let mut rows = Vec::new();
+		for route in provider_routes {
+			let planner =
+				omp_llm_inference::router::Router::new(registry.clone(), Duration::from_secs(30));
+			let meta = CallMeta {
+				id:       RequestId::from(format!("omp-model-refresh-{}", provider.as_str())),
+				target:   Target::ProviderService(provider.clone()),
+				deadline: None,
+				budget:   ExecutionBudget::default(),
+				session:  None,
+			};
+			let mut cursor = None;
+			loop {
+				let page = Client::new(registry.service(), planner.clone(), meta.clone())
+					.execute(DiscoveryRequest {
+						provider:  Some(provider.clone()),
+						route:     Some(route.clone()),
+						cursor:    cursor.clone(),
+						page_size: 500,
+						operation: None,
+					})
+					.await;
+				let page = match page {
+					Ok(page) => page,
+					Err(error) => {
+						failures.push(format!("{}: {error}", provider.as_str()));
+						break;
+					},
+				};
+				rows.extend(
+					page
+						.models
+						.iter()
+						.filter_map(|model| discovered(model, &provider, &route, now_ms)),
+				);
+				cursor = page.next_cursor;
+				if cursor.is_none() {
+					break;
+				}
+			}
+		}
+		if !rows.is_empty() {
+			store
+				.publish(&provider, &rows, now_ms, Duration::from_secs(24 * 60 * 60))
+				.into_diagnostic()?;
+			refreshed = refreshed.saturating_add(rows.len());
+		}
+	}
+	for failure in failures {
+		eprintln!("warning: discovery refresh failed for {failure}");
+	}
+	println!("refreshed {refreshed} runtime model row(s); configured catalog models remain visible");
+	Ok(())
+}
+
+fn discovered(
+	model: &ModelSpec,
+	provider: &ProviderId<str>,
+	route: &omp_llm_catalog::RouteId<str>,
+	now_ms: u64,
+) -> Option<DiscoveredModel> {
+	let wire_model = model
+		.wire_ids
+		.iter()
+		.find_map(|(candidate, wire)| (candidate == route).then(|| wire.clone()))?;
+	Some(DiscoveredModel {
+		provider: provider.to_owned(),
+		route: route.to_owned(),
+		wire_model,
+		aliases: Box::new([]),
+		display_name: Some(model.display_name.clone()),
+		declared_class: Some(model.class.clone()),
+		declared_operations: OperationBits::empty(),
+		declared_capabilities: Some(model.capabilities.clone()),
+		declared_limits: Some(model.limits.clone()),
+		extended_context_mode: None,
+		availability: Some(model.availability.clone()),
+		source: Str::new_static("runtime-inference-discovery"),
+		observed_at_ms: Some(now_ms),
+		updated_at_ms: None,
+		deprecated: None,
+	})
 }
 
 fn select<'a>(
@@ -75,10 +195,7 @@ fn select<'a>(
 
 fn print_rows(rows: &[&ModelSpec], json: bool) -> miette::Result<()> {
 	if json {
-		println!(
-			"{}",
-			serde_json::to_string_pretty(rows).map_err(|error| miette!(error.to_string()))?
-		);
+		println!("{}", serde_json::to_string_pretty(rows).into_diagnostic()?);
 		return Ok(());
 	}
 	for model in rows {

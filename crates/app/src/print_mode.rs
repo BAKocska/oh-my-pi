@@ -100,6 +100,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		additional_roots: args.add_dir.clone().into_boxed_slice(),
 		model,
 		resume: None,
+		fork: None,
 		py_eval: false,
 		session_generation: 1,
 	})

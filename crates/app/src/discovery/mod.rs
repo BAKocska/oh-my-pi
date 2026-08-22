@@ -7,6 +7,7 @@ pub mod containment;
 pub mod context;
 pub mod custom_tools;
 pub mod foreign;
+pub mod managed_skills;
 pub mod manifest;
 pub mod mcp;
 pub mod mcp_ssh;
@@ -14,6 +15,7 @@ pub mod models;
 pub mod native;
 pub mod packages;
 pub mod project;
+pub mod prompts;
 pub mod registry;
 pub mod roles;
 pub mod rules;
@@ -25,6 +27,7 @@ pub mod slash_commands;
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use futures::future::join_all;
+use omp_core::Str;
 use omp_llm_catalog::{
 	ContextStrategy, Pricing, RouteId, ThinkingPolicyId, WirePolicyId,
 	discover::{DiscoveredModel, DiscoveryDefaults, DiscoveryNormalizer, NormalizedDiscovery},
@@ -40,9 +43,11 @@ use self::{
 #[derive(Clone, Debug)]
 pub struct ActiveContentSnapshots {
 	/// Active skills.
-	pub skills: Arc<crate::skills::SkillSnapshot>,
+	pub skills:   Arc<crate::skills::SkillSnapshot>,
 	/// Active declarative rules.
-	pub rules:  Arc<crate::rulebook::RuleSnapshot>,
+	pub rules:    Arc<crate::rulebook::RuleSnapshot>,
+	/// Active native Markdown slash commands in discovery precedence order.
+	pub commands: Arc<[crate::chat_ui::input::CommandContribution]>,
 }
 
 /// Discovers native repository/user content once and freezes the skill/rule
@@ -55,12 +60,46 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 	let foreign = foreign::discover(root, &foreign::ForeignContentSettings::default());
 	discovered.declarations.extend(foreign.skills);
 	discovered.declarations.extend(foreign.rules);
+	let managed = managed_skills::discover_dead_last(
+		&native::user_config_root(&home),
+		&skills::SkillDiscoverySettings::default(),
+	);
+	discovered.declarations.extend(managed.declarations);
+	let mut commands = discovered
+		.declarations
+		.iter()
+		.filter_map(|declaration| {
+			let manifest::CapabilityPayload::SlashCommands(command) = &declaration.payload else {
+				return None;
+			};
+			let origin = match declaration.source.scope {
+				manifest::SourceScope::Project => "Project .omp",
+				manifest::SourceScope::User => "User .omp",
+				_ => "OMP command",
+			};
+			Some(crate::chat_ui::input::CommandContribution {
+				name:        command.name.clone(),
+				aliases:     smallvec::SmallVec::new(),
+				description: command.description.clone(),
+				hint:        Some(Str::new_static("[arguments]")),
+				origin:      Str::new_static(origin),
+				template:    Some(command.content.clone()),
+			})
+		})
+		.collect::<Vec<_>>();
+	if !commands
+		.iter()
+		.any(|command| command.name.as_str().eq_ignore_ascii_case("init"))
+	{
+		commands.extend(crate::chat_ui::input::embedded_workflow_commands());
+	}
 	ActiveContentSnapshots {
-		skills: Arc::new(crate::skills::SkillSnapshot::from_declarations(&discovered.declarations)),
-		rules:  Arc::new(crate::rulebook::RuleSnapshot::from_declarations(
+		skills:   Arc::new(crate::skills::SkillSnapshot::from_declarations(&discovered.declarations)),
+		rules:    Arc::new(crate::rulebook::RuleSnapshot::from_declarations(
 			&discovered.declarations,
 			&crate::rulebook::RulebookSettings::default(),
 		)),
+		commands: commands.into(),
 	}
 }
 

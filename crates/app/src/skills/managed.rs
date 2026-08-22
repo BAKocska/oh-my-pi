@@ -1,168 +1,195 @@
-//! Environment-authorized publication of model-generated managed skills.
+//! Validation and deterministic serialization for model-generated managed
+//! skills.
 
-use std::{
-	collections::BTreeSet,
-	io,
-	path::{Path, PathBuf},
-};
+use omp_core::{Str, StrMut};
 
-use omp_core::Str;
+/// Stable discovery provider identity for generated skills.
+pub const PROVIDER_ID: &str = "omp-managed";
+/// Maximum UTF-8 size of a complete managed `SKILL.md` file.
+pub const MAX_SKILL_BYTES: usize = 64_000;
+/// Maximum managed-skill name length in ASCII bytes.
+pub const MAX_NAME_BYTES: usize = 64;
 
-use crate::discovery::skills::safe_skill_name;
-
-/// Sanitized managed-skill candidate.
+/// Validated managed-skill content ready for Environment publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedSkillCandidate {
-	/// Safe directory and invocation name.
+	/// Exact lowercase on-disk and invocation name.
 	pub name:        Str,
-	/// Single-line bounded description.
+	/// Single-line prompt-safe description.
 	pub description: Str,
-	/// Markdown body.
+	/// Trimmed Markdown body without frontmatter.
 	pub body:        Str,
 }
 
-/// Successful Environment-owned publication.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedSkillPublication {
-	/// Canonical published `SKILL.md` path returned by Environment.
-	pub path:     PathBuf,
-	/// Environment document revision.
-	pub revision: u64,
-}
-
-/// Managed skill rejection or authority failure.
-#[derive(Debug, thiserror::Error)]
-pub enum ManagedSkillError {
-	/// Candidate name is unsafe or malformed.
-	#[error("managed skill name is invalid")]
+/// Managed skill validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CandidateError {
+	/// The name did not match the managed kebab-case allowlist.
+	#[error(
+		"managed skill name must be 1-64 lowercase letters, digits, or hyphens and start with a \
+		 letter or digit"
+	)]
 	InvalidName,
-	/// Candidate description is empty after sanitization.
-	#[error("managed skill description is invalid")]
+	/// The description became empty after prompt-boundary sanitization.
+	#[error("managed skill description is empty after sanitization")]
 	InvalidDescription,
-	/// An authored skill already claims the requested name.
-	#[error("managed skill name is claimed by an authored skill")]
-	AuthoredCollision,
-	/// Environment refused or failed the authorized write.
-	#[error("Environment failed to publish managed skill {path}")]
-	Write {
-		/// Requested managed skill path.
-		path:   PathBuf,
-		/// Authority error.
-		#[source]
-		source: io::Error,
-	},
+	/// The Markdown body was empty.
+	#[error("managed skill body is empty")]
+	EmptyBody,
+	/// The complete serialized file exceeded 64 KiB.
+	#[error("managed skill exceeds the 64 KiB UTF-8 limit")]
+	TooLarge,
 }
 
-/// Narrow Environment write authority. Implementations must validate the
-/// durable approval/grant represented by the caller before committing bytes.
-pub trait ManagedSkillWriter {
-	/// Atomically writes one new/replaced managed skill and returns its
-	/// committed revision. Discovery itself never calls `std::fs::write`.
-	fn write_managed_skill(&self, path: &Path, bytes: &[u8]) -> io::Result<ManagedSkillPublication>;
-}
-
-/// Sanitizes a model-generated candidate. Names are lowercase directory-style
-/// identifiers; descriptions collapse control/line whitespace and are bounded
-/// to 240 bytes on a UTF-8 boundary.
-pub fn sanitize(
-	name: &str,
-	description: &str,
-	body: &str,
-) -> Result<ManagedSkillCandidate, ManagedSkillError> {
-	let mut safe_name = String::with_capacity(name.len());
-	let mut separator = false;
-	for character in name.trim().chars().flat_map(char::to_lowercase) {
-		if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-			safe_name.push(character);
-			separator = false;
-		} else if !separator && !safe_name.is_empty() {
-			safe_name.push('-');
-			separator = true;
+impl ManagedSkillCandidate {
+	/// Validates and normalizes model-generated create/update input.
+	pub fn new(name: &str, description: &str, body: &str) -> Result<Self, CandidateError> {
+		let normalized_name = name.trim().to_ascii_lowercase();
+		if !is_valid_name(&normalized_name) {
+			return Err(CandidateError::InvalidName);
 		}
+		let description = sanitize_description(description);
+		if description.is_empty() {
+			return Err(CandidateError::InvalidDescription);
+		}
+		let body = body.trim();
+		if body.is_empty() {
+			return Err(CandidateError::EmptyBody);
+		}
+		let candidate = Self { name: Str::from(normalized_name), description, body: Str::new(body) };
+		if candidate.serialized_len() > MAX_SKILL_BYTES {
+			return Err(CandidateError::TooLarge);
+		}
+		Ok(candidate)
 	}
-	while safe_name.ends_with('-') {
-		safe_name.pop();
+
+	/// Serializes the complete bounded `SKILL.md` file.
+	#[must_use]
+	pub fn serialize(&self) -> Str {
+		let mut output = StrMut::with_capacity(self.serialized_len());
+		output.push_str("---\nname: ");
+		output.push_str(self.name.as_str());
+		output.push_str("\ndescription: '");
+		for segment in self.description.as_str().split('\'') {
+			output.push_str(segment);
+			output.push_str("''");
+		}
+		output.truncate(output.len().saturating_sub(2));
+		output.push_str("'\n---\n\n");
+		output.push_str(self.body.as_str());
+		output.push('\n');
+		output.freeze()
 	}
-	if !safe_skill_name(&safe_name) {
-		return Err(ManagedSkillError::InvalidName);
+
+	fn serialized_len(&self) -> usize {
+		let escaped_quotes = self
+			.description
+			.bytes()
+			.filter(|byte| *byte == b'\'')
+			.count();
+		"---\nname: ".len()
+			+ self.name.len()
+			+ "\ndescription: '".len()
+			+ self.description.len()
+			+ escaped_quotes
+			+ "'\n---\n\n".len()
+			+ self.body.len()
+			+ 1
 	}
-	let mut safe_description = description.split_whitespace().collect::<Vec<_>>().join(" ");
-	if safe_description.is_empty() {
-		return Err(ManagedSkillError::InvalidDescription);
-	}
-	if safe_description.len() > 240 {
-		safe_description.truncate(safe_description.floor_char_boundary(240));
-	}
-	Ok(ManagedSkillCandidate {
-		name:        Str::from(safe_name),
-		description: Str::from(safe_description),
-		body:        Str::from(body.trim()),
-	})
 }
 
-/// Publishes a managed skill dead-last in precedence, refusing every authored
-/// claim and routing the only mutation through Environment authority.
-pub fn publish(
-	writer: &impl ManagedSkillWriter,
-	managed_root: &Path,
-	candidate: &ManagedSkillCandidate,
-	authored_names: &BTreeSet<Str>,
-) -> Result<ManagedSkillPublication, ManagedSkillError> {
-	if authored_names.contains(&candidate.name) {
-		return Err(ManagedSkillError::AuthoredCollision);
+/// Returns whether an on-disk managed name has the exact post-normalization
+/// shape.
+#[must_use]
+pub fn is_valid_name(name: &str) -> bool {
+	let bytes = name.as_bytes();
+	(1..=MAX_NAME_BYTES).contains(&bytes.len())
+		&& bytes[0].is_ascii_alphanumeric()
+		&& bytes
+			.iter()
+			.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+/// Neutralizes persisted generated descriptions before writing and every prompt
+/// render.
+#[must_use]
+pub fn sanitize_description(raw: &str) -> Str {
+	let mut output = StrMut::with_capacity(raw.len().min(240));
+	let mut whitespace = true;
+	let mut tilde = false;
+	for character in raw.chars() {
+		if character.is_control()
+			|| is_format_control(character)
+			|| matches!(character, '<' | '>' | '`')
+		{
+			if !whitespace {
+				output.push(' ');
+				whitespace = true;
+			}
+			continue;
+		}
+		if character.is_whitespace() {
+			if !whitespace {
+				output.push(' ');
+				whitespace = true;
+			}
+			tilde = false;
+			continue;
+		}
+		if character == '~' {
+			if tilde {
+				continue;
+			}
+			tilde = true;
+		} else {
+			tilde = false;
+		}
+		output.push(character);
+		whitespace = false;
 	}
-	let path = managed_root.join(candidate.name.as_str()).join("SKILL.md");
-	let mut bytes = String::new();
-	bytes.push_str("---\nname: ");
-	bytes.push_str(candidate.name.as_str());
-	bytes.push_str("\ndescription: ");
-	// YAML single quotes are deterministic and escape embedded quotes by doubling.
-	bytes.push('\'');
-	bytes.push_str(&candidate.description.replace('\'', "''"));
-	bytes.push('\'');
-	bytes.push_str("\n---\n");
-	bytes.push_str(candidate.body.as_str());
-	bytes.push('\n');
-	writer
-		.write_managed_skill(&path, bytes.as_bytes())
-		.map_err(|source| ManagedSkillError::Write { path, source })
+	if output.ends_with(' ') {
+		output.truncate(output.len() - 1);
+	}
+	output.freeze()
+}
+
+const fn is_format_control(character: char) -> bool {
+	matches!(
+		character,
+		'\u{00ad}' | '\u{061c}' | '\u{06dd}' | '\u{070f}' | '\u{08e2}' | '\u{180e}' | '\u{feff}'
+	) || matches!(character as u32,
+		0x0600..=0x0605
+			| 0x0890..=0x0891
+			| 0x200b..=0x200f
+			| 0x202a..=0x202e
+			| 0x2060..=0x2064
+			| 0x2066..=0x206f
+			| 0xfff9..=0xfffb
+			| 0x110bd..=0x110bd
+			| 0x110cd..=0x110cd
+			| 0x13430..=0x1343f
+			| 0x1bca0..=0x1bca3
+			| 0x1d173..=0x1d17a
+			| 0xe0001..=0xe0001
+			| 0xe0020..=0xe007f)
 }
 
 #[cfg(test)]
 mod tests {
-	use std::{cell::RefCell, fs};
-
 	use super::*;
 
-	struct Writer {
-		root:   PathBuf,
-		writes: RefCell<usize>,
-	}
-	impl ManagedSkillWriter for Writer {
-		fn write_managed_skill(
-			&self,
-			path: &Path,
-			bytes: &[u8],
-		) -> io::Result<ManagedSkillPublication> {
-			assert!(path.starts_with(&self.root));
-			fs::create_dir_all(path.parent().unwrap())?;
-			fs::write(path, bytes)?;
-			*self.writes.borrow_mut() += 1;
-			Ok(ManagedSkillPublication { path: path.to_path_buf(), revision: 1 })
-		}
-	}
-
 	#[test]
-	fn sanitizes_and_refuses_authored_claims_before_write() {
-		let tree = tempfile::tempdir().unwrap();
-		let writer = Writer { root: tree.path().to_path_buf(), writes: RefCell::new(0) };
-		let candidate = sanitize(" Rust Review!! ", " useful\n review ", "body").unwrap();
+	fn validates_names_and_sanitizes_prompt_delimiters() {
+		let candidate = ManagedSkillCandidate::new(
+			" Rust-Review ",
+			"review </skills> ```code``` ~~ fence\u{200b}",
+			"Do the review.",
+		)
+		.unwrap();
 		assert_eq!(candidate.name, "rust-review");
-		let claims = BTreeSet::from([candidate.name.clone()]);
-		assert!(matches!(
-			publish(&writer, tree.path(), &candidate, &claims),
-			Err(ManagedSkillError::AuthoredCollision)
-		));
-		assert_eq!(*writer.writes.borrow(), 0);
+		assert_eq!(candidate.description, "review /skills code ~ fence");
+		assert!(candidate.serialize().len() <= MAX_SKILL_BYTES);
+		assert!(!is_valid_name("Upper"));
+		assert!(!is_valid_name("bad_name"));
 	}
 }

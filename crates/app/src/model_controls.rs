@@ -206,16 +206,16 @@ mod tests {
 			model("provider/preferred"),
 		)]));
 		let journaled = controls.switch_session("default", model("provider/temporary"), None);
-		assert_eq!(controls.effective("default"), Some(ModelKey::from_ref("provider/temporary")));
+		assert_eq!(controls.effective("default"), Some(&model("provider/temporary")));
 
 		let mut resumed = ModelControls::from_durable(BTreeMap::from([(
 			"default".into(),
 			model("provider/preferred"),
 		)]));
 		resumed.restore_override(Some(journaled));
-		assert_eq!(resumed.effective("default"), Some(ModelKey::from_ref("provider/temporary")));
+		assert_eq!(resumed.effective("default"), Some(&model("provider/temporary")));
 		resumed.clear_override();
-		assert_eq!(resumed.effective("default"), Some(ModelKey::from_ref("provider/preferred")));
+		assert_eq!(resumed.effective("default"), Some(&model("provider/preferred")));
 	}
 
 	#[test]

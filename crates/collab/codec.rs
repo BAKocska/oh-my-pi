@@ -199,14 +199,6 @@ enum Node {
 	Snapshot,
 	#[strum(serialize = "JournalRecord")]
 	Journal,
-	#[strum(serialize = "CompactionRecord")]
-	Compaction,
-	#[strum(serialize = "ModelChangeRecord")]
-	ModelChange,
-	#[strum(serialize = "ThinkingLevelChangeRecord")]
-	ThinkingChange,
-	#[strum(serialize = "CustomRecord")]
-	Custom,
 	StreamEvent,
 	ToolExecution,
 	Notice,
@@ -264,11 +256,7 @@ impl Node {
 			(Self::Welcome, 3) => Some(Self::SessionState),
 			(Self::Welcome, 4) => Some(Self::Registry),
 			(Self::Snapshot, 1) => Some(Self::Journal),
-			(Self::Journal, 4) => Some(Self::Opaque),
-			(Self::Journal, 5) => Some(Self::Compaction),
-			(Self::Journal, 6) => Some(Self::ModelChange),
-			(Self::Journal, 7) => Some(Self::ThinkingChange),
-			(Self::Journal, 8) => Some(Self::Custom),
+			(Self::Journal, 2) => Some(Self::Opaque),
 			(Self::StreamEvent, 2) => Some(Self::Opaque),
 			(Self::StreamEvent, 3) => Some(Self::ToolExecution),
 			(Self::StreamEvent, 4) => Some(Self::Notice),
@@ -333,6 +321,8 @@ fn scan_message(encoded: &[u8], node: Node, depth: usize, base: usize) -> Result
 					.map_err(|_| CodecError::Malformed { offset: base + length_offset })?;
 				let limit = if matches!(node, Node::RelayEnvelope) && field == 3 {
 					FRAME_MAX_BYTES + NONCE_BYTES + TAG_BYTES
+				} else if matches!(node, Node::Journal) && field == 2 {
+					FRAME_MAX_BYTES
 				} else {
 					FIELD_MAX_BYTES
 				};

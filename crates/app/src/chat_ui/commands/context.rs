@@ -16,11 +16,15 @@ pub fn render(snapshot: &ContextSnapshot) -> Str {
 	let mut output = String::with_capacity(320);
 	let _ = writeln!(
 		output,
-		"Context · turn {} · projection {}",
-		snapshot.turn_id, snapshot.projection_revision
+		"Context · turn {} · anchor {} · revision {} · epoch {}",
+		snapshot.turn_id,
+		snapshot.prompt_anchor,
+		snapshot.context_revision,
+		snapshot.compaction_epoch
 	);
 	category(&mut output, "System", snapshot.system_tokens);
 	category(&mut output, "Messages", snapshot.message_tokens);
+	category(&mut output, "Skills", snapshot.skill_tokens);
 	category(&mut output, "Tools", snapshot.tool_tokens);
 	category(&mut output, "Buffers", snapshot.buffer_tokens);
 	let _ = writeln!(output, "Unclassified/unavailable: {} tokens", snapshot.unclassified_tokens);

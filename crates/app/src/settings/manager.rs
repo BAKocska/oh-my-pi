@@ -8,8 +8,9 @@ use std::{
 };
 
 use omp_settings::{
-	DomainRevision, FieldDescriptor, Revision, SettingScope, SettingsDomain, SettingsSnapshot,
-	SnapshotPublisher, Subscription, deep_merge, registered_domains,
+	DomainRevision, DynamicOption, FieldDescriptor, OptionProvider, Revision, SettingScope,
+	SettingsDomain, SettingsSnapshot, SnapshotPublisher, Subscription, deep_merge,
+	registered_domains,
 };
 use parking_lot::{Mutex, RwLock};
 
@@ -48,6 +49,29 @@ pub struct SettingsPaths {
 	pub project:  Option<PathBuf>,
 	/// Ordered read-only native overlays.
 	pub overlays: Vec<PathBuf>,
+}
+/// One reflected row consumed by the settings overlay.
+#[derive(Clone, Debug)]
+pub struct SettingsEditorField {
+	/// Owning runtime domain.
+	pub domain:     &'static str,
+	/// Type-owned field contract.
+	pub descriptor: FieldDescriptor,
+	/// Current merged value, masked when secret.
+	pub value:      Option<toml::Value>,
+	/// Options resolved at query time.
+	pub options:    Arc<[DynamicOption]>,
+	/// Whether the field condition currently holds.
+	pub visible:    bool,
+}
+
+/// One of the ten stable settings-overlay panels.
+#[derive(Clone, Debug)]
+pub struct SettingsEditorPanel {
+	/// Stable panel identifier.
+	pub id:     &'static str,
+	/// Descriptor-ordered fields.
+	pub fields: Vec<SettingsEditorField>,
 }
 
 impl SettingsPaths {
@@ -217,6 +241,70 @@ impl SettingsManager {
 		fields
 	}
 
+	/// Builds a current, secret-safe editor model from typed descriptors.
+	#[must_use]
+	pub fn editor_panels(&self) -> Vec<SettingsEditorPanel> {
+		const IDS: &[&str] = &[
+			"appearance",
+			"model",
+			"interaction",
+			"context",
+			"files_shell",
+			"tools_tasks",
+			"orchestration",
+			"providers",
+			"extensions",
+			"lifecycle",
+		];
+		let snapshot = self.snapshot();
+		let mut panels = IDS
+			.iter()
+			.map(|id| SettingsEditorPanel { id, fields: Vec::new() })
+			.collect::<Vec<_>>();
+		for domain in registered_domains() {
+			let target = panels
+				.iter_mut()
+				.find(|panel| panel.id == panel_for_domain(domain.name))
+				.expect("domain panel exists");
+			let mut fields = domain.fields.to_vec();
+			fields.sort_unstable_by_key(|field| (field.order, field.path));
+			for descriptor in fields {
+				let raw = value_at(snapshot.document(), descriptor.path).cloned();
+				let value = if descriptor.secret {
+					raw.as_ref()
+						.map(|_| toml::Value::String("********".to_owned()))
+				} else {
+					raw
+				};
+				let options = match descriptor.options {
+					Some(OptionProvider::Static(options)) => options
+						.iter()
+						.map(|option| DynamicOption {
+							value:       Arc::from(option.value),
+							label:       Arc::from(option.label),
+							description: option.description.map(Arc::from),
+						})
+						.collect::<Vec<_>>()
+						.into(),
+					Some(OptionProvider::Dynamic(provider)) => provider(),
+					None => Arc::from([]),
+				};
+				let visible = descriptor.condition.is_none_or(|condition| {
+					value_at(snapshot.document(), condition.field)
+						.is_some_and(|value| scalar_spelling(value) == condition.equals)
+				});
+				target.fields.push(SettingsEditorField {
+					domain: domain.name,
+					descriptor,
+					value,
+					options,
+					visible,
+				});
+			}
+		}
+		panels
+	}
+
 	/// Sets one reflected value. Persistent mutations are serialized, lock and
 	/// re-read the target, then merge only this whole field before replacement.
 	pub async fn set(
@@ -365,6 +453,40 @@ fn report_quarantine(diagnostic: &QuarantineDiagnostic) {
 	);
 }
 
+fn value_at<'a>(document: &'a toml::Table, path: &str) -> Option<&'a toml::Value> {
+	let mut segments = path.split('.');
+	let mut value = document.get(segments.next()?)?;
+	for segment in segments {
+		value = value.as_table()?.get(segment)?;
+	}
+	Some(value)
+}
+
+fn scalar_spelling(value: &toml::Value) -> String {
+	match value {
+		toml::Value::String(value) => value.clone(),
+		toml::Value::Integer(value) => value.to_string(),
+		toml::Value::Float(value) => value.to_string(),
+		toml::Value::Boolean(value) => value.to_string(),
+		_ => value.to_string(),
+	}
+}
+
+fn panel_for_domain(domain: &str) -> &'static str {
+	match domain {
+		"tui" | "chat_ui" | "appearance" => "appearance",
+		"model" | "catalog" | "inference" => "model",
+		"interaction" | "voice" | "collaboration" => "interaction",
+		"agent" | "memory" | "compaction" => "context",
+		"files" | "shell" | "lsp" | "eval" => "files_shell",
+		"tools" | "tasks" | "approvals" => "tools_tasks",
+		"orchestration" | "subagent" => "orchestration",
+		"providers" | "search" => "providers",
+		"extensions" | "mcp" => "extensions",
+		_ => "lifecycle",
+	}
+}
+
 fn compose_document(
 	global: toml::Table,
 	project: toml::Table,
@@ -412,16 +534,6 @@ fn load_overlays(paths: &[PathBuf]) -> Result<Vec<toml::Table>, SettingsManagerE
 		.iter()
 		.map(|path| read_document(path).map_err(Into::into))
 		.collect()
-}
-
-fn value_at<'a>(document: &'a toml::Table, path: &str) -> Option<&'a toml::Value> {
-	let mut segments = path.split('.');
-	let first = segments.next()?;
-	let mut value = document.get(first)?;
-	for segment in segments {
-		value = value.as_table()?.get(segment)?;
-	}
-	Some(value)
 }
 
 fn apply_runtime(document: &mut toml::Table, mutation: &DocumentMutation) {

@@ -363,6 +363,47 @@ impl McpManager {
 		StartupSnapshot { status: self.service.status(None), completed }
 	}
 
+	/// Atomically refreshes live mounts from the Environment configuration
+	/// authority after a successful mutation.
+	pub async fn replace_config_entries(self: &Arc<Self>, entries: Vec<pb::McpConfigEntry>) {
+		let mut declarations = BTreeMap::new();
+		for entry in entries {
+			if declarations.contains_key(entry.name.as_str()) {
+				continue;
+			}
+			let Ok(config) = serde_json::from_slice::<McpServerConfig>(&entry.server_json) else {
+				tracing::warn!(
+					server = %entry.name,
+					"MCP config refresh skipped an invalid declaration"
+				);
+				continue;
+			};
+			if !config.enabled {
+				continue;
+			}
+			let values = ResolvedTransportValues {
+				env:     config
+					.env
+					.iter()
+					.map(|(name, value)| (name.clone(), ResolvedConfigValue::Public(value.clone())))
+					.collect(),
+				headers: config
+					.headers
+					.iter()
+					.map(|(name, value)| (name.clone(), ResolvedConfigValue::Public(value.clone())))
+					.collect(),
+			};
+			declarations.insert(Str::from(entry.name.as_str()), MountSpec {
+				name: Str::from(entry.name),
+				config: Arc::new(config),
+				config_json: entry.server_json,
+				values,
+				auth_headers: None,
+			});
+		}
+		let _ = self.start(declarations.into_values().collect()).await;
+	}
+
 	/// Enables or disables exact resource subscriptions across every live
 	/// server. Reconnects replay the desired set and stale completions roll
 	/// themselves back.

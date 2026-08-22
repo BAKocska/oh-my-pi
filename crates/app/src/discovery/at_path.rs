@@ -17,6 +17,16 @@ pub fn expand_at_paths(path: &Path) -> io::Result<String> {
 	let mut visited = BTreeSet::new();
 	expand(path, 0, &mut visited)
 }
+/// Expands local `@path` references in an already-parsed instruction field.
+///
+/// Relative references resolve beside `source`. The source itself is marked
+/// visited so an instruction cannot recursively import its containing YAML
+/// document.
+pub fn expand_at_text(text: &str, source: &Path) -> io::Result<String> {
+	let canonical = fs::canonicalize(source)?;
+	let mut visited = BTreeSet::from([canonical.clone()]);
+	expand_content(text, canonical.parent().unwrap_or(Path::new("")), 0, &mut visited)
+}
 /// Extracts unique `@path`, `@'path'`, and `@"path"` mentions in first-seen
 /// order.
 ///
@@ -88,6 +98,18 @@ fn expand(path: &Path, depth: usize, visited: &mut BTreeSet<PathBuf>) -> io::Res
 		return Ok(String::new());
 	}
 	let content = fs::read_to_string(&canonical)?;
+	let rendered =
+		expand_content(&content, canonical.parent().unwrap_or(Path::new("")), depth, visited)?;
+	visited.remove(&canonical);
+	Ok(rendered)
+}
+
+fn expand_content(
+	content: &str,
+	base: &Path,
+	depth: usize,
+	visited: &mut BTreeSet<PathBuf>,
+) -> io::Result<String> {
 	let mut fenced = None::<&str>;
 	let mut rendered = String::with_capacity(content.len());
 	for line in content.split_inclusive('\n') {
@@ -109,14 +131,8 @@ fn expand(path: &Path, depth: usize, visited: &mut BTreeSet<PathBuf>) -> io::Res
 			rendered.push_str(line);
 			continue;
 		}
-		rendered.push_str(&expand_line(
-			line,
-			canonical.parent().unwrap_or(Path::new("")),
-			depth,
-			visited,
-		)?);
+		rendered.push_str(&expand_line(line, base, depth, visited)?);
 	}
-	visited.remove(&canonical);
 	Ok(rendered)
 }
 

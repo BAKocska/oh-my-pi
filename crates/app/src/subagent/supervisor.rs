@@ -68,7 +68,7 @@ impl<C: TurnClient> SupervisedRuntime<C> {
 
 struct ChildHandle {
 	commands: flume::Sender<ChildCommand>,
-	abort:    Arc<RwLock<AbortHandle>>,
+	abort:    Arc<RwLock<Option<AbortHandle>>>,
 	state:    Arc<SubagentRunState>,
 }
 
@@ -81,8 +81,14 @@ struct RunCommand {
 
 enum ChildCommand {
 	Run(RunCommand),
-	Park(flume::Sender<Result<(), SupervisorError>>),
+	Park(ParkReason, flume::Sender<Result<(), SupervisorError>>),
 	Teardown(flume::Sender<()>),
+}
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum ParkReason {
+	Parked,
+	Stop,
 }
 
 /// Session-owned durable child-loop authority.
@@ -117,6 +123,12 @@ impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 		*self.parent_jobs.write() = Some(jobs);
 	}
 
+	/// Returns the parent board used for self-delivering durable child turns.
+	#[must_use]
+	pub fn parent_jobs(&self) -> Option<Arc<JobBoard>> {
+		self.parent_jobs.read().clone()
+	}
+
 	/// Registers and starts ownership of one configured child loop.
 	pub fn register(
 		&self,
@@ -130,15 +142,47 @@ impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 			return Err(SupervisorError::AlreadyRegistered { id });
 		}
 		let state = Arc::new(SubagentRunState::new(id.clone()));
-		let abort = Arc::new(RwLock::new(runtime.agent.abort_handle()));
+		let abort = Arc::new(RwLock::new(Some(runtime.agent.abort_handle())));
 		let (commands, receiver) = flume::unbounded();
 		let tree = Arc::clone(&self.tree);
 		let loop_state = Arc::clone(&state);
 		tokio::spawn(child_loop(
 			node,
 			tree,
-			runtime,
+			Some(runtime),
 			reviver,
+			Arc::clone(&abort),
+			loop_state,
+			receiver,
+		));
+		children.insert(id, ChildHandle { commands, abort, state: Arc::clone(&state) });
+		Ok(state)
+	}
+
+	/// Registers a journal-recovered identity without constructing live
+	/// resources.
+	pub fn register_parked(
+		&self,
+		node: Arc<AgentNode>,
+		reviver: Arc<dyn ChildReviver<C>>,
+	) -> Result<Arc<SubagentRunState>, SupervisorError> {
+		let id = node.id.clone();
+		let mut children = self.children.write();
+		if children.contains_key(&id) {
+			return Err(SupervisorError::AlreadyRegistered { id });
+		}
+		let state = Arc::new(SubagentRunState::new(id.clone()));
+		state.transition(SubagentLifecycle::Settled)?;
+		state.transition(SubagentLifecycle::Parked)?;
+		let abort = Arc::new(RwLock::new(None));
+		let (commands, receiver) = flume::unbounded();
+		let tree = Arc::clone(&self.tree);
+		let loop_state = Arc::clone(&state);
+		tokio::spawn(child_loop(
+			node,
+			tree,
+			None,
+			Some(reviver),
 			Arc::clone(&abort),
 			loop_state,
 			receiver,
@@ -237,13 +281,24 @@ impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 		let child = children
 			.get(id)
 			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::from(id) })?;
-		child.abort.read().abort();
+		if let Some(abort) = child.abort.read().as_ref() {
+			abort.abort();
+		}
 		Ok(())
 	}
 
 	/// Releases one idle loop's live resources while retaining its state and
 	/// reviver.
 	pub async fn park(&self, id: &str) -> Result<(), SupervisorError> {
+		self.park_with_reason(id, ParkReason::Parked).await
+	}
+
+	/// Releases a cancelled loop within the stop lifecycle.
+	pub async fn park_stopped(&self, id: &str) -> Result<(), SupervisorError> {
+		self.park_with_reason(id, ParkReason::Stop).await
+	}
+
+	async fn park_with_reason(&self, id: &str, reason: ParkReason) -> Result<(), SupervisorError> {
 		let commands = self
 			.children
 			.read()
@@ -252,7 +307,7 @@ impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::from(id) })?;
 		let (reply, response) = flume::bounded(1);
 		commands
-			.send_async(ChildCommand::Park(reply))
+			.send_async(ChildCommand::Park(reason, reply))
 			.await
 			.map_err(|_| SupervisorError::Stopped { id: Str::from(id) })?;
 		response
@@ -278,7 +333,9 @@ impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 			.write()
 			.remove(id)
 			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::from(id) })?;
-		child.abort.read().abort();
+		if let Some(abort) = child.abort.read().as_ref() {
+			abort.abort();
+		}
 		let (reply, response) = flume::bounded(1);
 		child
 			.commands
@@ -295,7 +352,9 @@ impl<C: TurnClient + Send + 'static> SessionSupervisor<C> {
 impl<C: TurnClient + Send + 'static> Drop for SessionSupervisor<C> {
 	fn drop(&mut self) {
 		for (_, child) in self.children.get_mut().drain() {
-			child.abort.read().abort();
+			if let Some(abort) = child.abort.read().as_ref() {
+				abort.abort();
+			}
 			let (reply, _) = flume::bounded(1);
 			let _ = child.commands.send(ChildCommand::Teardown(reply));
 		}
@@ -305,13 +364,12 @@ impl<C: TurnClient + Send + 'static> Drop for SessionSupervisor<C> {
 async fn child_loop<C: TurnClient + Send + 'static>(
 	node: Arc<AgentNode>,
 	tree: Arc<AgentTree>,
-	runtime: SupervisedRuntime<C>,
+	mut runtime: Option<SupervisedRuntime<C>>,
 	reviver: Option<Arc<dyn ChildReviver<C>>>,
-	abort: Arc<RwLock<AbortHandle>>,
+	abort: Arc<RwLock<Option<AbortHandle>>>,
 	state: Arc<SubagentRunState>,
 	commands: flume::Receiver<ChildCommand>,
 ) {
-	let mut runtime = Some(runtime);
 	while let Ok(command) = commands.recv_async().await {
 		match command {
 			ChildCommand::Run(command) => {
@@ -329,17 +387,22 @@ async fn child_loop<C: TurnClient + Send + 'static>(
 				.await;
 				let _ = command.reply.send(result);
 			},
-			ChildCommand::Park(reply) => {
+			ChildCommand::Park(reason, reply) => {
 				let result = if reviver.is_none() {
 					Err(SupervisorError::RevivalUnavailable { id: node.id.clone() })
 				} else if state.lifecycle() != SubagentLifecycle::Settled {
 					Err(SupervisorError::NotIdle { id: node.id.clone() })
 				} else {
-					runtime = None;
-					node.set_status(AgentStatus::Settled);
-					state
-						.transition(SubagentLifecycle::Parked)
-						.map_err(SupervisorError::State)
+					let journaled = runtime.as_mut().map_or(Ok(()), |runtime| {
+						record_lifecycle(runtime, &state, &node.id, <&'static str>::from(reason), None)
+					});
+					journaled.and_then(|()| {
+						runtime = None;
+						node.set_status(AgentStatus::Settled);
+						state
+							.transition(SubagentLifecycle::Parked)
+							.map_err(SupervisorError::State)
+					})
 				};
 				let _ = reply.send(result);
 			},
@@ -358,12 +421,13 @@ async fn run_child<C: TurnClient + Send + 'static>(
 	state: &SubagentRunState,
 	runtime: &mut Option<SupervisedRuntime<C>>,
 	reviver: Option<&Arc<dyn ChildReviver<C>>>,
-	abort: &RwLock<AbortHandle>,
+	abort: &RwLock<Option<AbortHandle>>,
 	items: Vec<Item>,
 	turn_id: TurnId,
 	settings: &TaskSettings,
 ) -> Result<AgentRunSummary, SupervisorError> {
 	let first_turn = state.lifecycle() == SubagentLifecycle::Created;
+	let reopening = state.lifecycle() == SubagentLifecycle::Parked;
 	match state.lifecycle() {
 		SubagentLifecycle::Created => state.transition(SubagentLifecycle::Starting)?,
 		SubagentLifecycle::Settled | SubagentLifecycle::Parked => {
@@ -375,11 +439,32 @@ async fn run_child<C: TurnClient + Send + 'static>(
 		let factory =
 			reviver.ok_or_else(|| SupervisorError::RevivalUnavailable { id: node.id.clone() })?;
 		*runtime = Some(factory.revive().await?);
-		*abort.write() = runtime
-			.as_ref()
-			.expect("reviver produced a live runtime")
-			.agent
-			.abort_handle();
+		*abort.write() = Some(
+			runtime
+				.as_ref()
+				.expect("reviver produced a live runtime")
+				.agent
+				.abort_handle(),
+		);
+	}
+	let runtime = runtime
+		.as_mut()
+		.expect("runtime was restored before lifecycle publication");
+	record_lifecycle(
+		runtime,
+		state,
+		&node.id,
+		if first_turn {
+			"spawn"
+		} else if reopening {
+			"reopen"
+		} else {
+			"turn-started"
+		},
+		None,
+	)?;
+	if first_turn || reopening {
+		record_lifecycle(runtime, state, &node.id, "turn-started", None)?;
 	}
 	let permit = tree.admit(1).await?;
 	state.transition(SubagentLifecycle::Running)?;
@@ -397,17 +482,7 @@ async fn run_child<C: TurnClient + Send + 'static>(
 		..SubagentActivity::default()
 	})?;
 	node.set_status(AgentStatus::Running);
-	let result = supervised_submit(
-		state,
-		runtime
-			.as_mut()
-			.expect("runtime was restored before submission"),
-		abort,
-		items,
-		turn_id,
-		settings,
-	)
-	.await;
+	let result = supervised_submit(state, runtime, abort, items, turn_id, settings).await;
 	drop(permit);
 	match result {
 		Ok(summary) => {
@@ -417,6 +492,7 @@ async fn run_child<C: TurnClient + Send + 'static>(
 				SubagentTerminalKind::Succeeded
 			};
 			settle(state, kind)?;
+			record_lifecycle(runtime, state, &node.id, "turn-settled", Some(kind))?;
 			node.set_status(if summary.interrupted {
 				AgentStatus::Cancelled
 			} else {
@@ -426,31 +502,79 @@ async fn run_child<C: TurnClient + Send + 'static>(
 		},
 		Err(SupervisorError::RuntimeLimit { .. }) => {
 			settle(state, SubagentTerminalKind::RuntimeLimit)?;
+			record_lifecycle(
+				runtime,
+				state,
+				&node.id,
+				"turn-settled",
+				Some(SubagentTerminalKind::RuntimeLimit),
+			)?;
 			node.set_status(AgentStatus::Exhausted);
 			result
 		},
 		Err(SupervisorError::RequestBudget { .. }) => {
 			settle(state, SubagentTerminalKind::Failed)?;
+			record_lifecycle(
+				runtime,
+				state,
+				&node.id,
+				"turn-settled",
+				Some(SubagentTerminalKind::Failed),
+			)?;
 			node.set_status(AgentStatus::Exhausted);
 			result
 		},
 		Err(SupervisorError::Agent(AgentError::Interrupted)) => {
 			settle(state, SubagentTerminalKind::Cancelled)?;
+			record_lifecycle(
+				runtime,
+				state,
+				&node.id,
+				"turn-settled",
+				Some(SubagentTerminalKind::Cancelled),
+			)?;
 			node.set_status(AgentStatus::Cancelled);
 			Err(SupervisorError::Agent(AgentError::Interrupted))
 		},
 		Err(error) => {
 			settle(state, SubagentTerminalKind::Failed)?;
+			record_lifecycle(
+				runtime,
+				state,
+				&node.id,
+				"turn-settled",
+				Some(SubagentTerminalKind::Failed),
+			)?;
 			node.set_status(AgentStatus::Failed);
 			Err(error)
 		},
 	}
 }
 
+fn record_lifecycle<C: TurnClient>(
+	runtime: &mut SupervisedRuntime<C>,
+	state: &SubagentRunState,
+	child_id: &Str,
+	lifecycle: &'static str,
+	terminal: Option<SubagentTerminalKind>,
+) -> Result<(), SupervisorError> {
+	runtime.agent.record_child_lifecycle(
+		now_ms(),
+		omp_storage::transcript::ChildLifecycleEntry {
+			child_id:        child_id.clone(),
+			generation:      state.generation().0,
+			init_event:      0,
+			lifecycle:       Str::new(lifecycle),
+			terminal_status: terminal.map(|kind| Str::from(kind.to_string())),
+		},
+	)?;
+	Ok(())
+}
+
 async fn supervised_submit<C: TurnClient + Send + 'static>(
 	state: &SubagentRunState,
 	runtime: &mut SupervisedRuntime<C>,
-	abort: &RwLock<AbortHandle>,
+	abort: &RwLock<Option<AbortHandle>>,
 	items: Vec<Item>,
 	turn_id: TurnId,
 	settings: &TaskSettings,
@@ -477,7 +601,9 @@ async fn supervised_submit<C: TurnClient + Send + 'static>(
 				}
 			},
 			() = tokio::time::sleep_until(deadline), if settings.max_runtime_ms != 0 => {
-				abort.read().abort();
+				if let Some(abort) = abort.read().as_ref() {
+					abort.abort();
+				}
 				let _ = tokio::time::timeout(Duration::from_secs(5), &mut submission).await;
 				return Err(SupervisorError::RuntimeLimit {
 					max_runtime_ms: settings.max_runtime_ms,
@@ -492,7 +618,7 @@ fn handle_event(
 	event: &AgentEvent,
 	mailbox: &omp_agent::MailboxSender,
 	settings: &TaskSettings,
-	abort: &RwLock<AbortHandle>,
+	abort: &RwLock<Option<AbortHandle>>,
 ) -> Result<bool, SupervisorError> {
 	match event {
 		AgentEvent::Turn { event, .. } => match event.event.as_ref() {
@@ -529,7 +655,9 @@ fn handle_event(
 					);
 				}
 				if u64::from(requests) >= stop.saturating_add(5) {
-					abort.read().abort();
+					if let Some(abort) = abort.read().as_ref() {
+						abort.abort();
+					}
 					return Ok(true);
 				}
 			},
@@ -630,6 +758,9 @@ pub enum SupervisorError {
 	/// Agent loop failure.
 	#[error(transparent)]
 	Agent(#[from] AgentError),
+	/// Durable lifecycle publication failed.
+	#[error(transparent)]
+	Journal(#[from] omp_agent::JournalError),
 	/// Core-owned lifecycle mutation failed.
 	#[error(transparent)]
 	State(#[from] SubagentStateError),
@@ -697,6 +828,12 @@ pub enum SupervisorError {
 	/// Memory parking is unavailable without an equivalent cold reviver.
 	#[error("subagent {id} has no cold-revival factory")]
 	RevivalUnavailable {
+		/// Stable ID.
+		id: Str,
+	},
+	/// The application could not reconstruct an equivalent parked loop.
+	#[error("subagent {id} cold revival failed")]
+	RevivalFailed {
 		/// Stable ID.
 		id: Str,
 	},

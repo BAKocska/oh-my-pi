@@ -1244,7 +1244,17 @@ mod tests {
 			.await
 			.expect("document hello");
 		let workspace = WorkspaceHost::open(root).expect("workspace host");
-		WorkspaceSearchAdapter::new(workspace, documents)
+		let read_sources = crate::envd::tool_read_sources::ReadSourceAdapter::new(
+			documents.clone(),
+			workspace.clone(),
+			crate::envd::document_cache::project_document_cache(root),
+		);
+		WorkspaceSearchAdapter::new(
+			workspace,
+			documents,
+			read_sources,
+			std::sync::Arc::new(ResolverTable::default()),
+		)
 	}
 
 	fn search_request(

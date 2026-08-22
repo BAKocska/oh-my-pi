@@ -1,6 +1,7 @@
 //! Production built-in tool registry assembly.
 
 use std::{
+	collections::BTreeSet,
 	future::Future,
 	sync::{
 		Arc, LazyLock,
@@ -36,11 +37,12 @@ use super::{
 	exec_settings::{AcpRouting, AcpSettings, ShellSettings},
 	media_devices,
 	search_backend::SearchBridgeHost,
+	tool_debug::DocumentDebugControl,
 	tool_lsp::DocumentLspControl,
 	tool_read_sources::ReadSourceAdapter,
 	tool_search::WorkspaceSearchAdapter,
 	tool_settings::ToolSettings,
-	tool_shell::ShellExecHost,
+	tool_shell::{AcpExecSlot, ShellExecHost},
 	tool_url::production_url_resolvers,
 	worker::ExtHostSupervisor,
 	workspace::WorkspaceHost,
@@ -51,7 +53,7 @@ use super::{
 /// Resource adapters are cloned into their typed executors. Worker declarations
 /// occupy device presentation entries and explicit worker routes; only the
 /// environment's worker supervisor can invoke them.
-pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
+pub(crate) fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	documents: &DocumentHost,
 	blobs: &BlobHost,
 	exec: &ExecHost,
@@ -60,6 +62,7 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	github_cache: Arc<omp_storage::github_cache::GithubCache>,
 	mcp: &Arc<super::mcp::McpService>,
 	workspace: &WorkspaceHost,
+	memory: &Arc<omp_memory::MemoryRuntime>,
 	telemetry: &Arc<omp_storage::telemetry_index::TelemetryIndex>,
 	root_uri: &Str,
 	workers: &ExtHostSupervisor,
@@ -67,6 +70,8 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	tool_settings: &ToolSettings,
 	shell_settings: &ShellSettings,
 	acp_settings: &AcpSettings,
+	acp_exec: AcpExecSlot,
+	autolearn_settings: &crate::settings::AutolearnSettings,
 	device_invoker: I,
 	policy: ToolsPolicy,
 	mut registry: Registry,
@@ -74,6 +79,7 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	(
 		Arc<Registry>,
 		Arc<SessionBridgeHost>,
+		Arc<crate::memory::ReflectionBridgeHost>,
 		omp_tools::eval::EvalSessionControl,
 		AgentCheckpointControl,
 		Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
@@ -92,10 +98,12 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		"eval",
 		"task",
 		"hub",
+		"browser",
 		"learn",
 		"manage_skill",
 		"computer",
 		"lsp",
+		"debug",
 	]);
 	for name in [
 		"read",
@@ -115,16 +123,42 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		"checkpoint",
 		"rewind",
 		"hub",
+		"browser",
+		"github",
 		"image_gen",
 		"tts",
 		"report_issue",
 		"vibe",
+		"retain",
+		"recall",
+		"reflect",
+		"memory_edit",
+		"learn",
+		"manage_skill",
 		"dyn",
 		"lsp",
+		"debug",
+		"computer",
 	] {
 		ensure_name_absent(&registry, name)?;
 	}
-	for device in [media_devices::image_gen(), media_devices::tts()] {
+	let search_bridge = Arc::new(SearchBridgeHost::new());
+	let browser_daemon = crate::browser_daemon::BrowserDaemon::start(blobs.clone());
+	registry.register(
+		omp_tools::browser::tool(browser_daemon),
+		Presentation::Device,
+		builtin_device_claims(),
+	)?;
+	let computer = super::computer::ComputerSessionHost::new(blobs.clone());
+	registry.register(
+		omp_tools::computer::tool(computer),
+		Presentation::Device,
+		builtin_device_claims(),
+	)?;
+	for device in [
+		media_devices::image_gen(Arc::clone(&search_bridge), blobs.clone()),
+		media_devices::tts(Arc::clone(&search_bridge), blobs.clone()),
+	] {
 		registry.register(device, Presentation::Device, builtin_device_claims())?;
 	}
 	registry.register(
@@ -133,9 +167,74 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		builtin_device_claims(),
 	)?;
 	registry.register(crate::vibe::tool(), Presentation::Device, builtin_device_claims())?;
-	let checkpoint_control = AgentCheckpointControl::default();
-	let search_bridge = Arc::new(SearchBridgeHost::new());
+	let active = crate::discovery::active_content_snapshots(workspace.root());
+	let reflection_bridge = Arc::new(crate::memory::ReflectionBridgeHost::new());
+	let memory_capabilities = memory.capabilities();
+	if memory_capabilities.writable {
+		registry.register(
+			omp_tools::memory::retain_tool(Arc::clone(memory)),
+			Presentation::Device,
+			builtin_device_claims(),
+		)?;
+	}
+	if memory_capabilities.searchable {
+		registry.register(
+			omp_tools::memory::recall_tool(Arc::clone(memory)),
+			Presentation::Device,
+			builtin_device_claims(),
+		)?;
+		registry.register(
+			omp_tools::memory::reflect_tool(Arc::clone(memory), Arc::clone(&reflection_bridge)),
+			Presentation::Device,
+			builtin_device_claims(),
+		)?;
+	}
+	if memory_capabilities.editable {
+		registry.register(
+			omp_tools::memory_edit::tool(Arc::clone(memory)),
+			Presentation::Device,
+			builtin_device_claims(),
+		)?;
+	}
+	if autolearn_settings.enabled {
+		let home = std::env::var_os("HOME")
+			.map_or_else(|| workspace.root().to_path_buf(), std::path::PathBuf::from);
+		let authored_names = active
+			.skills
+			.all()
+			.iter()
+			.filter(|skill| skill.source.as_str() != crate::skills::managed::PROVIDER_ID)
+			.map(|skill| skill.name.clone())
+			.collect::<BTreeSet<_>>();
+		let authority = Arc::new(super::managed_skills::ManagedSkills::new(
+			crate::discovery::managed_skills::root(&crate::discovery::native::user_config_root(&home)),
+			authored_names,
+		));
+		registry.register(
+			omp_tools::manage_skill::tool(Arc::clone(&authority)),
+			Presentation::Device,
+			builtin_device_claims(),
+		)?;
+		if memory_capabilities.writable {
+			registry.register(
+				omp_tools::learn::tool(Arc::clone(memory), authority),
+				Presentation::Device,
+				builtin_device_claims(),
+			)?;
+		}
+	}
 	let github_credentials = Arc::new(super::github_url::GithubCredentialBridge::new());
+	let github = super::github::GithubService::new(
+		workspace.root().to_path_buf(),
+		state_dir,
+		Arc::clone(&github_credentials),
+	);
+	crate::telemetry_upload::start(Arc::clone(telemetry), Arc::clone(&github_credentials));
+	registry.register(
+		omp_tools::github::tool(github),
+		Presentation::Device,
+		builtin_device_claims(),
+	)?;
 	let ssh = super::ssh::SshService::new(
 		super::ssh::HostStore::load(&state_dir.join("ssh/hosts.toml"))
 			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
@@ -152,7 +251,6 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		super::document_cache::project_document_cache(state_dir),
 	);
 	let conflicts = Arc::new(ConflictRegistry::default());
-	let active = crate::discovery::active_content_snapshots(workspace.root());
 	let resolvers = production_url_resolvers(
 		Arc::clone(&conflicts),
 		blobs.store().clone(),
@@ -203,13 +301,14 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	if tool_settings.enabled("fetch") && tool_settings.fetch_enabled {
 		registry.register(fetch, Presentation::Slot, core_claims())?;
 	}
-	if tool_settings.enabled("web_search") {
-		registry.register(
-			omp_tools::web_search::tool(Arc::clone(&search_bridge)),
-			Presentation::Slot,
-			core_claims(),
-		)?;
-	}
+	let web_search_identity = if tool_settings.enabled("web_search") {
+		let web_search = omp_tools::web_search::tool(Arc::clone(&search_bridge));
+		let identity = web_search.spec().identity();
+		registry.register(web_search, Presentation::Slot, core_claims())?;
+		Some(identity)
+	} else {
+		None
+	};
 
 	let mut hashline_edit = Some(omp_tools::edit::tool_with_snapshots(
 		documents.clone(),
@@ -328,6 +427,17 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 			core_claims(),
 		)?;
 	}
+	if tool_settings.enabled("debug") {
+		let maximum = tool_settings
+			.max_timeout
+			.and_then(|duration| duration.to_std().ok())
+			.unwrap_or_else(|| std::time::Duration::from_secs(300));
+		registry.register(
+			omp_tools::debug::tool(DocumentDebugControl::new(documents.clone()), maximum),
+			Presentation::Slot,
+			core_claims(),
+		)?;
+	}
 	let search = WorkspaceSearchAdapter::new(
 		workspace.clone(),
 		documents.clone(),
@@ -385,7 +495,10 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	}
 	if tool_settings.enabled("ask") {
 		registry.register(
-			omp_tools::ask::tool(omp_chat_ui::ask::presenter()),
+			omp_tools::ask::tool_with_vocalizer(
+				omp_chat_ui::ask::presenter(),
+				media_devices::ask_vocalizer(),
+			),
 			Presentation::Slot,
 			core_claims(),
 		)?;
@@ -401,12 +514,18 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 			core_claims(),
 		)?;
 	}
-	if tool_settings.enabled("hub") {
-		registry.register(crate::chat::chat_hub_tool(), Presentation::Slot, core_claims())?;
-	}
+	let hub_identity = if tool_settings.enabled("hub") {
+		let hub = crate::chat::chat_hub_tool();
+		let identity = hub.spec().identity();
+		registry.register(hub, Presentation::Slot, core_claims())?;
+		Some(identity)
+	} else {
+		None
+	};
 	if tool_settings.enabled("yield") {
 		registry.register(omp_tools::yield_tool::tool(), Presentation::Slot, core_claims())?;
 	}
+	let checkpoint_control = AgentCheckpointControl::default();
 	let (checkpoint, rewind) = omp_tools::checkpoint::tools(checkpoint_control.clone());
 	if tool_settings.enabled("checkpoint") {
 		registry.register(checkpoint, Presentation::Slot, core_claims())?;
@@ -451,7 +570,13 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 			minimizer_enabled: shell_settings.minimizer.enabled,
 		};
 		let shell = omp_tools::shell::shell_with_snapshot_and_timeout_bounds(
-			ShellExecHost::new(exec.clone(), root_uri.clone(), shell_settings.clone()),
+			ShellExecHost::new(
+				exec.clone(),
+				root_uri.clone(),
+				shell_settings.clone(),
+				acp_exec,
+				acp_settings.routing != AcpRouting::Never,
+			),
 			shell_timeout_bounds(tool_settings),
 			&snapshot,
 		)
@@ -466,13 +591,15 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 		None
 	};
 	register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
-		edit:  tool_settings.enabled("edit").then_some(edit_identity),
-		grep:  tool_settings.enabled("grep").then_some(grep_identity),
-		glob:  tool_settings.enabled("glob").then_some(glob_identity),
-		shell: shell_identity,
-		write: tool_settings.enabled("write").then_some(write_identity),
-		read:  tool_settings.enabled("read").then_some(read_identity),
-		eval:  eval_identity,
+		edit:       tool_settings.enabled("edit").then_some(edit_identity),
+		grep:       tool_settings.enabled("grep").then_some(grep_identity),
+		web_search: web_search_identity,
+		glob:       tool_settings.enabled("glob").then_some(glob_identity),
+		shell:      shell_identity,
+		hub:        hub_identity,
+		write:      tool_settings.enabled("write").then_some(write_identity),
+		read:       tool_settings.enabled("read").then_some(read_identity),
+		eval:       eval_identity,
 	})
 	.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
 	let flattened_slots = if policy == ToolsPolicy::ToolOnly {
@@ -535,6 +662,7 @@ pub fn production_registry<I: omp_tools::device::DeviceInvoker + 'static>(
 	Ok((
 		registry,
 		eval_host,
+		reflection_bridge,
 		eval_control,
 		checkpoint_control,
 		resolvers,

@@ -10,9 +10,14 @@ use omp_agent::{
 	ApprovalInbox, ApprovalRoute, Budget, EventSubscription, InProcTurnClient, TurnId,
 };
 use omp_core::{Str, sf};
+use omp_llm_catalog::ModelKey;
 use omp_llm_inference::Registry as InferenceRegistry;
 use omp_proto::thread::v1::Item;
 use omp_sdk::{SessionHandle, SessionIdentity, SessionRuntime};
+use omp_storage::transcript::{
+	ModelChange as JournalModelChange, ModelId as JournalModelId, ModelRef as JournalModelRef,
+	ProviderId as JournalProviderId,
+};
 
 use self::finalize::{FinalizerBudget, FinalizerReport, HeadlessFinalizerHandle};
 use crate::{
@@ -32,6 +37,8 @@ pub struct HeadlessSessionOptions {
 	pub model:              Str,
 	/// Existing durable session to resume, or a fresh journal when absent.
 	pub resume:             Option<Str>,
+	/// Existing durable session whose live projection is copied into a fork.
+	pub fork:               Option<Str>,
 	/// Whether the Python eval device is enabled.
 	pub py_eval:            bool,
 	/// Session-incarnation fence stamped onto observable events.
@@ -44,6 +51,8 @@ pub struct HeadlessSessionOptions {
 /// dropped before the project Environment authority.
 pub struct HeadlessSession {
 	session:             SessionHandle,
+	state:               AgentState,
+	control:             omp_agent::ControlSender,
 	env:                 omp_env::EnvClient,
 	modes:               Arc<ExecutionModes>,
 	tree:                Arc<AgentTree>,
@@ -87,13 +96,17 @@ impl HeadlessSession {
 		.wrap_err("could not start the project Environment for headless mode")?;
 		let env = environment.client().clone();
 		let registry = environment.registry();
-		let session = chat::open_session(
+		let open = if let Some(source) = options.fork.as_ref() {
+			chat::SessionOpen::Fork(source)
+		} else if let Some(source) = options.resume.as_ref() {
+			chat::SessionOpen::Resume(source)
+		} else {
+			chat::SessionOpen::New
+		};
+		let mut session = chat::open_session(
 			&root,
 			&sessions_dir,
-			options
-				.resume
-				.as_ref()
-				.map_or(chat::SessionOpen::New, chat::SessionOpen::Resume),
+			open,
 			registry.as_ref(),
 			Some(environment.sessions_index()),
 		)
@@ -107,21 +120,37 @@ impl HeadlessSession {
 			Arc::clone(&registry),
 		)
 		.map_err(|error| miette::miette!(error))?;
-		let snapshot =
+		let mut snapshot =
 			chat::agent_snapshot(&blueprint, catalog).map_err(|error| miette::miette!(error))?;
-		let mut state = AgentState::new(snapshot);
+		if options.resume.is_some() || options.fork.is_some() {
+			let journal_path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
+			let revived = omp_agent::revive_existing(&journal_path, session.journal, snapshot)
+				.map_err(|error| miette::miette!(error))?;
+			session.journal = revived.journal;
+			session.initial_items = revived.live_items;
+			snapshot = revived.snapshot;
+			if let Some(model) = revived.model_override
+				&& !model.fallback
+			{
+				snapshot.turn.params.model =
+					format!("{}/{}", model.model.provider.0, model.model.model.0);
+			}
+		}
+		let autolearn = omp_agent::AutolearnSettings {
+			enabled:        settings.autolearn.enabled
+				&& registry
+					.devices()
+					.any(|device| device.name.as_str() == "manage_skill"),
+			auto_continue:  settings.autolearn.auto_continue,
+			min_tool_calls: settings.autolearn.min_tool_calls,
+		};
+		let state = AgentState::new(snapshot);
 		let (inference_registry, inference, credential_authority) =
 			crate::daemon::production_inference(&data_dir, Arc::clone(&registry), Some(&root))
 				.await
 				.into_diagnostic()?;
-		environment
-			.search_bridge()
-			.bind(inference.clone())
-			.into_diagnostic()?;
-		environment
-			.github_credentials()
-			.bind(credential_authority)
-			.map_err(|_| miette::miette!("GitHub credential authority is already bound"))?;
+		let _ = environment.search_bridge().bind(inference.clone());
+		let _ = environment.github_credentials().bind(credential_authority);
 		let client = InProcTurnClient::new(inference).await.into_diagnostic()?;
 		let journal_path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
 		let content = crate::discovery::active_content_snapshots(&root);
@@ -131,12 +160,26 @@ impl HeadlessSession {
 		}
 		let mut agent =
 			Agent::new(client, env.clone(), state.clone(), session.journal, chat::CHAT_CAPS_BASE);
+		agent.set_autolearn(autolearn);
 		blueprint.configure_agent(&mut agent);
 		agent.set_ttsr_registry(ttsr);
 		agent
 			.events()
 			.set_session_generation(options.session_generation);
-		let modes = Arc::new(ExecutionModes::new(agent.execution_mode()));
+		let control = agent.control();
+		let (mode_store, projection) = crate::modes::persistence::ModePersistence::open(
+			agent.journal(),
+			control.clone(),
+			session.id.as_str(),
+			root.to_string_lossy().as_ref(),
+		)
+		.map_err(|error| miette::miette!(error))?;
+		let modes = Arc::new(ExecutionModes::from_projection(
+			agent.execution_mode(),
+			projection.unwrap_or_default(),
+		));
+		modes.attach_persistence(mode_store);
+		modes.bind_plan_selection(state.clone(), None);
 		state.update(|snapshot| {
 			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
 		});
@@ -166,6 +209,8 @@ impl HeadlessSession {
 		let (approval_route, approval_inbox) = ApprovalRoute::new(Arc::clone(&approval_book));
 		Ok(Self {
 			session: session_handle,
+			state,
+			control,
 			env,
 			modes,
 			tree,
@@ -208,6 +253,85 @@ impl HeadlessSession {
 	#[must_use]
 	pub const fn env(&self) -> &omp_env::EnvClient {
 		&self.env
+	}
+
+	/// Binds or clears the session-scoped ACP terminal execution capability.
+	pub(crate) fn bind_acp_exec(
+		&self,
+		backend: Option<Arc<dyn crate::envd::tool_shell::AcpExecBackend>>,
+	) {
+		self._environment.bind_acp_exec(backend);
+	}
+
+	/// Returns the current session-effective model selector.
+	#[must_use]
+	pub fn model(&self) -> Str {
+		Str::new(self.state.snapshot().turn.params.model.as_str())
+	}
+
+	/// Applies a validated session-only model override and records it in the
+	/// owning v4 journal before changing the live snapshot.
+	pub async fn set_model(&self, selector: &str) -> miette::Result<()> {
+		let catalog = omp_llm_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
+		let model =
+			chat::resolve_model_selector(catalog, selector).map_err(|error| miette::miette!(error))?;
+		let spec = catalog
+			.model(ModelKey::from_ref(model.as_str()))
+			.ok_or_else(|| miette::miette!("unknown model `{selector}`"))?;
+		let route = spec
+			.routes
+			.first()
+			.and_then(|route| catalog.route(route))
+			.ok_or_else(|| miette::miette!("model `{selector}` has no selectable route"))?;
+		self
+			.control
+			.model_override(now_ms(), JournalModelChange {
+				role:     sf!("temporary"),
+				model:    JournalModelRef {
+					provider: JournalProviderId(Str::new(route.provider.as_str())),
+					api:      Str::new(route.codec.as_str()),
+					model:    JournalModelId(Str::new(spec.key.as_str())),
+				},
+				fallback: false,
+			})
+			.await
+			.into_diagnostic()?;
+		self
+			.state
+			.update(|snapshot| snapshot.turn.params.model = model.to_string());
+		Ok(())
+	}
+
+	/// Replaces the session-only provider reasoning request after the ACP host
+	/// has clamped it through the selected model policy.
+	pub fn set_thinking(&self, thinking: Option<omp_proto::inference::v1::Reasoning>) {
+		self
+			.state
+			.update(|snapshot| snapshot.turn.params.thinking = thinking);
+	}
+
+	/// Interrupts the active caller submission without waiting for settlement.
+	pub fn interrupt(&self) {
+		self.session.interrupt();
+	}
+
+	/// Returns a cheap interrupt-only capable clone of the durable handle.
+	///
+	/// Protocol hosts use this before borrowing the session mutably for a
+	/// submission so cancellation never contends on their session mutex.
+	#[must_use]
+	pub fn interrupt_handle(&self) -> SessionHandle {
+		self.session.clone()
+	}
+
+	/// Records a user-visible session title through the sole journal owner.
+	pub async fn set_title(&self, title: Str) -> miette::Result<()> {
+		self
+			.control
+			.set_title(now_ms(), title)
+			.await
+			.into_diagnostic()?;
+		Ok(())
 	}
 
 	/// Returns the session-scoped execution modes.
@@ -278,4 +402,15 @@ impl HeadlessSession {
 	pub fn publish(&self, event: AgentEvent) {
 		self.session.publish(event);
 	}
+}
+
+fn now_ms() -> u64 {
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX)
 }
