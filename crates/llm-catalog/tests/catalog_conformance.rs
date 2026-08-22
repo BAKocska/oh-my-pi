@@ -2459,6 +2459,42 @@ fn copilot_and_opencode_go_discovery_defaults_ride_the_responses_route() {
 }
 
 #[test]
+fn vercel_muse_contributor_caps_output_below_context() {
+	let compiled = compile_frozen_oracle();
+	let model = compiled
+		.models
+		.iter()
+		.find(|model| model.key.as_str() == "vercel-ai-gateway/meta/muse-spark-1.2-contributor")
+		.expect("Vercel Muse contributor row");
+	assert_eq!(model.limits.context_window, Some(1_048_576));
+	assert_eq!(model.limits.maximum_output_tokens, Some(131_072));
+}
+
+#[test]
+fn sloppy_edit_fallback_is_compiled_from_model_lineage() {
+	let compiled = compile_frozen_oracle();
+	for key in [
+		"aiand/moonshotai/kimi-k2.7-code",
+		"aimlapi/xiaomi/mimo-v2.5",
+		"aiand/deepseek-ai/deepseek-v4-flash",
+		"aimlapi/stepfun/step-3.7-flash",
+	] {
+		let model = compiled
+			.models
+			.iter()
+			.find(|model| model.key.as_str() == key)
+			.unwrap_or_else(|| panic!("missing fallback fixture {key}"));
+		assert_eq!(model.edit_revision.as_deref(), Some("sloppy.1"), "{key}");
+	}
+	let control = compiled
+		.models
+		.iter()
+		.find(|model| model.key.as_str() == "agnes/agnes-1.5-flash")
+		.expect("control model");
+	assert_eq!(control.edit_revision, None, "absence preserves the source default");
+}
+
+#[test]
 fn embedded_snapshot_and_all_indexes_match_a_fresh_deterministic_encoding() {
 	let compiled = compile_frozen_oracle();
 	let embedded = Catalog::embedded();

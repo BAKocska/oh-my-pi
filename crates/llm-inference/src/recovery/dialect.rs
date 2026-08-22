@@ -4,7 +4,7 @@ use std::fmt;
 
 use bytes::{Bytes, BytesMut};
 use omp_core::{Str, sf};
-use omp_llm_catalog::id::WirePolicyId;
+use omp_llm_catalog::{id::WirePolicyId, policy::LeakedThinkingHealer};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
 
@@ -16,6 +16,11 @@ use crate::receipt::{ReasonId, RecoveryKind, RecoveryRecord};
 
 static JSON_TAG: &[Delimiter] =
 	&[Delimiter { id: DelimiterId("json-tag"), open: b"<tool_call>", close: b"</tool_call>" }];
+static QWEN_XML: &[Delimiter] = &[Delimiter {
+	id:    DelimiterId("qwen-xml-tool-calls"),
+	open:  b"<tool_calls>",
+	close: b"</tool_calls>",
+}];
 static GEMINI: &[Delimiter] =
 	&[Delimiter { id: DelimiterId("gemini-tool-code"), open: b"```tool_code\n", close: b"```" }];
 static GEMMA: &[Delimiter] = &[Delimiter {
@@ -78,6 +83,8 @@ pub enum Dialect {
 	Harmony,
 	/// Qwen 3 JSON-in-tag calls.
 	Qwen3,
+	/// Qwen self-closing XML calls.
+	QwenXml,
 	/// Gemini Python fenced calls.
 	Gemini,
 	/// Gemma token-delimited calls.
@@ -87,9 +94,21 @@ pub enum Dialect {
 }
 
 impl Dialect {
+	/// Resolves a tool-envelope dialect from catalog-selected recovery policy.
+	pub const fn from_healer(healer: LeakedThinkingHealer) -> Option<Self> {
+		match healer {
+			LeakedThinkingHealer::Qwen => Some(Self::QwenXml),
+			LeakedThinkingHealer::None
+			| LeakedThinkingHealer::Thinking
+			| LeakedThinkingHealer::Kimi
+			| LeakedThinkingHealer::Dsml => None,
+		}
+	}
+
 	const fn delimiters(self) -> &'static [Delimiter] {
 		match self {
 			Self::Hermes | Self::Qwen3 => JSON_TAG,
+			Self::QwenXml => QWEN_XML,
 			Self::Gemini => GEMINI,
 			Self::Gemma => GEMMA,
 			Self::Kimi => KIMI,
@@ -112,6 +131,7 @@ impl Dialect {
 			Self::DeepSeek => "deepseek",
 			Self::Harmony => "harmony",
 			Self::Qwen3 => "qwen3",
+			Self::QwenXml => "qwen-xml",
 			Self::Gemini => "gemini",
 			Self::Gemma => "gemma",
 			Self::MiniMax => "minimax",
@@ -300,12 +320,16 @@ fn parse_candidates(dialect: Dialect, raw: &[u8]) -> Vec<(Option<Str>, Bytes)> {
 			})
 			.collect();
 	}
+	if dialect == Dialect::QwenXml {
+		return parse_qwen_xml(raw);
+	}
 	parse_envelope(dialect, raw).into_iter().collect()
 }
 
 fn parse_envelope(dialect: Dialect, raw: &[u8]) -> Option<(Option<Str>, Bytes)> {
 	match dialect {
 		Dialect::Hermes | Dialect::Qwen3 => parse_json_tag(raw),
+		Dialect::QwenXml => None,
 		Dialect::Gemini => None,
 		Dialect::Gemma => parse_gemma(raw),
 		Dialect::Kimi => parse_token_pair(
@@ -328,6 +352,81 @@ fn parse_envelope(dialect: Dialect, raw: &[u8]) -> Option<(Option<Str>, Bytes)> 
 		),
 		Dialect::Glm => parse_glm(raw),
 		Dialect::Xml | Dialect::Anthropic | Dialect::MiniMax => parse_xml(raw),
+	}
+}
+fn parse_qwen_xml(raw: &[u8]) -> Vec<(Option<Str>, Bytes)> {
+	let Some(body) = raw
+		.strip_prefix(b"<tool_calls>")
+		.and_then(|body| body.strip_suffix(b"</tool_calls>"))
+	else {
+		return Vec::new();
+	};
+	let Ok(body) = std::str::from_utf8(body) else {
+		return Vec::new();
+	};
+	let mut calls = Vec::new();
+	let mut cursor = 0;
+	while let Some(start) = body[cursor..].find('<') {
+		let start = cursor + start;
+		let Some(relative_end) = body[start..].find('>') else {
+			break;
+		};
+		let end = start + relative_end + 1;
+		if let Some((name, arguments)) = parse_qwen_element(&body[start..end])
+			&& let Ok(arguments) = serde_json::to_vec(&arguments)
+		{
+			calls.push((Some(name), Bytes::from(arguments)));
+		}
+		cursor = end;
+	}
+	calls
+}
+
+fn parse_qwen_element(element: &str) -> Option<(Str, Map<String, Value>)> {
+	let body = element.strip_prefix('<')?.strip_suffix('>')?.trim();
+	let body = body.strip_suffix('/')?.trim_end();
+	let name_end = body
+		.char_indices()
+		.find_map(|(index, character)| {
+			(!qwen_name_character(character, index == 0)).then_some(index)
+		})
+		.unwrap_or(body.len());
+	let name = body.get(..name_end)?;
+	if name.is_empty() {
+		return None;
+	}
+	let mut rest = &body[name_end..];
+	let mut arguments = Map::new();
+	while !rest.trim_start().is_empty() {
+		rest = rest.trim_start();
+		let key_end = rest
+			.char_indices()
+			.find_map(|(index, character)| {
+				(!qwen_name_character(character, index == 0)).then_some(index)
+			})
+			.unwrap_or(rest.len());
+		let key = rest.get(..key_end)?;
+		if key.is_empty() {
+			return None;
+		}
+		rest = rest.get(key_end..)?.trim_start().strip_prefix('=')?.trim_start();
+		let quote = rest.chars().next()?;
+		if !matches!(quote, '"' | '\'') {
+			return None;
+		}
+		rest = rest.get(quote.len_utf8()..)?;
+		let value_end = rest.find(quote)?;
+		arguments.insert(key.to_owned(), Value::String(rest[..value_end].to_owned()));
+		rest = rest.get(value_end + quote.len_utf8()..)?;
+	}
+	Some((Str::new(name), arguments))
+}
+
+fn qwen_name_character(character: char, first: bool) -> bool {
+	if first {
+		character.is_ascii_alphabetic() || character == '_'
+	} else {
+		character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-')
 	}
 }
 
@@ -819,6 +918,7 @@ mod tests {
 			(Dialect::DeepSeek, "<｜tool▁call▁begin｜>echo<｜tool▁sep｜>{\"x\":1}<｜tool▁call▁end｜>".as_bytes()),
 			(Dialect::Harmony, b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>analysis to=functions.echo<\x7cmessage\x7c>{\"x\":1}<\x7ccall\x7c>"),
 			(Dialect::Qwen3, b"<tool_call>{\"name\":\"echo\",\"arguments\":{\"x\":1}}</tool_call>"),
+			(Dialect::QwenXml, b"<tool_calls><echo x=\"1\" /></tool_calls>"),
 			(Dialect::Gemini, b"```tool_code\ndefault_api.echo(x=1)\n```"),
 			(Dialect::Gemma, b"<|tool_call>call:echo{x:1}<tool_call|>"),
 			(Dialect::MiniMax, b"<minimax:tool_call><invoke name=\"echo\"><parameter name=\"x\">1</parameter></invoke></minimax:tool_call>"),
@@ -835,5 +935,34 @@ mod tests {
 	fn prose_outside_owned_blocks_never_fabricates_calls() {
 		assert!(calls(Dialect::Gemini, b"default_api.search(query='outside')", 1).is_empty());
 		assert!(calls(Dialect::Gemma, b"call:search{query:'outside'}", 1).is_empty());
+	}
+	#[test]
+	fn qwen_xml_heals_self_closing_calls_with_quoted_attributes() {
+		assert_eq!(
+			Dialect::from_healer(LeakedThinkingHealer::Qwen),
+			Some(Dialect::QwenXml),
+		);
+		let input = br#"Before
+<tool_calls>
+<read path="/etc/hostname" mode='safe' />
+<write-file path="a.txt" text="hello" />
+</tool_calls>
+After"#;
+		for split in 0..=input.len() {
+			assert_eq!(
+				calls(Dialect::QwenXml, input, split),
+				vec![
+					(
+						sf!("read"),
+						serde_json::json!({"path":"/etc/hostname","mode":"safe"}),
+					),
+					(
+						sf!("write-file"),
+						serde_json::json!({"path":"a.txt","text":"hello"}),
+					),
+				],
+				"split {split}",
+			);
+		}
 	}
 }

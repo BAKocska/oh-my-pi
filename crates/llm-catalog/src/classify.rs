@@ -110,6 +110,15 @@ pub struct ModelClassification {
 pub fn classify(input: ClassificationInput<'_>) -> ModelClassification {
 	classify_with_taxonomy(input, taxonomy())
 }
+/// Whether a provider declares conservative dynamic effort-sibling grouping.
+pub(crate) fn supports_dynamic_effort_siblings(provider: &str) -> bool {
+	taxonomy().supports_dynamic_effort_siblings(provider)
+}
+
+/// Returns the standard-lane id for a provider-declared effort lane.
+pub(crate) fn strip_effort_lane<'a>(provider: &str, model: &'a str) -> &'a str {
+	taxonomy().strip_effort_lane(provider, model)
+}
 
 fn classify_with_taxonomy(
 	input: ClassificationInput<'_>,
@@ -371,17 +380,31 @@ mod tests {
 	#[test]
 	fn collapses_all_effort_tiers() {
 		for (suffix, effort) in [
+			("none", EffortTier::Off),
 			("minimal", EffortTier::Minimal),
 			("low", EffortTier::Low),
 			("medium", EffortTier::Medium),
 			("high", EffortTier::High),
 			("xhigh", EffortTier::XHigh),
+			("extra-high", EffortTier::XHigh),
 			("max", EffortTier::Max),
 		] {
 			let value = compiler(&format!("gpt-5-luna-{suffix}"));
 			assert_eq!(value.logical_model.as_str(), "gpt-5-luna");
 			assert_eq!(value.effort, Some(effort));
 		}
+	}
+	#[test]
+	fn bundled_dynamic_cursor_families_are_data_driven() {
+		assert!(supports_dynamic_effort_siblings("CURSOR"));
+		assert_eq!(
+			strip_effort_lane("cursor", "gpt-5.6-luna-fast"),
+			"gpt-5.6-luna"
+		);
+		assert_eq!(
+			strip_effort_lane("other", "gpt-5.6-luna-fast"),
+			"gpt-5.6-luna-fast"
+		);
 	}
 
 	#[test]
@@ -411,11 +434,12 @@ mod tests {
 		let elsewhere = compiler("cursor-grok-4.6-low-fast");
 		assert_eq!(elsewhere.logical_model.as_str(), "cursor-grok-4.6-low-fast");
 		assert_eq!(elsewhere.effort, None);
-		// Coding SKUs and non-Grok fast tiers stay out of the lane.
+		// Coding SKUs do not carry a wedged effort suffix. Other Cursor lanes
+		// are classified structurally, then batch safety decides collapse.
 		assert_eq!(cursor("grok-code-fast-1").logical_model.as_str(), "grok-code-fast-1");
 		assert_eq!(
 			cursor("claude-opus-5-high-fast").logical_model.as_str(),
-			"claude-opus-5-high-fast"
+			"claude-opus-5-fast"
 		);
 	}
 

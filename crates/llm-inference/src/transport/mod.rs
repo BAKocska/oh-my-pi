@@ -9,6 +9,7 @@ pub mod eventstream;
 pub mod frame;
 pub mod http;
 pub mod ndjson;
+mod proxy;
 pub mod sse;
 pub mod websocket;
 pub mod websocket_transport;

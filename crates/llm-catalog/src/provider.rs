@@ -324,6 +324,8 @@ pub enum OAuthExchangeKind {
 	ExternalRedirectPkce,
 	/// Polls Cursor's public login exchange endpoint.
 	CursorPoll,
+	/// Completes Google Antigravity PKCE and Cloud Code Assist provisioning.
+	GoogleAntigravity,
 	/// Exchanges a Z.AI authorization result for an API key.
 	ZaiApiKey,
 	/// Exchanges a Devin CLI authorization result for a token.

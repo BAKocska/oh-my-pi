@@ -58,7 +58,7 @@ principal_resolution = { kind = "userinfo-endpoint", url = "https://www.googleap
 [[provider]]
 provider = "google-antigravity"
 credential_provider = "google-antigravity"
-kind = "pkce"
+kind = "custom-exchange"
 client_id = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
 token_url = "https://oauth2.googleapis.com/token"
@@ -69,11 +69,9 @@ scopes = [
 	"https://www.googleapis.com/auth/cclog",
 	"https://www.googleapis.com/auth/experimentsandconfigs",
 ]
-callback_port = 51121
-callback_host = "127.0.0.1"
-callback_path = "/oauth-callback"
-authorize_params = { access_type = "offline", prompt = "consent" }
+custom_params = { access_type = "offline", prompt = "consent", redirect_uri = "http://127.0.0.1:51121/oauth-callback" }
 token_params = { client_secret = "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" }
+exchange = "google-antigravity"
 principal_resolution = { kind = "userinfo-endpoint", url = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", field = "email" }
 
 [[provider]]

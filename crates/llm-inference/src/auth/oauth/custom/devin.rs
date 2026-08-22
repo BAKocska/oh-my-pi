@@ -154,6 +154,7 @@ impl DevinCliTokenHandler {
 			token_type: sf!("Bearer"),
 			expires_in: Some(expires_in),
 			identity_response: response.body,
+			project: None,
 		})
 	}
 }

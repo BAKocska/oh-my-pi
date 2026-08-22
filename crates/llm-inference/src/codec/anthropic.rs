@@ -1661,6 +1661,9 @@ impl Decoder for AnthropicWireDecoder {
 		}
 		Ok(())
 	}
+	fn is_complete(&self) -> bool {
+		self.inner.completed
+	}
 }
 
 fn emit_anthropic_event(
@@ -2454,7 +2457,7 @@ mod tests {
 			Sampling, ToolDefinition, ToolInputConstraint,
 		},
 		id::{AccountId, PrincipalId, RequestId},
-		transport::EventStreamDecoder,
+		transport::{EventStreamDecoder, SseEvent},
 	};
 
 	fn canonical_chat(system: &[&str]) -> ChatRequest {
@@ -3267,6 +3270,29 @@ mod tests {
 			},
 		);
 		assert_eq!(truncated.finish().unwrap_err().kind, ErrorKind::StreamCorruption);
+	}
+	#[test]
+	fn message_stop_marks_the_wire_decoder_complete_without_waiting_for_eof() {
+		let mut decoder = AnthropicWireDecoder {
+			adapter: AnthropicAdapter::Direct,
+			claude_code_oauth: false,
+			inner: AnthropicDecoder::new(),
+			signature_cursor: 0,
+			citation_cursor: 0,
+			history_cursor: 0,
+		};
+		let mut events = Vec::new();
+		decoder
+			.push(
+				Frame::Sse(SseEvent {
+					name: Some(sf!("message_stop")),
+					data: Bytes::from_static(br#"{"type":"message_stop"}"#),
+				}),
+				&mut |event| events.push(event),
+			)
+			.expect("message_stop decodes");
+		assert!(decoder.is_complete());
+		assert!(events.iter().any(|event| matches!(event, RawEvent::Completion(_))));
 	}
 
 	#[test]

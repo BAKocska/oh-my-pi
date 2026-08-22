@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::{
 	Availability, CatalogAlias, ModelAvailability, ModelKey, ModelSpec, ProviderId, RouteDef,
-	RouteId,
+	RouteId, settings::FallbackChains,
 };
 
 /// A configured or built-in role that expands to an ordered selector chain.
@@ -832,6 +832,87 @@ pub fn visible_roles(roles: &[ModelRole]) -> Vec<&ModelRole> {
 	visible
 }
 
+/// Resolves the retry fallback chain owning one live catalog selection.
+///
+/// Specificity is exact model, longest provider wildcard, a matching live
+/// role hint, another matching configured role with `default` preferred, then
+/// an unassigned default chain. A role hint whose configured primary no longer
+/// matches `current` is ignored.
+pub fn retry_fallback_chain_key(
+	models: &[ModelSpec],
+	routes: &[RouteDef],
+	aliases: &[CatalogAlias],
+	roles: &[ModelRole],
+	mru: &BTreeMap<(ProviderId, ModelKey), u64>,
+	chains: &FallbackChains,
+	current: &SelectedModel,
+	role_hint: Option<&str>,
+) -> Option<Str> {
+	let full = format!("{}/{}", current.provider, logical_id(&current.model));
+	if chains.contains_key(current.model.as_str()) {
+		return Some(Str::new(current.model.as_str()));
+	}
+	if chains.contains_key(full.as_str()) {
+		return Some(full.into());
+	}
+
+	let mut wildcard = None;
+	let mut wildcard_len = 0;
+	for key in chains.keys() {
+		let Some(prefix) = key.strip_suffix("/*") else {
+			continue;
+		};
+		if full == prefix.as_str() || full.strip_prefix(prefix.as_str()).is_some_and(|tail| tail.starts_with('/')) {
+			if prefix.len() > wildcard_len {
+				wildcard = Some(key.clone());
+				wildcard_len = prefix.len();
+			}
+		}
+	}
+	if wildcard.is_some() {
+		return wildcard;
+	}
+
+	let role_matches = |id: &str| {
+		let Some(role) = roles
+			.iter()
+			.find(|candidate| candidate.id == id && !candidate.selectors.is_empty())
+		else {
+			return false;
+		};
+		let Some(selected) = role.selectors.iter().find_map(|selector| {
+			select_model(models, routes, aliases, roles, mru, selector).ok()
+		}) else {
+			return false;
+		};
+		selected.provider == current.provider && selected.model == current.model
+	};
+	if let Some(hint) = role_hint
+		&& chains.contains_key(hint)
+		&& role_matches(hint)
+	{
+		return Some(Str::new(hint));
+	}
+	let mut matched = None;
+	for key in chains.keys() {
+		if !role_matches(key) {
+			continue;
+		}
+		if key == "default" {
+			return Some(key.clone());
+		}
+		matched.get_or_insert_with(|| key.clone());
+	}
+	if matched.is_some() {
+		return matched;
+	}
+	let default_unassigned = roles
+		.iter()
+		.find(|role| role.id == "default")
+		.is_none_or(|role| role.selectors.is_empty());
+	(chains.contains_key("default") && default_unassigned).then(|| Str::new_static("default"))
+}
+
 /// Resolves comma- and array-based selector chains without consulting
 /// credential state.
 ///
@@ -982,6 +1063,114 @@ mod tests {
 				Some("auto")
 			)
 			.expect("unchanged task assignment")
+		);
+	}
+
+	#[test]
+	fn retry_role_resolution_prefers_live_hint_then_default_for_shared_assignment() {
+		let catalog = crate::Catalog::embedded();
+		let mru = BTreeMap::new();
+		let current =
+			pick_default(catalog.models(), catalog.routes(), &mru).expect("default catalog model");
+		let selector = current.model.as_str();
+		let roles = vec![
+			ModelRole::assignment("vision", selector, None).expect("vision role"),
+			ModelRole::assignment("default", selector, None).expect("default role"),
+		];
+		let chains = FallbackChains::from([
+			(Str::new_static("vision"), vec![sf!("provider/vision-fallback")]),
+			(Str::new_static("default"), vec![sf!("provider/default-fallback")]),
+		]);
+		assert_eq!(
+			retry_fallback_chain_key(
+				catalog.models(),
+				catalog.routes(),
+				catalog.aliases(),
+				&roles,
+				&mru,
+				&chains,
+				&current,
+				Some("vision"),
+			)
+			.as_deref(),
+			Some("vision")
+		);
+		assert_eq!(
+			retry_fallback_chain_key(
+				catalog.models(),
+				catalog.routes(),
+				catalog.aliases(),
+				&roles,
+				&mru,
+				&chains,
+				&current,
+				None,
+			)
+			.as_deref(),
+			Some("default")
+		);
+	}
+
+	#[test]
+	fn retry_role_resolution_ignores_stale_and_unowned_role_hints() {
+		let catalog = crate::Catalog::embedded();
+		let mru = BTreeMap::new();
+		let current =
+			pick_default(catalog.models(), catalog.routes(), &mru).expect("default catalog model");
+		let other = catalog
+			.models()
+			.iter()
+			.find(|model| model.key != current.model && !model.routes.is_empty())
+			.and_then(|model| {
+				select_model(
+					catalog.models(),
+					catalog.routes(),
+					catalog.aliases(),
+					&[],
+					&mru,
+					model.key.as_str(),
+				)
+				.ok()
+			})
+			.expect("second catalog model");
+		let roles = vec![
+			ModelRole::assignment("vision", other.model.as_str(), None).expect("vision role"),
+			ModelRole::assignment("default", current.model.as_str(), None).expect("default role"),
+		];
+		let chains = FallbackChains::from([
+			(Str::new_static("vision"), vec![sf!("provider/vision-fallback")]),
+			(Str::new_static("default"), vec![sf!("provider/default-fallback")]),
+		]);
+		assert_eq!(
+			retry_fallback_chain_key(
+				catalog.models(),
+				catalog.routes(),
+				catalog.aliases(),
+				&roles,
+				&mru,
+				&chains,
+				&current,
+				Some("vision"),
+			)
+			.as_deref(),
+			Some("default")
+		);
+		let unowned_roles = vec![
+			ModelRole::assignment("vision", other.model.as_str(), None).expect("vision role"),
+			ModelRole::assignment("default", other.model.as_str(), None).expect("default role"),
+		];
+		assert_eq!(
+			retry_fallback_chain_key(
+				catalog.models(),
+				catalog.routes(),
+				catalog.aliases(),
+				&unowned_roles,
+				&mru,
+				&chains,
+				&current,
+				None,
+			),
+			None
 		);
 	}
 

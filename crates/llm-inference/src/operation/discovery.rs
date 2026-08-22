@@ -176,11 +176,11 @@ impl CatalogDiscoveryProjector {
 		let canonical_bundled = taxonomy()
 			.recovers_canonical_params(route.provider.as_str())
 			.then(|| {
-				// Discovered open-weight rows carry canonical namespaced ids
-				// (`deepseek-ai/…`, pi PR #8991): index every bundled
-				// namespaced identity across providers so intrinsic
-				// parameters can be recovered. The first entry in frozen
-				// catalog order wins deterministically.
+				// Canonical open-weight rows normally carry namespaced ids
+				// (`deepseek-ai/…`, pi PR #8991). Exact gateway-first response
+				// pins may also recover a reviewed bare canonical card (Muse
+				// Spark, pi bb80c8bc45). The first entry in frozen catalog
+				// order wins deterministically.
 				let owners: BTreeMap<_, _> = catalog
 					.routes()
 					.iter()
@@ -197,7 +197,11 @@ impl CatalogDiscoveryProjector {
 					else {
 						continue;
 					};
-					if !relative.contains('/') {
+					if !relative.contains('/')
+						&& !hints
+							.as_ref()
+							.is_some_and(|hints| hints.hinted(WireModelId::from_ref(relative)))
+					{
 						continue;
 					}
 					index
@@ -392,8 +396,8 @@ fn project_mixed_page(
 				// Gateway-first id bundled with an openai-responses route on
 				// this provider or a sibling gateway (pi #8957): materialize
 				// the listing on this provider's responses route instead of
-				// the discovery route. Only the route transfers — pricing,
-				// limits, and thinking stay conservative.
+				// the discovery route. Canonical intrinsic parameters may be
+				// recovered separately; pricing and wire policy never transfer.
 				model.wire_ids = Box::new([(hints.target.clone(), row.wire_model.clone())]);
 				model.routes = Box::new([hints.target.clone()]);
 			}
@@ -417,19 +421,17 @@ fn routing_variant_counterpart<'catalog>(
 }
 
 /// Returns the bundled canonical reference backing a discovered open-weight
-/// identity (`deepseek-ai/DeepSeek-V4-Pro` resold under its canonical id).
+/// identity (`deepseek-ai/DeepSeek-V4-Pro` resold under its canonical id) or an
+/// exact bare gateway-first response pin.
 ///
-/// Matching is ASCII-case-insensitive and restricted to namespaced ids, so
-/// bare generic slugs never inherit another provider's card (pi PR #8991).
+/// The index construction, not this lookup, limits bare identities to reviewed
+/// provider-scoped pins, so generic slugs never inherit another provider's card.
 fn canonical_reference<'catalog>(
 	canonical_bundled: Option<&'catalog BTreeMap<Str, ModelSpec>>,
 	key: &ModelKey<str>,
 ) -> Option<&'catalog ModelSpec> {
 	let index = canonical_bundled?;
 	let lookup = key.as_str().to_ascii_lowercase();
-	if !lookup.contains('/') {
-		return None;
-	}
 	index.get(lookup.as_str())
 }
 
@@ -1309,10 +1311,18 @@ mod tests {
 			thinking:             None,
 			pricing:              Pricing::default(),
 		});
+		let canonical = crate::catalog::snapshot::Catalog::embedded()
+			.model(ModelKey::from_ref("meta/muse-spark-1.2-contributor"))
+			.expect("canonical Muse contributor")
+			.clone();
+		let canonical_bundled = BTreeMap::from([(
+			Str::new_static("muse-spark-1.2-contributor"),
+			canonical,
+		)]);
 		let page = project_mixed_page(
 			&BTreeMap::new(),
 			None,
-			None,
+			Some(&canonical_bundled),
 			Some(&hints),
 			&normalizer,
 			&provider,
@@ -1360,6 +1370,42 @@ mod tests {
 			"the wire identity follows the rebound route"
 		);
 		assert_eq!(contributor.pricing, Pricing::default(), "pricing never follows the hint");
+		assert_eq!(contributor.limits.context_window, Some(1_048_576));
+		assert_eq!(contributor.limits.maximum_output_tokens, Some(131_072));
+		assert!(contributor.thinking.is_some(), "canonical thinking ladder recovered");
+	}
+
+	#[test]
+	fn opencode_go_muse_discovery_recovers_intrinsic_parameters() {
+		let catalog = crate::catalog::snapshot::Catalog::embedded();
+		let route = catalog
+			.route(RouteId::from_ref("opencode-go/primary"))
+			.expect("Go discovery route is bundled");
+		let projector =
+			CatalogDiscoveryProjector::for_route(catalog, route).expect("Go projector");
+		let provider = ProviderId::from("opencode-go");
+		let page = projector
+			.project(
+				&hint_request(&provider, &route.id),
+				vec![
+					discovered(&provider, &route.id, "muse-spark-1.2"),
+					discovered(&provider, &route.id, "muse-spark-1.2-contributor"),
+				],
+				None,
+			)
+			.expect("Muse discovery page");
+		assert_eq!(page.models.len(), 2);
+		for model in &page.models {
+			assert_eq!(model.limits.context_window, Some(1_048_576));
+			assert_eq!(model.limits.maximum_output_tokens, Some(131_072));
+			assert!(model.thinking.is_some(), "{} thinking ladder", model.key);
+			assert_eq!(
+				model.routes.as_ref(),
+				std::slice::from_ref(&route.id),
+				"{} Responses route",
+				model.key
+			);
+		}
 	}
 
 	#[test]

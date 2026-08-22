@@ -121,6 +121,9 @@ fn census_thinking_format(provider: &str, class: &str) -> Option<&'static str> {
 }
 
 fn frozen_class_of(model: &NormalizedModel) -> &str {
+	if model.model.to_ascii_lowercase().starts_with("muse-spark") {
+		return "meta";
+	}
 	model
 		.class
 		.as_deref()
@@ -230,7 +233,12 @@ fn axis_vocabulary_matches_the_oracles_and_reviewed_extensions() {
 	// the next intentional snapshot refresh; compat KDL may use them without
 	// rewriting source digests in an unrelated port.
 	oracle_axes
-		.extend(["template_reasoning_effort".to_owned(), "thinking_tool_choice_conflict".to_owned()]);
+		.extend([
+			"glyph_tokenization".to_owned(),
+			"leaked_thinking_healer".to_owned(),
+			"template_reasoning_effort".to_owned(),
+			"thinking_tool_choice_conflict".to_owned(),
+		]);
 	oracle_axes.sort_unstable();
 	oracle_axes.dedup();
 	let mut known: Vec<String> = KNOWN_AXES
@@ -297,6 +305,11 @@ fn cascade_resolves_every_catalog_model_to_oracle_plus_census_overlay() {
 			// V4; the frozen wire oracle predates the override.
 			expected.insert("supports_tool_choice".into(), Value::from(false));
 		}
+		if model.provider == "opencode-go" || model.provider == "opencode-zen" {
+			// pi 4e32740f63: both gateway Responses routes reject named
+			// forced choices and must cascade to automatic tool selection.
+			expected.insert("supports_forced_tool_choice".into(), Value::from(false));
+		}
 		if model.provider == "xai"
 			&& classification
 				.family
@@ -331,6 +344,12 @@ fn cascade_resolves_every_catalog_model_to_oracle_plus_census_overlay() {
 				.is_some_and(|revision| revision >= SemVer::new(3, 8, 0))
 		{
 			expected.insert("template_reasoning_effort".into(), Value::from(true));
+		}
+		if class == "anthropic" {
+			expected.insert("glyph_tokenization".into(), Value::from(true));
+		}
+		if class == "qwen" {
+			expected.insert("leaked_thinking_healer".into(), Value::from("qwen"));
 		}
 		let resolved_wire: BTreeMap<String, Value> = resolved
 			.wire
@@ -718,6 +737,45 @@ fn run_identity_case(case: &Case) {
 			other => panic!("{}: unhandled identity expectation `{other}`", case.id),
 		}
 	}
+}
+
+#[test]
+fn opencode_responses_downgrade_forced_tool_choice() {
+	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
+	for (provider, model) in [
+		("opencode-go", "muse-spark-1.2-contributor"),
+		("opencode-zen", "muse-spark-1.2"),
+	] {
+		let resolved = cascade
+			.resolve(&ResolveTarget {
+				provider,
+				class: "meta",
+				family: None,
+				revision: Some(SemVer::new(1, 2, 0)),
+				model,
+				reasoning: true,
+			})
+			.expect("OpenCode compat resolves");
+		assert_eq!(
+			resolved.wire.get("supports_forced_tool_choice"),
+			Some(&Value::Bool(false)),
+			"{provider}/{model}"
+		);
+	}
+	let control = cascade
+		.resolve(&ResolveTarget {
+			provider: "openai",
+			class: "openai",
+			family: Some("gpt"),
+			revision: Some(SemVer::new(5, 0, 0)),
+			model: "gpt-5",
+			reasoning: true,
+		})
+		.expect("OpenAI compat resolves");
+	assert_ne!(
+		control.wire.get("supports_forced_tool_choice"),
+		Some(&Value::Bool(false))
+	);
 }
 
 fn run_policy_case(cascade: &CompatCascade, case: &Case) {

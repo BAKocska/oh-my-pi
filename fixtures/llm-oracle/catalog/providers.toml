@@ -692,6 +692,9 @@ facets = ["chat"]
 
 [providers."litellm"]
 transport = "open-ai-chat"
+# Additional wire protocol exposed at the same endpoint. This route remains
+# inert until per-model discovery evidence selects it.
+additional_transports = ["open-ai-responses"]
 base_url = "http://127.0.0.1:4000/v1"
 auth = { type = "optional-bearer", env = ["OMP_LITELLM_API_KEY"] }
 discovery = { kind = "open-ai-models", label = "LiteLLM", authoritative = false }

@@ -74,6 +74,7 @@ impl OAuthCustomHandler for ApiKeyPasteHandler {
 				token_type: sf!("Bearer"),
 				expires_in: None,
 				identity_response: SecretString::from("{}".to_owned()),
+				project: None,
 			})
 		}
 		.boxed()

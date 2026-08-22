@@ -1,5 +1,7 @@
 collapse {
 	thinking-suffix "-thinking"
+	effort-suffix "-extra-high" tier="xhigh"
+	effort-suffix "-none" tier="off"
 	effort-suffix "-minimal" tier="minimal"
 	effort-suffix "-medium" tier="medium"
 	effort-suffix "-xhigh" tier="xhigh"
@@ -10,12 +12,14 @@ collapse {
 	// `-wm` suffix (`gpt-5.6-luna-wm`, pi PR #8929): the same model behind a
 	// different route, with base-model metadata owned by the plain bundled SKU.
 	routing-variant-suffix "-wm" "openai-codex" "openai-codex-device"
-	// Cursor serves Grok 4.5/4.6 as per-effort sibling ids
-	// (`cursor-grok-4.6-low|-medium|-high|-xhigh`) alongside a parallel
-	// `-fast` service-tier lane (`-low-fast`, ..., pi PR #8988). Each lane
-	// collapses into its own logical model, so the lane token is transparent
-	// to effort collapse and the logical id keeps the `-fast` suffix. The
-	// gate keeps Cursor's Claude/GPT fast tiers and the non-reasoning
-	// `grok-code-*` coding SKUs out of the lane.
-	effort-lane-suffix "-fast" "cursor" bare-prefix="cursor-grok"
+	// Cursor discovery serves pure effort-suffixed siblings as one logical
+	// model. The reviewed GPT-5.6 seeds enable the generic grouping rule for
+	// the provider; live metadata and duplicate-tier checks decide every
+	// candidate family, including later model generations.
+	effort-family "cursor" "gpt-5.6-luna"
+	effort-family "cursor" "gpt-5.6-sol"
+	effort-family "cursor" "gpt-5.6-terra"
+	// `-fast` is a parallel SKU lane. It stays in the logical identifier while
+	// the effort token immediately before it selects the wire sibling.
+	effort-lane-suffix "-fast" "cursor"
 }

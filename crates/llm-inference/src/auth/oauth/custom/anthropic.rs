@@ -235,6 +235,7 @@ fn token_response(
 		token_type: sf!("Bearer"),
 		expires_in: Some(Duration::from_secs(expires_in.saturating_sub(5 * 60))),
 		identity_response: response.body,
+		project: None,
 	})
 }
 

@@ -1,4 +1,5 @@
 class "meta" {
+	bounded "muse-spark"
 	bounded "llama"
 	namespace "meta-llama"
 

@@ -39,11 +39,14 @@ use crate::{
 	},
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
 	call::AuthInput,
-	id::{AccountId, PrincipalId},
+	id::{AccountId, PrincipalId, ProjectId},
 };
 
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const CODEX_AUTH_CLAIM: &str = "https://api.openai.com/auth";
+const CODEX_DATA_RESIDENCY_CLAIM: &str = "chatgpt_data_residency";
+const CODEX_COMPUTE_RESIDENCY_CLAIM: &str = "chatgpt_compute_residency";
 
 pub use omp_oauth::{
 	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError, SystemOAuthHttpClient,
@@ -213,13 +216,17 @@ pub enum OAuthCustomDispatchError {
 }
 
 /// Data-driven OAuth protocol engine.
-pub struct OAuthEngine<'a, C, K, R = SystemEntropySource> {
+pub struct OAuthEngine<'a, C: ?Sized, K: ?Sized, R = SystemEntropySource> {
 	http:    &'a C,
 	clock:   &'a K,
 	entropy: R,
 }
 
-impl<'a, C, K> OAuthEngine<'a, C, K, SystemEntropySource> {
+impl<'a, C, K> OAuthEngine<'a, C, K, SystemEntropySource>
+where
+	C: ?Sized,
+	K: ?Sized,
+{
 	/// Constructs an engine using operating-system cryptographic entropy.
 	pub const fn new(http: &'a C, clock: &'a K) -> Self {
 		Self { http, clock, entropy: SystemEntropySource }
@@ -228,8 +235,8 @@ impl<'a, C, K> OAuthEngine<'a, C, K, SystemEntropySource> {
 
 impl<'a, C, K, R> OAuthEngine<'a, C, K, R>
 where
-	C: OAuthHttpClient,
-	K: OAuthClock,
+	C: OAuthHttpClient + ?Sized,
+	K: OAuthClock + ?Sized,
 	R: OAuthEntropy,
 {
 	/// Constructs an engine with deterministic injectable entropy.
@@ -560,8 +567,8 @@ pub struct PkcePending {
 
 impl<C, K, R> OAuthEngine<'_, C, K, R>
 where
-	C: OAuthHttpClient,
-	K: OAuthClock,
+	C: OAuthHttpClient + ?Sized,
+	K: OAuthClock + ?Sized,
 	R: OAuthEntropy,
 {
 	/// Persists a successful interactive OAuth result as one opaque credential
@@ -785,6 +792,7 @@ pub struct OAuthTokenSet {
 	token_type:        Str,
 	expires_in:        Option<Duration>,
 	identity_response: SecretString,
+	project:           Option<ProjectId>,
 }
 
 impl OAuthTokenSet {
@@ -801,6 +809,25 @@ impl OAuthTokenSet {
 	/// Returns the relative lifetime reported by the token endpoint.
 	pub const fn expires_in(&self) -> Option<Duration> {
 		self.expires_in
+	}
+
+	/// Borrows non-secret project routing discovered during login.
+	pub(crate) fn project(&self) -> Option<&ProjectId<str>> {
+		self.project.as_deref()
+	}
+
+	/// Attaches non-secret project routing discovered by a custom login flow.
+	pub(crate) fn set_project(&mut self, project: ProjectId) {
+		self.project = Some(project);
+	}
+
+	/// Returns the normalized workspace residency carried by a Codex access
+	/// token.
+	///
+	/// The data-residency claim is authoritative. Compute residency is used
+	/// only when data residency is absent or invalid.
+	pub fn codex_residency(&self) -> Option<Str> {
+		codex_residency(self.access_token.expose_secret())
 	}
 
 	/// Resolves the authenticated principal using only the catalog-selected
@@ -1069,6 +1096,24 @@ pub enum OAuthError {
 	/// Token or device response has an invalid typed shape.
 	#[error("OAuth response is malformed")]
 	MalformedResponse,
+	/// Cloud Code Assist rejected a project discovery or provisioning request.
+	#[error("OAuth project provisioning was rejected with HTTP status {status}")]
+	ProvisioningRejected {
+		/// Exact HTTP status returned by the control plane.
+		status: u16,
+	},
+	/// The authenticated account is explicitly ineligible for the free tier.
+	#[error("OAuth account is ineligible for Cloud Code Assist free-tier provisioning")]
+	ProvisioningIneligible,
+	/// A Cloud Code Assist onboarding operation completed with an error.
+	#[error("OAuth project provisioning operation failed with code {code:?}")]
+	ProvisioningFailed {
+		/// Structured operation error code, when supplied.
+		code: Option<i64>,
+	},
+	/// The single onboarding deadline elapsed.
+	#[error("OAuth project provisioning timed out")]
+	ProvisioningTimeout,
 	/// HTTP transport failed without retaining source text.
 	#[error(transparent)]
 	Transport(#[from] OAuthTransportError),
@@ -1278,6 +1323,7 @@ fn token_response(
 			.into(),
 		expires_in:        parsed.expires_in.map(Duration::from_secs),
 		identity_response: response.body,
+		project:           None,
 	})
 }
 
@@ -1332,6 +1378,24 @@ fn jwt_claim(token: &str, claims: &[Str]) -> Result<Str, OAuthError> {
 		}
 	}
 	Err(OAuthError::PrincipalUnresolved)
+}
+fn codex_residency(token: &str) -> Option<Str> {
+	let mut segments = token.split('.');
+	segments.next()?;
+	let payload = segments.next()?;
+	segments.next()?;
+	if segments.next().is_some() {
+		return None;
+	}
+	let decoded = Zeroizing::new(base64_url::decode_raw(payload.as_bytes()).into_vec().ok()?);
+	let document: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+	let auth = document.get(CODEX_AUTH_CLAIM)?.as_object()?;
+	[CODEX_DATA_RESIDENCY_CLAIM, CODEX_COMPUTE_RESIDENCY_CLAIM]
+		.into_iter()
+		.filter_map(|claim| auth.get(claim)?.as_str())
+		.map(str::trim)
+		.find(|residency| !residency.is_empty())
+		.map(Str::new)
 }
 
 fn provider_error(status: u16, body: &SecretString, refresh: bool) -> OAuthError {
@@ -1544,6 +1608,50 @@ mod tests {
 	fn provider_codes_keep_wire_spelling() {
 		assert_eq!(OAuthProviderCode::AuthorizationPending.as_str(), "authorization_pending");
 		assert_eq!(OAuthProviderCode::TemporarilyUnavailable.as_str(), "temporarily_unavailable");
+	}
+	#[test]
+	fn codex_residency_claim_prefers_data_then_falls_back_to_compute() {
+		let token = |claims: &str| {
+			let payload = base64_url::encode_raw(
+				format!(r#"{{"{CODEX_AUTH_CLAIM}":{claims}}}"#).as_bytes(),
+			)
+			.into_string();
+			format!("header.{payload}.signature")
+		};
+		assert_eq!(
+			codex_residency(&token(
+				r#"{"chatgpt_data_residency":" eu ","chatgpt_compute_residency":"us"}"#,
+			))
+			.as_deref(),
+			Some("eu"),
+		);
+		assert_eq!(
+			codex_residency(&token(
+				r#"{"chatgpt_data_residency":" ","chatgpt_compute_residency":" us "}"#,
+			))
+			.as_deref(),
+			Some("us"),
+		);
+		assert_eq!(
+			codex_residency(&token(
+				r#"{"chatgpt_data_residency":42,"chatgpt_compute_residency":"eu"}"#,
+			))
+			.as_deref(),
+			Some("eu"),
+		);
+		assert_eq!(
+			codex_residency(&token(r#"{"chatgpt_data_residency":42}"#)),
+			None,
+		);
+		assert_eq!(codex_residency(&token(r#"{}"#)), None);
+		assert_eq!(
+			codex_residency(&format!(
+				"{}.extra",
+				token(r#"{"chatgpt_data_residency":"us"}"#),
+			)),
+			None,
+		);
+		assert_eq!(codex_residency("opaque-access-token"), None);
 	}
 
 	struct FixedEntropy;
@@ -1968,6 +2076,7 @@ mod tests {
 			token_type:        "Bearer".into(),
 			expires_in:        Some(Duration::from_secs(3600)),
 			identity_response: SecretString::from("{}".to_owned()),
+			project:           None,
 		};
 		let bundle = tokens.into_stored_bundle();
 		let encoded = bundle.encode().expect("encode");
@@ -1986,6 +2095,7 @@ mod tests {
 			token_type:        "Bearer".into(),
 			expires_in:        None,
 			identity_response: SecretString::from("{}".to_owned()),
+			project:           None,
 		};
 		let encoded = tokens.into_stored_bundle().encode().expect("encode");
 		let decoded = StoredOAuthBundle::decode(&encoded).expect("decode");
@@ -2000,6 +2110,7 @@ mod tests {
 			token_type:        "Bearer".into(),
 			expires_in:        None,
 			identity_response: SecretString::from("{}".to_owned()),
+			project:           None,
 		};
 		let meta = LeaseMeta {
 			account:    AccountId::from("account"),
@@ -2032,6 +2143,7 @@ mod tests {
 			token_type:        "Bearer".into(),
 			expires_in:        None,
 			identity_response: SecretString::from("{}".to_owned()),
+			project:           None,
 		};
 		let http = TestHttp(Mutex::new(VecDeque::new()));
 		let clock = TestClock(issued_at);
@@ -2067,6 +2179,7 @@ mod tests {
 			token_type:        "Bearer".into(),
 			expires_in:        Some(Duration::from_secs(1)),
 			identity_response: SecretString::from("{}".to_owned()),
+			project:           None,
 		};
 		let http = TestHttp(Mutex::new(VecDeque::from([OAuthHttpResponse {
 			status: 200,
@@ -2136,6 +2249,7 @@ mod tests {
 			token_type:        "Bearer".into(),
 			expires_in:        Some(Duration::from_secs(3600)),
 			identity_response: SecretString::from(identity),
+			project:           None,
 		};
 		let http = TestHttp(Mutex::new(VecDeque::from([OAuthHttpResponse {
 			status:  200,

@@ -19,7 +19,10 @@ use crate::{
 		TranscriptionCapabilities, TranscriptionFeatureBits, VideoCapabilities, VideoFeatureBits,
 	},
 	cascade::{AxisMap, CascadeError, CompatCascade, ResolveTarget},
-	classify::{ClassificationInput, ClassificationPhase, ModelClassification, classify},
+	classify::{
+		ClassificationInput, ClassificationPhase, ModelClassification, classify,
+		strip_effort_lane, supports_dynamic_effort_siblings,
+	},
 	discover::DiscoveryDefaults,
 	id::{
 		AuthSpecId, CatalogRevision, CodecId, DiscoverySpecId, ModelKey, OAuthSpecId, ProviderId,
@@ -74,6 +77,13 @@ impl RawModelProperties {
 		self.0.get()
 	}
 }
+impl PartialEq for RawModelProperties {
+	fn eq(&self, other: &Self) -> bool {
+		self.0.get() == other.0.get()
+	}
+}
+
+impl Eq for RawModelProperties {}
 
 /// Typed source modality.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -149,7 +159,7 @@ pub enum SourceTransport {
 }
 
 /// Typed source price components in decimal US dollars.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceCost {
 	/// Input price per million tokens.
@@ -170,7 +180,7 @@ pub struct SourceCost {
 }
 
 /// Typed long-context source price schedule.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceLongContextCost {
 	/// Exclusive prompt-token threshold.
@@ -262,6 +272,9 @@ pub struct SourceModelRecord {
 	/// Context promotion target.
 	#[serde(default)]
 	pub context_promotion_target: Option<Str>,
+	/// Local compaction model target.
+	#[serde(default)]
+	pub compaction_model: Option<Str>,
 	/// Wire model override.
 	#[serde(default)]
 	pub request_model_id: Option<Str>,
@@ -470,12 +483,14 @@ pub struct SourceDiscovery {
 }
 
 /// Sparse typed provider/model wire-policy source.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SourceWirePolicy {
 	/// Streaming usage support.
 	#[serde(alias = "supportsUsageInStreaming")]
 	pub usage_in_streaming: Option<bool>,
+	/// Reversible private-use glyph tokenization at the provider wire boundary.
+	pub glyph_tokenization: Option<bool>,
 	/// Multiple system-message support.
 	pub multiple_system_messages: Option<bool>,
 	/// Output-token field spelling.
@@ -676,6 +691,12 @@ pub enum SourceFacet {
 pub struct SourceProviderRecord {
 	/// Source transport.
 	pub transport:            SourceTransport,
+	/// Additional wire protocols exposed at the primary base URL.
+	///
+	/// These routes are addressable by runtime discovery but remain inert for
+	/// bundled models unless model evidence explicitly selects them.
+	#[serde(default)]
+	pub additional_transports: Vec<SourceTransport>,
 	/// Typed codec-construction discriminator.
 	#[serde(default)]
 	pub codec_profile:        CodecProfile,
@@ -2969,7 +2990,9 @@ fn compile_providers(
 		let mut urls = Vec::with_capacity(1 + source.fallback_base_urls.len());
 		urls.push(source.base_url.clone());
 		urls.extend(source.fallback_base_urls.iter().cloned());
-		let mut owned_routes = Vec::with_capacity(urls.len());
+		let mut owned_routes =
+			Vec::with_capacity(urls.len().saturating_add(source.additional_transports.len()));
+		let mut inherited_routes = Vec::with_capacity(urls.len());
 		let mut route_operations = facet_operations(&source.facets);
 		if discovery_id.is_some() {
 			route_operations.insert_kind(OperationKind::DiscoverModels);
@@ -3014,6 +3037,51 @@ fn compile_providers(
 				trust_domain: TrustDomain {
 					origin:          Str::from(origin),
 					redirects:       RedirectTrust::SameOrigin,
+					allow_plaintext: false,
+				},
+				codex_transport: if source.codex_transport.as_deref() == Some("websocket-preferred") {
+					CodexTransportPreference::WebsocketPreferred
+				} else {
+					CodexTransportPreference::HttpOnly
+				},
+				use_responses_lite: Some(source.codex_responses_lite),
+				priority: None,
+			});
+			owned_routes.push(route_id.clone());
+			inherited_routes.push(route_id);
+		}
+		for additional in &source.additional_transports {
+			let (codec, transport) = translate_transport(*additional);
+			let route_id = RouteId::new(format!("{provider_key}/{}", codec.as_str()));
+			if owned_routes.contains(&route_id) {
+				return Err(CompileError::Invariant(sf!(
+					"provider `{provider_key}` declares duplicate route `{route_id}`"
+				)));
+			}
+			let origin = source
+				.base_url
+				.as_str()
+				.split('/')
+				.take(3)
+				.collect::<Vec<_>>()
+				.join("/");
+			routes.push(RouteDef {
+				id: route_id.clone(),
+				provider: provider_id.clone(),
+				codec_profile: source.codec_profile,
+				codec,
+				transport,
+				endpoint: EndpointSpec { base_url: source.base_url.clone(), region: None },
+				auth: auth_id.clone(),
+				headers: header_id.clone(),
+				discovery: discovery_id.clone(),
+				capability_limits: RouteRestrictions {
+					operations: (route_operations != OperationBits::empty()).then_some(route_operations),
+					..RouteRestrictions::default()
+				},
+				trust_domain: TrustDomain {
+					origin: Str::from(origin),
+					redirects: RedirectTrust::SameOrigin,
 					allow_plaintext: false,
 				},
 				codex_transport: if source.codex_transport.as_deref() == Some("websocket-preferred") {
@@ -3075,7 +3143,7 @@ fn compile_providers(
 			discovery_defaults,
 			mapping,
 		});
-		provider_routes.insert(provider_key, owned_routes);
+		provider_routes.insert(provider_key, inherited_routes);
 	}
 	output.sort_by(|left, right| left.id.cmp(&right.id));
 	routes.sort_by(|left, right| left.id.cmp(&right.id));
@@ -3247,7 +3315,7 @@ fn compile_models(
 				(model.clone(), classified)
 			})
 			.collect();
-		let collapsible = collapsible_groups(&identities);
+		let collapsible = collapsible_groups(provider.as_str(), &rows, &identities);
 		let mut logical: BTreeMap<Str, Vec<(Str, SourceModelRecord, ModelClassification)>> =
 			BTreeMap::new();
 		for (wire, row) in rows {
@@ -3338,6 +3406,12 @@ fn compile_models(
 				&first.1.cost,
 				resolved.catalog.get("longContext"),
 			)?;
+			let edit_revision = resolved
+				.catalog
+				.get("editRevision")
+				.and_then(Value::as_str)
+				.map(Str::new)
+				.or_else(|| first.1.edit_revision.clone());
 			if resolved.thinking.contains_key("efforts") {
 				merged_row.reasoning = true;
 			}
@@ -3430,10 +3504,13 @@ fn compile_models(
 					.or_insert_with(|| profile.clone());
 				id
 			});
-			for (wire, _, classified) in &members {
-				if wire.as_str() != logical_id.as_str() {
+			for (wire, row, classified) in &members {
+				for source in std::iter::once(wire.as_str())
+					.chain(row.request_model_id.as_deref())
+					.filter(|source| *source != logical_id.as_str())
+				{
 					aliases.push(CatalogAlias {
-						alias:      Str::from(format!("{provider}/{wire}")),
+						alias:      Str::from(format!("{provider}/{source}")),
 						target:     key.clone(),
 						rationale:  classified.evidence.rationale.clone(),
 						provenance: classified.evidence.provenance.clone(),
@@ -3512,8 +3589,14 @@ fn compile_models(
 						Str::from(format!("{provider}/{target}"))
 					})
 				}),
-				compaction_model: None,
-				edit_revision: first.1.edit_revision.clone(),
+				compaction_model: first.1.compaction_model.as_ref().map(|target| {
+					ModelKey::new(if target.contains('/') {
+						target.clone()
+					} else {
+						Str::from(format!("{provider}/{target}"))
+					})
+				}),
+				edit_revision,
 				remote_compaction: first.1.remote_compaction.as_ref().map(|source| {
 					ModelRemoteCompaction {
 						enabled:              source.enabled,
@@ -3539,6 +3622,7 @@ fn compile_models(
 			});
 		}
 	}
+	retarget_collapsed_model_references(&mut output, &aliases);
 	aliases.sort_by(|left, right| {
 		left
 			.alias
@@ -3546,6 +3630,9 @@ fn compile_models(
 			.then_with(|| left.target.cmp(&right.target))
 	});
 	aliases.dedup_by(|left, right| left.alias == right.alias && left.target == right.target);
+	if aliases.windows(2).any(|pair| pair[0].alias == pair[1].alias) {
+		return Err(CompileError::Invariant(sf!("variant alias has multiple logical targets",)));
+	}
 	let attached = output
 		.iter()
 		.filter_map(|model| model.thinking.as_ref())
@@ -3555,24 +3642,174 @@ fn compile_models(
 	Ok((output, aliases))
 }
 
-fn collapsible_groups(classified: &BTreeMap<Str, ModelClassification>) -> BTreeSet<Str> {
+fn retarget_collapsed_model_references(models: &mut [ModelSpec], aliases: &[CatalogAlias]) {
+	let live = models
+		.iter()
+		.map(|model| model.key.clone())
+		.collect::<BTreeSet<_>>();
+	let aliases = aliases
+		.iter()
+		.filter(|alias| live.contains(&alias.target))
+		.map(|alias| (alias.alias.clone(), alias.target.clone()))
+		.collect::<BTreeMap<_, _>>();
+	for model in models {
+		retarget_collapsed_model_reference(&mut model.context_promotion_target, &live, &aliases);
+		retarget_collapsed_model_reference(&mut model.compaction_model, &live, &aliases);
+	}
+}
+
+fn retarget_collapsed_model_reference(
+	reference: &mut Option<ModelKey>,
+	live: &BTreeSet<ModelKey>,
+	aliases: &BTreeMap<Str, ModelKey>,
+) {
+	let Some(target) = reference else {
+		return;
+	};
+	if live.contains(target) {
+		return;
+	}
+	if let Some(replacement) = aliases.get(target.as_str())
+		&& live.contains(replacement)
+	{
+		*target = replacement.clone();
+	}
+}
+
+fn collapsible_groups(
+	provider: &str,
+	rows: &BTreeMap<Str, SourceModelRecord>,
+	classified: &BTreeMap<Str, ModelClassification>,
+) -> BTreeSet<Str> {
 	let raw: BTreeSet<&str> = classified.keys().map(Str::as_str).collect();
-	let mut tiers: BTreeMap<&str, usize> = BTreeMap::new();
+	let mut groups = BTreeMap::<&str, Vec<(&Str, &SourceModelRecord, &ModelClassification)>>::new();
 	let mut result = BTreeSet::new();
-	for value in classified.values() {
+	for (wire, value) in classified {
 		if value.thinking_variant && raw.contains(value.logical_model.as_str()) {
 			result.insert(value.logical_model.clone());
 		}
 		if value.effort.is_some() {
-			*tiers.entry(value.logical_model.as_str()).or_default() += 1;
+			groups.entry(value.logical_model.as_str()).or_default().push((
+				wire,
+				rows.get(wire).expect("classification and source rows agree"),
+				value,
+			));
 		}
 	}
-	for (logical, count) in tiers {
-		if count >= 2 {
-			result.insert(Str::new(logical));
+	if !supports_dynamic_effort_siblings(provider) {
+		for (logical, members) in groups {
+			if members.len() >= 2 {
+				result.insert(Str::new(logical));
+			}
+		}
+		return result;
+	}
+
+	let candidate_logicals = groups.keys().map(|logical| Str::new(*logical)).collect::<BTreeSet<_>>();
+	for (logical, members) in &groups {
+		if cursor_effort_group_is_safe(
+			provider,
+			logical,
+			members,
+			rows,
+			&candidate_logicals,
+			&groups,
+		) {
+			result.insert(Str::new(*logical));
 		}
 	}
 	result
+}
+
+fn cursor_effort_group_is_safe(
+	provider: &str,
+	logical: &str,
+	members: &[(&Str, &SourceModelRecord, &ModelClassification)],
+	rows: &BTreeMap<Str, SourceModelRecord>,
+	candidate_logicals: &BTreeSet<Str>,
+	groups: &BTreeMap<&str, Vec<(&Str, &SourceModelRecord, &ModelClassification)>>,
+) -> bool {
+	if members.len() < 2 {
+		return false;
+	}
+	let distinct_efforts = members
+		.iter()
+		.filter_map(|(_, _, classification)| classification.effort)
+		.collect::<BTreeSet<_>>();
+	if distinct_efforts.len() != members.len()
+		|| logical
+			.split('-')
+			.any(|token| token.eq_ignore_ascii_case("thinking"))
+	{
+		return false;
+	}
+	let nested = classify(ClassificationInput {
+		phase: ClassificationPhase::CatalogCompiler,
+		provider,
+		model: logical,
+		observed_at_ms: None,
+	});
+	if nested.effort.is_some()
+		|| candidate_logicals.iter().any(|candidate| {
+			candidate.as_str() != logical
+				&& classify(ClassificationInput {
+					phase:          ClassificationPhase::CatalogCompiler,
+					provider,
+					model:          candidate,
+					observed_at_ms: None,
+				})
+				.logical_model
+				.as_str() == logical
+		})
+	{
+		return false;
+	}
+
+	let standard = strip_effort_lane(provider, logical);
+	if let Some(row) = rows.get(standard)
+		&& !collapsed_logical_covers(row, groups.get(standard).map_or(&[], Vec::as_slice))
+	{
+		return false;
+	}
+	if logical != standard
+		&& let Some(row) = rows.get(logical)
+		&& !collapsed_logical_covers(row, members)
+	{
+		return false;
+	}
+	if members
+		.iter()
+		.any(|(_, row, _)| row.thinking.is_some() || row.request_model_id.is_some())
+	{
+		return false;
+	}
+	let first = members[0].1;
+	members.iter().all(|(_, row, _)| {
+		row.api == first.api
+			&& row.base_url == first.base_url
+			&& row.context_window == first.context_window
+			&& row.max_tokens == first.max_tokens
+			&& row.cursor_max_mode == first.cursor_max_mode
+			&& row.cost == first.cost
+			&& row.compat == first.compat
+	})
+}
+
+fn collapsed_logical_covers(
+	logical: &SourceModelRecord,
+	members: &[(&Str, &SourceModelRecord, &ModelClassification)],
+) -> bool {
+	if members.is_empty() {
+		return false;
+	}
+	let Some(thinking) = &logical.thinking else {
+		return false;
+	};
+	members.iter().all(|(wire, row, _)| {
+		let selected = row.request_model_id.as_ref().unwrap_or(*wire);
+		logical.request_model_id.as_ref() == Some(selected)
+			|| thinking.effort_routing.values().any(|route| route == selected)
+	})
 }
 
 fn axis_map_to_source_wire_policy(source: AxisMap) -> Result<SourceWirePolicy, CompileError> {
@@ -3601,6 +3838,9 @@ fn compile_wire_policy(
 	source: &SourceWirePolicy,
 ) -> Result<WirePolicy, CompileError> {
 	policy.usage.in_streaming = source.usage_in_streaming.or(policy.usage.in_streaming);
+	policy.context.glyph_tokenization = source
+		.glyph_tokenization
+		.or(policy.context.glyph_tokenization);
 	policy.role.multiple_system_messages = source
 		.multiple_system_messages
 		.or(policy.role.multiple_system_messages);
@@ -3791,7 +4031,8 @@ fn compile_thinking(
 	classified_efforts.sort();
 	classified_efforts.dedup();
 	let tier_collapsed = classified_efforts.len() >= 2;
-	let synthesize_cursor = provider == "cursor" && tier_collapsed && source.is_none();
+	let synthesize_cursor =
+		supports_dynamic_effort_siblings(provider) && tier_collapsed && source.is_none();
 	let profile = if synthesize_cursor {
 		let efforts = classified_efforts
 			.iter()
@@ -4783,6 +5024,112 @@ fn revision_for(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	fn source_model(value: Value) -> SourceModelRecord {
+		serde_json::from_value(value).expect("source model")
+	}
+
+	fn classifications(
+		provider: &str,
+		rows: &BTreeMap<Str, SourceModelRecord>,
+	) -> BTreeMap<Str, ModelClassification> {
+		rows
+			.keys()
+			.map(|wire| {
+				(
+					wire.clone(),
+					classify(ClassificationInput {
+						phase:          ClassificationPhase::CatalogCompiler,
+						provider,
+						model:          wire,
+						observed_at_ms: None,
+					}),
+				)
+			})
+			.collect()
+	}
+
+	#[test]
+	fn cursor_collapse_groups_extra_high_and_rejects_duplicate_efforts() {
+		let rows = ["low", "extra-high"]
+			.into_iter()
+			.map(|tier| {
+				(
+					Str::from(format!("review-{tier}")),
+					source_model(serde_json::json!({
+						"api": "cursor",
+						"contextWindow": 200000,
+						"maxTokens": 64000
+					})),
+				)
+			})
+			.collect::<BTreeMap<_, _>>();
+		assert!(collapsible_groups("cursor", &rows, &classifications("cursor", &rows)).contains("review"));
+
+		let duplicate = ["low", "xhigh", "extra-high"]
+			.into_iter()
+			.map(|tier| {
+				(
+					Str::from(format!("duplicate-{tier}")),
+					source_model(serde_json::json!({ "api": "cursor" })),
+				)
+			})
+			.collect::<BTreeMap<_, _>>();
+		assert!(
+			!collapsible_groups("cursor", &duplicate, &classifications("cursor", &duplicate))
+				.contains("duplicate")
+		);
+	}
+
+	#[test]
+	fn matching_static_logical_row_dedupes_live_cursor_tiers() {
+		let rows = BTreeMap::from([
+			(
+				Str::from("review"),
+				source_model(serde_json::json!({
+					"api": "cursor",
+					"reasoning": true,
+					"thinking": {
+						"mode": "effort",
+						"efforts": ["low", "high"],
+						"effortRouting": {
+							"low": "review-low",
+							"high": "review-high"
+						}
+					}
+				})),
+			),
+			(
+				Str::from("review-low"),
+				source_model(serde_json::json!({ "api": "cursor" })),
+			),
+			(
+				Str::from("review-high"),
+				source_model(serde_json::json!({ "api": "cursor" })),
+			),
+		]);
+		assert!(collapsible_groups("cursor", &rows, &classifications("cursor", &rows)).contains("review"));
+	}
+
+	#[test]
+	fn collapsed_references_retarget_only_to_live_alias_destinations() {
+		let live = BTreeSet::from([
+			ModelKey::from("cursor/logical"),
+			ModelKey::from("cursor/live-tier"),
+		]);
+		let aliases = BTreeMap::from([
+			(Str::from("cursor/member-high"), ModelKey::from("cursor/logical")),
+			(Str::from("cursor/stale"), ModelKey::from("cursor/missing")),
+		]);
+		let mut collapsed = Some(ModelKey::from("cursor/member-high"));
+		retarget_collapsed_model_reference(&mut collapsed, &live, &aliases);
+		assert_eq!(collapsed, Some(ModelKey::from("cursor/logical")));
+		let mut live_tier = Some(ModelKey::from("cursor/live-tier"));
+		retarget_collapsed_model_reference(&mut live_tier, &live, &aliases);
+		assert_eq!(live_tier, Some(ModelKey::from("cursor/live-tier")));
+		let mut stale = Some(ModelKey::from("cursor/stale"));
+		retarget_collapsed_model_reference(&mut stale, &live, &aliases);
+		assert_eq!(stale, Some(ModelKey::from("cursor/stale")));
+	}
 
 	#[test]
 	fn rejects_header_injection_and_credentials() {
@@ -4898,6 +5245,39 @@ mod tests {
 			.as_ref()
 			.expect("coreweave discovery source");
 		assert!(discovery.authoritative, "coreweave dynamic discovery must be authoritative");
+	}
+
+	#[test]
+	fn additional_transports_are_inert_until_selected() {
+		let providers = r#"
+[providers.synthetic]
+transport = "open-ai-chat"
+additional_transports = ["open-ai-responses"]
+base_url = "https://example.test/v1"
+facets = ["chat"]
+discovery = { kind = "open-ai-models", label = "Synthetic", authoritative = false }
+"#;
+		let models = br#"{"synthetic":{"model":{"input":["text"],"output":["text"]}}}"#;
+		let compressed = zstd::stream::encode_all(&models[..], 1).expect("fixture compression");
+		let compiled = compile(parse_oracle(providers, &compressed).expect("typed source"))
+			.expect("catalog compilation");
+		let provider = compiled
+			.providers
+			.iter()
+			.find(|provider| provider.id.as_str() == "synthetic")
+			.expect("compiled provider");
+		assert!(
+			provider
+				.routes
+				.iter()
+				.any(|route| route.as_str() == "synthetic/openai-responses")
+		);
+		let model = compiled
+			.models
+			.iter()
+			.find(|model| model.key.as_str() == "synthetic/model")
+			.expect("compiled model");
+		assert_eq!(model.routes.as_ref(), &[RouteId::from("synthetic/primary")]);
 	}
 
 	#[test]

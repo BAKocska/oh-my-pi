@@ -18,13 +18,18 @@ use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
 	client::legacy::{Client, connect::HttpConnector},
-	rt::TokioExecutor,
+	rt::{TokioExecutor, TokioIo},
 };
 use omp_core::Str;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
+use tokio::{
+	io::{AsyncReadExt as _, AsyncWriteExt as _},
+	net::TcpStream,
+};
 use tower::{Service, ServiceExt as _};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::{
 	body::{
@@ -46,6 +51,7 @@ use crate::{
 			BrowserFetch, BrowserFetchError, BrowserFetchRequest, BrowserHeader, MAX_BROWSER_DEADLINE,
 		},
 		cassette::{CapturedFrame, capture_frame, is_commit_candidate},
+		proxy,
 	},
 };
 
@@ -84,9 +90,206 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const PUBLIC_REQUEST_ID_HEADERS: [&str; 5] =
 	["x-request-id", "request-id", "x-amzn-requestid", "x-goog-request-id", "cf-ray"];
 
-type Connector = HttpsConnector<HttpConnector>;
+type Connector = HttpsConnector<EnvProxyConnector>;
 type RequestBody = UnsyncBoxBody<Bytes, Error>;
 type PooledClient = Client<Connector, RequestBody>;
+type ConnectorError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Clone, Debug)]
+struct EnvProxyConnector {
+	direct: HttpConnector,
+}
+
+impl EnvProxyConnector {
+	fn new() -> Self {
+		let mut direct = HttpConnector::new();
+		direct.enforce_http(false);
+		Self { direct }
+	}
+}
+
+impl Service<Uri> for EnvProxyConnector {
+	type Response = TokioIo<TcpStream>;
+	type Error = ConnectorError;
+	type Future =
+		Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+	fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		match self.direct.poll_ready(context) {
+			Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+			Poll::Ready(Err(error)) => {
+				Poll::Ready(Err(Box::new(error) as ConnectorError))
+			},
+			Poll::Pending => Poll::Pending,
+		}
+	}
+
+	fn call(&mut self, destination: Uri) -> Self::Future {
+		let mut direct = self.direct.clone();
+		Box::pin(async move {
+			let target = Url::parse(&destination.to_string()).ok();
+			let selected = target.as_ref().and_then(proxy::for_url);
+			let Some(proxy) = selected else {
+				return direct
+					.call(destination)
+					.await
+					.map_err(|error| Box::new(error) as ConnectorError);
+			};
+			if proxy.scheme() != "http" {
+				return Err(connector_error("proxy URL must use http"));
+			}
+			let proxy_host = proxy
+				.host_str()
+				.ok_or_else(|| connector_error("proxy URL has no host"))?;
+			let proxy_port = proxy.port().unwrap_or(80);
+			let proxy_authority = if proxy_host.contains(':') {
+				format!("[{proxy_host}]:{proxy_port}")
+			} else {
+				format!("{proxy_host}:{proxy_port}")
+			};
+			let proxy_uri = format!("http://{proxy_authority}")
+				.parse::<Uri>()
+				.map_err(|_| connector_error("proxy URL is invalid"))?;
+			let mut stream = direct
+				.call(proxy_uri)
+				.await
+				.map_err(|error| Box::new(error) as ConnectorError)?;
+			let authorization = proxy_basic_authorization(&proxy)?;
+			connect_tunnel(&mut stream, &destination, authorization.as_ref().map(|value| value.as_str())).await?;
+			Ok(stream)
+		})
+	}
+}
+
+fn connector_error(message: &'static str) -> ConnectorError {
+	Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, message))
+}
+
+fn proxy_basic_authorization(proxy: &Url) -> Result<Option<Zeroizing<String>>, ConnectorError> {
+	if proxy.username().is_empty() && proxy.password().is_none() {
+		return Ok(None);
+	}
+	let username = Zeroizing::new(
+		percent_decode(proxy.username())
+			.ok_or_else(|| connector_error("proxy username has invalid percent encoding"))?,
+	);
+	let password = Zeroizing::new(
+		percent_decode(proxy.password().unwrap_or_default())
+			.ok_or_else(|| connector_error("proxy password has invalid percent encoding"))?,
+	);
+	let mut credentials = Zeroizing::new(Vec::with_capacity(username.len() + password.len() + 1));
+	credentials.extend_from_slice(&username);
+	credentials.push(b':');
+	credentials.extend_from_slice(&password);
+	Ok(Some(Zeroizing::new(base64(&credentials))))
+}
+
+fn percent_decode(value: &str) -> Option<Vec<u8>> {
+	let bytes = value.as_bytes();
+	let mut output = Vec::with_capacity(bytes.len());
+	let mut index = 0;
+	while index < bytes.len() {
+		if bytes[index] != b'%' {
+			output.push(bytes[index]);
+			index += 1;
+			continue;
+		}
+		let high = hex_digit(*bytes.get(index + 1)?)?;
+		let low = hex_digit(*bytes.get(index + 2)?)?;
+		output.push((high << 4) | low);
+		index += 3;
+	}
+	Some(output)
+}
+
+const fn hex_digit(byte: u8) -> Option<u8> {
+	match byte {
+		b'0'..=b'9' => Some(byte - b'0'),
+		b'a'..=b'f' => Some(byte - b'a' + 10),
+		b'A'..=b'F' => Some(byte - b'A' + 10),
+		_ => None,
+	}
+}
+
+fn base64(input: &[u8]) -> String {
+	const ALPHABET: &[u8; 64] =
+		b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+	for chunk in input.chunks(3) {
+		let bits = (u32::from(chunk[0]) << 16)
+			| (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+			| u32::from(*chunk.get(2).unwrap_or(&0));
+		output.push(ALPHABET[((bits >> 18) & 0x3f) as usize] as char);
+		output.push(ALPHABET[((bits >> 12) & 0x3f) as usize] as char);
+		output.push(if chunk.len() > 1 {
+			ALPHABET[((bits >> 6) & 0x3f) as usize] as char
+		} else {
+			'='
+		});
+		output.push(if chunk.len() > 2 {
+			ALPHABET[(bits & 0x3f) as usize] as char
+		} else {
+			'='
+		});
+	}
+	output
+}
+
+async fn connect_tunnel(
+	stream: &mut TokioIo<TcpStream>,
+	destination: &Uri,
+	authorization: Option<&str>,
+) -> Result<(), ConnectorError> {
+	let host = destination
+		.host()
+		.ok_or_else(|| connector_error("proxy destination has no host"))?;
+	let port = destination
+		.port_u16()
+		.unwrap_or_else(|| if destination.scheme_str() == Some("https") { 443 } else { 80 });
+	let authority = if host.contains(':') {
+		format!("[{host}]:{port}")
+	} else {
+		format!("{host}:{port}")
+	};
+	let authorization = authorization.map_or_else(String::new, |value| {
+		format!("Proxy-Authorization: Basic {value}\r\n")
+	});
+	let request = Zeroizing::new(format!(
+		"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{authorization}Proxy-Connection: \
+		 Keep-Alive\r\n\r\n"
+	));
+	stream
+		.inner_mut()
+		.write_all(request.as_bytes())
+		.await
+		.map_err(|error| Box::new(error) as ConnectorError)?;
+	let mut response = Vec::with_capacity(256);
+	let mut byte = [0_u8; 1];
+	while response.len() < 8 * 1024 && !response.ends_with(b"\r\n\r\n") {
+		stream
+			.inner_mut()
+			.read_exact(&mut byte)
+			.await
+			.map_err(|error| Box::new(error) as ConnectorError)?;
+		response.push(byte[0]);
+	}
+	if !response.ends_with(b"\r\n\r\n") {
+		return Err(connector_error("proxy CONNECT response exceeds header bound"));
+	}
+	let first_line = response
+		.split(|byte| *byte == b'\n')
+		.next()
+		.and_then(|line| std::str::from_utf8(line).ok())
+		.unwrap_or_default();
+	let accepted = first_line
+		.split_ascii_whitespace()
+		.nth(1)
+		.is_some_and(|status| status == "200");
+	if !accepted {
+		return Err(connector_error("proxy rejected CONNECT tunnel"));
+	}
+	Ok(())
+}
 
 static POOLED_CLIENT: LazyLock<PooledClient> = LazyLock::new(|| {
 	let _ = rustls::crypto::ring::default_provider().install_default();
@@ -95,7 +298,7 @@ static POOLED_CLIENT: LazyLock<PooledClient> = LazyLock::new(|| {
 		.https_or_http()
 		.enable_http1()
 		.enable_http2()
-		.build();
+		.wrap_connector(EnvProxyConnector::new());
 	Client::builder(TokioExecutor::new()).build(connector)
 });
 
@@ -960,7 +1163,7 @@ fn decode_stream(
 		let mut capture_remaining = capture_limit;
 		let mut ordinal = 0_u64;
 		let mut emitted = false;
-		loop {
+		'response: loop {
 			let next = tokio::select! {
 				next = incoming.frame() => next,
 				() = poll_fn(|context| cancel.poll_cancelled(context)) => {
@@ -1117,6 +1320,12 @@ fn decode_stream(
 							yield Ok(event);
 						},
 					}
+				}
+				if decoder.is_complete() {
+					// A provider terminal envelope owns response completion even
+					// when a broken keep-alive leaves the HTTP body open.
+					guard.disarm();
+					break 'response;
 				}
 			}
 		}

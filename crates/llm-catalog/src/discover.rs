@@ -1,6 +1,12 @@
 //! Conservative normalization of runtime provider model discovery.
 
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc, time::Instant};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	error::Error,
+	fmt,
+	sync::Arc,
+	time::Instant,
+};
 
 use omp_core::{Str, sf};
 use parking_lot::Mutex;
@@ -13,7 +19,8 @@ use crate::{
 	ExtendedContextMode, ModelAvailability, ModelCapabilities, ModelKey, ModelLimits, ModelOverlay,
 	ModelPatch, ModelProvenance, ModelSpec, OperationBits, OperationKind, Pricing, ProvenanceKind,
 	ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, ScopedAlias, ThinkingPolicyId,
-	ThinkingRouting, WireModelId, WirePolicyId, classify,
+	ThinkingEffort, ThinkingRouting, WireModelId, WirePolicyId, classify,
+	classify::{strip_effort_lane, supports_dynamic_effort_siblings},
 };
 
 /// Provider-declared facts for one remotely discovered wire model.
@@ -472,11 +479,17 @@ impl DiscoveryNormalizer {
 			.aliases
 			.iter()
 			.filter(|alias| *alias != &row.wire_model)
-			.map(|alias| CatalogAlias {
-				alias:      Str::new(alias.as_str()),
-				target:     ModelKey::new(classification.logical_model.clone()),
-				rationale:  sf!("provider discovery declared an alternate wire model identifier",),
-				provenance: row.source.clone(),
+			.flat_map(|alias| {
+				[Str::new(alias.as_str()), sf!("{}/{}", row.provider, alias)]
+					.into_iter()
+					.map(|alias| CatalogAlias {
+						alias,
+						target: ModelKey::new(classification.logical_model.clone()),
+						rationale: sf!(
+							"provider discovery declared an alternate wire model identifier",
+						),
+						provenance: row.source.clone(),
+					})
 			})
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
@@ -527,6 +540,7 @@ impl DiscoveryNormalizer {
 			.iter()
 			.map(|row| self.normalize(row))
 			.collect::<Result<Vec<_>, _>>()?;
+		prepare_dynamic_effort_groups(&mut normalized);
 		normalized.sort_by(|left, right| {
 			left
 				.provider
@@ -545,6 +559,189 @@ impl DiscoveryNormalizer {
 			}
 		}
 		Ok(grouped.into_values().collect())
+	}
+}
+
+fn prepare_dynamic_effort_groups(normalized: &mut [NormalizedDiscovery]) {
+	let mut groups = BTreeMap::<(ProviderId, ModelKey), Vec<usize>>::new();
+	let mut raw_by_provider = BTreeMap::<ProviderId, BTreeSet<Str>>::new();
+	for (index, item) in normalized.iter().enumerate() {
+		let Some((_, wire)) = item.model.wire_ids.first() else {
+			continue;
+		};
+		raw_by_provider
+			.entry(item.provider.clone())
+			.or_default()
+			.insert(Str::new(wire.as_str()));
+		if !supports_dynamic_effort_siblings(item.provider.as_str()) {
+			continue;
+		}
+		let classification = classify(ClassificationInput {
+			phase:          ClassificationPhase::DiscoveryNormalizer,
+			provider:       item.provider.as_str(),
+			model:          wire.as_str(),
+			observed_at_ms: item.model.provenance.sources[0].observed_at_ms,
+		});
+		if classification.effort.is_some() {
+			groups
+				.entry((item.provider.clone(), classification.logical_model.into()))
+				.or_default()
+				.push(index);
+		}
+	}
+	let candidate_logicals = groups
+		.keys()
+		.map(|(provider, logical)| (provider.clone(), logical.clone()))
+		.collect::<BTreeSet<_>>();
+	let safe = groups
+		.iter()
+		.filter(|((provider, logical), members)| {
+			dynamic_effort_group_is_safe(
+				provider,
+				logical,
+				members,
+				normalized,
+				raw_by_provider
+					.get(provider)
+					.expect("raw provider index is complete"),
+				&candidate_logicals,
+			)
+		})
+		.map(|(key, _)| key.clone())
+		.collect::<BTreeSet<_>>();
+
+	for item in normalized {
+		if !supports_dynamic_effort_siblings(item.provider.as_str()) {
+			continue;
+		}
+		let wire = item.model.wire_ids[0].1.clone();
+		let classification = classify(ClassificationInput {
+			phase:          ClassificationPhase::DiscoveryNormalizer,
+			provider:       item.provider.as_str(),
+			model:          wire.as_str(),
+			observed_at_ms: item.model.provenance.sources[0].observed_at_ms,
+		});
+		let key = (item.provider.clone(), ModelKey::new(classification.logical_model));
+		if classification.effort.is_none() {
+			continue;
+		}
+		if !safe.contains(&key) {
+			item.model.key = ModelKey::new(wire.as_str());
+			for alias in &mut item.aliases {
+				alias.target = item.model.key.clone();
+			}
+			continue;
+		}
+		let rationale = classification.evidence.rationale;
+		let provenance = classification.evidence.provenance;
+		let effort = classification.effort.expect("dynamic effort member");
+		item
+			.model
+			.thinking_routing
+			.effort_routing
+			.insert(discovery_effort(effort), wire.clone());
+		let target = item.model.key.clone();
+		let mut aliases = item.aliases.to_vec();
+		for alias in [Str::new(wire.as_str()), sf!("{}/{}", item.provider, wire)] {
+			if aliases.iter().any(|held| held.alias == alias) {
+				continue;
+			}
+			aliases.push(CatalogAlias {
+				alias,
+				target: target.clone(),
+				rationale: rationale.clone(),
+				provenance: provenance.clone(),
+			});
+		}
+		item.aliases = aliases.into_boxed_slice();
+	}
+}
+
+fn dynamic_effort_group_is_safe(
+	provider: &ProviderId<str>,
+	logical: &ModelKey<str>,
+	members: &[usize],
+	normalized: &[NormalizedDiscovery],
+	raw: &BTreeSet<Str>,
+	candidate_logicals: &BTreeSet<(ProviderId, ModelKey)>,
+) -> bool {
+	if members.len() < 2
+		|| logical
+			.as_str()
+			.split('-')
+			.any(|token| token.eq_ignore_ascii_case("thinking"))
+	{
+		return false;
+	}
+	let efforts = members
+		.iter()
+		.filter_map(|index| {
+			let item = &normalized[*index];
+			classify(ClassificationInput {
+				phase:          ClassificationPhase::DiscoveryNormalizer,
+				provider:       provider.as_str(),
+				model:          item.model.wire_ids[0].1.as_str(),
+				observed_at_ms: item.model.provenance.sources[0].observed_at_ms,
+			})
+			.effort
+		})
+		.collect::<BTreeSet<_>>();
+	if efforts.len() != members.len() {
+		return false;
+	}
+	let nested = classify(ClassificationInput {
+		phase:          ClassificationPhase::DiscoveryNormalizer,
+		provider:       provider.as_str(),
+		model:          logical.as_str(),
+		observed_at_ms: None,
+	});
+	if nested.effort.is_some()
+		|| candidate_logicals.iter().any(|(candidate_provider, candidate)| {
+			candidate_provider == provider
+				&& candidate != logical
+				&& candidate.as_str().starts_with(logical.as_str())
+				&& classify(ClassificationInput {
+					phase:          ClassificationPhase::DiscoveryNormalizer,
+					provider:       provider.as_str(),
+					model:          candidate.as_str(),
+					observed_at_ms: None,
+				})
+				.logical_model
+				.as_str() == logical.as_str()
+		})
+	{
+		return false;
+	}
+	let standard = strip_effort_lane(provider.as_str(), logical.as_str());
+	if raw.contains(logical.as_str()) || raw.contains(standard) {
+		return false;
+	}
+	let first = &normalized[members[0]].model;
+	members
+		.iter()
+		.map(|index| &normalized[*index].model)
+		.all(|model| dynamic_effort_metadata_matches(first, model))
+}
+
+fn dynamic_effort_metadata_matches(left: &ModelSpec, right: &ModelSpec) -> bool {
+	left.class == right.class
+		&& left.routes == right.routes
+		&& left.capabilities == right.capabilities
+		&& left.limits == right.limits
+		&& left.wire_policy == right.wire_policy
+		&& left.context == right.context
+		&& left.pricing == right.pricing
+		&& left.availability == right.availability
+}
+const fn discovery_effort(effort: crate::EffortTier) -> ThinkingEffort {
+	match effort {
+		crate::EffortTier::Off => ThinkingEffort::Off,
+		crate::EffortTier::Minimal => ThinkingEffort::Minimal,
+		crate::EffortTier::Low => ThinkingEffort::Low,
+		crate::EffortTier::Medium => ThinkingEffort::Medium,
+		crate::EffortTier::High => ThinkingEffort::High,
+		crate::EffortTier::XHigh => ThinkingEffort::XHigh,
+		crate::EffortTier::Max => ThinkingEffort::Max,
 	}
 }
 
@@ -636,6 +833,14 @@ fn merge_discovery(existing: &mut NormalizedDiscovery, incoming: NormalizedDisco
 	existing.model.wire_ids =
 		merge_sorted_unique(&existing.model.wire_ids, &incoming.model.wire_ids);
 	existing.model.routes = merge_sorted_unique(&existing.model.routes, &incoming.model.routes);
+	for (effort, wire) in incoming.model.thinking_routing.effort_routing {
+		existing
+			.model
+			.thinking_routing
+			.effort_routing
+			.entry(effort)
+			.or_insert(wire);
+	}
 	existing
 		.model
 		.capabilities
@@ -1029,6 +1234,77 @@ mod tests {
 		);
 		assert!(normalized[0].model.capabilities.chat.is_none());
 	}
+	#[test]
+	fn cursor_effort_siblings_collapse_with_aliases_and_extra_high_routing() {
+		let mut low = row("gpt-5.6-luna-low");
+		low.provider = ProviderId::from("cursor");
+		let mut xhigh = row("gpt-5.6-luna-extra-high");
+		xhigh.provider = ProviderId::from("cursor");
+		let normalized = DiscoveryNormalizer::new(defaults())
+			.normalize_batch(&[xhigh, low])
+			.expect("safe Cursor siblings normalize");
+		assert_eq!(normalized.len(), 1);
+		let model = &normalized[0].model;
+		assert_eq!(model.key, "gpt-5.6-luna");
+		assert_eq!(
+			model
+				.thinking_routing
+				.effort_routing
+				.get(&ThinkingEffort::XHigh)
+				.map(WireModelId::as_str),
+			Some("gpt-5.6-luna-extra-high")
+		);
+		let aliases = normalized[0]
+			.aliases
+			.iter()
+			.map(|alias| alias.alias.as_str())
+			.collect::<BTreeSet<_>>();
+		assert!(aliases.contains("gpt-5.6-luna-low"));
+		assert!(aliases.contains("cursor/gpt-5.6-luna-extra-high"));
+	}
+
+	#[test]
+	fn cursor_duplicate_effort_members_abort_dynamic_collapse() {
+		let mut low = row("review-low");
+		low.provider = ProviderId::from("cursor");
+		let mut xhigh = row("review-xhigh");
+		xhigh.provider = ProviderId::from("cursor");
+		let mut extra_high = row("review-extra-high");
+		extra_high.provider = ProviderId::from("cursor");
+		let normalized = DiscoveryNormalizer::new(defaults())
+			.normalize_batch(&[low, xhigh, extra_high])
+			.expect("duplicate tier group remains live");
+		assert_eq!(
+			normalized
+				.iter()
+				.map(|item| item.model.key.as_str())
+				.collect::<BTreeSet<_>>(),
+			BTreeSet::from(["review-extra-high", "review-low", "review-xhigh"])
+		);
+	}
+
+	#[test]
+	fn cursor_live_base_and_mixed_limits_preserve_skus() {
+		let mut base = row("review");
+		base.provider = ProviderId::from("cursor");
+		let mut low = row("review-low");
+		low.provider = ProviderId::from("cursor");
+		let mut high = row("review-high");
+		high.provider = ProviderId::from("cursor");
+		high.declared_limits = Some(ModelLimits {
+			context_window:        Some(1_000_000),
+			maximum_input_tokens:  None,
+			maximum_output_tokens: None,
+			maximum_batch:         None,
+		});
+		let normalized = DiscoveryNormalizer::new(defaults())
+			.normalize_batch(&[base, low, high])
+			.expect("unsafe group remains live");
+		assert_eq!(normalized.len(), 3);
+		assert!(normalized.iter().any(|item| item.model.key == "review-low"));
+		assert!(normalized.iter().any(|item| item.model.key == "review-high"));
+	}
+
 	#[test]
 	fn periodic_discovery_is_floored_and_deduplicated_across_gate_clones() {
 		let spec = DiscoverySpec {

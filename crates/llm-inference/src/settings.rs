@@ -180,6 +180,40 @@ impl RetrySettings {
 			.flatten();
 		exact.chain(wildcard)
 	}
+	/// Expands the configured chain and then the chain owned by its last
+	/// reachable fallback.
+	///
+	/// The walk is bounded by the caller's remaining attempt budget and keeps
+	/// the first occurrence of each model. This makes a fallback that is itself
+	/// a chain key reachable without allowing cyclic chains to grow forever.
+	pub fn fallback_walk(
+		&self,
+		primary: &ModelKey<str>,
+		primary_provider: Option<&ProviderId<str>>,
+		max_fallbacks: usize,
+		mut provider_for: impl FnMut(&ModelKey<str>) -> Option<ProviderId>,
+	) -> Vec<ModelKey> {
+		let mut selected = Vec::new();
+		let mut current = primary.to_owned();
+		let mut provider = primary_provider.map(ToOwned::to_owned);
+		while selected.len() < max_fallbacks {
+			let remaining = max_fallbacks - selected.len();
+			let next = self
+				.fallback_selectors(&current, provider.as_deref())
+				.map(|selector| ModelKey::from(selector.clone()))
+				.filter(|candidate| candidate != primary && !selected.contains(candidate))
+				.filter_map(|candidate| provider_for(&candidate).map(|provider| (candidate, provider)))
+				.take(remaining)
+				.collect::<Vec<_>>();
+			let Some((last, last_provider)) = next.last().cloned() else {
+				break;
+			};
+			selected.extend(next.into_iter().map(|(candidate, _)| candidate));
+			current = last;
+			provider = Some(last_provider);
+		}
+		selected
+	}
 }
 
 impl SettingsDomain for RetrySettings {
@@ -556,4 +590,55 @@ omp_settings::inventory::submit! {
 }
 omp_settings::inventory::submit! {
 	DomainRegistration::of::<ProviderRuntimeSettings>()
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn fallback_walk_reaches_chain_owned_by_last_fallback_within_budget() {
+		let settings = RetrySettings {
+			fallback_chains: BTreeMap::from([
+				(Str::new_static("provider/a"), vec![Str::new_static("provider/b")]),
+				(Str::new_static("provider/b"), vec![Str::new_static("provider/c")]),
+			]),
+			..RetrySettings::default()
+		};
+		let walked = settings.fallback_walk(
+			ModelKey::from_ref("provider/a"),
+			Some(ProviderId::from_ref("provider")),
+			2,
+			|model| {
+				matches!(model.as_str(), "provider/a" | "provider/b" | "provider/c")
+					.then(|| ProviderId::from("provider"))
+			},
+		);
+		assert_eq!(
+			walked,
+			[
+				ModelKey::from("provider/b"),
+				ModelKey::from("provider/c"),
+			]
+		);
+	}
+
+	#[test]
+	fn fallback_walk_deduplicates_cycles_and_obeys_attempt_bound() {
+		let settings = RetrySettings {
+			fallback_chains: BTreeMap::from([
+				(Str::new_static("provider/a"), vec![Str::new_static("provider/b")]),
+				(Str::new_static("provider/b"), vec![Str::new_static("provider/a")]),
+			]),
+			..RetrySettings::default()
+		};
+		assert_eq!(
+			settings.fallback_walk(
+				ModelKey::from_ref("provider/a"),
+				Some(ProviderId::from_ref("provider")),
+				10,
+				|_| Some(ProviderId::from("provider")),
+			),
+			[ModelKey::from("provider/b")]
+		);
+	}
 }

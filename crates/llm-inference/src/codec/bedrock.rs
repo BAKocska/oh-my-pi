@@ -635,32 +635,22 @@ fn encode_message(
 			},
 			ContentPart::Text { .. } => {},
 			ContentPart::Reasoning { text, proof } if message.role == Role::Assistant => {
-				let signature = match proof {
-					Some(proof) => Some(proof_text(proof, context)?),
-					None => None,
-				};
-				match signature {
-					Some(signature) => content.push(WireContentBlock::Reasoning {
+				if text.trim().is_empty() {
+					continue;
+				}
+				if let Some(proof) = proof {
+					content.push(WireContentBlock::Reasoning {
 						reasoning_content: ReasoningContent {
 							reasoning_text: ReasoningText {
 								text:      text.clone(),
-								signature: Some(signature),
+								signature: Some(proof_text(proof, context)?),
 							},
 						},
-					}),
-					None if context.policy.reasoning.replay_unsigned == Some(true) => {
-						content.push(WireContentBlock::Reasoning {
-							reasoning_content: ReasoningContent {
-								reasoning_text: ReasoningText { text: text.clone(), signature: None },
-							},
-						});
-					},
-					None => {
-						return Err(encoding_error(
-							ErrorKind::CapabilityMismatch,
-							"bedrock.reasoning.missing_proof",
-						));
-					},
+					});
+				} else {
+					content.push(WireContentBlock::Text {
+						text: sf!("<thinking>\n{text}\n</thinking>"),
+					});
 				}
 			},
 			ContentPart::Reasoning { .. } => {
@@ -2413,6 +2403,61 @@ mod tests {
 		]);
 		request.cache_retention = Setting::Require(CacheRetention::Long);
 		assert_fixture(encode_fixture(&request, &BedrockOptions::default()), "cache");
+	}
+	#[test]
+	fn replay_demotes_unsigned_reasoning_and_preserves_signed_reasoning_content() {
+		let proof = ProviderProof {
+			provider: ProviderId::new("amazon-bedrock"),
+			codec: CodecId::new("bedrock-converse"),
+			value: Bytes::from_static(b"captured-signature"),
+		};
+		let request = base_request(vec![
+			text_message(Role::User, "Plan the change."),
+			Message {
+				role: Role::Assistant,
+				content: vec![
+					ContentPart::Reasoning {
+						text: sf!("unsigned reasoning"),
+						proof: None,
+					},
+					ContentPart::Reasoning {
+						text: sf!("signed reasoning"),
+						proof: Some(proof),
+					},
+				]
+				.into(),
+				name: None,
+			},
+			text_message(Role::User, "Continue."),
+		]);
+		let body: Value = serde_json::from_slice(&encode_fixture(
+			&request,
+			&BedrockOptions::default(),
+		))
+		.expect("encoded request is JSON");
+		let blocks = body["messages"][1]["content"]
+			.as_array()
+			.expect("assistant content blocks");
+		assert_eq!(
+			blocks[0],
+			serde_json::json!({"text":"<thinking>\nunsigned reasoning\n</thinking>"})
+		);
+		assert_eq!(
+			blocks[1],
+			serde_json::json!({
+				"reasoningContent": {
+					"reasoningText": {
+						"text": "signed reasoning",
+						"signature": "captured-signature"
+					}
+				}
+			})
+		);
+		assert!(blocks.iter().all(|block| {
+			block
+				.get("reasoningContent")
+				.is_none_or(|reasoning| reasoning["reasoningText"]["signature"].is_string())
+		}));
 	}
 
 	#[test]

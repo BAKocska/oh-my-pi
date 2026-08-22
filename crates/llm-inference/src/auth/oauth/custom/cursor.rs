@@ -292,6 +292,7 @@ fn cursor_token_response(
 		token_type: sf!("Bearer"),
 		expires_in,
 		identity_response: response.body,
+		project: None,
 	})
 }
 

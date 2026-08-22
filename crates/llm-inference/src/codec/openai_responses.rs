@@ -1274,12 +1274,16 @@ impl OpenAiResponsesDecoder {
 				self.append_delta(&event, SlotClass::Tool, &mut out);
 			},
 			ResponsesStreamEventKind::OutputTextDone | ResponsesStreamEventKind::RefusalDone => {
-				self.replace_done(&event, SlotClass::Text);
+				self.replace_done(&event, SlotClass::Text, &mut out);
 			},
 			ResponsesStreamEventKind::ReasoningSummaryDone
-			| ResponsesStreamEventKind::ReasoningDone => self.replace_done(&event, SlotClass::Thinking),
+			| ResponsesStreamEventKind::ReasoningDone => {
+				self.replace_done(&event, SlotClass::Thinking, &mut out);
+			},
 			ResponsesStreamEventKind::FunctionArgumentsDone
-			| ResponsesStreamEventKind::CustomInputDone => self.replace_done(&event, SlotClass::Tool),
+			| ResponsesStreamEventKind::CustomInputDone => {
+				self.replace_done(&event, SlotClass::Tool, &mut out);
+			},
 			ResponsesStreamEventKind::PartialImage => {
 				if let Some(index) = self.lookup_index(&event)
 					&& let Some(OutputSlot::Image { encoded }) = self.outputs.get_mut(&index)
@@ -1568,7 +1572,12 @@ impl OpenAiResponsesDecoder {
 		}
 	}
 
-	fn replace_done(&mut self, event: &ResponsesStreamEvent, class: SlotClass) {
+	fn replace_done(
+		&mut self,
+		event: &ResponsesStreamEvent,
+		class: SlotClass,
+		out: &mut Vec<ResponsesProjection>,
+	) {
 		let Some(index) = self.lookup_index(event) else {
 			return;
 		};
@@ -1580,8 +1589,21 @@ impl OpenAiResponsesDecoder {
 			return;
 		};
 		match (self.outputs.get_mut(&index), class) {
+			(Some(OutputSlot::Thinking { text, emitted, .. }), SlotClass::Thinking) => {
+				let previous = text.len();
+				if complete.as_bytes().starts_with(text.as_ref())
+					&& let Some(delta) = complete.get(previous..)
+					&& !delta.is_empty()
+				{
+					text.extend_from_slice(delta.as_bytes());
+					*emitted = true;
+					out.push(ResponsesProjection::Canonical(ChatEvent::ThinkingDelta {
+						index,
+						text: Str::new(delta),
+					}));
+				}
+			},
 			(Some(OutputSlot::Text { text, .. }), SlotClass::Text)
-			| (Some(OutputSlot::Thinking { text, .. }), SlotClass::Thinking)
 			| (Some(OutputSlot::Tool { arguments: text, .. }), SlotClass::Tool) => {
 				text.clear();
 				text.extend_from_slice(complete.as_bytes());
@@ -3893,6 +3915,40 @@ mod tests {
 			ResponsesProjection::Completion(completion)
 				if completion.reason == FinishReason::ToolCalls
 		)));
+	}
+	#[test]
+	fn reasoning_summary_done_recovers_omitted_part_and_delta_events() {
+		for (delta, expected) in [
+			(None, vec!["Let's check"]),
+			(Some("Let's "), vec!["Let's ", "check"]),
+		] {
+			let mut decoder = OpenAiResponsesDecoder::default();
+			let mut events = decoder.push_json(
+				br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_ollama","summary":[]}}"#,
+			);
+			if let Some(delta) = delta {
+				events.extend(decoder.push_json(
+					format!(
+						r#"{{"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_ollama","summary_index":0,"delta":{}}}"#,
+						serde_json::to_string(delta).unwrap(),
+					)
+					.as_bytes(),
+				));
+			}
+			events.extend(decoder.push_json(
+				br#"{"type":"response.reasoning_summary_text.done","output_index":0,"item_id":"rs_ollama","summary_index":0,"text":"Let's check"}"#,
+			));
+			let deltas = events
+				.iter()
+				.filter_map(|event| match event {
+					ResponsesProjection::Canonical(ChatEvent::ThinkingDelta { text, .. }) => {
+						Some(text.as_str())
+					},
+					_ => None,
+				})
+				.collect::<Vec<_>>();
+			assert_eq!(deltas, expected);
+		}
 	}
 
 	#[test]

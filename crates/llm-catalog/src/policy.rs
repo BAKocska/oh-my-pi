@@ -249,6 +249,8 @@ policy_enum!(/// Policy for healing leaked reasoning markup in ordinary text.
 		Kimi,
 		/// Heal `DeepSeek` markup language reasoning.
 		Dsml,
+		/// Heal Qwen self-closing XML tool-call markup.
+		Qwen,
 	}
 );
 policy_enum!(/// Additional provider-specific thinking text representation.
@@ -528,6 +530,8 @@ pub struct ContextPolicy {
 	pub stateful_response_chaining: Option<bool>,
 	/// Provider wire mode used to enable an extended context path.
 	pub extended_mode:              Option<ExtendedContextMode>,
+	/// Whether private-use glyphs require reversible ASCII wire tokenization.
+	pub glyph_tokenization:         Option<bool>,
 }
 
 /// Streaming framing, timeout, and recovery policy.
@@ -671,6 +675,7 @@ impl WirePolicy {
 				supports_store:             None,
 				stateful_response_chaining: None,
 				extended_mode:              None,
+				glyph_tokenization:         None,
 			},
 			streaming:  StreamingPolicy { protocol: None, watchdog: None },
 			usage:      UsagePolicy { in_streaming: None },
@@ -701,7 +706,7 @@ impl WirePolicy {
 		policy.reasoning.loop_guard = Some(false);
 		policy.cache.control_format = Some(CacheControlFormat::None);
 		policy.context.max_tokens_field = Some(MaxTokensField::MaxCompletionTokens);
-		policy.context.stateful_response_chaining = Some(false);
+		policy.context.glyph_tokenization = Some(false);
 		policy.streaming.protocol = Some(StreamProtocol::SseData);
 		policy.streaming.watchdog =
 			Some(StreamWatchdog { first_event_ms: None, idle_ms: None });

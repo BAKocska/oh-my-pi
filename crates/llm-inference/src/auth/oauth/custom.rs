@@ -9,6 +9,7 @@ mod api_key;
 mod cursor;
 mod devin;
 mod gitlab;
+mod google_antigravity;
 mod perplexity;
 mod zai;
 
@@ -22,6 +23,7 @@ pub(super) fn register_all(
 	cursor::register(dispatcher, http.clone(), clock.clone())?;
 	devin::register(dispatcher, http.clone(), clock.clone())?;
 	gitlab::register(dispatcher, http.clone(), clock.clone())?;
+	google_antigravity::register(dispatcher, http.clone(), clock.clone())?;
 	perplexity::register(dispatcher, http.clone(), clock.clone())?;
 	zai::register(dispatcher, http, clock)
 }

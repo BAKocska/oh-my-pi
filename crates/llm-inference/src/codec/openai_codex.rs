@@ -15,6 +15,7 @@ use super::openai_responses::{
 const CODEX_CLIENT_VERSION: &str = "0.144.1";
 const CODEX_ORIGINATOR: &str = "omp";
 const CODEX_DISCOVERY_SOURCE: &str = "openai_codex_models";
+const CODEX_RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
 
 /// Codex wire transport selected for one attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,6 +269,26 @@ pub fn apply_codex_client_metadata(
 		}
 	}
 	request.client_metadata = Some(metadata);
+}
+/// Adds a region-pinned workspace's residency to Codex request headers
+/// without replacing a caller-supplied value.
+pub fn apply_codex_residency_header(
+	headers: &mut Vec<super::RequestHeader>,
+	account: Option<&crate::call::AccountRoutingContext>,
+) {
+	if headers
+		.iter()
+		.any(|header| header.name.eq_ignore_ascii_case(CODEX_RESIDENCY_HEADER))
+	{
+		return;
+	}
+	let Some(residency) = account.and_then(|account| account.region.as_ref()) else {
+		return;
+	};
+	headers.push(super::RequestHeader {
+		name:  Str::new_static(CODEX_RESIDENCY_HEADER),
+		value: Str::new(residency.as_str()),
+	});
 }
 
 /// Resolves a configured endpoint to `/codex/responses` without duplicating the
@@ -898,6 +919,7 @@ impl super::Codec for OpenAiCodexCodec {
 				headers
 					.push(super::RequestHeader { name: sf!("chatgpt-account-id"), value: account_id });
 			}
+			apply_codex_residency_header(&mut headers, context.account);
 			return Ok(super::EncodedRequest {
 				operation: crate::catalog::OperationKind::DiscoverModels,
 				method: super::RequestMethod::Get,
@@ -974,15 +996,16 @@ impl super::Codec for OpenAiCodexCodec {
 			),
 		};
 		let body = body.map_err(|_| fail("codex_request_serialization"))?;
+		let mut headers = vec![
+			super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+			super::RequestHeader { name: sf!("accept"), value: Str::new(accept) },
+		];
+		apply_codex_residency_header(&mut headers, context.account);
 		Ok(super::EncodedRequest {
 			operation: crate::catalog::OperationKind::Chat,
 			method,
 			uri,
-			headers: vec![
-				super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
-				super::RequestHeader { name: sf!("accept"), value: Str::new(accept) },
-			]
-			.into_boxed_slice(),
+			headers: headers.into_boxed_slice(),
 			body: BodySource::Bytes(body),
 			framing,
 			bounds: super::SizeBounds {
@@ -1033,6 +1056,11 @@ mod tests {
 	use crate::codec::openai_responses::{
 		ResponsesOutputItem, ResponsesRequest, ResponsesStreamEvent,
 	};
+	use crate::{
+		call::AccountRoutingContext,
+		codec::RequestHeader,
+		id::RegionId,
+	};
 
 	#[test]
 	fn responses_lite_fixture_is_an_exact_typed_rewrite() {
@@ -1046,6 +1074,36 @@ mod tests {
 		.expect("typed expected fixture");
 		transform_codex_request(&mut request, true, false).expect("Responses Lite rewrite");
 		assert_eq!(request, expected);
+	}
+	#[test]
+	fn residency_header_is_applied_only_for_claimed_regions() {
+		let account = AccountRoutingContext {
+			region: Some(RegionId::new("us")),
+			..AccountRoutingContext::default()
+		};
+		let mut headers = Vec::new();
+		super::apply_codex_residency_header(&mut headers, Some(&account));
+		assert_eq!(
+			headers,
+			vec![RequestHeader {
+				name:  Str::new_static("x-openai-internal-codex-residency"),
+				value: Str::new_static("us"),
+			}],
+		);
+
+		let mut configured = vec![RequestHeader {
+			name:  Str::new_static("X-OpenAI-Internal-Codex-Residency"),
+			value: Str::new_static("eu"),
+		}];
+		super::apply_codex_residency_header(&mut configured, Some(&account));
+		assert_eq!(configured[0].value.as_str(), "eu");
+
+		let mut absent = Vec::new();
+		super::apply_codex_residency_header(
+			&mut absent,
+			Some(&AccountRoutingContext::default()),
+		);
+		assert!(absent.is_empty());
 	}
 
 	#[test]

@@ -10,7 +10,32 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Secret-free identity of one provider discovery cache namespace.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DiscoveryCacheKey {
+	/// Provider identity.
+	pub provider: ProviderId,
+	/// Opaque credential/account affinity. Empty means provider-wide.
+	pub credential_scope: Option<Str>,
+}
+
+impl DiscoveryCacheKey {
+	/// Creates a provider-wide cache identity.
+	pub fn provider(provider: impl Into<ProviderId>) -> Self {
+		Self { provider: provider.into(), credential_scope: None }
+	}
+
+	/// Creates a credential-scoped identity from a non-secret stable affinity.
+	pub fn credential(provider: impl Into<ProviderId>, affinity: impl Into<Str>) -> Self {
+		Self { provider: provider.into(), credential_scope: Some(affinity.into()) }
+	}
+
+	fn scope(&self) -> &str {
+		self.credential_scope.as_deref().unwrap_or_default()
+	}
+}
 
 /// Provider discovery lifecycle persisted without credential material.
 #[derive(
@@ -49,8 +74,8 @@ pub struct ProviderLifecycle {
 /// One fresh cached provider generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CachedDiscovery {
-	/// Provider identity.
-	pub provider:      ProviderId,
+	/// Exact cache namespace.
+	pub key:           DiscoveryCacheKey,
 	/// Atomic generation number.
 	pub generation:    u64,
 	/// Secret-free normalized rows.
@@ -83,6 +108,7 @@ impl DiscoveryStore {
 			);
 			 CREATE TABLE IF NOT EXISTS discovered_models (
 			  provider TEXT NOT NULL,
+			  cache_scope TEXT NOT NULL DEFAULT '',
 			  generation INTEGER NOT NULL,
 			  ordinal INTEGER NOT NULL,
 			  row_json BLOB NOT NULL,
@@ -92,6 +118,26 @@ impl DiscoveryStore {
 			 CREATE INDEX IF NOT EXISTS discovered_models_fresh
 			   ON discovered_models(provider, expires_at_ms, generation);",
 		)?;
+		let has_scope = {
+			let mut statement = connection.prepare("PRAGMA table_info(discovered_models)")?;
+			let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+			let mut has_scope = false;
+			for column in columns {
+				has_scope |= column? == "cache_scope";
+			}
+			has_scope
+		};
+		if !has_scope {
+			connection.execute(
+				"ALTER TABLE discovered_models ADD COLUMN cache_scope TEXT NOT NULL DEFAULT ''",
+				[],
+			)?;
+		}
+		connection.execute_batch(
+			"DROP INDEX IF EXISTS discovered_models_fresh;
+			 CREATE INDEX discovered_models_fresh
+			   ON discovered_models(provider, cache_scope, expires_at_ms, generation);",
+		)?;
 		connection.execute(
 			"INSERT INTO discovery_meta(key, value) VALUES('schema_version', ?1)
 			 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -100,15 +146,16 @@ impl DiscoveryStore {
 		Ok(Self { connection: Mutex::new(connection) })
 	}
 
-	/// Atomically replaces one provider's complete row generation and lifecycle
-	/// state.
+	/// Atomically replaces one cache namespace's complete row generation and
+	/// updates provider lifecycle state.
 	pub fn publish(
 		&self,
-		provider: &ProviderId<str>,
+		key: &DiscoveryCacheKey,
 		rows: &[DiscoveredModel],
 		now_ms: u64,
 		ttl: Duration,
 	) -> Result<u64, DiscoveryStoreError> {
+		let provider = &key.provider;
 		if rows.iter().any(|row| row.provider != *provider) {
 			return Err(DiscoveryStoreError::ProviderMismatch);
 		}
@@ -123,14 +170,23 @@ impl DiscoveryStore {
 		for (ordinal, row) in rows.iter().enumerate() {
 			let encoded = serde_json::to_vec(row)?;
 			transaction.execute(
-				"INSERT INTO discovered_models(provider, generation, ordinal, row_json, expires_at_ms)
-				 VALUES(?1, ?2, ?3, ?4, ?5)",
-				params![provider.as_str(), generation, ordinal as u64, encoded, expires_at_ms],
+				"INSERT INTO discovered_models(
+				   provider, cache_scope, generation, ordinal, row_json, expires_at_ms
+				 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+				params![
+					provider.as_str(),
+					key.scope(),
+					generation,
+					ordinal as u64,
+					encoded,
+					expires_at_ms
+				],
 			)?;
 		}
 		transaction.execute(
-			"DELETE FROM discovered_models WHERE provider=?1 AND generation<>?2",
-			params![provider.as_str(), generation],
+			"DELETE FROM discovered_models
+			 WHERE provider=?1 AND cache_scope=?2 AND generation<>?3",
+			params![provider.as_str(), key.scope(), generation],
 		)?;
 		upsert_lifecycle(&transaction, &ProviderLifecycle {
 			provider:       provider.to_owned(),
@@ -146,16 +202,16 @@ impl DiscoveryStore {
 	/// Loads the latest unexpired generation after restart.
 	pub fn load_fresh(
 		&self,
-		provider: &ProviderId<str>,
+		key: &DiscoveryCacheKey,
 		now_ms: u64,
 	) -> Result<Option<CachedDiscovery>, DiscoveryStoreError> {
 		let connection = self.connection.lock();
 		let generation: Option<(u64, u64)> = connection
 			.query_row(
 				"SELECT generation, MAX(expires_at_ms) FROM discovered_models
-				 WHERE provider=?1 AND expires_at_ms>?2 GROUP BY generation
-				 ORDER BY generation DESC LIMIT 1",
-				params![provider.as_str(), now_ms],
+				 WHERE provider=?1 AND cache_scope=?2 AND expires_at_ms>?3
+				 GROUP BY generation ORDER BY generation DESC LIMIT 1",
+				params![key.provider.as_str(), key.scope(), now_ms],
 				|row| Ok((row.get(0)?, row.get(1)?)),
 			)
 			.optional()?;
@@ -163,16 +219,23 @@ impl DiscoveryStore {
 			return Ok(None);
 		};
 		let mut statement = connection.prepare(
-			"SELECT row_json FROM discovered_models WHERE provider=?1 AND generation=?2
-			 ORDER BY ordinal",
+			"SELECT row_json FROM discovered_models
+			 WHERE provider=?1 AND cache_scope=?2 AND generation=?3 ORDER BY ordinal",
 		)?;
-		let encoded = statement
-			.query_map(params![provider.as_str(), generation], |row| row.get::<_, Vec<u8>>(0))?;
+		let encoded = statement.query_map(
+			params![key.provider.as_str(), key.scope(), generation],
+			|row| row.get::<_, Vec<u8>>(0),
+		)?;
 		let mut rows = Vec::new();
 		for row in encoded {
 			rows.push(serde_json::from_slice(&row?)?);
 		}
-		Ok(Some(CachedDiscovery { provider: provider.to_owned(), generation, rows, expires_at_ms }))
+		Ok(Some(CachedDiscovery {
+			key: key.clone(),
+			generation,
+			rows,
+			expires_at_ms,
+		}))
 	}
 
 	/// Persists a lifecycle/error transition separately from non-authoritative
@@ -286,16 +349,17 @@ mod tests {
 		let directory = tempfile::tempdir().expect("directory");
 		let path = directory.path().join("models.db");
 		let provider = ProviderId::from("local");
+		let key = DiscoveryCacheKey::provider(provider.clone());
 		{
 			let store = DiscoveryStore::open(&path).expect("open");
 			store
-				.publish(&provider, &[row(&provider)], 100, Duration::from_secs(1))
+				.publish(&key, &[row(&provider)], 100, Duration::from_secs(1))
 				.expect("publish");
 		}
 		let reopened = DiscoveryStore::open(&path).expect("reopen");
 		assert_eq!(
 			reopened
-				.load_fresh(&provider, 500)
+				.load_fresh(&key, 500)
 				.expect("load")
 				.unwrap()
 				.rows
@@ -304,7 +368,7 @@ mod tests {
 		);
 		assert!(
 			reopened
-				.load_fresh(&provider, 1_101)
+				.load_fresh(&key, 1_101)
 				.expect("expired")
 				.is_none()
 		);
@@ -316,5 +380,71 @@ mod tests {
 				.state,
 			ProviderDiscoveryState::Ready
 		);
+	}
+	#[test]
+	fn legacy_provider_wide_rows_migrate_into_the_restorable_scope() {
+		let directory = tempfile::tempdir().expect("directory");
+		let path = directory.path().join("models.db");
+		let provider = ProviderId::from("opencode-zen");
+		let legacy = Connection::open(&path).expect("legacy database");
+		legacy
+			.execute_batch(
+				"CREATE TABLE discovered_models (
+				   provider TEXT NOT NULL,
+				   generation INTEGER NOT NULL,
+				   ordinal INTEGER NOT NULL,
+				   row_json BLOB NOT NULL,
+				   expires_at_ms INTEGER NOT NULL,
+				   PRIMARY KEY(provider, generation, ordinal)
+				 );",
+			)
+			.expect("legacy schema");
+		legacy
+			.execute(
+				"INSERT INTO discovered_models(
+				   provider, generation, ordinal, row_json, expires_at_ms
+				 ) VALUES(?1, 1, 0, ?2, 1000)",
+				params![
+					provider.as_str(),
+					serde_json::to_vec(&row(&provider)).expect("row JSON")
+				],
+			)
+			.expect("legacy row");
+		drop(legacy);
+
+		let store = DiscoveryStore::open(&path).expect("migrate");
+		let cached = store
+			.load_fresh(&DiscoveryCacheKey::provider(provider), 100)
+			.expect("load migrated row")
+			.expect("legacy row remains available");
+		assert_eq!(cached.rows.len(), 1);
+	}
+
+	#[test]
+	fn credential_scopes_are_isolated_without_persisting_credentials() {
+		let directory = tempfile::tempdir().expect("directory");
+		let path = directory.path().join("models.db");
+		let provider = ProviderId::from("github-copilot");
+		let first = DiscoveryCacheKey::credential(provider.clone(), "affinity-a");
+		let second = DiscoveryCacheKey::credential(provider.clone(), "affinity-b");
+		let store = DiscoveryStore::open(&path).expect("open");
+		store
+			.publish(&first, &[row(&provider)], 100, Duration::from_secs(60))
+			.expect("publish scoped cache");
+		assert!(store.load_fresh(&first, 101).expect("first scope").is_some());
+		assert!(store.load_fresh(&second, 101).expect("second scope").is_none());
+		let encoded: Vec<u8> = store
+			.connection
+			.lock()
+			.query_row(
+				"SELECT row_json FROM discovered_models WHERE provider=?1 AND cache_scope=?2",
+				params![provider.as_str(), first.scope()],
+				|row| row.get(0),
+			)
+			.expect("cached row");
+		let encoded = std::str::from_utf8(&encoded).expect("JSON text");
+		assert!(!encoded.contains("authorization"));
+		assert!(!encoded.contains("headers"));
+		assert!(!encoded.contains("credential-secret"));
 	}
 }

@@ -15,5 +15,6 @@ pub use probe::{
 	DiscoveryHttpClient, DiscoveryProbe, ProbeError, ProbeHttpFuture, ProbeHttpRequest,
 };
 pub use store::{
-	CachedDiscovery, DiscoveryStore, DiscoveryStoreError, ProviderDiscoveryState, ProviderLifecycle,
+	CachedDiscovery, DiscoveryCacheKey, DiscoveryStore, DiscoveryStoreError, ProviderDiscoveryState,
+	ProviderLifecycle,
 };

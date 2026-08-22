@@ -41,6 +41,7 @@ pub mod anthropic;
 pub mod cursor;
 pub mod discovery;
 pub mod gemini;
+pub(crate) mod glyph;
 pub mod google_cca;
 pub mod ollama;
 pub mod openai;
@@ -797,6 +798,11 @@ pub trait Decoder: Send {
 	/// Completes the stream, flushing partial state or returning a typed
 	/// truncation error.
 	fn finish(&mut self, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error>;
+	/// Returns whether a provider terminal envelope completed the response even
+	/// if the transport body remains open.
+	fn is_complete(&self) -> bool {
+		false
+	}
 	/// Resets state for one browser-backed replay after this decoder identified
 	/// a credential-free navigation challenge.
 	fn prepare_browser_retry(&mut self) -> bool {

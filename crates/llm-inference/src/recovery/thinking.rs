@@ -174,6 +174,7 @@ impl LeakedThinkingStage {
 				LeakedThinkingHealer::Thinking => THINK_PATTERNS,
 				LeakedThinkingHealer::Kimi => KIMI_PATTERNS,
 				LeakedThinkingHealer::Dsml => DSML_PATTERNS,
+				LeakedThinkingHealer::Qwen => NO_PATTERNS,
 			},
 		};
 		Self { config, patterns, buffer: BytesMut::new(), state: State::Visible, line_indent: 0 }

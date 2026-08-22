@@ -125,7 +125,7 @@ discovery {
 }
 ```
 
-`recover-canonical-params` takes one or more provider IDs (unique case-insensitively). On a declared provider, runtime discovery recovers intrinsic base-model parameters — display name, context window, output limit, and the interned thinking policy — for a discovered **namespaced** identity (`deepseek-ai/…`) from the bundled canonical reference index built across all providers; the first entry in frozen catalog order wins. Pricing, wire policy, and effort routing are never borrowed across providers, and bare un-namespaced slugs never match.
+`recover-canonical-params` takes one or more provider IDs (unique case-insensitively). On a declared provider, runtime discovery recovers intrinsic base-model parameters — display name, context window, output limit, and the interned thinking policy — for a discovered **namespaced** identity (`deepseek-ai/…`) from the bundled canonical reference index built across all providers; the first entry in frozen catalog order wins. A bare identity is eligible only when the same provider also declares it through `responses-route-models`, keeping canonical recovery limited to reviewed exact gateway-first pins. Pricing, wire policy, and effort routing are never borrowed across providers., and bare un-namespaced slugs never match.
 
 `borrow-responses-route` takes one or more provider IDs forming a sibling-gateway group; a provider may belong to at most one group across the inventory. On a declared provider, an **unbundled** discovered id — or its billing-variant base — that is bundled on any group member with an `openai-responses` route materializes on the discovering provider's own responses route instead of the discovery route (pi #8957: the OpenCode gateways ship models before any census bundles them). Only the responses signal is borrowed: anthropic and chat transports genuinely diverge across gateways, and pricing, limits, and thinking stay conservative. Declaring a group also indexes every group member's bundled wire identities so an advertised bundled slug keeps its own card even off the discovery route.
 
@@ -254,6 +254,16 @@ extra-body {
 | `thinking-supports-display` | `supportsDisplay` | Scalar |
 
 A rule cannot assign the same resolved axis twice in one block.
+#### Catalog-data directives
+
+| KDL directive | Resolved key | Shape |
+| --- | --- | --- |
+| `edit-revision` | `editRevision` | Non-empty string scalar |
+| `long-context-cost` | `longContext` | Object |
+
+Catalog-data directives patch compiled model metadata rather than request wire
+policy. `edit-revision` selects an existing registered edit-tool contract such
+as `sloppy.1`; absence preserves the source model's `editRevision` value.
 
 ### Precedence and ambiguity
 

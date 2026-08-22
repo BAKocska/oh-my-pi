@@ -278,3 +278,36 @@ fn normalize_scopes(scopes: Option<&str>) -> Box<[Str]> {
 	scopes.dedup();
 	scopes.into_boxed_slice()
 }
+#[cfg(test)]
+mod tests {
+	use http::{HeaderMap, HeaderValue, header::WWW_AUTHENTICATE};
+	use omp_core::Str;
+
+	use super::discover_auth_challenge;
+
+	#[test]
+	fn rfc_6750_challenge_scope_precedes_body_catalogue() {
+		let mut headers = HeaderMap::new();
+		headers.insert(
+			WWW_AUTHENTICATE,
+			HeaderValue::from_static(
+				r#"Bearer scope="genie offline_access", resource_metadata="https://example.com/.well-known/oauth-protected-resource""#,
+			),
+		);
+		let challenge = discover_auth_challenge(
+			&headers,
+			r#"{"scopes_supported":["email","openid","profile","workspace"]}"#,
+		)
+		.expect("bearer challenge is discovered");
+		let expected_scopes = [Str::from("genie"), Str::from("offline_access")];
+
+		assert_eq!(
+			challenge.scopes.as_ref(),
+			expected_scopes.as_slice(),
+		);
+		assert_eq!(
+			challenge.resource_metadata.as_deref(),
+			Some("https://example.com/.well-known/oauth-protected-resource"),
+		);
+	}
+}

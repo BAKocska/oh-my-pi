@@ -1,6 +1,7 @@
 // Model-lineage compat for "kimi"; regenerated from the frozen census using class taxonomy selectors.
 
 class "kimi" {
+	edit-revision "sloppy.1"
 	on "aiand" "baseten" "coreweave" "fireworks" "huggingface" "kilo" "nanogpt" "novita" \
 		"opencode-go" "opencode-zen" "together" "vercel-ai-gateway" "zenmux" {
 		family "k2.7-code" {

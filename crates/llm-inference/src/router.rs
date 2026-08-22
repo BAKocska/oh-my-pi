@@ -166,6 +166,44 @@ impl Router {
 		self.plan_applied_call(&call, now)
 	}
 
+	fn model_candidates(
+		&self,
+		spec: &omp_llm_catalog::ModelSpec,
+		target: Option<&Target>,
+	) -> Vec<RouteCandidate> {
+		let policy_model = Arc::new(PolicyModel::from(spec));
+		let mut candidates = Vec::new();
+		for route_id in &spec.routes {
+			let Some(route) = self.registry.catalog().route(route_id) else {
+				continue;
+			};
+			if target.is_some_and(|target| {
+				!target_route_allowed(target, route_id, &route.provider)
+			}) {
+				continue;
+			}
+			let Some((_, wire_model)) = spec
+				.wire_ids
+				.iter()
+				.find(|(candidate, _)| candidate == route_id)
+			else {
+				continue;
+			};
+			candidates.push(RouteCandidate {
+				model:        spec.key.clone(),
+				provider:     route.provider.clone(),
+				policy_model: policy_model.clone(),
+				wire_target:  WireTarget {
+					route:      route.id.clone(),
+					codec:      route.codec.clone(),
+					endpoint:   route.endpoint.clone(),
+					wire_model: wire_model.clone(),
+				},
+			});
+		}
+		candidates
+	}
+
 	fn plan_applied_call(&self, call: &Call, now: Instant) -> Result<ExecutionPlan, Error> {
 		match &call.target {
 			Target::ProviderService(provider) => self.plan_management(call, provider, None, now),
@@ -183,48 +221,33 @@ impl Router {
 					.catalog()
 					.model(model)
 					.ok_or_else(|| target_not_found(&call.target))?;
-				let policy_model = Arc::new(PolicyModel::from(spec));
-				let mut candidates = Vec::new();
-				for route_id in &spec.routes {
-					let Some(route) = self.registry.catalog().route(route_id) else {
-						continue;
-					};
-					if !target_route_allowed(&call.target, route_id, &route.provider) {
-						continue;
-					}
-					let Some((_, wire_model)) = spec
-						.wire_ids
-						.iter()
-						.find(|(candidate, _)| candidate == route_id)
-					else {
-						continue;
-					};
-					candidates.push(RouteCandidate {
-						model:        spec.key.clone(),
-						provider:     route.provider.clone(),
-						policy_model: policy_model.clone(),
-						wire_target:  WireTarget {
-							route:      route.id.clone(),
-							codec:      route.codec.clone(),
-							endpoint:   route.endpoint.clone(),
-							wire_model: wire_model.clone(),
-						},
-					});
-				}
-				let primary_provider = candidates.first().map(|candidate| &*candidate.provider);
+				let mut candidates = self.model_candidates(spec, Some(&call.target));
+				let primary_provider = candidates.first().map(|candidate| candidate.provider.clone());
+				let max_fallbacks =
+					usize::try_from(call.budget.max_attempts.saturating_sub(1)).unwrap_or(usize::MAX);
 				let fallback_models = if self.settings.retry.model_fallback {
-					self
-						.settings
-						.retry
-						.fallback_selectors(model, primary_provider)
-						.map(|selector| ModelKey::from(selector.clone()))
-						.filter(|fallback| {
-							fallback != model && self.registry.catalog().model(fallback).is_some()
-						})
-						.collect::<Vec<_>>()
+					self.settings.retry.fallback_walk(
+						model,
+						primary_provider.as_deref(),
+						max_fallbacks,
+						|candidate| {
+							self
+								.registry
+								.catalog()
+								.model(candidate)
+								.and_then(|spec| spec.routes.first())
+								.and_then(|route| self.registry.catalog().route(route))
+								.map(|route| route.provider.clone())
+						},
+					)
 				} else {
 					Vec::new()
 				};
+				for fallback in &fallback_models {
+					if let Some(spec) = self.registry.catalog().model(fallback) {
+						candidates.extend(self.model_candidates(spec, None));
+					}
+				}
 				let request = PlanRequest {
 					selection:        RouteSelection {
 						target:          call.target.clone(),

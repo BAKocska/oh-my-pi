@@ -13,7 +13,7 @@ use thiserror::Error;
 use crate::{
 	cascade::{CascadeError, glob_match},
 	classify::EffortTier,
-	id::{ClassId, FamilyId},
+	id::{ClassId, FamilyId, ProviderId},
 };
 
 macro_rules! sources {
@@ -214,12 +214,24 @@ struct DiscoveryVocabulary {
 	billing_variant_suffixes: Vec<Str>,
 }
 
+/// One reviewed seed for provider-scoped dynamic effort-sibling collapse.
+///
+/// Declaring at least one family enables the generic grouping rule for that
+/// provider. The reviewed ids retain the upstream inventory in data without
+/// baking provider or model names into compiler code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EffortFamily {
+	provider: ProviderId,
+	logical:  Str,
+}
+
 /// Parsed checked-in identity taxonomy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Taxonomy {
 	classes:          Vec<ClassDef>,
 	collapse:         Vec<SuffixDef>,
 	lanes:            Vec<EffortLaneSuffix>,
+	effort_families:  Vec<EffortFamily>,
 	routing_variants: Vec<RoutingVariantSuffix>,
 	discovery:        DiscoveryVocabulary,
 }
@@ -260,6 +272,7 @@ impl Taxonomy {
 		let mut classes = Vec::new();
 		let mut collapse = Vec::new();
 		let mut lanes = Vec::new();
+		let mut effort_families = Vec::new();
 		let mut routing_variants = Vec::new();
 		let mut discovery = DiscoveryVocabulary::default();
 		let mut source_names = BTreeSet::new();
@@ -310,6 +323,7 @@ impl Taxonomy {
 						}
 						saw_collapse = true;
 						(collapse, lanes, routing_variants) = parse_collapse(file, node)?;
+						effort_families = parse_effort_families(file, node)?;
 					},
 					"discovery" => {
 						if saw_discovery {
@@ -325,7 +339,14 @@ impl Taxonomy {
 		if !saw_collapse || collapse.is_empty() {
 			return malformed("taxonomy", "collapse");
 		}
-		Ok(Self { classes, collapse, lanes, routing_variants, discovery })
+		Ok(Self {
+			classes,
+			collapse,
+			lanes,
+			effort_families,
+			routing_variants,
+			discovery,
+		})
 	}
 
 	/// Returns the full responses-route hint group containing `provider` —
@@ -541,6 +562,32 @@ impl Taxonomy {
 			}
 		}
 		(Cow::Borrowed(model), None, false)
+	}
+	/// Whether `provider` declares dynamic effort-sibling families.
+	pub(crate) fn supports_dynamic_effort_siblings(&self, provider: &str) -> bool {
+		self
+			.effort_families
+			.iter()
+			.any(|family| {
+				family.provider.eq_ignore_ascii_case(provider) && !family.logical.is_empty()
+			})
+	}
+
+	/// Returns the standard-lane id when `model` ends in a declared effort lane.
+	pub(crate) fn strip_effort_lane<'a>(&self, provider: &str, model: &'a str) -> &'a str {
+		self
+			.lanes
+			.iter()
+			.find(|lane| {
+				lane
+					.providers
+					.iter()
+					.any(|candidate| candidate.eq_ignore_ascii_case(provider))
+					&& model
+						.get(model.len().saturating_sub(lane.suffix.len())..)
+						.is_some_and(|suffix| suffix.eq_ignore_ascii_case(lane.suffix.as_str()))
+			})
+			.map_or(model, |lane| &model[..model.len() - lane.suffix.len()])
 	}
 
 	/// Classifies a model into class, product family, and revision ranks.
@@ -852,7 +899,11 @@ fn parse_collapse(
 		let directive = child.name().value();
 		if !matches!(
 			directive,
-			"thinking-suffix" | "effort-suffix" | "effort-lane-suffix" | "routing-variant-suffix"
+			"thinking-suffix"
+				| "effort-suffix"
+				| "effort-lane-suffix"
+				| "effort-family"
+				| "routing-variant-suffix"
 		) {
 			return unexpected(file, directive, "collapse");
 		}
@@ -871,6 +922,9 @@ fn parse_collapse(
 			return malformed(file, directive);
 		}
 		let arguments = positional_strings(child);
+		if directive == "effort-family" {
+			continue;
+		}
 		if directive == "routing-variant-suffix" {
 			// One suffix followed by one or more provider ids; the suffix
 			// shares the case-insensitive uniqueness namespace with the
@@ -949,6 +1003,34 @@ fn parse_collapse(
 		});
 	}
 	Ok((rules, lanes, routing_variants))
+}
+fn parse_effort_families(file: &str, node: &KdlNode) -> Result<Vec<EffortFamily>, CascadeError> {
+	let Some(children) = node.children() else {
+		return malformed(file, "collapse");
+	};
+	let mut families = Vec::new();
+	let mut unique = BTreeSet::new();
+	for child in children.nodes().iter().filter(|child| child.name().value() == "effort-family") {
+		validate_properties(file, child, "effort-family", &[])?;
+		let arguments = positional_strings(child);
+		let [provider, logical] = arguments.as_slice() else {
+			return malformed(file, "effort-family");
+		};
+		let provider = provider.to_ascii_lowercase();
+		let logical = logical.to_ascii_lowercase();
+		if provider.is_empty()
+			|| logical.is_empty()
+			|| child.children().is_some()
+			|| !unique.insert((provider.clone(), logical.clone()))
+		{
+			return malformed(file, "effort-family");
+		}
+		families.push(EffortFamily {
+			provider: ProviderId::new(provider),
+			logical: logical.to_str(),
+		});
+	}
+	Ok(families)
 }
 
 fn parse_discovery(file: &str, node: &KdlNode) -> Result<DiscoveryVocabulary, CascadeError> {
@@ -1582,11 +1664,20 @@ mod tests {
 	}
 
 	#[test]
-	fn bundled_collapse_declares_the_cursor_grok_fast_lane() {
-		// pi PR #8988: Cursor serves Grok 4.5/4.6 as per-effort sibling ids
-		// alongside a parallel `-fast` service-tier lane; each lane collapses
-		// into its own logical model.
+	fn bundled_collapse_declares_the_cursor_fast_lane() {
+		// Cursor serves effort siblings alongside a parallel `-fast`
+		// service-tier lane; batch safety decides which candidate groups
+		// actually collapse.
 		let taxonomy = taxonomy();
+		assert_eq!(
+			taxonomy
+				.effort_families
+				.iter()
+				.filter(|family| family.provider == "cursor")
+				.map(|family| family.logical.as_str())
+				.collect::<Vec<_>>(),
+			["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
+		);
 		assert_eq!(
 			taxonomy.collapse("cursor", "cursor-grok-4.6-medium-fast"),
 			(Cow::Owned::<str>("cursor-grok-4.6-fast".into()), Some(EffortTier::Medium), false)
@@ -1598,10 +1689,9 @@ mod tests {
 		// The non-reasoning coding SKU keeps its identity: it neither ends in
 		// the lane token nor carries the versioned prefix.
 		assert_eq!(taxonomy.collapse("cursor", "grok-code-fast-1").0, "grok-code-fast-1");
-		// Cursor's Claude/GPT fast tiers stay outside the Grok lane gate.
 		assert_eq!(
-			taxonomy.collapse("cursor", "claude-opus-5-high-fast").0,
-			"claude-opus-5-high-fast"
+			taxonomy.collapse("cursor", "claude-opus-5-high-fast"),
+			(Cow::Owned::<str>("claude-opus-5-fast".into()), Some(EffortTier::High), false)
 		);
 	}
 
@@ -1638,6 +1728,7 @@ mod tests {
 		assert!(!taxonomy.recovers_canonical_params("siliconflow"));
 		// pi PR #8991: the bundled inventory declares GMI Cloud's recovery.
 		assert!(super::taxonomy().recovers_canonical_params("gmi-cloud"));
+		assert!(super::taxonomy().recovers_canonical_params("opencode-go"));
 		assert!(!super::taxonomy().recovers_canonical_params("openrouter"));
 	}
 

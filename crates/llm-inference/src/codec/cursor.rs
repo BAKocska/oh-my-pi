@@ -274,11 +274,15 @@ pub struct CursorSessionCheckpoint {
 /// Typed request for Cursor's `RunSSE` reconnect method.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CursorReconnectRequest {
-	/// Stable request identity whose server stream is resumed.
+	/// Bidi request id issued by the original run stream.
 	pub request_id: Str,
 }
 
-/// Encodes one typed run request as a Connect data envelope.
+/// Encodes the Connect-framed body for Cursor's streaming `Run` method.
+///
+/// # Errors
+/// Returns [`CursorProtocolError`] when the request state cannot be lowered
+/// onto the wire schema.
 pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorProtocolError> {
 	let state = request
 		.checkpoint
@@ -300,7 +304,7 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 				.collect(),
 			..Default::default()
 		});
-
+	let request_context = cursor_request_context(&request.root_prompts);
 	let action = match &request.action {
 		CursorRunAction::UserMessage { message_id, text } => {
 			wire::conversation_action::Action::UserMessageAction(wire::UserMessageAction {
@@ -309,13 +313,13 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 					message_id: message_id.as_str().to_owned(),
 					..Default::default()
 				}),
-				request_context:              None,
+				request_context:              Some(request_context),
 				send_to_interaction_listener: None,
 			})
 		},
 		CursorRunAction::Resume => {
 			wire::conversation_action::Action::ResumeAction(wire::ResumeAction {
-				request_context: None,
+				request_context: Some(request_context),
 			})
 		},
 		CursorRunAction::Cancel => {
@@ -337,20 +341,31 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 			input_schema_json:   None,
 		})
 		.collect();
+	let wire_model = resolve_cursor_wire_model(request.model_id.as_str());
 	let model = wire::ModelDetails {
-		model_id: request.model_id.as_str().to_owned(),
-		display_model_id: request.model_id.as_str().to_owned(),
-		display_name: request.model_id.as_str().to_owned(),
+		model_id: wire_model.model_id.as_str().to_owned(),
+		display_model_id: wire_model.model_id.as_str().to_owned(),
+		display_name: wire_model.model_id.as_str().to_owned(),
 		max_mode: Some(request.max_mode),
 		..Default::default()
 	};
+	let parameters = wire_model
+		.reasoning
+		.map(|value| {
+			vec![wire::RequestedModelModelParameterbytes {
+				id: "reasoning".to_owned(),
+				value: value.as_str().to_owned(),
+			}]
+		})
+		.unwrap_or_default();
 	let run = wire::AgentRunRequest {
 		conversation_state: Some(state),
 		action: Some(wire::ConversationAction { action: Some(action) }),
 		model_details: Some(model),
 		requested_model: Some(wire::RequestedModel {
-			model_id: request.model_id.as_str().to_owned(),
+			model_id: wire_model.model_id.as_str().to_owned(),
 			max_mode: request.max_mode,
+			parameters,
 			..Default::default()
 		}),
 		mcp_tools: Some(wire::McpTools { mcp_tools: tools }),
@@ -363,6 +378,81 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 	Ok(connect_message(&wire::AgentClientMessage {
 		message: Some(wire::agent_client_message::Message::RunRequest(run)),
 	}))
+}
+/// Projects ordered system/developer prompts as global `requestContext.rules`
+/// so Cursor's AgentService retains always-apply rules when it reconstructs
+/// prompts server-side (pi #8997).
+fn cursor_request_context(root_prompts: &[CursorRootPrompt]) -> wire::RequestContext {
+	wire::RequestContext {
+		rules: root_prompts
+			.iter()
+			.filter(|prompt| !prompt.text.is_empty())
+			.enumerate()
+			.map(|(index, prompt)| wire::CursorRule {
+				full_path: format!("/omp/system-prompt/{index}.mdc"),
+				content: prompt.text.as_str().to_owned(),
+				r#type: Some(wire::CursorRuleType {
+					r#type: Some(wire::cursor_rule_type::Type::Global(
+						wire::CursorRuleTypeGlobal::default(),
+					)),
+				}),
+				source: wire::CursorRuleSource::User as i32,
+				..Default::default()
+			})
+			.collect(),
+		..Default::default()
+	}
+}
+
+/// Wire lowering of a routed Cursor model id: base slug plus an optionally
+/// split reasoning tier.
+struct CursorWireModel {
+	model_id:  Str,
+	reasoning: Option<Str>,
+}
+
+/// Effort tiers Cursor appends to OpenAI sibling slugs, least to most intense.
+const CURSOR_EFFORT_TIERS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Splits a routed Cursor model id into its wire base id and reasoning tier.
+///
+/// Cursor's `GetUsableModels` lists OpenAI reasoning models as per-effort
+/// sibling slugs (`gpt-5.6-sol-high`); the Run endpoint rejects a sibling slug
+/// as the wire `model_id` with `resource_exhausted` (error 528384). Mirror the
+/// official client: strip a trailing effort tier — preserving the `-fast`
+/// service lane — and emit it as a `reasoning` parameter. Non-OpenAI ids pass
+/// through unchanged: Cursor-native ids carry no effort suffix and other
+/// families need parameters the discovery schema does not expose.
+fn resolve_cursor_wire_model(model_id: &str) -> CursorWireModel {
+	let (stem, fast) = match model_id.strip_suffix("-fast") {
+		Some(stem) => (stem, true),
+		None => (model_id, false),
+	};
+	for tier in CURSOR_EFFORT_TIERS {
+		let Some(base) = stem
+			.strip_suffix(tier)
+			.and_then(|prefix| prefix.strip_suffix('-'))
+		else {
+			continue;
+		};
+		if !is_openai_family(base) {
+			break;
+		}
+		let model_id = if fast { sf!("{base}-fast") } else { Str::new(base) };
+		return CursorWireModel { model_id, reasoning: Some(Str::new_static(tier)) };
+	}
+	CursorWireModel { model_id: Str::new(model_id), reasoning: None }
+}
+
+/// OpenAI-family gate mirroring pi's `parseOpenAIModel`: the slug contains
+/// `gpt-` immediately followed by a version digit.
+fn is_openai_family(base: &str) -> bool {
+	base.match_indices("gpt-").any(|(index, matched)| {
+		base[index + matched.len()..]
+			.bytes()
+			.next()
+			.is_some_and(|byte| byte.is_ascii_digit())
+	})
 }
 
 /// Encodes the request body for `RunSSE` reconnect.
@@ -857,6 +947,15 @@ pub enum CursorEvent {
 	},
 	/// Cursor requested shell execution.
 	ShellInvoke(CursorShellInvocation),
+	/// Cursor requested one edit-owned materialization operation.
+	WorkflowInvoke {
+		/// Provider invocation identity.
+		invocation: Str,
+		/// Stable operation name consumed by the Cursor bridge.
+		name:       Str,
+		/// JSON operation arguments.
+		arguments:  Bytes,
+	},
 	/// Cursor cancelled one outstanding execution.
 	InvokeCancel {
 		/// Numeric Cursor correlation identifier.
@@ -903,6 +1002,9 @@ struct OpenBlock {
 	tool_id:   ToolCallId,
 	tool_name: Str,
 	arguments: BytesMut,
+	edit_path: Option<Str>,
+	edit_text: String,
+	edit_inner_id: ToolCallId,
 }
 
 /// Stateful protobuf projector for one Cursor Agent attempt.
@@ -1039,7 +1141,7 @@ impl CursorDecoder {
 				self.project_interaction(update)
 			},
 			Some(wire::agent_server_message::Message::ExecServerMessage(exec)) => {
-				Ok(vec![CursorEvent::ShellInvoke(shell_invocation(exec)?)])
+				self.project_exec(exec)
 			},
 			Some(wire::agent_server_message::Message::ExecServerControlMessage(control)) => {
 				let Some(wire::exec_server_control_message::Message::Abort(abort)) = control.message
@@ -1097,7 +1199,7 @@ impl CursorDecoder {
 			},
 			Some(Message::ToolCallCompleted(completed)) => {
 				let id = call_id(completed.call_id, completed.tool_call.as_ref());
-				let completion_arguments = mcp_tool_arguments(completed.tool_call.as_ref());
+				let completion_arguments = tool_arguments(completed.tool_call.as_ref());
 				if let Some(open) = self.open.take() {
 					if open.kind != OpenKind::Tool || (!id.as_str().is_empty() && open.tool_id != id) {
 						self.open = Some(open);
@@ -1108,7 +1210,11 @@ impl CursorDecoder {
 						));
 					}
 					let arguments = match completion_arguments {
-						Some(completion) => merge_mcp_arguments(&open.arguments, completion),
+						Some(completion) if open.edit_path.is_none() => {
+							merge_mcp_arguments(&open.arguments, completion)
+						},
+						Some(completion) => completion,
+						None if open.edit_path.is_some() => edit_open_arguments(&open),
 						None => open.arguments.freeze(),
 					};
 					events.push(CursorEvent::ToolCallComplete {
@@ -1164,6 +1270,75 @@ impl CursorDecoder {
 		Ok(events)
 	}
 
+	fn project_exec(
+		&self,
+		exec: wire::ExecServerMessage,
+	) -> Result<Vec<CursorEvent>, CursorProtocolError> {
+		let fallback_invocation = Str::new(exec.id.to_string());
+		match exec.message {
+			Some(wire::exec_server_message::Message::ReadArgs(args))
+				if self.edit_owns(args.tool_call_id.as_str()) =>
+			{
+				let invocation = if args.tool_call_id.is_empty() {
+					fallback_invocation
+				} else {
+					Str::new(args.tool_call_id.as_str())
+				};
+				let path = cursor_edit_read_path(&args.path, args.offset, args.limit);
+				let arguments = Bytes::from(
+					serde_json::to_vec(&serde_json::json!({
+						"path": path,
+						"tool_call_id": args.tool_call_id,
+					}))
+					.expect("Cursor read arguments contain only strings"),
+				);
+				Ok(vec![CursorEvent::WorkflowInvoke {
+					invocation,
+					name: sf!("read"),
+					arguments,
+				}])
+			},
+			Some(wire::exec_server_message::Message::WriteArgs(args))
+				if self.edit_owns(args.tool_call_id.as_str()) =>
+			{
+				let invocation = if args.tool_call_id.is_empty() {
+					fallback_invocation
+				} else {
+					Str::new(args.tool_call_id.as_str())
+				};
+				let content = if args.file_text.is_empty() && !args.file_bytes.is_empty() {
+					String::from_utf8_lossy(&args.file_bytes).into_owned()
+				} else {
+					args.file_text
+				};
+				let arguments = Bytes::from(
+					serde_json::to_vec(&serde_json::json!({
+						"path": args.path,
+						"content": content,
+						"tool_call_id": args.tool_call_id,
+					}))
+					.expect("Cursor write arguments contain only strings"),
+				);
+				Ok(vec![CursorEvent::WorkflowInvoke {
+					invocation,
+					name: sf!("write"),
+					arguments,
+				}])
+			},
+			message => Ok(vec![CursorEvent::ShellInvoke(shell_invocation(
+				wire::ExecServerMessage { message, ..exec },
+			)?)])
+		}
+	}
+
+	fn edit_owns(&self, tool_call_id: &str) -> bool {
+		self.open.as_ref().is_some_and(|open| {
+			open.edit_path.is_some()
+				&& (open.tool_id.as_str() == tool_call_id
+					|| open.edit_inner_id.as_str() == tool_call_id)
+		})
+	}
+
 	fn push_text(&mut self, kind: OpenKind, text: String, events: &mut Vec<CursorEvent>) {
 		let index = if let Some(open) = self.open.as_ref().filter(|open| open.kind == kind) {
 			open.index
@@ -1200,7 +1375,18 @@ impl CursorDecoder {
 	) {
 		let id = call_id(call_id_text, tool);
 		let name = tool_name(tool);
+		let (edit_path, edit_text) = edit_tool_state(tool);
+		let edit_inner_id = ToolCallId::from(
+			tool
+				.and_then(|tool| tool.tool_call_id.as_deref())
+				.unwrap_or_default(),
+		);
 		let index = self.start_block(OpenKind::Tool, id.clone(), name.clone());
+		if let Some(open) = self.open.as_mut() {
+			open.edit_path = edit_path;
+			open.edit_text = edit_text;
+			open.edit_inner_id = edit_inner_id;
+		}
 		self.saw_tool = true;
 		events.push(CursorEvent::Chat(Box::new(ChatEvent::BlockStarted {
 			index,
@@ -1214,7 +1400,16 @@ impl CursorDecoder {
 		let index = self.next_index;
 		self.next_index = self.next_index.saturating_add(1);
 		self.blocks = self.blocks.saturating_add(1);
-		self.open = Some(OpenBlock { index, kind, tool_id, tool_name, arguments: BytesMut::new() });
+		self.open = Some(OpenBlock {
+			index,
+			kind,
+			tool_id,
+			tool_name,
+			arguments: BytesMut::new(),
+			edit_path: None,
+			edit_text: String::new(),
+			edit_inner_id: ToolCallId::default(),
+		});
 		index
 	}
 }
@@ -1244,6 +1439,26 @@ fn shell_invocation(
 	})
 }
 
+fn cursor_edit_read_path(path: &str, offset: Option<i32>, limit: Option<u32>) -> String {
+	let has_raw = path
+		.split(':')
+		.any(|component| component.eq_ignore_ascii_case("raw"));
+	let mut output = if has_raw {
+		path.to_owned()
+	} else {
+		format!("{path}:raw")
+	};
+	match (offset, limit) {
+		(Some(offset), Some(limit)) => {
+			output.push_str(&format!(":{}+{limit}", offset.max(1)));
+		},
+		(Some(offset), None) => output.push_str(&format!(":{}-", offset.max(1))),
+		(None, Some(limit)) => output.push_str(&format!(":1+{limit}")),
+		(None, None) => {},
+	}
+	output
+}
+
 fn mcp_tool_arguments(tool: Option<&wire::ToolCall>) -> Option<Bytes> {
 	use wire::tool_call::Tool;
 	let Some(Tool::McpToolCall(call)) = tool.and_then(|tool| tool.tool.as_ref()) else {
@@ -1258,6 +1473,70 @@ fn mcp_tool_arguments(tool: Option<&wire::ToolCall>) -> Option<Bytes> {
 	serde_json::to_vec(&serde_json::Value::Object(fields))
 		.ok()
 		.map(Bytes::from)
+}
+
+fn tool_arguments(tool: Option<&wire::ToolCall>) -> Option<Bytes> {
+	edit_tool_arguments(tool).or_else(|| mcp_tool_arguments(tool))
+}
+
+fn edit_tool_state(tool: Option<&wire::ToolCall>) -> (Option<Str>, String) {
+	use wire::tool_call::Tool;
+	let Some(Tool::EditToolCall(call)) = tool.and_then(|tool| tool.tool.as_ref()) else {
+		return (None, String::new());
+	};
+	let Some(args) = call.args.as_ref() else {
+		return (Some(Str::default()), String::new());
+	};
+	(
+		Some(Str::new(args.path.as_str())),
+		args
+			.stream_content
+			.as_deref()
+			.unwrap_or_default()
+			.to_owned(),
+	)
+}
+
+fn edit_tool_arguments(tool: Option<&wire::ToolCall>) -> Option<Bytes> {
+	use wire::tool_call::Tool;
+	let Some(Tool::EditToolCall(call)) = tool.and_then(|tool| tool.tool.as_ref()) else {
+		return None;
+	};
+	let args = call.args.as_ref()?;
+	Some(edit_arguments(
+		&args.path,
+		args
+			.stream_content
+			.as_deref()
+			.unwrap_or_default(),
+	))
+}
+
+fn edit_open_arguments(open: &OpenBlock) -> Bytes {
+	edit_arguments(
+		open
+			.edit_path
+			.as_ref()
+			.map_or("", |path| path.as_str()),
+		&open.edit_text,
+	)
+}
+
+fn edit_arguments(path: &str, stream_content: &str) -> Bytes {
+	let mut arguments = serde_json::Map::new();
+	if !path.is_empty() {
+		arguments.insert("path".to_owned(), serde_json::Value::String(path.to_owned()));
+	}
+	if !stream_content.is_empty() {
+		arguments.insert(
+			"stream_content".to_owned(),
+			serde_json::Value::String(stream_content.to_owned()),
+		);
+	}
+	Bytes::from(
+		serde_json::to_vec(&serde_json::Value::Object(arguments))
+			.expect("Cursor edit arguments contain only strings"),
+	)
 }
 
 fn merge_mcp_arguments(streamed: &[u8], completion: Bytes) -> Bytes {
@@ -1985,6 +2264,14 @@ fn cursor_raw_event(event: CursorEvent) -> RawEvent {
 				streaming:  invocation.streaming,
 			})
 		},
+		CursorEvent::WorkflowInvoke { invocation, name, arguments } => {
+			RawEvent::Control(ProviderControlEvent::WorkflowAction {
+				request_id: invocation,
+				name,
+				arguments,
+				timeout_ms: None,
+			})
+		},
 		CursorEvent::InvokeCancel { id } => {
 			RawEvent::Control(ProviderControlEvent::Cancel { call: ToolCallId::from(id.to_string()) })
 		},
@@ -2084,6 +2371,157 @@ mod tests {
 		}
 	}
 
+	fn encoded_run(model_id: &str, roots: Box<[CursorRootPrompt]>) -> wire::AgentRunRequest {
+		let encoded = encode_run_request(&CursorRunRequest {
+			model_id: Str::new(model_id),
+			max_mode: false,
+			conversation_id: None,
+			checkpoint: None,
+			root_prompts: roots,
+			tools: Box::new([]),
+			action: CursorRunAction::UserMessage {
+				message_id: sf!("request"),
+				text: sf!("hello"),
+			},
+		})
+		.expect("encoded Cursor request");
+		let message =
+			wire::AgentClientMessage::decode(encoded.slice(5..)).expect("framed Cursor request");
+		let Some(wire::agent_client_message::Message::RunRequest(run)) = message.message else {
+			panic!("run request")
+		};
+		run
+	}
+
+	#[test]
+	fn requested_model_splits_reasoning_tier_and_preserves_fast_lane() {
+		for (routed, base, effort) in [
+			("gpt-5.6-sol-minimal", "gpt-5.6-sol", "minimal"),
+			("gpt-5.6-sol-low", "gpt-5.6-sol", "low"),
+			("gpt-5.6-sol-medium", "gpt-5.6-sol", "medium"),
+			("gpt-5.6-sol-high", "gpt-5.6-sol", "high"),
+			("gpt-5.6-sol-xhigh", "gpt-5.6-sol", "xhigh"),
+			("gpt-5.6-sol-max", "gpt-5.6-sol", "max"),
+			("gpt-5.6-sol-high-fast", "gpt-5.6-sol-fast", "high"),
+		] {
+			let run = encoded_run(routed, Box::new([]));
+			let requested = run.requested_model.expect("requested model");
+			assert_eq!(requested.model_id, base, "{routed}");
+			let details = run.model_details.expect("model details");
+			assert_eq!(details.model_id, base, "{routed}");
+			assert_eq!(details.display_model_id, base, "{routed}");
+			assert_eq!(requested.parameters.len(), 1, "{routed}");
+			assert_eq!(requested.parameters[0].id, "reasoning", "{routed}");
+			assert_eq!(requested.parameters[0].value, effort, "{routed}");
+		}
+	}
+
+	#[test]
+	fn requested_model_does_not_split_non_openai_siblings() {
+		let run = encoded_run("claude-fable-5-low", Box::new([]));
+		let requested = run.requested_model.expect("requested model");
+		assert_eq!(requested.model_id, "claude-fable-5-low");
+		assert!(requested.parameters.is_empty());
+		let off = encoded_run("gpt-5.6-sol-none", Box::new([]));
+		let requested = off.requested_model.expect("requested model");
+		assert_eq!(requested.model_id, "gpt-5.6-sol-none");
+		assert!(requested.parameters.is_empty());
+	}
+
+	#[test]
+	fn routed_chat_request_populates_agent_run_reasoning_parameters() {
+		let target = omp_llm_catalog::WireTarget {
+			route: omp_llm_catalog::RouteId::from("cursor"),
+			codec: omp_llm_catalog::CodecId::from("cursor"),
+			endpoint: omp_llm_catalog::EndpointSpec {
+				base_url: sf!("https://api2.cursor.sh"),
+				region: None,
+			},
+			wire_model: WireModelId::new("gpt-5.6-terra-medium"),
+		};
+		let mut policy = omp_llm_catalog::WirePolicy::baseline();
+		policy.context.extended_mode = Some(ExtendedContextMode::Standard);
+		let selection = omp_llm_catalog::ThinkingSelection {
+			effort: omp_llm_catalog::ThinkingEffort::Medium,
+			wire_effort: omp_llm_catalog::ThinkingEffort::Medium,
+			native_effort: None,
+			budget: None,
+			wire_model: target.wire_model.clone(),
+			reasoning_mode: None,
+			suppress_when_off: false,
+		};
+		let mut request = empty_chat_request();
+		request.messages = Arc::from([crate::call::Message {
+			role: Role::User,
+			content: Arc::from([ContentPart::Text { text: sf!("hello"), proof: None }]),
+			name: None,
+		}]);
+		request.reasoning = Setting::Require(crate::call::ReasoningRequest {
+			visibility: crate::call::ReasoningVisibility::Visible,
+			effort: Some(omp_llm_catalog::ReasoningEffort::Medium),
+			max_tokens: None,
+			preserve_signatures: false,
+		});
+		let context = EncodeContext {
+			target: Some(&target),
+			policy: &policy,
+			thinking_selection: Some(&selection),
+			..EncodeContext::default()
+		};
+		let encoded = encode_chat_call(
+			&context,
+			&request,
+			&Arc::new(Mutex::new(CursorConversationRotations::default())),
+		)
+		.expect("encoded routed chat");
+		let BodySource::Bytes(body) = encoded.body else {
+			panic!("inline Cursor request")
+		};
+		let message =
+			wire::AgentClientMessage::decode(body.slice(5..)).expect("framed Cursor request");
+		let Some(wire::agent_client_message::Message::RunRequest(run)) = message.message else {
+			panic!("run request")
+		};
+		let requested = run.requested_model.expect("requested model");
+		assert_eq!(requested.model_id, "gpt-5.6-terra");
+		assert_eq!(requested.parameters.len(), 1);
+		assert_eq!(requested.parameters[0].id, "reasoning");
+		assert_eq!(requested.parameters[0].value, "medium");
+		assert_eq!(
+			run.model_details.expect("model details").model_id,
+			"gpt-5.6-terra"
+		);
+	}
+
+	#[test]
+	fn system_prompts_are_global_request_context_rules() {
+		let run = encoded_run(
+			"cursor-composer-2.5",
+			vec![
+				CursorRootPrompt { role: CursorPromptRole::System, text: sf!("first") },
+				CursorRootPrompt { role: CursorPromptRole::Developer, text: Str::default() },
+				CursorRootPrompt { role: CursorPromptRole::Developer, text: sf!("second") },
+			]
+			.into_boxed_slice(),
+		);
+		let Some(wire::conversation_action::Action::UserMessageAction(action)) =
+			run.action.and_then(|action| action.action)
+		else {
+			panic!("user action")
+		};
+		let rules = action.request_context.expect("request context").rules;
+		assert_eq!(rules.len(), 2);
+		assert_eq!(rules[0].full_path, "/omp/system-prompt/0.mdc");
+		assert_eq!(rules[0].content, "first");
+		assert_eq!(rules[0].source, wire::CursorRuleSource::User as i32);
+		assert!(matches!(
+			rules[0].r#type.as_ref().and_then(|kind| kind.r#type.as_ref()),
+			Some(wire::cursor_rule_type::Type::Global(_))
+		));
+		assert_eq!(rules[1].full_path, "/omp/system-prompt/1.mdc");
+		assert_eq!(rules[1].content, "second");
+	}
+
 	#[test]
 	fn model_routed_reasoning_is_not_rejected_as_unprojected() {
 		let mut request = empty_chat_request();
@@ -2146,6 +2584,160 @@ mod tests {
 				"completion": 12
 			})
 		);
+	}
+
+	#[test]
+	fn native_edit_tool_call_opens_edit_and_collects_stream_content() {
+		let tool = wire::ToolCall {
+			tool_call_id: Some("edit-1".to_owned()),
+			tool: Some(wire::tool_call::Tool::EditToolCall(wire::EditToolCall {
+				args: Some(wire::EditArgs {
+					path: "/tmp/note.txt".to_owned(),
+					stream_content: Some("orange".to_owned()),
+				}),
+				..Default::default()
+			})),
+		};
+		let mut decoder = CursorDecoder::default();
+		let started = decoder
+			.push_payload(update(wire::interaction_update::Message::ToolCallStarted(
+				wire::ToolCallStartedUpdate {
+					call_id: "call-edit".to_owned(),
+					tool_call: Some(tool.clone()),
+					..Default::default()
+				},
+			)))
+			.expect("edit started");
+		assert!(started.iter().any(|event| matches!(
+			event,
+			CursorEvent::Chat(event)
+				if matches!(
+					event.as_ref(),
+					ChatEvent::ToolCallStarted { id, name, .. }
+						if id.as_str() == "call-edit" && name.as_str() == "edit"
+				)
+		)));
+		decoder
+			.push_payload(update(wire::interaction_update::Message::ToolCallDelta(
+				wire::ToolCallDeltaUpdate {
+					call_id: "call-edit".to_owned(),
+					tool_call_delta: Some(wire::ToolCallDelta {
+						delta: Some(wire::tool_call_delta::Delta::EditToolCallDelta(
+							wire::EditToolCallDelta {
+								stream_content_delta: " peel".to_owned(),
+							},
+						)),
+					}),
+					..Default::default()
+				},
+			)))
+			.expect("edit delta");
+		let completed = decoder
+			.push_payload(update(wire::interaction_update::Message::ToolCallCompleted(
+				wire::ToolCallCompletedUpdate {
+					call_id: "call-edit".to_owned(),
+					tool_call: Some(wire::ToolCall {
+						tool_call_id: Some("edit-1".to_owned()),
+						tool: Some(wire::tool_call::Tool::EditToolCall(wire::EditToolCall {
+							args: None,
+							..Default::default()
+						})),
+					}),
+					..Default::default()
+				},
+			)))
+			.expect("edit completed");
+		let arguments = completed
+			.into_iter()
+			.find_map(|event| match event {
+				CursorEvent::ToolCallComplete { name, arguments, .. }
+					if name.as_str() == "edit" =>
+				{
+					Some(arguments)
+				},
+				_ => None,
+			})
+			.expect("complete edit");
+		assert_eq!(
+			serde_json::from_slice::<serde_json::Value>(&arguments).expect("edit JSON"),
+			serde_json::json!({"path":"/tmp/note.txt","stream_content":"orange peel"})
+		);
+	}
+
+	#[test]
+	fn native_edit_materialization_read_is_raw_and_write_reuses_active_call() {
+		let tool = wire::ToolCall {
+			tool_call_id: Some("edit-inner".to_owned()),
+			tool: Some(wire::tool_call::Tool::EditToolCall(wire::EditToolCall {
+				args: Some(wire::EditArgs {
+					path: "/tmp/note.txt".to_owned(),
+					stream_content: None,
+				}),
+				..Default::default()
+			})),
+		};
+		let mut decoder = CursorDecoder::default();
+		decoder
+			.push_payload(update(wire::interaction_update::Message::ToolCallStarted(
+				wire::ToolCallStartedUpdate {
+					call_id: "edit-envelope".to_owned(),
+					tool_call: Some(tool),
+					..Default::default()
+				},
+			)))
+			.expect("edit started");
+		let read = wire::AgentServerMessage {
+			message: Some(wire::agent_server_message::Message::ExecServerMessage(
+				wire::ExecServerMessage {
+					id: 7,
+					message: Some(wire::exec_server_message::Message::ReadArgs(wire::ReadArgs {
+						path: "/tmp/note.txt".to_owned(),
+						tool_call_id: "edit-inner".to_owned(),
+						offset: Some(2),
+						limit: Some(1),
+						..Default::default()
+					})),
+					..Default::default()
+				},
+			)),
+		};
+		let events = decoder
+			.push_payload(Bytes::from(read.encode_to_vec()))
+			.expect("materialization read");
+		let CursorEvent::WorkflowInvoke { name, arguments, .. } = &events[0] else {
+			panic!("read workflow")
+		};
+		assert_eq!(name.as_str(), "read");
+		assert_eq!(
+			serde_json::from_slice::<serde_json::Value>(arguments).expect("read JSON")["path"],
+			"/tmp/note.txt:raw:2+1"
+		);
+
+		let write = wire::AgentServerMessage {
+			message: Some(wire::agent_server_message::Message::ExecServerMessage(
+				wire::ExecServerMessage {
+					id: 8,
+					message: Some(wire::exec_server_message::Message::WriteArgs(wire::WriteArgs {
+						path: "/tmp/note.txt".to_owned(),
+						file_text: "after".to_owned(),
+						tool_call_id: "edit-inner".to_owned(),
+						..Default::default()
+					})),
+					..Default::default()
+				},
+			)),
+		};
+		let events = decoder
+			.push_payload(Bytes::from(write.encode_to_vec()))
+			.expect("materialization write");
+		let CursorEvent::WorkflowInvoke { name, arguments, .. } = &events[0] else {
+			panic!("write workflow")
+		};
+		assert_eq!(name.as_str(), "write");
+		let arguments =
+			serde_json::from_slice::<serde_json::Value>(arguments).expect("write JSON");
+		assert_eq!(arguments["tool_call_id"], "edit-inner");
+		assert_eq!(arguments["content"], "after");
 	}
 
 	fn update(message: wire::interaction_update::Message) -> Bytes {

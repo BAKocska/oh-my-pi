@@ -93,7 +93,9 @@ pub const KNOWN_AXES: &[(&str, AxisSet, &str, AxisKind)] = &[
 	("extra-body", AxisSet::Wire, "extra_body", AxisKind::Object),
 	("filter-reasoning-history", AxisSet::Wire, "filter_reasoning_history", AxisKind::Scalar),
 	("flatten-root-unions", AxisSet::Wire, "flatten_root_unions", AxisKind::Scalar),
+	("glyph-tokenization", AxisSet::Wire, "glyph_tokenization", AxisKind::Scalar),
 	("include-encrypted-reasoning", AxisSet::Wire, "include_encrypted_reasoning", AxisKind::Scalar),
+	("leaked-thinking-healer", AxisSet::Wire, "leaked_thinking_healer", AxisKind::Scalar),
 	("max-tokens-field", AxisSet::Wire, "max_tokens_field", AxisKind::Scalar),
 	("official-endpoint", AxisSet::Wire, "official_endpoint", AxisKind::Scalar),
 	("omit-reasoning-effort", AxisSet::Wire, "omit_reasoning_effort", AxisKind::Scalar),
@@ -866,6 +868,26 @@ impl RuleAxes {
 			}
 			return Ok(());
 		}
+		if written == "edit-revision" {
+			let value =
+				node_value(node, AxisKind::Scalar).filter(|value| {
+					value
+						.as_str()
+						.is_some_and(|revision| !revision.trim().is_empty())
+				}).ok_or_else(
+					|| CascadeError::MalformedDirective {
+						file:      file.to_str(),
+						directive: written.to_str(),
+					},
+				)?;
+			if self.catalog.insert("editRevision".to_str(), value).is_some() {
+				return Err(CascadeError::DuplicateAxis {
+					file: file.to_str(),
+					axis: "editRevision".to_str(),
+				});
+			}
+			return Ok(());
+		}
 		let Some(&(_, set, key, kind)) = KNOWN_AXES
 			.iter()
 			.find(|(directive, ..)| *directive == written)
@@ -1056,6 +1078,32 @@ mod tests {
 		assert!(resolved.thinking.is_empty());
 		assert_eq!(resolved.catalog["longContext"]["inputThreshold"], Value::from(272_000));
 		assert_eq!(resolved.catalog["longContext"]["cacheWrite"], Value::from(12.5));
+	}
+
+	#[test]
+	fn edit_revision_is_catalog_data_and_absence_is_empty() {
+		let cascade = parse_one(
+			r#"class "kimi" {
+				edit-revision "sloppy.1"
+			}"#,
+		)
+		.expect("edit revision directive parses");
+		let resolved = cascade
+			.resolve(&target("openrouter", "kimi", "moonshotai/kimi-k2", false))
+			.expect("catalog data resolves");
+		assert_eq!(resolved.catalog["editRevision"], Value::from("sloppy.1"));
+		assert!(resolved.wire.is_empty());
+		assert!(
+			cascade
+				.resolve(&target("openai", "openai", "gpt-5", false))
+				.expect("unmatched target resolves")
+				.catalog
+				.is_empty()
+		);
+		assert!(matches!(
+			parse_one(r#"class "kimi" { edit-revision "" }"#),
+			Err(CascadeError::MalformedDirective { .. })
+		));
 	}
 
 	#[test]

@@ -149,6 +149,9 @@ pub enum RetryAction {
 	},
 	/// Refresh credentials for the same account and principal.
 	RefreshCredential,
+	/// Refresh the current credential and replay exactly once without rotating
+	/// to a sibling account.
+	RefreshCredentialOnce,
 	/// Select another eligible account.
 	RotateAccount,
 	/// Select another allowed route for the same normalized model.

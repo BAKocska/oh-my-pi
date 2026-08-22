@@ -123,6 +123,7 @@ impl ZaiApiKeyHandler {
 			token_type: sf!("Bearer"),
 			expires_in: None,
 			identity_response,
+			project: None,
 		})
 	}
 

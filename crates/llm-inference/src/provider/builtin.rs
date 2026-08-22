@@ -38,6 +38,7 @@ use crate::{
 		},
 		gemini::GeminiCodec,
 		gitlab::GitLabWorkflowCodec,
+		glyph,
 		google_cca::{AntigravityPolicy, CcaHeaders, GoogleCcaCodec},
 		ollama::OllamaCodec,
 		openai::OpenAiCodec,
@@ -867,7 +868,12 @@ impl Codec for RouteCodecSet {
 		context: &EncodeContext<'_>,
 		operation: &OperationCall,
 	) -> Result<EncodedRequest, Error> {
-		self.codec(operation.kind())?.encode(context, operation)
+		let encoded_operation = (context.policy.context.glyph_tokenization == Some(true))
+			.then(|| glyph::encode_operation(operation))
+			.flatten();
+		self
+			.codec(operation.kind())?
+			.encode(context, encoded_operation.as_ref().unwrap_or(operation))
 	}
 
 	fn encode_realtime_handshake(
@@ -881,7 +887,14 @@ impl Codec for RouteCodecSet {
 	}
 
 	fn decoder(&self, context: &DecodeContext<'_>) -> Result<DecoderState, Error> {
-		self.codec(context.operation)?.decoder(context)
+		let decoder = self.codec(context.operation)?.decoder(context)?;
+		Ok(if context.policy.context.glyph_tokenization == Some(true)
+			&& glyph::operation_active(context.operation_call)
+		{
+			glyph::wrap_decoder(decoder)
+		} else {
+			decoder
+		})
 	}
 
 	fn realtime(

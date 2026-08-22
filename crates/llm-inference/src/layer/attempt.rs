@@ -50,6 +50,7 @@ where
 		let mut service = mem::replace(&mut self.inner, replacement);
 		async move {
 			let mut reentries = 0_u32;
+			let mut refresh_once_replay_used = false;
 			request.context.set_attempt_action(AttemptAction::Initial);
 			loop {
 				request.context.clear_body_evidence();
@@ -77,6 +78,15 @@ where
 					.last()
 					.and_then(|attempt| attempt.account.clone());
 				let action = match &error.action {
+					RetryAction::RefreshCredentialOnce => {
+						if refresh_once_replay_used {
+							error.action = RetryAction::Never;
+							request.context.finalize_error(&mut error);
+							return Err(error);
+						}
+						refresh_once_replay_used = true;
+						AttemptAction::RefreshCredential { previous_account }
+					},
 					RetryAction::RefreshCredential => match attempted_action {
 						AttemptAction::Initial => AttemptAction::RefreshCredential { previous_account },
 						AttemptAction::RefreshCredential { previous_account: refreshed_account } => {
@@ -235,33 +245,57 @@ mod tests {
 		fn call(&mut self, request: LayerCall<()>) -> Self::Future {
 			self.actions.lock().push(request.context.attempt_action());
 			let index = self.calls.fetch_add(1, Ordering::SeqCst) as u32;
-			let mut receipt = ExecutionReceipt::default();
-			receipt.record_attempt(AttemptReceipt {
-				index,
-				hidden: false,
-				provider: None,
-				route: None,
-				account: Some(AccountId::from("account")),
-				principal: None,
-				body: AttemptBodyEvidence {
-					opened:         true,
-					consumed:       true,
-					replayability:  Replayability::Replayable,
-					retry_decision: RetryDecision::Allow,
-					reason:         RetryDecisionReason::ReplayableSource,
-				},
-				outcome: AttemptOutcome::FailedPreCommit,
-				usage: Usage { input_tokens: 1, ..Usage::default() },
-				cost: Cost::from_micro_usd(1),
-				provider_evidence: ProviderEvidence::default(),
-				elapsed: Duration::ZERO,
-			});
-			ready(Err(Error::new(
-				ErrorKind::Authentication,
-				ErrorPhase::Authentication,
-				RetryAction::RefreshCredential,
-				receipt,
-			)))
+			ready(Err(refresh_error(index, RetryAction::RefreshCredential)))
+		}
+	}
+
+	fn refresh_error(index: u32, action: RetryAction) -> Error {
+		let mut receipt = ExecutionReceipt::default();
+		receipt.record_attempt(AttemptReceipt {
+			index,
+			hidden: false,
+			provider: None,
+			route: None,
+			account: Some(AccountId::from("account")),
+			principal: None,
+			body: AttemptBodyEvidence {
+				opened:         true,
+				consumed:       true,
+				replayability:  Replayability::Replayable,
+				retry_decision: RetryDecision::Allow,
+				reason:         RetryDecisionReason::ReplayableSource,
+			},
+			outcome: AttemptOutcome::FailedPreCommit,
+			usage: Usage { input_tokens: 1, ..Usage::default() },
+			cost: Cost::from_micro_usd(1),
+			provider_evidence: ProviderEvidence::default(),
+			elapsed: Duration::ZERO,
+		});
+		Error::new(ErrorKind::Authentication, ErrorPhase::Authentication, action, receipt)
+	}
+
+	#[derive(Clone)]
+	struct RefreshSequence {
+		calls:    Arc<AtomicUsize>,
+		actions:  Arc<Mutex<Vec<AttemptAction>>>,
+		failures: Arc<[RetryAction]>,
+	}
+	impl Service<LayerCall<()>> for RefreshSequence {
+		type Error = Error;
+		type Future = Ready<Result<(), Error>>;
+		type Response = ();
+
+		fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn call(&mut self, request: LayerCall<()>) -> Self::Future {
+			self.actions.lock().push(request.context.attempt_action());
+			let index = self.calls.fetch_add(1, Ordering::SeqCst);
+			match self.failures.get(index) {
+				Some(action) => ready(Err(refresh_error(index as u32, action.clone()))),
+				None => ready(Ok(())),
+			}
 		}
 	}
 
@@ -291,6 +325,65 @@ mod tests {
 		);
 		assert_eq!(error.receipt().usage.input_tokens, 2);
 		assert_eq!(error.receipt().cost.micro_usd, 2);
+	}
+
+	#[tokio::test]
+	async fn explicit_refresh_replays_once_without_rotating() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let actions = Arc::new(Mutex::new(Vec::new()));
+		let failures: Arc<[RetryAction]> =
+			Arc::from([RetryAction::RefreshCredentialOnce, RetryAction::RefreshCredentialOnce]);
+		let context =
+			ExecutionContext::new(ExecutionBudget { max_attempts: 3, ..ExecutionBudget::default() });
+		let mut service = AttemptService {
+			inner: RefreshSequence {
+				calls: calls.clone(),
+				actions: actions.clone(),
+				failures,
+			},
+		};
+		futures::future::poll_fn(|cx| service.poll_ready(cx))
+			.await
+			.expect("ready");
+		service
+			.call(LayerCall { payload: (), context })
+			.await
+			.expect_err("second explicit refresh request must surface");
+		assert_eq!(calls.load(Ordering::SeqCst), 2);
+		assert_eq!(actions.lock().as_slice(), [
+			AttemptAction::Initial,
+			AttemptAction::RefreshCredential { previous_account: Some(AccountId::from("account")) },
+		]);
+	}
+
+	#[tokio::test]
+	async fn explicit_refresh_is_still_honored_after_401_refresh() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let actions = Arc::new(Mutex::new(Vec::new()));
+		let failures: Arc<[RetryAction]> =
+			Arc::from([RetryAction::RefreshCredential, RetryAction::RefreshCredentialOnce]);
+		let context =
+			ExecutionContext::new(ExecutionBudget { max_attempts: 3, ..ExecutionBudget::default() });
+		let mut service = AttemptService {
+			inner: RefreshSequence {
+				calls: calls.clone(),
+				actions: actions.clone(),
+				failures,
+			},
+		};
+		futures::future::poll_fn(|cx| service.poll_ready(cx))
+			.await
+			.expect("ready");
+		service
+			.call(LayerCall { payload: (), context })
+			.await
+			.expect("forced refresh succeeds");
+		assert_eq!(calls.load(Ordering::SeqCst), 3);
+		assert_eq!(actions.lock().as_slice(), [
+			AttemptAction::Initial,
+			AttemptAction::RefreshCredential { previous_account: Some(AccountId::from("account")) },
+			AttemptAction::RefreshCredential { previous_account: Some(AccountId::from("account")) },
+		]);
 	}
 
 	#[tokio::test]

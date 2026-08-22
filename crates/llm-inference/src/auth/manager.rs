@@ -35,7 +35,7 @@ use crate::{
 	},
 	call::{AccountRoutingContext, AuthInput, AuthMethod, AuthRequest, LoginRequest},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
-	id::{AccountId, LoginSessionId, PrincipalId},
+	id::{AccountId, LoginSessionId, PrincipalId, RegionId},
 	receipt::ExecutionReceipt,
 	session::CredentialAffinityDigest,
 };
@@ -521,6 +521,8 @@ where
 						.resolve_principal(&resolution, http.as_ref())
 						.await
 						.map_err(oauth_error)?;
+					let residency = tokens.codex_residency().map(RegionId::new);
+					let project = tokens.project().map(ToOwned::to_owned);
 					let account = AccountId::from(format!("{provider_id}:{principal}"));
 					let issued_at = clock.now();
 					let meta = super::LeaseMeta {
@@ -540,7 +542,11 @@ where
 							routes,
 							enabled: true,
 							credential_generation: freshness.generation,
-							routing: AccountRoutingContext::default(),
+							routing: AccountRoutingContext {
+								project,
+								region: residency,
+								..AccountRoutingContext::default()
+							},
 						})
 						.map_err(|_| auth_store_failure())?;
 					let summary = AccountSummary {
@@ -1132,6 +1138,9 @@ fn oauth_error(error: OAuthError) -> Error {
 			.status(Some(status))
 			.code(Str::new(code.as_str()))
 			.detail(detail),
+		OAuthError::ProvisioningRejected { status } => {
+			auth_unavailable().status(Some(status)).detail(detail)
+		},
 		_ => auth_unavailable().detail(detail),
 	}
 }

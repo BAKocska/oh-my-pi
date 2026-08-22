@@ -565,8 +565,11 @@ impl GoogleSchema {
 		Ok(schema)
 	}
 
-	/// Applies Google's nullable/enum/object normalization recursively.
+	/// Applies Google's wire-safe schema normalization recursively.
 	pub fn normalize(&mut self) {
+		for key in ["deprecated", "readOnly", "writeOnly", "$comment", "x-mcp-header"] {
+			self.extensions.remove(key);
+		}
 		let nullable_type = match &self.schema_type {
 			Some(GoogleSchemaType::Multiple(types)) => {
 				let mut non_null = types.iter().filter(|kind| kind.as_str() != "null");
@@ -607,8 +610,8 @@ impl GoogleSchema {
 		}
 	}
 
-	/// Removes the five schema keywords rejected by Cloud Code Assist
-	/// recursively.
+	/// Removes the schema keywords rejected specifically by Cloud Code Assist
+	/// recursively, after applying the shared Google wire normalization.
 	pub fn normalize_for_cca(&mut self) {
 		self.normalize();
 		self.draft = None;
@@ -3178,6 +3181,44 @@ mod tests {
 		assert_eq!(
 			serde_json::to_vec(&actual).expect("actual schema serializes"),
 			serde_json::to_vec(&expected).expect("expected schema serializes"),
+		);
+	}
+	#[test]
+	fn google_and_cca_strip_protojson_unknown_annotations() {
+		let input = r#"{
+			"type":"object",
+			"properties":{
+				"annotated":{
+					"type":"string",
+					"deprecated":true,
+					"readOnly":true,
+					"writeOnly":true,
+					"$comment":"internal",
+					"x-mcp-header":"owner"
+				},
+				"x-mcp-header":{"type":"string"}
+			}
+		}"#;
+		let expected = serde_json::json!({
+			"type": "object",
+			"properties": {
+				"annotated": {"type": "string"},
+				"x-mcp-header": {"type": "string"}
+			}
+		});
+
+		let google = GoogleSchema::from_opaque(&opaque(input)).expect("Google schema projects");
+		assert_eq!(
+			serde_json::to_value(&google).expect("Google schema serializes"),
+			expected,
+		);
+
+		let mut cca: GoogleSchema =
+			serde_json::from_str(input).expect("CCA schema input is typed");
+		cca.normalize_for_cca();
+		assert_eq!(
+			serde_json::to_value(&cca).expect("CCA schema serializes"),
+			expected,
 		);
 	}
 
