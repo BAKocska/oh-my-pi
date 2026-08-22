@@ -17,6 +17,7 @@ const ADC_TAG: &str = "application-default";
 const AWS_TAG: &str = "aws-chain";
 const OAUTH_TAG: &str = "oauth";
 const SESSION_TAG: &str = "session";
+const INVOCATION_TAG: &str = "invocation";
 
 /// Secret environment boundary used by [`CredentialBroker`].
 pub trait CredentialEnvironment: Send + Sync {
@@ -98,6 +99,11 @@ enum BrokerSource {
 	BasicEnvironment { username_names: Box<[Str]>, password_names: Box<[Str]> },
 	Engine(EngineKind),
 }
+#[derive(Clone, Debug)]
+struct InvocationOverride {
+	specs:  Arc<BTreeMap<AuthSpecId, CredentialKind>>,
+	secret: SecretString,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BrokerPlan {
@@ -114,6 +120,13 @@ pub enum CredentialBrokerError {
 	/// A credential environment source contains an empty or non-OMP name.
 	#[error("catalog credential environment source is invalid")]
 	InvalidEnvironment(AuthSpecId),
+	/// The selected provider does not exist in the catalog.
+	#[error("invocation credential override names an unknown provider")]
+	UnknownProvider(omp_llm_catalog::ProviderId),
+	/// The selected provider has no scalar authentication compatible with a
+	/// generic API key.
+	#[error("selected provider does not accept a generic invocation API key")]
+	UnsupportedOverride(omp_llm_catalog::ProviderId),
 }
 
 /// Catalog-aware composite credential source.
@@ -126,6 +139,7 @@ pub struct CredentialBroker {
 	plans:       Arc<BTreeMap<AuthSpecId, BrokerPlan>>,
 	environment: Arc<dyn CredentialEnvironment>,
 	engines:     CredentialBrokerEngines,
+	invocation:  Option<InvocationOverride>,
 }
 
 impl CredentialBroker {
@@ -180,7 +194,7 @@ impl CredentialBroker {
 			}
 			plans.insert(auth.id.clone(), BrokerPlan { kind, sources: sources.into_boxed_slice() });
 		}
-		Ok(Self { plans: Arc::new(plans), environment, engines })
+		Ok(Self { plans: Arc::new(plans), environment, engines, invocation: None })
 	}
 
 	/// Uses the process environment without upstream aliases or fallbacks.
@@ -189,6 +203,67 @@ impl CredentialBroker {
 		engines: CredentialBrokerEngines,
 	) -> Result<Self, CredentialBrokerError> {
 		Self::from_catalog(catalog, Arc::new(SystemCredentialEnvironment), engines)
+	}
+
+	/// Returns a session-owned broker overlay for one selected provider.
+	///
+	/// The generic key is held only by the returned clone. It is never written
+	/// to the process environment or delegated to a durable credential engine.
+	pub fn with_api_key_override(
+		&self,
+		catalog: &Catalog,
+		provider: &omp_llm_catalog::ProviderId<str>,
+		secret: SecretString,
+	) -> Result<Self, CredentialBrokerError> {
+		let provider = catalog
+			.provider(provider)
+			.ok_or_else(|| CredentialBrokerError::UnknownProvider(provider.to_owned()))?;
+		let specs = provider
+			.auth
+			.iter()
+			.filter_map(|id| {
+				let kind = credential_kind(catalog.auth_spec(id)?.kind)?;
+				matches!(
+					kind,
+					CredentialKind::ApiKey | CredentialKind::Bearer | CredentialKind::SessionToken
+				)
+				.then(|| (id.clone(), kind))
+			})
+			.collect::<BTreeMap<_, _>>();
+		if specs.is_empty() {
+			return Err(CredentialBrokerError::UnsupportedOverride(provider.id.clone()));
+		}
+		let mut broker = self.clone();
+		broker.invocation = Some(InvocationOverride { specs: Arc::new(specs), secret });
+		Ok(broker)
+	}
+
+	fn invocation_lease(
+		&self,
+		need: &CredentialNeed,
+	) -> Option<Result<CredentialLease, CredentialError>> {
+		let invocation = self.invocation.as_ref()?;
+		let kind = *invocation.specs.get(&need.spec)?;
+		let account = need
+			.account
+			.clone()
+			.unwrap_or_else(|| crate::AccountId::from("invocation"));
+		let principal = need
+			.principal
+			.clone()
+			.unwrap_or_else(|| crate::PrincipalId::from("invocation"));
+		let meta = LeaseMeta { account, principal, generation: 0, expires_at: None };
+		let lease = match kind {
+			CredentialKind::ApiKey => CredentialLease::api_key(meta, invocation.secret.clone()),
+			CredentialKind::Bearer => CredentialLease::bearer(meta, invocation.secret.clone()),
+			CredentialKind::SessionToken => {
+				CredentialLease::session_token(meta, invocation.secret.clone())
+			},
+			CredentialKind::Basic | CredentialKind::AwsSigV4 => {
+				return Some(Err(CredentialError::InvalidSource));
+			},
+		};
+		Some(Ok(lease.with_source_tag(sf!(INVOCATION_TAG))))
 	}
 
 	fn engine(&self, kind: EngineKind) -> Option<&Arc<dyn CredentialSource>> {
@@ -287,6 +362,7 @@ impl fmt::Debug for CredentialBroker {
 			.debug_struct("CredentialBroker")
 			.field("plans", &self.plans.len())
 			.field("engines", &self.engines)
+			.field("invocation", &self.invocation.is_some())
 			.finish()
 	}
 }
@@ -297,6 +373,9 @@ impl CredentialSource for CredentialBroker {
 		need: CredentialNeed,
 	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
 		async move {
+			if let Some(lease) = self.invocation_lease(&need) {
+				return lease;
+			}
 			let plan = self
 				.plans
 				.get(&need.spec)
@@ -336,6 +415,9 @@ impl CredentialSource for CredentialBroker {
 			if tag == ENVIRONMENT_TAG {
 				return Ok(());
 			}
+			if tag == INVOCATION_TAG {
+				return Ok(());
+			}
 			let kind = match tag {
 				STORED_TAG => EngineKind::Stored,
 				ADC_TAG => EngineKind::ApplicationDefault,
@@ -371,8 +453,12 @@ const fn credential_kind(kind: AuthSpecKind) -> Option<CredentialKind> {
 
 #[cfg(test)]
 mod tests {
-	use std::time::SystemTime;
+	use std::{
+		sync::atomic::{AtomicUsize, Ordering},
+		time::SystemTime,
+	};
 
+	use omp_core::ExposeSecret as _;
 	use parking_lot::Mutex;
 
 	use super::*;
@@ -385,6 +471,102 @@ mod tests {
 		fn read(&self, _: &str) -> Result<Option<SecretString>, CredentialError> {
 			Ok(None)
 		}
+	}
+	#[derive(Debug, Default)]
+	struct TrackingEnvironment {
+		reads: AtomicUsize,
+	}
+
+	impl CredentialEnvironment for TrackingEnvironment {
+		fn read(&self, _: &str) -> Result<Option<SecretString>, CredentialError> {
+			self.reads.fetch_add(1, Ordering::Relaxed);
+			Ok(None)
+		}
+	}
+
+	#[derive(Debug, Default)]
+	struct TrackingStore {
+		leases: AtomicUsize,
+	}
+
+	impl CredentialSource for TrackingStore {
+		fn lease(
+			&self,
+			_: CredentialNeed,
+		) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+			self.leases.fetch_add(1, Ordering::Relaxed);
+			futures::future::ready(Err(CredentialError::Unavailable)).boxed()
+		}
+
+		fn reject<'a>(
+			&'a self,
+			_: &'a CredentialLease,
+			_: AuthRejection,
+		) -> BoxFuture<'a, Result<(), CredentialError>> {
+			futures::future::ready(Ok(())).boxed()
+		}
+	}
+
+	#[tokio::test]
+	async fn invocation_key_is_provider_scoped_and_bypasses_external_sources() {
+		let catalog = Catalog::embedded();
+		let selected = catalog
+			.providers()
+			.iter()
+			.find_map(|provider| {
+				provider.auth.iter().find_map(|spec| {
+					let kind = credential_kind(catalog.auth_spec(spec)?.kind)?;
+					matches!(
+						kind,
+						CredentialKind::ApiKey | CredentialKind::Bearer | CredentialKind::SessionToken
+					)
+					.then(|| (provider, spec.clone()))
+				})
+			})
+			.expect("provider with scalar authentication");
+		let other = catalog
+			.auth_specs()
+			.iter()
+			.find(|spec| {
+				spec.id != selected.1
+					&& credential_kind(spec.kind).is_some()
+					&& !selected.0.auth.contains(&spec.id)
+			})
+			.expect("authentication outside selected provider");
+		let environment = Arc::new(TrackingEnvironment::default());
+		let store = Arc::new(TrackingStore::default());
+		let broker =
+			CredentialBroker::from_catalog(catalog, environment.clone(), CredentialBrokerEngines {
+				stored: Some(store.clone()),
+				..CredentialBrokerEngines::default()
+			})
+			.expect("base broker")
+			.with_api_key_override(catalog, &selected.0.id, SecretString::from("invocation-only-key"))
+			.expect("provider override");
+		let need = |spec| CredentialNeed {
+			spec,
+			account: Some(AccountId::from("selected-account")),
+			principal: Some(PrincipalId::from("selected-principal")),
+			valid_after: SystemTime::UNIX_EPOCH,
+		};
+
+		let lease = broker
+			.lease(need(selected.1))
+			.await
+			.expect("invocation lease");
+		assert_eq!(lease.scalar_secret().expect("scalar key").expose_secret(), "invocation-only-key");
+		assert_eq!(lease.meta().account.as_str(), "selected-account");
+		assert_eq!(lease.meta().principal.as_str(), "selected-principal");
+		assert_eq!(environment.reads.load(Ordering::Relaxed), 0);
+		assert_eq!(store.leases.load(Ordering::Relaxed), 0);
+
+		assert_eq!(
+			broker.lease(need(other.id.clone())).await.unwrap_err(),
+			CredentialError::Unavailable
+		);
+		assert!(
+			environment.reads.load(Ordering::Relaxed) > 0 || store.leases.load(Ordering::Relaxed) > 0
+		);
 	}
 
 	#[test]
@@ -441,6 +623,7 @@ mod tests {
 			})])),
 			environment: environment.clone(),
 			engines:     CredentialBrokerEngines::default(),
+			invocation:  None,
 		};
 		let lease = broker
 			.lease(CredentialNeed {

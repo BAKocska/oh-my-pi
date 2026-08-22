@@ -38,6 +38,7 @@ pub struct SecretRule {
 	replacement:   Option<Str>,
 	friendly_name: Option<Str>,
 	regex:         Option<Regex>,
+	boundary:      bool,
 }
 
 impl SecretRule {
@@ -77,7 +78,7 @@ impl SecretRule {
 		{
 			return Err(SecretRuleError::UnresolvableRegexReplacement);
 		}
-		Ok(Self { kind, mode, content, replacement, friendly_name, regex })
+		Ok(Self { kind, mode, content, replacement, friendly_name, regex, boundary: false })
 	}
 
 	/// Returns the match kind.
@@ -108,6 +109,21 @@ impl SecretRule {
 	/// Returns the compiled expression for a regex rule.
 	pub fn regex(&self) -> Option<&Regex> {
 		self.regex.as_ref()
+	}
+
+	/// Requires matches to sit on credential-alphabet boundaries.
+	///
+	/// Emulates pi's `(?<![0-9A-Za-z_*-])…(?![0-9A-Za-z_*-])` lookarounds,
+	/// which the guaranteed linear-time engine cannot express; the obfuscator
+	/// rejects matches adjacent to credential-alphabet characters instead.
+	pub const fn with_boundary_guard(mut self) -> Self {
+		self.boundary = true;
+		self
+	}
+
+	/// Returns whether matches must sit on credential-alphabet boundaries.
+	pub const fn boundary_guard(&self) -> bool {
+		self.boundary
 	}
 
 	pub(crate) fn into_irreversible(mut self) -> Self {

@@ -87,6 +87,9 @@ service Auth {
   rpc GetUsageHistory(GetUsageHistoryRequest) returns (GetUsageHistoryResponse);
   // Per-client token burn aggregates, metered by the gateway per turn.
   rpc GetClientUsage(GetClientUsageRequest) returns (GetClientUsageResponse);
+  // Probe every selected credential against its provider through the
+  // inference-owned credential and HTTP authorities.
+  rpc ProbeCredentials(ProbeCredentialsRequest) returns (ProbeCredentialsResponse);
 
   // ── Scoped egress ─────────────────────────────────────────────────────
   rpc MintScopedToken(MintScopedTokenRequest) returns (ScopedToken);
@@ -369,6 +372,41 @@ message GetUsageRequest {
   uint64 credential_id = 2;
   // Bypass the broker cache and refetch upstream now.
   bool refresh = 3;
+}
+// Controls an upstream per-credential health probe.
+message ProbeCredentialsRequest {
+  // Empty probes every provider with configured credentials.
+  string provider = 1;
+  // Bypass cached usage health and require a live upstream HTTP probe.
+  bool strict = 2;
+}
+
+// Typed health for every credential selected by ProbeCredentials.
+message ProbeCredentialsResponse {
+  repeated CredentialHealth credentials = 1;
+}
+
+message CredentialHealth {
+  uint64 credential_id = 1;
+  string provider = 2;
+  bool healthy = 3;
+  optional uint32 status_code = 4;
+  uint64 latency_ms = 5;
+
+  enum ErrorClass {
+    ERROR_CLASS_UNSPECIFIED = 0;
+    ERROR_CLASS_AUTHENTICATION = 1;
+    ERROR_CLASS_AUTHORIZATION = 2;
+    ERROR_CLASS_RATE_LIMITED = 3;
+    ERROR_CLASS_QUOTA = 4;
+    ERROR_CLASS_CONNECTIVITY = 5;
+    ERROR_CLASS_TIMEOUT = 6;
+    ERROR_CLASS_INVALID_REQUEST = 7;
+    ERROR_CLASS_UPSTREAM = 8;
+    ERROR_CLASS_INTERNAL = 9;
+  }
+
+  ErrorClass error_class = 6;
 }
 
 message GetUsageResponse {

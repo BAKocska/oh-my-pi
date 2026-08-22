@@ -85,5 +85,5 @@ pub use spec::{
 };
 pub use store::{
 	CredentialMetadata, CredentialOrigin, CredentialStore, CredentialWrite, LeaseOutcome,
-	PersistentLease, StoreError, StoredCredentialSource,
+	OAuthCredentialImport, PersistentLease, StoreError, StoredCredentialSource,
 };

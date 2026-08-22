@@ -1,5 +1,5 @@
-//! Deterministic in-memory transport for lifecycle, handshake, and replay
-//! tests.
+//! Deterministic in-memory transport for lifecycle, handshake, and provider
+//! capture replay.
 
 use std::{
 	collections::VecDeque,
@@ -30,7 +30,7 @@ use crate::{
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	receipt::{ExecutionReceipt, ReasonId},
-	transport::{Frame, http::record_failure},
+	transport::{Frame, FramingError, SseDecoder, capture::CaptureSnapshot, http::record_failure},
 };
 
 /// Request-body behavior performed by one scripted attempt.
@@ -75,6 +75,117 @@ pub struct CassetteAttempt {
 	pub frames:              Box<[Frame]>,
 	/// Terminal behavior after all frames.
 	pub terminal:            CassetteTerminal,
+}
+
+/// Failure to construct a replay cassette from provider capture artifacts.
+#[derive(Debug, thiserror::Error)]
+pub enum CassetteReplayBuildError {
+	/// A response frame appeared before its request marker.
+	#[error("provider capture response sequence {sequence} has no preceding request")]
+	ResponseWithoutRequest {
+		/// Process-local capture sequence.
+		sequence: u64,
+	},
+	/// A captured SSE response could not be framed.
+	#[error("provider capture SSE framing failed")]
+	Framing {
+		/// Typed framing failure.
+		#[source]
+		source: FramingError,
+	},
+}
+
+/// Immutable deterministic replay script built from [`CaptureSnapshot`].
+///
+/// Capture exchanges are matched in capture order, like pi's first-completed
+/// `/v1/messages` exchange queue. Request payloads and credentials are not
+/// fingerprinted because the always-on capture intentionally never retains
+/// them. Each transport returned by [`Self::transport`] starts at exchange
+/// zero.
+#[derive(Clone, Debug)]
+pub struct CassetteReplayDriver {
+	attempts: Arc<[CassetteAttempt]>,
+}
+
+struct ReplayAttemptBuilder {
+	framer: SseDecoder,
+	frames: Vec<Frame>,
+}
+
+impl CassetteReplayDriver {
+	/// Reconstructs complete SSE attempts from the exact artifacts emitted by
+	/// [`crate::transport::global_provider_capture`].
+	pub fn from_capture(snapshot: &CaptureSnapshot) -> Result<Self, CassetteReplayBuildError> {
+		let mut attempts = Vec::new();
+		let mut framer = None;
+		for frame in &snapshot.frames {
+			match frame.event.as_str() {
+				"request.pre_dispatch" => {
+					if let Some(framer) = framer.take() {
+						attempts.push(finish_replay_attempt(framer)?);
+					}
+					framer = Some(ReplayAttemptBuilder {
+						framer: SseDecoder::for_replay(),
+						frames: Vec::new(),
+					});
+				},
+				"sse" => {
+					let Some(framer) = framer.as_mut() else {
+						return Err(CassetteReplayBuildError::ResponseWithoutRequest {
+							sequence: frame.sequence,
+						});
+					};
+					let emitted = framer
+						.framer
+						.push(Bytes::copy_from_slice(frame.payload.as_bytes()))
+						.map_err(|source| CassetteReplayBuildError::Framing { source })?;
+					framer.frames.extend(emitted.into_iter().map(Frame::Sse));
+				},
+				_ => {},
+			}
+		}
+		if let Some(framer) = framer {
+			attempts.push(finish_replay_attempt(framer)?);
+		}
+		Ok(Self { attempts: attempts.into() })
+	}
+
+	/// Number of recorded request/response exchanges.
+	pub fn len(&self) -> usize {
+		self.attempts.len()
+	}
+
+	/// Whether the capture contains no replayable request exchange.
+	pub fn is_empty(&self) -> bool {
+		self.attempts.is_empty()
+	}
+
+	/// Creates an order-matched transport with an independent replay cursor.
+	pub fn transport(&self) -> CassetteTransport {
+		CassetteTransport::new(Arc::clone(&self.attempts))
+	}
+}
+
+fn finish_replay_attempt(
+	mut builder: ReplayAttemptBuilder,
+) -> Result<CassetteAttempt, CassetteReplayBuildError> {
+	builder.frames.extend(
+		builder
+			.framer
+			.finish()
+			.map_err(|source| CassetteReplayBuildError::Framing { source })?
+			.into_iter()
+			.map(Frame::Sse),
+	);
+	let frames = builder.frames.into_boxed_slice();
+	Ok(CassetteAttempt {
+		status: Some(200),
+		headers: Box::new([]),
+		provider_request_id: None,
+		body: CassetteBodyAction::Drain,
+		frames,
+		terminal: CassetteTerminal::Complete,
+	})
 }
 
 /// Sanitized structural frame record. Payload bytes are never retained.
@@ -246,11 +357,7 @@ impl Service<TransportRequest> for CassetteTransport {
 			return Poll::Pending;
 		}
 		if self.cursor >= self.attempts.len() {
-			return Poll::Ready(Err(transport_error(
-				ErrorPhase::Readiness,
-				false,
-				"cassette-exhausted",
-			)));
+			return Poll::Ready(Err(cassette_miss(self.cursor, self.attempts.len())));
 		}
 		self.ready_permit = true;
 		Poll::Ready(Ok(()))
@@ -263,14 +370,14 @@ impl Service<TransportRequest> for CassetteTransport {
 			self.cursor += 1;
 		}
 		let attempt = self.attempts.get(index).cloned();
+		let recorded = self.attempts.len();
 		let captures = self.captures.clone();
 		let request_body_capture_limit = self.request_body_capture_limit;
 		async move {
 			if !permit {
 				return Err(transport_error(ErrorPhase::Readiness, false, "call-without-readiness"));
 			}
-			let attempt = attempt
-				.ok_or_else(|| transport_error(ErrorPhase::Readiness, false, "cassette-exhausted"))?;
+			let attempt = attempt.ok_or_else(|| cassette_miss(index, recorded))?;
 			run_attempt(index, attempt, request, captures, request_body_capture_limit).await
 		}
 	}
@@ -967,6 +1074,16 @@ fn cancelled(committed: bool) -> Error {
 	};
 	Error::new(ErrorKind::Cancelled, phase, RetryAction::Never, ExecutionReceipt::default())
 		.committed(committed)
+}
+
+fn cassette_miss(request_index: usize, recorded: usize) -> Error {
+	Error::new(
+		ErrorKind::ReplayRequired,
+		ErrorPhase::Readiness,
+		RetryAction::Never,
+		ExecutionReceipt::default(),
+	)
+	.detail(ErrorDetail::cassette_miss(request_index, recorded))
 }
 
 fn transport_error(phase: ErrorPhase, committed: bool, reason: &'static str) -> Error {

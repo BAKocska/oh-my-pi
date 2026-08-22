@@ -175,7 +175,7 @@ mod tests {
 		assert!(!format!("{resolver:?}").contains("secret-marker"));
 	}
 
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn transient_failure_retries_after_ttl() {
 		let executor =
 			Arc::new(CountingExecutor { calls: AtomicUsize::new(0), fail: AtomicUsize::new(1) });
@@ -192,7 +192,7 @@ mod tests {
 				.await,
 			Err(CommandCredentialError::FailureCached)
 		));
-		tokio::time::sleep(Duration::from_millis(2)).await;
+		tokio::time::advance(Duration::from_millis(2)).await;
 		assert_eq!(
 			resolver
 				.resolve("credential command", CancellationToken::new())

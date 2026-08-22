@@ -16,10 +16,26 @@ package omp.gateway.v1;
 // schema revision. A client only uses an optional surface when both peers
 // advertise its stable id: "inference.turn", "inference.invoke", "auth",
 // "blob.v1", "search", or "media".
+import "omp/inference/v1/inference.proto";
+
 service Gateway {
   // Negotiates the schema revision and optional capabilities for this
   // connection. This is the only pre-flight RPC.
   rpc Hello(HelloRequest) returns (HelloResponse);
+}
+// Bearer-authenticated HTTP forward proxy. Requests retain the closed native
+// path vocabulary so callers cannot select an arbitrary credential sink.
+service ForwardProxy {
+  // Executes one allowlisted provider-format HTTP request through inference.
+  // Credential selection, refresh, and header/query injection remain
+  // server-side; response chunks never carry upstream credential headers.
+  rpc Forward(ForwardRequest) returns (stream omp.inference.v1.NativeChunk);
+}
+
+// One credential-free request accepted by the forward-proxy surface.
+message ForwardRequest {
+  // Typed allowlisted HTTP request. The client supplies no credential fields.
+  omp.inference.v1.NativeRequest request = 1;
 }
 
 // The client's wire requirements and optional feature set.

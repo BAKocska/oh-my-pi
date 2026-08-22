@@ -126,19 +126,24 @@ pub enum Target {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRequest {
 	/// Conversation to append or query.
-	pub conversation:   ConversationId,
+	pub conversation:          ConversationId,
 	/// Immutable base revision.
-	pub revision:       Revision,
+	pub revision:              Revision,
 	/// Idempotency identity for the new turn.
-	pub turn:           TurnId,
+	pub turn:                  TurnId,
 	/// Requested context transport strategy.
-	pub strategy:       ContextStrategy,
+	pub strategy:              ContextStrategy,
+	/// Invocation-scoped provider prompt-cache identity.
+	///
+	/// Compatible codecs lower this opaque value to their native cache-affinity
+	/// field; incompatible codecs ignore it.
+	pub prompt_cache_affinity: Option<Str>,
 	/// Preserve a byte-stable prefix and admit only newly appended messages.
-	pub append_only:    bool,
+	pub append_only:           bool,
 	/// Discard provider-native affinity before selecting an account.
-	pub provider_reset: bool,
+	pub provider_reset:        bool,
 	/// Whether the caller deliberately forked from an earlier revision.
-	pub forked:         bool,
+	pub forked:                bool,
 }
 
 /// Determines how canonical conversation context reaches a provider.

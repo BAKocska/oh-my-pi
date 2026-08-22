@@ -27,7 +27,7 @@ pub fn global_provider_capture() -> &'static RawProviderCapture {
 }
 
 /// One already-redacted provider/debug frame.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CapturedFrame {
 	/// Monotonic process-local sequence.
 	pub sequence: u64,
@@ -40,7 +40,7 @@ pub struct CapturedFrame {
 }
 
 /// Current capture accounting.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CaptureSummary {
 	/// Frames currently retained.
 	pub retained:         usize,
@@ -51,7 +51,7 @@ pub struct CaptureSummary {
 }
 
 /// Atomic snapshot of retained frames and counters.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CaptureSnapshot {
 	/// Retained frames in sequence order.
 	pub frames:  Vec<CapturedFrame>,

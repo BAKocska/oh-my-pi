@@ -228,6 +228,14 @@ pub enum ErrorDetail {
 		/// Typed protocol reason.
 		reason: ReasonId,
 	},
+	/// An order-matched replay requested an exchange beyond the cassette.
+	#[error("cassette miss at request {request_index}; only {recorded} exchanges were recorded")]
+	CassetteMiss {
+		/// Zero-based request index that could not be served.
+		request_index: usize,
+		/// Number of exchanges in the cassette.
+		recorded:      usize,
+	},
 	/// Bounded provider message after codec-owned sanitization.
 	#[error("{sanitized_message}")]
 	Provider {
@@ -282,6 +290,11 @@ impl ErrorDetail {
 	/// Records a sanitized protocol reason.
 	pub const fn protocol(reason: ReasonId) -> Self {
 		Self::Protocol { reason }
+	}
+
+	/// Records an order-matched cassette miss.
+	pub const fn cassette_miss(request_index: usize, recorded: usize) -> Self {
+		Self::CassetteMiss { request_index, recorded }
 	}
 
 	/// Records a sanitized provider message.
@@ -344,6 +357,7 @@ impl fmt::Debug for Error {
 			ErrorDetail::Capability { .. } => "Capability",
 			ErrorDetail::Replay { .. } => "Replay",
 			ErrorDetail::Protocol { .. } => "Protocol",
+			ErrorDetail::CassetteMiss { .. } => "CassetteMiss",
 			ErrorDetail::Provider { .. } => "Provider",
 			ErrorDetail::SearchFailures { .. } => "SearchFailures",
 			ErrorDetail::LocalUnavailable { .. } => "LocalUnavailable",

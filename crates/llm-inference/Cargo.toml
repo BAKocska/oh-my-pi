@@ -93,7 +93,7 @@ whisper-rs = { workspace = true, features = ["metal"], optional = true }
 
 [dev-dependencies]
 protox = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 prost = { workspace = true }

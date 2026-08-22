@@ -18,6 +18,7 @@
 //! - [`export`] / [`redact`] — OTLP bootstrap, configuration, and scrubbing.
 
 pub mod attrs;
+pub mod autoqa;
 pub mod collector;
 pub mod config;
 pub mod content;

@@ -108,6 +108,26 @@ pub struct CredentialWrite<'a, S: zeroize::Zeroize + ?Sized = [u8]> {
 	/// Optional compare-and-swap generation.
 	pub expected_generation: Option<u64>,
 }
+/// Renewable OAuth material imported from an external credential authority.
+///
+/// The store converts this typed input into its canonical opaque renewal
+/// bundle; callers never encode or depend on that private format.
+pub struct OAuthCredentialImport {
+	/// Account receiving the renewable credential.
+	pub account_id:    AccountId,
+	/// Stable non-secret identity associated with the credential.
+	pub principal_id:  PrincipalId,
+	/// Current OAuth access token.
+	pub access_token:  SecretString,
+	/// OAuth refresh token used for coordinated renewal.
+	pub refresh_token: SecretString,
+	/// Absolute access-token expiry.
+	pub expires_at:    SystemTime,
+	/// Time at which this external credential was imported.
+	pub imported_at:   SystemTime,
+	/// Source controlling whether persistence is permitted.
+	pub origin:        CredentialOrigin,
+}
 
 /// Crate-private opaque OAuth renewal payload persistence input.
 pub(crate) struct OAuthCredentialWrite<'a> {
@@ -234,6 +254,9 @@ pub enum StoreError {
 	/// Authenticated encryption failed.
 	#[error(transparent)]
 	Crypto(#[from] CryptoError),
+	/// An imported OAuth bundle could not be encoded canonically.
+	#[error(transparent)]
+	OAuth(#[from] super::oauth::OAuthError),
 	/// A supplied system time predates the Unix epoch or overflows milliseconds.
 	#[error("credential persistence time is out of range")]
 	InvalidTime,
@@ -305,6 +328,31 @@ impl CredentialStore {
 		S: AsRef<[u8]> + zeroize::Zeroize + ?Sized,
 	{
 		self.put_inner(write, None)
+	}
+
+	/// Canonically encodes and persists an imported renewable OAuth bundle.
+	pub fn import_oauth_bundle(
+		&self,
+		import: OAuthCredentialImport,
+	) -> Result<CredentialMetadata, StoreError> {
+		let expires_in = import
+			.expires_at
+			.duration_since(import.imported_at)
+			.unwrap_or(Duration::ZERO);
+		let bundle = super::oauth::encode_imported_bundle(
+			import.access_token,
+			import.refresh_token,
+			expires_in,
+		)?;
+		self.put_oauth_bundle(OAuthCredentialWrite {
+			account_id:          &import.account_id,
+			principal_id:        &import.principal_id,
+			bundle:              &bundle,
+			expires_at_ms:       Some(unix_ms(import.expires_at)?),
+			origin:              import.origin,
+			now_ms:              unix_ms(import.imported_at)?,
+			expected_generation: None,
+		})
 	}
 
 	/// Persists an OAuth-owned opaque renewable bundle atomically.
@@ -1220,6 +1268,7 @@ fn refresh_store_error(error: StoreError) -> crate::account::RefreshStoreError {
 		StoreError::MalformedLease => "malformed-lease",
 		StoreError::Key(_) => "key-unavailable",
 		StoreError::Crypto(_) => "authentication",
+		StoreError::OAuth(_) => "oauth-bundle",
 		StoreError::InvalidTime => "invalid-time",
 		StoreError::BackupIo(_) => "backup",
 	};
@@ -1381,6 +1430,42 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	#[test]
+	fn imported_oauth_bundle_roundtrips_as_renewable() {
+		let directory = tempdir().expect("temporary directory");
+		let path = directory.path().join("credentials.sqlite");
+		let store = CredentialStore::open(&path, source("key", KEY_ONE)).expect("open store");
+		let account = AccountId::new("anthropic:person@example.com");
+		let principal = PrincipalId::new("person@example.com");
+		let imported_at = UNIX_EPOCH + Duration::from_secs(100);
+		let expires_at = UNIX_EPOCH + Duration::from_secs(3_700);
+
+		let metadata = store
+			.import_oauth_bundle(OAuthCredentialImport {
+				account_id: account.clone(),
+				principal_id: principal.clone(),
+				access_token: SecretString::from("imported-access"),
+				refresh_token: SecretString::from("imported-refresh"),
+				expires_at,
+				imported_at,
+				origin: CredentialOrigin::Persistent,
+			})
+			.expect("import OAuth bundle");
+		assert_eq!(metadata.account_id, account);
+		assert_eq!(metadata.principal_id, principal);
+		assert_eq!(metadata.expires_at_ms, Some(3_700_000));
+		assert_eq!(metadata.kind, OAUTH_RENEWABLE_KIND);
+
+		let stored = store
+			.load_oauth_bundle(&account)
+			.expect("load imported OAuth bundle");
+		let refresh = super::super::oauth::StoredOAuthBundle::decode(&stored.bundle)
+			.expect("decode canonical OAuth bundle")
+			.into_refresh()
+			.expect("imported bundle is renewable");
+		assert_eq!(refresh.expose_secret(), "imported-refresh");
 	}
 
 	#[test]

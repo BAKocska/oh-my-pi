@@ -16,14 +16,17 @@ const CREDENTIAL_PATTERN: &str = concat!(
 /// Returns built-in reversible GitHub, GitLab, OpenAI, and Anthropic token
 /// rules.
 pub fn credential_rules() -> Result<Vec<SecretRule>, SecretRuleError> {
-	Ok(vec![SecretRule::new(
-		SecretKind::Regex,
-		SecretMode::Obfuscate,
-		CREDENTIAL_PATTERN,
-		None,
-		Some("i"),
-		Some(Str::new_static("Credential")),
-	)?])
+	Ok(vec![
+		SecretRule::new(
+			SecretKind::Regex,
+			SecretMode::Obfuscate,
+			CREDENTIAL_PATTERN,
+			None,
+			Some("i"),
+			Some(Str::new_static("Credential")),
+		)?
+		.with_boundary_guard(),
+	])
 }
 
 /// Returns a one-way rule protecting the persisted placeholder key itself.

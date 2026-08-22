@@ -2842,6 +2842,14 @@ impl OpenAiResponsesCodec {
 					},
 					Setting::Require(_) | Setting::Prefer(_) => Some(sf!("in_memory")),
 				});
+		let prompt_cache_key = if context.route.capability_limits.disable_prompt_caching {
+			None
+		} else {
+			context
+				.session
+				.and_then(|session| session.prompt_cache_affinity.clone())
+				.or_else(|| self.options.prompt_cache_key.clone())
+		};
 		let service_tier = match &request.service_tier {
 			Setting::Unset => None,
 			Setting::Require(value) | Setting::Prefer(value) => Some(value.name.clone()),
@@ -2917,7 +2925,7 @@ impl OpenAiResponsesCodec {
 				store: self.options.stateful,
 				instructions,
 				previous_response_id,
-				prompt_cache_key: self.options.prompt_cache_key.clone(),
+				prompt_cache_key,
 				prompt_cache_retention,
 				include,
 				tools,
@@ -3347,13 +3355,14 @@ mod tests {
 	};
 	use crate::{
 		call::{
-			ChatRequest, ContentPart, Message, NegotiationPolicy, OpaqueJson, ProviderProof,
-			ReasoningRequest, ReasoningVisibility, Role, Sampling, Setting, ToolDefinition,
-			ToolGrammar, ToolGrammarSyntax, ToolInputConstraint, ToolResultContent,
+			ChatRequest, ContentPart, ContextStrategy, Message, NegotiationPolicy, OpaqueJson,
+			ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling, SessionRequest,
+			Setting, ToolDefinition, ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
+			ToolResultContent,
 		},
 		codec::EncodeContext,
 		event::{ChatEvent, FinishReason},
-		id::{RequestId, ToolCallId},
+		id::{ConversationId, RequestId, Revision, ToolCallId},
 	};
 
 	fn replay_sse(fixture: &str) -> Vec<ResponsesProjection> {
@@ -3440,6 +3449,80 @@ mod tests {
 			.encode_chat(&context, &request_with_tool(input))
 			.expect("tool request encodes");
 		serde_json::to_vec(&encoded.request.tools).expect("tools serialize")
+	}
+	fn encode_cache_affinity(disable_prompt_caching: bool) -> Option<Str> {
+		let catalog = Catalog::embedded();
+		let model = catalog
+			.models()
+			.iter()
+			.find(|model| {
+				model.routes.iter().any(|route| {
+					catalog
+						.route(route)
+						.is_some_and(|route| route.codec.as_str() == "openai-responses")
+				})
+			})
+			.expect("embedded Responses model");
+		let mut route = model
+			.routes
+			.iter()
+			.filter_map(|route| catalog.route(route))
+			.find(|route| route.codec.as_str() == "openai-responses")
+			.expect("embedded Responses route")
+			.clone();
+		route.capability_limits.disable_prompt_caching = disable_prompt_caching;
+		let wire_model = model
+			.wire_ids
+			.iter()
+			.find(|(candidate, _)| candidate == &route.id)
+			.expect("embedded Responses wire model")
+			.1
+			.clone();
+		let target = WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model,
+		};
+		let policy = catalog
+			.wire_policy(&model.wire_policy)
+			.expect("embedded Responses wire policy");
+		let session = SessionRequest {
+			conversation:          ConversationId::new("cache-conversation"),
+			revision:              Revision::new("cache-revision"),
+			turn:                  crate::TurnId::new("cache-turn"),
+			strategy:              ContextStrategy::Replay,
+			prompt_cache_affinity: Some(sf!("invocation-cache")),
+			append_only:           true,
+			provider_reset:        false,
+			forked:                false,
+		};
+		let request_id = RequestId::new("responses-cache-encoding");
+		let context = EncodeContext {
+			request_id: &request_id,
+			route: &route,
+			target: Some(&target),
+			policy,
+			session: Some(&session),
+			..EncodeContext::default()
+		};
+		OpenAiResponsesCodec::default()
+			.encode_chat(
+				&context,
+				&request_with_tool(ToolInputConstraint::JsonSchema {
+					parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
+					strict:     false,
+				}),
+			)
+			.expect("cache request encodes")
+			.request
+			.prompt_cache_key
+	}
+
+	#[test]
+	fn session_cache_affinity_lowers_only_on_compatible_route() {
+		assert_eq!(encode_cache_affinity(false).as_deref(), Some("invocation-cache"));
+		assert_eq!(encode_cache_affinity(true), None);
 	}
 
 	fn encode_with_policy(

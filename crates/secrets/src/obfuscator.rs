@@ -233,6 +233,9 @@ impl SecretObfuscator {
 					let start = range.start + found.start();
 					let end = range.start + found.end();
 					let value = &source[start..end];
+					if rule.boundary_guard() && !on_credential_boundary(&source, start, end) {
+						continue;
+					}
 					if value.len() < MIN_OBFUSCATE_SECRET_LEN && rule.mode() == SecretMode::Obfuscate {
 						continue;
 					}
@@ -294,6 +297,21 @@ fn replace_literal_outside(
 		}
 	}
 	tracked.replace_ranges(&mut replacements);
+}
+/// Returns whether `start..end` is not flanked by credential-alphabet bytes.
+///
+/// Enforces [`SecretRule::boundary_guard`]: pi's lookaround boundary over
+/// `[0-9A-Za-z_*-]`, checked here because the linear-time engine cannot.
+fn on_credential_boundary(source: &str, start: usize, end: usize) -> bool {
+	let alphabet = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'*' | b'-');
+	let left = start
+		.checked_sub(1)
+		.is_none_or(|index| !alphabet(source.as_bytes()[index]));
+	left
+		&& source
+			.as_bytes()
+			.get(end)
+			.is_none_or(|byte| !alphabet(*byte))
 }
 
 #[cfg(test)]

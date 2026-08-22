@@ -951,6 +951,22 @@ impl StoredOAuthBundle {
 		self.refresh_token.ok_or(OAuthError::RefreshUnsupported)
 	}
 }
+pub(crate) fn encode_imported_bundle(
+	access_token: SecretString,
+	refresh_token: SecretString,
+	expires_in: Duration,
+) -> Result<SecretBox<Vec<u8>>, OAuthError> {
+	if access_token.expose_secret().is_empty() || refresh_token.expose_secret().is_empty() {
+		return Err(OAuthError::MalformedRenewableCredential);
+	}
+	StoredOAuthBundle {
+		access_token,
+		refresh_token: Some(refresh_token),
+		token_type: sf!("Bearer"),
+		expires_in: Some(expires_in),
+	}
+	.encode()
+}
 
 impl std::fmt::Debug for StoredOAuthBundle {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

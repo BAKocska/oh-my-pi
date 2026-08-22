@@ -489,6 +489,14 @@ impl Codec for OpenAiChatCodec {
 		validate_thinking_selection(request, context.thinking_selection)?;
 		let mut selected = self.clone();
 		selected.profile.apply_policy(context.policy);
+		if !context.route.capability_limits.disable_prompt_caching
+			&& let Some(key) = context
+				.session
+				.and_then(|session| session.prompt_cache_affinity.as_ref())
+			&& let Some(OpenAiChatAdapterOptions::OpenAi(options)) = selected.adapter.as_mut()
+		{
+			options.prompt_cache_key = Some(key.clone());
+		}
 		selected.profile.template_effort_top_level_only =
 			context.attempt.is_template_effort_rejected();
 		let wire_model = context

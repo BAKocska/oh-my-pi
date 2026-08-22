@@ -8,12 +8,15 @@ use std::{
 
 use bytes::Bytes;
 use futures::{FutureExt as _, StreamExt as _, stream};
-use omp_core::sf;
+use omp_core::{Str, sf};
 use omp_llm_catalog::{OperationKind, ProviderId, RouteId};
 use serde::Deserialize;
 use tower::{Service as _, ServiceExt as _};
 
-use super::{Frame, FramingProtocol, WebSocketTransport, cassette::*, http::HttpTransport};
+use super::{
+	CaptureSnapshot, CaptureSummary, CapturedFrame as ProviderCapturedFrame, Frame, FramingProtocol,
+	WebSocketTransport, cassette::*, http::HttpTransport,
+};
 use crate::{
 	answer::{RealtimeEvent, RealtimeInput},
 	body::{
@@ -65,6 +68,25 @@ struct RetryCase {
 struct RetryExpected {
 	attempt_count: Option<u32>,
 	retry_action:  Option<String>,
+}
+
+struct CapturedSseDecoder;
+
+impl Decoder for CapturedSseDecoder {
+	fn push(&mut self, frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		let Frame::Sse(event) = frame else {
+			panic!("replay must preserve SSE framing")
+		};
+		emit(RawEvent::Chat(ChatEvent::TextDelta {
+			index: 0,
+			text:  Str::new(String::from_utf8_lossy(&event.data)),
+		}));
+		Ok(())
+	}
+
+	fn finish(&mut self, _emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		Ok(())
+	}
 }
 
 struct EmitDecoder;
@@ -217,6 +239,91 @@ fn attempt(
 			.into_boxed_slice(),
 		terminal,
 	}
+}
+
+fn replay_capture() -> CaptureSnapshot {
+	CaptureSnapshot {
+		frames:  vec![
+			ProviderCapturedFrame {
+				sequence: 0,
+				session:  Some(sf!("session")),
+				event:    sf!("request.pre_dispatch"),
+				payload:  sf!("Chat Post https://provider.invalid/v1/stream headers=[]"),
+			},
+			ProviderCapturedFrame {
+				sequence: 1,
+				session:  None,
+				event:    sf!("sse"),
+				payload:  sf!("data: first\n\n"),
+			},
+			ProviderCapturedFrame {
+				sequence: 2,
+				session:  None,
+				event:    sf!("sse"),
+				payload:  sf!("data: second\n\n"),
+			},
+		],
+		summary: CaptureSummary { retained: 3, evicted: 0, subscriber_drops: 0 },
+	}
+}
+
+async fn replay_text(mut service: CassetteTransport) -> Vec<Str> {
+	service.ready().await.expect("cassette ready");
+	let response = service
+		.call(request(
+			BodySource::Bytes(Bytes::from_static(b"same-request")),
+			CapturedSseDecoder,
+			Cancellation::default(),
+		))
+		.await
+		.expect("replay handshake");
+	let mut events = response.events.expect("ordinary event stream");
+	let mut text = Vec::new();
+	while let Some(event) = events.next().await {
+		if let RawEvent::Chat(ChatEvent::TextDelta { text: delta, .. }) = event.expect("replay event")
+		{
+			text.push(delta);
+		}
+	}
+	text
+}
+
+#[tokio::test]
+async fn provider_capture_replays_identical_chat_event_streams() {
+	let encoded = serde_json::to_vec(&replay_capture()).expect("serialize capture artifact");
+	let capture: CaptureSnapshot =
+		serde_json::from_slice(&encoded).expect("deserialize exact capture artifact");
+	let driver = CassetteReplayDriver::from_capture(&capture).expect("valid capture");
+	assert_eq!(driver.len(), 1);
+	let first = replay_text(driver.transport()).await;
+	let second = replay_text(driver.transport()).await;
+	assert_eq!(first, [sf!("first"), sf!("second")]);
+	assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn provider_capture_reports_typed_cassette_miss() {
+	let driver = CassetteReplayDriver::from_capture(&replay_capture()).expect("valid capture");
+	let mut service = driver.transport();
+	let _ = replay_text(service.clone()).await;
+	service.ready().await.expect("first exchange ready");
+	let response = service
+		.call(request(
+			BodySource::Bytes(Bytes::from_static(b"same-request")),
+			CapturedSseDecoder,
+			Cancellation::default(),
+		))
+		.await
+		.expect("first replay handshake");
+	drop(response.events);
+	let error = match service.ready().await {
+		Ok(_) => panic!("second exchange must miss"),
+		Err(error) => error,
+	};
+	assert_eq!(
+		error.detail_ref(),
+		Some(&ErrorDetail::CassetteMiss { request_index: 1, recorded: 1 })
+	);
 }
 
 #[tokio::test]
