@@ -17,6 +17,7 @@ arc-swap = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 omp-core = { workspace = true }
+omp-executor = { workspace = true }
 omp-storage = { workspace = true }
 omp-tui = { workspace = true }
 omp-tools = { workspace = true }
