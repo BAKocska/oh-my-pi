@@ -73,6 +73,17 @@ lint-locked-maps:
         echo "$matches"
     fi
 
+# Scan for banned inline qualified paths (`std::sync::atomic::AtomicU32`, `crate::`/`super::`),
+# mostly-Arc-wrapped structs, and `Mutex<Arc<…>>`-style locks (see tools/lintx).
+[group('format & lint')]
+lintx *paths='crates':
+    cargo run --quiet --release --locked --manifest-path tools/lintx/Cargo.toml -- {{ paths }}
+
+# Autofix banned inline paths in place (conservative: ambiguous cases stay diagnostics). Run `just fmt` afterwards.
+[group('format & lint')]
+lintx-fix *paths='crates':
+    cargo run --quiet --release --locked --manifest-path tools/lintx/Cargo.toml -- --fix {{ paths }}
+
 # Run every formatter-check and linter this repo defines.
 [group('format & lint')]
 lint: fmt-check clippy proto-lint lint-locked-maps

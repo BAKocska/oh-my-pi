@@ -1,0 +1,14 @@
+# Standalone repo lint tool — deliberately NOT a workspace member: its ra_ap_*
+# dependency tree must not enter workspace resolution. Run via `just lintx`.
+[workspace]
+
+[package]
+name = "lintx"
+version = "0.1.0"
+edition = "2024"
+description = "omp path/style linter: bans long inline qualified paths and crate::/super:: paths (with autofix), flags Arc-field structs and Mutex<Arc<…>> for arc-swap"
+publish = false
+
+[dependencies]
+ra_ap_syntax = "0.0.348"
+walkdir = "2.5.0"

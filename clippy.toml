@@ -2,6 +2,7 @@ disallowed-methods = [
 	{ path = "std::sync::Mutex::new", reason = "use `parking_lot::Mutex::new` instead" },
 	{ path = "tokio::sync::mpsc::channel", reason = "use `flume::bounded` instead" },
 	{ path = "tokio::sync::mpsc::unbounded_channel", reason = "use `flume::unbounded` instead" },
+	{ path = "tokio::task::block_in_place", reason = "hijacks a runtime worker; make the boundary async or hand off to a dedicated thread" },
 	# Removed workspace deps — paths only resolve if the crate sneaks back in.
 	{ path = "base64::Engine::encode", reason = "use `omp_core::encoding::base64` instead", allow-invalid = true },
 	{ path = "base64::Engine::decode", reason = "use `omp_core::encoding::base64` instead", allow-invalid = true },
