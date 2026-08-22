@@ -137,8 +137,13 @@ pub enum SessionHandleError {
 
 type SubmitFuture<'a> =
 	Pin<Box<dyn Future<Output = Result<AgentRunSummary, AgentError>> + Send + 'a>>;
-type RetryFuture<'a> =
-	Pin<Box<dyn Future<Output = Result<Option<(Vec<Item>, Str, AgentRunSummary)>, AgentError>> + Send + 'a>>;
+type RetryFuture<'a> = Pin<
+	Box<
+		dyn Future<Output = Result<Option<(Vec<Item>, Str, AgentRunSummary)>, AgentError>>
+			+ Send
+			+ 'a,
+	>,
+>;
 type CompactFuture<'a> =
 	Pin<Box<dyn Future<Output = Result<ManualCompactionOutcome, AgentError>> + Send + 'a>>;
 type EngageFuture<'a> = Pin<
@@ -160,14 +165,15 @@ trait RuntimeDriver: Send {
 	fn disengage<'a>(&'a mut self, engagement: Str, now_ms: u64) -> DisengageFuture<'a>;
 }
 
-struct AgentRuntime<C: TurnClient + Send + 'static> {
+struct AgentRuntime<C: TurnClient + Clone + Send + 'static> {
 	agent: Agent<C>,
 }
 
-impl<C: TurnClient + Send + 'static> RuntimeDriver for AgentRuntime<C> {
+impl<C: TurnClient + Clone + Send + 'static> RuntimeDriver for AgentRuntime<C> {
 	fn submit<'a>(&'a mut self, items: Vec<Item>, turn_id: TurnId) -> SubmitFuture<'a> {
 		Box::pin(self.agent.submit(items, turn_id))
 	}
+
 	fn retry<'a>(&'a mut self, turn_id: TurnId) -> RetryFuture<'a> {
 		Box::pin(self.agent.retry_last_turn(turn_id))
 	}
@@ -213,7 +219,7 @@ impl SessionRuntime {
 	/// Takes ownership of one fully composed native agent loop.
 	pub fn from_agent<C>(agent: Agent<C>) -> Self
 	where
-		C: TurnClient + Send + 'static,
+		C: TurnClient + Clone + Send + 'static,
 	{
 		let events = agent.events().subscribe_lossless();
 		let abort = agent.abort_handle();
@@ -381,6 +387,7 @@ impl SessionHandle {
 			.await
 			.map_err(|_| SessionHandleError::Closed)?
 	}
+
 	/// Rewinds and resubmits the latest durable user turn.
 	pub async fn retry_last_turn(
 		&self,

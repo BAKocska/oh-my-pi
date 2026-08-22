@@ -33,11 +33,11 @@ pub use omp_agent::{
 	AgentEvent, Anchor, ContextView, InheritPosition, Item, PatchOp, PromptError, PromptHash,
 	PromptPatchSet, RenderedPrompt, SlotClass, SlotId, SlotPatch, Thread, WorkspaceInput,
 };
-pub use omp_core::{Hash32, Str, Ulid};
-pub use omp_llm_catalog::{
+pub use omp_catalog::{
 	AuthSpecId, Catalog, ModelKey, ModelRole, ProviderId, RouteId, SelectedModel,
 	SelectionCandidate, SelectionError,
 };
+pub use omp_core::{Hash32, Str, Ulid};
 pub use omp_proto::thread::v1::Role;
 pub use omp_tool::{
 	Claims, Constraint, Effects, Ev, IncomingParams, LiftedCall, Part, Presentation, PromptCaps,

@@ -1264,6 +1264,10 @@ mod tests {
 				.pragma_query_value(None, "query_only", |row| row.get::<_, bool>(0))
 				.unwrap()
 		);
-		assert!(reader.execute("INSERT INTO records VALUES ('changed')", []).is_err());
+		assert!(
+			reader
+				.execute("INSERT INTO records VALUES ('changed')", [])
+				.is_err()
+		);
 	}
 }

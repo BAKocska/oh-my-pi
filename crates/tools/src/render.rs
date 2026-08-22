@@ -1360,8 +1360,8 @@ mod tests {
 				.view(identities.edit.as_ref().unwrap(), &state, None)
 				.expect("live edit renders")
 				.as_str(),
-			"<col gap=0><row gap=1><text bold>edit</text><text fg=muted> · src/lib.rs (+1 more) · preview · 2 ops · +3 \
-			 -1</text></row><diff max=40>+&amp;lt;already-markup</diff></col>",
+			"<col gap=0><row gap=1><text bold>edit</text><text fg=muted> · src/lib.rs (+1 more) · \
+			 preview · 2 ops · +3 -1</text></row><diff max=40>+&amp;lt;already-markup</diff></col>",
 		);
 
 		let outcome =

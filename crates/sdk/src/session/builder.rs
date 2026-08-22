@@ -7,9 +7,9 @@ use std::{
 };
 
 use omp_agent::{PromptHash, RenderedPrompt, WorkspaceInput};
+use omp_catalog::{CandidateProvenance, Catalog, TransportKind};
 use omp_core::{Hash32, Str, sf};
-use omp_llm_catalog::{CandidateProvenance, Catalog, TransportKind};
-use omp_llm_inference::transport::http::{HttpTransport, PreconnectLaunch};
+use omp_inference::transport::http::{HttpTransport, PreconnectLaunch};
 use omp_secrets::obfuscator::SecretObfuscator;
 use omp_telemetry::firehose::{Envelope, Event as TelemetryEvent, Firehose, SessionStart};
 use omp_tool::Registry;
@@ -98,7 +98,10 @@ impl SessionBlueprint {
 
 	/// Installs builder-owned runtime authorities on a newly composed native
 	/// loop.
-	pub fn configure_agent<C: omp_agent::TurnClient>(&self, agent: &mut omp_agent::Agent<C>) {
+	pub fn configure_agent<C: omp_agent::TurnClient + Clone>(
+		&self,
+		agent: &mut omp_agent::Agent<C>,
+	) {
 		if let Some(firehose) = &self.firehose {
 			agent.set_firehose(Arc::clone(firehose));
 		}

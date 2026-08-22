@@ -166,8 +166,7 @@ fn uri_end(input: &str, start: usize, quote: QuoteContext) -> usize {
 				byte.is_ascii_whitespace()
 					|| matches!(
 						byte,
-						b'\'' | b'"' | b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b'$' | b'\\'
-							| b')'
+						b'\'' | b'"' | b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b'$' | b'\\' | b')'
 					)
 			},
 		};

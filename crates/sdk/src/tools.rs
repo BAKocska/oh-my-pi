@@ -3,7 +3,7 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use omp_core::Str;
-use omp_llm_inference::call::{
+use omp_inference::call::{
 	OpaqueJson, ToolDefinition, ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
 };
 use omp_proto::thread::v1::{Item, item, part};

@@ -102,6 +102,14 @@ pub struct TaskAgentDescription<'a> {
 	/// Whether this role executes inline.
 	pub blocking:    bool,
 }
+/// One extension-provided prelude helper projected into eval task guidance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreludeHelperDescription<'a> {
+	/// Callable signature shown to the model.
+	pub signature: &'a str,
+	/// Concise description of the helper's behavior.
+	pub summary:   &'a str,
+}
 
 /// Session facts used to build model-facing task guidance once.
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +118,8 @@ pub struct TaskDescriptionSnapshot<'a> {
 	pub default_agent:   &'a str,
 	/// Effective discovered roster after disablement.
 	pub agents:          &'a [TaskAgentDescription<'a>],
+	/// Extension-provided prelude helpers available in this session.
+	pub helpers:         &'a [PreludeHelperDescription<'a>],
 	/// Whether child jobs may continue asynchronously.
 	pub asynchronous:    bool,
 	/// Whether ordered batches are supported.
@@ -176,6 +186,16 @@ pub fn task_description(snapshot: TaskDescriptionSnapshot<'_>) -> Str {
 		 read-only agents only for investigation. For concurrent siblings, assign disjoint \
 		 ownership and coordinate shared files over IRC before editing.\n</task-runtime>",
 	);
+	if !snapshot.helpers.is_empty() {
+		output.push_str(
+			"\n\n<extension-helpers>\nExtension-provided prelude functions (call like any prelude \
+			 helper):\n",
+		);
+		for helper in snapshot.helpers {
+			let _ = writeln!(output, "- `{}` — {}", helper.signature, helper.summary);
+		}
+		output.push_str("</extension-helpers>");
+	}
 	Str::from(output)
 }
 
@@ -224,17 +244,26 @@ const STANDARD_TASK_AGENTS: &[TaskAgentDescription<'static>] = &[
 	},
 ];
 
+impl TaskDescriptionSnapshot<'static> {
+	/// Returns the standard eval task-description snapshot.
+	#[must_use]
+	pub const fn standard() -> Self {
+		Self {
+			default_agent:   "task",
+			agents:          STANDARD_TASK_AGENTS,
+			helpers:         &[],
+			asynchronous:    false,
+			batch:           true,
+			isolation:       true,
+			irc:             true,
+			effort:          true,
+			max_concurrency: 32,
+		}
+	}
+}
+
 fn standard_eval_description() -> Str {
-	task_description(TaskDescriptionSnapshot {
-		default_agent:   "task",
-		agents:          STANDARD_TASK_AGENTS,
-		asynchronous:    false,
-		batch:           true,
-		isolation:       true,
-		irc:             true,
-		effort:          true,
-		max_concurrency: 32,
-	})
+	task_description(TaskDescriptionSnapshot::standard())
 }
 
 const MAX_DISPLAY_TEXT_BYTES: usize = 8_000;
@@ -1356,6 +1385,41 @@ mod cow_bytes {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn standard_task_description_omits_empty_extension_helpers() {
+		let description = standard_eval_description();
+
+		assert_eq!(description, task_description(TaskDescriptionSnapshot::standard()));
+		assert!(!description.contains("<extension-helpers>"));
+		assert!(description.ends_with("</task-runtime>"));
+	}
+
+	#[test]
+	fn task_description_renders_extension_helpers_after_runtime() {
+		let helpers = [
+			PreludeHelperDescription {
+				signature: "merge_patches(patches, *, strategy=\"sequential\")",
+				summary:   "Merge patches using the requested strategy.",
+			},
+			PreludeHelperDescription {
+				signature: "workspace_root()",
+				summary:   "Return the active workspace root.",
+			},
+		];
+		let description = task_description(TaskDescriptionSnapshot {
+			helpers: &helpers,
+			..TaskDescriptionSnapshot::standard()
+		});
+
+		assert!(description.contains("</task-runtime>\n\n<extension-helpers>"));
+		assert!(description.ends_with(
+			"<extension-helpers>\nExtension-provided prelude functions (call like any prelude \
+			 helper):\n- `merge_patches(patches, *, strategy=\"sequential\")` — Merge patches using \
+			 the requested strategy.\n- `workspace_root()` — Return the active workspace \
+			 root.\n</extension-helpers>"
+		));
+	}
 
 	#[test]
 	fn params_accept_omitted_optionals_and_reject_invalid_fields() {

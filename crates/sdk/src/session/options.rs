@@ -2,8 +2,8 @@
 
 use std::{path::PathBuf, time::Duration};
 
+use omp_catalog::ModelRole;
 use omp_core::Str;
-use omp_llm_catalog::ModelRole;
 
 /// Maximum reasoning effort accepted from model selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

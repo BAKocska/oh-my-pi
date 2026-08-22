@@ -105,14 +105,13 @@ fn flush_section(
 	path: &mut Option<Str>,
 	body: &mut String,
 ) -> Result<(), SloppyError> {
-	let Some(path) = path.take() else { return Ok(()) };
+	let Some(path) = path.take() else {
+		return Ok(());
+	};
 	if body.trim().is_empty() {
 		return Err(SloppyError::EmptySection { path });
 	}
-	sections.push(SloppySection {
-		path,
-		input: body.trim_matches('\n').into(),
-	});
+	sections.push(SloppySection { path, input: body.trim_matches('\n').into() });
 	body.clear();
 	Ok(())
 }
@@ -154,7 +153,10 @@ fn strip_envelope_noise<'a>(raw: Vec<&'a str>) -> Vec<&'a str> {
 			continue;
 		}
 		if skipping {
-			if parse_section_opener(line).and_then(|(_, path)| path).is_none() {
+			if parse_section_opener(line)
+				.and_then(|(_, path)| path)
+				.is_none()
+			{
 				continue;
 			}
 			skipping = false;
@@ -182,11 +184,11 @@ fn envelope_control(line: &str) -> bool {
 
 #[derive(Clone, Debug)]
 struct Operation {
-	all:          bool,
-	pattern_raw:  String,
-	match_text:   String,
-	desired:      Vec<Piece>,
-	has_add:      bool,
+	all:           bool,
+	pattern_raw:   String,
+	match_text:    String,
+	desired:       Vec<Piece>,
+	has_add:       bool,
 	block_rewrite: Option<String>,
 }
 
@@ -228,7 +230,9 @@ fn parse_operations(input: &str) -> Result<Vec<Operation>, SloppyError> {
 	for line in &lines {
 		let trimmed = line.trim();
 		if trimmed == "§»" {
-			if state == ParseState::Pattern && pattern.iter().any(|line: &String| !line.trim().is_empty()) {
+			if state == ParseState::Pattern
+				&& pattern.iter().any(|line: &String| !line.trim().is_empty())
+			{
 				state = ParseState::Rewrite;
 			}
 			continue;
@@ -257,7 +261,8 @@ fn parse_operations(input: &str) -> Result<Vec<Operation>, SloppyError> {
 			ParseState::Pattern if trimmed == REWRITE => state = ParseState::Rewrite,
 			ParseState::Pattern => pattern.push(line.clone()),
 			ParseState::Rewrite if trimmed == REWRITE => {
-				// A second or trailing separator is recovery-only structure, never text.
+				// A second or trailing separator is recovery-only structure, never
+				// text.
 			},
 			ParseState::Rewrite => rewrite.push(line.clone()),
 		}
@@ -299,23 +304,18 @@ fn build_operation(
 		pattern_raw = embed_add_lines(&pattern_raw);
 	}
 	let selections = selection_facts(&pattern_raw, operation)?;
-	let explicit = rewrite_lines.map(|lines| trim_trailing_blank_lines(lines)
-		.iter()
-		.map(|line| add_line_text(line).unwrap_or_else(|| line.clone()))
-		.collect::<Vec<_>>()
-		.join("\n"));
+	let explicit = rewrite_lines.map(|lines| {
+		trim_trailing_blank_lines(lines)
+			.iter()
+			.map(|line| add_line_text(line).unwrap_or_else(|| line.clone()))
+			.collect::<Vec<_>>()
+			.join("\n")
+	});
 
 	match explicit {
 		Some(rewrite) if selections.bare == 1 && selections.paired == 0 => {
 			let (match_text, desired) = legacy_selection_template(&pattern_raw, &rewrite, operation)?;
-			Ok(Operation {
-				all,
-				pattern_raw,
-				match_text,
-				desired,
-				has_add,
-				block_rewrite: None,
-			})
+			Ok(Operation { all, pattern_raw, match_text, desired, has_add, block_rewrite: None })
 		},
 		Some(rewrite) if selections.paired > 0 => {
 			let (match_text, inline_desired) = inline_template(&pattern_raw, true, operation)?;
@@ -357,14 +357,7 @@ fn build_operation(
 		},
 		None if selections.paired > 0 || selections.bare > 0 || has_add => {
 			let (match_text, desired) = inline_template(&pattern_raw, true, operation)?;
-			Ok(Operation {
-				all,
-				pattern_raw,
-				match_text,
-				desired,
-				has_add,
-				block_rewrite: None,
-			})
+			Ok(Operation { all, pattern_raw, match_text, desired, has_add, block_rewrite: None })
 		},
 		None => Err(SloppyError::Malformed {
 			operation,
@@ -397,7 +390,10 @@ fn selection_facts(pattern: &str, operation: usize) -> Result<SelectionFacts, Sl
 		};
 		let selection = &after[..close];
 		if selection.matches(SELECT_DIVIDER).count() > 1 {
-			return Err(SloppyError::Malformed { operation, reason: "selection has multiple │ markers" });
+			return Err(SloppyError::Malformed {
+				operation,
+				reason: "selection has multiple │ markers",
+			});
 		}
 		if selection.contains(SELECT_DIVIDER) {
 			facts.paired += 1;
@@ -419,14 +415,21 @@ fn has_add_lines(pattern: &str) -> bool {
 fn add_line_text(line: &str) -> Option<String> {
 	let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
 	let rest = &line[indent_len..];
-	rest.strip_prefix(ADD_LINE)
+	rest
+		.strip_prefix(ADD_LINE)
 		.map(|text| format!("{}{}", &line[..indent_len], text))
 }
 
 fn embed_add_lines(pattern: &str) -> String {
 	let mut source = pattern
 		.split('\n')
-		.map(|line| if line.trim().is_empty() { String::new() } else { line.to_owned() })
+		.map(|line| {
+			if line.trim().is_empty() {
+				String::new()
+			} else {
+				line.to_owned()
+			}
+		})
 		.collect::<Vec<_>>();
 	let mut compact = Vec::with_capacity(source.len());
 	for line in source.drain(..) {
@@ -446,7 +449,9 @@ fn embed_add_lines(pattern: &str) -> String {
 		}
 		let mut added = Vec::new();
 		while index < compact.len() {
-			let Some(line) = add_line_text(&compact[index]) else { break };
+			let Some(line) = add_line_text(&compact[index]) else {
+				break;
+			};
 			added.push(line);
 			index += 1;
 		}
@@ -472,9 +477,7 @@ fn embed_add_lines(pattern: &str) -> String {
 			));
 			index += 1;
 		} else if let Some(previous) = output.last_mut() {
-			previous.push_str(&format!(
-				"{SELECT_OPEN}{SELECT_DIVIDER}\n{inserted}{SELECT_CLOSE}"
-			));
+			previous.push_str(&format!("{SELECT_OPEN}{SELECT_DIVIDER}\n{inserted}{SELECT_CLOSE}"));
 		} else {
 			output.push(format!("{SELECT_OPEN}{SELECT_DIVIDER}{inserted}{SELECT_CLOSE}"));
 		}
@@ -496,7 +499,10 @@ fn is_near_variant(anchor: &str, added: &str) -> bool {
 }
 
 fn word_tokens(text: &str) -> Vec<&str> {
-	text.split(|character: char| !(character.is_alphanumeric() || character == '_' || character == '$'))
+	text
+		.split(|character: char| {
+			!(character.is_alphanumeric() || character == '_' || character == '$')
+		})
 		.filter(|token| !token.is_empty())
 		.collect()
 }
@@ -629,9 +635,9 @@ fn pieces_from_rewrite(rewrite: &str, captures: usize, mapping: Option<&[usize]>
 	let mut rest = rewrite;
 	while let Some(gap) = rest.find(GAP) {
 		push_text(&mut pieces, &rest[..gap]);
-		let mapped = mapping.and_then(|mapping| mapping.get(capture).copied()).or_else(|| {
-			(capture < captures).then_some(capture)
-		});
+		let mapped = mapping
+			.and_then(|mapping| mapping.get(capture).copied())
+			.or_else(|| (capture < captures).then_some(capture));
 		if let Some(index) = mapped {
 			pieces.push(Piece::Capture(index));
 		} else {
@@ -729,10 +735,10 @@ struct Candidate {
 
 #[derive(Clone, Debug)]
 struct PlannedEdit {
-	start:     usize,
-	end:       usize,
+	start:       usize,
+	end:         usize,
 	replacement: String,
-	operation: usize,
+	operation:   usize,
 }
 
 /// Applies one section atomically. Operations address the original source;
@@ -751,12 +757,7 @@ pub fn apply_sloppy(source: &str, input: &str) -> Result<String, SloppyError> {
 				.map(|edit| (edit.start, edit.end))
 				.collect::<Vec<_>>()
 		});
-		match plan_operation(
-			source,
-			&operations[index],
-			operation_number,
-			exclusions.as_deref(),
-		) {
+		match plan_operation(source, &operations[index], operation_number, exclusions.as_deref()) {
 			Ok(mut edits) => planned.append(&mut edits),
 			Err(SloppyError::Ambiguous { .. }) if !deferred[index] => {
 				deferred[index] = true;
@@ -820,7 +821,7 @@ fn plan_operation(
 	} else {
 		return Err(SloppyError::Ambiguous {
 			operation: operation_number,
-			lines: candidates
+			lines:     candidates
 				.iter()
 				.map(|candidate| line_at(source, candidate.start))
 				.collect(),
@@ -891,7 +892,8 @@ fn minimal_edit(
 }
 
 fn common_prefix(left: &str, right: &str) -> usize {
-	left.chars()
+	left
+		.chars()
 		.zip(right.chars())
 		.take_while(|(left, right)| left == right)
 		.map(|(character, _)| character.len_utf8())
@@ -899,7 +901,8 @@ fn common_prefix(left: &str, right: &str) -> usize {
 }
 
 fn common_suffix(left: &str, right: &str) -> usize {
-	left.chars()
+	left
+		.chars()
 		.rev()
 		.zip(right.chars().rev())
 		.take_while(|(left, right)| left == right)
@@ -997,8 +1000,16 @@ fn candidate_from_positions(
 	let last = positions.iter().flatten().next_back().copied()?;
 	let leading = pattern.literals.first().is_some_and(String::is_empty);
 	let trailing = pattern.literals.last().is_some_and(String::is_empty);
-	let start = if leading { line_start(content, first.0) } else { first.0 };
-	let end = if trailing { line_end(content, last.1) } else { last.1 };
+	let start = if leading {
+		line_start(content, first.0)
+	} else {
+		first.0
+	};
+	let end = if trailing {
+		line_end(content, last.1)
+	} else {
+		last.1
+	};
 	let mut captures = Vec::with_capacity(pattern.bounded.len());
 	for gap in 0..pattern.bounded.len() {
 		let left = positions[..=gap]
@@ -1037,8 +1048,8 @@ fn locate_fuzzy_lines(content: &str, pattern: &str) -> Vec<Candidate> {
 			.all(|(left, right)| fuzzy_line_equal(left, &content[right.0..right.1]))
 		{
 			candidates.push(Candidate {
-				start: actual[row].0,
-				end: actual[row + expected.len() - 1].1,
+				start:    actual[row].0,
+				end:      actual[row + expected.len() - 1].1,
 				captures: Vec::new(),
 			});
 		}
@@ -1049,11 +1060,13 @@ fn locate_fuzzy_lines(content: &str, pattern: &str) -> Vec<Candidate> {
 fn fuzzy_line_equal(left: &str, right: &str) -> bool {
 	let left = left.trim();
 	let right = right.trim();
-	left == right || (operator_signature(left) == operator_signature(right) && levenshtein(left, right) <= 2)
+	left == right
+		|| (operator_signature(left) == operator_signature(right) && levenshtein(left, right) <= 2)
 }
 
 fn operator_signature(text: &str) -> String {
-	text.chars()
+	text
+		.chars()
 		.filter(|character| !(character.is_alphanumeric() || *character == '_' || *character == '$'))
 		.collect()
 }
@@ -1065,9 +1078,11 @@ fn levenshtein(left: &str, right: &str) -> usize {
 		let mut current = Vec::with_capacity(right.len() + 1);
 		current.push(row + 1);
 		for (column, right) in right.iter().enumerate() {
-			current.push((previous[column + 1] + 1).min(current[column] + 1).min(
-				previous[column] + usize::from(left != *right),
-			));
+			current.push(
+				(previous[column + 1] + 1)
+					.min(current[column] + 1)
+					.min(previous[column] + usize::from(left != *right)),
+			);
 		}
 		previous = current;
 	}
@@ -1105,7 +1120,9 @@ fn recover_non_consecutive(
 			.filter(|(_, range)| fuzzy_line_equal(pattern, &source[range.0..range.1]))
 			.map(|(offset, _)| from + offset)
 			.collect::<Vec<_>>();
-		let [line] = matches.as_slice() else { return None };
+		let [line] = matches.as_slice() else {
+			return None;
+		};
 		found.push(*line);
 		from = line + 1;
 	}
@@ -1144,7 +1161,10 @@ fn source_lines(content: &str) -> Vec<(usize, usize)> {
 	lines
 }
 
-fn reconcile_edits(source: &str, mut edits: Vec<PlannedEdit>) -> Result<Vec<PlannedEdit>, SloppyError> {
+fn reconcile_edits(
+	source: &str,
+	mut edits: Vec<PlannedEdit>,
+) -> Result<Vec<PlannedEdit>, SloppyError> {
 	edits.sort_by_key(|edit| (edit.start, edit.end));
 	let mut result = Vec::<PlannedEdit>::new();
 	for edit in edits {
@@ -1153,7 +1173,9 @@ fn reconcile_edits(source: &str, mut edits: Vec<PlannedEdit>) -> Result<Vec<Plan
 			continue;
 		};
 		let overlaps = edit.start < previous.end
-			|| (edit.start == previous.start && edit.end == edit.start && previous.end == previous.start);
+			|| (edit.start == previous.start
+				&& edit.end == edit.start
+				&& previous.end == previous.start);
 		if !overlaps {
 			result.push(edit);
 			continue;
@@ -1178,19 +1200,11 @@ fn reconcile_edits(source: &str, mut edits: Vec<PlannedEdit>) -> Result<Vec<Plan
 			previous.replacement,
 			&source[previous.end..end]
 		);
-		let right = format!(
-			"{}{}{}",
-			&source[start..edit.start],
-			edit.replacement,
-			&source[edit.end..end]
-		);
+		let right =
+			format!("{}{}{}", &source[start..edit.start], edit.replacement, &source[edit.end..end]);
 		if left == right {
-			*result.last_mut().expect("present") = PlannedEdit {
-				start,
-				end,
-				replacement: left,
-				operation: edit.operation,
-			};
+			*result.last_mut().expect("present") =
+				PlannedEdit { start, end, replacement: left, operation: edit.operation };
 			continue;
 		}
 		return Err(SloppyError::Overlap { operation: edit.operation });
@@ -1216,12 +1230,7 @@ fn merge_contained_deletion(
 	{
 		replacement.push('\n');
 	}
-	Some(PlannedEdit {
-		start: outer.start,
-		end: outer.end,
-		replacement,
-		operation: inner.operation,
-	})
+	Some(PlannedEdit { start: outer.start, end: outer.end, replacement, operation: inner.operation })
 }
 
 fn line_at(content: &str, offset: usize) -> usize {
@@ -1250,10 +1259,10 @@ mod tests {
 
 	#[test]
 	fn extracts_paths_from_partial_payloads() {
-		assert_eq!(
-			sloppy_paths("§src/a.rs\nold⟪old│new⟫\n§\nmore\n§*src/b.rs\npartial"),
-			vec![Str::new("src/a.rs"), Str::new("src/b.rs")]
-		);
+		assert_eq!(sloppy_paths("§src/a.rs\nold⟪old│new⟫\n§\nmore\n§*src/b.rs\npartial"), vec![
+			Str::new("src/a.rs"),
+			Str::new("src/b.rs")
+		]);
 	}
 
 	#[test]
@@ -1286,10 +1295,12 @@ mod tests {
 	#[test]
 	fn add_lines_keep_order_and_absolute_indent() {
 		let source = "interface P {\n\tlimit: number;\n\tjitter: boolean;\n}\n";
-		let input = "§\n\tlimit: number;\n＋\tcomment: string;\n＋\tdelay: number;\n\tjitter: boolean;";
+		let input =
+			"§\n\tlimit: number;\n＋\tcomment: string;\n＋\tdelay: number;\n\tjitter: boolean;";
 		assert_eq!(
 			apply_sloppy(source, input).expect("add"),
-			"interface P {\n\tlimit: number;\n\tcomment: string;\n\tdelay: number;\n\tjitter: boolean;\n}\n"
+			"interface P {\n\tlimit: number;\n\tcomment: string;\n\tdelay: number;\n\tjitter: \
+			 boolean;\n}\n"
 		);
 	}
 
@@ -1374,14 +1385,10 @@ mod tests {
 	#[test]
 	fn glued_opener_separator_recovers_after_match_and_drops_elsewhere() {
 		assert_eq!(
-			apply_sloppy("const x = old;\n", "§\nconst x = old;\n§»\nconst x = new;")
-				.expect("glued"),
+			apply_sloppy("const x = old;\n", "§\nconst x = old;\n§»\nconst x = new;").expect("glued"),
 			"const x = new;\n"
 		);
-		assert_eq!(
-			apply_sloppy("x\n", "§\nx\n»\ny\n§»").expect("stray"),
-			"y\n"
-		);
+		assert_eq!(apply_sloppy("x\n", "§\nx\n»\ny\n§»").expect("stray"), "y\n");
 	}
 
 	#[test]
@@ -1407,8 +1414,11 @@ mod tests {
 
 	#[test]
 	fn non_consecutive_positional_rewrite_preserves_skipped_rows() {
-		let source = "const entries = source\n  ? avlue\n  : typeof value === 'object' &&\n      Array.isArray(value.models)\n    ? avlue.models\n    : typeof avlue === 'object'\n";
-		let input = "§\n  ? avlue\n    ? avlue.models\n    : typeof avlue === 'object'\n»\n  ? value\n    ? value.models\n    : typeof value === 'object'";
+		let source = "const entries = source\n  ? avlue\n  : typeof value === 'object' &&\n      \
+		              Array.isArray(value.models)\n    ? avlue.models\n    : typeof avlue === \
+		              'object'\n";
+		let input = "§\n  ? avlue\n    ? avlue.models\n    : typeof avlue === 'object'\n»\n  ? \
+		             value\n    ? value.models\n    : typeof value === 'object'";
 		assert_eq!(
 			apply_sloppy(source, input).expect("non-consecutive"),
 			source.replace("avlue", "value")

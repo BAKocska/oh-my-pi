@@ -12,8 +12,8 @@ use omp_agent::{
 };
 pub use omp_core::SecretString;
 use omp_core::Str;
-use omp_llm_inference::auth::{AuthRejection, CredentialSource};
-pub use omp_llm_inference::{
+use omp_inference::auth::{AuthRejection, CredentialSource};
+pub use omp_inference::{
 	AccountId, PrincipalId,
 	auth::{CredentialError, CredentialLease, CredentialNeed, LeaseMeta},
 };

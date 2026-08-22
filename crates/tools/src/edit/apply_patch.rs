@@ -68,9 +68,7 @@ impl FreeformKind {
 			Self::ApplyPatch => {
 				"Apply a Codex begin/add/update/move/delete patch envelope atomically."
 			},
-			Self::Sloppy => {
-				SLOPPY_DESCRIPTION
-			},
+			Self::Sloppy => SLOPPY_DESCRIPTION,
 		}
 	}
 }

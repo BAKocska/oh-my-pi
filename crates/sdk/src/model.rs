@@ -2,12 +2,12 @@
 
 use std::collections::BTreeMap;
 
-use omp_core::Str;
-use omp_llm_catalog::{
+use omp_catalog::{
 	CandidateProvenance, Catalog, ModelRole, ModelScope, SelectionCandidate, SelectionError,
 	candidate_plan, pick_default,
 };
-pub use omp_llm_inference::recovery::dialect::{Dialect, DialectEvent, DialectStage, ToolEnvelope};
+use omp_core::Str;
+pub use omp_inference::recovery::dialect::{Dialect, DialectEvent, DialectStage, ToolEnvelope};
 use thiserror::Error;
 
 /// Ordered credential-blind fallback plan for one session.

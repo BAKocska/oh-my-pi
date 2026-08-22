@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use omp_core::Str;
 use omp_docserver::lsp_registry::LspBindingHandle;
-use omp_llm_inference::transport::http::PreconnectLaunch;
+use omp_inference::transport::http::PreconnectLaunch;
 use parking_lot::RwLock;
 
 /// Why one model fallback candidate may be selected at call time.
