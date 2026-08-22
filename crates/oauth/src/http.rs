@@ -37,9 +37,6 @@ impl OAuthHttpRequest {
 		if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
 			return Err(OAuthRequestError::InvalidUrl);
 		}
-		headers
-			.entry(ACCEPT)
-			.or_insert(HeaderValue::from_static("application/json"));
 		Ok(Self { method, url, headers, body })
 	}
 
@@ -47,6 +44,7 @@ impl OAuthHttpRequest {
 	pub fn secret_form(url: &str, body: SecretString) -> Result<Self, OAuthRequestError> {
 		let mut headers = HeaderMap::new();
 		headers.insert(CONTENT_TYPE, HeaderValue::from_static(FORM_CONTENT_TYPE));
+		headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 		Self::new(Method::POST, url, headers, Some(body))
 	}
 
