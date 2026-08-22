@@ -521,6 +521,14 @@ mod tests {
 	}
 
 	#[test]
+	fn boundary_layout_runs_to_the_edge_when_the_right_group_is_empty() {
+		let layout = boundary_layout(1, 38, 10, 0, 2).expect("left group and gauge fit");
+		assert_eq!(layout.boundary_x, 11);
+		assert_eq!(layout.boundary_width, 28);
+		assert_eq!(layout.right_x, 39);
+	}
+
+	#[test]
 	fn context_gauge_rounds_and_clamps_to_its_boundary() {
 		assert_eq!(context_gauge_cells(20, 25, 100), 5);
 		assert_eq!(context_gauge_cells(9, 50, 100), 5);

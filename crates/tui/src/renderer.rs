@@ -40,6 +40,32 @@ const DEFAULT_CELL_PIXEL_HEIGHT: u16 = 18;
 const MAX_CONPTY_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_OUTPUT_BACKLOG_BYTES: usize = 64 * 1024 * 1024;
 
+/// Native-scrollback policy for a settled in-place width resize.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	serde::Deserialize,
+	serde::Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+pub enum ResizeScrollbackMode {
+	/// Replay the transcript at the current width below existing history.
+	Append,
+	/// Erase native history and replay one current-width transcript copy.
+	Rebuild,
+	/// Repaint only the viewport, retaining existing native history.
+	#[default]
+	Preserve,
+}
+
 /// Health of the renderer's bounded terminal output queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputState {
@@ -331,7 +357,10 @@ pub struct Renderer<W: Write> {
 	cell_pixel_width:        u16,
 	cell_pixel_height:       u16,
 	tmux_passthrough:        bool,
-	preserve_resize_history: bool,
+	resize_in_place:         bool,
+	resize_scrollback:       ResizeScrollbackMode,
+	mux_pushed_rows:         u16,
+	mux_push_seam:           u16,
 	sync_output:             bool,
 	screen_to_scrollback:    bool,
 	hyperlinks:              bool,
@@ -372,7 +401,10 @@ impl<W: Write> Renderer<W> {
 			cell_pixel_width: DEFAULT_CELL_PIXEL_WIDTH,
 			cell_pixel_height: DEFAULT_CELL_PIXEL_HEIGHT,
 			tmux_passthrough: false,
-			preserve_resize_history: false,
+			resize_in_place: false,
+			resize_scrollback: ResizeScrollbackMode::Preserve,
+			mux_pushed_rows: 0,
+			mux_push_seam: 0,
 			sync_output: true,
 			screen_to_scrollback: false,
 			margin_scrollback: false,
@@ -392,7 +424,7 @@ impl<W: Write> Renderer<W> {
 		self.set_margin_scrollback(caps.margin_scrollback);
 		self.set_hyperlinks(caps.hyperlinks);
 		self.set_tmux_passthrough(caps.inside_tmux);
-		self.set_preserve_resize_history(caps.inside_multiplexer);
+		self.set_resize_in_place(caps.inside_multiplexer);
 		if let Some((width, height)) = caps.cell_px {
 			self.set_cell_pixel_size(width, height)?;
 		}
@@ -505,14 +537,23 @@ impl<W: Write> Renderer<W> {
 		self.tmux_passthrough = enabled;
 	}
 
-	/// Keeps native history intact when terminal geometry changes.
+	/// Selects the in-place geometry path used by multiplexer-owned panes.
 	///
-	/// Multiplexers own pane scrollback and may reflow it independently. In
-	/// this mode a width change starts a new row-coordinate epoch and repaints
-	/// only the viewport; later finalized growth advances through an explicit
-	/// current-width seam instead of indexing old-width commits.
-	pub const fn set_preserve_resize_history(&mut self, enabled: bool) {
-		self.preserve_resize_history = enabled;
+	/// A width change starts a new row-coordinate epoch. The configured
+	/// [`ResizeScrollbackMode`] then decides whether the settled frame replays
+	/// the current-width transcript or only repaints the viewport.
+	pub const fn set_resize_in_place(&mut self, enabled: bool) {
+		self.resize_in_place = enabled;
+	}
+
+	/// Selects how a settled in-place width resize refreshes native history.
+	pub const fn set_resize_scrollback(&mut self, mode: ResizeScrollbackMode) {
+		self.resize_scrollback = mode;
+	}
+
+	/// Returns the settled in-place width-resize history policy.
+	pub const fn resize_scrollback(&self) -> ResizeScrollbackMode {
+		self.resize_scrollback
 	}
 
 	/// Paints a logical document with an immutable leading-row boundary.
@@ -1040,11 +1081,13 @@ impl<W: Write> Renderer<W> {
 			top:    next.size().height.saturating_sub(viewport_height),
 			height: viewport_height,
 		};
-		if self.preserve_resize_history
+		if self.resize_in_place
 			&& self.width_epoch_capture.is_none()
-			&& self.previous.as_ref().is_some_and(|previous| {
-				previous.size().width != next.size().width || self.viewport_height != viewport_height
-			}) {
+			&& self
+				.previous
+				.as_ref()
+				.is_some_and(|previous| previous.size().width != next.size().width)
+		{
 			self.width_epoch_capture = Some(WidthEpochCapture { frame: next.clone(), window });
 		}
 		let can_diff = leading_sequence.is_empty()
@@ -1214,25 +1257,40 @@ impl<W: Write> Renderer<W> {
 		if stable_rows > next.size().height {
 			return Err(contract_error("stable_rows exceeds the document height"));
 		}
-		let preserve_geometry = self.preserve_resize_history
+		let width_resize = self.resize_in_place
+			&& self.previous.as_ref().is_some_and(|previous| {
+				previous.size().width != next.size().width || self.width_epoch_capture.is_some()
+			});
+		let preserve_geometry = self.resize_in_place
 			&& self.previous.as_ref().is_some_and(|previous| {
 				previous.size().width != next.size().width
 					|| self.viewport_height != viewport_height
 					|| self.width_epoch_capture.is_some()
 			});
-		let preserving_first_paint = self.preserve_resize_history && self.previous.is_none();
-		let stats = if preserve_geometry {
+		let preserving_first_paint = self.resize_in_place && self.previous.is_none();
+		let resize_replay = width_resize && self.resize_scrollback != ResizeScrollbackMode::Preserve;
+		let stats = if preserve_geometry && !resize_replay {
 			self.repaint_preserving_history(next, viewport_height, stable_rows, leading_sequence)?
 		} else {
 			self.width_epoch = None;
 			self.width_epoch_capture = None;
 			self.epoch_commits.clear();
-			let clear = if preserving_first_paint {
+			self.mux_pushed_rows = 0;
+			let clear = if preserving_first_paint
+				|| (resize_replay && self.resize_scrollback == ResizeScrollbackMode::Append)
+			{
 				CLEAR_VIEWPORT
 			} else {
 				REBUILD_HISTORY
 			};
-			self.full_paint(next, viewport_height, stable_rows, leading_sequence, clear)?
+			self.full_paint(
+				next,
+				viewport_height,
+				stable_rows,
+				leading_sequence,
+				clear,
+				!resize_replay,
+			)?
 		};
 		self.publish_debug_screen();
 		Ok(stats)
@@ -1262,6 +1320,33 @@ impl<W: Write> Renderer<W> {
 	/// viewport.
 	pub const fn committed_rows(&self) -> u16 {
 		self.committed_rows
+	}
+	/// Lowest document row at which a transcript tail may be removed in place.
+	///
+	/// During a width epoch the frame-coordinate seam, rather than the native
+	/// history count accumulated across widths, is the immutable boundary.
+	pub const fn rewind_floor(&self) -> u16 {
+		match self.width_epoch {
+			Some(epoch) => epoch.seam,
+			None => self.committed_rows,
+		}
+	}
+
+	/// Retracts the declared-stable tail without clearing native history.
+	///
+	/// # Errors
+	///
+	/// Rejects a boundary below rows already present in native history or
+	/// beyond the currently declared stable prefix.
+	pub fn truncate_uncommitted_tail(&mut self, stable_rows: u16) -> io::Result<()> {
+		if stable_rows < self.rewind_floor() {
+			return Err(contract_error("cannot truncate rows already present in native history"));
+		}
+		if stable_rows > self.stable_rows {
+			return Err(contract_error("truncate boundary exceeds the stable transcript"));
+		}
+		self.stable_rows = stable_rows;
+		Ok(())
 	}
 
 	/// Returns the document row currently shown at the viewport top.
@@ -1368,15 +1453,47 @@ impl<W: Write> Renderer<W> {
 		stable_rows: u16,
 		leading_sequence: &str,
 	) -> io::Result<PaintStats> {
+		let previous_size = self
+			.previous
+			.as_ref()
+			.expect("preserving rebuild requires an established normal screen")
+			.size();
+		let width_changed = previous_size.width != next.size().width;
+		if !width_changed {
+			self.validate_stable_prefix(&next)?;
+		}
+		let previous_height = self.viewport_height;
+		let height_changed = previous_height != viewport_height;
+		let previous_grid_full = previous_height > 0
+			&& previous_size.height.saturating_sub(self.window_top) >= previous_height;
+		if width_changed {
+			self.mux_pushed_rows = 0;
+		} else if height_changed && previous_grid_full {
+			if self.committed_rows != self.mux_push_seam {
+				self.mux_pushed_rows = 0;
+			}
+			if viewport_height < previous_height {
+				self.mux_pushed_rows = self
+					.mux_pushed_rows
+					.saturating_add(previous_height - viewport_height);
+				self.mux_push_seam = self.committed_rows;
+			} else if viewport_height > previous_height {
+				let pull = viewport_height - previous_height;
+				let from_pushed = pull.min(self.mux_pushed_rows);
+				self.mux_pushed_rows -= from_pushed;
+				let from_committed = (pull - from_pushed).min(self.committed_rows);
+				self.uncommit_native_rows(from_committed);
+				self.mux_push_seam = self.committed_rows;
+			}
+		}
+		let captured = self.width_epoch_capture.take();
+		let epoch_reset = width_changed || captured.is_some();
+		let natural_top = next.size().height.saturating_sub(viewport_height);
+		let previous_natural_top = previous_size.height.saturating_sub(previous_height);
 		let previous = self
 			.previous
 			.as_ref()
 			.expect("preserving rebuild requires an established normal screen");
-		let width_changed = previous.size().width != next.size().width;
-		let captured = self.width_epoch_capture.take();
-		let epoch_reset = width_changed || captured.is_some();
-		let natural_top = next.size().height.saturating_sub(viewport_height);
-		let previous_natural_top = previous.size().height.saturating_sub(self.viewport_height);
 		let unresolved_tail = self.width_epoch.is_some_and(|epoch| {
 			epoch.width == previous.size().width
 				&& epoch.seam < previous_natural_top.min(epoch.baseline_rows)
@@ -1395,10 +1512,9 @@ impl<W: Write> Renderer<W> {
 			natural_top
 		};
 
-		if !epoch_reset && viewport_height < self.viewport_height {
-			let previous_viewport_rows = self
-				.viewport_height
-				.min(previous.size().height.saturating_sub(self.window_top));
+		if !epoch_reset && viewport_height < previous_height {
+			let previous_viewport_rows =
+				previous_height.min(previous.size().height.saturating_sub(self.window_top));
 			let host_rows = natural_top
 				.saturating_sub(seam)
 				.min(previous_viewport_rows.saturating_sub(viewport_height));
@@ -1638,6 +1754,25 @@ impl<W: Write> Renderer<W> {
 		Ok(stats)
 	}
 
+	fn uncommit_native_rows(&mut self, rows: u16) {
+		let new_committed = self.committed_rows.saturating_sub(rows);
+		while self
+			.epoch_commits
+			.last()
+			.is_some_and(|commit| commit.native_from >= new_committed)
+		{
+			self.epoch_commits.pop();
+		}
+		if let Some(last) = self.epoch_commits.last_mut() {
+			let retained = new_committed.saturating_sub(last.native_from);
+			let length = last.frame_to.saturating_sub(last.frame_from);
+			if retained < length {
+				last.frame_to = last.frame_from.saturating_add(retained);
+			}
+		}
+		self.committed_rows = new_committed;
+	}
+
 	fn record_epoch_commit(&mut self, epoch: u32, frame_from: u16, frame_to: u16) {
 		let native_from = self.committed_rows;
 		if let Some(last) = self.epoch_commits.last_mut()
@@ -1662,7 +1797,7 @@ impl<W: Write> Renderer<W> {
 		viewport_height: u16,
 		stable_rows: u16,
 	) -> io::Result<PaintStats> {
-		self.full_paint(next, viewport_height, stable_rows, "", CLEAR_VIEWPORT)
+		self.full_paint(next, viewport_height, stable_rows, "", CLEAR_VIEWPORT, true)
 	}
 
 	fn initial_paint_overlaid(
@@ -1672,7 +1807,7 @@ impl<W: Write> Renderer<W> {
 		stable_rows: u16,
 		layers: &[ResolvedLayer<'_>],
 	) -> io::Result<PaintStats> {
-		self.paint_full(next, viewport_height, stable_rows, "", CLEAR_VIEWPORT, layers)
+		self.paint_full(next, viewport_height, stable_rows, "", CLEAR_VIEWPORT, true, layers)
 	}
 
 	fn full_paint(
@@ -1682,8 +1817,17 @@ impl<W: Write> Renderer<W> {
 		stable_rows: u16,
 		leading_sequence: &str,
 		clear_sequence: &str,
+		copy_screen_to_scrollback: bool,
 	) -> io::Result<PaintStats> {
-		self.paint_full(next, viewport_height, stable_rows, leading_sequence, clear_sequence, &[])
+		self.paint_full(
+			next,
+			viewport_height,
+			stable_rows,
+			leading_sequence,
+			clear_sequence,
+			copy_screen_to_scrollback,
+			&[],
+		)
 	}
 
 	fn paint_full(
@@ -1693,6 +1837,7 @@ impl<W: Write> Renderer<W> {
 		stable_rows: u16,
 		leading_sequence: &str,
 		clear_sequence: &str,
+		copy_screen_to_scrollback: bool,
 		layers: &[ResolvedLayer<'_>],
 	) -> io::Result<PaintStats> {
 		let layout = layout(next.size().height, viewport_height, stable_rows, 0);
@@ -1744,7 +1889,7 @@ impl<W: Write> Renderer<W> {
 		output.push_str(HIDE_CURSOR);
 		output.push_str(leading_sequence);
 		output.push_str(RESET_STYLE);
-		if self.screen_to_scrollback && clear_sequence == CLEAR_VIEWPORT {
+		if copy_screen_to_scrollback && self.screen_to_scrollback && clear_sequence == CLEAR_VIEWPORT {
 			output.push_str(SCREEN_TO_SCROLLBACK);
 		}
 		output.push_str(clear_sequence);
@@ -3419,7 +3564,7 @@ mod tests {
 		REBUILD_HISTORY, ResolvedLayer, SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END, VIEWPORT_BOTTOM,
 	};
 	use crate::{
-		Color, Frame, Graphics, Renderer, Size, Style,
+		Color, Frame, Graphics, Renderer, ResizeScrollbackMode, Size, Style,
 		overlay::{Layer, OverlayAnchor, OverlayOptions},
 		test_support::TerminalModel,
 	};
@@ -4621,7 +4766,7 @@ mod tests {
 	#[test]
 	fn multiplexer_first_rebuild_keeps_existing_shell_history() {
 		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_preserve_resize_history(true);
+		renderer.set_resize_in_place(true);
 		let mut terminal = TerminalModel::new(8, 2);
 		terminal.history.push("shell-output".to_owned());
 		renderer
@@ -4635,9 +4780,44 @@ mod tests {
 	}
 
 	#[test]
+	fn resize_scrollback_append_replays_without_erasing_history() {
+		let mut renderer = Renderer::new(Vec::new());
+		renderer.set_resize_in_place(true);
+		renderer.set_resize_scrollback(ResizeScrollbackMode::Append);
+		renderer
+			.present(document_at_width(8, &["r0", "r1", "r2", "r3"]), 2, 4)
+			.unwrap();
+		renderer.writer_mut().clear();
+
+		renderer
+			.rebuild(document_at_width(6, &["r0", "r1", "r2", "r3"]), 2, 4, "")
+			.unwrap();
+		let output = String::from_utf8(renderer.writer_mut().clone()).unwrap();
+		assert!(output.contains("\x1b[2J"));
+		assert!(!output.contains("\x1b[3J"));
+	}
+
+	#[test]
+	fn resize_scrollback_rebuild_erases_history_before_replay() {
+		let mut renderer = Renderer::new(Vec::new());
+		renderer.set_resize_in_place(true);
+		renderer.set_resize_scrollback(ResizeScrollbackMode::Rebuild);
+		renderer
+			.present(document_at_width(8, &["r0", "r1", "r2", "r3"]), 2, 4)
+			.unwrap();
+		renderer.writer_mut().clear();
+
+		renderer
+			.rebuild(document_at_width(6, &["r0", "r1", "r2", "r3"]), 2, 4, "")
+			.unwrap();
+		let output = String::from_utf8(renderer.writer_mut().clone()).unwrap();
+		assert_eq!(output.matches("\x1b[3J").count(), 1);
+	}
+
+	#[test]
 	fn multiplexer_width_epoch_preserves_history_and_queued_output() {
 		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_preserve_resize_history(true);
+		renderer.set_resize_in_place(true);
 		let mut terminal = TerminalModel::new(8, 3);
 		renderer
 			.present(document_at_width(8, &["old00", "old01", "old02", "old03", "old04"]), 3, 4)
@@ -4685,7 +4865,7 @@ mod tests {
 	#[test]
 	fn width_epoch_maps_non_prefix_append_before_trailing_root() {
 		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_preserve_resize_history(true);
+		renderer.set_resize_in_place(true);
 		let mut terminal = TerminalModel::new(8, 2);
 		renderer
 			.present(document_at_width(8, &["h0", "h1", "live", "footer"]), 2, 2)
@@ -4715,9 +4895,48 @@ mod tests {
 	}
 
 	#[test]
+	fn multiplexer_height_only_shrink_and_grow_preserve_the_commit_ledger() {
+		let mut renderer = Renderer::new(Vec::new());
+		renderer.set_resize_in_place(true);
+		let frame = document_at_width(8, &["r0", "r1", "r2", "r3", "r4", "r5", "r6"]);
+		renderer.present(frame.clone(), 3, 7).unwrap();
+		assert_eq!(renderer.committed_rows(), 4);
+
+		renderer.rebuild(frame.clone(), 2, 7, "").unwrap();
+		assert_eq!(renderer.committed_rows(), 4, "height shrink does not rewrite the tape ledger");
+
+		renderer.rebuild(frame, 3, 7, "").unwrap();
+		assert_eq!(
+			renderer.committed_rows(),
+			4,
+			"the grow pulls the uncommitted row pushed at the scrollback tail first",
+		);
+	}
+
+	#[test]
+	fn height_grow_uncommits_rows_after_a_commit_buries_the_pushed_tail() {
+		let mut renderer = Renderer::new(Vec::new());
+		renderer.set_resize_in_place(true);
+		let initial = document_at_width(8, &["r0", "r1", "r2", "r3", "r4", "r5", "r6"]);
+		renderer.present(initial.clone(), 3, 7).unwrap();
+		renderer.rebuild(initial, 2, 7, "").unwrap();
+
+		let grown = document_at_width(8, &["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]);
+		renderer.present(grown.clone(), 2, 8).unwrap();
+		assert_eq!(renderer.committed_rows(), 5);
+
+		renderer.rebuild(grown, 3, 8, "").unwrap();
+		assert_eq!(
+			renderer.committed_rows(),
+			4,
+			"a later commit buried the pane-pushed row, so the grow pulled a committed row",
+		);
+	}
+
+	#[test]
 	fn width_epoch_separates_host_height_shrink_from_append_overflow() {
 		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_preserve_resize_history(true);
+		renderer.set_resize_in_place(true);
 		let mut terminal = TerminalModel::new(8, 4);
 		let initial = ["r0", "r1", "r2", "r3", "r4", "r5", "r6"];
 		renderer
@@ -4749,7 +4968,7 @@ mod tests {
 	#[test]
 	fn width_epoch_backfills_finalized_growth_under_an_overlay() {
 		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_preserve_resize_history(true);
+		renderer.set_resize_in_place(true);
 		let mut terminal = TerminalModel::new(8, 3);
 		renderer
 			.present(document_at_width(8, &["p0", "p1", "p2", "p3", "p4"]), 3, 2)
@@ -4807,7 +5026,7 @@ mod tests {
 
 		let mut renderer = Renderer::new(Vec::new());
 		renderer.set_graphics(Graphics::KittyDirect);
-		renderer.set_preserve_resize_history(true);
+		renderer.set_resize_in_place(true);
 		renderer.register_image(7, vec![1, 2, 3]).unwrap();
 		renderer.present(image_frame(4), 3, 0).unwrap();
 		renderer.writer_mut().clear();

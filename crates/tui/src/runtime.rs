@@ -169,9 +169,13 @@ impl ImageLoader {
 		width: u16,
 		height: Option<u16>,
 		trim: bool,
+		prepare_kitty: bool,
 	) {
 		let tx = self.tx.clone();
 		let _task = self.rt.spawn_blocking(move || {
+			if prepare_kitty {
+				let _ = crate::imagereg::prepare_png(&source);
+			}
 			let state = crate::components::decode_source(&source, width, height, trim);
 			let _ = tx.send(Msg::ImageDecoded { slot, state });
 		});

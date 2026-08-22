@@ -110,6 +110,8 @@ pub enum NotifyProtocol {
 pub struct TerminalCaps {
 	/// Detected terminal emulator.
 	pub id: TerminalId,
+	/// Whether the terminal supports 24-bit RGB SGR colors.
+	pub true_color: bool,
 	/// Glyph capability tier inferred from the emulator (`OMP_TUI_CHARSET`
 	/// overrides).
 	pub charset: crate::Charset,
@@ -881,6 +883,7 @@ fn detect_terminal_id(vars: &impl Fn(&str) -> Option<String>) -> TerminalId {
 			("vscode", TerminalId::Vscode),
 			("alacritty", TerminalId::Alacritty),
 			("warpterminal", TerminalId::Warp),
+			("apple_terminal", TerminalId::Base),
 		] {
 			if program.eq_ignore_ascii_case(name) {
 				return id;
@@ -1202,6 +1205,7 @@ fn detect_with(
 	tty: bool,
 ) -> TerminalCaps {
 	let id = detect_terminal_id(vars);
+	let true_color = id != TerminalId::Base || value(vars, "WT_SESSION").is_some();
 	let inside_tmux = value(vars, "TMUX").is_some()
 		|| value(vars, "TERM").is_some_and(|term| term.to_ascii_lowercase().starts_with("tmux"));
 	let inside_multiplexer = inside_multiplexer(vars);
@@ -1234,6 +1238,7 @@ fn detect_with(
 	};
 	TerminalCaps {
 		id,
+		true_color,
 		charset: detect_charset(vars, id),
 		graphics,
 		kitty_placeholders: placeholders && graphics == Graphics::KittyPlaceholders,
@@ -1314,6 +1319,30 @@ mod tests {
 		// Context threading: apply_terminal_caps adopts the tier.
 		let ctx = crate::UiContext::default().with_terminal_caps(&ghostty);
 		assert_eq!(ctx.charset, Charset::NerdFont);
+	}
+
+	#[test]
+	fn apple_terminal_quantizes_theme_colors_to_indexed_sgr() {
+		let caps = detect(
+			&[
+				("TERM_PROGRAM", "Apple_Terminal"),
+				("TERM", "xterm-256color"),
+				("COLORTERM", "truecolor"),
+			],
+			TerminalPlatform::MacOs,
+		);
+		assert_eq!(caps.id, crate::TerminalId::Base);
+		assert!(!caps.true_color);
+
+		let context = crate::UiContext {
+			theme: crate::Theme {
+				accent: crate::Color::Rgb(0xf5, 0xe0, 0xac),
+				..crate::Theme::default()
+			},
+			..crate::UiContext::default()
+		}
+		.with_terminal_caps(&caps);
+		assert_eq!(context.theme.accent, crate::Color::Indexed(223));
 	}
 
 	#[test]

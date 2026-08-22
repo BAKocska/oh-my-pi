@@ -24,6 +24,7 @@ workspace = true
 [dependencies]
 arboard = { workspace = true }
 flume = { workspace = true }
+image = { workspace = true }
 im = { workspace = true }
 layout-rs = { workspace = true }
 mermaid-text = { workspace = true }

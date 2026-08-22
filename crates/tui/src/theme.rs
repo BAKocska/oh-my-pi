@@ -20,13 +20,24 @@ pub struct JsonTheme {
 impl JsonTheme {
 	/// Parses either omp's compact semantic palette or pi's richer `colors`
 	/// palette. Rich component slots lower onto omp's semantic tokens once at
-	/// load time, never during paint.
+	/// load time; code-fence borders that miss the contrast floor are blended
+	/// toward the theme's muted or foreground tier.
 	pub fn parse(source: &str) -> Result<Self, ThemeError> {
 		let file: ThemeFile = serde_json::from_str(source).map_err(ThemeError::Json)?;
 		let (dark, light) = if let Some(colors) = &file.colors {
 			(
-				apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Dark))?,
-				apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Light))?,
+				apply_rich(
+					colors,
+					&file.vars,
+					file.export.as_ref(),
+					Theme::for_appearance(Appearance::Dark),
+				)?,
+				apply_rich(
+					colors,
+					&file.vars,
+					file.export.as_ref(),
+					Theme::for_appearance(Appearance::Light),
+				)?,
 			)
 		} else {
 			let dark = file.dark.apply(Theme::for_appearance(Appearance::Dark))?;
@@ -105,15 +116,16 @@ struct ThemePatch {
 	ok:        Option<String>,
 	warn:      Option<String>,
 	err:       Option<String>,
-	muted:     Option<String>,
-	border:    Option<String>,
-	surface:   Option<String>,
-	hover:     Option<String>,
-	selection: Option<String>,
-	shadow:    Option<String>,
-	panel:     Option<String>,
-	secondary: Option<String>,
-	contrast:  Option<String>,
+	muted:       Option<String>,
+	border:      Option<String>,
+	code_border: Option<String>,
+	surface:     Option<String>,
+	hover:       Option<String>,
+	selection:   Option<String>,
+	shadow:      Option<String>,
+	panel:       Option<String>,
+	secondary:   Option<String>,
+	contrast:    Option<String>,
 }
 
 impl ThemePatch {
@@ -136,6 +148,7 @@ impl ThemePatch {
 		apply!(err);
 		apply!(muted);
 		apply!(border);
+		apply!(code_border);
 		apply!(surface);
 		apply!(hover);
 		apply!(selection);
@@ -150,6 +163,7 @@ impl ThemePatch {
 fn apply_rich(
 	colors: &BTreeMap<String, ColorValue>,
 	vars: &BTreeMap<String, ColorValue>,
+	export: Option<&serde_json::Value>,
 	mut theme: Theme,
 ) -> Result<Theme, ThemeError> {
 	for (slot, value) in colors {
@@ -166,9 +180,8 @@ fn apply_rich(
 			"muted" | "dim" | "thinkingText" | "toolOutput" | "toolDiffContext" | "statusLineSep" => {
 				theme.muted = color
 			},
-			"border" | "borderMuted" | "mdCodeBlockBorder" | "mdQuoteBorder" | "mdHr" => {
-				theme.border = color;
-			},
+			"mdCodeBlockBorder" => theme.code_border = color,
+			"border" | "borderMuted" | "mdQuoteBorder" | "mdHr" => theme.border = color,
 			"selectedBg" => theme.selection = color,
 			"toolPendingBg" => theme.surface = color,
 			"userMessageBg" | "customMessageBg" | "toolSuccessBg" | "statusLineBg" => {
@@ -180,6 +193,23 @@ fn apply_rich(
 			"userMessageText" | "customMessageText" => theme.contrast = color,
 			_ => {},
 		}
+	}
+	if let Some(background) = export
+		.and_then(|value| value.get("pageBg"))
+		.and_then(|value| match value {
+			serde_json::Value::String(source) => Some(ColorValue::Text(source.clone())),
+			serde_json::Value::Number(index) => {
+				index.as_u64().and_then(|index| u16::try_from(index).ok()).map(ColorValue::Index)
+			},
+			_ => None,
+		})
+		.as_ref()
+		.map(|value| resolve_color("pageBg", value, vars))
+		.transpose()?
+		.flatten()
+	{
+		theme.code_border =
+			legible_fence_border(theme.code_border, background, theme.muted, theme.fg);
 	}
 	Ok(theme)
 }
@@ -213,6 +243,56 @@ fn resolve_color(
 		}
 	}
 	Err(ThemeError::Color { token: Str::new(token), value: Str::new_static("variable cycle") })
+}
+
+const MIN_FENCE_CONTRAST: f64 = 2.4;
+
+fn color_contrast(left: Color, right: Color) -> Option<f64> {
+	let Color::Rgb(left_red, left_green, left_blue) = left else {
+		return None;
+	};
+	let Color::Rgb(right_red, right_green, right_blue) = right else {
+		return None;
+	};
+	let left = relative_luminance([left_red, left_green, left_blue]);
+	let right = relative_luminance([right_red, right_green, right_blue]);
+	let (lighter, darker) = if left > right { (left, right) } else { (right, left) };
+	Some((lighter + 0.05) / (darker + 0.05))
+}
+
+fn legible_fence_border(
+	border: Color,
+	background: Color,
+	muted: Color,
+	foreground: Color,
+) -> Color {
+	if color_contrast(border, background).is_none_or(|ratio| ratio >= MIN_FENCE_CONTRAST) {
+		return border;
+	}
+	let target = if color_contrast(muted, background)
+		.is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST)
+	{
+		muted
+	} else {
+		foreground
+	};
+	let (Color::Rgb(red, green, blue), Color::Rgb(to_red, to_green, to_blue)) = (border, target)
+	else {
+		return target;
+	};
+	for step in 1_u16..=255 {
+		let blend = |from: u8, to: u8| {
+			((u16::from(from) * (255 - step) + u16::from(to) * step + 127) / 255) as u8
+		};
+		let candidate =
+			Color::Rgb(blend(red, to_red), blend(green, to_green), blend(blue, to_blue));
+		if color_contrast(candidate, background)
+			.is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST)
+		{
+			return candidate;
+		}
+	}
+	target
 }
 
 /// Derives a stable TrueColor accent from a session name and active theme.
@@ -380,6 +460,41 @@ mod tests {
 		assert_eq!(dark.err, Color::Rgb(0xff, 0x33, 0x44));
 		assert_eq!(dark.panel, Color::Rgb(0x10, 0x12, 0x16));
 		assert!(matches!(theme.for_appearance_256(Appearance::Dark).accent, Color::Indexed(_)));
+	}
+
+	#[test]
+	fn affected_dark_theme_fence_borders_meet_contrast_floor() {
+		for (name, border, broken_border, muted, background) in [
+			("dark", "#777d88", "#3d424a", "#777d88", "#18181e"),
+			("dark-catppuccin", "#6c7086", "#313244", "#7f849c", "#1e1e2e"),
+			("dark-nord", "#616e88", "#434c5e", "#4c566a", "#2e3440"),
+			("dark-eclipse", "#67616c", "#111018", "#8b8792", "#08070d"),
+			("dark-retro", "#cc8800", "#664400", "#cc8800", "#0a0a0a"),
+		] {
+			for candidate in [border, broken_border] {
+				let source = format!(
+					r##"{{
+						"name":"{name}",
+						"colors":{{"muted":"{muted}","mdCodeBlockBorder":"{candidate}"}},
+						"export":{{"pageBg":"{background}"}}
+					}}"##
+				);
+				let theme = JsonTheme::parse(&source).expect("dark theme");
+				let resolved = theme.for_appearance(Appearance::Dark).code_border;
+				let requested = Color::parse(candidate).expect("fence border");
+				if candidate == border {
+					assert_eq!(resolved, requested, "{name} changed an already-legible border");
+				} else {
+					assert_ne!(resolved, requested, "{name} kept its illegible border");
+				}
+				let background = Color::parse(background).expect("page background");
+				let ratio = color_contrast(resolved, background).expect("RGB colors");
+				assert!(
+					ratio >= MIN_FENCE_CONTRAST,
+					"{name} fence border contrast was {ratio:.3}:1"
+				);
+			}
+		}
 	}
 
 	#[test]

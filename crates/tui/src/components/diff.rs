@@ -351,7 +351,10 @@ impl Component for DiffView {
 
 	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
 		self.render(ctx, width);
-		RichText::rows(&self.rich)
+		self
+			.props
+			.max()
+			.map_or_else(|| RichText::rows(&self.rich), |max| RichText::rows(&self.rich).min(max))
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
@@ -433,6 +436,15 @@ mod tests {
 		let frame = paint(&mut diff, 5, 2);
 		assert_eq!(frame_row_text(&frame, 0).trim_end(), "+ 한");
 		assert_eq!(frame_row_text(&frame, 1).trim_end(), "  글");
+	}
+	#[test]
+	fn max_rows_bounds_wrapped_physical_rows() {
+		let mut diff = DiffView::new().with(Prop::Max, 3_u16);
+		diff.push(DiffKind::Add, "abcdefghijklmnopqrstuvwxyz");
+		diff.push(DiffKind::Add, "another logical line");
+		let ctx = UiContext::default();
+
+		assert_eq!(diff.height(&ctx, 8), 3);
 	}
 	fn paint_with_ctx(
 		component: &mut dyn Component,

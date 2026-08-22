@@ -1,6 +1,6 @@
 //! Process-global interning of `<img src>` sources for typed image cells.
 //!
-//! [`crate::components::Img`] interns a PNG source once and paints typed
+//! [`crate::components::Img`] interns an image source once and paints typed
 //! image cells carrying the returned ID; the renderer resolves IDs it has
 //! never seen through [`bytes`] and uploads them on first reference, so
 //! applications never touch terminal image IDs. Mirrors the hyperlink
@@ -10,7 +10,11 @@
 //! cannot collide with the low IDs applications typically pass to
 //! [`crate::Renderer::register_image`].
 
-use std::{collections::HashMap, sync::LazyLock};
+use std::{
+	collections::{HashMap, HashSet},
+	io::Cursor,
+	sync::LazyLock,
+};
 
 use omp_core::{CowBytes, Str};
 use parking_lot::Mutex;
@@ -31,6 +35,7 @@ struct Registry {
 	/// missing sources are probed once, not every rebuild.
 	by_source: HashMap<Str, Option<InternedImage>>,
 	by_id:     HashMap<u32, CowBytes<'static>>,
+	converting: HashSet<Str>,
 	allocated: u32,
 }
 
@@ -38,24 +43,35 @@ static IMAGES: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry:
 
 /// Interns a PNG filesystem path or packaged `asset://login/<provider>`
 /// source, returning its stable terminal image ID and pixel dimensions.
-/// Non-PNG or unreadable sources return `None` (the half-block decoder
-/// handles those tiers separately).
+/// Non-PNG sources return `None` until [`prepare_png`] converts and caches them off
+/// the paint path. Unreadable sources are negatively cached.
 pub fn intern(source: &str) -> Option<InternedImage> {
 	let mut registry = IMAGES.lock();
 	if let Some(cached) = registry.by_source.get(source) {
 		return cached.clone();
 	}
-	let interned = load(source, registry.allocated);
-	if interned.is_some() {
-		registry.allocated += 1;
+	if registry.converting.contains(source) {
+		return None;
 	}
+	let Some(png) = source_bytes(source) else {
+		registry.by_source.insert(Str::new(source), None);
+		return None;
+	};
+	// Kitty transmissions are sent as `f=100`: PNG only. Leave other formats uncached so the
+	// component's existing off-thread loader can claim and convert them.
+	if !is_png(&png) {
+		return None;
+	}
+	let Some(interned) = make_interned(png, registry.allocated) else {
+		registry.by_source.insert(Str::new(source), None);
+		return None;
+	};
+	registry.allocated += 1;
+	registry.by_id.insert(interned.id, interned.png.clone());
 	registry
 		.by_source
-		.insert(Str::new(source), interned.clone());
-	if let Some(entry) = &interned {
-		registry.by_id.insert(entry.id, entry.png.clone());
-	}
-	interned
+		.insert(Str::new(source), Some(interned.clone()));
+	Some(interned)
 }
 
 /// PNG bytes for a registry-allocated ID, for renderer-side upload.
@@ -64,15 +80,59 @@ pub fn bytes(id: u32) -> Option<CowBytes<'static>> {
 	registry.by_id.get(&id).cloned()
 }
 
-fn load(source: &str, allocated: u32) -> Option<InternedImage> {
+fn make_interned(png: CowBytes<'static>, allocated: u32) -> Option<InternedImage> {
 	let id = 0x00ff_ffff_u32.checked_sub(allocated)?;
-	let png = source_bytes(source)?;
-	// Kitty transmissions are sent as `f=100`: PNG only.
-	if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
-		return None;
-	}
 	let dimensions = imagefmt::dimensions(&png)?;
 	Some(InternedImage { id, png, dimensions })
+}
+
+fn is_png(bytes: &[u8]) -> bool {
+	bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+}
+
+/// Returns a cached PNG form of `source`, converting supported non-PNG formats exactly once.
+///
+/// Async hosts run this through the component's off-thread decode loader. Its normal completion delivery
+/// invalidates the component and repaints the newly interned Kitty image.
+pub(crate) fn prepare_png(source: &str) -> Option<CowBytes<'static>> {
+	{
+		let mut registry = IMAGES.lock();
+		if let Some(cached) = registry.by_source.get(source) {
+			return cached.as_ref().map(|entry| entry.png.clone());
+		}
+		if !registry.converting.insert(Str::new(source)) {
+			return None;
+		}
+	}
+
+	let png = convert_to_png(source);
+	let mut registry = IMAGES.lock();
+	registry.converting.remove(source);
+	let Some(png) = png else {
+		registry.by_source.insert(Str::new(source), None);
+		return None;
+	};
+	let Some(interned) = make_interned(png, registry.allocated) else {
+		registry.by_source.insert(Str::new(source), None);
+		return None;
+	};
+	registry.allocated += 1;
+	registry.by_id.insert(interned.id, interned.png.clone());
+	registry
+		.by_source
+		.insert(Str::new(source), Some(interned.clone()));
+	Some(interned.png)
+}
+
+fn convert_to_png(source: &str) -> Option<CowBytes<'static>> {
+	let bytes = source_bytes(source)?;
+	if is_png(&bytes) {
+		return Some(bytes);
+	}
+	let image = image::load_from_memory(&bytes).ok()?;
+	let mut output = Cursor::new(Vec::new());
+	image.write_to(&mut output, image::ImageFormat::Png).ok()?;
+	Some(CowBytes::from(output.into_inner()))
 }
 
 /// Loads bytes from a filesystem path or packaged provider-logo URI.

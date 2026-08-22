@@ -17,7 +17,7 @@ type CellColors = (Option<Rgb>, Option<Rgb>);
 enum AutoBox {
 	#[default]
 	Unresolved,
-	Resolved(Option<(u32, u16, u16)>),
+	Resolved((u32, u16, u16)),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -49,13 +49,12 @@ impl ImgState {
 
 /// A terminal-rendered image backing the `<img>` markup tag.
 ///
-/// On the Kitty-placeholder graphics tier a PNG `src` renders as real pixels
-/// with no further setup: the source is interned process-wide, uploaded by
-/// the renderer on first reference, and placed in the cell box derived from
-/// `w`/`h` (aspect-derived when `h` is omitted). On every other tier, PNG
-/// and binary PPM sources decode to colored half-block cells. JPEG, GIF,
-/// and WebP sources are header-probed only: the component reserves their
-/// aspect-correct cell box and paints a themed placeholder. The `trim` flag
+/// On the Kitty-placeholder graphics tier an image `src` renders as real pixels
+/// after PNG sources are interned directly and JPEG/WebP sources convert to a
+/// process-cached PNG off-thread. The renderer uploads that PNG on first
+/// reference and places it in the cell box derived from `w`/`h`
+/// (aspect-derived when `h` is omitted). On every other tier, supported image
+/// sources decode to colored half-block cells. The `trim` flag
 /// crops fully transparent margins before half-block sampling (terminal
 /// compositors always show the full source), so padded logo sources stay
 /// visible even as tiny thumbnails.
@@ -123,12 +122,14 @@ impl Img {
 			return None;
 		}
 		if matches!(self.auto, AutoBox::Unresolved) {
-			self.auto = AutoBox::Resolved(resolve_placeholder_box(&self.props));
+			if let Some(cell_box) = resolve_placeholder_box(&self.props) {
+				self.auto = AutoBox::Resolved(cell_box);
+			}
 		}
-		let AutoBox::Resolved(cell_box) = self.auto else {
-			unreachable!("placeholder resolution was initialized");
-		};
-		cell_box
+		match self.auto {
+			AutoBox::Resolved(cell_box) => Some(cell_box),
+			AutoBox::Unresolved => None,
+		}
 	}
 
 	fn requested_width(&self, available: u16) -> u16 {
@@ -151,11 +152,14 @@ impl Img {
 		let width = self.requested_width(available);
 		let trim = self.props.flag(Prop::Trim);
 		if let Some(loader) = &ctx.loader {
-			loader.request(self.slot, source.to_str(), width, self.props.h(), trim);
+			loader.request(self.slot, source.to_str(), width, self.props.h(), trim, ctx.graphics == Graphics::KittyPlaceholders);
 			self.state.phase = Load::Loading;
 			self.state.width = width;
 			self.state.rows = 3;
 		} else {
+			if ctx.graphics == Graphics::KittyPlaceholders {
+				let _ = crate::imagereg::prepare_png(source);
+			}
 			self.state = decode_source(source, width, self.props.h(), trim);
 		}
 	}
@@ -170,7 +174,7 @@ impl Img {
 }
 
 /// Resolves an interned placeholder box from `src`, `w`, and `h` props:
-/// PNG-only, fixed-cell widths only, aspect-derived rows when `h` is
+/// PNG-backed, fixed-cell widths only, aspect-derived rows when `h` is
 /// omitted, bounded by Kitty's diacritic table.
 fn resolve_placeholder_box(props: &Props) -> Option<(u32, u16, u16)> {
 	let source = props.str_of(Prop::Src)?;
@@ -866,6 +870,41 @@ mod tests {
 			Rect::new(0, 0, 2, 1),
 		);
 		assert_ne!(frame_row_text(&cells, 0), "", "embedded logo paints half-block cells");
+	}
+
+	#[test]
+	fn jpeg_attachment_converts_once_to_cached_png_for_kitty() {
+		let path =
+			std::env::temp_dir().join(format!("omp-tui-img-kitty-jpeg-{}.jpg", std::process::id()));
+		let pixels = image::RgbImage::from_pixel(2, 2, image::Rgb([20, 40, 60]));
+		let mut jpeg = std::io::Cursor::new(Vec::new());
+		image::DynamicImage::ImageRgb8(pixels)
+			.write_to(&mut jpeg, image::ImageFormat::Jpeg)
+			.unwrap();
+		std::fs::write(&path, jpeg.into_inner()).unwrap();
+		let source = path.to_string_lossy().into_owned();
+		let ctx = UiContext { graphics: Graphics::KittyPlaceholders, ..UiContext::default() };
+
+		let mut attachment = Img::new()
+			.with(Prop::Src, source.as_str())
+			.with(Prop::W, 2_u16)
+			.with(Prop::H, 1_u16);
+		assert_eq!(attachment.height(&ctx, 2), 1);
+		let mut frame = Frame::new(Size::new(2, 1));
+		attachment.paint(
+			&mut PaintCtx::new(&mut frame, &ctx, &mut Vec::new(), &mut Vec::new()),
+			Rect::new(0, 0, 2, 1),
+		);
+		let CellContent::Image { id, .. } = frame.cell(0, 0).content else {
+			panic!("converted JPEG paints Kitty image cells");
+		};
+		let cached = crate::imagereg::bytes(id).expect("converted image is registry-cached");
+		assert!(cached.starts_with(b"\x89PNG\r\n\x1a\n"), "Kitty f=100 receives PNG bytes");
+
+		let sibling = crate::imagereg::intern(&source).expect("same source reuses cached PNG");
+		assert_eq!(sibling.id, id);
+		assert_eq!(sibling.png.as_ptr(), cached.as_ptr(), "cache avoids a second conversion");
+		std::fs::remove_file(path).unwrap();
 	}
 
 	#[test]

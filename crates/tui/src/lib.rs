@@ -96,10 +96,10 @@ pub use overlay::{Layer, OverlayAnchor, OverlayBand, OverlayId, OverlayMargin, O
 pub use paste::{Pasted, PastedImage};
 pub use props::{Prop, PropValue, Props};
 pub use pump::{DebugOp, DebugQuery, TerminalEvent};
-pub use renderer::{OutputState, PaintStats, Renderer};
+pub use renderer::{OutputState, PaintStats, Renderer, ResizeScrollbackMode};
 pub use rich::{
 	Clip, Measure, Pipeline, Prefix, Prefixed, Restyle, RichSink, RichText, Rows, Tee, Wrap,
-	decompose,
+	cell_width, decompose,
 };
 pub use runtime::{App, AppEnv, AppEvent, AppOptions, ImageLoader, UiHandle, is_core_chord};
 pub use terminal::{AltScreenUse, CursorStyle, Progress, Terminal, TerminalOptions};

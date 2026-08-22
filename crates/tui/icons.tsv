@@ -219,7 +219,7 @@ crutch	object.crutch	crutch	🩼	
 crying-cat	status.cryingCat	cry	😿	
 crying-face	object.cryingFace	:'(	😢	
 crystal-ball	object.crystalBall	orb	🔮	󰬯
-csharp	lang.csharp	cs	♯	
+csharp	lang.csharp	cs	♯	
 css	lang.css	css	🎨	
 csv	lang.csv	csv	📑	󰈛
 csv-file	file.csv	[csv]	📊	
@@ -295,6 +295,7 @@ exa	tool.exa	exa	🔭	
 exclamation-question	status.exclamationQuestion	!?	⁉	
 exit	nav.exit	exit	🚪	
 expand	action.expand	<>	↔	
+extension-command	cmd.extension	EX	🧩	
 external	nav.external	ext	↗	
 eye	object.eye	eye	👁	
 eye-off	object.eyeOff	eye-off	🙈	

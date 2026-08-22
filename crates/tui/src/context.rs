@@ -392,6 +392,8 @@ pub struct Theme {
 	pub muted:     Color,
 	/// Container borders and rules; dimmer than `fg`, brighter than `surface`.
 	pub border:    Color,
+	/// Markdown code-fence rows, kept legible against the theme page background.
+	pub code_border: Color,
 	/// Neutral chip / button fill.
 	pub surface:   Color,
 	/// Hover row tint.
@@ -420,6 +422,7 @@ impl Default for Theme {
 			err:       Color::Rgb(0xe0, 0x6c, 0x75),
 			muted:     Color::Rgb(0x5c, 0x63, 0x70),
 			border:    Color::Rgb(0x45, 0x4b, 0x58),
+			code_border: Color::Rgb(0x5c, 0x63, 0x70),
 			surface:   Color::Rgb(0x3a, 0x3f, 0x4b),
 			hover:     Color::Rgb(0x2c, 0x31, 0x3a),
 			selection: Color::Rgb(0x36, 0x4c, 0x61),
@@ -443,6 +446,7 @@ impl Theme {
 			err:       self.err.quantized_256(),
 			muted:     self.muted.quantized_256(),
 			border:    self.border.quantized_256(),
+			code_border: self.code_border.quantized_256(),
 			surface:   self.surface.quantized_256(),
 			hover:     self.hover.quantized_256(),
 			selection: self.selection.quantized_256(),
@@ -465,6 +469,7 @@ impl Theme {
 				err:       Color::Rgb(0xe0, 0x6c, 0x75),
 				muted:     Color::Rgb(0x5c, 0x63, 0x70),
 				border:    Color::Rgb(0x45, 0x4b, 0x58),
+				code_border: Color::Rgb(0x5c, 0x63, 0x70),
 				surface:   Color::Rgb(0x3a, 0x3f, 0x4b),
 				hover:     Color::Rgb(0x2c, 0x31, 0x3a),
 				selection: Color::Rgb(0x36, 0x4c, 0x61),
@@ -482,6 +487,7 @@ impl Theme {
 				err:       Color::Rgb(0xb0, 0x24, 0x32),
 				muted:     Color::Rgb(0x6b, 0x70, 0x78),
 				border:    Color::Rgb(0xd0, 0xd7, 0xde),
+				code_border: Color::Rgb(0x6b, 0x70, 0x78),
 				surface:   Color::Rgb(0xe2, 0xe5, 0xea),
 				hover:     Color::Rgb(0xed, 0xef, 0xf2),
 				selection: Color::Rgb(0xc2, 0xda, 0xed),
@@ -506,6 +512,7 @@ impl Theme {
 			"err" => self.err,
 			"muted" => self.muted,
 			"border" => self.border,
+			"code_border" => self.code_border,
 			"surface" => self.surface,
 			"hover" => self.hover,
 			"selection" => self.selection,
@@ -528,6 +535,7 @@ impl Theme {
 				| "panel"
 				| "secondary"
 				| "border"
+				| "code_border"
 				| "surface"
 				| "hover"
 				| "selection"
@@ -618,8 +626,8 @@ impl UiContext {
 		crate::rich::set_jamo_width(width)
 	}
 
-	/// Applies the detected terminal's capabilities: graphics tier, glyph
-	/// charset, Compatibility Jamo policy, and background appearance.
+	/// Applies the detected terminal's capabilities: graphics tier, color
+	/// depth, glyph charset, Compatibility Jamo policy, and background appearance.
 	///
 	/// Capability values are `0` for platform default, `1` for narrow, and `2`
 	/// for wide.
@@ -635,6 +643,11 @@ impl UiContext {
 				self.theme = Theme::for_appearance(appearance);
 				changed = true;
 			}
+		}
+		if !caps.true_color {
+			let theme = self.theme.quantized_256();
+			changed |= theme != self.theme;
+			self.theme = theme;
 		}
 		changed
 	}
@@ -682,7 +695,18 @@ mod tests {
 		let light = Theme::for_appearance(Appearance::Light);
 		assert_ne!(dark, light);
 		for token in [
-			"fg", "accent", "info", "ok", "warn", "err", "muted", "surface", "hover", "shadow",
+			"fg",
+			"accent",
+			"info",
+			"ok",
+			"warn",
+			"err",
+			"muted",
+			"border",
+			"code_border",
+			"surface",
+			"hover",
+			"shadow",
 			"contrast",
 		] {
 			assert!(dark.token(token).is_some(), "dark palette misses {token}");

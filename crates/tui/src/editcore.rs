@@ -19,13 +19,14 @@ use smallvec::SmallVec;
 use xutf::Text;
 
 use crate::{
+	Icon,
 	input::{Key, sanitize_paste},
 	rich::cell_width,
 };
 
 const KILL_CAP: usize = 60;
 const UNDO_CAP: usize = 100;
-const PICKER_ROWS: usize = 5;
+const PICKER_ROWS: usize = 10;
 const MAX_INPUT_ROWS: usize = 16;
 const MAX_EMOJI_SUGGESTIONS: usize = 12;
 const HISTORY_CAPACITY: usize = 100;
@@ -1376,6 +1377,7 @@ pub struct Suggestion {
 	value:       Str,
 	display:     SuggestionDisplay,
 	description: Option<Str>,
+	icon:        Option<Icon>,
 	hint:        Option<Str>,
 	category:    Option<Str>,
 	match_spans: SmallVec<(u16, u16), 8>,
@@ -1389,6 +1391,7 @@ impl Suggestion {
 			value:       insert.into_str(),
 			display:     SuggestionDisplay::Text(label.into_str()),
 			description: None,
+			icon:        None,
 			hint:        None,
 			category:    None,
 			match_spans: SmallVec::new(),
@@ -1399,6 +1402,17 @@ impl Suggestion {
 	pub fn with_description(mut self, description: impl IntoStr) -> Self {
 		self.description = Some(description.into_str());
 		self
+	}
+
+	/// Assigns a semantic type-indicator icon.
+	pub const fn with_icon(mut self, icon: Icon) -> Self {
+		self.icon = Some(icon);
+		self
+	}
+
+	/// Returns the semantic type-indicator icon.
+	pub const fn icon(&self) -> Option<Icon> {
+		self.icon
 	}
 
 	/// Ghost text shown after the cursor while this row is selected.
@@ -1537,7 +1551,7 @@ pub struct Picker {
 }
 
 impl Picker {
-	/// Returns the centered five-row suggestion window and its first index.
+	/// Returns the centered ten-row suggestion window and its first index.
 	pub fn visible_suggestions(&self) -> (usize, &[Suggestion]) {
 		let visible = self.suggestions.len().min(PICKER_ROWS);
 		let max_start = self.suggestions.len().saturating_sub(visible);
@@ -1674,7 +1688,7 @@ impl Editor {
 			self
 				.picker
 				.as_ref()
-				.map_or(0, |picker| picker.visible_rows().len()),
+				.map_or(0, |picker| picker.visible_rows().len().min(PICKER_ROWS)),
 		)
 		.unwrap_or(u16::MAX)
 	}
@@ -2110,6 +2124,7 @@ pub struct Command {
 	name:         Str,
 	description:  Str,
 	aliases:      SmallVec<Str, 1>,
+	icon:         Option<Icon>,
 	args:         Box<[CommandArg]>,
 	hint:         Option<Str>,
 	dynamic_args: Option<Arc<dyn Fn(&str) -> Box<[CommandArgument]> + Send + Sync>>,
@@ -2141,11 +2156,18 @@ impl Command {
 			name:         Str::new(name),
 			description:  Str::new(description),
 			aliases:      aliases.iter().map(Str::new).collect(),
+			icon:         None,
 			args:         Box::default(),
 			hint:         None,
 			dynamic_args: None,
 			status:       None,
 		}
+	}
+
+	/// Assigns a semantic type-indicator icon resolved by the active charset.
+	pub const fn with_icon(mut self, icon: Icon) -> Self {
+		self.icon = Some(icon);
+		self
 	}
 
 	/// Supplies live argument candidates. The provider runs only while this
@@ -2204,12 +2226,21 @@ impl Command {
 /// (pi `buildSubcommandInlineHint`).
 pub struct SlashCommands {
 	commands: Box<[Command]>,
+	usage:    Option<Arc<dyn Fn(&str) -> u64 + Send + Sync>>,
 }
 
 impl SlashCommands {
 	/// Wraps a command palette for [`Editor::set_completion`].
 	pub fn new(commands: impl Into<Box<[Command]>>) -> Self {
-		Self { commands: commands.into() }
+		Self { commands: commands.into(), usage: None }
+	}
+	/// Ranks equally matching command names by their persisted invocation count.
+	pub fn with_usage(
+		mut self,
+		usage: impl Fn(&str) -> u64 + Send + Sync + 'static,
+	) -> Self {
+		self.usage = Some(Arc::new(usage));
+		self
 	}
 
 	fn find(&self, name: &str) -> Option<&Command> {
@@ -2220,6 +2251,7 @@ impl SlashCommands {
 	}
 
 	fn name_suggestions(&self, line_start: usize, line: &str) -> Option<Suggestions> {
+		const SKILL_NAMESPACE: &str = "skill:";
 		let trimmed = line.trim_start_matches([' ', '\t']);
 		let body = trimmed.strip_prefix('/')?;
 		if body.contains('/') {
@@ -2232,8 +2264,22 @@ impl SlashCommands {
 		}) {
 			return None;
 		}
-		let mut ranked: SmallVec<(u16, Suggestion), 8> = SmallVec::new();
+		let expand_skills = query.starts_with(SKILL_NAMESPACE);
+		let skill_count = self
+			.commands
+			.iter()
+			.filter(|command| command.name.starts_with(SKILL_NAMESPACE))
+			.count();
+		let skill_icon = self
+			.commands
+			.iter()
+			.find(|command| command.name.starts_with(SKILL_NAMESPACE))
+			.and_then(|command| command.icon);
+		let mut ranked: SmallVec<(u16, u64, Suggestion), 8> = SmallVec::new();
 		for command in &self.commands {
+			if !expand_skills && command.name.starts_with(SKILL_NAMESPACE) {
+				continue;
+			}
 			let mut selected_name = &command.name;
 			let mut score = command_score(&query, &command.name);
 			for alias in &command.aliases {
@@ -2246,25 +2292,46 @@ impl SlashCommands {
 			let description_score = fuzzy_score(&query, &command.description.to_ascii_lowercase()) / 2;
 			score = score.max(description_score);
 			if score > 0 {
-				ranked.push((score, Suggestion {
-					value:       sf!("/{selected_name} "),
-					display:     SuggestionDisplay::Text(selected_name.clone()),
-					description: Some(
-						command
-							.status
-							.as_ref()
-							.map_or_else(|| command.description.clone(), |status| status()),
-					),
-					hint:        command.hint.clone(),
-					category:    Some(sf!("Commands")),
-					match_spans: fuzzy_match_spans(selected_name, &query),
-				}));
+				ranked.push((
+					score,
+					self.usage.as_ref().map_or(0, |usage| usage(&command.name)),
+					Suggestion {
+						value:       sf!("/{selected_name} "),
+						display:     SuggestionDisplay::Text(selected_name.clone()),
+						description: Some(command.status.as_ref().map_or_else(
+							|| command.description.clone(),
+							|status| status(),
+						)),
+						icon:        command.icon,
+						hint:        command.hint.clone(),
+						category:    Some(sf!("Commands")),
+						match_spans: fuzzy_match_spans(selected_name, &query),
+					},
+				));
 			}
 		}
-		ranked.sort_by_key(|(score, _)| Reverse(*score));
+		if !expand_skills && skill_count > 0 && SKILL_NAMESPACE.starts_with(&query) {
+			ranked.push((
+				command_score(&query, SKILL_NAMESPACE),
+				0,
+				Suggestion {
+					value:       sf!("/skill:"),
+					display:     SuggestionDisplay::Text(sf!("skill:")),
+					description: Some(sf!(
+						"{skill_count} skill{}",
+						if skill_count == 1 { "" } else { "s" }
+					)),
+					icon:        skill_icon,
+					hint:        None,
+					category:    Some(sf!("Commands")),
+					match_spans: fuzzy_match_spans(SKILL_NAMESPACE, &query),
+				},
+			));
+		}
+		ranked.sort_by_key(|(score, usage, _)| (Reverse(*score), Reverse(*usage)));
 		let items = ranked
 			.into_iter()
-			.map(|(_, suggestion)| suggestion)
+			.map(|(_, _, suggestion)| suggestion)
 			.collect::<SuggestionList>();
 		(!items.is_empty()).then_some(Suggestions { prefix_start, items })
 	}
@@ -2316,6 +2383,7 @@ impl SlashCommands {
 					},
 					display:     SuggestionDisplay::Text(arg.value.clone()),
 					description: Some(arg.description.clone()),
+					icon:        None,
 					hint:        arg.usage.clone(),
 					category:    Some(sf!("Arguments")),
 					match_spans: fuzzy_match_spans(&arg.value, &query),
@@ -2409,6 +2477,9 @@ impl EditorCompletion for SlashCommands {
 		let line_start = before.rfind('\n').map_or(0, |index| index + 1);
 		let line = &before[line_start..];
 		let body = line.trim_start_matches([' ', '\t']).strip_prefix('/')?;
+		if body.starts_with("skill:") && !body.contains(char::is_whitespace) {
+			return self.name_suggestions(line_start, line);
+		}
 		match body.find(|ch: char| ch.is_whitespace() || ch == ':') {
 			Some(delimiter) => self.argument_suggestions(cursor, body, delimiter),
 			None => self.name_suggestions(line_start, line),
@@ -2475,6 +2546,7 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 				value:       sf!(emoji),
 				display:     SuggestionDisplay::Emoji { emoji, shortcode: pattern },
 				description: None,
+				icon:        None,
 				hint:        None,
 				category:    Some(sf!("Emoji")),
 				match_spans: SmallVec::new(),
@@ -2492,6 +2564,7 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 				value:       sf!(entry[1]),
 				display:     SuggestionDisplay::Emoji { emoji: entry[1], shortcode: entry[0] },
 				description: None,
+				icon:        None,
 				hint:        None,
 				category:    Some(sf!("Emoji")),
 				match_spans: SmallVec::new(),
@@ -2720,6 +2793,83 @@ mod tests {
 		assert_eq!(editor.handle_key(key(Key::Down)), EditOutcome::Changed);
 		assert_eq!(editor.handle_key(key(Key::Enter)), EditOutcome::Changed);
 		assert_eq!(editor.text(), "/settings ");
+	}
+	#[test]
+	fn command_frequency_breaks_equal_text_score_ties() {
+		let mut usage = HashMap::new();
+		usage.insert("settings", 4_u64);
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(
+			SlashCommands::new(palette()).with_usage(move |name| usage.get(name).copied().unwrap_or(0)),
+		));
+		type_text(&mut editor, "/se");
+		let picker = editor.picker().expect("command candidates open");
+		assert_eq!(picker.suggestions[picker.selected].value(), "/settings ");
+	}
+
+	#[test]
+	fn skill_namespace_collapses_then_chains_to_individual_skills() {
+		let commands = vec![
+			Command::new("settings", "Open settings", &[]),
+			Command::new("skill:review", "Review code", &[]).with_icon(Icon::Skill),
+			Command::new("skill:test", "Run focused tests", &[]).with_icon(Icon::Skill),
+		];
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(SlashCommands::new(commands)));
+		type_text(&mut editor, "/");
+		let picker = editor.picker().expect("namespace candidates open");
+		assert!(
+			picker.suggestions.iter().any(|item| item.value() == "/skill:"),
+			"collapsed namespace is offered"
+		);
+		assert!(
+			picker
+				.suggestions
+				.iter()
+				.all(|item| !item.value().starts_with("/skill:") || item.value() == "/skill:"),
+			"individual skills stay collapsed"
+		);
+
+		type_text(&mut editor, "skill:");
+		let picker = editor.picker().expect("skill candidates expand");
+		assert_eq!(
+			picker
+				.suggestions
+				.iter()
+				.map(|item| item.value().as_str())
+				.collect::<Vec<_>>(),
+			["/skill:review ", "/skill:test "]
+		);
+		assert!(picker.suggestions.iter().all(|item| item.icon() == Some(Icon::Skill)));
+	}
+
+	#[test]
+	fn accepting_skill_namespace_reopens_completion_without_a_space() {
+		let commands = vec![Command::new("skill:review", "Review code", &[])];
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(SlashCommands::new(commands)));
+		type_text(&mut editor, "/");
+		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
+		assert_eq!(editor.text(), "/skill:");
+		assert_eq!(editor.picker().expect("skill candidates reopen").len(), 1);
+	}
+	#[test]
+	fn command_picker_defaults_to_ten_visible_suggestions() {
+		let commands = (0..12)
+			.map(|index| Command::new(&format!("command-{index}"), "command", &[]))
+			.collect::<Vec<_>>();
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(SlashCommands::new(commands)));
+		type_text(&mut editor, "/");
+		assert_eq!(
+			editor
+				.picker()
+				.expect("command candidates open")
+				.visible_suggestions()
+				.1
+				.len(),
+			10
+		);
 	}
 
 	#[test]

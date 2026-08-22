@@ -64,13 +64,7 @@ pub fn width_config_epoch() -> u64 {
 	WIDTH_CONFIG_EPOCH.load(Ordering::Relaxed)
 }
 
-/// Visible width saturated to `u16::MAX`.
-///
-/// `xutf` supplies cluster-aware Unicode widths and treats East Asian
-/// Ambiguous characters as narrow. Compatibility Jamo are corrected by the
-/// delta from `xutf`'s own per-character classification to the active terminal
-/// policy; U+3164 HANGUL FILLER always remains zero-width.
-pub fn cell_width(text: &str) -> u16 {
+fn plain_cell_width(text: &str) -> u16 {
 	if text.is_ascii() && text.bytes().all(|byte| !byte.is_ascii_control()) {
 		return u16::try_from(text.len()).unwrap_or(u16::MAX);
 	}
@@ -95,6 +89,38 @@ pub fn cell_width(text: &str) -> u16 {
 		width = width.saturating_sub(unicode_width).saturating_add(target);
 	}
 	u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+/// Visible width saturated to `u16::MAX`.
+///
+/// `xutf` supplies cluster-aware Unicode widths and treats East Asian
+/// Ambiguous characters as narrow. Compatibility Jamo are corrected by the
+/// delta from `xutf`'s own per-character classification to the active terminal
+/// policy; U+3164 HANGUL FILLER always remains zero-width. APC strings
+/// (`ESC _ ... ST|BEL`), including Kitty placement commands and cursor
+/// markers, occupy no terminal cells.
+pub fn cell_width(text: &str) -> u16 {
+	let Some(mut start) = text.find("\x1b_") else {
+		return plain_cell_width(text);
+	};
+	let mut width = plain_cell_width(&text[..start]);
+	loop {
+		let payload = start + 2;
+		let tail = &text[payload..];
+		let bell = tail.find('\x07').map(|end| payload + end + 1);
+		let st = tail.find("\x1b\\").map(|end| payload + end + 2);
+		let end = match (bell, st) {
+			(Some(bell), Some(st)) => bell.min(st),
+			(Some(bell), None) => bell,
+			(None, Some(st)) => st,
+			(None, None) => return width,
+		};
+		let Some(relative) = text[end..].find("\x1b_") else {
+			return width.saturating_add(plain_cell_width(&text[end..]));
+		};
+		start = end + relative;
+		width = width.saturating_add(plain_cell_width(&text[end..start]));
+	}
 }
 
 fn emit_spaces(sink: &mut dyn RichSink, style: Style, mut count: u16) {
@@ -1387,6 +1413,16 @@ mod tests {
 		}
 		assert_eq!(texts(&output), ["ab"]);
 	}
+	#[test]
+	fn apc_sequences_occupy_zero_cells() {
+		assert_eq!(cell_width("\x1b_Ga=p,U=1,i=7,p=7,c=9,r=4\x1b\\"), 0);
+		assert_eq!(cell_width("x\x1b_cursor-marker\x07y"), 2);
+		assert_eq!(
+			cell_width("\x1b_Ga=p,i=1\x1b\\a\x1b_Ga=p,i=2\x1b\\b"),
+			2,
+		);
+	}
+
 	#[test]
 	fn jamo_profiles_filler_and_ambiguous_widths() {
 		let original = jamo_width();

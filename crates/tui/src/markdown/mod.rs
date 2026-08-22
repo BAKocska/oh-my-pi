@@ -113,7 +113,7 @@ impl MdTheme {
 			emphasis: Style::new().fg(theme.fg).italic(),
 			code: Style::new().fg(theme.warn).bg(theme.hover),
 			code_block,
-			code_border: Style::new().fg(theme.border),
+			code_border: Style::new().fg(theme.code_border),
 			quote: Style::new().fg(theme.muted).dim().italic(),
 			bullet: Style::new().fg(theme.info),
 			link: Style::new().fg(theme.accent).underline(),
@@ -1707,6 +1707,23 @@ mod tests {
 		(0..RichText::rows(&rendered))
 			.map(|row| rendered.row_text(row).to_owned())
 			.collect()
+	}
+
+	#[test]
+	fn fence_info_row_uses_dedicated_theme_border() {
+		let fence = Color::Rgb(0x61, 0x6e, 0x88);
+		let theme = Theme {
+			border: Color::Rgb(0x43, 0x4c, 0x5e),
+			code_border: fence,
+			..Theme::default()
+		};
+		let rendered = rendered("```rust\nlet value = 1;\n```", 80, &MdTheme::from_theme(&theme));
+		assert_eq!(rendered.row_text(0), "```rust");
+		assert!(
+			rendered
+				.row_runs(0)
+				.all(|(style, _)| style.foreground_color() == fence)
+		);
 	}
 
 	const GEMINI_SOAK_RESULTS: &str = "=== PACED IP ROTATION SOAK RESULTS ===\nTotal Queries: \

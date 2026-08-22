@@ -24,6 +24,7 @@ use crate::{
 	input::{Key, Mouse, UiEvent, byte_at_column, sanitize_paste},
 	markup::Border,
 	props::{Prop, PropValue, Props},
+	rich::cell_width,
 	syntax::{SyntaxRun, highlight_xml, xml_comment_state},
 };
 /// Built-in composer chrome selected by the `composer.shape` setting.
@@ -363,17 +364,70 @@ impl EditInput {
 				.max(1),
 		)
 	}
+	fn picker_icon_width(&self, ctx: &UiContext) -> u16 {
+		self
+			.editor
+			.picker()
+			.into_iter()
+			.flat_map(|picker| picker.visible_suggestions().1)
+			.filter_map(|suggestion| suggestion.icon())
+			.map(|icon| cell_width(ctx.charset.icon(icon)))
+			.max()
+			.unwrap_or_default()
+	}
+
+	fn picker_height(&self, ctx: &UiContext, width: u16) -> u16 {
+		const MAX_ROWS: u16 = 10;
+		let Some(picker) = self.editor.picker() else {
+			return 0;
+		};
+		let icon_width = self.picker_icon_width(ctx);
+		let mut rows = 0_u16;
+		for picker_row in picker.visible_rows() {
+			if rows >= MAX_ROWS {
+				break;
+			}
+			let height = match picker_row {
+				PickerRow::Header(_) => 1,
+				PickerRow::Suggestion { suggestion, .. } => {
+					let label_width = match suggestion.display() {
+						SuggestionDisplay::Text(label) => cell_width(label),
+						SuggestionDisplay::Emoji { emoji, shortcode } => cell_width(emoji)
+							.saturating_add(cell_width(shortcode))
+							.saturating_add(3),
+					};
+					let description_width = width
+						.saturating_sub(cell_width(ctx.charset.cursor()))
+						.saturating_sub(icon_width.saturating_add(u16::from(icon_width > 0)))
+						.saturating_sub(label_width)
+						.saturating_sub(2);
+					if suggestion
+						.description()
+						.is_some_and(|description| cell_width(description) > description_width)
+						&& description_width > 0
+					{
+						2
+					} else {
+						1
+					}
+				},
+			};
+			rows = rows.saturating_add(height.min(MAX_ROWS - rows));
+		}
+		rows
+	}
 
 	fn paint_picker(&self, pc: &mut PaintCtx<'_>, rect: Rect, y: u16) {
+		const MAX_ROWS: u16 = 10;
 		let Some(picker) = self.editor.picker() else {
 			return;
 		};
-		for (offset, picker_row) in picker.visible_rows().into_iter().enumerate() {
-			let Ok(offset) = u16::try_from(offset) else {
-				break;
-			};
+		let right = rect.x.saturating_add(rect.width);
+		let icon_width = self.picker_icon_width(pc.ctx);
+		let mut offset = 0_u16;
+		for picker_row in picker.visible_rows() {
 			let row = y.saturating_add(offset);
-			if row >= pc.clip {
+			if offset >= MAX_ROWS || row >= pc.clip || row >= rect.y.saturating_add(rect.height) {
 				break;
 			}
 			let PickerRow::Suggestion { index, suggestion } = picker_row else {
@@ -382,6 +436,7 @@ impl EditInput {
 				};
 				let style = Style::new().fg(pc.ctx.theme.border).bold();
 				pc.frame.put(rect.x.saturating_add(2), row, category, style);
+				offset = offset.saturating_add(1);
 				continue;
 			};
 			let selected = index == picker.selected();
@@ -400,6 +455,13 @@ impl EditInput {
 				},
 				style,
 			);
+			if icon_width > 0 {
+				let icon_start = x;
+				if let Some(icon) = suggestion.icon() {
+					pc.frame.put(x, row, pc.ctx.charset.icon(icon), style);
+				}
+				x = icon_start.saturating_add(icon_width).saturating_add(1);
+			}
 			x = match suggestion.display() {
 				SuggestionDisplay::Text(name) => {
 					Self::paint_match_text(pc, x, row, name, suggestion.match_spans(), style)
@@ -411,12 +473,46 @@ impl EditInput {
 					pc.frame.put(x, row, ":", style)
 				},
 			};
-			if let Some(description) = suggestion.description() {
-				let x = x.saturating_add(2);
-				if x < rect.x.saturating_add(rect.width) {
-					pc.frame.put(x, row, description, style);
-				}
+			offset = offset.saturating_add(1);
+			let Some(description) = suggestion.description() else {
+				continue;
+			};
+			let description_x = x.saturating_add(2);
+			let description_width = right.saturating_sub(description_x);
+			if description_width == 0 {
+				continue;
 			}
+			let first_end = prefix_byte_at_width(description, description_width);
+			pc.frame.put(description_x, row, &description[..first_end], style);
+			let rest = description[first_end..].trim_start();
+			if rest.is_empty() {
+				continue;
+			}
+			if offset >= MAX_ROWS || y.saturating_add(offset) >= pc.clip {
+				let truncated = super::hr::truncate_to_width(description, description_width);
+				pc.frame.put(description_x, row, truncated.text, style);
+				if truncated.ellipsis {
+					pc.frame.put(
+						description_x.saturating_add(truncated.width.saturating_sub(1)),
+						row,
+						"…",
+						style,
+					);
+				}
+				continue;
+			}
+			let continuation = super::hr::truncate_to_width(rest, description_width);
+			let continuation_row = y.saturating_add(offset);
+			pc.frame.put(description_x, continuation_row, continuation.text, style);
+			if continuation.ellipsis {
+				pc.frame.put(
+					description_x.saturating_add(continuation.width.saturating_sub(1)),
+					continuation_row,
+					"…",
+					style,
+				);
+			}
+			offset = offset.saturating_add(1);
 		}
 	}
 
@@ -445,6 +541,17 @@ impl EditInput {
 		}
 		pc.frame.put(x, row, &text[at..], style)
 	}
+}
+fn prefix_byte_at_width(text: &str, width: u16) -> usize {
+	let mut used = 0_u16;
+	for (offset, grapheme) in text.grapheme_indices() {
+		let next = used.saturating_add(cell_width(grapheme));
+		if next > width {
+			return offset;
+		}
+		used = next;
+	}
+	text.len()
 }
 
 impl Default for EditInput {
@@ -480,7 +587,7 @@ impl Component for EditInput {
 			.saturating_add(chrome.top_rows)
 			.saturating_add(chrome.bottom_rows)
 			.min(18);
-		composer.saturating_add(self.editor.picker_height()).min(18)
+		composer.saturating_add(self.picker_height(ctx, width)).min(18)
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
@@ -491,7 +598,12 @@ impl Component for EditInput {
 		let atoms = self.editor.atom_ranges();
 		let layout = self.style.layout(pc.ctx.charset);
 		let input_width = self.text_width(rect.width, pc.ctx.charset);
-		let picker_height = self.editor.picker_height();
+		let minimum_composer = 4_u16
+			.saturating_add(layout.top_rows)
+			.saturating_add(layout.bottom_rows);
+		let picker_height = self
+			.picker_height(pc.ctx, rect.width)
+			.min(rect.height.saturating_sub(minimum_composer));
 		let composer_height = rect.height.saturating_sub(picker_height);
 		let content_height = composer_height
 			.saturating_sub(layout.top_rows)
@@ -1949,7 +2061,7 @@ mod tests {
 		);
 	}
 	use crate::{
-		Color, Ui,
+		Color, Icon, Ui,
 		components::{ContextGaugeMode, Input, Segment, Status, StatusPlacement},
 		context::{Charset, UiContext},
 		frame::{Frame, Size},
@@ -2325,6 +2437,84 @@ mod tests {
 		assert_eq!(input.editor.picker().expect("slash popup").len(), 2);
 		assert!(ui.height() > collapsed_height);
 	}
+	#[test]
+	fn slash_completion_icons_resolve_per_charset_and_align_labels() {
+		let cases = [
+			(Charset::Ascii, ["/", "PR", "MCP", "SK", "EX", "id"]),
+			(Charset::Unicode, ["⌘", "✎", "🔌", "✦", "🧩", "🆔"]),
+			(Charset::NerdFont, ["", "", "", "", "", "󰁑"]),
+		];
+		for (charset, glyphs) in cases {
+			let commands = [
+				("action", Icon::SlashCommand),
+				("prompt", Icon::Prompt),
+				("mcp", Icon::McpExtension),
+				("skill", Icon::Skill),
+				("extension", Icon::ExtensionCommand),
+				("session", Icon::Session),
+			]
+			.into_iter()
+			.map(|(name, icon)| Command::new(name, "type", &[]).with_icon(icon))
+			.collect::<Vec<_>>();
+			let pane = EditorPane::new()
+				.completion(Box::new(crate::SlashCommands::new(commands.into_boxed_slice())));
+			let mut ui = Ui::from_root(
+				pane,
+				80,
+				UiContext { charset, ..UiContext::default() },
+			);
+			ui.focus_first();
+			ui.handle_key(Key::Char('/'));
+			let mut renderer = crate::Renderer::new(Vec::new());
+			ui.present(&mut renderer, 24, 0).unwrap();
+			let rows = (0..ui.height())
+				.map(|row| frame_row_text(ui.frame(), row))
+				.collect::<Vec<_>>();
+			let mut columns = Vec::new();
+			for ((name, _), glyph) in [
+				("action", Icon::SlashCommand),
+				("prompt", Icon::Prompt),
+				("mcp", Icon::McpExtension),
+				("skill", Icon::Skill),
+				("extension", Icon::ExtensionCommand),
+				("session", Icon::Session),
+			]
+			.into_iter()
+			.zip(glyphs)
+			{
+				let row = rows.iter().find(|row| row.contains(name)).expect("command row");
+				assert!(row.contains(glyph), "{charset:?} row did not use catalog glyph: {row}");
+				let at = row.find(name).expect("label offset");
+				columns.push(cell_width(&row[..at]));
+			}
+			assert!(columns.windows(2).all(|pair| pair[0] == pair[1]), "{charset:?}: {rows:?}");
+		}
+	}
+
+	#[test]
+	fn slash_completion_description_is_capped_at_two_rows_with_ellipsis() {
+		let description = "Plan and execute non-trivial architectural improvements to the \
+			codebase while preserving behavior, validating invariants, and documenting every \
+			important tradeoff long past the available popup space.";
+		let command = Command::new("improve-architecture", description, &[]);
+		let pane = EditorPane::new()
+			.completion(Box::new(crate::SlashCommands::new(vec![command].into_boxed_slice())));
+		let mut ui = Ui::from_root(pane, 64, UiContext::default());
+		ui.focus_first();
+		ui.handle_key(Key::Char('/'));
+		let mut renderer = crate::Renderer::new(Vec::new());
+		ui.present(&mut renderer, 24, 0).unwrap();
+		let rows = (0..ui.height())
+			.map(|row| frame_row_text(ui.frame(), row))
+			.collect::<Vec<_>>();
+		let command_row = rows
+			.iter()
+			.position(|row| row.contains("improve-architecture"))
+			.expect("command row");
+		assert!(rows.get(command_row + 1).is_some_and(|row| row.contains('…')), "{rows:?}");
+		assert!(!rows.iter().any(|row| row.contains("available popup space")));
+	}
+
 	#[test]
 	fn editor_status_embeds_in_rounded_top_border() {
 		let ctx = UiContext { charset: Charset::NerdFont, ..UiContext::default() };

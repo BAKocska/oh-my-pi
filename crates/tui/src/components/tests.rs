@@ -1248,6 +1248,20 @@ fn icon_catalog_resolves_short_names_and_qualified_aliases() {
 	assert_eq!(Charset::Ascii.icon(omp), "⍧");
 	assert_eq!(Charset::Unicode.icon(omp), "⍧");
 	assert_eq!(Charset::NerdFont.icon(omp), "󰵗");
+	assert_eq!(Charset::NerdFont.icon(Icon::Csharp), "\u{e7b2}");
+	let command_types = [
+		(Icon::SlashCommand, ["/", "⌘", ""]),
+		(Icon::Prompt, ["PR", "✎", ""]),
+		(Icon::McpExtension, ["MCP", "🔌", ""]),
+		(Icon::Skill, ["SK", "✦", ""]),
+		(Icon::ExtensionCommand, ["EX", "🧩", ""]),
+		(Icon::Session, ["id", "🆔", "󰁑"]),
+	];
+	for (icon, [ascii, unicode, nerd_font]) in command_types {
+		assert_eq!(Charset::Ascii.icon(icon), ascii);
+		assert_eq!(Charset::Unicode.icon(icon), unicode);
+		assert_eq!(Charset::NerdFont.icon(icon), nerd_font);
+	}
 
 	let future = Icon::from_name("placeholder-rail").unwrap();
 	assert_eq!(future.alias(), None, "new rows need no qualified alias");
