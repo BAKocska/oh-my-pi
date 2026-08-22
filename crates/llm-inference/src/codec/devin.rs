@@ -442,8 +442,8 @@ impl Codec for DevinCodec {
 		match context.operation {
 			omp_llm_catalog::OperationKind::Chat => Ok(Box::new(CascadeDecoder::default())),
 			omp_llm_catalog::OperationKind::DiscoverModels => Ok(Box::new(DiscoveryDecoder {
-				provider:  context.provider.clone(),
-				route:     context.route.clone(),
+				provider:  context.provider.to_owned(),
+				route:     context.route.to_owned(),
 				completed: false,
 			})),
 			_ => Err(invalid_request("devin.operation.unsupported")),

@@ -508,13 +508,13 @@ impl AppliedCredentials {
 
 	/// Returns the non-secret account identity for admission evidence.
 	#[must_use]
-	pub fn account(&self) -> &AccountId {
+	pub fn account(&self) -> &AccountId<str> {
 		&self.lease.meta().account
 	}
 
 	/// Returns the non-secret principal identity for session affinity.
 	#[must_use]
-	pub fn principal(&self) -> &PrincipalId {
+	pub fn principal(&self) -> &PrincipalId<str> {
 		&self.lease.meta().principal
 	}
 }

@@ -2,6 +2,7 @@
 
 pub mod cassette;
 pub mod connect;
+pub mod custom;
 pub mod eventstream;
 pub mod frame;
 pub mod http;
@@ -14,6 +15,7 @@ pub mod websocket_transport;
 mod tests;
 
 pub use connect::{ConnectDecoder, ConnectEnvelope, ConnectEnvelopeKind};
+pub use custom::{CustomEndpoint, CustomEndpointError, CustomEndpointMode};
 pub use eventstream::{
 	EventStreamDecoder, EventStreamHeader, EventStreamHeaderValue, EventStreamMessage,
 };

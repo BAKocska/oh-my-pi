@@ -158,11 +158,11 @@ impl ConstraintBudget {
 	pub fn assign(
 		&self,
 		slot_hash: [u8; 32],
-		route: &RouteId,
+		route: &RouteId<str>,
 		caps: ConstraintBudgetCaps,
 		intents: &[ConstraintIntent],
 	) -> Arc<ConstraintAssignment> {
-		let key = (slot_hash, route.clone());
+		let key = (slot_hash, route.to_owned());
 		let mut cache = self.cache.lock();
 		if let Some(assignment) = cache.assignments.get(&key) {
 			return Arc::clone(assignment);
@@ -500,7 +500,7 @@ impl ExecutionPlan {
 	pub fn validate(
 		&self,
 		now: Instant,
-		catalog_revision: &CatalogRevision,
+		catalog_revision: &CatalogRevision<str>,
 		registry_generation: u64,
 	) -> Result<(), Error> {
 		if plan_is_current(
@@ -539,13 +539,13 @@ impl ExecutionPlan {
 fn plan_is_current(
 	now: Instant,
 	expires_at: Instant,
-	planned_revision: &CatalogRevision,
-	current_revision: &CatalogRevision,
+	planned_revision: &CatalogRevision<str>,
+	current_revision: &CatalogRevision<str>,
 	planned_generation: u64,
 	current_generation: u64,
 ) -> bool {
 	now <= expires_at
-		&& planned_revision == current_revision
+		&& planned_revision.as_str() == current_revision.as_str()
 		&& planned_generation == current_generation
 }
 
@@ -613,13 +613,13 @@ pub fn negotiate(
 /// occurs.
 pub fn negotiate_native_option(
 	requirement: Option<&NativeOptionRequirement>,
-	selected_codec: &CodecId,
+	selected_codec: &CodecId<str>,
 	allow_drop_preferred: bool,
 ) -> Result<Option<NegotiationDecision>, Error> {
 	let Some(requirement) = requirement else {
 		return Ok(None);
 	};
-	if &requirement.codec == selected_codec {
+	if requirement.codec.as_str() == selected_codec.as_str() {
 		return Ok(Some(NegotiationDecision::Native { feature: requirement.feature.clone() }));
 	}
 	if requirement.strength == RequirementStrength::Preferred && allow_drop_preferred {
@@ -793,7 +793,7 @@ mod tests {
 			feature:  FeatureId(sf!("openai-prediction")),
 		};
 		assert_eq!(
-			negotiate_native_option(Some(&option), &CodecId::from("anthropic"), true)
+			negotiate_native_option(Some(&option), CodecId::from_ref("anthropic"), true)
 				.expect_err("required mismatch")
 				.kind,
 			ErrorKind::CodecMismatch,
@@ -801,7 +801,7 @@ mod tests {
 		let preferred =
 			NativeOptionRequirement { strength: RequirementStrength::Preferred, ..option };
 		assert!(matches!(
-			negotiate_native_option(Some(&preferred), &CodecId::from("anthropic"), true).unwrap(),
+			negotiate_native_option(Some(&preferred), CodecId::from_ref("anthropic"), true).unwrap(),
 			Some(NegotiationDecision::Dropped { .. })
 		));
 	}
@@ -849,7 +849,7 @@ mod tests {
 			7,
 			7
 		));
-		assert!(!plan_is_current(now, expiry, &revision, &CatalogRevision::from("r2"), 7, 7));
+		assert!(!plan_is_current(now, expiry, &revision, CatalogRevision::from_ref("r2"), 7, 7));
 		assert!(!plan_is_current(now, expiry, &revision, &revision, 7, 8));
 	}
 	#[test]

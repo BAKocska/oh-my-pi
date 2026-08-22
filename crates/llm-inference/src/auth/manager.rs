@@ -18,6 +18,7 @@ use omp_llm_catalog::{
 	provider::{AuthSpecKind, OAuthFlowSpec},
 };
 use parking_lot::Mutex;
+use zeroize::Zeroizing;
 
 use super::{
 	AuthSpec, CredentialBroker, CredentialError, CredentialNeed, CredentialOrigin, CredentialSource,
@@ -36,7 +37,74 @@ use crate::{
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	id::{AccountId, LoginSessionId, PrincipalId},
 	receipt::ExecutionReceipt,
+	session::CredentialAffinityDigest,
 };
+
+/// Inference-owned keyed resolver for journal-safe credential affinity.
+///
+/// The key is retained only in process-owned credential state. Journals receive
+/// the resulting digest, never account ids, principals, or key bytes.
+#[derive(Clone)]
+pub struct CredentialAffinityResolver {
+	key: Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for CredentialAffinityResolver {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("CredentialAffinityResolver")
+			.field("key", &"[REDACTED]")
+			.finish()
+	}
+}
+
+/// Failure restoring one opaque affinity against the live credential catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CredentialAffinityError {
+	/// No live account has the persisted affinity.
+	#[error("credential affinity no longer matches an available account")]
+	NotFound,
+	/// More than one live account matched, so selecting either would be unsafe.
+	#[error("credential affinity matched multiple accounts")]
+	Ambiguous,
+}
+
+impl CredentialAffinityResolver {
+	/// Creates a resolver from credential-authority-owned random bytes.
+	#[must_use]
+	pub fn new(key: [u8; 32]) -> Self {
+		Self { key: Zeroizing::new(key) }
+	}
+
+	/// Computes opaque affinity for one inference-owned account record.
+	#[must_use]
+	pub fn digest(&self, account: &AccountRecord) -> CredentialAffinityDigest {
+		CredentialAffinityDigest::derive(
+			&self.key,
+			&account.provider,
+			&account.account,
+			&account.principal,
+		)
+	}
+
+	/// Restores exactly one live account from opaque journal evidence.
+	pub fn resolve(
+		&self,
+		pool: &AccountPool,
+		provider: &omp_llm_catalog::ProviderId<str>,
+		affinity: &CredentialAffinityDigest,
+	) -> Result<AccountRecord, CredentialAffinityError> {
+		let mut matched = pool
+			.accounts()
+			.into_iter()
+			.filter(|account| &account.provider == provider && self.digest(account) == *affinity);
+		let account = matched.next().ok_or(CredentialAffinityError::NotFound)?;
+		if matched.next().is_some() {
+			return Err(CredentialAffinityError::Ambiguous);
+		}
+		Ok(account)
+	}
+}
 /// One constructed engine for a typed public login method.
 pub trait AuthLoginEngine: Send + Sync {
 	/// Public login method implemented by this engine.
@@ -45,7 +113,7 @@ pub trait AuthLoginEngine: Send + Sync {
 	///
 	/// Provider-scoped engines must be registered before generic engines for
 	/// the same method because dispatch selects the first supporting engine.
-	fn supports(&self, provider: &omp_llm_catalog::ProviderId) -> bool;
+	fn supports(&self, provider: &omp_llm_catalog::ProviderId<str>) -> bool;
 
 	/// Begins the exact catalog-selected authentication specification.
 	fn begin(
@@ -101,7 +169,7 @@ impl AuthLoginEngine for SecretLoginEngine {
 		self.method
 	}
 
-	fn supports(&self, _provider: &omp_llm_catalog::ProviderId) -> bool {
+	fn supports(&self, _provider: &omp_llm_catalog::ProviderId<str>) -> bool {
 		true
 	}
 
@@ -241,7 +309,7 @@ impl AuthLoginEngine for CredentialAcquisitionLoginEngine {
 		self.method
 	}
 
-	fn supports(&self, _provider: &omp_llm_catalog::ProviderId) -> bool {
+	fn supports(&self, _provider: &omp_llm_catalog::ProviderId<str>) -> bool {
 		true
 	}
 
@@ -360,7 +428,7 @@ where
 		self.method
 	}
 
-	fn supports(&self, _provider: &omp_llm_catalog::ProviderId) -> bool {
+	fn supports(&self, _provider: &omp_llm_catalog::ProviderId<str>) -> bool {
 		true
 	}
 
@@ -846,12 +914,12 @@ fn select_auth_spec(
 		let method = auth_method(catalog, spec)?;
 		if let Some(requested) = requested {
 			if requested == method {
-				return Ok(Some((id.clone(), method)));
+				return Ok(Some((id.to_owned(), method)));
 			}
 		} else {
-			fallback.get_or_insert_with(|| (id.clone(), method));
+			fallback.get_or_insert_with(|| (id.to_owned(), method));
 			if matches!(method, AuthMethod::OAuthPkce | AuthMethod::OAuthDevice) {
-				return Ok(Some((id.clone(), method)));
+				return Ok(Some((id.to_owned(), method)));
 			}
 		}
 	}
@@ -893,7 +961,7 @@ fn required_login_methods(
 }
 fn select_login_engine<'a>(
 	engines: &'a [Arc<dyn AuthLoginEngine>],
-	provider: &omp_llm_catalog::ProviderId,
+	provider: &omp_llm_catalog::ProviderId<str>,
 ) -> Option<&'a Arc<dyn AuthLoginEngine>> {
 	engines.iter().find(|engine| engine.supports(provider))
 }
@@ -1088,7 +1156,7 @@ fn credential_error(error: CredentialError) -> Error {
 #[cfg(test)]
 mod tests {
 	use std::{
-		collections::VecDeque,
+		collections::{BTreeSet, VecDeque},
 		sync::Arc,
 		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
@@ -1100,20 +1168,47 @@ mod tests {
 	use parking_lot::Mutex;
 
 	use super::{
-		AuthLoginEngine, AuthRefreshEngine, OAuthLoginEngine, StoredOAuthRefreshEngine, auth_method,
-		auth_store_error, select_auth_spec, select_login_engine,
+		AuthLoginEngine, AuthRefreshEngine, CredentialAffinityError, CredentialAffinityResolver,
+		OAuthLoginEngine, StoredOAuthRefreshEngine, auth_method, auth_store_error, select_auth_spec,
+		select_login_engine,
 	};
 	use crate::{
-		account::{AccountPool, RefreshCoordinator, RefreshPolicy},
+		account::{AccountPool, AccountRecord, RefreshCoordinator, RefreshPolicy},
 		answer::AuthEvent,
 		auth::{
 			AlibabaTokenPlanLoginEngine, CredentialStore, HeadlessKeySource, KeyError, KeyId,
 			OAuthClock, OAuthCustomDispatcher, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse,
 			OAuthTransportError, SecretLoginEngine, StoreError,
 		},
-		call::{AuthInput, AuthMethod, LoginRequest},
+		call::{AccountRoutingContext, AuthInput, AuthMethod, LoginRequest},
 		error::ErrorKind,
+		id::{AccountId, PrincipalId},
 	};
+
+	#[test]
+	fn credential_affinity_restores_without_persisting_identity() {
+		let pool = AccountPool::new();
+		let provider = ProviderId::from("provider");
+		let account = AccountRecord {
+			account:               AccountId::from("raw-account-uuid"),
+			principal:             PrincipalId::from("person@example.test"),
+			provider:              provider.clone(),
+			routes:                BTreeSet::new(),
+			enabled:               true,
+			credential_generation: 1,
+			routing:               AccountRoutingContext::default(),
+		};
+		pool.upsert(account.clone()).expect("register account");
+		let resolver = CredentialAffinityResolver::new([7; 32]);
+		let digest = resolver.digest(&account);
+		assert!(!digest.as_str().contains(account.account.as_str()));
+		assert!(!digest.as_str().contains(account.principal.as_str()));
+		assert_eq!(resolver.resolve(&pool, &provider, &digest).unwrap(), account);
+		assert_eq!(
+			CredentialAffinityResolver::new([8; 32]).resolve(&pool, &provider, &digest),
+			Err(CredentialAffinityError::NotFound)
+		);
+	}
 
 	#[test]
 	fn unavailable_credential_key_has_distinct_error_kind() {
@@ -1137,7 +1232,7 @@ mod tests {
 	fn embedded_copilot_bearer_then_device_prefers_interactive_login() {
 		let catalog = Catalog::embedded();
 		let provider = catalog
-			.provider(&ProviderId::from("github-copilot"))
+			.provider(ProviderId::from_ref("github-copilot"))
 			.expect("GitHub Copilot provider");
 		let spec_for = |method| {
 			provider
@@ -1170,7 +1265,7 @@ mod tests {
 	fn plain_bearer_auth_is_an_api_key_login_method() {
 		let catalog = Catalog::embedded();
 		let provider = catalog
-			.provider(&ProviderId::from("alibaba-token-plan"))
+			.provider(ProviderId::from_ref("alibaba-token-plan"))
 			.expect("Alibaba Token Plan provider");
 		let spec = catalog
 			.auth_spec(provider.auth.first().expect("Alibaba auth spec id"))

@@ -343,7 +343,7 @@ impl LeakedThinkingStage {
 			.config
 			.thinking_policy
 			.as_ref()
-			.map_or("none", ThinkingPolicyId::as_str);
+			.map_or("none", |policy| policy.as_str());
 		let rule = ReasonId(sf!(
 			"thinking-leak/{}/{thinking}/{}",
 			self.config.wire_policy.as_str(),

@@ -306,13 +306,14 @@ impl PerplexityResponse {
 				snippet:      (!result.snippet.is_empty()).then_some(result.snippet),
 				score:        None,
 				published_at: result.date.as_deref().and_then(parse_date),
+				author:       None,
 			});
 		}
 		let usage = self.usage.map_or_else(
 			|| Usage { search_calls: 1, source: UsageSource::Measured, ..Usage::default() },
 			PerplexityUsage::canonical,
 		);
-		Ok(SearchResults { results, answer, usage })
+		Ok(SearchResults { results, answer, usage, metadata: Default::default() })
 	}
 }
 #[derive(Debug, Deserialize)]
@@ -558,14 +559,15 @@ mod tests {
 
 	fn search_request() -> SearchRequest {
 		SearchRequest {
-			query:             sf!("latest Rust release"),
-			include_domains:   Arc::from([sf!("rust-lang.org")]),
-			exclude_domains:   Arc::from([sf!("spam.example")]),
-			recency:           Some(SearchRecency::Week),
-			locale:            Some(sf!("en-US")),
-			max_results:       5,
+			query: sf!("latest Rust release"),
+			include_domains: Arc::from([sf!("rust-lang.org")]),
+			exclude_domains: Arc::from([sf!("spam.example")]),
+			recency: Some(SearchRecency::Week),
+			locale: Some(sf!("en-US")),
+			max_results: 5,
 			synthesize_answer: Setting::Require(true),
-			negotiation:       NegotiationPolicy::default(),
+			negotiation: NegotiationPolicy::default(),
+			..SearchRequest::new(sf!("latest Rust release"), 5)
 		}
 	}
 

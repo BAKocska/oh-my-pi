@@ -1568,18 +1568,18 @@ impl CursorConversationRotations {
 			.unwrap_or_else(|| base.clone())
 	}
 
-	fn begin(&mut self, request: &RequestId, base: &Str) -> Str {
+	fn begin(&mut self, request: &RequestId<str>, base: &Str) -> Str {
 		let wire = self.resolve(base);
 		self
 			.pending
-			.insert(request.clone(), CursorConversationAttempt {
+			.insert(RequestId::from(request), CursorConversationAttempt {
 				base: base.clone(),
 				seed: Str::new(request.as_str()),
 			});
 		wire
 	}
 
-	fn take(&mut self, request: &RequestId) -> Option<CursorConversationAttempt> {
+	fn take(&mut self, request: &RequestId<str>) -> Option<CursorConversationAttempt> {
 		self.pending.remove(request)
 	}
 
@@ -1920,6 +1920,7 @@ fn discovered_capabilities(reasoning: bool) -> ModelCapabilities {
 				Availability::Unsupported
 			},
 			input_modalities:  unknown_availability(),
+			image_input:       unknown_availability(),
 			hosted_tools:      unknown_availability(),
 			prompt_caching:    unknown_availability(),
 			service_tiers:     unknown_availability(),

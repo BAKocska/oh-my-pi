@@ -313,6 +313,7 @@ static DEFAULT_ROUTE: RouteDef = RouteDef {
 		maximum_output_tokens:  None,
 		disable_server_state:   false,
 		disable_prompt_caching: false,
+		disable_strict_tools:   false,
 	},
 	trust_domain:       TrustDomain {
 		origin:          Str::empty(),

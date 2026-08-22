@@ -80,7 +80,7 @@ impl Registry {
 	}
 
 	/// Returns the immutable catalog revision used by this registry.
-	pub fn catalog_revision(&self) -> &CatalogRevision {
+	pub fn catalog_revision(&self) -> &CatalogRevision<str> {
 		self.inner.catalog.revision()
 	}
 
@@ -101,7 +101,7 @@ impl Registry {
 	}
 
 	/// Returns typed construction evidence for an unavailable route.
-	pub fn unavailability(&self, route: &RouteId) -> Option<&RouteUnavailable> {
+	pub fn unavailability(&self, route: &RouteId<str>) -> Option<&RouteUnavailable> {
 		match self.inner.bindings.get(route) {
 			Some(RouteBinding::Unavailable(evidence)) => Some(evidence),
 			Some(RouteBinding::Available(_)) | None => None,
@@ -109,7 +109,7 @@ impl Registry {
 	}
 
 	/// Returns whether a concrete route has a constructed comprehensive service.
-	pub fn contains_service(&self, route: &RouteId) -> bool {
+	pub fn contains_service(&self, route: &RouteId<str>) -> bool {
 		matches!(self.inner.bindings.get(route), Some(RouteBinding::Available(_)))
 	}
 
@@ -155,7 +155,7 @@ impl Registry {
 
 	pub(crate) fn route_service(
 		&self,
-		route: &RouteId,
+		route: &RouteId<str>,
 		operation: OperationKind,
 	) -> Result<RouteProviderService, Error> {
 		match self.inner.bindings.get(route) {
@@ -410,7 +410,7 @@ impl RegistryBuilder {
 		})
 	}
 
-	fn require_catalog_route(&self, route: &RouteId) -> Result<&RouteDef, Error> {
+	fn require_catalog_route(&self, route: &RouteId<str>) -> Result<&RouteDef, Error> {
 		self
 			.catalog
 			.route(route)
@@ -593,6 +593,13 @@ async fn dispatch_preplanned(
 			Ok(mut answer) => {
 				layered.context.merge_receipt(&answer.receipt);
 				answer.receipt = layered.context.receipt();
+				if index > 0
+					&& let (Some(primary), Some(selected)) =
+						(plan.fallback_scope.primary.as_ref(), plan.model.as_ref())
+					&& primary != selected
+				{
+					crate::settings::record_fallback(primary, selected);
+				}
 				return Ok(answer);
 			},
 			Err(mut error) => {
@@ -613,18 +620,18 @@ async fn dispatch_preplanned(
 
 fn attribute_error(
 	error: &mut Error,
-	provider: &ProviderId,
-	route: &RouteId,
-	request_id: &RequestId,
+	provider: &ProviderId<str>,
+	route: &RouteId<str>,
+	request_id: &RequestId<str>,
 ) {
 	if error.provider.is_none() {
-		error.provider = Some(Box::new(provider.clone()));
+		error.provider = Some(Box::new(provider.to_owned()));
 	}
 	if error.route.is_none() {
-		error.route = Some(Box::new(route.clone()));
+		error.route = Some(Box::new(route.to_owned()));
 	}
 	if error.request_id.is_none() {
-		error.request_id = Some(Box::new(request_id.clone()));
+		error.request_id = Some(Box::new(request_id.to_owned()));
 	}
 }
 
@@ -672,7 +679,7 @@ fn target_error(selector: &str) -> Error {
 	)
 }
 
-fn duplicate_route_error(route: &RouteId) -> Error {
+fn duplicate_route_error(route: &RouteId<str>) -> Error {
 	Error::planning(
 		ErrorKind::ProviderContractMismatch,
 		ErrorDetail::capability(
@@ -722,7 +729,7 @@ mod tests {
 			self.0
 		}
 
-		fn supports(&self, _provider: &ProviderId) -> bool {
+		fn supports(&self, _provider: &ProviderId<str>) -> bool {
 			true
 		}
 

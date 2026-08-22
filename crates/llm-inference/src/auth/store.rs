@@ -92,9 +92,9 @@ impl fmt::Debug for StoredCredential {
 /// Input for an atomic credential insert or replacement.
 pub struct CredentialWrite<'a, S: zeroize::Zeroize + ?Sized = [u8]> {
 	/// Account receiving the secret.
-	pub account_id:          &'a AccountId,
+	pub account_id:          &'a AccountId<str>,
 	/// Principal owning the account.
-	pub principal_id:        &'a PrincipalId,
+	pub principal_id:        &'a PrincipalId<str>,
 	/// Credential kind authenticated with the ciphertext.
 	pub kind:                &'a str,
 	/// New secret bytes.
@@ -112,9 +112,9 @@ pub struct CredentialWrite<'a, S: zeroize::Zeroize + ?Sized = [u8]> {
 /// Crate-private opaque OAuth renewal payload persistence input.
 pub(crate) struct OAuthCredentialWrite<'a> {
 	/// Account receiving the renewable bundle.
-	pub(crate) account_id:          &'a AccountId,
+	pub(crate) account_id:          &'a AccountId<str>,
 	/// Principal owning the account.
-	pub(crate) principal_id:        &'a PrincipalId,
+	pub(crate) principal_id:        &'a PrincipalId<str>,
 	/// Opaque OAuth-owned bundle bytes.
 	pub(crate) bundle:              &'a SecretBox<Vec<u8>>,
 	/// Optional access-token expiry time in Unix milliseconds.
@@ -366,7 +366,7 @@ impl CredentialStore {
 	/// Loads one OAuth-owned opaque renewable bundle inside the auth boundary.
 	pub(crate) fn load_oauth_bundle(
 		&self,
-		account_id: &AccountId,
+		account_id: &AccountId<str>,
 	) -> Result<StoredOAuthCredential, StoreError> {
 		let stored = self.get(account_id)?;
 		if stored.metadata.kind != OAUTH_RENEWABLE_KIND {
@@ -490,8 +490,8 @@ impl CredentialStore {
 		)?;
 		transaction.commit()?;
 		Ok(CredentialMetadata {
-			account_id: write.account_id.clone(),
-			principal_id: write.principal_id.clone(),
+			account_id: write.account_id.to_owned(),
+			principal_id: write.principal_id.to_owned(),
 			kind: Str::new(write.kind),
 			generation,
 			created_at_ms,
@@ -501,7 +501,7 @@ impl CredentialStore {
 	}
 
 	/// Loads and authenticates one credential.
-	pub(crate) fn get(&self, account_id: &AccountId) -> Result<StoredCredential, StoreError> {
+	pub(crate) fn get(&self, account_id: &AccountId<str>) -> Result<StoredCredential, StoreError> {
 		let connection = self.connection()?;
 		let row = connection
 			.query_row(
@@ -547,7 +547,7 @@ impl CredentialStore {
 		)?;
 		Ok(StoredCredential {
 			metadata: CredentialMetadata {
-				account_id:    account_id.clone(),
+				account_id:    AccountId::from(account_id),
 				principal_id:  PrincipalId::new(row.0),
 				kind:          Str::new(row.1),
 				generation:    row.2,
@@ -562,7 +562,7 @@ impl CredentialStore {
 	/// Returns secret-free metadata for an account.
 	pub fn metadata(
 		&self,
-		account_id: &AccountId,
+		account_id: &AccountId<str>,
 	) -> Result<Option<CredentialMetadata>, StoreError> {
 		let connection = self.connection()?;
 		connection
@@ -570,7 +570,7 @@ impl CredentialStore {
 				"SELECT principal_id, kind, generation, created_at_ms, updated_at_ms, expires_at_ms
 				 FROM credentials WHERE account_id = ?1",
 				[account_id.as_str()],
-				|row| metadata_from_row(account_id.clone(), row, 0),
+				|row| metadata_from_row(AccountId::from(account_id), row, 0),
 			)
 			.optional()
 			.map_err(StoreError::from)
@@ -595,7 +595,7 @@ impl CredentialStore {
 
 	/// Deletes credential metadata, encrypted bytes, and associated leases
 	/// atomically.
-	pub fn delete(&self, account_id: &AccountId) -> Result<bool, StoreError> {
+	pub fn delete(&self, account_id: &AccountId<str>) -> Result<bool, StoreError> {
 		let connection = self.connection()?;
 		Ok(connection
 			.execute("DELETE FROM credentials WHERE account_id = ?1", [account_id.as_str()])?
@@ -696,7 +696,7 @@ impl CredentialStore {
 	/// Tries to acquire an expiring, cross-process lease.
 	pub fn try_acquire_lease(
 		&self,
-		account_id: &AccountId,
+		account_id: &AccountId<str>,
 		kind: &str,
 		owner: &str,
 		now: SystemTime,
@@ -743,7 +743,7 @@ impl CredentialStore {
 		)?;
 		transaction.commit()?;
 		Ok(LeaseOutcome::Acquired(PersistentLease {
-			account_id: account_id.clone(),
+			account_id: account_id.to_owned(),
 			kind: Str::new(kind),
 			owner: Str::new(owner),
 			epoch,
@@ -964,7 +964,7 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 
 	fn wait_for_newer<'a>(
 		&'a self,
-		account: &'a AccountId,
+		account: &'a AccountId<str>,
 		minimum_generation: u64,
 		lease_expires_at: SystemTime,
 	) -> Pin<
@@ -992,7 +992,7 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 						observed_at,
 					};
 					let receipt = crate::account::RefreshReceipt {
-						account:              account.clone(),
+						account:              account.to_owned(),
 						principal:            metadata.principal_id.clone(),
 						rejected_generation:  minimum_generation.saturating_sub(1),
 						resulting_generation: Some(metadata.generation),
@@ -1002,7 +1002,7 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 					};
 					return Ok(crate::account::RefreshLeaseWait::Published(Box::new(
 						crate::account::RefreshResult {
-							account: account.clone(),
+							account: account.to_owned(),
 							principal: metadata.principal_id,
 							freshness,
 							receipt,
@@ -1266,7 +1266,7 @@ mod tests {
 
 	fn put(
 		store: &CredentialStore,
-		account: &AccountId,
+		account: &AccountId<str>,
 		value: &[u8],
 		now_ms: u64,
 	) -> CredentialMetadata {
@@ -1274,7 +1274,7 @@ mod tests {
 		store
 			.put(CredentialWrite {
 				account_id: account,
-				principal_id: &PrincipalId::new("principal"),
+				principal_id: PrincipalId::from_ref("principal"),
 				kind: "bearer",
 				secret: &secret,
 				expires_at_ms: Some(now_ms + 10_000),
@@ -1396,7 +1396,7 @@ mod tests {
 		assert!(matches!(
 			store.put_oauth_bundle(OAuthCredentialWrite {
 				account_id:          &account,
-				principal_id:        &PrincipalId::new("principal"),
+				principal_id:        PrincipalId::from_ref("principal"),
 				bundle:              &bundle,
 				expires_at_ms:       None,
 				origin:              CredentialOrigin::Environment,
@@ -1535,7 +1535,7 @@ mod tests {
 
 		let store = CredentialStore::open(&path, key_source).expect("migrate");
 		let loaded = store
-			.get(&AccountId::new("account"))
+			.get(AccountId::from_ref("account"))
 			.expect("load migrated");
 		assert_eq!(loaded.secret.expose_secret().as_slice(), b"legacy-encrypted");
 		assert_eq!(loaded.metadata.created_at_ms, 0);
@@ -1581,7 +1581,7 @@ mod tests {
 		assert!(matches!(
 			store.put(CredentialWrite {
 				account_id:          &account,
-				principal_id:        &PrincipalId::new("different-principal"),
+				principal_id:        PrincipalId::from_ref("different-principal"),
 				kind:                "bearer",
 				secret:              &replacement,
 				expires_at_ms:       None,
@@ -1682,7 +1682,7 @@ mod tests {
 			store.put_under_lease(
 				CredentialWrite {
 					account_id:          &account,
-					principal_id:        &PrincipalId::new("principal"),
+					principal_id:        PrincipalId::from_ref("principal"),
 					kind:                "bearer",
 					secret:              &stale_secret,
 					expires_at_ms:       None,
@@ -1700,7 +1700,7 @@ mod tests {
 			.put_under_lease(
 				CredentialWrite {
 					account_id:          &account,
-					principal_id:        &PrincipalId::new("principal"),
+					principal_id:        PrincipalId::from_ref("principal"),
 					kind:                "bearer",
 					secret:              &fresh_secret,
 					expires_at_ms:       None,
@@ -1735,7 +1735,7 @@ mod tests {
 		assert!(matches!(
 			store.put(CredentialWrite {
 				account_id:          &account,
-				principal_id:        &PrincipalId::new("principal"),
+				principal_id:        PrincipalId::from_ref("principal"),
 				kind:                "api-key",
 				secret:              &secret,
 				expires_at_ms:       None,
@@ -1763,8 +1763,8 @@ mod tests {
 		let persistent = boxed_secret(b"not-written");
 		assert!(matches!(
 			unavailable.put(CredentialWrite {
-				account_id:          &AccountId::new("missing-key"),
-				principal_id:        &PrincipalId::new("principal"),
+				account_id:          AccountId::from_ref("missing-key"),
+				principal_id:        PrincipalId::from_ref("principal"),
 				kind:                "api-key",
 				secret:              &persistent,
 				expires_at_ms:       None,
@@ -1776,7 +1776,7 @@ mod tests {
 		));
 		assert_eq!(
 			unavailable
-				.metadata(&AccountId::new("missing-key"))
+				.metadata(AccountId::from_ref("missing-key"))
 				.expect("failed write metadata"),
 			None
 		);

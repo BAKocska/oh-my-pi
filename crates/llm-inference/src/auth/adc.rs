@@ -247,7 +247,8 @@ where
 			let value = HeaderValue::from_str(&header.value).map_err(|_| AdcError::InvalidSpec)?;
 			request_headers.insert(name, value);
 		}
-		let request = OAuthHttpRequest::new(Method::GET, url, request_headers, None)?;
+		let request = OAuthHttpRequest::new(Method::GET, url, request_headers, None)
+			.map_err(OAuthError::from)?;
 		let response = self.execute(request).await?;
 		if response.status == 404 || response.status == 403 {
 			return Ok(None);
@@ -265,7 +266,8 @@ where
 		for (name, value) in fields {
 			serializer.append_pair(name, value);
 		}
-		Ok(OAuthHttpRequest::secret_form(url, SecretString::from(serializer.finish()))?)
+		Ok(OAuthHttpRequest::secret_form(url, SecretString::from(serializer.finish()))
+			.map_err(OAuthError::from)?)
 	}
 
 	async fn execute(&self, request: OAuthHttpRequest) -> Result<OAuthHttpResponse, AdcError> {

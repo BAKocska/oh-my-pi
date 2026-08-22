@@ -3,7 +3,9 @@
 
 pub mod adc;
 pub mod alibaba_token_plan;
+pub mod apply;
 pub mod broker;
+pub mod command;
 pub mod crypto;
 pub mod github_copilot;
 pub mod key;
@@ -24,9 +26,14 @@ pub use alibaba_token_plan::{
 	AlibabaTokenPlanLoginEngine, AlibabaTokenPlanLoginError, AlibabaTokenPlanShaper,
 	parse_alibaba_token_plan_credential, serialize_alibaba_token_plan_credential,
 };
+pub use apply::{CustomAuthApplyError, SecretHeader, apply_custom_auth};
 pub use broker::{
 	CredentialBroker, CredentialBrokerEngines, CredentialBrokerError, CredentialEnvironment,
 	SystemCredentialEnvironment,
+};
+pub use command::{
+	CommandCredentialError, CommandCredentialExecutor, CommandCredentialResolver,
+	CommandExecutionFuture,
 };
 pub use github_copilot::{
 	COPILOT_API_VERSION, COPILOT_USER_AGENT, CopilotProbeFuture, GithubCopilotShaper,
@@ -49,8 +56,9 @@ pub use login::{
 };
 pub use manager::{
 	AuthLoginEngine, AuthManager, AuthManagerBuildError, AuthRefreshEngine,
-	CredentialAcquisitionLoginEngine, CredentialAcquisitionLoginEngineError, OAuthLoginEngine,
-	OAuthLoginEngineError, SecretLoginEngine, SecretLoginEngineError, StoredOAuthRefreshEngine,
+	CredentialAcquisitionLoginEngine, CredentialAcquisitionLoginEngineError,
+	CredentialAffinityError, CredentialAffinityResolver, OAuthLoginEngine, OAuthLoginEngineError,
+	SecretLoginEngine, SecretLoginEngineError, StoredOAuthRefreshEngine,
 };
 pub use oauth::{
 	DevicePending, OAuthClock, OAuthCredentialManagerError, OAuthCustomDispatchError,

@@ -57,13 +57,13 @@ struct ResponsesRouteHints {
 impl ResponsesRouteHints {
 	/// Whether the discovered wire id — exactly or via its billing-variant
 	/// base — is hinted onto the responses route.
-	fn hinted(&self, wire_model: &WireModelId) -> bool {
+	fn hinted(&self, wire_model: &WireModelId<str>) -> bool {
 		if self.wire_ids.contains(wire_model) {
 			return true;
 		}
 		taxonomy()
 			.billing_variant_plain(wire_model.as_str())
-			.is_some_and(|base| self.wire_ids.contains(&WireModelId::from(base)))
+			.is_some_and(|base| self.wire_ids.contains(WireModelId::from_ref(base)))
 	}
 }
 
@@ -155,7 +155,7 @@ impl CatalogDiscoveryProjector {
 			// bundled SKUs may live on per-model routes, so collect every
 			// bundled wire identity owned by this provider for the
 			// plain-counterpart and seeded-row lookups.
-			let owned: BTreeSet<&RouteId> = catalog
+			let owned: BTreeSet<_> = catalog
 				.routes()
 				.iter()
 				.filter(|definition| definition.provider == route.provider)
@@ -181,7 +181,7 @@ impl CatalogDiscoveryProjector {
 				// namespaced identity across providers so intrinsic
 				// parameters can be recovered. The first entry in frozen
 				// catalog order wins deterministically.
-				let owners: BTreeMap<&RouteId, &ProviderId> = catalog
+				let owners: BTreeMap<_, _> = catalog
 					.routes()
 					.iter()
 					.map(|definition| (&definition.id, &definition.provider))
@@ -247,13 +247,13 @@ fn responses_route_hints(catalog: &Catalog, route: &RouteDef) -> Option<Response
 				.then_with(|| right.id.cmp(&left.id))
 		})
 		.map(|definition| definition.id.clone())?;
-	let responses_routes: BTreeSet<&RouteId> = catalog
+	let responses_routes: BTreeSet<_> = catalog
 		.routes()
 		.iter()
 		.filter(|definition| definition.codec.as_str() == OPENAI_RESPONSES_CODEC)
 		.map(|definition| &definition.id)
 		.collect();
-	let owners: BTreeMap<&RouteId, &ProviderId> = catalog
+	let owners: BTreeMap<_, _> = catalog
 		.routes()
 		.iter()
 		.map(|definition| (&definition.id, &definition.provider))
@@ -326,8 +326,8 @@ fn project_mixed_page(
 	canonical_bundled: Option<&BTreeMap<Str, ModelSpec>>,
 	hints: Option<&ResponsesRouteHints>,
 	normalizer: &DiscoveryNormalizer,
-	provider: &ProviderId,
-	route: &RouteId,
+	provider: &ProviderId<str>,
+	route: &RouteId<str>,
 	request: &DiscoveryRequest,
 	rows: Vec<DiscoveredModel>,
 	next_cursor: Option<Str>,
@@ -408,8 +408,8 @@ fn project_mixed_page(
 /// wire identifier (`gpt-5.6-luna-wm` → the bundled `gpt-5.6-luna` spec).
 fn routing_variant_counterpart<'catalog>(
 	provider_bundled: Option<&'catalog BTreeMap<WireModelId, ModelSpec>>,
-	provider: &ProviderId,
-	wire_model: &WireModelId,
+	provider: &ProviderId<str>,
+	wire_model: &WireModelId<str>,
 ) -> Option<&'catalog ModelSpec> {
 	let bundled = provider_bundled?;
 	let plain = taxonomy().routing_variant_plain(provider.as_str(), wire_model.as_str())?;
@@ -423,7 +423,7 @@ fn routing_variant_counterpart<'catalog>(
 /// bare generic slugs never inherit another provider's card (pi PR #8991).
 fn canonical_reference<'catalog>(
 	canonical_bundled: Option<&'catalog BTreeMap<Str, ModelSpec>>,
-	key: &ModelKey,
+	key: &ModelKey<str>,
 ) -> Option<&'catalog ModelSpec> {
 	let index = canonical_bundled?;
 	let lookup = key.as_str().to_ascii_lowercase();
@@ -607,8 +607,8 @@ where
 /// normalizer.
 pub fn normalize_page(
 	normalizer: &DiscoveryNormalizer,
-	provider: &ProviderId,
-	route: &RouteId,
+	provider: &ProviderId<str>,
+	route: &RouteId<str>,
 	request: &DiscoveryRequest,
 	page: RawDiscoveryPage,
 ) -> Result<ModelDiscoveryPage, Error> {
@@ -703,12 +703,16 @@ mod tests {
 		layer::recover::DiscoveryProjector,
 	};
 
-	fn discovered(provider: &ProviderId, route: &RouteId, wire_model: &str) -> DiscoveredModel {
+	fn discovered(
+		provider: &ProviderId<str>,
+		route: &RouteId<str>,
+		wire_model: &str,
+	) -> DiscoveredModel {
 		let mut operations = OperationBits::empty();
 		operations.insert_kind(OperationKind::Embed);
 		DiscoveredModel {
-			provider:              provider.clone(),
-			route:                 route.clone(),
+			provider:              provider.to_owned(),
+			route:                 route.to_owned(),
 			wire_model:            WireModelId::from(wire_model),
 			aliases:               Box::new([]),
 			display_name:          None,
@@ -725,7 +729,7 @@ mod tests {
 		}
 	}
 
-	fn projector(provider: &ProviderId, route: &RouteId) -> CatalogDiscoveryProjector {
+	fn projector(provider: &ProviderId<str>, route: &RouteId<str>) -> CatalogDiscoveryProjector {
 		CatalogDiscoveryProjector::new(
 			DiscoveryNormalizer::new(DiscoveryDefaults {
 				wire_policy:          WirePolicyId::from("wire"),
@@ -734,8 +738,8 @@ mod tests {
 				thinking:             None,
 				pricing:              Pricing::default(),
 			}),
-			provider.clone(),
-			route.clone(),
+			provider.to_owned(),
+			route.to_owned(),
 		)
 	}
 	#[test]
@@ -876,7 +880,7 @@ mod tests {
 			operation: None,
 		};
 		let valid = discovered(&provider, &route, "one");
-		let wrong = discovered(&ProviderId::from("other"), &route, "wrong");
+		let wrong = discovered(ProviderId::from_ref("other"), &route, "wrong");
 		assert!(projector.project(&request, vec![wrong], None).is_err());
 		assert!(
 			projector
@@ -1230,7 +1234,7 @@ mod tests {
 		use crate::catalog::snapshot::Catalog;
 		let catalog = Catalog::embedded();
 		let route = catalog
-			.route(&RouteId::from("gmi-cloud/primary"))
+			.route(RouteId::from_ref("gmi-cloud/primary"))
 			.expect("gmi-cloud primary route is bundled");
 		let projector =
 			CatalogDiscoveryProjector::for_route(catalog, route).expect("gmi-cloud projector");
@@ -1271,10 +1275,10 @@ mod tests {
 		assert!(flash.thinking.is_some(), "the provider's own seed keeps its thinking policy");
 	}
 
-	fn hint_request(provider: &ProviderId, route: &RouteId) -> DiscoveryRequest {
+	fn hint_request(provider: &ProviderId<str>, route: &RouteId<str>) -> DiscoveryRequest {
 		DiscoveryRequest {
-			provider:  Some(provider.clone()),
-			route:     Some(route.clone()),
+			provider:  Some(provider.to_owned()),
+			route:     Some(route.to_owned()),
 			cursor:    None,
 			page_size: 8,
 			operation: None,
@@ -1367,7 +1371,7 @@ mod tests {
 		use crate::catalog::snapshot::Catalog;
 		let catalog = Catalog::embedded();
 		let route = catalog
-			.route(&RouteId::from("opencode-zen/primary"))
+			.route(RouteId::from_ref("opencode-zen/primary"))
 			.expect("zen primary route is bundled");
 		assert_eq!(route.codec.as_str(), "anthropic", "zen discovery route is the anthropic primary");
 		let projector = CatalogDiscoveryProjector::for_route(catalog, route).expect("zen projector");

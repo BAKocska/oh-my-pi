@@ -51,7 +51,7 @@ impl GithubCopilotUsageFetcher {
 }
 
 impl ConsoleUsageFetcher for GithubCopilotUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

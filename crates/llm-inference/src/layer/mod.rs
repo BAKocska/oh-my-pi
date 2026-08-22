@@ -14,6 +14,8 @@ pub mod operation;
 pub mod rate;
 pub mod recover;
 pub mod retry;
+/// Bidirectional secret projection and restoration.
+pub mod secrets;
 pub mod semantic;
 pub mod session;
 pub mod stack;

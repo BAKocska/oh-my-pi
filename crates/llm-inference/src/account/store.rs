@@ -302,8 +302,8 @@ impl AccountStateStore {
 	/// ownership.
 	pub fn update_generation(
 		&self,
-		account: &AccountId,
-		principal: &PrincipalId,
+		account: &AccountId<str>,
+		principal: &PrincipalId<str>,
 		generation: u64,
 	) -> Result<bool, AccountStateStoreError> {
 		let generation = i64::try_from(generation).map_err(|_| AccountStateStoreError::OutOfRange)?;
@@ -330,7 +330,7 @@ impl AccountStateStore {
 	/// ownership.
 	pub fn save_rejection(
 		&self,
-		account: &AccountId,
+		account: &AccountId<str>,
 		rejection: &PersistedRejection,
 	) -> Result<(), AccountStateStoreError> {
 		let generation =
@@ -352,7 +352,7 @@ impl AccountStateStore {
 	/// history.
 	pub fn set_account_enabled(
 		&self,
-		account: &AccountId,
+		account: &AccountId<str>,
 		enabled: bool,
 	) -> Result<bool, AccountStateStoreError> {
 		let _guard = self.writes.lock();
@@ -367,7 +367,7 @@ impl AccountStateStore {
 	/// account.
 	pub fn load_account(
 		&self,
-		account: &AccountId,
+		account: &AccountId<str>,
 	) -> Result<PersistedAccountState, AccountStateStoreError> {
 		let connection = self.connection()?;
 		let cooldown = connection
@@ -379,7 +379,7 @@ impl AccountStateStore {
 			.optional()?
 			.map(|(until_ms, reason)| {
 				Ok::<PersistedCooldown, AccountStateStoreError>(PersistedCooldown {
-					account: account.clone(),
+					account: account.to_owned(),
 					until:   from_millis(until_ms)?,
 					reason:  CooldownReason::from_str(&reason).map_err(|_| {
 						AccountStateStoreError::InvalidVocabulary {
@@ -494,7 +494,7 @@ impl AccountStateStore {
 	}
 
 	/// Removes only the explicit cooldown for an account.
-	pub fn clear_cooldown(&self, account: &AccountId) -> Result<(), AccountStateStoreError> {
+	pub fn clear_cooldown(&self, account: &AccountId<str>) -> Result<(), AccountStateStoreError> {
 		let _guard = self.writes.lock();
 		self
 			.connection()?
@@ -508,7 +508,7 @@ impl AccountStateStore {
 	/// Appends one partial rate receipt atomically.
 	pub fn append_rate(
 		&self,
-		account: &AccountId,
+		account: &AccountId<str>,
 		observation: &RateObservation,
 	) -> Result<(), AccountStateStoreError> {
 		let _guard = self.writes.lock();
@@ -535,7 +535,7 @@ impl AccountStateStore {
 	/// Appends one partial quota receipt atomically.
 	pub fn append_quota(
 		&self,
-		account: &AccountId,
+		account: &AccountId<str>,
 		observation: &QuotaObservation,
 	) -> Result<(), AccountStateStoreError> {
 		let _guard = self.writes.lock();
@@ -621,7 +621,7 @@ impl AccountStateStore {
 
 	/// Explicitly purges secret-free account state; credential removal never
 	/// calls this.
-	pub fn purge_account(&self, account: &AccountId) -> Result<(), AccountStateStoreError> {
+	pub fn purge_account(&self, account: &AccountId<str>) -> Result<(), AccountStateStoreError> {
 		let _guard = self.writes.lock();
 		let mut connection = self.connection()?;
 		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;

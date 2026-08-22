@@ -3,7 +3,7 @@
 use std::{
 	fmt,
 	sync::Arc,
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime},
 };
 
 use bytes::Bytes;
@@ -125,15 +125,19 @@ pub enum Target {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRequest {
 	/// Conversation to append or query.
-	pub conversation: ConversationId,
+	pub conversation:   ConversationId,
 	/// Immutable base revision.
-	pub revision:     Revision,
+	pub revision:       Revision,
 	/// Idempotency identity for the new turn.
-	pub turn:         TurnId,
+	pub turn:           TurnId,
 	/// Requested context transport strategy.
-	pub strategy:     ContextStrategy,
+	pub strategy:       ContextStrategy,
+	/// Preserve a byte-stable prefix and admit only newly appended messages.
+	pub append_only:    bool,
+	/// Discard provider-native affinity before selecting an account.
+	pub provider_reset: bool,
 	/// Whether the caller deliberately forked from an earlier revision.
-	pub forked:       bool,
+	pub forked:         bool,
 }
 
 /// Determines how canonical conversation context reaches a provider.
@@ -686,19 +690,23 @@ pub enum CacheRetention {
 #[derive(Clone, Debug, Default)]
 pub struct Sampling {
 	/// Temperature.
-	pub temperature:       Option<f32>,
+	pub temperature:        Option<f32>,
 	/// Nucleus probability.
-	pub top_p:             Option<f32>,
+	pub top_p:              Option<f32>,
 	/// Top-k candidate bound.
-	pub top_k:             Option<u32>,
+	pub top_k:              Option<u32>,
+	/// Minimum token probability relative to the most likely token.
+	pub min_p:              Option<f32>,
 	/// Deterministic seed when supported.
-	pub seed:              Option<u64>,
+	pub seed:               Option<u64>,
 	/// Stop sequences.
-	pub stop:              Arc<[Str]>,
+	pub stop:               Arc<[Str]>,
 	/// Presence penalty.
-	pub presence_penalty:  Option<f32>,
+	pub presence_penalty:   Option<f32>,
 	/// Frequency penalty.
-	pub frequency_penalty: Option<f32>,
+	pub frequency_penalty:  Option<f32>,
+	/// Provider-native repetition penalty.
+	pub repetition_penalty: Option<f32>,
 }
 
 /// One typed content-safety setting.
@@ -756,6 +764,36 @@ pub struct ChatRequest {
 	pub safety:            Arc<[SafetySetting]>,
 	/// Capability negotiation policy.
 	pub negotiation:       NegotiationPolicy,
+}
+
+impl ChatRequest {
+	/// Validates that an explicitly named choice occurs in the policy-resolved
+	/// live declarations. This runs once at the shared pre-codec boundary.
+	pub fn validate_named_tool_choice(&self) -> Result<(), NamedToolChoiceError> {
+		let choice = match &self.tool_choice {
+			Setting::Require(ToolChoice::Named(name)) | Setting::Prefer(ToolChoice::Named(name)) => {
+				name
+			},
+			Setting::Unset
+			| Setting::Require(ToolChoice::Disabled | ToolChoice::Auto | ToolChoice::Required)
+			| Setting::Prefer(ToolChoice::Disabled | ToolChoice::Auto | ToolChoice::Required) => {
+				return Ok(());
+			},
+		};
+		if self.tools.iter().any(|tool| tool.name == *choice) {
+			Ok(())
+		} else {
+			Err(NamedToolChoiceError { name: choice.clone() })
+		}
+	}
+}
+
+/// A named tool choice absent from the live declarations.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("named tool {name} is not declared")]
+pub struct NamedToolChoiceError {
+	/// Unavailable tool name.
+	pub name: Str,
 }
 
 /// Provenance required for token counting.
@@ -1004,6 +1042,62 @@ pub enum RealtimeModality {
 	Audio,
 }
 
+/// Semantic destination for text appended to a realtime session.
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum RealtimeContextChannel {
+	/// Text suitable for speaking to the user.
+	Speakable,
+	/// Progress text that should not interrupt the spoken response.
+	Commentary,
+}
+
+/// Scope receiving appended realtime context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RealtimeContextTarget {
+	/// Session-wide context not tied to delegated work.
+	Session,
+	/// Context associated with one delegated agent turn.
+	Delegation {
+		/// Stable delegation identity issued by the realtime peer.
+		id: Str,
+	},
+}
+
+/// Provider-neutral context appended during a realtime session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeContextAppend {
+	/// Scope receiving the context.
+	pub target:  RealtimeContextTarget,
+	/// Semantic presentation channel.
+	pub channel: RealtimeContextChannel,
+	/// Canonical UTF-8 text. Transport chunking is adapter-owned.
+	pub text:    Str,
+}
+
+/// Terminal state of one delegated agent turn.
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum RealtimeDelegationStatus {
+	/// The delegated turn produced its final response.
+	Completed,
+	/// The caller cancelled delegated work.
+	Cancelled,
+	/// The delegated turn failed before producing a final response.
+	Failed,
+}
+
+/// Exactly-once settlement evidence for one delegated agent turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeDelegationReceipt {
+	/// Stable delegation identity issued by the realtime peer.
+	pub delegation_id: Str,
+	/// Terminal delegated-turn state.
+	pub status:        RealtimeDelegationStatus,
+	/// Time at which the core agent bridge settled the turn.
+	pub settled_at:    SystemTime,
+}
+
 /// Server-side turn detection for realtime audio.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnDetection {
@@ -1077,22 +1171,64 @@ pub enum SearchRecency {
 /// Request for standalone ranked web search.
 #[derive(Clone, Debug)]
 pub struct SearchRequest {
-	/// Search query.
-	pub query:             Str,
-	/// Included domains; empty means unrestricted.
-	pub include_domains:   Arc<[Str]>,
-	/// Excluded domains.
-	pub exclude_domains:   Arc<[Str]>,
+	/// Search query as authored.
+	pub query:              Str,
+	/// Parsed directives shared across route attempts.
+	pub parsed_query:       Arc<crate::operation::search_query::SearchQuery>,
+	/// Included domains supplied outside query text; empty means unrestricted.
+	pub include_domains:    Arc<[Str]>,
+	/// Excluded domains supplied outside query text.
+	pub exclude_domains:    Arc<[Str]>,
 	/// Recency constraint.
-	pub recency:           Option<SearchRecency>,
+	pub recency:            Option<SearchRecency>,
 	/// BCP-47 locale hint.
-	pub locale:            Option<Str>,
-	/// Maximum ranked result count.
-	pub max_results:       u32,
+	pub locale:             Option<Str>,
+	/// Maximum ranked result count returned to the caller.
+	pub max_results:        u32,
+	/// Provider retrieval count when distinct from returned results.
+	pub retrieval_results:  Option<u32>,
+	/// Maximum synthesis output tokens.
+	pub max_output_tokens:  Option<u32>,
+	/// Synthesis sampling temperature.
+	pub temperature:        Option<f32>,
+	/// Explicit provider pin, when any.
+	pub provider:           Option<ProviderId>,
+	/// Configured provider preference order for automatic search.
+	pub provider_order:     Arc<[ProviderId]>,
+	/// Providers excluded from automatic search.
+	pub excluded_providers: Arc<[ProviderId]>,
+	/// Per-provider attempt timeout, already clamped by the owner.
+	pub attempt_timeout:    Duration,
 	/// Whether an answer synthesis is requested.
-	pub synthesize_answer: Setting<bool>,
+	pub synthesize_answer:  Setting<bool>,
 	/// Capability negotiation policy.
-	pub negotiation:       NegotiationPolicy,
+	pub negotiation:        NegotiationPolicy,
+}
+
+impl SearchRequest {
+	/// Constructs a canonical search request with automatic provider selection.
+	#[must_use]
+	pub fn new(query: impl Into<Str>, max_results: u32) -> Self {
+		let query = query.into();
+		Self {
+			parsed_query: Arc::new(crate::operation::search_query::parse_search_query(&query)),
+			query,
+			include_domains: Arc::new([]),
+			exclude_domains: Arc::new([]),
+			recency: None,
+			locale: None,
+			max_results,
+			retrieval_results: None,
+			max_output_tokens: None,
+			temperature: None,
+			provider: None,
+			provider_order: Arc::new([]),
+			excluded_providers: Arc::new([]),
+			attempt_timeout: Duration::from_secs(60),
+			synthesize_answer: Setting::Unset,
+			negotiation: NegotiationPolicy::default(),
+		}
+	}
 }
 
 /// Usage windows to query.

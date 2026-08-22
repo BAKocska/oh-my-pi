@@ -54,7 +54,7 @@ impl MiniMaxCodeUsageFetcher {
 	}
 }
 impl ConsoleUsageFetcher for MiniMaxCodeUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

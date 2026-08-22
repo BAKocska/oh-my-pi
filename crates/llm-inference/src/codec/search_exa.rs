@@ -171,9 +171,9 @@ impl Codec for ExaSearchCodec {
 		Ok(Box::new(ExaDecoder {
 			bytes:      BytesMut::new(),
 			finished:   false,
-			provider:   context.provider.clone(),
-			route:      context.route.clone(),
-			request_id: context.request_id.clone(),
+			provider:   context.provider.to_owned(),
+			route:      context.route.to_owned(),
+			request_id: context.request_id.to_owned(),
 		}))
 	}
 }
@@ -249,12 +249,14 @@ impl Decoder for ExaDecoder {
 						snippet:      snippet(result.highlights, result.text),
 						score:        result.score.filter(|score| score.is_finite()),
 						published_at: result.published_date.as_deref().and_then(parse_rfc3339),
+						author:       None,
 					})
 					.collect();
 				emit(RawEvent::Answer(AnswerBody::Search(SearchResults {
 					results,
 					answer: None,
 					usage: Usage { search_calls: 1, source: UsageSource::Provider, ..Usage::default() },
+					metadata: Default::default(),
 				})));
 			},
 			ExaResponse::ApiError(error) => emit(RawEvent::Failure(self.api_error(error))),
@@ -401,14 +403,15 @@ mod tests {
 
 	fn request() -> SearchRequest {
 		SearchRequest {
-			query:             sf!("rust inference"),
-			include_domains:   Arc::from([sf!("docs.rs"), sf!("rust-lang.org/book")]),
-			exclude_domains:   Arc::from([sf!("spam.example")]),
-			recency:           Some(SearchRecency::Week),
-			locale:            None,
-			max_results:       7,
+			query: sf!("rust inference"),
+			include_domains: Arc::from([sf!("docs.rs"), sf!("rust-lang.org/book")]),
+			exclude_domains: Arc::from([sf!("spam.example")]),
+			recency: Some(SearchRecency::Week),
+			locale: None,
+			max_results: 7,
 			synthesize_answer: Setting::Unset,
-			negotiation:       NegotiationPolicy::default(),
+			negotiation: NegotiationPolicy::default(),
+			..SearchRequest::new(sf!("rust inference"), 7)
 		}
 	}
 

@@ -739,6 +739,7 @@ impl CodexModelsDecoder {
 					Availability::Native(modalities)
 				},
 				hosted_tools:      Availability::Unknown,
+				image_input:       Availability::Unknown,
 				prompt_caching:    Availability::Unknown,
 				service_tiers:     Availability::Unknown,
 				sampling:          Availability::Unknown,

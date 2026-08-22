@@ -303,6 +303,7 @@ fn project_results(data: KagiData) -> SearchResults {
 		results,
 		answer: None,
 		usage: Usage { search_calls: 1, source: UsageSource::Measured, ..Usage::default() },
+		metadata: Default::default(),
 	}
 }
 
@@ -319,6 +320,7 @@ fn project_record(record: KagiUrlRecord) -> Option<SearchResult> {
 		snippet: record.snippet.and_then(trimmed),
 		score: None,
 		published_at: record.time.as_deref().and_then(parse_rfc3339),
+		author: None,
 	})
 }
 
@@ -392,14 +394,15 @@ mod tests {
 
 	fn request() -> SearchRequest {
 		SearchRequest {
-			query:             sf!("rust sans-I/O"),
-			include_domains:   Arc::from([]),
-			exclude_domains:   Arc::from([]),
-			recency:           None,
-			locale:            None,
-			max_results:       7,
+			query: sf!("rust sans-I/O"),
+			include_domains: Arc::from([]),
+			exclude_domains: Arc::from([]),
+			recency: None,
+			locale: None,
+			max_results: 7,
 			synthesize_answer: Setting::Unset,
-			negotiation:       NegotiationPolicy::default(),
+			negotiation: NegotiationPolicy::default(),
+			..SearchRequest::new(sf!("rust sans-I/O"), 7)
 		}
 	}
 

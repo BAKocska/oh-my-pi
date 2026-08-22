@@ -271,7 +271,7 @@ impl GithubCopilotShaper {
 
 	/// Provider whose credentials this shaper rewrites.
 	#[must_use]
-	pub const fn provider(&self) -> &ProviderId {
+	pub fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

@@ -23,7 +23,7 @@ impl AuthLoginEngine for UnusedLogin {
 		self.0
 	}
 
-	fn supports(&self, _provider: &omp_llm_catalog::ProviderId) -> bool {
+	fn supports(&self, _provider: &omp_llm_catalog::ProviderId<str>) -> bool {
 		true
 	}
 

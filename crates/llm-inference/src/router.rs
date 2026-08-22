@@ -12,7 +12,8 @@ use omp_core::{Str, sf};
 use crate::{
 	call::{Call, ContentPart, OperationCall, Role, Target},
 	catalog::{
-		CodecId, ModelKey, OperationKind, PolicyModel, PriceUnit, ProviderId, RouteId, WireTarget,
+		CodecId, ModelKey, OperationKind, PolicyModel, PriceUnit, ProviderId, RouteId,
+		ThinkingEffort, WireTarget, clamp_thinking_effort,
 	},
 	error::{Error, ErrorDetail, ErrorKind},
 	plan::{
@@ -37,6 +38,30 @@ pub struct RouteCandidate {
 	pub wire_target:  WireTarget,
 }
 
+/// Leases credentials in candidate-plan order and returns the first callable
+/// route.
+///
+/// The candidate values are cloned, not rewritten: testing a fallback can never
+/// mutate the pinned selector retained in [`RouteSelection`].
+pub async fn first_callable_candidate<E, F, Fut>(
+	candidates: &[RouteCandidate],
+	mut lease: F,
+) -> Result<RouteCandidate, Vec<(RouteId, E)>>
+where
+	F: FnMut(RouteCandidate) -> Fut,
+	Fut: Future<Output = Result<(), E>>,
+{
+	let mut failures = Vec::new();
+	for candidate in candidates {
+		let owned = candidate.clone();
+		match lease(owned.clone()).await {
+			Ok(()) => return Ok(owned),
+			Err(error) => failures.push((candidate.wire_target.route.clone(), error)),
+		}
+	}
+	Err(failures)
+}
+
 /// Exact primary selector and caller-authorized ordered model fallback chain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteSelection {
@@ -49,7 +74,7 @@ pub struct RouteSelection {
 
 impl RouteSelection {
 	/// Returns the exact primary model without exposing a wire identifier.
-	pub const fn primary_model(&self) -> Option<&ModelKey> {
+	pub fn primary_model(&self) -> Option<&ModelKey<str>> {
 		match &self.target {
 			Target::Model(model) | Target::Provider { model, .. } | Target::Route { model, .. } => {
 				Some(model)
@@ -63,26 +88,31 @@ impl RouteSelection {
 #[derive(Clone, Debug)]
 pub struct PlanRequest {
 	/// Exact selector and explicit ordered fallbacks.
-	pub selection:      RouteSelection,
+	pub selection:        RouteSelection,
 	/// Closed operation kind.
-	pub operation:      OperationKind,
+	pub operation:        OperationKind,
 	/// Exact clone-cheap operation payload used for setting negotiation.
-	pub operation_call: Option<OperationCall>,
+	pub operation_call:   Option<OperationCall>,
 	/// All resolved catalog candidates; the router never creates candidates
 	/// itself.
-	pub candidates:     Arc<[RouteCandidate]>,
+	pub candidates:       Arc<[RouteCandidate]>,
 	/// Required and preferred capability axes.
-	pub requirements:   Arc<[CapabilityRequirement]>,
+	pub requirements:     Arc<[CapabilityRequirement]>,
 	/// Typed codec-specific option, when present.
-	pub native_option:  Option<NativeOptionRequirement>,
+	pub native_option:    Option<NativeOptionRequirement>,
 	/// Caller negotiation policy.
-	pub policy:         PlanningPolicy,
+	pub policy:           PlanningPolicy,
 	/// Aggregate replay and staging facts.
-	pub replay:         ReplayRequirements,
+	pub replay:           ReplayRequirements,
 	/// Cross-attempt execution budget.
-	pub budget:         ExecutionBudget,
+	pub budget:           ExecutionBudget,
+	/// Configured models retained without a discovery/catalog route.
+	pub declared_models:  Arc<[ModelKey]>,
 	/// Existing account/session route affinity, when any.
-	pub affinity_route: Option<RouteId>,
+	pub affinity_route:   Option<RouteId>,
+	/// Final configured thinking ceiling applied equally to primary and fallback
+	/// candidates.
+	pub thinking_ceiling: Option<ThinkingEffort>,
 }
 
 /// Immutable capability-first router over one immutable registry.
@@ -91,13 +121,36 @@ pub struct Router {
 	registry: Registry,
 	plan_ttl: Duration,
 	runtime:  Arc<HashMap<RouteId, RuntimeRouteEvidence>>,
+	settings: crate::settings::InferenceSettings,
 }
 
 impl Router {
 	/// Creates a router whose plans expire after the supplied short validity
 	/// window.
 	pub fn new(registry: Registry, plan_ttl: Duration) -> Self {
-		Self { registry, plan_ttl, runtime: Arc::new(HashMap::new()) }
+		Self {
+			registry,
+			plan_ttl,
+			runtime: Arc::new(HashMap::new()),
+			settings: crate::settings::InferenceSettings::default(),
+		}
+	}
+
+	/// Installs the immutable runtime settings projection used for planning.
+	#[must_use]
+	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
+		self.settings = settings;
+		self
+	}
+
+	/// Returns the configured selector for one harness-owned auxiliary model
+	/// use.
+	#[must_use]
+	pub const fn special_selector(
+		&self,
+		purpose: omp_llm_catalog::settings::SpecialModelPurpose,
+	) -> &Str {
+		self.settings.model.special_selector(purpose)
 	}
 
 	/// Replaces credential-free route observations used by subsequent
@@ -110,6 +163,12 @@ impl Router {
 	/// Resolves catalog candidates and operation intent directly from a
 	/// canonical call.
 	pub fn plan_call(&self, call: &Call, now: Instant) -> Result<ExecutionPlan, Error> {
+		let mut call = call.clone();
+		self.settings.apply_planning_call(&mut call);
+		self.plan_applied_call(&call, now)
+	}
+
+	fn plan_applied_call(&self, call: &Call, now: Instant) -> Result<ExecutionPlan, Error> {
 		match &call.target {
 			Target::ProviderService(provider) => self.plan_management(call, provider, None, now),
 			Target::RouteService(route) => {
@@ -154,20 +213,36 @@ impl Router {
 						},
 					});
 				}
+				let primary_provider = candidates.first().map(|candidate| &*candidate.provider);
+				let fallback_models = if self.settings.retry.model_fallback {
+					self
+						.settings
+						.retry
+						.fallback_selectors(model, primary_provider)
+						.map(|selector| ModelKey::from(selector.clone()))
+						.filter(|fallback| {
+							fallback != model && self.registry.catalog().model(fallback).is_some()
+						})
+						.collect::<Vec<_>>()
+				} else {
+					Vec::new()
+				};
 				let request = PlanRequest {
-					selection:      RouteSelection {
+					selection:        RouteSelection {
 						target:          call.target.clone(),
-						fallback_models: Arc::from([]),
+						fallback_models: fallback_models.into(),
 					},
-					operation:      call.operation.kind(),
-					candidates:     candidates.into(),
-					requirements:   extract_requirements(&call.operation).into(),
-					operation_call: Some(call.operation.clone()),
-					native_option:  None,
-					policy:         operation_policy(&call.operation),
-					replay:         operation_replay(&call.operation),
-					budget:         call.budget.clone(),
-					affinity_route: None,
+					operation:        call.operation.kind(),
+					candidates:       candidates.into(),
+					requirements:     extract_requirements(&call.operation).into(),
+					operation_call:   Some(call.operation.clone()),
+					native_option:    None,
+					policy:           operation_policy(&call.operation),
+					replay:           operation_replay(&call.operation),
+					budget:           call.budget.clone(),
+					declared_models:  Arc::from([]),
+					affinity_route:   None,
+					thinking_ceiling: Some(self.settings.model.thinking_ceiling),
 				};
 				self.plan(&request, &self.runtime, now)
 			},
@@ -177,8 +252,8 @@ impl Router {
 	fn plan_management(
 		&self,
 		call: &Call,
-		provider: &ProviderId,
-		pinned_route: Option<&RouteId>,
+		provider: &ProviderId<str>,
+		pinned_route: Option<&RouteId<str>>,
 		now: Instant,
 	) -> Result<ExecutionPlan, Error> {
 		let definition = self
@@ -191,7 +266,7 @@ impl Router {
 		let requirements = extract_requirements(&call.operation);
 		let policy = operation_policy(&call.operation);
 		let evidence_route = pinned_route
-			.or_else(|| definition.routes.first())
+			.or_else(|| definition.routes.first().map(|route| &**route))
 			.ok_or_else(|| target_not_found(&call.target))?;
 		let wire_policy = self
 			.registry
@@ -305,7 +380,7 @@ impl Router {
 			.into_iter()
 			.map(|(candidate, runtime, decisions)| crate::plan::PlannedFallback {
 				model:              None,
-				provider:           provider.clone(),
+				provider:           provider.to_owned(),
 				route:              candidate.id.clone(),
 				codec:              candidate.codec.clone(),
 				wire_policy:        Arc::new(wire_policy.clone()),
@@ -319,12 +394,12 @@ impl Router {
 			.collect::<Vec<_>>();
 		Ok(ExecutionPlan {
 			planned_at: std::time::SystemTime::now(),
-			catalog_revision: self.registry.catalog_revision().clone(),
+			catalog_revision: self.registry.catalog_revision().to_owned(),
 			registry_generation: self.registry.generation(),
 			expires_at: now.checked_add(self.plan_ttl).unwrap_or(now),
 			operation,
 			model: None,
-			provider: provider.clone(),
+			provider: provider.to_owned(),
 			route: route.id.clone(),
 			codec: route.codec.clone(),
 			policy_model: None,
@@ -361,10 +436,22 @@ impl Router {
 			));
 		};
 		let mut authorized = Vec::with_capacity(request.selection.fallback_models.len() + 1);
-		authorized.push(primary.clone());
-		authorized.extend(request.selection.fallback_models.iter().cloned());
+		if self.settings.retry.fallback_revert == crate::settings::FallbackRevertPolicy::Never
+			&& let Some(active) = crate::settings::active_fallback(primary)
+			&& request.selection.fallback_models.contains(&active)
+		{
+			authorized.push(active);
+		}
+		if !authorized.iter().any(|model| model == primary) {
+			authorized.push(primary.to_owned());
+		}
+		for model in request.selection.fallback_models.iter() {
+			if !authorized.contains(model) {
+				authorized.push(model.clone());
+			}
+		}
 		let authorized_scope = FallbackScope {
-			primary:  Some(primary.clone()),
+			primary:  Some(primary.to_owned()),
 			explicit: request.selection.fallback_models.clone(),
 		};
 		let mut last_error = None;
@@ -374,18 +461,18 @@ impl Router {
 			for candidate in request
 				.candidates
 				.iter()
-				.filter(|candidate| &candidate.model == model)
+				.filter(|candidate| candidate.model.as_str() == model.as_str())
 			{
 				if !selector_accepts(
 					&request.selection.target,
 					primary,
 					&authorized_scope,
 					candidate,
-					model == primary,
+					model.as_str() == primary.as_str(),
 				) {
 					continue;
 				}
-				if model != primary
+				if model.as_str() != primary.as_str()
 					&& anthropic_thinking_binds_model(
 						request.operation_call.as_ref(),
 						&candidate.provider,
@@ -398,10 +485,39 @@ impl Router {
 					Err(error) => last_error = Some(prefer_error(last_error, error)),
 				}
 			}
-			model_candidates.sort_by(compare_evaluated);
+			model_candidates
+				.sort_by(|left, right| compare_evaluated(left, right, &self.settings.model));
+			let inside_reserve = model.as_str() == primary.as_str()
+				&& self.settings.retry.usage_aware_fallback
+				&& !model_candidates.is_empty()
+				&& model_candidates.iter().all(|candidate| {
+					candidate.runtime.quota_millionths > 0
+						&& candidate.runtime.quota_millionths
+							<= u32::from(self.settings.retry.usage_reserve_pct) * 10_000
+				});
+			if inside_reserve {
+				match self.settings.retry.usage_reserve_policy {
+					crate::settings::UsageReservePolicy::Confirm => {},
+					crate::settings::UsageReservePolicy::Auto => continue,
+					crate::settings::UsageReservePolicy::FailClosed => {
+						return Err(capability_error(
+							ErrorKind::QuotaExhausted,
+							request.operation,
+							"configured-usage-reserve-reached",
+						));
+					},
+				}
+			}
 			eligible.extend(model_candidates);
 		}
 		if eligible.is_empty() {
+			if request.declared_models.iter().any(|model| model == primary) {
+				return Err(Error::planning(
+					ErrorKind::RouteUnavailable,
+					ErrorDetail::target(sf!("configured-model-route-unavailable")),
+					ExecutionReceipt::default(),
+				));
+			}
 			return Err(last_error.unwrap_or_else(|| target_not_found(&request.selection.target)));
 		}
 		let selected = self.resolved_candidate(request, &eligible[0])?;
@@ -412,7 +528,7 @@ impl Router {
 		let replay = plan_replay(&request.replay, &request.budget)?;
 		Ok(ExecutionPlan {
 			planned_at: std::time::SystemTime::now(),
-			catalog_revision: self.registry.catalog_revision().clone(),
+			catalog_revision: self.registry.catalog_revision().to_owned(),
 			registry_generation: self.registry.generation(),
 			expires_at: now.checked_add(self.plan_ttl).unwrap_or(now),
 			operation: request.operation,
@@ -451,7 +567,7 @@ impl Router {
 				)
 			})?;
 		let mut wire_target = candidate.candidate.wire_target.clone();
-		let thinking_policy = candidate
+		let mut thinking_policy = candidate
 			.candidate
 			.policy_model
 			.thinking
@@ -467,8 +583,15 @@ impl Router {
 					})
 			})
 			.transpose()?;
+		if let Some(policy) = &mut thinking_policy {
+			self.settings.model.apply_thinking_policy(policy);
+		}
 		let requested_effort =
-			chat_thinking_effort(request.operation_call.as_ref(), thinking_policy.as_ref())?;
+			chat_thinking_effort(request.operation_call.as_ref(), thinking_policy.as_ref())?
+				.or(Some(self.settings.model.default_thinking));
+		let requested_effort = thinking_policy.as_ref().and_then(|policy| {
+			clamp_thinking_effort(policy, requested_effort, request.thinking_ceiling)
+		});
 		let thinking_selection = thinking_policy
 			.as_ref()
 			.map(|policy| {
@@ -489,6 +612,10 @@ impl Router {
 		if let Some(selection) = &thinking_selection {
 			wire_target.wire_model = selection.wire_model.clone();
 		}
+		wire_target.wire_model = self
+			.settings
+			.model
+			.openrouter_wire_model(candidate.candidate.provider.as_str(), &wire_target.wire_model);
 		Ok(crate::plan::PlannedFallback {
 			model: Some(candidate.candidate.model.clone()),
 			provider: candidate.candidate.provider.clone(),
@@ -520,6 +647,13 @@ impl Router {
 			|| definition.codec != candidate.wire_target.codec
 		{
 			return Err(route_contract_error(route, "candidate-route-definition-mismatch"));
+		}
+		if !self.settings.model.wire_route_allowed(
+			definition.provider.as_str(),
+			definition.codec.as_str(),
+			definition.transport,
+		) {
+			return Err(route_contract_error(route, "route-disabled-by-wire-settings"));
 		}
 		if !candidate
 			.policy_model
@@ -627,7 +761,7 @@ impl Planner for Router {
 	}
 }
 
-fn target_route_allowed(target: &Target, route: &RouteId, provider: &ProviderId) -> bool {
+fn target_route_allowed(target: &Target, route: &RouteId<str>, provider: &ProviderId<str>) -> bool {
 	match target {
 		Target::Model(_) => true,
 		Target::Provider { provider: expected, .. } => expected == provider,
@@ -987,8 +1121,8 @@ const fn reasoning_to_thinking(
 }
 
 fn model_less_route_is_candidate(
-	route: &RouteId,
-	pinned_route: Option<&RouteId>,
+	route: &RouteId<str>,
+	pinned_route: Option<&RouteId<str>>,
 	provider_support: bool,
 	route_operations: Option<crate::catalog::OperationBits>,
 	operation: OperationKind,
@@ -1017,7 +1151,7 @@ struct EvaluatedCandidate {
 
 fn selector_accepts(
 	target: &Target,
-	primary: &ModelKey,
+	primary: &ModelKey<str>,
 	scope: &FallbackScope,
 	candidate: &RouteCandidate,
 	is_primary: bool,
@@ -1048,8 +1182,8 @@ fn selector_accepts(
 /// (same-model retry) and other providers stay eligible.
 fn anthropic_thinking_binds_model(
 	operation_call: Option<&OperationCall>,
-	provider: &ProviderId,
-	codec: &CodecId,
+	provider: &ProviderId<str>,
+	codec: &CodecId<str>,
 ) -> bool {
 	if codec.as_str() != "anthropic" {
 		return false;
@@ -1074,11 +1208,17 @@ fn anthropic_thinking_binds_model(
 	})
 }
 
-fn compare_evaluated(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Ordering {
+fn compare_evaluated(
+	left: &EvaluatedCandidate,
+	right: &EvaluatedCandidate,
+	settings: &omp_llm_catalog::settings::ModelSettings,
+) -> Ordering {
 	let left_affinity = left.runtime.affinity;
 	let right_affinity = right.runtime.affinity;
-	right_affinity
-		.cmp(&left_affinity)
+	settings
+		.provider_rank(left.candidate.provider.as_str())
+		.cmp(&settings.provider_rank(right.candidate.provider.as_str()))
+		.then_with(|| right_affinity.cmp(&left_affinity))
 		.then_with(|| health_rank(left.runtime.health).cmp(&health_rank(right.runtime.health)))
 		.then_with(|| {
 			right
@@ -1165,7 +1305,7 @@ fn target_not_found(target: &Target) -> Error {
 	)
 }
 
-fn target_route_not_found(route: &RouteId) -> Error {
+fn target_route_not_found(route: &RouteId<str>) -> Error {
 	Error::planning(
 		ErrorKind::TargetNotFound,
 		ErrorDetail::target(Str::new(route.as_str())),
@@ -1181,13 +1321,13 @@ fn capability_error(kind: ErrorKind, operation: OperationKind, reason: &'static 
 	)
 }
 
-fn route_contract_error(route: &RouteId, reason: &'static str) -> Error {
+fn route_contract_error(route: &RouteId<str>, reason: &'static str) -> Error {
 	Error::planning(
 		ErrorKind::RouteUnavailable,
 		ErrorDetail::capability(Str::new(route.as_str()), ReasonId(Str::new(reason))),
 		ExecutionReceipt::default(),
 	)
-	.route(route.clone())
+	.route(route.to_owned())
 }
 
 #[cfg(test)]

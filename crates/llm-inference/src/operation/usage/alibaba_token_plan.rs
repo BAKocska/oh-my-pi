@@ -128,7 +128,7 @@ impl AlibabaTokenPlanUsageFetcher {
 }
 
 impl ConsoleUsageFetcher for AlibabaTokenPlanUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

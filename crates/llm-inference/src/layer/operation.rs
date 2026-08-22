@@ -57,14 +57,22 @@ pub struct OperationPolicyConfig {
 /// Construction-time layer applying canonical operation behavior exactly once.
 #[derive(Clone, Debug)]
 pub struct OperationPolicyLayer {
-	config: OperationPolicyConfig,
+	config:   OperationPolicyConfig,
+	settings: crate::settings::InferenceSettings,
 }
 
 impl OperationPolicyLayer {
 	/// Constructs route operation policy from catalog and executable service
 	/// facts.
-	pub const fn new(config: OperationPolicyConfig) -> Self {
-		Self { config }
+	pub fn new(config: OperationPolicyConfig) -> Self {
+		Self { config, settings: crate::settings::InferenceSettings::default() }
+	}
+
+	/// Installs the immutable runtime settings projection applied before policy.
+	#[must_use]
+	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
+		self.settings = settings;
+		self
 	}
 }
 
@@ -72,7 +80,7 @@ impl<S> Layer<S> for OperationPolicyLayer {
 	type Service = OperationPolicyService<S>;
 
 	fn layer(&self, inner: S) -> Self::Service {
-		OperationPolicyService { inner, config: self.config.clone() }
+		OperationPolicyService { inner, config: self.config.clone(), settings: self.settings.clone() }
 	}
 }
 
@@ -80,8 +88,9 @@ impl<S> Layer<S> for OperationPolicyLayer {
 /// validation.
 #[derive(Clone, Debug)]
 pub struct OperationPolicyService<S> {
-	inner:  S,
-	config: OperationPolicyConfig,
+	inner:    S,
+	config:   OperationPolicyConfig,
+	settings: crate::settings::InferenceSettings,
 }
 
 impl<S> Service<LayerCall<crate::call::Call>> for OperationPolicyService<S>
@@ -101,7 +110,8 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, request: LayerCall<crate::call::Call>) -> Self::Future {
+	fn call(&mut self, mut request: LayerCall<crate::call::Call>) -> Self::Future {
+		self.settings.apply_call(&mut request.payload);
 		let original = request.payload.clone();
 		let config = self.config.clone();
 		let prepared = prepare(&request, &config);

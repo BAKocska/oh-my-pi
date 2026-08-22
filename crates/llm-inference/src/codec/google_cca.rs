@@ -882,8 +882,8 @@ pub fn parse_cca_models(body: &[u8]) -> Result<Vec<CcaModelRecord>, GoogleCodecE
 }
 
 fn cca_discovered_rows(
-	provider: &ProviderId,
-	route: &RouteId,
+	provider: &ProviderId<str>,
+	route: &RouteId<str>,
 	records: Vec<CcaModelRecord>,
 ) -> Vec<DiscoveredModel> {
 	records
@@ -915,6 +915,7 @@ fn cca_discovered_rows(
 						None => Availability::Unknown,
 					},
 					hosted_tools:      Availability::Unknown,
+					image_input:       Availability::Unknown,
 					prompt_caching:    Availability::Unknown,
 					service_tiers:     Availability::Unknown,
 					sampling:          Availability::Unknown,
@@ -940,8 +941,8 @@ fn cca_discovered_rows(
 					maximum_batch:         None,
 				});
 			DiscoveredModel {
-				provider: provider.clone(),
-				route: route.clone(),
+				provider: provider.to_owned(),
+				route: route.to_owned(),
 				wire_model: WireModelId::from(record.wire_id),
 				aliases: Box::new([]),
 				display_name: record.display_name,
@@ -1506,8 +1507,8 @@ mod tests {
 			.expect("internal record remains explicit raw evidence");
 		assert!(internal.is_internal);
 		let rows = cca_discovered_rows(
-			&ProviderId::from("google-cca"),
-			&RouteId::from("google-cca-primary"),
+			ProviderId::from_ref("google-cca"),
+			RouteId::from_ref("google-cca-primary"),
 			records,
 		);
 		let internal = rows

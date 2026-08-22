@@ -317,9 +317,10 @@ mod tests {
 		assert!(RealtimeRequest::extract(answer(AnswerBody::Realtime(realtime))).is_ok());
 		assert!(
 			SearchRequest::extract(answer(AnswerBody::Search(SearchResults {
-				results: Vec::new(),
-				answer:  None,
-				usage:   Usage::default(),
+				results:  Vec::new(),
+				answer:   None,
+				usage:    Usage::default(),
+				metadata: Default::default(),
 			})))
 			.is_ok()
 		);

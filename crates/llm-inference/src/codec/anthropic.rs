@@ -662,8 +662,8 @@ fn spill_root_combinators(schema: &mut Value) {
 
 fn lower_count_tokens(
 	model: Str,
-	provider: &ProviderId,
-	codec: &CodecId,
+	provider: &ProviderId<str>,
+	codec: &CodecId<str>,
 	request: &CountTokensRequest,
 	claude_code_oauth: bool,
 ) -> Result<Bytes, Error> {
@@ -824,8 +824,8 @@ fn serialize_body(body: &MessagesRequest) -> Result<Bytes, Error> {
 /// Lowers the canonical chat vocabulary into the typed Messages body.
 pub fn lower_chat(
 	model: Str,
-	provider: &ProviderId,
-	codec: &CodecId,
+	provider: &ProviderId<str>,
+	codec: &CodecId<str>,
 	thinking_selection: Option<&ThinkingSelection>,
 	request: &ChatRequest,
 ) -> Result<MessagesRequest, Error> {
@@ -950,8 +950,8 @@ fn append_message(messages: &mut Vec<Message>, role: &'static str, mut blocks: V
 fn lower_parts(
 	parts: &[CanonicalPart],
 	cache: Option<CacheControl>,
-	provider: &ProviderId,
-	codec: &CodecId,
+	provider: &ProviderId<str>,
+	codec: &CodecId<str>,
 ) -> Result<Vec<ContentBlock>, Error> {
 	let mut blocks = Vec::with_capacity(parts.len());
 	for part in parts {
@@ -1092,8 +1092,8 @@ fn media_source(media: &MediaInput) -> Result<MediaSource, Error> {
 
 fn validate_proof(
 	proof: &ProviderProof,
-	provider: &ProviderId,
-	codec: &CodecId,
+	provider: &ProviderId<str>,
+	codec: &CodecId<str>,
 ) -> Result<(), Error> {
 	if &proof.provider == provider && &proof.codec == codec {
 		Ok(())
@@ -1104,8 +1104,8 @@ fn validate_proof(
 
 fn proof_signature(
 	proof: Option<&ProviderProof>,
-	provider: &ProviderId,
-	codec: &CodecId,
+	provider: &ProviderId<str>,
+	codec: &CodecId<str>,
 ) -> Result<Str, Error> {
 	let proof = proof.ok_or_else(|| capability_error("anthropic.reasoning.proof_required"))?;
 	validate_proof(proof, provider, codec)?;
@@ -2990,8 +2990,8 @@ mod tests {
 		};
 		let body = lower_chat(
 			sf!("claude-opus-5"),
-			&ProviderId::new("anthropic"),
-			&CodecId::new("anthropic"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
 			None,
 			&request,
 		)

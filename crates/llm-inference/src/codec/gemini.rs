@@ -88,6 +88,25 @@ pub struct GoogleProofScope {
 	pub codec:    CodecId,
 }
 
+/// Whether tool descriptors are moved into deterministic system guidance.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InlineToolDescriptorsMode {
+	/// Enable only for Gemini-equivalent guidance. This codec is
+	/// Gemini-equivalent.
+	#[default]
+	Auto,
+	/// Always inline descriptors.
+	On,
+	/// Keep descriptions and schemas in native declarations.
+	Off,
+}
+
+impl InlineToolDescriptorsMode {
+	const fn enabled_for_gemini(self) -> bool {
+		!matches!(self, Self::Off)
+	}
+}
+
 /// A provider-scoped request option supplied explicitly by planning or the
 /// caller.
 #[derive(Clone, Debug, Default)]
@@ -111,6 +130,8 @@ pub struct GoogleRequestOptions {
 	/// Legacy typed remote-file substitutions keyed by `(message index, part
 	/// index)`.
 	pub remote_files:            BTreeMap<(usize, usize), GoogleFileData>,
+	/// Inline descriptor optimization mode.
+	pub inline_tool_descriptors: InlineToolDescriptorsMode,
 }
 
 /// One explicit Google harm-policy entry.
@@ -169,6 +190,9 @@ pub struct GenerateContentRequest {
 	/// Generation controls.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub generation_config:  Option<GoogleGenerationConfig>,
+	/// Requested Google serving tier.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub service_tier:       Option<Str>,
 }
 
 /// One role-tagged `GenerateContent` content item.
@@ -697,12 +721,22 @@ impl GeminiCodec {
 				&mut adjustments,
 			)?;
 		}
+		if options.inline_tool_descriptors.enabled_for_gemini() && !request.tools.is_empty() {
+			system_parts.push(GooglePart {
+				text: Some(inline_tool_guidance(&request.tools)?),
+				..GooglePart::default()
+			});
+		}
 		if !system_parts.is_empty() {
 			output.system_instruction =
 				Some(GoogleSystemInstruction { role: None, parts: system_parts });
 		}
 		self.project_tools(request, options, &mut output, &mut adjustments)?;
 		output.generation_config = self.project_generation(request, options, &mut adjustments)?;
+		output.service_tier = match &request.service_tier {
+			Setting::Unset => None,
+			Setting::Require(tier) | Setting::Prefer(tier) => Some(tier.name.clone()),
+		};
 		output.safety_settings = if options.safety_settings.is_empty() {
 			request
 				.safety
@@ -1016,13 +1050,20 @@ impl GeminiCodec {
 						sf!("Gemini function declarations do not expose a strict boolean"),
 					));
 				}
-				let (parameters_json_schema, parameters) = match self.endpoint.schema_key() {
-					GoogleSchemaKey::Parameters => (None, Some(schema)),
-					GoogleSchemaKey::ParametersJsonSchema => (Some(schema), None),
-				};
+				let (parameters_json_schema, parameters, description) =
+					if options.inline_tool_descriptors.enabled_for_gemini() {
+						(None, None, None)
+					} else {
+						match self.endpoint.schema_key() {
+							GoogleSchemaKey::Parameters => (None, Some(schema), tool.description.clone()),
+							GoogleSchemaKey::ParametersJsonSchema => {
+								(Some(schema), None, tool.description.clone())
+							},
+						}
+					};
 				declarations.push(GoogleFunctionDeclaration {
 					name: tool.name.clone(),
-					description: tool.description.clone(),
+					description,
 					parameters_json_schema,
 					parameters,
 				});
@@ -1090,12 +1131,6 @@ impl GeminiCodec {
 			adjustments.push(GoogleAdjustment::new_static(
 				"cache",
 				"a cache retention request is not a Google cachedContent resource name",
-			));
-		}
-		if !matches!(request.service_tier, Setting::Unset) {
-			adjustments.push(GoogleAdjustment::new_static(
-				"service_tier",
-				"Google service tier is selected by route policy, not the GenerateContent body",
 			));
 		}
 		if request.top_logprobs.is_some() {
@@ -1448,6 +1483,29 @@ fn append_content(
 	} else {
 		contents.push(GoogleContent { role, parts });
 	}
+}
+
+fn inline_tool_guidance(tools: &[ToolDefinition]) -> Result<Str, GoogleCodecError> {
+	let mut guidance = String::from(
+		"Tool descriptors (use the native function names exactly; arguments must match each JSON \
+		 schema):",
+	);
+	for tool in tools {
+		let Some((parameters, _)) = tool.input.json_schema() else {
+			return Err(GoogleCodecError::capability("gemini.tools.grammar_unsupported"));
+		};
+		guidance.push_str("\n\n");
+		guidance.push_str(tool.name.as_str());
+		if let Some(description) = &tool.description {
+			guidance.push_str(": ");
+			guidance.push_str(description);
+		}
+		guidance.push_str("\ninput_schema: ");
+		let schema = serde_json::to_string(parameters.0.as_ref())
+			.map_err(|error| GoogleCodecError::encoding(format!("invalid tool schema: {error}")))?;
+		guidance.push_str(&schema);
+	}
+	Ok(Str::from(guidance))
 }
 
 fn project_tool_choice(
@@ -3626,7 +3684,7 @@ mod tests {
 			.resolve(
 				&policy,
 				Some(ThinkingEffort::Minimal),
-				&omp_llm_catalog::WireModelId::new("gemini-3.7-flash"),
+				omp_llm_catalog::WireModelId::from_ref("gemini-3.7-flash"),
 			)
 			.expect("minimal resolves");
 		assert_eq!(selection.wire_model, "gemini-3.7-flash-low");
@@ -3750,13 +3808,15 @@ mod tests {
 			cache_retention:   Setting::Unset,
 			service_tier:      Setting::Unset,
 			sampling:          crate::call::Sampling {
-				temperature:       Some(0.2),
-				top_p:             Some(0.9),
-				top_k:             Some(32),
-				seed:              None,
-				stop:              vec!["END".into()].into(),
-				presence_penalty:  None,
-				frequency_penalty: None,
+				temperature:        Some(0.2),
+				top_p:              Some(0.9),
+				top_k:              Some(32),
+				min_p:              None,
+				seed:               None,
+				stop:               vec!["END".into()].into(),
+				presence_penalty:   None,
+				frequency_penalty:  None,
+				repetition_penalty: None,
 			},
 			max_output_tokens: Some(2048),
 			top_logprobs:      None,

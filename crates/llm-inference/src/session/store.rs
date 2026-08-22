@@ -40,45 +40,47 @@ pub trait ConversationStore<I>: Send + Sync {
 	/// Creates an empty conversation and its committed root revision.
 	fn create(&self) -> Result<CommittedRevision<I>, ConversationError>;
 	/// Returns the current committed head.
-	fn head(&self, conversation: &ConversationId)
-	-> Result<CommittedRevision<I>, ConversationError>;
+	fn head(
+		&self,
+		conversation: &ConversationId<str>,
+	) -> Result<CommittedRevision<I>, ConversationError>;
 	/// Returns one immutable committed revision.
-	fn revision(&self, revision: &Revision) -> Result<CommittedRevision<I>, ConversationError>;
+	fn revision(&self, revision: &Revision<str>) -> Result<CommittedRevision<I>, ConversationError>;
 	/// Creates a new branch whose head references an existing committed
 	/// revision.
-	fn fork(&self, at: &Revision) -> Result<ConversationId, ConversationError>;
+	fn fork(&self, at: &Revision<str>) -> Result<ConversationId, ConversationError>;
 	/// Privately stages an append at the exact branch head.
 	fn begin(
 		&self,
-		conversation: &ConversationId,
-		at: &Revision,
+		conversation: &ConversationId<str>,
+		at: &Revision<str>,
 		turn: TurnId,
 		append: Arc<[I]>,
 	) -> Result<Self::Draft, ConversationError>;
 	/// Returns a committed revision by its conversation-scoped turn identity.
 	fn committed_turn(
 		&self,
-		conversation: &ConversationId,
-		turn: &TurnId,
+		conversation: &ConversationId<str>,
+		turn: &TurnId<str>,
 	) -> Result<Option<CommittedRevision<I>>, ConversationError>;
 	/// Extracts immutable items after `base`, or a complete replay from the
 	/// root.
 	fn delta(
 		&self,
-		base: Option<&Revision>,
-		head: &Revision,
+		base: Option<&Revision<str>>,
+		head: &Revision<str>,
 	) -> Result<HistoryDelta<I>, ConversationError>;
 	/// Returns whether one committed revision is an ancestor of another.
 	fn is_ancestor(
 		&self,
-		ancestor: &Revision,
-		descendant: &Revision,
+		ancestor: &Revision<str>,
+		descendant: &Revision<str>,
 	) -> Result<bool, ConversationError>;
 	/// Returns provider-side state atomically attached to the branch's last
 	/// successful turn.
 	fn server_state(
 		&self,
-		conversation: &ConversationId,
+		conversation: &ConversationId<str>,
 	) -> Result<Option<ServerStateBinding>, ConversationError>;
 }
 
@@ -110,7 +112,7 @@ impl<I> InMemoryConversationStore<I> {
 	}
 
 	/// Returns the terminal response for a globally unique logical turn.
-	pub fn turn_replay(&self, turn: &TurnId) -> Option<TurnReplay> {
+	pub fn turn_replay(&self, turn: &TurnId<str>) -> Option<TurnReplay> {
 		self.replays.lock().get(turn).cloned()
 	}
 
@@ -163,7 +165,7 @@ impl<I> InMemoryConversationStore<I> {
 
 fn validate_turn_replay(
 	replays: &HashMap<TurnId, TurnReplay>,
-	turn: &TurnId,
+	turn: &TurnId<str>,
 	request: &Bytes,
 	outcome: &Bytes,
 ) -> Result<(), ConversationError> {
@@ -171,7 +173,7 @@ fn validate_turn_replay(
 		&& (existing.request.as_ref() != request.as_ref()
 			|| existing.outcome.as_ref() != outcome.as_ref())
 	{
-		return Err(ConversationError::TurnConflict(turn.clone()));
+		return Err(ConversationError::TurnConflict(turn.to_owned()));
 	}
 	Ok(())
 }
@@ -195,34 +197,33 @@ impl<I: PartialEq + Send + Sync + 'static> ConversationStore<I> for InMemoryConv
 
 	fn head(
 		&self,
-		conversation: &ConversationId,
+		conversation: &ConversationId<str>,
 	) -> Result<CommittedRevision<I>, ConversationError> {
 		let state = self.state.lock();
-		let head = state
-			.heads
-			.get(conversation)
-			.ok_or_else(|| ConversationError::UnknownConversation(conversation.clone()))?;
+		let head = state.heads.get(conversation).ok_or_else(|| {
+			ConversationError::UnknownConversation(ConversationId::from(conversation))
+		})?;
 		revision(&state, head)
 	}
 
-	fn revision(&self, id: &Revision) -> Result<CommittedRevision<I>, ConversationError> {
+	fn revision(&self, id: &Revision<str>) -> Result<CommittedRevision<I>, ConversationError> {
 		revision(&self.state.lock(), id)
 	}
 
-	fn fork(&self, at: &Revision) -> Result<ConversationId, ConversationError> {
+	fn fork(&self, at: &Revision<str>) -> Result<ConversationId, ConversationError> {
 		let mut state = self.state.lock();
 		if !state.revisions.contains_key(at) {
-			return Err(ConversationError::UnknownRevision(at.clone()));
+			return Err(ConversationError::UnknownRevision(Revision::from(at)));
 		}
 		let conversation = state.allocate_conversation();
-		state.heads.insert(conversation.clone(), at.clone());
+		state.heads.insert(conversation.clone(), Revision::from(at));
 		Ok(conversation)
 	}
 
 	fn begin(
 		&self,
-		conversation: &ConversationId,
-		at: &Revision,
+		conversation: &ConversationId<str>,
+		at: &Revision<str>,
 		turn: TurnId,
 		append: Arc<[I]>,
 	) -> Result<Self::Draft, ConversationError> {
@@ -230,14 +231,14 @@ impl<I: PartialEq + Send + Sync + 'static> ConversationStore<I> for InMemoryConv
 		let head = state
 			.heads
 			.get(conversation)
-			.ok_or_else(|| ConversationError::UnknownConversation(conversation.clone()))?;
+			.ok_or_else(|| ConversationError::UnknownConversation(conversation.to_owned()))?;
 		let existing = state
 			.turns
-			.contains_key(&(conversation.clone(), turn.clone()));
+			.contains_key(&(conversation.to_owned(), turn.clone()));
 		if head != at && !existing {
 			return Err(ConversationError::RevisionConflict {
 				expected: head.clone(),
-				actual:   at.clone(),
+				actual:   at.to_owned(),
 			});
 		}
 		let draft = state.next_draft;
@@ -247,8 +248,8 @@ impl<I: PartialEq + Send + Sync + 'static> ConversationStore<I> for InMemoryConv
 		Ok(TurnDraft {
 			state: Arc::clone(&self.state),
 			draft,
-			conversation: conversation.clone(),
-			base: at.clone(),
+			conversation: conversation.to_owned(),
+			base: at.to_owned(),
 			turn,
 			items: Some(append),
 			binding: None,
@@ -257,11 +258,12 @@ impl<I: PartialEq + Send + Sync + 'static> ConversationStore<I> for InMemoryConv
 
 	fn committed_turn(
 		&self,
-		conversation: &ConversationId,
-		turn: &TurnId,
+		conversation: &ConversationId<str>,
+		turn: &TurnId<str>,
 	) -> Result<Option<CommittedRevision<I>>, ConversationError> {
 		let state = self.state.lock();
-		let Some(committed) = state.turns.get(&(conversation.clone(), turn.clone())) else {
+		let key = (ConversationId::from(conversation), TurnId::from(turn));
+		let Some(committed) = state.turns.get(&key) else {
 			return Ok(None);
 		};
 		revision(&state, committed).map(Some)
@@ -269,34 +271,34 @@ impl<I: PartialEq + Send + Sync + 'static> ConversationStore<I> for InMemoryConv
 
 	fn delta(
 		&self,
-		base: Option<&Revision>,
-		head: &Revision,
+		base: Option<&Revision<str>>,
+		head: &Revision<str>,
 	) -> Result<HistoryDelta<I>, ConversationError> {
 		delta(&self.state.lock(), base, head)
 	}
 
 	fn is_ancestor(
 		&self,
-		ancestor: &Revision,
-		descendant: &Revision,
+		ancestor: &Revision<str>,
+		descendant: &Revision<str>,
 	) -> Result<bool, ConversationError> {
 		let state = self.state.lock();
 		if !state.revisions.contains_key(ancestor) {
-			return Err(ConversationError::UnknownRevision(ancestor.clone()));
+			return Err(ConversationError::UnknownRevision(Revision::from(ancestor)));
 		}
 		if !state.revisions.contains_key(descendant) {
-			return Err(ConversationError::UnknownRevision(descendant.clone()));
+			return Err(ConversationError::UnknownRevision(Revision::from(descendant)));
 		}
 		Ok(is_ancestor(&state, ancestor, descendant))
 	}
 
 	fn server_state(
 		&self,
-		conversation: &ConversationId,
+		conversation: &ConversationId<str>,
 	) -> Result<Option<ServerStateBinding>, ConversationError> {
 		let state = self.state.lock();
 		if !state.heads.contains_key(conversation) {
-			return Err(ConversationError::UnknownConversation(conversation.clone()));
+			return Err(ConversationError::UnknownConversation(conversation.to_owned()));
 		}
 		Ok(state.bindings.get(conversation).cloned())
 	}
@@ -345,7 +347,7 @@ impl<I> SqliteConversationStore<I> {
 	}
 
 	/// Returns the exact terminal response for a globally unique logical turn.
-	pub fn turn_replay(&self, turn: &TurnId) -> Result<Option<TurnReplay>, ConversationError> {
+	pub fn turn_replay(&self, turn: &TurnId<str>) -> Result<Option<TurnReplay>, ConversationError> {
 		self
 			.connection
 			.lock()
@@ -614,9 +616,9 @@ fn sqlite_next_conversation_id(connection: &Connection) -> Result<i64, Conversat
 }
 
 fn sqlite_revision_id(
-	conversation: &ConversationId,
-	parent: Option<&Revision>,
-	turn: Option<&TurnId>,
+	conversation: &ConversationId<str>,
+	parent: Option<&Revision<str>>,
+	turn: Option<&TurnId<str>>,
 ) -> Revision {
 	let mut hasher = DefaultHasher::new();
 	conversation.hash(&mut hasher);
@@ -663,22 +665,22 @@ impl<I: Serialize + DeserializeOwned + Send + Sync + 'static> ConversationStore<
 
 	fn head(
 		&self,
-		conversation: &ConversationId,
+		conversation: &ConversationId<str>,
 	) -> Result<CommittedRevision<I>, ConversationError> {
 		let connection = self.connection.lock();
 		let head: String = connection
 			.query_row("SELECT head FROM conversations WHERE id=?1", [conversation.as_str()], |row| {
 				row.get(0)
 			})
-			.map_err(|_| ConversationError::UnknownConversation(conversation.clone()))?;
-		sqlite_revision(&connection, &Revision::new(head))
+			.map_err(|_| ConversationError::UnknownConversation(ConversationId::from(conversation)))?;
+		sqlite_revision(&connection, Revision::from_ref(&head))
 	}
 
-	fn revision(&self, revision: &Revision) -> Result<CommittedRevision<I>, ConversationError> {
+	fn revision(&self, revision: &Revision<str>) -> Result<CommittedRevision<I>, ConversationError> {
 		sqlite_revision(&self.connection.lock(), revision)
 	}
 
-	fn fork(&self, at: &Revision) -> Result<ConversationId, ConversationError> {
+	fn fork(&self, at: &Revision<str>) -> Result<ConversationId, ConversationError> {
 		let connection = self.connection.lock();
 		let exists: bool = connection
 			.query_row("SELECT EXISTS(SELECT 1 FROM revisions WHERE id=?1)", [at.as_str()], |row| {
@@ -686,7 +688,7 @@ impl<I: Serialize + DeserializeOwned + Send + Sync + 'static> ConversationStore<
 			})
 			.map_err(|_| ConversationError::Persistence)?;
 		if !exists {
-			return Err(ConversationError::UnknownRevision(at.clone()));
+			return Err(ConversationError::UnknownRevision(Revision::from(at)));
 		}
 		let conversation =
 			ConversationId::new(format!("conversation-{}", sqlite_next_conversation_id(&connection)?));
@@ -701,8 +703,8 @@ impl<I: Serialize + DeserializeOwned + Send + Sync + 'static> ConversationStore<
 
 	fn begin(
 		&self,
-		conversation: &ConversationId,
-		at: &Revision,
+		conversation: &ConversationId<str>,
+		at: &Revision<str>,
 		turn: TurnId,
 		append: Arc<[I]>,
 	) -> Result<Self::Draft, ConversationError> {
@@ -711,7 +713,7 @@ impl<I: Serialize + DeserializeOwned + Send + Sync + 'static> ConversationStore<
 			.query_row("SELECT head FROM conversations WHERE id=?1", [conversation.as_str()], |row| {
 				row.get(0)
 			})
-			.map_err(|_| ConversationError::UnknownConversation(conversation.clone()))?;
+			.map_err(|_| ConversationError::UnknownConversation(conversation.to_owned()))?;
 		let existing: bool = connection
 			.query_row(
 				"SELECT EXISTS(SELECT 1 FROM revisions WHERE conversation=?1 AND turn=?2)",
@@ -722,14 +724,14 @@ impl<I: Serialize + DeserializeOwned + Send + Sync + 'static> ConversationStore<
 		if head != at.as_str() && !existing {
 			return Err(ConversationError::RevisionConflict {
 				expected: Revision::new(head),
-				actual:   at.clone(),
+				actual:   at.to_owned(),
 			});
 		}
 		drop(connection);
 		Ok(SqliteTurnDraft {
 			connection: Arc::clone(&self.connection),
-			conversation: conversation.clone(),
-			base: at.clone(),
+			conversation: conversation.to_owned(),
+			base: at.to_owned(),
 			turn,
 			items: Some(append),
 			binding: None,
@@ -739,8 +741,8 @@ impl<I: Serialize + DeserializeOwned + Send + Sync + 'static> ConversationStore<
 
 	fn committed_turn(
 		&self,
-		conversation: &ConversationId,
-		turn: &TurnId,
+		conversation: &ConversationId<str>,
+		turn: &TurnId<str>,
 	) -> Result<Option<CommittedRevision<I>>, ConversationError> {
 		let connection = self.connection.lock();
 		let revision = connection
@@ -752,57 +754,57 @@ impl<I: Serialize + DeserializeOwned + Send + Sync + 'static> ConversationStore<
 			.optional()
 			.map_err(|_| ConversationError::Persistence)?;
 		revision
-			.map(|revision| sqlite_revision(&connection, &Revision::new(revision)))
+			.map(|revision| sqlite_revision(&connection, Revision::from_ref(&revision)))
 			.transpose()
 	}
 
 	fn delta(
 		&self,
-		base: Option<&Revision>,
-		head: &Revision,
+		base: Option<&Revision<str>>,
+		head: &Revision<str>,
 	) -> Result<HistoryDelta<I>, ConversationError> {
 		let connection = self.connection.lock();
-		let mut cursor = Some(head.clone());
+		let mut cursor = Some(head.to_owned());
 		let mut segments = Vec::new();
 		while let Some(revision) = cursor.as_ref() {
-			if base == Some(revision) {
+			if base.is_some_and(|base| base.as_str() == revision.as_str()) {
 				break;
 			}
 			let committed: CommittedRevision<I> = sqlite_revision(&connection, revision)?;
 			segments.push(committed.shared_items());
-			cursor = committed.parent().cloned();
+			cursor = committed.parent().map(ToOwned::to_owned);
 		}
 		if let (Some(base), None) = (base, cursor.as_ref()) {
 			return Err(ConversationError::RevisionConflict {
-				expected: head.clone(),
-				actual:   base.clone(),
+				expected: head.to_owned(),
+				actual:   base.to_owned(),
 			});
 		}
 		segments.reverse();
-		Ok(HistoryDelta::new(base.cloned(), head.clone(), segments))
+		Ok(HistoryDelta::new(base.map(ToOwned::to_owned), head.to_owned(), segments))
 	}
 
 	fn is_ancestor(
 		&self,
-		ancestor: &Revision,
-		descendant: &Revision,
+		ancestor: &Revision<str>,
+		descendant: &Revision<str>,
 	) -> Result<bool, ConversationError> {
 		let connection = self.connection.lock();
-		let mut cursor = Some(descendant.clone());
+		let mut cursor = Some(Revision::from(descendant));
 		while let Some(revision) = cursor {
-			if &revision == ancestor {
+			if revision.as_str() == ancestor.as_str() {
 				return Ok(true);
 			}
 			cursor = sqlite_revision::<I>(&connection, &revision)?
 				.parent()
-				.cloned();
+				.map(ToOwned::to_owned);
 		}
 		Ok(false)
 	}
 
 	fn server_state(
 		&self,
-		conversation: &ConversationId,
+		conversation: &ConversationId<str>,
 	) -> Result<Option<ServerStateBinding>, ConversationError> {
 		let connection = self.connection.lock();
 		let bytes: Option<Vec<u8>> = connection
@@ -821,7 +823,7 @@ impl<I: Serialize + DeserializeOwned + Send + Sync + 'static> ConversationStore<
 
 fn sqlite_revision<I: DeserializeOwned>(
 	connection: &Connection,
-	revision: &Revision,
+	revision: &Revision<str>,
 ) -> Result<CommittedRevision<I>, ConversationError> {
 	let row = connection
 		.query_row(
@@ -838,11 +840,11 @@ fn sqlite_revision<I: DeserializeOwned>(
 		)
 		.optional()
 		.map_err(|_| ConversationError::Persistence)?
-		.ok_or_else(|| ConversationError::UnknownRevision(revision.clone()))?;
+		.ok_or_else(|| ConversationError::UnknownRevision(Revision::from(revision)))?;
 	let items = postcard::from_bytes(&row.3).map_err(|_| ConversationError::CorruptStore)?;
 	Ok(CommittedRevision::new(
 		ConversationId::new(row.0),
-		revision.clone(),
+		Revision::from(revision),
 		row.1.map(Revision::new),
 		row.2.map(TurnId::new),
 		items,

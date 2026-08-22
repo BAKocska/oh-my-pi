@@ -1363,12 +1363,12 @@ impl ToolResultPairer {
 	}
 
 	/// Pairs a result without ever treating model-authored results as trusted.
-	pub fn pair(&mut self, id: Option<&ToolCallId>, source: ToolResultSource) -> ToolPairing {
+	pub fn pair(&mut self, id: Option<&ToolCallId<str>>, source: ToolResultSource) -> ToolPairing {
 		if source == ToolResultSource::ModelOutput {
 			return ToolPairing::RejectedFabricated;
 		}
 		let (id, repaired) = match id {
-			Some(id) if self.outstanding.contains(id) => (id.clone(), false),
+			Some(id) if self.outstanding.contains(id) => (id.to_owned(), false),
 			Some(_) => return ToolPairing::RejectedFabricated,
 			None if self.outstanding.len() == 1 => (
 				self

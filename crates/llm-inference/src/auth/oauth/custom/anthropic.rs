@@ -197,12 +197,13 @@ fn post_json<T: Serialize + ?Sized>(
 	headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
 	let mut body =
 		Zeroizing::new(serde_json::to_string(value).map_err(|_| OAuthError::MalformedResponse)?);
-	Ok(OAuthHttpRequest {
-		method: Method::POST,
-		url: parse_http_url(url)?,
+	OAuthHttpRequest::new(
+		Method::POST,
+		parse_http_url(url)?.as_str(),
 		headers,
-		body: Some(SecretString::from(std::mem::take(&mut *body))),
-	})
+		Some(SecretString::from(std::mem::take(&mut *body))),
+	)
+	.map_err(Into::into)
 }
 
 fn token_response(
@@ -532,7 +533,7 @@ mod tests {
 			)
 			.await
 			.expect("inline email principal");
-		assert_eq!(principal.as_ref(), "user@example.com");
+		assert_eq!(principal.as_str(), "user@example.com");
 
 		let request = http.request.lock();
 		assert_eq!(request.method, Some(Method::POST));

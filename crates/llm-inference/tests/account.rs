@@ -87,7 +87,10 @@ fn account_and_principal_are_separate_stable_identities() {
 		vec![AccountId::new("account"), AccountId::new("account-z")],
 	);
 	assert_eq!(
-		pool.account(&AccountId::new("account")).unwrap().principal,
+		pool
+			.account(AccountId::from_ref("account"))
+			.unwrap()
+			.principal,
 		PrincipalId::new("principal-a")
 	);
 }
@@ -457,8 +460,8 @@ fn durable_account_state_survives_reopen_and_account_removal() {
 	assert!(
 		pool
 			.update_credential_generation(
-				&AccountId::new("durable"),
-				&PrincipalId::new("principal"),
+				AccountId::from_ref("durable"),
+				PrincipalId::from_ref("principal"),
 				2,
 			)
 			.unwrap()
@@ -466,7 +469,7 @@ fn durable_account_state_survives_reopen_and_account_removal() {
 	pool.upsert(record("durable", "principal", &route)).unwrap();
 	assert_eq!(
 		pool
-			.account(&AccountId::new("durable"))
+			.account(AccountId::from_ref("durable"))
 			.unwrap()
 			.credential_generation,
 		2
@@ -476,19 +479,24 @@ fn durable_account_state_survives_reopen_and_account_removal() {
 		.unwrap();
 	assert!(
 		pool
-			.set_enabled(&AccountId::new("durable-b"), false)
+			.set_enabled(AccountId::from_ref("durable-b"), false)
 			.unwrap()
 	);
 	drop(pool);
 	let pool = AccountPool::with_store(Arc::new(AccountStateStore::open(&path).unwrap())).unwrap();
 	assert_eq!(
 		pool
-			.account(&AccountId::new("durable"))
+			.account(AccountId::from_ref("durable"))
 			.unwrap()
 			.credential_generation,
 		2
 	);
-	assert!(!pool.account(&AccountId::new("durable-b")).unwrap().enabled);
+	assert!(
+		!pool
+			.account(AccountId::from_ref("durable-b"))
+			.unwrap()
+			.enabled
+	);
 	let rejection = pool
 		.select(&selection_request(&route, at(181)))
 		.unwrap_err();
@@ -498,8 +506,8 @@ fn durable_account_state_survives_reopen_and_account_removal() {
 	assert!(
 		pool
 			.update_credential_generation(
-				&AccountId::new("durable"),
-				&PrincipalId::new("principal"),
+				AccountId::from_ref("durable"),
+				PrincipalId::from_ref("principal"),
 				3,
 			)
 			.unwrap()
@@ -614,10 +622,10 @@ struct MockStore {
 }
 
 impl MockStore {
-	fn acquired(account: &AccountId) -> RefreshLeaseAcquire {
+	fn acquired(account: &AccountId<str>) -> RefreshLeaseAcquire {
 		RefreshLeaseAcquire::Acquired(PersistentRefreshLease {
 			id:         "lease".into(),
-			account:    account.clone(),
+			account:    account.to_owned(),
 			owner:      "process".into(),
 			expires_at: at(200),
 		})
@@ -640,7 +648,7 @@ impl RefreshLeaseStore for MockStore {
 
 	fn wait_for_newer<'a>(
 		&'a self,
-		_account: &'a AccountId,
+		_account: &'a AccountId<str>,
 		_minimum_generation: u64,
 		_lease_expires_at: SystemTime,
 	) -> Pin<Box<dyn Future<Output = Result<RefreshLeaseWait, RefreshStoreError>> + Send + 'a>> {
@@ -786,7 +794,7 @@ async fn expired_persistent_lease_is_recovered_and_timeline_is_preserved() {
 	let store = Arc::new(MockStore::default());
 	store.acquire_script.lock().extend([
 		RefreshLeaseAcquire::HeldByPeer { expires_at: at(110) },
-		MockStore::acquired(&AccountId::new("recovery")),
+		MockStore::acquired(AccountId::from_ref("recovery")),
 	]);
 	store
 		.wait_script

@@ -46,7 +46,7 @@ impl CursorUsageFetcher {
 	}
 }
 impl ConsoleUsageFetcher for CursorUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

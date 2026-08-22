@@ -8,26 +8,18 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use bytes::{Bytes, BytesMut};
 use futures::{
 	FutureExt,
 	future::{BoxFuture, Either, select},
 };
 use http::{
-	HeaderMap, HeaderValue, Method, Request,
+	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
-};
-use http_body_util::{BodyExt as _, Full};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-	client::legacy::{Client, connect::HttpConnector},
-	rt::TokioExecutor,
 };
 use omp_core::{ExposeSecret, SecretBox, SecretString, Str, base64_url, sf};
 use omp_llm_catalog::provider::PrincipalResolution;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -53,141 +45,9 @@ use crate::{
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// Secret-bearing OAuth request handed directly to an injected HTTP transport.
-pub struct OAuthHttpRequest {
-	method:  Method,
-	url:     Url,
-	headers: HeaderMap,
-	body:    Option<SecretString>,
-}
-
-impl OAuthHttpRequest {
-	/// Consumes the request into transport-ready parts while preserving body
-	/// secrecy.
-	#[must_use]
-	pub fn into_parts(self) -> (Method, Url, HeaderMap, Option<SecretString>) {
-		(self.method, self.url, self.headers, self.body)
-	}
-
-	/// Creates a secret-bearing request at a protocol-engine boundary.
-	pub(crate) fn new(
-		method: Method,
-		url: &str,
-		mut headers: HeaderMap,
-		body: Option<SecretString>,
-	) -> Result<Self, OAuthError> {
-		let url = parse_http_url(url)?;
-		headers
-			.entry(ACCEPT)
-			.or_insert(HeaderValue::from_static("application/json"));
-		Ok(Self { method, url, headers, body })
-	}
-
-	/// Creates a form-encoded secret POST request for another auth engine.
-	pub(crate) fn secret_form(url: &str, body: SecretString) -> Result<Self, OAuthError> {
-		let mut headers = HeaderMap::new();
-		headers.insert(CONTENT_TYPE, HeaderValue::from_static(FORM_CONTENT_TYPE));
-		Self::new(Method::POST, url, headers, Some(body))
-	}
-}
-
-/// Secret-bearing OAuth response returned only to the protocol engine.
-pub struct OAuthHttpResponse {
-	/// HTTP-like response status.
-	pub status:  u16,
-	/// Response headers used only by protocol-specific transport policy.
-	pub headers: HeaderMap,
-	/// Bounded response body, which may contain access and refresh tokens.
-	pub body:    SecretString,
-}
-
-/// Cold I/O boundary used by every generic OAuth engine.
-pub trait OAuthHttpClient: Send + Sync {
-	/// Executes one OAuth request without logging its secret body.
-	fn execute(
-		&self,
-		request: OAuthHttpRequest,
-	) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>>;
-}
-
-const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
-type PooledOAuthClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
-
-/// Production OAuth client using the workspace rustls root set and bounded
-/// responses.
-#[derive(Clone)]
-pub struct SystemOAuthHttpClient {
-	inner: PooledOAuthClient,
-}
-
-impl SystemOAuthHttpClient {
-	/// Constructs a pooled HTTP/1.1 and HTTP/2 OAuth client.
-	#[must_use]
-	pub fn new() -> Self {
-		let _ = rustls::crypto::ring::default_provider().install_default();
-		let connector = HttpsConnectorBuilder::new()
-			.with_webpki_roots()
-			.https_or_http()
-			.enable_http1()
-			.enable_http2()
-			.build();
-		let inner = Client::builder(TokioExecutor::new()).build(connector);
-		Self { inner }
-	}
-}
-
-impl Default for SystemOAuthHttpClient {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl std::fmt::Debug for SystemOAuthHttpClient {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		formatter.write_str("SystemOAuthHttpClient(..)")
-	}
-}
-
-impl OAuthHttpClient for SystemOAuthHttpClient {
-	fn execute(
-		&self,
-		request: OAuthHttpRequest,
-	) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
-		let client = self.inner.clone();
-		async move {
-			let (method, url, headers, body) = request.into_parts();
-			let body = body.as_ref().map_or_else(Bytes::new, |body| {
-				Bytes::copy_from_slice(body.expose_secret().as_bytes())
-			});
-			let mut outbound = Request::builder()
-				.method(method)
-				.uri(url.as_str())
-				.body(Full::new(body))
-				.map_err(|_| OAuthTransportError)?;
-			*outbound.headers_mut() = headers;
-			let response = client
-				.request(outbound)
-				.await
-				.map_err(|_| OAuthTransportError)?;
-			let status = response.status().as_u16();
-			let headers = response.headers().clone();
-			let mut incoming = response.into_body();
-			let mut bytes = BytesMut::new();
-			while let Some(frame) = incoming.frame().await {
-				let frame = frame.map_err(|_| OAuthTransportError)?;
-				if let Some(data) = frame.data_ref() {
-					if bytes.len().saturating_add(data.len()) > MAX_OAUTH_RESPONSE_BYTES {
-						return Err(OAuthTransportError);
-					}
-					bytes.extend_from_slice(data);
-				}
-			}
-			let body = String::from_utf8(bytes.to_vec()).map_err(|_| OAuthTransportError)?;
-			Ok(OAuthHttpResponse { status, headers, body: SecretString::from(body) })
-		}
-		.boxed()
-	}
-}
+pub use omp_oauth::{
+	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError, SystemOAuthHttpClient,
+};
 
 /// Production wall clock and bounded asynchronous sleeper for OAuth polling.
 #[derive(Clone, Copy, Debug, Default)]
@@ -386,14 +246,8 @@ where
 		spec: &OAuthPkceSpec,
 		driver: &LoginDriver,
 	) -> Result<PkcePending, OAuthError> {
-		let mut verifier_bytes = Zeroizing::new([0_u8; 32]);
-		let mut state_bytes = Zeroizing::new([0_u8; 24]);
-		self.entropy.fill(&mut verifier_bytes[..])?;
-		self.entropy.fill(&mut state_bytes[..])?;
-		let verifier = SecretString::from(base64_url::encode_raw(&verifier_bytes[..]).into_string());
-		let state = Str::new(base64_url::encode_raw(&state_bytes[..]).into_string());
-		let challenge =
-			base64_url::encode_raw(&Sha256::digest(verifier.expose_secret().as_bytes())).into_string();
+		let material = omp_oauth::generate_pkce(|bytes| self.entropy.fill(bytes))?;
+		let (verifier, challenge, state) = material.into_parts();
 		let mut url = parse_http_url(&spec.authorize_url)?;
 		{
 			let mut query = url.query_pairs_mut();
@@ -401,7 +255,7 @@ where
 				.append_pair("response_type", "code")
 				.append_pair("client_id", &spec.client.client_id)
 				.append_pair("redirect_uri", &spec.redirect_uri)
-				.append_pair("code_challenge", &challenge)
+				.append_pair("code_challenge", challenge.as_str())
 				.append_pair("code_challenge_method", "S256")
 				.append_pair("state", &state);
 			if !spec.client.scopes.is_empty() {
@@ -750,7 +604,7 @@ where
 	pub fn lease_persisted(
 		&self,
 		store: &CredentialStore,
-		account: &AccountId,
+		account: &AccountId<str>,
 		now: SystemTime,
 	) -> Result<CredentialLease, OAuthCredentialManagerError> {
 		let stored = store.load_oauth_bundle(account)?;
@@ -1185,11 +1039,6 @@ impl OAuthProviderCode {
 	}
 }
 
-/// OAuth transport failure stripped of request/response material.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("OAuth HTTP transport failed")]
-pub struct OAuthTransportError;
-
 /// OAuth engine failure with typed, secret-free evidence.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum OAuthError {
@@ -1261,6 +1110,12 @@ pub enum OAuthError {
 	/// Login event/input channel failed.
 	#[error(transparent)]
 	Login(LoginChannelError),
+}
+
+impl From<omp_oauth::OAuthRequestError> for OAuthError {
+	fn from(_: omp_oauth::OAuthRequestError) -> Self {
+		Self::InvalidUrl
+	}
 }
 
 impl From<LoginChannelError> for OAuthError {
@@ -1624,7 +1479,7 @@ fn form_request(
 	let mut headers = HeaderMap::new();
 	headers.insert(CONTENT_TYPE, HeaderValue::from_static(FORM_CONTENT_TYPE));
 	headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-	Ok(OAuthHttpRequest { method: Method::POST, url, headers, body: Some(body) })
+	OAuthHttpRequest::new(Method::POST, url.as_str(), headers, Some(body)).map_err(Into::into)
 }
 
 enum FormValue<'a> {

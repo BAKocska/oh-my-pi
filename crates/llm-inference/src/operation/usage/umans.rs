@@ -50,7 +50,7 @@ impl UmansUsageFetcher {
 	}
 }
 impl ConsoleUsageFetcher for UmansUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

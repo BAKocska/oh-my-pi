@@ -727,11 +727,13 @@ mod tests {
 				deadline: None,
 				budget,
 				session: Some(SessionRequest {
-					conversation: root.conversation().clone(),
-					revision:     root.revision().clone(),
-					turn:         turn.clone(),
-					strategy:     ContextStrategy::Replay,
-					forked:       true,
+					conversation:   root.conversation().to_owned(),
+					revision:       root.revision().to_owned(),
+					turn:           turn.clone(),
+					strategy:       ContextStrategy::Replay,
+					append_only:    true,
+					provider_reset: false,
+					forked:         true,
 				}),
 			},
 			OperationCall::Chat(Arc::new(ChatRequest {

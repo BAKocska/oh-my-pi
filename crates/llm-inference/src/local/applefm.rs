@@ -1158,15 +1158,15 @@ fn append_clean_completion(output: &mut VecDeque<RawEvent>, usage: Usage) {
 }
 
 fn apple_discovered_model(
-	provider: &ProviderId,
-	route: &RouteId,
+	provider: &ProviderId<str>,
+	route: &RouteId<str>,
 	evidence: &AppleFmAvailabilityEvidence,
 ) -> DiscoveredModel {
 	let mut operations = OperationBits::empty();
 	operations.insert_kind(OperationKind::Chat);
 	DiscoveredModel {
-		provider:              provider.clone(),
-		route:                 route.clone(),
+		provider:              provider.to_owned(),
+		route:                 route.to_owned(),
 		wire_model:            WireModelId::new("apple-intelligence"),
 		aliases:               Box::new([]),
 		display_name:          Some(sf!("Apple Intelligence (on-device)")),
@@ -1194,9 +1194,9 @@ fn apple_discovered_model(
 
 fn apple_prompt(
 	request: &crate::call::ChatRequest,
-	request_id: &crate::id::RequestId,
-	provider: &ProviderId,
-	route: &RouteId,
+	request_id: &crate::id::RequestId<str>,
+	provider: &ProviderId<str>,
+	route: &RouteId<str>,
 ) -> std::result::Result<(Str, Option<Str>, bool), Error> {
 	if !request.tools.is_empty()
 		|| !request.hosted_tools.is_empty()
@@ -1362,14 +1362,14 @@ fn apple_codec_error(kind: ErrorKind, message: &str, context: &EncodeContext<'_>
 fn codec_route_error(
 	kind: ErrorKind,
 	message: &str,
-	request_id: &crate::id::RequestId,
-	provider: &ProviderId,
-	route: &RouteId,
+	request_id: &crate::id::RequestId<str>,
+	provider: &ProviderId<str>,
+	route: &RouteId<str>,
 ) -> Error {
 	Error::new(kind, ErrorPhase::Encoding, RetryAction::Never, ExecutionReceipt::default())
-		.provider(provider.clone())
-		.route(route.clone())
-		.request_id(request_id.clone())
+		.provider(provider.to_owned())
+		.route(route.to_owned())
+		.request_id(request_id.to_owned())
 		.detail(ErrorDetail::capability(sf!("apple-foundation-models"), ReasonId::new(message)))
 }
 

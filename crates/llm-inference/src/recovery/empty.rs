@@ -1,6 +1,6 @@
 //! Deterministic empty-completion classification.
 
-use omp_core::sf;
+use omp_core::{Str, sf};
 use omp_llm_catalog::id::WirePolicyId;
 
 use super::{RecoveryError, Stage};
@@ -8,6 +8,35 @@ use crate::{
 	event::{BlockKind, ChatEvent},
 	receipt::{ReasonId, RecoveryKind, RecoveryRecord},
 };
+
+/// Structural evidence for a provider stop that may have ended prematurely.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UnexpectedStopEvidence {
+	/// Provider reported an ordinary end-turn stop.
+	pub end_turn:        bool,
+	/// At least one non-whitespace visible text block exists.
+	pub visible_text:    bool,
+	/// At least one signed non-whitespace thinking block exists.
+	pub signed_thinking: bool,
+	/// The turn emitted a tool call and therefore stopped actionably.
+	pub tool_call:       bool,
+}
+
+/// Returns whether pi's secondary unexpected-stop classifier should run.
+#[must_use]
+pub const fn is_unexpected_stop_candidate(evidence: UnexpectedStopEvidence) -> bool {
+	evidence.end_turn && !evidence.tool_call && (evidence.visible_text || evidence.signed_thinking)
+}
+
+/// Builds the bounded retry guidance injected after a classified unexpected
+/// stop.
+#[must_use]
+pub fn unexpected_stop_guidance(retry: u32, maximum: u32) -> Str {
+	sf!(
+		"<system-injection>\nYou said you would continue with a tool call or action but stopped. \
+		 Continue now.\nAttempt #{retry}/{maximum}\n</system-injection>"
+	)
+}
 
 /// Why a successful provider completion carried no usable public answer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +234,22 @@ impl EmptyCompletionKind {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn unexpected_stop_candidate_excludes_tool_calls_and_unsigned_thinking() {
+		assert!(is_unexpected_stop_candidate(UnexpectedStopEvidence {
+			end_turn: true,
+			visible_text: true,
+			..UnexpectedStopEvidence::default()
+		}));
+		assert!(!is_unexpected_stop_candidate(UnexpectedStopEvidence {
+			end_turn: true,
+			signed_thinking: true,
+			tool_call: true,
+			..UnexpectedStopEvidence::default()
+		}));
+		assert!(unexpected_stop_guidance(1, 3).contains("Attempt #1/3"));
+	}
 
 	#[test]
 	fn terminal_only_completion_is_empty_but_not_precommitted() {

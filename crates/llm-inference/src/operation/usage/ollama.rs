@@ -45,7 +45,7 @@ impl Default for OllamaUsageFetcher {
 }
 
 impl ConsoleUsageFetcher for OllamaUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

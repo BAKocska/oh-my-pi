@@ -55,7 +55,7 @@ impl XaiOauthUsageFetcher {
 	}
 }
 impl ConsoleUsageFetcher for XaiOauthUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

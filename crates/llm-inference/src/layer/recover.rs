@@ -18,7 +18,9 @@ use crate::{
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{ChatEvent, Completion},
 	layer::LayerCall,
-	receipt::{AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, ReasonId},
+	receipt::{
+		AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, ReasonId, ServingModelAttribution,
+	},
 	recovery::{
 		Stage,
 		empty::{EmptyCompletionKind, EmptyCompletionStage, EmptyEvent, EmptyInput},
@@ -514,6 +516,10 @@ fn finalize_completion(
 	context: &crate::layer::ExecutionContext,
 ) -> Result<ChatEvent, Error> {
 	let plan = plan.ok_or_else(|| recovery_error("completion.missing-execution-plan", context))?;
+	let serving_model = plan
+		.model
+		.clone()
+		.ok_or_else(|| recovery_error("completion.missing-serving-model", context))?;
 	let model = plan
 		.policy_model
 		.as_ref()
@@ -589,6 +595,11 @@ fn finalize_completion(
 				elapsed: context.attempt_elapsed(index),
 			});
 		}
+		let _ = receipt.settle_serving_model(ServingModelAttribution {
+			provider: plan.provider.clone(),
+			model:    serving_model,
+			attempt:  index,
+		});
 		receipt.timings.total = context.elapsed();
 		receipt.timings.completed_at = Some(SystemTime::now());
 	});

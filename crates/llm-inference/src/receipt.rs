@@ -480,29 +480,88 @@ pub struct TimingBreakdown {
 	pub completed_at:   Option<SystemTime>,
 }
 
+/// Serving model attributed only after a successful attempt settles.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ServingModelAttribution {
+	/// Concrete serving provider.
+	pub provider: ProviderId,
+	/// Concrete serving model.
+	pub model:    crate::catalog::ModelKey,
+	/// Successful attempt index that settled this attribution.
+	pub attempt:  u32,
+}
+
+/// Complete accounting record for an execution, including failed hidden
+/// attempts.
+/// Token categories measured against one immutable request projection.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextUsageReceipt {
+	/// Stable turn identity anchoring every measurement.
+	pub turn_id:             Option<Str>,
+	/// Projection revision measured by the tokenizer.
+	pub projection_revision: Option<u64>,
+	/// Model context-window ceiling.
+	pub window_tokens:       Option<u64>,
+	/// Complete serialized input tokens at this anchor.
+	pub input_tokens:        Option<u64>,
+	/// System-prompt tokens, when independently measurable.
+	pub system_tokens:       Option<u64>,
+	/// Conversation-message tokens, when independently measurable.
+	pub message_tokens:      Option<u64>,
+	/// Tool declarations and tool-result tokens, when independently measurable.
+	pub tool_tokens:         Option<u64>,
+	/// Reserved runtime buffers, when independently measurable.
+	pub buffer_tokens:       Option<u64>,
+	/// Input tokens avoided by the active Snapcompact projection.
+	pub snapcompact_savings: Option<u64>,
+}
+
 /// Complete accounting record for an execution, including failed hidden
 /// attempts.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExecutionReceipt {
 	/// Credential-free plan summary.
-	pub plan:        PlanSummary,
+	pub plan:          PlanSummary,
 	/// Negotiation changes made with caller permission.
-	pub adjustments: Vec<Adjustment>,
+	pub adjustments:   Vec<Adjustment>,
 	/// Every visible and hidden attempt.
-	pub attempts:    Vec<AttemptReceipt>,
+	pub attempts:      Vec<AttemptReceipt>,
+	/// Exactly one model attributed after successful settlement.
+	pub serving_model: Option<ServingModelAttribution>,
 	/// Deterministic recovery actions.
-	pub recoveries:  Vec<RecoveryRecord>,
+	pub recoveries:    Vec<RecoveryRecord>,
 	/// Explicit staging evidence.
-	pub staging:     Vec<StagingReceipt>,
+	pub staging:       Vec<StagingReceipt>,
 	/// Accumulated dimensioned usage.
-	pub usage:       Usage,
+	pub usage:         Usage,
+	/// Anchored request-context accounting for the settled attempt.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub context:       Option<ContextUsageReceipt>,
 	/// Accumulated integer cost.
-	pub cost:        Cost,
+	pub cost:          Cost,
 	/// Cross-phase timings.
-	pub timings:     TimingBreakdown,
+	pub timings:       TimingBreakdown,
 }
 
 impl ExecutionReceipt {
+	/// Settles serving-model attribution once after success.
+	///
+	/// Replaying the same settlement is idempotent; a conflicting second
+	/// attribution is rejected.
+	pub fn settle_serving_model(
+		&mut self,
+		attribution: ServingModelAttribution,
+	) -> Result<(), ServingModelAttribution> {
+		match &self.serving_model {
+			None => {
+				self.serving_model = Some(attribution);
+				Ok(())
+			},
+			Some(current) if current == &attribution => Ok(()),
+			Some(_) => Err(attribution),
+		}
+	}
+
 	/// Adds usage and cost from an attempt before storing it.
 	pub fn record_attempt(&mut self, attempt: AttemptReceipt) {
 		self.usage += attempt.usage;
@@ -513,7 +572,22 @@ impl ExecutionReceipt {
 
 #[cfg(test)]
 mod tests {
-	use super::{Cost, Usage, UsageSource};
+	use super::{Cost, ExecutionReceipt, ServingModelAttribution, Usage, UsageSource};
+
+	#[test]
+	fn serving_model_settles_once_and_replay_is_idempotent() {
+		let attribution = ServingModelAttribution {
+			provider: crate::catalog::ProviderId::from("provider"),
+			model:    crate::catalog::ModelKey::from("model"),
+			attempt:  2,
+		};
+		let mut receipt = ExecutionReceipt::default();
+		assert_eq!(receipt.settle_serving_model(attribution.clone()), Ok(()));
+		assert_eq!(receipt.settle_serving_model(attribution.clone()), Ok(()));
+		let conflicting =
+			ServingModelAttribution { model: crate::catalog::ModelKey::from("other"), ..attribution };
+		assert_eq!(receipt.settle_serving_model(conflicting.clone()), Err(conflicting));
+	}
 
 	#[test]
 	fn accumulates_every_usage_dimension_and_integer_cost() {

@@ -15,6 +15,7 @@ use std::{
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use omp_core::{SecretString, Str};
+use strum::IntoStaticStr;
 
 use crate::{
 	body::ByteStream,
@@ -671,6 +672,91 @@ pub enum TranscriptEvent {
 	},
 }
 
+/// Role represented by a realtime transcript update.
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum RealtimeTranscriptRole {
+	/// Transcript produced from caller input.
+	User,
+	/// Transcript produced by the realtime assistant.
+	Assistant,
+}
+
+/// Incremental or final text for one realtime conversational turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeTranscript {
+	/// Speaker role.
+	pub role:      RealtimeTranscriptRole,
+	/// Monotonic role-local turn number used to coalesce updates.
+	pub turn:      u64,
+	/// Latest complete text for this update.
+	pub text:      Str,
+	/// Whether this text is terminal for the role-local turn.
+	pub finalized: bool,
+}
+
+/// Provider-neutral realtime session activity.
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum RealtimePhase {
+	/// Establishing signaling and media channels.
+	Connecting,
+	/// Waiting for caller input.
+	Listening,
+	/// Executing delegated agent work.
+	Working,
+	/// Producing assistant audio.
+	Speaking,
+	/// Caller microphone input is muted.
+	Muted,
+	/// Closing session resources.
+	Closing,
+	/// Session reached an error.
+	Error,
+}
+
+/// Agent work requested by the realtime peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeDelegation {
+	/// Stable delegation identity issued by the realtime peer.
+	pub id:      Str,
+	/// Provider-neutral coding request text.
+	pub request: Str,
+}
+
+/// Origin of a terminal realtime close.
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "kebab-case")]
+pub enum RealtimeCloseOrigin {
+	/// The caller requested session closure.
+	Caller,
+	/// The realtime peer ended the session.
+	Provider,
+}
+
+/// Reason a realtime session closed.
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum RealtimeCloseReason {
+	/// Session completed normally.
+	Completed,
+	/// Session was cancelled.
+	Cancelled,
+	/// Session terminated after a classified failure.
+	Failed,
+}
+
+/// Exactly-once evidence of terminal realtime session closure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealtimeCloseReceipt {
+	/// Side that initiated closure.
+	pub origin:    RealtimeCloseOrigin,
+	/// Terminal close reason.
+	pub reason:    RealtimeCloseReason,
+	/// Time at which the session owner settled closure.
+	pub closed_at: SystemTime,
+}
+
 /// Caller-to-provider message in an owned realtime session.
 #[derive(Clone, Debug)]
 pub enum RealtimeInput {
@@ -689,6 +775,17 @@ pub enum RealtimeInput {
 		/// Whether tool execution failed.
 		is_error: bool,
 	},
+	/// Append provider-neutral context to the session or active delegation.
+	AppendContext(crate::call::RealtimeContextAppend),
+	/// Enable or disable caller microphone input.
+	SetMuted(bool),
+	/// Cancel one delegated agent turn without closing the session.
+	CancelDelegation {
+		/// Stable delegation identity issued by the realtime peer.
+		id: Str,
+	},
+	/// Settle one delegated agent turn exactly once.
+	SettleDelegation(crate::call::RealtimeDelegationReceipt),
 	/// Commit current input and request a response.
 	Commit,
 	/// Cancel the active response.
@@ -708,7 +805,17 @@ pub enum RealtimeEvent {
 	Audio(AudioChunk),
 	/// Input audio was committed.
 	InputCommitted,
-	/// Session closed cleanly.
+	/// Realtime activity phase changed.
+	Phase(RealtimePhase),
+	/// Incremental or final conversational transcript.
+	Transcript(RealtimeTranscript),
+	/// Realtime peer delegated agent work.
+	Delegation(RealtimeDelegation),
+	/// Effective caller microphone mute state changed.
+	Muted(bool),
+	/// Session closed with an exactly-once terminal receipt.
+	CloseReceipt(RealtimeCloseReceipt),
+	/// Session closed cleanly without a richer transport receipt.
 	Closed,
 }
 
@@ -774,17 +881,88 @@ pub struct SearchResult {
 	pub score:        Option<f32>,
 	/// Publication time when known.
 	pub published_at: Option<SystemTime>,
+	/// Author or publisher when exposed.
+	pub author:       Option<Str>,
+}
+
+/// One inline citation anchoring synthesized search text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchCitation {
+	/// Cited URL.
+	pub url:        Str,
+	/// Provider-supplied citation title.
+	pub title:      Option<Str>,
+	/// Provider-supplied cited excerpt.
+	pub cited_text: Option<Str>,
+	/// Inclusive byte offset in the synthesized answer.
+	pub start:      Option<u32>,
+	/// Exclusive byte offset in the synthesized answer.
+	pub end:        Option<u32>,
+}
+
+/// Stable category for one failed search-provider attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum SearchFailureKind {
+	/// Credentials were absent or rejected.
+	Authentication,
+	/// The account has insufficient credit or quota.
+	Quota,
+	/// The requested provider model was not found.
+	ModelNotFound,
+	/// Provider transport or connectivity failed.
+	Transport,
+	/// The attempt exceeded its deadline.
+	Timeout,
+	/// The provider returned another classified failure.
+	Provider,
+}
+
+/// Bounded, secret-free failed search-provider attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchProviderFailure {
+	/// Provider attempted.
+	pub provider: ProviderId,
+	/// Stable failure category.
+	pub kind:     SearchFailureKind,
+	/// HTTP-like status when available.
+	pub status:   Option<u16>,
+	/// Sanitized structured provider error code.
+	pub code:     Option<Str>,
+}
+
+/// Search metadata retained losslessly across tool and RPC boundaries.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SearchMetadata {
+	/// Provider that served the successful attempt.
+	pub provider:          Option<ProviderId>,
+	/// Opaque account identity used for the successful attempt.
+	pub account:           Option<AccountId>,
+	/// UI-safe credential mode label.
+	pub auth_mode:         Option<Str>,
+	/// Inline citations anchoring the answer.
+	pub citations:         Vec<SearchCitation>,
+	/// Provider-generated subqueries.
+	pub search_queries:    Vec<Str>,
+	/// Provider-generated related questions.
+	pub related_questions: Vec<Str>,
+	/// Constraint relaxation and provider warnings.
+	pub warnings:          Vec<Str>,
+	/// Failed attempts preceding success, or every attempt on aggregate failure.
+	pub failures:          Vec<SearchProviderFailure>,
 }
 
 /// Ranked standalone search answer and optional synthesis.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchResults {
 	/// Ordered ranked results.
-	pub results: Vec<SearchResult>,
+	pub results:  Vec<SearchResult>,
 	/// Optional provider-generated answer synthesis.
-	pub answer:  Option<Str>,
+	pub answer:   Option<Str>,
 	/// Search resource usage.
-	pub usage:   Usage,
+	pub usage:    Usage,
+	/// Provider, citation, warning, and fallback metadata.
+	pub metadata: SearchMetadata,
 }
 
 /// Type of an account usage or quota window.

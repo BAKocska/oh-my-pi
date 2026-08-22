@@ -60,7 +60,7 @@ impl GeminiUsageFetcher {
 	}
 }
 impl ConsoleUsageFetcher for GeminiUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

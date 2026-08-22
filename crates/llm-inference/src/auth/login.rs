@@ -79,7 +79,7 @@ pub struct LoginDriver {
 impl LoginDriver {
 	/// Returns the stable session identity.
 	#[must_use]
-	pub const fn id(&self) -> &LoginSessionId {
+	pub fn id(&self) -> &LoginSessionId<str> {
 		&self.id
 	}
 

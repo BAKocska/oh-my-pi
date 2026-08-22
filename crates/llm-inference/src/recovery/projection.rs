@@ -127,7 +127,7 @@ impl<'a> RecoveryProjector<'a> {
 			ProjectionInput::Tool { channel, fragment } => self.project_tool(channel, fragment),
 			ProjectionInput::Dialect(event) => self.project_dialect(event),
 			ProjectionInput::CallerToolResult { call } => {
-				match self.pairer.pair(call.as_ref(), ToolResultSource::Caller) {
+				match self.pairer.pair(call.as_deref(), ToolResultSource::Caller) {
 					ToolPairing::Paired(_) => ProjectionBatch::default(),
 					ToolPairing::Repaired(_) => ProjectionBatch {
 						evidence: vec![self.evidence(

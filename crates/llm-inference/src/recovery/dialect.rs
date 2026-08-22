@@ -218,7 +218,7 @@ impl Stage<Bytes, DialectEvent> for DialectStage {
 
 fn project_event(
 	dialect: Dialect,
-	wire_policy: &WirePolicyId,
+	wire_policy: &WirePolicyId<str>,
 	attempt: u32,
 	max_diagnostic_bytes: usize,
 	event: TagEvent,
@@ -247,7 +247,7 @@ fn project_event(
 					arguments,
 					raw: bound_raw(canonical, max_diagnostic_bytes),
 					recovery: record,
-					wire_policy: wire_policy.clone(),
+					wire_policy: wire_policy.to_owned(),
 				}));
 			}
 		},

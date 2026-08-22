@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures::future::poll_fn;
+use ring::rand::{SecureRandom as _, SystemRandom};
 use tower::{Layer, Service};
 
 use crate::{
@@ -15,16 +16,54 @@ use crate::{
 	layer::LayerCall,
 };
 
+/// Full-jitter exponential backoff policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryBackoff {
+	/// First exponential ceiling.
+	pub base:    std::time::Duration,
+	/// Largest exponential ceiling.
+	pub maximum: std::time::Duration,
+}
+
+impl RetryBackoff {
+	#[cfg(test)]
+	const ZERO: Self =
+		Self { base: std::time::Duration::ZERO, maximum: std::time::Duration::ZERO };
+}
+
+impl Default for RetryBackoff {
+	fn default() -> Self {
+		Self {
+			base:    std::time::Duration::from_millis(500),
+			maximum: std::time::Duration::from_secs(8),
+		}
+	}
+}
+
 /// Maximum same-route retries; the overall attempt budget remains
 /// authoritative.
 #[derive(Clone, Copy, Debug)]
 pub struct TransportRetryLayer {
 	max_retries: u32,
+	backoff:     RetryBackoff,
 }
 impl TransportRetryLayer {
 	/// Creates a same-route retry layer.
 	pub const fn new(max_retries: u32) -> Self {
-		Self { max_retries }
+		Self {
+			max_retries,
+			backoff: RetryBackoff {
+				base:    std::time::Duration::from_millis(500),
+				maximum: std::time::Duration::from_secs(8),
+			},
+		}
+	}
+
+	/// Overrides full-jitter bounds from the typed retry settings snapshot.
+	#[must_use]
+	pub const fn with_backoff(mut self, backoff: RetryBackoff) -> Self {
+		self.backoff = backoff;
+		self
 	}
 }
 
@@ -34,12 +73,13 @@ impl TransportRetryLayer {
 pub struct TransportRetryService<S> {
 	inner:       S,
 	max_retries: u32,
+	backoff:     RetryBackoff,
 }
 impl<S> Layer<S> for TransportRetryLayer {
 	type Service = TransportRetryService<S>;
 
 	fn layer(&self, inner: S) -> Self::Service {
-		TransportRetryService { inner, max_retries: self.max_retries }
+		TransportRetryService { inner, max_retries: self.max_retries, backoff: self.backoff }
 	}
 }
 
@@ -63,6 +103,7 @@ where
 		let replacement = self.inner.clone();
 		let mut service = mem::replace(&mut self.inner, replacement);
 		let max_retries = self.max_retries;
+		let backoff = self.backoff;
 		async move {
 			let mut retry_index = 0;
 			loop {
@@ -78,7 +119,7 @@ where
 				if let Some(attempt) = error.receipt().attempts.last() {
 					request.context.set_body_evidence(attempt.body);
 				}
-				let delay = match &error.action {
+				let retry_after = match &error.action {
 					RetryAction::SameRoute { after }
 						if !error.committed && retry_index < max_retries =>
 					{
@@ -89,6 +130,11 @@ where
 						return Err(error);
 					},
 				};
+				if retry_after > backoff.maximum {
+					error.action = RetryAction::ReselectRoute;
+					request.context.finalize_error(&mut error);
+					return Err(error);
+				}
 				let replay_safe = request
 					.context
 					.body_evidence()
@@ -99,6 +145,8 @@ where
 					return Err(error);
 				}
 				request.context.checkpoint(ErrorPhase::Readiness)?;
+				let jitter = full_jitter_delay(backoff, retry_index, random_u64());
+				let delay = retry_after.max(jitter);
 				if !delay.is_zero() {
 					wait_retry_delay(request.context.clone(), delay).await?;
 				}
@@ -106,6 +154,33 @@ where
 				poll_fn(|cx| service.poll_ready(cx)).await?;
 			}
 		}
+	}
+}
+
+/// Calculates `Uniform(0, min(maximum, base * 2^attempt))`.
+///
+/// `sample` is injected for deterministic tests; production uses OS entropy.
+#[must_use]
+pub fn full_jitter_delay(policy: RetryBackoff, attempt: u32, sample: u64) -> std::time::Duration {
+	let factor = 1_u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
+	let ceiling = policy
+		.base
+		.checked_mul(factor)
+		.unwrap_or(policy.maximum)
+		.min(policy.maximum);
+	let nanos = ceiling.as_nanos().min(u128::from(u64::MAX)) as u64;
+	if nanos == 0 {
+		return std::time::Duration::ZERO;
+	}
+	std::time::Duration::from_nanos(sample % nanos.saturating_add(1))
+}
+
+fn random_u64() -> u64 {
+	let mut bytes = [0_u8; 8];
+	if SystemRandom::new().fill(&mut bytes).is_ok() {
+		u64::from_le_bytes(bytes)
+	} else {
+		u64::MAX / 2
 	}
 }
 
@@ -151,7 +226,7 @@ mod tests {
 	use futures::future::{Ready, ready};
 	use tower::Service;
 
-	use super::TransportRetryService;
+	use super::{RetryBackoff, TransportRetryService, full_jitter_delay};
 	use crate::{
 		body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
 		error::{Error, ErrorKind, ErrorPhase, RetryAction},
@@ -204,6 +279,16 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn full_jitter_is_bounded_and_retry_after_can_be_a_floor() {
+		let policy =
+			RetryBackoff { base: Duration::from_millis(500), maximum: Duration::from_secs(8) };
+		assert_eq!(full_jitter_delay(policy, 0, 0), Duration::ZERO);
+		assert!(full_jitter_delay(policy, 4, u64::MAX) <= Duration::from_secs(8));
+		let provider_floor = Duration::from_secs(3);
+		assert_eq!(provider_floor.max(full_jitter_delay(policy, 0, 1)), provider_floor);
+	}
+
 	fn context() -> ExecutionContext {
 		ExecutionContext::new(ExecutionBudget { max_attempts: 3, ..ExecutionBudget::default() })
 	}
@@ -214,6 +299,7 @@ mod tests {
 		let mut service = TransportRetryService {
 			inner:       Failing { calls: calls.clone(), body: None },
 			max_retries: 2,
+			backoff:     RetryBackoff::ZERO,
 		};
 		futures::future::poll_fn(|cx| service.poll_ready(cx))
 			.await
@@ -239,6 +325,7 @@ mod tests {
 		let mut service = TransportRetryService {
 			inner:       Failing { calls: calls.clone(), body: Some(body) },
 			max_retries: 2,
+			backoff:     RetryBackoff::ZERO,
 		};
 		futures::future::poll_fn(|cx| service.poll_ready(cx))
 			.await
@@ -352,6 +439,7 @@ mod tests {
 		let mut service = TransportRetryService {
 			inner:       OverflowFailing { calls: calls.clone() },
 			max_retries: 2,
+			backoff:     RetryBackoff::ZERO,
 		};
 		futures::future::poll_fn(|cx| service.poll_ready(cx))
 			.await
@@ -372,6 +460,7 @@ mod tests {
 		let mut service = TransportRetryService {
 			inner:       FailThenSuccess { calls, body: replayable() },
 			max_retries: 1,
+			backoff:     RetryBackoff::ZERO,
 		};
 		futures::future::poll_fn(|cx| service.poll_ready(cx))
 			.await
@@ -391,6 +480,7 @@ mod tests {
 		let mut service = TransportRetryService {
 			inner:       Failing { calls, body: Some(replayable()) },
 			max_retries: 1,
+			backoff:     RetryBackoff::ZERO,
 		};
 		futures::future::poll_fn(|cx| service.poll_ready(cx))
 			.await
@@ -463,6 +553,7 @@ mod tests {
 		let mut service = TransportRetryService {
 			inner:       CommittedFailing { calls: calls.clone() },
 			max_retries: 2,
+			backoff:     RetryBackoff::ZERO,
 		};
 		futures::future::poll_fn(|cx| service.poll_ready(cx))
 			.await

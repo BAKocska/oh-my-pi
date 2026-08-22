@@ -45,7 +45,7 @@ impl RefreshLeaseStore for SharedRefreshStore {
 
 	fn wait_for_newer<'a>(
 		&'a self,
-		_account: &'a AccountId,
+		_account: &'a AccountId<str>,
 		_minimum_generation: u64,
 		_lease_expires_at: SystemTime,
 	) -> Pin<Box<dyn Future<Output = Result<RefreshLeaseWait, RefreshStoreError>> + Send + 'a>> {

@@ -16,6 +16,7 @@ pub mod call;
 pub mod client;
 pub mod codec;
 pub mod difficulty;
+pub mod discovery;
 pub mod error;
 pub mod event;
 pub mod gate;
@@ -30,7 +31,9 @@ pub mod receipt;
 pub mod recovery;
 pub mod registry;
 pub mod router;
+pub mod search_settings;
 pub mod session;
+pub mod settings;
 pub mod staging;
 pub mod transport;
 
@@ -59,3 +62,4 @@ pub use plan::{
 pub use provider::ProviderService;
 pub use receipt::*;
 pub use registry::{Registry, RegistryBuilder, RegistryHandle, RegistrySnapshot, RouteUnavailable};
+pub use settings::InferenceSettings;

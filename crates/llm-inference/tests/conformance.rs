@@ -225,9 +225,10 @@ fn every_operation_has_a_typed_extraction_bound_to_the_operations_manifest() {
 	assert!(RealtimeRequest::extract(answer(AnswerBody::Realtime(realtime))).is_ok());
 	assert!(
 		SearchRequest::extract(answer(AnswerBody::Search(SearchResults {
-			results: Vec::new(),
-			answer:  None,
-			usage:   Usage::default(),
+			results:  Vec::new(),
+			answer:   None,
+			usage:    Usage::default(),
+			metadata: Default::default(),
 		})))
 		.is_ok()
 	);
@@ -575,7 +576,7 @@ fn session_forks_are_immutable_and_reseed_is_strictly_one_shot() {
 	let _ = oracle::fixture("recovery", "recovery.middleware-corpus.v1");
 	let store = InMemoryConversationStore::<Str>::new();
 	let root = store.create().unwrap();
-	let main = root.conversation().clone();
+	let main = root.conversation().to_owned();
 	let first = store
 		.begin(&main, root.revision(), TurnId::from("turn-1"), Arc::from([sf!("one")]))
 		.unwrap()

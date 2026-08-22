@@ -55,7 +55,7 @@ impl ClaudeUsageFetcher {
 }
 
 impl ConsoleUsageFetcher for ClaudeUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

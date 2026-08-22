@@ -73,7 +73,7 @@ pub enum UsageFetchError {
 /// `credential_requirement` returns [`UsageCredentialRequirement::None`].
 pub trait ConsoleUsageFetcher: Send + Sync {
 	/// Provider whose credential envelopes this fetcher understands.
-	fn provider(&self) -> &ProviderId;
+	fn provider(&self) -> &ProviderId<str>;
 
 	/// Declares whether the manager must acquire a credential lease.
 	fn credential_requirement(&self) -> UsageCredentialRequirement;
@@ -117,12 +117,12 @@ impl UsageFetcherRegistry {
 	pub fn new(fetchers: impl IntoIterator<Item = Arc<dyn ConsoleUsageFetcher>>) -> Self {
 		let fetchers = fetchers
 			.into_iter()
-			.map(|fetcher| (fetcher.provider().clone(), fetcher))
+			.map(|fetcher| (fetcher.provider().to_owned(), fetcher))
 			.collect();
 		Self { fetchers: Arc::new(fetchers) }
 	}
 
-	fn get(&self, provider: &ProviderId) -> Option<&Arc<dyn ConsoleUsageFetcher>> {
+	fn get(&self, provider: &ProviderId<str>) -> Option<&Arc<dyn ConsoleUsageFetcher>> {
 		self.fetchers.get(provider)
 	}
 }
@@ -158,8 +158,8 @@ impl ConsoleUsageManager {
 	/// Fetches and normalizes usage for one planned provider route.
 	pub async fn execute(
 		&self,
-		provider: &ProviderId,
-		route: &RouteId,
+		provider: &ProviderId<str>,
+		route: &RouteId<str>,
 		request: &UsageRequest,
 		deadline: Option<Instant>,
 	) -> Result<UsageReport, Error> {
@@ -239,7 +239,7 @@ impl ConsoleUsageManager {
 			|lease| (lease.meta().account.clone(), Some(lease.meta().principal.clone())),
 		);
 		let mut report = UsageReport {
-			provider: provider.clone(),
+			provider: provider.to_owned(),
 			account,
 			principal,
 			plan: fetched.plan,

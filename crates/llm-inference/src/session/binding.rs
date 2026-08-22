@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use omp_llm_catalog::{
 	id::{ModelKey, RouteId},
 	provider::TrustDomain,
@@ -19,6 +19,58 @@ use crate::{
 	body::{AttemptBodyEvidence, RetryDecision},
 	id::{ConversationId, PrincipalId, Revision},
 };
+
+/// Journal-safe opaque evidence identifying a credential affinity.
+///
+/// The digest is keyed by installation-owned random bytes. It can be compared
+/// across revival without revealing an account id, principal, or credential.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct CredentialAffinityDigest(Str);
+
+impl CredentialAffinityDigest {
+	/// Computes a domain-separated affinity digest from inference-owned
+	/// identity.
+	///
+	/// `key` must come from the credential authority and must never be
+	/// journaled.
+	#[must_use]
+	pub fn derive(
+		key: &[u8; 32],
+		provider: &omp_llm_catalog::ProviderId<str>,
+		account: &crate::id::AccountId<str>,
+		principal: &PrincipalId<str>,
+	) -> Self {
+		let mut hasher = Hash32::hasher();
+		hasher
+			.update(b"omp.credential-affinity.v1\0")
+			.update(key)
+			.update(b"\0provider\0")
+			.update(provider.as_str().as_bytes())
+			.update(b"\0account\0")
+			.update(account.as_str().as_bytes())
+			.update(b"\0principal\0")
+			.update(principal.as_str().as_bytes());
+		Self(Str::new(hasher.finalize().to_hex().as_str()))
+	}
+
+	/// Restores already-derived opaque journal evidence.
+	///
+	/// Only canonical lowercase BLAKE3-256 hex is accepted.
+	#[must_use]
+	pub fn parse(value: &str) -> Option<Self> {
+		value
+			.parse::<Hash32>()
+			.ok()
+			.map(|digest| Self(Str::new(digest.to_hex().as_str())))
+	}
+
+	/// Borrows the opaque canonical digest.
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		self.0.as_str()
+	}
+}
 
 /// Determines whether credential refresh invalidates provider-side state.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -189,13 +241,13 @@ impl ServerStateBinding {
 #[derive(Clone, Debug)]
 pub struct BindingContext<'a> {
 	/// Active conversation branch.
-	pub conversation:          &'a ConversationId,
+	pub conversation:          &'a ConversationId<str>,
 	/// Selected concrete route.
-	pub route:                 &'a RouteId,
+	pub route:                 &'a RouteId<str>,
 	/// Selected normalized model deployment.
-	pub model:                 &'a ModelKey,
+	pub model:                 &'a ModelKey<str>,
 	/// Authenticated principal.
-	pub principal:             &'a PrincipalId,
+	pub principal:             &'a PrincipalId<str>,
 	/// Account-selection evidence, when execution follows an earlier attempt.
 	pub account_change:        Option<&'a AccountChangeEvidence>,
 	/// Selected route's current trust boundary.
@@ -236,6 +288,9 @@ pub enum ReseedReason {
 	/// Route policy binds state to a replaced credential generation.
 	#[strum(serialize = "CredentialGenerationChanged")]
 	CredentialGenerationChanged,
+	/// Caller requested fresh provider-native state and account selection.
+	#[strum(serialize = "ProviderReset")]
+	ProviderReset,
 	/// Provider-declared expiry elapsed.
 	#[strum(serialize = "ProviderExpired")]
 	ProviderExpired,

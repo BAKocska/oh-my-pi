@@ -183,7 +183,7 @@ pub trait RefreshLeaseStore: Send + Sync + 'static {
 	/// Waits for a generation newer than `minimum_generation` or lease expiry.
 	fn wait_for_newer<'a>(
 		&'a self,
-		account: &'a AccountId,
+		account: &'a AccountId<str>,
 		minimum_generation: u64,
 		lease_expires_at: SystemTime,
 	) -> Pin<Box<dyn Future<Output = Result<RefreshLeaseWait, RefreshStoreError>> + Send + 'a>>;
@@ -458,7 +458,7 @@ impl Drop for FlightGuard {
 	}
 }
 
-fn remove_flight(account: &AccountId, flight: &Arc<ProcessFlight>) {
+fn remove_flight(account: &AccountId<str>, flight: &Arc<ProcessFlight>) {
 	let mut active = FLIGHTS.lock();
 	if active
 		.get(account)
@@ -740,20 +740,20 @@ async fn record_release<S: RefreshLeaseStore>(
 
 fn validate_result(
 	request: &RefreshRequest,
-	account: &AccountId,
-	principal: &PrincipalId,
+	account: &AccountId<str>,
+	principal: &PrincipalId<str>,
 	freshness: &CredentialFreshness,
 	receipt: &RefreshReceipt,
 ) -> Result<(), RefreshError> {
 	if account != &request.account {
 		return Err(RefreshError {
-			kind:    RefreshErrorKind::AccountChanged { actual: account.clone() },
+			kind:    RefreshErrorKind::AccountChanged { actual: account.to_owned() },
 			receipt: Box::new(receipt.clone()),
 		});
 	}
 	if principal != &request.principal {
 		return Err(RefreshError {
-			kind:    RefreshErrorKind::PrincipalChanged { actual: principal.clone() },
+			kind:    RefreshErrorKind::PrincipalChanged { actual: principal.to_owned() },
 			receipt: Box::new(receipt.clone()),
 		});
 	}

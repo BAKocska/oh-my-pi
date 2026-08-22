@@ -958,14 +958,15 @@ mod tests {
 				negotiation:    NegotiationPolicy::default(),
 			})),
 			OperationCall::Search(Arc::new(SearchRequest {
-				query:             sf!("private query"),
-				include_domains:   Arc::from([]),
-				exclude_domains:   Arc::from([]),
-				recency:           None,
-				locale:            None,
-				max_results:       3,
+				query: sf!("private query"),
+				include_domains: Arc::from([]),
+				exclude_domains: Arc::from([]),
+				recency: None,
+				locale: None,
+				max_results: 3,
 				synthesize_answer: Setting::default(),
-				negotiation:       NegotiationPolicy::default(),
+				negotiation: NegotiationPolicy::default(),
+				..SearchRequest::new(sf!("private query"), 3)
 			})),
 			OperationCall::Usage(Arc::new(UsageRequest {
 				provider:    None,

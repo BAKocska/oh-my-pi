@@ -18,6 +18,51 @@ const EXACT_SHORT_MAX_PERIOD_BYTES: usize = 60;
 const EXACT_SHORT_MIN_REPEATED_BYTES: usize = 180;
 const EXACT_LONG_MIN_REPEATED_BYTES: usize = 1024;
 
+/// Recoverable HTTP/2 or idle-stream failure classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamRecoveryKind {
+	/// Peer reset the HTTP/2 stream before ordinary output committed.
+	Http2Reset,
+	/// A successful handshake produced no decodable event within the watchdog.
+	FirstEventStall,
+	/// The stream stalled after tool results but before a new model event.
+	PostToolIdleStall,
+}
+
+/// Classifies reset/stall evidence without inspecting provider names.
+#[must_use]
+pub fn classify_stream_recovery(
+	code: Option<&str>,
+	committed: bool,
+	saw_event: bool,
+	pending_tool_results: bool,
+) -> Option<StreamRecoveryKind> {
+	if committed {
+		return None;
+	}
+	if code.is_some_and(|code| {
+		code.eq_ignore_ascii_case("NGHTTP2_INTERNAL_ERROR")
+			|| code.eq_ignore_ascii_case("NGHTTP2_REFUSED_STREAM")
+			|| code.eq_ignore_ascii_case("h2_reset")
+	}) {
+		return Some(StreamRecoveryKind::Http2Reset);
+	}
+	if !saw_event {
+		return Some(StreamRecoveryKind::FirstEventStall);
+	}
+	pending_tool_results.then_some(StreamRecoveryKind::PostToolIdleStall)
+}
+
+/// Corrective prompt for a detected thinking loop.
+#[must_use]
+pub fn thinking_loop_redirect() -> Str {
+	Str::new_static(
+		"<system-interrupt reason=\"thinking_loop_detected\">Loop guard interrupted prior turn. \
+		 Stop narrating intended actions; issue one concrete tool call, choose the most boring \
+		 viable option, or finish now.</system-interrupt>",
+	)
+}
+
 /// Whether provisional output is still hidden from the consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputVisibility {
@@ -529,6 +574,20 @@ mod tests {
 	use serde_json::json;
 
 	use super::*;
+
+	#[test]
+	fn h2_reset_and_stalls_only_recover_before_commit() {
+		assert_eq!(
+			classify_stream_recovery(Some("NGHTTP2_REFUSED_STREAM"), false, false, false),
+			Some(StreamRecoveryKind::Http2Reset)
+		);
+		assert_eq!(
+			classify_stream_recovery(None, false, false, false),
+			Some(StreamRecoveryKind::FirstEventStall)
+		);
+		assert_eq!(classify_stream_recovery(None, true, false, true), None);
+		assert!(thinking_loop_redirect().contains("thinking_loop_detected"));
+	}
 
 	#[test]
 	fn committed_loops_surface_and_gated_loops_may_retry() {

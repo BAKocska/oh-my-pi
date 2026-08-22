@@ -439,12 +439,12 @@ impl AccountPool {
 
 	/// Removes account metadata while retaining independent cooldown, rate, and
 	/// quota observations.
-	pub fn remove(&self, account: &AccountId) -> Option<AccountRecord> {
+	pub fn remove(&self, account: &AccountId<str>) -> Option<AccountRecord> {
 		self.state.write().accounts.remove(account)
 	}
 
 	/// Returns an account metadata snapshot.
-	pub fn account(&self, account: &AccountId) -> Option<AccountRecord> {
+	pub fn account(&self, account: &AccountId<str>) -> Option<AccountRecord> {
 		self.state.read().accounts.get(account).cloned()
 	}
 
@@ -456,7 +456,7 @@ impl AccountPool {
 	/// Enables or disables a static account without deleting accounting history.
 	pub fn set_enabled(
 		&self,
-		account: &AccountId,
+		account: &AccountId<str>,
 		enabled: bool,
 	) -> Result<bool, AccountStateStoreError> {
 		if let Some(store) = &self.store
@@ -493,7 +493,7 @@ impl AccountPool {
 
 	/// Clears only the explicit cooldown while preserving rate and quota
 	/// receipts.
-	pub fn clear_cooldown(&self, account: &AccountId) -> Result<(), AccountStateStoreError> {
+	pub fn clear_cooldown(&self, account: &AccountId<str>) -> Result<(), AccountStateStoreError> {
 		if let Some(store) = &self.store {
 			store.clear_cooldown(account)?;
 		}
@@ -550,8 +550,8 @@ impl AccountPool {
 	/// provider ownership.
 	pub fn update_credential_generation(
 		&self,
-		account: &AccountId,
-		principal: &PrincipalId,
+		account: &AccountId<str>,
+		principal: &PrincipalId<str>,
 		generation: u64,
 	) -> Result<bool, AccountStateStoreError> {
 		if self
@@ -665,7 +665,7 @@ impl AccountPool {
 	}
 
 	/// Returns an independent rate-state snapshot.
-	pub fn rate_state(&self, account: &AccountId) -> RateState {
+	pub fn rate_state(&self, account: &AccountId<str>) -> RateState {
 		self
 			.state
 			.read()
@@ -676,7 +676,7 @@ impl AccountPool {
 	}
 
 	/// Returns an independent quota-state snapshot.
-	pub fn quota_state(&self, account: &AccountId) -> QuotaState {
+	pub fn quota_state(&self, account: &AccountId<str>) -> QuotaState {
 		self
 			.state
 			.read()

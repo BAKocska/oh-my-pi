@@ -54,7 +54,7 @@ impl GoogleAntigravityUsageFetcher {
 	}
 }
 impl ConsoleUsageFetcher for GoogleAntigravityUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

@@ -480,6 +480,7 @@ const fn openai_chat_capabilities(
 		text_verbosity: Availability::Unknown,
 		reasoning: Availability::Unknown,
 		input_modalities: Availability::Native(input_modalities),
+		image_input: Availability::Unknown,
 		hosted_tools: Availability::Unknown,
 		prompt_caching: Availability::Unknown,
 		service_tiers: Availability::Unknown,

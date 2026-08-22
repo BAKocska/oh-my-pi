@@ -95,6 +95,10 @@ impl RealtimeWireCodec for OpenAiRealtimeWireCodec {
 					item: RealtimeItem::FunctionCallOutput { call_id: call.as_str(), output },
 				})
 			},
+			RealtimeInput::AppendContext(_)
+			| RealtimeInput::SetMuted(_)
+			| RealtimeInput::CancelDelegation { .. }
+			| RealtimeInput::SettleDelegation(_) => Err(capability_error()),
 			RealtimeInput::Commit => {
 				let mut frames = RealtimeWireFrames::new();
 				frames.push(json_bytes(&TypeOnly { kind: TypeOnlyKind::InputAudioBufferCommit })?);

@@ -186,7 +186,7 @@ impl AlibabaTokenPlanShaper {
 
 	/// Provider whose credentials this shaper rewrites.
 	#[must_use]
-	pub const fn provider(&self) -> &ProviderId {
+	pub fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 
@@ -284,7 +284,7 @@ impl AuthLoginEngine for AlibabaTokenPlanLoginEngine {
 		AuthMethod::ApiKey
 	}
 
-	fn supports(&self, provider: &ProviderId) -> bool {
+	fn supports(&self, provider: &ProviderId<str>) -> bool {
 		provider == &self.provider
 	}
 

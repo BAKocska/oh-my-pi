@@ -5,7 +5,7 @@ use std::{fmt, mem, time::Duration};
 use omp_core::Str;
 
 use crate::{
-	answer::AnswerKind,
+	answer::{AnswerKind, SearchFailureKind, SearchProviderFailure},
 	catalog::{OperationKind, ProviderId, RouteId},
 	id::RequestId,
 	operation::MediaOperationError,
@@ -196,6 +196,12 @@ pub enum ErrorDetail {
 		/// Typed failure reason.
 		reason:  ReasonId,
 	},
+	/// An explicitly named tool was absent from the live declarations.
+	#[error("named tool {name} is not declared")]
+	NamedToolUnavailable {
+		/// Requested tool name.
+		name: Str,
+	},
 	/// A selector or target could not resolve.
 	#[error("target {selector} did not resolve")]
 	Target {
@@ -227,6 +233,12 @@ pub enum ErrorDetail {
 	Provider {
 		/// Sanitized bounded provider message.
 		sanitized_message: Str,
+	},
+	/// Ordered, bounded failures from an automatic search-provider chain.
+	#[error("all search providers failed")]
+	SearchFailures {
+		/// Secret-free failure summary in attempt order.
+		failures: std::sync::Arc<[SearchProviderFailure]>,
 	},
 	/// Local availability evidence.
 	#[error("local backend unavailable ({})", .reason.0)]
@@ -277,6 +289,11 @@ impl ErrorDetail {
 		Self::Provider { sanitized_message }
 	}
 
+	/// Records ordered, secret-free search-provider failures.
+	pub fn search_failures(failures: impl Into<std::sync::Arc<[SearchProviderFailure]>>) -> Self {
+		Self::SearchFailures { failures: failures.into() }
+	}
+
 	/// Records why a local backend is unavailable.
 	pub const fn local_unavailable(reason: ReasonId) -> Self {
 		Self::LocalUnavailable { reason }
@@ -320,6 +337,7 @@ impl fmt::Debug for Error {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let detail_kind = self.detail_ref().map(|detail| match detail {
 			ErrorDetail::BodyVariantMismatch { .. } => "BodyVariantMismatch",
+			ErrorDetail::NamedToolUnavailable { .. } => "NamedToolUnavailable",
 			ErrorDetail::Budget { .. } => "Budget",
 			ErrorDetail::Context { .. } => "Context",
 			ErrorDetail::Target { .. } => "Target",
@@ -327,6 +345,7 @@ impl fmt::Debug for Error {
 			ErrorDetail::Replay { .. } => "Replay",
 			ErrorDetail::Protocol { .. } => "Protocol",
 			ErrorDetail::Provider { .. } => "Provider",
+			ErrorDetail::SearchFailures { .. } => "SearchFailures",
 			ErrorDetail::LocalUnavailable { .. } => "LocalUnavailable",
 			ErrorDetail::StalePlan { .. } => "StalePlan",
 		});
@@ -502,6 +521,70 @@ impl std::error::Error for Error {
 			.as_ref()
 			.map(|source| source as &(dyn std::error::Error + 'static))
 	}
+}
+
+/// Classifies one failed search attempt without retaining provider body text.
+#[must_use]
+pub fn search_provider_failure(error: &Error) -> SearchProviderFailure {
+	let kind = match (error.status, error.kind) {
+		(Some(401 | 403), _) | (_, ErrorKind::Authentication | ErrorKind::Authorization) => {
+			SearchFailureKind::Authentication
+		},
+		(Some(402 | 429), _)
+		| (_, ErrorKind::PaymentRequired | ErrorKind::QuotaExhausted | ErrorKind::RateLimited) => {
+			SearchFailureKind::Quota
+		},
+		(Some(404), _) | (_, ErrorKind::TargetNotFound) => SearchFailureKind::ModelNotFound,
+		(_, ErrorKind::DeadlineExceeded) => SearchFailureKind::Timeout,
+		(
+			_,
+			ErrorKind::Dns
+			| ErrorKind::Tls
+			| ErrorKind::Connectivity
+			| ErrorKind::Protocol
+			| ErrorKind::StreamCorruption,
+		) => SearchFailureKind::Transport,
+		_ => SearchFailureKind::Provider,
+	};
+	SearchProviderFailure {
+		provider: error
+			.provider
+			.as_deref()
+			.cloned()
+			.unwrap_or_else(|| crate::catalog::ProviderId::from("unknown")),
+		kind,
+		status: error.status,
+		code: error.code.clone(),
+	}
+}
+
+/// Produces one typed aggregate error from an ordered provider fallback chain.
+///
+/// At most sixteen summaries are retained; the most recent receipt remains the
+/// accounting authority and provider diagnostics never enter the aggregate.
+pub fn aggregate_search_failures(mut failures: Vec<Error>) -> Error {
+	const MAX_FAILURES: usize = 16;
+	let retained = failures
+		.iter()
+		.rev()
+		.take(MAX_FAILURES)
+		.map(search_provider_failure)
+		.collect::<Vec<_>>()
+		.into_iter()
+		.rev()
+		.collect::<Vec<_>>();
+	let Some(mut last) = failures.pop() else {
+		return Error::new(
+			ErrorKind::RouteUnavailable,
+			ErrorPhase::Planning,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		)
+		.detail(ErrorDetail::search_failures(retained));
+	};
+	last.action = RetryAction::Never;
+	last.committed = false;
+	last.detail(ErrorDetail::search_failures(retained))
 }
 
 #[cfg(test)]

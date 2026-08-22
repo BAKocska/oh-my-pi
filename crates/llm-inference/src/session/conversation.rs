@@ -521,9 +521,9 @@ impl<I> ConversationState<I> {
 	}
 
 	pub fn revision_for(
-		conversation: &ConversationId,
-		parent: Option<&Revision>,
-		turn: Option<&TurnId>,
+		conversation: &ConversationId<str>,
+		parent: Option<&Revision<str>>,
+		turn: Option<&TurnId<str>>,
 	) -> Revision {
 		let mut hasher = DefaultHasher::new();
 		conversation.hash(&mut hasher);
@@ -691,15 +691,15 @@ impl<I> Drop for TurnDraft<I> {
 
 pub(crate) fn revision<I>(
 	state: &ConversationState<I>,
-	id: &Revision,
+	id: &Revision<str>,
 ) -> Result<CommittedRevision<I>, ConversationError> {
 	let node = state
 		.revisions
 		.get(id)
-		.ok_or_else(|| ConversationError::UnknownRevision(id.clone()))?;
+		.ok_or_else(|| ConversationError::UnknownRevision(Revision::from(id)))?;
 	Ok(CommittedRevision::new(
 		node.conversation.clone(),
-		id.clone(),
+		Revision::from(id),
 		node.parent.clone(),
 		node.turn.clone(),
 		Arc::clone(&node.items),
@@ -708,40 +708,40 @@ pub(crate) fn revision<I>(
 
 pub(crate) fn is_ancestor<I>(
 	state: &ConversationState<I>,
-	ancestor: &Revision,
-	descendant: &Revision,
+	ancestor: &Revision<str>,
+	descendant: &Revision<str>,
 ) -> bool {
-	let mut cursor = Some(descendant);
+	let mut cursor: Option<&Revision<str>> = Some(descendant);
 	while let Some(revision) = cursor {
-		if revision == ancestor {
+		if revision.as_str() == ancestor.as_str() {
 			return true;
 		}
 		cursor = state
 			.revisions
 			.get(revision)
-			.and_then(|node| node.parent.as_ref());
+			.and_then(|node| node.parent.as_deref());
 	}
 	false
 }
 
 pub(crate) fn delta<I>(
 	state: &ConversationState<I>,
-	base: Option<&Revision>,
-	head: &Revision,
+	base: Option<&Revision<str>>,
+	head: &Revision<str>,
 ) -> Result<HistoryDelta<I>, ConversationError> {
 	if !state.revisions.contains_key(head) {
-		return Err(ConversationError::UnknownRevision(head.clone()));
+		return Err(ConversationError::UnknownRevision(head.to_owned()));
 	}
 	if base.is_some_and(|base| !is_ancestor(state, base, head)) {
 		return Err(ConversationError::RevisionConflict {
-			expected: head.clone(),
-			actual:   base.cloned().expect("checked some"),
+			expected: head.to_owned(),
+			actual:   base.map(ToOwned::to_owned).expect("checked some"),
 		});
 	}
-	let mut cursor = Some(head);
+	let mut cursor: Option<&Revision<str>> = Some(head);
 	let mut segments = Vec::new();
 	while let Some(revision) = cursor {
-		if base == Some(revision) {
+		if base.is_some_and(|base| base == revision) {
 			break;
 		}
 		let node = state
@@ -749,8 +749,8 @@ pub(crate) fn delta<I>(
 			.get(revision)
 			.ok_or(ConversationError::CorruptStore)?;
 		segments.push(Arc::clone(&node.items));
-		cursor = node.parent.as_ref();
+		cursor = node.parent.as_deref();
 	}
 	segments.reverse();
-	Ok(HistoryDelta::new(base.cloned(), head.clone(), segments))
+	Ok(HistoryDelta::new(base.map(ToOwned::to_owned), head.to_owned(), segments))
 }

@@ -12,9 +12,9 @@ use std::{
 };
 
 pub use binding::{
-	BindingContext, BindingKey, BindingValidity, CredentialGenerationPolicy,
-	PendingServerStateBinding, ProviderExpiryDecision, ReseedReason, ReseedState,
-	ServerStateBinding, SessionExpiryError, StoredProviderStateEvent,
+	BindingContext, BindingKey, BindingValidity, CredentialAffinityDigest,
+	CredentialGenerationPolicy, PendingServerStateBinding, ProviderExpiryDecision, ReseedReason,
+	ReseedState, ServerStateBinding, SessionExpiryError, StoredProviderStateEvent,
 };
 use bytes::Bytes;
 pub use conversation::{
@@ -89,7 +89,7 @@ pub enum ContextPlan<I> {
 pub fn plan_context<I, S>(
 	store: &S,
 	strategy: &ContextStrategy,
-	head: &Revision,
+	head: &Revision<str>,
 	binding: Option<&ServerStateBinding>,
 	context: Option<&BindingContext<'_>>,
 ) -> Result<ContextPlan<I>, ConversationError>
@@ -107,7 +107,7 @@ where
 			let key = sf!("prefix:{}", head.as_str());
 			Ok(ContextPlan::PrefixCache {
 				history,
-				cache: PrefixCacheIdentity { revision: head.clone(), key },
+				cache: PrefixCacheIdentity { revision: head.to_owned(), key },
 			})
 		},
 		ContextStrategy::ServerState(policy) => {
@@ -138,7 +138,7 @@ where
 				}),
 				BindingValidity::Reseed(_) => Err(ConversationError::RevisionConflict {
 					expected: binding.key.base_revision.clone(),
-					actual:   head.clone(),
+					actual:   head.to_owned(),
 				}),
 			}
 		},
@@ -191,7 +191,7 @@ impl PlannerStore {
 		}
 	}
 
-	fn fork(&self, at: &Revision) -> Result<crate::id::ConversationId, ConversationError> {
+	fn fork(&self, at: &Revision<str>) -> Result<crate::id::ConversationId, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.fork(at),
 			Self::Memory(store) => store.fork(at),
@@ -200,8 +200,8 @@ impl PlannerStore {
 
 	fn committed_turn(
 		&self,
-		conversation: &crate::id::ConversationId,
-		turn: &crate::id::TurnId,
+		conversation: &crate::id::ConversationId<str>,
+		turn: &crate::id::TurnId<str>,
 	) -> Result<Option<CommittedRevision<StoredMessage>>, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.committed_turn(conversation, turn),
@@ -211,7 +211,7 @@ impl PlannerStore {
 
 	fn turn_replay(
 		&self,
-		turn: &crate::id::TurnId,
+		turn: &crate::id::TurnId<str>,
 	) -> Result<Option<TurnReplay>, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.turn_replay(turn),
@@ -233,7 +233,7 @@ impl PlannerStore {
 
 	fn server_state(
 		&self,
-		conversation: &crate::id::ConversationId,
+		conversation: &crate::id::ConversationId<str>,
 	) -> Result<Option<ServerStateBinding>, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.server_state(conversation),
@@ -243,8 +243,8 @@ impl PlannerStore {
 
 	fn delta(
 		&self,
-		base: Option<&Revision>,
-		head: &Revision,
+		base: Option<&Revision<str>>,
+		head: &Revision<str>,
 	) -> Result<HistoryDelta<StoredMessage>, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.delta(base, head),
@@ -255,7 +255,7 @@ impl PlannerStore {
 	fn plan(
 		&self,
 		strategy: &ContextStrategy,
-		head: &Revision,
+		head: &Revision<str>,
 		binding: Option<&ServerStateBinding>,
 		context: Option<&BindingContext<'_>>,
 	) -> Result<ContextPlan<StoredMessage>, ConversationError> {
@@ -267,8 +267,8 @@ impl PlannerStore {
 
 	fn begin(
 		&self,
-		conversation: &crate::id::ConversationId,
-		revision: &Revision,
+		conversation: &crate::id::ConversationId<str>,
+		revision: &Revision<str>,
 		turn: crate::id::TurnId,
 		input: Arc<[StoredMessage]>,
 	) -> Result<PlannerDraft, ConversationError> {
@@ -384,7 +384,7 @@ impl ConversationSessionPlanner {
 	/// Forks provider history at an immutable committed revision.
 	pub fn fork_conversation(
 		&self,
-		at: &Revision,
+		at: &Revision<str>,
 	) -> Result<crate::id::ConversationId, ConversationError> {
 		self.store.fork(at)
 	}
@@ -392,8 +392,8 @@ impl ConversationSessionPlanner {
 	/// Returns the provider-history commit for one conversation-scoped turn.
 	pub fn committed_turn(
 		&self,
-		conversation: &crate::id::ConversationId,
-		turn: &crate::id::TurnId,
+		conversation: &crate::id::ConversationId<str>,
+		turn: &crate::id::TurnId<str>,
 	) -> Result<Option<CommittedRevision<StoredMessage>>, ConversationError> {
 		self.store.committed_turn(conversation, turn)
 	}
@@ -401,7 +401,7 @@ impl ConversationSessionPlanner {
 	/// Returns an exact terminal RPC response retained for logical-turn replay.
 	pub fn turn_replay(
 		&self,
-		turn: &crate::id::TurnId,
+		turn: &crate::id::TurnId<str>,
 	) -> Result<Option<TurnReplay>, ConversationError> {
 		self.store.turn_replay(turn)
 	}
@@ -476,6 +476,8 @@ impl ConversationSessionPlanner {
 				.map_err(|_| session_error(context, ErrorKind::InvalidRequest, RetryAction::Never))?
 				.into(),
 		};
+		let explicit_provider_reset = session.provider_reset;
+		let force_replay = force_replay || explicit_provider_reset;
 		let binding = if force_replay || session.forked {
 			None
 		} else {
@@ -490,7 +492,11 @@ impl ConversationSessionPlanner {
 					session_error(context, ErrorKind::SessionConflict, RetryAction::Never)
 				})?,
 				capture_server_state: matches!(session.strategy, ContextStrategy::ServerState(_)),
-				reason:               Some(ReseedReason::ProviderExpired),
+				reason:               Some(if explicit_provider_reset {
+					ReseedReason::ProviderReset
+				} else {
+					ReseedReason::ProviderExpired
+				}),
 			}
 		} else if session.forked {
 			ContextPlan::Replay {
@@ -1033,10 +1039,10 @@ mod tests {
 	}
 
 	fn context<'a>(
-		conversation: &'a crate::id::ConversationId,
-		route: &'a RouteId,
-		model: &'a ModelKey,
-		principal: &'a PrincipalId,
+		conversation: &'a crate::id::ConversationId<str>,
+		route: &'a RouteId<str>,
+		model: &'a ModelKey<str>,
+		principal: &'a PrincipalId<str>,
 		trust_domain: &'a TrustDomain,
 		now: SystemTime,
 	) -> BindingContext<'a> {
@@ -1112,11 +1118,13 @@ mod tests {
 		let prepared = super::PreparedTurn {
 			request:           RequestId::new("request"),
 			session:           crate::call::SessionRequest {
-				conversation: root.conversation().clone(),
-				revision:     root.revision().clone(),
-				turn:         TurnId::new("turn"),
-				strategy:     server_strategy(),
-				forked:       false,
+				conversation:   root.conversation().to_owned(),
+				revision:       root.revision().to_owned(),
+				turn:           TurnId::new("turn"),
+				strategy:       server_strategy(),
+				append_only:    true,
+				provider_reset: false,
+				forked:         false,
 			},
 			input:             Arc::clone(&input),
 			provider:          ProviderId::new("provider"),
@@ -1157,7 +1165,7 @@ mod tests {
 			.unwrap();
 		let committed = fresh
 			.commit_successful_turn(pending(
-				root.conversation().clone(),
+				root.conversation().to_owned(),
 				"route",
 				"model",
 				"principal",
@@ -1172,7 +1180,7 @@ mod tests {
 				.unwrap()
 				.key
 				.base_revision,
-			committed.revision().clone(),
+			committed.revision().to_owned(),
 		);
 	}
 
@@ -1251,11 +1259,13 @@ mod tests {
 				deadline: None,
 				budget,
 				session: Some(SessionRequest {
-					conversation: root.conversation().clone(),
-					revision:     root.revision().clone(),
-					turn:         TurnId::new("fork-turn"),
-					strategy:     ContextStrategy::Replay,
-					forked:       true,
+					conversation:   root.conversation().to_owned(),
+					revision:       root.revision().to_owned(),
+					turn:           TurnId::new("fork-turn"),
+					strategy:       ContextStrategy::Replay,
+					append_only:    true,
+					provider_reset: false,
+					forked:         true,
 				}),
 			},
 			OperationCall::Chat(Arc::new(ChatRequest {
@@ -1316,7 +1326,7 @@ mod tests {
 			.unwrap();
 		captured
 			.capture_server_state(pending(
-				first.conversation().clone(),
+				first.conversation().to_owned(),
 				"route",
 				"model",
 				"principal",
@@ -1358,7 +1368,7 @@ mod tests {
 			.unwrap();
 		original
 			.capture_server_state(pending(
-				root.conversation().clone(),
+				root.conversation().to_owned(),
 				"route",
 				"model",
 				"principal",
@@ -1636,7 +1646,7 @@ mod tests {
 		assert_eq!(first.revision(), repeated.revision());
 		assert_eq!(
 			store
-				.committed_turn(root.conversation(), &TurnId::new("same"))
+				.committed_turn(root.conversation(), TurnId::from_ref("same"))
 				.unwrap()
 				.unwrap()
 				.revision(),
@@ -1702,8 +1712,8 @@ mod tests {
 		{
 			let store = super::store::SqliteConversationStore::<i32>::open(&database).unwrap();
 			let root = store.create().unwrap();
-			conversation = root.conversation().clone();
-			revision = root.revision().clone();
+			conversation = root.conversation().to_owned();
+			revision = root.revision().to_owned();
 
 			let mut dropped = store
 				.begin(&conversation, &revision, TurnId::new("dropped"), Arc::from([7]))
@@ -1718,13 +1728,13 @@ mod tests {
 			drop(dropped);
 			assert!(
 				store
-					.turn_replay(&TurnId::new("dropped"))
+					.turn_replay(TurnId::from_ref("dropped"))
 					.unwrap()
 					.is_none()
 			);
 			assert!(
 				store
-					.committed_turn(&conversation, &TurnId::new("dropped"))
+					.committed_turn(&conversation, TurnId::from_ref("dropped"))
 					.unwrap()
 					.is_none()
 			);

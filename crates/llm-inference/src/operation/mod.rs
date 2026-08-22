@@ -8,6 +8,7 @@ pub mod job;
 pub mod native;
 pub mod realtime;
 pub mod search;
+pub mod search_query;
 pub mod speech;
 pub mod tokens;
 pub mod transcription;

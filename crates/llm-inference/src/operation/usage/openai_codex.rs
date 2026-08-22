@@ -53,7 +53,7 @@ impl OpenAiCodexUsageFetcher {
 }
 
 impl ConsoleUsageFetcher for OpenAiCodexUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

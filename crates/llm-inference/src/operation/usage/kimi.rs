@@ -56,7 +56,7 @@ impl KimiUsageFetcher {
 	}
 }
 impl ConsoleUsageFetcher for KimiUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

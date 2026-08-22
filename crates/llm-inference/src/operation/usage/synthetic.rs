@@ -43,7 +43,7 @@ impl SyntheticUsageFetcher {
 	}
 }
 impl ConsoleUsageFetcher for SyntheticUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 

@@ -40,7 +40,7 @@ pub enum ProviderShaper {
 impl ProviderShaper {
 	/// Provider whose credentials this shaper rewrites.
 	#[must_use]
-	pub const fn provider(&self) -> &ProviderId {
+	pub fn provider(&self) -> &ProviderId<str> {
 		match self {
 			Self::GithubCopilot(shaper) => shaper.provider(),
 			Self::AlibabaTokenPlan(shaper) => shaper.provider(),
@@ -88,7 +88,7 @@ impl CredentialShaperRegistry {
 
 	/// Registers one provider shaper, rejecting duplicate provider ids.
 	pub fn register(&mut self, shaper: ProviderShaper) -> Result<(), DuplicateShaperError> {
-		let provider = shaper.provider().clone();
+		let provider = shaper.provider().to_owned();
 		if self.shapers.contains_key(&provider) {
 			return Err(DuplicateShaperError { provider });
 		}
@@ -98,7 +98,7 @@ impl CredentialShaperRegistry {
 
 	/// Returns the shaper registered for `provider`, if any.
 	#[must_use]
-	pub fn get(&self, provider: &ProviderId) -> Option<&ProviderShaper> {
+	pub fn get(&self, provider: &ProviderId<str>) -> Option<&ProviderShaper> {
 		self.shapers.get(provider)
 	}
 }

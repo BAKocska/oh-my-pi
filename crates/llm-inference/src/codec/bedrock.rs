@@ -1250,8 +1250,8 @@ struct FoundationModelLifecycle {
 impl FoundationModelSummary {
 	fn into_discovered(
 		self,
-		provider: &omp_llm_catalog::ProviderId,
-		route: &omp_llm_catalog::RouteId,
+		provider: &omp_llm_catalog::ProviderId<str>,
+		route: &omp_llm_catalog::RouteId<str>,
 	) -> Option<DiscoveredModel> {
 		if self.model_id.is_empty() || !self.is_usable() {
 			return None;
@@ -1284,6 +1284,7 @@ impl FoundationModelSummary {
 				text_verbosity:    Availability::Unknown,
 				reasoning:         Availability::Unknown,
 				input_modalities:  Availability::Native(modalities),
+				image_input:       Availability::Unknown,
 				hosted_tools:      Availability::Unknown,
 				prompt_caching:    Availability::Unknown,
 				service_tiers:     Availability::Unknown,
@@ -1303,8 +1304,8 @@ impl FoundationModelSummary {
 			tokenization:  None,
 		};
 		Some(DiscoveredModel {
-			provider: provider.clone(),
-			route: route.clone(),
+			provider: provider.to_owned(),
+			route: route.to_owned(),
 			wire_model: WireModelId::from(self.model_id),
 			aliases: Box::new([]),
 			display_name,

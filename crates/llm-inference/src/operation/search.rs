@@ -21,7 +21,10 @@ use crate::{
 	},
 	catalog::{Emulation, OperationKind, SearchCapabilities, SearchFeatureBits},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
-	operation::{OperationRequest, OperationResponse},
+	operation::{
+		OperationRequest, OperationResponse,
+		search_query::{SearchQuery, parse_date_value},
+	},
 	receipt::{Adjustment, ExecutionReceipt, FeatureId, ReasonId, Usage, UsageSource},
 };
 
@@ -181,7 +184,14 @@ where
 				return Err(request_error("search", "search_backend_not_called"));
 			};
 			let mut response = pending.await?;
-			let results = finalize_search(&plan, response.output)?;
+			let mut results = finalize_search(&plan, response.output)?;
+			results.metadata.provider = Some(response.meta.provider.clone());
+			results.metadata.account = response
+				.receipt
+				.attempts
+				.iter()
+				.rev()
+				.find_map(|attempt| attempt.account.clone());
 			response.receipt.adjustments.extend(plan.adjustments);
 			Ok(OperationResponse {
 				meta:    response.meta,
@@ -205,6 +215,18 @@ pub fn plan_search(
 	}
 	if request.max_results == 0 {
 		return Err(request_error("search.max_results", "zero_search_results_requested"));
+	}
+	if request.retrieval_results == Some(0) {
+		return Err(request_error("search.retrieval_results", "zero_search_retrieval_count"));
+	}
+	if request.max_output_tokens == Some(0) {
+		return Err(request_error("search.max_output_tokens", "zero_search_output_tokens"));
+	}
+	if request.temperature.is_some_and(|value| !value.is_finite()) {
+		return Err(request_error("search.temperature", "non_finite_search_temperature"));
+	}
+	if request.attempt_timeout.is_zero() || request.attempt_timeout > Duration::from_secs(300) {
+		return Err(request_error("search.attempt_timeout", "search_timeout_out_of_range"));
 	}
 	for domain in request
 		.include_domains
@@ -276,52 +298,48 @@ pub fn plan_search(
 		},
 	};
 
-	if capabilities
+	let effective_max = capabilities
 		.maximum_results
-		.is_some_and(|maximum| request.max_results > u32::from(maximum))
-	{
-		return Err(planning_error(
-			"search.max_results",
-			"requested_search_result_count_exceeds_route_limit",
-		));
+		.map_or(request.max_results, |maximum| request.max_results.min(u32::from(maximum)));
+	if effective_max != request.max_results {
+		adjustments.push(Adjustment::Substituted {
+			feature: FeatureId(sf!("search.max_results")),
+			from:    Str::new(request.max_results.to_string()),
+			to:      Str::new(effective_max.to_string()),
+		});
 	}
-	let effective_max = request.max_results;
-	let filter_request = Arc::new(SearchRequest {
-		query:             request.query.clone(),
-		include_domains:   if domains_native {
-			Arc::new([])
-		} else {
-			Arc::clone(&request.include_domains)
-		},
-		exclude_domains:   if domains_native {
-			Arc::new([])
-		} else {
-			Arc::clone(&request.exclude_domains)
-		},
-		recency:           (!recency_native).then_some(request.recency).flatten(),
-		locale:            (!locale_native).then(|| request.locale.clone()).flatten(),
-		max_results:       effective_max,
-		synthesize_answer: request.synthesize_answer.clone(),
-		negotiation:       request.negotiation.clone(),
-	});
-	let backend_request = Arc::new(SearchRequest {
-		query:             request.query.clone(),
-		include_domains:   if domains_native {
-			Arc::clone(&request.include_domains)
-		} else {
-			Arc::new([])
-		},
-		exclude_domains:   if domains_native {
-			Arc::clone(&request.exclude_domains)
-		} else {
-			Arc::new([])
-		},
-		recency:           recency_native.then_some(request.recency).flatten(),
-		locale:            locale_native.then(|| request.locale.clone()).flatten(),
-		max_results:       effective_max,
-		synthesize_answer: synthesis,
-		negotiation:       request.negotiation.clone(),
-	});
+	let mut filter = request.clone();
+	filter.include_domains = if domains_native {
+		Arc::new([])
+	} else {
+		Arc::clone(&request.include_domains)
+	};
+	filter.exclude_domains = if domains_native {
+		Arc::new([])
+	} else {
+		Arc::clone(&request.exclude_domains)
+	};
+	filter.recency = (!recency_native).then_some(request.recency).flatten();
+	filter.locale = (!locale_native).then(|| request.locale.clone()).flatten();
+	filter.max_results = request.max_results;
+	let filter_request = Arc::new(filter);
+
+	let mut backend = request.clone();
+	backend.include_domains = if domains_native {
+		Arc::clone(&request.include_domains)
+	} else {
+		Arc::new([])
+	};
+	backend.exclude_domains = if domains_native {
+		Arc::clone(&request.exclude_domains)
+	} else {
+		Arc::new([])
+	};
+	backend.recency = recency_native.then_some(request.recency).flatten();
+	backend.locale = locale_native.then(|| request.locale.clone()).flatten();
+	backend.max_results = effective_max;
+	backend.synthesize_answer = synthesis;
+	let backend_request = Arc::new(backend);
 	Ok(SearchPlan {
 		backend_request,
 		filter_request,
@@ -346,11 +364,30 @@ pub fn finalize_search(plan: &SearchPlan, mut page: SearchPage) -> Result<Search
 		}
 	}
 	let request = &plan.filter_request;
-	page.documents.retain(|document| {
-		matches_domain_filters(&document.url, &request.include_domains, &request.exclude_domains)
-			&& matches_locale(document.locale.as_deref(), request.locale.as_deref())
-			&& matches_recency(document.published_at, request.recency, plan.now)
-	});
+	let parsed = request.parsed_query.as_ref();
+	let mut warnings = Vec::new();
+	apply_dimension(
+		&mut page.documents,
+		&mut warnings,
+		domain_label(&request.include_domains, &request.exclude_domains),
+		|document| {
+			matches_domain_filters(&document.url, &request.include_domains, &request.exclude_domains)
+		},
+	);
+	apply_query_dimensions(&mut page.documents, parsed, &mut warnings);
+	if let Some(locale) = request.locale.as_deref() {
+		apply_dimension(
+			&mut page.documents,
+			&mut warnings,
+			Some(Str::new(format!("language:{locale}"))),
+			|document| matches_locale(document.locale.as_deref(), Some(locale)),
+		);
+	}
+	if request.recency.is_some() {
+		apply_dimension(&mut page.documents, &mut warnings, Some(sf!("recency")), |document| {
+			matches_recency(document.published_at, request.recency, plan.now)
+		});
+	}
 	page
 		.documents
 		.sort_by(|left, right| match (left.score, right.score) {
@@ -383,9 +420,232 @@ pub fn finalize_search(plan: &SearchPlan, mut page: SearchPage) -> Result<Search
 			snippet:      document.snippet,
 			score:        document.score,
 			published_at: document.published_at,
+			author:       None,
 		})
 		.collect();
-	Ok(SearchResults { results, answer: page.answer, usage: page.usage })
+	Ok(SearchResults {
+		results,
+		answer: page.answer,
+		usage: page.usage,
+		metadata: crate::answer::SearchMetadata { warnings, ..Default::default() },
+	})
+}
+
+fn apply_query_dimensions(
+	documents: &mut Vec<SearchDocument>,
+	query: &SearchQuery,
+	warnings: &mut Vec<Str>,
+) {
+	if !query.sites.is_empty() {
+		let label = query
+			.sites
+			.iter()
+			.map(|site| format!("site:{site}"))
+			.collect::<Vec<_>>()
+			.join(" OR ");
+		apply_dimension(documents, warnings, Some(Str::new(label)), |document| {
+			query
+				.sites
+				.iter()
+				.any(|site| matches_site(&document.url, site))
+		});
+	}
+	if !query.excluded_sites.is_empty() {
+		let label = query
+			.excluded_sites
+			.iter()
+			.map(|site| format!("-site:{site}"))
+			.collect::<Vec<_>>()
+			.join(" ");
+		apply_dimension(documents, warnings, Some(Str::new(label)), |document| {
+			!query
+				.excluded_sites
+				.iter()
+				.any(|site| matches_site(&document.url, site))
+		});
+	}
+	apply_text_dimension(documents, warnings, "inurl", &query.in_url, false, |document| {
+		document.url.as_str()
+	});
+	apply_text_dimension(documents, warnings, "-inurl", &query.excluded_in_url, true, |document| {
+		document.url.as_str()
+	});
+	apply_text_dimension(documents, warnings, "intitle", &query.in_title, false, |document| {
+		document.title.as_str()
+	});
+	apply_text_dimension(
+		documents,
+		warnings,
+		"-intitle",
+		&query.excluded_in_title,
+		true,
+		|document| document.title.as_str(),
+	);
+	if !query.filetypes.is_empty() {
+		let label = query
+			.filetypes
+			.iter()
+			.map(|extension| format!("filetype:{extension}"))
+			.collect::<Vec<_>>()
+			.join(" OR ");
+		apply_dimension(documents, warnings, Some(Str::new(label)), |document| {
+			query
+				.filetypes
+				.iter()
+				.any(|extension| matches_filetype(&document.url, extension))
+		});
+	}
+	if !query.excluded_filetypes.is_empty() {
+		let label = query
+			.excluded_filetypes
+			.iter()
+			.map(|extension| format!("-filetype:{extension}"))
+			.collect::<Vec<_>>()
+			.join(" ");
+		apply_dimension(documents, warnings, Some(Str::new(label)), |document| {
+			!query
+				.excluded_filetypes
+				.iter()
+				.any(|extension| matches_filetype(&document.url, extension))
+		});
+	}
+	if query.after.is_some() || query.before.is_some() {
+		let after = query.after.as_deref().and_then(iso_date_time);
+		let before = query.before.as_deref().and_then(iso_date_time);
+		let label = [
+			query.after.as_ref().map(|date| format!("after:{date}")),
+			query.before.as_ref().map(|date| format!("before:{date}")),
+		]
+		.into_iter()
+		.flatten()
+		.collect::<Vec<_>>()
+		.join(" ");
+		apply_dimension(documents, warnings, Some(Str::new(label)), |document| {
+			let Some(published) = document.published_at else {
+				return true;
+			};
+			after.is_none_or(|bound| published >= bound)
+				&& before.is_none_or(|bound| published < bound)
+		});
+	}
+}
+
+fn apply_text_dimension(
+	documents: &mut Vec<SearchDocument>,
+	warnings: &mut Vec<Str>,
+	name: &str,
+	values: &[Str],
+	excluded: bool,
+	field: impl for<'a> Fn(&'a SearchDocument) -> &'a str,
+) {
+	if values.is_empty() {
+		return;
+	}
+	let label = values
+		.iter()
+		.map(|value| format!("{name}:{value}"))
+		.collect::<Vec<_>>()
+		.join(" ");
+	apply_dimension(documents, warnings, Some(Str::new(label)), |document| {
+		let haystack = field(document);
+		if excluded {
+			!values
+				.iter()
+				.any(|value| contains_ascii_case_insensitive(haystack, value))
+		} else {
+			values
+				.iter()
+				.all(|value| contains_ascii_case_insensitive(haystack, value))
+		}
+	});
+}
+
+fn apply_dimension(
+	documents: &mut Vec<SearchDocument>,
+	warnings: &mut Vec<Str>,
+	label: Option<Str>,
+	matches: impl Fn(&SearchDocument) -> bool,
+) {
+	let Some(label) = label else {
+		return;
+	};
+	if documents.is_empty() {
+		return;
+	}
+	if documents.iter().any(&matches) {
+		documents.retain(matches);
+	} else {
+		warnings.push(Str::new(format!("no results matched `{label}`; the constraint was relaxed")));
+	}
+}
+
+fn domain_label(included: &[Str], excluded: &[Str]) -> Option<Str> {
+	if included.is_empty() && excluded.is_empty() {
+		return None;
+	}
+	let mut labels = included
+		.iter()
+		.map(|domain| format!("site:{domain}"))
+		.collect::<Vec<_>>();
+	labels.extend(excluded.iter().map(|domain| format!("-site:{domain}")));
+	Some(Str::new(labels.join(" ")))
+}
+
+fn matches_site(url: &str, site: &str) -> bool {
+	let Some(host) = url_host(url) else {
+		return false;
+	};
+	let (site_host, site_path) = site.split_once('/').unwrap_or((site, ""));
+	if !host_matches(host, site_host) {
+		return false;
+	}
+	if site_path.is_empty() {
+		return true;
+	}
+	let Some((_, rest)) = url.split_once("://") else {
+		return false;
+	};
+	let path = rest.find('/').map_or("", |index| &rest[index + 1..]);
+	path
+		.get(..site_path.len())
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case(site_path))
+}
+
+fn matches_filetype(url: &str, extension: &str) -> bool {
+	let without_query = url.split(['?', '#']).next().unwrap_or(url);
+	let suffix = format!(".{extension}");
+	without_query
+		.get(without_query.len().saturating_sub(suffix.len())..)
+		.is_some_and(|ending| ending.eq_ignore_ascii_case(&suffix))
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+	if needle.is_empty() {
+		return true;
+	}
+	haystack
+		.as_bytes()
+		.windows(needle.len())
+		.any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn iso_date_time(value: &str) -> Option<SystemTime> {
+	let normalized = parse_date_value(value)?;
+	let mut parts = normalized.as_str().split('-').map(str::parse::<i64>);
+	let year = parts.next()?.ok()?;
+	let month = parts.next()?.ok()?;
+	let day = parts.next()?.ok()?;
+	let year = year - i64::from(month <= 2);
+	let era = if year >= 0 { year } else { year - 399 } / 400;
+	let year_of_era = year - era * 400;
+	let shifted_month = month + if month > 2 { -3 } else { 9 };
+	let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+	let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+	let days = era * 146_097 + day_of_era - 719_468;
+	let seconds = days.checked_mul(86_400)?;
+	u64::try_from(seconds)
+		.ok()
+		.map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
 }
 
 /// Returns whether route fallback is permitted by both the error and exact body
@@ -591,17 +851,18 @@ mod tests {
 	fn replay_page_is_filtered_ranked_and_measured() {
 		let now = UNIX_EPOCH + Duration::from_days(10);
 		let request = SearchRequest {
-			query:             "rust tower".into(),
-			include_domains:   Arc::new(["example.test".into()]),
-			exclude_domains:   Arc::new(["blocked.example.test".into()]),
-			recency:           Some(SearchRecency::Week),
-			locale:            Some("en".into()),
-			max_results:       2,
+			query: "rust tower".into(),
+			include_domains: Arc::new(["example.test".into()]),
+			exclude_domains: Arc::new(["blocked.example.test".into()]),
+			recency: Some(SearchRecency::Week),
+			locale: Some("en".into()),
+			max_results: 2,
 			synthesize_answer: Setting::Unset,
-			negotiation:       NegotiationPolicy {
+			negotiation: NegotiationPolicy {
 				emulation: EmulationPolicy::AllowLossless,
 				..NegotiationPolicy::default()
 			},
+			..SearchRequest::new("rust tower", 2)
 		};
 		let plan = plan_search(
 			&request,

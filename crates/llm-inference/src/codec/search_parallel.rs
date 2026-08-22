@@ -276,6 +276,7 @@ fn project(response: WireResponse) -> Result<SearchResults, Error> {
 			snippet: bounded_snippet(excerpts.unwrap_or_default()),
 			score,
 			published_at: publish_date.as_deref().and_then(parse_date),
+			author: None,
 		});
 	}
 	// Parallel reports billable SKU rows rather than token counts. Retain their
@@ -290,6 +291,7 @@ fn project(response: WireResponse) -> Result<SearchResults, Error> {
 		results,
 		answer: None,
 		usage: Usage { search_calls: 1, source: UsageSource::Provider, ..Usage::default() },
+		metadata: Default::default(),
 	})
 }
 
@@ -395,14 +397,15 @@ mod tests {
 
 	fn request() -> SearchRequest {
 		SearchRequest {
-			query:             sf!("parallel web systems"),
-			include_domains:   Arc::from([sf!("parallel.ai")]),
-			exclude_domains:   Arc::from([sf!("example.invalid")]),
-			recency:           None,
-			locale:            None,
-			max_results:       4,
+			query: sf!("parallel web systems"),
+			include_domains: Arc::from([sf!("parallel.ai")]),
+			exclude_domains: Arc::from([sf!("example.invalid")]),
+			recency: None,
+			locale: None,
+			max_results: 4,
 			synthesize_answer: Setting::Unset,
-			negotiation:       NegotiationPolicy::default(),
+			negotiation: NegotiationPolicy::default(),
+			..SearchRequest::new(sf!("parallel web systems"), 4)
 		}
 	}
 

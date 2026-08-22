@@ -67,6 +67,14 @@ pub enum RealtimeInputKind {
 	Text,
 	/// Result of one authorized tool call.
 	ToolResult,
+	/// Provider-neutral session or delegation context.
+	AppendContext,
+	/// Caller microphone mute state.
+	SetMuted,
+	/// Cancellation of one delegated agent turn.
+	CancelDelegation,
+	/// Terminal settlement of one delegated agent turn.
+	SettleDelegation,
 	/// Commit current input.
 	Commit,
 	/// Cancel only the active response.
@@ -81,6 +89,10 @@ impl RealtimeInputKind {
 			RealtimeInput::Audio(_) => Self::Audio,
 			RealtimeInput::Text(_) => Self::Text,
 			RealtimeInput::ToolResult { .. } => Self::ToolResult,
+			RealtimeInput::AppendContext(_) => Self::AppendContext,
+			RealtimeInput::SetMuted(_) => Self::SetMuted,
+			RealtimeInput::CancelDelegation { .. } => Self::CancelDelegation,
+			RealtimeInput::SettleDelegation(_) => Self::SettleDelegation,
 			RealtimeInput::Commit => Self::Commit,
 			RealtimeInput::CancelResponse => Self::CancelResponse,
 			RealtimeInput::Close => Self::Close,
@@ -200,7 +212,7 @@ impl RealtimeSession {
 			.recv_async()
 			.await
 			.map_err(|_| RealtimeSessionError::InboundClosed)?;
-		if matches!(&event, Ok(RealtimeEvent::Closed) | Err(_)) {
+		if matches!(&event, Ok(RealtimeEvent::CloseReceipt(_) | RealtimeEvent::Closed) | Err(_)) {
 			self.closed.store(true, Ordering::Release);
 		}
 		Ok(event)
@@ -225,7 +237,8 @@ impl RealtimeProviderEndpoint {
 		if self.terminal_sent {
 			return Err(RealtimeSessionError::AlreadyClosed);
 		}
-		let terminal = matches!(&event, Ok(RealtimeEvent::Closed) | Err(_));
+		let terminal =
+			matches!(&event, Ok(RealtimeEvent::CloseReceipt(_) | RealtimeEvent::Closed) | Err(_));
 		if self.closed.load(Ordering::Acquire) && !terminal {
 			return Err(RealtimeSessionError::AlreadyClosed);
 		}
@@ -249,7 +262,8 @@ impl RealtimeProviderEndpoint {
 		if self.terminal_sent {
 			return Err(RealtimeSessionError::AlreadyClosed);
 		}
-		let terminal = matches!(&event, Ok(RealtimeEvent::Closed) | Err(_));
+		let terminal =
+			matches!(&event, Ok(RealtimeEvent::CloseReceipt(_) | RealtimeEvent::Closed) | Err(_));
 		if self.closed.load(Ordering::Acquire) && !terminal {
 			return Err(RealtimeSessionError::AlreadyClosed);
 		}
@@ -394,6 +408,7 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::answer::{RealtimeCloseOrigin, RealtimeCloseReason, RealtimeCloseReceipt};
 
 	#[test]
 	fn bounded_queue_reports_backpressure_and_close_receipt() {
@@ -428,6 +443,27 @@ mod tests {
 		assert!(matches!(event, RealtimeEvent::Closed));
 		assert_eq!(
 			provider.try_send(Ok(RealtimeEvent::Closed)),
+			Err(RealtimeSessionError::AlreadyClosed)
+		);
+	}
+	#[test]
+	fn provider_close_receipt_is_terminal_and_exactly_once() {
+		let (session, mut provider) = RealtimeSession::bounded(1).unwrap();
+		let receipt = RealtimeCloseReceipt {
+			origin:    RealtimeCloseOrigin::Provider,
+			reason:    RealtimeCloseReason::Completed,
+			closed_at: SystemTime::now(),
+		};
+		provider
+			.try_send(Ok(RealtimeEvent::CloseReceipt(receipt)))
+			.unwrap();
+		assert!(session.is_closed());
+		assert!(matches!(
+			session.inbound.try_recv().unwrap().unwrap(),
+			RealtimeEvent::CloseReceipt(received) if received == receipt
+		));
+		assert_eq!(
+			provider.try_send(Ok(RealtimeEvent::CloseReceipt(receipt))),
 			Err(RealtimeSessionError::AlreadyClosed)
 		);
 	}

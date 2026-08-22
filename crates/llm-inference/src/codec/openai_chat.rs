@@ -382,12 +382,17 @@ impl OpenAiChatCodec {
 			return Err(capability_error());
 		}
 		if !self.profile.sampling
-			&& (sampling.temperature.is_some() || sampling.top_p.is_some() || sampling.top_k.is_some())
+			&& (sampling.temperature.is_some()
+				|| sampling.top_p.is_some()
+				|| sampling.top_k.is_some()
+				|| sampling.min_p.is_some())
 		{
 			return Err(capability_error());
 		}
 		if !self.profile.penalties
-			&& (sampling.presence_penalty.is_some() || sampling.frequency_penalty.is_some())
+			&& (sampling.presence_penalty.is_some()
+				|| sampling.frequency_penalty.is_some()
+				|| sampling.repetition_penalty.is_some())
 		{
 			return Err(capability_error());
 		}
@@ -427,6 +432,7 @@ impl OpenAiChatCodec {
 				.flatten(),
 			top_p: self.profile.sampling.then_some(sampling.top_p).flatten(),
 			top_k: self.profile.sampling.then_some(sampling.top_k).flatten(),
+			min_p: self.profile.sampling.then_some(sampling.min_p).flatten(),
 			presence_penalty: self
 				.profile
 				.penalties
@@ -436,6 +442,11 @@ impl OpenAiChatCodec {
 				.profile
 				.penalties
 				.then_some(sampling.frequency_penalty)
+				.flatten(),
+			repetition_penalty: self
+				.profile
+				.penalties
+				.then_some(sampling.repetition_penalty)
 				.flatten(),
 			stop: (!sampling.stop.is_empty()).then(|| sampling.stop.to_vec()),
 			seed: sampling.seed,
@@ -563,9 +574,13 @@ struct WireRequest {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	top_k:                 Option<u32>,
 	#[serde(skip_serializing_if = "Option::is_none")]
+	min_p:                 Option<f32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	presence_penalty:      Option<f32>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	frequency_penalty:     Option<f32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	repetition_penalty:    Option<f32>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	stop:                  Option<Vec<Str>>,
 	#[serde(skip_serializing_if = "Option::is_none")]

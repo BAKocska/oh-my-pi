@@ -166,6 +166,8 @@ pub struct ProductionDependencies {
 	auth_application:     AuthApplicationConfig,
 	credential_shapers:   Arc<CredentialShaperRegistry>,
 	usage_manager:        Option<crate::operation::usage::ConsoleUsageManager>,
+	settings:             crate::settings::InferenceSettings,
+	provider_admission:   Arc<BTreeMap<crate::ProviderId, AdmissionController>>,
 	local_routes:         Arc<BTreeMap<crate::catalog::RouteId, LocalRouteBackend>>,
 	discovery_projectors: Arc<BTreeMap<crate::catalog::RouteId, Arc<dyn DiscoveryProjector>>>,
 	local_unavailable:    Arc<BTreeMap<crate::catalog::RouteId, ReasonId>>,
@@ -200,6 +202,8 @@ impl ProductionDependencies {
 			transport_timeout,
 			credential_shapers,
 			usage_manager: None,
+			settings: crate::settings::InferenceSettings::default(),
+			provider_admission: Arc::new(BTreeMap::new()),
 			discovery_projectors,
 			local_routes: Arc::new(BTreeMap::new()),
 			local_unavailable: Arc::new(BTreeMap::new()),
@@ -221,6 +225,28 @@ impl ProductionDependencies {
 		manager: crate::operation::usage::ConsoleUsageManager,
 	) -> Self {
 		self.usage_manager = Some(manager);
+		self
+	}
+
+	/// Installs the immutable runtime settings projection used by every route
+	/// stack.
+	#[must_use]
+	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
+		self.provider_admission = Arc::new(
+			settings
+				.providers
+				.max_in_flight
+				.iter()
+				.filter(|(_, limit)| **limit > 0)
+				.map(|(provider, limit)| {
+					(
+						crate::ProviderId::from(provider.clone()),
+						AdmissionController::new(*limit, settings.providers.max_queued),
+					)
+				})
+				.collect(),
+		);
+		self.settings = settings;
 		self
 	}
 
@@ -296,12 +322,20 @@ impl RouteComposer for ProductionRouteComposer {
 				)
 			},
 			TransportKind::Http | TransportKind::AwsEventStream | TransportKind::Connect => (
-				codec_binding(route, &self.dependencies.google_cca)?,
+				codec_binding(
+					route,
+					&self.dependencies.google_cca,
+					self.dependencies.settings.retry.server_side_fallback,
+				)?,
 				WireService::new(self.dependencies.http.clone()),
 				self.dependencies.transport_timeout,
 			),
 			TransportKind::Websocket => (
-				codec_binding(route, &self.dependencies.google_cca)?,
+				codec_binding(
+					route,
+					&self.dependencies.google_cca,
+					self.dependencies.settings.retry.server_side_fallback,
+				)?,
 				WireService::new(self.dependencies.websocket.clone()),
 				self.dependencies.transport_timeout,
 			),
@@ -403,18 +437,31 @@ impl RouteComposer for ProductionRouteComposer {
 				})
 				.unwrap_or_default(),
 			codec,
-			transport_timeout: self.dependencies.transport_timeout.min(framework_timeout),
+			transport_timeout: self
+				.dependencies
+				.transport_timeout
+				.min(framework_timeout)
+				.min(Duration::from_secs(self.dependencies.settings.providers.timeout_seconds)),
 		};
+		let admission = self
+			.dependencies
+			.provider_admission
+			.get(&route.provider)
+			.cloned()
+			.unwrap_or_else(|| self.dependencies.admission.clone());
+		let retry = &self.dependencies.settings.retry;
 		let stack = build_route_stack(wire, RouteStackLayers {
 			intent: IntentLayer::new(PlannedIntent { route: route.id.clone() }),
 			session: SessionLayer::new(self.dependencies.sessions.clone()),
 			semantic: SemanticLayer::new(CanonicalSemantic),
-			operation: OperationPolicyLayer::new(operation),
+			operation: OperationPolicyLayer::new(operation)
+				.with_settings(self.dependencies.settings.clone()),
 			recovery,
-			admission: AdmissionLayer::new(self.dependencies.admission.clone()),
+			admission: AdmissionLayer::new(admission),
 			account: AccountPoolLayer::new(account),
 			auth: AuthLeaseLayer::new(leases),
-			retry: TransportRetryLayer::new(u32::MAX),
+			retry: TransportRetryLayer::new(retry.max_attempts().saturating_sub(1))
+				.with_backoff(retry.backoff()),
 			rate: RateLayer::new(PoolRateLimiter { pool: self.dependencies.accounts.clone() }),
 			encode: crate::layer::encode::EncodeLayer::new(encoder, false),
 			credential_apply: CredentialApplyLayer::new(RouteCredentialApplier {
@@ -475,6 +522,7 @@ fn local_codec_binding(
 fn codec_binding(
 	route: &RouteDef,
 	cca: &GoogleCcaConfig,
+	server_side_fallback: bool,
 ) -> Result<CodecBinding, RouteUnavailable> {
 	let (primary, supported, embedding, openai_embedding_override): (
 		Arc<dyn Codec>,
@@ -483,7 +531,9 @@ fn codec_binding(
 		bool,
 	) = match (route.codec.as_str(), route.codec_profile) {
 		("anthropic", CodecProfile::Standard) => (
-			Arc::new(AnthropicCodec::direct()),
+			Arc::new(AnthropicCodec::direct().with_betas(
+				server_side_fallback.then_some(Str::new_static("server-side-fallback-2026-06-01")),
+			)),
 			operation_bits(&[OperationKind::Chat, OperationKind::CountTokens]),
 			None,
 			false,
@@ -801,6 +851,19 @@ fn encode_wire_request(
 	operation: &OperationCall,
 	execution: &ExecutionContext,
 ) -> Result<EncodedRequest, Error> {
+	if let OperationCall::Chat(request) = operation
+		&& let Err(error) = request.validate_named_tool_choice()
+	{
+		return Err(
+			Error::new(
+				ErrorKind::InvalidRequest,
+				ErrorPhase::Encoding,
+				RetryAction::Never,
+				ExecutionReceipt::default(),
+			)
+			.detail(ErrorDetail::NamedToolUnavailable { name: error.name }),
+		);
+	}
 	if operation.kind() == OperationKind::Realtime {
 		codec
 			.encode_realtime_handshake(context, operation)?
@@ -1383,7 +1446,7 @@ mod tests {
 		session::{CredentialGenerationPolicy, PendingServerStateBinding},
 	};
 
-	fn lease(provider: &ProviderId, secret: &str) -> CredentialLease {
+	fn lease(provider: &ProviderId<str>, secret: &str) -> CredentialLease {
 		CredentialLease::bearer(
 			LeaseMeta {
 				account:    AccountId::new("account"),
@@ -1415,7 +1478,7 @@ mod tests {
 			),
 			antigravity_policy:  AntigravityPolicy::default(),
 		};
-		let binding = codec_binding(&route, &cca).expect("route codec binding");
+		let binding = codec_binding(&route, &cca, false).expect("route codec binding");
 		let codec = discovery_codec(catalog, &route, &binding)
 			.expect("discovery codec")
 			.expect("route supports discovery");
@@ -1647,7 +1710,7 @@ mod tests {
 			),
 			antigravity_policy:  AntigravityPolicy::default(),
 		};
-		let binding = codec_binding(&route, &cca).expect("route codec binding");
+		let binding = codec_binding(&route, &cca, false).expect("route codec binding");
 		let codec = RouteCodecSet::for_route(
 			&route,
 			OperationBits::for_kind(OperationKind::Realtime),

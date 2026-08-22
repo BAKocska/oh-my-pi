@@ -5,7 +5,7 @@ use std::{
 	convert::Infallible,
 	future::Future,
 	pin::Pin,
-	sync::Arc,
+	sync::{Arc, LazyLock},
 	task::{Context, Poll},
 	time::Instant,
 };
@@ -24,6 +24,7 @@ use omp_core::Str;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use tower::{Service, ServiceExt as _};
+use url::Url;
 
 use crate::{
 	body::{
@@ -84,6 +85,35 @@ type Connector = HttpsConnector<HttpConnector>;
 type RequestBody = UnsyncBoxBody<Bytes, Error>;
 type PooledClient = Client<Connector, RequestBody>;
 
+static POOLED_CLIENT: LazyLock<PooledClient> = LazyLock::new(|| {
+	let _ = rustls::crypto::ring::default_provider().install_default();
+	let connector = HttpsConnectorBuilder::new()
+		.with_webpki_roots()
+		.https_or_http()
+		.enable_http1()
+		.enable_http2()
+		.build();
+	Client::builder(TokioExecutor::new()).build(connector)
+});
+
+/// Outcome of scheduling a credential-free best-effort host preconnect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum PreconnectLaunch {
+	/// A background DNS/TCP/TLS/HTTP handshake was scheduled.
+	Scheduled,
+	/// Construction happened outside a Tokio runtime.
+	NoRuntime,
+	/// The endpoint is not an HTTP(S) URL.
+	UnsupportedEndpoint,
+	/// The endpoint could not be represented as an HTTP URI.
+	InvalidEndpoint,
+}
+
+fn pooled_client() -> PooledClient {
+	POOLED_CLIENT.clone()
+}
+
 /// Sanitized bounded evidence retained from a live HTTP attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpCapture {
@@ -135,19 +165,48 @@ impl HttpTransport {
 	/// Constructs a pooled rustls client supporting HTTP/1.1 and HTTP/2.
 	#[must_use]
 	pub fn new() -> Self {
-		let _ = rustls::crypto::ring::default_provider().install_default();
-		let connector = HttpsConnectorBuilder::new()
-			.with_webpki_roots()
-			.https_or_http()
-			.enable_http1()
-			.enable_http2()
-			.build();
-		let inner = Client::builder(TokioExecutor::new()).build(connector);
 		Self {
-			inner:        Some(inner),
+			inner:        Some(pooled_client()),
 			ready_permit: false,
 			captures:     Arc::new(Mutex::new(Vec::new())),
 		}
+	}
+
+	/// Starts a best-effort credential-free preconnect on the same process-wide
+	/// pool used by production provider requests.
+	///
+	/// The HEAD exchange carries no request headers or body and is detached from
+	/// session construction. Failure is intentionally unobservable beyond the
+	/// typed scheduling result because preconnect is only a latency
+	/// optimization.
+	#[must_use]
+	pub fn preconnect_host(base_url: &Url) -> PreconnectLaunch {
+		if !matches!(base_url.scheme(), "http" | "https") {
+			return PreconnectLaunch::UnsupportedEndpoint;
+		}
+		if !base_url.username().is_empty() || base_url.password().is_some() {
+			return PreconnectLaunch::InvalidEndpoint;
+		}
+		let mut target = base_url.clone();
+		target.set_query(None);
+		target.set_fragment(None);
+		let Ok(uri) = target.as_str().parse::<Uri>() else {
+			return PreconnectLaunch::InvalidEndpoint;
+		};
+		let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+			return PreconnectLaunch::NoRuntime;
+		};
+		let body = Full::new(Bytes::new())
+			.map_err(|never: Infallible| match never {})
+			.boxed_unsync();
+		let Ok(request) = Request::builder().method(Method::HEAD).uri(uri).body(body) else {
+			return PreconnectLaunch::InvalidEndpoint;
+		};
+		let client = pooled_client();
+		runtime.spawn(async move {
+			let _ = client.request(request).await;
+		});
+		PreconnectLaunch::Scheduled
 	}
 
 	/// Returns deterministic snapshots of completed and in-flight sanitized

@@ -261,6 +261,7 @@ impl Decoder for TavilySearchDecoder {
 					snippet: Some(result.content),
 					score: Some(result.score),
 					published_at,
+					author: None,
 				})
 			})
 			.collect::<Result<Vec<_>, Error>>()?;
@@ -277,6 +278,7 @@ impl Decoder for TavilySearchDecoder {
 			results,
 			answer: response.answer.0,
 			usage,
+			metadata: Default::default(),
 		})));
 		Ok(())
 	}
@@ -476,6 +478,7 @@ mod tests {
 			max_results: 3,
 			synthesize_answer,
 			negotiation: NegotiationPolicy::default(),
+			..SearchRequest::new(sf!("latest Rust release"), 3)
 		}
 	}
 

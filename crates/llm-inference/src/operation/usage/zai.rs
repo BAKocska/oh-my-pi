@@ -55,7 +55,7 @@ impl ZaiUsageFetcher {
 }
 
 impl ConsoleUsageFetcher for ZaiUsageFetcher {
-	fn provider(&self) -> &ProviderId {
+	fn provider(&self) -> &ProviderId<str> {
 		&self.provider
 	}
 
