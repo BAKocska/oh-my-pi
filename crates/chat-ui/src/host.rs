@@ -1,10 +1,16 @@
 //! Interactive chat state and its terminal host for the host-agnostic
 //! immediate-mode chat scene.
 
-use std::{collections::VecDeque, io, io::Write, time::Duration};
+use std::{
+	collections::VecDeque,
+	io,
+	io::Write,
+	time::{Duration, Instant},
+};
 
 use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
+use omp_executor::Executor;
 use omp_tui::{
 	AltScreenUse, CursorStyle, DebugOp, DebugQuery, Frame, Icon, InputEvent, Key, Layer, Mouse,
 	MouseReport, Notification, PaintStats, Pasted, Renderer, ResizeScrollbackMode, Size, Terminal,
@@ -12,7 +18,7 @@ use omp_tui::{
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
-use tokio::{sync::oneshot, time::Instant};
+use tokio::sync::oneshot;
 
 use crate::{
 	AgentHub, AgentHubEvent, ApprovalAction, BackendEvent, Chat, ChatKey, CommandPalette,
@@ -136,12 +142,13 @@ pub struct HostOutcome {
 	reason = "chat components remain confined to their terminal event-loop thread"
 )]
 pub async fn run(
+	executor: Executor,
 	chat: Chat,
 	ctx: UiContext,
 	events: Receiver<BackendEvent>,
 	intents: Sender<Intent>,
 ) -> io::Result<()> {
-	run_with_options(chat, ctx, events, intents, HostOptions {
+	run_with_options(executor, chat, ctx, events, intents, HostOptions {
 		welcome:                true,
 		exit_on_session_change: false,
 		completion_notify:      true,
@@ -159,13 +166,14 @@ pub async fn run(
 	reason = "chat components remain confined to their terminal event-loop thread"
 )]
 pub async fn run_with_options(
+	executor: Executor,
 	chat: Chat,
 	ctx: UiContext,
 	events: Receiver<BackendEvent>,
 	intents: Sender<Intent>,
 	options: HostOptions,
 ) -> io::Result<HostExit> {
-	run_with_draft(chat, ctx, events, intents, options, Str::default())
+	run_with_draft(executor, chat, ctx, events, intents, options, Str::default())
 		.await
 		.map(|outcome| outcome.exit)
 }
@@ -177,6 +185,7 @@ pub async fn run_with_options(
 	reason = "chat components remain confined to their terminal event-loop thread"
 )]
 pub async fn run_with_draft(
+	executor: Executor,
 	mut chat: Chat,
 	ctx: UiContext,
 	events: Receiver<BackendEvent>,
@@ -186,13 +195,24 @@ pub async fn run_with_draft(
 ) -> io::Result<HostOutcome> {
 	chat.set_composer_text(initial_draft.as_str());
 	let caps = detect();
-	let mut terminal =
-		Terminal::enter(TerminalOptions::new(caps).cursor_style(CursorStyle::BlinkingBar))?;
+	let mut terminal = Terminal::enter(
+		executor.clone(),
+		TerminalOptions::new(caps).cursor_style(CursorStyle::BlinkingBar),
+	)?;
 	let mut renderer = Renderer::new(TtyOut::new()?);
 	renderer.apply_caps(&caps)?;
 	renderer.set_resize_scrollback(options.resize_scrollback);
-	let result =
-		run_with_terminal(&mut terminal, &mut renderer, chat, &ctx, &events, &intents, options).await;
+	let result = run_with_terminal(
+		&executor,
+		&mut terminal,
+		&mut renderer,
+		chat,
+		&ctx,
+		&events,
+		&intents,
+		options,
+	)
+	.await;
 	let scrub = terminal.leave_alt().and_then(|()| renderer.clear_layers());
 	match (result, scrub) {
 		(Err(error), _) | (Ok(_), Err(error)) => Err(error),
@@ -205,6 +225,7 @@ pub async fn run_with_draft(
 	reason = "chat components remain confined to their terminal event-loop thread"
 )]
 async fn run_with_terminal(
+	executor: &Executor,
 	terminal: &mut Terminal,
 	renderer: &mut Renderer<TtyOut>,
 	mut chat: Chat,
@@ -238,6 +259,7 @@ async fn run_with_terminal(
 		}
 	}
 	run_chat(
+		executor,
 		terminal,
 		renderer,
 		ctx,
@@ -1127,6 +1149,7 @@ impl ResizeState {
 	reason = "chat components remain confined to their terminal event-loop thread"
 )]
 async fn run_chat(
+	executor: &Executor,
 	terminal: &mut Terminal,
 	renderer: &mut Renderer<TtyOut>,
 	ctx: &UiContext,
@@ -1456,8 +1479,8 @@ async fn run_chat(
 									next_frame = Some(Instant::now());
 								}
 							},
-							() = deadline(paste_deadline) => paste_read = None,
-							() = deadline(next_frame) => {
+							() = deadline(executor, paste_deadline) => paste_read = None,
+							() = deadline(executor, next_frame) => {
 								let now = Instant::now();
 								let resized = observe_resize(terminal, &mut viewport, &mut resize, now)?;
 								host.chat.set_right_inset(host.sidebar.reserved(viewport));
@@ -1489,7 +1512,7 @@ async fn run_chat(
 								}
 								next_frame = chat_deadline(&host.chat);
 							},
-							() = deadline(resize.map(ResizeState::deadline)) => {
+							() = deadline(executor, resize.map(ResizeState::deadline)) => {
 								let now = Instant::now();
 								if !resize.is_some_and(|state| state.settled(now)) { continue; }
 								if host.overlay.is_some() {
@@ -2125,9 +2148,9 @@ fn chat_deadline(chat: &Chat) -> Option<Instant> {
 	chat.next_wake().map(|delay| Instant::now() + delay)
 }
 
-async fn deadline(at: Option<Instant>) {
+async fn deadline(executor: &Executor, at: Option<Instant>) {
 	match at {
-		Some(at) => tokio::time::sleep_until(at).await,
+		Some(at) => executor.timer(at.saturating_duration_since(Instant::now())).await,
 		None => std::future::pending().await,
 	}
 }

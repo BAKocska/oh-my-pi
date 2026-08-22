@@ -23,9 +23,7 @@ use {
 	tokio::{
 		io::{AsyncRead, AsyncWrite, ReadBuf},
 		net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions},
-		sync::mpsc,
 	},
-	tokio_stream::wrappers::ReceiverStream,
 	tonic::transport::server::Connected,
 	tower::service_fn,
 };
@@ -38,7 +36,8 @@ pub type Incoming = UnixListenerStream;
 
 /// A stream of accepted owner-local Windows named-pipe connections.
 #[cfg(windows)]
-pub type Incoming = ReceiverStream<Result<NamedPipeConnection, std::io::Error>>;
+pub type Incoming =
+	flume::r#async::RecvStream<'static, Result<NamedPipeConnection, std::io::Error>>;
 
 /// Bind an owner-only Unix-domain socket and return its incoming connection
 /// stream.
@@ -99,28 +98,32 @@ pub async fn listen(path: &Path) -> Result<Incoming, Error> {
 	let first = ServerOptions::new()
 		.first_pipe_instance(true)
 		.create(&name)?;
-	let (sender, receiver) = mpsc::channel(16);
+	let (sender, receiver) = flume::bounded(16);
 	tokio::spawn(async move {
 		let mut pending = first;
 		loop {
 			if let Err(error) = pending.connect().await {
-				let _ = sender.send(Err(error)).await;
+				let _ = sender.send_async(Err(error)).await;
 				break;
 			}
 			let next = match ServerOptions::new().create(&name) {
 				Ok(next) => next,
 				Err(error) => {
-					let _ = sender.send(Err(error)).await;
+					let _ = sender.send_async(Err(error)).await;
 					break;
 				},
 			};
-			if sender.send(Ok(NamedPipeConnection(pending))).await.is_err() {
+			if sender
+				.send_async(Ok(NamedPipeConnection(pending)))
+				.await
+				.is_err()
+			{
 				break;
 			}
 			pending = next;
 		}
 	});
-	Ok(ReceiverStream::new(receiver))
+	Ok(receiver.into_stream())
 }
 
 /// Connects a tonic channel to an owner-local Windows named pipe.

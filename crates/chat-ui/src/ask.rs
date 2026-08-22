@@ -1,8 +1,12 @@
 //! Interactive `ask@1` presentation over the core `UiRequest` dialog path.
 
-use std::sync::{
-	Arc, LazyLock,
-	atomic::{AtomicU64, Ordering},
+use std::{
+	future::Future,
+	pin::Pin,
+	sync::{
+		Arc, LazyLock,
+		atomic::{AtomicU64, Ordering},
+	},
 };
 
 use omp_core::{IntoStr, Str, sf};
@@ -100,25 +104,34 @@ pub fn presenter() -> Arc<dyn AskPresenter> {
 }
 
 impl AskPresenter for UiRequestPresenter {
-	fn present(&self, questions: &[Question]) -> Result<Presentation, Fault> {
+	fn present<'p>(
+		&'p self,
+		questions: &'p [Question],
+	) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
 		let Some(sender) = ACTIVE.lock().as_ref().map(|binding| binding.sender.clone()) else {
 			return HeadlessPresenter.present(questions);
 		};
-		let mut answers = Vec::with_capacity(questions.len());
-		for question in questions {
-			let (reply, result) = flume::bounded(1);
-			let request =
-				AskRequest { request: dialog_request(question), question: question.clone(), reply };
-			sender
-				.send(request)
-				.map_err(|_| presenter_fault("interactive UI disconnected"))?;
-			answers.push(
-				result
-					.recv()
-					.map_err(|_| presenter_fault("Ask dialog was dismissed"))??,
-			);
-		}
-		Ok(Presentation { answers, headless: false })
+		Box::pin(async move {
+			let mut answers = Vec::with_capacity(questions.len());
+			for question in questions {
+				let (reply, result) = flume::bounded(1);
+				let request = AskRequest {
+					request: dialog_request(question),
+					question: question.clone(),
+					reply,
+				};
+				sender
+					.send(request)
+					.map_err(|_| presenter_fault("interactive UI disconnected"))?;
+				answers.push(
+					result
+						.recv_async()
+						.await
+						.map_err(|_| presenter_fault("Ask dialog was dismissed"))??,
+				);
+			}
+			Ok(Presentation { answers, headless: false })
+		})
 	}
 }
 
@@ -291,10 +304,10 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn presenter_uses_headless_policy_without_bound_host() {
+	#[tokio::test(flavor = "current_thread")]
+	async fn presenter_uses_headless_policy_without_bound_host() {
 		*ACTIVE.lock() = None;
-		let result = UiRequestPresenter.present(&[question(false)]).unwrap();
+		let result = UiRequestPresenter.present(&[question(false)]).await.unwrap();
 		assert!(result.headless);
 		assert_eq!(result.answers[0].selected, ["Rust"]);
 	}
