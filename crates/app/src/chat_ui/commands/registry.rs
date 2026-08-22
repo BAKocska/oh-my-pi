@@ -211,6 +211,21 @@ pub struct CommandRoster {
 	commands:  Arc<[CommandDeclaration]>,
 	spellings: Arc<HashMap<Str, usize>>,
 }
+fn completion_icon(declaration: &CommandDeclaration) -> omp_tui::Icon {
+	match declaration.provenance.kind {
+		CommandSourceKind::Skill => omp_tui::Icon::Skill,
+		CommandSourceKind::Extension => omp_tui::Icon::ExtensionCommand,
+		CommandSourceKind::Custom | CommandSourceKind::Markdown => omp_tui::Icon::Prompt,
+		CommandSourceKind::Builtin if declaration.name == "mcp" => omp_tui::Icon::McpExtension,
+		CommandSourceKind::Builtin if declaration.name == "pin" => omp_tui::Icon::Pin,
+		CommandSourceKind::Builtin
+			if matches!(declaration.name.as_str(), "resume" | "new" | "clear") =>
+		{
+			omp_tui::Icon::Session
+		},
+		CommandSourceKind::Builtin => omp_tui::Icon::SlashCommand,
+	}
+}
 
 impl CommandRoster {
 	/// Builds the inventory roster with no dynamic contributions.
@@ -297,6 +312,12 @@ impl CommandRoster {
 	pub fn completions(&self) -> Vec<omp_tui::Command> {
 		self.completions_for(CommandRole::Owner)
 	}
+	/// Resolves submitted slash input to its winning canonical declaration name.
+	pub fn command_usage_name(&self, text: &str) -> Option<Str> {
+		let token = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+		let index = self.spellings.get(token)?;
+		self.commands.get(*index).map(|command| command.name.clone())
+	}
 
 	/// Slash completion entries filtered for the collaboration role.
 	pub fn completions_for(&self, role: CommandRole) -> Vec<omp_tui::Command> {
@@ -311,7 +332,8 @@ impl CommandRoster {
 					declaration.name.as_str(),
 					declaration.description.as_str(),
 					&aliases,
-				);
+				)
+				.with_icon(completion_icon(declaration));
 				if !declaration.hints.is_empty() {
 					let hints: Vec<_> = declaration
 						.hints

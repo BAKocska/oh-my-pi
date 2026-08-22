@@ -1,4 +1,8 @@
-use std::{borrow::Cow, collections::HashSet};
+use std::{
+	borrow::Cow,
+	collections::{BTreeMap, HashSet},
+	sync::Arc,
+};
 
 use omp_agent::Budget;
 use omp_core::{Str, sf};
@@ -6,7 +10,9 @@ use omp_proto::{
 	inference::v1::TaskBudget,
 	thread::v1::{Item, Message, Part, Role, item, part},
 };
-use omp_tui::Command;
+use omp_storage::index::SessionIndex;
+use omp_tui::{Command, Icon};
+use parking_lot::RwLock;
 use smallvec::SmallVec;
 
 use super::now_ms;
@@ -349,6 +355,33 @@ impl From<CommandContribution> for AvailableCommand {
 pub struct CommandRoster {
 	available: Vec<AvailableCommand>,
 }
+/// Process-local slash-command counts backed by the authoritative session index.
+pub struct CommandUsage {
+	index:  Arc<SessionIndex>,
+	counts: RwLock<BTreeMap<Str, u64>>,
+}
+
+impl CommandUsage {
+	/// Loads persisted counts from `index` for synchronous completion ranking.
+	pub fn load(index: Arc<SessionIndex>) -> Result<Self, omp_storage::index::Error> {
+		let counts = index.command_usage()?;
+		Ok(Self { index, counts: RwLock::new(counts) })
+	}
+
+	/// Returns the persisted invocation count for `name`.
+	pub fn count(&self, name: &str) -> u64 {
+		self.counts.read().get(name).copied().unwrap_or_default()
+	}
+
+	/// Persists one invocation and updates the process-local ranking snapshot.
+	pub fn record(&self, name: &str, now_ms: u64) -> Result<(), omp_storage::index::Error> {
+		self.index.record_command_usage(name, now_ms)?;
+		let mut counts = self.counts.write();
+		let count = counts.entry(Str::new(name)).or_default();
+		*count = count.saturating_add(1);
+		Ok(())
+	}
+}
 
 impl CommandRoster {
 	/// Aggregates builtins followed by provider feeds in precedence order.
@@ -372,6 +405,18 @@ impl CommandRoster {
 	/// Parses builtin and provider-contributed slash commands.
 	pub fn parse_input(&self, text: &str) -> Result<ChatCommand, InputError> {
 		parse_input(text, &self.available)
+	}
+	/// Resolves submitted slash input to the canonical name used for frequency ranking.
+	pub fn command_usage_name(&self, text: &str) -> Option<Str> {
+		let parsed = parse_slash(text)?;
+		self
+			.available
+			.iter()
+			.find(|command| {
+				command.name == parsed.name
+					|| command.aliases.iter().any(|alias| alias == parsed.name)
+			})
+			.map(|command| command.name.clone())
 	}
 
 	/// Renders help from the same winning roster used by completion and
@@ -441,7 +486,8 @@ fn reserved_names() -> HashSet<Str> {
 fn to_completion(available: &AvailableCommand) -> Command {
 	let aliases: SmallVec<&str, 2> = available.aliases.iter().map(Str::as_str).collect();
 	let mut command =
-		Command::new(available.name.as_str(), available.description.as_str(), &aliases);
+		Command::new(available.name.as_str(), available.description.as_str(), &aliases)
+			.with_icon(command_icon(available));
 	if let Some(spec) = COMMANDS
 		.iter()
 		.find(|spec| spec.name == available.name.as_str())
@@ -458,6 +504,23 @@ fn to_completion(available: &AvailableCommand) -> Command {
 		command = command.with_hint(hint);
 	}
 	command
+}
+
+fn command_icon(command: &AvailableCommand) -> Icon {
+	let origin = command.origin.to_ascii_lowercase();
+	if command.name == "mcp" || origin.contains("mcp") {
+		Icon::McpExtension
+	} else if command.name.starts_with("skill:") {
+		Icon::Skill
+	} else if command.builtin && matches!(command.name.as_str(), "resume" | "new" | "clear") {
+		Icon::Session
+	} else if command.builtin {
+		Icon::SlashCommand
+	} else if origin.contains("extension") {
+		Icon::ExtensionCommand
+	} else {
+		Icon::Prompt
+	}
 }
 
 fn render_help(available: &[AvailableCommand]) -> String {
@@ -1029,6 +1092,66 @@ mod tests {
 		);
 		assert_eq!(commands.parse_input("/vibe on"), Ok(ChatCommand::Vibe(sf!("on"))));
 		assert_eq!(commands.parse_input("/prewalk status"), Ok(ChatCommand::Prewalk(sf!("status"))));
+	}
+	#[test]
+	fn usage_names_canonicalize_aliases_and_reject_unknown_commands() {
+		let commands = CommandRoster::new(vec![vec![contribution(
+			"review",
+			"Review changes",
+			"extension",
+			"Review $ARGUMENTS",
+		)]]);
+		assert_eq!(commands.command_usage_name("/q"), Some(sf!("quit")));
+		assert_eq!(commands.command_usage_name("/review focused"), Some(sf!("review")));
+		assert_eq!(commands.command_usage_name("/unknown"), None);
+	}
+	#[test]
+	fn command_usage_ranking_state_survives_restart() {
+		let directory = tempfile::tempdir().expect("temporary directory");
+		let path = directory.path().join("sessions.sqlite3");
+		{
+			let index = Arc::new(SessionIndex::open(&path).expect("open session index"));
+			let usage = CommandUsage::load(index).expect("load command usage");
+			usage.record("model", 1_000).expect("record model");
+			usage.record("model", 2_000).expect("record model again");
+			usage.record("skill:rust", 3_000).expect("record skill");
+			assert_eq!(usage.count("model"), 2);
+		}
+
+		let index = Arc::new(SessionIndex::open(&path).expect("reopen session index"));
+		let restarted = CommandUsage::load(index).expect("reload command usage");
+		assert_eq!(restarted.count("model"), 2);
+		assert_eq!(restarted.count("skill:rust"), 1);
+	}
+
+	#[test]
+	fn completion_types_use_semantic_catalog_icons() {
+		let builtin = AvailableCommand {
+			name:        sf!("help"),
+			aliases:     SmallVec::new(),
+			description: sf!("help"),
+			hint:        None,
+			origin:      sf!("builtin"),
+			template:    None,
+			builtin:     true,
+		};
+		let session = AvailableCommand { name: sf!("resume"), ..builtin.clone() };
+		let mcp = AvailableCommand { name: sf!("mcp"), ..builtin.clone() };
+		let prompt = AvailableCommand {
+			name: sf!("prompt"), origin: sf!("project"), builtin: false, ..builtin.clone()
+		};
+		let extension = AvailableCommand {
+			name: sf!("extension"), origin: sf!("extension"), builtin: false, ..builtin.clone()
+		};
+		let skill = AvailableCommand {
+			name: sf!("skill:rust"), origin: sf!("skill"), builtin: false, ..builtin.clone()
+		};
+		assert_eq!(command_icon(&builtin), Icon::SlashCommand);
+		assert_eq!(command_icon(&session), Icon::Session);
+		assert_eq!(command_icon(&mcp), Icon::McpExtension);
+		assert_eq!(command_icon(&prompt), Icon::Prompt);
+		assert_eq!(command_icon(&extension), Icon::ExtensionCommand);
+		assert_eq!(command_icon(&skill), Icon::Skill);
 	}
 
 	#[test]

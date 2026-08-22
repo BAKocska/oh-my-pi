@@ -46,8 +46,8 @@ pub enum SessionRequest {
 	Info,
 	/// Delete through the guarded session authority.
 	Delete,
-	/// Pin opaque provider account affinity.
-	Pin(Str),
+	/// Toggle one durable session's resume-list pin.
+	Pin(Option<Str>),
 }
 
 /// Parsed workspace-root operation.
@@ -207,7 +207,7 @@ pub trait SessionCommandHost {
 	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_>;
 	/// Execute a structured workspace operation.
 	fn workspace(&mut self, request: WorkspaceRequest) -> CommandFuture<'_>;
-	/// Summarize the live conversation into a new independent session.
+	/// Summarize the session into a handoff document and compact it in place.
 	fn handoff(&mut self, instructions: Option<Str>) -> CommandFuture<'_> {
 		let _ = instructions;
 		Box::pin(async { Err(miette::miette!("session handoff is unavailable")) })

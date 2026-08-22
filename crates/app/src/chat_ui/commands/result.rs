@@ -18,17 +18,23 @@ pub struct PromptResult {
 pub struct ConsumedResult {
 	/// Optional user-visible status. `None` is a deliberately silent success.
 	pub status: Option<Str>,
+	/// Whether the command scheduled a real agent turn after returning.
+	pub agent_invoked: bool,
 }
 
 impl ConsumedResult {
 	/// Creates a silent consumed result.
 	pub const fn silent() -> Self {
-		Self { status: None }
+		Self { status: None, agent_invoked: false }
 	}
 
 	/// Creates a consumed result with one status message.
 	pub fn status(status: impl Into<Str>) -> Self {
-		Self { status: Some(status.into()) }
+		Self { status: Some(status.into()), agent_invoked: false }
+	}
+	/// Creates a consumed result for scheduled agent work.
+	pub fn agent(status: impl Into<Str>) -> Self {
+		Self { status: Some(status.into()), agent_invoked: true }
 	}
 }
 

@@ -147,6 +147,39 @@ fn append_projection(
 }
 
 #[test]
+fn command_usage_accumulates_and_survives_reopen() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("sessions.sqlite3");
+	let expected = std::collections::BTreeMap::from([
+		(Str::new_static("model"), 2_u64),
+		(Str::new_static("skill:review"), 1_u64),
+	]);
+	{
+		let index = SessionIndex::open(&path).expect("open index");
+		index
+			.record_command_usage("model", 1_000)
+			.expect("record model use");
+		index
+			.record_command_usage("model", 2_000)
+			.expect("record second model use");
+		index
+			.record_command_usage("skill:review", 3_000)
+			.expect("record skill use");
+		assert_eq!(index.command_usage().expect("list command use"), expected);
+	}
+
+	let reopened = SessionIndex::open(&path).expect("reopen index");
+	assert_eq!(
+		reopened.command_usage().expect("list command use after restart"),
+		expected
+	);
+	reopened
+		.record_command_usage("model", 4_000)
+		.expect("record after restart");
+	assert_eq!(reopened.command_usage().expect("list updated command use")["model"], 3);
+}
+
+#[test]
 fn failed_journal_header_does_not_publish_a_session_row() {
 	let directory = tempdir().expect("temporary directory");
 	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");

@@ -11,7 +11,7 @@ use omp_llm_catalog::{DiscoveredModel, ModelSpec, OperationBits, ProviderId, sna
 use omp_llm_inference::{
 	Client,
 	call::{CallMeta, DiscoveryRequest, Target},
-	discovery::DiscoveryStore,
+	discovery::{DiscoveryCacheKey, DiscoveryStore},
 	id::RequestId,
 	receipt::ExecutionBudget,
 };
@@ -106,7 +106,12 @@ async fn refresh() -> miette::Result<()> {
 		}
 		if !rows.is_empty() {
 			store
-				.publish(&provider, &rows, now_ms, Duration::from_secs(24 * 60 * 60))
+				.publish(
+					&DiscoveryCacheKey::provider(provider.clone()),
+					&rows,
+					now_ms,
+					Duration::from_secs(24 * 60 * 60),
+				)
 				.into_diagnostic()?;
 			refreshed = refreshed.saturating_add(rows.len());
 		}

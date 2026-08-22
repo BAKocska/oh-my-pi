@@ -247,6 +247,24 @@ impl Default for TaskSettings {
 	}
 }
 
+/// Normalizes legacy boolean per-agent role overrides within one settings
+/// layer before that layer participates in precedence merging.
+pub(crate) fn normalize_persisted_agent_overrides(document: &mut toml::Table) {
+	let Some(task) = document.get_mut("task").and_then(toml::Value::as_table_mut) else {
+		return;
+	};
+	for key in ["agentPrewalk", "agentAdvisor"] {
+		let Some(overrides) = task.get_mut(key).and_then(toml::Value::as_table_mut) else {
+			continue;
+		};
+		for value in overrides.values_mut() {
+			if let toml::Value::Boolean(enabled) = value {
+				*value = toml::Value::String(if *enabled { "on" } else { "off" }.to_owned());
+			}
+		}
+	}
+}
+
 impl SettingsDomain for TaskSettings {
 	const DOMAIN: &'static str = "task";
 	const FIELDS: &'static [FieldDescriptor] = &[

@@ -3,7 +3,7 @@
 use super::command;
 
 command!(compact, 410, "compact", [], "Compact conversation context", [Context, Execution], false, typed("[soft|remote|snapcompact] [focus]", ["soft", "remote", "snapcompact"], parse_compact) => |host, request| host.compact(request));
-command!(shake, 420, "shake", [], "Reclaim replaceable context", [Context, Execution], false, raw("[elide|drop-media]", ["elide", "drop-media"]) => |host, args| host.shake(args));
+command!(shake, 420, "shake", [], "Reclaim replaceable context", [Context, Execution], false, raw("[elide|drop-media|thinking]", ["elide", "drop-media", "thinking"]) => |host, args| host.shake(args));
 command!(usage, 430, "usage", [], "Show or reset durable usage", [Context], false, raw("[show|reset]", ["show", "reset"]) => |host, args| host.usage(args));
 command!(stats, 440, "stats", [], "Open the local usage dashboard", [Context], false, flags("[--host HOST] [--port PORT]", ["--host", "--port"]) => |host, flags| host.stats(flags));
 command!(plan, 450, "plan", [], "Control planning mode", [Execution], false, raw("[args]", []) => |host, args| host.plan(args));

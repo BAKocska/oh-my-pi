@@ -5,7 +5,7 @@
 //! through SQLite's transaction-serialized WAL writer path. Foreign and legacy
 //! journals enter through the explicitly named [`SessionIndex::repair`] API.
 
-use std::{fmt, path::Path, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, fmt, path::Path, str::FromStr, time::Duration};
 
 use omp_core::Str;
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
@@ -131,6 +131,12 @@ CREATE TABLE IF NOT EXISTS model_performance (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS model_performance_model
     ON model_performance(provider, model, ts_ms);
+
+CREATE TABLE IF NOT EXISTS command_usage (
+    name TEXT PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0,
+    last_used_at INTEGER NOT NULL
+) WITHOUT ROWID;
 ";
 
 /// Whether an index is writable authority or a stale offline projection.
@@ -1123,6 +1129,35 @@ impl SessionIndex {
 			output_tokens: weighted(output, total_weight).unwrap_or_default(),
 			samples:       u32::try_from(samples.len()).expect("query limit fits u32"),
 		}))
+	}
+
+	/// Records one invocation of a canonical slash-command name.
+	pub fn record_command_usage(&self, name: &str, now_ms: u64) -> Result<(), Error> {
+		self.require_writer()?;
+		let connection = self.connection.lock();
+		connection.execute(
+			"INSERT INTO command_usage(name, count, last_used_at) VALUES (?1, 1, ?2)
+			 ON CONFLICT(name) DO UPDATE SET
+			     count = command_usage.count + 1,
+			     last_used_at = excluded.last_used_at",
+			params![name, sql_u64(now_ms, "command_usage.last_used_at")?],
+		)?;
+		Ok(())
+	}
+
+	/// Returns persisted slash-command invocation counts keyed by canonical name.
+	pub fn command_usage(&self) -> Result<BTreeMap<Str, u64>, Error> {
+		let connection = self.connection.lock();
+		let mut statement = connection.prepare("SELECT name, count FROM command_usage")?;
+		let rows = statement.query_map([], |row| {
+			Ok((Str::new(row.get::<_, String>(0)?), row.get::<_, u64>(1)?))
+		})?;
+		let mut counts = BTreeMap::new();
+		for row in rows {
+			let (name, count) = row?;
+			counts.insert(name, count);
+		}
+		Ok(counts)
 	}
 
 	/// Backfills at most `limit` legacy receipt samples from the bounded

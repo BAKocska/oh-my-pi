@@ -581,6 +581,8 @@ async fn supervised_submit<C: TurnClient + Send + 'static>(
 	tokio::pin!(submission);
 	let deadline =
 		tokio::time::Instant::now() + Duration::from_millis(settings.max_runtime_ms.max(1));
+	let mut runtime_limit_active = settings.max_runtime_ms != 0;
+	let mut pending_terminal_yield = None;
 	loop {
 		tokio::select! {
 			biased;
@@ -589,14 +591,28 @@ async fn supervised_submit<C: TurnClient + Send + 'static>(
 				let Ok(event) = event else {
 					continue;
 				};
-				if handle_event(state, event.as_ref(), &mailbox, settings, abort)? {
+				if handle_event(
+					state,
+					event.as_ref(),
+					&mailbox,
+					settings,
+					abort,
+					&mut pending_terminal_yield,
+				)? {
 					return Err(SupervisorError::RequestBudget {
 						requests: state.progress().requests,
 						budget: settings.soft_request_budget,
 					});
 				}
+				if state.yield_committed() {
+					runtime_limit_active = false;
+				}
 			},
-			() = tokio::time::sleep_until(deadline), if settings.max_runtime_ms != 0 => {
+			() = tokio::time::sleep_until(deadline), if runtime_limit_active => {
+				if !runtime_limit_should_abort(state) {
+					runtime_limit_active = false;
+					continue;
+				}
 				if let Some(abort) = abort.read().as_ref() {
 					abort.abort();
 				}
@@ -615,6 +631,7 @@ fn handle_event(
 	mailbox: &omp_agent::MailboxSender,
 	settings: &TaskSettings,
 	abort: &RwLock<Option<AbortHandle>>,
+	pending_terminal_yield: &mut Option<Str>,
 ) -> Result<bool, SupervisorError> {
 	match event {
 		AgentEvent::Turn { event, .. } => match event.event.as_ref() {
@@ -658,6 +675,9 @@ fn handle_event(
 				}
 			},
 			Some(turn_event::Event::Outcome(outcome)) => {
+				if let Some(call_id) = outcome.output.iter().find_map(terminal_yield_call) {
+					*pending_terminal_yield = Some(call_id);
+				}
 				let usage = outcome.usage.as_ref();
 				state.record_activity(SubagentActivity {
 					kind:           Some(SubagentActivityKind::Usage),
@@ -683,6 +703,19 @@ fn handle_event(
 			},
 			_ => {},
 		},
+		AgentEvent::ToolFinished { call_id, item, .. } => {
+			if pending_terminal_yield.as_deref() == Some(call_id.as_str()) {
+				let succeeded = matches!(
+					item.kind.as_ref(),
+					Some(thread::item::Kind::ToolResult(result))
+						if result.name == "yield" && !result.is_error
+				);
+				*pending_terminal_yield = None;
+				if succeeded {
+					state.commit_yield();
+				}
+			}
+		},
 		AgentEvent::ToolOpened { name, .. } => {
 			state.record_activity(SubagentActivity {
 				kind: Some(SubagentActivityKind::Tool),
@@ -700,6 +733,22 @@ fn handle_event(
 		_ => {},
 	}
 	Ok(false)
+}
+
+fn terminal_yield_call(item: &Item) -> Option<Str> {
+	let Some(thread::item::Kind::ToolCall(call)) = item.kind.as_ref() else {
+		return None;
+	};
+	if call.name != "yield" {
+		return None;
+	}
+	let params = serde_json::from_slice::<omp_tools::yield_tool::Params>(&call.args_json).ok()?;
+	let terminal = match params.kind {
+		Some(omp_tools::yield_tool::YieldType::Terminal(_)) => true,
+		Some(omp_tools::yield_tool::YieldType::Sections(_)) => false,
+		None => params.result.is_some(),
+	};
+	terminal.then(|| Str::new(&call.id))
 }
 
 fn steer(mailbox: &omp_agent::MailboxSender, text: Str) {
@@ -730,6 +779,13 @@ fn now_ms() -> u64 {
 		.as_millis()
 		.try_into()
 		.unwrap_or(u64::MAX)
+}
+
+fn runtime_limit_should_abort(state: &SubagentRunState) -> bool {
+	matches!(
+		state.lifecycle(),
+		SubagentLifecycle::Starting | SubagentLifecycle::Running | SubagentLifecycle::Waiting
+	) && !state.yield_committed()
 }
 
 fn settle(state: &SubagentRunState, kind: SubagentTerminalKind) -> Result<(), SupervisorError> {
@@ -833,4 +889,61 @@ pub enum SupervisorError {
 		/// Stable ID.
 		id: Str,
 	},
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn running_state() -> SubagentRunState {
+		let state = SubagentRunState::new(sf!("race-child"));
+		state.transition(SubagentLifecycle::Starting).unwrap();
+		state.transition(SubagentLifecycle::Running).unwrap();
+		state
+	}
+	
+	fn yield_call(args: &'static [u8]) -> Item {
+		Item {
+			kind: Some(thread::item::Kind::ToolCall(thread::ToolCall {
+				id: sf!("yield-call").to_string(),
+				name: sf!("yield").to_string(),
+				args_json: bytes::Bytes::from_static(args),
+				..Default::default()
+			})),
+			..Default::default()
+		}
+	}
+	
+	#[test]
+	fn only_structurally_valid_terminal_yields_can_commit_an_outcome() {
+		assert_eq!(
+			terminal_yield_call(&yield_call(br#"{"result":{"data":{"ok":true}}}"#)),
+			Some(sf!("yield-call"))
+		);
+		assert!(terminal_yield_call(&yield_call(
+			br#"{"type":["findings"],"result":{"data":[1]}}"#
+		))
+		.is_none());
+		assert!(terminal_yield_call(&yield_call(br#"{}"#)).is_none());
+	}
+
+	#[test]
+	fn late_runtime_limit_does_not_replace_committed_outcomes() {
+		let yielded = running_state();
+		yielded.commit_yield();
+		assert!(!runtime_limit_should_abort(&yielded));
+		settle(&yielded, SubagentTerminalKind::Succeeded).unwrap();
+		assert_eq!(
+			yielded.terminal().map(|terminal| terminal.kind),
+			Some(SubagentTerminalKind::Succeeded)
+		);
+		assert!(!runtime_limit_should_abort(&yielded));
+
+		let budget_killed = running_state();
+		settle(&budget_killed, SubagentTerminalKind::Failed).unwrap();
+		assert!(!runtime_limit_should_abort(&budget_killed));
+		assert_eq!(
+			budget_killed.terminal().map(|terminal| terminal.kind),
+			Some(SubagentTerminalKind::Failed)
+		);
+	}
 }
