@@ -120,13 +120,17 @@ omp-core = { path = "crates/core", version = "0.1.0" }
 objc2-core-graphics = "=0.3.2"
 omp-docserver = { path = "crates/docserver", version = "0.1.0" }
 omp-desktop = { path = "crates/desktop", version = "0.1.0" }
+omp-driver = { path = "crates/driver", version = "0.1.0" }
 omp-env = { path = "crates/env", version = "0.1.0" }
+omp-envd = { path = "crates/envd", version = "0.1.0" }
+omp-ext = { path = "crates/ext", version = "0.1.0" }
 omp-exthost = { path = "crates/exthost", version = "0.1.0" }
 omp-grep = { path = "crates/grep", version = "0.1.0" }
 omp-gui = { path = "crates/gui", version = "0.1.0" }
 omp-hashline = { path = "crates/hashline", version = "0.1.0" }
-omp-llm-catalog = { path = "crates/llm-catalog", version = "0.1.0" }
-omp-llm-inference = { path = "crates/llm-inference", version = "0.1.0" }
+omp-catalog = { path = "crates/catalog", version = "0.1.0" }
+omp-inference = { path = "crates/inference", version = "0.1.0" }
+omp-serve = { path = "crates/serve", version = "0.1.0" }
 omp-memory = { path = "crates/memory", version = "0.1.0" }
 omp-oauth = { path = "crates/oauth", version = "0.1.0" }
 omp-macros = { path = "crates/macros", version = "0.1.0" }
@@ -135,7 +139,8 @@ omp-py = { path = "crates/py", version = "0.1.0" }
 omp-rpc = { path = "crates/rpc", version = "0.1.0" }
 omp-collab = { path = "crates/collab", version = "0.1.0" }
 omp-sdk = { path = "crates/sdk", version = "0.1.0" }
-omp-snapcompact = { path = "crates/omp-snapcompact", version = "0.1.0" }
+omp-scribe = { path = "crates/scribe", version = "0.1.0" }
+omp-snapcompact = { path = "crates/snapcompact", version = "0.1.0" }
 omp-secrets = { path = "crates/secrets", version = "0.1.0" }
 omp-settings = { path = "crates/settings", version = "0.1.0" }
 omp-sandbox = { path = "crates/sandbox", version = "0.1.0" }

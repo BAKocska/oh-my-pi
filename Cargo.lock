@@ -6598,8 +6598,9 @@ dependencies = [
  "omp-ast",
  "omp-core",
  "omp-env",
- "omp-llm-inference",
+ "omp-inference",
  "omp-proto",
+ "omp-scribe",
  "omp-secrets",
  "omp-slopjson",
  "omp-snapcompact",
@@ -6627,55 +6628,43 @@ name = "omp-app"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "async-stream",
  "async-trait",
  "blake3",
- "bytecount",
  "bytes",
  "clap",
  "clap_complete",
  "ctor",
- "encoding_rs",
  "flate2",
  "flume",
  "futures",
- "globset",
  "handlebars",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "im",
  "image",
  "indicatif",
  "inventory",
- "itertools 0.14.0",
  "jiff",
  "libc",
  "miette",
  "nix 0.31.3",
  "omp-agent",
  "omp-ar",
+ "omp-catalog",
  "omp-chat-ui",
  "omp-collab",
  "omp-core",
- "omp-desktop",
- "omp-docserver",
+ "omp-driver",
  "omp-env",
+ "omp-envd",
+ "omp-ext",
  "omp-grep",
  "omp-gui",
  "omp-hashline",
- "omp-llm-catalog",
- "omp-llm-inference",
- "omp-memory",
- "omp-oauth",
+ "omp-inference",
  "omp-proto",
  "omp-py",
  "omp-rpc",
  "omp-sdk",
- "omp-secrets",
+ "omp-serve",
  "omp-settings",
- "omp-shell-engine",
  "omp-slopjson",
  "omp-storage",
  "omp-telemetry",
@@ -6684,17 +6673,11 @@ dependencies = [
  "omp-tui",
  "omp-voice",
  "omp-walker",
- "omp-webview",
  "parking_lot",
- "prost",
- "pyo3",
  "rand 0.10.2",
  "regex",
  "ring",
  "rusqlite",
- "russh",
- "russh-sftp",
- "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -6708,12 +6691,10 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-health",
- "tower",
  "tracing",
  "url",
  "windows-sys 0.61.2",
  "wreq",
- "xutf",
  "zeroize",
 ]
 
@@ -6810,6 +6791,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "omp-catalog"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "globset",
+ "kdl",
+ "omp-core",
+ "omp-settings",
+ "parking_lot",
+ "postcard",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smallvec 2.0.0-alpha.12",
+ "strum",
+ "thiserror 2.0.20",
+ "toml",
+ "zstd",
+]
+
+[[package]]
 name = "omp-chat-ui"
 version = "0.1.0"
 dependencies = [
@@ -6818,6 +6820,7 @@ dependencies = [
  "flume",
  "omp-core",
  "omp-proto",
+ "omp-storage",
  "omp-tools",
  "omp-tui",
  "parking_lot",
@@ -6876,6 +6879,7 @@ dependencies = [
  "smol_bitmap",
  "strum",
  "thiserror 2.0.20",
+ "tracing",
  "zeroize",
 ]
 
@@ -6944,6 +6948,75 @@ dependencies = [
 ]
 
 [[package]]
+name = "omp-driver"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "flate2",
+ "flume",
+ "futures",
+ "globset",
+ "handlebars",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "im",
+ "inventory",
+ "libc",
+ "notify",
+ "omp-agent",
+ "omp-ar",
+ "omp-catalog",
+ "omp-collab",
+ "omp-core",
+ "omp-docserver",
+ "omp-env",
+ "omp-envd",
+ "omp-ext",
+ "omp-inference",
+ "omp-memory",
+ "omp-proto",
+ "omp-rpc",
+ "omp-sdk",
+ "omp-secrets",
+ "omp-serve",
+ "omp-settings",
+ "omp-slopjson",
+ "omp-storage",
+ "omp-telemetry",
+ "omp-tool",
+ "omp-tools",
+ "omp-walker",
+ "parking_lot",
+ "prost",
+ "rand 0.10.2",
+ "regex",
+ "ring",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "smallvec 2.0.0-alpha.12",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tonic",
+ "tracing",
+ "url",
+ "wreq",
+ "xutf",
+ "zeroize",
+]
+
+[[package]]
 name = "omp-e2e"
 version = "0.1.0"
 dependencies = [
@@ -6955,12 +7028,13 @@ dependencies = [
  "nix 0.31.3",
  "omp-agent",
  "omp-app",
+ "omp-catalog",
  "omp-core",
  "omp-docserver",
  "omp-env",
+ "omp-envd",
  "omp-hashline",
- "omp-llm-catalog",
- "omp-llm-inference",
+ "omp-inference",
  "omp-proto",
  "omp-rpc",
  "omp-shell",
@@ -6991,6 +7065,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "flume",
+ "libc",
+ "nix 0.31.3",
  "omp-ar",
  "omp-core",
  "omp-proto",
@@ -7004,8 +7080,92 @@ dependencies = [
 ]
 
 [[package]]
-name = "omp-exthost"
+name = "omp-envd"
 version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "bytecount",
+ "bytes",
+ "encoding_rs",
+ "flate2",
+ "flume",
+ "futures",
+ "globset",
+ "http",
+ "hyper",
+ "im",
+ "libc",
+ "miette",
+ "nix 0.31.3",
+ "notify",
+ "omp-agent",
+ "omp-ar",
+ "omp-catalog",
+ "omp-core",
+ "omp-desktop",
+ "omp-docserver",
+ "omp-env",
+ "omp-ext",
+ "omp-grep",
+ "omp-hashline",
+ "omp-inference",
+ "omp-memory",
+ "omp-oauth",
+ "omp-proto",
+ "omp-py",
+ "omp-secrets",
+ "omp-settings",
+ "omp-shell-engine",
+ "omp-storage",
+ "omp-telemetry",
+ "omp-tool",
+ "omp-tools",
+ "omp-voice",
+ "omp-walker",
+ "omp-webview",
+ "parking_lot",
+ "prost",
+ "pyo3",
+ "rand 0.10.2",
+ "regex",
+ "ring",
+ "rusqlite",
+ "russh",
+ "russh-sftp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "smallvec 2.0.0-alpha.12",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tonic",
+ "tracing",
+ "url",
+ "wreq",
+ "xutf",
+ "zeroize",
+]
+
+[[package]]
+name = "omp-ext"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "omp-core",
+ "ring",
+ "serde",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.20",
+ "toml",
+]
 
 [[package]]
 name = "omp-grep"
@@ -7067,28 +7227,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "omp-llm-catalog"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "globset",
- "kdl",
- "omp-core",
- "omp-settings",
- "parking_lot",
- "postcard",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "smallvec 2.0.0-alpha.12",
- "strum",
- "thiserror 2.0.20",
- "toml",
- "zstd",
-]
-
-[[package]]
-name = "omp-llm-inference"
+name = "omp-inference"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
@@ -7109,8 +7248,8 @@ dependencies = [
  "im",
  "libc",
  "llama-cpp-2",
+ "omp-catalog",
  "omp-core",
- "omp-llm-catalog",
  "omp-oauth",
  "omp-proto",
  "omp-secrets",
@@ -7226,6 +7365,7 @@ version = "0.1.0"
 dependencies = [
  "omp-core",
  "omp-env",
+ "omp-scribe",
  "omp-storage",
  "omp-tool",
  "parking_lot",
@@ -7261,6 +7401,18 @@ name = "omp-sandbox"
 version = "0.1.0"
 
 [[package]]
+name = "omp-scribe"
+version = "0.1.0"
+dependencies = [
+ "im",
+ "omp-core",
+ "serde",
+ "serde_json",
+ "smallvec 2.0.0-alpha.12",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "omp-sdk"
 version = "0.1.0"
 dependencies = [
@@ -7268,10 +7420,10 @@ dependencies = [
  "flume",
  "futures",
  "omp-agent",
+ "omp-catalog",
  "omp-core",
  "omp-docserver",
- "omp-llm-catalog",
- "omp-llm-inference",
+ "omp-inference",
  "omp-proto",
  "omp-secrets",
  "omp-telemetry",
@@ -7303,17 +7455,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "omp-serve"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "bytes",
+ "flume",
+ "futures",
+ "im",
+ "omp-agent",
+ "omp-catalog",
+ "omp-core",
+ "omp-inference",
+ "omp-proto",
+ "omp-storage",
+ "omp-tool",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "omp-settings"
 version = "0.1.0"
 dependencies = [
  "flume",
  "globset",
  "inventory",
+ "libc",
+ "omp-slopjson",
  "parking_lot",
+ "rusqlite",
  "serde",
+ "serde_json",
  "strum",
+ "tempfile",
  "thiserror 2.0.20",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -7510,9 +7693,9 @@ dependencies = [
  "bytes",
  "flume",
  "futures",
+ "omp-catalog",
  "omp-core",
- "omp-llm-catalog",
- "omp-llm-inference",
+ "omp-inference",
  "omp-proto",
  "omp-slopjson",
  "parking_lot",
