@@ -2668,7 +2668,13 @@ mod tests {
 			.unwrap();
 		assert!(capabilities.final_cwd);
 		assert!(capabilities.materialization);
-		assert_eq!(capabilities.shell_profiles, [String::from("brush")]);
+		assert_eq!(capabilities.shell_profiles, [
+			String::from("brush"),
+			String::from("user"),
+			String::from("bash"),
+			String::from("zsh"),
+			String::from("fish")
+		]);
 
 		let (started, run) = host
 			.exec(
