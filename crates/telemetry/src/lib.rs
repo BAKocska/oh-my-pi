@@ -137,6 +137,63 @@ pub mod authority {
 	}
 
 	/// Historical query boundary owned by the durable telemetry index.
+	#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+	pub struct DurableTelemetryRow {
+		/// Durable session containing the indexed frame.
+		pub session:       Str,
+		/// Durable turn carried by the event, or zero for session-level events.
+		pub turn:          u64,
+		/// Exact byte offset in that session's append-only telemetry file.
+		pub offset:        u64,
+		/// Canonical indexed event kind.
+		pub kind:          Str,
+		/// Event observation time in Unix milliseconds.
+		pub occurred_at_ms: u64,
+		/// Whether transcript replay supplied this row.
+		pub backfilled:    bool,
+		/// Canonical payload decoded from the durable side file.
+		pub events:        Vec<Value>,
+		/// Named match binding, when the query step declared one.
+		pub bindings:      BTreeMap<Str, Value>,
+		/// Selected indexed or payload values.
+		pub values:        BTreeMap<Str, Value>,
+	}
+
+	/// Authoritative result envelope shared by durable query implementations.
+	#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+	pub struct DurableTelemetryRows {
+		/// Selected rows in durable offset order.
+		pub rows:             Vec<DurableTelemetryRow>,
+		/// Rows matching before the caller's limit was applied.
+		pub total:            usize,
+		/// Opaque next offset, when more rows remain.
+		pub cursor:           Option<Str>,
+		/// Whether the result was bounded by its limit.
+		pub truncated:        bool,
+		/// Number of durable sessions inspected.
+		pub scanned_sessions: usize,
+		/// Number of indexed event rows inspected.
+		pub scanned_events:   usize,
+		/// Whether any selected row came from transcript replay.
+		pub backfilled:       bool,
+		/// Whether the installation-time visibility floor removed rows.
+		pub floored:          bool,
+		/// Host-side query elapsed time in whole milliseconds.
+		pub elapsed_ms:       u64,
+	}
+
+	impl DurableTelemetryRows {
+		/// Serializes the canonical CONTROL result without a second schema.
+		pub fn into_value(self) -> Result<Value, TelemetryAuthorityError> {
+			serde_json::to_value(self).map_err(|error| {
+				TelemetryAuthorityError::Owner(Str::new(format!(
+					"telemetry result serialization failed: {error}"
+				)))
+			})
+		}
+	}
+
+	/// Historical query boundary owned by the durable telemetry index.
 	pub trait DurableTelemetryQuery: Send + Sync + 'static {
 		/// Executes a canonical query, respecting the supplied install floor.
 		fn query(
