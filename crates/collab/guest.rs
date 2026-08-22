@@ -5,10 +5,11 @@ use std::{
 	path::{Path, PathBuf},
 };
 
+use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
 use omp_proto::collab::v1::{
-	AgentSummary, ContextUsage, JournalRecord, ModelMetadata, RegistrySnapshot, SessionStateUpdate,
-	SnapshotChunk, UiRequest, VisibilityClass, agent_summary, ui_request,
+	AgentSummary, ContextUsage, JournalRecord, ModelMetadata, RegistrySnapshot, SessionHeader,
+	SessionStateUpdate, SnapshotChunk, UiRequest, VisibilityClass, agent_summary, ui_request,
 };
 use omp_storage::transcript::{
 	SessionId,
@@ -17,6 +18,7 @@ use omp_storage::transcript::{
 	},
 };
 use thiserror::Error;
+use tokio::sync::watch;
 
 /// Commands that remain local while rendering a remote collaboration replica.
 ///
@@ -429,6 +431,261 @@ impl GuestReplica {
 	}
 }
 
+const REPLICA_MAILBOX_CAPACITY: usize = 64;
+
+/// Latest durable state published by the ordered guest replica pump.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GuestReplicaProjection {
+	/// Durable replica path once the first welcome has identified the room.
+	pub path:       Option<PathBuf>,
+	/// Highest physical host revision durably applied.
+	pub watermark:  u64,
+	/// Reseed generation, incremented for every welcome.
+	pub generation: u64,
+	/// Whether a complete snapshot currently backs the projection.
+	pub ready:      bool,
+	/// Whether a live revision gap requires a fresh host snapshot.
+	pub gap:        bool,
+}
+
+enum GuestReplicaCommand {
+	Begin {
+		room_id:          Str,
+		header:           SessionHeader,
+		expected_records: usize,
+		reply:            Sender<Result<GuestReplicaProjection, GuestReplicaError>>,
+	},
+	Snapshot {
+		chunk: SnapshotChunk,
+		reply: Sender<Result<GuestReplicaProjection, GuestReplicaError>>,
+	},
+	Live {
+		record: JournalRecord,
+		reply:  Sender<Result<GuestReplicaProjection, GuestReplicaError>>,
+	},
+	Stop,
+}
+
+/// Clone-cheap producer and projection observer for [`GuestRelayPump`].
+#[derive(Clone)]
+pub struct GuestReplicaHandle {
+	commands: Sender<GuestReplicaCommand>,
+	updates:  watch::Receiver<GuestReplicaProjection>,
+}
+
+impl GuestReplicaHandle {
+	/// Starts an initial or reconnect snapshot for one authenticated room.
+	pub async fn begin_snapshot(
+		&self,
+		room_id: Str,
+		header: SessionHeader,
+		expected_records: usize,
+	) -> Result<GuestReplicaProjection, GuestReplicaError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send_async(GuestReplicaCommand::Begin { room_id, header, expected_records, reply })
+			.await
+			.map_err(|_| GuestReplicaError::PumpStopped)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| GuestReplicaError::PumpStopped)?
+	}
+
+	/// Applies one ordered snapshot chunk.
+	pub async fn push_snapshot_chunk(
+		&self,
+		chunk: SnapshotChunk,
+	) -> Result<GuestReplicaProjection, GuestReplicaError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send_async(GuestReplicaCommand::Snapshot { chunk, reply })
+			.await
+			.map_err(|_| GuestReplicaError::PumpStopped)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| GuestReplicaError::PumpStopped)?
+	}
+
+	/// Applies one ordered live record.
+	pub async fn append_live(
+		&self,
+		record: JournalRecord,
+	) -> Result<GuestReplicaProjection, GuestReplicaError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send_async(GuestReplicaCommand::Live { record, reply })
+			.await
+			.map_err(|_| GuestReplicaError::PumpStopped)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| GuestReplicaError::PumpStopped)?
+	}
+
+	/// Returns the most recently published durable projection state.
+	pub fn projection(&self) -> GuestReplicaProjection {
+		self.updates.borrow().clone()
+	}
+
+	/// Subscribes to coalesced durable projection updates.
+	pub fn subscribe(&self) -> watch::Receiver<GuestReplicaProjection> {
+		self.updates.clone()
+	}
+
+	/// Stops the pump after the collaboration owner has detached.
+	pub async fn stop(&self) {
+		let _ = self.commands.send_async(GuestReplicaCommand::Stop).await;
+	}
+}
+
+/// Ordered guest snapshot/live actor.
+///
+/// The actor has one bounded flume mailbox. A malformed or gapped record
+/// settles only that request; the loop remains alive so a reconnect welcome
+/// can reseed the same durable replica.
+pub struct GuestRelayPump {
+	root:       PathBuf,
+	local_cwd:  PathBuf,
+	created_ms: u64,
+	commands:   Receiver<GuestReplicaCommand>,
+	updates:    watch::Sender<GuestReplicaProjection>,
+	replica:    Option<GuestReplica>,
+	room_id:    Option<Str>,
+	projection: GuestReplicaProjection,
+}
+
+impl GuestRelayPump {
+	/// Creates an idle pump rooted in guest-local state.
+	pub fn new(root: PathBuf, local_cwd: PathBuf, created_ms: u64) -> (Self, GuestReplicaHandle) {
+		let (commands, receiver) = flume::bounded(REPLICA_MAILBOX_CAPACITY);
+		let projection = GuestReplicaProjection::default();
+		let (updates, observed) = watch::channel(projection.clone());
+		(
+			Self {
+				root,
+				local_cwd,
+				created_ms,
+				commands: receiver,
+				updates,
+				replica: None,
+				room_id: None,
+				projection,
+			},
+			GuestReplicaHandle { commands, updates: observed },
+		)
+	}
+
+	/// Runs until the owner explicitly stops or every producer is dropped.
+	pub async fn run(mut self) {
+		while let Ok(command) = self.commands.recv_async().await {
+			match command {
+				GuestReplicaCommand::Begin { room_id, header, expected_records, reply } => {
+					let result = self.begin(room_id, header, expected_records);
+					let _ = reply.send(result);
+				},
+				GuestReplicaCommand::Snapshot { chunk, reply } => {
+					let result = self.snapshot(chunk);
+					let _ = reply.send(result);
+				},
+				GuestReplicaCommand::Live { record, reply } => {
+					let result = self.live(record);
+					let _ = reply.send(result);
+				},
+				GuestReplicaCommand::Stop => break,
+			}
+		}
+	}
+
+	fn begin(
+		&mut self,
+		room_id: Str,
+		header: SessionHeader,
+		expected_records: usize,
+	) -> Result<GuestReplicaProjection, GuestReplicaError> {
+		if self.room_id.as_ref() != Some(&room_id) {
+			std::fs::create_dir_all(&self.root).map_err(|source| {
+				GuestReplicaError::CreateDirectory { path: self.root.clone(), source }
+			})?;
+			let path = self.root.join(format!("{room_id}.jsonl"));
+			let replica = if path.exists() {
+				GuestReplica::open(&path, room_id.as_str())?
+			} else {
+				GuestReplica::create(
+					&path,
+					SessionId(Str::from(omp_core::Ulid::generate().to_string())),
+					self.created_ms,
+					self.local_cwd.clone(),
+					RemoteProvenance {
+						host_session: SessionId(Str::new(&header.session_id)),
+						room_id:      room_id.clone(),
+						host_created: header.created_at_ms,
+					},
+				)?
+			};
+			self.replica = Some(replica);
+			self.room_id = Some(room_id);
+			self.projection.path = Some(path);
+		}
+		let replica = self
+			.replica
+			.as_mut()
+			.ok_or(GuestReplicaError::SnapshotRequired)?;
+		replica.begin_snapshot(expected_records)?;
+		self.projection.generation = self.projection.generation.saturating_add(1);
+		self.projection.ready = false;
+		self.projection.gap = false;
+		self.publish();
+		Ok(self.projection.clone())
+	}
+
+	fn snapshot(
+		&mut self,
+		chunk: SnapshotChunk,
+	) -> Result<GuestReplicaProjection, GuestReplicaError> {
+		let replica = self
+			.replica
+			.as_mut()
+			.ok_or(GuestReplicaError::SnapshotRequired)?;
+		if replica.push_snapshot_chunk(chunk)? {
+			self.projection.watermark = replica.replica().host_revision_watermark();
+			self.projection.ready = true;
+			self.projection.gap = false;
+			self.publish();
+		}
+		Ok(self.projection.clone())
+	}
+
+	fn live(&mut self, record: JournalRecord) -> Result<GuestReplicaProjection, GuestReplicaError> {
+		let replica = self
+			.replica
+			.as_mut()
+			.ok_or(GuestReplicaError::SnapshotRequired)?;
+		match replica.append_live(record) {
+			Ok(watermark) => {
+				self.projection.watermark = watermark;
+				self.publish();
+				Ok(self.projection.clone())
+			},
+			Err(error @ GuestReplicaError::Replica(ReplicaError::Revision { .. })) => {
+				self.projection.ready = false;
+				self.projection.gap = true;
+				self.publish();
+				Err(error)
+			},
+			Err(error) => Err(error),
+		}
+	}
+
+	fn publish(&self) {
+		self.updates.send_replace(self.projection.clone());
+	}
+}
+
 /// Guest replica protocol or storage failure.
 #[derive(Debug, Error)]
 pub enum GuestReplicaError {
@@ -466,6 +723,18 @@ pub enum GuestReplicaError {
 	/// Live traffic arrived before any complete snapshot established the fence.
 	#[error("collaboration live record arrived before a complete snapshot")]
 	SnapshotRequired,
+	/// The ordered replica actor is no longer running.
+	#[error("collaboration guest replica pump has stopped")]
+	PumpStopped,
+	/// The guest-local replica directory could not be created.
+	#[error("collaboration guest replica directory could not be created at {path}")]
+	CreateDirectory {
+		/// Guest-local replica directory.
+		path:   PathBuf,
+		/// Filesystem failure.
+		#[source]
+		source: std::io::Error,
+	},
 	/// A journal record carried an unknown visibility value.
 	#[error("collaboration journal record has an unknown visibility class")]
 	UnknownVisibility,
@@ -546,5 +815,106 @@ mod tests {
 			Some(LocalSessionRestore::Saved(PathBuf::from("/tmp/session.jsonl")))
 		);
 		assert_eq!(restore.take(), None);
+	}
+
+	fn wire_record(revision: u64) -> JournalRecord {
+		JournalRecord {
+			revision,
+			transcript_v4_json: bytes::Bytes::from(format!(r#"{{"ts":{revision},"k":"reset"}}"#)),
+			visibility_class: VisibilityClass::PublicTranscript as i32,
+		}
+	}
+
+	fn header() -> SessionHeader {
+		SessionHeader {
+			session_id:    "host-session".to_owned(),
+			title:         "Remote".to_owned(),
+			created_at_ms: 7,
+			host_cwd:      "/host/secret".to_owned(),
+		}
+	}
+
+	#[tokio::test]
+	async fn relay_pump_applies_snapshot_then_live_records_in_order() {
+		let directory = tempfile::tempdir().expect("temporary replica directory");
+		let (pump, handle) =
+			GuestRelayPump::new(directory.path().to_path_buf(), PathBuf::from("/guest"), 11);
+		let task = tokio::spawn(pump.run());
+		handle
+			.begin_snapshot(sf!("room"), header(), 2)
+			.await
+			.expect("begin snapshot");
+		let snapshot = handle
+			.push_snapshot_chunk(SnapshotChunk {
+				entries:                 vec![wire_record(1), wire_record(2)],
+				r#final:                 true,
+				host_revision_watermark: 2,
+			})
+			.await
+			.expect("commit snapshot");
+		assert!(snapshot.ready);
+		assert_eq!(snapshot.watermark, 2);
+		let live = handle
+			.append_live(wire_record(3))
+			.await
+			.expect("append live");
+		assert_eq!(live.watermark, 3);
+
+		let path = live.path.expect("replica path");
+		let log = omp_storage::transcript::load(&path).expect("load replica");
+		assert_eq!(log.len(), 3);
+		handle.stop().await;
+		task.await.expect("pump task");
+	}
+
+	#[tokio::test]
+	async fn relay_pump_survives_a_live_gap_until_reseed() {
+		let directory = tempfile::tempdir().expect("temporary replica directory");
+		let (pump, handle) =
+			GuestRelayPump::new(directory.path().to_path_buf(), PathBuf::from("/guest"), 11);
+		let task = tokio::spawn(pump.run());
+		handle
+			.begin_snapshot(sf!("room"), header(), 1)
+			.await
+			.expect("begin snapshot");
+		handle
+			.push_snapshot_chunk(SnapshotChunk {
+				entries:                 vec![wire_record(1)],
+				r#final:                 true,
+				host_revision_watermark: 1,
+			})
+			.await
+			.expect("commit snapshot");
+
+		assert!(matches!(
+			handle.append_live(wire_record(3)).await,
+			Err(GuestReplicaError::Replica(ReplicaError::Revision { expected: 2, actual: 3 }))
+		));
+		assert!(handle.projection().gap);
+
+		handle
+			.begin_snapshot(sf!("room"), header(), 3)
+			.await
+			.expect("begin recovery snapshot");
+		let recovered = handle
+			.push_snapshot_chunk(SnapshotChunk {
+				entries:                 vec![wire_record(1), wire_record(2), wire_record(3)],
+				r#final:                 true,
+				host_revision_watermark: 3,
+			})
+			.await
+			.expect("commit recovery snapshot");
+		assert!(recovered.ready);
+		assert!(!recovered.gap);
+		assert_eq!(
+			handle
+				.append_live(wire_record(4))
+				.await
+				.expect("append after reseed")
+				.watermark,
+			4,
+		);
+		handle.stop().await;
+		task.await.expect("pump task");
 	}
 }

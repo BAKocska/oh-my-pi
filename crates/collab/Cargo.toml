@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 bytes.workspace = true
+flume.workspace = true
 futures.workspace = true
 http.workspace = true
 omp-core.workspace = true
@@ -32,3 +33,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
