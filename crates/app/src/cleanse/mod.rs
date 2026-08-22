@@ -3,6 +3,7 @@
 pub mod balance;
 pub mod checkers;
 pub mod parsers;
+pub mod production;
 pub mod types;
 
 use std::{error::Error as StdError, future::Future, path::PathBuf};
@@ -34,16 +35,19 @@ pub trait CleanseHost: BinaryResolver + CheckerRunner {
 	/// Returns the bounded project file snapshot used for discovery.
 	fn project_files(&self) -> &[PathBuf];
 	/// Runs the one-shot interactive picker.
+	///
+	/// Thread-confined like every alternate-screen TUI future; the cleanse
+	/// driver runs on the dispatch task and never spawns this.
 	fn pick_target(
 		&self,
 		checkers: &[Checker],
 		cancel: &CancellationToken,
-	) -> impl Future<Output = Result<TargetChoice, <Self as CheckerRunner>::Error>> + Send;
+	) -> impl Future<Output = Result<TargetChoice, <Self as CheckerRunner>::Error>>;
 	/// Prompts for a free-form request when no built-in checker is runnable.
 	fn prompt_request(
 		&self,
 		cancel: &CancellationToken,
-	) -> impl Future<Output = Result<Option<Str>, <Self as CheckerRunner>::Error>> + Send;
+	) -> impl Future<Output = Result<Option<Str>, <Self as CheckerRunner>::Error>>;
 	/// Uses a schema-constrained child to discover exact checker argv.
 	fn discover_custom(
 		&self,

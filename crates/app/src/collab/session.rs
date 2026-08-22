@@ -7,12 +7,13 @@ use flume::{Receiver, Sender};
 use omp_collab::{
 	codec::RelayRoute,
 	crypto::{CryptoError, RoomKey, WriteToken},
+	guest::{GuestReplicaError, GuestReplicaHandle},
 	link::{CollabLink, HostedRoom, RelayEndpoint, WebEndpoint},
 	presence::{ConnectionState, PresenceFacts},
 	relay::{Handshake, RelayClient, RelayError, RelayInbound, RelayRole, SendDisposition},
 };
 use omp_core::Str;
-use omp_proto::collab::v1::{Bye, Hello, PromptRequest, collab_frame};
+use omp_proto::collab::v1::{Bye, Hello, PromptRequest, Welcome, collab_frame};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle, time::error::Elapsed};
 
@@ -106,6 +107,7 @@ struct OwnerRequest {
 pub struct CollabCommandHandle {
 	commands: Sender<OwnerRequest>,
 	presence: watch::Receiver<Option<PresenceFacts>>,
+	replica:  Option<GuestReplicaHandle>,
 }
 
 impl CollabCommandHandle {
@@ -136,23 +138,37 @@ impl CollabCommandHandle {
 	pub fn subscribe_presence(&self) -> watch::Receiver<Option<PresenceFacts>> {
 		self.presence.clone()
 	}
+
+	/// Returns the guest transcript projection handle when replica storage was
+	/// attached to this owner.
+	pub fn guest_replica(&self) -> Option<GuestReplicaHandle> {
+		self.replica.clone()
+	}
 }
 
 /// Receiving half retained by the production host/guest lifecycle owner.
 pub struct CollabSessionAuthority {
 	commands: Receiver<OwnerRequest>,
 	presence: watch::Sender<Option<PresenceFacts>>,
+	replica:  Option<GuestReplicaHandle>,
 }
 
 impl CollabSessionAuthority {
 	/// Constructs the sole authority and its clone-cheap UI handle.
 	pub fn new() -> (Self, CollabCommandHandle) {
+		Self::with_guest_replica(None)
+	}
+
+	/// Constructs the sole authority with guest replica storage attached.
+	pub fn with_guest_replica(
+		replica: Option<GuestReplicaHandle>,
+	) -> (Self, CollabCommandHandle) {
 		let (commands, requests) = flume::bounded(COMMAND_CAPACITY);
 		let (presence, observed_presence) = watch::channel(None);
-		(Self { commands: requests, presence }, CollabCommandHandle {
-			commands,
-			presence: observed_presence,
-		})
+		(
+			Self { commands: requests, presence, replica: replica.clone() },
+			CollabCommandHandle { commands, presence: observed_presence, replica },
+		)
 	}
 
 	/// Receives the next serialized owner request.
@@ -180,7 +196,14 @@ pub fn spawn_session_owner(authority: CollabSessionAuthority) -> JoinHandle<()> 
 
 enum ActiveSession {
 	Host { relay: RelayClient, _write_token: WriteToken, result: CollabCommandResult },
-	Guest { relay: RelayClient, sequence: u64, result: CollabCommandResult },
+	Guest {
+		relay:    RelayClient,
+		sequence: u64,
+		hello:    omp_proto::collab::v1::CollabFrame,
+		room_id:  Str,
+		replica:  GuestReplicaHandle,
+		result:   CollabCommandResult,
+	},
 }
 
 impl ActiveSession {
@@ -209,20 +232,128 @@ impl ActiveSession {
 impl CollabSessionAuthority {
 	async fn run(self) {
 		let mut active = None;
-		while let Ok(request) = self.recv().await {
-			let clears_presence = matches!(
-				request.command(),
-				CollabOwnerCommand::Start(_) | CollabOwnerCommand::Join { .. }
-			);
-			let result = self.apply(request.command(), &mut active).await;
-			if clears_presence && result.is_err() {
-				self.publish_presence(None);
+		loop {
+			enum Input {
+				Request(Result<CollabOwnerRequest, CollabCommandFault>),
+				Inbound(Result<Option<RelayInbound>, RelayError>),
 			}
-			let _ = request.settle(result);
+			let input = match active.as_mut() {
+				Some(ActiveSession::Guest { relay, .. }) => {
+					tokio::select! {
+						request = self.recv() => Input::Request(request),
+						inbound = relay.receive() => Input::Inbound(inbound),
+					}
+				},
+				Some(ActiveSession::Host { .. }) | None => Input::Request(self.recv().await),
+			};
+			match input {
+				Input::Request(Ok(request)) => {
+					let clears_presence = matches!(
+						request.command(),
+						CollabOwnerCommand::Start(_) | CollabOwnerCommand::Join { .. }
+					);
+					let result = self.apply(request.command(), &mut active).await;
+					if clears_presence && result.is_err() {
+						self.publish_presence(None);
+					}
+					let _ = request.settle(result);
+				},
+				Input::Request(Err(_)) => break,
+				Input::Inbound(Ok(inbound)) => {
+					if self.apply_guest_inbound(inbound, &mut active).await.is_err() {
+						self.publish_presence(None);
+						active = None;
+					}
+				},
+				Input::Inbound(Err(_)) => {
+					self.publish_presence(None);
+					active = None;
+				},
+			}
 		}
 		if let Some(mut session) = active {
 			let _ = session.close("runtime stopped").await;
 		}
+	}
+
+	async fn apply_guest_inbound(
+		&self,
+		inbound: Option<RelayInbound>,
+		active: &mut Option<ActiveSession>,
+	) -> Result<(), CollabCommandFault> {
+		let Some(ActiveSession::Guest { relay, hello, room_id, replica, result, .. }) =
+			active.as_mut()
+		else {
+			return Ok(());
+		};
+		let Some(inbound) = inbound else {
+			let read_only = result.presence.is_some_and(PresenceFacts::read_only);
+			self.publish_presence(Some(PresenceFacts::guest(
+				ConnectionState::Reconnecting,
+				0,
+				read_only,
+			)));
+			connect(relay).await?;
+			if relay.send(RelayRoute { peer_id: 0 }, hello).await? != SendDisposition::Sent {
+				return Err(CollabCommandFault::OutboundQueued);
+			}
+			return Ok(());
+		};
+		let RelayInbound::Frame(frame) = inbound else {
+			return Ok(());
+		};
+		match frame.frame.payload {
+			Some(collab_frame::Payload::Welcome(welcome)) => {
+				let read_only = welcome.read_only;
+				begin_guest_snapshot(replica, room_id.clone(), &welcome).await?;
+				let participant_count = welcome
+					.initial_state
+					.as_ref()
+					.map_or(1, |state| state.participants.len().max(1));
+				let presence =
+					PresenceFacts::guest(ConnectionState::Connected, participant_count, read_only);
+				result.presence = Some(presence);
+				self.publish_presence(Some(presence));
+			},
+			Some(collab_frame::Payload::SnapshotChunk(chunk)) => {
+				replica.push_snapshot_chunk(chunk).await?;
+			},
+			Some(collab_frame::Payload::JournalRecord(record)) => {
+				if let Err(error) = replica.append_live(record).await {
+					if matches!(
+						&error,
+						GuestReplicaError::Replica(
+							omp_storage::transcript::replica::ReplicaError::Revision { .. }
+						)
+					) {
+						if relay.send(RelayRoute { peer_id: 0 }, hello).await?
+							!= SendDisposition::Sent
+						{
+							return Err(CollabCommandFault::OutboundQueued);
+						}
+					} else {
+						return Err(error.into());
+					}
+				}
+			},
+			Some(collab_frame::Payload::State(state)) => {
+				let read_only = result.presence.is_some_and(PresenceFacts::read_only);
+				let presence = PresenceFacts::guest(
+					ConnectionState::Connected,
+					state.participants.len().max(1),
+					read_only,
+				);
+				result.presence = Some(presence);
+				self.publish_presence(Some(presence));
+			},
+			Some(collab_frame::Payload::Bye(_)) => {
+				self.publish_presence(None);
+				result.presence = None;
+				relay.close().await?;
+			},
+			_ => {},
+		}
+		Ok(())
 	}
 
 	async fn apply(
@@ -279,6 +410,10 @@ impl CollabSessionAuthority {
 				if active.is_some() {
 					return Err(CollabCommandFault::AlreadyActive);
 				}
+				let replica = self
+					.replica
+					.clone()
+					.ok_or(CollabCommandFault::ReplicaUnavailable)?;
 				self.publish_presence(Some(PresenceFacts::guest(
 					ConnectionState::Connecting,
 					0,
@@ -315,6 +450,9 @@ impl CollabSessionAuthority {
 				if welcome.read_only != link.credentials().is_read_only() {
 					return Err(CollabCommandFault::CredentialTierMismatch);
 				}
+				let room_id =
+					Str::from(omp_core::base64_url::encode_raw(link.room_id().as_bytes()).into_string());
+				begin_guest_snapshot(&replica, room_id.clone(), &welcome).await?;
 				let participant_count = welcome
 					.initial_state
 					.as_ref()
@@ -326,12 +464,19 @@ impl CollabSessionAuthority {
 				);
 				let result =
 					CollabCommandResult { presence: Some(presence), ..CollabCommandResult::inactive() };
-				*active = Some(ActiveSession::Guest { relay, sequence: 1, result: result.clone() });
+				*active = Some(ActiveSession::Guest {
+					relay,
+					sequence: 1,
+					hello,
+					room_id,
+					replica,
+					result: result.clone(),
+				});
 				self.publish_presence(Some(presence));
 				Ok(result)
 			},
 			CollabOwnerCommand::Prompt { text, images } => {
-				let Some(ActiveSession::Guest { relay, sequence, result }) = active else {
+				let Some(ActiveSession::Guest { relay, sequence, result, .. }) = active else {
 					return Err(CollabCommandFault::NotGuest);
 				};
 				if result.presence.is_some_and(PresenceFacts::read_only) {
@@ -375,6 +520,26 @@ async fn connect(relay: &mut RelayClient) -> Result<(), CollabCommandFault> {
 	tokio::time::timeout(CONNECT_TIMEOUT, relay.connect())
 		.await
 		.map_err(|source| CollabCommandFault::ConnectTimeout { source })??;
+	Ok(())
+}
+
+async fn begin_guest_snapshot(
+	replica: &GuestReplicaHandle,
+	room_id: Str,
+	welcome: &Welcome,
+) -> Result<(), CollabCommandFault> {
+	let header = welcome
+		.header
+		.clone()
+		.ok_or(CollabCommandFault::MissingWelcomeHeader)?;
+	replica
+		.begin_snapshot(
+			room_id,
+			header,
+			usize::try_from(welcome.total_entry_count)
+				.expect("protobuf u32 record count fits in usize"),
+		)
+		.await?;
 	Ok(())
 }
 
@@ -454,6 +619,15 @@ pub enum CollabCommandFault {
 	/// Viewer credentials cannot submit prompts.
 	#[error("this collaboration link is read-only")]
 	ReadOnly,
+	/// Guest join was composed without a durable transcript replica.
+	#[error("collaboration guest replica storage is unavailable")]
+	ReplicaUnavailable,
+	/// Host welcome omitted the required session header.
+	#[error("collaboration host welcome omitted its session header")]
+	MissingWelcomeHeader,
+	/// Guest transcript projection failed.
+	#[error(transparent)]
+	GuestReplica(#[from] GuestReplicaError),
 }
 
 #[cfg(test)]

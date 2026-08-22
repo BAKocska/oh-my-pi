@@ -1,6 +1,7 @@
 //! Standalone semantic-compression command.
 
 pub mod protocol;
+pub mod production;
 pub mod types;
 
 use std::{

@@ -191,21 +191,19 @@ pub async fn run(database: PathBuf, command: AuthCommand) -> Result<()> {
 	let planner =
 		omp_llm_inference::router::Router::new(registry.clone(), std::time::Duration::from_secs(30));
 	let mut client = Client::new(registry.service(), planner, meta);
-	print_auth(client.execute(operation).await.into_diagnostic()?).await
+	print_auth(client.execute(operation).await.into_diagnostic()?, &database).await
 }
 
-async fn print_auth(answer: AuthAnswer) -> Result<()> {
+async fn print_auth(answer: AuthAnswer, database: &std::path::Path) -> Result<()> {
 	match answer {
 		AuthAnswer::Session(session) => {
 			let session_id = session.id.clone();
 			while let Ok(event) = session.events.recv_async().await {
 				match event.into_diagnostic()? {
 					AuthEvent::OpenUrl(url) => {
-						crate::open::open_path(&url);
-						println!("open {url}");
+						println!("\nOpen this URL in your browser:\n{url}\n");
 					},
 					AuthEvent::ShowDeviceCode { code, verification_url } => {
-						crate::open::open_path(&verification_url);
 						println!(
 							"complete device authorization at {verification_url} using code {}",
 							code.expose_secret()
@@ -224,6 +222,7 @@ async fn print_auth(answer: AuthAnswer) -> Result<()> {
 					AuthEvent::Waiting => println!("waiting for provider authorization"),
 					AuthEvent::Complete(account) => {
 						println!("{} {}", account.account, account.provider);
+						println!("\nCredentials saved to {}", database.display());
 						break;
 					},
 				}

@@ -1150,6 +1150,10 @@ impl Runtime {
 			resume,
 			fork,
 			py_eval: false,
+			pty_denied: false,
+			credential_provider: None,
+			api_key: None,
+			prompt_cache_affinity: None,
 			session_generation: generation,
 		})
 		.await?;

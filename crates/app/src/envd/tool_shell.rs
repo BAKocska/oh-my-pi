@@ -562,6 +562,9 @@ impl ShellExec for ShellExecHost {
 	type Run = SelectedShellRun;
 
 	async fn open_session(&self, options: SessionOptions) -> Result<Session, Fault> {
+		if options.pty && super::tools::pty_denied() {
+			return Err(Fault::PtyDenied);
+		}
 		let cwd_uri = self.resolve_cwd(options.cwd.as_deref()).await?;
 		let pty = options.pty;
 		let environment = self
@@ -662,6 +665,9 @@ impl ShellExec for ShellExecHost {
 	}
 
 	async fn detach(&self, request: DetachRequest) -> Result<DetachedJob, Fault> {
+		if request.options.pty && super::tools::pty_denied() {
+			return Err(Fault::PtyDenied);
+		}
 		let cwd_uri = self.resolve_cwd(request.options.cwd.as_deref()).await?;
 		let pty = request.options.pty;
 		let environment = self
@@ -768,4 +774,75 @@ fn resource_fault(operation: &'static str, error: ExecError) -> Fault {
 
 fn protocol_fault(operation: &'static str, message: impl Into<Str>) -> Fault {
 	Fault::Resource { operation: sf!(operation), message: message.into() }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn test_host(root: &Path) -> ShellExecHost {
+		let root_uri = url::Url::from_directory_path(root)
+			.expect("workspace URI")
+			.to_string();
+		ShellExecHost::new(
+			ExecHost::new(),
+			Str::from(root_uri),
+			Arc::new(ResolverTable::default()),
+			ShellSettings::default(),
+			AcpExecSlot::default(),
+			false,
+		)
+	}
+
+	#[tokio::test]
+	async fn authenticated_pty_denial_is_invocation_local_and_plain_exec_still_runs() {
+		let root = tempfile::tempdir().expect("workspace");
+		let host = test_host(root.path());
+		let denied_host = host.clone();
+		let allowed_host = host.clone();
+		let denied = tokio::spawn(super::super::tools::with_invocation_scope(true, async move {
+			denied_host
+				.open_session(SessionOptions { pty: true, ..SessionOptions::default() })
+				.await
+		}));
+		let allowed = tokio::spawn(super::super::tools::with_invocation_scope(false, async move {
+			allowed_host
+				.open_session(SessionOptions { pty: true, ..SessionOptions::default() })
+				.await
+		}));
+		assert_eq!(denied.await.expect("denied scope task"), Err(Fault::PtyDenied));
+		let allowed_session = allowed
+			.await
+			.expect("allowed scope task")
+			.expect("unrestricted scope allocates a PTY");
+		host.close_session(&allowed_session)
+			.await
+			.expect("close PTY session");
+
+		let plain_session = super::super::tools::with_invocation_scope(
+			true,
+			host.open_session(SessionOptions::default()),
+		)
+		.await
+		.expect("denied scope permits non-PTY session");
+		let mut run = host
+			.run(&plain_session, RunRequest {
+				command:    sf!("printf scope-ok"),
+				timeout_ms: Some(5_000),
+			})
+			.await
+			.expect("plain execution starts");
+		let mut exited = false;
+		while let Some(event) = run.next_event().await.expect("plain execution event") {
+			if let RunEvent::Exit(status) = event {
+				assert_eq!(status.outcome, ExecOutcome::Exited);
+				exited = true;
+				break;
+			}
+		}
+		assert!(exited, "plain execution must report terminal status");
+		host.close_session(&plain_session)
+			.await
+			.expect("close plain session");
+	}
 }

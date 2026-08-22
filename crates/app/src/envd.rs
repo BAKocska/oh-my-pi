@@ -15,6 +15,7 @@ pub(crate) mod github_url;
 pub(crate) mod host_info;
 mod http_egress;
 mod journal_runtime;
+mod presence;
 pub(crate) mod lsp_settings;
 mod managed_skills;
 pub(crate) mod mcp;
@@ -53,11 +54,15 @@ use std::{io, path::Path, sync::Arc};
 #[doc(hidden)]
 pub use eval::{EVAL_CHILD_ARG, run_eval_child_entry};
 use miette::IntoDiagnostic as _;
-use omp_core::{Hash32, Str, sf};
+use bytes::Bytes;
+use omp_core::{Hash32, Str, Ulid, sf};
 use omp_env::EnvClient;
-use omp_proto::env::v1::{ClientHello, ServerHello};
+use omp_proto::env::v1::{
+	ClientHello, RegisterPresence, ReleasePresence, ServerHello,
+};
 use omp_tool::Registry;
 pub use server::{EnvServer, EnvdError};
+pub use site::validate_trusted_module;
 use tokio_util::sync::CancellationToken;
 #[doc(hidden)]
 pub use worker::run_py_worker_entry;
@@ -67,6 +72,122 @@ use self::{
 	worker::{ExtHostConfig, ExtHostSpec, HostKey, PY_EVAL_MODULE},
 };
 use crate::cli::EnvdArgs;
+/// One startup client's daemon-owned project presence.
+///
+/// Dropping the handle closes the owner connection, which releases the lease
+/// even when orderly RPC release cannot run.
+#[must_use]
+pub struct ClientPresenceLease {
+	client:    EnvClient,
+	lease_id: Bytes,
+	bridge:   tokio::task::AbortHandle,
+}
+
+impl ClientPresenceLease {
+	/// Removes the durable presence record before closing the owner connection.
+	pub async fn close(self) -> Result<(), EnvdError> {
+		self
+			.client
+			.release_presence(ReleasePresence {
+				lease_id: self.lease_id.clone(),
+				props:    None,
+			})
+			.await?;
+		Ok(())
+	}
+}
+
+impl Drop for ClientPresenceLease {
+	fn drop(&mut self) {
+		self.bridge.abort();
+	}
+}
+
+/// Registers one launch-shaped application process with its project daemon.
+#[cfg(any(unix, windows))]
+pub async fn register_project_presence(
+	project_root: &Path,
+	data_dir: &Path,
+	kind: &'static str,
+) -> Result<ClientPresenceLease, EnvdError> {
+	let root = std::fs::canonicalize(project_root)?;
+	let state_dir = crate::project_state::directory(data_dir, &root)?;
+	let socket = crate::project_state::environment_socket(&state_dir);
+	let (client, bridge) = match connect_presence_owner(&socket).await {
+		Ok(connection) => connection,
+		Err(EnvdError::Io(error))
+			if matches!(
+				error.kind(),
+				io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+			) =>
+		{
+			spawn_project_daemon(
+				&root,
+				&state_dir,
+				&socket,
+				&crate::project_state::document_socket(&state_dir),
+			)
+			.await?;
+			connect_presence_owner(&socket).await?
+		},
+		Err(error) => return Err(error),
+	};
+	if let Err(error) = hello(&client).await {
+		bridge.abort();
+		return Err(error);
+	}
+	let client_id = Ulid::generate().to_string();
+	let registered = match client
+		.register_presence(RegisterPresence {
+			client_id: Bytes::copy_from_slice(client_id.as_bytes()),
+			pid:       std::process::id(),
+			kind:      kind.to_owned(),
+			props:     None,
+		})
+		.await
+	{
+		Ok(registered) => registered,
+		Err(error) => {
+			bridge.abort();
+			return Err(error.into());
+		},
+	};
+	Ok(ClientPresenceLease { client, lease_id: registered.lease_id, bridge })
+}
+
+/// Reports that client-presence registration needs a local Environment transport.
+#[cfg(not(any(unix, windows)))]
+pub async fn register_project_presence(
+	_project_root: &Path,
+	_data_dir: &Path,
+	_kind: &'static str,
+) -> Result<ClientPresenceLease, EnvdError> {
+	Err(io::Error::new(
+		io::ErrorKind::Unsupported,
+		"client presence requires a local Environment transport",
+	)
+	.into())
+}
+
+#[cfg(unix)]
+async fn connect_presence_owner(
+	socket: &Path,
+) -> Result<(EnvClient, tokio::task::AbortHandle), EnvdError> {
+	let (client, bridge) = EnvServer::connect_owner_uds(socket).await?;
+	let abort = bridge.abort_handle();
+	drop(bridge);
+	Ok((client, abort))
+}
+
+#[cfg(windows)]
+async fn connect_presence_owner(
+	socket: &Path,
+) -> Result<(EnvClient, tokio::task::AbortHandle), EnvdError> {
+	let (client, bridge) = omp_env::windows::connect_owner_pipe(socket)?;
+	let abort = bridge.abort_handle();
+	drop(bridge);
+	Ok((client, abort))
+}
 
 /// Copies session-local artifacts into the replacement session root.
 pub(crate) fn migrate_session_artifacts(
@@ -137,6 +258,7 @@ impl ProjectEnvironment {
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 	) -> Result<Self, EnvdError> {
 		match EnvServer::connect_owner_uds(socket).await {
@@ -169,6 +291,7 @@ impl ProjectEnvironment {
 										socket,
 										docserver_socket,
 										py_eval,
+										trusted_extensions,
 										interrupt_grace,
 									)
 									.await;
@@ -197,7 +320,14 @@ impl ProjectEnvironment {
 					},
 					Err(error) => return Err(error),
 				}
-				Self::connect_peer(root, state_dir, docserver_socket, py_eval, interrupt_grace).await
+				Self::connect_peer(
+					root,
+					state_dir,
+					docserver_socket,
+					py_eval,
+					trusted_extensions,
+					interrupt_grace,
+				).await
 			},
 			Err(EnvdError::Io(error))
 				if matches!(
@@ -209,7 +339,14 @@ impl ProjectEnvironment {
 				// authorities outlive this process, then join it as a peer.
 				match spawn_project_daemon(root, state_dir, socket, docserver_socket).await {
 					Ok(()) => {
-						Self::connect_peer(root, state_dir, docserver_socket, py_eval, interrupt_grace)
+						Self::connect_peer(
+							root,
+							state_dir,
+							docserver_socket,
+							py_eval,
+							trusted_extensions,
+							interrupt_grace,
+						)
 							.await
 					},
 					Err(error) => {
@@ -218,7 +355,15 @@ impl ProjectEnvironment {
 							%error,
 							"could not autostart the project daemon; running an embedded environment"
 						);
-						Self::start(root, state_dir, socket, docserver_socket, py_eval, interrupt_grace)
+						Self::start(
+							root,
+							state_dir,
+							socket,
+							docserver_socket,
+							py_eval,
+							trusted_extensions,
+							interrupt_grace,
+						)
 							.await
 					},
 				}
@@ -235,6 +380,7 @@ impl ProjectEnvironment {
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 	) -> Result<Self, EnvdError> {
 		match omp_env::windows::connect_owner_pipe(socket) {
@@ -258,6 +404,7 @@ impl ProjectEnvironment {
 										socket,
 										docserver_socket,
 										py_eval,
+										trusted_extensions,
 										interrupt_grace,
 									)
 									.await;
@@ -279,7 +426,14 @@ impl ProjectEnvironment {
 					},
 					Err(error) => return Err(EnvdError::Client(error)),
 				}
-				Self::connect_peer(root, state_dir, docserver_socket, py_eval, interrupt_grace).await
+				Self::connect_peer(
+					root,
+					state_dir,
+					docserver_socket,
+					py_eval,
+					trusted_extensions,
+					interrupt_grace,
+				).await
 			},
 			Err(error)
 				if matches!(
@@ -289,7 +443,14 @@ impl ProjectEnvironment {
 			{
 				match spawn_project_daemon(root, state_dir, socket, docserver_socket).await {
 					Ok(()) => {
-						Self::connect_peer(root, state_dir, docserver_socket, py_eval, interrupt_grace)
+						Self::connect_peer(
+							root,
+							state_dir,
+							docserver_socket,
+							py_eval,
+							trusted_extensions,
+							interrupt_grace,
+						)
 							.await
 					},
 					Err(error) => {
@@ -298,7 +459,15 @@ impl ProjectEnvironment {
 							%error,
 							"could not autostart the project daemon; running an embedded environment"
 						);
-						Self::start(root, state_dir, socket, docserver_socket, py_eval, interrupt_grace)
+						Self::start(
+							root,
+							state_dir,
+							socket,
+							docserver_socket,
+							py_eval,
+							trusted_extensions,
+							interrupt_grace,
+						)
 							.await
 					},
 				}
@@ -317,9 +486,15 @@ impl ProjectEnvironment {
 		state_dir: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 	) -> Result<Self, EnvdError> {
-		let (worker_config, data_bindings) = worker_config(state_dir, py_eval, interrupt_grace)?;
+		let (worker_config, data_bindings) = worker_config(
+			state_dir,
+			py_eval,
+			trusted_extensions,
+			interrupt_grace,
+		)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
@@ -366,9 +541,15 @@ impl ProjectEnvironment {
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 	) -> Result<Self, EnvdError> {
-		let (worker_config, data_bindings) = worker_config(state_dir, py_eval, interrupt_grace)?;
+		let (worker_config, data_bindings) = worker_config(
+			state_dir,
+			py_eval,
+			trusted_extensions,
+			interrupt_grace,
+		)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
@@ -430,10 +611,16 @@ impl ProjectEnvironment {
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 	) -> Result<Self, EnvdError> {
 		let owner_listener = windows::OwnerPipeListener::bind(socket)?;
-		let (worker_config, data_bindings) = worker_config(state_dir, py_eval, interrupt_grace)?;
+		let (worker_config, data_bindings) = worker_config(
+			state_dir,
+			py_eval,
+			trusted_extensions,
+			interrupt_grace,
+		)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
@@ -486,7 +673,12 @@ impl ProjectEnvironment {
 	/// Starts an embedded Environment rooted at one isolated worktree.
 	pub(crate) async fn isolated(root: &Path, state_dir: &Path) -> Result<Self, EnvdError> {
 		let (worker_config, data_bindings) =
-			worker_config(state_dir, true, omp_tool::DEFAULT_INTERRUPT_GRACE)?;
+			worker_config(
+				state_dir,
+				true,
+				&[],
+				omp_tool::DEFAULT_INTERRUPT_GRACE,
+			)?;
 		let server =
 			Arc::new(EnvServer::open_local(root, state_dir, Registry::new(), worker_config).await?);
 		let registry = server.registry();
@@ -524,6 +716,9 @@ impl ProjectEnvironment {
 
 	pub(crate) fn registry(&self) -> Arc<Registry> {
 		Arc::clone(&self.registry)
+	}
+	pub(crate) fn documents(&self) -> &docs::DocumentHost {
+		self.lifecycle.server.documents()
 	}
 
 	/// Binds or clears the editor-owned terminal backend for this environment
@@ -606,6 +801,7 @@ impl ProjectEnvironment {
 fn worker_config(
 	state_dir: &Path,
 	py_eval: bool,
+	trusted_extensions: &[ExtHostSpec],
 	interrupt_grace: omp_core::Duration,
 ) -> Result<(ExtHostConfig, Vec<ExtensionDataBinding>), EnvdError> {
 	let (authority, session_id, session_generation) = authenticated_runtime_identity()?;
@@ -644,6 +840,7 @@ fn worker_config(
 		config.extensions.push(extension);
 		bindings.push(binding);
 	}
+	config.extensions.extend_from_slice(trusted_extensions);
 	Ok((config, bindings))
 }
 

@@ -9,8 +9,8 @@ use omp_agent::{
 	Agent, AgentEvent, AgentKind, AgentRunSummary, AgentState, AgentStatus, AgentTree, ApprovalBook,
 	ApprovalInbox, ApprovalRoute, Budget, EventSubscription, InProcTurnClient, TurnId,
 };
-use omp_core::{Str, sf};
-use omp_llm_catalog::ModelKey;
+use omp_core::{SecretString, Str, sf};
+use omp_llm_catalog::{ModelKey, ProviderId};
 use omp_llm_inference::Registry as InferenceRegistry;
 use omp_proto::thread::v1::Item;
 use omp_sdk::{SessionHandle, SessionIdentity, SessionRuntime};
@@ -45,6 +45,14 @@ pub struct HeadlessSessionOptions {
 	pub fork:                Option<Str>,
 	/// Whether the Python eval device is enabled.
 	pub py_eval:             bool,
+	/// Whether authenticated tool invocations are forbidden from allocating PTYs.
+	pub pty_denied:          bool,
+	/// Provider pinned by an invocation API-key lease.
+	pub credential_provider: Option<ProviderId>,
+	/// Generic invocation key held only by the inference broker overlay.
+	pub api_key:              Option<SecretString>,
+	/// Opaque prompt-cache identity lowered by compatible codecs.
+	pub prompt_cache_affinity: Option<Str>,
 	/// Session-incarnation fence stamped onto observable events.
 	pub session_generation:  u64,
 }
@@ -77,6 +85,24 @@ impl HeadlessSession {
 	/// Constructs the production Environment, v4 journal, agent loop, tree,
 	/// extension sink, approval route, and lossless event subscription.
 	pub async fn open(data_dir: PathBuf, options: HeadlessSessionOptions) -> miette::Result<Self> {
+		Self::open_inner(data_dir, options, None).await
+	}
+
+	/// Constructs a production session over an exact command-owned tool
+	/// registry while retaining the normal Environment and inference owners.
+	pub(crate) async fn open_with_registry(
+		data_dir: PathBuf,
+		options: HeadlessSessionOptions,
+		registry: Arc<omp_tool::Registry>,
+	) -> miette::Result<Self> {
+		Self::open_inner(data_dir, options, Some(registry)).await
+	}
+
+	async fn open_inner(
+		data_dir: PathBuf,
+		options: HeadlessSessionOptions,
+		registry_override: Option<Arc<omp_tool::Registry>>,
+	) -> miette::Result<Self> {
 		let root =
 			chat::canonical_project(&options.project).map_err(|error| miette::miette!(error))?;
 		let catalog = omp_llm_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
@@ -93,13 +119,16 @@ impl HeadlessSession {
 			&crate::project_state::environment_socket(&state_dir),
 			&crate::project_state::document_socket(&state_dir),
 			options.py_eval,
+			&[],
 			settings.runtime_durations().interrupt_grace,
 		)
 		.await
 		.map_err(|error| miette::miette!(error))
 		.wrap_err("could not start the project Environment for headless mode")?;
-		let env = environment.client().clone();
-		let registry = environment.registry();
+		let grant = omp_env::InvocationGrant::unrestricted();
+		let grant = if options.pty_denied { grant.deny_pty() } else { grant };
+		let env = environment.client().with_invocation_grant(grant);
+		let registry = registry_override.unwrap_or_else(|| environment.registry());
 		let open = if let Some(source) = options.fork.as_ref() {
 			chat::SessionOpen::Fork(source)
 		} else if let Some(source) = options.resume.as_ref() {
@@ -150,9 +179,18 @@ impl HeadlessSession {
 		};
 		let state = AgentState::new(snapshot);
 		let (inference_registry, inference, credential_authority) =
-			crate::daemon::production_inference(&data_dir, Arc::clone(&registry), Some(&root))
-				.await
-				.into_diagnostic()?;
+			crate::daemon::production_inference_for_session(
+				&data_dir,
+				Arc::clone(&registry),
+				Some(&root),
+				crate::daemon::InferenceSessionOverrides {
+					provider: options.credential_provider,
+					api_key: options.api_key,
+					prompt_cache_affinity: options.prompt_cache_affinity,
+				},
+			)
+			.await
+			.into_diagnostic()?;
 		let _ = environment.search_bridge().bind(inference.clone());
 		let _ = environment.github_credentials().bind(credential_authority);
 		let client = InProcTurnClient::new(inference).await.into_diagnostic()?;
@@ -352,6 +390,30 @@ impl HeadlessSession {
 			.state
 			.update(|snapshot| snapshot.turn.params.thinking = thinking);
 	}
+	/// Installs a strict command-owned JSON response schema for later turns.
+	pub(crate) fn set_response_schema(
+		&self,
+		name: &'static str,
+		schema: serde_json::Value,
+	) -> Result<(), serde_json::Error> {
+		let schema_json = serde_json::to_vec(&schema)?;
+		self.state.update(|snapshot| {
+			snapshot.turn.params.response_format =
+				Some(omp_proto::inference::v1::ResponseFormat {
+					kind: Some(
+						omp_proto::inference::v1::response_format::Kind::JsonSchema(
+							omp_proto::inference::v1::response_format::JsonSchema {
+								name: name.to_owned(),
+								schema_json: schema_json.into(),
+								strict: Some(true),
+							},
+						),
+					),
+					on_unsupported: omp_proto::inference::v1::Fallback::Error as i32,
+				});
+		});
+		Ok(())
+	}
 
 	/// Interrupts the active caller submission without waiting for settlement.
 	pub fn interrupt(&self) {
@@ -448,6 +510,10 @@ impl HeadlessSession {
 	/// Returns the session-owned finalizer for authority registration.
 	pub const fn finalizer_mut(&mut self) -> &mut HeadlessFinalizerHandle {
 		&mut self.finalizer
+	}
+	/// Disposes the live session without running mode-specific finalizers.
+	pub(crate) async fn dispose(&mut self) {
+		let _ = self.session.dispose().await;
 	}
 
 	/// Runs ordered bounded finalization. Dropping this session afterward

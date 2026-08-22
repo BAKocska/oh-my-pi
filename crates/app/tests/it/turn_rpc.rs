@@ -297,11 +297,11 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 	let client = RpcTurnClient::new(channel);
 	let thread = user_thread();
 	let options = TurnOptions {
-		context_id:     Some(sf!("context-1")),
-		params:         pb::ChatParams { model, ..Default::default() },
-		executor:       Some(pb::Executor { tools: vec!["exec.shell".to_owned()] }),
-		props:          None,
-		provider_reset: false,
+		context_id:      Some(sf!("context-1")),
+		params:          pb::ChatParams { model, ..Default::default() },
+		executor:        Some(pb::Executor { tools: vec!["exec.shell".to_owned()] }),
+		props:           None,
+		provider_reset:  false,
 		stream_watchdog: omp_agent::StreamWatchdog::default(),
 	};
 

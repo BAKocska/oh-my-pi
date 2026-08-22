@@ -82,6 +82,8 @@ pub struct InferenceRpc {
 	contexts:            Arc<Mutex<BTreeMap<String, RpcContext>>>,
 	generations:         Arc<Mutex<BTreeMap<String, RpcGeneration>>>,
 	search_settings:     Arc<omp_llm_inference::search_settings::WebSearchSettings>,
+	session_provider:    Option<ProviderId>,
+	prompt_cache_affinity: Option<Str>,
 }
 
 #[derive(Clone, Default)]
@@ -160,6 +162,8 @@ impl InferenceRpc {
 			contexts: Arc::new(Mutex::new(BTreeMap::new())),
 			generations: Arc::new(Mutex::new(BTreeMap::new())),
 			search_settings: Arc::new(Default::default()),
+			session_provider: None,
+			prompt_cache_affinity: None,
 		}
 	}
 
@@ -169,6 +173,19 @@ impl InferenceRpc {
 		settings: omp_llm_inference::search_settings::WebSearchSettings,
 	) -> Self {
 		self.search_settings = Arc::new(settings);
+		self
+	}
+	/// Applies invocation-scoped routing and prompt-cache affinity.
+	///
+	/// These values live only on this RPC facade and are never projected into
+	/// agent state or transcript items.
+	pub fn with_session_overrides(
+		mut self,
+		provider: Option<ProviderId>,
+		prompt_cache_affinity: Option<Str>,
+	) -> Self {
+		self.session_provider = provider;
+		self.prompt_cache_affinity = prompt_cache_affinity;
 		self
 	}
 
@@ -222,7 +239,19 @@ impl InferenceRpc {
 			if catalog.model(ModelKey::from_ref(selector)).is_none()
 				&& let Some(spec) = catalog.resolve_alias(selector)
 			{
+				if let Some(provider) = &self.session_provider {
+					return Ok(Target::Provider {
+						provider: provider.clone(),
+						model: spec.key.clone(),
+					});
+				}
 				return Ok(Target::Model(spec.key.clone()));
+			}
+			if let Some(provider) = &self.session_provider {
+				return Ok(Target::Provider {
+					provider: provider.clone(),
+					model: ModelKey::from(selector),
+				});
 			}
 			return Ok(Target::Model(ModelKey::from(selector)));
 		}
@@ -355,6 +384,7 @@ impl InferenceRpc {
 					revision: revision.clone(),
 					turn,
 					strategy,
+					prompt_cache_affinity: self.prompt_cache_affinity.clone(),
 					append_only: true,
 					provider_reset,
 					forked: false,
@@ -462,6 +492,7 @@ impl InferenceRpc {
 					revision,
 					turn,
 					strategy,
+					prompt_cache_affinity: self.prompt_cache_affinity.clone(),
 					append_only: true,
 					provider_reset,
 					forked,

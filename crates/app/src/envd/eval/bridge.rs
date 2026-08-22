@@ -698,7 +698,23 @@ impl SessionBridgeHost {
 		owner: &str,
 		session: &Bytes,
 	) -> Result<RuntimeSnapshot, BridgeHostError> {
-		let (binding_owner, generation, parent) = self.parent_for(owner)?;
+		// No bound parent session (bare in-process embedder): cells still run,
+		// scoped to the daemon's working directory, but no runtime lease exists
+		// so parent-backed helpers (completion/agent/budget) stay unavailable.
+		let Ok((binding_owner, generation, parent)) = self.parent_for(owner) else {
+			let cwd = std::env::current_dir()
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
+			return Ok(RuntimeSnapshot {
+				cwd:         Some(cwd),
+				managed_env: [
+					(sf!("OMP_EVAL_LOCAL_ROOTS"), None),
+					(sf!("OMP_ARTIFACTS_DIR"), None),
+					(sf!("OMP_SESSION_FILE"), None),
+				]
+				.into_iter()
+				.collect(),
+			});
+		};
 		let config = parent.eval_session_config()?;
 		self
 			.runtime_snapshots
@@ -756,12 +772,28 @@ impl SessionBridgeHost {
 		args: Value,
 		progress: &dyn BridgeProgressSink,
 	) -> Result<Value, BridgeHostError> {
-		let (binding_owner, generation, parent) = self
+		let lease = self
 			.runtime_snapshots
 			.lock()
 			.get(&(Str::new(owner), session.clone()))
-			.map(|lease| (lease.binding_owner.clone(), lease.generation, Arc::clone(&lease.parent)))
-			.ok_or_else(|| BridgeHostError::message("eval bridge runtime lease is not active"))?;
+			.map(|lease| (lease.binding_owner.clone(), lease.generation, Arc::clone(&lease.parent)));
+		let Some((binding_owner, generation, parent)) = lease else {
+			// Bare in-process sessions carry no parent lease: registry-backed
+			// native tools stay available while parent-scoped helpers fail with
+			// their typed absence below.
+			if matches!(name, COMPLETION | AGENT | CONCURRENCY | BUDGET) {
+				return Err(BridgeHostError::message(
+					"eval bridge parent session is not bound for this owner",
+				));
+			}
+			let registry = self
+				.registry
+				.get()
+				.ok_or_else(|| BridgeHostError::message("eval bridge registry is not bound"))?;
+			return RegistryBridgeHost::new(Arc::clone(registry))
+				.call(name, args, progress)
+				.await;
+		};
 		if !self
 			.parents
 			.lock()

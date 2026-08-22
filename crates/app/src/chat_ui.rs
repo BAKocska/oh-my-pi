@@ -29,7 +29,7 @@ use omp_chat_ui::{
 	completion::{
 		CompletionChain, CompletionQuery, CompletionSource, CompletionTrigger, DeferredCompletion,
 	},
-	host::{HostExit, HostOptions},
+	host::HostOptions,
 };
 use omp_core::{EnvPath, Hash32, SecretString, Str, encoding::hex, sf};
 use omp_llm_catalog::{
@@ -130,6 +130,7 @@ pub enum ChatAuthCommand {
 }
 
 /// Non-blocking command and event channels for provider authentication.
+#[derive(Clone)]
 pub struct ChatAuth {
 	commands: flume::Sender<ChatAuthCommand>,
 	events:   flume::Receiver<ChatAuthEvent>,
@@ -488,6 +489,33 @@ fn subscribe_chat_events(bus: &omp_agent::EventBus) -> omp_agent::EventSubscript
 	bus.subscribe_lossless()
 }
 
+fn replica_items(path: &std::path::Path, registry: &Registry) -> miette::Result<Vec<Item>> {
+	let log = omp_storage::transcript::load(path).into_diagnostic()?;
+	let mut live = omp_storage::transcript::LiveSet::new();
+	log.live_into(&mut live);
+	Ok(omp_agent::project_journal(&log, &live, registry, &crate::chat::CHAT_CAPS_BASE)
+		.into_diagnostic()?
+		.items)
+}
+
+async fn next_replica_update(
+	updates: &mut Option<tokio::sync::watch::Receiver<omp_collab::guest::GuestReplicaProjection>>,
+) -> Option<omp_collab::guest::GuestReplicaProjection> {
+	let updates = updates.as_mut()?;
+	updates.changed().await.ok()?;
+	let projection = updates.borrow_and_update().clone();
+	Some(projection)
+}
+
+async fn next_presence_update(
+	presence: &mut Option<tokio::sync::watch::Receiver<Option<omp_collab::presence::PresenceFacts>>>,
+) -> Option<Option<omp_collab::presence::PresenceFacts>> {
+	let presence = presence.as_mut()?;
+	presence.changed().await.ok()?;
+	let facts = *presence.borrow_and_update();
+	Some(facts)
+}
+
 fn structural_roster(
 	sources: &[Vec<CommandContribution>],
 	security_enabled: bool,
@@ -548,8 +576,36 @@ fn command_role(collab: Option<&crate::collab::session::CollabCommandHandle>) ->
 		CommandRole::Owner
 	}
 }
+struct ChatSceneSeed {
+	typed_commands: commands::CommandRoster,
+	role:           CommandRole,
+	workspace_root: PathBuf,
+	composer_style: omp_tui::components::ComposerStyle,
+}
 
-pub async fn run<'a, C, R>(
+fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
+	let mut chat = Chat::new(ctx);
+	let accent_keywords: Arc<[Str]> = omp_agent::prompt_assets::PROMPT_KEYWORDS
+		.iter()
+		.map(|keyword| Str::from(keyword.text))
+		.collect();
+	chat.set_keyword_accent(KeywordAccent::from_shared(accent_keywords));
+	let completion = CompletionChain::new()
+		.source(Box::new(SlashCommands::new(seed.typed_commands.completions_for(seed.role))))
+		.source(Box::new(DeferredCompletion::new(
+			[
+				('@', CompletionTrigger::Mention),
+				('#', CompletionTrigger::Hash),
+				(':', CompletionTrigger::Custom),
+			],
+			Arc::new(ProjectCompletionSource::scan(&seed.workspace_root)),
+		)));
+	chat.set_completion(Box::new(completion));
+	chat.set_composer_style(seed.composer_style);
+	chat
+}
+
+pub async fn run<C, R>(
 	mut agent: Agent<C>,
 	session: ChatUiSession,
 	registry: Arc<Registry>,
@@ -557,7 +613,7 @@ pub async fn run<'a, C, R>(
 	parent: Arc<crate::chat::ChatParentHost<C>>,
 	collab: Option<crate::collab::session::CollabCommandHandle>,
 	modes: Arc<CampaignHandle>,
-	auth: Option<&'a ChatAuth>,
+	auth: Option<ChatAuth>,
 	data_dir: PathBuf,
 	workspace_root: PathBuf,
 	local_root: PathBuf,
@@ -569,15 +625,29 @@ pub async fn run<'a, C, R>(
 	mut list_sessions: R,
 	welcome: bool,
 	initial_draft: Str,
+	presentation: crate::chat::ChatPresentation,
 ) -> miette::Result<omp_chat_ui::host::HostOutcome>
 where
 	C: TurnClient + Clone + Send + 'static,
-	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + 'a,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send + 'static,
 {
 	let bus = agent.events().clone();
 	let environment = agent.environment();
 	let mailbox = agent.mailbox();
 	let control = agent.control();
+	let mut replica_updates = collab
+		.as_ref()
+		.and_then(crate::collab::session::CollabCommandHandle::guest_replica)
+		.map(|replica| replica.subscribe());
+	let mut collab_presence = collab
+		.as_ref()
+		.map(crate::collab::session::CollabCommandHandle::subscribe_presence);
+	let local_session_path = crate::project_state::directory(&data_dir, &workspace_root)
+		.into_diagnostic()?
+		.join("sessions")
+		.join(format!("{}.jsonl", session.session_id));
+	let mut session_restore = omp_collab::guest::GuestSessionRestore::default();
+	let mut guest_projected = false;
 	// Turn deltas and their authoritative outcome share this stream. Dropping
 	// either can leave a blank or permanently partial transcript.
 	let agent_events = subscribe_chat_events(&bus);
@@ -719,26 +789,10 @@ where
 
 	let caps = detect();
 	let ctx = UiContext::default().with_terminal_caps(&caps);
-	let mut chat = Chat::new(&ctx);
-	let accent_keywords: Arc<[Str]> = omp_agent::prompt_assets::PROMPT_KEYWORDS
-		.iter()
-		.map(|keyword| Str::from(keyword.text))
-		.collect();
-	chat.set_keyword_accent(KeywordAccent::from_shared(accent_keywords));
 	let typed_commands = structural_roster(&command_sources, security_enabled);
+	let chat_commands = typed_commands.clone();
 	let commands = CommandRoster::new(command_sources);
 	let initial_command_role = command_role(collab.as_ref());
-	let completion = CompletionChain::new()
-		.source(Box::new(SlashCommands::new(typed_commands.completions_for(initial_command_role))))
-		.source(Box::new(DeferredCompletion::new(
-			[
-				('@', CompletionTrigger::Mention),
-				('#', CompletionTrigger::Hash),
-				(':', CompletionTrigger::Custom),
-			],
-			Arc::new(ProjectCompletionSource::scan(&workspace_root)),
-		)));
-	chat.set_completion(Box::new(completion));
 	let (backend_tx, backend_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
 	let snapshot = agent_state.snapshot();
@@ -807,7 +861,12 @@ where
 		skills,
 		approvals: HashMap::new(),
 	};
-	chat.set_composer_style(state.settings.composer.shape);
+	let chat_seed = ChatSceneSeed {
+		typed_commands: chat_commands,
+		role: initial_command_role,
+		workspace_root,
+		composer_style: state.settings.composer.shape,
+	};
 
 	send_backend(&backend_tx, BackendEvent::ModelsUpdated {
 		rows:    model_rows(Catalog::embedded()),
@@ -847,7 +906,7 @@ where
 												&agent_state,
 												&modes,
 																					parent.as_ref(),
-			auth,
+			auth.as_ref(),
 												&data_dir,
 												&mut list_sessions,
 												&bus,
@@ -890,7 +949,7 @@ where
 												.await;
 											}
 						},
-										Some(event) = next_auth_event(auth) => {
+										Some(event) = next_auth_event(auth.as_ref()) => {
 											handle_auth_event(&backend_tx, &mut state, event);
 										},
 										Some(request) = next_approval_request(&mut approval_inbox) => {
@@ -901,7 +960,75 @@ where
 											);
 											state.approvals.insert(ticket_id, request);
 										},
+										Some(projection) = next_replica_update(&mut replica_updates) => {
+											if projection.gap {
+												send_backend(
+													&backend_tx,
+													BackendEvent::Error(sf!(
+														"Collaboration transcript gap detected; requesting a fresh snapshot."
+													)),
+												);
+											} else if projection.ready
+												&& let Some(path) = projection.path.as_deref()
+											{
+												match replica_items(path, registry.as_ref()) {
+													Ok(items) => {
+														if !guest_projected {
+															session_restore.begin(Some(&local_session_path));
+															guest_projected = true;
+														}
+														state.tools.clear();
+														state.part_serial = 0;
+														send_backend(&backend_tx, BackendEvent::HistoryCleared);
+														replay_items(
+															&backend_tx,
+															&items,
+															&mut state.tools,
+															&mut state.part_serial,
+															registry.as_ref(),
+														);
+													},
+													Err(error) => send_backend(
+														&backend_tx,
+														BackendEvent::Error(sf!(
+															"Could not project collaboration transcript: {error}"
+														)),
+													),
+												}
+											}
+										},
+										Some(presence) = next_presence_update(&mut collab_presence) => {
+											if presence.is_none() && guest_projected {
+												if let Some(restore) = session_restore.take() {
+													state.tools.clear();
+													state.part_serial = 0;
+													send_backend(&backend_tx, BackendEvent::HistoryCleared);
+													if let omp_collab::guest::LocalSessionRestore::Saved(path) = restore {
+														match replica_items(&path, registry.as_ref()) {
+															Ok(items) => replay_items(
+																&backend_tx,
+																&items,
+																&mut state.tools,
+																&mut state.part_serial,
+																registry.as_ref(),
+															),
+															Err(error) => send_backend(
+																&backend_tx,
+																BackendEvent::Error(sf!(
+																	"Could not restore local transcript: {error}"
+																)),
+															),
+														}
+													}
+												}
+												guest_projected = false;
+											}
+											send_status(&backend_tx, &state, &bus, 0);
+										},
 										Ok(event) = agent_events.recv() => {
+											if guest_projected {
+												continue;
+											}
 											if matches!(&*event, AgentEvent::RosterChanged { .. }) {
 												publish_agent_roster(&backend_tx, &parent, &tree, &session_id, &mut last_roster);
 											} else {
@@ -941,21 +1068,46 @@ where
 		Ok::<(), miette::Report>(())
 	};
 
-	let host = omp_chat_ui::host::run_with_draft(
-		chat,
-		ctx,
-		backend_rx,
-		intent_tx,
-		HostOptions {
-			welcome,
-			exit_on_session_change: true,
-			completion_notify: true,
-			error_notify: true,
-			title_enabled,
+	let options = HostOptions {
+		welcome,
+		exit_on_session_change: true,
+		completion_notify: true,
+		error_notify: true,
+		title_enabled,
+	};
+	let (host_result, bridge_result): (
+		miette::Result<omp_chat_ui::host::HostOutcome>,
+		miette::Result<()>,
+	) = match presentation {
+		crate::chat::ChatPresentation::Terminal => {
+			let host = omp_chat_ui::host::run_with_draft(
+				chat_scene(&chat_seed, &ctx),
+				ctx,
+				backend_rx,
+				intent_tx,
+				options,
+				initial_draft,
+			);
+			let (host_result, bridge_result) = tokio::join!(host, bridge);
+			(host_result.into_diagnostic(), bridge_result)
 		},
-		initial_draft,
-	);
-	let (host_result, bridge_result) = tokio::join!(host, bridge);
+		crate::chat::ChatPresentation::Gui => {
+			let (host_result, bridge_result) = crate::gui::run(
+				move |ctx| {
+					omp_chat_ui::host::RetainedChat::new(
+						chat_scene(&chat_seed, ctx),
+						ctx.clone(),
+						backend_rx,
+						intent_tx,
+						options,
+						initial_draft,
+					)
+				},
+				bridge,
+			);
+			(Ok(host_result), bridge_result)
+		},
+	};
 	if tokio::time::timeout(Duration::from_secs(3), &mut agent_task)
 		.await
 		.is_err()
@@ -964,8 +1116,214 @@ where
 		let _ = agent_task.await;
 	}
 	bridge_result?;
+	host_result
+}
+
+/// Runs a standalone collaboration composer backed only by the durable guest
+/// transcript projection and the host-authorized prompt forwarding handle.
+pub async fn run_guest(
+	replica: omp_collab::guest::GuestReplicaHandle,
+	collab: crate::collab::session::CollabCommandHandle,
+	registry: Arc<Registry>,
+	initial_draft: Str,
+) -> miette::Result<omp_chat_ui::host::HostOutcome> {
+	let caps = detect();
+	let ctx = UiContext::default().with_terminal_caps(&caps);
+	let chat = Chat::new(&ctx);
+	let (backend_tx, backend_rx) = flume::unbounded();
+	let (intent_tx, intent_rx) = flume::unbounded();
+	let mut updates = replica.subscribe();
+	let mut projection = replica.projection();
+	while !projection.ready {
+		updates.changed().await.into_diagnostic()?;
+		projection = updates.borrow_and_update().clone();
+	}
+	let path = projection
+		.path
+		.as_deref()
+		.ok_or_else(|| miette::miette!("collaboration replica has no durable path"))?;
+	let mut tools = HashMap::new();
+	let mut serial = 0;
+	replay_items(
+		&backend_tx,
+		&replica_items(path, registry.as_ref())?,
+		&mut tools,
+		&mut serial,
+		registry.as_ref(),
+	);
+	send_backend(&backend_tx, BackendEvent::Status(guest_status(&collab)));
+	let mut presence = collab.subscribe_presence();
+
+	let bridge = async {
+		loop {
+			tokio::select! {
+				intent = intent_rx.recv_async() => {
+					let Ok(intent) = intent else { break };
+					match intent {
+						Intent::Quit => break,
+						Intent::Submit { text, attachments, .. } => {
+							let read_only = collab
+								.presence()
+								.is_some_and(|facts| facts.read_only());
+							match omp_collab::guest::admit_guest_input(text.as_str(), read_only) {
+								Ok(omp_collab::guest::GuestInputDisposition::RemotePrompt) => {
+									let mut remote_text = text.to_string();
+									let mut images = Vec::new();
+									for attachment in attachments {
+										match attachment.content {
+											AttachmentContent::Text { text, .. } => {
+												remote_text.push_str("\n\n");
+												remote_text.push_str(text.as_str());
+											},
+											AttachmentContent::Image { source, .. } => {
+												const REMOTE_IMAGE_MAX_BYTES: u64 = 24 * 1024 * 1024;
+												let metadata = tokio::fs::metadata(source.as_str())
+													.await
+													.into_diagnostic()?;
+												if metadata.len() > REMOTE_IMAGE_MAX_BYTES {
+													send_backend(
+														&backend_tx,
+														BackendEvent::Error(sf!(
+															"Collaboration image attachment exceeds 24 MiB."
+														)),
+													);
+													continue;
+												}
+												let data = tokio::fs::read(source.as_str())
+													.await
+													.into_diagnostic()?;
+												let mime_type = image::ImageFormat::from_path(source.as_str())
+													.map(|format| format.to_mime_type())
+													.unwrap_or("application/octet-stream");
+												images.push(crate::collab::session::RemoteImage {
+													data: Bytes::from(data),
+													mime_type: Str::new_static(mime_type),
+												});
+											},
+										}
+									}
+									match collab
+										.request(crate::collab::session::CollabOwnerCommand::Prompt {
+											text: Str::from(remote_text),
+											images,
+										})
+										.await
+									{
+										Ok(_) => send_backend(
+											&backend_tx,
+											BackendEvent::Ack { interrupted: false },
+										),
+										Err(error) => send_backend(
+											&backend_tx,
+											BackendEvent::Error(Str::new(error.to_string())),
+										),
+									}
+								},
+								Ok(omp_collab::guest::GuestInputDisposition::LocalCommand) => {
+									let command = text
+										.trim_start()
+										.trim_start_matches('/')
+										.split_ascii_whitespace()
+										.next()
+										.unwrap_or_default();
+									if matches!(command, "leave" | "quit" | "exit") {
+										let _ = collab
+											.request(crate::collab::session::CollabOwnerCommand::Leave)
+											.await;
+										break;
+									}
+									send_backend(
+										&backend_tx,
+										BackendEvent::Notice(sf!(
+											"`/{command}` is not available in the standalone guest composer."
+										)),
+									);
+								},
+								Err(error) => send_backend(
+									&backend_tx,
+									BackendEvent::Error(Str::new(error.to_string())),
+								),
+							}
+						},
+						_ => {},
+					}
+				},
+				changed = updates.changed() => {
+					if changed.is_err() {
+						break;
+					}
+					let projection = updates.borrow_and_update().clone();
+					if projection.gap {
+						send_backend(
+							&backend_tx,
+							BackendEvent::Error(sf!(
+								"Collaboration transcript gap detected; requesting a fresh snapshot."
+							)),
+						);
+					} else if projection.ready
+						&& let Some(path) = projection.path.as_deref()
+					{
+						match replica_items(path, registry.as_ref()) {
+							Ok(items) => {
+								tools.clear();
+								serial = 0;
+								send_backend(&backend_tx, BackendEvent::HistoryCleared);
+								replay_items(
+									&backend_tx,
+									&items,
+									&mut tools,
+									&mut serial,
+									registry.as_ref(),
+								);
+							},
+							Err(error) => send_backend(
+								&backend_tx,
+								BackendEvent::Error(sf!(
+									"Could not project collaboration transcript: {error}"
+								)),
+							),
+						}
+					}
+				},
+				changed = presence.changed() => {
+					if changed.is_err() {
+						break;
+					}
+					send_backend(&backend_tx, BackendEvent::Status(guest_status(&collab)));
+				},
+			}
+		}
+		Ok::<(), miette::Report>(())
+	};
+
+	let host = omp_chat_ui::host::run_with_draft(
+		chat,
+		ctx,
+		backend_rx,
+		intent_tx,
+		HostOptions {
+			welcome:                false,
+			exit_on_session_change: false,
+			completion_notify:      true,
+			error_notify:           true,
+			title_enabled:          true,
+		},
+		initial_draft,
+	);
+	let (host_result, bridge_result) = tokio::join!(host, bridge);
+	bridge_result?;
 	host_result.into_diagnostic()
 }
+
+fn guest_status(collab: &crate::collab::session::CollabCommandHandle) -> StatusFacts {
+	let presence = collab.presence();
+	StatusFacts {
+		model: sf!("Collaboration"),
+		collab_peers: presence.map_or(0, |facts| facts.participant_count().saturating_sub(1)),
+		..StatusFacts::default()
+	}
+}
+
 fn campaign_status(modes: &CampaignHandle) -> Str {
 	modes.mode_holder().map_or_else(
 		|| sf!("No campaign holds the mode slot."),
@@ -1339,7 +1697,7 @@ impl<R> LiveCommandHost<'_, R> {
 
 impl<R> ShellCommandHost for LiveCommandHost<'_, R>
 where
-	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn help(&mut self) -> CommandFuture<'_> {
 		let help = self.roster.help_text(
@@ -1396,7 +1754,7 @@ where
 
 impl<R> SessionCommandHost for LiveCommandHost<'_, R>
 where
-	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn clear(&mut self) -> CommandFuture<'_> {
 		Box::pin(async move {
@@ -1517,7 +1875,7 @@ where
 
 impl<R> ModelCommandHost for LiveCommandHost<'_, R>
 where
-	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn model(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
 		Box::pin(async move {
@@ -1558,7 +1916,7 @@ where
 
 impl<R> ConfigCommandHost for LiveCommandHost<'_, R>
 where
-	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn settings(&mut self) -> CommandFuture<'_> {
 		send_backend(self.backend, BackendEvent::SettingsSchema(setting_rows(&self.state.settings)));
@@ -1884,7 +2242,7 @@ fn todo_params(
 
 impl<R> FlowCommandHost for LiveCommandHost<'_, R>
 where
-	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn context(&mut self) -> CommandFuture<'_> {
 		let Some(snapshot) = self.state.context_snapshot.as_ref() else {
@@ -2567,7 +2925,7 @@ async fn handle_intent<C, R>(
 ) -> miette::Result<bool>
 where
 	C: TurnClient + Clone + Send + 'static,
-	R: FnMut() -> miette::Result<Vec<ResumeChoice>>,
+	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	match intent {
 		Intent::Submit { text, attachments, mode } => {

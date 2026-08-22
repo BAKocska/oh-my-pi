@@ -193,6 +193,20 @@ pub enum ChatError {
 		/// Preformatted nearest-key hint, or empty.
 		suggestions: Str,
 	},
+	/// The selected model has no route for the requested credential provider.
+	#[error("model `{model}` is not served by provider `{provider}`")]
+	ModelProviderUnavailable {
+		/// Canonical selected model.
+		model:    Str,
+		/// Provider requested or selected for the invocation credential.
+		provider: omp_llm_catalog::ProviderId,
+	},
+	/// The selected model has no concrete provider route.
+	#[error("model `{model}` has no provider route")]
+	ModelHasNoProvider {
+		/// Canonical selected model.
+		model: Str,
+	},
 	/// The session-scoped eval parent bridge could not be bound.
 	#[error("eval session bridge failed: {0}")]
 	EvalBridge(Str),
@@ -2448,6 +2462,14 @@ pub(crate) enum ChatStart {
 	/// Open the alternate-screen session index before the transcript.
 	SessionIndex,
 }
+/// Presentation selected for the interactive project-chat session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChatPresentation {
+	/// Render through the inline terminal host.
+	Terminal,
+	/// Render through the native GPU window host.
+	Gui,
+}
 
 /// Runs one interactive durable project-chat session.
 #[cfg(any(unix, windows))]
@@ -2455,7 +2477,11 @@ pub(crate) enum ChatStart {
 	clippy::future_not_send,
 	reason = "the interactive chat future owns a thread-confined terminal scene"
 )]
-pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<()> {
+pub(crate) async fn run(
+	args: ChatArgs,
+	mut start: ChatStart,
+	presentation: ChatPresentation,
+) -> miette::Result<()> {
 	use miette::{Context as _, IntoDiagnostic as _};
 	let launch_root = canonical_project(&args.project).map_err(|e| miette::miette!(e))?;
 	let data_dir = crate::cli::data_dir(None)?;
@@ -2572,6 +2598,17 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 		},
 		Err(error) => return Err(miette::miette!(error).into()),
 	};
+	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
+		return Err(miette::miette!(
+			"--api-key requires a model to be specified via --model or --models"
+		));
+	}
+	let credential_provider = args
+		.api_key
+		.as_ref()
+		.map(|_| resolve_model_provider(catalog, model.as_str(), args.provider.as_deref()))
+		.transpose()
+		.map_err(|error| miette::miette!(error))?;
 	let state_dir =
 		crate::project_state::directory(&data_dir, &root).map_err(|e| miette::miette!(e))?;
 	ensure_state_directory(&state_dir).map_err(|e| miette::miette!(e))?;
@@ -2600,6 +2637,7 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 		&env_socket,
 		&document_socket,
 		args.py_eval,
+		&args.trusted_extensions,
 		interrupt_grace,
 	)
 	.await
@@ -2683,7 +2721,6 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 	} else {
 		None
 	};
-	let env = environment.client().clone();
 	let eval_bridge = environment.eval_bridge();
 	let eval_control = environment.eval_control();
 
@@ -2776,8 +2813,9 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 	snapshot.workspace.model.identifier = Str::new(&snapshot.turn.params.model);
 	snapshot.workspace.model.codex_task_policy =
 		crate::task::prompt_policy::uses_codex_task_prompt(&snapshot.turn.params.model);
-	apply_launch_tool_selection(&mut snapshot, &args, registry.as_ref())
+	let invocation_grant = apply_launch_tool_selection(&mut snapshot, &args, registry.as_ref())
 		.map_err(|error| miette::miette!(error))?;
+	let env = environment.client().with_invocation_grant(invocation_grant);
 	let settings_manager = crate::settings::manager::SettingsManager::open(
 		crate::settings::manager::SettingsPaths::discover(&data_dir, Some(&root)),
 	)
@@ -2852,7 +2890,13 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 	let initial_campaign = args.plan_mode.then_some("plan");
 
 	if let Some(endpoint) = args.gateway {
-		let channel = omp_rpc::uds::connect(endpoint.as_path())
+		if args.api_key.is_some() || args.prompt_cache_key.is_some() {
+			return Err(miette::miette!(
+				"--api-key and --prompt-cache-key require in-process inference"
+			));
+		}
+		let channel = endpoint
+			.connect()
 			.await
 			.into_diagnostic()
 			.wrap_err_with(|| format!("could not connect to {endpoint}"))?;
@@ -2886,14 +2930,24 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 				persist_sessions: !args.no_session,
 			},
 			start,
+			presentation,
 		))
 		.await
 		.into_diagnostic()?;
 	} else {
 		let (inference_registry, inference, credential_authority) =
-			crate::daemon::production_inference(&data_dir, Arc::clone(&registry), Some(&root))
-				.await
-				.into_diagnostic()?;
+			crate::daemon::production_inference_for_session(
+				&data_dir,
+				Arc::clone(&registry),
+				Some(&root),
+				crate::daemon::InferenceSessionOverrides {
+					provider:              credential_provider,
+					api_key:               args.api_key.clone(),
+					prompt_cache_affinity: args.prompt_cache_key.clone(),
+				},
+			)
+			.await
+			.into_diagnostic()?;
 		environment
 			.search_bridge()
 			.bind(inference.clone())
@@ -2932,6 +2986,7 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 				persist_sessions: !args.no_session,
 			},
 			start,
+			presentation,
 		))
 		.await
 		.into_diagnostic()?;
@@ -2946,7 +3001,11 @@ pub(crate) async fn run(args: ChatArgs, mut start: ChatStart) -> miette::Result<
 
 /// Reports the platform limitation before touching project state.
 #[cfg(not(any(unix, windows)))]
-pub(crate) async fn run(_args: ChatArgs, _start: ChatStart) -> miette::Result<()> {
+pub(crate) async fn run(
+	_args: ChatArgs,
+	_start: ChatStart,
+	_presentation: ChatPresentation,
+) -> miette::Result<()> {
 	use miette::IntoDiagnostic as _;
 	Err(ChatError::UnsupportedPlatform).into_diagnostic()
 }
@@ -3008,6 +3067,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 	title_enabled: bool,
 	scope: ChatScope<'_>,
 	mut start: ChatStart,
+	presentation: ChatPresentation,
 ) -> Result<(), ChatError> {
 	let memory_source = Arc::new(crate::memory::RuntimePromptMemorySource::new(
 		environment.memory_runtime(),
@@ -3235,7 +3295,15 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 		let approval_book = Arc::new(omp_agent::ApprovalBook::new());
 		let (_approval_route, approval_inbox) =
 			omp_agent::ApprovalRoute::new(Arc::clone(&approval_book));
-		let (collab_authority, collab) = crate::collab::session::CollabSessionAuthority::new();
+		let (replica_pump, replica) = omp_collab::guest::GuestRelayPump::new(
+			data_dir.join("collab"),
+			scope.root.to_path_buf(),
+			now_ms(),
+		);
+		let replica_shutdown = replica.clone();
+		let mut replica_task = tokio::spawn(replica_pump.run());
+		let (collab_authority, collab) =
+			crate::collab::session::CollabSessionAuthority::with_guest_replica(Some(replica));
 		let mut collab_task = crate::collab::session::spawn_session_owner(collab_authority);
 		let title = scope
 			.session_index
@@ -3256,7 +3324,7 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			Arc::clone(&parent),
 			Some(collab),
 			modes,
-			auth.as_ref().map(|worker| &worker.ui),
+			auth.as_ref().map(|worker| worker.ui().clone()),
 			data_dir.clone(),
 			scope.root.to_path_buf(),
 			session_root.join("local"),
@@ -3265,11 +3333,25 @@ async fn run_ui<C: TurnClient + Clone + Send + 'static>(
 			vec![content.commands.to_vec()],
 			content.skills,
 			Some(approval_inbox),
-			|| resume_choices(scope.sessions_dir, scope.root, Some(&current_id)).into_diagnostic(),
+			{
+				let sessions_dir = scope.sessions_dir.to_path_buf();
+				let root = scope.root.to_path_buf();
+				let current_id = current_id.clone();
+				move || resume_choices(&sessions_dir, &root, Some(&current_id)).into_diagnostic()
+			},
 			matches!(start, ChatStart::SessionIndex),
 			Str::from(initial_draft),
+			presentation,
 		)
 		.await;
+		replica_shutdown.stop().await;
+		if tokio::time::timeout(Duration::from_secs(3), &mut replica_task)
+			.await
+			.is_err()
+		{
+			replica_task.abort();
+			let _ = replica_task.await;
+		}
 		if let Some(task) = autolearn_task {
 			task.abort();
 			let _ = task.await;
@@ -3551,6 +3633,37 @@ pub(crate) fn resolve_model_selector(
 	};
 	Err(ChatError::UnknownModel { selector: selector.into(), suggestions })
 }
+/// Selects the exact provider domain receiving an invocation credential.
+pub(crate) fn resolve_model_provider(
+	catalog: &omp_llm_catalog::snapshot::Catalog,
+	model: &str,
+	requested: Option<&str>,
+) -> Result<omp_llm_catalog::ProviderId, ChatError> {
+	let spec = catalog
+		.model(omp_llm_catalog::ModelKey::from_ref(model))
+		.ok_or_else(|| ChatError::UnknownModel {
+			selector:    model.into(),
+			suggestions: Str::empty(),
+		})?;
+	if let Some(requested) = requested {
+		let provider = omp_llm_catalog::ProviderId::from(requested);
+		if spec.routes.iter().any(|route| {
+			catalog
+				.route(route)
+				.is_some_and(|route| route.provider == provider)
+		}) {
+			return Ok(provider);
+		}
+		return Err(ChatError::ModelProviderUnavailable { model: model.into(), provider });
+	}
+	spec
+		.routes
+		.iter()
+		.filter_map(|route| catalog.route(route))
+		.next()
+		.map(|route| route.provider.clone())
+		.ok_or_else(|| ChatError::ModelHasNoProvider { model: model.into() })
+}
 
 pub(crate) fn canonical_project(path: &Path) -> Result<PathBuf, ChatError> {
 	let root = std::fs::canonicalize(path)
@@ -3641,7 +3754,7 @@ pub(crate) fn open_session(
 	Ok(Session { id, journal, initial_items })
 }
 
-fn create_indexed_journal(
+pub(crate) fn create_indexed_journal(
 	path: &Path,
 	root: &Path,
 	id: &Str,
@@ -4087,7 +4200,7 @@ fn apply_launch_tool_selection(
 	snapshot: &mut AgentSnapshot,
 	args: &ChatArgs,
 	registry: &Registry,
-) -> Result<(), ChatError> {
+) -> Result<omp_env::InvocationGrant, ChatError> {
 	let known = registry
 		.prompt_projection(None)
 		.entries()
@@ -4127,7 +4240,8 @@ fn apply_launch_tool_selection(
 		.filter(|name| allowed(name))
 		.cloned()
 		.collect();
-	Ok(())
+	let grant = omp_env::InvocationGrant::unrestricted();
+	Ok(if args.no_pty { grant.deny_pty() } else { grant })
 }
 
 fn thinking_effort(

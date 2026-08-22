@@ -32,7 +32,8 @@ pub use registry::{
 pub use result::{CommandResult, ConsumedResult, DispatchResult, PromptResult};
 
 /// Cold command future allocated only after an explicit user command.
-pub type CommandFuture<'a> = Pin<Box<dyn Future<Output = miette::Result<CommandResult>> + 'a>>;
+pub type CommandFuture<'a> =
+	Pin<Box<dyn Future<Output = miette::Result<CommandResult>> + Send + 'a>>;
 
 /// Erased structural handler generated beside its command declaration.
 pub type CommandHandler =
@@ -518,6 +519,7 @@ pub trait FlowCommandHost {
 /// Complete command host assembled from capability-scoped interfaces.
 pub trait CommandHost:
 	ShellCommandHost + SessionCommandHost + ModelCommandHost + ConfigCommandHost + FlowCommandHost
+ + Send
 {
 }
 
@@ -527,6 +529,7 @@ impl<T> CommandHost for T where
 		+ ModelCommandHost
 		+ ConfigCommandHost
 		+ FlowCommandHost
+		+ Send
 {
 }
 

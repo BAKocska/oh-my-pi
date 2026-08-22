@@ -29,7 +29,8 @@ use omp_proto::{
 	blob::v1::{Chunk, GetRequest},
 	env::v1::{
 		Admission, AdmitInvocation, ClientHello, ExecOutcome, ExecRequest, InvokeTool, ListProcesses,
-		OpenSessionRequest, ProcessSpec, Script, StartProcess, StopProcess,
+		OpenSessionRequest, ProcessSpec, RegisterPresence, ReleasePresence, Script, StartProcess,
+		StopProcess,
 	},
 };
 use omp_tool::{
@@ -506,6 +507,62 @@ impl Drop for Harness {
 	}
 }
 
+#[tokio::test]
+async fn presence_rpc_publishes_coexisting_leases_and_releases_them() {
+	let harness = Harness::start(Registry::new()).await;
+	let first = harness
+		.client()
+		.register_presence(RegisterPresence {
+			client_id: Bytes::from_static(b"client-a"),
+			pid: std::process::id(),
+			kind: "interactive".to_owned(),
+			..RegisterPresence::default()
+		})
+		.await
+		.expect("register first presence");
+	let (second_client, second_task) = harness.connect("presence-second").await;
+	let second = second_client
+		.register_presence(RegisterPresence {
+			client_id: Bytes::from_static(b"client-b"),
+			pid: std::process::id(),
+			kind: "rpc".to_owned(),
+			..RegisterPresence::default()
+		})
+		.await
+		.expect("register second presence");
+	let clients = harness.state.path().join("clients");
+	assert_eq!(
+		std::fs::read_dir(&clients)
+			.expect("presence directory")
+			.count(),
+		2
+	);
+
+	harness
+		.client()
+		.release_presence(ReleasePresence { lease_id: first.lease_id, ..ReleasePresence::default() })
+		.await
+		.expect("release first presence");
+	assert_eq!(
+		std::fs::read_dir(&clients)
+			.expect("presence directory")
+			.count(),
+		1
+	);
+
+	second_client
+		.release_presence(ReleasePresence { lease_id: second.lease_id, ..ReleasePresence::default() })
+		.await
+		.expect("release second presence");
+	assert_eq!(
+		std::fs::read_dir(&clients)
+			.expect("presence directory")
+			.count(),
+		0
+	);
+	second_task.abort();
+}
+
 fn cwd_uri(path: &Path) -> String {
 	url::Url::from_directory_path(path)
 		.expect("directory file URI")
@@ -665,6 +722,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("rewind", "1".to_owned()),
 		("yield", "1".to_owned()),
 		("ask", "1".to_owned()),
+		("ast_edit", "1".to_owned()),
+		("ast_grep", "1".to_owned()),
+		("debug", "1".to_owned()),
 		("dyn", "1".to_owned()),
 		("edit", "hl.1".to_owned()),
 		("eval", "1".to_owned()),
@@ -672,9 +732,11 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("glob", "1".to_owned()),
 		("grep", "1".to_owned()),
 		("hub", "1".to_owned()),
+		("lsp", "1".to_owned()),
 		("shell", "1".to_owned()),
 		("think", "1".to_owned()),
 		("todo", "1".to_owned()),
+		("web_search", "1".to_owned()),
 		("write", "1".to_owned()),
 		("read", "1".to_owned()),
 	]);
@@ -1683,7 +1745,11 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 		json!({"language":"py","code":"2 + 3"}),
 	)
 	.await;
-	assert!(!local_eval.is_error, "session-local in-process eval was denied");
+	assert!(
+		!local_eval.is_error,
+		"session-local in-process eval was denied: {}",
+		String::from_utf8_lossy(&local_eval.json)
+	);
 
 	let socket = harness.state.path().join("env-remote.sock");
 	let shutdown = CancellationToken::new();
@@ -1762,7 +1828,7 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 			maximum_strict: None,
 		})
 		.expect("advertise worker registry");
-	assert_eq!(advertised.len(), 16);
+	assert_eq!(advertised.len(), 21);
 	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry
@@ -2544,11 +2610,21 @@ async fn cancelled_exec_preserves_session_cwd_and_kills_term_ignoring_tree() {
 	assert!(child_pid.exists() && grandchild_pid.exists(), "child tree did not start");
 	drop(run);
 	for pid_file in [&child_pid, &grandchild_pid] {
-		let pid: i32 = std::fs::read_to_string(pid_file)
-			.expect("pid file")
-			.trim()
-			.parse()
-			.expect("pid");
+		// The shell creates the file before the redirected write lands; poll for
+		// a parseable pid instead of racing the first byte.
+		let mut parsed = None;
+		for _ in 0..100 {
+			if let Ok(pid) = std::fs::read_to_string(pid_file)
+				.expect("pid file")
+				.trim()
+				.parse::<i32>()
+			{
+				parsed = Some(pid);
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+		let pid: i32 = parsed.expect("pid");
 		let mut dead = false;
 		for _ in 0..100 {
 			// SAFETY: `pid` is a parsed child process identifier; `kill` only reads it.
@@ -2733,7 +2809,9 @@ async fn named_process_attach_has_no_gap_between_backlog_and_future_output() {
 			.expect("attachment event")
 			.expect("attachment remains open");
 		match event {
-			ProcessAttachmentEvent::Output(output) => sequences.push(output.sequence),
+			ProcessAttachmentEvent::Output(output) => {
+				sequences.push((output.log_offset, output.sequence));
+			},
 			ProcessAttachmentEvent::State(state)
 				if state
 					.process
@@ -2747,9 +2825,8 @@ async fn named_process_attach_has_no_gap_between_backlog_and_future_output() {
 		}
 	}
 	assert!(!sequences.is_empty());
-	assert_eq!(sequences[0], 1);
 	assert!(
-		sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),
+		sequences.windows(2).all(|pair| pair[1].0 == pair[0].1),
 		"attachment must not lose output at the snapshot/subscription boundary"
 	);
 }

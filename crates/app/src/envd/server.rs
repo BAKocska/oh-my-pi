@@ -51,6 +51,7 @@ use super::{
 	host_info::HostInfoHost,
 	http_egress::{HttpEgressError, HttpEgressHost},
 	journal_runtime::ExternalJournalActor,
+	presence::{PresenceError, PresenceLease, PresenceRegistry},
 	mcp::{
 		McpService,
 		manager::{McpManager, ProductionConnector},
@@ -237,6 +238,9 @@ pub enum EnvdError {
 	/// The environment client could not complete its protocol handshake.
 	#[error(transparent)]
 	Client(#[from] omp_env::ClientError),
+	/// Daemon-owned client presence could not be updated.
+	#[error(transparent)]
+	Presence(#[from] super::presence::PresenceError),
 	/// A spawned environment connection task failed.
 	#[error("environment connection task failed: {0}")]
 	Task(#[from] tokio::task::JoinError),
@@ -539,6 +543,7 @@ pub struct EnvServer {
 	authority:           Arc<AuthorityTable>,
 	repository_revision: AtomicU64,
 	process_store:       super::process_store::ProcessStore,
+	presence:            PresenceRegistry,
 }
 
 fn execution_settings(
@@ -877,6 +882,7 @@ impl EnvServer {
 			state_dir.join("local"),
 		);
 		mcp.bind_manager(&mcp_manager);
+		let presence = PresenceRegistry::new(state_dir, workspace.root());
 		Self {
 			identity,
 			documents,
@@ -915,6 +921,7 @@ impl EnvServer {
 			process_store: super::process_store::ProcessStore::new(
 				state_dir.join("processes").join("meta.json"),
 			),
+			presence: presence,
 		}
 	}
 
@@ -1296,6 +1303,10 @@ impl EnvServer {
 	pub fn registry(&self) -> Arc<Registry> {
 		Arc::clone(&self.registry)
 	}
+	/// Returns the project document authority shared by standalone commands.
+	pub(crate) const fn documents(&self) -> &DocumentHost {
+		&self.documents
+	}
 
 	/// Returns the session's sole Off/Mnemopi runtime.
 	pub(crate) fn memory_runtime(&self) -> Arc<omp_memory::MemoryRuntime> {
@@ -1546,8 +1557,17 @@ impl EnvServer {
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 			Err(error) => return Err(error.into()),
 		}
-		let listener = tokio::net::UnixListener::bind(path)?;
-		tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+		// Bind under a staging name, restrict, then rename into place so the
+		// published path never exposes a permissive-mode window to connectors.
+		let staging = path.with_extension(format!("staging-{}", std::process::id()));
+		match tokio::fs::symlink_metadata(&staging).await {
+			Ok(_) => tokio::fs::remove_file(&staging).await?,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+			Err(error) => return Err(error.into()),
+		}
+		let listener = tokio::net::UnixListener::bind(&staging)?;
+		tokio::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600)).await?;
+		tokio::fs::rename(&staging, path).await?;
 		let socket_metadata = std::fs::symlink_metadata(path)?;
 		let retire = CancellationToken::new();
 		let mut listener = Some(listener);
@@ -1834,6 +1854,18 @@ impl EnvServer {
 		{
 			return;
 		}
+		if scope.as_ref().is_some_and(|scope| scope.pty_denied)
+			&& requests_pty(&body)
+		{
+			send_error(
+				responses,
+				frame.request_id,
+				pb::ProtocolErrorCode::PermissionDenied,
+				"PTY allocation is denied by the authenticated invocation scope",
+			)
+			.await;
+			return;
+		}
 		let continuation = matches!(
 			&body,
 			client_frame::Body::ArgText(_)
@@ -1919,9 +1951,155 @@ impl EnvServer {
 					.await;
 				}
 			},
+			client_frame::Body::RegisterPresence(request) => {
+				if policy.host.is_some() {
+					send_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::PermissionDenied,
+						"presence registration is unavailable on extension transports",
+					)
+					.await;
+					return;
+				}
+				if connection.presence.is_some() {
+					send_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::AlreadyExists,
+						"this connection already owns a presence lease",
+					)
+					.await;
+					return;
+				}
+				let Ok(client_id) = std::str::from_utf8(&request.client_id) else {
+					send_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"presence client_id must be UTF-8",
+					)
+					.await;
+					return;
+				};
+				if client_id.is_empty() || client_id.len() > 256 {
+					send_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"presence client_id must contain 1..=256 bytes",
+					)
+					.await;
+					return;
+				}
+				if request.kind.is_empty() || request.kind.len() > 64 {
+					send_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::InvalidArgument,
+						"presence kind must contain 1..=64 bytes",
+					)
+					.await;
+					return;
+				}
+				match self.presence.register(
+					Str::from(client_id),
+					request.pid,
+					Str::from(request.kind),
+				) {
+					Ok(lease) => {
+						let lease_id = Bytes::copy_from_slice(lease.id().as_bytes());
+						connection.presence = Some(lease);
+						send_body(
+							responses,
+							frame.request_id,
+							server_frame::Body::PresenceRegistered(pb::PresenceRegistered {
+								lease_id,
+								props: None,
+							}),
+						)
+						.await;
+					},
+					Err(PresenceError::ClientNotLive { .. }) => {
+						send_error(
+							responses,
+							frame.request_id,
+							pb::ProtocolErrorCode::InvalidArgument,
+							"presence pid is not a live process",
+						)
+						.await;
+					},
+					Err(error) => {
+						tracing::warn!(%error, "failed to register client presence");
+						send_error(
+							responses,
+							frame.request_id,
+							pb::ProtocolErrorCode::Internal,
+							"failed to persist client presence",
+						)
+						.await;
+					},
+				}
+			},
+			client_frame::Body::ReleasePresence(request) => {
+				let Some(lease) = connection.presence.as_ref() else {
+					send_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::NotFound,
+						"this connection has no presence lease",
+					)
+					.await;
+					return;
+				};
+				if request.lease_id.as_ref() != lease.id().as_bytes() {
+					send_error(
+						responses,
+						frame.request_id,
+						pb::ProtocolErrorCode::PermissionDenied,
+						"presence lease does not belong to this connection",
+					)
+					.await;
+					return;
+				}
+				let lease = connection
+					.presence
+					.take()
+					.expect("presence lease checked immediately above");
+				match lease.release() {
+					Ok(()) => {
+						send_body(
+							responses,
+							frame.request_id,
+							server_frame::Body::PresenceReleased(pb::PresenceReleased {
+								lease_id: request.lease_id,
+								props:    None,
+							}),
+						)
+						.await;
+					},
+					Err(error) => {
+						tracing::warn!(%error, "failed to release client presence");
+						send_error(
+							responses,
+							frame.request_id,
+							pb::ProtocolErrorCode::Internal,
+							"failed to remove client presence",
+						)
+						.await;
+					},
+				}
+			},
 			client_frame::Body::InvokeTool(request) => {
 				self
-					.open_invocation(frame.request_id, request, responses, finished, connection)
+					.open_invocation(
+						frame.request_id,
+						request,
+						scope.as_ref(),
+						responses,
+						finished,
+						connection,
+					)
 					.await;
 			},
 			client_frame::Body::ArgText(request) => {
@@ -2024,6 +2202,28 @@ impl EnvServer {
 				}
 			},
 			client_frame::Body::ArgsCommitted(request) => {
+				match connection.scope_authenticates(
+					frame.request_id,
+					&request.invocation_id,
+					&request.effect_token,
+					scope.as_ref(),
+				) {
+					Ok(true) => {},
+					Ok(false) => {
+						send_error(
+							responses,
+							frame.request_id,
+							pb::ProtocolErrorCode::PermissionDenied,
+							"invocation scope is not authenticated by the committed effect token",
+						)
+						.await;
+						return;
+					},
+					Err((code, message)) => {
+						send_error(responses, frame.request_id, code, message).await;
+						return;
+					},
+				}
 				let denial =
 					match connection.plan_denial(frame.request_id, &request.invocation_id, &request.raw)
 					{
@@ -4322,6 +4522,7 @@ impl EnvServer {
 		&self,
 		request_id: u64,
 		request: pb::InvokeTool,
+		scope: Option<&pb::InvocationScope>,
 		responses: &flume::Sender<pb::ServerFrame>,
 		finished: &flume::Sender<Finished>,
 		connection: &mut ConnectionState,
@@ -4346,6 +4547,16 @@ impl EnvServer {
 				request_id,
 				pb::ProtocolErrorCode::InvalidArgument,
 				"invocation_id must not be empty",
+			)
+			.await;
+			return;
+		}
+		if scope.is_some_and(|scope| scope.invocation_id != invocation_id.as_str()) {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"invocation scope does not match InvokeTool.invocation_id",
 			)
 			.await;
 			return;
@@ -4410,6 +4621,7 @@ impl EnvServer {
 					pending_commit: None,
 					maximum_effects: maximum_effects.clone(),
 					execution: execution.clone(),
+					request_scope: scope.map(|scope| scope.pty_denied),
 					cancel: cancel.clone(),
 				}),
 			);
@@ -4425,10 +4637,12 @@ impl EnvServer {
 				}),
 			)
 			.await;
+
 			spawn_native_invocation(
 				request_id,
 				invocation_id,
 				name,
+				scope.is_some_and(|scope| scope.pty_denied),
 				feed,
 				deadline,
 				params,
@@ -4481,6 +4695,7 @@ impl EnvServer {
 					pending_commit: None,
 					maximum_effects,
 					execution,
+					request_scope: scope.map(|scope| scope.pty_denied),
 					interrupt,
 					interrupts: Some(interrupts),
 					cancel,
@@ -4828,6 +5043,7 @@ struct ConnectionState {
 	authority:        Arc<AuthorityTable>,
 	connection_owner: u64,
 	quotas:           QuotaAccount,
+	presence:         Option<PresenceLease>,
 }
 
 enum RequestState {
@@ -4851,6 +5067,7 @@ enum InvocationState {
 		pending_commit:  Option<pb::ArgsCommitted>,
 		maximum_effects: Effects,
 		execution:       InvocationExecutionPolicy,
+		request_scope:   Option<bool>,
 		cancel:          CancellationToken,
 	},
 	Worker {
@@ -4862,6 +5079,7 @@ enum InvocationState {
 		pending_commit:  Option<pb::ArgsCommitted>,
 		maximum_effects: Effects,
 		execution:       InvocationExecutionPolicy,
+		request_scope:   Option<bool>,
 		interrupt:       flume::Sender<pb::Interrupt>,
 		interrupts:      Option<flume::Receiver<pb::Interrupt>>,
 		cancel:          CancellationToken,
@@ -4976,6 +5194,7 @@ impl ConnectionState {
 			authority,
 			connection_owner,
 			quotas,
+			presence: None,
 		}
 	}
 
@@ -5025,6 +5244,44 @@ impl ConnectionState {
 			)),
 			None => Err((pb::ProtocolErrorCode::NotFound, "invocation is not open")),
 		}
+	}
+	fn scope_authenticates(
+		&self,
+		request_id: u64,
+		invocation_id: &str,
+		effect_token: &[u8],
+		scope: Option<&pb::InvocationScope>,
+	) -> Result<bool, (pb::ProtocolErrorCode, &'static str)> {
+		let state = match self.requests.get(&request_id) {
+			Some(RequestState::Invocation(state)) if state.id() == invocation_id => state,
+			Some(RequestState::Invocation(_)) => {
+				return Err((
+					pb::ProtocolErrorCode::InvalidArgument,
+					"invocation_id does not match the open request",
+				));
+			},
+			Some(_) => {
+				return Err((
+					pb::ProtocolErrorCode::PreconditionFailed,
+					"request_id is not an invocation stream",
+				));
+			},
+			None => return Err((pb::ProtocolErrorCode::NotFound, "invocation is not open")),
+		};
+		let expected = match state {
+			InvocationState::Native { request_scope, .. }
+			| InvocationState::Worker { request_scope, .. } => *request_scope,
+		};
+		Ok(match (expected, scope) {
+			(None, None) => true,
+			(Some(expected), Some(scope)) => {
+				scope.invocation_id == invocation_id
+					&& !effect_token.is_empty()
+					&& scope.effect_token.as_ref() == effect_token
+					&& scope.pty_denied == expected
+			},
+			(None, Some(_)) | (Some(_), None) => false,
+		})
 	}
 
 	fn plan_denial(
@@ -5401,6 +5658,7 @@ async fn spawn_native_invocation(
 	request_id: u64,
 	invocation_id: Str,
 	name: Str,
+	pty_denied: bool,
 	feed: omp_tool::InvocationFeed,
 	deadline: Duration,
 	params: IncomingParams<'static>,
@@ -5411,7 +5669,7 @@ async fn spawn_native_invocation(
 	finished: flume::Sender<Finished>,
 ) {
 	let (started, start) = flume::bounded(1);
-	tokio::spawn(async move {
+	tokio::spawn(super::tools::with_invocation_scope(pty_denied, async move {
 		let result = registry.invoke(&name, params);
 		let _ = started.send(());
 		match result {
@@ -5556,7 +5814,7 @@ async fn spawn_native_invocation(
 		let _ = finished
 			.send_async(Finished { request_id, invocation_id: Some(invocation_id) })
 			.await;
-	});
+	}));
 	let _ = start.recv_async().await;
 }
 
@@ -7191,6 +7449,15 @@ fn frame_data_operation(body: &client_frame::Body) -> Option<(&'static str, &'st
 		client_frame::Body::BlobPutCommit(_) => Some(("omp.env.blobs.commit_put", "env.blob")),
 		client_frame::Body::BlobDelete(_) => Some(("omp.env.blobs.delete", "env.blob")),
 		_ => None,
+	}
+}
+fn requests_pty(body: &client_frame::Body) -> bool {
+	match body {
+		client_frame::Body::OpenSession(request) => request.pty.is_some(),
+		client_frame::Body::StartProcess(request) => {
+			request.spec.as_ref().is_some_and(|spec| spec.pty.is_some())
+		},
+		_ => false,
 	}
 }
 

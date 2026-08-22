@@ -48,6 +48,23 @@ use super::{
 	workspace::WorkspaceHost,
 };
 
+tokio::task_local! {
+	static PTY_DENIED: bool;
+}
+
+/// Runs one native tool stream under its authenticated invocation restrictions.
+pub(super) async fn with_invocation_scope<T>(
+	pty_denied: bool,
+	future: impl Future<Output = T>,
+) -> T {
+	PTY_DENIED.scope(pty_denied, future).await
+}
+
+/// Returns whether the current authenticated invocation denies PTY allocation.
+pub(super) fn pty_denied() -> bool {
+	PTY_DENIED.try_with(|denied| *denied).unwrap_or(false)
+}
+
 /// Builds the complete registry shared by environment dispatch and the agent.
 ///
 /// Resource adapters are cloned into their typed executors. Worker declarations

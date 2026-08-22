@@ -1,6 +1,9 @@
 //! Standalone alternate-screen pickers shared by CLI startup flows.
 
-use std::{io, path::PathBuf};
+use std::{
+	io::{self, IsTerminal as _, Write as _},
+	path::PathBuf,
+};
 
 use omp_chat_ui::{ListPicker, ListRow, PickerEvent};
 use omp_core::Str;
@@ -9,6 +12,8 @@ use omp_tui::{
 	Frame, InputEvent, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext,
 };
 use thiserror::Error;
+
+use crate::cleanse::{Checker, TargetChoice};
 
 /// A session selected before project-scoped authorities are started.
 #[derive(Clone, Debug)]
@@ -27,6 +32,61 @@ pub(crate) enum PickerError {
 	/// Terminal entry, input, or rendering failed.
 	#[error(transparent)]
 	Terminal(#[from] io::Error),
+}
+
+/// Chooses all checkers, one checker, or a free-form discovery request.
+///
+/// Non-interactive invocations deterministically select every discovered
+/// checker instead of attempting to enter the alternate screen.
+pub(crate) async fn pick_cleanse_target(
+	checkers: &[Checker],
+) -> Result<TargetChoice, PickerError> {
+	if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+		return Ok(TargetChoice::All);
+	}
+	let mut rows = Vec::with_capacity(checkers.len() + 2);
+	rows.push(ListRow {
+		key:    "all".into(),
+		label:  Str::from(format!(
+			"Run all {} discovered checker{}",
+			checkers.len(),
+			if checkers.len() == 1 { "" } else { "s" }
+		)),
+		detail: Str::new(""),
+	});
+	rows.extend(checkers.iter().map(|checker| ListRow {
+		key:    checker.id.clone(),
+		label:  checker.label.clone(),
+		detail: Str::from(format!("{} — {}", checker.language, checker.binary.display())),
+	}));
+	rows.push(ListRow {
+		key:    "request".into(),
+		label:  Str::new("Describe what to fix…"),
+		detail: Str::new("A discovery agent determines the checker command"),
+	});
+	let Some(index) = run_list("Select what to cleanse", &rows).await? else {
+		return Ok(TargetChoice::Cancel);
+	};
+	if index == 0 {
+		Ok(TargetChoice::All)
+	} else if index == rows.len() - 1 {
+		Ok(prompt_cleanse_request()?.map_or(TargetChoice::Cancel, TargetChoice::Request))
+	} else {
+		Ok(TargetChoice::Checker(checkers[index - 1].id.clone()))
+	}
+}
+
+/// Reads a cleanse discovery request only when both standard streams are TTYs.
+pub(crate) fn prompt_cleanse_request() -> Result<Option<Str>, PickerError> {
+	if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+		return Ok(None);
+	}
+	print!("Describe what to detect and fix (for example, \"ts errors\"): ");
+	io::stdout().flush()?;
+	let mut request = String::new();
+	io::stdin().read_line(&mut request)?;
+	let request = request.trim();
+	Ok((!request.is_empty()).then(|| Str::from(request)))
 }
 
 /// Lists sessions from every native project index and asks the user to choose

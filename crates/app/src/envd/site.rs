@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{Hash32, Str};
+use omp_core::{ArtifactDigest, Hash32, Str};
 use omp_proto::env::v1 as pb;
 use omp_storage::blob::{BlobRef, BlobStore};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,8 @@ pub struct TrustedModule {
 	pub path:   PathBuf,
 	/// Importable single-module name.
 	pub module: Str,
+	/// BLAKE3 digest of the exact operator-approved module bytes.
+	pub artifact_digest: ArtifactDigest,
 }
 
 /// Validates `--trusted-extension` as one absolute Python module, never a
@@ -73,7 +75,17 @@ pub fn validate_trusted_module(path: &Path) -> Result<TrustedModule, SiteError> 
 		.filter(|value| python_identifier(value))
 		.map(Str::new)
 		.ok_or_else(|| trusted_load_error(path, "module filename is not a Python identifier"))?;
-	Ok(TrustedModule { path: canonical, module })
+	let bytes = fs::read(&canonical)
+		.map_err(|_| trusted_load_error(path, "module cannot be read"))?;
+	let mut digest = Hash32::hasher();
+	digest.update(b"omp/trusted-extension-module/v1");
+	digest.update(&(bytes.len() as u64).to_le_bytes());
+	digest.update(&bytes);
+	Ok(TrustedModule {
+		path: canonical,
+		module,
+		artifact_digest: ArtifactDigest::new(digest.finalize().into_bytes()),
+	})
 }
 
 fn python_identifier(value: &str) -> bool {

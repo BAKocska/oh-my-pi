@@ -9,8 +9,17 @@ use serde_json::{Value, json};
 
 use crate::envd::github_url::GithubCredentialBridge;
 
-const ENDPOINT: &str = "https://qa.omp.sh/v1/issues";
+const ENDPOINT: &str = "https://qa.omp.sh/v1/grievances";
 const BATCH: usize = 4;
+
+/// Result of an explicit grievance upload drain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManualPushResult {
+	/// Rows durably acknowledged by the remote authority.
+	pub pushed: usize,
+	/// Whether the entire planning snapshot was acknowledged.
+	pub ok:     bool,
+}
 
 /// Applies an explicit UI decision against the exact displayed target
 /// revision. Model-facing report arguments never reach this authority.
@@ -43,7 +52,7 @@ pub(crate) fn start(store: Arc<TelemetryIndex>, credentials: Arc<GithubCredentia
 			let now = now_ms();
 			if let Ok(pending) = store.pending_uploads(now, BATCH) {
 				for issue in pending {
-					deliver(&client, &store, &credentials, issue, now).await;
+					let _ = deliver_to(&client, ENDPOINT, &store, &credentials, issue, now, false).await;
 				}
 			}
 			tokio::time::sleep(Duration::from_secs(15)).await;
@@ -51,57 +60,80 @@ pub(crate) fn start(store: Arc<TelemetryIndex>, credentials: Arc<GithubCredentia
 	});
 }
 
-async fn deliver(
+/// Authenticates and drains every issue selected by explicit manual intent.
+pub(crate) async fn manual_push(
+	store: &TelemetryIndex,
+	credentials: &GithubCredentialBridge,
+) -> Result<ManualPushResult, omp_storage::telemetry_index::QueryError> {
+	let client = wreq::Client::builder()
+		.redirect(wreq::redirect::Policy::none())
+		.build()
+		.expect("AutoQA client");
+	let endpoint = std::env::var("OMP_AUTO_QA_PUSH_URL").unwrap_or_else(|_| ENDPOINT.to_owned());
+	let mut pushed = 0;
+	loop {
+		let pending = store.pending_manual_uploads(BATCH)?;
+		if pending.is_empty() {
+			return Ok(ManualPushResult { pushed, ok: true });
+		}
+		for issue in pending {
+			if deliver_to(&client, endpoint.trim(), store, credentials, issue, now_ms(), true).await {
+				pushed += 1;
+			} else {
+				return Ok(ManualPushResult { pushed, ok: false });
+			}
+		}
+	}
+}
+
+async fn deliver_to(
 	client: &wreq::Client,
+	endpoint: &str,
 	store: &TelemetryIndex,
 	credentials: &GithubCredentialBridge,
 	pending: PendingIssue,
 	now: u64,
-) {
-	let Some(revision) = pending.issue.consent_revision.as_deref() else {
-		let _ = store.reject_upload(&pending.issue.id);
-		return;
+	bypass_consent: bool,
+) -> bool {
+	let revision = if bypass_consent {
+		pending.issue.rev.as_deref()
+	} else {
+		pending.issue.consent_revision.as_deref()
 	};
-	if pending.issue.rev.as_deref() != Some(revision) {
+	let Some(revision) = revision else {
 		let _ = store.reject_upload(&pending.issue.id);
-		return;
+		return false;
+	};
+	if !bypass_consent && pending.issue.rev.as_deref() != Some(revision) {
+		let _ = store.reject_upload(&pending.issue.id);
+		return false;
 	}
-	let payload = String::from_utf8_lossy(&pending.payload);
-	let redacted = omp_telemetry::redact::redact_sensitive_credentials(&payload);
 	let body = json!({
 		"issue_id": pending.issue.id,
 		"session_id": pending.issue.session_id,
 		"device": pending.issue.device,
 		"revision": revision,
-		"payload": serde_json::from_str::<Value>(&redacted).unwrap_or(Value::String(redacted)),
+		"payload": omp_telemetry::autoqa::project_payload(&pending.payload),
 	});
 	let mut headers = HeaderMap::new();
 	headers.insert(USER_AGENT, HeaderValue::from_static("omp-autoqa/1"));
 	let Ok(idempotency) = HeaderValue::from_str(&pending.issue.id) else {
 		let _ = store.reject_upload(&pending.issue.id);
-		return;
+		return false;
 	};
 	headers.insert("idempotency-key", idempotency);
 	let Ok(Some(lease)) = credentials.lease_for("autoqa").await else {
 		let _ = retry(store, &pending, now);
-		return;
+		return false;
 	};
-	if lease
-		.apply_header(&HeaderPlacement::bearer(), &mut headers)
-		.is_err()
-	{
+	if lease.apply_header(&HeaderPlacement::bearer(), &mut headers).is_err() {
 		let _ = retry(store, &pending, now);
-		return;
+		return false;
 	}
-	let response = client
-		.post(ENDPOINT)
-		.headers(headers)
-		.json(&body)
-		.send()
-		.await;
+	let response = client.post(endpoint).headers(headers).json(&body).send().await;
 	let Ok(response) = response else {
 		let _ = retry(store, &pending, now);
-		return;
+		return false;
 	};
 	let status = response.status().as_u16();
 	if (200..300).contains(&status) {
@@ -116,12 +148,18 @@ async fn deliver(
 					.map(str::to_owned)
 			})
 			.unwrap_or_else(|| pending.issue.id.to_string());
-		let _ = store.acknowledge_upload(&pending.issue.id, &acknowledgement);
+		commit_acknowledgement(store, &pending.issue.id, &acknowledgement)
 	} else if status == 408 || status == 429 || status >= 500 {
 		let _ = retry(store, &pending, now);
+		false
 	} else {
 		let _ = store.reject_upload(&pending.issue.id);
+		false
 	}
+}
+
+fn commit_acknowledgement(store: &TelemetryIndex, id: &str, acknowledgement: &str) -> bool {
+	store.acknowledge_upload(id, acknowledgement).unwrap_or(false)
 }
 
 fn retry(
@@ -144,4 +182,45 @@ fn now_ms() -> u64 {
 		.as_millis()
 		.try_into()
 		.unwrap_or(u64::MAX)
+}
+#[cfg(test)]
+mod tests {
+	use omp_core::sf;
+	use omp_storage::telemetry_index::StoredIssue;
+	use tempfile::tempdir;
+
+	use super::*;
+
+	#[test]
+	fn upload_response_commits_exactly_one_acknowledgement() {
+		let directory = tempdir().unwrap();
+		let store =
+			TelemetryIndex::open(directory.path(), &directory.path().join("telemetry.sqlite"))
+				.unwrap();
+		let payload = br#"{"report":"redacted"}"#;
+		let offset = store.append("session-a", "issue_report", 1, payload).unwrap();
+		store
+			.store_issue(&StoredIssue {
+				id:                 sf!("qa-a"),
+				session_id:         sf!("session-a"),
+				device:             sf!("read"),
+				rev:                Some(sf!("1")),
+				consent:            sf!("upload"),
+				created_at_ms:      1,
+				payload_offset:     offset.0,
+				payload_len:        payload.len().try_into().unwrap(),
+				consent_revision:   Some(sf!("1")),
+				attempt_count:      0,
+				next_attempt_at_ms: 0,
+				terminal:           false,
+				remote_ack:         None,
+			})
+			.unwrap();
+
+		assert!(commit_acknowledgement(&store, "qa-a", "remote-a"));
+		assert!(!commit_acknowledgement(&store, "qa-a", "remote-b"));
+		let issue = store.issue("qa-a").unwrap().unwrap();
+		assert_eq!(issue.remote_ack.as_deref(), Some("remote-a"));
+		assert_eq!(issue.attempt_count, 1);
+	}
 }

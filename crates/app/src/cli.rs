@@ -14,7 +14,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::Str;
+use omp_core::{SecretString, Str};
+
+fn parse_cli_secret(value: &str) -> Result<SecretString, std::convert::Infallible> {
+	Ok(SecretString::from(value))
+}
 use omp_llm_catalog::{ModelKey, compile::compile_oracle};
 #[cfg(feature = "local-applefm")]
 use omp_llm_inference::local::applefm::{AppleFm, AppleFmEvent, AppleFmOptions};
@@ -281,7 +285,7 @@ pub struct OmpCli {
 		value_parser = trusted_extension_path,
 		conflicts_with_all = ["ext", "ext_only", "no_ext"]
 	)]
-	pub trusted_extension: Vec<PathBuf>,
+	pub trusted_extension: Vec<crate::envd::site::TrustedModule>,
 	/// Suppress all configured extensions for this invocation.
 	#[arg(
 		long = "no-ext",
@@ -305,6 +309,9 @@ pub struct OmpCli {
 	/// Permit running interactively from the home directory.
 	#[arg(long, global = true)]
 	pub allow_home:        bool,
+	/// Render interactive chat in a native GPU window.
+	#[arg(long, global = true)]
+	pub gui:               bool,
 	/// Select a named profile before settings and extensions are loaded.
 	#[arg(skip)]
 	pub profile:           Option<Str>,
@@ -625,6 +632,41 @@ pub struct GrepArgs {
 	pub json:         bool,
 }
 
+/// Grievance operation selected by the positional action.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum GrievanceAction {
+	/// List the newest project findings.
+	#[default]
+	List,
+	/// Delete one exact issue scope.
+	Clean,
+	/// Authenticate and upload every unacknowledged finding.
+	Push,
+}
+
+/// Cross-session AutoQA grievance options.
+#[derive(Clone, Debug, Args)]
+pub struct GrievancesArgs {
+	/// Operation to perform; bare `omp grievances` lists findings.
+	#[arg(value_enum, default_value = "list")]
+	pub action: GrievanceAction,
+	/// Maximum number of newest findings to list.
+	#[arg(short = 'n', long, default_value_t = 20)]
+	pub limit:  usize,
+	/// Filter list output or clean every finding for one tool/device.
+	#[arg(short = 't', long)]
+	pub tool:   Option<Str>,
+	/// Clean one exact stable issue identifier.
+	#[arg(long)]
+	pub id:     Option<Str>,
+	/// Clean the entire project issue inventory.
+	#[arg(long)]
+	pub all:    bool,
+	/// Emit machine-readable JSON.
+	#[arg(short = 'j', long)]
+	pub json:   bool,
+}
+
 /// Stream category used by standalone TTSR matching.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum TtsrSourceArg {
@@ -757,6 +799,56 @@ pub struct ShareArgs {
 	pub no_redact: bool,
 }
 
+/// Standalone collaboration guest options.
+#[derive(Clone, Debug, Args)]
+pub struct JoinArgs {
+	/// Collaboration link shared by the authoritative host.
+	#[arg(value_name = "LINK")]
+	pub link: Str,
+}
+/// Bounded checker discovery and file-disjoint repair options.
+#[derive(Clone, Debug, Args)]
+pub struct CleanseCliArgs {
+	/// What to detect and fix; a discovery child determines exact checker argv.
+	#[arg(value_name = "REQUEST")]
+	pub request: Option<Str>,
+	/// Maximum number of file-disjoint repair children.
+	#[arg(long, short = 'n', default_value_t = 32)]
+	pub agents:  usize,
+	/// Repair and discovery model selector.
+	#[arg(long, short = 'm', default_value = "@smol")]
+	pub model:   Str,
+	/// Include configured project test suites.
+	#[arg(long, short = 't')]
+	pub tests:   bool,
+	/// Run every discovered checker without the target picker.
+	#[arg(long, short = 'a')]
+	pub all:     bool,
+}
+
+/// Semantic file compression options.
+#[derive(Clone, Debug, Args)]
+pub struct CompressCliArgs {
+	/// Literal files or glob patterns to compress.
+	#[arg(required = true, num_args = 1.., value_name = "FILE")]
+	pub files:    Vec<Str>,
+	/// Write an approved single-file draft to this path.
+	#[arg(long, short = 'o')]
+	pub out:      Option<PathBuf>,
+	/// Overwrite every source only after its draft is approved.
+	#[arg(long, short = 'i')]
+	pub in_place: bool,
+	/// Maximum draft rounds per file.
+	#[arg(long, short = 'r', default_value_t = 3)]
+	pub rounds:   u32,
+	/// Files compressed concurrently.
+	#[arg(long = "agents", short = 'n', default_value_t = 4)]
+	pub agents:   usize,
+	/// Compression model selector; absent uses the configured default.
+	#[arg(long, short = 'm')]
+	pub model:    Option<Str>,
+}
+
 /// Production application commands.
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
@@ -779,6 +871,8 @@ pub enum Command {
 	Acp(AcpArgs),
 	/// Run one typed operation in process.
 	Infer(InferArgs),
+	/// Join a live collaboration in a replica-backed standalone composer.
+	Join(JoinArgs),
 	/// Manage provider credentials.
 	Auth(AuthArgs),
 	/// Manage generated model-catalog data.
@@ -804,6 +898,8 @@ pub enum Command {
 	Stats(StatsArgs),
 	/// Inspect or apply lock-safe session and blob maintenance.
 	Gc(GcArgs),
+	/// Render native tool lifecycle cards to text or PNG fixtures.
+	Gallery(crate::gallery_cmd::GalleryArgs),
 	/// Inspect or invalidate durable provider quota observations.
 	Usage(UsageArgs),
 	/// Benchmark model TTFT, throughput, concurrency, and cold/warm cache pairs.
@@ -820,10 +916,14 @@ pub enum Command {
 	Say(SayArgs),
 	/// Run the native grep engine as a standalone operator.
 	Grep(GrepArgs),
+	/// View, clean, or manually push reported tool issues.
+	Grievances(GrievancesArgs),
 	/// Manage scoped native SSH hosts and run bounded client operations.
 	Ssh(crate::ssh_cmd::SshArgs),
 	/// Inspect and test active Time-Traveling Stream Rules.
 	Ttsr(TtsrArgs),
+	/// Detect, repair, and verify native project diagnostics.
+	Cleanse(CleanseCliArgs),
 	/// Generate a static shell completion script.
 	Completions {
 		/// Target shell.
@@ -840,6 +940,8 @@ pub enum Command {
 		#[arg(last = true, default_value = "")]
 		prefix: Str,
 	},
+	/// Rewrite text files into a dense telegraphic register.
+	Compress(CompressCliArgs),
 	/// Auth-broker verbs are retained as structured errors until a broker
 	/// backend lands.
 	#[command(name = "auth-broker")]
@@ -920,6 +1022,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "chat", aliases: &["i", "launch"] },
 	CommandSpec { name: "print", aliases: &["p"] },
 	CommandSpec { name: "infer", aliases: &[] },
+	CommandSpec { name: "join", aliases: &[] },
 	CommandSpec { name: "rpc", aliases: &[] },
 	CommandSpec { name: "rpc-ui", aliases: &[] },
 	CommandSpec { name: "acp", aliases: &[] },
@@ -937,6 +1040,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "worktree", aliases: &[] },
 	CommandSpec { name: "stats", aliases: &[] },
 	CommandSpec { name: "gc", aliases: &[] },
+	CommandSpec { name: "gallery", aliases: &[] },
 	CommandSpec { name: "usage", aliases: &[] },
 	CommandSpec { name: "bench", aliases: &[] },
 	CommandSpec { name: "dry-balance", aliases: &[] },
@@ -944,10 +1048,13 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "setup", aliases: &[] },
 	CommandSpec { name: "say", aliases: &[] },
 	CommandSpec { name: "grep", aliases: &[] },
+	CommandSpec { name: "grievances", aliases: &[] },
 	CommandSpec { name: "ssh", aliases: &[] },
 	CommandSpec { name: "ttsr", aliases: &[] },
+	CommandSpec { name: "cleanse", aliases: &[] },
 	CommandSpec { name: "completions", aliases: &[] },
 	CommandSpec { name: "__complete", aliases: &[] },
+	CommandSpec { name: "compress", aliases: &[] },
 ];
 
 /// Returns whether a root command shares the launch option surface.
@@ -1118,34 +1225,34 @@ pub struct PromptArgs {
 pub struct ChatArgs {
 	/// Catalog model key, alias, or role.
 	#[arg(long)]
-	pub model:            Option<Str>,
+	pub model:              Option<Str>,
 	/// Provider preference for the selected model.
 	#[arg(long)]
-	pub provider:         Option<Str>,
+	pub provider:           Option<Str>,
 	/// Fast/low-cost model-role selector.
 	#[arg(long)]
-	pub smol:             Option<Str>,
+	pub smol:               Option<Str>,
 	/// Deep-reasoning model-role selector.
 	#[arg(long)]
-	pub slow:             Option<Str>,
+	pub slow:               Option<Str>,
 	/// Planning model-role selector.
 	#[arg(long)]
-	pub plan:             Option<Str>,
+	pub plan:               Option<Str>,
 	/// Ordered model selectors available for interactive cycling.
 	#[arg(long)]
-	pub models:           Option<SelectorList>,
+	pub models:             Option<SelectorList>,
 	/// Provider session selector, never inferred from prompt text.
 	#[arg(long = "provider-session-id")]
-	pub provider_session: Option<Str>,
+	pub provider_session:   Option<Str>,
 	/// Project root whose environment and durable sessions are used.
 	#[arg(long, value_name = "PATH", default_value = ".")]
-	pub project:          PathBuf,
+	pub project:            PathBuf,
 	/// Existing inference gateway endpoint. Omit to run inference in process.
 	#[arg(long, value_name = "LOCAL_ENDPOINT")]
-	pub gateway:          Option<LocalEndpoint>,
+	pub gateway:            Option<LocalEndpoint>,
 	/// Existing ULID session to reopen strictly.
 	#[arg(long, value_name = "ULID")]
-	pub resume:           Option<Str>,
+	pub resume:             Option<Str>,
 	/// Continue a UUID session.
 	#[arg(
 		long = "continue",
@@ -1155,123 +1262,127 @@ pub struct ChatArgs {
 		default_missing_value = "@terminal",
 		conflicts_with = "fork"
 	)]
-	pub continue_session: Option<Str>,
+	pub continue_session:   Option<Str>,
 	/// Fork an existing session before opening the chat.
 	#[arg(long, value_name = "SESSION", conflicts_with_all = ["resume", "continue_session", "no_session"])]
-	pub fork:             Option<Str>,
+	pub fork:               Option<Str>,
 	/// Do not persist a durable session for this chat.
 	#[arg(long, conflicts_with_all = ["resume", "continue_session", "fork"])]
-	pub no_session:       bool,
+	pub no_session:         bool,
 	/// Override the native session storage directory.
 	#[arg(long, value_name = "PATH")]
-	pub session_dir:      Option<PathBuf>,
+	pub session_dir:        Option<PathBuf>,
 	/// Select provider reasoning effort with unambiguous prefix abbreviations.
 	#[arg(long)]
-	pub thinking:         Option<ThinkingLevel>,
+	pub thinking:           Option<ThinkingLevel>,
 	/// Select the provider's service tier.
 	#[arg(long)]
-	pub service_tier:     Option<ServiceTier>,
+	pub service_tier:       Option<ServiceTier>,
 	/// Tool approval policy.
 	#[arg(long)]
-	pub approval_mode:    Option<ApprovalMode>,
+	pub approval_mode:      Option<ApprovalMode>,
 	/// Stop after this strictly positive duration.
 	#[arg(long)]
-	pub max_time:         Option<CliDuration>,
+	pub max_time:           Option<CliDuration>,
 	/// Restrict enabled tools to these normalized names.
 	#[arg(long, conflicts_with = "no_tools")]
-	pub tools:            Option<ToolNames>,
+	pub tools:              Option<ToolNames>,
 	/// Disable every built-in tool.
 	#[arg(long)]
-	pub no_tools:         bool,
+	pub no_tools:           bool,
 	/// Disable LSP tools, formatting, and diagnostics.
 	#[arg(long)]
-	pub no_lsp:           bool,
+	pub no_lsp:             bool,
 	/// Disable PTY-backed shell execution.
 	#[arg(long)]
-	pub no_pty:           bool,
+	pub no_pty:             bool,
 	/// Enter read-only planning mode at startup.
 	#[arg(long = "plan-mode")]
-	pub plan_mode:        bool,
+	pub plan_mode:          bool,
 	/// Enter prewalk automation.
 	#[arg(long, conflicts_with = "no_prewalk")]
-	pub prewalk:          bool,
+	pub prewalk:            bool,
 	/// Disable configured prewalk automation.
 	#[arg(long, conflicts_with = "prewalk")]
-	pub no_prewalk:       bool,
+	pub no_prewalk:         bool,
 	/// Model selector used when prewalk begins.
 	#[arg(long)]
-	pub prewalk_into:     Option<Str>,
+	pub prewalk_into:       Option<Str>,
 	/// Read-only native TOML settings overlays in precedence order.
 	#[arg(long = "config", value_name = "TOML")]
-	pub config:           Vec<PathBuf>,
+	pub config:             Vec<PathBuf>,
 	/// Additional authorized workspace roots.
 	#[arg(long = "add-dir", value_name = "PATH")]
-	pub add_dir:          Vec<PathBuf>,
+	pub add_dir:            Vec<PathBuf>,
 	/// Comma-separated skill glob filters.
 	#[arg(long)]
-	pub skills:           Option<SelectorList>,
+	pub skills:             Option<SelectorList>,
 	/// Disable skill discovery.
 	#[arg(long, conflicts_with = "skills")]
-	pub no_skills:        bool,
+	pub no_skills:          bool,
 	/// Disable rule discovery.
 	#[arg(long)]
-	pub no_rules:         bool,
+	pub no_rules:           bool,
 	/// Disable generated terminal titles.
 	#[arg(long)]
-	pub no_title:         bool,
-	/// Ephemeral provider API key; never journaled.
-	#[arg(long)]
-	pub api_key:          Option<Str>,
+	pub no_title:           bool,
+	/// Ephemeral provider API key; never journaled or rendered by `Debug`.
+	#[arg(long, value_parser = parse_cli_secret)]
+	pub api_key:            Option<SecretString>,
 	/// Ephemeral provider prompt-cache affinity.
 	#[arg(long = "prompt-cache-key")]
-	pub prompt_cache_key: Option<Str>,
+	pub prompt_cache_key:   Option<Str>,
 	#[arg(long)]
-	pub py_eval:          bool,
+	pub py_eval:            bool,
+	/// Deployment-authenticated exact modules admitted by the CLI boundary.
+	#[arg(skip)]
+	pub trusted_extensions: Vec<crate::envd::worker::ExtHostSpec>,
 	/// Typed prompt settings and invocation overrides.
 	#[command(flatten)]
-	pub prompt_settings:  PromptArgs,
+	pub prompt_settings:    PromptArgs,
 }
 
 impl ChatArgs {
 	/// Returns the default options for an interactive project chat.
 	pub fn default_interactive() -> Self {
 		Self {
-			model:            None,
-			provider:         None,
-			smol:             None,
-			slow:             None,
-			plan:             None,
-			models:           None,
-			provider_session: None,
-			project:          ".".into(),
-			gateway:          None,
-			resume:           None,
-			continue_session: None,
-			fork:             None,
-			no_session:       false,
-			session_dir:      None,
-			thinking:         None,
-			service_tier:     None,
-			approval_mode:    None,
-			max_time:         None,
-			tools:            None,
-			no_tools:         false,
-			no_lsp:           false,
-			no_pty:           false,
-			plan_mode:        false,
-			prewalk:          false,
-			no_prewalk:       false,
-			prewalk_into:     None,
-			config:           Vec::new(),
-			add_dir:          Vec::new(),
-			skills:           None,
-			no_skills:        false,
-			no_rules:         false,
-			no_title:         false,
-			api_key:          None,
-			prompt_cache_key: None,
-			py_eval:          false,
-			prompt_settings:  PromptArgs::default(),
+			model:              None,
+			provider:           None,
+			smol:               None,
+			slow:               None,
+			plan:               None,
+			models:             None,
+			provider_session:   None,
+			project:            ".".into(),
+			gateway:            None,
+			resume:             None,
+			continue_session:   None,
+			fork:               None,
+			no_session:         false,
+			session_dir:        None,
+			thinking:           None,
+			service_tier:       None,
+			approval_mode:      None,
+			max_time:           None,
+			tools:              None,
+			no_tools:           false,
+			no_lsp:             false,
+			no_pty:             false,
+			plan_mode:          false,
+			prewalk:            false,
+			no_prewalk:         false,
+			prewalk_into:       None,
+			config:             Vec::new(),
+			add_dir:            Vec::new(),
+			skills:             None,
+			no_skills:          false,
+			no_rules:           false,
+			no_title:           false,
+			api_key:            None,
+			prompt_cache_key:   None,
+			py_eval:            false,
+			trusted_extensions: Vec::new(),
+			prompt_settings:    PromptArgs::default(),
 		}
 	}
 }
@@ -1329,6 +1440,12 @@ pub struct PrintArgs {
 	/// Disable PTY-backed tools.
 	#[arg(long)]
 	pub no_pty:           bool,
+	/// Ephemeral provider API key; never journaled or rendered by `Debug`.
+	#[arg(long, value_parser = parse_cli_secret)]
+	pub api_key:          Option<SecretString>,
+	/// Ephemeral provider prompt-cache affinity.
+	#[arg(long = "prompt-cache-key")]
+	pub prompt_cache_key: Option<Str>,
 	/// Additional user messages applied in order after the initial prompt.
 	#[arg(long = "follow-up", value_name = "TEXT")]
 	pub follow_ups:       Vec<Str>,
@@ -1644,6 +1761,12 @@ pub enum AuthBrokerCommand {
 	Login {
 		/// Provider identifier.
 		provider: Str,
+		/// Configured SSH host alias running the remote broker.
+		#[arg(long)]
+		via:      Option<Str>,
+		/// Print the native tunnel plan without connecting.
+		#[arg(long)]
+		dry_run:  bool,
 	},
 	/// Remove stored OAuth credentials for one provider.
 	Logout {
@@ -1655,7 +1778,16 @@ pub enum AuthBrokerCommand {
 	/// Import credential material from a file.
 	Import {
 		/// Credential export path.
-		path: PathBuf,
+		path:             PathBuf,
+		/// Override CLIProxyAPI type-to-provider mapping.
+		#[arg(long)]
+		provider:         Option<Str>,
+		/// Import records marked disabled.
+		#[arg(long)]
+		include_disabled: bool,
+		/// Validate and print the import plan without persisting.
+		#[arg(long)]
+		dry_run:          bool,
 	},
 	/// Apply store migrations and rotate every credential under the active key.
 	Migrate {
@@ -1681,32 +1813,44 @@ pub struct AuthGatewayArgs {
 /// Credential-injecting gateway operations.
 #[derive(Clone, Debug, Subcommand)]
 pub enum AuthGatewayCommand {
-	/// Start the gateway over an owner-local socket or named pipe.
+	/// Start the bearer-authenticated TCP forward proxy.
 	Serve {
-		/// Platform-local socket or named-pipe endpoint.
-		#[arg(long, value_name = "LOCAL_ENDPOINT")]
-		endpoint: LocalEndpoint,
+		/// TCP bind address.
+		#[arg(long, default_value = "127.0.0.1:4000", value_name = "HOST:PORT")]
+		bind:    std::net::SocketAddr,
+		/// Disable bearer auth. Accepted only for loopback binds.
+		#[arg(long)]
+		no_auth: bool,
 	},
 	/// Print or rotate the gateway bearer token.
 	Token {
 		/// Replace the current bearer token.
 		#[arg(long)]
 		regenerate: bool,
+		/// Render machine-readable output.
+		#[arg(long)]
+		json:       bool,
 	},
 	/// Query the versioned gateway health handshake.
 	Status {
-		/// Platform-local socket or named-pipe endpoint.
-		#[arg(long, value_name = "LOCAL_ENDPOINT")]
-		endpoint: LocalEndpoint,
-	},
-	/// Check gateway health, optionally failing on an unavailable endpoint.
-	Check {
-		/// Platform-local socket or named-pipe endpoint.
-		#[arg(long, value_name = "LOCAL_ENDPOINT")]
-		endpoint: LocalEndpoint,
-		/// Return an error when the gateway is unhealthy.
+		/// TCP gateway address.
+		#[arg(long, default_value = "127.0.0.1:4000", value_name = "HOST:PORT")]
+		bind: std::net::SocketAddr,
+		/// Render machine-readable output.
 		#[arg(long)]
-		strict:   bool,
+		json: bool,
+	},
+	/// Probe every configured credential through the upstream provider.
+	Check {
+		/// TCP gateway address.
+		#[arg(long, default_value = "127.0.0.1:4000", value_name = "HOST:PORT")]
+		bind:   std::net::SocketAddr,
+		/// Bypass cached health and require a live upstream HTTP probe.
+		#[arg(long)]
+		strict: bool,
+		/// Render machine-readable output.
+		#[arg(long)]
+		json:   bool,
 	},
 }
 
@@ -1776,6 +1920,7 @@ enum DispatchTarget {
 	RpcUi,
 	Acp,
 	Infer,
+	Join,
 	Auth,
 	CatalogImport,
 	LocalInfer,
@@ -1790,6 +1935,7 @@ enum DispatchTarget {
 	Worktree,
 	Stats,
 	Gc,
+	Gallery,
 	Usage,
 	Bench,
 	DryBalance,
@@ -1797,10 +1943,13 @@ enum DispatchTarget {
 	Setup,
 	Say,
 	Grep,
+	Grievances,
 	Ssh,
 	Ttsr,
+	Cleanse,
 	Completions,
 	Complete,
+	Compress,
 }
 
 #[cfg(test)]
@@ -1814,6 +1963,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Serve(_)) => DispatchTarget::Serve,
 		Some(Command::Envd(_)) => DispatchTarget::Envd,
 		Some(Command::Infer(_)) => DispatchTarget::Infer,
+		Some(Command::Join(_)) => DispatchTarget::Join,
 		Some(Command::Auth(_)) => DispatchTarget::Auth,
 		Some(Command::Catalog(CatalogArgs { command: CatalogCommand::Import(_) })) => {
 			DispatchTarget::CatalogImport
@@ -1830,6 +1980,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Worktree(_)) => DispatchTarget::Worktree,
 		Some(Command::Stats(_)) => DispatchTarget::Stats,
 		Some(Command::Gc(_)) => DispatchTarget::Gc,
+		Some(Command::Gallery(_)) => DispatchTarget::Gallery,
 		Some(Command::Usage(_)) => DispatchTarget::Usage,
 		Some(Command::Bench(_)) => DispatchTarget::Bench,
 		Some(Command::DryBalance(_)) => DispatchTarget::DryBalance,
@@ -1837,10 +1988,13 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Setup(_)) => DispatchTarget::Setup,
 		Some(Command::Say(_)) => DispatchTarget::Say,
 		Some(Command::Grep(_)) => DispatchTarget::Grep,
+		Some(Command::Grievances(_)) => DispatchTarget::Grievances,
 		Some(Command::Ssh(_)) => DispatchTarget::Ssh,
 		Some(Command::Ttsr(_)) => DispatchTarget::Ttsr,
+		Some(Command::Cleanse(_)) => DispatchTarget::Cleanse,
 		Some(Command::Completions { .. }) => DispatchTarget::Completions,
 		Some(Command::Complete { .. }) => DispatchTarget::Complete,
+		Some(Command::Compress(_)) => DispatchTarget::Compress,
 		Some(Command::AuthBroker(_)) => DispatchTarget::AuthBroker,
 		Some(Command::AuthGateway(_)) => DispatchTarget::AuthGateway,
 	}
@@ -1892,13 +2046,24 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			"refusing to start an interactive session in HOME; pass --allow-home or --cwd"
 		));
 	}
-	match cli
+	let gui = cli.gui;
+	let trusted_extensions = cli
+		.trusted_extension
+		.iter()
+		.cloned()
+		.map(trusted_extension)
+		.collect::<Vec<_>>();
+	let command = cli
 		.command
-		.unwrap_or_else(|| Command::Chat(ChatArgs::default_interactive()))
-	{
+		.unwrap_or_else(|| Command::Chat(ChatArgs::default_interactive()));
+	if gui && !matches!(&command, Command::Chat(_)) {
+		return Err(miette!("--gui is only supported by interactive chat"));
+	}
+	match command {
 		Command::Serve(args) => serve(args).await,
 		Command::Envd(args) => crate::envd::run(args).await,
 		Command::Chat(mut args) => {
+			args.trusted_extensions = trusted_extensions;
 			let start = chat_start(&mut args);
 			crate::startup_notice::show_once(
 				&data_dir(None)?,
@@ -1913,12 +2078,22 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 				},
 			)
 			.into_diagnostic()?;
-			Box::pin(crate::chat::run(args, start)).await
+			Box::pin(crate::chat::run(
+				args,
+				start,
+				if gui {
+					crate::chat::ChatPresentation::Gui
+				} else {
+					crate::chat::ChatPresentation::Terminal
+				},
+			))
+			.await
 		},
 		Command::Print(args) => crate::print_mode::run(args).await,
 		Command::Rpc(args) | Command::RpcUi(args) => crate::rpc_mode::run(args).await,
 		Command::Acp(args) => crate::acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
+		Command::Join(args) => crate::join_cmd::run(args).await,
 		Command::Auth(args) => auth(args).await,
 		Command::Catalog(CatalogArgs { command: CatalogCommand::Import(args) }) => {
 			catalog_import(&args)
@@ -1933,6 +2108,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Worktree(args) => crate::worktree_cmd::run(&data_dir(None)?, &args),
 		Command::Stats(args) => crate::stats_cmd::run(args).await,
 		Command::Gc(args) => crate::gc_cmd::run(args),
+		Command::Gallery(args) => crate::gallery_cmd::run(args),
 		Command::Usage(args) => crate::usage_cmd::run(args).await,
 		Command::Bench(args) => crate::bench_cmd::run(args).await,
 		Command::DryBalance(args) => crate::dry_balance_cmd::run(args).await,
@@ -1940,13 +2116,35 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Setup(args) => crate::setup_cmd::run(args).await,
 		Command::Say(args) => crate::say_cmd::run(args).await,
 		Command::Grep(args) => crate::grep_cmd::run(args),
+		Command::Grievances(args) => crate::grievances_cmd::run(args).await,
 		Command::Ssh(args) => crate::ssh_cmd::run(args).await,
 		Command::Ttsr(args) => crate::ttsr_cmd::run(args),
+		Command::Cleanse(args) => {
+			crate::cleanse::production::run_command(crate::cleanse::CleanseArgs {
+				agents:  args.agents,
+				model:   args.model,
+				tests:   args.tests,
+				all:     args.all,
+				request: args.request,
+			})
+			.await
+		},
 		Command::Completions { shell } => {
 			let bytes = crate::completions::script(shell.into());
 			std::io::Write::write_all(&mut std::io::stdout(), &bytes).into_diagnostic()
 		},
 		Command::Complete { kind, prefix } => crate::complete_cmd::run(kind, &prefix),
+		Command::Compress(args) => {
+			crate::compress::production::run_command(crate::compress::CompressArgs {
+				files:       args.files,
+				model:       args.model,
+				rounds:      args.rounds,
+				concurrency: args.agents,
+				out:         args.out,
+				in_place:    args.in_place,
+			})
+			.await
+		},
 		Command::AuthBroker(args) => crate::auth_broker_cmd::run(args).await,
 		Command::AuthGateway(args) => crate::auth_gateway_cmd::run(args).await,
 	}
@@ -1972,6 +2170,7 @@ pub fn parse_from_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Om
 		&& first_positional(&arguments).is_none()
 		&& !arguments.iter().skip(1).any(|argument| {
 			matches!(argument.to_string_lossy().as_ref(), "--help" | "-h" | "--version" | "-V")
+				|| argument == "--gui"
 		}) {
 		arguments.push(OsString::from("print"));
 	}
@@ -2004,6 +2203,7 @@ fn builtin_contribution_names() -> impl Iterator<Item = Str> {
 		"cwd",
 		"ext",
 		"ext-only",
+		"gui",
 		"model",
 		"models",
 		"no-ext",
@@ -2123,10 +2323,46 @@ fn is_command(argument: &OsString) -> bool {
 		.any(|entry| entry.name == argument || entry.aliases.contains(&argument.as_ref()))
 }
 
-fn trusted_extension_path(value: &str) -> Result<PathBuf, String> {
-	crate::envd::site::validate_trusted_module(Path::new(value))
-		.map(|module| module.path)
-		.map_err(|error| error.to_string())
+fn trusted_extension_path(value: &str) -> Result<crate::envd::site::TrustedModule, String> {
+	crate::envd::site::validate_trusted_module(Path::new(value)).map_err(|error| error.to_string())
+}
+
+/// Converts one exact operator-approved module into the deployment-owned
+/// activation contract admitted by the extension supervisor.
+///
+/// A bare trusted module has no static OMP declaration metadata. The CLI trust
+/// act authenticates its exact startup module and bytes; named tools,
+/// inter-extension services, and CONTROL quota classes stay empty because pi
+/// supplies no deployment-owned metadata for those sets. Python registration
+/// is never promoted into an authenticated manifest.
+pub fn trusted_extension(
+	module: crate::envd::site::TrustedModule,
+) -> crate::envd::worker::ExtHostSpec {
+	let encoded = omp_core::encoding::hex::encode_n(module.artifact_digest.as_bytes());
+	let extension_id = Str::from(format!("trusted.{}.{}", module.module, &encoded[..16],));
+	let key = crate::envd::worker::HostKey::new("invocation", "trusted", extension_id.clone());
+	let provenance = omp_core::Provenance::new(
+		Str::new_static("operator-cli"),
+		extension_id,
+		Str::new_static("cli"),
+		module.artifact_digest,
+		Str::new_static("invocation"),
+		Str::new_static("trusted"),
+		1,
+	);
+	let manifest = crate::exthost::ExtensionManifest::new(
+		provenance,
+		module.module,
+		[],
+		crate::exthost::DeclarationSet::default(),
+		crate::exthost::ServiceManifest::default(),
+		[],
+		[crate::exthost::ActivationTrigger::FirstReach],
+	);
+	let mut extension = crate::envd::worker::ExtHostSpec::new(key, manifest);
+	extension.python_site = module.path.parent().map(Path::to_path_buf);
+	extension.entry_path = Some(module.path);
+	extension
 }
 
 fn is_home_dir() -> miette::Result<bool> {
@@ -2358,6 +2594,57 @@ mod tests {
 		};
 		assert!(args.model.is_none());
 	}
+	#[test]
+	fn parses_standalone_join_link() {
+		let Some(Command::Join(args)) = parse(&["omp", "join", "room.credentials"]).command else {
+			panic!("join command");
+		};
+		assert_eq!(args.link.as_str(), "room.credentials");
+		assert_eq!(dispatch_target(Some(&Command::Join(args))), DispatchTarget::Join);
+	}
+
+	#[test]
+	fn parses_grievance_actions_and_selectors() {
+		let Some(Command::Grievances(list)) = parse(&["omp", "grievances"]).command else {
+			panic!("grievances list command");
+		};
+		assert_eq!(list.action, GrievanceAction::List);
+		assert_eq!(list.limit, 20);
+		assert_eq!(dispatch_target(Some(&Command::Grievances(list))), DispatchTarget::Grievances);
+
+		let Some(Command::Grievances(clean)) =
+			parse(&["omp", "grievances", "clean", "--id", "qa-a", "--all"]).command
+		else {
+			panic!("grievances clean command");
+		};
+		assert_eq!(clean.action, GrievanceAction::Clean);
+		assert_eq!(clean.id.as_deref(), Some("qa-a"));
+		assert!(clean.all);
+	}
+	#[test]
+	fn parses_cleanse_and_compress_contracts() {
+		let Some(Command::Cleanse(cleanse)) =
+			parse(&["omp", "cleanse", "ts errors", "--agents", "8", "--tests"]).command
+		else {
+			panic!("cleanse command");
+		};
+		assert_eq!(cleanse.request.as_deref(), Some("ts errors"));
+		assert_eq!(cleanse.agents, 8);
+		assert_eq!(cleanse.model.as_str(), "@smol");
+		assert!(cleanse.tests);
+		assert_eq!(dispatch_target(Some(&Command::Cleanse(cleanse))), DispatchTarget::Cleanse,);
+
+		let Some(Command::Compress(compress)) =
+			parse(&["omp", "compress", "a.md", "b.md", "--in-place", "--rounds", "5"]).command
+		else {
+			panic!("compress command");
+		};
+		assert_eq!(compress.files, [Str::new("a.md"), Str::new("b.md")]);
+		assert!(compress.in_place);
+		assert_eq!(compress.rounds, 5);
+		assert_eq!(compress.agents, 4);
+		assert_eq!(dispatch_target(Some(&Command::Compress(compress))), DispatchTarget::Compress,);
+	}
 
 	#[test]
 	fn parses_every_dispatch_branch() {
@@ -2422,6 +2709,84 @@ mod tests {
 		assert_eq!(args.gateway.as_ref().map(LocalEndpoint::as_path), Some(Path::new(TEST_ENDPOINT)));
 		assert_eq!(args.resume, Some(sf!("01ARZ3NDEKTSV4RRFFQ69G5FAV")));
 		assert!(args.py_eval);
+	}
+	#[test]
+	fn parses_ephemeral_inference_overrides_without_debugging_secret() {
+		let Some(Command::Chat(chat)) = parse(&[
+			"omp",
+			"chat",
+			"--model",
+			"provider/model",
+			"--api-key",
+			"chat-secret-marker",
+			"--prompt-cache-key",
+			"chat-cache",
+		])
+		.command
+		else {
+			panic!("chat command");
+		};
+		assert!(chat.api_key.is_some());
+		assert_eq!(chat.prompt_cache_key.as_deref(), Some("chat-cache"));
+		assert!(!format!("{chat:?}").contains("chat-secret-marker"));
+
+		let Some(Command::Print(print)) = parse(&[
+			"omp",
+			"print",
+			"--model",
+			"provider/model",
+			"--api-key",
+			"print-secret-marker",
+			"--prompt-cache-key",
+			"print-cache",
+			"hello",
+		])
+		.command
+		else {
+			panic!("print command");
+		};
+		assert!(print.api_key.is_some());
+		assert_eq!(print.prompt_cache_key.as_deref(), Some("print-cache"));
+		assert!(!format!("{print:?}").contains("print-secret-marker"));
+	}
+
+	#[test]
+	fn trusted_extension_builds_exact_startup_activation_contract() {
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("policy.py");
+		std::fs::write(&path, b"activated = True\n").unwrap();
+
+		let extension = trusted_extension(crate::envd::site::validate_trusted_module(&path).unwrap());
+		assert_eq!(extension.manifest.entry, "policy");
+		assert!(extension.manifest.declaration_modules.is_empty());
+		assert_eq!(extension.manifest.declarations.tools().len(), 0);
+		assert_eq!(extension.manifest.declarations.hooks().len(), 0);
+		assert_eq!(extension.manifest.declarations.actions().len(), 0);
+		assert_eq!(extension.manifest.services.provides().len(), 0);
+		assert_eq!(extension.manifest.services.requires().len(), 0);
+		assert!(extension.manifest.resource_limits.is_empty());
+		assert_eq!(
+			extension.manifest.activation_triggers,
+			[crate::exthost::ActivationTrigger::FirstReach]
+				.into_iter()
+				.collect(),
+		);
+		assert_eq!(extension.python_site.as_deref(), Some(directory.path()));
+		assert_eq!(extension.entry_path.as_deref(), Some(path.as_path()));
+		assert_eq!(extension.key.layer(), "invocation");
+		assert_eq!(extension.key.tier(), "trusted");
+
+		let relative = OmpCli::try_parse_from(["omp", "--trusted-extension", "relative.py"])
+			.expect_err("relative trusted modules must hard-fail");
+		assert_eq!(relative.kind(), ErrorKind::ValueValidation);
+		let missing = directory.path().join("missing.py");
+		let missing = OmpCli::try_parse_from([
+			OsString::from("omp"),
+			OsString::from("--trusted-extension"),
+			missing.into_os_string(),
+		])
+		.expect_err("missing trusted modules must hard-fail");
+		assert_eq!(missing.kind(), ErrorKind::ValueValidation);
 	}
 
 	#[test]
@@ -2617,6 +2982,20 @@ mod tests {
 				panic!("chat command");
 			};
 			assert_eq!(args.model, Some(sf!("provider/model")));
+		}
+	}
+	#[test]
+	fn parses_gui_across_interactive_chat_forms() {
+		for arguments in [
+			&["omp", "--gui"][..],
+			&["omp", "--gui", "chat"][..],
+			&["omp", "chat", "--gui"][..],
+			&["omp", "--model", "provider/model", "--gui", "chat"][..],
+		] {
+			let cli = parse_from_os(arguments.iter().map(OsString::from))
+				.expect("GUI interactive chat invocation");
+			assert!(cli.gui);
+			assert!(matches!(cli.command, None | Some(Command::Chat(_))));
 		}
 	}
 

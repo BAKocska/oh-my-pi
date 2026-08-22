@@ -8,14 +8,14 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use omp_core::SecretString;
 use omp_llm_catalog::ProviderId;
 use omp_llm_inference::{
-	Client, Registry,
+	Client, Error as InferenceError, ErrorKind, Registry,
 	answer::{
 		AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthSession, UsageQuantity, UsageReport,
 		UsageStatus, UsageUnit, UsageWindowKind,
@@ -114,6 +114,36 @@ impl AuthRpc {
 			}),
 			_ => Err(Status::internal("auth operation returned the wrong typed answer")),
 		}
+	}
+
+	async fn probe_account(
+		&self,
+		account: AccountSummary,
+		strict: bool,
+	) -> Result<pb::CredentialHealth, Status> {
+		let credential_id = parse_account_id(&account.account)?;
+		let provider = account.provider.clone();
+		let started = Instant::now();
+		let result = self
+			.client(provider.clone())
+			.execute(UsageRequest {
+				provider: Some(provider.clone()),
+				account: Some(account.account),
+				scope: UsageScope::All,
+				allow_stale: !strict,
+			})
+			.await;
+		Ok(match result {
+			Ok(_) => pb::CredentialHealth {
+				credential_id,
+				provider: provider.as_str().to_owned(),
+				healthy: true,
+				status_code: Some(200),
+				latency_ms: elapsed_ms(started.elapsed()),
+				error_class: pb::credential_health::ErrorClass::Unspecified as i32,
+			},
+			Err(error) => failed_health(credential_id, provider, started.elapsed(), &error),
+		})
 	}
 }
 
@@ -347,6 +377,33 @@ impl pb::auth_server::Auth for AuthRpc {
 		_request: Request<pb::GetClientUsageRequest>,
 	) -> Result<Response<pb::GetClientUsageResponse>, Status> {
 		Err(not_available("per-client usage accounting"))
+	}
+
+	async fn probe_credentials(
+		&self,
+		request: Request<pb::ProbeCredentialsRequest>,
+	) -> Result<Response<pb::ProbeCredentialsResponse>, Status> {
+		let request = request.into_inner();
+		let requested =
+			(!request.provider.is_empty()).then(|| ProviderId::from(request.provider.as_str()));
+		let provider = self.provider_for(requested.as_ref().map(ProviderId::as_str))?;
+		let answer = self
+			.execute(provider, AuthRequest::ListAccounts { provider: requested })
+			.await?;
+		let AuthAnswer::Accounts(accounts) = answer else {
+			return Err(Status::internal("auth probe list returned the wrong typed answer"));
+		};
+		let strict = request.strict;
+		let credentials = futures::stream::iter(accounts.into_iter().map(|account| {
+			let rpc = self.clone();
+			async move { rpc.probe_account(account, strict).await }
+		}))
+		.buffered(4)
+		.collect::<Vec<_>>()
+		.await
+		.into_iter()
+		.collect::<Result<Vec<_>, _>>()?;
+		Ok(Response::new(pb::ProbeCredentialsResponse { credentials }))
 	}
 
 	async fn mint_scoped_token(
@@ -585,6 +642,78 @@ fn usage_time_ms(time: std::time::SystemTime) -> u64 {
 fn usage_quantity_f64(quantity: UsageQuantity) -> f64 {
 	quantity.units as f64 / 10_f64.powi(i32::from(quantity.decimal_exponent))
 }
+fn failed_health(
+	credential_id: u64,
+	provider: ProviderId,
+	elapsed: Duration,
+	error: &InferenceError,
+) -> pb::CredentialHealth {
+	pb::CredentialHealth {
+		credential_id,
+		provider: provider.as_str().to_owned(),
+		healthy: false,
+		status_code: error.status.map(u32::from),
+		latency_ms: elapsed_ms(elapsed),
+		error_class: error_class(error) as i32,
+	}
+}
+
+fn elapsed_ms(elapsed: Duration) -> u64 {
+	elapsed.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn error_class(error: &InferenceError) -> pb::credential_health::ErrorClass {
+	use pb::credential_health::ErrorClass;
+
+	match error.status {
+		Some(401) => return ErrorClass::Authentication,
+		Some(403) => return ErrorClass::Authorization,
+		Some(408) => return ErrorClass::Timeout,
+		Some(429) => return ErrorClass::RateLimited,
+		Some(500..=599) => return ErrorClass::Upstream,
+		_ => {},
+	}
+	match error.kind {
+		ErrorKind::Authentication
+		| ErrorKind::CredentialStorageUnavailable
+		| ErrorKind::AccountDisabled => ErrorClass::Authentication,
+		ErrorKind::Authorization | ErrorKind::PaymentRequired => ErrorClass::Authorization,
+		ErrorKind::RateLimited => ErrorClass::RateLimited,
+		ErrorKind::QuotaExhausted | ErrorKind::BudgetExhausted => ErrorClass::Quota,
+		ErrorKind::Dns
+		| ErrorKind::Tls
+		| ErrorKind::Connectivity
+		| ErrorKind::Protocol
+		| ErrorKind::StreamCorruption => ErrorClass::Connectivity,
+		ErrorKind::Cancelled | ErrorKind::DeadlineExceeded => ErrorClass::Timeout,
+		ErrorKind::InvalidRequest
+		| ErrorKind::TargetNotFound
+		| ErrorKind::CapabilityUnknown
+		| ErrorKind::CodecMismatch
+		| ErrorKind::CapabilityMismatch
+		| ErrorKind::NativeRequestRejected => ErrorClass::InvalidRequest,
+		ErrorKind::RouteUnavailable
+		| ErrorKind::StalePlan
+		| ErrorKind::ReplayRequired
+		| ErrorKind::StagingRequired
+		| ErrorKind::ProviderContractMismatch
+		| ErrorKind::ContextOverflow
+		| ErrorKind::ContentFilter
+		| ErrorKind::SafetyRefusal
+		| ErrorKind::MalformedModelOutput
+		| ErrorKind::StructuredOutputFailure
+		| ErrorKind::ToolNonCompliance
+		| ErrorKind::RepeatedReasoning
+		| ErrorKind::RepeatedToolCall
+		| ErrorKind::EmptyCompletion
+		| ErrorKind::EmptyOutput
+		| ErrorKind::SessionExpired
+		| ErrorKind::SessionConflict
+		| ErrorKind::LocalModelUnavailable
+		| ErrorKind::ResourceExhausted => ErrorClass::Upstream,
+		ErrorKind::PolicyBufferExceeded | ErrorKind::InternalInvariant => ErrorClass::Internal,
+	}
+}
 fn not_available(capability: &str) -> Status {
 	Status::failed_precondition(format!(
 		"{capability} is not exposed by any constructed canonical auth operation"
@@ -592,4 +721,30 @@ fn not_available(capability: &str) -> Status {
 }
 fn inference_status(error: omp_llm_inference::Error) -> Status {
 	Status::failed_precondition(error.to_string())
+}
+#[cfg(test)]
+mod tests {
+	use omp_llm_inference::{
+		Error, ErrorKind,
+		error::{ErrorPhase, RetryAction},
+		receipt::ExecutionReceipt,
+	};
+
+	use super::{error_class, pb};
+
+
+	#[test]
+	fn credential_probe_failures_keep_typed_http_health() {
+		let error = Error::new(
+			ErrorKind::Connectivity,
+			ErrorPhase::Connecting,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		)
+		.status(Some(401));
+		assert_eq!(
+			error_class(&error),
+			pb::credential_health::ErrorClass::Authentication,
+		);
+	}
 }

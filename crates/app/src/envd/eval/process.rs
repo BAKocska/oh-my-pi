@@ -522,7 +522,9 @@ impl EvalChild {
 			interrupt_grace: Str::from(interrupt_grace.to_string()),
 		})
 		.await?;
-		match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut process.stdout)).await {
+		// Cold start covers exec plus embedded-interpreter boot; tolerate load
+		// spikes that the per-frame runtime deadlines must not.
+		match tokio::time::timeout(Duration::from_secs(30), read_frame(&mut process.stdout)).await {
 			Ok(Ok(Some(ChildFrame::Ready))) => Ok(process),
 			Ok(Ok(Some(ChildFrame::Fatal { message }))) => Err(ProcessError::Protocol(message)),
 			Ok(Ok(Some(_))) => {

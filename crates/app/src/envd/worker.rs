@@ -146,6 +146,8 @@ pub struct ExtHostSpec {
 	pub data_grants: Grants,
 	/// Optional site-packages directory passed through as `OMP_PY_SITE`.
 	pub python_site: Option<PathBuf>,
+	/// Exact entry file preloaded under the manifest module name.
+	pub entry_path:  Option<PathBuf>,
 	/// Scoped DATA socket passed only to this extension host.
 	pub data_socket: Option<PathBuf>,
 }
@@ -160,6 +162,7 @@ impl ExtHostSpec {
 			pool: None,
 			data_grants: Grants::default(),
 			python_site: None,
+			entry_path: None,
 			data_socket: None,
 		}
 	}
@@ -235,6 +238,10 @@ pub struct ExtHostConfig {
 	pub max_frame_bytes:    NonZeroUsize,
 	/// Time allowed for hello, registration, ping, and individual frame reads.
 	pub health_timeout:     Duration,
+	/// Time allowed for a cold worker to produce its hello and registration
+	/// frames; spawn covers process exec plus embedded-interpreter boot, so it
+	/// tolerates load the steady-state health deadline must not.
+	pub spawn_timeout:      Duration,
 	/// Idle interval between worker health probes.
 	pub ping_interval:      Duration,
 	/// Courtesy-interrupt grace period before the process group is killed.
@@ -276,6 +283,7 @@ impl ExtHostConfig {
 			max_frame_bytes: NonZeroUsize::new(DEFAULT_MAX_FRAME_BYTES)
 				.expect("the default worker frame limit is nonzero"),
 			health_timeout: Duration::from_secs(5),
+			spawn_timeout: Duration::from_secs(30),
 			ping_interval: Duration::from_secs(15),
 			interrupt_grace: omp_tool::DEFAULT_INTERRUPT_GRACE,
 			data_authority: None,
@@ -1116,6 +1124,7 @@ struct ProcessConfig {
 	executable:           PathBuf,
 	workspace_root:       Option<PathBuf>,
 	python_site:          Option<PathBuf>,
+	exact_entry:         Option<(Str, PathBuf)>,
 	modules:              Vec<Str>,
 	manifests:            BTreeMap<HostKey, ExtensionManifest>,
 	data_socket:          Option<PathBuf>,
@@ -1126,6 +1135,7 @@ struct ProcessConfig {
 	session_id:           Str,
 	max_frame_bytes:      NonZeroUsize,
 	health_timeout:       Duration,
+	spawn_timeout:        Duration,
 	ping_interval:        Duration,
 	interrupt_grace:      Duration,
 	initial_backoff:      Duration,
@@ -1170,6 +1180,21 @@ impl ProcessConfig {
 				"extensions in an explicit pool must use the same scoped DATA socket",
 			)));
 		}
+		let exact_entries = extensions
+			.iter()
+			.filter_map(|extension| {
+				extension
+					.entry_path
+					.as_ref()
+					.map(|path| (extension.manifest.entry.clone(), path.clone()))
+			})
+			.collect::<Vec<_>>();
+		if exact_entries.len() > 1 {
+			return Err(WorkerError::Protocol(sf!(
+				"an exact trusted module cannot share an extension host process",
+			)));
+		}
+		let exact_entry = exact_entries.into_iter().next();
 		let mut modules_seen = HashSet::new();
 		let mut manifests = BTreeMap::new();
 		let mut modules = Vec::new();
@@ -1192,6 +1217,7 @@ impl ProcessConfig {
 			executable: root.executable.clone(),
 			workspace_root: root.workspace_root.clone(),
 			python_site,
+			exact_entry,
 			modules,
 			manifests,
 			data_socket,
@@ -1202,6 +1228,7 @@ impl ProcessConfig {
 			session_started_at: root.session_started_at,
 			max_frame_bytes: root.max_frame_bytes,
 			health_timeout: root.health_timeout,
+			spawn_timeout: root.spawn_timeout,
 			ping_interval: root.ping_interval,
 			interrupt_grace: root
 				.interrupt_grace
@@ -1282,6 +1309,15 @@ impl WorkerProcess {
 		}
 		if let Some(site) = &config.python_site {
 			command.env("OMP_PY_SITE", site);
+		}
+		if let Some((module, path)) = &config.exact_entry {
+			command
+				.env("OMP_PY_ENTRY_MODULE", module.as_str())
+				.env("OMP_PY_ENTRY_PATH", path);
+		} else {
+			command
+				.env_remove("OMP_PY_ENTRY_MODULE")
+				.env_remove("OMP_PY_ENTRY_PATH");
 		}
 		if config.modules.is_empty() {
 			command.env_remove("OMP_PY_MODULES");
@@ -1372,7 +1408,7 @@ impl WorkerProcess {
 		generation: u64,
 		cause: ActivationCause,
 	) -> Result<(), WorkerError> {
-		let hello_frame = self.read_timeout(config).await?;
+		let hello_frame = self.read_deadline(config.spawn_timeout, config).await?;
 		let Some(worker_frame::Body::Hello(hello)) = hello_frame.body else {
 			return Err(WorkerError::Protocol(sf!("WorkerHello must be the first frame")));
 		};
@@ -1433,7 +1469,7 @@ impl WorkerProcess {
 				config,
 			)
 			.await?;
-		let registrations = self.read_timeout(config).await?;
+		let registrations = self.read_deadline(config.spawn_timeout, config).await?;
 		let Some(worker_frame::Body::RegisterTools(RegisterTools {
 			tools,
 			generation: registration_generation,
@@ -1500,8 +1536,16 @@ impl WorkerProcess {
 	}
 
 	async fn read_timeout(&mut self, config: &ProcessConfig) -> Result<WorkerFrame, WorkerError> {
+		self.read_deadline(config.health_timeout, config).await
+	}
+
+	async fn read_deadline(
+		&mut self,
+		deadline: Duration,
+		config: &ProcessConfig,
+	) -> Result<WorkerFrame, WorkerError> {
 		tokio::time::timeout(
-			config.health_timeout,
+			deadline,
 			read_async_frame(&mut self.stdout, config.max_frame_bytes, &mut self.read_scratch),
 		)
 		.await
@@ -3099,6 +3143,49 @@ fn install_scheme_snapshot() -> Result<(), WorkerError> {
 	Ok(())
 }
 
+fn preload_exact_entry(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerError> {
+	let module = env::var_os("OMP_PY_ENTRY_MODULE");
+	let path = env::var_os("OMP_PY_ENTRY_PATH");
+	let (module, path) = match (module, path) {
+		(None, None) => return Ok(()),
+		(Some(module), Some(path)) => (
+			module.into_string().map_err(|_| {
+				WorkerError::Protocol(sf!("exact Python entry module is not UTF-8"))
+			})?,
+			PathBuf::from(path),
+		),
+		_ => {
+			return Err(WorkerError::Protocol(sf!(
+				"exact Python entry requires both module and path",
+			)));
+		},
+	};
+	if !modules.iter().any(|configured| configured.as_str() == module) {
+		return Err(WorkerError::Protocol(sf!(
+			"exact Python entry module is not admitted",
+		)));
+	}
+	engine
+		.attach(|py| -> PyResult<()> {
+			let importlib = PyModule::import(py, "importlib.util")?;
+			let spec = importlib.call_method1("spec_from_file_location", (module.as_str(), &path))?;
+			if spec.is_none() {
+				return Err(PyValueError::new_err(
+					"exact Python entry has no import specification",
+				));
+			}
+			let loaded = importlib.call_method1("module_from_spec", (&spec,))?;
+			let sys = PyModule::import(py, "sys")?;
+			sys.getattr("modules")?
+				.cast::<PyDict>()?
+				.set_item(module.as_str(), &loaded)?;
+			spec.getattr("loader")?
+				.call_method1("exec_module", (&loaded,))?;
+			Ok(())
+		})
+		.map_err(WorkerError::from)
+}
+
 fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerError> {
 	engine.attach(|py| -> PyResult<()> {
 		let sys = PyModule::import(py, "sys")?;
@@ -3176,6 +3263,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			"AdmitExtensions modules differ from the spawned worker configuration",
 		)));
 	}
+	preload_exact_entry(engine, modules)?;
 	let mut tools = load_tools(engine, modules)?;
 	for tool in &mut tools {
 		let extension_id = admitted_modules

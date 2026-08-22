@@ -154,7 +154,7 @@ pub async fn run(args: SshArgs) -> miette::Result<()> {
 	}
 }
 
-fn service(
+pub(crate) fn service(
 	alias: &str,
 	project: &std::path::Path,
 	user: &std::path::Path,

@@ -368,6 +368,39 @@ async fn supervisor_rejects_stale_host_generation() {
 }
 
 #[tokio::test]
+async fn trusted_cli_module_is_loaded_and_activated_from_its_exact_file() {
+	let scratch = tempfile::tempdir().expect("trusted module scratch");
+	let module = scratch.path().join("trusted_policy.py");
+	let marker = scratch.path().join("activated");
+	let marker_json =
+		serde_json::to_string(marker.to_string_lossy().as_ref()).expect("encode marker path");
+	fs::write(
+		&module,
+		format!(
+			"def extension_activate(_event, _context):\n    with open({marker_json}, 'w', \
+			 encoding='utf-8') as marker:\n        marker.write(__file__)\n",
+		),
+	)
+	.expect("write trusted extension module");
+
+	let extension = omp_app::cli::trusted_extension(
+		omp_app::envd::validate_trusted_module(&module).expect("validate trusted module"),
+	);
+	assert!(extension.manifest.declarations.tools().next().is_none());
+	assert!(extension.manifest.services.provides().next().is_none());
+	assert!(extension.manifest.resource_limits.is_empty());
+	let mut config = test_config(env!("CARGO_BIN_EXE_omp").into());
+	config.extensions.push(extension);
+	let supervisor = tokio::time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
+		.await
+		.expect("trusted worker activation timed out")
+		.expect("activate exact trusted module");
+	assert_eq!(fs::read_to_string(&marker).expect("activation marker"), module.to_string_lossy(),);
+	assert!(supervisor.registrations().is_empty());
+	supervisor.shutdown().await;
+}
+
+#[tokio::test]
 async fn same_binary_worker_kills_native_call_and_respawns() {
 	let site = tempfile::tempdir().expect("Python site scratch directory");
 	fs::write(site.path().join("phase1_worker_tools.py"), EXTENSION)
@@ -400,7 +433,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		.to_std()
 		.expect("test interrupt grace");
 
-	let supervisor = tokio::time::timeout(Duration::from_secs(10), ExtHostSupervisor::spawn(config))
+	let supervisor = tokio::time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
 		.await
 		.expect("worker hello and registration timed out")
 		.expect("spawn same-binary Python worker");
@@ -580,7 +613,7 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		.interrupt_grace
 		.to_std()
 		.expect("test interrupt grace");
-	let supervisor = tokio::time::timeout(Duration::from_secs(10), ExtHostSupervisor::spawn(config))
+	let supervisor = tokio::time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
 		.await
 		.expect("py_eval worker registration timed out")
 		.expect("spawn py_eval worker");

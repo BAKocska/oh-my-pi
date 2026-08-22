@@ -1816,6 +1816,11 @@ fn setup_io(
 			ws_ypixel: 0,
 		};
 		let opened = nix::pty::openpty(Some(&winsize), None).map_err(errno_io)?;
+		#[cfg(target_os = "macos")]
+		// SAFETY: fcntl on an owned, open descriptor with no memory arguments.
+		unsafe {
+			libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&opened.master), 73, 1);
+		}
 		let master_read = opened.master.as_fd().try_clone_to_owned()?;
 		let master_write = std::fs::File::from(opened.master);
 		let slave = std::fs::File::from(opened.slave);
@@ -1830,6 +1835,21 @@ fn setup_io(
 		let (stdin_read, stdin_write) = std::io::pipe()?;
 		let (stdout_read, stdout_write) = std::io::pipe()?;
 		let (stderr_read, stderr_write) = std::io::pipe()?;
+		#[cfg(target_os = "macos")]
+		for fd in [
+			std::os::fd::AsRawFd::as_raw_fd(&stdin_write),
+			std::os::fd::AsRawFd::as_raw_fd(&stdout_write),
+			std::os::fd::AsRawFd::as_raw_fd(&stderr_write),
+		] {
+			// `F_SETNOSIGPIPE` (73, absent from `libc`): writes into a closed pipe
+			// surface as `EPIPE` instead of raising `SIGPIPE`. The in-process shell
+			// writes builtin output on host threads; a capped/cancelled reader must
+			// never kill the daemon.
+			// SAFETY: fcntl on an owned, open descriptor with no memory arguments.
+			unsafe {
+				libc::fcntl(fd, 73, 1);
+			}
+		}
 		params.set_fd(OpenFiles::STDIN_FD, stdin_read.into());
 		params.set_fd(OpenFiles::STDOUT_FD, stdout_write.into());
 		params.set_fd(OpenFiles::STDERR_FD, stderr_write.into());

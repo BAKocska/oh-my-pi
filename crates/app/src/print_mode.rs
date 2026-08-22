@@ -80,6 +80,19 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		.or_else(|| args.model.clone())
 		.or_else(|| settings.default_model.clone().map(Str::from))
 		.ok_or_else(|| miette!("print mode requires --model or config.default_model"))?;
+	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
+		return Err(miette!(
+			"--api-key requires a model to be specified via --model or --models"
+		));
+	}
+	let model = crate::chat::resolve_model_selector(catalog, model.as_str())
+		.map_err(|error| miette!(error))?;
+	let credential_provider = args
+		.api_key
+		.as_ref()
+		.map(|_| crate::chat::resolve_model_provider(catalog, model.as_str(), None))
+		.transpose()
+		.map_err(|error| miette!(error))?;
 	let initial = initial_parts(&args.prompt, settings.images.auto_resize).await?;
 	if initial.is_empty() {
 		return Err(
@@ -104,6 +117,10 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		resume: None,
 		fork: None,
 		py_eval: false,
+		pty_denied: args.no_pty,
+		credential_provider,
+		api_key: args.api_key.clone(),
+		prompt_cache_affinity: args.prompt_cache_key.clone(),
 		session_generation: 1,
 	})
 	.await?;

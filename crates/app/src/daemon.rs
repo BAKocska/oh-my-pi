@@ -8,7 +8,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::{Hash32, Str, sf};
+use omp_core::{ExposeSecret as _, Hash32, SecretString, Str, sf};
 #[cfg(target_os = "macos")]
 use omp_llm_inference::auth::FallbackKeySource;
 use omp_llm_inference::{
@@ -56,20 +56,29 @@ use omp_llm_inference::{
 #[cfg(feature = "local-applefm")]
 use omp_llm_inference::{ReasonId, provider::builtin::LocalRouteBackend};
 use omp_proto::{
-	auth::v1::auth_server::AuthServer, blob::v1::blob_server::BlobServer, control::v1 as control_pb,
-	inference::v1::inference_server::InferenceServer, thread::v1::Item,
+	auth::v1::auth_server::AuthServer,
+	blob::v1::blob_server::BlobServer,
+	control::v1 as control_pb,
+	gateway::v1::{
+		forward_proxy_server::ForwardProxyServer, gateway_server::GatewayServer,
+	},
+	inference::v1::inference_server::InferenceServer,
+	thread::v1::Item,
 };
 use omp_storage::{
 	blob::BlobStore,
 	transcript::{Event, Header, ItemRecord, Kind, SessionId, Writer, writer::JournalError},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::{sync::watch, task::JoinHandle};
-use tonic::transport::Server;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Request, Status, transport::Server};
+use zeroize::Zeroizing;
 
 use crate::{
 	auth_rpc::AuthRpc, blob_rpc::BlobRpc, endpoint::LocalEndpoint,
-	envd::browser_fetch::BrowserFetchAdapter, rpc_adapter::InferenceRpc,
+	envd::browser_fetch::BrowserFetchAdapter, gateway_rpc::GatewayRpc,
+	rpc_adapter::InferenceRpc,
 };
 
 const DATA_DIR_ENV: &str = "OMP_DATA_DIR";
@@ -402,8 +411,9 @@ impl CredentialKeyMode {
 
 /// Production daemon construction options.
 pub struct DaemonConfig {
-	data_dir: Option<PathBuf>,
-	endpoint: LocalEndpoint,
+	data_dir:          Option<PathBuf>,
+	endpoint:          LocalEndpoint,
+	bearer_token_file: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -414,7 +424,25 @@ impl DaemonConfig {
 			.or_else(|| {
 				std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/omp"))
 			});
-		Self { data_dir, endpoint: endpoint.into() }
+		Self { data_dir, endpoint: endpoint.into(), bearer_token_file: None }
+	}
+
+	/// Creates a bearer-authenticated TCP daemon configuration.
+	pub fn tcp(
+		address: std::net::SocketAddr,
+		bearer_token_file: impl Into<PathBuf>,
+	) -> Self {
+		let mut config = Self::local(LocalEndpoint::tcp(address));
+		config.bearer_token_file = Some(bearer_token_file.into());
+		config
+	}
+
+	/// Creates an unauthenticated loopback TCP daemon configuration.
+	pub fn loopback_without_auth(address: std::net::SocketAddr) -> Result<Self, DaemonError> {
+		if !address.ip().is_loopback() {
+			return Err(DaemonError::UnauthenticatedRemoteTcp);
+		}
+		Ok(Self::local(LocalEndpoint::tcp(address)))
 	}
 
 	/// Overrides the directory containing encrypted credentials and session
@@ -428,7 +456,7 @@ impl DaemonConfig {
 /// Runtime facts available once registry construction succeeds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonReadiness {
-	/// Requested owner-local endpoint.
+	/// Requested local-socket or TCP endpoint.
 	pub endpoint: LocalEndpoint,
 	/// Number of catalog routes backed by constructed services.
 	pub routes:   usize,
@@ -497,14 +525,26 @@ pub enum DaemonError {
 	/// Owner-local RPC listener could not bind.
 	#[error("could not bind owner-local RPC endpoint")]
 	RpcListen(#[source] omp_rpc::Error),
+	/// TCP RPC listener could not bind.
+	#[error("could not bind TCP gateway endpoint")]
+	TcpListen(#[source] std::io::Error),
+	/// A TCP listener was configured without bearer authentication off loopback.
+	#[error("unauthenticated TCP gateway endpoints must bind to loopback")]
+	UnauthenticatedRemoteTcp,
+	/// The gateway bearer token could not be loaded.
+	#[error("could not load gateway bearer token")]
+	GatewayToken(#[source] std::io::Error),
+	/// The gateway bearer token file contained no token.
+	#[error("gateway bearer token file is empty")]
+	EmptyGatewayToken,
 	/// Tonic RPC serving failed.
-	#[error("owner-local inference RPC server failed")]
+	#[error("inference RPC server failed")]
 	RpcServe(#[source] tonic::transport::Error),
 	/// The daemon RPC task failed to join.
-	#[error("owner-local inference RPC task failed")]
+	#[error("inference RPC task failed")]
 	RpcTask(#[source] tokio::task::JoinError),
 	/// The RPC server exited before a shutdown request.
-	#[error("owner-local inference RPC server stopped unexpectedly")]
+	#[error("inference RPC server stopped unexpectedly")]
 	RpcStopped,
 	/// Signal handling failed.
 	#[error("shutdown signal handling failed")]
@@ -640,6 +680,17 @@ pub(crate) async fn production_rpc_registry(
 		.await
 		.map(|(registry, _, _, auth, _)| (registry, auth))
 }
+/// Invocation-owned inference values that must not enter agent or durable state.
+#[derive(Default)]
+pub(crate) struct InferenceSessionOverrides {
+	/// Provider pinned by an invocation API-key lease.
+	pub provider:              Option<omp_llm_catalog::ProviderId>,
+	/// Generic API key held only by the session's credential broker overlay.
+	pub api_key:               Option<SecretString>,
+	/// Opaque prompt-cache identity lowered by compatible codecs.
+	pub prompt_cache_affinity: Option<Str>,
+}
+
 /// Builds the production inference RPC authority used by both the standalone
 /// gateway and in-process chat turns.
 ///
@@ -652,9 +703,40 @@ pub(crate) async fn production_inference(
 	project_root: Option<&Path>,
 ) -> Result<(Registry, InferenceRpc, Arc<dyn crate::auth_backend::CredentialAuthority>), DaemonError>
 {
+	production_inference_for_session(
+		data_dir,
+		tool_registry,
+		project_root,
+		InferenceSessionOverrides::default(),
+	)
+	.await
+}
+
+/// Builds a session-owned production inference stack with ephemeral overrides.
+pub(crate) async fn production_inference_for_session(
+	data_dir: &Path,
+	tool_registry: Arc<omp_tool::Registry>,
+	project_root: Option<&Path>,
+	overrides: InferenceSessionOverrides,
+) -> Result<(Registry, InferenceRpc, Arc<dyn crate::auth_backend::CredentialAuthority>), DaemonError>
+{
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
+	let provider = overrides.provider.clone();
+	let invocation_key = match (provider.as_ref(), overrides.api_key) {
+		(Some(provider), Some(secret)) => Some((provider.clone(), secret)),
+		(None, None) => None,
+		(Some(_), None) | (None, Some(_)) => {
+			return Err(DaemonError::Inference(Box::new(omp_llm_inference::Error::planning(
+				omp_llm_inference::ErrorKind::InvalidRequest,
+				omp_llm_inference::ErrorDetail::target(sf!(
+					"invocation-credential-override-incomplete"
+				)),
+				Default::default(),
+			))));
+		},
+	};
 	let (registry, sessions, authority, ..) =
-		production_assembly(data_dir, credential_store).await?;
+		production_assembly_for_session(data_dir, credential_store, invocation_key).await?;
 	let settings = crate::settings::manager::SettingsManager::open(
 		crate::settings::manager::SettingsPaths::discover(data_dir, project_root),
 	)?;
@@ -664,6 +746,7 @@ pub(crate) async fn production_inference(
 		.get()
 		.clone();
 	let inference = InferenceRpc::new(registry.clone(), sessions, tool_registry)
+		.with_session_overrides(provider, overrides.prompt_cache_affinity)
 		.with_search_settings(search_settings);
 	Ok((registry, inference, authority))
 }
@@ -671,6 +754,23 @@ pub(crate) async fn production_inference(
 async fn production_assembly(
 	data_dir: &Path,
 	credential_store: Arc<CredentialStore>,
+) -> Result<
+	(
+		Registry,
+		ConversationSessionPlanner,
+		Arc<dyn crate::auth_backend::CredentialAuthority>,
+		AuthManager,
+		ConsoleUsageManager,
+	),
+	DaemonError,
+> {
+	production_assembly_for_session(data_dir, credential_store, None).await
+}
+
+async fn production_assembly_for_session(
+	data_dir: &Path,
+	credential_store: Arc<CredentialStore>,
+	invocation_key: Option<(omp_llm_catalog::ProviderId, SecretString)>,
 ) -> Result<
 	(
 		Registry,
@@ -709,6 +809,20 @@ async fn production_assembly(
 			Default::default(),
 		)))
 	})?;
+	let credentials = match invocation_key {
+		Some((provider, secret)) => credentials
+			.with_api_key_override(&catalog, &provider, secret)
+			.map_err(|_| {
+				DaemonError::Inference(Box::new(omp_llm_inference::Error::planning(
+					omp_llm_inference::ErrorKind::InvalidRequest,
+					omp_llm_inference::ErrorDetail::target(sf!(
+						"invocation-credential-override-invalid"
+					)),
+					Default::default(),
+				)))
+			})?,
+		None => credentials,
+	};
 	let database = data_dir.join("credentials.db");
 	let accounts = AccountPool::with_store(Arc::new(AccountStateStore::open(&database)?))?;
 	let oauth_http = Arc::new(SystemOAuthHttpClient::new());
@@ -973,12 +1087,84 @@ impl Observer for TracingObservation {
 	}
 }
 
+#[derive(Clone)]
+struct BearerAuth {
+	token: Arc<RwLock<SecretString>>,
+}
+
+impl BearerAuth {
+	fn authorize(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+		let supplied = request
+			.metadata()
+			.get("authorization")
+			.and_then(|value| value.to_str().ok())
+			.and_then(|value| value.strip_prefix("Bearer "));
+		let token = self.token.read();
+		let valid = supplied.is_some_and(|supplied| {
+			ring::constant_time::verify_slices_are_equal(
+				supplied.as_bytes(),
+				token.expose_secret().as_bytes(),
+			)
+			.is_ok()
+		});
+		if valid {
+			Ok(request)
+		} else {
+			Err(Status::unauthenticated("valid gateway bearer token required"))
+		}
+	}
+}
+
+fn bearer_interceptor(
+	mut auth: BearerAuth,
+) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone {
+	move |request| auth.authorize(request)
+}
+
+fn load_gateway_token(path: &Path) -> Result<SecretString, DaemonError> {
+	let bytes = Zeroizing::new(std::fs::read(path).map_err(DaemonError::GatewayToken)?);
+	parse_gateway_token(&bytes).ok_or(DaemonError::EmptyGatewayToken)
+}
+
+fn parse_gateway_token(bytes: &[u8]) -> Option<SecretString> {
+	let value = std::str::from_utf8(bytes).ok()?.trim();
+	(!value.is_empty()).then(|| SecretString::from(value.to_owned()))
+}
+
+async fn watch_gateway_token(
+	path: PathBuf,
+	token: Arc<RwLock<SecretString>>,
+	mut shutdown: watch::Receiver<bool>,
+) {
+	let mut interval = tokio::time::interval(Duration::from_millis(250));
+	loop {
+		tokio::select! {
+			_ = interval.tick() => {
+				if let Ok(bytes) = tokio::fs::read(&path).await {
+					let bytes = Zeroizing::new(bytes);
+					if let Some(next) = parse_gateway_token(&bytes)
+						&& next.expose_secret() != token.read().expose_secret()
+					{
+						*token.write() = next;
+					}
+				}
+			},
+			changed = shutdown.changed() => {
+				if changed.is_err() || *shutdown.borrow() {
+					return;
+				}
+			},
+		}
+	}
+}
+
 /// Running comprehensive inference registry.
 pub struct DaemonHandle {
 	readiness: DaemonReadiness,
 	registry:  Registry,
-	shutdown:  watch::Sender<bool>,
-	rpc_task:  JoinHandle<Result<(), tonic::transport::Error>>,
+	shutdown:   watch::Sender<bool>,
+	rpc_task:   JoinHandle<Result<(), tonic::transport::Error>>,
+	token_task: Option<JoinHandle<()>>,
 }
 
 impl DaemonHandle {
@@ -1036,29 +1222,123 @@ impl DaemonHandle {
 			.iter()
 			.filter(|route| registry.contains_service(&route.id))
 			.count();
-		let incoming = omp_rpc::uds::listen(config.endpoint.as_path())
-			.await
-			.map_err(DaemonError::RpcListen)?;
+		let endpoint = config.endpoint;
+		let bearer_token_file = config.bearer_token_file;
 		let (shutdown, mut rpc_shutdown) = watch::channel(false);
 		let blobs = Arc::new(BlobStore::open(&data_dir)?);
-		let inference = InferenceServer::new(inference);
-		let auth = AuthServer::new(AuthRpc::new(registry.clone()));
-		let blobs = BlobServer::new(BlobRpc::new(blobs));
-		let rpc_task = tokio::spawn(async move {
-			Server::builder()
-				.add_service(inference)
-				.add_service(blobs)
-				.add_service(auth)
-				.serve_with_incoming_shutdown(incoming, async move {
-					while !*rpc_shutdown.borrow() && rpc_shutdown.changed().await.is_ok() {}
-				})
-				.await
-		});
+		let hello = || {
+			omp_rpc::HelloService::new(
+				env!("CARGO_PKG_VERSION"),
+				vec![sf!("auth"), sf!("inference.native"), sf!("gateway.forward")],
+			)
+		};
+		let (rpc_task, token_task) = match &endpoint {
+			LocalEndpoint::Local(path) => {
+				let incoming = omp_rpc::uds::listen(path)
+					.await
+					.map_err(DaemonError::RpcListen)?;
+				let inference_service = InferenceServer::new(inference.clone());
+				let gateway = GatewayServer::new(hello());
+				let forward = ForwardProxyServer::new(GatewayRpc::new(inference.clone()));
+				let auth = AuthServer::new(AuthRpc::new(registry.clone()));
+				let blobs = BlobServer::new(BlobRpc::new(blobs.clone()));
+				let task = tokio::spawn(async move {
+					Server::builder()
+						.add_service(gateway)
+						.add_service(forward)
+						.add_service(inference_service)
+						.add_service(blobs)
+						.add_service(auth)
+						.serve_with_incoming_shutdown(incoming, async move {
+							while !*rpc_shutdown.borrow() && rpc_shutdown.changed().await.is_ok() {}
+						})
+						.await
+				});
+				(task, None)
+			},
+			LocalEndpoint::Tcp(address) => {
+				if bearer_token_file.is_none() && !address.ip().is_loopback() {
+					return Err(DaemonError::UnauthenticatedRemoteTcp);
+				}
+				let listener = tokio::net::TcpListener::bind(address)
+					.await
+					.map_err(DaemonError::TcpListen)?;
+				let incoming = TcpListenerStream::new(listener);
+				if let Some(path) = bearer_token_file {
+					let auth_state = BearerAuth {
+						token: Arc::new(RwLock::new(load_gateway_token(&path)?)),
+					};
+					let token_shutdown = rpc_shutdown.clone();
+					let token_task = tokio::spawn(watch_gateway_token(
+						path,
+						auth_state.token.clone(),
+						token_shutdown,
+					));
+					let inference_service = InferenceServer::with_interceptor(
+						inference.clone(),
+						bearer_interceptor(auth_state.clone()),
+					);
+					let gateway = GatewayServer::with_interceptor(
+						hello(),
+						bearer_interceptor(auth_state.clone()),
+					);
+					let forward = ForwardProxyServer::with_interceptor(
+						GatewayRpc::new(inference.clone()),
+						bearer_interceptor(auth_state.clone()),
+					);
+					let auth = AuthServer::with_interceptor(
+						AuthRpc::new(registry.clone()),
+						bearer_interceptor(auth_state.clone()),
+					);
+					let blobs = BlobServer::with_interceptor(
+						BlobRpc::new(blobs.clone()),
+						bearer_interceptor(auth_state),
+					);
+					let task = tokio::spawn(async move {
+						Server::builder()
+							.add_service(gateway)
+							.add_service(forward)
+							.add_service(inference_service)
+							.add_service(blobs)
+							.add_service(auth)
+							.serve_with_incoming_shutdown(incoming, async move {
+								while !*rpc_shutdown.borrow()
+									&& rpc_shutdown.changed().await.is_ok()
+								{}
+							})
+							.await
+					});
+					(task, Some(token_task))
+				} else {
+					let inference_service = InferenceServer::new(inference.clone());
+					let gateway = GatewayServer::new(hello());
+					let forward = ForwardProxyServer::new(GatewayRpc::new(inference.clone()));
+					let auth = AuthServer::new(AuthRpc::new(registry.clone()));
+					let blobs = BlobServer::new(BlobRpc::new(blobs.clone()));
+					let task = tokio::spawn(async move {
+						Server::builder()
+							.add_service(gateway)
+							.add_service(forward)
+							.add_service(inference_service)
+							.add_service(blobs)
+							.add_service(auth)
+							.serve_with_incoming_shutdown(incoming, async move {
+								while !*rpc_shutdown.borrow()
+									&& rpc_shutdown.changed().await.is_ok()
+								{}
+							})
+							.await
+					});
+					(task, None)
+				}
+			},
+		};
 		Ok(Self {
-			readiness: DaemonReadiness { endpoint: config.endpoint, routes },
+			readiness: DaemonReadiness { endpoint, routes },
 			registry,
 			shutdown,
 			rpc_task,
+			token_task,
 		})
 	}
 
@@ -1100,16 +1380,61 @@ impl DaemonHandle {
 			.await
 			.map_err(DaemonError::RpcTask)?
 			.map_err(DaemonError::RpcServe)?;
+		if let Some(task) = self.token_task.take() {
+			task.await.map_err(DaemonError::RpcTask)?;
+		}
 		#[cfg(unix)]
-		match tokio::fs::remove_file(self.readiness.endpoint.as_path()).await {
-			Ok(()) => {},
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-			Err(error) => return Err(DaemonError::PrepareState(error)),
+		if let LocalEndpoint::Local(path) = &self.readiness.endpoint {
+			match tokio::fs::remove_file(path).await {
+				Ok(()) => {},
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+				Err(error) => return Err(DaemonError::PrepareState(error)),
+			}
 		}
 
 		Ok(())
 	}
 }
+#[cfg(test)]
+mod gateway_bearer_tests {
+	use std::sync::Arc;
+
+	use omp_core::SecretString;
+	use tonic::{Code, Request, metadata::MetadataValue};
+
+	use super::{BearerAuth, RwLock};
+
+	fn request(token: &str) -> Request<()> {
+		let mut request = Request::new(());
+		request
+			.metadata_mut()
+			.insert("authorization", MetadataValue::try_from(token).expect("metadata"));
+		request
+	}
+
+	#[test]
+	fn bearer_auth_rejects_bad_tokens_and_observes_rotation() {
+		let token = Arc::new(RwLock::new(SecretString::from("first-token")));
+		let mut auth = BearerAuth { token: token.clone() };
+		let error = auth
+			.authorize(request("Bearer wrong-token"))
+			.expect_err("bad bearer must fail");
+		assert_eq!(error.code(), Code::Unauthenticated);
+		auth
+			.authorize(request("Bearer first-token"))
+			.expect("current bearer");
+
+		*token.write() = SecretString::from("rotated-token");
+		assert!(
+			auth.authorize(request("Bearer first-token")).is_err(),
+			"rotated-out bearer must stop authorizing",
+		);
+		auth
+			.authorize(request("Bearer rotated-token"))
+			.expect("rotated bearer");
+	}
+}
+
 #[cfg(test)]
 mod credential_key_mode_tests {
 	use std::ffi::OsStr;

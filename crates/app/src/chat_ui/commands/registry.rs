@@ -387,7 +387,7 @@ impl CommandRoster {
 		text: &'a str,
 		surface: CommandSurface,
 		host: &'a mut dyn CommandHost,
-	) -> Pin<Box<dyn Future<Output = miette::Result<DispatchResult>> + 'a>> {
+	) -> Pin<Box<dyn Future<Output = miette::Result<DispatchResult>> + Send + 'a>> {
 		Box::pin(async move {
 			let Some(body) = text.strip_prefix('/') else {
 				return Ok(DispatchResult::Passthrough(Str::new(text)));

@@ -5,6 +5,7 @@ use std::{
 	io::Write as _,
 	path::{Path, PathBuf},
 	process::Command,
+	time::{SystemTime, UNIX_EPOCH},
 };
 
 use futures::StreamExt as _;
@@ -213,10 +214,7 @@ fn select<'a>(index: &'a SignedIndex, package: &str, target: &str) -> miette::Re
 		.iter()
 		.filter(|release| release.attested && !release.yanked)
 		.filter_map(|release| {
-			release
-				.artifacts
-				.iter()
-				.find(|artifact| artifact.target.as_str() == target)
+			target_artifact(release, target)
 				.map(|artifact| (release, artifact))
 		})
 		.max_by(|(left, _), (right, _)| {
@@ -232,6 +230,12 @@ fn select<'a>(index: &'a SignedIndex, package: &str, target: &str) -> miette::Re
 	)
 	.map_err(|error| miette!("{error}"))?;
 	Ok(Selected { issued_at: &index.issued_at, extension, release, artifact })
+}
+fn target_artifact<'a>(release: &'a IndexRelease, target: &str) -> Option<&'a IndexArtifact> {
+	release
+		.artifacts
+		.iter()
+		.find(|artifact| artifact.target.as_str() == target)
 }
 
 async fn install(selected: Selected<'_>) -> miette::Result<()> {
@@ -259,6 +263,7 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 		.open(&lock_path)
 		.map_err(|error| miette!("another updater owns {}: {error}", lock_path.display()))?;
 	let _lock = UpdateLock(lock_path);
+
 	let bytes = fetch_asset(selected.artifact).await?;
 	verify_bytes(&bytes, selected.artifact)?;
 	let executable = extract_executable(&bytes, selected.artifact.file.as_str())?;
@@ -266,7 +271,12 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 	let destination = renamed_destination(&current);
 	let install_dir = destination.parent().unwrap_or_else(|| Path::new("."));
 	prune_stale(install_dir)?;
-	let staged = install_dir.join(format!("omp-{}.staged", std::process::id()));
+	let timestamp = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.into_diagnostic()?
+		.as_millis();
+	let attempt = format!("{timestamp}.{}", std::process::id());
+	let (staged, backup) = update_artifact_paths(&destination, &attempt)?;
 	write_executable(&staged, &executable)?;
 	let mut keys =
 		KeysFile::read(&data_dir.join("ext/keys.toml")).map_err(|error| miette!("{error}"))?;
@@ -282,11 +292,13 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 	keys
 		.write(&data_dir.join("ext/keys.toml"))
 		.into_diagnostic()?;
-	atomic_replace(&staged, &destination, selected.release.version.as_str())?;
-	#[cfg(not(windows))]
-	if destination != current {
-		fs::remove_file(current).into_diagnostic()?;
-	}
+	atomic_replace(
+		&staged,
+		&destination,
+		&backup,
+		selected.release.version.as_str(),
+	)?;
+	retire_renamed_source(&current, &destination, &attempt)?;
 	Ok(())
 }
 
@@ -371,15 +383,58 @@ fn write_executable(path: &Path, bytes: &[u8]) -> miette::Result<()> {
 	Ok(())
 }
 
-fn atomic_replace(staged: &Path, destination: &Path, expected_version: &str) -> miette::Result<()> {
-	let backup = destination.with_extension(format!("backup-{}", std::process::id()));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenameFailureKind {
+	Denied,
+	Other,
+}
+
+fn classify_rename_failure(error: &std::io::Error) -> RenameFailureKind {
+	if error.kind() == std::io::ErrorKind::PermissionDenied
+		|| matches!(error.raw_os_error(), Some(5 | 32 | 33))
+	{
+		RenameFailureKind::Denied
+	} else {
+		RenameFailureKind::Other
+	}
+}
+
+fn update_artifact_paths(
+	destination: &Path,
+	attempt: &str,
+) -> miette::Result<(PathBuf, PathBuf)> {
+	let file = destination
+		.file_name()
+		.ok_or_else(|| miette!("update destination has no filename"))?
+		.to_string_lossy();
+	let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+	Ok((
+		parent.join(format!("{file}.{attempt}.new")),
+		parent.join(format!("{file}.{attempt}.bak")),
+	))
+}
+
+fn atomic_replace(
+	staged: &Path,
+	destination: &Path,
+	backup: &Path,
+	expected_version: &str,
+) -> miette::Result<()> {
 	let had_destination = destination.exists();
 	if had_destination {
-		fs::rename(destination, &backup).into_diagnostic()?;
+		if let Err(error) = fs::rename(destination, backup) {
+			return match classify_rename_failure(&error) {
+				RenameFailureKind::Denied => Err(miette!(
+					"running omp executable could not be renamed; the existing installation was \
+					 left untouched"
+				)),
+				RenameFailureKind::Other => Err(error).into_diagnostic(),
+			};
+		}
 	}
 	if let Err(error) = fs::rename(staged, destination) {
 		if had_destination {
-			let _ = fs::rename(&backup, destination);
+			let _ = fs::rename(backup, destination);
 		}
 		return Err(error).into_diagnostic();
 	}
@@ -393,34 +448,78 @@ fn atomic_replace(staged: &Path, destination: &Path, expected_version: &str) -> 
 		let failed = destination.with_extension("failed-update");
 		let _ = fs::rename(destination, &failed);
 		if had_destination {
-			fs::rename(&backup, destination).into_diagnostic()?;
+			fs::rename(backup, destination).into_diagnostic()?;
 		}
 		let _ = fs::remove_file(failed);
 		return Err(miette!("installed omp failed version verification; previous binary restored"));
 	}
 	if had_destination {
-		fs::remove_file(backup).into_diagnostic()?;
+		// Windows keeps the renamed process image mapped until this updater
+		// exits. A failed unlink does not invalidate a verified replacement;
+		// the next locked update reclaims the numeric `.bak` sidecar.
+		let _ = fs::remove_file(backup);
 	}
 	Ok(())
 }
 
+fn retire_renamed_source(current: &Path, destination: &Path, attempt: &str) -> miette::Result<()> {
+	if current == destination || !current.exists() {
+		return Ok(());
+	}
+	let (_, backup) = update_artifact_paths(current, attempt)?;
+	fs::rename(current, &backup).into_diagnostic()?;
+	let _ = fs::remove_file(backup);
+	Ok(())
+}
+
 fn renamed_destination(current: &Path) -> PathBuf {
+	renamed_destination_for(current, cfg!(windows))
+}
+
+fn renamed_destination_for(current: &Path, windows: bool) -> PathBuf {
 	if current
 		.file_stem()
 		.and_then(|name| name.to_str())
 		.is_some_and(|name| matches!(name, "pi" | "oh-my-pi"))
 	{
-		return current.with_file_name(if cfg!(windows) { "omp.exe" } else { "omp" });
+		return current.with_file_name(if windows { "omp.exe" } else { "omp" });
 	}
 	current.to_path_buf()
 }
+fn is_update_artifact_name(name: &str) -> bool {
+	const BASES: [&str; 6] = ["omp.exe", "oh-my-pi.exe", "pi.exe", "omp", "oh-my-pi", "pi"];
+	for base in BASES {
+		let Some(rest) = name.strip_prefix(base) else {
+			continue;
+		};
+		let middle = if let Some(middle) = rest.strip_suffix(".bak") {
+			middle
+		} else if let Some(middle) = rest.strip_suffix(".new") {
+			middle
+		} else {
+			continue;
+		};
+		if middle.is_empty()
+			|| middle.strip_prefix('.').is_some_and(|numeric| {
+				!numeric.is_empty()
+					&& numeric
+						.split('.')
+						.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+			})
+		{
+			return true;
+		}
+	}
+	false
+}
 
-fn prune_stale(cache: &Path) -> miette::Result<()> {
-	for entry in fs::read_dir(cache).into_diagnostic()? {
+fn prune_stale(directory: &Path) -> miette::Result<()> {
+	for entry in fs::read_dir(directory).into_diagnostic()? {
 		let entry = entry.into_diagnostic()?;
 		let name = entry.file_name();
-		let name = name.to_string_lossy();
-		if (name.starts_with("omp-") && name.ends_with(".staged")) || name.contains(".backup-") {
+		if is_update_artifact_name(&name.to_string_lossy()) {
+			// A mapped Windows backup may still belong to a running older
+			// updater. Deletion remains best-effort just like pi.
 			let _ = fs::remove_file(entry.path());
 		}
 	}
@@ -531,4 +630,117 @@ async fn upgrade_extensions() -> miette::Result<()> {
 		}),
 	})
 	.await
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn artifact(target: &'static str, file: &'static str) -> IndexArtifact {
+		IndexArtifact {
+			target: Str::new_static(target),
+			url: format!("https://releases.example/{file}"),
+			file: Str::new_static(file),
+			tag: Str::new_static("native"),
+			size: 1,
+			blake3: Str::new_static("b3:00"),
+			sha256: Str::new_static("sha256:00"),
+			signature: Str::new_static("signature"),
+		}
+	}
+
+	#[test]
+	fn windows_release_selects_its_attested_target_asset() {
+		let windows = "x86_64-pc-windows-msvc";
+		let release = IndexRelease {
+			version: Str::new_static("18.0.0"),
+			manifest_digest: Str::new_static("b3:manifest"),
+			capability_digest: Str::new_static("b3:capabilities"),
+			attested: true,
+			yanked: false,
+			shadows: Vec::new(),
+			artifacts: vec![
+				artifact("aarch64-apple-darwin", "omp-darwin"),
+				artifact(windows, "omp.exe"),
+			],
+		};
+		assert_eq!(target_artifact(&release, windows).unwrap().file, "omp.exe");
+	}
+
+	#[test]
+	fn rename_denial_is_classified_without_a_helper_route() {
+		let portable = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+		assert_eq!(classify_rename_failure(&portable), RenameFailureKind::Denied);
+		let windows_sharing_violation = std::io::Error::from_raw_os_error(32);
+		assert_eq!(
+			classify_rename_failure(&windows_sharing_violation),
+			RenameFailureKind::Denied
+		);
+		let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+		assert_eq!(classify_rename_failure(&missing), RenameFailureKind::Other);
+	}
+
+	#[test]
+	fn stale_numeric_backups_and_downloads_are_pruned() {
+		let root = tempfile::tempdir().unwrap();
+		for name in [
+			"omp.100.42.bak",
+			"omp.exe.101.43.new",
+			"pi.102.44.bak",
+			"oh-my-pi.exe.103.45.bak",
+			"omp.bak",
+		] {
+			fs::write(root.path().join(name), b"stale").unwrap();
+		}
+		for name in ["omp.notes.bak", "company.bak", "omp.100.42.txt"] {
+			fs::write(root.path().join(name), b"keep").unwrap();
+		}
+		prune_stale(root.path()).unwrap();
+		assert!(!root.path().join("omp.100.42.bak").exists());
+		assert!(!root.path().join("omp.exe.101.43.new").exists());
+		assert!(!root.path().join("pi.102.44.bak").exists());
+		assert!(!root.path().join("oh-my-pi.exe.103.45.bak").exists());
+		assert!(!root.path().join("omp.bak").exists());
+		assert!(root.path().join("omp.notes.bak").exists());
+		assert!(root.path().join("company.bak").exists());
+		assert!(root.path().join("omp.100.42.txt").exists());
+	}
+	#[cfg(unix)]
+	#[test]
+	fn atomic_replace_verifies_and_removes_backup() {
+		let root = tempfile::tempdir().unwrap();
+		let destination = root.path().join("omp");
+		let staged = root.path().join("omp.100.42.new");
+		let backup = root.path().join("omp.100.42.bak");
+		write_executable(&destination, b"#!/bin/sh\necho 'omp 17.0.0'\n").unwrap();
+		write_executable(&staged, b"#!/bin/sh\necho 'omp 18.0.0'\n").unwrap();
+		atomic_replace(&staged, &destination, &backup, "18.0.0").unwrap();
+		assert!(!backup.exists());
+		assert_eq!(
+			fs::read_to_string(destination).unwrap(),
+			"#!/bin/sh\necho 'omp 18.0.0'\n"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn atomic_replace_restores_previous_binary_after_failed_verification() {
+		let root = tempfile::tempdir().unwrap();
+		let destination = root.path().join("omp");
+		let staged = root.path().join("omp.100.42.new");
+		let backup = root.path().join("omp.100.42.bak");
+		let old = b"#!/bin/sh\necho 'omp 17.0.0'\n";
+		write_executable(&destination, old).unwrap();
+		write_executable(&staged, b"#!/bin/sh\necho 'not omp'\n").unwrap();
+		assert!(atomic_replace(&staged, &destination, &backup, "18.0.0").is_err());
+		assert_eq!(fs::read(destination).unwrap(), old);
+		assert!(!backup.exists());
+	}
+
+	#[test]
+	fn legacy_windows_name_migrates_to_omp_exe() {
+		assert_eq!(
+			renamed_destination_for(Path::new("/tools/pi.exe"), true),
+			PathBuf::from("/tools/omp.exe")
+		);
+	}
 }
