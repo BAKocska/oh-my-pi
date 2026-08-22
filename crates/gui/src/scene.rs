@@ -61,6 +61,13 @@ pub trait Scene {
 	/// Routes clipboard text; `raw` inserts verbatim without attachment
 	/// staging or drop classification.
 	fn paste(&mut self, text: &str, raw: bool) -> Effect;
+	/// Pumps host-external state before the next paint.
+	///
+	/// Channel-driven scenes use this to request repaint, clipboard, or exit
+	/// effects without waiting for a user input event.
+	fn poll(&mut self) -> Effect {
+		Effect::Ignored
+	}
 
 	/// Repaint cadence while the scene animates.
 	fn tick(&self) -> Duration;

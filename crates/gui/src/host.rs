@@ -90,6 +90,9 @@ pub struct HostConfig {
 	pub native_decor: bool,
 	/// Initial logical window size.
 	pub size:         (f64, f64),
+	/// Permit tabs, splits, and additional windows that each require a fresh
+	/// scene.
+	pub multiplex:    bool,
 }
 
 impl Default for HostConfig {
@@ -104,13 +107,14 @@ impl Default for HostConfig {
 			opacity:      opacity.clamp(0.1, 1.0),
 			native_decor: true,
 			size:         (1120.0, 720.0),
+			multiplex:    true,
 		}
 	}
 }
 
 /// Runs scenes built by `build` — one per pane — in GPU windows until the
 /// last window closes. `build` seeds the first pane and runs again for
-/// every new split, tab, and window.
+/// every new split, tab, and window when [`HostConfig::multiplex`] is enabled.
 pub fn run<S: Scene>(config: HostConfig, build: impl Fn(&UiContext) -> S) {
 	let event_loop = EventLoop::<UserEvent>::with_user_event()
 		.build()
@@ -1102,6 +1106,9 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 	/// Opens a window seeded with one tab holding one fresh pane. `size` is
 	/// the spawning window's logical size, or the config default.
 	fn spawn_window(&mut self, el: &ActiveEventLoop, size: Option<LogicalSize<f64>>) {
+		if !self.config.multiplex && !self.windows.is_empty() {
+			return;
+		}
 		let size = size.unwrap_or_else(|| LogicalSize::new(self.config.size.0, self.config.size.1));
 		let attrs = Window::default_attributes()
 			.with_title(&self.config.title)
@@ -1189,6 +1196,9 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 
 	/// Appends and activates a tab holding one fresh pane.
 	fn new_tab(&mut self, widx: usize) {
+		if !self.config.multiplex {
+			return;
+		}
 		let scene = (self.build)(&self.windows[widx].ctx);
 		let win = &mut self.windows[widx];
 		let id = PaneId(win.next_pane);
@@ -1208,6 +1218,9 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 	/// Splits the focused pane, focusing the fresh half; a no-op when the
 	/// pane cannot fit two minimum-size children plus the gutter.
 	fn split(&mut self, widx: usize, axis: Axis) {
+		if !self.config.multiplex {
+			return;
+		}
 		let win = &self.windows[widx];
 		let gutter = GUTTER * win.px_scale();
 		let focused = win.focused();
@@ -1892,6 +1905,23 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 	}
 
 	fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+		let mut effects = SmallVec::<(WindowId, PaneId, Effect), 4>::new();
+		for win in &mut self.windows {
+			for tab in &mut win.tabs {
+				for pane in &mut tab.panes {
+					match pane.scene.poll() {
+						Effect::Ignored => {},
+						effect => effects.push((win.id, pane.id, effect)),
+					}
+				}
+			}
+		}
+		for (window, pane, effect) in effects {
+			self.handle_effect(el, window, pane, effect);
+			if let Some(win) = self.windows.iter().find(|win| win.id == window) {
+				win.window.request_redraw();
+			}
+		}
 		let now = Instant::now();
 		let mut wake: Option<Instant> = None;
 		for win in &mut self.windows {

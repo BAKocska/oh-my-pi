@@ -70,7 +70,7 @@ struct ChatState {
 
 impl ChatState {
 	fn new(ctx: &UiContext, viewport: Size, facts: &StatusFacts) -> Self {
-		let sidebar = Sidebar::new(facts, ctx);
+		let sidebar = Sidebar::new_hidden(facts, ctx);
 		let mut chat = Chat::new(ctx);
 		chat.set_status(facts.clone());
 		chat.set_right_inset(sidebar.reserved(viewport));
