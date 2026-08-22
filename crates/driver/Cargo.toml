@@ -1,0 +1,92 @@
+[package]
+name = "omp-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Headless coding-agent harness: session composition, execution modes, orchestration, discovery, and settings for OMP"
+readme = "README.md"
+
+[features]
+default = ["local-applefm", "local-embedding", "local-text", "local-stt", "local-tts"]
+local = ["omp-inference/local"]
+local-applefm = ["local", "omp-inference/local-applefm"]
+local-embedding = ["local", "omp-inference/local-embedding"]
+local-text = ["local", "omp-inference/local-text"]
+local-stt = ["local", "omp-inference/local-stt"]
+local-tts = ["local", "omp-inference/local-tts"]
+
+[dependencies]
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+handlebars = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+im = { workspace = true }
+inventory = { workspace = true }
+omp-agent = { workspace = true }
+omp-ar = { workspace = true }
+omp-collab = { workspace = true }
+omp-core = { workspace = true }
+omp-docserver = { workspace = true }
+omp-env = { workspace = true }
+omp-envd = { workspace = true }
+omp-ext = { workspace = true }
+omp-catalog = { workspace = true }
+omp-inference = { workspace = true }
+omp-serve = { workspace = true }
+omp-memory = { workspace = true }
+omp-proto = { workspace = true, features = ["tonic"] }
+omp-rpc = { workspace = true }
+omp-sdk = { workspace = true }
+omp-secrets = { workspace = true }
+omp-settings = { workspace = true }
+omp-storage = { workspace = true }
+omp-telemetry = { workspace = true }
+omp-tool = { workspace = true }
+omp-tools = { workspace = true }
+omp-walker = { workspace = true }
+parking_lot = { workspace = true }
+rusqlite = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tonic = { workspace = true }
+
+url = { workspace = true }
+wreq = { workspace = true }
+zeroize = { workspace = true }
+
+libc = { workspace = true }
+xutf = { workspace = true }
+prost = { workspace = true }
+smallvec = { workspace = true }
+ring = { workspace = true }
+globset = { workspace = true }
+notify = { workspace = true }
+omp-slopjson = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+
+[lints]
+workspace = true
