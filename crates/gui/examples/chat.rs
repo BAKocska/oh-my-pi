@@ -456,6 +456,7 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 					let _ = events.send(BackendEvent::ToolStarted {
 						id:    tool.clone(),
 						name:  sf!("shell"),
+						rev:   sf!("r0"),
 						title: sf!("Inspect chat scene"),
 					});
 					let _ = events.send(BackendEvent::ToolOutput {
@@ -500,9 +501,16 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				)));
 			},
 			Intent::Login(_)
+			| Intent::AgentSteer { .. }
+			| Intent::AgentRevive { .. }
+			| Intent::AgentKill { .. }
 			| Intent::AuthAnswer { .. }
 			| Intent::AuthCancel
 			| Intent::RewindRequest
+			| Intent::PtyInput { .. }
+			| Intent::PtyResize { .. }
+			| Intent::PtyKill { .. }
+			| Intent::Approval { .. }
 			| Intent::Rewind { .. } => {},
 			Intent::Quit => break,
 		}

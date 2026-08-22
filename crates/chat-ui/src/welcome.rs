@@ -19,6 +19,7 @@
 
 use std::{
 	f32::consts::{PI, TAU},
+	fmt::Write as _,
 	time::Duration,
 };
 
@@ -32,7 +33,7 @@ use omp_tui::{
 	shader::{Eclipse, Surface},
 };
 
-use crate::SessionRow;
+use crate::{ModelDownloadProgress, SessionRow};
 
 /// Wide card: logo on the left, recent sessions on the right.
 const CARD_COLS: u16 = 98;
@@ -190,6 +191,12 @@ pub enum WelcomeEvent {
 }
 
 /// Animated welcome screen with a host-provided recent-session index.
+struct WelcomeDownload {
+	progress:  ModelDownloadProgress,
+	received:  Duration,
+	completed: Option<Duration>,
+}
+
 pub struct Welcome {
 	frame:          Frame,
 	title:          Str,
@@ -215,6 +222,7 @@ pub struct Welcome {
 	pointer:        Option<(u16, u16)>,
 	/// Eased hover amount driving the border glow.
 	hover:          Tween<f32>,
+	download:       Option<WelcomeDownload>,
 }
 
 impl Welcome {
@@ -244,7 +252,17 @@ impl Welcome {
 			surface:        Surface::new(),
 			pointer:        None,
 			hover:          Tween::settled(0.0),
+			download:       None,
 		}
+	}
+
+	/// Updates model download progress retained by the welcome activity row.
+	pub fn set_download_progress(&mut self, progress: ModelDownloadProgress, now: Duration) {
+		self.download = Some(WelcomeDownload {
+			completed: progress.complete.then_some(now),
+			progress,
+			received: now,
+		});
 	}
 
 	/// Replaces the recent-session index while preserving a visible selection.
@@ -350,6 +368,32 @@ impl Welcome {
 			.retarget(clock, if hovered { 1.0 } else { 0.0 }, HOVER_EASE, Easing::EaseOut);
 		let hover = self.hover.sample(clock).clamp(0.0, 1.0);
 		self.draw_card(cols, left, top, elapsed, hover);
+		if let Some(download) = &self.download
+			&& clock >= download.received.saturating_add(Duration::from_secs(1))
+			&& download
+				.completed
+				.is_none_or(|completed| clock < completed.saturating_add(Duration::from_secs(3)))
+		{
+			let mut label =
+				format!(" {} · {} bytes", download.progress.label, download.progress.downloaded);
+			if let Some(total) = download.progress.total.filter(|total| *total > 0) {
+				let percent = download.progress.downloaded.saturating_mul(100) / total;
+				let _ = write!(label, " / {total} · {percent}%");
+			}
+			if download.progress.complete {
+				label.push_str(" · ready");
+			}
+			self.frame.fill(
+				Rect::new(left + 1, top + CARD_ROWS - 2, cols - 2, 1),
+				on_footer(self.theme, self.theme.fg),
+			);
+			self.frame.put(
+				left + 3,
+				top + CARD_ROWS - 2,
+				&label,
+				on_footer(self.theme, self.theme.info),
+			);
+		}
 		&self.frame
 	}
 

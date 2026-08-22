@@ -71,7 +71,7 @@ pub use dap_adapter::{
 pub use dap_protocol::{DapInbound, DapProtocol, DapProtocolError, SpawnedDap};
 pub use dap_session::{
 	DapAction, DapApprovalTier, DapReverseRequestHandler, DapSession, DapSessionError,
-	DapSessionRegistry, DapSessionState,
+	DapSessionRegistry, DapSessionState, DapStopSnapshot,
 };
 pub use edit_adapter::{
 	EditAdapterRegistry, HASHLINE_EDIT_FORMAT, REPLACE_EDIT_FORMAT, TextEditAdapter,

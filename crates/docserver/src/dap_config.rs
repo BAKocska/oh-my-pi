@@ -167,7 +167,10 @@ impl ResolvedDapAdapter {
 		spec.attach_defaults = self.attach_defaults.value.clone();
 		spec.preference = self.preference.value;
 		spec.transport = match self.connect_mode.value.as_deref() {
-			Some("tcp" | "socket") => DapTransport::Tcp { port_argument: Str::new_static("${port}") },
+			Some("tcp") => DapTransport::Tcp { port_argument: Str::new_static("${port}") },
+			Some("socket" | "unix") => {
+				DapTransport::Unix { socket_argument: Str::new_static("${socket}") }
+			},
 			Some(mode) => {
 				return Err(DapConfigError::InvalidConnectMode {
 					adapter: self.name.clone(),

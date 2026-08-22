@@ -1,8 +1,8 @@
 //! Bounded retained-frame validation and exact-key storage.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Write as _};
 
-use omp_core::{IntoStr, Str};
+use omp_core::{IntoStr, Str, sf};
 use omp_proto::omp::ui::v1::{
 	FrameActionFired, RetainedFrame, RetainedFrameEnvelope, RetainedFrameKey,
 	retained_frame_envelope,
@@ -36,6 +36,16 @@ pub struct FrameIdentity {
 }
 
 impl FrameIdentity {
+	/// Creates an exact identity for a locally projected retained frame.
+	#[must_use]
+	pub fn new(kind: impl IntoStr, rev: impl IntoStr, stable_id: impl IntoStr) -> Self {
+		Self {
+			kind:      kind.into_str(),
+			rev:       rev.into_str(),
+			stable_id: stable_id.into_str(),
+		}
+	}
+
 	/// Borrows the semantic frame kind.
 	#[must_use]
 	pub fn kind(&self) -> &str {
@@ -238,6 +248,520 @@ fn validate_key(key: Option<&RetainedFrameKey>) -> Result<FrameIdentity, FrameEr
 	})
 }
 
+/// Builds the enhanced card for a known typed frame revision, otherwise
+/// returns the producer's required generic TML fallback.
+#[must_use]
+pub fn render_frame_tml(frame: &RetainedFrame) -> Str {
+	let fallback = || {
+		frame
+			.fallback
+			.as_ref()
+			.and_then(|tml| std::str::from_utf8(&tml.source).ok())
+			.map_or_else(|| sf!("<text fg=error>invalid retained-frame fallback</text>"), Str::from)
+	};
+	let Some(key) = frame.key.as_ref() else {
+		return fallback();
+	};
+	if !matches!(key.rev.as_str(), "1" | "v1") {
+		return fallback();
+	}
+	let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&frame.payload) else {
+		return fallback();
+	};
+	if let Some(rendered) = render_portfolio_card(&key.kind, &payload) {
+		return rendered;
+	}
+	let Some(spec) = card_spec(&key.kind) else {
+		return fallback();
+	};
+	render_typed_card(spec, &payload).unwrap_or_else(fallback)
+}
+
+fn render_portfolio_card(kind: &str, payload: &serde_json::Value) -> Option<Str> {
+	match kind {
+		"shell" | "exec" => render_shell_frame(payload),
+		"hub" => render_hub_frame(payload),
+		"irc" => render_irc_frame(payload),
+		"async-job" | "async_job" | "async-jobs" | "async_jobs" => render_job_frame(payload),
+		"process" | "processes" | "process-log" | "process_log" => render_process_frame(payload),
+		_ => None,
+	}
+}
+
+fn render_shell_frame(payload: &serde_json::Value) -> Option<Str> {
+	let object = payload.as_object()?;
+	if !["command", "status", "tail", "output", "detach_reason", "detachReason"]
+		.iter()
+		.any(|key| object.contains_key(*key))
+	{
+		return None;
+	}
+	let status = object
+		.get("status")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("running");
+	let running = matches!(status, "running" | "starting" | "queued");
+	let color = match status {
+		"exited" | "succeeded" | "success" => "success",
+		"timeout" | "timed_out" => "warning",
+		"failed" | "cancelled" | "denied" => "error",
+		_ => "accent",
+	};
+	let mut output = String::from("<box border=round pad=\"0 1\" bc=");
+	output.push_str(color);
+	output.push_str("><col gap=0><row gap=1><text bold fg=accent>$</text><text bold>shell</text>");
+	if running {
+		output.push_str("<spinner>");
+		push_tml_text(&mut output, status);
+		output.push_str("</spinner>");
+	} else {
+		output.push_str("<text fg=");
+		output.push_str(color);
+		output.push('>');
+		push_tml_text(&mut output, status);
+		output.push_str("</text>");
+	}
+	if let Some(code) = object.get("exit_code").and_then(serde_json::Value::as_i64) {
+		let _ = write!(output, "<text fg={color}>exit {code}</text>");
+	}
+	if let Some(wall_ms) = object
+		.get("wall_time_ms")
+		.or_else(|| object.get("wallClockMs"))
+		.and_then(serde_json::Value::as_u64)
+	{
+		let _ = write!(output, "<text dim>{wall_ms} ms</text>");
+	}
+	output.push_str("</row>");
+	if let Some(command) = object.get("command").and_then(serde_json::Value::as_str) {
+		output.push_str("<pre fg=accent>");
+		push_tml_text(&mut output, "$ ");
+		push_tml_text(&mut output, command);
+		output.push_str("</pre>");
+	}
+	if let Some(cwd) = object.get("cwd").and_then(serde_json::Value::as_str) {
+		output.push_str("<row gap=1><text dim>cwd</text><text truncate>");
+		push_tml_text(&mut output, cwd);
+		output.push_str("</text></row>");
+	}
+	if let Some(environment) = object.get("env").and_then(serde_json::Value::as_object) {
+		output.push_str("<row gap=1><text dim>env</text><text truncate>");
+		for (index, key) in environment.keys().take(12).enumerate() {
+			if index > 0 {
+				output.push_str(" · ");
+			}
+			push_tml_text(&mut output, key);
+		}
+		output.push_str("</text></row>");
+	}
+	if let Some(tail) = object
+		.get("tail")
+		.or_else(|| object.get("output"))
+		.and_then(serde_json::Value::as_str)
+	{
+		output.push_str("<pre fg=muted>");
+		push_tml_text(&mut output, tail);
+		output.push_str("</pre>");
+		if object.get("truncated").and_then(serde_json::Value::as_bool) == Some(true) {
+			output.push_str("<text dim>earlier output hidden · ctrl+o to expand</text>");
+		}
+	}
+	if let Some(reason) = object
+		.get("detach_reason")
+		.or_else(|| object.get("detachReason"))
+		.and_then(serde_json::Value::as_str)
+	{
+		output.push_str("<row gap=1><text fg=info>detached</text><text>");
+		push_tml_text(&mut output, reason);
+		output.push_str("</text></row>");
+	}
+	output.push_str("</col></box>");
+	Some(Str::new(output))
+}
+
+fn render_hub_frame(payload: &serde_json::Value) -> Option<Str> {
+	let object = payload.as_object()?;
+	if object.contains_key("peers") {
+		return render_roster_frame(payload);
+	}
+	if object.contains_key("jobs") {
+		return render_job_frame(payload);
+	}
+	if object.contains_key("processes") || object.contains_key("lines") {
+		return render_process_frame(payload);
+	}
+	if object.contains_key("messages")
+		|| object.contains_key("message")
+		|| object.contains_key("deliveries")
+	{
+		return render_irc_frame(payload);
+	}
+	let waited = value_u64(object, &["waiting_ms", "waitingMs", "waitedMs"])?;
+	let mut output = String::from(
+		"<box border=round pad=\"0 1\" bc=info><row gap=1><spinner>hub wait</spinner><text dim>",
+	);
+	let _ = write!(output, "{waited} ms elapsed");
+	output.push_str("</text></row></box>");
+	Some(Str::new(output))
+}
+
+fn render_roster_frame(payload: &serde_json::Value) -> Option<Str> {
+	let peers = payload.get("peers")?.as_array()?;
+	let mut output = String::from(
+		"<box border=round pad=\"0 1\" bc=info><col gap=0><row gap=1><text bold \
+		 fg=info>@</text><text bold>Hub roster</text><text dim>",
+	);
+	let _ = write!(output, "{} peers", peers.len());
+	output.push_str("</text></row>");
+	for peer in peers.iter().take(24) {
+		let Some(peer) = peer.as_object() else {
+			continue;
+		};
+		let name = value_string(peer, &["name", "callerName", "id"]).unwrap_or("unknown");
+		let status = value_string(peer, &["status", "lifecycle"]).unwrap_or("unknown");
+		output.push_str("<row gap=1>");
+		if matches!(status, "running" | "active" | "reviving" | "queued") {
+			output.push_str("<spinner></spinner>");
+		} else {
+			output.push_str("<text dim>○</text>");
+		}
+		output.push_str("<text bold>");
+		push_tml_text(&mut output, name);
+		output.push_str("</text><text dim>");
+		push_tml_text(&mut output, status);
+		if let Some(parent) = value_string(peer, &["parent", "parentId"]) {
+			output.push_str(" · child of ");
+			push_tml_text(&mut output, parent);
+		}
+		if let Some(unread) = value_u64(peer, &["unread", "unreadCount"])
+			&& unread > 0
+		{
+			let _ = write!(output, " · {unread} unread");
+		}
+		output.push_str("</text></row>");
+	}
+	output.push_str("</col></box>");
+	Some(Str::new(output))
+}
+
+fn render_irc_frame(payload: &serde_json::Value) -> Option<Str> {
+	let object = payload.as_object()?;
+	let mut output = String::from(
+		"<box border=round pad=\"0 1\" bc=info><col gap=0><row gap=1><text bold \
+		 fg=info>@</text><text bold>IRC</text></row>",
+	);
+	let rows = object
+		.get("messages")
+		.or_else(|| object.get("deliveries"))
+		.and_then(serde_json::Value::as_array);
+	if let Some(rows) = rows {
+		for row in rows.iter().take(24) {
+			push_irc_row(&mut output, row);
+		}
+	} else if object.contains_key("message") || object.contains_key("text") {
+		push_irc_row(&mut output, payload);
+	} else {
+		return None;
+	}
+	output.push_str("</col></box>");
+	Some(Str::new(output))
+}
+
+fn push_irc_row(output: &mut String, value: &serde_json::Value) {
+	let Some(message) = value.as_object() else {
+		return;
+	};
+	let text = value_string(message, &["text", "message", "status"]).unwrap_or_default();
+	output.push_str("<row gap=1><text fg=info>");
+	if let Some(title) = value_string(message, &["title"]) {
+		push_tml_text(output, title);
+	} else {
+		let from = value_string(message, &["from", "sender"]).unwrap_or("me");
+		let to = value_string(message, &["to", "recipient"]).unwrap_or("hub");
+		push_tml_text(output, from);
+		output.push_str(" → ");
+		push_tml_text(output, to);
+	}
+	output.push_str("</text><text>");
+	push_tml_text(output, text);
+	output.push_str("</text></row>");
+}
+
+fn render_job_frame(payload: &serde_json::Value) -> Option<Str> {
+	let object = payload.as_object()?;
+	if !["jobs", "name", "id", "job", "status", "state"]
+		.iter()
+		.any(|key| object.contains_key(*key))
+	{
+		return None;
+	}
+	let jobs = object.get("jobs").and_then(serde_json::Value::as_array);
+	let mut output = String::from(
+		"<box border=round pad=\"0 1\" bc=info><col gap=0><row gap=1><text bold \
+		 fg=info>&amp;</text><text bold>Jobs</text></row>",
+	);
+	if let Some(jobs) = jobs {
+		for job in jobs.iter().take(24) {
+			push_job_row(&mut output, job);
+		}
+	} else {
+		push_job_row(&mut output, payload);
+	}
+	output.push_str("</col></box>");
+	Some(Str::new(output))
+}
+
+fn push_job_row(output: &mut String, value: &serde_json::Value) {
+	let Some(job) = value.as_object() else {
+		return;
+	};
+	let name = value_string(job, &["name", "id", "job"]).unwrap_or("unknown");
+	let status = value_string(job, &["status", "state", "lifecycle"]).unwrap_or("unknown");
+	output.push_str("<row gap=1>");
+	if matches!(status, "running" | "active" | "queued" | "waiting") {
+		output.push_str("<spinner></spinner>");
+	} else {
+		output.push_str("<text dim>└</text>");
+	}
+	output.push_str("<text bold>");
+	push_tml_text(output, name);
+	output.push_str("</text><text dim>");
+	push_tml_text(output, status);
+	if let Some(duration) = value_u64(job, &["durationMs", "elapsedMs"]) {
+		let _ = write!(output, " · {duration} ms");
+	}
+	output.push_str("</text></row>");
+	if let Some(detail) = value_string(job, &["detail", "result", "error", "reason"]) {
+		output.push_str("<text dim>  ");
+		push_tml_text(output, detail);
+		output.push_str("</text>");
+	}
+}
+
+fn render_process_frame(payload: &serde_json::Value) -> Option<Str> {
+	let object = payload.as_object()?;
+	if !["processes", "lines", "name", "status", "state"]
+		.iter()
+		.any(|key| object.contains_key(*key))
+	{
+		return None;
+	}
+	let mut output = String::from(
+		"<box border=round pad=\"0 1\" bc=secondary><col gap=0><row gap=1><text bold \
+		 fg=secondary>&gt;_</text><text bold>Processes</text></row>",
+	);
+	if let Some(lines) = object.get("lines") {
+		output.push_str("<box border=round bc=muted><pre>");
+		match lines {
+			serde_json::Value::Array(lines) => {
+				for (index, line) in lines.iter().take(80).enumerate() {
+					if index > 0 {
+						output.push('\n');
+					}
+					push_tml_text(&mut output, line.as_str().unwrap_or_default());
+				}
+			},
+			serde_json::Value::String(lines) => push_tml_text(&mut output, lines),
+			_ => {},
+		}
+		output.push_str("</pre></box>");
+	} else if let Some(processes) = object
+		.get("processes")
+		.and_then(serde_json::Value::as_array)
+	{
+		for process in processes.iter().take(24) {
+			push_process_row(&mut output, process);
+		}
+	} else {
+		push_process_row(&mut output, payload);
+	}
+	output.push_str("</col></box>");
+	Some(Str::new(output))
+}
+
+fn push_process_row(output: &mut String, value: &serde_json::Value) {
+	let Some(process) = value.as_object() else {
+		return;
+	};
+	let name = value_string(process, &["name"]).unwrap_or("unknown");
+	let status = value_string(process, &["status", "state"]).unwrap_or("unknown");
+	output.push_str("<row gap=1><text bold>");
+	push_tml_text(output, name);
+	output.push_str("</text><text dim>");
+	push_tml_text(output, status);
+	if let Some(pid) = value_u64(process, &["pid"]) {
+		let _ = write!(output, " · pid {pid}");
+	}
+	if let Some(uptime) = value_u64(process, &["uptimeMs", "elapsedMs"]) {
+		let _ = write!(output, " · up {uptime} ms");
+	}
+	output.push_str("</text></row>");
+}
+
+fn value_string<'a>(
+	object: &'a serde_json::Map<String, serde_json::Value>,
+	keys: &[&str],
+) -> Option<&'a str> {
+	keys
+		.iter()
+		.find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+}
+
+fn value_u64(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<u64> {
+	keys
+		.iter()
+		.find_map(|key| object.get(*key).and_then(serde_json::Value::as_u64))
+}
+
+#[derive(Clone, Copy)]
+struct CardSpec {
+	label:    &'static str,
+	color:    &'static str,
+	icon:     &'static str,
+	max_rows: usize,
+}
+
+fn card_spec(kind: &str) -> Option<CardSpec> {
+	let (label, color, icon, max_rows) = match kind {
+		"diagnostic" | "diagnostics" => ("Diagnostics", "warning", "!", 12),
+		"todo" | "todos" => ("TODO", "accent", "[]", 12),
+		"usage" => ("Usage", "info", "%", 10),
+		"skill" => ("Skill", "accent", "*", 8),
+		"hook" => ("Hook", "warning", "~", 8),
+		"advisor" => ("Advisor", "secondary", "?", 8),
+		"tan" => ("TAN", "accent", "^", 8),
+		"irc" => ("IRC", "info", "@", 8),
+		"async-job" | "async_job" | "async-jobs" | "async_jobs" => ("Async jobs", "info", "&", 12),
+		"file-mention" | "file_mention" | "file-mentions" | "file_mentions" => {
+			("File mentions", "secondary", "#", 12)
+		},
+		"stripped-tool" | "stripped_tool" | "stripped-tools" | "stripped_tools" => {
+			("Stripped tools", "muted", "-", 12)
+		},
+		"policy" | "policy-fact" | "policy_fact" | "ttsr" => ("Policy", "warning", "!", 10),
+		_ => return None,
+	};
+	Some(CardSpec { label, color, icon, max_rows })
+}
+
+fn render_typed_card(spec: CardSpec, payload: &serde_json::Value) -> Option<Str> {
+	let object = payload.as_object()?;
+	let title = object
+		.get("title")
+		.or_else(|| object.get("name"))
+		.or_else(|| object.get("status"))
+		.and_then(serde_json::Value::as_str);
+	let detail = object
+		.get("detail")
+		.or_else(|| object.get("message"))
+		.or_else(|| object.get("summary"))
+		.or_else(|| object.get("reason"))
+		.and_then(serde_json::Value::as_str);
+	let mut output = String::from("<box border=round pad=\"0 1\" bc=");
+	output.push_str(spec.color);
+	output.push_str("><col gap=0><row gap=1><text bold fg=");
+	output.push_str(spec.color);
+	output.push('>');
+	push_tml_text(&mut output, spec.icon);
+	output.push_str("</text><text bold>");
+	push_tml_text(&mut output, spec.label);
+	output.push_str("</text>");
+	if let Some(title) = title {
+		output.push_str("<text dim truncate>");
+		push_tml_text(&mut output, title);
+		output.push_str("</text>");
+	}
+	output.push_str("</row>");
+	if let Some(detail) = detail {
+		output.push_str("<text>");
+		push_tml_text(&mut output, detail);
+		output.push_str("</text>");
+	}
+	let rows = card_rows(object);
+	for row in rows.iter().take(spec.max_rows) {
+		output.push_str("<row gap=1><text fg=");
+		output.push_str(spec.color);
+		output.push_str(">·</text><text truncate>");
+		push_tml_text(&mut output, row);
+		output.push_str("</text></row>");
+	}
+	if rows.len() > spec.max_rows {
+		output.push_str("<text dim>");
+		let _ = write!(output, "+{} more", rows.len() - spec.max_rows);
+		output.push_str("</text>");
+	}
+	if object
+		.get("ttl_ms")
+		.and_then(serde_json::Value::as_u64)
+		.is_some()
+	{
+		output.push_str("<text dim>presentation expires; durable fact retained</text>");
+	}
+	output.push_str("</col></box>");
+	Some(Str::new(output))
+}
+
+fn card_rows(object: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+	for key in
+		["items", "rows", "diagnostics", "todos", "jobs", "files", "messages", "tools", "facts"]
+	{
+		if let Some(values) = object.get(key).and_then(serde_json::Value::as_array) {
+			return values.iter().map(row_label).collect();
+		}
+	}
+	let mut rows = Vec::new();
+	for (key, value) in object {
+		if matches!(
+			key.as_str(),
+			"title" | "name" | "status" | "detail" | "message" | "summary" | "reason" | "ttl_ms"
+		) {
+			continue;
+		}
+		let value = row_label(value);
+		rows.push(format!("{key}: {value}"));
+	}
+	rows
+}
+
+fn row_label(value: &serde_json::Value) -> String {
+	match value {
+		serde_json::Value::String(text) => text.clone(),
+		serde_json::Value::Object(object) => {
+			let primary = object
+				.get("label")
+				.or_else(|| object.get("title"))
+				.or_else(|| object.get("path"))
+				.or_else(|| object.get("name"))
+				.or_else(|| object.get("message"))
+				.and_then(serde_json::Value::as_str);
+			let state = object
+				.get("status")
+				.or_else(|| object.get("severity"))
+				.or_else(|| object.get("state"))
+				.and_then(serde_json::Value::as_str);
+			match (primary, state) {
+				(Some(primary), Some(state)) => format!("{primary} · {state}"),
+				(Some(primary), None) => primary.to_owned(),
+				(None, Some(state)) => state.to_owned(),
+				(None, None) => serde_json::to_string(value).unwrap_or_default(),
+			}
+		},
+		_ => value.to_string(),
+	}
+}
+
+fn push_tml_text(output: &mut String, text: &str) {
+	for character in text.chars() {
+		match character {
+			'&' => output.push_str("&amp;"),
+			'<' => output.push_str("&lt;"),
+			'>' => output.push_str("&gt;"),
+			'"' => output.push_str("&quot;"),
+			'\'' => output.push_str("&apos;"),
+			_ => output.push(character),
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
@@ -246,7 +770,7 @@ mod tests {
 		RetainedFrameEnvelope, RetainedFrameKey, Tml, retained_frame_envelope,
 	};
 
-	use super::{FrameError, FrameMutation, RetainedFrames};
+	use super::{FrameError, FrameMutation, RetainedFrames, render_frame_tml};
 
 	fn key(rev: &str) -> RetainedFrameKey {
 		RetainedFrameKey {
@@ -346,5 +870,51 @@ mod tests {
 			.expect("remove unknown exact key");
 		assert!(matches!(removed, FrameMutation::Removed { existed: false, .. }));
 		assert_eq!(frames.len(), 1);
+	}
+	#[test]
+	fn exact_v1_shell_and_hub_frames_render_specialized_cards() {
+		let shell = RetainedFrame {
+			key:      Some(RetainedFrameKey {
+				kind:      "shell".into(),
+				rev:       "v1".into(),
+				stable_id: "shell:1".into(),
+			}),
+			payload:  Bytes::from_static(
+				br#"{"command":"printf '<ok>'","cwd":"/work","status":"timeout","exit_code":124,"wall_time_ms":5000,"tail":"partial","truncated":true}"#,
+			),
+			fallback: Some(Tml {
+				source: Bytes::from_static(b"<text>fallback</text>"),
+				hash:   0,
+			}),
+			actions:  Vec::new(),
+		};
+		let rendered = render_frame_tml(&shell);
+		assert!(rendered.contains("shell"));
+		assert!(rendered.contains("exit 124"));
+		assert!(rendered.contains("printf &apos;&lt;ok&gt;&apos;"));
+		assert!(rendered.contains("ctrl+o to expand"));
+
+		let mut unknown_shell = shell.clone();
+		unknown_shell.key.as_mut().expect("key").rev = "v2".into();
+		assert_eq!(render_frame_tml(&unknown_shell).as_str(), "<text>fallback</text>");
+		let mut malformed_shell = shell.clone();
+		malformed_shell.payload = Bytes::from_static(b"{}");
+		assert_eq!(render_frame_tml(&malformed_shell).as_str(), "<text>fallback</text>");
+		let hub = RetainedFrame {
+			key:      Some(RetainedFrameKey {
+				kind:      "hub".into(),
+				rev:       "v1".into(),
+				stable_id: "hub:1".into(),
+			}),
+			payload:  Bytes::from_static(
+				br#"{"peers":[{"name":"Scout","status":"running","parent":"Main","unreadCount":3}]}"#,
+			),
+			fallback: Some(Tml { source: Bytes::from_static(b"<text>fallback</text>"), hash: 0 }),
+			actions:  Vec::new(),
+		};
+		let rendered = render_frame_tml(&hub);
+		assert!(rendered.contains("Hub roster"));
+		assert!(rendered.contains("<spinner>"));
+		assert!(rendered.contains("3 unread"));
 	}
 }

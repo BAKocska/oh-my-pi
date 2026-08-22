@@ -3,6 +3,7 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
+	path::PathBuf,
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,10 +14,12 @@ use std::{
 use async_trait::async_trait;
 use omp_core::Str;
 use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use strum::{EnumString, IntoStaticStr};
 use thiserror::Error;
 use tokio::{
+	io::AsyncReadExt,
 	process::Child,
 	sync::{Mutex as AsyncMutex, broadcast},
 };
@@ -26,9 +29,11 @@ use crate::dap_protocol::{DapInbound, DapProtocol, DapProtocolError, SpawnedDap}
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+const SWEEP_INTERVALS: u8 = 6;
 
 /// Stable DAP lifecycle state.
-#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq, Serialize)]
 #[strum(serialize_all = "snake_case")]
 pub enum DapSessionState {
 	/// Adapter process and initialize request are starting.
@@ -44,7 +49,7 @@ pub enum DapSessionState {
 }
 
 /// Debug action exposed to policy and tool layers.
-#[derive(Clone, Copy, Debug, EnumString, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, EnumString, Eq, Hash, PartialEq, Serialize)]
 #[strum(serialize_all = "snake_case")]
 pub enum DapAction {
 	/// Start a program.
@@ -55,6 +60,10 @@ pub enum DapAction {
 	SetBreakpoint,
 	/// Remove a source breakpoint.
 	RemoveBreakpoint,
+	/// Add or replace a function breakpoint.
+	SetFunctionBreakpoint,
+	/// Remove a function breakpoint.
+	RemoveFunctionBreakpoint,
 	/// Add an instruction breakpoint.
 	SetInstructionBreakpoint,
 	/// Remove an instruction breakpoint.
@@ -141,6 +150,8 @@ impl DapAction {
 			| Self::Attach
 			| Self::SetBreakpoint
 			| Self::RemoveBreakpoint
+			| Self::SetFunctionBreakpoint
+			| Self::RemoveFunctionBreakpoint
 			| Self::SetInstructionBreakpoint
 			| Self::RemoveInstructionBreakpoint
 			| Self::SetDataBreakpoint
@@ -183,6 +194,23 @@ impl DapAction {
 	}
 }
 
+/// Stop context returned after a stepping or pause transition completes.
+#[derive(Clone, Debug, Serialize)]
+pub struct DapStopSnapshot {
+	/// Action that produced this state.
+	pub action:      DapAction,
+	/// Adapter stop reason.
+	pub reason:      Str,
+	/// Selected thread identity when supplied by the adapter.
+	pub thread_id:   Option<i64>,
+	/// Top stack frame, including source and line fields.
+	pub frame:       Option<Value>,
+	/// Requested stepping granularity.
+	pub granularity: Option<Str>,
+	/// Stable session state after the event.
+	pub state:       DapSessionState,
+}
+
 /// Session handshake, state, or protocol failure.
 #[derive(Debug, Error)]
 pub enum DapSessionError {
@@ -209,6 +237,9 @@ pub enum DapSessionError {
 	/// Session identity is absent.
 	#[error("debug session {0:?} was not found")]
 	NotFound(Str),
+	/// Adapter supplied an invalid reverse-request payload.
+	#[error("invalid DAP reverse request")]
+	InvalidReverseRequest,
 }
 
 /// Authority callback for adapter-to-client reverse requests.
@@ -230,33 +261,40 @@ impl DapReverseRequestHandler for RejectReverseRequests {
 	async fn handle(
 		&self,
 		_session: Arc<DapSession>,
-		command: &str,
+		_command: &str,
 		_arguments: Value,
 	) -> Result<Value, Str> {
-		Err(Str::from(format!("reverse request {command:?} is not configured")))
+		Err(Str::new_static("DAP reverse requests are not configured"))
 	}
 }
 
 /// One live DAP session and its child-session subtree.
 pub struct DapSession {
-	id:                  Str,
-	adapter:             Str,
-	protocol:            DapProtocol,
-	process:             Option<Arc<AsyncMutex<Child>>>,
-	state:               Mutex<DapSessionState>,
-	capabilities:        RwLock<Value>,
-	output:              Mutex<VecDeque<u8>>,
-	last_activity_ms:    AtomicU64,
-	revision:            AtomicU64,
-	event_sequence:      AtomicU64,
-	read_granted:        AtomicBool,
-	execute_granted:     AtomicBool,
-	event_byte_limit:    AtomicU64,
-	parent:              Mutex<Option<Weak<Self>>>,
-	children:            Mutex<Vec<Weak<Self>>>,
+	id: Str,
+	adapter: Str,
+	protocol: DapProtocol,
+	process: Option<Arc<AsyncMutex<Child>>>,
+	terminal_processes: Mutex<Vec<Arc<AsyncMutex<Child>>>>,
+	cleanup_path: Option<PathBuf>,
+	attached: bool,
+	state: Mutex<DapSessionState>,
+	capabilities: RwLock<Value>,
+	output: Mutex<VecDeque<u8>>,
+	last_activity_ms: AtomicU64,
+	revision: AtomicU64,
+	event_sequence: AtomicU64,
+	read_granted: AtomicBool,
+	execute_granted: AtomicBool,
+	event_byte_limit: AtomicU64,
+	parent: Mutex<Option<Weak<Self>>>,
+	children: Mutex<Vec<Weak<Self>>>,
 	breakpoint_mutation: AsyncMutex<()>,
-	source_breakpoints:  Mutex<BTreeMap<Str, Vec<Value>>>,
-	handler:             Arc<dyn DapReverseRequestHandler>,
+	breakpoint_intent_mutation: AsyncMutex<()>,
+	source_breakpoints: Mutex<BTreeMap<Str, Vec<Value>>>,
+	function_breakpoints: Mutex<Vec<Value>>,
+	instruction_breakpoints: Mutex<Vec<Value>>,
+	data_breakpoints: Mutex<Vec<Value>>,
+	handler: Arc<dyn DapReverseRequestHandler>,
 }
 
 impl DapSession {
@@ -270,7 +308,7 @@ impl DapSession {
 		arguments: Map<String, Value>,
 		handler: Option<Arc<dyn DapReverseRequestHandler>>,
 	) -> Result<Arc<Self>, DapSessionError> {
-		Self::start_owned(id, adapter, protocol, None, attach, arguments, handler).await
+		Self::start_owned(id, adapter, protocol, None, None, attach, arguments, handler).await
 	}
 
 	/// Starts a session while retaining ownership of its spawned adapter.
@@ -287,6 +325,7 @@ impl DapSession {
 			adapter,
 			spawned.protocol,
 			Some(spawned.child),
+			spawned.cleanup_path,
 			attach,
 			arguments,
 			handler,
@@ -299,6 +338,7 @@ impl DapSession {
 		adapter: impl AsRef<str>,
 		protocol: DapProtocol,
 		process: Option<Arc<AsyncMutex<Child>>>,
+		cleanup_path: Option<PathBuf>,
 		attach: bool,
 		arguments: Map<String, Value>,
 		handler: Option<Arc<dyn DapReverseRequestHandler>>,
@@ -309,6 +349,9 @@ impl DapSession {
 			adapter: Str::new(adapter.as_ref()),
 			protocol,
 			process,
+			terminal_processes: Mutex::new(Vec::new()),
+			cleanup_path,
+			attached: attach,
 			state: Mutex::new(DapSessionState::Launching),
 			capabilities: RwLock::new(Value::Null),
 			output: Mutex::new(VecDeque::with_capacity(MAX_OUTPUT_BYTES)),
@@ -321,7 +364,11 @@ impl DapSession {
 			parent: Mutex::new(None),
 			children: Mutex::new(Vec::new()),
 			breakpoint_mutation: AsyncMutex::new(()),
+			breakpoint_intent_mutation: AsyncMutex::new(()),
 			source_breakpoints: Mutex::new(BTreeMap::new()),
+			function_breakpoints: Mutex::new(Vec::new()),
+			instruction_breakpoints: Mutex::new(Vec::new()),
+			data_breakpoints: Mutex::new(Vec::new()),
 			handler: handler.unwrap_or_else(|| Arc::new(RejectReverseRequests)),
 		});
 		Self::spawn_event_loop(&session);
@@ -361,7 +408,49 @@ impl DapSession {
 		if session.state() == DapSessionState::Configuring {
 			session.transition(DapSessionState::Running)?;
 		}
+		Self::spawn_maintenance(&session);
 		Ok(session)
+	}
+
+	fn spawn_maintenance(session: &Arc<Self>) {
+		let weak = Arc::downgrade(session);
+		tokio::spawn(async move {
+			let mut interval = tokio::time::interval(LIVENESS_INTERVAL);
+			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			let mut intervals = 0_u8;
+			loop {
+				interval.tick().await;
+				let Some(session) = weak.upgrade() else { break };
+				if session.state() == DapSessionState::Terminated || session.protocol.is_closed() {
+					break;
+				}
+				if let Some(process) = &session.process
+					&& process.lock().await.try_wait().ok().flatten().is_some()
+				{
+					*session.state.lock() = DapSessionState::Terminated;
+					session.protocol.shutdown();
+					break;
+				}
+				if session
+					.protocol
+					.request("threads", json!({}))
+					.await
+					.is_err()
+				{
+					*session.state.lock() = DapSessionState::Terminated;
+					session.protocol.shutdown();
+					break;
+				}
+				intervals = intervals.saturating_add(1);
+				if intervals == SWEEP_INTERVALS {
+					intervals = 0;
+					if !session.attached && session.is_idle(now_ms()) {
+						let _ = session.terminate().await;
+						break;
+					}
+				}
+			}
+		});
 	}
 
 	fn spawn_event_loop(session: &Arc<Self>) {
@@ -530,6 +619,76 @@ impl DapSession {
 	}
 
 	/// Sends an adapter-specific request without rewriting its payload.
+	/// Continues, pauses, or steps and awaits the corresponding lifecycle event.
+	pub async fn control(
+		&self,
+		action: DapAction,
+		arguments: Value,
+	) -> Result<DapStopSnapshot, DapSessionError> {
+		let command = action
+			.command()
+			.ok_or(DapSessionError::UnsupportedAction(action))?;
+		if !matches!(
+			action,
+			DapAction::Continue
+				| DapAction::Pause
+				| DapAction::StepOver
+				| DapAction::StepIn
+				| DapAction::StepOut
+		) {
+			return Err(DapSessionError::UnsupportedAction(action));
+		}
+		let events = self.protocol.subscribe();
+		let granularity = arguments
+			.get("granularity")
+			.and_then(Value::as_str)
+			.map(Str::new);
+		self.touch();
+		let response = self.protocol.request(command, arguments).await?;
+		let event_name = if action == DapAction::Continue {
+			"continued"
+		} else {
+			"stopped"
+		};
+		let body = DapProtocol::wait_for_event(events, event_name, HANDSHAKE_TIMEOUT).await?;
+		let thread_id = body.get("threadId").and_then(Value::as_i64).or_else(|| {
+			response
+				.get("allThreadsContinued")
+				.and_then(Value::as_bool)
+				.and(Some(0))
+		});
+		let frame = if event_name == "stopped" {
+			if let Some(thread_id) = thread_id {
+				self
+					.protocol
+					.request("stackTrace", json!({"threadId": thread_id, "startFrame": 0, "levels": 1}))
+					.await?
+					.get("stackFrames")
+					.and_then(Value::as_array)
+					.and_then(|frames| frames.first())
+					.cloned()
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+		Ok(DapStopSnapshot {
+			action,
+			reason: Str::new(
+				body
+					.get("reason")
+					.and_then(Value::as_str)
+					.unwrap_or(event_name),
+			),
+			thread_id,
+			frame,
+			granularity,
+			state: self.state(),
+		})
+	}
+
+	/// Sends an adapter-specific request without rewriting its payload.
 	pub async fn custom_request(
 		&self,
 		command: &str,
@@ -559,6 +718,31 @@ impl DapSession {
 		Ok(response)
 	}
 
+	/// Adds, replaces, or removes one source breakpoint without discarding
+	/// sibling intent.
+	pub async fn mutate_source_breakpoint(
+		self: &Arc<Self>,
+		source: impl AsRef<str>,
+		breakpoint: Value,
+		remove: bool,
+	) -> Result<Value, DapSessionError> {
+		let _intent_guard = self.breakpoint_intent_mutation.lock().await;
+		let source = Str::new(source.as_ref());
+		let mut breakpoints = self
+			.source_breakpoints
+			.lock()
+			.get(&source)
+			.cloned()
+			.unwrap_or_default();
+		breakpoints.retain(|existing| !same_breakpoint(existing, &breakpoint, &["line", "column"]));
+		if !remove {
+			breakpoints.push(breakpoint);
+		}
+		self
+			.set_source_breakpoints(source.as_str(), breakpoints)
+			.await
+	}
+
 	async fn replace_source_breakpoints(
 		&self,
 		source: &Str,
@@ -585,6 +769,7 @@ impl DapSession {
 
 	/// Adds a child and replays current source breakpoints before exposing it.
 	pub async fn add_child(self: &Arc<Self>, child: &Arc<Self>) -> Result<(), DapSessionError> {
+		let _intent_guard = self.breakpoint_intent_mutation.lock().await;
 		if Arc::ptr_eq(self, child) || self.has_ancestor(child) {
 			return Err(DapSessionError::SessionTreeCycle);
 		}
@@ -596,7 +781,156 @@ impl DapSession {
 				.set_source_breakpoints(source.as_str(), values)
 				.await?;
 		}
+		let function_breakpoints = self.function_breakpoints.lock().clone();
+		let instruction_breakpoints = self.instruction_breakpoints.lock().clone();
+		let data_breakpoints = self.data_breakpoints.lock().clone();
+		if !function_breakpoints.is_empty()
+			&& child.supports_breakpoint_command("setFunctionBreakpoints")
+		{
+			child.set_function_breakpoints(function_breakpoints).await?;
+		}
+		if !instruction_breakpoints.is_empty()
+			&& child.supports_breakpoint_command("setInstructionBreakpoints")
+		{
+			child
+				.set_instruction_breakpoints(instruction_breakpoints)
+				.await?;
+		}
+		if !data_breakpoints.is_empty() && child.supports_breakpoint_command("setDataBreakpoints") {
+			child.set_data_breakpoints(data_breakpoints).await?;
+		}
 		Ok(())
+	}
+
+	/// Replaces function-breakpoint intent throughout the session tree.
+	pub async fn set_function_breakpoints(
+		self: &Arc<Self>,
+		breakpoints: Vec<Value>,
+	) -> Result<Value, DapSessionError> {
+		self
+			.replace_tree_breakpoints("setFunctionBreakpoints", breakpoints)
+			.await
+	}
+
+	/// Adds, replaces, or removes one function breakpoint.
+	pub async fn mutate_function_breakpoint(
+		self: &Arc<Self>,
+		breakpoint: Value,
+		remove: bool,
+	) -> Result<Value, DapSessionError> {
+		let _intent_guard = self.breakpoint_intent_mutation.lock().await;
+		let mut breakpoints = self.function_breakpoints.lock().clone();
+		breakpoints.retain(|existing| !same_breakpoint(existing, &breakpoint, &["name"]));
+		if !remove {
+			breakpoints.push(breakpoint);
+		}
+		self.set_function_breakpoints(breakpoints).await
+	}
+
+	/// Replaces instruction-breakpoint intent throughout the session tree.
+	pub async fn set_instruction_breakpoints(
+		self: &Arc<Self>,
+		breakpoints: Vec<Value>,
+	) -> Result<Value, DapSessionError> {
+		self
+			.replace_tree_breakpoints("setInstructionBreakpoints", breakpoints)
+			.await
+	}
+
+	/// Adds, replaces, or removes one instruction breakpoint.
+	pub async fn mutate_instruction_breakpoint(
+		self: &Arc<Self>,
+		breakpoint: Value,
+		remove: bool,
+	) -> Result<Value, DapSessionError> {
+		let _intent_guard = self.breakpoint_intent_mutation.lock().await;
+		let mut breakpoints = self.instruction_breakpoints.lock().clone();
+		breakpoints.retain(|existing| {
+			!same_breakpoint(existing, &breakpoint, &["instructionReference", "offset"])
+		});
+		if !remove {
+			breakpoints.push(breakpoint);
+		}
+		self.set_instruction_breakpoints(breakpoints).await
+	}
+
+	/// Replaces data-breakpoint intent throughout the session tree.
+	pub async fn set_data_breakpoints(
+		self: &Arc<Self>,
+		breakpoints: Vec<Value>,
+	) -> Result<Value, DapSessionError> {
+		self
+			.replace_tree_breakpoints("setDataBreakpoints", breakpoints)
+			.await
+	}
+
+	/// Adds, replaces, or removes one data breakpoint.
+	pub async fn mutate_data_breakpoint(
+		self: &Arc<Self>,
+		breakpoint: Value,
+		remove: bool,
+	) -> Result<Value, DapSessionError> {
+		let _intent_guard = self.breakpoint_intent_mutation.lock().await;
+		let mut breakpoints = self.data_breakpoints.lock().clone();
+		breakpoints.retain(|existing| !same_breakpoint(existing, &breakpoint, &["dataId"]));
+		if !remove {
+			breakpoints.push(breakpoint);
+		}
+		self.set_data_breakpoints(breakpoints).await
+	}
+
+	async fn replace_tree_breakpoints(
+		self: &Arc<Self>,
+		command: &'static str,
+		breakpoints: Vec<Value>,
+	) -> Result<Value, DapSessionError> {
+		let mut pending = vec![Arc::clone(self)];
+		let mut root_response = Value::Null;
+		while let Some(session) = pending.pop() {
+			let _guard = session.breakpoint_mutation.lock().await;
+			match command {
+				"setFunctionBreakpoints" => *session.function_breakpoints.lock() = breakpoints.clone(),
+				"setInstructionBreakpoints" => {
+					*session.instruction_breakpoints.lock() = breakpoints.clone()
+				},
+				"setDataBreakpoints" => *session.data_breakpoints.lock() = breakpoints.clone(),
+				_ => return Err(DapSessionError::UnsupportedAction(DapAction::SetBreakpoint)),
+			}
+			let children = session
+				.children
+				.lock()
+				.iter()
+				.filter_map(Weak::upgrade)
+				.collect::<Vec<_>>();
+			if !Arc::ptr_eq(&session, self) && !session.supports_breakpoint_command(command) {
+				pending.extend(children);
+				continue;
+			}
+			let response = session
+				.protocol
+				.request(command, json!({"breakpoints": breakpoints}))
+				.await?;
+			if Arc::ptr_eq(&session, self) {
+				root_response = response;
+			}
+			pending.extend(children);
+		}
+		Ok(root_response)
+	}
+
+	fn supports_breakpoint_command(&self, command: &str) -> bool {
+		let capability = match command {
+			"setFunctionBreakpoints" => "supportsFunctionBreakpoints",
+			"setInstructionBreakpoints" => "supportsInstructionBreakpoints",
+			"setDataBreakpoints" => "supportsDataBreakpoints",
+			_ => return true,
+		};
+		self
+			.capabilities
+			.read()
+			.get(capability)
+			.and_then(Value::as_bool)
+			.unwrap_or(false)
 	}
 
 	/// Cascades termination through children, then disconnects this adapter.
@@ -628,7 +962,93 @@ impl DapSession {
 				process.kill().await?;
 			}
 		}
+		let terminal_processes = self.terminal_processes.lock().clone();
+		for process in terminal_processes {
+			let mut process = process.lock().await;
+			if process.try_wait()?.is_none() {
+				process.kill().await?;
+			}
+		}
+		if let Some(path) = &self.cleanup_path {
+			match tokio::fs::remove_file(path).await {
+				Ok(()) => {},
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+				Err(error) => return Err(DapSessionError::Process(error)),
+			}
+		}
 		Ok(())
+	}
+
+	/// Runs an adapter-requested terminal process inside the workspace, captures
+	/// output, and binds its lifetime to this session tree.
+	pub async fn run_in_terminal(
+		self: &Arc<Self>,
+		workspace: &std::path::Path,
+		arguments: &Value,
+	) -> Result<Value, DapSessionError> {
+		let argv = arguments
+			.get("args")
+			.and_then(Value::as_array)
+			.ok_or(DapSessionError::InvalidReverseRequest)?;
+		let (program, rest) = argv
+			.split_first()
+			.ok_or(DapSessionError::InvalidReverseRequest)?;
+		let program = program
+			.as_str()
+			.ok_or(DapSessionError::InvalidReverseRequest)?;
+		let cwd = arguments
+			.get("cwd")
+			.and_then(Value::as_str)
+			.map(std::path::PathBuf::from)
+			.unwrap_or_else(|| workspace.to_path_buf());
+		let cwd = tokio::fs::canonicalize(cwd).await?;
+		let workspace = tokio::fs::canonicalize(workspace).await?;
+		if !cwd.starts_with(&workspace) {
+			return Err(DapSessionError::InvalidReverseRequest);
+		}
+		let mut command = tokio::process::Command::new(program);
+		command
+			.args(rest.iter().map(|value| value.as_str().unwrap_or_default()))
+			.current_dir(cwd)
+			.stdin(std::process::Stdio::null())
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::piped())
+			.kill_on_drop(true)
+			.env("CI", "1")
+			.env("GIT_TERMINAL_PROMPT", "0");
+		if let Some(environment) = arguments.get("env").and_then(Value::as_object) {
+			for (name, value) in environment {
+				if let Some(value) = value.as_str() {
+					command.env(name, value);
+				}
+			}
+		}
+		#[cfg(unix)]
+		{
+			// SAFETY: `setsid` is async-signal-safe and touches no shared Rust state.
+			unsafe {
+				command.pre_exec(|| {
+					if libc::setsid() < 0 {
+						Err(std::io::Error::last_os_error())
+					} else {
+						Ok(())
+					}
+				})
+			};
+		}
+		let mut child = command.spawn()?;
+		let process_id = child.id().map(u64::from);
+		if let Some(stdout) = child.stdout.take() {
+			spawn_output_reader(Arc::downgrade(self), stdout);
+		}
+		if let Some(stderr) = child.stderr.take() {
+			spawn_output_reader(Arc::downgrade(self), stderr);
+		}
+		self
+			.terminal_processes
+			.lock()
+			.push(Arc::new(AsyncMutex::new(child)));
+		Ok(json!({"processId": process_id, "shellProcessId": process_id}))
 	}
 
 	/// Returns the retained tail of adapter/debuggee output.
@@ -673,6 +1093,14 @@ impl DapSession {
 	}
 }
 
+impl Drop for DapSession {
+	fn drop(&mut self) {
+		if let Some(path) = &self.cleanup_path {
+			let _ = std::fs::remove_file(path);
+		}
+	}
+}
+
 /// Project-scoped live debug-session registry.
 #[derive(Default)]
 pub struct DapSessionRegistry {
@@ -702,6 +1130,8 @@ impl DapSessionRegistry {
 
 	/// Removes terminated sessions and idle sessions whose transport is already
 	/// closed.
+	/// Removes terminated sessions and inactive non-attached sessions after the
+	/// ten-minute idle ceiling.
 	pub fn cleanup(&self) -> Vec<Str> {
 		let now = now_ms();
 		let removed = self
@@ -710,7 +1140,7 @@ impl DapSessionRegistry {
 			.iter()
 			.filter(|&(_id, session)| {
 				(session.state() == DapSessionState::Terminated)
-					|| (session.is_idle(now) && session.protocol.is_closed())
+					|| (session.is_idle(now) && !session.attached)
 			})
 			.map(|(id, _session)| id.clone())
 			.collect::<Vec<_>>();
@@ -726,6 +1156,33 @@ fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn spawn_output_reader<R>(session: Weak<DapSession>, mut reader: R)
+where
+	R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+	tokio::spawn(async move {
+		let mut buffer = [0_u8; 4096];
+		loop {
+			match reader.read(&mut buffer).await {
+				Ok(0) | Err(_) => break,
+				Ok(read) => {
+					let Some(session) = session.upgrade() else {
+						break;
+					};
+					session.push_output(&buffer[..read]);
+					session.touch();
+				},
+			}
+		}
+	});
+}
+
+fn same_breakpoint(left: &Value, right: &Value, identity: &[&str]) -> bool {
+	identity
+		.iter()
+		.all(|field| left.get(*field) == right.get(*field))
 }
 
 #[cfg(test)]
@@ -750,24 +1207,31 @@ mod tests {
 		let (stream, _) = tokio::io::duplex(64);
 		let (reader, writer) = tokio::io::split(stream);
 		let session = DapSession {
-			id:                  sf!("test"),
-			adapter:             sf!("test"),
-			protocol:            DapProtocol::from_streams(reader, writer),
-			process:             None,
-			state:               Mutex::new(DapSessionState::Running),
-			capabilities:        RwLock::new(Value::Null),
-			output:              Mutex::new(VecDeque::new()),
-			last_activity_ms:    AtomicU64::new(0),
-			revision:            AtomicU64::new(1),
-			event_sequence:      AtomicU64::new(0),
-			read_granted:        AtomicBool::new(false),
-			execute_granted:     AtomicBool::new(false),
-			event_byte_limit:    AtomicU64::new(0),
-			parent:              Mutex::new(None),
-			children:            Mutex::new(Vec::new()),
+			id: sf!("test"),
+			adapter: sf!("test"),
+			protocol: DapProtocol::from_streams(reader, writer),
+			process: None,
+			terminal_processes: Mutex::new(Vec::new()),
+			cleanup_path: None,
+			attached: false,
+			state: Mutex::new(DapSessionState::Running),
+			capabilities: RwLock::new(Value::Null),
+			output: Mutex::new(VecDeque::new()),
+			last_activity_ms: AtomicU64::new(0),
+			revision: AtomicU64::new(1),
+			event_sequence: AtomicU64::new(0),
+			read_granted: AtomicBool::new(false),
+			execute_granted: AtomicBool::new(false),
+			event_byte_limit: AtomicU64::new(0),
+			parent: Mutex::new(None),
+			children: Mutex::new(Vec::new()),
 			breakpoint_mutation: AsyncMutex::new(()),
-			source_breakpoints:  Mutex::new(BTreeMap::new()),
-			handler:             Arc::new(RejectReverseRequests),
+			breakpoint_intent_mutation: AsyncMutex::new(()),
+			source_breakpoints: Mutex::new(BTreeMap::new()),
+			function_breakpoints: Mutex::new(Vec::new()),
+			instruction_breakpoints: Mutex::new(Vec::new()),
+			data_breakpoints: Mutex::new(Vec::new()),
+			handler: Arc::new(RejectReverseRequests),
 		};
 		session.push_output(&vec![b'a'; MAX_OUTPUT_BYTES]);
 		session.push_output(b"tail");

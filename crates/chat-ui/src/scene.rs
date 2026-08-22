@@ -25,8 +25,9 @@ use omp_tui::{
 use smallvec::SmallVec;
 
 use crate::{
-	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, StatusFacts, SubmitMode,
-	TranscriptFrame, TranscriptFrameKind,
+	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, ModelDownloadProgress,
+	StatusFacts, StatusLayout, StatusSeparator, SubmitMode, TranscriptFrame, TranscriptFrameKind,
+	frame::{FrameError, FrameIdentity, FrameMutation, RetainedFrames, render_frame_tml},
 	slots::{Mount, Slots},
 };
 
@@ -434,9 +435,45 @@ struct CompactionEntry {
 }
 
 struct LiveAssistant {
-	id:   Str,
-	text: StrMut,
+	id:       Str,
+	text:     StrMut,
+	started:  Duration,
+	thinking: bool,
 }
+struct DownloadActivity {
+	progress:  ModelDownloadProgress,
+	received:  Duration,
+	completed: Option<Duration>,
+	label:     Str,
+}
+
+impl DownloadActivity {
+	fn new(progress: ModelDownloadProgress, received: Duration) -> Self {
+		let completed = progress.complete.then_some(received);
+		let label = download_label(&progress);
+		Self { progress, received, completed, label }
+	}
+
+	fn visible(&self, now: Duration) -> bool {
+		now >= self.received.saturating_add(Duration::from_secs(1))
+			&& self
+				.completed
+				.is_none_or(|completed| now < completed.saturating_add(Duration::from_secs(3)))
+	}
+}
+fn retained_expiry(
+	frame: &omp_proto::omp::ui::v1::RetainedFrame,
+	now: Duration,
+) -> Option<Duration> {
+	let key = frame.key.as_ref()?;
+	if key.kind != "irc" {
+		return None;
+	}
+	let payload = serde_json::from_slice::<serde_json::Value>(&frame.payload).ok()?;
+	let ttl = payload.get("ttl_ms")?.as_u64()?.min(300_000);
+	Some(now.saturating_add(Duration::from_millis(ttl)))
+}
+
 struct LiveTool {
 	id:       Str,
 	name:     Str,
@@ -447,13 +484,61 @@ struct LiveTool {
 	images:   Vec<ToolImageEntry>,
 }
 
+struct RetainedEntry {
+	identity:   FrameIdentity,
+	view:       ToolView,
+	expires_at: Option<Duration>,
+}
+
+struct ThinkingEntry {
+	body:     RichText,
+	elapsed:  Str,
+	expanded: bool,
+}
+
 enum Entry {
 	User(UserEntry),
 	Assistant(RichText),
+	Thinking(ThinkingEntry),
+	Peer { title: Str, detail: Option<Str> },
 	Tool(ToolEntry),
 	ToolGroup(ToolGroup),
 	Compaction(CompactionEntry),
+	Retained(RetainedEntry),
 	Notice { text: Str, error: bool },
+}
+
+fn restyle_entry(entry: &mut Entry, ctx: &UiContext) {
+	match entry {
+		Entry::User(user) => {
+			if let Some(view) = user.body.view.as_mut() {
+				let _ = view.set_context(ctx.clone());
+			}
+		},
+		Entry::Assistant(body) => {
+			if let Some(view) = body.view.as_mut() {
+				let _ = view.set_context(ctx.clone());
+			}
+		},
+		Entry::Thinking(thinking) => {
+			if let Some(view) = thinking.body.view.as_mut() {
+				let _ = view.set_context(ctx.clone());
+			}
+		},
+		Entry::Peer { .. } => {},
+		Entry::Tool(tool) => {
+			let _ = tool.view.rendered.set_context(ctx.clone());
+		},
+		Entry::ToolGroup(group) => {
+			for tool in &mut group.tools {
+				let _ = tool.view.rendered.set_context(ctx.clone());
+			}
+		},
+		Entry::Retained(frame) => {
+			let _ = frame.view.rendered.set_context(ctx.clone());
+		},
+		Entry::Compaction(_) | Entry::Notice { .. } => {},
+	}
 }
 
 enum PreviewEntry<'a> {
@@ -472,9 +557,13 @@ impl<'a> PreviewEntry<'a> {
 			Entry::Assistant(body) => {
 				Self::Assistant(RichText::new(body.text.as_str(), width.max(1), ctx))
 			},
-			Entry::Tool(_) | Entry::ToolGroup(_) | Entry::Compaction(_) | Entry::Notice { .. } => {
-				Self::Other(entry)
-			},
+			Entry::Thinking(_) => Self::Other(entry),
+			Entry::Peer { .. } => Self::Other(entry),
+			Entry::Tool(_)
+			| Entry::ToolGroup(_)
+			| Entry::Compaction(_)
+			| Entry::Retained(_)
+			| Entry::Notice { .. } => Self::Other(entry),
 		}
 	}
 
@@ -526,6 +615,13 @@ struct StatusLabels {
 	activity: Option<Str>,
 	git:      Option<Str>,
 	context:  Option<(Str, bool)>,
+	velocity: Option<Str>,
+	cwd:      Option<Str>,
+	thinking: Option<Str>,
+	hooks:    Option<Str>,
+	tasks:    Option<Str>,
+	collab:   Option<Str>,
+	account:  Option<Str>,
 	queued:   Option<Str>,
 	jobs:     Option<Str>,
 	attempt:  Option<Str>,
@@ -537,6 +633,9 @@ impl StatusLabels {
 		let mut model = fmts_mut!("{} {}", charset.icon(Icon::Model), facts.model);
 		if let Some(advisor) = &facts.advisor_model {
 			let _ = write!(model, " {} {advisor}", charset.icon(Icon::Advisor));
+		}
+		if let Some(accent) = &facts.session_accent {
+			let _ = write!(model, " · {accent}");
 		}
 		let activity = facts
 			.live_activity
@@ -560,16 +659,79 @@ impl StatusLabels {
 			}
 			(label.freeze(), overflow)
 		});
-		Self {
+		let mut labels = Self {
 			model: model.freeze(),
 			activity,
 			git,
 			context,
+			velocity: facts
+				.tokens_per_second
+				.map(|rate| fmts_mut!("{rate} tok/s").freeze()),
+			cwd: facts
+				.cwd
+				.as_ref()
+				.map(|cwd| fmts_mut!("cwd {cwd}").freeze()),
+			thinking: facts
+				.thinking
+				.as_ref()
+				.map(|thinking| fmts_mut!("think {thinking}").freeze()),
+			hooks: (facts.hooks > 0).then(|| fmts_mut!("hooks {}", facts.hooks).freeze()),
+			tasks: (facts.tasks > 0).then(|| fmts_mut!("tasks {}", facts.tasks).freeze()),
+			collab: (facts.collab_peers > 0)
+				.then(|| fmts_mut!("collab {}", facts.collab_peers).freeze()),
+			account: facts
+				.account_override
+				.as_ref()
+				.map(|account| fmts_mut!("acct {account}").freeze()),
 			queued: (facts.queued > 0).then(|| fmts_mut!("queued {}", facts.queued).freeze()),
 			jobs: (facts.jobs > 0).then(|| fmts_mut!("jobs {}", facts.jobs).freeze()),
 			attempt: (facts.attempt > 0).then(|| fmts_mut!("retry {}", facts.attempt).freeze()),
 			dropped: (facts.dropped > 0).then(|| fmts_mut!("dropped {}", facts.dropped).freeze()),
+		};
+		labels.decorate(facts.separator, charset);
+		labels
+	}
+
+	fn decorate(&mut self, separator: StatusSeparator, charset: Charset) {
+		if separator == StatusSeparator::Bracket {
+			self.model = bracketed(&self.model);
 		}
+		for label in [
+			&mut self.activity,
+			&mut self.git,
+			&mut self.velocity,
+			&mut self.cwd,
+			&mut self.thinking,
+			&mut self.hooks,
+			&mut self.tasks,
+			&mut self.collab,
+			&mut self.account,
+			&mut self.queued,
+			&mut self.jobs,
+			&mut self.attempt,
+			&mut self.dropped,
+		] {
+			if let Some(text) = label {
+				*text = separated(text, separator, charset);
+			}
+		}
+		if let Some((text, _)) = &mut self.context {
+			*text = separated(text, separator, charset);
+		}
+	}
+}
+
+fn bracketed(text: &str) -> Str {
+	fmts_mut!("[{text}]").freeze()
+}
+
+fn separated(text: &str, separator: StatusSeparator, charset: Charset) -> Str {
+	match separator {
+		StatusSeparator::Dot => {
+			let dot = if charset == Charset::Ascii { "." } else { "·" };
+			fmts_mut!("{dot} {text}").freeze()
+		},
+		StatusSeparator::Bracket => bracketed(text),
 	}
 }
 
@@ -635,6 +797,10 @@ impl ChatStatus {
 		self.style = style;
 	}
 
+	const fn set_theme(&mut self, theme: Theme) {
+		self.theme = theme;
+	}
+
 	fn group(&self) -> Status {
 		Status::new()
 			.with(Prop::Bg, self.theme.panel)
@@ -667,19 +833,71 @@ impl ChatStatus {
 		let work = self.work.borrow();
 		let facts = &work.facts;
 		let mut status = self.group().with_str(Prop::Align, "right");
-		if let Some(activity) = &work.labels.activity {
+		if matches!(facts.layout, StatusLayout::Full | StatusLayout::Developer)
+			&& let Some(velocity) = &work.labels.velocity
+		{
 			status = status.segment(
 				Segment::new()
-					.label(activity.clone())
+					.label(velocity.clone())
 					.with(Prop::Fg, self.theme.accent),
 			);
 		}
-		if let Some(git) = &work.labels.git {
+		if let Some(activity) = &work.labels.activity {
+			if facts.layout != StatusLayout::Minimal {
+				status = status.segment(
+					Segment::new()
+						.label(activity.clone())
+						.with(Prop::Fg, self.theme.accent),
+				);
+			}
+		}
+		if matches!(facts.layout, StatusLayout::Full | StatusLayout::Developer)
+			&& let Some(cwd) = &work.labels.cwd
+		{
 			status = status.segment(
 				Segment::new()
-					.label(git.clone())
+					.label(cwd.clone())
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		if let Some(git) = &work.labels.git {
+			if facts.layout != StatusLayout::Minimal {
+				status = status.segment(
+					Segment::new()
+						.label(git.clone())
+						.with(Prop::Fg, self.theme.info),
+				);
+			}
+		}
+		if facts.layout != StatusLayout::Minimal
+			&& let Some(thinking) = &work.labels.thinking
+		{
+			status = status.segment(
+				Segment::new()
+					.label(thinking.clone())
 					.with(Prop::Fg, self.theme.info),
 			);
+		}
+		if matches!(facts.layout, StatusLayout::Full | StatusLayout::Compact)
+			&& let Some(tasks) = &work.labels.tasks
+		{
+			status = status.segment(
+				Segment::new()
+					.label(tasks.clone())
+					.with(Prop::Fg, self.theme.warn),
+			);
+		}
+		if facts.layout == StatusLayout::Full {
+			for label in [&work.labels.hooks, &work.labels.collab, &work.labels.account]
+				.into_iter()
+				.flatten()
+			{
+				status = status.segment(
+					Segment::new()
+						.label(label.clone())
+						.with(Prop::Fg, self.theme.secondary),
+				);
+			}
 		}
 		if matches!(context_gauge, ContextGaugeMode::Numeric)
 			&& (facts.context_tokens > 0 || facts.context_window.is_some())
@@ -762,6 +980,13 @@ impl ChatStatus {
 		let facts = &self.work.borrow().facts;
 		facts.live_activity.is_some()
 			|| facts.git.is_some()
+			|| facts.tokens_per_second.is_some()
+			|| facts.cwd.is_some()
+			|| facts.thinking.is_some()
+			|| facts.hooks > 0
+			|| facts.tasks > 0
+			|| facts.collab_peers > 0
+			|| facts.account_override.is_some()
 			|| facts.context_tokens > 0
 			|| facts.cost_nanos > 0
 			|| facts.model_subscription
@@ -947,6 +1172,10 @@ pub struct Chat {
 	slots:              Slots,
 	agents:             Vec<AgentRow>,
 	agent_labels:       Vec<Str>,
+	retained_frames:    RetainedFrames,
+	pinned_error:       Option<Str>,
+	download_activity:  Option<DownloadActivity>,
+	celebration_until:  Option<Duration>,
 	attribution:        Option<Attribution>,
 	keyword_accent:     KeywordAccent,
 }
@@ -1000,6 +1229,10 @@ impl Chat {
 			layout_width: 0,
 			agents: Vec::new(),
 			agent_labels: Vec::new(),
+			retained_frames: RetainedFrames::new(),
+			pinned_error: None,
+			download_activity: None,
+			celebration_until: None,
 			slots: Slots::new(ctx.clone()),
 			attribution: None,
 			keyword_accent: KeywordAccent::default(),
@@ -1063,6 +1296,10 @@ impl Chat {
 	pub fn handle_key(&mut self, key: Key) -> ChatKey {
 		if key == Key::Ctrl('o') {
 			self.toggle_latest_tool();
+			return ChatKey::Consumed;
+		}
+		if key == Key::Ctrl('t') {
+			self.toggle_latest_thinking();
 			return ChatKey::Consumed;
 		}
 		if key == Key::Enter && self.composer_empty() && self.is_working() {
@@ -1168,6 +1405,12 @@ impl Chat {
 		self.pending_submit.pop_front()
 	}
 
+	/// Clones the staged attachment descriptors for read-only overlays.
+	#[must_use]
+	pub fn composer_attachments(&self) -> Vec<Attachment> {
+		self.attachments.snapshot()
+	}
+
 	/// Returns whether the composer contains no non-whitespace text.
 	pub fn composer_empty(&self) -> bool {
 		self.composer_text().trim().is_empty()
@@ -1230,7 +1473,12 @@ impl Chat {
 
 	/// Begins a live assistant message.
 	pub fn begin_assistant(&mut self, id: impl Into<Str>) {
-		self.live_assistant = Some(LiveAssistant { id: id.into(), text: StrMut::new("") });
+		self.live_assistant = Some(LiveAssistant {
+			id:       id.into(),
+			text:     StrMut::new(""),
+			started:  self.started_at.elapsed(),
+			thinking: false,
+		});
 		self.bump_live();
 	}
 
@@ -1240,6 +1488,7 @@ impl Chat {
 			&& message.id.as_str() == id
 		{
 			message.text.push_str(text);
+			message.thinking |= message.text.as_str().starts_with("*Thinking:* ");
 			self.bump_live();
 		}
 	}
@@ -1255,11 +1504,40 @@ impl Chat {
 				.live_assistant
 				.take()
 				.expect("matching live assistant exists");
-			self.transcript.push(Entry::Assistant(RichText::new(
-				message.text.as_str(),
-				Self::message_width(self.layout_width),
-				&self.ctx,
-			)));
+			let body = message
+				.text
+				.as_str()
+				.strip_prefix("*Thinking:* ")
+				.unwrap_or(message.text.as_str());
+			let body = RichText::new(body, Self::message_width(self.layout_width), &self.ctx);
+			if message.thinking {
+				let elapsed = elapsed_label(self.started_at.elapsed().saturating_sub(message.started));
+				self
+					.transcript
+					.push(Entry::Thinking(ThinkingEntry { body, elapsed, expanded: false }));
+			} else {
+				self.transcript.push(Entry::Assistant(body));
+			}
+			self.bump_live();
+		}
+	}
+
+	/// Begins a live tool card.
+	/// Toggles the latest committed thinking block without mutating transcript
+	/// truth.
+	pub fn toggle_latest_thinking(&mut self) {
+		if let Some(thinking) = self
+			.transcript
+			.iter_mut()
+			.rev()
+			.find_map(|entry| match entry {
+				Entry::Thinking(thinking) => Some(thinking),
+				_ => None,
+			}) {
+			thinking.expanded = !thinking.expanded;
+			self.drawn_entries = 0;
+			self.transcript_rows = 0;
+			self.last_viewport = Size::new(0, 0);
 			self.bump_live();
 		}
 	}
@@ -1505,13 +1783,111 @@ impl Chat {
 
 	/// Appends an error transcript notice.
 	pub fn push_error(&mut self, text: impl IntoStr) {
+		let text = text.into_str();
+		self.pinned_error = Some(text.clone());
+		self.transcript.push(Entry::Notice { text, error: true });
+		self.bump_live();
+	}
+
+	/// Applies an exact-key retained frame, enhancing known revisions and
+	/// retaining the producer fallback for unknown revisions.
+	pub fn apply_retained_frame(
+		&mut self,
+		envelope: omp_proto::omp::ui::v1::RetainedFrameEnvelope,
+	) -> Result<(), FrameError> {
+		match self.retained_frames.apply(envelope)? {
+			FrameMutation::Upserted(identity) => {
+				let frame = self
+					.retained_frames
+					.get(&identity)
+					.expect("an upserted retained frame is present");
+				let source = render_frame_tml(frame);
+				let expires_at = retained_expiry(frame, self.started_at.elapsed());
+				let width = Self::tool_view_width(self.layout_width.max(1));
+				if let Some(entry) = self.transcript.iter_mut().find_map(|entry| match entry {
+					Entry::Retained(entry) if entry.identity == identity => Some(entry),
+					_ => None,
+				}) {
+					entry.view.replace(source, &self.ctx);
+					entry.expires_at = expires_at;
+				} else {
+					self.transcript.push(Entry::Retained(RetainedEntry {
+						identity,
+						view: ToolView::structured(source, width, &self.ctx),
+						expires_at,
+					}));
+				}
+				self.drawn_entries = 0;
+				self.transcript_rows = 0;
+				self.last_viewport = Size::new(0, 0);
+			},
+			FrameMutation::Removed { identity, .. } => {
+				self.transcript.retain(
+					|entry| !matches!(entry, Entry::Retained(frame) if frame.identity == identity),
+				);
+				self.drawn_entries = 0;
+				self.transcript_rows = 0;
+				self.last_viewport = Size::new(0, 0);
+			},
+		}
+		self.bump_live();
+		Ok(())
+	}
+
+	/// Applies a non-persistent theme preview and invalidates every retained
+	/// presentation cache derived from the previous semantic palette.
+	pub fn preview_theme(&mut self, theme: Theme) {
+		if self.ctx.theme == theme {
+			return;
+		}
+		self.ctx.theme = theme;
+		let context = self.ctx.clone();
+		let _ = self.editor_ui.set_context(context.clone());
 		self
-			.transcript
-			.push(Entry::Notice { text: text.into_str(), error: true });
+			.editor_ui
+			.update_component::<ChatStatus>(STATUS_ID, |status| {
+				status.set_theme(theme);
+				true
+			});
+		for entry in &mut self.transcript {
+			restyle_entry(entry, &context);
+		}
+		for tool in &mut self.live_tools {
+			let _ = tool.view.rendered.set_context(context.clone());
+		}
+		self.drawn_entries = 0;
+		self.transcript_rows = 0;
+		self.last_viewport = Size::new(0, 0);
+		self.bump_live();
 	}
 
 	/// Appends a semantic transcript boundary with core-owned styling.
 	pub fn push_transcript_frame(&mut self, frame: TranscriptFrame) {
+		if frame.kind == TranscriptFrameKind::Peer {
+			self
+				.transcript
+				.push(Entry::Peer { title: frame.title, detail: frame.detail });
+			return;
+		}
+		if frame.kind == TranscriptFrameKind::Recovery && self.pinned_error.take().is_some() {
+			let boundary = self
+				.transcript
+				.iter()
+				.rposition(|entry| matches!(entry, Entry::User(_)))
+				.map_or(0, |index| index.saturating_add(1));
+			let mut index = boundary;
+			while index < self.transcript.len() {
+				if matches!(self.transcript[index], Entry::Notice { error: true, .. }) {
+					self.transcript.remove(index);
+				} else {
+					index += 1;
+				}
+			}
+			self.push_notice("retry recovered · previous error collapsed");
+			self.drawn_entries = 0;
+			self.transcript_rows = 0;
+			self.last_viewport = Size::new(0, 0);
+		}
 		let marker = match frame.kind {
 			TranscriptFrameKind::Compaction => "compact",
 			TranscriptFrameKind::Branch => "branch",
@@ -1547,9 +1923,53 @@ impl Chat {
 		&self.agents
 	}
 
+	/// Serializes the retained visible transcript in presentation order for
+	/// explicit owner-requested export. Live mutable tails are excluded.
+	#[must_use]
+	pub fn visible_transcript_text(&self) -> String {
+		let mut output = String::new();
+		for entry in &self.transcript {
+			if !output.is_empty() {
+				output.push('\n');
+			}
+			match entry {
+				Entry::User(user) => output.push_str(&user.body.text),
+				Entry::Assistant(body) => output.push_str(&body.text),
+				Entry::Thinking(thinking) => output.push_str(&thinking.body.text),
+				Entry::Peer { title, detail } => {
+					output.push_str(title);
+					if let Some(detail) = detail {
+						let _ = write!(output, "\n{detail}");
+					}
+				},
+				Entry::Tool(tool) => {
+					let _ = writeln!(output, "{}@{}", tool.name, tool.rev);
+					output.push_str(&tool.view.source);
+				},
+				Entry::ToolGroup(group) => {
+					output.push_str(&group.label);
+					for tool in &group.tools {
+						let _ = write!(output, "\n{}@{}\n{}", tool.name, tool.rev, tool.view.source);
+					}
+				},
+				Entry::Compaction(compaction) => output.push_str(&compaction.label),
+				Entry::Retained(frame) => output.push_str(&frame.view.source),
+				Entry::Notice { text, .. } => output.push_str(text),
+			}
+		}
+		output
+	}
+
 	/// Replaces the complete status snapshot.
 	pub fn set_status(&mut self, facts: StatusFacts) {
 		let now = self.started_at.elapsed();
+		let quota_reset = {
+			let previous = &self.work.borrow().facts;
+			!previous.quota_reset && facts.quota_reset && !facts.reduced_motion
+		};
+		if quota_reset {
+			self.celebration_until = Some(now.saturating_add(Duration::from_secs(2)));
+		}
 		let labels = StatusLabels::new(&facts, self.ctx.charset);
 		let mut work = self.work.borrow_mut();
 		if work.facts.working != facts.working {
@@ -1613,6 +2033,8 @@ impl Chat {
 	/// Removes committed and live transcript content.
 	pub fn clear_history(&mut self) {
 		self.transcript.clear();
+		self.retained_frames = RetainedFrames::new();
+		self.pinned_error = None;
 		self.live_assistant = None;
 		self.live_tools.clear();
 		self.drawn_entries = 0;
@@ -1647,10 +2069,22 @@ impl Chat {
 				self.push_compaction(summary, title, method, tokens_before, tokens_after);
 			},
 			BackendEvent::TranscriptFrame(frame) => self.push_transcript_frame(frame),
+			BackendEvent::RetainedFrame(envelope) => {
+				if let Err(error) = self.apply_retained_frame(envelope) {
+					self.push_error(sf!("Rejected retained frame: {error}"));
+				}
+			},
 			BackendEvent::AgentRoster(rows) => self.set_agent_roster(rows),
+			BackendEvent::SlashCommands(commands) => self.set_slash_commands(commands),
 			BackendEvent::Notice(text) => self.push_notice(text),
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
+			BackendEvent::ThemePreview(theme) => self.preview_theme(theme),
+			BackendEvent::ModelDownloadProgress(progress) => {
+				let now = self.started_at.elapsed();
+				self.download_activity = Some(DownloadActivity::new(progress, now));
+				self.bump_live();
+			},
 			BackendEvent::SessionTitle(title) => self.set_session_title(title),
 			BackendEvent::HistoryCleared => self.clear_history(),
 			BackendEvent::Ack { interrupted } => {
@@ -1672,6 +2106,7 @@ impl Chat {
 			| BackendEvent::AuthPromptClose
 			| BackendEvent::SettingsSchema(_)
 			| BackendEvent::OpenAgentTree
+			| BackendEvent::CopyToClipboard(_)
 			| BackendEvent::Pause
 			| BackendEvent::NewSessionRequested) => return Some(event),
 		}
@@ -1692,10 +2127,55 @@ impl Chat {
 			return Some(Duration::ZERO);
 		}
 		let elapsed = self.started_at.elapsed();
-		self
+		let editor = self
 			.editor_ui
 			.next_wake()
+			.map(|deadline| deadline.saturating_sub(elapsed));
+		let download = self.download_activity.as_ref().and_then(|activity| {
+			let reveal = activity.received.saturating_add(Duration::from_secs(1));
+			let hide = activity
+				.completed
+				.map(|completed| completed.saturating_add(Duration::from_secs(3)));
+			let deadline = if elapsed < reveal {
+				Some(reveal)
+			} else {
+				hide.filter(|hide| elapsed < *hide)
+			};
+			deadline.map(|deadline| deadline.saturating_sub(elapsed))
+		});
+		let retained = self
+			.transcript
+			.iter()
+			.filter_map(|entry| match entry {
+				Entry::Retained(frame) => frame.expires_at,
+				_ => None,
+			})
+			.filter(|deadline| elapsed < *deadline)
 			.map(|deadline| deadline.saturating_sub(elapsed))
+			.min();
+		let celebration = self
+			.celebration_until
+			.filter(|deadline| elapsed < *deadline)
+			.map(|deadline| {
+				deadline
+					.saturating_sub(elapsed)
+					.min(Duration::from_millis(50))
+			});
+		let animation = match (editor, download) {
+			(Some(editor), Some(download)) => Some(editor.min(download)),
+			(Some(editor), None) => Some(editor),
+			(None, download) => download,
+		};
+		let animation = match (animation, celebration) {
+			(Some(animation), Some(celebration)) => Some(animation.min(celebration)),
+			(Some(animation), None) => Some(animation),
+			(None, celebration) => celebration,
+		};
+		match (animation, retained) {
+			(Some(animation), Some(retained)) => Some(animation.min(retained)),
+			(Some(animation), None) => Some(animation),
+			(None, retained) => retained,
+		}
 	}
 
 	/// Produces one throwaway viewport during an active resize gesture.
@@ -1775,6 +2255,15 @@ impl Chat {
 	}
 
 	fn render_at(&mut self, viewport: Size, elapsed: Duration) -> RenderedFrame<'_> {
+		let before = self.transcript.len();
+		self.transcript.retain(|entry| {
+			!matches!(entry, Entry::Retained(frame) if frame.expires_at.is_some_and(|at| elapsed >= at))
+		});
+		if self.transcript.len() != before {
+			self.drawn_entries = 0;
+			self.transcript_rows = 0;
+			self.last_viewport = Size::new(0, 0);
+		}
 		if viewport.width == 0 || viewport.height == 0 {
 			self.last_viewport = viewport;
 			self.height_floor = 0;
@@ -1890,6 +2379,18 @@ impl Chat {
 		}
 		if repaint_suffix || live_changed {
 			self.draw_session_title_owned(title_y);
+			if self
+				.celebration_until
+				.is_some_and(|deadline| elapsed < deadline)
+			{
+				draw_quota_celebration(
+					&mut self.frame,
+					title_y,
+					elapsed,
+					self.ctx.charset,
+					self.ctx.theme,
+				);
+			}
 		}
 		let hud = Rect::new(0, working_y, content_width, 2);
 		if !self.frame.noselect().contains(&hud) {
@@ -1954,7 +2455,18 @@ impl Chat {
 				.saturating_add(1)
 				.saturating_add(if tool.expanded { tool.view.height() } else { 0 })
 		});
+		let error_rows = self
+			.pinned_error
+			.as_ref()
+			.map_or(0, |error| flowed_height(error, inner_width).min(3));
+		let download_rows = self
+			.download_activity
+			.as_ref()
+			.filter(|activity| activity.visible(self.started_at.elapsed()))
+			.map_or(0, |_| 1);
 		let content_rows = agent_rows
+			.saturating_add(error_rows)
+			.saturating_add(download_rows)
 			.saturating_add(assistant_rows)
 			.saturating_add(tool_rows)
 			.min(MAX_LIVE_PANEL_CONTENT_ROWS);
@@ -1981,12 +2493,15 @@ impl Chat {
 		match entry {
 			Entry::User(user) => user.body.resize(message_width, ctx),
 			Entry::Assistant(body) => body.resize(width.max(1), ctx),
+			Entry::Thinking(thinking) => thinking.body.resize(width.max(1), ctx),
+			Entry::Peer { .. } => {},
 			Entry::Tool(tool) => tool.view.resize(Self::tool_view_width(width), ctx),
 			Entry::ToolGroup(group) => {
 				for tool in &mut group.tools {
 					tool.view.resize(Self::tool_view_width(width), ctx);
 				}
 			},
+			Entry::Retained(frame) => frame.view.resize(Self::tool_view_width(width), ctx),
 			Entry::Compaction(_) | Entry::Notice { .. } => {},
 		}
 	}
@@ -1999,6 +2514,20 @@ impl Chat {
 				.saturating_add(u16::from(!user.chips.is_empty()))
 				.saturating_add(1),
 			Entry::Assistant(body) => body.height().saturating_add(1),
+			Entry::Thinking(thinking) => {
+				if thinking.expanded {
+					thinking.body.height().saturating_add(2)
+				} else {
+					2
+				}
+			},
+			Entry::Peer { title, detail } => flowed_height(title, width.saturating_sub(4))
+				.saturating_add(
+					detail
+						.as_ref()
+						.map_or(0, |detail| flowed_height(detail, width.saturating_sub(4))),
+				)
+				.saturating_add(2),
 			Entry::Tool(tool) => tool_height(tool, width).saturating_add(1),
 			Entry::ToolGroup(group) => group.tools.iter().fold(1_u16, |height, tool| {
 				height
@@ -2008,6 +2537,7 @@ impl Chat {
 			Entry::Compaction(compaction) => {
 				flowed_height(&compaction.label, width.saturating_sub(2)).saturating_add(1)
 			},
+			Entry::Retained(frame) => frame.view.height().saturating_add(1),
 			Entry::Notice { text, .. } => {
 				flowed_height(text, width.saturating_sub(2)).saturating_add(1)
 			},
@@ -2018,6 +2548,39 @@ impl Chat {
 		match entry {
 			Entry::User(user) => draw_user(frame, y, user, ctx),
 			Entry::Assistant(body) => draw_rich(frame, y, body, 0, width, ctx.theme).saturating_add(1),
+			Entry::Thinking(thinking) => {
+				let marker = fmts_mut!("thinking · {} · ctrl+t", thinking.elapsed).freeze();
+				draw_line(frame, 1, y, width.saturating_sub(2), &[Span::new(
+					&marker,
+					ink(ctx.theme.muted).italic(),
+				)]);
+				if thinking.expanded {
+					draw_rich(
+						frame,
+						y.saturating_add(1),
+						&thinking.body,
+						1,
+						width.saturating_sub(1),
+						ctx.theme,
+					)
+					.saturating_add(2)
+				} else {
+					2
+				}
+			},
+			Entry::Peer { title, detail } => {
+				let body = detail.as_deref().unwrap_or("");
+				let used = draw_flowed(
+					frame,
+					Rect::new(2, y, width.saturating_sub(4), frame.size().height.saturating_sub(y)),
+					&[
+						Span::new(title, ink(ctx.theme.secondary).bold()),
+						Span::new("\n", ink(ctx.theme.secondary)),
+						Span::new(body, ink(ctx.theme.fg)),
+					],
+				);
+				used.saturating_add(1)
+			},
 			Entry::Tool(tool) => draw_tool(frame, y, width, tool, ctx).saturating_add(1),
 			Entry::ToolGroup(group) => {
 				draw_line(frame, 1, y, width.saturating_sub(2), &[Span::new(
@@ -2036,6 +2599,13 @@ impl Chat {
 				&[Span::new(&compaction.label, ink(ctx.theme.info).bold())],
 			)
 			.saturating_add(1),
+			Entry::Retained(entry) => {
+				let height = entry.view.height();
+				if height > 0 {
+					frame.blit(entry.view.rendered.frame(), 0, height, 1, y);
+				}
+				height.saturating_add(1)
+			},
 			Entry::Notice { text, error } => {
 				let style = if *error {
 					ink(ctx.theme.err)
@@ -2060,6 +2630,8 @@ impl Chat {
 			self.live_assistant.as_ref(),
 			&self.live_tools,
 			&self.agent_labels,
+			self.pinned_error.as_deref(),
+			self.download_activity.as_ref(),
 			&ctx,
 			elapsed,
 		);
@@ -2072,6 +2644,8 @@ impl Chat {
 			self.live_assistant.as_ref(),
 			&self.live_tools,
 			&self.agent_labels,
+			self.pinned_error.as_deref(),
+			self.download_activity.as_ref(),
 			&self.ctx,
 			elapsed,
 		);
@@ -2115,11 +2689,18 @@ fn draw_live_panel_impl(
 	assistant: Option<&LiveAssistant>,
 	tools: &[LiveTool],
 	agent_labels: &[Str],
+	pinned_error: Option<&str>,
+	download: Option<&DownloadActivity>,
 	ctx: &UiContext,
 	elapsed: Duration,
 ) {
 	frame.fill(rect, base_style(ctx.theme));
-	if assistant.is_none() && tools.is_empty() && agent_labels.is_empty() {
+	if assistant.is_none()
+		&& tools.is_empty()
+		&& agent_labels.is_empty()
+		&& pinned_error.is_none()
+		&& download.is_none_or(|activity| !activity.visible(elapsed))
+	{
 		return;
 	}
 	draw_box(
@@ -2132,6 +2713,28 @@ fn draw_live_panel_impl(
 	);
 	let mut y = rect.y.saturating_add(1);
 	let bottom = rect.y.saturating_add(rect.height).saturating_sub(1);
+	if let Some(error) = pinned_error {
+		let used = draw_flowed(
+			frame,
+			Rect::new(
+				rect.x.saturating_add(1),
+				y,
+				rect.width.saturating_sub(2),
+				bottom.saturating_sub(y).min(3),
+			),
+			&[Span::new(error, ink(ctx.theme.err).bold())],
+		);
+		y = y.saturating_add(used).min(bottom);
+	}
+	if let Some(activity) = download.filter(|activity| activity.visible(elapsed))
+		&& y < bottom
+	{
+		draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
+			&activity.label,
+			ink(ctx.theme.info),
+		)]);
+		y = y.saturating_add(1);
+	}
 	for label in agent_labels.iter().take(8) {
 		if y >= bottom {
 			break;
@@ -2182,6 +2785,20 @@ fn draw_live_panel_impl(
 	}
 }
 
+fn download_label(progress: &ModelDownloadProgress) -> Str {
+	let mut label = fmts_mut!("model · {}", progress.label);
+	if let Some(total) = progress.total.filter(|total| *total > 0) {
+		let percent = progress.downloaded.saturating_mul(100) / total;
+		let _ = write!(label, " · {}/{} bytes · {percent}%", progress.downloaded.min(total), total);
+	} else {
+		let _ = write!(label, " · {} bytes", progress.downloaded);
+	}
+	if progress.complete {
+		label.push_str(" · ready");
+	}
+	label.freeze()
+}
+
 fn draw_working_impl(
 	frame: &mut Frame,
 	y: u16,
@@ -2223,6 +2840,44 @@ fn draw_working_impl(
 			rect: Rect::new(start, y, column.saturating_sub(start), 1),
 			kind: DecorKind::Shimmer { period: SHIMMER_PERIOD },
 		});
+	}
+}
+
+fn draw_quota_celebration(
+	frame: &mut Frame,
+	y: u16,
+	elapsed: Duration,
+	charset: Charset,
+	theme: Theme,
+) {
+	if y >= frame.size().height || frame.size().width < 12 {
+		return;
+	}
+	let glyphs = if charset == Charset::Ascii {
+		["*", "+", "."]
+	} else {
+		["✦", "✧", "·"]
+	};
+	let phase = usize::try_from(elapsed.as_millis() / 100).unwrap_or(0);
+	for index in 0..6_u16 {
+		let x = frame
+			.size()
+			.width
+			.saturating_sub(2 + index.saturating_mul(2));
+		if x == 0 {
+			break;
+		}
+		let glyph = glyphs[(phase + usize::from(index)) % glyphs.len()];
+		frame.put(
+			x,
+			y,
+			glyph,
+			ink(if index.is_multiple_of(2) {
+				theme.accent
+			} else {
+				theme.ok
+			}),
+		);
 	}
 }
 
@@ -3150,13 +3805,20 @@ mod tests {
 		let mut context = ctx();
 		context.theme = Theme::for_appearance(omp_tui::Appearance::Light);
 		let mut frame = Frame::new(Size::new(20, 5));
-		let assistant = Some(LiveAssistant { id: sf!("a"), text: StrMut::new("stream") });
+		let assistant = Some(LiveAssistant {
+			id:       sf!("a"),
+			text:     StrMut::new("stream"),
+			started:  Duration::ZERO,
+			thinking: false,
+		});
 		draw_live_panel_impl(
 			&mut frame,
 			Rect::new(0, 0, 20, 5),
 			assistant.as_ref(),
 			&[],
 			&[],
+			None,
+			None,
 			&context,
 			Duration::ZERO,
 		);

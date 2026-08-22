@@ -119,12 +119,16 @@ pub struct DapProtocol {
 	inner: Arc<ProtocolInner>,
 }
 
+const ADAPTER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const ADAPTER_READY_POLL: Duration = Duration::from_millis(25);
 /// A spawned stdio adapter and its protocol connection.
 pub struct SpawnedDap {
 	/// Active framed protocol.
-	pub protocol: DapProtocol,
+	pub protocol:     DapProtocol,
 	/// Owned adapter process.
-	pub child:    Arc<AsyncMutex<Child>>,
+	pub child:        Arc<AsyncMutex<Child>>,
+	/// Unix socket removed when the owning session tears down.
+	pub cleanup_path: Option<std::path::PathBuf>,
 }
 
 impl DapProtocol {
@@ -183,8 +187,9 @@ impl DapProtocol {
 			.take()
 			.ok_or_else(|| io::Error::other("adapter stdin unavailable"))?;
 		Ok(SpawnedDap {
-			protocol: Self::from_streams(reader, writer),
-			child:    Arc::new(AsyncMutex::new(child)),
+			protocol:     Self::from_streams(reader, writer),
+			child:        Arc::new(AsyncMutex::new(child)),
+			cleanup_path: None,
 		})
 	}
 
@@ -193,6 +198,15 @@ impl DapProtocol {
 		let stream = tokio::net::TcpStream::connect(address).await?;
 		let (reader, writer) = stream.into_split();
 		Ok(Self::from_streams(reader, writer))
+	}
+
+	/// Resolves and connects a configured remote adapter endpoint.
+	pub async fn connect_tcp_host(host: &str, port: u16) -> Result<Self, DapProtocolError> {
+		let mut addresses = tokio::net::lookup_host((host, port)).await?;
+		let address = addresses
+			.next()
+			.ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no DAP address"))?;
+		Self::connect_tcp(address).await
 	}
 
 	/// Connects an existing Unix-domain debug adapter.
@@ -300,6 +314,202 @@ impl DapProtocol {
 	#[must_use]
 	pub fn is_closed(&self) -> bool {
 		self.inner.closed.is_cancelled()
+	}
+
+	/// Spawns an adapter using its declared stdio, TCP, Unix-socket, or
+	/// reverse-client transport and waits for a bounded owner-local connection.
+	pub async fn spawn_adapter(
+		command: &str,
+		args: &[Str],
+		transport: &crate::DapTransport,
+		cwd: &Path,
+	) -> Result<SpawnedDap, DapProtocolError> {
+		match transport {
+			crate::DapTransport::Stdio => Self::spawn_stdio(command, args, cwd),
+			crate::DapTransport::Tcp { port_argument } => {
+				Self::spawn_tcp(command, args, port_argument, cwd).await
+			},
+			crate::DapTransport::Unix { socket_argument } => {
+				#[cfg(target_os = "linux")]
+				{
+					Self::spawn_unix(command, args, socket_argument, cwd).await
+				}
+				#[cfg(not(target_os = "linux"))]
+				{
+					Self::spawn_reverse_tcp(command, args, socket_argument, cwd).await
+				}
+			},
+		}
+	}
+
+	async fn spawn_tcp(
+		command: &str,
+		args: &[Str],
+		port_argument: &str,
+		cwd: &Path,
+	) -> Result<SpawnedDap, DapProtocolError> {
+		let reservation = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+		let port = reservation.local_addr()?.port();
+		drop(reservation);
+		let replacement = port.to_string();
+		let args = substituted_args(args, port_argument, &replacement);
+		let child = spawn_socket_process(command, &args, cwd)?;
+		let child = Arc::new(AsyncMutex::new(child));
+		let deadline = tokio::time::Instant::now() + ADAPTER_READY_TIMEOUT;
+		loop {
+			match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+				Ok(stream) => {
+					let (reader, writer) = stream.into_split();
+					return Ok(SpawnedDap {
+						protocol: Self::from_streams(reader, writer),
+						child,
+						cleanup_path: None,
+					});
+				},
+				Err(error) if tokio::time::Instant::now() < deadline => {
+					if child.lock().await.try_wait()?.is_some() {
+						return Err(DapProtocolError::Io(error));
+					}
+					tokio::time::sleep(ADAPTER_READY_POLL).await;
+				},
+				Err(_error) => {
+					kill_child(&child).await;
+					return Err(DapProtocolError::Timeout);
+				},
+			}
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	async fn spawn_unix(
+		command: &str,
+		args: &[Str],
+		socket_argument: &str,
+		cwd: &Path,
+	) -> Result<SpawnedDap, DapProtocolError> {
+		let socket_path = std::env::temp_dir().join(format!(
+			"omp-dap-{}-{}.sock",
+			std::process::id(),
+			rand::random::<u64>()
+		));
+		let replacement = socket_path.to_string_lossy();
+		let args = substituted_args(args, socket_argument, replacement.as_ref());
+		let child = Arc::new(AsyncMutex::new(spawn_socket_process(command, &args, cwd)?));
+		let deadline = tokio::time::Instant::now() + ADAPTER_READY_TIMEOUT;
+		loop {
+			match tokio::net::UnixStream::connect(&socket_path).await {
+				Ok(stream) => {
+					let (reader, writer) = stream.into_split();
+					return Ok(SpawnedDap {
+						protocol: Self::from_streams(reader, writer),
+						child,
+						cleanup_path: Some(socket_path),
+					});
+				},
+				Err(error) if tokio::time::Instant::now() < deadline => {
+					if child.lock().await.try_wait()?.is_some() {
+						return Err(DapProtocolError::Io(error));
+					}
+					tokio::time::sleep(ADAPTER_READY_POLL).await;
+				},
+				Err(_error) => {
+					kill_child(&child).await;
+					let _ = tokio::fs::remove_file(&socket_path).await;
+					return Err(DapProtocolError::Timeout);
+				},
+			}
+		}
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	async fn spawn_reverse_tcp(
+		command: &str,
+		args: &[Str],
+		client_argument: &str,
+		cwd: &Path,
+	) -> Result<SpawnedDap, DapProtocolError> {
+		let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+		let address = listener.local_addr()?;
+		let replacement = address.to_string();
+		let args = substituted_args(args, client_argument, &replacement);
+		let child = Arc::new(AsyncMutex::new(spawn_socket_process(command, &args, cwd)?));
+		let accepted = tokio::time::timeout(ADAPTER_READY_TIMEOUT, listener.accept()).await;
+		match accepted {
+			Ok(Ok((stream, peer))) if peer.ip().is_loopback() => {
+				let (reader, writer) = stream.into_split();
+				Ok(SpawnedDap {
+					protocol: Self::from_streams(reader, writer),
+					child,
+					cleanup_path: None,
+				})
+			},
+			Ok(Ok((_stream, _))) => {
+				kill_child(&child).await;
+				Err(DapProtocolError::InvalidFrame(sf!(
+					"reverse DAP adapter connected from a non-owner-local address",
+				)))
+			},
+			Ok(Err(error)) => {
+				kill_child(&child).await;
+				Err(DapProtocolError::Io(error))
+			},
+			Err(_) => {
+				kill_child(&child).await;
+				Err(DapProtocolError::Timeout)
+			},
+		}
+	}
+}
+
+fn substituted_args(args: &[Str], marker: &str, replacement: &str) -> Vec<Str> {
+	args
+		.iter()
+		.map(|argument| {
+			if argument.contains(marker) {
+				Str::from(argument.replace(marker, replacement))
+			} else {
+				argument.clone()
+			}
+		})
+		.collect()
+}
+
+fn spawn_socket_process(
+	command: &str,
+	args: &[Str],
+	cwd: &Path,
+) -> Result<Child, DapProtocolError> {
+	let mut process = Command::new(command);
+	process
+		.args(args.iter().map(Str::as_str))
+		.current_dir(cwd)
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
+		.kill_on_drop(true)
+		.env("CI", "1")
+		.env("TERM", "dumb")
+		.env("GIT_TERMINAL_PROMPT", "0");
+	#[cfg(unix)]
+	{
+		// SAFETY: `setsid` is async-signal-safe and touches no shared Rust state.
+		unsafe {
+			process.pre_exec(|| {
+				if libc::setsid() < 0 {
+					Err(io::Error::last_os_error())
+				} else {
+					Ok(())
+				}
+			})
+		};
+	}
+	Ok(process.spawn()?)
+}
+
+async fn kill_child(child: &Arc<AsyncMutex<Child>>) {
+	let mut child = child.lock().await;
+	if child.try_wait().ok().flatten().is_none() {
+		let _ = child.kill().await;
 	}
 }
 

@@ -5,18 +5,20 @@ use std::{collections::VecDeque, io, io::Write, time::Duration};
 use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
 use omp_tui::{
-	AltScreenUse, CursorStyle, DebugOp, DebugQuery, InputEvent, Key, Layer, Mouse, PaintStats,
-	Pasted, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext, detect,
+	AltScreenUse, CursorStyle, DebugOp, DebugQuery, InputEvent, Key, Layer, Mouse, Notification,
+	PaintStats, Pasted, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext,
+	Urgency, detect,
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
 use tokio::{sync::oneshot, time::Instant};
 
 use crate::{
-	ApprovalAction, BackendEvent, Chat, ChatKey, CommandPalette, Intent, ListPicker, ListRow,
-	ModelPicker, ModelRow, PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, PromptEvent,
-	PromptOverlay, ProviderPicker, PtyEvent, PtyOverlay, RenderedFrame, RewindTargetRow, SessionRow,
-	Sidebar, Welcome, WelcomeEvent,
+	AgentHub, AgentHubEvent, ApprovalAction, BackendEvent, Chat, ChatKey, CommandPalette,
+	ImageOverlay, ImageOverlayEvent, Intent, ListPicker, ListRow, ModelPicker, ModelRow,
+	PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, PromptEvent, PromptOverlay,
+	ProviderPicker, PtyEvent, PtyOverlay, RenderedFrame, RewindTargetRow, SessionRow, Sidebar,
+	Welcome, WelcomeEvent,
 	approval::{ApprovalEvent, ApprovalOverlay},
 	ask::{self, AskDialog, AskDialogEvent, AskRequest},
 };
@@ -73,11 +75,20 @@ pub struct HostOptions {
 	pub welcome:                bool,
 	/// Whether session-changing actions return to the caller for reconstruction.
 	pub exit_on_session_change: bool,
+	/// Notify when a non-interrupted turn settles.
+	pub completion_notify:      bool,
+	/// Notify and retain an attention title for backend errors.
+	pub error_notify:           bool,
 }
 
 impl Default for HostOptions {
 	fn default() -> Self {
-		Self { welcome: true, exit_on_session_change: true }
+		Self {
+			welcome:                true,
+			exit_on_session_change: true,
+			completion_notify:      true,
+			error_notify:           true,
+		}
 	}
 }
 
@@ -115,6 +126,8 @@ pub async fn run(
 	run_with_options(chat, ctx, events, intents, HostOptions {
 		welcome:                true,
 		exit_on_session_change: false,
+		completion_notify:      true,
+		error_notify:           true,
 	})
 	.await
 	.map(|_| ())
@@ -214,6 +227,8 @@ async fn run_with_terminal(
 		events,
 		intents,
 		options.exit_on_session_change,
+		options.completion_notify,
+		options.error_notify,
 	)
 	.await
 }
@@ -241,73 +256,78 @@ async fn run_welcome(
 ) -> io::Result<WelcomeOutcome> {
 	let mut alt_enter = terminal.stage_alt_enter(AltScreenUse::Interactive);
 	let mut welcome = Welcome::new(ctx, Vec::new());
+	let started = Instant::now();
 	loop {
 		if let Some(size) = terminal.take_resize()? {
 			*viewport = size;
 		}
 		renderer.preview(
-			welcome.render(*viewport, Duration::ZERO),
+			welcome.render(*viewport, started.elapsed()),
 			viewport.height,
 			alt_enter.take().as_deref().unwrap_or(""),
 		)?;
 		tokio::select! {
-			event = terminal.next() => match event? {
-				TerminalEvent::Resize => if let Some(size) = terminal.take_resize()? { *viewport = size; },
-				TerminalEvent::Debug(query) => answer_debug(query, chat),
-				TerminalEvent::Effect(effect) => {
-					let _ = chat.slots_mut().apply_serialized(effect);
-				},
-				TerminalEvent::Closed => return Ok(WelcomeOutcome::Exit(HostExit::Quit)),
-				TerminalEvent::Input(event) => {
-					let Some(event) = user_event(terminal, renderer, event)? else { continue };
-					match event {
-						InputEvent::Key(key) => match welcome.handle_key(key) {
-							WelcomeEvent::Consumed => {},
-							WelcomeEvent::NewSession => {
-								send(intents, Intent::NewSession);
-								return Ok(if exit_on_session_change {
-									WelcomeOutcome::Exit(HostExit::NewSession)
-								} else {
-									WelcomeOutcome::Proceed
-								});
-							},
-							WelcomeEvent::Resume(id) => {
-								send(intents, Intent::Resume(Some(id.clone())));
-								return Ok(if exit_on_session_change {
-									WelcomeOutcome::Exit(HostExit::Resume(id))
-								} else {
-									WelcomeOutcome::Proceed
-								});
-							},
-							WelcomeEvent::Quit => {
-								send(intents, Intent::Quit);
-								return Ok(WelcomeOutcome::Exit(HostExit::Quit));
-							},
+					event = terminal.next() => match event? {
+						TerminalEvent::Resize => if let Some(size) = terminal.take_resize()? { *viewport = size; },
+						TerminalEvent::Debug(query) => answer_debug(query, chat),
+						TerminalEvent::Effect(effect) => {
+							let _ = chat.slots_mut().apply_serialized(effect);
 						},
-						InputEvent::Mouse(report) if matches!(report.kind, Mouse::Move | Mouse::Drag) => {
-							welcome.point_at(report.col, report.row);
+						TerminalEvent::Closed => return Ok(WelcomeOutcome::Exit(HostExit::Quit)),
+						TerminalEvent::Input(event) => {
+							let Some(event) = user_event(terminal, renderer, event)? else { continue };
+							match event {
+								InputEvent::Key(key) => match welcome.handle_key(key) {
+									WelcomeEvent::Consumed => {},
+									WelcomeEvent::NewSession => {
+										send(intents, Intent::NewSession);
+										return Ok(if exit_on_session_change {
+											WelcomeOutcome::Exit(HostExit::NewSession)
+										} else {
+											WelcomeOutcome::Proceed
+										});
+									},
+									WelcomeEvent::Resume(id) => {
+										send(intents, Intent::Resume(Some(id.clone())));
+										return Ok(if exit_on_session_change {
+											WelcomeOutcome::Exit(HostExit::Resume(id))
+										} else {
+											WelcomeOutcome::Proceed
+										});
+									},
+									WelcomeEvent::Quit => {
+										send(intents, Intent::Quit);
+										return Ok(WelcomeOutcome::Exit(HostExit::Quit));
+									},
+								},
+								InputEvent::Mouse(report) if matches!(report.kind, Mouse::Move | Mouse::Drag) => {
+									welcome.point_at(report.col, report.row);
+								},
+								InputEvent::Mouse(_) | InputEvent::Paste(_) | InputEvent::Focus(_)
+								| InputEvent::Response(_) => {},
+							}
 						},
-						InputEvent::Mouse(_) | InputEvent::Paste(_) | InputEvent::Focus(_)
-						| InputEvent::Response(_) => {},
-					}
-				},
-			},
+					},
 			backend = events.recv_async() => match backend {
-				Ok(BackendEvent::Sessions(rows)) => welcome.set_sessions(rows),
-				Ok(BackendEvent::OpenModelPicker { rows, current }
-					| BackendEvent::ModelsUpdated { rows, current }) => {
-					*models = rows;
-					*current_model = current.min(models.len().saturating_sub(1));
-				},
-				Ok(event) => { let _ = chat.apply_backend_event(event); },
-				Err(_) => return Ok(WelcomeOutcome::Exit(HostExit::Quit)),
-			},
-		}
+						Ok(BackendEvent::Sessions(rows)) => welcome.set_sessions(rows),
+										Ok(BackendEvent::ModelDownloadProgress(progress)) => {
+							welcome.set_download_progress(progress, started.elapsed());
+						},
+		Ok(BackendEvent::OpenModelPicker { rows, current }
+							| BackendEvent::ModelsUpdated { rows, current }) => {
+							*models = rows;
+							*current_model = current.min(models.len().saturating_sub(1));
+						},
+						Ok(event) => { let _ = chat.apply_backend_event(event); },
+						Err(_) => return Ok(WelcomeOutcome::Exit(HostExit::Quit)),
+					},
+				}
 	}
 }
 
 struct ChatHost {
 	chat:              Chat,
+	session_title:     Str,
 	sidebar:           Sidebar,
 	overlay:           Option<Overlay>,
 	models:            Vec<ModelRow>,
@@ -330,6 +350,7 @@ impl ChatHost {
 		chat.set_right_inset(sidebar.reserved(viewport));
 		Self {
 			chat,
+			session_title: sf!("omp"),
 			sidebar,
 			overlay: None,
 			models,
@@ -370,6 +391,9 @@ enum Overlay {
 	Pty(PtyOverlay),
 	Palette(CommandPalette),
 	List { picker: ListPicker, rows: Vec<ListRow>, prefill: Vec<Str>, purpose: ListPurpose },
+	AgentHub(AgentHub),
+	Images(ImageOverlay),
+	AgentPrompt { prompt: PromptOverlay, agent_id: Str, revive: bool },
 	Providers(ProviderPicker),
 	Prompt(PromptOverlay),
 	Approval(ApprovalOverlay),
@@ -386,6 +410,11 @@ enum OverlayEvent {
 	Palette(PaletteAction),
 	PromptCancel,
 	Prompt(Str),
+	OpenAgentPrompt(Str),
+	OpenAgentRevivePrompt(Str),
+	AgentSteerPrompt { agent_id: Str, prompt: Str },
+	AgentRevivePrompt { agent_id: Str, prompt: Str },
+	AgentKill(Str),
 	ApprovalCancel,
 	ApprovalDecide { ticket_id: Str, action: ApprovalAction },
 	ApprovalAmend(Str),
@@ -405,6 +434,20 @@ impl Overlay {
 			},
 			Self::Palette(palette) => palette_event(palette.handle_key(key)),
 			Self::List { picker, .. } => picker_event(picker.handle_key(key)),
+			Self::AgentHub(hub) => agent_hub_event(hub.handle_key(key)),
+			Self::Images(images) => image_overlay_event(images.handle_key(key)),
+			Self::AgentPrompt { prompt, agent_id, revive } => {
+				match prompt_event(prompt.handle_key(key)) {
+					OverlayEvent::Prompt(value) if *revive => {
+						OverlayEvent::AgentRevivePrompt { agent_id: agent_id.clone(), prompt: value }
+					},
+					OverlayEvent::Prompt(value) => {
+						OverlayEvent::AgentSteerPrompt { agent_id: agent_id.clone(), prompt: value }
+					},
+					OverlayEvent::PromptCancel => OverlayEvent::Close,
+					event => event,
+				}
+			},
 			Self::Providers(picker) => picker_event(picker.handle_key(key)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_key(key)),
 			Self::Approval(approval) => {
@@ -430,6 +473,19 @@ impl Overlay {
 			},
 			Self::Palette(palette) => palette_event(palette.handle_paste(text)),
 			Self::List { picker, .. } => picker_event(picker.handle_paste(text)),
+			Self::AgentHub(_) | Self::Images(_) => OverlayEvent::Consumed,
+			Self::AgentPrompt { prompt, agent_id, revive } => {
+				match prompt_event(prompt.handle_paste(text)) {
+					OverlayEvent::Prompt(value) if *revive => {
+						OverlayEvent::AgentRevivePrompt { agent_id: agent_id.clone(), prompt: value }
+					},
+					OverlayEvent::Prompt(value) => {
+						OverlayEvent::AgentSteerPrompt { agent_id: agent_id.clone(), prompt: value }
+					},
+					OverlayEvent::PromptCancel => OverlayEvent::Close,
+					event => event,
+				}
+			},
 			Self::Providers(picker) => picker_event(picker.handle_paste(text)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_paste(text)),
 			Self::Approval(approval) => {
@@ -450,6 +506,9 @@ impl Overlay {
 			Self::Pty(_) => OverlayEvent::Consumed,
 			Self::Palette(palette) => palette_event(palette.handle_mouse(col, row, kind, viewport)),
 			Self::List { picker, .. } => picker_event(picker.handle_mouse(col, row, kind, viewport)),
+			Self::AgentHub(hub) => agent_hub_event(hub.handle_mouse(col, row, kind, viewport)),
+			Self::Images(images) => image_overlay_event(images.handle_mouse(col, row, kind, viewport)),
+			Self::AgentPrompt { .. } => OverlayEvent::Consumed,
 			Self::Providers(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_mouse(col, row, kind, viewport)),
 			Self::Approval(approval) => approval_event(
@@ -473,6 +532,9 @@ impl Overlay {
 			Self::Pty(pty) => pty.layer(viewport),
 			Self::Palette(palette) => palette.layer(viewport),
 			Self::List { picker, .. } => picker.layer(viewport),
+			Self::AgentHub(hub) => hub.layer(viewport),
+			Self::Images(images) => images.layer(viewport),
+			Self::AgentPrompt { prompt, .. } => prompt.layer(viewport),
 			Self::Providers(picker) => picker.layer(viewport),
 			Self::Prompt(prompt) => prompt.layer(viewport),
 			Self::Approval(approval) => approval.layer(viewport),
@@ -487,6 +549,21 @@ const fn picker_event(event: PickerEvent) -> OverlayEvent {
 		PickerEvent::Consumed => OverlayEvent::Consumed,
 		PickerEvent::Close => OverlayEvent::Close,
 		PickerEvent::Pick(index) => OverlayEvent::Pick(index),
+	}
+}
+fn agent_hub_event(event: AgentHubEvent) -> OverlayEvent {
+	match event {
+		AgentHubEvent::Consumed => OverlayEvent::Consumed,
+		AgentHubEvent::Close => OverlayEvent::Close,
+		AgentHubEvent::Steer(id) => OverlayEvent::OpenAgentPrompt(id),
+		AgentHubEvent::Revive(id) => OverlayEvent::OpenAgentRevivePrompt(id),
+		AgentHubEvent::Kill(id) => OverlayEvent::AgentKill(id),
+	}
+}
+const fn image_overlay_event(event: ImageOverlayEvent) -> OverlayEvent {
+	match event {
+		ImageOverlayEvent::Consumed => OverlayEvent::Consumed,
+		ImageOverlayEvent::Close => OverlayEvent::Close,
 	}
 }
 
@@ -562,6 +639,8 @@ async fn run_chat(
 	events: &Receiver<BackendEvent>,
 	intents: &Sender<Intent>,
 	exit_on_session_change: bool,
+	completion_notify: bool,
+	error_notify: bool,
 ) -> io::Result<HostOutcome> {
 	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model);
 	let ask_binding = ask::bind();
@@ -579,55 +658,165 @@ async fn run_chat(
 	loop {
 		let paste_deadline = paste_read.as_ref().map(|read| read.abandon_at);
 		tokio::select! {
-			event = terminal.next(), if paste_read.is_none() => match event? {
-				TerminalEvent::Resize => {
-					let resized = observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
-					host.chat.set_right_inset(host.sidebar.reserved(viewport));
-					if host.overlay.is_some() && resized { overlay_stale = true; }
-					send_pty_resize(&mut host, viewport, intents);
-				},
-				TerminalEvent::Debug(query) => answer_debug(query, &mut host.chat),
-				TerminalEvent::Effect(effect) => {
-					let _ = host.chat.slots_mut().apply_serialized(effect);
-				},
-				TerminalEvent::Closed => return Ok(host_outcome(&host, HostExit::Quit)),
-				TerminalEvent::Input(event) => {
-					let Some(event) = user_event(terminal, renderer, event)? else { continue };
-					match event {
-						InputEvent::Key(key) => {
+					event = terminal.next(), if paste_read.is_none() => match event? {
+						TerminalEvent::Resize => {
+							let resized = observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
+							host.chat.set_right_inset(host.sidebar.reserved(viewport));
+							if host.overlay.is_some() && resized { overlay_stale = true; }
+							send_pty_resize(&mut host, viewport, intents);
+						},
+						TerminalEvent::Debug(query) => answer_debug(query, &mut host.chat),
+						TerminalEvent::Effect(effect) => {
+							let _ = host.chat.slots_mut().apply_serialized(effect);
+						},
+						TerminalEvent::Closed => return Ok(host_outcome(&host, HostExit::Quit)),
+						TerminalEvent::Input(event) => {
+							let Some(event) = user_event(terminal, renderer, event)? else { continue };
+							match event {
+								InputEvent::Key(key) => {
+									if host.overlay.is_some() {
+										if key == Key::Ctrl('c') {
+											send(intents, Intent::Quit);
+											break;
+										}
+										let event = host.overlay.as_mut().expect("overlay present").handle_key(key);
+										if let Some(exit) = apply_overlay_event(
+											&mut host,
+											event,
+											ctx,
+											viewport,
+											intents,
+											exit_on_session_change,
+										) {
+											return Ok(host_outcome(&host, exit));
+										}
+										if host.overlay.is_none() {
+											close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
+										}
+									} else if key == Key::Ctrl('b') {
+										host.sidebar.toggle();
+										host.chat.set_right_inset(host.sidebar.reserved(viewport));
+									} else if key == Key::Ctrl('k') {
+										host.overlay = Some(Overlay::Palette(CommandPalette::open(palette_entries(), ctx)));
+										open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
+									} else if host.sidebar.focused() {
+										if key == Key::Ctrl('c') {
+											send(intents, Intent::Quit);
+											break;
+										}
+										host.sidebar.handle_key(key);
+									} else if key == Key::Alt('a') || key == Key::Ctrl('s') {
+										open_agents(&mut host, ctx);
+										open_overlay(
+											terminal,
+											renderer,
+											&mut host,
+											viewport,
+											&mut drag_alt,
+											&mut overlay_stale,
+											&mut resize,
+										)?;
+									} else if key == Key::Ctrl('p') || key == Key::Alt('p') {
+										host.open_models(ctx);
+										if host.overlay.is_some() {
+											open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
+										}
+									} else if let Some(scope) = ClipboardRead::for_key(key) {
+										paste_read = Some(PasteRead::start(scope));
+									} else if key == Key::Esc && host.chat.is_working() {
+										host.last_esc = None;
+										send(intents, Intent::Abort);
+									} else if key == Key::Esc && host.chat.composer_empty() {
+										let now = Instant::now();
+										if host.last_esc.is_some_and(|last| now.duration_since(last) <= DOUBLE_ESC) {
+											host.last_esc = None;
+											send(intents, Intent::RewindRequest);
+										} else {
+											host.last_esc = Some(now);
+										}
+									} else {
+										host.last_esc = None;
+										let result = host.chat.handle_key(key);
+										if let Some(text) = host.chat.take_copied() { terminal.copy_to_clipboard(&text)?; }
+										while let Some((text, attachments, mode)) = host.chat.take_submission() {
+																				if text.trim() == "/images" {
+												host.overlay = Some(Overlay::Images(ImageOverlay::open(
+													&host.chat.composer_attachments(),
+													ctx,
+												)));
+												open_overlay(
+													terminal,
+													renderer,
+													&mut host,
+													viewport,
+													&mut drag_alt,
+													&mut overlay_stale,
+													&mut resize,
+												)?;
+												continue;
+											}
+		send(intents, Intent::Submit { text, attachments, mode });
+										}
+										if result == ChatKey::Quit {
+											send(intents, Intent::Quit);
+											break;
+										}
+									}
+									next_frame = Some(Instant::now());
+								},
+								InputEvent::Paste(text) => {
+									if let Some(active) = host.overlay.as_mut() {
+										let event = active.handle_paste(&text);
+										if let Some(exit) = apply_overlay_event(
+											&mut host,
+											event,
+											ctx,
+											viewport,
+											intents,
+											exit_on_session_change,
+										) {
+											return Ok(host_outcome(&host, exit));
+										}
+										if host.overlay.is_none() {
+											close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
+										}
+									} else if !host.sidebar.focused() {
+										host.chat.handle_paste(&text);
+									}
+									next_frame = Some(Instant::now());
+								},
+								InputEvent::Mouse(report) => {
+									if let Some(active) = host.overlay.as_mut() {
+										let event = active.handle_mouse(report.col, report.row, report.kind, viewport);
+										if let Some(exit) = apply_overlay_event(
+											&mut host,
+											event,
+											ctx,
+											viewport,
+											intents,
+											exit_on_session_change,
+										) {
+											return Ok(host_outcome(&host, exit));
+										}
+										if host.overlay.is_none() {
+											close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
+										}
+									} else if !host.sidebar.handle_mouse(report.col, report.row, report.kind, viewport) {
+										host.chat.handle_mouse(&report);
+									}
+									next_frame = Some(Instant::now());
+								},
+								InputEvent::Focus(_) | InputEvent::Response(_) => {},
+							}
+						},
+					},
+					request = ask_binding.recv() => {
+						if let Ok(request) = request {
 							if host.overlay.is_some() {
-								if key == Key::Ctrl('c') {
-									send(intents, Intent::Quit);
-									break;
-								}
-								let event = host.overlay.as_mut().expect("overlay present").handle_key(key);
-								if let Some(exit) = apply_overlay_event(
-									&mut host,
-									event,
-									ctx,
-									viewport,
-									intents,
-									exit_on_session_change,
-								) {
-									return Ok(host_outcome(&host, exit));
-								}
-								if host.overlay.is_none() {
-									close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
-								}
-							} else if key == Key::Ctrl('b') {
-								host.sidebar.toggle();
-								host.chat.set_right_inset(host.sidebar.reserved(viewport));
-							} else if key == Key::Ctrl('k') {
-								host.overlay = Some(Overlay::Palette(CommandPalette::open(palette_entries(), ctx)));
-								open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
-							} else if host.sidebar.focused() {
-								if key == Key::Ctrl('c') {
-									send(intents, Intent::Quit);
-									break;
-								}
-								host.sidebar.handle_key(key);
-							} else if key == Key::Alt('a') || key == Key::Ctrl('s') {
-								open_agents(&mut host, ctx);
+								request.fail("another modal dialog is already active");
+							} else {
+								let dialog = AskDialog::open(request.question.clone(), ctx);
+								host.overlay = Some(Overlay::Ask { dialog, request });
 								open_overlay(
 									terminal,
 									renderer,
@@ -637,198 +826,138 @@ async fn run_chat(
 									&mut overlay_stale,
 									&mut resize,
 								)?;
-							} else if key == Key::Ctrl('p') || key == Key::Alt('p') {
-								host.open_models(ctx);
-								if host.overlay.is_some() {
-									open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
-								}
-							} else if let Some(scope) = ClipboardRead::for_key(key) {
-								paste_read = Some(PasteRead::start(scope));
-							} else if key == Key::Esc && host.chat.is_working() {
-								host.last_esc = None;
-								send(intents, Intent::Abort);
-							} else if key == Key::Esc && host.chat.composer_empty() {
-								let now = Instant::now();
-								if host.last_esc.is_some_and(|last| now.duration_since(last) <= DOUBLE_ESC) {
-									host.last_esc = None;
-									send(intents, Intent::RewindRequest);
-								} else {
-									host.last_esc = Some(now);
-								}
+								next_frame = Some(Instant::now());
+							}
+						}
+					},
+					backend = events.recv_async() => match backend {
+						Ok(BackendEvent::NewSessionRequested) if exit_on_session_change => {
+							return Ok(host_outcome(&host, HostExit::NewSession));
+						},
+						Ok(event) => {
+							match &event {
+								BackendEvent::ApprovalPending(_) => terminal.set_title("Approval required · omp")?,
+								BackendEvent::ApprovalSettled { .. } if host.pending_approvals <= 1 => {
+									terminal.set_title(host.session_title.as_str())?;
+								},
+								BackendEvent::Error(message) => {
+									terminal.set_title("Error · omp")?;
+									if error_notify {
+										terminal.notify(
+											&Notification::builder()
+												.title("omp error")
+												.body(message.clone())
+												.id("omp-error")
+												.urgency(Urgency::Critical)
+												.build(),
+										)?;
+									}
+								},
+								BackendEvent::Ack { interrupted: false } => {
+									terminal.set_title(host.session_title.as_str())?;
+									if completion_notify {
+										terminal.notify(
+											&Notification::builder()
+												.title("omp")
+												.body("Turn complete")
+												.id("omp-complete")
+												.build(),
+										)?;
+									}
+								},
+								BackendEvent::SessionTitle(title) => {
+									host.session_title = sf!("{title} · omp");
+									if host.pending_approvals == 0 {
+										terminal.set_title(host.session_title.as_str())?;
+									}
+								},
+								BackendEvent::CopyToClipboard(text) => {
+									terminal.copy_to_clipboard(text)?;
+								},
+								_ => {},
+							}
+							let had_overlay = host.overlay.is_some();
+							apply_backend(&mut host, event, ctx);
+							send_pty_resize(&mut host, viewport, intents);
+							if !had_overlay && host.overlay.is_some() {
+								open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
+							} else if had_overlay && host.overlay.is_none() {
+								close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
+							}
+							next_frame = Some(Instant::now());
+						},
+						Err(_) => break,
+					},
+					clipboard = async { (&mut paste_read.as_mut().expect("branch gated").clipboard).await }, if paste_read.is_some() => {
+						let read = paste_read.take().expect("branch gated");
+						if let Ok(Some(clipboard)) = clipboard
+							&& let Some(text) = clipboard_paste_text(clipboard)
+							&& host.overlay.is_none()
+							&& !host.sidebar.focused()
+						{
+							match read.scope {
+								ClipboardRead::Text => host.chat.handle_paste_raw(&text),
+								ClipboardRead::Smart => host.chat.handle_paste(&text),
+							}
+							next_frame = Some(Instant::now());
+						}
+					},
+					() = deadline(paste_deadline) => paste_read = None,
+					() = deadline(next_frame) => {
+						let now = Instant::now();
+						let resized = observe_resize(terminal, &mut viewport, &mut resize, now)?;
+						host.chat.set_right_inset(host.sidebar.reserved(viewport));
+						if host.overlay.is_some() && resized { overlay_stale = true; }
+						if resize.is_some() {
+							let preview = host.chat.render_resize_preview(viewport);
+							let mut layers = rail_layers(&mut host.sidebar, viewport);
+							if let Some(active) = host.overlay.as_mut() {
+								layers.push(active.layer(viewport));
+								renderer.preview_overlaid(&preview, &layers, viewport.height, "")?;
 							} else {
-								host.last_esc = None;
-								let result = host.chat.handle_key(key);
-								if let Some(text) = host.chat.take_copied() { terminal.copy_to_clipboard(&text)?; }
-								while let Some((text, attachments, mode)) = host.chat.take_submission() {
-									send(intents, Intent::Submit { text, attachments, mode });
-								}
-								if result == ChatKey::Quit {
-									send(intents, Intent::Quit);
-									break;
-								}
+								let width_changed = resize.is_some_and(|state| state.width_changed);
+								let alt_enter = if drag_alt || !width_changed { None } else {
+									let staged = terminal.stage_alt_enter(AltScreenUse::Resize);
+									drag_alt = staged.is_some();
+									staged
+								};
+								renderer.preview_overlaid(&preview, &layers, viewport.height, alt_enter.as_deref().unwrap_or(""))?;
 							}
-							next_frame = Some(Instant::now());
-						},
-						InputEvent::Paste(text) => {
-							if let Some(active) = host.overlay.as_mut() {
-								let event = active.handle_paste(&text);
-								if let Some(exit) = apply_overlay_event(
-									&mut host,
-									event,
-									ctx,
-									viewport,
-									intents,
-									exit_on_session_change,
-								) {
-									return Ok(host_outcome(&host, exit));
-								}
-								if host.overlay.is_none() {
-									close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
-								}
-							} else if !host.sidebar.focused() {
-								host.chat.handle_paste(&text);
-							}
-							next_frame = Some(Instant::now());
-						},
-						InputEvent::Mouse(report) => {
-							if let Some(active) = host.overlay.as_mut() {
-								let event = active.handle_mouse(report.col, report.row, report.kind, viewport);
-								if let Some(exit) = apply_overlay_event(
-									&mut host,
-									event,
-									ctx,
-									viewport,
-									intents,
-									exit_on_session_change,
-								) {
-									return Ok(host_outcome(&host, exit));
-								}
-								if host.overlay.is_none() {
-									close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
-								}
-							} else if !host.sidebar.handle_mouse(report.col, report.row, report.kind, viewport) {
-								host.chat.handle_mouse(&report);
-							}
-							next_frame = Some(Instant::now());
-						},
-						InputEvent::Focus(_) | InputEvent::Response(_) => {},
-					}
-				},
-			},
-			request = ask_binding.recv() => {
-				if let Ok(request) = request {
-					if host.overlay.is_some() {
-						request.fail("another modal dialog is already active");
-					} else {
-						let dialog = AskDialog::open(request.question.clone(), ctx);
-						host.overlay = Some(Overlay::Ask { dialog, request });
-						open_overlay(
-							terminal,
-							renderer,
-							&mut host,
-							viewport,
-							&mut drag_alt,
-							&mut overlay_stale,
-							&mut resize,
-						)?;
-						next_frame = Some(Instant::now());
-					}
+						} else if host.overlay.is_some() {
+							let rendered = host.chat.render(viewport);
+							let mut layers = rail_layers(&mut host.sidebar, viewport);
+							layers.push(host.overlay.as_mut().expect("overlay present").layer(viewport));
+							renderer.preview_overlaid(rendered.frame, &layers, viewport.height, "")?;
+						} else {
+							let rendered = host.chat.render(viewport);
+							let layers = rail_layers(&mut host.sidebar, viewport);
+							present(renderer, rendered, viewport, &layers)?;
+						}
+						next_frame = chat_deadline(&host.chat);
+					},
+					() = deadline(resize.map(ResizeState::deadline)) => {
+						let now = Instant::now();
+						if !resize.is_some_and(|state| state.settled(now)) { continue; }
+						if host.overlay.is_some() {
+							overlay_stale = true;
+							resize = None;
+							continue;
+						}
+						host.chat.set_right_inset(host.sidebar.reserved(viewport));
+						let rendered = host.chat.render(viewport);
+						let alt_exit = if drag_alt {
+							drag_alt = false;
+							terminal.stage_alt_leave().unwrap_or("")
+						} else { "" };
+						renderer.rebuild(rendered.frame.clone(), viewport.height, rendered.stable_rows, alt_exit)?;
+						let layers = rail_layers(&mut host.sidebar, viewport);
+						if !layers.is_empty() {
+							renderer.present_overlaid(rendered.frame, &[], viewport.height, rendered.stable_rows, &layers)?;
+						}
+						resize = None;
+						next_frame = chat_deadline(&host.chat);
+					},
 				}
-			},
-			backend = events.recv_async() => match backend {
-				Ok(BackendEvent::NewSessionRequested) if exit_on_session_change => {
-					return Ok(host_outcome(&host, HostExit::NewSession));
-				},
-				Ok(event) => {
-					match &event {
-						BackendEvent::ApprovalPending(_) => terminal.set_title("Approval required · omp")?,
-						BackendEvent::ApprovalSettled { .. } if host.pending_approvals <= 1 => {
-							terminal.set_title("omp")?;
-						},
-						_ => {},
-					}
-					let had_overlay = host.overlay.is_some();
-					apply_backend(&mut host, event, ctx);
-					send_pty_resize(&mut host, viewport, intents);
-					if !had_overlay && host.overlay.is_some() {
-						open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
-					} else if had_overlay && host.overlay.is_none() {
-						close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
-					}
-					next_frame = Some(Instant::now());
-				},
-				Err(_) => break,
-			},
-			clipboard = async { (&mut paste_read.as_mut().expect("branch gated").clipboard).await }, if paste_read.is_some() => {
-				let read = paste_read.take().expect("branch gated");
-				if let Ok(Some(clipboard)) = clipboard
-					&& let Some(text) = clipboard_paste_text(clipboard)
-					&& host.overlay.is_none()
-					&& !host.sidebar.focused()
-				{
-					match read.scope {
-						ClipboardRead::Text => host.chat.handle_paste_raw(&text),
-						ClipboardRead::Smart => host.chat.handle_paste(&text),
-					}
-					next_frame = Some(Instant::now());
-				}
-			},
-			() = deadline(paste_deadline) => paste_read = None,
-			() = deadline(next_frame) => {
-				let now = Instant::now();
-				let resized = observe_resize(terminal, &mut viewport, &mut resize, now)?;
-				host.chat.set_right_inset(host.sidebar.reserved(viewport));
-				if host.overlay.is_some() && resized { overlay_stale = true; }
-				if resize.is_some() {
-					let preview = host.chat.render_resize_preview(viewport);
-					let mut layers = rail_layers(&mut host.sidebar, viewport);
-					if let Some(active) = host.overlay.as_mut() {
-						layers.push(active.layer(viewport));
-						renderer.preview_overlaid(&preview, &layers, viewport.height, "")?;
-					} else {
-						let width_changed = resize.is_some_and(|state| state.width_changed);
-						let alt_enter = if drag_alt || !width_changed { None } else {
-							let staged = terminal.stage_alt_enter(AltScreenUse::Resize);
-							drag_alt = staged.is_some();
-							staged
-						};
-						renderer.preview_overlaid(&preview, &layers, viewport.height, alt_enter.as_deref().unwrap_or(""))?;
-					}
-				} else if host.overlay.is_some() {
-					let rendered = host.chat.render(viewport);
-					let mut layers = rail_layers(&mut host.sidebar, viewport);
-					layers.push(host.overlay.as_mut().expect("overlay present").layer(viewport));
-					renderer.preview_overlaid(rendered.frame, &layers, viewport.height, "")?;
-				} else {
-					let rendered = host.chat.render(viewport);
-					let layers = rail_layers(&mut host.sidebar, viewport);
-					present(renderer, rendered, viewport, &layers)?;
-				}
-				next_frame = chat_deadline(&host.chat);
-			},
-			() = deadline(resize.map(ResizeState::deadline)) => {
-				let now = Instant::now();
-				if !resize.is_some_and(|state| state.settled(now)) { continue; }
-				if host.overlay.is_some() {
-					overlay_stale = true;
-					resize = None;
-					continue;
-				}
-				host.chat.set_right_inset(host.sidebar.reserved(viewport));
-				let rendered = host.chat.render(viewport);
-				let alt_exit = if drag_alt {
-					drag_alt = false;
-					terminal.stage_alt_leave().unwrap_or("")
-				} else { "" };
-				renderer.rebuild(rendered.frame.clone(), viewport.height, rendered.stable_rows, alt_exit)?;
-				let layers = rail_layers(&mut host.sidebar, viewport);
-				if !layers.is_empty() {
-					renderer.present_overlaid(rendered.frame, &[], viewport.height, rendered.stable_rows, &layers)?;
-				}
-				resize = None;
-				next_frame = chat_deadline(&host.chat);
-			},
-		}
 	}
 	Ok(host_outcome(&host, HostExit::Quit))
 }
@@ -898,7 +1027,12 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 		BackendEvent::Sessions(rows) => open_sessions(host, rows, ctx),
 		BackendEvent::LoginProviders(rows) => open_login_providers(host, rows, ctx),
 		BackendEvent::RewindTargets(rows) => open_rewind(host, rows, ctx),
-		BackendEvent::AgentRoster(rows) => host.chat.set_agent_roster(rows),
+		BackendEvent::AgentRoster(rows) => {
+			if let Some(Overlay::AgentHub(hub)) = &mut host.overlay {
+				hub.update_rows(&rows);
+			}
+			host.chat.set_agent_roster(rows);
+		},
 		BackendEvent::SettingsSchema(rows) => open_settings(host, rows, ctx),
 		BackendEvent::OpenAgentTree => open_agents(host, ctx),
 		BackendEvent::Pause => open_pause(host, ctx),
@@ -950,47 +1084,30 @@ fn open_login_providers(host: &mut ChatHost, providers: Vec<SessionRow>, ctx: &U
 }
 
 fn open_settings(host: &mut ChatHost, fields: Vec<crate::SettingRow>, ctx: &UiContext) {
-	let rows: Vec<ListRow> = fields
+	let rows = fields
 		.into_iter()
+		.filter(|field| field.visible)
 		.map(|field| {
+			let value = field.value.as_deref().unwrap_or("unset");
 			let detail = if field.secret {
-				sf!("{} · secret value managed by inference", field.description)
+				sf!("{} · secret value managed by its owner", field.description)
 			} else {
-				sf!("{} · {}", field.kind, field.description)
+				sf!("{} · current: {value} · {}", field.kind, field.description)
 			};
-			ListRow { key: field.path, label: sf!("{} / {}", field.domain, field.label), detail }
+			ListRow {
+				key: field.path,
+				label: sf!("{} / {} / {}", field.panel, field.domain, field.label),
+				detail,
+			}
 		})
-		.collect();
+		.collect::<Vec<_>>();
 	let picker = ListPicker::open("Settings", &rows, 0, ctx);
 	host.overlay =
 		Some(Overlay::List { picker, rows, prefill: Vec::new(), purpose: ListPurpose::Settings });
 }
 
 fn open_agents(host: &mut ChatHost, ctx: &UiContext) {
-	let rows: Vec<ListRow> = host
-		.chat
-		.agent_roster()
-		.iter()
-		.map(|agent| {
-			let indent = "  ".repeat(usize::from(agent.depth));
-			let detail = match (&agent.tool, agent.tokens) {
-				(Some(tool), Some(tokens)) => {
-					Str::new(format!("{} · {tool} · {tokens} tokens", agent.status))
-				},
-				(Some(tool), None) => Str::new(format!("{} · {tool}", agent.status)),
-				(None, Some(tokens)) => Str::new(format!("{} · {tokens} tokens", agent.status)),
-				(None, None) => agent.status.clone(),
-			};
-			ListRow {
-				key: agent.id.clone(),
-				label: Str::new(format!("{indent}{}", agent.name)),
-				detail,
-			}
-		})
-		.collect();
-	let picker = ListPicker::open("Agents · live hierarchy", &rows, 0, ctx);
-	host.overlay =
-		Some(Overlay::List { picker, rows, prefill: Vec::new(), purpose: ListPurpose::Agents });
+	host.overlay = Some(Overlay::AgentHub(AgentHub::open(host.chat.agent_roster(), ctx)));
 }
 
 fn open_pause(host: &mut ChatHost, ctx: &UiContext) {
@@ -1044,6 +1161,32 @@ fn apply_overlay_event(
 		OverlayEvent::PtyInput { id, data } => send(intents, Intent::PtyInput { id, data }),
 		OverlayEvent::PtyKill { id } => send(intents, Intent::PtyKill { id }),
 		OverlayEvent::Close => host.overlay = None,
+		OverlayEvent::OpenAgentPrompt(agent_id) => {
+			host.overlay = Some(Overlay::AgentPrompt {
+				prompt: PromptOverlay::open("Steer selected agent", false, ctx),
+				agent_id,
+				revive: false,
+			});
+		},
+		OverlayEvent::OpenAgentRevivePrompt(agent_id) => {
+			host.overlay = Some(Overlay::AgentPrompt {
+				prompt: PromptOverlay::open("Revive selected agent", false, ctx),
+				agent_id,
+				revive: true,
+			});
+		},
+		OverlayEvent::AgentSteerPrompt { agent_id, prompt } => {
+			send(intents, Intent::AgentSteer { id: agent_id, prompt });
+			host.overlay = None;
+		},
+		OverlayEvent::AgentRevivePrompt { agent_id, prompt } => {
+			send(intents, Intent::AgentRevive { id: agent_id, prompt });
+			host.overlay = None;
+		},
+		OverlayEvent::AgentKill(id) => {
+			send(intents, Intent::AgentKill { id });
+			host.overlay = None;
+		},
 		OverlayEvent::Pick(index) => match host.overlay.as_ref() {
 			Some(Overlay::Models(_)) => {
 				if let Some(model) = host.models.get(index) {

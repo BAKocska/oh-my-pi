@@ -7,6 +7,7 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use omp_core::Str;
 use omp_proto::{document::v1 as proto, prost::Message};
@@ -15,7 +16,7 @@ use url::Url;
 
 use crate::{
 	ByteEdit, ByteRange, DapAction, DapApprovalTier, DapInbound, DapProtocol, DapSession,
-	DapSessionError, DapTransport, DocumentHead, DocumentId, DocumentKind, DocumentLocator,
+	DapSessionError, DapSessionRegistry, DocumentHead, DocumentId, DocumentKind, DocumentLocator,
 	DocumentPresence, DocumentSnapshot, EnvironmentSession, Error, FileKind, FollowSymlinks,
 	LanguageId, LeaseId, LineRange, PathMetadata, PortablePermissions, ReadBody, ReadSelection,
 	Revision, SymlinkTarget, SymlinkTargetForm, SymlinkTargetKind, TransactionId,
@@ -36,6 +37,130 @@ use crate::{
 		TransactionBuildError, TransactionOutcome, TransactionRejectReason,
 	},
 };
+
+#[derive(Clone)]
+struct EnvironmentDapReverseHandler {
+	environment: crate::Environment,
+	workspace:   PathBuf,
+	read:        bool,
+	execute:     bool,
+	event_limit: u32,
+}
+
+#[async_trait]
+impl crate::DapReverseRequestHandler for EnvironmentDapReverseHandler {
+	async fn handle(
+		&self,
+		parent: Arc<DapSession>,
+		command: &str,
+		arguments: serde_json::Value,
+	) -> Result<serde_json::Value, Str> {
+		match command {
+			"runInTerminal" => parent
+				.run_in_terminal(&self.workspace, &arguments)
+				.await
+				.map_err(|_| Str::new_static("runInTerminal was rejected")),
+			"startDebugging" => self.start_child(parent, arguments).await,
+			_ => Err(Str::new_static("unsupported DAP reverse request")),
+		}
+	}
+}
+
+impl EnvironmentDapReverseHandler {
+	async fn start_child(
+		&self,
+		parent: Arc<DapSession>,
+		arguments: serde_json::Value,
+	) -> Result<serde_json::Value, Str> {
+		let configuration = arguments
+			.get("configuration")
+			.and_then(serde_json::Value::as_object)
+			.cloned()
+			.ok_or_else(|| Str::new_static("startDebugging requires configuration"))?;
+		let attach = arguments.get("request").and_then(serde_json::Value::as_str) == Some("attach")
+			|| configuration
+				.get("request")
+				.and_then(serde_json::Value::as_str)
+				== Some("attach");
+		let adapter_name = configuration
+			.get("type")
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or_else(|| parent.adapter());
+		let adapter = self
+			.environment
+			.dap_adapters()
+			.select_attach(Some(adapter_name), None)
+			.or_else(|| {
+				self
+					.environment
+					.dap_adapters()
+					.select_attach(Some(parent.adapter()), None)
+			})
+			.ok_or_else(|| Str::new_static("child DAP adapter was not found"))?;
+		let protocol = if attach {
+			if let Some(port) = configuration
+				.get("port")
+				.and_then(serde_json::Value::as_u64)
+			{
+				let port = u16::try_from(port)
+					.map_err(|_| Str::new_static("child DAP port is out of range"))?;
+				let host = configuration
+					.get("host")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or("127.0.0.1");
+				Some(
+					DapProtocol::connect_tcp_host(host, port)
+						.await
+						.map_err(|_| Str::new_static("child DAP connection failed"))?,
+				)
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+		let child_id: [u8; 16] = rand::random();
+		let child_id = omp_core::hex::encode_n(&child_id);
+		let handler = Arc::new(self.clone());
+		let child = if let Some(protocol) = protocol {
+			DapSession::start(
+				child_id.as_str(),
+				adapter.spec.name.as_str(),
+				protocol,
+				attach,
+				adapter.spec.merged_arguments(attach, &configuration),
+				Some(handler),
+			)
+			.await
+		} else {
+			let spawned = DapProtocol::spawn_adapter(
+				adapter.spec.command.as_str(),
+				&adapter.spec.args,
+				&adapter.spec.transport,
+				&self.workspace,
+			)
+			.await
+			.map_err(|_| Str::new_static("child DAP adapter launch failed"))?;
+			DapSession::start_spawned(
+				child_id.as_str(),
+				adapter.spec.name.as_str(),
+				spawned,
+				attach,
+				adapter.spec.merged_arguments(attach, &configuration),
+				Some(handler),
+			)
+			.await
+		}
+		.map_err(|_| Str::new_static("child DAP session failed"))?;
+		child.set_wire_grants(self.read, self.execute, self.event_limit);
+		parent
+			.add_child(&child)
+			.await
+			.map_err(|_| Str::new_static("child DAP linkage failed"))?;
+		self.environment.dap_sessions().insert(child);
+		Ok(serde_json::json!({}))
+	}
+}
 
 /// Dispatches one post-handshake request body. Framing, hello, and cancellation
 /// routing remain connection-owned.
@@ -466,11 +591,6 @@ async fn dap_start(
 		.dap_adapters()
 		.select_attach(Some(&adapter_name), None)
 		.ok_or_else(|| Failure::not_found("configured DAP adapter was not found"))?;
-	if !matches!(adapter.spec.transport, DapTransport::Stdio) {
-		return Err(Failure::precondition(
-			"the selected DAP adapter does not use the available stdio transport",
-		));
-	}
 	let supplied: serde_json::Value = serde_json::from_slice(&configuration_json)
 		.map_err(|_| Failure::invalid("DAP configuration must be valid JSON"))?;
 	let supplied = supplied
@@ -480,21 +600,62 @@ async fn dap_start(
 	let root = workspace
 		.to_file_path()
 		.map_err(|()| Failure::invalid("DAP workspace is not a local file URI"))?;
-	let spawned = DapProtocol::spawn_stdio(adapter.spec.command.as_str(), &adapter.spec.args, &root)
-		.map_err(|error| Failure::internal(error.to_string()))?;
+	let reverse_handler: Arc<dyn crate::DapReverseRequestHandler> =
+		Arc::new(EnvironmentDapReverseHandler {
+			environment: connection.environment().clone(),
+			workspace: root.clone(),
+			read,
+			execute,
+			event_limit: max_event_bytes,
+		});
 	let session_id: [u8; 16] = rand::random();
 	let registry_id = omp_core::hex::encode_n(&session_id);
 	let debug_session = tokio::select! {
 		biased;
 		() = cancellation.cancelled() => return Err(Failure::cancelled("DAP launch cancelled")),
-		result = DapSession::start_spawned(
-			registry_id.as_str(),
-			adapter.spec.name.as_str(),
-			spawned,
-			attach,
-			arguments,
-			None,
-		) => result.map_err(Failure::from_dap)?,
+		result = async {
+			if attach {
+				if let Some(port) = supplied.get("port").and_then(serde_json::Value::as_u64) {
+					let port = u16::try_from(port)
+						.map_err(|_| Failure::invalid("DAP attach port is out of range"))?;
+					let host = supplied
+						.get("host")
+						.and_then(serde_json::Value::as_str)
+						.unwrap_or("127.0.0.1");
+					let protocol = DapProtocol::connect_tcp_host(host, port)
+						.await
+						.map_err(|_| Failure::internal("DAP remote adapter connection failed"))?;
+					return DapSession::start(
+						registry_id.as_str(),
+						adapter.spec.name.as_str(),
+						protocol,
+						true,
+						arguments,
+						Some(Arc::clone(&reverse_handler)),
+					)
+					.await
+					.map_err(Failure::from_dap);
+				}
+			}
+			let spawned = DapProtocol::spawn_adapter(
+				adapter.spec.command.as_str(),
+				&adapter.spec.args,
+				&adapter.spec.transport,
+				&root,
+			)
+			.await
+			.map_err(|_| Failure::internal("DAP adapter launch failed"))?;
+			DapSession::start_spawned(
+				registry_id.as_str(),
+				adapter.spec.name.as_str(),
+				spawned,
+				attach,
+				arguments,
+				Some(reverse_handler),
+			)
+			.await
+			.map_err(Failure::from_dap)
+		} => result?,
 	};
 	debug_session.set_wire_grants(read, execute, max_event_bytes);
 	let adapter_capabilities_json = serde_json::to_vec(&debug_session.capabilities())
@@ -604,7 +765,7 @@ async fn dap_action(
 	let result = tokio::select! {
 		biased;
 		() = cancellation.cancelled() => return Err(Failure::cancelled("DAP action cancelled")),
-		result = execute_dap_action(&debug_session, action, arguments) => result?,
+		result = execute_dap_action(connection.environment().dap_sessions(), &debug_session, action, arguments) => result?,
 	};
 	let revision = debug_session.advance_revision();
 	let response_ref = proto::DapSessionRef {
@@ -641,22 +802,108 @@ async fn dap_action(
 }
 
 async fn execute_dap_action(
+	registry: &DapSessionRegistry,
 	session: &Arc<DapSession>,
 	action: DapAction,
 	arguments: serde_json::Value,
 ) -> DispatchResult<serde_json::Value> {
 	match action {
 		DapAction::Output => Ok(serde_json::json!({})),
+		DapAction::SetBreakpoint | DapAction::RemoveBreakpoint => {
+			let source = arguments
+				.get("source")
+				.and_then(|source| source.get("path"))
+				.and_then(serde_json::Value::as_str)
+				.ok_or_else(|| Failure::invalid("source breakpoint requires source.path"))?;
+			let breakpoint = arguments
+				.get("breakpoint")
+				.cloned()
+				.ok_or_else(|| Failure::invalid("source breakpoint requires breakpoint"))?;
+			session
+				.mutate_source_breakpoint(source, breakpoint, action == DapAction::RemoveBreakpoint)
+				.await
+				.map_err(Failure::from_dap)
+		},
+		DapAction::SetFunctionBreakpoint | DapAction::RemoveFunctionBreakpoint => {
+			let breakpoint = arguments
+				.get("breakpoint")
+				.cloned()
+				.ok_or_else(|| Failure::invalid("function breakpoint requires breakpoint"))?;
+			session
+				.mutate_function_breakpoint(breakpoint, action == DapAction::RemoveFunctionBreakpoint)
+				.await
+				.map_err(Failure::from_dap)
+		},
+		DapAction::SetInstructionBreakpoint | DapAction::RemoveInstructionBreakpoint => {
+			let breakpoint = arguments
+				.get("breakpoint")
+				.cloned()
+				.ok_or_else(|| Failure::invalid("instruction breakpoint requires breakpoint"))?;
+			session
+				.mutate_instruction_breakpoint(
+					breakpoint,
+					action == DapAction::RemoveInstructionBreakpoint,
+				)
+				.await
+				.map_err(Failure::from_dap)
+		},
+		DapAction::SetDataBreakpoint | DapAction::RemoveDataBreakpoint => {
+			let breakpoint = arguments
+				.get("breakpoint")
+				.cloned()
+				.ok_or_else(|| Failure::invalid("data breakpoint requires breakpoint"))?;
+			session
+				.mutate_data_breakpoint(breakpoint, action == DapAction::RemoveDataBreakpoint)
+				.await
+				.map_err(Failure::from_dap)
+		},
+		DapAction::Continue
+		| DapAction::Pause
+		| DapAction::StepOver
+		| DapAction::StepIn
+		| DapAction::StepOut => session
+			.control(action, arguments)
+			.await
+			.map_err(Failure::from_dap)
+			.and_then(|snapshot| {
+				serde_json::to_value(snapshot)
+					.map_err(|_| Failure::internal("DAP stop snapshot could not be encoded"))
+			}),
+		DapAction::CustomRequest => {
+			let command = arguments
+				.get("command")
+				.and_then(serde_json::Value::as_str)
+				.ok_or_else(|| Failure::invalid("custom request requires command"))?;
+			let body = arguments
+				.get("arguments")
+				.cloned()
+				.unwrap_or_else(|| serde_json::json!({}));
+			session
+				.custom_request(command, body)
+				.await
+				.map_err(Failure::from_dap)
+		},
 		DapAction::Terminate => {
 			session.terminate().await.map_err(Failure::from_dap)?;
 			Ok(serde_json::json!({}))
 		},
-		DapAction::Sessions => Ok(serde_json::json!([{
-			"id": session.id(),
-			"adapter": session.adapter(),
-			"state": Into::<&'static str>::into(session.state()),
-			"revision": session.revision(),
-		}])),
+		DapAction::Sessions => {
+			registry.cleanup();
+			Ok(serde_json::Value::Array(
+				registry
+					.list()
+					.into_iter()
+					.map(|session| {
+						serde_json::json!({
+							"id": session.id(),
+							"adapter": session.adapter(),
+							"state": Into::<&'static str>::into(session.state()),
+							"revision": session.revision(),
+						})
+					})
+					.collect(),
+			))
+		},
 		_ => session
 			.execute(action, arguments)
 			.await
@@ -2598,7 +2845,9 @@ impl Failure {
 	fn from_dap(error: DapSessionError) -> Self {
 		match error {
 			DapSessionError::NotFound(_) => Self::not_found(error.to_string()),
-			DapSessionError::UnsupportedAction(_) => Self::invalid(error.to_string()),
+			DapSessionError::UnsupportedAction(_) | DapSessionError::InvalidReverseRequest => {
+				Self::invalid(error.to_string())
+			},
 			DapSessionError::InvalidTransition { .. } | DapSessionError::SessionTreeCycle => {
 				Self::precondition(error.to_string())
 			},

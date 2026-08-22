@@ -1,0 +1,48 @@
+[package]
+name = "omp-desktop"
+version.workspace = true
+edition.workspace = true
+description = "Native actor-owned desktop capture, input, and accessibility automation"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+wayland-pipewire = ["dep:pipewire"]
+
+[dependencies]
+bytes.workspace = true
+flume.workspace = true
+image.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+atspi.workspace = true
+futures.workspace = true
+pipewire = { workspace = true, optional = true }
+reis.workspace = true
+x11rb.workspace = true
+xkeysym.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics.workspace = true
+foreign-types.workspace = true
+libc.workspace = true
+objc2-app-kit.workspace = true
+objc2-application-services.workspace = true
+objc2-core-foundation.workspace = true
+tempfile.workspace = true
+xcap.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+enigo.workspace = true
+uiautomation.workspace = true
+windows-sys.workspace = true
+xcap.workspace = true
+
+[lints]
+workspace = true

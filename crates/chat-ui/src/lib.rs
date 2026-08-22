@@ -6,18 +6,24 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
-pub mod approval;
+pub mod agent_hub;
+mod approval;
 pub mod ask;
+pub mod autoqa;
 pub mod completion;
+pub mod debug_selector;
 pub mod frame;
 pub mod gradient;
 pub mod host;
+pub mod log_viewer;
 mod overlays;
 pub mod palette;
 pub mod picker;
+pub mod protocol_probe;
 pub mod provider_picker;
 pub mod pty;
 pub mod queue;
+pub mod raw_stream;
 pub mod scene;
 pub mod sidebar;
 pub mod welcome;
@@ -25,7 +31,10 @@ pub mod welcome;
 pub mod slots;
 use std::time::Instant;
 
+pub use agent_hub::{AgentHub, AgentHubEvent};
+pub mod image_overlay;
 pub use gradient::{EditorGradient, EditorHighlight, GradientStop};
+pub use image_overlay::{ImageOverlay, ImageOverlayEvent};
 use omp_core::Str;
 pub use omp_tui::components::Attachment;
 pub use overlays::{ListPicker, ListRow, OverlayPanel, PromptEvent, PromptOverlay, panel_divider};
@@ -69,8 +78,16 @@ pub struct SettingRow {
 	pub description: Str,
 	/// Reflected widget kind.
 	pub kind:        Str,
+	/// Stable settings panel identifier.
+	pub panel:       Str,
 	/// Whether the value must never be projected into the UI.
 	pub secret:      bool,
+	/// Current merged value, masked by the settings authority when secret.
+	pub value:       Option<Str>,
+	/// Current dynamic or static option labels.
+	pub options:     Vec<Str>,
+	/// Whether descriptor conditions currently expose this field.
+	pub visible:     bool,
 }
 
 /// One resumable session shown by a list picker.
@@ -87,19 +104,33 @@ pub struct SessionRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentRow {
 	/// Stable agent identity.
-	pub id:     Str,
+	pub id:            Str,
 	/// User-facing agent name.
-	pub name:   Str,
+	pub name:          Str,
 	/// Parent identity, absent for a root.
-	pub parent: Option<Str>,
+	pub parent:        Option<Str>,
 	/// Hierarchy depth.
-	pub depth:  u16,
+	pub depth:         u16,
 	/// Allocation-free lifecycle status snapshot.
-	pub status: Str,
+	pub status:        Str,
 	/// Currently executing tool, when known.
-	pub tool:   Option<Str>,
+	pub tool:          Option<Str>,
 	/// Token consumption, when known.
-	pub tokens: Option<u64>,
+	pub tokens:        Option<u64>,
+	/// Resolved delegated-agent definition badge.
+	pub definition:    Option<Str>,
+	/// Requested model selector badge.
+	pub model:         Option<Str>,
+	/// Model that served the latest request.
+	pub serving_model: Option<Str>,
+	/// Bounded transcript/activity preview supplied by the tree owner.
+	pub transcript:    Str,
+	/// Whether the backend currently accepts steering for this node.
+	pub can_steer:     bool,
+	/// Whether the backend currently accepts cold revival for this node.
+	pub can_revive:    bool,
+	/// Whether the backend currently accepts cancellation for this node.
+	pub can_kill:      bool,
 }
 
 /// Core-owned transcript frame category.
@@ -233,6 +264,55 @@ pub struct StatusFacts {
 	pub git:                    Option<GitFacts>,
 	/// `/live` firehose activity history, absent when live display is disabled.
 	pub live_activity:          Option<ActivityWaveform>,
+	/// Smoothed provider output velocity, in tokens per second.
+	pub tokens_per_second:      Option<u64>,
+	/// Current Environment working directory.
+	pub cwd:                    Option<Str>,
+	/// Active worktree label when distinct from `cwd`.
+	pub worktree:               Option<Str>,
+	/// Effective thinking level or ceiling.
+	pub thinking:               Option<Str>,
+	/// Number of active hook facts.
+	pub hooks:                  usize,
+	/// Number of active durable tasks.
+	pub tasks:                  usize,
+	/// Number of connected collaboration peers.
+	pub collab_peers:           usize,
+	/// Opaque account-override display label; never a credential.
+	pub account_override:       Option<Str>,
+	/// Stable session accent seed.
+	pub session_accent:         Option<Str>,
+	/// One-shot quota-reset edge emitted by the provider usage authority.
+	pub quota_reset:            bool,
+	/// Disable non-essential retained animation.
+	pub reduced_motion:         bool,
+	/// Responsive status shedding policy.
+	pub layout:                 StatusLayout,
+	/// Separator used between visible status segments.
+	pub separator:              StatusSeparator,
+}
+/// Responsive status-segment shedding policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StatusLayout {
+	/// Balanced defaults with secondary facts shed first.
+	#[default]
+	Compact,
+	/// Show every available owner-facing fact.
+	Full,
+	/// Prefer diagnostics, timing, and throughput.
+	Developer,
+	/// Keep only model, working state, and context.
+	Minimal,
+}
+
+/// Visual separator between status segments.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StatusSeparator {
+	/// Centered dot on Unicode terminals, a period in ASCII.
+	#[default]
+	Dot,
+	/// Put each segment in square brackets.
+	Bracket,
 }
 
 /// How a composer submission interacts with an active turn.
@@ -292,6 +372,25 @@ pub enum Intent {
 	},
 	/// Abort the active turn.
 	Abort,
+	/// Steer one selected child through the core-owned agent authority.
+	AgentSteer {
+		/// Stable agent identity.
+		id:     Str,
+		/// User-authored steering prompt.
+		prompt: Str,
+	},
+	/// Revive one selected cold child through the core-owned agent authority.
+	AgentRevive {
+		/// Stable agent identity.
+		id:     Str,
+		/// User-authored follow-up prompt.
+		prompt: Str,
+	},
+	/// Cancel one selected live child through the core-owned agent authority.
+	AgentKill {
+		/// Stable agent identity.
+		id: Str,
+	},
 	/// Write exact bytes to an interactive PTY execution.
 	PtyInput {
 		/// Stable tool-call identity.
@@ -486,8 +585,12 @@ pub enum BackendEvent {
 	AgentRoster(Vec<AgentRow>),
 	/// Replace the reflected settings schema and open its TUI surface.
 	SettingsSchema(Vec<SettingRow>),
+	/// Replace role-filtered slash-command completion data.
+	SlashCommands(Vec<omp_tui::Command>),
 	/// Request the live agent hierarchy overlay.
 	OpenAgentTree,
+	/// Copy backend-produced text through the terminal host clipboard authority.
+	CopyToClipboard(Str),
 	/// Request the pause overlay.
 	Pause,
 	/// Request a host-level fresh session transition.
@@ -496,8 +599,14 @@ pub enum BackendEvent {
 	Notice(Str),
 	/// Append an error notice.
 	Error(Str),
+	/// Apply one bounded exact-key retained transcript frame.
+	RetainedFrame(omp_proto::omp::ui::v1::RetainedFrameEnvelope),
 	/// Replace status facts.
 	Status(StatusFacts),
+	/// Preview a parsed theme without committing settings.
+	ThemePreview(omp_tui::Theme),
+	/// Update tiny-title model download activity.
+	ModelDownloadProgress(ModelDownloadProgress),
 	/// Replace the session title.
 	SessionTitle(Str),
 	/// Open the model picker with these rows and current selection.
@@ -536,4 +645,16 @@ pub enum BackendEvent {
 		/// Whether the submission ended by interruption.
 		interrupted: bool,
 	},
+}
+/// Retained tiny-title model download activity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelDownloadProgress {
+	/// Stable model or artifact label.
+	pub label:      Str,
+	/// Downloaded bytes.
+	pub downloaded: u64,
+	/// Total expected bytes when known.
+	pub total:      Option<u64>,
+	/// Whether the download has reached a terminal success state.
+	pub complete:   bool,
 }
