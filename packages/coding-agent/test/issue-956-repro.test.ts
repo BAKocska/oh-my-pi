@@ -58,7 +58,7 @@ describe("interactive /mcp test", () => {
 		await removeWithRetries(agentDir);
 	});
 
-	it("tests a discovered server and keeps its advertised Esc cancellation grace", async () => {
+	it("tests a discovered server and reports a settled Esc during the cancellation grace", async () => {
 		vi.useFakeTimers();
 		const transport = {
 			connected: true,
@@ -109,7 +109,8 @@ describe("interactive /mcp test", () => {
 		expect(signal?.aborted).toBe(false);
 		expect(mcpTestEscapeHandlers).toHaveLength(1);
 		for (const handler of mcpTestEscapeHandlers) handler();
-		expect(signal?.aborted).toBe(true);
+		expect(signal?.aborted).toBe(false);
+		expect(showStatus).toHaveBeenCalledWith('MCP test for "github" already finished');
 		vi.advanceTimersByTime(4_999);
 		expect(mcpTestEscapeHandlers).toHaveLength(1);
 		vi.advanceTimersByTime(1);
