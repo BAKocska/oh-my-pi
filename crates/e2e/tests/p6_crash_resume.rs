@@ -1091,7 +1091,7 @@ fn receipt_child(root: &Path, crash: bool) {
 			accepted: vec![false],
 		});
 		journal
-			.append_gateway_outcome(4, RECEIPT_TURN, outcome)
+			.append_arbiter_outcome(4, RECEIPT_TURN, outcome)
 			.expect("durable terminal receipt");
 		write_marker(&root.join("receipt"));
 		loop {

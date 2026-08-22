@@ -416,9 +416,10 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 			tools: vec![tool_def(1)],
 			..Default::default()
 		},
-		executor:       None,
-		props:          None,
-		provider_reset: false,
+		executor:        None,
+		props:           None,
+		provider_reset:  false,
+		stream_watchdog: omp_agent::StreamWatchdog::default(),
 	};
 	let workspace = WorkspaceInput::new(
 		scratch.project(),
