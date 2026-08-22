@@ -513,7 +513,7 @@ fn parse_proc_match_args(
 								.map_err(|_| (2, "invalid queue value".to_string()))?,
 						);
 					},
-					'q' if mode == ProcMatchMode::Grep && cfg!(target_os = "macos") => {
+					'q' if mode == ProcMatchMode::Grep => {
 						options.quiet = true;
 					},
 					'q' => return Err((2, "unrecognized option '-q'".to_string())),
@@ -950,17 +950,42 @@ fn write_proc_match_help(
 	if mode == ProcMatchMode::Kill {
 		writeln!(output, "  -q value, --queue value  send an integer with sigqueue")?;
 	}
-	#[cfg(target_os = "macos")]
 	if mode == ProcMatchMode::Grep {
-		writeln!(output, "  -q  suppress output")?;
+		writeln!(output, "  -q, --quiet  suppress output")?;
 	}
 	Ok(())
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
 	use super::*;
 
+	#[test]
+	fn pgrep_quiet_short_and_long_options_parse() {
+		for quiet in ["-q", "--quiet"] {
+			let parsed = parse_proc_match_args(
+				ProcMatchMode::Grep,
+				&[quiet.to_string(), "needle".to_string()],
+				Path::new("/"),
+				&mut io::empty(),
+			)
+			.expect("pgrep quiet option must parse on every platform");
+			let ParseProcResult::Options(options) = parsed else {
+				panic!("quiet invocation must produce process-match options");
+			};
+			assert!(options.quiet);
+		}
+	}
+
+	#[test]
+	fn pgrep_help_advertises_quiet_short_and_long_options() {
+		let mut help = Vec::new();
+		write_proc_match_help(&mut help, "pgrep", ProcMatchMode::Grep).unwrap();
+		let help = String::from_utf8(help).unwrap();
+		assert!(help.contains("-q, --quiet  suppress output"));
+	}
+
+	#[cfg(windows)]
 	#[test]
 	fn resolves_msys_drive_alias_pidfiles() {
 		assert_eq!(

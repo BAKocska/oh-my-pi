@@ -1000,6 +1000,9 @@ fn display_path_for_operand(operand: &OsStr, resolved: &Path, path: &Path) -> Pa
 	}
 }
 
+/// Exit status for a process terminated by `SIGPIPE` (`128 + 13`).
+const SIGPIPE_EXIT_CODE: i32 = 141;
+
 #[allow(clippy::too_many_arguments, reason = "search state is shared across output modes")]
 fn search_file_path<M: Matcher, W: Write>(
 	host: &mut Host,
@@ -1011,20 +1014,21 @@ fn search_file_path<M: Matcher, W: Write>(
 	opts: &Options,
 	out: &mut W,
 	had_error: &mut bool,
-) -> bool {
+) -> io::Result<bool> {
 	let display_path = display_path_for_operand(operand, resolved, path);
 	match File::open(path) {
 		Ok(file) => {
 			let display = display_path.as_os_str().as_encoded_bytes();
 			match process_reader(matcher, searcher, file, display, opts, out) {
-				Ok(matched) => matched,
+				Ok(matched) => Ok(matched),
+				Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Err(error),
 				Err(error) => {
 					*had_error = true;
 					if !opts.no_messages {
 						let _ =
 							writeln!(host.stderr, "grep: {}: {error}", display_path.to_string_lossy());
 					}
-					false
+					Ok(false)
 				},
 			}
 		},
@@ -1033,7 +1037,7 @@ fn search_file_path<M: Matcher, W: Write>(
 			if !opts.no_messages {
 				let _ = writeln!(host.stderr, "grep: {}: {error}", display_path.to_string_lossy());
 			}
-			false
+			Ok(false)
 		},
 	}
 }
@@ -1072,7 +1076,7 @@ fn search_dir<M: Matcher, W: Write>(
 	follow_links: omp_walker::FollowLinks,
 	out: &mut W,
 	had_error: &mut bool,
-) -> bool {
+) -> io::Result<bool> {
 	let request = grep_walk_request(resolved, follow_links);
 	let mut any = false;
 	let had_error_state = std::cell::Cell::new(*had_error);
@@ -1112,7 +1116,7 @@ fn search_dir<M: Matcher, W: Write>(
 				opts,
 				out,
 				&mut entry_had_error,
-			);
+			)?;
 			had_error_state.set(entry_had_error);
 			any |= matched;
 			if opts.quiet && any {
@@ -1132,18 +1136,23 @@ fn search_dir<M: Matcher, W: Write>(
 	);
 	*had_error |= had_error_state.get();
 	match walk {
-		Ok(omp_walker::WalkStatus::Complete | omp_walker::WalkStatus::Stopped) => any,
+		Ok(omp_walker::WalkStatus::Complete | omp_walker::WalkStatus::Stopped) => Ok(any),
+		Err(omp_walker::WalkError::Interrupted(error))
+			if error.kind() == io::ErrorKind::BrokenPipe =>
+		{
+			Err(error)
+		},
 		Err(omp_walker::WalkError::Interrupted(_)) if host.is_cancelled() => {
 			// The shell wrapper owns the user-visible cancellation status.
 			*had_error = true;
-			any
+			Ok(any)
 		},
 		Err(omp_walker::WalkError::Interrupted(error)) => {
 			*had_error = true;
 			if !opts.no_messages {
 				let _ = writeln!(host.stderr, "grep: {error}");
 			}
-			any
+			Ok(any)
 		},
 		Err(omp_walker::WalkError::InvalidData { path, message }) => {
 			*had_error = true;
@@ -1151,7 +1160,7 @@ fn search_dir<M: Matcher, W: Write>(
 				let display_path = display_path_for_operand(operand, resolved, &path);
 				let _ = writeln!(host.stderr, "grep: {}: {message}", display_path.to_string_lossy());
 			}
-			any
+			Ok(any)
 		},
 	}
 }
@@ -1325,6 +1334,9 @@ fn execute_search<M: Matcher>(
 				.as_encoded_bytes();
 			match process_reader(matcher, &mut searcher, &mut host.stdin, display, opts, &mut out) {
 				Ok(matched) => any_match |= matched,
+				Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+					return SIGPIPE_EXIT_CODE;
+				},
 				Err(error) => {
 					had_error = true;
 					if !opts.no_messages {
@@ -1343,8 +1355,8 @@ fn execute_search<M: Matcher>(
 		match std::fs::metadata(&resolved) {
 			Ok(metadata) if metadata.is_dir() => match directory_action {
 				DirectoryAction::Recurse => {
-					if rules.allows_dir(Path::new(operand))
-						&& search_dir(
+					if rules.allows_dir(Path::new(operand)) {
+						match search_dir(
 							host,
 							operand.as_os_str(),
 							&resolved,
@@ -1356,7 +1368,12 @@ fn execute_search<M: Matcher>(
 							&mut out,
 							&mut had_error,
 						) {
-						any_match = true;
+							Ok(matched) => any_match |= matched,
+							Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+								return SIGPIPE_EXIT_CODE;
+							},
+							Err(_) => unreachable!("directory search only propagates broken pipes"),
+						}
 					}
 				},
 				DirectoryAction::Skip => {},
@@ -1372,7 +1389,7 @@ fn execute_search<M: Matcher>(
 				if !rules.allows_file(Path::new(operand)) {
 					continue;
 				}
-				if search_file_path(
+				match search_file_path(
 					host,
 					operand.as_os_str(),
 					&resolved,
@@ -1383,7 +1400,11 @@ fn execute_search<M: Matcher>(
 					&mut out,
 					&mut had_error,
 				) {
-					any_match = true;
+					Ok(matched) => any_match |= matched,
+					Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+						return SIGPIPE_EXIT_CODE;
+					},
+					Err(_) => unreachable!("file search only propagates broken pipes"),
 				}
 			},
 			Err(error) => {
@@ -1399,7 +1420,9 @@ fn execute_search<M: Matcher>(
 		}
 	}
 
-	let _ = out.flush();
+	if out.flush().is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe) {
+		return SIGPIPE_EXIT_CODE;
+	}
 	if opts.quiet {
 		if any_match {
 			0
@@ -1631,6 +1654,20 @@ mod tests {
 		let parsed = Grep::try_parse_from(["grep", "hit", "-"]).unwrap();
 		assert_eq!(run_caught(parsed, &mut host), 0, "{}", capture.err());
 		assert_eq!(snapshot.lock().as_slice(), b"hit\n");
+	}
+
+	#[test]
+	fn broken_pipe_on_stdout_is_silent_and_exits_141() {
+		let parsed = Grep::try_parse_from(["grep", "hit"]).unwrap();
+		let (mut host, capture) = Host::for_test("grep", "hit\nmiss\nhit\n", "/");
+		let (reader, writer) = std::io::pipe().unwrap();
+		drop(reader);
+		host.stdout = openfiles::OpenFile::from(writer);
+
+		let code = parsed.run(&mut host);
+
+		assert_eq!(code, SIGPIPE_EXIT_CODE);
+		assert!(capture.err().is_empty(), "stderr must stay clean: {:?}", capture.err());
 	}
 
 	#[test]

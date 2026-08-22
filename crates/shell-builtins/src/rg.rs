@@ -34,6 +34,9 @@ use ignore::{
 
 use crate::host::{Host, StreamWriter, Utility};
 
+/// Exit status for a process terminated by `SIGPIPE` (`128 + 13`).
+const SIGPIPE_EXIT_CODE: i32 = 141;
+
 #[derive(Parser, Debug)]
 #[command(
 	name = "rg",
@@ -1339,7 +1342,7 @@ fn process_file<M: Matcher, W: Write>(
 	opts: &SearchOptions,
 	stats: &mut Stats,
 	out: &mut W,
-) -> SearchOutcome {
+) -> io::Result<SearchOutcome> {
 	let result = if cli.search_zip && !cli.no_search_zip {
 		let builder = DecompressionReaderBuilder::new();
 		if builder.get_matcher().has_command(path) {
@@ -1356,11 +1359,12 @@ fn process_file<M: Matcher, W: Write>(
 			.and_then(|file| process_reader(matcher, searcher, file, display, opts, stats, out))
 	};
 	match result {
-		Ok(any_match) => SearchOutcome { any_match, had_error: false },
-		Err(error) => SearchOutcome {
+		Ok(any_match) => Ok(SearchOutcome { any_match, had_error: false }),
+		Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Err(error),
+		Err(error) => Ok(SearchOutcome {
 			any_match: false,
 			had_error: report_path_error(host, display, path, error, opts),
-		},
+		}),
 	}
 }
 
@@ -1395,17 +1399,17 @@ fn search_collected_files<M: Matcher, W: Write>(
 	opts: &SearchOptions,
 	stats: &mut Stats,
 	out: &mut W,
-) -> SearchOutcome {
+) -> io::Result<SearchOutcome> {
 	let mut files = match collect_filtered_files(host, cli, root) {
 		Ok(files) => files,
 		Err(_) if host.is_cancelled() => {
-			return SearchOutcome { any_match: false, had_error: true };
+			return Ok(SearchOutcome { any_match: false, had_error: true });
 		},
 		Err(err) => {
 			if !opts.no_messages {
 				let _ = writeln!(host.stderr, "{err}");
 			}
-			return SearchOutcome { any_match: false, had_error: true };
+			return Ok(SearchOutcome { any_match: false, had_error: true });
 		},
 	};
 	files.sort_unstable_by(|a, b| b.cmp(a));
@@ -1424,7 +1428,7 @@ fn search_collected_files<M: Matcher, W: Write>(
 		let display_path = display_path(operand, root, &path);
 		let display_bytes = display_path.as_os_str().as_encoded_bytes().to_vec();
 		let display = (show_names || opts.json).then_some(display_bytes.as_slice());
-		let outcome = process_file(host, cli, matcher, searcher, &path, display, opts, stats, out);
+		let outcome = process_file(host, cli, matcher, searcher, &path, display, opts, stats, out)?;
 		any_match |= outcome.any_match;
 		had_error |= outcome.had_error;
 		if host.is_cancelled() {
@@ -1432,7 +1436,7 @@ fn search_collected_files<M: Matcher, W: Write>(
 			break;
 		}
 	}
-	SearchOutcome { any_match, had_error }
+	Ok(SearchOutcome { any_match, had_error })
 }
 
 #[allow(
@@ -1450,7 +1454,7 @@ fn search_dir<M: Matcher, W: Write>(
 	opts: &SearchOptions,
 	stats: &mut Stats,
 	out: &mut W,
-) -> SearchOutcome {
+) -> io::Result<SearchOutcome> {
 	if cli.sortr.as_deref() == Some("path") {
 		return search_collected_files(
 			host, cli, matcher, searcher, operand, root, show_names, opts, stats, out,
@@ -1462,7 +1466,7 @@ fn search_dir<M: Matcher, W: Write>(
 			if !opts.no_messages {
 				let _ = writeln!(host.stderr, "{err}");
 			}
-			return SearchOutcome { any_match: false, had_error: true };
+			return Ok(SearchOutcome { any_match: false, had_error: true });
 		},
 	};
 	let any_match = std::cell::Cell::new(false);
@@ -1495,7 +1499,7 @@ fn search_dir<M: Matcher, W: Write>(
 			let display_path = display_path(operand, root, path);
 			let display_bytes = display_path.as_os_str().as_encoded_bytes().to_vec();
 			let display = (show_names || opts.json).then_some(display_bytes.as_slice());
-			let outcome = process_file(host, cli, matcher, searcher, path, display, opts, stats, out);
+			let outcome = process_file(host, cli, matcher, searcher, path, display, opts, stats, out)?;
 			any_match.set(any_match.get() || outcome.any_match);
 			had_error.set(had_error.get() || outcome.had_error);
 			Ok(if opts.quiet && any_match.get() {
@@ -1513,20 +1517,25 @@ fn search_dir<M: Matcher, W: Write>(
 		},
 	) {
 		Ok(omp_walker::WalkStatus::Complete | omp_walker::WalkStatus::Stopped) => {
-			Some(SearchOutcome { any_match: any_match.get(), had_error: had_error.get() })
+			Some(Ok(SearchOutcome { any_match: any_match.get(), had_error: had_error.get() }))
 		},
 		Err(omp_walker::WalkError::Interrupted(_)) if host.is_cancelled() => {
 			// Harness cancellation; the shell wrapper overrides the exit code
 			// and stay-silent on stderr — no spurious "interrupted" diagnostic.
 			had_error.set(true);
-			Some(SearchOutcome { any_match: any_match.get(), had_error: true })
+			Some(Ok(SearchOutcome { any_match: any_match.get(), had_error: true }))
+		},
+		Err(omp_walker::WalkError::Interrupted(error))
+			if error.kind() == io::ErrorKind::BrokenPipe =>
+		{
+			Some(Err(error))
 		},
 		Err(err) => {
 			had_error.set(true);
 			if !opts.no_messages {
 				let _ = writeln!(host.stderr, "rg: {err}");
 			}
-			Some(SearchOutcome { any_match: any_match.get(), had_error: had_error.get() })
+			Some(Ok(SearchOutcome { any_match: any_match.get(), had_error: had_error.get() }))
 		},
 	};
 	streamed.unwrap_or_else(|| {
@@ -1571,7 +1580,7 @@ fn list_files<W: Write>(
 	paths: &[OsString],
 	path_separator: Option<u8>,
 	out: &mut W,
-) -> SearchOutcome {
+) -> io::Result<SearchOutcome> {
 	let mut any = false;
 	let mut had_error = false;
 	let mut processed_operand = false;
@@ -1601,15 +1610,14 @@ fn list_files<W: Write>(
 				}
 				for path in files {
 					let display = display_path(operand.as_os_str(), &resolved, &path);
-					let _ =
-						write_display_bytes(out, display.as_os_str().as_encoded_bytes(), path_separator);
-					let _ = out.write_all(if cli.null { b"\0" } else { b"\n" });
+					write_display_bytes(out, display.as_os_str().as_encoded_bytes(), path_separator)?;
+					out.write_all(if cli.null { b"\0" } else { b"\n" })?;
 					any = true;
 				}
 			},
 			Ok(meta) if meta.is_file() => {
-				let _ = write_display_bytes(out, operand.as_encoded_bytes(), path_separator);
-				let _ = out.write_all(if cli.null { b"\0" } else { b"\n" });
+				write_display_bytes(out, operand.as_encoded_bytes(), path_separator)?;
+				out.write_all(if cli.null { b"\0" } else { b"\n" })?;
 				any = true;
 			},
 			Ok(_) => {},
@@ -1623,7 +1631,7 @@ fn list_files<W: Write>(
 			break;
 		}
 	}
-	SearchOutcome { any_match: any, had_error }
+	Ok(SearchOutcome { any_match: any, had_error })
 }
 
 fn default_paths(paths: &mut Vec<OsString>, use_implicit_stdin: bool) {
@@ -1668,7 +1676,9 @@ fn write_json_summary<W: Write>(out: &mut W, stats: &Stats) -> io::Result<()> {
 			}
 		}
 	});
-	serde_json::to_writer(&mut *out, &summary).map_err(io::Error::other)?;
+	serde_json::to_writer(&mut *out, &summary).map_err(|error| {
+		io::Error::new(error.io_error_kind().unwrap_or(io::ErrorKind::Other), error)
+	})?;
 	out.write_all(b"\n")
 }
 
@@ -1724,6 +1734,9 @@ fn execute_search<M: Matcher, W: Write>(
 				out,
 			) {
 				Ok(matched) => any_match |= matched,
+				Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+					return SIGPIPE_EXIT_CODE;
+				},
 				Err(error) => {
 					had_error = true;
 					if !opts.no_messages {
@@ -1740,7 +1753,7 @@ fn execute_search<M: Matcher, W: Write>(
 		let resolved = host.resolve(operand);
 		match std::fs::metadata(&resolved) {
 			Ok(meta) if meta.is_dir() => {
-				let outcome = search_dir(
+				match search_dir(
 					host,
 					cli,
 					matcher,
@@ -1751,14 +1764,26 @@ fn execute_search<M: Matcher, W: Write>(
 					opts,
 					&mut stats,
 					out,
-				);
-				any_match |= outcome.any_match;
-				had_error |= outcome.had_error;
+				) {
+					Ok(outcome) => {
+						any_match |= outcome.any_match;
+						had_error |= outcome.had_error;
+					},
+					Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+						return SIGPIPE_EXIT_CODE;
+					},
+					Err(error) => {
+						had_error = true;
+						if !opts.no_messages {
+							let _ = writeln!(host.stderr, "rg: {error}");
+						}
+					},
+				}
 			},
 			Ok(meta) if meta.is_file() => {
 				let display =
 					(show_names || opts.json).then_some(operand.as_os_str().as_encoded_bytes());
-				let outcome = process_file(
+				match process_file(
 					host,
 					cli,
 					matcher,
@@ -1768,9 +1793,21 @@ fn execute_search<M: Matcher, W: Write>(
 					opts,
 					&mut stats,
 					out,
-				);
-				any_match |= outcome.any_match;
-				had_error |= outcome.had_error;
+				) {
+					Ok(outcome) => {
+						any_match |= outcome.any_match;
+						had_error |= outcome.had_error;
+					},
+					Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+						return SIGPIPE_EXIT_CODE;
+					},
+					Err(error) => {
+						had_error = true;
+						if !opts.no_messages {
+							let _ = writeln!(host.stderr, "rg: {error}");
+						}
+					},
+				}
 			},
 			Ok(_) => {},
 			Err(error) => {
@@ -1785,10 +1822,15 @@ fn execute_search<M: Matcher, W: Write>(
 			break;
 		}
 	}
-	if opts.json {
-		let _ = write_json_summary(out, &stats);
+	if opts.json
+		&& write_json_summary(out, &stats)
+			.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+	{
+		return SIGPIPE_EXIT_CODE;
 	}
-	let _ = out.flush();
+	if out.flush().is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe) {
+		return SIGPIPE_EXIT_CODE;
+	}
 	if opts.quiet {
 		if any_match {
 			0
@@ -1860,8 +1902,19 @@ impl Utility for Rg {
 			!cli.files && !pattern_stdin_consumed && host.stdin_is_search_input(),
 		);
 		if cli.files {
-			let outcome = list_files(host, &cli, &paths, opts.path_separator, &mut out);
-			let _ = out.flush();
+			let outcome = match list_files(host, &cli, &paths, opts.path_separator, &mut out) {
+				Ok(outcome) => outcome,
+				Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+					return SIGPIPE_EXIT_CODE;
+				},
+				Err(error) => {
+					let _ = writeln!(host.stderr, "rg: {error}");
+					return 2;
+				},
+			};
+			if out.flush().is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe) {
+				return SIGPIPE_EXIT_CODE;
+			}
 			return if outcome.had_error {
 				2
 			} else if outcome.any_match {
@@ -1899,6 +1952,22 @@ mod tests {
 	fn run(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_util::<Rg>(args, stdin, "/");
 		(code, capture.out(), capture.err())
+	}
+
+	#[test]
+	fn broken_pipe_on_stdout_is_silent_and_exits_141() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("match.txt"), "hit\n").unwrap();
+		let parsed = Rg::try_parse_from(["rg", "hit", "match.txt"]).unwrap();
+		let (mut host, capture) = Host::for_test("rg", "", tree.path());
+		let (reader, writer) = std::io::pipe().unwrap();
+		drop(reader);
+		host.stdout = omp_shell_engine::openfiles::OpenFile::from(writer);
+
+		let code = parsed.run(&mut host);
+
+		assert_eq!(code, SIGPIPE_EXIT_CODE);
+		assert!(capture.err().is_empty(), "stderr must stay clean: {:?}", capture.err());
 	}
 
 	#[test]
