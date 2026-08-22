@@ -18,6 +18,8 @@ pub mod gc;
 /// Rebuildable direct-GitHub response cache.
 pub mod github_cache;
 pub mod index;
+/// Collision-aware session-index archive and lineage operations.
+pub mod maintenance;
 /// Persistent MCP definition-cache storage.
 pub mod mcp_cache;
 /// Persistent secret-placeholder key storage.

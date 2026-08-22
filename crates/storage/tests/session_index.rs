@@ -9,13 +9,14 @@ use std::{
 };
 
 use omp_core::{Str, sf};
-use omp_proto::inference::v1 as pb;
+use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
 use omp_storage::{
 	index::{
 		EventProjection, IndexAuthority, IndexedEvent, IndexedWriteError, JournalPosition,
 		NewSession, RepairRecord, SessionFilter, SessionIndex, SessionKind, UsageBucketWidth,
 		UsageDimension, UsageQuery,
 	},
+	maintenance::MaintenanceMode,
 	transcript::{SessionId, TitleSource},
 };
 use smallvec::smallvec;
@@ -27,6 +28,23 @@ fn session_id(value: &str) -> SessionId {
 
 fn create(index: &SessionIndex, id: &SessionId) {
 	create_after_journal(index, id, || {});
+}
+
+fn create_child(index: &SessionIndex, id: &SessionId, parent: &SessionId) {
+	index
+		.create_session(
+			&NewSession {
+				id,
+				cwd: "/workspace/project",
+				project: "/workspace/project",
+				created_ms: 2_000,
+				kind: SessionKind::Interactive,
+				parent: Some(parent),
+				remote: false,
+			},
+			|| Ok::<_, io::Error>(((), 64)),
+		)
+		.expect("write child header and session index row");
 }
 
 fn create_after_journal(index: &SessionIndex, id: &SessionId, after_journal: impl FnOnce()) {
@@ -107,6 +125,25 @@ const fn receipt_event<'a>(
 		kind: "omp.turn_receipt",
 		projection: EventProjection::TurnReceipt { outcome, failed: false },
 	}
+}
+fn append_projection(
+	index: &SessionIndex,
+	session: &SessionId,
+	event_index: u64,
+	kind: &str,
+	projection: EventProjection<'_>,
+) {
+	index
+		.append(
+			&IndexedEvent { session, ts_ms: 3_000_u64.saturating_add(event_index), kind, projection },
+			|| {
+				Ok::<_, io::Error>(((), JournalPosition {
+					event_index,
+					byte_watermark: 128_u64.saturating_add(event_index.saturating_mul(64)),
+				}))
+			},
+		)
+		.expect("append indexed projection");
 }
 
 #[test]
@@ -494,5 +531,154 @@ fn two_writer_connections_serialize_distinct_session_commits() {
 			.sessions
 			.iter()
 			.any(|session| session.id == session_id("second-writer"))
+	);
+}
+#[test]
+fn lineage_rekey_moves_all_projections_retains_collision_winners_and_rolls_back_dry_run() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("sessions.sqlite3");
+	let index = SessionIndex::open(&path).expect("open index");
+	let concurrent_writer = SessionIndex::open(&path).expect("open second WAL writer");
+	let retained = session_id("retained-child");
+	let archived = session_id("archived-parent");
+	create(&index, &archived);
+	create_child(&index, &retained, &archived);
+
+	let retained_receipt = outcome(10, 11);
+	let archived_collision_receipt = outcome(20, 21);
+	let archived_unique_receipt = outcome(30, 31);
+	let retained_item = thread_pb::Item {
+		kind: Some(thread_pb::item::Kind::Message(thread_pb::Message {
+			role:  thread_pb::Role::User as i32,
+			parts: Vec::new(),
+		})),
+		..thread_pb::Item::default()
+	};
+	let archived_collision_item = retained_item.clone();
+	let archived_unique_item = retained_item.clone();
+	append_projection(&index, &retained, 0, "omp.turn_receipt", EventProjection::TurnReceipt {
+		outcome: &retained_receipt,
+		failed:  false,
+	});
+	append_projection(&index, &retained, 1, "omp.item", EventProjection::ThreadItem {
+		item:    &retained_item,
+		prompt:  Some("retained collision prompt"),
+		context: None,
+	});
+	append_projection(&index, &archived, 0, "omp.turn_receipt", EventProjection::TurnReceipt {
+		outcome: &archived_collision_receipt,
+		failed:  false,
+	});
+	append_projection(&index, &archived, 1, "omp.item", EventProjection::ThreadItem {
+		item:    &archived_collision_item,
+		prompt:  Some("archived collision prompt"),
+		context: None,
+	});
+	append_projection(&index, &archived, 2, "omp.turn_receipt", EventProjection::TurnReceipt {
+		outcome: &archived_unique_receipt,
+		failed:  false,
+	});
+	append_projection(&index, &archived, 3, "omp.archived_item", EventProjection::ThreadItem {
+		item:    &archived_unique_item,
+		prompt:  Some("archived unique prompt"),
+		context: None,
+	});
+
+	let dry_run = index
+		.rekey_archived_lineage(&retained, std::slice::from_ref(&archived), MaintenanceMode::DryRun)
+		.expect("measure lineage transfer");
+	assert_eq!(dry_run.receipts.transferred, 1);
+	assert_eq!(dry_run.receipts.collisions, 1);
+	assert_eq!(dry_run.item_outcomes.transferred, 1);
+	assert_eq!(dry_run.item_outcomes.collisions, 1);
+	assert_eq!(dry_run.model_performance.transferred, 1);
+	assert_eq!(dry_run.model_performance.collisions, 1);
+	assert_eq!(dry_run.entry_kinds.transferred, 1);
+	assert_eq!(dry_run.entry_kinds.collisions, 2);
+	assert_eq!(dry_run.prompts_fts.transferred, 1);
+	assert_eq!(dry_run.prompts_fts.collisions, 1);
+	assert_eq!(dry_run.archived_sessions, 1);
+	assert!(
+		index
+			.receipt(&archived, 2)
+			.expect("query archived receipt after dry run")
+			.is_some()
+	);
+	assert_eq!(
+		index
+			.search_prompts("archived unique prompt", 5)
+			.expect("query archived prompt after dry run")[0]
+			.session,
+		archived
+	);
+
+	let applied = index
+		.rekey_archived_lineage(&retained, std::slice::from_ref(&archived), MaintenanceMode::Apply)
+		.expect("apply lineage transfer");
+	assert_eq!(applied, dry_run);
+	assert_eq!(
+		index
+			.receipt(&retained, 0)
+			.expect("query retained collision receipt")
+			.expect("retained collision receipt")
+			.usage
+			.input_tokens,
+		10
+	);
+	assert_eq!(
+		index
+			.receipt(&retained, 2)
+			.expect("query transferred receipt")
+			.expect("transferred receipt")
+			.usage
+			.input_tokens,
+		30
+	);
+	assert!(
+		index
+			.receipt(&archived, 2)
+			.expect("query removed archived receipt")
+			.is_none()
+	);
+	let retained_prompt = index
+		.search_prompts("retained collision prompt", 5)
+		.expect("query retained collision prompt");
+	assert_eq!(retained_prompt.len(), 1);
+	assert_eq!(retained_prompt[0].session, retained);
+	assert!(
+		index
+			.search_prompts("archived collision prompt", 5)
+			.expect("query discarded collision prompt")
+			.is_empty()
+	);
+	let transferred_prompt = index
+		.search_prompts("archived unique prompt", 5)
+		.expect("query transferred prompt");
+	assert_eq!(transferred_prompt.len(), 1);
+	assert_eq!(transferred_prompt[0].session, retained);
+	let statistics = index
+		.session_statistics(&retained, false)
+		.expect("query transferred statistics");
+	assert_eq!(statistics.requests, 2);
+	assert_eq!(statistics.user_messages, 2);
+	let page = index
+		.list(&SessionFilter {
+			contains_kind: Some(sf!("omp.archived_item")),
+			..SessionFilter::default()
+		})
+		.expect("query transferred entry kind");
+	assert_eq!(page.sessions.len(), 1);
+	assert_eq!(page.sessions[0].id, retained);
+	assert_eq!(page.sessions[0].turns, 2);
+
+	let post_maintenance = session_id("post-maintenance-writer");
+	create(&concurrent_writer, &post_maintenance);
+	assert_eq!(
+		concurrent_writer
+			.list(&SessionFilter::default())
+			.expect("query after maintenance writer")
+			.sessions
+			.len(),
+		2
 	);
 }

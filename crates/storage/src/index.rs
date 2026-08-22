@@ -346,6 +346,18 @@ pub enum Error {
 		/// Counter being converted.
 		field: &'static str,
 	},
+	/// The retained lineage target is also among the sessions being archived.
+	#[error("retained lineage target is also marked for archive")]
+	RetainedSessionArchived {
+		/// Conflicting session identifier.
+		session: SessionId,
+	},
+	/// A lineage maintenance request named a session absent from the index.
+	#[error("lineage maintenance session is absent from the index")]
+	MissingMaintenanceSession {
+		/// Missing session identifier.
+		session: SessionId,
+	},
 }
 
 /// Filters applied directly by `sessions.list` SQL.
@@ -613,9 +625,9 @@ pub struct RepairRecord<'a> {
 
 /// SQLite WAL sessions index with transaction-serialized writers.
 pub struct SessionIndex {
-	connection: Mutex<Connection>,
-	authority:  IndexAuthority,
-	writable:   bool,
+	pub(crate) connection: Mutex<Connection>,
+	authority:             IndexAuthority,
+	writable:              bool,
 }
 
 impl SessionIndex {
@@ -1135,7 +1147,7 @@ impl SessionIndex {
 		Ok(u64::try_from(changed).expect("SQLite changed-row count fits u64"))
 	}
 
-	const fn require_writer(&self) -> Result<(), Error> {
+	pub(crate) const fn require_writer(&self) -> Result<(), Error> {
 		match (self.authority, self.writable) {
 			(IndexAuthority::Authoritative, true) => Ok(()),
 			(IndexAuthority::Authoritative, false) => Err(Error::ReadOnlyAuthority),

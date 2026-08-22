@@ -86,6 +86,54 @@ pub struct PendingIssue {
 	/// Exact payload bytes referenced by the row.
 	pub payload: Vec<u8>,
 }
+/// Filter for a cross-session `AutoQA` issue inventory.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IssueInventoryFilter {
+	/// Restrict findings to one device/tool name.
+	pub device: Option<Str>,
+	/// Maximum number of newest findings to return.
+	pub limit:  usize,
+}
+
+/// One durable issue and its locally stored, already-redacted finding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssueFinding {
+	/// Durable issue metadata.
+	pub issue:   StoredIssue,
+	/// Exact private payload referenced by the metadata row.
+	pub payload: Vec<u8>,
+}
+
+/// Raw mutually-exclusive selectors accepted by issue deletion.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IssueDeleteSelector {
+	/// Delete one exact stable issue identifier.
+	pub id:     Option<Str>,
+	/// Delete every issue for one device/tool name.
+	pub device: Option<Str>,
+	/// Delete every issue in the project inventory.
+	pub all:    bool,
+}
+
+impl IssueDeleteSelector {
+	/// Enforces PI-compatible exact-one selector semantics before any database
+	/// is opened or mutated.
+	///
+	/// # Errors
+	/// Returns a typed selector error unless exactly one selector is present.
+	pub fn validate(&self) -> Result<(), QueryError> {
+		let selected = usize::from(self.id.is_some())
+			+ usize::from(self.device.is_some())
+			+ usize::from(self.all);
+		if selected == 0 {
+			return Err(QueryError::MissingIssueSelector);
+		}
+		if selected > 1 {
+			return Err(QueryError::ConflictingIssueSelectors);
+		}
+		Ok(())
+	}
+}
 
 /// A cancellation guard for a core-side query.
 #[derive(Clone, Debug, Default)]
@@ -169,6 +217,12 @@ pub enum QueryError {
 	/// The query was cancelled by dropping its guard.
 	#[error("telemetry query cancelled")]
 	Cancelled,
+	/// Issue deletion requires one selector.
+	#[error("specify exactly one issue selector: id, device, or all")]
+	MissingIssueSelector,
+	/// Issue deletion selectors are mutually exclusive.
+	#[error("issue selectors id, device, and all are mutually exclusive")]
+	ConflictingIssueSelectors,
 }
 
 impl Where {
@@ -469,6 +523,69 @@ impl TelemetryIndex {
 			.map_err(QueryError::from)
 	}
 
+	/// Lists the newest issues across every session in this project index.
+	///
+	/// Payloads are read through the telemetry owner rather than by callers
+	/// opening the private side file directly.
+	///
+	/// # Errors
+	/// Returns a SQLite or side-file error if inventory materialization fails.
+	pub fn issue_inventory(
+		&self,
+		filter: &IssueInventoryFilter,
+	) -> Result<Vec<IssueFinding>, QueryError> {
+		let limit = i64::try_from(filter.limit).unwrap_or(i64::MAX);
+		let issues = {
+			let database = self.database.lock();
+			let mut statement = if filter.device.is_some() {
+				database.prepare(
+					"SELECT id, session_id, device, rev, consent, created_at_ms, payload_offset, \
+					 payload_len, consent_revision, attempt_count, next_attempt_at_ms, terminal, \
+					 remote_ack FROM telemetry_issues WHERE device = ?1 ORDER BY created_at_ms DESC, \
+					 id DESC LIMIT ?2",
+				)?
+			} else {
+				database.prepare(
+					"SELECT id, session_id, device, rev, consent, created_at_ms, payload_offset, \
+					 payload_len, consent_revision, attempt_count, next_attempt_at_ms, terminal, \
+					 remote_ack FROM telemetry_issues ORDER BY created_at_ms DESC, id DESC LIMIT ?2",
+				)?
+			};
+			let rows = if let Some(device) = filter.device.as_deref() {
+				statement.query_map(params![device, limit], stored_issue_row)?
+			} else {
+				statement.query_map(params![Option::<&str>::None, limit], stored_issue_row)?
+			};
+			rows.collect::<Result<Vec<_>, _>>()?
+		};
+		let mut findings = Vec::with_capacity(issues.len());
+		for issue in issues {
+			let payload = self.read_payload(issue.payload_offset, issue.payload_len)?;
+			findings.push(IssueFinding { issue, payload });
+		}
+		Ok(findings)
+	}
+
+	/// Deletes one unambiguous issue scope in a single SQLite transaction.
+	///
+	/// # Errors
+	/// Returns a typed selector error before opening the transaction unless
+	/// exactly one of `id`, `device`, or `all` is selected.
+	pub fn delete_issues(&self, selector: &IssueDeleteSelector) -> Result<usize, QueryError> {
+		selector.validate()?;
+		let mut database = self.database.lock();
+		let transaction = database.transaction()?;
+		let deleted = if let Some(id) = selector.id.as_deref() {
+			transaction.execute("DELETE FROM telemetry_issues WHERE id = ?1", params![id])?
+		} else if let Some(device) = selector.device.as_deref() {
+			transaction.execute("DELETE FROM telemetry_issues WHERE device = ?1", params![device])?
+		} else {
+			transaction.execute("DELETE FROM telemetry_issues", [])?
+		};
+		transaction.commit()?;
+		Ok(deleted)
+	}
+
 	/// Grants upload consent only when the UI-confirmed target revision still
 	/// matches the filed issue.
 	pub fn consent_upload(&self, id: &str, revision: &str, now_ms: u64) -> Result<bool, QueryError> {
@@ -495,6 +612,34 @@ impl TelemetryIndex {
 				 remote_ack IS NULL AND next_attempt_at_ms <= ?1 ORDER BY created_at_ms, id LIMIT ?2",
 			)?;
 			let rows = statement.query_map(params![now_ms, limit], stored_issue_row)?;
+			rows.collect::<Result<Vec<_>, _>>()?
+		};
+		let mut pending = Vec::with_capacity(issues.len());
+		for issue in issues {
+			let payload = self.read_payload(issue.payload_offset, issue.payload_len)?;
+			pending.push(PendingIssue { issue, payload });
+		}
+		Ok(pending)
+	}
+
+	/// Returns bounded unacknowledged rows for an explicit manual push.
+	///
+	/// Manual invocation is itself the user's upload intent, so this bypasses
+	/// the interactive consent disposition while preserving terminal remote
+	/// acknowledgements.
+	///
+	/// # Errors
+	/// Returns a SQLite or side-file error if pending findings cannot be read.
+	pub fn pending_manual_uploads(&self, limit: usize) -> Result<Vec<PendingIssue>, QueryError> {
+		let issues = {
+			let database = self.database.lock();
+			let mut statement = database.prepare(
+				"SELECT id, session_id, device, rev, consent, created_at_ms, payload_offset, \
+				 payload_len, consent_revision, attempt_count, next_attempt_at_ms, terminal, \
+				 remote_ack FROM telemetry_issues WHERE terminal = 0 AND remote_ack IS NULL ORDER BY \
+				 created_at_ms, id LIMIT ?1",
+			)?;
+			let rows = statement.query_map(params![limit], stored_issue_row)?;
 			rows.collect::<Result<Vec<_>, _>>()?
 		};
 		let mut pending = Vec::with_capacity(issues.len());
@@ -597,5 +742,111 @@ mod tests {
 				.unwrap();
 		assert_eq!(index.append("s", "turn_start", 1, b"one").unwrap(), TelemetryWatermark(0));
 		assert_eq!(index.watermark(), TelemetryWatermark(7));
+	}
+	fn store_test_issue(
+		index: &TelemetryIndex,
+		id: &'static str,
+		session: &'static str,
+		device: &'static str,
+		created_at_ms: u64,
+	) {
+		let payload = format!(r#"{{"report":"{id}"}}"#);
+		let offset = index
+			.append(session, "issue_report", created_at_ms, payload.as_bytes())
+			.unwrap();
+		index
+			.store_issue(&StoredIssue {
+				id: Str::new_static(id),
+				session_id: Str::new_static(session),
+				device: Str::new_static(device),
+				rev: Some(sf!("1")),
+				consent: sf!("local_only"),
+				created_at_ms,
+				payload_offset: offset.0,
+				payload_len: payload.len().try_into().unwrap(),
+				consent_revision: Some(sf!("1")),
+				attempt_count: 0,
+				next_attempt_at_ms: 0,
+				terminal: false,
+				remote_ack: None,
+			})
+			.unwrap();
+	}
+
+	#[test]
+	fn issue_inventory_filters_across_sessions_and_delete_is_transactional() {
+		let temporary = tempdir().unwrap();
+		let index =
+			TelemetryIndex::open(temporary.path(), &temporary.path().join("telemetry.sqlite"))
+				.unwrap();
+		store_test_issue(&index, "qa-a", "session-a", "read", 1);
+		store_test_issue(&index, "qa-b", "session-b", "write", 2);
+		store_test_issue(&index, "qa-c", "session-c", "read", 3);
+
+		let all = index
+			.issue_inventory(&IssueInventoryFilter { device: None, limit: 20 })
+			.unwrap();
+		assert_eq!(
+			all.iter()
+				.map(|finding| finding.issue.id.as_str())
+				.collect::<Vec<_>>(),
+			["qa-c", "qa-b", "qa-a"]
+		);
+		let reads = index
+			.issue_inventory(&IssueInventoryFilter { device: Some(sf!("read")), limit: 20 })
+			.unwrap();
+		assert_eq!(
+			reads
+				.iter()
+				.map(|finding| finding.issue.session_id.as_str())
+				.collect::<Vec<_>>(),
+			["session-c", "session-a"]
+		);
+
+		assert!(matches!(
+			index.delete_issues(&IssueDeleteSelector::default()),
+			Err(QueryError::MissingIssueSelector)
+		));
+		assert!(matches!(
+			index.delete_issues(&IssueDeleteSelector {
+				id:     Some(sf!("qa-a")),
+				device: None,
+				all:    true,
+			}),
+			Err(QueryError::ConflictingIssueSelectors)
+		));
+		assert_eq!(
+			index
+				.delete_issues(&IssueDeleteSelector {
+					id:     None,
+					device: Some(sf!("read")),
+					all:    false,
+				})
+				.unwrap(),
+			2
+		);
+		let remaining = index
+			.issue_inventory(&IssueInventoryFilter { device: None, limit: 20 })
+			.unwrap();
+		assert_eq!(remaining.len(), 1);
+		assert_eq!(remaining[0].issue.id, "qa-b");
+	}
+
+	#[test]
+	fn upload_acknowledgement_is_committed_once() {
+		let temporary = tempdir().unwrap();
+		let index =
+			TelemetryIndex::open(temporary.path(), &temporary.path().join("telemetry.sqlite"))
+				.unwrap();
+		store_test_issue(&index, "qa-a", "session-a", "read", 1);
+		let pending = index.pending_manual_uploads(20).unwrap();
+		assert_eq!(pending.len(), 1);
+		assert_eq!(pending[0].issue.consent, "local_only");
+		assert!(index.acknowledge_upload("qa-a", "remote-1").unwrap());
+		assert!(!index.acknowledge_upload("qa-a", "remote-2").unwrap());
+		let issue = index.issue("qa-a").unwrap().unwrap();
+		assert_eq!(issue.remote_ack.as_deref(), Some("remote-1"));
+		assert_eq!(issue.attempt_count, 1);
+		assert!(issue.terminal);
 	}
 }
