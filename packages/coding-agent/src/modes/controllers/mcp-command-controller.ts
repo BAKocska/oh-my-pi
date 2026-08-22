@@ -4,7 +4,7 @@
  * Handles /mcp subcommands for managing MCP servers.
  */
 import * as path from "node:path";
-import { type Component, replaceTabs, Spacer, Text } from "@oh-my-pi/pi-tui";
+import { type Component, Loader, replaceTabs, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { getMCPConfigPath, getProjectDir } from "@oh-my-pi/pi-utils";
 import type { SourceMeta } from "../../capability/types";
 import { expandEnvVarsDeep } from "../../discovery/helpers";
@@ -258,40 +258,6 @@ class McpConnectingBlock extends ChatBlock {
 	setStatus(text: string): void {
 		this.#text.setText(text);
 		this.requestRender();
-	}
-}
-
-type McpTestOutcome = "succeeded" | "cancelled" | "failed";
-
-/**
- * Live "(esc to cancel)" hint for an in-flight `/mcp test`. Unlike a static
- * transcript line, the hint retires its Esc affordance the moment the test
- * settles ({@link settle}) so scrollback never keeps advertising a cancellation
- * that Esc no longer performs (#9310).
- */
-export class McpTestHintBlock extends ChatBlock {
-	readonly #text: Text;
-	#settled = false;
-
-	constructor(private readonly serverName: string) {
-		super();
-		this.addChild(new Spacer(1));
-		this.#text = new Text(theme.fg("muted", `Testing connection to "${serverName}"... (esc to cancel)`), 1, 0);
-		this.addChild(this.#text);
-	}
-
-	/** Render and freeze the terminal test outcome, ignoring duplicate settlement. */
-	settle(outcome: McpTestOutcome): void {
-		if (this.#settled) return;
-		this.#settled = true;
-		const text =
-			outcome === "succeeded"
-				? `Tested connection to "${this.serverName}".`
-				: outcome === "cancelled"
-					? `Cancelled connection test for "${this.serverName}".`
-					: `Connection test for "${this.serverName}" failed.`;
-		this.#text.setText(theme.fg("muted", text));
-		this.finish();
 	}
 }
 
@@ -1611,8 +1577,22 @@ export class MCPCommandController {
 		const abortController = new AbortController();
 		let settled = false;
 		let connection: MCPServerConnection | undefined;
-		let hint: McpTestHintBlock | undefined;
-		let outcome: McpTestOutcome = "succeeded";
+		// The "(esc to cancel)" affordance lives in the anchored status container
+		// — never the transcript — so it costs no scrollback rows and can be
+		// retired in place on settle. A mid-stream transcript mount would
+		// re-render rows below the live block, duplicate them in native
+		// scrollback, and commit an immutable hint that settle could not retire.
+		let hintLoader: Loader | undefined;
+		let hintShown = false;
+		const retireHint = (): void => {
+			if (!hintLoader) return;
+			hintLoader.stop();
+			// Remove only our own child so a concurrent agent turn's loading
+			// animation, which shares this container, survives.
+			this.ctx.statusContainer.removeChild(hintLoader);
+			hintLoader = undefined;
+			this.ctx.ui.requestRender();
+		};
 		const handleEscape = (): void => {
 			if (settled) {
 				// Ownership is retained across the settling frame only to absorb a
@@ -1623,9 +1603,9 @@ export class MCPCommandController {
 				this.ctx.showStatus(`MCP test for "${name}" already finished`);
 				return;
 			}
-			// Retire the live affordance synchronously. The connection/auth stack
-			// may take another event-loop turn to reject from the abort signal.
-			hint?.settle("cancelled");
+			// Retire the affordance synchronously; the connection/auth stack may
+			// take another event-loop turn to reject from the abort signal.
+			retireHint();
 			abortController.abort();
 		};
 
@@ -1634,10 +1614,9 @@ export class MCPCommandController {
 		// agent-turn abort while the command is already running.
 		this.ctx.mcpTestEscapeHandlers.add(handleEscape);
 
-		// The live hint owns the on-screen "(esc to cancel)" affordance and retires
-		// it on settle; the grace window below only applies once it is shown, so a
-		// pre-hint failure releases Esc immediately rather than swallowing it for a
-		// prompt the user never saw.
+		// The grace window below only applies once the hint is shown, so a
+		// pre-hint failure releases Esc immediately rather than swallowing it for
+		// a prompt the user never saw.
 		try {
 			const found = await this.#resolveServerForAuth(name);
 
@@ -1665,8 +1644,16 @@ export class MCPCommandController {
 				return;
 			}
 
-			hint = new McpTestHintBlock(name);
-			this.ctx.present(hint);
+			hintLoader = new Loader(
+				this.ctx.ui,
+				spinner => theme.fg("accent", spinner),
+				text => theme.fg("muted", text),
+				`Testing connection to "${name}"... (esc to cancel)`,
+				theme.spinnerFrames,
+			);
+			this.ctx.statusContainer.addChild(hintLoader);
+			this.ctx.ui.requestRender();
+			hintShown = true;
 
 			// Resolve auth config if needed
 			let resolvedConfig: MCPServerConfig;
@@ -1705,12 +1692,10 @@ export class MCPCommandController {
 			await this.#syncManagerConnection(name, config);
 			this.#showMessage(lines.join("\n"));
 		} catch (error) {
-			outcome = "cancelled";
 			if (abortController.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
 				this.ctx.showStatus(`Cancelled MCP test for "${name}"`);
 				return;
 			}
-			outcome = "failed";
 
 			const errorMsg = error instanceof Error ? error.message : String(error);
 
@@ -1731,11 +1716,12 @@ export class MCPCommandController {
 			this.ctx.showError(`Failed to connect to "${name}": ${errorMsg}${helpText}`);
 		} finally {
 			settled = true;
-			// Retire the hint's Esc affordance the instant the test settles so
-			// scrollback stops advertising a cancellation Esc no longer performs.
-			hint?.settle(outcome);
+			// Retire the affordance the instant the test settles so a later Esc
+			// press is never mistaken for test cancellation and cannot abort the
+			// running agent turn once the grace window expires.
+			retireHint();
 			if (this.ctx.mcpTestEscapeHandlers.has(handleEscape)) {
-				if (hint) {
+				if (hintShown) {
 					const timer = setTimeout(() => {
 						this.ctx.mcpTestEscapeHandlers.delete(handleEscape);
 					}, MCP_TEST_ESCAPE_GRACE_MS);
