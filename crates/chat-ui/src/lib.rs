@@ -36,7 +36,7 @@ pub mod vibe_wall;
 pub mod welcome;
 
 pub mod slots;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 pub use agent_hub::{AgentHub, AgentHubEvent};
 pub mod image_overlay;
@@ -256,6 +256,18 @@ impl Default for ActivityWaveform {
 }
 
 /// Complete host-supplied status snapshot.
+/// One visible campaign-slot holder projected by the backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VisibleSlotFacts {
+	/// Canonical slot name.
+	pub slot:        Str,
+	/// Campaign declaration currently holding the slot.
+	pub holder:      Str,
+	/// Durable FIFO tickets waiting behind the holder.
+	pub queue_depth: usize,
+}
+
+/// Complete host-supplied status snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct StatusFacts {
 	/// Model label shown in the status line.
@@ -282,6 +294,8 @@ pub struct StatusFacts {
 	pub advisor_cost_nanos:     u64,
 	/// Number of queued user submissions.
 	pub queued:                 usize,
+	/// Campaign slots whose declarations opt into user-facing status.
+	pub visible_slots:          Arc<[VisibleSlotFacts]>,
 	/// Number of active background jobs.
 	pub jobs:                   usize,
 	/// Current retry attempt.

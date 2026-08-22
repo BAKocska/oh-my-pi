@@ -83,6 +83,8 @@ pub struct HostOptions {
 	pub completion_notify:      bool,
 	/// Notify and retain an attention title for backend errors.
 	pub error_notify:           bool,
+	/// Permit generated terminal-title escape sequences.
+	pub title_enabled:          bool,
 }
 
 impl Default for HostOptions {
@@ -92,6 +94,7 @@ impl Default for HostOptions {
 			exit_on_session_change: true,
 			completion_notify:      true,
 			error_notify:           true,
+			title_enabled:          true,
 		}
 	}
 }
@@ -137,6 +140,7 @@ pub async fn run(
 		exit_on_session_change: false,
 		completion_notify:      true,
 		error_notify:           true,
+		title_enabled:          true,
 	})
 	.await
 	.map(|_| ())
@@ -238,6 +242,7 @@ async fn run_with_terminal(
 		options.exit_on_session_change,
 		options.completion_notify,
 		options.error_notify,
+		options.title_enabled,
 	)
 	.await
 }
@@ -768,6 +773,7 @@ async fn run_chat(
 	exit_on_session_change: bool,
 	completion_notify: bool,
 	error_notify: bool,
+	title_enabled: bool,
 ) -> io::Result<HostOutcome> {
 	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model);
 	let ask_binding = ask::bind();
@@ -1010,12 +1016,18 @@ async fn run_chat(
 								},
 								Ok(event) => {
 									match &event {
-										BackendEvent::ApprovalPending(_) => terminal.set_title("Approval required · omp")?,
-										BackendEvent::ApprovalSettled { .. } if host.pending_approvals <= 1 => {
+										BackendEvent::ApprovalPending(_) if title_enabled => {
+											terminal.set_title("Approval required · omp")?;
+										},
+										BackendEvent::ApprovalSettled { .. }
+											if title_enabled && host.pending_approvals <= 1 =>
+										{
 											terminal.set_title(host.session_title.as_str())?;
 										},
 										BackendEvent::Error(message) => {
-											terminal.set_title("Error · omp")?;
+											if title_enabled {
+												terminal.set_title("Error · omp")?;
+											}
 											if error_notify {
 												terminal.notify(
 													&Notification::builder()
@@ -1028,7 +1040,9 @@ async fn run_chat(
 											}
 										},
 										BackendEvent::Ack { interrupted: false } => {
-											terminal.set_title(host.session_title.as_str())?;
+											if title_enabled {
+												terminal.set_title(host.session_title.as_str())?;
+											}
 											if completion_notify {
 												terminal.notify(
 													&Notification::builder()
@@ -1041,7 +1055,7 @@ async fn run_chat(
 										},
 										BackendEvent::SessionTitle(title) => {
 											host.session_title = sf!("{title} · omp");
-											if host.pending_approvals == 0 {
+											if title_enabled && host.pending_approvals == 0 {
 												terminal.set_title(host.session_title.as_str())?;
 											}
 										},

@@ -899,6 +899,7 @@ struct StatusLabels {
 	velocity: Option<Str>,
 	cwd:      Option<Str>,
 	thinking: Option<Str>,
+	slots:    SmallVec<Str, 5>,
 	hooks:    Option<Str>,
 	tasks:    Option<Str>,
 	collab:   Option<Str>,
@@ -956,6 +957,17 @@ impl StatusLabels {
 				.thinking
 				.as_ref()
 				.map(|thinking| fmts_mut!("think {thinking}").freeze()),
+			slots: facts
+				.visible_slots
+				.iter()
+				.map(|slot| {
+					let mut label = fmts_mut!("{} {}", slot.slot, slot.holder);
+					if slot.queue_depth > 0 {
+						let _ = write!(label, " +{}", slot.queue_depth);
+					}
+					label.freeze()
+				})
+				.collect(),
 			hooks: (facts.hooks > 0).then(|| fmts_mut!("hooks {}", facts.hooks).freeze()),
 			tasks: (facts.tasks > 0).then(|| fmts_mut!("tasks {}", facts.tasks).freeze()),
 			collab: (facts.collab_peers > 0)
@@ -995,6 +1007,9 @@ impl StatusLabels {
 			if let Some(text) = label {
 				*text = separated(text, separator, charset);
 			}
+		}
+		for label in &mut self.slots {
+			*label = separated(label, separator, charset);
 		}
 		if let Some((text, _)) = &mut self.context {
 			*text = separated(text, separator, charset);
@@ -1159,6 +1174,15 @@ impl ChatStatus {
 					.with(Prop::Fg, self.theme.info),
 			);
 		}
+		if facts.layout != StatusLayout::Minimal {
+			for label in &work.labels.slots {
+				status = status.segment(
+					Segment::new()
+						.label(label.clone())
+						.with(Prop::Fg, self.theme.accent),
+				);
+			}
+		}
 		if matches!(facts.layout, StatusLayout::Full | StatusLayout::Compact)
 			&& let Some(tasks) = &work.labels.tasks
 		{
@@ -1264,6 +1288,7 @@ impl ChatStatus {
 			|| facts.tokens_per_second.is_some()
 			|| facts.cwd.is_some()
 			|| facts.thinking.is_some()
+			|| !facts.visible_slots.is_empty()
 			|| facts.hooks > 0
 			|| facts.tasks > 0
 			|| facts.collab_peers > 0
@@ -3638,6 +3663,8 @@ const fn prose_style(theme: Theme) -> Style {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use super::*;
 
 	fn ctx() -> UiContext {
@@ -3652,6 +3679,21 @@ mod tests {
 		}
 		assert_eq!(activity_waveform_label(&waveform, Charset::Ascii), "live .:-*#");
 		assert_eq!(activity_waveform_label(&waveform, Charset::Unicode), "live ▁▂▄▆█");
+	}
+	#[test]
+	fn visible_campaign_slot_renders_holder_and_queue_depth() {
+		let facts = StatusFacts {
+			visible_slots: Arc::from([crate::VisibleSlotFacts {
+				slot:        sf!("mode"),
+				holder:      sf!("plan"),
+				queue_depth: 2,
+			}]),
+			..StatusFacts::default()
+		};
+		let labels = StatusLabels::new(&facts, Charset::Unicode);
+		assert_eq!(labels.slots.as_slice(), &["· mode plan +2"]);
+		let empty = StatusLabels::new(&StatusFacts::default(), Charset::Unicode);
+		assert!(empty.slots.is_empty());
 	}
 
 	fn row_text(frame: &Frame, row: u16) -> String {
