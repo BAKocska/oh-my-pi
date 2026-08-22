@@ -28,6 +28,9 @@ pub fn map_key(event: &winit::event::KeyEvent, mods: ModifiersState) -> Option<K
 	if mods.super_key() {
 		return None;
 	}
+	if let Some(key) = physical_ctrl_key(event.physical_key, mods) {
+		return Some(key);
+	}
 	match &event.logical_key {
 		WinitKey::Named(named) => map_named(*named, mods),
 		WinitKey::Character(text) => {
@@ -56,6 +59,20 @@ pub fn map_key(event: &winit::event::KeyEvent, mods: ModifiersState) -> Option<K
 		},
 		_ => None,
 	}
+}
+/// Maps a Ctrl chord by physical key before text-input normalization.
+fn physical_ctrl_key(physical: PhysicalKey, mods: ModifiersState) -> Option<Key> {
+	if !mods.control_key() || mods.alt_key() {
+		return None;
+	}
+	let letter = letter_of(physical)?;
+	if mods.shift_key() && letter == 'v' {
+		return Some(Key::PasteRaw);
+	}
+	if letter == 'v' {
+		return Some(Key::Paste);
+	}
+	Some(Key::Ctrl(letter))
 }
 
 /// Maps a named (non-character) key with its modifiers; shift promotes
@@ -210,6 +227,13 @@ mod tests {
 		assert_eq!(map_named(NamedKey::ArrowLeft, none), Some(Key::Left));
 		assert_eq!(map_named(NamedKey::Home, none), Some(Key::Home));
 		assert_eq!(map_named(NamedKey::Tab, ModifiersState::SHIFT), Some(Key::BackTab));
+	}
+	#[test]
+	fn ctrl_b_uses_the_physical_key_before_text_normalization() {
+		assert_eq!(
+			physical_ctrl_key(PhysicalKey::Code(KeyCode::KeyB), ModifiersState::CONTROL),
+			Some(Key::Ctrl('b'))
+		);
 	}
 
 	#[test]
