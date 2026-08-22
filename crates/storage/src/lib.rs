@@ -23,5 +23,9 @@ pub mod mcp_cache;
 /// Persistent secret-placeholder key storage.
 pub mod secret_key;
 pub mod state;
+/// Consent-gated prompt-free statistics storage.
+pub mod stats_db;
+/// Incremental background transcript statistics ingestion.
+pub mod stats_ingest;
 pub mod telemetry_index;
 pub mod transcript;

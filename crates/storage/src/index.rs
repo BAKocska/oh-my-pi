@@ -870,6 +870,38 @@ impl SessionIndex {
 		Ok(SessionPage { sessions, authority: self.authority })
 	}
 
+	/// Returns one root and every durable lineage descendant in parent-before-
+	/// child order.
+	pub fn subagent_tree(&self, root: &SessionId) -> Result<Vec<SessionInfo>, Error> {
+		let connection = self.connection.lock();
+		let mut statement = connection.prepare(
+			"WITH RECURSIVE lineage(id, depth) AS (
+			   SELECT id, 0 FROM sessions WHERE id = ?1
+			   UNION ALL
+			   SELECT child.id, lineage.depth + 1
+			   FROM sessions child JOIN lineage ON child.parent = lineage.id
+			 )
+			 SELECT s.id, s.title, s.title_source, s.cwd, s.project, s.created_ms, s.updated_ms,
+			        s.status, s.kind, s.parent, s.entries, s.turns, s.journal_watermark,
+			        s.last_event_index, s.remote
+			 FROM lineage JOIN sessions s ON s.id = lineage.id
+			 ORDER BY lineage.depth, s.created_ms, s.id",
+		)?;
+		let rows = statement.query_map([root.0.as_str()], decode_session)?;
+		let mut sessions = Vec::new();
+		for row in rows {
+			sessions.push(row?);
+		}
+		drop(statement);
+		for session in &mut sessions {
+			let (usage, cost, models) = session_accounting(&connection, &session.id)?;
+			session.usage = usage;
+			session.cost = cost;
+			session.models = models;
+		}
+		Ok(sessions)
+	}
+
 	/// Executes SQL aggregation over write-time receipt rows.
 	pub fn usage(&self, query: &UsageQuery) -> Result<Vec<UsageBucket>, Error> {
 		let (sql, values) = usage_sql(query)?;
