@@ -45,12 +45,14 @@ omp-core = { workspace = true }
 omp-docserver = { workspace = true }
 omp-env = { workspace = true }
 omp-envd = { workspace = true }
+omp-executor = { workspace = true }
 omp-ext = { workspace = true }
 omp-hashline = { workspace = true }
 omp-catalog = { workspace = true }
 omp-inference = { workspace = true, features = ["test-support"] }
 omp-proto = { workspace = true }
 omp-rpc = { workspace = true }
+omp-serve = { workspace = true }
 omp-shell = { workspace = true }
 omp-shell-engine = { workspace = true }
 omp-storage = { workspace = true }
