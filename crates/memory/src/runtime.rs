@@ -798,6 +798,25 @@ impl RuntimeRegistry {
 		None
 	}
 
+	/// Resolves the deterministic live runtime for a canonical primary root.
+	///
+	/// Multiple worktree sessions may share the same bank identity. The
+	/// lexicographically smallest live session id wins so contextless callers
+	/// never depend on hash-map iteration order.
+	#[must_use]
+	pub fn lookup_primary_root(primary_root: &Path) -> Option<Arc<MemoryRuntime>> {
+		let mut runtimes = RUNTIMES.write();
+		runtimes.retain(|_, runtime| runtime.strong_count() != 0);
+		runtimes
+			.iter()
+			.filter_map(|(session_id, runtime)| {
+				let runtime = runtime.upgrade()?;
+				(runtime.identity_root().ok() == Some(primary_root)).then_some((session_id, runtime))
+			})
+			.min_by(|(left, _), (right, _)| left.cmp(right))
+			.map(|(_, runtime)| runtime)
+	}
+
 	/// Removes one session mapping without affecting shared bank handles held
 	/// elsewhere.
 	pub fn unregister(session_id: &str) {
