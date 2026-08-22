@@ -16,8 +16,14 @@ workspace = true
 name = "omp"
 path = "src/main.rs"
 
+[[bin]]
+name = "claude-trace"
+path = "src/claude_trace.rs"
+required-features = ["claude-trace"]
+
 [features]
 default = ["local-applefm", "local-embedding", "local-text", "local-stt", "local-tts"]
+claude-trace = []
 local = ["omp-llm-inference/local"]
 local-applefm = ["local", "omp-llm-inference/local-applefm"]
 local-embedding = ["local", "omp-llm-inference/local-embedding"]
@@ -60,6 +66,7 @@ omp-core.workspace = true
 omp-docserver.workspace = true
 omp-desktop.workspace = true
 omp-env.workspace = true
+omp-gui.workspace = true
 omp-grep.workspace = true
 omp-hashline.workspace = true
 omp-llm-catalog.workspace = true
@@ -82,6 +89,7 @@ omp-voice = { workspace = true, features = ["realtime-transport"] }
 omp-slopjson.workspace = true
 omp-tools.workspace = true
 omp-walker.workspace = true
+jiff.workspace = true
 nix.workspace = true
 parking_lot.workspace = true
 pyo3.workspace = true
@@ -97,6 +105,7 @@ serde_yaml.workspace = true
 handlebars.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tower.workspace = true
@@ -113,6 +122,7 @@ serde.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+ctor.workspace = true
 flume = { workspace = true }
 omp-llm-inference = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

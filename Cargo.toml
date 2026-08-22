@@ -13,6 +13,7 @@ repository = "https://github.com/stencil-hq/omp"
 # All dependencies live here; member crates reference them with
 # `dep = { workspace = true }` and never pin their own versions.
 [workspace.dependencies]
+ctor = "0.2"
 arc-swap = "1.7"
 anydoc = "0.1.9"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
