@@ -66,5 +66,37 @@ pub(crate) fn spawn(command: std::process::Command) -> std::io::Result<Child> {
 		use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 		command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 	}
-	command.spawn()
+	let child = command.spawn()?;
+	shield_pipes_from_sigpipe(&child);
+	Ok(child)
 }
+
+/// Marks the child's parent-held pipe endpoints `F_SETNOSIGPIPE` so a write
+/// after child exit surfaces as `EPIPE` instead of raising `SIGPIPE`.
+///
+/// Embedded job control (signal-mask and disposition juggling around waits)
+/// can leave the host process with a default `SIGPIPE` disposition on the
+/// writing thread; the host must never die because one child closed early.
+#[cfg(target_os = "macos")]
+fn shield_pipes_from_sigpipe(child: &Child) {
+	use std::os::fd::AsRawFd as _;
+	/// `fcntl` selector absent from the `libc` crate; from
+	/// `<sys/fcntl.h>`: `#define F_SETNOSIGPIPE 73`.
+	const F_SETNOSIGPIPE: libc::c_int = 73;
+	for fd in [
+		child.stdin.as_ref().map(|pipe| pipe.as_raw_fd()),
+		child.stdout.as_ref().map(|pipe| pipe.as_raw_fd()),
+		child.stderr.as_ref().map(|pipe| pipe.as_raw_fd()),
+	]
+	.into_iter()
+	.flatten()
+	{
+		// SAFETY: fcntl on an owned, open descriptor with no memory arguments.
+		unsafe {
+			libc::fcntl(fd, F_SETNOSIGPIPE, 1);
+		}
+	}
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shield_pipes_from_sigpipe(_child: &Child) {}
