@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use omp_core::{IntoStr, Str};
+use omp_core::{Str};
 use smallvec::SmallVec;
 
 use crate::{
@@ -75,15 +75,9 @@ impl Engine {
 		Template::compile(self, Str::new_static(name), Str::new_static(source))
 	}
 
-	/// Compiles a runtime-supplied template source — prompt assets loaded
-	/// from disk, user command templates, extension-provided sources.
-	/// Identical to [`Self::compile`] except the name and source are owned.
-	pub fn compile_source(
-		&self,
-		name: impl IntoStr,
-		source: impl IntoStr,
-	) -> Result<Template, Error> {
-		Template::compile(self, name.into_str(), source.into_str())
+	/// Compiles a runtime-supplied template from an owned name and copied source.
+	pub fn compile_owned(&self, name: Str, source: &str) -> Result<Template, Error> {
+		Template::compile(self, name, Str::new(source))
 	}
 }
 
@@ -910,5 +904,16 @@ mod tests {
 		let second = template.render_str(&engine, &bag).unwrap();
 		assert_eq!(first, "abc");
 		assert_eq!(first, second);
+	}
+	#[test]
+	fn compile_owned_retains_runtime_source() {
+		let engine = Engine::new();
+		let source = String::from("hello {{ name }}");
+		let template = engine
+			.compile_owned(Str::new("runtime"), &source)
+			.expect("owned template");
+		drop(source);
+		let bag = props(&[("name", Value::from("Ada"))]);
+		assert_eq!(template.render_str(&engine, &bag).unwrap(), "hello Ada");
 	}
 }

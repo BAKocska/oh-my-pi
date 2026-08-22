@@ -1,6 +1,11 @@
 //! Interactive question selection with a host-provided presentation seam.
 
-use std::{fmt, sync::Arc};
+use std::{
+	fmt,
+	future::Future,
+	pin::Pin,
+	sync::Arc,
+};
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -116,7 +121,10 @@ impl std::error::Error for Fault {}
 /// parity.
 pub trait AskPresenter: Send + Sync + 'static {
 	/// Presents ordered questions and returns durable selections.
-	fn present(&self, questions: &[Question]) -> Result<Presentation, Fault>;
+	fn present<'p>(
+		&'p self,
+		questions: &'p [Question],
+	) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>>;
 }
 
 /// Replaceable per-environment presentation bridge.
@@ -138,8 +146,12 @@ impl PresenterSlot {
 }
 
 impl AskPresenter for PresenterSlot {
-	fn present(&self, questions: &[Question]) -> Result<Presentation, Fault> {
-		self.inner.read().present(questions)
+	fn present<'p>(
+		&'p self,
+		questions: &'p [Question],
+	) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
+		let presenter = Arc::clone(&*self.inner.read());
+		Box::pin(async move { presenter.present(questions).await })
 	}
 }
 /// Presenter result, preserving whether answers came from headless fallback.
@@ -173,14 +185,17 @@ pub trait AskVocalizer: Send + Sync + 'static {
 #[derive(Default)]
 pub struct HeadlessPresenter;
 impl AskPresenter for HeadlessPresenter {
-	fn present(&self, questions: &[Question]) -> Result<Presentation, Fault> {
-		Ok(Presentation {
-			answers:  questions
+	fn present<'p>(
+		&'p self,
+		questions: &'p [Question],
+	) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
+		Box::pin(std::future::ready(
+			questions
 				.iter()
 				.map(headless_answer)
-				.collect::<Result<_, _>>()?,
-			headless: true,
-		})
+				.collect::<Result<_, _>>()
+				.map(|answers| Presentation { answers, headless: true }),
+		))
 	}
 }
 
@@ -277,7 +292,7 @@ impl Tool for Ask {
 					},
 				}
 			}
-			let result = self.presenter.present(&arguments.questions).map(|presentation| Payload {
+			let result = self.presenter.present(&arguments.questions).await.map(|presentation| Payload {
 				answers: presentation.answers,
 				headless: presentation.headless,
 			});
@@ -390,6 +405,8 @@ fn protocol_issue(message: Str) -> ArgIssue {
 
 #[cfg(test)]
 mod tests {
+	use futures::StreamExt as _;
+
 	use super::*;
 	fn question(recommended: Option<usize>) -> Question {
 		Question {
@@ -420,5 +437,49 @@ mod tests {
 		reserved.options[0].label = sf!("Next →");
 		assert!(validate(&[reserved]).is_err());
 		assert!(headless_answer(&question(None)).is_err());
+	}
+
+	struct DelayedPresenter;
+
+	impl AskPresenter for DelayedPresenter {
+		fn present<'p>(
+			&'p self,
+			questions: &'p [Question],
+		) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
+			Box::pin(async move {
+				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+				Ok(Presentation {
+					answers:  vec![Answer {
+						id:        questions[0].id.clone(),
+						selected:  vec![questions[0].options[0].label.clone()],
+						timed_out: false,
+					}],
+					headless: false,
+				})
+			})
+		}
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn call_awaits_async_presenter_on_current_thread_runtime() {
+		let ask = tool(Arc::new(DelayedPresenter));
+		let (feed, params) = IncomingParams::channel();
+		feed
+			.args_committed(Str::new(
+				r#"{"questions":[{"id":"format","question":"Which?","options":[{"label":"Markdown"}]}]}"#,
+			))
+			.expect("ask invocation remains live");
+
+		let events = ask.call(params).collect::<Vec<_>>().await;
+		let [Ev::Done(ToolTerminal::Done {
+			result: Ok(Payload { answers, headless }),
+			..
+		})] = events.as_slice()
+		else {
+			panic!("expected successful async ask result: {events:?}");
+		};
+		assert!(!headless);
+		assert_eq!(answers[0].selected, [sf!("Markdown")]);
+		assert!(!answers[0].timed_out);
 	}
 }

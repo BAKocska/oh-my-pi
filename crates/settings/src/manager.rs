@@ -642,7 +642,7 @@ mod tests {
 			path:        "default_model",
 			label:       "Default Model",
 			description: "Model selected by default.",
-			kind:        SettingKind::Text,
+			kind:        SettingKind::String,
 			scopes:      PROBE_SCOPES,
 			order:       0,
 			options:     None,
