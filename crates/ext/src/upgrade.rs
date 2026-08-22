@@ -7,10 +7,7 @@ use std::{
 };
 
 use omp_core::Str;
-use omp_env::{ClientError, EnvClient};
-use omp_proto::env::v1::{MaterializeSite, SiteMaterialized};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use super::{
 	ExtensionCode, ExtensionError,
@@ -151,41 +148,6 @@ pub struct Generation {
 	pub lock:      LockFile,
 	/// Local enabled/link selection state.
 	pub installed: InstalledRecord,
-}
-
-/// Failure while publishing a verified generation through the Environment
-/// site authority.
-#[derive(Debug, Error)]
-pub enum MaterializedGenerationError {
-	/// The verified wheel/site manifest could not be materialized.
-	#[error("Environment site materialization failed")]
-	Environment(#[from] ClientError),
-	/// The durable lock/install generation could not be committed.
-	#[error("extension generation commit failed")]
-	Generation(#[from] ExtensionError),
-}
-
-/// Materializes verified wheel/blob inputs through the installer-only
-/// Environment connection, then atomically publishes the corresponding
-/// lock/install generation.
-///
-/// Site trees are immutable and content-addressed, so a later generation-file
-/// failure leaves only an unreachable tree eligible for ordinary GC; it never
-/// exposes partially updated active extension state.
-pub async fn materialize_and_commit_generation(
-	client: &EnvClient,
-	request: MaterializeSite,
-	lock_path: &Path,
-	installed_path: &Path,
-	generation_root: &Path,
-	generation_id: &str,
-	generation: &Generation,
-) -> Result<(PathBuf, SiteMaterialized), MaterializedGenerationError> {
-	generation.lock.validate_for(generation.lock.layer)?;
-	let materialized = client.materialize_site(request).await?;
-	let committed =
-		commit_generation(lock_path, installed_path, generation_root, generation_id, generation)?;
-	Ok((committed, materialized))
 }
 
 /// Writes a verified generation while retaining a restorable copy of the prior

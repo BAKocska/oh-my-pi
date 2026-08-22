@@ -43,6 +43,26 @@ pub enum CliValueKind {
 	OptionalString,
 }
 
+/// One typed value delivered to an extension activation sink.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContributedValue {
+	/// Presence-only value.
+	Boolean(bool),
+	/// String value.
+	String(Str),
+}
+
+/// A declaration-linked contributed value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContributedCliValue {
+	/// Qualified extension owner.
+	pub owner: Str,
+	/// Declared sink key.
+	pub sink:  Str,
+	/// Parsed typed value.
+	pub value: ContributedValue,
+}
+
 /// Declaration-checked sink key exposed only to the owning extension.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CliValueSink {
@@ -646,6 +666,417 @@ pub fn lower_tools(tools: impl IntoIterator<Item = ToolManifestEntry>) -> Vec<De
 			api:     tool.api,
 		})
 		.collect()
+}
+
+/// One sealed extension declaration retained before executable code is loaded.
+///
+/// The common routing fields are typed while class-specific signed properties
+/// remain available verbatim. Permission is granted by membership in the
+/// containing declaration table, never by a runtime callback.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct StaticDeclaration {
+	/// Stable identity within its declaration class.
+	#[serde(default)]
+	pub id:         Str,
+	/// Closed declaration kind from the deployment manifest.
+	#[serde(default)]
+	pub kind:       Str,
+	/// Package-contained module that implements the declaration.
+	#[serde(default)]
+	pub module:     Str,
+	/// Static activation trigger.
+	#[serde(default)]
+	pub trigger:    Str,
+	/// Static class-specific route key.
+	#[serde(default)]
+	pub key:        Str,
+	/// Required OMP API revision.
+	#[serde(default)]
+	pub api:        u32,
+	/// Unavailability behavior fixed by the manifest.
+	#[serde(default)]
+	pub failure:    Str,
+	/// Deployment-granted capability names.
+	#[serde(default)]
+	pub grants:     Box<[Str]>,
+	/// Class-specific signed declaration properties.
+	#[serde(flatten)]
+	pub properties: BTreeMap<Str, serde_json::Value>,
+}
+
+/// Sealed interactive UI declaration tables.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct UiDeclarations {
+	/// Namespaced command declarations.
+	#[serde(default)]
+	pub commands:          Box<[StaticDeclaration]>,
+	/// High-level shortcut declarations.
+	#[serde(default)]
+	pub shortcuts:         Box<[StaticDeclaration]>,
+	/// Versioned message renderer declarations.
+	#[serde(default)]
+	pub message_renderers: Box<[StaticDeclaration]>,
+	/// Versioned verdict renderer declarations.
+	#[serde(default)]
+	pub verdict_renderers: Box<[StaticDeclaration]>,
+	/// Typed completion source declarations.
+	#[serde(default)]
+	pub completions:       Box<[StaticDeclaration]>,
+}
+
+/// Sealed telemetry declaration tables.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryDeclarations {
+	/// Event subscriptions visible to the extension.
+	#[serde(default)]
+	pub subscriptions: Box<[StaticDeclaration]>,
+	/// Consent-gated telemetry export declarations.
+	#[serde(default)]
+	pub exports:       Box<[StaticDeclaration]>,
+}
+
+/// Every statically declared extension CONTROL surface.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct StaticDeclarations {
+	/// Exact deployment capability grant payload, grouped by authority domain.
+	#[serde(default, rename = "capabilities")]
+	pub capability_grants: BTreeMap<Str, serde_json::Value>,
+	/// Uniform sealed declaration rows in deployment order.
+	#[serde(default, rename = "declarations")]
+	pub ordered:           Box<[StaticDeclaration]>,
+	/// Soft and hard tool declarations.
+	#[serde(default)]
+	pub tools:             Box<[StaticDeclaration]>,
+	/// Hook declarations.
+	#[serde(default)]
+	pub hooks:             Box<[StaticDeclaration]>,
+	/// Inter-extension service declarations.
+	#[serde(default)]
+	pub services:          Box<[StaticDeclaration]>,
+	/// Inference provider catalog declarations.
+	#[serde(default)]
+	pub providers:         Box<[StaticDeclaration]>,
+	/// Session and turn campaign declarations.
+	#[serde(default)]
+	pub campaigns:         Box<[StaticDeclaration]>,
+	/// Interactive presentation declarations.
+	#[serde(default)]
+	pub ui:                UiDeclarations,
+	/// Telemetry observation and export declarations.
+	#[serde(default)]
+	pub telemetry:         TelemetryDeclarations,
+	/// Typed system-prompt slot contributions.
+	#[serde(default)]
+	pub prompt_slots:      Box<[StaticDeclaration]>,
+	/// Opaque credential-source declarations.
+	#[serde(default)]
+	pub credentials:       Box<[StaticDeclaration]>,
+	/// Secret transform and reference declarations.
+	#[serde(default)]
+	pub secrets:           Box<[StaticDeclaration]>,
+	/// Supervised Python worker declarations.
+	#[serde(default)]
+	pub workers:           Box<[StaticDeclaration]>,
+	/// Worker placement constraints and affinity declarations.
+	#[serde(default)]
+	pub placement:         Box<[StaticDeclaration]>,
+}
+
+/// Closed class identity used by declaration/runtime drift reports.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StaticDeclarationClass {
+	/// Soft or hard tool.
+	Tool,
+	/// Hook.
+	Hook,
+	/// Inter-extension service.
+	Service,
+	/// Inference provider.
+	Provider,
+	/// Campaign.
+	Campaign,
+	/// UI command.
+	UiCommand,
+	/// UI shortcut.
+	UiShortcut,
+	/// UI message renderer.
+	UiMessageRenderer,
+	/// UI verdict renderer.
+	UiVerdictRenderer,
+	/// UI completion source.
+	UiCompletion,
+	/// Telemetry subscription.
+	TelemetrySubscription,
+	/// Telemetry exporter.
+	TelemetryExport,
+	/// Prompt slot.
+	PromptSlot,
+	/// Credential source.
+	Credential,
+	/// Secret declaration.
+	Secret,
+	/// Supervised worker.
+	Worker,
+	/// Placement rule.
+	Placement,
+}
+
+/// Exact identities missing from or unexpectedly reported by a frozen runtime.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StaticDeclarationDrift {
+	/// Manifest rows absent from the runtime report.
+	pub missing:    Box<[(StaticDeclarationClass, Str)]>,
+	/// Runtime rows absent from the authenticated manifest.
+	pub unexpected: Box<[(StaticDeclarationClass, Str)]>,
+}
+
+impl StaticDeclarationDrift {
+	/// Returns whether static and runtime identities agree exactly.
+	pub fn is_empty(&self) -> bool {
+		self.missing.is_empty() && self.unexpected.is_empty()
+	}
+}
+
+impl StaticDeclarations {
+	/// Parses declaration tables from authenticated manifest properties.
+	pub fn from_properties(
+		properties: &BTreeMap<Str, serde_json::Value>,
+	) -> Result<Self, serde_json::Error> {
+		let mut parsed = serde_json::from_value::<Self>(serde_json::to_value(properties)?)?;
+		let mut tools = Vec::from(parsed.tools);
+		let mut hooks = Vec::from(parsed.hooks);
+		let mut services = Vec::from(parsed.services);
+		let mut providers = Vec::from(parsed.providers);
+		let mut campaigns = Vec::from(parsed.campaigns);
+		let mut commands = Vec::from(parsed.ui.commands);
+		let mut shortcuts = Vec::from(parsed.ui.shortcuts);
+		let mut message_renderers = Vec::from(parsed.ui.message_renderers);
+		let mut verdict_renderers = Vec::from(parsed.ui.verdict_renderers);
+		let mut completions = Vec::from(parsed.ui.completions);
+		let mut subscriptions = Vec::from(parsed.telemetry.subscriptions);
+		let mut exports = Vec::from(parsed.telemetry.exports);
+		let mut prompt_slots = Vec::from(parsed.prompt_slots);
+		let mut credentials = Vec::from(parsed.credentials);
+		let mut secrets = Vec::from(parsed.secrets);
+		let mut workers = Vec::from(parsed.workers);
+		let mut placement = Vec::from(parsed.placement);
+		for row in &parsed.ordered {
+			if !matches!(
+				row.trigger.as_str(),
+				"" | "static"
+					| "lazy" | "first_reach"
+					| "eager-prompt"
+					| "before_first_prompt"
+					| "eager-ui"
+					| "before_ui_input"
+			) {
+				return Err(serde::de::Error::custom(format!(
+					"unknown activation trigger `{}`",
+					row.trigger
+				)));
+			}
+			match row.kind.as_str() {
+				"soft" | "hard" | "tool" => tools.push(row.clone()),
+				"hook" => hooks.push(row.clone()),
+				"service" => services.push(row.clone()),
+				"provider" => providers.push(row.clone()),
+				"campaign" => campaigns.push(row.clone()),
+				"command" => commands.push(row.clone()),
+				"shortcut" => shortcuts.push(row.clone()),
+				"message_renderer" => message_renderers.push(row.clone()),
+				"verdict_renderer" | "renderer" => verdict_renderers.push(row.clone()),
+				"completion" => completions.push(row.clone()),
+				"telemetry" | "telemetry_subscription" => subscriptions.push(row.clone()),
+				"telemetry_export" => exports.push(row.clone()),
+				"prompt_slot" => prompt_slots.push(row.clone()),
+				"credential" => credentials.push(row.clone()),
+				"secret" => secrets.push(row.clone()),
+				"worker" => workers.push(row.clone()),
+				"placement" => placement.push(row.clone()),
+				"skills" | "rules" | "context-files" | "prompts" => {},
+				kind => {
+					return Err(serde::de::Error::custom(format!(
+						"unknown static declaration kind `{kind}`"
+					)));
+				},
+			}
+		}
+		parsed.tools = tools.into_boxed_slice();
+		parsed.hooks = hooks.into_boxed_slice();
+		parsed.services = services.into_boxed_slice();
+		parsed.providers = providers.into_boxed_slice();
+		parsed.campaigns = campaigns.into_boxed_slice();
+		parsed.ui.commands = commands.into_boxed_slice();
+		parsed.ui.shortcuts = shortcuts.into_boxed_slice();
+		parsed.ui.message_renderers = message_renderers.into_boxed_slice();
+		parsed.ui.verdict_renderers = verdict_renderers.into_boxed_slice();
+		parsed.ui.completions = completions.into_boxed_slice();
+		parsed.telemetry.subscriptions = subscriptions.into_boxed_slice();
+		parsed.telemetry.exports = exports.into_boxed_slice();
+		parsed.prompt_slots = prompt_slots.into_boxed_slice();
+		parsed.credentials = credentials.into_boxed_slice();
+		parsed.secrets = secrets.into_boxed_slice();
+		parsed.workers = workers.into_boxed_slice();
+		parsed.placement = placement.into_boxed_slice();
+		Ok(parsed)
+	}
+
+	/// Visits every declaration row without changing manifest order within a
+	/// declaration class.
+	pub fn rows(&self) -> impl Iterator<Item = &StaticDeclaration> {
+		self
+			.tools
+			.iter()
+			.chain(self.hooks.iter())
+			.chain(self.services.iter())
+			.chain(self.providers.iter())
+			.chain(self.campaigns.iter())
+			.chain(self.ui.commands.iter())
+			.chain(self.ui.shortcuts.iter())
+			.chain(self.ui.message_renderers.iter())
+			.chain(self.ui.verdict_renderers.iter())
+			.chain(self.ui.completions.iter())
+			.chain(self.telemetry.subscriptions.iter())
+			.chain(self.telemetry.exports.iter())
+			.chain(self.prompt_slots.iter())
+			.chain(self.credentials.iter())
+			.chain(self.secrets.iter())
+			.chain(self.workers.iter())
+			.chain(self.placement.iter())
+	}
+
+	/// Visits every identity with its closed declaration class.
+	pub fn identities(&self) -> impl Iterator<Item = (StaticDeclarationClass, &Str)> {
+		self
+			.tools
+			.iter()
+			.map(|row| (StaticDeclarationClass::Tool, &row.id))
+			.chain(
+				self
+					.hooks
+					.iter()
+					.map(|row| (StaticDeclarationClass::Hook, &row.id)),
+			)
+			.chain(
+				self
+					.services
+					.iter()
+					.map(|row| (StaticDeclarationClass::Service, &row.id)),
+			)
+			.chain(
+				self
+					.providers
+					.iter()
+					.map(|row| (StaticDeclarationClass::Provider, &row.id)),
+			)
+			.chain(
+				self
+					.campaigns
+					.iter()
+					.map(|row| (StaticDeclarationClass::Campaign, &row.id)),
+			)
+			.chain(
+				self
+					.ui
+					.commands
+					.iter()
+					.map(|row| (StaticDeclarationClass::UiCommand, &row.id)),
+			)
+			.chain(
+				self
+					.ui
+					.shortcuts
+					.iter()
+					.map(|row| (StaticDeclarationClass::UiShortcut, &row.id)),
+			)
+			.chain(
+				self
+					.ui
+					.message_renderers
+					.iter()
+					.map(|row| (StaticDeclarationClass::UiMessageRenderer, &row.id)),
+			)
+			.chain(
+				self
+					.ui
+					.verdict_renderers
+					.iter()
+					.map(|row| (StaticDeclarationClass::UiVerdictRenderer, &row.id)),
+			)
+			.chain(
+				self
+					.ui
+					.completions
+					.iter()
+					.map(|row| (StaticDeclarationClass::UiCompletion, &row.id)),
+			)
+			.chain(
+				self
+					.telemetry
+					.subscriptions
+					.iter()
+					.map(|row| (StaticDeclarationClass::TelemetrySubscription, &row.id)),
+			)
+			.chain(
+				self
+					.telemetry
+					.exports
+					.iter()
+					.map(|row| (StaticDeclarationClass::TelemetryExport, &row.id)),
+			)
+			.chain(
+				self
+					.prompt_slots
+					.iter()
+					.map(|row| (StaticDeclarationClass::PromptSlot, &row.id)),
+			)
+			.chain(
+				self
+					.credentials
+					.iter()
+					.map(|row| (StaticDeclarationClass::Credential, &row.id)),
+			)
+			.chain(
+				self
+					.secrets
+					.iter()
+					.map(|row| (StaticDeclarationClass::Secret, &row.id)),
+			)
+			.chain(
+				self
+					.workers
+					.iter()
+					.map(|row| (StaticDeclarationClass::Worker, &row.id)),
+			)
+			.chain(
+				self
+					.placement
+					.iter()
+					.map(|row| (StaticDeclarationClass::Placement, &row.id)),
+			)
+	}
+
+	/// Compares a frozen runtime observation against this authenticated
+	/// declaration snapshot. Runtime rows verify drift and never add authority.
+	pub fn drift(&self, runtime: &Self) -> StaticDeclarationDrift {
+		let expected = self
+			.identities()
+			.map(|(class, id)| (class, id.clone()))
+			.collect::<BTreeSet<_>>();
+		let actual = runtime
+			.identities()
+			.map(|(class, id)| (class, id.clone()))
+			.collect::<BTreeSet<_>>();
+		StaticDeclarationDrift {
+			missing:    expected.difference(&actual).cloned().collect(),
+			unexpected: actual.difference(&expected).cloned().collect(),
+		}
+	}
+
+	/// Returns whether no static CONTROL declaration is present.
+	pub fn is_empty(&self) -> bool {
+		self.rows().next().is_none()
+	}
 }
 
 #[cfg(test)]

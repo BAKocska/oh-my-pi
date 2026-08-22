@@ -1,8 +1,9 @@
-//! Extension discovery, resolution, locking, and local trust state.
+//! Extension configuration, resolution, locking, and local trust state.
 //!
-//! The module is intentionally CLI-agnostic: `crate::cli` owns argument
-//! parsing while this surface owns deterministic data transformations and
-//! durable state.
+//! The crate is intentionally CLI- and host-agnostic: argument parsing lives in
+//! the application, Environment-backed materialization lives in the
+//! environment host, and this surface owns deterministic data transformations
+//! plus durable on-disk state.
 
 pub mod config;
 pub mod doctor;
