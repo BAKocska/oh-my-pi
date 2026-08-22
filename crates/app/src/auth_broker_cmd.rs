@@ -3,7 +3,6 @@
 use std::{
 	collections::BTreeSet,
 	path::Path,
-	sync::Arc,
 	time::{SystemTime, UNIX_EPOCH},
 };
 

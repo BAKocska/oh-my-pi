@@ -19,7 +19,9 @@ pub fn preprocess_tiny_message(message: &str) -> Str {
 	let without_ansi = ANSI.replace_all(message, "");
 	let without_tags = strip_paired_tags(&without_ansi);
 	let shortened = HASH.replace_all(&without_tags, |captures: &Captures<'_>| {
-		captures.get(0).map_or_else(String::new, |matched| matched.as_str()[..7].to_owned())
+		captures
+			.get(0)
+			.map_or_else(String::new, |matched| matched.as_str()[..7].to_owned())
 	});
 	let without_code = strip_fenced_code(&shortened);
 	let cleaned = if without_code.trim().chars().count() >= 12 {

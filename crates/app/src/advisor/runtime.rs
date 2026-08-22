@@ -35,7 +35,7 @@ impl AdvisorFallbackChain {
 			if selector.is_empty() {
 				return Err(AdvisorResilienceError::EmptySelector);
 			}
-			if !retained.iter().any(|existing: &Str| existing == selector) {
+			if !retained.iter().any(|existing: &Str| *existing == selector) {
 				retained.push(Str::new(selector));
 			}
 		}
