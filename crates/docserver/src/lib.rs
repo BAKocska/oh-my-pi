@@ -11,23 +11,37 @@ pub mod client;
 pub mod connection;
 /// Long-lived document authority over standard I/O or a Unix-domain socket.
 pub mod daemon;
-/// Project-scoped Debug Adapter Protocol registry and selection.
 pub mod dap_adapter;
+/// Native DAP configuration discovery and provenance-preserving merge.
+pub mod dap_config;
 /// Bounded framed Debug Adapter Protocol transport engine.
 pub mod dap_protocol;
 /// Debug session lifecycle, trees, actions, and env-side tiers.
 pub mod dap_session;
+/// Project-scoped Debug Adapter Protocol registry and selection.
+/// Canonical cross-source diagnostics and LSP push/pull normalization.
+pub mod diagnostics;
+/// New-and-changed-only diagnostic delivery state.
+pub mod diagnostics_ledger;
 /// Session-scoped lowering of opaque edit-format proposals.
 pub mod edit_adapter;
 /// Project-scoped authority and connection-local sessions.
 pub mod environment;
 mod error;
+/// Per-document formatting option resolution.
+pub mod format_options;
 /// Portable Environment filesystem value types.
 pub mod fs;
 /// Ordered LSP lifecycle, synchronization, and passthrough primitives.
 pub mod lsp;
 /// Transactional lowering for server-initiated workspace edit requests.
 pub mod lsp_apply_edit;
+/// Environment-owned executable planning for language servers.
+pub mod lsp_binary;
+/// Native LSP catalog discovery, validation, merging, and provenance.
+pub mod lsp_config;
+/// Per-server/workspace singleton client cache and crash backoff.
+pub mod lsp_pool;
 /// Bounded child-process JSON-RPC transport and production LSP binding startup.
 pub mod lsp_process;
 pub mod lsp_registry;
@@ -83,7 +97,7 @@ pub use rebase::{
 };
 pub use types::{
 	AuthorityLock, ByteRange, DocumentHead, DocumentId, DocumentKind, DocumentPresence,
-	DocumentSnapshot, FileFingerprint, FileMetadata, LanguageId, LeaseId, LineRange, Revision,
-	ServerConfig, TransactionId,
+	DocumentSnapshot, EquivalentUriMap, FileFingerprint, FileMetadata, FileUriKey, LanguageId,
+	LeaseId, LineRange, Revision, ServerConfig, TransactionId,
 };
 pub use watch::{ActiveFileWatch, FileWatchEvent, FileWatchKind, classify_event};

@@ -4,7 +4,9 @@
 
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
+	path::{Path, PathBuf},
 	sync::Arc,
+	time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -12,15 +14,23 @@ use omp_core::{Hash32, Str};
 use omp_walker::glob::{CompiledPattern, PatternBuilder};
 use parking_lot::Mutex;
 use serde_json::Value;
+use strum::IntoStaticStr;
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tokio::{
+	sync::{Mutex as AsyncMutex, broadcast},
+	task::JoinSet,
+	time::{sleep, timeout},
+};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
 	DocumentEvent, DocumentHead, DocumentId, DocumentKind, DocumentPresence, DocumentSnapshot,
 	DocumentStore, LanguageId, LeaseId, ReadBody, ReadSelection, Revision, TransactionId,
-	lsp::{LspDocument, LspError, LspResponse, LspServer, LspTransportError, SyncPolicy},
+	lsp::{
+		LspActivity, LspDocument, LspError, LspResponse, LspResponseOutcome, LspServer,
+		LspTransportError, LspWatchedFileChange, LspWatchedFileKind, SyncPolicy,
+	},
 	transaction::{
 		FormatCoordinator, FormatRequest, FormatResult, PublishedDocument, RevertedDocument,
 	},
@@ -116,6 +126,24 @@ impl LspSelector {
 		}
 	}
 
+	/// Compiles pi-compatible extension and exact-filename routes.
+	pub fn for_file_types(file_types: &[Str]) -> Result<Self, LspRegistryError> {
+		let patterns = file_types
+			.iter()
+			.map(|file_type| {
+				let value = file_type.as_str();
+				if value.starts_with('.') {
+					Str::new(format!("**/*{value}"))
+				} else if value.contains('.') {
+					Str::new(format!("**/*.{value}"))
+				} else {
+					Str::new(format!("**/{value}"))
+				}
+			})
+			.collect();
+		Self::new(Vec::new(), vec![Str::new_static("file")], patterns)
+	}
+
 	/// Returns the language restrictions in declaration order.
 	#[must_use]
 	pub fn languages(&self) -> &[LanguageId] {
@@ -156,9 +184,13 @@ impl LspSelector {
 /// Declaration used when installing a named server binding.
 #[derive(Clone, Debug)]
 pub struct LspBindingSpec {
-	name:     Str,
-	priority: i32,
-	selector: LspSelector,
+	name:              Str,
+	priority:          i32,
+	selector:          LspSelector,
+	is_linter:         bool,
+	root_markers:      Vec<Str>,
+	idle_timeout:      Option<Duration>,
+	readiness_timeout: Duration,
 }
 
 impl LspBindingSpec {
@@ -172,7 +204,15 @@ impl LspBindingSpec {
 		if name.is_empty() {
 			return Err(LspRegistryError::InvalidBindingName);
 		}
-		Ok(Self { name: Str::new(name), priority, selector })
+		Ok(Self {
+			name: Str::new(name),
+			priority,
+			selector,
+			is_linter: false,
+			root_markers: Vec::new(),
+			idle_timeout: None,
+			readiness_timeout: Duration::from_secs(5),
+		})
 	}
 
 	/// Returns the unique binding name.
@@ -191,6 +231,56 @@ impl LspBindingSpec {
 	#[must_use]
 	pub const fn selector(&self) -> &LspSelector {
 		&self.selector
+	}
+
+	/// Marks whether this binding is a linter/checker.
+	#[must_use]
+	pub const fn with_linter(mut self, is_linter: bool) -> Self {
+		self.is_linter = is_linter;
+		self
+	}
+
+	/// Installs ancestor root markers used to exclude unrelated files.
+	#[must_use]
+	pub fn with_root_markers(mut self, root_markers: Vec<Str>) -> Self {
+		self.root_markers = root_markers;
+		self
+	}
+
+	/// Applies lifecycle timing policy from the resolved declaration.
+	#[must_use]
+	pub const fn with_lifecycle(
+		mut self,
+		idle_timeout: Option<Duration>,
+		readiness_timeout: Duration,
+	) -> Self {
+		self.idle_timeout = idle_timeout;
+		self.readiness_timeout = readiness_timeout;
+		self
+	}
+
+	/// Returns whether this is a linter/checker binding.
+	#[must_use]
+	pub const fn is_linter(&self) -> bool {
+		self.is_linter
+	}
+
+	/// Returns configured ancestor root markers.
+	#[must_use]
+	pub fn root_markers(&self) -> &[Str] {
+		&self.root_markers
+	}
+
+	fn matches(&self, uri: &Url, language: Option<&LanguageId>) -> bool {
+		if !self.selector.matches(uri, language) {
+			return false;
+		}
+		if self.root_markers.is_empty() || uri.scheme() != "file" {
+			return true;
+		}
+		uri.to_file_path()
+			.ok()
+			.is_some_and(|path| root_marker_ancestor(&path, &self.root_markers).is_some())
 	}
 }
 
@@ -333,6 +423,33 @@ pub enum LspRegistryEvent {
 	Inbound(Box<TaggedLspEvent>),
 	/// A binding lifecycle or synchronization-policy change.
 	Binding(LspBindingEvent),
+	/// Bounded discovery/startup progress.
+	Startup(LspStartupEvent),
+}
+
+/// Startup progress stage for one selected declaration.
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum LspStartupStage {
+	/// A declaration matched project markers and file routing.
+	Discovered,
+	/// Initialization has begun.
+	Starting,
+	/// rust-analyzer is still indexing.
+	Indexing,
+	/// Initialization or readiness completed.
+	Ready,
+	/// Initialization failed.
+	Failed,
+}
+
+/// One bounded startup progress event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LspStartupEvent {
+	/// Server declaration name.
+	pub name:  Str,
+	/// Current startup stage.
+	pub stage: LspStartupStage,
 }
 
 /// The kind of an installed binding change.
@@ -500,6 +617,16 @@ struct RegistryState {
 	public_versions:    HashMap<(LspBindingId, DocumentId), VecDeque<(Str, i32)>>,
 	provisional_leases: HashSet<ProvisionalLeaseKey>,
 	publication_gates:  HashMap<TransactionId, CancellationToken>,
+	diagnostic_events:  HashMap<(LspBindingId, DocumentId), DiagnosticRecord>,
+	diagnostics_ledger: crate::diagnostics_ledger::DiagnosticsLedger,
+}
+
+#[derive(Clone)]
+struct DiagnosticRecord {
+	version:     Option<i64>,
+	payload:     Hash32,
+	event:       TaggedLspEvent,
+	observed_at: Instant,
 }
 
 struct RegistryInner {
@@ -582,6 +709,199 @@ impl LspRegistry {
 		self.inner.events.subscribe()
 	}
 
+	/// Concurrently installs selected bindings and publishes bounded startup
+	/// progress. Result order matches candidate order.
+	pub async fn warm_bindings(
+		&self,
+		candidates: Vec<(LspBindingSpec, LspServer)>,
+		cancel: CancellationToken,
+	) -> Vec<Result<LspBindingId, LspRegistryError>> {
+		let count = candidates.len();
+		let mut tasks = JoinSet::new();
+		for (index, (spec, server)) in candidates.into_iter().enumerate() {
+			self.publish_startup(spec.name.clone(), LspStartupStage::Discovered);
+			let registry = self.clone();
+			let task_cancel = cancel.child_token();
+			tasks.spawn(async move {
+				registry.publish_startup(spec.name.clone(), LspStartupStage::Starting);
+				let result = registry
+					.add_binding(spec.clone(), server, task_cancel.child_token())
+					.await;
+				if let Ok(binding_id) = result {
+					let readiness = registry
+						.wait_for_binding_ready(binding_id, task_cancel)
+						.await;
+					match readiness {
+						Ok(()) => {
+							registry.publish_startup(spec.name, LspStartupStage::Ready);
+							(index, Ok(binding_id))
+						},
+						Err(error) => {
+							let _ = registry
+								.remove_binding(binding_id, CancellationToken::new())
+								.await;
+							registry.publish_startup(spec.name, LspStartupStage::Failed);
+							(index, Err(error))
+						},
+					}
+				} else {
+					registry.publish_startup(spec.name, LspStartupStage::Failed);
+					(index, result)
+				}
+			});
+		}
+		let mut results = std::iter::repeat_with(|| None)
+			.take(count)
+			.collect::<Vec<_>>();
+		while let Some(joined) = tasks.join_next().await {
+			match joined {
+				Ok((index, result)) => results[index] = Some(result),
+				Err(source) => {
+					if let Some(slot) = results.iter_mut().find(|slot| slot.is_none()) {
+						*slot = Some(Err(LspRegistryError::WarmupTask { source }));
+					}
+				},
+			}
+		}
+		results
+			.into_iter()
+			.map(|result| result.unwrap_or(Err(LspRegistryError::WarmupResultMissing)))
+			.collect()
+	}
+
+	/// Polls rust-analyzer status until a workspace is observed or the
+	/// configured readiness bound expires. Other servers are immediately ready.
+	pub async fn wait_for_binding_ready(
+		&self,
+		binding_id: LspBindingId,
+		cancel: CancellationToken,
+	) -> Result<(), LspRegistryError> {
+		let binding = self.binding(binding_id)?;
+		if binding.spec.name != "rust-analyzer" {
+			return Ok(());
+		}
+		let started = Instant::now();
+		let deadline = started + binding.spec.readiness_timeout;
+		loop {
+			if cancel.is_cancelled() {
+				return Err(LspError::Transport(LspTransportError::Cancelled).into());
+			}
+			let request = binding.server.request(
+				"rust-analyzer/analyzerStatus",
+				Bytes::from_static(b"{}"),
+				None,
+				cancel.child_token(),
+			);
+			if let Ok(Ok(response)) = timeout(Duration::from_secs(1), request).await
+				&& let LspResponseOutcome::Result(result) = response.outcome
+				&& let Ok(status) = serde_json::from_slice::<Str>(&result)
+				&& !status.starts_with("No workspaces")
+				&& started.elapsed() >= Duration::from_secs(2).min(binding.spec.readiness_timeout)
+			{
+				return Ok(());
+			}
+			if Instant::now() >= deadline {
+				return Ok(());
+			}
+			self.publish_startup(binding.spec.name.clone(), LspStartupStage::Indexing);
+			tokio::select! {
+				() = sleep(Duration::from_millis(100)) => {},
+				() = cancel.cancelled() => return Err(LspError::Transport(LspTransportError::Cancelled).into()),
+			}
+		}
+	}
+
+	/// Returns current activity for one binding.
+	pub fn binding_activity(
+		&self,
+		binding_id: LspBindingId,
+	) -> Result<LspActivity, LspRegistryError> {
+		Ok(self.binding(binding_id)?.server.activity())
+	}
+
+	/// Runs periodic inactivity reaping until cancelled.
+	#[must_use]
+	pub fn spawn_idle_reaper(
+		&self,
+		interval: Duration,
+		cancel: CancellationToken,
+	) -> tokio::task::JoinHandle<()> {
+		let registry = self.clone();
+		tokio::spawn(async move {
+			loop {
+				tokio::select! {
+					() = sleep(interval) => {
+						let _ = registry.reap_inactive(cancel.child_token()).await;
+					},
+					() = cancel.cancelled() => return,
+				}
+			}
+		})
+	}
+
+	/// Evicts bindings that exceeded their configured idle timeout and have no
+	/// pending requests.
+	pub async fn reap_inactive(
+		&self,
+		cancel: CancellationToken,
+	) -> Result<Vec<LspBindingId>, LspRegistryError> {
+		let inactive = self
+			.sorted_bindings()
+			.into_iter()
+			.filter_map(|binding| {
+				let timeout = binding.spec.idle_timeout?;
+				let activity = binding.server.activity();
+				(activity.pending_requests == 0 && activity.idle_for >= timeout).then_some(binding.id)
+			})
+			.collect::<Vec<_>>();
+		for binding_id in &inactive {
+			self
+				.remove_binding(*binding_id, cancel.child_token())
+				.await?;
+		}
+		Ok(inactive)
+	}
+
+	/// Performs protocol reload notifications before optionally replacing the
+	/// native binding lane. Callers evict config and pool caches before calling.
+	pub async fn reload_binding(
+		&self,
+		binding_id: LspBindingId,
+		settings_json: Bytes,
+		replacement: Option<LspServer>,
+		cancel: CancellationToken,
+	) -> Result<(), LspRegistryError> {
+		let binding = self.binding(binding_id)?;
+		if binding.spec.name == "rust-analyzer" {
+			let _ = binding
+				.server
+				.request(
+					"rust-analyzer/reloadWorkspace",
+					Bytes::from_static(b"{}"),
+					None,
+					cancel.child_token(),
+				)
+				.await;
+		}
+		binding
+			.server
+			.notification("workspace/didChangeConfiguration", settings_json, cancel.child_token())
+			.await?;
+		if let Some(replacement) = replacement {
+			self
+				.restart_binding(binding_id, replacement, cancel)
+				.await?;
+		}
+		Ok(())
+	}
+
+	fn publish_startup(&self, name: Str, stage: LspStartupStage) {
+		let _ = self
+			.inner
+			.events
+			.send(LspRegistryEvent::Startup(LspStartupEvent { name, stage }));
+	}
+
 	/// Defers actor-event publication until an inbound LSP response is written.
 	pub(crate) fn defer_transaction_publication(
 		&self,
@@ -632,7 +952,7 @@ impl LspRegistry {
 			HashMap::<DocumentId, (Arc<DocumentSnapshot>, Url, Option<LanguageId>, usize)>::new();
 		for (_, record) in &lease_records {
 			let (snapshot, uri) = self.current_snapshot(record.document_id).await?;
-			if !spec.selector.matches(&uri, record.language_id.as_ref()) {
+			if !spec.matches(&uri, record.language_id.as_ref()) {
 				continue;
 			}
 			documents
@@ -752,6 +1072,10 @@ impl LspRegistry {
 			state.bindings.remove(&binding_id);
 			state.binding_names.remove(binding.spec.name.as_str());
 			state.public_versions.retain(|(id, _), _| *id != binding_id);
+			state
+				.diagnostic_events
+				.retain(|(id, _), _| *id != binding_id);
+			state.diagnostics_ledger.clear();
 		}
 		self.publish_binding_event(binding_id, None, LspBindingEventKind::Stopped);
 		Ok(())
@@ -1009,7 +1333,7 @@ impl LspRegistry {
 						tokio::select! {
 							biased;
 							result = &mut release => result,
-							() = cancel.cancelled() => Err(LspTransportError::Cancelled.into()),
+							() = cancel.cancelled() => Err(LspError::Transport(LspTransportError::Cancelled).into()),
 						}
 					};
 					if let Err(error) = result {
@@ -1162,6 +1486,10 @@ impl LspRegistry {
 		{
 			let mut state = self.inner.state.lock();
 			state.public_versions.retain(|(id, _), _| *id != binding_id);
+			state
+				.diagnostic_events
+				.retain(|(id, _), _| *id != binding_id);
+			state.diagnostics_ledger.clear();
 			for (document_id, uri, version) in public_versions {
 				state
 					.public_versions
@@ -1361,11 +1689,174 @@ impl LspRegistry {
 		params_json: Bytes,
 	) -> Result<TaggedLspEvent, LspRegistryError> {
 		let event = self.tag_inbound_event(handle, method, params_json)?;
-		let _ = self
-			.inner
-			.events
-			.send(LspRegistryEvent::Inbound(Box::new(event.clone())));
+		let publish = if event.method() == "textDocument/publishDiagnostics" {
+			self.should_publish_diagnostics(&event)
+		} else {
+			true
+		};
+		if publish {
+			let _ = self
+				.inner
+				.events
+				.send(LspRegistryEvent::Inbound(Box::new(event.clone())));
+		}
 		Ok(event)
+	}
+
+	/// Waits at most `budget` for a fresh push/pull batch fenced to an exact
+	/// committed revision. Unversioned streams receive their quiescence window
+	/// inside this same wall-clock budget.
+	pub async fn await_diagnostics_for_revision(
+		&self,
+		document_id: DocumentId,
+		revision: Revision,
+		deduplicate: bool,
+		budget: Duration,
+	) -> Vec<TaggedLspEvent> {
+		let has_bindings = self
+			.inner
+			.state
+			.lock()
+			.leases
+			.values()
+			.any(|lease| lease.document_id == document_id && !lease.binding_ids.is_empty());
+		if !has_bindings {
+			return Vec::new();
+		}
+		let deadline = Instant::now() + budget;
+		loop {
+			let events = self.drain_diagnostics_for_revision(document_id, revision, deduplicate);
+			if !events.is_empty() || Instant::now() >= deadline {
+				return events;
+			}
+			sleep(Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())))
+				.await;
+		}
+	}
+
+	/// Applies the persistent new-and-changed-only delivery ledger.
+	pub fn diagnostic_delta(
+		&self,
+		uri: Str,
+		diagnostics: Vec<crate::diagnostics::Diagnostic>,
+		deduplicate: bool,
+	) -> crate::diagnostics_ledger::DiagnosticDelta {
+		self
+			.inner
+			.state
+			.lock()
+			.diagnostics_ledger
+			.update(uri, diagnostics, deduplicate)
+	}
+
+	/// Returns the negotiated position encoding for a diagnostic event.
+	#[must_use]
+	pub fn diagnostic_position_encoding(
+		&self,
+		event: &TaggedLspEvent,
+	) -> crate::position::PositionEncoding {
+		let state = self.inner.state.lock();
+		let language = state
+			.leases
+			.values()
+			.find(|lease| {
+				event
+					.document_id()
+					.is_some_and(|document_id| lease.document_id == document_id)
+			})
+			.and_then(|lease| lease.language_id.as_ref());
+		state
+			.bindings
+			.get(&event.binding_id())
+			.and_then(|binding| {
+				event
+					.document_uri()
+					.map(|uri| binding.server.sync_policy(uri, language).position_encoding)
+			})
+			.unwrap_or_default()
+	}
+
+	/// Drains diagnostics observed for one exact committed revision. Records
+	/// from formatter/save intermediates and stale revisions are discarded.
+	/// Unversioned streams are accepted only after a 250 ms quiescence window
+	/// and are fenced to the newest public version for that binding/document.
+	/// When `deduplicate` is enabled, byte-identical final batches collapse
+	/// across bindings.
+	pub fn drain_diagnostics_for_revision(
+		&self,
+		document_id: DocumentId,
+		revision: Revision,
+		deduplicate: bool,
+	) -> Vec<TaggedLspEvent> {
+		let mut state = self.inner.state.lock();
+		let keys = state
+			.diagnostic_events
+			.keys()
+			.filter(|(_, candidate)| *candidate == document_id)
+			.copied()
+			.collect::<Vec<_>>();
+		let mut seen = HashSet::new();
+		let mut events = Vec::new();
+		for key in keys {
+			let Some(record) = state.diagnostic_events.get(&key) else {
+				continue;
+			};
+			let event_revision = record.event.revision().or_else(|| {
+				(record.observed_at.elapsed() >= Duration::from_millis(250))
+					.then(|| {
+						let version = state.public_versions.get(&key)?.back()?.1;
+						state
+							.bindings
+							.get(&key.0)?
+							.server
+							.revision_for_version(record.event.document_uri()?, version)
+					})
+					.flatten()
+			});
+			if event_revision != Some(revision) {
+				if event_revision.is_some() {
+					state.diagnostic_events.remove(&key);
+				}
+				continue;
+			}
+			let Some(mut record) = state.diagnostic_events.remove(&key) else {
+				continue;
+			};
+			record.event.revision = Some(revision);
+			if !deduplicate || seen.insert(record.payload) {
+				events.push(record.event);
+			}
+		}
+		events.sort_by_key(|event| event.binding_id());
+		events
+	}
+
+	fn should_publish_diagnostics(&self, event: &TaggedLspEvent) -> bool {
+		let Some(document_id) = event.document_id() else {
+			return true;
+		};
+		let version = serde_json::from_slice::<Value>(event.params_json())
+			.ok()
+			.and_then(|value| value.get("version").and_then(Value::as_i64));
+		let next = DiagnosticRecord {
+			version,
+			payload: Hash32::sum(event.params_json()),
+			event: event.clone(),
+			observed_at: Instant::now(),
+		};
+		let mut state = self.inner.state.lock();
+		let key = (event.binding_id(), document_id);
+		if let Some(current) = state.diagnostic_events.get(&key) {
+			if current.payload == next.payload {
+				return false;
+			}
+			if matches!((current.version, next.version), (Some(current), Some(next)) if next < current)
+			{
+				return false;
+			}
+		}
+		state.diagnostic_events.insert(key, next);
+		true
 	}
 
 	fn binding_document_ids(&self, binding_id: LspBindingId) -> HashSet<DocumentId> {
@@ -1470,12 +1961,7 @@ impl LspRegistry {
 			}
 			let desired = bindings
 				.iter()
-				.filter(|binding| {
-					binding
-						.spec
-						.selector
-						.matches(&uri, record.language_id.as_ref())
-				})
+				.filter(|binding| binding.spec.matches(&uri, record.language_id.as_ref()))
 				.map(|binding| binding.id)
 				.collect::<Vec<_>>();
 			for id in &desired {
@@ -1655,7 +2141,7 @@ impl LspRegistry {
 		self
 			.sorted_bindings()
 			.into_iter()
-			.filter(|binding| binding.spec.selector.matches(uri, language_id))
+			.filter(|binding| binding.spec.matches(uri, language_id))
 			.collect()
 	}
 
@@ -1841,12 +2327,7 @@ impl LspRegistry {
 		};
 		let bindings = all_bindings
 			.into_iter()
-			.filter(|binding| {
-				binding
-					.spec
-					.selector
-					.matches(&base_uri, base_language_id.as_ref())
-			})
+			.filter(|binding| binding.spec.matches(&base_uri, base_language_id.as_ref()))
 			.collect::<Vec<_>>();
 		let shadow_document = format_shadow_document(request);
 		let shadow_uri = format_shadow_uri(request);
@@ -2055,7 +2536,15 @@ impl LspRegistry {
 					.server
 					.format_document(
 						lsp_document(&snapshot, uri, language_id),
-						Bytes::from_static(br#"{"tabSize":4,"insertSpaces":true}"#),
+						Bytes::from(
+							serde_json::to_vec(&crate::format_options::resolve(
+								std::str::from_utf8(&content).unwrap_or_default(),
+								None,
+							))
+							.map_err(|error| LspRegistryError::InvalidInboundJson {
+								reason: Str::new(error.to_string()),
+							})?,
+						),
 						cancel.child_token(),
 					)
 					.await?;
@@ -2080,7 +2569,10 @@ impl LspRegistry {
 				.synchronize(lsp_document(&snapshot, uri, language_id), cancel.child_token())
 				.await?;
 		}
-		Ok(content)
+		let text =
+			std::str::from_utf8(&content).map_err(|_| LspRegistryError::FormattingUnavailable)?;
+		let options = crate::format_options::resolve(text, None);
+		Ok(Bytes::copy_from_slice(crate::format_options::enforce(text, options).as_bytes()))
 	}
 
 	async fn publish_committed_inner(
@@ -2108,6 +2600,32 @@ impl LspRegistry {
 					.did_save(lsp_document(&snapshot, document.uri(), language_id), cancel.child_token())
 					.await?;
 			}
+		}
+		let mut changes = Vec::with_capacity(2);
+		if let Some(previous) = document.previous_uri().filter(|uri| *uri != document.uri()) {
+			changes.push(LspWatchedFileChange {
+				uri:  previous.clone(),
+				kind: LspWatchedFileKind::Deleted,
+			});
+			changes.push(LspWatchedFileChange {
+				uri:  document.uri().clone(),
+				kind: LspWatchedFileKind::Created,
+			});
+		} else {
+			let kind = if document.head().presence() == DocumentPresence::Missing {
+				LspWatchedFileKind::Deleted
+			} else if document.head().revision().sequence() <= 1 {
+				LspWatchedFileKind::Created
+			} else {
+				LspWatchedFileKind::Changed
+			};
+			changes.push(LspWatchedFileChange { uri: document.uri().clone(), kind });
+		}
+		for binding in bindings.iter().cloned() {
+			binding
+				.server
+				.did_change_watched_files(&changes, cancel.child_token())
+				.await?;
 		}
 		Ok(())
 	}
@@ -2354,11 +2872,55 @@ const fn lsp_document<'a>(
 	LspDocument { snapshot, uri, language_id }
 }
 
+/// Finds the nearest ancestor containing any configured root marker. Glob
+/// markers are matched only against direct children of each ancestor.
+#[must_use]
+pub fn root_marker_ancestor(file: &Path, markers: &[Str]) -> Option<PathBuf> {
+	let mut directory = if file.is_dir() {
+		file.to_owned()
+	} else {
+		file.parent()?.to_owned()
+	};
+	loop {
+		if root_has_marker(&directory, markers) {
+			return Some(directory);
+		}
+		if !directory.pop() {
+			return None;
+		}
+	}
+}
+
+fn root_has_marker(directory: &Path, markers: &[Str]) -> bool {
+	markers.iter().any(|marker| {
+		let marker = marker.as_str();
+		if marker == "." {
+			return true;
+		}
+		if !marker.contains('*') {
+			return directory.join(marker).exists();
+		}
+		let Ok(pattern) = PatternBuilder::new(marker).literal_separator(true).build() else {
+			return false;
+		};
+		let Ok(entries) = std::fs::read_dir(directory) else {
+			return false;
+		};
+		entries.filter_map(Result::ok).any(|entry| {
+			entry
+				.file_name()
+				.to_str()
+				.is_some_and(|name| pattern.matches(name))
+		})
+	})
+}
+
 fn binding_order(left: &Binding, right: &Binding) -> std::cmp::Ordering {
 	right
 		.spec
 		.priority
 		.cmp(&left.spec.priority)
+		.then_with(|| left.spec.is_linter.cmp(&right.spec.is_linter))
 		.then_with(|| left.spec.name.cmp(&right.spec.name))
 		.then_with(|| left.id.cmp(&right.id))
 }
@@ -2368,6 +2930,7 @@ fn binding_info_order(left: &LspBindingInfo, right: &LspBindingInfo) -> std::cmp
 		.spec
 		.priority
 		.cmp(&left.spec.priority)
+		.then_with(|| left.spec.is_linter.cmp(&right.spec.is_linter))
 		.then_with(|| left.spec.name.cmp(&right.spec.name))
 		.then_with(|| left.id.cmp(&right.id))
 }
@@ -2462,6 +3025,16 @@ pub enum LspRegistryError {
 	/// No selected server advertised an operation capable of formatting bytes.
 	#[error("no selected LSP binding provides formatting")]
 	FormattingUnavailable,
+	/// A warmup task terminated before reporting its binding result.
+	#[error("LSP warmup task failed: {source}")]
+	WarmupTask {
+		/// Join failure.
+		#[source]
+		source: tokio::task::JoinError,
+	},
+	/// A warmup task completed without filling its ordered result slot.
+	#[error("LSP warmup result is missing")]
+	WarmupResultMissing,
 	/// The document store rejected the operation.
 	#[error(transparent)]
 	Store(#[from] crate::Error),
@@ -2939,6 +3512,30 @@ mod tests {
 	}
 
 	#[test]
+	fn file_types_route_extensions_and_exact_filenames() {
+		let selector =
+			LspSelector::for_file_types(&[Str::new_static(".rs"), Str::new_static("Dockerfile")])
+				.unwrap();
+		assert!(selector.matches(&Url::parse("file:///project/src/lib.rs").unwrap(), None));
+		assert!(selector.matches(&Url::parse("file:///project/Dockerfile").unwrap(), None));
+		assert!(!selector.matches(&Url::parse("file:///project/Dockerfile.dev").unwrap(), None));
+	}
+
+	#[test]
+	fn root_markers_walk_ancestors_and_match_one_level_globs() {
+		let root = tempfile::tempdir().unwrap();
+		std::fs::write(root.path().join("workspace.cabal"), b"").unwrap();
+		let nested = root.path().join("src/nested");
+		std::fs::create_dir_all(&nested).unwrap();
+		let found =
+			root_marker_ancestor(&nested.join("Main.hs"), &[Str::new_static("*.cabal")]).unwrap();
+		assert_eq!(found, root.path());
+		assert!(
+			root_marker_ancestor(&nested.join("Main.hs"), &[Str::new_static("go.mod")]).is_none()
+		);
+	}
+
+	#[test]
 	fn bindings_order_by_priority_name_then_identity() {
 		let mut bindings = [binding(3, "zeta", 10), binding(2, "alpha", 10), binding(1, "low", 1)];
 		bindings.sort_by(binding_order);
@@ -2949,6 +3546,14 @@ mod tests {
 				.collect::<Vec<_>>(),
 			vec![2, 3, 1],
 		);
+
+		let mut primary = binding(4, "z-primary", 10);
+		let mut linter = binding(5, "a-linter", 10);
+		linter.spec = linter.spec.with_linter(true);
+		let mut same_priority = [linter, primary.clone()];
+		same_priority.sort_by(binding_order);
+		assert_eq!(same_priority[0].id, primary.id);
+		primary.spec = primary.spec.with_linter(false);
 	}
 
 	#[test]

@@ -98,21 +98,29 @@ impl AppliedEdits {
 /// Validates that edits are sorted, non-overlapping, unambiguous, and in
 /// bounds.
 pub fn validate_edits(base_len: u64, edits: &[ByteEdit]) -> Result<()> {
-	let mut previous: Option<ByteRange> = None;
+	let mut previous: Option<&ByteEdit> = None;
 	for edit in edits {
 		let range = edit.range.validate(base_len)?;
 		if let Some(prior) = previous {
-			let starts_not_increasing = range.start() <= prior.start();
-			let overlaps_prior = range.start() < prior.end();
+			if byte_identical_duplicate(prior, edit) {
+				continue;
+			}
+			let prior_range = prior.range;
+			let starts_not_increasing = range.start() <= prior_range.start();
+			let overlaps_prior = range.start() < prior_range.end();
 			if starts_not_increasing || overlaps_prior {
 				return Err(invalid_edits(
 					"byte edits must be sorted, non-overlapping, and have distinct starts",
 				));
 			}
 		}
-		previous = Some(range);
+		previous = Some(edit);
 	}
 	Ok(())
+}
+
+fn byte_identical_duplicate(previous: &ByteEdit, edit: &ByteEdit) -> bool {
+	!edit.range.is_empty() && previous == edit
 }
 
 /// Applies validated base-coordinate edits with one allocation for the final
@@ -120,8 +128,7 @@ pub fn validate_edits(base_len: u64, edits: &[ByteEdit]) -> Result<()> {
 pub fn apply_edits(base: &Bytes, edits: &[ByteEdit]) -> Result<AppliedEdits> {
 	let base_len = usize_to_u64(base.len())?;
 	validate_edits(base_len, edits)?;
-	let mapped = edits
-		.iter()
+	let mapped = unique_edits(edits)
 		.map(|edit| {
 			Ok(MappedEdit {
 				start:       u64_to_usize(edit.range.start())?,
@@ -177,7 +184,7 @@ pub fn rebase_edits(
 	let mut mapped = Vec::with_capacity(edits.len());
 	let mut conflicts = Vec::new();
 
-	for edit in edits {
+	for edit in unique_edits(edits) {
 		if let Some((start, end)) = map_range(edit.range, base, head, &equal_regions) {
 			mapped.push(MappedEdit { start, end, replacement: &edit.replacement });
 		} else if conflicts.last() != Some(&edit.range) {
@@ -200,6 +207,17 @@ pub fn rebase_content(
 ) -> Result<std::result::Result<AppliedEdits, RebaseConflict>> {
 	let edits = canonical_edits(base, proposed)?;
 	rebase_edits(base, head, &edits)
+}
+
+fn unique_edits(edits: &[ByteEdit]) -> impl Iterator<Item = &ByteEdit> {
+	let mut previous: Option<&ByteEdit> = None;
+	edits.iter().filter(move |edit| {
+		if previous.is_some_and(|prior| byte_identical_duplicate(prior, edit)) {
+			return false;
+		}
+		previous = Some(edit);
+		true
+	})
 }
 
 #[derive(Clone, Copy)]
@@ -419,6 +437,27 @@ mod tests {
 			.expect("valid edits")
 			.expect_err("repeated alignment is ambiguous");
 		assert_eq!(conflict.ranges(), &[ByteRange::new(1, 2).unwrap()]);
+	}
+
+	#[test]
+	fn duplicate_nonempty_edits_collapse_before_overlap_validation() {
+		let base = Bytes::from_static(b"abcdef");
+		let duplicate = edit(1, 4, b"XYZ");
+		let applied =
+			apply_edits(&base, &[duplicate.clone(), duplicate]).expect("duplicates collapse");
+		assert_eq!(&applied.content()[..], b"aXYZef");
+		assert_eq!(applied.changed_ranges(), &[ByteRange::new(1, 4).unwrap()]);
+	}
+
+	#[test]
+	fn duplicate_insertions_remain_ordered_distinct_edits() {
+		let base = Bytes::from_static(b"ab");
+		assert!(apply_edits(&base, &[edit(1, 1, b"x"), edit(1, 1, b"x")]).is_err());
+	}
+
+	#[test]
+	fn same_range_with_different_bytes_remains_a_conflicting_overlap() {
+		assert!(validate_edits(6, &[edit(1, 4, b"x"), edit(1, 4, b"y")]).is_err());
 	}
 
 	#[test]

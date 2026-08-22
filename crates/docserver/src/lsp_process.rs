@@ -33,6 +33,7 @@ use url::Url;
 use crate::{
 	Environment, LanguageId,
 	lsp::{LspError, LspServer, LspTransport, LspTransportError},
+	lsp_binary::{BinaryPlatform, LspBinaryError, resolve_lsp_binary},
 	lsp_registry::{
 		LspBindingHandle, LspBindingId, LspBindingSpec, LspRegistry, LspRegistryError, LspSelector,
 	},
@@ -152,6 +153,21 @@ pub struct LspProcessConfig {
 	/// Optional exact JSON value supplied as `initializationOptions`.
 	#[serde(default)]
 	pub initialization_options: Option<Value>,
+	/// Settings sent after initialization.
+	#[serde(default)]
+	pub settings:               Option<Value>,
+	/// Ancestor project-root markers.
+	#[serde(default)]
+	pub root_markers:           Vec<Str>,
+	/// Whether this binding is a linter/checker.
+	#[serde(default)]
+	pub is_linter:              bool,
+	/// Optional inactivity shutdown bound.
+	#[serde(default)]
+	pub idle_timeout_ms:        Option<u64>,
+	/// Workspace readiness bound.
+	#[serde(default = "default_readiness_timeout_ms")]
+	pub readiness_timeout_ms:   u64,
 	/// Bounded transport and shutdown settings.
 	#[serde(default)]
 	pub transport:              LspTransportSettings,
@@ -184,8 +200,18 @@ impl LspProcessConfig {
 			self.selector.schemes.clone(),
 			self.selector.path_patterns.clone(),
 		)?;
-		Ok(LspBindingSpec::new(self.name.as_str(), self.priority, selector)?)
+		Ok(LspBindingSpec::new(self.name.as_str(), self.priority, selector)?
+			.with_linter(self.is_linter)
+			.with_root_markers(self.root_markers.clone())
+			.with_lifecycle(
+				self.idle_timeout_ms.map(Duration::from_millis),
+				Duration::from_millis(self.readiness_timeout_ms),
+			))
 	}
+}
+
+const fn default_readiness_timeout_ms() -> u64 {
+	5_000
 }
 
 /// Failure while loading, starting, operating, or stopping a process binding.
@@ -229,6 +255,16 @@ pub enum LspProcessError {
 		setting: &'static str,
 		/// Largest accepted timeout in milliseconds.
 		max:     u64,
+	},
+	/// Executable planning failed inside Environment-owned path authority.
+	#[error(transparent)]
+	Binary(#[from] LspBinaryError),
+	/// Post-initialize settings could not be encoded.
+	#[error("cannot encode LSP settings: {source}")]
+	SerializeConfig {
+		/// JSON serialization failure.
+		#[source]
+		source: serde_json::Error,
 	},
 	/// The child did not complete initialize before the configured deadline.
 	#[error("LSP initialize request timed out")]
@@ -291,9 +327,28 @@ impl LspProcess {
 		cancel: CancellationToken,
 	) -> Result<Self, LspProcessError> {
 		let spec = config.binding_spec()?;
-		let mut command = Command::new(&config.executable);
+		let local_roots = environment
+			.root_uri()
+			.to_file_path()
+			.ok()
+			.into_iter()
+			.collect::<Vec<_>>();
+		let platform = if cfg!(windows) {
+			BinaryPlatform::Windows
+		} else {
+			BinaryPlatform::Posix
+		};
+		let resolved = resolve_lsp_binary(
+			config.executable.to_string_lossy().as_ref(),
+			&config.args,
+			&local_roots,
+			std::env::var_os("PATH").as_deref(),
+			std::process::id(),
+			platform,
+		)?;
+		let mut command = Command::new(&resolved.executable);
 		command
-			.args(config.args.iter().map(Str::as_str))
+			.args(resolved.args.iter().map(Str::as_str))
 			.envs(
 				config
 					.env
@@ -380,6 +435,25 @@ impl LspProcess {
 					.remove_binding(binding_id, CancellationToken::new())
 					.await;
 				return Err(error.into());
+			}
+			if let Some(settings) = config.settings {
+				let settings_result = serde_json::to_vec(&serde_json::json!({ "settings": settings }))
+					.map(Bytes::from)
+					.map_err(|source| LspProcessError::SerializeConfig { source });
+				let settings_result = match settings_result {
+					Ok(params) => transport
+						.notify("workspace/didChangeConfiguration", params, cancel.child_token())
+						.await
+						.map_err(LspProcessError::from),
+					Err(error) => Err(error),
+				};
+				if let Err(error) = settings_result {
+					let _ = environment
+						.lsp()
+						.remove_binding(binding_id, CancellationToken::new())
+						.await;
+					return Err(error);
+				}
 			}
 			Ok::<_, LspProcessError>(binding_id)
 		}
@@ -1078,27 +1152,41 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
 	max_header_bytes: usize,
 	max_message_bytes: usize,
 ) -> Result<Bytes, LspFrameError> {
-	let mut header = Vec::with_capacity(max_header_bytes.min(1024));
+	let mut scanned = Vec::with_capacity(max_header_bytes.min(1024));
+	let mut discarded = 0_usize;
+	let mut header_start = None;
 	let mut byte = [0_u8; 1];
 	loop {
 		match reader.read(&mut byte).await {
-			Ok(0) if header.is_empty() => return Err(LspFrameError::Eof),
+			Ok(0) if scanned.is_empty() => return Err(LspFrameError::Eof),
 			Ok(0) => return Err(LspFrameError::HeaderEof),
-			Ok(_) => {
-				if header.len() == max_header_bytes {
-					return Err(LspFrameError::HeaderTooLarge);
-				}
-				if header.len() == header.capacity() {
-					header.reserve_exact(1);
-				}
-				header.push(byte[0]);
-			},
+			Ok(_) => scanned.push(byte[0]),
 			Err(source) => return Err(LspFrameError::ReadHeader { source }),
 		}
-		if header.ends_with(b"\r\n\r\n") {
-			break;
+		if header_start.is_none() {
+			header_start = find_content_length_start(&scanned);
+		}
+		if let Some(start) = header_start {
+			if scanned.len().saturating_sub(start) > max_header_bytes {
+				return Err(LspFrameError::HeaderTooLarge);
+			}
+			if scanned[start..].ends_with(b"\r\n\r\n") {
+				scanned.drain(..start);
+				break;
+			}
+		} else {
+			let retain = b"content-length:".len().saturating_sub(1);
+			if scanned.len() > retain {
+				let remove = scanned.len() - retain;
+				scanned.drain(..remove);
+				discarded = discarded.saturating_add(remove);
+				if discarded > max_header_bytes {
+					return Err(LspFrameError::HeaderTooLarge);
+				}
+			}
 		}
 	}
+	let header = scanned;
 	let header_text = std::str::from_utf8(&header).map_err(|_| LspFrameError::HeaderUtf8)?;
 	if !header.is_ascii() {
 		return Err(LspFrameError::HeaderNonAscii);
@@ -1131,6 +1219,17 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
 		.await
 		.map_err(|source| LspFrameError::ReadPayload { source })?;
 	Ok(Bytes::from(payload))
+}
+
+fn find_content_length_start(bytes: &[u8]) -> Option<usize> {
+	const PREFIX: &[u8] = b"content-length:";
+	if bytes.len() < PREFIX.len() {
+		return None;
+	}
+	(0..=bytes.len() - PREFIX.len()).find(|&start| {
+		(start == 0 || bytes[start - 1] == b'\n')
+			&& bytes[start..start + PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+	})
 }
 
 fn parse_fields(payload: &[u8]) -> Result<HashMap<String, Box<RawValue>>, LspTransportError> {
@@ -1426,7 +1525,15 @@ async fn dispatch_response(
 		}]))
 		.map(Bytes::from)
 		.map_err(|error| RpcError::invalid_params(error.to_string())),
-		"window/workDoneProgress/create" => Ok(Bytes::from_static(b"null")),
+		"window/workDoneProgress/create"
+		| "workspace/semanticTokens/refresh"
+		| "workspace/codeLens/refresh"
+		| "workspace/inlayHint/refresh"
+		| "workspace/diagnostic/refresh"
+		| "workspace/foldingRange/refresh"
+		| "workspace/inlineValue/refresh" => Ok(Bytes::from_static(b"null")),
+		"window/showMessageRequest" => Ok(Bytes::from_static(b"null")),
+		"window/showDocument" => Ok(Bytes::from_static(b"{\"success\":false}")),
 		_ => Err(RpcError::method_not_found(method)),
 	}
 }
@@ -1474,6 +1581,19 @@ mod tests {
 			initialize_timeout_ms:  100,
 			shutdown_timeout_ms:    100,
 		}
+	}
+
+	#[tokio::test]
+	async fn resynchronizes_after_bounded_stray_stdout() {
+		let (mut writer, mut reader) = duplex(1024);
+		tokio::spawn(async move {
+			writer
+				.write_all(b"server banner\r\nnot protocol\r\nContent-Length: 2\r\n\r\n{}")
+				.await
+				.unwrap();
+		});
+		let payload = read_frame(&mut reader, 256, 256).await.unwrap();
+		assert_eq!(payload, Bytes::from_static(b"{}"));
 	}
 
 	#[tokio::test]

@@ -1,6 +1,7 @@
 use std::{
 	collections::{HashMap, VecDeque},
 	sync::Arc,
+	time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -508,6 +509,27 @@ impl SelectorPattern {
 	}
 }
 
+/// LSP watched-file change kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum LspWatchedFileKind {
+	/// File creation.
+	Created = 1,
+	/// File content change.
+	Changed = 2,
+	/// File deletion.
+	Deleted = 3,
+}
+
+/// One committed filesystem change broadcast to language servers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LspWatchedFileChange {
+	/// Canonical file URI.
+	pub uri:  Url,
+	/// Change kind.
+	pub kind: LspWatchedFileKind,
+}
+
 /// Borrowed exact document input for synchronization-sensitive operations.
 #[derive(Clone, Copy)]
 pub struct LspDocument<'a> {
@@ -574,6 +596,33 @@ struct ServerInner {
 	transport: Arc<dyn LspTransport>,
 	lane:      AsyncMutex<()>,
 	state:     Mutex<ServerState>,
+	activity:  Mutex<ServerActivity>,
+}
+
+struct ServerActivity {
+	last:    Instant,
+	pending: usize,
+}
+
+/// Current request activity used by readiness and idle reaping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LspActivity {
+	/// Time since the most recent request or notification began/completed.
+	pub idle_for:         Duration,
+	/// Requests currently waiting for a server response.
+	pub pending_requests: usize,
+}
+
+struct RequestActivity<'a> {
+	server: &'a LspServer,
+}
+
+impl Drop for RequestActivity<'_> {
+	fn drop(&mut self) {
+		let mut activity = self.server.inner.activity.lock();
+		activity.pending = activity.pending.saturating_sub(1);
+		activity.last = Instant::now();
+	}
 }
 
 /// Ordered LSP synchronization and raw-request coordinator.
@@ -605,6 +654,7 @@ impl LspServer {
 				transport,
 				lane: AsyncMutex::new(()),
 				state: Mutex::new(ServerState { capabilities, documents: HashMap::new() }),
+				activity: Mutex::new(ServerActivity { last: Instant::now(), pending: 0 }),
 			}),
 		})
 	}
@@ -612,6 +662,24 @@ impl LspServer {
 	/// Returns an owned copy of the exact initialize capability JSON.
 	pub fn capabilities_json(&self) -> Bytes {
 		self.inner.state.lock().capabilities.raw_json().clone()
+	}
+
+	/// Returns the current pending-request count and inactivity duration.
+	#[must_use]
+	pub fn activity(&self) -> LspActivity {
+		let activity = self.inner.activity.lock();
+		LspActivity { idle_for: activity.last.elapsed(), pending_requests: activity.pending }
+	}
+
+	fn begin_request(&self) -> RequestActivity<'_> {
+		let mut activity = self.inner.activity.lock();
+		activity.pending = activity.pending.saturating_add(1);
+		activity.last = Instant::now();
+		RequestActivity { server: self }
+	}
+
+	fn mark_activity(&self) {
+		self.inner.activity.lock().last = Instant::now();
 	}
 
 	/// Resolves the current selector-scoped synchronization policy.
@@ -898,6 +966,31 @@ impl LspServer {
 		apply_edit_result(document.snapshot.content(), result, policy.public.position_encoding)
 	}
 
+	/// Broadcasts committed workspace file changes after document
+	/// synchronization and save notifications.
+	pub async fn did_change_watched_files(
+		&self,
+		changes: &[LspWatchedFileChange],
+		cancel: CancellationToken,
+	) -> Result<(), LspError> {
+		let changes = changes
+			.iter()
+			.map(|change| {
+				json!({
+					"uri": change.uri.as_str(),
+					"type": change.kind as u8,
+				})
+			})
+			.collect::<Vec<_>>();
+		self
+			.notification(
+				"workspace/didChangeWatchedFiles",
+				encode_json(&json!({ "changes": changes }))?,
+				cancel,
+			)
+			.await
+	}
+
 	/// Sends an arbitrary request after exact document synchronization when
 	/// provided.
 	pub async fn request(
@@ -923,6 +1016,7 @@ impl LspServer {
 		if cancel.is_cancelled() {
 			return Err(LspTransportError::Cancelled.into());
 		}
+		let _activity = self.begin_request();
 		let outcome = match self
 			.inner
 			.transport
@@ -961,11 +1055,13 @@ impl LspServer {
 		if cancel.is_cancelled() {
 			return Err(LspTransportError::Cancelled.into());
 		}
+		self.mark_activity();
 		self
 			.inner
 			.transport
 			.notify(method, params_json, cancel)
 			.await?;
+		self.mark_activity();
 		Ok(())
 	}
 
@@ -1246,11 +1342,13 @@ impl LspServer {
 		if cancel.is_cancelled() {
 			return Err(LspTransportError::Cancelled.into());
 		}
+		self.mark_activity();
 		self
 			.inner
 			.transport
 			.notify(method, encode_json(&params)?, cancel)
 			.await?;
+		self.mark_activity();
 		Ok(())
 	}
 
@@ -1263,6 +1361,7 @@ impl LspServer {
 		if cancel.is_cancelled() {
 			return Err(LspTransportError::Cancelled.into());
 		}
+		let _activity = self.begin_request();
 		let result = self
 			.inner
 			.transport

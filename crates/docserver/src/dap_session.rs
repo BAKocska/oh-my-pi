@@ -5,7 +5,7 @@ use std::{
 	collections::{BTreeMap, VecDeque},
 	sync::{
 		Arc, Weak,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,17 +14,22 @@ use async_trait::async_trait;
 use omp_core::Str;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Map, Value, json};
+use strum::{EnumString, IntoStaticStr};
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::{
+	process::Child,
+	sync::{Mutex as AsyncMutex, broadcast},
+};
 
-use crate::dap_protocol::{DapInbound, DapProtocol, DapProtocolError};
+use crate::dap_protocol::{DapInbound, DapProtocol, DapProtocolError, SpawnedDap};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Stable DAP lifecycle state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
 pub enum DapSessionState {
 	/// Adapter process and initialize request are starting.
 	Launching,
@@ -39,7 +44,8 @@ pub enum DapSessionState {
 }
 
 /// Debug action exposed to policy and tool layers.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, EnumString, Eq, Hash, PartialEq)]
+#[strum(serialize_all = "snake_case")]
 pub enum DapAction {
 	/// Start a program.
 	Launch,
@@ -62,16 +68,20 @@ pub enum DapAction {
 	/// Resume execution.
 	Continue,
 	/// Step over.
+	#[strum(serialize = "step_over", serialize = "next")]
 	StepOver,
 	/// Step into.
+	#[strum(serialize = "step_in", serialize = "stepIn")]
 	StepIn,
 	/// Step out.
+	#[strum(serialize = "step_out", serialize = "stepOut")]
 	StepOut,
 	/// Suspend execution.
 	Pause,
 	/// Evaluate an expression.
 	Evaluate,
 	/// Inspect stack frames.
+	#[strum(serialize = "stack_trace", serialize = "stackTrace")]
 	StackTrace,
 	/// Inspect threads.
 	Threads,
@@ -82,12 +92,15 @@ pub enum DapAction {
 	/// Inspect instructions.
 	Disassemble,
 	/// Read process memory.
+	#[strum(serialize = "read_memory", serialize = "readMemory")]
 	ReadMemory,
 	/// Write process memory.
+	#[strum(serialize = "write_memory", serialize = "writeMemory")]
 	WriteMemory,
 	/// Inspect modules.
 	Modules,
 	/// Inspect loaded sources.
+	#[strum(serialize = "loaded_sources", serialize = "loadedSources")]
 	LoadedSources,
 	/// Send an adapter extension request.
 	CustomRequest,
@@ -114,9 +127,7 @@ impl DapAction {
 	#[must_use]
 	pub const fn approval_tier(self) -> DapApprovalTier {
 		match self {
-			Self::DataBreakpointInfo
-			| Self::Evaluate
-			| Self::StackTrace
+			Self::StackTrace
 			| Self::Threads
 			| Self::Scopes
 			| Self::Variables
@@ -139,6 +150,8 @@ impl DapAction {
 			| Self::StepIn
 			| Self::StepOut
 			| Self::Pause
+			| Self::Evaluate
+			| Self::DataBreakpointInfo
 			| Self::WriteMemory
 			| Self::CustomRequest
 			| Self::Terminate => DapApprovalTier::Execution,
@@ -187,6 +200,9 @@ pub enum DapSessionError {
 	/// This action requires a higher-level operation.
 	#[error("debug action {0:?} has no direct protocol command")]
 	UnsupportedAction(DapAction),
+	/// Adapter process ownership failed.
+	#[error("DAP adapter process failed")]
+	Process(#[from] std::io::Error),
 	/// Parent-child registration would create a cycle.
 	#[error("debug session tree cannot contain a cycle")]
 	SessionTreeCycle,
@@ -226,10 +242,16 @@ pub struct DapSession {
 	id:                  Str,
 	adapter:             Str,
 	protocol:            DapProtocol,
+	process:             Option<Arc<AsyncMutex<Child>>>,
 	state:               Mutex<DapSessionState>,
 	capabilities:        RwLock<Value>,
 	output:              Mutex<VecDeque<u8>>,
 	last_activity_ms:    AtomicU64,
+	revision:            AtomicU64,
+	event_sequence:      AtomicU64,
+	read_granted:        AtomicBool,
+	execute_granted:     AtomicBool,
+	event_byte_limit:    AtomicU64,
 	parent:              Mutex<Option<Weak<Self>>>,
 	children:            Mutex<Vec<Weak<Self>>>,
 	breakpoint_mutation: AsyncMutex<()>,
@@ -248,15 +270,54 @@ impl DapSession {
 		arguments: Map<String, Value>,
 		handler: Option<Arc<dyn DapReverseRequestHandler>>,
 	) -> Result<Arc<Self>, DapSessionError> {
+		Self::start_owned(id, adapter, protocol, None, attach, arguments, handler).await
+	}
+
+	/// Starts a session while retaining ownership of its spawned adapter.
+	pub async fn start_spawned(
+		id: impl AsRef<str>,
+		adapter: impl AsRef<str>,
+		spawned: SpawnedDap,
+		attach: bool,
+		arguments: Map<String, Value>,
+		handler: Option<Arc<dyn DapReverseRequestHandler>>,
+	) -> Result<Arc<Self>, DapSessionError> {
+		Self::start_owned(
+			id,
+			adapter,
+			spawned.protocol,
+			Some(spawned.child),
+			attach,
+			arguments,
+			handler,
+		)
+		.await
+	}
+
+	async fn start_owned(
+		id: impl AsRef<str>,
+		adapter: impl AsRef<str>,
+		protocol: DapProtocol,
+		process: Option<Arc<AsyncMutex<Child>>>,
+		attach: bool,
+		arguments: Map<String, Value>,
+		handler: Option<Arc<dyn DapReverseRequestHandler>>,
+	) -> Result<Arc<Self>, DapSessionError> {
 		let initialized = protocol.subscribe();
 		let session = Arc::new(Self {
 			id: Str::new(id.as_ref()),
 			adapter: Str::new(adapter.as_ref()),
 			protocol,
+			process,
 			state: Mutex::new(DapSessionState::Launching),
 			capabilities: RwLock::new(Value::Null),
 			output: Mutex::new(VecDeque::with_capacity(MAX_OUTPUT_BYTES)),
 			last_activity_ms: AtomicU64::new(now_ms()),
+			revision: AtomicU64::new(1),
+			event_sequence: AtomicU64::new(0),
+			read_granted: AtomicBool::new(false),
+			execute_granted: AtomicBool::new(false),
+			event_byte_limit: AtomicU64::new(0),
 			parent: Mutex::new(None),
 			children: Mutex::new(Vec::new()),
 			breakpoint_mutation: AsyncMutex::new(()),
@@ -404,6 +465,57 @@ impl DapSession {
 		self.capabilities.read().clone()
 	}
 
+	/// Returns the current revision fence.
+	#[must_use]
+	pub fn revision(&self) -> u64 {
+		self.revision.load(Ordering::Acquire)
+	}
+
+	/// Installs immutable capabilities and the session event byte ceiling.
+	pub fn set_wire_grants(&self, read: bool, execute: bool, event_byte_limit: u32) {
+		self.read_granted.store(read, Ordering::Release);
+		self.execute_granted.store(execute, Ordering::Release);
+		self
+			.event_byte_limit
+			.store(u64::from(event_byte_limit), Ordering::Release);
+	}
+
+	/// Reports whether the launch contract granted this action tier.
+	#[must_use]
+	pub fn grants(&self, tier: DapApprovalTier) -> bool {
+		match tier {
+			DapApprovalTier::ReadOnly => self.read_granted.load(Ordering::Acquire),
+			DapApprovalTier::Execution => self.execute_granted.load(Ordering::Acquire),
+		}
+	}
+
+	/// Returns the bounded event payload ceiling set at launch.
+	#[must_use]
+	pub fn event_byte_limit(&self) -> usize {
+		usize::try_from(self.event_byte_limit.load(Ordering::Acquire)).unwrap_or(usize::MAX)
+	}
+
+	/// Advances and returns the current revision after a completed action.
+	pub fn advance_revision(&self) -> u64 {
+		self
+			.revision
+			.fetch_add(1, Ordering::AcqRel)
+			.saturating_add(1)
+	}
+
+	/// Allocates the next contiguous output/event sequence.
+	pub fn next_event_sequence(&self) -> u64 {
+		self
+			.event_sequence
+			.fetch_add(1, Ordering::AcqRel)
+			.saturating_add(1)
+	}
+
+	/// Subscribes to adapter events before starting an action.
+	pub fn subscribe(&self) -> broadcast::Receiver<DapInbound> {
+		self.protocol.subscribe()
+	}
+
 	/// Executes one direct action; callers can inspect `approval_tier` first.
 	pub async fn execute(
 		&self,
@@ -510,6 +622,12 @@ impl DapSession {
 			*self.state.lock() = DapSessionState::Terminated;
 		}
 		self.protocol.shutdown();
+		if let Some(process) = &self.process {
+			let mut process = process.lock().await;
+			if process.try_wait()?.is_none() {
+				process.kill().await?;
+			}
+		}
 		Ok(())
 	}
 
@@ -618,7 +736,11 @@ mod tests {
 
 	#[test]
 	fn policy_tiers_are_environment_data() {
+		assert_eq!("variables".parse::<DapAction>().unwrap(), DapAction::Variables);
+		assert_eq!("readMemory".parse::<DapAction>().unwrap(), DapAction::ReadMemory);
+		assert_eq!("stackTrace".parse::<DapAction>().unwrap(), DapAction::StackTrace);
 		assert_eq!(DapAction::Variables.approval_tier(), DapApprovalTier::ReadOnly);
+		assert_eq!(DapAction::Evaluate.approval_tier(), DapApprovalTier::Execution);
 		assert_eq!(DapAction::Continue.approval_tier(), DapApprovalTier::Execution);
 		assert_eq!(DapAction::SetBreakpoint.approval_tier(), DapApprovalTier::Execution);
 	}
@@ -631,10 +753,16 @@ mod tests {
 			id:                  sf!("test"),
 			adapter:             sf!("test"),
 			protocol:            DapProtocol::from_streams(reader, writer),
+			process:             None,
 			state:               Mutex::new(DapSessionState::Running),
 			capabilities:        RwLock::new(Value::Null),
 			output:              Mutex::new(VecDeque::new()),
 			last_activity_ms:    AtomicU64::new(0),
+			revision:            AtomicU64::new(1),
+			event_sequence:      AtomicU64::new(0),
+			read_granted:        AtomicBool::new(false),
+			execute_granted:     AtomicBool::new(false),
+			event_byte_limit:    AtomicU64::new(0),
 			parent:              Mutex::new(None),
 			children:            Mutex::new(Vec::new()),
 			breakpoint_mutation: AsyncMutex::new(()),

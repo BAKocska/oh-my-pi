@@ -1,4 +1,5 @@
 use std::{
+	collections::HashMap,
 	fmt, fs, io,
 	num::{NonZeroU64, NonZeroUsize},
 	path::{Path, PathBuf},
@@ -165,6 +166,150 @@ impl LanguageId {
 impl fmt::Display for LanguageId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.as_str())
+	}
+}
+
+/// Canonical lookup identity for one local file URI.
+///
+/// POSIX paths retain case and backslashes exactly. Windows drive paths are
+/// slash-normalized and ASCII case-folded, matching the filesystem lookup
+/// semantics used by language servers on Windows without aliasing distinct
+/// POSIX files.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FileUriKey(Str);
+
+impl FileUriKey {
+	/// Canonicalizes a parsed local file URI for equivalent lookup.
+	pub fn new(uri: &Url) -> Result<Self> {
+		if uri.scheme() != "file"
+			|| uri
+				.host_str()
+				.is_some_and(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost"))
+			|| uri.query().is_some()
+			|| uri.fragment().is_some()
+		{
+			return Err(Error::InvalidTarget {
+				target: Str::new(uri.as_str()),
+				reason: sf!("target is not a plain local file URI"),
+			});
+		}
+		let path = uri.to_file_path().map_err(|()| Error::InvalidTarget {
+			target: Str::new(uri.as_str()),
+			reason: sf!("target is not a local file URI"),
+		})?;
+		let path_text = path.to_string_lossy();
+		let normalized = windows_drive_path(&path_text).map_or_else(
+			|| {
+				Url::from_file_path(&path)
+					.map(|canonical| Str::new(canonical.as_str()))
+					.map_err(|()| Error::InvalidTarget {
+						target: Str::new(uri.as_str()),
+						reason: sf!("file URI path cannot be represented canonically"),
+					})
+			},
+			|windows| {
+				let mut canonical =
+					Url::parse("file:///").expect("the canonical file URI base is valid");
+				canonical.set_path(&windows);
+				Ok(Str::new(canonical.as_str()))
+			},
+		)?;
+		Ok(Self(normalized))
+	}
+
+	/// Parses and canonicalizes a local file URI.
+	pub fn parse(uri: &str) -> Result<Self> {
+		let parsed = Url::parse(uri).map_err(|_| Error::InvalidTarget {
+			target: Str::new(uri),
+			reason: sf!("target is not a valid file URI"),
+		})?;
+		Self::new(&parsed)
+	}
+
+	/// Converts one local path into its percent-encoded canonical lookup key.
+	pub fn from_path(path: &Path) -> Result<Self> {
+		let uri = Url::from_file_path(path).map_err(|()| Error::InvalidTarget {
+			target: Str::new(path.to_string_lossy()),
+			reason: sf!("path cannot be represented as a file URI"),
+		})?;
+		Self::new(&uri)
+	}
+
+	/// Returns the canonical percent-encoded file URI.
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		self.0.as_str()
+	}
+}
+
+fn windows_drive_path(path: &str) -> Option<String> {
+	let bytes = path.as_bytes();
+	let drive = match bytes {
+		[b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => 1,
+		[drive, b':', ..] if drive.is_ascii_alphabetic() => 0,
+		_ => return None,
+	};
+	let mut normalized = String::with_capacity(path.len() + usize::from(drive == 0));
+	normalized.push('/');
+	for character in path[drive..].chars() {
+		normalized.push(if character == '\\' {
+			'/'
+		} else {
+			character.to_ascii_lowercase()
+		});
+	}
+	Some(normalized)
+}
+
+/// Map keyed by canonical local file URI identity.
+#[derive(Clone, Debug)]
+pub struct EquivalentUriMap<V> {
+	entries: HashMap<FileUriKey, V>,
+}
+
+impl<V> Default for EquivalentUriMap<V> {
+	fn default() -> Self {
+		Self { entries: HashMap::new() }
+	}
+}
+
+impl<V> EquivalentUriMap<V> {
+	/// Creates an empty equivalent-URI map.
+	#[must_use]
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Inserts a value under the canonical identity of `uri`.
+	pub fn insert(&mut self, uri: &Url, value: V) -> Result<Option<V>> {
+		Ok(self.entries.insert(FileUriKey::new(uri)?, value))
+	}
+
+	/// Returns the value for any spelling equivalent to `uri`.
+	pub fn get(&self, uri: &Url) -> Result<Option<&V>> {
+		Ok(self.entries.get(&FileUriKey::new(uri)?))
+	}
+
+	/// Reports whether any equivalent spelling of `uri` is present.
+	pub fn contains_key(&self, uri: &Url) -> Result<bool> {
+		Ok(self.entries.contains_key(&FileUriKey::new(uri)?))
+	}
+
+	/// Removes and returns the value for any equivalent spelling of `uri`.
+	pub fn remove(&mut self, uri: &Url) -> Result<Option<V>> {
+		Ok(self.entries.remove(&FileUriKey::new(uri)?))
+	}
+
+	/// Returns the number of canonical file identities.
+	#[must_use]
+	pub fn len(&self) -> usize {
+		self.entries.len()
+	}
+
+	/// Reports whether no canonical file identity is stored.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.entries.is_empty()
 	}
 }
 
@@ -782,6 +927,45 @@ mod tests {
 	use tempfile::TempDir;
 
 	use super::*;
+
+	#[test]
+	fn file_uri_keys_normalize_percent_encoding_and_windows_spelling() {
+		let table = [
+			("file:///C:/Users/Dev/My%20Project/Main.RS", "file:///c:/users/dev/my%20project/main.rs"),
+			(
+				"file:///c:%5Cusers%5Cdev%5Cmy%20project%5Cmain.rs",
+				"file:///c:/users/dev/my%20project/main.rs",
+			),
+			("file:///tmp/My%20Project/%23main.rs", "file:///tmp/My%20Project/%23main.rs"),
+			("file:///tmp/raw space.rs", "file:///tmp/raw%20space.rs"),
+		];
+		for (input, expected) in table {
+			assert_eq!(
+				FileUriKey::parse(input)
+					.expect("canonical file URI")
+					.as_str(),
+				expected
+			);
+		}
+	}
+
+	#[test]
+	fn equivalent_uri_map_folds_windows_case_and_slashes_but_not_posix_case() {
+		let mut map = EquivalentUriMap::new();
+		let windows = Url::parse("file:///C:/Work/Source/Main.rs").unwrap();
+		map.insert(&windows, 7).unwrap();
+		assert_eq!(
+			map.get(&Url::parse("file:///c:%5Cwork%5Csource%5CMAIN.RS").unwrap())
+				.unwrap(),
+			Some(&7)
+		);
+
+		let upper = Url::parse("file:///tmp/Source.rs").unwrap();
+		let lower = Url::parse("file:///tmp/source.rs").unwrap();
+		map.insert(&upper, 9).unwrap();
+		assert_eq!(map.get(&lower).unwrap(), None);
+		assert_eq!(map.len(), 2);
+	}
 
 	#[test]
 	fn cloned_config_cannot_reenter_its_authority() {

@@ -14,10 +14,11 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-	ByteEdit, ByteRange, DocumentHead, DocumentId, DocumentKind, DocumentLocator, DocumentPresence,
-	DocumentSnapshot, EnvironmentSession, Error, FileKind, FollowSymlinks, LanguageId, LeaseId,
-	LineRange, PathMetadata, PortablePermissions, ReadBody, ReadSelection, Revision, SymlinkTarget,
-	SymlinkTargetForm, SymlinkTargetKind, TransactionId,
+	ByteEdit, ByteRange, DapAction, DapApprovalTier, DapInbound, DapProtocol, DapSession,
+	DapSessionError, DapTransport, DocumentHead, DocumentId, DocumentKind, DocumentLocator,
+	DocumentPresence, DocumentSnapshot, EnvironmentSession, Error, FileKind, FollowSymlinks,
+	LanguageId, LeaseId, LineRange, PathMetadata, PortablePermissions, ReadBody, ReadSelection,
+	Revision, SymlinkTarget, SymlinkTargetForm, SymlinkTargetKind, TransactionId,
 	lsp::{LspError, LspResponseOutcome, LspTransportError, TextDocumentSyncKind},
 	lsp_registry::{
 		DocumentEventStreamError, LspBindingId, LspRegistryError, LspRegistryEvent,
@@ -192,6 +193,22 @@ pub async fn registry_event_frame(
 				document,
 			})
 		},
+		LspRegistryEvent::Startup(event) => {
+			let stage: &'static str = event.stage.into();
+			let params_json = serde_json::to_vec(&serde_json::json!({
+				"name": event.name.as_str(),
+				"stage": stage,
+			}))
+			.ok()
+			.map(Bytes::from)?;
+			proto::server_frame::Body::LspEvent(proto::LspEvent {
+				server_id: Bytes::new(),
+				method: "omp/lspStartup".to_owned(),
+				params_json,
+				document: None,
+				revision: None,
+			})
+		},
 	};
 	Some(proto::ServerFrame { request_id: 0, body: Some(body) })
 }
@@ -360,6 +377,380 @@ async fn dispatch(
 		Request::SetPermissions(request) => set_permissions(session, request, cancellation)
 			.await
 			.map(Response::PermissionsSet),
+		Request::DapLaunch(request) => dap_start(
+			session,
+			request.adapter,
+			request.workspace_uri,
+			request.configuration_json,
+			request.capabilities,
+			request.max_event_bytes,
+			false,
+			&events,
+			event_frame_limit,
+			cancellation,
+		)
+		.await
+		.map(Response::DapSession),
+		Request::DapAttach(request) => dap_start(
+			session,
+			request.adapter,
+			request.workspace_uri,
+			request.configuration_json,
+			request.capabilities,
+			request.max_event_bytes,
+			true,
+			&events,
+			event_frame_limit,
+			cancellation,
+		)
+		.await
+		.map(Response::DapSession),
+		Request::DapAction(request) => {
+			dap_action(session, request, &events, event_frame_limit, cancellation)
+				.await
+				.map(Response::DapAction)
+		},
+	}
+}
+
+const MAX_DAP_CONFIGURATION_BYTES: usize = 1024 * 1024;
+const MAX_DAP_EVENT_BYTES: u32 = 1024 * 1024;
+const MAX_DAP_RESPONSE_BYTES: u32 = 4 * 1024 * 1024;
+const DAP_SESSION_GENERATION: u64 = 1;
+
+async fn dap_start(
+	connection: &EnvironmentSession,
+	adapter_name: String,
+	workspace_uri: String,
+	configuration_json: Bytes,
+	capabilities: Vec<i32>,
+	max_event_bytes: u32,
+	attach: bool,
+	events: &flume::Sender<proto::ServerFrame>,
+	event_frame_limit: usize,
+	cancellation: CancellationToken,
+) -> DispatchResult<proto::DapSessionResponse> {
+	if adapter_name.is_empty() {
+		return Err(Failure::invalid("DAP adapter name must not be empty"));
+	}
+	if configuration_json.len() > MAX_DAP_CONFIGURATION_BYTES {
+		return Err(Failure::resource("DAP configuration exceeds its byte ceiling"));
+	}
+	if max_event_bytes == 0 || max_event_bytes > MAX_DAP_EVENT_BYTES {
+		return Err(Failure::invalid("DAP event byte ceiling is out of range"));
+	}
+	let workspace = parse_file_uri(&workspace_uri)?;
+	if workspace != *connection.environment().root_uri() {
+		return Err(Failure::precondition(
+			"DAP workspace must equal this Environment's project root",
+		));
+	}
+	let mut read = false;
+	let mut execute = false;
+	for capability in capabilities {
+		match proto::DapCapability::try_from(capability)
+			.map_err(|_| Failure::invalid("unknown DAP capability"))?
+		{
+			proto::DapCapability::Read => read = true,
+			proto::DapCapability::Execute => execute = true,
+			proto::DapCapability::Unspecified => {
+				return Err(Failure::invalid("unspecified DAP capability is not grantable"));
+			},
+		}
+	}
+	if !execute {
+		return Err(Failure::precondition("launch and attach require the DAP execute capability"));
+	}
+	let adapter = connection
+		.environment()
+		.dap_adapters()
+		.select_attach(Some(&adapter_name), None)
+		.ok_or_else(|| Failure::not_found("configured DAP adapter was not found"))?;
+	if !matches!(adapter.spec.transport, DapTransport::Stdio) {
+		return Err(Failure::precondition(
+			"the selected DAP adapter does not use the available stdio transport",
+		));
+	}
+	let supplied: serde_json::Value = serde_json::from_slice(&configuration_json)
+		.map_err(|_| Failure::invalid("DAP configuration must be valid JSON"))?;
+	let supplied = supplied
+		.as_object()
+		.ok_or_else(|| Failure::invalid("DAP configuration must be a JSON object"))?;
+	let arguments = adapter.spec.merged_arguments(attach, supplied);
+	let root = workspace
+		.to_file_path()
+		.map_err(|()| Failure::invalid("DAP workspace is not a local file URI"))?;
+	let spawned = DapProtocol::spawn_stdio(adapter.spec.command.as_str(), &adapter.spec.args, &root)
+		.map_err(|error| Failure::internal(error.to_string()))?;
+	let session_id: [u8; 16] = rand::random();
+	let registry_id = omp_core::hex::encode_n(&session_id);
+	let debug_session = tokio::select! {
+		biased;
+		() = cancellation.cancelled() => return Err(Failure::cancelled("DAP launch cancelled")),
+		result = DapSession::start_spawned(
+			registry_id.as_str(),
+			adapter.spec.name.as_str(),
+			spawned,
+			attach,
+			arguments,
+			None,
+		) => result.map_err(Failure::from_dap)?,
+	};
+	debug_session.set_wire_grants(read, execute, max_event_bytes);
+	let adapter_capabilities_json = serde_json::to_vec(&debug_session.capabilities())
+		.map(Bytes::from)
+		.map_err(|_| Failure::internal("DAP capabilities could not be encoded"))?;
+	if adapter_capabilities_json.len() > usize::try_from(max_event_bytes).unwrap_or(usize::MAX) {
+		let _ = debug_session.terminate().await;
+		return Err(Failure::resource("DAP adapter capabilities exceed the requested byte ceiling"));
+	}
+	connection
+		.environment()
+		.dap_sessions()
+		.insert(Arc::clone(&debug_session));
+	let session_ref = dap_session_ref(&session_id, &debug_session);
+	let mut started_body = serde_json::to_vec(&serde_json::json!({
+		"state": Into::<&'static str>::into(debug_session.state()),
+	}))
+	.map_err(|_| Failure::internal("DAP lifecycle event could not be encoded"))?;
+	if started_body.len() > usize::try_from(max_event_bytes).unwrap_or(usize::MAX) {
+		started_body.clear();
+	}
+	let started_body = Bytes::from(started_body);
+	send_dap_frame(
+		events,
+		event_frame_limit,
+		proto::server_frame::Body::DapEvent(proto::DapEvent {
+			session:   Some(session_ref.clone()),
+			sequence:  debug_session.next_event_sequence(),
+			event:     "started".to_owned(),
+			body_json: started_body,
+		}),
+	)
+	.await?;
+	Ok(proto::DapSessionResponse {
+		session: Some(session_ref),
+		granted_capabilities: [
+			read.then_some(proto::DapCapability::Read as i32),
+			execute.then_some(proto::DapCapability::Execute as i32),
+		]
+		.into_iter()
+		.flatten()
+		.collect(),
+		adapter_capabilities_json,
+	})
+}
+
+async fn dap_action(
+	connection: &EnvironmentSession,
+	request: proto::DapActionRequest,
+	events: &flume::Sender<proto::ServerFrame>,
+	event_frame_limit: usize,
+	cancellation: CancellationToken,
+) -> DispatchResult<proto::DapActionResponse> {
+	let session_ref = required(request.session, "DAP session")?;
+	if session_ref.session_id.len() != 16 {
+		return Err(Failure::invalid("DAP session identity must be exactly 16 bytes"));
+	}
+	let session_id: [u8; 16] = session_ref
+		.session_id
+		.as_ref()
+		.try_into()
+		.expect("DAP session identity length was validated");
+	let registry_id = omp_core::hex::encode_n(&session_id);
+	let debug_session = connection
+		.environment()
+		.dap_sessions()
+		.get(registry_id.as_str())
+		.map_err(Failure::from_dap)?;
+	if session_ref.generation != DAP_SESSION_GENERATION {
+		return Err(Failure::precondition("DAP session generation is stale"));
+	}
+	let current_revision = debug_session.revision();
+	if request.expected_revision != current_revision || session_ref.revision != current_revision {
+		return Err(Failure::precondition("DAP session revision is stale"));
+	}
+	if request.max_response_bytes == 0 || request.max_response_bytes > MAX_DAP_RESPONSE_BYTES {
+		return Err(Failure::invalid("DAP response byte ceiling is out of range"));
+	}
+	let action = request
+		.command
+		.parse::<DapAction>()
+		.map_err(|_| Failure::invalid("unknown DAP action command"))?;
+	let tier = action.approval_tier();
+	if !debug_session.grants(tier) {
+		return Err(Failure::precondition(
+			"DAP session was not granted the capability required by this action",
+		));
+	}
+	let required_capability = proto::DapCapability::try_from(request.required_capability)
+		.map_err(|_| Failure::invalid("unknown required DAP capability"))?;
+	let expected_capability = match tier {
+		DapApprovalTier::ReadOnly => proto::DapCapability::Read,
+		DapApprovalTier::Execution => proto::DapCapability::Execute,
+	};
+	if required_capability != expected_capability {
+		return Err(Failure::precondition(
+			"DAP action capability does not match the authoritative action tier",
+		));
+	}
+	let arguments = if request.arguments_json.is_empty() {
+		serde_json::json!({})
+	} else {
+		serde_json::from_slice(&request.arguments_json)
+			.map_err(|_| Failure::invalid("DAP action arguments must be valid JSON"))?
+	};
+	let mut inbound = debug_session.subscribe();
+	let result = tokio::select! {
+		biased;
+		() = cancellation.cancelled() => return Err(Failure::cancelled("DAP action cancelled")),
+		result = execute_dap_action(&debug_session, action, arguments) => result?,
+	};
+	let revision = debug_session.advance_revision();
+	let response_ref = proto::DapSessionRef {
+		session_id: Bytes::copy_from_slice(&session_id),
+		generation: DAP_SESSION_GENERATION,
+		revision,
+	};
+	while let Ok(event) = inbound.try_recv() {
+		forward_dap_inbound(events, event_frame_limit, &debug_session, &response_ref, event).await?;
+	}
+	if action == DapAction::Output {
+		send_dap_output(
+			events,
+			event_frame_limit,
+			&debug_session,
+			&response_ref,
+			"console",
+			debug_session.output_snapshot(),
+		)
+		.await?;
+	}
+	let body_json = serde_json::to_vec(&result)
+		.map(Bytes::from)
+		.map_err(|_| Failure::internal("DAP action response could not be encoded"))?;
+	if body_json.len() > usize::try_from(request.max_response_bytes).unwrap_or(usize::MAX) {
+		return Err(Failure::resource("DAP action response exceeds the requested byte ceiling"));
+	}
+	Ok(proto::DapActionResponse {
+		session: Some(response_ref),
+		success: true,
+		body_json,
+		message: String::new(),
+	})
+}
+
+async fn execute_dap_action(
+	session: &Arc<DapSession>,
+	action: DapAction,
+	arguments: serde_json::Value,
+) -> DispatchResult<serde_json::Value> {
+	match action {
+		DapAction::Output => Ok(serde_json::json!({})),
+		DapAction::Terminate => {
+			session.terminate().await.map_err(Failure::from_dap)?;
+			Ok(serde_json::json!({}))
+		},
+		DapAction::Sessions => Ok(serde_json::json!([{
+			"id": session.id(),
+			"adapter": session.adapter(),
+			"state": Into::<&'static str>::into(session.state()),
+			"revision": session.revision(),
+		}])),
+		_ => session
+			.execute(action, arguments)
+			.await
+			.map_err(Failure::from_dap),
+	}
+}
+
+async fn forward_dap_inbound(
+	events: &flume::Sender<proto::ServerFrame>,
+	event_frame_limit: usize,
+	session: &DapSession,
+	session_ref: &proto::DapSessionRef,
+	inbound: DapInbound,
+) -> DispatchResult<()> {
+	match inbound {
+		DapInbound::Event { event, body } if event == "output" => {
+			let category = body
+				.get("category")
+				.and_then(serde_json::Value::as_str)
+				.unwrap_or("console");
+			let output = body
+				.get("output")
+				.and_then(serde_json::Value::as_str)
+				.unwrap_or_default()
+				.as_bytes()
+				.to_vec();
+			send_dap_output(events, event_frame_limit, session, session_ref, category, output).await
+		},
+		DapInbound::Event { event, body } => {
+			let mut body_json = serde_json::to_vec(&body)
+				.map_err(|_| Failure::internal("DAP event body could not be encoded"))?;
+			if body_json.len() > session.event_byte_limit() {
+				body_json.clear();
+			}
+			send_dap_frame(
+				events,
+				event_frame_limit,
+				proto::server_frame::Body::DapEvent(proto::DapEvent {
+					session:   Some(session_ref.clone()),
+					sequence:  session.next_event_sequence(),
+					event:     event.into(),
+					body_json: Bytes::from(body_json),
+				}),
+			)
+			.await
+		},
+		DapInbound::ReverseRequest { .. } => Ok(()),
+	}
+}
+
+async fn send_dap_output(
+	events: &flume::Sender<proto::ServerFrame>,
+	event_frame_limit: usize,
+	session: &DapSession,
+	session_ref: &proto::DapSessionRef,
+	category: &str,
+	mut output: Vec<u8>,
+) -> DispatchResult<()> {
+	let truncated = output.len() > session.event_byte_limit();
+	output.truncate(session.event_byte_limit());
+	send_dap_frame(
+		events,
+		event_frame_limit,
+		proto::server_frame::Body::DapOutput(proto::DapOutput {
+			session: Some(session_ref.clone()),
+			sequence: session.next_event_sequence(),
+			category: category.to_owned(),
+			output: Bytes::from(output),
+			truncated,
+		}),
+	)
+	.await
+}
+
+async fn send_dap_frame(
+	events: &flume::Sender<proto::ServerFrame>,
+	event_frame_limit: usize,
+	body: proto::server_frame::Body,
+) -> DispatchResult<()> {
+	let frame = proto::ServerFrame { request_id: 0, body: Some(body) };
+	if frame.encoded_len() > event_frame_limit {
+		return Err(Failure::resource("DAP event exceeds the document frame ceiling"));
+	}
+	events
+		.send_async(frame)
+		.await
+		.map_err(|_| Failure::cancelled("DAP event consumer disconnected"))
+}
+
+fn dap_session_ref(session_id: &[u8; 16], session: &DapSession) -> proto::DapSessionRef {
+	proto::DapSessionRef {
+		session_id: Bytes::copy_from_slice(session_id),
+		generation: DAP_SESSION_GENERATION,
+		revision:   session.revision(),
 	}
 }
 
@@ -671,7 +1062,9 @@ async fn commit_transaction(
 			build_operations(build_session, operations, build_cancellation).await
 		})
 		.await;
-	Ok(transaction_outcome_to_proto(outcome.as_ref()))
+	let mut response = transaction_outcome_to_proto(outcome.as_ref());
+	enrich_transaction_diagnostics(session, outcome.as_ref(), &mut response).await;
+	Ok(response)
 }
 
 async fn build_operations(
@@ -1542,6 +1935,159 @@ fn fallback_to_proto(fallback: &SummaryFallback) -> proto::DocumentSummaryUnavai
 	}
 }
 
+async fn enrich_transaction_diagnostics(
+	session: &EnvironmentSession,
+	outcome: &TransactionOutcome,
+	response: &mut proto::CommitTransactionResponse,
+) {
+	let operations = match outcome {
+		TransactionOutcome::Committed { operations, .. } => operations.as_slice(),
+		TransactionOutcome::PartiallyCommitted { committed_operations, .. } => {
+			committed_operations.as_slice()
+		},
+		TransactionOutcome::Rejected { .. } => return,
+	};
+	let response_operations = match response.outcome.as_mut() {
+		Some(proto::commit_transaction_response::Outcome::Committed(committed)) => {
+			&mut committed.operations
+		},
+		Some(proto::commit_transaction_response::Outcome::PartiallyCommitted(partial)) => {
+			&mut partial.committed_operations
+		},
+		_ => return,
+	};
+	let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+	let mut pending = operations
+		.iter()
+		.map(|operation| operation.operation_index())
+		.collect::<std::collections::HashSet<_>>();
+	while !pending.is_empty() {
+		for operation in operations {
+			if !pending.contains(&operation.operation_index()) {
+				continue;
+			}
+			let events = session.environment().lsp().drain_diagnostics_for_revision(
+				operation.head().document_id(),
+				operation.head().revision(),
+				true,
+			);
+			if events.is_empty() {
+				continue;
+			}
+			let mut diagnostics = Vec::new();
+			let mut encodings = Vec::new();
+			for event in events {
+				let encoding = session
+					.environment()
+					.lsp()
+					.diagnostic_position_encoding(&event);
+				if let Ok((_, _, batch)) =
+					crate::diagnostics::parse_push(event.params_json(), event.binding_name())
+				{
+					encodings.extend(
+						batch
+							.iter()
+							.map(|diagnostic| (diagnostic.source.clone(), diagnostic.range, encoding)),
+					);
+					diagnostics.extend(batch);
+				}
+			}
+			let diagnostics = crate::diagnostics::normalize(diagnostics);
+			let diagnostics = session
+				.environment()
+				.lsp()
+				.diagnostic_delta(Str::from(operation.uri().as_str()), diagnostics, true)
+				.changed;
+			let content = session
+				.environment()
+				.store()
+				.read(
+					DocumentLocator::Document(operation.head().document_id()),
+					Some(operation.head().revision()),
+					ReadSelection::Whole,
+				)
+				.await
+				.ok()
+				.and_then(|read| match read.body() {
+					ReadBody::Whole(content) => Some(content.clone()),
+					ReadBody::Slices(_) => None,
+				});
+			if let Some(result) = response_operations
+				.iter_mut()
+				.find(|result| result.operation_index == operation.operation_index())
+				&& let Some(batch) = result.diagnostics.as_mut()
+			{
+				batch.diagnostics = diagnostics
+					.into_iter()
+					.take(50)
+					.map(|diagnostic| {
+						let encoding = encodings
+							.iter()
+							.find(|(source, range, _)| {
+								diagnostic.source.contains(source.as_str()) && *range == diagnostic.range
+							})
+							.map(|(_, _, encoding)| *encoding)
+							.unwrap_or_default();
+						proto::CommittedDiagnostic {
+							range:    content.as_ref().and_then(|content| {
+								diagnostic_byte_range(content, diagnostic.range, encoding)
+							}),
+							severity: match diagnostic.severity {
+								crate::diagnostics::Severity::Error => proto::DiagnosticSeverity::Error,
+								crate::diagnostics::Severity::Warning => proto::DiagnosticSeverity::Warning,
+								crate::diagnostics::Severity::Information => {
+									proto::DiagnosticSeverity::Information
+								},
+								crate::diagnostics::Severity::Hint => proto::DiagnosticSeverity::Hint,
+							} as i32,
+							code:     diagnostic.code.unwrap_or_default().into(),
+							source:   diagnostic.source.into(),
+							message:  diagnostic.message.into(),
+						}
+					})
+					.collect();
+				batch.omitted = 0;
+				batch.complete = true;
+			}
+			pending.remove(&operation.operation_index());
+		}
+		if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+	for result in response_operations {
+		if pending.contains(&result.operation_index)
+			&& let Some(batch) = result.diagnostics.as_mut()
+		{
+			batch.complete = false;
+		}
+	}
+}
+
+fn diagnostic_byte_range(
+	content: &[u8],
+	range: crate::diagnostics::Range,
+	encoding: crate::position::PositionEncoding,
+) -> Option<proto::ByteRange> {
+	let text = std::str::from_utf8(content).ok()?;
+	let start = encoding
+		.position_to_offset(text, crate::position::Position {
+			line:      range.start.line,
+			character: range.start.character,
+		})
+		.ok()
+		.and_then(|offset| u64::try_from(offset).ok())?;
+	let end = encoding
+		.position_to_offset(text, crate::position::Position {
+			line:      range.end.line,
+			character: range.end.character,
+		})
+		.ok()
+		.and_then(|offset| u64::try_from(offset).ok())?;
+	(start <= end).then_some(proto::ByteRange { start, end })
+}
+
 fn transaction_outcome_to_proto(outcome: &TransactionOutcome) -> proto::CommitTransactionResponse {
 	let outcome = match outcome {
 		TransactionOutcome::Committed { transaction_id, operations } => {
@@ -1608,6 +2154,28 @@ fn operation_results_to_proto(operations: &[OperationResult]) -> Vec<proto::Oper
 			previous_uri:    operation
 				.previous_uri()
 				.map_or_else(String::new, Url::to_string),
+			diagnostics:     Some(proto::CommittedDiagnosticBatch {
+				document:           Some(proto::DocumentRef {
+					id:  Bytes::copy_from_slice(operation.head().document_id().as_bytes()),
+					uri: operation.uri().to_string(),
+				}),
+				committed_revision: Some(revision_to_proto(operation.head().revision())),
+				diagnostics:        Vec::new(),
+				complete:           true,
+				omitted:            0,
+			}),
+			format_drift:    Some(proto::ClientFormatDrift {
+				submitted_revision:                Some(revision_to_proto(
+					operation.submitted_revision(),
+				)),
+				committed_revision:                Some(revision_to_proto(operation.head().revision())),
+				client_formatted:                  false,
+				server_formatted:                  operation.formatted(),
+				bytes_changed_after_client_format: false,
+				committed_content_hash:            Bytes::copy_from_slice(
+					operation.head().revision().content_hash(),
+				),
+			}),
 		})
 		.collect()
 }
@@ -2023,6 +2591,23 @@ impl Failure {
 		Self::new(proto::ProtocolErrorCode::Internal, message)
 	}
 
+	fn resource(message: impl Into<String>) -> Self {
+		Self::new(proto::ProtocolErrorCode::InvalidArgument, message)
+	}
+
+	fn from_dap(error: DapSessionError) -> Self {
+		match error {
+			DapSessionError::NotFound(_) => Self::not_found(error.to_string()),
+			DapSessionError::UnsupportedAction(_) => Self::invalid(error.to_string()),
+			DapSessionError::InvalidTransition { .. } | DapSessionError::SessionTreeCycle => {
+				Self::precondition(error.to_string())
+			},
+			DapSessionError::Protocol(_) | DapSessionError::Process(_) => {
+				Self::internal(error.to_string())
+			},
+		}
+	}
+
 	fn into_proto(self) -> proto::ProtocolError {
 		proto::ProtocolError { code: self.code as i32, message: self.message }
 	}
@@ -2089,6 +2674,8 @@ impl Failure {
 					LspRegistryError::PathCannotBeUri { .. }
 					| LspRegistryError::BindingIdOverflow
 					| LspRegistryError::BindingGenerationOverflow { .. }
+					| LspRegistryError::WarmupTask { .. }
+					| LspRegistryError::WarmupResultMissing
 					| LspRegistryError::Store(_)
 					| LspRegistryError::Lsp(_) => proto::ProtocolErrorCode::Internal,
 				};

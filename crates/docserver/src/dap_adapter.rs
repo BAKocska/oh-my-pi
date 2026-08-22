@@ -1,7 +1,7 @@
 //! Built-in Debug Adapter Protocol declarations and deterministic selection.
 
 use std::{
-	collections::{BTreeMap, HashSet},
+	collections::BTreeMap,
 	path::{Path, PathBuf},
 };
 
@@ -91,6 +91,29 @@ impl DapAdapterSpec {
 		merged.extend(supplied.clone());
 		merged
 	}
+
+	/// Applies adapter-specific launch defaults derived from the resolved
+	/// program. Delve debugs Go sources/directories and executes binaries.
+	#[must_use]
+	pub fn launch_arguments(
+		&self,
+		program: &Path,
+		supplied: &Map<String, Value>,
+	) -> Map<String, Value> {
+		let mut merged = self.launch_defaults.clone();
+		if self.name == "dlv" {
+			let mode = if program.is_dir()
+				|| program.extension().and_then(|value| value.to_str()) == Some("go")
+			{
+				"debug"
+			} else {
+				"exec"
+			};
+			merged.insert("mode".to_owned(), Value::String(mode.to_owned()));
+		}
+		merged.extend(supplied.clone());
+		merged
+	}
 }
 
 /// Stable process-local identity of an installed DAP adapter.
@@ -122,9 +145,11 @@ pub enum LaunchAdapterSelection {
 	/// Selection succeeded but the configured executable is absent.
 	Unavailable {
 		/// Selected adapter.
-		adapter: DapAdapterInfo,
+		adapter:  DapAdapterInfo,
 		/// Missing command.
-		command: Str,
+		command:  Str,
+		/// Actionable installation or discovery guidance.
+		guidance: Option<Str>,
 	},
 	/// No configured adapter accepts the target.
 	NoMatch,
@@ -199,6 +224,43 @@ impl DapAdapterRegistry {
 		self.state.read().by_name.values().cloned().collect()
 	}
 
+	/// Resolves pi-compatible js-debug installation locations, preferring the
+	/// explicit environment path, then Mason, then `~/.local/opt/js-debug`.
+	/// The discovered script replaces the synthetic built-in command.
+	pub fn discover_js_debug(
+		&self,
+		project_root: &Path,
+		home: &Path,
+		xdg_data_home: Option<&Path>,
+		configured: Option<&Path>,
+	) -> Option<DapAdapterId> {
+		let script = discover_js_debug_server(project_root, home, xdg_data_home, configured)?;
+		let node = resolve_path_command("node")?;
+		let mut spec = self
+			.state
+			.read()
+			.by_name
+			.get("js-debug-adapter")?
+			.spec
+			.clone();
+		spec.command = Str::new(node.to_string_lossy());
+		spec.args = vec![
+			Str::new(script.to_string_lossy()),
+			Str::new_static("${port}"),
+			Str::new_static("127.0.0.1"),
+		];
+		spec.transport = DapTransport::Tcp { port_argument: Str::new_static("${port}") };
+		self.replace(spec).ok()
+	}
+
+	/// Resolves js-debug using `JS_DEBUG_DAP_SERVER`, XDG data, and HOME.
+	pub fn discover_js_debug_from_env(&self, project_root: &Path) -> Option<DapAdapterId> {
+		let home = std::env::var_os("HOME").map(PathBuf::from)?;
+		let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+		let configured = std::env::var_os("JS_DEBUG_DAP_SERVER").map(PathBuf::from);
+		self.discover_js_debug(project_root, &home, xdg.as_deref(), configured.as_deref())
+	}
+
 	/// Selects a launch adapter by extension, root marker, preference, then
 	/// name.
 	pub fn select_launch(&self, program: &Path, project_root: &Path) -> LaunchAdapterSelection {
@@ -219,11 +281,9 @@ impl DapAdapterRegistry {
 					.extensions
 					.iter()
 					.any(|candidate| candidate.trim_start_matches('.') == extension);
-				let marker_rank = adapter
-					.spec
-					.root_markers
-					.iter()
-					.any(|marker| project_root.join(marker.as_str()).exists());
+				let marker_rank =
+					crate::lsp_registry::root_marker_ancestor(program, &adapter.spec.root_markers)
+						.is_some_and(|root| root.starts_with(project_root));
 				if !extension_rank && !marker_rank && !extension.is_empty() {
 					return None;
 				}
@@ -256,7 +316,12 @@ impl DapAdapterRegistry {
 		if command_available(adapter.spec.command.as_str()) {
 			LaunchAdapterSelection::Available(adapter)
 		} else {
-			LaunchAdapterSelection::Unavailable { command: adapter.spec.command.clone(), adapter }
+			let guidance = unavailable_guidance(adapter.spec.name.as_str());
+			LaunchAdapterSelection::Unavailable {
+				command: adapter.spec.command.clone(),
+				adapter,
+				guidance,
+			}
 		}
 	}
 
@@ -281,17 +346,76 @@ impl DapAdapterRegistry {
 }
 
 fn command_available(command: &str) -> bool {
+	resolve_path_command(command).is_some()
+}
+
+fn resolve_path_command(command: &str) -> Option<PathBuf> {
 	let path = Path::new(command);
 	if path.components().count() > 1 {
-		return path.is_file();
+		return path.is_file().then(|| path.to_owned());
 	}
-	std::env::var_os("PATH").is_some_and(|paths| {
-		std::env::split_paths(&paths).any(|directory| {
+	std::env::var_os("PATH").and_then(|paths| {
+		std::env::split_paths(&paths).find_map(|directory| {
 			executable_candidates(&directory, command)
-				.iter()
-				.any(|path| path.is_file())
+				.into_iter()
+				.find(|path| path.is_file())
 		})
 	})
+}
+
+/// Locates the js-debug server script in pi-compatible priority order.
+#[must_use]
+pub fn discover_js_debug_server(
+	project_root: &Path,
+	home: &Path,
+	xdg_data_home: Option<&Path>,
+	configured: Option<&Path>,
+) -> Option<PathBuf> {
+	let data_home = xdg_data_home
+		.map(Path::to_owned)
+		.unwrap_or_else(|| home.join(".local/share"));
+	let configured = configured.map(|path| {
+		if path.is_absolute() {
+			path.to_owned()
+		} else {
+			project_root.join(path)
+		}
+	});
+	configured
+		.into_iter()
+		.chain([
+			data_home.join("nvim/mason/packages/js-debug-adapter/js-debug/src/dapDebugServer.js"),
+			home.join(".local/opt/js-debug/src/dapDebugServer.js"),
+		])
+		.find(|path| path.is_file())
+}
+
+/// Converts known adapter startup diagnostics into actionable installation
+/// guidance without hiding the original process failure.
+#[must_use]
+pub fn dap_startup_guidance(adapter: &str, diagnostic: &str) -> Option<Str> {
+	if adapter == "debugpy"
+		&& (diagnostic.contains("No module named debugpy")
+			|| diagnostic.contains("No module named 'debugpy'"))
+	{
+		return Some(Str::new_static(
+			"debugpy is unavailable; install it with `python -m pip install debugpy`",
+		));
+	}
+	unavailable_guidance(adapter)
+}
+
+fn unavailable_guidance(adapter: &str) -> Option<Str> {
+	match adapter {
+		"debugpy" => Some(Str::new_static(
+			"debugpy is unavailable; install it with `python -m pip install debugpy`",
+		)),
+		"js-debug-adapter" => Some(Str::new_static(
+			"js-debug is unavailable; set JS_DEBUG_DAP_SERVER or install js-debug under Mason or \
+			 ~/.local/opt/js-debug",
+		)),
+		_ => None,
+	}
 }
 
 #[cfg(windows)]
@@ -314,41 +438,219 @@ fn executable_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
 	vec![directory.join(command)]
 }
 
-fn builtin_adapters() -> Vec<DapAdapterSpec> {
-	let declarations: &[(&str, &str, &[&str], &[&str])] = &[
-		("gdb", "gdb", &["-i", "dap"], &["c", "cc", "cpp", "cxx"]),
-		("lldb-dap", "lldb-dap", &[], &["c", "cc", "cpp", "cxx", "m", "mm", "swift"]),
-		("codelldb", "codelldb", &["--port", "${port}"], &["rs", "c", "cc", "cpp"]),
-		("debugpy", "python", &["-m", "debugpy.adapter"], &["py", "pyw"]),
-		("dlv", "dlv", &["dap", "--listen=127.0.0.1:${port}"], &["go"]),
-		("js-debug", "js-debug-adapter", &["${port}"], &["js", "jsx", "mjs", "cjs", "ts", "tsx"]),
-		("netcoredbg", "netcoredbg", &["--interpreter=vscode"], &["cs", "dll"]),
-		("kotlin", "kotlin-debug-adapter", &[], &["kt", "kts"]),
-		("rdbg", "rdbg", &["--open", "--command", "--"], &["rb"]),
-		("php", "php-debug-adapter", &[], &["php"]),
-		("bash", "bash-debug-adapter", &[], &["sh", "bash"]),
-		("dart", "dart-debug-adapter", &[], &["dart"]),
-		("flutter", "flutter-debug-adapter", &[], &["dart"]),
-		("elixir", "elixir-ls-debugger", &[], &["ex", "exs"]),
+pub(crate) fn builtin_adapters() -> Vec<DapAdapterSpec> {
+	struct Builtin<'a> {
+		name:       &'a str,
+		command:    &'a str,
+		args:       &'a [&'a str],
+		extensions: &'a [&'a str],
+		markers:    &'a [&'a str],
+		launch:     Value,
+		attach:     Value,
+		directory:  bool,
+		tcp:        bool,
+	}
+	let builtins = vec![
+		Builtin {
+			name:       "gdb",
+			command:    "gdb",
+			args:       &["-i", "dap"],
+			extensions: &["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "rs"],
+			markers:    &["Makefile", "CMakeLists.txt", "Cargo.toml", "compile_commands.json"],
+			launch:     serde_json::json!({"request":"launch","stopOnEntry":true,"stopAtBeginningOfMainSubprogram":true}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "lldb-dap",
+			command:    "lldb-dap",
+			args:       &[],
+			extensions: &["c", "cc", "cpp", "cxx", "m", "mm", "swift", "rs", "zig"],
+			markers:    &["Package.swift", "Cargo.toml", "Makefile", "CMakeLists.txt", "build.zig"],
+			launch:     serde_json::json!({"request":"launch","stopOnEntry":true}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "codelldb",
+			command:    "codelldb",
+			args:       &["--port", "${port}"],
+			extensions: &["c", "cc", "cpp", "cxx", "rs", "zig"],
+			markers:    &[
+				"Cargo.toml",
+				"CMakeLists.txt",
+				"Makefile",
+				"compile_commands.json",
+				"build.zig",
+			],
+			launch:     serde_json::json!({"request":"launch","stopOnEntry":true}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        true,
+		},
+		Builtin {
+			name:       "debugpy",
+			command:    "python",
+			args:       &["-m", "debugpy.adapter"],
+			extensions: &["py"],
+			markers:    &["pyproject.toml", "setup.py", "requirements.txt", "Pipfile"],
+			launch:     serde_json::json!({"request":"launch","justMyCode":false,"stopOnEntry":true}),
+			attach:     serde_json::json!({"request":"attach","justMyCode":false}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "dlv",
+			command:    "dlv",
+			args:       &["dap", "--listen=127.0.0.1:${port}"],
+			extensions: &["go"],
+			markers:    &["go.mod", "go.sum", "go.work"],
+			launch:     serde_json::json!({"request":"launch","mode":"debug","stopOnEntry":true}),
+			attach:     serde_json::json!({"request":"attach","mode":"local"}),
+			directory:  true,
+			tcp:        true,
+		},
+		Builtin {
+			name:       "js-debug-adapter",
+			command:    "js-debug-adapter",
+			args:       &[],
+			extensions: &["js", "jsx", "ts", "tsx", "mjs", "cjs"],
+			markers:    &["package.json", "tsconfig.json", "jsconfig.json"],
+			launch:     serde_json::json!({"request":"launch","type":"pwa-node","stopOnEntry":true}),
+			attach:     serde_json::json!({"request":"attach","type":"pwa-node"}),
+			directory:  false,
+			tcp:        true,
+		},
+		Builtin {
+			name:       "netcoredbg",
+			command:    "netcoredbg",
+			args:       &["--interpreter=vscode"],
+			extensions: &["cs", "csx", "fs", "fsx"],
+			markers:    &["*.sln", "*.csproj", "*.fsproj", "global.json"],
+			launch:     serde_json::json!({"request":"launch","stopAtEntry":true}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "kotlin-debug-adapter",
+			command:    "kotlin-debug-adapter",
+			args:       &[],
+			extensions: &["kt", "kts"],
+			markers:    &[
+				"build.gradle",
+				"build.gradle.kts",
+				"pom.xml",
+				"settings.gradle",
+				"settings.gradle.kts",
+			],
+			launch:     serde_json::json!({"request":"launch","mainClass":"","projectRoot":""}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "rdbg",
+			command:    "rdbg",
+			args:       &["--open", "--command", "--"],
+			extensions: &["rb", "rake", "gemspec"],
+			markers:    &["Gemfile", "Rakefile", ".ruby-version"],
+			launch:     serde_json::json!({"request":"launch","type":"rdbg"}),
+			attach:     serde_json::json!({"request":"attach","type":"rdbg"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "php-debug-adapter",
+			command:    "php-debug-adapter",
+			args:       &[],
+			extensions: &["php", "phtml"],
+			markers:    &["composer.json", "composer.lock"],
+			launch:     serde_json::json!({"request":"launch","stopOnEntry":true}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "bash-debug-adapter",
+			command:    "bash-debug-adapter",
+			args:       &[],
+			extensions: &["sh", "bash"],
+			markers:    &[".git"],
+			launch:     serde_json::json!({"request":"launch","type":"bashdb","pathBashdb":"bashdb","pathBash":"bash"}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "dart-debug-adapter",
+			command:    "dart",
+			args:       &["debug_adapter"],
+			extensions: &["dart"],
+			markers:    &["pubspec.yaml", "pubspec.lock"],
+			launch:     serde_json::json!({"request":"launch","stopOnEntry":true}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "flutter-debug-adapter",
+			command:    "dart",
+			args:       &["debug_adapter", "--flutter-sdk-path", ""],
+			extensions: &["dart"],
+			markers:    &["pubspec.yaml", "android", "ios", "lib/main.dart"],
+			launch:     serde_json::json!({"request":"launch"}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
+		Builtin {
+			name:       "elixir-ls-debugger",
+			command:    "elixir-ls-debugger",
+			args:       &[],
+			extensions: &["ex", "exs", "heex", "eex"],
+			markers:    &["mix.exs", "mix.lock"],
+			launch:     serde_json::json!({"request":"launch","type":"mix_task","task":"run","stopOnEntry":true}),
+			attach:     serde_json::json!({"request":"attach"}),
+			directory:  false,
+			tcp:        false,
+		},
 	];
-	let tcp = HashSet::from(["codelldb", "dlv", "js-debug"]);
-	declarations
-		.iter()
+	builtins
+		.into_iter()
 		.enumerate()
-		.map(|(preference, (name, command, args, extensions))| {
-			let mut spec = DapAdapterSpec::new(name, command).expect("static adapter declaration");
-			spec.args = args.iter().copied().map(Str::new_static).collect();
-			spec.extensions = extensions.iter().copied().map(Str::new_static).collect();
+		.map(|(preference, builtin)| {
+			let mut spec =
+				DapAdapterSpec::new(builtin.name, builtin.command).expect("static adapter declaration");
+			spec.args = builtin.args.iter().copied().map(Str::new_static).collect();
+			spec.extensions = builtin
+				.extensions
+				.iter()
+				.copied()
+				.map(Str::new_static)
+				.collect();
+			spec.root_markers = builtin
+				.markers
+				.iter()
+				.copied()
+				.map(Str::new_static)
+				.collect();
+			spec.accepts_directory_program = builtin.directory;
+			spec.launch_defaults = builtin
+				.launch
+				.as_object()
+				.cloned()
+				.expect("launch defaults object");
+			spec.attach_defaults = builtin
+				.attach
+				.as_object()
+				.cloned()
+				.expect("attach defaults object");
 			spec.preference = u16::try_from(preference).expect("small built-in adapter set");
-			if tcp.contains(*name) {
+			if builtin.tcp {
 				spec.transport = DapTransport::Tcp { port_argument: Str::new_static("${port}") };
-			}
-			if *name == "dlv" {
-				spec.accepts_directory_program = true;
-				spec.root_markers = vec![sf!("go.mod"), sf!("go.work")];
-			}
-			if *name == "debugpy" {
-				spec.root_markers = vec![sf!("pyproject.toml")];
 			}
 			spec
 		})
@@ -371,6 +673,46 @@ mod tests {
 			| LaunchAdapterSelection::Unavailable { adapter, .. } => assert_eq!(adapter.spec.name, "gdb"),
 			LaunchAdapterSelection::NoMatch => panic!("extensionless debugger"),
 		}
+	}
+
+	#[test]
+	fn delve_launch_mode_tracks_program_shape() {
+		let registry = DapAdapterRegistry::with_builtins();
+		let dlv = registry
+			.list()
+			.into_iter()
+			.find(|adapter| adapter.spec.name == "dlv")
+			.unwrap();
+		let root = tempfile::tempdir().unwrap();
+		let source = root.path().join("main.go");
+		std::fs::write(&source, b"package main").unwrap();
+		assert_eq!(dlv.spec.launch_arguments(&source, &Map::new())["mode"], "debug");
+		let binary = root.path().join("app");
+		std::fs::write(&binary, b"").unwrap();
+		assert_eq!(dlv.spec.launch_arguments(&binary, &Map::new())["mode"], "exec");
+	}
+
+	#[test]
+	fn js_debug_discovery_prefers_configured_path() {
+		let root = tempfile::tempdir().unwrap();
+		let home = tempfile::tempdir().unwrap();
+		let configured = root.path().join("configured/dapDebugServer.js");
+		std::fs::create_dir_all(configured.parent().unwrap()).unwrap();
+		std::fs::write(&configured, b"").unwrap();
+		let mason = home
+			.path()
+			.join(".local/share/nvim/mason/packages/js-debug-adapter/js-debug/src/dapDebugServer.js");
+		std::fs::create_dir_all(mason.parent().unwrap()).unwrap();
+		std::fs::write(&mason, b"").unwrap();
+		assert_eq!(
+			discover_js_debug_server(
+				root.path(),
+				home.path(),
+				None,
+				Some(Path::new("configured/dapDebugServer.js"))
+			),
+			Some(configured),
+		);
 	}
 
 	#[test]

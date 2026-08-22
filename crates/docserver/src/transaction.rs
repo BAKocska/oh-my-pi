@@ -9,7 +9,10 @@ use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
 use bytes::Bytes;
 use omp_core::{Str, sf};
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
+use tokio::{
+	sync::oneshot,
+	time::{Duration, timeout},
+};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -681,13 +684,14 @@ impl DocumentConflict {
 /// Result for one successfully finalized declared operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationResult {
-	operation_index: u32,
-	head:            DocumentHead,
-	uri:             Url,
-	rebased:         bool,
-	formatted:       bool,
-	changed_ranges:  Vec<ByteRange>,
-	previous_uri:    Option<Url>,
+	operation_index:    u32,
+	head:               DocumentHead,
+	uri:                Url,
+	rebased:            bool,
+	formatted:          bool,
+	submitted_revision: Revision,
+	changed_ranges:     Vec<ByteRange>,
+	previous_uri:       Option<Url>,
 }
 
 impl OperationResult {
@@ -719,6 +723,12 @@ impl OperationResult {
 	#[must_use]
 	pub const fn formatted(&self) -> bool {
 		self.formatted
+	}
+
+	/// Returns the revision submitted before server-side formatting.
+	#[must_use]
+	pub const fn submitted_revision(&self) -> Revision {
+		self.submitted_revision
 	}
 
 	/// Returns ranges in finalized-head coordinates.
@@ -1233,13 +1243,14 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 				finalized_ranges(plan.reserved.snapshot.content(), &plan.content).unwrap_or_default();
 			for operation_index in &plan.operation_indices {
 				results.push(OperationResult {
-					operation_index: *operation_index,
-					head:            head.clone(),
-					uri:             plan.uri.clone(),
-					rebased:         plan.rebased.contains(operation_index),
-					formatted:       plan.formatted.contains(operation_index),
-					changed_ranges:  changed.clone(),
-					previous_uri:    plan.previous_uri.clone(),
+					operation_index:    *operation_index,
+					head:               head.clone(),
+					uri:                plan.uri.clone(),
+					rebased:            plan.rebased.contains(operation_index),
+					formatted:          plan.formatted.contains(operation_index),
+					submitted_revision: plan.reserved.snapshot.head().revision(),
+					changed_ranges:     changed.clone(),
+					previous_uri:       plan.previous_uri.clone(),
 				});
 			}
 			if publish {
@@ -1742,13 +1753,25 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 			language_id,
 			candidate.clone(),
 		);
-		match self
-			.inner
-			.formatter
-			.format_candidate(request, cancellation)
-			.await
-		{
-			Ok(result) => {
+		let format_cancel = cancellation.child_token();
+		let formatted = timeout(
+			Duration::from_secs(5),
+			self
+				.inner
+				.formatter
+				.format_candidate(request, format_cancel.clone()),
+		)
+		.await;
+		match formatted {
+			Err(_) => {
+				format_cancel.cancel();
+				if policy == FormatPolicy::BestEffort {
+					Ok((candidate, false))
+				} else {
+					Err(PlanningFailure::format(operation_index, "formatter timed out after 5 seconds"))
+				}
+			},
+			Ok(Ok(result)) => {
 				plan.format_attempted = true;
 				if std::str::from_utf8(result.content()).is_ok() {
 					Ok((result.into_content(), true))
@@ -1758,8 +1781,8 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 					Err(PlanningFailure::format(operation_index, "formatter returned invalid UTF-8"))
 				}
 			},
-			Err(_) if policy == FormatPolicy::BestEffort => Ok((candidate, false)),
-			Err(error) => Err(PlanningFailure::format(operation_index, error.to_string())),
+			Ok(Err(_)) if policy == FormatPolicy::BestEffort => Ok((candidate, false)),
+			Ok(Err(error)) => Err(PlanningFailure::format(operation_index, error.to_string())),
 		}
 	}
 

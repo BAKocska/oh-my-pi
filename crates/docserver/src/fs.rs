@@ -488,6 +488,50 @@ impl LocalFs {
 		})
 	}
 
+	/// Writes a prepared replacement and applies an exact Unix mode to the
+	/// temporary before it can become visible.
+	pub fn prepare_write_with_mode(
+		&self,
+		path: impl AsRef<Path>,
+		content: Bytes,
+		expected: DiskExpectation,
+		mode: u32,
+	) -> Result<PreparedWrite> {
+		let prepared = self.prepare_write(path, content, expected)?;
+		if mode == 0 {
+			return Ok(prepared);
+		}
+		#[cfg(unix)]
+		{
+			use cap_std::fs::PermissionsExt;
+
+			let file = prepared
+				.parent
+				.open(&prepared.temporary_name)
+				.map_err(|source| Self::persistence_error(&prepared.destination_path, source))?;
+			let mut permissions = file
+				.metadata()
+				.map_err(|source| Self::persistence_error(&prepared.destination_path, source))?
+				.permissions();
+			permissions.set_mode(mode);
+			file
+				.set_permissions(permissions)
+				.map_err(|source| Self::persistence_error(&prepared.destination_path, source))?;
+		}
+		#[cfg(not(unix))]
+		{
+			return Err(Self::io_error(
+				"set prepared write mode",
+				&prepared.destination_path,
+				io::Error::new(
+					io::ErrorKind::Unsupported,
+					"exact file modes are unavailable on this platform",
+				),
+			));
+		}
+		Ok(prepared)
+	}
+
 	/// Rechecks the expected disk state, atomically renames, and flushes the
 	/// parent.
 	///
@@ -971,6 +1015,75 @@ impl LocalFs {
 		};
 		result.map_err(|source| Self::io_error("create directory", &absolute, source))?;
 		self.stat(absolute, FollowSymlinks::No)
+	}
+
+	/// Removes one exact final entry through its already-open parent handle.
+	///
+	/// The final component is first moved to a collision-safe quarantine name,
+	/// then its inode identity is rechecked before deletion. A symlink is
+	/// removed as a link and is never followed.
+	pub fn remove_no_follow_if(
+		&self,
+		path: impl AsRef<Path>,
+		expected_present: bool,
+		recursive: bool,
+	) -> Result<DiskState> {
+		let resolved = self.resolve_entry(path.as_ref())?;
+		Self::reject_root_entry(&resolved, "remove")?;
+		let (parent_relative, _) = Self::split_relative(&resolved.relative)
+			.ok_or_else(|| Self::invalid_argument(&resolved.absolute, "path has no parent entry"))?;
+		let (parent, name) = self.open_parent(&resolved)?;
+		let parent_identity = Self::directory_identity(&parent)
+			.map_err(|source| Self::io_error("identify removal parent", &resolved.absolute, source))?;
+		let metadata = match parent.symlink_metadata(&name) {
+			Ok(_) if !expected_present => {
+				return Err(Error::StaleDiskState { path: resolved.absolute });
+			},
+			Ok(metadata) => metadata,
+			Err(source) if source.kind() == io::ErrorKind::NotFound && !expected_present => {
+				return Ok(DiskState::Missing);
+			},
+			Err(source) if source.kind() == io::ErrorKind::NotFound => {
+				return Err(Error::StaleDiskState { path: resolved.absolute });
+			},
+			Err(source) => {
+				return Err(Self::io_error("inspect removal target", &resolved.absolute, source));
+			},
+		};
+		if metadata.is_dir() && !recursive {
+			return Err(Self::io_error(
+				"remove directory",
+				&resolved.absolute,
+				io::Error::new(io::ErrorKind::IsADirectory, "recursive removal was not approved"),
+			));
+		}
+		let expected_identity = Self::metadata_file_identity(&metadata);
+		let quarantine = self.unique_temporary_name(&parent, &name, |candidate| {
+			Self::rename_noreplace(&parent, &name, &parent, candidate)
+		})?;
+		if !self.prepared_parent_is_current_parts(
+			&parent_relative,
+			parent_identity,
+			&resolved.absolute,
+		)? {
+			let _ = Self::rename_noreplace(&parent, &quarantine, &parent, &name);
+			return Err(Error::StaleDiskState { path: resolved.absolute });
+		}
+		let displaced = parent.symlink_metadata(&quarantine).map_err(|source| {
+			Self::io_error("reinspect quarantined removal target", &resolved.absolute, source)
+		})?;
+		if Self::metadata_file_identity(&displaced) != expected_identity {
+			let _ = Self::rename_noreplace(&parent, &quarantine, &parent, &name);
+			return Err(Error::StaleDiskState { path: resolved.absolute });
+		}
+		let removed = if displaced.is_dir() {
+			parent.remove_dir_all(&quarantine)
+		} else {
+			parent.remove_file(&quarantine)
+		};
+		removed.map_err(|source| Self::persistence_error(&resolved.absolute, source))?;
+		Self::flush_directory(&parent, &resolved.absolute)?;
+		Ok(DiskState::Missing)
 	}
 
 	/// Removes a file, link, empty directory, or recursively a directory tree.
@@ -2021,6 +2134,23 @@ impl LocalFs {
 		let current_identity = Self::directory_identity(&current)
 			.map_err(|source| Self::io_error("reidentify prepared-operation parent", path, source))?;
 		Ok(Self::directory_identities_match(parent_identity, current_identity))
+	}
+
+	#[cfg(unix)]
+	fn metadata_file_identity(metadata: &Metadata) -> FileIdentity {
+		use cap_std::fs::MetadataExt;
+
+		FileIdentity { device: metadata.dev(), inode: metadata.ino() }
+	}
+
+	#[cfg(windows)]
+	fn metadata_file_identity(metadata: &Metadata) -> FileIdentity {
+		FileIdentity { volume: None, file_index: Some(metadata.len()) }
+	}
+
+	#[cfg(not(any(unix, windows)))]
+	const fn metadata_file_identity(_: &Metadata) -> FileIdentity {
+		FileIdentity
 	}
 
 	#[cfg(unix)]
@@ -3190,6 +3320,52 @@ mod tests {
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+	#[cfg(unix)]
+	#[test]
+	fn privileged_write_refuses_final_symlink() {
+		use std::os::unix::fs::symlink;
+
+		let (_root, filesystem) = self::filesystem();
+		let target = filesystem.root_path().join("target.txt");
+		let link = filesystem.root_path().join("link.txt");
+		fs::write(&target, b"keep").expect("target");
+		symlink(&target, &link).expect("link");
+		let prepared = filesystem.prepare_write_with_mode(
+			&link,
+			Bytes::from_static(b"replace"),
+			DiskExpectation::Missing,
+			0,
+		);
+		assert!(prepared.is_ok(), "staging beside a link is side-effect free");
+		assert!(
+			filesystem
+				.commit_prepared(prepared.expect("prepared"))
+				.is_err()
+		);
+		assert_eq!(fs::read(&target).expect("target remains"), b"keep");
+		assert!(link.is_symlink());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn privileged_no_follow_removal_unlinks_symlink_not_target() {
+		use std::os::unix::fs::symlink;
+
+		let (_root, filesystem) = self::filesystem();
+		let target = filesystem.root_path().join("target.txt");
+		let link = filesystem.root_path().join("link.txt");
+		fs::write(&target, b"keep").expect("target");
+		symlink(&target, &link).expect("link");
+		assert_eq!(
+			filesystem
+				.remove_no_follow_if(&link, true, false)
+				.expect("unlink"),
+			DiskState::Missing
+		);
+		assert_eq!(fs::read(&target).expect("target remains"), b"keep");
+		assert!(!link.exists());
+	}
+
 	#[test]
 	fn prepared_delete_preserves_replacements_on_both_sides_of_rename() {
 		let (_root, filesystem) = self::filesystem();
