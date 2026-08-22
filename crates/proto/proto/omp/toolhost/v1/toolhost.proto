@@ -647,6 +647,142 @@ message HookWorkerEnvelope {
   omp.inference.v1.ValueMap props = 15;
 }
 
+// Campaign declaration, lifecycle, and reaction traffic. Point and verdict
+// numbers are frozen wire tables: append only, and never reuse a value.
+enum CampaignPoint {
+  CAMPAIGN_POINT_UNSPECIFIED = 0;
+  CAMPAIGN_POINT_CONTEXT = 1;
+  CAMPAIGN_POINT_TOOL_CHOICE = 2;
+  CAMPAIGN_POINT_PRE_MODEL = 3;
+  CAMPAIGN_POINT_STREAM = 4;
+  CAMPAIGN_POINT_ADMISSION = 5;
+  CAMPAIGN_POINT_BATCH = 6;
+  CAMPAIGN_POINT_TURN_END = 7;
+  CAMPAIGN_POINT_SETTLE = 8;
+  CAMPAIGN_POINT_IDLE = 9;
+}
+
+enum CampaignVerdictKind {
+  CAMPAIGN_VERDICT_KIND_UNSPECIFIED = 0;
+  CAMPAIGN_VERDICT_KIND_PASS = 1;
+  CAMPAIGN_VERDICT_KIND_INJECT = 2;
+  CAMPAIGN_VERDICT_KIND_PATCH = 3;
+  CAMPAIGN_VERDICT_KIND_HOLD = 4;
+  CAMPAIGN_VERDICT_KIND_DENY = 5;
+  CAMPAIGN_VERDICT_KIND_CONTINUE = 6;
+  CAMPAIGN_VERDICT_KIND_FORCE = 7;
+  CAMPAIGN_VERDICT_KIND_CUT = 8;
+  CAMPAIGN_VERDICT_KIND_BIND = 9;
+  CAMPAIGN_VERDICT_KIND_DONE = 10;
+  CAMPAIGN_VERDICT_KIND_EXHAUSTED = 11;
+  CAMPAIGN_VERDICT_KIND_ESCALATE = 12;
+}
+
+enum CampaignScope {
+  CAMPAIGN_SCOPE_UNSPECIFIED = 0;
+  CAMPAIGN_SCOPE_TURN = 1;
+  CAMPAIGN_SCOPE_RUN = 2;
+  CAMPAIGN_SCOPE_SESSION = 3;
+}
+
+enum CampaignExhaust {
+  CAMPAIGN_EXHAUST_UNSPECIFIED = 0;
+  CAMPAIGN_EXHAUST_SETTLE = 1;
+  CAMPAIGN_EXHAUST_FAULT = 2;
+}
+
+message CampaignManifest {
+  string id = 1;
+  uint32 rev = 2;
+  repeated CampaignPoint points = 3;
+  CampaignScope scope = 4;
+  CampaignExhaust exhaust = 5;
+  optional string state_family = 6;
+  optional uint32 state_rev = 7;
+  OnFailure on_failure = 8;
+  bytes policy = 9;
+  repeated string claims = 10;
+  repeated string binds = 11;
+  bool composes = 12;
+  bytes when = 13;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Worker import-time declaration table. Core admits this domain only when
+// api_level supports campaigns, then exact-validates manifests at FREEZE.
+message CampaignDeclare {
+  string extension_id = 1;
+  uint64 generation = 2;
+  uint32 api_level = 3;
+  uint32 table_rev = 4;
+  repeated CampaignManifest manifests = 5;
+  repeated CampaignPoint point_table = 6;
+  repeated CampaignVerdictKind verdict_table = 7;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message CampaignEngage {
+  string campaign_id = 1;
+  string engagement_id = 2;
+  uint32 campaign_rev = 3;
+  bytes state = 4;
+  uint64 deadline_ms = 5;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message CampaignReact {
+  string campaign_id = 1;
+  string engagement_id = 2;
+  uint32 campaign_rev = 3;
+  CampaignPoint point = 4;
+  uint32 event_rev = 5;
+  bytes event_payload = 6;
+  bytes state = 7;
+  uint64 deadline_ms = 8;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message CampaignLadderStep {
+  uint32 rung = 1;
+  uint32 engagements = 2;
+  uint32 turns = 3;
+  bool delivered = 4;
+}
+
+message CampaignReaction {
+  string engagement_id = 1;
+  uint32 campaign_rev = 2;
+  CampaignVerdictKind verdict = 3;
+  bytes verdict_payload = 4;
+  optional CampaignLadderStep step = 5;
+  bytes new_state = 6;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message CampaignDisengage {
+  string campaign_id = 1;
+  string engagement_id = 2;
+  uint32 campaign_rev = 3;
+  optional string reason = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message CampaignHostEnvelope {
+  oneof body {
+    CampaignEngage engage = 1;
+    CampaignReact react = 2;
+    CampaignDisengage disengage = 3;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
+
+message CampaignWorkerEnvelope {
+  oneof body {
+    CampaignDeclare declare = 1;
+    CampaignReaction reaction = 2;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
 // Projection, lift, render, and availability operations.
 message ProjectionKey {
   string name = 1;
@@ -1241,6 +1377,7 @@ message HostFrame {
     ControlHostEnvelope control = 12;
     InferenceHostEnvelope inference = 13;
     TelemetryHostEnvelope telemetry = 14;
+    CampaignHostEnvelope campaigns = 16;
   }
   omp.inference.v1.ValueMap props = 15;
 }
@@ -1266,6 +1403,7 @@ message WorkerFrame {
     ControlWorkerEnvelope control = 18;
     InferenceWorkerEnvelope inference = 19;
     TelemetryWorkerEnvelope telemetry = 20;
+    CampaignWorkerEnvelope campaigns = 21;
   }
   omp.inference.v1.ValueMap props = 15;
 }
