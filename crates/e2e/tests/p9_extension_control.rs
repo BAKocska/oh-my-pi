@@ -173,7 +173,7 @@ fn extension_config(scratch: &Scratch) -> Result<(ExtHostConfig, flume::Receiver
 		"declarations": [{"id": "extension-proof", "kind": "command"}]
 	}))?;
 	let static_declarations = StaticDeclarations::from_properties(&properties)
-		.map_err(|error| error(format!("building authenticated manifest declarations: {error}")))?;
+		.map_err(|source| error(format!("building authenticated manifest declarations: {source}")))?;
 	let manifest = ExtensionManifest::new_with_static(
 		provenance,
 		sf!(MODULE),

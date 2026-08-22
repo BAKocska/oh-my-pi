@@ -470,7 +470,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		..Default::default()
 	};
 	let (provider_data, provider_request) =
-		omp_app::rpc_adapter::project_provider_turn_for_test(&data, &params, &without_lift)
+		omp_serve::inference::project_provider_turn_for_test(&data, &params, &without_lift)
 			.expect("owned provider dialect accepts unliftable canonical history");
 	assert_eq!(provider_data.encode_to_vec(), original.encode_to_vec());
 	assert_eq!(schema_bytes(&provider_request), vec![HL2_SCHEMA.to_vec()]);

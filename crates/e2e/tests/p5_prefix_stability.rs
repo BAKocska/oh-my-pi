@@ -7,9 +7,9 @@ use bytes::Bytes;
 use futures::{FutureExt as _, Stream};
 use omp_agent::{
 	Agent, AgentSnapshot, AgentState, ContextFile, InProcTurnClient, Journal, TurnClient, TurnId,
-	TurnInput, TurnOptions, Props,
+	TurnInput, TurnOptions, PromptFacts,
 };
-use omp_app::rpc_adapter::InferenceRpc;
+use omp_serve::inference::InferenceRpc;
 use omp_catalog::{
 	CompiledCatalog,
 	snapshot::{Catalog, SnapshotProvenance},
@@ -208,7 +208,7 @@ fn tool_def(revision: u16) -> pb::ToolDef {
 
 fn catalog() -> Arc<Catalog> {
 	let mut value: serde_json::Value =
-		serde_json::from_str(include_str!("../../llm-catalog/data/catalog.normalized.json"))
+		serde_json::from_str(include_str!("../../catalog/data/catalog.normalized.json"))
 			.expect("normalized catalog JSON");
 	let model = value["models"]
 		.as_array_mut()
@@ -421,11 +421,13 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 		provider_reset:  false,
 		stream_watchdog: omp_agent::StreamWatchdog::default(),
 	};
-	let workspace = Props::new(
+	let props = PromptFacts::new(
 		scratch.project(),
 		Arc::<[ContextFile]>::from([context_file(&prompt_path)]),
-	);
-	let state = AgentState::new(AgentSnapshot::new(options, workspace, Arc::clone(&tools_v1)));
+	)
+	.props()
+	.expect("prefix-stability prompt facts");
+	let state = AgentState::new(AgentSnapshot::new(options, props, Arc::clone(&tools_v1)));
 	let (env, _env_transport) = omp_env::EnvClient::in_process(4);
 	let mut agent = Agent::new(client, env, state.clone(), journal(&scratch), CapsBase {
 		maximum_parts:      4,
@@ -462,7 +464,12 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 		.write("AGENTS.md", b"stable prompt v2\n")
 		.expect("mutate real context file");
 	state.update(|snapshot| {
-		snapshot.workspace.context_files = Arc::from([context_file(&prompt_path)]);
+		snapshot.props = PromptFacts::new(
+			scratch.project(),
+			Arc::<[ContextFile]>::from([context_file(&prompt_path)]),
+		)
+		.props()
+		.expect("updated prefix-stability prompt facts");
 	});
 	let fourth = within(
 		"p5 prompt rewind",

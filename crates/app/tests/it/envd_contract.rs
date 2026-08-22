@@ -10,7 +10,7 @@ use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
 use omp_envd::{
-	EnvServer,
+	EnvServer, RegistryBridges,
 	exec::{ExecEvent as HostExecEvent, ExecHost},
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
@@ -470,7 +470,13 @@ impl Harness {
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("state scratch directory");
 		let server = Arc::new(
-			EnvServer::open_local(root.path(), state.path(), registry, worker)
+			EnvServer::open_local(
+				root.path(),
+				state.path(),
+				registry,
+				worker,
+				RegistryBridges::default(),
+			)
 				.await
 				.expect("real local environment host"),
 		);
@@ -699,7 +705,14 @@ async fn write_name_is_reserved_before_production_registry_assembly() {
 	registry
 		.register(EffectTool::named("write", marker), Presentation::Slot, test_claims())
 		.expect("register colliding caller write tool");
-	let result = EnvServer::open_local(root.path(), state.path(), registry, test_config()).await;
+	let result = EnvServer::open_local(
+		root.path(),
+		state.path(),
+		registry,
+		test_config(),
+		RegistryBridges::default(),
+	)
+	.await;
 	let Err(error) = result else {
 		panic!("production registry accepted a caller-owned write tool");
 	};

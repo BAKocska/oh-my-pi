@@ -37,8 +37,8 @@ use omp_agent::{
 use omp_app::{
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
-	envd::{EnvServer, worker::ExtHostConfig},
 };
+use omp_envd::{EnvServer, RegistryBridges, worker::ExtHostConfig};
 use omp_catalog::{
 	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
@@ -312,7 +312,7 @@ async fn rpc_host(
 	first: bool,
 ) -> (DaemonHandle, RpcTurnClient, String, flume::Receiver<WorkflowResponse>) {
 	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../llm-catalog/data/catalog.normalized.json"))
+		serde_json::from_str(include_str!("../../catalog/data/catalog.normalized.json"))
 			.expect("normalized catalog");
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {
@@ -1138,6 +1138,7 @@ async fn batch_child(root: &Path, create: bool) {
 				omp_core::sf!("p6-session"),
 				1,
 			),
+			RegistryBridges::default(),
 		)
 		.await
 		.expect("real local environment host"),

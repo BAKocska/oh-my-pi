@@ -23,14 +23,12 @@ use nix::{
 	sys::signal,
 	unistd::{Pid, getpgid},
 };
-use omp_app::{
-	envd::{
-		EnvServer,
-		worker::{ExtHostConfig, ExtHostSpec, HostKey},
-	},
+use omp_envd::{
+	EnvServer, RegistryBridges,
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
+	worker::{ExtHostConfig, ExtHostSpec, HostKey},
 };
 use omp_core::{ArtifactDigest, Principal, Provenance, sf};
 use omp_e2e::support::{AllowAdmission, install_omp_binary_env, omp_binary};
@@ -171,7 +169,7 @@ impl LocalEnv {
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("environment state scratch directory");
 		let server = Arc::new(
-			EnvServer::open_local(root.path(), state.path(), registry, worker)
+			EnvServer::open_local(root.path(), state.path(), registry, worker, RegistryBridges::default())
 				.await
 				.expect("open real local environment authority"),
 		);

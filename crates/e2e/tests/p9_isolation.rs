@@ -6,14 +6,12 @@
 use std::{path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
-use omp_app::{
-	envd::{
-		EnvServer,
-		worker::{ExtHostConfig, ExtHostSpec, HostKey},
-	},
+use omp_envd::{
+	EnvServer, RegistryBridges,
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
+	worker::{ExtHostConfig, ExtHostSpec, HostKey},
 };
 use omp_core::{ArtifactDigest, Principal, Provenance, sf};
 use omp_e2e::{
@@ -115,9 +113,15 @@ impl ChildEnvironment {
 		config.extensions.push(extension);
 
 		let server = Arc::new(
-			EnvServer::open_local(&root, state.path(), Registry::new(), config)
-				.await
-				.context("open isolated environment")?,
+			EnvServer::open_local(
+				&root,
+				state.path(),
+				Registry::new(),
+				config,
+				RegistryBridges::default(),
+			)
+			.await
+			.context("open isolated environment")?,
 		);
 		let (client, transport) = EnvClient::in_process(64);
 		client.set_admitter(AllowAdmission);

@@ -13,7 +13,7 @@ use futures::StreamExt as _;
 use nix::{sys::stat::Mode, unistd::mkfifo};
 use omp_agent::{
 	Agent, AgentEvent, AgentSnapshot, AgentState, EventSubscription, Journal, TurnClient, TurnId,
-	TurnInput, TurnOptions, TurnSession, Props,
+	TurnInput, TurnOptions, TurnSession, PromptFacts,
 };
 use omp_core::{Str, sf};
 use omp_e2e::support::{
@@ -22,7 +22,7 @@ use omp_e2e::support::{
 	user_item,
 };
 use omp_env::{BlobDownloadEvent, EnvClient, ProcessAttachmentEvent};
-use omp_envd::{EnvServer, worker::ExtHostConfig};
+use omp_envd::{EnvServer, RegistryBridges, worker::ExtHostConfig};
 use omp_inference::{
 	event::{BlockKind, ChatEvent, Completion, FinishReason},
 	provider::fake::FakeScript,
@@ -80,6 +80,7 @@ impl RealEnv {
 					omp_core::sf!("p3-session"),
 					1,
 				),
+				RegistryBridges::default(),
 			)
 			.await
 			.expect("real local environment"),
@@ -165,7 +166,13 @@ fn state(root: &Path, registry: Arc<Registry>) -> AgentState {
 	let turn = TurnOptions { context_id: Some(sf!("p3-context")), ..Default::default() };
 	let snapshot = AgentSnapshot {
 		enabled_tools: Arc::from([sf!("shell")]),
-		..AgentSnapshot::new(turn, Props::new(root, Arc::from([])), registry)
+		..AgentSnapshot::new(
+			turn,
+			PromptFacts::new(root, Arc::from([]))
+				.props()
+				.expect("detached-job prompt facts"),
+			registry,
+		)
 	};
 	AgentState::new(snapshot)
 }

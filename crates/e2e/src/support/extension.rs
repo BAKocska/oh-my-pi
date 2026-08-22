@@ -105,6 +105,7 @@ pub fn recording_ui_factory() -> (Arc<dyn ControlAuthorityFactory>, Receiver<Pre
 			capabilities:       Arc::clone(&identity.capabilities),
 		});
 		let owner = Arc::new(PresentationAuthority::new(
+			omp_executor::Executor::new(None),
 			presentation_identity,
 			Arc::new(RecordingPresentationClient { effects: effects.clone() }),
 			Arc::new(UnusedPresentationCallbacks),
@@ -146,6 +147,7 @@ impl PresentationCallbackDispatcher for UnusedPresentationCallbacks {
 	async fn dispatch(
 		&self,
 		_identity: Arc<PresentationIdentity>,
+		_invocation: omp_envd::exthost::control::ControlInvocationAuthority,
 		_callback: PresentationCallback,
 	) -> Result<serde_json::Value, PresentationAuthorityError> {
 		Err(PresentationAuthorityError::Unavailable)

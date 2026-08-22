@@ -325,7 +325,7 @@ fn scripted_registry(
 	preview_release: Receiver<()>,
 ) -> (Registry, ConversationSessionPlanner, FakeProvider, String) {
 	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../llm-catalog/data/catalog.normalized.json"))
+		serde_json::from_str(include_str!("../../catalog/data/catalog.normalized.json"))
 			.expect("normalized catalog");
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {
