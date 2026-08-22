@@ -76,6 +76,8 @@ pub mod path;
 mod render;
 /// Typed policy projection owned by file tools.
 pub mod settings;
+/// Shared staged-proposal lifecycle for preview-producing tools.
+pub mod staging;
 
 pub use render::{
 	BuiltinRendererIdentities,

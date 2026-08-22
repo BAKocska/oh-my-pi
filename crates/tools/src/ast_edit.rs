@@ -1,6 +1,5 @@
 //! Multi-file structural rewrites with dry-run validation and recovery
 //! snapshots.
-
 use std::{
 	collections::HashSet,
 	fmt,
@@ -18,6 +17,11 @@ use omp_tool::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::staging::{
+	PREVIEW_PENDING_NOTICE, PreviewActionError, PreviewDecision, PreviewError, PreviewRegistry,
+	PreviewRejection, StagedAction,
+};
 
 const MAX_FILES: usize = 200;
 
@@ -54,9 +58,11 @@ pub struct Advisory {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Payload {
-	pub files:         Vec<ChangedFile>,
-	pub advisories:    Vec<Advisory>,
-	pub recovery_root: Option<Str>,
+	pub files:           Vec<ChangedFile>,
+	pub advisories:      Vec<Advisory>,
+	pub recovery_root:   Option<Str>,
+	/// Uncommitted proposal identity requiring resolve or reject.
+	pub pending_preview: Option<Str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,18 +79,20 @@ impl fmt::Display for Fault {
 impl std::error::Error for Fault {}
 
 pub struct AstEdit {
-	root: PathBuf,
-	spec: ToolSpec,
+	root:     PathBuf,
+	spec:     ToolSpec,
+	previews: PreviewRegistry,
 }
 
-pub fn tool(root: PathBuf) -> AstEdit {
+pub fn tool(root: PathBuf, previews: PreviewRegistry) -> AstEdit {
 	AstEdit {
 		root,
+		previews,
 		spec: ToolSpec {
 			name:            sf!("ast_edit"),
 			rev:             Rev { family: Default::default(), n: 1 },
 			description:     sf!(
-				"Applies structural ast-grep rewrites across mixed-language targets. Every rewrite is \
+				"Stages structural ast-grep rewrites across mixed-language targets. Every rewrite is \
 				 dry-run first; duplicate patterns and more than 200 files are rejected. Source \
 				 hashes are rechecked immediately before an all-file commit, and recovery snapshots \
 				 are retained under the project .omp state."
@@ -159,23 +167,26 @@ impl Tool for AstEdit {
 				let (updated, replacements) = match omp_ast::ops::rewrite_source(source, language, &rules) { Ok(v) => v, Err(e) => { yield done(Err(Fault { message: Str::new(e.to_string()) })); return; } };
 				if replacements != 0 { prepared.push(Prepared { absolute, relative: file.relative_path, before: *Hash32::sum(&original).as_bytes(), after: *Hash32::sum(updated.as_bytes()).as_bytes(), original, updated, replacements }); }
 			}
-			if prepared.is_empty() { yield done(Ok(Payload { files: Vec::new(), advisories, recovery_root: None })); return; }
-			for item in &prepared { match std::fs::read(&item.absolute) { Ok(current) if Hash32::sum(&current).as_bytes() == &item.before => {}, Ok(_) => { yield done(Err(fault("ast_edit aborted because a document revision changed after dry-run"))); return; }, Err(e) => { yield done(Err(Fault { message: Str::new(e.to_string()) })); return; } } }
-			let generation = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |v| v.as_nanos());
-			let recovery = root.join(".omp/recovery/ast-edit").join(generation.to_string());
-			if let Err(e) = snapshot_all(&recovery, &prepared) { yield done(Err(Fault { message: Str::new(e.to_string()) })); return; }
-			let mut committed = 0;
-			for item in &prepared {
-				let temporary = item.absolute.with_extension(format!("omp-ast-edit-{generation}"));
-				let result = std::fs::write(&temporary, item.updated.as_bytes()).and_then(|()| std::fs::rename(&temporary, &item.absolute));
-				if let Err(error) = result {
-					for restore in prepared[..committed].iter().rev() { let _ = std::fs::write(&restore.absolute, &restore.original); }
-					yield done(Err(Fault { message: Str::new(error.to_string()) })); return;
-				}
-				committed += 1;
-			}
-			let files = prepared.into_iter().map(|p| ChangedFile { path: p.relative, replacements: p.replacements, before_hash: short_hash(&p.before), after_hash: short_hash(&p.after) }).collect();
-			yield done(Ok(Payload { files, advisories, recovery_root: Some(Str::from(recovery.to_string_lossy().into_owned())) }));
+			if prepared.is_empty() { yield done(Ok(Payload { files: Vec::new(), advisories, recovery_root: None, pending_preview: None })); return; }
+			let files = prepared.iter().map(|p| ChangedFile { path: p.relative.clone(), replacements: p.replacements, before_hash: short_hash(&p.before), after_hash: short_hash(&p.after) }).collect::<Vec<_>>();
+			let summary = sf!("Pending proposal: ast_edit would change {} file(s).", files.len());
+			let pending = match self.previews.stage(
+				sf!("ast_edit"),
+				summary,
+				AstEditAction { root, prepared },
+			).await {
+				Ok(pending) => pending,
+				Err(error) => {
+					yield done(Err(Fault { message: Str::new(error.to_string()) }));
+					return;
+				},
+			};
+			yield done(Ok(Payload {
+				files,
+				advisories,
+				recovery_root: None,
+				pending_preview: Some(pending.id),
+			}));
 		}
 	}
 
@@ -197,6 +208,9 @@ impl Tool for AstEdit {
 						use std::fmt::Write as _;
 						let _ = writeln!(out, "[advisory {}] {}", advisory.path, advisory.message);
 					}
+					if p.pending_preview.is_some() {
+						out.push_str(PREVIEW_PENDING_NOTICE);
+					}
 					Str::new(out)
 				},
 			},
@@ -213,6 +227,76 @@ fn snapshot_all(root: &Path, prepared: &[Prepared]) -> std::io::Result<()> {
 		std::fs::write(target, &item.original)?;
 	}
 	Ok(())
+}
+struct AstEditAction {
+	root:     PathBuf,
+	prepared: Vec<Prepared>,
+}
+
+impl StagedAction for AstEditAction {
+	fn finalize(&mut self, decision: &PreviewDecision) -> Result<serde_json::Value, PreviewError> {
+		if matches!(
+			decision,
+			PreviewDecision::Reject(
+				PreviewRejection::Requested { .. } | PreviewRejection::CampaignExhausted
+			)
+		) {
+			return Ok(serde_json::json!({ "rejected": true }));
+		}
+		self.apply().map_err(PreviewError::from)
+	}
+}
+
+impl AstEditAction {
+	fn apply(&mut self) -> Result<serde_json::Value, PreviewActionError> {
+		for item in &self.prepared {
+			let current = std::fs::read(&item.absolute)
+				.map_err(|source| PreviewActionError::Io { path: item.absolute.clone(), source })?;
+			if Hash32::sum(&current).as_bytes() != &item.before {
+				return Err(PreviewActionError::RevisionChanged { path: item.absolute.clone() });
+			}
+		}
+		let generation = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map_or(0, |duration| duration.as_nanos());
+		let recovery = self
+			.root
+			.join(".omp/recovery/ast-edit")
+			.join(generation.to_string());
+		snapshot_all(&recovery, &self.prepared)
+			.map_err(|source| PreviewActionError::Io { path: recovery.clone(), source })?;
+		let mut committed = 0;
+		for item in &self.prepared {
+			let temporary = item
+				.absolute
+				.with_extension(format!("omp-ast-edit-{generation}"));
+			let result = std::fs::write(&temporary, item.updated.as_bytes())
+				.and_then(|()| std::fs::rename(&temporary, &item.absolute));
+			if let Err(source) = result {
+				for restore in self.prepared[..committed].iter().rev() {
+					let _ = std::fs::write(&restore.absolute, &restore.original);
+				}
+				return Err(PreviewActionError::Io { path: item.absolute.clone(), source });
+			}
+			committed += 1;
+		}
+		let files = self
+			.prepared
+			.iter()
+			.map(|prepared| ChangedFile {
+				path:         prepared.relative.clone(),
+				replacements: prepared.replacements,
+				before_hash:  short_hash(&prepared.before),
+				after_hash:   short_hash(&prepared.after),
+			})
+			.collect();
+		Ok(serde_json::to_value(Payload {
+			files,
+			advisories: Vec::new(),
+			recovery_root: Some(Str::from(recovery.to_string_lossy().into_owned())),
+			pending_preview: None,
+		})?)
+	}
 }
 fn short_hash(hash: &[u8; 32]) -> Str {
 	use omp_core::encoding::hex;
@@ -250,5 +334,50 @@ fn issue(message: Str) -> ArgIssue {
 		kind:     ArgIssueKind::Protocol,
 		example:  None,
 		found:    Some(message),
+	}
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn action(root: &Path, path: &Path, original: &[u8], updated: &str) -> AstEditAction {
+		AstEditAction {
+			root:     root.to_path_buf(),
+			prepared: vec![Prepared {
+				absolute:     path.to_path_buf(),
+				relative:     Str::new("sample.rs"),
+				original:     original.to_vec(),
+				updated:      updated.to_owned(),
+				replacements: 1,
+				before:       *Hash32::sum(original).as_bytes(),
+				after:        *Hash32::sum(updated.as_bytes()).as_bytes(),
+			}],
+		}
+	}
+
+	#[test]
+	fn staged_action_mutates_only_after_resolve_and_reject_is_effect_free() {
+		let temp = tempfile::tempdir().expect("temporary workspace");
+		let path = temp.path().join("sample.rs");
+		let original = b"fn old() {}\n";
+		std::fs::write(&path, original).expect("seed source");
+
+		let mut rejected = action(temp.path(), &path, original, "fn new() {}\n");
+		rejected
+			.finalize(&PreviewDecision::Reject(PreviewRejection::Requested {
+				reason: Str::new_static("The rewrite is not desired."),
+			}))
+			.expect("proposal rejected");
+		assert_eq!(std::fs::read(&path).expect("source readable"), original);
+
+		let mut resolved = action(temp.path(), &path, original, "fn new() {}\n");
+		let payload = resolved
+			.finalize(&PreviewDecision::Resolve {
+				reason: Str::new_static("Apply the reviewed rewrite."),
+			})
+			.expect("proposal resolved");
+		assert_eq!(std::fs::read_to_string(&path).expect("source readable"), "fn new() {}\n");
+		assert_eq!(payload["files"][0]["path"], "sample.rs");
+		assert!(payload["recovery_root"].as_str().is_some());
 	}
 }

@@ -135,6 +135,14 @@ pub enum Fault {
 	/// The active mode prevents a goal transition.
 	#[error("the active execution mode prevents this goal transition")]
 	ModeConflict,
+	/// Campaign arbitration denied the goal regime's mode-slot claim.
+	#[error("the goal campaign mode-slot claim is held by another engagement")]
+	ClaimDenied {
+		/// Stable engagement currently holding the mode slot.
+		holder: Str,
+		/// Epoch millisecond at which the holder acquired the slot.
+		since:  u64,
+	},
 	/// The requested transition is invalid for the current goal state.
 	#[error("the requested goal transition is invalid for its durable state")]
 	InvalidTransition,
