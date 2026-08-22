@@ -21,16 +21,16 @@ use omp_proto::{
 		commit_transaction_response, document_target, read_document_response,
 	},
 	env::v1::{
-		Admission, AdmitInvocation, ArgText, ArgsCommitted, AttachOutput, BlobGetComplete,
-		CancelRequest, ClientFrame, ClientHello, CloseSessionRequest, CloseSessionResponse,
-		CommitBlobPut, CreateWorktree, DataEvent, DataRequest, DataResponse, DestroyWorktree,
-		EventStreamError, EventStreamKind, ExecRequest, ExecStarted, ExitEvent, Interrupt,
-		InvocationScope, InvokeAccepted, InvokeTool, ListProcesses, MaterializeSite, MergeWorktree,
-		OpenSessionRequest, OpenSessionResponse, OutputAttached, OutputFrame, ProcessCommandAccepted,
-		ProcessList, ProcessOutput, ProcessStarted, ProcessStateEvent, ProtocolError,
-		ProtocolErrorCode, Retire, SearchComplete, SearchMatchMsg, SearchRequest, SendInput,
-		ServerFrame, ServerHello, SignalProcess, SignalRequest, SiteMaterialized, StartProcess,
-		StdinFrame, StopProcess, Update, Verdict, WalkComplete, WalkEntry, WalkRequest,
+		self as env_wire, Admission, AdmitInvocation, ArgText, ArgsCommitted, AttachOutput,
+		BlobGetComplete, CancelRequest, ClientFrame, ClientHello, CloseSessionRequest,
+		CloseSessionResponse, CommitBlobPut, CreateWorktree, DataEvent, DataRequest, DataResponse,
+		DestroyWorktree, EventStreamError, EventStreamKind, ExecRequest, ExecStarted, ExitEvent,
+		Interrupt, InvocationScope, InvokeAccepted, InvokeTool, ListProcesses, MaterializeSite,
+		MergeWorktree, OpenSessionRequest, OpenSessionResponse, OutputAttached, OutputFrame,
+		ProcessCommandAccepted, ProcessList, ProcessOutput, ProcessStarted, ProcessStateEvent,
+		ProtocolError, ProtocolErrorCode, Retire, SearchComplete, SearchMatchMsg, SearchRequest,
+		SendInput, ServerFrame, ServerHello, SignalProcess, SignalRequest, SiteMaterialized,
+		StartProcess, StdinFrame, StopProcess, Update, Verdict, WalkComplete, WalkEntry, WalkRequest,
 		WorktreeResult, cancel_request, client_frame, data_event, data_request, data_response,
 		document_op, document_result, server_frame, worktree_op,
 	},
@@ -148,6 +148,92 @@ pub struct EnvClient {
 	inner: Arc<ClientInner>,
 }
 
+/// Cloneable out-of-band control for one active environment execution.
+///
+/// Unlike [`ExecRun`], this handle does not own the execution stream or its
+/// cancellation guard. It is safe to hand to a UI overlay: every operation is
+/// resolved by the Environment from the opaque execution id and remains
+/// generation-fenced by the invocation scope.
+#[derive(Clone, Debug)]
+pub struct ActiveExecControl {
+	client: EnvClient,
+	exec:   Bytes,
+}
+
+impl ActiveExecControl {
+	/// Returns the opaque execution identity.
+	#[must_use]
+	pub fn exec_id(&self) -> &Bytes {
+		&self.exec
+	}
+
+	/// Writes bytes to the active execution's stdin.
+	pub async fn stdin(&self, data: Bytes) -> Result<bool, ClientError> {
+		self
+			.client
+			.exec_live_control(env_wire::exec_session_op::Op::Stdin(StdinFrame {
+				exec:  self.exec.clone(),
+				input: Some(env_wire::stdin_frame::Input::Data(data)),
+				props: None,
+			}))
+			.await
+	}
+
+	/// Closes the active execution's stdin.
+	pub async fn eof(&self) -> Result<bool, ClientError> {
+		self
+			.client
+			.exec_live_control(env_wire::exec_session_op::Op::Stdin(StdinFrame {
+				exec:  self.exec.clone(),
+				input: Some(env_wire::stdin_frame::Input::Eof(true)),
+				props: None,
+			}))
+			.await
+	}
+
+	/// Resizes the active execution's pseudo-terminal.
+	pub async fn resize(&self, rows: u32, columns: u32) -> Result<bool, ClientError> {
+		self
+			.client
+			.exec_live_control(env_wire::exec_session_op::Op::Resize(env_wire::ResizeRequest {
+				exec: self.exec.clone(),
+				rows,
+				columns,
+				props: None,
+			}))
+			.await
+	}
+
+	/// Sends one named process-group signal.
+	pub async fn signal(&self, signal: impl Into<String>) -> Result<bool, ClientError> {
+		self
+			.client
+			.exec_live_control(env_wire::exec_session_op::Op::Signal(SignalRequest {
+				exec:   self.exec.clone(),
+				signal: signal.into(),
+				props:  None,
+			}))
+			.await
+	}
+
+	/// Applies resource-owned graceful or forced cancellation.
+	pub async fn cancel(
+		&self,
+		control: env_wire::ExecControlKind,
+		grace_ms: u64,
+	) -> Result<bool, ClientError> {
+		Ok(self
+			.client
+			.exec_control(env_wire::ExecControlRequest {
+				exec: self.exec.clone(),
+				control: control as i32,
+				grace_ms,
+				wire_revision: omp_proto::SCHEMA_REV,
+			})
+			.await?
+			.accepted)
+	}
+}
 struct ClientInner {
 	outgoing:     Sender<ClientFrame>,
 	pending:      Mutex<HashMap<u64, Sender<ServerFrame>>>,
@@ -422,6 +508,54 @@ pub struct DataStream {
 	stream: RequestStream,
 }
 
+/// One typed DAP stream item.
+#[derive(Debug)]
+pub enum DapStreamEvent {
+	/// The session was launched or attached.
+	Session(document::DapSessionResponse),
+	/// The action's terminal response.
+	Action(document::DapActionResponse),
+	/// Ordered adapter output.
+	Output(document::DapOutput),
+	/// Ordered adapter lifecycle or debugger event.
+	Event(document::DapEvent),
+}
+
+/// A cancellable DAP launch, attach, or action stream.
+#[derive(Debug)]
+pub struct DapStream {
+	stream: RequestStream,
+}
+
+/// One internal-resource completion item.
+#[derive(Debug)]
+pub enum ResourceCompletionEvent {
+	/// One scored completion.
+	Completion(env_wire::ResourceCompletion),
+	/// Terminal completion accounting.
+	Complete(env_wire::ResourceCompletionComplete),
+}
+
+/// A cancellable internal-resource completion stream.
+#[derive(Debug)]
+pub struct ResourceCompletionStream {
+	stream: RequestStream,
+}
+
+/// One MCP subscription item.
+#[derive(Debug)]
+pub enum McpSubscriptionEvent {
+	/// Server notification.
+	Notification(env_wire::McpNotification),
+	/// Lifecycle/status transition.
+	Status(env_wire::McpServerStatus),
+}
+
+/// A cancellable MCP notification and status subscription.
+#[derive(Debug)]
+pub struct McpSubscription {
+	stream: RequestStream,
+}
 impl EnvClient {
 	/// Builds a client over decoded bidirectional frame channels.
 	///
@@ -548,6 +682,20 @@ impl EnvClient {
 		}
 	}
 
+	/// Begins graceful Environment shutdown and waits for admission closure.
+	pub async fn shutdown(
+		&self,
+		request: env_wire::ShutdownRequest,
+	) -> Result<env_wire::ShutdownAcknowledged, ClientError> {
+		match self
+			.one_shot(client_frame::Body::Shutdown(request), None)
+			.await?
+		{
+			server_frame::Body::ShutdownAcknowledged(acknowledged) => Ok(acknowledged),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ShutdownAcknowledged" }),
+		}
+	}
+
 	/// Materializes one immutable Python site tree through the installer-only
 	/// environment connection.
 	///
@@ -573,6 +721,157 @@ impl EnvClient {
 			}) => Ok(response),
 			_ => Err(ClientError::UnexpectedResponse { expected: "SiteMaterialized" }),
 		}
+	}
+
+	/// Retrieves bounded, versioned host facts from the Environment authority.
+	pub async fn host_info(
+		&self,
+		request: env_wire::HostInfoRequest,
+	) -> Result<env_wire::HostInfo, ClientError> {
+		let response = self
+			.data_request_owned(DataRequest {
+				body: Some(data_request::Body::HostInfo(request)),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::HostInfo(result)) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "HostInfo" }),
+		}
+	}
+
+	/// Retrieves the ordered canonical set of primary and granted roots.
+	pub async fn workspace_roots(
+		&self,
+		request: env_wire::WorkspaceRootSetRequest,
+	) -> Result<env_wire::WorkspaceRootSet, ClientError> {
+		let response = self
+			.data_request_owned(DataRequest {
+				body: Some(data_request::Body::WorkspaceRoots(request)),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::WorkspaceRoots(result)) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceRootSet" }),
+		}
+	}
+
+	/// Returns Environment-owned MCP lifecycle status and definition epoch.
+	pub async fn mcp_status(
+		&self,
+		request: env_wire::McpStatusRequest,
+	) -> Result<env_wire::McpStatusResult, ClientError> {
+		let result = self
+			.mcp_request(env_wire::mcp_op::Op::Status(request))
+			.await?;
+		match result.result {
+			Some(env_wire::mcp_result::Result::Status(status)) => Ok(status),
+			_ => Err(ClientError::UnexpectedResponse { expected: "McpStatusResult" }),
+		}
+	}
+
+	/// Executes one finite native MCP configuration operation.
+	pub async fn mcp_config(
+		&self,
+		request: env_wire::McpConfigRequest,
+	) -> Result<env_wire::McpConfigResult, ClientError> {
+		let result = self
+			.mcp_request(env_wire::mcp_op::Op::Config(request))
+			.await?;
+		match result.result {
+			Some(env_wire::mcp_result::Result::Config(config)) => Ok(config),
+			_ => Err(ClientError::UnexpectedResponse { expected: "McpConfigResult" }),
+		}
+	}
+
+	/// Resets one MCP server at its exact definition epoch.
+	pub async fn mcp_reset(
+		&self,
+		request: env_wire::McpResetRequest,
+	) -> Result<env_wire::McpResetResult, ClientError> {
+		let result = self
+			.mcp_request(env_wire::mcp_op::Op::Reset(request))
+			.await?;
+		match result.result {
+			Some(env_wire::mcp_result::Result::Reset(reset)) => Ok(reset),
+			_ => Err(ClientError::UnexpectedResponse { expected: "McpResetResult" }),
+		}
+	}
+
+	/// Resolves live transport headers without exposing credential ownership.
+	pub async fn mcp_live_header(
+		&self,
+		request: env_wire::McpLiveHeaderRequest,
+	) -> Result<env_wire::McpLiveHeader, ClientError> {
+		let result = self
+			.mcp_request(env_wire::mcp_op::Op::LiveHeader(request))
+			.await?;
+		match result.result {
+			Some(env_wire::mcp_result::Result::LiveHeader(header)) => Ok(header),
+			_ => Err(ClientError::UnexpectedResponse { expected: "McpLiveHeader" }),
+		}
+	}
+
+	/// Reads one bounded MCP resource.
+	pub async fn mcp_resource(
+		&self,
+		request: env_wire::McpResourceRequest,
+	) -> Result<env_wire::McpResourceResult, ClientError> {
+		let result = self
+			.mcp_request(env_wire::mcp_op::Op::Resource(request))
+			.await?;
+		match result.result {
+			Some(env_wire::mcp_result::Result::Resource(resource)) => Ok(resource),
+			_ => Err(ClientError::UnexpectedResponse { expected: "McpResourceResult" }),
+		}
+	}
+
+	/// Renders one bounded MCP prompt.
+	pub async fn mcp_prompt(
+		&self,
+		request: env_wire::McpPromptRequest,
+	) -> Result<env_wire::McpPromptResult, ClientError> {
+		let result = self
+			.mcp_request(env_wire::mcp_op::Op::Prompt(request))
+			.await?;
+		match result.result {
+			Some(env_wire::mcp_result::Result::Prompt(prompt)) => Ok(prompt),
+			_ => Err(ClientError::UnexpectedResponse { expected: "McpPromptResult" }),
+		}
+	}
+
+	/// Invokes one MCP tool under Environment lifecycle and timeout authority.
+	pub async fn mcp_invoke(
+		&self,
+		request: env_wire::McpInvokeRequest,
+	) -> Result<env_wire::McpInvokeResult, ClientError> {
+		let result = self
+			.mcp_request(env_wire::mcp_op::Op::Invoke(request))
+			.await?;
+		match result.result {
+			Some(env_wire::mcp_result::Result::Invoke(invoke)) => Ok(invoke),
+			_ => Err(ClientError::UnexpectedResponse { expected: "McpInvokeResult" }),
+		}
+	}
+
+	/// Opens a cancellable MCP notification/status subscription.
+	pub async fn mcp_subscribe(
+		&self,
+		request: env_wire::McpSubscribeRequest,
+	) -> Result<McpSubscription, ClientError> {
+		let stream = self
+			.open(
+				client_frame::Body::Data(DataRequest {
+					body: Some(data_request::Body::Mcp(env_wire::McpOp {
+						op: Some(env_wire::mcp_op::Op::Subscribe(request)),
+					})),
+					..DataRequest::default()
+				}),
+				None,
+			)
+			.await?;
+		Ok(McpSubscription { stream })
 	}
 
 	/// Creates an Environment-owned isolated worktree.
@@ -601,6 +900,81 @@ impl EnvClient {
 		request: MergeWorktree,
 	) -> Result<WorktreeResult, ClientError> {
 		self.worktree_request(worktree_op::Op::Merge(request)).await
+	}
+
+	async fn data_request_owned(&self, request: DataRequest) -> Result<DataResponse, ClientError> {
+		match self
+			.one_shot(client_frame::Body::Data(request), None)
+			.await?
+		{
+			server_frame::Body::Data(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "DataResponse" }),
+		}
+	}
+
+	/// Creates a cloneable out-of-band control handle for one active execution.
+	#[must_use]
+	pub fn active_exec_control(&self, exec: Bytes) -> ActiveExecControl {
+		ActiveExecControl { client: self.clone(), exec }
+	}
+
+	/// Applies typed control to one exec generation.
+	pub async fn exec_control(
+		&self,
+		request: env_wire::ExecControlRequest,
+	) -> Result<env_wire::ExecControlResult, ClientError> {
+		let result = self
+			.exec_session_request(env_wire::exec_session_op::Op::Control(request))
+			.await?;
+		match result.result {
+			Some(env_wire::exec_session_result::Result::Controlled(controlled)) => Ok(controlled),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ExecControlResult" }),
+		}
+	}
+
+	async fn exec_live_control(
+		&self,
+		op: env_wire::exec_session_op::Op,
+	) -> Result<bool, ClientError> {
+		let result = self.exec_session_request(op).await?;
+		match result.result {
+			Some(env_wire::exec_session_result::Result::Controlled(controlled)) => {
+				Ok(controlled.accepted)
+			},
+			_ => Err(ClientError::UnexpectedResponse { expected: "ExecControlResult" }),
+		}
+	}
+
+	async fn exec_session_request(
+		&self,
+		op: env_wire::exec_session_op::Op,
+	) -> Result<env_wire::ExecSessionResult, ClientError> {
+		let response = self
+			.data_request_owned(DataRequest {
+				body: Some(data_request::Body::ExecSession(env_wire::ExecSessionOp { op: Some(op) })),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::ExecSession(result)) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ExecSessionResult" }),
+		}
+	}
+
+	async fn mcp_request(
+		&self,
+		op: env_wire::mcp_op::Op,
+	) -> Result<env_wire::McpResult, ClientError> {
+		let response = self
+			.data_request_owned(DataRequest {
+				body: Some(data_request::Body::Mcp(env_wire::McpOp { op: Some(op) })),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::Mcp(result)) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "McpResult" }),
+		}
 	}
 
 	async fn worktree_request(
@@ -1125,6 +1499,239 @@ impl WorkerEnvClient {
 			.open(client_frame::Body::Data(request), Some(&self.scope))
 			.await?;
 		Ok(LspEvents { stream })
+	}
+
+	/// Reads the Environment-owned repository snapshot for a granted root.
+	pub async fn repository_snapshot(
+		&self,
+		request: env_wire::RepositorySnapshotRequest,
+	) -> Result<env_wire::RepositorySnapshot, ClientError> {
+		let response = self
+			.request(DataRequest {
+				body: Some(data_request::Body::RepositorySnapshot(request)),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::RepositorySnapshot(snapshot)) => Ok(snapshot),
+			_ => Err(ClientError::UnexpectedResponse { expected: "RepositorySnapshot" }),
+		}
+	}
+
+	/// Executes an attributed, approval-ticketed privileged write or unlink.
+	pub async fn privileged_mutation(
+		&self,
+		request: env_wire::PrivilegedMutationIntent,
+	) -> Result<env_wire::PrivilegedMutationResult, ClientError> {
+		let response = self
+			.request(DataRequest {
+				body: Some(data_request::Body::PrivilegedMutation(request)),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::PrivilegedMutation(result)) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "PrivilegedMutationResult" }),
+		}
+	}
+
+	/// Materializes one internal resource as a leased Environment path.
+	pub async fn materialize(
+		&self,
+		request: env_wire::MaterializeRequest,
+	) -> Result<env_wire::MaterializationLease, ClientError> {
+		let result = self
+			.exec_session_request(env_wire::exec_session_op::Op::Materialize(request))
+			.await?;
+		match result.result {
+			Some(env_wire::exec_session_result::Result::Materialized(lease)) => Ok(lease),
+			_ => Err(ClientError::UnexpectedResponse { expected: "MaterializationLease" }),
+		}
+	}
+
+	/// Releases a materialized Environment path lease.
+	pub async fn release_materialization(
+		&self,
+		request: env_wire::ReleaseMaterialization,
+	) -> Result<env_wire::MaterializationReleased, ClientError> {
+		let result = self
+			.exec_session_request(env_wire::exec_session_op::Op::ReleaseMaterialization(request))
+			.await?;
+		match result.result {
+			Some(env_wire::exec_session_result::Result::MaterializationReleased(released)) => {
+				Ok(released)
+			},
+			_ => Err(ClientError::UnexpectedResponse { expected: "MaterializationReleased" }),
+		}
+	}
+
+	/// Applies typed control to one exec generation.
+	pub async fn exec_control(
+		&self,
+		request: env_wire::ExecControlRequest,
+	) -> Result<env_wire::ExecControlResult, ClientError> {
+		let result = self
+			.exec_session_request(env_wire::exec_session_op::Op::Control(request))
+			.await?;
+		match result.result {
+			Some(env_wire::exec_session_result::Result::Controlled(controlled)) => Ok(controlled),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ExecControlResult" }),
+		}
+	}
+
+	/// Negotiates backend capabilities for an exec session.
+	pub async fn exec_capabilities(
+		&self,
+		request: env_wire::ExecCapabilitiesRequest,
+	) -> Result<env_wire::ExecBackendCapabilities, ClientError> {
+		let result = self
+			.exec_session_request(env_wire::exec_session_op::Op::Capabilities(request))
+			.await?;
+		match result.result {
+			Some(env_wire::exec_session_result::Result::Capabilities(capabilities)) => {
+				Ok(capabilities)
+			},
+			_ => Err(ClientError::UnexpectedResponse { expected: "ExecBackendCapabilities" }),
+		}
+	}
+
+	/// Reads revision-fenced final working-directory metadata.
+	pub async fn exec_final_cwd(
+		&self,
+		request: env_wire::ExecFinalCwdRequest,
+	) -> Result<env_wire::ExecFinalCwd, ClientError> {
+		let result = self
+			.exec_session_request(env_wire::exec_session_op::Op::FinalCwd(request))
+			.await?;
+		match result.result {
+			Some(env_wire::exec_session_result::Result::FinalCwd(final_cwd)) => Ok(final_cwd),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ExecFinalCwd" }),
+		}
+	}
+
+	/// Launches a revision-fenced DAP session and streams its typed events.
+	pub async fn dap_launch(
+		&self,
+		request: document::DapLaunchRequest,
+	) -> Result<DapStream, ClientError> {
+		self
+			.dap_stream(data_request::Body::DapLaunch(request))
+			.await
+	}
+
+	/// Attaches a revision-fenced DAP session and streams its typed events.
+	pub async fn dap_attach(
+		&self,
+		request: document::DapAttachRequest,
+	) -> Result<DapStream, ClientError> {
+		self
+			.dap_stream(data_request::Body::DapAttach(request))
+			.await
+	}
+
+	/// Applies one capability-tagged, revision-fenced DAP action.
+	pub async fn dap_action(
+		&self,
+		request: document::DapActionRequest,
+	) -> Result<DapStream, ClientError> {
+		self
+			.dap_stream(data_request::Body::DapAction(request))
+			.await
+	}
+
+	/// Reads one bounded internal resource.
+	pub async fn resource_read(
+		&self,
+		request: env_wire::ResourceReadRequest,
+	) -> Result<env_wire::ResourceResult, ClientError> {
+		self
+			.resource_request(env_wire::resource_op::Op::Read(request))
+			.await
+	}
+
+	/// Lists one bounded internal resource.
+	pub async fn resource_list(
+		&self,
+		request: env_wire::ResourceListRequest,
+	) -> Result<env_wire::ResourceResult, ClientError> {
+		self
+			.resource_request(env_wire::resource_op::Op::List(request))
+			.await
+	}
+
+	/// Resolves one internal resource to canonical path metadata without bytes.
+	pub async fn resource_path(
+		&self,
+		request: env_wire::ResourcePathRequest,
+	) -> Result<env_wire::ResourceResult, ClientError> {
+		self
+			.resource_request(env_wire::resource_op::Op::Path(request))
+			.await
+	}
+
+	/// Opens a cancellable, bounded internal-resource completion stream.
+	pub async fn resource_complete(
+		&self,
+		request: env_wire::ResourceCompleteRequest,
+	) -> Result<ResourceCompletionStream, ClientError> {
+		let stream = self
+			.client
+			.open(
+				client_frame::Body::Data(DataRequest {
+					body: Some(data_request::Body::Resource(env_wire::ResourceOp {
+						op: Some(env_wire::resource_op::Op::Complete(request)),
+					})),
+					..DataRequest::default()
+				}),
+				Some(&self.scope),
+			)
+			.await?;
+		Ok(ResourceCompletionStream { stream })
+	}
+
+	async fn exec_session_request(
+		&self,
+		op: env_wire::exec_session_op::Op,
+	) -> Result<env_wire::ExecSessionResult, ClientError> {
+		let response = self
+			.request(DataRequest {
+				body: Some(data_request::Body::ExecSession(env_wire::ExecSessionOp { op: Some(op) })),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::ExecSession(result)) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ExecSessionResult" }),
+		}
+	}
+
+	async fn resource_request(
+		&self,
+		op: env_wire::resource_op::Op,
+	) -> Result<env_wire::ResourceResult, ClientError> {
+		let response = self
+			.request(DataRequest {
+				body: Some(data_request::Body::Resource(env_wire::ResourceOp { op: Some(op) })),
+				..DataRequest::default()
+			})
+			.await?;
+		match response.body {
+			Some(data_response::Body::Resource(env_wire::ResourceOpResult {
+				result: Some(result),
+			})) => Ok(result),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ResourceResult" }),
+		}
+	}
+
+	async fn dap_stream(&self, body: data_request::Body) -> Result<DapStream, ClientError> {
+		let stream = self
+			.client
+			.open(
+				client_frame::Body::Data(DataRequest { body: Some(body), ..DataRequest::default() }),
+				Some(&self.scope),
+			)
+			.await?;
+		Ok(DapStream { stream })
 	}
 
 	/// Starts a streaming workspace walk rooted at a typed environment path.
@@ -1845,6 +2452,110 @@ impl DataStream {
 	}
 }
 
+impl DapStream {
+	/// Waits for the next typed DAP session, action, output, or event frame.
+	pub async fn next_event(&mut self) -> Result<Option<DapStreamEvent>, ClientError> {
+		let Some(frame) = self.stream.next().await? else {
+			return Ok(None);
+		};
+		match response_body(frame) {
+			Ok(server_frame::Body::Data(DataResponse {
+				body: Some(data_response::Body::DapSession(session)),
+				..
+			})) => {
+				self.stream.finish();
+				Ok(Some(DapStreamEvent::Session(session)))
+			},
+			Ok(server_frame::Body::Data(DataResponse {
+				body: Some(data_response::Body::DapAction(action)),
+				..
+			})) => {
+				self.stream.finish();
+				Ok(Some(DapStreamEvent::Action(action)))
+			},
+			Ok(server_frame::Body::DataEvent(DataEvent {
+				body: Some(data_event::Body::DapOutput(output)),
+				..
+			})) => Ok(Some(DapStreamEvent::Output(output))),
+			Ok(server_frame::Body::DataEvent(DataEvent {
+				body: Some(data_event::Body::DapEvent(event)),
+				..
+			})) => Ok(Some(DapStreamEvent::Event(event))),
+			Ok(_) => Err(ClientError::UnexpectedResponse { expected: "typed DAP frame" }),
+			Err(error) => {
+				self.stream.finish();
+				Err(error)
+			},
+		}
+	}
+
+	/// Cancels the server-side DAP request or subscription.
+	pub fn cancel(self) {
+		self.stream.cancel();
+	}
+}
+
+impl ResourceCompletionStream {
+	/// Waits for the next completion or terminal accounting frame.
+	pub async fn next_event(&mut self) -> Result<Option<ResourceCompletionEvent>, ClientError> {
+		let Some(frame) = self.stream.next().await? else {
+			return Ok(None);
+		};
+		match response_body(frame) {
+			Ok(server_frame::Body::DataEvent(DataEvent {
+				body: Some(data_event::Body::ResourceCompletion(completion)),
+				..
+			})) => Ok(Some(ResourceCompletionEvent::Completion(completion))),
+			Ok(server_frame::Body::DataEvent(DataEvent {
+				body: Some(data_event::Body::ResourceCompletionComplete(complete)),
+				..
+			})) => {
+				self.stream.finish();
+				Ok(Some(ResourceCompletionEvent::Complete(complete)))
+			},
+			Ok(_) => Err(ClientError::UnexpectedResponse { expected: "resource completion frame" }),
+			Err(error) => {
+				self.stream.finish();
+				Err(error)
+			},
+		}
+	}
+
+	/// Cancels the server-side completion request.
+	pub fn cancel(self) {
+		self.stream.cancel();
+	}
+}
+
+impl McpSubscription {
+	/// Waits for the next MCP notification or lifecycle transition.
+	pub async fn next_event(&mut self) -> Result<Option<McpSubscriptionEvent>, ClientError> {
+		let Some(frame) = self.stream.next().await? else {
+			return Ok(None);
+		};
+		match response_body(frame) {
+			Ok(server_frame::Body::DataEvent(DataEvent {
+				body: Some(data_event::Body::McpNotification(notification)),
+				..
+			})) => Ok(Some(McpSubscriptionEvent::Notification(notification))),
+			Ok(server_frame::Body::DataEvent(DataEvent {
+				body: Some(data_event::Body::McpStatus(status)),
+				..
+			})) => Ok(Some(McpSubscriptionEvent::Status(status))),
+			Ok(_) => Err(ClientError::UnexpectedResponse { expected: "MCP subscription frame" }),
+			Err(error) => {
+				self.stream.finish();
+				Err(error)
+			},
+		}
+	}
+
+	/// Cancels the MCP subscription.
+	pub fn cancel(self) {
+		self.stream.cancel();
+	}
+}
+
 impl BlobDownload {
 	/// Waits for the next ordered chunk or terminal completion marker.
 	pub async fn next_event(&mut self) -> Result<Option<BlobDownloadEvent>, ClientError> {
@@ -2009,6 +2720,9 @@ fn stream_lost(event: EventStreamError) -> ClientError {
 		EventStreamKind::ProcessOutput | EventStreamKind::ProcessState => {
 			"reattach and resume after the last observed sequence"
 		},
+		EventStreamKind::Dap => "reopen the DAP session before issuing another action",
+		EventStreamKind::ResourceCompletion => "restart completion from a fresh catalog revision",
+		EventStreamKind::McpNotification => "resubscribe from the last observed sequence",
 		EventStreamKind::Unspecified => "reopen the resource before continuing",
 	};
 	ClientError::StreamLost(StreamLost {
@@ -2024,7 +2738,14 @@ const fn ensure_worker_data(request: &DataRequest) -> Result<(), ClientError> {
 		Some(
 			data_request::Body::Document(_)
 			| data_request::Body::Walk(_)
-			| data_request::Body::Search(_),
+			| data_request::Body::Search(_)
+			| data_request::Body::RepositorySnapshot(_)
+			| data_request::Body::PrivilegedMutation(_)
+			| data_request::Body::ExecSession(_)
+			| data_request::Body::DapLaunch(_)
+			| data_request::Body::DapAttach(_)
+			| data_request::Body::DapAction(_)
+			| data_request::Body::Resource(_),
 		) => Ok(()),
 		_ => Err(ClientError::ScopedOperationDenied),
 	}

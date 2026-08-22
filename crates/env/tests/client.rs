@@ -836,3 +836,75 @@ fn owner_worktree_api_preserves_typed_merge_disposition() {
 	assert_eq!(result.branch.as_deref(), Some("omp/agent/agent-1"));
 	server.join().expect("worktree server");
 }
+
+#[test]
+fn host_info_api_preserves_versioned_bounded_facts() {
+	let (client, transport) = EnvClient::in_process(0);
+	let (requests, responses) = transport.into_parts();
+	let server = thread::spawn(move || {
+		let request = receive(&requests);
+		let request_id = request.request_id;
+		assert!(matches!(
+			request.body,
+			Some(client_frame::Body::Data(frame::DataRequest {
+				body: Some(data_request::Body::HostInfo(frame::HostInfoRequest {
+					wire_revision: 9,
+					max_field_bytes: 256,
+					..
+				})),
+				..
+			}))
+		));
+		respond(
+			&responses,
+			request_id,
+			server_frame::Body::Data(frame::DataResponse {
+				body: Some(frame::data_response::Body::HostInfo(frame::HostInfo {
+					wire_revision: 9,
+					os: "Darwin".into(),
+					architecture: "arm64".into(),
+					..Default::default()
+				})),
+				..Default::default()
+			}),
+		);
+	});
+	let info =
+		block_on(client.host_info(frame::HostInfoRequest { wire_revision: 9, max_field_bytes: 256 }))
+			.expect("typed host info");
+	assert_eq!(info.os, "Darwin");
+	assert_eq!(info.architecture, "arm64");
+	server.join().expect("host-info server");
+}
+
+#[test]
+fn resource_completion_is_scoped_streamed_and_cancellable() {
+	let (client, transport) = EnvClient::in_process(0);
+	let (requests, responses) = transport.into_parts();
+	let worker = client.worker_scope(data_scope());
+	let stream = block_on(worker.resource_complete(frame::ResourceCompleteRequest {
+		input:            "skill://pro".into(),
+		max_results:      5,
+		catalog_revision: 7,
+		wire_revision:    8,
+	}))
+	.expect("completion stream");
+	let request = receive(&requests);
+	let request_id = request.request_id;
+	assert!(request.scope.is_some());
+	assert!(matches!(
+		request.body,
+		Some(client_frame::Body::Data(frame::DataRequest {
+			body: Some(data_request::Body::Resource(frame::ResourceOp {
+				op: Some(frame::resource_op::Op::Complete(frame::ResourceCompleteRequest {
+					max_results: 5,
+					..
+				})),
+			})),
+			..
+		}))
+	));
+	stream.cancel();
+	expect_scoped_cancel(receive(&requests), request_id);
+	drop(responses);
+}

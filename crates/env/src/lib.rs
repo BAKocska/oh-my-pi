@@ -18,11 +18,13 @@ pub use bundle::{
 	push_bundle, unpack_bundle,
 };
 pub use client::{
-	BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, DataScope, DataStream, DataStreamItem,
-	DocumentEvents, DocumentLease, DocumentRead, EnvClient, ExecEvent, ExecRun,
-	InProcessEnvTransport, Invocation, InvocationEvent, LspEvents, LspStreamEvent,
-	ProcessAttachment, ProcessAttachmentEvent, RequestStream, SearchEvent, SearchStream, StreamLost,
-	TransactionId, TransactionOutcome, WalkEvent, WalkStream, WorkerEnvClient,
+	ActiveExecControl, BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, DapStream,
+	DapStreamEvent, DataScope, DataStream, DataStreamItem, DocumentEvents, DocumentLease,
+	DocumentRead, EnvClient, ExecEvent, ExecRun, InProcessEnvTransport, Invocation, InvocationEvent,
+	LspEvents, LspStreamEvent, McpSubscription, McpSubscriptionEvent, ProcessAttachment,
+	ProcessAttachmentEvent, RequestStream, ResourceCompletionEvent, ResourceCompletionStream,
+	SearchEvent, SearchStream, StreamLost, TransactionId, TransactionOutcome, WalkEvent, WalkStream,
+	WorkerEnvClient,
 };
 pub use guard::{RunGuard, WorkerLease};
 /// Generated `omp.env.v1` wire frames used at transport boundaries.
