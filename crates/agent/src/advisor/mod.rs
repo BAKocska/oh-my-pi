@@ -1,10 +1,15 @@
 //! Isolated advisor policy, bounded primary-history delivery, and emission
 //! admission.
 
+mod advise;
 mod guard;
 mod rules;
 mod runtime;
 
+pub use advise::{
+	AdviceAdmission, AdviseFault, AdviseParams, AdvisePayload, AdviseTool, AdviseUpdate,
+	AdvisorAdviceQueue, QueuedAdvice, tool as advise_tool,
+};
 pub use guard::{
 	ADVICE_DEDUPE_LIMIT, AdvisorEmissionGuard, AdvisorQuarantineReason, AdvisorSuppression,
 	GuardedAdvice, normalize_advice, quarantine_advisor_turn,
@@ -15,7 +20,9 @@ pub use rules::{
 	parse_watchdog_yaml, slugify_advisor_name,
 };
 pub use runtime::{
-	AdviceDelivery, AdviceSeverity, AdvisorHistoryDelta, AdvisorHistoryEntry, AdvisorRuntimeState,
-	BoundedAdvisorHistory, DEFAULT_HISTORY_BYTE_LIMIT, DEFAULT_HISTORY_ENTRY_LIMIT, DeliveryContext,
-	ImmuneTurnAccount,
+	ADVISOR_FINGERPRINT_CHUNK_BYTES, AdviceDelivery, AdviceSeverity, AdvisorDeliveryRouter,
+	AdvisorDeltaBatch, AdvisorDeltaChunk, AdvisorDeltaSync, AdvisorHistoryDelta,
+	AdvisorHistoryEntry, AdvisorRouteError, AdvisorRuntimeState, BoundedAdvisorHistory,
+	DEFAULT_HISTORY_BYTE_LIMIT, DEFAULT_HISTORY_ENTRY_LIMIT, DeliveryContext, ImmuneTurnAccount,
+	MAX_DELTA_COALESCE_ROUNDS, RoutedAdvice,
 };

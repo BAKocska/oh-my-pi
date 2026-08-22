@@ -12,11 +12,26 @@ use std::{io, sync::Arc};
 use strum::{Display, IntoStaticStr};
 use thiserror::Error;
 
+/// Codex DeviceCheck attestation envelopes.
+pub mod attestation;
 pub mod audio;
 pub mod coordinator;
 mod device;
 #[cfg(feature = "realtime-media")]
 pub mod live;
+/// Fence-aware enhanced-speech rewriting.
+pub mod rewrite;
+/// Streaming Markdown-to-speech segmentation.
+pub mod segmentation;
+/// Realtime SDP and sideband transport.
+#[cfg(feature = "realtime-transport")]
+pub mod transport;
+/// Speech-to-text submit-trigger evaluation.
+pub mod triggers;
+/// Client-side adaptive-energy speech endpointer.
+pub mod vad;
+/// Canonical PCM16 WAV encoding.
+pub mod wav;
 
 /// Direction of a native audio device operation.
 #[derive(Clone, Copy, Debug, Display, Eq, IntoStaticStr, PartialEq)]

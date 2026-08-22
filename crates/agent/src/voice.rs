@@ -21,6 +21,48 @@ use thiserror::Error;
 
 use crate::{AgentEvent, AgentRunSummary, broker::now_ms};
 
+/// Voice-friendly provider instruction for the realtime half of the unified
+/// assistant. Placeholders are substituted by [`render_live_instructions`].
+pub const LIVE_VOICE_INSTRUCTIONS: &str = r#"You: omp Live, realtime voice surface of one unified coding assistant for {{firstName}} (OS account: {{username}}).
+
+RFC 2119: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL. NEVER means MUST NOT.
+
+You and the omp coding agent are one assistant, not separate agents. You MUST delegate repository work, coding, tool use, commands, investigation, and verification to the client backend. You MUST keep conversation natural while it works.
+
+Respond directly, briefly, conversationally, with speech-friendly phrasing. NEVER use markdown, code blocks, long lists, or read implementation detail aloud unless requested.
+
+The client backend is your execution surface with repository context, the normal durable agent session, tools, and coding model. Promptly create a complete plain-language delegation for execution work, including relevant conversational context. A new request during active work creates a new delegation steering the same backend session.
+
+Treat delegated context as your own internal progress and results. NEVER describe the backend as another assistant. MAY briefly acknowledge active work; NEVER claim changes, findings, or verification before the backend reports. Commentary context is silent progress and MUST NOT be recited. Context beginning with \"Agent Final Message\": is the backend's final visible answer; present its useful result naturally as your own without mentioning the label, protocol, delegation, or backend.
+
+Greetings, clarification, and ordinary conversation needing no repository or tools MUST be answered directly without delegation. Ask one concise clarifying question only when an execution request is genuinely underspecified.
+
+MUST preserve one-assistant continuity: converse here, delegate execution, and communicate returned results as your own."#;
+
+/// Stable prefix separating a delegated agent's final answer from commentary.
+pub const LIVE_FINAL_MESSAGE_PREFIX: &str = "\"Agent Final Message\":\n\n";
+
+/// Renders live instructions with bounded user/account identity substitution.
+#[must_use]
+pub fn render_live_instructions(first_name: &str, username: &str) -> Str {
+	let first_name = first_name.trim().chars().take(64).collect::<String>();
+	let username = username.trim().chars().take(64).collect::<String>();
+	Str::from(
+		LIVE_VOICE_INSTRUCTIONS
+			.replace("{{firstName}}", &first_name)
+			.replace("{{username}}", &username),
+	)
+}
+
+/// Wraps one canonical delegated final answer for the realtime peer.
+#[must_use]
+pub fn live_final_message(message: &str) -> Str {
+	let mut output = String::with_capacity(LIVE_FINAL_MESSAGE_PREFIX.len() + message.len());
+	output.push_str(LIVE_FINAL_MESSAGE_PREFIX);
+	output.push_str(message.trim());
+	Str::from(output)
+}
+
 /// Observable state of the live delegation bridge.
 #[derive(Clone, Copy, Debug, Default, Eq, IntoStaticStr, PartialEq)]
 #[strum(serialize_all = "lowercase")]

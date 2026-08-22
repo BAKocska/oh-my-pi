@@ -235,6 +235,8 @@ pub enum AgentEvent {
 		call_id: Str,
 		/// Canonical result item staged for the next delta.
 		item:    Item,
+		/// Cumulative session usage observed before this tool boundary.
+		usage:   omp_proto::inference::v1::Usage,
 	},
 	/// A detached job began settlement tracking.
 	JobRegistered {
@@ -613,13 +615,17 @@ mod tests {
 		clone.transition(AgentPhase::Idle, AgentPhase::Projecting);
 		assert_eq!(bus.phase(), AgentPhase::Projecting);
 
-		let event = events
-			.try_recv()
-			.expect("transition must remain observable");
-		assert!(matches!(event.as_ref(), AgentEvent::PhaseChanged {
-			from: AgentPhase::Idle,
-			to:   AgentPhase::Projecting,
-		}));
+		let mut saw_phase_change = false;
+		while let Ok(event) = events.try_recv() {
+			if matches!(event.as_ref(), AgentEvent::PhaseChanged {
+				from: AgentPhase::Idle,
+				to:   AgentPhase::Projecting,
+			}) {
+				saw_phase_change = true;
+				break;
+			}
+		}
+		assert!(saw_phase_change, "transition must remain observable");
 		assert_eq!(clone.phase(), AgentPhase::Projecting);
 
 		bus.transition(AgentPhase::Projecting, AgentPhase::Turning);

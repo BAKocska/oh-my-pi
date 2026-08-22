@@ -502,6 +502,18 @@ pub struct ManualCompactionRequest {
 	/// Optional user focus text for summary-producing modes.
 	pub focus: Option<Str>,
 }
+/// Receipt from a mechanical `/shake` rewrite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManualShakeOutcome {
+	/// Mechanical compaction tier applied.
+	pub tier:             CompactionTier,
+	/// Number of historical content regions replaced.
+	pub replaced_regions: u64,
+	/// Exact source bytes moved out of the live prompt.
+	pub removed_bytes:    u64,
+	/// Last materialized prompt-head item event.
+	pub event:            u64,
+}
 
 /// Invalid `/compact` arguments.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -709,6 +721,34 @@ pub fn boundary_reason(
 pub const SNAPCOMPACT_TIER: &str = "SNAPCOMPACT";
 
 /// The current context budget used to decide whether compaction is necessary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContextUsageBreakdown {
+	/// System-policy and static instruction tokens.
+	pub system_tokens:  u64,
+	/// Tool descriptor and tool-choice tokens.
+	pub tool_tokens:    u64,
+	/// Installed skill/context-asset tokens.
+	pub skill_tokens:   u64,
+	/// Conversation message tokens.
+	pub message_tokens: u64,
+	/// Media token estimate.
+	pub media_tokens:   u64,
+}
+
+impl ContextUsageBreakdown {
+	/// Returns the saturating sum of independently measured categories.
+	#[must_use]
+	pub const fn total(self) -> u64 {
+		self
+			.system_tokens
+			.saturating_add(self.tool_tokens)
+			.saturating_add(self.skill_tokens)
+			.saturating_add(self.message_tokens)
+			.saturating_add(self.media_tokens)
+	}
+}
+
+/// The current context budget used to decide whether compaction is necessary.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContextUsage {
 	/// All input tokens currently occupying the provider context.
@@ -733,6 +773,12 @@ pub struct ContextUsage {
 	pub threshold_fraction:    f64,
 	/// Whether a streaming turn makes the total an extrapolation.
 	pub in_flight:             bool,
+	/// Independently measured prompt categories.
+	pub breakdown:             ContextUsageBreakdown,
+	/// Estimated tokens added by the currently streaming turn.
+	pub in_flight_tokens:      u64,
+	/// Prompt tokens removed by the most recent durable history rewrite.
+	pub rewrite_savings:       u64,
 }
 
 impl ContextUsage {
@@ -756,7 +802,56 @@ impl ContextUsage {
 			compaction_epoch: 0,
 			threshold_fraction,
 			in_flight: false,
+			breakdown: ContextUsageBreakdown {
+				system_tokens:  0,
+				tool_tokens:    0,
+				skill_tokens:   0,
+				message_tokens: 0,
+				media_tokens:   0,
+			},
+			in_flight_tokens: 0,
+			rewrite_savings: 0,
 		}
+	}
+
+	/// Replaces the discrete category breakdown without changing authoritative
+	/// provider total usage.
+	#[must_use]
+	pub const fn with_breakdown(mut self, breakdown: ContextUsageBreakdown) -> Self {
+		self.breakdown = breakdown;
+		self
+	}
+
+	/// Marks the usage as in-flight and includes a conservative current-turn
+	/// token estimate in threshold calculations.
+	#[must_use]
+	pub const fn extrapolate_in_flight(mut self, added_tokens: u64) -> Self {
+		self.in_flight = true;
+		self.in_flight_tokens = added_tokens;
+		self
+	}
+
+	/// Records the exact prompt delta across a committed history rewrite and
+	/// advances the durable compaction epoch.
+	#[must_use]
+	pub const fn after_history_rewrite(
+		mut self,
+		before_prompt_tokens: u64,
+		after_prompt_tokens: u64,
+		compaction_epoch: u64,
+	) -> Self {
+		self.total_tokens = after_prompt_tokens;
+		self.rewrite_savings = before_prompt_tokens.saturating_sub(after_prompt_tokens);
+		self.compaction_epoch = compaction_epoch;
+		self.in_flight = false;
+		self.in_flight_tokens = 0;
+		self
+	}
+
+	/// Returns prompt occupancy including the in-flight extrapolation.
+	#[must_use]
+	pub const fn effective_total_tokens(self) -> u64 {
+		self.total_tokens.saturating_add(self.in_flight_tokens)
 	}
 
 	/// Returns occupancy of the usable context window.
@@ -765,7 +860,7 @@ impl ContextUsage {
 		if self.usable_tokens == 0 {
 			return f64::INFINITY;
 		}
-		self.total_tokens as f64 / self.usable_tokens as f64
+		self.effective_total_tokens() as f64 / self.usable_tokens as f64
 	}
 
 	/// Returns the target token count at the configured trigger threshold.
@@ -908,18 +1003,23 @@ pub struct LosslessReceipt {
 /// projection.
 #[must_use]
 pub fn plan_lossless(items: &[ProjectionItem]) -> LosslessPlan {
-	plan_lossless_with_warm_suffix(items, PROMPT_CACHE_WARM_SUFFIX_TOKENS)
+	plan_lossless_with_warm_suffix(items, PROMPT_CACHE_WARM_SUFFIX_TOKENS, |_| false)
 }
 
-/// Plans lossless work while protecting the newest tokenizer-measured suffix.
+/// Plans lossless work while protecting the newest tokenizer-measured suffix
+/// and app-owned retained tool results.
 ///
 /// Items are ordered oldest to newest. The complete item that crosses
 /// `warm_suffix_tokens` is retained, so the protected suffix never undershoots
-/// the configured prompt-cache budget.
+/// the configured prompt-cache budget. `retain_event` is consulted by prune,
+/// shake/drop-media, and asynchronous callers using this shared planner; plan
+/// file reads can therefore remain lossless without agent depending on app
+/// artifact policy.
 #[must_use]
 pub fn plan_lossless_with_warm_suffix(
 	items: &[ProjectionItem],
 	warm_suffix_tokens: u64,
+	retain_event: impl Fn(u64) -> bool,
 ) -> LosslessPlan {
 	let mut protected_start = items.len();
 	let mut protected_tokens = 0_u64;
@@ -934,6 +1034,9 @@ pub fn plan_lossless_with_warm_suffix(
 	plan.receipt.warm_suffix_tokens = protected_tokens;
 	plan.receipt.warm_suffix_event = items.get(protected_start).map(|item| item.event);
 	for item in &items[..protected_start] {
+		if retain_event(item.event) {
+			continue;
+		}
 		if item.useless || item.superseded {
 			plan.prune.push(item.event);
 			plan.receipt.pruned_tokens = plan
@@ -1676,7 +1779,7 @@ mod tests {
 		};
 		let pruned = ProjectionItem { event: 2, useless: true, ..retained };
 		let projection = [retained, pruned];
-		let plan = plan_lossless(&projection);
+		let plan = super::plan_lossless_with_warm_suffix(&projection, 0, |_| false);
 		assert_eq!(plan.prune, vec![2]);
 		assert_eq!(projection[0], retained);
 	}

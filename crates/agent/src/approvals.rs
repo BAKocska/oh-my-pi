@@ -410,6 +410,13 @@ impl ApprovalBook {
 	}
 
 	/// Returns pending tickets in filing order.
+	/// Returns one ticket by its authenticated durable identity.
+	#[must_use]
+	pub fn ticket(&self, ticket_id: &str) -> Option<ApprovalTicket> {
+		self.tickets.lock().get(ticket_id).cloned()
+	}
+
+	/// Returns pending tickets in filing order.
 	#[must_use]
 	pub fn pending(&self) -> Vec<ApprovalTicket> {
 		self

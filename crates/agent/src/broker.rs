@@ -1147,6 +1147,7 @@ impl Broker {
 					source: InterruptSource::Peer { from: message.from.clone() },
 				};
 				if mailbox.try_enqueue(interrupt).is_ok() {
+					node.inbox.push(message.clone());
 					if node.idle {
 						Receipt::Woken
 					} else {
@@ -1465,12 +1466,14 @@ const fn class(mode: DeliveryMode) -> InterruptClass {
 /// Encodes a peer message as the canonical thread item journaled by the loop.
 #[must_use]
 pub fn peer_item(message: &PeerMessage) -> Item {
+	let mut text = String::new();
+	crate::prompt_assets::render_parent_irc(&mut text, message.from.as_str(), message.text.as_str());
 	Item {
 		seq:           0,
 		created_at_ms: message.sent_ms,
 		kind:          Some(item::Kind::Message(ThreadMessage {
 			role:  Role::User as i32,
-			parts: vec![Part { kind: Some(part::Kind::Text(message.text.to_string())) }],
+			parts: vec![Part { kind: Some(part::Kind::Text(text)) }],
 		})),
 		props:         None,
 	}

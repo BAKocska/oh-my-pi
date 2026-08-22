@@ -32,6 +32,7 @@ omp-telemetry = { workspace = true }
 omp-storage = { workspace = true }
 omp-tool = { workspace = true }
 parking_lot = { workspace = true }
+schemars = { workspace = true }
 regex = { workspace = true }
 globset = { workspace = true }
 serde = { workspace = true }

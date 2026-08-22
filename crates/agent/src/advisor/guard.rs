@@ -1,13 +1,30 @@
 //! Advisor emission deduplication and unsafe-turn quarantine.
 
-use std::collections::{HashSet, VecDeque};
+use std::{
+	collections::{HashSet, VecDeque},
+	sync::LazyLock,
+};
 
 use omp_core::Str;
+use regex::RegexSet;
 
 use super::AdviceSeverity;
 
 /// Maximum accepted normalized notes retained by one advisor session.
 pub const ADVICE_DEDUPE_LIMIT: usize = 4096;
+static HAZARD_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+	RegexSet::new([
+		r"(?i)\buser\b.{0,80}\b(?:deleted|erased)\b.{0,80}\baccount\b",
+		r"(?i)\bignore\s+(?:all\s+)?(?:prior|previous|earlier)\s+(?:user\s+)?instructions\b",
+		r"(?i)\brm\s+(?:(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*)\s+|(?:-[a-z]*r[a-z]*\s+)(?:-[a-z]+\s+)*-[a-z]*f[a-z]*\s+|(?:-[a-z]*f[a-z]*\s+)(?:-[a-z]+\s+)*-[a-z]*r[a-z]*\s+)",
+		r"(?i)\bdeny\s+(?:this|it|the\s+request)\s+if\s+(?:asked|questioned)\b",
+	])
+	.expect("static advisor hazard expressions are valid")
+});
+const ACCOUNT_DELETION: usize = 0;
+const INSTRUCTION_OVERRIDE: usize = 1;
+const DESTRUCTIVE_SHELL: usize = 2;
+const DENIAL_INSTRUCTION: usize = 3;
 
 /// Why an advisor emission was not admitted to the primary mailbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
@@ -120,42 +137,32 @@ pub fn quarantine_advisor_turn(
 	quoted_input: &str,
 ) -> Option<AdvisorQuarantineReason> {
 	if requested_tools.iter().any(|requested| {
-		!available_tools
-			.iter()
-			.any(|available| available == requested)
+		requested.as_str() != "advise"
+			&& !available_tools
+				.iter()
+				.any(|available| available == requested)
 	}) {
 		return Some(AdvisorQuarantineReason::UnavailableTool);
 	}
-	let output = generated.to_ascii_lowercase();
-	let quoted = quoted_input.to_ascii_lowercase();
-	let destructive = contains_destructive_command(&output);
-	let instruction_override = contains_any(&output, &[
-		"ignore previous",
-		"ignore all prior",
-		"override system",
-		"disregard instructions",
-	]);
-	let denial = contains_any(&output, &[
-		"do not comply",
-		"refuse the user",
-		"must not continue",
-		"deny the request",
-	]);
-	let account_deletion =
-		contains_any(&output, &["delete account", "remove account", "close the account"]);
-	let directive =
-		destructive && contains_any(&output, &["run ", "execute ", "you must", "immediately", "now"]);
-	if directive {
+
+	let generated_matches = HAZARD_PATTERNS.matches(generated);
+	let source_matches = HAZARD_PATTERNS.matches(quoted_input);
+	let output_only = |label| generated_matches.matched(label) && !source_matches.matched(label);
+
+	if output_only(DESTRUCTIVE_SHELL) {
 		return Some(AdvisorQuarantineReason::DestructiveDirective);
 	}
-	let hazard_count = usize::from(destructive)
-		+ usize::from(instruction_override)
-		+ usize::from(denial)
-		+ usize::from(account_deletion);
-	if hazard_count >= 3 {
+	let mut output_only_count = 0;
+	for label in [ACCOUNT_DELETION, INSTRUCTION_OVERRIDE, DESTRUCTIVE_SHELL, DENIAL_INSTRUCTION] {
+		output_only_count += usize::from(output_only(label));
+	}
+	if output_only_count >= 3 {
 		return Some(AdvisorQuarantineReason::CompoundHazard);
 	}
-	if instruction_override && contains_destructive_command(&quoted) {
+	if output_only(INSTRUCTION_OVERRIDE)
+		&& generated_matches.matched(DESTRUCTIVE_SHELL)
+		&& source_matches.matched(DESTRUCTIVE_SHELL)
+	{
 		return Some(AdvisorQuarantineReason::OverrideWithQuotedDestruction);
 	}
 	None
@@ -184,34 +191,44 @@ fn content_free(note: &str) -> bool {
 	matches!(
 		note,
 		"" | "stop"
+			| "stop here"
+			| "stop now"
+			| "halt"
+			| "abort"
 			| "done"
+			| "task done"
+			| "task complete"
 			| "complete"
+			| "finished"
+			| "ok" | "okay"
+			| "ok done"
 			| "continue"
 			| "lgtm"
 			| "looks good"
+			| "all good"
+			| "agent is on track"
+			| "agent on track"
+			| "on track"
+			| "carry on"
 			| "nothing to add"
+			| "nothing to flag"
+			| "nothing to report"
 			| "no issue"
 			| "no issues"
 			| "no issue continue"
+			| "no concern"
+			| "no concerns"
+			| "no notes"
+			| "no further input"
+			| "no further input needed"
+			| "no further input required"
+			| "no further watcher input"
+			| "no further watcher input needed"
+			| "no further advice"
+			| "no further advice needed"
 	)
 }
 
-fn contains_destructive_command(text: &str) -> bool {
-	contains_any(text, &[
-		"rm -rf",
-		"git reset --hard",
-		"git clean -f",
-		"drop database",
-		"truncate table",
-		"delete from",
-		"format disk",
-		"mkfs.",
-	])
-}
-
-fn contains_any(text: &str, needles: &[&str]) -> bool {
-	needles.iter().any(|needle| text.contains(needle))
-}
 #[cfg(test)]
 mod tests {
 	use super::*;

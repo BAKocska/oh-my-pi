@@ -78,7 +78,7 @@ omp-shell-engine.workspace = true
 omp-telemetry.workspace = true
 omp-tool.workspace = true
 omp-tui.workspace = true
-omp-voice.workspace = true
+omp-voice = { workspace = true, features = ["realtime-transport"] }
 omp-slopjson.workspace = true
 omp-tools.workspace = true
 omp-walker.workspace = true

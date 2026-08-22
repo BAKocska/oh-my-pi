@@ -268,3 +268,75 @@ pub fn render_empty_stop_retry(out: &mut String, retry_count: usize, max_retries
 	write!(out, "{max_retries}").expect("writing to String cannot fail");
 	out.push_str(after_max);
 }
+/// Renders one parent-agent steering notice into an existing buffer.
+pub fn render_parent_irc(out: &mut String, from: &str, message: &str) {
+	const FROM: &str = "{{from}}";
+	const MESSAGE: &str = "{{message}}";
+	let template = prompt_asset(PromptAssetId::ParentIrc).content;
+	let (before_from, after_from) = template
+		.split_once(FROM)
+		.expect("embedded parent IRC asset contains from slot");
+	let (between, after_message) = after_from
+		.split_once(MESSAGE)
+		.expect("embedded parent IRC asset contains message slot");
+	out.reserve(template.len() + from.len() + message.len());
+	out.push_str(before_from);
+	out.push_str(from);
+	out.push_str(between);
+	out.push_str(message);
+	out.push_str(after_message);
+}
+/// Renders bounded loop evidence into the repeated-tool-call redirect.
+pub fn render_tool_call_loop_redirect(out: &mut String, count: u32, digest: &str) {
+	const TOOL: &str = "{{tool_name}}";
+	const COUNT: &str = "{{count}}";
+	const ARGUMENTS: &str = "{{arguments_summary}}";
+	const RESULT: &str = "{{result_summary}}";
+	let template = prompt_asset(PromptAssetId::ToolCallLoopRedirect).content;
+	let (before_tool, after_tool) = template
+		.split_once(TOOL)
+		.expect("embedded tool-loop asset contains tool_name slot");
+	let (before_count, after_count) = after_tool
+		.split_once(COUNT)
+		.expect("embedded tool-loop asset contains count slot");
+	let (before_arguments, after_arguments) = after_count
+		.split_once(ARGUMENTS)
+		.expect("embedded tool-loop asset contains arguments_summary slot");
+	let (before_result, after_result) = after_arguments
+		.split_once(RESULT)
+		.expect("embedded tool-loop asset contains result_summary slot");
+	let (before_second_tool, after_second_tool) = after_result
+		.split_once(TOOL)
+		.expect("embedded tool-loop asset contains repeated tool_name slot");
+	out.reserve(template.len() + digest.len());
+	out.push_str(before_tool);
+	out.push_str("the same tool");
+	out.push_str(before_count);
+	write!(out, "{count}").expect("writing to String cannot fail");
+	out.push_str(before_arguments);
+	out.push_str(digest);
+	out.push_str(before_result);
+	out.push_str("See the immediately preceding tool result.");
+	out.push_str(before_second_tool);
+	out.push_str("the same tool");
+	out.push_str(after_second_tool);
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn dynamic_assets_replace_every_typed_slot() {
+		let mut parent = String::new();
+		render_parent_irc(&mut parent, "parent", "steer now");
+		assert!(parent.contains("parent"));
+		assert!(parent.contains("steer now"));
+		assert!(!parent.contains("{{"));
+
+		let mut redirect = String::new();
+		render_tool_call_loop_redirect(&mut redirect, 3, "digest:abc");
+		assert!(redirect.contains("3 consecutive"));
+		assert!(redirect.contains("digest:abc"));
+		assert!(!redirect.contains("{{"));
+	}
+}

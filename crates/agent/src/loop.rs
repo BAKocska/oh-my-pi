@@ -10,14 +10,19 @@ use std::{
 use futures::StreamExt;
 use omp_core::{Hash32, IntoStr, InvocationPhase, Str, sf};
 use omp_env::EnvClient;
-use omp_llm_inference::TurnId;
+use omp_llm_inference::{TurnId, layer::secrets::SecretStreamRestorer};
 use omp_proto::{
 	inference::v1::{self as pb, ContextRef, Outcome, ThreadDelta},
 	thread::v1::{self as thread, Item, Thread},
 };
-use omp_secrets::{json::deobfuscate_json, obfuscator::SecretObfuscator};
+use omp_secrets::{
+	json::{deobfuscate_json, obfuscate_json},
+	message::{MessageTextKind, obfuscate_message_text, restore_message_text},
+	obfuscator::SecretObfuscator,
+};
 use omp_storage::{
 	blob::BlobStore,
+	gc::{ArtifactCatalog, ArtifactLifetime},
 	transcript::{
 		CallId, ChildLifecycleEntry, Entry, InvocationTransition, Kind, SnapcompactArchive,
 	},
@@ -34,11 +39,12 @@ use serde_json::{Value, value::RawValue};
 use thiserror::Error;
 
 use crate::{
-	AgentRegistry, BatchError, CompactionCoordinator, CompactionMethodOrder, Journal, JournalError,
-	Mailbox, MailboxSender, ManualCompactionMode, ManualCompactionOutcome, ManualCompactionRequest,
-	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource,
-	SnapcompactPreparation, TtsrMatch, TtsrMatchContext, TtsrRegistry, TtsrSource, TurnClient,
-	TurnInput, TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	AgentRegistry, BatchError, CompactionCoordinator, CompactionMethodOrder, CompactionTier,
+	Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode, ManualCompactionOutcome,
+	ManualCompactionRequest, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError,
+	PromptMemoryQuery, PromptMemorySnapshotSource, SnapcompactPreparation, TtsrMatch,
+	TtsrMatchContext, TtsrRegistry, TtsrSource, TurnClient, TurnInput, TurnSession, YieldPayload,
+	YieldPayloadError, YieldPayloadValidator,
 	batch::{
 		ExecutionModeHandle, InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest,
 		SpeculativeCall, ToolBatch,
@@ -360,6 +366,9 @@ pub enum AgentError {
 	/// Durable blob placement failed before a journal commit.
 	#[error(transparent)]
 	Blob(#[from] omp_storage::blob::Error),
+	/// Artifact metadata publication failed before a prompt rewrite.
+	#[error(transparent)]
+	Artifact(#[from] omp_storage::gc::Error),
 	/// Deterministic prompt rendering failed.
 	#[error(transparent)]
 	Prompt(#[from] PromptError),
@@ -481,6 +490,8 @@ pub struct Agent<C: TurnClient> {
 	phase: AgentPhase,
 	control_serviced_during_turn: bool,
 	context: Option<ContextRef>,
+	cumulative_usage: pb::Usage,
+	pending_reasoning_demotion: bool,
 	prompt_hash: Option<PromptHash>,
 	prompt_head_events: Vec<u64>,
 	settled_gate: Option<Arc<HookGate>>,
@@ -495,6 +506,7 @@ pub struct Agent<C: TurnClient> {
 	secret_obfuscator: Option<Arc<Mutex<SecretObfuscator>>>,
 	compaction: CompactionCoordinator,
 	blob_store: Option<BlobStore>,
+	artifact_catalog: Option<Arc<Mutex<ArtifactCatalog>>>,
 	ttsr: Option<TtsrRegistry>,
 	deferred_ttsr: Vec<DeferredTtsr>,
 	autolearn: Option<crate::AutolearnController>,
@@ -577,6 +589,8 @@ impl<C: TurnClient> Agent<C> {
 			phase: AgentPhase::Idle,
 			control_serviced_during_turn: false,
 			context,
+			cumulative_usage: pb::Usage::default(),
+			pending_reasoning_demotion: false,
 			prompt_hash,
 			prompt_head_events,
 			settled_gate: None,
@@ -591,6 +605,7 @@ impl<C: TurnClient> Agent<C> {
 			secret_obfuscator: None,
 			compaction: CompactionCoordinator::default(),
 			blob_store: None,
+			artifact_catalog: None,
 			ttsr: None,
 			deferred_ttsr: Vec::new(),
 			autolearn: None,
@@ -712,6 +727,77 @@ impl<C: TurnClient> Agent<C> {
 	/// paths.
 	pub fn set_blob_store(&mut self, blob_store: BlobStore) {
 		self.blob_store = Some(blob_store);
+	}
+
+	/// Installs the app-owned artifact metadata authority used by `/shake`.
+	pub fn set_artifact_catalog(&mut self, catalog: Arc<Mutex<ArtifactCatalog>>) {
+		self.artifact_catalog = Some(catalog);
+	}
+
+	/// Applies the mechanical `/shake` tiers while retaining a warm recent tail.
+	///
+	/// Elided source is put in the app-injected blob authority before its live
+	/// prompt part is replaced, so every placeholder remains recoverable.
+	pub fn shake_manual(&mut self, tier: CompactionTier) -> Result<ManualShakeOutcome, AgentError> {
+		if !matches!(tier, CompactionTier::Elide | CompactionTier::DropMedia) {
+			return Err(AgentError::Protocol("unsupported /shake tier"));
+		}
+		if self.journal.pending_turn().is_some() {
+			return Err(AgentError::Protocol("cannot shake while a turn is pending"));
+		}
+		let prompt_hash = self
+			.prompt_hash
+			.ok_or(AgentError::Protocol("cannot shake before the prompt is assembled"))?;
+		let store = self
+			.blob_store
+			.as_ref()
+			.ok_or(AgentError::Protocol("shake blob store is not configured"))?;
+		let catalog = self
+			.artifact_catalog
+			.as_ref()
+			.ok_or(AgentError::Protocol("shake artifact catalog is not configured"))?;
+		let live_events = self.journal.live_item_events()?;
+		let mut items = self.journal.items_at(&live_events)?;
+		if items.is_empty() {
+			return Err(AgentError::Protocol("nothing to shake"));
+		}
+		const PROTECTED_TAIL_BYTES: usize = 16_000;
+		let mut tail_bytes = 0usize;
+		let mut protected_start = items.len();
+		for (index, item) in items.iter().enumerate().rev() {
+			if tail_bytes >= PROTECTED_TAIL_BYTES {
+				break;
+			}
+			protected_start = index;
+			tail_bytes = tail_bytes.saturating_add(serde_json::to_vec(item)?.len());
+		}
+		let mut replaced_regions = 0_u64;
+		let mut removed_bytes = 0_u64;
+		for item in &mut items[..protected_start] {
+			shake_item(
+				item,
+				tier,
+				store,
+				catalog,
+				self.journal.session_id(),
+				&mut replaced_regions,
+				&mut removed_bytes,
+			)?;
+		}
+		if replaced_regions == 0 {
+			return Err(AgentError::Protocol("nothing eligible to shake"));
+		}
+		let rewritten = self
+			.journal
+			.rewrite_prompt_head(now_ms(), prompt_hash, &items, &[])?;
+		self.context = None;
+		self.prompt_head_events.clone_from(&rewritten);
+		Ok(ManualShakeOutcome {
+			tier,
+			replaced_regions,
+			removed_bytes,
+			event: rewritten.last().copied().unwrap_or_default(),
+		})
 	}
 
 	/// Executes and durably commits a one-off manual compaction.
@@ -1120,6 +1206,7 @@ impl<C: TurnClient> Agent<C> {
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
 					self.context = None;
+					self.pending_reasoning_demotion = true;
 					self.abort_rx.mark_unchanged();
 					self.drain_control();
 					self.execute_scheduled_rewinds()?;
@@ -1179,6 +1266,9 @@ impl<C: TurnClient> Agent<C> {
 				},
 			};
 			self.publish_model_request(&outcome);
+			if let Some(usage) = outcome.usage.as_ref() {
+				accumulate_usage(&mut self.cumulative_usage, usage);
+			}
 			committed_turns = committed_turns.saturating_add(1);
 			let stop = outcome.stop();
 			self.context = outcome.revision.clone().and_then(|expected| {
@@ -1224,6 +1314,10 @@ impl<C: TurnClient> Agent<C> {
 						return Err(error);
 					},
 				};
+				let mut calls = calls;
+				for call in &mut calls {
+					call.set_cumulative_usage(self.cumulative_usage.clone());
+				}
 				let made_environment_effect = calls
 					.iter()
 					.any(|call| crate::effects_mutate_environment(call.effects()));
@@ -1350,6 +1444,19 @@ impl<C: TurnClient> Agent<C> {
 				self
 					.loop_signal
 					.observe(call_digest, made_environment_effect, empty_output_retries);
+				if self.loop_signal.repeats >= 3 {
+					next.insert(
+						0,
+						tool_loop_redirect_item(
+							self.loop_signal.repeats,
+							self
+								.loop_signal
+								.digest
+								.as_deref()
+								.unwrap_or("identical arguments"),
+						),
+					);
+				}
 				if self.execute_scheduled_rewinds()? {
 					self.transition(AgentPhase::Idle);
 					return Ok(run_summary(Some(outcome), committed_turns, false));
@@ -1523,6 +1630,11 @@ impl<C: TurnClient> Agent<C> {
 			let outcome = gate.gate_domain(&event).await;
 			candidate = from_hook(outcome.winner, sf!("agent_settled"), continuation_item());
 			policy = ContinuationPolicy::default();
+		}
+		if self.loop_signal.no_progress_turns >= 3
+			&& let Continuation::Continue { item, .. } = &mut candidate
+		{
+			*item = recovery_prompt_item(crate::prompt_assets::PromptAssetId::ThinkingLoopRedirect);
 		}
 		match self
 			.continuations
@@ -1763,7 +1875,15 @@ impl<C: TurnClient> Agent<C> {
 						omp_proto::toolhost::v1::HookEventId::HookEventThreadProjection,
 					) != 0;
 				match project_context(projected, &all_live, context_handlers) {
-					ContextProjection::Unchanged(thread) | ContextProjection::View { thread, .. } => {
+					ContextProjection::Unchanged(mut thread)
+					| ContextProjection::View { mut thread, .. } => {
+						if let Ok(date) = omp_core::display_time::local_calendar_date(SystemTime::now()) {
+							let cwd = snapshot.workspace.cwd.to_string_lossy();
+							let _ = crate::inject_first_turn_metadata(&mut thread, &date, &cwd);
+						}
+						if std::mem::take(&mut self.pending_reasoning_demotion) {
+							let _ = crate::demote_interrupted_reasoning(&mut thread);
+						}
 						TurnInput::Full(thread)
 					},
 				}
@@ -1778,6 +1898,8 @@ impl<C: TurnClient> Agent<C> {
 				TurnInput::Delta(held, ThreadDelta { truncate_to, append })
 			};
 			let mut provider_input = input.clone();
+			publish_input_attachments(self.journal.session_id().0.as_str(), &provider_input);
+			obfuscate_provider_input(&mut provider_input, self.secret_obfuscator.as_ref())?;
 			let reminder_appended = self.checkpoint_state.lock().active.is_some();
 			if reminder_appended {
 				append_checkpoint_reminder(&mut provider_input);
@@ -1858,7 +1980,8 @@ impl<C: TurnClient> Agent<C> {
 			self.drain_invocation_facts()?;
 			let session_result = selected?;
 			match session_result {
-				Ok(DriveSessionResult::Complete(outcome, speculative)) => {
+				Ok(DriveSessionResult::Complete(mut outcome, speculative)) => {
+					restore_provider_output(&mut outcome.output, self.secret_obfuscator.as_ref())?;
 					validate_outcome(&outcome)?;
 					if stateful && outcome.revision.is_none() {
 						return Err(AgentError::Protocol("stateful outcome missing revision"));
@@ -2086,6 +2209,7 @@ impl<C: TurnClient> Agent<C> {
 		let mut speculative = BTreeMap::new();
 		let mut part_calls: BTreeMap<u32, Str> = BTreeMap::new();
 		let mut ttsr_parts: BTreeMap<u32, TtsrPartState> = BTreeMap::new();
+		let mut secret_streams: BTreeMap<u32, SecretStreamRestorer> = BTreeMap::new();
 		loop {
 			let event = if duplex.is_empty() {
 				let mut events = session.events();
@@ -2139,10 +2263,67 @@ impl<C: TurnClient> Agent<C> {
 				}
 			};
 			let event = event.ok_or_else(|| tonic::Status::unavailable("turn stream lost"))??;
-			self.events.publish(AgentEvent::Turn {
-				turn_id: turn_id.clone(),
-				event:   Box::new(event.clone()),
-			});
+			let publish = |event: pb::TurnEvent| {
+				self
+					.events
+					.publish(AgentEvent::Turn { turn_id: turn_id.clone(), event: Box::new(event) });
+			};
+			match event.event.as_ref() {
+				Some(pb::turn_event::Event::PartStart(part))
+					if part.kind() == pb::part_start::Kind::Text && self.secret_obfuscator.is_some() =>
+				{
+					secret_streams.insert(part.index, SecretStreamRestorer::new());
+					publish(event.clone());
+				},
+				Some(pb::turn_event::Event::PartDelta(part))
+					if secret_streams.contains_key(&part.index) =>
+				{
+					let fragment = std::str::from_utf8(&part.chunk)
+						.map_err(|_| TurnError::Protocol("stream fragment is not UTF-8"))?;
+					let restored = secret_streams
+						.get_mut(&part.index)
+						.expect("checked stream")
+						.push(
+							fragment,
+							&self
+								.secret_obfuscator
+								.as_ref()
+								.expect("secret stream requires transform")
+								.lock(),
+						);
+					if !restored.is_empty() {
+						let mut display = event.clone();
+						if let Some(pb::turn_event::Event::PartDelta(delta)) = display.event.as_mut() {
+							delta.chunk = bytes::Bytes::from(restored);
+						}
+						publish(display);
+					}
+				},
+				Some(pb::turn_event::Event::PartEnd(part))
+					if secret_streams.contains_key(&part.index) =>
+				{
+					let restored = secret_streams
+						.remove(&part.index)
+						.expect("checked stream")
+						.finish(
+							&self
+								.secret_obfuscator
+								.as_ref()
+								.expect("secret stream requires transform")
+								.lock(),
+						);
+					if !restored.is_empty() {
+						publish(pb::TurnEvent {
+							event: Some(pb::turn_event::Event::PartDelta(pb::PartDelta {
+								index: part.index,
+								chunk: bytes::Bytes::from(restored),
+							})),
+						});
+					}
+					publish(event.clone());
+				},
+				_ => publish(event.clone()),
+			}
 			match event.event {
 				Some(pb::turn_event::Event::Outcome(outcome)) => {
 					return Ok(DriveSessionResult::Complete(outcome, speculative));
@@ -2541,6 +2722,120 @@ const fn empty_invocation_transition(
 	}
 }
 
+fn publish_input_attachments(session: &str, input: &TurnInput) {
+	match input {
+		TurnInput::Full(thread) => crate::attachments::publish_session_attachments(session, thread),
+		TurnInput::Delta(_, delta) => {
+			crate::attachments::publish_session_attachments(session, &Thread {
+				items: delta.append.clone(),
+			});
+		},
+	}
+}
+
+fn obfuscate_provider_input(
+	input: &mut TurnInput,
+	secret_obfuscator: Option<&Arc<Mutex<SecretObfuscator>>>,
+) -> Result<(), AgentError> {
+	let Some(secret_obfuscator) = secret_obfuscator else {
+		return Ok(());
+	};
+	let mut obfuscator = secret_obfuscator.lock();
+	let items = match input {
+		TurnInput::Full(thread) => &mut thread.items,
+		TurnInput::Delta(_, delta) => &mut delta.append,
+	};
+	for item in items {
+		match item.kind.as_mut() {
+			Some(thread::item::Kind::Message(message)) => {
+				let kind = match thread::Role::try_from(message.role) {
+					Ok(thread::Role::User) => MessageTextKind::User,
+					Ok(thread::Role::Assistant) => MessageTextKind::AssistantReplay,
+					Ok(thread::Role::System | thread::Role::Unspecified) | Err(_) => {
+						MessageTextKind::System
+					},
+				};
+				for part in &mut message.parts {
+					if let Some(thread::part::Kind::Text(text)) = part.kind.as_mut() {
+						let mapped = obfuscate_message_text(&mut obfuscator, kind, text);
+						if mapped != *text {
+							*text = mapped;
+						}
+					}
+				}
+			},
+			Some(thread::item::Kind::ToolResult(result)) => {
+				for part in &mut result.parts {
+					if let Some(thread::part::Kind::Text(text)) = part.kind.as_mut() {
+						let mapped =
+							obfuscate_message_text(&mut obfuscator, MessageTextKind::ToolResult, text);
+						if mapped != *text {
+							*text = mapped;
+						}
+					}
+				}
+			},
+			Some(thread::item::Kind::ToolCall(call)) => {
+				let mut value: serde_json::Value = serde_json::from_slice(&call.args_json)
+					.map_err(|_| AgentError::Protocol("tool arguments are not one JSON document"))?;
+				obfuscate_json(&mut value, &mut obfuscator);
+				call.args_json = bytes::Bytes::from(
+					serde_json::to_vec(&value)
+						.map_err(|_| AgentError::Protocol("tool arguments could not be encoded"))?,
+				);
+			},
+			None => {},
+		}
+	}
+	Ok(())
+}
+
+fn restore_provider_output(
+	items: &mut [Item],
+	secret_obfuscator: Option<&Arc<Mutex<SecretObfuscator>>>,
+) -> Result<(), AgentError> {
+	let Some(secret_obfuscator) = secret_obfuscator else {
+		return Ok(());
+	};
+	let obfuscator = secret_obfuscator.lock();
+	for item in items {
+		match item.kind.as_mut() {
+			Some(thread::item::Kind::Message(message))
+				if thread::Role::try_from(message.role) == Ok(thread::Role::Assistant) =>
+			{
+				for part in &mut message.parts {
+					if let Some(thread::part::Kind::Text(text)) = part.kind.as_mut() {
+						let restored =
+							restore_message_text(&obfuscator, MessageTextKind::AssistantOutput, text);
+						if restored != *text {
+							*text = restored;
+						}
+					}
+				}
+			},
+			Some(thread::item::Kind::ToolCall(call)) => {
+				let mut value: serde_json::Value = serde_json::from_slice(&call.args_json)
+					.map_err(|_| AgentError::Protocol("tool arguments are not one JSON document"))?;
+				deobfuscate_json(&mut value, &obfuscator);
+				call.args_json = bytes::Bytes::from(
+					serde_json::to_vec(&value)
+						.map_err(|_| AgentError::Protocol("tool arguments could not be encoded"))?,
+				);
+				if let Some(intent) = call.intent.as_mut() {
+					let restored =
+						restore_message_text(&obfuscator, MessageTextKind::ModelMetadata, intent);
+					if restored != *intent {
+						*intent = restored;
+					}
+				}
+			},
+			Some(thread::item::Kind::Message(_)) | Some(thread::item::Kind::ToolResult(_)) | None => {
+			},
+		}
+	}
+	Ok(())
+}
+
 fn restore_canonical_raw(
 	bytes: &[u8],
 	secret_obfuscator: Option<&Arc<Mutex<SecretObfuscator>>>,
@@ -2688,6 +2983,77 @@ async fn sleep_with_deadline(
 		() = tokio::time::sleep(duration) => Ok(()),
 		() = wait_deadline(deadline) => Err(AgentError::Deadline),
 	}
+}
+
+fn shake_item(
+	item: &mut Item,
+	tier: CompactionTier,
+	store: &BlobStore,
+	catalog: &Arc<Mutex<ArtifactCatalog>>,
+	session: &omp_storage::transcript::SessionId,
+	replaced_regions: &mut u64,
+	removed_bytes: &mut u64,
+) -> Result<(), AgentError> {
+	let (parts, tool_result) = match item.kind.as_mut() {
+		Some(thread::item::Kind::Message(message)) => (&mut message.parts, false),
+		Some(thread::item::Kind::ToolResult(result)) => (&mut result.parts, true),
+		_ => return Ok(()),
+	};
+	for part in parts {
+		let replacement = match part.kind.as_ref() {
+			Some(thread::part::Kind::Text(text))
+				if tier == CompactionTier::Elide
+					&& text.len() >= 1_600
+					&& (tool_result || shake_block_candidate(text)) =>
+			{
+				let reference = store.put(text.as_bytes())?;
+				let artifact = catalog.lock().adopt(
+					session,
+					reference.hash.into_bytes(),
+					Some(reference.size),
+					ArtifactLifetime::Session,
+				)?;
+				*removed_bytes =
+					removed_bytes.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+				Some(format!(
+					"[{} bytes elided by /shake; recover with {}]",
+					text.len(),
+					artifact.url()
+				))
+			},
+			Some(thread::part::Kind::Blob(blob)) if tier == CompactionTier::DropMedia => {
+				let digest = <[u8; 32]>::try_from(blob.hash.as_ref())
+					.ok()
+					.map(Hash32::new)
+					.map(|hash| hash.to_hex().to_string());
+				*removed_bytes = removed_bytes.saturating_add(
+					blob
+						.size
+						.max(u64::try_from(blob.inline.len()).unwrap_or(u64::MAX)),
+				);
+				Some(digest.map_or_else(
+					|| String::from("[Media removed by /shake drop-media]"),
+					|digest| {
+						format!("[Media removed by /shake drop-media; recover with artifact://{digest}]")
+					},
+				))
+			},
+			_ => None,
+		};
+		if let Some(replacement) = replacement {
+			part.kind = Some(thread::part::Kind::Text(replacement));
+			*replaced_regions = replaced_regions.saturating_add(1);
+		}
+	}
+	Ok(())
+}
+
+fn shake_block_candidate(text: &str) -> bool {
+	text.contains("```")
+		|| text.contains("~~~")
+		|| text
+			.lines()
+			.any(|line| line.starts_with('<') && line.ends_with('>'))
 }
 
 fn interrupt_reason(source: &crate::mailbox::InterruptSource) -> Str {
@@ -2857,6 +3223,37 @@ fn continuation_item() -> Item {
 	}
 }
 
+fn recovery_prompt_item(id: crate::prompt_assets::PromptAssetId) -> Item {
+	Item {
+		seq:           0,
+		created_at_ms: now_ms(),
+		kind:          Some(thread::item::Kind::Message(thread::Message {
+			role:  thread::Role::User as i32,
+			parts: vec![thread::Part {
+				kind: Some(thread::part::Kind::Text(format!(
+					"<system-injection>\n{}\n</system-injection>",
+					crate::prompt_assets::prompt_asset(id).content.trim(),
+				))),
+			}],
+		})),
+		props:         None,
+	}
+}
+
+fn tool_loop_redirect_item(count: u32, digest: &str) -> Item {
+	let mut content = String::new();
+	crate::prompt_assets::render_tool_call_loop_redirect(&mut content, count, digest);
+	Item {
+		seq:           0,
+		created_at_ms: now_ms(),
+		kind:          Some(thread::item::Kind::Message(thread::Message {
+			role:  thread::Role::User as i32,
+			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(content)) }],
+		})),
+		props:         None,
+	}
+}
+
 fn rewind_background_warning(count: usize) -> Item {
 	let text = format!(
 		"<system-injection>\nRewind left {count} background job(s) running; their settlements may \
@@ -2934,6 +3331,27 @@ fn empty_output_cap_detail(error: &pb::TurnError) -> String {
 
 fn follow_up_id(_root: &TurnId<str>, _ordinal: u32) -> TurnId {
 	TurnId::new(omp_core::Ulid::generate().to_string())
+}
+
+fn accumulate_usage(target: &mut pb::Usage, source: &pb::Usage) {
+	target.input_tokens = target.input_tokens.saturating_add(source.input_tokens);
+	target.output_tokens = target.output_tokens.saturating_add(source.output_tokens);
+	target.cache_read_tokens = target
+		.cache_read_tokens
+		.saturating_add(source.cache_read_tokens);
+	target.cache_write_tokens = target
+		.cache_write_tokens
+		.saturating_add(source.cache_write_tokens);
+	target.reasoning_tokens = match (target.reasoning_tokens, source.reasoning_tokens) {
+		(Some(left), Some(right)) => Some(left.saturating_add(right)),
+		(left, None) => left,
+		(None, right) => right,
+	};
+	target.total_tokens = match (target.total_tokens, source.total_tokens) {
+		(Some(left), Some(right)) => Some(left.saturating_add(right)),
+		(left, None) => left,
+		(None, right) => right,
+	};
 }
 
 fn runtime_duration(duration: omp_core::Duration) -> Duration {

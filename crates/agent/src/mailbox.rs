@@ -361,7 +361,8 @@ impl DeferredCommands {
 /// Cloneable nonblocking producer for the agent's sole command mailbox.
 #[derive(Clone, Debug)]
 pub struct MailboxSender {
-	tx: flume::Sender<Interrupt>,
+	tx:       flume::Sender<Interrupt>,
+	commands: flume::Sender<MailboxCommand>,
 }
 
 impl MailboxSender {
@@ -379,6 +380,23 @@ impl MailboxSender {
 	pub fn is_disconnected(&self) -> bool {
 		self.tx.is_disconnected()
 	}
+
+	/// Removes every producer-authored interrupt that has not reached a drain
+	/// point yet, returning the number removed.
+	pub async fn take_unstarted_producers(&self) -> Option<usize> {
+		let (reply, removed) = flume::bounded(1);
+		self
+			.commands
+			.send_async(MailboxCommand::TakeProducer { reply })
+			.await
+			.ok()?;
+		removed.recv_async().await.ok()
+	}
+}
+
+#[derive(Debug)]
+enum MailboxCommand {
+	TakeProducer { reply: flume::Sender<usize> },
 }
 
 /// Single-consumer interrupt mailbox with an ordered backlog.
@@ -386,9 +404,11 @@ impl MailboxSender {
 /// Shutdown is deliberately absent: the owner races [`Self::wait`] against a
 /// `tokio::watch` receiver, so selecting shutdown never consumes an interrupt.
 pub struct Mailbox {
-	tx:      flume::Sender<Interrupt>,
-	rx:      flume::Receiver<Interrupt>,
-	backlog: VecDeque<Interrupt>,
+	tx:          flume::Sender<Interrupt>,
+	rx:          flume::Receiver<Interrupt>,
+	commands_tx: flume::Sender<MailboxCommand>,
+	commands_rx: flume::Receiver<MailboxCommand>,
+	backlog:     VecDeque<Interrupt>,
 }
 impl Default for Mailbox {
 	fn default() -> Self {
@@ -400,12 +420,13 @@ impl Mailbox {
 	/// Creates an empty unbounded mailbox.
 	pub fn new() -> Self {
 		let (tx, rx) = flume::unbounded();
-		Self { tx, rx, backlog: VecDeque::new() }
+		let (commands_tx, commands_rx) = flume::unbounded();
+		Self { tx, rx, commands_tx: commands_tx.clone(), commands_rx, backlog: VecDeque::new() }
 	}
 
 	/// Returns a cloneable producer for this mailbox.
 	pub fn sender(&self) -> MailboxSender {
-		MailboxSender { tx: self.tx.clone() }
+		MailboxSender { tx: self.tx.clone(), commands: self.commands_tx.clone() }
 	}
 
 	/// Waits until one interrupt is retained in the local backlog.
@@ -414,9 +435,16 @@ impl Mailbox {
 	/// the received value remains owned by the mailbox until a matching drain.
 	pub async fn wait(&mut self) -> Result<(), flume::RecvError> {
 		loop {
-			let interrupt = self.rx.recv_async().await?;
-			if self.push_back(interrupt) {
-				return Ok(());
+			tokio::select! {
+				interrupt = self.rx.recv_async() => {
+					if self.push_back(interrupt?) {
+						return Ok(());
+					}
+				},
+				command = self.commands_rx.recv_async() => {
+					let command = command?;
+					self.handle_command(command);
+				},
 			}
 		}
 	}
@@ -428,6 +456,7 @@ impl Mailbox {
 	/// before eligibility is evaluated, so an immediate-point drain retains
 	/// them.
 	pub fn drain(&mut self, point: DrainPoint, defer_interrupts: bool) -> Vec<Interrupt> {
+		self.service_commands();
 		self.pump(defer_interrupts);
 		if defer_interrupts {
 			self.demote_immediate();
@@ -485,6 +514,25 @@ impl Mailbox {
 				interrupt.class = InterruptClass::TurnBoundary;
 			}
 			self.push_back(interrupt);
+		}
+	}
+
+	fn service_commands(&mut self) {
+		while let Ok(command) = self.commands_rx.try_recv() {
+			self.handle_command(command);
+		}
+	}
+
+	fn handle_command(&mut self, command: MailboxCommand) {
+		match command {
+			MailboxCommand::TakeProducer { reply } => {
+				self.pump(false);
+				let before = self.backlog.len();
+				self
+					.backlog
+					.retain(|interrupt| !matches!(interrupt.source, InterruptSource::Producer(_)));
+				let _ = reply.send(before.saturating_sub(self.backlog.len()));
+			},
 		}
 	}
 

@@ -1,19 +1,36 @@
 //! Session attachment indexing and provider-boundary image policy.
 
+use std::{
+	collections::HashMap,
+	future::Future,
+	path::Path,
+	sync::{Arc, LazyLock},
+};
+
 use bytes::Bytes;
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, hex, sf};
 #[cfg(test)]
 use omp_proto::thread::v1::Item;
 use omp_proto::{
 	inference::v1 as inference,
 	thread::v1::{self as thread, Thread},
 };
+use parking_lot::RwLock;
 use thiserror::Error;
+
+static SESSION_ATTACHMENTS: LazyLock<RwLock<HashMap<Str, Arc<AttachmentIndex>>>> =
+	LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Hard upper bound for one transient input image before normalization.
 pub const MAX_TRANSIENT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 /// Conservative image-count floor for providers without a declared override.
 pub const DEFAULT_PROVIDER_IMAGE_BUDGET: usize = 5;
+const NO_VISION_MODEL_NOTE: &str = "[No vision-capable model is configured, so this image could \
+                                    not be described automatically. The image was saved; \
+                                    configure a vision model and use inspect_image to analyze it.]";
+const DESCRIPTION_UNAVAILABLE_NOTE: &str = "[Image description unavailable: the vision model \
+                                            returned no usable text. The image was saved for \
+                                            further analysis.]";
 
 /// One image addressable as `attachment://N` in the latest user message.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,11 +107,31 @@ impl AttachmentIndex {
 		let index = raw
 			.parse::<usize>()
 			.map_err(|_| AttachmentError::InvalidUri)?;
+		if index == 0 {
+			return Err(AttachmentError::NotFound { index });
+		}
 		self
 			.entries
 			.get(index.saturating_sub(1))
 			.ok_or(AttachmentError::NotFound { index })
 	}
+}
+
+/// Publishes the latest projected user-image index for app-owned URL resolvers.
+pub fn publish_session_attachments(session: &str, thread: &Thread) {
+	let index = AttachmentIndex::from_thread(thread);
+	let mut snapshots = SESSION_ATTACHMENTS.write();
+	if index.entries.is_empty() {
+		snapshots.remove(session);
+	} else {
+		snapshots.insert(Str::new(session), Arc::new(index));
+	}
+}
+
+/// Returns the latest immutable attachment projection for one live session.
+#[must_use]
+pub fn session_attachments(session: &str) -> Option<Arc<AttachmentIndex>> {
+	SESSION_ATTACHMENTS.read().get(session).cloned()
 }
 
 /// Normalized image supplied by the environment-owned image processor.
@@ -104,6 +141,89 @@ pub struct NormalizedAttachmentImage {
 	pub bytes:      Bytes,
 	/// Media type matching the encoded bytes.
 	pub media_type: Str,
+}
+
+/// One-shot vision completion boundary used only for text-model attachment
+/// fallback.
+pub trait VisionDescriptionGenerator: Sync {
+	/// Describes one persisted image. Failure is represented as no description
+	/// so the caller can retain a visible saved-path notice.
+	fn describe(
+		&self,
+		attachment: &Attachment,
+		bytes: Bytes,
+	) -> impl Future<Output = Option<Str>> + Send;
+}
+
+/// Failure to persist a text-model fallback image.
+#[derive(Debug, Error)]
+pub enum ImageDescriptionError {
+	/// The session-local image directory could not be created.
+	#[error("could not create image fallback directory {path:?}")]
+	CreateDirectory {
+		/// Directory that could not be created.
+		path:   std::path::PathBuf,
+		/// Filesystem failure.
+		#[source]
+		source: std::io::Error,
+	},
+	/// One content-addressed image could not be persisted.
+	#[error("could not persist image fallback artifact {path:?}")]
+	Write {
+		/// Artifact path that could not be written.
+		path:   std::path::PathBuf,
+		/// Filesystem failure.
+		#[source]
+		source: std::io::Error,
+	},
+}
+
+/// Persists attached images under the session `local://` root and produces
+/// one text-model companion block per image.
+///
+/// A configured generator is invoked exactly once per image. Missing or empty
+/// descriptions retain a bounded notice and the durable local path.
+pub async fn generate_text_model_image_descriptions<G: VisionDescriptionGenerator>(
+	images: &[(Attachment, Bytes)],
+	local_root: &Path,
+	generator: Option<&G>,
+) -> Result<Vec<Str>, ImageDescriptionError> {
+	tokio::fs::create_dir_all(local_root)
+		.await
+		.map_err(|source| ImageDescriptionError::CreateDirectory {
+			path: local_root.to_path_buf(),
+			source,
+		})?;
+	let mut descriptions = Vec::with_capacity(images.len());
+	for (attachment, bytes) in images {
+		let digest = Hash32::sum(bytes);
+		let stem = hex::encode(&digest.as_bytes()[..8]).into_string();
+		let extension = attachment_extension(&attachment.blob.mime);
+		let file_name = format!("image-{stem}.{extension}");
+		let path = local_root.join(&file_name);
+		tokio::fs::write(&path, bytes)
+			.await
+			.map_err(|source| ImageDescriptionError::Write { path: path.clone(), source })?;
+		let description = match generator {
+			Some(generator) => generator
+				.describe(attachment, bytes.clone())
+				.await
+				.filter(|description| !description.trim().is_empty())
+				.unwrap_or_else(|| Str::new_static(DESCRIPTION_UNAVAILABLE_NOTE)),
+			None => Str::new_static(NO_VISION_MODEL_NOTE),
+		};
+		descriptions.push(sf!("<image path=\"local://{file_name}\">\n{description}\n</image>"));
+	}
+	Ok(descriptions)
+}
+
+fn attachment_extension(mime: &str) -> &'static str {
+	match mime {
+		"image/jpeg" | "image/jpg" => "jpg",
+		"image/gif" => "gif",
+		"image/webp" => "webp",
+		_ => "png",
+	}
 }
 
 /// Attachment normalization failure.

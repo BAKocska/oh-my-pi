@@ -1,19 +1,47 @@
 //! Bounded advisor history delivery and interruption accounting.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+	collections::VecDeque,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use omp_core::Str;
+use omp_secrets::{obfuscator::SecretObfuscator, replacement::bun_wyhash};
+use parking_lot::Mutex;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// Maximum primary entries retained for advisor catch-up by default.
 pub const DEFAULT_HISTORY_ENTRY_LIMIT: usize = 256;
 /// Maximum approximate payload bytes retained for advisor catch-up by default.
 pub const DEFAULT_HISTORY_BYTE_LIMIT: usize = 512 * 1024;
+/// Maximum late-arrival coalescing passes before dispatch yields.
+pub const MAX_DELTA_COALESCE_ROUNDS: usize = 3;
+/// Fingerprint chunk size used to compare advisor context projections.
+pub const ADVISOR_FINGERPRINT_CHUNK_BYTES: usize = 4 * 1024;
 
 /// Severity requested by an advisor.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, strum::Display)]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	JsonSchema,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	Serialize,
+	strum::Display,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum AdviceSeverity {
 	/// Non-interrupting cleanup or optional improvement.
+	#[default]
 	Nit,
 	/// Material risk which should steer when policy permits.
 	Concern,
@@ -243,6 +271,241 @@ pub struct AdvisorRuntimeState {
 	pub input_tokens:   u64,
 	/// Separate advisor usage totals.
 	pub output_tokens:  u64,
+}
+/// One accepted note routed to a primary-loop delivery channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutedAdvice {
+	/// Source advisor identity.
+	pub advisor_id: Str,
+	/// Concrete note.
+	pub note:       Str,
+	/// Effective severity.
+	pub severity:   AdviceSeverity,
+}
+
+/// Delivery-channel setup failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum AdvisorRouteError {
+	/// The live steering receiver has stopped.
+	#[error("advisor steering channel is closed")]
+	SteeringClosed,
+	/// The idle-preserve receiver has stopped.
+	#[error("advisor preserve channel is closed")]
+	PreserveClosed,
+}
+
+/// Runtime router spanning aside, live-steering, and idle-preserve delivery.
+pub struct AdvisorDeliveryRouter {
+	asides:   VecDeque<RoutedAdvice>,
+	steering: flume::Sender<RoutedAdvice>,
+	preserve: flume::Sender<RoutedAdvice>,
+	immunity: ImmuneTurnAccount,
+}
+
+impl AdvisorDeliveryRouter {
+	/// Creates a router and its two externally consumed channels.
+	#[must_use]
+	pub fn channel(
+		immune_turns: u32,
+	) -> (Self, flume::Receiver<RoutedAdvice>, flume::Receiver<RoutedAdvice>) {
+		let (steering, steering_rx) = flume::unbounded();
+		let (preserve, preserve_rx) = flume::unbounded();
+		(
+			Self {
+				asides: VecDeque::new(),
+				steering,
+				preserve,
+				immunity: ImmuneTurnAccount::new(immune_turns),
+			},
+			steering_rx,
+			preserve_rx,
+		)
+	}
+
+	/// Routes one note using current primary-loop facts.
+	pub fn route(
+		&mut self,
+		advice: RoutedAdvice,
+		context: DeliveryContext,
+	) -> Result<AdviceDelivery, AdvisorRouteError> {
+		let delivery = self.immunity.evaluate(advice.severity, context);
+		match delivery {
+			AdviceDelivery::Aside => self.asides.push_back(advice),
+			AdviceDelivery::Steer => {
+				self
+					.steering
+					.send(advice)
+					.map_err(|_| AdvisorRouteError::SteeringClosed)?;
+				self.immunity.record_steer();
+			},
+			AdviceDelivery::Preserve => {
+				self
+					.preserve
+					.send(advice)
+					.map_err(|_| AdvisorRouteError::PreserveClosed)?;
+			},
+		}
+		Ok(delivery)
+	}
+
+	/// Accounts a completed primary turn once for interrupt immunity.
+	pub fn record_primary_completion(&mut self, turn_id: u64) {
+		self.immunity.record_primary_completion(turn_id);
+	}
+
+	/// Drains oldest-to-newest asides at the next primary step boundary.
+	pub fn drain_asides(&mut self) -> impl Iterator<Item = RoutedAdvice> + '_ {
+		self.asides.drain(..)
+	}
+
+	/// Remaining post-steer immune completions.
+	#[must_use]
+	pub const fn immune_turns_remaining(&self) -> u32 {
+		self.immunity.remaining()
+	}
+}
+
+/// One obfuscated, fingerprinted advisor-context chunk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvisorDeltaChunk {
+	/// Absolute primary-history cursor.
+	pub cursor:      u64,
+	/// Provider-safe projected text.
+	pub text:        Str,
+	/// Bun-compatible Wyhash of this exact chunk.
+	pub fingerprint: u64,
+}
+
+/// Coalesced delta ready for one advisor update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvisorDeltaBatch {
+	/// Projection generation; changes whenever primary history is rewritten.
+	pub revision:    u64,
+	/// Whether the advisor must discard its old context before applying chunks.
+	pub reprime:     bool,
+	/// Cursor after the newest consumed primary entry.
+	pub next_cursor: u64,
+	/// Provider-safe oldest-to-newest chunks.
+	pub chunks:      Arc<[AdvisorDeltaChunk]>,
+}
+
+/// Primary-to-advisor delta synchronization coordinator.
+pub struct AdvisorDeltaSync {
+	pending:              VecDeque<(u64, Str)>,
+	next_cursor:          u64,
+	revision:             u64,
+	reprime:              bool,
+	last_maintenance:     Instant,
+	maintenance_interval: Duration,
+	obfuscator:           Option<Arc<Mutex<SecretObfuscator>>>,
+}
+
+impl AdvisorDeltaSync {
+	/// Creates a coordinator with optional session-secret obfuscation.
+	#[must_use]
+	pub fn new(
+		maintenance_interval: Duration,
+		obfuscator: Option<Arc<Mutex<SecretObfuscator>>>,
+	) -> Self {
+		Self {
+			pending: VecDeque::new(),
+			next_cursor: 0,
+			revision: 0,
+			reprime: false,
+			last_maintenance: Instant::now(),
+			maintenance_interval,
+			obfuscator,
+		}
+	}
+
+	/// Queues one primary projection without dispatching a partial batch.
+	pub fn push(&mut self, text: impl Into<Str>) -> u64 {
+		let cursor = self.next_cursor;
+		self.next_cursor = self.next_cursor.saturating_add(1);
+		self.pending.push_back((cursor, text.into()));
+		cursor
+	}
+
+	/// Invalidates advisor context after rewind, branch, or compaction.
+	pub fn history_rewritten(&mut self) {
+		self.pending.clear();
+		self.revision = self.revision.saturating_add(1);
+		self.reprime = true;
+		self.next_cursor = self.next_cursor.saturating_add(1);
+	}
+
+	/// Reports whether proactive provider-context maintenance is due.
+	#[must_use]
+	pub fn maintenance_due(&self, now: Instant) -> bool {
+		now.saturating_duration_since(self.last_maintenance) >= self.maintenance_interval
+	}
+
+	/// Records successful provider-context maintenance.
+	pub fn record_maintenance(&mut self, now: Instant) {
+		self.last_maintenance = now;
+	}
+
+	/// Coalesces pending arrivals into a bounded number of oldest-first rounds.
+	///
+	/// Each source entry is split on UTF-8 boundaries, obfuscated, then
+	/// fingerprinted. Items arriving after the third round remain queued for the
+	/// next advisor update so a hot primary cannot starve dispatch.
+	pub fn drain_coalesced(&mut self) -> Option<AdvisorDeltaBatch> {
+		if self.pending.is_empty() && !self.reprime {
+			return None;
+		}
+		let mut chunks = Vec::new();
+		let mut rounds = 0;
+		while rounds < MAX_DELTA_COALESCE_ROUNDS && !self.pending.is_empty() {
+			let round_len = self.pending.len();
+			for _ in 0..round_len {
+				let Some((cursor, text)) = self.pending.pop_front() else {
+					break;
+				};
+				let safe = self.obfuscator.as_ref().map_or_else(
+					|| text.to_string(),
+					|obfuscator| obfuscator.lock().obfuscate(text.as_str()),
+				);
+				for chunk in utf8_chunks(&safe, ADVISOR_FINGERPRINT_CHUNK_BYTES) {
+					chunks.push(AdvisorDeltaChunk {
+						cursor,
+						fingerprint: bun_wyhash(chunk.as_bytes()),
+						text: Str::new(chunk),
+					});
+				}
+			}
+			rounds += 1;
+		}
+		let reprime = std::mem::take(&mut self.reprime);
+		Some(AdvisorDeltaBatch {
+			revision: self.revision,
+			reprime,
+			next_cursor: self.next_cursor,
+			chunks: chunks.into(),
+		})
+	}
+}
+
+impl Default for AdvisorDeltaSync {
+	fn default() -> Self {
+		Self::new(Duration::from_secs(60), None)
+	}
+}
+
+fn utf8_chunks(text: &str, limit: usize) -> impl Iterator<Item = &str> {
+	let mut start = 0;
+	std::iter::from_fn(move || {
+		if start >= text.len() {
+			return None;
+		}
+		let mut end = start.saturating_add(limit.max(1)).min(text.len());
+		while !text.is_char_boundary(end) {
+			end -= 1;
+		}
+		let chunk = &text[start..end];
+		start = end;
+		Some(chunk)
+	})
 }
 #[cfg(test)]
 mod tests {

@@ -838,6 +838,7 @@ impl SpeculativeCall {
 			effects,
 			pump,
 			events,
+			usage: Default::default(),
 		}
 	}
 }
@@ -863,6 +864,7 @@ pub struct CommittedCall {
 	effects:          Effects,
 	pump:             InvocationPump,
 	events:           EventBus,
+	usage:            omp_proto::inference::v1::Usage,
 }
 
 impl CommittedCall {
@@ -894,6 +896,11 @@ impl CommittedCall {
 	/// Returns the exact Core-narrowed authority envelope.
 	pub const fn effects(&self) -> &Effects {
 		&self.effects
+	}
+
+	/// Attaches the cumulative usage receipt observed before tool execution.
+	pub fn set_cumulative_usage(&mut self, usage: omp_proto::inference::v1::Usage) {
+		self.usage = usage;
 	}
 }
 
@@ -1379,9 +1386,11 @@ fn durable_outcome(
 }
 
 fn finish_event(call: &CommittedCall, item: Item) -> Arc<AgentEvent> {
-	call
-		.events
-		.publish(AgentEvent::ToolFinished { call_id: call.call_id.clone(), item })
+	call.events.publish(AgentEvent::ToolFinished {
+		call_id: call.call_id.clone(),
+		item,
+		usage: call.usage.clone(),
+	})
 }
 
 fn harness_parts(outcome: &CallOutcome<Value, Value>) -> Option<Vec<Part>> {

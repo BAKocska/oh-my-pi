@@ -313,6 +313,8 @@ impl LivePeerCore {
 			.set_remote_description(answer)
 			.await
 			.map_err(|error| format!("Failed to install the live SDP answer: {error}"))
+	?;
+		Ok(())
 	}
 
 	/// Wait until the `oai-events` data channel is open, failing on peer

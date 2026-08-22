@@ -2167,7 +2167,7 @@ mod tests {
 			 librarian]\nmodel: '@task'\nthinkingLevel: high\nblocking: true\n---\nReview carefully.",
 		)
 		.expect("definition");
-		assert_eq!(definition.tools.as_ref(), ["read", "grep", "hub"]);
+		assert_eq!(definition.tools.as_ref(), ["read", "grep", "hub", "yield"]);
 		assert!(definition.spawns.allows("SCOUT"));
 		assert!(!definition.spawns.allows("task"));
 		assert_eq!(definition.spawns.default_definition(), Some("scout"));

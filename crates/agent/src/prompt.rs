@@ -1526,11 +1526,11 @@ fn canonicalize_prompt(content: &str) -> String {
 		let fence = trimmed.trim_start();
 		if fence.starts_with("```") || fence.starts_with("~~~") {
 			in_fence = !in_fence;
-			push_canonical_line(&mut out, trimmed, &mut blank);
+			push_canonical_line(&mut out, raw_line, &mut blank);
 			continue;
 		}
 		if in_fence {
-			push_canonical_line(&mut out, trimmed, &mut blank);
+			push_canonical_line(&mut out, raw_line, &mut blank);
 			continue;
 		}
 
@@ -2374,7 +2374,7 @@ mod tests {
 	use super::*;
 	#[test]
 	fn prompt_paths_are_slash_normalized_without_changing_unix_paths() {
-		assert_eq!(prompt_path(Path::new(r"src\\main.rs")).unwrap(), "src/main.rs");
+		assert_eq!(prompt_path(Path::new(r"src\main.rs")).unwrap(), "src/main.rs");
 		assert!(matches!(prompt_path(Path::new("src/main.rs")).unwrap(), Cow::Borrowed(_)));
 	}
 
@@ -2869,7 +2869,7 @@ mod tests {
 		ModePromptSource::new(PromptMode::Prewalk)
 			.render(&WorkspaceInput::default(), &mut mode)
 			.unwrap();
-		assert!(mode.contains("reason to execute"));
-		assert!(mode.contains("no-op"));
+		assert!(mode.contains("grep every other call site"));
+		assert!(!mode.contains("Plan mode is active"));
 	}
 }
