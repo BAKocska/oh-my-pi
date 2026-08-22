@@ -548,7 +548,6 @@ impl ProjectEnvironment {
 	}
 
 	/// Returns the session's sole Off/Mnemopi runtime.
-
 	pub(crate) fn memory_runtime(&self) -> Arc<omp_memory::MemoryRuntime> {
 		self.lifecycle.server.memory_runtime()
 	}
