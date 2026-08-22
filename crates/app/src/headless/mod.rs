@@ -207,7 +207,8 @@ impl HeadlessSession {
 		let (lifecycle, lifecycle_events) = HeadlessLifecycleSink::new(options.session_generation);
 		let approval_book = Arc::new(ApprovalBook::new());
 		let (approval_route, approval_inbox) = ApprovalRoute::new(Arc::clone(&approval_book));
-		environment.bind_approval_authority(Some(Arc::clone(&approval_book)), Some(approval_route.clone()));
+		environment
+			.bind_approval_authority(Some(Arc::clone(&approval_book)), Some(approval_route.clone()));
 		Ok(Self {
 			session: session_handle,
 			state,
@@ -263,6 +264,7 @@ impl HeadlessSession {
 	) {
 		self._environment.bind_acp_exec(backend);
 	}
+
 	/// Binds or clears the session-scoped ACP document capability.
 	pub(crate) fn bind_acp_documents(
 		&self,

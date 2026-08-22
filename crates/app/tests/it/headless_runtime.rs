@@ -92,6 +92,7 @@ async fn headless_runtime() {
 			})),
 			..Item::default()
 		},
+		usage:   omp_proto::inference::v1::Usage::default(),
 	});
 	assert!(matches!(events.try_recv().unwrap().as_ref(), AgentEvent::ToolObserved {
 		session_generation: 9,
