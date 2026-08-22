@@ -1735,7 +1735,7 @@ impl PromptCaps {
 }
 ```
 
-`ModelClass` derives from `crates/llm-catalog` capability data (context window plus a
+`ModelClass` derives from `crates/catalog` capability data (context window plus a
 capability bit), not from a hand-maintained model-name table. Wire it as a catalog-derived
 field so a new model gets the right class without a code change.
 

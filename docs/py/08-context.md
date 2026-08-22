@@ -171,7 +171,7 @@ structural problems that cannot recur here:
    OpenAI `prompt_cache_key`, stripping `prompt_cache_retention` on models that 400 on it,
    and reordering Anthropic's mixed cache-control TTLs. This one is real work and it does
    not belong to an extension either — it is provider-dialect normalization, and it belongs
-   in `crates/llm-inference` beside every other quirk (`docs/py/13-inference.md`).
+   in `crates/inference` beside every other quirk (`docs/py/13-inference.md`).
 
 So the useful reading of that package is not "a competing context extension." It is a bug
 report with four items, filed against the harness, three of which are answered by making
@@ -1906,7 +1906,7 @@ the Python function's determinism is checked at *pull* time by calling it twice 
 and after that the agent renders from immutable bytes. A slot that is nondeterministic is
 caught in Python, where the traceback names the extension.
 
-**Cache breakpoint emission.** `crates/llm-inference` needs a per-provider breakpoint budget
+**Cache breakpoint emission.** `crates/inference` needs a per-provider breakpoint budget
 and a placement pass consuming `[BandHash; 4]` plus the trailing message window — this pass
 *is* the semantic-groups-into-marker-budget packing `docs/py/13-inference.md` owns. Anthropic
 gets four `cache_control` markers, three at band transitions and one trailing; providers with
@@ -1924,7 +1924,7 @@ Three provider quirks belong in the same pass, and the argument for putting them
   fleet of subagents needs.
 - `prompt_cache_retention` must be gated on catalog capability. `pi-cache-optimizer` exists in
   part because pi sends it to every OpenAI-compatible endpoint and third-party proxies answer
-  400. `crates/llm-catalog` is where "this endpoint accepts this field" belongs.
+  400. `crates/catalog` is where "this endpoint accepts this field" belongs.
 - Anthropic rejects mixed cache-control TTL ordering. With bands, TTL is a property of the
   band (frozen bands want the long TTL, volatile the short one) and ordering falls out of
   band order automatically, so the class that produced the bug cannot arise.

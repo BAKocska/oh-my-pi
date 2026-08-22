@@ -1757,7 +1757,7 @@ adjacent lift steps toward the live revision, falling back to
 constraint lowering with explicit `Adjustment` receipts is written
 (`:648-712`), against real catalog bitsets — `ToolFeatureBits::STRICT_SCHEMA`,
 `GrammarBits::{LARK, REGEX, EBNF}`, `ToolCapabilities::maximum_tools`
-(`crates/llm-catalog/src/capability.rs`). `live_hash()` already produces a
+(`crates/catalog/src/capability.rs`). `live_hash()` already produces a
 stable blake3 digest over the ordered live identities, registration-order
 independent (`registry.rs:458-467`).
 

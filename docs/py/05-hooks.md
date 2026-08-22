@@ -135,7 +135,7 @@ sentence, and the catalog row lives in §3.11 family H.
 `omp.events.spec(event).returns` reports the return type, so this is discoverable rather than
 folklore. A domain return is not an escape hatch for new event families: adding one requires that
 the decision space already exists as a typed enumeration owned by a sibling document — `omp.Failover`
-mirrors `crates/llm-inference/src/error.rs`, `ContextPatch`'s op set is closed and validated by
+mirrors `crates/inference/src/error.rs`, `ContextPatch`'s op set is closed and validated by
 [`08-context.md`](08-context.md) — not merely that five arms feel awkward.
 
 ### 2.3 Where hooks attach — and who decides
@@ -2603,7 +2603,7 @@ Attach sites, all at existing seams:
 
 Session-family hooks attach in the session manager around `Agent::rewind` (`loop.rs:235`),
 `rewind_targets` (`loop.rs:251`) and the switch/branch paths; provider-family hooks attach in
-`crates/llm-inference` at request assembly and error classification; `compaction` attaches wherever
+`crates/inference` at request assembly and error classification; `compaction` attaches wherever
 `Kind::Compact` is written. The decision procedure for `tool_call` runs in `HookGate`, off the
 mailbox loop — the loop never awaits it, which is what keeps the batch invariant intact. A previous
 revision called this component "a small, self-contained courier task"; per §2.3 that framing is

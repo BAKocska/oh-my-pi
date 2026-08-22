@@ -2362,7 +2362,7 @@ The issue store is a table in the same database. `FEATURES.md:643` describes `re
 late if AutoQA is meant to drive device revisions, because the loop is worth most while devices are
 still churning. Pulling it forward is a sequencing recommendation, not a design one.
 
-### `crates/tools`, `crates/tool`, `crates/llm-inference`, `crates/env`
+### `crates/tools`, `crates/tool`, `crates/inference`, `crates/env`
 
 - `crates/tools/src/render/truncate.rs` already computes every `ArtifactSpill` field for
   `layer="render"`: `DEFAULT_MAX_BYTES` (51 200), `DEFAULT_MAX_LINES` (3 000), `DEFAULT_MAX_COLUMN`
@@ -2374,7 +2374,7 @@ still churning. Pulling it forward is a sequencing recommendation, not a design 
   claim in this document that the loop needed a `rev()` accessor added. It already stamps
   `TOOL_REV_PROP`. What `layer="verdict"` needs is an environment implementation of the existing
   `VerdictSpill` trait, plus the defect below.
-- `crates/llm-inference` emits `ModelRequest` where it already holds `Outcome`. Field mapping is
+- `crates/inference` emits `ModelRequest` where it already holds `Outcome`. Field mapping is
   direct: `Outcome.usage`→`Tokens`, `Outcome.cost`→`Cost`, `Outcome.unsupported`→`Degradation`
   (`Unsupported.Action` maps 1:1 onto `DegradeAction`), `Outcome.diagnostics`→`Diagnostic`,
   `Outcome.duration_ms`/`ttft_ms`, `Outcome.provider`/`model`/`upstream_provider`. `Accepted.replay`

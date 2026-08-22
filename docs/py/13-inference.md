@@ -24,7 +24,7 @@ start from zero. Then the third one did too.
 than chat completions. In omp a provider declares which of fifteen typed `Operation`s it serves, and
 gets synchronized OAuth refresh, account rotation, rate reservation, retry classification, cost
 accounting, and cross-route failover for all of them, because those live in the Tower spine
-(`crates/llm-inference/src/layer/stack.rs:194-221`) rather than in each provider's code.
+(`crates/inference/src/layer/stack.rs:194-221`) rather than in each provider's code.
 
 The measure of how much room `stream`/`streamSimple` left is that it left none. Grep
 `/work/pi/packages/ai/src` — the entire inference package — and the count of files mentioning
@@ -52,7 +52,7 @@ unconstrained sampling with charitable decoding when the budget runs out.
 
 ### Providers are data; code is the cold path only
 
-The catalog is facts. `crates/llm-catalog/README.md` states it plainly: "The crate contains facts
+The catalog is facts. `crates/catalog/README.md` states it plainly: "The crate contains facts
 rather than executable provider behavior." An extension's primary contribution is therefore a value,
 not a function — a `ProviderSpec` that names routes, endpoints, codecs, authentication shape, models,
 limits, pricing, reasoning policy, and compatibility flags. Python code exists only where a fact is
@@ -72,7 +72,7 @@ much Python survives the port:
 Class (a) is the target. Two entries in the pi catalog that shipped as *code* are class (a) here:
 `@thebinaryguy/pi-fast-mode` and `pi-openai-fast` both exist to inject `"service_tier": "priority"`
 into a request body via `before_provider_request`. In omp, service tiers are a declared model
-capability (`ServiceTier { name, priority }`, `crates/llm-catalog/src/capability.rs:402-409`) and a
+capability (`ServiceTier { name, priority }`, `crates/catalog/src/capability.rs:402-409`) and a
 caller intent (`omp.intent.service_tier`). The extension becomes a data patch and a keybinding.
 
 ```mermaid
@@ -82,7 +82,7 @@ flowchart LR
         COLD["@omp.hook<br/>login · refresh · sign<br/>before_request · discover<br/>provider_error · usage"]
     end
     subgraph RS["Rust"]
-        OVL["catalog overlay<br/>(omp-llm-catalog)"]
+        OVL["catalog overlay<br/>(omp-catalog)"]
         SPINE["Tower spine<br/>Intent → Session → Answer → Semantic →<br/>Recovery → Attempt → Admission → AccountPool →<br/>AuthLease → Retry → Rate → Encode → CredentialApply"]
         WIRE["codec + transport"]
     end
@@ -95,7 +95,7 @@ flowchart LR
 
 ### The operation surface a provider may serve
 
-`OperationKind` (`crates/llm-catalog/src/capability.rs:95-126`) is the closed vocabulary shared by
+`OperationKind` (`crates/catalog/src/capability.rs:95-126`) is the closed vocabulary shared by
 the catalog and the request layer. Mirrored into Python as `omp.Operation`, it is the honest answer to
 "what is a provider":
 
@@ -112,7 +112,7 @@ lossless-bytes escape valve, and it is *not* an extension slot — see "Custom w
 ### Codecs are selected, never implemented
 
 `api=` on a `RouteSpec` selects from a closed codec set that Rust owns
-(`crates/llm-inference/src/codec/`). An extension picks `Api.OPENAI_CHAT` or `Api.ANTHROPIC_MESSAGES`;
+(`crates/inference/src/codec/`). An extension picks `Api.OPENAI_CHAT` or `Api.ANTHROPIC_MESSAGES`;
 it never writes a codec. This is the hard line that keeps Python out of the token path, and it is what
 makes class (c) a proxy rather than a plugin.
 
@@ -138,7 +138,7 @@ flowchart TD
 ```
 
 Two properties matter. First, degradation is never silent: a dropped preference produces an
-`Adjustment` in the execution receipt (`crates/llm-inference/src/receipt.rs:42-79`), which reaches
+`Adjustment` in the execution receipt (`crates/inference/src/receipt.rs:42-79`), which reaches
 telemetry (`docs/py/10-telemetry.md`) and the journal (`docs/py/09-journal.md`). Second, `REQUIRE`
 fails loudly rather than degrading, so a tool that genuinely cannot work unconstrained says so once
 instead of emitting garbage forever.
@@ -153,7 +153,7 @@ is three rungs:
    told about and flails when reasoning is on. The soft prompt levels that field, so it is
    unconditional and costs nothing.
 2. **Native flag only when free.** If the route declares `ToolFeatureBits::NAMED_CHOICE` /
-   `REQUIRED_CHOICE` (`crates/llm-catalog/src/capability.rs:224-237`) *and* the wire policy does not
+   `REQUIRED_CHOICE` (`crates/catalog/src/capability.rs:224-237`) *and* the wire policy does not
    attach a penalty, set `tool_choice`. Anthropic charges a cache miss on the entire conversation when
    a call is forced, so on Anthropic this rung is skipped.
 3. **Escalate on non-compliance.** If the model does not call the tool, retry a bounded number of
@@ -207,8 +207,8 @@ class-count reversal on its side.
 `omp.creds` is bound to the providers the extension declares in its manifest. There is no
 cross-provider read, no enumeration of other providers' accounts, and no filesystem path to the
 store. The store itself is Rust: an encrypted SQLite table
-(`crates/llm-inference/src/auth/store.rs`) whose master key comes from the OS keychain
-(`crates/llm-inference/src/auth/key.rs`), reached over CONTROL through the daemon so refresh is
+(`crates/inference/src/auth/store.rs`) whose master key comes from the OS keychain
+(`crates/inference/src/auth/key.rs`), reached over CONTROL through the daemon so refresh is
 serialized across every omp process on the machine.
 
 The default is stronger than scoping: **`omp.creds` hands out metadata, not secrets.** A refresh hook
@@ -290,7 +290,7 @@ tie-break:
 
 - `extends="<provider-id>"` declares an **overlay**: this declaration patches the named base
   declaration, its populated fields layered over the base through the same field-granular overlay
-  merge the catalog already uses (`CatalogOverlay`, `crates/llm-catalog/src/resolve.rs:256`). The
+  merge the catalog already uses (`CatalogOverlay`, `crates/catalog/src/resolve.rs:256`). The
   base must exist at activation — extending an absent provider is the same activation-time error —
   and both declarations stay visible in provenance, each field attributed to the declaration that
   set it.
@@ -451,7 +451,7 @@ class ManagementSpec:
 `operations` are the *provider-level* operations — typically `{Operation.AUTH}`,
 `{Operation.USAGE}`, `{Operation.DISCOVER_MODELS}` — as distinct from a model's operations.
 `multiple_accounts` opts the provider into the account pool, so several stored principals may be
-selected and rotated (`crates/llm-inference/src/account/pool.rs`). `refresh` declares that a
+selected and rotated (`crates/inference/src/account/pool.rs`). `refresh` declares that a
 credential can be renewed without changing principal, which is what makes `RetryAction::RefreshCredential`
 a legal failover. `principal_quota` declares that quota observations are per-principal rather than
 per-provider, which is what makes rotation on `QuotaExhausted` meaningful.
@@ -538,7 +538,7 @@ Selecting an `Api` marked "not available to extensions" raises `PermissionError`
 ### `Transport`
 
 `HTTP`, `WEBSOCKET`, `WEBRTC`, `AWS_EVENT_STREAM`, `CONNECT`, `LOCAL`. Mirrors `TransportKind`
-(`crates/llm-catalog/src/provider.rs:32-45`). Only combinations the selected codec supports are
+(`crates/catalog/src/provider.rs:32-45`). Only combinations the selected codec supports are
 accepted; the pairing table is validated at declaration, not at first request.
 
 ### `AuthSpec`
@@ -559,7 +559,7 @@ class AuthSpec:
 ```
 
 `AuthMode`: `NONE`, `API_KEY`, `BEARER`, `OAUTH`, `AWS_SIGV4`, `GCP_ADC`, `AZURE_AD`, `GITHUB_APP`,
-`OMP_SESSION` — mirrors `AuthSpecKind` (`crates/llm-catalog/src/provider.rs:92-111`).
+`OMP_SESSION` — mirrors `AuthSpecKind` (`crates/catalog/src/provider.rs:92-111`).
 
 `header`/`prefix`/`query` are the credential placement, mutually exclusive between header and query.
 This is the field that deletes a whole category of extension code:
@@ -567,7 +567,7 @@ This is the field that deletes a whole category of extension code:
 `authorization: Bearer <token>`, because pi's Anthropic client hard-coded an `sk-ant-oat` prefix check
 before it would use a bearer. Here that is `AuthSpec(mode=AuthMode.BEARER, header="authorization",
 prefix="Bearer ")` — data, applied by `CredentialApplyService`
-(`crates/llm-inference/src/layer/encode.rs:209`) with no extension in the path.
+(`crates/inference/src/layer/encode.rs:209`) with no extension in the path.
 
 `account_scope`: `PROVIDER` (one principal for everything), `ROUTE`, or `REGION`. Sets the boundary at
 which a principal and its quota are shared, and therefore what "rotate to a sibling account" means.
@@ -739,7 +739,7 @@ class DiscoveryDefaults:
 	confidence: Confidence = Confidence.INFERRED
 ```
 
-Discovery is conservative by construction (`crates/llm-catalog/src/discover.rs`): a discovered model
+Discovery is conservative by construction (`crates/catalog/src/discover.rs`): a discovered model
 that reports nothing gets *unknown* capabilities, not optimistic ones, and `Confidence.INFERRED`
 marks every fact that came from a default rather than from the provider. Facts from separate
 observations merge by taking the conservative minimum.
@@ -804,7 +804,7 @@ class ModelSpec:
 ### `Cap`, `UNKNOWN`, `UNSUPPORTED`
 
 Capability axes are three-valued, because "we have not checked" and "the provider does not support
-this" must not collapse (`crates/llm-catalog/src/capability.rs:176-193`).
+this" must not collapse (`crates/catalog/src/capability.rs:176-193`).
 
 ```python
 UNKNOWN: Final[Cap]        # no evidence either way — the default
@@ -1085,7 +1085,7 @@ class Cost:
 because `0.1` is not `0.1` and money that drifts is worse than money that is missing. The token
 dimensions are priced per million units; `image` and `request` are per unit; `video_second` and
 `audio_second` are per second. Internally everything becomes `u64` nano-USD
-(`crates/llm-catalog/src/pricing.rs`), and cost arithmetic is checked integer math with
+(`crates/catalog/src/pricing.rs`), and cost arithmetic is checked integer math with
 ceiling division.
 
 ```python
@@ -1202,7 +1202,7 @@ has not thought about it.
 
 On the Rust side this lowers onto two existing types rather than one: the value plus `Fallback.ERROR`
 becomes `Setting::Require`, the value plus `IGNORE`/`EMULATE` becomes `Setting::Prefer`
-(`crates/llm-inference/src/call.rs:300-308`), and the ignore-versus-emulate distinction becomes
+(`crates/inference/src/call.rs:300-308`), and the ignore-versus-emulate distinction becomes
 `NegotiationPolicy.emulation` (`EmulationPolicy::Forbid | AllowLossless | AllowDeclaredLossy`,
 `call.rs:311-320`) — where `Emulation::PromptInstruction` is the one classified lossy, so
 `Fallback.IGNORE` maps to `Forbid` and `Fallback.EMULATE` to `AllowDeclaredLossy`.
@@ -1248,7 +1248,7 @@ Three consequences follow from the protocol rather than from taste:
 3. **The remaining intent kinds have no toolhost frame, because they are not tool properties.**
    `FORCE_CALL`, `SERVICE_TIER`, `VERBOSITY`, `CACHE_RETENTION`, `REASONING`, `SAFETY`,
    `DETERMINISM`, and `HOSTED_TOOL` all constrain the *turn*, and in Rust they are already
-   `Setting<T>` fields on `ChatRequest` (`crates/llm-inference/src/call.rs:699-728`). They are what
+   `Setting<T>` fields on `ChatRequest` (`crates/inference/src/call.rs:699-728`). They are what
    `omp.intents.set` needs a new frame for; `STRICT` and `GRAMMAR` do not.
 4. **Degradation is already implemented, so the documented behavior is observed behavior.** Inside the
    environment, `ToolConstraint` becomes `omp_tool::Constraint`
@@ -1308,9 +1308,10 @@ extension owns its keys and can
 neither read nor overwrite another extension's. **Channel** CONTROL, fire-and-forget. **Latency
 class** per-toggle, not per-request; the assignment is recomputed on the registration-set change, not
 on the turn. **Failure** fail-open: a rejected contribution leaves the previous set in place and
-journals the rejection. `declared()` returns only this extension's contributions, which is the
-deliberate asymmetry — the harness sees everything so it can arbitrate, and no extension does, so no
-extension can strategize against its neighbors.
+journals the rejection. The Python process keeps no speculative mirror:
+`declared()` therefore returns an empty tuple; authoritative contributions remain harness-owned. The
+intent effect carries the host and session generation, and the host validates and arbitrates it
+against the extension-owned key.
 
 They are never booleans on a tool, and an extension cannot see another extension's intents — only the
 harness can, which is the whole point.
@@ -1379,7 +1380,7 @@ class Adjustment:
 capability was reproduced by, and `Emulation.PROMPT_INSTRUCTION` is the one classified as lossy — so
 `EmulationPolicy.ALLOW_LOSSLESS` permits everything except prompt-level fakery.
 
-These mirror `Adjustment` in `crates/llm-inference/src/receipt.rs:42-79`, which is the *receipt* form.
+These mirror `Adjustment` in `crates/inference/src/receipt.rs:42-79`, which is the *receipt* form.
 The *wire* form already exists too, as `omp.inference.v1.Unsupported`
 (`crates/proto/proto/omp/inference/v1/common.proto:120-132`), returned as
 `repeated Unsupported unsupported` on chat (`inference.proto:597`, `:644`), media (`media.proto:107`,
@@ -1671,7 +1672,7 @@ class ProviderError:
 `ACCOUNT_DISABLED`, `PAYMENT_REQUIRED`, `CONTEXT_OVERFLOW`, `RESOURCE_EXHAUSTED`, `CONNECTIVITY`,
 `STREAM_CORRUPTION`, `MALFORMED_MODEL_OUTPUT`, `TOOL_NON_COMPLIANCE`, `EMPTY_COMPLETION`,
 `SESSION_EXPIRED`, `CONTENT_FILTER`, `SAFETY_REFUSAL`, `INVALID_REQUEST`, and the rest of
-`crates/llm-inference/src/error.rs:11-96`. `retryability` is the typed retry lane
+`crates/inference/src/error.rs:11-96`. `retryability` is the typed retry lane
 (`docs/py/10-telemetry.md` §Retryability). `retry_after` is already parsed from the header into an
 `omp.Duration`, whether it arrived as a delta or an HTTP date.
 
@@ -1746,7 +1747,7 @@ class UsageWindow:
 policy, and any status widget — which is why `@ogulcancelik/pi-minimal-footer` and
 `@benvargas/pi-synthetic-provider`'s quota command become a declaration plus a TML slot instead of a
 private HTTP client and a cache file. Fourteen providers already have Rust usage projections
-(`crates/llm-inference/src/operation/usage/`); this hook is for the fifteenth.
+(`crates/inference/src/operation/usage/`); this hook is for the fifteenth.
 
 #### `search_parse`
 
@@ -1911,7 +1912,7 @@ That is the whole extension. What went where:
   0600 file and shelling out to a platform binary for a fingerprint is not solving its own problem.
 - **Prompt caching** → `ContextSpec.prefix_cache` + `ChatCaps.prompt_caching`, so the harness places
   breakpoints instead of the extension guessing.
-- **>1 MB image auto-upload** → nothing. Large media staging is `crates/llm-inference/src/staging.rs`
+- **>1 MB image auto-upload** → nothing. Large media staging is `crates/inference/src/staging.rs`
   and `MediaInput`, with `StagingReceipt` evidence. This was never an extension's job; it looked like
   one because pi's provider interface had no media concept.
 - **Token counting** → one member in `operations`. pi had no slot for Anthropic's endpoint at all;
@@ -2211,30 +2212,30 @@ that exists in embryo as `toolhost/v1`.
 
 The types are all present and the merge algebra is written. What is missing is a producer.
 
-`crates/llm-catalog/src/resolve.rs` already defines `CatalogOverlay` (line 256), `ModelOverlay` /
+`crates/catalog/src/resolve.rs` already defines `CatalogOverlay` (line 256), `ModelOverlay` /
 `ModelPatch` (170-219), `RouteOverlay` / `RoutePatch` (222-253), `ScopedAlias` (86), field-granular
 `FieldProvenance` (160-167) over the 38-variant `ModelField` and 20-variant `RouteField` enums, the
 `CatalogResolver` that layers overlays over the bundled snapshot (429-665), `validate_overlay` with
 `UnsafeTrustScope` gating security-sensitive route changes (667-693), and per-field `ProvenanceSource`
-attribution. `crates/llm-catalog/src/discover.rs` has the conservative discovery normalizer with
+attribution. `crates/catalog/src/discover.rs` has the conservative discovery normalizer with
 `DiscoveryDefaults`, `RouteDiscoveryProjector`, and `merge_discovery`.
 
 **And nothing outside the crate constructs a `CatalogOverlay`.** `grep -rn CatalogOverlay --include=*.rs crates/`
-returns hits only in `crates/llm-catalog/src/`. The overlay layer was built and never wired. So the
+returns hits only in `crates/catalog/src/`. The overlay layer was built and never wired. So the
 work is not "design a contribution format" — it is "connect the one that exists."
 
 Concretely:
 
-1. **`crates/llm-catalog`** — add a `contrib` module: `OverlaySource` (`Bundled | UserConfig | Discovery | Extension { id: Str }`), an
+1. **`crates/catalog`** — add a `contrib` module: `OverlaySource` (`Bundled | UserConfig | Discovery | Extension { id: Str }`), an
    `OverlayStack` holding `Arc<[CatalogOverlay]>` plus a `u64` generation, and
    `OverlayStack::with_replaced(source, overlay) -> Self` returning a new stack with a bumped
    generation. Immutable-with-generation, not interior-mutable: `ExecutionPlan` already validates
    itself against `(CatalogRevision, generation)` in `plan_is_current`
-   (`crates/llm-catalog/../llm-inference/src/plan.rs:324-335`), so in-flight requests are already
+   (`crates/catalog/../llm-inference/src/plan.rs:324-335`), so in-flight requests are already
    safe against a swap. This is the single strongest argument for the generation design over any
    locking scheme — the invalidation protocol is written and tested.
 
-2. **`crates/llm-inference/src/registry.rs`** — the real friction. `RegistryBuilder` states that
+2. **`crates/inference/src/registry.rs`** — the real friction. `RegistryBuilder` states that
    "mutation ends permanently at `build`" (line 166) and `RouteBinding` services are preconstructed
    per route. An extension-declared route has no preconstructed stack.
 
@@ -2313,7 +2314,7 @@ Concretely:
    these messages already carries — which is what that field is for, and it means none of this work
    needs to land as a protocol change before it can be exercised.
 
-4. **`crates/llm-inference/src/layer/`** — the cold-path hooks need dispatch points. `before_request`
+4. **`crates/inference/src/layer/`** — the cold-path hooks need dispatch points. `before_request`
    fits `EncodeService`. `provider_error` needs a classification interception in the
    `Error → RetryAction` path, before `fallback_is_safe` (`registry.rs:481-489`) consumes it.
    `provider_sign` sits inside `CredentialApplyService` (`layer/encode.rs:209`) and is the only new
@@ -2359,7 +2360,7 @@ route and a `Fallback.ERROR` must still fail honestly — but build it knowing t
 designed out rather than budgeted for, and build the filter first, because until it exists the budget
 would be arbitrating a set that should not be on the wire.
 
-New: `ConstraintBudget` in `crates/llm-inference/src/plan.rs`, holding per-route ceilings
+New: `ConstraintBudget` in `crates/inference/src/plan.rs`, holding per-route ceilings
 (`maximum_tools`, provider strict-schema cap, grammar-tool cap) and an `assign(&[Intent]) -> Assignment`.
 
 The interesting design question is not the allocation rule; it is **stability**. A greedy
@@ -2662,7 +2663,7 @@ overlay wiring (item 1 above) is a prerequisite and belongs earlier.
    (`crates/app/src/chat.rs:511`), reached through `ParentSessionHost::completion`
    (`crates/app/src/envd/eval/bridge.rs:483`), is the same call the eval prelude's `completion()`
    already exposes. `Operation.CHAT` against a `smol`/`tiny` role reaches
-   `crates/llm-inference/src/local/text.rs`, which has `TextAdapter::generate`, `GenerationOptions`,
+   `crates/inference/src/local/text.rs`, which has `TextAdapter::generate`, `GenerationOptions`,
    `TextCapabilities`, and idle unloading for on-device models;
    `.plan/feature-map/voice.md:146-155` names the shipped Q4 models (`lfm2-350m`, `qwen3-0.6b`,
    `gemma-270m`, `qwen2.5-0.5b`). The blogpost's "Extra: Use local models!" argues for exactly this,

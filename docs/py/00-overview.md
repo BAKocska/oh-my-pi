@@ -20,6 +20,8 @@ omp's Python extension surface, from the process outward.
 | [13-inference.md](13-inference.md) | `@omp.provider`, the provider surface, `omp.creds`, request intents |
 | [14-deploy.md](14-deploy.md) | packaging, distribution, dependency resolution, install/trust lifecycle, `(publisher_key, extension_id)` identity, the manifest declaration table, `WorkspaceUri`, client↔remote layering |
 | [15-campaigns.md](15-campaigns.md) | `@omp.campaign`, fixed decision points, bounded durable engagement state, verdict arbitration, slot claims, and `omp.campaigns.engage/active/disengage` |
+| [16-prelude.md](16-prelude.md) | `@omp.prelude`, extension-declared eval-namespace helpers, declaration and manifest identity, generated sync stubs, JSON call boundary, lifecycle, and failure semantics |
+| [17-scribe.md](17-scribe.md) | `omp.scribe`: `Template`, `render`, `canonicalize`, `TemplateError` — deterministic prompt templating, the props value model, the template grammar, and the builtin helper set |
 
 Rule of the set: the owner defines, everyone else links. This file names sibling symbols but never redefines them. The rule is machine-enforced, not merely stated: the generated spec (*The generated spec*, build section) fails CI on a duplicate public symbol owner, because the review caught the rule being violated by the most central symbols in the set.
 
