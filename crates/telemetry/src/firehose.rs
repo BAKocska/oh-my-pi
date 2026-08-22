@@ -425,7 +425,6 @@ pub struct HostWarning {
 }
 
 /// One typed post-hoc observation.
-
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Event {
