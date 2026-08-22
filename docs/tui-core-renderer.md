@@ -285,16 +285,16 @@ width models in measure-vs-slice produced crashes.
 
 **Rule:** any new measuring code routes through these helpers, and the hot
 path clamps instead of throwing. Known residual: combining-heavy scripts
-(Arabic harakat) survive painting verbatim, but kitty-vt-wasm's cell snapshots
-expose at most two combining marks per cell — the stress harness compares those
-rows with marks stripped (`sameLinesAllowingMarkDrift`).
+(Arabic harakat) survive painting verbatim, but ghostty-web's cell readback can
+migrate non-spacing marks across cells — the stress harness compares those rows
+with marks stripped (`sameLinesAllowingMarkDrift`).
 
 ---
 
 ## 6. The fidelity gate (use it)
 
 `packages/tui/test/render-stress-harness.ts` drives the renderer's **real
-emitted ANSI** into a kitty-vt-wasm (kitty's real screen.c) `VirtualTerminal` across randomized op
+emitted ANSI** into a ghostty-web `VirtualTerminal` across randomized op
 sequences and parameterized terminal shapes, and validates the contract with a
 **shadow commit ledger**: an independent reimplementation of §1's math, fed
 only by observed frames (a `render` wrap) and observed bytes (a `write` wrap).

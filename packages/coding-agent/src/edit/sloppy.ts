@@ -1469,8 +1469,7 @@ function fuzzyOccurrences(content: string, pattern: string, allowSinglePunctuati
 			const punctuationEdits = candidateSignature === structural ? 0 : 1;
 			if (
 				punctuationEdits !== 0 &&
-				(!allowSinglePunctuationInsertion ||
-					!differsByOnePunctuationInsertion(structural, candidateSignature))
+				(!allowSinglePunctuationInsertion || !differsByOnePunctuationInsertion(structural, candidateSignature))
 			) {
 				continue;
 			}

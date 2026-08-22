@@ -701,9 +701,7 @@ interface SloppyArgs {
 const sloppyStrategy: EditStreamingStrategy<SloppyArgs> = {
 	extractCompleteEdits(args, _partialJson, isStreaming) {
 		const input = args.input;
-		return isStreaming && typeof input === "string"
-			? { input: trimTrailingPartialLine(input, true) }
-			: args;
+		return isStreaming && typeof input === "string" ? { input: trimTrailingPartialLine(input, true) } : args;
 	},
 	async computeDiffPreview(args, ctx) {
 		if (typeof args.input !== "string" || args.input.length === 0) return null;
