@@ -432,6 +432,28 @@ impl Default for Theme {
 }
 
 impl Theme {
+	/// Quantizes every semantic token for terminals without truecolor.
+	#[must_use]
+	pub const fn quantized_256(self) -> Self {
+		Self {
+			fg:        self.fg.quantized_256(),
+			accent:    self.accent.quantized_256(),
+			info:      self.info.quantized_256(),
+			ok:        self.ok.quantized_256(),
+			warn:      self.warn.quantized_256(),
+			err:       self.err.quantized_256(),
+			muted:     self.muted.quantized_256(),
+			border:    self.border.quantized_256(),
+			surface:   self.surface.quantized_256(),
+			hover:     self.hover.quantized_256(),
+			selection: self.selection.quantized_256(),
+			shadow:    self.shadow.quantized_256(),
+			panel:     self.panel.quantized_256(),
+			secondary: self.secondary.quantized_256(),
+			contrast:  self.contrast.quantized_256(),
+		}
+	}
+
 	/// Returns the semantic palette for a terminal background appearance.
 	pub const fn for_appearance(appearance: Appearance) -> Self {
 		match appearance {

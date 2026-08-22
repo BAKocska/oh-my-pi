@@ -26,6 +26,8 @@ pub enum CompletionTrigger {
 pub struct CompletionQuery {
 	/// Trigger byte offset in the editor buffer.
 	pub prefix_start: usize,
+	/// Trigger family selected by the typed sigil.
+	pub trigger:      CompletionTrigger,
 	/// Typed query after the trigger.
 	pub query:        Str,
 }
@@ -39,6 +41,48 @@ pub trait CompletionSource: Send + Sync + 'static {
 struct CompletionResult {
 	query: CompletionQuery,
 	items: SuggestionList,
+}
+
+/// Ordered completion composition. The first source with visible rows wins.
+pub struct CompletionChain {
+	sources: SmallVec<Box<dyn EditorCompletion>, 2>,
+}
+
+impl CompletionChain {
+	/// Builds an empty ordered source chain.
+	#[must_use]
+	pub const fn new() -> Self {
+		Self { sources: SmallVec::new() }
+	}
+
+	/// Appends a lower-precedence source.
+	#[must_use]
+	pub fn source(mut self, source: Box<dyn EditorCompletion>) -> Self {
+		self.sources.push(source);
+		self
+	}
+}
+
+impl Default for CompletionChain {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl EditorCompletion for CompletionChain {
+	fn suggest(&mut self, text: &str, cursor: usize) -> Option<Suggestions> {
+		self
+			.sources
+			.iter_mut()
+			.find_map(|source| source.suggest(text, cursor))
+	}
+
+	fn hint(&mut self, text: &str, cursor: usize) -> Option<Str> {
+		self
+			.sources
+			.iter_mut()
+			.find_map(|source| source.hint(text, cursor))
+	}
 }
 
 /// Bridges asynchronous extension completion to [`EditorCompletion`].
@@ -96,11 +140,32 @@ impl DeferredCompletion {
 				.iter()
 				.any(|(candidate, _)| candidate == character)
 		})?;
+		let kind = self
+			.triggers
+			.iter()
+			.find(|(candidate, _)| candidate == &trigger)
+			.map(|(_, kind)| *kind)?;
 		let after = before.get(offset + trigger.len_utf8()..)?;
 		if after.chars().any(char::is_whitespace) {
 			return None;
 		}
-		Some(CompletionQuery { prefix_start: offset, query: Str::new(after) })
+		if kind == CompletionTrigger::Custom {
+			let token_start = before[..offset]
+				.char_indices()
+				.rev()
+				.find(|(_, character)| character.is_whitespace())
+				.map_or(0, |(at, character)| at + character.len_utf8());
+			return Some(CompletionQuery {
+				prefix_start: token_start,
+				trigger:      kind,
+				query:        Str::new(&before[token_start..]),
+			});
+		}
+		Some(CompletionQuery {
+			prefix_start: offset,
+			trigger:      kind,
+			query:        Str::new(after),
+		})
 	}
 
 	fn drain(&mut self) {

@@ -5,7 +5,8 @@ mod col;
 mod countdown;
 mod custom;
 mod diff;
-mod editor;
+/// Editable composer and external-editor lifecycle primitives.
+pub mod editor;
 mod form;
 pub mod hr;
 mod icon;
@@ -45,7 +46,7 @@ pub use custom::CustomElement;
 pub use diff::{DiffKind, DiffLine, DiffView};
 pub use editor::{
 	Attachment, AttachmentContent, Attachments, ComposerLayout, ComposerStatusAttachment,
-	ComposerStyle, EditInput, EditorPane, attachment_color, chip_label,
+	ComposerStyle, EditInput, EditorPane, KeywordAccent, attachment_color, chip_label,
 };
 pub use form::{Field, Form};
 pub use hr::{Hr, Spacer};

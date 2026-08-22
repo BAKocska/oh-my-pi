@@ -105,6 +105,62 @@ impl Color {
 			CssColor::System(_) => None,
 		}
 	}
+
+	/// Quantizes a 24-bit color to the nearest xterm 256-color cube or
+	/// grayscale entry. Default and already-indexed colors pass through.
+	#[must_use]
+	pub const fn quantized_256(self) -> Self {
+		let Self::Rgb(red, green, blue) = self else {
+			return self;
+		};
+		let levels = [0_u8, 95, 135, 175, 215, 255];
+		let ri = nearest_level(red);
+		let gi = nearest_level(green);
+		let bi = nearest_level(blue);
+		let cube = 16 + 36 * ri + 6 * gi + bi;
+		let cube_r = levels[ri as usize];
+		let cube_g = levels[gi as usize];
+		let cube_b = levels[bi as usize];
+		let cube_error = distance_sq(red, green, blue, cube_r, cube_g, cube_b);
+
+		let average = (red as u16 + green as u16 + blue as u16) / 3;
+		let gray_index = if average <= 8 {
+			0
+		} else {
+			let candidate = (average - 8 + 5) / 10;
+			if candidate > 23 { 23 } else { candidate as u8 }
+		};
+		let gray = 8 + 10 * gray_index;
+		let gray_error = distance_sq(red, green, blue, gray, gray, gray);
+		if gray_error < cube_error {
+			Self::Indexed(232 + gray_index)
+		} else {
+			Self::Indexed(cube)
+		}
+	}
+}
+const fn nearest_level(channel: u8) -> u8 {
+	let levels = [0_u8, 95, 135, 175, 215, 255];
+	let mut best = 0_u8;
+	let mut best_distance = u16::MAX;
+	let mut index = 0_u8;
+	while index < 6 {
+		let level = levels[index as usize];
+		let distance = channel.abs_diff(level) as u16;
+		if distance < best_distance {
+			best = index;
+			best_distance = distance;
+		}
+		index += 1;
+	}
+	best
+}
+
+const fn distance_sq(r: u8, g: u8, b: u8, rr: u8, gg: u8, bb: u8) -> u32 {
+	let dr = r.abs_diff(rr) as u32;
+	let dg = g.abs_diff(gg) as u32;
+	let db = b.abs_diff(bb) as u32;
+	dr * dr + dg * dg + db * db
 }
 /// A two-stop terminal color ramp.
 ///

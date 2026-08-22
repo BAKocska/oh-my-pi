@@ -14,15 +14,18 @@ workspace = true
 
 [dependencies]
 arc-swap = { workspace = true }
+bytes = { workspace = true }
 flume = { workspace = true }
 omp-core = { workspace = true }
 omp-tui = { workspace = true }
 omp-tools = { workspace = true }
 parking_lot = { workspace = true }
 omp-proto = { workspace = true }
+prost = { workspace = true }
 smallvec = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
 xutf = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh3"] }

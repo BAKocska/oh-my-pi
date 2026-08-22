@@ -19,7 +19,7 @@ use crate::{
 const KILL_CAP: usize = 60;
 const UNDO_CAP: usize = 100;
 const PICKER_ROWS: usize = 5;
-const MAX_INPUT_ROWS: usize = 8;
+const MAX_INPUT_ROWS: usize = 16;
 const MAX_EMOJI_SUGGESTIONS: usize = 12;
 const HISTORY_CAPACITY: usize = 100;
 
@@ -1385,6 +1385,8 @@ pub struct Suggestion {
 	display:     SuggestionDisplay,
 	description: Option<Str>,
 	hint:        Option<Str>,
+	category:    Option<Str>,
+	match_spans: SmallVec<(u16, u16), 8>,
 }
 
 impl Suggestion {
@@ -1396,6 +1398,8 @@ impl Suggestion {
 			display:     SuggestionDisplay::Text(label.into_str()),
 			description: None,
 			hint:        None,
+			category:    None,
+			match_spans: SmallVec::new(),
 		}
 	}
 
@@ -1411,6 +1415,36 @@ impl Suggestion {
 	pub fn with_hint(mut self, hint: impl IntoStr) -> Self {
 		self.hint = Some(hint.into_str());
 		self
+	}
+
+	/// Assigns a category. The picker retains one non-selectable header at each
+	/// category boundary inside the visible window.
+	#[must_use]
+	pub fn with_category(mut self, category: impl IntoStr) -> Self {
+		self.category = Some(category.into_str());
+		self
+	}
+
+	/// Assigns UTF-8 byte spans to emphasize within the dropdown label.
+	#[must_use]
+	pub fn with_match_spans(mut self, spans: impl IntoIterator<Item = (u16, u16)>) -> Self {
+		self.match_spans = spans
+			.into_iter()
+			.filter(|(start, end)| start < end)
+			.collect();
+		self
+	}
+
+	/// Returns the row category, when present.
+	#[must_use]
+	pub fn category(&self) -> Option<&str> {
+		self.category.as_deref()
+	}
+
+	/// Returns UTF-8 byte match spans in the dropdown label.
+	#[must_use]
+	pub fn match_spans(&self) -> &[(u16, u16)] {
+		&self.match_spans
 	}
 
 	/// Returns the row's dropdown label.
@@ -1496,6 +1530,20 @@ pub trait EditorCompletion {
 	}
 }
 
+/// One retained row in a visible picker window.
+#[derive(Clone, Copy, Debug)]
+pub enum PickerRow<'a> {
+	/// Non-selectable category header.
+	Header(&'a Str),
+	/// Selectable suggestion and its absolute picker index.
+	Suggestion {
+		/// Absolute suggestion index.
+		index:      usize,
+		/// Borrowed suggestion.
+		suggestion: &'a Suggestion,
+	},
+}
+
 /// Active completion dropdown state.
 pub struct Picker {
 	prefix_start: usize,
@@ -1513,6 +1561,24 @@ impl Picker {
 		let max_start = self.suggestions.len().saturating_sub(visible);
 		let start = self.selected.saturating_sub(PICKER_ROWS / 2).min(max_start);
 		(start, &self.suggestions[start..start + visible])
+	}
+
+	/// Returns visible rows including category headers.
+	#[must_use]
+	pub fn visible_rows(&self) -> SmallVec<PickerRow<'_>, 8> {
+		let (start, suggestions) = self.visible_suggestions();
+		let mut rows = SmallVec::new();
+		let mut category: Option<&Str> = None;
+		for (offset, suggestion) in suggestions.iter().enumerate() {
+			if suggestion.category.as_ref() != category {
+				category = suggestion.category.as_ref();
+				if let Some(header) = category {
+					rows.push(PickerRow::Header(header));
+				}
+			}
+			rows.push(PickerRow::Suggestion { index: start + offset, suggestion });
+		}
+		rows
 	}
 
 	/// Returns the selected suggestion's absolute index.
@@ -1635,7 +1701,7 @@ impl Editor {
 			self
 				.picker
 				.as_ref()
-				.map_or(0, |picker| picker.len().min(PICKER_ROWS)),
+				.map_or(0, |picker| picker.visible_rows().len()),
 		)
 		.unwrap_or(u16::MAX)
 	}
@@ -2189,6 +2255,8 @@ impl SlashCommands {
 					display:     SuggestionDisplay::Text(selected_name.clone()),
 					description: Some(command.description.clone()),
 					hint:        command.hint.clone(),
+					category:    Some(sf!("Commands")),
+					match_spans: fuzzy_match_spans(selected_name, &query),
 				}));
 			}
 		}
@@ -2226,6 +2294,8 @@ impl SlashCommands {
 					display:     SuggestionDisplay::Text(arg.name.clone()),
 					description: Some(arg.description.clone()),
 					hint:        None,
+					category:    Some(sf!("Arguments")),
+					match_spans: fuzzy_match_spans(&arg.name, &query),
 				}));
 			}
 		}
@@ -2311,6 +2381,8 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 				display:     SuggestionDisplay::Emoji { emoji, shortcode: pattern },
 				description: None,
 				hint:        None,
+				category:    Some(sf!("Emoji")),
+				match_spans: SmallVec::new(),
 			});
 		}
 	}
@@ -2326,6 +2398,8 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 				display:     SuggestionDisplay::Emoji { emoji: entry[1], shortcode: entry[0] },
 				description: None,
 				hint:        None,
+				category:    Some(sf!("Emoji")),
+				match_spans: SmallVec::new(),
 			});
 		}
 	}
@@ -2368,6 +2442,41 @@ fn lookup_emoji(name: &str) -> Option<&'static str> {
 		.get(index)
 		.filter(|entry| entry[0] == name)
 		.map(|entry| entry[1])
+}
+
+fn fuzzy_match_spans(candidate: &str, query: &str) -> SmallVec<(u16, u16), 8> {
+	if query.is_empty() {
+		return SmallVec::new();
+	}
+	let folded = candidate.to_ascii_lowercase();
+	if let Some(start) = folded.find(query) {
+		let Ok(start) = u16::try_from(start) else {
+			return SmallVec::new();
+		};
+		let Ok(end) = u16::try_from(usize::from(start) + query.len()) else {
+			return SmallVec::new();
+		};
+		return smallvec::smallvec![(start, end)];
+	}
+	let mut spans = SmallVec::new();
+	let mut query = query.bytes();
+	let mut wanted = query.next();
+	for (index, byte) in folded.bytes().enumerate() {
+		if wanted == Some(byte) {
+			if let Ok(index) = u16::try_from(index) {
+				spans.push((index, index.saturating_add(1)));
+			}
+			wanted = query.next();
+			if wanted.is_none() {
+				break;
+			}
+		}
+	}
+	if wanted.is_none() {
+		spans
+	} else {
+		SmallVec::new()
+	}
 }
 
 fn command_score(query: &str, target: &str) -> u16 {

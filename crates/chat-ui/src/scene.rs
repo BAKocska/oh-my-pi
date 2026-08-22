@@ -16,7 +16,7 @@ use omp_tui::{
 	anim::{Easing, Shimmer, Tween},
 	components::{
 		Attachment, AttachmentContent, Attachments, ComposerStatusAttachment, ComposerStyle,
-		ContextGaugeMode, EditorPane, Segment, Status, TextLeaf, advisor_spend_label,
+		ContextGaugeMode, EditorPane, KeywordAccent, Segment, Status, TextLeaf, advisor_spend_label,
 		boundary_layout, collapse_hud_line, compaction_threshold_color, context_gauge_cells,
 		hr::truncate_to_width, spend_label,
 	},
@@ -402,11 +402,14 @@ impl ToolView {
 }
 
 struct ToolEntry {
-	name:   Str,
-	label:  Str,
-	ok:     bool,
-	view:   ToolView,
-	images: Vec<ToolImageEntry>,
+	id:       Str,
+	name:     Str,
+	rev:      Str,
+	label:    Str,
+	ok:       bool,
+	expanded: bool,
+	view:     ToolView,
+	images:   Vec<ToolImageEntry>,
 }
 
 struct ToolGroup {
@@ -435,11 +438,13 @@ struct LiveAssistant {
 	text: StrMut,
 }
 struct LiveTool {
-	id:     Str,
-	name:   Str,
-	title:  Str,
-	view:   ToolView,
-	images: Vec<ToolImageEntry>,
+	id:       Str,
+	name:     Str,
+	rev:      Str,
+	title:    Str,
+	expanded: bool,
+	view:     ToolView,
+	images:   Vec<ToolImageEntry>,
 }
 
 enum Entry {
@@ -943,6 +948,7 @@ pub struct Chat {
 	agents:             Vec<AgentRow>,
 	agent_labels:       Vec<Str>,
 	attribution:        Option<Attribution>,
+	keyword_accent:     KeywordAccent,
 }
 
 impl Chat {
@@ -996,6 +1002,7 @@ impl Chat {
 			agent_labels: Vec::new(),
 			slots: Slots::new(ctx.clone()),
 			attribution: None,
+			keyword_accent: KeywordAccent::default(),
 		}
 	}
 
@@ -1014,6 +1021,18 @@ impl Chat {
 				true
 			});
 		self.refresh_composer();
+	}
+
+	/// Replaces the prompt-policy keyword data used by editor accent and replay
+	/// masking.
+	pub fn set_keyword_accent(&mut self, accent: KeywordAccent) {
+		self.keyword_accent = accent.clone();
+		self
+			.editor_ui
+			.update_component::<EditorPane>(INPUT_ID, |pane| {
+				pane.set_keyword_accent(accent);
+				true
+			});
 	}
 
 	/// Borrows retained extension slots for composition or headless inspection.
@@ -1042,6 +1061,10 @@ impl Chat {
 
 	/// Routes a key through the composer.
 	pub fn handle_key(&mut self, key: Key) -> ChatKey {
+		if key == Key::Ctrl('o') {
+			self.toggle_latest_tool();
+			return ChatKey::Consumed;
+		}
 		if key == Key::Enter && self.composer_empty() && self.is_working() {
 			self
 				.pending_submit
@@ -1122,6 +1145,9 @@ impl Chat {
 
 	/// Routes a document-space mouse report into the composer.
 	pub fn handle_mouse(&mut self, report: &MouseReport) {
+		if report.kind == omp_tui::Mouse::Click && self.toggle_tool_at_row(report.row) {
+			return;
+		}
 		let rows = self.composer_rows();
 		let y = self.frame.size().height.saturating_sub(rows);
 		if report.row >= y && report.row < y.saturating_add(rows) {
@@ -1168,6 +1194,16 @@ impl Chat {
 		self.work.borrow().facts.clone()
 	}
 
+	/// Replaces the composer's completion source.
+	pub fn set_completion(&mut self, completion: Box<dyn omp_tui::EditorCompletion>) {
+		self
+			.editor_ui
+			.update_component::<EditorPane>(INPUT_ID, |pane| {
+				pane.set_completion(completion);
+				true
+			});
+	}
+
 	/// Replaces slash-command completion data.
 	pub fn set_slash_commands(&mut self, commands: Vec<Command>) {
 		self
@@ -1185,6 +1221,7 @@ impl Chat {
 
 	/// Appends a committed user message.
 	pub fn push_user(&mut self, text: impl Into<String>, chips: Vec<Str>) {
+		let text = mask_keywords(text.into(), &self.keyword_accent);
 		self.transcript.push(Entry::User(UserEntry {
 			body: RichText::new(text, Self::message_width(self.layout_width), &self.ctx),
 			chips,
@@ -1228,12 +1265,20 @@ impl Chat {
 	}
 
 	/// Begins a live tool card.
-	pub fn tool_started(&mut self, id: impl Into<Str>, name: impl Into<Str>, title: impl Into<Str>) {
+	pub fn tool_started(
+		&mut self,
+		id: impl Into<Str>,
+		name: impl Into<Str>,
+		rev: impl Into<Str>,
+		title: impl Into<Str>,
+	) {
 		let title = hud_line(title.into(), self.ctx.charset);
 		self.live_tools.push(LiveTool {
 			id: id.into(),
 			name: name.into(),
+			rev: rev.into(),
 			title,
+			expanded: true,
 			view: ToolView::structured(
 				Default::default(),
 				Self::tool_view_width(self.layout_width),
@@ -1305,8 +1350,17 @@ impl Chat {
 			} else {
 				self.ctx.charset.icon(Icon::Error)
 			};
-			let label = fmts_mut!("{icon} {}", tool.title).freeze();
-			let entry = ToolEntry { name: tool.name, label, ok, view: tool.view, images: tool.images };
+			let label = fmts_mut!("{icon} {}@{} · {}", tool.name, tool.rev, tool.title).freeze();
+			let entry = ToolEntry {
+				id: tool.id,
+				name: tool.name,
+				rev: tool.rev,
+				label,
+				ok,
+				expanded: false,
+				view: tool.view,
+				images: tool.images,
+			};
 			if entry.name.as_str() == "read" {
 				let prior_is_read = matches!(self.transcript.last(), Some(Entry::Tool(prior)) if prior.name.as_str() == "read");
 				if let Some(Entry::ToolGroup(group)) = self.transcript.last_mut() {
@@ -1324,6 +1378,83 @@ impl Chat {
 			} else {
 				self.transcript.push(Entry::Tool(entry));
 			}
+			self.bump_live();
+		}
+	}
+
+	/// Toggles the exact-identity tool card whose header occupies `row`.
+	pub fn toggle_tool_at_row(&mut self, row: u16) -> bool {
+		let width = self.last_viewport.width;
+		let mut y = 0_u16;
+		for entry in &mut self.transcript {
+			match entry {
+				Entry::Tool(tool) => {
+					if row == y {
+						tool.expanded = !tool.expanded;
+						self.live_revision = self.live_revision.wrapping_add(1);
+						return true;
+					}
+				},
+				Entry::ToolGroup(group) => {
+					let mut tool_y = y.saturating_add(1);
+					for tool in &mut group.tools {
+						if row == tool_y {
+							tool.expanded = !tool.expanded;
+							self.live_revision = self.live_revision.wrapping_add(1);
+							return true;
+						}
+						tool_y = tool_y
+							.saturating_add(tool_height(tool, width))
+							.saturating_add(1);
+					}
+				},
+				_ => {},
+			}
+			y = y.saturating_add(Self::entry_height(entry, width));
+		}
+		false
+	}
+
+	/// Toggles one committed card only when call id, name, and revision all
+	/// match.
+	pub fn toggle_tool_identity(&mut self, id: &str, name: &str, rev: &str) -> bool {
+		let tool = self.transcript.iter_mut().find_map(|entry| match entry {
+			Entry::Tool(tool)
+				if tool.id.as_str() == id && tool.name.as_str() == name && tool.rev.as_str() == rev =>
+			{
+				Some(tool)
+			},
+			Entry::ToolGroup(group) => group.tools.iter_mut().find(|tool| {
+				tool.id.as_str() == id && tool.name.as_str() == name && tool.rev.as_str() == rev
+			}),
+			_ => None,
+		});
+		let Some(tool) = tool else {
+			return false;
+		};
+		tool.expanded = !tool.expanded;
+		self.live_revision = self.live_revision.wrapping_add(1);
+		true
+	}
+
+	/// Toggles the most recent exact-identity tool card.
+	pub fn toggle_latest_tool(&mut self) {
+		if let Some(tool) = self.live_tools.last_mut() {
+			tool.expanded = !tool.expanded;
+			self.bump_live();
+			return;
+		}
+		let tool = self
+			.transcript
+			.iter_mut()
+			.rev()
+			.find_map(|entry| match entry {
+				Entry::Tool(tool) => Some(tool),
+				Entry::ToolGroup(group) => group.tools.last_mut(),
+				_ => None,
+			});
+		if let Some(tool) = tool {
+			tool.expanded = !tool.expanded;
 			self.bump_live();
 		}
 	}
@@ -1387,6 +1518,7 @@ impl Chat {
 			TranscriptFrameKind::Handoff => "handoff",
 			TranscriptFrameKind::CacheBreak => "cache break",
 			TranscriptFrameKind::Recovery => "recovery",
+			TranscriptFrameKind::Peer => "peer",
 			TranscriptFrameKind::Error => "error",
 		};
 		let text = match frame.detail {
@@ -1504,7 +1636,9 @@ impl Chat {
 				self.append_assistant(id.as_str(), text.as_str());
 			},
 			BackendEvent::AssistantEnd { id } => self.end_assistant(id.as_str()),
-			BackendEvent::ToolStarted { id, name, title } => self.tool_started(id, name, title),
+			BackendEvent::ToolStarted { id, name, rev, title } => {
+				self.tool_started(id, name, rev, title);
+			},
 			BackendEvent::ToolOutput { id, chunk } => self.tool_output(id.as_str(), chunk.as_str()),
 			BackendEvent::ToolView { id, view } => self.tool_view(id.as_str(), view),
 			BackendEvent::ToolImage { id, source } => self.tool_image(id.as_str(), source),
@@ -1524,14 +1658,19 @@ impl Chat {
 					self.push_notice("Interrupted.");
 				}
 			},
-			event @ (BackendEvent::OpenModelPicker { .. }
+			event @ (BackendEvent::ApprovalPending(_)
+			| BackendEvent::ApprovalSettled { .. }
+			| BackendEvent::PtyStarted { .. }
+			| BackendEvent::PtyOutput { .. }
+			| BackendEvent::PtyFinished { .. }
+			| BackendEvent::OpenModelPicker { .. }
 			| BackendEvent::ModelsUpdated { .. }
 			| BackendEvent::Sessions(_)
 			| BackendEvent::LoginProviders(_)
 			| BackendEvent::RewindTargets(_)
 			| BackendEvent::AuthPrompt { .. }
 			| BackendEvent::AuthPromptClose
-			| BackendEvent::OpenSettings
+			| BackendEvent::SettingsSchema(_)
 			| BackendEvent::OpenAgentTree
 			| BackendEvent::Pause
 			| BackendEvent::NewSessionRequested) => return Some(event),
@@ -1607,7 +1746,9 @@ impl Chat {
 		frame
 	}
 
-	fn composer_text(&self) -> String {
+	/// Returns the current unsent composer text.
+	#[must_use]
+	pub fn composer_text(&self) -> String {
 		self.editor_ui.values()[INPUT_ID]
 			.as_str()
 			.unwrap_or_default()
@@ -1808,10 +1949,11 @@ impl Chat {
 			.live_assistant
 			.as_ref()
 			.map_or(0, |assistant| flowed_height(assistant.text.as_str(), inner_width));
-		let tool_rows = self
-			.live_tools
-			.iter()
-			.fold(0_u16, |rows, tool| rows.saturating_add(1).saturating_add(tool.view.height()));
+		let tool_rows = self.live_tools.iter().fold(0_u16, |rows, tool| {
+			rows
+				.saturating_add(1)
+				.saturating_add(if tool.expanded { tool.view.height() } else { 0 })
+		});
 		let content_rows = agent_rows
 			.saturating_add(assistant_rows)
 			.saturating_add(tool_rows)
@@ -2018,12 +2160,19 @@ fn draw_live_panel_impl(
 			break;
 		}
 		let style = ink(ctx.theme.info);
+		let identity = fmts_mut!("{}@{}", tool.name, tool.rev).freeze();
 		draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[
+			Span::new(if tool.expanded { "v" } else { ">" }, style),
 			Span::new(ctx.charset.spinner().at(elapsed), style),
 			Span::new(" ", style),
+			Span::new(&identity, style.bold()),
+			Span::new(" · ", style),
 			Span::new(&tool.title, style),
 		]);
 		y = y.saturating_add(1);
+		if !tool.expanded {
+			continue;
+		}
 		let available = bottom.saturating_sub(y);
 		let height = tool.view.height().min(available);
 		if height > 0 {
@@ -2142,6 +2291,9 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 		&tool.label,
 		ink(state).bold(),
 	)]);
+	if !tool.expanded {
+		return height;
+	}
 	let mut row = y.saturating_add(1);
 	let bottom = y.saturating_add(height).saturating_sub(1);
 	let view_height = tool.view.height().min(bottom.saturating_sub(row));
@@ -2182,6 +2334,9 @@ fn tool_image_box(image: &ToolImageEntry, width: u16) -> (u16, u16) {
 }
 
 fn tool_height(tool: &ToolEntry, width: u16) -> u16 {
+	if !tool.expanded {
+		return 1;
+	}
 	let image_rows = tool
 		.images
 		.iter()
@@ -2192,6 +2347,13 @@ fn tool_height(tool: &ToolEntry, width: u16) -> u16 {
 		.saturating_add(image_rows)
 		.saturating_add(2)
 		.max(3)
+}
+
+fn mask_keywords(mut text: String, accent: &KeywordAccent) -> String {
+	for (start, end) in accent.matched_spans(&text).into_iter().rev() {
+		text.replace_range(start..end, &"•".repeat(end - start));
+	}
+	text
 }
 
 fn preserves_attachments(text: &str) -> bool {
@@ -2520,7 +2682,7 @@ mod tests {
 		assert_eq!(chat.live_panel_height(viewport.width), 3, "one label needs one row plus border");
 		assert_eq!(damage.as_slice(), &[(chat.transcript_rows, chat.frame.size().height)]);
 
-		chat.tool_started("tool", "read", "Read source");
+		chat.tool_started("tool", "read", "1", "Read source");
 		let prior_height = chat.live_panel_height(viewport.width);
 		let (_, damage) =
 			present_and_assert_terminal(&mut chat, &mut renderer, &mut terminal, viewport);
@@ -2735,6 +2897,7 @@ mod tests {
 		chat.tool_started(
 			"tool",
 			"task",
+			"1",
 			"Complete assignment thoroughly:\n\n  # Target\nFiles: src/foo.rs",
 		);
 		chat.set_session_title("First line\n\nSecond line");
@@ -2753,15 +2916,15 @@ mod tests {
 	#[test]
 	fn consecutive_reads_group_until_another_transcript_entry() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("read-a", "read", "src/a.rs");
+		chat.tool_started("read-a", "read", "1", "src/a.rs");
 		chat.tool_finished("read-a", true, sf!("a"));
-		chat.tool_started("read-b", "read", "src/b.rs");
+		chat.tool_started("read-b", "read", "1", "src/b.rs");
 		chat.tool_finished("read-b", true, sf!("b"));
 		assert!(matches!(&chat.transcript[..], [Entry::ToolGroup(group)] if group.tools.len() == 2));
 
-		chat.tool_started("shell", "bash", "cargo metadata");
+		chat.tool_started("shell", "bash", "1", "cargo metadata");
 		chat.tool_finished("shell", true, sf!("ok"));
-		chat.tool_started("read-c", "read", "src/c.rs");
+		chat.tool_started("read-c", "read", "1", "src/c.rs");
 		chat.tool_finished("read-c", true, sf!("c"));
 		assert!(matches!(
 			&chat.transcript[..],
@@ -3024,7 +3187,7 @@ mod tests {
 		let source = Str::new(path.to_string_lossy().as_ref());
 
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("t1", "read", "read page.pdf:p1.png");
+		chat.tool_started("t1", "read", "1", "read page.pdf:p1.png");
 		chat.tool_image("t1", source);
 		chat.tool_finished("t1", true, sf!("<row>rendered page 1</row>"));
 		let frame = chat.render(Size::new(80, 40)).frame;
@@ -3042,7 +3205,7 @@ mod tests {
 	#[test]
 	fn undecodable_tool_image_keeps_the_text_card() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("t1", "shell", "shell ls");
+		chat.tool_started("t1", "shell", "1", "shell ls");
 		chat.tool_image("t1", "/nonexistent/omp-tool-image.png");
 		chat.tool_finished("t1", true, sf!("<row>done</row>"));
 		let frame = chat.render(Size::new(80, 24)).frame;
@@ -3053,7 +3216,7 @@ mod tests {
 	#[test]
 	fn live_tool_view_replaces_retained_markup_without_line_vectors() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("t1", "same-name", "same-name");
+		chat.tool_started("t1", "same-name", "1", "same-name");
 		chat.tool_view("t1", sf!("<row>first update</row>"));
 		chat.tool_view("t1", sf!("<row>second update</row>"));
 		let live = chat.render(Size::new(80, 24)).frame;

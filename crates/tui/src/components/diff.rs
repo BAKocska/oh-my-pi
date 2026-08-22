@@ -3,7 +3,7 @@ use omp_core::{IntoStr, Str};
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::UiContext,
-	frame::{Rect, Style},
+	frame::{Color, Rect, Style},
 	props::{Prop, PropValue, Props},
 	rich::{Pipeline, Prefix, RichSink, RichText, width_config_epoch},
 };
@@ -30,6 +30,18 @@ pub struct DiffLine {
 	pub text: Str,
 }
 
+/// Width-sensitive diff presentation policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DiffLayout {
+	/// Select side-by-side at wide widths and unified otherwise.
+	#[default]
+	Auto,
+	/// Always render one canonical unified stream.
+	Unified,
+	/// Render adjacent remove/add pairs in two columns when space permits.
+	SideBySide,
+}
+
 /// A component that renders a diff with semantic styles.
 pub struct DiffView {
 	props:              Props,
@@ -41,6 +53,10 @@ pub struct DiffView {
 	cached_width_epoch: u64,
 	cached_revision:    u64,
 	cached_context:     Option<u16>,
+	layout:             DiffLayout,
+	colorblind:         bool,
+	cached_side:        bool,
+	cached_colorblind:  bool,
 }
 
 impl DiffView {
@@ -56,6 +72,10 @@ impl DiffView {
 			cached_width_epoch: 0,
 			cached_revision:    0,
 			cached_context:     None,
+			layout:             DiffLayout::Auto,
+			colorblind:         false,
+			cached_side:        false,
+			cached_colorblind:  false,
 		}
 	}
 
@@ -64,6 +84,16 @@ impl DiffView {
 	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
 		self.props.set(prop, value);
 		self
+	}
+
+	/// Selects unified, side-by-side, or width-sensitive automatic layout.
+	pub const fn set_layout(&mut self, layout: DiffLayout) {
+		self.layout = layout;
+	}
+
+	/// Enables a blue/amber palette in addition to semantic +/- glyphs.
+	pub const fn set_colorblind(&mut self, colorblind: bool) {
+		self.colorblind = colorblind;
 	}
 
 	/// Appends a new line to the diff view.
@@ -105,11 +135,18 @@ impl DiffView {
 		let width_epoch = width_config_epoch();
 		let revision = ctx.revision;
 		let context = self.props.context();
+		let side = match self.layout {
+			DiffLayout::Auto => width >= 100,
+			DiffLayout::Unified => false,
+			DiffLayout::SideBySide => width >= 40,
+		};
 
 		if self.cached_width == width
 			&& self.cached_width_epoch == width_epoch
 			&& self.cached_revision == revision
 			&& self.cached_context == context
+			&& self.cached_side == side
+			&& self.cached_colorblind == self.colorblind
 		{
 			if self.rendered_lines == self.lines.len() {
 				return;
@@ -126,9 +163,19 @@ impl DiffView {
 			self.cached_width_epoch = width_epoch;
 			self.cached_revision = revision;
 			self.cached_context = context;
+			self.cached_side = side;
+			self.cached_colorblind = self.colorblind;
 		}
 
-		let (info, muted, ok, err) = (ctx.theme.info, ctx.theme.muted, ctx.theme.ok, ctx.theme.err);
+		let (info, muted, ok, err) = if self.colorblind {
+			(ctx.theme.info, ctx.theme.muted, ctx.theme.secondary, ctx.theme.accent)
+		} else {
+			(ctx.theme.info, ctx.theme.muted, ctx.theme.ok, ctx.theme.err)
+		};
+		if side {
+			self.render_side_by_side(width, info, muted, ok, err);
+			return;
+		}
 
 		let prefixes = ctx.charset.diff_prefixes();
 		let mut p_header = Prefix::default();
@@ -193,6 +240,69 @@ impl DiffView {
 		}
 		self.rendered_lines = self.lines.len();
 	}
+
+	fn render_side_by_side(
+		&mut self,
+		width: u16,
+		info: Color,
+		muted: Color,
+		add: Color,
+		remove: Color,
+	) {
+		self.rich.clear();
+		let split = usize::from(width.saturating_sub(3) / 2);
+		let mut index = 0;
+		while index < self.lines.len() {
+			let line = &self.lines[index];
+			if line.kind == DiffKind::Remove
+				&& let Some(next) = self.lines.get(index + 1)
+				&& next.kind == DiffKind::Add
+			{
+				let left = truncate_cells(line.text.as_str(), split.saturating_sub(2));
+				let right = truncate_cells(next.text.as_str(), split.saturating_sub(2));
+				let mut wrap = (&mut self.rich).wrap_chars(width);
+				wrap.run(Style::new().fg(remove), "- ");
+				wrap.run(Style::new().fg(remove), left.as_str());
+				wrap.run(Style::new().fg(muted), " │ ");
+				wrap.run(Style::new().fg(add), "+ ");
+				wrap.run(Style::new().fg(add), right.as_str());
+				wrap.newline();
+				index += 2;
+				continue;
+			}
+			let color = match line.kind {
+				DiffKind::Header => info,
+				DiffKind::Context => muted,
+				DiffKind::Add => add,
+				DiffKind::Remove => remove,
+			};
+			let prefix = match line.kind {
+				DiffKind::Header | DiffKind::Context => "  ",
+				DiffKind::Add => "+ ",
+				DiffKind::Remove => "- ",
+			};
+			let mut wrap = (&mut self.rich).wrap_chars(width);
+			wrap.run(Style::new().fg(color), prefix);
+			wrap.run(Style::new().fg(color), line.text.as_str());
+			wrap.newline();
+			index += 1;
+		}
+		self.rendered_lines = self.lines.len();
+	}
+}
+
+fn truncate_cells(text: &str, width: usize) -> Str {
+	if xutf::width_str(text) <= width {
+		return Str::new(text);
+	}
+	let mut out = String::new();
+	for character in text.chars() {
+		if xutf::width_str(&out).saturating_add(xutf::width_char(character)) > width {
+			break;
+		}
+		out.push(character);
+	}
+	Str::new(out)
 }
 
 impl Default for DiffView {

@@ -1,6 +1,8 @@
 use std::{
 	cell::RefCell,
+	io,
 	rc::Rc,
+	sync::Arc,
 	time::{Duration, Instant},
 };
 
@@ -13,7 +15,7 @@ use xutf::Text;
 
 use super::Img;
 use crate::{
-	Completion, EditBuffer, EditOutcome, Editor, EditorOptions, SuggestionDisplay,
+	Completion, EditBuffer, EditOutcome, Editor, EditorOptions, PickerRow, SuggestionDisplay,
 	component::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoComponent, PaintCtx, Slot, next_slot,
 	},
@@ -192,28 +194,91 @@ const fn scrollbar_thumb(charset: Charset) -> char {
 	}
 }
 
+/// Data-driven accent policy for editor keywords.
+#[derive(Clone, Debug, Default)]
+pub struct KeywordAccent {
+	keywords: Arc<[Str]>,
+}
+
+impl KeywordAccent {
+	/// Creates an immutable keyword set. Empty values are ignored.
+	#[must_use]
+	pub fn new(keywords: impl IntoIterator<Item = Str>) -> Self {
+		Self {
+			keywords: keywords
+				.into_iter()
+				.filter(|keyword| !keyword.is_empty())
+				.collect(),
+		}
+	}
+
+	/// Uses an already shared immutable keyword set without copying it.
+	#[must_use]
+	pub fn from_shared(keywords: Arc<[Str]>) -> Self {
+		Self { keywords }
+	}
+
+	/// Finds case-insensitive whole-word keyword spans in one immutable text.
+	#[must_use]
+	pub fn matched_spans(&self, text: &str) -> SmallVec<(usize, usize), 8> {
+		let mut spans = SmallVec::new();
+		for (at, _) in text.char_indices() {
+			let boundary_before = text[..at]
+				.chars()
+				.next_back()
+				.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+			if !boundary_before {
+				continue;
+			}
+			for keyword in self.keywords.iter() {
+				let end = at.saturating_add(keyword.len());
+				let Some(candidate) = text.get(at..end) else {
+					continue;
+				};
+				let boundary_after = text[end..]
+					.chars()
+					.next()
+					.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+				if boundary_after
+					&& xutf::equals_ignore_ascii_case::<xutf::Utf8, xutf::Utf8>(
+						candidate.as_bytes(),
+						keyword.as_bytes(),
+					) {
+					spans.push((at, end));
+					break;
+				}
+			}
+		}
+		spans
+	}
+}
+
 /// Focusable editable leaf used by [`EditorPane`].
 pub struct EditInput {
-	props:       Props,
-	slot:        Slot,
-	editor:      Editor,
-	style:       ComposerStyle,
-	attachments: Option<Attachments>,
-	dragging:    bool,
-	last_click:  Option<((u16, u16), Instant)>,
+	props:          Props,
+	slot:           Slot,
+	editor:         Editor,
+	style:          ComposerStyle,
+	attachments:    Option<Attachments>,
+	dragging:       bool,
+	last_click:     Option<((u16, u16), Instant)>,
+	keyword_accent: KeywordAccent,
+	keyword_spans:  SmallVec<(usize, usize), 8>,
 }
 
 impl EditInput {
 	/// Creates an empty editor.
 	pub fn new() -> Self {
 		Self {
-			props:       Props::new(),
-			slot:        next_slot(),
-			editor:      Editor::new(EditorOptions::default()),
-			style:       ComposerStyle::Borderless,
-			attachments: None,
-			dragging:    false,
-			last_click:  None,
+			props:          Props::new(),
+			slot:           next_slot(),
+			editor:         Editor::new(EditorOptions::default()),
+			style:          ComposerStyle::Borderless,
+			attachments:    None,
+			dragging:       false,
+			last_click:     None,
+			keyword_accent: KeywordAccent::default(),
+			keyword_spans:  SmallVec::new(),
 		}
 	}
 
@@ -235,6 +300,17 @@ impl EditInput {
 	/// Replaces the active composer chrome.
 	pub const fn set_composer_style(&mut self, style: ComposerStyle) {
 		self.style = style;
+	}
+
+	/// Replaces the data-driven keyword accent policy and refreshes cached
+	/// spans.
+	pub fn set_keyword_accent(&mut self, accent: KeywordAccent) {
+		self.keyword_accent = accent;
+		self.refresh_keyword_spans();
+	}
+
+	fn refresh_keyword_spans(&mut self) {
+		self.keyword_spans = self.keyword_accent.matched_spans(self.editor.text());
 	}
 
 	/// Hides staged attachments whose chip left the buffer (an undo that
@@ -299,8 +375,7 @@ impl EditInput {
 		let Some(picker) = self.editor.picker() else {
 			return;
 		};
-		let (start, suggestions) = picker.visible_suggestions();
-		for (offset, suggestion) in suggestions.iter().enumerate() {
+		for (offset, picker_row) in picker.visible_rows().into_iter().enumerate() {
 			let Ok(offset) = u16::try_from(offset) else {
 				break;
 			};
@@ -308,7 +383,15 @@ impl EditInput {
 			if row >= pc.clip {
 				break;
 			}
-			let selected = start + usize::from(offset) == picker.selected();
+			let PickerRow::Suggestion { index, suggestion } = picker_row else {
+				let PickerRow::Header(category) = picker_row else {
+					unreachable!()
+				};
+				let style = Style::new().fg(pc.ctx.theme.border).bold();
+				pc.frame.put(rect.x.saturating_add(2), row, category, style);
+				continue;
+			};
+			let selected = index == picker.selected();
 			let style = Style::new().fg(if selected {
 				pc.ctx.theme.accent
 			} else {
@@ -325,7 +408,9 @@ impl EditInput {
 				style,
 			);
 			x = match suggestion.display() {
-				SuggestionDisplay::Text(name) => pc.frame.put(x, row, name, style),
+				SuggestionDisplay::Text(name) => {
+					Self::paint_match_text(pc, x, row, name, suggestion.match_spans(), style)
+				},
 				SuggestionDisplay::Emoji { emoji, shortcode } => {
 					let x = pc.frame.put(x, row, emoji, style);
 					let x = pc.frame.put(x, row, "  :", style);
@@ -340,6 +425,32 @@ impl EditInput {
 				}
 			}
 		}
+	}
+
+	fn paint_match_text(
+		pc: &mut PaintCtx<'_>,
+		mut x: u16,
+		row: u16,
+		text: &str,
+		spans: &[(u16, u16)],
+		style: Style,
+	) -> u16 {
+		let mut at = 0;
+		for &(start, end) in spans {
+			let start = usize::from(start).min(text.len());
+			let end = usize::from(end).min(text.len());
+			if start < at
+				|| start >= end
+				|| !text.is_char_boundary(start)
+				|| !text.is_char_boundary(end)
+			{
+				continue;
+			}
+			x = pc.frame.put(x, row, &text[at..start], style);
+			x = pc.frame.put(x, row, &text[start..end], style.bold());
+			at = end;
+		}
+		pc.frame.put(x, row, &text[at..], style)
 	}
 }
 
@@ -366,12 +477,18 @@ impl Component for EditInput {
 		(20, 40)
 	}
 
-	fn height(&mut self, ctx: &UiContext, _width: u16) -> u16 {
+	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
 		let chrome = self.style.layout(ctx.charset);
-		4_u16
+		let input_width = self.text_width(width, ctx.charset);
+		let composer = self
+			.editor
+			.input_height_for(input_width)
 			.saturating_add(chrome.top_rows)
 			.saturating_add(chrome.bottom_rows)
+			.clamp(6, 18);
+		composer
 			.saturating_add(self.editor.picker_height())
+			.clamp(6, 18)
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
@@ -400,9 +517,25 @@ impl Component for EditInput {
 		} else {
 			None
 		};
-		let edge = Style::new().fg(pc.ctx.theme.border);
-		let accent = Style::new().fg(if focused {
+		let shell = text.trim_start().starts_with('!');
+		let keyword_accent = !self.keyword_spans.is_empty();
+		let active_color = if shell {
+			pc.ctx.theme.warn
+		} else if keyword_accent && (pc.now.as_millis() / 180).is_multiple_of(2) {
+			pc.ctx.theme.secondary
+		} else {
 			pc.ctx.theme.accent
+		};
+		if keyword_accent {
+			pc.wake(self.slot, pc.now.saturating_add(std::time::Duration::from_millis(40)));
+		}
+		let edge = Style::new().fg(if shell || keyword_accent {
+			active_color
+		} else {
+			pc.ctx.theme.border
+		});
+		let accent = Style::new().fg(if focused {
+			active_color
 		} else {
 			pc.ctx.theme.muted
 		});
@@ -607,6 +740,7 @@ impl Component for EditInput {
 			};
 		match self.editor.handle(key) {
 			EditOutcome::Changed => {
+				self.refresh_keyword_spans();
 				if self.reconcile(ec.ctx) {
 					// The pane's attachment band changed height outside this
 					// leaf's own box.
@@ -708,6 +842,7 @@ impl Component for EditInput {
 					let _ = self.editor.insert_reference(&chip, path.as_str());
 					let _ = self.editor.insert_text(" ");
 				}
+				self.refresh_keyword_spans();
 				ec.request_layout();
 				return Flow::Consumed;
 			}
@@ -720,6 +855,7 @@ impl Component for EditInput {
 			let payload = sanitize_paste(text);
 			let _ = self.editor.insert_reference(&chip, &payload);
 			let _ = self.editor.insert_text(" ");
+			self.refresh_keyword_spans();
 			ec.request_layout();
 			return Flow::Consumed;
 		}
@@ -733,6 +869,7 @@ impl Component for EditInput {
 			let _ = self.editor.insert_text(" ");
 		}
 		if matches!(self.editor.insert_text(&sanitized), EditOutcome::Changed) {
+			self.refresh_keyword_spans();
 			Flow::Consumed
 		} else {
 			Flow::Skip
@@ -744,6 +881,7 @@ impl Component for EditInput {
 		// and editable — no attachment staging, no large-paste chip, no
 		// auto-spacing. Sanitization still applies inside `insert_text`.
 		if matches!(self.editor.insert_text(text), EditOutcome::Changed) {
+			self.refresh_keyword_spans();
 			Flow::Consumed
 		} else {
 			Flow::Skip
@@ -761,6 +899,7 @@ impl Component for EditInput {
 			return false;
 		}
 		self.editor.set_text(&text);
+		self.refresh_keyword_spans();
 		true
 	}
 }
@@ -1133,6 +1272,21 @@ impl EditorPane {
 		self.style = style;
 		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
 			input.set_composer_style(style);
+			self.children[0].invalidate();
+		}
+	}
+
+	/// Selects the data-driven composer keyword accent policy.
+	#[must_use]
+	pub fn keyword_accent(mut self, accent: KeywordAccent) -> Self {
+		self.set_keyword_accent(accent);
+		self
+	}
+
+	/// Replaces the data-driven composer keyword accent policy.
+	pub fn set_keyword_accent(&mut self, accent: KeywordAccent) {
+		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
+			input.set_keyword_accent(accent);
 			self.children[0].invalidate();
 		}
 	}
@@ -1589,9 +1743,155 @@ fn paint_xml_runs(
 	);
 }
 
+/// Injection-safe executable and arguments for an external editor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalEditorCommand {
+	/// Executable resolved through the child environment.
+	pub program:   Str,
+	/// Arguments preceding the temporary draft path.
+	pub arguments: Box<[Str]>,
+}
+
+/// Shell-word parsing failure for an external editor command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ExternalEditorCommandError {
+	/// The command contained no executable.
+	#[error("external editor command is empty")]
+	Empty,
+	/// A single or double quote was not closed.
+	#[error("external editor command contains an unterminated quote")]
+	UnterminatedQuote,
+	/// A shell control operator was used instead of a literal argv word.
+	#[error("external editor command contains shell operator {0:?}")]
+	ShellOperator(char),
+}
+
+/// Splits a configured editor command into argv without invoking a shell.
+///
+/// Single and double quotes group words, backslash quotes the next scalar, and
+/// unquoted shell control operators are rejected rather than interpreted.
+pub fn parse_external_editor_command(
+	command: &str,
+) -> Result<ExternalEditorCommand, ExternalEditorCommandError> {
+	let mut words = Vec::new();
+	let mut current = String::new();
+	let mut quote = None;
+	let mut escaped = false;
+	let mut started = false;
+	for character in command.chars() {
+		if escaped {
+			current.push(character);
+			escaped = false;
+			started = true;
+			continue;
+		}
+		if character == '\\' {
+			escaped = true;
+			started = true;
+			continue;
+		}
+		if let Some(open) = quote {
+			if character == open {
+				quote = None;
+			} else {
+				current.push(character);
+			}
+			started = true;
+			continue;
+		}
+		match character {
+			'\'' | '"' => {
+				quote = Some(character);
+				started = true;
+			},
+			'|' | '&' | ';' | '<' | '>' | '(' | ')' | '\n' | '\r' => {
+				return Err(ExternalEditorCommandError::ShellOperator(character));
+			},
+			character if character.is_whitespace() => {
+				if started {
+					words.push(Str::from(std::mem::take(&mut current)));
+					started = false;
+				}
+			},
+			_ => {
+				current.push(character);
+				started = true;
+			},
+		}
+	}
+	if quote.is_some() {
+		return Err(ExternalEditorCommandError::UnterminatedQuote);
+	}
+	if escaped {
+		current.push('\\');
+	}
+	if started {
+		words.push(Str::from(current));
+	}
+	let mut words = words.into_iter();
+	let program = words.next().ok_or(ExternalEditorCommandError::Empty)?;
+	Ok(ExternalEditorCommand { program, arguments: words.collect::<Vec<_>>().into_boxed_slice() })
+}
+
+/// Host lifecycle needed while a full-screen external editor owns the tty.
+pub trait ExternalEditorTerminal {
+	/// Leaves raw/alternate-screen modes before the child starts.
+	fn suspend_for_external_editor(&mut self) -> io::Result<()>;
+	/// Re-enters the UI and forces a complete repaint after the child exits.
+	fn restore_after_external_editor(&mut self) -> io::Result<()>;
+}
+
+/// RAII terminal suspension that restores the UI on every exit path.
+pub struct ExternalEditorSuspension<'a, T: ExternalEditorTerminal + ?Sized> {
+	terminal: Option<&'a mut T>,
+}
+
+impl<'a, T: ExternalEditorTerminal + ?Sized> ExternalEditorSuspension<'a, T> {
+	/// Suspends `terminal` and arms guaranteed restoration.
+	pub fn new(terminal: &'a mut T) -> io::Result<Self> {
+		terminal.suspend_for_external_editor()?;
+		Ok(Self { terminal: Some(terminal) })
+	}
+
+	/// Restores immediately and disarms drop restoration.
+	pub fn restore(mut self) -> io::Result<()> {
+		let terminal = self.terminal.take().expect("armed suspension");
+		terminal.restore_after_external_editor()
+	}
+}
+
+impl<T: ExternalEditorTerminal + ?Sized> Drop for ExternalEditorSuspension<'_, T> {
+	fn drop(&mut self) {
+		if let Some(terminal) = self.terminal.take() {
+			let _ = terminal.restore_after_external_editor();
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn external_editor_command_is_shell_worded_without_operators() {
+		assert_eq!(
+			parse_external_editor_command(r#""Visual Studio Code" --wait --reuse-window"#).unwrap(),
+			ExternalEditorCommand {
+				program:   "Visual Studio Code".into(),
+				arguments: vec![Str::from("--wait"), Str::from("--reuse-window")].into_boxed_slice(),
+			}
+		);
+		assert_eq!(
+			parse_external_editor_command("vim --cmd 'set ft=markdown'"),
+			Ok(ExternalEditorCommand {
+				program:   "vim".into(),
+				arguments: vec![Str::from("--cmd"), Str::from("set ft=markdown")].into_boxed_slice(),
+			})
+		);
+		assert_eq!(
+			parse_external_editor_command("vim; rm draft"),
+			Err(ExternalEditorCommandError::ShellOperator(';'))
+		);
+	}
 	use crate::{
 		Color, Ui,
 		components::{ContextGaugeMode, Input, Segment, Status, StatusPlacement},

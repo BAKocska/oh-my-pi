@@ -6,14 +6,17 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod approval;
 pub mod ask;
 pub mod completion;
+pub mod frame;
 pub mod gradient;
 pub mod host;
 mod overlays;
 pub mod palette;
 pub mod picker;
 pub mod provider_picker;
+pub mod pty;
 pub mod queue;
 pub mod scene;
 pub mod sidebar;
@@ -29,6 +32,7 @@ pub use overlays::{ListPicker, ListRow, OverlayPanel, PromptEvent, PromptOverlay
 pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
 pub use picker::{ModelPicker, PickerEvent};
 pub use provider_picker::ProviderPicker;
+pub use pty::{PtyEvent, PtyOutputQueue, PtyOverlay, PtyStatus, TerminalState};
 pub use scene::{Chat, ChatKey, RenderedFrame};
 pub use sidebar::Sidebar;
 pub use welcome::{Welcome, WelcomeEvent};
@@ -50,6 +54,23 @@ pub struct ModelRow {
 	pub input_mtok:  Option<f64>,
 	/// Output price in dollars per million tokens, when known.
 	pub output_mtok: Option<f64>,
+}
+
+/// One reflected setting shown by schema-driven TUI surfaces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingRow {
+	/// Owning settings domain.
+	pub domain:      Str,
+	/// Stable dotted settings path.
+	pub path:        Str,
+	/// Human-readable field label.
+	pub label:       Str,
+	/// User-facing description.
+	pub description: Str,
+	/// Reflected widget kind.
+	pub kind:        Str,
+	/// Whether the value must never be projected into the UI.
+	pub secret:      bool,
 }
 
 /// One resumable session shown by a list picker.
@@ -94,6 +115,8 @@ pub enum TranscriptFrameKind {
 	CacheBreak,
 	/// Automatic context recovery.
 	Recovery,
+	/// Display-only peer-to-peer coordination observation.
+	Peer,
 	/// Turn-ending error.
 	Error,
 }
@@ -224,6 +247,37 @@ pub enum SubmitMode {
 	FollowUp,
 }
 
+/// Host-agnostic projection of one pending durable approval ticket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalTicketView {
+	/// Stable idempotency key.
+	pub ticket_id:     Str,
+	/// Invocation blocked by this ticket, when present.
+	pub invocation_id: Option<Str>,
+	/// Compact merged-reason title.
+	pub title:         Str,
+	/// TML-safe merged-reason detail.
+	pub detail:        Str,
+	/// Exact command, path, or device subject.
+	pub subject:       Str,
+	/// Narrowest persistent scope offered by policy.
+	pub always_scope:  Option<Str>,
+	/// Rule and derived-fact evidence.
+	pub evidence:      Vec<Str>,
+}
+
+/// One user decision for a pending approval ticket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApprovalAction {
+	/// Approve only the blocked invocation.
+	AllowOnce,
+	/// Approve and persist the narrowest offered policy scope.
+	AllowAlways,
+	/// Deny the invocation.
+	Reject,
+	/// Replace the exact subject and approve only that amended invocation.
+	Amend(Str),
+}
 /// Outbound intent for the host to forward to its backend.
 #[derive(Clone)]
 pub enum Intent {
@@ -238,6 +292,34 @@ pub enum Intent {
 	},
 	/// Abort the active turn.
 	Abort,
+	/// Write exact bytes to an interactive PTY execution.
+	PtyInput {
+		/// Stable tool-call identity.
+		id:   Str,
+		/// Bytes translated by the terminal overlay.
+		data: bytes::Bytes,
+	},
+	/// Resize an interactive PTY execution.
+	PtyResize {
+		/// Stable tool-call identity.
+		id:      Str,
+		/// Terminal rows.
+		rows:    u16,
+		/// Terminal columns.
+		columns: u16,
+	},
+	/// Force-kill an interactive PTY execution.
+	PtyKill {
+		/// Stable tool-call identity.
+		id: Str,
+	},
+	/// Settle one durable approval ticket exactly once.
+	Approval {
+		/// Stable ticket idempotency key.
+		ticket_id: Str,
+		/// User-selected action.
+		action:    ApprovalAction,
+	},
 	/// Ask the backend for rewind targets.
 	RewindRequest,
 	/// Rewind the durable transcript to an event.
@@ -279,6 +361,14 @@ pub struct RewindTargetRow {
 #[derive(Clone)]
 pub enum BackendEvent {
 	/// Replay a user message from durable history.
+	/// Present one pending durable approval ticket.
+	ApprovalPending(ApprovalTicketView),
+	/// Remove a settled or withdrawn approval ticket.
+	ApprovalSettled {
+		/// Stable ticket idempotency key.
+		ticket_id: Str,
+	},
+	/// Replay a user message from durable history.
 	UserReplayed {
 		/// Message text.
 		text:  Str,
@@ -315,6 +405,8 @@ pub enum BackendEvent {
 		id:    Str,
 		/// Backend tool name.
 		name:  Str,
+		/// Exact argument/rendering revision.
+		rev:   Str,
 		/// Human-readable tool title.
 		title: Str,
 	},
@@ -324,6 +416,29 @@ pub enum BackendEvent {
 		id:    Str,
 		/// Output chunk.
 		chunk: Str,
+	},
+	/// Open an interactive PTY overlay for a live shell invocation.
+	PtyStarted {
+		/// Stable tool-call identifier.
+		id:      Str,
+		/// Exact command displayed in the overlay chrome.
+		command: Str,
+	},
+	/// Append raw output to the active PTY overlay.
+	PtyOutput {
+		/// Stable tool-call identifier.
+		id:    Str,
+		/// Raw PTY bytes.
+		chunk: bytes::Bytes,
+	},
+	/// Mark the active PTY overlay terminal.
+	PtyFinished {
+		/// Stable tool-call identifier.
+		id:        Str,
+		/// Terminal lifecycle.
+		status:    pty::PtyStatus,
+		/// Process exit code when reported.
+		exit_code: Option<i32>,
 	},
 	/// Replace the retained structured view of a live tool invocation.
 	ToolView {
@@ -369,8 +484,8 @@ pub enum BackendEvent {
 	TranscriptFrame(TranscriptFrame),
 	/// Replace the live `AgentTree` roster projection.
 	AgentRoster(Vec<AgentRow>),
-	/// Request the core-owned settings seam.
-	OpenSettings,
+	/// Replace the reflected settings schema and open its TUI surface.
+	SettingsSchema(Vec<SettingRow>),
 	/// Request the live agent hierarchy overlay.
 	OpenAgentTree,
 	/// Request the pause overlay.

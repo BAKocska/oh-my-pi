@@ -1,6 +1,6 @@
 //! Terminal host for the host-agnostic immediate-mode chat scene.
 
-use std::{io, io::Write, time::Duration};
+use std::{collections::VecDeque, io, io::Write, time::Duration};
 
 use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
@@ -13,9 +13,11 @@ use smallvec::SmallVec;
 use tokio::{sync::oneshot, time::Instant};
 
 use crate::{
-	BackendEvent, Chat, ChatKey, CommandPalette, Intent, ListPicker, ListRow, ModelPicker, ModelRow,
-	PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, PromptEvent, PromptOverlay,
-	ProviderPicker, RenderedFrame, RewindTargetRow, SessionRow, Sidebar, Welcome, WelcomeEvent,
+	ApprovalAction, BackendEvent, Chat, ChatKey, CommandPalette, Intent, ListPicker, ListRow,
+	ModelPicker, ModelRow, PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, PromptEvent,
+	PromptOverlay, ProviderPicker, PtyEvent, PtyOverlay, RenderedFrame, RewindTargetRow, SessionRow,
+	Sidebar, Welcome, WelcomeEvent,
+	approval::{ApprovalEvent, ApprovalOverlay},
 	ask::{self, AskDialog, AskDialogEvent, AskRequest},
 };
 
@@ -90,6 +92,15 @@ pub enum HostExit {
 	NewSession,
 }
 
+/// Terminal host result with the final unsent composer draft.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostOutcome {
+	/// Why the host returned.
+	pub exit:  HostExit,
+	/// Unsent composer text at the exact exit boundary.
+	pub draft: Str,
+}
+
 /// Runs the example-style terminal host, handling session choices in-band.
 #[expect(
 	clippy::future_not_send,
@@ -121,6 +132,26 @@ pub async fn run_with_options(
 	intents: Sender<Intent>,
 	options: HostOptions,
 ) -> io::Result<HostExit> {
+	run_with_draft(chat, ctx, events, intents, options, Str::default())
+		.await
+		.map(|outcome| outcome.exit)
+}
+
+/// Runs the terminal host with an owner-supplied draft and returns the final
+/// unsent composer text without persisting it in the UI crate.
+#[expect(
+	clippy::future_not_send,
+	reason = "chat components remain confined to their terminal event-loop thread"
+)]
+pub async fn run_with_draft(
+	mut chat: Chat,
+	ctx: UiContext,
+	events: Receiver<BackendEvent>,
+	intents: Sender<Intent>,
+	options: HostOptions,
+	initial_draft: Str,
+) -> io::Result<HostOutcome> {
+	chat.set_composer_text(initial_draft.as_str());
 	let caps = detect();
 	let mut terminal =
 		Terminal::enter(TerminalOptions::new(caps).cursor_style(CursorStyle::BlinkingBar))?;
@@ -147,7 +178,7 @@ async fn run_with_terminal(
 	events: &Receiver<BackendEvent>,
 	intents: &Sender<Intent>,
 	options: HostOptions,
-) -> io::Result<HostExit> {
+) -> io::Result<HostOutcome> {
 	let mut viewport = terminal.size()?;
 	let mut models = Vec::new();
 	let mut current_model = 0;
@@ -167,7 +198,9 @@ async fn run_with_terminal(
 		.await?
 		{
 			WelcomeOutcome::Proceed => terminal.leave_alt()?,
-			WelcomeOutcome::Exit(exit) => return Ok(exit),
+			WelcomeOutcome::Exit(exit) => {
+				return Ok(HostOutcome { exit, draft: Str::from(chat.composer_text()) });
+			},
 		}
 	}
 	run_chat(
@@ -274,12 +307,14 @@ async fn run_welcome(
 }
 
 struct ChatHost {
-	chat:          Chat,
-	sidebar:       Sidebar,
-	overlay:       Option<Overlay>,
-	models:        Vec<ModelRow>,
-	current_model: usize,
-	last_esc:      Option<Instant>,
+	chat:              Chat,
+	sidebar:           Sidebar,
+	overlay:           Option<Overlay>,
+	models:            Vec<ModelRow>,
+	current_model:     usize,
+	last_esc:          Option<Instant>,
+	pending_approvals: usize,
+	approval_queue:    VecDeque<crate::ApprovalTicketView>,
 }
 
 impl ChatHost {
@@ -293,7 +328,16 @@ impl ChatHost {
 		let status = chat.status();
 		let sidebar = Sidebar::new(&status, ctx);
 		chat.set_right_inset(sidebar.reserved(viewport));
-		Self { chat, sidebar, overlay: None, models, current_model, last_esc: None }
+		Self {
+			chat,
+			sidebar,
+			overlay: None,
+			models,
+			current_model,
+			last_esc: None,
+			pending_approvals: 0,
+			approval_queue: VecDeque::new(),
+		}
 	}
 
 	fn open_models(&mut self, ctx: &UiContext) {
@@ -323,20 +367,28 @@ enum ListPurpose {
 
 enum Overlay {
 	Models(ModelPicker),
+	Pty(PtyOverlay),
 	Palette(CommandPalette),
 	List { picker: ListPicker, rows: Vec<ListRow>, prefill: Vec<Str>, purpose: ListPurpose },
 	Providers(ProviderPicker),
 	Prompt(PromptOverlay),
+	Approval(ApprovalOverlay),
+	ApprovalAmend { prompt: PromptOverlay, ticket_id: Str },
 	Ask { dialog: AskDialog, request: AskRequest },
 }
 
 enum OverlayEvent {
 	Consumed,
+	PtyInput { id: Str, data: bytes::Bytes },
+	PtyKill { id: Str },
 	Close,
 	Pick(usize),
 	Palette(PaletteAction),
 	PromptCancel,
 	Prompt(Str),
+	ApprovalCancel,
+	ApprovalDecide { ticket_id: Str, action: ApprovalAction },
+	ApprovalAmend(Str),
 	AskCancel,
 	AskSubmit(Vec<Str>),
 }
@@ -345,10 +397,24 @@ impl Overlay {
 	fn handle_key(&mut self, key: Key) -> OverlayEvent {
 		match self {
 			Self::Models(picker) => picker_event(picker.handle_key(key)),
+			Self::Pty(pty) => match pty.handle_key(key) {
+				PtyEvent::Input(data) => OverlayEvent::PtyInput { id: pty.id().clone(), data },
+				PtyEvent::ForceKill => OverlayEvent::PtyKill { id: pty.id().clone() },
+				PtyEvent::Close => OverlayEvent::Close,
+				PtyEvent::Consumed => OverlayEvent::Consumed,
+			},
 			Self::Palette(palette) => palette_event(palette.handle_key(key)),
 			Self::List { picker, .. } => picker_event(picker.handle_key(key)),
 			Self::Providers(picker) => picker_event(picker.handle_key(key)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_key(key)),
+			Self::Approval(approval) => {
+				approval_event(approval.ticket_id().clone(), approval.handle_key(key))
+			},
+			Self::ApprovalAmend { prompt, .. } => match prompt_event(prompt.handle_key(key)) {
+				OverlayEvent::Prompt(value) => OverlayEvent::ApprovalAmend(value),
+				OverlayEvent::PromptCancel => OverlayEvent::ApprovalCancel,
+				event => event,
+			},
 			Self::Ask { dialog, .. } => ask_event(dialog.handle_key(key)),
 		}
 	}
@@ -356,10 +422,24 @@ impl Overlay {
 	fn handle_paste(&mut self, text: &str) -> OverlayEvent {
 		match self {
 			Self::Models(picker) => picker_event(picker.handle_paste(text)),
+			Self::Pty(pty) => match pty.handle_paste(text) {
+				PtyEvent::Input(data) => OverlayEvent::PtyInput { id: pty.id().clone(), data },
+				PtyEvent::ForceKill => OverlayEvent::PtyKill { id: pty.id().clone() },
+				PtyEvent::Close => OverlayEvent::Close,
+				PtyEvent::Consumed => OverlayEvent::Consumed,
+			},
 			Self::Palette(palette) => palette_event(palette.handle_paste(text)),
 			Self::List { picker, .. } => picker_event(picker.handle_paste(text)),
 			Self::Providers(picker) => picker_event(picker.handle_paste(text)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_paste(text)),
+			Self::Approval(approval) => {
+				approval_event(approval.ticket_id().clone(), approval.handle_paste(text))
+			},
+			Self::ApprovalAmend { prompt, .. } => match prompt_event(prompt.handle_paste(text)) {
+				OverlayEvent::Prompt(value) => OverlayEvent::ApprovalAmend(value),
+				OverlayEvent::PromptCancel => OverlayEvent::ApprovalCancel,
+				event => event,
+			},
 			Self::Ask { dialog, .. } => ask_event(dialog.handle_paste(text)),
 		}
 	}
@@ -367,10 +447,22 @@ impl Overlay {
 	fn handle_mouse(&mut self, col: u16, row: u16, kind: Mouse, viewport: Size) -> OverlayEvent {
 		match self {
 			Self::Models(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
+			Self::Pty(_) => OverlayEvent::Consumed,
 			Self::Palette(palette) => palette_event(palette.handle_mouse(col, row, kind, viewport)),
 			Self::List { picker, .. } => picker_event(picker.handle_mouse(col, row, kind, viewport)),
 			Self::Providers(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_mouse(col, row, kind, viewport)),
+			Self::Approval(approval) => approval_event(
+				approval.ticket_id().clone(),
+				approval.handle_mouse(col, row, kind, viewport),
+			),
+			Self::ApprovalAmend { prompt, .. } => {
+				match prompt_event(prompt.handle_mouse(col, row, kind, viewport)) {
+					OverlayEvent::Prompt(value) => OverlayEvent::ApprovalAmend(value),
+					OverlayEvent::PromptCancel => OverlayEvent::ApprovalCancel,
+					event => event,
+				}
+			},
 			Self::Ask { dialog, .. } => ask_event(dialog.handle_mouse(col, row, kind, viewport)),
 		}
 	}
@@ -378,10 +470,13 @@ impl Overlay {
 	fn layer(&mut self, viewport: Size) -> Layer<'_> {
 		match self {
 			Self::Models(picker) => picker.layer(viewport),
+			Self::Pty(pty) => pty.layer(viewport),
 			Self::Palette(palette) => palette.layer(viewport),
 			Self::List { picker, .. } => picker.layer(viewport),
 			Self::Providers(picker) => picker.layer(viewport),
 			Self::Prompt(prompt) => prompt.layer(viewport),
+			Self::Approval(approval) => approval.layer(viewport),
+			Self::ApprovalAmend { prompt, .. } => prompt.layer(viewport),
 			Self::Ask { dialog, .. } => dialog.layer(viewport),
 		}
 	}
@@ -411,6 +506,14 @@ fn prompt_event(event: PromptEvent) -> OverlayEvent {
 	}
 }
 
+fn approval_event(ticket_id: Str, event: ApprovalEvent) -> OverlayEvent {
+	match event {
+		ApprovalEvent::Consumed => OverlayEvent::Consumed,
+		ApprovalEvent::Cancel => OverlayEvent::ApprovalCancel,
+		ApprovalEvent::Decide(action) => OverlayEvent::ApprovalDecide { ticket_id, action },
+		ApprovalEvent::Amend => OverlayEvent::ApprovalAmend(ticket_id),
+	}
+}
 fn ask_event(event: AskDialogEvent) -> OverlayEvent {
 	match event {
 		AskDialogEvent::Consumed => OverlayEvent::Consumed,
@@ -459,7 +562,7 @@ async fn run_chat(
 	events: &Receiver<BackendEvent>,
 	intents: &Sender<Intent>,
 	exit_on_session_change: bool,
-) -> io::Result<HostExit> {
+) -> io::Result<HostOutcome> {
 	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model);
 	let ask_binding = ask::bind();
 	{
@@ -481,12 +584,13 @@ async fn run_chat(
 					let resized = observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
 					host.chat.set_right_inset(host.sidebar.reserved(viewport));
 					if host.overlay.is_some() && resized { overlay_stale = true; }
+					send_pty_resize(&mut host, viewport, intents);
 				},
 				TerminalEvent::Debug(query) => answer_debug(query, &mut host.chat),
 				TerminalEvent::Effect(effect) => {
 					let _ = host.chat.slots_mut().apply_serialized(effect);
 				},
-				TerminalEvent::Closed => return Ok(HostExit::Quit),
+				TerminalEvent::Closed => return Ok(host_outcome(&host, HostExit::Quit)),
 				TerminalEvent::Input(event) => {
 					let Some(event) = user_event(terminal, renderer, event)? else { continue };
 					match event {
@@ -505,7 +609,7 @@ async fn run_chat(
 									intents,
 									exit_on_session_change,
 								) {
-									return Ok(exit);
+									return Ok(host_outcome(&host, exit));
 								}
 								if host.overlay.is_none() {
 									close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
@@ -576,7 +680,7 @@ async fn run_chat(
 									intents,
 									exit_on_session_change,
 								) {
-									return Ok(exit);
+									return Ok(host_outcome(&host, exit));
 								}
 								if host.overlay.is_none() {
 									close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
@@ -597,7 +701,7 @@ async fn run_chat(
 									intents,
 									exit_on_session_change,
 								) {
-									return Ok(exit);
+									return Ok(host_outcome(&host, exit));
 								}
 								if host.overlay.is_none() {
 									close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
@@ -633,11 +737,19 @@ async fn run_chat(
 			},
 			backend = events.recv_async() => match backend {
 				Ok(BackendEvent::NewSessionRequested) if exit_on_session_change => {
-					return Ok(HostExit::NewSession);
+					return Ok(host_outcome(&host, HostExit::NewSession));
 				},
 				Ok(event) => {
+					match &event {
+						BackendEvent::ApprovalPending(_) => terminal.set_title("Approval required · omp")?,
+						BackendEvent::ApprovalSettled { .. } if host.pending_approvals <= 1 => {
+							terminal.set_title("omp")?;
+						},
+						_ => {},
+					}
 					let had_overlay = host.overlay.is_some();
 					apply_backend(&mut host, event, ctx);
+					send_pty_resize(&mut host, viewport, intents);
 					if !had_overlay && host.overlay.is_some() {
 						open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
 					} else if had_overlay && host.overlay.is_none() {
@@ -718,11 +830,60 @@ async fn run_chat(
 			},
 		}
 	}
-	Ok(HostExit::Quit)
+	Ok(host_outcome(&host, HostExit::Quit))
+}
+
+fn host_outcome(host: &ChatHost, exit: HostExit) -> HostOutcome {
+	HostOutcome { exit, draft: Str::from(host.chat.composer_text()) }
 }
 
 fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 	match event {
+		BackendEvent::ApprovalPending(ticket) => {
+			host.pending_approvals = host.pending_approvals.saturating_add(1);
+			if matches!(host.overlay, Some(Overlay::Approval(_) | Overlay::ApprovalAmend { .. })) {
+				host.approval_queue.push_back(ticket);
+			} else {
+				host.overlay = Some(Overlay::Approval(ApprovalOverlay::open(ticket, ctx)));
+			}
+		},
+		BackendEvent::ApprovalSettled { ticket_id } => {
+			host.pending_approvals = host.pending_approvals.saturating_sub(1);
+			let closes = matches!(
+				&host.overlay,
+				Some(Overlay::Approval(approval)) if approval.ticket_id() == &ticket_id
+			) || matches!(
+				&host.overlay,
+				Some(Overlay::ApprovalAmend { ticket_id: active, .. }) if active == &ticket_id
+			);
+			if closes {
+				host.overlay = host
+					.approval_queue
+					.pop_front()
+					.map(|ticket| Overlay::Approval(ApprovalOverlay::open(ticket, ctx)));
+			} else {
+				host
+					.approval_queue
+					.retain(|ticket| ticket.ticket_id != ticket_id);
+			}
+		},
+		BackendEvent::PtyStarted { id, command } => {
+			host.overlay = Some(Overlay::Pty(PtyOverlay::open(id, command, ctx)));
+		},
+		BackendEvent::PtyOutput { id, chunk } => {
+			if let Some(Overlay::Pty(pty)) = &mut host.overlay
+				&& pty.id() == &id
+			{
+				pty.append_output(chunk);
+			}
+		},
+		BackendEvent::PtyFinished { id, status, exit_code } => {
+			if let Some(Overlay::Pty(pty)) = &mut host.overlay
+				&& pty.id() == &id
+			{
+				pty.finish(status, exit_code);
+			}
+		},
 		BackendEvent::Status(facts) => {
 			host.sidebar.set_status(&facts);
 			let _ = host.chat.apply_backend_event(BackendEvent::Status(facts));
@@ -738,7 +899,7 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 		BackendEvent::LoginProviders(rows) => open_login_providers(host, rows, ctx),
 		BackendEvent::RewindTargets(rows) => open_rewind(host, rows, ctx),
 		BackendEvent::AgentRoster(rows) => host.chat.set_agent_roster(rows),
-		BackendEvent::OpenSettings => open_settings(host, ctx),
+		BackendEvent::SettingsSchema(rows) => open_settings(host, rows, ctx),
 		BackendEvent::OpenAgentTree => open_agents(host, ctx),
 		BackendEvent::Pause => open_pause(host, ctx),
 		BackendEvent::NewSessionRequested => {},
@@ -788,34 +949,18 @@ fn open_login_providers(host: &mut ChatHost, providers: Vec<SessionRow>, ctx: &U
 	host.overlay = Some(Overlay::Providers(ProviderPicker::open(providers, ctx)));
 }
 
-fn open_settings(host: &mut ChatHost, ctx: &UiContext) {
-	let rows = vec![
-		ListRow {
-			key:    sf!("appearance"),
-			label:  sf!("Appearance"),
-			detail: sf!("Theme and glyph presentation"),
-		},
-		ListRow {
-			key:    sf!("model"),
-			label:  sf!("Model"),
-			detail: sf!("Model and provider selection"),
-		},
-		ListRow {
-			key:    sf!("interaction"),
-			label:  sf!("Interaction"),
-			detail: sf!("Queue, steering, and hotkeys"),
-		},
-		ListRow {
-			key:    sf!("tools"),
-			label:  sf!("Tools"),
-			detail: sf!("Tool visibility and behavior"),
-		},
-		ListRow {
-			key:    sf!("tasks"),
-			label:  sf!("Tasks"),
-			detail: sf!("Agent and background-job settings"),
-		},
-	];
+fn open_settings(host: &mut ChatHost, fields: Vec<crate::SettingRow>, ctx: &UiContext) {
+	let rows: Vec<ListRow> = fields
+		.into_iter()
+		.map(|field| {
+			let detail = if field.secret {
+				sf!("{} · secret value managed by inference", field.description)
+			} else {
+				sf!("{} · {}", field.kind, field.description)
+			};
+			ListRow { key: field.path, label: sf!("{} / {}", field.domain, field.label), detail }
+		})
+		.collect();
 	let picker = ListPicker::open("Settings", &rows, 0, ctx);
 	host.overlay =
 		Some(Overlay::List { picker, rows, prefill: Vec::new(), purpose: ListPurpose::Settings });
@@ -877,6 +1022,15 @@ fn open_rewind(host: &mut ChatHost, targets: Vec<RewindTargetRow>, ctx: &UiConte
 	host.overlay = Some(Overlay::List { picker, rows, prefill, purpose: ListPurpose::Rewind });
 }
 
+fn send_pty_resize(host: &mut ChatHost, viewport: Size, intents: &Sender<Intent>) {
+	let Some(Overlay::Pty(pty)) = &mut host.overlay else {
+		return;
+	};
+	let _ = pty.layer(viewport);
+	let (rows, columns) = pty.dimensions();
+	send(intents, Intent::PtyResize { id: pty.id().clone(), rows, columns });
+}
+
 fn apply_overlay_event(
 	host: &mut ChatHost,
 	event: OverlayEvent,
@@ -887,6 +1041,8 @@ fn apply_overlay_event(
 ) -> Option<HostExit> {
 	match event {
 		OverlayEvent::Consumed => {},
+		OverlayEvent::PtyInput { id, data } => send(intents, Intent::PtyInput { id, data }),
+		OverlayEvent::PtyKill { id } => send(intents, Intent::PtyKill { id }),
 		OverlayEvent::Close => host.overlay = None,
 		OverlayEvent::Pick(index) => match host.overlay.as_ref() {
 			Some(Overlay::Models(_)) => {
@@ -961,6 +1117,26 @@ fn apply_overlay_event(
 		OverlayEvent::PromptCancel => {
 			send(intents, Intent::AuthCancel);
 			host.overlay = None;
+		},
+		OverlayEvent::ApprovalCancel => {
+			host.overlay = None;
+		},
+		OverlayEvent::ApprovalDecide { ticket_id, action } => {
+			send(intents, Intent::Approval { ticket_id, action });
+			host.overlay = None;
+		},
+		OverlayEvent::ApprovalAmend(value) => match host.overlay.take() {
+			Some(Overlay::Approval(approval)) => {
+				let ticket_id = approval.ticket_id().clone();
+				host.overlay = Some(Overlay::ApprovalAmend {
+					prompt: PromptOverlay::open("Amended exact command or subject", false, ctx),
+					ticket_id,
+				});
+			},
+			Some(Overlay::ApprovalAmend { ticket_id, .. }) => {
+				send(intents, Intent::Approval { ticket_id, action: ApprovalAction::Amend(value) });
+			},
+			overlay => host.overlay = overlay,
 		},
 		OverlayEvent::AskSubmit(values) => {
 			if let Some(Overlay::Ask { request, .. }) = host.overlay.take() {

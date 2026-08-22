@@ -1,6 +1,10 @@
 //! Terminal-agnostic keyboard and mouse input primitives.
 
-use std::time::{Duration, Instant};
+use std::{
+	fmt::Write as _,
+	str::FromStr,
+	time::{Duration, Instant},
+};
 
 use omp_core::Str;
 use xutf::{IntoUnicodeNormalized, Text};
@@ -1197,6 +1201,39 @@ impl Chord {
 		Self { key, mods }
 	}
 
+	/// Parses a configurable chord. Modifier aliases are ASCII-insensitive:
+	/// `ctrl`/`control`, `alt`/`option`, `cmd`/`command`/`super`/`win`,
+	/// `shift`, `meta`, and `hyper`.
+	pub fn parse(source: &str) -> Result<Self, ChordParseError> {
+		source.parse()
+	}
+
+	/// Writes the canonical portable chord spelling.
+	#[must_use]
+	pub fn label(self) -> Str {
+		let mut label = String::new();
+		for (active, name) in [
+			(self.mods.ctrl, "ctrl"),
+			(self.mods.alt, "alt"),
+			(self.mods.shift, "shift"),
+			(self.mods.super_key, "super"),
+			(self.mods.meta, "meta"),
+			(self.mods.hyper, "hyper"),
+		] {
+			if active {
+				if !label.is_empty() {
+					label.push('+');
+				}
+				label.push_str(name);
+			}
+		}
+		if !label.is_empty() {
+			label.push('+');
+		}
+		write_key_label(&mut label, self.key);
+		Str::from(label)
+	}
+
 	const fn plain(key: Key) -> Self {
 		Self::new(key, Mods {
 			shift:     false,
@@ -1233,6 +1270,121 @@ impl Chord {
 		let mut mods = self.mods;
 		mods.shift = false;
 		(lowered != ch || mods != self.mods).then_some(Self { key: Key::Char(lowered), mods })
+	}
+}
+
+/// A malformed configurable chord.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ChordParseError {
+	/// The chord was empty.
+	#[error("key chord is empty")]
+	Empty,
+	/// A modifier name was not recognized.
+	#[error("key chord contains an unknown modifier")]
+	UnknownModifier,
+	/// The chord contains no key or more than one key.
+	#[error("key chord must contain exactly one key")]
+	InvalidKeyCount,
+	/// The key name was not recognized.
+	#[error("key chord contains an unknown key")]
+	UnknownKey,
+	/// The same modifier occurred more than once.
+	#[error("key chord contains a duplicate modifier")]
+	DuplicateModifier,
+}
+
+impl FromStr for Chord {
+	type Err = ChordParseError;
+
+	fn from_str(source: &str) -> Result<Self, Self::Err> {
+		let source = source.trim();
+		if source.is_empty() {
+			return Err(ChordParseError::Empty);
+		}
+		let mut parts = source.split('+').map(str::trim).peekable();
+		let mut mods = Mods::default();
+		let mut key = None;
+		while let Some(part) = parts.next() {
+			if part.is_empty() {
+				return Err(ChordParseError::UnknownKey);
+			}
+			let last = parts.peek().is_none();
+			if last {
+				key = Some(parse_key_name(part)?);
+				continue;
+			}
+			let slot = match part.to_ascii_lowercase().as_str() {
+				"ctrl" | "control" | "ctl" => &mut mods.ctrl,
+				"alt" | "option" | "opt" => &mut mods.alt,
+				"shift" => &mut mods.shift,
+				"super" | "cmd" | "command" | "win" | "windows" => &mut mods.super_key,
+				"meta" => &mut mods.meta,
+				"hyper" => &mut mods.hyper,
+				_ => return Err(ChordParseError::UnknownModifier),
+			};
+			if *slot {
+				return Err(ChordParseError::DuplicateModifier);
+			}
+			*slot = true;
+		}
+		Ok(Self::new(key.ok_or(ChordParseError::InvalidKeyCount)?, mods))
+	}
+}
+
+fn parse_key_name(source: &str) -> Result<Key, ChordParseError> {
+	if source.chars().count() == 1 {
+		return Ok(Key::Char(source.chars().next().expect("one scalar")));
+	}
+	let folded = source.to_ascii_lowercase();
+	let key = match folded.as_str() {
+		"up" => Key::Up,
+		"down" => Key::Down,
+		"left" => Key::Left,
+		"right" => Key::Right,
+		"tab" => Key::Tab,
+		"enter" | "return" => Key::Enter,
+		"space" => Key::Space,
+		"esc" | "escape" => Key::Esc,
+		"backspace" | "bs" => Key::Backspace,
+		"delete" | "del" => Key::Delete,
+		"insert" | "ins" => Key::Insert,
+		"home" => Key::Home,
+		"end" => Key::End,
+		"pageup" | "pgup" => Key::PageUp,
+		"pagedown" | "pgdown" => Key::PageDown,
+		_ if folded.starts_with('f') => folded[1..]
+			.parse::<u8>()
+			.ok()
+			.filter(|number| (1..=12).contains(number))
+			.map(Key::Function)
+			.ok_or(ChordParseError::UnknownKey)?,
+		_ => return Err(ChordParseError::UnknownKey),
+	};
+	Ok(key)
+}
+
+fn write_key_label(target: &mut String, key: Key) {
+	match key {
+		Key::Up => target.push_str("up"),
+		Key::Down => target.push_str("down"),
+		Key::Left => target.push_str("left"),
+		Key::Right => target.push_str("right"),
+		Key::Tab => target.push_str("tab"),
+		Key::Enter => target.push_str("enter"),
+		Key::Space => target.push_str("space"),
+		Key::Esc => target.push_str("esc"),
+		Key::Backspace => target.push_str("backspace"),
+		Key::Delete => target.push_str("delete"),
+		Key::Insert => target.push_str("insert"),
+		Key::Home => target.push_str("home"),
+		Key::End => target.push_str("end"),
+		Key::PageUp => target.push_str("pageup"),
+		Key::PageDown => target.push_str("pagedown"),
+		Key::Function(number) => {
+			let _ = write!(target, "f{number}");
+		},
+		Key::Char(character) => target.push(character),
+		_ => target.push_str("semantic"),
 	}
 }
 
@@ -1638,9 +1790,26 @@ mod tests {
 	use std::time::{Duration, Instant};
 
 	use super::{
-		Chord, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
-		TerminalResponse, decode_keys, mods_from_bits,
+		Chord, ChordParseError, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton,
+		MouseReport, TerminalResponse, decode_keys, mods_from_bits,
 	};
+
+	#[test]
+	fn configurable_chords_accept_modifier_aliases_and_canonicalize() {
+		let control = Chord::parse("Control+Shift+K").expect("control alias");
+		assert!(control.mods.ctrl && control.mods.shift);
+		assert_eq!(control.key, Key::Char('K'));
+		assert_eq!(control.label(), "ctrl+shift+K");
+
+		let command = Chord::parse("cmd+option+left").expect("mac aliases");
+		assert!(command.mods.super_key && command.mods.alt);
+		assert_eq!(command.key, Key::Left);
+		assert_eq!(command.label(), "alt+super+left");
+
+		assert_eq!(Chord::parse("ctrl+ctrl+x"), Err(ChordParseError::DuplicateModifier));
+		assert_eq!(Chord::parse("mystery+x"), Err(ChordParseError::UnknownModifier));
+		assert_eq!(Chord::parse("ctrl+no-such-key"), Err(ChordParseError::UnknownKey));
+	}
 
 	fn drip(bytes: &[u8]) -> Vec<InputEvent> {
 		let start = Instant::now();

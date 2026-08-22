@@ -1,7 +1,10 @@
-//! JSON theme loading with automatic dark/light palette selection.
+//! JSON theme loading with rich-slot lowering and appearance selection.
 
-use omp_core::Str;
+use std::collections::BTreeMap;
+
+use omp_core::{IntoStr, Str};
 use serde::Deserialize;
+use thiserror::Error;
 
 use crate::{Appearance, Color, Theme};
 
@@ -15,17 +18,25 @@ pub struct JsonTheme {
 }
 
 impl JsonTheme {
-	/// Parses a strict JSON theme. Colors accept every [`Color::parse`] syntax;
-	/// omitted tokens inherit the built-in palette for that appearance.
+	/// Parses either omp's compact semantic palette or pi's richer `colors`
+	/// palette. Rich component slots lower onto omp's semantic tokens once at
+	/// load time, never during paint.
 	pub fn parse(source: &str) -> Result<Self, ThemeError> {
-		let file: ThemeFile = serde_json::from_str(source)
-			.map_err(|error| ThemeError::Json(Str::from(error.to_string())))?;
-		let dark = file.dark.apply(Theme::for_appearance(Appearance::Dark))?;
-		let light = file
-			.light
-			.unwrap_or_else(|| file.dark.clone())
-			.apply(Theme::for_appearance(Appearance::Light))?;
-		Ok(Self { name: Str::from(file.name), dark, light })
+		let file: ThemeFile = serde_json::from_str(source).map_err(ThemeError::Json)?;
+		let (dark, light) = if let Some(colors) = &file.colors {
+			(
+				apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Dark))?,
+				apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Light))?,
+			)
+		} else {
+			let dark = file.dark.apply(Theme::for_appearance(Appearance::Dark))?;
+			let light = file
+				.light
+				.unwrap_or_else(|| file.dark.clone())
+				.apply(Theme::for_appearance(Appearance::Light))?;
+			(dark, light)
+		};
+		Ok(Self { name: file.name.into_str(), dark, light })
 	}
 
 	/// Selects the palette matching the terminal's current appearance.
@@ -36,38 +47,55 @@ impl JsonTheme {
 			Appearance::Light => self.light,
 		}
 	}
+
+	/// Selects and quantizes the palette for an indexed-color terminal.
+	#[must_use]
+	pub const fn for_appearance_256(&self, appearance: Appearance) -> Theme {
+		self.for_appearance(appearance).quantized_256()
+	}
 }
 
 /// Theme parsing failure with a stable diagnostic.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum ThemeError {
 	/// Invalid JSON shape.
-	Json(Str),
+	#[error("invalid theme JSON")]
+	Json(#[source] serde_json::Error),
 	/// A named token did not contain a supported color.
+	#[error("invalid theme color `{token}`: {value}")]
 	Color {
 		/// Semantic token containing the bad value.
-		token: &'static str,
+		token: Str,
 		/// Unparsed color source.
 		value: Str,
 	},
+	/// An indexed color exceeded the terminal palette.
+	#[error("theme color `{token}` has an index above 255")]
+	Index {
+		/// Semantic token containing the bad value.
+		token: Str,
+	},
 }
-
-impl std::fmt::Display for ThemeError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::Json(message) => write!(f, "invalid theme JSON: {message}"),
-			Self::Color { token, value } => write!(f, "invalid theme color `{token}`: {value}"),
-		}
-	}
-}
-impl std::error::Error for ThemeError {}
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ThemeFile {
-	name:  String,
-	dark:  ThemePatch,
-	light: Option<ThemePatch>,
+	#[serde(rename = "$schema")]
+	_schema: Option<String>,
+	name:    String,
+	vars:    BTreeMap<String, ColorValue>,
+	colors:  Option<BTreeMap<String, ColorValue>>,
+	dark:    ThemePatch,
+	light:   Option<ThemePatch>,
+	export:  Option<serde_json::Value>,
+	symbols: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum ColorValue {
+	Text(String),
+	Index(u16),
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -96,7 +124,7 @@ impl ThemePatch {
 			($field:ident) => {
 				if let Some(value) = &self.$field {
 					theme.$field = Color::parse(value).ok_or_else(|| ThemeError::Color {
-						token: stringify!($field),
+						token: Str::new_static(stringify!($field)),
 						value: Str::new(value.as_str()),
 					})?;
 				}
@@ -121,6 +149,74 @@ impl ThemePatch {
 	}
 }
 
+fn apply_rich(
+	colors: &BTreeMap<String, ColorValue>,
+	vars: &BTreeMap<String, ColorValue>,
+	mut theme: Theme,
+) -> Result<Theme, ThemeError> {
+	for (slot, value) in colors {
+		let Some(color) = resolve_color(slot, value, vars)? else {
+			continue;
+		};
+		match slot.as_str() {
+			"text" => theme.fg = color,
+			"accent" | "borderAccent" | "mdLink" | "statusLineModel" => theme.accent = color,
+			"mdCodeBlock" | "bashMode" | "statusLinePath" => theme.info = color,
+			"success" | "toolDiffAdded" | "statusLineGitClean" => theme.ok = color,
+			"warning" | "statusLineGitDirty" | "statusLineDirty" => theme.warn = color,
+			"error" | "toolDiffRemoved" | "toolErrorBg" => theme.err = color,
+			"muted" | "dim" | "thinkingText" | "toolOutput" | "toolDiffContext" | "statusLineSep" => {
+				theme.muted = color
+			},
+			"border" | "borderMuted" | "mdCodeBlockBorder" | "mdQuoteBorder" | "mdHr" => {
+				theme.border = color;
+			},
+			"selectedBg" => theme.selection = color,
+			"toolPendingBg" => theme.surface = color,
+			"userMessageBg" | "customMessageBg" | "toolSuccessBg" | "statusLineBg" => {
+				theme.panel = color;
+			},
+			"customMessageLabel" | "pythonMode" | "statusLineSpend" | "statusLineCost" => {
+				theme.secondary = color;
+			},
+			"userMessageText" | "customMessageText" => theme.contrast = color,
+			_ => {},
+		}
+	}
+	Ok(theme)
+}
+
+fn resolve_color(
+	token: &str,
+	value: &ColorValue,
+	vars: &BTreeMap<String, ColorValue>,
+) -> Result<Option<Color>, ThemeError> {
+	let mut value = value;
+	for _ in 0..16 {
+		match value {
+			ColorValue::Index(index) => {
+				let index =
+					u8::try_from(*index).map_err(|_| ThemeError::Index { token: Str::new(token) })?;
+				return Ok(Some(Color::Indexed(index)));
+			},
+			ColorValue::Text(source) if source.is_empty() => return Ok(None),
+			ColorValue::Text(source) => {
+				if let Some(variable) = vars.get(source) {
+					value = variable;
+					continue;
+				}
+				return Color::parse(source)
+					.map(Some)
+					.ok_or_else(|| ThemeError::Color {
+						token: Str::new(token),
+						value: Str::new(source.as_str()),
+					});
+			},
+		}
+	}
+	Err(ThemeError::Color { token: Str::new(token), value: Str::new_static("variable cycle") })
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -139,10 +235,29 @@ mod tests {
 		assert_eq!(theme.for_appearance(Appearance::Dark).accent, Color::Rgb(0, 255, 255));
 		assert_eq!(theme.for_appearance(Appearance::Dark).panel, Color::Rgb(1, 2, 3));
 		assert_eq!(theme.for_appearance(Appearance::Light).accent, Color::Rgb(0, 95, 175));
-		assert_eq!(
-			theme.for_appearance(Appearance::Light).panel,
-			Theme::for_appearance(Appearance::Light).panel
-		);
+	}
+
+	#[test]
+	fn rich_pi_slots_and_variables_lower_to_semantic_tokens() {
+		let theme = JsonTheme::parse(
+			r##"{
+			"name":"rich",
+			"vars":{"violet":"#8855ee"},
+			"colors":{
+				"text":"#eeeeee","borderAccent":"violet","success":40,
+				"toolDiffRemoved":"#ff3344","statusLineBg":"#101216",
+				"syntaxKeyword":"#abcdef"
+			}
+		}"##,
+		)
+		.expect("rich theme");
+		let dark = theme.for_appearance(Appearance::Dark);
+		assert_eq!(dark.fg, Color::Rgb(0xee, 0xee, 0xee));
+		assert_eq!(dark.accent, Color::Rgb(0x88, 0x55, 0xee));
+		assert_eq!(dark.ok, Color::Indexed(40));
+		assert_eq!(dark.err, Color::Rgb(0xff, 0x33, 0x44));
+		assert_eq!(dark.panel, Color::Rgb(0x10, 0x12, 0x16));
+		assert!(matches!(theme.for_appearance_256(Appearance::Dark).accent, Color::Indexed(_)));
 	}
 
 	#[test]
