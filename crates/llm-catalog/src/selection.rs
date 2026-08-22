@@ -129,8 +129,10 @@ pub fn upsert_role_assignment(
 
 /// The built-in role vocabulary.  Values remain user-configurable; these ids
 /// are the stable public contract used by selectors and persisted settings.
-pub const BUILTIN_ROLE_IDS: &[&str] =
-	&["default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "task", "advisor"];
+pub const BUILTIN_ROLE_IDS: &[&str] = &[
+	"default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "memory", "task",
+	"advisor",
+];
 
 /// Parsed, syntax-only model selector annotations.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -384,7 +386,11 @@ fn select_inner(
 			.ok_or_else(|| SelectionError::UnknownRole(Str::new(role)))?;
 		if found.selectors.is_empty() {
 			let selected = match role {
-				"smol" | "tiny" | "task" => find_smol(models, routes, mru),
+				"tiny" | "memory" => ["commit", "smol"].into_iter().find_map(|fallback| {
+					let selector = format!("@{fallback}");
+					select_inner(models, routes, aliases, roles, mru, &selector, visiting).ok()
+				}),
+				"smol" | "task" => find_smol(models, routes, mru),
 				"slow" | "plan" | "advisor" => find_slow(models, routes, mru),
 				_ => pick_default(models, routes, mru),
 			};
@@ -400,13 +406,18 @@ fn select_inner(
 				select_inner(models, routes, aliases, roles, mru, &qualified, visiting).ok()
 			})
 		});
-		let result = preferred
-			.or_else(|| {
-				found.selectors.iter().find_map(|pattern| {
-					select_inner(models, routes, aliases, roles, mru, pattern, visiting).ok()
-				})
+		let mut selected = preferred.or_else(|| {
+			found.selectors.iter().find_map(|pattern| {
+				select_inner(models, routes, aliases, roles, mru, pattern, visiting).ok()
 			})
-			.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
+		});
+		if selected.is_none() && matches!(role, "tiny" | "memory") {
+			selected = ["commit", "smol"].into_iter().find_map(|fallback| {
+				let selector = format!("@{fallback}");
+				select_inner(models, routes, aliases, roles, mru, &selector, visiting).ok()
+			});
+		}
+		let result = selected.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
 		visiting.remove(role);
 		return result;
 	}
@@ -1019,5 +1030,38 @@ mod tests {
 		let roles = known_roles(&[role]);
 		assert_eq!(roles[0].id.as_str(), "custom");
 		assert!(roles.iter().any(|role| role.id == "default"));
+	}
+	#[test]
+	fn tiny_and_memory_follow_commit_before_smol_without_mutation() {
+		let catalog = crate::Catalog::embedded();
+		let selected_model = catalog
+			.models()
+			.iter()
+			.find(|model| {
+				model.availability != ModelAvailability::Disabled
+					&& model
+						.routes
+						.iter()
+						.any(|route| catalog.route(route).is_some())
+			})
+			.expect("available catalog model");
+		let original = ModelRole::assignment("commit", selected_model.key.as_str(), None)
+			.expect("commit assignment");
+		let unavailable_tiny =
+			ModelRole::assignment("tiny", "definitely-missing-model", None).expect("tiny assignment");
+		let roles = known_roles(&[original.clone(), unavailable_tiny.clone()]);
+		for selector in ["@tiny", "@memory"] {
+			let selected = select_model(
+				catalog.models(),
+				catalog.routes(),
+				catalog.aliases(),
+				&roles,
+				&BTreeMap::new(),
+				selector,
+			)
+			.expect(selector);
+			assert_eq!(selected.model, selected_model.key);
+		}
+		assert_eq!(roles.iter().find(|role| role.id == "tiny"), Some(&unavailable_tiny));
 	}
 }

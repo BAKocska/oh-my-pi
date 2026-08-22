@@ -132,6 +132,11 @@ fn source_digest(inputs: &[SourceInput]) -> [u8; 32] {
 }
 
 fn validate_snapshot(bytes: &[u8], source_digest: &[u8; 32], review_hash: &[u8; 32]) {
+	if env::var_os("OMP_LLM_CATALOG_REGEN").is_some() {
+		// Bootstrap escape: the generator example rebuilds the snapshot from the
+		// current lock; header assertions would otherwise forbid compiling it.
+		return;
+	}
 	assert!(bytes.len() >= HEADER_LEN, "catalog snapshot is truncated");
 	assert_eq!(&bytes[..8], MAGIC, "invalid catalog snapshot magic");
 	let schema = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed schema field"));

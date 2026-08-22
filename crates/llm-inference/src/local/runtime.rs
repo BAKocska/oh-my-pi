@@ -214,7 +214,8 @@ struct Loaded<E> {
 }
 
 struct RuntimeState<E> {
-	loaded: Option<Loaded<E>>,
+	loaded:       Option<Loaded<E>>,
+	load_failure: Option<LocalError>,
 }
 
 struct RuntimeInner<E> {
@@ -256,7 +257,7 @@ impl<E> LocalRuntime<E> {
 		}
 		Ok(Self {
 			inner: Arc::new(RuntimeInner {
-				state: Mutex::new(RuntimeState { loaded: None }),
+				state: Mutex::new(RuntimeState { loaded: None, load_failure: None }),
 				loader: Arc::new(loader),
 				memory,
 				model_bytes,
@@ -276,9 +277,18 @@ impl<E> LocalRuntime<E> {
 		let permit = self.inner.admission.try_acquire()?;
 		let now = Instant::now();
 		let mut state = self.inner.state.lock();
+		if let Some(failure) = state.load_failure.as_ref() {
+			return Err(failure.clone());
+		}
 		if state.loaded.is_none() {
 			let reservation = self.inner.memory.reserve(self.inner.model_bytes)?;
-			let engine = (self.inner.loader)()?;
+			let engine = match (self.inner.loader)() {
+				Ok(engine) => engine,
+				Err(error) => {
+					state.load_failure = Some(error.clone());
+					return Err(error);
+				},
+			};
 			let instance = self.inner.next_instance.fetch_add(1, Ordering::Relaxed);
 			state.loaded = Some(Loaded { engine, _memory: reservation, instance, last_used: now });
 		}
@@ -286,6 +296,27 @@ impl<E> LocalRuntime<E> {
 		let instance = state.loaded.as_ref().expect("loaded above").instance;
 		drop(state);
 		Ok(RuntimeLease { runtime: self.clone(), _permit: permit, request, instance })
+	}
+
+	/// Loads the model during idle time and immediately releases admission.
+	///
+	/// A failed prewarm records the same per-model failure blacklist as the
+	/// first real request, preventing repeated expensive load attempts.
+	pub fn prewarm(&self, cancel: &LocalCancellation) -> LocalResult<LocalExecutionReceipt> {
+		let lease = self.acquire(cancel)?;
+		Ok(lease.receipt())
+	}
+
+	/// Returns the first blacklisted model-load failure, if any.
+	pub fn load_failure(&self) -> Option<LocalError> {
+		self.inner.state.lock().load_failure.clone()
+	}
+
+	/// Clears a model-load blacklist after explicit artifact/config repair.
+	///
+	/// Ordinary inference never calls this automatically.
+	pub fn clear_load_failure(&self) -> bool {
+		self.inner.state.lock().load_failure.take().is_some()
 	}
 
 	/// Unloads an inactive model after its configured idle interval.
@@ -364,5 +395,34 @@ impl Deref for LocalError {
 
 	fn deref(&self) -> &Self::Target {
 		self.message.as_str()
+	}
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn failed_load_is_blacklisted_until_explicit_repair() {
+		let attempts = Arc::new(AtomicUsize::new(0));
+		let observed = Arc::clone(&attempts);
+		let runtime = LocalRuntime::<()>::new(
+			move || {
+				observed.fetch_add(1, Ordering::Relaxed);
+				Err(LocalError::new(LocalErrorKind::Backend, "fixture load failed"))
+			},
+			Arc::new(MemoryPool::new(1)),
+			1,
+			1,
+			Duration::from_secs(1),
+		)
+		.expect("runtime");
+		let cancel = LocalCancellation::new();
+		assert!(runtime.acquire(&cancel).is_err());
+		assert!(runtime.acquire(&cancel).is_err());
+		assert_eq!(attempts.load(Ordering::Relaxed), 1);
+		assert!(runtime.load_failure().is_some());
+		assert!(runtime.clear_load_failure());
+		assert!(runtime.acquire(&cancel).is_err());
+		assert_eq!(attempts.load(Ordering::Relaxed), 2);
 	}
 }

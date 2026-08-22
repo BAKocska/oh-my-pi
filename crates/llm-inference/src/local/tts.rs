@@ -1,16 +1,27 @@
 //! Kokoro-82M-backed local speech synthesis.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+	collections::HashMap,
+	path::PathBuf,
+	sync::{Arc, LazyLock},
+	time::Duration,
+};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use omp_core::Str;
-use omp_voice_kokoro::{KModel, ModelConfig, SynthesisMode};
+use omp_voice_kokoro::{KModel, ModelConfig, SynthesisMode, catalog as kokoro_catalog};
+use parking_lot::Mutex;
 
-use super::runtime::{
-	LocalCancellation, LocalError, LocalErrorKind, LocalExecutionReceipt, LocalResult, LocalRuntime,
-	MemoryPool,
+use super::{
+	artifact::ArtifactStore,
+	runtime::{
+		LocalCancellation, LocalError, LocalErrorKind, LocalExecutionReceipt, LocalResult,
+		LocalRuntime, MemoryPool,
+	},
+	speech_catalog::SpeechArtifactManifests,
 };
+static TTS_INFERENCE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Accelerator requested for Kokoro.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +52,47 @@ pub struct KokoroConfig {
 	pub idle_timeout:    Duration,
 }
 
+impl KokoroConfig {
+	/// Verifies the canonical speech manifest and binds every engine path.
+	///
+	/// The manifest contains all twelve voices, so every later voice switch is
+	/// a local tensor load and never an artifact download.
+	pub fn from_verified_artifacts(
+		store: &ArtifactStore,
+		artifacts: &SpeechArtifactManifests,
+		device: KokoroDevice,
+		idle_timeout: Duration,
+		cancel: &LocalCancellation,
+	) -> LocalResult<Self> {
+		let paths = artifacts.verified_kokoro_paths(store, cancel)?;
+		let resident_bytes = usize::try_from(
+			artifacts
+				.kokoro_manifest()
+				.total_bytes()
+				.map_err(|_| LocalError::new(LocalErrorKind::Artifact, "invalid Kokoro manifest"))?,
+		)
+		.map_err(|_| {
+			LocalError::new(LocalErrorKind::Overloaded, "Kokoro artifacts exceed address space")
+		})?;
+		let config_path = required_artifact(&paths, "config.json")?;
+		let weights_path = required_artifact(&paths, "kokoro-v1_0.safetensors")?;
+		let mut voices = HashMap::with_capacity(kokoro_catalog::VOICES.len());
+		for voice in kokoro_catalog::VOICES {
+			let filename = format!("{}.safetensors", voice.id);
+			voices.insert(Str::new_static(voice.id), required_artifact(&paths, &filename)?);
+		}
+		Ok(Self {
+			config_path,
+			weights_path,
+			voices,
+			device,
+			resident_bytes,
+			max_concurrency: 1,
+			idle_timeout,
+		})
+	}
+}
+
 /// Controls one synthesis.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SynthesisOptions {
@@ -69,6 +121,43 @@ pub struct SynthesisOutput {
 	pub receipt:     LocalExecutionReceipt,
 }
 
+/// Evidence returned after backpressured streaming synthesis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamingSynthesisReceipt {
+	/// Native sample rate of every emitted chunk.
+	pub sample_rate: u32,
+	/// Number of non-empty chunks emitted.
+	pub chunks:      usize,
+	/// Total number of mono samples emitted.
+	pub samples:     usize,
+	/// Serialized local-runtime execution evidence.
+	pub receipt:     LocalExecutionReceipt,
+}
+
+/// One ordered line in a spoken dialog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpokenDialogTurn<'a> {
+	/// Speakable text for this line.
+	pub text:  &'a str,
+	/// Optional voice override; absent and stale ids resolve to `af_heart`.
+	pub voice: Option<&'a str>,
+}
+
+/// Aggregate evidence for an ordered, non-interleaved spoken dialog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpokenDialogReceipt {
+	/// Number of dialog turns synthesized.
+	pub turns:       usize,
+	/// Number of PCM chunks emitted.
+	pub chunks:      usize,
+	/// Total number of mono samples emitted.
+	pub samples:     usize,
+	/// Native sample rate shared by all dialog turns.
+	pub sample_rate: u32,
+	/// Runtime evidence for the final serialized turn.
+	pub receipt:     LocalExecutionReceipt,
+}
+
 struct KokoroEngine {
 	model:       KModel,
 	config:      ModelConfig,
@@ -87,6 +176,15 @@ pub struct KokoroAdapter {
 impl KokoroAdapter {
 	/// Creates a lazy adapter from local model and voice artifacts.
 	pub fn new(config: KokoroConfig, memory: Arc<MemoryPool>) -> LocalResult<Self> {
+		if kokoro_catalog::VOICES
+			.iter()
+			.any(|voice| !config.voices.contains_key(voice.id))
+		{
+			return Err(LocalError::new(
+				LocalErrorKind::Artifact,
+				"Kokoro artifact binding must include all registered voices",
+			));
+		}
 		let resident = config.resident_bytes;
 		let concurrency = config.max_concurrency;
 		let idle = config.idle_timeout;
@@ -106,6 +204,12 @@ impl KokoroAdapter {
 							format!("Kokoro config decode failed: {error}"),
 						)
 					})?;
+				if model_config.sample_rate != kokoro_catalog::SAMPLE_RATE {
+					return Err(LocalError::new(
+						LocalErrorKind::Artifact,
+						"Kokoro config declares an unexpected sample rate",
+					));
+				}
 				// SAFETY: Candle owns each mapping for the lifetime of tensors built from it.
 				let variables = unsafe {
 					VarBuilder::from_mmaped_safetensors(&[&config.weights_path], DType::F32, &device)
@@ -133,7 +237,7 @@ impl KokoroAdapter {
 		Ok(Self { runtime })
 	}
 
-	/// Synthesizes text into mono PCM with the selected real voice pack.
+	/// Synthesizes text into one owned mono PCM buffer.
 	pub fn synthesize(
 		&self,
 		text: &str,
@@ -141,31 +245,113 @@ impl KokoroAdapter {
 		options: SynthesisOptions,
 		cancel: &LocalCancellation,
 	) -> LocalResult<SynthesisOutput> {
-		validate_synthesis(text, voice, options)?;
+		let mut samples = Vec::new();
+		let streamed =
+			self.synthesize_streaming(text, voice, options, cancel, |chunk, _sample_rate| {
+				samples.extend_from_slice(chunk);
+				true
+			})?;
+		Ok(SynthesisOutput { samples, sample_rate: streamed.sample_rate, receipt: streamed.receipt })
+	}
+
+	/// Synthesizes chunk-by-chunk while holding the serialized model lease.
+	///
+	/// `on_chunk` is synchronous backpressure. Returning `false` stops
+	/// synthesis with a cancellation result; already-delivered audio remains
+	/// valid. A stale voice id resolves to `af_heart` before any local tensor
+	/// access, matching pi's persisted-setting fallback.
+	pub fn synthesize_streaming(
+		&self,
+		text: &str,
+		voice: &str,
+		options: SynthesisOptions,
+		cancel: &LocalCancellation,
+		on_chunk: impl FnMut(&[f32], u32) -> bool,
+	) -> LocalResult<StreamingSynthesisReceipt> {
+		let _serialized = TTS_INFERENCE_LOCK.lock();
+		self.synthesize_streaming_locked(text, voice, options, cancel, on_chunk)
+	}
+
+	/// Synthesizes a complete dialog without allowing another synthesis to
+	/// interleave between turns.
+	pub fn synthesize_dialog(
+		&self,
+		turns: &[SpokenDialogTurn<'_>],
+		options: SynthesisOptions,
+		cancel: &LocalCancellation,
+		mut on_chunk: impl FnMut(usize, &[f32], u32) -> bool,
+	) -> LocalResult<SpokenDialogReceipt> {
+		if turns.is_empty() {
+			return Err(LocalError::new(
+				LocalErrorKind::InvalidInput,
+				"spoken dialog requires at least one turn",
+			));
+		}
+		let _serialized = TTS_INFERENCE_LOCK.lock();
+		let mut chunks = 0_usize;
+		let mut samples = 0_usize;
+		let mut final_receipt = None;
+		for (turn_index, turn) in turns.iter().enumerate() {
+			let synthesized = self.synthesize_streaming_locked(
+				turn.text,
+				turn.voice.unwrap_or(kokoro_catalog::DEFAULT_VOICE),
+				options,
+				cancel,
+				|audio, sample_rate| on_chunk(turn_index, audio, sample_rate),
+			)?;
+			chunks = chunks.saturating_add(synthesized.chunks);
+			samples = samples.saturating_add(synthesized.samples);
+			final_receipt = Some(synthesized.receipt);
+		}
+		Ok(SpokenDialogReceipt {
+			turns: turns.len(),
+			chunks,
+			samples,
+			sample_rate: kokoro_catalog::SAMPLE_RATE,
+			receipt: final_receipt.expect("non-empty dialog synthesized above"),
+		})
+	}
+
+	fn synthesize_streaming_locked(
+		&self,
+		text: &str,
+		voice: &str,
+		options: SynthesisOptions,
+		cancel: &LocalCancellation,
+		mut on_chunk: impl FnMut(&[f32], u32) -> bool,
+	) -> LocalResult<StreamingSynthesisReceipt> {
+		validate_synthesis(text, options)?;
+		let voice = kokoro_catalog::resolve_voice(Some(voice)).id;
 		let lease = self.runtime.acquire(cancel)?;
 		let receipt = lease.receipt();
-		let (samples, sample_rate) = lease.with_engine(|engine| {
-			if !engine.voices.contains_key(voice) {
-				let path = engine.voice_paths.get(voice).ok_or_else(|| {
-					LocalError::new(LocalErrorKind::InvalidInput, "unknown Kokoro voice")
-				})?;
-				let tensors =
-					candle_core::safetensors::load(path, &engine.device).map_err(|error| {
-						LocalError::new(
-							LocalErrorKind::Artifact,
-							format!("Kokoro voice load failed: {error}"),
-						)
-					})?;
-				let tensor = tensors.into_values().next().ok_or_else(|| {
-					LocalError::new(LocalErrorKind::Artifact, "Kokoro voice pack contains no tensors")
-				})?;
-				engine.voices.insert(Str::new(voice), tensor);
-			}
-			let voice_tensor = engine.voices.get(voice).expect("inserted above").clone();
-			let samples = synthesize_text(engine, &voice_tensor, text, options, cancel)?;
-			Ok((samples, engine.config.sample_rate))
+		let mut chunks = 0_usize;
+		let mut samples = 0_usize;
+		let sample_rate = lease.with_engine(|engine| {
+			let voice_tensor = load_voice(engine, voice)?;
+			let sample_rate = engine.config.sample_rate;
+			synthesize_text_streaming(engine, &voice_tensor, text, options, cancel, &mut |audio| {
+				chunks += 1;
+				samples = samples.saturating_add(audio.len());
+				on_chunk(audio, sample_rate)
+			})?;
+			Ok(sample_rate)
 		})?;
-		Ok(SynthesisOutput { samples, sample_rate, receipt })
+		Ok(StreamingSynthesisReceipt { sample_rate, chunks, samples, receipt })
+	}
+
+	/// Loads Kokoro and validates the model ahead of the first dialog.
+	pub fn prewarm(&self, cancel: &LocalCancellation) -> LocalResult<LocalExecutionReceipt> {
+		self.runtime.prewarm(cancel)
+	}
+
+	/// Returns the blacklisted first-load failure, if loading has failed.
+	pub fn load_failure(&self) -> Option<LocalError> {
+		self.runtime.load_failure()
+	}
+
+	/// Clears the failure blacklist after explicit artifact/config repair.
+	pub fn clear_load_failure(&self) -> bool {
+		self.runtime.clear_load_failure()
 	}
 
 	/// Unloads Kokoro when inactive for its configured interval.
@@ -177,6 +363,36 @@ impl KokoroAdapter {
 	pub fn is_loaded(&self) -> bool {
 		self.runtime.is_loaded()
 	}
+}
+
+fn required_artifact(paths: &[PathBuf], filename: &str) -> LocalResult<PathBuf> {
+	paths
+		.iter()
+		.find(|path| {
+			path
+				.file_name()
+				.is_some_and(|candidate| candidate == filename)
+		})
+		.cloned()
+		.ok_or_else(|| {
+			LocalError::new(LocalErrorKind::Artifact, "Kokoro manifest is missing a runtime file")
+		})
+}
+
+fn load_voice(engine: &mut KokoroEngine, voice: &str) -> LocalResult<Tensor> {
+	if !engine.voices.contains_key(voice) {
+		let path = engine.voice_paths.get(voice).ok_or_else(|| {
+			LocalError::new(LocalErrorKind::Artifact, "Kokoro manifest is missing a registered voice")
+		})?;
+		let tensors = candle_core::safetensors::load(path, &engine.device).map_err(|error| {
+			LocalError::new(LocalErrorKind::Artifact, format!("Kokoro voice load failed: {error}"))
+		})?;
+		let tensor = tensors.into_values().next().ok_or_else(|| {
+			LocalError::new(LocalErrorKind::Artifact, "Kokoro voice pack contains no tensors")
+		})?;
+		engine.voices.insert(Str::new(voice), tensor);
+	}
+	Ok(engine.voices.get(voice).expect("inserted above").clone())
 }
 
 fn kokoro_device(requested: KokoroDevice) -> LocalResult<Device> {
@@ -200,11 +416,11 @@ fn kokoro_device(requested: KokoroDevice) -> LocalResult<Device> {
 	}
 }
 
-fn validate_synthesis(text: &str, voice: &str, options: SynthesisOptions) -> LocalResult<()> {
-	if text.trim().is_empty() || voice.is_empty() {
+fn validate_synthesis(text: &str, options: SynthesisOptions) -> LocalResult<()> {
+	if text.trim().is_empty() {
 		return Err(LocalError::new(
 			LocalErrorKind::InvalidInput,
-			"speech synthesis requires text and a voice",
+			"speech synthesis requires non-empty text",
 		));
 	}
 	if !options.speed.is_finite() || options.speed <= 0.0 || options.max_chunk_chars == 0 {
@@ -216,14 +432,15 @@ fn validate_synthesis(text: &str, voice: &str, options: SynthesisOptions) -> Loc
 	Ok(())
 }
 
-fn synthesize_text(
+fn synthesize_text_streaming(
 	engine: &KokoroEngine,
 	voice: &Tensor,
 	text: &str,
 	options: SynthesisOptions,
 	cancel: &LocalCancellation,
-) -> LocalResult<Vec<f32>> {
-	let mut output = Vec::new();
+	emit: &mut dyn FnMut(&[f32]) -> bool,
+) -> LocalResult<()> {
+	let mut emitted = false;
 	for_each_text_chunk(text, options.max_chunk_chars, |chunk| {
 		if cancel.is_cancelled() {
 			return Err(LocalError::cancelled());
@@ -270,13 +487,19 @@ fn synthesize_text(
 			.map_err(|error| {
 				LocalError::new(LocalErrorKind::Backend, format!("Kokoro inference failed: {error}"))
 			})?;
-		output.extend(audio);
+		if audio.is_empty() {
+			return Ok(());
+		}
+		emitted = true;
+		if !emit(&audio) {
+			return Err(LocalError::cancelled());
+		}
 		Ok(())
 	})?;
-	if output.is_empty() {
+	if !emitted {
 		return Err(LocalError::new(LocalErrorKind::Backend, "text produced no supported phonemes"));
 	}
-	Ok(output)
+	Ok(())
 }
 
 fn for_each_text_chunk<E>(

@@ -1,14 +1,17 @@
 //! Backend-neutral speech catalog and artifact-backed cache snapshots.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, path::PathBuf};
 
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
 use super::{
-	artifact::{ArtifactCacheState, ArtifactManifest, ArtifactResult, ArtifactStore},
-	runtime::LocalCancellation,
+	artifact::{
+		ArtifactCacheState, ArtifactManifest, ArtifactResult, ArtifactShard, ArtifactSpec,
+		ArtifactStore, sha256_digest,
+	},
+	runtime::{LocalCancellation, LocalResult},
 };
 
 /// Stable setting key for the selected speech-to-text preset.
@@ -293,6 +296,126 @@ pub struct SpeechArtifactManifests {
 }
 
 impl SpeechArtifactManifests {
+	/// Builds the revision-pinned pi-parity speech artifact portfolio.
+	///
+	/// Whisper uses whisper.cpp's native GGML checkpoints, Parakeet uses pi's
+	/// exact sherpa-onnx export, and Kokoro uses the safetensors conversion
+	/// consumed by `omp-voice-kokoro`. Kokoro's single manifest deliberately
+	/// includes every curated voice so switching voices never performs network
+	/// I/O after the model becomes ready.
+	pub fn pi_parity() -> Result<Self, SpeechCatalogError> {
+		const WHISPER_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+		const PARAKEET_REVISION: &str = "2bda32ec70b097a55adaa07d9a7173915b43cc78";
+		const KOKORO_REVISION: &str = "e02c9eada7ce7416798af36b190a8a2dd2ecd566";
+
+		let fast = ArtifactManifest::new("stt-fast-whisper-base", vec![speech_shard(
+			"speech/stt/fast/ggml-base.bin",
+			&format!(
+				"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REVISION}/ggml-base.bin"
+			),
+			147_951_465,
+			b"60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+		)])
+		.map_err(|source| SpeechCatalogError::Artifact { source })?;
+		let balanced = ArtifactManifest::new("stt-balanced-whisper-small", vec![speech_shard(
+			"speech/stt/balanced/ggml-small.bin",
+			&format!(
+					"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REVISION}/ggml-small.bin"
+				),
+			487_601_967,
+			b"1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+		)])
+		.map_err(|source| SpeechCatalogError::Artifact { source })?;
+		let turbo = ArtifactManifest::new(
+			"stt-turbo-whisper-large-v3-turbo",
+			vec![speech_shard(
+				"speech/stt/turbo/ggml-large-v3-turbo.bin",
+				&format!(
+					"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REVISION}/ggml-large-v3-turbo.bin"
+				),
+				1_624_555_275,
+				b"1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+			)],
+		)
+		.map_err(|source| SpeechCatalogError::Artifact { source })?;
+		let parakeet_base = concat!(
+			"https://huggingface.co/csukuangfj/",
+			"sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/"
+		);
+		let parakeet = ArtifactManifest::new("stt-parakeet-tdt-0.6b-v3-int8", vec![
+			speech_shard(
+				"speech/stt/parakeet/encoder.int8.onnx",
+				&format!("{parakeet_base}{PARAKEET_REVISION}/encoder.int8.onnx"),
+				652_184_281,
+				b"acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247",
+			),
+			speech_shard(
+				"speech/stt/parakeet/decoder.int8.onnx",
+				&format!("{parakeet_base}{PARAKEET_REVISION}/decoder.int8.onnx"),
+				11_845_275,
+				b"179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e",
+			),
+			speech_shard(
+				"speech/stt/parakeet/joiner.int8.onnx",
+				&format!("{parakeet_base}{PARAKEET_REVISION}/joiner.int8.onnx"),
+				6_355_277,
+				b"3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3",
+			),
+			speech_shard(
+				"speech/stt/parakeet/tokens.txt",
+				&format!("{parakeet_base}{PARAKEET_REVISION}/tokens.txt"),
+				93_939,
+				b"d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
+			),
+		])
+		.map_err(|source| SpeechCatalogError::Artifact { source })?;
+
+		let kokoro_base = "https://huggingface.co/prince-canuma/Kokoro-82M/resolve";
+		let mut kokoro_shards = Vec::with_capacity(14);
+		kokoro_shards.push(speech_shard(
+			"speech/tts/kokoro/config.json",
+			&format!("{kokoro_base}/{KOKORO_REVISION}/config.json"),
+			2_351,
+			b"5abb01e2403b072bf03d04fde160443e209d7a0dad49a423be15196b9b43c17f",
+		));
+		kokoro_shards.push(speech_shard(
+			"speech/tts/kokoro/kokoro-v1_0.safetensors",
+			&format!("{kokoro_base}/{KOKORO_REVISION}/kokoro-v1_0.safetensors"),
+			327_115_152,
+			b"4e9ecdf03b8b6cf906070390237feda473dc13327cb8d56a43deaa374c02acd8",
+		));
+		for (voice, digest) in [
+			("af_heart", b"4e40b08984cd84a86b4d07960939bd85bb6b3747dd747b7de48dca3aaeab37ca"),
+			("af_bella", b"a18024b9332f5ff217c7f604cbe94449a3ca51c3b8d85500e31cd3cbdc4ef6ce"),
+			("af_nicole", b"769ee38efeb131196eaab5ed43592b315bba829881d4aee7411872efa6cf05c6"),
+			("af_aoede", b"fce9bf78661a0444ca333f5687183d850bfb73b71c67f2678dd5ddb3ac3a96d2"),
+			("af_kore", b"71fb664533d3bcbed8cf96eafe9280dfa7c244302ded62501a0b42d18377ed1b"),
+			("af_sarah", b"2bc36ea1b08925188da3c81e30858952bec28fbb61512bdd573312e5a62dd3f9"),
+			("am_michael", b"19a8661430456e2bbf0a68b52fa9b49678bb0fb7418619f868df77921f5aa43c"),
+			("am_fenrir", b"843c5a6abcd2f25f242e1bf3b008c3c8fcc8f6d99f081767275e1c852eb7beee"),
+			("am_puck", b"a6be98717a1332b631c689c25b69e6e0e48693453002d160d0690a80cf989d47"),
+			("bf_emma", b"ed92055e1ed96f2a0b4a52b76956dcfd76627bd548c33801743a62c0817dec01"),
+			("bm_george", b"a3a6682cde622e7aee35597b91947fa018f78be101a97587a100effe227e5a21"),
+			("bm_fable", b"146cd42da875a06d45b9808f5dbdc1b0485283a590187aaeffda64239f0faa54"),
+		] {
+			let relative = format!("speech/tts/kokoro/voices/{voice}.safetensors");
+			let source = format!("{kokoro_base}/{KOKORO_REVISION}/voices/{voice}.safetensors");
+			kokoro_shards.push(speech_shard(&relative, &source, 522_339, digest));
+		}
+		let kokoro = ArtifactManifest::new("tts-kokoro-82m-v1.0", kokoro_shards)
+			.map_err(|source| SpeechCatalogError::Artifact { source })?;
+
+		Self::new(
+			[
+				(SttPreset::Fast, fast),
+				(SttPreset::Balanced, balanced),
+				(SttPreset::Turbo, turbo),
+				(SttPreset::Parakeet, parakeet),
+			],
+			kokoro,
+		)
+	}
+
 	/// Constructs bindings and enforces exactly one manifest per STT preset.
 	pub fn new(
 		stt: [(SttPreset, ArtifactManifest); 4],
@@ -328,6 +451,49 @@ impl SpeechArtifactManifests {
 	/// Returns the platform manifest for Kokoro-82M.
 	pub const fn kokoro_manifest(&self) -> &ArtifactManifest {
 		&self.kokoro
+	}
+
+	/// Verifies and returns the engine paths for one STT preset in manifest
+	/// order.
+	pub fn verified_stt_paths(
+		&self,
+		store: &ArtifactStore,
+		preset: SttPreset,
+		cancel: &LocalCancellation,
+	) -> LocalResult<Vec<PathBuf>> {
+		verified_paths(store, self.stt_manifest(preset), cancel)
+	}
+
+	/// Verifies and returns Kokoro config, weights, and all voice paths.
+	pub fn verified_kokoro_paths(
+		&self,
+		store: &ArtifactStore,
+		cancel: &LocalCancellation,
+	) -> LocalResult<Vec<PathBuf>> {
+		verified_paths(store, self.kokoro_manifest(), cancel)
+	}
+}
+
+fn verified_paths(
+	store: &ArtifactStore,
+	manifest: &ArtifactManifest,
+	cancel: &LocalCancellation,
+) -> LocalResult<Vec<PathBuf>> {
+	manifest
+		.shards
+		.iter()
+		.map(|shard| {
+			store
+				.verify(&shard.spec, cancel)
+				.map(|artifact| artifact.path().to_path_buf())
+		})
+		.collect()
+}
+
+fn speech_shard(path: &str, source: &str, bytes: u64, digest: &[u8; 64]) -> ArtifactShard {
+	ArtifactShard {
+		spec:   ArtifactSpec { path: PathBuf::from(path), bytes, sha256: sha256_digest(digest) },
+		source: Str::new(source),
 	}
 }
 
@@ -730,5 +896,28 @@ mod tests {
 			fixture(),
 		);
 		assert!(matches!(result, Err(SpeechCatalogError::DuplicateSttPreset { .. })));
+	}
+	#[test]
+	fn pi_parity_manifests_bind_every_runtime_file() {
+		let artifacts = SpeechArtifactManifests::pi_parity().expect("curated manifests");
+		assert_eq!(artifacts.stt_manifest(SttPreset::Fast).shards.len(), 1);
+		assert_eq!(artifacts.stt_manifest(SttPreset::Balanced).shards.len(), 1);
+		assert_eq!(artifacts.stt_manifest(SttPreset::Turbo).shards.len(), 1);
+		assert_eq!(artifacts.stt_manifest(SttPreset::Parakeet).shards.len(), 4);
+		assert_eq!(artifacts.kokoro_manifest().shards.len(), 14);
+		assert!(
+			artifacts
+				.kokoro_manifest()
+				.shards
+				.iter()
+				.any(|shard| { shard.spec.path.ends_with("voices/af_heart.safetensors") })
+		);
+		assert!(
+			artifacts
+				.kokoro_manifest()
+				.shards
+				.iter()
+				.all(|shard| { shard.source.as_str().contains("/resolve/") && shard.spec.bytes > 0 })
+		);
 	}
 }

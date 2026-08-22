@@ -19,7 +19,7 @@ local = []
 test-support = []
 local-applefm = ["local"]
 local-embedding = ["local", "dep:fastembed"]
-local-stt = ["local", "dep:whisper-rs"]
+local-stt = ["local", "dep:whisper-rs", "dep:sherpa-onnx"]
 local-text = ["local", "dep:llama-cpp-2"]
 local-tts = [
 	"local",
@@ -79,6 +79,9 @@ voice-g2p = { workspace = true, optional = true }
 whisper-rs = { workspace = true, features = ["tracing_backend"], optional = true }
 xutf = { workspace = true }
 zeroize = { workspace = true }
+
+[target.'cfg(any(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "windows", target_arch = "x86_64")))'.dependencies]
+sherpa-onnx = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { workspace = true, features = ["metal"], optional = true }

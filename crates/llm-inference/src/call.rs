@@ -1172,37 +1172,41 @@ pub enum SearchRecency {
 #[derive(Clone, Debug)]
 pub struct SearchRequest {
 	/// Search query as authored.
-	pub query:              Str,
+	pub query:                Str,
 	/// Parsed directives shared across route attempts.
-	pub parsed_query:       Arc<crate::operation::search_query::SearchQuery>,
+	pub parsed_query:         Arc<crate::operation::search_query::SearchQuery>,
 	/// Included domains supplied outside query text; empty means unrestricted.
-	pub include_domains:    Arc<[Str]>,
+	pub include_domains:      Arc<[Str]>,
 	/// Excluded domains supplied outside query text.
-	pub exclude_domains:    Arc<[Str]>,
+	pub exclude_domains:      Arc<[Str]>,
 	/// Recency constraint.
-	pub recency:            Option<SearchRecency>,
+	pub recency:              Option<SearchRecency>,
 	/// BCP-47 locale hint.
-	pub locale:             Option<Str>,
+	pub locale:               Option<Str>,
 	/// Maximum ranked result count returned to the caller.
-	pub max_results:        u32,
+	pub max_results:          u32,
 	/// Provider retrieval count when distinct from returned results.
-	pub retrieval_results:  Option<u32>,
+	pub retrieval_results:    Option<u32>,
 	/// Maximum synthesis output tokens.
-	pub max_output_tokens:  Option<u32>,
+	pub max_output_tokens:    Option<u32>,
 	/// Synthesis sampling temperature.
-	pub temperature:        Option<f32>,
+	pub temperature:          Option<f32>,
 	/// Explicit provider pin, when any.
-	pub provider:           Option<ProviderId>,
+	pub provider:             Option<ProviderId>,
 	/// Configured provider preference order for automatic search.
-	pub provider_order:     Arc<[ProviderId]>,
+	pub provider_order:       Arc<[ProviderId]>,
 	/// Providers excluded from automatic search.
-	pub excluded_providers: Arc<[ProviderId]>,
+	pub excluded_providers:   Arc<[ProviderId]>,
 	/// Per-provider attempt timeout, already clamped by the owner.
-	pub attempt_timeout:    Duration,
+	pub attempt_timeout:      Duration,
+	/// Validated endpoint override for a configurable self-hosted route.
+	pub endpoint_override:    Option<Str>,
+	/// Whether Perplexity uses its Responses-compatible endpoint.
+	pub perplexity_responses: bool,
 	/// Whether an answer synthesis is requested.
-	pub synthesize_answer:  Setting<bool>,
+	pub synthesize_answer:    Setting<bool>,
 	/// Capability negotiation policy.
-	pub negotiation:        NegotiationPolicy,
+	pub negotiation:          NegotiationPolicy,
 }
 
 impl SearchRequest {
@@ -1225,6 +1229,8 @@ impl SearchRequest {
 			provider_order: Arc::new([]),
 			excluded_providers: Arc::new([]),
 			attempt_timeout: Duration::from_secs(60),
+			endpoint_override: None,
+			perplexity_responses: false,
 			synthesize_answer: Setting::Unset,
 			negotiation: NegotiationPolicy::default(),
 		}

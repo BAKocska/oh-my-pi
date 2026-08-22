@@ -28,6 +28,15 @@ pub struct WebSearchSettings {
 	pub perplexity_responses: bool,
 }
 
+/// Resolves a user-facing search engine name to its catalog provider key.
+#[must_use]
+pub fn catalog_provider_name(name: &str) -> &str {
+	match name {
+		"google" => "google-search",
+		_ => name,
+	}
+}
+
 impl Default for WebSearchSettings {
 	fn default() -> Self {
 		Self {

@@ -1,5 +1,6 @@
 //! Protocol-neutral bounded transport framing.
 
+pub mod browser;
 pub mod cassette;
 pub mod connect;
 pub mod custom;

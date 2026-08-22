@@ -499,7 +499,11 @@ pub struct ContextUsageReceipt {
 	/// Stable turn identity anchoring every measurement.
 	pub turn_id:             Option<Str>,
 	/// Projection revision measured by the tokenizer.
-	pub projection_revision: Option<u64>,
+	pub context_revision:    Option<u64>,
+	/// Physical journal event anchoring the prompt projection.
+	pub prompt_anchor:       Option<u64>,
+	/// Durable compaction/reset epoch measured by the tokenizer.
+	pub compaction_epoch:    Option<u64>,
 	/// Model context-window ceiling.
 	pub window_tokens:       Option<u64>,
 	/// Complete serialized input tokens at this anchor.
@@ -508,6 +512,8 @@ pub struct ContextUsageReceipt {
 	pub system_tokens:       Option<u64>,
 	/// Conversation-message tokens, when independently measurable.
 	pub message_tokens:      Option<u64>,
+	/// Installed skill prompt tokens, when independently measurable.
+	pub skill_tokens:        Option<u64>,
 	/// Tool declarations and tool-result tokens, when independently measurable.
 	pub tool_tokens:         Option<u64>,
 	/// Reserved runtime buffers, when independently measurable.

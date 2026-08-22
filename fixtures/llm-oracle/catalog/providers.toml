@@ -445,6 +445,121 @@ auth = { type = "bearer", env = ["OMP_PERPLEXITY_API_KEY"] }
 oauth_flow = "perplexity"
 mapping = { kind = "replacement", component = "tool-runtime", reason = "Perplexity account login is consumed by web research, not inference" }
 facets = ["web_search"]
+[providers."perplexity-cookie"]
+transport = "embedded"
+codec = "search-perplexity"
+route_transport = "http"
+base_url = "https://www.perplexity.ai"
+auth = { type = "header", name = "Cookie", env = ["OMP_PERPLEXITY_COOKIE"] }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Perplexity browser cookies remain sealed search credentials" }
+facets = ["web_search"]
+
+[providers."perplexity-openrouter"]
+transport = "embedded"
+codec = "search-perplexity"
+route_transport = "http"
+base_url = "https://openrouter.ai/api/v1"
+auth = { type = "bearer", env = ["OMP_OPENROUTER_API_KEY"] }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "OpenRouter is a Perplexity search credential fallback" }
+facets = ["web_search"]
+
+[providers."perplexity-anonymous"]
+transport = "embedded"
+codec = "search-perplexity"
+route_transport = "http"
+base_url = "https://www.perplexity.ai"
+auth = { type = "none" }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Perplexity anonymous search is an explicit ephemeral fallback" }
+facets = ["web_search"]
+[providers."duckduckgo"]
+transport = "embedded"
+codec = "search-duckduckgo"
+route_transport = "http"
+base_url = "https://html.duckduckgo.com"
+auth = { type = "none" }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "DuckDuckGo is a standalone web-search route" }
+facets = ["web_search"]
+
+[providers."google-search"]
+transport = "embedded"
+codec = "search-google"
+route_transport = "http"
+base_url = "https://www.google.com"
+auth = { type = "none" }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Google HTML search is a standalone web-search route" }
+facets = ["web_search"]
+
+[providers."startpage"]
+transport = "embedded"
+codec = "search-startpage"
+route_transport = "http"
+base_url = "https://www.startpage.com"
+auth = { type = "none" }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Startpage is a standalone web-search route" }
+facets = ["web_search"]
+
+[providers."ecosia"]
+transport = "embedded"
+codec = "search-ecosia"
+route_transport = "http"
+base_url = "https://www.ecosia.org"
+auth = { type = "none" }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Ecosia is a standalone web-search route" }
+facets = ["web_search"]
+
+[providers."mojeek"]
+transport = "embedded"
+codec = "search-mojeek"
+route_transport = "http"
+base_url = "https://www.mojeek.com"
+auth = { type = "none" }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Mojeek is a standalone web-search route" }
+facets = ["web_search"]
+
+[providers."searxng"]
+transport = "embedded"
+codec = "search-searxng"
+route_transport = "http"
+base_url = "http://127.0.0.1:8080"
+auth = { type = "optional-bearer", env = ["OMP_SEARXNG_API_KEY"] }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "SearXNG endpoint is selected by native web-search settings" }
+facets = ["web_search"]
+
+[providers."firecrawl"]
+transport = "embedded"
+codec = "search-firecrawl"
+route_transport = "http"
+base_url = "https://api.firecrawl.dev/v1"
+auth = { type = "bearer", env = ["OMP_FIRECRAWL_API_KEY"] }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Firecrawl is a standalone web-search credential" }
+facets = ["web_search"]
+
+[providers."brave"]
+transport = "embedded"
+codec = "search-brave"
+route_transport = "http"
+base_url = "https://api.search.brave.com"
+auth = { type = "header", name = "X-Subscription-Token", env = ["OMP_BRAVE_SEARCH_API_KEY"] }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Brave Search is a standalone web-search credential" }
+facets = ["web_search"]
+
+[providers."jina"]
+transport = "embedded"
+codec = "search-jina"
+route_transport = "http"
+base_url = "https://s.jina.ai"
+auth = { type = "optional-bearer", env = ["OMP_JINA_API_KEY"] }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "Jina Search is a standalone web-search route" }
+facets = ["web_search"]
+
+[providers."tinyfish"]
+transport = "embedded"
+codec = "search-tinyfish"
+route_transport = "http"
+base_url = "https://agent.tinyfish.ai/v1/search"
+auth = { type = "bearer", env = ["OMP_TINYFISH_API_KEY"] }
+mapping = { kind = "replacement", component = "tool-runtime", reason = "TinyFish is a standalone web-search credential" }
+facets = ["web_search"]
 
 [providers."gigachat"]
 transport = "open-ai-chat"

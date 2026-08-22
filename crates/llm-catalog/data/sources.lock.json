@@ -1,6 +1,6 @@
 {
 	"schema_version": 1,
-	"source_digest": "a3518b4f4a0f844728ee16cbbd8aa162716e897d1e8b7f90a29fb0039409f5b3",
+	"source_digest": "5055ee3b44dde13f9576930ee2a0d88edf992d146e93f2d62c04e09794f2bf04",
 	"inputs": [
 		{
 			"id": "catalog-policy.manifest.v1",
@@ -11,7 +11,7 @@
 		{
 			"id": "catalog.census.v1",
 			"path": "fixtures/llm-oracle/catalog/census.json",
-			"sha256": "49d623c86d34b2fe73c9af71648b42dc0fc69d53ef9cade38cfabf9b5cc81960",
+			"sha256": "ebc4e6c6178997ca4e4f835729c3bda8aa1949d085dcced1f5e7e69a05a421d9",
 			"source": "oracle:catalog.census.v1"
 		},
 		{
@@ -143,7 +143,7 @@
 		{
 			"id": "catalog.providers.source.v1",
 			"path": "fixtures/llm-oracle/catalog/providers.toml",
-			"sha256": "4878842fe3d7a49abbf8afde97867f5f89bcf5ff775254d2e91b8e6d323e7a13",
+			"sha256": "de952e3f47da3a94500908517b6a8c2b5c2c8e0bad3421b6f8908647b67bc5e5",
 			"source": "oracle:catalog.providers.source.v1"
 		},
 		{

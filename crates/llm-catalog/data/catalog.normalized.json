@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "revision": "catalog-ccdeb550fe4caafdc213dca60991551ec358fa52e96335a4838eb68d64d91911",
+  "revision": "catalog-88c3d604ce623012f5928db874e81b486f4d0ad7b51e7461042ebaba515c15a8",
   "census": {
     "raw_models": 4302,
     "logical_models": 4225,
-    "providers": 94,
+    "providers": 107,
     "raw_provider_keys": 80,
-    "urls": 108,
+    "urls": 118,
     "transports": 16,
     "active_transports": 13
   },
@@ -354,6 +354,30 @@
       "mapping": "concrete"
     },
     {
+      "id": "brave",
+      "name": "Brave",
+      "auth": [
+        "auth-27381281bfff02a0c8424efa70b4916cb29a0b70da69c9bb8c16bfc3b6b6fb69"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "brave/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Brave Search is a standalone web-search credential"
+        }
+      }
+    },
+    {
       "id": "cerebras",
       "name": "Cerebras",
       "auth": [
@@ -617,6 +641,54 @@
       "mapping": "concrete"
     },
     {
+      "id": "duckduckgo",
+      "name": "Duckduckgo",
+      "auth": [
+        "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73"
+      ],
+      "management": {
+        "operations": 0,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "duckduckgo/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "DuckDuckGo is a standalone web-search route"
+        }
+      }
+    },
+    {
+      "id": "ecosia",
+      "name": "Ecosia",
+      "auth": [
+        "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73"
+      ],
+      "management": {
+        "operations": 0,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "ecosia/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Ecosia is a standalone web-search route"
+        }
+      }
+    },
+    {
       "id": "exa",
       "name": "Exa",
       "auth": [
@@ -637,6 +709,30 @@
         "replacement": {
           "component": "tool-runtime",
           "reason": "Exa is a web-search credential, not an inference provider"
+        }
+      }
+    },
+    {
+      "id": "firecrawl",
+      "name": "Firecrawl",
+      "auth": [
+        "auth-a01f80ff8df10765a0060ab70ddb30a68ea4607a32f6fec64cbd9be89f16984e"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "firecrawl/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Firecrawl is a standalone web-search credential"
         }
       }
     },
@@ -961,6 +1057,30 @@
       "mapping": "concrete"
     },
     {
+      "id": "google-search",
+      "name": "Google Search",
+      "auth": [
+        "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73"
+      ],
+      "management": {
+        "operations": 0,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "google-search/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Google HTML search is a standalone web-search route"
+        }
+      }
+    },
+    {
       "id": "google-vertex",
       "name": "Google Vertex",
       "auth": [
@@ -1085,6 +1205,30 @@
         }
       },
       "mapping": "concrete"
+    },
+    {
+      "id": "jina",
+      "name": "Jina",
+      "auth": [
+        "auth-cb131d4cd4c8eb03175b2be6bf82b0691c99efdef06b076b599454f8e0a64c76"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "jina/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Jina Search is a standalone web-search route"
+        }
+      }
     },
     {
       "id": "kagi",
@@ -1383,6 +1527,30 @@
         }
       },
       "mapping": "concrete"
+    },
+    {
+      "id": "mojeek",
+      "name": "Mojeek",
+      "auth": [
+        "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73"
+      ],
+      "management": {
+        "operations": 0,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "mojeek/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Mojeek is a standalone web-search route"
+        }
+      }
     },
     {
       "id": "moonshot",
@@ -1855,6 +2023,78 @@
       }
     },
     {
+      "id": "perplexity-anonymous",
+      "name": "Perplexity Anonymous",
+      "auth": [
+        "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73"
+      ],
+      "management": {
+        "operations": 0,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "perplexity-anonymous/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Perplexity anonymous search is an explicit ephemeral fallback"
+        }
+      }
+    },
+    {
+      "id": "perplexity-cookie",
+      "name": "Perplexity Cookie",
+      "auth": [
+        "auth-68e2c58931727cd680212a246279241599e9102fca0e6c2ddb599e940e198e2e"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "perplexity-cookie/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Perplexity browser cookies remain sealed search credentials"
+        }
+      }
+    },
+    {
+      "id": "perplexity-openrouter",
+      "name": "Perplexity Openrouter",
+      "auth": [
+        "auth-6ffca619eb98a2bb086cc0143d85b2fcf1819a7bca4259247f397b258e476672"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "perplexity-openrouter/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "OpenRouter is a Perplexity search credential fallback"
+        }
+      }
+    },
+    {
       "id": "poolside",
       "name": "Poolside",
       "auth": [
@@ -2029,6 +2269,30 @@
       "mapping": "concrete"
     },
     {
+      "id": "searxng",
+      "name": "Searxng",
+      "auth": [
+        "auth-488d882493579add6393c9d1e1bcafcd24f472306b3f729d93622c9b27f9216c"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "searxng/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "SearXNG endpoint is selected by native web-search settings"
+        }
+      }
+    },
+    {
       "id": "siliconflow",
       "name": "Siliconflow",
       "auth": [
@@ -2083,6 +2347,30 @@
         }
       },
       "mapping": "concrete"
+    },
+    {
+      "id": "startpage",
+      "name": "Startpage",
+      "auth": [
+        "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73"
+      ],
+      "management": {
+        "operations": 0,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "startpage/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "Startpage is a standalone web-search route"
+        }
+      }
     },
     {
       "id": "stepfun",
@@ -2192,6 +2480,30 @@
         "replacement": {
           "component": "tool-runtime",
           "reason": "Tavily is a web-search credential, not an inference provider"
+        }
+      }
+    },
+    {
+      "id": "tinyfish",
+      "name": "Tinyfish",
+      "auth": [
+        "auth-9b025bf0ed8e35682f2c91ab6b4eb8d53f557e8d94a8dff9bf4c1349865da6fd"
+      ],
+      "management": {
+        "operations": 8192,
+        "multiple_accounts": false,
+        "refresh": false,
+        "principal_quota": true
+      },
+      "routes": [
+        "tinyfish/primary"
+      ],
+      "wire_policy": "wire-sha256-d14ed2ba7dc54a5b56aa7fe0113bc209fae7f59ef2f82aad5ebcfc9ff338fb0d",
+      "discovery_defaults": null,
+      "mapping": {
+        "replacement": {
+          "component": "tool-runtime",
+          "reason": "TinyFish is a standalone web-search credential"
         }
       }
     },
@@ -3191,6 +3503,29 @@
       "signing": null
     },
     {
+      "id": "auth-27381281bfff02a0c8424efa70b4916cb29a0b70da69c9bb8c16bfc3b6b6fb69",
+      "kind": "api_key",
+      "header_name": "X-Subscription-Token",
+      "query_parameter": null,
+      "prefix": null,
+      "sealed_body": null,
+      "scopes": [],
+      "audience": null,
+      "account_scope": "provider",
+      "credential_sources": [
+        {
+          "environment": {
+            "ordered_names": [
+              "OMP_BRAVE_SEARCH_API_KEY"
+            ]
+          }
+        },
+        "stored"
+      ],
+      "oauth": null,
+      "signing": null
+    },
+    {
       "id": "auth-299304063b459f2fb8c1dff9d2cd70376e31bc31bb859646f0eec318b80a1c7c",
       "kind": "bearer",
       "header_name": "authorization",
@@ -3443,6 +3778,29 @@
       "signing": null
     },
     {
+      "id": "auth-488d882493579add6393c9d1e1bcafcd24f472306b3f729d93622c9b27f9216c",
+      "kind": "bearer",
+      "header_name": "authorization",
+      "query_parameter": null,
+      "prefix": "Bearer ",
+      "sealed_body": null,
+      "scopes": [],
+      "audience": null,
+      "account_scope": "provider",
+      "credential_sources": [
+        {
+          "environment": {
+            "ordered_names": [
+              "OMP_SEARXNG_API_KEY"
+            ]
+          }
+        },
+        "stored"
+      ],
+      "oauth": null,
+      "signing": null
+    },
+    {
       "id": "auth-5121f6561cb59390eaca191a436e747192d44aa066ec1b2edd84ee989af8d845",
       "kind": "bearer",
       "header_name": "authorization",
@@ -3593,6 +3951,29 @@
           "environment": {
             "ordered_names": [
               "OMP_STEP_API_KEY"
+            ]
+          }
+        },
+        "stored"
+      ],
+      "oauth": null,
+      "signing": null
+    },
+    {
+      "id": "auth-68e2c58931727cd680212a246279241599e9102fca0e6c2ddb599e940e198e2e",
+      "kind": "api_key",
+      "header_name": "Cookie",
+      "query_parameter": null,
+      "prefix": null,
+      "sealed_body": null,
+      "scopes": [],
+      "audience": null,
+      "account_scope": "provider",
+      "credential_sources": [
+        {
+          "environment": {
+            "ordered_names": [
+              "OMP_PERPLEXITY_COOKIE"
             ]
           }
         },
@@ -3977,6 +4358,29 @@
       "signing": null
     },
     {
+      "id": "auth-9b025bf0ed8e35682f2c91ab6b4eb8d53f557e8d94a8dff9bf4c1349865da6fd",
+      "kind": "bearer",
+      "header_name": "authorization",
+      "query_parameter": null,
+      "prefix": "Bearer ",
+      "sealed_body": null,
+      "scopes": [],
+      "audience": null,
+      "account_scope": "provider",
+      "credential_sources": [
+        {
+          "environment": {
+            "ordered_names": [
+              "OMP_TINYFISH_API_KEY"
+            ]
+          }
+        },
+        "stored"
+      ],
+      "oauth": null,
+      "signing": null
+    },
+    {
       "id": "auth-9fa26099aff711d0294a485e098135257a1e8d2ce911e679d93439db0638e851",
       "kind": "bearer",
       "header_name": "authorization",
@@ -3991,6 +4395,29 @@
           "environment": {
             "ordered_names": [
               "OMP_MINIMAX_CODE_API_KEY"
+            ]
+          }
+        },
+        "stored"
+      ],
+      "oauth": null,
+      "signing": null
+    },
+    {
+      "id": "auth-a01f80ff8df10765a0060ab70ddb30a68ea4607a32f6fec64cbd9be89f16984e",
+      "kind": "bearer",
+      "header_name": "authorization",
+      "query_parameter": null,
+      "prefix": "Bearer ",
+      "sealed_body": null,
+      "scopes": [],
+      "audience": null,
+      "account_scope": "provider",
+      "credential_sources": [
+        {
+          "environment": {
+            "ordered_names": [
+              "OMP_FIRECRAWL_API_KEY"
             ]
           }
         },
@@ -4530,6 +4957,29 @@
           "environment": {
             "ordered_names": [
               "OMP_PARALLEL_API_KEY"
+            ]
+          }
+        },
+        "stored"
+      ],
+      "oauth": null,
+      "signing": null
+    },
+    {
+      "id": "auth-cb131d4cd4c8eb03175b2be6bf82b0691c99efdef06b076b599454f8e0a64c76",
+      "kind": "bearer",
+      "header_name": "authorization",
+      "query_parameter": null,
+      "prefix": "Bearer ",
+      "sealed_body": null,
+      "scopes": [],
+      "audience": null,
+      "account_scope": "provider",
+      "credential_sources": [
+        {
+          "environment": {
+            "ordered_names": [
+              "OMP_JINA_API_KEY"
             ]
           }
         },
@@ -6923,6 +7373,36 @@
       "priority": null
     },
     {
+      "id": "brave/primary",
+      "provider": "brave",
+      "codec_profile": "standard",
+      "codec": "search-brave",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://api.search.brave.com",
+        "region": null
+      },
+      "auth": "auth-27381281bfff02a0c8424efa70b4916cb29a0b70da69c9bb8c16bfc3b6b6fb69",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://api.search.brave.com",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
       "id": "cerebras/primary",
       "provider": "cerebras",
       "codec_profile": "standard",
@@ -7193,6 +7673,66 @@
       "priority": null
     },
     {
+      "id": "duckduckgo/primary",
+      "provider": "duckduckgo",
+      "codec_profile": "standard",
+      "codec": "search-duckduckgo",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://html.duckduckgo.com",
+        "region": null
+      },
+      "auth": "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 1024,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://html.duckduckgo.com",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "ecosia/primary",
+      "provider": "ecosia",
+      "codec_profile": "standard",
+      "codec": "search-ecosia",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://www.ecosia.org",
+        "region": null
+      },
+      "auth": "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 1024,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://www.ecosia.org",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
       "id": "exa/primary",
       "provider": "exa",
       "codec_profile": "standard",
@@ -7215,6 +7755,36 @@
       },
       "trust_domain": {
         "origin": "https://api.exa.ai",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "firecrawl/primary",
+      "provider": "firecrawl",
+      "codec_profile": "standard",
+      "codec": "search-firecrawl",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://api.firecrawl.dev/v1",
+        "region": null
+      },
+      "auth": "auth-a01f80ff8df10765a0060ab70ddb30a68ea4607a32f6fec64cbd9be89f16984e",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://api.firecrawl.dev",
         "redirects": "same_origin",
         "allow_plaintext": false
       },
@@ -7553,6 +8123,36 @@
       "priority": null
     },
     {
+      "id": "google-search/primary",
+      "provider": "google-search",
+      "codec_profile": "standard",
+      "codec": "search-google",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://www.google.com",
+        "region": null
+      },
+      "auth": "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 1024,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://www.google.com",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
       "id": "google-vertex/primary",
       "provider": "google-vertex",
       "codec_profile": "standard",
@@ -7695,6 +8295,36 @@
       },
       "trust_domain": {
         "origin": "https://api.inceptionlabs.ai",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "jina/primary",
+      "provider": "jina",
+      "codec_profile": "standard",
+      "codec": "search-jina",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://s.jina.ai",
+        "region": null
+      },
+      "auth": "auth-cb131d4cd4c8eb03175b2be6bf82b0691c99efdef06b076b599454f8e0a64c76",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://s.jina.ai",
         "redirects": "same_origin",
         "allow_plaintext": false
       },
@@ -8055,6 +8685,36 @@
       },
       "trust_domain": {
         "origin": "https://api.mistral.ai",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "mojeek/primary",
+      "provider": "mojeek",
+      "codec_profile": "standard",
+      "codec": "search-mojeek",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://www.mojeek.com",
+        "region": null
+      },
+      "auth": "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 1024,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://www.mojeek.com",
         "redirects": "same_origin",
         "allow_plaintext": false
       },
@@ -8505,6 +9165,96 @@
       },
       "trust_domain": {
         "origin": "https://api.parallel.ai",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "perplexity-anonymous/primary",
+      "provider": "perplexity-anonymous",
+      "codec_profile": "standard",
+      "codec": "search-perplexity",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://www.perplexity.ai",
+        "region": null
+      },
+      "auth": "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 1024,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://www.perplexity.ai",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "perplexity-cookie/primary",
+      "provider": "perplexity-cookie",
+      "codec_profile": "standard",
+      "codec": "search-perplexity",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://www.perplexity.ai",
+        "region": null
+      },
+      "auth": "auth-68e2c58931727cd680212a246279241599e9102fca0e6c2ddb599e940e198e2e",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://www.perplexity.ai",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "perplexity-openrouter/primary",
+      "provider": "perplexity-openrouter",
+      "codec_profile": "standard",
+      "codec": "search-perplexity",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "region": null
+      },
+      "auth": "auth-6ffca619eb98a2bb086cc0143d85b2fcf1819a7bca4259247f397b258e476672",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://openrouter.ai",
         "redirects": "same_origin",
         "allow_plaintext": false
       },
@@ -12173,6 +12923,36 @@
       "priority": null
     },
     {
+      "id": "searxng/primary",
+      "provider": "searxng",
+      "codec_profile": "standard",
+      "codec": "search-searxng",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "http://127.0.0.1:8080",
+        "region": null
+      },
+      "auth": "auth-488d882493579add6393c9d1e1bcafcd24f472306b3f729d93622c9b27f9216c",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "http://127.0.0.1:8080",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
       "id": "siliconflow-cn/primary",
       "provider": "siliconflow-cn",
       "codec_profile": "standard",
@@ -12225,6 +13005,36 @@
       },
       "trust_domain": {
         "origin": "https://api.siliconflow.com",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "startpage/primary",
+      "provider": "startpage",
+      "codec_profile": "standard",
+      "codec": "search-startpage",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://www.startpage.com",
+        "region": null
+      },
+      "auth": "auth-ff0f08b1aa6194023a4e4fadb848e1a977cb9f23c42b5d9cda8ea2552d9d1f73",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 1024,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://www.startpage.com",
         "redirects": "same_origin",
         "allow_plaintext": false
       },
@@ -12345,6 +13155,36 @@
       },
       "trust_domain": {
         "origin": "https://api.tavily.com",
+        "redirects": "same_origin",
+        "allow_plaintext": false
+      },
+      "codex_transport": "http_only",
+      "use_responses_lite": false,
+      "priority": null
+    },
+    {
+      "id": "tinyfish/primary",
+      "provider": "tinyfish",
+      "codec_profile": "standard",
+      "codec": "search-tinyfish",
+      "transport": "http",
+      "endpoint": {
+        "base_url": "https://agent.tinyfish.ai/v1/search",
+        "region": null
+      },
+      "auth": "auth-9b025bf0ed8e35682f2c91ab6b4eb8d53f557e8d94a8dff9bf4c1349865da6fd",
+      "headers": "headers-sha256-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "discovery": null,
+      "capability_limits": {
+        "operations": 9216,
+        "maximum_context_tokens": null,
+        "maximum_output_tokens": null,
+        "disable_server_state": false,
+        "disable_prompt_caching": false,
+        "disable_strict_tools": false
+      },
+      "trust_domain": {
+        "origin": "https://agent.tinyfish.ai",
         "redirects": "same_origin",
         "allow_plaintext": false
       },

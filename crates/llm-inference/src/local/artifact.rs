@@ -34,6 +34,23 @@ use tokio::sync::Mutex;
 
 use super::runtime::{LocalCancellation, LocalError, LocalErrorKind, LocalResult};
 
+/// Decodes a compile-time lowercase or uppercase SHA-256 identity.
+///
+/// Catalogs use this instead of storing a second textual digest beside the
+/// fixed-size identity consumed by verification.
+pub const fn sha256_digest(hex: &[u8; 64]) -> [u8; 32] {
+	let mut digest = [0_u8; 32];
+	let mut index = 0;
+	while index < digest.len() {
+		digest[index] = match omp_core::hex::parse_byte([hex[index * 2], hex[index * 2 + 1]]) {
+			Ok(byte) => byte,
+			Err(_) => panic!("invalid catalog SHA-256"),
+		};
+		index += 1;
+	}
+	digest
+}
+
 /// Immutable expected identity of one local-model artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactSpec {

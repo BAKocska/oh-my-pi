@@ -44,11 +44,21 @@ use crate::{
 		openai_codex::OpenAiCodexCodec,
 		openai_embedding::OpenAiEmbeddingCodec,
 		openai_responses::OpenAiResponsesCodec,
+		search_brave::BraveSearchCodec,
+		search_duckduckgo::DuckduckgoSearchCodec,
+		search_ecosia::EcosiaSearchCodec,
 		search_exa::ExaSearchCodec,
+		search_firecrawl::FirecrawlSearchCodec,
+		search_google::GoogleSearchCodec,
+		search_jina::JinaSearchCodec,
 		search_kagi::KagiSearchCodec,
+		search_mojeek::MojeekSearchCodec,
 		search_parallel::ParallelSearchCodec,
 		search_perplexity::PerplexitySearchCodec,
+		search_searxng::SearxngSearchCodec,
+		search_startpage::StartpageSearchCodec,
 		search_tavily::TavilySearchCodec,
+		search_tinyfish::TinyfishSearchCodec,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	gate::GateCondition,
@@ -381,7 +391,7 @@ impl RouteComposer for ProductionRouteComposer {
 			crate::auth::spec::AuthSpec::from_catalog(auth, oauth, signing_region.clone())
 				.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
 		let mut auth_specs = vec![(route.auth.clone(), runtime_auth)];
-		if route.codec.as_str() == "anthropic" {
+		if matches!(route.codec.as_str(), "anthropic" | "search-perplexity") {
 			let provider = catalog
 				.provider(&route.provider)
 				.ok_or_else(|| unavailable(route, "catalog-provider-missing"))?;
@@ -399,7 +409,11 @@ impl RouteComposer for ProductionRouteComposer {
 				let runtime =
 					crate::auth::spec::AuthSpec::from_catalog(auth, oauth, signing_region.clone())
 						.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
-				auth_specs.push((auth_id.clone(), runtime));
+				if route.codec.as_str() == "search-perplexity" {
+					auth_specs.insert(0, (auth_id.clone(), runtime));
+				} else {
+					auth_specs.push((auth_id.clone(), runtime));
+				}
 			}
 		}
 		let account = RouteAccountSelector {
@@ -657,8 +671,29 @@ fn codec_binding(
 		("search-exa", CodecProfile::Standard) => {
 			(Arc::new(ExaSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
 		},
+		("search-brave", CodecProfile::Standard) => {
+			(Arc::new(BraveSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-duckduckgo", CodecProfile::Standard) => {
+			(Arc::new(DuckduckgoSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-ecosia", CodecProfile::Standard) => {
+			(Arc::new(EcosiaSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-firecrawl", CodecProfile::Standard) => {
+			(Arc::new(FirecrawlSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-jina", CodecProfile::Standard) => {
+			(Arc::new(JinaSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-google", CodecProfile::Standard) => {
+			(Arc::new(GoogleSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
 		("search-kagi", CodecProfile::Standard) => {
 			(Arc::new(KagiSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-mojeek", CodecProfile::Standard) => {
+			(Arc::new(MojeekSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
 		},
 		("search-parallel", CodecProfile::Standard) => {
 			(Arc::new(ParallelSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
@@ -666,8 +701,17 @@ fn codec_binding(
 		("search-perplexity", CodecProfile::Standard) => {
 			(Arc::new(PerplexitySearchCodec), operation_bits(&[OperationKind::Search]), None, false)
 		},
+		("search-searxng", CodecProfile::Standard) => {
+			(Arc::new(SearxngSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-startpage", CodecProfile::Standard) => {
+			(Arc::new(StartpageSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
 		("search-tavily", CodecProfile::Standard) => {
 			(Arc::new(TavilySearchCodec), operation_bits(&[OperationKind::Search]), None, false)
+		},
+		("search-tinyfish", CodecProfile::Standard) => {
+			(Arc::new(TinyfishSearchCodec), operation_bits(&[OperationKind::Search]), None, false)
 		},
 		_ => return Err(unavailable(route, "codec-or-profile-not-implemented")),
 	};

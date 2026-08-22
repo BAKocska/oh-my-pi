@@ -505,6 +505,54 @@ impl AccountStateStore {
 		Ok(())
 	}
 
+	/// Invalidates durable rate and quota observations without touching account
+	/// ownership, credentials, affinities, or rejection history.
+	pub fn invalidate_usage(
+		&self,
+		provider: Option<&ProviderId<str>>,
+		account: Option<&AccountId<str>>,
+	) -> Result<usize, AccountStateStoreError> {
+		let _guard = self.writes.lock();
+		let mut connection = self.connection()?;
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		let (rate, quota) = if let Some(account) = account {
+			(
+				transaction
+					.execute("DELETE FROM account_state_rate_receipts WHERE account_id = ?1", [
+						account.as_str(),
+					])?,
+				transaction
+					.execute("DELETE FROM account_state_quota_receipts WHERE account_id = ?1", [
+						account.as_str(),
+					])?,
+			)
+		} else if let Some(provider) = provider {
+			(
+				transaction.execute(
+					"DELETE FROM account_state_rate_receipts
+					 WHERE account_id IN (
+						SELECT account_id FROM account_state_accounts WHERE provider_id = ?1
+					 )",
+					[provider.as_str()],
+				)?,
+				transaction.execute(
+					"DELETE FROM account_state_quota_receipts
+					 WHERE account_id IN (
+						SELECT account_id FROM account_state_accounts WHERE provider_id = ?1
+					 )",
+					[provider.as_str()],
+				)?,
+			)
+		} else {
+			(
+				transaction.execute("DELETE FROM account_state_rate_receipts", [])?,
+				transaction.execute("DELETE FROM account_state_quota_receipts", [])?,
+			)
+		};
+		transaction.commit()?;
+		Ok(rate.saturating_add(quota))
+	}
+
 	/// Appends one partial rate receipt atomically.
 	pub fn append_rate(
 		&self,

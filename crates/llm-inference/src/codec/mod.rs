@@ -56,11 +56,23 @@ pub mod devin;
 pub mod gitlab;
 pub mod native;
 pub mod omp_native;
+pub mod search_brave;
+pub mod search_duckduckgo;
+pub mod search_ecosia;
 pub mod search_exa;
+pub mod search_firecrawl;
+pub mod search_google;
+pub mod search_jina;
+mod search_json;
 pub mod search_kagi;
+pub mod search_mojeek;
 pub mod search_parallel;
 pub mod search_perplexity;
+mod search_scraper;
+pub mod search_searxng;
+pub mod search_startpage;
 pub mod search_tavily;
+pub mod search_tinyfish;
 /// HTTP method used by a wire request without pulling policy into the
 /// transport.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1038,6 +1050,15 @@ mod tests {
 			"openai-codex" => openai_codex::resolve_codex_responses_url(base),
 			"openai-responses" => openai_responses::responses_uri(base),
 			"search-exa" | "search-kagi" | "search-tavily" => openai_chat::join_uri(base, "/search"),
+			"search-firecrawl" => openai_chat::join_uri(base, "/search"),
+			"search-brave" => openai_chat::join_uri(base, "/res/v1/web/search"),
+			"search-duckduckgo" => openai_chat::join_uri(base, "/html/"),
+			"search-google" | "search-ecosia" | "search-mojeek" => {
+				openai_chat::join_uri(base, "/search")
+			},
+			"search-startpage" => openai_chat::join_uri(base, "/sp/search"),
+			"search-jina" | "search-tinyfish" => Str::new(base),
+			"search-searxng" => openai_chat::join_uri(base, "/search"),
 			"search-parallel" => openai_chat::join_uri(base, "/v1beta/search"),
 			"search-perplexity" => openai_chat::join_uri(base, "/chat/completions"),
 			unknown => panic!("embedded route uses unaudited codec {unknown}"),

@@ -14,9 +14,13 @@ use llama_cpp_2::{
 use omp_core::Str;
 use xutf::{Encoding, Utf8};
 
-use super::runtime::{
-	LocalCancellation, LocalError, LocalErrorKind, LocalExecutionReceipt, LocalResult, LocalRuntime,
-	MemoryPool,
+use super::{
+	artifact::ArtifactStore,
+	runtime::{
+		LocalCancellation, LocalError, LocalErrorKind, LocalExecutionReceipt, LocalResult,
+		LocalRuntime, MemoryPool,
+	},
+	tiny_catalog::TinyModelSpec,
 };
 
 /// Role of one local chat message.
@@ -59,22 +63,92 @@ pub struct TextConfig {
 	pub idle_timeout:    Duration,
 }
 
+impl TextConfig {
+	/// Verifies and binds one curated tiny-model GGUF artifact.
+	pub fn from_verified_artifact(
+		store: &ArtifactStore,
+		spec: &TinyModelSpec,
+		threads: usize,
+		gpu_layers: u32,
+		idle_timeout: Duration,
+		cancel: &LocalCancellation,
+	) -> LocalResult<Self> {
+		let manifest = spec.manifest().map_err(|_| {
+			LocalError::new(LocalErrorKind::Artifact, "invalid curated tiny-model manifest")
+		})?;
+		let shard = manifest.shards.first().ok_or_else(|| {
+			LocalError::new(LocalErrorKind::Artifact, "tiny-model manifest contains no GGUF")
+		})?;
+		let artifact = store.verify(&shard.spec, cancel)?;
+		let resident_bytes = usize::try_from(shard.spec.bytes).map_err(|_| {
+			LocalError::new(LocalErrorKind::Overloaded, "tiny-model GGUF exceeds address space")
+		})?;
+		Ok(Self {
+			model_path: artifact.path().to_path_buf(),
+			context_tokens: spec.context_tokens,
+			threads,
+			gpu_layers,
+			resident_bytes,
+			max_concurrency: 1,
+			idle_timeout,
+		})
+	}
+}
+
 /// Sampling controls implemented by the llama.cpp adapter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationOptions {
 	/// Maximum newly generated tokens.
-	pub max_tokens:  usize,
+	pub max_tokens:       usize,
 	/// Optional non-negative temperature; zero is greedy.
-	pub temperature: Option<f32>,
+	pub temperature:      Option<f32>,
 	/// Sampling seed.
-	pub seed:        u32,
+	pub seed:             u32,
 	/// Stop sequences withheld from output.
-	pub stop:        Vec<Str>,
+	pub stop:             Vec<Str>,
+	/// Assistant prefix appended after the structural chat template.
+	pub prefill:          Option<Str>,
+	/// Injects an explicit no-reasoning template instruction.
+	pub disable_thinking: bool,
 }
 
 impl Default for GenerationOptions {
 	fn default() -> Self {
-		Self { max_tokens: 256, temperature: None, seed: 0, stop: Vec::new() }
+		Self {
+			max_tokens:       256,
+			temperature:      None,
+			seed:             0,
+			stop:             Vec::new(),
+			prefill:          None,
+			disable_thinking: false,
+		}
+	}
+}
+
+impl GenerationOptions {
+	/// Pi-parity bounded title generation: no thinking, `<title>` prefill,
+	/// withheld closing marker, and a hard twenty-token completion cap.
+	pub fn title() -> Self {
+		Self {
+			max_tokens:       20,
+			temperature:      None,
+			seed:             0,
+			stop:             vec![Str::new_static("</title>")],
+			prefill:          Some(Str::new_static("<title>")),
+			disable_thinking: true,
+		}
+	}
+
+	/// Bounded memory extraction/consolidation completion options.
+	pub fn memory(max_tokens: usize) -> Self {
+		Self {
+			max_tokens:       max_tokens.clamp(1, 512),
+			temperature:      None,
+			seed:             0,
+			stop:             Vec::new(),
+			prefill:          None,
+			disable_thinking: true,
+		}
 	}
 }
 
@@ -254,6 +328,9 @@ impl TextAdapter {
 		let lease = self.runtime.acquire(cancel)?;
 		let receipt = lease.receipt();
 		let mut content = String::new();
+		if let Some(prefill) = options.prefill.as_ref() {
+			content.push_str(prefill.as_str());
+		}
 		let (prompt_tokens, output_tokens) = lease.with_engine(|engine| {
 			generate(engine, messages, &options, cancel, &mut |delta| {
 				content.push_str(delta);
@@ -300,10 +377,12 @@ impl TextAdapter {
 		let output = self.generate(
 			&constrained,
 			GenerationOptions {
-				max_tokens:  16,
-				temperature: None,
-				seed:        0,
-				stop:        Vec::new(),
+				max_tokens:       16,
+				temperature:      None,
+				seed:             0,
+				stop:             Vec::new(),
+				prefill:          None,
+				disable_thinking: true,
 			},
 			cancel,
 			|_| true,
@@ -315,6 +394,21 @@ impl TextAdapter {
 				label,
 				source: ClassifierDecisionSource::Model,
 			}))
+	}
+
+	/// Loads the GGUF model ahead of the first request.
+	pub fn prewarm(&self, cancel: &LocalCancellation) -> LocalResult<LocalExecutionReceipt> {
+		self.runtime.prewarm(cancel)
+	}
+
+	/// Returns the blacklisted first-load failure, if loading has failed.
+	pub fn load_failure(&self) -> Option<LocalError> {
+		self.runtime.load_failure()
+	}
+
+	/// Clears the failure blacklist after explicit artifact/config repair.
+	pub fn clear_load_failure(&self) -> bool {
+		self.runtime.clear_load_failure()
 	}
 
 	/// Unloads the model when no call is active and its idle interval elapsed.
@@ -335,28 +429,43 @@ fn generate(
 	cancel: &LocalCancellation,
 	emit: &mut dyn FnMut(&str) -> bool,
 ) -> LocalResult<(u64, u64)> {
-	let chat = messages
-		.iter()
-		.map(|message| {
-			let role = match message.role {
-				ChatRole::System => "system",
-				ChatRole::User => "user",
-				ChatRole::Assistant => "assistant",
-			};
-			LlamaChatMessage::new(role.to_owned(), message.content.to_string()).map_err(|error| {
+	let mut chat = Vec::with_capacity(messages.len() + usize::from(options.disable_thinking));
+	if options.disable_thinking {
+		chat.push(
+			LlamaChatMessage::new(
+				"system".to_owned(),
+				"Thinking is disabled. Answer directly and never emit reasoning or <think> tags."
+					.to_owned(),
+			)
+			.map_err(|error| {
 				LocalError::new(LocalErrorKind::InvalidInput, format!("chat message failed: {error}"))
-			})
-		})
-		.collect::<LocalResult<Vec<_>>>()?;
+			})?,
+		);
+	}
+	for message in messages {
+		let role = match message.role {
+			ChatRole::System => "system",
+			ChatRole::User => "user",
+			ChatRole::Assistant => "assistant",
+		};
+		chat.push(LlamaChatMessage::new(role.to_owned(), message.content.to_string()).map_err(
+			|error| {
+				LocalError::new(LocalErrorKind::InvalidInput, format!("chat message failed: {error}"))
+			},
+		)?);
+	}
 	let template = engine.model.chat_template(None).map_err(|error| {
 		LocalError::new(LocalErrorKind::Backend, format!("chat template failed: {error}"))
 	})?;
-	let prompt = engine
+	let mut prompt = engine
 		.model
 		.apply_chat_template(&template, &chat, true)
 		.map_err(|error| {
 			LocalError::new(LocalErrorKind::Backend, format!("chat rendering failed: {error}"))
 		})?;
+	if let Some(prefill) = options.prefill.as_ref() {
+		prompt.push_str(prefill.as_str());
+	}
 	let tokens = engine
 		.model
 		.str_to_token(&prompt, AddBos::Always)
@@ -576,7 +685,7 @@ mod tests {
 
 	use omp_core::sf;
 
-	use super::ClassifierLadder;
+	use super::{ClassifierLadder, GenerationOptions};
 
 	#[test]
 	fn classifier_ladder_uses_earliest_accepted_label() {
@@ -591,5 +700,17 @@ mod tests {
 	fn classifier_ladder_rejects_an_open_vocabulary() {
 		assert!(ClassifierLadder::new(Arc::from([sf!("allow"), sf!("allow")])).is_err());
 		assert!(ClassifierLadder::new(Arc::from([])).is_err());
+	}
+	#[test]
+	fn title_and_memory_options_are_bounded_and_disable_thinking() {
+		let title = GenerationOptions::title();
+		assert_eq!(title.max_tokens, 20);
+		assert_eq!(title.prefill.as_deref(), Some("<title>"));
+		assert_eq!(title.stop.as_slice(), [sf!("</title>")]);
+		assert!(title.disable_thinking);
+
+		assert_eq!(GenerationOptions::memory(0).max_tokens, 1);
+		assert_eq!(GenerationOptions::memory(4_096).max_tokens, 512);
+		assert!(GenerationOptions::memory(64).disable_thinking);
 	}
 }

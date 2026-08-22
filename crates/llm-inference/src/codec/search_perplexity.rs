@@ -57,7 +57,12 @@ impl Codec for PerplexitySearchCodec {
 		let OperationCall::Search(request) = operation else {
 			return Err(codec_error("perplexity_search_operation_required"));
 		};
-		let body = serde_json::to_vec(&PerplexityRequest::from_search(request)?)
+		let model = if context.route.provider.as_str() == "perplexity-openrouter" {
+			"perplexity/sonar"
+		} else {
+			"sonar"
+		};
+		let body = serde_json::to_vec(&PerplexityRequest::from_search(request, model)?)
 			.map_err(|_| encoding_error("perplexity_search_request_serialization_failed"))?;
 		if body.len() as u64 > MAX_REQUEST_BYTES {
 			return Err(encoding_error("perplexity_search_request_too_large"));
@@ -97,7 +102,7 @@ impl Codec for PerplexitySearchCodec {
 
 #[derive(Debug, Serialize)]
 struct PerplexityRequest<'a> {
-	model:                  &'static str,
+	model:                  &'a str,
 	messages:               [PerplexityMessage<'a>; 1],
 	#[serde(skip_serializing_if = "Option::is_none")]
 	search_domain_filter:   Option<Vec<String>>,
@@ -114,7 +119,7 @@ struct PerplexityMessage<'a> {
 }
 
 impl<'a> PerplexityRequest<'a> {
-	fn from_search(request: &'a SearchRequest) -> Result<Self, Error> {
+	fn from_search(request: &'a SearchRequest, model: &'a str) -> Result<Self, Error> {
 		let mut domains = Vec::with_capacity(
 			request
 				.include_domains
@@ -140,7 +145,7 @@ impl<'a> PerplexityRequest<'a> {
 			.transpose()?
 			.map(|language| [language]);
 		Ok(Self {
-			model: "sonar",
+			model,
 			messages: [PerplexityMessage { role: "user", content: request.query.as_str() }],
 			search_domain_filter,
 			search_recency_filter,

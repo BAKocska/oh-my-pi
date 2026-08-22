@@ -10,6 +10,9 @@ pub mod artifact;
 pub mod embedding;
 /// Shared admission, memory, cancellation, and idle-unload lifecycle.
 pub mod runtime;
+/// sherpa-onnx Parakeet speech recognition.
+#[cfg(feature = "local-stt")]
+pub mod sherpa;
 /// Backend-neutral speech catalog and artifact-backed cache snapshots.
 pub mod speech_catalog;
 /// Whisper.cpp speech recognition.
@@ -18,6 +21,8 @@ pub mod stt;
 /// llama.cpp GGUF text generation.
 #[cfg(feature = "local-text")]
 pub mod text;
+/// Curated GGUF title, memory, and classifier artifacts.
+pub mod tiny_catalog;
 /// Kokoro-82M speech synthesis.
 #[cfg(feature = "local-tts")]
 pub mod tts;
@@ -27,6 +32,7 @@ pub use artifact::{
 	ArtifactFetchResponse, ArtifactFetcher, ArtifactIoOperation, ArtifactManifest,
 	ArtifactManifestReceipt, ArtifactProgress, ArtifactReceipt, ArtifactResult, ArtifactShard,
 	ArtifactSpec, ArtifactStore, SystemArtifactBody, SystemArtifactFetcher, VerifiedArtifact,
+	sha256_digest,
 };
 pub use runtime::{
 	AdmissionControl, AvailabilityEvidence, LocalCancellation, LocalError, LocalErrorKind,
@@ -41,4 +47,9 @@ pub use speech_catalog::{
 	SpeechToTextModelOption, SpeechVoiceOption, SttPreset, TTS_MODEL_SETTING, TTS_PROVIDER_SETTING,
 	TTS_VOICE_SETTING, TextToSpeechCatalog, TextToSpeechModelOption, XAI_VOICES, XaiSpeechCatalog,
 	XaiVoice,
+};
+pub use tiny_catalog::{
+	CLASSIFIER_MODELS, DEFAULT_MEMORY_LOCAL_MODEL, DEFAULT_TITLE_LOCAL_MODEL, MEMORY_MODEL_SETTING,
+	MEMORY_MODELS, ONLINE_TINY_MODEL, TINY_MODEL_SETTING, TITLE_MODELS, TinyArtifact,
+	TinyBlockedEvidence, TinyModelSpec, TinyWorkload, model as tiny_model, models as tiny_models,
 };

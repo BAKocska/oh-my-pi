@@ -53,11 +53,11 @@ pub const ORACLE_RAW_MODELS: usize = 4_302;
 /// Verified normalized logical model count of the checked-in oracle.
 pub const ORACLE_LOGICAL_MODELS: usize = 4_225;
 /// Verified curated provider count.
-pub const ORACLE_PROVIDERS: usize = 94;
+pub const ORACLE_PROVIDERS: usize = 107;
 /// Verified number of provider keys present in raw model records.
 pub const ORACLE_RAW_PROVIDER_KEYS: usize = 80;
 /// Verified number of distinct route URLs.
-pub const ORACLE_URLS: usize = 108;
+pub const ORACLE_URLS: usize = 118;
 /// Full transport vocabulary size in the oracle.
 pub const ORACLE_TRANSPORTS: usize = 16;
 /// Transport variants active in the checked-in oracle.
