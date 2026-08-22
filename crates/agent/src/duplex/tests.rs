@@ -416,6 +416,7 @@ async fn dropping_manager_interrupts_active_tasks_before_sender_destruction() {
 		drop(responses);
 	});
 	manager.start(invoke("invoke-drop", "call-drop", 4));
+	tokio::task::yield_now().await;
 	drop(manager);
 	tokio::task::spawn_blocking(move || server.join())
 		.await

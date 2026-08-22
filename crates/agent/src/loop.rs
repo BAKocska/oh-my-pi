@@ -9,7 +9,7 @@ use std::{
 use futures::StreamExt;
 use omp_core::{Hash32, IntoStr, InvocationPhase, Point, Str, sf};
 use omp_env::EnvClient;
-use omp_llm_inference::{TurnId, layer::secrets::SecretStreamRestorer};
+use omp_inference::{TurnId, layer::secrets::SecretStreamRestorer};
 use omp_proto::{
 	inference::v1::{self as pb, ContextRef, Outcome, ThreadDelta},
 	thread::v1::{self as thread, Item, Thread},
@@ -35,13 +35,12 @@ use serde_json::{Value, value::RawValue};
 use thiserror::Error;
 
 use crate::{
-	AgentRegistry, BatchError, CompactionCancellation, CompactionCoordinator,
-	CompactionMethodOrder, CompactionTier,
-	Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode, ManualCompactionOutcome,
-	ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError,
-	PromptMemoryQuery, PromptMemorySnapshotSource, SnapcompactPreparation, TtsrMatch, TtsrRegistry,
-	TtsrSource, TurnClient, TurnInput, TurnSession, YieldPayload, YieldPayloadError,
-	YieldPayloadValidator,
+	AgentRegistry, BatchError, CompactionCancellation, CompactionCoordinator, CompactionMethodOrder,
+	CompactionTier, Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode,
+	ManualCompactionOutcome, ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome,
+	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource,
+	SnapcompactPreparation, TtsrMatch, TtsrRegistry, TtsrSource, TurnClient, TurnInput, TurnSession,
+	YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	arbiter::{
 		Arbiter, PointCx,
 		context::{compaction_instruction, recover_checkpoint_state, rewind_background_warning},
@@ -343,6 +342,37 @@ enum DriveSessionResult {
 	Complete(Outcome, BTreeMap<Str, SpeculativeCall>),
 	Ttsr(TtsrCampaignCut),
 }
+/// Cloneable request handle for state owned by the live agent loop.
+#[derive(Clone)]
+pub struct AgentHostControl {
+	commands: flume::Sender<AgentHostCommand>,
+}
+
+struct AgentHostCommand {
+	operation: Str,
+	arguments: serde_json::Map<String, Value>,
+	reply:     flume::Sender<Result<Value, Str>>,
+}
+
+impl AgentHostControl {
+	/// Executes one correlated host lifecycle request on the sole mutable owner.
+	pub async fn request(
+		&self,
+		operation: impl Into<Str>,
+		arguments: serde_json::Map<String, Value>,
+	) -> Result<Value, Str> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send_async(AgentHostCommand { operation: operation.into(), arguments, reply })
+			.await
+			.map_err(|_| sf!("agent loop is no longer live"))?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| sf!("agent loop stopped before servicing host lifecycle state"))?
+	}
+}
 
 impl Drop for RunActivityGuard {
 	fn drop(&mut self) {
@@ -364,6 +394,8 @@ pub struct Agent<C: TurnClient> {
 	invocation_fact_rx: flume::Receiver<InvocationAdmissionFact>,
 	control_tx: ControlSender,
 	control_mailbox: ControlMailbox,
+	host_control: AgentHostControl,
+	host_commands: flume::Receiver<AgentHostCommand>,
 	checkpoint_state: Arc<Mutex<CheckpointState>>,
 	arbiter: Arbiter,
 	tool_choices: crate::tool_choice::ToolChoiceQueue,
@@ -384,6 +416,7 @@ pub struct Agent<C: TurnClient> {
 	settled_gate: Option<Arc<HookGate>>,
 	provider_error_gate: Option<Arc<HookGate>>,
 	continuations: ContinuationLedger,
+	continuation_policies: BTreeMap<Str, ContinuationPolicy>,
 	legacy_session_stop: crate::LegacySessionStopCampaign,
 	continuation_source: Option<Arc<dyn ContinuationSource>>,
 	redemption_authority: Option<Arc<dyn RedemptionAuthority>>,
@@ -399,7 +432,7 @@ pub struct Agent<C: TurnClient> {
 	autolearn: Option<crate::AutolearnController>,
 }
 
-impl<C: TurnClient> Agent<C> {
+impl<C: TurnClient + Clone> Agent<C> {
 	/// Constructs an agent with stable state, event, mailbox, and job handles.
 	pub fn new(
 		client: C,
@@ -415,6 +448,9 @@ impl<C: TurnClient> Agent<C> {
 		let (hook_bus, hook_requests) = InvocationHookBus::channel();
 		let (invocation_fact_tx, invocation_fact_rx) = flume::unbounded();
 		let (control_tx, control_mailbox) = crate::control::channel();
+		let (host_commands_tx, host_commands) = flume::unbounded();
+		let host_control = AgentHostControl { commands: host_commands_tx };
+		control_tx.bind_host_control(host_control.clone());
 		let checkpoint_state = control_tx.checkpoint_state();
 		let mut context = None;
 		let mut prompt_hash = None;
@@ -466,6 +502,8 @@ impl<C: TurnClient> Agent<C> {
 			invocation_fact_rx,
 			control_tx,
 			control_mailbox,
+			host_control,
+			host_commands,
 			checkpoint_state,
 			arbiter: Arbiter::new(),
 			tool_choices: crate::tool_choice::ToolChoiceQueue::new(),
@@ -486,6 +524,7 @@ impl<C: TurnClient> Agent<C> {
 			settled_gate: None,
 			provider_error_gate: None,
 			continuations: ContinuationLedger::new(8),
+			continuation_policies: BTreeMap::new(),
 			legacy_session_stop: crate::LegacySessionStopCampaign::default(),
 			continuation_source: None,
 			redemption_authority: None,
@@ -590,6 +629,12 @@ impl<C: TurnClient> Agent<C> {
 	/// Returns a sender for authenticated extension CONTROL operations.
 	pub fn control(&self) -> ControlSender {
 		self.control_tx.clone()
+	}
+
+	/// Returns the live host authority for lifecycle state that cannot be
+	/// reconstructed from configuration snapshots.
+	pub fn host_control(&self) -> AgentHostControl {
+		self.host_control.clone()
 	}
 
 	/// Installs the fail-open `agent_settled` hook gate for this durable loop.
@@ -893,7 +938,9 @@ impl<C: TurnClient> Agent<C> {
 			let preparation = SnapcompactPreparation {
 				text: Str::from(source),
 				source_tokens,
-				provider: model.split_once('/').map(|(provider, _)| Str::new(provider)),
+				provider: model
+					.split_once('/')
+					.map(|(provider, _)| Str::new(provider)),
 				api: None,
 				model_id: Some(Str::from(model)),
 				existing_images: 0,
@@ -1076,7 +1123,7 @@ impl<C: TurnClient> Agent<C> {
 		}
 		Ok(targets)
 	}
-	
+
 	/// Rewinds to and resubmits the latest live user turn.
 	///
 	/// Returns `None` when the transcript has no retryable user turn. The
@@ -1096,9 +1143,7 @@ impl<C: TurnClient> Agent<C> {
 			created_at_ms: now_ms(),
 			kind:          Some(thread::item::Kind::Message(thread::Message {
 				role:  i32::from(thread::Role::User),
-				parts: vec![thread::Part {
-					kind: Some(thread::part::Kind::Text(text.to_string())),
-				}],
+				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
 			})),
 			props:         None,
 		};
@@ -1572,6 +1617,12 @@ impl<C: TurnClient> Agent<C> {
 								aborted = true;
 								interrupt_tx.send_replace(Some(sf!("user interrupt")));
 							},
+							command = self.host_commands.recv_async() => {
+								if let Ok(command) = command {
+									self.handle_host_control(command);
+									self.control_serviced_during_turn = true;
+								}
+							},
 							event = self.control_mailbox.handle_next(&mut self.journal) => {
 								match event {
 									ControlMailboxEvent::Closed => std::future::pending::<()>().await,
@@ -1934,6 +1985,11 @@ impl<C: TurnClient> Agent<C> {
 			&& let Continuation::Continue { item, .. } = &mut candidate
 		{
 			*item = recovery_prompt_item(crate::prompt_assets::PromptAssetId::ThinkingLoopRedirect);
+		}
+		if let Continuation::Continue { owner, .. } = &candidate
+			&& let Some(owner_policy) = self.continuation_policies.get(owner)
+		{
+			policy = *owner_policy;
 		}
 		match self
 			.continuations
@@ -2475,13 +2531,24 @@ impl<C: TurnClient> Agent<C> {
 		enabled_tools: Arc<[Str]>,
 		enforce_ttsr: bool,
 	) -> Result<DriveSessionResult, TurnError> {
+		// The opened turn future borrows the client for the whole drive, while
+		// host control commands need `&mut self`; driving it through a cloned
+		// handle keeps those borrows disjoint. Turn clients are cheap-clone
+		// handles.
 		let pending_tool_results = turn_input_has_tool_results(&input);
 		let stream_recovery_mailbox = self.mailbox.sender();
-		let opening = self.client.turn(turn_id.clone(), input, options);
+		let client = self.client.clone();
+		let opening = client.turn(turn_id.clone(), input, options);
 		tokio::pin!(opening);
 		let mut session = loop {
 			tokio::select! {
 				session = &mut opening => break session?,
+				command = self.host_commands.recv_async() => {
+					if let Ok(command) = command {
+						self.handle_host_control(command);
+						self.control_serviced_during_turn = true;
+					}
+				},
 				event = self.control_mailbox.handle_next(&mut self.journal) => {
 					match event {
 						ControlMailboxEvent::Closed => std::future::pending::<()>().await,
@@ -2529,6 +2596,16 @@ impl<C: TurnClient> Agent<C> {
 							pending_tool_results,
 						));
 					},
+					command = self.host_commands.recv_async() => {
+						match command {
+							Ok(command) => {
+								self.handle_host_control(command);
+								self.control_serviced_during_turn = true;
+								continue;
+							},
+							Err(_) => std::future::pending().await,
+						}
+					},
 					event = self.control_mailbox.handle_next(&mut self.journal) => {
 						match event {
 							ControlMailboxEvent::Closed => std::future::pending().await,
@@ -2566,6 +2643,16 @@ impl<C: TurnClient> Agent<C> {
 								saw_stream_event,
 								pending_tool_results,
 							));
+						},
+						command = self.host_commands.recv_async() => {
+							match command {
+								Ok(command) => {
+									self.handle_host_control(command);
+									self.control_serviced_during_turn = true;
+									continue;
+								},
+								Err(_) => std::future::pending().await,
+							}
 						},
 						event = self.control_mailbox.handle_next(&mut self.journal) => {
 							match event {
@@ -2874,6 +2961,9 @@ impl<C: TurnClient> Agent<C> {
 	}
 
 	fn drain_control(&mut self) {
+		while let Ok(command) = self.host_commands.try_recv() {
+			self.handle_host_control(command);
+		}
 		let mut campaigns = Vec::new();
 		self.control_mailbox.drain_ready(
 			&mut self.journal,
@@ -2889,6 +2979,259 @@ impl<C: TurnClient> Agent<C> {
 				campaign,
 			);
 		}
+	}
+
+	fn handle_host_control(&mut self, command: AgentHostCommand) {
+		let result = match command.operation.as_str() {
+			"omp.context.view" => self.context_control_view(),
+			"omp.context.usage" => self.context_control_view().and_then(|view| {
+				view
+					.get("usage")
+					.cloned()
+					.ok_or_else(|| sf!("context usage projection is missing"))
+			}),
+			"omp.context.epoch" => Ok(Value::from(self.journal.context_position().epoch)),
+			"omp.context.message.parts" => self.context_control_item(&command.arguments).map(|item| {
+				let parts = match item.kind.as_ref() {
+					Some(thread::item::Kind::Message(message)) => message.parts.as_slice(),
+					Some(thread::item::Kind::ToolResult(result)) => result.parts.as_slice(),
+					_ => &[],
+				};
+				Value::Array(parts.iter().filter_map(context_part_json).collect())
+			}),
+			"omp.context.message.raw_args" => {
+				self
+					.context_control_item(&command.arguments)
+					.map(|item| match item.kind {
+						Some(thread::item::Kind::ToolCall(call)) => call.raw.map_or(Value::Null, |raw| {
+							serde_json::json!({
+								"base64": omp_core::base64::encode(raw.as_ref())
+							})
+						}),
+						_ => Value::Null,
+					})
+			},
+			"omp.context.message.verdict" => {
+				self
+					.context_control_item(&command.arguments)
+					.and_then(|item| {
+						let Some(thread::item::Kind::ToolResult(result)) = item.kind else {
+							return Err(sf!("NoVerdict: context item is not a tool result"));
+						};
+						result
+							.details
+							.as_ref()
+							.and_then(context_proto_value_json)
+							.ok_or_else(|| sf!("NoVerdict: context item has no structured verdict"))
+					})
+			},
+			"omp.agents.continuations" => Ok(serde_json::json!({
+				"consecutive": self.continuations.consecutive,
+				"total": self.continuations.total,
+				"cap": self.continuations.cap,
+				"last_ms": self.continuations.last_ms,
+				"refusals": self.continuations.refusals,
+				"owner": self.continuations.owner,
+			})),
+			"omp.agents.loop_signal" => Ok(serde_json::json!({
+				"repeats": self.loop_signal.repeats,
+				"digest": self.loop_signal.digest,
+				"no_progress_turns": self.loop_signal.no_progress_turns,
+				"empty_output_retries": self.loop_signal.empty_output_retries,
+				"stalled": self.loop_signal.stalled,
+			})),
+			"omp.agents.set_continuation_policy" => {
+				let owner = command
+					.arguments
+					.get("_owner")
+					.and_then(Value::as_str)
+					.map(Str::from)
+					.ok_or_else(|| sf!("continuation policy owner is required"));
+				let policy = command.arguments.get("policy").and_then(Value::as_object);
+				match (owner, policy) {
+					(Ok(owner), Some(policy)) => {
+						let on_exhausted = policy
+							.get("on_exhausted")
+							.and_then(Value::as_str)
+							.unwrap_or("stop");
+						self
+							.continuation_policies
+							.insert(owner, ContinuationPolicy {
+								max_consecutive:  policy
+									.get("max_consecutive")
+									.and_then(Value::as_u64)
+									.unwrap_or(8)
+									.min(u64::from(u32::MAX)) as u32,
+								max_total:        policy.get("max_total").and_then(Value::as_u64),
+								min_interval:     Duration::from_millis(
+									policy
+										.get("min_interval_ms")
+										.and_then(Value::as_u64)
+										.unwrap_or(0),
+								),
+								notify_exhausted: on_exhausted == "notify",
+							});
+						Ok(Value::Null)
+					},
+					(Err(error), _) => Err(error),
+					(_, None) => Err(sf!("continuation policy is required")),
+				}
+			},
+			"omp.agents.rewind_targets" => self
+				.rewind_targets()
+				.map(|targets| {
+					Value::Array(
+						targets
+							.into_iter()
+							.map(|target| {
+								serde_json::json!({
+									"event": target.event,
+									"keep": target.keep,
+									"text": target.text,
+									"ts_ms": 0,
+									"snapshot_id": null,
+								})
+							})
+							.collect(),
+					)
+				})
+				.map_err(|error| Str::from(error.to_string())),
+			"omp.agents.rewind" => {
+				let target = command.arguments.get("to").and_then(Value::as_u64);
+				let before = self
+					.rewind_targets()
+					.map(|targets| targets.len())
+					.unwrap_or(0);
+				if command
+					.arguments
+					.get("dry_run")
+					.and_then(Value::as_bool)
+					.unwrap_or(false)
+				{
+					let _ = command.reply.send(Ok(serde_json::json!({
+						"head": target.unwrap_or(0),
+						"dropped_items": before,
+						"scope": "thread",
+						"restore": null,
+						"dry_run": true,
+					})));
+					return;
+				}
+				self
+					.rewind(target)
+					.map(|items| {
+						serde_json::json!({
+							"head": target.unwrap_or(0),
+							"dropped_items": before.saturating_sub(
+								self.rewind_targets().map(|targets| targets.len()).unwrap_or(0),
+							),
+							"scope": "thread",
+							"restore": null,
+							"dry_run": command
+								.arguments
+								.get("dry_run")
+								.and_then(Value::as_bool)
+								.unwrap_or(false),
+							"items": items.len(),
+						})
+					})
+					.map_err(|error| Str::from(error.to_string()))
+			},
+			_ => Err(sf!("unknown agent host lifecycle operation")),
+		};
+		let _ = command.reply.send(result);
+	}
+
+	fn context_control_view(&self) -> Result<Value, Str> {
+		let events = self
+			.journal
+			.live_item_events()
+			.map_err(|error| Str::from(error.to_string()))?;
+		let items = self
+			.journal
+			.items_at(&events)
+			.map_err(|error| Str::from(error.to_string()))?;
+		let latest = self.journal.latest_receipt();
+		let snapshot = latest.and_then(|receipt| receipt.outcome.context_snapshot.as_ref());
+		let total_tokens = snapshot.map_or(0, |usage| usage.prompt_tokens);
+		let context_window = snapshot
+			.and_then(|usage| usage.window_tokens)
+			.unwrap_or(total_tokens);
+		let model_fallback = self.state.snapshot().turn.params.model.clone();
+		let model = latest
+			.map(|receipt| receipt.outcome.model.as_str())
+			.filter(|model| !model.is_empty())
+			.unwrap_or(model_fallback.as_str());
+		let provider = latest
+			.map(|receipt| receipt.outcome.provider.as_str())
+			.filter(|provider| !provider.is_empty())
+			.or_else(|| model.split_once('/').map(|(provider, _)| provider))
+			.unwrap_or_default();
+		let position = self.journal.context_position();
+		let messages = events
+			.into_iter()
+			.zip(items.iter())
+			.map(|(event, item)| context_ref_json(event, item))
+			.collect::<Result<Vec<_>, _>>()?;
+		Ok(serde_json::json!({
+			"session_id": self.journal.session_id().0.as_str(),
+			"turn_id": latest.map_or("", |receipt| receipt.turn_id.as_str()),
+			"model": model,
+			"provider": provider,
+			"epoch": position.epoch,
+			"messages": messages,
+			"usage": {
+				"total_tokens": total_tokens,
+				"context_window": context_window,
+				"reserve_tokens": 0,
+				"usable_tokens": context_window,
+				"fraction": if context_window == 0 {
+					0.0
+				} else {
+					total_tokens as f64 / context_window as f64
+				},
+				"prompt_head_tokens": snapshot.map_or(0, |usage| usage.non_message_tokens),
+				"device_catalog_tokens": 0,
+				"message_tokens": snapshot.and_then(|usage| usage.message_tokens).unwrap_or(0),
+				"catalog_notice_tokens": 0,
+				"media_tokens": 0,
+				"compaction_epoch": position.epoch,
+				"threshold_fraction": 0.0,
+				"in_flight": self.journal.pending_turn().is_some(),
+			},
+			"prompt_hash": self.prompt_hash.map_or_else(String::new, |hash| hash.to_string()),
+			"reset_event": Value::Null,
+		}))
+	}
+
+	fn context_control_item(&self, arguments: &serde_json::Map<String, Value>) -> Result<Item, Str> {
+		let event = arguments
+			.get("event")
+			.and_then(Value::as_u64)
+			.ok_or_else(|| sf!("context message event is required"))?;
+		let seq = arguments
+			.get("seq")
+			.and_then(Value::as_u64)
+			.ok_or_else(|| sf!("context message sequence is required"))?;
+		if !self
+			.journal
+			.live_item_events()
+			.map_err(|error| Str::from(error.to_string()))?
+			.contains(&event)
+		{
+			return Err(sf!("ContextGone: context item is no longer live"));
+		}
+		let mut items = self
+			.journal
+			.items_at(&[event])
+			.map_err(|error| Str::from(error.to_string()))?;
+		let item = items
+			.pop()
+			.ok_or_else(|| sf!("ContextGone: context item is no longer live"))?;
+		if item.seq != seq {
+			return Err(sf!("ContextGone: context item sequence changed"));
+		}
+		Ok(item)
 	}
 
 	fn handle_campaign_control(
@@ -3184,6 +3527,137 @@ const fn empty_invocation_transition(
 	}
 }
 
+fn context_ref_json(event: u64, item: &Item) -> Result<Value, Str> {
+	let bytes = serde_json::to_vec(item).map_err(|error| Str::from(error.to_string()))?;
+	let (kind, role, part_count, media_count, tool, is_error, useless, preview) =
+		match item.kind.as_ref() {
+			Some(thread::item::Kind::Message(message)) => {
+				let role = match thread::Role::try_from(message.role) {
+					Ok(thread::Role::System) => "system",
+					Ok(thread::Role::User) => "user",
+					Ok(thread::Role::Assistant) => "assistant",
+					_ => "custom",
+				};
+				let preview = message
+					.parts
+					.iter()
+					.find_map(|part| match part.kind.as_ref() {
+						Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+						_ => None,
+					});
+				(
+					role,
+					role,
+					message.parts.len(),
+					message
+						.parts
+						.iter()
+						.filter(|part| matches!(part.kind, Some(thread::part::Kind::Blob(_))))
+						.count(),
+					Value::Null,
+					false,
+					false,
+					preview,
+				)
+			},
+			Some(thread::item::Kind::ToolCall(call)) => (
+				"tool_call",
+				"assistant",
+				1,
+				0,
+				serde_json::json!({"name": call.name, "family": "", "rev": 0}),
+				false,
+				false,
+				Some(call.name.as_str()),
+			),
+			Some(thread::item::Kind::ToolResult(result)) => (
+				"tool_result",
+				"user",
+				result.parts.len(),
+				result
+					.parts
+					.iter()
+					.filter(|part| matches!(part.kind, Some(thread::part::Kind::Blob(_))))
+					.count(),
+				serde_json::json!({"name": result.name, "family": "", "rev": 0}),
+				result.is_error,
+				result.useless.unwrap_or(false),
+				result
+					.parts
+					.iter()
+					.find_map(|part| match part.kind.as_ref() {
+						Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+						_ => None,
+					}),
+			),
+			None => ("custom", "custom", 0, 0, Value::Null, false, false, None),
+		};
+	Ok(serde_json::json!({
+		"id": event.to_string(),
+		"event": event,
+		"seq": item.seq,
+		"kind": kind,
+		"role": role,
+		"turn_id": Value::Null,
+		"created_at_ms": item.created_at_ms,
+		"tokens": u64::try_from(bytes.len().div_ceil(4)).unwrap_or(u64::MAX),
+		"byte_len": bytes.len(),
+		"part_count": part_count,
+		"media_count": media_count,
+		"tool": tool,
+		"is_error": is_error,
+		"useless": useless,
+		"pinned": false,
+		"elided": false,
+		"superseded_by": Value::Null,
+		"artifacts": [],
+		"preview": preview.unwrap_or_default(),
+	}))
+}
+
+fn context_part_json(part: &thread::Part) -> Option<Value> {
+	match part.kind.as_ref()? {
+		thread::part::Kind::Text(text) => Some(serde_json::json!({"kind": "text", "text": text})),
+		thread::part::Kind::Blob(blob) => Some(serde_json::json!({
+			"kind": "blob",
+			"hash": omp_core::hex::encode(blob.hash.as_ref()).to_string(),
+			"size": blob.size,
+			"alt": Value::Null,
+		})),
+		thread::part::Kind::Thinking(_)
+		| thread::part::Kind::Fallback(_)
+		| thread::part::Kind::ServerTool(_) => None,
+	}
+}
+fn context_proto_value_json(value: &pb::Value) -> Option<Value> {
+	Some(match value.kind.as_ref()? {
+		pb::value::Kind::Null(_) => Value::Null,
+		pb::value::Kind::Bool(value) => Value::Bool(*value),
+		pb::value::Kind::Int(value) => Value::from(*value),
+		pb::value::Kind::Uint(value) => Value::from(*value),
+		pb::value::Kind::Double(value) => serde_json::Number::from_f64(*value)
+			.map(Value::Number)
+			.unwrap_or(Value::Null),
+		pb::value::Kind::String(value) => Value::String(value.clone()),
+				pb::value::Kind::List(values) => Value::Array(
+			values
+				.values
+				.iter()
+				.filter_map(context_proto_value_json)
+				.collect(),
+		),
+		pb::value::Kind::Map(values) => Value::Object(
+			values
+				.fields
+				.iter()
+				.filter_map(|(key, value)| {
+					context_proto_value_json(value).map(|value| (key.clone(), value))
+				})
+				.collect(),
+		),
+	})
+}
+
 fn publish_input_attachments(session: &str, input: &TurnInput) {
 	match input {
 		TurnInput::Full(thread) => crate::attachments::publish_session_attachments(session, thread),
@@ -3457,7 +3931,7 @@ fn stream_watchdog_error(
 	saw_event: bool,
 	pending_tool_results: bool,
 ) -> TurnError {
-	if let Some(kind) = omp_llm_inference::recovery::repetition::classify_stream_recovery(
+	if let Some(kind) = omp_inference::recovery::repetition::classify_stream_recovery(
 		None,
 		false,
 		saw_event,
@@ -3634,14 +4108,12 @@ fn duplex_turn_error(error: DuplexError) -> TurnError {
 fn follow_up_id(_root: &TurnId<str>, _ordinal: u32) -> TurnId {
 	TurnId::new(omp_core::Ulid::generate().to_string())
 }
-fn proto_tool_choice(choice: omp_llm_inference::call::ToolChoice) -> pb::ToolChoice {
+fn proto_tool_choice(choice: omp_inference::call::ToolChoice) -> pb::ToolChoice {
 	let (mode, name) = match choice {
-		omp_llm_inference::call::ToolChoice::Disabled => (pb::tool_choice::Mode::None, String::new()),
-		omp_llm_inference::call::ToolChoice::Auto => (pb::tool_choice::Mode::Auto, String::new()),
-		omp_llm_inference::call::ToolChoice::Required => {
-			(pb::tool_choice::Mode::Required, String::new())
-		},
-		omp_llm_inference::call::ToolChoice::Named(name) => {
+		omp_inference::call::ToolChoice::Disabled => (pb::tool_choice::Mode::None, String::new()),
+		omp_inference::call::ToolChoice::Auto => (pb::tool_choice::Mode::Auto, String::new()),
+		omp_inference::call::ToolChoice::Required => (pb::tool_choice::Mode::Required, String::new()),
+		omp_inference::call::ToolChoice::Named(name) => {
 			(pb::tool_choice::Mode::Named, name.to_string())
 		},
 	};
@@ -4073,7 +4545,7 @@ mod tests {
 		};
 		let (compaction, ()) = tokio::join!(
 			agent.compact_manual(ManualCompactionRequest {
-				mode: Some(ManualCompactionMode::Soft),
+				mode:  Some(ManualCompactionMode::Soft),
 				focus: None,
 			}),
 			aborting,
@@ -4082,7 +4554,7 @@ mod tests {
 			compaction,
 			Err(AgentError::CompactionCancelled(CompactionCancellation::UserInterrupt))
 		));
-	
+
 		let follow_up = agent
 			.submit(
 				[message(thread::Role::User, "replacement prompt")],
@@ -4095,7 +4567,7 @@ mod tests {
 		drop(agent);
 		std::fs::remove_file(path).expect("remove journal");
 	}
-	
+
 	#[test]
 	fn thinking_shake_drops_plain_and_redacted_blocks_and_invalidates_prompt_state() {
 		let (mut journal, path) = test_journal("shake-thinking");
@@ -4118,9 +4590,7 @@ mod tests {
 							redacted:  true,
 						})),
 					},
-					thread::Part {
-						kind: Some(thread::part::Kind::Text("visible answer".to_owned())),
-					},
+					thread::Part { kind: Some(thread::part::Kind::Text("visible answer".to_owned())) },
 				],
 			})),
 			..Item::default()
@@ -4143,6 +4613,7 @@ mod tests {
 			journal,
 			test_caps(),
 		);
+		agent.prompt_hash = Some(prompt_hash);
 		let outcome = agent
 			.shake_manual(ManualShakeMode::Thinking)
 			.expect("thinking shake rewrites history");
@@ -4163,7 +4634,7 @@ mod tests {
 		drop(agent);
 		std::fs::remove_file(path).expect("remove journal");
 	}
-	
+
 	#[tokio::test]
 	async fn caller_abort_settles_pending_stream_and_allows_follow_up() {
 		let (journal, path) = test_journal("stream-abort");

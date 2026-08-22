@@ -11,6 +11,7 @@ use std::{
 use bytes::Bytes;
 use omp_core::{Hash32, Str, sf};
 use omp_proto::thread::v1::{self as thread, Item};
+use omp_scribe::canon::canonicalize_prompt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
@@ -1472,143 +1473,6 @@ fn dedupe_prompt_source(content: &str, seen: &mut HashSet<String>) -> String {
 	out
 }
 
-fn canonicalize_prompt(content: &str) -> String {
-	let mut out = String::with_capacity(content.len());
-	let mut in_fence = false;
-	let mut in_comment = false;
-	let mut blank = false;
-	for raw_line in content.lines() {
-		let trimmed = raw_line.trim_end();
-		let fence = trimmed.trim_start();
-		if fence.starts_with("```") || fence.starts_with("~~~") {
-			in_fence = !in_fence;
-			push_canonical_line(&mut out, raw_line, &mut blank);
-			continue;
-		}
-		if in_fence {
-			push_canonical_line(&mut out, raw_line, &mut blank);
-			continue;
-		}
-
-		let mut line = String::with_capacity(trimmed.len());
-		let mut rest = trimmed;
-		loop {
-			if in_comment {
-				let Some(end) = rest.find("-->") else {
-					break;
-				};
-				rest = &rest[end + 3..];
-				in_comment = false;
-			}
-			let Some(start) = rest.find("<!--") else {
-				line.push_str(rest);
-				break;
-			};
-			line.push_str(&rest[..start]);
-			rest = &rest[start + 4..];
-			in_comment = true;
-		}
-		let line = canonicalize_text_line(line.trim_end());
-		push_canonical_line(&mut out, &line, &mut blank);
-	}
-	while out.ends_with('\n') {
-		out.pop();
-	}
-	out
-}
-
-fn push_raw_line(out: &mut String, line: &str, blank: &mut bool) {
-	if *blank {
-		out.push_str("\n\n");
-		*blank = false;
-	} else if !out.is_empty() {
-		out.push('\n');
-	}
-	out.push_str(line);
-}
-
-fn push_canonical_line(out: &mut String, line: &str, blank: &mut bool) {
-	if line.trim().is_empty() {
-		*blank = !out.is_empty();
-		return;
-	}
-	if *blank {
-		out.push_str("\n\n");
-	} else if !out.is_empty() {
-		out.push('\n');
-	}
-	out.push_str(line);
-	*blank = false;
-}
-
-fn canonicalize_text_line(line: &str) -> String {
-	let trimmed = line.trim_start();
-	let indent = &line[..line.len() - trimmed.len()];
-	if trimmed.starts_with('|') && trimmed.ends_with('|') {
-		let mut compact = String::with_capacity(line.len());
-		compact.push_str(indent);
-		for (index, cell) in trimmed.split('|').enumerate() {
-			if index > 0 {
-				compact.push('|');
-			}
-			let cell = cell.trim();
-			if !cell.is_empty()
-				&& cell
-					.chars()
-					.all(|character| matches!(character, '-' | ':' | ' '))
-			{
-				let left = cell.starts_with(':');
-				let right = cell.ends_with(':');
-				match (left, right) {
-					(true, true) => compact.push_str(":---:"),
-					(true, false) => compact.push_str(":---"),
-					(false, true) => compact.push_str("---:"),
-					(false, false) => compact.push_str("---"),
-				}
-			} else {
-				compact.push_str(cell);
-			}
-		}
-		return canonicalize_inline(&compact);
-	}
-	canonicalize_inline(line)
-}
-
-fn canonicalize_inline(line: &str) -> String {
-	let mut out = String::with_capacity(line.len());
-	for (index, segment) in line.split('`').enumerate() {
-		if index > 0 {
-			out.push('`');
-		}
-		if index % 2 == 1 {
-			out.push_str(segment);
-			continue;
-		}
-		let segment = segment
-			.replace("**MUST NOT**", "NEVER")
-			.replace("**SHOULD NOT**", "AVOID")
-			.replace("MUST NOT", "NEVER")
-			.replace("SHOULD NOT", "AVOID")
-			.replace("**MUST**", "MUST")
-			.replace("**SHOULD**", "SHOULD")
-			.replace("**REQUIRED**", "REQUIRED")
-			.replace("**RECOMMENDED**", "RECOMMENDED")
-			.replace("**MAY**", "MAY")
-			.replace("**OPTIONAL**", "OPTIONAL")
-			.replace("**NEVER**", "NEVER")
-			.replace("**AVOID**", "AVOID")
-			.replace("<->", "↔")
-			.replace("->", "→")
-			.replace("<-", "←")
-			.replace("!=", "≠")
-			.replace("<=", "≤")
-			.replace(">=", "≥")
-			.replace("...", "…");
-		out.push_str(&segment);
-	}
-	out
-}
-
 fn render_role_conditionals(workspace: &WorkspaceInput, out: &mut String) {
 	if workspace.settings.render_mermaid {
 		out.push_str(
@@ -1884,11 +1748,11 @@ fn render_delegation_policy(workspace: &WorkspaceInput, out: &mut String) {
 	}
 	out.push_str("\n# Delegation\n");
 	out.push_str(
-		"- Agent typing: pick each task's most specific available agent. Omitting `agent` selects the \
-		 spawn-policy default. Omit it when that default is the best fit; otherwise pass the \
-		 specialist explicitly.\n- \
-		 Overlap: parallelize independent ownership. Same-file edits are not guaranteed to merge. \
-		 Name one integration owner and serialize only the irreducibly shared mutation boundary.\n",
+		"- Agent typing: pick each task's most specific available agent. Omitting `agent` selects \
+		 the spawn-policy default. Omit it when that default is the best fit; otherwise pass the \
+		 specialist explicitly.\n- Overlap: parallelize independent ownership. Same-file edits are \
+		 not guaranteed to merge. Name one integration owner and serialize only the irreducibly \
+		 shared mutation boundary.\n",
 	);
 	if policy.coordination {
 		out.push_str("- Have siblings coordinate through `hub` before editing shared files.\n");
@@ -2728,14 +2592,6 @@ mod tests {
 		assert!(bands.iter().all(|band| *band == hash_band(&[])));
 	}
 
-	#[test]
-	fn canonicalization_never_rewrites_fenced_or_inline_code() {
-		let input = "MUST NOT change `a -> b`.\n\n```text\nMUST NOT  \n\nx -> y\n```\n";
-		assert_eq!(
-			canonicalize_prompt(input),
-			"NEVER change `a -> b`.\n\n```text\nMUST NOT  \n\nx -> y\n```"
-		);
-	}
 	#[test]
 	fn volatile_source_is_rejected() {
 		struct VolatileSource(AtomicBool);

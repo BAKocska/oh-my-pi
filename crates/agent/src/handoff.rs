@@ -5,8 +5,7 @@ use omp_storage::blob::BlobRef;
 
 use crate::journal::Compact;
 /// Instruction used when a model prepares a successor-facing handoff document.
-pub const HANDOFF_DOCUMENT_PROMPT: &str =
-	include_str!("../prompts/compaction/handoff-document.md");
+pub const HANDOFF_DOCUMENT_PROMPT: &str = include_str!("../prompts/compaction/handoff-document.md");
 
 /// Structured context transferred to a handoff child.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -90,25 +90,25 @@ pub use campaign::{
 	goal_regime_spec, plan_regime_spec, vibe_regime_spec,
 };
 pub use compact::{
-	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionBoundary, CompactionCoordinator,
-	CompactionCancellation, CompactionDecision, CompactionEvent, CompactionHysteresis, CompactionMethodOrder,
-	CompactionReason, CompactionResolution, CompactionSpeculationOptions, CompactionTier,
-	CompactionVerdict, ContextUsage, ContextUsageBreakdown, CustomSummary, DelegateCompaction,
-	IDLE_PRUNE_AFTER, ItemUsage, LosslessPlan, LosslessReceipt, ManualCompactionDecision,
-	ManualCompactionError, ManualCompactionMode, ManualCompactionOutcome, ManualCompactionRequest,
-	ManualShakeMode, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionItem, RemoteCheckpoint,
-	SNAPCOMPACT_TIER, SPECULATION_LEAD_FRACTION, SPECULATION_LEAD_MAX_TOKENS,
-	SPECULATION_LEAD_MIN_TOKENS, SnapcompactOutcome, SnapcompactPreparation, SpeculationRequest,
-	SpeculationResult, SpeculationSnapshot, SpeculationState, SupersededCompaction,
-	back_project_provider_usage, boundary_reason, dispatch_tier, encode_domain_verdict,
-	execute_snapcompact, plan_lossless, plan_lossless_with_warm_suffix, resolve_verdicts,
-	speculation_lead_tokens,
+	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionBoundary, CompactionCancellation,
+	CompactionCoordinator, CompactionDecision, CompactionEvent, CompactionHysteresis,
+	CompactionMethodOrder, CompactionReason, CompactionResolution, CompactionSpeculationOptions,
+	CompactionTier, CompactionVerdict, ContextUsage, ContextUsageBreakdown, CustomSummary,
+	DelegateCompaction, IDLE_PRUNE_AFTER, ItemUsage, LosslessPlan, LosslessReceipt,
+	ManualCompactionDecision, ManualCompactionError, ManualCompactionMode, ManualCompactionOutcome,
+	ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS,
+	ProjectionItem, RemoteCheckpoint, SNAPCOMPACT_TIER, SPECULATION_LEAD_FRACTION,
+	SPECULATION_LEAD_MAX_TOKENS, SPECULATION_LEAD_MIN_TOKENS, SnapcompactOutcome,
+	SnapcompactPreparation, SpeculationRequest, SpeculationResult, SpeculationSnapshot,
+	SpeculationState, SupersededCompaction, back_project_provider_usage, boundary_reason,
+	dispatch_tier, encode_domain_verdict, execute_snapcompact, plan_lossless,
+	plan_lossless_with_warm_suffix, resolve_verdicts, speculation_lead_tokens,
 };
 pub use context::{
 	Anchor, ContextProjection, ContextSnapshot, ContextSnapshotError, ContextView, InheritPosition,
-	InterruptedReasoningDialect, MessageKind, MessageRef, PatchOp, PatchOutcome, PatchRejected, RefFlags, apply_patches,
-	demote_interrupted_reasoning, external_thinking_for_model, inject_first_turn_metadata,
-	project_context,
+	InterruptedReasoningDialect, MessageKind, MessageRef, PatchOp, PatchOutcome, PatchRejected,
+	RefFlags, apply_patches, demote_interrupted_reasoning, external_thinking_for_model,
+	inject_first_turn_metadata, project_context,
 };
 pub use continuation::{
 	AgentSettledEvent, Continuation, ContinuationLedger, ContinuationPolicy, ContinuationSource,
@@ -146,7 +146,8 @@ pub use lifecycle::{
 	ShutdownStage, ShutdownTask, shutdown_ordered,
 };
 pub use r#loop::{
-	AbortHandle, Agent, AgentError, AgentRunSummary, RewindTarget, RunActivity, RunSettlement,
+	AbortHandle, Agent, AgentError, AgentHostControl, AgentRunSummary, RewindTarget, RunActivity,
+	RunSettlement,
 };
 pub use mailbox::{
 	DEFERRED_DIAGNOSTIC_DOCUMENT_PROP, DEFERRED_DIAGNOSTIC_GENERATION_PROP,
@@ -157,7 +158,7 @@ pub use mailbox::{
 	device_availability_interrupt, remote_principal_interrupt,
 };
 pub use name::{AgentNameAllocator, AgentNameError};
-pub use omp_llm_inference::TurnId;
+pub use omp_inference::TurnId;
 pub use omp_proto::{
 	inference::v1::{
 		Accepted, ChatParams, ContextRef, ExecStatus, Executor, Invoke, InvokeCancel, InvokeComplete,

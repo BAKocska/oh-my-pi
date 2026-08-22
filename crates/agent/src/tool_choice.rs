@@ -7,7 +7,7 @@
 use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc};
 
 use omp_core::{Str, sf};
-use omp_llm_inference::call::ToolChoice;
+use omp_inference::call::ToolChoice;
 use serde_json::Value;
 
 /// Why a claimed choice could not be settled successfully.

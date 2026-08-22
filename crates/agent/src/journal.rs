@@ -2856,7 +2856,7 @@ impl Journal {
 		&mut self,
 		ts: u64,
 		provider: transcript::ProviderId,
-		affinity: &omp_llm_inference::session::CredentialAffinityDigest,
+		affinity: &omp_inference::session::CredentialAffinityDigest,
 	) -> Result<u64, JournalError> {
 		self.append(&Event {
 			ts,

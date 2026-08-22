@@ -6,7 +6,7 @@ use std::{
 };
 
 use omp_core::{Point, PointSet, Str, Ulid};
-use omp_llm_inference::call::ToolChoice;
+use omp_inference::call::ToolChoice;
 use omp_proto::thread::v1::Item;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};

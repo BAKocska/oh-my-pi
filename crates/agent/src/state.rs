@@ -89,23 +89,23 @@ pub enum RetryPolicyError {
 #[derive(Clone)]
 pub struct AgentSnapshot {
 	/// Per-turn arbiter options.
-	pub turn:             TurnOptions,
+	pub turn:              TurnOptions,
 	/// Names of tools enabled for this turn, in stable publication order.
-	pub enabled_tools:    Arc<[Str]>,
+	pub enabled_tools:     Arc<[Str]>,
 	/// Live revisioned tools used for advertisement, projection, and execution.
-	pub registry:         Arc<Registry>,
+	pub registry:          Arc<Registry>,
 	/// Immutable workspace and context-file input.
-	pub workspace:        WorkspaceInput,
+	pub workspace:         WorkspaceInput,
 	/// Synchronous source used to construct the canonical prompt head.
-	pub prompt_source:    Arc<dyn PromptSource>,
+	pub prompt_source:     Arc<dyn PromptSource>,
 	/// Dialect policy governing hidden continuity after interrupted reasoning.
 	pub reasoning_dialect: InterruptedReasoningDialect,
 	/// Whether immediate interrupts are demoted to turn-boundary interrupts.
-	pub defer_interrupts: bool,
+	pub defer_interrupts:  bool,
 	/// Absolute deadline for the active logical turn, when bounded by the host.
-	pub deadline:         Option<Instant>,
+	pub deadline:          Option<Instant>,
 	/// Bounded loop-level recovery policy.
-	pub retry:            RetryPolicy,
+	pub retry:             RetryPolicy,
 }
 
 impl AgentSnapshot {

@@ -1123,16 +1123,16 @@ pub(crate) mod stream {
 	}
 
 	pub(crate) fn stream_recovery_item(
-		kind: omp_llm_inference::recovery::repetition::StreamRecoveryKind,
+		kind: omp_inference::recovery::repetition::StreamRecoveryKind,
 	) -> Item {
 		let reason = match kind {
-			omp_llm_inference::recovery::repetition::StreamRecoveryKind::Http2Reset => {
+			omp_inference::recovery::repetition::StreamRecoveryKind::Http2Reset => {
 				"the provider reset the response stream before output committed"
 			},
-			omp_llm_inference::recovery::repetition::StreamRecoveryKind::FirstEventStall => {
+			omp_inference::recovery::repetition::StreamRecoveryKind::FirstEventStall => {
 				"the provider produced no first response event before the watchdog expired"
 			},
-			omp_llm_inference::recovery::repetition::StreamRecoveryKind::PostToolIdleStall => {
+			omp_inference::recovery::repetition::StreamRecoveryKind::PostToolIdleStall => {
 				"the provider stalled after tool results before producing another event"
 			},
 		};

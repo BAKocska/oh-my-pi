@@ -12,9 +12,9 @@ use omp_tool::{
 };
 use serde::Deserialize;
 use thiserror::Error;
-const COMPACTION_SUMMARY_CONTEXT: &str =
-	"Prior model work/tool state available.\nMUST build on prior work; NEVER duplicate prior \
-	 work.\n\n<summary>\n{{summary}}\n</summary>\n";
+const COMPACTION_SUMMARY_CONTEXT: &str = "Prior model work/tool state available.\nMUST build on \
+                                          prior work; NEVER duplicate prior \
+                                          work.\n\n<summary>\n{{summary}}\n</summary>\n";
 const HANDOFF_SUMMARY_CONTEXT: &str =
 	include_str!("../prompts/compaction/handoff-summary-context.md");
 
@@ -183,7 +183,10 @@ pub fn project_journal(
 			},
 			Kind::Compact { summary, method, snapcompact, .. } => {
 				let mut parts = vec![thread_pb::Part {
-					kind: Some(thread_pb::part::Kind::Text(render_compaction_summary(summary, method.as_deref()))),
+					kind: Some(thread_pb::part::Kind::Text(render_compaction_summary(
+						summary,
+						method.as_deref(),
+					))),
 				}];
 				if let Some(archive) = snapcompact {
 					parts.extend(archive.frames.iter().map(|reference| thread_pb::Part {
@@ -609,16 +612,17 @@ mod tests {
 	use super::{project_journal, render_compaction_summary};
 
 	static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
-	
+
 	#[test]
 	fn handoff_compaction_uses_successor_memory_framing() {
-		let rendered = render_compaction_summary("## Next Steps\nRun the focused test.", Some("handoff"));
+		let rendered =
+			render_compaction_summary("## Next Steps\nRun the focused test.", Some("handoff"));
 		assert!(rendered.contains("<handoff>"));
 		assert!(rendered.contains("prior instance"));
 		assert!(rendered.contains("NEVER write another handoff document"));
 		assert!(!rendered.contains("<summary>"));
 	}
-	
+
 	#[test]
 	fn ordinary_compaction_keeps_summary_framing() {
 		let rendered = render_compaction_summary("portable state", Some("remote"));

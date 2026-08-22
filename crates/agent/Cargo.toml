@@ -22,11 +22,12 @@ omp-core = { workspace = true }
 omp-ast = { workspace = true }
 # D2 world boundary: client API only. CI rejects docserver, shell-engine, and walker.
 omp-env = { workspace = true }
-omp-llm-inference = { workspace = true }
+omp-inference = { workspace = true }
 omp-slopjson = { workspace = true }
 omp-secrets = { workspace = true }
 omp-snapcompact = { workspace = true }
 omp-proto = { workspace = true, features = ["tonic"] }
+omp-scribe = { workspace = true }
 # The sole sanctioned direct storage edge is the durable journal subscriber.
 omp-telemetry = { workspace = true }
 omp-storage = { workspace = true }

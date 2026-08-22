@@ -16,7 +16,8 @@ use std::{
 use bytes::Bytes;
 use omp_core::{Str, sf};
 use omp_storage::{
-	state::{DurableRequest, StateAuthority, StateRevision},
+	blob::BlobRef,
+	state::{ContentRoot, DurableRequest, StateAuthority, StateRevision},
 	transcript::{InvocationTransition, ModelChange, TitleSource},
 };
 use parking_lot::Mutex;
@@ -44,6 +45,7 @@ pub struct ControlSender {
 	commands:         flume::Sender<ControlCommand>,
 	next_receipt:     Arc<AtomicU64>,
 	checkpoint_state: Arc<Mutex<CheckpointState>>,
+	host_control:     Arc<Mutex<Option<crate::AgentHostControl>>>,
 }
 
 /// The receive half retained by the sole mutable journal owner.
@@ -259,6 +261,7 @@ pub fn channel() -> (ControlSender, ControlMailbox) {
 			commands,
 			next_receipt: Arc::new(AtomicU64::new(1)),
 			checkpoint_state: Arc::clone(&checkpoint_state),
+			host_control: Arc::new(Mutex::new(None)),
 		},
 		ControlMailbox { commands: receiver, checkpoint_state },
 	)
@@ -267,6 +270,15 @@ pub fn channel() -> (ControlSender, ControlMailbox) {
 impl ControlSender {
 	pub(crate) fn checkpoint_state(&self) -> Arc<Mutex<CheckpointState>> {
 		Arc::clone(&self.checkpoint_state)
+	}
+
+	pub(crate) fn bind_host_control(&self, host: crate::AgentHostControl) {
+		*self.host_control.lock() = Some(host);
+	}
+
+	/// Returns the generation-fenced live Agent projection mailbox.
+	pub fn host_control(&self) -> Option<crate::AgentHostControl> {
+		self.host_control.lock().clone()
 	}
 
 	/// Appends an in-place reset boundary through the sole journal owner.
@@ -507,6 +519,60 @@ impl ControlSender {
 		self
 			.commands
 			.send(ControlCommand::SessionStateWatch { authority, key, since, reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
+	/// Durably roots one already-stored blob in the live SESSION journal.
+	///
+	/// # Errors
+	/// Returns a closed-owner or typed journal authority failure.
+	pub async fn session_state_root_content(
+		&self,
+		ts: u64,
+		authority: StateAuthority,
+		reference: BlobRef,
+		request: DurableRequest,
+	) -> Result<ContentRoot, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::SessionStateRootContent {
+				ts,
+				authority,
+				reference,
+				request,
+				reply,
+			})
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
+	/// Checks live SESSION-journal reachability for one blob.
+	///
+	/// # Errors
+	/// Returns a closed-owner or typed journal authority failure.
+	pub async fn session_state_content_is_rooted(
+		&self,
+		authority: StateAuthority,
+		reference: BlobRef,
+	) -> Result<bool, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::SessionStateContentIsRooted {
+				authority,
+				reference,
+				reply,
+			})
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -803,6 +869,18 @@ pub(crate) enum ControlCommand {
 		since:     Option<StateRevision>,
 		reply:     flume::Sender<JournalReplyResult<flume::Receiver<SessionStateWatchEvent>>>,
 	},
+	SessionStateRootContent {
+		ts:        u64,
+		authority: StateAuthority,
+		reference: BlobRef,
+		request:   DurableRequest,
+		reply:     flume::Sender<JournalReplyResult<ContentRoot>>,
+	},
+	SessionStateContentIsRooted {
+		authority: StateAuthority,
+		reference: BlobRef,
+		reply:     flume::Sender<JournalReplyResult<bool>>,
+	},
 	InvocationTransition {
 		ts:         u64,
 		transition: InvocationTransition,
@@ -893,6 +971,24 @@ fn handle_command(
 		},
 		ControlCommand::SessionStateWatch { authority, key, since, reply } => {
 			let _ = reply.send(journal.subscribe_session_state(&authority, key, since));
+		},
+		ControlCommand::SessionStateRootContent {
+			ts,
+			authority,
+			reference,
+			request,
+			reply,
+		} => {
+			let _ =
+				reply.send(journal.root_session_state_content(ts, &authority, reference, &request));
+		},
+		ControlCommand::SessionStateContentIsRooted { authority, reference, reply } => {
+			let namespace = Str::new(authority.namespace());
+			let _ = reply.send(journal.session_state_content_is_rooted(
+				&authority,
+				namespace.as_str(),
+				&reference,
+			));
 		},
 		ControlCommand::InvocationTransition { ts, transition, reply } => {
 			let _ = reply.send(journal.record_invocation_transition(ts, transition));

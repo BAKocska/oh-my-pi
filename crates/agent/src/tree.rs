@@ -11,7 +11,7 @@ use std::{
 };
 
 use omp_core::{AppendVec, Hash32, InvocationPhase, Str};
-use omp_llm_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
+use omp_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
 use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;

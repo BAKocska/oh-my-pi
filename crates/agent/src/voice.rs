@@ -8,7 +8,7 @@
 use std::{collections::BTreeMap, string::FromUtf8Error, time::SystemTime};
 
 use omp_core::Str;
-use omp_llm_inference::{
+use omp_inference::{
 	RealtimeContextAppend, RealtimeContextChannel, RealtimeContextTarget, RealtimeDelegation,
 	RealtimeDelegationReceipt, RealtimeDelegationStatus, RealtimeInput, TurnId,
 };

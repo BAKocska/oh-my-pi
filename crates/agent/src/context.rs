@@ -11,6 +11,7 @@ use omp_proto::{
 	inference::v1 as inference,
 	thread::v1::{self as thread, Item, Thread},
 };
+use serde_json::Value;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -50,7 +51,7 @@ pub struct ContextSnapshot {
 impl ContextSnapshot {
 	/// Constructs a snapshot only when its single anchor and totals reconcile.
 	pub fn from_receipt(
-		receipt: &omp_llm_inference::receipt::ContextUsageReceipt,
+		receipt: &omp_inference::receipt::ContextUsageReceipt,
 	) -> Result<Self, ContextSnapshotError> {
 		let turn_id = receipt
 			.turn_id
@@ -105,6 +106,32 @@ impl ContextSnapshot {
 			unclassified_tokens: input_tokens - categorized_tokens,
 			slack_tokens: window_tokens - input_tokens,
 			snapcompact_savings: receipt.snapcompact_savings,
+		})
+	}
+
+	/// Serializes authoritative receipt accounting for JSON CONTROL without
+	/// dropping unavailable categories into invented estimates.
+	pub fn control_usage(&self, reserve_tokens: u64) -> Value {
+		let usable_tokens = self.window_tokens.saturating_sub(reserve_tokens);
+		serde_json::json!({
+			"total_tokens": self.input_tokens,
+			"context_window": self.window_tokens,
+			"reserve_tokens": reserve_tokens,
+			"usable_tokens": usable_tokens,
+			"fraction": if usable_tokens == 0 {
+				0.0
+			} else {
+				self.input_tokens as f64 / usable_tokens as f64
+			},
+			"prompt_head_tokens": self.system_tokens.unwrap_or(0)
+				.saturating_add(self.skill_tokens.unwrap_or(0)),
+			"device_catalog_tokens": 0,
+			"message_tokens": self.message_tokens.unwrap_or(0),
+			"catalog_notice_tokens": 0,
+			"media_tokens": 0,
+			"compaction_epoch": self.compaction_epoch,
+			"threshold_fraction": 0.0,
+			"in_flight": false,
 		})
 	}
 }
@@ -318,11 +345,11 @@ pub enum ContextProjection {
 ///
 /// Native reasoning wins. Explicitly unsupported reasoning activates the tool;
 /// unknown capability evidence does not silently change the tool surface.
-pub fn external_thinking_for_model(capabilities: &omp_llm_inference::ModelCapabilities) -> bool {
+pub fn external_thinking_for_model(capabilities: &omp_inference::ModelCapabilities) -> bool {
 	capabilities
 		.chat
 		.as_ref()
-		.is_some_and(|chat| matches!(chat.reasoning, omp_llm_inference::Availability::Unsupported))
+		.is_some_and(|chat| matches!(chat.reasoning, omp_inference::Availability::Unsupported))
 }
 
 /// Removes replay-unsafe reasoning from an interrupted assistant tail and
@@ -396,7 +423,8 @@ pub enum InterruptedReasoningDialect {
 	/// Ordinary dialects accept a hidden user-shaped continuity quote.
 	#[default]
 	Other,
-	/// Anthropic reasoning classifiers reject model reasoning replayed as user text.
+	/// Anthropic reasoning classifiers reject model reasoning replayed as user
+	/// text.
 	Anthropic,
 }
 
@@ -810,10 +838,7 @@ mod tests {
 				props:         None,
 			}],
 		};
-		assert!(demote_interrupted_reasoning(
-			&mut thread,
-			InterruptedReasoningDialect::Other,
-		));
+		assert!(demote_interrupted_reasoning(&mut thread, InterruptedReasoningDialect::Other,));
 		let assistant = match thread.items[0].kind.as_ref().unwrap() {
 			thread::item::Kind::Message(message) => message,
 			_ => unreachable!(),
@@ -834,7 +859,7 @@ mod tests {
 				.contains_key("omp/hidden-continuity")
 		);
 	}
-	
+
 	#[test]
 	fn anthropic_dialect_drops_reasoning_without_hidden_continuity() {
 		let mut thread = Thread {
@@ -857,10 +882,7 @@ mod tests {
 				..Item::default()
 			}],
 		};
-		assert!(demote_interrupted_reasoning(
-			&mut thread,
-			InterruptedReasoningDialect::Anthropic,
-		));
+		assert!(demote_interrupted_reasoning(&mut thread, InterruptedReasoningDialect::Anthropic,));
 		assert_eq!(thread.items.len(), 1);
 		let Some(thread::item::Kind::Message(message)) = thread.items[0].kind.as_ref() else {
 			panic!("assistant message remains");

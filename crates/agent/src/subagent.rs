@@ -260,14 +260,14 @@ pub enum SubagentStateError {
 
 /// Sole mutable owner of retained state for one stable subagent identity.
 pub struct SubagentRunState {
-	agent_id:   Str,
-	generation: AtomicU64,
-	sequence:   AtomicU64,
-	lifecycle:  AtomicU8,
+	agent_id:        Str,
+	generation:      AtomicU64,
+	sequence:        AtomicU64,
+	lifecycle:       AtomicU8,
 	yield_committed: AtomicBool,
-	progress:   Mutex<SubagentProgressSnapshot>,
-	terminal:   Mutex<Option<SubagentTerminalStatus>>,
-	events:     AppendVec<SubagentRunEvent>,
+	progress:        Mutex<SubagentProgressSnapshot>,
+	terminal:        Mutex<Option<SubagentTerminalStatus>>,
+	events:          AppendVec<SubagentRunEvent>,
 }
 
 impl SubagentRunState {
@@ -311,12 +311,12 @@ impl SubagentRunState {
 	pub fn terminal(&self) -> Option<SubagentTerminalStatus> {
 		self.terminal.lock().clone()
 	}
-	
+
 	/// Records that this generation committed a terminal `yield` call.
 	pub fn commit_yield(&self) {
 		self.yield_committed.store(true, Ordering::Release);
 	}
-	
+
 	/// Whether this generation committed a terminal `yield` call.
 	pub fn yield_committed(&self) -> bool {
 		self.yield_committed.load(Ordering::Acquire)
@@ -356,7 +356,9 @@ impl SubagentRunState {
 			progress.input_tokens.max(activity.input_tokens)
 		};
 		progress.output_tokens = if usage_receipt {
-			progress.output_tokens.saturating_add(activity.output_tokens)
+			progress
+				.output_tokens
+				.saturating_add(activity.output_tokens)
 		} else {
 			progress.output_tokens.max(activity.output_tokens)
 		};
@@ -536,7 +538,7 @@ mod tests {
 		assert!(state.progress().activity.len() <= MAX_PROGRESS_ACTIVITY_BYTES);
 		assert!(state.progress().truncated);
 	}
-	
+
 	#[test]
 	fn usage_receipts_accumulate_across_a_generation() {
 		let state = SubagentRunState::new(sf!("agent-usage"));

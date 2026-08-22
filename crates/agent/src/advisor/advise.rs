@@ -105,7 +105,9 @@ impl AdvisorAdviceQueue {
 		}
 		if severity == AdviceSeverity::Blocker || !state.mid_turn {
 			state.delivered.insert(key, severity);
-			state.ready.push(QueuedAdvice { note: Str::new(note), severity });
+			state
+				.ready
+				.push(QueuedAdvice { note: Str::new(note), severity });
 			return AdviceAdmission::Ready;
 		}
 		if let Some(index) = state.deferred_index.get(&key).copied() {
@@ -117,7 +119,9 @@ impl AdvisorAdviceQueue {
 			return AdviceAdmission::Deferred;
 		}
 		let index = state.deferred.len();
-		state.deferred.push(QueuedAdvice { note: Str::new(note), severity });
+		state
+			.deferred
+			.push(QueuedAdvice { note: Str::new(note), severity });
 		state.deferred_index.insert(key, index);
 		AdviceAdmission::Deferred
 	}
@@ -224,8 +228,8 @@ impl Tool for AdviseTool {
 	fn prompt(&self, view: Result<&AdvisePayload, &AdviseFault>, _: &PromptCaps) -> Vec<Part> {
 		let text = match view {
 			Ok(payload) if payload.admission == "deferred" => sf!(
-				"Deferred — primary is mid-turn; this note will be delivered automatically when \
-				 the turn completes. Do not re-raise the same point."
+				"Deferred — primary is mid-turn; this note will be delivered automatically when the \
+				 turn completes. Do not re-raise the same point."
 			),
 			Ok(payload) if payload.admission == "suppressed" => sf!("Duplicate advice ignored."),
 			Ok(_) => sf!("Recorded."),
@@ -267,45 +271,34 @@ fn protocol_issue(message: Str) -> ArgIssue {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use omp_tool::{Dialect, ModelClass};
+
+	use super::*;
 
 	#[test]
 	fn deferred_notes_dedupe_escalate_in_place_and_flush_oldest_first() {
 		let queue = AdvisorAdviceQueue::default();
 		queue.set_mid_turn(true);
-		assert_eq!(
-			queue.submit("First issue.", AdviceSeverity::Nit),
-			AdviceAdmission::Deferred
-		);
-		assert_eq!(
-			queue.submit("Second issue.", AdviceSeverity::Concern),
-			AdviceAdmission::Deferred
-		);
+		assert_eq!(queue.submit("First issue.", AdviceSeverity::Nit), AdviceAdmission::Deferred);
+		assert_eq!(queue.submit("Second issue.", AdviceSeverity::Concern), AdviceAdmission::Deferred);
 		assert_eq!(
 			queue.submit("First   issue.", AdviceSeverity::Concern),
 			AdviceAdmission::Deferred
 		);
-		assert_eq!(
-			queue.submit("First issue.", AdviceSeverity::Nit),
-			AdviceAdmission::Suppressed
-		);
+		assert_eq!(queue.submit("First issue.", AdviceSeverity::Nit), AdviceAdmission::Suppressed);
 		assert!(queue.drain_ready().is_empty());
 
 		queue.set_mid_turn(false);
-		assert_eq!(
-			queue.drain_ready(),
-			[
-				QueuedAdvice {
-					note:     Str::new_static("First issue."),
-					severity: AdviceSeverity::Concern,
-				},
-				QueuedAdvice {
-					note:     Str::new_static("Second issue."),
-					severity: AdviceSeverity::Concern,
-				},
-			]
-		);
+		assert_eq!(queue.drain_ready(), [
+			QueuedAdvice {
+				note:     Str::new_static("First issue."),
+				severity: AdviceSeverity::Concern,
+			},
+			QueuedAdvice {
+				note:     Str::new_static("Second issue."),
+				severity: AdviceSeverity::Concern,
+			},
+		]);
 	}
 
 	#[test]
@@ -320,13 +313,10 @@ mod tests {
 			queue.submit("Unsafe operation.", AdviceSeverity::Blocker),
 			AdviceAdmission::Ready
 		);
-		assert_eq!(
-			queue.drain_ready(),
-			[QueuedAdvice {
-				note:     Str::new_static("Unsafe operation."),
-				severity: AdviceSeverity::Blocker,
-			}]
-		);
+		assert_eq!(queue.drain_ready(), [QueuedAdvice {
+			note:     Str::new_static("Unsafe operation."),
+			severity: AdviceSeverity::Blocker,
+		}]);
 		queue.set_mid_turn(false);
 		assert!(queue.drain_ready().is_empty());
 	}
@@ -334,19 +324,13 @@ mod tests {
 	#[test]
 	fn delivered_note_accepts_only_a_later_escalation() {
 		let queue = AdvisorAdviceQueue::default();
-		assert_eq!(
-			queue.submit("Regression risk.", AdviceSeverity::Nit),
-			AdviceAdmission::Ready
-		);
+		assert_eq!(queue.submit("Regression risk.", AdviceSeverity::Nit), AdviceAdmission::Ready);
 		let _ = queue.drain_ready();
 		assert_eq!(
 			queue.submit("Regression risk.", AdviceSeverity::Nit),
 			AdviceAdmission::Suppressed
 		);
-		assert_eq!(
-			queue.submit("Regression risk.", AdviceSeverity::Concern),
-			AdviceAdmission::Ready
-		);
+		assert_eq!(queue.submit("Regression risk.", AdviceSeverity::Concern), AdviceAdmission::Ready);
 	}
 
 	#[test]
@@ -354,16 +338,13 @@ mod tests {
 		let queue = AdvisorAdviceQueue::default();
 		let tool = tool(queue);
 		let payload = AdvisePayload { admission: sf!("deferred") };
-		let parts = tool.prompt(
-			Ok(&payload),
-			&PromptCaps {
-				maximum_parts:      1,
-				maximum_text_bytes: 512,
-				media:              false,
-				dialect:            Dialect::default(),
-				model_class:        ModelClass::default(),
-			},
-		);
+		let parts = tool.prompt(Ok(&payload), &PromptCaps {
+			maximum_parts:      1,
+			maximum_text_bytes: 512,
+			media:              false,
+			dialect:            Dialect::default(),
+			model_class:        ModelClass::default(),
+		});
 		assert!(matches!(
 			parts.as_slice(),
 			[Part::Text { text }] if text.contains("Deferred")

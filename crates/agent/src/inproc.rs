@@ -4,7 +4,7 @@ use std::{io, sync::Arc};
 
 use flume::Sender;
 use hyper_util::rt::TokioIo;
-use omp_llm_inference::TurnId;
+use omp_inference::TurnId;
 use omp_proto::inference::v1::{
 	TurnEvent, TurnFrame,
 	inference_client::InferenceClient,

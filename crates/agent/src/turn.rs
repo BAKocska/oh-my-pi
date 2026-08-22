@@ -10,7 +10,7 @@ use std::{
 
 use futures::Stream;
 use omp_core::Str;
-use omp_llm_inference::TurnId;
+use omp_inference::TurnId;
 use omp_proto::{
 	inference::v1::{
 		self as pb, ChatParams, ContextRef, Executor, InvokeComplete, InvokeInput, ThreadDelta,

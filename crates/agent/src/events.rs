@@ -7,7 +7,7 @@ use std::sync::{
 
 use bytes::Bytes;
 use omp_core::{Str, ToolPath};
-use omp_llm_inference::TurnId;
+use omp_inference::TurnId;
 use omp_proto::{
 	inference::v1::{TurnEvent, turn_event},
 	thread::v1::Item,

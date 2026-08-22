@@ -157,10 +157,10 @@ fn two_force_claims_are_serialized_by_the_existing_queue() {
 	let fold = book.fold(Point::ToolChoice, &PointCx::default(), Some(&mut queue));
 	assert_eq!(fold.winner, WinnerKind::Force);
 	assert_eq!(queue.len(), 2);
-	assert!(matches!(queue.claim_next(), Some(omp_llm_inference::call::ToolChoice::Named(_))));
+	assert!(matches!(queue.claim_next(), Some(omp_inference::call::ToolChoice::Named(_))));
 	assert!(queue.claim_next().is_none(), "one claim remains exclusively in flight");
 	queue.resolve();
-	assert!(matches!(queue.claim_next(), Some(omp_llm_inference::call::ToolChoice::Named(_))));
+	assert!(matches!(queue.claim_next(), Some(omp_inference::call::ToolChoice::Named(_))));
 }
 
 #[test]
