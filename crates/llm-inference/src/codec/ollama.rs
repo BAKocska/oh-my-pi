@@ -242,7 +242,6 @@ pub struct OllamaModelDetails {
 }
 
 /// Decodes a complete, bounded Ollama discovery body without network access.
-
 #[derive(Serialize)]
 struct OllamaEmbedRequest<'a> {
 	model:      &'a str,

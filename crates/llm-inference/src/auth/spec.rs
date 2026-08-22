@@ -850,7 +850,6 @@ pub struct SessionTokenSpec {
 
 /// Structural authentication-spec validation failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-
 pub enum AuthSpecError {
 	/// A required catalog field is empty.
 	#[error("authentication specification has an empty {0}")]
