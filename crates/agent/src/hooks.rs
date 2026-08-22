@@ -164,18 +164,53 @@ impl DomainReturn for AgentSettled {
 	}
 }
 
-/// Domain result for `provider_error`; bytes remain the inference-owned
-/// failover vocabulary.
+/// Domain result for `provider_error`.
+///
+/// The wire payload is a JSON array of model-route names in failover order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderFailover(pub Bytes);
 
+impl ProviderFailover {
+	/// Decodes the validated failover chain.
+	pub fn routes(&self) -> Vec<Str> {
+		serde_json::from_slice(self.0.as_ref()).unwrap_or_default()
+	}
+}
+
 impl DomainReturn for ProviderFailover {
 	fn decode_domain(bytes: &[u8]) -> Option<Self> {
-		Some(Self(Bytes::copy_from_slice(bytes)))
+		let routes = serde_json::from_slice::<Vec<Str>>(bytes).ok()?;
+		(!routes.is_empty()).then(|| Self(Bytes::copy_from_slice(bytes)))
 	}
 
 	fn fail_open() -> Self {
 		Self(Bytes::new())
+	}
+}
+
+/// Hook payload emitted after a retryable provider failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderErrorEvent {
+	/// Stable classified failure code.
+	pub code:    Str,
+	/// Durable turn that failed.
+	pub turn_id: Str,
+}
+
+impl HookEvent for ProviderErrorEvent {
+	type Return = ProviderFailover;
+
+	const ID: HookEventId = HookEventId::HookEventProviderError;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut BytesMut) {
+		out.extend_from_slice(self.code.as_bytes());
+		out.extend_from_slice(b"\n");
+		out.extend_from_slice(self.turn_id.as_bytes());
+	}
+
+	fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
+		Ok(())
 	}
 }
 
@@ -656,9 +691,18 @@ mod tests {
 	use omp_proto::toolhost::v1::HookEventId;
 
 	use super::{
-		GateDecision, GateEvent, HookGate, HookPatch, HookPhase, OnFailure, SourceRef, Subscription,
-		When,
+		DomainReturn, GateDecision, GateEvent, HookGate, HookPatch, HookPhase, OnFailure,
+		ProviderFailover, SourceRef, Subscription, When,
 	};
+
+	#[test]
+	fn provider_failover_requires_a_nonempty_typed_route_chain() {
+		let failover =
+			ProviderFailover::decode_domain(br#"["model-a","model-b"]"#).expect("valid route chain");
+		assert_eq!(failover.routes(), vec![sf!("model-a"), sf!("model-b")]);
+		assert!(ProviderFailover::decode_domain(b"[]").is_none());
+		assert!(ProviderFailover::decode_domain(b"not-json").is_none());
+	}
 
 	fn subscription(phase: HookPhase, id: u32) -> Subscription {
 		Subscription {

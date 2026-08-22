@@ -405,7 +405,7 @@ async fn conflict_and_need_full_are_typed_terminal_recoveries_without_seam_polic
 async fn replay_acceptance_and_unknown_terminal_errors_pass_through_verbatim() {
 	let unknown = pb::TurnError {
 		kind: 777,
-		detail: "future gateway error".to_owned(),
+		detail: "future arbiter error".to_owned(),
 		retry_after_ms: 55,
 		error_id: Some(99),
 		..Default::default()

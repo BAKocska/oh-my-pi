@@ -37,11 +37,13 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
+	arbiter::FoldFact,
+	campaign::CampaignEntry,
 	events::EventBus,
 	journal_kinds::{
-		CHECKPOINT_KIND, CORE_EXTENSION, CORE_REVISION, EntryKindDecl, EntryKindError,
-		EntryKindRegistry, REWIND_REPORT_KIND, TTSR_INJECTION_KIND, core_checkpoint_declarations,
-		core_ttsr_declaration,
+		ARBITER_FOLD_KIND, CAMPAIGN_ENTRY_KIND, CHECKPOINT_KIND, CORE_EXTENSION, CORE_REVISION,
+		EntryKindDecl, EntryKindError, EntryKindRegistry, REWIND_REPORT_KIND, TTSR_INJECTION_KIND,
+		core_campaign_declarations, core_checkpoint_declarations, core_ttsr_declaration,
 	},
 	prompt::PromptHash,
 	ttsr::TtsrSource,
@@ -577,8 +579,8 @@ pub enum JournalError {
 	/// A sequence amendment targeted a non-item event.
 	#[error("sequence amendment target {0} is not a canonical item")]
 	InvalidItemTarget(u64),
-	/// Gateway-assigned item sequences begin at one.
-	#[error("gateway sequence must be nonzero")]
+	/// Arbiter-assigned item sequences begin at one.
+	#[error("arbiter sequence must be nonzero")]
 	ZeroSequence,
 	/// A resumed turn replay did not match its already journaled prefix.
 	#[error("replayed outcome for turn {0} differs from its durable prefix")]
@@ -606,8 +608,8 @@ pub enum JournalError {
 	/// A turn start referenced an absent or non-item event.
 	#[error("turn start references non-item event {0}")]
 	InvalidTurnInput(u64),
-	/// A terminal gateway outcome arrived without a durable turn start.
-	#[error("gateway outcome for turn {0} has no durable turn start")]
+	/// A terminal arbiter outcome arrived without a durable turn start.
+	#[error("arbiter outcome for turn {0} has no durable turn start")]
 	MissingTurnStart(Str),
 	/// A durable receipt revision cannot assign its recorded input sequences.
 	#[error("turn receipt for {0} has an invalid sequence range")]
@@ -637,7 +639,7 @@ pub enum JournalError {
 	/// An authorization named a call absent from its turn receipt.
 	#[error("tool call {call_id} is absent from receipt {turn_id}")]
 	UnknownReceiptCall {
-		/// Gateway turn identifier.
+		/// Arbiter turn identifier.
 		turn_id: Str,
 		/// Missing call identifier.
 		call_id: Str,
@@ -3061,13 +3063,13 @@ impl Journal {
 			.collect())
 	}
 
-	/// Appends an authoritative gateway outcome and its terminal receipt.
+	/// Appends an authoritative arbiter outcome and its terminal receipt.
 	///
 	/// Prompt identity and head boundaries come from the durable [`TurnStart`],
 	/// never from mutable caller state. Replaying an existing receipt succeeds
 	/// only when the complete canonical outcome is field-exact; it appends no
 	/// duplicate items or receipt.
-	pub fn append_gateway_outcome(
+	pub fn append_arbiter_outcome(
 		&mut self,
 		ts: u64,
 		turn_id: &str,
@@ -3116,7 +3118,7 @@ impl Journal {
 				}),
 			};
 			let Kind::Item(record) = &event.kind else {
-				unreachable!("constructed gateway item event");
+				unreachable!("constructed arbiter item event");
 			};
 			let prompt = self
 				.session_index
@@ -3175,6 +3177,138 @@ impl Journal {
 			return Err(JournalError::SessionIndexAfterJournal { event_index: receipt_event, source });
 		}
 		Ok((receipt, false))
+	}
+
+	/// Appends one invisible core TTSR injection with its model-context
+	/// projection.
+	/// Appends one invisible arbiter-fold fact and emits no model context.
+	pub fn append_arbiter_fold(&mut self, ts: u64, fact: &FoldFact) -> Result<u64, JournalError> {
+		self.append_campaign_fact(
+			ts,
+			ARBITER_FOLD_KIND,
+			sf!("fold-{}", omp_core::Ulid::generate()),
+			serde_json::value::to_raw_value(fact).map_err(transcript::Error::from)?,
+		)
+	}
+
+	/// Appends one first-class durable campaign lifecycle record.
+	pub fn append_campaign_entry(
+		&mut self,
+		ts: u64,
+		entry: &CampaignEntry,
+	) -> Result<u64, JournalError> {
+		self.append_campaign_fact(
+			ts,
+			CAMPAIGN_ENTRY_KIND,
+			sf!(
+				"campaign-{}-{}-{}-{}",
+				entry.engagement.as_str(),
+				entry.ladder_position,
+				entry.status,
+				Hash32::sum(entry.state.as_bytes()),
+			),
+			serde_json::value::to_raw_value(entry).map_err(transcript::Error::from)?,
+		)
+	}
+
+	/// Recovers the latest lifecycle record for every engagement.
+	pub fn recover_campaign_entries(&self) -> Result<Vec<CampaignEntry>, JournalError> {
+		let log = self.load()?;
+		let mut latest = BTreeMap::<Str, CampaignEntry>::new();
+		for index in log.as_ref().iter() {
+			let Some(transcript::Entry::Ok(event)) = log.get(index) else {
+				continue;
+			};
+			let Kind::Custom(custom) = &event.kind else {
+				continue;
+			};
+			if custom.kind() != CAMPAIGN_ENTRY_KIND {
+				continue;
+			}
+			let Some(data) = custom.data() else {
+				continue;
+			};
+			let Ok(entry) = serde_json::from_str::<CampaignEntry>(data.get()) else {
+				continue;
+			};
+			latest.insert(entry.engagement.clone(), entry);
+		}
+		Ok(latest.into_values().collect())
+	}
+
+	/// Returns SETTLE fold facts explaining who vetoed a stop for `turn_id`.
+	pub fn settle_vetoes(&self, turn_id: &str) -> Result<Vec<FoldFact>, JournalError> {
+		let log = self.load()?;
+		let mut facts = Vec::new();
+		for index in log.as_ref().iter() {
+			let Some(transcript::Entry::Ok(event)) = log.get(index) else {
+				continue;
+			};
+			let Kind::Custom(custom) = &event.kind else {
+				continue;
+			};
+			if custom.kind() != ARBITER_FOLD_KIND {
+				continue;
+			}
+			let Some(data) = custom.data() else {
+				continue;
+			};
+			let Ok(fact) = serde_json::from_str::<FoldFact>(data.get()) else {
+				continue;
+			};
+			if fact.point == omp_core::phase::Point::Settle
+				&& fact
+					.turn_id
+					.as_ref()
+					.is_some_and(|candidate| candidate == turn_id)
+				&& fact.winner != "pass"
+			{
+				facts.push(fact);
+			}
+		}
+		Ok(facts)
+	}
+
+	fn append_campaign_fact(
+		&mut self,
+		ts: u64,
+		kind: &'static str,
+		request_id: Str,
+		data: Box<RawValue>,
+	) -> Result<u64, JournalError> {
+		self.declare_entry_kinds(CORE_EXTENSION, core_campaign_declarations())?;
+		let reply = self.handle_request(JournalRequest {
+			ts,
+			stamp: JournalRequestStamp {
+				idempotency_key: request_id.clone(),
+				request_id,
+				host_generation: self.generations.host,
+				session_generation: self.generations.session,
+			},
+			author: JournalAuthor {
+				principal:  Principal::new(sf!("omp.core"), sf!("OMP Core")),
+				provenance: Provenance::new(
+					sf!("omp"),
+					sf!(CORE_EXTENSION),
+					sf!(env!("CARGO_PKG_VERSION")),
+					ArtifactDigest::new([0; 32]),
+					sf!("core"),
+					sf!("builtin"),
+					0,
+				),
+			},
+			operation: JournalOperation::Append(PendingCustomEntry {
+				kind:    sf!(kind),
+				rev:     sf!(CORE_REVISION),
+				data:    Some(data),
+				context: None,
+				display: Some(false),
+			}),
+		})?;
+		Ok(*reply
+			.indexes
+			.first()
+			.expect("single campaign fact append returns one payload index"))
 	}
 
 	/// Appends one invisible core TTSR injection with its model-context
@@ -3384,7 +3518,7 @@ impl Journal {
 		self.pending_jobs.values().map(|(_, job)| job)
 	}
 
-	/// Appends a later event assigning a gateway sequence to an item event.
+	/// Appends a later event assigning a arbiter sequence to an item event.
 	pub fn amend_seq(&mut self, ts: u64, target: u64, seq: u64) -> Result<u64, JournalError> {
 		if seq == 0 {
 			return Err(JournalError::ZeroSequence);
@@ -4078,7 +4212,7 @@ mod tests {
 			})
 			.expect("start turn");
 		journal
-			.append_gateway_outcome(4, "turn", tool_outcome())
+			.append_arbiter_outcome(4, "turn", tool_outcome())
 			.expect("append tool outcome");
 		if authorized {
 			journal
@@ -4183,7 +4317,7 @@ mod tests {
 		outcome.output.push(second);
 		outcome.revision.as_mut().expect("revision").head = 4;
 		journal
-			.append_gateway_outcome(4, "turn", outcome.clone())
+			.append_arbiter_outcome(4, "turn", outcome.clone())
 			.expect("append tool outcome");
 		journal
 			.authorize_tool_batch(5, "turn", &[sf!("call-1"), sf!("call-2")])
@@ -4265,7 +4399,7 @@ mod tests {
 			})
 			.expect("start first group");
 		journal
-			.append_gateway_outcome(6, &first_turn, outcome())
+			.append_arbiter_outcome(6, &first_turn, outcome())
 			.expect("complete first group");
 		drop(journal);
 
@@ -4295,7 +4429,7 @@ mod tests {
 			})
 			.expect("start second group");
 		journal
-			.append_gateway_outcome(8, &second_turn, outcome())
+			.append_arbiter_outcome(8, &second_turn, outcome())
 			.expect("complete second group");
 		drop(journal);
 
@@ -4311,7 +4445,7 @@ mod tests {
 	}
 
 	#[test]
-	fn gateway_outcome_receipt_round_trips_and_replays_exactly_once() {
+	fn arbiter_outcome_receipt_round_trips_and_replays_exactly_once() {
 		let path = path("receipt");
 		let prompt_hash = PromptHash::from([7; 32]);
 		let mut journal = Journal::create(&path, &header()).expect("create journal");
@@ -4348,7 +4482,7 @@ mod tests {
 
 		let expected = outcome();
 		let (receipt, replay) = journal
-			.append_gateway_outcome(5, "turn", expected.clone())
+			.append_arbiter_outcome(5, "turn", expected.clone())
 			.expect("append outcome");
 		assert!(!replay);
 		assert_eq!(receipt.prompt_hash, prompt_hash.digest());
@@ -4357,7 +4491,7 @@ mod tests {
 		let bytes = std::fs::read(&path).expect("read committed journal");
 
 		let (replayed, replay) = journal
-			.append_gateway_outcome(6, "turn", expected.clone())
+			.append_arbiter_outcome(6, "turn", expected.clone())
 			.expect("replay exact outcome");
 		assert!(replay);
 		assert_eq!(replayed, receipt);
@@ -4366,7 +4500,7 @@ mod tests {
 		let mut different = expected;
 		different.provider = "other".to_owned();
 		assert!(matches!(
-			journal.append_gateway_outcome(7, "turn", different),
+			journal.append_arbiter_outcome(7, "turn", different),
 			Err(JournalError::TurnReplayMismatch(_))
 		));
 		assert_eq!(std::fs::read(&path).expect("read rejected replay journal"), bytes);
@@ -4486,7 +4620,7 @@ mod tests {
 			.start_turn(7, success)
 			.expect("start successful turn");
 		reopened
-			.append_gateway_outcome(8, "successful-turn", outcome())
+			.append_arbiter_outcome(8, "successful-turn", outcome())
 			.expect("append successful receipt");
 		assert_eq!(reopened.trailing_aborts(), 0);
 		drop(reopened);

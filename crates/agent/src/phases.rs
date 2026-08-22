@@ -3,7 +3,9 @@
 //! Stable lifecycle, invocation, and hook decision vocabularies.
 
 /// Canonical lifecycle and invocation vocabularies.
-pub use omp_core::phase::{ActivateReason, InvocationPhase, LifecyclePhase, RestartReason};
+pub use omp_core::phase::{
+	ActivateReason, InvocationPhase, LifecyclePhase, Point, PointSet, RestartReason,
+};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 

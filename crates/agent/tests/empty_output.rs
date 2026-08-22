@@ -256,7 +256,7 @@ fn exhausted_journal(path: &std::path::Path) -> Journal {
 		.start_turn(2, turn_start("prior-success"))
 		.expect("start prior success");
 	journal
-		.append_gateway_outcome(3, "prior-success", success())
+		.append_arbiter_outcome(3, "prior-success", success())
 		.expect("commit prior success");
 	let texts = [
 		"capped original".to_owned(),
@@ -472,7 +472,7 @@ async fn crash_after_abort_reclaims_input_under_fresh_full_reseed() {
 		.start_turn(2, prior)
 		.expect("start prior successful turn");
 	journal
-		.append_gateway_outcome(3, "prior-success", pb::Outcome {
+		.append_arbiter_outcome(3, "prior-success", pb::Outcome {
 			stop: pb::StopReason::StopEndTurn as i32,
 			revision: Some(prior_revision.clone()),
 			..pb::Outcome::default()
@@ -640,7 +640,7 @@ async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
 		.start_turn(2, turn_start("prior-success"))
 		.expect("start prior successful turn");
 	journal
-		.append_gateway_outcome(3, "prior-success", success())
+		.append_arbiter_outcome(3, "prior-success", success())
 		.expect("commit prior successful turn");
 
 	let (opened_tx, opened_rx) = flume::unbounded();

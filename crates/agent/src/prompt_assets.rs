@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 
-use crate::{PromptMode, SlotClass, SlotId};
+use crate::{SlotClass, SlotId};
 
 /// Semantic family of an immutable prompt asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,24 +228,25 @@ pub fn prompt_assets() -> impl ExactSizeIterator<Item = &'static PromptAsset> + 
 	ASSETS.iter()
 }
 
-/// Returns the rich asset selected by a live execution mode.
-pub const fn mode_prompt_asset(mode: PromptMode) -> &'static PromptAsset {
-	let id = match mode {
-		PromptMode::Plan => PromptAssetId::ModePlan,
-		PromptMode::Prewalk => PromptAssetId::ModePrewalk,
-		PromptMode::Goal => PromptAssetId::ModeGoal,
-		PromptMode::Vibe => PromptAssetId::ModeVibe,
-		PromptMode::MemoryPipeline => PromptAssetId::ModeMemoryPipeline,
-		PromptMode::Advisor => PromptAssetId::ModeAdvisor,
-		PromptMode::Autoresearch => PromptAssetId::ModeAutoresearch,
-		PromptMode::SecurityAudit => PromptAssetId::ModeSecurityAudit,
-		PromptMode::Bench => PromptAssetId::ModeBench,
-		PromptMode::Review => PromptAssetId::ModeReview,
-		PromptMode::Cleanse => PromptAssetId::ModeCleanse,
-		PromptMode::Compress => PromptAssetId::ModeCompress,
-		PromptMode::LiveCollab => PromptAssetId::ModeLiveCollab,
+/// Returns the rich asset selected by a campaign prompt-slot binding.
+pub fn prompt_slot_asset(slot: &str) -> Option<&'static PromptAsset> {
+	let id = match slot {
+		"plan" | "plan-yolo" => PromptAssetId::ModePlan,
+		"prewalk" => PromptAssetId::ModePrewalk,
+		"goal" => PromptAssetId::ModeGoal,
+		"vibe" => PromptAssetId::ModeVibe,
+		"memory-pipeline" => PromptAssetId::ModeMemoryPipeline,
+		"advisor" => PromptAssetId::ModeAdvisor,
+		"autoresearch" => PromptAssetId::ModeAutoresearch,
+		"security-audit" => PromptAssetId::ModeSecurityAudit,
+		"bench" => PromptAssetId::ModeBench,
+		"review" => PromptAssetId::ModeReview,
+		"cleanse" => PromptAssetId::ModeCleanse,
+		"compress" => PromptAssetId::ModeCompress,
+		"live-collab" => PromptAssetId::ModeLiveCollab,
+		_ => return None,
 	};
-	prompt_asset(id)
+	Some(prompt_asset(id))
 }
 
 /// Renders the typed retry count into the immutable empty-stop template.

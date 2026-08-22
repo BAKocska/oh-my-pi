@@ -9,7 +9,18 @@ pub(crate) const CORE_EXTENSION: &str = "dev.omp.core";
 pub(crate) const CHECKPOINT_KIND: &str = "dev.omp.core.checkpoint";
 pub(crate) const REWIND_REPORT_KIND: &str = "dev.omp.core.rewind-report";
 pub(crate) const TTSR_INJECTION_KIND: &str = "dev.omp.core.ttsr-injection";
+pub(crate) const ARBITER_FOLD_KIND: &str = "dev.omp.core.arbiter-fold";
+pub(crate) const CAMPAIGN_ENTRY_KIND: &str = "dev.omp.core.campaign-entry";
 pub(crate) const CORE_REVISION: &str = "core.1";
+
+pub(crate) fn core_campaign_declarations() -> Vec<EntryKindDecl> {
+	vec![
+		EntryKindDecl::parse(ARBITER_FOLD_KIND, CORE_REVISION, false, false, None)
+			.expect("static arbiter fold revision is valid"),
+		EntryKindDecl::parse(CAMPAIGN_ENTRY_KIND, CORE_REVISION, false, false, None)
+			.expect("static campaign entry revision is valid"),
+	]
+}
 
 pub(crate) fn core_ttsr_declaration() -> EntryKindDecl {
 	EntryKindDecl::parse(TTSR_INJECTION_KIND, CORE_REVISION, false, false, None)

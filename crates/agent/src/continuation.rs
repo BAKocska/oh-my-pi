@@ -1,6 +1,6 @@
 //! Settled-boundary continuation decisions and recursive ledger accounting.
 
-use std::time::Duration;
+use std::{future::Future, pin::Pin, time::Duration};
 
 use bytes::BytesMut;
 use omp_core::Str;
@@ -10,6 +10,41 @@ use crate::{
 	hooks::{AgentSettled, GateError, HookEvent, HookPatch},
 	mailbox::InterruptSource,
 };
+
+/// Committed recovery evidence offered to a cold OAuth redemption authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RedemptionEvidence {
+	/// Preserve a committed partial generation.
+	Salvage {
+		/// Durable turn identity.
+		turn_id: Str,
+	},
+	/// Restore a turn that produced no usable output.
+	Restore {
+		/// Durable turn identity.
+		turn_id: Str,
+	},
+	/// A compaction replaced provider history at this journal epoch.
+	PostCompaction {
+		/// Compaction journal event.
+		epoch: u64,
+	},
+}
+
+/// Cold future allocated only around real OAuth redemption I/O.
+pub type RedemptionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// App-owned authority bridging loop evidence to provider redemption.
+///
+/// This is deliberately the cold dynamic boundary sanctioned for real network
+/// I/O; the hot arbiter fold remains allocation-free.
+pub trait RedemptionAuthority: Send + Sync + 'static {
+	/// Attempts redemption for committed typed evidence.
+	fn redeem(&self, evidence: RedemptionEvidence) -> RedemptionFuture<'_, bool>;
+
+	/// Reseeds provider-native history after a successful redemption.
+	fn reseed_history(&self) -> RedemptionFuture<'_, ()>;
+}
 
 /// Consecutive-continuation accounting projected from durable journal facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +130,64 @@ impl LoopSignal {
 pub trait ContinuationSource: Send + Sync {
 	/// Returns a candidate and its owner policy from Core loop evidence.
 	fn decide(&self, signal: &LoopSignal, now_ms: u64) -> (Continuation, ContinuationPolicy);
+}
+/// Built-in participant lanes evaluated by the SETTLE arbiter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettledParticipant {
+	/// Application-owned autonomous continuation source.
+	ContinuationSource,
+	/// Stateless `AgentSettled` domain hook.
+	AgentSettled,
+}
+
+/// Degenerate pre-campaign SETTLE fold over the two built-in participants.
+pub struct SettledFold {
+	candidate: Continuation,
+	policy:    ContinuationPolicy,
+	winner:    Option<SettledParticipant>,
+}
+
+impl Default for SettledFold {
+	fn default() -> Self {
+		Self {
+			candidate: Continuation::Settle,
+			policy:    ContinuationPolicy::default(),
+			winner:    None,
+		}
+	}
+}
+
+impl SettledFold {
+	/// Creates an empty settle fold.
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Considers a participant in priority order; the first continuation wins.
+	pub fn consider(
+		&mut self,
+		participant: SettledParticipant,
+		candidate: Continuation,
+		policy: ContinuationPolicy,
+	) {
+		if matches!(self.candidate, Continuation::Settle)
+			&& matches!(candidate, Continuation::Continue { .. })
+		{
+			self.candidate = candidate;
+			self.policy = policy;
+			self.winner = Some(participant);
+		}
+	}
+
+	/// Returns the winning participant, if a lane vetoed settlement.
+	pub const fn winner(&self) -> Option<SettledParticipant> {
+		self.winner
+	}
+
+	/// Consumes the fold into the candidate and its owner policy.
+	pub fn into_parts(self) -> (Continuation, ContinuationPolicy) {
+		(self.candidate, self.policy)
+	}
 }
 
 impl ContinuationLedger {

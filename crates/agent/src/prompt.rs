@@ -664,54 +664,22 @@ impl SlotSource for CachedContribution {
 		Ok(())
 	}
 }
-/// Built-in execution-role prompt selected for one immutable turn snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum PromptMode {
-	/// Read-only planning and review.
-	Plan,
-	/// Plan validation that switches on the first justified mutation.
-	Prewalk,
-	/// Continue autonomously toward a durable goal.
-	Goal,
-	/// Coordinate a broad agent swarm through one orchestration device.
-	Vibe,
-	/// Refresh compacted memory without performing unrelated work.
-	MemoryPipeline,
-	/// Advise without taking workspace ownership.
-	Advisor,
-	/// Gather external evidence before proposing changes.
-	Autoresearch,
-	/// Audit for exploitable security defects.
-	SecurityAudit,
-	/// Measure a defined scenario and report reproducible evidence.
-	Bench,
-	/// Review a concrete change set.
-	Review,
-	/// Remove generated residue without changing behavior.
-	Cleanse,
-	/// Compress context while preserving active constraints.
-	Compress,
-	/// Coordinate edits with live collaborators.
-	LiveCollab,
+/// Immutable built-in [`SlotSource`] selected by the campaign prompt-slot
+/// binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptSlotSource {
+	slot: Str,
 }
 
-impl PromptMode {
-	const fn prompt(self) -> &'static str {
-		crate::prompt_assets::mode_prompt_asset(self).content
+impl PromptSlotSource {
+	/// Creates a prompt source from a canonical prompt-slot binding value.
+	pub fn new(slot: impl Into<Str>) -> Self {
+		Self { slot: slot.into() }
 	}
-}
 
-/// Immutable built-in [`SlotSource`] for one execution mode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ModePromptSource {
-	mode: PromptMode,
-}
-
-impl ModePromptSource {
-	/// Creates the prompt source for an active mode.
-	pub const fn new(mode: PromptMode) -> Self {
-		Self { mode }
+	/// Returns the canonical binding value.
+	pub fn slot(&self) -> &str {
+		self.slot.as_str()
 	}
 
 	/// Wraps this source in the canonical volatile status slot.
@@ -728,13 +696,15 @@ impl ModePromptSource {
 	}
 }
 
-impl SlotSource for ModePromptSource {
+impl SlotSource for PromptSlotSource {
 	fn render(
 		&self,
 		_workspace: &WorkspaceInput,
 		out: &mut dyn PromptOut,
 	) -> Result<(), PromptError> {
-		out.write_str(self.mode.prompt());
+		let asset = crate::prompt_assets::prompt_slot_asset(self.slot.as_str())
+			.ok_or_else(|| PromptError::UnknownPromptSlot { slot: self.slot.clone() })?;
+		out.write_str(asset.content);
 		Ok(())
 	}
 }
@@ -2220,6 +2190,12 @@ impl PromptSource for WorkspacePromptSource {
 /// Prompt rendering or canonicalization failure.
 #[derive(Debug, Error)]
 pub enum PromptError {
+	/// A campaign binding named no built-in prompt slot.
+	#[error("unknown prompt slot {slot}")]
+	UnknownPromptSlot {
+		/// Unknown binding value.
+		slot: Str,
+	},
 	/// The source emitted different items for identical immutable input.
 	#[error("prompt source emitted volatile output for identical workspace input")]
 	Volatile,
@@ -2852,7 +2828,7 @@ mod tests {
 	#[test]
 	fn built_in_mode_source_renders_only_the_selected_mode() {
 		let mut mode = String::new();
-		ModePromptSource::new(PromptMode::Prewalk)
+		PromptSlotSource::new("prewalk")
 			.render(&WorkspaceInput::default(), &mut mode)
 			.unwrap();
 		assert!(mode.contains("grep every other call site"));

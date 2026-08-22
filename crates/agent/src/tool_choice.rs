@@ -100,7 +100,7 @@ pub struct PushOptions {
 enum ChoiceGenerator {
 	Once(Option<ToolChoice>),
 	Sequence(std::vec::IntoIter<ToolChoice>),
-	Custom(Box<dyn Iterator<Item = ToolChoice> + Send + 'static>),
+	Custom(Box<dyn Iterator<Item = ToolChoice> + Send + Sync + 'static>),
 }
 
 impl Iterator for ChoiceGenerator {
@@ -188,7 +188,7 @@ impl ToolChoiceQueue {
 	pub fn push_generator<I>(&mut self, choices: I, options: PushOptions)
 	where
 		I: IntoIterator<Item = ToolChoice>,
-		I::IntoIter: Send + 'static,
+		I::IntoIter: Send + Sync + 'static,
 	{
 		self.push_inner(ChoiceGenerator::Custom(Box::new(choices.into_iter())), options);
 	}
@@ -250,10 +250,15 @@ impl ToolChoiceQueue {
 	///
 	/// Merely inspecting queue state never marks the directive invoked.
 	pub fn invoke_in_flight(&mut self, input: Value) -> Option<InvokeFuture> {
+		let invoker = self.in_flight_invoker()?;
+		Some(invoker(input))
+	}
+
+	pub(crate) fn in_flight_invoker(&mut self) -> Option<Invoker> {
 		let in_flight = self.in_flight.as_mut()?;
 		let invoker = in_flight.callbacks.on_invoked.as_ref()?;
 		in_flight.invoked = true;
-		Some(invoker(input))
+		Some(Arc::clone(invoker))
 	}
 
 	/// Registers or replaces one uniquely identified, non-forcing preview
@@ -286,6 +291,13 @@ impl ToolChoiceQueue {
 			.pending_invokers
 			.last()
 			.map(|pending| (pending.invoker)(input))
+	}
+
+	pub(crate) fn pending_invoker(&self) -> Option<Invoker> {
+		self
+			.pending_invokers
+			.last()
+			.map(|pending| Arc::clone(&pending.invoker))
 	}
 
 	/// Returns metadata for the most recently registered pending invoker.

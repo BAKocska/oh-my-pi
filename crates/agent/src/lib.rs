@@ -14,11 +14,13 @@ extern crate omp_core;
 
 pub mod advisor;
 mod approvals;
+pub mod arbiter;
 pub mod attachments;
 mod autolearn;
 mod batch;
 pub mod branch_summary;
 mod broker;
+pub mod campaign;
 mod compact;
 pub mod context;
 mod continuation;
@@ -55,6 +57,7 @@ pub use approvals::{
 	ApprovalBook, ApprovalDecision, ApprovalGuard, ApprovalInbox, ApprovalRequest, ApprovalRoute,
 	ApprovalSource, ApprovalSpec, ApprovalTicket, TicketState,
 };
+pub use arbiter::{Arbiter, ArbiterError, Fold, FoldFact, Lane, PendingInvokerCx, PointCx};
 pub use attachments::{
 	Attachment, AttachmentError, AttachmentIndex, DEFAULT_PROVIDER_IMAGE_BUDGET,
 	MAX_TRANSIENT_IMAGE_BYTES, NormalizeAttachmentError, NormalizedAttachmentImage,
@@ -66,15 +69,25 @@ pub use autolearn::{
 	capture_interrupt, is_capture_item, standing_guidance,
 };
 pub use batch::{
-	BatchError, BatchResult, CommittedCall, EXECUTION_MODE_PROP, ExecutionMode, ExecutionModeHandle,
-	InvocationAdmission, InvocationHookBus, InvocationHookRequest, PLAN_YOLO_PROP,
-	PREWALK_REASON_PROP, SpeculativeCall, ToolBatch, effects_mutate_environment, hook_event_mask,
+	BatchError, BatchResult, CommittedCall, EXECUTION_MODE_PROP, InvocationAdmission,
+	InvocationHookBus, InvocationHookRequest, PLAN_YOLO_PROP, PREWALK_REASON_PROP, SpeculativeCall,
+	ToolBatch, effects_mutate_environment, hook_event_mask, invocation_mode_props,
 };
 pub use broker::{
 	AgentHistory, AgentRecord, AgentRegistry, Broker, BrokerError, BrokerInbox, CollabAgentKind,
 	CollabAgentRecord, CollabRegistrySnapshot, DeliveryMode, DeliveryReceipt, DiscoveryDiagnostic,
 	DiscoveryDiagnosticKind, ParkLease, PeerMessage, Receipt, RegistryError, RegistryStatus,
 	RevivalRequest, RoutedEvent, now_ms as broker_now_ms, peer_item,
+};
+pub use campaign::{
+	BindSlot, CampaignEntry, CampaignEntryStatus, CampaignFold, CampaignMachine, CampaignScope,
+	CampaignSpec, CampaignSpecId, CampaignStack, CampaignStateError, CampaignStepResult,
+	CampaignWhen, ClaimOutcome, DeclareError, DisengageError, EngageError, EngageOptions,
+	EngageReceipt, EngagementId, ExhaustPolicy, GoalCampaign, GoalCampaignState, HoldError, HoldSet,
+	HoldTicket, Ladder, LadderStep, LegacySessionStopCampaign, QuiescenceBarrier, Reaction,
+	RegimeMachine, RevivalReport, SLOT_TABLE, ScopedBinding, SlotClaim, SlotRegistry,
+	SubagentYieldCampaign, Verdict, WinnerKind, autoresearch_regime_spec, core_regime,
+	goal_regime_spec, plan_regime_spec, vibe_regime_spec,
 };
 pub use compact::{
 	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionBoundary, CompactionCoordinator,
@@ -99,7 +112,8 @@ pub use context::{
 };
 pub use continuation::{
 	AgentSettledEvent, Continuation, ContinuationLedger, ContinuationPolicy, ContinuationSource,
-	LoopSignal, continues_loop, from_hook,
+	LoopSignal, RedemptionAuthority, RedemptionEvidence, RedemptionFuture, SettledFold,
+	SettledParticipant, continues_loop, from_hook,
 };
 pub use control::{ControlError, ControlSender, RewindAck};
 pub use events::{
@@ -110,7 +124,7 @@ pub use events::{
 pub use hooks::{
 	AgentSettled, Composition, ContextPatch, DomainReturn, GateDecision, GateError, GateEvent,
 	GateOutcome, HookDispatch, HookEvent, HookGate, HookPatch, MODIFY_ROUNDS, OBSERVE_HANDLER_CAP,
-	OnFailure, ProviderFailover, SourceRef, Subscription, TransformTrail, When,
+	OnFailure, ProviderErrorEvent, ProviderFailover, SourceRef, Subscription, TransformTrail, When,
 };
 pub use inproc::{InProcTurnClient, RpcTurnClient, RpcTurnSession};
 pub use jobs::{
@@ -155,7 +169,8 @@ pub use oneshot::{
 	Completion, CompletionError, CompletionRequest, resolve_completion, select_choice,
 };
 pub use phases::{
-	ActivateReason, HookDecision, HookPhase, InvocationPhase, LifecyclePhase, RestartReason,
+	ActivateReason, HookDecision, HookPhase, InvocationPhase, LifecyclePhase, Point, PointSet,
+	RestartReason,
 };
 pub use project::{
 	ProjectionError, project_journal, project_thread_history, tool_result_item,
@@ -163,11 +178,11 @@ pub use project::{
 };
 pub use prompt::{
 	ActiveRepositoryInput, BandHash, CachedContribution, CanonicalPromptSource, ContextFile,
-	ConventionsPromptSource, DeliveryPromptSource, EagerTaskPolicy, HostInfoInput, ModePromptSource,
-	ModelPromptInput, MutationPromptInput, Personality, PolicyPromptSource, ProjectPromptSource,
+	ConventionsPromptSource, DeliveryPromptSource, EagerTaskPolicy, HostInfoInput, ModelPromptInput,
+	MutationPromptInput, Personality, PolicyPromptSource, ProjectPromptSource,
 	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptError, PromptHash,
-	PromptMemoryInput, PromptMemorySlotInput, PromptMode, PromptNamedInput, PromptOut,
-	PromptPatchSet, PromptSchemeInput, PromptSettingsInput, PromptSource, PromptToolExampleInput,
+	PromptMemoryInput, PromptMemorySlotInput, PromptNamedInput, PromptOut, PromptPatchSet,
+	PromptSchemeInput, PromptSettingsInput, PromptSlotSource, PromptSource, PromptToolExampleInput,
 	PromptToolInput, RenderedPrompt, RepositoryInput, RolePromptSource, RuntimePromptSource,
 	SECURITY_REVIEW_INSTRUCTION_V1, SlotAssembler, SlotClass, SlotDecl, SlotId, SlotPatch,
 	SlotRegistration, SlotSource, ToolInventoryMode, VcsIdentity, VolatilePrompt,
@@ -200,6 +215,6 @@ pub use ttsr::{
 	TtsrRepeatMode, TtsrRule, TtsrSettings, TtsrSource,
 };
 pub use turn::{
-	Error, InvokeFrame, PROVIDER_RESET_PROP, Recovery, TurnClient, TurnInput, TurnOptions,
-	TurnSession, empty_stop,
+	Error, InvokeFrame, PROVIDER_RESET_PROP, Recovery, StreamWatchdog, TurnClient, TurnInput,
+	TurnOptions, TurnSession, empty_stop,
 };

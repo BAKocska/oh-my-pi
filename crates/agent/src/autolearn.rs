@@ -6,7 +6,7 @@ use omp_proto::{
 	thread::v1::{self as thread, Item},
 };
 
-use crate::{Interrupt, InterruptClass, InterruptSource, PromptNamedInput, batch::ExecutionMode};
+use crate::{Interrupt, InterruptClass, InterruptSource, PromptNamedInput};
 
 /// Durable item property marking the private synthetic capture turn.
 pub const CAPTURE_PROP: &str = "omp/autolearn-capture";
@@ -65,11 +65,11 @@ pub enum CaptureDecision {
 /// Agent-owned substantive-turn detector and non-overlap controller.
 #[derive(Clone, Debug)]
 pub struct AutolearnController {
-	settings:             AutolearnSettings,
-	settled_tool_calls:   usize,
-	turn_started_in_mode: ExecutionMode,
-	capture_in_flight:    bool,
-	capture_pending:      bool,
+	settings:                AutolearnSettings,
+	settled_tool_calls:      usize,
+	turn_started_suppressed: bool,
+	capture_in_flight:       bool,
+	capture_pending:         bool,
 }
 
 impl AutolearnController {
@@ -78,7 +78,7 @@ impl AutolearnController {
 		Self {
 			settings,
 			settled_tool_calls: 0,
-			turn_started_in_mode: ExecutionMode::Standard,
+			turn_started_suppressed: false,
 			capture_in_flight: false,
 			capture_pending: false,
 		}
@@ -90,9 +90,9 @@ impl AutolearnController {
 	}
 
 	/// Begins one primary caller submission and clears all prior boundary facts.
-	pub const fn begin_primary(&mut self, mode: ExecutionMode) {
+	pub fn begin_primary(&mut self, prompt_slot: &str) {
 		self.settled_tool_calls = 0;
-		self.turn_started_in_mode = mode;
+		self.turn_started_suppressed = suppressed_prompt_slot(prompt_slot);
 	}
 
 	/// Counts one tool execution only after it reached a settled terminal
@@ -103,20 +103,15 @@ impl AutolearnController {
 
 	/// Finishes one primary turn, resetting its counter before every eligibility
 	/// gate.
-	pub fn finish_primary(
-		&mut self,
-		ended_in_mode: ExecutionMode,
-		aborted: bool,
-	) -> CaptureDecision {
+	pub fn finish_primary(&mut self, ended_prompt_slot: &str, aborted: bool) -> CaptureDecision {
 		let tool_calls = std::mem::take(&mut self.settled_tool_calls);
-		let started_in_mode =
-			std::mem::replace(&mut self.turn_started_in_mode, ExecutionMode::Standard);
+		let started_suppressed = std::mem::take(&mut self.turn_started_suppressed);
 		let eligible = !aborted
 			&& self.settings.enabled
 			&& self.settings.auto_continue
 			&& tool_calls >= self.settings.min_tool_calls
-			&& !suppressed_mode(started_in_mode)
-			&& !suppressed_mode(ended_in_mode);
+			&& !started_suppressed
+			&& !suppressed_prompt_slot(ended_prompt_slot);
 		if !eligible {
 			return CaptureDecision::None;
 		}
@@ -133,7 +128,7 @@ impl AutolearnController {
 	/// coalesced newer capture.
 	pub const fn finish_capture(&mut self, aborted: bool) -> CaptureDecision {
 		self.settled_tool_calls = 0;
-		self.turn_started_in_mode = ExecutionMode::Standard;
+		self.turn_started_suppressed = false;
 		self.capture_in_flight = false;
 		if aborted || !self.capture_pending || !self.settings.enabled || !self.settings.auto_continue
 		{
@@ -149,7 +144,7 @@ impl AutolearnController {
 	/// fault.
 	pub const fn abort(&mut self) {
 		self.settled_tool_calls = 0;
-		self.turn_started_in_mode = ExecutionMode::Standard;
+		self.turn_started_suppressed = false;
 		self.capture_in_flight = false;
 		self.capture_pending = false;
 	}
@@ -160,8 +155,8 @@ impl AutolearnController {
 	}
 }
 
-const fn suppressed_mode(mode: ExecutionMode) -> bool {
-	matches!(mode, ExecutionMode::Plan | ExecutionMode::PlanYolo | ExecutionMode::Goal)
+fn suppressed_prompt_slot(prompt_slot: &str) -> bool {
+	matches!(prompt_slot, "plan" | "plan-yolo" | "goal")
 }
 
 /// Builds stable standing guidance from the tools actually active for this
@@ -230,24 +225,24 @@ mod tests {
 	#[test]
 	fn threshold_resets_at_every_primary_boundary() {
 		let mut controller = active();
-		controller.begin_primary(ExecutionMode::Standard);
+		controller.begin_primary("standard");
 		for _ in 0..4 {
 			controller.observe_settled_tool_execution();
 		}
-		assert_eq!(controller.finish_primary(ExecutionMode::Standard, false), CaptureDecision::None);
-		controller.begin_primary(ExecutionMode::Standard);
+		assert_eq!(controller.finish_primary("standard", false), CaptureDecision::None);
+		controller.begin_primary("standard");
 		controller.observe_settled_tool_execution();
-		assert_eq!(controller.finish_primary(ExecutionMode::Standard, false), CaptureDecision::None);
+		assert_eq!(controller.finish_primary("standard", false), CaptureDecision::None);
 	}
 
 	#[test]
 	fn abort_plan_and_goal_boundaries_are_suppressed() {
 		for (start, end, aborted) in [
-			(ExecutionMode::Standard, ExecutionMode::Standard, true),
-			(ExecutionMode::Plan, ExecutionMode::Standard, false),
-			(ExecutionMode::Standard, ExecutionMode::PlanYolo, false),
-			(ExecutionMode::Goal, ExecutionMode::Standard, false),
-			(ExecutionMode::Standard, ExecutionMode::Goal, false),
+			("standard", "standard", true),
+			("plan", "standard", false),
+			("standard", "plan-yolo", false),
+			("goal", "standard", false),
+			("standard", "goal", false),
 		] {
 			let mut controller = active();
 			controller.begin_primary(start);
@@ -261,19 +256,16 @@ mod tests {
 	#[test]
 	fn coalesces_one_pending_capture() {
 		let mut controller = active();
-		controller.begin_primary(ExecutionMode::Standard);
+		controller.begin_primary("standard");
 		for _ in 0..DEFAULT_MIN_TOOL_CALLS {
 			controller.observe_settled_tool_execution();
 		}
-		assert_eq!(
-			controller.finish_primary(ExecutionMode::Standard, false),
-			CaptureDecision::Enqueue
-		);
-		controller.begin_primary(ExecutionMode::Standard);
+		assert_eq!(controller.finish_primary("standard", false), CaptureDecision::Enqueue);
+		controller.begin_primary("standard");
 		for _ in 0..DEFAULT_MIN_TOOL_CALLS {
 			controller.observe_settled_tool_execution();
 		}
-		assert_eq!(controller.finish_primary(ExecutionMode::Standard, false), CaptureDecision::None);
+		assert_eq!(controller.finish_primary("standard", false), CaptureDecision::None);
 		assert_eq!(controller.finish_capture(false), CaptureDecision::Enqueue);
 		assert_eq!(controller.finish_capture(false), CaptureDecision::None);
 	}

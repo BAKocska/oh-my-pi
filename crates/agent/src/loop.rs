@@ -2,13 +2,12 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
-	fmt::Write as _,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::StreamExt;
-use omp_core::{Hash32, IntoStr, InvocationPhase, Str, sf};
+use omp_core::{Hash32, IntoStr, InvocationPhase, Point, Str, sf};
 use omp_env::EnvClient;
 use omp_llm_inference::{TurnId, layer::secrets::SecretStreamRestorer};
 use omp_proto::{
@@ -23,9 +22,7 @@ use omp_secrets::{
 use omp_storage::{
 	blob::BlobStore,
 	gc::{ArtifactCatalog, ArtifactLifetime},
-	transcript::{
-		CallId, ChildLifecycleEntry, Entry, InvocationTransition, Kind, SnapcompactArchive,
-	},
+	transcript::{CallId, ChildLifecycleEntry, InvocationTransition, SnapcompactArchive},
 };
 use omp_telemetry::firehose::{
 	Branch, BranchOp, Envelope, Event as FirehoseEvent, Firehose, ModelAttempt, ModelRequest,
@@ -34,7 +31,6 @@ use omp_telemetry::firehose::{
 };
 use omp_tool::{CapsBase, Registry as ToolRegistry, ToolIdentity};
 use parking_lot::Mutex;
-use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 use thiserror::Error;
 
@@ -42,19 +38,30 @@ use crate::{
 	AgentRegistry, BatchError, CompactionCoordinator, CompactionMethodOrder, CompactionTier,
 	Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode, ManualCompactionOutcome,
 	ManualCompactionRequest, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError,
-	PromptMemoryQuery, PromptMemorySnapshotSource, SnapcompactPreparation, TtsrMatch,
-	TtsrMatchContext, TtsrRegistry, TtsrSource, TurnClient, TurnInput, TurnSession, YieldPayload,
-	YieldPayloadError, YieldPayloadValidator,
+	PromptMemoryQuery, PromptMemorySnapshotSource, SnapcompactPreparation, TtsrMatch, TtsrRegistry,
+	TtsrSource, TurnClient, TurnInput, TurnSession, YieldPayload, YieldPayloadError,
+	YieldPayloadValidator,
+	arbiter::{
+		Arbiter, PointCx,
+		context::{compaction_instruction, recover_checkpoint_state, rewind_background_warning},
+		settle::{EmptyOutputRetry, source_candidate},
+		stream::{
+			TtsrCampaignCut, TtsrStreamPart, stream_recovery_item, ttsr_reminder_item,
+			ttsr_reminder_text,
+		},
+	},
 	batch::{
-		ExecutionModeHandle, InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest,
-		SpeculativeCall, ToolBatch,
+		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
 	},
 	context::{ContextProjection, project_context},
 	continuation::{
 		AgentSettledEvent, Continuation, ContinuationLedger, ContinuationPolicy, ContinuationSource,
-		LoopSignal, continues_loop, from_hook,
+		LoopSignal, RedemptionAuthority, RedemptionEvidence, SettledFold, SettledParticipant,
+		continues_loop, from_hook,
 	},
-	control::{ControlMailbox, ControlMailboxEvent, ControlSender, ScheduledRewind},
+	control::{
+		CampaignControl, ControlMailbox, ControlMailboxEvent, ControlSender, ScheduledRewind,
+	},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
 	hooks::HookGate,
@@ -64,16 +71,13 @@ use crate::{
 	project::project_journal,
 	prompt::{PromptError, PromptHash},
 	state::AgentState,
-	turn::{Error as TurnError, empty_stop},
+	turn::Error as TurnError,
 };
 
 const INTERRUPT_GRACE: omp_core::Duration =
 	omp_core::Duration::new(500, omp_core::DurationUnit::Milliseconds);
 const TOOL_DEADLINE: omp_core::Duration =
 	omp_core::Duration::new(300, omp_core::DurationUnit::Seconds);
-const EMPTY_OUTPUT_RETRY_CAP: u8 = 3;
-const EMPTY_OUTPUT_RETRY_DETAIL: &str =
-	"Assistant returned no final output after retry cap; try switching models";
 const CONTROL_DRAIN_LIMIT: usize = 32;
 const MEMORY_RECALL_QUERY_MAX_CHARS: usize = 32 * 1024;
 
@@ -101,7 +105,7 @@ pub enum RunSettlement {
 /// follow-ups.
 #[derive(Clone, Debug)]
 pub struct AgentRunSummary {
-	/// Authoritative terminal gateway outcome of the last committed turn, if
+	/// Authoritative terminal arbiter outcome of the last committed turn, if
 	/// any.
 	pub outcome:         Option<Outcome>,
 	/// Committed turn count for this submission.
@@ -223,117 +227,7 @@ fn authoritative_assistant(outcome: &Outcome) -> Option<Str> {
 	(!text.is_empty()).then(|| Str::from(text))
 }
 
-fn compaction_instruction(text: Str) -> Item {
-	Item {
-		created_at_ms: now_ms(),
-		kind: Some(thread::item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
-		})),
-		..Default::default()
-	}
-}
-fn append_checkpoint_reminder(input: &mut TurnInput) {
-	let reminder = crate::prompt::checkpoint_active_reminder();
-	match input {
-		TurnInput::Full(thread) => thread.items.push(reminder),
-		TurnInput::Delta(_, delta) => delta.append.push(reminder),
-	}
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub(crate) struct ActiveCheckpoint {
-	pub(crate) opaque_token: Str,
-	pub(crate) event:        u64,
-	pub(crate) goal:         Str,
-	pub(crate) started_at:   u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub(crate) struct CompletedCheckpoint {
-	pub(crate) opaque_token: Str,
-	pub(crate) goal:         Str,
-	pub(crate) report:       Str,
-	pub(crate) started_at:   u64,
-	pub(crate) rewound_at:   u64,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct CheckpointState {
-	pub(crate) active:           Option<ActiveCheckpoint>,
-	pub(crate) last_completed:   Option<CompletedCheckpoint>,
-	pub(crate) rewind_scheduled: bool,
-}
-
-fn recover_checkpoint_state(journal: &Journal) -> Result<CheckpointState, JournalError> {
-	#[derive(Deserialize)]
-	struct CheckpointRecord {
-		token:      Str,
-		goal:       Str,
-		started_at: u64,
-	}
-	#[derive(Deserialize)]
-	struct RewindRecord {
-		token:      Str,
-		goal:       Str,
-		report:     Str,
-		started_at: u64,
-		rewound_at: u64,
-	}
-
-	let log = journal.load()?;
-	let mut state = CheckpointState::default();
-	for index in log.as_ref().iter() {
-		let Some(Entry::Ok(event)) = log.get(index) else {
-			continue;
-		};
-		let Kind::Custom(custom) = &event.kind else {
-			continue;
-		};
-		match custom.kind() {
-			crate::journal_kinds::CHECKPOINT_KIND => {
-				let Some(data) = custom.data() else {
-					continue;
-				};
-				let Ok(record) = serde_json::from_str::<CheckpointRecord>(data.get()) else {
-					continue;
-				};
-				state.active = Some(ActiveCheckpoint {
-					opaque_token: record.token,
-					event:        index,
-					goal:         record.goal,
-					started_at:   record.started_at,
-				});
-				state.rewind_scheduled = false;
-			},
-			crate::journal_kinds::REWIND_REPORT_KIND => {
-				let Some(data) = custom.data() else {
-					continue;
-				};
-				let Ok(record) = serde_json::from_str::<RewindRecord>(data.get()) else {
-					continue;
-				};
-				if state
-					.active
-					.as_ref()
-					.is_some_and(|active| active.opaque_token == record.token)
-				{
-					state.active = None;
-				}
-				state.last_completed = Some(CompletedCheckpoint {
-					opaque_token: record.token,
-					goal:         record.goal,
-					report:       record.report,
-					started_at:   record.started_at,
-					rewound_at:   record.rewound_at,
-				});
-				state.rewind_scheduled = false;
-			},
-			_ => {},
-		}
-	}
-	Ok(state)
-}
+pub(crate) use crate::arbiter::context::{ActiveCheckpoint, CheckpointState, CompletedCheckpoint};
 
 /// A live user message that can be rewound and edited.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,6 +247,9 @@ pub enum AgentError {
 	/// Durable journal operation failed.
 	#[error(transparent)]
 	Journal(#[from] JournalError),
+	/// Campaign arbitration or lifecycle journaling failed.
+	#[error(transparent)]
+	Arbiter(#[from] crate::ArbiterError),
 	/// Canonical thread projection failed.
 	#[error(transparent)]
 	Projection(#[from] ProjectionError),
@@ -371,14 +268,17 @@ pub enum AgentError {
 	/// Live history serialization failed.
 	#[error(transparent)]
 	LiveHistory(#[from] serde_json::Error),
-	/// Gateway turn failed.
+	/// Arbiter turn failed.
 	#[error(transparent)]
 	Turn(#[from] TurnError),
 	/// Tool execution or lowering failed.
 	#[error(transparent)]
 	Batch(#[from] BatchError),
-	/// Gateway stream or outcome violated the canonical turn contract.
-	#[error("gateway turn protocol violation: {0}")]
+	/// A required-deadline campaign hold expired or was aborted.
+	#[error(transparent)]
+	CampaignHold(#[from] crate::HoldError),
+	/// Arbiter stream or outcome violated the canonical turn contract.
+	#[error("arbiter turn protocol violation: {0}")]
 	Protocol(&'static str),
 	/// A crash replay cannot reconstruct the exact frozen tool registry.
 	#[error("durable turn toolset differs from the authoritative registry")]
@@ -432,29 +332,12 @@ type TurnCompletion =
 
 enum RunTurnResult {
 	Complete(TurnCompletion),
-	Ttsr(TtsrTrigger),
-}
-
-struct TtsrTrigger {
-	matches: Vec<TtsrMatch>,
-	source:  TtsrSource,
-}
-
-struct DeferredTtsr {
-	matched: TtsrMatch,
-	source:  TtsrSource,
-}
-
-struct TtsrPartState {
-	source:     TtsrSource,
-	tool_name:  Option<Str>,
-	stream_key: Str,
-	arguments:  String,
+	Ttsr(TtsrCampaignCut),
 }
 
 enum DriveSessionResult {
 	Complete(Outcome, BTreeMap<Str, SpeculativeCall>),
-	Ttsr(TtsrTrigger),
+	Ttsr(TtsrCampaignCut),
 }
 
 impl Drop for RunActivityGuard {
@@ -478,6 +361,9 @@ pub struct Agent<C: TurnClient> {
 	control_tx: ControlSender,
 	control_mailbox: ControlMailbox,
 	checkpoint_state: Arc<Mutex<CheckpointState>>,
+	arbiter: Arbiter,
+	tool_choices: crate::tool_choice::ToolChoiceQueue,
+	holds: crate::HoldSet,
 	pending_rewinds: VecDeque<ScheduledRewind>,
 	mailbox: Mailbox,
 	jobs: Arc<JobBoard>,
@@ -492,9 +378,11 @@ pub struct Agent<C: TurnClient> {
 	prompt_hash: Option<PromptHash>,
 	prompt_head_events: Vec<u64>,
 	settled_gate: Option<Arc<HookGate>>,
+	provider_error_gate: Option<Arc<HookGate>>,
 	continuations: ContinuationLedger,
-	execution_mode: ExecutionModeHandle,
+	legacy_session_stop: crate::LegacySessionStopCampaign,
 	continuation_source: Option<Arc<dyn ContinuationSource>>,
+	redemption_authority: Option<Arc<dyn RedemptionAuthority>>,
 	loop_signal: LoopSignal,
 	last_toolset_hash: Option<Hash32>,
 	firehose: Arc<Firehose>,
@@ -504,8 +392,6 @@ pub struct Agent<C: TurnClient> {
 	compaction: CompactionCoordinator,
 	blob_store: Option<BlobStore>,
 	artifact_catalog: Option<Arc<Mutex<ArtifactCatalog>>>,
-	ttsr: Option<TtsrRegistry>,
-	deferred_ttsr: Vec<DeferredTtsr>,
 	autolearn: Option<crate::AutolearnController>,
 }
 
@@ -577,6 +463,9 @@ impl<C: TurnClient> Agent<C> {
 			control_tx,
 			control_mailbox,
 			checkpoint_state,
+			arbiter: Arbiter::new(),
+			tool_choices: crate::tool_choice::ToolChoiceQueue::new(),
+			holds: crate::HoldSet::default(),
 			pending_rewinds: VecDeque::new(),
 			mailbox,
 			jobs,
@@ -591,9 +480,11 @@ impl<C: TurnClient> Agent<C> {
 			prompt_hash,
 			prompt_head_events,
 			settled_gate: None,
+			provider_error_gate: None,
 			continuations: ContinuationLedger::new(8),
-			execution_mode: ExecutionModeHandle::default(),
+			legacy_session_stop: crate::LegacySessionStopCampaign::default(),
 			continuation_source: None,
+			redemption_authority: None,
 			loop_signal: LoopSignal::default(),
 			firehose: Arc::new(Firehose::new()),
 			last_toolset_hash,
@@ -603,8 +494,6 @@ impl<C: TurnClient> Agent<C> {
 			compaction: CompactionCoordinator::default(),
 			blob_store: None,
 			artifact_catalog: None,
-			ttsr: None,
-			deferred_ttsr: Vec::new(),
 			autolearn: None,
 		}
 	}
@@ -612,6 +501,58 @@ impl<C: TurnClient> Agent<C> {
 	/// Returns the authoritative configuration handle.
 	pub const fn state(&self) -> &AgentState {
 		&self.state
+	}
+
+	/// Returns the named decision arbiter and durable campaign owner.
+	pub const fn arbiter(&self) -> &Arbiter {
+		&self.arbiter
+	}
+
+	/// Returns mutable access to the named decision arbiter.
+	pub const fn arbiter_mut(&mut self) -> &mut Arbiter {
+		&mut self.arbiter
+	}
+
+	/// Engages and durably records one campaign.
+	pub fn engage_campaign(
+		&mut self,
+		spec: Arc<crate::CampaignSpec>,
+		machine: Box<dyn crate::CampaignMachine>,
+		options: crate::EngageOptions,
+	) -> Result<crate::EngageReceipt, AgentError> {
+		Ok(self
+			.arbiter
+			.engage(spec, machine, &mut self.journal, options)?)
+	}
+
+	/// Disengages and durably records one campaign after dwell.
+	pub fn disengage_campaign(&mut self, engagement: &str, now_ms: u64) -> Result<bool, AgentError> {
+		Ok(self
+			.arbiter
+			.disengage(engagement, now_ms, &mut self.journal)?)
+	}
+
+	/// Recovers durable campaign engagements through an application resolver.
+	pub fn recover_campaigns<F>(
+		&mut self,
+		resolve: F,
+		now_ms: u64,
+	) -> Result<crate::RevivalReport, AgentError>
+	where
+		F: FnMut(&str) -> Option<(Arc<crate::CampaignSpec>, Box<dyn crate::CampaignMachine>)>,
+	{
+		Ok(self.arbiter.recover(&mut self.journal, resolve, now_ms)?)
+	}
+
+	/// Returns mutable access to future-turn tool directives.
+	pub const fn tool_choices_mut(&mut self) -> &mut crate::tool_choice::ToolChoiceQueue {
+		&mut self.tool_choices
+	}
+
+	/// Returns a cloneable handle for resolving required-deadline campaign
+	/// holds.
+	pub fn holds(&self) -> crate::HoldSet {
+		self.holds.clone()
 	}
 
 	/// Returns the ordered event feed handle.
@@ -653,15 +594,52 @@ impl<C: TurnClient> Agent<C> {
 		self.continuations = ContinuationLedger::new(cap);
 	}
 
-	/// Returns the shared mode handle whose invocation metadata is enforced by
-	/// the Environment dispatch boundary.
-	pub fn execution_mode(&self) -> ExecutionModeHandle {
-		self.execution_mode.clone()
+	/// Installs the fail-closed `provider_error` domain hook gate.
+	pub fn set_provider_error_gate(&mut self, gate: Arc<HookGate>) {
+		self.provider_error_gate = Some(gate);
+	}
+
+	/// Returns the active campaign prompt-slot binding.
+	pub fn prompt_slot(&self) -> Option<&str> {
+		self
+			.arbiter
+			.campaigns()
+			.slots()
+			.binding(&crate::BindSlot::PromptSlot)
+	}
+
+	fn invocation_mode_props(arbiter: &mut Arbiter, effects: &omp_tool::Effects) -> pb::ValueMap {
+		let mode = arbiter
+			.campaigns()
+			.slots()
+			.binding(&crate::BindSlot::PromptSlot)
+			.map(Str::new);
+		if crate::effects_mutate_environment(effects)
+			&& mode
+				.as_ref()
+				.is_some_and(|mode| matches!(mode.as_str(), "plan-yolo" | "prewalk"))
+		{
+			arbiter
+				.campaigns_mut()
+				.slots_mut()
+				.pop_binding(&crate::BindSlot::PromptSlot);
+		}
+		crate::batch::invocation_mode_props(mode.as_deref(), effects)
 	}
 
 	/// Installs one application-owned autonomous-mode continuation source.
 	pub fn set_continuation_source(&mut self, source: Arc<dyn ContinuationSource>) {
 		self.continuation_source = Some(source);
+	}
+
+	/// Installs the cold app-owned provider redemption authority.
+	pub fn set_redemption_authority(&mut self, authority: Arc<dyn RedemptionAuthority>) {
+		self.redemption_authority = Some(authority);
+	}
+
+	/// Installs a bounded provider failover route campaign.
+	pub fn set_provider_failover_routes(&mut self, routes: Vec<Str>) {
+		self.arbiter.set_retry_chain(routes);
 	}
 
 	/// Returns Core's latest loop-repetition and progress evidence.
@@ -967,6 +945,9 @@ impl<C: TurnClient> Agent<C> {
 		self.context = None;
 		self.prompt_hash = None;
 		self.prompt_head_events.clear();
+		self
+			.redeem_recovery(RedemptionEvidence::PostCompaction { epoch: event })
+			.await;
 		Ok(ManualCompactionOutcome { method: mode, event, tokens_before, tokens_after, frame_count })
 	}
 
@@ -1035,18 +1016,20 @@ impl<C: TurnClient> Agent<C> {
 		items: impl IntoIterator<Item = Item>,
 		root_turn_id: TurnId,
 	) -> Result<AgentRunSummary, AgentError> {
+		let starting_prompt_slot = self.prompt_slot().unwrap_or("standard").to_str();
 		if let Some(controller) = self.autolearn.as_mut() {
-			controller.begin_primary(self.execution_mode.get());
+			controller.begin_primary(starting_prompt_slot.as_str());
 		}
 		let capture_root = root_turn_id.clone();
 		let result = self.submit_inner(items, root_turn_id).await;
 		let aborted = result.as_ref().map_or(true, |summary| summary.interrupted);
+		let ending_prompt_slot = self.prompt_slot().unwrap_or("standard").to_str();
 		let mut decision = if let Some(controller) = self.autolearn.as_mut() {
 			if aborted {
 				controller.abort();
 				crate::CaptureDecision::None
 			} else {
-				controller.finish_primary(self.execution_mode.get(), false)
+				controller.finish_primary(ending_prompt_slot.as_str(), false)
 			}
 		} else {
 			crate::CaptureDecision::None
@@ -1121,11 +1104,11 @@ impl<C: TurnClient> Agent<C> {
 			if released {
 				let attempt = u8::try_from(self.journal.trailing_aborts())
 					.unwrap_or(u8::MAX)
-					.clamp(1, EMPTY_OUTPUT_RETRY_CAP);
+					.clamp(1, EmptyOutputRetry::CAP);
 				pending_indexes.push(self.journal.append_turn_input(
 					now,
 					turn_id.as_str(),
-					empty_output_retry_item(attempt),
+					EmptyOutputRetry::item(attempt),
 					self.prompt_hash,
 				)?);
 			}
@@ -1134,6 +1117,8 @@ impl<C: TurnClient> Agent<C> {
 			(pending_indexes, TurnId::new(turn_id))
 		} else {
 			self.drain_control();
+			let idle_fold =
+				self.fold_point(Point::Idle, Some(root_turn_id.as_str()), None, None, false)?;
 			self.execute_scheduled_rewinds()?;
 			let snapshot = self.state.snapshot();
 			let queued = self
@@ -1143,6 +1128,14 @@ impl<C: TurnClient> Agent<C> {
 			pending_indexes.extend_from_slice(self.journal.recoverable_settlement_events());
 			pending_indexes.sort_unstable();
 			pending_indexes.extend(self.stage_interrupts(&root_turn_id, queued)?);
+			for item in idle_fold.campaign.injects {
+				pending_indexes.push(self.journal.append_turn_input(
+					now,
+					root_turn_id.as_str(),
+					item,
+					self.prompt_hash,
+				)?);
+			}
 			for item in supplied {
 				pending_indexes.push(self.journal.append_turn_input(
 					now,
@@ -1156,11 +1149,13 @@ impl<C: TurnClient> Agent<C> {
 		self.publish_live_history()?;
 		let mut committed_turns = 0_u32;
 		let mut last_outcome = None;
-		let mut empty_output_retries = if continuing_recovery {
-			u8::try_from(self.journal.trailing_aborts()).unwrap_or(u8::MAX)
-		} else {
-			0
-		};
+		self
+			.arbiter
+			.restore_empty_output_retry(if continuing_recovery {
+				u8::try_from(self.journal.trailing_aborts()).unwrap_or(u8::MAX)
+			} else {
+				0
+			});
 
 		loop {
 			self
@@ -1173,13 +1168,14 @@ impl<C: TurnClient> Agent<C> {
 			let (outcome, mut speculative, submitted_context_id, snapshot, enabled_tools) = match turn
 			{
 				Ok(RunTurnResult::Complete(turn)) => {
-					empty_output_retries = 0;
+					self.arbiter.reset_empty_output_retry();
 					turn
 				},
 				Ok(RunTurnResult::Ttsr(trigger)) => {
 					self
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Continue)?;
+					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.context = None;
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
 					let reminder_text = ttsr_reminder_text(&trigger.matches);
@@ -1198,6 +1194,7 @@ impl<C: TurnClient> Agent<C> {
 					self
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
+					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.context = None;
 					self.pending_reasoning_demotion = true;
 					self.abort_rx.mark_unchanged();
@@ -1226,35 +1223,91 @@ impl<C: TurnClient> Agent<C> {
 					if pb::turn_error::Kind::try_from(error.kind)
 						== Ok(pb::turn_error::Kind::EmptyOutput) =>
 				{
-					let disposition = if empty_output_retries < EMPTY_OUTPUT_RETRY_CAP {
-						AbortDisposition::Continue
-					} else {
+					self
+						.redeem_recovery(RedemptionEvidence::Restore {
+							turn_id: Str::new(turn_id.as_str()),
+						})
+						.await;
+					let reaction = self.arbiter.react_empty_output_retry(&PointCx {
+						turn_id: Some(turn_id.as_str()),
+						now_ms: now_ms(),
+						delivered: true,
+						..PointCx::default()
+					});
+					let exhausted = reaction
+						.verdicts
+						.iter()
+						.any(|verdict| matches!(verdict, crate::Verdict::Fault { .. }));
+					let disposition = if exhausted {
 						AbortDisposition::Exhausted
+					} else {
+						AbortDisposition::Continue
 					};
 					self
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), disposition)?;
+					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.context = None;
-					if disposition == AbortDisposition::Exhausted {
-						error.detail = empty_output_cap_detail(&error);
+					if exhausted {
+						error.detail = EmptyOutputRetry::cap_detail(&error);
 						return Err(AgentError::Turn(TurnError::Terminal(error)));
 					}
-					empty_output_retries = empty_output_retries.saturating_add(1);
-					let next_turn_id = follow_up_id(&turn_id, u32::from(empty_output_retries));
-					pending_indexes = self
-						.append_pending(&next_turn_id, [empty_output_retry_item(empty_output_retries)])?;
+					let retry = reaction
+						.verdicts
+						.into_iter()
+						.find_map(|verdict| match verdict {
+							crate::Verdict::Inject(mut items) => items.pop(),
+							_ => None,
+						})
+						.expect("empty-output retry campaign injects one retry item");
+					let next_turn_id =
+						follow_up_id(&turn_id, u32::from(self.arbiter.empty_output_retry_spent()));
+					pending_indexes = self.append_pending(&next_turn_id, [retry])?;
 					turn_id = next_turn_id;
 					continue;
 				},
 				Err(AgentError::Turn(error @ TurnError::Terminal(_))) => {
+					let routes = self.provider_failover_routes(turn_id.as_str()).await;
+					let disposition = if routes.is_empty() {
+						AbortDisposition::Exhausted
+					} else {
+						AbortDisposition::Continue
+					};
 					self
 						.journal
-						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
+						.abort_turn(now_ms(), turn_id.as_str(), disposition)?;
+					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.context = None;
-					return Err(AgentError::Turn(error));
+					if routes.is_empty() {
+						return Err(AgentError::Turn(error));
+					}
+					self.arbiter.set_retry_chain(routes);
+					let next_turn_id = follow_up_id(&turn_id, committed_turns);
+					pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
+						crate::prompt_assets::PromptAssetId::AutoContinue,
+					)])?;
+					turn_id = next_turn_id;
+					continue;
 				},
 				Err(error) => {
 					self.publish_provider_error("turn_failed", Some(Str::new(error.to_string())));
+					let routes = self.provider_failover_routes(turn_id.as_str()).await;
+					if !routes.is_empty() {
+						self.journal.abort_turn(
+							now_ms(),
+							turn_id.as_str(),
+							AbortDisposition::Continue,
+						)?;
+						self.arbiter.flush(&mut self.journal, now_ms())?;
+						self.context = None;
+						self.arbiter.set_retry_chain(routes);
+						let next_turn_id = follow_up_id(&turn_id, committed_turns);
+						pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
+							crate::prompt_assets::PromptAssetId::AutoContinue,
+						)])?;
+						turn_id = next_turn_id;
+						continue;
+					}
 					return Err(error);
 				},
 			};
@@ -1268,9 +1321,23 @@ impl<C: TurnClient> Agent<C> {
 				submitted_context_id
 					.map(|context_id| ContextRef { context_id, expected: Some(expected) })
 			});
+			if stop == pb::StopReason::StopMaxTokens && !outcome.output.is_empty() {
+				self
+					.redeem_recovery(RedemptionEvidence::Salvage { turn_id: Str::new(turn_id.as_str()) })
+					.await;
+			}
 
 			self.events.publish(AgentEvent::Snapshot(snapshot.clone()));
 			self.publish_live_history()?;
+			let turn_end =
+				self.fold_point(Point::TurnEnd, Some(turn_id.as_str()), None, None, false)?;
+			for item in turn_end.campaign.injects {
+				let _ = self.mailbox.sender().try_enqueue(crate::Interrupt {
+					class: crate::InterruptClass::Immediate,
+					item,
+					source: crate::InterruptSource::Continuation { owner: sf!("campaign") },
+				});
+			}
 			self.drain_control();
 			let mut immediate = self
 				.mailbox
@@ -1311,6 +1378,29 @@ impl<C: TurnClient> Agent<C> {
 				for call in &mut calls {
 					call.set_cumulative_usage(self.cumulative_usage.clone());
 				}
+				for call in &mut calls {
+					if call.identity().name != "dyn" {
+						continue;
+					}
+					let Ok(input) = serde_json::from_slice::<Value>(call.raw_args()) else {
+						continue;
+					};
+					let resolution = input
+						.get("do_")
+						.and_then(Value::as_str)
+						.is_some_and(|operation| matches!(operation, "invoke/resolve" | "invoke/reject"));
+					if !resolution {
+						continue;
+					}
+					let invoker = self
+						.tool_choices
+						.in_flight_invoker()
+						.or_else(|| self.tool_choices.pending_invoker());
+					if let Some(invoker) = invoker {
+						call.set_override_invoker(invoker, input);
+					}
+					break;
+				}
 				let made_environment_effect = calls
 					.iter()
 					.any(|call| crate::effects_mutate_environment(call.effects()));
@@ -1347,10 +1437,22 @@ impl<C: TurnClient> Agent<C> {
 						},
 					)?;
 				}
+				let batch_fold =
+					self.fold_point(Point::Batch, Some(turn_id.as_str()), None, None, false)?;
+				for item in batch_fold.campaign.injects {
+					boundary.push(crate::Interrupt {
+						class: crate::InterruptClass::Immediate,
+						item,
+						source: crate::InterruptSource::Continuation { owner: sf!("campaign") },
+					});
+				}
 				let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(None);
 				let mut aborted = self.abort_rx.has_changed().unwrap_or(false);
 				if aborted {
 					interrupt_tx.send_replace(Some(sf!("user interrupt")));
+				}
+				if batch_fold.campaign.winner == crate::WinnerKind::Cut {
+					interrupt_tx.send_replace(Some(sf!("campaign cut")));
 				}
 				let mut deadline_elapsed = false;
 				let mut abort_rx = self.abort_rx.clone();
@@ -1379,6 +1481,12 @@ impl<C: TurnClient> Agent<C> {
 									ControlMailboxEvent::Closed => std::future::pending::<()>().await,
 									ControlMailboxEvent::JournalHandled => {},
 									ControlMailboxEvent::Rewind(rewind) => self.pending_rewinds.push_back(rewind),
+									ControlMailboxEvent::Campaign(campaign) => Self::handle_campaign_control(
+										&mut self.arbiter,
+										&mut self.journal,
+										&mut self.tool_choices,
+										campaign,
+									),
 								}
 							},
 							received = self.mailbox.wait() => {
@@ -1434,9 +1542,11 @@ impl<C: TurnClient> Agent<C> {
 				if let Some(reminder) = self.take_deferred_ttsr(turn_id.as_str())? {
 					next.insert(0, reminder);
 				}
-				self
-					.loop_signal
-					.observe(call_digest, made_environment_effect, empty_output_retries);
+				self.loop_signal.observe(
+					call_digest,
+					made_environment_effect,
+					self.arbiter.empty_output_retry_spent(),
+				);
 				if self.loop_signal.repeats >= 3 {
 					next.insert(
 						0,
@@ -1486,6 +1596,14 @@ impl<C: TurnClient> Agent<C> {
 				self.transition(AgentPhase::Idle);
 				return Ok(run_summary(Some(outcome), committed_turns, false));
 			}
+			let idle_fold = self.fold_point(Point::Idle, Some(turn_id.as_str()), None, None, false)?;
+			for item in idle_fold.campaign.injects {
+				let _ = self.mailbox.sender().try_enqueue(crate::Interrupt {
+					class: crate::InterruptClass::Immediate,
+					item,
+					source: crate::InterruptSource::Continuation { owner: sf!("campaign") },
+				});
+			}
 			let mut idle = self
 				.mailbox
 				.drain(DrainPoint::Idle, snapshot.defer_interrupts);
@@ -1505,8 +1623,10 @@ impl<C: TurnClient> Agent<C> {
 				turn_id = next_turn_id;
 				continue;
 			}
-			self.loop_signal.observe(None, false, empty_output_retries);
-			if let Some(interrupt) = self.settled_continuation(&turn_id).await {
+			self
+				.loop_signal
+				.observe(None, false, self.arbiter.empty_output_retry_spent());
+			if let Some(interrupt) = self.settled_continuation(&turn_id).await? {
 				let _ = self.mailbox.sender().try_enqueue(interrupt);
 				boundary = self
 					.mailbox
@@ -1587,6 +1707,20 @@ impl<C: TurnClient> Agent<C> {
 			})));
 	}
 
+	async fn provider_failover_routes(&self, turn_id: &str) -> Vec<Str> {
+		let Some(gate) = self.provider_error_gate.as_ref() else {
+			return Vec::new();
+		};
+		gate
+			.gate_domain(&crate::ProviderErrorEvent {
+				code:    sf!("turn_failed"),
+				turn_id: Str::new(turn_id),
+			})
+			.await
+			.winner
+			.routes()
+	}
+
 	fn append_pending(
 		&mut self,
 		turn_id: &TurnId<str>,
@@ -1604,24 +1738,100 @@ impl<C: TurnClient> Agent<C> {
 			.collect()
 	}
 
+	fn fold_point(
+		&mut self,
+		point: Point,
+		turn_id: Option<&str>,
+		invocation_id: Option<&str>,
+		stream_delta: Option<&str>,
+		delivered: bool,
+	) -> Result<crate::Fold, AgentError> {
+		let pending_invoker = self
+			.tool_choices
+			.pending_head()
+			.map(|head| crate::PendingInvokerCx {
+				id:          head.id,
+				source_tool: head.source_tool,
+			});
+		let cx = PointCx {
+			turn_id,
+			invocation_id,
+			stream_delta,
+			now_ms: now_ms(),
+			delivered,
+			pending_invoker,
+		};
+		Ok(self
+			.arbiter
+			.fold_and_record(point, &cx, None, &mut self.journal)?)
+	}
+
 	/// Runs the settled-boundary domain hook and converts an accepted decision
 	/// into a normal mailbox interrupt so `defer_interrupts` remains
 	/// authoritative.
-	async fn settled_continuation(&mut self, turn_id: &TurnId<str>) -> Option<crate::Interrupt> {
+	async fn settled_continuation(
+		&mut self,
+		turn_id: &TurnId<str>,
+	) -> Result<Option<crate::Interrupt>, AgentError> {
 		let now = now_ms();
-		let (mut candidate, mut policy) = self
-			.continuation_source
-			.as_ref()
-			.map_or((Continuation::Settle, ContinuationPolicy::default()), |source| {
-				source.decide(&self.loop_signal, now)
-			});
-		if matches!(candidate, Continuation::Settle)
+		let mut builtins = SettledFold::new();
+		let (candidate, policy) =
+			source_candidate(self.continuation_source.as_deref(), &self.loop_signal, now);
+		builtins.consider(SettledParticipant::ContinuationSource, candidate, policy);
+		if builtins.winner().is_none()
 			&& let Some(gate) = self.settled_gate.clone()
 		{
 			let event =
 				AgentSettledEvent { agent_id: sf!("agent"), turn_id: Str::new(turn_id.as_str()) };
 			let outcome = gate.gate_domain(&event).await;
-			candidate = from_hook(outcome.winner, sf!("agent_settled"), continuation_item());
+			let winner = if outcome.winner == crate::AgentSettled::Continue {
+				let reaction = crate::CampaignMachine::react(
+					&mut self.legacy_session_stop,
+					Point::Settle,
+					&PointCx { turn_id: Some(turn_id.as_str()), now_ms: now, ..PointCx::default() },
+				);
+				if reaction
+					.verdicts
+					.iter()
+					.any(|verdict| matches!(verdict, crate::Verdict::Continue))
+				{
+					crate::AgentSettled::Continue
+				} else {
+					crate::AgentSettled::Settle
+				}
+			} else {
+				self.legacy_session_stop = crate::LegacySessionStopCampaign::default();
+				crate::AgentSettled::Settle
+			};
+			builtins.consider(
+				SettledParticipant::AgentSettled,
+				from_hook(
+					winner,
+					sf!("agent_settled"),
+					recovery_prompt_item(crate::prompt_assets::PromptAssetId::AutoContinue),
+				),
+				ContinuationPolicy::default(),
+			);
+		}
+		let (mut candidate, mut policy) = builtins.into_parts();
+		let settle_fold = self.arbiter.fold_and_record(
+			Point::Settle,
+			&PointCx { turn_id: Some(turn_id.as_str()), now_ms: now, ..PointCx::default() },
+			None,
+			&mut self.journal,
+		)?;
+		if settle_fold.campaign.winner == crate::WinnerKind::Continue
+			&& matches!(candidate, Continuation::Settle)
+		{
+			candidate = Continuation::Continue {
+				owner:          settle_fold
+					.campaign
+					.winner_lane
+					.unwrap_or_else(|| sf!("campaign")),
+				item:           recovery_prompt_item(crate::prompt_assets::PromptAssetId::AutoContinue),
+				label:          Some(sf!("campaign")),
+				collapse_prior: false,
+			};
 			policy = ContinuationPolicy::default();
 		}
 		if self.loop_signal.no_progress_turns >= 3
@@ -1633,12 +1843,12 @@ impl<C: TurnClient> Agent<C> {
 			.continuations
 			.decide_with_policy(candidate, now, policy)
 		{
-			Continuation::Continue { owner, item, .. } => Some(crate::Interrupt {
+			Continuation::Continue { owner, item, .. } => Ok(Some(crate::Interrupt {
 				class: crate::InterruptClass::Immediate,
 				item,
 				source: crate::InterruptSource::Continuation { owner },
-			}),
-			Continuation::Settle | Continuation::Refused { .. } => None,
+			})),
+			Continuation::Settle | Continuation::Refused { .. } => Ok(None),
 		}
 	}
 
@@ -1669,8 +1879,7 @@ impl<C: TurnClient> Agent<C> {
 
 	/// Installs the compiled stream-rule generation used by subsequent turns.
 	pub fn set_ttsr_registry(&mut self, registry: TtsrRegistry) {
-		self.ttsr = Some(registry);
-		self.deferred_ttsr.clear();
+		self.arbiter.ttsr_campaign_mut().install(registry);
 	}
 
 	/// Installs a host activity assertion acquired only while a turn is active.
@@ -1831,14 +2040,15 @@ impl<C: TurnClient> Agent<C> {
 		);
 		let mut attempts = 0_u32;
 		let mut backoff = snapshot.retry.initial_backoff();
-		let frozen_options = durable.as_ref().map_or_else(
+		let mut frozen_options = durable.as_ref().map_or_else(
 			|| snapshot.turn.clone(),
 			|start| crate::TurnOptions {
-				context_id:     start.options.context_id.clone(),
-				params:         start.options.params.clone(),
-				executor:       start.options.executor.clone(),
-				props:          start.options.props.clone(),
-				provider_reset: snapshot.turn.provider_reset,
+				context_id:      start.options.context_id.clone(),
+				params:          start.options.params.clone(),
+				executor:        start.options.executor.clone(),
+				props:           start.options.props.clone(),
+				provider_reset:  snapshot.turn.provider_reset,
+				stream_watchdog: snapshot.turn.stream_watchdog,
 			},
 		);
 		let lifted_reseed = if changed_toolset {
@@ -1891,12 +2101,58 @@ impl<C: TurnClient> Agent<C> {
 				TurnInput::Delta(held, ThreadDelta { truncate_to, append })
 			};
 			let mut provider_input = input.clone();
+			let checkpoint_active = self.checkpoint_state.lock().active.is_some();
+			self
+				.arbiter
+				.checkpoint_notice_mut()
+				.set_active(checkpoint_active);
+			let context_fold =
+				self.fold_point(Point::Context, Some(turn_id.as_str()), None, None, false)?;
+			for item in context_fold.campaign.injects {
+				match &mut provider_input {
+					TurnInput::Full(thread) => thread.items.push(item),
+					TurnInput::Delta(_, delta) => delta.append.push(item),
+				}
+			}
 			publish_input_attachments(self.journal.session_id().0.as_str(), &provider_input);
 			obfuscate_provider_input(&mut provider_input, self.secret_obfuscator.as_ref())?;
-			let reminder_appended = self.checkpoint_state.lock().active.is_some();
-			if reminder_appended {
-				append_checkpoint_reminder(&mut provider_input);
+			let pending_invoker = self
+				.tool_choices
+				.pending_head()
+				.map(|head| (Str::new(head.id), Str::new(head.source_tool)));
+			let pending_invoker =
+				pending_invoker
+					.as_ref()
+					.map(|(id, source_tool)| crate::PendingInvokerCx {
+						id:          id.as_str(),
+						source_tool: source_tool.as_str(),
+					});
+			let choice_cx = PointCx {
+				turn_id: Some(turn_id.as_str()),
+				now_ms: now_ms(),
+				pending_invoker,
+				..PointCx::default()
+			};
+			self.arbiter.fold_and_record(
+				Point::ToolChoice,
+				&choice_cx,
+				Some(&mut self.tool_choices),
+				&mut self.journal,
+			)?;
+			if let Some(choice) = self.tool_choices.claim_next() {
+				frozen_options.params.tool_choice = Some(proto_tool_choice(choice));
 			}
+			let pre_model =
+				self.fold_point(Point::PreModel, Some(turn_id.as_str()), None, None, false)?;
+			for binding in pre_model.campaign.binds {
+				if let crate::ScopedBinding { slot: crate::BindSlot::ModelRoute, value } = binding {
+					frozen_options.params.model = value.to_string();
+				}
+			}
+			for ticket in pre_model.campaign.holds {
+				self.holds.insert(ticket)?;
+			}
+			self.holds.wait_empty(self.abort_rx.clone()).await?;
 			let start = TurnStart {
 				turn_id: turn_id.as_str().to_str(),
 				item_events: input_events.clone(),
@@ -1972,6 +2228,11 @@ impl<C: TurnClient> Agent<C> {
 			};
 			self.drain_invocation_facts()?;
 			let session_result = selected?;
+			if session_result.is_err() {
+				self
+					.tool_choices
+					.reject(crate::tool_choice::RejectReason::Error);
+			}
 			match session_result {
 				Ok(DriveSessionResult::Complete(mut outcome, speculative)) => {
 					restore_provider_output(&mut outcome.output, self.secret_obfuscator.as_ref())?;
@@ -1992,11 +2253,12 @@ impl<C: TurnClient> Agent<C> {
 							));
 						}
 					}
-					let (receipt, _) = self.journal.append_gateway_outcome(
+					let (receipt, _) = self.journal.append_arbiter_outcome(
 						now_ms(),
 						turn_id.as_str(),
 						outcome.clone(),
 					)?;
+					self.arbiter.flush(&mut self.journal, now_ms())?;
 					if frozen_options.provider_reset {
 						self
 							.state
@@ -2005,13 +2267,12 @@ impl<C: TurnClient> Agent<C> {
 					self.record_committed_invocations(&outcome, &speculative, &receipt)?;
 					self.patch_input_sequences(
 						&sequence_targets,
-						u64::from(reminder_appended),
+						u64::from(checkpoint_active),
 						&outcome,
 					)?;
 					self.last_toolset_hash = Some(toolset_hash);
-					if let Some(ttsr) = self.ttsr.as_mut() {
-						ttsr.advance_message();
-					}
+					self.arbiter.ttsr_campaign_mut().advance_message();
+					self.tool_choices.resolve();
 					return Ok(RunTurnResult::Complete((
 						outcome,
 						speculative,
@@ -2021,6 +2282,9 @@ impl<C: TurnClient> Agent<C> {
 					)));
 				},
 				Ok(DriveSessionResult::Ttsr(trigger)) => {
+					self
+						.tool_choices
+						.reject(crate::tool_choice::RejectReason::Aborted);
 					return Ok(RunTurnResult::Ttsr(trigger));
 				},
 				Err(TurnError::Conflict(error)) => {
@@ -2073,64 +2337,6 @@ impl<C: TurnClient> Agent<C> {
 		}
 	}
 
-	fn check_ttsr_delta(
-		ttsr: &mut Option<TtsrRegistry>,
-		deferred_ttsr: &mut Vec<DeferredTtsr>,
-		state: &mut TtsrPartState,
-		fragment: &str,
-	) -> Option<TtsrTrigger> {
-		let ttsr = ttsr.as_mut()?;
-		let mut paths = Vec::new();
-		let mut snapshot = None;
-		if state.source == TtsrSource::Tool {
-			state.arguments.push_str(fragment);
-			let parsed = omp_slopjson::parse_streaming(state.arguments.as_str());
-			collect_ttsr_paths(&parsed, &mut paths);
-			snapshot = Some(tool_matcher_snapshot(&parsed, state.arguments.as_str()));
-		}
-		let path_refs = paths.iter().map(Str::as_str).collect::<Vec<_>>();
-		let context = TtsrMatchContext {
-			source:     state.source,
-			tool_name:  state.tool_name.as_ref().map(Str::as_str),
-			file_paths: path_refs.as_slice(),
-			stream_key: Some(state.stream_key.as_str()),
-		};
-		let mut matches = if let Some(snapshot) = snapshot.as_deref() {
-			ttsr.check_snapshot(snapshot, context).into_vec()
-		} else {
-			ttsr.check_delta(fragment, context).into_vec()
-		};
-		if let Some(snapshot) = snapshot.as_deref()
-			&& ttsr.has_ast_rules()
-			&& let Ok(ast_matches) = ttsr.check_ast_snapshot(snapshot, context)
-		{
-			for matched in ast_matches {
-				if !matches.iter().any(|present| present.name == matched.name) {
-					matches.push(matched);
-				}
-			}
-		}
-		if matches.is_empty() {
-			return None;
-		}
-		if matches
-			.iter()
-			.any(|matched| matched.interrupt_mode.interrupts(state.source))
-		{
-			return Some(TtsrTrigger { matches, source: state.source });
-		}
-		for matched in matches {
-			if deferred_ttsr
-				.iter()
-				.any(|present| present.matched.name == matched.name)
-			{
-				continue;
-			}
-			deferred_ttsr.push(DeferredTtsr { matched, source: state.source });
-		}
-		None
-	}
-
 	fn record_ttsr_injection(
 		&mut self,
 		turn_id: &str,
@@ -2145,25 +2351,20 @@ impl<C: TurnClient> Agent<C> {
 		self
 			.journal
 			.append_ttsr_injection(now_ms(), turn_id, source, &names, content)?;
-		if let Some(ttsr) = self.ttsr.as_mut() {
-			ttsr.mark_injected(names.iter().map(Str::as_str));
-		}
+		self
+			.arbiter
+			.ttsr_campaign_mut()
+			.mark_injected(names.iter().map(Str::as_str));
 		Ok(())
 	}
 
 	fn take_deferred_ttsr(&mut self, turn_id: &str) -> Result<Option<Item>, AgentError> {
-		if self.deferred_ttsr.is_empty() {
+		let Some((source, matches, text, item)) = self.arbiter.ttsr_campaign_mut().take_deferred()
+		else {
 			return Ok(None);
-		}
-		let deferred = std::mem::take(&mut self.deferred_ttsr);
-		let source = deferred[0].source;
-		let matches = deferred
-			.into_iter()
-			.map(|entry| entry.matched)
-			.collect::<Vec<_>>();
-		let text = ttsr_reminder_text(&matches);
+		};
 		self.record_ttsr_injection(turn_id, source, &matches, text.as_str())?;
-		Ok(Some(ttsr_reminder_item(text)))
+		Ok(Some(item))
 	}
 
 	async fn drive_session(
@@ -2175,6 +2376,8 @@ impl<C: TurnClient> Agent<C> {
 		enabled_tools: Arc<[Str]>,
 		enforce_ttsr: bool,
 	) -> Result<DriveSessionResult, TurnError> {
+		let pending_tool_results = turn_input_has_tool_results(&input);
+		let stream_recovery_mailbox = self.mailbox.sender();
 		let opening = self.client.turn(turn_id.clone(), input, options);
 		tokio::pin!(opening);
 		let mut session = loop {
@@ -2185,6 +2388,12 @@ impl<C: TurnClient> Agent<C> {
 						ControlMailboxEvent::Closed => std::future::pending::<()>().await,
 						ControlMailboxEvent::JournalHandled => {},
 						ControlMailboxEvent::Rewind(rewind) => self.pending_rewinds.push_back(rewind),
+						ControlMailboxEvent::Campaign(campaign) => Self::handle_campaign_control(
+							&mut self.arbiter,
+							&mut self.journal,
+							&mut self.tool_choices,
+							campaign,
+						),
 					}
 				},
 			}
@@ -2196,18 +2405,31 @@ impl<C: TurnClient> Agent<C> {
 			self.caps,
 			runtime_duration(INTERRUPT_GRACE),
 		);
-		if enforce_ttsr && let Some(ttsr) = self.ttsr.as_mut() {
-			ttsr.reset_streams();
+		if enforce_ttsr {
+			self.arbiter.ttsr_campaign_mut().reset_streams();
 		}
 		let mut speculative = BTreeMap::new();
 		let mut part_calls: BTreeMap<u32, Str> = BTreeMap::new();
-		let mut ttsr_parts: BTreeMap<u32, TtsrPartState> = BTreeMap::new();
+		let mut ttsr_parts: BTreeMap<u32, TtsrStreamPart> = BTreeMap::new();
 		let mut secret_streams: BTreeMap<u32, SecretStreamRestorer> = BTreeMap::new();
+		let mut saw_stream_event = false;
 		loop {
+			let watchdog_ms = if saw_stream_event {
+				options.stream_watchdog.idle_ms
+			} else {
+				options.stream_watchdog.first_event_ms
+			};
 			let event = if duplex.is_empty() {
 				let mut events = session.events();
 				tokio::select! {
 					event = events.next() => event,
+					() = wait_stream_watchdog(watchdog_ms) => {
+						return Err(stream_watchdog_error(
+							&stream_recovery_mailbox,
+							saw_stream_event,
+							pending_tool_results,
+						));
+					},
 					event = self.control_mailbox.handle_next(&mut self.journal) => {
 						match event {
 							ControlMailboxEvent::Closed => std::future::pending().await,
@@ -2220,6 +2442,16 @@ impl<C: TurnClient> Agent<C> {
 								self.control_serviced_during_turn = true;
 								continue;
 							},
+							ControlMailboxEvent::Campaign(campaign) => {
+								Self::handle_campaign_control(
+									&mut self.arbiter,
+									&mut self.journal,
+									&mut self.tool_choices,
+									campaign,
+								);
+								self.control_serviced_during_turn = true;
+								continue;
+							},
 						}
 					},
 				}
@@ -2229,6 +2461,13 @@ impl<C: TurnClient> Agent<C> {
 					tokio::select! {
 						event = events.next() => Ok(event),
 						completion = duplex.next() => Err(completion),
+						() = wait_stream_watchdog(watchdog_ms) => {
+							return Err(stream_watchdog_error(
+								&stream_recovery_mailbox,
+								saw_stream_event,
+								pending_tool_results,
+							));
+						},
 						event = self.control_mailbox.handle_next(&mut self.journal) => {
 							match event {
 								ControlMailboxEvent::Closed => std::future::pending().await,
@@ -2238,6 +2477,16 @@ impl<C: TurnClient> Agent<C> {
 								},
 								ControlMailboxEvent::Rewind(rewind) => {
 									self.pending_rewinds.push_back(rewind);
+									self.control_serviced_during_turn = true;
+									continue;
+								},
+								ControlMailboxEvent::Campaign(campaign) => {
+									Self::handle_campaign_control(
+									&mut self.arbiter,
+									&mut self.journal,
+									&mut self.tool_choices,
+									campaign,
+								);
 									self.control_serviced_during_turn = true;
 									continue;
 								},
@@ -2256,6 +2505,7 @@ impl<C: TurnClient> Agent<C> {
 				}
 			};
 			let event = event.ok_or_else(|| tonic::Status::unavailable("turn stream lost"))??;
+			saw_stream_event = true;
 			let publish = |event: pb::TurnEvent| {
 				self
 					.events
@@ -2329,13 +2579,14 @@ impl<C: TurnClient> Agent<C> {
 						pb::part_start::Kind::Unspecified => None,
 					};
 					if enforce_ttsr && let Some(source) = source {
-						ttsr_parts.insert(part.index, TtsrPartState {
-							source,
-							tool_name: (source == TtsrSource::Tool)
-								.then(|| Str::new(part.tool_name.as_str())),
-							stream_key: sf!("part:{}:{}", part.index, source),
-							arguments: String::new(),
-						});
+						ttsr_parts.insert(
+							part.index,
+							TtsrStreamPart::new(
+								part.index,
+								source,
+								(source == TtsrSource::Tool).then_some(part.tool_name.as_str()),
+							),
+						);
 					}
 					if part.kind() != pb::part_start::Kind::ToolCall {
 						continue;
@@ -2354,13 +2605,41 @@ impl<C: TurnClient> Agent<C> {
 						.map_err(|_| TurnError::Protocol("stream named unknown tool"))?
 						.clone();
 					let call_id = part.tool_call_id.as_str().to_str();
+					let admission = self
+						.arbiter
+						.fold_and_record(
+							Point::Admission,
+							&PointCx {
+								turn_id: Some(turn_id.as_str()),
+								invocation_id: Some(call_id.as_str()),
+								now_ms: now_ms(),
+								..PointCx::default()
+							},
+							None,
+							&mut self.journal,
+						)
+						.map_err(|_| TurnError::Protocol("failed to journal admission fold"))?;
+					if admission.campaign.winner == crate::WinnerKind::Deny {
+						return Err(TurnError::Protocol("campaign denied tool admission"));
+					}
+					for ticket in admission.campaign.holds {
+						self
+							.holds
+							.insert(ticket)
+							.map_err(|_| TurnError::Protocol("campaign admission hold is invalid"))?;
+					}
+					self
+						.holds
+						.wait_empty(self.abort_rx.clone())
+						.await
+						.map_err(|_| TurnError::Protocol("campaign admission hold did not resolve"))?;
 					let opened = SpeculativeCall::open_with_props(
 						&self.env,
 						&self.events,
 						call_id.clone(),
 						ToolIdentity { name: name.clone(), rev: rev.clone() },
 						runtime_duration(TOOL_DEADLINE),
-						self.execution_mode.invocation_props(&maximum_effects),
+						Self::invocation_mode_props(&mut self.arbiter, &maximum_effects),
 					)
 					.await
 					.map_err(|_| TurnError::Protocol("failed to open speculative tool"))?;
@@ -2388,14 +2667,33 @@ impl<C: TurnClient> Agent<C> {
 				Some(pb::turn_event::Event::PartDelta(part)) => {
 					let fragment = std::str::from_utf8(&part.chunk)
 						.map_err(|_| TurnError::Protocol("stream fragment is not UTF-8"))?;
-					if let Some(state) = ttsr_parts.get_mut(&part.index)
-						&& let Some(trigger) = Self::check_ttsr_delta(
-							&mut self.ttsr,
-							&mut self.deferred_ttsr,
-							state,
-							fragment,
-						) {
-						return Ok(DriveSessionResult::Ttsr(trigger));
+					let trigger = if let Some(state) = ttsr_parts.get_mut(&part.index) {
+						self
+							.arbiter
+							.ttsr_campaign_mut()
+							.check_delta(state, fragment)
+					} else {
+						None
+					};
+					let stream_fold = self
+						.arbiter
+						.fold_and_record(
+							Point::Stream,
+							&PointCx {
+								turn_id: Some(turn_id.as_str()),
+								stream_delta: Some(fragment),
+								now_ms: now_ms(),
+								..PointCx::default()
+							},
+							None,
+							&mut self.journal,
+						)
+						.map_err(|_| TurnError::Protocol("failed to journal stream campaign fold"))?;
+					if stream_fold.campaign.winner == crate::WinnerKind::Cut {
+						if let Some(trigger) = trigger {
+							return Ok(DriveSessionResult::Ttsr(trigger));
+						}
+						return Err(TurnError::Protocol("campaign cut the stream"));
 					}
 					if let Some(call_id) = part_calls.get(&part.index) {
 						speculative
@@ -2420,7 +2718,7 @@ impl<C: TurnClient> Agent<C> {
 	}
 
 	async fn complete_missing_speculation(
-		&self,
+		&mut self,
 		output: &[Item],
 		speculative: &mut BTreeMap<Str, SpeculativeCall>,
 		registry: &ToolRegistry,
@@ -2449,7 +2747,7 @@ impl<C: TurnClient> Agent<C> {
 				call.id.as_str().to_str(),
 				ToolIdentity { name: name.clone(), rev: rev.clone() },
 				runtime_duration(TOOL_DEADLINE),
-				self.execution_mode.invocation_props(&maximum_effects),
+				Self::invocation_mode_props(&mut self.arbiter, &maximum_effects),
 			)
 			.await?;
 			opened.attach_runtime(
@@ -2466,12 +2764,84 @@ impl<C: TurnClient> Agent<C> {
 		Ok(())
 	}
 
+	async fn redeem_recovery(&mut self, evidence: RedemptionEvidence) {
+		let Some(authority) = self.redemption_authority.clone() else {
+			return;
+		};
+		if authority.redeem(evidence).await {
+			authority.reseed_history().await;
+			self.context = None;
+		}
+	}
+
 	fn drain_control(&mut self) {
+		let mut campaigns = Vec::new();
 		self.control_mailbox.drain_ready(
 			&mut self.journal,
 			CONTROL_DRAIN_LIMIT,
 			&mut self.pending_rewinds,
+			&mut campaigns,
 		);
+		for campaign in campaigns {
+			Self::handle_campaign_control(
+				&mut self.arbiter,
+				&mut self.journal,
+				&mut self.tool_choices,
+				campaign,
+			);
+		}
+	}
+
+	fn handle_campaign_control(
+		arbiter: &mut Arbiter,
+		journal: &mut Journal,
+		tool_choices: &mut crate::tool_choice::ToolChoiceQueue,
+		command: CampaignControl,
+	) {
+		match command {
+			CampaignControl::Engage { spec, machine, options, reply } => {
+				let result = arbiter
+					.engage(spec, machine, journal, options)
+					.map_err(crate::ControlError::from);
+				let _ = reply.send(result);
+			},
+			CampaignControl::Active { reply } => {
+				let _ = reply.send(Ok(arbiter.campaigns().entries()));
+			},
+			CampaignControl::Disengage { engagement, now_ms, reply } => {
+				let result = arbiter
+					.disengage(engagement.as_str(), now_ms, journal)
+					.map_err(crate::ControlError::from);
+				let _ = reply.send(result);
+			},
+			CampaignControl::RegisterPendingInvoker { id, source_tool, invoker, reply } => {
+				tool_choices.register_pending_invoker(id, source_tool, invoker);
+				let _ = reply.send(Ok(()));
+			},
+			CampaignControl::RemovePendingInvoker { id, reply } => {
+				tool_choices.remove_pending_invoker(id.as_str());
+				let _ = reply.send(Ok(()));
+			},
+			CampaignControl::Step { engagement, reason, reply } => {
+				let _ = reason;
+				let result = arbiter
+					.step(engagement.as_str(), now_ms(), journal)
+					.map_err(crate::ControlError::from);
+				let _ = reply.send(result);
+			},
+			CampaignControl::Cut { engagement, reply } => {
+				let result = arbiter
+					.cut(engagement.as_str(), now_ms(), journal)
+					.map_err(crate::ControlError::from);
+				let _ = reply.send(result);
+			},
+			CampaignControl::UpdateState { engagement, payload, reply } => {
+				let result = arbiter
+					.update_state(engagement.as_str(), payload.as_ref(), now_ms(), journal)
+					.map_err(crate::ControlError::from);
+				let _ = reply.send(result);
+			},
+		}
 	}
 
 	fn execute_scheduled_rewinds(&mut self) -> Result<bool, AgentError> {
@@ -2967,6 +3337,41 @@ async fn wait_deadline(deadline: Option<std::time::Instant>) {
 		None => std::future::pending().await,
 	}
 }
+async fn wait_stream_watchdog(timeout_ms: Option<u64>) {
+	match timeout_ms {
+		Some(timeout_ms) => tokio::time::sleep(Duration::from_millis(timeout_ms)).await,
+		None => std::future::pending().await,
+	}
+}
+
+fn turn_input_has_tool_results(input: &TurnInput) -> bool {
+	let items = match input {
+		TurnInput::Full(thread) => thread.items.as_slice(),
+		TurnInput::Delta(_, delta) => delta.append.as_slice(),
+	};
+	items
+		.iter()
+		.any(|item| matches!(item.kind, Some(thread::item::Kind::ToolResult(_))))
+}
+fn stream_watchdog_error(
+	mailbox: &MailboxSender,
+	saw_event: bool,
+	pending_tool_results: bool,
+) -> TurnError {
+	if let Some(kind) = omp_llm_inference::recovery::repetition::classify_stream_recovery(
+		None,
+		false,
+		saw_event,
+		pending_tool_results,
+	) {
+		let _ = mailbox.try_enqueue(crate::Interrupt {
+			class:  crate::InterruptClass::TurnBoundary,
+			item:   stream_recovery_item(kind),
+			source: crate::InterruptSource::Continuation { owner: sf!("campaign") },
+		});
+	}
+	TurnError::Rpc(tonic::Status::deadline_exceeded("stream watchdog elapsed"))
+}
 
 async fn sleep_with_deadline(
 	duration: Duration,
@@ -3089,133 +3494,6 @@ fn tool_call_digest(items: &[Item]) -> Option<Str> {
 	(calls != 0).then(|| Str::new(hasher.finalize().to_string()))
 }
 
-fn collect_ttsr_paths(value: &omp_slopjson::Value, paths: &mut Vec<Str>) {
-	match value {
-		omp_slopjson::Value::Object(object) => {
-			for (key, value) in object.iter() {
-				let normalized = key.to_ascii_lowercase();
-				let path_field = normalized == "path"
-					|| normalized == "file"
-					|| normalized.ends_with("_path")
-					|| normalized.ends_with("path");
-				if path_field {
-					if let Some(path) = value.as_str()
-						&& !path.is_empty()
-						&& !paths.iter().any(|present| present == path)
-					{
-						paths.push(Str::new(path));
-					}
-				}
-				if normalized == "paths" || normalized == "files" {
-					for path in value.as_array().unwrap_or_default() {
-						if let Some(path) = path.as_str()
-							&& !path.is_empty()
-							&& !paths.iter().any(|present| present == path)
-						{
-							paths.push(Str::new(path));
-						}
-					}
-				}
-				collect_ttsr_paths(value, paths);
-			}
-		},
-		omp_slopjson::Value::Array(values) => {
-			for value in values {
-				collect_ttsr_paths(value, paths);
-			}
-		},
-		_ => {},
-	}
-}
-
-fn tool_matcher_snapshot(value: &omp_slopjson::Value, fallback: &str) -> String {
-	let mut snapshot = String::new();
-	collect_ttsr_source(value, None, &mut snapshot);
-	if snapshot.is_empty() {
-		snapshot.push_str(fallback);
-	}
-	snapshot
-}
-
-fn collect_ttsr_source(value: &omp_slopjson::Value, field: Option<&str>, output: &mut String) {
-	match value {
-		omp_slopjson::Value::String(text)
-			if field.is_some_and(|field| {
-				matches!(
-					field,
-					"content"
-						| "text" | "new"
-						| "new_text" | "newtext"
-						| "replacement"
-						| "patch" | "code"
-				)
-			}) =>
-		{
-			if !output.is_empty() {
-				output.push('\n');
-			}
-			output.push_str(text);
-		},
-		omp_slopjson::Value::Object(object) => {
-			for (key, value) in object.iter() {
-				let normalized = key.to_ascii_lowercase();
-				collect_ttsr_source(value, Some(normalized.as_str()), output);
-			}
-		},
-		omp_slopjson::Value::Array(values) => {
-			for value in values {
-				collect_ttsr_source(value, field, output);
-			}
-		},
-		_ => {},
-	}
-}
-
-fn ttsr_reminder_text(matches: &[TtsrMatch]) -> String {
-	let mut text = String::from(
-		"<system-injection>\nThe previous generation was interrupted by the following stream rules. \
-		 Correct the output before continuing.\n",
-	);
-	for matched in matches {
-		let _ = writeln!(text, "\nRule `{}`:\n{}", matched.name.as_str(), matched.content.as_str());
-	}
-	text.push_str("</system-injection>");
-	text
-}
-
-fn ttsr_reminder_item(text: String) -> Item {
-	Item {
-		seq:           0,
-		created_at_ms: now_ms(),
-		kind:          Some(thread::item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
-		})),
-		props:         None,
-	}
-}
-
-fn continuation_item() -> Item {
-	Item {
-		seq:           0,
-		created_at_ms: now_ms(),
-		kind:          Some(thread::item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
-			parts: vec![thread::Part {
-				kind: Some(thread::part::Kind::Text(format!(
-					"<system-injection>\n{}\n</system-injection>",
-					crate::prompt_assets::prompt_asset(
-						crate::prompt_assets::PromptAssetId::AutoContinue,
-					)
-					.content
-					.trim(),
-				))),
-			}],
-		})),
-		props:         None,
-	}
-}
-
 fn recovery_prompt_item(id: crate::prompt_assets::PromptAssetId) -> Item {
 	Item {
 		seq:           0,
@@ -3247,22 +3525,6 @@ fn tool_loop_redirect_item(count: u32, digest: &str) -> Item {
 	}
 }
 
-fn rewind_background_warning(count: usize) -> Item {
-	let text = format!(
-		"<system-injection>\nRewind left {count} background job(s) running; their settlements may \
-		 still arrive. Cancel them explicitly if they are no longer wanted.\n</system-injection>"
-	);
-	Item {
-		seq:           0,
-		created_at_ms: now_ms(),
-		kind:          Some(thread::item::Kind::Message(thread::Message {
-			role:  thread::Role::System as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
-		})),
-		props:         None,
-	}
-}
-
 fn duplex_turn_error(error: DuplexError) -> TurnError {
 	TurnError::Protocol(match error {
 		DuplexError::Batch(_) => "duplex tool batch failed",
@@ -3270,60 +3532,21 @@ fn duplex_turn_error(error: DuplexError) -> TurnError {
 		DuplexError::MissingToolResult => "duplex completion missing tool result",
 	})
 }
-fn empty_output_retry_item(attempt: u8) -> Item {
-	let mut text = String::new();
-	crate::prompt_assets::render_empty_stop_retry(
-		&mut text,
-		usize::from(attempt),
-		usize::from(EMPTY_OUTPUT_RETRY_CAP),
-	);
-	Item {
-		seq:           0,
-		created_at_ms: now_ms(),
-		kind:          Some(thread::item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
-		})),
-		props:         None,
-	}
-}
-
-/// Selects the terminal message for a capped empty-output chain from the
-/// gateway's empty-stop diagnostics on the final failed turn.
-///
-/// Billed non-reasoning output on a zero-block stop means content was
-/// generated and then dropped downstream — a filter or refusal flattened to a
-/// clean stop by a proxy, or a lossy API translation — so the generic
-/// switch-models hint would misdiagnose a provider-side delivery problem.
-/// Known reasoning-only usage is not evidence that deliverable content was
-/// dropped and keeps the context hint.
-fn empty_output_cap_detail(error: &pb::TurnError) -> String {
-	let diagnostic = error
-		.diagnostics
-		.iter()
-		.rev()
-		.find(|diagnostic| diagnostic.code.starts_with("empty_stop."));
-	match diagnostic.map(|diagnostic| (diagnostic.code.as_str(), diagnostic.detail.as_str())) {
-		Some((empty_stop::BILLED_OUTPUT, billed)) => {
-			let tokens: u64 = billed.parse().unwrap_or(0);
-			let plural = if tokens == 1 { "" } else { "s" };
-			format!(
-				"Assistant returned an empty stop after retry cap, but the provider billed {tokens} \
-				 output token{plural} for it; content was generated and then dropped before delivery, \
-				 which usually points to a provider-side content filter or a lossy API translation \
-				 rather than a context problem"
-			)
-		},
-		Some((empty_stop::EMPTY, _)) => "Assistant returned an empty stop after retry cap; try \
-		                                 switching models or removing large attachments from recent \
-		                                 context"
-			.to_owned(),
-		_ => EMPTY_OUTPUT_RETRY_DETAIL.to_owned(),
-	}
-}
-
 fn follow_up_id(_root: &TurnId<str>, _ordinal: u32) -> TurnId {
 	TurnId::new(omp_core::Ulid::generate().to_string())
+}
+fn proto_tool_choice(choice: omp_llm_inference::call::ToolChoice) -> pb::ToolChoice {
+	let (mode, name) = match choice {
+		omp_llm_inference::call::ToolChoice::Disabled => (pb::tool_choice::Mode::None, String::new()),
+		omp_llm_inference::call::ToolChoice::Auto => (pb::tool_choice::Mode::Auto, String::new()),
+		omp_llm_inference::call::ToolChoice::Required => {
+			(pb::tool_choice::Mode::Required, String::new())
+		},
+		omp_llm_inference::call::ToolChoice::Named(name) => {
+			(pb::tool_choice::Mode::Named, name.to_string())
+		},
+	};
+	pb::ToolChoice { mode: mode as i32, name, on_unsupported: 0 }
 }
 
 fn accumulate_usage(target: &mut pb::Usage, source: &pb::Usage) {
@@ -3382,6 +3605,26 @@ mod tests {
 	type Script = Vec<Result<pb::TurnEvent, TurnError>>;
 	type OpenedTurn = (TurnId, TurnInput, crate::TurnOptions);
 	type OpenedTurns = Vec<OpenedTurn>;
+	#[test]
+	fn stream_watchdog_classifies_and_queues_recovery_guidance() {
+		let mut mailbox = Mailbox::new();
+		let sender = mailbox.sender();
+		let error = stream_watchdog_error(&sender, false, false);
+		assert!(matches!(error, TurnError::Rpc(_)));
+		let queued = mailbox.drain(DrainPoint::TurnBoundary, false);
+		assert_eq!(queued.len(), 1);
+		let Some(thread::item::Kind::Message(message)) = queued[0].item.kind.as_ref() else {
+			panic!("watchdog guidance must be a canonical message");
+		};
+		let text = message
+			.parts
+			.iter()
+			.find_map(|part| match part.kind.as_ref() {
+				Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+				_ => None,
+			});
+		assert!(text.is_some_and(|text| text.contains("no first response event")));
+	}
 
 	#[derive(Clone)]
 	struct ScriptedClient {

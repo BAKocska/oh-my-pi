@@ -30,6 +30,14 @@ pub enum TurnInput {
 	/// Applies an atomic delta against a held context revision.
 	Delta(ContextRef, ThreadDelta),
 }
+/// Typed stream watchdog bounds consumed by the STREAM arbiter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamWatchdog {
+	/// Maximum wait for the first decoded event.
+	pub first_event_ms: Option<u64>,
+	/// Maximum wait between decoded events.
+	pub idle_ms:        Option<u64>,
+}
 
 /// Per-turn inference options passed through to the live protocol.
 #[derive(Clone, Debug, Default)]
@@ -38,15 +46,17 @@ pub struct TurnOptions {
 	///
 	/// Leaving this absent makes the full turn stateless. Incremental turns take
 	/// their context identity from [`TurnInput::Delta`].
-	pub context_id:     Option<Str>,
+	pub context_id:      Option<Str>,
 	/// Canonical chat parameters, including model, tools, and sampling controls.
-	pub params:         ChatParams,
-	/// In-turn invocation capability advertised to the gateway.
-	pub executor:       Option<Executor>,
+	pub params:          ChatParams,
+	/// In-turn invocation capability advertised to the arbiter.
+	pub executor:        Option<Executor>,
 	/// Namespaced turn-level extension properties.
-	pub props:          Option<ValueMap>,
+	pub props:           Option<ValueMap>,
 	/// Discard provider-native affinity for this one successful turn.
-	pub provider_reset: bool,
+	pub provider_reset:  bool,
+	/// Optional loop-owned stream watchdog bounds.
+	pub stream_watchdog: StreamWatchdog,
 }
 
 /// A client response frame for a live server-initiated invocation.
@@ -86,7 +96,7 @@ impl From<InvokeFrame> for TurnFrame {
 /// Stable diagnostic codes attached to [`pb::turn_error::Kind::EmptyOutput`]
 /// terminal errors.
 ///
-/// The gateway classifies why a completed provider turn carried no actionable
+/// The arbiter classifies why a completed provider turn carried no actionable
 /// output and stamps one [`pb::Diagnostic`] with these codes. The agent loop
 /// selects its terminal retry-cap message from the code so a provider-side
 /// content filter is never misreported as a model or context problem.
@@ -101,11 +111,11 @@ pub mod empty_stop {
 }
 /// Loop-owned recovery timing for a typed turn-layer failure.
 ///
-/// This classification is deliberately limited to gateway protocol kinds. It
+/// This classification is deliberately limited to arbiter protocol kinds. It
 /// does not expose provider routes, credentials, or internal retry policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Recovery {
-	/// Retry the same logical turn after the gateway-mandated delay.
+	/// Retry the same logical turn after the arbiter-mandated delay.
 	RetryAfter(Duration),
 	/// Retry the same logical turn with the agent's bounded transient backoff.
 	Backoff,
@@ -237,7 +247,7 @@ impl From<tonic::transport::Error> for Error {
 	}
 }
 
-/// Starts logical turns against an inference gateway.
+/// Starts logical turns against an inference arbiter.
 ///
 /// Implementations provide transport only. They never retry, rebase, reseed,
 /// journal, or deduplicate beyond forwarding the caller's stable [`TurnId`].

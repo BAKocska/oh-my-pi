@@ -10,13 +10,13 @@ journal projection, supervised tool batches, and detached-job settlement.
 turn re-reads the latest options, enabled tools, live revisioned registry,
 workspace bytes, prompt source, interrupt policy, deadline, and bounded retry
 policy without sharing mutable configuration. Registry identity is hashed
-separately from prompt content so revision swaps invalidate held gateway
+separately from prompt content so revision swaps invalidate held arbiter
 context and re-project durable history through the current lift chains. Prompt
 sources are synchronous and receive an immutable
 workspace capture; every render is repeated and compared before canonical
 system items and their stable BLAKE3 hash are accepted.
 
-The transcript journal is durable truth. Gateway context is only a working
+The transcript journal is durable truth. Arbiter context is only a working
 copy: projection rebuilds canonical threads, applies amendments and rewinds,
 and lets the live tool registry lift historical results. One flume mailbox
 orders immediate, turn-boundary, and idle inputs. Tool calls execute only

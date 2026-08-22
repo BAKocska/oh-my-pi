@@ -4,7 +4,7 @@ use std::{
 	collections::BTreeMap,
 	sync::{
 		Arc, OnceLock,
-		atomic::{AtomicBool, AtomicU8, AtomicU128, Ordering},
+		atomic::{AtomicBool, AtomicU128, Ordering},
 	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -39,103 +39,33 @@ pub const PLAN_YOLO_PROP: &str = "omp/plan-yolo";
 /// Namespaced explanation for an automatic prewalk transition.
 pub const PREWALK_REASON_PROP: &str = "omp/prewalk-reason";
 
-/// Mutually exclusive application execution mode projected onto each
-/// invocation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[repr(u8)]
-pub enum ExecutionMode {
-	/// Ordinary interactive execution.
-	#[default]
-	Standard = 0,
-	/// Read-only planning enforced by the Environment.
-	Plan     = 1,
-	/// Planning which may make one env-authorized transition on first mutation.
-	PlanYolo = 2,
-	/// Goal auto-continuation.
-	Goal     = 3,
-	/// Director/worker vibe orchestration.
-	Vibe     = 4,
-	/// Cheap prewalk reasoning until the first mutation.
-	Prewalk  = 5,
-}
-
-/// Cloneable atomic mode handle shared by the application and loop.
-#[derive(Clone, Debug, Default)]
-pub struct ExecutionModeHandle(Arc<AtomicU8>);
-
-impl ExecutionModeHandle {
-	/// Replaces the current mutually exclusive execution mode.
-	pub fn set(&self, mode: ExecutionMode) {
-		self.0.store(mode as u8, Ordering::Release);
-	}
-
-	/// Returns the current execution mode.
-	pub fn get(&self) -> ExecutionMode {
-		match self.0.load(Ordering::Acquire) {
-			1 => ExecutionMode::Plan,
-			2 => ExecutionMode::PlanYolo,
-			3 => ExecutionMode::Goal,
-			4 => ExecutionMode::Vibe,
-			5 => ExecutionMode::Prewalk,
-			_ => ExecutionMode::Standard,
-		}
-	}
-
-	/// Builds immutable invocation metadata and performs one-way prewalk/yolo
-	/// automation on the first mutating tool.
-	pub fn invocation_props(&self, effects: &Effects) -> value_pb::ValueMap {
-		let mut mode = self.get();
-		let mut fields = BTreeMap::new();
-		if effects_mutate_environment(effects) {
-			match mode {
-				ExecutionMode::PlanYolo => {
-					if self
-						.0
-						.compare_exchange(
-							ExecutionMode::PlanYolo as u8,
-							ExecutionMode::Standard as u8,
-							Ordering::AcqRel,
-							Ordering::Acquire,
-						)
-						.is_ok()
-					{
-						fields.insert(PLAN_YOLO_PROP.to_owned(), bool_value(true));
-					} else {
-						mode = self.get();
-					}
-				},
-				ExecutionMode::Prewalk => {
-					if self
-						.0
-						.compare_exchange(
-							ExecutionMode::Prewalk as u8,
-							ExecutionMode::Standard as u8,
-							Ordering::AcqRel,
-							Ordering::Acquire,
-						)
-						.is_ok()
-					{
-						fields.insert(
-							PREWALK_REASON_PROP.to_owned(),
-							string_value("first mutating environment effect"),
-						);
-					} else {
-						mode = self.get();
-					}
-				},
-				_ => {},
+/// Builds immutable invocation metadata from the campaign prompt-slot binding.
+///
+/// `plan-yolo` and `prewalk` are one-shot bindings removed by the agent before
+/// this function is called for their first mutating effect.
+pub fn invocation_mode_props(mode: Option<&str>, effects: &Effects) -> value_pb::ValueMap {
+	let mode = mode.unwrap_or("standard");
+	let mut fields = BTreeMap::new();
+	let label = match mode {
+		"plan-yolo" => {
+			if effects_mutate_environment(effects) {
+				fields.insert(PLAN_YOLO_PROP.to_owned(), bool_value(true));
 			}
-		}
-		let label = match mode {
-			ExecutionMode::Standard => "standard",
-			ExecutionMode::Plan | ExecutionMode::PlanYolo => "plan",
-			ExecutionMode::Goal => "goal",
-			ExecutionMode::Vibe => "vibe",
-			ExecutionMode::Prewalk => "prewalk",
-		};
-		fields.insert(EXECUTION_MODE_PROP.to_owned(), string_value(label));
-		value_pb::ValueMap { fields }
-	}
+			"plan"
+		},
+		"prewalk" => {
+			if effects_mutate_environment(effects) {
+				fields.insert(
+					PREWALK_REASON_PROP.to_owned(),
+					string_value("first mutating environment effect"),
+				);
+			}
+			"prewalk"
+		},
+		mode => mode,
+	};
+	fields.insert(EXECUTION_MODE_PROP.to_owned(), string_value(label));
+	value_pb::ValueMap { fields }
 }
 
 /// Returns whether an effect envelope may mutate Environment-owned state.
@@ -148,7 +78,7 @@ pub fn effects_mutate_environment(effects: &Effects) -> bool {
 		|| effects.subagents != 0
 }
 
-fn string_value(value: &'static str) -> value_pb::Value {
+fn string_value(value: &str) -> value_pb::Value {
 	value_pb::Value { kind: Some(value_pb::value::Kind::String(value.to_owned())) }
 }
 
@@ -833,6 +763,7 @@ impl SpeculativeCall {
 			pump,
 			events,
 			usage: Default::default(),
+			override_invoker: None,
 		}
 	}
 }
@@ -859,6 +790,7 @@ pub struct CommittedCall {
 	pump:             InvocationPump,
 	events:           EventBus,
 	usage:            omp_proto::inference::v1::Usage,
+	override_invoker: Option<(crate::tool_choice::Invoker, Value)>,
 }
 
 impl CommittedCall {
@@ -895,6 +827,11 @@ impl CommittedCall {
 	/// Attaches the cumulative usage receipt observed before tool execution.
 	pub fn set_cumulative_usage(&mut self, usage: omp_proto::inference::v1::Usage) {
 		self.usage = usage;
+	}
+
+	/// Bypasses the registered executor with one directive-owned invocation.
+	pub fn set_override_invoker(&mut self, invoker: crate::tool_choice::Invoker, input: Value) {
+		self.override_invoker = Some((invoker, input));
 	}
 }
 
@@ -1061,13 +998,26 @@ impl ToolBatch {
 
 async fn run_call(
 	index: usize,
-	call: CommittedCall,
+	mut call: CommittedCall,
 	registry: &Registry,
 	caps: &CapsBase,
 	interrupt: flume::Receiver<InterruptRequest>,
 	grace: Duration,
 	updates: Option<flume::Sender<BatchUpdate>>,
 ) -> (usize, BatchResult) {
+	if let Some((invoker, input)) = call.override_invoker.take() {
+		let value = invoker(input).await;
+		let outcome = CallOutcome::<Value, Value>::Ok(value);
+		let raw = Bytes::from(
+			serde_json::to_vec(&outcome).expect("directive-owned invocation outcome is valid JSON"),
+		);
+		let parts = harness_parts(&outcome)
+			.expect("successful directive-owned outcome uses the harness renderer");
+		let mut result = lower_tool_parts(&call, &raw, false, false, &parts)
+			.expect("directive-owned invocation lowers to a canonical tool result");
+		result.outcome = Some(durable_outcome(&raw, &outcome));
+		return (index, result);
+	}
 	let receipt = match call.pump.begin_authorization(
 		call.raw_args.clone(),
 		Bytes::copy_from_slice(call.effect_token.as_bytes()),
@@ -1994,9 +1944,7 @@ mod tests {
 		assert_eq!(terminal_text(&results[0]), "committed");
 	}
 	#[test]
-	fn prewalk_transitions_once_on_first_mutating_effect() {
-		let mode = ExecutionModeHandle::default();
-		mode.set(ExecutionMode::Prewalk);
+	fn prewalk_metadata_appears_only_on_mutating_effects() {
 		let read_only = Effects {
 			documents: Some(omp_tool::DocEffects { read: true, write_globs: Arc::default() }),
 			..Effects::empty()
@@ -2008,36 +1956,29 @@ mod tests {
 			}),
 			..Effects::empty()
 		};
-		let read_props = mode.invocation_props(&read_only);
-		assert_eq!(mode.get(), ExecutionMode::Prewalk);
-		assert!(!read_props.fields.contains_key(PREWALK_REASON_PROP));
-		let write_props = mode.invocation_props(&mutating);
-		assert_eq!(mode.get(), ExecutionMode::Standard);
-		assert!(write_props.fields.contains_key(PREWALK_REASON_PROP));
 		assert!(
-			!mode
-				.invocation_props(&mutating)
+			!invocation_mode_props(Some("prewalk"), &read_only)
+				.fields
+				.contains_key(PREWALK_REASON_PROP)
+		);
+		assert!(
+			invocation_mode_props(Some("prewalk"), &mutating)
 				.fields
 				.contains_key(PREWALK_REASON_PROP)
 		);
 	}
 
 	#[test]
-	fn plan_yolo_is_a_single_env_authorized_transition() {
-		let mode = ExecutionModeHandle::default();
-		mode.set(ExecutionMode::PlanYolo);
+	fn plan_yolo_metadata_authorizes_mutating_effect() {
 		let mutating = Effects {
 			exec: Some(omp_tool::ExecEffects { commands: Arc::from([sf!("*")]), network: false }),
 			..Effects::empty()
 		};
-		let props = mode.invocation_props(&mutating);
+		let props = invocation_mode_props(Some("plan-yolo"), &mutating);
 		assert!(props.fields.contains_key(PLAN_YOLO_PROP));
-		assert_eq!(mode.get(), ExecutionMode::Standard);
-		assert!(
-			!mode
-				.invocation_props(&mutating)
-				.fields
-				.contains_key(PLAN_YOLO_PROP)
+		assert_eq!(
+			props.fields[EXECUTION_MODE_PROP].kind,
+			Some(value_pb::value::Kind::String("plan".to_owned())),
 		);
 	}
 }

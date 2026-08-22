@@ -13,6 +13,7 @@ use std::{
 	},
 };
 
+use bytes::Bytes;
 use omp_core::{Str, sf};
 use omp_storage::{
 	state::{DurableRequest, StateAuthority, StateRevision},
@@ -23,12 +24,18 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
+	ArbiterError,
+	campaign::{
+		CampaignEntry, CampaignMachine, CampaignSpec, CampaignStepResult, DisengageError,
+		EngageError, EngageOptions, EngageReceipt,
+	},
 	journal::{
 		Journal, JournalCustomEntry, JournalError, JournalQuery, JournalReply, JournalRequest,
 		SessionStateValue, SessionStateWatchEvent,
 	},
 	journal_kinds::EntryKindDecl,
 	r#loop::{ActiveCheckpoint, CheckpointState},
+	tool_choice::Invoker,
 };
 
 /// A cloneable sender for authenticated extension CONTROL operations.
@@ -72,6 +79,21 @@ pub enum ControlError {
 	/// A rewind for the active checkpoint is already queued.
 	#[error("rewind already scheduled for the active checkpoint")]
 	RewindAlreadyScheduled,
+	/// The campaign stack rejected an engagement.
+	#[error(transparent)]
+	CampaignEngage(#[from] EngageError),
+	/// The campaign stack rejected a disengagement.
+	#[error(transparent)]
+	CampaignDisengage(#[from] DisengageError),
+	/// Campaign journaling or arbitration failed on the mutable agent owner.
+	#[error(transparent)]
+	CampaignArbiter(#[from] ArbiterError),
+	/// A built-in campaign selector was not declared by Core.
+	#[error("unknown core campaign")]
+	UnknownCoreCampaign {
+		/// Unknown stable declaration identity.
+		spec_id: Str,
+	},
 }
 
 /// Authoritative acknowledgement that a checkpoint became active.
@@ -118,6 +140,108 @@ pub enum ControlMailboxEvent {
 	JournalHandled,
 	/// A loop-scoped rewind is ready for boundary execution.
 	Rewind(ScheduledRewind),
+	/// A campaign command requires mutable access to the agent arbiter.
+	Campaign(CampaignControl),
+}
+/// One authenticated campaign operation surfaced to the mutable agent owner.
+pub enum CampaignControl {
+	/// Engage a declared machine.
+	Engage {
+		/// Immutable declaration.
+		spec:    Arc<CampaignSpec>,
+		/// Extension or core machine.
+		machine: Box<dyn CampaignMachine>,
+		/// Engagement options.
+		options: EngageOptions,
+		/// Correlated result.
+		reply:   flume::Sender<Result<EngageReceipt, ControlError>>,
+	},
+	/// Project every active engagement.
+	Active {
+		/// Correlated result.
+		reply: flume::Sender<Result<Vec<CampaignEntry>, ControlError>>,
+	},
+	/// Remove one owned engagement.
+	Disengage {
+		/// Engagement identity.
+		engagement: Str,
+		/// Current epoch milliseconds.
+		now_ms:     u64,
+		/// Correlated result.
+		reply:      flume::Sender<Result<bool, ControlError>>,
+	},
+	/// Register or replace one staged-preview invoker.
+	RegisterPendingInvoker {
+		/// Stable preview identity.
+		id:          Str,
+		/// Tool that staged the preview.
+		source_tool: Str,
+		/// Resolution invoker.
+		invoker:     Invoker,
+		/// Correlated acknowledgement.
+		reply:       flume::Sender<Result<(), ControlError>>,
+	},
+	/// Remove one staged-preview invoker.
+	RemovePendingInvoker {
+		/// Stable preview identity.
+		id:    Str,
+		/// Correlated acknowledgement.
+		reply: flume::Sender<Result<(), ControlError>>,
+	},
+	/// Explicitly step one campaign ladder.
+	Step {
+		/// Engagement identity.
+		engagement: Str,
+		/// Forensic transition reason.
+		reason:     Str,
+		/// Correlated result.
+		reply:      flume::Sender<Result<CampaignStepResult, ControlError>>,
+	},
+	/// Cut one campaign without dwell.
+	Cut {
+		/// Engagement identity.
+		engagement: Str,
+		/// Correlated result.
+		reply:      flume::Sender<Result<bool, ControlError>>,
+	},
+	/// Update one campaign's typed state payload.
+	UpdateState {
+		/// Engagement identity.
+		engagement: Str,
+		/// Machine-family payload.
+		payload:    Bytes,
+		/// Correlated durable entry.
+		reply:      flume::Sender<Result<CampaignEntry, ControlError>>,
+	},
+}
+
+impl CampaignControl {
+	/// Rejects a loop-scoped command received by a journal-only harness.
+	pub fn reject_unavailable(self) {
+		match self {
+			Self::Engage { reply, .. } => {
+				let _ = reply.send(Err(ControlError::Closed));
+			},
+			Self::Active { reply } => {
+				let _ = reply.send(Err(ControlError::Closed));
+			},
+			Self::Disengage { reply, .. } => {
+				let _ = reply.send(Err(ControlError::Closed));
+			},
+			Self::RegisterPendingInvoker { reply, .. } | Self::RemovePendingInvoker { reply, .. } => {
+				let _ = reply.send(Err(ControlError::Closed));
+			},
+			Self::Step { reply, .. } => {
+				let _ = reply.send(Err(ControlError::Closed));
+			},
+			Self::Cut { reply, .. } => {
+				let _ = reply.send(Err(ControlError::Closed));
+			},
+			Self::UpdateState { reply, .. } => {
+				let _ = reply.send(Err(ControlError::Closed));
+			},
+		}
+	}
 }
 
 type JournalReplyResult<T> = Result<T, JournalError>;
@@ -187,7 +311,25 @@ impl ControlSender {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::SetTitle { ts, title, reply })
+			.send(ControlCommand::SetTitle { ts, title, source: TitleSource::User, reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
+	/// Appends an assistant-generated durable session title through the journal
+	/// owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner or typed journal transition failure.
+	pub async fn set_generated_title(&self, ts: u64, title: Str) -> Result<u64, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::SetTitle { ts, title, source: TitleSource::Assistant, reply })
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -395,6 +537,151 @@ impl ControlSender {
 			.map_err(ControlError::from)
 	}
 
+	/// Engages one campaign on the sole mutable agent owner.
+	pub async fn engage_campaign(
+		&self,
+		spec: Arc<CampaignSpec>,
+		machine: Box<dyn CampaignMachine>,
+		options: EngageOptions,
+	) -> Result<EngageReceipt, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Campaign(CampaignControl::Engage { spec, machine, options, reply }))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
+	/// Engages a built-in regime by stable declaration identity.
+	pub async fn engage_regime(
+		&self,
+		spec_id: &str,
+		queue: bool,
+	) -> Result<EngageReceipt, ControlError> {
+		let (spec, machine) = crate::core_regime(spec_id)
+			.ok_or_else(|| ControlError::UnknownCoreCampaign { spec_id: Str::new(spec_id) })?;
+		self
+			.engage_campaign(spec, machine, EngageOptions { now_ms: crate::r#loop::now_ms(), queue })
+			.await
+	}
+
+	/// Registers or replaces a staged-preview resolution invoker.
+	pub async fn register_pending_invoker(
+		&self,
+		id: Str,
+		source_tool: Str,
+		invoker: Invoker,
+	) -> Result<(), ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Campaign(CampaignControl::RegisterPendingInvoker {
+				id,
+				source_tool,
+				invoker,
+				reply,
+			}))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
+	/// Removes a staged-preview resolution invoker.
+	pub async fn remove_pending_invoker(&self, id: Str) -> Result<(), ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Campaign(CampaignControl::RemovePendingInvoker { id, reply }))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
+	/// Explicitly steps one campaign ladder on the sole mutable owner.
+	pub async fn step_campaign(
+		&self,
+		engagement: Str,
+		reason: Str,
+	) -> Result<CampaignStepResult, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Campaign(CampaignControl::Step { engagement, reason, reply }))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
+	/// Cuts one campaign without dwell on the sole mutable owner.
+	pub async fn cut_campaign(&self, engagement: Str) -> Result<bool, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Campaign(CampaignControl::Cut { engagement, reply }))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
+	/// Updates one campaign's typed state and returns the journaled entry.
+	pub async fn update_campaign_state(
+		&self,
+		engagement: Str,
+		payload: Bytes,
+	) -> Result<CampaignEntry, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Campaign(CampaignControl::UpdateState {
+				engagement,
+				payload,
+				reply,
+			}))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
+	/// Returns every active or queued campaign engagement.
+	pub async fn active_campaigns(&self) -> Result<Vec<CampaignEntry>, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Campaign(CampaignControl::Active { reply }))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
+	/// Disengages one campaign on the sole mutable agent owner.
+	pub async fn disengage_campaign(&self, engagement: Str) -> Result<bool, ControlError> {
+		let now_ms = crate::r#loop::now_ms();
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Campaign(CampaignControl::Disengage { engagement, now_ms, reply }))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
 	/// Schedules a full agent rewind for the next turn boundary.
 	///
 	/// The acknowledgement means the sole owner accepted the command into its
@@ -440,16 +727,17 @@ impl ControlMailbox {
 		journal: &mut Journal,
 		limit: usize,
 		surfaced: &mut VecDeque<ScheduledRewind>,
+		campaigns: &mut Vec<CampaignControl>,
 	) -> usize {
 		let mut handled = 0;
 		while handled < limit {
 			let Ok(command) = self.commands.try_recv() else {
 				break;
 			};
-			if let ControlMailboxEvent::Rewind(rewind) =
-				handle_command(journal, command, &self.checkpoint_state)
-			{
-				surfaced.push_back(rewind);
+			match handle_command(journal, command, &self.checkpoint_state) {
+				ControlMailboxEvent::Rewind(rewind) => surfaced.push_back(rewind),
+				ControlMailboxEvent::Campaign(campaign) => campaigns.push(campaign),
+				ControlMailboxEvent::Closed | ControlMailboxEvent::JournalHandled => {},
 			}
 			handled += 1;
 		}
@@ -458,6 +746,7 @@ impl ControlMailbox {
 }
 
 pub(crate) enum ControlCommand {
+	Campaign(CampaignControl),
 	Reset {
 		ts:    u64,
 		reply: flume::Sender<JournalReplyResult<u64>>,
@@ -472,9 +761,10 @@ pub(crate) enum ControlCommand {
 		reply: flume::Sender<JournalReplyResult<u64>>,
 	},
 	SetTitle {
-		ts:    u64,
-		title: Str,
-		reply: flume::Sender<JournalReplyResult<u64>>,
+		ts:     u64,
+		title:  Str,
+		source: TitleSource,
+		reply:  flume::Sender<JournalReplyResult<u64>>,
 	},
 	Checkpoint {
 		goal:  Str,
@@ -532,6 +822,7 @@ fn handle_command(
 	checkpoint_state: &Mutex<CheckpointState>,
 ) -> ControlMailboxEvent {
 	match command {
+		ControlCommand::Campaign(command) => return ControlMailboxEvent::Campaign(command),
 		ControlCommand::Reset { ts, reply } => {
 			let _ = reply.send(journal.reset(ts));
 		},
@@ -541,8 +832,8 @@ fn handle_command(
 		ControlCommand::ModelOverride { ts, model, reply } => {
 			let _ = reply.send(journal.model_override(ts, model));
 		},
-		ControlCommand::SetTitle { ts, title, reply } => {
-			let _ = reply.send(journal.append_title(ts, title, TitleSource::User));
+		ControlCommand::SetTitle { ts, title, source, reply } => {
+			let _ = reply.send(journal.append_title(ts, title, source));
 		},
 		ControlCommand::Checkpoint { goal, reply } => {
 			let mut state = checkpoint_state.lock();

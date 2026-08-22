@@ -37,7 +37,7 @@ pub struct RevivedSession {
 	pub original_root:  PathBuf,
 }
 
-/// Cold-loads the journal and overlays its durable projections on the supplied
+/// Cold-loads the journal and applies its durable projections on the supplied
 /// current policy/grants/tool registry snapshot.
 ///
 /// The supplied snapshot owns current executable capabilities and policy. The

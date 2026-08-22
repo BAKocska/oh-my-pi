@@ -1,4 +1,4 @@
-//! Concurrent server-initiated tool invocations for a live gateway turn.
+//! Concurrent server-initiated tool invocations for a live arbiter turn.
 
 use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
@@ -153,7 +153,7 @@ impl DuplexManager {
 		if let Some(active) = self.active.remove(invocation_id) {
 			let _ = active
 				.interrupt
-				.send(Some(sf!("gateway cancelled invocation")));
+				.send(Some(sf!("arbiter cancelled invocation")));
 		}
 	}
 

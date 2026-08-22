@@ -88,7 +88,7 @@ pub enum RetryPolicyError {
 /// files.
 #[derive(Clone)]
 pub struct AgentSnapshot {
-	/// Per-turn gateway options.
+	/// Per-turn arbiter options.
 	pub turn:             TurnOptions,
 	/// Names of tools enabled for this turn, in stable publication order.
 	pub enabled_tools:    Arc<[Str]>,
