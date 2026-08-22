@@ -1,0 +1,4 @@
+[install]
+# Global bunfig gates fresh releases; kitty-vt-wasm is first-party (can1357).
+minimumReleaseAge = 86400
+minimumReleaseAgeExcludes = ["kitty-vt-wasm"]

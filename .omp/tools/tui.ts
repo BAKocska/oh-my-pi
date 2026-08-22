@@ -8,16 +8,23 @@
 // `frame`/`tree`/`values` are mailbox queries answered by `App` hosts
 // (immediate-mode hosts let them time out server-side).
 //
-// A built-in VT screen emulator tracks every PTY byte, so `screen` (and the
-// socketless `text` fallback) render any app's display as plain text — no
-// escape decoding required — and input ops echo an after-screenshot.
+// kitty's real terminal core (screen.c + vt-parser.c via kitty-vt-wasm)
+// tracks every PTY byte, so `screen` (and the socketless `text` fallback)
+// render any app's display exactly as kitty would — SGR, rewrap-on-resize,
+// scrollback, graphemes/wide chars — and input ops echo an after-screenshot.
+// Query replies the core generates (DA, DECRQSS, XTGETTCAP, OSC color
+// queries) are written back to the child, so capability probes resolve as on
+// a real terminal instead of timing out.
 //
 // Sessions live in this module for the lifetime of the agent session; the
 // child and its terminal are torn down on `stop` or shutdown.
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as net from "node:net";
+import { inflateSync } from "node:zlib";
 import type * as CanvasModule from "@napi-rs/canvas";
+import type * as KittyVt from "kitty-vt-wasm";
+import type { Color, KittyEvent, KittyTerminal } from "kitty-vt-wasm";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -61,7 +68,8 @@ interface ToolResult {
 	details?: Record<string, unknown>;
 }
 
-interface TuiParams {
+/** Parameter object accepted by the tool's `execute`. */
+export interface TuiParams {
 	op:
 		| "start"
 		| "stop"
@@ -100,84 +108,60 @@ interface TuiParams {
 
 // ─── VT screen emulator ──────────────────────────────────────────────────────
 
-/** Whether a code point occupies two terminal columns (common CJK/emoji ranges). */
-function wide(cp: number): boolean {
-	return (
-		(cp >= 0x1100 && cp <= 0x115f) ||
-		(cp >= 0x2e80 && cp <= 0xa4cf) ||
-		(cp >= 0xac00 && cp <= 0xd7a3) ||
-		(cp >= 0xf900 && cp <= 0xfaff) ||
-		(cp >= 0xfe30 && cp <= 0xfe4f) ||
-		(cp >= 0xff00 && cp <= 0xff60) ||
-		(cp >= 0xffe0 && cp <= 0xffe6) ||
-		(cp >= 0x1f300 && cp <= 0x1faff) ||
-		(cp >= 0x20000 && cp <= 0x3fffd)
-	);
+/** Lazily loaded kitty-vt-wasm module: a missing install degrades `start`, not module load. */
+let vtApi: Promise<typeof KittyVt> | null = null;
+
+function loadVt() {
+	vtApi ??= import("kitty-vt-wasm").catch((error) => {
+		vtApi = null;
+		throw new Error(
+			`screen emulation needs kitty-vt-wasm — run \`bun install\` in .omp/tools (${error})`,
+		);
+	});
+	return vtApi;
 }
+/** Decoded kitty-graphics command (the lib exports it only inside the event union). */
+type GraphicsCommand = Extract<KittyEvent, { type: "graphics_command" }>;
 
-/** Whether a code point occupies no terminal column (combining marks, ZWJ, variation selectors). */
-function zeroWidth(cp: number): boolean {
-	return (
-		(cp >= 0x0300 && cp <= 0x036f) ||
-		(cp >= 0x0483 && cp <= 0x0489) ||
-		(cp >= 0x1ab0 && cp <= 0x1aff) ||
-		(cp >= 0x1dc0 && cp <= 0x1dff) ||
-		(cp >= 0x200b && cp <= 0x200f) ||
-		cp === 0x2060 ||
-		(cp >= 0x20d0 && cp <= 0x20ff) ||
-		(cp >= 0xfe00 && cp <= 0xfe0f) ||
-		(cp >= 0xfe20 && cp <= 0xfe2f) ||
-		(cp >= 0xe0100 && cp <= 0xe01ef)
-	);
-}
+/**
+ * kitty's row/column diacritics (gen/rowcolumn-diacritics.txt): the Nth
+ * combining mark on a U+10EEEE image-placeholder cell encodes tile row/col N.
+ */
+const ROWCOL_DIACRITICS =
+	"0305,030D,030E,0310,0312,033D,033E,033F,0346,034A,034B,034C,0350,0351,0352,0357,035B,0363," +
+	"0364,0365,0366,0367,0368,0369,036A,036B,036C,036D,036E,036F,0483,0484,0485,0486,0487,0592," +
+	"0593,0594,0595,0597,0598,0599,059C,059D,059E,059F,05A0,05A1,05A8,05A9,05AB,05AC,05AF,05C4," +
+	"0610,0611,0612,0613,0614,0615,0616,0617,0657,0658,0659,065A,065B,065D,065E,06D6,06D7,06D8," +
+	"06D9,06DA,06DB,06DC,06DF,06E0,06E1,06E2,06E4,06E7,06E8,06EB,06EC,0730,0732,0733,0735,0736," +
+	"073A,073D,073F,0740,0741,0743,0745,0747,0749,074A,07EB,07EC,07ED,07EE,07EF,07F0,07F1,07F3," +
+	"0816,0817,0818,0819,081B,081C,081D,081E,081F,0820,0821,0822,0823,0825,0826,0827,0829,082A," +
+	"082B,082C,082D,0951,0953,0954,0F82,0F83,0F86,0F87,135D,135E,135F,17DD,193A,1A17,1A75,1A76," +
+	"1A77,1A78,1A79,1A7A,1A7B,1A7C,1B6B,1B6D,1B6E,1B6F,1B70,1B71,1B72,1B73,1CD0,1CD1,1CD2,1CDA," +
+	"1CDB,1CE0,1DC0,1DC1,1DC3,1DC4,1DC5,1DC6,1DC7,1DC8,1DC9,1DCB,1DCC,1DD1,1DD2,1DD3,1DD4,1DD5," +
+	"1DD6,1DD7,1DD8,1DD9,1DDA,1DDB,1DDC,1DDD,1DDE,1DDF,1DE0,1DE1,1DE2,1DE3,1DE4,1DE5,1DE6,1DFE," +
+	"20D0,20D1,20D4,20D5,20D6,20D7,20DB,20DC,20E1,20E7,20E9,20F0,2CEF,2CF0,2CF1,2DE0,2DE1,2DE2," +
+	"2DE3,2DE4,2DE5,2DE6,2DE7,2DE8,2DE9,2DEA,2DEB,2DEC,2DED,2DEE,2DEF,2DF0,2DF1,2DF2,2DF3,2DF4," +
+	"2DF5,2DF6,2DF7,2DF8,2DF9,2DFA,2DFB,2DFC,2DFD,2DFE,2DFF,A66F,A67C,A67D,A6F0,A6F1,A8E0,A8E1," +
+	"A8E2,A8E3,A8E4,A8E5,A8E6,A8E7,A8E8,A8E9,A8EA,A8EB,A8EC,A8ED,A8EE,A8EF,A8F0,A8F1,AAB0,AAB2," +
+	"AAB3,AAB7,AAB8,AABE,AABF,AAC1,FE20,FE21,FE22,FE23,FE24,FE25,FE26,10A0F,10A38,1D185,1D186," +
+	"1D187,1D188,1D189,1D1AA,1D1AB,1D1AC,1D1AD,1D242,1D243,1D244";
 
-/** Style attribute bits carried per cell. */
-const BOLD = 1;
-const DIM = 2;
-const ITALIC = 4;
-const UNDERLINE = 8;
-const REVERSE = 16;
-const STRIKE = 32;
+/** Combining-mark codepoint → row/column index for image placeholders. */
+const rowcolIndex = new Map<number, number>();
+ROWCOL_DIACRITICS.split(",").forEach((hex, index) => {
+	rowcolIndex.set(Number.parseInt(hex, 16), index);
+});
 
-/** Interned SGR paint state shared by every cell painted under it (colors 0xRRGGBB). */
-interface Style {
-	fg: number | null;
-	bg: number | null;
-	flags: number;
-}
+/** kitty image-placeholder cell (U+10EEEE + diacritics), scrubbed in text snapshots. */
+const PLACEHOLDER_RE = /\u{10EEEE}\p{M}*/gu;
 
-/** One rendered cell: glyph (empty = wide-char continuation) + style (null = default). */
-interface Cell {
-	ch: string;
-	st: Style | null;
-}
-
-const BLANK: Cell = { ch: " ", st: null };
-
-/** xterm's default 16-color palette. */
-const PALETTE16 = [
-	0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5,
-	0x7f7f7f, 0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
-];
-
-/** xterm 256-color index → 0xRRGGBB (16 basic, 6×6×6 cube, 24 grays). */
-function color256(index: number): number {
-	if (index < 16) return PALETTE16[index] ?? PALETTE16[0];
-	let r: number;
-	let g: number;
-	let b: number;
-	if (index < 232) {
-		const cube = index - 16;
-		r = Math.floor(cube / 36);
-		g = Math.floor(cube / 6) % 6;
-		b = cube % 6;
-		r = r === 0 ? 0 : 55 + 40 * r;
-		g = g === 0 ? 0 : 55 + 40 * g;
-		b = b === 0 ? 0 : 55 + 40 * b;
-	} else {
-		r = g = b = 8 + 10 * (index - 232);
-	}
-	return (r << 16) | (g << 8) | b;
+/** One completed kitty-graphics transmission (pixels for `shot`). */
+interface StoredImage {
+	bytes: Uint8Array;
+	/** kitty `f=`: 100 png, 32 rgba, 24 rgb. */
+	format: number;
+	width: number;
+	height: number;
 }
 
 // ─── PNG rasterizer ──────────────────────────────────────────────────────────
@@ -200,7 +184,11 @@ const DEF_FG = 0xd4d4d4;
 const DEF_BG = 0x101418;
 
 /** Lazily loaded canvas module + resolved font-family stack. */
-let canvasApi: { create: typeof CanvasModule.createCanvas; stack: string } | null = null;
+let canvasApi: {
+	create: typeof CanvasModule.createCanvas;
+	load: typeof CanvasModule.loadImage;
+	stack: string;
+} | null = null;
 
 /**
  * Loads @napi-rs/canvas and builds the fallback font stack from the fonts
@@ -237,6 +225,7 @@ async function loadCanvas() {
 	}
 	canvasApi = {
 		create: mod.createCanvas,
+		load: mod.loadImage,
 		stack: stack.map((family) => `"${family}"`).join(", "),
 	};
 	return canvasApi;
@@ -258,121 +247,326 @@ function lerpColor(from: number, to: number, t: number): number {
 }
 
 /**
- * Minimal VT100/xterm cell-grid emulator fed every PTY byte. Text and SGR
- * styling are both tracked, so any session — omp-tui host or not — can be
- * read as plain text (`snapshot`) or rasterized to pixels (`png`). Backs the
- * `screen`/`shot` ops, the socketless `text` fallback, and the
- * after-screenshot on input ops.
+ * Terminal emulation fed every PTY byte: kitty's real core (screen.c +
+ * vt-parser.c compiled to wasm via kitty-vt-wasm), so SGR, rewrap-on-resize,
+ * scrollback, graphemes, and wide chars behave exactly as in kitty. Any
+ * session — omp-tui host or not — can be read as plain text (`snapshot`) or
+ * rasterized to pixels (`png`). Backs the `screen`/`shot` ops, the socketless
+ * `text` fallback, and the after-screenshot on input ops. Query replies the
+ * core emits (DA, DECRQSS, XTGETTCAP, OSC color queries) surface on
+ * `onReply` for the session to write back to the child.
  */
-class Screen {
-	cols: number;
-	rows: number;
-	/** Lines scrolled off the top of the primary screen (capped at 2000). */
-	scrollback: string[] = [];
-	altActive = false;
-	cursorVisible = true;
-	private grid: Cell[][];
-	private altGrid: Cell[][];
-	private current: Style | null = null;
-	private x = 0;
-	private y = 0;
-	private savedX = 0;
-	private savedY = 0;
-	private top = 0;
-	private bottom: number;
-	private wrapPending = false;
-	private state: "ground" | "esc" | "csi" | "osc" | "str" | "charset" = "ground";
-	private csiBuf = "";
-	private utf8: number[] = [];
-	private utf8Need = 0;
+export class Screen {
+	/** Sink for terminal→child bytes (query replies); wired to the session PTY. */
+	onReply: ((bytes: Uint8Array) => void) | null = null;
+	private term: KittyTerminal;
+	/** Completed image transmissions by image id (insertion order backs eviction). */
+	private images = new Map<number, StoredImage>();
+	/** In-flight chunked transmission; continuation commands carry no id. */
+	private pending: {
+		id: number;
+		format: number;
+		compressed: number;
+		width: number;
+		height: number;
+		chunks: Buffer[];
+	} | null = null;
 
-	constructor(cols: number, rows: number) {
-		this.cols = cols;
-		this.rows = rows;
-		this.bottom = rows - 1;
-		this.grid = Screen.blank(cols, rows);
-		this.altGrid = Screen.blank(cols, rows);
+	private constructor(term: KittyTerminal) {
+		this.term = term;
 	}
 
-	private static blank(cols: number, rows: number): Cell[][] {
-		return Array.from({ length: rows }, () => new Array<Cell>(cols).fill(BLANK));
+	/** Loads the wasm module (cached process-wide) and allocates a terminal. */
+	static async create(cols: number, rows: number): Promise<Screen> {
+		const vt = await loadVt();
+		const term = await vt.KittyTerminal.create({
+			columns: cols,
+			rows,
+			scrollback: 2000,
+		});
+		const screen = new Screen(term);
+		term.onOutput = (bytes) => screen.onReply?.(bytes);
+		// Image transmissions are kept for `shot`; the handler also keeps
+		// core logs and other host events off the host's stderr.
+		term.onEvent = (event) => {
+			if (event.type === "graphics_command") screen.graphics(event);
+		};
+		return screen;
 	}
-
-	private active(): Cell[][] {
-		return this.altActive ? this.altGrid : this.grid;
-	}
-
-	/** Blank cell for erases: carries the current background (bce), else default. */
-	private eraseCell(): Cell {
-		const bg = this.current?.bg;
-		return bg ? { ch: " ", st: { fg: null, bg, flags: 0 } } : BLANK;
+	/**
+	 * Accumulates kitty-graphics transmissions. Chunked payloads (`m=1`)
+	 * arrive as separate commands whose continuations carry no id; pixels are
+	 * stored per image for the `shot` rasterizer.
+	 */
+	private graphics(cmd: GraphicsCommand) {
+		if (!this.pending) {
+			// Only transmissions carry pixels; queries/puts/deletes do not.
+			if (cmd.action !== "t" && cmd.action !== "T") return;
+			this.pending = {
+				id: cmd.id || cmd.image_number,
+				format: cmd.format,
+				compressed: cmd.compressed,
+				width: cmd.data_width,
+				height: cmd.data_height,
+				chunks: [],
+			};
+		}
+		const pending = this.pending;
+		if (cmd.payload) pending.chunks.push(Buffer.from(cmd.payload, "base64"));
+		if (cmd.more) return;
+		this.pending = null;
+		let bytes: Buffer =
+			pending.chunks.length === 1
+				? pending.chunks[0]
+				: Buffer.concat(pending.chunks);
+		if (pending.compressed) {
+			try {
+				bytes = inflateSync(bytes);
+			} catch {
+				return;
+			}
+		}
+		this.images.set(pending.id, {
+			bytes,
+			format: pending.format,
+			width: pending.width,
+			height: pending.height,
+		});
+		// Bound retained pixels: drop the oldest transmissions past 128.
+		if (this.images.size > 128) {
+			const oldest = this.images.keys().next().value;
+			if (oldest !== undefined) this.images.delete(oldest);
+		}
 	}
 
 	feed(chunk: Buffer) {
-		for (const byte of chunk) this.step(byte);
+		this.term.write(chunk);
+	}
+
+	/** Resize with kitty's real semantics: content rewraps and refills from scrollback. */
+	resize(cols: number, rows: number) {
+		this.term.resize(cols, rows);
+	}
+
+	/** Frees the native terminal. */
+	dispose() {
+		this.term.dispose();
+	}
+
+	/** Resolves a decoded color against the palette; null = terminal default. */
+	private rgb(color: Color, fallback: number): number {
+		if (!color) return fallback;
+		return "rgb" in color ? color.rgb : this.term.paletteColor(color.index);
+	}
+
+	/** Decodes a stored transmission to a drawable: PNG via Skia, raw RGB(A) via ImageData. */
+	private async decodeImage(
+		create: typeof CanvasModule.createCanvas,
+		load: typeof CanvasModule.loadImage,
+		image: StoredImage,
+	): Promise<CanvasModule.Image | CanvasModule.Canvas | null> {
+		if (image.format === 100) {
+			try {
+				return await load(Buffer.from(image.bytes));
+			} catch {
+				return null;
+			}
+		}
+		const channels = image.format === 24 ? 3 : 4;
+		const { width, height } = image;
+		if (!width || !height || image.bytes.length < width * height * channels)
+			return null;
+		const off = create(width, height);
+		const ctx = off.getContext("2d");
+		const data = ctx.createImageData(width, height);
+		for (let i = 0, j = 0; i < width * height; i++, j += channels) {
+			data.data[i * 4] = image.bytes[j];
+			data.data[i * 4 + 1] = image.bytes[j + 1];
+			data.data[i * 4 + 2] = image.bytes[j + 2];
+			data.data[i * 4 + 3] = channels === 4 ? image.bytes[j + 3] : 255;
+		}
+		ctx.putImageData(data, 0, 0);
+		return off;
 	}
 
 	/** Plain-text screen: header, optional scrollback tail, then the viewport. */
 	snapshot(history = 0): string {
+		const term = this.term;
+		const cursor = term.cursor;
 		const out = [
-			`── screen ${this.cols}x${this.rows}` +
-				`${this.altActive ? ", alt screen" : ""}` +
-				`, cursor=[${this.x},${this.y}]${this.cursorVisible ? "" : " hidden"}` +
-				`, scrollback=${this.scrollback.length} ──`,
+			`── screen ${term.columns}x${term.rows}` +
+				`${term.isMainScreen ? "" : ", alt screen"}` +
+				`, cursor=[${cursor.x},${cursor.y}]${cursor.visible ? "" : " hidden"}` +
+				`, scrollback=${term.scrollbackLength} ──`,
 		];
-		for (const line of history > 0 ? this.scrollback.slice(-history) : []) {
-			out.push(`┆${line}`);
+		if (history > 0) {
+			const total = term.scrollbackLength;
+			for (let i = Math.max(0, total - history); i < total; i++) {
+				out.push(
+					`┆${(term.scrollbackLine(i) ?? "").replace(PLACEHOLDER_RE, "▒")}`,
+				);
+			}
 		}
-		for (const row of this.active()) {
-			out.push(`│${row.map((cell) => cell.ch).join("").replace(/ +$/, "")}`);
-		}
+		for (let y = 0; y < term.rows; y++)
+			out.push(`│${term.line(y).replace(PLACEHOLDER_RE, "▒")}`);
 		return out.join("\n");
 	}
 
 	/** Rasterizes the viewport to a PNG via Skia with real system fonts. */
 	async png(): Promise<Buffer> {
-		const { create, stack } = await loadCanvas();
-		const width = this.cols * CW;
-		const height = this.rows * CH;
+		const { create, load, stack } = await loadCanvas();
+		const term = this.term;
+		const cols = term.columns;
+		const rows = term.rows;
+		const defFg = this.rgb(term.defaultFg, DEF_FG);
+		const defBg = this.rgb(term.defaultBg, DEF_BG);
+		const width = cols * CW;
+		const height = rows * CH;
 		const canvas = create(width, height);
 		const ctx = canvas.getContext("2d");
-		ctx.fillStyle = css(DEF_BG);
+		ctx.fillStyle = css(defBg);
 		ctx.fillRect(0, 0, width, height);
-		const grid = this.active();
 		// Resolve each cell's paint once; draw backgrounds before any text so
 		// glyph overhang (italics, wide fallback) never sits under a
 		// neighbor's background.
-		const cells: { px: number; py: number; ch: string; fg: number; flags: number; span: number }[] =
-			[];
-		for (let y = 0; y < this.rows; y++) {
-			const row = grid[y];
-			for (let x = 0; x < this.cols; x++) {
-				const cell = row[x];
+		const cells: {
+			px: number;
+			py: number;
+			ch: string;
+			fg: number;
+			deco: number;
+			bold: boolean;
+			italic: boolean;
+			underline: number;
+			strike: boolean;
+			span: number;
+		}[] = [];
+		// kitty unicode image placeholders collected off the grid (drawn as tiles).
+		const holders: {
+			px: number;
+			py: number;
+			id: number;
+			row: number;
+			col: number;
+		}[] = [];
+		for (let y = 0; y < rows; y++) {
+			for (let x = 0; x < cols; x++) {
+				const cell = term.cell(x, y);
 				// Wide-char continuations are drawn by their lead cell.
-				if (cell.ch === "") continue;
-				const st = cell.st;
-				let fg = st?.fg ?? DEF_FG;
-				let bg = st?.bg ?? null;
-				if (st && st.flags & REVERSE) {
+				if (!cell || cell.wideTrail) continue;
+				let fg = this.rgb(cell.fg, defFg);
+				let bg = cell.bg ? this.rgb(cell.bg, defBg) : null;
+				if (cell.reverse) {
 					const swap = fg;
-					fg = bg ?? DEF_BG;
+					fg = bg ?? defBg;
 					bg = swap;
 				}
-				if (st && st.flags & DIM) fg = lerpColor(fg, bg ?? DEF_BG, 0.45);
-				const span = x + 1 < this.cols && row[x + 1].ch === "" ? 2 : 1;
+				if (cell.dim) fg = lerpColor(fg, bg ?? defBg, 0.45);
+				const span = cell.wide ? 2 : 1;
 				const px = x * CW;
 				const py = y * CH;
 				if (bg !== null) {
 					ctx.fillStyle = css(bg);
 					ctx.fillRect(px, py, span * CW, CH);
 				}
-				cells.push({ px, py, ch: cell.ch, fg, flags: st?.flags ?? 0, span });
+				if (cell.ch.codePointAt(0) === 0x10eeee) {
+					// Image placeholder: fg encodes the image id, combining
+					// diacritics the tile row/col; omitted diacritics continue
+					// the previous cell's run (kitty spec).
+					const id = cell.fg
+						? "rgb" in cell.fg
+							? cell.fg.rgb
+							: cell.fg.index
+						: 0;
+					const row = rowcolIndex.get(cell.combining[0]?.codePointAt(0) ?? -1);
+					const col = rowcolIndex.get(cell.combining[1]?.codePointAt(0) ?? -1);
+					const prev = holders.at(-1);
+					const run = prev && prev.id === id && prev.py === py;
+					holders.push({
+						px,
+						py,
+						id,
+						row: row ?? (run ? prev.row : 0),
+						col: col ?? (run ? prev.col + 1 : 0),
+					});
+					continue;
+				}
+				cells.push({
+					px,
+					py,
+					ch: cell.ch ? cell.ch + cell.combining.join("") : " ",
+					fg,
+					deco: cell.decorationFg ? this.rgb(cell.decorationFg, fg) : fg,
+					bold: cell.bold,
+					italic: cell.italic,
+					underline: cell.underline,
+					strike: cell.strikethrough,
+					span,
+				});
 			}
 		}
-		for (const { px, py, ch, fg, flags, span } of cells) {
+		// Decode every image referenced by a placement or placeholder cell.
+		const placements = term.graphicsPlacements();
+		const drawable = new Map<
+			number,
+			CanvasModule.Image | CanvasModule.Canvas
+		>();
+		const wanted = new Set(holders.map((holder) => holder.id));
+		for (const placement of placements) {
+			if (!placement.unicodePlacement) wanted.add(placement.imageId);
+		}
+		for (const id of wanted) {
+			const stored = this.images.get(id);
+			if (!stored) continue;
+			const image = await this.decodeImage(create, load, stored);
+			if (image) drawable.set(id, image);
+		}
+		const direct = placements
+			.filter((placement) => !placement.unicodePlacement)
+			.sort((a, b) => a.zIndex - b.zIndex);
+		const drawDirect = (placement: (typeof direct)[number]) => {
+			const image = drawable.get(placement.imageId);
+			if (!image) return;
+			// Natural-size placements (numCols/numRows 0): the wasm core
+			// assumes 10x20px cells when sizing them.
+			const spanCols = placement.numCols || Math.ceil(image.width / 10);
+			const spanRows = placement.numRows || Math.ceil(image.height / 20);
+			ctx.drawImage(
+				image,
+				placement.col * CW,
+				placement.row * CH,
+				spanCols * CW,
+				spanRows * CH,
+			);
+		};
+		// kitty z-order: negative z-index draws under text, the rest above.
+		for (const placement of direct)
+			if (placement.zIndex < 0) drawDirect(placement);
+		for (const {
+			px,
+			py,
+			ch,
+			fg,
+			deco,
+			bold,
+			italic,
+			underline,
+			strike,
+			span,
+		} of cells) {
+			if (underline) {
+				// Coarse style fidelity: double gets two bars; straight,
+				// curly, dotted, and dashed all render as one.
+				ctx.fillStyle = css(deco);
+				if (underline === 2) {
+					ctx.fillRect(px, py + 27, span * CW, 1);
+					ctx.fillRect(px, py + 30, span * CW, 1);
+				} else {
+					ctx.fillRect(px, py + 28, span * CW, 2);
+				}
+			}
 			ctx.fillStyle = css(fg);
-			if (flags & UNDERLINE) ctx.fillRect(px, py + 28, span * CW, 2);
-			if (flags & STRIKE) ctx.fillRect(px, py + 15, span * CW, 2);
+			if (strike) ctx.fillRect(px, py + 15, span * CW, 2);
 			if (ch === " ") continue;
 			const cp = ch.codePointAt(0) ?? 0;
 			if (cp >= 0xe0b0 && cp <= 0xe0b3) {
@@ -399,509 +593,59 @@ class Screen {
 				continue;
 			}
 			ctx.font =
-				`${flags & ITALIC ? "italic " : ""}${flags & BOLD ? "bold " : ""}` +
+				`${italic ? "italic " : ""}${bold ? "bold " : ""}` +
 				`${FONT_PX}px ${stack}`;
 			ctx.fillText(ch, px, py + BASELINE);
 		}
-		if (this.cursorVisible) {
+		for (const placement of direct)
+			if (placement.zIndex >= 0) drawDirect(placement);
+		// Placeholder tiles: scale each image to its virtual grid (or the max
+		// extent seen) and draw the cell's slice.
+		const grids = new Map<number, { cols: number; rows: number }>();
+		for (const placement of placements) {
+			if (
+				placement.unicodePlacement &&
+				placement.numCols &&
+				placement.numRows
+			) {
+				grids.set(placement.imageId, {
+					cols: placement.numCols,
+					rows: placement.numRows,
+				});
+			}
+		}
+		for (const holder of holders) {
+			const grid = grids.get(holder.id) ?? { cols: 0, rows: 0 };
+			grid.cols = Math.max(grid.cols, holder.col + 1);
+			grid.rows = Math.max(grid.rows, holder.row + 1);
+			grids.set(holder.id, grid);
+		}
+		for (const holder of holders) {
+			const image = drawable.get(holder.id);
+			const grid = grids.get(holder.id);
+			if (!image || !grid) continue;
+			const sw = image.width / grid.cols;
+			const sh = image.height / grid.rows;
+			ctx.drawImage(
+				image,
+				holder.col * sw,
+				holder.row * sh,
+				sw,
+				sh,
+				holder.px,
+				holder.py,
+				CW,
+				CH,
+			);
+		}
+		const cursor = term.cursor;
+		if (cursor.visible) {
 			ctx.globalAlpha = 0.4;
 			ctx.fillStyle = "#ffffff";
-			ctx.fillRect(this.x * CW, this.y * CH, CW, CH);
+			ctx.fillRect(cursor.x * CW, cursor.y * CH, CW, CH);
 			ctx.globalAlpha = 1;
 		}
 		return canvas.toBuffer("image/png");
-	}
-
-	resize(cols: number, rows: number) {
-		const fit = (grid: Cell[][]) => {
-			grid.length = Math.min(grid.length, rows);
-			while (grid.length < rows) grid.push(new Array<Cell>(cols).fill(BLANK));
-			for (const row of grid) {
-				row.length = Math.min(row.length, cols);
-				while (row.length < cols) row.push(BLANK);
-			}
-		};
-		this.cols = cols;
-		this.rows = rows;
-		fit(this.grid);
-		fit(this.altGrid);
-		this.top = 0;
-		this.bottom = rows - 1;
-		this.x = Math.min(this.x, cols - 1);
-		this.y = Math.min(this.y, rows - 1);
-		this.wrapPending = false;
-	}
-
-	private step(byte: number) {
-		switch (this.state) {
-			case "ground":
-				if (byte === 0x1b) {
-					this.utf8Need = 0;
-					this.state = "esc";
-				} else if (byte < 0x20 || byte === 0x7f) this.control(byte);
-				else this.decode(byte);
-				return;
-			case "esc":
-				this.escByte(byte);
-				return;
-			case "charset":
-				this.state = "ground";
-				return;
-			case "csi":
-				if (byte === 0x1b) this.state = "esc";
-				else if (byte >= 0x40 && byte <= 0x7e) {
-					this.state = "ground";
-					this.csi(String.fromCharCode(byte));
-				} else if (byte >= 0x20) this.csiBuf += String.fromCharCode(byte);
-				else this.control(byte);
-				return;
-			case "osc":
-				if (byte === 0x07) this.state = "ground";
-				else if (byte === 0x1b) this.state = "esc";
-				return;
-			case "str":
-				if (byte === 0x1b) this.state = "esc";
-				return;
-		}
-	}
-
-	private escByte(byte: number) {
-		this.state = "ground";
-		switch (String.fromCharCode(byte)) {
-			case "[":
-				this.csiBuf = "";
-				this.state = "csi";
-				return;
-			case "]":
-				this.state = "osc";
-				return;
-			case "P":
-			case "X":
-			case "^":
-			case "_":
-				this.state = "str";
-				return;
-			case "(":
-			case ")":
-			case "*":
-			case "+":
-			case "#":
-			case "%":
-				this.state = "charset";
-				return;
-			case "7":
-				this.savedX = this.x;
-				this.savedY = this.y;
-				return;
-			case "8":
-				this.x = this.savedX;
-				this.y = this.savedY;
-				this.wrapPending = false;
-				return;
-			case "D":
-				this.lineFeed();
-				return;
-			case "E":
-				this.lineFeed();
-				this.x = 0;
-				return;
-			case "M":
-				this.reverseIndex();
-				return;
-			case "c":
-				this.reset();
-				return;
-			default:
-				return;
-		}
-	}
-
-	private control(byte: number) {
-		if (byte === 0x0d) {
-			this.x = 0;
-			this.wrapPending = false;
-		} else if (byte === 0x0a || byte === 0x0b || byte === 0x0c) this.lineFeed();
-		else if (byte === 0x08) {
-			if (this.x > 0) this.x--;
-			this.wrapPending = false;
-		} else if (byte === 0x09) {
-			this.x = Math.min((Math.floor(this.x / 8) + 1) * 8, this.cols - 1);
-			this.wrapPending = false;
-		}
-	}
-
-	private decode(byte: number) {
-		if (this.utf8Need > 0) {
-			if ((byte & 0xc0) === 0x80) {
-				this.utf8.push(byte);
-				if (this.utf8.length === this.utf8Need) {
-					const text = Buffer.from(this.utf8).toString("utf8");
-					this.utf8Need = 0;
-					for (const ch of text) this.print(ch);
-				}
-				return;
-			}
-			this.utf8Need = 0;
-		}
-		if (byte < 0x80) {
-			this.print(String.fromCharCode(byte));
-			return;
-		}
-		const need = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 0;
-		if (need === 0) return;
-		this.utf8 = [byte];
-		this.utf8Need = need;
-	}
-
-	private print(ch: string) {
-		const cp = ch.codePointAt(0) ?? 0;
-		if (zeroWidth(cp)) {
-			// Attach to the cell the cursor last wrote (skipping wide-char
-			// continuation cells) so columns stay aligned.
-			const row = this.active()[this.y];
-			let cell = this.wrapPending ? this.cols - 1 : this.x - 1;
-			while (cell > 0 && row[cell].ch === "") cell--;
-			if (cell >= 0) row[cell] = { ch: row[cell].ch + ch, st: row[cell].st };
-			return;
-		}
-		if (this.wrapPending) {
-			this.wrapPending = false;
-			this.x = 0;
-			this.lineFeed();
-		}
-		const width = wide(cp) ? 2 : 1;
-		if (width === 2 && this.x >= this.cols - 1) {
-			this.x = 0;
-			this.lineFeed();
-		}
-		const row = this.active()[this.y];
-		row[this.x] = { ch, st: this.current };
-		if (width === 2 && this.x + 1 < this.cols) {
-			row[this.x + 1] = { ch: "", st: this.current };
-		}
-		this.x += width;
-		if (this.x >= this.cols) {
-			this.x = this.cols - 1;
-			this.wrapPending = true;
-		}
-	}
-
-	private lineFeed() {
-		this.wrapPending = false;
-		if (this.y === this.bottom) this.scrollUp(1);
-		else if (this.y < this.rows - 1) this.y++;
-	}
-
-	private reverseIndex() {
-		this.wrapPending = false;
-		if (this.y === this.top) this.scrollDown(1);
-		else if (this.y > 0) this.y--;
-	}
-
-	private scrollUp(n: number) {
-		const grid = this.active();
-		for (let i = 0; i < n; i++) {
-			const removed = grid.splice(this.top, 1)[0];
-			if (!this.altActive && this.top === 0) {
-				this.scrollback.push(removed.map((cell) => cell.ch).join("").replace(/ +$/, ""));
-				if (this.scrollback.length > 2000) this.scrollback.shift();
-			}
-			grid.splice(this.bottom, 0, new Array<Cell>(this.cols).fill(BLANK));
-		}
-	}
-
-	private scrollDown(n: number) {
-		const grid = this.active();
-		for (let i = 0; i < n; i++) {
-			grid.splice(this.bottom, 1);
-			grid.splice(this.top, 0, new Array<Cell>(this.cols).fill(BLANK));
-		}
-	}
-
-	private eraseDisplay(kind: number) {
-		if (kind === 3) {
-			this.scrollback = [];
-			return;
-		}
-		const grid = this.active();
-		const cell = this.eraseCell();
-		if (kind === 2) {
-			for (const row of grid) row.fill(cell);
-		} else if (kind === 1) {
-			for (let row = 0; row < this.y; row++) grid[row].fill(cell);
-			grid[this.y].fill(cell, 0, this.x + 1);
-		} else {
-			grid[this.y].fill(cell, this.x);
-			for (let row = this.y + 1; row < this.rows; row++) grid[row].fill(cell);
-		}
-	}
-
-	private eraseLine(kind: number) {
-		const row = this.active()[this.y];
-		const cell = this.eraseCell();
-		if (kind === 2) row.fill(cell);
-		else if (kind === 1) row.fill(cell, 0, this.x + 1);
-		else row.fill(cell, this.x);
-	}
-
-	private mode(modes: number[], set: boolean) {
-		for (const mode of modes) {
-			if (mode === 25) this.cursorVisible = set;
-			else if (mode === 47 || mode === 1047 || mode === 1049) {
-				if (set && !this.altActive) {
-					this.savedX = this.x;
-					this.savedY = this.y;
-					this.altActive = true;
-					this.altGrid = Screen.blank(this.cols, this.rows);
-					this.top = 0;
-					this.bottom = this.rows - 1;
-					this.x = 0;
-					this.y = 0;
-				} else if (!set && this.altActive) {
-					this.altActive = false;
-					this.top = 0;
-					this.bottom = this.rows - 1;
-					this.x = this.savedX;
-					this.y = this.savedY;
-				}
-			}
-		}
-	}
-
-	private reset() {
-		this.grid = Screen.blank(this.cols, this.rows);
-		this.altGrid = Screen.blank(this.cols, this.rows);
-		this.altActive = false;
-		this.current = null;
-		this.x = this.y = this.savedX = this.savedY = 0;
-		this.top = 0;
-		this.bottom = this.rows - 1;
-		this.cursorVisible = true;
-		this.wrapPending = false;
-	}
-
-	/** Applies one SGR parameter string (handles `;` params and `:` subparams). */
-	private sgr(raw: string) {
-		let fg = this.current?.fg ?? null;
-		let bg = this.current?.bg ?? null;
-		let flags = this.current?.flags ?? 0;
-		const params = raw === "" ? ["0"] : raw.split(";");
-		for (let i = 0; i < params.length; i++) {
-			const subs = params[i].split(":");
-			const code = Number.parseInt(subs[0], 10) || 0;
-			switch (code) {
-				case 0:
-					fg = bg = null;
-					flags = 0;
-					break;
-				case 1:
-					flags |= BOLD;
-					break;
-				case 2:
-					flags |= DIM;
-					break;
-				case 3:
-					flags |= ITALIC;
-					break;
-				case 4:
-					if (subs[1] === "0") flags &= ~UNDERLINE;
-					else flags |= UNDERLINE;
-					break;
-				case 7:
-					flags |= REVERSE;
-					break;
-				case 9:
-					flags |= STRIKE;
-					break;
-				case 22:
-					flags &= ~(BOLD | DIM);
-					break;
-				case 23:
-					flags &= ~ITALIC;
-					break;
-				case 24:
-					flags &= ~UNDERLINE;
-					break;
-				case 27:
-					flags &= ~REVERSE;
-					break;
-				case 29:
-					flags &= ~STRIKE;
-					break;
-				case 39:
-					fg = null;
-					break;
-				case 49:
-					bg = null;
-					break;
-				case 38:
-				case 48:
-				case 58: {
-					// Extended color: `38;2;r;g;b` / `38;5;n` (also `:` subparam
-					// forms, incl. the optional colorspace slot). 58 (underline
-					// color) is consumed but dropped.
-					let color: number | null = null;
-					if (subs.length > 1) {
-						const mode = Number.parseInt(subs[1], 10);
-						if (mode === 5) color = color256(Number.parseInt(subs[2], 10) || 0);
-						else if (mode === 2) {
-							const from = subs.length > 5 ? 3 : 2;
-							const [r, g, b] = subs
-								.slice(from, from + 3)
-								.map((sub) => Number.parseInt(sub, 10) || 0);
-							color = (r << 16) | (g << 8) | b;
-						}
-					} else {
-						const mode = Number.parseInt(params[++i], 10);
-						if (mode === 5) color = color256(Number.parseInt(params[++i], 10) || 0);
-						else if (mode === 2) {
-							const r = Number.parseInt(params[++i], 10) || 0;
-							const g = Number.parseInt(params[++i], 10) || 0;
-							const b = Number.parseInt(params[++i], 10) || 0;
-							color = (r << 16) | (g << 8) | b;
-						}
-					}
-					if (code === 38) fg = color;
-					else if (code === 48) bg = color;
-					break;
-				}
-				default:
-					if (code >= 30 && code <= 37) fg = PALETTE16[code - 30];
-					else if (code >= 90 && code <= 97) fg = PALETTE16[code - 90 + 8];
-					else if (code >= 40 && code <= 47) bg = PALETTE16[code - 40];
-					else if (code >= 100 && code <= 107) bg = PALETTE16[code - 100 + 8];
-					break;
-			}
-		}
-		this.current = fg === null && bg === null && flags === 0 ? null : { fg, bg, flags };
-	}
-
-	private csi(final: string) {
-		const buf = this.csiBuf;
-		const priv = /^[?>=<]/.test(buf);
-		if (final === "m") {
-			if (!priv) this.sgr(buf);
-			return;
-		}
-		const nums = (priv ? buf.slice(1) : buf)
-			.split(";")
-			.map((part) => Number.parseInt(part, 10));
-		const arg = (index: number, fallback: number) =>
-			Number.isFinite(nums[index]) && nums[index] > 0 ? nums[index] : fallback;
-		this.wrapPending = false;
-		switch (final) {
-			case "A":
-				this.y = Math.max(0, this.y - arg(0, 1));
-				break;
-			case "B":
-				this.y = Math.min(this.rows - 1, this.y + arg(0, 1));
-				break;
-			case "C":
-				this.x = Math.min(this.cols - 1, this.x + arg(0, 1));
-				break;
-			case "D":
-				this.x = Math.max(0, this.x - arg(0, 1));
-				break;
-			case "E":
-				this.y = Math.min(this.rows - 1, this.y + arg(0, 1));
-				this.x = 0;
-				break;
-			case "F":
-				this.y = Math.max(0, this.y - arg(0, 1));
-				this.x = 0;
-				break;
-			case "G":
-			case "`":
-				this.x = Math.min(this.cols - 1, arg(0, 1) - 1);
-				break;
-			case "H":
-			case "f":
-				this.y = Math.min(this.rows - 1, arg(0, 1) - 1);
-				this.x = Math.min(this.cols - 1, arg(1, 1) - 1);
-				break;
-			case "d":
-				this.y = Math.min(this.rows - 1, arg(0, 1) - 1);
-				break;
-			case "J":
-				this.eraseDisplay(nums[0] > 0 ? nums[0] : 0);
-				break;
-			case "K":
-				this.eraseLine(nums[0] > 0 ? nums[0] : 0);
-				break;
-			case "L":
-			case "M": {
-				if (this.y < this.top || this.y > this.bottom) break;
-				const grid = this.active();
-				for (let i = Math.min(arg(0, 1), this.rows); i > 0; i--) {
-					if (final === "L") {
-						grid.splice(this.bottom, 1);
-						grid.splice(this.y, 0, new Array<Cell>(this.cols).fill(BLANK));
-					} else {
-						grid.splice(this.y, 1);
-						grid.splice(this.bottom, 0, new Array<Cell>(this.cols).fill(BLANK));
-					}
-				}
-				break;
-			}
-			case "@": {
-				const row = this.active()[this.y];
-				const cell = this.eraseCell();
-				for (let i = Math.min(arg(0, 1), this.cols); i > 0; i--) {
-					row.pop();
-					row.splice(this.x, 0, cell);
-				}
-				break;
-			}
-			case "P": {
-				const row = this.active()[this.y];
-				const cell = this.eraseCell();
-				for (let i = Math.min(arg(0, 1), this.cols); i > 0; i--) {
-					row.splice(this.x, 1);
-					row.push(cell);
-				}
-				break;
-			}
-			case "X":
-				this.active()[this.y].fill(
-					this.eraseCell(),
-					this.x,
-					Math.min(this.cols, this.x + arg(0, 1)),
-				);
-				break;
-			case "S":
-				this.scrollUp(Math.min(arg(0, 1), this.rows));
-				break;
-			case "T":
-				this.scrollDown(Math.min(arg(0, 1), this.rows));
-				break;
-			case "r":
-				this.top = Math.min(this.rows - 1, arg(0, 1) - 1);
-				this.bottom = Math.min(this.rows - 1, arg(1, this.rows) - 1);
-				if (this.top >= this.bottom) {
-					this.top = 0;
-					this.bottom = this.rows - 1;
-				}
-				this.x = 0;
-				this.y = 0;
-				break;
-			case "h":
-			case "l":
-				if (priv) this.mode(nums, final === "h");
-				break;
-			case "s":
-				this.savedX = this.x;
-				this.savedY = this.y;
-				break;
-			case "u":
-				if (!priv) {
-					this.x = this.savedX;
-					this.y = this.savedY;
-				}
-				break;
-			default:
-				// Queries and anything unrecognized: no text effect.
-				break;
-		}
 	}
 }
 
@@ -958,7 +702,11 @@ function capture(session: Session, chunk: Buffer) {
 	}
 }
 
-function connectSocket(session: Session, path: string, timeoutMs: number): Promise<boolean> {
+function connectSocket(
+	session: Session,
+	path: string,
+	timeoutMs: number,
+): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	const { promise, resolve } = Promise.withResolvers<boolean>();
 	const attempt = () => {
@@ -1014,7 +762,8 @@ function request(
 			),
 		);
 	}
-	const { promise, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
+	const { promise, resolve, reject } =
+		Promise.withResolvers<Record<string, unknown>>();
 	const timer = setTimeout(() => {
 		const index = session.waiters.findIndex((waiter) => waiter.timer === timer);
 		if (index >= 0) session.waiters.splice(index, 1);
@@ -1060,6 +809,7 @@ async function stopSession(session: Session): Promise<number | null> {
 	}
 	session.sock?.destroy();
 	session.proc.terminal.close();
+	session.screen.dispose();
 	rmSync(session.dir, { recursive: true, force: true });
 	sessions.delete(session.name);
 	return exited ?? -9;
@@ -1096,7 +846,11 @@ function screenshotText(response: Record<string, unknown>): string {
  * After-input screenshot: the renderer's viewport when a debug socket exists
  * (and answers), else the emulator's screen.
  */
-async function settled(session: Session, note: string, waitMs = 180): Promise<string> {
+async function settled(
+	session: Session,
+	note: string,
+	waitMs = 180,
+): Promise<string> {
 	await sleep(waitMs);
 	if (session.sock) {
 		try {
@@ -1124,7 +878,9 @@ function renderTree(node: unknown, depth: number, out: string[]) {
 	out.push(
 		"  ".repeat(depth) +
 			`${field(node, "kind")}${typeof id === "string" ? `#${id}` : ""}` +
-			(Array.isArray(rect) ? ` [${rect[0]},${rect[1]} ${rect[2]}x${rect[3]}]` : "") +
+			(Array.isArray(rect)
+				? ` [${rect[0]},${rect[1]} ${rect[2]}x${rect[3]}]`
+				: "") +
 			(flags ? `  ${flags}` : ""),
 	);
 	const children = field(node, "children");
@@ -1220,7 +976,9 @@ const factory = (omp: ToolHost) => {
 		if (params.build !== false) {
 			onUpdate?.({ content: [{ type: "text", text: `building ${target}…` }] });
 			const kind = params.example ? "--example" : "--bin";
-			const built = await omp.exec("cargo", ["build", kind, target], { cwd: omp.cwd });
+			const built = await omp.exec("cargo", ["build", kind, target], {
+				cwd: omp.cwd,
+			});
 			if (built.code !== 0) {
 				throw new Error(`cargo build failed:\n${built.stderr.slice(-4000)}`);
 			}
@@ -1233,26 +991,37 @@ const factory = (omp: ToolHost) => {
 		const cols = params.cols ?? 100;
 		const dir = mkdtempSync(join(tmpdir(), `omp-tui-${name}-`));
 		const sockPath = join(dir, "debug.sock");
+		const screen = await Screen.create(cols, rows);
 		// The PTY data callback closes over `session`; Bun.spawn returns
 		// synchronously and the callback fires on the event loop, so the
 		// binding is assigned before the first chunk can arrive.
 		let session: Session;
-		const proc: Child = Bun.spawn([binary, ...(params.args ?? [])], {
-			cwd: omp.cwd,
-			env: {
-				...process.env,
-				OMP_TUI_DEBUG: sockPath,
-				TERM: "xterm-256color",
-				COLORTERM: "truecolor",
-			},
-			terminal: {
-				cols,
-				rows,
-				data(_terminal: TerminalHandle, chunk: Buffer) {
-					capture(session, chunk);
+		let proc: Child;
+		try {
+			proc = Bun.spawn([binary, ...(params.args ?? [])], {
+				cwd: omp.cwd,
+				env: {
+					...process.env,
+					OMP_TUI_DEBUG: sockPath,
+					TERM: "xterm-256color",
+					COLORTERM: "truecolor",
 				},
-			},
-		});
+				terminal: {
+					cols,
+					rows,
+					data(_terminal: TerminalHandle, chunk: Buffer) {
+						capture(session, chunk);
+					},
+				},
+			});
+		} catch (error) {
+			screen.dispose();
+			rmSync(dir, { recursive: true, force: true });
+			throw error;
+		}
+		// Route the core's query replies (DA, DECRQSS, OSC color queries) back
+		// to the child: capability probes resolve as on a real terminal.
+		screen.onReply = (bytes) => proc.terminal.write(bytes);
 		session = {
 			name,
 			target,
@@ -1260,7 +1029,7 @@ const factory = (omp: ToolHost) => {
 			cols,
 			rows,
 			dir,
-			screen: new Screen(cols, rows),
+			screen,
 			sock: null,
 			sockBuf: "",
 			waiters: [],
@@ -1319,7 +1088,7 @@ const factory = (omp: ToolHost) => {
 			"Run and debug omp-tui apps (cargo examples or bins) headlessly on a real " +
 			"PTY plus the OMP_TUI_DEBUG socket. Ops: start (example|bin, rows/cols, " +
 			"args, build), text (viewport screenshot as plain text), screen " +
-			"(plain-text screen from the built-in VT emulator — works for any app, no " +
+			"(plain-text screen from kitty's real terminal core — works for any app, no " +
 			"debug socket needed; peek=N prepends N scrollback lines), frame (full " +
 			"document), tree (component tree with ids/rects/focus), values (widget " +
 			"values JSON), info, keys (spec like \"tab C-c enter 'literal'\"), type " +
@@ -1340,12 +1109,27 @@ const factory = (omp: ToolHost) => {
 				.describe(
 					"operation: start | stop | list | text | screen | shot | frame | tree | values | info | keys | type | paste | mouse | send | resize | raw",
 				),
-			name: omp.zod.string().optional().describe("session name (default: main)"),
-			example: omp.zod.string().optional().describe("start: cargo example name"),
+			name: omp.zod
+				.string()
+				.optional()
+				.describe("session name (default: main)"),
+			example: omp.zod
+				.string()
+				.optional()
+				.describe("start: cargo example name"),
 			bin: omp.zod.string().optional().describe("start: cargo bin name"),
-			args: omp.zod.array(omp.zod.string()).optional().describe("start: program argv"),
-			rows: omp.zod.number().optional().describe("start/resize: pty rows (default 30)"),
-			cols: omp.zod.number().optional().describe("start/resize: pty cols (default 100)"),
+			args: omp.zod
+				.array(omp.zod.string())
+				.optional()
+				.describe("start: program argv"),
+			rows: omp.zod
+				.number()
+				.optional()
+				.describe("start/resize: pty rows (default 30)"),
+			cols: omp.zod
+				.number()
+				.optional()
+				.describe("start/resize: pty cols (default 100)"),
 			build: omp.zod
 				.boolean()
 				.optional()
@@ -1354,15 +1138,26 @@ const factory = (omp: ToolHost) => {
 				.string()
 				.optional()
 				.describe("keys: spec, e.g. \"tab tab enter C-c pgdn 'hello'\""),
-			text: omp.zod.string().optional().describe("type/paste/send: payload text"),
+			text: omp.zod
+				.string()
+				.optional()
+				.describe("type/paste/send: payload text"),
 			x: omp.zod.number().optional().describe("mouse: zero-based column"),
 			y: omp.zod.number().optional().describe("mouse: zero-based viewport row"),
-			action: omp.zod.string().optional().describe("mouse: gesture (default click)"),
+			action: omp.zod
+				.string()
+				.optional()
+				.describe("mouse: gesture (default click)"),
 			peek: omp.zod
 				.number()
 				.optional()
-				.describe("screen: scrollback lines to include; raw: tail bytes (default 2000)"),
-			clear: omp.zod.boolean().optional().describe("raw: reset capture after reading"),
+				.describe(
+					"screen: scrollback lines to include; raw: tail bytes (default 2000)",
+				),
+			clear: omp.zod
+				.boolean()
+				.optional()
+				.describe("raw: reset capture after reading"),
 			quiet: omp.zod
 				.boolean()
 				.optional()
@@ -1378,7 +1173,10 @@ const factory = (omp: ToolHost) => {
 			params: TuiParams,
 			onUpdate?: (update: ToolUpdate) => void,
 		): Promise<ToolResult> {
-			const reply = (text: string, details?: Record<string, unknown>): ToolResult => ({
+			const reply = (
+				text: string,
+				details?: Record<string, unknown>,
+			): ToolResult => ({
 				content: [{ type: "text", text }],
 				details,
 			});
@@ -1403,7 +1201,8 @@ const factory = (omp: ToolHost) => {
 				}
 				case "text": {
 					const session = need(params.name);
-					if (!session.sock) return reply(session.screen.snapshot(params.peek ?? 0));
+					if (!session.sock)
+						return reply(session.screen.snapshot(params.peek ?? 0));
 					const response = await request(session, { op: "text" });
 					return reply(screenshotText(response), response);
 				}
@@ -1412,12 +1211,19 @@ const factory = (omp: ToolHost) => {
 				}
 				case "shot": {
 					const session = need(params.name);
-					const png = join(tmpdir(), `omp-tui-${session.name}-${Date.now()}.png`);
+					const png = join(
+						tmpdir(),
+						`omp-tui-${session.name}-${Date.now()}.png`,
+					);
 					const bytes = await session.screen.png();
 					writeFileSync(png, bytes);
 					return {
 						content: [
-							{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" },
+							{
+								type: "image",
+								data: bytes.toString("base64"),
+								mimeType: "image/png",
+							},
 							{ type: "text", text: `screenshot saved: ${png}` },
 						],
 					};
@@ -1452,25 +1258,45 @@ const factory = (omp: ToolHost) => {
 				case "keys": {
 					if (!params.keys) throw new Error("keys op needs `keys`");
 					const session = need(params.name);
-					const response = await request(session, { op: "keys", keys: params.keys });
+					const response = await request(session, {
+						op: "keys",
+						keys: params.keys,
+					});
 					if (!response.ok) throw new Error(String(response.error));
 					const note = `injected ${response.injected} events`;
-					return reply(params.quiet ? note : await settled(session, note), response);
+					return reply(
+						params.quiet ? note : await settled(session, note),
+						response,
+					);
 				}
 				case "type": {
-					if (params.text === undefined) throw new Error("type op needs `text`");
+					if (params.text === undefined)
+						throw new Error("type op needs `text`");
 					const session = need(params.name);
-					const response = await request(session, { op: "bytes", data: params.text });
+					const response = await request(session, {
+						op: "bytes",
+						data: params.text,
+					});
 					if (!response.ok) throw new Error(String(response.error));
 					const note = `typed ${params.text.length} chars`;
-					return reply(params.quiet ? note : await settled(session, note), response);
+					return reply(
+						params.quiet ? note : await settled(session, note),
+						response,
+					);
 				}
 				case "paste": {
-					if (params.text === undefined) throw new Error("paste op needs `text`");
+					if (params.text === undefined)
+						throw new Error("paste op needs `text`");
 					const session = need(params.name);
-					const response = await request(session, { op: "paste", text: params.text });
+					const response = await request(session, {
+						op: "paste",
+						text: params.text,
+					});
 					if (!response.ok) throw new Error(String(response.error));
-					return reply(params.quiet ? "pasted" : await settled(session, "pasted"), response);
+					return reply(
+						params.quiet ? "pasted" : await settled(session, "pasted"),
+						response,
+					);
 				}
 				case "mouse": {
 					if (params.x === undefined || params.y === undefined) {
@@ -1485,10 +1311,14 @@ const factory = (omp: ToolHost) => {
 					});
 					if (!response.ok) throw new Error(String(response.error));
 					const note = `mouse ${params.action ?? "click"} at ${params.x},${params.y}`;
-					return reply(params.quiet ? note : await settled(session, note), response);
+					return reply(
+						params.quiet ? note : await settled(session, note),
+						response,
+					);
 				}
 				case "send": {
-					if (params.text === undefined) throw new Error("send op needs `text`");
+					if (params.text === undefined)
+						throw new Error("send op needs `text`");
 					const session = need(params.name);
 					const bytes = unescapeBytes(params.text);
 					session.proc.terminal.write(bytes);
@@ -1536,6 +1366,7 @@ const factory = (omp: ToolHost) => {
 					try {
 						session.proc.kill("SIGKILL");
 						session.proc.terminal.close();
+						session.screen.dispose();
 						rmSync(session.dir, { recursive: true, force: true });
 					} catch {
 						// Best-effort teardown.
