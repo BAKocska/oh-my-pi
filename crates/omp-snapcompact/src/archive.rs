@@ -1,5 +1,7 @@
 //! Provider-aware frame geometry and bounded text chunking.
 
+use std::borrow::Cow;
+
 use crate::{
 	Result as RenderResult, SnapcompactError, SnapcompactRenderOptions, cell_units,
 	render_snapcompact_png,
@@ -15,6 +17,249 @@ pub const FRAME_DATA_BYTES_BUDGET: usize = 3_000_000;
 pub const SAVINGS_MARGIN: f64 = 0.9;
 /// Safe image-count floor for an unknown provider.
 pub const DEFAULT_PROVIDER_IMAGE_BUDGET: usize = 5;
+
+/// Whether data-URL text came from intact source or a structure-blind legacy archive slice.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DataUrlContext {
+	/// Intact source text; short non-canonical examples remain prose.
+	#[default]
+	Source,
+	/// Previously archived text that may end at any point inside a payload.
+	Archive,
+}
+
+const DAMAGED_PAYLOAD_MIN_CHARS: usize = 40;
+
+fn ascii_eq(left: u8, right: u8) -> bool {
+	left.eq_ignore_ascii_case(&right)
+}
+
+fn starts_ascii_case_insensitive(bytes: &[u8], needle: &[u8]) -> bool {
+	bytes.len() >= needle.len()
+		&& bytes
+			.iter()
+			.zip(needle)
+			.all(|(&left, &right)| ascii_eq(left, right))
+}
+
+fn media_token(byte: u8) -> bool {
+	byte.is_ascii_alphanumeric()
+		|| matches!(
+			byte,
+			b'_' | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+				| b'^' | b'|' | b'~'
+		)
+}
+
+fn take_media_token(bytes: &[u8], mut at: usize) -> usize {
+	while bytes.get(at).is_some_and(|byte| media_token(*byte)) {
+		at += 1;
+	}
+	at
+}
+
+fn parse_data_url_prefix(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+	let mut at = start.checked_add(5)?;
+	if !bytes.get(at).is_some_and(u8::is_ascii_alphabetic) {
+		return None;
+	}
+	at = take_media_token(bytes, at + 1);
+	if bytes.get(at) != Some(&b'/') {
+		return None;
+	}
+	at += 1;
+	let subtype = at;
+	at = take_media_token(bytes, at);
+	if at == subtype {
+		return None;
+	}
+	loop {
+		if starts_ascii_case_insensitive(bytes.get(at..)?, b";base64,") {
+			return Some((at, at + b";base64,".len()));
+		}
+		if bytes.get(at) != Some(&b';') {
+			return None;
+		}
+		at += 1;
+		let name = at;
+		at = take_media_token(bytes, at);
+		if at == name || bytes.get(at) != Some(&b'=') {
+			return None;
+		}
+		at += 1;
+		let value = at;
+		at = take_media_token(bytes, at);
+		if at == value {
+			return None;
+		}
+	}
+}
+
+fn canonical_base64(payload: &[u8]) -> bool {
+	if !payload.len().is_multiple_of(4) {
+		return false;
+	}
+	let padding = payload.iter().rev().take_while(|&&byte| byte == b'=').count();
+	padding <= 2
+		&& payload[..payload.len().saturating_sub(padding)]
+			.iter()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+		&& payload[payload.len().saturating_sub(padding)..]
+			.iter()
+			.all(|byte| *byte == b'=')
+}
+
+fn parse_elided_marker(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+	let (ellipsis, mut at) = if bytes.get(start..)?.starts_with("[…".as_bytes()) {
+		("…".as_bytes(), start + "[…".len())
+	} else if bytes.get(start..)?.starts_with(b"[...") {
+		(b"...".as_slice(), start + 4)
+	} else {
+		return None;
+	};
+	let digits = at;
+	while bytes.get(at).is_some_and(u8::is_ascii_digit) {
+		at += 1;
+	}
+	if at == digits || !bytes.get(at..)?.starts_with(b"ch elided") {
+		return None;
+	}
+	let count = std::str::from_utf8(&bytes[digits..at])
+		.ok()?
+		.parse::<usize>()
+		.ok()?;
+	at += b"ch elided".len();
+	if !bytes.get(at..)?.starts_with(ellipsis) {
+		return None;
+	}
+	at += ellipsis.len();
+	(bytes.get(at) == Some(&b']')).then_some((at + 1, count))
+}
+
+fn adjacent_markdown_opener(text: &str, data_start: usize, floor: usize) -> Option<usize> {
+	let bytes = text.as_bytes();
+	let mut at = data_start;
+	while at > floor && bytes[at - 1].is_ascii_whitespace() {
+		at -= 1;
+	}
+	if at < floor + 2 || bytes.get(at - 2..at) != Some(b"](") {
+		return None;
+	}
+	let mut opener = None;
+	for index in (floor..at - 2).rev() {
+		match bytes[index] {
+			b']' | b'\n' => break,
+			b'[' => opener = Some(index),
+			_ => {},
+		}
+	}
+	let opener = opener?;
+	Some(if opener > floor && bytes[opener - 1] == b'!' { opener - 1 } else { opener })
+}
+
+/// Atomically replaces inline base64 data URLs before any character or frame slicing.
+///
+/// Archive context also heals short, non-canonical fragments left by older structure-blind
+/// slices. Matching advances from `data:` prefixes and only scans backward through the adjacent
+/// unprocessed Markdown opener, keeping unmatched-bracket input linear.
+pub fn elide_data_urls(text: &str, context: DataUrlContext) -> Cow<'_, str> {
+	let bytes = text.as_bytes();
+	let mut search = 0usize;
+	let mut floor = 0usize;
+	let mut emitted = 0usize;
+	let mut output = None::<String>;
+	while search + 5 <= bytes.len() {
+		let Some(relative) = bytes[search..]
+			.windows(5)
+			.position(|window| starts_ascii_case_insensitive(window, b"data:"))
+		else {
+			break;
+		};
+		let start = search + relative;
+		let Some((mime_end, payload_start)) = parse_data_url_prefix(bytes, start) else {
+			search = start + 5;
+			continue;
+		};
+		let mut payload_end = payload_start;
+		while bytes
+			.get(payload_end)
+			.is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+		{
+			payload_end += 1;
+		}
+		let first_run_end = payload_end;
+		let mut marker = None;
+		let mut after_space = payload_end;
+		while bytes.get(after_space).is_some_and(u8::is_ascii_whitespace) {
+			after_space += 1;
+		}
+		if let Some((marker_end, restored)) = parse_elided_marker(bytes, after_space) {
+			let mut second_run = marker_end;
+			while bytes.get(second_run).is_some_and(u8::is_ascii_whitespace) {
+				second_run += 1;
+			}
+			let second_start = second_run;
+			while bytes
+				.get(second_run)
+				.is_some_and(|byte| {
+					byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+				})
+			{
+				second_run += 1;
+			}
+			marker = Some((second_start, second_run, restored));
+			payload_end = second_run;
+		}
+		let mut url_end = payload_end;
+		while bytes.get(url_end).is_some_and(u8::is_ascii_whitespace) {
+			url_end += 1;
+		}
+		let closer = (bytes.get(url_end) == Some(&b')')).then_some(url_end + 1);
+		if let Some(end) = closer {
+			url_end = end;
+		} else {
+			url_end = payload_end;
+		}
+		let payload = &bytes[payload_start..first_run_end];
+		let is_atom = context == DataUrlContext::Archive
+			|| marker.is_some()
+			|| canonical_base64(payload)
+			|| payload.len() >= DAMAGED_PAYLOAD_MIN_CHARS;
+		if !is_atom {
+			floor = url_end;
+			search = url_end.max(start + 5);
+			continue;
+		}
+		let payload_chars = marker.map_or(payload.len(), |(second_start, second_end, restored)| {
+			first_run_end
+				.saturating_sub(payload_start)
+				.saturating_add(second_end.saturating_sub(second_start))
+				.saturating_add(restored)
+		});
+		let opener = adjacent_markdown_opener(text, start, floor);
+		let replace_start = opener.unwrap_or(start);
+		let output = output.get_or_insert_with(|| String::with_capacity(text.len()));
+		output.push_str(&text[emitted..replace_start]);
+		if opener.is_some() && closer.is_none() {
+			output.push_str(&text[opener.unwrap_or(start)..start]);
+		}
+		let mime = &text[start + 5..mime_end];
+		use std::fmt::Write as _;
+		let _ = write!(output, "[data URL omitted: {mime}, {payload_chars} base64 chars]");
+		if opener.is_none() && closer.is_some() {
+			output.push_str(&text[payload_end..url_end]);
+		}
+		emitted = url_end;
+		floor = url_end;
+		search = url_end.max(start + 5);
+	}
+	if let Some(mut output) = output {
+		output.push_str(&text[emitted..]);
+		Cow::Owned(output)
+	} else {
+		Cow::Borrowed(text)
+	}
+}
 
 /// Provider billing family for image inputs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +509,8 @@ pub fn render_archive(
 	provider: Option<&str>,
 	existing_images: usize,
 ) -> ArchiveResult<Archive> {
+	let text = elide_data_urls(text, DataUrlContext::Source);
+	let text = text.as_ref();
 	let shape = resolve_shape(target);
 	let max_frames = provider_frame_budget(provider, existing_images);
 	let (capacity, cols, rows) = frame_capacity(shape);
@@ -308,4 +555,39 @@ pub fn render_archive(
 /// Calls the renderer directly for callers that already performed framing.
 pub fn render_frame(text: &str, shape: Shape) -> RenderResult<Vec<u8>> {
 	render_snapcompact_png(text, &shape_options(shape))
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn data_urls_are_elided_before_any_frame_slice() {
+		let payload = "QUFB".repeat(2_000);
+		let source = format!("{}![img](data:image/png;base64,{payload}){}", "x".repeat(1_199), "y");
+		let elided = elide_data_urls(&source, DataUrlContext::Source);
+		assert!(elided.contains("[data URL omitted: image/png, 8000 base64 chars]"));
+		assert!(!elided.contains(";base64,"), "no decodable prefix can straddle a later slice");
+	}
+
+	#[test]
+	fn unmatched_markdown_brackets_do_not_rescan_the_remaining_input() {
+		let source = format!("{};base64,", "[".repeat(80_000));
+		assert_eq!(elide_data_urls(&source, DataUrlContext::Source), source);
+	}
+
+	#[test]
+	fn archive_elision_restores_legacy_marker_character_counts() {
+		let source = "data:image/png;base64,QUFB [...900ch elided...] QUFB";
+		assert_eq!(
+			elide_data_urls(source, DataUrlContext::Archive),
+			"[data URL omitted: image/png, 908 base64 chars]"
+		);
+	}
+
+	#[test]
+	fn provider_frame_budget_applies_provider_cap_and_unknown_floor() {
+		assert_eq!(provider_frame_budget(Some("unknown-gateway"), 0), 5);
+		assert_eq!(provider_frame_budget(Some("umans"), 7), 3);
+		assert_eq!(provider_frame_budget(Some("openai"), 0), 17);
+	}
 }
