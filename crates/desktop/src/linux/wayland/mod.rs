@@ -1,6 +1,6 @@
 #[cfg(feature = "wayland-pipewire")]
-mod capture;
-mod libei;
+pub(super) mod capture;
+pub(super) mod libei;
 mod portal;
 
 use image::RgbaImage;
@@ -165,7 +165,7 @@ impl Backend for WaylandBackend {
 		#[cfg(feature = "wayland-pipewire")]
 		{
 			self.selected_display_allowed()?;
-			let image = capture::capture()?;
+			let image = super::actor::capture()?;
 			let display = Self::synthetic_display(&image);
 			self.displays = vec![display.clone()];
 			match target {

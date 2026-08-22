@@ -244,8 +244,7 @@ fn grab_pipewire_frame(node: u32, fd: OwnedFd) -> Result<RgbaImage, String> {
 		.unwrap_or_else(|| Err("PipeWire stream ended before producing a frame".to_string()))
 }
 
-pub(super) fn capture() -> CoreResult<RgbaImage> {
-	let runtime = super::portal::portal_runtime()?;
+pub(super) fn capture(runtime: &tokio::runtime::Runtime) -> CoreResult<RgbaImage> {
 	let (node, fd) = runtime.block_on(open_screencast()).map_err(|err| {
 		DesktopError::capture_failed(format!("wayland screencast unavailable: {err}"))
 	})?;

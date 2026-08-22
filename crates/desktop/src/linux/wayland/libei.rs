@@ -44,25 +44,15 @@ struct EiDevice {
 type RemoteDesktopSession = Session<'static, RemoteDesktop<'static>>;
 
 struct PortalSession {
-	runtime: &'static tokio::runtime::Runtime,
 	session: RemoteDesktopSession,
 }
 
-pub(super) struct Libei {
+pub(crate) struct ActorLibei {
 	context:        ei::Context,
 	pointer:        Option<EiDevice>,
 	keyboard:       Option<EiDevice>,
 	sequence:       u32,
 	portal_session: Option<PortalSession>,
-}
-
-impl Drop for Libei {
-	fn drop(&mut self) {
-		let Some(portal) = self.portal_session.take() else {
-			return;
-		};
-		close_session(portal.runtime, &portal.session);
-	}
 }
 
 /// Closes a `RemoteDesktop` portal session, bounded by `CLOSE_TIMEOUT` so an
@@ -72,9 +62,8 @@ fn close_session(runtime: &tokio::runtime::Runtime, session: &RemoteDesktopSessi
 		runtime.block_on(async { tokio::time::timeout(crate::CLOSE_TIMEOUT, session.close()).await });
 }
 
-impl Libei {
-	pub(super) fn new() -> CoreResult<Self> {
-		let runtime = super::portal::portal_runtime()?;
+impl ActorLibei {
+	pub(crate) fn new(runtime: &tokio::runtime::Runtime) -> CoreResult<Self> {
 		let (context, portal_session, targets) = match ei::Context::connect_to_env() {
 			Ok(Some(context)) => (context, None, DiscoveryTargets::ALL),
 			Ok(None) => {
@@ -102,7 +91,7 @@ impl Libei {
 	}
 
 	fn portal_context(
-		runtime: &'static tokio::runtime::Runtime,
+		runtime: &tokio::runtime::Runtime,
 	) -> CoreResult<(ei::Context, PortalSession, DiscoveryTargets)> {
 		let (fd, session, targets) = runtime
 			.block_on(async {
@@ -144,9 +133,6 @@ impl Libei {
 				match fd {
 					Ok((fd, targets)) => Ok((fd, session, targets)),
 					Err(err) => {
-						// Already inside `runtime.block_on`, so the `close_session`
-						// helper (itself a `block_on`) would abort with a nested-runtime
-						// panic; bound this consent-denied close inline instead.
 						let _ = tokio::time::timeout(crate::CLOSE_TIMEOUT, session.close()).await;
 						Err(err)
 					},
@@ -160,7 +146,12 @@ impl Libei {
 				return Err(DesktopError::input_failed(format!("libei portal socket: {err}")));
 			},
 		};
-		Ok((context, PortalSession { runtime, session }, targets))
+		Ok((context, PortalSession { session }, targets))
+	}
+	pub(crate) fn close(mut self, runtime: &tokio::runtime::Runtime) {
+		if let Some(portal) = self.portal_session.take() {
+			close_session(runtime, &portal.session);
+		}
 	}
 
 	fn discover_devices(
@@ -315,7 +306,7 @@ impl Libei {
 		Ok(())
 	}
 
-	pub(super) fn pointer(&mut self, event: PointerEvent) -> CoreResult<()> {
+	pub(crate) fn pointer(&mut self, event: PointerEvent) -> CoreResult<()> {
 		let device = self.pointer.as_ref().ok_or_else(|| {
 			DesktopError::permission_denied("RemoteDesktop portal did not provide a libei pointer")
 		})?;
@@ -402,7 +393,7 @@ impl Libei {
 		result
 	}
 
-	pub(super) fn key_chord(&mut self, keys: &[KeyName]) -> CoreResult<()> {
+	pub(crate) fn key_chord(&mut self, keys: &[KeyName]) -> CoreResult<()> {
 		let device = self.keyboard.as_ref().ok_or_else(|| {
 			DesktopError::permission_denied("RemoteDesktop portal did not provide a libei keyboard")
 		})?;
@@ -426,7 +417,7 @@ impl Libei {
 		Ok(())
 	}
 
-	pub(super) fn type_text(&mut self, text: &str) -> CoreResult<()> {
+	pub(crate) fn type_text(&mut self, text: &str) -> CoreResult<()> {
 		let device = self.keyboard.as_ref().ok_or_else(|| {
 			DesktopError::permission_denied("RemoteDesktop portal did not provide a libei keyboard")
 		})?;
@@ -460,6 +451,33 @@ impl Libei {
 		}
 		self.finish(device);
 		Ok(())
+	}
+}
+
+pub(super) struct Libei;
+
+impl Libei {
+	pub(crate) fn new() -> CoreResult<Self> {
+		super::super::actor::libei_init()?;
+		Ok(Self)
+	}
+
+	pub(crate) fn pointer(&mut self, event: PointerEvent) -> CoreResult<()> {
+		super::super::actor::libei_pointer(event)
+	}
+
+	pub(crate) fn key_chord(&mut self, keys: &[KeyName]) -> CoreResult<()> {
+		super::super::actor::libei_key_chord(keys.to_vec())
+	}
+
+	pub(crate) fn type_text(&mut self, text: &str) -> CoreResult<()> {
+		super::super::actor::libei_type_text(text.to_string())
+	}
+}
+
+impl Drop for Libei {
+	fn drop(&mut self) {
+		super::super::actor::libei_close();
 	}
 }
 

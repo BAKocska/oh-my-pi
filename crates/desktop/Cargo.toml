@@ -23,6 +23,7 @@ tokio.workspace = true
 ashpd.workspace = true
 atspi.workspace = true
 futures.workspace = true
+libc.workspace = true
 pipewire = { workspace = true, optional = true }
 reis.workspace = true
 x11rb.workspace = true

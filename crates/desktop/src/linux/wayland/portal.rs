@@ -1,32 +1,7 @@
 use std::{
 	fs,
 	path::{Path, PathBuf},
-	sync::LazyLock,
 };
-
-use tokio::runtime::{Builder, Runtime};
-
-use crate::error::{CoreResult, DesktopError};
-
-/// Process-wide Tokio runtime shared by every xdg-desktop-portal call.
-///
-/// `ashpd` caches a process-global D-Bus connection whose I/O tasks are bound
-/// to the runtime that first creates it. A long-lived multi-thread runtime
-/// keeps that connection alive and drives it while portal callers block.
-static PORTAL_RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(|| {
-	Builder::new_multi_thread()
-		.worker_threads(1)
-		.enable_all()
-		.build()
-		.map_err(|err| err.to_string())
-});
-
-/// Borrow the shared portal runtime, surfacing a one-time build failure.
-pub(super) fn portal_runtime() -> CoreResult<&'static Runtime> {
-	PORTAL_RUNTIME
-		.as_ref()
-		.map_err(|err| DesktopError::internal(format!("xdg-desktop-portal runtime: {err}")))
-}
 
 /// File name of the `RemoteDesktop` restore token that pre-#7884 builds wrote
 /// (world-readable) during read-only `computer` calls. Nothing reads it after
@@ -84,19 +59,6 @@ pub(super) fn store_token(name: &str, token: Option<&str>) {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	/// Every portal caller (libei input init and PipeWire capture) must borrow
-	/// one persistent runtime; a regression to per-call runtimes would return
-	/// distinct instances and re-open the orphaned-connection bug (#7886).
-	#[test]
-	fn portal_runtime_is_shared_across_calls() {
-		let first = portal_runtime().expect("portal runtime builds");
-		let second = portal_runtime().expect("portal runtime builds");
-		assert!(
-			std::ptr::eq(first, second),
-			"portal_runtime must hand back one long-lived runtime, not a fresh per-call instance"
-		);
-	}
 
 	/// The orphaned RemoteDesktop token written by pre-#7884 builds must be
 	/// removed, and a second removal on the now-missing file must stay a no-op.
