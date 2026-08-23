@@ -2,6 +2,7 @@
 
 use std::str;
 
+use omp_core::Str;
 use omp_tool::schema;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -60,4 +61,38 @@ fn generated_schema_is_compact_inlined_and_model_facing() {
 	for forbidden in ["$schema", "$ref", "$defs", "title"] {
 		assert!(!encoded.contains(forbidden), "schema must not contain {forbidden}");
 	}
+}
+#[allow(dead_code, reason = "fields are inspected by schema generation tests")]
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StrParams {
+	/// Required compact text.
+	id:    Str,
+	/// Optional compact text.
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
+	label: Option<Str>,
+	/// Compact text list.
+	items: Vec<Str>,
+}
+
+#[allow(dead_code, reason = "fields are inspected by schema generation tests")]
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StringParams {
+	/// Required compact text.
+	id:    String,
+	/// Optional compact text.
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
+	label: Option<String>,
+	/// Compact text list.
+	items: Vec<String>,
+}
+
+#[test]
+fn str_fields_project_exactly_like_string_fields() {
+	assert_eq!(
+		schema::<StrParams>(),
+		schema::<StringParams>(),
+		"Str fields must emit the same schema as String fields without `with` overrides"
+	);
 }

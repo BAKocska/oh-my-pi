@@ -17,7 +17,7 @@ async-stream = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
-omp-core = { workspace = true }
+omp-core = { workspace = true, features = ["schemars"] }
 omp-catalog = { workspace = true }
 omp-inference = { workspace = true }
 omp-slopjson = { workspace = true }

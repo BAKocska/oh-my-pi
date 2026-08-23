@@ -2441,10 +2441,13 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, Regi
 			if caps.grammar.contains(grammar_bit(*syntax)) =>
 		{
 			(
-				ToolInputConstraint::Grammar(ToolGrammar {
-					syntax:     grammar_syntax(*syntax),
-					definition: definition.clone(),
-				}),
+				ToolInputConstraint::Grammar {
+					grammar:  ToolGrammar {
+						syntax:     grammar_syntax(*syntax),
+						definition: definition.clone(),
+					},
+					fallback: entry.schema().clone(),
+				},
 				Some(ConstraintDisposition::Required),
 				Some(*priority),
 			)
