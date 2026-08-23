@@ -70,8 +70,9 @@ fn grammar_tool_survives_binary_protocol_roundtrip_losslessly() {
 		name:        "edit".to_owned(),
 		description: "Sparse edit".to_owned(),
 		input:       Some(tool_def::Input::Grammar(tool_def::Grammar {
-			syntax:     grammar::Syntax::Lark as i32,
-			definition: EDIT_LARK.to_owned(),
+			syntax:               grammar::Syntax::Lark as i32,
+			definition:           EDIT_LARK.to_owned(),
+			fallback_schema_json: Bytes::from_static(br#"{"type":"object"}"#),
 		})),
 	};
 	let decoded = ToolDef::decode(tool.encode_to_vec().as_slice()).expect("ToolDef decodes");
@@ -80,6 +81,7 @@ fn grammar_tool_survives_binary_protocol_roundtrip_losslessly() {
 	};
 	assert_eq!(grammar.syntax, grammar::Syntax::Lark as i32);
 	assert_eq!(grammar.definition, EDIT_LARK);
+	assert_eq!(grammar.fallback_schema_json.as_ref(), br#"{"type":"object"}"#);
 }
 
 #[test]

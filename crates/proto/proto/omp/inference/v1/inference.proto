@@ -380,6 +380,9 @@ message ToolDef {
     Syntax syntax = 1;
     // Complete grammar definition.
     string definition = 2;
+    // Non-strict JSON Schema encoded by transports without
+    // grammar-constrained tools.
+    bytes fallback_schema_json = 3;
   }
 
   // Stable tool name.
