@@ -6,6 +6,8 @@ mod docserver;
 #[cfg(unix)]
 mod envd;
 #[cfg(unix)]
+mod extension;
+#[cfg(unix)]
 mod gateway;
 mod process;
 mod scratch;
@@ -23,6 +25,8 @@ pub use docserver::DocServerTask;
 pub use envd::{
 	AllowAdmission, EnvHarness, FramedEnvConnection, ProcessEnvHarness, connect_env, read_blob,
 };
+#[cfg(unix)]
+pub use extension::{ExtensionHarness, recording_ui_factory};
 #[cfg(unix)]
 pub use gateway::ScriptedGateway;
 pub use process::{OwnedProcess, install_omp_binary_env, omp_binary};

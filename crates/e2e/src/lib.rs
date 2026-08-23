@@ -50,5 +50,8 @@ pub fn error(message: impl Display) -> Error {
 	io::Error::other(message.to_string()).into()
 }
 
+/// P8 performance-baseline recorder shared by the `baseline` bin and tests.
+pub mod baseline;
+
 /// Reusable acceptance-test infrastructure.
 pub mod support;

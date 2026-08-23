@@ -1,4 +1,4 @@
-#![cfg(unix)]
+//! Real local Environment plus Python extension-host process harness.
 
 use std::sync::Arc;
 
@@ -8,10 +8,6 @@ use omp_app::chat_ui::presentation_authority::{
 	PresentationAuthority, PresentationAuthorityError, PresentationCallback,
 	PresentationCallbackDispatcher, PresentationClient, PresentationEffect, PresentationIdentity,
 	PresentationRequest, PresentationResponse,
-};
-use omp_e2e::{
-	Context as _, Result,
-	support::{AllowAdmission, DEFAULT_TIMEOUT, Scratch, within},
 };
 use omp_env::EnvClient;
 use omp_envd::{
@@ -28,6 +24,11 @@ use omp_envd::{
 use omp_proto::{SCHEMA_REV, env::v1::ClientHello};
 use omp_tool::Registry;
 use tokio::task::JoinHandle;
+
+use crate::{
+	Context as _, Result,
+	support::{AllowAdmission, DEFAULT_TIMEOUT, Scratch, within},
+};
 
 /// Real local Environment plus its owned Python extension-host process tree.
 pub struct ExtensionHarness {

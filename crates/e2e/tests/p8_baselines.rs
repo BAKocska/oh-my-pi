@@ -1,11 +1,8 @@
 //! Executable P8 checks for the non-gating performance baseline recorder.
 
-#[path = "../src/bin/baseline.rs"]
-mod baseline;
-
 use std::{fs, time::Duration};
 
-use baseline::{BaselineMetrics, duration_rate, measure, slowdown_ratio, write_metrics};
+use omp_e2e::baseline::{BaselineMetrics, duration_rate, measure, slowdown_ratio, write_metrics};
 
 #[test]
 fn ratio_math_and_zero_duration_are_guarded() {

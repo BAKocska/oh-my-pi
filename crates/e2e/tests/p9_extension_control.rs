@@ -2,20 +2,19 @@
 
 #![cfg(unix)]
 
-#[path = "../src/support/extension.rs"]
-mod extension;
-
 use std::time::Duration;
 
 use bytes::Bytes;
-use extension::{ExtensionHarness, recording_ui_factory};
 use flume::Receiver;
 use omp_agent::HookPhase;
 use omp_app::chat_ui::presentation_authority::PresentationEffect;
 use omp_core::{ArtifactDigest, Principal, Provenance, sf};
 use omp_e2e::{
 	Context as _, Result, error,
-	support::{DEFAULT_TIMEOUT, Scratch, install_omp_binary_env, omp_binary, within},
+	support::{
+		DEFAULT_TIMEOUT, ExtensionHarness, Scratch, install_omp_binary_env, omp_binary,
+		recording_ui_factory, within,
+	},
 };
 use omp_env::{Invocation, InvocationEvent};
 use omp_envd::{

@@ -5,19 +5,16 @@
 //! externally initiated `stop` waits out any in-flight callback.
 
 #[cfg(all(feature = "native-audio", target_os = "macos"))]
-#[path = "device/coreaudio.rs"]
 mod coreaudio;
 #[cfg(all(feature = "native-audio", target_os = "macos"))]
 use coreaudio as imp;
 
 #[cfg(all(feature = "native-audio", target_os = "windows"))]
-#[path = "device/wasapi.rs"]
 mod wasapi;
 #[cfg(all(feature = "native-audio", target_os = "windows"))]
 use wasapi as imp;
 
 #[cfg(all(feature = "native-audio", target_os = "linux"))]
-#[path = "device/linux.rs"]
 mod linux;
 #[cfg(all(feature = "native-audio", target_os = "linux"))]
 use linux as imp;
