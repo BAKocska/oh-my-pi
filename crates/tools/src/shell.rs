@@ -65,7 +65,7 @@ pub fn command_segments(
 ))]
 pub struct Params {
 	/// Shell script to execute.
-	#[schemars(with = "String", length(min = 1), description = "Shell script to execute.")]
+	#[schemars(length(min = 1), description = "Shell script to execute.")]
 	pub command:      Str,
 	/// Host-enforced execution timeout in milliseconds; zero disables the
 	/// deadline.

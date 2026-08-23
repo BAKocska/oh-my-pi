@@ -79,27 +79,20 @@ pub struct Params {
 	/// Lifecycle action.
 	pub action:    Action,
 	/// Stable tab name; defaults to `main`.
-	#[schemars(with = "Option<String>")]
 	pub name:      Option<Str>,
 	/// Initial or navigated URL.
-	#[schemars(with = "Option<String>")]
 	pub url:       Option<Str>,
 	/// Typed operation for `run`; defaults to `evaluate` when `code` is present.
 	pub operation: Option<RunOperation>,
 	/// JavaScript evaluated by `run`.
-	#[schemars(with = "Option<String>")]
 	pub code:      Option<Str>,
 	/// Primary selector accepted by the embedded automation engine.
-	#[schemars(with = "Option<String>")]
 	pub selector:  Option<Str>,
 	/// Drag destination selector.
-	#[schemars(with = "Option<String>")]
 	pub target:    Option<Str>,
 	/// Text/value/key/URL-pattern argument.
-	#[schemars(with = "Option<String>")]
 	pub value:     Option<Str>,
 	/// Multiple select values or upload paths.
-	#[schemars(with = "Option<Vec<String>>")]
 	pub values:    Option<Vec<Str>>,
 	/// Viewport width in CSS pixels.
 	pub width:     Option<u32>,

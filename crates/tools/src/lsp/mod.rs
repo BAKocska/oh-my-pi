@@ -87,33 +87,27 @@ pub struct Params {
 	pub action:   Action,
 	/// Workspace-relative file, glob for diagnostics, or `*` workspace.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub file:     Option<Str>,
 	/// One-based source line.
 	#[serde(default)]
 	pub line:     Option<u32>,
 	/// Identifier or `identifier#N` occurrence target.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub symbol:   Option<Str>,
 	/// Workspace symbol query, code-action selector, or rename destination path.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub query:    Option<Str>,
 	/// New identifier for rename.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub new_name: Option<Str>,
 	/// Apply a rename/code action; false requests a dry-run.
 	#[serde(default)]
 	pub apply:    Option<bool>,
 	/// Optional native binding name.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub server:   Option<Str>,
 	/// Raw request method for `request`.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub method:   Option<Str>,
 	/// Raw JSON parameters for `request`; textDocument and position are
 	/// auto-filled when omitted.

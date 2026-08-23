@@ -20,19 +20,19 @@ pub struct Params {
 	/// State transition to perform.
 	pub op:     Op,
 	/// Complete phased list, required by `init`.
-	#[schemars(with = "Option<Vec<Phase>>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub list:   Option<Vec<Phase>>,
 	/// Phase name for item operations and `append`.
-	#[schemars(with = "Option<String>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub phase:  Option<Str>,
 	/// Item text for single-item operations.
-	#[schemars(with = "Option<String>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub item:   Option<Str>,
 	/// Items appended to `phase`.
-	#[schemars(with = "Option<Vec<String>>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub items:  Option<Vec<Str>>,
 	/// Required explanation when blocking an item.
-	#[schemars(with = "Option<String>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub reason: Option<Str>,
 }
 
@@ -75,7 +75,6 @@ pub enum Op {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Phase {
 	/// Stable phase label.
-	#[schemars(with = "String")]
 	pub phase: Str,
 	/// Items in their user-defined order.
 	pub items: Vec<Item>,
@@ -85,13 +84,12 @@ pub struct Phase {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Item {
 	/// User-visible task text.
-	#[schemars(with = "String")]
 	pub text:   Str,
 	/// Current lifecycle state.
 	#[serde(default)]
 	pub status: Status,
 	/// Block explanation, only present while blocked.
-	#[schemars(with = "Option<String>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reason: Option<Str>,
 }

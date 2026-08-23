@@ -44,13 +44,10 @@ pub struct ReplaceParams {
 #[serde(deny_unknown_fields)]
 pub struct ReplaceOperation {
 	/// Workspace-relative document path.
-	#[schemars(with = "String")]
 	pub path:        Str,
 	/// Text to locate using the progressive fallback ladder.
-	#[schemars(with = "String")]
 	pub old:         Str,
 	/// Text replacing the selected match.
-	#[schemars(with = "String")]
 	pub new:         Str,
 	/// Replace every independently safe occurrence.
 	#[serde(default)]

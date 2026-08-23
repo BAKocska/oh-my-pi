@@ -25,7 +25,6 @@ const MAX_RETAIN_ITEMS: usize = 64;
 #[serde(deny_unknown_fields)]
 pub struct RecallParams {
 	/// Natural-language search query.
-	#[schemars(with = "String")]
 	pub query:        Str,
 	/// Approximate result token budget.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,11 +45,9 @@ pub struct RecallPayload {
 #[serde(deny_unknown_fields)]
 pub struct ReflectParams {
 	/// Question answered from long-term memory.
-	#[schemars(with = "String")]
 	pub query:        Str,
 	/// Optional angle or current context for synthesis.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[schemars(with = "Option<String>")]
 	pub context:      Option<Str>,
 	/// Approximate recall token budget.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,11 +68,9 @@ pub struct ReflectPayload {
 #[serde(deny_unknown_fields)]
 pub struct RetainItem {
 	/// Specific, self-contained information to remember.
-	#[schemars(with = "String")]
 	pub content: Str,
 	/// Optional source context.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[schemars(with = "Option<String>")]
 	pub context: Option<Str>,
 }
 

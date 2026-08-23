@@ -110,15 +110,12 @@ pub struct Params {
 	pub action:                Action,
 	/// Adapter name for launch or attach.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub adapter:               Option<Str>,
 	/// Stable session identity returned by launch or attach.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub session:               Option<Str>,
 	/// Launch program or source path.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub path:                  Option<Str>,
 	/// Process identity for attach.
 	#[serde(default)]
@@ -128,7 +125,6 @@ pub struct Params {
 	pub port:                  Option<u16>,
 	/// Configured remote adapter host.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub host:                  Option<Str>,
 	/// One-based source line.
 	#[serde(default)]
@@ -138,30 +134,24 @@ pub struct Params {
 	pub column:                Option<u32>,
 	/// Breakpoint condition.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub condition:             Option<Str>,
 	/// Breakpoint hit condition.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub hit_condition:         Option<Str>,
 	/// Function-breakpoint name.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub function:              Option<Str>,
 	/// Instruction address/reference.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub instruction_reference: Option<Str>,
 	/// Instruction or memory offset.
 	#[serde(default)]
 	pub offset:                Option<i64>,
 	/// Data-breakpoint identifier.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub data_id:               Option<Str>,
 	/// Data-breakpoint access type.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub access_type:           Option<Str>,
 	/// Thread identity.
 	#[serde(default)]
@@ -180,27 +170,21 @@ pub struct Params {
 	pub count:                 Option<u32>,
 	/// Expression for evaluate or dataBreakpointInfo.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub expression:            Option<Str>,
 	/// Evaluation context.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub context:               Option<Str>,
 	/// Adapter memory reference.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub memory_reference:      Option<Str>,
 	/// Base64 bytes for writeMemory.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub data:                  Option<Str>,
 	/// Stepping granularity.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub granularity:           Option<Str>,
 	/// Adapter-specific request command.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub command:               Option<Str>,
 	/// Raw launch, attach, or custom-request fields merged last.
 	#[serde(default)]

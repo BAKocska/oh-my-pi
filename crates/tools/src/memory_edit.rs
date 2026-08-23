@@ -23,18 +23,15 @@ pub struct Params {
 	/// Edit operation.
 	pub op:             Operation,
 	/// Memory id returned by recall or a full `memory://` read.
-	#[schemars(with = "String")]
 	pub id:             Str,
 	/// Whole replacement content for update.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[schemars(with = "Option<String>")]
 	pub content:        Option<Str>,
 	/// Replacement importance, clamped to `[0, 1]`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub importance:     Option<f64>,
 	/// Optional superseding memory id for invalidate.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[schemars(with = "Option<String>")]
 	pub replacement_id: Option<Str>,
 }
 

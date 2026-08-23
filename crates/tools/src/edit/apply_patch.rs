@@ -37,7 +37,6 @@ const SLOPPY_DESCRIPTION: &str = include_str!("../sloppy_prompt.txt");
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct FreeformEditParams {
 	/// Complete dialect input.
-	#[schemars(with = "String")]
 	pub input: Str,
 }
 

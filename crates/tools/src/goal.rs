@@ -47,7 +47,6 @@ pub struct Params {
 	pub op:           Operation,
 	/// Required non-empty objective for `create`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[schemars(with = "Option<String>")]
 	pub objective:    Option<Str>,
 	/// Optional positive hard token budget for `create`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]

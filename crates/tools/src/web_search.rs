@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Google-style search query.
-	#[schemars(with = "String")]
 	pub query:              Str,
 	/// Optional recency window: `day`, `week`, `month`, or `year`.
 	#[serde(default)]
@@ -42,7 +41,6 @@ pub struct Params {
 	pub num_search_results: Option<u32>,
 	/// Explicit provider pin; omitted uses configured automatic routing.
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	pub provider:           Option<Str>,
 }
 

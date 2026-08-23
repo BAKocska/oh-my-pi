@@ -81,12 +81,10 @@ pub enum Signal {
 #[serde(deny_unknown_fields)]
 pub struct Ready {
 	/// Regex matched against combined process output.
-	#[schemars(with = "Option<String>")]
 	pub log:     Option<Str>,
 	/// TCP port that must accept connections.
 	pub port:    Option<u16>,
 	/// TCP readiness host, defaulting to `127.0.0.1`.
-	#[schemars(with = "Option<String>")]
 	pub host:    Option<Str>,
 	/// Readiness deadline in seconds.
 	pub timeout: Option<f64>,
@@ -99,24 +97,19 @@ pub struct Params {
 	/// Operation to perform.
 	pub op:                   Op,
 	/// Peer recipient or `all`.
-	#[schemars(with = "Option<String>")]
 	pub to:                   Option<Str>,
 	/// Peer message body.
-	#[schemars(with = "Option<String>")]
 	pub message:              Option<Str>,
 	/// Prior peer message ID being answered.
 	#[serde(rename = "replyTo")]
-	#[schemars(with = "Option<String>")]
 	pub reply_to:             Option<Str>,
 	/// Block for the recipient's threaded reply.
 	#[serde(rename = "await", default)]
 	pub await_reply:          bool,
 	/// Only accept a peer message from this sender.
 	#[serde(rename = "from")]
-	#[schemars(with = "Option<String>")]
 	pub from_peer:            Option<Str>,
 	/// Job IDs selected for wait or cancellation.
-	#[schemars(with = "Option<Vec<String>>")]
 	pub ids:                  Option<Vec<Str>>,
 	/// Explicit timeout in milliseconds; zero means infinite.
 	#[serde(rename = "timeoutMs")]
@@ -125,19 +118,14 @@ pub struct Params {
 	#[serde(default)]
 	pub peek:                 bool,
 	/// Stable process name.
-	#[schemars(with = "Option<String>")]
 	pub name:                 Option<Str>,
 	/// Process executable.
-	#[schemars(with = "Option<String>")]
 	pub application:          Option<Str>,
 	/// Process argv.
-	#[schemars(with = "Option<Vec<String>>")]
 	pub args:                 Option<Vec<Str>>,
 	/// Process environment.
-	#[schemars(with = "Option<BTreeMap<String, String>>")]
 	pub env:                  Option<BTreeMap<Str, Str>>,
 	/// Process working directory.
-	#[schemars(with = "Option<String>")]
 	pub cwd:                  Option<Str>,
 	/// Allocate an interactive PTY.
 	pub pty:                  Option<bool>,
@@ -158,7 +146,6 @@ pub struct Params {
 	#[serde(default)]
 	pub head:                 bool,
 	/// Regex log filter.
-	#[schemars(with = "Option<String>")]
 	pub grep:                 Option<Str>,
 	/// Output sequence cursor.
 	pub cursor:               Option<u64>,
@@ -170,18 +157,14 @@ pub struct Params {
 	pub render_terminal_rows: bool,
 	/// Process lifecycle target (`ready` or `exit`).
 	#[serde(rename = "for")]
-	#[schemars(with = "Option<String>")]
 	pub wait_for:             Option<Str>,
 	/// Output regex taking precedence over lifecycle target.
-	#[schemars(with = "Option<String>")]
 	pub pattern:              Option<Str>,
 	/// Process stdin text.
-	#[schemars(with = "Option<String>")]
 	pub text:                 Option<Str>,
 	/// Append Enter after process stdin text.
 	pub enter:                Option<bool>,
 	/// Named control keys.
-	#[schemars(with = "Option<Vec<String>>")]
 	pub keys:                 Option<Vec<Str>>,
 	/// OS process-group signal.
 	pub signal:               Option<Signal>,

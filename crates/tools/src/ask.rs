@@ -40,13 +40,11 @@ pub struct Params {
 #[serde(deny_unknown_fields)]
 pub struct Question {
 	/// Stable key returned with the answer.
-	#[schemars(with = "String")]
 	pub id:          Str,
 	/// User-visible question text.
-	#[schemars(with = "String")]
 	pub question:    Str,
 	/// Compact section label.
-	#[schemars(with = "Option<String>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub header:      Option<Str>,
 	/// Available choices.
 	pub options:     Vec<OptionItem>,
@@ -62,13 +60,12 @@ pub struct Question {
 #[serde(deny_unknown_fields)]
 pub struct OptionItem {
 	/// Returned choice label.
-	#[schemars(with = "String")]
 	pub label:       Str,
 	/// Optional explanation.
-	#[schemars(with = "Option<String>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub description: Option<Str>,
 	/// Optional rich preview source.
-	#[schemars(with = "Option<String>", default, skip_serializing_if = "Option::is_none")]
+	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub preview:     Option<Str>,
 }
 /// A resolved answer to one question.

@@ -32,11 +32,9 @@ const MAX_FILES: usize = 200;
 #[serde(deny_unknown_fields)]
 /// One ordered ast-grep pattern and replacement-template pair.
 pub struct RewriteOp {
-	#[schemars(with = "String")]
 	/// Structural AST pattern whose metavariables may be reused by the
 	/// replacement.
 	pub pat: Str,
-	#[schemars(with = "String")]
 	/// Replacement template substituted for every match of `pat`.
 	pub out: Str,
 }
@@ -48,7 +46,6 @@ pub struct Params {
 	/// Required non-empty operations applied in order to every compatible
 	/// target.
 	pub ops:   Vec<RewriteOp>,
-	#[schemars(with = "Vec<String>")]
 	/// Required workspace-relative files, directories, or globs selecting at
 	/// most 200 files.
 	pub paths: Vec<Str>,

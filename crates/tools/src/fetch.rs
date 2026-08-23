@@ -27,7 +27,6 @@ use crate::read::{
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// HTTP(S) URL, optionally followed by a read line selector or `:raw`.
-	#[schemars(with = "String")]
 	pub url: Str,
 }
 

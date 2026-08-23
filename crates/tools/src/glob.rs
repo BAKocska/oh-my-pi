@@ -58,11 +58,11 @@ pub struct Params {
 	pub path:      Option<Str>,
 	/// include hidden files
 	#[serde(default = "default_true")]
-	#[schemars(skip_serializing_if = "is_true", with = "bool")]
+	#[schemars(skip_serializing_if = "is_true")]
 	pub hidden:    bool,
 	/// respect gitignore
 	#[serde(default = "default_true")]
-	#[schemars(skip_serializing_if = "is_true", with = "bool")]
+	#[schemars(skip_serializing_if = "is_true")]
 	pub gitignore: bool,
 	/// max results
 	#[schemars(default, skip_serializing_if = "Option::is_none", with = "serde_json::Number")]

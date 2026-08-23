@@ -54,45 +54,32 @@ pub struct Params {
 	/// Operation selector.
 	pub op:               Operation,
 	/// `owner/repo`; omitted operations resolve the current checkout.
-	#[schemars(with = "Option<String>")]
 	pub repo:             Option<Str>,
 	/// Repository-relative file path.
-	#[schemars(with = "Option<String>")]
 	pub path:             Option<Str>,
 	/// Branch, ref, or watched commit.
-	#[schemars(with = "Option<String>")]
 	pub branch:           Option<Str>,
 	/// Pull request number, URL, or branch; arrays batch checkout.
-	#[schemars(with = "Option<Vec<String>>")]
 	pub pr:               Option<Vec<Str>>,
 	/// Search query.
-	#[schemars(with = "Option<String>")]
 	pub query:            Option<Str>,
 	/// Lower date bound.
-	#[schemars(with = "Option<String>")]
 	pub since:            Option<Str>,
 	/// Upper date bound.
-	#[schemars(with = "Option<String>")]
 	pub until:            Option<Str>,
 	/// Search date field.
-	#[schemars(with = "Option<String>")]
 	pub date_field:       Option<Str>,
 	/// Maximum returned rows.
 	pub limit:            Option<u32>,
 	/// Pull request title.
-	#[schemars(with = "Option<String>")]
 	pub title:            Option<Str>,
 	/// Pull request body.
-	#[schemars(with = "Option<String>")]
 	pub body:             Option<Str>,
 	/// Pull request base branch.
-	#[schemars(with = "Option<String>")]
 	pub base:             Option<Str>,
 	/// Pull request head branch.
-	#[schemars(with = "Option<String>")]
 	pub head:             Option<Str>,
 	/// Actions run id or URL.
-	#[schemars(with = "Option<String>")]
 	pub run:              Option<Str>,
 	/// Open a draft pull request.
 	#[serde(default)]

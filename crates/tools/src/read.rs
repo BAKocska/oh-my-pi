@@ -214,6 +214,25 @@ pub trait ReadSources: web::types::HttpClient + Send + Sync + 'static {
 		path: Str,
 		max_depth: usize,
 	) -> impl Future<Output = Result<DirectorySource, Fault>> + Send + '_;
+	/// Atomically commits extracted document media and rewrites conversion
+	/// links.
+	///
+	/// Implementations that support local document conversion MUST preserve the
+	/// attachment transaction or reject media extraction rather than emit links
+	/// to files that do not exist.
+	fn commit_document_media(
+		&self,
+		_source: &SourceStat,
+		conversion: &mut markit::Conversion,
+	) -> Result<(), Fault> {
+		if conversion.attachments.is_empty() {
+			return Ok(());
+		}
+		Err(Fault::Unsupported {
+			message: Str::new("document media extraction is unavailable for this source"),
+		})
+	}
+
 	/// Reads a bounded prefix for magic-byte classification.
 	fn read_prefix(
 		&self,
@@ -939,16 +958,20 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		}
 		if self.policy.render_markdown && markit::supports_path(path) {
 			let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
+			let extract_media = path.extension().is_some_and(|extension| {
+				extension.eq_ignore_ascii_case("docx") || extension.eq_ignore_ascii_case("pptx")
+			});
 			match markit::convert_cached(
 				&self.sources,
 				markit::DocumentMetadata::from_path(path),
 				&bytes,
-				markit::ConversionOptions::default(),
+				markit::ConversionOptions { extract_media },
 			)
 			.await
 			{
 				Ok(Some(converted)) => {
-					let converted = converted.conversion;
+					let mut converted = converted.conversion;
+					self.sources.commit_document_media(&stat, &mut converted)?;
 					let mut text = format!("Content-Type: text/markdown\n{}", converted.text);
 					if let Some(note) = converted.note {
 						text = format!("{note}\n{text}");

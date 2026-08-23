@@ -34,9 +34,9 @@ pub struct Params {
 #[serde(untagged)]
 pub enum YieldType {
 	/// Named terminal result.
-	Terminal(#[schemars(with = "String")] Str),
+	Terminal(Str),
 	/// Non-empty incremental section path.
-	Sections(#[schemars(with = "Vec<String>")] Vec<Str>),
+	Sections(Vec<Str>),
 }
 
 /// Structured success or failure.
@@ -46,12 +46,12 @@ pub enum ResultEnvelope {
 	/// Successful structured output.
 	Data {
 		/// Caller-schema-bound structured value.
+		#[schemars(schema_with = "loose_record_schema")]
 		data: Value,
 	},
 	/// Terminal failure description.
 	Error {
 		/// Human-readable failure.
-		#[schemars(with = "String")]
 		error: Str,
 	},
 }
@@ -69,6 +69,16 @@ pub struct Payload {
 /// Yield does not stream updates.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Update {}
+
+/// Loose object schema for `data`. Providers reject property schemas without
+/// a `type` key, and strict validation of the caller schema happens
+/// caller-side (`YieldPayloadValidator`), so the wire schema stays advisory.
+fn loose_record_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+	schemars::json_schema!({
+		"type": "object",
+		"additionalProperties": true,
+	})
+}
 
 /// Invalid yield envelope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -100,15 +110,15 @@ pub fn tool() -> Yield {
 				 to use the last assistant turn.",
 			),
 			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       255,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
+			// Never strict: strict sampling forbids `additionalProperties: true`,
+			// so an arbitrary caller-schema-bound `data` value cannot ride a
+			// strict declaration. The caller-side validator owns the real check.
+			constraint:      Constraint::None,
 			effects:         Effects::empty(),
 			projection_code: omp_tool::native_projection_code(
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
-				include_bytes!("yield.rs"),
+				include_bytes!("yield_tool.rs"),
 			)
 			.into(),
 		},
@@ -218,5 +228,16 @@ mod tests {
 			)
 			.is_err()
 		);
+	}
+	#[test]
+	fn wire_schema_types_data_and_never_requests_strict_sampling() {
+		// OpenAI-side validation rejects any property schema without a `type`
+		// key, and strict sampling forbids `additionalProperties: true`.
+		let yield_tool = tool();
+		assert_eq!(yield_tool.spec().constraint, Constraint::None);
+		let schema: Value = serde_json::from_slice(&yield_tool.spec().schema).unwrap();
+		let data = &schema["properties"]["result"]["anyOf"][0]["anyOf"][0]["properties"]["data"];
+		assert_eq!(data["type"], "object");
+		assert_eq!(data["additionalProperties"], true);
 	}
 }

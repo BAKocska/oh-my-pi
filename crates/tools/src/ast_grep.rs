@@ -21,10 +21,8 @@ const MAX_LIMIT: usize = 500;
 /// Agent-supplied structural search arguments.
 pub struct Params {
 	/// Ast-grep structural pattern, including any metavariables to bind.
-	#[schemars(with = "String")]
 	pub pat:    Str,
 	#[serde(default)]
-	#[schemars(with = "Option<String>")]
 	/// Semicolon-separated workspace-relative files, directories, or globs;
 	/// defaults to `"."`.
 	pub path:   Option<Str>,

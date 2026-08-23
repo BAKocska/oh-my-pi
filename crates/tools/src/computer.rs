@@ -69,13 +69,10 @@ pub struct Params {
 	#[serde(default)]
 	pub read_only:  bool,
 	/// Window id; absence selects the complete desktop.
-	#[schemars(with = "Option<String>")]
 	pub window:     Option<Str>,
 	/// Accessibility reference or window id depending on the action.
-	#[schemars(with = "Option<String>")]
 	pub reference:  Option<Str>,
 	/// Text, key chord, role, or query name.
-	#[schemars(with = "Option<String>")]
 	pub value:      Option<Str>,
 	/// Primary x coordinate.
 	pub x:          Option<f64>,

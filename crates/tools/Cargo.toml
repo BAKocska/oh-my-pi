@@ -30,7 +30,7 @@ image = { workspace = true }
 libc = { workspace = true }
 omp-ast = { workspace = true }
 omp-ar = { workspace = true }
-omp-core = { workspace = true }
+omp-core = { workspace = true, features = ["schemars"] }
 omp-docserver = { workspace = true }
 omp-env = { workspace = true }
 omp-hashline = { workspace = true }

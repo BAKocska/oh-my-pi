@@ -65,7 +65,6 @@ pub struct RewindAck {
 #[serde(deny_unknown_fields)]
 pub struct CheckpointParams {
 	/// Goal of the speculative exploration branch.
-	#[schemars(with = "String")]
 	pub goal: Str,
 }
 
@@ -74,10 +73,8 @@ pub struct CheckpointParams {
 #[serde(deny_unknown_fields)]
 pub struct RewindParams {
 	/// Opaque token returned by `checkpoint`.
-	#[schemars(with = "String")]
 	pub token:  Str,
 	/// Findings retained after the exploration branch is discarded.
-	#[schemars(with = "String")]
 	pub report: Str,
 }
 

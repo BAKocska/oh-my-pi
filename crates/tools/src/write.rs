@@ -64,10 +64,10 @@ const STRIPPED_NOTICE: &str =
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// file path
-	#[schemars(description = "file path", with = "String")]
+	#[schemars(description = "file path")]
 	pub path:    Str,
 	/// file content
-	#[schemars(description = "file content", with = "String")]
+	#[schemars(description = "file content")]
 	pub content: Str,
 }
 

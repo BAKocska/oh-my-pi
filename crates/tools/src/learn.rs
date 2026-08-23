@@ -29,13 +29,10 @@ pub struct SkillInput {
 	/// Create or update. Delete is not accepted by `learn`.
 	pub action:      LearnSkillAction,
 	/// Kebab-case managed-skill name.
-	#[schemars(with = "String")]
 	pub name:        Str,
 	/// Prompt-safe one-line use-case description.
-	#[schemars(with = "String")]
 	pub description: Str,
 	/// Markdown body without frontmatter.
-	#[schemars(with = "String")]
 	pub body:        Str,
 }
 
@@ -76,11 +73,9 @@ impl From<LearnSkillAction> for Action {
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Durable, self-contained lesson: what worked, when, and why.
-	#[schemars(with = "String")]
 	pub memory:  Str,
 	/// Optional source context retained as lesson metadata.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[schemars(with = "Option<String>")]
 	pub context: Option<Str>,
 	/// Optional generated-skill create/update.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,7 +96,6 @@ pub enum SkillOutcome {
 	/// Lesson succeeded but an authored skill owns the requested name.
 	AuthoredShadow {
 		/// Normalized requested name when valid.
-		#[schemars(with = "String")]
 		name: Str,
 	},
 }
@@ -110,7 +104,6 @@ pub enum SkillOutcome {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct LearnOutcome {
 	/// Mnemopi memory identity.
-	#[schemars(with = "String")]
 	pub memory_id: Str,
 	/// Optional skill-side outcome.
 	pub skill:     SkillOutcome,

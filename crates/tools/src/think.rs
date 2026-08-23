@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Private reasoning note retained in the durable tool-call journal.
-	#[schemars(with = "String")]
 	pub thoughts: Str,
 }
 

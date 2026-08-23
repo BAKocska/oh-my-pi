@@ -138,5 +138,4 @@ pub mod web_search;
 /// Pi-compatible whole-file writes.
 pub mod write;
 /// Structured subagent result submission.
-#[path = "yield.rs"]
 pub mod yield_tool;

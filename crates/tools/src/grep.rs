@@ -53,7 +53,6 @@ const SEARCH_GREP_TIMEOUT_MS: u32 = 30_000;
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// regex pattern
-	#[schemars(with = "String")]
 	pub pattern:   Str,
 	/// file, directory, glob, internal URL, or "<file>:<lines>" selector to
 	/// search; pass several as a semicolon-delimited list ("src; tests").

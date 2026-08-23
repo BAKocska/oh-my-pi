@@ -49,15 +49,12 @@ pub struct Params {
 	/// Mutation action.
 	pub action:      Action,
 	/// Kebab-case skill name.
-	#[schemars(with = "String")]
 	pub name:        Str,
 	/// Prompt-safe one-line use-case description. Required for create/update.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[schemars(with = "Option<String>")]
 	pub description: Option<Str>,
 	/// Markdown body without frontmatter. Required for create/update.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[schemars(with = "Option<String>")]
 	pub body:        Option<Str>,
 }
 
@@ -80,10 +77,8 @@ pub struct MutationOutcome {
 	/// Completed action.
 	pub action:   Action,
 	/// Normalized managed-skill name.
-	#[schemars(with = "String")]
 	pub name:     Str,
 	/// Path relative to the isolated managed root.
-	#[schemars(with = "String")]
 	pub path:     Str,
 	/// Monotonic inventory revision after refresh.
 	pub revision: u64,

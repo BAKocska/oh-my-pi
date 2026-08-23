@@ -174,7 +174,7 @@ const DESCRIPTION: &str = include_str!("edit_prompt.txt");
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Complete hashline input, including every `[PATH#TAG]` section header.
-	#[schemars(description = "", with = "String")]
+	#[schemars(description = "")]
 	pub input: Str,
 }
 
