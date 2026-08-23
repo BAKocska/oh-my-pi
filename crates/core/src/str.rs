@@ -2521,6 +2521,27 @@ impl<'de> serde::Deserialize<'de> for Str {
 	}
 }
 
+/// Mirrors `String`'s JSON Schema so derives use `Str` fields directly
+/// instead of per-field `#[schemars(with = "String")]` overrides.
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for Str {
+	fn inline_schema() -> bool {
+		<String as schemars::JsonSchema>::inline_schema()
+	}
+
+	fn schema_name() -> std::borrow::Cow<'static, str> {
+		<String as schemars::JsonSchema>::schema_name()
+	}
+
+	fn schema_id() -> std::borrow::Cow<'static, str> {
+		<String as schemars::JsonSchema>::schema_id()
+	}
+
+	fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+		<String as schemars::JsonSchema>::json_schema(generator)
+	}
+}
+
 impl serde::Serialize for CowStr<'_> {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
