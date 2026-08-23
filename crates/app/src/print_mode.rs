@@ -169,11 +169,10 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 			Str::new(session.session_id()),
 			true,
 			session.available_tool_names(),
+			session.advise_queue(),
 			catalog,
 			true,
-		)
-		.await
-		.into_diagnostic()?;
+		);
 		Some(Arc::new(runtime))
 	} else {
 		None

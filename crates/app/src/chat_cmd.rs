@@ -9,7 +9,7 @@ use nix::sys::signal;
 use nix::unistd::Pid;
 use omp_agent::{
 	Agent, AgentKind, AgentState, AgentStatus, Budget, InProcTurnClient, RpcTurnClient, TurnClient,
-	advisor::{AdviceDelivery, DeliveryContext},
+	advisor::{AdviceDelivery, AdvisorAdviceQueue, DeliveryContext},
 };
 use omp_catalog::snapshot;
 use omp_chat_ui::host;
@@ -24,15 +24,14 @@ use omp_driver::{
 	autolearn::AutolearnCampaign,
 	bridges::{AgentGoalControl, InferenceBridge},
 	chat::{
-		AdvisorChildError, AdvisorChildSpec, AgentCampaignControlBackend, AgentsControlAuthority,
-		CHAT_CAPS_BASE, CampaignControlAuthorityFactory, ChatAuthWorker,
-		ChatError as DriverChatError, ChatParentHost, ChatProviderControlBackend, ChatScope,
-		EphemeralSessions, LaunchToolSelection, Session, SessionOpen, agent_snapshot,
-		apply_launch_tool_selection, canonical_project, ensure_state_directory,
-		fallback_model_selector, interrupted_reasoning_dialect, model_context_window,
-		model_selector_is_selectable, now_ms, open_session, resolve_model_provider,
-		resolve_model_selector, resume_choices, session_blueprint, strict_session_id,
-		thinking_effort,
+		AdvisorChildSpec, AgentCampaignControlBackend, AgentsControlAuthority, CHAT_CAPS_BASE,
+		CampaignControlAuthorityFactory, ChatAuthWorker, ChatError as DriverChatError,
+		ChatParentHost, ChatProviderControlBackend, ChatScope, EphemeralSessions,
+		LaunchToolSelection, Session, SessionOpen, agent_snapshot, apply_launch_tool_selection,
+		canonical_project, ensure_state_directory, fallback_model_selector,
+		interrupted_reasoning_dialect, model_context_window, model_selector_is_selectable, now_ms,
+		open_session, resolve_model_provider, resolve_model_selector, resume_choices,
+		session_blueprint, strict_session_id, thinking_effort,
 	},
 	collab::session::{self, CollabSessionAuthority},
 	discovery::{
@@ -335,9 +334,6 @@ enum ChatError {
 	/// Session index mutation failed.
 	#[error(transparent)]
 	SessionIndex(#[from] index::Error),
-	/// Advisor child or campaign composition failed.
-	#[error(transparent)]
-	Advisor(#[from] AppAdvisorError),
 	/// Interactive terminal or GUI host failed.
 	#[error("interactive chat shell failed: {0}")]
 	Ui(miette::Report),
@@ -607,8 +603,14 @@ pub(crate) async fn run(
 	let document_socket = omp_env::project_state::document_socket(&state_dir);
 	let search_bridge = Arc::new(InferenceBridge::default());
 	let goal_control = AgentGoalControl::default();
-	let bridges =
-		omp_driver::bridges::builtin(&root, Arc::clone(&search_bridge), goal_control.clone(), None);
+	let advise_queue = omp_agent::advisor::AdvisorAdviceQueue::default();
+	let bridges = omp_driver::bridges::builtin(
+		&root,
+		Arc::clone(&search_bridge),
+		goal_control.clone(),
+		None,
+		advise_queue.clone(),
+	);
 	let bridges = omp_envd::RegistryBridges {
 		ask_presenter: Some(omp_chat_ui::ask::presenter()),
 		// A remote gateway serves search/media itself; leave the host
@@ -947,6 +949,7 @@ pub(crate) async fn run(
 				sessions_dir: &sessions_dir,
 				session_index: Arc::clone(&session_index),
 				registry,
+				advise_queue: advise_queue.clone(),
 				persist_sessions: !args.no_session,
 			},
 			start,
@@ -1023,6 +1026,7 @@ pub(crate) async fn run(
 				sessions_dir: &sessions_dir,
 				session_index: Arc::clone(&session_index),
 				registry,
+				advise_queue: advise_queue.clone(),
 				persist_sessions: !args.no_session,
 			},
 			start,
@@ -1082,38 +1086,41 @@ fn bind_goal_todo_context(events: omp_agent::EventSubscription, modes: sync::Wea
 	}));
 }
 
-/// App-owned failures while attaching persistent advisor children.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum AppAdvisorError {
-	/// Persistent advisor child composition failed.
-	#[error(transparent)]
-	Child(#[from] AdvisorChildError),
-}
-
 /// Shared app adapter joining engine coordination to persistent child
 /// execution.
 pub(crate) struct AppAdvisorRuntime<C: TurnClient + Clone + Send + Sync + 'static> {
-	engine:    Arc<Mutex<AdvisorEngine>>,
-	parent:    Arc<ChatParentHost<C>>,
+	engine:   Arc<Mutex<AdvisorEngine>>,
+	parent:   Arc<ChatParentHost<C>>,
+	links:    tokio::sync::Mutex<AdvisorLinks>,
+	notices:  flume::Sender<Option<Str>>,
+	headless: bool,
+}
+
+/// Lazily created advisor children and delivery campaigns.
+///
+/// Held behind a `tokio::sync::Mutex` because the guard genuinely spans the
+/// child spawn and batch-run awaits, serializing advisor turns.
+#[derive(Default)]
+struct AdvisorLinks {
 	control:   Option<omp_agent::ControlSender>,
 	children:  BTreeMap<Str, Str>,
 	campaigns: BTreeMap<Str, ActiveAdvisorCampaign>,
-	notices:   flume::Sender<Option<Str>>,
-	headless:  bool,
 }
 
 impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
-	/// Composes engine workers and their restricted persistent children.
-	pub(crate) async fn compose(
+	/// Composes engine workers; children and campaigns attach lazily on the
+	/// first dispatched batch, so disabled sessions never spawn a child.
+	pub(crate) fn compose(
 		parent: Arc<ChatParentHost<C>>,
 		control: Option<omp_agent::ControlSender>,
 		project_root: PathBuf,
 		primary_session: Str,
 		enabled: bool,
 		available_tools: Vec<Str>,
+		advice_queue: AdvisorAdviceQueue,
 		catalog: &snapshot::Catalog,
 		headless: bool,
-	) -> Result<(Self, flume::Receiver<Option<Str>>), AppAdvisorError> {
+	) -> (Self, flume::Receiver<Option<Str>>) {
 		let engine = Arc::new(Mutex::new(AdvisorEngine::compose(
 			AdvisorEngineOptions {
 				project_root,
@@ -1121,36 +1128,13 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
 				enabled,
 				immune_turns: 3,
 				available_tools,
+				advice_queue,
 			},
 			catalog,
 		)));
-		let specs = {
-			let engine = engine.lock();
-			engine
-				.workers()
-				.filter_map(|worker| {
-					Some(AdvisorChildSpec {
-						id:            worker.id.clone(),
-						display_name:  worker.display_name.clone(),
-						model:         worker.model.clone(),
-						tools:         worker.tools.clone(),
-						system_prompt: worker.system_prompt.clone(),
-						advice_queue:  engine.advice_queue(worker.id.as_str())?,
-					})
-				})
-				.collect::<Vec<_>>()
-		};
-		let mut children = BTreeMap::new();
-		for spec in specs {
-			let advisor_id = spec.id.clone();
-			let child_id = parent.spawn_advisor(spec).await?;
-			children.insert(advisor_id, child_id);
-		}
 		let (notices, receiver) = flume::unbounded();
-		Ok((
-			Self { engine, parent, control, children, campaigns: BTreeMap::new(), notices, headless },
-			receiver,
-		))
+		let links = tokio::sync::Mutex::new(AdvisorLinks { control, ..AdvisorLinks::default() });
+		(Self { engine, parent, links, notices, headless }, receiver)
 	}
 
 	/// Returns the shared engine used by commands and status presentation.
@@ -1158,24 +1142,53 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
 		Arc::clone(&self.engine)
 	}
 
-	/// Engages delivery campaigns after the primary agent actor starts.
-	pub(crate) async fn activate(&mut self) -> Result<(), omp_agent::ControlError> {
-		let Some(control) = self.control.take() else {
-			return Ok(());
-		};
-		let advisor_ids = self
-			.engine
-			.lock()
-			.workers()
-			.map(|worker| worker.id.clone())
-			.collect::<Vec<_>>();
-		for advisor_id in advisor_ids {
-			let campaign =
-				ActiveAdvisorCampaign::engage(control.clone(), advisor_id.as_str(), Duration::ZERO, 2)
-					.await?;
-			self.campaigns.insert(advisor_id, campaign);
+	/// Attaches the persistent child and delivery campaign for one advisor.
+	///
+	/// Returns the supervised child id, or `None` when composition failed and
+	/// the batch must be skipped; failures are recorded on the engine.
+	async fn ensure_linked(&self, links: &mut AdvisorLinks, advisor_id: &str) -> Option<Str> {
+		if !links.children.contains_key(advisor_id) {
+			let spec = {
+				let engine = self.engine.lock();
+				engine
+					.workers()
+					.find(|worker| worker.id.as_str() == advisor_id)
+					.map(|worker| AdvisorChildSpec {
+						id:            worker.id.clone(),
+						display_name:  worker.display_name.clone(),
+						model:         worker.model.clone(),
+						tools:         worker.tools.clone(),
+						system_prompt: worker.system_prompt.clone(),
+					})
+			};
+			let spec = spec?;
+			match self.parent.spawn_advisor(spec).await {
+				Ok(child_id) => {
+					links.children.insert(Str::from(advisor_id), child_id);
+				},
+				Err(error) => {
+					tracing::warn!(advisor = %advisor_id, %error, "advisor child could not be spawned");
+					self
+						.engine
+						.lock()
+						.record_failure(advisor_id, AdvisorFailureClass::Transient);
+					return None;
+				},
+			}
 		}
-		Ok(())
+		if !links.campaigns.contains_key(advisor_id) {
+			if let Some(control) = links.control.clone() {
+				match ActiveAdvisorCampaign::engage(control, advisor_id, Duration::ZERO, 2).await {
+					Ok(campaign) => {
+						links.campaigns.insert(Str::from(advisor_id), campaign);
+					},
+					Err(error) => {
+						tracing::warn!(advisor = %advisor_id, %error, "advisor delivery campaign could not be engaged");
+					},
+				}
+			}
+		}
+		links.children.get(advisor_id).cloned()
 	}
 
 	/// Applies one primary-loop event and runs any resulting advisor batches.
@@ -1251,6 +1264,10 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
 		turn_id: omp_agent::TurnId,
 		context: DeliveryContext,
 	) {
+		if jobs.is_empty() {
+			return;
+		}
+		let mut links = self.links.lock().await;
 		for job in jobs {
 			let chunks = job
 				.batch
@@ -1270,10 +1287,12 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
 					});
 				}
 			}
-			let child_id = self
-				.children
-				.get(job.advisor_id.as_str())
-				.unwrap_or(&job.advisor_id);
+			let Some(child_id) = self
+				.ensure_linked(&mut links, job.advisor_id.as_str())
+				.await
+			else {
+				continue;
+			};
 			let outcome = match self
 				.parent
 				.run_advisor_batch(child_id.as_str(), chunks, turn_id.clone())
@@ -1327,12 +1346,12 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
 						)));
 					},
 					AdviceOutcome::Deliver { advice, .. } => {
-						if let Some(campaign) = self.campaigns.get(advice.advisor_id.as_str()) {
+						if let Some(campaign) = links.campaigns.get(advice.advisor_id.as_str()) {
 							let _ = campaign.handle().submit(advice, context);
 						}
 					},
 					AdviceOutcome::Quarantined(reason) => {
-						if let Some(campaign) = self.campaigns.get(job.advisor_id.as_str()) {
+						if let Some(campaign) = links.campaigns.get(job.advisor_id.as_str()) {
 							let _ = campaign.record_quarantine(reason.to_string()).await;
 						}
 					},
@@ -1743,16 +1762,12 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			id.clone(),
 			advisor_enabled,
 			available_advisor_tools,
+			scope.advise_queue.clone(),
 			scope.catalog,
 			false,
-		)
-		.await?;
+		);
 		let advisor_engine = advisor_runtime.engine();
 		let advisor_task = tokio::spawn(async move {
-			let mut advisor_runtime = advisor_runtime;
-			if let Err(error) = advisor_runtime.activate().await {
-				tracing::warn!(%error, "advisor delivery campaigns could not be engaged");
-			}
 			while let Ok(event) = advisor_events.recv().await {
 				advisor_runtime.observe(event.as_ref()).await;
 			}

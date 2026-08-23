@@ -2227,6 +2227,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 				Arc::new(InferenceBridge::default()),
 				AgentGoalControl::default(),
 				None,
+				omp_agent::advisor::AdvisorAdviceQueue::default(),
 			);
 			omp_envd::run(args.into_config(), bridges).await
 		},

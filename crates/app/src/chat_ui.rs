@@ -6259,7 +6259,8 @@ fn send_status(
 	let advisor_status = state
 		.advisor
 		.as_ref()
-		.map(|advisor| advisor.lock().status());
+		.map(|advisor| advisor.lock().status())
+		.filter(|status| status.enabled);
 	let advisor_model = advisor_status
 		.as_ref()
 		.filter(|status| status.enabled)
