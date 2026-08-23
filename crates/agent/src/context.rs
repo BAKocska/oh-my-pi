@@ -343,13 +343,19 @@ pub enum ContextProjection {
 
 /// Resolves whether a model should receive the external thinking tool.
 ///
-/// Native reasoning wins. Explicitly unsupported reasoning activates the tool;
-/// unknown capability evidence does not silently change the tool surface.
-pub fn external_thinking_for_model(capabilities: &omp_inference::ModelCapabilities) -> bool {
-	capabilities
-		.chat
-		.as_ref()
-		.is_some_and(|chat| matches!(chat.reasoning, omp_inference::Availability::Unsupported))
+/// An invocation override takes precedence. Without one, explicitly unsupported
+/// native reasoning activates the tool; unknown capability evidence does not
+/// silently change the tool surface.
+pub fn external_thinking_for_model(
+	capabilities: &omp_inference::ModelCapabilities,
+	override_: Option<bool>,
+) -> bool {
+	override_.unwrap_or_else(|| {
+		capabilities
+			.chat
+			.as_ref()
+			.is_some_and(|chat| matches!(chat.reasoning, omp_inference::Availability::Unsupported))
+	})
 }
 
 /// Removes replay-unsafe reasoning from an interrupted assistant tail and
@@ -810,6 +816,25 @@ mod tests {
 				_ => "",
 			})
 			.collect()
+	}
+
+	#[test]
+	fn external_thinking_override_wins_over_missing_capabilities() {
+		let capabilities = omp_inference::ModelCapabilities {
+			operations:    Default::default(),
+			chat:          None,
+			embeddings:    None,
+			image:         None,
+			video:         None,
+			speech:        None,
+			transcription: None,
+			realtime:      None,
+			search:        None,
+			tokenization:  None,
+		};
+		assert!(external_thinking_for_model(&capabilities, Some(true)));
+		assert!(!external_thinking_for_model(&capabilities, Some(false)));
+		assert!(!external_thinking_for_model(&capabilities, None));
 	}
 
 	#[test]

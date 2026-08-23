@@ -18,7 +18,7 @@ hifijson = { workspace = true }
 jaq-core = { workspace = true }
 jaq-json = { workspace = true }
 jaq-std = { workspace = true }
-omp-core = { workspace = true }
+omp-core = { workspace = true, features = ["schemars"] }
 omp-ast = { workspace = true }
 # D2 world boundary: client API only. CI rejects docserver, shell-engine, and walker.
 omp-env = { workspace = true }

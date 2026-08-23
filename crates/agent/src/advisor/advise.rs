@@ -19,7 +19,6 @@ use super::{AdviceSeverity, normalize_advice};
 #[serde(deny_unknown_fields)]
 pub struct AdviseParams {
 	/// Concrete issue and proposed correction.
-	#[schemars(with = "String")]
 	pub note:     Str,
 	/// Urgency used by the primary-loop router.
 	#[serde(default)]
