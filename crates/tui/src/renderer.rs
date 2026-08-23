@@ -32,6 +32,7 @@ const SYNC_OUTPUT_BEGIN: &str = esc!(sync_output);
 const SYNC_OUTPUT_END: &str = esc!(!sync_output);
 const HIDE_CURSOR: &str = esc!(!cursor_visible);
 const SHOW_CURSOR: &str = esc!(cursor_visible);
+const RESET_HISTORY: &str = esc!(cursor_home, erase_scrollback, erase_display);
 // CUD clamps at the bottom without changing the user's scrollback viewport.
 const VIEWPORT_BOTTOM: &str = esc!(viewport_bottom);
 const DEFAULT_CELL_PIXEL_WIDTH: u16 = 9;
@@ -558,11 +559,7 @@ impl<W: Write> Renderer<W> {
 				"finalized and viewport frames must have equal widths",
 			));
 		}
-		if !self.alt_screen
-			&& self.previous.as_ref().is_some_and(|previous| {
-				previous.size().width != viewport.size().width
-					|| self.viewport_height != viewport_height
-			}) {
+		if self.retire_requires_present(viewport.size().width, viewport_height) {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
 				"retirement geometry differs from the painted viewport",
@@ -721,6 +718,53 @@ impl<W: Write> Renderer<W> {
 		self.cursor = cursor;
 		self.publish_debug_screen();
 		Ok(RetireStats { rows: finalized_rows, bytes })
+	}
+
+	/// Whether the next [`Renderer::retire`] at this geometry must be preceded
+	/// by a history-neutral present.
+	///
+	/// Retirement scrolls relative to the previously painted viewport; after a
+	/// geometry change the caller presents once at the new size, then retires
+	/// on a following paint.
+	#[must_use]
+	pub fn retire_requires_present(&self, width: u16, viewport_height: u16) -> bool {
+		!self.alt_screen
+			&& self.previous.as_ref().is_some_and(|previous| {
+				previous.size().width != width || self.viewport_height != viewport_height
+			})
+	}
+
+	/// Destructively clears native history, the visible screen, and registered
+	/// terminal graphics.
+	///
+	/// The next paint is a full first paint onto the blank screen at row zero.
+	///
+	/// # Errors
+	///
+	/// Writer failure poisons the renderer.
+	pub fn reset_history(&mut self) -> io::Result<()> {
+		if self.poisoned {
+			return Err(io::Error::other(
+				"renderer state is unknown after a partial write; restart the terminal session",
+			));
+		}
+
+		let mut output = mem::take(&mut self.output_scratch);
+		output.clear();
+		for &id in self.images.keys() {
+			append_delete_image(&mut output, id, self.tmux_passthrough);
+		}
+		output.push_str(RESET_HISTORY);
+		let result = self.write(&output);
+		self.output_scratch = output;
+		result?;
+
+		self.previous = None;
+		self.layers.clear();
+		self.viewport_height = 0;
+		self.cursor = None;
+		self.images.clear();
+		Ok(())
 	}
 
 	/// Repaints the raw viewport under stored layers and drops those layers.
@@ -2194,7 +2238,7 @@ mod tests {
 
 	use super::{
 		ConptyChunks, MAX_CONPTY_WRITE_CHUNK_BYTES, MAX_OUTPUT_BACKLOG_BYTES, OutputBacklogGuard,
-		Renderer, ResolvedLayer, SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END,
+		RESET_HISTORY, Renderer, ResolvedLayer, SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END,
 	};
 	use crate::{Color, Frame, Graphics, Size, Style, test_support::TerminalModel};
 
@@ -2386,6 +2430,26 @@ mod tests {
 		apply(&mut first, &mut terminal);
 		assert_eq!(terminal.history, ["界 link"]);
 		assert_eq!(terminal.visible_rows(), ["界 live", "next"]);
+	}
+
+	#[test]
+	fn reset_history_clears_graphics_and_forces_a_full_repaint() {
+		let painted = frame(8, &["same", "frame"]);
+		let mut renderer = Renderer::new(Vec::new());
+		renderer.present(painted.clone(), 2, &[]).unwrap();
+		renderer.writer_mut().clear();
+		renderer.register_image(7, [1_u8, 2, 3]).unwrap();
+
+		renderer.reset_history().unwrap();
+		let reset = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
+		assert!(reset.contains("a=d,d=I,i=7,q=2"));
+		assert!(reset.ends_with(RESET_HISTORY));
+		assert!(renderer.screen_text().is_empty());
+		assert_eq!(renderer.screen_cursor(), None);
+
+		let stats = renderer.present(painted, 2, &[]).unwrap();
+		assert!(stats.full_repaint);
+		assert!(stats.bytes > 0);
 	}
 
 	#[test]

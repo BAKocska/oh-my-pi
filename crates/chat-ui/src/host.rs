@@ -101,6 +101,8 @@ pub struct HostOptions {
 	pub error_notify:           bool,
 	/// Permit generated terminal-title escape sequences.
 	pub title_enabled:          bool,
+	/// How a settled terminal width change refreshes retired scrollback rows.
+	pub resize_scrollback:      ResizeScrollback,
 }
 
 impl Default for HostOptions {
@@ -111,8 +113,21 @@ impl Default for HostOptions {
 			completion_notify:      true,
 			error_notify:           true,
 			title_enabled:          true,
+			resize_scrollback:      ResizeScrollback::Rebuild,
 		}
 	}
+}
+/// How a settled terminal width change refreshes transcript rows already
+/// retired into native scrollback (written at the old width).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ResizeScrollback {
+	/// Replay the finalized transcript at the new width below retained history.
+	Append,
+	/// Erase native scrollback, then replay one current-width transcript.
+	#[default]
+	Rebuild,
+	/// Repaint only the mutable viewport; scrollback keeps its old width.
+	Preserve,
 }
 
 const DOUBLE_LEFT_MIN: Duration = Duration::from_millis(40);
@@ -158,6 +173,7 @@ pub async fn run(
 		completion_notify:      true,
 		error_notify:           true,
 		title_enabled:          true,
+		resize_scrollback:      ResizeScrollback::Rebuild,
 	})
 	.await
 	.map(|_| ())
@@ -271,10 +287,7 @@ async fn run_with_terminal(
 		current_model,
 		events,
 		intents,
-		options.exit_on_session_change,
-		options.completion_notify,
-		options.error_notify,
-		options.title_enabled,
+		options,
 	)
 	.await
 }
@@ -1157,19 +1170,25 @@ async fn run_chat(
 	current_model: usize,
 	events: &Receiver<BackendEvent>,
 	intents: &Sender<Intent>,
-	exit_on_session_change: bool,
-	completion_notify: bool,
-	error_notify: bool,
-	title_enabled: bool,
+	options: HostOptions,
 ) -> io::Result<HostOutcome> {
 	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model, true);
 	let ask_binding = ask::bind();
 	paint_host(renderer, &mut host, viewport, false)?;
 
 	let mut resize = None;
+	let mut settled_width = viewport.width;
 	let mut paste_read: Option<PasteRead> = None;
 	let mut next_frame = chat_deadline(&host.chat);
 	let mut requested_exit = HostExit::Quit;
+	let HostOptions {
+		exit_on_session_change,
+		completion_notify,
+		error_notify,
+		title_enabled,
+		resize_scrollback,
+		..
+	} = options;
 	loop {
 		let paste_deadline = paste_read.as_ref().map(|read| read.abandon_at);
 		tokio::select! {
@@ -1216,6 +1235,14 @@ async fn run_chat(
 												break;
 											} else if key == Key::Alt('l') {
 												terminal.refresh_appearance()?;
+												// Destructive redraw gesture (pi's Ctrl+L): replay the
+												// complete finalized transcript under the refreshed
+												// appearance. ED3 is skipped inside multiplexers, where
+												// it would wipe pane history; the replay then appends.
+												host.chat.reset_retirement();
+												if !terminal.inside_multiplexer() {
+													renderer.reset_history()?;
+												}
 												let rendered = host.chat.render(viewport);
 												let layers = rail_layers(&mut host.sidebar, viewport);
 												renderer.repaint(
@@ -1470,16 +1497,45 @@ async fn run_chat(
 							() = deadline(executor, next_frame) => {
 								observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
 								host.chat.set_right_inset(host.sidebar.reserved(viewport));
-								paint_host(renderer, &mut host, viewport, true)?;
-								next_frame = chat_deadline(&host.chat);
+								// A retired batch may leave further finalized prefixes
+								// (or replay batches) ready: repaint immediately to
+								// drain them instead of waiting for the next event.
+								next_frame = match paint_host(renderer, &mut host, viewport, true)? {
+									PaintKind::Retired | PaintKind::Deferred => Some(Instant::now()),
+									PaintKind::Presented => chat_deadline(&host.chat),
+								};
 							},
 							() = deadline(executor, resize.map(ResizeState::deadline)) => {
 								let now = Instant::now();
 								if !resize.is_some_and(|state| state.settled(now)) { continue; }
 								host.chat.set_right_inset(host.sidebar.reserved(viewport));
-								paint_host(renderer, &mut host, viewport, true)?;
+								// A settled width change leaves native scrollback rows
+								// wrapped at the old width; refresh them per the
+								// configured mode by reopening the committed prefix so
+								// ordered retirement replays it at the new width.
+								if viewport.width != settled_width {
+									settled_width = viewport.width;
+									let mode = if resize_scrollback == ResizeScrollback::Rebuild
+										&& terminal.inside_multiplexer()
+									{
+										// ED3 wipes multiplexer pane history irrecoverably;
+										// degrade to an append replay.
+										ResizeScrollback::Append
+									} else {
+										resize_scrollback
+									};
+									if mode != ResizeScrollback::Preserve && host.overlay.is_none() {
+										host.chat.reset_retirement();
+										if mode == ResizeScrollback::Rebuild {
+											renderer.reset_history()?;
+										}
+									}
+								}
 								resize = None;
-								next_frame = chat_deadline(&host.chat);
+								next_frame = match paint_host(renderer, &mut host, viewport, true)? {
+									PaintKind::Retired | PaintKind::Deferred => Some(now),
+									PaintKind::Presented => chat_deadline(&host.chat),
+								};
 							},
 						}
 	}
@@ -1883,7 +1939,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
 			"Choose the model for the next turn",
 			PaletteAction::OpenModelPicker,
 		)
-		.key("Ctrl+P"),
+		.key("Alt+P"),
 		PaletteEntry::new(
 			"Toggle sidebar",
 			"Show or hide session facts",
@@ -1970,6 +2026,9 @@ fn clipboard_paste_text(clipboard: Clipboard) -> Option<String> {
 enum PaintKind {
 	Presented,
 	Retired,
+	/// A geometry change forced a history-neutral present before the pending
+	/// retirement; repaint immediately to retire.
+	Deferred,
 }
 
 fn paint_host<W: Write>(
@@ -1978,8 +2037,11 @@ fn paint_host<W: Write>(
 	viewport: Size,
 	allow_retirement: bool,
 ) -> io::Result<PaintKind> {
-	let batch = if allow_retirement && host.overlay.is_none() {
-		host.chat.retirement_batch(viewport.width)
+	let geometry_gate = allow_retirement
+		&& host.overlay.is_none()
+		&& renderer.retire_requires_present(viewport.width, viewport.height);
+	let batch = if allow_retirement && host.overlay.is_none() && !geometry_gate {
+		host.chat.retirement_batch(viewport)
 	} else {
 		None
 	};
@@ -1995,7 +2057,11 @@ fn paint_host<W: Write>(
 			viewport.height,
 			&layers,
 		)?;
-		return Ok(PaintKind::Presented);
+		return Ok(if geometry_gate {
+			PaintKind::Deferred
+		} else {
+			PaintKind::Presented
+		});
 	};
 	let upto = batch.range.end;
 	renderer.retire(&batch.frame, rendered.frame, viewport.height, &layers)?;
@@ -2122,7 +2188,11 @@ mod tests {
 
 	fn finalized_host(ctx: &UiContext, viewport: Size) -> ChatHost {
 		let mut chat = Chat::new(ctx);
-		chat.push_notice("finalized");
+		// Enough finalized rows to overflow the 40x8 live region, forcing a
+		// capacity-pressure retirement offer.
+		for index in 0..6 {
+			chat.push_notice(format!("finalized {index}"));
+		}
 		ChatHost::new(chat, ctx, viewport, Vec::new(), 0, false)
 	}
 
@@ -2137,7 +2207,22 @@ mod tests {
 			paint_host(&mut renderer, &mut host, viewport, false).unwrap(),
 			PaintKind::Presented
 		);
-		assert!(host.chat.retirement_batch(viewport.width).is_some());
+		assert!(host.chat.retirement_batch(viewport).is_some());
+	}
+
+	#[test]
+	fn width_change_defers_retirement_until_the_viewport_repaints() {
+		let viewport = Size::new(40, 8);
+		let ctx = UiContext::default();
+		let mut host = finalized_host(&ctx, viewport);
+		let mut renderer = Renderer::new(Vec::new());
+		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
+
+		// Retirement scrolls relative to the painted viewport, so a geometry
+		// change presents once before the pending batch retires.
+		let resized = Size::new(60, 8);
+		assert_eq!(paint_host(&mut renderer, &mut host, resized, true).unwrap(), PaintKind::Deferred);
+		assert_eq!(paint_host(&mut renderer, &mut host, resized, true).unwrap(), PaintKind::Retired);
 	}
 
 	#[test]
@@ -2149,7 +2234,7 @@ mod tests {
 		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
 
 		assert_eq!(paint_host(&mut renderer, &mut host, viewport, true).unwrap(), PaintKind::Retired);
-		assert!(host.chat.retirement_batch(viewport.width).is_none());
+		assert!(host.chat.retirement_batch(viewport).is_none());
 		assert_eq!(
 			paint_host(&mut renderer, &mut host, viewport, true).unwrap(),
 			PaintKind::Presented
@@ -2169,11 +2254,11 @@ mod tests {
 			paint_host(&mut renderer, &mut host, viewport, true).unwrap(),
 			PaintKind::Presented
 		);
-		assert!(host.chat.retirement_batch(viewport.width).is_some());
+		assert!(host.chat.retirement_batch(viewport).is_some());
 
 		host.overlay = None;
 		assert_eq!(paint_host(&mut renderer, &mut host, viewport, true).unwrap(), PaintKind::Retired);
-		assert!(host.chat.retirement_batch(viewport.width).is_none());
+		assert!(host.chat.retirement_batch(viewport).is_none());
 	}
 
 	#[derive(Clone, Default)]
@@ -2215,6 +2300,6 @@ mod tests {
 
 		assert_eq!(error.kind(), io::ErrorKind::Other);
 		assert_eq!(control.writes.get(), writes_before + 1);
-		assert!(host.chat.retirement_batch(viewport.width).is_some());
+		assert!(host.chat.retirement_batch(viewport).is_some());
 	}
 }

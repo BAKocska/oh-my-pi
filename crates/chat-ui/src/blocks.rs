@@ -5,12 +5,17 @@
 //! [`BlockPhase::FinalizedPending`], and [`BlockPhase::Committed`]. The
 //! scheduler treats sampled painted heights as authoritative: it first asks
 //! existing blocks to contract, then admits queued blocks only after sampled
-//! rows are physically free. Collapse and exit requests pass through observed
-//! two-row and one-row bridge states.
+//! rows are physically free. Collapse requests pass through observed
+//! two-row and one-row bridge heights.
 //!
-//! [`Blocks::retirement_batch`] exposes only the maximal finalized prefix at
-//! the monotonic commit frontier. Allocation never changes that frontier, and
-//! retirement never selects a block across an unfinished predecessor.
+//! Finalization immediately hands a block's presentation to its settled
+//! semantic snapshot: the block stops sampling, and the scene renders the
+//! snapshot in the live viewport until ordered retirement moves it into
+//! native history. [`Blocks::retirement_batch`] exposes only the maximal
+//! finalized prefix at the monotonic commit frontier. Allocation never
+//! changes that frontier, and retirement never selects a block across an
+//! unfinished predecessor. [`Blocks::reset_retirement`] rewinds the frontier
+//! so a display replay can re-retire the complete finalized transcript.
 
 use std::ops::Range;
 
@@ -30,7 +35,7 @@ pub enum BlockPhase {
 	Queued,
 	/// Admitted to the live viewport allocator.
 	Active,
-	/// Finalized and waiting for its exit bridge and ordered retirement.
+	/// Finalized and waiting for its exit bridge and  ordered retirement.
 	FinalizedPending,
 	/// Successfully retired into native history.
 	Committed,
@@ -81,20 +86,10 @@ impl Plan {
 	}
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BridgeStage {
-	Stable,
-	ToTwo,
-	ToOne,
-	Exiting,
-	Exited,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct BlockRecord {
 	phase:  BlockPhase,
 	target: u16,
-	bridge: BridgeStage,
 }
 
 /// Ordered block store, sampled-height allocator, and commit frontier.
@@ -115,34 +110,48 @@ impl Blocks {
 	/// Creates one queued block and returns its never-reused ordinal.
 	pub fn create(&mut self) -> BlockOrdinal {
 		let ordinal = BlockOrdinal(self.records.len() as u64);
-		self.records.push(BlockRecord {
-			phase:  BlockPhase::Queued,
-			target: 0,
-			bridge: BridgeStage::Stable,
-		});
+		self
+			.records
+			.push(BlockRecord { phase: BlockPhase::Queued, target: 0 });
 		ordinal
+	}
+
+	/// Number of blocks not yet committed (queued, active, or settled).
+	#[must_use]
+	pub fn live_count(&self) -> u64 {
+		self.records.len() as u64 - self.frontier
+	}
+
+	/// Rewinds the commit frontier so a display replay can re-retire the
+	/// complete finalized transcript under the current width.
+	///
+	/// Committed blocks become settled ([`BlockPhase::FinalizedPending`])
+	/// again; active, queued, and already-settled blocks are untouched. The
+	/// caller owns erasing or retaining the native rows the previous
+	/// generation wrote.
+	pub fn reset_retirement(&mut self) {
+		for record in &mut self.records[..self.frontier as usize] {
+			debug_assert_eq!(record.phase, BlockPhase::Committed);
+			record.phase = BlockPhase::FinalizedPending;
+			record.target = 0;
+		}
+		self.frontier = 0;
 	}
 
 	/// Finalizes an active or queued block.
 	///
-	/// Active blocks retain an internal exit bridge until a sampled height of
-	/// zero is observed. A never-admitted queued block is already hidden and is
-	/// immediately eligible at the retirement frontier. Returns `false` when
-	/// the ordinal is unknown or was already finalized or committed.
+	/// The block's live presentation ends immediately: it stops sampling and
+	/// its settled semantic snapshot becomes eligible for viewport rendering
+	/// and ordered retirement. Returns `false` when the ordinal is unknown or
+	/// was already finalized or committed.
 	pub fn finalize(&mut self, ordinal: BlockOrdinal) -> bool {
 		let Some(record) = self.record_mut(ordinal) else {
 			return false;
 		};
 		match record.phase {
-			BlockPhase::Queued => {
+			BlockPhase::Queued | BlockPhase::Active => {
 				record.phase = BlockPhase::FinalizedPending;
 				record.target = 0;
-				record.bridge = BridgeStage::Exited;
-				true
-			},
-			BlockPhase::Active => {
-				record.phase = BlockPhase::FinalizedPending;
-				record.bridge = BridgeStage::Exiting;
 				true
 			},
 			BlockPhase::FinalizedPending | BlockPhase::Committed => false,
@@ -175,9 +184,6 @@ impl Blocks {
 						natural: natural(ordinal).max(1),
 					});
 				},
-				BlockPhase::FinalizedPending if record.bridge != BridgeStage::Exited => {
-					samples.push(Sample { index, ordinal, height: sampled(ordinal), natural: 0 });
-				},
 				BlockPhase::Queued | BlockPhase::FinalizedPending | BlockPhase::Committed => {},
 			}
 		}
@@ -198,11 +204,9 @@ impl Blocks {
 			let target = match record.phase {
 				BlockPhase::Active if queue_waiting => collapse_target(sample.height),
 				BlockPhase::Active => settled_target(sample.height, record.target, sample.natural),
-				BlockPhase::FinalizedPending => exit_target(sample.height),
-				BlockPhase::Queued | BlockPhase::Committed => 0,
+				BlockPhase::Queued | BlockPhase::FinalizedPending | BlockPhase::Committed => 0,
 			};
 			record.target = target;
-			record.bridge = bridge_stage(record.phase, sample.height, target);
 			occupied = occupied.saturating_add(u32::from(sample.height.max(target)));
 			plan
 				.targets
@@ -220,7 +224,6 @@ impl Blocks {
 				}
 				record.phase = BlockPhase::Active;
 				record.target = 1;
-				record.bridge = BridgeStage::Stable;
 				let ordinal = BlockOrdinal(index as u64);
 				plan.targets.push(BlockTarget { ordinal, height: 1 });
 				plan.admitted.push(ordinal);
@@ -238,7 +241,6 @@ impl Blocks {
 				let grant = u32::from(sample.natural - target.height).min(free) as u16;
 				target.height += grant;
 				record.target = target.height;
-				record.bridge = BridgeStage::Stable;
 				free -= u32::from(grant);
 			}
 		}
@@ -254,7 +256,7 @@ impl Blocks {
 		let start = self.frontier;
 		let mut end = start;
 		while let Some(record) = self.record(BlockOrdinal(end)) {
-			if record.phase != BlockPhase::FinalizedPending || record.bridge != BridgeStage::Exited {
+			if record.phase != BlockPhase::FinalizedPending {
 				break;
 			}
 			end += 1;
@@ -275,8 +277,7 @@ impl Blocks {
 		if upto >= start {
 			while safe_end < requested {
 				let record = &self.records[safe_end as usize];
-				if record.phase != BlockPhase::FinalizedPending || record.bridge != BridgeStage::Exited
-				{
+				if record.phase != BlockPhase::FinalizedPending {
 					break;
 				}
 				safe_end += 1;
@@ -288,7 +289,6 @@ impl Blocks {
 			let record = &mut self.records[ordinal as usize];
 			record.phase = BlockPhase::Committed;
 			record.target = 0;
-			record.bridge = BridgeStage::Exited;
 		}
 		self.frontier = safe_end;
 	}
@@ -324,26 +324,13 @@ impl Blocks {
 		};
 		for sample in samples {
 			let record = &mut self.records[sample.index];
-			let height = if record.phase == BlockPhase::Active
-				&& plan
+			let height = u16::from(
+				plan
 					.overflow
 					.as_ref()
-					.is_some_and(|overflow| overflow.visible.contains(&sample.ordinal))
-			{
-				1
-			} else {
-				0
-			};
+					.is_some_and(|overflow| overflow.visible.contains(&sample.ordinal)),
+			);
 			record.target = height;
-			if record.phase == BlockPhase::Active {
-				record.bridge = if height == 0 {
-					BridgeStage::ToOne
-				} else {
-					BridgeStage::Stable
-				};
-			} else if sample.height == 0 {
-				record.bridge = BridgeStage::Exited;
-			}
 			plan
 				.targets
 				.push(BlockTarget { ordinal: sample.ordinal, height });
@@ -449,29 +436,6 @@ fn settled_target(sampled: u16, previous: u16, natural: u16) -> u16 {
 	}
 }
 
-fn exit_target(sampled: u16) -> u16 {
-	match sampled {
-		0 | 1 => 0,
-		2 => 1,
-		_ => 2,
-	}
-}
-
-fn bridge_stage(phase: BlockPhase, sampled: u16, target: u16) -> BridgeStage {
-	if phase == BlockPhase::FinalizedPending {
-		return if sampled == 0 {
-			BridgeStage::Exited
-		} else {
-			BridgeStage::Exiting
-		};
-	}
-	match (sampled, target) {
-		(_, 2) if sampled > 2 => BridgeStage::ToTwo,
-		(2, 1) => BridgeStage::ToOne,
-		_ => BridgeStage::Stable,
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use std::collections::BTreeSet;
@@ -501,7 +465,7 @@ mod tests {
 	}
 
 	#[test]
-	fn finalized_row_must_be_observed_free_before_one_waiter_is_admitted() {
+	fn finalization_releases_the_live_row_to_the_next_waiter() {
 		let mut blocks = Blocks::new();
 		let first = blocks.create();
 		let second = blocks.create();
@@ -509,20 +473,19 @@ mod tests {
 		blocks.tick(2, |_| 0, |_| 3);
 		assert!(blocks.finalize(first));
 
+		// The finalized block stops sampling immediately: its settled snapshot
+		// now occupies scene-owned rows outside this allocator's budget, so the
+		// queued waiter is admitted into the released allocator row.
 		let sampled = [1, 1, 0];
-		let exiting = blocks.tick(2, |ordinal| sample_from(&sampled, ordinal), |_| 3);
-		assert_eq!(exiting.target(first), Some(0));
-		assert!(exiting.admitted.is_empty());
-
-		let sampled = [0, 1, 0];
 		let released = blocks.tick(2, |ordinal| sample_from(&sampled, ordinal), |_| 3);
+		assert!(released.target(first).is_none());
 		assert_eq!(released.admitted.as_slice(), &[waiting]);
 		assert_eq!(blocks.phase(second), Some(BlockPhase::Active));
 		assert_eq!(blocks.phase(waiting), Some(BlockPhase::Active));
 	}
 
 	#[test]
-	fn collapse_and_exit_cross_observed_bridge_rows() {
+	fn queue_pressure_collapses_across_observed_bridge_rows() {
 		let mut blocks = Blocks::new();
 		let donor = blocks.create();
 		blocks.tick(5, |_| 0, |_| 5);
@@ -537,15 +500,9 @@ mod tests {
 		assert_eq!(still_two.target(donor), Some(2));
 		assert_eq!(still_two.admitted.as_slice(), &[waiting]);
 
+		// Finalization needs no exit bridge: the settled snapshot is
+		// immediately eligible at the retirement frontier.
 		assert!(blocks.finalize(donor));
-		let exit_to_two = blocks.tick(5, |ordinal| if ordinal == donor { 3 } else { 1 }, |_| 5);
-		assert_eq!(exit_to_two.target(donor), Some(2));
-		let exit_to_one = blocks.tick(5, |ordinal| if ordinal == donor { 2 } else { 1 }, |_| 5);
-		assert_eq!(exit_to_one.target(donor), Some(1));
-		let exit = blocks.tick(5, |ordinal| u16::from(ordinal == donor), |_| 5);
-		assert_eq!(exit.target(donor), Some(0));
-		assert!(blocks.retirement_batch().is_none());
-		blocks.tick(5, |_| 0, |_| 5);
 		assert_eq!(blocks.retirement_batch(), Some(0..1));
 	}
 
@@ -573,11 +530,8 @@ mod tests {
 		let later = blocks.create();
 		blocks.tick(2, |_| 0, |_| 1);
 		assert!(blocks.finalize(later));
-		blocks.tick(2, |_| 1, |_| 1);
-		blocks.tick(2, |ordinal| u16::from(ordinal == head), |_| 1);
+		assert!(blocks.retirement_batch().is_none());
 		assert!(blocks.finalize(head));
-		blocks.tick(2, |ordinal| u16::from(ordinal == head), |_| 1);
-		blocks.tick(2, |_| 0, |_| 1);
 
 		assert_eq!(blocks.retirement_batch(), Some(0..2));
 		blocks.mark_committed(2);
@@ -585,6 +539,28 @@ mod tests {
 		assert_eq!(blocks.phase(head), Some(BlockPhase::Committed));
 		assert_eq!(blocks.phase(later), Some(BlockPhase::Committed));
 		assert!(blocks.retirement_batch().is_none());
+	}
+
+	#[test]
+	fn reset_retirement_reopens_the_committed_prefix_for_replay() {
+		let mut blocks = Blocks::new();
+		let first = blocks.create();
+		let second = blocks.create();
+		blocks.tick(2, |_| 0, |_| 1);
+		assert!(blocks.finalize(first));
+		blocks.mark_committed(1);
+		assert_eq!(blocks.live_count(), 1);
+
+		blocks.reset_retirement();
+		assert_eq!(blocks.frontier(), 0);
+		assert_eq!(blocks.live_count(), 2);
+		assert_eq!(blocks.phase(first), Some(BlockPhase::FinalizedPending));
+		assert_eq!(blocks.phase(second), Some(BlockPhase::Active));
+		// The replayed prefix retires in the original order, stopping at the
+		// still-active successor.
+		assert_eq!(blocks.retirement_batch(), Some(0..1));
+		blocks.mark_committed(1);
+		assert_eq!(blocks.frontier(), 1);
 	}
 
 	#[test]
@@ -663,8 +639,6 @@ mod tests {
 		for ordinal in outcomes.into_iter().rev() {
 			assert!(blocks.finalize(ordinal));
 		}
-		blocks.tick(3, |_| 1, |_| 1);
-		blocks.tick(3, |_| 0, |_| 1);
 		assert_eq!(blocks.retirement_batch(), Some(0..3));
 	}
 
@@ -680,7 +654,6 @@ mod tests {
 	#[derive(Clone, Copy)]
 	struct ReferenceRecord {
 		phase: BlockPhase,
-		ready: bool,
 	}
 
 	#[derive(Default)]
@@ -694,42 +667,31 @@ mod tests {
 			let ordinal = BlockOrdinal(self.records.len() as u64);
 			self
 				.records
-				.push(ReferenceRecord { phase: BlockPhase::Queued, ready: false });
+				.push(ReferenceRecord { phase: BlockPhase::Queued });
 			ordinal
 		}
 
 		fn finalize(&mut self, ordinal: BlockOrdinal) -> bool {
 			let record = &mut self.records[ordinal.0 as usize];
 			match record.phase {
-				BlockPhase::Queued => {
+				BlockPhase::Queued | BlockPhase::Active => {
 					record.phase = BlockPhase::FinalizedPending;
-					record.ready = true;
-					true
-				},
-				BlockPhase::Active => {
-					record.phase = BlockPhase::FinalizedPending;
-					record.ready = false;
 					true
 				},
 				BlockPhase::FinalizedPending | BlockPhase::Committed => false,
 			}
 		}
 
-		fn apply_tick(&mut self, plan: &Plan, sampled: &[u16]) {
+		fn apply_tick(&mut self, plan: &Plan) {
 			for ordinal in &plan.admitted {
 				self.records[ordinal.0 as usize].phase = BlockPhase::Active;
-			}
-			for (index, record) in self.records.iter_mut().enumerate() {
-				if record.phase == BlockPhase::FinalizedPending && sampled[index] == 0 {
-					record.ready = true;
-				}
 			}
 		}
 
 		fn retirement_batch(&self) -> Option<Range<u64>> {
 			let mut end = self.frontier;
 			while let Some(record) = self.records.get(end as usize) {
-				if record.phase != BlockPhase::FinalizedPending || !record.ready {
+				if record.phase != BlockPhase::FinalizedPending {
 					break;
 				}
 				end += 1;
@@ -809,7 +771,7 @@ mod tests {
 					|ordinal| sampled[ordinal.0 as usize],
 					|ordinal| 1 + ((ordinal.0 as u16).wrapping_add(lag) % 6),
 				);
-				reference.apply_tick(&plan, &sampled);
+				reference.apply_tick(&plan);
 				let target_sum = plan.targets.iter().map(|target| u32::from(target.height)).sum::<u32>();
 				prop_assert!(target_sum <= u32::from(h_live));
 				if let Some(overflow) = &plan.overflow {
@@ -821,14 +783,9 @@ mod tests {
 				}
 				for target in &plan.targets {
 					let phase = blocks.phase(target.ordinal).expect("planned ordinal");
-					prop_assert!(matches!(phase, BlockPhase::Active | BlockPhase::FinalizedPending));
-					if plan.overflow.is_none() && phase == BlockPhase::Active {
+					prop_assert!(phase == BlockPhase::Active);
+					if plan.overflow.is_none() {
 						prop_assert!(target.height >= 1);
-					}
-					if phase == BlockPhase::FinalizedPending
-						&& blocks.record(target.ordinal).expect("record").bridge == BridgeStage::Exited
-					{
-						prop_assert_eq!(target.height, 0);
 					}
 					last_targets[target.ordinal.0 as usize] = target.height;
 				}

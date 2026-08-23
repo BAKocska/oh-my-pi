@@ -48,15 +48,15 @@ pub use image_overlay::{ImageOverlay, ImageOverlayEvent};
 pub use inspector::{HistoryInspector, HistoryInspectorEvent};
 use omp_core::Str;
 use omp_proto::omp::ui::v1;
-pub use omp_tui::components::Attachment;
+pub use omp_tui::components::{Attachment, ComposerStyle};
 pub use overlays::{ListPicker, ListRow, OverlayPanel, PromptEvent, PromptOverlay, panel_divider};
 pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
 pub use picker::{ModelPicker, PickerEvent};
 pub use provider_picker::ProviderPicker;
 pub use pty::{PtyEvent, PtyOutputQueue, PtyOverlay, PtyStatus, TerminalState};
 pub use scene::{
-	Chat, ChatKey, FinalSnapshotRef, LiveVoiceAction, LiveVoicePhase, LiveVoiceVisualizer,
-	RetirementBatch, ToolPresentation, ViewportFrame,
+	Chat, ChatKey, LiveVoiceAction, LiveVoicePhase, LiveVoiceVisualizer, RetirementBatch,
+	ToolPresentation, ViewportFrame,
 };
 pub use selection_overlay::{SelectionEvent, SelectionOverlay, SelectionPurpose};
 pub use settings_overlay::{SettingChange, SettingsEvent, SettingsOverlay};
@@ -320,8 +320,8 @@ pub struct StatusFacts {
 	pub cwd:                    Option<Str>,
 	/// Active worktree label when distinct from `cwd`.
 	pub worktree:               Option<Str>,
-	/// Effective thinking level or ceiling.
-	pub thinking:               Option<Str>,
+	/// Effective reasoning effort rendered as the model-segment glyph.
+	pub thinking:               Option<ThinkingLevel>,
 	/// Number of active hook facts.
 	pub hooks:                  usize,
 	/// Number of active durable tasks.
@@ -330,8 +330,6 @@ pub struct StatusFacts {
 	pub collab_peers:           usize,
 	/// Opaque account-override display label; never a credential.
 	pub account_override:       Option<Str>,
-	/// Stable session accent seed.
-	pub session_accent:         Option<Str>,
 	/// One-shot quota-reset edge emitted by the provider usage authority.
 	pub quota_reset:            bool,
 	/// Disable non-essential retained animation.
@@ -340,6 +338,22 @@ pub struct StatusFacts {
 	pub layout:                 StatusLayout,
 	/// Separator used between visible status segments.
 	pub separator:              StatusSeparator,
+}
+/// Reasoning effort represented by the model-status glyph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThinkingLevel {
+	/// Minimal reasoning effort.
+	Minimal,
+	/// Low reasoning effort.
+	Low,
+	/// Medium reasoning effort.
+	Medium,
+	/// High reasoning effort.
+	High,
+	/// Extra-high reasoning effort.
+	Xhigh,
+	/// Maximum reasoning effort.
+	Max,
 }
 /// Responsive status-segment shedding policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -746,6 +760,8 @@ pub enum BackendEvent {
 	Status(StatusFacts),
 	/// Preview a parsed theme without committing settings.
 	ThemePreview(omp_tui::Theme),
+	/// Replace the composer's live chrome without reconstructing the chat.
+	ComposerStyleChanged(ComposerStyle),
 	/// Update tiny-title model download activity.
 	ModelDownloadProgress(ModelDownloadProgress),
 	/// Start realtime voice composer takeover.

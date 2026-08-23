@@ -44,13 +44,13 @@ use crate::{
 #[strum(serialize_all = "lowercase")]
 pub enum ComposerStyle {
 	/// Rounded frame with the status embedded in its top edge.
-	#[default]
 	Box,
 	/// Full-width rules, a prompt gutter, and a right-docked status chip.
 	Claude,
 	/// Rounded frame with a `> ` gutter and a scrollbar in the right edge.
 	Pi,
-	/// Prompt gutter without any surrounding chrome.
+	/// Unboxed prompt with a single curved left cue and a status strip above it.
+	#[default]
 	Borderless,
 	/// One status-bearing rule above the input.
 	Rule,
@@ -75,30 +75,33 @@ pub enum ComposerStatusAttachment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComposerLayout {
 	/// Rows above the editable content.
-	pub top_rows:          u16,
+	pub top_rows:            u16,
 	/// Rows below the editable content.
-	pub bottom_rows:       u16,
+	pub bottom_rows:         u16,
 	/// Horizontal padding between the gutter/text and side chrome.
-	pub horizontal_pad:    u16,
+	pub horizontal_pad:      u16,
 	/// Chrome cells consumed on each side, excluding the prompt gutter.
-	pub side_chrome:       u16,
+	pub side_chrome:         u16,
 	/// Visible cells consumed by the first-row prompt gutter.
-	pub gutter_width:      u16,
+	pub gutter_width:        u16,
 	/// Status attachment used by the host scene.
-	pub status_attachment: ComposerStatusAttachment,
+	pub status_attachment:   ComposerStatusAttachment,
 	/// Whether the primary status line owns a separate row.
-	pub status_placement:  StatusPlacement,
+	pub status_placement:    StatusPlacement,
 	/// Context presentation appropriate for this status placement.
-	pub context_gauge:     ContextGaugeMode,
+	pub context_gauge:       ContextGaugeMode,
 	/// Whether a blank row separates the input from standalone status.
-	pub status_gap:        bool,
+	pub status_gap:          bool,
+	/// Whether a standalone status row precedes the editable content.
+	pub status_before_input: bool,
 }
 
 impl ComposerStyle {
 	/// Resolves row chrome and status placement for `charset`.
 	pub const fn layout(self, _charset: Charset) -> ComposerLayout {
 		let gutter_width = match self {
-			Self::Claude | Self::Borderless | Self::Rule | Self::Pi => 2,
+			Self::Claude | Self::Rule | Self::Pi => 2,
+			Self::Borderless => 3,
 			Self::Box | Self::Field | Self::Rail => 0,
 		};
 		let (top_rows, bottom_rows, horizontal_pad, side_chrome) = match self {
@@ -127,6 +130,7 @@ impl ComposerStyle {
 			ContextGaugeMode::Numeric
 		};
 		let status_gap = matches!(self, Self::Rule | Self::Field | Self::Rail);
+		let status_before_input = matches!(self, Self::Borderless);
 		ComposerLayout {
 			top_rows,
 			bottom_rows,
@@ -137,13 +141,18 @@ impl ComposerStyle {
 			status_placement,
 			context_gauge,
 			status_gap,
+			status_before_input,
 		}
 	}
 
 	/// Prompt gutter for the first editable row.
 	pub const fn prompt_gutter(self, charset: Charset) -> &'static str {
 		match self {
-			Self::Claude | Self::Borderless | Self::Rule => charset.cursor(),
+			Self::Claude | Self::Rule => charset.cursor(),
+			Self::Borderless => match charset {
+				Charset::Ascii => "+- ",
+				Charset::Unicode | Charset::NerdFont => "╰─ ",
+			},
 			Self::Pi => "> ",
 			Self::Box | Self::Field | Self::Rail => "",
 		}
@@ -590,7 +599,7 @@ impl Component for EditInput {
 		let composer = self
 			.editor
 			.input_height_for(input_width)
-			.max(4)
+			.max(1)
 			.saturating_add(chrome.top_rows)
 			.saturating_add(chrome.bottom_rows)
 			.min(18);
@@ -607,7 +616,7 @@ impl Component for EditInput {
 		let atoms = self.editor.atom_ranges();
 		let layout = self.style.layout(pc.ctx.charset);
 		let input_width = self.text_width(rect.width, pc.ctx.charset);
-		let minimum_composer = 4_u16
+		let minimum_composer = 1_u16
 			.saturating_add(layout.top_rows)
 			.saturating_add(layout.bottom_rows);
 		let picker_height = self
@@ -1724,6 +1733,7 @@ impl Component for EditorPane {
 	fn place(&mut self, ctx: &UiContext, rect: Rect) {
 		self.sync_attachments();
 		let band = self.band_rows();
+		let layout = self.style.layout(ctx.charset);
 		let status_height = if self.has_status {
 			self.style.standalone_status_rows()
 		} else {
@@ -1733,16 +1743,25 @@ impl Component for EditorPane {
 			.height
 			.saturating_sub(band)
 			.saturating_sub(status_height);
-		let editor_y = rect.y.saturating_add(band);
+		let editor_y = rect
+			.y
+			.saturating_add(band)
+			.saturating_add(if layout.status_before_input {
+				status_height
+			} else {
+				0
+			});
 		self.children[0].place(ctx, Rect::new(rect.x, editor_y, rect.width, editor_height));
 		if self.has_status {
 			let status = &mut self.children[1];
 			let _ = status.measure(ctx);
 			let _ = status.height(ctx, rect.width);
-			status.place(
-				ctx,
-				Rect::new(rect.x, editor_y, rect.width, editor_height.saturating_add(status_height)),
-			);
+			let status_rect = if layout.status_before_input {
+				Rect::new(rect.x, rect.y.saturating_add(band), rect.width, status_height)
+			} else {
+				Rect::new(rect.x, editor_y, rect.width, editor_height.saturating_add(status_height))
+			};
+			status.place(ctx, status_rect);
 		}
 		self.band =
 			Rect::new(rect.x, rect.y, rect.width, if band > 0 { PREVIEW_BOX_ROWS } else { 0 });
@@ -2101,7 +2120,7 @@ mod tests {
 			(ComposerStyle::Box, (1, 1, 2, 3, 0, ComposerStatusAttachment::TopBorder)),
 			(ComposerStyle::Claude, (1, 1, 0, 0, 2, ComposerStatusAttachment::TopRuleChip)),
 			(ComposerStyle::Pi, (1, 1, 1, 2, 2, ComposerStatusAttachment::Standalone)),
-			(ComposerStyle::Borderless, (0, 0, 0, 0, 2, ComposerStatusAttachment::Standalone)),
+			(ComposerStyle::Borderless, (0, 0, 0, 0, 3, ComposerStatusAttachment::Standalone)),
 			(ComposerStyle::Rule, (1, 0, 0, 0, 2, ComposerStatusAttachment::TopRuleChip)),
 			(ComposerStyle::Field, (0, 0, 1, 2, 0, ComposerStatusAttachment::Standalone)),
 			(ComposerStyle::Rail, (0, 0, 1, 2, 0, ComposerStatusAttachment::Standalone)),
@@ -2127,7 +2146,9 @@ mod tests {
 				assert_eq!(layout.status_placement, StatusPlacement::Standalone);
 				assert_eq!(layout.context_gauge, ContextGaugeMode::Numeric);
 			}
+			assert_eq!(layout.status_before_input, style == ComposerStyle::Borderless);
 		}
+		assert_eq!(ComposerStyle::default(), ComposerStyle::Borderless);
 	}
 
 	#[test]
@@ -2164,7 +2185,7 @@ mod tests {
 		);
 
 		let borderless = render(ComposerStyle::Borderless);
-		assert!(frame_row_text(borderless.frame(), 0).starts_with("❯ hello"));
+		assert!(frame_row_text(borderless.frame(), 0).starts_with("╰─ hello"));
 
 		let rule = render(ComposerStyle::Rule);
 		assert_eq!(frame_row_text(rule.frame(), 0), "─".repeat(20));
@@ -2257,9 +2278,9 @@ mod tests {
 			.copied()
 			.expect("editor press target");
 
-		ui.handle_mouse(hit.rect.x + 2, hit.rect.y, Mouse::Click);
-		ui.handle_mouse(hit.rect.x + 7, hit.rect.y, Mouse::Drag);
-		ui.handle_mouse(hit.rect.x + 7, hit.rect.y, Mouse::Release);
+		ui.handle_mouse(hit.rect.x + 3, hit.rect.y, Mouse::Click);
+		ui.handle_mouse(hit.rect.x + 8, hit.rect.y, Mouse::Drag);
+		ui.handle_mouse(hit.rect.x + 8, hit.rect.y, Mouse::Release);
 		let selected = ui
 			.root()
 			.comp()
@@ -2269,8 +2290,8 @@ mod tests {
 			.selected_text();
 		assert_eq!(selected, Some("hello"));
 
-		ui.handle_mouse(hit.rect.x + 8, hit.rect.y, Mouse::Click);
-		ui.handle_mouse(hit.rect.x + 8, hit.rect.y, Mouse::Click);
+		ui.handle_mouse(hit.rect.x + 9, hit.rect.y, Mouse::Click);
+		ui.handle_mouse(hit.rect.x + 9, hit.rect.y, Mouse::Click);
 		let selected = ui
 			.root()
 			.comp()
@@ -2540,7 +2561,7 @@ mod tests {
 	fn editor_status_embeds_in_rounded_top_border() {
 		let ctx = UiContext { charset: Charset::NerdFont, ..UiContext::default() };
 		let mut editor = Cached::new(Box::new(
-			EditorPane::new().status(
+			EditorPane::new().composer_style(ComposerStyle::Box).status(
 				Status::new()
 					.with(Prop::Bg, "yellow")
 					.segment(Segment::new().label("ready")),
@@ -2561,27 +2582,30 @@ mod tests {
 	}
 
 	#[test]
-	fn borderless_composer_has_prompt_gutter_without_chrome_rows() {
+	fn borderless_composer_places_status_above_one_curved_prompt() {
 		let ctx = UiContext { charset: Charset::NerdFont, ..UiContext::default() };
 		let mut editor = Cached::new(Box::new(
 			EditorPane::new()
 				.composer_style(ComposerStyle::Borderless)
-				.with(Prop::Value, "body"),
+				.with(Prop::Value, "body")
+				.status(Status::new().segment(Segment::new().label("ready"))),
 		));
 		let height = editor.height(&ctx, 20);
+		assert_eq!(height, 2);
 		editor.place(&ctx, Rect::new(0, 0, 20, height));
 		let mut frame = Frame::new(Size::new(20, height));
 		let mut hits = Vec::new();
 		editor.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
 
-		assert!(frame_row_text(&frame, 0).contains("body"));
+		assert!(frame_row_text(&frame, 0).contains("ready"));
+		assert!(frame_row_text(&frame, 1).starts_with("╰─ body"));
 		for row in 0..height {
 			let text = frame_row_text(&frame, row);
 			assert!(
 				!text
 					.chars()
-					.any(|glyph| matches!(glyph, '╭' | '╮' | '╰' | '╯' | '│' | '─')),
-				"unexpected editor border on row {row}: {text}",
+					.any(|glyph| matches!(glyph, '╭' | '╮' | '╯' | '│')),
+				"unexpected enclosing editor border on row {row}: {text}",
 			);
 		}
 	}
@@ -2945,13 +2969,15 @@ mod tests {
 			UiContext::default(),
 		);
 		ui.focus_first();
-		let base = ui.height();
 
 		// An existing image path inserts as text instead of staging an
 		// attachment (Ctrl+Shift+V contract: verbatim insertion).
 		let path_text = path.to_str().expect("temp path is UTF-8").to_owned();
 		ui.handle_paste_raw(&path_text);
-		assert_eq!(ui.height(), base, "no attachment band appears");
+		assert!(
+			editor_pane(&ui).attachments.is_empty(),
+			"raw paste must not stage an attachment card"
+		);
 		assert_eq!(
 			ui.values().get("composer").and_then(Value::as_str),
 			Some(path_text.as_str()),
@@ -2976,7 +3002,7 @@ mod tests {
 		// “single-line”; inline multiline content must still grow the editor.
 		assert_eq!(
 			ui.height(),
-			14,
+			13,
 			"verbatim multiline text grows the inline editor without adding the seven-row chip band"
 		);
 		assert!(

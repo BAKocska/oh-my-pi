@@ -28,8 +28,8 @@ use smallvec::SmallVec;
 
 use crate::{
 	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, ModelDownloadProgress,
-	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, TranscriptFrame,
-	TranscriptFrameKind,
+	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, ThinkingLevel,
+	TranscriptFrame, TranscriptFrameKind,
 	blocks::{BlockOrdinal, Blocks},
 	frame::{FrameError, FrameMutation, RetainedFrames, render_frame_tml},
 	slots::{Mount, Slots},
@@ -56,6 +56,9 @@ const LIVE_TOOL_CARD_ID: &str = "live-tool-card";
 
 const LIVE_VOICE_ROWS: u16 = 4;
 const LIVE_VOICE_FRAME: Duration = Duration::from_millis(50);
+/// Memory bound on live (uncommitted) blocks: reaching it forces retirement
+/// offers even while the screen still has room. Matches pi's transcript cap.
+const MAX_LIVE_BLOCKS: u64 = 256;
 
 /// Provider phase displayed while realtime voice owns the composer.
 #[derive(Clone, Copy, Debug, Default, Eq, IntoStaticStr, PartialEq)]
@@ -758,37 +761,26 @@ struct LiveTool {
 	expanded:          bool,
 	view:              ToolView,
 	images:            Vec<ToolImageEntry>,
-	finalized:         bool,
-	final_ok:          bool,
 	card_ui:           Ui,
 	target_height:     u16,
 	target_changed_at: Duration,
 	body_folded:       bool,
 }
-/// Immutable handle to one finalized semantic snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FinalSnapshotRef(
-	/// Snapshot block ordinal.
-	pub BlockOrdinal,
-);
-
 /// Normalized live tool model consumed by the active-stack renderer.
 #[derive(Clone, Debug)]
 pub struct ToolPresentation {
 	/// Stable tool call identity.
-	pub id:             Str,
+	pub id:        Str,
 	/// Human-readable tool name.
-	pub name:           Str,
+	pub name:      Str,
 	/// Stable operation description.
-	pub intent:         Str,
+	pub intent:    Str,
 	/// Latest one-line semantic progress.
-	pub activity:       Str,
+	pub activity:  Str,
 	/// Optional compact status badge.
-	pub badge:          Option<Str>,
+	pub badge:     Option<Str>,
 	/// Current bounded live body.
-	pub live_body:      Str,
-	/// Frozen final snapshot handle once finalized.
-	pub final_snapshot: Option<FinalSnapshotRef>,
+	pub live_body: Str,
 }
 
 impl LiveTool {
@@ -808,7 +800,6 @@ impl LiveTool {
 			activity,
 			badge: Some(self.rev.clone()),
 			live_body: self.view.source.clone(),
-			final_snapshot: self.finalized.then_some(FinalSnapshotRef(self.ordinal)),
 		}
 	}
 }
@@ -887,7 +878,6 @@ struct StatusLabels {
 	context:  Option<(Str, bool)>,
 	velocity: Option<Str>,
 	cwd:      Option<Str>,
-	thinking: Option<Str>,
 	slots:    SmallVec<Str, 5>,
 	hooks:    Option<Str>,
 	tasks:    Option<Str>,
@@ -901,12 +891,12 @@ struct StatusLabels {
 
 impl StatusLabels {
 	fn new(facts: &StatusFacts, charset: Charset) -> Self {
-		let mut model = fmts_mut!("{} {}", charset.icon(Icon::Model), facts.model);
+		let icon = facts
+			.thinking
+			.map_or_else(|| charset.icon(Icon::Model), |level| thinking_glyph(charset, level));
+		let mut model = fmts_mut!("{icon} {}", facts.model);
 		if let Some(advisor) = &facts.advisor_model {
 			let _ = write!(model, " {} {advisor}", charset.icon(Icon::Advisor));
-		}
-		if let Some(accent) = &facts.session_accent {
-			let _ = write!(model, " · {accent}");
 		}
 		let activity = facts
 			.live_activity
@@ -942,10 +932,6 @@ impl StatusLabels {
 				.cwd
 				.as_ref()
 				.map(|cwd| fmts_mut!("cwd {cwd}").freeze()),
-			thinking: facts
-				.thinking
-				.as_ref()
-				.map(|thinking| fmts_mut!("think {thinking}").freeze()),
 			slots: facts
 				.visible_slots
 				.iter()
@@ -983,7 +969,6 @@ impl StatusLabels {
 			&mut self.git,
 			&mut self.velocity,
 			&mut self.cwd,
-			&mut self.thinking,
 			&mut self.hooks,
 			&mut self.tasks,
 			&mut self.collab,
@@ -1004,6 +989,22 @@ impl StatusLabels {
 			*text = separated(text, separator, charset);
 		}
 	}
+}
+
+fn thinking_glyph(charset: Charset, level: ThinkingLevel) -> &'static str {
+	let icon = match level {
+		ThinkingLevel::Minimal => Icon::Minimal,
+		ThinkingLevel::Low => Icon::Low,
+		ThinkingLevel::Medium => Icon::Medium,
+		ThinkingLevel::High => Icon::High,
+		ThinkingLevel::Xhigh => Icon::Xhigh,
+		ThinkingLevel::Max => Icon::Max,
+	};
+	charset
+		.icon(icon)
+		.split_whitespace()
+		.next()
+		.unwrap_or_default()
 }
 
 fn bracketed(text: &str) -> Str {
@@ -1154,15 +1155,6 @@ impl ChatStatus {
 				);
 			}
 		}
-		if facts.layout != StatusLayout::Minimal
-			&& let Some(thinking) = &work.labels.thinking
-		{
-			status = status.segment(
-				Segment::new()
-					.label(thinking.clone())
-					.with(Prop::Fg, self.theme.info),
-			);
-		}
 		if facts.layout != StatusLayout::Minimal {
 			for label in &work.labels.slots {
 				status = status.segment(
@@ -1276,7 +1268,6 @@ impl ChatStatus {
 			|| facts.git.is_some()
 			|| facts.tokens_per_second.is_some()
 			|| facts.cwd.is_some()
-			|| facts.thinking.is_some()
 			|| !facts.visible_slots.is_empty()
 			|| facts.hooks > 0
 			|| facts.tasks > 0
@@ -1438,6 +1429,19 @@ impl Component for ChatStatus {
 	}
 }
 
+/// Per-frame chrome row budget shared by rendering and retirement pressure.
+#[derive(Clone, Copy, Debug, Default)]
+struct ChromeLayout {
+	editor_height: u16,
+	editor_y:      u16,
+	title_y:       u16,
+	working_y:     u16,
+	error_rows:    u16,
+	download_rows: u16,
+	/// Rows available to the live transcript region.
+	h_live:        u16,
+}
+
 /// Immediate-mode designed chat scene driven entirely by host data.
 pub struct Chat {
 	started_at:              Instant,
@@ -1449,13 +1453,16 @@ pub struct Chat {
 	work:                    Rc<RefCell<WorkState>>,
 	session_title:           Str,
 	blocks:                  Blocks,
-	pending:                 BTreeMap<BlockOrdinal, Entry>,
+	/// Finalized semantic snapshots by ordinal. Snapshots at or past the
+	/// commit frontier are settled (viewport-resident); earlier ones are
+	/// retained so a display replay can re-retire them at a new width.
+	entries:                 BTreeMap<BlockOrdinal, Entry>,
 	last_viewport:           Size,
 	last_editor_height:      u16,
 	frame:                   Frame,
-	assistant_scratch:       Frame,
+	clip_scratch:            Frame,
 	live_assistant:          Option<LiveAssistant>,
-	exiting_assistant:       Option<LiveAssistant>,
+	live_layout:             SmallVec<(BlockOrdinal, u16, u16), 8>,
 	live_tools:              Vec<LiveTool>,
 	live_revision:           u64,
 	drawn_live:              u64,
@@ -1494,7 +1501,6 @@ impl Chat {
 			.composer_style(style)
 			.with(Prop::Id, INPUT_ID)
 			.with(Prop::Submit, true)
-			.with(Prop::Placeholder, "Ask anything…")
 			.status(ChatStatus::new(Rc::clone(&work), ctx.charset, ctx.theme, style));
 		let attachments = pane.attachments();
 		let mut editor_ui = Ui::from_root(pane, 0, ctx.clone());
@@ -1509,13 +1515,13 @@ impl Chat {
 			work,
 			session_title: Str::default(),
 			blocks: Blocks::new(),
-			pending: BTreeMap::new(),
+			entries: BTreeMap::new(),
 			last_viewport: Size::new(0, 0),
 			last_editor_height: 0,
 			frame: Frame::new(Size::new(0, 0)),
-			assistant_scratch: Frame::new(Size::new(0, 0)),
+			clip_scratch: Frame::new(Size::new(0, 0)),
 			live_assistant: None,
-			exiting_assistant: None,
+			live_layout: SmallVec::new(),
 			live_tools: Vec::new(),
 			live_revision: 0,
 			drawn_live: 0,
@@ -1725,31 +1731,25 @@ impl Chat {
 	/// Routes a viewport-space mouse report into the composer.
 	pub fn handle_mouse(&mut self, report: &MouseReport) {
 		if report.kind == omp_tui::Mouse::Click {
-			let mut y = self
-				.live_assistant
-				.as_ref()
-				.map_or(0, |assistant| assistant.allocation)
-				.saturating_add(
-					self
-						.exiting_assistant
-						.as_ref()
-						.map_or(0, |assistant| assistant.allocation),
-				);
-			for tool in &mut self.live_tools {
-				let height = tool.card_ui.height();
-				if report.row == y && height > 0 {
-					tool.expanded = !tool.expanded;
-					if tool.expanded && tool.body_folded {
-						tool.body_folded = false;
-						tool
-							.card_ui
-							.update_component::<ToolCard>(LIVE_TOOL_CARD_ID, |card| {
-								card.set_folded(false)
-							});
-					}
-					return;
+			let hit = self
+				.live_layout
+				.iter()
+				.find(|(_, top, height)| report.row == *top && *height > 0)
+				.map(|(ordinal, ..)| *ordinal);
+			if let Some(ordinal) = hit
+				&& let Some(tool) = self
+					.live_tools
+					.iter_mut()
+					.find(|tool| tool.ordinal == ordinal)
+			{
+				tool.expanded = !tool.expanded;
+				if tool.expanded && tool.body_folded {
+					tool.body_folded = false;
+					tool
+						.card_ui
+						.update_component::<ToolCard>(LIVE_TOOL_CARD_ID, |card| card.set_folded(false));
 				}
-				y = y.saturating_add(height);
+				return;
 			}
 		}
 		let rows = self.composer_rows();
@@ -1888,17 +1888,16 @@ impl Chat {
 					let elapsed =
 						elapsed_label(self.started_at.elapsed().saturating_sub(message.started));
 					let body = RichText::new(body, Self::message_width(self.layout_width), &self.ctx);
-					self.pending.insert(
+					self.entries.insert(
 						message.ordinal,
 						Entry::Thinking(ThinkingEntry { body, elapsed, expanded: false }),
 					);
 				}
 			} else {
 				let body = RichText::new(body, Self::message_width(self.layout_width), &self.ctx);
-				self.pending.insert(message.ordinal, Entry::Assistant(body));
+				self.entries.insert(message.ordinal, Entry::Assistant(body));
 			}
 			self.blocks.finalize(message.ordinal);
-			self.exiting_assistant = Some(message);
 			self.bump_live();
 		}
 	}
@@ -1908,10 +1907,10 @@ impl Chat {
 	/// transcript truth.
 	pub fn toggle_latest_thinking(&mut self) {
 		if let Some(thinking) = self
-			.pending
-			.values_mut()
+			.entries
+			.range_mut(BlockOrdinal(self.blocks.frontier())..)
 			.rev()
-			.find_map(|entry| match entry {
+			.find_map(|(_, entry)| match entry {
 				Entry::Thinking(thinking) => Some(thinking),
 				_ => None,
 			}) {
@@ -1960,8 +1959,6 @@ impl Chat {
 				&self.ctx,
 			),
 			images: Vec::new(),
-			finalized: false,
-			final_ok: false,
 			card_ui,
 			target_height: 0,
 			target_changed_at: self.started_at.elapsed(),
@@ -1976,7 +1973,7 @@ impl Chat {
 		if let Some(tool) = self
 			.live_tools
 			.iter_mut()
-			.find(|tool| !tool.finalized && tool.id.as_str() == id)
+			.find(|tool| tool.id.as_str() == id)
 		{
 			tool.view.append_plain(chunk, &ctx);
 			Self::refresh_live_tool_card(tool, self.layout_width.max(1), &ctx);
@@ -1990,7 +1987,7 @@ impl Chat {
 		if let Some(tool) = self
 			.live_tools
 			.iter_mut()
-			.find(|tool| !tool.finalized && tool.id.as_str() == id)
+			.find(|tool| tool.id.as_str() == id)
 		{
 			tool.view.replace(view, &ctx);
 			Self::refresh_live_tool_card(tool, self.layout_width.max(1), &ctx);
@@ -2013,7 +2010,7 @@ impl Chat {
 		if let Some(tool) = self
 			.live_tools
 			.iter_mut()
-			.find(|tool| !tool.finalized && tool.id.as_str() == id)
+			.find(|tool| tool.id.as_str() == id)
 		{
 			tool.images.push(ToolImageEntry { source, px });
 			Self::refresh_live_tool_card(tool, self.layout_width.max(1), &ctx);
@@ -2023,16 +2020,16 @@ impl Chat {
 
 	/// Finalizes a matching live tool card with its terminal branch and view.
 	pub fn tool_finished(&mut self, id: &str, ok: bool, view: Str) {
-		if let Some(tool) = self
+		if let Some(index) = self
 			.live_tools
-			.iter_mut()
-			.find(|tool| !tool.finalized && tool.id.as_str() == id)
+			.iter()
+			.position(|tool| tool.id.as_str() == id)
 		{
+			let tool = self.live_tools.remove(index);
 			let ordinal = tool.ordinal;
 			let name = tool.name.clone();
 			let width = tool.view.width;
 			let images = tool.images.clone();
-			tool.view.replace(view.clone(), &self.ctx);
 			let icon = if ok {
 				self.ctx.charset.check()
 			} else {
@@ -2047,10 +2044,7 @@ impl Chat {
 				view: ToolView::structured(view, width, &self.ctx),
 				images,
 			};
-			tool.finalized = true;
-			tool.final_ok = ok;
-			Self::refresh_live_tool_card(tool, self.layout_width.max(1), &self.ctx);
-			self.pending.insert(ordinal, Entry::Tool(entry));
+			self.entries.insert(ordinal, Entry::Tool(entry));
 			self.blocks.finalize(ordinal);
 			self.bump_live();
 		}
@@ -2165,7 +2159,7 @@ impl Chat {
 				status.set_theme(theme);
 				true
 			});
-		for entry in &mut self.pending.values_mut() {
+		for entry in &mut self.entries.values_mut() {
 			restyle_entry(entry, &context);
 		}
 		for tool in &mut self.live_tools {
@@ -2264,12 +2258,12 @@ impl Chat {
 	/// Restores a prompt that the backend dropped before committing its first
 	/// turn, without overwriting a draft started while cancellation settled.
 	pub fn restore_dropped_prompt(&mut self, text: Str, attachments: Vec<Attachment>) {
-		if let Some(index) = self.pending.values().rposition(
+		if let Some(index) = self.entries.values().rposition(
 			|entry| matches!(entry, Entry::User(user) if user.body.text.as_str() == text.as_str()),
 		) {
-			let ordinal = *self.pending.keys().nth(index).expect("pending index");
+			let ordinal = *self.entries.keys().nth(index).expect("entries index");
 			self
-				.pending
+				.entries
 				.insert(ordinal, Entry::Notice { text: Str::default(), error: false });
 			self.bump_live();
 		}
@@ -2299,13 +2293,13 @@ impl Chat {
 		let mut attachments = Vec::new();
 		for prompt in prompts {
 			if let Some(index) = self
-				.pending
+				.entries
 				.values()
 				.rposition(|entry| matches!(entry, Entry::User(user) if user.body.text == prompt.text))
 			{
-				let ordinal = *self.pending.keys().nth(index).expect("pending index");
+				let ordinal = *self.entries.keys().nth(index).expect("entries index");
 				self
-					.pending
+					.entries
 					.insert(ordinal, Entry::Notice { text: Str::default(), error: false });
 			}
 			if !queued.is_empty() {
@@ -2327,7 +2321,7 @@ impl Chat {
 	/// finalized rewind marker.
 	pub fn rewind_user(&mut self, user_index: usize, text: &str) -> bool {
 		let selected = self
-			.pending
+			.entries
 			.iter()
 			.filter(|(_, entry)| matches!(entry, Entry::User(_)))
 			.nth(user_index)
@@ -2337,7 +2331,7 @@ impl Chat {
 			})
 			.or_else(|| {
 				self
-					.pending
+					.entries
 					.iter()
 					.find_map(|(ordinal, entry)| match entry {
 						Entry::User(user) if user.body.text == text => Some(*ordinal),
@@ -2346,11 +2340,11 @@ impl Chat {
 			});
 		let matched = selected.is_some();
 		if let Some(selected) = selected {
-			for (_, entry) in self.pending.range_mut(selected..) {
+			for (_, entry) in self.entries.range_mut(selected..) {
 				*entry = Entry::Notice { text: Str::default(), error: false };
 			}
 		} else {
-			for entry in self.pending.values_mut() {
+			for entry in self.entries.values_mut() {
 				*entry = Entry::Notice { text: Str::default(), error: false };
 			}
 		}
@@ -2366,25 +2360,14 @@ impl Chat {
 		let reason = reason.into_str();
 		if let Some(assistant) = self.live_assistant.take() {
 			self
-				.pending
+				.entries
 				.insert(assistant.ordinal, Entry::Notice { text: reason.clone(), error: true });
 			self.blocks.finalize(assistant.ordinal);
 		}
-		if let Some(assistant) = self.exiting_assistant.take() {
-			if !self.pending.contains_key(&assistant.ordinal) {
-				self
-					.pending
-					.insert(assistant.ordinal, Entry::Notice { text: reason.clone(), error: true });
-			}
-			self.blocks.finalize(assistant.ordinal);
-		}
 		for tool in self.live_tools.drain(..) {
-			if tool.finalized {
-				continue;
-			}
 			let label = sf!("{}@{} · {reason}", tool.name, tool.rev);
 			self
-				.pending
+				.entries
 				.insert(tool.ordinal, Entry::Notice { text: label, error: true });
 			self.blocks.finalize(tool.ordinal);
 		}
@@ -2394,11 +2377,11 @@ impl Chat {
 	/// Drops every uncommitted snapshot, clears live state, and appends a
 	/// finalized history-cleared divider. Native history is unaffected.
 	pub fn clear_history(&mut self) {
-		for entry in self.pending.values_mut() {
+		for entry in self.entries.values_mut() {
 			*entry = Entry::Notice { text: Str::default(), error: false };
 		}
 		self.cancel_active("cancelled because history was cleared");
-		for entry in self.pending.values_mut() {
+		for entry in self.entries.values_mut() {
 			*entry = Entry::Notice { text: Str::default(), error: false };
 		}
 		self.retained_frames = RetainedFrames::new();
@@ -2447,6 +2430,7 @@ impl Chat {
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
 			BackendEvent::ThemePreview(theme) => self.preview_theme(theme),
+			BackendEvent::ComposerStyleChanged(style) => self.set_composer_style(style),
 			BackendEvent::ModelDownloadProgress(progress) => {
 				let now = self.started_at.elapsed();
 				self.download_activity = Some(DownloadActivity::new(progress, now));
@@ -2537,9 +2521,9 @@ impl Chat {
 			deadline.map(|deadline| deadline.saturating_sub(elapsed))
 		});
 		let retained = self
-			.pending
-			.values()
-			.filter_map(|entry| match entry {
+			.entries
+			.range(BlockOrdinal(self.blocks.frontier())..)
+			.filter_map(|(_, entry)| match entry {
 				Entry::Retained(frame) => frame.expires_at,
 				_ => None,
 			})
@@ -2554,10 +2538,8 @@ impl Chat {
 					.saturating_sub(elapsed)
 					.min(Duration::from_millis(50))
 			});
-		let active = (self.live_assistant.is_some()
-			|| self.exiting_assistant.is_some()
-			|| !self.live_tools.is_empty())
-		.then_some(anim::FRAME);
+		let active =
+			(self.live_assistant.is_some() || !self.live_tools.is_empty()).then_some(anim::FRAME);
 		let voice = self.live_voice.is_some().then_some(LIVE_VOICE_FRAME);
 		[editor, download, retained, celebration, active, voice]
 			.into_iter()
@@ -2592,23 +2574,15 @@ impl Chat {
 		viewport.width.saturating_sub(self.right_inset()).max(1)
 	}
 
-	fn render_at(&mut self, viewport: Size, elapsed: Duration) -> ViewportFrame<'_> {
-		self.last_viewport = viewport;
-		if self.frame.size() != viewport {
-			self.frame = Frame::new(viewport);
-		}
+	/// Resolves the chrome row budget shared by rendering and retirement.
+	fn chrome_layout(&mut self, viewport: Size, elapsed: Duration) -> ChromeLayout {
 		if viewport.width == 0 || viewport.height == 0 {
-			return ViewportFrame { frame: &self.frame, damage: SmallVec::new() };
+			return ChromeLayout::default();
 		}
-		self
-			.frame
-			.fill(Rect::new(0, 0, viewport.width, viewport.height), base_style(self.ctx.theme));
 		let content_width = self.content_width(viewport);
-		self.layout_width = content_width;
 		if self.editor_ui.frame().size().width != content_width {
 			self.editor_ui.resize(content_width);
 		}
-		self.editor_ui.tick(elapsed);
 		let editor_height = self.composer_rows().min(viewport.height);
 		let editor_y = viewport.height.saturating_sub(editor_height);
 		let title_y = editor_y.saturating_sub(1);
@@ -2630,8 +2604,55 @@ impl Chat {
 				.is_some_and(|activity| activity.visible(elapsed)),
 		)
 		.min(available_chrome.saturating_sub(error_rows));
-		let chrome_rows = error_rows.saturating_add(download_rows);
-		let h_live = working_y.saturating_sub(chrome_rows);
+		let h_live = working_y.saturating_sub(error_rows.saturating_add(download_rows));
+		ChromeLayout {
+			editor_height,
+			editor_y,
+			title_y,
+			working_y,
+			error_rows,
+			download_rows,
+			h_live,
+		}
+	}
+
+	fn render_at(&mut self, viewport: Size, elapsed: Duration) -> ViewportFrame<'_> {
+		self.last_viewport = viewport;
+		if self.frame.size() != viewport {
+			self.frame = Frame::new(viewport);
+		}
+		if viewport.width == 0 || viewport.height == 0 {
+			return ViewportFrame { frame: &self.frame, damage: SmallVec::new() };
+		}
+		self
+			.frame
+			.fill(Rect::new(0, 0, viewport.width, viewport.height), base_style(self.ctx.theme));
+		let content_width = self.content_width(viewport);
+		self.layout_width = content_width;
+		self.editor_ui.tick(elapsed);
+		let chrome = self.chrome_layout(viewport, elapsed);
+		let ChromeLayout {
+			editor_height,
+			editor_y,
+			title_y,
+			working_y,
+			error_rows,
+			download_rows,
+			h_live,
+		} = chrome;
+		// Settled snapshots stay in the mutable viewport, re-measured at the
+		// current width every frame (so resizes reflow and theme changes
+		// restyle them), until ordered retirement moves them into native
+		// history under capacity pressure.
+		let frontier = self.blocks.frontier();
+		let mut settled = SmallVec::<(BlockOrdinal, u16), 8>::new();
+		for (ordinal, entry) in self.entries.range_mut(BlockOrdinal(frontier)..) {
+			Self::resize_entry(entry, content_width, &self.ctx);
+			let height = Self::entry_height(entry, content_width);
+			if height > 0 {
+				settled.push((*ordinal, height));
+			}
+		}
 
 		let mut sampled = SmallVec::<(BlockOrdinal, u16), 16>::new();
 		let mut natural = SmallVec::<(BlockOrdinal, u16), 16>::new();
@@ -2641,10 +2662,6 @@ impl Chat {
 				assistant.ordinal,
 				flowed_height(assistant.text.as_str(), content_width.max(1)).max(1),
 			));
-		}
-		if let Some(assistant) = self.exiting_assistant.as_ref() {
-			sampled.push((assistant.ordinal, assistant.allocation));
-			natural.push((assistant.ordinal, 1));
 		}
 		for tool in &mut self.live_tools {
 			if tool.card_ui.frame().size().width != content_width {
@@ -2661,8 +2678,56 @@ impl Chat {
 				},
 			));
 		}
+		// Merged one-visible-row allocation across settled snapshots and live
+		// cards: within capacity everything renders whole; under pressure every
+		// block keeps one row and surplus flows to the newest blocks first.
+		let mut merged = SmallVec::<(BlockOrdinal, u16, bool), 16>::new();
+		for (ordinal, height) in &settled {
+			merged.push((*ordinal, *height, true));
+		}
+		for ((ordinal, painted), (_, wanted)) in sampled.iter().zip(natural.iter()) {
+			merged.push((*ordinal, (*painted).max(*wanted), false));
+		}
+		merged.sort_unstable_by_key(|(ordinal, ..)| *ordinal);
+		let mut allocs = SmallVec::<u16, 16>::new();
+		let wanted_total: u32 = merged
+			.iter()
+			.map(|(_, desired, _)| u32::from(*desired))
+			.sum();
+		if wanted_total <= u32::from(h_live) {
+			allocs.extend(merged.iter().map(|(_, desired, _)| *desired));
+		} else {
+			allocs.resize(merged.len(), 0);
+			let mut budget = h_live;
+			for alloc in allocs.iter_mut().rev() {
+				if budget == 0 {
+					break;
+				}
+				*alloc = 1;
+				budget -= 1;
+			}
+			for (alloc, (_, desired, _)) in allocs.iter_mut().rev().zip(merged.iter().rev()) {
+				if budget == 0 {
+					break;
+				}
+				if *alloc == 0 {
+					continue;
+				}
+				let grant = desired.saturating_sub(*alloc).min(budget);
+				*alloc += grant;
+				budget -= grant;
+			}
+		}
+		let settled_rows: u32 = merged
+			.iter()
+			.zip(&allocs)
+			.filter(|((.., is_settled), _)| *is_settled)
+			.map(|(_, alloc)| u32::from(*alloc))
+			.sum();
+		let tick_budget =
+			u16::try_from(u32::from(h_live).saturating_sub(settled_rows)).unwrap_or(u16::MAX);
 		let plan = self.blocks.tick(
-			h_live,
+			tick_budget,
 			|ordinal| {
 				sampled
 					.iter()
@@ -2686,12 +2751,7 @@ impl Chat {
 				.live_assistant
 				.as_mut()
 				.filter(|assistant| assistant.ordinal == target.ordinal)
-				.or_else(|| {
-					self
-						.exiting_assistant
-						.as_mut()
-						.filter(|assistant| assistant.ordinal == target.ordinal)
-				}) {
+			{
 				assistant.allocation = target.height;
 				continue;
 			}
@@ -2738,55 +2798,31 @@ impl Chat {
 					.update_component::<ToolCard>(LIVE_TOOL_CARD_ID, |card| card.set_folded(false));
 			}
 		}
-		self.live_tools.retain(|tool| {
-			!tool.finalized
-				|| tool.target_height != 0
-				|| tool.card_ui.height() != 0
-				|| elapsed.saturating_sub(tool.target_changed_at) < transition
-		});
-		if self
-			.exiting_assistant
-			.as_ref()
-			.is_some_and(|assistant| assistant.allocation == 0)
-		{
-			self.exiting_assistant = None;
-		}
-
 		let visible = plan.overflow.as_ref().map(|overflow| &overflow.visible);
-		let mut active = SmallVec::<(BlockOrdinal, bool), 16>::new();
-		if let Some(assistant) = self.live_assistant.as_ref() {
-			active.push((assistant.ordinal, true));
-		}
-		if let Some(assistant) = self.exiting_assistant.as_ref() {
-			active.push((assistant.ordinal, true));
-		}
-		for tool in &self.live_tools {
-			active.push((tool.ordinal, false));
-		}
-		active.sort_unstable_by_key(|(ordinal, _)| *ordinal);
 		let mut y = 0_u16;
-		for (ordinal, assistant) in active {
-			let mut allocation = if assistant {
+		self.live_layout.clear();
+		for ((ordinal, desired, is_settled), alloc) in merged.iter().zip(&allocs) {
+			let mut allocation = if *is_settled {
+				*alloc
+			} else if self
+				.live_assistant
+				.as_ref()
+				.is_some_and(|assistant| assistant.ordinal == *ordinal)
+			{
 				self
 					.live_assistant
 					.as_ref()
-					.filter(|candidate| candidate.ordinal == ordinal)
-					.or_else(|| {
-						self
-							.exiting_assistant
-							.as_ref()
-							.filter(|candidate| candidate.ordinal == ordinal)
-					})
 					.map_or(0, |assistant| assistant.allocation)
 			} else {
 				self
 					.live_tools
 					.iter()
-					.find(|tool| tool.ordinal == ordinal)
+					.find(|tool| tool.ordinal == *ordinal)
 					.map_or(0, |tool| tool.card_ui.height())
 			};
-			if let Some(visible) = visible
-				&& !visible.contains(&ordinal)
+			if !*is_settled
+				&& let Some(visible) = visible
+				&& !visible.contains(ordinal)
 			{
 				allocation = 0;
 			}
@@ -2794,10 +2830,17 @@ impl Chat {
 			if allocation == 0 {
 				continue;
 			}
-			if assistant {
-				self.draw_live_assistant_clipped(ordinal, y, allocation, content_width);
+			if *is_settled {
+				self.draw_settled_clipped(*ordinal, y, allocation, *desired, content_width);
+			} else if self
+				.live_assistant
+				.as_ref()
+				.is_some_and(|assistant| assistant.ordinal == *ordinal)
+			{
+				self.draw_live_assistant_clipped(*ordinal, y, allocation, content_width);
 			} else {
-				self.draw_live_tool_clipped(ordinal, y, allocation, content_width);
+				self.live_layout.push((*ordinal, y, allocation));
+				self.draw_live_tool_clipped(*ordinal, y, allocation, content_width);
 			}
 			y = y.saturating_add(allocation);
 		}
@@ -2908,19 +2951,81 @@ impl Chat {
 		}
 	}
 
-	/// Renders the maximal contiguous finalized prefix at the requested width.
-	pub fn retirement_batch(&mut self, width: u16) -> Option<RetirementBatch> {
-		let range = self.blocks.retirement_batch()?;
-		let width = width.max(1);
+	/// Renders the shortest finalized prefix that must retire for the live
+	/// tail to fit the viewport's transcript capacity.
+	///
+	/// While the screen has room — and fewer than [`MAX_LIVE_BLOCKS`] blocks
+	/// are live — nothing retires: settled snapshots keep reflowing in the
+	/// mutable viewport. Retirement stops at the first unfinished block. A
+	/// zero-height viewport (headless export) retires the complete finalized
+	/// prefix.
+	pub fn retirement_batch(&mut self, viewport: Size) -> Option<RetirementBatch> {
+		let eligible = self.blocks.retirement_batch()?;
+		let elapsed = self.started_at.elapsed();
+		let h_live = self.chrome_layout(viewport, elapsed).h_live;
+		let content_width = self.content_width(viewport);
+
+		// Measure the live tail at the width the viewport renders: settled
+		// snapshot heights plus the rows every live card wants.
+		let live_end = self.blocks.frontier() + self.blocks.live_count();
+		let mut prefix = SmallVec::<u32, 8>::new();
+		let mut total = 0_u32;
+		for ordinal in eligible.start..live_end {
+			let height = match self.entries.get_mut(&BlockOrdinal(ordinal)) {
+				Some(entry) => {
+					Self::resize_entry(entry, content_width, &self.ctx);
+					u32::from(Self::entry_height(entry, content_width))
+				},
+				None => 0,
+			};
+			if ordinal < eligible.end {
+				prefix.push(height);
+			}
+			total = total.saturating_add(height);
+		}
+		if let Some(assistant) = self.live_assistant.as_ref() {
+			let wanted = flowed_height(assistant.text.as_str(), content_width.max(1)).max(1);
+			total = total.saturating_add(u32::from(assistant.allocation.max(wanted)));
+		}
+		for tool in &self.live_tools {
+			let wanted = if tool.expanded {
+				tool.view.height().saturating_add(2).max(1)
+			} else {
+				1
+			};
+			total = total.saturating_add(u32::from(tool.card_ui.height().max(wanted)));
+		}
+
+		let live_count = self.blocks.live_count();
+		if total <= u32::from(h_live) && live_count < MAX_LIVE_BLOCKS {
+			return None;
+		}
+		// Shortest eligible prefix whose removal fits both bounds; under
+		// sustained overflow the complete eligible prefix retires.
+		let mut end = eligible.start;
+		let mut freed = 0_u32;
+		for height in &prefix {
+			let taken = end - eligible.start;
+			if total - freed <= u32::from(h_live) && live_count - taken < MAX_LIVE_BLOCKS {
+				break;
+			}
+			freed += height;
+			end += 1;
+		}
+		if end == eligible.start {
+			return None;
+		}
+		let range = eligible.start..end;
+		let width = viewport.width.max(1);
 		for ordinal in range.clone() {
-			if let Some(entry) = self.pending.get_mut(&BlockOrdinal(ordinal)) {
+			if let Some(entry) = self.entries.get_mut(&BlockOrdinal(ordinal)) {
 				Self::resize_entry(entry, width, &self.ctx);
 			}
 		}
 		let mut height = 0_u16;
 		let mut previous_read = false;
 		for ordinal in range.clone() {
-			let entry = self.pending.get(&BlockOrdinal(ordinal));
+			let entry = self.entries.get(&BlockOrdinal(ordinal));
 			let is_read = matches!(entry, Some(Entry::Tool(tool)) if tool.name.as_str() == "read");
 			if is_read && !previous_read {
 				let count = range
@@ -2928,7 +3033,7 @@ impl Chat {
 					.skip_while(|candidate| *candidate != ordinal)
 					.take_while(|candidate| {
 						matches!(
-							self.pending.get(&BlockOrdinal(*candidate)),
+							self.entries.get(&BlockOrdinal(*candidate)),
 							Some(Entry::Tool(tool)) if tool.name.as_str() == "read"
 						)
 					})
@@ -2947,7 +3052,7 @@ impl Chat {
 		let mut y = 0_u16;
 		let mut previous_read = false;
 		for ordinal in range.clone() {
-			let Some(entry) = self.pending.get(&BlockOrdinal(ordinal)) else {
+			let Some(entry) = self.entries.get(&BlockOrdinal(ordinal)) else {
 				continue;
 			};
 			let is_read = matches!(entry, Entry::Tool(tool) if tool.name.as_str() == "read");
@@ -2957,7 +3062,7 @@ impl Chat {
 					.skip_while(|candidate| *candidate != ordinal)
 					.take_while(|candidate| {
 						matches!(
-							self.pending.get(&BlockOrdinal(*candidate)),
+							self.entries.get(&BlockOrdinal(*candidate)),
 							Some(Entry::Tool(tool)) if tool.name.as_str() == "read"
 						)
 					})
@@ -2977,15 +3082,26 @@ impl Chat {
 		Some(RetirementBatch { range, frame })
 	}
 
-	/// Advances the retirement frontier and drops committed semantic snapshots.
+	/// Advances the retirement frontier.
+	///
+	/// Committed snapshots are retained so a display replay
+	/// ([`Chat::reset_retirement`]) can re-render the complete finalized
+	/// transcript at a new width.
 	pub fn mark_committed(&mut self, upto: u64) {
 		self.blocks.mark_committed(upto);
-		self.pending.retain(|ordinal, _| ordinal.0 >= upto);
+	}
+
+	/// Reopens the committed prefix so the finalized transcript replays
+	/// through ordered retirement, e.g. after a settled resize or a
+	/// destructive display reset.
+	pub fn reset_retirement(&mut self) {
+		self.blocks.reset_retirement();
+		self.bump_live();
 	}
 
 	fn enqueue_final(&mut self, entry: Entry) -> BlockOrdinal {
 		let ordinal = self.blocks.create();
-		self.pending.insert(ordinal, entry);
+		self.entries.insert(ordinal, entry);
 		self.blocks.finalize(ordinal);
 		ordinal
 	}
@@ -3001,30 +3117,24 @@ impl Chat {
 			.live_assistant
 			.as_ref()
 			.filter(|message| message.ordinal == ordinal)
-			.or_else(|| {
-				self
-					.exiting_assistant
-					.as_ref()
-					.filter(|message| message.ordinal == ordinal)
-			})
 		else {
 			return;
 		};
 		let natural = flowed_height(message.text.as_str(), width.max(1)).max(1);
 		let scratch_size = Size::new(width, natural);
-		if self.assistant_scratch.size() != scratch_size {
-			self.assistant_scratch = Frame::new(scratch_size);
+		if self.clip_scratch.size() != scratch_size {
+			self.clip_scratch = Frame::new(scratch_size);
 		}
 		self
-			.assistant_scratch
+			.clip_scratch
 			.fill(Rect::new(0, 0, width, natural), base_style(self.ctx.theme));
-		draw_flowed(&mut self.assistant_scratch, Rect::new(0, 0, width, natural), &[Span::new(
+		draw_flowed(&mut self.clip_scratch, Rect::new(0, 0, width, natural), &[Span::new(
 			message.text.as_str(),
 			prose_style(self.ctx.theme),
 		)]);
 		self
 			.frame
-			.blit(&self.assistant_scratch, natural.saturating_sub(height), height, 0, y);
+			.blit(&self.clip_scratch, natural.saturating_sub(height), height, 0, y);
 	}
 
 	fn draw_live_tool_clipped(&mut self, ordinal: BlockOrdinal, y: u16, height: u16, _width: u16) {
@@ -3032,6 +3142,36 @@ impl Chat {
 			return;
 		};
 		self.frame.blit(tool.card_ui.frame(), 0, height, 0, y);
+	}
+
+	/// Draws one settled snapshot into the live viewport, keeping its latest
+	/// rows when the allocation is smaller than its natural height.
+	fn draw_settled_clipped(
+		&mut self,
+		ordinal: BlockOrdinal,
+		y: u16,
+		height: u16,
+		natural: u16,
+		width: u16,
+	) {
+		let Some(entry) = self.entries.get(&ordinal) else {
+			return;
+		};
+		if height >= natural {
+			Self::draw_entry(&mut self.frame, entry, y, width, &self.ctx);
+			return;
+		}
+		let size = Size::new(width, natural);
+		if self.clip_scratch.size() != size {
+			self.clip_scratch = Frame::new(size);
+		}
+		self
+			.clip_scratch
+			.fill(Rect::new(0, 0, width, natural), base_style(self.ctx.theme));
+		Self::draw_entry(&mut self.clip_scratch, entry, 0, width, &self.ctx);
+		self
+			.frame
+			.blit(&self.clip_scratch, natural - height, height, 0, y);
 	}
 
 	fn refresh_live_tool_card(tool: &mut LiveTool, width: u16, ctx: &UiContext) {
@@ -3055,15 +3195,7 @@ impl Chat {
 				dirty |= card.set_intent(presentation.intent);
 				dirty |= card.set_activity(presentation.activity);
 				dirty |= card.set_badge(presentation.badge.unwrap_or_default());
-				dirty |= card.set_state(if tool.finalized {
-					if tool.final_ok {
-						ToolState::Success
-					} else {
-						ToolState::Failure
-					}
-				} else {
-					ToolState::Streaming
-				});
+				dirty |= card.set_state(ToolState::Streaming);
 				dirty |= card.replace_body(body);
 				dirty
 			});
@@ -3715,6 +3847,56 @@ mod tests {
 			assert_eq!(chat.render(viewport).frame.size(), viewport);
 		}
 	}
+	#[test]
+	fn thinking_replaces_the_model_icon_without_rendering_a_level_label() {
+		let ctx = UiContext { charset: Charset::NerdFont, ..UiContext::default() };
+		let mut chat = Chat::new(&ctx);
+		chat.set_status(StatusFacts {
+			model: "Fable 5".into(),
+			thinking: Some(ThinkingLevel::Max),
+			..StatusFacts::default()
+		});
+
+		let text = frame_text(chat.render(Size::new(80, 8)).frame);
+		assert!(text.contains(" Fable 5"), "{text}");
+		assert!(!text.contains("think"), "{text}");
+	}
+
+	#[test]
+	fn composer_style_event_replaces_live_chrome() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(50, 8);
+		assert!(frame_text(chat.render(viewport).frame).contains("╰─"));
+
+		let _ = chat.apply_backend_event(BackendEvent::ComposerStyleChanged(ComposerStyle::Rail));
+		let text = frame_text(chat.render(viewport).frame);
+		assert!(text.contains('▎'), "{text}");
+		assert!(!text.contains("╰─"), "{text}");
+	}
+
+	#[test]
+	fn boxed_composer_repaints_status_and_input_together() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(50, 10);
+		chat.set_composer_style(ComposerStyle::Box);
+		chat.set_status(StatusFacts { model: "Fable 5".into(), ..StatusFacts::default() });
+		let _ = chat.render(viewport);
+
+		assert_eq!(chat.handle_key(Key::Char('x')), ChatKey::Consumed);
+		let typed = frame_text(chat.render(viewport).frame);
+		assert!(typed.contains("Fable 5"), "{typed}");
+		assert!(typed.contains('x'), "{typed}");
+
+		assert_eq!(chat.handle_key(Key::Enter), ChatKey::Consumed);
+		chat.set_status(StatusFacts {
+			model: "Fable 5".into(),
+			working: true,
+			..StatusFacts::default()
+		});
+		let submitted = frame_text(chat.render(viewport).frame);
+		assert!(submitted.contains("Fable 5"), "{submitted}");
+		assert!(submitted.contains('╰'), "{submitted}");
+	}
 
 	#[test]
 	fn viewport_damage_is_local() {
@@ -3738,14 +3920,18 @@ mod tests {
 			chat.tool_started(id, "read", "1", id);
 			chat.tool_finished(id, true, id.into());
 		}
-		let batch = chat.retirement_batch(40).expect("queued finals retire");
+		let batch = chat
+			.retirement_batch(Size::new(40, 0))
+			.expect("queued finals retire");
 		assert!(frame_text(&batch.frame).contains("Read 2 files"));
 		chat.mark_committed(batch.range.end);
 		chat.tool_started("shell", "bash", "1", "shell");
 		chat.tool_finished("shell", true, "done".into());
 		chat.tool_started("c", "read", "1", "c");
 		chat.tool_finished("c", true, "c".into());
-		let batch = chat.retirement_batch(40).expect("next finals retire");
+		let batch = chat
+			.retirement_batch(Size::new(40, 0))
+			.expect("next finals retire");
 		assert_eq!(frame_text(&batch.frame).matches("Read 1 files").count(), 0);
 		assert!(frame_text(&batch.frame).contains("c"));
 	}
@@ -3756,10 +3942,15 @@ mod tests {
 		chat.push_user("recover me", Vec::new());
 		chat.restore_dropped_prompt("recover me".into(), Vec::new());
 		assert_eq!(chat.composer_text(), "recover me");
+		// The tombstone contributes no rows, so it never creates pressure by
+		// itself; it retires contiguously with the next pressured batch.
+		assert!(chat.retirement_batch(Size::new(40, 0)).is_none());
+		chat.push_notice("follow-up");
 		let batch = chat
-			.retirement_batch(40)
+			.retirement_batch(Size::new(40, 0))
 			.expect("tombstone remains contiguous");
-		assert_eq!(batch.frame.size().height, 0);
+		assert_eq!(batch.range.start, 0);
+		assert!(frame_text(&batch.frame).contains("follow-up"));
 	}
 	#[test]
 	fn tool_result_images_render_inline_in_committed_cards() {
@@ -3776,7 +3967,7 @@ mod tests {
 		chat.tool_image("image", source.clone());
 		chat.tool_finished("image", true, source.clone());
 		let batch = chat
-			.retirement_batch(60)
+			.retirement_batch(Size::new(60, 0))
 			.expect("queued image snapshot retires");
 		let text = frame_text(&batch.frame);
 		assert!(text.contains("omp-s") && text.contains(".png"), "{text:?}");
@@ -3801,8 +3992,8 @@ mod tests {
 	#[test]
 	fn allocator_observes_mid_tween_tool_height() {
 		let mut chat = Chat::new(&ctx());
-		let roomy = Size::new(40, 14);
-		let pressured = Size::new(40, 10);
+		let roomy = Size::new(40, 10);
+		let pressured = Size::new(40, 6);
 		chat.tool_started("one", "read", "1", "first");
 		chat.tool_output("one", "a\nb\nc\nd");
 		let _ = chat.render_at(roomy, Duration::ZERO);
@@ -3862,6 +4053,79 @@ mod tests {
 	}
 
 	#[test]
+	fn settled_blocks_stay_in_viewport_until_capacity_pressure() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_user("hello there", Vec::new());
+		chat.push_notice("finalized notice");
+		// Roomy viewport: nothing retires and the settled snapshots render in
+		// the mutable viewport.
+		let roomy = Size::new(40, 20);
+		assert!(chat.retirement_batch(roomy).is_none());
+		let rendered = chat.render(roomy);
+		let text = frame_text(rendered.frame);
+		assert!(text.contains("hello there"), "{text:?}");
+		assert!(text.contains("finalized notice"), "{text:?}");
+		// Shrinking below the live tail forces the shortest prefix out.
+		let tight = Size::new(40, 7);
+		let batch = chat.retirement_batch(tight).expect("pressure retires");
+		assert_eq!(batch.range.start, 0);
+		chat.mark_committed(batch.range.end);
+		assert!(chat.retirement_batch(tight).is_none());
+	}
+
+	#[test]
+	fn settled_blocks_reflow_to_the_current_width() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_notice("alpha beta gamma delta epsilon zeta");
+		let wide = chat.render(Size::new(60, 20));
+		let wide_text = frame_text(wide.frame);
+		assert!(
+			wide_text
+				.lines()
+				.any(|line| line.contains("alpha beta gamma delta epsilon zeta"))
+		);
+		let narrow = chat.render(Size::new(18, 20));
+		let narrow_text = frame_text(narrow.frame);
+		assert!(narrow_text.contains("alpha"), "{narrow_text:?}");
+		assert!(
+			!narrow_text
+				.lines()
+				.any(|line| line.contains("alpha beta gamma delta epsilon zeta")),
+			"{narrow_text:?}"
+		);
+	}
+
+	#[test]
+	fn reset_retirement_reoffers_the_committed_prefix() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_notice("replayed row");
+		let drained = Size::new(40, 0);
+		let batch = chat.retirement_batch(drained).expect("initial retire");
+		chat.mark_committed(batch.range.end);
+		assert!(chat.retirement_batch(drained).is_none());
+
+		chat.reset_retirement();
+		let replay = chat.retirement_batch(drained).expect("replay retire");
+		assert_eq!(replay.range.start, 0);
+		assert!(frame_text(&replay.frame).contains("replayed row"));
+		chat.mark_committed(replay.range.end);
+		assert!(chat.retirement_batch(drained).is_none());
+	}
+
+	#[test]
+	fn live_block_memory_bound_forces_retirement_offers() {
+		let mut chat = Chat::new(&ctx());
+		for index in 0..MAX_LIVE_BLOCKS {
+			chat.push_notice(format!("row {index}"));
+		}
+		// A huge viewport has room, but the memory bound still forces an offer.
+		let batch = chat
+			.retirement_batch(Size::new(40, u16::MAX))
+			.expect("memory pressure retires");
+		assert_eq!(batch.range.start, 0);
+	}
+
+	#[test]
 	fn later_tool_finishing_first_blocks_retirement() {
 		let mut chat = Chat::new(&ctx());
 		chat.tool_started("head", "bash", "1", "head");
@@ -3869,7 +4133,7 @@ mod tests {
 		settle(&mut chat, Size::new(40, 8));
 		chat.tool_finished("later", true, "done".into());
 		settle(&mut chat, Size::new(40, 8));
-		assert!(chat.retirement_batch(40).is_none());
+		assert!(chat.retirement_batch(Size::new(40, 0)).is_none());
 	}
 
 	#[test]
@@ -3882,7 +4146,7 @@ mod tests {
 		chat.tool_finished("head", true, "head done".into());
 		settle(&mut chat, Size::new(40, 8));
 		let batch = chat
-			.retirement_batch(40)
+			.retirement_batch(Size::new(40, 0))
 			.expect("head unblocks later final");
 		assert_eq!(batch.range, 0..2);
 		let text = frame_text(&batch.frame);
@@ -3895,8 +4159,8 @@ mod tests {
 		for id in ["a", "b", "c"] {
 			chat.tool_started(id, "read", "1", id);
 		}
-		settle(&mut chat, Size::new(30, 14));
-		let rendered = chat.render_at(Size::new(30, 9), Duration::from_millis(500));
+		settle(&mut chat, Size::new(30, 10));
+		let rendered = chat.render_at(Size::new(30, 5), Duration::from_millis(500));
 		assert!(frame_text(rendered.frame).contains("active"));
 	}
 
@@ -3905,8 +4169,8 @@ mod tests {
 		let mut chat = Chat::new(&ctx());
 		chat.begin_assistant("a");
 		chat.append_assistant("a", "oldest\nmiddle\nnewest");
-		settle(&mut chat, Size::new(30, 12));
-		let rendered = chat.render_at(Size::new(30, 10), Duration::from_millis(500));
+		settle(&mut chat, Size::new(30, 8));
+		let rendered = chat.render_at(Size::new(30, 6), Duration::from_millis(500));
 		let text = frame_text(rendered.frame);
 		assert!(text.contains("newest"));
 		assert!(!text.contains("oldest"));
@@ -3920,7 +4184,7 @@ mod tests {
 		chat.clear_history();
 		assert_eq!(chat.composer_text(), "draft");
 		let batch = chat
-			.retirement_batch(40)
+			.retirement_batch(Size::new(40, 0))
 			.expect("tombstone and marker retire");
 		assert!(frame_text(&batch.frame).contains("history cleared"));
 	}
