@@ -238,7 +238,7 @@ pub trait ModelCommandHost {
 	/// Set or select the durable model preference.
 	fn model(&mut self, selector: Option<Str>) -> CommandFuture<'_>;
 	/// Set a resume-stable session override.
-	fn switch(&mut self, selector: Str) -> CommandFuture<'_>;
+	fn switch(&mut self, selector: Option<Str>) -> CommandFuture<'_>;
 }
 
 /// Configuration/credential-scoped command capabilities.

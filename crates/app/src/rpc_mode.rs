@@ -2581,7 +2581,10 @@ impl ModelCommandHost for RpcCommandHost {
 		})
 	}
 
-	fn switch(&mut self, selector: Str) -> CommandFuture<'_> {
+	fn switch(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
+		let Some(selector) = selector else {
+			return unavailable_command("switch");
+		};
 		self.model(Some(selector))
 	}
 }
