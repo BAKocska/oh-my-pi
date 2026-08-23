@@ -37,7 +37,10 @@ pub fn custom_tool_to_definition<T: Tool>(
 				GrammarSyntax::Regex => ToolGrammarSyntax::Regex,
 				GrammarSyntax::Ebnf => ToolGrammarSyntax::Ebnf,
 			};
-			ToolInputConstraint::Grammar(ToolGrammar { syntax, definition: definition.clone() })
+			ToolInputConstraint::Grammar {
+				grammar:  ToolGrammar { syntax, definition: definition.clone() },
+				fallback: OpaqueJson::new(schema),
+			}
 		},
 	};
 	Ok(ToolDefinition {
