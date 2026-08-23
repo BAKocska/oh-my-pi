@@ -141,7 +141,9 @@ fn replay_chat(items: &[v1::Item], registry: &Registry) -> Chat {
 
 fn retirement_frame(chat: &mut Chat, width: u16) -> Frame {
 	chat
-		.retirement_batch(width)
+		// Zero-height viewport: headless export drains the complete
+		// finalized prefix regardless of capacity pressure.
+		.retirement_batch(Size::new(width, 0))
 		.map_or_else(|| Frame::new(Size::new(width, 0)), |batch| batch.frame)
 }
 

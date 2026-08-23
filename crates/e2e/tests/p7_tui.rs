@@ -867,6 +867,9 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		.expect("secure scratch root");
 	let project = scratch.path().join("project");
 	fs::create_dir(&project).expect("project directory");
+	// The product canonicalizes `--project`; macOS tempdirs live behind the
+	// `/var` symlink, so the fixture must hash the same canonical root.
+	let project = fs::canonicalize(&project).expect("canonical project root");
 	fs::write(project.join("scratch.txt"), "old\n").expect("write read/edit fixture");
 	let metadata_dir = project.join(".omp");
 	fs::create_dir(&metadata_dir).expect("project metadata directory");
@@ -902,20 +905,34 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	let mut bootstrap_debug =
 		DebugClient::connect(&debug_socket, Instant::now() + READY_TIMEOUT, &mut bootstrap);
 	let index =
-		wait_snapshot(&mut bootstrap_debug, &bootstrap_raw, "session index ready", |snapshot| {
-			snapshot.text.contains("SESSION INDEX") && snapshot.text.contains("New session")
+		wait_snapshot(&mut bootstrap_debug, &bootstrap_raw, "bootstrap chat ready", |snapshot| {
+			// Bare `omp chat` boots directly into the inline chat scene; the
+			// session-index card is reserved for the explicit picker flag.
+			snapshot.text.contains("session") && snapshot.text.contains("idle")
 		});
-	assert_surface(&index, "session index");
-	let journals: Vec<_> = fs::read_dir(state_dir.join("sessions"))
-		.expect("read session directory")
-		.map(|entry| entry.expect("read session entry").path())
-		.filter(|path| {
-			path
-				.extension()
-				.is_some_and(|extension| extension == "jsonl")
-		})
-		.collect();
-	assert_eq!(journals.len(), 1, "expected one eagerly-created journal: {journals:?}");
+	assert_surface(&index, "bootstrap chat");
+	// The chat scene paints before the backend finishes opening the journal;
+	// eager creation still means "without any user input", so poll briefly.
+	let journal_deadline = Instant::now() + CHECKPOINT_TIMEOUT;
+	let journals: Vec<_> = loop {
+		let journals: Vec<_> = fs::read_dir(state_dir.join("sessions"))
+			.expect("read session directory")
+			.map(|entry| entry.expect("read session entry").path())
+			.filter(|path| {
+				path
+					.extension()
+					.is_some_and(|extension| extension == "jsonl")
+			})
+			.collect();
+		if journals.len() == 1 {
+			break journals;
+		}
+		assert!(
+			Instant::now() < journal_deadline,
+			"expected one eagerly-created journal: {journals:?}"
+		);
+		thread::sleep(Duration::from_millis(15));
+	};
 	let initial_session_id = journals[0]
 		.file_stem()
 		.and_then(ffi::OsStr::to_str)
@@ -1047,7 +1064,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 
 	debug.keys("'/new' enter");
 	let fresh = wait_snapshot(&mut debug, &raw_capture, "fresh session ready", |snapshot| {
-		snapshot.frame.contains("Ask anything") && !snapshot.frame.contains("Interrupted.")
+		snapshot.frame.contains("╰─") && !snapshot.frame.contains("Interrupted.")
 	});
 	assert_surface(&fresh, "fresh session");
 	debug.keys("'continue' enter");

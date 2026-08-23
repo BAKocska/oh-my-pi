@@ -90,6 +90,32 @@ pub enum ShimmerMode {
 	Disabled,
 }
 
+/// Terminal scrollback refresh policy after a settled resize.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	Serialize,
+	Deserialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum ResizeScrollbackMode {
+	/// Append the resized transcript after existing scrollback rows.
+	Append,
+	/// Rebuild retained transcript rows at the settled terminal width.
+	#[default]
+	Rebuild,
+	/// Preserve existing terminal scrollback rows without replaying them.
+	Preserve,
+}
+
 /// TUI-specific rendering and input behavior.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -106,6 +132,9 @@ pub struct TuiSettings {
 	pub max_inline_images: u16,
 	/// Keep prompt chrome stable during IME preedit.
 	pub ime_safe_cursor:   bool,
+	/// How a settled terminal resize refreshes transcript rows retained in
+	/// terminal scrollback.
+	pub resize_scrollback: ResizeScrollbackMode,
 }
 
 impl Default for TuiSettings {
@@ -117,6 +146,7 @@ impl Default for TuiSettings {
 			tight:             false,
 			max_inline_images: default_max_inline_images(),
 			ime_safe_cursor:   false,
+			resize_scrollback: ResizeScrollbackMode::Rebuild,
 		}
 	}
 }
@@ -159,6 +189,13 @@ impl SettingsDomain for TuiSettings {
 			"Keep prompt chrome stable during IME preedit.",
 			SettingKind::Boolean,
 			60,
+		),
+		field(
+			"tui.resizeScrollback",
+			"Resize Scrollback",
+			"How a settled terminal resize refreshes transcript rows retained in terminal scrollback",
+			SettingKind::Enum(&["append", "rebuild", "preserve"]),
+			70,
 		),
 	];
 }

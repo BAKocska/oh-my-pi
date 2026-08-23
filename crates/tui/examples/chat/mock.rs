@@ -10,9 +10,12 @@ use std::{
 
 use flume::{Receiver, Sender};
 use omp_chat_ui::{
-	BackendEvent, GitFacts, Intent, ModelRow, RewindTargetRow, SessionRow, StatusFacts,
+	BackendEvent, GitFacts, Intent, ModelRow, RewindTargetRow, SessionRow, SettingRow, StatusFacts,
+	ThinkingLevel,
 };
 use omp_core::{Str, sf};
+use omp_tui::components::ComposerStyle;
+use strum::IntoEnumIterator;
 
 pub fn start(executor: &omp_executor::Executor) -> (Receiver<BackendEvent>, Sender<Intent>) {
 	let (event_tx, event_rx) = flume::unbounded();
@@ -31,6 +34,7 @@ async fn run(
 	let models = models();
 	let generation = Arc::new(AtomicU64::new(0));
 	let mut model = 0_usize;
+	let mut composer_style = ComposerStyle::default();
 	let mut messages: Vec<(u64, Str)> = Vec::new();
 	let mut next_event = 1_u64;
 	let _ = events.send(BackendEvent::Sessions(sessions()));
@@ -40,6 +44,10 @@ async fn run(
 	while let Ok(intent) = intents.recv_async().await {
 		match intent {
 			Intent::Submit { text, attachments, mode: _ } => {
+				if text == "/settings" {
+					let _ = events.send(BackendEvent::SettingsSchema(setting_rows(composer_style)));
+					continue;
+				}
 				let event = next_event;
 				next_event += 1;
 				messages.push((event, Str::from(text.clone())));
@@ -115,6 +123,20 @@ async fn run(
 				messages.clear();
 				let _ = events.send(BackendEvent::HistoryCleared);
 				let _ = events.send(BackendEvent::SessionTitle(sf!("New local session")));
+			},
+			Intent::ApplySettings { changes, commit } => {
+				for change in changes {
+					if change.path == "composer.shape"
+						&& let Some(value) = change.value.as_str()
+						&& let Ok(style) = value.parse::<ComposerStyle>()
+					{
+						composer_style = style;
+						let _ = events.send(BackendEvent::ComposerStyleChanged(style));
+					}
+				}
+				if commit {
+					let _ = events.send(BackendEvent::Notice(sf!("Settings saved by mock backend.")));
+				}
 			},
 			Intent::Help => {
 				let _ = events.send(BackendEvent::Notice(sf!(
@@ -199,8 +221,26 @@ fn status(model: &Str, working: bool) -> StatusFacts {
 		attempt: 0,
 		dropped: 0,
 		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9 }),
+		thinking: Some(ThinkingLevel::Max),
 		..StatusFacts::default()
 	}
+}
+
+fn setting_rows(style: ComposerStyle) -> Vec<SettingRow> {
+	vec![SettingRow {
+		panel:       sf!("interaction"),
+		domain:      sf!("core"),
+		path:        sf!("composer.shape"),
+		label:       sf!("Composer shape"),
+		description: sf!("Chat composer chrome."),
+		kind:        sf!("enum"),
+		secret:      false,
+		value:       Some(Str::from(style.to_string())),
+		options:     ComposerStyle::iter()
+			.map(|style| Str::from(style.to_string()))
+			.collect(),
+		visible:     true,
+	}]
 }
 
 fn models() -> Vec<ModelRow> {

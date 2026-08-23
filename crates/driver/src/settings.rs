@@ -8,9 +8,9 @@ use omp_inference::{Difficulty, DifficultyBackend};
 mod domains;
 pub use domains::{
 	AppearanceSettings, CompletionSettings, DisplaySettings, ErrorNotificationSettings,
-	HyperlinkMode, InteractionSettings, LifecycleSettings, NotifyToggle, RootDisplaySettings,
-	ShareSettings, ShareStore, ShimmerMode, TitleSettings, TtsrContextMode, TtsrInterruptMode,
-	TtsrSettings, TuiSettings,
+	HyperlinkMode, InteractionSettings, LifecycleSettings, NotifyToggle, ResizeScrollbackMode,
+	RootDisplaySettings, ShareSettings, ShareStore, ShimmerMode, TitleSettings, TtsrContextMode,
+	TtsrInterruptMode, TtsrSettings, TuiSettings,
 };
 pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
 impl PromptSettings {
@@ -45,13 +45,13 @@ use serde::{Deserialize, Serialize};
 #[strum(serialize_all = "lowercase")]
 pub enum ComposerStyle {
 	/// Rounded frame with status embedded in the top edge.
-	#[default]
 	Box,
 	/// Full-width rules with prompt gutter and status chip.
 	Claude,
 	/// Rounded frame with a prompt gutter and scrollbar.
 	Pi,
-	/// Prompt gutter without surrounding chrome.
+	/// Unboxed prompt with a single curved left cue and a status strip above it.
+	#[default]
 	Borderless,
 	/// One status-bearing rule above the input.
 	Rule,
@@ -1005,6 +1005,7 @@ mod tests {
 
 	#[test]
 	fn composer_shape_uses_nested_appearance_setting() {
+		assert_eq!(Settings::default().composer.shape, ComposerStyle::Borderless);
 		let settings: Settings =
 			toml::from_str("[composer]\nshape = \"rail\"").expect("composer settings parse");
 		assert_eq!(settings.composer.shape, ComposerStyle::Rail);

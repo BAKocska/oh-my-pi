@@ -30,7 +30,8 @@ use omp_catalog::{
 use omp_chat_ui::{
 	ActivityWaveform, AgentRow, ApprovalAction, ApprovalTicketView, Attachment, BackendEvent, Chat,
 	Intent, ModelRow, RewindTargetRow, SessionRow, StatusFacts, StatusLayout, StatusSeparator,
-	SubmitMode, TranscriptFrame, TranscriptFrameKind, VisibleSlotFacts,
+	SubmitMode, ThinkingLevel as StatusThinkingLevel, TranscriptFrame, TranscriptFrameKind,
+	VisibleSlotFacts,
 	completion::{
 		CompletionChain, CompletionQuery, CompletionSource, CompletionTrigger, DeferredCompletion,
 	},
@@ -975,8 +976,7 @@ struct BridgeState {
 	live_activity: ActivityWaveform,
 	token_rate: Option<TokenRateMeter>,
 	tokens_per_second: Option<u64>,
-	thinking: Option<Str>,
-	session_accent: Str,
+	thinking: Option<StatusThinkingLevel>,
 	replaying_turn: bool,
 	vision_override: Option<InspectImageMode>,
 	settings: Settings,
@@ -1224,6 +1224,7 @@ pub async fn run<C, R>(
 	local_root: PathBuf,
 	security_enabled: bool,
 	title_enabled: bool,
+	resize_scrollback: omp_chat_ui::host::ResizeScrollback,
 	command_sources: Vec<Vec<CommandContribution>>,
 	skills: Arc<omp_driver::skills::SkillSnapshot>,
 	mut approval_inbox: Option<ApprovalInbox>,
@@ -1411,14 +1412,7 @@ where
 		.thinking
 		.as_ref()
 		.and_then(|reasoning| Effort::try_from(reasoning.effort).ok())
-		.map(|effort| {
-			Str::from(
-				effort
-					.as_str_name()
-					.trim_start_matches("EFFORT_")
-					.to_ascii_lowercase(),
-			)
-		});
+		.and_then(status_thinking_level);
 	drop(snapshot);
 	let mut state = BridgeState {
 		model,
@@ -1459,7 +1453,6 @@ where
 		token_rate: None,
 		tokens_per_second: None,
 		thinking,
-		session_accent: session_id.clone(),
 		pending_auth_kind: None,
 		replaying_turn: false,
 		vision_override: None,
@@ -1759,6 +1752,7 @@ where
 		completion_notify: true,
 		error_notify: true,
 		title_enabled,
+		resize_scrollback,
 	};
 	let (host_result, bridge_result): (
 		miette::Result<omp_chat_ui::host::HostOutcome>,
@@ -2013,6 +2007,7 @@ pub async fn run_guest(
 			completion_notify:      true,
 			error_notify:           true,
 			title_enabled:          true,
+			resize_scrollback:      omp_chat_ui::host::ResizeScrollback::Rebuild,
 		},
 		initial_draft,
 	);
@@ -2426,7 +2421,7 @@ fn append_hotkeys(mut help: String) -> String {
 		 active turn or submit |\n| Composer | `Alt+Enter` | Queue follow-up |\n| Composer | `Esc` \
 		 | Interrupt active work |\n| Composer | `Esc Esc` | Open rewind history |\n| Composer | \
 		 `Ctrl+O` | Expand exact tool card |\n| Composer | `Ctrl+T` | Expand latest thinking timer \
-		 |\n| Composer | `Ctrl+P` | Switch model for this session |\n| Composer | `Ctrl+R` | Search \
+		 |\n| Composer | `Alt+P` | Switch model for this session |\n| Composer | `Ctrl+R` | Search \
 		 prompt history |\n| Composer | `Alt+Up` / `Shift+Up` | Restore newest queued item |\n| \
 		 Modal | `Enter` | Commit highlighted action |\n| Modal | `Esc` | Cancel modal; never \
 		 trigger composer shortcuts |\n| Modal | `Tab` / `Shift+Tab` | Move focus |\n| Approval | \
@@ -2439,6 +2434,25 @@ impl<R> LiveCommandHost<'_, R> {
 	fn unavailable(&self, message: &'static str) -> CommandFuture<'static> {
 		send_backend(self.backend, BackendEvent::Error(sf!(message)));
 		silent_command()
+	}
+	fn select_model(&mut self, selector: Option<Str>, durable: bool) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if let Some(selector) = selector {
+				switch_model(
+					self.backend,
+					self.agent_state,
+					self.data_dir,
+					selector.as_str(),
+					self.state,
+					self.control,
+					durable,
+				)
+				.await;
+			} else {
+				send_open_models(self.backend, self.state);
+			}
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
 	}
 }
 
@@ -2678,39 +2692,11 @@ where
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn model(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
-		Box::pin(async move {
-			if let Some(selector) = selector {
-				switch_model(
-					self.backend,
-					self.agent_state,
-					self.data_dir,
-					selector.as_str(),
-					self.state,
-					self.control,
-					true,
-				)
-				.await;
-			} else {
-				send_open_models(self.backend, self.state);
-			}
-			Ok(CommandResult::Consumed(ConsumedResult::silent()))
-		})
+		self.select_model(selector, true)
 	}
 
-	fn switch(&mut self, selector: Str) -> CommandFuture<'_> {
-		Box::pin(async move {
-			switch_model(
-				self.backend,
-				self.agent_state,
-				self.data_dir,
-				selector.as_str(),
-				self.state,
-				self.control,
-				false,
-			)
-			.await;
-			Ok(CommandResult::Consumed(ConsumedResult::silent()))
-		})
+	fn switch(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
+		self.select_model(selector, false)
 	}
 }
 
@@ -2841,6 +2827,18 @@ fn set_toml_value(
 	Err(miette::miette!("setting path is empty"))
 }
 
+const fn status_thinking_level(effort: Effort) -> Option<StatusThinkingLevel> {
+	match effort {
+		Effort::Minimal => Some(StatusThinkingLevel::Minimal),
+		Effort::Low => Some(StatusThinkingLevel::Low),
+		Effort::Medium => Some(StatusThinkingLevel::Medium),
+		Effort::High => Some(StatusThinkingLevel::High),
+		Effort::Xhigh => Some(StatusThinkingLevel::Xhigh),
+		Effort::Max => Some(StatusThinkingLevel::Max),
+		_ => None,
+	}
+}
+
 fn set_interactive_thinking(agent_state: &AgentState, state: &mut BridgeState, cycle: bool) {
 	use omp_proto::inference::v1::Reasoning;
 
@@ -2876,12 +2874,7 @@ fn set_interactive_thinking(agent_state: &AgentState, state: &mut BridgeState, c
 		snapshot.turn.params.thinking =
 			Some(Reasoning { effort: next as i32, ..Reasoning::default() });
 	});
-	state.thinking = Some(Str::from(
-		next
-			.as_str_name()
-			.trim_start_matches("EFFORT_")
-			.to_ascii_lowercase(),
-	));
+	state.thinking = status_thinking_level(next);
 }
 
 async fn mutate_mcp(
@@ -4371,7 +4364,16 @@ where
 		},
 		Intent::Suspend | Intent::ResetDisplay | Intent::InspectHistory => {},
 		Intent::ApplySettings { changes, commit } => {
+			let composer_style = state.settings.composer.shape;
 			apply_setting_changes(&mut state.settings, &changes)?;
+			if state.settings.composer.shape != composer_style {
+				send_backend(
+					backend,
+					BackendEvent::ComposerStyleChanged(presentation_composer_style(
+						state.settings.composer.shape,
+					)),
+				);
+			}
 			if commit {
 				let encoded = toml::to_string_pretty(&state.settings).into_diagnostic()?;
 				omp_settings::io::atomic_replace(&data_dir.join("config.toml"), &encoded)
@@ -5901,7 +5903,14 @@ async fn switch_model(
 		return;
 	};
 	if !durable {
-		let Some(route) = spec.routes.first().and_then(|route| catalog.route(route)) else {
+		let Some((route, wire_model)) = spec.routes.first().and_then(|route_id| {
+			let route = catalog.route(route_id)?;
+			let (_, wire_model) = spec
+				.wire_ids
+				.iter()
+				.find(|(candidate, _)| candidate == route_id)?;
+			Some((route, wire_model))
+		}) else {
 			send_backend(
 				backend,
 				BackendEvent::Error(sf!("Model {selector} has no selectable provider route.")),
@@ -5913,7 +5922,7 @@ async fn switch_model(
 			model:    JournalModelRef {
 				provider: JournalProviderId(Str::new(route.provider.as_str())),
 				api:      Str::new(route.codec.as_str()),
-				model:    JournalModelId(Str::new(spec.key.as_str())),
+				model:    JournalModelId(Str::new(wire_model.as_str())),
 			},
 			fallback: false,
 		};
@@ -5950,6 +5959,14 @@ async fn switch_model(
 	state.model = key;
 	state.context_window = spec.limits.context_window;
 	send_models_updated(backend, state);
+	send_backend(
+		backend,
+		BackendEvent::Notice(if durable {
+			sf!("Default and session model: `{}`.", state.model)
+		} else {
+			sf!("Session model: `{}`.", state.model)
+		}),
+	);
 }
 
 fn resolve_model<'a>(catalog: &'a Catalog, selector: &str) -> Option<&'a ModelSpec> {
@@ -6077,7 +6094,7 @@ fn send_status(
 	send_backend(
 		backend,
 		BackendEvent::Status(StatusFacts {
-			model: Str::from(state.model.as_str()),
+			model: status_model_label(state.model.as_str()),
 			model_subscription: model_uses_subscription(Catalog::embedded(), &state.model),
 			advisor_model: None,
 			advisor_subscription: false,
@@ -6107,18 +6124,31 @@ fn send_status(
 			tokens_per_second: state.tokens_per_second,
 			cwd: Some(state.workspace_root.clone()),
 			worktree: None,
-			thinking: state.thinking.clone(),
+			thinking: state.thinking,
 			hooks: 0,
 			tasks: 0,
 			collab_peers: 0,
 			account_override: None,
-			session_accent: Some(state.session_accent.clone()),
 			quota_reset: false,
 			reduced_motion: false,
 			layout: StatusLayout::Compact,
 			separator: StatusSeparator::Dot,
 		}),
 	);
+}
+
+fn status_model_label(model: &str) -> Str {
+	Catalog::embedded()
+		.model(ModelKey::from_ref(model))
+		.map_or_else(
+			|| Str::from(model),
+			|model| {
+				model
+					.display_name
+					.strip_prefix("Claude ")
+					.unwrap_or_else(|| model.display_name.clone())
+			},
+		)
 }
 
 fn send_backend(sender: &flume::Sender<BackendEvent>, event: BackendEvent) {
@@ -6504,6 +6534,32 @@ mod tests {
 		assert!(message.contains(granted.engagement.as_str()));
 		assert!(message.contains("since 41"));
 	}
+	#[test]
+	fn status_model_label_uses_catalog_display_without_claude_prefix() {
+		assert_eq!(status_model_label("anthropic/claude-opus-5"), "Opus 5");
+		assert_eq!(status_model_label("not-catalogued"), "not-catalogued");
+	}
+	#[test]
+	fn status_thinking_level_keeps_only_visible_reasoning_efforts() {
+		assert_eq!(status_thinking_level(Effort::Off), None);
+		assert_eq!(status_thinking_level(Effort::Max), Some(StatusThinkingLevel::Max));
+	}
+	#[test]
+	fn composer_shape_setting_decodes_into_live_style() {
+		let mut settings = Settings::default();
+		apply_setting_changes(&mut settings, &[omp_chat_ui::SettingChange {
+			domain: sf!("interaction"),
+			path:   sf!("composer.shape"),
+			value:  Value::String("rail".into()),
+		}])
+		.expect("composer shape setting");
+
+		assert_eq!(settings.composer.shape, settings::ComposerStyle::Rail);
+		assert_eq!(
+			presentation_composer_style(settings.composer.shape),
+			components::ComposerStyle::Rail
+		);
+	}
 
 	fn test_bridge_state(scratch: &Path) -> BridgeState {
 		let command_usage = Arc::new(
@@ -6553,7 +6609,6 @@ mod tests {
 			token_rate: None,
 			tokens_per_second: None,
 			thinking: None,
-			session_accent: sf!("test"),
 			replaying_turn: false,
 			vision_override: None,
 			settings: Settings::default(),
@@ -6624,7 +6679,7 @@ mod tests {
 			.collect::<Vec<_>>()
 			.join("\n");
 		let retirement_text = chat
-			.retirement_batch(viewport.width)
+			.retirement_batch(Size::new(viewport.width, 0))
 			.map(|batch| {
 				(0..batch.frame.size().height)
 					.map(|row| frame_row_text(&batch.frame, row))

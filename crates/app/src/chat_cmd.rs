@@ -407,6 +407,11 @@ pub(crate) async fn run(
 	let settings =
 		omp_driver::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
 	let security_enabled = settings.security.enabled;
+	let resize_scrollback = match settings.tui.resize_scrollback {
+		omp_driver::settings::ResizeScrollbackMode::Append => host::ResizeScrollback::Append,
+		omp_driver::settings::ResizeScrollbackMode::Rebuild => host::ResizeScrollback::Rebuild,
+		omp_driver::settings::ResizeScrollbackMode::Preserve => host::ResizeScrollback::Preserve,
+	};
 	let roles = roles::resolve_launch_roles(
 		catalog,
 		args.model.as_deref(),
@@ -501,8 +506,18 @@ pub(crate) async fn run(
 	let goal_control = AgentGoalControl::default();
 	let bridges =
 		omp_driver::bridges::builtin(&root, Arc::clone(&search_bridge), goal_control.clone(), None);
-	let bridges =
-		omp_envd::RegistryBridges { ask_presenter: Some(omp_chat_ui::ask::presenter()), ..bridges };
+	let bridges = omp_envd::RegistryBridges {
+		ask_presenter: Some(omp_chat_ui::ask::presenter()),
+		// A remote gateway serves search/media itself; leave the host
+		// bridge unbound so `bind_remote` can install the gateway client
+		// instead of colliding with the pre-seeded local facade.
+		search: if args.gateway.is_some() {
+			None
+		} else {
+			bridges.search
+		},
+		..bridges
+	};
 	let prompt_head = Arc::new(ProductionPromptHead::from_extension_specs(&args.trusted_extensions));
 	let environment = omp_envd::ProjectEnvironment::connect_or_start(
 		&root,
@@ -810,6 +825,7 @@ pub(crate) async fn run(
 			plan_selection,
 			security_enabled,
 			!args.no_title,
+			resize_scrollback,
 			ChatScope {
 				catalog,
 				root: &root,
@@ -879,6 +895,7 @@ pub(crate) async fn run(
 			plan_selection,
 			security_enabled,
 			!args.no_title,
+			resize_scrollback,
 			ChatScope {
 				catalog,
 				root: &root,
@@ -973,6 +990,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	plan_selection: Option<ModelSelection>,
 	security_enabled: bool,
 	title_enabled: bool,
+	resize_scrollback: host::ResizeScrollback,
 	scope: ChatScope<'_>,
 	mut start: ChatStart,
 	presentation: ChatPresentation,
@@ -1322,6 +1340,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			session_root.join("local"),
 			security_enabled,
 			title_enabled,
+			resize_scrollback,
 			vec![
 				content
 					.commands
