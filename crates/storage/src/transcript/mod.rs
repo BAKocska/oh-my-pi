@@ -12,8 +12,6 @@
 pub mod block;
 pub mod capsule;
 pub mod codec;
-#[cfg(test)]
-mod codec_tests;
 pub mod event;
 pub mod import;
 pub mod msg;
@@ -35,7 +33,9 @@ pub use event::{
 	TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart,
 };
 pub use import::{
-	ForeignFormat, ImportDiagnostic, ImportedEntry, ImportedTranscript, parse_foreign_jsonl,
+	ForeignFormat, ForeignImportError, ForeignImportReport, ForeignSessionInfo, ImportDiagnostic,
+	ImportedEntry, ImportedTranscript, import_foreign_session, list_foreign_sessions,
+	list_foreign_sessions_in, parse_foreign_jsonl,
 };
 pub use msg::{
 	Content, MAX_PERSISTED_CHARS, Msg, PERSISTENCE_TRUNCATION_NOTICE, UserBlock,

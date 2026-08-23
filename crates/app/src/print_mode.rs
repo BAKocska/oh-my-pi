@@ -4,22 +4,25 @@ use std::{
 	collections::BTreeMap,
 	env, fs, io,
 	io::IsTerminal as _,
-	iter,
 	path::{Path, PathBuf},
+	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use miette::{IntoDiagnostic as _, miette};
-use omp_agent::{AgentEvent, AgentRunSummary, EventSubscription, PlanState, RunSettlement};
+use omp_agent::{
+	AgentEvent, AgentRunSummary, EventSubscription, InProcTurnClient, PlanState, RunSettlement,
+};
 use omp_catalog::snapshot;
 use omp_core::{Hash32, Str};
 use omp_driver::{
-	discovery::{native, roles},
+	discovery::roles,
 	headless::{
 		HeadlessSession, HeadlessSessionOptions,
 		finalize::{FinalizerBudget, FinalizerReport},
 	},
+	plan::ModelSelection,
 };
 use omp_envd::exthost::lifecycle::{HeadlessLifecycleKind, HeadlessLifecycleSubscription};
 use omp_inference::call::{ContentPart, MediaInput};
@@ -31,6 +34,7 @@ use omp_tools::read::dirtree;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Stderr, Stdout, stderr, stdin, stdout};
 
 use crate::{
+	chat_cmd::AppAdvisorRuntime,
 	cli::{PrintArgs, turn_id},
 	image_attachment,
 	image_attachment::ImageAttachmentError,
@@ -97,6 +101,26 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	}
 	let model = omp_driver::chat::resolve_model_selector(catalog, model.as_str())
 		.map_err(|error| miette!(error))?;
+	let plan_handoff = if args.plan_yolo {
+		match args.plan_yolo_into.as_deref() {
+			Some(selector) => {
+				let selected =
+					roles::resolve_role_selector(catalog, selector).map_err(|error| miette!(error))?;
+				Some(
+					ModelSelection::resolved(selected.model.as_str(), selected.thinking.as_deref())
+						.map_err(|error| miette!(error))?,
+				)
+			},
+			None => roles
+				.smol
+				.as_ref()
+				.map(|model| ModelSelection::resolved(model.as_str(), None))
+				.transpose()
+				.map_err(|error| miette!(error))?,
+		}
+	} else {
+		None
+	};
 	let credential_provider = args
 		.api_key
 		.as_ref()
@@ -124,9 +148,11 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		model,
 		initial_campaign: args.plan_yolo.then_some("plan"),
 		initial_prompt_slot: args.plan_yolo.then_some("plan-yolo"),
+		plan_handoff,
 		resume: None,
 		fork: None,
 		py_eval: false,
+		approval_mode: args.effective_approval().map(Into::into),
 		pty_denied: args.no_pty,
 		credential_provider,
 		api_key: args.api_key.clone(),
@@ -135,6 +161,23 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	})
 	.await
 	.into_diagnostic()?;
+	let advisor_runtime = if args.advisor {
+		let (runtime, _notices) = AppAdvisorRuntime::compose(
+			session.advisor_parent(),
+			None,
+			cwd.clone(),
+			Str::new(session.session_id()),
+			true,
+			session.available_tool_names(),
+			catalog,
+			true,
+		)
+		.await
+		.into_diagnostic()?;
+		Some(Arc::new(runtime))
+	} else {
+		None
+	};
 	let fresh = session.initial_items().is_empty();
 	let startup_plan_ignored = startup_plan_ignored(&settings, fresh, args.plan_yolo);
 	let mut stderr = stderr();
@@ -157,6 +200,12 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	session
 		.finalizer_mut()
 		.set_telemetry(|| async { omp_telemetry::export::shutdown() });
+	if let Some(runtime) = advisor_runtime.as_ref() {
+		let runtime = Arc::clone(runtime);
+		session
+			.finalizer_mut()
+			.set_advisor(move || async move { runtime.drain().await });
+	}
 	let events = session
 		.take_events()
 		.expect("headless print owns the lossless event subscription");
@@ -183,6 +232,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		&mut session,
 		&events,
 		&lifecycle_events,
+		advisor_runtime.as_deref(),
 		initial_message(initial, system),
 		&mut part_kinds,
 		json,
@@ -202,6 +252,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 			&mut session,
 			&events,
 			&lifecycle_events,
+			advisor_runtime.as_deref(),
 			vec![message(Role::User, vec![Part {
 				kind: Some(part::Kind::Text(follow_up.to_string())),
 			}])],
@@ -281,6 +332,7 @@ async fn submit_print_turn(
 	session: &mut HeadlessSession,
 	events: &EventSubscription,
 	lifecycle_events: &HeadlessLifecycleSubscription,
+	advisor: Option<&AppAdvisorRuntime<InProcTurnClient>>,
 	items: Vec<Item>,
 	part_kinds: &mut BTreeMap<u32, part_start::Kind>,
 	json: bool,
@@ -295,7 +347,10 @@ async fn submit_print_turn(
 			result = &mut submit => break result,
 			event = events.recv() => {
 				let Ok(event) = event else { continue; };
-		emit_event(&event, part_kinds, json, shape_transcript, stdout, stderr).await?;
+				if let Some(advisor) = advisor {
+					advisor.observe(event.as_ref()).await;
+				}
+				emit_event(&event, part_kinds, json, shape_transcript, stdout, stderr).await?;
 			},
 			event = lifecycle_events.recv() => {
 				let Ok(event) = event else { continue; };
@@ -304,6 +359,9 @@ async fn submit_print_turn(
 		}
 	};
 	while let Ok(event) = events.try_recv() {
+		if let Some(advisor) = advisor {
+			advisor.observe(event.as_ref()).await;
+		}
 		emit_event(&event, part_kinds, json, shape_transcript, stdout, stderr).await?;
 	}
 	Ok(result?)
@@ -722,30 +780,6 @@ fn document_media_type(path: &Path, bytes: &[u8]) -> Option<&'static str> {
 	}
 }
 
-fn discover_system_prompt() -> miette::Result<Option<Str>> {
-	let cwd = env::current_dir().into_diagnostic()?;
-	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
-	discover_system_prompt_from(&cwd, &home)
-}
-
-fn discover_system_prompt_from(cwd: &Path, home: &Path) -> miette::Result<Option<Str>> {
-	let roots = native::discover_roots(cwd, home, 32);
-	let candidates = roots
-		.project
-		.iter()
-		.map(|root| root.join("SYSTEM.md"))
-		.chain(iter::once(roots.user.join("SYSTEM.md")));
-	for path in candidates {
-		if path.is_file() {
-			return fs::read_to_string(path)
-				.map(Str::from)
-				.into_diagnostic()
-				.map(Some);
-		}
-	}
-	Ok(None)
-}
-
 async fn write_json(stdout: &mut Stdout, line: &str) -> miette::Result<()> {
 	stdout.write_all(line.as_bytes()).await.into_diagnostic()?;
 	stdout.flush().await.into_diagnostic()
@@ -761,7 +795,6 @@ fn json_string(text: &str) -> String {
 #[cfg(test)]
 mod tests {
 
-	use omp_core::sf;
 	use omp_driver::settings::Settings;
 
 	use super::*;
@@ -819,17 +852,5 @@ mod tests {
 		};
 		assert!(listing.contains("blob.bin"));
 		assert!(listing.contains("main.rs"));
-	}
-
-	#[test]
-	fn discovers_nearest_project_system_prompt() {
-		let tree = tempfile::tempdir().expect("tree");
-		let cwd = tree.path().join("nested");
-		fs::create_dir_all(cwd.join(".omp")).expect("config");
-		fs::write(cwd.join(".omp/SYSTEM.md"), "project instructions").expect("system");
-		assert_eq!(
-			discover_system_prompt_from(&cwd, tree.path()).expect("discover"),
-			Some(sf!("project instructions"))
-		);
 	}
 }

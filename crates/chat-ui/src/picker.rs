@@ -1,4 +1,5 @@
-//! Compact session-model picker backed exclusively by host-supplied catalog rows.
+//! Compact session-model picker backed exclusively by host-supplied catalog
+//! rows.
 
 use std::fmt::{self, Write as _};
 

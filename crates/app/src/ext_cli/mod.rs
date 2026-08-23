@@ -1133,12 +1133,6 @@ fn pack_airgap_bundle(targets: Vec<Str>, files: Vec<BundleFile>) -> miette::Resu
 	pack_bundle("omp ext", targets, files).map_err(|error| miette!("{error}"))
 }
 
-/// Rechecks an air-gap bundle's fixed layout and every payload digest.
-fn verify_airgap_bundle(bytes: &[u8]) -> miette::Result<()> {
-	unpack_bundle(bytes).map_err(|error| miette!("{error}"))?;
-	Ok(())
-}
-
 fn validate_specs(specs: &[Str]) -> miette::Result<()> {
 	for spec in specs {
 		SourceSpec::parse(spec).map_err(|error| miette!("{error}"))?;

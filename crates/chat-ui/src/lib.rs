@@ -490,6 +490,8 @@ pub enum Intent {
 		/// User-selected action.
 		action:    ApprovalAction,
 	},
+	/// Apply one explicit AutoQA upload decision.
+	AutoQaConsent(autoqa::ConsentIntent),
 	/// Ask the backend for rewind targets.
 	RewindRequest,
 	/// Open the alternate-screen inspector over canonical conversation history.
@@ -592,6 +594,8 @@ pub enum BackendEvent {
 	},
 	/// Present one pending durable approval ticket.
 	ApprovalPending(ApprovalTicketView),
+	/// Present explicit upload consent for one redacted AutoQA report.
+	AutoQaConsent(autoqa::ConsentRequest),
 	/// Remove a settled or withdrawn approval ticket.
 	ApprovalSettled {
 		/// Stable ticket idempotency key.

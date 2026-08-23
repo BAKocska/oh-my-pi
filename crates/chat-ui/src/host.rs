@@ -28,6 +28,7 @@ use crate::{
 	WelcomeEvent,
 	approval::{ApprovalEvent, ApprovalOverlay},
 	ask::{self, AskDialog, AskDialogEvent, AskRequest},
+	autoqa::{AutoQaConsent, ConsentRequest, Decision},
 	modes::{GuidedGoalEvent, GuidedGoalInterview},
 	plan_review::{PlanReviewEvent, PlanReviewOverlay, PlanReviewSection},
 	selection_overlay::{SelectionEvent, SelectionOverlay},
@@ -397,6 +398,7 @@ struct ChatHost {
 	left_taps:               u8,
 	pending_approvals:       usize,
 	approval_queue:          VecDeque<ApprovalTicketView>,
+	autoqa_queue:            VecDeque<ConsentRequest>,
 	suppress_history_replay: bool,
 }
 
@@ -428,6 +430,7 @@ impl ChatHost {
 			left_taps: 0,
 			pending_approvals: 0,
 			approval_queue: VecDeque::new(),
+			autoqa_queue: VecDeque::new(),
 			suppress_history_replay: false,
 		}
 	}
@@ -847,6 +850,7 @@ enum Overlay {
 	Approval(ApprovalOverlay),
 	ApprovalAmend { prompt: PromptOverlay, ticket_id: Str },
 	Ask { dialog: AskDialog, request: AskRequest },
+	AutoQaConsent { dialog: AskDialog, consent: AutoQaConsent },
 }
 
 enum OverlayEvent {
@@ -870,6 +874,7 @@ enum OverlayEvent {
 	ApprovalAmend(Str),
 	AskCancel,
 	AskSubmit(Vec<Str>),
+	AutoQaConsent(Decision),
 	SettingsPreview(Vec<SettingChange>),
 	SettingsCommit(Vec<SettingChange>),
 	Selection(SelectionPurpose, Str),
@@ -920,6 +925,7 @@ impl Overlay {
 				event => event,
 			},
 			Self::Ask { dialog, .. } => ask_event(dialog.handle_key(key)),
+			Self::AutoQaConsent { dialog, .. } => autoqa_event(dialog.handle_key(key)),
 		}
 	}
 
@@ -966,6 +972,7 @@ impl Overlay {
 				event => event,
 			},
 			Self::Ask { dialog, .. } => ask_event(dialog.handle_paste(text)),
+			Self::AutoQaConsent { dialog, .. } => autoqa_event(dialog.handle_paste(text)),
 		}
 	}
 
@@ -1006,6 +1013,9 @@ impl Overlay {
 				}
 			},
 			Self::Ask { dialog, .. } => ask_event(dialog.handle_mouse(col, row, kind, viewport)),
+			Self::AutoQaConsent { dialog, .. } => {
+				autoqa_event(dialog.handle_mouse(col, row, kind, viewport))
+			},
 		}
 	}
 
@@ -1028,6 +1038,7 @@ impl Overlay {
 			Self::Approval(approval) => approval.layer(viewport),
 			Self::ApprovalAmend { prompt, .. } => prompt.layer(viewport),
 			Self::Ask { dialog, .. } => dialog.layer(viewport),
+			Self::AutoQaConsent { dialog, .. } => dialog.layer(viewport),
 		}
 	}
 }
@@ -1129,6 +1140,19 @@ fn ask_event(event: AskDialogEvent) -> OverlayEvent {
 		AskDialogEvent::Consumed => OverlayEvent::Consumed,
 		AskDialogEvent::Cancel => OverlayEvent::AskCancel,
 		AskDialogEvent::Submit(values) => OverlayEvent::AskSubmit(values),
+	}
+}
+fn autoqa_event(event: AskDialogEvent) -> OverlayEvent {
+	match event {
+		AskDialogEvent::Consumed => OverlayEvent::Consumed,
+		AskDialogEvent::Cancel => OverlayEvent::AutoQaConsent(Decision::LocalOnly),
+		AskDialogEvent::Submit(values) => {
+			OverlayEvent::AutoQaConsent(if values.iter().any(|value| value == "Upload") {
+				Decision::Upload
+			} else {
+				Decision::LocalOnly
+			})
+		},
 	}
 }
 
@@ -1592,6 +1616,13 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 				host.overlay = Some(Overlay::Approval(ApprovalOverlay::open(ticket, ctx)));
 			}
 		},
+		BackendEvent::AutoQaConsent(request) => {
+			if host.overlay.is_some() {
+				host.autoqa_queue.push_back(request);
+			} else {
+				open_autoqa_consent(host, request, ctx);
+			}
+		},
 		BackendEvent::ApprovalSettled { ticket_id } => {
 			host.pending_approvals = host.pending_approvals.saturating_sub(1);
 			let closes = matches!(
@@ -1670,6 +1701,12 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 		},
 	}
 }
+fn open_autoqa_consent(host: &mut ChatHost, request: ConsentRequest, ctx: &UiContext) {
+	let consent = AutoQaConsent::new(request);
+	let dialog = AskDialog::open(consent.question(), ctx);
+	host.overlay = Some(Overlay::AutoQaConsent { dialog, consent });
+}
+
 fn update_models(host: &mut ChatHost, rows: Vec<ModelRow>, current: usize) {
 	host.current_model = current.min(rows.len().saturating_sub(1));
 	if let Some(Overlay::Models(picker)) = &mut host.overlay {
@@ -1917,6 +1954,11 @@ fn apply_overlay_event(
 				request.fail("Ask dialog cancelled");
 			}
 		},
+		OverlayEvent::AutoQaConsent(decision) => {
+			if let Some(Overlay::AutoQaConsent { consent, .. }) = host.overlay.take() {
+				send(intents, Intent::AutoQaConsent(consent.decide(decision)));
+			}
+		},
 		OverlayEvent::SettingsPreview(changes) => {
 			send(intents, Intent::ApplySettings { changes, commit: false });
 		},
@@ -1928,6 +1970,11 @@ fn apply_overlay_event(
 			send(intents, Intent::Select { purpose, key });
 			host.overlay = None;
 		},
+	}
+	if host.overlay.is_none()
+		&& let Some(request) = host.autoqa_queue.pop_front()
+	{
+		open_autoqa_consent(host, request, ctx);
 	}
 	None
 }
@@ -2131,13 +2178,14 @@ mod tests {
 		rc::Rc,
 	};
 
+	use omp_core::sf;
 	use omp_tui::{Frame, Key, Renderer, Size, UiContext};
 
 	use super::{
 		ChatHost, Duration, HostExit, HostOptions, Instant, Overlay, PaintKind, ResizeState,
 		RetainedChat, RetainedChatEffect, paint_host,
 	};
-	use crate::{BackendEvent, Chat, HistoryInspector};
+	use crate::{BackendEvent, Chat, HistoryInspector, Intent, ModelRow};
 
 	#[test]
 	fn resize_settle_window_restarts_at_each_event() {
@@ -2184,6 +2232,48 @@ mod tests {
 		assert!(chat.render().layers.is_empty());
 		assert_eq!(chat.key(Key::Ctrl('b')), RetainedChatEffect::Consumed);
 		assert_eq!(chat.render().layers.len(), 1);
+	}
+
+	#[test]
+	fn retained_model_picker_commits_the_next_model() {
+		let ctx = UiContext::default();
+		let (events, receiver) = flume::unbounded();
+		let (intents, requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+		let row = |key: &'static str, name: &'static str| ModelRow {
+			key:         sf!(key),
+			name:        sf!(name),
+			provider_id: sf!("provider"),
+			provider:    sf!("Provider"),
+			context:     None,
+			input_mtok:  None,
+			output_mtok: None,
+		};
+		events
+			.send(BackendEvent::ModelsUpdated {
+				rows:    vec![row("provider/first", "First"), row("provider/second", "Second")],
+				current: 0,
+			})
+			.expect("retained chat receiver remains connected");
+
+		assert_eq!(chat.poll(), RetainedChatEffect::Consumed);
+		assert_eq!(chat.key(Key::Alt('p')), RetainedChatEffect::Consumed);
+		assert_eq!(chat.key(Key::Down), RetainedChatEffect::Consumed);
+		assert_eq!(chat.key(Key::Enter), RetainedChatEffect::Consumed);
+
+		let intent = requests.try_recv().expect("model pick emits an intent");
+		let Intent::SwitchModel(model) = intent else {
+			panic!("model pick emitted the wrong intent");
+		};
+		assert_eq!(model, "provider/second");
+		assert!(chat.render().layers.is_empty());
 	}
 
 	fn finalized_host(ctx: &UiContext, viewport: Size) -> ChatHost {

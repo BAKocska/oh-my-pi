@@ -4,7 +4,8 @@
 //! diagnostics while later complete records retain their source line identity.
 
 use std::{
-	fs::File,
+	collections::{HashMap, HashSet},
+	fs::{self, File},
 	io,
 	io::{BufRead as _, BufReader},
 	path::{Path, PathBuf},
@@ -15,6 +16,9 @@ use omp_core::{Str, sf, time::parse_rfc3339};
 use serde_json::Value;
 use strum::IntoStaticStr;
 use thiserror::Error;
+
+mod foreign;
+use foreign::{list_claude_sessions, list_codex_sessions};
 
 use super::{
 	Attribution, Block, BlockKind, CallId, Event, Header, Kind, ModelId, ModelRef, Msg, ProviderId,
@@ -30,6 +34,50 @@ pub enum ForeignFormat {
 	ClaudeCode,
 	/// Codex CLI's rollout JSONL log.
 	Codex,
+}
+
+/// Metadata for one foreign session that can be offered to a picker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignSessionInfo {
+	/// Foreign session dialect.
+	pub source:        ForeignFormat,
+	/// Source-native session identifier.
+	pub id:            Str,
+	/// JSONL transcript path.
+	pub path:          PathBuf,
+	/// Working directory recorded by the foreign client, when known.
+	pub cwd:           Option<PathBuf>,
+	/// User-visible title or first prompt, when known.
+	pub title:         Option<Str>,
+	/// Last modification time in epoch milliseconds.
+	pub updated:       u64,
+	/// Number of indexed messages, when known.
+	pub message_count: Option<u64>,
+}
+
+/// Result of importing one selected foreign session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignImportReport {
+	/// New native journal header.
+	pub header:      Header,
+	/// Parsed foreign content and recoverable diagnostics.
+	pub transcript:  ImportedTranscript,
+	/// Durable event count, including provenance.
+	pub event_count: u64,
+}
+
+/// Failure while publishing a foreign session as a native journal.
+#[derive(Debug, Error)]
+pub enum ForeignImportError {
+	/// Source or destination filesystem operation failed.
+	#[error("foreign session import filesystem operation failed")]
+	Io(#[from] io::Error),
+	/// Transcript encoding or validation failed.
+	#[error(transparent)]
+	Transcript(#[from] CodecError),
+	/// Atomic v4 journal publication failed.
+	#[error(transparent)]
+	Journal(#[from] JournalError),
 }
 
 /// One recoverable problem found while scanning a foreign journal.
@@ -66,10 +114,6 @@ pub struct ImportedTranscript {
 impl ImportedTranscript {
 	/// Expands canonical messages into journal events and adjacent durable
 	/// labels.
-	///
-	/// The label targets the imported message's physical event index, preserving
-	/// provenance for assistant and tool-result entries whose message schema has
-	/// no attribution field.
 	pub fn into_events(self, format: ForeignFormat, first_event_index: u64) -> Vec<Event> {
 		let marker: &'static str = format.into();
 		let mut events = Vec::with_capacity(self.entries.len().saturating_mul(2));
@@ -90,10 +134,79 @@ impl ImportedTranscript {
 	}
 }
 
+/// Lists sessions from the default Claude Code or Codex data directory.
+///
+/// Missing, unreadable, and schema-incompatible indexes are treated as empty:
+/// callers can always present the remaining independently discovered files.
+pub fn list_foreign_sessions(format: ForeignFormat) -> Vec<ForeignSessionInfo> {
+	let root = match format {
+		ForeignFormat::ClaudeCode => std::env::var_os("CLAUDE_CONFIG_DIR")
+			.map(PathBuf::from)
+			.or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))),
+		ForeignFormat::Codex => {
+			std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+		},
+	};
+	root.map_or_else(Vec::new, |root| list_foreign_sessions_in(format, &root))
+}
+
+/// Lists sessions rooted at `root`, primarily for callers with an explicit
+/// foreign-client data directory and for deterministic tests.
+pub fn list_foreign_sessions_in(format: ForeignFormat, root: &Path) -> Vec<ForeignSessionInfo> {
+	let mut sessions = match format {
+		ForeignFormat::ClaudeCode => list_claude_sessions(root),
+		ForeignFormat::Codex => list_codex_sessions(root),
+	};
+	sessions.sort_unstable_by(|left, right| {
+		right
+			.updated
+			.cmp(&left.updated)
+			.then_with(|| left.path.cmp(&right.path))
+	});
+	sessions
+}
+
+/// Converts `info` to a native v4 journal at `destination`.
+///
+/// `header` is supplied by the native session creator and therefore carries a
+/// fresh session id and its selected working directory. A durable provenance
+/// label precedes all imported entries.
+pub fn import_foreign_session(
+	info: &ForeignSessionInfo,
+	destination: &Path,
+	header: Header,
+) -> Result<ForeignImportReport, ForeignImportError> {
+	let input = fs::read_to_string(&info.path)?;
+	let transcript = parse_foreign_jsonl(info.source, &input);
+	let source: &'static str = info.source.into();
+	let cwd = info
+		.cwd
+		.as_ref()
+		.map_or_else(String::new, |cwd| cwd.display().to_string());
+	let provenance = Str::from(format!(
+		"foreign_session_import:{source}:{}:{}:{cwd}",
+		info.id,
+		info.path.display()
+	));
+	let mut events = transcript.clone().into_events(info.source, 0);
+	if !events.is_empty() {
+		events.insert(1, Event {
+			ts:   header.created,
+			kind: Kind::Label { target: 0, label: Some(provenance) },
+		});
+	}
+	let event_count = u64::try_from(events.len()).expect("event count fits in u64");
+	let mut writer = Writer::create_lazy(destination, &header)?;
+	writer.append_atomic(&events)?;
+	Ok(ForeignImportReport { header, transcript, event_count })
+}
+
 /// Parses a Claude Code or Codex JSONL journal without allowing one damaged
 /// physical record to discard later complete messages.
 pub fn parse_foreign_jsonl(format: ForeignFormat, input: &str) -> ImportedTranscript {
 	let mut output = ImportedTranscript::default();
+	let mut claude_parents = HashMap::<Str, Option<Str>>::new();
+	let mut claude_tail = None;
 	for (offset, line) in input.lines().enumerate() {
 		let source_line = offset as u64 + 1;
 		if line.trim().is_empty() {
@@ -110,6 +223,20 @@ pub fn parse_foreign_jsonl(format: ForeignFormat, input: &str) -> ImportedTransc
 				continue;
 			},
 		};
+		if format == ForeignFormat::ClaudeCode {
+			if let Some(object) = value.as_object() {
+				if let Some(uuid) = object.get("uuid").and_then(Value::as_str) {
+					claude_tail = Some(Str::new(uuid));
+					claude_parents.insert(
+						Str::new(uuid),
+						object
+							.get("parentUuid")
+							.and_then(Value::as_str)
+							.map(Str::new),
+					);
+				}
+			}
+		}
 		match parse_record(format, source_line, &value) {
 			Ok(Some(entry)) => output.entries.push(entry),
 			Ok(None) => {},
@@ -120,7 +247,50 @@ pub fn parse_foreign_jsonl(format: ForeignFormat, input: &str) -> ImportedTransc
 			}),
 		}
 	}
+	if format == ForeignFormat::ClaudeCode {
+		let mut active = HashSet::new();
+		let mut cursor = claude_tail;
+		while let Some(id) = cursor {
+			if !active.insert(id.clone()) {
+				break;
+			}
+			cursor = claude_parents.get(&id).cloned().flatten();
+		}
+		if active.len() > 1 {
+			output.entries.retain(|entry| {
+				entry
+					.source_id
+					.as_ref()
+					.is_none_or(|id| active.contains(id))
+			});
+		}
+		output
+			.entries
+			.sort_unstable_by_key(|entry| entry.source_line);
+		link_claude_tools(&mut output.entries);
+	}
 	output
+}
+
+fn link_claude_tools(entries: &mut [ImportedEntry]) {
+	let mut names = HashMap::<Str, Str>::new();
+	for entry in entries {
+		match &mut entry.event.kind {
+			Kind::Msg(Msg::Assistant { content, .. }) => {
+				for block in content {
+					if let BlockKind::Tool { id, name, .. } = &block.kind {
+						names.insert(id.0.clone(), name.clone());
+					}
+				}
+			},
+			Kind::Msg(Msg::ToolResult { call, tool, .. }) if tool == "unknown" => {
+				if let Some(name) = names.get(&call.0) {
+					*tool = name.clone();
+				}
+			},
+			_ => {},
+		}
+	}
 }
 
 fn parse_record(
@@ -158,6 +328,33 @@ fn parse_claude(value: &Value) -> Option<Msg> {
 	}
 	let message = value.get("message").unwrap_or(value);
 	let role = message.get("role").and_then(Value::as_str).unwrap_or(kind);
+	if role == "user" {
+		if let Some(result) = message
+			.get("content")
+			.and_then(Value::as_array)
+			.and_then(|blocks| {
+				blocks
+					.iter()
+					.find(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+			}) {
+			let call = result.get("tool_use_id").and_then(Value::as_str)?;
+			return Some(Msg::ToolResult {
+				call:          CallId(Str::new(call)),
+				tool:          sf!("unknown"),
+				content:       extract_text(result.get("content"))
+					.into_iter()
+					.map(|text| UserBlock::Text { text })
+					.collect(),
+				details:       None,
+				error:         result
+					.get("is_error")
+					.and_then(Value::as_bool)
+					.unwrap_or(false),
+				useless:       false,
+				provider_meta: None,
+			});
+		}
+	}
 	if role == "assistant"
 		&& let Some(parts) = message.get("content").and_then(Value::as_array)
 	{
@@ -718,6 +915,20 @@ mod tests {
 			&parsed.entries[2].event.kind,
 			Kind::Msg(Msg::Assistant { content, .. })
 				if matches!(&content[0].kind, BlockKind::Tool { id, name, .. } if id.0 == "call-1" && name == "read")
+		));
+	}
+
+	#[test]
+	fn claude_links_tool_results_to_the_preceding_tool_call() {
+		let input = concat!(
+			r#"{"type":"assistant","uuid":"a","message":{"role":"assistant","content":[{"type":"tool_use","id":"call","name":"read","input":{}}]}}"#,
+			"\n",
+			r#"{"type":"user","uuid":"u","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":"ok"}]}}"#,
+		);
+		let parsed = parse_foreign_jsonl(ForeignFormat::ClaudeCode, input);
+		assert!(matches!(
+			&parsed.entries[1].event.kind,
+			Kind::Msg(Msg::ToolResult { tool, .. }) if tool == "read"
 		));
 	}
 }

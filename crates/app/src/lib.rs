@@ -13,7 +13,6 @@ pub mod chat_cmd;
 /// its output.
 #[doc(hidden)]
 pub mod chat_ui;
-pub mod claude_trace;
 pub mod cleanse_cmd;
 pub mod cli;
 pub mod complete_cmd;

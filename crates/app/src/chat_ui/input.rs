@@ -165,7 +165,7 @@ pub const COMMANDS: &[CommandSpec] = &[
 		name:        "switch",
 		aliases:     &[],
 		description: "Temporarily change this session's model",
-		usage:       "<model>",
+		usage:       "[model]",
 		subcommands: &[],
 	},
 	CommandSpec {
@@ -1062,6 +1062,7 @@ mod tests {
 		assert_eq!(commands.parse_input("/live"), Ok(ChatCommand::Live));
 		assert_eq!(parse_slash("/model: smol"), Some(ParsedSlash { name: "model", args: "smol" }));
 		assert_eq!(commands.parse_input("/model:smol"), Ok(ChatCommand::Model(sf!("smol"))));
+		assert_eq!(commands.parse_input("/model"), Ok(ChatCommand::ModelPicker));
 		assert_eq!(commands.parse_input("/switch"), Ok(ChatCommand::ModelPicker));
 		assert_eq!(
 			commands.parse_input("/switch anthropic/opus"),

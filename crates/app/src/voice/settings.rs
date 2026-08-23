@@ -15,7 +15,7 @@ const STT_MODEL_OPTIONS: &[SettingOption] = &[
 	SettingOption {
 		value:       "parakeet",
 		label:       "Parakeet TDT v3",
-		description: Some("SoTA English speech recognition through sherpa-onnx"),
+		description: Some("SoTA English speech recognition through Candle Parakeet"),
 	},
 	SettingOption {
 		value:       "fast",

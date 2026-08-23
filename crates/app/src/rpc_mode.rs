@@ -3405,56 +3405,6 @@ impl CommandError {
 	}
 }
 
-const fn supported_commands() -> &'static [&'static str] {
-	&[
-		"prompt",
-		"steer",
-		"follow_up",
-		"abort",
-		"abort_and_prompt",
-		"new_session",
-		"get_state",
-		"set_model",
-		"cycle_model",
-		"get_available_models",
-		"set_fast_mode",
-		"set_thinking_level",
-		"cycle_thinking_level",
-		"set_steering_mode",
-		"set_follow_up_mode",
-		"set_interrupt_mode",
-		"compact",
-		"set_auto_compaction",
-		"set_auto_retry",
-		"abort_retry",
-		"set_todos",
-		"bash",
-		"abort_bash",
-		"get_session_stats",
-		"export_html",
-		"switch_session",
-		"branch",
-		"get_branch_messages",
-		"get_last_assistant_text",
-		"set_session_name",
-		"handoff",
-		"get_messages",
-		"get_messages_page",
-		"get_login_providers",
-		"login",
-		"set_host_tools",
-		"call_host_tool",
-		"set_host_uri_schemes",
-		"set_subagent_subscription",
-		"get_subagents",
-		"get_subagent_messages",
-		"get_available_commands",
-		"reload_extensions",
-		"extension_ui_request",
-		"extension_error",
-	]
-}
-
 fn unix_millis() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)

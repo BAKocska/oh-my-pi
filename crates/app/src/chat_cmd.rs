@@ -9,23 +9,30 @@ use nix::sys::signal;
 use nix::unistd::Pid;
 use omp_agent::{
 	Agent, AgentKind, AgentState, AgentStatus, Budget, InProcTurnClient, RpcTurnClient, TurnClient,
+	advisor::{AdviceDelivery, DeliveryContext},
 };
 use omp_catalog::snapshot;
 use omp_chat_ui::host;
 use omp_collab::guest::GuestRelayPump;
 use omp_core::{Str, sf};
 use omp_driver::{
+	advisor::{
+		engine::{AdviceOutcome, AdvisorEngine, AdvisorEngineOptions, AdvisorPromptJob},
+		runtime::{ActiveAdvisorCampaign, AdvisorFailureClass},
+		transcript::{AdvisorTranscriptRecord, AdvisorUsageTotals},
+	},
 	autolearn::AutolearnCampaign,
 	bridges::{AgentGoalControl, InferenceBridge},
 	chat::{
-		AgentCampaignControlBackend, AgentsControlAuthority, CHAT_CAPS_BASE,
-		CampaignControlAuthorityFactory, ChatAuthWorker, ChatError as DriverChatError,
-		ChatParentHost, ChatProviderControlBackend, ChatScope, EphemeralSessions,
-		LaunchToolSelection, Session, SessionOpen, agent_snapshot, apply_launch_tool_selection,
-		canonical_project, ensure_state_directory, fallback_model_selector,
-		interrupted_reasoning_dialect, model_context_window, model_selector_is_selectable, now_ms,
-		open_session, resolve_model_provider, resolve_model_selector, resume_choices,
-		session_blueprint, strict_session_id, thinking_effort,
+		AdvisorChildError, AdvisorChildSpec, AgentCampaignControlBackend, AgentsControlAuthority,
+		CHAT_CAPS_BASE, CampaignControlAuthorityFactory, ChatAuthWorker,
+		ChatError as DriverChatError, ChatParentHost, ChatProviderControlBackend, ChatScope,
+		EphemeralSessions, LaunchToolSelection, Session, SessionOpen, agent_snapshot,
+		apply_launch_tool_selection, canonical_project, ensure_state_directory,
+		fallback_model_selector, interrupted_reasoning_dialect, model_context_window,
+		model_selector_is_selectable, now_ms, open_session, resolve_model_provider,
+		resolve_model_selector, resume_choices, session_blueprint, strict_session_id,
+		thinking_effort,
 	},
 	collab::session::{self, CollabSessionAuthority},
 	discovery::{
@@ -69,8 +76,17 @@ use omp_proto::{
 use omp_sdk::SessionBlueprint;
 use omp_settings::manager::{SettingsManager, SettingsManagerError, SettingsPaths};
 use omp_storage::{
-	blob, blob::BlobStore, gc, gc::ArtifactCatalog, index, index::SessionIndex,
-	telemetry_index::TelemetryIndex, transcript::SessionId,
+	blob,
+	blob::BlobStore,
+	gc,
+	gc::ArtifactCatalog,
+	index,
+	index::SessionIndex,
+	telemetry_index::TelemetryIndex,
+	transcript::{
+		ForeignFormat, Header as JournalHeader, SessionId, import_foreign_session,
+		list_foreign_sessions,
+	},
 };
 use omp_tools::eval::EvalSessionControl;
 use parking_lot::Mutex;
@@ -319,6 +335,9 @@ enum ChatError {
 	/// Session index mutation failed.
 	#[error(transparent)]
 	SessionIndex(#[from] index::Error),
+	/// Advisor child or campaign composition failed.
+	#[error(transparent)]
+	Advisor(#[from] AppAdvisorError),
 	/// Interactive terminal or GUI host failed.
 	#[error("interactive chat shell failed: {0}")]
 	Ui(miette::Report),
@@ -403,6 +422,70 @@ pub(crate) async fn run(
 			);
 		}
 	}
+	if args.from_claude || args.from_codex {
+		let format = if args.from_claude {
+			ForeignFormat::ClaudeCode
+		} else {
+			ForeignFormat::Codex
+		};
+		let source_label = if args.from_claude {
+			"Claude Code"
+		} else {
+			"Codex"
+		};
+		let sessions = list_foreign_sessions(format);
+		if sessions.is_empty() {
+			return Err(miette::miette!("no importable {source_label} sessions were found"));
+		}
+		let rows: Vec<omp_chat_ui::ListRow> = sessions
+			.iter()
+			.map(|info| omp_chat_ui::ListRow {
+				key:    info.id.clone(),
+				label:  info.title.clone().unwrap_or_else(|| info.id.clone()),
+				detail: info.cwd.as_ref().map_or_else(
+					|| Str::from(info.path.to_string_lossy().as_ref()),
+					|cwd| Str::from(cwd.to_string_lossy().as_ref()),
+				),
+			})
+			.collect();
+		let title = format!("Import {source_label} session");
+		let Some(selected) = run_list(&title, &rows)
+			.await
+			.map_err(|error| miette::miette!(error))?
+		else {
+			return Ok(());
+		};
+		let info = &sessions[selected];
+		if let Some(cwd) = info.cwd.as_ref().filter(|cwd| cwd.is_dir()) {
+			root = canonical_project(cwd).map_err(|error| miette::miette!(error))?;
+		}
+		let import_state_dir = omp_env::project_state::directory(&data_dir, &root)
+			.map_err(|error| miette::miette!(error))?;
+		let import_sessions_dir = import_state_dir.join("sessions");
+		ensure_state_directory(&import_sessions_dir).map_err(|error| miette::miette!(error))?;
+		let imported_id = Str::from(omp_core::Ulid::generate().to_string());
+		let destination = import_sessions_dir.join(format!("{imported_id}.jsonl"));
+		let header = JournalHeader {
+			v:       4,
+			id:      SessionId(imported_id.clone()),
+			created: now_ms(),
+			cwd:     root.clone(),
+		};
+		let report = import_foreign_session(info, &destination, header)
+			.map_err(|error| miette::miette!(error))?;
+		for diagnostic in report.transcript.diagnostics.iter().take(5) {
+			eprintln!(
+				"Import warning at {source_label} line {}: {}",
+				diagnostic.line, diagnostic.reason
+			);
+		}
+		eprintln!(
+			"Imported {source_label} session {} as {imported_id} ({} events).",
+			info.id, report.event_count
+		);
+		picked_resume = Some(imported_id);
+		selected_sessions_dir = Some(import_sessions_dir);
+	}
 	let catalog = snapshot::Catalog::try_embedded().map_err(|e| miette::miette!(e))?;
 	let settings =
 		omp_driver::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
@@ -439,6 +522,26 @@ pub(crate) async fn run(
 		.map(|model| ModelSelection::resolved(model.as_str(), roles.plan_thinking.as_deref()))
 		.transpose()
 		.map_err(|error| miette::miette!(error))?;
+	let plan_handoff = if args.plan_yolo {
+		match args.plan_yolo_into.as_deref() {
+			Some(selector) => {
+				let selected = roles::resolve_role_selector(catalog, selector)
+					.map_err(|error| miette::miette!(error))?;
+				Some(
+					ModelSelection::resolved(selected.model.as_str(), selected.thinking.as_deref())
+						.map_err(|error| miette::miette!(error))?,
+				)
+			},
+			None => roles
+				.smol
+				.as_ref()
+				.map(|model| ModelSelection::resolved(model.as_str(), None))
+				.transpose()
+				.map_err(|error| miette::miette!(error))?,
+		}
+	} else {
+		None
+	};
 	let interrupt_grace = settings.runtime_durations().interrupt_grace;
 	let auto_thinking = settings.auto_thinking;
 	let power_mode = omp_driver::power::configured(&data_dir).into_diagnostic()?;
@@ -525,6 +628,7 @@ pub(crate) async fn run(
 		&env_socket,
 		&document_socket,
 		args.py_eval,
+		args.effective_approval().map(Into::into),
 		&args.trusted_extensions,
 		interrupt_grace,
 		bridges,
@@ -659,8 +763,8 @@ pub(crate) async fn run(
 		Arc::clone(&registry),
 	)
 	.map_err(|error| miette::miette!(error))?;
-	let mut snapshot =
-		agent_snapshot(&blueprint, catalog).map_err(|error| miette::miette!(error))?;
+	let mut snapshot = agent_snapshot(&blueprint, catalog, args.external_thinking.then_some(true))
+		.map_err(|error| miette::miette!(error))?;
 	let mut prompt_facts = blueprint.prompt_facts().clone();
 	let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
 	let prompt_settings = PromptSettings::default()
@@ -672,7 +776,9 @@ pub(crate) async fn run(
 		identifier:        model.clone(),
 		codex_task_policy: prompt_policy::uses_codex_task_prompt(model.as_str()),
 	};
-	if let Some(level) = args.thinking {
+	if let Some(level) = args.thinking
+		&& !args.external_thinking
+	{
 		let effort = thinking_effort(level.into(), auto_thinking);
 		snapshot.turn.params.thinking =
 			Some(inference_pb::Reasoning { effort: effort as i32, ..Default::default() });
@@ -716,8 +822,10 @@ pub(crate) async fn run(
 	)
 	.map_err(|error| miette::miette!(error))?;
 	let env = environment.client().with_invocation_grant(invocation_grant);
-	let settings_manager = SettingsManager::open(SettingsPaths::discover(&data_dir, Some(&root)))
-		.map_err(|error| miette::miette!(error))?;
+	let settings_manager = Arc::new(
+		SettingsManager::open(SettingsPaths::discover(&data_dir, Some(&root)))
+			.map_err(|error| miette::miette!(error))?,
+	);
 	let configured_autolearn = settings_manager
 		.snapshot()
 		.project::<omp_driver::settings::Settings>()
@@ -783,7 +891,8 @@ pub(crate) async fn run(
 		.props()
 		.map_err(|error| miette::miette!(error))?;
 	let state = AgentState::new(snapshot);
-	let initial_campaign = args.plan_mode.then_some("plan");
+	let initial_campaign = (args.plan_mode || args.plan_yolo).then_some("plan");
+	let initial_prompt_slot = args.plan_yolo.then_some("plan-yolo");
 
 	if let Some(endpoint) = args.gateway {
 		if args.api_key.is_some() || args.prompt_cache_key.is_some() {
@@ -807,6 +916,7 @@ pub(crate) async fn run(
 			env,
 			state,
 			autolearn,
+			args.advisor,
 			session,
 			blueprint,
 			eval_control.clone(),
@@ -819,10 +929,15 @@ pub(crate) async fn run(
 			credential_control_grants,
 			Arc::clone(&prompt_head),
 			data_dir.clone(),
+			Arc::clone(&settings_manager),
 			state_dir.clone(),
 			power_mode,
 			initial_campaign,
+			initial_prompt_slot,
 			plan_selection,
+			plan_handoff.clone(),
+			args.external_thinking.then_some(true),
+			args.hide_thinking,
 			security_enabled,
 			!args.no_title,
 			resize_scrollback,
@@ -877,6 +992,7 @@ pub(crate) async fn run(
 			env,
 			state,
 			autolearn,
+			args.advisor,
 			session,
 			blueprint,
 			eval_control,
@@ -889,10 +1005,15 @@ pub(crate) async fn run(
 			credential_control_grants,
 			prompt_head,
 			data_dir,
+			settings_manager,
 			state_dir,
 			power_mode,
 			initial_campaign,
+			initial_prompt_slot,
 			plan_selection,
+			plan_handoff,
+			args.external_thinking.then_some(true),
+			args.hide_thinking,
 			security_enabled,
 			!args.no_title,
 			resize_scrollback,
@@ -961,6 +1082,300 @@ fn bind_goal_todo_context(events: omp_agent::EventSubscription, modes: sync::Wea
 	}));
 }
 
+/// App-owned failures while attaching persistent advisor children.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AppAdvisorError {
+	/// Persistent advisor child composition failed.
+	#[error(transparent)]
+	Child(#[from] AdvisorChildError),
+}
+
+/// Shared app adapter joining engine coordination to persistent child
+/// execution.
+pub(crate) struct AppAdvisorRuntime<C: TurnClient + Clone + Send + Sync + 'static> {
+	engine:    Arc<Mutex<AdvisorEngine>>,
+	parent:    Arc<ChatParentHost<C>>,
+	control:   Option<omp_agent::ControlSender>,
+	children:  BTreeMap<Str, Str>,
+	campaigns: BTreeMap<Str, ActiveAdvisorCampaign>,
+	notices:   flume::Sender<Option<Str>>,
+	headless:  bool,
+}
+
+impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
+	/// Composes engine workers and their restricted persistent children.
+	pub(crate) async fn compose(
+		parent: Arc<ChatParentHost<C>>,
+		control: Option<omp_agent::ControlSender>,
+		project_root: PathBuf,
+		primary_session: Str,
+		enabled: bool,
+		available_tools: Vec<Str>,
+		catalog: &snapshot::Catalog,
+		headless: bool,
+	) -> Result<(Self, flume::Receiver<Option<Str>>), AppAdvisorError> {
+		let engine = Arc::new(Mutex::new(AdvisorEngine::compose(
+			AdvisorEngineOptions {
+				project_root,
+				primary_session,
+				enabled,
+				immune_turns: 3,
+				available_tools,
+			},
+			catalog,
+		)));
+		let specs = {
+			let engine = engine.lock();
+			engine
+				.workers()
+				.filter_map(|worker| {
+					Some(AdvisorChildSpec {
+						id:            worker.id.clone(),
+						display_name:  worker.display_name.clone(),
+						model:         worker.model.clone(),
+						tools:         worker.tools.clone(),
+						system_prompt: worker.system_prompt.clone(),
+						advice_queue:  engine.advice_queue(worker.id.as_str())?,
+					})
+				})
+				.collect::<Vec<_>>()
+		};
+		let mut children = BTreeMap::new();
+		for spec in specs {
+			let advisor_id = spec.id.clone();
+			let child_id = parent.spawn_advisor(spec).await?;
+			children.insert(advisor_id, child_id);
+		}
+		let (notices, receiver) = flume::unbounded();
+		Ok((
+			Self { engine, parent, control, children, campaigns: BTreeMap::new(), notices, headless },
+			receiver,
+		))
+	}
+
+	/// Returns the shared engine used by commands and status presentation.
+	pub(crate) fn engine(&self) -> Arc<Mutex<AdvisorEngine>> {
+		Arc::clone(&self.engine)
+	}
+
+	/// Engages delivery campaigns after the primary agent actor starts.
+	pub(crate) async fn activate(&mut self) -> Result<(), omp_agent::ControlError> {
+		let Some(control) = self.control.take() else {
+			return Ok(());
+		};
+		let advisor_ids = self
+			.engine
+			.lock()
+			.workers()
+			.map(|worker| worker.id.clone())
+			.collect::<Vec<_>>();
+		for advisor_id in advisor_ids {
+			let campaign =
+				ActiveAdvisorCampaign::engage(control.clone(), advisor_id.as_str(), Duration::ZERO, 2)
+					.await?;
+			self.campaigns.insert(advisor_id, campaign);
+		}
+		Ok(())
+	}
+
+	/// Applies one primary-loop event and runs any resulting advisor batches.
+	pub(crate) async fn observe(&self, event: &omp_agent::AgentEvent) {
+		match event {
+			omp_agent::AgentEvent::ToolFinished { item, .. } => {
+				if let Some(text) = advisor_tool_text(item) {
+					self.engine.lock().observe_primary_text(text.as_str());
+				}
+			},
+			omp_agent::AgentEvent::Turn { turn_id, event } => {
+				let Some(inference_pb::turn_event::Event::Outcome(outcome)) = event.event.as_ref()
+				else {
+					return;
+				};
+				for item in &outcome.output {
+					if let Some(text) = advisor_assistant_text(item) {
+						self.engine.lock().observe_primary_text(text.as_str());
+					}
+				}
+				let will_continue = outcome.stop == inference_pb::StopReason::StopToolUse as i32;
+				let jobs = self.engine.lock().end_primary_turn(will_continue);
+				let context = if self.headless {
+					DeliveryContext {
+						terminal_answer: true,
+						deferred_client_turns: true,
+						..DeliveryContext::default()
+					}
+				} else {
+					DeliveryContext {
+						terminal_answer: !will_continue,
+						queued_work: will_continue,
+						update_in_progress: will_continue,
+						..DeliveryContext::default()
+					}
+				};
+				self.run_jobs(jobs, turn_id.clone(), context).await;
+			},
+			_ => {},
+		}
+	}
+
+	/// Runs pending headless catch-up batches until the engine backlog is empty.
+	pub(crate) async fn drain(&self) {
+		loop {
+			let jobs = {
+				let mut engine = self.engine.lock();
+				if engine.backlog() == 0 {
+					break;
+				}
+				engine.end_primary_turn(false)
+			};
+			if jobs.is_empty() {
+				break;
+			}
+			self
+				.run_jobs(
+					jobs,
+					omp_agent::TurnId::new(format!("advisor-finalize-{}", omp_core::Ulid::generate())),
+					DeliveryContext {
+						terminal_answer: true,
+						deferred_client_turns: true,
+						..DeliveryContext::default()
+					},
+				)
+				.await;
+		}
+	}
+
+	async fn run_jobs(
+		&self,
+		jobs: Vec<AdvisorPromptJob>,
+		turn_id: omp_agent::TurnId,
+		context: DeliveryContext,
+	) {
+		for job in jobs {
+			let chunks = job
+				.batch
+				.chunks
+				.iter()
+				.map(|chunk| chunk.text.clone())
+				.collect::<Vec<_>>();
+			{
+				let mut engine = self.engine.lock();
+				for chunk in &chunks {
+					engine.record_transcript(&AdvisorTranscriptRecord {
+						timestamp_ms: now_ms(),
+						advisor_id:   job.advisor_id.clone(),
+						kind:         sf!("prompt"),
+						content:      chunk.clone(),
+						usage:        AdvisorUsageTotals::default(),
+					});
+				}
+			}
+			let child_id = self
+				.children
+				.get(job.advisor_id.as_str())
+				.unwrap_or(&job.advisor_id);
+			let outcome = match self
+				.parent
+				.run_advisor_batch(child_id.as_str(), chunks, turn_id.clone())
+				.await
+			{
+				Ok(outcome) => outcome,
+				Err(error) => {
+					tracing::warn!(advisor = %job.advisor_id, %error, "advisor batch failed");
+					let mut engine = self.engine.lock();
+					engine.record_failure(job.advisor_id.as_str(), AdvisorFailureClass::Transient);
+					engine.record_transcript(&AdvisorTranscriptRecord {
+						timestamp_ms: now_ms(),
+						advisor_id:   job.advisor_id.clone(),
+						kind:         sf!("error"),
+						content:      sf!("advisor batch failed"),
+						usage:        AdvisorUsageTotals::default(),
+					});
+					continue;
+				},
+			};
+			let queue = {
+				let mut engine = self.engine.lock();
+				engine.record_usage(job.advisor_id.as_str(), outcome.usage);
+				engine.record_transcript(&AdvisorTranscriptRecord {
+					timestamp_ms: now_ms(),
+					advisor_id:   job.advisor_id.clone(),
+					kind:         sf!("assistant"),
+					content:      outcome.final_text,
+					usage:        outcome.usage,
+				});
+				engine.record_success(job.advisor_id.as_str());
+				engine.advice_queue(job.advisor_id.as_str())
+			};
+			let Some(queue) = queue else {
+				continue;
+			};
+			for queued in queue.drain_ready() {
+				let admission = self.engine.lock().admit_advice(
+					job.advisor_id.as_str(),
+					queued.note,
+					queued.severity,
+					context,
+				);
+				match admission {
+					AdviceOutcome::Deliver { advice, delivery: AdviceDelivery::Preserve } => {
+						let _ = self.notices.send(Some(sf!(
+							"**Advisor {} ({})**\n\n{}",
+							advice.advisor_id,
+							advice.severity,
+							advice.note
+						)));
+					},
+					AdviceOutcome::Deliver { advice, .. } => {
+						if let Some(campaign) = self.campaigns.get(advice.advisor_id.as_str()) {
+							let _ = campaign.handle().submit(advice, context);
+						}
+					},
+					AdviceOutcome::Quarantined(reason) => {
+						if let Some(campaign) = self.campaigns.get(job.advisor_id.as_str()) {
+							let _ = campaign.record_quarantine(reason.to_string()).await;
+						}
+					},
+					AdviceOutcome::Suppressed(_) => {},
+				}
+			}
+			let _ = self.notices.send(None);
+		}
+	}
+}
+
+fn advisor_assistant_text(item: &omp_proto::thread::v1::Item) -> Option<Str> {
+	let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
+		return None;
+	};
+	if message.role != omp_proto::thread::v1::Role::Assistant as i32 {
+		return None;
+	}
+	advisor_parts_text(&message.parts)
+}
+
+fn advisor_tool_text(item: &omp_proto::thread::v1::Item) -> Option<Str> {
+	let Some(item::Kind::ToolResult(result)) = item.kind.as_ref() else {
+		return None;
+	};
+	let text = advisor_parts_text(&result.parts)?;
+	Some(sf!("Tool `{}` result:\n\n{}", result.name, text))
+}
+
+fn advisor_parts_text(parts: &[omp_proto::thread::v1::Part]) -> Option<Str> {
+	let mut rendered = String::new();
+	for part in parts {
+		let Some(part::Kind::Text(text)) = part.kind.as_ref() else {
+			continue;
+		};
+		if !rendered.is_empty() {
+			rendered.push('\n');
+		}
+		rendered.push_str(text);
+	}
+	(!rendered.is_empty()).then(|| Str::from(rendered))
+}
+
 #[expect(
 	clippy::future_not_send,
 	reason = "the designed terminal host remains confined to its event-loop thread"
@@ -972,6 +1387,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	env: omp_env::EnvClient,
 	mut state: AgentState,
 	autolearn: omp_agent::AutolearnSettings,
+	advisor_enabled: bool,
 	mut session: Session,
 	mut blueprint: SessionBlueprint,
 	eval_control: EvalSessionControl,
@@ -984,10 +1400,15 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	credential_control_grants: BTreeMap<Str, omp_driver::auth_backend::CredentialControlGrant>,
 	prompt_head: Arc<ProductionPromptHead>,
 	data_dir: PathBuf,
+	settings_manager: Arc<SettingsManager>,
 	state_dir: PathBuf,
 	power_mode: omp_driver::power::SleepPrevention,
 	initial_campaign: Option<&'static str>,
+	initial_prompt_slot: Option<&'static str>,
 	plan_selection: Option<ModelSelection>,
+	plan_handoff: Option<ModelSelection>,
+	external_thinking: Option<bool>,
+	hide_thinking: bool,
 	security_enabled: bool,
 	title_enabled: bool,
 	resize_scrollback: host::ResizeScrollback,
@@ -1229,8 +1650,14 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				.owner(&omp_agent::SlotClaim::Mode)
 				.is_none()
 		{
-			let (spec, machine) =
+			let (mut spec, machine) =
 				omp_agent::core_regime(spec_id).expect("startup names a built-in regime");
+			if let Some(prompt_slot) = initial_prompt_slot {
+				Arc::make_mut(&mut spec).binds = Arc::from([omp_agent::ScopedBinding {
+					slot:  omp_agent::BindSlot::PromptSlot,
+					value: Str::new_static(prompt_slot),
+				}]);
+			}
 			let _ = agent.engage_campaign(spec, machine, omp_agent::EngageOptions {
 				now_ms: now_ms(),
 				queue:  false,
@@ -1240,6 +1667,9 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		modes.sync_campaigns(agent.arbiter().campaigns());
 		bind_goal_todo_context(agent.events().subscribe_lossless(), Arc::downgrade(&modes));
 		modes.bind_plan_selection(state.clone(), plan_selection.clone());
+		if let Some(handoff) = plan_handoff.clone() {
+			modes.bind_plan_handoff(handoff);
+		}
 		parent.bind_campaigns(Arc::clone(&modes));
 		let _goal_binding = goal_control.bind(Arc::clone(&modes), agent.control());
 		state.update(|snapshot| {
@@ -1300,6 +1730,33 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			Some(parent.supervisor()),
 		)));
 		let _vibe = omp_driver::vibe::attach_chat(Arc::clone(&parent), Arc::clone(&modes));
+		let advisor_events = agent.events().subscribe_lossless();
+		let available_advisor_tools = scope
+			.registry
+			.devices()
+			.map(|device| device.name.clone())
+			.collect();
+		let (advisor_runtime, advisor_notices) = AppAdvisorRuntime::compose(
+			Arc::clone(&parent),
+			Some(agent.control()),
+			scope.root.to_path_buf(),
+			id.clone(),
+			advisor_enabled,
+			available_advisor_tools,
+			scope.catalog,
+			false,
+		)
+		.await?;
+		let advisor_engine = advisor_runtime.engine();
+		let advisor_task = tokio::spawn(async move {
+			let mut advisor_runtime = advisor_runtime;
+			if let Err(error) = advisor_runtime.activate().await {
+				tracing::warn!(%error, "advisor delivery campaigns could not be engaged");
+			}
+			while let Ok(event) = advisor_events.recv().await {
+				advisor_runtime.observe(event.as_ref()).await;
+			}
+		});
 		let initial_draft = if scope.persist_sessions {
 			drafts
 				.consume(&SessionId(current_id.clone()))?
@@ -1328,6 +1785,8 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			executor.clone(),
 			agent,
 			ChatUiSession { session_id: id, initial_items, context_window, title },
+			Some(advisor_engine),
+			advisor_notices,
 			Arc::clone(&scope.registry),
 			parent.tree(),
 			Arc::clone(&parent),
@@ -1335,6 +1794,8 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			modes,
 			auth.as_ref().map(|worker| worker.ui().clone()),
 			data_dir.clone(),
+			Arc::clone(&settings_manager),
+			Arc::clone(&telemetry_index),
 			Arc::clone(&scope.session_index),
 			scope.root.to_path_buf(),
 			session_root.join("local"),
@@ -1351,6 +1812,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			],
 			content.skills,
 			Some(approval_inbox),
+			hide_thinking,
 			{
 				let sessions_dir = scope.sessions_dir.to_path_buf();
 				let root = scope.root.to_path_buf();
@@ -1374,6 +1836,11 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		if let Some(task) = autolearn_task {
 			task.abort();
 			let _ = task.await;
+		}
+		advisor_task.abort();
+		let _ = advisor_task.await;
+		if let Err(error) = parent.clear_advisors().await {
+			tracing::warn!(%error, "advisor children could not be cleared");
 		}
 		capture_task.abort();
 		let _ = capture_task.await;
@@ -1417,7 +1884,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 					&session.id,
 					Arc::clone(&scope.registry),
 				)?;
-				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
+				let mut next = agent_snapshot(&blueprint, scope.catalog, external_thinking)?;
 				next.props = replace_model_props(prompt_props, &model);
 				state = AgentState::new(next);
 			},
@@ -1452,7 +1919,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 					&session.id,
 					Arc::clone(&scope.registry),
 				)?;
-				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
+				let mut next = agent_snapshot(&blueprint, scope.catalog, external_thinking)?;
 				next.props = replace_model_props(prompt_props, &model);
 				state = AgentState::new(next);
 			},
@@ -1491,7 +1958,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 					&session.id,
 					Arc::clone(&scope.registry),
 				)?;
-				let mut next = agent_snapshot(&blueprint, scope.catalog)?;
+				let mut next = agent_snapshot(&blueprint, scope.catalog, external_thinking)?;
 				next.props = replace_model_props(prompt_props, &model);
 				state = AgentState::new(next);
 			},
@@ -1501,26 +1968,4 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		auth.shutdown().await;
 	}
 	Ok(())
-}
-
-/// Resolves the catalog streaming watchdog for one model's primary route.
-///
-/// Absent providers, routes, or policies leave both bounds unset, which
-/// disables the loop's stream watchdog entirely.
-pub(crate) fn model_stream_watchdog(
-	catalog: &snapshot::Catalog,
-	model: &str,
-) -> omp_agent::StreamWatchdog {
-	let watchdog = catalog
-		.model(omp_catalog::ModelKey::from_ref(model))
-		.or_else(|| catalog.resolve_alias(model))
-		.and_then(|spec| spec.routes.first())
-		.and_then(|route| catalog.route(route))
-		.and_then(|route| catalog.provider(&route.provider))
-		.and_then(|provider| catalog.wire_policy(&provider.wire_policy))
-		.and_then(|policy| policy.streaming.watchdog);
-	watchdog.map_or_else(omp_agent::StreamWatchdog::default, |watchdog| omp_agent::StreamWatchdog {
-		first_event_ms: watchdog.first_event_ms,
-		idle_ms:        watchdog.idle_ms,
-	})
 }

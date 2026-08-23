@@ -43,8 +43,10 @@ pub use omp_driver::auth_flow::{
 	prompt_masks_input,
 };
 use omp_driver::{
+	advisor::engine::{AdvisorEngine, AdvisorEngineStatus, AdvisorRunState},
 	modes::{CampaignHandle, Goal, GoalStatus, GoalUsage},
 	settings::{self, Settings},
+	subagent::settings::TaskSettings,
 };
 use omp_executor::Executor;
 use omp_inference::{call::AuthInput, id::TurnId};
@@ -82,9 +84,9 @@ use serde_json::Value;
 
 use crate::chat_ui::{
 	commands::{
-		CommandFuture, CommandResult, CommandRole, CommandSurface, ConfigCommandHost, ConfigScope,
-		ConsumedResult, DispatchResult, FlowCommandHost, McpRequest, ModelCommandHost, ParsedFlags,
-		SessionCommandHost, SessionRequest, ShellCommandHost, WorkspaceRequest,
+		AdvisorRequest, CommandFuture, CommandResult, CommandRole, CommandSurface, ConfigCommandHost,
+		ConfigScope, ConsumedResult, DispatchResult, FlowCommandHost, McpRequest, ModelCommandHost,
+		ParsedFlags, SessionCommandHost, SessionRequest, ShellCommandHost, WorkspaceRequest,
 	},
 	input::{ChatCommand, CommandContribution, CommandRoster, CommandUsage, ParsedTurnBudget},
 };
@@ -112,7 +114,10 @@ use omp_driver::{
 };
 use omp_envd::github_url::GithubCredentialBridge;
 use omp_proto::inference::{v1, v1::Effort};
-use omp_settings::manager::{MutationScope, SettingsManager, SettingsPaths};
+use omp_settings::{
+	manager::{MutationScope, SettingsManager, SettingsPaths},
+	subscription::DomainSubscription,
+};
 use omp_tools::debug;
 use omp_tui::components;
 use tokio::{runtime, sync::watch::Receiver};
@@ -939,6 +944,7 @@ fn inspect_image_enabled(state: &BridgeState) -> bool {
 
 struct BridgeState {
 	model: String,
+	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
 	session_id: Str,
 	title: SessionTitleState,
 	title_replan_refresh_pending: bool,
@@ -1176,6 +1182,7 @@ struct ChatSceneSeed {
 	role:           CommandRole,
 	workspace_root: PathBuf,
 	composer_style: components::ComposerStyle,
+	hide_thinking:  bool,
 }
 
 fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
@@ -1205,6 +1212,7 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 		)));
 	chat.set_completion(Box::new(completion));
 	chat.set_composer_style(seed.composer_style);
+	chat.set_hide_thinking(seed.hide_thinking);
 	chat
 }
 
@@ -1212,6 +1220,8 @@ pub async fn run<C, R>(
 	executor: Executor,
 	mut agent: Agent<C>,
 	session: ChatUiSession,
+	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
+	advisor_notices: flume::Receiver<Option<Str>>,
 	registry: Arc<Registry>,
 	tree: Arc<AgentTree>,
 	parent: Arc<ChatParentHost<C>>,
@@ -1219,6 +1229,8 @@ pub async fn run<C, R>(
 	modes: Arc<CampaignHandle>,
 	auth: Option<ChatAuth>,
 	data_dir: PathBuf,
+	settings_manager: Arc<SettingsManager>,
+	telemetry_index: Arc<omp_storage::telemetry_index::TelemetryIndex>,
 	session_index: Arc<SessionIndex>,
 	workspace_root: PathBuf,
 	local_root: PathBuf,
@@ -1228,6 +1240,7 @@ pub async fn run<C, R>(
 	command_sources: Vec<Vec<CommandContribution>>,
 	skills: Arc<omp_driver::skills::SkillSnapshot>,
 	mut approval_inbox: Option<ApprovalInbox>,
+	hide_thinking: bool,
 	mut list_sessions: R,
 	welcome: bool,
 	initial_draft: Str,
@@ -1239,6 +1252,23 @@ where
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send + 'static,
 {
 	let bus = agent.events().clone();
+	let task_settings = settings_manager
+		.snapshot()
+		.project::<TaskSettings>()
+		.into_diagnostic()?
+		.shared();
+	parent.apply_task_settings(task_settings);
+	let mut task_settings_updates =
+		DomainSubscription::<TaskSettings>::new(settings_manager.as_ref());
+	let task_settings_parent = Arc::downgrade(&parent);
+	let task_settings_watch = tokio::spawn(async move {
+		while let Ok(settings) = task_settings_updates.recv_async().await {
+			let Some(parent) = task_settings_parent.upgrade() else {
+				break;
+			};
+			parent.apply_task_settings(settings.shared());
+		}
+	});
 	let environment = agent.environment();
 	let mailbox = agent.mailbox();
 	let control = agent.control();
@@ -1416,6 +1446,7 @@ where
 	drop(snapshot);
 	let mut state = BridgeState {
 		model,
+		advisor,
 		session_id: session_id.clone(),
 		title: session.title,
 		title_replan_refresh_pending: false,
@@ -1470,6 +1501,7 @@ where
 		role: initial_command_role,
 		workspace_root,
 		composer_style: presentation_composer_style(state.settings.composer.shape),
+		hide_thinking,
 	};
 
 	send_backend(&backend_tx, BackendEvent::ModelsUpdated {
@@ -1541,6 +1573,8 @@ where
 									parent.as_ref(),
 									auth.as_ref(),
 									&data_dir,
+									settings_manager.as_ref(),
+									telemetry_index.as_ref(),
 									&mut list_sessions,
 									&bus,
 									registry.as_ref(),
@@ -1552,6 +1586,12 @@ where
 							},
 							Ok(message) = error_rx.recv_async() => {
 								send_backend(&backend_tx, BackendEvent::Error(Str::from(message)));
+							},
+							Ok(notice) = advisor_notices.recv_async() => {
+								if let Some(notice) = notice {
+									send_backend(&backend_tx, BackendEvent::Notice(notice));
+								}
+								send_status(&backend_tx, &state, &bus, 0);
 							},
 							Ok(event) = maintenance_rx.recv_async() => {
 								match event {
@@ -1789,6 +1829,8 @@ where
 			(Ok(host_result), bridge_result)
 		},
 	};
+	task_settings_watch.abort();
+	let _ = task_settings_watch.await;
 	if executor
 		.timeout(Duration::from_secs(3), &mut agent_task)
 		.await
@@ -2435,7 +2477,11 @@ impl<R> LiveCommandHost<'_, R> {
 		send_backend(self.backend, BackendEvent::Error(sf!(message)));
 		silent_command()
 	}
-	fn select_model(&mut self, selector: Option<Str>, durable: bool) -> CommandFuture<'_> {
+
+	fn select_model(&mut self, selector: Option<Str>, durable: bool) -> CommandFuture<'_>
+	where
+		R: Send,
+	{
 		Box::pin(async move {
 			if let Some(selector) = selector {
 				switch_model(
@@ -3036,6 +3082,39 @@ fn todo_params(
 	}
 }
 
+fn advisor_status(status: &AdvisorEngineStatus) -> Str {
+	use std::fmt::Write as _;
+
+	let mut rendered = String::new();
+	let enabled = if status.enabled {
+		"enabled"
+	} else {
+		"disabled"
+	};
+	let _ = write!(
+		rendered,
+		"**Advisor {enabled}** · {} worker{}",
+		status.advisors.len(),
+		if status.advisors.len() == 1 { "" } else { "s" },
+	);
+	for advisor in &status.advisors {
+		let micro = advisor.usage.cost_micro_usd.max(0);
+		let dollars = micro / 1_000_000;
+		let fraction = micro % 1_000_000;
+		let _ = write!(
+			rendered,
+			"\n- **{}** (`{}`) · {} · `{}` · {} message{} · ${dollars}.{fraction:06}",
+			advisor.display_name,
+			advisor.id,
+			advisor.state,
+			advisor.model,
+			advisor.messages,
+			if advisor.messages == 1 { "" } else { "s" },
+		);
+	}
+	rendered.into()
+}
+
 impl<R> FlowCommandHost for LiveCommandHost<'_, R>
 where
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
@@ -3208,6 +3287,38 @@ where
 		self.state.live_enabled = !self.state.live_enabled;
 		send_status(self.backend, self.state, self.bus, self.dropped);
 		silent_command()
+	}
+
+	fn advisor(&mut self, request: AdvisorRequest) -> CommandFuture<'_> {
+		let Some(advisor) = self.state.advisor.as_ref() else {
+			return self.unavailable("Advisor runtime is not attached to this session.");
+		};
+		let result = match request {
+			AdvisorRequest::Toggle => {
+				let mut engine = advisor.lock();
+				let enabled = !engine.enabled();
+				engine.set_enabled(enabled);
+				advisor_status(&engine.status())
+			},
+			AdvisorRequest::SetEnabled(enabled) => {
+				let mut engine = advisor.lock();
+				engine.set_enabled(enabled);
+				advisor_status(&engine.status())
+			},
+			AdvisorRequest::Status => advisor_status(&advisor.lock().status()),
+			AdvisorRequest::DumpRaw => advisor.lock().dump(false),
+			AdvisorRequest::Configure(_) => {
+				let path = Path::new(self.state.workspace_root.as_str()).join("WATCHDOG.yml");
+				return Box::pin(async move {
+					Err(miette::miette!(
+						"interactive advisor configuration is not available yet; edit {}",
+						path.display()
+					))
+				});
+			},
+		};
+		send_status(self.backend, self.state, self.bus, self.dropped);
+		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(result))) })
 	}
 
 	fn utility(&mut self, request: commands::UtilityRequest) -> CommandFuture<'_> {
@@ -3692,6 +3803,8 @@ async fn handle_intent<C, R>(
 	parent: &ChatParentHost<C>,
 	auth: Option<&ChatAuth>,
 	data_dir: &Path,
+	settings_manager: &SettingsManager,
+	telemetry_index: &omp_storage::telemetry_index::TelemetryIndex,
 	list_sessions: &mut R,
 	bus: &omp_agent::EventBus,
 	registry: &Registry,
@@ -4375,10 +4488,31 @@ where
 				);
 			}
 			if commit {
-				let encoded = toml::to_string_pretty(&state.settings).into_diagnostic()?;
-				omp_settings::io::atomic_replace(&data_dir.join("config.toml"), &encoded)
-					.into_diagnostic()?;
+				for change in &changes {
+					let raw = match &change.value {
+						serde_json::Value::String(value) => value.clone(),
+						value => value.to_string(),
+					};
+					settings_manager
+						.set_sync(MutationScope::Global, change.path.as_str(), &raw)
+						.into_diagnostic()?;
+				}
 				send_backend(backend, BackendEvent::Notice(sf!("Settings saved.")));
+			}
+		},
+		Intent::AutoQaConsent(intent) => {
+			match omp_driver::telemetry_upload::apply_consent(telemetry_index, intent) {
+				Ok(true) => send_backend(backend, BackendEvent::Notice(sf!("AutoQA consent saved."))),
+				Ok(false) => send_backend(
+					backend,
+					BackendEvent::Error(sf!("AutoQA report changed before consent could be saved.")),
+				),
+				Err(error) => {
+					send_backend(
+						backend,
+						BackendEvent::Error(sf!("Could not save AutoQA consent: {error}")),
+					);
+				},
 			}
 		},
 		Intent::Select { purpose, key } => match purpose {
@@ -5271,6 +5405,7 @@ fn handle_agent_event(
 			}
 			let mut tool = state.tools.remove(call_id.as_str());
 			let (identity, ok, view) = render_tool_result_view(registry, item, tool.as_ref());
+			let is_report_issue = identity.name == "report_issue";
 			if let Some(tool) = tool.as_mut() {
 				ensure_tool_started(backend, call_id, tool, true);
 			} else {
@@ -5283,6 +5418,12 @@ fn handle_agent_event(
 			}
 			send_tool_result_images(backend, call_id, item);
 			send_backend(backend, BackendEvent::ToolFinished { id: call_id.clone(), ok, view });
+			if ok
+				&& is_report_issue
+				&& let Some(request) = autoqa_consent_request(item)
+			{
+				send_backend(backend, BackendEvent::AutoQaConsent(request));
+			}
 		},
 		AgentEvent::JobRegistered { job_id } => {
 			state.jobs.insert(job_id.clone());
@@ -5368,6 +5509,33 @@ fn handle_agent_event(
 		| AgentEvent::RosterChanged { .. } => {},
 	}
 	send_status(backend, state, bus, dropped);
+}
+
+fn autoqa_consent_request(item: &Item) -> Option<omp_chat_ui::autoqa::ConsentRequest> {
+	let item::Kind::ToolResult(result) = item.kind.as_ref()? else {
+		return None;
+	};
+	if result.is_error || result.name != "report_issue" {
+		return None;
+	}
+	let value = proto_to_json(result.details.as_ref()?)?;
+	let payload = value.get("value")?;
+	let issue_id = payload.get("issue_id")?.as_str()?;
+	let target = payload.get("target")?.as_str()?;
+	let revision = payload
+		.get("revision")
+		.and_then(serde_json::Value::as_str)
+		.or_else(|| target.rsplit_once('@').map(|(_, revision)| revision))?;
+	let summary = payload
+		.get("summary")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("A redacted AutoQA report is ready for optional delivery.");
+	Some(omp_chat_ui::autoqa::ConsentRequest {
+		issue_id: Str::new(issue_id),
+		target:   Str::new(target),
+		revision: Str::new(revision),
+		summary:  Str::new(summary),
+	})
 }
 
 fn replay_items(
@@ -5903,28 +6071,12 @@ async fn switch_model(
 		return;
 	};
 	if !durable {
-		let Some((route, wire_model)) = spec.routes.first().and_then(|route_id| {
-			let route = catalog.route(route_id)?;
-			let (_, wire_model) = spec
-				.wire_ids
-				.iter()
-				.find(|(candidate, _)| candidate == route_id)?;
-			Some((route, wire_model))
-		}) else {
+		let Some(change) = session_model_override(catalog, spec) else {
 			send_backend(
 				backend,
 				BackendEvent::Error(sf!("Model {selector} has no selectable provider route.")),
 			);
 			return;
-		};
-		let change = JournalModelChange {
-			role:     sf!("temporary"),
-			model:    JournalModelRef {
-				provider: JournalProviderId(Str::new(route.provider.as_str())),
-				api:      Str::new(route.codec.as_str()),
-				model:    JournalModelId(Str::new(wire_model.as_str())),
-			},
-			fallback: false,
 		};
 		if let Err(error) = control.model_override(now_ms(), change).await {
 			send_backend(
@@ -5967,6 +6119,19 @@ async fn switch_model(
 			sf!("Session model: `{}`.", state.model)
 		}),
 	);
+}
+
+fn session_model_override(catalog: &Catalog, spec: &ModelSpec) -> Option<JournalModelChange> {
+	let route = catalog.route(spec.routes.first()?)?;
+	Some(JournalModelChange {
+		role:     sf!("temporary"),
+		model:    JournalModelRef {
+			provider: JournalProviderId(Str::new(route.provider.as_str())),
+			api:      Str::new(route.codec.as_str()),
+			model:    JournalModelId(Str::new(spec.key.as_str())),
+		},
+		fallback: false,
+	})
 }
 
 fn resolve_model<'a>(catalog: &'a Catalog, selector: &str) -> Option<&'a ModelSpec> {
@@ -6091,20 +6256,44 @@ fn send_status(
 	bus: &omp_agent::EventBus,
 	dropped: u64,
 ) {
+	let advisor_status = state
+		.advisor
+		.as_ref()
+		.map(|advisor| advisor.lock().status());
+	let advisor_model = advisor_status
+		.as_ref()
+		.filter(|status| status.enabled)
+		.and_then(|status| {
+			status
+				.advisors
+				.iter()
+				.find(|advisor| advisor.state == AdvisorRunState::Running)
+				.map(|advisor| advisor.model.clone())
+		});
+	let advisor_cost_micro_usd = advisor_status
+		.as_ref()
+		.into_iter()
+		.flat_map(|status| &status.advisors)
+		.fold(0_i128, |total, advisor| total.saturating_add(advisor.usage.cost_micro_usd))
+		.max(0);
+	let advisor_cost_nanos =
+		u64::try_from(advisor_cost_micro_usd.saturating_mul(1_000)).unwrap_or(u64::MAX);
 	send_backend(
 		backend,
 		BackendEvent::Status(StatusFacts {
 			model: status_model_label(state.model.as_str()),
 			model_subscription: model_uses_subscription(Catalog::embedded(), &state.model),
-			advisor_model: None,
-			advisor_subscription: false,
+			advisor_subscription: advisor_model
+				.as_ref()
+				.is_some_and(|model| model_uses_subscription(Catalog::embedded(), model.as_str())),
+			advisor_model,
 			working: chat_active(state.submit_pending, bus.phase()),
 			turn_started: state.turn_started,
 			context_tokens: state.context_tokens,
 			context_window: state.context_window,
 			compaction_speculation: omp_chat_ui::CompactionSpeculationStatus::Idle,
 			cost_nanos: state.cost_nanos,
-			advisor_cost_nanos: 0,
+			advisor_cost_nanos,
 			queued: state.queued,
 			visible_slots: state
 				.campaigns
@@ -6540,6 +6729,27 @@ mod tests {
 		assert_eq!(status_model_label("not-catalogued"), "not-catalogued");
 	}
 	#[test]
+	fn session_model_override_uses_the_catalog_key_not_a_wire_id() {
+		let catalog = Catalog::embedded();
+		let spec = resolve_model(catalog, "anthropic/claude-opus-5").expect("catalog model");
+		let change = session_model_override(catalog, spec).expect("model route");
+		assert_eq!(change.model.model.as_str(), "anthropic/claude-opus-5");
+	}
+	#[test]
+	fn model_picker_emits_selectable_catalog_rows() {
+		let scratch = tempfile::tempdir().expect("scratch");
+		let state = test_bridge_state(scratch.path());
+		let (backend, events) = flume::unbounded();
+		send_open_models(&backend, &state);
+
+		let BackendEvent::OpenModelPicker { rows, current } = events.recv().expect("model picker")
+		else {
+			panic!("model picker event")
+		};
+		assert!(!rows.is_empty());
+		assert!(current < rows.len());
+	}
+	#[test]
 	fn status_thinking_level_keeps_only_visible_reasoning_efforts() {
 		assert_eq!(status_thinking_level(Effort::Off), None);
 		assert_eq!(status_thinking_level(Effort::Max), Some(StatusThinkingLevel::Max));
@@ -6571,6 +6781,7 @@ mod tests {
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
 			model: "test/model".to_owned(),
+			advisor: None,
 			title: SessionTitleState::default(),
 			title_replan_refresh_pending: false,
 			environment,

@@ -162,6 +162,7 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 		&state.join("env.sock"),
 		&state.join("docs.sock"),
 		false,
+		None,
 		&[extension()],
 		omp_tool::DEFAULT_INTERRUPT_GRACE,
 		RegistryBridges::default(),

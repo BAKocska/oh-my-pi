@@ -201,6 +201,15 @@ impl FromStr for ApprovalMode {
 		}
 	}
 }
+impl From<ApprovalMode> for omp_envd::tool_settings::ApprovalMode {
+	fn from(value: ApprovalMode) -> Self {
+		match value {
+			ApprovalMode::AlwaysAsk => Self::AlwaysAsk,
+			ApprovalMode::Write => Self::Write,
+			ApprovalMode::Yolo => Self::Yolo,
+		}
+	}
+}
 
 /// A strictly positive launch duration parsed from seconds or `s`, `m`, `h`
 /// suffixes.
@@ -1141,6 +1150,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--resume"
 			| "--continue"
 			| "-c" | "--fork"
+			| "-r" | "--session"
 			| "--session-dir"
 			| "--thinking"
 			| "--service-tier"
@@ -1159,6 +1169,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--plan"
 			| "--models"
 			| "--prewalk-into"
+			| "--plan-yolo-into"
 			| "--skills"
 			| "--api-key"
 			| "--system-prompt"
@@ -1181,8 +1192,16 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--acp-terminal-auth"
 			| "--smoke-test"
 			| "--plan-mode"
+			| "--plan-yolo"
+			| "--yolo"
+			| "--auto-approve"
+			| "--hide-thinking"
+			| "--external-thinking"
+			| "--from-claude"
+			| "--from-codex"
 			| "--prewalk"
 			| "--no-prewalk"
+			| "--advisor"
 			| "--no-tools"
 			| "--no-lsp"
 			| "--no-pty"
@@ -1315,7 +1334,7 @@ pub struct ChatArgs {
 	#[arg(long, value_name = "LOCAL_ENDPOINT")]
 	pub gateway:            Option<LocalEndpoint>,
 	/// Existing ULID session to reopen strictly.
-	#[arg(long, value_name = "ULID")]
+	#[arg(long, short = 'r', visible_alias = "session", value_name = "ULID")]
 	pub resume:             Option<Str>,
 	/// Continue a UUID session.
 	#[arg(
@@ -1330,6 +1349,12 @@ pub struct ChatArgs {
 	/// Fork an existing session before opening the chat.
 	#[arg(long, value_name = "SESSION", conflicts_with_all = ["resume", "continue_session", "no_session"])]
 	pub fork:               Option<Str>,
+	/// Import a Claude Code session interactively before opening the chat.
+	#[arg(long = "from-claude", conflicts_with_all = ["from_codex", "resume", "continue_session", "fork", "no_session"])]
+	pub from_claude:        bool,
+	/// Import a Codex CLI session interactively before opening the chat.
+	#[arg(long = "from-codex", conflicts_with_all = ["resume", "continue_session", "fork", "no_session"])]
+	pub from_codex:         bool,
 	/// Do not persist a durable session for this chat.
 	#[arg(long, conflicts_with_all = ["resume", "continue_session", "fork"])]
 	pub no_session:         bool,
@@ -1337,7 +1362,7 @@ pub struct ChatArgs {
 	#[arg(long, value_name = "PATH")]
 	pub session_dir:        Option<PathBuf>,
 	/// Select provider reasoning effort with unambiguous prefix abbreviations.
-	#[arg(long)]
+	#[arg(long, value_parser = <ThinkingLevel as FromStr>::from_str)]
 	pub thinking:           Option<ThinkingLevel>,
 	/// Select the provider's service tier.
 	#[arg(long)]
@@ -1345,6 +1370,9 @@ pub struct ChatArgs {
 	/// Tool approval policy.
 	#[arg(long)]
 	pub approval_mode:      Option<ApprovalMode>,
+	/// Approve every tool without asking; an explicit `--approval-mode` wins.
+	#[arg(long, visible_alias = "auto-approve")]
+	pub yolo:               bool,
 	/// Stop after this strictly positive duration.
 	#[arg(long)]
 	pub max_time:           Option<CliDuration>,
@@ -1363,6 +1391,12 @@ pub struct ChatArgs {
 	/// Enter read-only planning mode at startup.
 	#[arg(long = "plan-mode")]
 	pub plan_mode:          bool,
+	/// Enter plan mode with one explicitly authorized mutation transition.
+	#[arg(long = "plan-yolo", conflicts_with = "plan_mode")]
+	pub plan_yolo:          bool,
+	/// Model selector switched to once the plan-yolo plan is approved.
+	#[arg(long = "plan-yolo-into", value_name = "SELECTOR", requires = "plan_yolo")]
+	pub plan_yolo_into:     Option<Str>,
 	/// Enter prewalk automation.
 	#[arg(long, conflicts_with = "no_prewalk")]
 	pub prewalk:            bool,
@@ -1390,6 +1424,9 @@ pub struct ChatArgs {
 	/// Disable generated terminal titles.
 	#[arg(long)]
 	pub no_title:           bool,
+	/// Enable the advisor watchdog runtime for this session.
+	#[arg(long)]
+	pub advisor:            bool,
 	/// Ephemeral provider API key; never journaled or rendered by `Debug`.
 	#[arg(long, value_parser = parse_cli_secret)]
 	pub api_key:            Option<SecretString>,
@@ -1400,6 +1437,14 @@ pub struct ChatArgs {
 	/// Enable the built-in Python expression-evaluation tool for this chat's
 	/// environment.
 	pub py_eval:            bool,
+	/// Hide thinking blocks in the transcript for this invocation.
+	#[arg(long = "hide-thinking")]
+	pub hide_thinking:      bool,
+	/// Force external thinking: provider reasoning off, hidden `think` tool on.
+	/// Providers have flagged the resulting request shape as abuse risk, up to
+	/// account-level enforcement.
+	#[arg(long = "external-thinking")]
+	pub external_thinking:  bool,
 	/// Deployment-authenticated exact modules admitted by the CLI boundary.
 	#[arg(skip)]
 	pub trusted_extensions: Vec<ExtHostSpec>,
@@ -1424,17 +1469,22 @@ impl ChatArgs {
 			resume:             None,
 			continue_session:   None,
 			fork:               None,
+			from_claude:        false,
+			from_codex:         false,
 			no_session:         false,
 			session_dir:        None,
 			thinking:           None,
 			service_tier:       None,
 			approval_mode:      None,
+			yolo:               false,
 			max_time:           None,
 			tools:              None,
 			no_tools:           false,
 			no_lsp:             false,
 			no_pty:             false,
 			plan_mode:          false,
+			plan_yolo:          false,
+			plan_yolo_into:     None,
 			prewalk:            false,
 			no_prewalk:         false,
 			prewalk_into:       None,
@@ -1444,12 +1494,23 @@ impl ChatArgs {
 			no_skills:          false,
 			no_rules:           false,
 			no_title:           false,
+			advisor:            false,
 			api_key:            None,
 			prompt_cache_key:   None,
 			py_eval:            false,
+			hide_thinking:      false,
+			external_thinking:  false,
 			trusted_extensions: Vec::new(),
 			prompt_settings:    PromptArgs::default(),
 		}
+	}
+
+	/// Effective tool approval policy: an explicit `--approval-mode` wins over
+	/// the `--yolo`/`--auto-approve` shorthand.
+	pub fn effective_approval(&self) -> Option<ApprovalMode> {
+		self
+			.approval_mode
+			.or_else(|| self.yolo.then_some(ApprovalMode::Yolo))
 	}
 }
 /// Non-interactive inference output options.
@@ -1457,76 +1518,99 @@ impl ChatArgs {
 pub struct PrintArgs {
 	/// Catalog model key. Falls back to `config.default_model`.
 	#[arg(long)]
-	pub model:            Option<Str>,
+	pub model:             Option<Str>,
 	/// Read-only native TOML settings overlays in precedence order.
 	#[arg(long = "config", value_name = "TOML")]
-	pub config:           Vec<PathBuf>,
+	pub config:            Vec<PathBuf>,
 	/// Additional authorized roots used by Environment-backed print tools.
 	#[arg(long = "add-dir", value_name = "PATH")]
-	pub add_dir:          Vec<PathBuf>,
+	pub add_dir:           Vec<PathBuf>,
 	/// Fast/low-cost model-role selector.
 	#[arg(long)]
-	pub smol:             Option<Str>,
+	pub smol:              Option<Str>,
 	/// Deep-reasoning model-role selector.
 	#[arg(long)]
-	pub slow:             Option<Str>,
+	pub slow:              Option<Str>,
 	/// Planning model-role selector.
 	#[arg(long)]
-	pub plan:             Option<Str>,
+	pub plan:              Option<Str>,
 	/// Model cycling list shared with interactive launch metadata.
 	#[arg(long)]
-	pub models:           Option<SelectorList>,
+	pub models:            Option<SelectorList>,
 	/// Emit newline-delimited JSON events rather than final text.
 	#[arg(long, value_parser = ["text", "json"], default_value = "text")]
-	pub mode:             String,
+	pub mode:              String,
 	/// Include streamed reasoning in text output.
 	#[arg(long)]
-	pub print_thoughts:   bool,
+	pub print_thoughts:    bool,
 	/// Select provider reasoning effort with unambiguous prefix abbreviations.
-	#[arg(long)]
-	pub thinking:         Option<ThinkingLevel>,
+	#[arg(long, value_parser = <ThinkingLevel as FromStr>::from_str)]
+	pub thinking:          Option<ThinkingLevel>,
 	/// Select the provider's service tier.
 	#[arg(long)]
-	pub service_tier:     Option<ServiceTier>,
+	pub service_tier:      Option<ServiceTier>,
 	/// Tool approval policy for launch-shaped invocations.
 	#[arg(long)]
-	pub approval_mode:    Option<ApprovalMode>,
+	pub approval_mode:     Option<ApprovalMode>,
+	/// Approve every tool without asking; an explicit `--approval-mode` wins.
+	#[arg(long, visible_alias = "auto-approve")]
+	pub yolo:              bool,
 	/// Stop after this strictly positive duration.
 	#[arg(long)]
-	pub max_time:         Option<CliDuration>,
+	pub max_time:          Option<CliDuration>,
 	/// Restrict enabled tools to these normalized names.
 	#[arg(long, conflicts_with = "no_tools")]
-	pub tools:            Option<ToolNames>,
+	pub tools:             Option<ToolNames>,
 	/// Disable every tool for this invocation.
 	#[arg(long)]
-	pub no_tools:         bool,
+	pub no_tools:          bool,
 	/// Disable LSP-backed tools.
 	#[arg(long)]
-	pub no_lsp:           bool,
+	pub no_lsp:            bool,
 	/// Disable PTY-backed tools.
 	#[arg(long)]
-	pub no_pty:           bool,
+	pub no_pty:            bool,
+	/// Enable the advisor watchdog runtime for this invocation.
+	#[arg(long)]
+	pub advisor:           bool,
 	/// Ephemeral provider API key; never journaled or rendered by `Debug`.
 	#[arg(long, value_parser = parse_cli_secret)]
-	pub api_key:          Option<SecretString>,
+	pub api_key:           Option<SecretString>,
 	/// Ephemeral provider prompt-cache affinity.
 	#[arg(long = "prompt-cache-key")]
-	pub prompt_cache_key: Option<Str>,
+	pub prompt_cache_key:  Option<Str>,
 	/// Additional user messages applied in order after the initial prompt.
 	#[arg(long = "follow-up", value_name = "TEXT")]
-	pub follow_ups:       Vec<Str>,
+	pub follow_ups:        Vec<Str>,
 	/// Enter plan mode with one explicitly authorized mutation transition.
 	#[arg(long)]
-	pub plan_yolo:        bool,
+	pub plan_yolo:         bool,
+	/// Model selector switched to once the plan-yolo plan is approved.
+	#[arg(long = "plan-yolo-into", value_name = "SELECTOR", requires = "plan_yolo")]
+	pub plan_yolo_into:    Option<Str>,
+	/// Force external thinking: provider reasoning off, hidden `think` tool on.
+	/// Providers have flagged the resulting request shape as abuse risk, up to
+	/// account-level enforcement.
+	#[arg(long = "external-thinking")]
+	pub external_thinking: bool,
 	/// Drop provider payloads and partial transcript snapshots from NDJSON.
 	#[arg(long)]
-	pub shape_transcript: bool,
+	pub shape_transcript:  bool,
 	/// Typed prompt settings and invocation overrides.
 	#[command(flatten)]
-	pub prompt_settings:  PromptArgs,
+	pub prompt_settings:   PromptArgs,
 	/// Prompt words; `@path` includes a typed attachment.
 	#[arg(num_args = 0..)]
-	pub prompt:           Vec<Str>,
+	pub prompt:            Vec<Str>,
+}
+impl PrintArgs {
+	/// Effective tool approval policy: an explicit `--approval-mode` wins over
+	/// the `--yolo`/`--auto-approve` shorthand.
+	pub fn effective_approval(&self) -> Option<ApprovalMode> {
+		self
+			.approval_mode
+			.or_else(|| self.yolo.then_some(ApprovalMode::Yolo))
+	}
 }
 
 /// Stateful headless RPC server options.
@@ -2117,7 +2201,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 	if let Some(cwd) = cli.cwd.as_deref() {
 		env::set_current_dir(cwd).into_diagnostic()?;
 	}
-	if !cli.allow_home && cli.command.is_none() && is_home_dir()? {
+	if !cli.allow_home && matches!(cli.command, None | Some(Command::Chat(_))) && is_home_dir()? {
 		return Err(miette!(
 			"refusing to start an interactive session in HOME; pass --allow-home or --cwd"
 		));
@@ -2246,6 +2330,15 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 /// options, normalizing bare prompts, and selecting print mode for a
 /// non-interactive empty invocation.
 pub fn parse_from_os(arguments: impl IntoIterator<Item = OsString>) -> Result<OmpCli, clap::Error> {
+	parse_with_terminal(arguments, io::stdin().is_terminal())
+}
+
+/// [`parse_from_os`] with an explicit interactive-stdin fact, so tests can
+/// exercise both terminal and piped normalization deterministically.
+fn parse_with_terminal(
+	arguments: impl IntoIterator<Item = OsString>,
+	interactive: bool,
+) -> Result<OmpCli, clap::Error> {
 	use clap::error::ErrorKind;
 	let profile = profile_bootstrap::extract(arguments)
 		.map_err(|error| clap::Error::raw(ErrorKind::InvalidValue, error.to_string()))?;
@@ -2258,7 +2351,7 @@ pub fn parse_from_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Om
 	profile_bootstrap::remove_boundaries(&mut bootstrap.arguments);
 	let mut arguments = bootstrap.arguments;
 	normalize_hidden_command(&mut arguments);
-	if !io::stdin().is_terminal()
+	if !interactive
 		&& first_positional(&arguments).is_none()
 		&& !arguments.iter().skip(1).any(|argument| {
 			matches!(argument.to_string_lossy().as_ref(), "--help" | "-h" | "--version" | "-V")
@@ -2277,6 +2370,10 @@ pub fn parse_from_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Om
 		}
 	}
 	normalize_hidden_command(&mut arguments);
+	normalize_transport_mode(&mut arguments);
+	if interactive {
+		normalize_interactive_launch(&mut arguments);
+	}
 	normalize_bare_resume(&mut arguments);
 	let mut cli = OmpCli::try_parse_from(arguments)?;
 	cli.profile = profile.profile;
@@ -2308,6 +2405,15 @@ fn builtin_contribution_names() -> impl Iterator<Item = Str> {
 		"plan",
 		"prewalk",
 		"prewalk-into",
+		"advisor",
+		"plan-yolo",
+		"plan-yolo-into",
+		"yolo",
+		"auto-approve",
+		"hide-thinking",
+		"external-thinking",
+		"from-claude",
+		"from-codex",
 		"profile",
 		"provider",
 		"provider-session-id",
@@ -2333,7 +2439,7 @@ fn normalize_hidden_command(arguments: &mut Vec<OsString>) {
 	let Some(command_index) = leading_command_index(arguments) else {
 		return;
 	};
-	if arguments[command_index] == "-p" {
+	if arguments[command_index] == "-p" || arguments[command_index] == "--print" {
 		arguments[command_index] = OsString::from("print");
 	}
 	if command_index == 1 {
@@ -2362,7 +2468,7 @@ fn leading_command_index(arguments: &[OsString]) -> Option<usize> {
 	let mut index = 1;
 	while index < arguments.len() {
 		let argument = &arguments[index];
-		if is_command(argument) || argument == "-p" {
+		if is_command(argument) || argument == "-p" || argument == "--print" {
 			return Some(index);
 		}
 		if argument == "--" || !argument.to_string_lossy().starts_with('-') {
@@ -2393,10 +2499,97 @@ fn first_positional(arguments: &[OsString]) -> Option<usize> {
 	None
 }
 
+/// Routes a launch `--mode` transport value to its stdio server command.
+///
+/// `--mode rpc`, `--mode rpc-ui`, and `--mode acp` select the matching
+/// transport command; `text` and `json` stay on `print`, which validates them
+/// itself.
+fn normalize_transport_mode(arguments: &mut Vec<OsString>) {
+	let command = arguments
+		.get(1)
+		.map(|argument| argument.to_string_lossy().into_owned());
+	let has_print = matches!(command.as_deref(), Some("print" | "p"));
+	if !has_print && command.is_some_and(|command| is_command(&OsString::from(command))) {
+		return;
+	}
+	let mut index = if has_print { 2 } else { 1 };
+	while index < arguments.len() {
+		let argument = arguments[index].to_string_lossy();
+		if argument == "--" {
+			return;
+		}
+		let (name, inline) = argument
+			.split_once('=')
+			.map_or((argument.as_ref(), None), |(name, value)| (name, Some(value.to_owned())));
+		if name == "--mode" {
+			let value = match inline {
+				Some(value) => value,
+				None => match arguments.get(index + 1) {
+					Some(value) => value.to_string_lossy().into_owned(),
+					None => return,
+				},
+			};
+			if !matches!(value.as_str(), "rpc" | "rpc-ui" | "acp") {
+				return;
+			}
+			let consumed = if argument.contains('=') { 1 } else { 2 };
+			arguments.drain(index..index + consumed);
+			if has_print {
+				arguments[1] = OsString::from(value);
+			} else {
+				arguments.insert(1, OsString::from(value));
+			}
+			return;
+		}
+		index +=
+			1 + usize::from(!argument.contains('=') && launch_option(&arguments[index]) == Some(true));
+	}
+}
+
+/// Returns whether a launch option belongs to the chat/print surface rather
+/// than the root-global set clap already parses without a command.
+fn chat_launch_option(argument: &OsString) -> bool {
+	if launch_option(argument).is_none() {
+		return false;
+	}
+	let argument = argument.to_string_lossy();
+	let name = argument
+		.split_once('=')
+		.map_or(argument.as_ref(), |(name, _)| name);
+	!matches!(
+		name,
+		"--help"
+			| "--version"
+			| "--cwd"
+			| "--export"
+			| "--ext"
+			| "--ext-only"
+			| "--trusted-extension"
+			| "--no-ext"
+			| "--no-workspace-ext"
+			| "--allow-home"
+			| "--smoke-test"
+	)
+}
+
+/// Opens interactive chat for flag-only terminal invocations such as
+/// `omp --model sonnet` or `omp -c`, which carry launch options that only a
+/// launch-shaped command accepts.
+fn normalize_interactive_launch(arguments: &mut Vec<OsString>) {
+	if arguments.len() < 2
+		|| first_positional(arguments).is_some()
+		|| !arguments.iter().skip(1).any(chat_launch_option)
+	{
+		return;
+	}
+	arguments.insert(1, OsString::from("chat"));
+}
+
 fn normalize_bare_resume(arguments: &mut Vec<OsString>) {
 	let mut index = 1;
 	while index < arguments.len() {
-		if arguments[index] == "--resume"
+		let argument = &arguments[index];
+		if (argument == "--resume" || argument == "-r" || argument == "--session")
 			&& arguments
 				.get(index + 1)
 				.is_none_or(|next| next.to_string_lossy().starts_with('-'))
@@ -2854,6 +3047,7 @@ mod tests {
 		let directory = tempfile::tempdir().unwrap();
 		let path = directory.path().join("policy.py");
 		fs::write(&path, b"activated = True\n").unwrap();
+		let canonical = path.canonicalize().unwrap();
 
 		let extension = trusted_extension(omp_envd::site::validate_trusted_module(&path).unwrap());
 		assert_eq!(extension.manifest.entry, "policy");
@@ -2870,8 +3064,8 @@ mod tests {
 				.into_iter()
 				.collect(),
 		);
-		assert_eq!(extension.python_site.as_deref(), Some(directory.path()));
-		assert_eq!(extension.entry_path.as_deref(), Some(path.as_path()));
+		assert_eq!(extension.python_site.as_deref(), canonical.parent());
+		assert_eq!(extension.entry_path.as_deref(), Some(canonical.as_path()));
 		assert_eq!(extension.key.layer(), "invocation");
 		assert_eq!(extension.key.tier(), "trusted");
 
@@ -3026,6 +3220,69 @@ mod tests {
 	}
 
 	#[test]
+	fn routes_print_long_alias_like_the_short_form() {
+		let Some(Command::Print(args)) =
+			parse_from_os(["omp", "--print", "explain"].map(OsString::from))
+				.expect("print invocation")
+				.command
+		else {
+			panic!("print command");
+		};
+		assert_eq!(args.prompt[0], sf!("explain"));
+	}
+
+	#[test]
+	fn routes_transport_modes_to_stdio_server_commands() {
+		for (arguments, target) in [
+			(&["omp", "--mode", "rpc"][..], DispatchTarget::Rpc),
+			(&["omp", "--mode=rpc-ui"][..], DispatchTarget::RpcUi),
+			(&["omp", "--mode", "acp"][..], DispatchTarget::Acp),
+			(&["omp", "--model", "provider/model", "--mode", "rpc"][..], DispatchTarget::Rpc),
+		] {
+			for interactive in [false, true] {
+				let cli = parse_with_terminal(arguments.iter().map(OsString::from), interactive)
+					.expect("transport invocation");
+				assert_eq!(dispatch_target(cli.command.as_ref()), target);
+			}
+		}
+		let Some(Command::Print(args)) =
+			parse_from_os(["omp", "-p", "--mode=json", "hello"].map(OsString::from))
+				.expect("print invocation")
+				.command
+		else {
+			panic!("print command");
+		};
+		assert_eq!(args.mode, "json");
+	}
+
+	#[test]
+	fn flag_only_terminal_invocations_open_interactive_chat() {
+		let cli = parse_with_terminal(
+			["omp", "--model", "provider/model", "--thinking", "high"].map(OsString::from),
+			true,
+		)
+		.expect("interactive launch");
+		let Some(Command::Chat(args)) = cli.command else {
+			panic!("chat command");
+		};
+		assert_eq!(args.model, Some(sf!("provider/model")));
+		assert_eq!(args.thinking, Some(ThinkingLevel::High));
+		// Piped stdin keeps the print-with-stdin-prompt contract.
+		let cli =
+			parse_with_terminal(["omp", "--model", "provider/model"].map(OsString::from), false)
+				.expect("piped launch");
+		assert!(matches!(cli.command, Some(Command::Print(_))));
+		// A bare interactive invocation stays the default chat composition.
+		let cli = parse_with_terminal([OsString::from("omp")], true).expect("bare invocation");
+		assert!(cli.command.is_none());
+		// Root-global options alone never force a launch command.
+		let cli =
+			parse_with_terminal(["omp", "--gui"].map(OsString::from), true).expect("gui invocation");
+		assert!(cli.command.is_none());
+		assert!(cli.gui);
+	}
+
+	#[test]
 	fn parses_print_inline_flags_and_posix_delimiter() {
 		let Some(Command::Print(args)) = parse(&[
 			"omp",
@@ -3063,6 +3320,61 @@ mod tests {
 		let cli = parse(&["omp", "print", "hello", "--no-ext", "--cwd=workspace"]);
 		assert!(cli.no_ext);
 		assert_eq!(cli.cwd, Some(PathBuf::from("workspace")));
+	}
+
+	#[test]
+	fn parses_plan_yolo_flags_and_requires_the_pair() {
+		let Some(Command::Chat(args)) =
+			parse(&["omp", "chat", "--plan-yolo", "--plan-yolo-into", "provider/model"]).command
+		else {
+			panic!("chat command");
+		};
+		assert!(args.plan_yolo);
+		assert_eq!(args.plan_yolo_into, Some(sf!("provider/model")));
+		let error = OmpCli::try_parse_from(["omp", "chat", "--plan-yolo-into", "provider/model"])
+			.expect_err("--plan-yolo-into requires --plan-yolo");
+		assert_eq!(error.exit_code(), 2);
+		let error = OmpCli::try_parse_from(["omp", "chat", "--plan-mode", "--plan-yolo"])
+			.expect_err("--plan-mode conflicts with --plan-yolo");
+		assert_eq!(error.exit_code(), 2);
+	}
+
+	#[test]
+	fn yolo_shorthand_yields_when_an_explicit_approval_mode_is_given() {
+		for flag in ["--yolo", "--auto-approve"] {
+			let Some(Command::Chat(args)) = parse(&["omp", "chat", flag]).command else {
+				panic!("chat command");
+			};
+			assert!(args.yolo);
+			assert_eq!(args.effective_approval(), Some(ApprovalMode::Yolo));
+		}
+		let Some(Command::Print(args)) =
+			parse(&["omp", "print", "--approval-mode", "write", "--yolo", "hello"]).command
+		else {
+			panic!("print command");
+		};
+		assert_eq!(args.effective_approval(), Some(ApprovalMode::Write));
+	}
+
+	#[test]
+	fn resume_aliases_parse_and_bare_forms_open_the_picker() {
+		for arguments in [
+			&["omp", "chat", "--session", "01ARZ3NDEKTSV4RRFFQ69G5FAV"][..],
+			&["omp", "chat", "-r", "01ARZ3NDEKTSV4RRFFQ69G5FAV"][..],
+		] {
+			let cli = parse_from_os(arguments.iter().map(OsString::from)).expect("resume alias");
+			let Some(Command::Chat(args)) = cli.command else {
+				panic!("chat command");
+			};
+			assert_eq!(args.resume, Some(sf!("01ARZ3NDEKTSV4RRFFQ69G5FAV")));
+		}
+		for arguments in [&["omp", "chat", "--session"][..], &["omp", "chat", "-r"][..]] {
+			let cli = parse_from_os(arguments.iter().map(OsString::from)).expect("bare resume");
+			let Some(Command::Chat(mut args)) = cli.command else {
+				panic!("chat command");
+			};
+			assert_eq!(chat_start(&mut args), crate::chat_cmd::ChatStart::SessionIndex);
+		}
 	}
 
 	#[test]

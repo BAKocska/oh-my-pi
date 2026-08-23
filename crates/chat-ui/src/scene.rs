@@ -1482,6 +1482,7 @@ pub struct Chat {
 	live_voice_action:       Option<LiveVoiceAction>,
 	reduced_motion:          bool,
 	suppress_history_replay: bool,
+	hide_thinking:           bool,
 }
 
 impl Chat {
@@ -1541,7 +1542,21 @@ impl Chat {
 			live_voice_action: None,
 			reduced_motion: false,
 			suppress_history_replay: false,
+			hide_thinking: false,
 		}
+	}
+
+	/// Hides provider thinking blocks from this scene without changing the
+	/// underlying transcript.
+	pub fn set_hide_thinking(&mut self, hide_thinking: bool) {
+		self.hide_thinking = hide_thinking;
+		if hide_thinking
+			&& let Some(assistant) = self.live_assistant.as_ref()
+			&& assistant.thinking
+		{
+			self.blocks.finalize(assistant.ordinal);
+		}
+		self.bump_live();
 	}
 
 	/// Switches the built-in composer chrome and its status attachment.
@@ -1862,6 +1877,9 @@ impl Chat {
 		{
 			message.text.push_str(text);
 			message.thinking |= message.text.as_str().starts_with("*Thinking:* ");
+			if self.hide_thinking && message.thinking {
+				self.blocks.finalize(message.ordinal);
+			}
 			self.bump_live();
 		}
 	}
@@ -1884,7 +1902,9 @@ impl Chat {
 				.strip_prefix("*Thinking:* ")
 				.unwrap_or(message.text.as_str());
 			if message.thinking {
-				if let Some(body) = sanitize_thinking_text(body, true) {
+				if !self.hide_thinking
+					&& let Some(body) = sanitize_thinking_text(body, true)
+				{
 					let elapsed =
 						elapsed_label(self.started_at.elapsed().saturating_sub(message.started));
 					let body = RichText::new(body, Self::message_width(self.layout_width), &self.ctx);
@@ -1906,6 +1926,9 @@ impl Chat {
 	/// Toggles the latest finalized pending thinking block without mutating
 	/// transcript truth.
 	pub fn toggle_latest_thinking(&mut self) {
+		if self.hide_thinking {
+			return;
+		}
 		if let Some(thinking) = self
 			.entries
 			.range_mut(BlockOrdinal(self.blocks.frontier())..)
@@ -2464,6 +2487,7 @@ impl Chat {
 				}
 			},
 			event @ (BackendEvent::ApprovalPending(_)
+			| BackendEvent::AutoQaConsent(_)
 			| BackendEvent::HistoryInspect { .. }
 			| BackendEvent::OpenGuidedGoal
 			| BackendEvent::OpenPlanReview { .. }
@@ -2538,8 +2562,12 @@ impl Chat {
 					.saturating_sub(elapsed)
 					.min(Duration::from_millis(50))
 			});
-		let active =
-			(self.live_assistant.is_some() || !self.live_tools.is_empty()).then_some(anim::FRAME);
+		let active = (self
+			.live_assistant
+			.as_ref()
+			.is_some_and(|assistant| !(self.hide_thinking && assistant.thinking))
+			|| !self.live_tools.is_empty())
+		.then_some(anim::FRAME);
 		let voice = self.live_voice.is_some().then_some(LIVE_VOICE_FRAME);
 		[editor, download, retained, celebration, active, voice]
 			.into_iter()
@@ -2647,16 +2675,22 @@ impl Chat {
 		let frontier = self.blocks.frontier();
 		let mut settled = SmallVec::<(BlockOrdinal, u16), 8>::new();
 		for (ordinal, entry) in self.entries.range_mut(BlockOrdinal(frontier)..) {
+			if self.hide_thinking && matches!(entry, Entry::Thinking(_)) {
+				continue;
+			}
 			Self::resize_entry(entry, content_width, &self.ctx);
 			let height = Self::entry_height(entry, content_width);
 			if height > 0 {
 				settled.push((*ordinal, height));
 			}
 		}
-
 		let mut sampled = SmallVec::<(BlockOrdinal, u16), 16>::new();
 		let mut natural = SmallVec::<(BlockOrdinal, u16), 16>::new();
-		if let Some(assistant) = self.live_assistant.as_ref() {
+		if let Some(assistant) = self
+			.live_assistant
+			.as_ref()
+			.filter(|assistant| !(self.hide_thinking && assistant.thinking))
+		{
 			sampled.push((assistant.ordinal, assistant.allocation));
 			natural.push((
 				assistant.ordinal,
@@ -2972,6 +3006,7 @@ impl Chat {
 		let mut total = 0_u32;
 		for ordinal in eligible.start..live_end {
 			let height = match self.entries.get_mut(&BlockOrdinal(ordinal)) {
+				Some(entry) if self.hide_thinking && matches!(entry, Entry::Thinking(_)) => 0,
 				Some(entry) => {
 					Self::resize_entry(entry, content_width, &self.ctx);
 					u32::from(Self::entry_height(entry, content_width))
@@ -2983,7 +3018,11 @@ impl Chat {
 			}
 			total = total.saturating_add(height);
 		}
-		if let Some(assistant) = self.live_assistant.as_ref() {
+		if let Some(assistant) = self
+			.live_assistant
+			.as_ref()
+			.filter(|assistant| !(self.hide_thinking && assistant.thinking))
+		{
 			let wanted = flowed_height(assistant.text.as_str(), content_width.max(1)).max(1);
 			total = total.saturating_add(u32::from(assistant.allocation.max(wanted)));
 		}
@@ -3018,7 +3057,9 @@ impl Chat {
 		let range = eligible.start..end;
 		let width = viewport.width.max(1);
 		for ordinal in range.clone() {
-			if let Some(entry) = self.entries.get_mut(&BlockOrdinal(ordinal)) {
+			if let Some(entry) = self.entries.get_mut(&BlockOrdinal(ordinal))
+				&& !(self.hide_thinking && matches!(entry, Entry::Thinking(_)))
+			{
 				Self::resize_entry(entry, width, &self.ctx);
 			}
 		}
@@ -3042,7 +3083,9 @@ impl Chat {
 					height = height.saturating_add(1);
 				}
 			}
-			if let Some(entry) = entry {
+			if let Some(entry) = entry
+				&& !(self.hide_thinking && matches!(entry, Entry::Thinking(_)))
+			{
 				height = height.saturating_add(Self::entry_height(entry, width));
 			}
 			previous_read = is_read;
@@ -3055,6 +3098,9 @@ impl Chat {
 			let Some(entry) = self.entries.get(&BlockOrdinal(ordinal)) else {
 				continue;
 			};
+			if self.hide_thinking && matches!(entry, Entry::Thinking(_)) {
+				continue;
+			}
 			let is_read = matches!(entry, Entry::Tool(tool) if tool.name.as_str() == "read");
 			if is_read && !previous_read {
 				let count = range
@@ -4174,6 +4220,20 @@ mod tests {
 		let text = frame_text(rendered.frame);
 		assert!(text.contains("newest"));
 		assert!(!text.contains("oldest"));
+	}
+
+	#[test]
+	fn hidden_thinking_never_renders_stream_or_snapshot() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(40, 10);
+		chat.set_hide_thinking(true);
+		chat.begin_assistant("a");
+		chat.append_assistant("a", "*Thinking:* private reasoning");
+
+		assert!(!frame_text(chat.render(viewport).frame).contains("private reasoning"));
+		chat.end_assistant("a");
+		assert!(!frame_text(chat.render(viewport).frame).contains("private reasoning"));
+		assert!(chat.entries.is_empty());
 	}
 
 	#[test]

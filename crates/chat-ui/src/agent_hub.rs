@@ -196,13 +196,6 @@ impl AgentHub {
 		Layer { frame: self.ui.frame(), options: &self.options, active: true }
 	}
 
-	fn selected_event(&self, event: impl FnOnce(Str) -> AgentHubEvent) -> AgentHubEvent {
-		self
-			.rows
-			.get(self.selected)
-			.map_or(AgentHubEvent::Consumed, |row| event(row.id.clone()))
-	}
-
 	fn capability_event(
 		&self,
 		allowed: impl FnOnce(&AgentRow) -> bool,

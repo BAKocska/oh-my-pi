@@ -735,7 +735,6 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 	assert_eq!(identities, [
 		("checkpoint", "1".to_owned()),
 		("rewind", "1".to_owned()),
-		("yield", "1".to_owned()),
 		("ask", "1".to_owned()),
 		("ast_edit", "1".to_owned()),
 		("ast_grep", "1".to_owned()),
@@ -755,6 +754,22 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("write", "1".to_owned()),
 		("read", "1".to_owned()),
 	]);
+	let hidden_yield = registry
+		.advertise_selected(
+			LoweringCaps {
+				strict_schema:  true,
+				grammar:        omp_catalog::GrammarBits::empty(),
+				maximum_tools:  None,
+				maximum_strict: None,
+			},
+			&[sf!("yield")],
+		)
+		.expect("advertise hidden yield selection");
+	assert_eq!(
+		hidden_yield.len(),
+		1,
+		"yield must stay selectable for child sessions while hidden from the top-level agent"
+	);
 	let write_definition = advertised
 		.iter()
 		.find(|tool| tool.identity.name == "write")
@@ -1841,7 +1856,7 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 			maximum_strict: None,
 		})
 		.expect("advertise worker registry");
-	assert_eq!(advertised.len(), 21);
+	assert_eq!(advertised.len(), 20);
 	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry
@@ -1881,7 +1896,7 @@ async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
 			maximum_strict: None,
 		})
 		.expect("advertise registry with prelude helper");
-	assert_eq!(advertised.len(), 21);
+	assert_eq!(advertised.len(), 20);
 
 	let verdict = invoke_builtin(
 		harness.client(),

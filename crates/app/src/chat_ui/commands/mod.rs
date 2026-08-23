@@ -237,7 +237,7 @@ pub trait SessionCommandHost {
 pub trait ModelCommandHost {
 	/// Set or select the durable model preference.
 	fn model(&mut self, selector: Option<Str>) -> CommandFuture<'_>;
-	/// Set a resume-stable session override.
+	/// Set a resume-stable session override, or request interactive selection.
 	fn switch(&mut self, selector: Option<Str>) -> CommandFuture<'_>;
 }
 

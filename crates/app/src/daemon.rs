@@ -52,16 +52,6 @@ use zeroize::Zeroizing;
 use crate::{endpoint::LocalEndpoint, gateway_rpc::GatewayRpc};
 
 const DATA_DIR_ENV: &str = "OMP_DATA_DIR";
-const KEYCHAIN_OPT_IN_ENV: &str = "OMP_LLM_KEYCHAIN";
-const KEYCHAIN_SERVICE: &str = "dev.omp.llm";
-const KEYCHAIN_ACCOUNT: &str = "credential-store-master";
-const ANTIGRAVITY_VERSION_ENV: &str = "OMP_ANTIGRAVITY_VERSION";
-const ANTIGRAVITY_CL_ENV: &str = "OMP_ANTIGRAVITY_CL";
-const ANTIGRAVITY_OS_ENV: &str = "OMP_ANTIGRAVITY_OS";
-const ANTIGRAVITY_ARCH_ENV: &str = "OMP_ANTIGRAVITY_ARCH";
-const ANTIGRAVITY_VERSION_CACHE_FILE: &str = "antigravity-version";
-const ANTIGRAVITY_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Daemon-owned session journal replication failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionAuthorityError {

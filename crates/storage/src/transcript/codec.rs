@@ -911,3 +911,6 @@ fn undecodable_line(
 		}),
 	})
 }
+
+#[cfg(test)]
+mod tests;
