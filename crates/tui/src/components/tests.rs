@@ -1,7 +1,7 @@
 //! Widget-tier behavior tests: focus ring, keyboard contract, mouse
 //! routing, conditionals, validation, values, and damage containment.
 
-use std::{env, fmt, fs, str, time};
+use std::{env, fmt, fs, time};
 
 use serde_json::json;
 
@@ -1148,55 +1148,6 @@ fn conditional_static_render_excludes_hidden() {
 	ui.handle_key(Key::Right);
 	let text = rows(&ui).join("\n");
 	assert!(!text.contains("alpha pane") && text.contains("beta pane"));
-}
-
-#[test]
-fn renderer_roundtrip_survives_popup_open_close_shrink() {
-	use crate::{Renderer, test_support::TerminalModel};
-
-	// a form whose select dropdown grows the document when opened and
-	// shrinks it when closed — the classic ratchet violation
-	let src = r#"<col><form id=f>
-<field id=theme kind=select label="Theme" options="dark light nord solar"/>
-</form><text>tail marker</text></col>"#;
-	let mut ui = Ui::from_markup(src, 30, UiContext::default()).unwrap();
-	let logical_before = ui.height();
-
-	let viewport: u16 = 10;
-	let mut renderer = Renderer::new(Vec::<u8>::new());
-	let mut terminal = TerminalModel::new(30, usize::from(viewport));
-	let stats = ui.present(&mut renderer, viewport, 0).unwrap();
-	assert!(stats.bytes > 0);
-
-	// open the dropdown: +4 option rows
-	ui.handle_key(Key::Enter);
-	assert!(ui.height() > logical_before, "dropdown grew the document");
-	ui.present(&mut renderer, viewport, 0).unwrap();
-
-	// close it: logical height shrinks, presented height must NOT
-	ui.handle_key(Key::Esc);
-	assert_eq!(ui.height(), logical_before);
-	assert!(ui.frame().size().height > logical_before, "frame padded to high-water");
-	let stats = ui
-		.present(&mut renderer, viewport, 0)
-		.expect("shrinking popup must not violate the height ratchet");
-
-	// replay everything the renderer emitted into the terminal model and
-	// compare the visible window cell-for-cell with the frame
-	let output = renderer.into_inner();
-	terminal.apply(str::from_utf8(&output).unwrap());
-	let height = ui.frame().size().height;
-	let window_top = height.saturating_sub(viewport);
-	let visible = terminal.visible_rows();
-	for (i, row) in visible.iter().enumerate() {
-		let frame_row = frame_row_text(ui.frame(), window_top + i as u16);
-		assert_eq!(row, &frame_row, "terminal row {i} diverged");
-	}
-	// the padded region below the logical document is blank
-	for y in ui.height()..height {
-		assert_eq!(frame_row_text(ui.frame(), y), "", "pad row {y} not blank");
-	}
-	let _ = stats;
 }
 
 #[test]

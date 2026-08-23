@@ -1,7 +1,7 @@
 //! Process-wide terminal lifecycle, raw-mode ownership, and emergency restore.
 
 use std::{
-	fs::{self, File},
+	fs::{File, OpenOptions},
 	io::{self, Write as _},
 	panic,
 	sync::{
@@ -68,6 +68,7 @@ mod platform {
 	};
 
 	use nix::{
+		errno::Errno,
 		libc,
 		sys::{
 			signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal},
@@ -540,7 +541,7 @@ mod platform {
 		TTY_FD.store(-1, Ordering::Release);
 	}
 
-	fn errno_to_io(error: nix::errno::Errno) -> io::Error {
+	fn errno_to_io(error: Errno) -> io::Error {
 		io::Error::from_raw_os_error(error as i32)
 	}
 
@@ -924,6 +925,8 @@ pub(crate) fn record_resize_signal() {
 
 use std::mem;
 
+use flume::Receiver;
+
 use crate::{
 	InputDecoder, InputEvent, Keymap, ProbeResults, Renderer, Size, TerminalCaps, TerminalResponse,
 	context::Appearance,
@@ -936,6 +939,30 @@ use crate::{
 	pump,
 	pump::{Input, Pump, TerminalEvent},
 };
+
+mod resize_watch {
+	use std::ops::{Deref, DerefMut};
+
+	use tokio::sync::watch::Receiver;
+
+	pub(super) struct ResizeWatch(pub(super) Receiver<u64>);
+
+	impl Deref for ResizeWatch {
+		type Target = Receiver<u64>;
+
+		fn deref(&self) -> &Self::Target {
+			&self.0
+		}
+	}
+
+	impl DerefMut for ResizeWatch {
+		fn deref_mut(&mut self) -> &mut Self::Target {
+			&mut self.0
+		}
+	}
+}
+
+use resize_watch::ResizeWatch;
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
 const APPEARANCE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -1261,8 +1288,8 @@ pub struct Terminal {
 	keymap: Keymap,
 	resize_ready: bool,
 	resize_live: bool,
-	events: flume::Receiver<TerminalEvent>,
-	resize_watch: tokio::sync::watch::Receiver<u64>,
+	events: Receiver<TerminalEvent>,
+	resize_watch: ResizeWatch,
 	pump: Pump,
 	cell_pixel_size: Option<(u16, u16)>,
 	progress: Option<ProgressWorker>,
@@ -1382,7 +1409,7 @@ impl Terminal {
 			resize_ready: false,
 			resize_live: true,
 			events: channels.events,
-			resize_watch: channels.resize,
+			resize_watch: ResizeWatch(channels.resize),
 			pump: channels.pump,
 			cell_pixel_size: caps.cell_px,
 			progress: None,
@@ -1401,15 +1428,11 @@ impl Terminal {
 	fn acquire_input() -> io::Result<Input> {
 		#[cfg(all(unix, not(target_os = "macos")))]
 		{
-			use fs::OpenOptions;
-
 			use crate::tty::open;
 			Ok(Input::Pollable(open(OpenOptions::new().read(true))?))
 		}
 		#[cfg(target_os = "macos")]
 		{
-			use fs::OpenOptions;
-
 			use crate::tty::{open, overridden};
 			// SAFETY: isatty reads only the fixed stdin descriptor.
 			let stdin_is_tty = unsafe { nix::libc::isatty(nix::libc::STDIN_FILENO) } == 1;
@@ -1431,7 +1454,7 @@ impl Terminal {
 		}
 		#[cfg(windows)]
 		{
-			Ok(Input::Bridged(fs::OpenOptions::new().read(true).open("CONIN$")?))
+			Ok(Input::Bridged(OpenOptions::new().read(true).open("CONIN$")?))
 		}
 	}
 
@@ -1912,9 +1935,8 @@ impl Terminal {
 	/// synchronized paint, keeping the switch atomic with the first frame
 	/// drawn there. `None` when the alternate screen is already active.
 	///
-	/// [`Renderer::preview`](crate::Renderer::preview) and
-	/// [`Renderer::preview_overlaid`](crate::Renderer::preview_overlaid)
-	/// accept the sequence as their leading sequence. A passive
+	/// [`Renderer::repaint`](crate::Renderer::repaint) accepts the sequence
+	/// as its leading prefix. A passive
 	/// [`AltScreenUse::Resize`] borrow never touches mouse modes: motion
 	/// reports would flood input mid-drag. Teardown and emergency restore
 	/// treat the alternate screen as active immediately, so the sequence
@@ -1969,7 +1991,7 @@ impl Terminal {
 	/// ownership enabled it, Kitty flag pop, buffer switch — so leaving the
 	/// alternate screen and repainting the main screen land in one
 	/// synchronized update (see
-	/// [`Renderer::rebuild`](crate::Renderer::rebuild)). `None` when already on
+	/// [`Renderer::repaint`](crate::Renderer::repaint)). `None` when already on
 	/// the main screen.
 	pub fn stage_alt_leave(&mut self) -> Option<&'static str> {
 		if !self.alt_screen {
@@ -2399,13 +2421,13 @@ mod tests {
 	use super::{
 		ACTIVE, ANSI_INSERT_MODE, ANSI_NEWLINE_MODE, APPEARANCE_NOTIFICATIONS_MODE, AltScreenUse,
 		ConsoleCodepage, CursorStyle, IN_BAND_RESIZE_MODE, INPUT_REPORTS_OFF, KeyboardMode,
-		MOUSE_TRACKING_ON, OSC11_QUERY, Progress, RESIZE_GENERATION, TITLE_POP, TITLE_PUSH, Terminal,
-		UTF8_CODEPAGE, XTERM_SCROLL_ON_KEY_PRESS, XTERM_SCROLL_ON_OUTPUT, ansi_mode_restore_modes,
-		ansi_mode_restore_payload, base64, compose_enter, compose_input_reports_off, compose_leave,
-		compose_progress, compose_title, emergency_restore_payload, ensure_console_utf8,
-		ensure_restore_hooks, keyboard_mode, notification_modes_off_payload,
-		owned_notification_modes, platform, progress_state, reconcile_in_band_geometry,
-		rounded_cell_pixels,
+		MOUSE_TRACKING_ON, OSC11_QUERY, Progress, RESIZE_GENERATION, ResizeWatch, TITLE_POP,
+		TITLE_PUSH, Terminal, UTF8_CODEPAGE, XTERM_SCROLL_ON_KEY_PRESS, XTERM_SCROLL_ON_OUTPUT,
+		ansi_mode_restore_modes, ansi_mode_restore_payload, base64, compose_enter,
+		compose_input_reports_off, compose_leave, compose_progress, compose_title,
+		emergency_restore_payload, ensure_console_utf8, ensure_restore_hooks, keyboard_mode,
+		notification_modes_off_payload, owned_notification_modes, platform, progress_state,
+		reconcile_in_band_geometry, rounded_cell_pixels,
 	};
 	use crate::{
 		Appearance, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
@@ -3401,7 +3423,7 @@ mod tests {
 			resize_ready: false,
 			resize_live: true,
 			events: channels.events,
-			resize_watch: channels.resize,
+			resize_watch: ResizeWatch(channels.resize),
 			pump: channels.pump,
 			cell_pixel_size: None,
 			progress: None,

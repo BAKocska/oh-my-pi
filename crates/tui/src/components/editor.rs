@@ -2410,7 +2410,7 @@ mod tests {
 		ui.focus_first();
 
 		let mut renderer = Renderer::new(Vec::new());
-		ui.present(&mut renderer, 10, 0).unwrap();
+		ui.present(&mut renderer, 10).unwrap();
 		let frame_text = (0..ui.height())
 			.map(|y| frame_row_text(ui.frame(), y))
 			.collect::<Vec<_>>();
@@ -2420,7 +2420,7 @@ mod tests {
 		);
 
 		ui.handle_key(Key::Char('x'));
-		ui.present(&mut renderer, 10, 0).unwrap();
+		ui.present(&mut renderer, 10).unwrap();
 		let painted = (0..ui.height())
 			.map(|y| frame_row_text(ui.frame(), y))
 			.collect::<Vec<_>>();
@@ -2479,7 +2479,7 @@ mod tests {
 			ui.focus_first();
 			ui.handle_key(Key::Char('/'));
 			let mut renderer = Renderer::new(Vec::new());
-			ui.present(&mut renderer, 24, 0).unwrap();
+			ui.present(&mut renderer, 24).unwrap();
 			let rows = (0..ui.height())
 				.map(|row| frame_row_text(ui.frame(), row))
 				.collect::<Vec<_>>();
@@ -2519,7 +2519,7 @@ mod tests {
 		ui.focus_first();
 		ui.handle_key(Key::Char('/'));
 		let mut renderer = Renderer::new(Vec::new());
-		ui.present(&mut renderer, 24, 0).unwrap();
+		ui.present(&mut renderer, 24).unwrap();
 		let rows = (0..ui.height())
 			.map(|row| frame_row_text(ui.frame(), row))
 			.collect::<Vec<_>>();

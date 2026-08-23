@@ -257,7 +257,7 @@ mod tests {
 		let mut renderer = Renderer::new(Vec::new());
 		let mut terminal = TerminalModel::new(width.into(), 18);
 		renderer
-			.rebuild(ui.frame().clone(), 18, 0, "")
+			.present(ui.frame().clone(), 18, &[])
 			.expect("paint succeeds");
 		replay(&mut renderer, &mut terminal);
 		terminal
@@ -308,7 +308,7 @@ mod tests {
 		let mut renderer = Renderer::new(Vec::new());
 		let mut terminal = TerminalModel::new(viewport.width.into(), viewport.height.into());
 		renderer
-			.rebuild(ui.frame().clone(), viewport.height, 0, "")
+			.present(ui.frame().clone(), viewport.height, &[])
 			.expect("initial paint succeeds");
 		replay(&mut renderer, &mut terminal);
 
@@ -324,7 +324,7 @@ mod tests {
 		{
 			ui.handle_key(key);
 			let stats = ui
-				.present(&mut renderer, viewport.height, 0)
+				.present(&mut renderer, viewport.height)
 				.expect("scroll paint succeeds");
 			replay(&mut renderer, &mut terminal);
 			let scroll_area = usize::from(viewport.width) * usize::from(scroll_height(viewport));
@@ -337,7 +337,7 @@ mod tests {
 
 		ui.handle_mouse(1, 3, Mouse::WheelDown);
 		let stats = ui
-			.present(&mut renderer, viewport.height, 0)
+			.present(&mut renderer, viewport.height)
 			.expect("wheel paint succeeds");
 		let scroll_area = usize::from(viewport.width) * usize::from(scroll_height(viewport));
 		assert!(stats.changed_cells <= scroll_area);
@@ -360,7 +360,7 @@ mod tests {
 				.unwrap();
 		}
 		renderer
-			.rebuild(ui.frame().clone(), viewport.height, 0, "")
+			.present(ui.frame().clone(), viewport.height, &[])
 			.expect("Kitty initial paint succeeds");
 		let output = String::from_utf8(renderer.into_inner()).unwrap();
 		assert!(output.starts_with("\x1b_Gf=100,t=d,a=t,i=1,q=2,"));

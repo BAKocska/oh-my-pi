@@ -27,11 +27,15 @@
 
 #[cfg(unix)]
 use std::os::fd;
-use std::{fs::File, future, io, mem, sync, sync::atomic, thread, time};
+use std::{fs::File, future, io, mem, sync, sync::atomic, thread, time::Instant};
 
+use flume::Receiver;
 #[cfg(unix)]
 use futures_lite::StreamExt as _;
+#[cfg(unix)]
+use omp_executor::signal::{self, Signals};
 use parking_lot::Mutex;
+use tokio::sync::watch;
 
 use crate::input::{InputDecoder, InputEvent, Keymap};
 
@@ -135,7 +139,7 @@ fn send_ctl(ctl: Ctl) -> bool {
 /// path without a live terminal; the returned receiver yields the events
 /// the actor would emit.
 #[cfg(test)]
-pub fn publish_ingress_for_test() -> flume::Receiver<TerminalEvent> {
+pub fn publish_ingress_for_test() -> Receiver<TerminalEvent> {
 	let (ctl_tx, ctl_rx) = flume::unbounded();
 	let (event_tx, event_rx) = flume::unbounded();
 	*SHARED_CTL.lock() = Some(ctl_tx);
@@ -205,10 +209,10 @@ pub struct PumpChannels {
 	/// The running actor.
 	pub pump:   Pump,
 	/// Sole receiver of decoded terminal events.
-	pub events: flume::Receiver<TerminalEvent>,
+	pub events: Receiver<TerminalEvent>,
 	/// Resize side channel; the value is a monotonically increasing wake
 	/// count. Never fires on Windows, where hosts poll geometry instead.
-	pub resize: tokio::sync::watch::Receiver<u64>,
+	pub resize: watch::Receiver<u64>,
 }
 
 /// Raw bytes flowing into the actor.
@@ -218,7 +222,7 @@ enum ByteSource {
 	#[cfg(unix)]
 	Fd(async_io::Async<fd::OwnedFd>),
 	/// Reader-thread bridge for handles the OS cannot poll.
-	Thread(flume::Receiver<Vec<u8>>),
+	Thread(Receiver<Vec<u8>>),
 }
 
 impl ByteSource {
@@ -273,18 +277,17 @@ pub fn spawn(
 	watch_resize: bool,
 ) -> io::Result<PumpChannels> {
 	let (events_tx, events_rx) = flume::unbounded();
-	let (resize_tx, resize_rx) = tokio::sync::watch::channel(0_u64);
+	let (resize_tx, resize_rx) = watch::channel(0_u64);
 	let (ctl_tx, ctl_rx) = flume::unbounded();
 
 	let (source, bridge) = input.into_source()?;
 	#[cfg(unix)]
-	let resize = watch_resize
-		.then(|| omp_executor::signal::Signals::new(&[omp_executor::signal::Signal::SIGWINCH]));
+	let resize = watch_resize.then(|| Signals::new(&[signal::Signal::SIGWINCH]));
 	#[cfg(windows)]
 	let resize = ();
 
 	let mut events = Vec::new();
-	decoder.feed(preserved, time::Instant::now(), &mut events);
+	decoder.feed(preserved, Instant::now(), &mut events);
 
 	let task = executor.spawn(actor(source, decoder, events, events_tx, ctl_rx, resize, resize_tx));
 	Ok(PumpChannels {
@@ -383,15 +386,16 @@ fn bridge_loop(input: File, tx: &flume::Sender<Vec<u8>>, stop: &atomic::AtomicBo
 	#[cfg(windows)]
 	{
 		use std::{io::Read as _, os::windows::io::AsRawHandle as _};
+
+		use windows_sys::Win32::{Foundation, System::Threading};
 		let mut input = input;
 		let handle = input.as_raw_handle();
 		while !stop.load(atomic::Ordering::Acquire) {
-			let ready =
-				unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(handle, 50) };
-			if ready == windows_sys::Win32::Foundation::WAIT_TIMEOUT {
+			let ready = unsafe { Threading::WaitForSingleObject(handle, 50) };
+			if ready == Foundation::WAIT_TIMEOUT {
 				continue;
 			}
-			if ready != windows_sys::Win32::Foundation::WAIT_OBJECT_0 {
+			if ready != Foundation::WAIT_OBJECT_0 {
 				return;
 			}
 			match input.read(&mut bytes) {
@@ -414,10 +418,10 @@ async fn actor(
 	mut decoder: InputDecoder,
 	mut events: Vec<InputEvent>,
 	events_tx: flume::Sender<TerminalEvent>,
-	ctl_rx: flume::Receiver<Ctl>,
-	#[cfg(unix)] mut resize: Option<omp_executor::signal::Signals>,
+	ctl_rx: Receiver<Ctl>,
+	#[cfg(unix)] mut resize: Option<Signals>,
 	#[cfg(windows)] resize: (),
-	resize_tx: tokio::sync::watch::Sender<u64>,
+	resize_tx: watch::Sender<u64>,
 ) {
 	// The resize sender lives for the actor's lifetime so
 	// `watch::Receiver::changed` pends instead of erroring where resize
@@ -442,7 +446,7 @@ async fn actor(
 				}
 			},
 			chunk = source.next() => if let Ok(Some(bytes)) = chunk {
-						decoder.feed(&bytes, std::time::Instant::now(), &mut events);
+						decoder.feed(&bytes, Instant::now(), &mut events);
 					} else {
 						let _ = events_tx.send(TerminalEvent::Closed);
 						return;
@@ -460,7 +464,7 @@ async fn actor(
 				}
 			},
 			() = deadline(wake) => {
-				decoder.tick(std::time::Instant::now(), &mut events);
+				decoder.tick(Instant::now(), &mut events);
 			},
 		}
 	}
@@ -477,7 +481,7 @@ fn apply_ctl(
 ) -> bool {
 	match ctl {
 		Ctl::Bytes(bytes) => {
-			decoder.feed(&bytes, time::Instant::now(), events);
+			decoder.feed(&bytes, Instant::now(), events);
 			true
 		},
 		Ctl::Event(event) => {
@@ -497,7 +501,7 @@ fn apply_ctl(
 
 /// Resolves once the next SIGWINCH arrives.
 #[cfg(unix)]
-async fn resize_readable(resize: &mut Option<omp_executor::signal::Signals>) {
+async fn resize_readable(resize: &mut Option<Signals>) {
 	let Some(resize) = resize else {
 		return future::pending().await;
 	};
@@ -510,7 +514,7 @@ async fn resize_readable(_resize: ()) {
 }
 
 /// Sleeps until `at`; `None` disables the branch.
-async fn deadline(at: Option<time::Instant>) {
+async fn deadline(at: Option<Instant>) {
 	match at {
 		Some(at) => {
 			async_io::Timer::at(at).await;

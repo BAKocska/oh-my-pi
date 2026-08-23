@@ -1,6 +1,11 @@
 //! Typed component properties with allocation-free well-known slots.
 
-use std::{error, fmt, str::FromStr, time::Duration};
+use std::{
+	error,
+	fmt::{self, Display},
+	str::FromStr,
+	time::Duration,
+};
 
 use omp_core::{IntoStr, Str, sf};
 use strum::{Display, EnumIter, EnumString};
@@ -451,7 +456,7 @@ pub struct PropError {
 	pub value: Str,
 }
 
-impl fmt::Display for PropError {
+impl Display for PropError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "bad value {:?} for property {:?}", self.value, self.prop)
 	}

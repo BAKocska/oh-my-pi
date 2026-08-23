@@ -11,7 +11,10 @@ use std::{
 	time::{Duration, Instant},
 };
 #[cfg(unix)]
-use std::{fs, os::fd::AsFd as _};
+use std::{
+	fs::{self, OpenOptions},
+	os::fd::AsFd as _,
+};
 
 #[cfg(unix)]
 use nix::{
@@ -769,7 +772,7 @@ fn probe_controlling_terminal(
 	inside_tmux: bool,
 	include_osc99: bool,
 ) -> Option<ProbeResults> {
-	let mut tty = open(fs::OpenOptions::new().read(true).write(true)).ok()?;
+	let mut tty = open(OpenOptions::new().read(true).write(true)).ok()?;
 	let original_termios = tcgetattr(&tty).ok()?;
 	let mut raw_termios = original_termios.clone();
 	cfmakeraw(&mut raw_termios);
@@ -1269,7 +1272,7 @@ mod tests {
 	use std::{
 		collections::HashMap,
 		io::{self, Read, Write},
-		time::{self, Duration},
+		time::{Duration, Instant},
 	};
 
 	use super::{
@@ -1407,7 +1410,7 @@ mod tests {
 		assert_eq!(preserved, b"x\x1b[Ayz");
 		let mut decoder = InputDecoder::new();
 		let mut events = Vec::new();
-		decoder.feed(&preserved, time::Instant::now(), &mut events);
+		decoder.feed(&preserved, Instant::now(), &mut events);
 		assert_eq!(events, [
 			InputEvent::Key(Key::Char('x')),
 			InputEvent::Key(Key::Up),

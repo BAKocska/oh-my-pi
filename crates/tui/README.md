@@ -1,6 +1,6 @@
 # `omp-tui`
 
-`omp-tui` builds retained terminal interfaces from declarative component trees. You describe a screen once, route terminal events into `Ui`, and let `Ui` update and repaint the smallest safe region. `Renderer` then writes only the changed cells while preserving native terminal scrollback.
+`omp-tui` builds retained terminal interfaces from declarative component trees. You describe a screen once, route terminal events into `Ui`, and let `Ui` update and repaint the smallest safe region. `Renderer` then writes only the changed viewport cells without scrolling terminal history.
 
 Most applications use `dom!` for their initial tree, stable `id` attributes for later updates, and `Ui::values()` to read interactive state.
 
@@ -339,7 +339,7 @@ Verbatim text. It does not parse Markdown.
 
 - **Content:** String literals or expressions in `dom!`; raw body text in runtime markup.
 - **Props:** Shared; `fg`; `bold`; `dim`; `italic`; `underline`; `reverse`; `strike`; `align`; `truncate`; `wrap`; `shimmer`; `reveal`.
-- **Wrapping:** Word-wraps by default. `wrap=char` flows grapheme-exact to the width like a bare terminal, and full-width rows flag their break as a soft wrap — the renderer joins such boundaries through terminal autowrap (mid-word overflow breaks join under word wrap too), so native selection copies the line unbroken, on screen and in scrollback.
+- **Wrapping:** Word-wraps by default. `wrap=char` flows grapheme-exact to the width like a bare terminal, and full-width rows flag their break as a soft wrap — the renderer joins such boundaries through terminal autowrap (mid-word overflow breaks join under word wrap too), so native selection copies the on-screen line unbroken.
 - **Updates:** `Ui::set_text(id, value)` replaces its content. With `reveal`, a replacement that extends the current text continues the reveal from the shown prefix; any other replacement restarts it from nothing.
 
 #### `<md>`
@@ -877,7 +877,7 @@ async fn main() -> io::Result<()> {
 - `Updated` means input changed or damaged the tree. Read `App::ui().values()` and apply dependent mutations before the next call presents it.
 - `Submitted` means the focused widget submitted.
 - `Pressed(id)` carries the ID of an activated button.
-- `Resized(size)` means the resize storm settled. `Ui::resize` already applied the new width; update fixed-height components before the next call rebuilds the terminal view.
+- `Resized(size)` means the resize storm settled. `Ui::resize` already applied the new width; update fixed-height components before the next viewport present.
 
 Ctrl-C quits by default. `AppOptions::quit` replaces the quit chords, and `keep_on_cancel` prevents a top-level `UiEvent::Cancel` from stopping the host. Once stopped, `next` continues to return `None`.
 
@@ -908,13 +908,13 @@ terminal.edit_keymap(|keymap| keymap.bind(alt_n, Key::PageDown));
 
 `Keymap::disable` masks a chord, including its identity fallback; `Keymap::unbind` removes a table entry and restores fallback handling. Exact bindings win before shift-folded spellings and identity fallbacks. `InputDecoder` exposes `keymap()` and `keymap_mut()` accessors for applications that decode their own byte streams.
 
-### Renderer stability boundary
+### Viewport presentation and explicit retirement
 
-The final `stable_rows` argument to `Ui::present` and `Renderer::rebuild` declares an immutable document prefix. Use `0` for a fully mutable application. Use a larger value only for rows that will never change again, such as completed transcript entries moving into native scrollback. Mutating an already committed stable row is rejected because terminal scrollback is not addressable.
+`Ui::present(&mut renderer, viewport_height)` paints exactly one history-neutral viewport. It never infers durable output from scene geometry and never scrolls terminal history. Applications move finalized output into native scrollback only through `Renderer::retire(finalized, viewport, viewport_height, layers)`: `finalized` contains the immutable rows selected by the application, while `viewport` is the exact screen that must remain after retirement. A successful retirement scrolls exactly the finalized row count; ordinary presents and full repaints scroll zero rows.
 
 ### Resize without losing state
 
-Call `ui.resize(new_width)` rather than rebuilding the `Ui`. Update fixed viewport components with `set_height`, then rebuild the renderer's terminal view. This preserves active tabs, editor text, selections, focus, and scroll positions.
+Call `ui.resize(new_width)` rather than rebuilding the `Ui`. Update fixed viewport components with `set_height`, then present the viewport. This preserves active tabs, editor text, selections, focus, and scroll positions.
 
 ## Paste and clipboard
 
@@ -955,16 +955,16 @@ Behavior:
 
 - **Placement is declarative.** `OverlayOptions` resolves against the viewport at every present: `anchor` (nine positions, `Center` default), `width`/`max_height` as cells or percentages (`Dim::Cells`, `Dim::Pct`), `margin` insets, `offset_x`/`offset_y` nudges, explicit `row`/`col` overrides, and `min_viewport` to gate the layer on small terminals. The default width is `min(80, available)`.
 - **Modal layers capture input (the default).** The topmost visible modal overlay receives every key and paste. A cancel from inside a layer (`Esc`, or a `<button cancel>`) dismisses it before anything else: the `App` runtime closes that layer and returns `AppEvent::OverlayClosed(id)` (quit-on-cancel only applies to the base tree), while manual hosts see `UiEvent::Cancel` and call `close_active_overlay`, which dismisses the layer that emitted it even when a higher-z non-modal pane sits above it in the stack (`close_top_overlay` pops the stack top regardless of modality). The base tree keeps its focus untouched, so closing an overlay restores the previous interaction exactly. Mouse input inside the overlay's bounds is routed to it and occluded from the document; clicks outside still reach the base tree.
-- **Scrollback stays clean.** Overlays are composited by the renderer as z-ordered viewport layers. The document keeps scrolling and committing while a layer is open: a row leaving the viewport is repainted from the raw document before it enters native scrollback, so overlay cells can never leak into terminal history.
+- **Presentation stays history-neutral.** Overlays are composited as z-ordered viewport layers. Presenting or repainting a layer never scrolls terminal history; explicit retirement receives finalized base rows separately, so overlay cells are never part of the retired batch.
 - **Stacking nests.** Later `show_overlay` calls stack on top; explicit `z` on `OverlayOptions` orders layers regardless of creation order, and ties stack newest-on-top. `set_overlay_hidden` parks a layer without losing its editor text, selection, or scroll state.
 
 ### Non-modal layers and sidebars
 
-`OverlayOptions::non_modal()` turns a layer into a persistent pane instead of a dialog: keys and paste stay with the base tree, `Esc` never dismisses it, and the `App` runtime keeps presenting inline instead of holding the alternate screen — the document keeps committing to native scrollback beneath the pane, and a row entering history is repainted from the raw document first, so sidebar cells never reach history.
+`OverlayOptions::non_modal()` turns a layer into a persistent pane instead of a dialog: keys and paste stay with the base tree, `Esc` never dismisses it, and the `App` runtime keeps presenting the history-neutral viewport instead of holding the alternate screen. The pane remains an overlay layer and is never included in an explicit finalized-row retirement.
 
 ```rust,no_run
 # use omp_tui::{dom, Dim, OverlayAnchor, OverlayOptions, Size, Ui, UiContext};
-# let mut ui = Ui::from_markup("<text>transcript</text>", 120, UiContext::default()).unwrap();
+# let mut ui = Ui::from_markup("<text>workspace</text>", 120, UiContext::default()).unwrap();
 let sidebar = ui.show_overlay(
     dom! {
         <col pad="0 1" gap=1>
@@ -998,9 +998,9 @@ Keyboard hand-off:
 
 `fill_height()` stretches a retained overlay tree to the full available viewport height on every present (margins and `max_height` still apply), so `grow` and `valign` lay the rail out like a full-height column; without it the band follows content height. Raw-frame `Layer` hosts size their frame directly instead — see `examples/chat` for a full-height, click-to-focus sidebar over an immediate-mode document.
 
-Teardown: the final inline screen persists into native scrollback once the shell resumes, so a pane must not be left composited at exit. `App` scrubs automatically on drop; manual hosts call `Renderer::clear_layers()` (after releasing any alternate-screen hold) before dropping the `Terminal`, which repaints the pane's bands from the raw document.
+Teardown: a pane must not remain composited when terminal ownership returns to the shell. `App` clears renderer layer state automatically on drop; manual hosts call `Renderer::clear_layers()` after releasing any alternate-screen hold and before dropping the `Terminal`.
 
-Limitations: direct-drawn images (sixel, iTerm2, Kitty direct) are not occluded by overlays — cell-based Kitty placeholder graphics are. The transient resize preview paints only the document; overlays reappear at resize settle.
+Limitations: direct-drawn images (sixel, iTerm2, Kitty direct) are not occluded by overlays — cell-based Kitty placeholder graphics are. Resizes relayout and repaint the complete composited viewport.
 
 ## Terminal lifecycle
 
@@ -1014,7 +1014,7 @@ Entry resets ANSI insert mode (IRM 4) and new-line mode (LNM 20) so cell writes 
 
 `detect()` is the fast, environment-only path. `negotiate(timeout) -> (TerminalCaps, ProbeResults)` adds a bounded controlling-terminal probe; `ProbeResults::preserved_input` retains every non-probe byte in original order. `negotiate_async` performs the same work on Tokio's blocking pool. Prefer `Terminal::enter(TerminalOptions::default())` when capabilities are not needed beforehand: entry negotiates internally, completed key, mouse, paste, and focus events are ready on the first `read`, terminal responses remain internal, and partial sequences continue in the live pump's decoder.
 
-When capabilities are needed before entry, pass both halves back with `TerminalOptions::new(caps).probe_results(probe)`. Keep the UI context and renderer aligned with `terminal.caps()` fields such as `graphics`, `sync_output`, `screen_to_scrollback`, `hyperlinks`, `cell_px`, and `inside_tmux`. `TerminalCaps` records terminal identity, selected graphics and notification protocols, keyboard support, pixel geometry, appearance, resize support, and multiplexer state; `TerminalCaps::resolve` applies probe results or an explicit graphics override.
+When capabilities are needed before entry, pass both halves back with `TerminalOptions::new(caps).probe_results(probe)`. Keep the UI context and renderer aligned with `terminal.caps()` fields such as `graphics`, `sync_output`, `hyperlinks`, `cell_px`, and `inside_tmux`. `TerminalCaps` records terminal identity, selected graphics and notification protocols, keyboard support, pixel geometry, appearance, resize support, and multiplexer state; `TerminalCaps::resolve` applies probe results or an explicit graphics override.
 
 The graphics detector recognizes these crate-specific overrides:
 
@@ -1177,8 +1177,8 @@ resizes, and raw byte-stream statistics as one session-based tool.
 - **Using a data tag under the wrong owner:** `<option>` belongs under `<select>`, `<tab>` under `<tabs>`, and so on.
 - **Treating construction-time `if` as reactive:** use `when=` for value-driven retained visibility.
 - **Rebuilding on resize:** call `resize` and `set_height` so focus, selections, and scroll offsets survive.
-- **Passing screen rows to `handle_mouse`:** translate them to document rows when content is taller than the viewport.
-- **Marking mutable content stable:** keep `stable_rows` at `0` unless the prefix is permanently immutable.
+- **Passing document rows to `handle_mouse`:** coordinates are viewport-local; pass terminal report rows directly.
+- **Retiring live content:** call `retire` only with immutable finalized rows selected in application order; ordinary viewport updates belong in `present`.
 - **Skipping terminal restoration:** enter through `Terminal`; its explicit `leave`, `Drop`, panic hook, and fatal-signal handlers restore the modes it owns.
 
 ## Run the bundled examples

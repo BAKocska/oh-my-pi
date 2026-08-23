@@ -132,6 +132,21 @@ impl TerminalModel {
 					self.apply_csi(&parameters, chars[index]);
 					index += 1;
 				},
+				'\x1b' if chars.get(index + 1) == Some(&']') => {
+					index += 2;
+					loop {
+						assert!(index < chars.len(), "unterminated OSC sequence");
+						if chars[index] == '\x07' {
+							index += 1;
+							break;
+						}
+						if chars[index] == '\x1b' && chars.get(index + 1) == Some(&'\\') {
+							index += 2;
+							break;
+						}
+						index += 1;
+					}
+				},
 				'\r' => {
 					self.cursor_col = 0;
 					self.pending_wrap = false;

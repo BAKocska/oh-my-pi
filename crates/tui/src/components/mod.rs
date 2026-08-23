@@ -30,7 +30,6 @@ mod tabs;
 mod text;
 mod todo;
 mod tool_card;
-mod transcript;
 mod tree;
 mod wizard;
 
@@ -74,6 +73,5 @@ pub use tabs::Tabs;
 pub use text::{Pre, TextLeaf};
 pub use todo::{TaskStatus, Todo, TodoTask, collapse_hud_line};
 pub use tool_card::{ToolCard, ToolState};
-pub use transcript::TranscriptView;
 pub use tree::{Tree, TreeNode};
 pub use wizard::Wizard;

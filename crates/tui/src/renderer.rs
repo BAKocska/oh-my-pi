@@ -4,7 +4,6 @@ use std::{
 	fmt::Write as _,
 	io::{self, Write},
 	mem,
-	ops::Range,
 	path::Path,
 	ptr,
 };
@@ -29,47 +28,17 @@ use crate::{
 };
 
 const RESET_STYLE: &str = esc!(style_reset);
-const CLEAR_VIEWPORT: &str = esc!(erase_display, cursor_home);
-const SCREEN_TO_SCROLLBACK: &str = esc!(screen_to_scrollback);
-const REBUILD_HISTORY: &str = esc!(cursor_home, erase_scrollback);
 const SYNC_OUTPUT_BEGIN: &str = esc!(sync_output);
 const SYNC_OUTPUT_END: &str = esc!(!sync_output);
 const HIDE_CURSOR: &str = esc!(!cursor_visible);
 const SHOW_CURSOR: &str = esc!(cursor_visible);
-// CUD clamps at the bottom without changing the user's scrollback viewport,
-// unlike an absolute CUP address.
+// CUD clamps at the bottom without changing the user's scrollback viewport.
 const VIEWPORT_BOTTOM: &str = esc!(viewport_bottom);
 const DEFAULT_CELL_PIXEL_WIDTH: u16 = 9;
 const DEFAULT_CELL_PIXEL_HEIGHT: u16 = 18;
 #[cfg(any(windows, target_os = "linux", test))]
 const MAX_CONPTY_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_OUTPUT_BACKLOG_BYTES: usize = 64 * 1024 * 1024;
-
-/// Native-scrollback policy for a settled in-place width resize.
-#[derive(
-	Clone,
-	Copy,
-	Debug,
-	Default,
-	Eq,
-	PartialEq,
-	serde::Deserialize,
-	serde::Serialize,
-	strum::Display,
-	strum::EnumString,
-	strum::IntoStaticStr,
-)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
-pub enum ResizeScrollbackMode {
-	/// Replay the transcript at the current width below existing history.
-	Append,
-	/// Erase native history and replay one current-width transcript copy.
-	Rebuild,
-	/// Repaint only the viewport, retaining existing native history.
-	#[default]
-	Preserve,
-}
 
 /// Health of the renderer's bounded terminal output queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,21 +65,26 @@ impl OutputBacklogGuard {
 	}
 }
 
-/// Measurements from one native-scrollback paint.
+/// Measurements from one history-neutral viewport paint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PaintStats {
 	/// Whether this replaced the complete viewport.
-	pub full_repaint:   bool,
+	pub full_repaint:  bool,
 	/// Number of changed cells emitted.
-	pub changed_cells:  usize,
+	pub changed_cells: usize,
 	/// Number of changed runs or complete rows emitted.
-	pub runs:           usize,
-	/// Number of newly finalized rows committed to native scrollback.
-	pub committed_rows: u16,
-	/// Number of uncommitted logical rows clipped above the live viewport.
-	pub clipped_rows:   u16,
+	pub runs:          usize,
 	/// Number of bytes written to the terminal.
-	pub bytes:          usize,
+	pub bytes:         usize,
+}
+
+/// Measurements from one explicit retirement transaction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetireStats {
+	/// Number of finalized rows appended to native history.
+	pub rows:  u16,
+	/// Number of bytes written to the terminal.
+	pub bytes: usize,
 }
 
 /// A layer with its band already resolved, ready to composite.
@@ -245,12 +219,6 @@ impl ComposedFrame<'_> {
 	}
 }
 
-#[derive(Clone, Copy)]
-struct Layout {
-	stable_limit: u16,
-	window_top:   u16,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Window {
 	top:    u16,
@@ -270,40 +238,15 @@ struct ScreenCursor {
 	row: u16,
 	col: u16,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct EpochCommit {
-	epoch:       u32,
-	frame_from:  u16,
-	frame_to:    u16,
-	native_from: u16,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WidthEpoch {
-	id:            u32,
-	width:         u16,
-	seam:          u16,
-	baseline_rows: u16,
-}
-
-struct WidthEpochCapture {
-	frame:  Frame,
-	window: Window,
-}
 
 struct RegisteredImage {
 	png:            CowBytes<'static>,
 	uploaded:       bool,
-	/// Cell boxes (`rows`, `cols`) already given a virtual placement.
 	placed:         SmallVec<(u16, u16), 2>,
 	sixel:          Option<SixelImage>,
 	sixel_decoded:  bool,
 	direct_visible: bool,
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("a previously declared-stable row changed; native history was left untouched")]
-struct StableRowMutation;
 
 impl RegisteredImage {
 	const fn new(png: CowBytes<'static>) -> Self {
@@ -318,82 +261,46 @@ impl RegisteredImage {
 	}
 }
 
-/// Renders an immutable document prefix and a mutable viewport-local suffix.
+/// Paints one fixed-height terminal viewport and retires finalized rows
+/// explicitly.
 ///
-/// `stable_rows` declares the leading rows that will never change again. Stable
-/// rows enter native scrollback only when they leave the visible top edge.
-/// Already-clipped stable rows remain protected but deferred until a rebuild,
-/// avoiding a viewport replay that would displace native text selections.
-/// A committed or previously declared-stable mutation is rejected before any
-/// terminal output, because native scrollback has no addressable cells. The
-/// retained physical screen model composes the raw previous frame with its
-/// stored viewport layers.
+/// [`Renderer::present`] and [`Renderer::repaint`] are history-neutral: tall
+/// frames are bottom-clipped and no presentation path scrolls.
+/// [`Renderer::retire`] is the sole source of terminal scrolling and appends
+/// exactly the finalized rows supplied by the caller.
 pub struct Renderer<W: Write> {
-	writer:               W,
-	previous:             Option<Frame>,
-	layers:               SmallVec<StoredLayer, 4>,
-	layer_scratch:        SmallVec<StoredLayer, 4>,
-	/// Throwaway-screen baseline retained separately from normal-buffer history.
-	preview_previous:     Option<Frame>,
-	preview_layers:       SmallVec<StoredLayer, 4>,
-	preview_window:       Option<Window>,
-	preview_cursor:       Option<ScreenCursor>,
-	/// Reused ANSI cell-diff assembly buffer for steady-state paints.
-	paint_scratch:        String,
-	/// Reused terminal output assembly buffer for steady-state paints.
-	output_scratch:       String,
-	viewport_height:      u16,
-	window_top:           u16,
-	committed_rows:       u16,
-	stable_rows:          u16,
-	width_epoch:          Option<WidthEpoch>,
-	width_epoch_capture:  Option<WidthEpochCapture>,
-	epoch_commits:        SmallVec<EpochCommit, 8>,
-	next_epoch:           u32,
-	cursor:               Option<ScreenCursor>,
-	poisoned:             bool,
-	output_state:         OutputState,
-	backlog:              OutputBacklogGuard,
+	writer:            W,
+	previous:          Option<Frame>,
+	layers:            SmallVec<StoredLayer, 4>,
+	paint_scratch:     String,
+	output_scratch:    String,
+	viewport_height:   u16,
+	cursor:            Option<ScreenCursor>,
+	poisoned:          bool,
+	output_state:      OutputState,
+	backlog:           OutputBacklogGuard,
 	#[cfg(any(windows, target_os = "linux"))]
-	conpty_hosted:        bool,
-	images:               BTreeMap<u32, RegisteredImage>,
-	alt_screen:           bool,
-	graphics:             Graphics,
-	cell_pixel_width:     u16,
-	cell_pixel_height:    u16,
-	tmux_passthrough:     bool,
-	resize_in_place:      bool,
-	resize_scrollback:    ResizeScrollbackMode,
-	mux_pushed_rows:      u16,
-	mux_push_seam:        u16,
-	sync_output:          bool,
-	screen_to_scrollback: bool,
-	hyperlinks:           bool,
-	margin_scrollback:    bool,
+	conpty_hosted:     bool,
+	images:            BTreeMap<u32, RegisteredImage>,
+	alt_screen:        bool,
+	graphics:          Graphics,
+	cell_pixel_width:  u16,
+	cell_pixel_height: u16,
+	tmux_passthrough:  bool,
+	sync_output:       bool,
+	hyperlinks:        bool,
 }
 
 impl<W: Write> Renderer<W> {
-	/// Creates a renderer whose first document clears only the visible viewport.
+	/// Creates a renderer with an empty viewport cache.
 	pub fn new(writer: W) -> Self {
 		Self {
 			writer,
 			previous: None,
-			viewport_height: 0,
 			layers: SmallVec::new(),
-			layer_scratch: SmallVec::new(),
-			preview_previous: None,
-			preview_layers: SmallVec::new(),
-			preview_window: None,
-			preview_cursor: None,
 			paint_scratch: String::new(),
 			output_scratch: String::new(),
-			window_top: 0,
-			committed_rows: 0,
-			stable_rows: 0,
-			width_epoch: None,
-			width_epoch_capture: None,
-			epoch_commits: SmallVec::new(),
-			next_epoch: 1,
+			viewport_height: 0,
 			cursor: None,
 			poisoned: false,
 			output_state: OutputState::Connected,
@@ -406,18 +313,13 @@ impl<W: Write> Renderer<W> {
 			cell_pixel_width: DEFAULT_CELL_PIXEL_WIDTH,
 			cell_pixel_height: DEFAULT_CELL_PIXEL_HEIGHT,
 			tmux_passthrough: false,
-			resize_in_place: false,
-			resize_scrollback: ResizeScrollbackMode::Preserve,
-			mux_pushed_rows: 0,
-			mux_push_seam: 0,
 			sync_output: true,
-			screen_to_scrollback: false,
-			margin_scrollback: false,
 			hyperlinks: false,
 		}
 	}
 
-	/// Configures every capability-driven renderer option from resolved caps.
+	/// Configures renderer options represented by resolved terminal
+	/// capabilities.
 	///
 	/// # Errors
 	///
@@ -425,11 +327,8 @@ impl<W: Write> Renderer<W> {
 	pub fn apply_caps(&mut self, caps: &TerminalCaps) -> io::Result<()> {
 		self.set_graphics(caps.graphics);
 		self.set_sync_output(caps.sync_output);
-		self.set_screen_to_scrollback(caps.screen_to_scrollback);
-		self.set_margin_scrollback(caps.margin_scrollback);
 		self.set_hyperlinks(caps.hyperlinks);
 		self.set_tmux_passthrough(caps.inside_tmux);
-		self.set_resize_in_place(caps.inside_multiplexer);
 		if let Some((width, height)) = caps.cell_px {
 			self.set_cell_pixel_size(width, height)?;
 		}
@@ -437,9 +336,6 @@ impl<W: Write> Renderer<W> {
 	}
 
 	/// Registers PNG bytes for a typed terminal image ID.
-	///
-	/// Protocol encoding is deferred until a presented frame references the
-	/// ID. Re-registering an ID replaces its bytes and protocol cache.
 	///
 	/// # Errors
 	///
@@ -462,62 +358,21 @@ impl<W: Write> Renderer<W> {
 	}
 
 	/// Selects how typed image cells are materialized.
-	///
-	/// Set this before the first presentation. [`Graphics::Cells`],
-	/// [`Graphics::Sixel`], and [`Graphics::KittyDirect`] materialize typed
-	/// cells as ordinary blanks; [`Graphics::KittyPlaceholders`] uses Unicode
-	/// placeholders.
 	pub const fn set_graphics(&mut self, graphics: Graphics) {
 		self.graphics = graphics;
 	}
 
 	/// Enables or disables DEC synchronized-output wrapping.
-	///
-	/// Wrapping is enabled by default to preserve the renderer's historical
-	/// behavior. Capability detection should disable it for unsupported
-	/// terminals.
 	pub const fn set_sync_output(&mut self, enabled: bool) {
 		self.sync_output = enabled;
 	}
 
-	/// Enables or disables moving cleared viewport content to native scrollback.
-	///
-	/// When enabled, a full viewport clear first emits Kitty's `CSI 22 J`
-	/// extension. It is disabled by default.
-	pub const fn set_screen_to_scrollback(&mut self, enabled: bool) {
-		self.screen_to_scrollback = enabled;
-	}
-
-	/// Enables committing scrolled-out rows through a top-anchored DECSTBM
-	/// region instead of a whole-screen scroll.
-	///
-	/// Screen rows below the region never move during a commit, and native
-	/// scrollback receives exactly the same history as a whole-screen
-	/// scroll. Whether a terminal-native text selection over the pinned
-	/// rows survives is a separate, terminal-specific property: kitty and
-	/// Alacritty transform selections correctly on region scrolls; ghostty,
-	/// iTerm2, and xterm.js leave them anchored to pre-scroll storage rows,
-	/// so they drift upward — matching what a whole-screen scroll does to
-	/// selections over stationary live content repainted back into place;
-	/// `WezTerm` clears them. Enable this only for terminals that move rows
-	/// scrolled out of a top-anchored region into native scrollback (see
-	/// `TerminalCaps::margin_scrollback`); it is disabled by default.
-	pub const fn set_margin_scrollback(&mut self, enabled: bool) {
-		self.margin_scrollback = enabled;
-	}
-
 	/// Enables or disables OSC 8 hyperlink materialization.
-	///
-	/// Link identities remain attached to frame cells while disabled, but output
-	/// stays byte-for-byte identical to ordinary styled text.
 	pub const fn set_hyperlinks(&mut self, enabled: bool) {
 		self.hyperlinks = enabled;
 	}
 
 	/// Sets the terminal cell size used to scale sixel placements.
-	///
-	/// The default is 9 by 18 pixels per cell, matching pi's nominal terminal
-	/// metrics. Detection code may override it before presentation.
 	///
 	/// # Errors
 	///
@@ -535,580 +390,199 @@ impl<W: Write> Renderer<W> {
 	}
 
 	/// Enables tmux DCS passthrough for Kitty and sixel graphics sequences.
-	///
-	/// Cursor movement, synchronized output, and ordinary text styling remain
-	/// direct terminal output.
 	pub const fn set_tmux_passthrough(&mut self, enabled: bool) {
 		self.tmux_passthrough = enabled;
 	}
 
-	/// Selects the in-place geometry path used by multiplexer-owned panes.
+	/// History-neutral paint of one viewport frame with overlay layers.
 	///
-	/// A width change starts a new row-coordinate epoch. The configured
-	/// [`ResizeScrollbackMode`] then decides whether the settled frame replays
-	/// the current-width transcript or only repaints the viewport.
-	pub const fn set_resize_in_place(&mut self, enabled: bool) {
-		self.resize_in_place = enabled;
-	}
-
-	/// Selects how a settled in-place width resize refreshes native history.
-	pub const fn set_resize_scrollback(&mut self, mode: ResizeScrollbackMode) {
-		self.resize_scrollback = mode;
-	}
-
-	/// Returns the settled in-place width-resize history policy.
-	pub const fn resize_scrollback(&self) -> ResizeScrollbackMode {
-		self.resize_scrollback
-	}
-
-	/// Paints a logical document with an immutable leading-row boundary.
-	///
-	/// The caller must disable terminal autowrap and keep terminal geometry
-	/// fixed while the renderer is active; the renderer itself re-enables
-	/// DECAWM transiently to join flagged soft-wrap boundaries (see
-	/// [`Frame::set_soft_wrap`]) so native selection and scrollback copy
-	/// them as one unbroken line. Advancing `stable_rows` is permanent,
-	/// and committed history makes the document height a ratchet: between
-	/// rebuilds the document may only grow, so transient rows (pickers, extra
-	/// input lines) must be absorbed by the caller rather than shrinking the
-	/// frame.
+	/// A frame taller than `viewport_height` is bottom-clipped as a pure paint
+	/// offset. This operation never scrolls and never changes native history.
 	///
 	/// # Errors
 	///
-	/// Rejects zero or changed geometry, a retreating stable boundary, mutation
-	/// within the prior stable prefix, or a document whose tail shrank below
-	/// committed history. Writer failure poisons the renderer because its
-	/// physical state is unknown.
+	/// Rejects zero geometry. Writer failure poisons the renderer.
 	pub fn present(
 		&mut self,
 		next: Frame,
 		viewport_height: u16,
-		stable_rows: u16,
-	) -> io::Result<PaintStats> {
-		self.forget_preview();
-		self.validate_input(&next, viewport_height, stable_rows)?;
-		let stats = if self.previous.is_none() {
-			self.initial_paint(next, viewport_height, stable_rows)?
-		} else {
-			let stats = self.paint_next(&next, viewport_height, stable_rows)?;
-			self.previous = Some(next);
-			stats
-		};
-		self.publish_debug_screen();
-		Ok(stats)
-	}
-
-	/// [`Renderer::present`] without taking the frame: diffs against the
-	/// retained previous frame, then `clone_from`s the borrowed one into
-	/// it — reusing the existing cell allocation instead of copying a
-	/// whole frame per paint. Cost is still O(grid) cell clones per call;
-	/// retained callers that track their own damage should prefer
-	/// [`Renderer::present_damaged`].
-	///
-	/// # Errors
-	/// Same contract as [`Renderer::present`].
-	pub fn present_ref(
-		&mut self,
-		next: &Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-	) -> io::Result<PaintStats> {
-		self.forget_preview();
-		self.validate_input(next, viewport_height, stable_rows)?;
-		let stats = if self.previous.is_none() {
-			self.initial_paint(next.clone(), viewport_height, stable_rows)?
-		} else {
-			let stats = self.paint_next(next, viewport_height, stable_rows)?;
-			self
-				.previous
-				.as_mut()
-				.expect("initial-paint branch checked previous above")
-				.clone_from(next);
-			stats
-		};
-		self.publish_debug_screen();
-		Ok(stats)
-	}
-
-	/// Paints a damaged raw document with declarative viewport-anchored layers.
-	///
-	/// `damaged` follows [`Renderer::present_damaged`]. Layers composite only
-	/// into the live viewport while history commits keep flowing: a row
-	/// leaving the window is repainted from the raw document before it
-	/// scrolls into native scrollback, so layer cells never reach history.
-	/// Direct-drawn sixel, Kitty-direct, and iTerm2 images remain raw and are
-	/// not occluded; Kitty placeholder cells participate in composition.
-	///
-	/// # Errors
-	/// Same contract as [`Renderer::present`].
-	pub fn present_overlaid(
-		&mut self,
-		next: &Frame,
-		damaged: &[(u16, u16)],
-		viewport_height: u16,
-		stable_rows: u16,
 		layers: &[Layer<'_>],
 	) -> io::Result<PaintStats> {
 		let viewport = Size::new(next.size().width, viewport_height);
 		let resolved = resolve_layers(layers, viewport);
-		self.present_resolved(next, damaged, viewport_height, stable_rows, &resolved)
+		let (stats, stored, cursor) =
+			self.paint_borrowed("", &next, None, viewport_height, &resolved, false)?;
+		self.previous = Some(next);
+		self.layers = stored;
+		self.viewport_height = viewport_height;
+		self.cursor = cursor;
+		self.publish_debug_screen();
+		Ok(stats)
 	}
 
-	/// Paints layers whose viewport bands have already been resolved.
+	/// Damage-hinted history-neutral paint of one viewport frame with overlay
+	/// layers.
+	///
+	/// The caller guarantees that every changed base-frame row appears in
+	/// `damage`. A tall frame is bottom-clipped; this operation never scrolls
+	/// or changes native history.
+	///
+	/// # Errors
+	///
+	/// Rejects zero geometry. Writer failure poisons the renderer.
+	pub fn present_damaged(
+		&mut self,
+		next: &Frame,
+		damage: &[(u16, u16)],
+		viewport_height: u16,
+		layers: &[Layer<'_>],
+	) -> io::Result<PaintStats> {
+		let viewport = Size::new(next.size().width, viewport_height);
+		let resolved = resolve_layers(layers, viewport);
+		self.present_resolved(next, damage, viewport_height, &resolved)
+	}
+
+	/// Unconditionally repaints the complete viewport in one synchronized
+	/// update.
+	///
+	/// `prefix` is emitted verbatim before the paint for buffer-exit or
+	/// mode-restoration staging. The repaint is history-neutral and never
+	/// scrolls.
+	///
+	/// # Errors
+	///
+	/// Rejects zero geometry. Writer failure poisons the renderer.
+	pub fn repaint(
+		&mut self,
+		prefix: &str,
+		next: Frame,
+		viewport_height: u16,
+		layers: &[Layer<'_>],
+	) -> io::Result<PaintStats> {
+		let viewport = Size::new(next.size().width, viewport_height);
+		let resolved = resolve_layers(layers, viewport);
+		self.repaint_resolved(prefix, next, viewport_height, &resolved)
+	}
+
+	/// Damage-hinted paint with already-resolved viewport layers.
 	pub(crate) fn present_resolved(
 		&mut self,
 		next: &Frame,
-		damaged: &[(u16, u16)],
+		damage: &[(u16, u16)],
 		viewport_height: u16,
-		stable_rows: u16,
 		layers: &[ResolvedLayer<'_>],
 	) -> io::Result<PaintStats> {
-		self.forget_preview();
-		self.validate_input(next, viewport_height, stable_rows)?;
-		let stats = if self.previous.is_none() {
-			self.initial_paint_overlaid(next.clone(), viewport_height, stable_rows, layers)?
-		} else {
-			self.validate_damaged_stable_prefix(next, damaged)?;
-			let stats =
-				self.paint_validated_next(next, viewport_height, stable_rows, Some(damaged), layers)?;
+		let (stats, stored, cursor) =
+			self.paint_borrowed("", next, Some(damage), viewport_height, layers, false)?;
+		if self
+			.previous
+			.as_ref()
+			.is_some_and(|previous| previous.size() == next.size())
+		{
 			let previous = self
 				.previous
 				.as_mut()
-				.expect("initial-paint branch checked previous above");
-			previous.resize_height(next.size().height, Style::default());
-			for &(start, end) in damaged {
+				.expect("same-size check requires a prior frame");
+			for &(start, end) in damage {
 				for row in start..end.min(next.size().height) {
 					previous.copy_row_from(next, row);
 				}
 			}
 			previous.sync_soft_wraps(next);
-			stats
-		};
+		} else {
+			match &mut self.previous {
+				Some(previous) => previous.clone_from(next),
+				None => self.previous = Some(next.clone()),
+			}
+		}
+		self.layers = stored;
+		self.viewport_height = viewport_height;
+		self.cursor = cursor;
 		self.publish_debug_screen();
 		Ok(stats)
 	}
 
-	/// [`Renderer::present_ref`] with a caller-supplied damage list: only rows
-	/// inside `damaged` `(start, end)` ranges are validated and snapshotted.
-	/// The caller guarantees every changed row is covered; the full grid is
-	/// copied only on the initial paint.
-	///
-	/// # Errors
-	/// Same contract as [`Renderer::present`].
-	pub fn present_damaged(
+	/// Full paint with already-resolved viewport layers.
+	pub(crate) fn repaint_resolved(
 		&mut self,
-		next: &Frame,
-		damaged: &[(u16, u16)],
+		prefix: &str,
+		next: Frame,
 		viewport_height: u16,
-		stable_rows: u16,
-	) -> io::Result<PaintStats> {
-		self.present_resolved(next, damaged, viewport_height, stable_rows, &[])
-	}
-
-	/// Repaints every composited viewport-layer band from the raw document
-	/// and drops the stored layers.
-	///
-	/// The final inline screen persists into native scrollback once the
-	/// host exits and the shell resumes scrolling, so teardown must not
-	/// leave layer cells composited — [`crate::App`] does this
-	/// automatically, and manual hosts call it before dropping their
-	/// [`crate::Terminal`]. Call it on the main screen (release any
-	/// alternate-screen hold first); with no stored layers, or while the
-	/// alternate screen is active, nothing is written.
-	///
-	/// # Errors
-	/// Propagates writer failures, which poison the renderer.
-	pub fn clear_layers(&mut self) -> io::Result<()> {
-		if self.poisoned || self.layers.is_empty() || alt_screen_active() {
-			return Ok(());
-		}
-		if self.previous.is_none() {
-			self.layers.clear();
-			return Ok(());
-		}
-		self.sync_screen_buffer();
-		let layers = mem::take(&mut self.layers);
-		let window = Window { top: self.window_top, height: self.viewport_height };
-		let mut stats = PaintStats::default();
-		let (output, next_cursor) = {
-			let previous = self
-				.previous
-				.as_ref()
-				.expect("layer-clearing checked previous above");
-			let previous_view = ComposedFrame { base: previous, layers: &layers };
-			let next_view = ComposedFrame { base: previous, layers: &[] };
-			let mut paint = String::new();
-			emit_window_diff(
-				&mut paint,
-				&previous_view,
-				window,
-				&next_view,
-				window,
-				0,
-				self.viewport_height,
-				self.graphics,
-				self.hyperlinks,
-				&mut stats,
-			);
-			let next_cursor = frame_cursor(previous, window);
-			let mut output = String::with_capacity(paint.len().saturating_add(64));
-			if stats.runs > 0 || next_cursor != self.cursor {
-				if self.sync_output {
-					output.push_str(SYNC_OUTPUT_BEGIN);
-				}
-				output.push_str(HIDE_CURSOR);
-				output.push_str(VIEWPORT_BOTTOM);
-				output.push_str(&paint);
-				place_cursor(&mut output, next_cursor, self.viewport_height);
-				if self.sync_output {
-					output.push_str(SYNC_OUTPUT_END);
-				}
-			}
-			(output, next_cursor)
-		};
-		self.write(&output)?;
-		self.cursor = next_cursor;
-		Ok(())
-	}
-
-	fn paint_next(
-		&mut self,
-		next: &Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-	) -> io::Result<PaintStats> {
-		self.validate_stable_prefix(next)?;
-		self.paint_validated_next(next, viewport_height, stable_rows, None, &[])
-	}
-
-	fn validate_stable_prefix(&self, next: &Frame) -> io::Result<()> {
-		let previous = self
-			.previous
-			.as_ref()
-			.expect("callers checked previous before painting");
-		if (0..self.stable_rows).any(|row| !previous.row_equals(row, next, row)) {
-			return Err(Self::stable_mutation_error());
-		}
-		Ok(())
-	}
-
-	fn validate_damaged_stable_prefix(
-		&self,
-		next: &Frame,
-		damaged: &[(u16, u16)],
-	) -> io::Result<()> {
-		let previous = self
-			.previous
-			.as_ref()
-			.expect("callers checked previous before painting");
-		for &(start, end) in damaged {
-			let end = end.min(self.stable_rows);
-			if (start.min(end)..end).any(|row| !previous.row_equals(row, next, row)) {
-				return Err(Self::stable_mutation_error());
-			}
-		}
-		Ok(())
-	}
-
-	/// Returns whether an I/O error is the renderer's stable-prefix mutation
-	/// violation.
-	///
-	/// Hosts may use this to recover from a scene contract bug without mistaking
-	/// unrelated invalid input or writer failures for a repaintable error.
-	pub fn is_stable_mutation_error(error: &io::Error) -> bool {
-		error
-			.get_ref()
-			.is_some_and(|source| source.is::<StableRowMutation>())
-	}
-
-	fn stable_mutation_error() -> io::Error {
-		io::Error::new(io::ErrorKind::InvalidData, StableRowMutation)
-	}
-
-	fn paint_validated_next(
-		&mut self,
-		next: &Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-		damaged: Option<&[(u16, u16)]>,
 		layers: &[ResolvedLayer<'_>],
 	) -> io::Result<PaintStats> {
-		if self.width_epoch.is_some() {
-			return self.paint_width_epoch_next(next, viewport_height, stable_rows, damaged, layers);
-		}
-		self.sync_screen_buffer();
-		let image_prefix = self.image_prefix(next, layers);
-		let mut output = mem::take(&mut self.output_scratch);
-		output.clear();
-		output.push_str(&image_prefix);
-		self.prepare_sixels(next);
-		let previous = self
-			.previous
-			.as_ref()
-			.expect("callers checked previous before painting");
-		let layout = layout(next.size().height, viewport_height, stable_rows, self.committed_rows);
-		let previous_window = Window { top: self.window_top, height: viewport_height };
-		let next_window = Window { top: layout.window_top, height: viewport_height };
-		let mut incoming = mem::take(&mut self.layer_scratch);
-		store_layers_into(layers, next_window, next.size().width, &mut incoming);
-		let commit_to =
-			scroll_append_to(previous_window, next_window, self.committed_rows, layout.stable_limit);
-		let newly_committed = commit_to - self.committed_rows;
-		let margin_rows = if self.margin_scrollback {
-			stable_rows
-				.saturating_sub(layout.window_top)
-				.max(newly_committed)
-				.max(2)
-		} else {
-			viewport_height
-		};
-		let mut stats = PaintStats {
-			committed_rows: newly_committed,
-			clipped_rows: layout.window_top.saturating_sub(commit_to),
-			..PaintStats::default()
-		};
-		// Direct-drawn image protocols consume the raw document. Only Kitty
-		// placeholder cells are occluded by the composed cell view below.
-		let sixels = self.sixel_output(
-			next,
-			next_window,
-			Some((previous, previous_window)),
-			damaged,
-			previous_window.top != next_window.top,
-		);
-		let kitty_direct = kitty_direct_output(
-			self.graphics,
-			&mut self.images,
-			next,
-			next_window,
-			Some((previous, previous_window)),
-			damaged,
-			false,
-			self.cell_pixel_width,
-			self.cell_pixel_height,
-			self.tmux_passthrough,
-		);
-		let iterm2 = iterm2_output(
-			self.graphics,
-			self
-				.images
-				.iter()
-				.map(|(&id, image)| Iterm2Image { id, png: &image.png }),
-			next,
-			Iterm2Viewport { top: next_window.top, height: next_window.height },
-			Some((previous, Iterm2Viewport {
-				top:    previous_window.top,
-				height: previous_window.height,
-			})),
-			damaged,
-			false,
-			self.tmux_passthrough,
-		);
-
-		let dirty_rows = damaged.and_then(|damaged| {
-			(previous_window.top == next_window.top && previous_window.height == next_window.height)
-				.then(|| changed_screen_rows(damaged, &self.layers, &incoming, next_window))
-		});
-		let previous_view = ComposedFrame { base: previous, layers: &self.layers };
-		let next_view = ComposedFrame { base: next, layers: &incoming };
-		let capacity = usize::from(next.size().width).saturating_mul(usize::from(viewport_height));
-		let mut paint = mem::take(&mut self.paint_scratch);
-		paint.clear();
-		paint.reserve(capacity);
-		if newly_committed > 0 {
-			// Scroll only the visible stable rows through a DECSTBM region so
-			// the live window below stays physically pinned. The region must
-			// cover the scrolled rows and span the two rows DECSTBM requires;
-			// a seam at or below the screen bottom leaves nothing to pin and
-			// falls back to the whole-screen scroll.
-			if margin_rows < viewport_height {
-				emit_margin_scroll_append(
-					&mut paint,
-					&previous_view,
-					previous_window,
-					&next_view,
-					next_window,
-					margin_rows,
-					self.graphics,
-					self.hyperlinks,
-					&mut stats,
-				);
-			} else {
-				emit_scroll_append(
-					&mut paint,
-					&previous_view,
-					previous_window,
-					&next_view,
-					next_window,
-					self.graphics,
-					self.hyperlinks,
-					&mut stats,
-				);
-			}
-		} else {
-			emit_window_diff_rows(
-				&mut paint,
-				&previous_view,
-				previous_window,
-				&next_view,
-				next_window,
-				0,
-				viewport_height,
-				dirty_rows.as_deref(),
-				self.graphics,
-				self.hyperlinks,
-				&mut stats,
-			);
-		}
-		// Wrap-boundary metadata has no in-place VT rewrite: boundaries
-		// whose hard/soft state changed are re-emitted surgically — never
-		// via a viewport clear, which scrollback-pushing terminals would
-		// turn into duplicated history.
-		reconcile_wrap_boundaries(
-			&mut paint,
-			&previous_view,
-			previous_window,
-			&next_view,
-			next_window,
-			newly_committed,
-			margin_rows.min(viewport_height),
-			self.graphics,
-			self.hyperlinks,
-			&mut stats,
-		);
-
-		let next_cursor = compose_cursor(next, &incoming, next_window, next.size().width);
-		output.reserve(
-			paint
-				.len()
-				.saturating_add(sixels.len())
-				.saturating_add(kitty_direct.len())
-				.saturating_add(iterm2.len())
-				.saturating_add(64),
-		);
-		if stats.runs > 0
-			|| !sixels.is_empty()
-			|| !kitty_direct.is_empty()
-			|| !iterm2.is_empty()
-			|| next_cursor != self.cursor
-		{
-			if self.sync_output {
-				output.push_str(SYNC_OUTPUT_BEGIN);
-			}
-			output.push_str(HIDE_CURSOR);
-			output.push_str(VIEWPORT_BOTTOM);
-			output.push_str(&paint);
-			output.push_str(&sixels);
-			output.push_str(&kitty_direct);
-			output.push_str(&iterm2);
-			place_cursor(&mut output, next_cursor, viewport_height);
-			if self.sync_output {
-				output.push_str(SYNC_OUTPUT_END);
-			}
-		}
-		let bytes = output.len();
-		let write_result = self.write(&output);
-		self.paint_scratch = paint;
-		self.output_scratch = output;
-		write_result?;
-
-		self.window_top = layout.window_top;
-		self.committed_rows = commit_to;
-		self.stable_rows = stable_rows;
-		self.cursor = next_cursor;
-		stats.bytes = bytes;
-		let previous_layers = mem::replace(&mut self.layers, incoming);
-		self.layer_scratch = previous_layers;
+		let (stats, stored, cursor) =
+			self.paint_borrowed(prefix, &next, None, viewport_height, layers, true)?;
+		self.previous = Some(next);
+		self.layers = stored;
+		self.viewport_height = viewport_height;
+		self.cursor = cursor;
+		self.publish_debug_screen();
 		Ok(stats)
 	}
 
-	/// Paints only the current raw document tail without changing committed
-	/// state.
+	/// Explicitly appends finalized rows to native history and leaves `viewport`
+	/// visible.
 	///
-	/// Resize handlers use this on an alternate buffer while normal-buffer
-	/// history remains untouched. Stored overlay layers are deliberately
-	/// ignored; `leading_sequence` is emitted inside the synchronized update,
-	/// before the viewport paint. Overlays go through
-	/// [`Renderer::preview_overlaid`].
+	/// This is the renderer's only scrolling operation. It streams `finalized ||
+	/// viewport` in one synchronized transaction, scrolls exactly
+	/// `finalized.size().height` times, and emits no trailing line feed.
 	///
 	/// # Errors
 	///
-	/// Rejects zero geometry. Writer failure poisons the renderer because its
-	/// physical state is unknown.
-	pub fn preview(
+	/// Rejects alternate-screen retirement, zero or mismatched geometry, or a
+	/// viewport whose height differs from `viewport_height`. Writer failure
+	/// poisons the renderer.
+	pub fn retire(
 		&mut self,
-		next: &Frame,
+		finalized: &Frame,
+		viewport: &Frame,
 		viewport_height: u16,
-		leading_sequence: &str,
-	) -> io::Result<PaintStats> {
-		self.preview_resolved(next, &[], viewport_height, leading_sequence)
-	}
-
-	/// [`Renderer::preview`] with declarative viewport-anchored layers.
-	///
-	/// The document tail and every visible layer composite into one throwaway
-	/// synchronized paint while committed history and stored layers stay
-	/// untouched. Alternate-screen holders — fullscreen scenes and modal
-	/// overlays — repaint with this on damage or geometry change;
-	/// [`Renderer::present_overlaid`] is the normal-buffer counterpart.
-	///
-	/// # Errors
-	///
-	/// Same contract as [`Renderer::preview`].
-	pub fn preview_overlaid(
-		&mut self,
-		next: &Frame,
 		layers: &[Layer<'_>],
-		viewport_height: u16,
-		leading_sequence: &str,
-	) -> io::Result<PaintStats> {
-		let viewport = Size::new(next.size().width, viewport_height);
-		let resolved = resolve_layers(layers, viewport);
-		self.preview_resolved(next, &resolved, viewport_height, leading_sequence)
-	}
-
-	/// Paints the viewport with pre-resolved layer bands, state-isolated.
-	pub(crate) fn preview_resolved(
-		&mut self,
-		next: &Frame,
-		layers: &[ResolvedLayer<'_>],
-		viewport_height: u16,
-		leading_sequence: &str,
-	) -> io::Result<PaintStats> {
-		self.validate_frame(next, viewport_height)?;
-		if !leading_sequence.is_empty() {
-			self.forget_preview();
+	) -> io::Result<RetireStats> {
+		self.validate_frame(viewport, viewport_height)?;
+		if alt_screen_active() {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"cannot retire rows while the alternate screen owns the terminal",
+			));
 		}
+		if viewport.size().height != viewport_height {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"retirement viewport height does not match viewport_height",
+			));
+		}
+		if finalized.size().width != viewport.size().width {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"finalized and viewport frames must have equal widths",
+			));
+		}
+		if !self.alt_screen
+			&& self.previous.as_ref().is_some_and(|previous| {
+				previous.size().width != viewport.size().width
+					|| self.viewport_height != viewport_height
+			}) {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"retirement geometry differs from the painted viewport",
+			));
+		}
+
 		self.sync_screen_buffer();
-
-		let paint_cells = usize::from(next.size().width).saturating_mul(usize::from(viewport_height));
-		let window = Window {
-			top:    next.size().height.saturating_sub(viewport_height),
-			height: viewport_height,
-		};
-		if self.resize_in_place
-			&& self.width_epoch_capture.is_none()
-			&& self
-				.previous
-				.as_ref()
-				.is_some_and(|previous| previous.size().width != next.size().width)
-		{
-			self.width_epoch_capture = Some(WidthEpochCapture { frame: next.clone(), window });
-		}
-		let can_diff = leading_sequence.is_empty()
-			&& self.preview_window == Some(window)
-			&& self
-				.preview_previous
-				.as_ref()
-				.is_some_and(|previous| previous.size() == next.size());
-		let composited = store_layers(layers, window, next.size().width);
-		let images = self.image_prefix(next, layers);
-		self.prepare_sixels(next);
-		let sixels = self.sixel_output(next, window, None, None, true);
+		let window = Window { top: 0, height: viewport_height };
+		let resolved = resolve_layers(layers, viewport.size());
+		let stored = store_layers(&resolved, window, viewport.size().width);
+		let finalized_view = ComposedFrame { base: finalized, layers: &[] };
+		let viewport_view = ComposedFrame { base: viewport, layers: &stored };
+		let cursor = compose_cursor(viewport, &stored, window, viewport.size().width);
+		let images = self.image_prefix(viewport, &resolved, window);
+		self.prepare_sixels(viewport, window);
+		let sixels = self.sixel_output(viewport, window, None, None, true);
 		let kitty_direct = kitty_direct_output(
 			self.graphics,
 			&mut self.images,
-			next,
+			viewport,
 			window,
 			None,
 			None,
@@ -1123,260 +597,162 @@ impl<W: Write> Renderer<W> {
 				.images
 				.iter()
 				.map(|(&id, image)| Iterm2Image { id, png: &image.png }),
-			next,
-			Iterm2Viewport { top: window.top, height: window.height },
+			viewport,
+			Iterm2Viewport { top: 0, height: viewport_height },
 			None,
 			None,
 			true,
 			self.tmux_passthrough,
 		);
-		let raw = ComposedFrame { base: next, layers: &composited };
-		let cursor = compose_cursor(next, &composited, window, next.size().width);
-		let mut stats = PaintStats::default();
-		let mut paint = String::new();
-		if can_diff {
-			let previous = ComposedFrame {
-				base:   self
-					.preview_previous
-					.as_ref()
-					.expect("preview geometry checked above"),
-				layers: &self.preview_layers,
-			};
-			emit_window_diff(
-				&mut paint,
-				&previous,
-				window,
-				&raw,
-				window,
-				0,
-				viewport_height,
-				self.graphics,
-				self.hyperlinks,
-				&mut stats,
-			);
-		}
 
-		let auxiliary =
-			!images.is_empty() || !sixels.is_empty() || !kitty_direct.is_empty() || !iterm2.is_empty();
-		let full_repaint = !can_diff;
-		let mut output = String::with_capacity(
-			if full_repaint {
-				paint_cells.saturating_mul(2)
+		let finalized_rows = finalized.size().height;
+		let mut output = mem::take(&mut self.output_scratch);
+		output.clear();
+		if self.sync_output {
+			output.push_str(SYNC_OUTPUT_BEGIN);
+		}
+		output.push_str(HIDE_CURSOR);
+		append_fixed_screen_modes(&mut output, viewport_height);
+		output.push_str(&images);
+
+		// Overwrite the first H rows of T without scrolling. Internal soft-wrap
+		// boundaries use armed autowrap only above the bottom row, where wrapping
+		// cannot scroll.
+		for screen_row in 0..viewport_height {
+			let index = screen_row;
+			let _ = write!(output, "\x1b[{};1H", screen_row + 1);
+			output.push_str(esc!(erase_line));
+			let joined = index > 0 && retirement_joinable(finalized, viewport, index - 1, index);
+			if joined {
+				let _ = write!(output, "\x1b[{};1H", screen_row);
+				output.push_str(esc!(autowrap));
+				arm_retirement_boundary(
+					&mut output,
+					&finalized_view,
+					&viewport_view,
+					finalized_rows,
+					index - 1,
+					self.graphics,
+					self.hyperlinks,
+				);
+				emit_retirement_row(
+					&mut output,
+					&finalized_view,
+					&viewport_view,
+					finalized_rows,
+					index,
+					self.graphics,
+					self.hyperlinks,
+				);
+				output.push_str(esc!(!autowrap));
 			} else {
-				paint.len()
-			}
-			.saturating_add(images.len())
-			.saturating_add(sixels.len())
-			.saturating_add(kitty_direct.len())
-			.saturating_add(iterm2.len())
-			.saturating_add(64),
-		);
-		if full_repaint {
-			if self.sync_output {
-				output.push_str(SYNC_OUTPUT_BEGIN);
-			}
-			output.push_str(HIDE_CURSOR);
-			output.push_str(leading_sequence);
-			// Kitty traffic must follow the staged buffer switch: per-screen
-			// image stores only keep bytes transmitted on the active screen.
-			output.push_str(&images);
-			output.push_str(RESET_STYLE);
-			output.push_str(esc!(cursor_home));
-			emit_rows(&mut output, &raw, 0..0, window, self.graphics, self.hyperlinks);
-			output.push_str(RESET_STYLE);
-			output.push('\r');
-			output.push_str(&sixels);
-			output.push_str(&kitty_direct);
-			output.push_str(&iterm2);
-			place_cursor(&mut output, cursor, viewport_height);
-			if self.sync_output {
-				output.push_str(SYNC_OUTPUT_END);
-			}
-			stats.full_repaint = true;
-			stats.changed_cells = paint_cells;
-			stats.runs = usize::from(viewport_height);
-		} else if stats.runs > 0 || cursor != self.preview_cursor || auxiliary {
-			if self.sync_output {
-				output.push_str(SYNC_OUTPUT_BEGIN);
-			}
-			output.push_str(HIDE_CURSOR);
-			output.push_str(&images);
-			output.push_str(VIEWPORT_BOTTOM);
-			output.push_str(&paint);
-			output.push_str(&sixels);
-			output.push_str(&kitty_direct);
-			output.push_str(&iterm2);
-			place_cursor(&mut output, cursor, viewport_height);
-			if self.sync_output {
-				output.push_str(SYNC_OUTPUT_END);
+				emit_retirement_row(
+					&mut output,
+					&finalized_view,
+					&viewport_view,
+					finalized_rows,
+					index,
+					self.graphics,
+					self.hyperlinks,
+				);
 			}
 		}
 
-		stats.bytes = output.len();
-		self.write(&output)?;
-		if debug::publishing() {
-			// A preview is what the terminal shows right now (alternate
-			// screen or drag frame); publish its composition, not the
-			// committed main-screen model.
-			debug::publish_screen(ScreenSnapshot {
-				lines:      stored_text(next, &composited, window.top, viewport_height),
-				cursor:     cursor.map(|cursor| (cursor.row, cursor.col)),
-				window_top: window.top,
-				cols:       next.size().width,
-				rows:       viewport_height,
-				doc_height: next.size().height,
-				overlay:    !composited.is_empty(),
-			});
-		}
-		match &mut self.preview_previous {
-			Some(previous) => previous.clone_from(next),
-			None => self.preview_previous = Some(next.clone()),
-		}
-		self.preview_layers = composited;
-		self.preview_window = Some(window);
-		self.preview_cursor = cursor;
-		Ok(stats)
-	}
-
-	/// Reconciles the document after terminal geometry changes.
-	///
-	/// Direct terminals clear and reconstruct native history. Multiplexer
-	/// sessions retain immutable pane history: a width change starts a new
-	/// coordinate epoch, and the synchronized update repaints only the bounded
-	/// viewport plus any finalized rows that genuinely crossed its seam.
-	///
-	/// # Errors
-	///
-	/// Rejects zero geometry or a stable boundary beyond the document. Writer
-	/// failure poisons the renderer because physical state may be partially
-	/// updated.
-	pub fn rebuild(
-		&mut self,
-		next: Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-		leading_sequence: &str,
-	) -> io::Result<PaintStats> {
-		self.forget_preview();
-		self.validate_frame(&next, viewport_height)?;
-		if stable_rows > next.size().height {
-			return Err(contract_error("stable_rows exceeds the document height"));
-		}
-		let width_resize = self.resize_in_place
-			&& self.previous.as_ref().is_some_and(|previous| {
-				previous.size().width != next.size().width || self.width_epoch_capture.is_some()
-			});
-		let preserve_geometry = self.resize_in_place
-			&& self.previous.as_ref().is_some_and(|previous| {
-				previous.size().width != next.size().width
-					|| self.viewport_height != viewport_height
-					|| self.width_epoch_capture.is_some()
-			});
-		let preserving_first_paint = self.resize_in_place && self.previous.is_none();
-		let resize_replay = width_resize && self.resize_scrollback != ResizeScrollbackMode::Preserve;
-		let stats = if preserve_geometry && !resize_replay {
-			self.repaint_preserving_history(next, viewport_height, stable_rows, leading_sequence)?
-		} else {
-			self.width_epoch = None;
-			self.width_epoch_capture = None;
-			self.epoch_commits.clear();
-			self.mux_pushed_rows = 0;
-			let clear = if preserving_first_paint
-				|| (resize_replay && self.resize_scrollback == ResizeScrollbackMode::Append)
-			{
-				CLEAR_VIEWPORT
+		// T has F + H rows, so exactly F rows remain and each iteration scrolls once.
+		for index in viewport_height..finalized_rows.saturating_add(viewport_height) {
+			let _ = write!(output, "\x1b[{};1H", viewport_height);
+			if retirement_joinable(finalized, viewport, index - 1, index) {
+				output.push_str(esc!(autowrap));
+				arm_retirement_boundary(
+					&mut output,
+					&finalized_view,
+					&viewport_view,
+					finalized_rows,
+					index - 1,
+					self.graphics,
+					self.hyperlinks,
+				);
+				emit_retirement_row(
+					&mut output,
+					&finalized_view,
+					&viewport_view,
+					finalized_rows,
+					index,
+					self.graphics,
+					self.hyperlinks,
+				);
+				output.push_str(esc!(!autowrap));
 			} else {
-				REBUILD_HISTORY
-			};
-			self.full_paint(
-				next,
-				viewport_height,
-				stable_rows,
-				leading_sequence,
-				clear,
-				!resize_replay,
-			)?
-		};
+				output.push_str("\r\n");
+				output.push('\r');
+				output.push_str(esc!(erase_line));
+				emit_retirement_row(
+					&mut output,
+					&finalized_view,
+					&viewport_view,
+					finalized_rows,
+					index,
+					self.graphics,
+					self.hyperlinks,
+				);
+			}
+		}
+		output.push_str(RESET_STYLE);
+		append_fixed_screen_modes(&mut output, viewport_height);
+		output.push_str(VIEWPORT_BOTTOM);
+		output.push_str(&sixels);
+		output.push_str(&kitty_direct);
+		output.push_str(&iterm2);
+		place_cursor_screen(&mut output, cursor);
+		if self.sync_output {
+			output.push_str(SYNC_OUTPUT_END);
+		}
+
+		let bytes = output.len();
+		let result = self.write(&output);
+		self.output_scratch = output;
+		result?;
+		match &mut self.previous {
+			Some(previous) => previous.clone_from(viewport),
+			None => self.previous = Some(viewport.clone()),
+		}
+		self.layers = stored;
+		self.viewport_height = viewport_height;
+		self.cursor = cursor;
 		self.publish_debug_screen();
-		Ok(stats)
+		Ok(RetireStats { rows: finalized_rows, bytes })
 	}
 
-	/// Publishes the committed screen to the shared debug snapshot when a
-	/// stream-served `OMP_TUI_DEBUG` host is listening; no-op otherwise.
-	fn publish_debug_screen(&self) {
-		if !debug::publishing() {
-			return;
-		}
-		let Some(previous) = &self.previous else {
-			return;
-		};
-		debug::publish_screen(ScreenSnapshot {
-			lines:      self.screen_text(),
-			cursor:     self.screen_cursor(),
-			window_top: self.window_top,
-			cols:       previous.size().width,
-			rows:       self.viewport_height,
-			doc_height: previous.size().height,
-			overlay:    !self.layers.is_empty(),
-		});
-	}
-
-	/// Returns the number of finalized rows physically stored above the
-	/// viewport.
-	pub const fn committed_rows(&self) -> u16 {
-		self.committed_rows
-	}
-
-	/// Lowest document row at which a transcript tail may be removed in place.
-	///
-	/// During a width epoch the frame-coordinate seam, rather than the native
-	/// history count accumulated across widths, is the immutable boundary.
-	pub const fn rewind_floor(&self) -> u16 {
-		match self.width_epoch {
-			Some(epoch) => epoch.seam,
-			None => self.committed_rows,
-		}
-	}
-
-	/// Retracts the declared-stable tail without clearing native history.
+	/// Repaints the raw viewport under stored layers and drops those layers.
 	///
 	/// # Errors
 	///
-	/// Rejects a boundary below rows already present in native history or
-	/// beyond the currently declared stable prefix.
-	pub fn truncate_uncommitted_tail(&mut self, stable_rows: u16) -> io::Result<()> {
-		if stable_rows < self.rewind_floor() {
-			return Err(contract_error("cannot truncate rows already present in native history"));
+	/// Writer failure poisons the renderer.
+	pub fn clear_layers(&mut self) -> io::Result<()> {
+		if self.poisoned || self.layers.is_empty() || alt_screen_active() {
+			return Ok(());
 		}
-		if stable_rows > self.stable_rows {
-			return Err(contract_error("truncate boundary exceeds the stable transcript"));
-		}
-		self.stable_rows = stable_rows;
+		let Some(previous) = self.previous.as_ref() else {
+			self.layers.clear();
+			return Ok(());
+		};
+		let frame = previous.clone();
+		self.repaint_resolved("", frame, self.viewport_height, &[])?;
 		Ok(())
 	}
 
-	/// Returns the document row currently shown at the viewport top.
-	pub const fn window_top(&self) -> u16 {
-		self.window_top
-	}
-
-	/// Renders the retained physical screen model — the committed frame
-	/// composed with its stored viewport layers — as visible text, one
-	/// right-trimmed string per viewport row.
-	///
-	/// This is what the terminal currently shows, driving the `OMP_TUI_DEBUG`
-	/// `text` op. Empty before the first present or rebuild.
+	/// Renders the retained viewport composition as right-trimmed text rows.
 	pub fn screen_text(&self) -> Vec<String> {
 		match &self.previous {
 			Some(previous) => {
-				stored_text(previous, &self.layers, self.window_top, self.viewport_height)
+				let top = previous.size().height.saturating_sub(self.viewport_height);
+				stored_text(previous, &self.layers, top, self.viewport_height)
 			},
 			None => Vec::new(),
 		}
 	}
 
-	/// Screen coordinates (row, column) of the visible hardware cursor, when
-	/// one was placed by the last present.
+	/// Screen coordinates of the hardware cursor placed by the last operation.
 	pub const fn screen_cursor(&self) -> Option<(u16, u16)> {
 		match self.cursor {
 			Some(cursor) => Some((cursor.row, cursor.col)),
@@ -1384,8 +760,7 @@ impl<W: Write> Renderer<W> {
 		}
 	}
 
-	/// Returns whether terminal output is connected or was abandoned after its
-	/// unflushed backlog crossed the safety limit.
+	/// Returns whether terminal output is connected.
 	pub const fn output_state(&self) -> OutputState {
 		self.output_state
 	}
@@ -1409,226 +784,57 @@ impl<W: Write> Renderer<W> {
 		if next.size().width == 0 || viewport_height == 0 {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
-				"document width and viewport height must be non-zero",
+				"frame width and viewport height must be non-zero",
 			));
 		}
 		Ok(())
 	}
 
-	fn validate_input(
-		&self,
+	#[allow(clippy::too_many_arguments, reason = "paint inputs are independent viewport state")]
+	fn paint_borrowed(
+		&mut self,
+		prefix: &str,
 		next: &Frame,
+		damage: Option<&[(u16, u16)]>,
 		viewport_height: u16,
-		stable_rows: u16,
-	) -> io::Result<()> {
+		layers: &[ResolvedLayer<'_>],
+		force: bool,
+	) -> io::Result<(PaintStats, SmallVec<StoredLayer, 4>, Option<ScreenCursor>)> {
 		self.validate_frame(next, viewport_height)?;
-		if stable_rows > next.size().height {
-			return Err(contract_error("stable_rows exceeds the document height"));
-		}
-		if stable_rows < self.stable_rows {
-			return Err(contract_error("stable_rows cannot retreat"));
-		}
-		if self.width_epoch.is_none() {
-			if next.size().height < self.committed_rows {
-				return Err(contract_error(
-					"document is shorter than rows already committed to native history",
-				));
-			}
-			if next.size().height.saturating_sub(viewport_height) < self.committed_rows {
-				return Err(contract_error(
-					"document tail shrank below committed history; document height must stay monotonic \
-					 between rebuilds",
-				));
-			}
-		}
-		if let Some(previous) = &self.previous
-			&& (previous.size().width != next.size().width || self.viewport_height != viewport_height)
-		{
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"terminal geometry changed; preserving native history requires a new renderer session",
-			));
-		}
-		Ok(())
-	}
-
-	fn repaint_preserving_history(
-		&mut self,
-		next: Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-		leading_sequence: &str,
-	) -> io::Result<PaintStats> {
-		let previous_size = self
-			.previous
-			.as_ref()
-			.expect("preserving rebuild requires an established normal screen")
-			.size();
-		let width_changed = previous_size.width != next.size().width;
-		if !width_changed {
-			self.validate_stable_prefix(&next)?;
-		}
-		let previous_height = self.viewport_height;
-		let height_changed = previous_height != viewport_height;
-		let previous_grid_full = previous_height > 0
-			&& previous_size.height.saturating_sub(self.window_top) >= previous_height;
-		if width_changed {
-			self.mux_pushed_rows = 0;
-		} else if height_changed && previous_grid_full {
-			if self.committed_rows != self.mux_push_seam {
-				self.mux_pushed_rows = 0;
-			}
-			if viewport_height < previous_height {
-				self.mux_pushed_rows = self
-					.mux_pushed_rows
-					.saturating_add(previous_height - viewport_height);
-				self.mux_push_seam = self.committed_rows;
-			} else if viewport_height > previous_height {
-				let pull = viewport_height - previous_height;
-				let from_pushed = pull.min(self.mux_pushed_rows);
-				self.mux_pushed_rows -= from_pushed;
-				let from_committed = (pull - from_pushed).min(self.committed_rows);
-				self.uncommit_native_rows(from_committed);
-				self.mux_push_seam = self.committed_rows;
-			}
-		}
-		let captured = self.width_epoch_capture.take();
-		let epoch_reset = width_changed || captured.is_some();
-		let natural_top = next.size().height.saturating_sub(viewport_height);
-		let previous_natural_top = previous_size.height.saturating_sub(previous_height);
-		let previous = self
-			.previous
-			.as_ref()
-			.expect("preserving rebuild requires an established normal screen");
-		let unresolved_tail = self.width_epoch.is_some_and(|epoch| {
-			epoch.width == previous.size().width
-				&& epoch.seam < previous_natural_top.min(epoch.baseline_rows)
-		});
-		let mut seam = if epoch_reset {
-			match captured {
-				Some(capture) if !unresolved_tail => {
-					resolve_width_epoch_capture(&capture, &next).unwrap_or(0)
-				},
-				Some(_) => 0,
-				None => natural_top,
-			}
-		} else if let Some(epoch) = self.width_epoch {
-			map_epoch_boundary(previous, &next, epoch.seam)
-		} else {
-			natural_top
-		};
-
-		if !epoch_reset && viewport_height < previous_height {
-			let previous_viewport_rows =
-				previous_height.min(previous.size().height.saturating_sub(self.window_top));
-			let host_rows = natural_top
-				.saturating_sub(seam)
-				.min(previous_viewport_rows.saturating_sub(viewport_height));
-			seam = seam.saturating_add(host_rows);
-		}
-		seam = seam.min(natural_top);
-
-		let epoch_id = if let (false, Some(epoch)) = (epoch_reset, self.width_epoch) {
-			epoch.id
-		} else {
-			let id = self.next_epoch;
-			self.next_epoch = self.next_epoch.wrapping_add(1).max(1);
-			id
-		};
-		self.width_epoch = Some(WidthEpoch {
-			id: epoch_id,
-			width: next.size().width,
-			seam,
-			baseline_rows: next.size().height,
-		});
-		let commit_to = stable_rows.min(natural_top).max(seam);
-		let stats = self.emit_width_epoch_paint(
-			&next,
-			viewport_height,
-			stable_rows,
-			None,
-			&[],
-			seam,
-			commit_to,
-			leading_sequence,
-			true,
-		)?;
-		self.previous = Some(next);
-		Ok(stats)
-	}
-
-	fn paint_width_epoch_next(
-		&mut self,
-		next: &Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-		damaged: Option<&[(u16, u16)]>,
-		layers: &[ResolvedLayer<'_>],
-	) -> io::Result<PaintStats> {
-		let epoch = self.width_epoch.expect("caller checked width epoch");
-		let previous = self
-			.previous
-			.as_ref()
-			.expect("width epoch requires an established normal screen");
-		debug_assert_eq!(epoch.width, next.size().width);
-		let natural_top = next.size().height.saturating_sub(viewport_height);
-		let mut seam = map_epoch_boundary(previous, next, epoch.seam).min(natural_top);
-		let commit_to = stable_rows.min(natural_top).max(seam);
-		let stats = self.emit_width_epoch_paint(
-			next,
-			viewport_height,
-			stable_rows,
-			damaged,
-			layers,
-			seam,
-			commit_to,
-			"",
-			false,
-		)?;
-		seam = commit_to;
-		self.width_epoch = Some(WidthEpoch { seam, baseline_rows: next.size().height, ..epoch });
-		Ok(stats)
-	}
-
-	#[allow(clippy::too_many_arguments, reason = "epoch paint inputs are independent frame state")]
-	fn emit_width_epoch_paint(
-		&mut self,
-		next: &Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-		damaged: Option<&[(u16, u16)]>,
-		layers: &[ResolvedLayer<'_>],
-		commit_from: u16,
-		commit_to: u16,
-		leading_sequence: &str,
-		force_viewport: bool,
-	) -> io::Result<PaintStats> {
 		self.sync_screen_buffer();
-		let image_prefix = self.image_prefix(next, layers);
-		self.prepare_sixels(next);
-		let previous_window = Window { top: self.window_top, height: self.viewport_height };
-		let next_window = Window {
+		let window = Window {
 			top:    next.size().height.saturating_sub(viewport_height),
 			height: viewport_height,
 		};
-		let mut incoming = mem::take(&mut self.layer_scratch);
-		store_layers_into(layers, next_window, next.size().width, &mut incoming);
-		let previous = self
-			.previous
-			.as_ref()
-			.expect("width epoch requires an established normal screen");
-		let comparable =
-			previous.size().width == next.size().width && self.viewport_height == viewport_height;
-		let previous_image = comparable.then_some((previous, previous_window));
-		let sixels = self.sixel_output(next, next_window, previous_image, damaged, !comparable);
+		let stored = store_layers(layers, window, next.size().width);
+		let cursor = compose_cursor(next, &stored, window, next.size().width);
+		let can_diff = !force
+			&& prefix.is_empty()
+			&& self.viewport_height == viewport_height
+			&& self
+				.previous
+				.as_ref()
+				.is_some_and(|previous| previous.size().width == next.size().width);
+		let images = self.image_prefix(next, layers, window);
+		self.prepare_sixels(next, window);
+		let previous_window = self.previous.as_ref().map(|previous| Window {
+			top:    previous.size().height.saturating_sub(viewport_height),
+			height: viewport_height,
+		});
+		let previous_image = if can_diff {
+			self.previous.as_ref().zip(previous_window)
+		} else {
+			None
+		};
+		let sixels = self.sixel_output(next, window, previous_image, damage, !can_diff);
 		let kitty_direct = kitty_direct_output(
 			self.graphics,
 			&mut self.images,
 			next,
-			next_window,
+			window,
 			previous_image,
-			damaged,
-			!comparable || force_viewport,
+			damage,
+			!can_diff,
 			self.cell_pixel_width,
 			self.cell_pixel_height,
 			self.tmux_passthrough,
@@ -1640,314 +846,109 @@ impl<W: Write> Renderer<W> {
 				.iter()
 				.map(|(&id, image)| Iterm2Image { id, png: &image.png }),
 			next,
-			Iterm2Viewport { top: next_window.top, height: next_window.height },
-			previous_image.map(|(frame, window)| {
-				(frame, Iterm2Viewport { top: window.top, height: window.height })
+			Iterm2Viewport { top: window.top, height: window.height },
+			previous_image.map(|(previous, previous_window)| {
+				(previous, Iterm2Viewport {
+					top:    previous_window.top,
+					height: previous_window.height,
+				})
 			}),
-			damaged,
-			!comparable || force_viewport,
+			damage,
+			!can_diff,
 			self.tmux_passthrough,
 		);
 
-		let mut stats = PaintStats {
-			committed_rows: commit_to.saturating_sub(commit_from),
-			clipped_rows: next_window.top.saturating_sub(commit_to),
-			..PaintStats::default()
-		};
-		let next_view = ComposedFrame { base: next, layers: &incoming };
+		let mut stats = PaintStats::default();
 		let mut paint = mem::take(&mut self.paint_scratch);
 		paint.clear();
-		if commit_to > commit_from {
-			let raw = ComposedFrame { base: next, layers: &[] };
-			emit_epoch_scroll(
-				&mut paint,
-				&raw,
-				&next_view,
-				commit_from,
-				commit_to,
-				next_window,
-				self.graphics,
-				self.hyperlinks,
-			);
-			stats.full_repaint = true;
-			stats.runs = usize::from(viewport_height.saturating_add(commit_to - commit_from));
-			stats.changed_cells = usize::from(next.size().width).saturating_mul(stats.runs);
-		} else if force_viewport || !comparable {
-			emit_bounded_window(&mut paint, &next_view, next_window, self.graphics, self.hyperlinks);
-			stats.full_repaint = true;
-			stats.runs = usize::from(viewport_height);
-			stats.changed_cells =
-				usize::from(next.size().width).saturating_mul(usize::from(viewport_height));
-		} else {
-			let dirty_rows = damaged.and_then(|damaged| {
-				(previous_window.top == next_window.top && previous_window.height == next_window.height)
-					.then(|| changed_screen_rows(damaged, &self.layers, &incoming, next_window))
+		if can_diff {
+			let previous = self
+				.previous
+				.as_ref()
+				.expect("diff geometry requires a previous frame");
+			let previous_window = previous_window.expect("diff geometry computed a previous window");
+			let dirty = damage.and_then(|damage| {
+				(previous_window == window)
+					.then(|| changed_screen_rows(damage, &self.layers, &stored, window))
 			});
-			let previous_view = ComposedFrame { base: previous, layers: &self.layers };
 			emit_window_diff_rows(
 				&mut paint,
-				&previous_view,
+				&ComposedFrame { base: previous, layers: &self.layers },
 				previous_window,
-				&next_view,
-				next_window,
+				&ComposedFrame { base: next, layers: &stored },
+				window,
 				0,
 				viewport_height,
-				dirty_rows.as_deref(),
+				dirty.as_deref(),
 				self.graphics,
 				self.hyperlinks,
 				&mut stats,
 			);
 		}
 
-		let next_cursor = compose_cursor(next, &incoming, next_window, next.size().width);
-		let auxiliary = !image_prefix.is_empty()
-			|| !sixels.is_empty()
-			|| !kitty_direct.is_empty()
-			|| !iterm2.is_empty();
+		let auxiliary =
+			!images.is_empty() || !sixels.is_empty() || !kitty_direct.is_empty() || !iterm2.is_empty();
+		let full = !can_diff;
 		let mut output = mem::take(&mut self.output_scratch);
 		output.clear();
-		if !paint.is_empty()
-			|| auxiliary
-			|| next_cursor != self.cursor
-			|| !leading_sequence.is_empty()
-		{
+		if full || stats.runs > 0 || cursor != self.cursor || auxiliary {
 			if self.sync_output {
 				output.push_str(SYNC_OUTPUT_BEGIN);
 			}
 			output.push_str(HIDE_CURSOR);
-			output.push_str(leading_sequence);
-			output.push_str(&image_prefix);
-			if !stats.full_repaint {
+			output.push_str(prefix);
+			append_fixed_screen_modes(&mut output, viewport_height);
+			output.push_str(&images);
+			if full {
+				emit_absolute_window(
+					&mut output,
+					&ComposedFrame { base: next, layers: &stored },
+					window,
+					self.graphics,
+					self.hyperlinks,
+				);
+				stats.full_repaint = true;
+				stats.changed_cells =
+					usize::from(next.size().width).saturating_mul(usize::from(viewport_height));
+				stats.runs = usize::from(viewport_height);
+			} else {
 				output.push_str(VIEWPORT_BOTTOM);
+				output.push_str(&paint);
 			}
-			output.push_str(&paint);
+			output.push_str(VIEWPORT_BOTTOM);
 			output.push_str(&sixels);
 			output.push_str(&kitty_direct);
 			output.push_str(&iterm2);
-			if stats.full_repaint {
-				place_cursor_absolute(&mut output, next_cursor, next_window, next.size().height);
-			} else {
-				place_cursor(&mut output, next_cursor, viewport_height);
-			}
+			place_cursor_screen(&mut output, cursor);
 			if self.sync_output {
 				output.push_str(SYNC_OUTPUT_END);
 			}
 		}
-		let bytes = output.len();
-		let write_result = self.write(&output);
+		stats.bytes = output.len();
+		let result = self.write(&output);
 		self.paint_scratch = paint;
 		self.output_scratch = output;
-		write_result?;
-
-		if commit_to > commit_from {
-			let epoch_id = self.width_epoch.expect("epoch established before paint").id;
-			self.record_epoch_commit(epoch_id, commit_from, commit_to);
-			self.committed_rows = self
-				.committed_rows
-				.saturating_add(commit_to.saturating_sub(commit_from));
-		}
-		if let Some(epoch) = &mut self.width_epoch {
-			epoch.seam = commit_to;
-			epoch.baseline_rows = next.size().height;
-		}
-		self.viewport_height = viewport_height;
-		self.window_top = next_window.top;
-		self.stable_rows = stable_rows;
-		self.cursor = next_cursor;
-		stats.bytes = bytes;
-		let previous_layers = mem::replace(&mut self.layers, incoming);
-		self.layer_scratch = previous_layers;
-		Ok(stats)
+		result?;
+		Ok((stats, stored, cursor))
 	}
 
-	fn uncommit_native_rows(&mut self, rows: u16) {
-		let new_committed = self.committed_rows.saturating_sub(rows);
-		while self
-			.epoch_commits
-			.last()
-			.is_some_and(|commit| commit.native_from >= new_committed)
-		{
-			self.epoch_commits.pop();
-		}
-		if let Some(last) = self.epoch_commits.last_mut() {
-			let retained = new_committed.saturating_sub(last.native_from);
-			let length = last.frame_to.saturating_sub(last.frame_from);
-			if retained < length {
-				last.frame_to = last.frame_from.saturating_add(retained);
-			}
-		}
-		self.committed_rows = new_committed;
-	}
-
-	fn record_epoch_commit(&mut self, epoch: u32, frame_from: u16, frame_to: u16) {
-		let native_from = self.committed_rows;
-		if let Some(last) = self.epoch_commits.last_mut()
-			&& last.epoch == epoch
-			&& last.frame_to == frame_from
-			&& last
-				.native_from
-				.saturating_add(last.frame_to - last.frame_from)
-				== native_from
-		{
-			last.frame_to = frame_to;
+	fn publish_debug_screen(&self) {
+		if !debug::publishing() {
 			return;
 		}
-		self
-			.epoch_commits
-			.push(EpochCommit { epoch, frame_from, frame_to, native_from });
-	}
-
-	fn initial_paint(
-		&mut self,
-		next: Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-	) -> io::Result<PaintStats> {
-		self.full_paint(next, viewport_height, stable_rows, "", CLEAR_VIEWPORT, true)
-	}
-
-	fn initial_paint_overlaid(
-		&mut self,
-		next: Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-		layers: &[ResolvedLayer<'_>],
-	) -> io::Result<PaintStats> {
-		self.paint_full(next, viewport_height, stable_rows, "", CLEAR_VIEWPORT, true, layers)
-	}
-
-	fn full_paint(
-		&mut self,
-		next: Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-		leading_sequence: &str,
-		clear_sequence: &str,
-		copy_screen_to_scrollback: bool,
-	) -> io::Result<PaintStats> {
-		self.paint_full(
-			next,
-			viewport_height,
-			stable_rows,
-			leading_sequence,
-			clear_sequence,
-			copy_screen_to_scrollback,
-			&[],
-		)
-	}
-
-	fn paint_full(
-		&mut self,
-		next: Frame,
-		viewport_height: u16,
-		stable_rows: u16,
-		leading_sequence: &str,
-		clear_sequence: &str,
-		copy_screen_to_scrollback: bool,
-		layers: &[ResolvedLayer<'_>],
-	) -> io::Result<PaintStats> {
-		let layout = layout(next.size().height, viewport_height, stable_rows, 0);
-		let paint_rows = layout.stable_limit.saturating_add(viewport_height);
-		let paint_cells = usize::from(next.size().width).saturating_mul(usize::from(paint_rows));
-		let window = Window { top: layout.window_top, height: viewport_height };
-		let stored_layers = store_layers(layers, window, next.size().width);
-		let next_cursor = compose_cursor(&next, &stored_layers, window, next.size().width);
-		self.sync_screen_buffer();
-		let images = self.image_prefix(&next, layers);
-		self.prepare_sixels(&next);
-		let sixels = self.sixel_output(&next, window, None, None, true);
-		let kitty_direct = kitty_direct_output(
-			self.graphics,
-			&mut self.images,
-			&next,
-			window,
-			None,
-			None,
-			true,
-			self.cell_pixel_width,
-			self.cell_pixel_height,
-			self.tmux_passthrough,
-		);
-		let iterm2 = iterm2_output(
-			self.graphics,
-			self
-				.images
-				.iter()
-				.map(|(&id, image)| Iterm2Image { id, png: &image.png }),
-			&next,
-			Iterm2Viewport { top: window.top, height: window.height },
-			None,
-			None,
-			true,
-			self.tmux_passthrough,
-		);
-		let mut output = String::with_capacity(
-			paint_cells
-				.saturating_mul(2)
-				.saturating_add(images.len())
-				.saturating_add(sixels.len())
-				.saturating_add(kitty_direct.len())
-				.saturating_add(iterm2.len()),
-		);
-		if self.sync_output {
-			output.push_str(SYNC_OUTPUT_BEGIN);
-		}
-		output.push_str(HIDE_CURSOR);
-		output.push_str(leading_sequence);
-		output.push_str(RESET_STYLE);
-		if copy_screen_to_scrollback && self.screen_to_scrollback && clear_sequence == CLEAR_VIEWPORT
-		{
-			output.push_str(SCREEN_TO_SCROLLBACK);
-		}
-		output.push_str(clear_sequence);
-		// Kitty traffic must follow both the staged buffer switch (per-screen
-		// image stores only keep what arrives on the active screen) and the
-		// clear, which may drop placements on some implementations.
-		output.push_str(&images);
-		let composed = ComposedFrame { base: &next, layers: &stored_layers };
-		emit_rows(
-			&mut output,
-			&composed,
-			0..layout.stable_limit,
-			window,
-			self.graphics,
-			self.hyperlinks,
-		);
-		output.push_str(RESET_STYLE);
-		output.push('\r');
-		output.push_str(&sixels);
-		output.push_str(&kitty_direct);
-		output.push_str(&iterm2);
-		place_cursor(&mut output, next_cursor, viewport_height);
-		if self.sync_output {
-			output.push_str(SYNC_OUTPUT_END);
-		}
-
-		let bytes = output.len();
-		self.write(&output)?;
-		let stats = PaintStats {
-			full_repaint: true,
-			changed_cells: paint_cells,
-			runs: usize::from(paint_rows),
-			committed_rows: layout.stable_limit,
-			clipped_rows: layout.window_top.saturating_sub(layout.stable_limit),
-			bytes,
+		let Some(previous) = &self.previous else {
+			return;
 		};
-		self.previous = Some(next);
-		self.viewport_height = viewport_height;
-		self.window_top = layout.window_top;
-		self.committed_rows = layout.stable_limit;
-		self.stable_rows = stable_rows;
-		self.cursor = next_cursor;
-		self.layers = stored_layers;
-		Ok(stats)
-	}
-
-	fn forget_preview(&mut self) {
-		self.preview_previous = None;
-		self.preview_layers.clear();
-		self.preview_window = None;
-		self.preview_cursor = None;
+		let top = previous.size().height.saturating_sub(self.viewport_height);
+		debug::publish_screen(ScreenSnapshot {
+			lines:      self.screen_text(),
+			cursor:     self.screen_cursor(),
+			window_top: top,
+			cols:       previous.size().width,
+			rows:       self.viewport_height,
+			doc_height: previous.size().height,
+			overlay:    !self.layers.is_empty(),
+		});
 	}
 
 	/// Reconciles graphics caches with the terminal's current screen buffer.
@@ -1965,7 +966,10 @@ impl<W: Write> Renderer<W> {
 		if alt_screen == self.alt_screen {
 			return;
 		}
-		self.forget_preview();
+		self.previous = None;
+		self.layers.clear();
+		self.cursor = None;
+		self.viewport_height = 0;
 		self.alt_screen = alt_screen;
 		for image in self.images.values_mut() {
 			image.uploaded = false;
@@ -1982,7 +986,12 @@ impl<W: Write> Renderer<W> {
 	/// accumulating and placeholder cells always resolve their exact grid.
 	/// IDs unknown to [`Renderer::register_image`] are resolved from the
 	/// process-wide `<img src>` registry.
-	fn image_prefix(&mut self, frame: &Frame, layers: &[ResolvedLayer<'_>]) -> String {
+	fn image_prefix(
+		&mut self,
+		frame: &Frame,
+		layers: &[ResolvedLayer<'_>],
+		window: Window,
+	) -> String {
 		if self.graphics != Graphics::KittyPlaceholders
 			|| (!frame.may_have_images() && layers.iter().all(|layer| !layer.frame.may_have_images()))
 		{
@@ -2001,7 +1010,7 @@ impl<W: Write> Renderer<W> {
 				}
 			}
 		};
-		collect(frame, 0, frame.size().height);
+		collect(frame, window.top, window.top.saturating_add(window.height));
 		for layer in layers {
 			collect(layer.frame, layer.src_top, layer.src_top.saturating_add(layer.rows));
 		}
@@ -2028,11 +1037,16 @@ impl<W: Write> Renderer<W> {
 		output
 	}
 
-	fn prepare_sixels(&mut self, frame: &Frame) {
+	fn prepare_sixels(&mut self, frame: &Frame, window: Window) {
 		if self.graphics != Graphics::Sixel {
 			return;
 		}
-		for y in 0..frame.size().height {
+		for y in window.top
+			..window
+				.top
+				.saturating_add(window.height)
+				.min(frame.size().height)
+		{
 			for x in 0..frame.size().width {
 				let CellContent::Image { id, .. } = frame.cell(x, y).content else {
 					continue;
@@ -2152,6 +1166,98 @@ impl<W: Write> Renderer<W> {
 			return Ok(());
 		}
 		terminal_write_all(&mut self.writer, output)
+	}
+}
+
+fn append_fixed_screen_modes(output: &mut String, viewport_height: u16) {
+	output.push_str(esc!(!origin));
+	if viewport_height > 1 {
+		output.push_str(esc!(margins_reset));
+	}
+	output.push_str(esc!(!autowrap));
+}
+
+fn place_cursor_screen(output: &mut String, cursor: Option<ScreenCursor>) {
+	match cursor {
+		Some(cursor) => {
+			let _ = write!(output, "\x1b[{};{}H", cursor.row + 1, cursor.col + 1);
+			output.push_str(SHOW_CURSOR);
+		},
+		None => output.push_str(HIDE_CURSOR),
+	}
+}
+
+fn emit_absolute_window(
+	output: &mut String,
+	frame: &ComposedFrame<'_>,
+	window: Window,
+	graphics: Graphics,
+	hyperlinks: bool,
+) {
+	for screen_row in 0..window.height {
+		let row = window.top.saturating_add(screen_row);
+		let _ = write!(output, "\x1b[{};1H", screen_row + 1);
+		output.push_str(esc!(erase_line));
+		let joined = screen_row > 0
+			&& row > 0
+			&& row - 1 < frame.base.size().height
+			&& wrap_joinable(frame, row - 1);
+		if joined {
+			let _ = write!(output, "\x1b[{};1H", screen_row);
+			output.push_str(esc!(autowrap));
+			arm_wrap_boundary(output, frame, row - 1, graphics, hyperlinks);
+			encode_frame_row(output, frame, row, graphics, hyperlinks);
+			output.push_str(esc!(!autowrap));
+		} else {
+			encode_frame_row(output, frame, row, graphics, hyperlinks);
+		}
+	}
+	output.push_str(RESET_STYLE);
+	output.push_str(esc!(!autowrap));
+}
+
+fn retirement_joinable(finalized: &Frame, viewport: &Frame, previous: u16, current: u16) -> bool {
+	let finalized_rows = finalized.size().height;
+	if current != previous.saturating_add(1) {
+		return false;
+	}
+	if current < finalized_rows {
+		return finalized.soft_wrap(previous);
+	}
+	previous >= finalized_rows && viewport.soft_wrap(previous - finalized_rows)
+}
+
+#[allow(clippy::too_many_arguments, reason = "row source and terminal state are independent")]
+fn emit_retirement_row(
+	output: &mut String,
+	finalized: &ComposedFrame<'_>,
+	viewport: &ComposedFrame<'_>,
+	finalized_rows: u16,
+	index: u16,
+	graphics: Graphics,
+	hyperlinks: bool,
+) {
+	if index < finalized_rows {
+		encode_frame_row(output, finalized, index, graphics, hyperlinks);
+	} else {
+		encode_frame_row(output, viewport, index - finalized_rows, graphics, hyperlinks);
+	}
+}
+
+#[allow(clippy::too_many_arguments, reason = "row source and terminal state are independent")]
+fn arm_retirement_boundary(
+	output: &mut String,
+	finalized: &ComposedFrame<'_>,
+	viewport: &ComposedFrame<'_>,
+	finalized_rows: u16,
+	index: u16,
+	graphics: Graphics,
+	hyperlinks: bool,
+) {
+	if index < finalized_rows {
+		arm_wrap_boundary(output, finalized, index, graphics, hyperlinks);
+	} else {
+		arm_wrap_boundary(output, viewport, index - finalized_rows, graphics, hyperlinks);
 	}
 }
 
@@ -2395,6 +1501,7 @@ fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
 	(width > 0 && height > 0).then_some((width, height))
 }
 
+/// Returns the top-left cell and declared cell-box size of an image placement.
 pub fn image_placement(frame: &Frame, id: u32) -> Option<(u16, u16, u16, u16)> {
 	for y in 0..frame.size().height {
 		for x in 0..frame.size().width {
@@ -2408,74 +1515,6 @@ pub fn image_placement(frame: &Frame, id: u32) -> Option<(u16, u16, u16, u16)> {
 		}
 	}
 	None
-}
-
-fn resolve_width_epoch_capture(capture: &WidthEpochCapture, next: &Frame) -> Option<u16> {
-	if capture.frame.size().width != next.size().width {
-		return None;
-	}
-	let rows = capture.window.height.min(
-		capture
-			.frame
-			.size()
-			.height
-			.saturating_sub(capture.window.top),
-	);
-	if rows == 0 || rows > next.size().height {
-		return None;
-	}
-	for offset in (0..=next.size().height - rows).rev() {
-		if (0..rows).all(|row| {
-			capture.frame.row_equals(
-				capture.window.top.saturating_add(row),
-				next,
-				offset.saturating_add(row),
-			)
-		}) {
-			return Some(offset);
-		}
-	}
-	None
-}
-
-fn map_epoch_boundary(previous: &Frame, next: &Frame, boundary: u16) -> u16 {
-	let previous_height = previous.size().height;
-	let next_height = next.size().height;
-	let shared = previous_height.min(next_height);
-	let mut prefix = 0;
-	while prefix < shared && previous.row_equals(prefix, next, prefix) {
-		prefix += 1;
-	}
-	if boundary <= prefix {
-		return boundary.min(next_height);
-	}
-
-	let mut suffix = 0;
-	while suffix < shared.saturating_sub(prefix)
-		&& previous.row_equals(previous_height - 1 - suffix, next, next_height - 1 - suffix)
-	{
-		suffix += 1;
-	}
-	let suffix_start = previous_height.saturating_sub(suffix);
-	if boundary >= suffix_start {
-		return next_height.saturating_sub(previous_height.saturating_sub(boundary));
-	}
-	prefix
-}
-fn contract_error(message: &'static str) -> io::Error {
-	io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn layout(
-	document_height: u16,
-	viewport_height: u16,
-	stable_rows: u16,
-	committed_rows: u16,
-) -> Layout {
-	let natural_top = document_height.saturating_sub(viewport_height);
-	let stable_limit = committed_rows.max(stable_rows.min(natural_top));
-	let window_top = committed_rows.max(natural_top);
-	Layout { stable_limit, window_top }
 }
 
 /// Resolves declarative layers into z-ordered viewport bands.
@@ -2670,427 +1709,11 @@ fn frame_cursor(frame: &Frame, window: Window) -> Option<ScreenCursor> {
 	Some(ScreenCursor { row: document_row - window.top, col })
 }
 
-fn place_cursor(output: &mut String, cursor: Option<ScreenCursor>, viewport_height: u16) {
-	let Some(cursor) = cursor else {
-		return;
-	};
-	let mut row = viewport_height - 1;
-	move_cursor_row(output, &mut row, cursor.row);
-	output.push('\r');
-	if cursor.col > 0 {
-		let _ = write!(output, esc!(cursor_forward), cursor.col);
-	}
-	output.push_str(SHOW_CURSOR);
-}
-
-const fn scroll_append_to(
-	previous_window: Window,
-	next_window: Window,
-	committed_rows: u16,
-	stable_limit: u16,
-) -> u16 {
-	if committed_rows != previous_window.top || next_window.top <= previous_window.top {
-		return committed_rows;
-	}
-	let scroll = next_window.top - previous_window.top;
-	if scroll >= previous_window.height || next_window.top > stable_limit {
-		return committed_rows;
-	}
-	next_window.top
-}
-
-/// Re-emits live wrap boundaries whose hard/soft state changed since the
-/// previous paint. VT has no in-place line-attribute rewrite: a boundary
-/// turning soft re-arms the pending wrap and re-prints its continuation
-/// row through autowrap; one turning hard erases and re-prints both rows
-/// (EL resets the attribute on mainstream terminals; frames that may hold
-/// direct-drawn images overprint without erasing so placements survive).
-/// Boundaries the commit loop emitted this paint are skipped; `scroll` is
-/// the number of newly committed rows and `region` the scrolled zone
-/// height (the full viewport without margin scrollback). The cursor is
-/// expected on — and is re-parked at — the viewport's bottom row.
-#[allow(clippy::too_many_arguments, reason = "diff inputs describe two composed viewport slices")]
-fn reconcile_wrap_boundaries(
-	output: &mut String,
-	previous: &ComposedFrame<'_>,
-	previous_window: Window,
-	next: &ComposedFrame<'_>,
-	next_window: Window,
-	scroll: u16,
-	region: u16,
-	graphics: Graphics,
-	hyperlinks: bool,
-	stats: &mut PaintStats,
-) {
-	let height = next_window.height;
-	let erase = !next.base.may_have_images();
-	let mut cursor_row = height - 1;
-	let mut emitted = false;
-	for boundary in 0..height.saturating_sub(1) {
-		let row = next_window.top.saturating_add(boundary);
-		let wanted = wrap_joinable(next, row);
-		let painted = if scroll == 0 {
-			wrap_joinable(previous, previous_window.top.saturating_add(boundary))
-		} else if boundary.saturating_add(1) < region.saturating_sub(scroll) {
-			// Retained rows scrolled up with their line attributes intact.
-			wrap_joinable(previous, next_window.top.saturating_add(boundary))
-		} else if boundary.saturating_add(1) == region {
-			// The commit scroll created the region's bottom line fresh.
-			false
-		} else if boundary >= region {
-			// Pinned rows below a margin region never moved.
-			wrap_joinable(previous, previous_window.top.saturating_add(boundary))
-		} else {
-			// The commit loop emits this boundary in its desired state.
-			continue;
-		};
-		if painted == wanted {
-			continue;
-		}
-		emitted = true;
-		stats.runs += 1;
-		stats.changed_cells = stats
-			.changed_cells
-			.saturating_add(usize::from(next.base.size().width).saturating_mul(2));
-		move_cursor_row(output, &mut cursor_row, boundary);
-		if wanted {
-			output.push_str(esc!(autowrap));
-			arm_wrap_boundary(output, next, row, graphics, hyperlinks);
-			// The continuation row's first glyph rides the pending wrap;
-			// re-printing it whole keeps the screen byte-identical.
-			encode_frame_row(output, next, row.saturating_add(1), graphics, hyperlinks);
-			output.push_str(esc!(!autowrap));
-			cursor_row = boundary + 1;
-		} else {
-			output.push('\r');
-			if erase {
-				output.push_str(esc!(erase_line));
-			}
-			encode_frame_row(output, next, row, graphics, hyperlinks);
-			move_cursor_row(output, &mut cursor_row, boundary + 1);
-			output.push('\r');
-			if erase {
-				output.push_str(esc!(erase_line));
-			}
-			encode_frame_row(output, next, row.saturating_add(1), graphics, hyperlinks);
-		}
-	}
-	if emitted {
-		output.push_str(RESET_STYLE);
-		move_cursor_row(output, &mut cursor_row, height - 1);
-		output.push('\r');
-	}
-}
-fn emit_bounded_window(
-	output: &mut String,
-	frame: &ComposedFrame<'_>,
-	window: Window,
-	graphics: Graphics,
-	hyperlinks: bool,
-) {
-	output.push_str(esc!(cursor_home));
-	emit_rows(output, frame, 0..0, window, graphics, hyperlinks);
-	output.push_str(RESET_STYLE);
-	output.push('\r');
-}
-
-fn emit_epoch_scroll(
-	output: &mut String,
-	raw: &ComposedFrame<'_>,
-	composed: &ComposedFrame<'_>,
-	commit_from: u16,
-	commit_to: u16,
-	window: Window,
-	graphics: Graphics,
-	hyperlinks: bool,
-) {
-	emit_bounded_window(
-		output,
-		raw,
-		Window { top: commit_from, height: window.height },
-		graphics,
-		hyperlinks,
-	);
-	output.push_str(VIEWPORT_BOTTOM);
-	let entering_from = commit_from.saturating_add(window.height);
-	let entering_to = commit_to.saturating_add(window.height);
-	let any_join = (entering_from..entering_to).any(|row| row > 0 && wrap_joinable(raw, row - 1));
-	if any_join {
-		output.push_str(esc!(autowrap));
-	}
-	for row in entering_from..entering_to {
-		if row > 0 && wrap_joinable(raw, row - 1) {
-			arm_wrap_boundary(output, raw, row - 1, graphics, hyperlinks);
-		} else {
-			output.push_str("\r\n");
-		}
-		encode_frame_row(output, raw, row, graphics, hyperlinks);
-	}
-	if any_join {
-		output.push_str(esc!(!autowrap));
-	}
-	emit_bounded_window(output, composed, window, graphics, hyperlinks);
-}
-
-fn place_cursor_absolute(
-	output: &mut String,
-	cursor: Option<ScreenCursor>,
-	window: Window,
-	document_height: u16,
-) {
-	let (row, col, visible) = if let Some(cursor) = cursor {
-		(cursor.row.min(window.height - 1), cursor.col, true)
-	} else {
-		let content_rows = window
-			.height
-			.min(document_height.saturating_sub(window.top))
-			.max(1);
-		(content_rows - 1, 0, false)
-	};
-	let _ = write!(output, "\x1b[{};{}H", row + 1, col + 1);
-	output.push_str(if visible { SHOW_CURSOR } else { HIDE_CURSOR });
-}
-
-fn emit_scroll_append(
-	output: &mut String,
-	previous: &ComposedFrame<'_>,
-	previous_window: Window,
-	next: &ComposedFrame<'_>,
-	next_window: Window,
-	graphics: Graphics,
-	hyperlinks: bool,
-	stats: &mut PaintStats,
-) {
-	let scroll = next_window.top - previous_window.top;
-	emit_window_diff(
-		output,
-		previous,
-		Window { top: previous_window.top, height: scroll },
-		next,
-		Window { top: next_window.top - scroll, height: scroll },
-		0,
-		next_window.height,
-		graphics,
-		hyperlinks,
-		stats,
-	);
-	output.push_str(VIEWPORT_BOTTOM);
-	let first_new = next_window.height - scroll;
-	let any_join = (first_new..next_window.height).any(|screen_y| {
-		let row = next_window.top.saturating_add(screen_y);
-		row > 0 && wrap_joinable(next, row - 1)
-	});
-	if any_join {
-		output.push_str(esc!(autowrap));
-	}
-	for screen_y in first_new..next_window.height {
-		let row = next_window.top.saturating_add(screen_y);
-		if row > 0 && wrap_joinable(next, row - 1) {
-			// The first joined row rides a freshly armed pending wrap: the
-			// bottom line still shows last frame's paint, so its trailing
-			// glyph is re-printed under DECAWM. Every further full-width
-			// row printed below arms the pending wrap itself.
-			if screen_y == first_new {
-				arm_wrap_boundary(output, next, row - 1, graphics, hyperlinks);
-			}
-		} else {
-			output.push_str("\r\n");
-		}
-		encode_frame_row(output, next, row, graphics, hyperlinks);
-	}
-	if any_join {
-		output.push_str(esc!(!autowrap));
-	}
-	stats.runs += usize::from(scroll);
-	stats.changed_cells += usize::from(next.base.size().width).saturating_mul(usize::from(scroll));
-
-	let retained_rows = next_window.height - scroll;
-	emit_window_diff(
-		output,
-		previous,
-		Window { top: previous_window.top.saturating_add(scroll), height: retained_rows },
-		next,
-		Window { top: next_window.top, height: retained_rows },
-		0,
-		next_window.height,
-		graphics,
-		hyperlinks,
-		stats,
-	);
-}
-
-/// Commits rows like [`emit_scroll_append`] but scrolls only the top
-/// `region_rows` screen rows through a top-anchored DECSTBM margin, leaving
-/// the rows below physically pinned.
-///
-/// On terminals that move margin-scrolled rows into native scrollback this
-/// keeps history identical to a whole-screen scroll while the pinned live
-/// rows never move on screen; whether a native selection over them survives
-/// is the terminal's selection-transform property (see
-/// [`Renderer::set_margin_scrollback`]). Changed pinned cells (spinners,
-/// streaming text) are diffed in place. The caller guarantees
-/// `scroll <= region_rows < viewport height`.
-fn emit_margin_scroll_append(
-	output: &mut String,
-	previous: &ComposedFrame<'_>,
-	previous_window: Window,
-	next: &ComposedFrame<'_>,
-	next_window: Window,
-	region_rows: u16,
-	graphics: Graphics,
-	hyperlinks: bool,
-	stats: &mut PaintStats,
-) {
-	let scroll = next_window.top - previous_window.top;
-	// Finalize the outgoing rows in place so native scrollback receives
-	// their committed content.
-	emit_window_diff(
-		output,
-		previous,
-		Window { top: previous_window.top, height: scroll },
-		next,
-		Window { top: next_window.top - scroll, height: scroll },
-		0,
-		next_window.height,
-		graphics,
-		hyperlinks,
-		stats,
-	);
-	// DECSTBM homes the cursor into the region; CUD then parks on the
-	// bottom margin, where each newline commits the region's top row.
-	let _ = write!(output, esc!(scroll_region, cursor_down), region_rows, region_rows - 1);
-	let first_new = region_rows - scroll;
-	let any_join = (first_new..region_rows).any(|screen_y| {
-		let row = next_window.top.saturating_add(screen_y);
-		row > 0 && wrap_joinable(next, row - 1)
-	});
-	if any_join {
-		output.push_str(esc!(autowrap));
-	}
-	for screen_y in first_new..region_rows {
-		let row = next_window.top.saturating_add(screen_y);
-		if row > 0 && wrap_joinable(next, row - 1) {
-			if screen_y == first_new {
-				arm_wrap_boundary(output, next, row - 1, graphics, hyperlinks);
-			}
-		} else {
-			output.push_str("\r\n");
-		}
-		encode_frame_row(output, next, row, graphics, hyperlinks);
-	}
-	if any_join {
-		output.push_str(esc!(!autowrap));
-	}
-	stats.runs += usize::from(scroll);
-	stats.changed_cells += usize::from(next.base.size().width).saturating_mul(usize::from(scroll));
-	// Reset the margins (homing the cursor again) and re-park at the
-	// viewport bottom for the retained-row diff.
-	output.push_str(esc!(margins_reset));
-	output.push_str(VIEWPORT_BOTTOM);
-	let shifted = region_rows - scroll;
-	emit_window_diff(
-		output,
-		previous,
-		Window { top: previous_window.top.saturating_add(scroll), height: shifted },
-		next,
-		Window { top: next_window.top, height: shifted },
-		0,
-		next_window.height,
-		graphics,
-		hyperlinks,
-		stats,
-	);
-	// The pinned live rows never moved; repaint their changed cells in place.
-	let pinned = next_window.height - region_rows;
-	emit_window_diff(
-		output,
-		previous,
-		Window { top: previous_window.top.saturating_add(region_rows), height: pinned },
-		next,
-		Window { top: next_window.top.saturating_add(region_rows), height: pinned },
-		region_rows,
-		next_window.height,
-		graphics,
-		hyperlinks,
-		stats,
-	);
-}
-
-/// Emits `prefix` document rows then the window sequentially from the
-/// cursor's current line. Hard boundaries advance with `\r\n`; a joinable
-/// boundary between consecutive document rows is left to terminal
-/// autowrap, marking the pair as one soft-wrapped line for native copy.
-fn emit_rows(
-	output: &mut String,
-	frame: &ComposedFrame<'_>,
-	prefix: Range<u16>,
-	window: Window,
-	graphics: Graphics,
-	hyperlinks: bool,
-) {
-	let mut any_join = false;
-	let mut previous: Option<u16> = None;
-	for row in prefix
-		.clone()
-		.chain((0..window.height).map(|screen_y| window.top.saturating_add(screen_y)))
-	{
-		if previous.is_some_and(|p| row == p.saturating_add(1) && wrap_joinable(frame, p)) {
-			any_join = true;
-			break;
-		}
-		previous = Some(row);
-	}
-	if any_join {
-		output.push_str(esc!(autowrap));
-	}
-	let mut previous: Option<u16> = None;
-	for row in prefix.chain((0..window.height).map(|screen_y| window.top.saturating_add(screen_y))) {
-		if let Some(p) = previous
-			&& !(row == p.saturating_add(1) && wrap_joinable(frame, p))
-		{
-			output.push_str("\r\n");
-		}
-		encode_frame_row(output, frame, row, graphics, hyperlinks);
-		previous = Some(row);
-	}
-	if any_join {
-		output.push_str(esc!(!autowrap));
-	}
-}
-
 #[inline(always)]
 fn cells_equal(previous: &Cell, next: &Cell, hyperlinks: bool) -> bool {
 	previous.content == next.content
 		&& (previous.style == next.style
 			|| (!hyperlinks && previous.style.without_link() == next.style.without_link()))
-}
-
-#[inline]
-fn emit_window_diff(
-	output: &mut String,
-	previous: &ComposedFrame<'_>,
-	previous_window: Window,
-	next: &ComposedFrame<'_>,
-	next_window: Window,
-	screen_top: u16,
-	screen_height: u16,
-	graphics: Graphics,
-	hyperlinks: bool,
-	stats: &mut PaintStats,
-) {
-	emit_window_diff_rows(
-		output,
-		previous,
-		previous_window,
-		next,
-		next_window,
-		screen_top,
-		screen_height,
-		None,
-		graphics,
-		hyperlinks,
-		stats,
-	);
 }
 
 #[allow(clippy::too_many_arguments, reason = "diff inputs describe two composed viewport slices")]
@@ -3179,6 +1802,7 @@ fn emit_window_diff_rows(
 	}
 }
 
+/// Appends relative vertical cursor motion and updates the tracked screen row.
 pub fn move_cursor_row(output: &mut String, current: &mut u16, target: u16) {
 	if target < *current {
 		let _ = write!(output, esc!(cursor_up), *current - target);
@@ -3566,27 +2190,15 @@ fn push_color_code(output: &mut String, first: &mut bool, color: Color, backgrou
 
 #[cfg(test)]
 mod tests {
-	use std::{io::ErrorKind, iter, mem};
+	use std::{io, mem};
 
 	use super::{
 		ConptyChunks, MAX_CONPTY_WRITE_CHUNK_BYTES, MAX_OUTPUT_BACKLOG_BYTES, OutputBacklogGuard,
-		REBUILD_HISTORY, ResolvedLayer, SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END, VIEWPORT_BOTTOM,
+		Renderer, ResolvedLayer, SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END,
 	};
-	use crate::{
-		Color, Frame, Graphics, Renderer, ResizeScrollbackMode, Size, Style,
-		overlay::{Layer, OverlayAnchor, OverlayOptions},
-		test_support::TerminalModel,
-	};
+	use crate::{Color, Frame, Graphics, Size, Style, test_support::TerminalModel};
 
-	fn document(lines: &[&str]) -> Frame {
-		let mut frame = Frame::new(Size::new(8, u16::try_from(lines.len()).expect("small fixture")));
-		for (row, line) in lines.iter().enumerate() {
-			frame.put(0, u16::try_from(row).expect("small fixture"), line, Style::default());
-		}
-		frame
-	}
-
-	fn document_at_width(width: u16, lines: &[&str]) -> Frame {
+	fn frame(width: u16, lines: &[&str]) -> Frame {
 		let mut frame =
 			Frame::new(Size::new(width, u16::try_from(lines.len()).expect("small fixture")));
 		for (row, line) in lines.iter().enumerate() {
@@ -3594,29 +2206,208 @@ mod tests {
 		}
 		frame
 	}
-	/// [`document`] with soft-wrap flags on the given boundary rows.
-	fn soft_document(lines: &[&str], soft_after: &[u16]) -> Frame {
-		let mut frame = document(lines);
-		for &row in soft_after {
-			frame.set_soft_wrap(row);
-		}
-		frame
-	}
 
-	fn apply_paint(renderer: &mut Renderer<Vec<u8>>, terminal: &mut TerminalModel) {
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("ANSI is UTF-8");
+	fn apply(renderer: &mut Renderer<Vec<u8>>, terminal: &mut TerminalModel) -> String {
+		let output =
+			String::from_utf8(mem::take(renderer.writer_mut())).expect("renderer emits UTF-8");
 		terminal.apply(&output);
-	}
-
-	fn without_sync_markers(output: &str) -> String {
 		output
-			.replace(SYNC_OUTPUT_BEGIN, "")
-			.replace(SYNC_OUTPUT_END, "")
 	}
 
 	#[test]
-	fn layer_appears_once_at_viewport_coordinates() {
-		let base = document(&["base000", "base111"]);
+	fn repeated_present_preserves_history_byte_for_byte() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(8, 3);
+		terminal.history.push("shell-before".to_owned());
+		for lines in [
+			&["one", "two", "three"][..],
+			&["one!", "two", "three"][..],
+			&["zero", "one!", "two", "three"][..],
+			&["short"][..],
+		] {
+			renderer.present(frame(8, lines), 3, &[]).unwrap();
+			apply(&mut renderer, &mut terminal);
+			assert_eq!(terminal.history, ["shell-before"]);
+		}
+	}
+
+	#[test]
+	fn tall_present_is_bottom_clipped_without_scrolling() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(8, 2);
+		renderer
+			.present(frame(8, &["old", "top", "bottom"]), 2, &[])
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		assert!(terminal.history.is_empty());
+		assert_eq!(terminal.visible_rows(), ["top", "bottom"]);
+		assert_eq!(renderer.screen_text(), ["top", "bottom"]);
+	}
+
+	#[test]
+	fn retire_puts_exact_finalized_rows_in_history_and_exact_viewport_visible() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(8, 3);
+		renderer
+			.present(frame(8, &["live-a", "live-b", "live-c"]), 3, &[])
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		let stats = renderer
+			.retire(
+				&frame(8, &["final-a", "final-b"]),
+				&frame(8, &["next-a", "next-b", "next-c"]),
+				3,
+				&[],
+			)
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		assert_eq!(stats.rows, 2);
+		assert_eq!(terminal.history, ["final-a", "final-b"]);
+		assert_eq!(terminal.visible_rows(), ["next-a", "next-b", "next-c"]);
+	}
+
+	#[test]
+	fn multi_row_retirement_batch_has_no_blank_or_duplicate_rows() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(8, 2);
+		renderer
+			.retire(
+				&frame(8, &["first", "second", "third"]),
+				&frame(8, &["queue-a", "queue-b"]),
+				2,
+				&[],
+			)
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		assert_eq!(terminal.history, ["first", "second", "third"]);
+		assert_eq!(terminal.visible_rows(), ["queue-a", "queue-b"]);
+	}
+
+	#[test]
+	fn full_width_final_row_does_not_wrap_into_extra_history() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(4, 2);
+		renderer
+			.retire(&frame(4, &["FULL"]), &frame(4, &["q1", "q2"]), 2, &[])
+			.unwrap();
+		let output = apply(&mut renderer, &mut terminal);
+		assert_eq!(terminal.history, ["FULL"]);
+		assert_eq!(terminal.visible_rows(), ["q1", "q2"]);
+		assert!(!output.ends_with('\n'));
+	}
+
+	#[test]
+	fn retirement_emits_no_trailing_line_feed_or_empty_history_row() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(6, 2);
+		renderer
+			.retire(&frame(6, &["done"]), &frame(6, &["live", ""]), 2, &[])
+			.unwrap();
+		let output = apply(&mut renderer, &mut terminal);
+		assert_eq!(terminal.history, ["done"]);
+		assert_eq!(terminal.visible_rows(), ["live", ""]);
+		let last_newline = output.rfind('\n').expect("one controlled scroll");
+		assert!(!output[last_newline + 1..].contains('\n'));
+		assert!(!output.ends_with('\n'));
+	}
+
+	#[test]
+	fn height_one_retirement_scrolls_once_per_finalized_row() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(5, 1);
+		let stats = renderer
+			.retire(&frame(5, &["one", "two"]), &frame(5, &["next"]), 1, &[])
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		assert_eq!(stats.rows, 2);
+		assert_eq!(terminal.history, ["one", "two"]);
+		assert_eq!(terminal.visible_rows(), ["next"]);
+	}
+
+	#[test]
+	fn zero_height_finalized_repaints_without_scrolling() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(5, 2);
+		terminal.history.push("before".to_owned());
+		let stats = renderer
+			.retire(&Frame::new(Size::new(5, 0)), &frame(5, &["q1", "q2"]), 2, &[])
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		assert_eq!(stats.rows, 0);
+		assert_eq!(terminal.history, ["before"]);
+		assert_eq!(terminal.visible_rows(), ["q1", "q2"]);
+	}
+
+	#[test]
+	fn blank_final_lines_retire_deterministically() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(5, 2);
+		renderer
+			.retire(&frame(5, &["", "done"]), &frame(5, &["", "live"]), 2, &[])
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		assert_eq!(terminal.history, ["", "done"]);
+		assert_eq!(terminal.visible_rows(), ["", "live"]);
+	}
+	#[test]
+	fn soft_wrapped_final_rows_preserve_native_join_metadata() {
+		let mut finalized = frame(4, &["abcd", "ef"]);
+		finalized.set_soft_wrap(0);
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(4, 2);
+		renderer
+			.retire(&finalized, &frame(4, &["q1", "q2"]), 2, &[])
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		assert_eq!(terminal.history, ["abcdef"]);
+		assert_eq!(terminal.visible_rows(), ["q1", "q2"]);
+	}
+
+	#[test]
+	fn wide_styled_linked_retirement_is_deterministic() {
+		fn styled_frames() -> (Frame, Frame) {
+			let mut finalized = Frame::new(Size::new(8, 1));
+			finalized.put(0, 0, "界", Style::new().bold().fg(Color::Indexed(2)));
+			finalized.put(2, 0, " link", Style::new().underline().link("https://example.test"));
+			let mut viewport = Frame::new(Size::new(8, 2));
+			viewport.put(0, 0, "界 live", Style::new().italic());
+			viewport.put(0, 1, "next", Style::default());
+			(finalized, viewport)
+		}
+		let (finalized, viewport) = styled_frames();
+		let mut first = Renderer::new(Vec::new());
+		let mut second = Renderer::new(Vec::new());
+		first.set_hyperlinks(true);
+		second.set_hyperlinks(true);
+		first.retire(&finalized, &viewport, 2, &[]).unwrap();
+		second.retire(&finalized, &viewport, 2, &[]).unwrap();
+		assert_eq!(first.writer_mut(), second.writer_mut());
+		let mut terminal = TerminalModel::new(8, 2);
+		apply(&mut first, &mut terminal);
+		assert_eq!(terminal.history, ["界 link"]);
+		assert_eq!(terminal.visible_rows(), ["界 live", "next"]);
+	}
+
+	#[test]
+	fn presentation_after_retirement_diffs_without_scrolling() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(8, 2);
+		renderer
+			.retire(&frame(8, &["done"]), &frame(8, &["live-a", "live-b"]), 2, &[])
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		let stats = renderer
+			.present(frame(8, &["live-a", "changed"]), 2, &[])
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+		assert!(!stats.full_repaint);
+		assert_eq!(terminal.history, ["done"]);
+		assert_eq!(terminal.visible_rows(), ["live-a", "changed"]);
+	}
+
+	#[test]
+	fn resolved_layer_diffs_and_clear_restores_base_cells() {
+		let base = frame(8, &["base000", "base111"]);
 		let mut overlay = Frame::new(Size::new(2, 1));
 		overlay.put(0, 0, "OV", Style::default());
 		let layer = ResolvedLayer {
@@ -3629,1853 +2420,156 @@ mod tests {
 		};
 		let mut renderer = Renderer::new(Vec::new());
 		let mut terminal = TerminalModel::new(8, 2);
-
-		let first = renderer
-			.present_resolved(&base, &[], 2, 0, &[layer])
-			.expect("overlay paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert!(first.runs > 0);
+		renderer.present_resolved(&base, &[], 2, &[layer]).unwrap();
+		apply(&mut renderer, &mut terminal);
 		assert_eq!(terminal.visible_rows(), ["base000", "baOV111"]);
-
-		let second = renderer
-			.present_resolved(&base, &[], 2, 0, &[ResolvedLayer {
-				frame:   &overlay,
-				x:       2,
-				y:       1,
-				src_top: 0,
-				rows:    1,
-				active:  false,
-			}])
-			.expect("identical overlay paint succeeds");
-		assert_eq!(second.runs, 0);
-		assert_eq!(second.bytes, 0);
-	}
-
-	#[test]
-	fn declarative_layer_resolves_options_to_a_band() {
-		let base = document(&["base000", "base111"]);
-		let mut overlay = Frame::new(Size::new(2, 1));
-		overlay.put(0, 0, "OV", Style::default());
-		let options = OverlayOptions::default()
-			.anchor(OverlayAnchor::TopLeft)
-			.offset_x(2)
-			.offset_y(1);
-		let layer = Layer { frame: &overlay, options: &options, active: false };
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 2);
-
-		renderer
-			.present_overlaid(&base, &[], 2, 0, &[layer])
-			.expect("declarative layer paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.visible_rows(), ["base000", "baOV111"]);
-	}
-
-	#[test]
-	fn clearing_overlay_repaints_document_cells() {
-		let base = document(&["base000", "base111"]);
-		let mut overlay = Frame::new(Size::new(2, 1));
-		overlay.put(0, 0, "OV", Style::default());
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 2);
-		renderer
-			.present(base.clone(), 2, 0)
-			.expect("base paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		renderer
-			.present_resolved(&base, &[], 2, 0, &[ResolvedLayer {
-				frame:   &overlay,
-				x:       2,
-				y:       1,
-				src_top: 0,
-				rows:    1,
-				active:  false,
-			}])
-			.expect("overlay paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		let stats = renderer
-			.present_ref(&base, 2, 0)
-			.expect("clearing paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert!(stats.runs > 0);
+		renderer.clear_layers().unwrap();
+		apply(&mut renderer, &mut terminal);
 		assert_eq!(terminal.visible_rows(), ["base000", "base111"]);
+		assert!(terminal.history.is_empty());
 	}
 
 	#[test]
-	fn document_growth_scrolls_raw_rows_to_history_under_open_overlay() {
-		fn resolved_layer(overlay: &Frame) -> ResolvedLayer<'_> {
-			ResolvedLayer {
-				frame:   overlay,
-				x:       0,
-				y:       0,
-				src_top: 0,
-				rows:    1,
-				active:  false,
-			}
-		}
-		let mut overlay = Frame::new(Size::new(2, 1));
-		overlay.put(0, 0, "OV", Style::default());
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 2);
-		renderer
-			.present(document(&["row00", "row01"]), 2, 2)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		let first = renderer
-			.present_resolved(&document(&["row00", "row01", "row02"]), &[(2, 3)], 2, 3, &[
-				resolved_layer(&overlay),
-			])
-			.expect("first growth under the layer succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(first.committed_rows, 1, "commits keep flowing under an open layer");
-		assert_eq!(terminal.history, ["row00"]);
-		assert_eq!(
-			terminal.visible_rows(),
-			["OVw01", "row02"],
-			"the layer stays viewport-anchored after the scroll"
-		);
-
-		let second = renderer
-			.present_resolved(&document(&["row00", "row01", "row02", "row03"]), &[(3, 4)], 2, 4, &[
-				resolved_layer(&overlay),
-			])
-			.expect("second growth under the layer succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(second.committed_rows, 1);
-		assert_eq!(
-			terminal.history,
-			["row00", "row01"],
-			"the row physically under the layer is restored before it scrolls out"
-		);
-		assert!(terminal.history.iter().all(|row| !row.contains("OV")));
-		assert_eq!(terminal.visible_rows(), ["OVw02", "row03"]);
-
-		renderer
-			.present_damaged(&document(&["row00", "row01", "row02", "row03"]), &[], 2, 4)
-			.expect("clearing the layer succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.visible_rows(), ["row02", "row03"]);
-		assert_eq!(terminal.history, ["row00", "row01"], "clearing commits nothing extra");
-	}
-
-	#[test]
-	fn clear_layers_restores_raw_cells_without_committing() {
-		let mut overlay = Frame::new(Size::new(2, 1));
-		overlay.put(0, 0, "OV", Style::default());
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 2);
-		renderer
-			.present(document(&["row00", "row01", "row02"]), 2, 3)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		renderer
-			.present_resolved(&document(&["row00", "row01", "row02"]), &[], 2, 3, &[ResolvedLayer {
-				frame:   &overlay,
-				x:       0,
-				y:       0,
-				src_top: 0,
-				rows:    1,
-				active:  false,
-			}])
-			.expect("layered paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.visible_rows(), ["OVw01", "row02"]);
-
-		renderer.clear_layers().expect("teardown scrub succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(
-			terminal.visible_rows(),
-			["row01", "row02"],
-			"bands repaint from the raw document"
-		);
-		assert_eq!(terminal.history, ["row00"], "the scrub commits nothing");
-
-		renderer.clear_layers().expect("layer-free scrub succeeds");
-		assert!(renderer.writer_mut().is_empty(), "a layer-free scrub writes nothing");
-	}
-
-	#[test]
-	fn cursor_follows_the_active_layer_and_base_shows_through_passive_ones() {
-		let mut base = document(&["base000", "base111", "base222"]);
+	fn active_layer_owns_cursor_and_passive_layer_releases_it() {
+		let mut base = frame(8, &["base", "next"]);
 		base.set_cursor(0, 0);
-		let mut overlay = Frame::new(Size::new(2, 2));
-		overlay.put(0, 0, "aa", Style::default());
-		overlay.put(0, 1, "bb", Style::default());
-		overlay.set_cursor(1, 1);
-		let layer =
-			|active| ResolvedLayer { frame: &overlay, x: 3, y: 0, src_top: 0, rows: 2, active };
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.present(base.clone(), 3, 0)
-			.expect("base paint succeeds");
-		renderer.writer_mut().clear();
-
-		// An active layer owns the caret, translated to screen coordinates.
-		renderer
-			.present_resolved(&base, &[], 3, 0, &[layer(true)])
-			.expect("active layer paint succeeds");
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
-		assert!(output.contains("\x1b[1A\r\x1b[4C\x1b[?25h"), "{output:?}");
-
-		// A passive layer lets the base document's caret show through.
-		renderer
-			.present_resolved(&base, &[], 3, 0, &[layer(false)])
-			.expect("passive layer paint succeeds");
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
-		assert!(output.contains("\x1b[2A\r\x1b[?25h"), "base caret at (0,0): {output:?}");
-
-		// An active layer without a frame cursor suppresses the base caret.
-		let mut blank = Frame::new(Size::new(2, 2));
-		blank.put(0, 0, "cc", Style::default());
-		renderer
-			.present_resolved(&base, &[], 3, 0, &[ResolvedLayer {
-				frame:   &blank,
-				x:       3,
-				y:       0,
-				src_top: 0,
-				rows:    2,
-				active:  true,
-			}])
-			.expect("cursorless active paint succeeds");
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
-		assert!(!output.contains("\x1b[?25h"), "no caret may show: {output:?}");
-	}
-
-	#[test]
-	fn wide_document_grapheme_cut_by_overlay_is_blank_not_torn() {
-		let mut base = Frame::new(Size::new(4, 1));
-		base.put(0, 0, "界x", Style::default());
-		let mut overlay = Frame::new(Size::new(1, 1));
-		overlay.put(0, 0, "O", Style::default());
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(4, 1);
-		renderer
-			.present(base.clone(), 1, 0)
-			.expect("base paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present_resolved(&base, &[], 1, 0, &[ResolvedLayer {
-				frame:   &overlay,
-				x:       1,
-				y:       0,
-				src_top: 0,
-				rows:    1,
-				active:  false,
-			}])
-			.expect("wide overlay paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.visible_rows(), [" Ox"]);
-	}
-
-	#[test]
-	fn damaged_present_diffs_away_stored_overlay() {
-		let base = document(&["base000", "base111"]);
 		let mut overlay = Frame::new(Size::new(2, 1));
-		overlay.put(0, 0, "OV", Style::default());
+		overlay.put(0, 0, "ov", Style::default());
+		overlay.set_cursor(1, 0);
+		let layer =
+			|active| ResolvedLayer { frame: &overlay, x: 3, y: 1, src_top: 0, rows: 1, active };
 		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 2);
 		renderer
-			.present(base.clone(), 2, 0)
-			.expect("base paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
+			.present_resolved(&base, &[], 2, &[layer(true)])
+			.unwrap();
+		assert_eq!(renderer.screen_cursor(), Some((1, 4)));
 		renderer
-			.present_resolved(&base, &[], 2, 0, &[ResolvedLayer {
-				frame:   &overlay,
-				x:       2,
-				y:       1,
-				src_top: 0,
-				rows:    1,
-				active:  false,
-			}])
-			.expect("overlay paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		let stats = renderer
-			.present_damaged(&base, &[], 2, 0)
-			.expect("damaged clearing paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert!(stats.runs > 0);
-		assert_eq!(terminal.visible_rows(), ["base000", "base111"]);
+			.present_resolved(&base, &[], 2, &[layer(false)])
+			.unwrap();
+		assert_eq!(renderer.screen_cursor(), Some((0, 0)));
 	}
 
 	#[test]
-	fn layer_only_kitty_image_still_transmits_and_places() {
-		let base = document(&["base000", "base111"]);
-		let mut overlay = Frame::new(Size::new(3, 1));
-		for col in 0..2 {
-			overlay.put_image_cell(col, 0, 7, 0, col, 1, 2);
-		}
+	fn damaged_present_updates_only_declared_rows() {
 		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_graphics(Graphics::KittyPlaceholders);
-		renderer
-			.register_image(7, b"\x89PNG\r\n\x1a\nsmall".to_vec())
-			.expect("image registration succeeds");
-		renderer
-			.present(base.clone(), 2, 0)
-			.expect("base paint succeeds");
+		renderer.present(frame(8, &["one", "two"]), 2, &[]).unwrap();
 		renderer.writer_mut().clear();
-
-		renderer
-			.present_resolved(&base, &[], 2, 0, &[ResolvedLayer {
-				frame:   &overlay,
-				x:       0,
-				y:       0,
-				src_top: 0,
-				rows:    1,
-				active:  false,
-			}])
-			.expect("overlay image paint succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		assert!(
-			output.contains("\x1b_G"),
-			"an image referenced only by a layer still uploads: {output:?}"
-		);
-
-		renderer.writer_mut().clear();
-		renderer
-			.present_resolved(&base, &[], 2, 0, &[ResolvedLayer {
-				frame:   &overlay,
-				x:       0,
-				y:       0,
-				src_top: 0,
-				rows:    1,
-				active:  false,
-			}])
-			.expect("steady overlay paint succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		assert!(!output.contains("\x1b_G"), "uploads happen once: {output:?}");
+		let next = frame(8, &["ignored", "changed"]);
+		renderer.present_resolved(&next, &[(1, 2)], 2, &[]).unwrap();
+		assert_eq!(renderer.screen_text(), ["one", "changed"]);
 	}
 
 	#[test]
-	fn conpty_chunker_prefers_newlines_within_sixteen_kibibytes() {
-		let line = "x".repeat(8 * 1024 - 1) + "\n";
-		let payload = line.repeat(5);
-		assert_eq!(payload.len(), 40 * 1024);
-		let chunks =
-			ConptyChunks::new(payload.as_bytes(), MAX_CONPTY_WRITE_CHUNK_BYTES).collect::<Vec<_>>();
-		assert!(chunks.len() > 1);
-		assert!(
-			chunks
-				.iter()
-				.all(|chunk| chunk.len() <= MAX_CONPTY_WRITE_CHUNK_BYTES)
-		);
-		assert!(
-			chunks[..chunks.len() - 1]
-				.iter()
-				.all(|chunk| chunk.ends_with(b"\n"))
-		);
-		assert_eq!(chunks.concat(), payload.as_bytes());
-	}
-
-	#[test]
-	fn conpty_chunker_extends_past_an_escape_sequence_without_newlines() {
-		let mut payload = vec![b'x'; MAX_CONPTY_WRITE_CHUNK_BYTES - 2];
-		payload.extend_from_slice(b"\x1b]8;;https://example.test/a-very-long-link\x1b\\");
-		payload.extend(iter::repeat_n(b'y', MAX_CONPTY_WRITE_CHUNK_BYTES));
-		let chunks = ConptyChunks::new(&payload, MAX_CONPTY_WRITE_CHUNK_BYTES).collect::<Vec<_>>();
-		assert!(chunks[0].len() > MAX_CONPTY_WRITE_CHUNK_BYTES);
-		assert!(chunks[0].ends_with(b"\x1b\\"));
-		assert_eq!(chunks.concat(), payload);
-	}
-
-	#[test]
-	fn backlog_disconnects_only_after_sixty_four_mibibytes() {
-		let mut guard = OutputBacklogGuard::default();
-		assert!(!guard.queue(MAX_OUTPUT_BACKLOG_BYTES - 1));
-		assert!(!guard.queue(1));
-		assert!(guard.queue(1));
-		guard.flushed();
-		assert!(!guard.queue(1));
-	}
-	#[test]
-	fn hyperlink_capability_materializes_only_the_link_label() {
-		let target = "https://example.test/docs";
-		let link_style = Style::new().underline().link(target);
-		let id = link_style.link.expect("non-empty URL is interned").get();
-		let mut frame = Frame::new(Size::new(12, 1));
-		frame.put(0, 0, "go ", Style::new());
-		frame.put(3, 0, "label", link_style);
-		frame.put(8, 0, " end", Style::new());
-
+	fn identical_viewport_writes_nothing() {
 		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_hyperlinks(true);
+		renderer.present(frame(8, &["one", "two"]), 2, &[]).unwrap();
+		renderer.writer_mut().clear();
+		let stats = renderer.present(frame(8, &["one", "two"]), 2, &[]).unwrap();
+		assert_eq!(stats, super::PaintStats::default());
+		assert!(renderer.writer_mut().is_empty());
+	}
+	#[test]
+	fn hardware_cursor_moves_without_repainting_cells() {
+		let mut first = frame(8, &["one", "two"]);
+		first.set_cursor(1, 1);
+		let mut renderer = Renderer::new(Vec::new());
+		renderer.present(first, 2, &[]).unwrap();
+		renderer.writer_mut().clear();
+		let mut second = frame(8, &["one", "two"]);
+		second.set_cursor(4, 0);
+		let stats = renderer.present(second, 2, &[]).unwrap();
+		assert_eq!(stats.changed_cells, 0);
+		assert_eq!(stats.runs, 0);
+		assert!(stats.bytes > 0);
+		assert_eq!(renderer.screen_cursor(), Some((0, 4)));
+	}
+
+	#[test]
+	fn kitty_images_upload_place_and_materialize_cells() {
+		let mut image = Frame::new(Size::new(3, 2));
+		image.put_image_cell(0, 0, 0x12_34_56, 0, 0, 2, 3);
+		image.put_image_cell(2, 1, 0x12_34_56, 1, 2, 2, 3);
+		let mut renderer = Renderer::new(Vec::new());
 		renderer
-			.present(frame, 1, 0)
-			.expect("hyperlinked frame paints");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		let linked = format!("\x1b]8;id={id};{target}\x1b\\label\x1b]8;;\x1b\\");
-		assert!(output.contains(&linked), "{output:?}");
-		assert_eq!(output.matches("\x1b]8;id=").count(), 1);
-		assert_eq!(output.matches("\x1b]8;;\x1b\\").count(), 1);
+			.register_image(0x12_34_56, vec![0x5a; 3073])
+			.unwrap();
+		renderer.present(image, 2, &[]).unwrap();
+		let output = String::from_utf8(renderer.into_inner()).unwrap();
+		assert!(output.contains("a=t,i=1193046"));
+		assert!(output.contains("a=p,U=1,i=1193046,p=1027,r=2,c=3"));
+		assert!(output.contains("\u{10eeee}"));
 	}
 
 	#[test]
-	fn disabled_hyperlinks_are_byte_identical_to_plain_styled_cells() {
-		let mut linked = Frame::new(Size::new(8, 1));
-		linked.put(0, 0, "label", Style::new().underline().link("https://example.test"));
-		let mut plain = Frame::new(Size::new(8, 1));
-		plain.put(0, 0, "label", Style::new().underline());
-
-		let mut linked_renderer = Renderer::new(Vec::new());
-		let mut plain_renderer = Renderer::new(Vec::new());
-		linked_renderer
-			.present(linked, 1, 0)
-			.expect("disabled hyperlink frame paints");
-		plain_renderer
-			.present(plain, 1, 0)
-			.expect("plain frame paints");
-		assert_eq!(linked_renderer.writer_mut(), plain_renderer.writer_mut());
-	}
-
-	#[test]
-	fn iterm2_graphics_dispatches_registered_png_post_pass() {
-		let mut frame = Frame::new(Size::new(2, 1));
+	fn iterm2_graphics_dispatches_registered_png() {
+		let mut image = Frame::new(Size::new(2, 1));
 		for col in 0..2 {
-			frame.put_image_cell(col, 0, 7, 0, col, 1, 2);
+			image.put_image_cell(col, 0, 7, 0, col, 1, 2);
 		}
 		let mut renderer = Renderer::new(Vec::new());
 		renderer.set_graphics(Graphics::Iterm2);
 		renderer
 			.register_image(7, b"\x89PNG\r\n\x1a\nsmall".to_vec())
-			.expect("image registration succeeds");
-		renderer.present(frame, 1, 0).expect("iTerm2 frame paints");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
+			.unwrap();
+		renderer.present(image, 1, &[]).unwrap();
+		let output = String::from_utf8(renderer.into_inner()).unwrap();
 		assert!(output.contains("\x1b]1337;File=inline=1;"));
 	}
 
 	#[test]
-	fn disabled_synchronized_output_only_removes_wrappers_from_every_paint_path() {
-		let initial = document(&["one", "two", "three"]);
-		let changed = document(&["one", "TWO", "three"]);
-		let mut synchronized = Renderer::new(Vec::new());
+	fn synchronized_output_can_be_disabled_without_changing_payload() {
+		let viewport = frame(8, &["one", "two"]);
+		let mut synced = Renderer::new(Vec::new());
 		let mut plain = Renderer::new(Vec::new());
 		plain.set_sync_output(false);
-
-		synchronized
-			.present(initial.clone(), 2, 1)
-			.expect("synchronized full paint succeeds");
-		plain
-			.present(initial, 2, 1)
-			.expect("plain full paint succeeds");
-		let synchronized_output =
-			String::from_utf8(mem::take(synchronized.writer_mut())).expect("ANSI is UTF-8");
-		let plain_output = String::from_utf8(mem::take(plain.writer_mut())).expect("ANSI is UTF-8");
-		assert_eq!(without_sync_markers(&synchronized_output), plain_output);
-		assert!(!plain_output.contains(SYNC_OUTPUT_BEGIN));
-		assert!(!plain_output.contains(SYNC_OUTPUT_END));
-
-		synchronized.writer_mut().clear();
-		plain.writer_mut().clear();
-		synchronized
-			.present(changed.clone(), 2, 1)
-			.expect("synchronized incremental paint succeeds");
-		plain
-			.present(changed.clone(), 2, 1)
-			.expect("plain incremental paint succeeds");
-		let synchronized_output =
-			String::from_utf8(synchronized.writer_mut().clone()).expect("ANSI is UTF-8");
-		let plain_output = String::from_utf8(plain.writer_mut().clone()).expect("ANSI is UTF-8");
-		assert_eq!(without_sync_markers(&synchronized_output), plain_output);
-		assert!(!plain_output.contains(SYNC_OUTPUT_BEGIN));
-		assert!(!plain_output.contains(SYNC_OUTPUT_END));
-
-		synchronized.writer_mut().clear();
-		plain.writer_mut().clear();
-		synchronized
-			.preview(&changed, 2, "\x1b[?1049h")
-			.expect("synchronized preview succeeds");
-		plain
-			.preview(&changed, 2, "\x1b[?1049h")
-			.expect("plain preview succeeds");
-		let synchronized_output =
-			String::from_utf8(synchronized.writer_mut().clone()).expect("ANSI is UTF-8");
-		let plain_output = String::from_utf8(plain.writer_mut().clone()).expect("ANSI is UTF-8");
-		assert_eq!(without_sync_markers(&synchronized_output), plain_output);
-		assert!(!plain_output.contains(SYNC_OUTPUT_BEGIN));
-		assert!(!plain_output.contains(SYNC_OUTPUT_END));
-	}
-
-	#[test]
-	fn screen_to_scrollback_precedes_viewport_clear_only_when_enabled() {
-		let mut ordinary = Renderer::new(Vec::new());
-		ordinary
-			.present(document(&["one", "two"]), 2, 0)
-			.expect("ordinary paint succeeds");
-		let ordinary_output =
-			String::from_utf8(ordinary.writer_mut().clone()).expect("ANSI is UTF-8");
-		assert!(!ordinary_output.contains("\x1b[22J"));
-
-		let mut preserving = Renderer::new(Vec::new());
-		preserving.set_screen_to_scrollback(true);
-		preserving
-			.present(document(&["one", "two"]), 2, 0)
-			.expect("scrollback-preserving paint succeeds");
-		let preserving_output =
-			String::from_utf8(preserving.writer_mut().clone()).expect("ANSI is UTF-8");
-		assert!(preserving_output.contains("\x1b[22J\x1b[2J\x1b[H"));
-	}
-
-	#[test]
-	fn soft_wrapped_rows_join_on_screen_and_in_history() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 3);
-
-		// "abcdefgh" fills the row exactly and continues mid-word on "ij".
-		renderer
-			.present(soft_document(&["abcdefgh", "ij", "tail"], &[0]), 3, 0)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert!(terminal.row_wrapped(1), "the continuation row carries the wrap attribute");
-		assert_eq!(terminal.visible_rows(), ["abcdefgh", "ij", "tail"]);
-
-		// Scrolling the pair into native scrollback keeps the join: copy
-		// reads one unbroken line.
-		renderer
-			.present(soft_document(&["abcdefgh", "ij", "tail", "x", "y"], &[0]), 3, 4)
-			.expect("growth paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["abcdefghij"]);
-		assert_eq!(terminal.visible_rows(), ["tail", "x", "y"]);
-	}
-
-	#[test]
-	fn scroll_append_arms_joins_for_committed_pairs() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 3);
-		renderer
-			.present(document(&["one", "two", "three"]), 3, 3)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present(soft_document(&["one", "two", "three", "abcdefgh", "ij"], &[3]), 3, 5)
-			.expect("scroll paint succeeds");
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
-		terminal.apply(&output);
-		assert!(output.contains("\x1b[?7h"), "committing a joined pair enables autowrap");
-		assert!(output.contains("\x1b[?7l"), "autowrap is restored after the commit");
-		assert_eq!(terminal.history, ["one", "two"]);
-		assert_eq!(terminal.visible_rows(), ["three", "abcdefgh", "ij"]);
-		assert!(terminal.row_wrapped(2), "the committed continuation soft-wraps on screen");
-
-		renderer
-			.present(soft_document(&["one", "two", "three", "abcdefgh", "ij", "z", "w"], &[3]), 3, 7)
-			.expect("second growth succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["one", "two", "three", "abcdefgh"]);
-
-		renderer
-			.present(
-				soft_document(&["one", "two", "three", "abcdefgh", "ij", "z", "w", "v", "u"], &[3]),
-				3,
-				9,
-			)
-			.expect("third growth succeeds");
-		apply_paint(&mut renderer, &mut terminal);
+		synced.present(viewport.clone(), 2, &[]).unwrap();
+		plain.present(viewport, 2, &[]).unwrap();
+		let synced = String::from_utf8(synced.into_inner()).unwrap();
+		let plain = String::from_utf8(plain.into_inner()).unwrap();
 		assert_eq!(
-			terminal.history,
-			["one", "two", "three", "abcdefghij", "z"],
-			"the soft pair merges as it scrolls into history"
-		);
-		assert_eq!(terminal.visible_rows(), ["w", "v", "u"]);
-	}
-
-	#[test]
-	fn wrap_boundary_flips_reconcile_in_place() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 2);
-		renderer
-			.present(soft_document(&["abcdefgh", "ij"], &[0]), 2, 0)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert!(terminal.row_wrapped(1));
-
-		// Same cells, hard boundary: both rows are erased and re-printed
-		// in place — never through a viewport clear, which would push
-		// duplicated history on scrollback-preserving terminals.
-		renderer
-			.present(document(&["abcdefgh", "ij"]), 2, 0)
-			.expect("hardening paint succeeds");
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
-		terminal.apply(&output);
-		assert!(!output.contains("\x1b[H"), "reconciliation never clears the viewport");
-		assert!(output.contains("\x1b[2K"), "the stale soft rows are erased in place");
-		assert!(!terminal.row_wrapped(1), "the boundary reads hard again");
-		assert_eq!(terminal.visible_rows(), ["abcdefgh", "ij"]);
-
-		// Flagging it again re-arms the join without a repaint of the
-		// rest of the viewport.
-		renderer
-			.present(soft_document(&["abcdefgh", "ij"], &[0]), 2, 0)
-			.expect("softening paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert!(terminal.row_wrapped(1), "the boundary soft-wraps again");
-		assert_eq!(terminal.visible_rows(), ["abcdefgh", "ij"]);
-	}
-
-	#[test]
-	fn char_wrapped_source_spaces_survive_history_joins() {
-		use crate::{
-			UiContext,
-			component::{Component, PaintCtx},
-			components::TextLeaf,
-			frame::Rect,
-			props::Prop,
-		};
-		let ctx = UiContext::default();
-		// The real space inside "ab cdef" lands in the final column of a
-		// width-3 row and is stored as a blank cell — the flag, not the
-		// cells, certifies the row as exactly full.
-		let mut leaf = TextLeaf::new().with(Prop::Wrap, "char").text("ab cdef");
-		let paint_into = |leaf: &mut TextLeaf, frame: &mut Frame| {
-			let mut hits = Vec::new();
-			let mut wakes = Vec::new();
-			let mut pc = PaintCtx::new(frame, &ctx, &mut hits, &mut wakes);
-			leaf.paint(&mut pc, Rect::new(0, 0, 3, 3));
-		};
-
-		let mut first = Frame::new(Size::new(3, 3));
-		paint_into(&mut leaf, &mut first);
-		assert!(first.soft_wrap(0) && first.soft_wrap(1));
-
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(3, 3);
-		renderer
-			.present(first, 3, 0)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert!(terminal.row_wrapped(1) && terminal.row_wrapped(2));
-
-		let mut grown = Frame::new(Size::new(3, 5));
-		paint_into(&mut leaf, &mut grown);
-		grown.put(0, 3, "x", Style::default());
-		grown.put(0, 4, "y", Style::default());
-		renderer
-			.present(grown, 3, 5)
-			.expect("growth paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["ab cde"], "the join keeps the written space");
-
-		let mut taller = Frame::new(Size::new(3, 7));
-		paint_into(&mut leaf, &mut taller);
-		for (offset, line) in ["x", "y", "z", "w"].iter().enumerate() {
-			taller.put(0, 3 + u16::try_from(offset).expect("small fixture"), line, Style::default());
-		}
-		renderer
-			.present(taller, 3, 7)
-			.expect("second growth succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(
-			terminal.history,
-			["ab cdef", "x"],
-			"copying the committed paragraph reproduces the source bytes"
-		);
-	}
-	#[test]
-	fn repeated_seam_advances_preserve_one_ordered_history_copy() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 3);
-
-		renderer
-			.present(document(&["row00", "row01", "work02", "work03", "footer"]), 3, 2)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present(document(&["row00", "row01", "row02", "work03", "work04", "footer"]), 3, 3)
-			.expect("first seam advance succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present(
-				document(&["row00", "row01", "row02", "row03", "work04", "work05", "footer"]),
-				3,
-				4,
-			)
-			.expect("second seam advance succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present(
-				document(&["row00", "row01", "row02", "row03", "row04", "work05", "work06", "footer"]),
-				3,
-				5,
-			)
-			.expect("third seam advance succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		assert_eq!(terminal.history, ["row00", "row01", "row02", "row03", "row04"]);
-		assert_eq!(terminal.visible_rows(), ["work05", "work06", "footer"]);
-	}
-
-	#[test]
-	fn live_panel_below_streaming_seam_stays_out_of_native_history() {
-		// Port of pi 7cff20cfd0 (#8793): while the transcript still streams,
-		// an anchored live panel below the streaming seam must never commit
-		// its scrolled-off rows into native scrollback, even as it outgrows
-		// the viewport on every growth frame. omp's commit ceiling is the
-		// caller-declared stable seam (`layout::stable_limit`,
-		// `scroll_append_to`), independent of which live region sits topmost:
-		// live rows below it — streaming tail and panel alike — are clipped,
-		// never frozen into history.
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(12, 8);
-		let transcript: Vec<String> = (0..5).map(|row| format!("HIST-{row}")).collect();
-
-		let mut lines: Vec<String> = transcript.clone();
-		lines.extend(["streaming".to_owned(), "BTW-0-0".to_owned(), "editor".to_owned()]);
-		let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-		renderer
-			.present(document_at_width(12, &refs), 8, 5)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		for tick in 1..=12u16 {
-			let mut lines: Vec<String> = transcript.clone();
-			lines.push(format!("tail-{tick}"));
-			lines.extend((0..=tick).map(|row| format!("BTW-{tick}-{row}")));
-			lines.push("editor".to_owned());
-			let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-			let stats = renderer
-				.present(document_at_width(12, &refs), 8, 5)
-				.expect("panel growth frame paints");
-			apply_paint(&mut renderer, &mut terminal);
-			if tick > 5 {
-				assert_eq!(
-					stats.committed_rows, 0,
-					"growth past the stable seam commits nothing (tick {tick})"
-				);
-			}
-		}
-
-		// Mid-stream native history holds exactly one copy of the finalized
-		// transcript prefix — zero rows of the growing panel or the mutable
-		// streaming tail.
-		assert_eq!(terminal.history, ["HIST-0", "HIST-1", "HIST-2", "HIST-3", "HIST-4"]);
-		assert!(
-			terminal
-				.history
-				.iter()
-				.all(|row| !row.starts_with("BTW-") && !row.starts_with("tail-")),
-			"no panel or streaming-tail row may reach native scrollback"
-		);
-		assert_eq!(renderer.committed_rows(), 5);
-		assert_eq!(terminal.visible_rows(), [
-			"BTW-12-6",
-			"BTW-12-7",
-			"BTW-12-8",
-			"BTW-12-9",
-			"BTW-12-10",
-			"BTW-12-11",
-			"BTW-12-12",
-			"editor"
-		]);
-	}
-
-	#[test]
-	fn initial_paint_commits_only_stable_overflow() {
-		let mut renderer = Renderer::new(Vec::new());
-
-		let stats = renderer
-			.present(document(&["one", "two", "three", "four"]), 2, 1)
-			.expect("paint succeeds");
-
-		assert!(stats.full_repaint);
-		assert_eq!(stats.committed_rows, 1);
-		assert_eq!(stats.clipped_rows, 1);
-		assert_eq!(renderer.committed_rows(), 1);
-	}
-
-	#[test]
-	fn clipped_stable_growth_is_deferred_without_replay() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 2);
-		renderer
-			.present(document(&["one", "two", "three", "four", "five"]), 2, 1)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		let stats = renderer
-			.present(document(&["one", "two", "three", "FOUR", "five", "six", "seven"]), 2, 2)
-			.expect("clipped stable growth succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		terminal.apply(&output);
-
-		assert_eq!(stats.committed_rows, 0);
-		assert_eq!(stats.clipped_rows, 4);
-		assert_eq!(renderer.committed_rows(), 1);
-		assert_eq!(output.matches("\r\n").count(), 0);
-		assert_eq!(terminal.history, ["one"]);
-		assert_eq!(terminal.visible_rows(), ["six", "seven"]);
-
-		renderer.writer_mut().clear();
-		let error = renderer
-			.present(document(&["one", "TWO", "three", "FOUR", "five", "six", "seven"]), 2, 2)
-			.expect_err("deferred stable rows remain immutable");
-		assert_eq!(error.kind(), ErrorKind::InvalidData);
-		assert_eq!(renderer.writer_mut().as_slice(), &[] as &[u8]);
-	}
-
-	#[test]
-	fn visible_mutation_uses_relative_cursor_without_scrolling() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.present(document(&["one", "two", "three", "four"]), 2, 2)
-			.expect("first paint succeeds");
-		renderer.writer_mut().clear();
-
-		let stats = renderer
-			.present(document(&["one", "two", "THREE", "four"]), 2, 2)
-			.expect("diff succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-
-		assert_eq!(stats.committed_rows, 0);
-		assert!(stats.changed_cells > 0);
-		assert!(output.contains("\x1b[1A\r"));
-		assert!(output.contains("\x1b[1B\r"));
-		assert!(!output.contains("\r\n"));
-		assert!(!output.contains("\x1b[1;"));
-		assert!(!output.contains("\x1b[2;"));
-		assert!(!output.contains("\x1b[2J"));
-		assert!(!output.contains("\x1b[3J"));
-	}
-
-	#[test]
-	fn committed_mutation_is_rejected_without_output() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.present(document(&["one", "two", "three", "four"]), 2, 2)
-			.expect("first paint succeeds");
-		renderer.writer_mut().clear();
-
-		let error = renderer
-			.present(document(&["ONE", "two", "three", "four"]), 2, 2)
-			.expect_err("stable mutation must fail");
-
-		assert_eq!(error.kind(), ErrorKind::InvalidData);
-		assert_eq!(renderer.writer_mut().as_slice(), &[] as &[u8]);
-		assert_eq!(renderer.committed_rows(), 2);
-	}
-
-	#[test]
-	fn damaged_stable_mutation_is_rejected_without_output() {
-		let mut renderer = Renderer::new(Vec::new());
-		let initial = document(&["one", "two", "three", "four"]);
-		renderer
-			.present_damaged(&initial, &[(0, 4)], 2, 2)
-			.expect("first paint succeeds");
-		renderer.writer_mut().clear();
-
-		let changed = document(&["ONE", "two", "three", "four"]);
-		let error = renderer
-			.present_damaged(&changed, &[(0, 1)], 2, 2)
-			.expect_err("reported stable mutation must fail");
-
-		assert_eq!(error.kind(), ErrorKind::InvalidData);
-		assert_eq!(renderer.writer_mut().as_slice(), &[] as &[u8]);
-		assert_eq!(renderer.committed_rows(), 2);
-	}
-
-	#[test]
-	fn seam_advance_corrects_final_row_then_scrolls_once() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 2);
-		renderer
-			.present(document(&["one", "two", "three", "four"]), 2, 2)
-			.expect("first paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		let stats = renderer
-			.present(document(&["one", "two", "THREE", "four", "five"]), 2, 3)
-			.expect("seam commit succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-
-		assert_eq!(stats.committed_rows, 1);
-		assert_eq!(renderer.committed_rows(), 3);
-		assert_eq!(output.matches("\r\n").count(), 1);
-		assert!(output.contains(VIEWPORT_BOTTOM));
-		assert!(output.contains("THREE"));
-		assert!(output.contains("five"));
-		terminal.apply(&output);
-		assert_eq!(terminal.history, ["one", "two", "THREE"]);
-		assert_eq!(terminal.visible_rows(), ["four", "five"]);
-		assert!(!output.contains("\x1b[2J"));
-		assert!(!output.contains("\x1b[3J"));
-	}
-
-	#[test]
-	fn scroll_append_keeps_adjacent_box_edges_separate() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 5);
-		renderer
-			.present(
-				document(&["old0", "old1", "╰ live─╯", "", "╭──────╮", "│ body │", "footer"]),
-				5,
-				2,
-			)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present(
-				document(&["old0", "old1", "╰──────╯", "", "╭──────╮", "│ body │", "new", "footer"]),
-				5,
-				3,
-			)
-			.expect("box boundary commit succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		terminal.apply(&output);
-
-		assert_eq!(output.matches("\r\n").count(), 1);
-		assert!(output.contains(VIEWPORT_BOTTOM));
-		assert_eq!(terminal.history, ["old0", "old1", "╰──────╯"]);
-		assert_eq!(terminal.visible_rows(), ["", "╭──────╮", "│ body │", "new", "footer"]);
-	}
-
-	#[test]
-	fn margin_commit_scrolls_history_without_touching_pinned_rows() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_margin_scrollback(true);
-		let mut terminal = TerminalModel::new(8, 4);
-		renderer
-			.present(document(&["old0", "old1", "work2", "editor", "footer"]), 4, 2)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		let stats = renderer
-			.present(document(&["old0", "old1", "row2", "row3", "editor", "footer"]), 4, 4)
-			.expect("margin commit succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		terminal.apply(&output);
-
-		assert_eq!(stats.committed_rows, 1);
-		assert!(output.contains("\x1b[1;2r"));
-		assert!(output.contains("\x1b[r"));
-		assert_eq!(output.matches("\r\n").count(), 1);
-		assert!(
-			!output.contains("editor") && !output.contains("footer"),
-			"pinned rows must never be re-emitted"
-		);
-		assert_eq!(terminal.history, ["old0", "old1"]);
-		assert_eq!(terminal.visible_rows(), ["row2", "row3", "editor", "footer"]);
-	}
-
-	#[test]
-	fn margin_commit_matches_whole_screen_scroll_end_state() {
-		let mut margin = Renderer::new(Vec::new());
-		margin.set_margin_scrollback(true);
-		let mut plain = Renderer::new(Vec::new());
-		let mut margin_terminal = TerminalModel::new(8, 4);
-		let mut plain_terminal = TerminalModel::new(8, 4);
-
-		for (renderer, terminal) in
-			[(&mut margin, &mut margin_terminal), (&mut plain, &mut plain_terminal)]
-		{
-			renderer
-				.present(document(&["old0", "old1", "work2", "editor", "footer"]), 4, 2)
-				.expect("initial paint succeeds");
-			apply_paint(renderer, terminal);
-			renderer
-				.present(document(&["old0", "old1", "row2", "row3", "editor", "footer"]), 4, 4)
-				.expect("commit succeeds");
-			apply_paint(renderer, terminal);
-		}
-
-		assert_eq!(margin_terminal.history, plain_terminal.history);
-		assert_eq!(margin_terminal.visible_rows(), plain_terminal.visible_rows());
-	}
-
-	#[test]
-	fn margin_commit_repaints_changed_live_rows_in_place() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_margin_scrollback(true);
-		let mut terminal = TerminalModel::new(8, 4);
-		renderer
-			.present(document(&["old0", "old1", "work2", "spin0", "footer"]), 4, 2)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present(document(&["old0", "old1", "row2", "row3", "pulse", "footer"]), 4, 4)
-			.expect("margin commit succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		terminal.apply(&output);
-
-		assert!(output.contains("\x1b[1;2r"), "animated live rows must not shrink the pin");
-		assert!(output.contains("pulse"), "changed live cells repaint in place");
-		assert!(!output.contains("footer"), "unchanged pinned rows stay untouched");
-		assert_eq!(terminal.history, ["old0", "old1"]);
-		assert_eq!(terminal.visible_rows(), ["row2", "row3", "pulse", "footer"]);
-	}
-
-	#[test]
-	fn margin_commit_falls_back_when_stable_seam_reaches_screen_bottom() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_margin_scrollback(true);
-		let mut terminal = TerminalModel::new(8, 4);
-		renderer
-			.present(document(&["old0", "old1", "work2", "editor", "footer"]), 4, 2)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present(document(&["old0", "old1", "row2", "row3", "editor", "footer"]), 4, 6)
-			.expect("fully stable commit succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		terminal.apply(&output);
-
-		assert!(
-			!output.contains("\x1b[1;"),
-			"a seam at the screen bottom must use the whole-screen scroll"
-		);
-		assert_eq!(terminal.history, ["old0", "old1"]);
-		assert_eq!(terminal.visible_rows(), ["row2", "row3", "editor", "footer"]);
-	}
-
-	#[test]
-	fn growing_mutable_suffix_is_clipped_without_committing_snapshots() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.present(document(&["one", "two", "three", "four"]), 2, 2)
-			.expect("first paint succeeds");
-		renderer.writer_mut().clear();
-
-		let stats = renderer
-			.present(document(&["one", "two", "three", "four", "five"]), 2, 2)
-			.expect("virtual shift succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-
-		assert_eq!(stats.committed_rows, 0);
-		assert_eq!(stats.clipped_rows, 1);
-		assert_eq!(renderer.committed_rows(), 2);
-		assert!(stats.changed_cells > 0);
-		assert!(output.contains("\x1b[1A\r"));
-		assert!(output.contains("\x1b[1C"));
-		assert!(!output.contains("\x1b[1;"));
-		assert!(!output.contains("\x1b[2;"));
-		assert!(!output.contains("\r\n"));
-	}
-
-	#[test]
-	fn live_collapse_below_history_is_rejected_until_rebuild() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.present(document(&["one", "two", "three", "four"]), 2, 2)
-			.expect("first paint succeeds");
-		renderer.writer_mut().clear();
-
-		let error = renderer
-			.present(document(&["one", "two", "three"]), 2, 2)
-			.expect_err("a document tail shorter than committed history must be rejected");
-		assert_eq!(error.kind(), ErrorKind::InvalidData);
-		assert_eq!(renderer.writer_mut().as_slice(), &[] as &[u8]);
-
-		renderer
-			.rebuild(document(&["one", "two", "three"]), 2, 2, "")
-			.expect("rebuild accepts the shorter document");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		assert!(output.contains("\x1b[3J"));
-		assert_eq!(renderer.committed_rows(), 1);
-	}
-
-	#[test]
-	fn stable_boundary_cannot_retreat() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.present(document(&["one", "two", "three"]), 2, 2)
-			.expect("first paint succeeds");
-		renderer.writer_mut().clear();
-
-		let error = renderer
-			.present(document(&["one", "two", "three"]), 2, 1)
-			.expect_err("retreat must fail");
-
-		assert_eq!(error.kind(), ErrorKind::InvalidData);
-		assert_eq!(renderer.writer_mut().as_slice(), &[] as &[u8]);
-	}
-
-	#[test]
-	fn resize_preview_leaves_normal_renderer_state_untouched() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.present(document(&["row00", "row01", "work02", "footer"]), 2, 2)
-			.expect("initial paint succeeds");
-		renderer.writer_mut().clear();
-
-		let preview = document(&["new00", "new01", "live02", "live03", "footer"]);
-		let stats = renderer
-			.preview(&preview, 3, "\x1b[?1049h")
-			.expect("alternate viewport preview succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-
-		assert!(stats.full_repaint);
-		assert_eq!(renderer.committed_rows(), 2);
-		assert!(output.contains("\x1b[?1049h"));
-		assert!(output.contains("live02"));
-		assert!(output.contains("footer"));
-		assert!(!output.contains("new00"));
-		assert!(!output.contains("\x1b[3J"));
-
-		renderer.writer_mut().clear();
-		let stats = renderer
-			.present(document(&["row00", "row01", "work02", "footer"]), 2, 2)
-			.expect("normal state still matches its pre-preview frame");
-		assert_eq!(stats.bytes, 0);
-	}
-
-	#[test]
-	fn settled_resize_clears_and_rebuilds_history_once() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut terminal = TerminalModel::new(8, 3);
-		renderer
-			.present(document(&["old00", "old01", "old02", "old03", "old04"]), 3, 4)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["old00", "old01"]);
-
-		terminal.resize(8, 2);
-		let stats = renderer
-			.rebuild(document(&["new00", "new01", "new02", "live03", "footer"]), 2, 3, "\x1b[?1049l")
-			.expect("settled resize rebuild succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-
-		let sync = output.find(SYNC_OUTPUT_BEGIN).expect("synchronized paint");
-		let alt_exit = output.find("\x1b[?1049l").expect("alternate-buffer exit");
-		let clear = output.find(REBUILD_HISTORY).expect("history clear");
-		assert!(sync < alt_exit && alt_exit < clear);
-		assert_eq!(output.matches("\x1b[3J").count(), 1);
-		assert!(!output.contains("\x1b[2J"));
-		assert!(stats.full_repaint);
-		assert_eq!(stats.committed_rows, 3);
-
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["new00", "new01", "new02"]);
-		assert_eq!(terminal.visible_rows(), ["live03", "footer"]);
-
-		let stats = renderer
-			.present(document(&["new00", "new01", "new02", "live03", "footer"]), 2, 3)
-			.expect("incremental rendering resumes from rebuilt state");
-		assert_eq!(stats.bytes, 0);
-
-		let stats = renderer
-			.present(document(&["new00", "new01", "new02", "new03", "live04", "footer"]), 2, 4)
-			.expect("immutable seam advances after the rebuild");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-		assert_eq!(stats.committed_rows, 1);
-		assert!(!output.contains("\x1b[3J"));
-
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["new00", "new01", "new02", "new03"]);
-		assert_eq!(terminal.visible_rows(), ["live04", "footer"]);
-	}
-
-	#[test]
-	fn multiplexer_first_rebuild_keeps_existing_shell_history() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		let mut terminal = TerminalModel::new(8, 2);
-		terminal.history.push("shell-output".to_owned());
-		renderer
-			.rebuild(document(&["app0", "app1"]), 2, 0, "")
-			.expect("initial multiplexer paint succeeds");
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(!output.contains("\x1b[3J"));
-		terminal.apply(&output);
-		assert_eq!(terminal.history, ["shell-output"]);
-		assert_eq!(terminal.visible_rows(), ["app0", "app1"]);
-	}
-
-	#[test]
-	fn resize_scrollback_append_replays_without_erasing_history() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		renderer.set_resize_scrollback(ResizeScrollbackMode::Append);
-		renderer
-			.present(document_at_width(8, &["r0", "r1", "r2", "r3"]), 2, 4)
-			.unwrap();
-		renderer.writer_mut().clear();
-
-		renderer
-			.rebuild(document_at_width(6, &["r0", "r1", "r2", "r3"]), 2, 4, "")
-			.unwrap();
-		let output = String::from_utf8(renderer.writer_mut().clone()).unwrap();
-		assert!(output.contains("\x1b[2J"));
-		assert!(!output.contains("\x1b[3J"));
-	}
-
-	#[test]
-	fn resize_scrollback_rebuild_erases_history_before_replay() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		renderer.set_resize_scrollback(ResizeScrollbackMode::Rebuild);
-		renderer
-			.present(document_at_width(8, &["r0", "r1", "r2", "r3"]), 2, 4)
-			.unwrap();
-		renderer.writer_mut().clear();
-
-		renderer
-			.rebuild(document_at_width(6, &["r0", "r1", "r2", "r3"]), 2, 4, "")
-			.unwrap();
-		let output = String::from_utf8(renderer.writer_mut().clone()).unwrap();
-		assert_eq!(output.matches("\x1b[3J").count(), 1);
-	}
-
-	#[test]
-	fn multiplexer_width_epoch_preserves_history_and_queued_output() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		let mut terminal = TerminalModel::new(8, 3);
-		renderer
-			.present(document_at_width(8, &["old00", "old01", "old02", "old03", "old04"]), 3, 4)
-			.expect("initial paint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["old00", "old01"]);
-
-		terminal.resize(6, 3);
-		renderer
-			.preview(&document_at_width(6, &["old00", "old01", "old02", "old03", "old04"]), 3, "")
-			.expect("resize preview succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-
-		let settled =
-			document_at_width(6, &["old00", "old01", "old02", "old03", "old04", "queued", "stream"]);
-		let stats = renderer
-			.rebuild(settled, 3, 6, "")
-			.expect("settled multiplexer repaint succeeds");
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert_eq!(stats.committed_rows, 2);
-		assert!(!output.contains("\x1b[3J"));
-		assert!(!output.contains("\x1b[2J"));
-		assert!(!output.contains("\x1b[22J"));
-		terminal.apply(&output);
-		assert_eq!(terminal.history, ["old00", "old01", "old02", "old03"]);
-		assert_eq!(terminal.visible_rows(), ["old04", "queued", "stream"]);
-
-		renderer
-			.present(
-				document_at_width(6, &[
-					"old00", "old01", "old02", "old03", "old04", "queued", "stream", "after",
-				]),
-				3,
-				7,
-			)
-			.expect("post-epoch append succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["old00", "old01", "old02", "old03", "old04"]);
-		assert_eq!(terminal.visible_rows(), ["queued", "stream", "after"]);
-		assert_eq!(renderer.epoch_commits.len(), 1, "adjacent commits share one epoch span");
-		assert_eq!(renderer.epoch_commits[0].frame_from, 2);
-		assert_eq!(renderer.epoch_commits[0].frame_to, 5);
-	}
-
-	#[test]
-	fn width_epoch_maps_non_prefix_append_before_trailing_root() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		let mut terminal = TerminalModel::new(8, 2);
-		renderer
-			.present(document_at_width(8, &["h0", "h1", "live", "footer"]), 2, 2)
-			.unwrap();
-		apply_paint(&mut renderer, &mut terminal);
-
-		terminal.resize(6, 2);
-		let baseline = document_at_width(6, &["h0", "h1", "live", "footer"]);
-		renderer.preview(&baseline, 2, "").unwrap();
-		apply_paint(&mut renderer, &mut terminal);
-		renderer.rebuild(baseline, 2, 2, "").unwrap();
-		apply_paint(&mut renderer, &mut terminal);
-
-		renderer
-			.present(document_at_width(6, &["h0", "h1", "live", "new-a", "new-b", "footer"]), 2, 5)
-			.expect("middle insertion maps around the retained footer");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["h0", "h1", "live", "new-a"]);
-		assert_eq!(terminal.visible_rows(), ["new-b", "footer"]);
-
-		renderer
-			.present(document_at_width(6, &["h0", "h1", "live", "new-a", "new-b", "status"]), 2, 5)
-			.expect("replaced trailing root remains viewport-local");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.history, ["h0", "h1", "live", "new-a"]);
-		assert_eq!(terminal.visible_rows(), ["new-b", "status"]);
-	}
-
-	#[test]
-	fn multiplexer_height_only_shrink_and_grow_preserve_the_commit_ledger() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		let frame = document_at_width(8, &["r0", "r1", "r2", "r3", "r4", "r5", "r6"]);
-		renderer.present(frame.clone(), 3, 7).unwrap();
-		assert_eq!(renderer.committed_rows(), 4);
-
-		renderer.rebuild(frame.clone(), 2, 7, "").unwrap();
-		assert_eq!(renderer.committed_rows(), 4, "height shrink does not rewrite the tape ledger");
-
-		renderer.rebuild(frame, 3, 7, "").unwrap();
-		assert_eq!(
-			renderer.committed_rows(),
-			4,
-			"the grow pulls the uncommitted row pushed at the scrollback tail first",
+			synced
+				.replace(SYNC_OUTPUT_BEGIN, "")
+				.replace(SYNC_OUTPUT_END, ""),
+			plain
 		);
 	}
 
 	#[test]
-	fn height_grow_uncommits_rows_after_a_commit_buries_the_pushed_tail() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		let initial = document_at_width(8, &["r0", "r1", "r2", "r3", "r4", "r5", "r6"]);
-		renderer.present(initial.clone(), 3, 7).unwrap();
-		renderer.rebuild(initial, 2, 7, "").unwrap();
-
-		let grown = document_at_width(8, &["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]);
-		renderer.present(grown.clone(), 2, 8).unwrap();
-		assert_eq!(renderer.committed_rows(), 5);
-
-		renderer.rebuild(grown, 3, 8, "").unwrap();
-		assert_eq!(
-			renderer.committed_rows(),
-			4,
-			"a later commit buried the pane-pushed row, so the grow pulled a committed row",
-		);
+	fn conpty_chunker_keeps_escape_sequences_whole() {
+		let mut payload = vec![b'x'; MAX_CONPTY_WRITE_CHUNK_BYTES - 2];
+		payload.extend_from_slice(b"\x1b[38;2;255;0;0mred");
+		let chunks = ConptyChunks::new(&payload, MAX_CONPTY_WRITE_CHUNK_BYTES).collect::<Vec<_>>();
+		assert_eq!(chunks.concat(), payload);
+		assert!(chunks.iter().all(|chunk| !chunk.ends_with(b"\x1b")));
 	}
 
 	#[test]
-	fn width_epoch_separates_host_height_shrink_from_append_overflow() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		let mut terminal = TerminalModel::new(8, 4);
-		let initial = ["r0", "r1", "r2", "r3", "r4", "r5", "r6"];
-		renderer
-			.present(document_at_width(8, &initial), 4, 7)
-			.unwrap();
-		apply_paint(&mut renderer, &mut terminal);
-
-		terminal.resize(6, 4);
-		let baseline = document_at_width(6, &initial);
-		renderer.preview(&baseline, 4, "").unwrap();
-		apply_paint(&mut renderer, &mut terminal);
-		renderer.rebuild(baseline, 4, 7, "").unwrap();
-		apply_paint(&mut renderer, &mut terminal);
-
-		// TerminalModel intentionally resets its screen on resize; model the
-		// occupied rows a real multiplexer moves into pane history on shrink.
-		terminal.history.extend(["r3".to_owned(), "r4".to_owned()]);
-		terminal.resize(6, 2);
-		let grown = document_at_width(6, &["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"]);
-		let stats = renderer
-			.rebuild(grown, 2, 9, "")
-			.expect("height shrink and append repaint succeeds");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(stats.committed_rows, 2, "host-owned shrink rows are not recommitted");
-		assert_eq!(terminal.history, ["r0", "r1", "r2", "r3", "r4", "r5", "r6"]);
-		assert_eq!(terminal.visible_rows(), ["r7", "r8"]);
+	fn backlog_disconnects_only_after_sixty_four_mibibytes() {
+		let mut guard = OutputBacklogGuard::default();
+		assert!(!guard.queue(MAX_OUTPUT_BACKLOG_BYTES));
+		assert!(guard.queue(1));
+		guard.flushed();
+		assert!(!guard.queue(1));
 	}
 
-	#[test]
-	fn width_epoch_backfills_finalized_growth_under_an_overlay() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_resize_in_place(true);
-		let mut terminal = TerminalModel::new(8, 3);
-		renderer
-			.present(document_at_width(8, &["p0", "p1", "p2", "p3", "p4"]), 3, 2)
-			.unwrap();
-		apply_paint(&mut renderer, &mut terminal);
+	struct FailingWriter;
 
-		terminal.resize(6, 3);
-		let baseline = document_at_width(6, &["p0", "p1", "p2", "p3", "p4"]);
-		renderer.preview(&baseline, 3, "").unwrap();
-		apply_paint(&mut renderer, &mut terminal);
-		renderer.rebuild(baseline, 3, 2, "").unwrap();
-		apply_paint(&mut renderer, &mut terminal);
-
-		let growth = document_at_width(6, &["p0", "p1", "p2", "p3", "p4", "p5", "p6"]);
-		let mut overlay = Frame::new(Size::new(2, 1));
-		overlay.put(0, 0, "OV", Style::default());
-		let layer = ResolvedLayer {
-			frame:   &overlay,
-			x:       0,
-			y:       0,
-			src_top: 0,
-			rows:    1,
-			active:  false,
-		};
-		let deferred = renderer
-			.present_resolved(&growth, &[(5, 7)], 3, 2, &[layer])
-			.expect("mutable growth stays viewport-local");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(deferred.committed_rows, 0);
-		assert_eq!(terminal.history, ["p0", "p1"]);
-
-		let finalized = renderer
-			.present_resolved(&growth, &[], 3, 7, &[layer])
-			.expect("finalization backfills the epoch seam");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(finalized.committed_rows, 2);
-		assert_eq!(terminal.history, ["p0", "p1", "p2", "p3"]);
-		assert!(terminal.history.iter().all(|row| !row.contains("OV")));
-
-		renderer
-			.present_ref(&growth, 3, 7)
-			.expect("overlay exit repaints raw cells");
-		apply_paint(&mut renderer, &mut terminal);
-		assert_eq!(terminal.visible_rows(), ["p4", "p5", "p6"]);
-	}
-
-	#[test]
-	fn kitty_direct_placement_survives_width_epoch_repaint() {
-		fn image_frame(width: u16) -> Frame {
-			let mut frame = Frame::new(Size::new(width, 3));
-			frame.put_image_cell(1, 1, 7, 0, 0, 1, 2);
-			frame.put_image_cell(2, 1, 7, 0, 1, 1, 2);
-			frame
+	impl io::Write for FailingWriter {
+		fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+			Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture failure"))
 		}
 
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_graphics(Graphics::KittyDirect);
-		renderer.set_resize_in_place(true);
-		renderer.register_image(7, vec![1, 2, 3]).unwrap();
-		renderer.present(image_frame(4), 3, 0).unwrap();
-		renderer.writer_mut().clear();
-		let resized = image_frame(6);
-		renderer.preview(&resized, 3, "").unwrap();
-		renderer.writer_mut().clear();
-		renderer.rebuild(resized, 3, 0, "").unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-
-		assert!(output.contains("a=p"), "the visible direct placement is refreshed");
-		assert!(!output.contains("a=d"), "width repaint must not delete the placement");
-		assert!(!output.contains("\x1b[3J"));
-		assert!(!output.contains("\x1b[2J"));
-	}
-
-	#[test]
-	fn hardware_cursor_moves_without_repainting_cells() {
-		let mut renderer = Renderer::new(Vec::new());
-		let mut first = document(&["one", "two"]);
-		first.set_cursor(1, 1);
-		renderer.present(first, 2, 2).expect("first paint succeeds");
-		renderer.writer_mut().clear();
-
-		let mut second = document(&["one", "two"]);
-		second.set_cursor(4, 0);
-		let stats = renderer
-			.present(second, 2, 2)
-			.expect("cursor move succeeds");
-		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
-
-		assert_eq!(stats.changed_cells, 0);
-		assert_eq!(stats.runs, 0);
-		assert!(stats.bytes > 0);
-		assert!(output.contains("\x1b[?25l"));
-		assert!(output.contains("\x1b[1A\r\x1b[4C\x1b[?25h"));
-		assert!(!output.contains("\r\n"));
-		assert!(!output.contains("\x1b[H"));
-	}
-
-	#[test]
-	fn identical_document_writes_nothing() {
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.present(document(&["one", "two"]), 2, 2)
-			.expect("first paint succeeds");
-		renderer.writer_mut().clear();
-
-		let stats = renderer
-			.present(document(&["one", "two"]), 2, 2)
-			.expect("second paint succeeds");
-
-		assert_eq!(stats.bytes, 0);
-		assert_eq!(renderer.writer_mut().as_slice(), &[] as &[u8]);
-	}
-
-	#[test]
-	fn kitty_images_upload_place_and_materialize_typed_cells() {
-		let mut frame = Frame::new(Size::new(3, 2));
-		frame.put_image_cell(0, 0, 0x12_34_56, 0, 0, 2, 3);
-		frame.put_image_cell(2, 1, 0x12_34_56, 1, 2, 2, 3);
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.register_image(0x12_34_56, vec![0x5a; 3073])
-			.unwrap();
-		renderer.present(frame, 2, 0).unwrap();
-		let output = String::from_utf8(renderer.into_inner()).unwrap();
-
-		// Transmission rides the synchronized paint, after the cursor hide,
-		// so a staged buffer switch in the leading sequence precedes it.
-		assert!(output.contains("\x1b_Gf=100,t=d,a=t,i=1193046,q=2,m=1;"));
-		assert!(output.contains("\x1b_Gm=0;"));
-		assert!(output.contains("\x1b_Ga=p,U=1,i=1193046,p=1027,r=2,c=3,q=2\x1b\\"));
-		assert!(output.contains("\u{10eeee}\u{0305}\u{0305}"));
-		assert!(output.contains("\u{10eeee}\u{030d}\u{030e}"));
-		// Image ID in the foreground, placement ID (2<<9|3 = 1027) in the
-		// underline color.
-		assert!(output.contains("38;2;18;52;86m"));
-		assert!(output.contains("58:2::0:4:3"));
-
-		let packets = output
-			.split("\x1b\\")
-			.filter_map(|piece| piece.find("\x1b_G").map(|start| &piece[start..]))
-			.filter(|packet| packet.contains(';'))
-			.collect::<Vec<_>>();
-		assert_eq!(packets.len(), 2);
-		assert!(
-			packets
-				.iter()
-				.all(|packet| packet.split_once(';').unwrap().1.len() <= 4096)
-		);
-	}
-
-	#[test]
-	fn clipped_kitty_image_uses_full_placement_without_scroll_rescaling() {
-		fn clipped_image(first_row: u16) -> Frame {
-			let mut frame = Frame::new(Size::new(8, 4));
-			for row in first_row..4 {
-				for col in 0..8 {
-					frame.put_image_cell(col, row, 7, row, col, 4, 8);
-				}
-			}
-			frame
-		}
-
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.register_image(7, vec![1, 2, 3]).unwrap();
-		renderer.present(clipped_image(3), 4, 0).unwrap();
-		let initial = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(initial.contains("\x1b_Ga=p,U=1,i=7,p=2056,r=4,c=8,q=2\x1b\\"));
-
-		for first_row in (0..3).rev() {
-			renderer.present(clipped_image(first_row), 4, 0).unwrap();
-			let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-			assert!(
-				!output.contains("\x1b_Ga=p"),
-				"declared 4x8 dimensions must not be re-placed when row {first_row} enters"
-			);
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
 		}
 	}
 
 	#[test]
-	fn distinct_cell_boxes_of_one_image_place_once_each_with_stable_ids() {
-		// Two boxes of image 7 in one frame: a 1x2 thumbnail and a 2x4 card.
-		let mut frame = Frame::new(Size::new(8, 3));
-		for col in 0..2 {
-			frame.put_image_cell(col, 0, 7, 0, col, 1, 2);
-		}
-		for row in 0..2 {
-			for col in 0..4 {
-				frame.put_image_cell(col, 1 + row, 7, row, col, 2, 4);
-			}
-		}
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.register_image(7, b"\x89PNG\r\n\x1a\nsmall".to_vec())
-			.unwrap();
-		renderer.present(frame.clone(), 3, 0).unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert_eq!(output.matches("a=t").count(), 1, "one upload serves every box");
-		assert!(output.contains("\x1b_Ga=p,U=1,i=7,p=514,r=1,c=2,q=2\x1b\\"));
-		assert!(output.contains("\x1b_Ga=p,U=1,i=7,p=1028,r=2,c=4,q=2\x1b\\"));
-		// Placeholder cells reference their box's placement via the
-		// underline color: 514 = 0:2:2, 1028 = 0:4:4.
-		assert!(output.contains("58:2::0:2:2"));
-		assert!(output.contains("58:2::0:4:4"));
-
-		// Identical re-present: placements are session-cached, never re-sent.
-		renderer.present(frame, 3, 0).unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(!output.contains("\x1b_G"), "no image traffic on a settled frame: {output:?}");
-	}
-
-	#[test]
-	fn screen_buffer_switch_retransmits_and_replaces_images() {
-		// Ghostty stores Kitty images per screen: transmissions and virtual
-		// placements made on one buffer do not exist on the other. Paints
-		// resync against the process flag (main under tests), so flipping the
-		// tracked buffer makes the next paint observe a switch.
-		let mut frame = Frame::new(Size::new(8, 3));
-		for col in 0..2 {
-			frame.put_image_cell(col, 0, 7, 0, col, 1, 2);
-		}
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.register_image(7, b"\x89PNG\r\n\x1a\nsmall".to_vec())
-			.unwrap();
-		renderer.present(frame.clone(), 3, 0).unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert_eq!(output.matches("a=t").count(), 1, "first paint uploads: {output:?}");
-
-		renderer.preview(&frame, 3, "").unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(!output.contains("\x1b_G"), "no retransmit within one buffer: {output:?}");
-
-		renderer.set_screen_buffer(true);
-		renderer.preview(&frame, 3, "").unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert_eq!(
-			output.matches("a=t").count(),
-			1,
-			"a buffer switch re-uploads to the new screen's store: {output:?}"
-		);
-		assert!(
-			output.contains("\x1b_Ga=p,U=1,i=7,p=514,r=1,c=2,q=2\x1b\\"),
-			"virtual placements are re-created after a switch: {output:?}"
-		);
-
-		renderer.preview(&frame, 3, "").unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(!output.contains("\x1b_G"), "caches hold once settled: {output:?}");
-	}
-
-	#[test]
-	fn alt_entry_preview_uploads_overlay_only_images_after_the_switch() {
-		// The model picker's logos live only in its overlay layer, and its
-		// alt-screen entry rides the preview's leading sequence: the images
-		// must be collected from the layers and their Kitty traffic must land
-		// after `?1049h`, or a per-screen store (ghostty) files them under
-		// the buffer being left.
-		let base = document(&["base000", "base111"]);
-		let mut overlay = Frame::new(Size::new(3, 1));
-		for col in 0..2 {
-			overlay.put_image_cell(col, 0, 7, 0, col, 1, 2);
-		}
-		let layer = ResolvedLayer {
-			frame:   &overlay,
-			x:       0,
-			y:       0,
-			src_top: 0,
-			rows:    1,
-			active:  false,
-		};
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.register_image(7, b"\x89PNG\r\n\x1a\nsmall".to_vec())
-			.unwrap();
-
-		renderer
-			.preview_resolved(&base, &[layer], 2, "\x1b[?1049h")
-			.unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		let switch = output
-			.find("\x1b[?1049h")
-			.expect("staged alt entry is emitted");
-		let upload = output
-			.find("\x1b_Gf=100,t=d,a=t")
-			.expect("overlay-only image uploads");
-		assert!(switch < upload, "upload must follow the buffer switch: {output:?}");
-		assert!(
-			output.contains("\x1b_Ga=p,U=1,i=7,p=514,r=1,c=2,q=2\x1b\\"),
-			"overlay-only image is placed: {output:?}"
-		);
-
-		renderer.preview_resolved(&base, &[layer], 2, "").unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(!output.contains("\x1b_G"), "steady overlay preview stays quiet: {output:?}");
-
-		// Leaving the hold flips the tracked buffer again: the exit
-		// retransmission must follow `?1049l` for the same reason.
-		renderer.set_screen_buffer(true);
-		renderer
-			.preview_resolved(&base, &[layer], 2, "\x1b[?1049l")
-			.unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		let switch = output
-			.find("\x1b[?1049l")
-			.expect("staged alt exit is emitted");
-		let upload = output
-			.find("\x1b_Gf=100,t=d,a=t")
-			.expect("the other buffer needs its own upload");
-		assert!(switch < upload, "re-upload must follow the buffer switch: {output:?}");
-	}
-
-	#[test]
-	fn staged_buffer_switch_precedes_image_uploads() {
-		// Per-screen image stores only keep what arrives on the active
-		// screen, so a staged `1049h`/`1049l` must hit the wire before any
-		// Kitty upload in the same paint.
-		let mut frame = Frame::new(Size::new(8, 3));
-		for col in 0..2 {
-			frame.put_image_cell(col, 0, 7, 0, col, 1, 2);
-		}
-		let mut renderer = Renderer::new(Vec::new());
-		renderer
-			.register_image(7, b"\x89PNG\r\n\x1a\nsmall".to_vec())
-			.unwrap();
-		renderer.present(frame.clone(), 3, 0).unwrap();
-		renderer.writer_mut().clear();
-
-		renderer.set_screen_buffer(true);
-		renderer.preview(&frame, 3, "\x1b[?1049h").unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		let switch = output.find("\x1b[?1049h").expect("staged entry is emitted");
-		let upload = output.find("a=t").expect("the new screen needs an upload");
-		assert!(switch < upload, "upload lands on the freshly entered screen: {output:?}");
-
-		// Paints resync the tracked buffer to the process flag (main under
-		// tests), so a fresh flip is needed to observe the exit switch.
-		renderer.set_screen_buffer(true);
-		renderer.rebuild(frame, 3, 0, "\x1b[?1049l").unwrap();
-		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		let switch = output.find("\x1b[?1049l").expect("staged exit is emitted");
-		let upload = output
-			.find("a=t")
-			.expect("the restored screen needs an upload");
-		assert!(switch < upload, "upload lands on the restored screen: {output:?}");
-		let clear = output
-			.find(REBUILD_HISTORY)
-			.expect("history clear is emitted");
-		assert!(clear < upload, "upload must follow the history clear: {output:?}");
-	}
-	#[test]
-	fn kitty_direct_crops_replaces_without_retransmit_and_deletes_offscreen() {
-		fn png_fixture() -> Vec<u8> {
-			let mut bytes = Vec::new();
-			{
-				let mut encoder = png::Encoder::new(&mut bytes, 2, 4);
-				encoder.set_color(png::ColorType::Rgb);
-				encoder.set_depth(png::BitDepth::Eight);
-				let mut writer = encoder.write_header().unwrap();
-				writer.write_image_data(&[0x7f; 24]).unwrap();
-			}
-			bytes
-		}
-
-		fn image_frame(top: u16) -> Frame {
-			let mut frame = Frame::new(Size::new(4, 6));
-			for row in 0..4 {
-				let y = top + row;
-				if y >= frame.size().height {
-					break;
-				}
-				frame.put(0, y, "L", Style::default());
-				for col in 0..2 {
-					frame.put_image_cell(1 + col, y, 7, row, col, 4, 2);
-				}
-				frame.put(3, y, "R", Style::default());
-			}
-			frame
-		}
-
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_graphics(Graphics::KittyDirect);
-		renderer.set_cell_pixel_size(1, 1).unwrap();
-		renderer.register_image(7, png_fixture()).unwrap();
-
-		renderer.present(image_frame(0), 4, 0).unwrap();
-		let clipped = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert_eq!(clipped.matches("a=t").count(), 1);
-		assert!(
-			clipped
-				.contains("\x1b[3A\r\x1b[1C\x1b_Ga=p,q=2,C=1,i=7,p=7,x=0,y=2,w=2,h=2,c=2,r=2\x1b\\")
-		);
-		assert!(clipped.contains("L  R"));
-		assert!(!clipped.contains("\u{10eeee}"));
-
-		renderer.present(image_frame(2), 4, 0).unwrap();
-		let fully_visible = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(!fully_visible.contains("a=t"));
-		assert!(
-			fully_visible
-				.contains("\x1b[3A\r\x1b[1C\x1b_Ga=p,q=2,C=1,i=7,p=7,x=0,y=0,w=2,h=4,c=2,r=4\x1b\\")
-		);
-
-		renderer.present(Frame::new(Size::new(4, 6)), 4, 0).unwrap();
-		let offscreen = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(offscreen.contains("\x1b_Ga=d,d=I,i=7,q=2\x1b\\"));
-	}
-
-	#[test]
-	fn tmux_passthrough_wraps_kitty_packets_but_not_text_sgr() {
-		let mut frame = Frame::new(Size::new(2, 1));
-		frame.put_image_cell(0, 0, 7, 0, 0, 1, 1);
-		frame.put(1, 0, "X", Style::new().fg(Color::Rgb(1, 2, 3)));
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_graphics(Graphics::KittyDirect);
-		renderer.set_tmux_passthrough(true);
-		renderer.set_cell_pixel_size(1, 1).unwrap();
-		renderer.register_image(7, [1, 2, 3]).unwrap();
-
-		renderer.present(frame, 1, 0).unwrap();
-		let output = String::from_utf8(renderer.into_inner()).unwrap();
-		assert!(
-			output.contains("\x1bPtmux;\x1b\x1b_Gf=100,t=d,a=t,i=7,q=2,m=0;AQID\x1b\x1b\\\x1b\\")
-		);
-		assert!(output.contains(
-			"\x1bPtmux;\x1b\x1b_Ga=p,q=2,C=1,i=7,p=7,x=0,y=0,w=1,h=1,c=1,r=1\x1b\x1b\\\x1b\\"
-		));
-		assert_eq!(output.matches("\x1bPtmux;").count(), output.matches("_G").count());
-		assert!(output.contains("\x1b[38;2;1;2;3mX"));
-		assert!(!output.contains("\x1bPtmux;\x1b\x1b[38;2;1;2;3m"));
-	}
-
-	#[test]
-	fn sixel_images_crop_reemit_and_leave_text_cells_intact() {
-		fn png_fixture() -> Vec<u8> {
-			let mut bytes = Vec::new();
-			{
-				let mut encoder = png::Encoder::new(&mut bytes, 4, 2);
-				encoder.set_color(png::ColorType::Rgb);
-				encoder.set_depth(png::BitDepth::Eight);
-				let mut writer = encoder.write_header().unwrap();
-				writer
-					.write_image_data(&[
-						255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 0, 255, 0,
-						0, 255,
-					])
-					.unwrap();
-			}
-			bytes
-		}
-
-		fn image_frame(top: u16, height: u16) -> Frame {
-			let mut frame = Frame::new(Size::new(10, height));
-			for row in 0..4 {
-				let y = top + row;
-				if y >= frame.size().height {
-					break;
-				}
-				frame.put(0, y, "L", Style::default());
-				for col in 0..8 {
-					frame.put_image_cell(1 + col, y, 7, row, col, 4, 8);
-				}
-				frame.put(9, y, "R", Style::default());
-			}
-			frame
-		}
-
-		let mut renderer = Renderer::new(Vec::new());
-		renderer.set_graphics(Graphics::Sixel);
-		renderer.set_cell_pixel_size(1, 1).unwrap();
-		renderer.register_image(7, png_fixture()).unwrap();
-
-		renderer.present(image_frame(0, 6), 4, 0).unwrap();
-		let clipped = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(clipped.contains("\x1b[3A\r\x1b[1C\x1bP0;1;0q"));
-		assert!(clipped.contains("\"1;1;8;2"));
-		assert!(!clipped.contains("\x1b_G"));
-		assert!(clipped.contains("L        R"));
-
-		let fully_visible = image_frame(4, 8);
-		renderer.present(fully_visible.clone(), 4, 0).unwrap();
-		let moved = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
-		assert!(moved.contains("\x1b[3A\r\x1b[1C\x1bP0;1;0q"));
-		assert!(moved.contains("\"1;1;8;4"));
-		assert!(!moved.contains("\x1b_G"));
-		assert!(moved.contains("L        R"));
-
-		let stats = renderer.present(fully_visible, 4, 0).unwrap();
-		assert_eq!(stats.bytes, 0);
-		assert_eq!(renderer.writer_mut().as_slice(), &[] as &[u8]);
-
-		let mut tmux = Renderer::new(Vec::new());
-		tmux.set_graphics(Graphics::Sixel);
-		tmux.set_tmux_passthrough(true);
-		tmux.set_cell_pixel_size(1, 1).unwrap();
-		tmux.register_image(7, png_fixture()).unwrap();
-		tmux.present(image_frame(0, 4), 4, 0).unwrap();
-		let wrapped = String::from_utf8(tmux.into_inner()).unwrap();
-		assert!(wrapped.contains("\x1bPtmux;\x1b\x1bP0;1;0q"));
-		assert!(wrapped.contains("\x1b\x1b\\\x1b\\"));
-		assert!(!wrapped.contains("\x1b_G"));
+	fn writer_failure_poisons_future_renderer_operations() {
+		let mut renderer = Renderer::new(FailingWriter);
+		let first = renderer.present(frame(4, &["one"]), 1, &[]).unwrap_err();
+		assert_eq!(first.kind(), io::ErrorKind::BrokenPipe);
+		let second = renderer.present(frame(4, &["two"]), 1, &[]).unwrap_err();
+		assert_eq!(second.kind(), io::ErrorKind::Other);
 	}
 }

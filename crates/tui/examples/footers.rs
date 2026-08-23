@@ -122,7 +122,7 @@ async fn run<'a>(
 		let mut screen = Frame::new(viewport);
 		screen.fill(Rect::new(0, 0, viewport.width, viewport.height), ink(TEXT));
 		screen.blit(&document, scroll, viewport.height, 0, 0);
-		renderer.preview(&screen, viewport.height, alt_enter.take().as_deref().unwrap_or(""))?;
+		renderer.repaint(alt_enter.take().as_deref().unwrap_or(""), screen, viewport.height, &[])?;
 	}
 }
 

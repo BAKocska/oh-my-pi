@@ -96,7 +96,7 @@ pub use overlay::{Layer, OverlayAnchor, OverlayBand, OverlayId, OverlayMargin, O
 pub use paste::{Pasted, PastedImage};
 pub use props::{Prop, PropValue, Props};
 pub use pump::{DebugOp, DebugQuery, TerminalEvent};
-pub use renderer::{OutputState, PaintStats, Renderer, ResizeScrollbackMode, file_link_target};
+pub use renderer::{OutputState, PaintStats, Renderer, RetireStats, file_link_target};
 pub use rich::{
 	Clip, Measure, Pipeline, Prefix, Prefixed, Restyle, RichSink, RichText, Rows, Tee, Wrap,
 	cell_width, decompose,

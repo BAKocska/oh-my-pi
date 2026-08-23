@@ -49,15 +49,6 @@ pub enum Flow {
 	Event(UiEvent),
 }
 
-/// A vertical stack exposed by [`Component::resize_tail`] for bottom-up
-/// viewport composition during a resize drag.
-pub struct ResizeTail<'a> {
-	/// Stacked children, last entry bottommost.
-	pub children: &'a mut [Cached],
-	/// Vertical gap between adjacent children.
-	pub gap:      u16,
-}
-
 /// A retained UI component.
 pub trait Component: Any {
 	/// Component properties.
@@ -108,20 +99,6 @@ pub trait Component: Any {
 	/// stretched layout width.
 	fn gradient_bounds(&self, content: Rect) -> Option<Rect> {
 		let _ = content;
-		None
-	}
-	/// Opt-in viewport-tail provider for resize drags: children a drag
-	/// frame may compose bottom-up, with the vertical gap between them.
-	/// `None` — the default — renders this component whole.
-	///
-	/// [`crate::Ui::compose_resize_tail`] walks providers backward at the
-	/// new width, laying out and painting only enough children to fill one
-	/// screen per drag frame; full-document reflow waits for the settled
-	/// [`crate::Ui::resize`]. Only chrome-neutral vertical flows may opt
-	/// in: the walk skips the provider's own background, border, and
-	/// alignment, so styled containers must return `None` and render
-	/// normally ([`crate::components::Col`] gates itself accordingly).
-	fn resize_tail(&mut self) -> Option<ResizeTail<'_>> {
 		None
 	}
 	/// A validation error blocking submission — an unmet `required` or
@@ -571,8 +548,9 @@ impl Cached {
 		})
 	}
 
-	/// The fixed height request, sampling an active size transition.
-	fn sampled_h(&mut self, ctx: &UiContext) -> Option<u16> {
+	/// Returns the fixed height request sampled at the context's current
+	/// instant.
+	pub fn sampled_h(&mut self, ctx: &UiContext) -> Option<u16> {
 		let target = self.comp.props().h();
 		let Some((duration, easing)) = self.anim_spec() else {
 			return target;
@@ -587,13 +565,22 @@ impl Cached {
 		Some(tween.sample(ctx.now))
 	}
 
+	/// Returns whether the sampled height has reached its current target.
+	pub fn height_settled(&self, now: Duration) -> bool {
+		self
+			.anim
+			.as_deref()
+			.is_none_or(|state| state.h.is_none_or(|tween| tween.is_settled(now)))
+	}
+
 	/// Whether no size transition is mid-flight — geometry memos are only
 	/// trustworthy while sizes hold still.
 	fn size_settled(&self, now: Duration) -> bool {
-		self.anim.as_deref().is_none_or(|state| {
-			state.h.is_none_or(|tween| tween.is_settled(now))
-				&& state.w.is_none_or(|(_, tween)| tween.is_settled(now))
-		})
+		self.height_settled(now)
+			&& self
+				.anim
+				.as_deref()
+				.is_none_or(|state| state.w.is_none_or(|(_, tween)| tween.is_settled(now)))
 	}
 
 	/// The `anim` transition spec, when declared.

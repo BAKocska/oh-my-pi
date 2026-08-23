@@ -305,6 +305,15 @@ impl Charset {
 		}
 	}
 
+	/// Low-amplitude activity pulse frames for this tier.
+	pub const fn pulse(self) -> Frames {
+		const STEP: Duration = Duration::from_millis(120);
+		match self {
+			Self::Ascii => Frames::new(&[".", "o", "O", "o", "."], STEP),
+			_ => Frames::new(&["·", "•", "●", "•", "·"], STEP),
+		}
+	}
+
 	/// Text cursor beam shown in inline edit modes.
 	pub(crate) const fn beam(self) -> &'static str {
 		match self {
@@ -679,7 +688,20 @@ impl Eq for UiContext {}
 
 #[cfg(test)]
 mod tests {
-	use super::{Appearance, Theme};
+	use std::time::Duration;
+
+	use super::{Appearance, Charset, Theme};
+	#[test]
+	fn pulse_frames_degrade_by_charset() {
+		let samples = [0, 120, 240, 360, 480].map(Duration::from_millis);
+		let unicode = samples.map(|now| Charset::Unicode.pulse().at(now));
+		let nerd = samples.map(|now| Charset::NerdFont.pulse().at(now));
+		let ascii = samples.map(|now| Charset::Ascii.pulse().at(now));
+
+		assert_eq!(unicode, ["·", "•", "●", "•", "·"]);
+		assert_eq!(nerd, unicode);
+		assert_eq!(ascii, [".", "o", "O", "o", "."]);
+	}
 
 	#[test]
 	fn bt601_classifies_boundary_colors_at_both_component_depths() {

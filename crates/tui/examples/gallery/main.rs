@@ -15,7 +15,7 @@ mod eclipse;
 mod overlay;
 mod render;
 
-use std::{io, time};
+use std::{io, time::Instant};
 
 use omp_tui::{AppEvent, AppOptions, Key, OverlayId, Size, Ui, UiContext, dom};
 
@@ -108,7 +108,7 @@ async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 	let mut synced = String::new();
 	let mut lab = anim::Lab::new();
 	let mut layers = Layers::default();
-	let mut next_step = time::Instant::now() + anim::AUTOPLAY_STEP;
+	let mut next_step = Instant::now() + anim::AUTOPLAY_STEP;
 
 	loop {
 		let event = tokio::select! {
@@ -116,7 +116,7 @@ async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 				Some(event) => event,
 				None => break,
 			},
-			() = executor.timer(next_step.saturating_duration_since(std::time::Instant::now())) => {
+			() = executor.timer(next_step.saturating_duration_since(Instant::now())) => {
 				if lab.autoplay && active_tab(app.ui()) == "Anim" {
 					lab.advance(app.ui_mut());
 				}

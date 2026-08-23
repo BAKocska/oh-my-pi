@@ -10,7 +10,6 @@ use crate::{
 	PaintStats, Renderer,
 	component::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoComponent, PaintCtx, Slot, Wake,
-		horizontal_inset, vertical_inset,
 	},
 	components::{Img, ImgState, Row, Scroll, Tabs, Wizard},
 	context::UiContext,
@@ -72,50 +71,43 @@ impl OverlayEntry {
 /// A parsed, laid-out, retained component tree painting into a [`Frame`].
 pub struct Ui {
 	#[allow(dead_code, reason = "keeps parsed source storage alive")]
-	pub(crate) source:     Str,
-	pub(crate) root:       Cached,
-	pub(crate) frame:      Frame,
-	pub(crate) width:      u16,
-	/// Max document height since the last width change or [`Self::refit`].
-	pub(crate) high_water: u16,
+	pub(crate) source:   Str,
+	pub(crate) root:     Cached,
+	pub(crate) frame:    Frame,
+	/// Cached fixed-height frame passed to the renderer.
+	viewport_frame:      Frame,
+	pub(crate) width:    u16,
 	/// Row ranges repainted since the last successful present.
-	pub(crate) damage:     SmallVec<(u16, u16), 8>,
-	pub(crate) focus:      Option<Slot>,
-	pub(crate) hover:      Option<(Slot, HitTag)>,
+	pub(crate) damage:   SmallVec<(u16, u16), 8>,
+	pub(crate) focus:    Option<Slot>,
+	pub(crate) hover:    Option<(Slot, HitTag)>,
 	/// Last pointer cell in document coordinates, feeding pointer-tracking
 	/// chrome such as the `hover` glow.
-	pub(crate) pointer:    Option<(u16, u16)>,
+	pub(crate) pointer:  Option<(u16, u16)>,
 	/// Whether the keyboard was the most recent input modality; gates the
 	/// focus-side hover chrome so only one chrome cursor exists.
-	pub(crate) keyboard:   bool,
-	pub(crate) hits:       Vec<Hit>,
-	drag:                  Option<Hit>,
-	conds:                 Vec<CompiledCond>,
+	pub(crate) keyboard: bool,
+	pub(crate) hits:     Vec<Hit>,
+	drag:                Option<Hit>,
+	conds:               Vec<CompiledCond>,
 	/// Presentation clock: the `now` of the most recent [`Ui::tick`].
-	now:                   Duration,
+	now:                 Duration,
 	/// Pending animation wake requests, rebuilt by every paint.
-	wakes:                 Vec<Wake>,
-	/// Throwaway drag-paint hit storage, retained to avoid per-frame allocation.
-	resize_hits:           Vec<Hit>,
-	/// Throwaway drag-paint wake storage, retained to avoid per-frame
-	/// allocation.
-	resize_wakes:          Vec<Wake>,
-	pub(crate) ctx:        UiContext,
+	wakes:               Vec<Wake>,
+	pub(crate) ctx:      UiContext,
 	/// Stacked overlay layers, bottom to top: ascending (`options.z`, creation
 	/// order).
-	overlays:              SmallVec<OverlayEntry, 4>,
+	overlays:            SmallVec<OverlayEntry, 4>,
 	/// Monotonic id source for overlay handles.
-	next_overlay:          u32,
+	next_overlay:        u32,
 	/// Non-modal layer currently holding the keyboard, if any.
-	key_overlay:           Option<OverlayId>,
+	key_overlay:         Option<OverlayId>,
 	/// Viewport recorded by the most recent [`Ui::present`].
-	viewport:              Option<Size>,
-	/// Renderer window top recorded by the most recent [`Ui::present`].
-	window_top:            u16,
+	viewport:            Option<Size>,
 	/// The overlay stack changed shape since the last present.
-	overlays_dirty:        bool,
+	overlays_dirty:      bool,
 	/// Marks an overlay-owned tree, which cannot stack overlays of its own.
-	nested:                bool,
+	nested:              bool,
 }
 
 impl Ui {
@@ -162,8 +154,8 @@ impl Ui {
 			source,
 			root,
 			frame: Frame::new(Size::new(width, 0)),
+			viewport_frame: Frame::new(Size::new(width, 0)),
 			width,
-			high_water: 0,
 			damage: SmallVec::new(),
 			focus: None,
 			hover: None,
@@ -174,14 +166,11 @@ impl Ui {
 			conds: Vec::new(),
 			now: Duration::ZERO,
 			wakes: Vec::new(),
-			resize_hits: Vec::new(),
-			resize_wakes: Vec::new(),
 			ctx,
 			overlays: SmallVec::new(),
 			next_overlay: 0,
 			key_overlay: None,
 			viewport: None,
-			window_top: 0,
 			overlays_dirty: false,
 			nested: false,
 		};
@@ -199,7 +188,7 @@ impl Ui {
 		ui
 	}
 
-	/// The retained document frame.
+	/// The retained component frame before fixed-viewport clipping.
 	pub const fn frame(&self) -> &Frame {
 		&self.frame
 	}
@@ -272,20 +261,7 @@ impl Ui {
 		changed
 	}
 
-	/// Clears damage after a renderer rebuild supersedes incremental updates.
-	///
-	/// A rebuild repaints the raw document, so any overlay stack must
-	/// recomposite on the next present.
-	pub(crate) fn clear_damage(&mut self) {
-		self.damage.clear();
-		self.overlays_dirty |= !self.overlays.is_empty();
-	}
-
-	/// Marks the whole document damaged so the next present repaints it.
-	///
-	/// Releasing an alternate-screen hold uses this: previews consumed the
-	/// incremental damage without ever painting the main buffer, so the
-	/// first present after restore must revalidate every live row.
+	/// Marks the whole component frame damaged so the next present repaints it.
 	pub(crate) fn damage_all(&mut self) {
 		self.damage.clear();
 		self.damage.push((0, self.frame.size().height));
@@ -504,20 +480,6 @@ impl Ui {
 	/// Relayouts and repaints everything at a new width.
 	pub fn resize(&mut self, width: u16) {
 		self.width = width;
-		self.refit();
-	}
-
-	/// Drops the height watermark and relayouts, shrinking the frame to the
-	/// current content height.
-	///
-	/// The watermark pads the frame so content shrinkage between presents
-	/// cannot move committed rows under the bottom-anchored window. A
-	/// [`Renderer::rebuild`](crate::Renderer::rebuild) re-anchors physical
-	/// state, so the runtime refits first — otherwise stale padding from a
-	/// taller viewport pins the window past the real document and paints
-	/// phantom blank rows.
-	pub(crate) fn refit(&mut self) {
-		self.high_water = 0;
 		self.root.invalidate();
 		self.layout_all();
 	}
@@ -525,15 +487,12 @@ impl Ui {
 	/// Forces this tree's root to a fixed height, relayouting when it
 	/// changes.
 	///
-	/// Fill-height overlays are sized to their viewport band on every
-	/// present; the watermark resets so a shrinking viewport shrinks the
-	/// frame with it.
+	/// Fill-height overlays are sized to their viewport band on every present.
 	fn set_root_height(&mut self, rows: u16) {
 		if self.root.comp().props().h() == Some(rows) {
 			return;
 		}
 		self.root.comp_mut().props_mut().set(Prop::H, rows);
-		self.high_water = 0;
 		self.root.invalidate();
 		self.layout_all();
 	}
@@ -576,6 +535,27 @@ impl Ui {
 		}
 	}
 
+	/// Composes the retained component frame into one exactly-sized viewport.
+	fn compose_viewport(&mut self, height: u16) -> u16 {
+		let target = Size::new(self.width, height);
+		if self.viewport_frame.size() == target {
+			self.viewport_frame.clear(Style::default());
+		} else {
+			self.viewport_frame = Frame::new(target);
+		}
+		let source_top = self.frame.size().height.saturating_sub(height);
+		let rows = self
+			.frame
+			.size()
+			.height
+			.saturating_sub(source_top)
+			.min(height);
+		self
+			.viewport_frame
+			.blit(&self.frame, source_top, rows, 0, 0);
+		source_top
+	}
+
 	/// The composited layer stack in z order, one entry per placed band.
 	/// The layer receiving keys carries the hardware cursor; passive panes
 	/// let the base document's caret show through.
@@ -596,8 +576,8 @@ impl Ui {
 			.collect()
 	}
 
-	/// Presents the retained frame without copying it, compositing every
-	/// visible overlay above the document for this viewport.
+	/// Composes and presents exactly one fixed-height viewport, compositing
+	/// every visible overlay above the retained component frame.
 	///
 	/// # Errors
 	/// Propagates the renderer's contract and writer errors.
@@ -605,15 +585,23 @@ impl Ui {
 		&mut self,
 		renderer: &mut Renderer<W>,
 		viewport_height: u16,
-		stable_rows: u16,
 	) -> io::Result<PaintStats> {
 		renderer.set_graphics(self.ctx.graphics);
 		let viewport = Size::new(self.width, viewport_height);
 		self.viewport = Some(viewport);
 		self.resolve_overlay_bands(viewport);
+		let source_top = self.compose_viewport(viewport_height);
+		let source_bottom = source_top.saturating_add(viewport_height);
 		self.damage.sort_unstable();
 		let mut merged: SmallVec<(u16, u16), 8> = SmallVec::new();
 		for &(start, end) in &self.damage {
+			let start = start.max(source_top);
+			let end = end.min(source_bottom);
+			if start >= end {
+				continue;
+			}
+			let start = start - source_top;
+			let end = end - source_top;
 			match merged.last_mut() {
 				Some(last) if start <= last.1 => last.1 = last.1.max(end),
 				_ => merged.push((start, end)),
@@ -621,9 +609,8 @@ impl Ui {
 		}
 		let layers = self.resolved_layers();
 		let stats =
-			renderer.present_resolved(&self.frame, &merged, viewport_height, stable_rows, &layers)?;
+			renderer.present_resolved(&self.viewport_frame, &merged, viewport_height, &layers)?;
 		drop(layers);
-		self.window_top = renderer.window_top();
 		self.overlays_dirty = false;
 		self.damage.clear();
 		for entry in &mut self.overlays {
@@ -632,92 +619,34 @@ impl Ui {
 		Ok(stats)
 	}
 
-	/// Paints the composited viewport as a throwaway frame, leaving the
-	/// renderer's committed history untouched.
+	/// Fully repaints the composited viewport, emitting `prefix` first.
 	///
-	/// Alternate-screen presentation: hosts holding the alternate screen —
-	/// for a modal overlay or a fullscreen scene — repaint with this on every
-	/// damage or geometry change, and `leading_sequence` lets the buffer
-	/// switch ride the same synchronized update (see
-	/// [`Terminal::stage_alt_enter`](crate::Terminal::stage_alt_enter)).
-	/// Damage is consumed exactly like [`Ui::present`].
+	/// Alternate-screen transitions use this path so the mode switch and
+	/// viewport paint share one synchronized terminal update.
 	///
 	/// # Errors
 	/// Propagates the renderer's contract and writer errors.
-	pub fn preview<W: io::Write>(
+	pub(crate) fn repaint<W: io::Write>(
 		&mut self,
 		renderer: &mut Renderer<W>,
 		viewport_height: u16,
-		leading_sequence: &str,
+		prefix: &str,
 	) -> io::Result<PaintStats> {
 		renderer.set_graphics(self.ctx.graphics);
 		let viewport = Size::new(self.width, viewport_height);
 		self.viewport = Some(viewport);
 		self.resolve_overlay_bands(viewport);
+		self.compose_viewport(viewport_height);
+		let frame = self.viewport_frame.clone();
 		let layers = self.resolved_layers();
-		let stats =
-			renderer.preview_resolved(&self.frame, &layers, viewport_height, leading_sequence)?;
+		let stats = renderer.repaint_resolved(prefix, frame, viewport_height, &layers)?;
 		drop(layers);
-		// Hit-testing while held maps against the previewed tail window.
-		self.window_top = self.frame.size().height.saturating_sub(viewport_height);
 		self.overlays_dirty = false;
 		self.damage.clear();
 		for entry in &mut self.overlays {
 			entry.ui.damage.clear();
 		}
 		Ok(stats)
-	}
-
-	/// Composes one screen of throwaway drag content at `viewport` without
-	/// relayouting the retained tree.
-	///
-	/// The root's tail children ([`crate::Component::resize_tail`]) are
-	/// composed bottom-up at the new width until the viewport is full —
-	/// O(viewport) work per drag frame. Nested vertical stacks (including
-	/// the implicit markup root) are walked recursively without ever
-	/// computing their full height, and a leaf taller than the space left
-	/// is sliced to its bottom rows, so work stays bounded by the screen
-	/// rather than document history. `None` means the root has no tail fast
-	/// path; callers fall back to a full [`Ui::resize`]. Child placement is
-	/// transient: the deferred [`Ui::resize`] at settle re-places
-	/// everything.
-	pub fn compose_resize_tail(&mut self, viewport: Size) -> Option<Frame> {
-		if viewport.width == 0 || viewport.height == 0 {
-			return None;
-		}
-		let paints_border = self.root.comp().paints_border();
-		let x_inset = horizontal_inset(self.root.comp().props(), paints_border);
-		let y_inset = vertical_inset(self.root.comp().props(), paints_border);
-		let content_width = viewport
-			.width
-			.saturating_sub(x_inset.saturating_mul(2))
-			.max(1);
-		let mut frame = Frame::new(viewport);
-		self.resize_hits.clear();
-		self.resize_wakes.clear();
-		let bottom_start = viewport.height.saturating_sub(y_inset);
-		let content_top = compose_tail(
-			&mut frame,
-			&self.ctx,
-			self.now,
-			self.focus,
-			&mut self.resize_hits,
-			&mut self.resize_wakes,
-			self.root.comp_mut(),
-			x_inset,
-			content_width,
-			bottom_start,
-		)?;
-		// Underflow: every child fits above the viewport bottom. Normal
-		// layout top-aligns a short document, so shift the composed band up
-		// instead of letting it jump to the bottom for the drag.
-		if content_top > y_inset && content_top < bottom_start {
-			let rows = bottom_start - content_top;
-			let mut aligned = Frame::new(viewport);
-			aligned.blit(&frame, content_top, rows, 0, y_inset);
-			return Some(aligned);
-		}
-		Some(frame)
 	}
 
 	/// Routes a key to the layer holding the keyboard — the topmost visible
@@ -887,12 +816,22 @@ impl Ui {
 		self.assign_focus(None, true);
 	}
 
-	/// Routes a mouse gesture in document cell coordinates; visible overlays
-	/// occlude the document within their bounds.
+	/// Routes a mouse gesture in viewport cell coordinates; visible overlays
+	/// occlude the base tree within their bounds.
 	pub fn handle_mouse(&mut self, x: u16, y: u16, mouse: Mouse) -> UiEvent {
 		if let Some(event) = self.route_overlay_mouse(x, y, mouse) {
 			return event;
 		}
+		let source_y = y.saturating_add(
+			self
+				.viewport
+				.map_or(0, |viewport| self.frame.size().height.saturating_sub(viewport.height)),
+		);
+		self.handle_mouse_document(x, source_y, mouse)
+	}
+
+	/// Routes a mouse gesture whose coordinates are already in frame space.
+	fn handle_mouse_document(&mut self, x: u16, y: u16, mouse: Mouse) -> UiEvent {
 		self.pointer = Some((x, y));
 		self.set_keyboard(false);
 		match mouse {
@@ -962,9 +901,8 @@ impl Ui {
 
 	/// Routes a viewport-coordinate mouse gesture into this tree when it is
 	/// composited as a raw [`crate::Layer`] under `options` — the raw-frame
-	/// host counterpart of the overlay stack's own routing
-	/// ([`crate::Renderer::present_overlaid`] instead of
-	/// [`Ui::show_overlay`]). The band is resolved exactly as the
+	/// host counterpart of the overlay stack's own routing with raw layers
+	/// instead of [`Ui::show_overlay`]. The band is resolved exactly as the
 	/// compositor resolves it, coordinates are translated into this tree's
 	/// local cells, and a drag that started inside stays captured. `None`
 	/// means the gesture fell outside the layer (a `Move` outside also
@@ -1002,7 +940,7 @@ impl Ui {
 		}
 		let local_x = x.saturating_sub(band.x);
 		let local_y = y.saturating_sub(band.y).saturating_add(band.src_top);
-		Some(self.handle_mouse(local_x, local_y, mouse))
+		Some(self.handle_mouse_document(local_x, local_y, mouse))
 	}
 
 	/// Records which modality drove the last input, repainting the focused
@@ -1199,10 +1137,9 @@ impl Ui {
 	///
 	/// While one is, [`crate::App`] holds the terminal's alternate screen
 	/// (vim/less idiom): the whole composited viewport paints there with
-	/// mouse tracking active, and the untouched main screen restores when
-	/// the last visible modal overlay closes. Non-modal layers never hold:
-	/// they composite into the live inline viewport while the document
-	/// keeps committing to native scrollback beneath them.
+	/// mouse tracking active, and the main screen is fully repainted when
+	/// the last visible modal overlay closes. Non-modal layers composite
+	/// directly into the live viewport.
 	pub fn has_overlay(&self) -> bool {
 		self
 			.overlays
@@ -1268,26 +1205,17 @@ impl Ui {
 
 	fn overlay_contains(&self, index: usize, x: u16, y: u16) -> bool {
 		let entry = &self.overlays[index];
-		let Some(viewport_y) = y.checked_sub(self.window_top) else {
-			return false;
-		};
 		entry.band.rows > 0
 			&& x >= entry.band.x
 			&& x < entry.band.x.saturating_add(entry.ui.width)
-			&& viewport_y >= entry.band.y
-			&& viewport_y < entry.band.y.saturating_add(entry.band.rows)
+			&& y >= entry.band.y
+			&& y < entry.band.y.saturating_add(entry.band.rows)
 	}
 
 	/// Maps document coordinates into an overlay's local cell space.
 	fn overlay_local(&self, index: usize, x: u16, y: u16) -> (u16, u16) {
 		let band = self.overlays[index].band;
-		let viewport_y = y.saturating_sub(self.window_top);
-		(
-			x.saturating_sub(band.x),
-			viewport_y
-				.saturating_sub(band.y)
-				.saturating_add(band.src_top),
-		)
+		(x.saturating_sub(band.x), y.saturating_sub(band.y).saturating_add(band.src_top))
 	}
 
 	/// Routes a mouse gesture to the overlay stack; `None` falls through to
@@ -1307,7 +1235,7 @@ impl Ui {
 			return Some(
 				self.overlays[index]
 					.ui
-					.handle_mouse(local_x, local_y, mouse),
+					.handle_mouse_document(local_x, local_y, mouse),
 			);
 		}
 		let target = (0..self.overlays.len())
@@ -1343,7 +1271,7 @@ impl Ui {
 		Some(
 			self.overlays[index]
 				.ui
-				.handle_mouse(local_x, local_y, mouse),
+				.handle_mouse_document(local_x, local_y, mouse),
 		)
 	}
 
@@ -1837,13 +1765,13 @@ impl Ui {
 	}
 
 	fn layout_all(&mut self) {
+		let previous_height = self.frame.size().height;
 		let _ = self.root.measure(&self.ctx);
 		let height = self.root.height(&self.ctx, self.width);
 		self
 			.root
 			.place(&self.ctx, Rect::new(0, 0, self.width, height));
-		self.high_water = self.high_water.max(height);
-		let target = Size::new(self.width, self.high_water);
+		let target = Size::new(self.width, height);
 		if self.frame.size() == target {
 			self.frame.clear(Style::default());
 		} else {
@@ -1861,7 +1789,7 @@ impl Ui {
 		if self.root.visible {
 			self.root.paint(&mut pc);
 		}
-		self.mark_damage(0, self.high_water);
+		self.mark_damage(0, height.max(previous_height));
 	}
 
 	fn mark_damage(&mut self, y: u16, height: u16) {
@@ -1955,84 +1883,6 @@ impl Ui {
 			self.hover = None;
 		}
 	}
-}
-
-/// Walks `comp`'s tail children bottom-up into `frame` above `start_bottom`,
-/// recursing into nested providers; returns the topmost painted row.
-///
-/// Providers ([`crate::Component::resize_tail`]) are transparent — their
-/// own height is never computed, so a drag frame's work stays bounded by
-/// the viewport even when markup wraps the whole transcript in one bare
-/// column. Every non-provider child renders whole with full chrome
-/// fidelity, and a leaf taller than the space left is sliced to its bottom
-/// rows through a scratch bounded by that one leaf's height. `None` when
-/// `comp` is not a provider.
-#[expect(clippy::too_many_arguments, reason = "one recursive paint cursor, not an API")]
-fn compose_tail(
-	frame: &mut Frame,
-	ctx: &UiContext,
-	now: Duration,
-	focus: Option<Slot>,
-	hits: &mut Vec<Hit>,
-	wakes: &mut Vec<Wake>,
-	comp: &mut dyn Component,
-	x: u16,
-	width: u16,
-	start_bottom: u16,
-) -> Option<u16> {
-	let tail = comp.resize_tail()?;
-	let mut bottom = start_bottom;
-	let mut content_top = start_bottom;
-	for child in tail.children.iter_mut().rev().filter(|child| child.visible) {
-		if bottom == 0 {
-			break;
-		}
-		let paints_border = child.comp().paints_border();
-		let x_inset = horizontal_inset(child.comp().props(), paints_border);
-		let y_inset = vertical_inset(child.comp().props(), paints_border);
-		let nested = compose_tail(
-			frame,
-			ctx,
-			now,
-			focus,
-			hits,
-			wakes,
-			child.comp_mut(),
-			x.saturating_add(x_inset),
-			width.saturating_sub(x_inset.saturating_mul(2)).max(1),
-			bottom.saturating_sub(y_inset),
-		);
-		if let Some(top) = nested {
-			content_top = top;
-			bottom = top.saturating_sub(tail.gap);
-			continue;
-		}
-		let height = child.height(ctx, width);
-		if height == 0 {
-			continue;
-		}
-		if height <= bottom {
-			bottom -= height;
-			child.place(ctx, Rect::new(x, bottom, width, height));
-			let mut pc = PaintCtx::new(frame, ctx, hits, wakes);
-			pc.now = now;
-			pc.focus = focus;
-			child.paint(&mut pc);
-			content_top = bottom;
-			bottom = bottom.saturating_sub(tail.gap);
-		} else {
-			// Bottom slice of a leaf taller than the space left.
-			let mut scratch = Frame::new(Size::new(x.saturating_add(width), height));
-			child.place(ctx, Rect::new(x, 0, width, height));
-			let mut pc = PaintCtx::new(&mut scratch, ctx, hits, wakes);
-			pc.now = now;
-			child.paint(&mut pc);
-			frame.blit(&scratch, height - bottom, bottom, 0, 0);
-			content_top = 0;
-			bottom = 0;
-		}
-	}
-	Some(content_top)
 }
 
 fn event_size(cached: &Cached) -> (u16, u16) {
@@ -2392,143 +2242,6 @@ mod tests {
 		"context",
 	];
 
-	#[test]
-	fn resize_tail_top_aligns_underflow_and_slices_overflow() {
-		// Underflow: a short column stays top-aligned during the drag, like
-		// normal layout — never jumping to the viewport bottom.
-		let mut ui = Ui::from_markup(
-			"<col><text>alpha</text><text>beta</text></col>",
-			12,
-			UiContext::default(),
-		)
-		.unwrap();
-		let frame = ui
-			.compose_resize_tail(Size::new(10, 6))
-			.expect("a col root has the tail fast path");
-		assert_eq!(frame_row_text(&frame, 0).trim_end(), "alpha");
-		assert_eq!(frame_row_text(&frame, 1).trim_end(), "beta");
-
-		// Overflow: only the bottom entries compose, newest at the bottom.
-		let mut ui = Ui::from_markup(
-			"<col><text>one</text><text>two</text><text>three</text><text>four</text></col>",
-			12,
-			UiContext::default(),
-		)
-		.unwrap();
-		let frame = ui
-			.compose_resize_tail(Size::new(10, 2))
-			.expect("a col root has the tail fast path");
-		assert_eq!(frame_row_text(&frame, 0).trim_end(), "three");
-		assert_eq!(frame_row_text(&frame, 1).trim_end(), "four");
-
-		// A single child taller than the viewport is sliced to its bottom
-		// rows, exactly like pi's tail compose.
-		let mut ui =
-			Ui::from_markup("<col><text>aaaa bbbb cccc dddd</text></col>", 5, UiContext::default())
-				.unwrap();
-		let frame = ui
-			.compose_resize_tail(Size::new(5, 2))
-			.expect("a col root has the tail fast path");
-		assert_eq!(frame_row_text(&frame, 0).trim_end(), "cccc");
-		assert_eq!(frame_row_text(&frame, 1).trim_end(), "dddd");
-
-		// Markup always roots at a Col, so even a `<row>` document has the
-		// fast path — it composes as one (sliceable) tail child.
-		let mut ui = Ui::from_markup("<row><text>x</text></row>", 10, UiContext::default()).unwrap();
-		assert!(ui.compose_resize_tail(Size::new(10, 4)).is_some());
-	}
-
-	/// One-row leaf counting its `height`/`paint` calls, for proving the
-	/// drag fast path's work bound.
-	struct MeteredLeaf {
-		props:   Props,
-		slot:    Slot,
-		label:   String,
-		heights: rc::Rc<cell::Cell<usize>>,
-		paints:  rc::Rc<cell::Cell<usize>>,
-	}
-
-	impl Component for MeteredLeaf {
-		fn props(&self) -> &Props {
-			&self.props
-		}
-
-		fn props_mut(&mut self) -> &mut Props {
-			&mut self.props
-		}
-
-		fn slot(&self) -> Slot {
-			self.slot
-		}
-
-		fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
-			(1, 1)
-		}
-
-		fn height(&mut self, _ctx: &UiContext, _width: u16) -> u16 {
-			self.heights.set(self.heights.get() + 1);
-			1
-		}
-
-		fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
-			self.paints.set(self.paints.get() + 1);
-			pc.frame.put(rect.x, rect.y, &self.label, Style::default());
-		}
-	}
-
-	#[test]
-	fn resize_tail_work_is_bounded_by_the_viewport_not_history() {
-		// A 10k-entry transcript inside a nested bare column (mirroring the
-		// implicit markup root wrapper): a drag frame may only measure and
-		// paint about one viewport of entries.
-		let heights = rc::Rc::new(cell::Cell::new(0));
-		let paints = rc::Rc::new(cell::Cell::new(0));
-		let mut transcript = Col::new();
-		for index in 0..10_000 {
-			transcript = transcript.child(Cached::new(Box::new(MeteredLeaf {
-				props:   Props::new(),
-				slot:    next_slot(),
-				label:   format!("entry {index}"),
-				heights: rc::Rc::clone(&heights),
-				paints:  rc::Rc::clone(&paints),
-			})));
-		}
-		let root = Col::new().child(Cached::new(Box::new(transcript)));
-		let mut ui = Ui::from_root(root, 24, UiContext::default());
-		heights.set(0);
-		paints.set(0);
-
-		let frame = ui
-			.compose_resize_tail(Size::new(20, 8))
-			.expect("a bare col chain is a tail provider");
-		assert_eq!(frame_row_text(&frame, 7).trim_end(), "entry 9999");
-		assert_eq!(frame_row_text(&frame, 0).trim_end(), "entry 9992");
-		assert!(paints.get() <= 9, "an 8-row viewport painted {} of 10000 entries", paints.get());
-		assert!(heights.get() <= 10, "an 8-row viewport measured {} of 10000 entries", heights.get());
-	}
-
-	#[test]
-	fn resize_tail_renders_styled_containers_with_full_fidelity() {
-		// A styled column is not a provider: the drag frame renders it whole
-		// through `Cached::paint`, byte-identical to the settled layout.
-		let source = "<col><col border=round pad=1><text>boxed</text></col></col>";
-		let mut ui = Ui::from_markup(source, 12, UiContext::default()).unwrap();
-		let settled: Vec<String> = (0..ui.height())
-			.map(|row| frame_row_text(ui.frame(), row))
-			.collect();
-
-		let frame = ui
-			.compose_resize_tail(Size::new(12, 8))
-			.expect("the bare root col is a provider");
-		for (row, expected) in settled.iter().enumerate() {
-			assert_eq!(
-				frame_row_text(&frame, row as u16).trim_end(),
-				expected.trim_end(),
-				"styled container drag frame diverges at row {row}"
-			);
-		}
-	}
-
 	fn frame_text(ui: &Ui) -> Vec<String> {
 		let size = ui.frame().size();
 		(0..size.height)
@@ -2547,28 +2260,25 @@ mod tests {
 	}
 
 	#[test]
-	fn base_changes_during_alt_previews_repaint_on_clean_release() {
-		// An alternate-screen hold previews the composited viewport while the
-		// main buffer stays frozen. Base damage consumed by those previews
-		// must still reach the main screen after a clean release (no resize):
-		// the runtime re-marks everything via `damage_all` and presents.
+	fn base_changes_during_alt_repaint_reach_main_repaint() {
+		// An alternate-screen repaint consumes composited viewport damage.
+		// A full main-screen repaint must still include base changes.
 		let mut ui = Ui::from_markup("<text id=msg>before</text>", 20, UiContext::default()).unwrap();
 		let mut renderer = Renderer::new(Vec::new());
-		ui.present(&mut renderer, 4, 0)
+		ui.present(&mut renderer, 4)
 			.expect("baseline main-buffer present");
 
 		let overlay = ui.show_overlay(dom! { <text>{"modal"}</text> }, OverlayOptions::default());
 		ui.set_text("msg", "supplanted");
-		ui.preview(&mut renderer, 4, "\x1b[?1049h")
-			.expect("held preview consumes the damage");
-		assert!(!ui.has_damage(), "previews consume damage like presents");
+		ui.repaint(&mut renderer, 4, "\x1b[?1049h")
+			.expect("held repaint consumes the damage");
+		assert!(!ui.has_damage(), "repaints consume damage like presents");
 
 		ui.close_overlay(overlay);
 		renderer.writer_mut().clear();
-		ui.damage_all();
 		let stats = ui
-			.present(&mut renderer, 4, 0)
-			.expect("release present succeeds");
+			.repaint(&mut renderer, 4, "\x1b[?1049l")
+			.expect("release repaint succeeds");
 		let output = String::from_utf8(renderer.writer_mut().clone()).expect("ANSI is UTF-8");
 		assert!(
 			output.contains("supplanted"),
@@ -3863,9 +3573,9 @@ mod tests {
 		assert!(steady.as_nanos() * 100 < rebuild.as_nanos());
 	}
 
-	/// Presentation must scale with DAMAGE, not document size: one
-	/// counter tick on a 4x taller document (and a padded high-water
-	/// frame) presents in comparable time. Run with the perf smoke:
+	/// Presentation must scale with damage, not component-frame size: one
+	/// counter tick on a four-times-taller, bottom-clipped frame presents in
+	/// comparable time. Run with the perf smoke:
 	/// `cargo nextest run -p omp-tui --release --run-ignored ignored-only
 	/// --no-capture -E 'test(perf)'`
 	#[test]
@@ -3887,12 +3597,12 @@ mod tests {
 			src.push_str("</col>");
 			let mut ui = Ui::from_markup(src, 120, UiContext::default()).unwrap();
 			let mut renderer = Renderer::new(io::sink());
-			ui.present(&mut renderer, 40, 0).unwrap();
+			ui.present(&mut renderer, 40).unwrap();
 			const FRAMES: u32 = 2000;
 			let t0 = Instant::now();
 			for i in 0..FRAMES {
 				ui.set_text(&format!("c{}", i % sections as u32), format!("counter {i}"));
-				ui.present(&mut renderer, 40, 0).unwrap();
+				ui.present(&mut renderer, 40).unwrap();
 			}
 			(t0.elapsed() / FRAMES, ui.frame().size().height)
 		};
@@ -4423,15 +4133,39 @@ cd</pre>"##,
 		)
 		.unwrap();
 		assert_eq!(ui.height(), 2);
+		let slot = find_id(ui.root(), "b")
+			.expect("animated column exists")
+			.comp()
+			.slot();
 
 		assert!(ui.set_height("b", 6));
 		assert_eq!(ui.height(), 2, "the transition starts from the on-screen size");
+		assert!(
+			!ui.root
+				.find_slot(slot)
+				.unwrap()
+				.height_settled(Duration::ZERO)
+		);
 		assert!(ui.next_wake().is_some());
 
 		ui.tick(Duration::from_millis(50));
 		assert_eq!(ui.height(), 4);
+		let ctx = ui.ctx.clone();
+		assert_eq!(ui.root.find_slot(slot).unwrap().sampled_h(&ctx), Some(4));
+		assert!(
+			!ui.root
+				.find_slot(slot)
+				.unwrap()
+				.height_settled(Duration::from_millis(50))
+		);
 		ui.tick(Duration::from_millis(100));
 		assert_eq!(ui.height(), 6);
+		assert!(
+			ui.root
+				.find_slot(slot)
+				.unwrap()
+				.height_settled(Duration::from_millis(100))
+		);
 		assert_eq!(ui.next_wake(), None);
 		assert!(!ui.tick(Duration::from_millis(200)));
 	}
@@ -4461,31 +4195,6 @@ cd</pre>"##,
 		assert_eq!(ui.next_wake(), None);
 	}
 
-	#[test]
-	fn refit_drops_the_height_watermark_for_a_post_resize_rebuild() {
-		// A vertical-only terminal shrink: the runtime relayouts (`resize`,
-		// width unchanged) before the app's `Resized` handler shrinks the
-		// fixed-height scroll, so the watermark stays pinned at the old
-		// document height until the pre-rebuild refit drops it. Without the
-		// refit the rebuild window bottom-anchors into the phantom padding,
-		// cutting the document top and painting blank rows at the bottom.
-		let body = "line\n".repeat(40);
-		let source = format!(
-			"<col><text>title</text><scroll id=body \
-			 h=15><text>{body}</text></scroll><text>hud</text></col>"
-		);
-		let mut ui = Ui::from_markup(&source, 30, UiContext::default()).unwrap();
-		assert_eq!(ui.frame().size().height, 17);
-
-		ui.resize(30);
-		assert!(ui.set_height("body", 9));
-		assert_eq!(ui.height(), 11, "content shrinks with the scroll");
-		assert_eq!(ui.frame().size().height, 17, "the watermark still pads the frame");
-
-		ui.refit();
-		assert_eq!(ui.frame().size().height, 11, "a rebuild-bound frame matches content");
-	}
-
 	fn overlay_paint(renderer: &mut Renderer<Vec<u8>>) -> String {
 		let bytes = mem::take(renderer.writer_mut());
 		String::from_utf8(bytes).expect("renderer output is UTF-8")
@@ -4508,14 +4217,14 @@ cd</pre>"##,
 			OverlayOptions::default().width(Dim::Cells(2)),
 		);
 		assert!(ui.has_damage(), "showing an overlay schedules a present");
-		ui.present(&mut renderer, 3, 0).unwrap();
+		ui.present(&mut renderer, 3).unwrap();
 		terminal.apply(&overlay_paint(&mut renderer));
 		assert_eq!(terminal.visible_rows()[1], "betaOV", "centered layer over the middle row");
 		assert!(ui.has_overlay());
 
 		assert!(ui.close_overlay(id));
 		assert!(ui.has_damage(), "closing an overlay schedules a present");
-		ui.present(&mut renderer, 3, 0).unwrap();
+		ui.present(&mut renderer, 3).unwrap();
 		terminal.apply(&overlay_paint(&mut renderer));
 		assert_eq!(terminal.visible_rows(), ["alpha", "beta", "gamma"]);
 		assert!(!ui.has_overlay());
@@ -4542,7 +4251,7 @@ cd</pre>"##,
 			OverlayOptions::default().width(Dim::Cells(2)).z(-1),
 		);
 
-		ui.present(&mut renderer, 3, 0).unwrap();
+		ui.present(&mut renderer, 3).unwrap();
 		terminal.apply(&overlay_paint(&mut renderer));
 		assert_eq!(terminal.visible_rows()[1], "betaAA");
 		assert_eq!(ui.top_overlay(), Some(a_id));
@@ -4598,6 +4307,36 @@ cd</pre>"##,
 	}
 
 	#[test]
+	fn bottom_clipped_base_hit_uses_viewport_coordinates() {
+		let mut ui = Ui::from_markup(
+			"<col><button id=top>aa</button><button id=bottom>bb</button></col>",
+			12,
+			UiContext::default(),
+		)
+		.unwrap();
+		let bottom_hit = ui
+			.hits()
+			.iter()
+			.find(|hit| {
+				find_id(ui.root(), "bottom").is_some_and(|cached| cached.comp().slot() == hit.slot)
+			})
+			.copied()
+			.expect("bottom button paints a hit region");
+		let mut renderer = Renderer::new(Vec::new());
+		ui.present(&mut renderer, 1).unwrap();
+		assert_eq!(ui.viewport_frame.size(), Size::new(12, 1));
+		assert_eq!(
+			frame_row_text(&ui.viewport_frame, 0),
+			frame_row_text(&ui.frame, bottom_hit.rect.y)
+		);
+
+		assert_eq!(
+			ui.handle_mouse(bottom_hit.rect.x, 0, Mouse::Click),
+			UiEvent::Pressed(sf!("bottom"))
+		);
+	}
+
+	#[test]
 	fn overlay_occludes_mouse_within_bounds_and_falls_through_outside() {
 		let mut ui = Ui::from_markup(
 			"<row><button id=left>aa</button><button id=right>bb</button></row>",
@@ -4621,7 +4360,7 @@ cd</pre>"##,
 				.row(Dim::Cells(0)),
 		);
 		let mut renderer = Renderer::new(Vec::new());
-		ui.present(&mut renderer, 1, 0).unwrap();
+		ui.present(&mut renderer, 1).unwrap();
 
 		assert_eq!(
 			ui.handle_mouse(1, 0, Mouse::Click),
@@ -4647,14 +4386,14 @@ cd</pre>"##,
 			dom! { <text>{"OV"}</text> },
 			OverlayOptions::default().width(Dim::Cells(2)),
 		);
-		ui.present(&mut renderer, 1, 0).unwrap();
+		ui.present(&mut renderer, 1).unwrap();
 		terminal.apply(&overlay_paint(&mut renderer));
 		assert!(terminal.visible_rows()[0].contains("OV"));
 
 		assert!(ui.set_overlay_hidden(id, true));
 		ui.handle_key(Key::Char('x'));
 		assert_eq!(ui.values()["base"], "x", "hidden overlays release the keyboard");
-		ui.present(&mut renderer, 1, 0).unwrap();
+		ui.present(&mut renderer, 1).unwrap();
 		terminal.apply(&overlay_paint(&mut renderer));
 		assert!(!terminal.visible_rows()[0].contains("OV"), "hidden overlays stop compositing");
 
@@ -4747,7 +4486,7 @@ cd</pre>"##,
 				.row(Dim::Cells(0)),
 		);
 		let mut renderer = Renderer::new(Vec::new());
-		ui.present(&mut renderer, 1, 0).unwrap();
+		ui.present(&mut renderer, 1).unwrap();
 
 		ui.handle_mouse(15, 0, Mouse::Click);
 		assert_eq!(ui.focused_overlay(), Some(rail), "a click inside the band focuses the pane");
@@ -4804,7 +4543,7 @@ cd</pre>"##,
 				.anchor(OverlayAnchor::Right)
 				.width(Dim::Cells(1)),
 		);
-		ui.present(&mut renderer, 4, 0).unwrap();
+		ui.present(&mut renderer, 4).unwrap();
 		terminal.apply(&overlay_paint(&mut renderer));
 		let rows = terminal.visible_rows();
 		assert_eq!(rows[0], "aaaa      A", "the band spans the full viewport height");
@@ -4833,22 +4572,6 @@ cd</pre>"##,
 		assert_eq!(ui.close_active_overlay(), None, "an empty stack has no active layer");
 	}
 
-	/// Column of the caret shown by the most recent paint, `None` when the
-	/// paint left the caret hidden.
-	fn shown_cursor_col(output: &str) -> Option<u16> {
-		let show = output.rfind("\x1b[?25h")?;
-		let segment = &output[..show];
-		let segment = &segment[segment.rfind('\r')? + 1..];
-		if segment.is_empty() {
-			return Some(0);
-		}
-		segment
-			.strip_prefix("\x1b[")?
-			.strip_suffix('C')?
-			.parse()
-			.ok()
-	}
-
 	#[test]
 	fn hardware_cursor_follows_the_keyboard_between_base_and_pane() {
 		let mut ui = Ui::from_markup("<input id=base/>", 20, UiContext::default()).unwrap();
@@ -4862,85 +4585,28 @@ cd</pre>"##,
 		);
 		let mut renderer = Renderer::new(Vec::new());
 
-		ui.present(&mut renderer, 1, 0).unwrap();
-		let col = shown_cursor_col(&overlay_paint(&mut renderer))
+		ui.present(&mut renderer, 1).unwrap();
+		assert_eq!(ui.viewport_frame.cursor(), ui.frame.cursor(), "viewport carries base cursor");
+		let col = renderer
+			.screen_cursor()
+			.map(|(_, col)| col)
 			.expect("the base caret shows through a passive pane");
 		assert!(col < 14, "caret sits in the composer, got column {col}");
 
 		ui.focus_overlay(rail);
-		ui.present(&mut renderer, 1, 0).unwrap();
-		let col =
-			shown_cursor_col(&overlay_paint(&mut renderer)).expect("the focused pane owns the caret");
+		ui.present(&mut renderer, 1).unwrap();
+		let col = renderer
+			.screen_cursor()
+			.map(|(_, col)| col)
+			.expect("the focused pane owns the caret");
 		assert!(col >= 14, "caret sits in the pane band, got column {col}");
 
 		ui.blur_overlay();
-		ui.present(&mut renderer, 1, 0).unwrap();
-		let col = shown_cursor_col(&overlay_paint(&mut renderer))
+		ui.present(&mut renderer, 1).unwrap();
+		let col = renderer
+			.screen_cursor()
+			.map(|(_, col)| col)
 			.expect("blurring returns the caret to the composer");
 		assert!(col < 14, "caret back in the composer, got column {col}");
-	}
-
-	#[test]
-	fn update_component_typed_path() {
-		use crate::{
-			component::Component,
-			components::{Col, TranscriptView},
-		};
-		let view = TranscriptView::new().with(Prop::Id, "transcript");
-		let mut ui = Ui::from_root(view, 40, UiContext::default());
-
-		let mut renderer = Renderer::new(Vec::new());
-		ui.present(&mut renderer, 10, 0).unwrap();
-		let initial_height = ui.frame.size().height;
-
-		let mut first_child_slot = 0;
-		let changed = ui.update_component::<TranscriptView>("transcript", |view| {
-			let mut child = Col::new();
-			child.props_mut().set(Prop::H, 2_u16);
-			first_child_slot = child.slot();
-			view.push(Cached::new(Box::new(child)));
-			true
-		});
-		assert!(changed);
-		ui.present(&mut renderer, 10, 0).unwrap();
-		assert!(ui.frame.size().height > initial_height);
-
-		ui.update_component::<TranscriptView>("transcript", |view| {
-			let child = Col::new();
-			view.push(Cached::new(Box::new(child)));
-			true
-		});
-		ui.present(&mut renderer, 10, 0).unwrap();
-
-		let mut tail_child_slot = 0;
-		let changed = ui.update_component::<TranscriptView>("transcript", |view| {
-			let child = Col::new();
-			tail_child_slot = child.slot();
-			view.replace_tail(Cached::new(Box::new(child)));
-			true
-		});
-		assert!(changed);
-		ui.present(&mut renderer, 10, 0).unwrap();
-
-		let final_slots: Vec<_> = ui
-			.root
-			.comp()
-			.children()
-			.iter()
-			.map(|c| c.comp().slot())
-			.collect();
-		assert_eq!(final_slots.len(), 2);
-		assert_eq!(final_slots[0], first_child_slot, "Earlier slot preserved");
-		assert_eq!(final_slots[1], tail_child_slot, "Tail slot replaced");
-
-		let mut wrong_type_called = false;
-		let changed = ui.update_component::<Col>("transcript", |_| {
-			wrong_type_called = true;
-			true
-		});
-		assert!(!changed, "Wrong type returns false");
-		assert!(!wrong_type_called, "Wrong type does not call closure");
-		let changed = ui.update_component::<TranscriptView>("transcript", |_| false);
-		assert!(!changed, "No-op returns false");
 	}
 }

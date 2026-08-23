@@ -496,12 +496,14 @@ mod server {
 	use std::{
 		env, fs, future,
 		io::{self, Read as _, Write as _},
-		os::unix::net,
+		os::unix::net::{UnixListener, UnixStream},
 		path::PathBuf,
 		task::Poll,
 		thread,
 		time::{Duration, Instant},
 	};
+
+	use flume::Receiver;
 
 	use super::{
 		DEBUG_ENV, DebugQuery, DebugRequest, RESPONSES, TerminalEvent, direct_response, parse_request,
@@ -526,7 +528,7 @@ mod server {
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 			Err(error) => return Err(error),
 		}
-		let listener = net::UnixListener::bind(&path)?;
+		let listener = UnixListener::bind(&path)?;
 		listener.set_nonblocking(true)?;
 		let (responses_tx, responses_rx) = flume::unbounded();
 		*RESPONSES.lock() = Some(responses_tx);
@@ -557,10 +559,7 @@ mod server {
 	/// ([`direct_response`]); retained-state ops ride the terminal mailbox
 	/// as [`TerminalEvent::Debug`] queries and resolve when the host calls
 	/// [`super::respond_debug_query`] — or expire for hosts that never answer.
-	async fn serve_loop(
-		server: &mut DebugServer,
-		responses: flume::Receiver<(u64, serde_json::Value)>,
-	) {
+	async fn serve_loop(server: &mut DebugServer, responses: Receiver<(u64, serde_json::Value)>) {
 		let mut pending: Vec<PendingQuery> = Vec::new();
 		let mut next_id = 1_u64;
 		loop {
@@ -636,7 +635,7 @@ mod server {
 
 	/// Line-framed JSON server owned by the debug thread.
 	struct DebugServer {
-		listener:  async_io::Async<net::UnixListener>,
+		listener:  async_io::Async<UnixListener>,
 		conns:     Vec<Conn>,
 		next_conn: u64,
 	}
@@ -645,7 +644,7 @@ mod server {
 		/// Stable client id; survives [`DebugServer::recv`]'s compaction of
 		/// dead connections, so pending queries can hold it across calls.
 		id:     u64,
-		stream: async_io::Async<net::UnixStream>,
+		stream: async_io::Async<UnixStream>,
 		buf:    Vec<u8>,
 		out:    Vec<u8>,
 		dead:   bool,
@@ -702,7 +701,7 @@ mod server {
 	}
 
 	impl DebugServer {
-		const fn new(listener: async_io::Async<net::UnixListener>) -> Self {
+		const fn new(listener: async_io::Async<UnixListener>) -> Self {
 			Self { listener, conns: Vec::new(), next_conn: 1 }
 		}
 
@@ -778,7 +777,11 @@ mod server {
 
 	#[cfg(test)]
 	mod tests {
-		use std::{env, fs, os::unix::net, time::Duration};
+		use std::{
+			env, fs,
+			os::unix::net::{UnixListener, UnixStream},
+			time::Duration,
+		};
 
 		use futures_lite::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
@@ -799,7 +802,7 @@ mod server {
 				let path =
 					env::temp_dir().join(format!("omp-tui-debug-idtest-{}.sock", std::process::id()));
 				let _ = fs::remove_file(&path);
-				let listener = net::UnixListener::bind(&path).expect("test socket binds");
+				let listener = UnixListener::bind(&path).expect("test socket binds");
 				listener
 					.set_nonblocking(true)
 					.expect("nonblocking listener");
@@ -808,7 +811,7 @@ mod server {
 				let serve = executor.spawn(async move { serve_loop(&mut server, responses_rx).await });
 
 				// Client A parks a retained query (id 1), then disconnects.
-				let mut first = async_io::Async::<net::UnixStream>::connect(&path)
+				let mut first = async_io::Async::<UnixStream>::connect(&path)
 					.await
 					.expect("first client connects");
 				first
@@ -824,7 +827,7 @@ mod server {
 
 				// Client B lands on the compacted slot an index token would
 				// still name and gets its own answer.
-				let second = async_io::Async::<net::UnixStream>::connect(&path)
+				let second = async_io::Async::<UnixStream>::connect(&path)
 					.await
 					.expect("second client connects");
 				let mut second = BufReader::new(second);

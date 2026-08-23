@@ -1,6 +1,6 @@
 use super::layout::{stack_height, stack_measure, stack_place};
 use crate::{
-	component::{Cached, Component, IntoChildren, PaintCtx, ResizeTail, Slot, next_slot},
+	component::{Cached, Component, IntoChildren, PaintCtx, Slot, next_slot},
 	context::UiContext,
 	frame::Rect,
 	props::{Prop, PropValue, Props},
@@ -63,20 +63,6 @@ impl Component for Col {
 
 	fn children_mut(&mut self) -> &mut [Cached] {
 		&mut self.children
-	}
-
-	fn resize_tail(&mut self) -> Option<ResizeTail<'_>> {
-		// Only a chrome-neutral flow decomposes into drag-frame tails;
-		// styled columns render whole so borders, backgrounds, and
-		// alignment keep full fidelity during a resize.
-		if self.props.border().is_some()
-			|| self.props.valign().is_some()
-			|| self.props.contains(Prop::Bg)
-			|| self.props.contains(Prop::On)
-		{
-			return None;
-		}
-		Some(ResizeTail { children: &mut self.children, gap: self.props.gap() })
 	}
 
 	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {

@@ -32,6 +32,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use flume::Receiver;
 use omp_core::{IntoStr, Str};
 use smallvec::SmallVec;
 use tokio_util::sync::CancellationToken;
@@ -156,7 +157,7 @@ impl ClipboardGate {
 #[derive(Clone)]
 pub struct ImageLoader {
 	tx:       flume::Sender<Msg>,
-	rx:       flume::Receiver<Msg>,
+	rx:       Receiver<Msg>,
 	executor: omp_executor::Executor,
 }
 
@@ -321,8 +322,8 @@ impl AppOptions {
 	}
 
 	/// Starts with the alternate screen held: the very first frame paints
-	/// there and the inline transcript stays untouched underneath until
-	/// [`App::hold_alt`] releases it. Fullscreen opening scenes — a welcome
+	/// there, and [`App::hold_alt`] later releases it through an atomic
+	/// main-screen repaint. Fullscreen opening scenes — a welcome
 	/// screen, a picker-first flow — use this so the main buffer never
 	/// flashes frame one. A Ui whose initial overlay stack is visible holds
 	/// automatically without this option.
@@ -382,11 +383,10 @@ impl AppOptions {
 		let initial_hold = hold_alt || ui.has_overlay();
 		let last_stats = if initial_hold {
 			let alt_enter = terminal.stage_alt_enter(AltScreenUse::Interactive);
-			ui.preview(&mut renderer, viewport.height, alt_enter.as_deref().unwrap_or(""))?
+			ui.repaint(&mut renderer, viewport.height, alt_enter.as_deref().unwrap_or(""))?
 		} else {
-			renderer.rebuild(ui.frame().clone(), viewport.height, 0, "")?
+			ui.present(&mut renderer, viewport.height)?
 		};
-		ui.clear_damage();
 		let now = Instant::now();
 		Ok(App {
 			executor,
@@ -406,15 +406,9 @@ impl AppOptions {
 			#[cfg(windows)]
 			resize_wait: Some(now + WINDOWS_RESIZE_POLL),
 			resize_settle: None,
-			resize_alt: false,
 			alt_hold: initial_hold,
 			hold_request: hold_alt,
-			main_stale: false,
-			held_damage: false,
-			tail_drag: false,
-			needs_rebuild: false,
 			clipboard: ClipboardGate::default(),
-			stable_rows: 0,
 			last_stats,
 			terminal,
 		})
@@ -507,7 +501,7 @@ pub struct App {
 	executor:       omp_executor::Executor,
 	ui:             Ui,
 	renderer:       Renderer<TtyOut>,
-	msgs:           flume::Receiver<Msg>,
+	msgs:           Receiver<Msg>,
 	tx:             flume::Sender<Msg>,
 	cancel:         CancellationToken,
 	epoch:          Instant,
@@ -518,15 +512,9 @@ pub struct App {
 	quit_on_cancel: bool,
 	resize_wait:    Option<Instant>,
 	resize_settle:  Option<Instant>,
-	resize_alt:     bool,
 	alt_hold:       bool,
 	hold_request:   bool,
-	main_stale:     bool,
-	held_damage:    bool,
-	tail_drag:      bool,
-	needs_rebuild:  bool,
 	clipboard:      ClipboardGate,
-	stable_rows:    u16,
 	last_stats:     PaintStats,
 	terminal:       Terminal,
 }
@@ -573,42 +561,20 @@ impl App {
 		self.viewport
 	}
 
-	/// Returns statistics from the most recent present or rebuild.
+	/// Returns statistics from the most recent viewport paint.
 	pub const fn last_stats(&self) -> PaintStats {
 		self.last_stats
-	}
-
-	/// Sets the immutable leading-row boundary used for presentation.
-	pub const fn set_stable_rows(&mut self, rows: u16) {
-		self.stable_rows = rows;
-	}
-
-	/// Rebuilds terminal history after the retained document is replaced
-	/// wholesale.
-	///
-	/// Direct terminals clear and reconstruct native history on the next
-	/// [`App::next`] call. A visible alternate-screen layer defers that rebuild
-	/// until release so the replacement appears atomically.
-	pub const fn rebuild_history(&mut self) {
-		if self.alt_hold {
-			self.main_stale = true;
-			self.needs_rebuild = false;
-		} else {
-			self.needs_rebuild = true;
-		}
 	}
 
 	/// Requests or releases a persistent alternate-screen hold.
 	///
 	/// Fullscreen scenes — a welcome screen, a pager — hold the alternate
 	/// screen for their lifetime: frames paint there with mouse tracking
-	/// active while the inline transcript stays untouched underneath. Every
-	/// visible modal overlay holds it automatically; this covers scenes
-	/// without one. Non-modal layers ([`crate::OverlayOptions::non_modal`])
-	/// never hold: they composite into the live inline viewport while the
-	/// document keeps committing to native scrollback. Release restores the
-	/// main screen, rebuilding history only when geometry changed while
-	/// held. Takes effect on the next [`App::next`] call.
+	/// active. Every visible modal overlay holds it automatically; this covers
+	/// scenes without one. Non-modal layers
+	/// ([`crate::OverlayOptions::non_modal`]) composite into the live viewport.
+	/// Enter and leave each repaint that viewport atomically with the staged
+	/// terminal sequence. Takes effect on the next [`App::next`] call.
 	pub const fn hold_alt(&mut self, hold: bool) {
 		self.hold_request = hold;
 	}
@@ -630,128 +596,24 @@ impl App {
 				return Ok(None);
 			}
 
-			// Alternate-screen hold: scenes ([`App::hold_alt`]) and visible
-			// modal overlays paint the composited viewport on the alternate
-			// screen while the inline transcript stays untouched underneath.
-			// Non-modal layers ride the inline present instead.
+			// Alternate-screen transitions and ordinary paints all render the
+			// same fixed viewport. Only the staged enter/leave prefix differs.
 			let want_hold = self.hold_request || self.ui.has_overlay();
-			if want_hold {
-				if !self.alt_hold {
-					self.alt_hold = true;
-					// A drag borrow or a pending settled rebuild transfers to
-					// the hold: same buffer, but main-screen history stays
-					// stale until release.
-					if self.resize_alt || self.needs_rebuild {
-						self.resize_alt = false;
-						self.needs_rebuild = false;
-						self.main_stale = true;
-					}
-					// A tail-composed drag deferred the document reflow; the
-					// held surface is live UI, so run it now.
-					if self.tail_drag {
-						self.tail_drag = false;
-						self.ui.resize(self.viewport.width);
-					}
-					self.held_damage |= self.ui.has_damage();
-					let alt_enter = self.terminal.stage_alt_enter(AltScreenUse::Interactive);
-					self.last_stats = self.ui.preview(
-						&mut self.renderer,
-						self.viewport.height,
-						alt_enter.as_deref().unwrap_or(""),
-					)?;
-				} else if self.ui.has_damage() {
-					// Previews consume damage that never reached the main
-					// buffer; remember to repaint it on release.
-					self.held_damage = true;
-					self.last_stats = self
-						.ui
-						.preview(&mut self.renderer, self.viewport.height, "")?;
-				}
-			} else if self.alt_hold {
-				self.alt_hold = false;
-				if self.main_stale {
-					// Geometry changed while held: leaving the alternate
-					// screen rides the rebuild's synchronized update so the
-					// buffer switch, history clear, and repaint land as one
-					// atomic frame.
-					self.main_stale = false;
-					self.held_damage = false;
-					self.ui.refit();
-					let alt_exit = self.terminal.stage_alt_leave().unwrap_or("");
-					self.last_stats = self.renderer.rebuild(
-						self.ui.frame().clone(),
-						self.viewport.height,
-						self.stable_rows,
-						alt_exit,
-					)?;
-					self.ui.clear_damage();
-				} else {
-					// The untouched main screen restores byte-exactly, but
-					// changes made during the hold only ever painted the
-					// alternate screen: revalidate every live row without
-					// touching history.
-					self.terminal.leave_alt()?;
-					if self.held_damage || self.ui.has_damage() {
-						self.held_damage = false;
-						self.ui.damage_all();
-						self.last_stats =
-							self
-								.ui
-								.present(&mut self.renderer, self.viewport.height, self.stable_rows)?;
-					}
-				}
-			} else if self.resize_settle.is_some() {
-				// A drag is live: ordinary damage — spinner ticks, streamed
-				// text, cursor moves — rides the same viewport fast path
-				// instead of freezing until settle; the settle rebuild
-				// repaints authoritatively.
-				if self.ui.has_damage() {
-					let tail = if self.tail_drag {
-						self.ui.compose_resize_tail(self.viewport)
-					} else {
-						None
-					};
-					match tail {
-						Some(frame) => {
-							self.renderer.preview(&frame, self.viewport.height, "")?;
-							self.ui.clear_damage();
-						},
-						None => {
-							self.last_stats =
-								self
-									.ui
-									.preview(&mut self.renderer, self.viewport.height, "")?;
-						},
-					}
-				}
-			} else if self.needs_rebuild {
-				// The app's `Resized` handler may have shrunk fixed-height
-				// components; drop the height watermark from the old viewport
-				// so the rebuilt document matches the content, not the
-				// pre-resize maximum.
-				self.ui.refit();
-				// Leaving the borrowed alternate screen rides the rebuild's
-				// synchronized update: buffer switch, history clear, and the
-				// settled repaint land as one atomic frame.
-				let alt_exit = if self.resize_alt {
-					self.resize_alt = false;
-					self.terminal.stage_alt_leave().unwrap_or("")
-				} else {
-					""
-				};
-				self.last_stats = self.renderer.rebuild(
-					self.ui.frame().clone(),
-					self.viewport.height,
-					self.stable_rows,
-					alt_exit,
-				)?;
-				self.ui.clear_damage();
-				self.needs_rebuild = false;
-			} else if self.ui.has_damage() {
-				self.last_stats =
+			if want_hold != self.alt_hold {
+				self.alt_hold = want_hold;
+				let prefix = if want_hold {
 					self
-						.ui
-						.present(&mut self.renderer, self.viewport.height, self.stable_rows)?;
+						.terminal
+						.stage_alt_enter(AltScreenUse::Interactive)
+						.unwrap_or_default()
+				} else {
+					Str::new(self.terminal.stage_alt_leave().unwrap_or(""))
+				};
+				self.last_stats = self
+					.ui
+					.repaint(&mut self.renderer, self.viewport.height, &prefix)?;
+			} else if self.ui.has_damage() {
+				self.last_stats = self.ui.present(&mut self.renderer, self.viewport.height)?;
 			}
 
 			// Replay input queued behind a clipboard read — oldest first, one
@@ -844,10 +706,8 @@ impl App {
 					self.resize_wait = None;
 					let now = Instant::now();
 					let consumed = match self.terminal.take_resize()? {
-						// A same-size report outside a drag is an echo — some
-						// terminals re-report geometry whenever the alternate
-						// screen toggles — and starting a preview for it would
-						// loop the borrow forever.
+						// A same-size report outside a drag is an echo. During
+						// an active resize burst it refreshes the settle deadline.
 						Some(viewport) if viewport != self.viewport || self.resize_settle.is_some() => {
 							self.begin_resize(viewport, now)?;
 							true
@@ -870,17 +730,6 @@ impl App {
 				},
 				Wakeup::ResizeSettle => {
 					self.resize_settle = None;
-					if self.tail_drag {
-						self.tail_drag = false;
-						// The drag composed viewport tails only; reflow the
-						// whole document once, before the app's `Resized`
-						// handler and the settled rebuild observe layout.
-						self.ui.resize(self.viewport.width);
-					}
-					// While held, main-screen history is already flagged stale
-					// and rebuilds on release; only inline sessions rebuild at
-					// settle.
-					self.needs_rebuild = !self.alt_hold;
 					return Ok(Some(AppEvent::Resized(self.viewport)));
 				},
 			}
@@ -1019,11 +868,7 @@ impl App {
 				routed => routed,
 			},
 			InputEvent::Mouse(report) => {
-				let offset = self.ui.height().saturating_sub(self.viewport.height);
-				let event =
-					self
-						.ui
-						.handle_mouse(report.col, report.row.saturating_add(offset), report.kind);
+				let event = self.ui.handle_mouse(report.col, report.row, report.kind);
 				match select_event(event) {
 					Ok(event) => Routed::Event(event),
 					Err(UiEvent::Submit) => Routed::Event(AppEvent::Submitted),
@@ -1049,50 +894,17 @@ impl App {
 		}
 	}
 
-	/// Applies new terminal geometry: relayout, drag preview, settle timer.
+	/// Applies new terminal geometry: relayout, full viewport paint, settle
+	/// timer.
 	///
 	/// Shared by the SIGWINCH-driven recheck and the `OMP_TUI_DEBUG` `resize`
 	/// op, which bypasses [`Terminal::take_resize`] because no resize signal
 	/// reaches an `OMP_TTY` override device.
 	fn begin_resize(&mut self, viewport: Size, now: Instant) -> io::Result<()> {
-		let width_changed = viewport.width != self.viewport.width;
 		self.viewport = viewport;
-		if self.alt_hold {
-			// The held surface is live UI: relayout immediately and repaint
-			// in place; the main-screen rebuild waits for release.
-			self.main_stale = true;
-			self.ui.resize(viewport.width);
-			self.ui.preview(&mut self.renderer, viewport.height, "")?;
-		} else {
-			// Only a width change borrows the alternate screen: the normal
-			// buffer rewraps under width churn, while height-only resizes
-			// repaint in place — and alt toggling on a height echo can
-			// self-sustain (terminals re-report size across the toggle).
-			// Multiplexer panes repaint in place: the host terminal owns
-			// the real screen. The settled rebuild leaves a borrow
-			// atomically.
-			let alt_enter = if self.caps.inside_multiplexer {
-				None
-			} else if width_changed && !self.resize_alt {
-				let staged = self.terminal.stage_alt_enter(AltScreenUse::Resize);
-				self.resize_alt |= staged.is_some();
-				staged
-			} else {
-				None
-			};
-			let leading = alt_enter.as_deref().unwrap_or("");
-			// Drag frames compose one viewport tail bottom-up at the new
-			// width; the O(document) reflow is deferred to settle.
-			if let Some(frame) = self.ui.compose_resize_tail(viewport) {
-				self.tail_drag = true;
-				self.renderer.preview(&frame, viewport.height, leading)?;
-			} else {
-				self.ui.resize(viewport.width);
-				self
-					.ui
-					.preview(&mut self.renderer, viewport.height, leading)?;
-			}
-		}
+		self.ui.resize(viewport.width);
+		self.ui.damage_all();
+		self.last_stats = self.ui.present(&mut self.renderer, viewport.height)?;
 		self.resize_settle = Some(now + RESIZE_SETTLE);
 		Ok(())
 	}
@@ -1125,10 +937,9 @@ impl App {
 
 impl Drop for App {
 	fn drop(&mut self) {
-		// The final inline screen persists into native scrollback once the
-		// shell resumes, so composited layer cells must not survive
-		// teardown: release any alternate-screen hold, then repaint layer
-		// bands from the raw document. Best effort — teardown cannot fail.
+		// Renderer layer state is surface-local and must not survive teardown:
+		// release any alternate-screen hold, then clear composited bands.
+		// Best effort — teardown cannot fail.
 		let _ = self.terminal.leave_alt();
 		let _ = self.renderer.clear_layers();
 	}
@@ -1231,7 +1042,7 @@ async fn deadline(executor: &omp_executor::Executor, at: Option<Instant>) {
 #[cfg(test)]
 mod tests {
 	use std::{
-		env, fs, io, process, thread, time,
+		env, fs, io, process, thread,
 		time::{Duration, Instant},
 	};
 
@@ -1328,11 +1139,13 @@ mod tests {
 	fn hold_alt_start_holds_without_overlay_and_releases() {
 		use std::io::Read as _;
 
+		use nix::fcntl::{FcntlArg, OFlag};
+
 		let winsize = nix::pty::Winsize { ws_row: 12, ws_col: 40, ws_xpixel: 0, ws_ypixel: 0 };
 		let pty = nix::pty::openpty(Some(&winsize), None).expect("openpty succeeds");
 		let device = nix::unistd::ttyname(&pty.slave).expect("the pty slave has a device path");
 		let mut master = fs::File::from(pty.master);
-		nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
+		nix::fcntl::fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
 			.expect("master goes nonblocking");
 
 		let exe = env::current_exe().expect("test binary path");
@@ -1347,7 +1160,7 @@ mod tests {
 
 		let mut stream = Vec::new();
 		let mut buffer = [0_u8; 4096];
-		let deadline = time::Instant::now() + Duration::from_secs(20);
+		let deadline = Instant::now() + Duration::from_secs(20);
 		loop {
 			match master.read(&mut buffer) {
 				Ok(0) => break,
@@ -1615,8 +1428,10 @@ mod tests {
 
 	#[test]
 	fn ui_handle_applies_sync_thread_update_between_frames() {
+		use super::CancellationToken;
+
 		let (tx, rx) = flume::unbounded();
-		let handle = UiHandle { tx, cancel: tokio_util::sync::CancellationToken::new() };
+		let handle = UiHandle { tx, cancel: CancellationToken::new() };
 		let mut ui =
 			Ui::from_markup(r#"<text id="message">before</text>"#, 20, UiContext::default()).unwrap();
 		let before = frame_row_text(ui.frame(), 0);

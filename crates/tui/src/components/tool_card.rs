@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use omp_core::{IntoStr, Str};
 
 use crate::{
@@ -24,29 +26,37 @@ pub enum ToolState {
 }
 
 /// A themed card component representing one tool call across its lifecycle.
+///
+/// Parents must not paint or hit-test a card granted zero rows.
 pub struct ToolCard {
-	props:    Props,
-	slot:     Slot,
-	state:    ToolState,
-	name:     Str,
-	intent:   Str,
-	badge:    Str,
-	folded:   bool,
-	children: Vec<Cached>,
+	props:         Props,
+	slot:          Slot,
+	state:         ToolState,
+	name:          Str,
+	intent:        Str,
+	activity:      Str,
+	badge:         Str,
+	folded:        bool,
+	last_paint_at: Duration,
+	finalized_at:  Option<Duration>,
+	children:      Vec<Cached>,
 }
 
 impl ToolCard {
 	/// Creates a new tool card in the streaming state, unfolded by default.
 	pub fn new() -> Self {
 		Self {
-			props:    Props::new(),
-			slot:     next_slot(),
-			state:    ToolState::Streaming,
-			name:     Str::default(),
-			intent:   Str::default(),
-			badge:    Str::default(),
-			folded:   false,
-			children: Vec::new(),
+			props:         Props::new(),
+			slot:          next_slot(),
+			state:         ToolState::Streaming,
+			name:          Str::default(),
+			intent:        Str::default(),
+			activity:      Str::default(),
+			badge:         Str::default(),
+			folded:        false,
+			last_paint_at: Duration::ZERO,
+			finalized_at:  None,
+			children:      Vec::new(),
 		}
 	}
 
@@ -78,6 +88,10 @@ impl ToolCard {
 			return false;
 		}
 		self.state = state;
+		self.finalized_at = match state {
+			ToolState::Streaming => None,
+			ToolState::Success | ToolState::Failure => Some(self.last_paint_at),
+		};
 		true
 	}
 
@@ -100,6 +114,26 @@ impl ToolCard {
 	/// Sets the intent or summary text.
 	pub fn intent(mut self, intent: impl IntoStr) -> Self {
 		self.set_intent(intent);
+		self
+	}
+
+	/// In-place update: the one-line semantic progress shown when collapsed.
+	///
+	/// An empty activity restores the stable intent as the collapsed fallback.
+	pub fn set_activity(&mut self, activity: impl IntoStr) -> bool {
+		let activity = activity.into_str();
+		if self.activity == activity {
+			return false;
+		}
+		self.activity = activity;
+		true
+	}
+
+	/// Sets the one-line semantic progress shown when collapsed.
+	///
+	/// An empty activity restores the stable intent as the collapsed fallback.
+	pub fn activity(mut self, activity: impl IntoStr) -> Self {
+		self.set_activity(activity);
 		self
 	}
 
@@ -165,6 +199,27 @@ impl ToolCard {
 			ToolState::Failure => ctx.theme.err,
 		}
 	}
+
+	fn collapsed_indicator(&self, pc: &mut PaintCtx<'_>) -> &'static str {
+		const STEP: Duration = Duration::from_millis(120);
+		const END: Duration = Duration::from_millis(240);
+
+		let pulse = pc.ctx.charset.pulse();
+		let Some(start) = self.finalized_at else {
+			pc.wake(self.slot, pulse.next_change(pc.now));
+			return pulse.at(pc.now);
+		};
+		let elapsed = pc.now.saturating_sub(start);
+		if elapsed < STEP {
+			pc.wake(self.slot, start.saturating_add(STEP));
+			pulse.at(END)
+		} else if elapsed < END {
+			pc.wake(self.slot, start.saturating_add(END));
+			pulse.at(STEP)
+		} else {
+			pulse.at(Duration::ZERO)
+		}
+	}
 }
 
 impl Default for ToolCard {
@@ -196,7 +251,7 @@ impl Component for ToolCard {
 
 	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {
 		let name_len = cell_width(&self.name);
-		let intent_len = cell_width(&self.intent);
+		let intent_len = cell_width(&self.intent).max(cell_width(&self.activity));
 		let badge_len = cell_width(&self.badge);
 		let header_min = 5 + name_len + intent_len + badge_len;
 		let header_nat = header_min.saturating_add(if badge_len > 0 { 2 } else { 0 });
@@ -235,14 +290,12 @@ impl Component for ToolCard {
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
-		if rect.y >= pc.clip || rect.width == 0 {
+		if rect.y >= pc.clip || rect.width == 0 || rect.height == 0 {
 			return;
 		}
+		self.last_paint_at = pc.now;
+		let granted_height = rect.height;
 
-		let expander = pc
-			.ctx
-			.charset
-			.expander(!self.folded && !self.children.is_empty());
 		let header_color = self.header_color(pc.ctx);
 		let header_style = Style::new().fg(header_color);
 		let normal_style = Style::new().fg(pc.ctx.theme.fg);
@@ -251,22 +304,34 @@ impl Component for ToolCard {
 		let mut x = rect.x;
 		let y = rect.y;
 
-		x = pc.frame.put(x, y, expander, header_style);
+		let leading = if granted_height >= 3 {
+			pc.ctx
+				.charset
+				.expander(!self.folded && !self.children.is_empty())
+		} else {
+			"  "
+		};
+		x = pc.frame.put(x, y, leading, header_style);
 
-		match self.state {
-			ToolState::Streaming => {
-				let frames = pc.ctx.charset.spinner();
-				x = pc.frame.put(x, y, frames.at(pc.now), header_style);
-				pc.wake(self.slot, frames.next_change(pc.now));
-			},
-			ToolState::Success => {
-				x = pc.frame.put(x, y, pc.ctx.charset.check(), header_style);
-			},
-			ToolState::Failure => {
-				x = pc
-					.frame
-					.put(x, y, pc.ctx.charset.icon(Icon::Error), header_style);
-			},
+		if granted_height == 1 {
+			let indicator = self.collapsed_indicator(pc);
+			x = pc.frame.put(x, y, indicator, header_style);
+		} else {
+			match self.state {
+				ToolState::Streaming => {
+					let frames = pc.ctx.charset.spinner();
+					x = pc.frame.put(x, y, frames.at(pc.now), header_style);
+					pc.wake(self.slot, frames.next_change(pc.now));
+				},
+				ToolState::Success => {
+					x = pc.frame.put(x, y, pc.ctx.charset.check(), header_style);
+				},
+				ToolState::Failure => {
+					x = pc
+						.frame
+						.put(x, y, pc.ctx.charset.icon(Icon::Error), header_style);
+				},
+			}
 		}
 		x = pc.frame.put(x, y, " ", header_style);
 
@@ -275,15 +340,19 @@ impl Component for ToolCard {
 			x = pc.frame.put(x, y, " ", normal_style);
 		}
 
-		if !self.intent.is_empty() {
+		let summary = if granted_height == 1 && !self.activity.is_empty() {
+			&self.activity
+		} else {
+			&self.intent
+		};
+		if !summary.is_empty() {
 			let badge_width = cell_width(&self.badge);
 			let mut available = rect.x.saturating_add(rect.width).saturating_sub(x);
 			if !self.badge.is_empty() {
 				available = available.saturating_sub(badge_width + 1);
 			}
 
-			let text = &self.intent[..];
-			x = pc.frame.put_clipped(x, y, available, text, normal_style);
+			x = pc.frame.put_clipped(x, y, available, summary, normal_style);
 		}
 
 		if !self.badge.is_empty() {
@@ -295,25 +364,28 @@ impl Component for ToolCard {
 			pc.frame.put(badge_x, y, &self.badge, muted_style);
 		}
 
-		if self.folded || self.children.is_empty() {
+		if granted_height == 1 {
 			return;
 		}
 
-		for child in self.children.iter_mut().filter(|child| child.visible) {
-			child.paint(pc);
+		let bottom_y = y.saturating_add(granted_height.saturating_sub(1));
+		if granted_height >= 3 && !self.folded && !self.children.is_empty() {
+			let outer_clip = pc.clip;
+			pc.clip = pc.clip.min(bottom_y);
+			for child in self.children.iter_mut().filter(|child| child.visible) {
+				child.paint(pc);
+			}
+			pc.clip = outer_clip;
 		}
 
 		let (_, last, rail) = pc.ctx.charset.guides(Border::Round);
-
-		let child_h = rect.height.saturating_sub(2);
-		for row in 0..child_h {
+		for row in 0..granted_height.saturating_sub(2) {
 			let cy = y + 1 + row;
 			if cy < pc.clip {
 				pc.frame.put(rect.x, cy, rail, header_style);
 			}
 		}
 
-		let bottom_y = y + 1 + child_h;
 		if bottom_y < pc.clip {
 			let mut bx = pc.frame.put(rect.x, bottom_y, last, header_style);
 			let width = rect.width.saturating_sub(2);
@@ -436,5 +508,97 @@ mod tests {
 		// Verify the component folded by checking that the row is cleared, independent
 		// of the monotonic frame height.
 		assert_eq!(frame_row_text(ui.frame(), 1), "");
+	}
+	fn gallery_card(height: u16) -> ToolCard {
+		ToolCard::new()
+			.with(Prop::H, height)
+			.name("read")
+			.intent("src/lib.rs")
+			.badge("2ms")
+			.child(TextLeaf::new().text("body row"))
+	}
+	fn text_column(row: &str, text: &str) -> u16 {
+		let byte = row.find(text).expect("text is present");
+		cell_width(&row[..byte])
+	}
+
+	#[test]
+	fn granted_heights_preserve_header_identity() {
+		let tall = Ui::from_root(gallery_card(3), 32, UiContext::default());
+		let bridge = Ui::from_root(gallery_card(2), 32, UiContext::default());
+		let collapsed = Ui::from_root(gallery_card(1), 32, UiContext::default());
+		let tall_row = frame_row_text(tall.frame(), 0);
+		let bridge_row = frame_row_text(bridge.frame(), 0);
+		let collapsed_row = frame_row_text(collapsed.frame(), 0);
+
+		assert_eq!(tall_row, "▾ ⠋ read src/lib.rs          2ms");
+		assert_eq!(bridge_row, "  ⠋ read src/lib.rs          2ms");
+		assert_eq!(collapsed_row, "  · read src/lib.rs          2ms");
+		assert_eq!(text_column(&tall_row, "read"), 4);
+		assert_eq!(text_column(&bridge_row, "read"), 4);
+		assert_eq!(text_column(&collapsed_row, "read"), 4);
+	}
+
+	#[test]
+	fn two_rows_are_header_and_closing_rail_only() {
+		let ui = Ui::from_root(gallery_card(2), 32, UiContext::default());
+
+		assert_eq!(frame_row_text(ui.frame(), 0), "  ⠋ read src/lib.rs          2ms");
+		assert_eq!(frame_row_text(ui.frame(), 1), format!("╰{}", "─".repeat(31)));
+		assert!(!frame_row_text(ui.frame(), 1).contains("body row"));
+	}
+
+	#[test]
+	fn finalized_one_row_pulse_attenuates_on_shared_clock() {
+		let card = ToolCard::new()
+			.with(Prop::Id, "pulse")
+			.with(Prop::H, 1_u16)
+			.name("read")
+			.activity("active");
+		let mut ui = Ui::from_root(card, 20, UiContext::default());
+		ui.tick(Duration::from_millis(240));
+		assert_eq!(frame_row_text(ui.frame(), 0), "  ● read active");
+
+		assert!(
+			ui.update_component::<ToolCard>("pulse", |card| { card.set_state(ToolState::Success) })
+		);
+		assert_eq!(frame_row_text(ui.frame(), 0), "  ● read active");
+		ui.tick(Duration::from_millis(360));
+		assert_eq!(frame_row_text(ui.frame(), 0), "  • read active");
+		ui.tick(Duration::from_millis(480));
+		assert_eq!(frame_row_text(ui.frame(), 0), "  · read active");
+	}
+
+	#[test]
+	fn streaming_body_growth_is_clipped_to_granted_height() {
+		let card = ToolCard::new()
+			.with(Prop::Id, "growing")
+			.with(Prop::H, 3_u16)
+			.name("bash")
+			.intent("running")
+			.child(TextLeaf::new().text("one"));
+		let mut ui = Ui::from_root(card, 24, UiContext::default());
+
+		assert!(ui.update_component::<ToolCard>("growing", |card| {
+			card.replace_body(TextLeaf::new().text("one\ntwo\nthree\nfour"))
+		}));
+		assert_eq!(ui.frame().size().height, 3);
+		assert_eq!(frame_row_text(ui.frame(), 1), "│ one");
+		assert_eq!(frame_row_text(ui.frame(), 2), format!("╰{}", "─".repeat(23)));
+	}
+
+	#[test]
+	fn one_row_shows_pulse_name_activity_and_badge_without_chrome() {
+		let card = ToolCard::new()
+			.with(Prop::H, 1_u16)
+			.name("read")
+			.intent("stable intent")
+			.activity("reading lines 1-8")
+			.badge("2ms")
+			.child(TextLeaf::new().text("hidden body"));
+		let ui = Ui::from_root(card, 32, UiContext::default());
+		let row = frame_row_text(ui.frame(), 0);
+
+		assert_eq!(row, "  · read reading lines 1-8   2ms");
 	}
 }

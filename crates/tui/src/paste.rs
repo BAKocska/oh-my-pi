@@ -26,6 +26,7 @@ use std::{
 
 use omp_core::{Str, base64, hex, sf};
 use smallvec::SmallVec;
+use tokio::sync::{oneshot, oneshot::Receiver};
 
 use crate::{Key, imagefmt, imagefmt::ImageFormat};
 
@@ -675,10 +676,8 @@ impl ClipboardRead {
 /// thread dies with the process. Backend subprocesses cap themselves at
 /// 5–8 s, but a hung *native* handle can outlive that — pair the receiver
 /// with a deadline and drop it to abandon the read.
-pub fn spawn_clipboard_read(
-	scope: ClipboardRead,
-) -> tokio::sync::oneshot::Receiver<Option<Clipboard>> {
-	let (tx, rx) = tokio::sync::oneshot::channel();
+pub fn spawn_clipboard_read(scope: ClipboardRead) -> Receiver<Option<Clipboard>> {
+	let (tx, rx) = oneshot::channel();
 	// A spawn error drops `tx`, closing the channel: the failure is
 	// observable immediately instead of after the caller's deadline.
 	let _ = thread::Builder::new()
