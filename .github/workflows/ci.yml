@@ -107,7 +107,7 @@ jobs:
           rustup show active-toolchain
 
       - name: Install native build tools
-        run: brew install lld uv zstd
+        run: brew install lld uv zstd ninja
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
