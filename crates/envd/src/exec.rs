@@ -454,6 +454,11 @@ impl ExecHost {
 
 	/// Enables durable named-process metadata and recovers verified detached
 	/// generations before accepting new launches.
+	///
+	/// Exactly one live composition owns durable process metadata per state
+	/// directory. When another environment daemon already holds the lease,
+	/// this host keeps running with in-memory process state only; recovery
+	/// and persistence stay with the lease owner.
 	pub fn with_process_store(self, store: ProcessStore) -> Result<Self, ExecError> {
 		let daemon = ProcessIdentity::current()?;
 		let mut snapshot = store
@@ -469,7 +474,18 @@ impl ExecHost {
 			.unwrap_or(0)
 			.saturating_add(1);
 		self.inner.next_order.store(next_order, Ordering::Relaxed);
-		let lease = DaemonLease::acquire(&store.process_root().join("envd.lease"))?;
+		let lease = match DaemonLease::acquire(&store.process_root().join("envd.lease")) {
+			Ok(lease) => lease,
+			Err(LeaseError::AlreadyOwned) => {
+				tracing::debug!(
+					root = %store.process_root().display(),
+					"durable process metadata is owned by another environment daemon; \
+					 running with in-memory process state"
+				);
+				return Ok(self);
+			},
+			Err(error) => return Err(error.into()),
+		};
 		store.save(&snapshot)?;
 		*self.inner.persistence.lock() = Some(ProcessPersistence { store, snapshot, _lease: lease });
 		self.recover_records(records)?;
@@ -2865,6 +2881,25 @@ mod tests {
 			}),
 			Err(ExecError::StaleFinalCwdRevision),
 		));
+	}
+
+	#[test]
+	fn second_host_on_a_leased_store_degrades_to_in_memory_state() {
+		let directory = tempfile::tempdir().unwrap();
+		let meta = directory.path().join("processes").join("meta.json");
+		let owner = ExecHost::new()
+			.with_process_store(ProcessStore::new(meta.clone()))
+			.unwrap();
+		assert!(owner.inner.persistence.lock().is_some());
+		let peer = ExecHost::new()
+			.with_process_store(ProcessStore::new(meta.clone()))
+			.unwrap();
+		assert!(peer.inner.persistence.lock().is_none());
+		drop(owner);
+		let successor = ExecHost::new()
+			.with_process_store(ProcessStore::new(meta))
+			.unwrap();
+		assert!(successor.inner.persistence.lock().is_some());
 	}
 
 	#[test]
