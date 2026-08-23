@@ -48,6 +48,11 @@ async fn run(
 					let _ = events.send(BackendEvent::SettingsSchema(setting_rows(composer_style)));
 					continue;
 				}
+				if matches!(text.as_str(), "/model" | "/switch") {
+					let _ = events
+						.send(BackendEvent::OpenModelPicker { rows: models.clone(), current: model });
+					continue;
+				}
 				let event = next_event;
 				next_event += 1;
 				messages.push((event, Str::from(text.clone())));
