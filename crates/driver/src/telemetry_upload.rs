@@ -26,7 +26,7 @@ pub struct ManualPushResult {
 
 /// Applies an explicit UI decision against the exact displayed target
 /// revision. Model-facing report arguments never reach this authority.
-pub(crate) fn apply_consent(
+pub fn apply_consent(
 	store: &TelemetryIndex,
 	intent: omp_storage::telemetry_index::ConsentIntent,
 ) -> Result<bool, omp_storage::telemetry_index::QueryError> {

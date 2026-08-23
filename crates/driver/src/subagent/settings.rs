@@ -443,6 +443,9 @@ const fn field(
 omp_settings::inventory::submit! {
 	DomainRegistration::of::<TaskSettings>()
 }
+omp_settings::inventory::submit! {
+	omp_settings::LayerNormalizer::new(normalize_persisted_agent_overrides)
+}
 
 /// Typed IRC wait and visibility settings owned by subagent supervision.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -565,6 +568,23 @@ mod tests {
 				.validate()
 				.is_err()
 		);
+	}
+	#[test]
+	fn legacy_agent_overrides_are_normalized_before_layering() {
+		let mut document = toml::Table::from_iter([(
+			"task".to_owned(),
+			toml::Value::Table(toml::Table::from_iter([(
+				"agentPrewalk".to_owned(),
+				toml::Value::Table(toml::Table::from_iter([(
+					"scout".to_owned(),
+					toml::Value::Boolean(true),
+				)])),
+			)])),
+		)]);
+		for normalizer in omp_settings::inventory::iter::<omp_settings::LayerNormalizer> {
+			normalizer.apply(&mut document);
+		}
+		assert_eq!(document["task"]["agentPrewalk"]["scout"].as_str(), Some("on"));
 	}
 
 	#[tokio::test]

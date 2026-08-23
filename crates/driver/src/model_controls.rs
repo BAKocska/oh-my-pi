@@ -1042,6 +1042,11 @@ struct RawRouteLimits {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+	dead_code,
+	reason = "compat is honored by pi custom-models.ts but OMP lacks runtime model-specific \
+	          WirePolicy records; remaining fields are accepted under deny_unknown_fields"
+)]
 struct RawModelSpec {
 	id: String,
 	display_name: String,

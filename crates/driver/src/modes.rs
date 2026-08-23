@@ -214,6 +214,7 @@ struct RegimeProjectionState {
 struct PlanBinding {
 	agent:     AgentState,
 	selection: Option<ModelSelection>,
+	handoff:   Option<ModelSelection>,
 }
 
 /// Read projection of the agent-owned [`CampaignStack`] plus app goal/plan
@@ -417,7 +418,18 @@ impl CampaignHandle {
 	/// Binds the active agent selection authority. Plan entry and exit then
 	/// apply model/thinking changes without provider mutation during streaming.
 	pub fn bind_plan_selection(&self, agent: AgentState, selection: Option<ModelSelection>) {
-		*self.plan_binding.lock() = Some(PlanBinding { agent, selection });
+		*self.plan_binding.lock() = Some(PlanBinding { agent, selection, handoff: None });
+	}
+
+	/// Arms a one-shot selection applied when the plan campaign exits,
+	/// replacing restoration of the pre-plan selection (`--plan-yolo-into`).
+	///
+	/// Requires a prior [`Self::bind_plan_selection`]; the handoff is consumed
+	/// by the first plan exit and later plan cycles restore normally.
+	pub fn bind_plan_handoff(&self, selection: ModelSelection) {
+		if let Some(binding) = self.plan_binding.lock().as_mut() {
+			binding.handoff = Some(selection);
+		}
 	}
 
 	/// Marks the current inference stream active for deferred plan transitions.
@@ -502,8 +514,15 @@ impl CampaignHandle {
 		let mut state = self.state.lock();
 		state.plan = state.plan.exited();
 		drop(state);
-		if let Some(binding) = self.plan_binding.lock().as_ref() {
-			self.plan_transitions.exit(&binding.agent);
+		if let Some(binding) = self.plan_binding.lock().as_mut() {
+			match binding.handoff.take() {
+				Some(target) => {
+					self.plan_transitions.exit_into(&binding.agent, target);
+				},
+				None => {
+					self.plan_transitions.exit(&binding.agent);
+				},
+			}
 		}
 	}
 

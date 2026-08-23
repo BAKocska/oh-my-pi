@@ -31,7 +31,6 @@ use crate::{
 	workspace_roots::{WorkspaceRootDiagnostic, WorkspaceRootError, WorkspaceRootGuard},
 };
 
-#[path = "prompt_prep/settings.rs"]
 pub mod settings;
 
 const HOST_FIELD_BYTES: u32 = 4 * 1024;

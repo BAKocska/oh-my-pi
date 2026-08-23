@@ -120,6 +120,28 @@ pub struct ResolvedAdvisorSchedule {
 }
 
 impl AdvisorConfigSnapshot {
+	/// Returns an invocation-local snapshot with advisor runtime enabled when
+	/// `enabled` is true.
+	///
+	/// Enabling preserves every configured advisor's model, tools, instructions,
+	/// ordering, and source while overriding its runtime toggle. An empty roster
+	/// receives the built-in default advisor, which uses the advisor model role
+	/// and default investigative tool grant. Passing `false` leaves the snapshot
+	/// unchanged.
+	pub fn with_invocation_enabled(mut self, enabled: bool) -> Self {
+		if !enabled {
+			return self;
+		}
+		if self.roster.advisors.is_empty() {
+			self.roster.advisors.push(default_advisor_rule());
+		} else {
+			for advisor in &mut self.roster.advisors {
+				advisor.enabled = true;
+			}
+		}
+		self
+	}
+
 	/// Resolves enabled advisors against the session's actual built-in tools.
 	pub fn schedule(
 		&self,
@@ -207,6 +229,18 @@ impl AdvisorConfigSnapshot {
 			prompt.push_str(block.as_str());
 		}
 		(!prompt.is_empty()).then(|| prompt.freeze())
+	}
+}
+
+fn default_advisor_rule() -> AdvisorRule {
+	AdvisorRule {
+		name:         Str::new_static("default"),
+		slug:         Str::new_static("default"),
+		enabled:      true,
+		model:        None,
+		tools:        None,
+		instructions: None,
+		source:       Str::new_static("built-in"),
 	}
 }
 
@@ -473,6 +507,61 @@ fn uuid_v7() -> Str {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn snapshot_with_rule(rule: AdvisorRule) -> AdvisorConfigSnapshot {
+		AdvisorConfigSnapshot {
+			roster:              AdvisorRoster { instructions: None, advisors: vec![rule] },
+			attention:           Arc::default(),
+			project_context:     None,
+			active_repo_context: None,
+			sources:             Arc::default(),
+			diagnostics:         Arc::default(),
+		}
+	}
+
+	#[test]
+	fn invocation_enable_overrides_disabled_roster_without_persisting_it() {
+		let snapshot = snapshot_with_rule(AdvisorRule {
+			name:         Str::new_static("reviewer"),
+			slug:         Str::new_static("reviewer"),
+			enabled:      false,
+			model:        Some(Str::new_static("provider/reviewer")),
+			tools:        Some(Box::from([Str::new_static("grep")])),
+			instructions: Some(Str::new_static("focus on regressions")),
+			source:       Str::new_static("WATCHDOG.yml"),
+		});
+		let sessions = AdvisorProviderSessions::default();
+		let tools = [Str::new_static("grep")];
+
+		assert!(
+			snapshot
+				.clone()
+				.with_invocation_enabled(false)
+				.schedule("primary", &tools, &sessions)
+				.advisors
+				.is_empty()
+		);
+
+		let scheduled = snapshot
+			.with_invocation_enabled(true)
+			.schedule("primary", &tools, &sessions);
+		assert_eq!(scheduled.advisors.len(), 1);
+		assert_eq!(scheduled.advisors[0].rule.name, "reviewer");
+		assert_eq!(scheduled.advisors[0].rule.model.as_deref(), Some("provider/reviewer"));
+		assert_eq!(scheduled.advisors[0].tools.as_ref(), ["grep"]);
+	}
+	#[test]
+	fn invocation_enable_seeds_default_for_an_empty_roster() {
+		let sessions = AdvisorProviderSessions::default();
+		let tools = [Str::new_static("read"), Str::new_static("grep"), Str::new_static("glob")];
+
+		let scheduled = AdvisorConfigSnapshot::default()
+			.with_invocation_enabled(true)
+			.schedule("primary", &tools, &sessions);
+		assert_eq!(scheduled.advisors.len(), 1);
+		assert_eq!(scheduled.advisors[0].rule.name, "default");
+		assert_eq!(scheduled.advisors[0].tools.as_ref(), ["read", "grep", "glob"]);
+	}
 
 	#[test]
 	fn provider_affinity_is_stable_and_session_scoped() {

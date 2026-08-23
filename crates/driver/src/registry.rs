@@ -254,7 +254,7 @@ pub async fn production_usage_manager(
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	production_assembly(data_dir, credential_store)
 		.await
-		.map(|(_, _, _, _, usage, _)| usage)
+		.map(|(_, _, _, _, _, usage, _)| usage)
 }
 
 /// Builds the production Codex saved-reset redemption authority, when the
@@ -294,7 +294,7 @@ pub async fn production_rpc_registry(
 ) -> Result<(Registry, AuthManager), RegistryError> {
 	production_assembly(data_dir, credential_store)
 		.await
-		.map(|(registry, _, _, auth, ..)| (registry, auth))
+		.map(|(registry, _, _, _, auth, ..)| (registry, auth))
 }
 /// Invocation-owned inference values that must not enter agent or durable
 /// state.
@@ -321,6 +321,10 @@ pub struct ProductionInference {
 	/// Narrow GitHub URL credential projection over the canonical encrypted
 	/// store.
 	pub credential_authority: Arc<dyn omp_envd::github_url::CredentialAuthority>,
+	/// Same encrypted authority used for MCP native-key import and OAuth leases.
+	pub mcp_authority:        Arc<auth_backend::CombinedAuthAuthority>,
+	/// MCP OAuth coordinator over that exact authority.
+	pub mcp_oauth:            Arc<omp_envd::mcp::oauth::McpOAuth>,
 	/// Authentication owner assembled into the registry's production route
 	/// stack.
 	pub auth_manager:         AuthManager,
@@ -363,7 +367,7 @@ pub async fn production_inference_for_session(
 			))));
 		},
 	};
-	let (registry, sessions, authority, auth_manager, _, builtins) =
+	let (registry, sessions, authority, mcp_authority, auth_manager, _, builtins) =
 		production_assembly_for_session(data_dir, credential_store, invocation_key).await?;
 	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, project_root))?;
 	let search_settings = settings
@@ -375,11 +379,18 @@ pub async fn production_inference_for_session(
 		.with_session_overrides(provider, overrides.prompt_cache_affinity)
 		.with_search_settings(search_settings);
 	let auth_control = auth_manager.control_handle();
+	let mcp_oauth = Arc::new(omp_envd::mcp::oauth::McpOAuth::new(
+		Arc::new(SystemOAuthHttpClient::new()),
+		Arc::clone(&mcp_authority),
+		Arc::new(omp_envd::mcp::oauth::SystemBrowserLauncher),
+	));
 	Ok(ProductionInference {
 		registry,
 		builtins,
 		rpc,
 		credential_authority: authority,
+		mcp_authority,
+		mcp_oauth,
 		auth_manager,
 		auth_control,
 	})
@@ -393,6 +404,7 @@ async fn production_assembly(
 		Registry,
 		ConversationSessionPlanner,
 		Arc<dyn omp_envd::github_url::CredentialAuthority>,
+		Arc<auth_backend::CombinedAuthAuthority>,
 		AuthManager,
 		ConsoleUsageManager,
 		BuiltinConfig,
@@ -411,6 +423,7 @@ async fn production_assembly_for_session(
 		Registry,
 		ConversationSessionPlanner,
 		Arc<dyn omp_envd::github_url::CredentialAuthority>,
+		Arc<auth_backend::CombinedAuthAuthority>,
 		AuthManager,
 		ConsoleUsageManager,
 		BuiltinConfig,
@@ -636,8 +649,16 @@ async fn production_assembly_for_session(
 		.with_builtins(builtins.clone())?
 		.build()?;
 	let authority: Arc<dyn omp_envd::github_url::CredentialAuthority> =
-		Arc::new(GithubCredentialAuthority::new(stored));
-	Ok((registry, sessions, authority, exposed_auth_manager, exposed_usage_manager, builtins))
+		Arc::new(GithubCredentialAuthority::new(Arc::clone(&stored)));
+	Ok((
+		registry,
+		sessions,
+		authority,
+		stored,
+		exposed_auth_manager,
+		exposed_usage_manager,
+		builtins,
+	))
 }
 
 /// Resolves the Antigravity client version without blocking assembly work:

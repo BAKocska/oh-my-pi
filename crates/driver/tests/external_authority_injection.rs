@@ -147,6 +147,7 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		&state.join("env.sock"),
 		&state.join("docs.sock"),
 		false,
+		None,
 		&[extension()],
 		omp_tool::DEFAULT_INTERRUPT_GRACE,
 		RegistryBridges::default(),

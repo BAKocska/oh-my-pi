@@ -117,6 +117,15 @@ impl TransitionQueue {
 		};
 		queue_or_apply(&mut state, agent, coding)
 	}
+
+	/// Applies `target` at plan exit instead of restoring the selection
+	/// captured on plan entry, discarding that restoration point (plan-yolo
+	/// handoff to an implementation model).
+	pub fn exit_into(&self, agent: &AgentState, target: ModelSelection) -> PlanModelTransition {
+		let mut state = self.state.lock();
+		state.coding = None;
+		queue_or_apply(&mut state, agent, target)
+	}
 }
 
 fn queue_or_apply(
@@ -151,5 +160,43 @@ fn apply_if_changed(agent: &AgentState, target: &ModelSelection) -> PlanModelTra
 	} else {
 		target.apply(agent);
 		PlanModelTransition::Applied
+	}
+}
+#[cfg(test)]
+mod tests {
+	use omp_agent::AgentSnapshot;
+
+	use super::*;
+
+	fn agent(model: &str) -> AgentState {
+		let state = AgentState::new(AgentSnapshot::default());
+		state.update(|snapshot| snapshot.turn.params.model = model.to_owned());
+		state
+	}
+
+	#[test]
+	fn exit_into_replaces_restoration_with_the_handoff_target() {
+		let queue = TransitionQueue::default();
+		let state = agent("provider/coding");
+		queue.enter(&state, Some(ModelSelection::resolved("provider/plan", None).expect("plan")));
+		assert_eq!(state.snapshot().turn.params.model, "provider/plan");
+		let target = ModelSelection::resolved("provider/impl", None).expect("target");
+		assert_eq!(queue.exit_into(&state, target), PlanModelTransition::Applied);
+		assert_eq!(state.snapshot().turn.params.model, "provider/impl");
+		assert_eq!(queue.exit(&state), PlanModelTransition::Unchanged);
+		assert_eq!(state.snapshot().turn.params.model, "provider/impl");
+	}
+
+	#[test]
+	fn exit_into_defers_while_streaming_and_applies_at_settlement() {
+		let queue = TransitionQueue::default();
+		let state = agent("provider/coding");
+		queue.enter(&state, None);
+		queue.begin_streaming();
+		let target = ModelSelection::resolved("provider/impl", None).expect("target");
+		assert_eq!(queue.exit_into(&state, target), PlanModelTransition::Deferred);
+		assert_eq!(state.snapshot().turn.params.model, "provider/coding");
+		assert_eq!(queue.settle(&state), PlanModelTransition::Applied);
+		assert_eq!(state.snapshot().turn.params.model, "provider/impl");
 	}
 }

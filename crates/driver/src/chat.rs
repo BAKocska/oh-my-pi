@@ -1,12 +1,6 @@
 //! Durable project-chat composition.
 
 mod agents;
-use crate::hub::{self as hub_backend};
-
-pub(crate) fn chat_hub_tool() -> impl omp_tool::Tool {
-	hub_backend::tool()
-}
-
 use std::{
 	cmp,
 	collections::{BTreeMap, BTreeSet},
@@ -87,9 +81,13 @@ use tokio::{task::JoinHandle, time, time::MissedTickBehavior};
 use url::Url;
 use xutf::IntoAnsiStripped as _;
 
+pub use crate::subagent::advisor_child::{
+	AdvisorBatchOutcome, AdvisorChildError, AdvisorChildSpec,
+};
 use crate::{
 	auth_flow::{AuthPromptKind, ChatAuth, ChatAuthCommand, ChatAuthEvent},
 	discovery,
+	hub::{self as hub_backend},
 	memory::InferenceExtractionLane,
 	model_controls::{
 		ProviderCatalogCursor, ProviderControlBackend, ProviderControlError, ProviderControlRequest,
@@ -108,6 +106,7 @@ use crate::{
 	session_title::OnlineTitleCompletion,
 	settings::AutoThinkingSettings,
 	subagent::{
+		advisor_child::{self, AdvisorChildren, AdvisorSpawnContext},
 		artifacts,
 		output::persist_bounded,
 		prewalk::PrewalkGate,
@@ -827,14 +826,15 @@ pub struct AgentHubCapabilities {
 
 /// Session-owned parent authority shared with interactive presentation.
 pub struct ChatParentHost<C: TurnClient + Clone + Send + 'static> {
-	client:     C,
-	env:        omp_env::EnvClient,
-	broker:     omp_agent::Broker,
-	supervisor: Arc<SessionSupervisor<C>>,
-	context:    Mutex<ChatParentContext>,
-	revival:    Mutex<BTreeMap<Str, flume::Sender<omp_agent::RevivalRequest>>>,
-	inboxes:    Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
-	controls:   Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
+	client:           C,
+	env:              omp_env::EnvClient,
+	broker:           omp_agent::Broker,
+	supervisor:       Arc<SessionSupervisor<C>>,
+	context:          Mutex<ChatParentContext>,
+	advisor_children: Mutex<AdvisorChildren>,
+	revival:          Mutex<BTreeMap<Str, flume::Sender<omp_agent::RevivalRequest>>>,
+	inboxes:          Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
+	controls:         Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
 }
 struct ProductionChildReviver<C: TurnClient + Clone + Send + 'static> {
 	client:         C,
@@ -1000,12 +1000,40 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		session_index: Arc<SessionIndex>,
 		security_enabled: bool,
 	) -> Self {
-		let definitions = discover_chat_agents(&root, security_enabled);
 		let tree = Arc::new(AgentTree::new(
 			8,
 			DEFAULT_EVAL_CONCURRENCY_LIMIT,
 			omp_agent::DEFAULT_MAX_ADMISSION_QUEUE,
 		));
+		Self::new_with_tree(
+			client,
+			env,
+			state,
+			session_id,
+			sessions_dir,
+			root,
+			session_index,
+			security_enabled,
+			tree,
+		)
+	}
+
+	/// Composes the parent authority over a caller-owned primary agent tree.
+	///
+	/// Headless compositions use this constructor so the primary loop and its
+	/// persistent advisor children share one authoritative roster.
+	pub fn new_with_tree(
+		client: C,
+		env: omp_env::EnvClient,
+		state: AgentState,
+		session_id: Str,
+		sessions_dir: PathBuf,
+		root: PathBuf,
+		session_index: Arc<SessionIndex>,
+		security_enabled: bool,
+		tree: Arc<AgentTree>,
+	) -> Self {
+		let definitions = discover_chat_agents(&root, security_enabled);
 		if let Err(error) =
 			artifacts::reserve_historical_stems(tree.as_ref(), &sessions_dir.join("eval-agents"))
 		{
@@ -1031,6 +1059,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				campaigns: None,
 				tree,
 			}),
+			advisor_children: Mutex::new(AdvisorChildren::default()),
 			revival: Mutex::new(BTreeMap::new()),
 			inboxes: Arc::new(Mutex::new(BTreeMap::new())),
 			controls: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1057,7 +1086,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 
 	/// Applies a reloaded task projection to admission and later child
 	/// snapshots.
-	pub(crate) fn apply_task_settings(&self, settings: Arc<TaskSettings>) {
+	pub fn apply_task_settings(&self, settings: Arc<TaskSettings>) {
 		self.supervisor.apply_settings(Arc::clone(&settings));
 		self.context.lock().task_settings.apply(settings);
 	}
@@ -1124,6 +1153,52 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	/// Returns the current durable session identity.
 	pub fn session_id(&self) -> Str {
 		self.context.lock().session_id.clone()
+	}
+
+	/// Composes one persistent advisor child without starting an inference turn.
+	pub async fn spawn_advisor(&self, spec: AdvisorChildSpec) -> Result<Str, AdvisorChildError> {
+		let context = self.context.lock().clone();
+		advisor_child::spawn(
+			AdvisorSpawnContext {
+				client:        self.client.clone(),
+				broker:        self.broker.clone(),
+				supervisor:    Arc::clone(&self.supervisor),
+				state:         context.state,
+				session_id:    context.session_id,
+				sessions_dir:  context.sessions_dir,
+				root:          context.root,
+				session_index: context.session_index,
+				tree:          context.tree,
+			},
+			&self.advisor_children,
+			spec,
+		)
+		.await
+	}
+
+	/// Prompts one persistent advisor once per delta chunk in one serialized
+	/// run.
+	pub async fn run_advisor_batch(
+		&self,
+		advisor_id: &str,
+		chunks: Vec<Str>,
+		turn_id: TurnId,
+	) -> Result<AdvisorBatchOutcome, AdvisorChildError> {
+		advisor_child::run_batch(
+			&self.broker,
+			self.supervisor.as_ref(),
+			&self.advisor_children,
+			advisor_id,
+			chunks,
+			turn_id,
+		)
+		.await
+	}
+
+	/// Tears down all persistent advisor children before a primary session
+	/// switch.
+	pub async fn clear_advisors(&self) -> Result<(), AdvisorChildError> {
+		advisor_child::clear(&self.broker, self.supervisor.as_ref(), &self.advisor_children).await
 	}
 
 	pub(crate) fn task_settings(&self) -> Arc<TaskSettings> {
@@ -5604,6 +5679,12 @@ pub(crate) fn create_indexed_journal(
 	Ok(journal)
 }
 
+#[allow(
+	dead_code,
+	reason = "staged for the planned /handoff + auto-handoff rescue tier \
+	          (.plan/feature-map/FEATURES.md \"handoff child sessions\"); no HandoffCommit \
+	          producer exists yet — omp currently compacts in place"
+)]
 pub(crate) fn create_indexed_handoff(
 	parent: &Journal,
 	path: &Path,
@@ -5928,7 +6009,9 @@ pub fn session_blueprint(
 		.map_err(Into::into)
 }
 
-fn protocol_tool_definition(tool: ToolDefinition) -> Result<inference_pb::ToolDef, ChatError> {
+pub(crate) fn protocol_tool_definition(
+	tool: ToolDefinition,
+) -> Result<inference_pb::ToolDef, ChatError> {
 	let input = match tool.input {
 		ToolInputConstraint::JsonSchema { parameters, strict } => {
 			let schema_json =
@@ -5938,15 +6021,18 @@ fn protocol_tool_definition(tool: ToolDefinition) -> Result<inference_pb::ToolDe
 				strict:      Some(strict),
 			})
 		},
-		ToolInputConstraint::Grammar(grammar) => {
+		ToolInputConstraint::Grammar { grammar, fallback } => {
 			let syntax = match grammar.syntax {
 				ToolGrammarSyntax::Lark => grammar::Syntax::Lark,
 				ToolGrammarSyntax::Regex => grammar::Syntax::Regex,
 				ToolGrammarSyntax::Ebnf => grammar::Syntax::Ebnf,
 			};
+			let fallback_schema_json =
+				serde_json::to_vec(fallback.as_value()).map_err(ChatError::ToolSchema)?;
 			tool_def::Input::Grammar(tool_def::Grammar {
-				syntax:     syntax as i32,
-				definition: grammar.definition.to_string(),
+				syntax:               syntax as i32,
+				definition:           grammar.definition.to_string(),
+				fallback_schema_json: fallback_schema_json.into(),
 			})
 		},
 	};
@@ -5960,9 +6046,14 @@ fn protocol_tool_definition(tool: ToolDefinition) -> Result<inference_pb::ToolDe
 }
 
 /// Projects a configured session blueprint into initial mutable agent state.
+///
+/// `external_thinking_override` is invocation-scoped: `Some(true)` replaces
+/// provider reasoning with the hidden `think` tool, while `Some(false)` keeps
+/// it disabled regardless of model capability evidence.
 pub fn agent_snapshot(
 	blueprint: &SessionBlueprint,
 	catalog: &snapshot::Catalog,
+	external_thinking_override: Option<bool>,
 ) -> Result<AgentSnapshot, ChatError> {
 	let model = blueprint
 		.model_plan()
@@ -5971,16 +6062,31 @@ pub fn agent_snapshot(
 		.map(|candidate| candidate.selector.as_str())
 		.ok_or(omp_sdk::SessionBuildError::NoDefaultModel)?;
 	let registry = blueprint.registry();
-	let advertised = if model_rejects_tools(catalog, model) {
+	let external_thinking = catalog
+		.model(omp_catalog::ModelKey::from_ref(model))
+		.or_else(|| catalog.resolve_alias(model))
+		.map_or(external_thinking_override.unwrap_or(false), |model| {
+			omp_agent::external_thinking_for_model(&model.capabilities, external_thinking_override)
+		});
+	let lowering_caps = LoweringCaps {
+		strict_schema:  true,
+		grammar:        GrammarBits::ALL,
+		maximum_tools:  None,
+		maximum_strict: None,
+	};
+	let mut advertised = if model_rejects_tools(catalog, model) {
 		Vec::new()
 	} else {
-		registry.advertise(LoweringCaps {
-			strict_schema:  true,
-			grammar:        GrammarBits::ALL,
-			maximum_tools:  None,
-			maximum_strict: None,
-		})?
+		registry.advertise(lowering_caps)?
 	};
+	if external_thinking {
+		let mut selected = advertised
+			.iter()
+			.map(|tool| tool.identity.name.clone())
+			.collect::<Vec<_>>();
+		selected.push(Str::new_static("think"));
+		advertised = registry.advertise_selected(lowering_caps, &selected)?;
+	}
 	let mut enabled_tools = Vec::with_capacity(advertised.len());
 	let mut tools = Vec::with_capacity(advertised.len());
 	for tool in advertised {
@@ -5998,6 +6104,10 @@ pub fn agent_snapshot(
 		params: inference_pb::ChatParams {
 			model: model.to_owned(),
 			tools,
+			thinking: external_thinking.then(|| inference_pb::Reasoning {
+				effort: Effort::Off as i32,
+				..inference_pb::Reasoning::default()
+			}),
 			..inference_pb::ChatParams::default()
 		},
 		stream_watchdog: model_stream_watchdog(catalog, model),
@@ -6023,6 +6133,9 @@ pub fn agent_snapshot(
 
 /// Applies launch-time tool filtering and returns the corresponding environment
 /// grant.
+///
+/// An external-thinking snapshot retains its hidden `think` tool even when
+/// ordinary launch filters exclude other tools.
 pub fn apply_launch_tool_selection(
 	snapshot: &mut AgentSnapshot,
 	selection: LaunchToolSelection<'_>,
@@ -6036,6 +6149,7 @@ pub fn apply_launch_tool_selection(
 	let requested = selection
 		.tools
 		.map(|tools| tools.iter().cloned().collect::<BTreeSet<_>>());
+	let external_thinking = snapshot.enabled_tools.iter().any(|name| name == "think");
 	if let Some(requested) = &requested
 		&& let Some(unknown) = requested.iter().find(|name| !known.contains(*name))
 	{
@@ -6045,6 +6159,9 @@ pub fn apply_launch_tool_selection(
 		});
 	}
 	let allowed = |name: &str| {
+		if external_thinking && name == "think" {
+			return true;
+		}
 		if selection.no_tools {
 			return false;
 		}
@@ -6764,10 +6881,13 @@ mod protocol_tests {
 		let tool = ToolDefinition {
 			name:        sf!("edit"),
 			description: Some(sf!("Sparse edit")),
-			input:       ToolInputConstraint::Grammar(ToolGrammar {
-				syntax:     ToolGrammarSyntax::Lark,
-				definition: Str::new_static(EDIT_GRAMMAR),
-			}),
+			input:       ToolInputConstraint::Grammar {
+				grammar:  ToolGrammar {
+					syntax:     ToolGrammarSyntax::Lark,
+					definition: Str::new_static(EDIT_GRAMMAR),
+				},
+				fallback: omp_inference::OpaqueJson::new(serde_json::json!({"type": "object"})),
+			},
 		};
 
 		let projected = protocol_tool_definition(tool).expect("edit grammar projects");
@@ -6776,5 +6896,6 @@ mod protocol_tests {
 		};
 		assert_eq!(grammar.syntax, grammar::Syntax::Lark as i32);
 		assert_eq!(grammar.definition, EDIT_GRAMMAR);
+		assert_eq!(grammar.fallback_schema_json.as_ref(), br#"{"type":"object"}"#);
 	}
 }

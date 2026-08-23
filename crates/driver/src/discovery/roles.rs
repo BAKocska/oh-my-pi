@@ -3,7 +3,8 @@
 use std::env;
 
 use omp_catalog::{
-	ModelKey, ModelRole, SelectionError, select_model, snapshot::Catalog, upsert_role_assignment,
+	ModelKey, ModelRole, SelectedModel, SelectionError, select_model, snapshot::Catalog,
+	upsert_role_assignment,
 };
 use omp_core::Str;
 use omp_storage::state::{DurableRequest, Error, StateAuthority, StateScope, StateStore};
@@ -62,6 +63,21 @@ pub fn resolve_launch_roles(
 		plan_thinking: plan.as_ref().and_then(|selected| selected.thinking.clone()),
 		plan:          plan.map(|selected| selected.model),
 	})
+}
+/// Resolves one explicit role selector through the catalog authority with no
+/// environment fallback (e.g. `--plan-yolo-into`, `--prewalk-into`).
+pub fn resolve_role_selector(
+	catalog: &Catalog,
+	selector: &str,
+) -> Result<SelectedModel, SelectionError> {
+	select_model(
+		catalog.models(),
+		catalog.routes(),
+		catalog.aliases(),
+		&[],
+		&Default::default(),
+		selector,
+	)
 }
 /// Failure while validating or durably saving a role assignment.
 #[derive(Debug, ThisError)]

@@ -8,12 +8,12 @@ use std::{
 		Arc, OnceLock,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::{SystemTime, UNIX_EPOCH},
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::StreamExt as _;
 use omp_agent::control;
-use omp_core::{Str, sf};
+use omp_core::{EnvPath, Str, sf};
 use omp_envd::github_url::GithubCredentialBridge;
 use omp_proto::{
 	inference::{
@@ -438,6 +438,29 @@ impl omp_envd::TelemetryUpload for TelemetryBridge {
 	}
 }
 
+/// Builds the deferred Environment command executor only after a live client
+/// exists, so MCP configuration and model auth share the exact execution path.
+struct CommandCredentialsBridge;
+
+impl omp_envd::CommandCredentialExecutorFactory for CommandCredentialsBridge {
+	fn make(
+		&self,
+		client: omp_env::EnvClient,
+		cwd: &Path,
+	) -> Arc<dyn omp_inference::auth::command::CommandCredentialExecutor> {
+		let cwd = url::Url::from_file_path(cwd)
+			.ok()
+			.and_then(|url| EnvPath::new(Str::from(url.as_str())).ok())
+			.expect("Environment project roots are absolute file paths");
+		Arc::new(crate::auth_backend::EnvCommandCredentialExecutor::new(
+			client,
+			cwd,
+			Duration::from_secs(30),
+			64 * 1024,
+		))
+	}
+}
+
 /// Builds all driver-owned environment registry bridges for one project.
 pub fn builtin(
 	root: &Path,
@@ -478,6 +501,7 @@ pub fn builtin(
 		replaces:   None,
 	};
 	omp_envd::RegistryBridges {
+		command_credentials: Some(Arc::new(CommandCredentialsBridge)),
 		dynamic_tools: vec![
 			omp_envd::DynamicTool::new(
 				crate::vibe::tool(),

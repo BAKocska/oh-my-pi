@@ -36,10 +36,8 @@ use crate::{chat::ChatParentHost, modes::CampaignHandle};
 #[serde(deny_unknown_fields)]
 pub struct WaveEntry {
 	/// Complete delegated brief.
-	#[schemars(with = "String")]
 	pub brief: Str,
 	/// Optional roster label.
-	#[schemars(with = "Option<String>")]
 	pub label: Option<Str>,
 	/// Worker tier: `fast` selects sonic; `good` selects task.
 	#[serde(default)]
@@ -327,13 +325,10 @@ pub struct Params {
 	pub wave:       Vec<WaveEntry>,
 	/// Worker identifiers for `status`, `collect`, or `stop`; empty means all.
 	#[serde(default)]
-	#[schemars(with = "Vec<String>")]
 	pub ids:        Vec<Str>,
 	/// One worker identifier for `steer`.
-	#[schemars(with = "Option<String>")]
 	pub id:         Option<Str>,
 	/// Steering text for `steer`.
-	#[schemars(with = "Option<String>")]
 	pub message:    Option<Str>,
 	/// Maximum wait for `collect`; omitted waits until every selected worker
 	/// settles.

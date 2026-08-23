@@ -121,6 +121,7 @@ impl ProductionCompressHost {
 			&omp_env::project_state::environment_socket(&state_dir),
 			&omp_env::project_state::document_socket(&state_dir),
 			false,
+			None,
 			&[],
 			settings.runtime_durations().interrupt_grace,
 			bridges,
@@ -201,9 +202,11 @@ impl CompressHost for ProductionCompressHost {
 					model:                 model?,
 					initial_campaign:      None,
 					initial_prompt_slot:   None,
+					plan_handoff:          None,
 					resume:                None,
 					fork:                  None,
 					py_eval:               false,
+					approval_mode:         None,
 					pty_denied:            false,
 					credential_provider:   None,
 					api_key:               None,
@@ -310,7 +313,6 @@ impl CompressHost for ProductionCompressHost {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RewriteParams {
-	#[schemars(with = "String")]
 	text:   Str,
 	losses: Vec<LossParams>,
 }
@@ -318,16 +320,13 @@ struct RewriteParams {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LossParams {
-	#[schemars(with = "String")]
 	content: Str,
-	#[schemars(with = "String")]
 	reason:  Str,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ApproveParams {
-	#[schemars(with = "String")]
 	verdict: Str,
 }
 

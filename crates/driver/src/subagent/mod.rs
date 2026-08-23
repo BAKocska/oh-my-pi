@@ -1,5 +1,6 @@
 //! Application-owned durable subagent supervision and settings.
 
+pub mod advisor_child;
 pub mod artifacts;
 pub mod output;
 pub mod prewalk;

@@ -117,14 +117,6 @@ pub enum AdvisorCampaignSubmission {
 	Muted(AdvisorMuteReason),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum AdvisorDeliveryLane {
-	ContextOrIdle,
-	TurnEnd,
-	Idle,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PendingAdvice {
 	advisor_id: Str,

@@ -35,7 +35,7 @@ inventory = { workspace = true }
 omp-agent = { workspace = true }
 omp-ar = { workspace = true }
 omp-collab = { workspace = true }
-omp-core = { workspace = true }
+omp-core = { workspace = true, features = ["schemars"] }
 omp-scribe = { workspace = true }
 omp-docserver = { workspace = true }
 omp-env = { workspace = true }
@@ -85,6 +85,7 @@ rand = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 
 [lints]

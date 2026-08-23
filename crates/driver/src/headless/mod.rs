@@ -69,12 +69,16 @@ pub struct HeadlessSessionOptions {
 	pub initial_campaign:      Option<&'static str>,
 	/// Optional prompt-slot override for the initial campaign.
 	pub initial_prompt_slot:   Option<&'static str>,
+	/// One-shot model selection applied when the plan campaign exits.
+	pub plan_handoff:          Option<crate::plan::ModelSelection>,
 	/// Existing durable session to resume, or a fresh journal when absent.
 	pub resume:                Option<Str>,
 	/// Existing durable session whose live projection is copied into a fork.
 	pub fork:                  Option<Str>,
 	/// Whether the Python eval device is enabled.
 	pub py_eval:               bool,
+	/// Invocation-only tool approval mode that overrides persisted settings.
+	pub approval_mode:         Option<omp_envd::tool_settings::ApprovalMode>,
 	/// Whether authenticated tool invocations are forbidden from allocating
 	/// PTYs.
 	pub pty_denied:            bool,
@@ -94,6 +98,7 @@ pub struct HeadlessSessionOptions {
 /// dropped before the project Environment authority.
 pub struct HeadlessSession {
 	session:             SessionHandle,
+	advisor_parent:      Arc<chat::ChatParentHost<InProcTurnClient>>,
 	state:               AgentState,
 	control:             omp_agent::ControlSender,
 	env:                 omp_env::EnvClient,
@@ -156,6 +161,7 @@ impl HeadlessSession {
 			&omp_env::project_state::environment_socket(&state_dir),
 			&omp_env::project_state::document_socket(&state_dir),
 			options.py_eval,
+			options.approval_mode,
 			&[],
 			settings.runtime_durations().interrupt_grace,
 			bridges,
@@ -194,7 +200,7 @@ impl HeadlessSession {
 			Arc::clone(&registry),
 		)
 		.map_err(composition)?;
-		let mut snapshot = chat::agent_snapshot(&blueprint, catalog).map_err(composition)?;
+		let mut snapshot = chat::agent_snapshot(&blueprint, catalog, None).map_err(composition)?;
 		if options.resume.is_some() || options.fork.is_some() {
 			let journal_path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
 			let revived = omp_agent::revive_existing(&journal_path, session.journal, snapshot)
@@ -222,6 +228,8 @@ impl HeadlessSession {
 			registry: inference_registry,
 			rpc: inference,
 			credential_authority,
+			mcp_authority,
+			mcp_oauth,
 			..
 		} = production_inference_for_session(
 			&data_dir,
@@ -237,9 +245,22 @@ impl HeadlessSession {
 		.map_err(composition)?;
 		let _ = search.bind(inference.clone());
 		let _ = environment.github_credentials().bind(credential_authority);
+		environment.bind_mcp_oauth(mcp_authority, mcp_oauth);
 		let client = InProcTurnClient::new(inference)
 			.await
 			.map_err(composition)?;
+		let tree = Arc::new(AgentTree::standard(8));
+		let advisor_parent = Arc::new(chat::ChatParentHost::new_with_tree(
+			client.clone(),
+			env.clone(),
+			state.clone(),
+			session.id.clone(),
+			sessions_dir.clone(),
+			root.clone(),
+			environment.sessions_index(),
+			settings.security.enabled,
+			Arc::clone(&tree),
+		));
 		let journal_path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
 		let content = discovery::active_content_snapshots(&root);
 		let (ttsr, ttsr_diagnostics) = rulebook::ttsr_registry(content.rules.as_ref());
@@ -293,11 +314,13 @@ impl HeadlessSession {
 		let goal_binding = goal_control.bind(Arc::clone(&modes), control.clone());
 		modes.sync_campaigns(agent.arbiter().campaigns());
 		modes.bind_plan_selection(state.clone(), None);
+		if let Some(handoff) = options.plan_handoff.clone() {
+			modes.bind_plan_handoff(handoff);
+		}
 		state.update(|snapshot| {
 			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
 		});
 		agent.set_continuation_source(modes.clone());
-		let tree = Arc::new(AgentTree::standard(8));
 		let node = tree
 			.register(
 				session.id.clone(),
@@ -324,6 +347,7 @@ impl HeadlessSession {
 			.bind_approval_authority(Some(Arc::clone(&approval_book)), Some(approval_route.clone()));
 		Ok(Self {
 			session: session_handle,
+			advisor_parent,
 			state,
 			control,
 			env,
@@ -372,6 +396,23 @@ impl HeadlessSession {
 	/// Returns the durable session identifier.
 	pub fn session_id(&self) -> &str {
 		self.session_id.as_str()
+	}
+
+	/// Returns the session-local parent authority used by persistent advisor
+	/// children.
+	pub fn advisor_parent(&self) -> Arc<chat::ChatParentHost<InProcTurnClient>> {
+		Arc::clone(&self.advisor_parent)
+	}
+
+	/// Lists model-callable environment tools available to advisor grant
+	/// evaluation.
+	pub fn available_tool_names(&self) -> Vec<Str> {
+		self
+			._environment
+			.registry()
+			.devices()
+			.map(|device| device.name.clone())
+			.collect()
 	}
 
 	/// Returns the canonical replay projection loaded before the first turn.

@@ -1,11 +1,15 @@
-//! Monotonic child snapshot attenuation and reasoning-effort resolution.
+//! Monotonic child snapshot attenuation (plus the hidden `yield` grant) and
+//! reasoning-effort resolution.
 
 use std::{ffi, path::Path, sync::Arc};
 
 use omp_agent::{AgentDefinition, AgentSnapshot};
-use omp_core::Str;
+use omp_catalog::GrammarBits;
+use omp_core::{Str, sf};
 use omp_envd::eval::spawn::SpawnEffort;
-use omp_proto::inference::v1::{Effort, Reasoning};
+use omp_inference::ToolInputConstraint;
+use omp_proto::inference::v1::{Effort, Reasoning, ToolDef, tool_def};
+use omp_tool::{LoweringCaps, Registry};
 
 use super::settings::{TaskEffortCeiling, TaskSettings};
 
@@ -64,7 +68,8 @@ pub struct ChildSnapshotOptions<'a> {
 	pub prewalk_gate:      bool,
 }
 
-/// Clones a parent runtime snapshot while applying only child attenuation.
+/// Clones a parent runtime snapshot while applying child attenuation and the
+/// hidden `yield` grant.
 pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>) -> AgentSnapshot {
 	let mut child = parent.clone();
 	child
@@ -120,22 +125,63 @@ pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>)
 		child.turn.params.thinking =
 			Some(Reasoning { effort: effort_proto(effective) as i32, ..Reasoning::default() });
 	}
-	let enabled = child
+	let mut enabled = child
 		.enabled_tools
 		.iter()
 		.filter(|name| tool_allowed(name.as_str(), &options))
 		.cloned()
 		.collect::<Vec<_>>();
-	child.enabled_tools = Arc::from(enabled);
-	child
-		.props
-		.set(omp_agent::prompt_keys::TOOLS, child.enabled_tools.iter().cloned().collect::<Vec<_>>());
 	child
 		.turn
 		.params
 		.tools
 		.retain(|tool| tool_allowed(tool.name.as_str(), &options));
+	// Every child finalizes through the hidden `yield` tool, which the
+	// top-level agent never advertises; widening the cloned set here is the
+	// one non-attenuating grant (pi: `requireYieldTool` on all task children).
+	if !enabled.iter().any(|name| name == "yield")
+		&& let Some(tool) = lowered_yield(&child.registry)
+	{
+		enabled.push(sf!("yield"));
+		child.turn.params.tools.push(tool);
+	}
+	child.enabled_tools = Arc::from(enabled);
 	child
+		.props
+		.set(omp_agent::prompt_keys::TOOLS, child.enabled_tools.iter().cloned().collect::<Vec<_>>());
+	child
+}
+/// Lowers the hidden `yield` declaration into a child's protocol tool list.
+///
+/// Returns `None` when the registry does not host `yield` (tool disabled or
+/// bare test registries); such a child terminates through its last assistant
+/// turn instead.
+fn lowered_yield(registry: &Registry) -> Option<ToolDef> {
+	let caps = LoweringCaps {
+		strict_schema:  true,
+		grammar:        GrammarBits::ALL,
+		maximum_tools:  None,
+		maximum_strict: None,
+	};
+	let tool = registry
+		.advertise_selected(caps, &[sf!("yield")])
+		.ok()?
+		.into_iter()
+		.next()?;
+	let ToolInputConstraint::JsonSchema { parameters, strict } = tool.definition.input else {
+		return None;
+	};
+	Some(ToolDef {
+		name:        tool.definition.name.to_string(),
+		description: tool
+			.definition
+			.description
+			.map_or_else(String::new, |value| value.to_string()),
+		input:       Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
+			schema_json: serde_json::to_vec(parameters.as_value()).ok()?.into(),
+			strict:      Some(strict),
+		})),
+	})
 }
 
 /// Resolves caller → model suffix → frontmatter → pattern and clamps every
@@ -265,5 +311,54 @@ const fn effort_proto(effort: SpawnEffort) -> Effort {
 		SpawnEffort::High => Effort::High,
 		SpawnEffort::Xhigh => Effort::Xhigh,
 		SpawnEffort::Max => Effort::Max,
+	}
+}
+#[cfg(test)]
+mod tests {
+	use omp_tool::{Claims, Precedence, Presentation};
+
+	use super::*;
+
+	#[test]
+	fn child_gains_hidden_yield_absent_from_parent() {
+		let mut registry = Registry::new();
+		registry
+			.register(omp_tools::yield_tool::tool(), Presentation::Hidden, Claims {
+				precedence: Precedence::CORE,
+				claimant:   sf!("omp/core"),
+				replaces:   None,
+			})
+			.expect("register hidden yield");
+		let mut parent = AgentSnapshot::default();
+		parent.registry = Arc::new(registry);
+		let definition =
+			AgentDefinition::parse_markdown("child", "---\ndescription: test child\n---\nbody")
+				.expect("definition");
+		let settings = TaskSettings::default();
+		let child = child_snapshot(&parent, ChildSnapshotOptions {
+			definition:        &definition,
+			settings:          &settings,
+			cwd:               Path::new("/"),
+			selected_model:    None,
+			inference_role:    None,
+			inherited_pattern: None,
+			caller_effort:     None,
+			model_ceiling:     None,
+			plan_mode:         false,
+			enable_lsp:        false,
+			prewalk_gate:      false,
+		});
+		assert!(child.enabled_tools.iter().any(|name| name == "yield"));
+		let tool = child
+			.turn
+			.params
+			.tools
+			.iter()
+			.find(|tool| tool.name == "yield")
+			.expect("child protocol tool list carries yield");
+		let Some(tool_def::Input::JsonSchema(schema)) = &tool.input else {
+			panic!("yield rides a JSON schema declaration");
+		};
+		assert_eq!(schema.strict, Some(false), "yield must never request strict sampling");
 	}
 }
