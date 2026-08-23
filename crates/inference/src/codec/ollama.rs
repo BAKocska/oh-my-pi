@@ -14,8 +14,8 @@ use crate::{
 	body::BodySource,
 	call::{
 		ChatRequest, ContentPart, EmbedRequest, EmbeddingInput, MediaInput, Message, OperationCall,
-		ProviderProof, ReasoningRequest, Role, Setting, ToolChoice, ToolResultContent,
-		TruncationPolicy,
+		ProviderProof, ReasoningRequest, Role, Setting, StructuredOutput, ToolChoice,
+		ToolResultContent, TruncationPolicy,
 	},
 	codec::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawCompletion,
@@ -83,6 +83,8 @@ struct OllamaChatRequest<'a> {
 	think:       Option<OllamaThink<'a>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	tool_choice: Option<&'static str>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	format:      Option<OllamaFormat<'a>>,
 	#[serde(skip_serializing_if = "options_are_empty")]
 	options:     OllamaOptions,
 	stream:      bool,
@@ -95,6 +97,12 @@ fn options_are_empty(options: &OllamaOptions) -> bool {
 		&& options.top_k.is_none()
 		&& options.seed.is_none()
 		&& options.stop.is_empty()
+}
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OllamaFormat<'a> {
+	Json(&'static str),
+	Schema(&'a Value),
 }
 
 #[derive(Serialize)]
@@ -295,7 +303,7 @@ impl Codec for OllamaCodec {
 				},
 				sealed_body: None,
 			}),
-			_ => Err(invalid_request("ollama_operation_not_supported")),
+			_ => Err(capability_error("ollama_operation_not_supported")),
 		}
 	}
 
@@ -312,7 +320,7 @@ fn encode_embed(
 		.target
 		.ok_or_else(|| invalid_request("ollama_wire_target_missing"))?;
 	if !matches!(request.normalize, Setting::Unset) {
-		return Err(invalid_request("ollama_embed_normalize_unsupported"));
+		return Err(capability_error("ollama_embed_normalize_unsupported"));
 	}
 	let dimensions = match request.dimensions {
 		Setting::Unset => None,
@@ -330,7 +338,7 @@ fn encode_embed(
 		TruncationPolicy::Reject => Some(false),
 		TruncationPolicy::End => Some(true),
 		TruncationPolicy::Start => {
-			return Err(invalid_request("ollama_embed_start_truncation_unsupported"));
+			return Err(capability_error("ollama_embed_start_truncation_unsupported"));
 		},
 	};
 	let wire = OllamaEmbedRequest { model: target.wire_model.as_str(), input, dimensions, truncate };
@@ -360,25 +368,37 @@ fn encode_chat(
 	request: &ChatRequest,
 ) -> Result<EncodedRequest, Error> {
 	if !request.hosted_tools.is_empty() {
-		return Err(invalid_request("ollama_hosted_tools_unsupported"));
+		return Err(capability_error("ollama_hosted_tools_unsupported"));
 	}
-	if !matches!(request.output, Setting::Unset) {
-		return Err(invalid_request("ollama_structured_output_unsupported"));
-	}
+	let format = match &request.output {
+		Setting::Unset => None,
+		Setting::Require(StructuredOutput::JsonObject)
+		| Setting::Prefer(StructuredOutput::JsonObject) => Some(OllamaFormat::Json("json")),
+		Setting::Require(StructuredOutput::JsonSchema { schema, .. })
+		| Setting::Prefer(StructuredOutput::JsonSchema { schema, .. }) => {
+			Some(OllamaFormat::Schema(schema.as_value()))
+		},
+		Setting::Require(_) | Setting::Prefer(_) => {
+			return Err(capability_error("ollama_output_grammar_unsupported"));
+		},
+	};
 	if !matches!(request.verbosity, Setting::Unset) {
-		return Err(invalid_request("ollama_verbosity_unsupported"));
+		return Err(capability_error("ollama_verbosity_unsupported"));
 	}
 	if !matches!(request.cache_retention, Setting::Unset) {
-		return Err(invalid_request("ollama_cache_retention_unsupported"));
+		return Err(capability_error("ollama_cache_retention_unsupported"));
 	}
 	if !matches!(request.service_tier, Setting::Unset) {
-		return Err(invalid_request("ollama_service_tier_unsupported"));
+		return Err(capability_error("ollama_service_tier_unsupported"));
 	}
-	if request.top_logprobs.is_some() || !request.safety.is_empty() {
-		return Err(invalid_request("ollama_requested_feature_unsupported"));
+	if request.top_logprobs.is_some() {
+		return Err(capability_error("ollama_logprobs_unsupported"));
+	}
+	if !request.safety.is_empty() {
+		return Err(capability_error("ollama_safety_settings_unsupported"));
 	}
 	if request.sampling.presence_penalty.is_some() || request.sampling.frequency_penalty.is_some() {
-		return Err(invalid_request("ollama_penalties_unsupported"));
+		return Err(capability_error("ollama_penalties_unsupported"));
 	}
 	let target = context
 		.target
@@ -386,7 +406,7 @@ fn encode_chat(
 	if context.policy.structured.sampling_params == Some(false)
 		&& (request.sampling.temperature.is_some() || request.sampling.top_p.is_some())
 	{
-		return Err(invalid_request("ollama_sampling_unsupported_by_policy"));
+		return Err(capability_error("ollama_sampling_unsupported_by_policy"));
 	}
 
 	let named_tool = match &request.tool_choice {
@@ -400,11 +420,12 @@ fn encode_chat(
 		.iter()
 		.filter(|tool| named_tool.is_none_or(|name| tool.name.as_str() == name))
 		.map(|tool| {
-			let Some((parameters, strict)) = tool.input.json_schema() else {
+			if tool.input.grammar().is_some() {
 				return Err(capability_error("ollama_tool_grammar_unsupported"));
-			};
+			}
+			let (parameters, strict) = tool.input.wire_schema();
 			if strict {
-				return Err(invalid_request("ollama_strict_tool_schema_unsupported"));
+				return Err(capability_error("ollama_strict_tool_schema_unsupported"));
 			}
 			Ok(OllamaTool {
 				kind:     "function",
@@ -456,6 +477,7 @@ fn encode_chat(
 		tools,
 		think,
 		tool_choice,
+		format,
 		options,
 		stream: true,
 	};
@@ -494,7 +516,7 @@ fn encode_think<'a>(
 	}
 	let selection = context
 		.thinking_selection
-		.ok_or_else(|| invalid_request("ollama_thinking_selection_missing"))?;
+		.ok_or_else(|| capability_error("ollama_thinking_selection_missing"))?;
 	if selection.suppress_when_off {
 		return Ok(None);
 	}
@@ -521,12 +543,15 @@ fn encode_message<'a>(
 	context: &EncodeContext<'_>,
 	message: &'a Message,
 ) -> Result<OllamaRequestMessage<'a>, Error> {
+	if message.name.is_some() && message.role != Role::Tool {
+		return Err(capability_error("ollama_message_name_unsupported"));
+	}
 	let role = match message.role {
 		Role::System => "system",
 		Role::User => "user",
 		Role::Assistant => "assistant",
 		Role::Tool => "tool",
-		Role::Developer => return Err(invalid_request("ollama_developer_role_unsupported")),
+		Role::Developer => "system",
 	};
 	let mut content = String::new();
 	let mut thinking = String::new();
@@ -550,10 +575,10 @@ fn encode_message<'a>(
 				images.push(base64::encode(data).into_string());
 			},
 			ContentPart::Image(_) => {
-				return Err(invalid_request("ollama_image_source_requires_staging"));
+				return Err(capability_error("ollama_image_source_requires_staging"));
 			},
 			ContentPart::Audio(_) | ContentPart::Document(_) => {
-				return Err(invalid_request("ollama_media_type_unsupported"));
+				return Err(capability_error("ollama_media_type_unsupported"));
 			},
 			ContentPart::ToolCall { name, arguments, proof, .. } => {
 				reject_proof(context, proof.as_ref())?;
@@ -570,7 +595,7 @@ fn encode_message<'a>(
 			},
 			ContentPart::ToolResult { name, content: result, .. } => {
 				if message.role != Role::Tool || message.content.len() != 1 || result.len() != 1 {
-					return Err(invalid_request("ollama_tool_result_shape_unsupported"));
+					return Err(capability_error("ollama_tool_result_shape_unsupported"));
 				}
 				tool_name = name.as_ref().map(Str::as_str).or(tool_name);
 				match &result[0] {
@@ -581,12 +606,12 @@ fn encode_message<'a>(
 						})?);
 					},
 					ToolResultContent::Image(_) | ToolResultContent::Document(_) => {
-						return Err(invalid_request("ollama_tool_result_media_unsupported"));
+						return Err(capability_error("ollama_tool_result_media_unsupported"));
 					},
 				}
 			},
 			ContentPart::CachePoint(_) => {
-				return Err(invalid_request("ollama_cache_point_unsupported"));
+				return Err(capability_error("ollama_cache_point_unsupported"));
 			},
 		}
 	}
@@ -608,7 +633,7 @@ fn reject_proof(context: &EncodeContext<'_>, proof: Option<&ProviderProof>) -> R
 		if proof.provider != context.route.provider || proof.codec != target.codec {
 			return Err(invalid_request("ollama_provider_proof_scope_mismatch"));
 		}
-		return Err(invalid_request("ollama_provider_proof_unsupported"));
+		return Err(capability_error("ollama_provider_proof_unsupported"));
 	}
 	Ok(())
 }

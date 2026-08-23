@@ -1,13 +1,12 @@
 //! Verifies catalog vendor schemas retain their expected structure.
-#[path = "support/descriptors.rs"]
-mod descriptors;
+mod support;
 
 use std::{collections::BTreeSet, fs, path::Path};
 
-use descriptors::{DescriptorShape, MessageShape, shape};
 use omp_inference::codec::{cursor, devin};
 use prost_types::FileDescriptorSet;
 use serde::Deserialize;
+use support::descriptors::{DescriptorShape, MessageShape, shape};
 
 #[derive(Debug, Deserialize)]
 struct DriftFixture {

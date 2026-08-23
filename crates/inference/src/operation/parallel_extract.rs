@@ -53,9 +53,6 @@ impl ParallelExtractRequest {
 		if self.urls.is_empty() || self.urls.len() > MAX_URLS {
 			return Err(ParallelExtractError::InvalidUrlCount);
 		}
-		fn slice_is_empty<T>(values: &[T]) -> bool {
-			values.is_empty()
-		}
 		if self
 			.urls
 			.iter()

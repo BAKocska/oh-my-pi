@@ -1143,9 +1143,7 @@ fn lower_tools(
 	let mut lowered = Vec::with_capacity(tools.len());
 	let mut withheld = Vec::new();
 	for tool in tools {
-		let Some((parameters, declared_strict)) = tool.input.json_schema() else {
-			return Err(tool_capability_error("openai.chat.tools.grammar_unsupported"));
-		};
+		let (parameters, declared_strict) = tool.input.wire_schema();
 		let (strict, normalize) = match profile.tool_strict {
 			ToolStrictWire::Mixed => (Some(declared_strict), declared_strict),
 			ToolStrictWire::All => (Some(true), true),

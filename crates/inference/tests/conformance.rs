@@ -1,13 +1,6 @@
 //! Cross-provider inference conformance tests.
 
-#[path = "support/auth.rs"]
-mod auth;
-#[path = "support/oracle.rs"]
-mod oracle;
-#[path = "support/refresh.rs"]
-mod refresh;
-#[path = "support/route_factory.rs"]
-mod route_factory;
+mod support;
 
 use std::{
 	collections::{BTreeSet, HashMap},
@@ -89,6 +82,7 @@ use omp_inference::{
 		cassette::{CassetteAttempt, CassetteBodyAction, CassetteTerminal, CassetteTransport},
 	},
 };
+use support::{auth, oracle, refresh, route_factory};
 use tokio::time;
 use tower::{Service as _, ServiceExt as _};
 

@@ -523,13 +523,7 @@ impl DevinCodec {
 			.tools
 			.iter()
 			.map(|tool| {
-				let Some((parameters, strict)) = tool.input.json_schema() else {
-					return Err(protocol_error_with_kind(
-						ErrorKind::CapabilityMismatch,
-						ErrorPhase::Encoding,
-						"devin.tool_grammar.unsupported",
-					));
-				};
+				let (parameters, strict) = tool.input.wire_schema();
 				serde_json::to_string(parameters.as_value())
 					.map(|schema| ChatToolDefinition {
 						name: tool.name.to_string(),

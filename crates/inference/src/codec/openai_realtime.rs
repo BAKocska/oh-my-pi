@@ -331,9 +331,7 @@ fn lower_session(request: &RealtimeRequest) -> Result<RealtimeSessionConfig<'_>,
 	})
 }
 fn lower_tool(tool: &ToolDefinition) -> Result<RealtimeTool<'_>, Error> {
-	let Some((parameters, _)) = tool.input.json_schema() else {
-		return Err(capability_error());
-	};
+	let (parameters, _) = tool.input.wire_schema();
 	Ok(RealtimeTool {
 		kind:        "function",
 		name:        tool.name.as_str(),

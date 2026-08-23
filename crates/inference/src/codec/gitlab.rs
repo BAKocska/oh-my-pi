@@ -13,7 +13,7 @@ use super::{
 use crate::{
 	body::BodySource,
 	call::{
-		ChatRequest, ContentPart, Message, OperationCall, ProviderProof, Role, Setting,
+		ChatRequest, ContentPart, Message, OperationCall, ProviderProof, Role, Setting, ToolChoice,
 		ToolResultContent,
 	},
 	codec::{
@@ -446,7 +446,7 @@ impl Codec for GitLabWorkflowCodec {
 			},
 			OperationCall::DiscoverModels(request) => {
 				if request.cursor.is_some() {
-					return Err(invalid_request("gitlab.discovery.pagination_unsupported"));
+					return Err(capability_error("gitlab.discovery.pagination_unsupported"));
 				}
 				let namespace = gitlab_root_namespace(context)?;
 				Ok(EncodedRequest {
@@ -467,7 +467,7 @@ impl Codec for GitLabWorkflowCodec {
 					sealed_body: None,
 				})
 			},
-			_ => Err(invalid_request("gitlab.workflow.operation_unsupported")),
+			_ => Err(capability_error("gitlab.workflow.operation_unsupported")),
 		}
 	}
 
@@ -479,7 +479,7 @@ impl Codec for GitLabWorkflowCodec {
 				route:     context.route.to_owned(),
 				completed: false,
 			})),
-			_ => Err(invalid_request("gitlab.workflow.operation_unsupported")),
+			_ => Err(capability_error("gitlab.workflow.operation_unsupported")),
 		}
 	}
 }
@@ -600,41 +600,72 @@ fn build_start_request(
 	session: WorkflowSession,
 ) -> Result<StartFrame, Error> {
 	if !request.hosted_tools.is_empty() {
-		return Err(invalid_request("gitlab.workflow.hosted_tools.unsupported"));
+		return Err(capability_error("gitlab.workflow.hosted_tools.unsupported"));
 	}
-	if !matches!(request.tool_choice, Setting::Unset)
-		|| !matches!(request.output, Setting::Unset)
-		|| !matches!(request.reasoning, Setting::Unset)
-		|| !matches!(request.verbosity, Setting::Unset)
-		|| !matches!(request.cache_retention, Setting::Unset)
-		|| !matches!(request.service_tier, Setting::Unset)
-		|| request.sampling.temperature.is_some()
+	let tools_enabled = match &request.tool_choice {
+		Setting::Unset | Setting::Require(ToolChoice::Auto) | Setting::Prefer(ToolChoice::Auto) => {
+			true
+		},
+		Setting::Require(ToolChoice::Disabled) | Setting::Prefer(ToolChoice::Disabled) => false,
+		Setting::Require(ToolChoice::Required | ToolChoice::Named(_))
+		| Setting::Prefer(ToolChoice::Required | ToolChoice::Named(_)) => {
+			return Err(capability_error("gitlab.workflow.tool_choice.unsupported"));
+		},
+	};
+	if !matches!(request.output, Setting::Unset) {
+		return Err(capability_error("gitlab.workflow.output.unsupported"));
+	}
+	if !matches!(request.reasoning, Setting::Unset) {
+		return Err(capability_error("gitlab.workflow.reasoning.unsupported"));
+	}
+	if !matches!(request.verbosity, Setting::Unset) {
+		return Err(capability_error("gitlab.workflow.verbosity.unsupported"));
+	}
+	if !matches!(request.cache_retention, Setting::Unset) {
+		return Err(capability_error("gitlab.workflow.cache_retention.unsupported"));
+	}
+	if !matches!(request.service_tier, Setting::Unset) {
+		return Err(capability_error("gitlab.workflow.service_tier.unsupported"));
+	}
+	if request.sampling.temperature.is_some()
 		|| request.sampling.top_p.is_some()
 		|| request.sampling.top_k.is_some()
 		|| request.sampling.seed.is_some()
 		|| !request.sampling.stop.is_empty()
 		|| request.sampling.presence_penalty.is_some()
 		|| request.sampling.frequency_penalty.is_some()
-		|| request.max_output_tokens.is_some()
-		|| request.top_logprobs.is_some()
-		|| !request.safety.is_empty()
 	{
-		return Err(invalid_request("gitlab.workflow.explicit_controls.unsupported"));
+		return Err(capability_error("gitlab.workflow.sampling.unsupported"));
+	}
+	if request.max_output_tokens.is_some() {
+		return Err(capability_error("gitlab.workflow.max_output_tokens.unsupported"));
+	}
+	if request.top_logprobs.is_some() {
+		return Err(capability_error("gitlab.workflow.logprobs.unsupported"));
+	}
+	if !request.safety.is_empty() {
+		return Err(capability_error("gitlab.workflow.safety_settings.unsupported"));
 	}
 	let mut tools = Vec::with_capacity(request.tools.len());
-	for tool in request.tools.iter() {
-		let Some((parameters, _)) = tool.input.json_schema() else {
-			return Err(capability_error("gitlab.workflow.tool_grammar.unsupported"));
-		};
-		tools.push(McpTool {
-			name:               tool.name.clone(),
-			original_tool_name: tool.name.clone(),
-			server_name:        "omp",
-			description:        tool.description.clone().unwrap_or_default(),
-			input_schema:       serde_json::to_string(parameters.as_value())
-				.map_err(|_| invalid_request("gitlab.workflow.tool_schema.serialization"))?,
-			is_approved:        true,
-		});
+	if tools_enabled {
+		for tool in request.tools.iter() {
+			if tool.input.grammar().is_some() {
+				return Err(capability_error("gitlab.workflow.tool.grammar.unsupported"));
+			}
+			let (parameters, strict) = tool.input.wire_schema();
+			if strict {
+				return Err(capability_error("gitlab.workflow.tool.strict.unsupported"));
+			}
+			tools.push(McpTool {
+				name:               tool.name.clone(),
+				original_tool_name: tool.name.clone(),
+				server_name:        "omp",
+				description:        tool.description.clone().unwrap_or_default(),
+				input_schema:       serde_json::to_string(parameters.as_value())
+					.map_err(|_| invalid_request("gitlab.workflow.tool_schema.serialization"))?,
+				is_approved:        true,
+			});
+		}
 	}
 	let system = workflow_system_prompt(request, context)?;
 	let goal = render_chatml(request, context)?;
@@ -660,7 +691,11 @@ fn build_start_request(
 				"command_timeout",
 				"tool_call_approval",
 			],
-			preapproved_tools: request.tools.iter().map(|tool| tool.name.clone()).collect(),
+			preapproved_tools: if tools_enabled {
+				request.tools.iter().map(|tool| tool.name.clone()).collect()
+			} else {
+				Vec::new()
+			},
 			mcp_tools: tools,
 			flow_config_schema_version: "v1",
 			flow_config: FlowConfig {
@@ -735,6 +770,9 @@ fn workflow_system_prompt(
 }
 
 fn message_text(message: &Message, context: &EncodeContext<'_>) -> Result<String, Error> {
+	if message.name.is_some() {
+		return Err(capability_error("gitlab.workflow.message_name.unrepresentable"));
+	}
 	let mut output = String::new();
 	for part in message.content.iter() {
 		if !output.is_empty() {
@@ -744,21 +782,21 @@ fn message_text(message: &Message, context: &EncodeContext<'_>) -> Result<String
 			ContentPart::Text { text, proof } => {
 				validate_proof(proof.as_ref(), context)?;
 				if proof.is_some() {
-					return Err(invalid_request("gitlab.workflow.text_proof.unrepresentable"));
+					return Err(capability_error("gitlab.workflow.text_proof.unrepresentable"));
 				}
 				output.push_str(text);
 			},
 			ContentPart::Reasoning { text, proof } => {
 				validate_proof(proof.as_ref(), context)?;
 				if proof.is_some() {
-					return Err(invalid_request("gitlab.workflow.reasoning_proof.unrepresentable"));
+					return Err(capability_error("gitlab.workflow.reasoning_proof.unrepresentable"));
 				}
 				output.push_str(text);
 			},
 			ContentPart::ToolCall { call: _, name, arguments, proof } => {
 				if proof.is_some() {
 					validate_proof(proof.as_ref(), context)?;
-					return Err(invalid_request("gitlab.workflow.tool_proof.unrepresentable"));
+					return Err(capability_error("gitlab.workflow.tool_proof.unrepresentable"));
 				}
 				output.push_str("<ran ");
 				output.push_str(name);
@@ -769,10 +807,7 @@ fn message_text(message: &Message, context: &EncodeContext<'_>) -> Result<String
 				);
 				output.push_str("</ran>");
 			},
-			ContentPart::ToolResult { name, content, is_error, .. } => {
-				if name.is_some() {
-					return Err(invalid_request("gitlab.workflow.tool_result.name_unrepresentable"));
-				}
+			ContentPart::ToolResult { name: _, content, is_error, .. } => {
 				output.push_str(if *is_error {
 					"<ran:result status=error>"
 				} else {
@@ -782,10 +817,10 @@ fn message_text(message: &Message, context: &EncodeContext<'_>) -> Result<String
 				output.push_str("</ran:result>");
 			},
 			ContentPart::Image(_) | ContentPart::Audio(_) | ContentPart::Document(_) => {
-				return Err(invalid_request("gitlab.workflow.media.unsupported"));
+				return Err(capability_error("gitlab.workflow.media.unsupported"));
 			},
 			ContentPart::CachePoint(_) => {
-				return Err(invalid_request("gitlab.workflow.explicit_cache_point.unsupported"));
+				return Err(capability_error("gitlab.workflow.explicit_cache_point.unsupported"));
 			},
 		}
 	}
@@ -804,7 +839,7 @@ fn append_tool_result(output: &mut String, content: &[ToolResultContent]) -> Res
 					.map_err(|_| invalid_request("gitlab.workflow.tool_result.serialization"))?,
 			),
 			ToolResultContent::Image(_) | ToolResultContent::Document(_) => {
-				return Err(invalid_request("gitlab.workflow.tool_result.media.unsupported"));
+				return Err(capability_error("gitlab.workflow.tool_result.media.unsupported"));
 			},
 		}
 	}
@@ -1337,7 +1372,6 @@ fn invalid_request(reason: &'static str) -> Error {
 	error.kind = ErrorKind::InvalidRequest;
 	error
 }
-
 fn capability_error(reason: &'static str) -> Error {
 	let mut error = protocol_error(ErrorPhase::Encoding, reason);
 	error.kind = ErrorKind::CapabilityMismatch;
@@ -1370,8 +1404,8 @@ mod tests {
 	use super::*;
 	use crate::{
 		call::{
-			NegotiationPolicy, Sampling, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
-			ToolInputConstraint,
+			NegotiationPolicy, OpaqueJson, Sampling, ToolDefinition, ToolGrammar,
+			ToolGrammarSyntax, ToolInputConstraint,
 		},
 		id::RequestId,
 	};
@@ -1858,7 +1892,7 @@ mod tests {
 	}
 
 	#[test]
-	fn workflow_codec_rejects_custom_tool_grammars_before_wire_encoding() {
+	fn workflow_codec_rejects_custom_tool_grammars() {
 		let catalog = Catalog::embedded();
 		let model = catalog.models().first().expect("embedded model");
 		let route = model
@@ -1869,7 +1903,7 @@ mod tests {
 		let policy = catalog
 			.wire_policy(&model.wire_policy)
 			.expect("embedded wire policy");
-		let request_id = RequestId::new("gitlab-grammar-rejection");
+		let request_id = RequestId::new("gitlab-grammar-fallback");
 		let context =
 			EncodeContext { request_id: &request_id, route, policy, ..EncodeContext::default() };
 		let request = ChatRequest {
@@ -1877,10 +1911,13 @@ mod tests {
 			tools:             Arc::from([ToolDefinition {
 				name:        sf!("match_input"),
 				description: None,
-				input:       ToolInputConstraint::Grammar(ToolGrammar {
-					syntax:     ToolGrammarSyntax::Lark,
-					definition: sf!("start: WORD"),
-				}),
+				input:       ToolInputConstraint::Grammar {
+					grammar:  ToolGrammar {
+						syntax:     ToolGrammarSyntax::Lark,
+						definition: sf!("start: WORD"),
+					},
+					fallback: OpaqueJson::new(serde_json::json!({"type": "object"})),
+				},
 			}]),
 			hosted_tools:      Arc::from([]),
 			tool_choice:       Setting::Unset,
@@ -1895,16 +1932,15 @@ mod tests {
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
 		};
-		let Err(error) =
-			build_start_request(&request, &context, WorkflowSession::new("workflow", "session"))
-		else {
-			panic!("GitLab Workflow must reject custom tool grammars");
-		};
+		let error =
+			match build_start_request(
+				&request,
+				&context,
+				WorkflowSession::new("workflow", "session"),
+			) {
+				Err(error) => error,
+				Ok(_) => panic!("workflow does not represent grammar-constrained tool input"),
+			};
 		assert_eq!(error.kind, ErrorKind::CapabilityMismatch);
-		assert!(matches!(
-			error.detail_ref(),
-			Some(ErrorDetail::Protocol { reason })
-				if reason.0.as_str() == "gitlab.workflow.tool_grammar.unsupported"
-		));
 	}
 }

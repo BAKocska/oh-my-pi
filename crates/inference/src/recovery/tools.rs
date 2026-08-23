@@ -451,7 +451,7 @@ impl<'a> ToolAssembler<'a> {
 				self.record("tool.complete-schema-valid", call.arguments.len() as u64, 1);
 				arguments
 			},
-			ToolInputConstraint::Grammar(_) => {
+			ToolInputConstraint::Grammar { .. } => {
 				let Ok(arguments) = str::from_utf8(&call.arguments) else {
 					return ToolAssemblyEvent::Rejected {
 						source_index,

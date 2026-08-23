@@ -687,9 +687,7 @@ fn lower_count_tokens(
 		prepend_claude_code_identity(&mut body.system);
 	}
 	for tool in request.tools.iter() {
-		let Some((parameters, strict)) = tool.input.json_schema() else {
-			return Err(capability_error("anthropic.tools.grammar_unsupported"));
-		};
+		let (parameters, strict) = tool.input.wire_schema();
 		let mut input_schema = parameters.as_value().clone();
 		spill_root_combinators(&mut input_schema);
 		body.tools.push(Tool::Client(ClientTool {
@@ -868,9 +866,7 @@ pub fn lower_chat(
 		}
 	}
 	for tool in request.tools.iter() {
-		let Some((parameters, strict)) = tool.input.json_schema() else {
-			return Err(capability_error("anthropic.tools.grammar_unsupported"));
-		};
+		let (parameters, strict) = tool.input.wire_schema();
 		let mut input_schema = parameters.as_value().clone();
 		spill_root_combinators(&mut input_schema);
 		body.tools.push(Tool::Client(ClientTool {

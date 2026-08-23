@@ -554,14 +554,20 @@ pub enum ToolInputConstraint {
 		strict:     bool,
 	},
 	/// Freeform text constrained by the exact grammar declaration.
-	Grammar(ToolGrammar),
+	Grammar {
+		/// Exact grammar declaration for grammar-capable transports.
+		grammar:  ToolGrammar,
+		/// Non-strict JSON Schema encoded by transports without
+		/// grammar-constrained tools; they ignore the grammar entirely.
+		fallback: OpaqueJson,
+	},
 }
 impl ToolInputConstraint {
 	/// Returns the JSON Schema declaration when this input is structured JSON.
 	pub const fn json_schema(&self) -> Option<(&OpaqueJson, bool)> {
 		match self {
 			Self::JsonSchema { parameters, strict } => Some((parameters, *strict)),
-			Self::Grammar(_) => None,
+			Self::Grammar { .. } => None,
 		}
 	}
 
@@ -569,7 +575,17 @@ impl ToolInputConstraint {
 	pub const fn grammar(&self) -> Option<&ToolGrammar> {
 		match self {
 			Self::JsonSchema { .. } => None,
-			Self::Grammar(grammar) => Some(grammar),
+			Self::Grammar { grammar, .. } => Some(grammar),
+		}
+	}
+
+	/// Returns the JSON Schema a schema-only transport encodes: the declared
+	/// schema for structured inputs, the non-strict fallback for grammar
+	/// inputs. Grammar-capable transports check [`Self::grammar`] first.
+	pub const fn wire_schema(&self) -> (&OpaqueJson, bool) {
+		match self {
+			Self::JsonSchema { parameters, strict } => (parameters, *strict),
+			Self::Grammar { fallback, .. } => (fallback, false),
 		}
 	}
 }

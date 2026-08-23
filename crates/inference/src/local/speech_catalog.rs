@@ -298,74 +298,103 @@ pub struct SpeechArtifactManifests {
 impl SpeechArtifactManifests {
 	/// Builds the revision-pinned pi-parity speech artifact portfolio.
 	///
-	/// Whisper uses whisper.cpp's native GGML checkpoints, Parakeet uses pi's
-	/// exact sherpa-onnx export, and Kokoro uses the safetensors conversion
+	/// Whisper and Parakeet use Candle-compatible safetensors checkpoints, while
+	/// Kokoro uses the safetensors conversion
 	/// consumed by `omp-voice-kokoro`. Kokoro's single manifest deliberately
 	/// includes every curated voice so switching voices never performs network
 	/// I/O after the model becomes ready.
 	pub fn pi_parity() -> Result<Self, SpeechCatalogError> {
-		const WHISPER_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
-		const PARAKEET_REVISION: &str = "2bda32ec70b097a55adaa07d9a7173915b43cc78";
+		const WHISPER_BASE_REVISION: &str = "e37978b90ca9030d5170a5c07aadb050351a65bb";
+		const WHISPER_SMALL_REVISION: &str = "973afd24965f72e36ca33b3055d56a652f456b4d";
+		const WHISPER_TURBO_REVISION: &str = "41f01f3fe87f28c78e2fbf8b568835947dd65ed9";
+		const PARAKEET_REVISION: &str = "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15";
 		const KOKORO_REVISION: &str = "e02c9eada7ce7416798af36b190a8a2dd2ecd566";
 
-		let fast = ArtifactManifest::new("stt-fast-whisper-base", vec![speech_shard(
-			"speech/stt/fast/ggml-base.bin",
-			&format!(
-				"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REVISION}/ggml-base.bin"
+		let whisper_base = "https://huggingface.co/openai/whisper-base/resolve";
+		let fast = ArtifactManifest::new("stt-fast-whisper-base", vec![
+			speech_shard(
+				"speech/stt/fast/model.safetensors",
+				&format!("{whisper_base}/{WHISPER_BASE_REVISION}/model.safetensors"),
+				290_403_936,
+				b"07cadb9f25677c8d50df603e66a98fbd842cce45047139baeb16e6219a1e807b",
 			),
-			147_951_465,
-			b"60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
-		)])
+			speech_shard(
+				"speech/stt/fast/config.json",
+				&format!("{whisper_base}/{WHISPER_BASE_REVISION}/config.json"),
+				1_983,
+				b"1617473816d10137971c1cbd9b8a529ade4343d63af95d727993d3706aae6423",
+			),
+			speech_shard(
+				"speech/stt/fast/tokenizer.json",
+				&format!("{whisper_base}/{WHISPER_BASE_REVISION}/tokenizer.json"),
+				2_480_466,
+				b"5aca11a905abd927aac05308d59a1bf7d307367224036974527ed96f1bab867e",
+			),
+		])
 		.map_err(|source| SpeechCatalogError::Artifact { source })?;
-		let balanced = ArtifactManifest::new("stt-balanced-whisper-small", vec![speech_shard(
-			"speech/stt/balanced/ggml-small.bin",
-			&format!(
-					"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REVISION}/ggml-small.bin"
-				),
-			487_601_967,
-			b"1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
-		)])
+		let whisper_small = "https://huggingface.co/openai/whisper-small/resolve";
+		let balanced = ArtifactManifest::new("stt-balanced-whisper-small", vec![
+			speech_shard(
+				"speech/stt/balanced/model.safetensors",
+				&format!("{whisper_small}/{WHISPER_SMALL_REVISION}/model.safetensors"),
+				966_995_080,
+				b"1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b",
+			),
+			speech_shard(
+				"speech/stt/balanced/config.json",
+				&format!("{whisper_small}/{WHISPER_SMALL_REVISION}/config.json"),
+				1_967,
+				b"e6a2b489da1b5aed65a8eb8d1e7466fa867ad5643a8bc138ba708bd56b2875c4",
+			),
+			speech_shard(
+				"speech/stt/balanced/tokenizer.json",
+				&format!("{whisper_small}/{WHISPER_SMALL_REVISION}/tokenizer.json"),
+				2_480_466,
+				b"27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec5374b4482d1a566",
+			),
+		])
 		.map_err(|source| SpeechCatalogError::Artifact { source })?;
-		let turbo = ArtifactManifest::new(
-			"stt-turbo-whisper-large-v3-turbo",
-			vec![speech_shard(
-				"speech/stt/turbo/ggml-large-v3-turbo.bin",
-				&format!(
-					"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REVISION}/ggml-large-v3-turbo.bin"
-				),
-				1_624_555_275,
-				b"1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
-			)],
-		)
+		let whisper_turbo = "https://huggingface.co/openai/whisper-large-v3-turbo/resolve";
+		let turbo = ArtifactManifest::new("stt-turbo-whisper-large-v3-turbo", vec![
+			speech_shard(
+				"speech/stt/turbo/model.safetensors",
+				&format!("{whisper_turbo}/{WHISPER_TURBO_REVISION}/model.safetensors"),
+				1_617_824_864,
+				b"542566a422ae4f3fd23f1ba11add198fca01bbf82e66e6a2857b3f608b1eb9d1",
+			),
+			speech_shard(
+				"speech/stt/turbo/config.json",
+				&format!("{whisper_turbo}/{WHISPER_TURBO_REVISION}/config.json"),
+				1_256,
+				b"c5b526b3e3cd64cd8940dabb45e8ba726629e22d8ed389c29b552f9140daf04a",
+			),
+			speech_shard(
+				"speech/stt/turbo/tokenizer.json",
+				&format!("{whisper_turbo}/{WHISPER_TURBO_REVISION}/tokenizer.json"),
+				2_710_337,
+				b"297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
+			),
+		])
 		.map_err(|source| SpeechCatalogError::Artifact { source })?;
-		let parakeet_base = concat!(
-			"https://huggingface.co/csukuangfj/",
-			"sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/"
-		);
-		let parakeet = ArtifactManifest::new("stt-parakeet-tdt-0.6b-v3-int8", vec![
+		let parakeet_base = "https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3/resolve";
+		let parakeet = ArtifactManifest::new("stt-parakeet-tdt-0.6b-v3", vec![
 			speech_shard(
-				"speech/stt/parakeet/encoder.int8.onnx",
-				&format!("{parakeet_base}{PARAKEET_REVISION}/encoder.int8.onnx"),
-				652_184_281,
-				b"acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247",
+				"speech/stt/parakeet/model.safetensors",
+				&format!("{parakeet_base}/{PARAKEET_REVISION}/model.safetensors"),
+				2_508_288_736,
+				b"05e01c7f396c298cf7d23f61da7b504adeab698f0aaeafd9c82d198625464592",
 			),
 			speech_shard(
-				"speech/stt/parakeet/decoder.int8.onnx",
-				&format!("{parakeet_base}{PARAKEET_REVISION}/decoder.int8.onnx"),
-				11_845_275,
-				b"179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e",
+				"speech/stt/parakeet/config.json",
+				&format!("{parakeet_base}/{PARAKEET_REVISION}/config.json"),
+				244_093,
+				b"f320f1292511f34ec47f513755fe20fd01dbfc09a925d42730e66059a6e1ef4c",
 			),
 			speech_shard(
-				"speech/stt/parakeet/joiner.int8.onnx",
-				&format!("{parakeet_base}{PARAKEET_REVISION}/joiner.int8.onnx"),
-				6_355_277,
-				b"3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3",
-			),
-			speech_shard(
-				"speech/stt/parakeet/tokens.txt",
-				&format!("{parakeet_base}{PARAKEET_REVISION}/tokens.txt"),
-				93_939,
-				b"d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
+				"speech/stt/parakeet/vocab.txt",
+				&format!("{parakeet_base}/{PARAKEET_REVISION}/vocab.txt"),
+				46_772,
+				b"3cde1409fd78783a79b29ed4d32da57c746993856f7c8263bcb905d2e5839db7",
 			),
 		])
 		.map_err(|source| SpeechCatalogError::Artifact { source })?;
@@ -900,10 +929,10 @@ mod tests {
 	#[test]
 	fn pi_parity_manifests_bind_every_runtime_file() {
 		let artifacts = SpeechArtifactManifests::pi_parity().expect("curated manifests");
-		assert_eq!(artifacts.stt_manifest(SttPreset::Fast).shards.len(), 1);
-		assert_eq!(artifacts.stt_manifest(SttPreset::Balanced).shards.len(), 1);
-		assert_eq!(artifacts.stt_manifest(SttPreset::Turbo).shards.len(), 1);
-		assert_eq!(artifacts.stt_manifest(SttPreset::Parakeet).shards.len(), 4);
+		assert_eq!(artifacts.stt_manifest(SttPreset::Fast).shards.len(), 3);
+		assert_eq!(artifacts.stt_manifest(SttPreset::Balanced).shards.len(), 3);
+		assert_eq!(artifacts.stt_manifest(SttPreset::Turbo).shards.len(), 3);
+		assert_eq!(artifacts.stt_manifest(SttPreset::Parakeet).shards.len(), 3);
 		assert_eq!(artifacts.kokoro_manifest().shards.len(), 14);
 		assert!(
 			artifacts

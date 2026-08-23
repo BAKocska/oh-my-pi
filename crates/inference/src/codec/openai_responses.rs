@@ -2592,7 +2592,7 @@ impl OpenAiResponsesCodec {
 					ToolInputConstraint::JsonSchema { .. } => {
 						(ResponsesToolKind::Custom, None, None, None)
 					},
-					ToolInputConstraint::Grammar(grammar) => (
+					ToolInputConstraint::Grammar { grammar, .. } => (
 						ResponsesToolKind::Custom,
 						None,
 						None,
@@ -3848,10 +3848,10 @@ mod tests {
 		];
 		for (syntax, definition, expected) in cases {
 			assert_eq!(
-				encode_tool(ToolInputConstraint::Grammar(ToolGrammar {
-					syntax,
-					definition: Str::new(definition),
-				})),
+				encode_tool(ToolInputConstraint::Grammar {
+					grammar:  ToolGrammar { syntax, definition: Str::new(definition) },
+					fallback: OpaqueJson::new(serde_json::json!({"type": "object"})),
+				}),
 				expected,
 			);
 		}

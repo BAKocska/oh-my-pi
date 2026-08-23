@@ -875,12 +875,7 @@ fn tool_config(
 	}
 	let mut tools = Vec::with_capacity(request.tools.len());
 	for tool in request.tools.iter() {
-		let Some((parameters, strict)) = tool.input.json_schema() else {
-			return Err(encoding_error(
-				ErrorKind::CapabilityMismatch,
-				"bedrock.tools.grammar_unsupported",
-			));
-		};
+		let (parameters, strict) = tool.input.wire_schema();
 		if strict {
 			return Err(encoding_error(
 				ErrorKind::CapabilityMismatch,

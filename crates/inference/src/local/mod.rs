@@ -13,14 +13,14 @@ pub mod embedding;
 /// llama.cpp GGUF text generation.
 /// Bounded tiny-message preprocessing and structural chat formatting.
 pub mod message_preproc;
+/// Candle Parakeet speech recognition.
+#[cfg(feature = "local-stt")]
+pub mod parakeet;
 /// Shared admission, memory, cancellation, and idle-unload lifecycle.
 pub mod runtime;
-/// sherpa-onnx Parakeet speech recognition.
-#[cfg(feature = "local-stt")]
-pub mod sherpa;
 /// Backend-neutral speech catalog and artifact-backed cache snapshots.
 pub mod speech_catalog;
-/// Whisper.cpp speech recognition.
+/// Candle Whisper speech recognition.
 #[cfg(feature = "local-stt")]
 pub mod stt;
 #[cfg(feature = "local-text")]

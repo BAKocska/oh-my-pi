@@ -784,7 +784,7 @@ impl GeminiCodec {
 		let reasoning_requested = !matches!(&request.reasoning, Setting::Unset);
 		let Some(selection) = selection else {
 			if reasoning_requested {
-				return Err(GoogleCodecError::encoding(
+				return Err(GoogleCodecError::capability(
 					"Google reasoning requires a thinking selection resolved by the execution plan",
 				));
 			}
@@ -1045,9 +1045,13 @@ impl GeminiCodec {
 		if !request.tools.is_empty() {
 			let mut declarations = Vec::with_capacity(request.tools.len());
 			for tool in request.tools.iter() {
-				let Some((parameters, strict)) = tool.input.json_schema() else {
-					return Err(GoogleCodecError::capability("gemini.tools.grammar_unsupported"));
-				};
+				if tool.input.grammar().is_some() {
+					return Err(GoogleCodecError::capability(format!(
+						"Gemini function declaration `{}` does not accept grammar-constrained tool input",
+						tool.name,
+					)));
+				}
+				let (parameters, strict) = tool.input.wire_schema();
 				let mut schema = GoogleSchema::from_opaque(parameters)?;
 				if matches!(self.endpoint, GoogleEndpointKind::CloudCodeAssist) {
 					schema.normalize_for_cca();
@@ -1185,7 +1189,7 @@ impl GeminiCodec {
 				generation.response_json_schema = Some(GoogleSchema::from_opaque(schema)?);
 			},
 			Setting::Require(_) => {
-				return Err(GoogleCodecError::encoding(
+				return Err(GoogleCodecError::capability(
 					"Gemini GenerateContent does not accept the required portable response format",
 				));
 			},
@@ -1210,14 +1214,14 @@ impl GeminiCodec {
 	) -> Result<GoogleThinkingConfig, GoogleCodecError> {
 		let include_thoughts = !matches!(reasoning.visibility, ReasoningVisibility::Hidden);
 		let Some(policy) = self.thinking_policy else {
-			return Err(GoogleCodecError::encoding(
+			return Err(GoogleCodecError::capability(
 				"resolved model policy does not advertise native Google thinking",
 			));
 		};
 		match policy {
 			GoogleThinkingPolicy::Level => {
 				if reasoning.max_tokens.is_some() {
-					return Err(GoogleCodecError::encoding(
+					return Err(GoogleCodecError::capability(
 						"Google level-mode models do not accept a token thinking budget",
 					));
 				}
@@ -1497,9 +1501,7 @@ fn inline_tool_guidance(tools: &[ToolDefinition]) -> Result<Str, GoogleCodecErro
 		 schema):",
 	);
 	for tool in tools {
-		let Some((parameters, _)) = tool.input.json_schema() else {
-			return Err(GoogleCodecError::capability("gemini.tools.grammar_unsupported"));
-		};
+		let (parameters, _) = tool.input.wire_schema();
 		guidance.push_str("\n\n");
 		guidance.push_str(tool.name.as_str());
 		if let Some(description) = &tool.description {
@@ -2116,7 +2118,7 @@ impl Codec for GeminiCodec {
 		}
 		let OperationCall::Chat(request) = operation else {
 			return Err(
-				GoogleCodecError::encoding(
+				GoogleCodecError::capability(
 					"Google codec accepts chat, count-tokens, and embedding operations",
 				)
 				.into_inference(false),
@@ -2148,7 +2150,7 @@ impl Codec for GeminiCodec {
 			.map_err(|error| error.into_inference(false))?;
 		if let Some(adjustment) = projection.adjustments.first() {
 			return Err(
-				GoogleCodecError::encoding(format!(
+				GoogleCodecError::capability(format!(
 					"planning did not account for unsupported Google feature `{}`: {}",
 					adjustment.what, adjustment.detail,
 				))
@@ -2289,7 +2291,7 @@ fn encode_google_count_tokens(
 		.map_err(|error| error.into_inference(false))?;
 	if let Some(adjustment) = projection.adjustments.first() {
 		return Err(
-			GoogleCodecError::encoding(format!(
+			GoogleCodecError::capability(format!(
 				"planning did not account for unsupported Google CountTokens feature `{}`: {}",
 				adjustment.what, adjustment.detail,
 			))
@@ -2339,7 +2341,7 @@ fn encode_google_embeddings(
 	}
 	if !matches!(&request.normalize, Setting::Unset) {
 		return Err(
-			GoogleCodecError::encoding(
+			GoogleCodecError::capability(
 				"Google embedding normalization must be resolved by planning; the wire has no control",
 			)
 			.into_inference(false),
@@ -2347,7 +2349,7 @@ fn encode_google_embeddings(
 	}
 	if !matches!(request.truncation, TruncationPolicy::Reject) {
 		return Err(
-			GoogleCodecError::encoding("Google embedding truncation has no explicit wire control")
+			GoogleCodecError::capability("Google embedding truncation has no explicit wire control")
 				.into_inference(false),
 		);
 	}
@@ -2360,7 +2362,7 @@ fn encode_google_embeddings(
 	for input in request.inputs.iter() {
 		let EmbeddingInput::Text(text) = input else {
 			return Err(
-				GoogleCodecError::encoding(
+				GoogleCodecError::capability(
 					"Google embedContent accepts text, not pre-tokenized inputs",
 				)
 				.into_inference(false),
@@ -2468,7 +2470,7 @@ fn google_unary_uri(
 			)
 			.into())
 		},
-		GoogleEndpointKind::CloudCodeAssist => Err(GoogleCodecError::encoding(
+		GoogleEndpointKind::CloudCodeAssist => Err(GoogleCodecError::capability(
 			"Cloud Code Assist does not expose this Google unary operation",
 		)),
 	}

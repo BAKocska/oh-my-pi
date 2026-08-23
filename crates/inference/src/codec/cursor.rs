@@ -1947,9 +1947,7 @@ fn encode_chat_call(
 		.tools
 		.iter()
 		.map(|tool| {
-			let Some((parameters, _)) = tool.input.json_schema() else {
-				return Err(encoding_error("cursor_tool_grammar_unsupported"));
-			};
+			let (parameters, _) = tool.input.wire_schema();
 			Ok(CursorToolDefinition {
 				name:         tool.name.clone(),
 				description:  tool.description.clone(),

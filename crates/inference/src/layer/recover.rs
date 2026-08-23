@@ -634,7 +634,7 @@ fn recover_tool(
 	};
 	let declared_kind = match &definition.input {
 		ToolInputConstraint::JsonSchema { .. } => ToolInputKind::Json,
-		ToolInputConstraint::Grammar(_) => ToolInputKind::Freeform,
+		ToolInputConstraint::Grammar { .. } => ToolInputKind::Freeform,
 	};
 	if call.input_kind != declared_kind {
 		return Err(recovery_error("tool.input-kind-mismatch", context));
