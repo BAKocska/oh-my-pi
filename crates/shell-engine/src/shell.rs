@@ -2,6 +2,7 @@
 
 use std::{
 	borrow::Cow,
+	env::current_dir,
 	path::{Path, PathBuf},
 };
 
@@ -37,9 +38,19 @@ mod prompts;
 mod state;
 mod traps;
 
+use std::time;
+
 pub use builder::{CreateOptions, ShellBuilder, ShellBuilderState};
 pub use initscripts::{ProfileLoadBehavior, RcLoadBehavior};
 pub use state::ShellState;
+
+use crate::{
+	callstack::CallStack,
+	env::EnvironmentLookup,
+	parser::{ParserImpl, ast::Node},
+	traps::TrapHandlerConfig,
+	variables::ShellVariable,
+};
 
 /// Represents an instance of a shell.
 ///
@@ -54,7 +65,7 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 	error_formatter: SE::ErrorFormatter,
 
 	/// Trap handler configuration for the shell.
-	traps: crate::traps::TrapHandlerConfig,
+	traps: TrapHandlerConfig,
 
 	/// Manages files opened and accessible via redirection operators.
 	open_files: openfiles::OpenFiles,
@@ -103,7 +114,7 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 	product_display_str: Option<String>,
 
 	/// Function/script call stack.
-	call_stack: crate::callstack::CallStack,
+	call_stack: CallStack,
 
 	/// Directory stack used by pushd et al.
 	directory_stack: Vec<PathBuf>,
@@ -115,13 +126,13 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 	program_location_cache: pathcache::PathCache,
 
 	/// Last "SECONDS" captured time.
-	last_stopwatch_time: std::time::SystemTime,
+	last_stopwatch_time: time::SystemTime,
 
 	/// Last "SECONDS" offset requested.
 	last_stopwatch_offset: u32,
 
 	/// Parser implementation to use.
-	parser_impl: crate::parser::ParserImpl,
+	parser_impl: ParserImpl,
 }
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
@@ -194,7 +205,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 			args: options.shell_args.unwrap_or_default(),
 			version: options.shell_version,
 			product_display_str: options.shell_product_display_str,
-			working_dir: options.working_dir.map_or_else(std::env::current_dir, Ok)?,
+			working_dir: options.working_dir.map_or_else(current_dir, Ok)?,
 			builtins: options.builtins,
 			parser_impl: options.parser,
 			..Self::default()
@@ -238,7 +249,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	}
 
 	/// Updates the currently executing command in the shell.
-	pub fn set_current_cmd(&mut self, cmd: &impl crate::parser::ast::Node) {
+	pub fn set_current_cmd(&mut self, cmd: &impl Node) {
 		self
 			.call_stack
 			.set_current_pos(cmd.location().map(|span| span.start));
@@ -261,7 +272,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 		// diagnostics are harmless.
 		if self
 			.env
-			.get_using_policy("_", crate::env::EnvironmentLookup::Anywhere)
+			.get_using_policy("_", EnvironmentLookup::Anywhere)
 			.is_some_and(|v| v.is_readonly())
 		{
 			return;
@@ -272,9 +283,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 		// clears any previously-set attributes (except readonly, handled
 		// above).
 		let value = last_arg.unwrap_or_default();
-		let _ = self
-			.env
-			.set_global("_", crate::variables::ShellVariable::new(value));
+		let _ = self.env.set_global("_", ShellVariable::new(value));
 	}
 
 	/// Applies errexit semantics to a result if enabled and appropriate.
@@ -318,7 +327,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	}
 
 	/// Returns the last "SECONDS" captured time.
-	pub fn last_stopwatch_time(&self) -> std::time::SystemTime {
+	pub fn last_stopwatch_time(&self) -> time::SystemTime {
 		self.last_stopwatch_time
 	}
 
@@ -368,12 +377,12 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	}
 
 	/// Returns the shell's trap handler configuration.
-	pub fn traps(&self) -> &crate::traps::TrapHandlerConfig {
+	pub fn traps(&self) -> &TrapHandlerConfig {
 		&self.traps
 	}
 
 	/// Returns a mutable reference to the shell's trap handler configuration.
-	pub fn traps_mut(&mut self) -> &mut crate::traps::TrapHandlerConfig {
+	pub fn traps_mut(&mut self) -> &mut TrapHandlerConfig {
 		&mut self.traps
 	}
 
@@ -438,7 +447,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	}
 
 	/// Returns the call stack for the shell.
-	pub fn call_stack(&self) -> &crate::callstack::CallStack {
+	pub fn call_stack(&self) -> &CallStack {
 		&self.call_stack
 	}
 
@@ -480,7 +489,7 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 		Shell::is_subshell(self)
 	}
 
-	fn last_stopwatch_time(&self) -> std::time::SystemTime {
+	fn last_stopwatch_time(&self) -> time::SystemTime {
 		Shell::last_stopwatch_time(self)
 	}
 
@@ -520,11 +529,11 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 		Shell::jobs_mut(self)
 	}
 
-	fn traps(&self) -> &crate::traps::TrapHandlerConfig {
+	fn traps(&self) -> &TrapHandlerConfig {
 		Shell::traps(self)
 	}
 
-	fn traps_mut(&mut self) -> &mut crate::traps::TrapHandlerConfig {
+	fn traps_mut(&mut self) -> &mut TrapHandlerConfig {
 		Shell::traps_mut(self)
 	}
 
@@ -568,7 +577,7 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 		Shell::depth(self)
 	}
 
-	fn call_stack(&self) -> &crate::callstack::CallStack {
+	fn call_stack(&self) -> &CallStack {
 		Shell::call_stack(self)
 	}
 

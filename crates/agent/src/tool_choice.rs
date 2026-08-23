@@ -4,7 +4,7 @@
 //! queue therefore never mutates or reorders a tool-call batch that the model
 //! has already emitted.
 
-use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc};
+use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc, vec};
 
 use omp_core::{Str, sf};
 use omp_inference::call::ToolChoice;
@@ -99,7 +99,7 @@ pub struct PushOptions {
 
 enum ChoiceGenerator {
 	Once(Option<ToolChoice>),
-	Sequence(std::vec::IntoIter<ToolChoice>),
+	Sequence(vec::IntoIter<ToolChoice>),
 	Custom(Box<dyn Iterator<Item = ToolChoice> + Send + Sync + 'static>),
 }
 

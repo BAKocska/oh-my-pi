@@ -1,6 +1,7 @@
 use std::{
-	io,
+	fmt, io, mem,
 	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+	str,
 	time::Duration,
 };
 
@@ -8,6 +9,7 @@ use omp_core::{SecretString, Str};
 use tokio::{
 	io::{AsyncReadExt as _, AsyncWriteExt as _},
 	net::{TcpListener, TcpStream},
+	time,
 };
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
@@ -64,8 +66,8 @@ pub struct CallbackGrant {
 	pub state: Str,
 }
 
-impl std::fmt::Debug for CallbackGrant {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CallbackGrant {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("CallbackGrant")
 			.field("code", &"[REDACTED]")
@@ -124,7 +126,7 @@ impl LoopbackCallback {
 	/// protocol deadline. Invalid paths and malformed requests are rejected and
 	/// do not consume the authorization attempt.
 	pub async fn receive(self, cancel: &CancellationToken) -> Result<CallbackGrant, CallbackError> {
-		let deadline = tokio::time::sleep(self.timeout);
+		let deadline = time::sleep(self.timeout);
 		tokio::pin!(deadline);
 		loop {
 			let mut stream = tokio::select! {
@@ -154,7 +156,7 @@ impl LoopbackCallback {
 			write_response(&mut stream, 200, "Authorization complete. You may close this window.")
 				.await?;
 			return Ok(CallbackGrant {
-				code:  SecretString::from(std::mem::take(&mut *code)),
+				code:  SecretString::from(mem::take(&mut *code)),
 				state: Str::from(state.as_str()),
 			});
 		}
@@ -273,7 +275,7 @@ async fn read_request_target(stream: &mut TcpStream) -> io::Result<String> {
 			break;
 		}
 	}
-	let request = std::str::from_utf8(&request[..length])
+	let request = str::from_utf8(&request[..length])
 		.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request is not UTF-8"))?;
 	let mut line = request
 		.lines()
@@ -291,7 +293,7 @@ async fn read_request_target(stream: &mut TcpStream) -> io::Result<String> {
 }
 
 async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
-	use std::fmt::Write as _;
+	use fmt::Write as _;
 	let reason = if status == 200 {
 		"OK"
 	} else if status == 404 {

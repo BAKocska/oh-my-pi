@@ -5,6 +5,7 @@ use omp_settings::{
 	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
 };
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 
@@ -168,8 +169,7 @@ impl SettingsDomain for WebSearchSettings {
 					.all(|(index, value)| values[..index].iter().all(|prior| prior != value))
 		};
 		let endpoint_valid = self.searxng_endpoint.as_deref().is_none_or(|endpoint| {
-			url::Url::parse(endpoint)
-				.is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some())
+			Url::parse(endpoint).is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some())
 		});
 		if unique(&self.order)
 			&& unique(&self.exclusions)

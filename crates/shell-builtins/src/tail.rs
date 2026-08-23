@@ -17,7 +17,7 @@ mod args {
 			parse::{ParseSizeError, SignPrefix, parse_signed_num_max, parse_time},
 			quote::Quotable,
 		},
-		tail::{TailError, TailResult, paths::Input, platform},
+		tail::{TailError, TailResult, paths::Input, platform, platform::Pid},
 	};
 
 	pub mod options {
@@ -134,7 +134,7 @@ mod args {
 		pub follow:              Option<FollowMode>,
 		pub max_unchanged_stats: u32,
 		pub mode:                FilterMode,
-		pub pid:                 platform::Pid,
+		pub pid:                 Pid,
 		pub retry:               bool,
 		pub sleep_sec:           Duration,
 		pub use_polling:         bool,
@@ -1316,6 +1316,7 @@ mod follow {
 			TailResult,
 			args::Settings,
 			chunks::BytesChunkBuffer,
+			map_output_error,
 			paths::{HeaderPrinter, PathExtTail},
 			text,
 		};
@@ -1459,10 +1460,8 @@ mod follow {
 						self.header_printer.print(display_name.as_str(), writer);
 					}
 
-					chunks
-						.print(writer)
-						.map_err(crate::tail::map_output_error)?;
-					writer.flush().map_err(crate::tail::map_output_error)?;
+					chunks.print(writer).map_err(map_output_error)?;
+					writer.flush().map_err(map_output_error)?;
 
 					self.last.replace(path.to_owned());
 					self.update_metadata(path, None);
@@ -1528,13 +1527,15 @@ mod follow {
 	mod watch {
 		//! Notification and polling follow loop.
 		use std::{
-			io::{BufRead, Write},
+			env, hint,
+			io::{self, BufRead, Write},
 			path::{Path, PathBuf},
 			sync::{
 				Arc,
 				atomic::{AtomicBool, Ordering},
 				mpsc::{self, Receiver, channel},
 			},
+			thread,
 			time::Duration,
 		};
 
@@ -1551,7 +1552,9 @@ mod follow {
 				args::{FollowMode, Settings},
 				follow::files::{FileHandling, PathData},
 				paths::{Input, InputKind, MetadataExtTail, PathExtTail},
-				platform, text,
+				platform,
+				platform::Pid,
+				text,
 			},
 		};
 
@@ -1638,7 +1641,7 @@ mod follow {
 			pub orphans:    Vec<PathBuf>,
 			pub files:      FileHandling,
 
-			pub pid:    platform::Pid,
+			pub pid:    Pid,
 			pub stdout: StreamWriter,
 			pub stderr: OpenFile,
 			pub cancel: Arc<AtomicBool>,
@@ -1650,7 +1653,7 @@ mod follow {
 				follow: Option<FollowMode>,
 				use_polling: bool,
 				files: FileHandling,
-				pid: platform::Pid,
+				pid: Pid,
 				stdout: StreamWriter,
 				stderr: OpenFile,
 				cancel: Arc<AtomicBool>,
@@ -1702,7 +1705,7 @@ mod follow {
 			) -> TailResult<()> {
 				if self.follow.is_some() {
 					let path = if path.is_relative() {
-						std::env::current_dir()?.join(path)
+						env::current_dir()?.join(path)
 					} else {
 						path.to_owned()
 					};
@@ -1823,7 +1826,7 @@ mod follow {
 								}
 								let mut path = path.clone();
 								if path.is_relative() {
-									path = std::env::current_dir()?.join(path);
+									path = env::current_dir()?.join(path);
 								}
 
 								if path.is_tailable() {
@@ -2153,12 +2156,12 @@ mod follow {
 								process_event(&mut observer, event, settings, &mut paths)?;
 							}
 							// Use both yield and spin hint for broader CPU support
-							std::thread::yield_now();
-							std::hint::spin_loop();
+							thread::yield_now();
+							hint::spin_loop();
 						}
 					},
 					Ok(Err(notify::Error { kind: notify::ErrorKind::Io(e), paths }))
-						if e.kind() == std::io::ErrorKind::NotFound =>
+						if e.kind() == io::ErrorKind::NotFound =>
 					{
 						if let Some(event_path) = paths.first()
 							&& observer.files.contains_key(event_path)
@@ -2803,7 +2806,9 @@ mod text {
 
 use std::{
 	cmp::Ordering,
+	error,
 	ffi::OsString,
+	fmt::{self, Display},
 	fs::File,
 	io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
@@ -2819,7 +2824,8 @@ use paths::{FileExtTail, HeaderPrinter, Input, InputKind};
 
 use crate::{
 	host::{Host, Utility, matches_parser, util},
-	support::quote::Quotable,
+	support::{fsutil::sane_blksize::sane_blksize_from_metadata, quote::Quotable},
+	tac::run_argv,
 };
 
 const SIGPIPE_EXIT_CODE: i32 = 141;
@@ -2845,8 +2851,8 @@ impl TailError {
 	}
 }
 
-impl std::fmt::Display for TailError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for TailError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Io(error) => error.fmt(f),
 			Self::Message(message) => f.write_str(message),
@@ -2855,7 +2861,7 @@ impl std::fmt::Display for TailError {
 	}
 }
 
-impl std::error::Error for TailError {}
+impl error::Error for TailError {}
 
 impl From<io::Error> for TailError {
 	fn from(error: io::Error) -> Self {
@@ -3042,7 +3048,7 @@ fn run_reverse(matches: &ArgMatches, host: &mut Host) -> i32 {
 		if let Some(files) = matches.get_many::<OsString>(args::options::ARG_FILES) {
 			argv.extend(files.cloned());
 		}
-		return crate::tac::run_argv(argv, host);
+		return run_argv(argv, host);
 	}
 	settings.resolve_paths(host);
 
@@ -3273,8 +3279,7 @@ fn tail_file(
 		match open_result {
 			Ok(mut file) => {
 				let st = file.metadata()?;
-				let blksize_limit =
-					crate::support::fsutil::sane_blksize::sane_blksize_from_metadata(&st);
+				let blksize_limit = sane_blksize_from_metadata(&st);
 				header_printer.print_input(input, &mut observer.stdout);
 				let mut reader;
 				if !settings.presume_input_pipe

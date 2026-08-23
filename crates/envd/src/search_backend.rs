@@ -1,13 +1,19 @@
 //! Late-bound bridge from the environment tool registry to the one inference
 //! facade.
 
-use std::sync::OnceLock;
+use std::{fmt, sync, sync::OnceLock};
 
 use futures::StreamExt as _;
 use omp_core::{Str, sf};
-use omp_proto::inference::v1 as pb;
+use omp_proto::{
+	inference::v1::{self as pb, image_event, inference_client::InferenceClient, speak_event},
+	thread::v1,
+};
 use omp_tools::web_search::{BackendError, SearchBackend};
 use thiserror::Error;
+use tonic::transport;
+
+use crate::SearchInference;
 
 /// Failure to bind the one production inference facade.
 #[derive(Clone, Copy, Debug, Error)]
@@ -27,13 +33,13 @@ pub struct SearchBridgeHost {
 }
 
 enum SearchFacade {
-	Local(std::sync::Arc<dyn crate::SearchInference>),
-	Remote(pb::inference_client::InferenceClient<tonic::transport::Channel>),
+	Local(sync::Arc<dyn SearchInference>),
+	Remote(InferenceClient<transport::Channel>),
 }
 
 impl SearchBridgeHost {
 	/// Creates an unbound host for registry construction.
-	pub(crate) fn new(inference: Option<std::sync::Arc<dyn crate::SearchInference>>) -> Self {
+	pub(crate) fn new(inference: Option<sync::Arc<dyn SearchInference>>) -> Self {
 		Self {
 			inference: inference
 				.map(SearchFacade::Local)
@@ -42,10 +48,10 @@ impl SearchBridgeHost {
 	}
 
 	/// Installs a client for an already-running inference daemon.
-	pub fn bind_remote(&self, channel: tonic::transport::Channel) -> Result<(), SearchBindingError> {
+	pub fn bind_remote(&self, channel: transport::Channel) -> Result<(), SearchBindingError> {
 		self
 			.inference
-			.set(SearchFacade::Remote(pb::inference_client::InferenceClient::new(channel)))
+			.set(SearchFacade::Remote(InferenceClient::new(channel)))
 			.map_err(|_| SearchBindingError::AlreadyBound)
 	}
 
@@ -54,7 +60,7 @@ impl SearchBridgeHost {
 	pub(crate) async fn generate_image(
 		&self,
 		request: pb::GenerateImageRequest,
-	) -> Result<Vec<omp_proto::thread::v1::Blob>, BackendError> {
+	) -> Result<Vec<v1::Blob>, BackendError> {
 		let inference = self.inference.get().ok_or_else(unbound_media)?;
 		match inference {
 			SearchFacade::Local(inference) => inference.generate_image(request).await,
@@ -85,13 +91,13 @@ impl SearchBridgeHost {
 		}
 	}
 }
-async fn collect_images<S>(mut events: S) -> Result<Vec<omp_proto::thread::v1::Blob>, BackendError>
+async fn collect_images<S>(mut events: S) -> Result<Vec<v1::Blob>, BackendError>
 where
 	S: futures::Stream<Item = Result<pb::ImageEvent, tonic::Status>> + Unpin,
 {
 	while let Some(event) = events.next().await {
 		let event = event.map_err(media_status)?;
-		if let Some(pb::image_event::Event::Done(done)) = event.event {
+		if let Some(image_event::Event::Done(done)) = event.event {
 			return Ok(done.images);
 		}
 	}
@@ -108,8 +114,8 @@ where
 	let mut audio = Vec::new();
 	while let Some(event) = events.next().await {
 		match event.map_err(media_status)?.event {
-			Some(pb::speak_event::Event::Chunk(chunk)) => audio.extend_from_slice(&chunk.audio),
-			Some(pb::speak_event::Event::Done(done)) => {
+			Some(speak_event::Event::Chunk(chunk)) => audio.extend_from_slice(&chunk.audio),
+			Some(speak_event::Event::Done(done)) => {
 				if let Some(blob) = done.audio {
 					audio.extend_from_slice(&blob.inline);
 				}
@@ -165,8 +171,8 @@ impl SearchBackend for SearchBridgeHost {
 	}
 }
 
-impl std::fmt::Debug for SearchBridgeHost {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SearchBridgeHost {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("SearchBridgeHost")
 			.field("bound", &self.inference.get().is_some())

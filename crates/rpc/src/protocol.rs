@@ -5,7 +5,10 @@
 //! depending on the application crate while preserving typed envelopes and
 //! control frames.
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+	collections::BTreeMap,
+	fmt::{self, Display},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -50,7 +53,7 @@ impl RequestId {
 	}
 }
 
-impl fmt::Display for RequestId {
+impl Display for RequestId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(&self.0)
 	}
@@ -186,7 +189,7 @@ impl TranscriptCursorError {
 	}
 }
 
-impl fmt::Display for RpcErrorCode {
+impl Display for RpcErrorCode {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(&self.0)
 	}

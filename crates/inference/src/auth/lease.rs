@@ -6,12 +6,16 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Request, Uri};
 use omp_catalog::AuthSpecId;
-use omp_core::{ExposeSecret, SecretString, Str};
+use omp_core::{ExposeSecret, SecretString, Str, encoding::base64};
 use zeroize::Zeroizing;
 
 use super::{
+	shape::ShapedCredential,
 	sigv4::{AwsCredential, SigV4Error, sign_request},
-	spec::{AuthSpec, BodyPlacement, HeaderPlacement, KeyPlacement, QueryPlacement, SigV4Spec},
+	spec::{
+		AuthSpec, BearerScheme, BodyPlacement, HeaderPlacement, KeyPlacement, QueryPlacement,
+		SessionTokenSpec as SpecSessionTokenSpec, SigV4Spec,
+	},
 };
 use crate::{
 	codec::{Cancellation, SealedBodyTemplate},
@@ -211,7 +215,7 @@ impl CredentialLease {
 		self.inner.material.scalar().ok()
 	}
 
-	pub(crate) fn with_shape(self, shaped: super::shape::ShapedCredential) -> Self {
+	pub(crate) fn with_shape(self, shaped: ShapedCredential) -> Self {
 		let kind = self.kind();
 		let Self { inner, source_tag, .. } = self;
 		let inner = match shaped.secret {
@@ -315,7 +319,7 @@ impl CredentialLease {
 		let mut joined = Zeroizing::new(Vec::with_capacity(placement.prefix.len() + encoded_len));
 		joined.extend_from_slice(placement.prefix.as_bytes());
 		{
-			let mut writer = omp_core::encoding::base64::encode_writer(&mut *joined);
+			let mut writer = base64::encode_writer(&mut *joined);
 			writer
 				.write_all(&plain)
 				.map_err(|_| CredentialApplyError::InvalidHeader)?;
@@ -387,7 +391,7 @@ impl CredentialLease {
 			AuthSpec::None => Ok(()),
 			AuthSpec::ApiKey { placement, .. }
 			| AuthSpec::Bearer { placement, .. }
-			| AuthSpec::SessionToken(super::spec::SessionTokenSpec { placement, .. }) => {
+			| AuthSpec::SessionToken(SpecSessionTokenSpec { placement, .. }) => {
 				self.apply_key_placement(placement, request)
 			},
 			AuthSpec::Basic { placement, .. } => self.apply_basic(placement, request.headers_mut()),
@@ -456,12 +460,12 @@ impl AuthScheme {
 			AuthSpec::None => Self::None,
 			AuthSpec::ApiKey { .. } => Self::ApiKey,
 			AuthSpec::Basic { .. } => Self::Basic,
-			AuthSpec::Bearer { scheme: super::spec::BearerScheme::OAuth, .. }
+			AuthSpec::Bearer { scheme: BearerScheme::OAuth, .. }
 			| AuthSpec::OAuthPkce(_)
 			| AuthSpec::OAuthDevice(_)
 			| AuthSpec::OAuthPaste(_)
 			| AuthSpec::OAuthCustom(_) => Self::OAuth,
-			AuthSpec::Bearer { scheme: super::spec::BearerScheme::ApplicationDefault, .. }
+			AuthSpec::Bearer { scheme: BearerScheme::ApplicationDefault, .. }
 			| AuthSpec::ApplicationDefault(_) => Self::ApplicationDefault,
 			AuthSpec::AwsSigV4(_) => Self::AwsSigV4,
 			AuthSpec::SessionToken(_) => Self::SessionToken,
@@ -541,7 +545,7 @@ impl AppliedCredentials {
 			return Err(CredentialApplyError::Cancelled);
 		}
 		let placement = match &self.spec {
-			AuthSpec::SessionToken(super::spec::SessionTokenSpec {
+			AuthSpec::SessionToken(SpecSessionTokenSpec {
 				placement: KeyPlacement::Body(placement),
 				..
 			}) => *placement,
@@ -794,7 +798,10 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		auth::spec::{BodyPlacement, CredentialSourceSpec, SessionTokenSpec},
+		auth::{
+			ShapedCredential as AuthShapedCredential,
+			spec::{BodyPlacement, CredentialSourceSpec, SessionTokenSpec},
+		},
 		codec::{SealedBodyTemplate, devin::DevinSealedBody},
 	};
 
@@ -812,7 +819,7 @@ mod tests {
 		let lease =
 			CredentialLease::bearer(meta(), SecretString::from("unchanged-secret".to_owned()));
 		let original = Arc::clone(&lease.inner);
-		let shaped = lease.with_shape(crate::auth::ShapedCredential {
+		let shaped = lease.with_shape(AuthShapedCredential {
 			secret:            None,
 			endpoint_override: Some(sf!("https://override.example")),
 		});

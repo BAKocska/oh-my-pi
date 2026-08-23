@@ -6,7 +6,7 @@
 //! stream even though the pinned descriptor declares the method unary;
 //! descriptor tests make that observed drift explicit.
 
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, error, fmt, fmt::Display, sync::Arc, time::Duration};
 
 use bytes::{BufMut as _, Bytes, BytesMut};
 use omp_catalog::{
@@ -21,6 +21,14 @@ use prost_types::{
 	value::Kind as ProtoValueKind,
 };
 
+use self::wire::{
+	agent_client_message, agent_server_message, ask_question_result, conversation_action,
+	create_plan_result, cursor_rule_type, exa_fetch_request_response, exa_search_request_response,
+	exec_client_control_message, exec_client_message, exec_server_control_message,
+	exec_server_message, interaction_update, shell_result, shell_stream,
+	switch_mode_request_response, tool_call, tool_call_delta, web_fetch_request_response,
+	web_search_request_response,
+};
 use super::{
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
 	ProviderControlEvent, ProviderStateEvent, RawCompletion, RawEvent, RequestHeader, RequestMethod,
@@ -131,13 +139,13 @@ impl CursorProtocolError {
 	}
 }
 
-impl fmt::Display for CursorProtocolError {
+impl Display for CursorProtocolError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.reason.as_str())
 	}
 }
 
-impl std::error::Error for CursorProtocolError {}
+impl error::Error for CursorProtocolError {}
 
 /// Maps an HTTP response status into Cursor's secret-free error vocabulary.
 pub const fn classify_http_status(status: u16) -> Option<CursorProtocolError> {
@@ -307,7 +315,7 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 	let request_context = cursor_request_context(&request.root_prompts);
 	let action = match &request.action {
 		CursorRunAction::UserMessage { message_id, text } => {
-			wire::conversation_action::Action::UserMessageAction(wire::UserMessageAction {
+			conversation_action::Action::UserMessageAction(wire::UserMessageAction {
 				user_message:                 Some(wire::UserMessage {
 					text: text.as_str().to_owned(),
 					message_id: message_id.as_str().to_owned(),
@@ -317,14 +325,10 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 				send_to_interaction_listener: None,
 			})
 		},
-		CursorRunAction::Resume => {
-			wire::conversation_action::Action::ResumeAction(wire::ResumeAction {
-				request_context: Some(request_context),
-			})
-		},
-		CursorRunAction::Cancel => {
-			wire::conversation_action::Action::CancelAction(wire::CancelAction {})
-		},
+		CursorRunAction::Resume => conversation_action::Action::ResumeAction(wire::ResumeAction {
+			request_context: Some(request_context),
+		}),
+		CursorRunAction::Cancel => conversation_action::Action::CancelAction(wire::CancelAction {}),
 	};
 	let tools = request
 		.tools
@@ -376,7 +380,7 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 		..Default::default()
 	};
 	Ok(connect_message(&wire::AgentClientMessage {
-		message: Some(wire::agent_client_message::Message::RunRequest(run)),
+		message: Some(agent_client_message::Message::RunRequest(run)),
 	}))
 }
 /// Projects ordered system/developer prompts as global `requestContext.rules`
@@ -392,9 +396,7 @@ fn cursor_request_context(root_prompts: &[CursorRootPrompt]) -> wire::RequestCon
 				full_path: format!("/omp/system-prompt/{index}.mdc"),
 				content: prompt.text.as_str().to_owned(),
 				r#type: Some(wire::CursorRuleType {
-					r#type: Some(wire::cursor_rule_type::Type::Global(
-						wire::CursorRuleTypeGlobal::default(),
-					)),
+					r#type: Some(cursor_rule_type::Type::Global(wire::CursorRuleTypeGlobal::default())),
 				}),
 				source: wire::CursorRuleSource::User as i32,
 				..Default::default()
@@ -730,10 +732,8 @@ pub enum CursorShellCompletion {
 pub fn shell_start(invocation: &CursorShellInvocation) -> wire::AgentClientMessage {
 	exec_message(
 		invocation,
-		wire::exec_client_message::Message::ShellStream(wire::ShellStream {
-			event: Some(wire::shell_stream::Event::Start(wire::ShellStreamStart {
-				sandbox_policy: None,
-			})),
+		exec_client_message::Message::ShellStream(wire::ShellStream {
+			event: Some(shell_stream::Event::Start(wire::ShellStreamStart { sandbox_policy: None })),
 		}),
 		None,
 	)
@@ -743,8 +743,8 @@ pub fn shell_start(invocation: &CursorShellInvocation) -> wire::AgentClientMessa
 pub fn shell_stdout(invocation: &CursorShellInvocation, text: &str) -> wire::AgentClientMessage {
 	exec_message(
 		invocation,
-		wire::exec_client_message::Message::ShellStream(wire::ShellStream {
-			event: Some(wire::shell_stream::Event::Stdout(wire::ShellStreamStdout {
+		exec_client_message::Message::ShellStream(wire::ShellStream {
+			event: Some(shell_stream::Event::Stdout(wire::ShellStreamStdout {
 				data: text.to_owned(),
 			})),
 		}),
@@ -756,8 +756,8 @@ pub fn shell_stdout(invocation: &CursorShellInvocation, text: &str) -> wire::Age
 pub fn shell_stderr(invocation: &CursorShellInvocation, text: &str) -> wire::AgentClientMessage {
 	exec_message(
 		invocation,
-		wire::exec_client_message::Message::ShellStream(wire::ShellStream {
-			event: Some(wire::shell_stream::Event::Stderr(wire::ShellStreamStderr {
+		exec_client_message::Message::ShellStream(wire::ShellStream {
+			event: Some(shell_stream::Event::Stderr(wire::ShellStreamStderr {
 				data: text.to_owned(),
 			})),
 		}),
@@ -778,10 +778,8 @@ pub fn shell_completion_frames(
 	if matches!(completion, CursorShellCompletion::Rejected { .. }) {
 		frames.push(exec_message(
 			invocation,
-			wire::exec_client_message::Message::ShellStream(wire::ShellStream {
-				event: Some(wire::shell_stream::Event::Rejected(shell_rejected(
-					invocation, completion,
-				))),
+			exec_client_message::Message::ShellStream(wire::ShellStream {
+				event: Some(shell_stream::Event::Rejected(shell_rejected(invocation, completion))),
 			}),
 			None,
 		));
@@ -789,8 +787,8 @@ pub fn shell_completion_frames(
 	if matches!(completion, CursorShellCompletion::PermissionDenied { .. }) {
 		frames.push(exec_message(
 			invocation,
-			wire::exec_client_message::Message::ShellStream(wire::ShellStream {
-				event: Some(wire::shell_stream::Event::PermissionDenied(shell_denied(
+			exec_client_message::Message::ShellStream(wire::ShellStream {
+				event: Some(shell_stream::Event::PermissionDenied(shell_denied(
 					invocation, completion,
 				))),
 			}),
@@ -811,8 +809,8 @@ pub fn shell_completion_frames(
 	};
 	frames.push(exec_message(
 		invocation,
-		wire::exec_client_message::Message::ShellStream(wire::ShellStream {
-			event: Some(wire::shell_stream::Event::Exit(wire::ShellStreamExit {
+		exec_client_message::Message::ShellStream(wire::ShellStream {
+			event: Some(shell_stream::Event::Exit(wire::ShellStreamExit {
 				code,
 				cwd: invocation.working_directory.as_str().to_owned(),
 				output_location: None,
@@ -825,9 +823,9 @@ pub fn shell_completion_frames(
 	));
 	frames.push(exec_message(invocation, shell_result(invocation, completion), local_ms));
 	frames.push(wire::AgentClientMessage {
-		message: Some(wire::agent_client_message::Message::ExecClientControlMessage(
+		message: Some(agent_client_message::Message::ExecClientControlMessage(
 			wire::ExecClientControlMessage {
-				message: Some(wire::exec_client_control_message::Message::StreamClose(
+				message: Some(exec_client_control_message::Message::StreamClose(
 					wire::ExecClientStreamClose { id: invocation.id },
 				)),
 			},
@@ -838,29 +836,27 @@ pub fn shell_completion_frames(
 
 fn exec_message(
 	invocation: &CursorShellInvocation,
-	message: wire::exec_client_message::Message,
+	message: exec_client_message::Message,
 	local_execution_time_ms: Option<i32>,
 ) -> wire::AgentClientMessage {
 	wire::AgentClientMessage {
-		message: Some(wire::agent_client_message::Message::ExecClientMessage(
-			wire::ExecClientMessage {
-				id: invocation.id,
-				exec_id: invocation.exec_id.as_str().to_owned(),
-				message: Some(message),
-				local_execution_time_ms,
-				..Default::default()
-			},
-		)),
+		message: Some(agent_client_message::Message::ExecClientMessage(wire::ExecClientMessage {
+			id: invocation.id,
+			exec_id: invocation.exec_id.as_str().to_owned(),
+			message: Some(message),
+			local_execution_time_ms,
+			..Default::default()
+		})),
 	}
 }
 
 fn shell_result(
 	invocation: &CursorShellInvocation,
 	completion: &CursorShellCompletion,
-) -> wire::exec_client_message::Message {
+) -> exec_client_message::Message {
 	let result = match completion {
 		CursorShellCompletion::Exited { stdout, stderr, local_execution_time_ms } => {
-			wire::shell_result::Result::Success(wire::ShellSuccess {
+			shell_result::Result::Success(wire::ShellSuccess {
 				command: invocation.command.as_str().to_owned(),
 				working_directory: invocation.working_directory.as_str().to_owned(),
 				exit_code: 0,
@@ -872,7 +868,7 @@ fn shell_result(
 			})
 		},
 		CursorShellCompletion::Failed { code, stdout, stderr, local_execution_time_ms } => {
-			wire::shell_result::Result::Failure(wire::ShellFailure {
+			shell_result::Result::Failure(wire::ShellFailure {
 				command: invocation.command.as_str().to_owned(),
 				working_directory: invocation.working_directory.as_str().to_owned(),
 				exit_code: *code as i32,
@@ -884,20 +880,20 @@ fn shell_result(
 			})
 		},
 		CursorShellCompletion::Rejected { .. } => {
-			wire::shell_result::Result::Rejected(shell_rejected(invocation, completion))
+			shell_result::Result::Rejected(shell_rejected(invocation, completion))
 		},
 		CursorShellCompletion::PermissionDenied { .. } => {
-			wire::shell_result::Result::PermissionDenied(shell_denied(invocation, completion))
+			shell_result::Result::PermissionDenied(shell_denied(invocation, completion))
 		},
 		CursorShellCompletion::TimedOut { timeout_ms } => {
-			wire::shell_result::Result::Timeout(wire::ShellTimeout {
+			shell_result::Result::Timeout(wire::ShellTimeout {
 				command:           invocation.command.as_str().to_owned(),
 				working_directory: invocation.working_directory.as_str().to_owned(),
 				timeout_ms:        *timeout_ms as i32,
 			})
 		},
 	};
-	wire::exec_client_message::Message::ShellResult(wire::ShellResult {
+	exec_client_message::Message::ShellResult(wire::ShellResult {
 		result: Some(result),
 		..Default::default()
 	})
@@ -1141,26 +1137,23 @@ impl CursorDecoder {
 		payload: &[u8],
 	) -> Result<Vec<CursorEvent>, CursorProtocolError> {
 		match message.message {
-			Some(wire::agent_server_message::Message::InteractionUpdate(update)) => {
+			Some(agent_server_message::Message::InteractionUpdate(update)) => {
 				self.project_interaction(update)
 			},
-			Some(wire::agent_server_message::Message::ExecServerMessage(exec)) => {
-				self.project_exec(exec)
-			},
-			Some(wire::agent_server_message::Message::ExecServerControlMessage(control)) => {
-				let Some(wire::exec_server_control_message::Message::Abort(abort)) = control.message
-				else {
+			Some(agent_server_message::Message::ExecServerMessage(exec)) => self.project_exec(exec),
+			Some(agent_server_message::Message::ExecServerControlMessage(control)) => {
+				let Some(exec_server_control_message::Message::Abort(abort)) = control.message else {
 					return Ok(Vec::new());
 				};
 				Ok(vec![CursorEvent::InvokeCancel { id: abort.id }])
 			},
-			Some(wire::agent_server_message::Message::ConversationCheckpointUpdate(checkpoint)) => {
+			Some(agent_server_message::Message::ConversationCheckpointUpdate(checkpoint)) => {
 				Ok(vec![CursorEvent::Checkpoint { data: Bytes::from(checkpoint.encode_to_vec()) }])
 			},
-			Some(wire::agent_server_message::Message::InteractionQuery(query)) => {
+			Some(agent_server_message::Message::InteractionQuery(query)) => {
 				Ok(project_interaction_query(query, payload))
 			},
-			Some(wire::agent_server_message::Message::KvServerMessage(_)) | None => Ok(Vec::new()),
+			Some(agent_server_message::Message::KvServerMessage(_)) | None => Ok(Vec::new()),
 		}
 	}
 
@@ -1168,17 +1161,18 @@ impl CursorDecoder {
 		&mut self,
 		update: wire::InteractionUpdate,
 	) -> Result<Vec<CursorEvent>, CursorProtocolError> {
-		use wire::interaction_update::Message;
 		let mut events = Vec::with_capacity(3);
 		match update.message {
-			Some(Message::TextDelta(delta)) => self.push_text(OpenKind::Text, delta.text, &mut events),
-			Some(Message::ThinkingDelta(delta)) => {
+			Some(interaction_update::Message::TextDelta(delta)) => {
+				self.push_text(OpenKind::Text, delta.text, &mut events)
+			},
+			Some(interaction_update::Message::ThinkingDelta(delta)) => {
 				self.push_text(OpenKind::Thinking, delta.text, &mut events);
 			},
-			Some(Message::ToolCallStarted(started)) => {
+			Some(interaction_update::Message::ToolCallStarted(started)) => {
 				self.start_tool(started.call_id, started.tool_call.as_ref(), &mut events);
 			},
-			Some(Message::PartialToolCall(partial)) => {
+			Some(interaction_update::Message::PartialToolCall(partial)) => {
 				let id = call_id(partial.call_id, partial.tool_call.as_ref());
 				if !matches!(self.open.as_ref(), Some(open) if open.kind == OpenKind::Tool && open.tool_id == id)
 				{
@@ -1201,16 +1195,16 @@ impl CursorDecoder {
 					}
 				}
 			},
-			Some(Message::ToolCallDelta(delta)) => {
+			Some(interaction_update::Message::ToolCallDelta(delta)) => {
 				if let Some(open) = self.open.as_mut()
 					&& let Some(tool_delta) = delta.tool_call_delta.as_ref()
-					&& let Some(wire::tool_call_delta::Delta::EditToolCallDelta(edit)) =
+					&& let Some(tool_call_delta::Delta::EditToolCallDelta(edit)) =
 						tool_delta.delta.as_ref()
 				{
 					open.edit_text.push_str(&edit.stream_content_delta);
 				}
 			},
-			Some(Message::ToolCallCompleted(completed)) => {
+			Some(interaction_update::Message::ToolCallCompleted(completed)) => {
 				let id = call_id(completed.call_id, completed.tool_call.as_ref());
 				let completion_arguments = tool_arguments(completed.tool_call.as_ref());
 				if let Some(open) = self.open.take() {
@@ -1238,7 +1232,7 @@ impl CursorDecoder {
 					});
 				}
 			},
-			Some(Message::TokenDelta(delta)) => {
+			Some(interaction_update::Message::TokenDelta(delta)) => {
 				self.usage.output_tokens = self
 					.usage
 					.output_tokens
@@ -1246,7 +1240,7 @@ impl CursorDecoder {
 				self.usage.source = UsageSource::Provider;
 				self.saw_usage = true;
 			},
-			Some(Message::TurnEnded(_)) => {
+			Some(interaction_update::Message::TurnEnded(_)) => {
 				self.open = None;
 				if self.saw_usage {
 					events.push(CursorEvent::Chat(Box::new(ChatEvent::Usage(UsageUpdate {
@@ -1267,16 +1261,15 @@ impl CursorDecoder {
 				self.terminal = true;
 			},
 			Some(
-				Message::ThinkingCompleted(_)
-				| Message::UserMessageAppended(_)
-				| Message::Summary(_)
-				| Message::SummaryStarted(_)
-				| Message::SummaryCompleted(_)
-				| Message::ShellOutputDelta(_)
-				| Message::Heartbeat(_)
-				| Message::ToolCallDelta(_)
-				| Message::StepStarted(_)
-				| Message::StepCompleted(_),
+				interaction_update::Message::ThinkingCompleted(_)
+				| interaction_update::Message::UserMessageAppended(_)
+				| interaction_update::Message::Summary(_)
+				| interaction_update::Message::SummaryStarted(_)
+				| interaction_update::Message::SummaryCompleted(_)
+				| interaction_update::Message::ShellOutputDelta(_)
+				| interaction_update::Message::Heartbeat(_)
+				| interaction_update::Message::StepStarted(_)
+				| interaction_update::Message::StepCompleted(_),
 			)
 			| None => {},
 		}
@@ -1289,7 +1282,7 @@ impl CursorDecoder {
 	) -> Result<Vec<CursorEvent>, CursorProtocolError> {
 		let fallback_invocation = Str::new(exec.id.to_string());
 		match exec.message {
-			Some(wire::exec_server_message::Message::ReadArgs(args))
+			Some(exec_server_message::Message::ReadArgs(args))
 				if self.edit_owns(args.tool_call_id.as_str()) =>
 			{
 				let invocation = if args.tool_call_id.is_empty() {
@@ -1307,7 +1300,7 @@ impl CursorDecoder {
 				);
 				Ok(vec![CursorEvent::WorkflowInvoke { invocation, name: sf!("read"), arguments }])
 			},
-			Some(wire::exec_server_message::Message::WriteArgs(args))
+			Some(exec_server_message::Message::WriteArgs(args))
 				if self.edit_owns(args.tool_call_id.as_str()) =>
 			{
 				let invocation = if args.tool_call_id.is_empty() {
@@ -1426,8 +1419,8 @@ fn shell_invocation(
 	exec: wire::ExecServerMessage,
 ) -> Result<CursorShellInvocation, CursorProtocolError> {
 	let (args, streaming) = match exec.message {
-		Some(wire::exec_server_message::Message::ShellArgs(args)) => (args, false),
-		Some(wire::exec_server_message::Message::ShellStreamArgs(args)) => (args, true),
+		Some(exec_server_message::Message::ShellArgs(args)) => (args, false),
+		Some(exec_server_message::Message::ShellStreamArgs(args)) => (args, true),
 		_ => {
 			return Err(CursorProtocolError::new(
 				CursorErrorKind::Unsupported,
@@ -1468,7 +1461,7 @@ fn cursor_edit_read_path(path: &str, offset: Option<i32>, limit: Option<u32>) ->
 }
 
 fn mcp_tool_arguments(tool: Option<&wire::ToolCall>) -> Option<Bytes> {
-	use wire::tool_call::Tool;
+	use tool_call::Tool;
 	let Some(Tool::McpToolCall(call)) = tool.and_then(|tool| tool.tool.as_ref()) else {
 		return None;
 	};
@@ -1488,7 +1481,7 @@ fn tool_arguments(tool: Option<&wire::ToolCall>) -> Option<Bytes> {
 }
 
 fn edit_tool_state(tool: Option<&wire::ToolCall>) -> (Option<Str>, String) {
-	use wire::tool_call::Tool;
+	use tool_call::Tool;
 	let Some(Tool::EditToolCall(call)) = tool.and_then(|tool| tool.tool.as_ref()) else {
 		return (None, String::new());
 	};
@@ -1506,7 +1499,7 @@ fn edit_tool_state(tool: Option<&wire::ToolCall>) -> (Option<Str>, String) {
 }
 
 fn edit_tool_arguments(tool: Option<&wire::ToolCall>) -> Option<Bytes> {
-	use wire::tool_call::Tool;
+	use tool_call::Tool;
 	let Some(Tool::EditToolCall(call)) = tool.and_then(|tool| tool.tool.as_ref()) else {
 		return None;
 	};
@@ -1584,7 +1577,7 @@ fn call_id(call_id: String, tool: Option<&wire::ToolCall>) -> ToolCallId {
 }
 
 fn tool_name(tool: Option<&wire::ToolCall>) -> Str {
-	use wire::tool_call::Tool;
+	use tool_call::Tool;
 	let Some(tool) = tool.and_then(|tool| tool.tool.as_ref()) else {
 		return Str::default();
 	};
@@ -1657,7 +1650,7 @@ fn project_interaction_query(query: wire::InteractionQuery, payload: &[u8]) -> V
 	if let Some(named) = query.query {
 		let reply = interaction_query_response(id, &named).map(|response| {
 			connect_message(&wire::AgentClientMessage {
-				message: Some(wire::agent_client_message::Message::InteractionResponse(response)),
+				message: Some(agent_client_message::Message::InteractionResponse(response)),
 			})
 		});
 		vec![CursorEvent::InteractionQuery { id, query: Some(named), reply }]
@@ -1691,28 +1684,28 @@ pub fn interaction_query_response(
 	let result = match query {
 		Query::WebSearchRequestQuery(_) => {
 			Reply::WebSearchRequestResponse(wire::WebSearchRequestResponse {
-				result: Some(wire::web_search_request_response::Result::Approved(
+				result: Some(web_search_request_response::Result::Approved(
 					wire::WebSearchRequestResponseApproved {},
 				)),
 			})
 		},
 		Query::ExaSearchRequestQuery(_) => {
 			Reply::ExaSearchRequestResponse(wire::ExaSearchRequestResponse {
-				result: Some(wire::exa_search_request_response::Result::Approved(
+				result: Some(exa_search_request_response::Result::Approved(
 					wire::ExaSearchRequestResponseApproved {},
 				)),
 			})
 		},
 		Query::ExaFetchRequestQuery(_) => {
 			Reply::ExaFetchRequestResponse(wire::ExaFetchRequestResponse {
-				result: Some(wire::exa_fetch_request_response::Result::Approved(
+				result: Some(exa_fetch_request_response::Result::Approved(
 					wire::ExaFetchRequestResponseApproved {},
 				)),
 			})
 		},
 		Query::WebFetchRequestQuery(_) => {
 			Reply::WebFetchRequestResponse(wire::WebFetchRequestResponse {
-				result: Some(wire::web_fetch_request_response::Result::Approved(
+				result: Some(web_fetch_request_response::Result::Approved(
 					wire::WebFetchRequestResponseApproved {},
 				)),
 			})
@@ -1720,17 +1713,15 @@ pub fn interaction_query_response(
 		Query::AskQuestionInteractionQuery(_) => {
 			Reply::AskQuestionInteractionResponse(wire::AskQuestionInteractionResponse {
 				result: Some(wire::AskQuestionResult {
-					result: Some(wire::ask_question_result::Result::Rejected(
-						wire::AskQuestionRejected {
-							reason: format!("Interactive questions are {NOT_IMPLEMENTED_SUFFIX}"),
-						},
-					)),
+					result: Some(ask_question_result::Result::Rejected(wire::AskQuestionRejected {
+						reason: format!("Interactive questions are {NOT_IMPLEMENTED_SUFFIX}"),
+					})),
 				}),
 			})
 		},
 		Query::SwitchModeRequestQuery(_) => {
 			Reply::SwitchModeRequestResponse(wire::SwitchModeRequestResponse {
-				result: Some(wire::switch_mode_request_response::Result::Rejected(
+				result: Some(switch_mode_request_response::Result::Rejected(
 					wire::SwitchModeRequestResponseRejected {
 						reason: format!("Mode switches are {NOT_IMPLEMENTED_SUFFIX}"),
 					},
@@ -1741,7 +1732,7 @@ pub fn interaction_query_response(
 			Reply::CreatePlanRequestResponse(wire::CreatePlanRequestResponse {
 				result: Some(wire::CreatePlanResult {
 					plan_uri: String::new(),
-					result:   Some(wire::create_plan_result::Result::Error(wire::CreatePlanError {
+					result:   Some(create_plan_result::Result::Error(wire::CreatePlanError {
 						error: format!("Plan files are {NOT_IMPLEMENTED_SUFFIX}"),
 					})),
 				}),
@@ -2334,16 +2325,25 @@ fn encoding_error(reason: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use std::{fs, sync::Arc};
+
+	use omp_catalog::ThinkingEffort;
+	use omp_core::encoding::hex;
 
 	use super::*;
-	use crate::transport::ConnectDecoder as ConnectFramer;
+	use crate::{
+		call::{
+			Message as CallMessage, ReasoningRequest as CallReasoningRequest,
+			ReasoningVisibility as CallReasoningVisibility,
+		},
+		transport::{ConnectDecoder as ConnectFramer, ConnectEnvelope as TransportConnectEnvelope},
+	};
 
 	const FIXTURES: &str =
 		concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/llm-oracle/agent-protocols/cursor/");
 
 	fn fixture(name: &str) -> Vec<u8> {
-		std::fs::read(format!("{FIXTURES}{name}")).expect("Cursor oracle fixture")
+		fs::read(format!("{FIXTURES}{name}")).expect("Cursor oracle fixture")
 	}
 
 	fn empty_chat_request() -> ChatRequest {
@@ -2381,7 +2381,7 @@ mod tests {
 		.expect("encoded Cursor request");
 		let message =
 			wire::AgentClientMessage::decode(encoded.slice(5..)).expect("framed Cursor request");
-		let Some(wire::agent_client_message::Message::RunRequest(run)) = message.message else {
+		let Some(agent_client_message::Message::RunRequest(run)) = message.message else {
 			panic!("run request")
 		};
 		run
@@ -2436,8 +2436,8 @@ mod tests {
 		let mut policy = omp_catalog::WirePolicy::baseline();
 		policy.context.extended_mode = Some(ExtendedContextMode::Standard);
 		let selection = omp_catalog::ThinkingSelection {
-			effort:            omp_catalog::ThinkingEffort::Medium,
-			wire_effort:       omp_catalog::ThinkingEffort::Medium,
+			effort:            ThinkingEffort::Medium,
+			wire_effort:       ThinkingEffort::Medium,
 			native_effort:     None,
 			budget:            None,
 			wire_model:        target.wire_model.clone(),
@@ -2445,13 +2445,13 @@ mod tests {
 			suppress_when_off: false,
 		};
 		let mut request = empty_chat_request();
-		request.messages = Arc::from([crate::call::Message {
+		request.messages = Arc::from([CallMessage {
 			role:    Role::User,
 			content: Arc::from([ContentPart::Text { text: sf!("hello"), proof: None }]),
 			name:    None,
 		}]);
-		request.reasoning = Setting::Require(crate::call::ReasoningRequest {
-			visibility:          crate::call::ReasoningVisibility::Visible,
+		request.reasoning = Setting::Require(CallReasoningRequest {
+			visibility:          CallReasoningVisibility::Visible,
 			effort:              Some(omp_catalog::ReasoningEffort::Medium),
 			max_tokens:          None,
 			preserve_signatures: false,
@@ -2473,7 +2473,7 @@ mod tests {
 		};
 		let message =
 			wire::AgentClientMessage::decode(body.slice(5..)).expect("framed Cursor request");
-		let Some(wire::agent_client_message::Message::RunRequest(run)) = message.message else {
+		let Some(agent_client_message::Message::RunRequest(run)) = message.message else {
 			panic!("run request")
 		};
 		let requested = run.requested_model.expect("requested model");
@@ -2495,7 +2495,7 @@ mod tests {
 			]
 			.into_boxed_slice(),
 		);
-		let Some(wire::conversation_action::Action::UserMessageAction(action)) =
+		let Some(conversation_action::Action::UserMessageAction(action)) =
 			run.action.and_then(|action| action.action)
 		else {
 			panic!("user action")
@@ -2510,7 +2510,7 @@ mod tests {
 				.r#type
 				.as_ref()
 				.and_then(|kind| kind.r#type.as_ref()),
-			Some(wire::cursor_rule_type::Type::Global(_))
+			Some(cursor_rule_type::Type::Global(_))
 		));
 		assert_eq!(rules[1].full_path, "/omp/system-prompt/1.mdc");
 		assert_eq!(rules[1].content, "second");
@@ -2519,8 +2519,8 @@ mod tests {
 	#[test]
 	fn model_routed_reasoning_is_not_rejected_as_unprojected() {
 		let mut request = empty_chat_request();
-		request.reasoning = Setting::Require(crate::call::ReasoningRequest {
-			visibility:          crate::call::ReasoningVisibility::Visible,
+		request.reasoning = Setting::Require(CallReasoningRequest {
+			visibility:          CallReasoningVisibility::Visible,
 			effort:              Some(omp_catalog::ReasoningEffort::High),
 			max_tokens:          None,
 			preserve_signatures: false,
@@ -2551,7 +2551,7 @@ mod tests {
 				.expect("encoded protobuf JSON string"),
 		);
 		let tool = wire::ToolCall {
-			tool: Some(wire::tool_call::Tool::McpToolCall(wire::McpToolCall {
+			tool: Some(tool_call::Tool::McpToolCall(wire::McpToolCall {
 				args: Some(wire::McpArgs { args, ..wire::McpArgs::default() }),
 				..wire::McpToolCall::default()
 			})),
@@ -2584,7 +2584,7 @@ mod tests {
 	fn native_edit_tool_call_opens_edit_and_collects_stream_content() {
 		let tool = wire::ToolCall {
 			tool_call_id: Some("edit-1".to_owned()),
-			tool:         Some(wire::tool_call::Tool::EditToolCall(wire::EditToolCall {
+			tool:         Some(tool_call::Tool::EditToolCall(wire::EditToolCall {
 				args: Some(wire::EditArgs {
 					path:           "/tmp/note.txt".to_owned(),
 					stream_content: Some("orange".to_owned()),
@@ -2594,7 +2594,7 @@ mod tests {
 		};
 		let mut decoder = CursorDecoder::default();
 		let started = decoder
-			.push_payload(update(wire::interaction_update::Message::ToolCallStarted(
+			.push_payload(update(interaction_update::Message::ToolCallStarted(
 				wire::ToolCallStartedUpdate {
 					call_id: "call-edit".to_owned(),
 					tool_call: Some(tool.clone()),
@@ -2612,25 +2612,25 @@ mod tests {
 				)
 		)));
 		decoder
-			.push_payload(update(wire::interaction_update::Message::ToolCallDelta(Box::new(
+			.push_payload(update(interaction_update::Message::ToolCallDelta(Box::new(
 				wire::ToolCallDeltaUpdate {
 					call_id: "call-edit".to_owned(),
 					tool_call_delta: Some(Box::new(wire::ToolCallDelta {
-						delta: Some(wire::tool_call_delta::Delta::EditToolCallDelta(
-							wire::EditToolCallDelta { stream_content_delta: " peel".to_owned() },
-						)),
+						delta: Some(tool_call_delta::Delta::EditToolCallDelta(wire::EditToolCallDelta {
+							stream_content_delta: " peel".to_owned(),
+						})),
 					})),
 					..Default::default()
 				},
 			))))
 			.expect("edit delta");
 		let completed = decoder
-			.push_payload(update(wire::interaction_update::Message::ToolCallCompleted(
+			.push_payload(update(interaction_update::Message::ToolCallCompleted(
 				wire::ToolCallCompletedUpdate {
 					call_id: "call-edit".to_owned(),
 					tool_call: Some(wire::ToolCall {
 						tool_call_id: Some("edit-1".to_owned()),
-						tool:         Some(wire::tool_call::Tool::EditToolCall(wire::EditToolCall {
+						tool:         Some(tool_call::Tool::EditToolCall(wire::EditToolCall {
 							args: None,
 							..Default::default()
 						})),
@@ -2658,7 +2658,7 @@ mod tests {
 	fn native_edit_materialization_read_is_raw_and_write_reuses_active_call() {
 		let tool = wire::ToolCall {
 			tool_call_id: Some("edit-inner".to_owned()),
-			tool:         Some(wire::tool_call::Tool::EditToolCall(wire::EditToolCall {
+			tool:         Some(tool_call::Tool::EditToolCall(wire::EditToolCall {
 				args: Some(wire::EditArgs {
 					path:           "/tmp/note.txt".to_owned(),
 					stream_content: None,
@@ -2668,7 +2668,7 @@ mod tests {
 		};
 		let mut decoder = CursorDecoder::default();
 		decoder
-			.push_payload(update(wire::interaction_update::Message::ToolCallStarted(
+			.push_payload(update(interaction_update::Message::ToolCallStarted(
 				wire::ToolCallStartedUpdate {
 					call_id: "edit-envelope".to_owned(),
 					tool_call: Some(tool),
@@ -2677,19 +2677,17 @@ mod tests {
 			)))
 			.expect("edit started");
 		let read = wire::AgentServerMessage {
-			message: Some(wire::agent_server_message::Message::ExecServerMessage(
-				wire::ExecServerMessage {
-					id: 7,
-					message: Some(wire::exec_server_message::Message::ReadArgs(wire::ReadArgs {
-						path: "/tmp/note.txt".to_owned(),
-						tool_call_id: "edit-inner".to_owned(),
-						offset: Some(2),
-						limit: Some(1),
-						..Default::default()
-					})),
+			message: Some(agent_server_message::Message::ExecServerMessage(wire::ExecServerMessage {
+				id: 7,
+				message: Some(exec_server_message::Message::ReadArgs(wire::ReadArgs {
+					path: "/tmp/note.txt".to_owned(),
+					tool_call_id: "edit-inner".to_owned(),
+					offset: Some(2),
+					limit: Some(1),
 					..Default::default()
-				},
-			)),
+				})),
+				..Default::default()
+			})),
 		};
 		let events = decoder
 			.push_payload(Bytes::from(read.encode_to_vec()))
@@ -2704,18 +2702,16 @@ mod tests {
 		);
 
 		let write = wire::AgentServerMessage {
-			message: Some(wire::agent_server_message::Message::ExecServerMessage(
-				wire::ExecServerMessage {
-					id: 8,
-					message: Some(wire::exec_server_message::Message::WriteArgs(wire::WriteArgs {
-						path: "/tmp/note.txt".to_owned(),
-						file_text: "after".to_owned(),
-						tool_call_id: "edit-inner".to_owned(),
-						..Default::default()
-					})),
+			message: Some(agent_server_message::Message::ExecServerMessage(wire::ExecServerMessage {
+				id: 8,
+				message: Some(exec_server_message::Message::WriteArgs(wire::WriteArgs {
+					path: "/tmp/note.txt".to_owned(),
+					file_text: "after".to_owned(),
+					tool_call_id: "edit-inner".to_owned(),
 					..Default::default()
-				},
-			)),
+				})),
+				..Default::default()
+			})),
 		};
 		let events = decoder
 			.push_payload(Bytes::from(write.encode_to_vec()))
@@ -2729,10 +2725,10 @@ mod tests {
 		assert_eq!(arguments["content"], "after");
 	}
 
-	fn update(message: wire::interaction_update::Message) -> Bytes {
+	fn update(message: interaction_update::Message) -> Bytes {
 		Bytes::from(
 			wire::AgentServerMessage {
-				message: Some(wire::agent_server_message::Message::InteractionUpdate(
+				message: Some(agent_server_message::Message::InteractionUpdate(
 					wire::InteractionUpdate { message: Some(message) },
 				)),
 			}
@@ -2827,7 +2823,7 @@ mod tests {
 		fn server_query(id: u32, query: Option<Query>) -> Bytes {
 			Bytes::from(
 				wire::AgentServerMessage {
-					message: Some(wire::agent_server_message::Message::InteractionQuery(
+					message: Some(agent_server_message::Message::InteractionQuery(
 						wire::InteractionQuery { id, query },
 					)),
 				}
@@ -2873,7 +2869,7 @@ mod tests {
 		}
 
 		fn reply_response(reply: &Bytes) -> wire::InteractionResponse {
-			let Some(wire::agent_client_message::Message::InteractionResponse(response)) =
+			let Some(agent_client_message::Message::InteractionResponse(response)) =
 				decode_reply(reply).message
 			else {
 				panic!("reply is an interaction_response client message")
@@ -2918,16 +2914,16 @@ mod tests {
 					assert_eq!(response.id, case.id);
 					match response.result.expect("approval result") {
 						Reply::WebSearchRequestResponse(wire::WebSearchRequestResponse {
-							result: Some(wire::web_search_request_response::Result::Approved(_)),
+							result: Some(web_search_request_response::Result::Approved(_)),
 						})
 						| Reply::ExaSearchRequestResponse(wire::ExaSearchRequestResponse {
-							result: Some(wire::exa_search_request_response::Result::Approved(_)),
+							result: Some(exa_search_request_response::Result::Approved(_)),
 						})
 						| Reply::ExaFetchRequestResponse(wire::ExaFetchRequestResponse {
-							result: Some(wire::exa_fetch_request_response::Result::Approved(_)),
+							result: Some(exa_fetch_request_response::Result::Approved(_)),
 						})
 						| Reply::WebFetchRequestResponse(wire::WebFetchRequestResponse {
-							result: Some(wire::web_fetch_request_response::Result::Approved(_)),
+							result: Some(web_fetch_request_response::Result::Approved(_)),
 						}) => {},
 						other => panic!("{} must be approved, got {other:?}", case.query),
 					}
@@ -2936,7 +2932,7 @@ mod tests {
 					let response = reply_response(reply.as_ref().expect("rejection reply"));
 					let reason = match response.result.expect("rejection result") {
 						Reply::AskQuestionInteractionResponse(response) => {
-							let Some(wire::ask_question_result::Result::Rejected(rejected)) =
+							let Some(ask_question_result::Result::Rejected(rejected)) =
 								response.result.and_then(|result| result.result)
 							else {
 								panic!("ask-question reply must be rejected")
@@ -2944,7 +2940,7 @@ mod tests {
 							rejected.reason
 						},
 						Reply::SwitchModeRequestResponse(response) => {
-							let Some(wire::switch_mode_request_response::Result::Rejected(rejected)) =
+							let Some(switch_mode_request_response::Result::Rejected(rejected)) =
 								response.result
 							else {
 								panic!("switch-mode reply must be rejected")
@@ -2963,7 +2959,7 @@ mod tests {
 					else {
 						panic!("create-plan reply carries a result")
 					};
-					let Some(wire::create_plan_result::Result::Error(error)) = result.result else {
+					let Some(create_plan_result::Result::Error(error)) = result.result else {
 						panic!("create-plan reply must be an error")
 					};
 					assert_eq!(Some(error.error.as_str()), case.reason.as_deref());
@@ -2999,7 +2995,7 @@ mod tests {
 			matches!(
 				response.result,
 				Some(Reply::WebFetchRequestResponse(wire::WebFetchRequestResponse {
-					result: Some(wire::web_fetch_request_response::Result::Approved(_)),
+					result: Some(web_fetch_request_response::Result::Approved(_)),
 				}))
 			),
 			"field-9 raw approval decodes as the named WebFetch approval"
@@ -3031,7 +3027,7 @@ mod tests {
 		}
 
 		fn end_stream(payload: &[u8]) -> Frame {
-			Frame::Connect(crate::transport::ConnectEnvelope {
+			Frame::Connect(TransportConnectEnvelope {
 				flags:   CONNECT_END_STREAM,
 				kind:    ConnectEnvelopeKind::EndStream,
 				payload: Bytes::copy_from_slice(payload),
@@ -3039,7 +3035,7 @@ mod tests {
 		}
 
 		fn message(payload: Bytes) -> Frame {
-			Frame::Connect(crate::transport::ConnectEnvelope {
+			Frame::Connect(TransportConnectEnvelope {
 				flags: 0,
 				kind: ConnectEnvelopeKind::Message,
 				payload,
@@ -3079,9 +3075,9 @@ mod tests {
 		let (mut decoder, _) = wire_decoder(&conversations, "request-3", &billed);
 		decoder
 			.push(
-				message(update(wire::interaction_update::Message::TokenDelta(
-					wire::TokenDeltaUpdate { tokens: 3 },
-				))),
+				message(update(interaction_update::Message::TokenDelta(wire::TokenDeltaUpdate {
+					tokens: 3,
+				}))),
 				&mut sink,
 			)
 			.expect("token delta projects");
@@ -3131,39 +3127,38 @@ mod tests {
 	fn recorded_tool_stream_projects_incrementally_and_authorizes_nothing() {
 		let tool = wire::ToolCall {
 			tool_call_id: Some("call-read".to_owned()),
-			tool:         Some(wire::tool_call::Tool::ReadToolCall(wire::ReadToolCall::default())),
+			tool:         Some(tool_call::Tool::ReadToolCall(wire::ReadToolCall::default())),
 		};
 		let payloads = [
-			update(wire::interaction_update::Message::ThinkingDelta(wire::ThinkingDeltaUpdate {
+			update(interaction_update::Message::ThinkingDelta(wire::ThinkingDeltaUpdate {
 				text: "Inspect first.".to_owned(),
 			})),
-			update(wire::interaction_update::Message::ToolCallStarted(wire::ToolCallStartedUpdate {
+			update(interaction_update::Message::ToolCallStarted(wire::ToolCallStartedUpdate {
 				call_id: "call-read".to_owned(),
 				tool_call: Some(tool.clone()),
 				..Default::default()
 			})),
-			update(wire::interaction_update::Message::PartialToolCall(wire::PartialToolCallUpdate {
+			update(interaction_update::Message::PartialToolCall(wire::PartialToolCallUpdate {
 				call_id: "call-read".to_owned(),
 				tool_call: Some(tool.clone()),
 				args_text_delta: "{\"pa".to_owned(),
 				..Default::default()
 			})),
-			update(wire::interaction_update::Message::PartialToolCall(wire::PartialToolCallUpdate {
+			update(interaction_update::Message::PartialToolCall(wire::PartialToolCallUpdate {
 				call_id: "call-read".to_owned(),
 				tool_call: Some(tool),
 				args_text_delta: r#"{"path":"package.json"}"#.to_owned(),
 				..Default::default()
 			})),
-			update(wire::interaction_update::Message::ToolCallCompleted(
-				wire::ToolCallCompletedUpdate { call_id: "call-read".to_owned(), ..Default::default() },
-			)),
-			update(wire::interaction_update::Message::TextDelta(wire::TextDeltaUpdate {
+			update(interaction_update::Message::ToolCallCompleted(wire::ToolCallCompletedUpdate {
+				call_id: "call-read".to_owned(),
+				..Default::default()
+			})),
+			update(interaction_update::Message::TextDelta(wire::TextDeltaUpdate {
 				text: "Done.".to_owned(),
 			})),
-			update(wire::interaction_update::Message::TokenDelta(wire::TokenDeltaUpdate {
-				tokens: 8,
-			})),
-			update(wire::interaction_update::Message::TurnEnded(wire::TurnEndedUpdate {})),
+			update(interaction_update::Message::TokenDelta(wire::TokenDeltaUpdate { tokens: 8 })),
+			update(interaction_update::Message::TurnEnded(wire::TurnEndedUpdate {})),
 		];
 		let mut decoder = CursorDecoder::default();
 		let events: Vec<_> = payloads
@@ -3403,15 +3398,11 @@ mod tests {
 
 		let mut terminal = CursorDecoder::default();
 		terminal
-			.push_payload(update(wire::interaction_update::Message::TurnEnded(
-				wire::TurnEndedUpdate {},
-			)))
+			.push_payload(update(interaction_update::Message::TurnEnded(wire::TurnEndedUpdate {})))
 			.expect("turn end");
 		assert_eq!(
 			terminal
-				.push_payload(update(wire::interaction_update::Message::Heartbeat(
-					wire::HeartbeatUpdate {},
-				)))
+				.push_payload(update(interaction_update::Message::Heartbeat(wire::HeartbeatUpdate {},)))
 				.expect_err("late frame")
 				.kind,
 			CursorErrorKind::AfterTerminal
@@ -3426,7 +3417,7 @@ mod tests {
 			..Default::default()
 		};
 		let server = wire::AgentServerMessage {
-			message: Some(wire::agent_server_message::Message::ConversationCheckpointUpdate(
+			message: Some(agent_server_message::Message::ConversationCheckpointUpdate(
 				checkpoint.clone(),
 			)),
 		};
@@ -3451,11 +3442,11 @@ mod tests {
 		);
 
 		let abort = wire::AgentServerMessage {
-			message: Some(wire::agent_server_message::Message::ExecServerControlMessage(
+			message: Some(agent_server_message::Message::ExecServerControlMessage(
 				wire::ExecServerControlMessage {
-					message: Some(wire::exec_server_control_message::Message::Abort(
-						wire::ExecServerAbort { id: 17 },
-					)),
+					message: Some(exec_server_control_message::Message::Abort(wire::ExecServerAbort {
+						id: 17,
+					})),
 				},
 			)),
 		};
@@ -3492,9 +3483,7 @@ mod tests {
 		cancelled.cancel();
 		assert_eq!(
 			cancelled
-				.push_payload(update(wire::interaction_update::Message::Heartbeat(
-					wire::HeartbeatUpdate {},
-				)))
+				.push_payload(update(interaction_update::Message::Heartbeat(wire::HeartbeatUpdate {},)))
 				.expect_err("cancel suppresses late frames")
 				.kind,
 			CursorErrorKind::Cancelled
@@ -3512,9 +3501,9 @@ mod tests {
 		};
 		assert!(matches!(
 			shell_start(&invocation).message,
-			Some(wire::agent_client_message::Message::ExecClientMessage(wire::ExecClientMessage {
-				message: Some(wire::exec_client_message::Message::ShellStream(wire::ShellStream {
-					event: Some(wire::shell_stream::Event::Start(_)),
+			Some(agent_client_message::Message::ExecClientMessage(wire::ExecClientMessage {
+				message: Some(exec_client_message::Message::ShellStream(wire::ShellStream {
+					event: Some(shell_stream::Event::Start(_)),
 				})),
 				..
 			}))
@@ -3527,16 +3516,15 @@ mod tests {
 				("stdout", "\u{1b}[31mred\u{1b}[0m\n"),
 			),
 		] {
-			let Some(wire::agent_client_message::Message::ExecClientMessage(exec)) = frame.message
-			else {
+			let Some(agent_client_message::Message::ExecClientMessage(exec)) = frame.message else {
 				panic!("shell output exec frame")
 			};
-			let Some(wire::exec_client_message::Message::ShellStream(stream)) = exec.message else {
+			let Some(exec_client_message::Message::ShellStream(stream)) = exec.message else {
 				panic!("shell stream frame")
 			};
 			let (channel, data) = match stream.event.expect("shell event") {
-				wire::shell_stream::Event::Stdout(stdout) => ("stdout", stdout.data),
-				wire::shell_stream::Event::Stderr(stderr) => ("stderr", stderr.data),
+				shell_stream::Event::Stdout(stdout) => ("stdout", stdout.data),
+				shell_stream::Event::Stderr(stderr) => ("stderr", stderr.data),
 				_ => panic!("unexpected shell output event"),
 			};
 			assert_eq!((channel, data.as_str()), expected);
@@ -3563,9 +3551,9 @@ mod tests {
 			let frames = shell_completion_frames(&invocation, &completion);
 			assert!(matches!(
 				frames.last().and_then(|frame| frame.message.as_ref()),
-				Some(wire::agent_client_message::Message::ExecClientControlMessage(
+				Some(agent_client_message::Message::ExecClientControlMessage(
 					wire::ExecClientControlMessage {
-						message: Some(wire::exec_client_control_message::Message::StreamClose(
+						message: Some(exec_client_control_message::Message::StreamClose(
 							wire::ExecClientStreamClose { id: 17 }
 						)),
 					}
@@ -3703,7 +3691,7 @@ mod tests {
 		})
 		.expect("typed run request");
 		let run = wire::AgentClientMessage::decode(encoded.slice(5..)).expect("framed run request");
-		let Some(wire::agent_client_message::Message::RunRequest(run)) = run.message else {
+		let Some(agent_client_message::Message::RunRequest(run)) = run.message else {
 			panic!("run request")
 		};
 		assert_eq!(run.model_details.as_ref().expect("model").model_id, "cursor-composer-2.5");
@@ -3851,8 +3839,6 @@ mod tests {
 	}
 
 	fn decode_hex(input: &str) -> Vec<u8> {
-		omp_core::encoding::hex::decode(input)
-			.into_vec()
-			.expect("hex oracle fixture")
+		hex::decode(input).into_vec().expect("hex oracle fixture")
 	}
 }

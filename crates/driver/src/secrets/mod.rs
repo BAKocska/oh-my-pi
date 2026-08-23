@@ -3,22 +3,28 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use omp_core::Str;
+use omp_envd::worker::ExtHostSpec;
 use omp_inference::auth::AuthControlHandle;
 use omp_secrets::SecretMaskingAuthority;
+
+use crate::auth_backend::{CredentialControlGrant, CredentialSecretControlFactory};
 
 /// Global/project rule loading.
 pub mod config;
 /// Credential-shaped environment collection.
 pub mod env;
+/// Persistent placeholder-key resolution with a process-stable ephemeral
+/// fallback.
 pub mod key;
 /// Immutable per-session snapshot composition.
 pub mod session;
+use session::SecretSessionSnapshot;
 
 /// Lowers deployment-admitted credential scopes into the exact Core-side
 /// grants consumed by the credential CONTROL factory.
 pub fn credential_control_grants(
-	extensions: &[omp_envd::worker::ExtHostSpec],
-) -> BTreeMap<Str, crate::auth_backend::CredentialControlGrant> {
+	extensions: &[ExtHostSpec],
+) -> BTreeMap<Str, CredentialControlGrant> {
 	use omp_inference::auth::{CredentialGrants, CredentialScope};
 
 	fn scope(value: Option<&serde_json::Value>) -> Arc<[Str]> {
@@ -47,7 +53,7 @@ pub fn credential_control_grants(
 				.cloned()
 				.collect::<Vec<_>>()
 				.into();
-			(extension.key.extension().clone(), crate::auth_backend::CredentialControlGrant {
+			(extension.key.extension().clone(), CredentialControlGrant {
 				grants: CredentialGrants {
 					allow:  CredentialScope::new(allow),
 					import: CredentialScope::new(import),
@@ -61,7 +67,7 @@ pub fn credential_control_grants(
 
 /// Builds one Core-owned masking authority over the immutable session rules.
 pub fn core_secret_masking_authority(
-	snapshot: &session::SecretSessionSnapshot,
+	snapshot: &SecretSessionSnapshot,
 	extension: impl Into<Str>,
 	host_generation: u64,
 ) -> Result<Arc<SecretMaskingAuthority>, omp_secrets::SecretMaskingError> {
@@ -78,10 +84,10 @@ pub fn core_secret_masking_authority(
 /// domain factory consumed by Environment authority wiring.
 pub fn credential_secret_control_factory(
 	control: AuthControlHandle,
-	grants: BTreeMap<Str, crate::auth_backend::CredentialControlGrant>,
-	snapshot: &session::SecretSessionSnapshot,
-) -> crate::auth_backend::CredentialSecretControlFactory {
-	crate::auth_backend::CredentialSecretControlFactory::new(
+	grants: BTreeMap<Str, CredentialControlGrant>,
+	snapshot: &SecretSessionSnapshot,
+) -> CredentialSecretControlFactory {
+	CredentialSecretControlFactory::new(
 		control,
 		grants,
 		Arc::from(snapshot.rules().to_vec()),

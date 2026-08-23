@@ -16,6 +16,8 @@
 pub mod child;
 pub mod frames;
 
+use std::{iter, ptr};
+
 use objc2::{
 	AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
 	rc::Retained,
@@ -161,7 +163,7 @@ pub fn configure_page(
 	// SAFETY: reading the fresh config's controller on the main thread.
 	let manager = unsafe { config.userContentController() };
 	let ipc = IpcHandler::new(&manager, events, mtm);
-	for script in std::iter::once(IPC_SHIM).chain(page.init_scripts.iter().map(Str::as_str)) {
+	for script in iter::once(IPC_SHIM).chain(page.init_scripts.iter().map(Str::as_str)) {
 		add_user_script(&manager, script, mtm);
 	}
 
@@ -494,7 +496,7 @@ impl TitleObserver {
 				&this,
 				ns_string!("title"),
 				NSKeyValueObservingOptions::New,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		this

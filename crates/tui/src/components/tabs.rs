@@ -3,6 +3,7 @@ use smallvec::SmallVec;
 
 use super::Col;
 use crate::{
+	Frame,
 	component::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoChildren, PaintCtx, Slot, next_slot,
 	},
@@ -292,7 +293,7 @@ impl Component for Tabs {
 }
 
 fn pill(
-	frame: &mut crate::Frame,
+	frame: &mut Frame,
 	x: u16,
 	y: u16,
 	label: &str,

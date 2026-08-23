@@ -1,7 +1,13 @@
-use std::{fmt, io, path::PathBuf, str::Utf8Error};
+use std::{
+	fmt::{self, Display},
+	io,
+	path::PathBuf,
+	result,
+	str::Utf8Error,
+};
 
 use omp_core::Str;
-use thiserror::Error as ThisError;
+use tokio::task::JoinError;
 
 use crate::{DocumentId, LeaseId, Revision, TransactionId};
 
@@ -14,7 +20,7 @@ pub enum RangeKind {
 	Line,
 }
 
-impl fmt::Display for RangeKind {
+impl Display for RangeKind {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(match self {
 			Self::Byte => "byte",
@@ -24,7 +30,7 @@ impl fmt::Display for RangeKind {
 }
 
 /// A failure produced while resolving or operating on documents.
-#[derive(Debug, ThisError)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
 	/// A path, URI, identifier, or other operation target is not valid.
 	#[error("invalid target {target}: {reason}")]
@@ -173,7 +179,7 @@ pub enum Error {
 	Worker {
 		/// The worker task failure.
 		#[source]
-		source: tokio::task::JoinError,
+		source: JoinError,
 	},
 
 	/// Retaining a hashline read snapshot failed.
@@ -271,4 +277,4 @@ pub enum Error {
 }
 
 /// A document-server result.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = result::Result<T, Error>;

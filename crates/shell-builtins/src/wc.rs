@@ -27,7 +27,7 @@ mod count_fast {
 	use libc::S_IFIFO;
 
 	#[cfg(any(target_os = "linux", target_os = "android"))]
-	use crate::support::sys::pipes::{MAX_ROOTLESS_PIPE_SIZE, pipe, splice, splice_exact};
+	use crate::support::sys::pipes::{MAX_ROOTLESS_PIPE_SIZE, dev_null, pipe, splice, splice_exact};
 
 	const BUF_SIZE: usize = 256 * 1024;
 
@@ -39,7 +39,7 @@ mod count_fast {
 	#[inline]
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn count_bytes_using_splice(fd: &impl AsFd) -> Result<usize, usize> {
-		let null_file = crate::support::sys::pipes::dev_null().ok_or(0_usize)?;
+		let null_file = dev_null().ok_or(0_usize)?;
 		// todo: avoid generating broker if input is pipe (fcntl_setpipe_size succeed)
 		// and directly splice() to /dev/null to save RAM usage
 		let (pipe_rd, pipe_wr) = pipe().map_err(|_| 0_usize)?;
@@ -538,10 +538,12 @@ use std::{
 	borrow::Cow,
 	cmp::max,
 	ffi::{OsStr, OsString},
+	fmt::Display,
 	fs::{self, File},
 	io::{self, Write},
 	iter,
 	path::{Path, PathBuf},
+	slice,
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
@@ -671,8 +673,8 @@ enum Inputs {
 
 #[derive(Clone)]
 enum InputsIter<'a> {
-	Stdin(std::iter::Once<Result<Input, &'a WcError>>),
-	Paths(std::slice::Iter<'a, InputIterItem>),
+	Stdin(iter::Once<Result<Input, &'a WcError>>),
+	Paths(slice::Iter<'a, InputIterItem>),
 }
 
 impl<'a> Iterator for InputsIter<'a> {
@@ -703,7 +705,7 @@ impl DoubleEndedIterator for InputsIter<'_> {
 }
 
 impl ExactSizeIterator for InputsIter<'_> {}
-impl std::iter::FusedIterator for InputsIter<'_> {}
+impl iter::FusedIterator for InputsIter<'_> {}
 
 impl Inputs {
 	fn new(matches: &ArgMatches, host: &mut Host) -> Result<Self, WcError> {
@@ -745,7 +747,7 @@ impl Inputs {
 	+ Clone
 	+ DoubleEndedIterator
 	+ ExactSizeIterator
-	+ std::iter::FusedIterator {
+	+ iter::FusedIterator {
 		match self {
 			Self::Stdin => InputsIter::Stdin(iter::once(Ok(Input::Stdin(StdinKind::Implicit)))),
 			Self::Paths(inputs) | Self::Files0From(inputs) => InputsIter::Paths(inputs.iter()),
@@ -1315,7 +1317,7 @@ type InputIterItem = Result<Input, WcError>;
 /// Reads NUL-delimited names from standard input.
 fn files0_iter_stdin(
 	host: &mut Host,
-) -> impl Iterator<Item = InputIterItem> + std::iter::FusedIterator + '_ {
+) -> impl Iterator<Item = InputIterItem> + iter::FusedIterator + '_ {
 	files0_iter(&mut host.stdin, STDIN_REPR.into()).map(|item| match item {
 		Ok(Input::Stdin(_)) => Err(WcError::StdinReprNotAllowed),
 		_ => item,
@@ -1325,7 +1327,7 @@ fn files0_iter_stdin(
 fn files0_iter_file(
 	path: &Path,
 	host: &Host,
-) -> Result<impl Iterator<Item = InputIterItem> + std::iter::FusedIterator, WcError> {
+) -> Result<impl Iterator<Item = InputIterItem> + iter::FusedIterator, WcError> {
 	let file = File::open(host.resolve(path)).map_err(|source| WcError::Io {
 		context: format!(
 			"cannot open {} for reading",
@@ -1344,7 +1346,7 @@ fn files0_iter_file(
 fn files0_iter(
 	reader: impl io::Read,
 	err_path: OsString,
-) -> impl Iterator<Item = InputIterItem> + std::iter::FusedIterator {
+) -> impl Iterator<Item = InputIterItem> + iter::FusedIterator {
 	use std::io::BufRead;
 	let mut iterator = Some(io::BufReader::new(reader).split(b'\0').map(
 		move |result| match result {
@@ -1459,7 +1461,7 @@ pub(crate) fn wc_simd_allowed(policy: &SimdPolicy) -> bool {
 	policy.iter_features().any(is_simd_runtime_feature)
 }
 
-fn record_error(host: &mut Host, error: impl std::fmt::Display) {
+fn record_error(host: &mut Host, error: impl Display) {
 	host.error(error, 1);
 }
 
@@ -1600,7 +1602,10 @@ pub(crate) fn wc_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
-	use std::io::{BufRead, Seek, SeekFrom, Write};
+	use std::{
+		fs,
+		io::{BufRead, Seek, SeekFrom, Write},
+	};
 
 	use super::{Wc, count_fast::count_bytes_fast, countable::WordCountable, word_count::WordCount};
 	use crate::host::run_util;
@@ -1616,7 +1621,7 @@ mod tests {
 	#[test]
 	fn resolves_relative_operands_but_prints_original_names() {
 		let directory = tempfile::tempdir().unwrap();
-		std::fs::write(directory.path().join("input"), b"hello\nworld\n").unwrap();
+		fs::write(directory.path().join("input"), b"hello\nworld\n").unwrap();
 		let cwd = directory.path().to_str().unwrap();
 		let (code, capture) = run_util::<Wc>(&["-l", "input"], "", cwd);
 		assert_eq!(code, 0);
@@ -1627,7 +1632,7 @@ mod tests {
 	#[test]
 	fn reports_failed_operands_and_continues() {
 		let directory = tempfile::tempdir().unwrap();
-		std::fs::write(directory.path().join("good"), b"x\n").unwrap();
+		fs::write(directory.path().join("good"), b"x\n").unwrap();
 		let cwd = directory.path().to_str().unwrap();
 		let (code, capture) = run_util::<Wc>(&["-l", "missing", "good"], "", cwd);
 		assert_eq!(code, 1);
@@ -1638,8 +1643,8 @@ mod tests {
 	#[test]
 	fn resolves_files0_from_entries_against_host_cwd() {
 		let directory = tempfile::tempdir().unwrap();
-		std::fs::write(directory.path().join("first"), b"a\n").unwrap();
-		std::fs::write(directory.path().join("names"), b"first\0").unwrap();
+		fs::write(directory.path().join("first"), b"a\n").unwrap();
+		fs::write(directory.path().join("names"), b"first\0").unwrap();
 		let cwd = directory.path().to_str().unwrap();
 		let (code, capture) = run_util::<Wc>(&["-l", "--files0-from", "names"], "", cwd);
 		assert_eq!(code, 0);

@@ -45,6 +45,7 @@ use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
 	f32::consts::PI,
+	result,
 	sync::LazyLock,
 };
 
@@ -97,7 +98,7 @@ pub enum SnapcompactError {
 }
 
 /// Result returned by the pure Rust renderer.
-pub type Result<T, E = SnapcompactError> = std::result::Result<T, E>;
+pub type Result<T, E = SnapcompactError> = result::Result<T, E>;
 
 /// Upper bound on the frame edge: a hard stop against absurd allocations
 /// (`size * size` pixel buffer), far above the 2576px production frame.

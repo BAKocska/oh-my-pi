@@ -4,6 +4,7 @@ use std::{
 	cmp::Ordering,
 	collections::HashMap,
 	sync::Arc,
+	time,
 	time::{Duration, Instant},
 };
 
@@ -11,19 +12,30 @@ use omp_core::{Str, sf};
 use tower::ServiceExt as _;
 
 use crate::{
-	call::{Call, ContentPart, OperationCall, Role, Target},
+	answer::Answer,
+	body::Replayability,
+	call::{
+		Call, ContentPart, MediaInput, NativePayload, OperationCall, Role, Setting, Target,
+		ToolResultContent,
+	},
 	catalog::{
-		CodecId, ModelKey, OperationKind, PolicyModel, PriceUnit, ProviderId, RouteId,
-		ThinkingEffort, WireTarget, clamp_thinking_effort,
+		Availability, CodecId, ModelKey, OperationBits, OperationKind, PolicyModel, PriceUnit,
+		ProviderId, ReasoningEffort, RouteId, ThinkingEffort, ThinkingPolicy, WireTarget,
+		clamp_thinking_effort,
 	},
 	error::{Error, ErrorDetail, ErrorKind},
 	plan::{
-		CapabilityAvailability, CapabilityRequirement, ExecutionPlan, FallbackScope,
-		NativeOptionRequirement, Planner, PlanningPolicy, ReplayRequirements, RuntimeRouteEvidence,
+		CapabilityAvailability, CapabilityEvidence, CapabilityRequirement, ExecutionPlan,
+		FallbackScope, NativeOptionRequirement, NegotiationDecision, PlannedFallback, Planner,
+		PlanningPolicy, ReplayRequirements, RequirementStrength, RouteHealth, RuntimeRouteEvidence,
 		negotiate, negotiate_native_option, plan_replay,
 	},
-	receipt::{ExecutionBudget, ExecutionReceipt, ReasonId},
+	receipt::{ExecutionBudget, ExecutionReceipt, FeatureId, ReasonId},
 	registry::Registry,
+	settings::{
+		FallbackRevertPolicy, InferenceSettings, UsageReservePolicy,
+		active_fallback as settings_active_fallback,
+	},
 };
 
 /// Plans and dispatches one raw call against the same immutable registry.
@@ -35,7 +47,7 @@ pub async fn execute_registry_call(
 	registry: Registry,
 	mut call: Call,
 	plan_ttl: Duration,
-) -> Result<crate::answer::Answer, Error> {
+) -> Result<Answer, Error> {
 	let router = Router::new(registry.clone(), plan_ttl);
 	let plan = <Router as Planner>::plan(&router, &call, Instant::now())?;
 	call.execution = Some(Arc::new(plan));
@@ -138,7 +150,7 @@ pub struct Router {
 	registry: Registry,
 	plan_ttl: Duration,
 	runtime:  Arc<HashMap<RouteId, RuntimeRouteEvidence>>,
-	settings: crate::settings::InferenceSettings,
+	settings: InferenceSettings,
 }
 
 impl Router {
@@ -149,12 +161,12 @@ impl Router {
 			registry,
 			plan_ttl,
 			runtime: Arc::new(HashMap::new()),
-			settings: crate::settings::InferenceSettings::default(),
+			settings: InferenceSettings::default(),
 		}
 	}
 
 	/// Installs the immutable runtime settings projection used for planning.
-	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
+	pub fn with_settings(mut self, settings: InferenceSettings) -> Self {
 		self.settings = settings;
 		self
 	}
@@ -343,7 +355,7 @@ impl Router {
 					.unwrap_or_else(|| RuntimeRouteEvidence {
 						route:            route_id.clone(),
 						generation:       self.registry.generation(),
-						health:           crate::plan::RouteHealth::Unknown,
+						health:           RouteHealth::Unknown,
 						quota_millionths: 0,
 						latency:          Duration::MAX,
 						affinity:         false,
@@ -354,7 +366,7 @@ impl Router {
 				last_error = Some(route_contract_error(route_id, "runtime-evidence-generation-stale"));
 				continue;
 			}
-			if runtime.health == crate::plan::RouteHealth::Unavailable {
+			if runtime.health == RouteHealth::Unavailable {
 				last_error = Some(route_contract_error(route_id, "runtime-route-unavailable"));
 				continue;
 			}
@@ -416,7 +428,7 @@ impl Router {
 		let (route, runtime, decisions) = eligible.remove(0);
 		let fallbacks = eligible
 			.into_iter()
-			.map(|(candidate, runtime, decisions)| crate::plan::PlannedFallback {
+			.map(|(candidate, runtime, decisions)| PlannedFallback {
 				model:              None,
 				provider:           provider.to_owned(),
 				route:              candidate.id.clone(),
@@ -431,7 +443,7 @@ impl Router {
 			})
 			.collect::<Vec<_>>();
 		Ok(ExecutionPlan {
-			planned_at: std::time::SystemTime::now(),
+			planned_at: time::SystemTime::now(),
 			catalog_revision: self.registry.catalog_revision().to_owned(),
 			registry_generation: self.registry.generation(),
 			expires_at: now.checked_add(self.plan_ttl).unwrap_or(now),
@@ -474,8 +486,8 @@ impl Router {
 			));
 		};
 		let mut authorized = Vec::with_capacity(request.selection.fallback_models.len() + 1);
-		if self.settings.retry.fallback_revert == crate::settings::FallbackRevertPolicy::Never
-			&& let Some(active) = crate::settings::active_fallback(primary)
+		if self.settings.retry.fallback_revert == FallbackRevertPolicy::Never
+			&& let Some(active) = settings_active_fallback(primary)
 			&& request.selection.fallback_models.contains(&active)
 		{
 			authorized.push(active);
@@ -552,9 +564,9 @@ impl Router {
 				});
 			if inside_reserve {
 				match self.settings.retry.usage_reserve_policy {
-					crate::settings::UsageReservePolicy::Confirm => {},
-					crate::settings::UsageReservePolicy::Auto => continue,
-					crate::settings::UsageReservePolicy::FailClosed => {
+					UsageReservePolicy::Confirm => {},
+					UsageReservePolicy::Auto => continue,
+					UsageReservePolicy::FailClosed => {
 						return Err(capability_error(
 							ErrorKind::QuotaExhausted,
 							request.operation,
@@ -582,7 +594,7 @@ impl Router {
 			.collect::<Result<Vec<_>, _>>()?;
 		let replay = plan_replay(&request.replay, &request.budget)?;
 		Ok(ExecutionPlan {
-			planned_at: std::time::SystemTime::now(),
+			planned_at: time::SystemTime::now(),
 			catalog_revision: self.registry.catalog_revision().to_owned(),
 			registry_generation: self.registry.generation(),
 			expires_at: now.checked_add(self.plan_ttl).unwrap_or(now),
@@ -609,7 +621,7 @@ impl Router {
 		&self,
 		request: &PlanRequest,
 		candidate: &EvaluatedCandidate,
-	) -> Result<crate::plan::PlannedFallback, Error> {
+	) -> Result<PlannedFallback, Error> {
 		let wire_policy = self
 			.registry
 			.catalog()
@@ -671,7 +683,7 @@ impl Router {
 			.settings
 			.model
 			.openrouter_wire_model(candidate.candidate.provider.as_str(), &wire_target.wire_model);
-		Ok(crate::plan::PlannedFallback {
+		Ok(PlannedFallback {
 			model: Some(candidate.candidate.model.clone()),
 			provider: candidate.candidate.provider.clone(),
 			route: candidate.candidate.wire_target.route.clone(),
@@ -748,7 +760,7 @@ impl Router {
 				route:            route.clone(),
 				operation:        CapabilityAvailability::Native,
 				generation:       self.registry.generation(),
-				health:           crate::plan::RouteHealth::Unknown,
+				health:           RouteHealth::Unknown,
 				quota_millionths: 0,
 				latency:          Duration::MAX,
 				affinity:         request.affinity_route.as_ref() == Some(route),
@@ -774,7 +786,7 @@ impl Router {
 			},
 			CapabilityAvailability::Native | CapabilityAvailability::Emulated(_) => {},
 		}
-		if runtime.health == crate::plan::RouteHealth::Unavailable {
+		if runtime.health == RouteHealth::Unavailable {
 			return Err(route_contract_error(route, "runtime-route-unavailable"));
 		}
 		let evidence = request
@@ -911,31 +923,28 @@ fn extract_requirements(operation: &OperationCall) -> Vec<CapabilityRequirement>
 
 fn push_setting<T>(
 	output: &mut Vec<CapabilityRequirement>,
-	setting: &crate::call::Setting<T>,
+	setting: &Setting<T>,
 	feature: &'static str,
 ) {
 	let strength = match setting {
-		crate::call::Setting::Unset => return,
-		crate::call::Setting::Require(_) => crate::plan::RequirementStrength::Required,
-		crate::call::Setting::Prefer(_) => crate::plan::RequirementStrength::Preferred,
+		Setting::Unset => return,
+		Setting::Require(_) => RequirementStrength::Required,
+		Setting::Prefer(_) => RequirementStrength::Preferred,
 	};
-	output.push(CapabilityRequirement {
-		feature: crate::receipt::FeatureId(Str::new(feature)),
-		strength,
-	});
+	output.push(CapabilityRequirement { feature: FeatureId(Str::new(feature)), strength });
 }
 
 fn push_required(output: &mut Vec<CapabilityRequirement>, feature: &'static str) {
 	output.push(CapabilityRequirement {
-		feature:  crate::receipt::FeatureId(Str::new(feature)),
-		strength: crate::plan::RequirementStrength::Required,
+		feature:  FeatureId(Str::new(feature)),
+		strength: RequirementStrength::Required,
 	});
 }
 
 fn catalog_capability_evidence(
 	model: &PolicyModel,
 	requirement: &CapabilityRequirement,
-) -> crate::plan::CapabilityEvidence {
+) -> CapabilityEvidence {
 	let availability = match requirement.feature.0.as_str() {
 		feature if feature.starts_with("chat.") => {
 			model.capabilities.chat.as_ref().map(|chat| match feature {
@@ -1002,23 +1011,19 @@ fn catalog_capability_evidence(
 		_ => None,
 	}
 	.unwrap_or(CapabilityAvailability::Unknown);
-	crate::plan::CapabilityEvidence {
+	CapabilityEvidence {
 		feature: requirement.feature.clone(),
 		availability,
 		reason: ReasonId(sf!("catalog-capability-evidence")),
 	}
 }
 
-const fn availability_class<C>(
-	availability: &crate::catalog::Availability<C>,
-) -> CapabilityAvailability {
+const fn availability_class<C>(availability: &Availability<C>) -> CapabilityAvailability {
 	match availability {
-		crate::catalog::Availability::Unsupported => CapabilityAvailability::Unsupported,
-		crate::catalog::Availability::Unknown => CapabilityAvailability::Unknown,
-		crate::catalog::Availability::Native(_) => CapabilityAvailability::Native,
-		crate::catalog::Availability::Emulated { method, .. } => {
-			CapabilityAvailability::Emulated(*method)
-		},
+		Availability::Unsupported => CapabilityAvailability::Unsupported,
+		Availability::Unknown => CapabilityAvailability::Unknown,
+		Availability::Native(_) => CapabilityAvailability::Native,
+		Availability::Emulated { method, .. } => CapabilityAvailability::Emulated(*method),
 	}
 }
 
@@ -1092,15 +1097,15 @@ fn operation_replay(operation: &OperationCall) -> ReplayRequirements {
 			}
 		},
 		OperationCall::Transcribe(request) => collect_media_replay(&request.audio, &mut parts),
-		OperationCall::Realtime(_) => parts.push(crate::body::Replayability::OneShot),
+		OperationCall::Realtime(_) => parts.push(Replayability::OneShot),
 		OperationCall::Native(request) => {
-			if let Some(crate::call::NativePayload::Body(body)) = request.payload.as_ref() {
+			if let Some(NativePayload::Body(body)) = request.payload.as_ref() {
 				parts.push(body.replay_evidence().replayability);
 			}
 		},
 		_ => {},
 	}
-	let replayability = crate::body::Replayability::aggregate(parts);
+	let replayability = Replayability::aggregate(parts);
 	ReplayRequirements {
 		replayability,
 		semantic_retry_possible,
@@ -1109,28 +1114,20 @@ fn operation_replay(operation: &OperationCall) -> ReplayRequirements {
 	}
 }
 
-fn collect_media_replay(
-	media: &crate::call::MediaInput,
-	parts: &mut Vec<crate::body::Replayability>,
-) {
-	if let crate::call::MediaInput::Body { body, .. } = media {
+fn collect_media_replay(media: &MediaInput, parts: &mut Vec<Replayability>) {
+	if let MediaInput::Body { body, .. } = media {
 		parts.push(body.replay_evidence().replayability);
 	}
 }
 
-fn collect_content_replay(
-	content: &crate::call::ContentPart,
-	parts: &mut Vec<crate::body::Replayability>,
-) {
+fn collect_content_replay(content: &ContentPart, parts: &mut Vec<Replayability>) {
 	match content {
-		crate::call::ContentPart::Image(media)
-		| crate::call::ContentPart::Audio(media)
-		| crate::call::ContentPart::Document(media) => collect_media_replay(media, parts),
-		crate::call::ContentPart::ToolResult { content, .. } => {
+		ContentPart::Image(media) | ContentPart::Audio(media) | ContentPart::Document(media) => {
+			collect_media_replay(media, parts)
+		},
+		ContentPart::ToolResult { content, .. } => {
 			for value in content.iter() {
-				if let crate::call::ToolResultContent::Image(media)
-				| crate::call::ToolResultContent::Document(media) = value
-				{
+				if let ToolResultContent::Image(media) | ToolResultContent::Document(media) = value {
 					collect_media_replay(media, parts);
 				}
 			}
@@ -1141,16 +1138,14 @@ fn collect_content_replay(
 
 fn chat_thinking_effort(
 	operation: Option<&OperationCall>,
-	policy: Option<&crate::catalog::ThinkingPolicy>,
-) -> Result<Option<crate::catalog::ThinkingEffort>, Error> {
+	policy: Option<&ThinkingPolicy>,
+) -> Result<Option<ThinkingEffort>, Error> {
 	let Some(OperationCall::Chat(request)) = operation else {
 		return Ok(None);
 	};
 	let requested = match &request.reasoning {
-		crate::call::Setting::Unset => None,
-		crate::call::Setting::Require(reasoning) | crate::call::Setting::Prefer(reasoning) => {
-			reasoning.effort
-		},
+		Setting::Unset => None,
+		Setting::Require(reasoning) | Setting::Prefer(reasoning) => reasoning.effort,
 	};
 	if policy.is_none() && requested.is_some() {
 		return Err(capability_error(
@@ -1162,17 +1157,15 @@ fn chat_thinking_effort(
 	Ok(requested.map(reasoning_to_thinking))
 }
 
-const fn reasoning_to_thinking(
-	effort: crate::catalog::ReasoningEffort,
-) -> crate::catalog::ThinkingEffort {
+const fn reasoning_to_thinking(effort: ReasoningEffort) -> ThinkingEffort {
 	match effort {
-		crate::catalog::ReasoningEffort::Off => crate::catalog::ThinkingEffort::Off,
-		crate::catalog::ReasoningEffort::Minimal => crate::catalog::ThinkingEffort::Minimal,
-		crate::catalog::ReasoningEffort::Low => crate::catalog::ThinkingEffort::Low,
-		crate::catalog::ReasoningEffort::Medium => crate::catalog::ThinkingEffort::Medium,
-		crate::catalog::ReasoningEffort::High => crate::catalog::ThinkingEffort::High,
-		crate::catalog::ReasoningEffort::Xhigh => crate::catalog::ThinkingEffort::XHigh,
-		crate::catalog::ReasoningEffort::Max => crate::catalog::ThinkingEffort::Max,
+		ReasoningEffort::Off => ThinkingEffort::Off,
+		ReasoningEffort::Minimal => ThinkingEffort::Minimal,
+		ReasoningEffort::Low => ThinkingEffort::Low,
+		ReasoningEffort::Medium => ThinkingEffort::Medium,
+		ReasoningEffort::High => ThinkingEffort::High,
+		ReasoningEffort::Xhigh => ThinkingEffort::XHigh,
+		ReasoningEffort::Max => ThinkingEffort::Max,
 	}
 }
 
@@ -1180,7 +1173,7 @@ fn model_less_route_is_candidate(
 	route: &RouteId<str>,
 	pinned_route: Option<&RouteId<str>>,
 	provider_support: bool,
-	route_operations: Option<crate::catalog::OperationBits>,
+	route_operations: Option<OperationBits>,
 	operation: OperationKind,
 ) -> bool {
 	pinned_route.is_none_or(|pinned| pinned == route)
@@ -1189,7 +1182,7 @@ fn model_less_route_is_candidate(
 
 const fn model_less_operation_advertised(
 	provider_support: bool,
-	route_operations: Option<crate::catalog::OperationBits>,
+	route_operations: Option<OperationBits>,
 	operation: OperationKind,
 ) -> bool {
 	match route_operations {
@@ -1201,7 +1194,7 @@ const fn model_less_operation_advertised(
 struct EvaluatedCandidate {
 	candidate: RouteCandidate,
 	runtime:   RuntimeRouteEvidence,
-	decisions: Vec<crate::plan::NegotiationDecision>,
+	decisions: Vec<NegotiationDecision>,
 	price:     u128,
 }
 
@@ -1301,12 +1294,12 @@ fn compare_evaluated(
 		})
 }
 
-const fn health_rank(health: crate::plan::RouteHealth) -> u8 {
+const fn health_rank(health: RouteHealth) -> u8 {
 	match health {
-		crate::plan::RouteHealth::Healthy => 0,
-		crate::plan::RouteHealth::Unknown => 1,
-		crate::plan::RouteHealth::Degraded => 2,
-		crate::plan::RouteHealth::Unavailable => 3,
+		RouteHealth::Healthy => 0,
+		RouteHealth::Unknown => 1,
+		RouteHealth::Degraded => 2,
+		RouteHealth::Unavailable => 3,
 	}
 }
 
@@ -1389,6 +1382,7 @@ fn route_contract_error(route: &RouteId<str>, reason: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::catalog::OperationBits as CatalogOperationBits;
 
 	const OPERATIONS: [OperationKind; 16] = [
 		OperationKind::Chat,
@@ -1414,11 +1408,11 @@ mod tests {
 		let route = RouteId::from("selected");
 		let other = RouteId::from("other");
 		for operation in OPERATIONS {
-			let exact = crate::catalog::OperationBits::for_kind(operation);
+			let exact = CatalogOperationBits::for_kind(operation);
 			let different = if operation == OperationKind::Chat {
-				crate::catalog::OperationBits::for_kind(OperationKind::Usage)
+				CatalogOperationBits::for_kind(OperationKind::Usage)
 			} else {
-				crate::catalog::OperationBits::for_kind(OperationKind::Chat)
+				CatalogOperationBits::for_kind(OperationKind::Chat)
 			};
 
 			assert!(model_less_route_is_candidate(&route, None, true, None, operation));

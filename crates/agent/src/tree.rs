@@ -1,21 +1,30 @@
 //! Session agent roster, recursive budget authority, and concurrency permits.
 
 use std::{
-	collections::{BTreeMap, HashMap, HashSet, VecDeque},
+	collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map},
 	future::Future,
+	mem,
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicU8, AtomicU64, Ordering},
 	},
+	time,
 	time::Instant,
 };
 
 use omp_core::{AppendVec, Hash32, InvocationPhase, Str};
 use omp_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
-use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1::{self as pb, usage, value},
+	prost::Message as _,
+	thread::v1::{self as thread_pb, item},
+};
 use parking_lot::{Mutex, RwLock};
-use serde_json::Value;
+use serde_json::{Value, map};
 use thiserror::Error;
+use tokio::sync::{Notify, watch, watch::Receiver};
+
+use crate::name::{AgentNameAllocator, AgentNameError};
 
 /// Default tree-wide number of concurrently running agent turns.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 32;
@@ -405,17 +414,17 @@ fn append_yield_path(
 	}
 	let force_array = schema_path_is_array(schema, path);
 	match current.entry((*leaf).to_owned()) {
-		serde_json::map::Entry::Vacant(entry) => {
+		map::Entry::Vacant(entry) => {
 			entry.insert(if force_array {
 				Value::Array(vec![value])
 			} else {
 				value
 			});
 		},
-		serde_json::map::Entry::Occupied(mut entry) => match entry.get_mut() {
+		map::Entry::Occupied(mut entry) => match entry.get_mut() {
 			Value::Array(values) => values.push(value),
 			existing if !existing.is_object() => {
-				let first = std::mem::replace(existing, Value::Null);
+				let first = mem::replace(existing, Value::Null);
 				*existing = Value::Array(vec![first, value]);
 			},
 			_ => {
@@ -962,7 +971,7 @@ impl TreeStatistics {
 	fn add_outcome(&mut self, outcome: &pb::Outcome) {
 		for item in &outcome.output {
 			match item.kind.as_ref() {
-				Some(thread_pb::item::Kind::Message(message)) => {
+				Some(item::Kind::Message(message)) => {
 					match thread_pb::Role::try_from(message.role).unwrap_or(thread_pb::Role::Unspecified)
 					{
 						thread_pb::Role::User => {
@@ -977,10 +986,10 @@ impl TreeStatistics {
 						thread_pb::Role::Unspecified => {},
 					}
 				},
-				Some(thread_pb::item::Kind::ToolCall(_)) => {
+				Some(item::Kind::ToolCall(_)) => {
 					self.tool_calls = self.tool_calls.saturating_add(1);
 				},
-				Some(thread_pb::item::Kind::ToolResult(result)) => {
+				Some(item::Kind::ToolResult(result)) => {
 					self.tool_results = self.tool_results.saturating_add(1);
 					self.tool_errors = self.tool_errors.saturating_add(u64::from(result.is_error));
 				},
@@ -1024,7 +1033,7 @@ fn merge_usage(target: &mut pb::Usage, source: &pb::Usage) {
 		(0, right) => right,
 		(left, 0) => left,
 		(left, right) if left == right => left,
-		_ => pb::usage::Accuracy::Mixed as i32,
+		_ => usage::Accuracy::Mixed as i32,
 	};
 	merge_usage_detail(&mut target.detail, source.detail.as_ref());
 	target.total_tokens = sum_optional(target.total_tokens, source.total_tokens);
@@ -1098,18 +1107,17 @@ fn merge_usage_detail(target: &mut Option<pb::ValueMap>, source: Option<&pb::Val
 	};
 	let target = target.get_or_insert_with(pb::ValueMap::default);
 	for (key, incoming) in &source.fields {
-		use std::collections::btree_map::Entry;
 		match target.fields.entry(key.clone()) {
-			Entry::Vacant(entry) => {
+			btree_map::Entry::Vacant(entry) => {
 				entry.insert(incoming.clone());
 			},
-			Entry::Occupied(mut entry) => {
+			btree_map::Entry::Occupied(mut entry) => {
 				let merged = match (entry.get().kind.as_ref(), incoming.kind.as_ref()) {
-					(Some(pb::value::Kind::Int(left)), Some(pb::value::Kind::Int(right))) => {
-						left.checked_add(*right).map(pb::value::Kind::Int)
+					(Some(value::Kind::Int(left)), Some(value::Kind::Int(right))) => {
+						left.checked_add(*right).map(value::Kind::Int)
 					},
-					(Some(pb::value::Kind::Uint(left)), Some(pb::value::Kind::Uint(right))) => {
-						left.checked_add(*right).map(pb::value::Kind::Uint)
+					(Some(value::Kind::Uint(left)), Some(value::Kind::Uint(right))) => {
+						left.checked_add(*right).map(value::Kind::Uint)
 					},
 					_ if entry.get() == incoming => continue,
 					_ => None,
@@ -1136,7 +1144,7 @@ pub struct Budget {
 	/// Maximum subtree durable receipt spend in micros of USD.
 	pub max_usd_micros:    Option<u64>,
 	/// Maximum duration from admission to settlement.
-	pub max_wall:          Option<std::time::Duration>,
+	pub max_wall:          Option<time::Duration>,
 }
 
 impl Budget {
@@ -1176,7 +1184,7 @@ pub struct BudgetRemainder {
 	/// Remaining durable-receipt spend.
 	pub usd_micros:    Option<u64>,
 	/// Remaining wall time.
-	pub wall:          Option<std::time::Duration>,
+	pub wall:          Option<time::Duration>,
 }
 
 #[derive(Debug)]
@@ -1322,7 +1330,7 @@ pub enum SpawnRefusal {
 	SelfRecursion,
 	/// A caller display name was invalid.
 	#[error(transparent)]
-	InvalidName(#[from] crate::name::AgentNameError),
+	InvalidName(#[from] AgentNameError),
 	/// The requested child would exceed the tree depth ceiling.
 	#[error("agent depth ceiling exceeded")]
 	DepthExceeded,
@@ -1371,7 +1379,7 @@ pub struct BudgetExceeded {
 struct ConcurrencyWaiter {
 	ticket: u64,
 	units:  usize,
-	wake:   Arc<tokio::sync::Notify>,
+	wake:   Arc<Notify>,
 }
 
 struct ConcurrencyState {
@@ -1442,7 +1450,7 @@ impl ConcurrencyController {
 			}
 			let ticket = state.next_ticket;
 			state.next_ticket = state.next_ticket.wrapping_add(1);
-			let wake = Arc::new(tokio::sync::Notify::new());
+			let wake = Arc::new(Notify::new());
 			state
 				.waiters
 				.push_back(ConcurrencyWaiter { ticket, units, wake: Arc::clone(&wake) });
@@ -1600,23 +1608,23 @@ pub struct AgentTree {
 	nodes:             AppendVec<Arc<AgentNode>>,
 	by_id:             RwLock<HashMap<Str, usize>>,
 	by_name:           RwLock<HashMap<Str, usize>>,
-	names:             crate::name::AgentNameAllocator,
+	names:             AgentNameAllocator,
 	concurrency:       Arc<ConcurrencyController>,
 	max_depth:         u16,
 	roster_generation: AtomicU64,
-	roster_watch:      tokio::sync::watch::Sender<u64>,
+	roster_watch:      watch::Sender<u64>,
 }
 
 impl AgentTree {
 	/// Creates an empty tree with explicit depth, concurrency, and queue
 	/// ceilings.
 	pub fn new(max_depth: u16, max_concurrency: usize, max_queue: usize) -> Self {
-		let (roster_watch, _) = tokio::sync::watch::channel(0_u64);
+		let (roster_watch, _) = watch::channel(0_u64);
 		Self {
 			nodes: AppendVec::new(),
 			by_id: RwLock::new(HashMap::new()),
 			by_name: RwLock::new(HashMap::new()),
-			names: crate::name::AgentNameAllocator::new(),
+			names: AgentNameAllocator::new(),
 			concurrency: ConcurrencyController::new(max_concurrency, max_queue),
 			max_depth,
 			roster_generation: AtomicU64::new(0),
@@ -1764,7 +1772,7 @@ impl AgentTree {
 	///
 	/// Consumers obtain the allocation-free roster after `changed()`; this
 	/// avoids UI polling while keeping node storage append-only.
-	pub fn watch_roster(&self) -> tokio::sync::watch::Receiver<u64> {
+	pub fn watch_roster(&self) -> Receiver<u64> {
 		self.roster_watch.subscribe()
 	}
 
@@ -1967,6 +1975,7 @@ impl AgentTree {
 #[cfg(test)]
 mod tests {
 	use serde_json::json;
+	use tokio::task;
 
 	use super::*;
 
@@ -1999,10 +2008,10 @@ mod tests {
 		tree.resize_concurrency(1);
 		let waiting_tree = Arc::clone(&tree);
 		let waiter = tokio::spawn(async move { waiting_tree.admit(1).await.unwrap() });
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 		assert!(!waiter.is_finished());
 		drop(first);
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 		assert!(!waiter.is_finished());
 		drop(second);
 		let third = waiter.await.unwrap();
@@ -2019,13 +2028,13 @@ mod tests {
 		let active = tree.admit(1).await.unwrap();
 		let cancelled_tree = Arc::clone(&tree);
 		let cancelled = tokio::spawn(async move { cancelled_tree.admit(1).await });
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 		cancelled.abort();
 		assert!(matches!(cancelled.await, Err(error) if error.is_cancelled()));
 
 		let next_tree = Arc::clone(&tree);
 		let next = tokio::spawn(async move { next_tree.admit(1).await.unwrap() });
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 		assert!(!next.is_finished());
 		drop(active);
 		let permit = next.await.unwrap();

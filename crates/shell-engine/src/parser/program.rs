@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::{fmt, io, path::PathBuf};
 
 use bon::bon;
 
 use crate::parser::{
 	ast,
+	error::{ParseError, convert_peg_parse_error},
 	tokenizer::{Token, TokenEndReason, Tokenizer, TokenizerOptions, Tokens},
 };
 
@@ -76,7 +77,7 @@ impl From<PathBuf> for SourceInfo {
 }
 
 /// Implements parsing for shell programs.
-pub struct Parser<R: std::io::BufRead> {
+pub struct Parser<R: io::BufRead> {
 	/// The reader to use for input
 	reader:  R,
 	/// Parsing options
@@ -84,7 +85,7 @@ pub struct Parser<R: std::io::BufRead> {
 }
 
 #[bon]
-impl<R: std::io::BufRead> Parser<R> {
+impl<R: io::BufRead> Parser<R> {
 	///
 	/// # Arguments
 	///
@@ -137,7 +138,7 @@ impl<R: std::io::BufRead> Parser<R> {
 	}
 
 	/// Parses the input into an abstract syntax tree (AST) of a shell program.
-	pub fn parse_program(&mut self) -> Result<ast::Program, crate::parser::error::ParseError> {
+	pub fn parse_program(&mut self) -> Result<ast::Program, ParseError> {
 		//
 		// References:
 		//   * https://www.gnu.org/software/bash/manual/bash.html#Shell-Syntax
@@ -155,16 +156,14 @@ impl<R: std::io::BufRead> Parser<R> {
 
 	/// Parses a function definition body from the input. The body is expected to
 	/// be preceded by "()", but no function name.
-	pub fn parse_function_parens_and_body(
-		&mut self,
-	) -> Result<ast::FunctionBody, crate::parser::error::ParseError> {
+	pub fn parse_function_parens_and_body(&mut self) -> Result<ast::FunctionBody, ParseError> {
 		let tokens = self.tokenize()?;
 		let parse_result =
 			peg::token_parser::function_parens_and_body(&Tokens { tokens: &tokens }, &self.options);
 		parse_result_to_error(parse_result, &tokens)
 	}
 
-	fn tokenize(&mut self) -> Result<Vec<Token>, crate::parser::error::ParseError> {
+	fn tokenize(&mut self) -> Result<Vec<Token>, ParseError> {
 		// First we tokenize the input, according to the policy implied by provided
 		// options.
 		let mut tokenizer = Tokenizer::new(&mut self.reader, &self.options.tokenizer_options());
@@ -176,7 +175,7 @@ impl<R: std::io::BufRead> Parser<R> {
 			let result = match tokenizer.next_token() {
 				Ok(result) => result,
 				Err(e) => {
-					return Err(crate::parser::error::ParseError::Tokenizing {
+					return Err(ParseError::Tokenizing {
 						inner:    e,
 						position: tokenizer.current_location(),
 					});
@@ -207,10 +206,7 @@ impl<R: std::io::BufRead> Parser<R> {
 ///
 /// * `tokens` - The tokens to parse.
 /// * `options` - The options to use when parsing.
-pub fn parse_tokens(
-	tokens: &[Token],
-	options: &ParserOptions,
-) -> Result<ast::Program, crate::parser::error::ParseError> {
+pub fn parse_tokens(tokens: &[Token], options: &ParserOptions) -> Result<ast::Program, ParseError> {
 	let parse_result = peg::token_parser::program(&Tokens { tokens }, options);
 	parse_result_to_error(parse_result, tokens)
 }
@@ -218,9 +214,9 @@ pub fn parse_tokens(
 fn parse_result_to_error<R>(
 	parse_result: Result<R, ::peg::error::ParseError<usize>>,
 	tokens: &[Token],
-) -> Result<R, crate::parser::error::ParseError>
+) -> Result<R, ParseError>
 where
-	R: std::fmt::Debug,
+	R: fmt::Debug,
 {
 	match parse_result {
 		Ok(program) => {
@@ -229,7 +225,7 @@ where
 		},
 		Err(parse_error) => {
 			tracing::debug!(target: "parse", "Parse error: {:?}", parse_error);
-			Err(crate::parser::error::convert_peg_parse_error(&parse_error, tokens))
+			Err(convert_peg_parse_error(&parse_error, tokens))
 		},
 	}
 }

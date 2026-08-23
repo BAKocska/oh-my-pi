@@ -1,7 +1,7 @@
 //! Four-voice recall, reciprocal-rank fusion, deduplication, and scoped
 //! fallback.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
@@ -319,10 +319,10 @@ fn fuse(
 	for result in fused.into_values() {
 		let key = normalized_content(result.memory.content.as_str());
 		match by_content.entry(key) {
-			std::collections::hash_map::Entry::Vacant(entry) => {
+			Entry::Vacant(entry) => {
 				entry.insert(result);
 			},
-			std::collections::hash_map::Entry::Occupied(mut entry) => {
+			Entry::Occupied(mut entry) => {
 				let current = entry.get_mut();
 				current.score += result.score;
 				current.voice_scores.merge(result.voice_scores);

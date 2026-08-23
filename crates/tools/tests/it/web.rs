@@ -3,6 +3,7 @@ use std::{
 	collections::VecDeque,
 	fmt::Write as _,
 	future::{Future, ready},
+	io,
 	sync::Arc,
 };
 
@@ -187,7 +188,7 @@ fn ok_json(body: &'static str) -> HttpResponse {
 }
 
 fn png_fixture() -> Bytes {
-	let mut output = std::io::Cursor::new(Vec::new());
+	let mut output = io::Cursor::new(Vec::new());
 	image::DynamicImage::new_rgba8(1, 1)
 		.write_to(&mut output, image::ImageFormat::Png)
 		.expect("encode PNG fixture");

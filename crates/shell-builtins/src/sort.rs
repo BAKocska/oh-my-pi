@@ -61,7 +61,13 @@ mod buffer_hint {
 	// file that was distributed with this source code.
 
 	//! Heuristics for determining buffer size for external sorting.
-	use std::ffi::OsString;
+	use std::{ffi::OsString, fs};
+
+	use super::{
+		FALLBACK_AUTOMATIC_BUF_SIZE, MAX_AUTOMATIC_BUF_SIZE, MIN_AUTOMATIC_BUF_SIZE, STDIN_FILE,
+	};
+	#[cfg(target_os = "linux")]
+	use crate::support::parse::available_memory_bytes;
 
 	// Heuristics to size the external sort buffer without overcommit memory.
 	pub(crate) fn automatic_buffer_size(files: &[OsString]) -> usize {
@@ -74,7 +80,7 @@ mod buffer_hint {
 			(Some(file), Some(mem)) => file.min(mem),
 			(Some(file), None) => file,
 			(None, Some(mem)) => mem,
-			(None, None) => super::FALLBACK_AUTOMATIC_BUF_SIZE,
+			(None, None) => FALLBACK_AUTOMATIC_BUF_SIZE,
 		}
 	}
 
@@ -83,11 +89,11 @@ mod buffer_hint {
 		let mut total_bytes: u128 = 0;
 
 		for file in files {
-			if file == super::STDIN_FILE {
+			if file == STDIN_FILE {
 				continue;
 			}
 
-			let Ok(metadata) = std::fs::metadata(file) else {
+			let Ok(metadata) = fs::metadata(file) else {
 				continue;
 			};
 
@@ -97,7 +103,7 @@ mod buffer_hint {
 
 			total_bytes = total_bytes.saturating_add(metadata.len() as u128);
 
-			if total_bytes >= (super::MAX_AUTOMATIC_BUF_SIZE as u128) * 8 {
+			if total_bytes >= (MAX_AUTOMATIC_BUF_SIZE as u128) * 8 {
 				break;
 			}
 		}
@@ -112,7 +118,7 @@ mod buffer_hint {
 
 	fn available_memory_hint() -> Option<usize> {
 		#[cfg(target_os = "linux")]
-		if let Some(bytes) = crate::support::parse::available_memory_bytes() {
+		if let Some(bytes) = available_memory_bytes() {
 			return Some(clamp_hint(bytes / 4));
 		}
 
@@ -120,8 +126,8 @@ mod buffer_hint {
 	}
 
 	fn clamp_hint(bytes: u128) -> usize {
-		let min = super::MIN_AUTOMATIC_BUF_SIZE as u128;
-		let max = super::MAX_AUTOMATIC_BUF_SIZE as u128;
+		let min = MIN_AUTOMATIC_BUF_SIZE as u128;
+		let max = MAX_AUTOMATIC_BUF_SIZE as u128;
 		let clamped = bytes.clamp(min, max);
 		clamped.min(usize::MAX as u128) as usize
 	}
@@ -131,7 +137,7 @@ mod buffer_hint {
 			return 0;
 		}
 
-		let max = super::MAX_AUTOMATIC_BUF_SIZE as u128;
+		let max = MAX_AUTOMATIC_BUF_SIZE as u128;
 
 		if total_bytes <= max {
 			return total_bytes.saturating_mul(12).clamp(total_bytes, max);
@@ -191,17 +197,14 @@ mod buffer_hint {
 		fn desired_buffer_matches_total_when_small() {
 			let six_mebibytes = 6 * 1024 * 1024;
 			let expected = ((six_mebibytes as u128) * 12)
-				.clamp(six_mebibytes as u128, super::super::MAX_AUTOMATIC_BUF_SIZE as u128);
+				.clamp(six_mebibytes as u128, MAX_AUTOMATIC_BUF_SIZE as u128);
 			assert_eq!(desired_file_buffer_bytes(six_mebibytes as u128), expected);
 		}
 
 		#[test]
 		fn desired_buffer_caps_at_max_for_large_inputs() {
 			let large = 256 * 1024 * 1024; // 256 MiB
-			assert_eq!(
-				desired_file_buffer_bytes(large as u128),
-				super::super::MAX_AUTOMATIC_BUF_SIZE as u128
-			);
+			assert_eq!(desired_file_buffer_bytes(large as u128), MAX_AUTOMATIC_BUF_SIZE as u128);
 		}
 	}
 }
@@ -346,6 +349,7 @@ mod chunks {
 
 	use std::{
 		io::{ErrorKind, Read},
+		mem,
 		ops::Range,
 	};
 
@@ -424,26 +428,24 @@ mod chunks {
 					// longer lifetime, because the vector is empty.
 					// Transmuting is necessary to make recycling possible. See https://github.com/rust-lang/rfcs/pull/2802
 					// for a rfc to make this unnecessary. Its example is similar to the code here.
-					std::mem::transmute::<Vec<Line<'_>>, Vec<Line<'static>>>(std::mem::take(
-						&mut contents.lines,
-					))
+					mem::transmute::<Vec<Line<'_>>, Vec<Line<'static>>>(mem::take(&mut contents.lines))
 				};
 				let selections = unsafe {
 					// SAFETY: (same as above) It is safe to (temporarily) transmute to a vector of
 					// &str with a longer lifetime, because the vector is empty.
-					std::mem::transmute::<Vec<&'_ [u8]>, Vec<&'static [u8]>>(std::mem::take(
+					mem::transmute::<Vec<&'_ [u8]>, Vec<&'static [u8]>>(mem::take(
 						&mut contents.line_data.selections,
 					))
 				};
 				RecycledChunk {
 					lines,
 					selections,
-					num_infos: std::mem::take(&mut contents.line_data.num_infos),
-					parsed_floats: std::mem::take(&mut contents.line_data.parsed_floats),
-					line_num_floats: std::mem::take(&mut contents.line_data.line_num_floats),
-					collation_key_buffer: std::mem::take(&mut contents.line_data.collation_key_buffer),
-					collation_key_ends: std::mem::take(&mut contents.line_data.collation_key_ends),
-					token_buffer: std::mem::take(&mut contents.token_buffer),
+					num_infos: mem::take(&mut contents.line_data.num_infos),
+					parsed_floats: mem::take(&mut contents.line_data.parsed_floats),
+					line_num_floats: mem::take(&mut contents.line_data.line_num_floats),
+					collation_key_buffer: mem::take(&mut contents.line_data.collation_key_buffer),
+					collation_key_ends: mem::take(&mut contents.line_data.collation_key_ends),
+					token_buffer: mem::take(&mut contents.token_buffer),
 					line_count_hint: contents.line_count_hint,
 					// buffer is set below after we consume `self`
 					buffer: Vec::new(),
@@ -559,13 +561,13 @@ mod chunks {
 					// SAFETY: It is safe to transmute to an empty vector of selections with shorter
 					// lifetime. It was only temporarily transmuted to a Vec<Line<'static>> to
 					// make recycling possible.
-					std::mem::transmute::<Vec<&'static [u8]>, Vec<&'_ [u8]>>(selections)
+					mem::transmute::<Vec<&'static [u8]>, Vec<&'_ [u8]>>(selections)
 				};
 				let mut lines = unsafe {
 					// SAFETY: (same as above) It is safe to transmute to a vector of lines with
 					// shorter lifetime, because it was only temporarily transmuted to a
 					// Vec<Line<'static>> to make recycling possible.
-					std::mem::transmute::<Vec<Line<'static>>, Vec<Line<'_>>>(lines)
+					mem::transmute::<Vec<Line<'static>>, Vec<Line<'_>>>(lines)
 				};
 				let read = &buffer[..read];
 				let mut line_data = LineData {
@@ -933,7 +935,7 @@ mod ext_sort {
 			fs::File,
 			io::{Read, Write},
 			path::PathBuf,
-			thread,
+			process, thread,
 		};
 
 		use flume::{Receiver, Sender};
@@ -981,9 +983,9 @@ mod ext_sort {
 			if let Some(compress) = &settings.compress {
 				let mut probe = compress.env.command(&compress.prog);
 				probe
-					.stdin(std::process::Stdio::null())
-					.stdout(std::process::Stdio::null())
-					.stderr(std::process::Stdio::null());
+					.stdin(process::Stdio::null())
+					.stdout(process::Stdio::null())
+					.stderr(process::Stdio::null());
 				match probe.spawn() {
 					Ok(mut child) => {
 						// Kill the test process immediately
@@ -1244,9 +1246,14 @@ mod ext_sort {
 
 		#[cfg(test)]
 		mod tests {
-			use std::io::{Cursor, Read};
+			use std::{
+				env, fs,
+				io::{Cursor, Read},
+				iter,
+			};
 
 			use super::*;
+			use crate::host::Host;
 
 			/// External (multi-chunk) sort must run to completion and emit fully
 			/// sorted output. Regression guard for #6760: `ext_sort` now joins
@@ -1267,24 +1274,21 @@ mod ext_sort {
 				let out_dir = tempfile::tempdir().expect("temp dir");
 				let out_path = out_dir.path().join("sorted.txt");
 
-				let mut files = std::iter::once(Ok(
-					Box::new(Cursor::new(input.into_bytes())) as Box<dyn Read + Send>
-				));
+				let mut files =
+					iter::once(Ok(Box::new(Cursor::new(input.into_bytes())) as Box<dyn Read + Send>));
 				let output = Output::new(Some(out_path.as_os_str()), None).expect("open output");
-				let mut tmp_dir = TmpDirWrapper::new(std::env::temp_dir());
+				let mut tmp_dir = TmpDirWrapper::new(env::temp_dir());
 
 				ext_sort(
 					&mut files,
 					&settings,
 					output,
 					&mut tmp_dir,
-					crate::host::Host::for_test("sort", "", "/")
-						.0
-						.stderr_clone(),
+					Host::for_test("sort", "", "/").0.stderr_clone(),
 				)
 				.expect("ext_sort succeeds");
 
-				let sorted = std::fs::read_to_string(&out_path).expect("read output");
+				let sorted = fs::read_to_string(&out_path).expect("read output");
 				let expected: String = (0..200u32).map(|i| format!("{i:04}\n")).collect();
 				assert_eq!(sorted, expected);
 			}
@@ -1382,8 +1386,9 @@ mod merge {
 		collections::BinaryHeap,
 		ffi::{OsStr, OsString},
 		fs::{self, File},
+		io,
 		io::{BufWriter, Read, Write},
-		iter,
+		iter, ops,
 		path::{Path, PathBuf},
 		process::{Child, ChildStdin, ChildStdout, Stdio},
 		rc::Rc,
@@ -1680,7 +1685,7 @@ mod merge {
 			&mut self,
 			settings: &GlobalSettings,
 			out: &mut impl Write,
-		) -> std::io::Result<bool> {
+		) -> io::Result<bool> {
 			if let Some(file) = self.heap.peek() {
 				let prev = self.prev.replace(PreviousLine {
 					chunk:       file.current_chunk.clone(),
@@ -1743,7 +1748,7 @@ mod merge {
 		settings: &'a GlobalSettings,
 	}
 
-	impl std::ops::Deref for HeapFile<'_> {
+	impl ops::Deref for HeapFile<'_> {
 		type Target = MergeableFile;
 
 		fn deref(&self) -> &Self::Target {
@@ -1751,7 +1756,7 @@ mod merge {
 		}
 	}
 
-	impl std::ops::DerefMut for HeapFile<'_> {
+	impl ops::DerefMut for HeapFile<'_> {
 		fn deref_mut(&mut self) -> &mut Self::Target {
 			&mut self.file
 		}
@@ -2461,12 +2466,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::{
 	cmp::Ordering,
 	ffi::{OsStr, OsString},
-	fs::{File, OpenOptions},
+	fs::{self, File, OpenOptions},
 	hash::{Hash, Hasher},
+	io,
 	io::{BufRead, BufReader, BufWriter, Read, Write},
 	num::IntErrorKind,
 	ops::Range,
 	path::{Path, PathBuf},
+	str,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -2504,10 +2511,10 @@ use crate::{
 
 type SortResult<T> = Result<T, SortError>;
 
-fn strip_errno(error: &std::io::Error) -> String {
+fn strip_errno(error: &io::Error) -> String {
 	error
 		.raw_os_error()
-		.map_or_else(|| error.to_string(), |code| std::io::Error::from_raw_os_error(code).to_string())
+		.map_or_else(|| error.to_string(), |code| io::Error::from_raw_os_error(code).to_string())
 }
 
 macro_rules! show_error {
@@ -2557,7 +2564,7 @@ fn materialize_stdin(
 	{
 		let (mut temp, path) = tmp_dir.next_file()?;
 		if let Some(reader) = stdin.take() {
-			std::io::copy(reader, &mut temp)
+			io::copy(reader, &mut temp)
 				.map_err(|error| SortError::ReadFailed { path: PathBuf::from(STDIN_FILE), error })?;
 		}
 		*file = path.into_os_string();
@@ -2629,22 +2636,22 @@ pub enum SortError {
 	Message(String),
 
 	#[error("write failed: {}: {}", .path.maybe_quote(), strip_errno(.error))]
-	WriteFailed { path: OsString, error: std::io::Error },
+	WriteFailed { path: OsString, error: io::Error },
 
 	#[error("{}", format_disorder(.file, .line_number, .line, .silent))]
 	Disorder { file: OsString, line_number: usize, line: String, silent: bool },
 
 	#[error("open failed: {}: {}", .path.maybe_quote(), strip_errno(.error))]
-	OpenFailed { path: PathBuf, error: std::io::Error },
+	OpenFailed { path: PathBuf, error: io::Error },
 
 	#[error("cannot read: {}: {}", .path.maybe_quote(), strip_errno(.error))]
-	ReadFailed { path: PathBuf, error: std::io::Error },
+	ReadFailed { path: PathBuf, error: io::Error },
 
 	#[error("failed to open temporary file: {}", strip_errno(.error))]
-	OpenTmpFileFailed { error: std::io::Error },
+	OpenTmpFileFailed { error: io::Error },
 
 	#[error("could not run compress program '{}': {}", .prog, strip_errno(.error))]
-	CompressProgExecutionFailed { prog: String, error: std::io::Error },
+	CompressProgExecutionFailed { prog: String, error: io::Error },
 
 	#[error("{} terminated abnormally", .prog.quote())]
 	CompressProgTerminatedAbnormally { prog: String },
@@ -3132,7 +3139,7 @@ impl<'a> Line<'a> {
 		if settings.mode == SortMode::Numeric {
 			// exclude inf, nan, scientific notation
 			let line_num_float = (!line.iter().any(u8::is_ascii_alphabetic))
-				.then(|| std::str::from_utf8(line).ok())
+				.then(|| str::from_utf8(line).ok())
 				.flatten()
 				.and_then(|s| s.parse::<f64>().ok());
 			line_data.line_num_floats.push(line_num_float);
@@ -3156,7 +3163,7 @@ impl<'a> Line<'a> {
 		Self { line, index }
 	}
 
-	fn print(&self, writer: &mut impl Write, settings: &GlobalSettings) -> std::io::Result<()> {
+	fn print(&self, writer: &mut impl Write, settings: &GlobalSettings) -> io::Result<()> {
 		if settings.debug {
 			self.write_debug(settings, writer)?;
 		} else {
@@ -3168,11 +3175,7 @@ impl<'a> Line<'a> {
 
 	/// Writes indicators for the selections this line matched. The original line
 	/// content is NOT expected to be already printed.
-	fn write_debug(
-		&self,
-		settings: &GlobalSettings,
-		writer: &mut impl Write,
-	) -> std::io::Result<()> {
+	fn write_debug(&self, settings: &GlobalSettings, writer: &mut impl Write) -> io::Result<()> {
 		// We do not consider this function performance critical, as debug output is
 		// only useful for small files, which are not a performance problem in any
 		// case. Therefore there aren't any special performance optimizations here.
@@ -3824,7 +3827,7 @@ pub(crate) fn current_open_fd_count() -> Option<usize> {
 	use nix::libc;
 
 	fn count_dir(path: &str) -> Option<usize> {
-		let entries = std::fs::read_dir(path).ok()?;
+		let entries = fs::read_dir(path).ok()?;
 		let mut count = 0usize;
 		for entry in entries.flatten() {
 			let name = entry.file_name();
@@ -4479,7 +4482,7 @@ fn uu_sort(
 				.stdin
 				.read_to_end(&mut bytes)
 				.map_err(|error| SortError::ReadFailed { path: PathBuf::from(STDIN_FILE), error })?;
-			Box::new(std::io::Cursor::new(bytes))
+			Box::new(io::Cursor::new(bytes))
 		} else {
 			open_with_open_failed_error(&files0_from)?
 		};
@@ -4487,8 +4490,7 @@ fn uu_sort(
 		for (line_num, line_res) in buf_reader.split(b'\0').enumerate() {
 			let line =
 				line_res.map_err(|error| SortError::ReadFailed { path: files0_from.clone(), error })?;
-			let f =
-				std::str::from_utf8(&line).expect("Could not parse string from zero terminated input.");
+			let f = str::from_utf8(&line).expect("Could not parse string from zero terminated input.");
 			match f {
 				STDIN_FILE => {
 					return Err(SortError::MinusInStdIn.into());
@@ -4574,7 +4576,7 @@ fn uu_sort(
 		{
 			if rayon_global_pool_available() {
 				let num_threads = match settings.threads.parse::<usize>() {
-					Ok(0) | Err(_) => std::thread::available_parallelism().map_or(1, NonZero::get),
+					Ok(0) | Err(_) => thread::available_parallelism().map_or(1, NonZero::get),
 					Ok(n) => n,
 				};
 				let _ = rayon::ThreadPoolBuilder::new()
@@ -5334,7 +5336,7 @@ fn general_bd_parse(a: &[u8], decimal_pt: u8) -> GeneralBigDecimalParseResult {
 	let input = parsed_bytes.as_deref().unwrap_or(a);
 
 	// The string should be valid ASCII to be parsed.
-	let Ok(a) = std::str::from_utf8(input) else {
+	let Ok(a) = str::from_utf8(input) else {
 		return GeneralBigDecimalParseResult::Invalid;
 	};
 
@@ -5711,7 +5713,7 @@ mod tests {
 	fn output_may_also_be_an_input() {
 		let dir = tempfile::tempdir().expect("temp dir");
 		let path = dir.path().join("values");
-		std::fs::write(&path, "beta\nalpha\n").expect("fixture");
+		fs::write(&path, "beta\nalpha\n").expect("fixture");
 		let (code, capture) = run_util::<Sort>(&["-o", "values", "values"], "", dir.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(std::fs::read_to_string(path).expect("output"), "alpha\nbeta\n");

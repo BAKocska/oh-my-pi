@@ -3,6 +3,8 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, hash_map},
+	fmt::{self, Display},
+	iter,
 };
 
 use im::HashMap as ImHashMap;
@@ -36,8 +38,8 @@ pub enum EnvironmentScope {
 	Command,
 }
 
-impl std::fmt::Display for EnvironmentScope {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for EnvironmentScope {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Local => write!(f, "local"),
 			Self::Global => write!(f, "global"),
@@ -51,7 +53,7 @@ impl std::fmt::Display for EnvironmentScope {
 #[must_use]
 pub(crate) struct ScopeGuard<'a, SE: extensions::ShellExtensions> {
 	scope_type: EnvironmentScope,
-	shell:      &'a mut crate::Shell<SE>,
+	shell:      &'a mut Shell<SE>,
 	detached:   bool,
 }
 
@@ -63,13 +65,13 @@ impl<'a, SE: extensions::ShellExtensions> ScopeGuard<'a, SE> {
 	///
 	/// * `shell` - The shell whose environment to modify.
 	/// * `scope_type` - The type of scope to push.
-	pub fn new(shell: &'a mut crate::Shell<SE>, scope_type: EnvironmentScope) -> Self {
+	pub fn new(shell: &'a mut Shell<SE>, scope_type: EnvironmentScope) -> Self {
 		shell.env_mut().push_scope(scope_type);
 		Self { scope_type, shell, detached: false }
 	}
 
 	/// Returns a mutable reference to the shell.
-	pub const fn shell(&mut self) -> &mut crate::Shell<SE> {
+	pub const fn shell(&mut self) -> &mut Shell<SE> {
 		self.shell
 	}
 
@@ -152,7 +154,7 @@ impl ShellEnvironment {
 	/// Returns an iterator over all exported variables defined in the variable.
 	pub fn iter_exported(
 		&self,
-	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + std::iter::FusedIterator + '_
+	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + iter::FusedIterator + '_
 	{
 		// We won't actually need to store all entries, but we expect it should be
 		// within the same order.
@@ -174,7 +176,7 @@ impl ShellEnvironment {
 	/// Returns an iterator over all the variables defined in the environment.
 	pub fn iter(
 		&self,
-	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + std::iter::FusedIterator + '_
+	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + iter::FusedIterator + '_
 	{
 		self.iter_using_policy(EnvironmentLookup::Anywhere)
 	}
@@ -188,7 +190,7 @@ impl ShellEnvironment {
 	pub fn iter_using_policy(
 		&self,
 		lookup_policy: EnvironmentLookup,
-	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + std::iter::FusedIterator + '_
+	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + iter::FusedIterator + '_
 	{
 		// We won't actually need to store all entries, but we expect it should be
 		// within the same order.
@@ -612,7 +614,7 @@ impl ShellVariableMap {
 	/// Returns an iterator over all the variables in the map.
 	pub fn iter(
 		&self,
-	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + std::iter::FusedIterator + '_
+	) -> impl Iterator<Item = (&String, &ShellVariable)> + ExactSizeIterator + iter::FusedIterator + '_
 	{
 		self.variables.iter()
 	}

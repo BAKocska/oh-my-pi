@@ -2,7 +2,9 @@
 
 use std::{
 	collections::BTreeMap,
+	env, fs, io,
 	io::IsTerminal as _,
+	iter,
 	path::{Path, PathBuf},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,18 +12,29 @@ use std::{
 use bytes::Bytes;
 use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{AgentEvent, AgentRunSummary, EventSubscription, PlanState, RunSettlement};
+use omp_catalog::snapshot;
 use omp_core::{Hash32, Str};
-use omp_driver::headless::{HeadlessSession, HeadlessSessionOptions, finalize::FinalizerBudget};
+use omp_driver::{
+	discovery::{native, roles},
+	headless::{
+		HeadlessSession, HeadlessSessionOptions,
+		finalize::{FinalizerBudget, FinalizerReport},
+	},
+};
 use omp_envd::exthost::lifecycle::{HeadlessLifecycleKind, HeadlessLifecycleSubscription};
 use omp_inference::call::{ContentPart, MediaInput};
 use omp_proto::{
-	inference::v1::{self as inference_pb, part_start},
-	thread::v1::{self as thread, Blob, Item, Message, Part, Role, item, part},
+	inference::v1::{part_start, turn_event},
+	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
 };
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use omp_tools::read::dirtree;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Stderr, Stdout, stderr, stdin, stdout};
 
 use crate::{
 	cli::{PrintArgs, turn_id},
+	image_attachment,
+	image_attachment::ImageAttachmentError,
+	spec,
 	usage_error::CliUsageError,
 };
 
@@ -35,7 +48,7 @@ enum PrintTurnError {
 	#[error(transparent)]
 	Session(#[from] omp_sdk::SessionHandleError),
 	#[error(transparent)]
-	Stdout(#[from] std::io::Error),
+	Stdout(#[from] io::Error),
 	#[error(transparent)]
 	Json(#[from] serde_json::Error),
 }
@@ -45,8 +58,8 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let settings =
 		omp_driver::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
-	let catalog = omp_catalog::snapshot::Catalog::try_embedded().map_err(|error| miette!(error))?;
-	let roles = omp_driver::discovery::roles::resolve_launch_roles(
+	let catalog = snapshot::Catalog::try_embedded().map_err(|error| miette!(error))?;
+	let roles = roles::resolve_launch_roles(
 		catalog,
 		args.model.as_deref(),
 		args.smol.as_deref(),
@@ -71,7 +84,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		.map_err(|error| miette!(error))?;
 	}
 	for root in &args.add_dir {
-		std::fs::canonicalize(root).into_diagnostic()?;
+		fs::canonicalize(root).into_diagnostic()?;
 	}
 	let model = roles
 		.primary
@@ -96,9 +109,9 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 			CliUsageError::new("print mode requires a prompt or piped standard input").into(),
 		);
 	}
-	let cwd = std::env::current_dir().into_diagnostic()?;
-	let home = std::env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
-	let system = crate::spec::resolve_prompt_slots(
+	let cwd = env::current_dir().into_diagnostic()?;
+	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
+	let system = spec::resolve_prompt_slots(
 		&cwd,
 		&home,
 		args.prompt_settings.custom_prompt.as_deref(),
@@ -106,7 +119,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	)?
 	.combined();
 	let mut session = HeadlessSession::open(data_dir, HeadlessSessionOptions {
-		project: std::env::current_dir().into_diagnostic()?,
+		project: env::current_dir().into_diagnostic()?,
 		additional_roots: args.add_dir.clone().into_boxed_slice(),
 		model,
 		initial_campaign: args.plan_yolo.then_some("plan"),
@@ -124,7 +137,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	.into_diagnostic()?;
 	let fresh = session.initial_items().is_empty();
 	let startup_plan_ignored = startup_plan_ignored(&settings, fresh, args.plan_yolo);
-	let mut stderr = tokio::io::stderr();
+	let mut stderr = stderr();
 	if startup_plan_ignored {
 		stderr
 			.write_all(
@@ -151,7 +164,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		.take_lifecycle_events()
 		.expect("headless print owns the extension event subscription");
 	let json = args.mode == "json";
-	let mut stdout = tokio::io::stdout();
+	let mut stdout = stdout();
 	if json {
 		write_json(
 			&mut stdout,
@@ -272,8 +285,8 @@ async fn submit_print_turn(
 	part_kinds: &mut BTreeMap<u32, part_start::Kind>,
 	json: bool,
 	shape_transcript: bool,
-	stdout: &mut tokio::io::Stdout,
-	stderr: &mut tokio::io::Stderr,
+	stdout: &mut Stdout,
+	stderr: &mut Stderr,
 ) -> Result<AgentRunSummary, PrintTurnError> {
 	let submit = session.submit(items, omp_agent::TurnId::new(turn_id()));
 	tokio::pin!(submit);
@@ -296,7 +309,7 @@ async fn submit_print_turn(
 	Ok(result?)
 }
 
-async fn emit_lifecycle(kind: &HeadlessLifecycleKind, stderr: &mut tokio::io::Stderr) {
+async fn emit_lifecycle(kind: &HeadlessLifecycleKind, stderr: &mut Stderr) {
 	if let HeadlessLifecycleKind::ExtensionError { extension, error } = kind {
 		let _ = stderr
 			.write_all(
@@ -311,8 +324,8 @@ async fn emit_event(
 	part_kinds: &mut BTreeMap<u32, part_start::Kind>,
 	json: bool,
 	shape_transcript: bool,
-	stdout: &mut tokio::io::Stdout,
-	stderr: &mut tokio::io::Stderr,
+	stdout: &mut Stdout,
+	stderr: &mut Stderr,
 ) -> Result<(), PrintTurnError> {
 	if let AgentEvent::Failed { message, .. } = event {
 		let _ = stderr
@@ -324,13 +337,13 @@ async fn emit_event(
 	}
 	let line = match event {
 		AgentEvent::Turn { turn_id, event } => match event.event.as_ref() {
-			Some(inference_pb::turn_event::Event::PartStart(start)) => {
+			Some(turn_event::Event::PartStart(start)) => {
 				if let Ok(kind) = part_start::Kind::try_from(start.kind) {
 					part_kinds.insert(start.index, kind);
 				}
 				serde_json::json!({"type":"part_start","turn_id":turn_id.as_str(),"index":start.index,"kind":start.kind})
 			},
-			Some(inference_pb::turn_event::Event::PartDelta(delta)) => {
+			Some(turn_event::Event::PartDelta(delta)) => {
 				let kind = part_kinds.get(&delta.index).copied();
 				let text = String::from_utf8_lossy(&delta.chunk);
 				serde_json::json!({
@@ -345,14 +358,14 @@ async fn emit_event(
 					"text":sanitize(&text),
 				})
 			},
-			Some(inference_pb::turn_event::Event::PartEnd(end)) => {
+			Some(turn_event::Event::PartEnd(end)) => {
 				part_kinds.remove(&end.index);
 				serde_json::json!({"type":"part_end","turn_id":turn_id.as_str(),"index":end.index})
 			},
-			Some(inference_pb::turn_event::Event::Outcome(outcome)) if shape_transcript => {
+			Some(turn_event::Event::Outcome(outcome)) if shape_transcript => {
 				serde_json::json!({"type":"outcome","turn_id":turn_id.as_str(),"stop":outcome.stop})
 			},
-			Some(inference_pb::turn_event::Event::Outcome(outcome)) => {
+			Some(turn_event::Event::Outcome(outcome)) => {
 				serde_json::json!({"type":"outcome","turn_id":turn_id.as_str(),"stop":outcome.stop,"model":outcome.model,"provider":outcome.provider})
 			},
 			Some(_) => serde_json::json!({"type":"turn_event","turn_id":turn_id.as_str()}),
@@ -423,10 +436,7 @@ async fn emit_event(
 	Ok(())
 }
 
-async fn emit_warning(
-	summary: &AgentRunSummary,
-	stderr: &mut tokio::io::Stderr,
-) -> miette::Result<()> {
+async fn emit_warning(summary: &AgentRunSummary, stderr: &mut Stderr) -> miette::Result<()> {
 	if summary.settlement != RunSettlement::Warning {
 		return Ok(());
 	}
@@ -454,10 +464,7 @@ async fn emit_warning(
 	Ok(())
 }
 
-async fn emit_finalizer_report(
-	report: omp_driver::headless::finalize::FinalizerReport,
-	stderr: &mut tokio::io::Stderr,
-) -> miette::Result<()> {
+async fn emit_finalizer_report(report: FinalizerReport, stderr: &mut Stderr) -> miette::Result<()> {
 	for phase in &report.timed_out {
 		stderr
 			.write_all(format!("Finalizer timed out: {}\n", <&str>::from(*phase)).as_bytes())
@@ -481,17 +488,17 @@ fn initial_message(parts: Vec<ContentPart>, system: Option<Str>) -> Vec<Item> {
 	for part in parts {
 		match part {
 			ContentPart::Text { text, .. } => {
-				canonical.push(Part { kind: Some(thread::part::Kind::Text(text.to_string())) })
+				canonical.push(Part { kind: Some(part::Kind::Text(text.to_string())) })
 			},
 			ContentPart::Image(media) | ContentPart::Document(media) => {
 				if let MediaInput::Bytes { media_type, data } = media {
 					canonical.push(Part {
-						kind: Some(thread::part::Kind::Blob(Blob {
+						kind: Some(part::Kind::Blob(Blob {
 							hash:   Bytes::copy_from_slice(Hash32::sum(&data).as_bytes()),
 							mime:   media_type.to_string(),
 							size:   data.len() as u64,
 							inline: data,
-							detail: thread::blob::Detail::Auto as i32,
+							detail: blob::Detail::Auto as i32,
 						})),
 					});
 				}
@@ -550,8 +557,8 @@ async fn initial_parts(
 			append_text(&mut text, word);
 		}
 	}
-	if text.is_empty() && !std::io::stdin().is_terminal() {
-		let mut stdin = tokio::io::stdin();
+	if text.is_empty() && !io::stdin().is_terminal() {
+		let mut stdin = stdin();
 		stdin.read_to_string(&mut text).await.into_diagnostic()?;
 	}
 	if !text.is_empty() {
@@ -578,11 +585,11 @@ fn read_reference(
 	consumed: &mut usize,
 	auto_resize_images: bool,
 ) -> miette::Result<Attachment> {
-	let metadata = std::fs::metadata(path).into_diagnostic()?;
+	let metadata = fs::metadata(path).into_diagnostic()?;
 	if metadata.is_dir() {
 		return read_directory_reference(path);
 	}
-	let bytes = std::fs::read(path).into_diagnostic()?;
+	let bytes = fs::read(path).into_diagnostic()?;
 	*consumed = consumed
 		.checked_add(bytes.len())
 		.ok_or_else(|| miette!("attachment budget overflow"))?;
@@ -599,12 +606,12 @@ fn read_reference(
 				data:       Bytes::from(bytes),
 			});
 		}
-		return match crate::image_attachment::prepare(Bytes::from(bytes), true) {
+		return match image_attachment::prepare(Bytes::from(bytes), true) {
 			Ok(image) => Ok(Attachment::Image {
 				media_type: Str::new_static(image.media_type),
 				data:       image.bytes,
 			}),
-			Err(crate::image_attachment::ImageAttachmentError::Unsupported) => {
+			Err(ImageAttachmentError::Unsupported) => {
 				Ok(skip_notice(path, "unrecognized image encoding", metadata.len() as usize))
 			},
 			Err(_) => Ok(skip_notice(path, "too large", metadata.len() as usize)),
@@ -639,7 +646,7 @@ fn read_reference(
 
 fn read_directory_reference(path: &Path) -> miette::Result<Attachment> {
 	let mut entries = Vec::new();
-	for entry in std::fs::read_dir(path).into_diagnostic()? {
+	for entry in fs::read_dir(path).into_diagnostic()? {
 		let entry = entry.into_diagnostic()?;
 		let metadata = match entry.metadata() {
 			Ok(metadata) => metadata,
@@ -651,7 +658,7 @@ fn read_directory_reference(path: &Path) -> miette::Result<Attachment> {
 			.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
 			.and_then(|duration| u64::try_from(duration.as_millis()).ok())
 			.unwrap_or(0);
-		entries.push(omp_tools::read::dirtree::DirEntry {
+		entries.push(dirtree::DirEntry {
 			relative_path: entry.file_name().to_string_lossy().into_owned().into(),
 			is_dir: metadata.is_dir(),
 			size: metadata.len(),
@@ -663,8 +670,7 @@ fn read_directory_reference(path: &Path) -> miette::Result<Attachment> {
 		.ok()
 		.and_then(|duration| u64::try_from(duration.as_millis()).ok())
 		.unwrap_or(0);
-	let listing =
-		omp_tools::read::dirtree::render_directory_mention(&entries, now_ms, DIRECTORY_MENTION_LIMIT);
+	let listing = dirtree::render_directory_mention(&entries, now_ms, DIRECTORY_MENTION_LIMIT);
 	Ok(Attachment::Text(format!("<directory name=\"{}\">\n{listing}\n</directory>", path.display())))
 }
 
@@ -717,21 +723,21 @@ fn document_media_type(path: &Path, bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn discover_system_prompt() -> miette::Result<Option<Str>> {
-	let cwd = std::env::current_dir().into_diagnostic()?;
-	let home = std::env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
+	let cwd = env::current_dir().into_diagnostic()?;
+	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
 	discover_system_prompt_from(&cwd, &home)
 }
 
 fn discover_system_prompt_from(cwd: &Path, home: &Path) -> miette::Result<Option<Str>> {
-	let roots = omp_driver::discovery::native::discover_roots(cwd, home, 32);
+	let roots = native::discover_roots(cwd, home, 32);
 	let candidates = roots
 		.project
 		.iter()
 		.map(|root| root.join("SYSTEM.md"))
-		.chain(std::iter::once(roots.user.join("SYSTEM.md")));
+		.chain(iter::once(roots.user.join("SYSTEM.md")));
 	for path in candidates {
 		if path.is_file() {
-			return std::fs::read_to_string(path)
+			return fs::read_to_string(path)
 				.map(Str::from)
 				.into_diagnostic()
 				.map(Some);
@@ -740,7 +746,7 @@ fn discover_system_prompt_from(cwd: &Path, home: &Path) -> miette::Result<Option
 	Ok(None)
 }
 
-async fn write_json(stdout: &mut tokio::io::Stdout, line: &str) -> miette::Result<()> {
+async fn write_json(stdout: &mut Stdout, line: &str) -> miette::Result<()> {
 	stdout.write_all(line.as_bytes()).await.into_diagnostic()?;
 	stdout.flush().await.into_diagnostic()
 }
@@ -754,12 +760,14 @@ fn json_string(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
 	use omp_core::sf;
+	use omp_driver::settings::Settings;
 
 	use super::*;
 	#[test]
 	fn print_suppresses_only_fresh_startup_plan_without_yolo() {
-		let mut settings = omp_driver::settings::Settings::default();
+		let mut settings = Settings::default();
 		settings.plan.enabled = true;
 		settings.plan.default_on_startup = true;
 		assert!(startup_plan_ignored(&settings, true, false));
@@ -778,20 +786,20 @@ mod tests {
 	}
 	#[test]
 	fn attachment_budget_returns_an_explicit_skip_notice() {
-		let file = std::env::temp_dir().join("omp-print-large-reference.txt");
-		std::fs::write(&file, vec![b'x'; MAX_AUTO_READ_TEXT_BYTES + 1]).expect("write");
+		let file = env::temp_dir().join("omp-print-large-reference.txt");
+		fs::write(&file, vec![b'x'; MAX_AUTO_READ_TEXT_BYTES + 1]).expect("write");
 		let Attachment::Text(notice) = read_reference(&file, &mut 0, true).expect("notice") else {
 			panic!("text notice");
 		};
 		assert!(notice.contains("skipped auto-read: too large"));
-		let _ = std::fs::remove_file(file);
+		let _ = fs::remove_file(file);
 	}
 
 	#[test]
 	fn text_binary_and_directory_mentions_are_classified_explicitly() {
 		let tree = tempfile::tempdir().unwrap();
 		let text = tree.path().join("main.rs");
-		std::fs::write(&text, "fn main() {}\n").unwrap();
+		fs::write(&text, "fn main() {}\n").unwrap();
 		let Attachment::Text(rendered) = read_reference(&text, &mut 0, true).unwrap() else {
 			panic!("text");
 		};
@@ -800,7 +808,7 @@ mod tests {
 		assert!(rendered.contains("1:fn main() {}"));
 
 		let binary = tree.path().join("blob.bin");
-		std::fs::write(&binary, b"a\0b").unwrap();
+		fs::write(&binary, b"a\0b").unwrap();
 		let Attachment::Text(notice) = read_reference(&binary, &mut 0, true).unwrap() else {
 			panic!("binary notice");
 		};
@@ -817,8 +825,8 @@ mod tests {
 	fn discovers_nearest_project_system_prompt() {
 		let tree = tempfile::tempdir().expect("tree");
 		let cwd = tree.path().join("nested");
-		std::fs::create_dir_all(cwd.join(".omp")).expect("config");
-		std::fs::write(cwd.join(".omp/SYSTEM.md"), "project instructions").expect("system");
+		fs::create_dir_all(cwd.join(".omp")).expect("config");
+		fs::write(cwd.join(".omp/SYSTEM.md"), "project instructions").expect("system");
 		assert_eq!(
 			discover_system_prompt_from(&cwd, tree.path()).expect("discover"),
 			Some(sf!("project instructions"))

@@ -1,7 +1,6 @@
 //! Line terminators shared by builtins with zero-terminated output modes.
 
-use std::fmt;
-
+use std::{fmt, fmt::Display};
 /// A newline or NUL record terminator.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,7 +31,7 @@ impl From<LineEnding> for u8 {
 	}
 }
 
-impl fmt::Display for LineEnding {
+impl Display for LineEnding {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(match self {
 			Self::Newline => "\n",

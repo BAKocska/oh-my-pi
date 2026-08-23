@@ -2,6 +2,7 @@
 
 use std::{borrow::Cow, cell::RefCell};
 
+use fancy_regex::RegexBuilder;
 use omp_core::cache::MemoCache;
 
 use crate::error;
@@ -117,7 +118,7 @@ pub(crate) fn compile_regex(
 		regex_str = updated_str.into();
 	}
 
-	let mut builder = fancy_regex::RegexBuilder::new(regex_str.as_ref());
+	let mut builder = RegexBuilder::new(regex_str.as_ref());
 	builder.case_insensitive(case_insensitive);
 
 	let re = match builder.build() {

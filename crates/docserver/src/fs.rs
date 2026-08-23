@@ -12,12 +12,17 @@ use std::{
 };
 
 use bytes::Bytes;
-use cap_std::fs::{Dir, Metadata, OpenOptions};
+use cap_std::{
+	fs,
+	fs::{Dir, Metadata, OpenOptions},
+};
 #[cfg(test)]
 use omp_core::Hash32;
 use omp_core::{Str, sf};
 #[cfg(test)]
 use parking_lot::Mutex;
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+use rustix::fs::RenameFlags;
 use xutf::IntoAnsiStripped as _;
 
 use crate::{Error, FileFingerprint, FileMetadata, Result, ServerConfig};
@@ -994,7 +999,10 @@ impl LocalFs {
 			)
 		};
 		mutation.map_err(|source| {
-			if matches!(source.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound) {
+			if matches!(
+				source.kind(),
+				std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+			) {
 				Self::stale_entry(&prepared.destination)
 			} else {
 				Self::persistence_error(&prepared.source.path, source)
@@ -1627,7 +1635,7 @@ impl LocalFs {
 						Error::Io { source, .. }
 							if matches!(
 								source.kind(),
-								io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+								std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
 							) =>
 						{
 							Error::InvalidTarget {
@@ -1840,7 +1848,7 @@ impl LocalFs {
 		})
 	}
 
-	fn stable_read_open_file(&self, file: &cap_std::fs::File, path: &Path) -> Result<DiskState> {
+	fn stable_read_open_file(&self, file: &fs::File, path: &Path) -> Result<DiskState> {
 		for _ in 0..STABLE_READ_ATTEMPTS {
 			let before = file
 				.metadata()
@@ -1885,7 +1893,7 @@ impl LocalFs {
 	fn entry_matches_open_file(
 		parent: &Dir,
 		name: &OsStr,
-		file: &cap_std::fs::File,
+		file: &fs::File,
 		path: &Path,
 	) -> Result<bool> {
 		let expected = Self::file_identity(file)
@@ -2254,7 +2262,10 @@ impl LocalFs {
 			Ok(current_relative) => current_relative,
 			Err(Error::InvalidTarget { .. }) => return Ok(false),
 			Err(Error::Io { source, .. })
-				if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) =>
+				if matches!(
+					source.kind(),
+					std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+				) =>
 			{
 				return Ok(false);
 			},
@@ -2291,7 +2302,7 @@ impl LocalFs {
 	}
 
 	#[cfg(unix)]
-	fn file_identity(file: &cap_std::fs::File) -> io::Result<FileIdentity> {
+	fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
 		use cap_std::fs::MetadataExt;
 
 		let metadata = file.metadata()?;
@@ -2299,7 +2310,7 @@ impl LocalFs {
 	}
 
 	#[cfg(windows)]
-	fn file_identity(file: &cap_std::fs::File) -> io::Result<FileIdentity> {
+	fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
 		use std::os::windows::fs::MetadataExt;
 
 		let metadata = file.try_clone()?.into_std().metadata()?;
@@ -2310,7 +2321,7 @@ impl LocalFs {
 	}
 
 	#[cfg(not(any(unix, windows)))]
-	fn file_identity(_: &cap_std::fs::File) -> io::Result<FileIdentity> {
+	fn file_identity(_: &fs::File) -> io::Result<FileIdentity> {
 		Err(io::Error::new(
 			io::ErrorKind::Unsupported,
 			"file identity is unavailable on this platform",
@@ -2404,7 +2415,7 @@ impl LocalFs {
 			source,
 			destination_parent,
 			destination,
-			rustix::fs::RenameFlags::NOREPLACE,
+			RenameFlags::NOREPLACE,
 		)
 		.map_err(io::Error::from)
 	}
@@ -2429,7 +2440,7 @@ impl LocalFs {
 			source,
 			destination_parent,
 			destination,
-			rustix::fs::RenameFlags::EXCHANGE,
+			RenameFlags::EXCHANGE,
 		)
 		.map_err(io::Error::from)
 	}
@@ -2452,11 +2463,7 @@ impl LocalFs {
 		Ok(())
 	}
 
-	fn create_temporary(
-		&self,
-		parent: &Dir,
-		destination: &OsStr,
-	) -> Result<(OsString, cap_std::fs::File)> {
+	fn create_temporary(&self, parent: &Dir, destination: &OsStr) -> Result<(OsString, fs::File)> {
 		for _ in 0..TEMP_CREATE_ATTEMPTS {
 			let name = self.next_temporary_name(destination);
 			let mut options = OpenOptions::new();
@@ -2746,7 +2753,7 @@ impl LocalFs {
 			Err(source)
 				if matches!(
 					source.kind(),
-					io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+					std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
 				) =>
 			{
 				Ok(())
@@ -2801,18 +2808,18 @@ impl LocalFs {
 	}
 
 	#[cfg(unix)]
-	fn owner_executable(permissions: &cap_std::fs::Permissions) -> bool {
+	fn owner_executable(permissions: &fs::Permissions) -> bool {
 		use cap_std::fs::PermissionsExt;
 		permissions.mode() & 0o100 != 0
 	}
 
 	#[cfg(not(unix))]
-	fn owner_executable(_: &cap_std::fs::Permissions) -> Option<bool> {
+	fn owner_executable(_: &fs::Permissions) -> Option<bool> {
 		None
 	}
 
 	#[cfg(unix)]
-	fn set_executable(permissions: &mut cap_std::fs::Permissions, executable: Option<bool>) {
+	fn set_executable(permissions: &mut fs::Permissions, executable: Option<bool>) {
 		use cap_std::fs::PermissionsExt;
 		if let Some(executable) = executable {
 			let mut mode = permissions.mode();
@@ -2826,7 +2833,7 @@ impl LocalFs {
 	}
 
 	#[cfg(not(unix))]
-	fn set_executable(_: &mut cap_std::fs::Permissions, executable: Option<bool>) -> io::Result<()> {
+	fn set_executable(_: &mut fs::Permissions, executable: Option<bool>) -> io::Result<()> {
 		if executable.is_some() {
 			Err(io::Error::new(
 				io::ErrorKind::Unsupported,
@@ -2895,6 +2902,7 @@ impl LocalFs {
 mod tests {
 	use std::{fs, num::NonZeroU64};
 
+	use self::filesystem as create_filesystem;
 	use super::*;
 
 	fn filesystem() -> (tempfile::TempDir, LocalFs) {
@@ -2913,7 +2921,7 @@ mod tests {
 
 	#[test]
 	fn stable_read_preserves_exact_bytes_and_missing_state() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let bytes = b"a\0\xff\r\n";
 		fs::write(filesystem.root_path().join("exact.bin"), bytes).expect("write fixture");
 		let DiskState::Present { content, fingerprint } = filesystem
@@ -2957,7 +2965,7 @@ mod tests {
 
 	#[test]
 	fn prepared_replacement_is_deferred_and_preserves_permissions() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let path = filesystem.root_path().join("document");
 		fs::write(&path, b"old").expect("write fixture");
 		let original = filesystem.stable_read(&path).expect("initial read");
@@ -2986,7 +2994,7 @@ mod tests {
 
 	#[test]
 	fn dropping_prepared_write_removes_only_its_temporary() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let destination = filesystem.root_path().join("new-document");
 		let prepared = filesystem
 			.prepare_write(&destination, Bytes::from_static(b"candidate"), DiskExpectation::Missing)
@@ -3000,7 +3008,7 @@ mod tests {
 
 	#[test]
 	fn stale_fingerprint_rejects_prepared_replacement() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let path = filesystem.root_path().join("document");
 		fs::write(&path, b"base").expect("write fixture");
 		let expected = match filesystem.stable_read(&path).expect("initial read") {
@@ -3017,7 +3025,7 @@ mod tests {
 
 	#[test]
 	fn prepared_commit_rejects_a_replaced_parent_even_when_fingerprint_matches() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let parent = filesystem.root_path().join("parent");
 		let moved_parent = filesystem.root_path().join("moved-parent");
 		fs::create_dir(&parent).expect("parent fixture");
@@ -3051,7 +3059,7 @@ mod tests {
 
 	#[test]
 	fn prepared_move_rejects_a_stale_source_without_touching_either_entry() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("source");
 		let destination = filesystem.root_path().join("destination");
 		fs::write(&source, b"base").expect("source fixture");
@@ -3074,7 +3082,7 @@ mod tests {
 
 	#[test]
 	fn prepared_move_rejects_a_stale_destination_without_touching_either_entry() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("source");
 		let destination = filesystem.root_path().join("destination");
 		fs::write(&source, b"source").expect("source fixture");
@@ -3098,7 +3106,7 @@ mod tests {
 
 	#[test]
 	fn prepared_move_with_content_rejects_a_raced_destination_without_partial_state() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("source");
 		let destination = filesystem.root_path().join("destination");
 		fs::write(&source, b"source").expect("source fixture");
@@ -3122,7 +3130,7 @@ mod tests {
 
 	#[test]
 	fn prepared_delete_rejects_a_replaced_parent_without_touching_either_entry() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let parent = filesystem.root_path().join("parent");
 		let moved_parent = filesystem.root_path().join("moved-parent");
 		fs::create_dir(&parent).expect("parent fixture");
@@ -3144,7 +3152,7 @@ mod tests {
 
 	#[test]
 	fn prepared_move_overwrites_only_an_exact_present_destination() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("source");
 		let destination = filesystem.root_path().join("destination");
 		fs::write(&source, b"moved").expect("source fixture");
@@ -3167,7 +3175,7 @@ mod tests {
 
 	#[test]
 	fn prepared_move_moves_between_names_in_one_parent() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("before");
 		let destination = filesystem.root_path().join("after");
 		fs::write(&source, b"payload").expect("source fixture");
@@ -3189,7 +3197,7 @@ mod tests {
 
 	#[test]
 	fn prepared_move_moves_between_captured_parent_handles() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source_parent = filesystem.root_path().join("source-parent");
 		let destination_parent = filesystem.root_path().join("destination-parent");
 		fs::create_dir(&source_parent).expect("source parent");
@@ -3215,7 +3223,7 @@ mod tests {
 
 	#[test]
 	fn prepared_delete_removes_and_observes_the_captured_entry() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let path = filesystem.root_path().join("document");
 		fs::write(&path, b"payload").expect("document fixture");
 		let prepared = filesystem
@@ -3232,7 +3240,7 @@ mod tests {
 
 	#[test]
 	fn prepared_operations_cannot_be_committed_by_another_local_filesystem() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let config = ServerConfig::new(filesystem.root_path()).expect("second server config");
 		let other = LocalFs::new(&config).expect("second local filesystem");
 		let path = filesystem.root_path().join("document");
@@ -3249,7 +3257,7 @@ mod tests {
 	fn symbolic_link_escape_is_confined() {
 		use std::os::unix::fs::symlink;
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let outside = tempfile::tempdir().expect("outside root");
 		fs::write(outside.path().join("secret"), b"secret").expect("outside fixture");
 		symlink(outside.path().join("secret"), filesystem.root_path().join("escape"))
@@ -3268,7 +3276,7 @@ mod tests {
 
 	#[test]
 	fn representative_path_operations_obey_entry_semantics() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let directory = filesystem.root_path().join("tree");
 		filesystem
 			.create_directory(&directory, false, ExistingDirectoryPolicy::FailIfExists)
@@ -3323,7 +3331,7 @@ mod tests {
 	fn relative_symlink_round_trips_and_partial_permissions_preserve_omissions() {
 		use std::os::unix::fs::PermissionsExt;
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let target = filesystem.root_path().join("target");
 		fs::write(&target, b"target").expect("target fixture");
 		fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).expect("fixture mode");
@@ -3370,7 +3378,7 @@ mod tests {
 	#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 	#[test]
 	fn prepared_write_is_atomic_across_pre_and_post_syscall_replacement() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let path = filesystem.root_path().join("write-before");
 		fs::write(&path, b"old").expect("old fixture");
 		let prepared = filesystem
@@ -3390,7 +3398,7 @@ mod tests {
 		assert!(matches!(filesystem.commit_prepared(prepared), Err(Error::StaleDiskState { .. })));
 		assert_eq!(fs::read(&path).expect("external destination"), b"external");
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let path = filesystem.root_path().join("write-after");
 		fs::write(&path, b"old").expect("old fixture");
 		let prepared = filesystem
@@ -3417,7 +3425,7 @@ mod tests {
 	#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 	#[test]
 	fn missing_create_is_atomic_and_returns_prepared_metadata() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("copy-source");
 		let destination = filesystem.root_path().join("copy-before");
 		fs::write(&source, b"action").expect("source fixture");
@@ -3438,7 +3446,7 @@ mod tests {
 		);
 		assert_eq!(fs::read(&destination).expect("external destination"), b"external");
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("copy-source");
 		let destination = filesystem.root_path().join("copy-after");
 		let moved = filesystem.root_path().join("copy-installed");
@@ -3462,7 +3470,7 @@ mod tests {
 	fn privileged_write_refuses_final_symlink() {
 		use std::os::unix::fs::symlink;
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let target = filesystem.root_path().join("target.txt");
 		let link = filesystem.root_path().join("link.txt");
 		fs::write(&target, b"keep").expect("target");
@@ -3488,7 +3496,7 @@ mod tests {
 	fn privileged_no_follow_removal_unlinks_symlink_not_target() {
 		use std::os::unix::fs::symlink;
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let target = filesystem.root_path().join("target.txt");
 		let link = filesystem.root_path().join("link.txt");
 		fs::write(&target, b"keep").expect("target");
@@ -3505,7 +3513,7 @@ mod tests {
 
 	#[test]
 	fn prepared_delete_preserves_replacements_on_both_sides_of_rename() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let path = filesystem.root_path().join("delete-before");
 		let old = filesystem.root_path().join("delete-old");
 		fs::write(&path, b"old").expect("old fixture");
@@ -3524,7 +3532,7 @@ mod tests {
 		));
 		assert_eq!(fs::read(&path).expect("restored external entry"), b"external");
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let path = filesystem.root_path().join("delete-after");
 		fs::write(&path, b"old").expect("old fixture");
 		let prepared = filesystem
@@ -3547,7 +3555,7 @@ mod tests {
 	#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 	#[test]
 	fn prepared_move_never_overwrites_a_racing_destination_or_rereads_success() {
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("move-before-source");
 		let destination = filesystem.root_path().join("move-before-destination");
 		fs::write(&source, b"action").expect("source fixture");
@@ -3571,7 +3579,7 @@ mod tests {
 		assert_eq!(fs::read(&destination).expect("external destination"), b"external");
 		assert_eq!(fs::read(&source).expect("unmoved source"), b"action");
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let source = filesystem.root_path().join("move-after-source");
 		let destination = filesystem.root_path().join("move-after-destination");
 		let moved = filesystem.root_path().join("move-installed");
@@ -3602,7 +3610,7 @@ mod tests {
 	fn conditional_permissions_never_chmod_a_replacement_inode() {
 		use std::os::unix::fs::PermissionsExt;
 
-		let (_root, filesystem) = self::filesystem();
+		let (_root, filesystem) = create_filesystem();
 		let path = filesystem.root_path().join("permissions");
 		let old = filesystem.root_path().join("permissions-old");
 		fs::write(&path, b"old").expect("old fixture");

@@ -1,4 +1,5 @@
 use std::{
+	fs, io,
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
@@ -175,9 +176,9 @@ fn create_binding(
 		return Err(error);
 	}
 
-	let target_exists = match std::fs::symlink_metadata(&target) {
+	let target_exists = match fs::symlink_metadata(&target) {
 		Ok(_) => true,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => false,
 		Err(error) => {
 			let callback_guard = gate.lock();
 			active.store(false, Ordering::SeqCst);
@@ -219,7 +220,7 @@ fn canonical_parent_and_target(path: &Path) -> notify::Result<(PathBuf, PathBuf)
 		.parent()
 		.filter(|parent| !parent.as_os_str().is_empty())
 		.unwrap_or_else(|| Path::new("."));
-	let parent = std::fs::canonicalize(parent).map_err(notify::Error::io_watch)?;
+	let parent = fs::canonicalize(parent).map_err(notify::Error::io_watch)?;
 	let target = parent.join(file_name);
 	Ok((parent, target))
 }
@@ -227,7 +228,7 @@ fn canonical_parent_and_target(path: &Path) -> notify::Result<(PathBuf, PathBuf)
 fn watch_path_missing(error: &notify::Error) -> bool {
 	match &error.kind {
 		notify::ErrorKind::PathNotFound => true,
-		notify::ErrorKind::Io(source) => source.kind() == std::io::ErrorKind::NotFound,
+		notify::ErrorKind::Io(source) => source.kind() == io::ErrorKind::NotFound,
 		_ => false,
 	}
 }
@@ -283,6 +284,8 @@ fn classify_rename(target: &Path, mode: RenameMode, paths: &[PathBuf]) -> Option
 
 #[cfg(test)]
 mod tests {
+	use std::{sync::mpsc, time};
+
 	use notify::event::{AccessKind, CreateKind, DataChange, Flag, RemoveKind};
 
 	use super::*;
@@ -359,15 +362,15 @@ mod tests {
 	fn missing_target_watch_observes_later_creation() {
 		let root = tempfile::tempdir().expect("temporary directory");
 		let target = root.path().join("created.txt");
-		let (sender, receiver) = std::sync::mpsc::channel();
+		let (sender, receiver) = mpsc::channel();
 		let watch = ActiveFileWatch::new(&target, 17, move |event| {
 			let _ = sender.send(event);
 		})
 		.expect("missing target watch");
 
-		std::fs::write(&target, b"created").expect("create watched target");
+		fs::write(&target, b"created").expect("create watched target");
 		let event = receiver
-			.recv_timeout(std::time::Duration::from_secs(5))
+			.recv_timeout(time::Duration::from_secs(5))
 			.expect("creation event");
 		assert_eq!(event, FileWatchEvent { generation: 17, kind: FileWatchKind::Changed });
 		drop(watch);
@@ -376,8 +379,8 @@ mod tests {
 	#[test]
 	fn recognizes_both_missing_path_error_forms() {
 		let explicit = notify::Error::path_not_found();
-		let backend = notify::Error::io(std::io::Error::from(std::io::ErrorKind::NotFound));
-		let denied = notify::Error::io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+		let backend = notify::Error::io(io::Error::from(io::ErrorKind::NotFound));
+		let denied = notify::Error::io(io::Error::from(io::ErrorKind::PermissionDenied));
 
 		assert!(watch_path_missing(&explicit));
 		assert!(watch_path_missing(&backend));

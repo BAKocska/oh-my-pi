@@ -1,6 +1,16 @@
 //! In-process sherpa-onnx Parakeet offline transcription.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+#[cfg(any(
+	all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+	all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
+	all(target_os = "windows", target_arch = "x86_64")
+))]
+use std::path::Path;
+use std::{
+	path::PathBuf,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use omp_core::Str;
 #[cfg(any(
@@ -19,10 +29,11 @@ use super::runtime::LocalRuntime;
 use super::{
 	artifact::ArtifactStore,
 	runtime::{
-		AvailabilityEvidence, LocalCancellation, LocalError, LocalErrorKind, LocalResult, MemoryPool,
+		AvailabilityEvidence, LocalCancellation, LocalError, LocalErrorKind, LocalExecutionReceipt,
+		LocalResult, MemoryPool,
 	},
 	speech_catalog::{SpeechArtifactManifests, SttPreset},
-	stt::{Transcription, TranscriptionOptions},
+	stt::{STT_INFERENCE_LOCK as STT_STT_INFERENCE_LOCK, Transcription, TranscriptionOptions},
 };
 
 /// Verified files and lifecycle controls for Parakeet TDT.
@@ -199,7 +210,7 @@ impl SherpaAdapter {
 			all(target_os = "windows", target_arch = "x86_64")
 		))]
 		{
-			let _serialized = super::stt::STT_INFERENCE_LOCK.lock();
+			let _serialized = STT_STT_INFERENCE_LOCK.lock();
 			let lease = self.runtime.acquire(cancel)?;
 			let receipt = lease.receipt();
 			let text = lease.with_engine(|engine| {
@@ -236,10 +247,7 @@ impl SherpaAdapter {
 	}
 
 	/// Loads and validates Parakeet ahead of first capture.
-	pub fn prewarm(
-		&self,
-		cancel: &LocalCancellation,
-	) -> LocalResult<super::runtime::LocalExecutionReceipt> {
+	pub fn prewarm(&self, cancel: &LocalCancellation) -> LocalResult<LocalExecutionReceipt> {
 		#[cfg(any(
 			all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
 			all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
@@ -260,7 +268,7 @@ impl SherpaAdapter {
 	}
 
 	/// Unloads Parakeet after its configured idle interval.
-	pub fn unload_if_idle(&self, now: std::time::Instant) -> bool {
+	pub fn unload_if_idle(&self, now: Instant) -> bool {
 		#[cfg(any(
 			all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
 			all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
@@ -300,7 +308,7 @@ fn required_path(paths: &[PathBuf], filename: &str) -> LocalResult<PathBuf> {
 	all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
 	all(target_os = "windows", target_arch = "x86_64")
 ))]
-fn path_string(path: &std::path::Path) -> LocalResult<String> {
+fn path_string(path: &Path) -> LocalResult<String> {
 	path.to_str().map(str::to_owned).ok_or_else(|| {
 		LocalError::new(LocalErrorKind::Artifact, "Parakeet artifact path is not UTF-8")
 	})

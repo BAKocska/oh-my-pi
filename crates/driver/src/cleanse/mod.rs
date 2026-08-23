@@ -6,7 +6,11 @@ pub mod parsers;
 pub mod production;
 pub mod types;
 
-use std::{error::Error as StdError, future::Future, path::PathBuf};
+use std::{
+	error::Error as StdError,
+	future::Future,
+	path::{Path, PathBuf},
+};
 
 use balance::{group_by_file, pack};
 pub use checkers::{
@@ -31,7 +35,7 @@ pub struct RepairOutcome {
 /// Production seams for picker, model discovery, repair children, and journal.
 pub trait CleanseHost: BinaryResolver + CheckerRunner {
 	/// Returns the canonical project root.
-	fn project_root(&self) -> &std::path::Path;
+	fn project_root(&self) -> &Path;
 	/// Returns the bounded project file snapshot used for discovery.
 	fn project_files(&self) -> &[PathBuf];
 	/// Runs the one-shot interactive picker.

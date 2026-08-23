@@ -1,6 +1,9 @@
 use std::{
 	borrow::Cow,
 	collections::{BTreeMap, HashSet},
+	error,
+	fmt::{self, Display},
+	iter, mem,
 	sync::Arc,
 };
 
@@ -10,7 +13,7 @@ use omp_proto::{
 	inference::v1::TaskBudget,
 	thread::v1::{Item, Message, Part, Role, item, part},
 };
-use omp_storage::index::SessionIndex;
+use omp_storage::index::{self, SessionIndex};
 use omp_tui::{Command, Icon};
 use parking_lot::RwLock;
 use smallvec::SmallVec;
@@ -376,7 +379,7 @@ pub struct CommandUsage {
 
 impl CommandUsage {
 	/// Loads persisted counts from `index` for synchronous completion ranking.
-	pub fn load(index: Arc<SessionIndex>) -> Result<Self, omp_storage::index::Error> {
+	pub fn load(index: Arc<SessionIndex>) -> Result<Self, index::Error> {
 		let counts = index.command_usage()?;
 		Ok(Self { index, counts: RwLock::new(counts) })
 	}
@@ -387,7 +390,7 @@ impl CommandUsage {
 	}
 
 	/// Persists one invocation and updates the process-local ranking snapshot.
-	pub fn record(&self, name: &str, now_ms: u64) -> Result<(), omp_storage::index::Error> {
+	pub fn record(&self, name: &str, now_ms: u64) -> Result<(), index::Error> {
 		self.index.record_command_usage(name, now_ms)?;
 		let mut counts = self.counts.write();
 		let count = counts.entry(Str::new(name)).or_default();
@@ -492,7 +495,7 @@ fn builtin_available() -> Vec<AvailableCommand> {
 fn reserved_names() -> HashSet<Str> {
 	COMMANDS
 		.iter()
-		.flat_map(|spec| std::iter::once(spec.name).chain(spec.aliases.iter().copied()))
+		.flat_map(|spec| iter::once(spec.name).chain(spec.aliases.iter().copied()))
 		.map(Str::new)
 		.collect()
 }
@@ -688,8 +691,8 @@ pub enum InputError {
 	InvalidBudget,
 }
 
-impl std::fmt::Display for InputError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for InputError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::UnterminatedQuote => f.write_str("unterminated quoted command argument"),
 			Self::MissingArgument { command } => write!(f, "/{command} requires an argument"),
@@ -699,7 +702,7 @@ impl std::fmt::Display for InputError {
 		}
 	}
 }
-impl std::error::Error for InputError {}
+impl error::Error for InputError {}
 
 /// Parses composer text against the same aggregated roster used for completion.
 /// Unknown slash names intentionally pass through as normal prompt text.
@@ -880,7 +883,7 @@ pub fn tokenize_args(raw: &str) -> Result<Vec<Str>, InputError> {
 			quote = Some(ch);
 		} else if ch.is_whitespace() {
 			if !current.is_empty() {
-				args.push(Str::from(std::mem::take(&mut current)));
+				args.push(Str::from(mem::take(&mut current)));
 			}
 		} else {
 			current.push(ch);

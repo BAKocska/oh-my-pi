@@ -2,13 +2,13 @@
 
 pub mod finalize;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{error, path::PathBuf, sync::Arc};
 
 use omp_agent::{
 	Agent, AgentEvent, AgentKind, AgentRunSummary, AgentState, AgentStatus, AgentTree, ApprovalBook,
 	ApprovalInbox, ApprovalRoute, Budget, EventSubscription, InProcTurnClient, TurnId,
 };
-use omp_catalog::{ModelKey, ProviderId};
+use omp_catalog::{ModelKey, ProviderId, snapshot};
 use omp_core::{SecretString, Str, sf};
 use omp_inference::Registry as InferenceRegistry;
 use omp_proto::thread::v1::Item;
@@ -24,7 +24,7 @@ use self::finalize::{FinalizerBudget, FinalizerReport, HeadlessFinalizerHandle};
 pub enum HeadlessError {
 	/// A typed authority used by headless composition failed.
 	#[error("headless session composition failed")]
-	Composition(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+	Composition(#[source] Box<dyn error::Error + Send + Sync + 'static>),
 	/// The requested model selector was not present in the embedded catalog.
 	#[error("unknown model `{0}`")]
 	UnknownModel(Str),
@@ -33,13 +33,28 @@ pub enum HeadlessError {
 	MissingRoute(Str),
 }
 
-fn composition(error: impl std::error::Error + Send + Sync + 'static) -> HeadlessError {
+fn composition(error: impl error::Error + Send + Sync + 'static) -> HeadlessError {
 	HeadlessError::Composition(Box::new(error))
 }
 
-use omp_envd::exthost::lifecycle::{HeadlessLifecycleSink, HeadlessLifecycleSubscription};
+use std::mem;
 
-use crate::{chat, modes::CampaignHandle};
+use omp_envd::exthost::lifecycle::{HeadlessLifecycleSink, HeadlessLifecycleSubscription};
+use omp_proto::inference::{v1, v1::response_format};
+use tokio::io;
+
+use crate::{
+	bridges::{AgentGoalBinding, AgentGoalControl, InferenceBridge, builtin},
+	chat::{self},
+	discovery,
+	modes::CampaignHandle,
+	registry::{
+		InferenceSessionOverrides, ProductionInference, production_inference_for_session,
+		production_redemption_authority,
+	},
+	rulebook,
+	settings::current,
+};
 
 /// Inputs required to create one production headless session.
 #[derive(Clone, Debug)]
@@ -91,7 +106,7 @@ pub struct HeadlessSession {
 	approval_route:      ApprovalRoute,
 	approval_inbox:      Option<ApprovalInbox>,
 	finalizer:           HeadlessFinalizerHandle,
-	_goal_binding:       crate::bridges::AgentGoalBinding,
+	_goal_binding:       AgentGoalBinding,
 	session_id:          Str,
 	initial_items:       Vec<Item>,
 	_inference_registry: InferenceRegistry,
@@ -124,17 +139,17 @@ impl HeadlessSession {
 		registry_override: Option<Arc<omp_tool::Registry>>,
 	) -> Result<Self, HeadlessError> {
 		let root = chat::canonical_project(&options.project).map_err(composition)?;
-		let catalog = omp_catalog::snapshot::Catalog::try_embedded().map_err(composition)?;
+		let catalog = snapshot::Catalog::try_embedded().map_err(composition)?;
 		let model =
 			chat::resolve_model_selector(catalog, options.model.as_str()).map_err(composition)?;
-		let settings = crate::settings::current(&data_dir).map_err(composition)?;
+		let settings = current(&data_dir).map_err(composition)?;
 		let state_dir = omp_env::project_state::directory(&data_dir, &root).map_err(composition)?;
 		let sessions_dir = state_dir.join("sessions");
 		chat::ensure_state_directory(&state_dir).map_err(composition)?;
 		chat::ensure_state_directory(&sessions_dir).map_err(composition)?;
-		let search = Arc::new(crate::bridges::InferenceBridge::default());
-		let goal_control = crate::bridges::AgentGoalControl::default();
-		let bridges = crate::bridges::builtin(&root, Arc::clone(&search), goal_control.clone(), None);
+		let search = Arc::new(InferenceBridge::default());
+		let goal_control = AgentGoalControl::default();
+		let bridges = builtin(&root, Arc::clone(&search), goal_control.clone(), None);
 		let environment = omp_envd::ProjectEnvironment::connect_or_start(
 			&root,
 			&state_dir,
@@ -203,16 +218,16 @@ impl HeadlessSession {
 			min_tool_calls: settings.autolearn.min_tool_calls,
 		};
 		let state = AgentState::new(snapshot);
-		let crate::registry::ProductionInference {
+		let ProductionInference {
 			registry: inference_registry,
 			rpc: inference,
 			credential_authority,
 			..
-		} = crate::registry::production_inference_for_session(
+		} = production_inference_for_session(
 			&data_dir,
 			Arc::clone(&registry),
 			Some(&root),
-			crate::registry::InferenceSessionOverrides {
+			InferenceSessionOverrides {
 				provider:              options.credential_provider,
 				api_key:               options.api_key,
 				prompt_cache_affinity: options.prompt_cache_affinity,
@@ -226,8 +241,8 @@ impl HeadlessSession {
 			.await
 			.map_err(composition)?;
 		let journal_path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
-		let content = crate::discovery::active_content_snapshots(&root);
-		let (ttsr, ttsr_diagnostics) = crate::rulebook::ttsr_registry(content.rules.as_ref());
+		let content = discovery::active_content_snapshots(&root);
+		let (ttsr, ttsr_diagnostics) = rulebook::ttsr_registry(content.rules.as_ref());
 		for error in ttsr_diagnostics {
 			tracing::warn!(%error, "headless TTSR rule condition was rejected");
 		}
@@ -235,7 +250,7 @@ impl HeadlessSession {
 			Agent::new(client, env.clone(), state.clone(), session.journal, chat::CHAT_CAPS_BASE);
 		agent.set_autolearn(autolearn);
 		blueprint.configure_agent(&mut agent);
-		match crate::registry::production_redemption_authority(&state_dir) {
+		match production_redemption_authority(&state_dir) {
 			Ok(Some(authority)) => agent.set_redemption_authority(authority),
 			Ok(None) => {},
 			Err(error) => {
@@ -401,7 +416,7 @@ impl HeadlessSession {
 	/// Applies a validated session-only model override and records it in the
 	/// owning v4 journal before changing the live snapshot.
 	pub async fn set_model(&self, selector: &str) -> Result<(), HeadlessError> {
-		let catalog = omp_catalog::snapshot::Catalog::try_embedded().map_err(composition)?;
+		let catalog = snapshot::Catalog::try_embedded().map_err(composition)?;
 		let model = chat::resolve_model_selector(catalog, selector).map_err(composition)?;
 		let spec = catalog
 			.model(ModelKey::from_ref(model.as_str()))
@@ -432,7 +447,7 @@ impl HeadlessSession {
 
 	/// Replaces the session-only provider reasoning request after the ACP host
 	/// has clamped it through the selected model policy.
-	pub fn set_thinking(&self, thinking: Option<omp_proto::inference::v1::Reasoning>) {
+	pub fn set_thinking(&self, thinking: Option<v1::Reasoning>) {
 		self
 			.state
 			.update(|snapshot| snapshot.turn.params.thinking = thinking);
@@ -446,15 +461,13 @@ impl HeadlessSession {
 	) -> Result<(), serde_json::Error> {
 		let schema_json = serde_json::to_vec(&schema)?;
 		self.state.update(|snapshot| {
-			snapshot.turn.params.response_format = Some(omp_proto::inference::v1::ResponseFormat {
-				kind:           Some(omp_proto::inference::v1::response_format::Kind::JsonSchema(
-					omp_proto::inference::v1::response_format::JsonSchema {
-						name:        name.to_owned(),
-						schema_json: schema_json.into(),
-						strict:      Some(true),
-					},
-				)),
-				on_unsupported: omp_proto::inference::v1::Fallback::Error as i32,
+			snapshot.turn.params.response_format = Some(v1::ResponseFormat {
+				kind:           Some(response_format::Kind::JsonSchema(response_format::JsonSchema {
+					name:        name.to_owned(),
+					schema_json: schema_json.into(),
+					strict:      Some(true),
+				})),
+				on_unsupported: v1::Fallback::Error as i32,
 			});
 		});
 		Ok(())
@@ -566,9 +579,9 @@ impl HeadlessSession {
 	/// disposes the agent and Environment last.
 	pub async fn finalize<W>(&mut self, stdout: &mut W, budget: FinalizerBudget) -> FinalizerReport
 	where
-		W: tokio::io::AsyncWrite + Unpin,
+		W: io::AsyncWrite + Unpin,
 	{
-		let report = std::mem::take(&mut self.finalizer)
+		let report = mem::take(&mut self.finalizer)
 			.finalize(stdout, budget)
 			.await;
 		let _ = self.session.dispose().await;

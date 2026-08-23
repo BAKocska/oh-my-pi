@@ -1,6 +1,7 @@
 //! Native OMP filesystem discovery with explicit, bounded ancestor walks.
 
 use std::{
+	collections::{BTreeMap, BTreeSet},
 	env, fs,
 	path::{Path, PathBuf},
 };
@@ -13,14 +14,15 @@ use serde::Deserialize;
 use super::{
 	containment::contained_existing,
 	manifest::{
-		CapabilityPayload, DiscoveredCapability, ExtensionPayload, HookPayload, HookPhase,
-		InstructionPayload, PromptPayload, PythonWorkerDeclaration, SettingsPayload,
+		CapabilityPayload, ContextPayload, DiscoveredCapability, ExtensionPayload, HookPayload,
+		HookPhase, InstructionPayload, PromptPayload, PythonWorkerDeclaration, SettingsPayload,
 		SourceProvenance, SourceScope, SystemPromptPayload, ToolHandlerDeclaration, ToolPayload,
 	},
 	mcp_ssh::{parse_mcp_file, parse_ssh_file},
 	packages::{self, ExtensionRootMode},
 	rules::{self, RuleSource},
 	skills::{self, SkillDiscoverySettings, SkillSource},
+	slash_commands,
 };
 
 /// A native OMP configuration root.
@@ -225,7 +227,7 @@ pub fn discover_capabilities(
 		);
 		roots.push((discovered.user, SourceScope::User));
 	}
-	let mut seen = std::collections::BTreeSet::new();
+	let mut seen = BTreeSet::new();
 	roots.retain_mut(|(path, _)| {
 		let canonical = fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
 		*path = canonical.clone();
@@ -240,7 +242,7 @@ pub fn discover_capabilities(
 	for (root, scope) in roots {
 		load_root(&root, scope, &mut output);
 	}
-	let mut extension_roots = std::collections::BTreeSet::new();
+	let mut extension_roots = BTreeSet::new();
 	for installed_path in install_records {
 		let installed = match InstalledRecord::read(&installed_path) {
 			Ok(installed) => installed,
@@ -267,7 +269,7 @@ pub fn discover_capabilities(
 		let key = Str::from(path.to_string_lossy().as_ref());
 		output.declarations.push(DiscoveredCapability::keyed(
 			key,
-			CapabilityPayload::ContextFiles(super::manifest::ContextPayload {
+			CapabilityPayload::ContextFiles(ContextPayload {
 				path:    path.clone(),
 				content: Str::from(content),
 				depth:   None,
@@ -441,7 +443,7 @@ fn load_root(root: &Path, scope: SourceScope, output: &mut NativeDiscovery) {
 				content: Str::from(content),
 			})
 		} else {
-			CapabilityPayload::ContextFiles(super::manifest::ContextPayload {
+			CapabilityPayload::ContextFiles(ContextPayload {
 				path:    path.clone(),
 				content: Str::from(content),
 				depth:   None,
@@ -513,17 +515,16 @@ fn load_markdown_dir(
 				apply_to: None,
 			}),
 			CapabilityFileKind::Command => {
-				let command =
-					match super::slash_commands::parse_markdown(name.clone(), path.clone(), &content) {
-						Ok(command) => command,
-						Err(error) => {
-							output.warnings.push(Str::from(format!(
-								"ignored /{name} from {}: {error}",
-								path.display(),
-							)));
-							continue;
-						},
-					};
+				let command = match slash_commands::parse_markdown(name.clone(), path.clone(), &content)
+				{
+					Ok(command) => command,
+					Err(error) => {
+						output
+							.warnings
+							.push(Str::from(format!("ignored /{name} from {}: {error}", path.display(),)));
+						continue;
+					},
+				};
 				CapabilityPayload::SlashCommands(command)
 			},
 		};
@@ -687,7 +688,7 @@ struct ExtensionManifest {
 	#[serde(default)]
 	cli:         Vec<omp_ext::config::CliContribution>,
 	#[serde(flatten)]
-	extra:       std::collections::BTreeMap<Str, serde_json::Value>,
+	extra:       BTreeMap<Str, serde_json::Value>,
 }
 
 fn load_extension(root: &Path, source_id: Str, scope: SourceScope, output: &mut NativeDiscovery) {

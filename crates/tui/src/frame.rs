@@ -1,12 +1,17 @@
-use std::sync::{
-	LazyLock,
-	atomic::{AtomicU64, Ordering},
+use std::{
+	sync::{
+		LazyLock,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::Duration,
 };
 
 use omp_core::Str;
 use parking_lot::Mutex;
 use smol_bitmap::SmolBitmap;
 use xutf::{Text, width_char};
+
+use crate::markup::Border;
 
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -251,7 +256,7 @@ pub enum DecorKind {
 	/// Border ring; `glow` is the focus/hover halo (color, strength 0..1).
 	Border {
 		/// Border shape.
-		border: crate::markup::Border,
+		border: Border,
 		/// Border paint.
 		ink:    DecorFill,
 		/// Optional halo color and normalized strength.
@@ -260,7 +265,7 @@ pub enum DecorKind {
 	/// Moving highlight crest over the rect's text (period of one sweep).
 	Shimmer {
 		/// Duration of one highlight sweep.
-		period: std::time::Duration,
+		period: Duration,
 	},
 	/// Soft fade-in edge of a streaming text reveal. The rect is the front
 	/// row's line; glyphs within ~2 cells behind `front` ramp in.

@@ -5,6 +5,7 @@ use std::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	},
+	thread,
 	time::Duration,
 };
 
@@ -13,7 +14,8 @@ use omp_core::Str;
 use crate::{
 	Error, Result,
 	recall::RecallBounds,
-	retain::{OwnedRetentionMessage, Retainer, RetentionMessage, RetentionOutcome},
+	retain,
+	retain::{OwnedRetentionMessage, Retainer, RetentionMessage, RetentionOutcome, RetentionRole},
 	runtime::MemoryRuntime,
 };
 
@@ -111,8 +113,7 @@ impl SessionMemory {
 		);
 		for item in outcome.items {
 			rendered.push_str("- ");
-			rendered
-				.push_str(crate::retain::strip_protocol_markers(item.memory.content.as_str()).as_str());
+			rendered.push_str(retain::strip_protocol_markers(item.memory.content.as_str()).as_str());
 			rendered.push('\n');
 		}
 		rendered.push_str("</memories>");
@@ -161,7 +162,7 @@ impl SessionMemory {
 			Duration::from_millis(self.shared.runtime.mnemopi_settings()?.shutdown_timeout_ms);
 		let runtime = Arc::clone(&self.shared.runtime);
 		let (sender, receiver) = flume::bounded(1);
-		std::thread::Builder::new()
+		thread::Builder::new()
 			.name("omp-memory-shutdown".to_owned())
 			.spawn(move || {
 				let result = force_retain_runtime(&runtime, &messages);
@@ -220,7 +221,7 @@ fn compose_query(
 	let mut user_boundaries = 0usize;
 	let mut start = 0usize;
 	for (index, message) in settled.iter().enumerate().rev() {
-		if message.role == crate::retain::RetentionRole::User {
+		if message.role == RetentionRole::User {
 			user_boundaries += 1;
 			start = index;
 			if user_boundaries == context_turns {
@@ -231,9 +232,7 @@ fn compose_query(
 	let mut context = Vec::new();
 	for message in &settled[start..] {
 		let content = message.content.trim();
-		if content.is_empty()
-			|| (message.role == crate::retain::RetentionRole::User && content == latest)
-		{
+		if content.is_empty() || (message.role == RetentionRole::User && content == latest) {
 			continue;
 		}
 		let role: &'static str = message.role.into();

@@ -1,6 +1,11 @@
 //! In-memory document-to-Markdown conversion.
 
-use std::{fmt, path::Path};
+use std::{
+	error,
+	fmt::{self, Display},
+	path::Path,
+	str,
+};
 
 use bytes::Bytes;
 use omp_core::{Hash32, IntoStr, Str};
@@ -172,13 +177,13 @@ impl MarkitError {
 	}
 }
 
-impl fmt::Display for MarkitError {
+impl Display for MarkitError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{} conversion failed: {}", self.format(), self.message())
 	}
 }
 
-impl std::error::Error for MarkitError {}
+impl error::Error for MarkitError {}
 
 fn convert_with_anydoc(
 	bytes: &[u8],
@@ -352,7 +357,7 @@ fn convert_format(
 			Conversion { text, note: None, title, attachments: Vec::new() }
 		},
 		Format::Html | Format::Xml => {
-			let source = std::str::from_utf8(bytes)
+			let source = str::from_utf8(bytes)
 				.map_err(|error| MarkitError::conversion("html/xml", error.to_string()))?;
 			let converted = html_to_markdown_rs::convert(source, None)
 				.map_err(|error| MarkitError::conversion("html/xml", error.to_string()))?;

@@ -9,7 +9,9 @@
 //! Its cost is constant in the executable size on every supported platform; it
 //! never opens or reads the executable contents.
 
-use std::{path::Path, sync::LazyLock};
+#[cfg(not(any(unix, windows)))]
+use std::time;
+use std::{env, fs, io, path::Path, sync::LazyLock};
 
 use omp_core::{Hash32, hex::ArrayStr};
 
@@ -34,13 +36,13 @@ pub fn is_stale(ours: &str, theirs: &str) -> bool {
 }
 
 fn compute() -> ArrayStr<32> {
-	std::env::current_exe()
+	env::current_exe()
 		.and_then(|executable| fingerprint(&executable))
 		.unwrap_or_default()
 }
 
-fn fingerprint(executable: &Path) -> std::io::Result<ArrayStr<32>> {
-	let metadata = std::fs::metadata(executable)?;
+fn fingerprint(executable: &Path) -> io::Result<ArrayStr<32>> {
+	let metadata = fs::metadata(executable)?;
 	let mut digest = Hash32::hasher();
 	digest.update(b"omp/executable-generation/v1");
 
@@ -71,11 +73,10 @@ fn fingerprint(executable: &Path) -> std::io::Result<ArrayStr<32>> {
 
 	#[cfg(not(any(unix, windows)))]
 	{
-		let (before_epoch, modified) =
-			match metadata.modified()?.duration_since(std::time::UNIX_EPOCH) {
-				Ok(modified) => (false, modified),
-				Err(error) => (true, error.duration()),
-			};
+		let (before_epoch, modified) = match metadata.modified()?.duration_since(time::UNIX_EPOCH) {
+			Ok(modified) => (false, modified),
+			Err(error) => (true, error.duration()),
+		};
 		digest.update([u8::from(before_epoch)]);
 		digest.update(modified.as_secs().to_le_bytes());
 		digest.update(modified.subsec_nanos().to_le_bytes());
@@ -86,6 +87,7 @@ fn fingerprint(executable: &Path) -> std::io::Result<ArrayStr<32>> {
 
 #[cfg(test)]
 mod tests {
+
 	use super::*;
 
 	#[test]
@@ -101,7 +103,7 @@ mod tests {
 	fn fingerprint_is_stable_and_changes_with_file_generation() {
 		let directory = tempfile::tempdir().expect("temporary executable directory");
 		let executable = directory.path().join("omp");
-		std::fs::write(&executable, b"first generation").expect("write first generation");
+		fs::write(&executable, b"first generation").expect("write first generation");
 
 		let first = fingerprint(&executable).expect("fingerprint first generation");
 		assert_eq!(
@@ -111,7 +113,7 @@ mod tests {
 				.as_str()
 		);
 
-		std::fs::write(&executable, b"replacement executable generation")
+		fs::write(&executable, b"replacement executable generation")
 			.expect("write replacement generation");
 		let replacement = fingerprint(&executable).expect("fingerprint replacement generation");
 		assert_ne!(first.as_str(), replacement.as_str());

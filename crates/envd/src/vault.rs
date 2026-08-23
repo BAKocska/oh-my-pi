@@ -2,6 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
+	fs, io,
 	path::{Component, Path, PathBuf},
 	sync::Arc,
 };
@@ -9,6 +10,7 @@ use std::{
 use omp_core::{CowBytes, Str};
 use parking_lot::RwLock;
 use serde::Deserialize;
+use toml::de;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,9 +26,9 @@ pub struct VaultService {
 
 impl VaultService {
 	pub fn load(path: &Path) -> Result<Self, VaultError> {
-		let body = match std::fs::read_to_string(path) {
+		let body = match fs::read_to_string(path) {
 			Ok(body) => body,
-			Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+			Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
 			Err(source) => return Err(VaultError::Io { path: path.to_path_buf(), source }),
 		};
 		let parsed: VaultFile = toml::from_str(&body)
@@ -82,7 +84,7 @@ impl VaultService {
 			return Err(VaultError::Escape);
 		}
 		if for_write
-			&& let Ok(metadata) = std::fs::symlink_metadata(&target)
+			&& let Ok(metadata) = fs::symlink_metadata(&target)
 			&& metadata.file_type().is_symlink()
 		{
 			return Err(VaultError::Escape);
@@ -97,12 +99,12 @@ impl VaultService {
 		limit: usize,
 	) -> Result<CowBytes<'static>, VaultError> {
 		let path = self.target(vault, relative, false)?;
-		let metadata = std::fs::metadata(&path)
-			.map_err(|source| VaultError::Io { path: path.clone(), source })?;
+		let metadata =
+			fs::metadata(&path).map_err(|source| VaultError::Io { path: path.clone(), source })?;
 		if metadata.len() > limit as u64 {
 			return Err(VaultError::Limit { limit });
 		}
-		std::fs::read(&path)
+		fs::read(&path)
 			.map(CowBytes::from)
 			.map_err(|source| VaultError::Io { path, source })
 	}
@@ -119,12 +121,12 @@ impl VaultService {
 		}
 		let path = self.target(vault, relative, true)?;
 		let parent = path.parent().ok_or(VaultError::Escape)?;
-		std::fs::create_dir_all(parent)
+		fs::create_dir_all(parent)
 			.map_err(|source| VaultError::Io { path: parent.to_path_buf(), source })?;
 		let temporary = path.with_extension("omp-tmp");
-		std::fs::write(&temporary, bytes)
+		fs::write(&temporary, bytes)
 			.map_err(|source| VaultError::Io { path: temporary.clone(), source })?;
-		std::fs::rename(&temporary, &path).map_err(|source| VaultError::Io { path, source })
+		fs::rename(&temporary, &path).map_err(|source| VaultError::Io { path, source })
 	}
 
 	pub fn list(
@@ -145,7 +147,7 @@ impl VaultService {
 		};
 		let mut values = Vec::new();
 		for item in
-			std::fs::read_dir(&path).map_err(|source| VaultError::Io { path: path.clone(), source })?
+			fs::read_dir(&path).map_err(|source| VaultError::Io { path: path.clone(), source })?
 		{
 			let item = item.map_err(|source| VaultError::Io { path: path.clone(), source })?;
 			let metadata = item
@@ -170,13 +172,13 @@ pub enum VaultError {
 	Io {
 		path:   PathBuf,
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	#[error("invalid vault configuration {path}")]
 	Parse {
 		path:   PathBuf,
 		#[source]
-		source: toml::de::Error,
+		source: de::Error,
 	},
 	#[error("invalid vault name {name}")]
 	InvalidName { name: Str },

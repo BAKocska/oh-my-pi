@@ -1,18 +1,23 @@
 //! Integration tests for the durable session index.
 
 use std::{
-	io,
+	collections::BTreeMap,
+	io, slice,
 	sync::{
 		Arc, Barrier,
 		atomic::{AtomicBool, Ordering},
 	},
+	thread,
 };
 
 use omp_core::{Str, sf};
-use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1::{self as pb, usage, value},
+	thread::v1::{self as thread_pb, item},
+};
 use omp_storage::{
 	index::{
-		EventProjection, IndexAuthority, IndexedEvent, IndexedWriteError, JournalPosition,
+		self, EventProjection, IndexAuthority, IndexedEvent, IndexedWriteError, JournalPosition,
 		NewSession, RepairRecord, SessionFilter, SessionIndex, SessionKind, UsageBucketWidth,
 		UsageDimension, UsageQuery,
 	},
@@ -77,10 +82,10 @@ fn outcome(input: u64, output: u64) -> pb::Outcome {
 			output_tokens:      output,
 			cache_read_tokens:  3,
 			cache_write_tokens: 4,
-			accuracy:           pb::usage::Accuracy::Exact as i32,
+			accuracy:           usage::Accuracy::Exact as i32,
 			detail:             Some(pb::ValueMap {
 				fields: [("anthropic/service_tier".to_owned(), pb::Value {
-					kind: Some(pb::value::Kind::String("standard".to_owned())),
+					kind: Some(value::Kind::String("standard".to_owned())),
 				})]
 				.into(),
 			}),
@@ -150,10 +155,8 @@ fn append_projection(
 fn command_usage_accumulates_and_survives_reopen() {
 	let directory = tempdir().expect("temporary directory");
 	let path = directory.path().join("sessions.sqlite3");
-	let expected = std::collections::BTreeMap::from([
-		(Str::new_static("model"), 2_u64),
-		(Str::new_static("skill:review"), 1_u64),
-	]);
+	let expected =
+		BTreeMap::from([(Str::new_static("model"), 2_u64), (Str::new_static("skill:review"), 1_u64)]);
 	{
 		let index = SessionIndex::open(&path).expect("open index");
 		index
@@ -288,7 +291,7 @@ fn receipt_persists_canonical_usage_and_sql_groups_every_scalar_field() {
 			.as_ref()
 			.and_then(|detail| detail.fields.get("anthropic/service_tier"))
 			.and_then(|value| value.kind.as_ref()),
-		Some(pb::value::Kind::String(value)) if value == "standard"
+		Some(value::Kind::String(value)) if value == "standard"
 	));
 	assert_eq!(
 		bucket
@@ -338,7 +341,7 @@ fn index_failure_after_journal_rolls_back_partial_sql_transaction() {
 		Err(IndexedWriteError::IndexAfterJournal {
 			written:  "durable",
 			position: Some(JournalPosition { event_index: 0, byte_watermark: 128 }),
-			source:   omp_storage::index::Error::MissingUsage,
+			source:   index::Error::MissingUsage,
 		})
 	));
 	let page = index
@@ -521,7 +524,7 @@ fn remote_authority_reader_bootstraps_before_writer_and_remains_query_only() {
 	);
 	assert!(matches!(
 		result,
-		Err(IndexedWriteError::IndexBeforeJournal(omp_storage::index::Error::ReadOnlyAuthority))
+		Err(IndexedWriteError::IndexBeforeJournal(index::Error::ReadOnlyAuthority))
 	));
 	assert!(!journal_ran.load(Ordering::SeqCst));
 }
@@ -534,14 +537,14 @@ fn two_writer_connections_serialize_distinct_session_commits() {
 	let second = SessionIndex::open(&path).expect("second writer connection");
 	let gate = Arc::new(Barrier::new(2));
 	let first_gate = Arc::clone(&gate);
-	let first_writer = std::thread::spawn(move || {
+	let first_writer = thread::spawn(move || {
 		let id = session_id("first-writer");
 		create_after_journal(&first, &id, || {
 			first_gate.wait();
 		});
 	});
 	let second_gate = Arc::clone(&gate);
-	let second_writer = std::thread::spawn(move || {
+	let second_writer = thread::spawn(move || {
 		let id = session_id("second-writer");
 		create_after_journal(&second, &id, || {
 			second_gate.wait();
@@ -583,7 +586,7 @@ fn lineage_rekey_moves_all_projections_retains_collision_winners_and_rolls_back_
 	let archived_collision_receipt = outcome(20, 21);
 	let archived_unique_receipt = outcome(30, 31);
 	let retained_item = thread_pb::Item {
-		kind: Some(thread_pb::item::Kind::Message(thread_pb::Message {
+		kind: Some(item::Kind::Message(thread_pb::Message {
 			role:  thread_pb::Role::User as i32,
 			parts: Vec::new(),
 		})),
@@ -620,7 +623,7 @@ fn lineage_rekey_moves_all_projections_retains_collision_winners_and_rolls_back_
 	});
 
 	let dry_run = index
-		.rekey_archived_lineage(&retained, std::slice::from_ref(&archived), MaintenanceMode::DryRun)
+		.rekey_archived_lineage(&retained, slice::from_ref(&archived), MaintenanceMode::DryRun)
 		.expect("measure lineage transfer");
 	assert_eq!(dry_run.receipts.transferred, 1);
 	assert_eq!(dry_run.receipts.collisions, 1);
@@ -648,7 +651,7 @@ fn lineage_rekey_moves_all_projections_retains_collision_winners_and_rolls_back_
 	);
 
 	let applied = index
-		.rekey_archived_lineage(&retained, std::slice::from_ref(&archived), MaintenanceMode::Apply)
+		.rekey_archived_lineage(&retained, slice::from_ref(&archived), MaintenanceMode::Apply)
 		.expect("apply lineage transfer");
 	assert_eq!(applied, dry_run);
 	assert_eq!(

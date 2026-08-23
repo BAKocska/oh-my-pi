@@ -1,12 +1,18 @@
 //! Widget-tier behavior tests: focus ring, keyboard contract, mouse
 //! routing, conditionals, validation, values, and damage containment.
 
+use std::{env, fmt, fs, str, time};
+
 use serde_json::json;
 
 use crate::{
-	Color, OverlayOptions, Prop, Rect, Ui, UiContext,
+	Charset, Color, Component, Elements, OverlayOptions, Prop, Props, Rect, Theme, Ui, UiContext,
 	component::{Cached, HitTag, Slot},
-	components::{Button, EditInput, EditorPane, Form, Input, Radio, Select, Tabs, Tree, Wizard},
+	components::{
+		Boxed, Button, CustomElement, EditInput, EditorPane, Form, Input, Radio, Select, Tabs,
+		TextLeaf, Tree, Wizard,
+	},
+	dom,
 	input::{Key, Mouse, UiEvent},
 	test_support::{frame_cell_style, frame_row_text},
 };
@@ -424,9 +430,7 @@ fn tree_expand_collapse_select() {
 #[test]
 fn editor_set_text_grows_layout_and_paints_every_row() {
 	let mut ui = Ui::from_root(
-		EditorPane::new()
-			.input(crate::components::TextLeaf::new())
-			.with(crate::Prop::Id, "e"),
+		EditorPane::new().input(TextLeaf::new()).with(Prop::Id, "e"),
 		40,
 		UiContext::default(),
 	);
@@ -734,7 +738,7 @@ fn wizard_validation_conditionals_and_submit() {
 #[test]
 fn scroll_chases_focus_and_contains_damage() {
 	let filler = (0..12).fold(String::new(), |mut filler, i| {
-		let _ = std::fmt::Write::write_fmt(&mut filler, format_args!("<text>filler {i}</text>"));
+		let _ = fmt::Write::write_fmt(&mut filler, format_args!("<text>filler {i}</text>"));
 		filler
 	});
 	let src = format!(
@@ -815,7 +819,7 @@ fn drag_over_scroll_pane_updates_hover() {
 	let target = ui
 		.hits()
 		.iter()
-		.find(|hit| hit.tag == crate::component::HitTag::Press)
+		.find(|hit| hit.tag == HitTag::Press)
 		.copied()
 		.unwrap();
 	ui.handle_mouse(target.rect.x, target.rect.y, Mouse::Drag);
@@ -892,7 +896,7 @@ fn keyboard_focus_bloom_spreads_from_the_chrome_center() {
 	assert_eq!(red(&ui, 10, 1), 0x33);
 	// Past the first FRAME wake: the lift has hopped (keyboard pace) but
 	// the bloom is still early in its declared 220ms linear spread.
-	ui.tick(std::time::Duration::from_millis(50));
+	ui.tick(time::Duration::from_millis(50));
 	// Mid-flight the glow is strongest at the top-center and still fading
 	// toward the corners: a spread, not a uniform crossfade.
 	assert!(
@@ -902,7 +906,7 @@ fn keyboard_focus_bloom_spreads_from_the_chrome_center() {
 		red(&ui, 0, 0),
 	);
 	assert!(red(&ui, 10, 0) < 0xc8, "the spread is still mid-flight, not an instant swap");
-	ui.tick(std::time::Duration::from_millis(400));
+	ui.tick(time::Duration::from_millis(400));
 	assert!(
 		red(&ui, 10, 0) > 0xc8 && red(&ui, 0, 0) > 0xc8,
 		"the ramp blankets the ring at rest: top-middle {} corner {}",
@@ -923,7 +927,7 @@ fn keyboard_focus_hops_outpace_the_declared_ease() {
 	.unwrap();
 	assert_eq!(rows(&ui)[0], "", "the box rests below its headroom");
 	ui.handle_key(Key::Tab);
-	ui.tick(std::time::Duration::from_millis(80));
+	ui.tick(time::Duration::from_millis(80));
 	// The declared linear 220ms pace would still round the rise to zero
 	// at 80ms; the keyboard hop (110ms, ease-out) already claimed the row.
 	assert_ne!(rows(&ui)[0], "", "keyboard hops rise at the snappy pace");
@@ -1074,8 +1078,8 @@ fn radio_arrow_keys_wrap_at_both_edges() {
 #[test]
 fn img_renders_ppm_and_placeholder() {
 	// synthesize a 4x4 red/blue PPM
-	let dir = std::env::temp_dir().join("omp-tui-img-test");
-	std::fs::create_dir_all(&dir).unwrap();
+	let dir = env::temp_dir().join("omp-tui-img-test");
+	fs::create_dir_all(&dir).unwrap();
 	let path = dir.join("t.ppm");
 	let mut ppm: Vec<u8> = b"P6\n4 4\n255\n".to_vec();
 	for y in 0..4u8 {
@@ -1087,17 +1091,15 @@ fn img_renders_ppm_and_placeholder() {
 			}
 		}
 	}
-	std::fs::write(&path, ppm).unwrap();
+	fs::write(&path, ppm).unwrap();
 	let source = format!("<img src={} w=4/>", path.display());
 	let ui = Ui::from_markup(source.clone(), 20, UiContext::default()).unwrap();
 	assert_eq!(ui.height(), 2, "4px tall = 2 half-block rows");
 	assert!(rows(&ui)[0].contains('▀'));
 
-	let ascii = Ui::from_markup(source, 20, crate::UiContext {
-		charset: crate::Charset::Ascii,
-		..crate::UiContext::default()
-	})
-	.unwrap();
+	let ascii =
+		Ui::from_markup(source, 20, UiContext { charset: Charset::Ascii, ..UiContext::default() })
+			.unwrap();
 	assert!(rows(&ascii)[0].contains('#'), "ASCII upper-half fallback");
 	assert!(!rows(&ascii).join("").contains('▀'));
 
@@ -1105,9 +1107,9 @@ fn img_renders_ppm_and_placeholder() {
 		Ui::from_markup("<img src=/nope/missing.png w=8/>", 30, UiContext::default()).unwrap();
 	assert_eq!(missing.height(), 3, "placeholder box");
 	assert!(rows(&missing)[1].contains("missing.png"));
-	let missing_ascii = Ui::from_markup("<img src=/nope/missing.png w=8/>", 30, crate::UiContext {
-		charset: crate::Charset::Ascii,
-		..crate::UiContext::default()
+	let missing_ascii = Ui::from_markup("<img src=/nope/missing.png w=8/>", 30, UiContext {
+		charset: Charset::Ascii,
+		..UiContext::default()
 	})
 	.unwrap();
 	let text = rows(&missing_ascii).join("\n");
@@ -1182,7 +1184,7 @@ fn renderer_roundtrip_survives_popup_open_close_shrink() {
 	// replay everything the renderer emitted into the terminal model and
 	// compare the visible window cell-for-cell with the frame
 	let output = renderer.into_inner();
-	terminal.apply(std::str::from_utf8(&output).unwrap());
+	terminal.apply(str::from_utf8(&output).unwrap());
 	let height = ui.frame().size().height;
 	let window_top = height.saturating_sub(viewport);
 	let visible = terminal.visible_rows();
@@ -1277,12 +1279,11 @@ fn icon_catalog_resolves_short_names_and_qualified_aliases() {
 
 #[test]
 fn callout_icon_accepts_short_catalog_names() {
-	let ui =
-		Ui::from_markup("<callout icon=folder title=Files>body</callout>", 30, crate::UiContext {
-			charset: crate::Charset::Ascii,
-			..crate::UiContext::default()
-		})
-		.unwrap();
+	let ui = Ui::from_markup("<callout icon=folder title=Files>body</callout>", 30, UiContext {
+		charset: Charset::Ascii,
+		..UiContext::default()
+	})
+	.unwrap();
 	let text = rows(&ui);
 	assert!(text[0].contains("[D] Files"), "{text:?}");
 	assert!(!text[0].contains("folder"), "name resolved rather than painted literally");
@@ -1315,7 +1316,7 @@ fn bare_css_color_flags_style_inline_spans_end_to_end() {
 	);
 	// unknown bare attrs stay inert
 	let inert = Ui::from_markup("<span mystery>m</span>", 10, UiContext::default()).unwrap();
-	let base = crate::Theme::default().fg;
+	let base = Theme::default().fg;
 	assert_eq!(inert.frame().cell(0, 0).style.foreground_color(), base);
 }
 
@@ -1335,11 +1336,9 @@ fn ico_tags_resolve_inline_and_in_titles_across_charsets() {
 		"code span literal: {text}"
 	);
 
-	let ascii = Ui::from_markup(src, 44, crate::UiContext {
-		charset: crate::Charset::Ascii,
-		..crate::UiContext::default()
-	})
-	.unwrap();
+	let ascii =
+		Ui::from_markup(src, 44, UiContext { charset: Charset::Ascii, ..UiContext::default() })
+			.unwrap();
 	let text = rows(&ascii).join("\n");
 	assert!(text.contains("[D] Files"), "ascii title icon: {text}");
 
@@ -1612,7 +1611,7 @@ fn poc_settings_demo_renders_icon_tabs_and_accent_pill() {
 		assert!(!text.contains(leak), "leaked {leak}: {text}");
 	}
 	// the active tab pill carries the accent background from `on=accent`
-	let accent = crate::Theme::default().accent;
+	let accent = Theme::default().accent;
 	let frame = ui.frame();
 	let pill = (0..frame.size().height).any(|y| {
 		(0..frame.size().width).any(|x| frame.cell(x, y).style.background_color() == accent)
@@ -1710,14 +1709,14 @@ fn poc_showcase_demo_covers_dash_borders_justify_truncate_and_gradients() {
 
 #[test]
 fn custom_element_registry_factory_paints_boxed_props_and_children() {
-	let ctx = crate::UiContext {
-		elements: crate::Elements::builder()
-			.with("user-card", |_: &str, props: crate::Props, children: Vec<crate::Cached>| {
+	let ctx = UiContext {
+		elements: Elements::builder()
+			.with("user-card", |_: &str, props: Props, children: Vec<Cached>| {
 				Box::new(
-					crate::components::Boxed::new()
-						.with(crate::Prop::Title, props.title().cloned().unwrap_or_default())
+					Boxed::new()
+						.with(Prop::Title, props.title().cloned().unwrap_or_default())
 						.child(children),
-				) as Box<dyn crate::Component>
+				) as Box<dyn Component>
 			})
 			.build(),
 		..Default::default()
@@ -1731,15 +1730,15 @@ fn custom_element_registry_factory_paints_boxed_props_and_children() {
 
 #[test]
 fn unregistered_custom_elements_render_as_div_fallbacks() {
-	let note = Ui::from_markup("<note>hello</note>", 24, crate::UiContext {
-		elements: crate::Elements::default(),
+	let note = Ui::from_markup("<note>hello</note>", 24, UiContext {
+		elements: Elements::default(),
 		..Default::default()
 	})
 	.unwrap();
 	assert!(rows(&note).iter().any(|row| row.contains("hello")));
 
-	let gone = Ui::from_markup("<gone/>", 24, crate::UiContext {
-		elements: crate::Elements::default(),
+	let gone = Ui::from_markup("<gone/>", 24, UiContext {
+		elements: Elements::default(),
 		..Default::default()
 	})
 	.unwrap();
@@ -1758,7 +1757,7 @@ fn custom_element_preserves_named_and_custom_props() {
 		Ui::from_markup("<note data-x=1 title=hi>hello</note>", 24, UiContext::default()).unwrap();
 	let custom = ui.root_mut().comp().children()[0]
 		.comp()
-		.downcast_ref::<crate::components::CustomElement>()
+		.downcast_ref::<CustomElement>()
 		.expect("root child is the custom element");
 	assert_eq!(
 		crate::Component::props(custom).custom("data-x"),
@@ -1815,7 +1814,7 @@ fn editor_markup_rejects_extra_or_text_children() {
 #[test]
 fn editor_layout_macro_accepts_status_child() {
 	let ui = Ui::from_root(
-		crate::dom! {
+		dom! {
 			<editor><status><segment>{"S1"}</segment></status></editor>
 		},
 		60,
@@ -1903,7 +1902,7 @@ fn tree_guides_paint_connectors_for_open_branches() {
 #[test]
 fn todo_layout_macro_builds_nested_tasks() {
 	let ui = Ui::from_root(
-		crate::dom! {
+		dom! {
 			<todo guides=round>
 				<task label="phase">
 					<task status="done">{"a"}</task>

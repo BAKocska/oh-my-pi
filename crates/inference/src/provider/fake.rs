@@ -11,6 +11,7 @@
 use std::{
 	collections::VecDeque,
 	future::poll_fn,
+	mem,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -27,12 +28,12 @@ use tower::Service;
 use super::ProviderService;
 use crate::{
 	answer::{
-		Answer, AnswerBody, AnswerKind, AudioChunk, AuthAnswer, DetokenizedText, EmbeddingBatch,
-		GenerationEvent, GenerationSession, ImageArtifact, ModelDiscoveryPage, NativeResponse,
-		RealtimeSession, ResponseMeta, SearchResults, TokenCount, TokenSequence, TranscriptEvent,
-		UsageReport, VideoArtifact,
+		Answer, AnswerBody, AnswerKind, AudioChunk, AuthAnswer, ChatStream, DetokenizedText,
+		EmbeddingBatch, GenerationEvent, GenerationSession, ImageArtifact, ModelDiscoveryPage,
+		NativeResponse, RealtimeSession, ResponseMeta, SearchResults, TokenCount, TokenSequence,
+		TranscriptEvent, UsageReport, VideoArtifact,
 	},
-	call::{AuthRequest, MediaInput, NativePayload, OperationCall},
+	call::{AuthRequest, Call, MediaInput, NativePayload, OperationCall},
 	catalog::{ModelKey, OperationKind, ProviderId, RouteId},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::ChatEvent,
@@ -85,7 +86,7 @@ impl FakeProvider {
 
 	/// Removes and returns all secret-safe captured calls.
 	pub fn take_calls(&self) -> Vec<CapturedCall> {
-		std::mem::take(&mut self.state.lock().calls)
+		mem::take(&mut self.state.lock().calls)
 	}
 
 	/// Erases this fake through the construction-time provider service boundary.
@@ -94,7 +95,7 @@ impl FakeProvider {
 	}
 }
 
-impl Service<crate::call::Call> for FakeProvider {
+impl Service<Call> for FakeProvider {
 	type Error = Error;
 	type Future = BoxFuture<'static, Result<Answer, Error>>;
 	type Response = Answer;
@@ -121,7 +122,7 @@ impl Service<crate::call::Call> for FakeProvider {
 		Poll::Ready(Ok(()))
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let actual = call.operation.kind();
 		let request_id = call.id.clone();
 		let mut state = self.state.lock();
@@ -470,9 +471,7 @@ impl FakeAnswer {
 
 	fn into_body(self) -> AnswerBody {
 		match self {
-			Self::Chat(items) => {
-				AnswerBody::Chat(crate::answer::ChatStream::ordinary(Box::pin(stream::iter(items))))
-			},
+			Self::Chat(items) => AnswerBody::Chat(ChatStream::ordinary(Box::pin(stream::iter(items)))),
 			Self::Tokens(value) => AnswerBody::Tokens(value),
 			Self::TokenIds(value) => AnswerBody::TokenIds(value),
 			Self::Text(value) => AnswerBody::Text(value),
@@ -706,7 +705,7 @@ pub enum CapturedNativePayload {
 }
 
 impl CapturedCall {
-	fn from_call(call: &crate::call::Call) -> Self {
+	fn from_call(call: &Call) -> Self {
 		Self {
 			request_id:     call.id.clone(),
 			operation:      call.operation.kind(),
@@ -832,7 +831,7 @@ fn contract_error(request_id: RequestId, reason: &'static str, receipt: Executio
 #[cfg(test)]
 mod tests {
 	use std::{
-		sync::Arc,
+		sync::{Arc, atomic},
 		task::{Context, Poll},
 		time::{Duration, SystemTime},
 	};
@@ -845,15 +844,16 @@ mod tests {
 	use super::{FakeProvider, FakeScript};
 	use crate::{
 		answer::{
-			AnswerBody, DetokenizedText, GenerationSession, RealtimeEvent, TokenizerProvenance,
+			AnswerBody, DetokenizedText, GenerationEvent, GenerationSession, RealtimeEvent,
+			RealtimeSession, TokenizerProvenance, VideoArtifact,
 		},
 		body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
 		call::{
 			AuthRequest, Call, ChatRequest, CountAccuracy, CountTokensRequest, DetokenizeRequest,
-			DiscoveryRequest, EmbedRequest, ImageRequest, MediaInput, NativeRequest,
-			NativeResponseFraming, NegotiationPolicy, OperationCall, RealtimeRequest, Sampling,
-			SearchRequest, Setting, SpeechRequest, Target, TokenizeRequest, TranscriptionRequest,
-			TruncationPolicy, UsageRequest, UsageScope, VideoRequest,
+			DiscoveryRequest, EmbedRequest, ImageRequest, InferenceAttribution, MediaInput,
+			NativeRequest, NativeResponseFraming, NegotiationPolicy, OperationCall, RealtimeRequest,
+			Sampling, SearchRequest, Setting, SpeechRequest, Target, TokenizeRequest,
+			TranscriptionRequest, TruncationPolicy, UsageRequest, UsageScope, VideoRequest,
 		},
 		catalog::{OperationKind, ProviderId, RouteId},
 		error::{Error, ErrorKind, ErrorPhase, RetryAction},
@@ -882,7 +882,7 @@ mod tests {
 			deadline: None,
 			budget: ExecutionBudget::default(),
 			session: None,
-			attribution: crate::call::InferenceAttribution::core(),
+			attribution: InferenceAttribution::core(),
 			execution: None,
 			operation,
 		}
@@ -1018,8 +1018,8 @@ mod tests {
 	}
 
 	fn video_session(
-		events: Vec<Result<crate::answer::GenerationEvent<crate::answer::VideoArtifact>, Error>>,
-	) -> GenerationSession<crate::answer::VideoArtifact> {
+		events: Vec<Result<GenerationEvent<VideoArtifact>, Error>>,
+	) -> GenerationSession<VideoArtifact> {
 		let job = JobRef {
 			provider:  ProviderId::from("fake-provider"),
 			route:     RouteId::from("fake-route"),
@@ -1220,11 +1220,11 @@ mod tests {
 				Ok(ChatEvent::TextDelta { index: 0, text: sf!("delta") }),
 				Err(stream_error),
 			]),
-			FakeScript::images(vec![Ok(crate::answer::GenerationEvent::Progress {
+			FakeScript::images(vec![Ok(GenerationEvent::Progress {
 				completed: 1,
 				total:     Some(2),
 			})]),
-			FakeScript::video(video_session(vec![Ok(crate::answer::GenerationEvent::Progress {
+			FakeScript::video(video_session(vec![Ok(GenerationEvent::Progress {
 				completed: 2,
 				total:     Some(2),
 			})])),
@@ -1237,10 +1237,10 @@ mod tests {
 			FakeScript::transcript(vec![Ok(crate::answer::TranscriptEvent::Started {
 				language: Some(sf!("en")),
 			})]),
-			FakeScript::realtime(crate::answer::RealtimeSession::from_channels(
+			FakeScript::realtime(RealtimeSession::from_channels(
 				outbound,
 				inbound,
-				Arc::new(std::sync::atomic::AtomicBool::new(false)),
+				Arc::new(atomic::AtomicBool::new(false)),
 			)),
 		]);
 		let mut service = fake;
@@ -1269,7 +1269,7 @@ mod tests {
 		let mut images = stream;
 		assert!(matches!(
 			images.next().await,
-			Some(Ok(crate::answer::GenerationEvent::Progress { completed: 1, .. }))
+			Some(Ok(GenerationEvent::Progress { completed: 1, .. }))
 		));
 		let AnswerBody::Video(stream) = service
 			.call(call(operations.remove(4)))
@@ -1282,7 +1282,7 @@ mod tests {
 		let mut video = stream;
 		assert!(matches!(
 			video.next().await,
-			Some(Ok(crate::answer::GenerationEvent::Progress { completed: 2, .. }))
+			Some(Ok(GenerationEvent::Progress { completed: 2, .. }))
 		));
 		let AnswerBody::Speech(stream) = service
 			.call(call(operations.remove(4)))

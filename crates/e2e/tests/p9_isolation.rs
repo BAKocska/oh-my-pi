@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-use std::{path::PathBuf, sync::Arc};
+use std::{fs, future, path::PathBuf, process, sync::Arc};
 
 use bytes::Bytes;
 use omp_core::{ArtifactDigest, Principal, Provenance, sf};
@@ -26,6 +26,7 @@ use omp_proto::{
 use omp_tool::{CallOutcome, Registry};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use url::Url;
 
 const MODULE: &str = "p9_isolated_worker";
 const MARKER: &str = "worker-proof.txt";
@@ -62,10 +63,10 @@ OMP_TOOLS = [
 struct AllowAdmission;
 
 impl Admitter for AllowAdmission {
-	type Future<'client> = std::future::Ready<Admission>;
+	type Future<'client> = future::Ready<Admission>;
 
 	fn admit<'client>(&'client self, query: AdmitInvocation) -> Self::Future<'client> {
-		std::future::ready(Admission {
+		future::ready(Admission {
 			invocation_id: query.invocation_id,
 			allow: true,
 			..Admission::default()
@@ -200,7 +201,7 @@ async fn p9_env_worker_is_rooted_in_the_isolated_worktree() -> Result<()> {
 		DEFAULT_TIMEOUT,
 		parent_env.client().create_worktree(CreateWorktree {
 			name: "p9-worker-sandbox".to_owned(),
-			owner_pid: std::process::id(),
+			owner_pid: process::id(),
 			..CreateWorktree::default()
 		}),
 	)
@@ -208,22 +209,22 @@ async fn p9_env_worker_is_rooted_in_the_isolated_worktree() -> Result<()> {
 	let worktree = created
 		.worktree
 		.context("environment omitted worktree identity")?;
-	let root = url::Url::parse(&worktree.root_uri)
+	let root = Url::parse(&worktree.root_uri)
 		.context("parse worktree root URI")?
 		.to_file_path()
 		.map_err(|()| error(format!("worktree root was not a file URI")))?;
-	std::fs::write(root.join(format!("{MODULE}.py")), WORKER_EXTENSION)
+	fs::write(root.join(format!("{MODULE}.py")), WORKER_EXTENSION)
 		.context("install isolated worker extension")?;
 
 	let child = ChildEnvironment::spawn(root.clone()).await?;
 	let proof = invoke_worker(&child.client).await?;
 	assert_eq!(proof["contents"], "isolated-worker\n");
 	assert_eq!(
-		std::fs::canonicalize(proof["cwd"].as_str().context("worker omitted cwd")?)?,
-		std::fs::canonicalize(&root)?,
+		fs::canonicalize(proof["cwd"].as_str().context("worker omitted cwd")?)?,
+		fs::canonicalize(&root)?,
 		"placed worker inherited a root other than its isolated Environment",
 	);
-	assert_eq!(std::fs::read(root.join(MARKER))?, b"isolated-worker\n");
+	assert_eq!(fs::read(root.join(MARKER))?, b"isolated-worker\n");
 	assert!(
 		!parent.project().join(MARKER).exists(),
 		"worker write escaped into the parent repository",

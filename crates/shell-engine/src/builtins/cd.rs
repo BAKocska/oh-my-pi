@@ -2,7 +2,7 @@ use std::{io::Write, path::PathBuf};
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 /// Change the current shell working directory.
 #[derive(Parser)]
@@ -26,11 +26,11 @@ pub(crate) struct CdCommand {
 }
 
 impl builtins::Command for CdCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		let mut should_print = false;
 		let mut target_dir = if let Some(target_dir) = &self.target_dir {

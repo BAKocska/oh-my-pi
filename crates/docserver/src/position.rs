@@ -1,4 +1,4 @@
-use std::fmt;
+use std::fmt::{self, Display};
 
 use bytes::Bytes;
 use omp_core::Str;
@@ -324,7 +324,7 @@ pub enum PositionError {
 	OutputTooLarge,
 }
 
-impl fmt::Display for Position {
+impl Display for Position {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}:{}", self.line, self.character)
 	}

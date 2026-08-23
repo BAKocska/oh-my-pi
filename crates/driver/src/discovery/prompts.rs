@@ -110,26 +110,42 @@ fn parse_markdown(markdown: &str) -> Result<(Str, &str), PromptTemplateError> {
 	Ok((description, body))
 }
 
+/// Failure while discovering or parsing a native Markdown prompt template.
 #[derive(Debug, thiserror::Error)]
 pub enum PromptTemplateError {
+	/// The project- or user-scoped prompt directory could not be enumerated.
 	#[error("failed to read prompt template directory {path}")]
 	ReadDirectory {
+		/// Prompt directory whose entries could not be read.
 		path:   PathBuf,
+		/// Filesystem error returned while opening the directory.
 		#[source]
 		source: io::Error,
 	},
+	/// A discovered Markdown template could not be read.
 	#[error("failed to read prompt template {path}")]
 	Read {
+		/// Winning source file that could not be loaded.
 		path:   PathBuf,
+		/// Filesystem error returned while reading the template.
 		#[source]
 		source: io::Error,
 	},
+	/// A Markdown path has no non-empty UTF-8 filename stem to use as its
+	/// canonical name.
 	#[error("invalid prompt template filename {path}")]
-	InvalidName { path: PathBuf },
+	InvalidName {
+		/// Discovered Markdown path with the invalid filename.
+		path: PathBuf,
+	},
+	/// Opening `---` frontmatter has no closing delimiter.
 	#[error("prompt template frontmatter is not terminated")]
 	UnterminatedFrontmatter,
+	/// YAML frontmatter could not be decoded.
 	#[error("prompt template frontmatter is malformed")]
 	Yaml(#[from] serde_yaml::Error),
+	/// Neither frontmatter nor the first non-empty body line supplies a
+	/// description.
 	#[error("prompt template has no description")]
 	MissingDescription,
 }

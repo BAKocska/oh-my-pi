@@ -1,8 +1,11 @@
 //! Push-based styled rich-text storage and rendering adapters.
 
-use std::sync::{
-	LazyLock,
-	atomic::{AtomicU8, AtomicU64, Ordering},
+use std::{
+	iter, mem,
+	sync::{
+		LazyLock,
+		atomic::{AtomicU8, AtomicU64, Ordering},
+	},
 };
 
 use omp_core::Str;
@@ -10,6 +13,7 @@ use smallvec::SmallVec;
 use xutf::{Text, width_char};
 
 use crate::{
+	context::JamoWidth,
 	escape::esc,
 	frame::{Color, Style},
 	renderer::push_style_parameters,
@@ -29,12 +33,12 @@ static JAMO_WIDTH: AtomicU8 = AtomicU8::new(JAMO_PLATFORM);
 static WIDTH_CONFIG_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Hangul Compatibility Jamo width policy currently used by [`cell_width`].
-pub fn jamo_width() -> crate::context::JamoWidth {
+pub fn jamo_width() -> JamoWidth {
 	match JAMO_WIDTH.load(Ordering::Relaxed) {
-		JAMO_UNICODE => crate::context::JamoWidth::Unicode,
-		JAMO_NARROW => crate::context::JamoWidth::Narrow,
-		JAMO_WIDE => crate::context::JamoWidth::Wide,
-		_ => crate::context::JamoWidth::Platform,
+		JAMO_UNICODE => JamoWidth::Unicode,
+		JAMO_NARROW => JamoWidth::Narrow,
+		JAMO_WIDE => JamoWidth::Wide,
+		_ => JamoWidth::Platform,
 	}
 }
 
@@ -43,12 +47,12 @@ pub fn jamo_width() -> crate::context::JamoWidth {
 /// Returns whether the policy changed. A change advances
 /// [`width_config_epoch`] so geometry and wrapping memos can discard widths
 /// measured under the previous policy.
-pub fn set_jamo_width(width: crate::context::JamoWidth) -> bool {
+pub fn set_jamo_width(width: JamoWidth) -> bool {
 	let encoded = match width {
-		crate::context::JamoWidth::Platform => JAMO_PLATFORM,
-		crate::context::JamoWidth::Unicode => JAMO_UNICODE,
-		crate::context::JamoWidth::Narrow => JAMO_NARROW,
-		crate::context::JamoWidth::Wide => JAMO_WIDE,
+		JamoWidth::Platform => JAMO_PLATFORM,
+		JamoWidth::Unicode => JAMO_UNICODE,
+		JamoWidth::Narrow => JAMO_NARROW,
+		JamoWidth::Wide => JAMO_WIDE,
 	};
 	if JAMO_WIDTH.swap(encoded, Ordering::Relaxed) == encoded {
 		return false;
@@ -79,11 +83,11 @@ fn plain_cell_width(text: &str) -> u16 {
 			0
 		} else {
 			match policy {
-				crate::context::JamoWidth::Unicode => unicode_width,
-				crate::context::JamoWidth::Narrow => 1,
-				crate::context::JamoWidth::Wide => 2,
-				crate::context::JamoWidth::Platform if cfg!(target_os = "macos") => 1,
-				crate::context::JamoWidth::Platform => unicode_width,
+				JamoWidth::Unicode => unicode_width,
+				JamoWidth::Narrow => 1,
+				JamoWidth::Wide => 2,
+				JamoWidth::Platform if cfg!(target_os = "macos") => 1,
+				JamoWidth::Platform => unicode_width,
 			}
 		};
 		width = width.saturating_sub(unicode_width).saturating_add(target);
@@ -419,7 +423,7 @@ impl RichText {
 	) -> impl DoubleEndedIterator<Item = (Style, &str)>
 	+ ExactSizeIterator
 	+ Clone
-	+ std::iter::FusedIterator
+	+ iter::FusedIterator
 	+ '_ {
 		let (start, end) = self.row_run_bounds(row);
 		self.runs[start..end]
@@ -904,9 +908,9 @@ impl<'p, S: RichSink> Wrap<'p, S> {
 		if self.word.is_empty() {
 			return;
 		}
-		let word = std::mem::take(&mut self.word);
-		let runs = std::mem::take(&mut self.word_runs);
-		let word_width = std::mem::take(&mut self.word_width);
+		let word = mem::take(&mut self.word);
+		let runs = mem::take(&mut self.word_runs);
+		let word_width = mem::take(&mut self.word_width);
 		self.start_row();
 		let join_gap = self.gap_width.max(1);
 		if self.content
@@ -1425,19 +1429,19 @@ mod tests {
 		let original = jamo_width();
 		let jamo = "ㅁㄴㅇㅂ";
 
-		set_jamo_width(crate::context::JamoWidth::Unicode);
+		set_jamo_width(JamoWidth::Unicode);
 		assert_eq!(cell_width(jamo), 8);
 		assert_eq!(cell_width("\u{3164}"), 0);
 
-		set_jamo_width(crate::context::JamoWidth::Narrow);
+		set_jamo_width(JamoWidth::Narrow);
 		assert_eq!(cell_width(jamo), 4);
 		assert_eq!(cell_width("\u{3164}"), 0);
 
-		set_jamo_width(crate::context::JamoWidth::Wide);
+		set_jamo_width(JamoWidth::Wide);
 		assert_eq!(cell_width(jamo), 8);
 		assert_eq!(cell_width("\u{3164}"), 0);
 
-		set_jamo_width(crate::context::JamoWidth::Platform);
+		set_jamo_width(JamoWidth::Platform);
 		assert_eq!(cell_width(jamo), if cfg!(target_os = "macos") { 4 } else { 8 });
 		assert_eq!(cell_width("\u{3164}"), 0);
 		assert_eq!(cell_width("©"), 1, "East Asian Ambiguous characters stay narrow");

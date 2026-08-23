@@ -3,6 +3,7 @@
 #![cfg(unix)]
 
 use std::{
+	fs,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::Duration,
@@ -18,8 +19,8 @@ use omp_agent::{
 use omp_core::{Str, sf};
 use omp_e2e::support::{
 	AllowAdmission, Gate, Scratch, ScriptedGateway, ScriptedStep, ScriptedTurn, ScriptedTurnClient,
-	accepted_event, install_omp_binary_env, omp_binary, outcome_event, tool_call_item, turn_event,
-	user_item,
+	accepted_event, install_omp_binary_env, omp_binary, outcome_event, tool_call_item,
+	turn_event as scripted_turn_event, user_item,
 };
 use omp_env::{BlobDownloadEvent, EnvClient, ProcessAttachmentEvent};
 use omp_envd::{EnvServer, RegistryBridges, worker::ExtHostConfig};
@@ -35,8 +36,8 @@ use omp_proto::{
 		AttachOutput, ClientHello, ProcessSpec, ProcessState, RestartPolicy, RestartSpec, Script,
 		StartProcess,
 	},
-	inference::v1::{self as inference, StopReason},
-	thread::v1::{self as thread, Revision},
+	inference::v1::{self as inference, StopReason, part_start, turn_event, value},
+	thread::v1::{self as thread, Revision, item, part},
 };
 use omp_storage::transcript::{Entry, Header, Kind, SessionId};
 use omp_tool::{
@@ -46,6 +47,10 @@ use omp_tool::{
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
+use tokio::{
+	task::{self, JoinHandle},
+	time,
+};
 
 const LIMIT: Duration = Duration::from_secs(15);
 const SETTLEMENT_MIME: &str = "application/vnd.omp.process-settlement+json";
@@ -61,7 +66,7 @@ struct RealEnv {
 	server: Arc<EnvServer>,
 	root:   TempDir,
 	_state: TempDir,
-	tasks:  Vec<tokio::task::JoinHandle<()>>,
+	tasks:  Vec<JoinHandle<()>>,
 }
 
 impl RealEnv {
@@ -116,7 +121,7 @@ impl RealEnv {
 			.expect("settlement artifact is addressable");
 		let mut bytes = Vec::new();
 		loop {
-			match tokio::time::timeout(LIMIT, download.next_event())
+			match time::timeout(LIMIT, download.next_event())
 				.await
 				.expect("blob download timeout")
 				.expect("blob download event")
@@ -137,10 +142,7 @@ impl Drop for RealEnv {
 	}
 }
 
-async fn connect_env(
-	server: &Arc<EnvServer>,
-	name: &str,
-) -> (EnvClient, tokio::task::JoinHandle<()>) {
+async fn connect_env(server: &Arc<EnvServer>, name: &str) -> (EnvClient, JoinHandle<()>) {
 	let (client, transport) = EnvClient::in_process(64);
 	client.set_admitter(AllowAdmission);
 	let host = Arc::clone(server);
@@ -205,17 +207,17 @@ fn shell_turn(name: &str, command: String) -> ScriptedTurn {
 	let call = tool_call_item(2, "shell-detached", &identity, args.clone());
 	ScriptedTurn::events([
 		accepted_event(false),
-		turn_event(inference::turn_event::Event::PartStart(inference::PartStart {
+		scripted_turn_event(turn_event::Event::PartStart(inference::PartStart {
 			index:        0,
-			kind:         inference::part_start::Kind::ToolCall as i32,
+			kind:         part_start::Kind::ToolCall as i32,
 			tool_call_id: "shell-detached".to_owned(),
 			tool_name:    "shell".to_owned(),
 		})),
-		turn_event(inference::turn_event::Event::PartDelta(inference::PartDelta {
+		scripted_turn_event(turn_event::Event::PartDelta(inference::PartDelta {
 			index: 0,
 			chunk: args,
 		})),
-		turn_event(inference::turn_event::Event::PartEnd(inference::PartEnd {
+		scripted_turn_event(turn_event::Event::PartEnd(inference::PartEnd {
 			index:     0,
 			signature: Bytes::new(),
 		})),
@@ -236,9 +238,9 @@ fn tool_use_outcome(mut call: thread::Item, head: u64) -> inference::Outcome {
 }
 
 async fn wait_board_empty(board: &omp_agent::JobBoard) {
-	tokio::time::timeout(LIMIT, async {
+	time::timeout(LIMIT, async {
 		while !board.is_empty() {
-			tokio::task::yield_now().await;
+			task::yield_now().await;
 		}
 	})
 	.await
@@ -246,7 +248,7 @@ async fn wait_board_empty(board: &omp_agent::JobBoard) {
 }
 
 async fn release_fifo(path: PathBuf) {
-	tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(move || std::fs::write(path, b"go\n")))
+	time::timeout(LIMIT, task::spawn_blocking(move || fs::write(path, b"go\n")))
 		.await
 		.expect("FIFO writer timeout")
 		.expect("FIFO writer task")
@@ -259,7 +261,7 @@ async fn one_job_event(
 	registered: bool,
 ) -> Arc<AgentEvent> {
 	loop {
-		let event = tokio::time::timeout(LIMIT, events.recv())
+		let event = time::timeout(LIMIT, events.recv())
 			.await
 			.expect("agent job event timeout")
 			.expect("agent event bus closed");
@@ -283,7 +285,7 @@ fn delta(input: &TurnInput) -> &inference::ThreadDelta {
 
 fn tool_result<'a>(items: &'a [thread::Item], call_id: &str) -> &'a thread::ToolResult {
 	let mut matching = items.iter().filter_map(|item| match item.kind.as_ref() {
-		Some(thread::item::Kind::ToolResult(result)) if result.call_id == call_id => Some(result),
+		Some(item::Kind::ToolResult(result)) if result.call_id == call_id => Some(result),
 		_ => None,
 	});
 	let result = matching.next().expect("canonical detached ToolResult");
@@ -307,18 +309,16 @@ fn detached_ref(result: &thread::ToolResult) -> JobRef {
 
 fn proto_json(value: &inference::Value) -> JsonValue {
 	match value.kind.as_ref().expect("proto JSON value kind") {
-		inference::value::Kind::Null(_) => JsonValue::Null,
-		inference::value::Kind::Bool(value) => JsonValue::Bool(*value),
-		inference::value::Kind::Int(value) => JsonValue::from(*value),
-		inference::value::Kind::Uint(value) => JsonValue::from(*value),
-		inference::value::Kind::Double(value) => serde_json::Number::from_f64(*value)
+		value::Kind::Null(_) => JsonValue::Null,
+		value::Kind::Bool(value) => JsonValue::Bool(*value),
+		value::Kind::Int(value) => JsonValue::from(*value),
+		value::Kind::Uint(value) => JsonValue::from(*value),
+		value::Kind::Double(value) => serde_json::Number::from_f64(*value)
 			.map(JsonValue::Number)
 			.expect("finite JSON number"),
-		inference::value::Kind::String(value) => JsonValue::String(value.clone()),
-		inference::value::Kind::List(values) => {
-			JsonValue::Array(values.values.iter().map(proto_json).collect())
-		},
-		inference::value::Kind::Map(values) => JsonValue::Object(
+		value::Kind::String(value) => JsonValue::String(value.clone()),
+		value::Kind::List(values) => JsonValue::Array(values.values.iter().map(proto_json).collect()),
+		value::Kind::Map(values) => JsonValue::Object(
 			values
 				.fields
 				.iter()
@@ -343,7 +343,7 @@ fn settlement_parts<'a>(
 	item: &'a thread::Item,
 	job_id: &str,
 ) -> Option<(&'a str, &'a thread::Blob)> {
-	let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+	let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
 		return None;
 	};
 	if message.role != thread::Role::System as i32 {
@@ -353,14 +353,14 @@ fn settlement_parts<'a>(
 		.parts
 		.iter()
 		.find_map(|part| match part.kind.as_ref() {
-			Some(thread::part::Kind::Text(text)) if text.contains(job_id) => Some(text.as_str()),
+			Some(part::Kind::Text(text)) if text.contains(job_id) => Some(text.as_str()),
 			_ => None,
 		})?;
 	let blob = message
 		.parts
 		.iter()
 		.find_map(|part| match part.kind.as_ref() {
-			Some(thread::part::Kind::Blob(blob)) => Some(blob),
+			Some(part::Kind::Blob(blob)) => Some(blob),
 			_ => None,
 		})?;
 	Some((text, blob))
@@ -479,7 +479,7 @@ async fn wait_terminal(client: &EnvClient, name: &str, generation: u64) {
 		.await
 		.expect("attach to named process");
 	loop {
-		let event = tokio::time::timeout(LIMIT, attachment.next_event())
+		let event = time::timeout(LIMIT, attachment.next_event())
 			.await
 			.expect("process terminal timeout")
 			.expect("process attachment event")
@@ -534,7 +534,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	);
 	let events = agent.events().subscribe_lossless();
 	let mut detached_start = tokio::spawn(async move {
-		tokio::time::timeout(
+		time::timeout(
 			LIMIT,
 			agent.submit(
 				[user_item("start detached shell")],
@@ -568,7 +568,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 		.parts
 		.iter()
 		.find_map(|part| match part.kind.as_ref() {
-			Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+			Some(part::Kind::Text(text)) => Some(text.as_str()),
 			_ => None,
 		});
 	assert_eq!(
@@ -588,7 +588,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	// process remains owned by the environment.
 	assert!(!detached_start.is_finished(), "detached-start submit returned before gate release");
 	detached_start.abort();
-	let _ = tokio::time::timeout(LIMIT, detached_start)
+	let _ = time::timeout(LIMIT, detached_start)
 		.await
 		.expect("detached-start cancellation timeout");
 
@@ -614,7 +614,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	let settled_events = reopened.events().subscribe_lossless();
 	let board = Arc::clone(reopened.jobs());
 	let resumed = tokio::spawn(async move {
-		let result = tokio::time::timeout(
+		let result = time::timeout(
 			LIMIT,
 			reopened.submit(
 				Vec::<thread::Item>::new(),
@@ -634,7 +634,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	wait_board_empty(&board).await;
 	assert!(!resumed.is_finished(), "settlement bypassed the blocked turn boundary");
 	settlement_gate.release();
-	let (reopened, resumed_result) = tokio::time::timeout(LIMIT, resumed)
+	let (reopened, resumed_result) = time::timeout(LIMIT, resumed)
 		.await
 		.expect("resumed detached submit join timeout")
 		.expect("resumed detached submit task");
@@ -687,7 +687,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 			name:       Str::from(early_name),
 			generation: started.generation,
 		},
-		metadata: std::sync::Arc::default(),
+		metadata: Arc::default(),
 		artifact: ExpectedArtifact {
 			description: sf!("expected PNG render"),
 			media_type:  Some(sf!("image/png")),
@@ -725,7 +725,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 			early_gate.release();
 		}
 	});
-	tokio::time::timeout(
+	time::timeout(
 		LIMIT,
 		final_agent.submit(
 			[user_item("observe retained early exit")],
@@ -774,28 +774,27 @@ async fn detached_replay_acceptance_comes_from_real_gateway_authority() {
 	let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
 	let first_outcome = {
 		let client = gateway.client().await.expect("first real gateway client");
-		let mut session =
-			tokio::time::timeout(LIMIT, client.turn(turn_id.clone(), input.clone(), &options))
-				.await
-				.expect("first gateway turn open timeout")
-				.expect("first gateway turn open");
+		let mut session = time::timeout(LIMIT, client.turn(turn_id.clone(), input.clone(), &options))
+			.await
+			.expect("first gateway turn open timeout")
+			.expect("first gateway turn open");
 		let mut events = session.events();
-		let accepted = tokio::time::timeout(LIMIT, events.next())
+		let accepted = time::timeout(LIMIT, events.next())
 			.await
 			.expect("first acceptance timeout")
 			.expect("first acceptance event")
 			.expect("first acceptance protocol");
 		assert!(matches!(
 			accepted.event,
-			Some(inference::turn_event::Event::Accepted(inference::Accepted { replay: false }))
+			Some(turn_event::Event::Accepted(inference::Accepted { replay: false }))
 		));
 		loop {
-			let event = tokio::time::timeout(LIMIT, events.next())
+			let event = time::timeout(LIMIT, events.next())
 				.await
 				.expect("first outcome timeout")
 				.expect("first outcome event")
 				.expect("first outcome protocol");
-			if let Some(inference::turn_event::Event::Outcome(outcome)) = event.event {
+			if let Some(turn_event::Event::Outcome(outcome)) = event.event {
 				break outcome;
 			}
 		}
@@ -807,27 +806,27 @@ async fn detached_replay_acceptance_comes_from_real_gateway_authority() {
 		.expect("restart durable gateway authority");
 	let replay_outcome = {
 		let client = gateway.client().await.expect("replay real gateway client");
-		let mut session = tokio::time::timeout(LIMIT, client.turn(turn_id, input, &options))
+		let mut session = time::timeout(LIMIT, client.turn(turn_id, input, &options))
 			.await
 			.expect("replay gateway turn open timeout")
 			.expect("replay gateway turn open");
 		let mut events = session.events();
-		let accepted = tokio::time::timeout(LIMIT, events.next())
+		let accepted = time::timeout(LIMIT, events.next())
 			.await
 			.expect("replay acceptance timeout")
 			.expect("replay acceptance event")
 			.expect("replay acceptance protocol");
 		assert!(matches!(
 			accepted.event,
-			Some(inference::turn_event::Event::Accepted(inference::Accepted { replay: true }))
+			Some(turn_event::Event::Accepted(inference::Accepted { replay: true }))
 		));
 		loop {
-			let event = tokio::time::timeout(LIMIT, events.next())
+			let event = time::timeout(LIMIT, events.next())
 				.await
 				.expect("replay outcome timeout")
 				.expect("replay outcome event")
 				.expect("replay outcome protocol");
-			if let Some(inference::turn_event::Event::Outcome(outcome)) = event.event {
+			if let Some(turn_event::Event::Outcome(outcome)) = event.event {
 				break outcome;
 			}
 		}

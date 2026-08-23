@@ -52,6 +52,8 @@ mod colors {
 	use rustc_hash::FxHashMap;
 
 	use super::PathData;
+	#[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
+	use crate::support::xattr::has_security_cap_acl;
 
 	/// ANSI CSI (Control Sequence Introducer)
 	const ANSI_CSI: &str = "\x1b[";
@@ -571,7 +573,7 @@ mod colors {
 			let has_capabilities = style_manager
 				.colors
 				.has_explicit_style_for(Indicator::Capabilities)
-				&& crate::support::xattr::has_security_cap_acl(&path.p_buf);
+				&& has_security_cap_acl(&path.p_buf);
 
 			// If the file has capabilities, use a specific style for `ca` (capabilities)
 			if has_capabilities {
@@ -926,6 +928,8 @@ mod config {
 		CompiledPattern::new(&characters.into_iter().collect::<String>())
 	}
 
+	use clap::parser;
+
 	use super::{
 		Host, LsError, LsRuntime,
 		colors::{LsColorsParseError, validate_ls_colors},
@@ -1136,7 +1140,7 @@ mod config {
 	/// A Files variant representing the type of files to display.
 	fn extract_files(options: &clap::ArgMatches) -> Files {
 		let get_last_index = |flag: &str| -> usize {
-			if options.value_source(flag) == Some(clap::parser::ValueSource::CommandLine) {
+			if options.value_source(flag) == Some(parser::ValueSource::CommandLine) {
 				options.index_of(flag).unwrap_or(0)
 			} else {
 				0
@@ -1166,7 +1170,7 @@ mod config {
 	/// A Sort variant representing the sorting method to use.
 	fn extract_sort(options: &clap::ArgMatches) -> Sort {
 		let get_last_index = |flag: &str| -> usize {
-			if options.value_source(flag) == Some(clap::parser::ValueSource::CommandLine) {
+			if options.value_source(flag) == Some(parser::ValueSource::CommandLine) {
 				options.index_of(flag).unwrap_or(0)
 			} else {
 				0
@@ -1313,7 +1317,7 @@ mod config {
 		}
 
 		let get_last_index = |flag: &str| -> usize {
-			if options.value_source(flag) == Some(clap::parser::ValueSource::CommandLine) {
+			if options.value_source(flag) == Some(parser::ValueSource::CommandLine) {
 				options.index_of(flag).unwrap_or(0)
 			} else {
 				0
@@ -1636,7 +1640,7 @@ mod config {
 				]
 				.iter()
 				.filter_map(|opt| {
-					if options.value_source(opt) == Some(clap::parser::ValueSource::CommandLine) {
+					if options.value_source(opt) == Some(parser::ValueSource::CommandLine) {
 						options.indices_of(opt)
 					} else {
 						None
@@ -1648,7 +1652,7 @@ mod config {
 					format = Format::Long;
 				} else if let Some(mut indices) = options.indices_of(options::format::ONE_LINE)
 					&& options.value_source(options::format::ONE_LINE)
-						== Some(clap::parser::ValueSource::CommandLine)
+						== Some(parser::ValueSource::CommandLine)
 					&& indices.any(|i| i > idx)
 				{
 					format = Format::OneLine;
@@ -1834,7 +1838,7 @@ mod config {
 				options::quoting::LITERAL,
 			];
 			let get_last = |flag: &str| -> usize {
-				if options.value_source(flag) == Some(clap::parser::ValueSource::CommandLine) {
+				if options.value_source(flag) == Some(parser::ValueSource::CommandLine) {
 					options.index_of(flag).unwrap_or(0)
 				} else {
 					0
@@ -2049,7 +2053,7 @@ mod dired {
 	//! GNU dired position tracking for the `ls` builtin.
 
 	use std::{
-		fmt,
+		fmt::{self, Display},
 		io::{self, Write},
 	};
 
@@ -2105,7 +2109,7 @@ mod dired {
 		pub line_offset:        usize,
 	}
 
-	impl fmt::Display for BytePosition {
+	impl Display for BytePosition {
 		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 			write!(f, "{} {}", self.start, self.end)
 		}
@@ -2383,6 +2387,7 @@ mod display {
 		ffi::{OsStr, OsString},
 		fmt::Write as FmtWrite,
 		fs::{self, DirEntry, FileType, Metadata},
+		io,
 		io::Write,
 		sync::LazyLock,
 		time::SystemTime,
@@ -2505,7 +2510,7 @@ mod display {
 		path_data: &PathData,
 		out: &mut W,
 		config: &Config,
-	) -> std::io::Result<()> {
+	) -> io::Result<()> {
 		let escaped_name = escape_dir_name_with_locale(path_data.path().as_os_str(), config);
 
 		let name = if config.hyperlink && !config.dired {
@@ -2683,7 +2688,7 @@ mod display {
 		config: &Config,
 		state: &mut ListState,
 		dired: &mut DiredOutput,
-	) -> std::io::Result<()> {
+	) -> io::Result<()> {
 		// `-Z`, `--context`:
 		// Display the SELinux security context or '?' if none is found. When used with
 		// the `-l` option, print the security context to the left of the size column.
@@ -2892,7 +2897,7 @@ mod display {
 		direction: Direction,
 		tab_size: usize,
 		out: &mut W,
-	) -> std::io::Result<()> {
+	) -> io::Result<()> {
 		if cells.is_empty() {
 			return Ok(());
 		}
@@ -2954,7 +2959,7 @@ mod display {
 		out: &mut W,
 		quoted: bool,
 		tab_size: usize,
-	) -> std::io::Result<()> {
+	) -> io::Result<()> {
 		if width == 0 {
 			// If the width is 0 we print one single line
 			let mut printed_something = false;
@@ -2991,7 +2996,7 @@ mod display {
 		padding: &PaddingCollection,
 		config: &Config,
 		out: &mut impl Write,
-	) -> std::io::Result<()> {
+	) -> io::Result<()> {
 		#[cfg(unix)]
 		{
 			if config.inode {
@@ -3074,7 +3079,7 @@ mod display {
 		config: &Config,
 		recent_time_range: &RangeInclusive<SystemTime>,
 		out: &mut Vec<u8>,
-	) -> std::io::Result<()> {
+	) -> io::Result<()> {
 		let Some(time) = metadata_get_time(metadata, config.time) else {
 			out.extend(b"???");
 			return Ok(());
@@ -3096,7 +3101,7 @@ mod display {
 		let mut writer = StdIoWrite(out);
 		broken_down
 			.format_with_config(&TimeFormatConfig::new().lenient(true), fmt, &mut writer)
-			.map_err(|err| std::io::Error::other(err.to_string()))
+			.map_err(|err| io::Error::other(err.to_string()))
 	}
 
 	fn display_len_or_rdev(metadata: &Metadata, config: &Config) -> SizeOrDeviceId {
@@ -3366,7 +3371,7 @@ mod display {
 		state: &mut ListState,
 		dired: &mut DiredOutput,
 		quoted: bool,
-	) -> std::io::Result<()> {
+	) -> io::Result<()> {
 		// apply normal color to non filename outputs
 		if let Some(style_manager) = &mut state.style_manager {
 			state
@@ -3847,7 +3852,7 @@ mod display {
 		os_bytes_lossy(haystack).starts_with(needle)
 	}
 
-	fn write_os_str<W: Write>(writer: &mut W, string: &OsStr) -> std::io::Result<()> {
+	fn write_os_str<W: Write>(writer: &mut W, string: &OsStr) -> io::Result<()> {
 		writer.write_all(&os_bytes_lossy(string))
 	}
 
@@ -3904,6 +3909,8 @@ mod display {
 	}
 }
 
+use std::io;
+
 use colors::StyleManager;
 pub use config::{Config, options};
 use config::{Dereference, Files, Sort, options::QUOTING_STYLE};
@@ -3917,7 +3924,7 @@ enum LsError {
 	InvalidLineWidth(String),
 
 	#[error("general io error: {0}")]
-	IOError(#[from] std::io::Error),
+	IOError(#[from] io::Error),
 
 	#[error("{}", match .1.kind() {
 		ErrorKind::NotADirectory => format!("cannot access {}: Not a directory", .0.quote()),
@@ -3936,7 +3943,7 @@ enum LsError {
 			format!("unknown io error: {}, '{:?}'", .0.quote(), .1)
 		},
 	})]
-	IOErrorContext(PathBuf, std::io::Error, bool, bool),
+	IOErrorContext(PathBuf, io::Error, bool, bool),
 
 	#[error("invalid --block-size argument '{0}'")]
 	BlockSizeParseError(String),
@@ -3974,7 +3981,8 @@ struct LsRuntime {
 
 impl LsRuntime {
 	fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
-		let normalized_path = omp_shell_engine::sys::fs::normalize_shell_path(path.as_ref());
+		use omp_shell_engine::sys::fs;
+		let normalized_path = fs::normalize_shell_path(path.as_ref());
 		let path = normalized_path.as_ref();
 		if path.is_absolute() {
 			path.to_path_buf()
@@ -5002,7 +5010,7 @@ struct ListState<'a> {
 }
 
 #[allow(clippy::cognitive_complexity, reason = "listing coordinates traversal and output state")]
-pub fn list(locs: Vec<&Path>, config: &Config, stdout: OpenFile) -> std::io::Result<()> {
+pub fn list(locs: Vec<&Path>, config: &Config, stdout: OpenFile) -> io::Result<()> {
 	let mut files = Vec::<PathData>::new();
 	let mut dirs = Vec::<PathData>::new();
 	let mut dired = DiredOutput::default();
@@ -5219,7 +5227,7 @@ fn depth_first_list(
 	state: &mut ListState,
 	dired: &mut DiredOutput,
 	is_top_level: bool,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
 	let path_data = PathData::new(dir_path.as_path().into(), None, None, config, false);
 
 	// Print dir heading - name... 'total' comes after error display
@@ -5358,7 +5366,7 @@ fn depth_first_list(
 	Ok(())
 }
 
-fn get_metadata_with_deref_opt(path: &Path, dereference: bool) -> std::io::Result<Metadata> {
+fn get_metadata_with_deref_opt(path: &Path, dereference: bool) -> io::Result<Metadata> {
 	if dereference {
 		path.metadata()
 	} else {
@@ -5366,11 +5374,7 @@ fn get_metadata_with_deref_opt(path: &Path, dereference: bool) -> std::io::Resul
 	}
 }
 
-fn write_total<W: Write>(
-	items: &[PathData],
-	config: &Config,
-	out: &mut W,
-) -> std::io::Result<usize> {
+fn write_total<W: Write>(items: &[PathData], config: &Config, out: &mut W) -> io::Result<usize> {
 	let mut total_size = 0;
 	for item in items {
 		total_size += item

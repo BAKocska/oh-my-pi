@@ -8,6 +8,7 @@ pub mod signal;
 
 use std::{
 	future::Future,
+	pin,
 	pin::Pin,
 	sync::{
 		Arc,
@@ -228,7 +229,7 @@ fn deterministic_block_on<F: Future>(scheduler: &deterministic::Scheduler, futur
 	let wake = Arc::new(RootWake(AtomicBool::new(true)));
 	let waker = Waker::from(Arc::clone(&wake));
 	let mut context = Context::from_waker(&waker);
-	let mut future = std::pin::pin!(future);
+	let mut future = pin::pin!(future);
 	loop {
 		wake.0.store(false, Ordering::Release);
 		if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
@@ -243,6 +244,9 @@ fn deterministic_block_on<F: Future>(scheduler: &deterministic::Scheduler, futur
 
 #[cfg(test)]
 mod tests {
+
+	use std::thread;
+
 	use futures_lite::future::yield_now;
 	use parking_lot::Mutex;
 
@@ -318,7 +322,7 @@ mod tests {
 	fn production_pool_runs_timer_and_cross_thread_task() {
 		let executor = Executor::new(Some(2));
 		let task_executor = executor.clone();
-		let task = std::thread::spawn(move || task_executor.spawn(async { 7 }))
+		let task = thread::spawn(move || task_executor.spawn(async { 7 }))
 			.join()
 			.expect("cross-thread spawner succeeds");
 		let value = executor.block_on(async {
@@ -335,7 +339,8 @@ mod tests {
 		let value = executor.block_on(async {
 			bridge
 				.spawn(async {
-					tokio::time::sleep(Duration::from_millis(10)).await;
+					use tokio::time;
+					time::sleep(Duration::from_millis(10)).await;
 					7
 				})
 				.await

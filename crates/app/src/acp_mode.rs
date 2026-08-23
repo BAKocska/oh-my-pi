@@ -1,12 +1,16 @@
 //! Agent Client Protocol (ACP) server over newline-delimited JSON on stdio.
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::{
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
+	env, fs,
 	future::Future,
+	io,
 	io::IsTerminal as _,
 	path::{Path, PathBuf},
 	pin::Pin,
-	process::Stdio,
+	process::{self, Stdio},
 	sync::{Arc, Weak},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,11 +23,12 @@ use omp_agent::{
 	ApprovalSource, ApprovalSpec, EventProvenance, EventSubscription, EventVisibility, PlanState,
 	RunSettlement,
 };
-use omp_catalog::{ModelKey, ThinkingEffort, clamp_thinking_effort};
+use omp_catalog::{ModelKey, ThinkingEffort, clamp_thinking_effort, snapshot};
 use omp_core::{CowBytes, Hash32, Str, ToolPath, sf};
 use omp_driver::{
 	headless::{HeadlessSession, HeadlessSessionOptions},
 	plan::PlanArtifactStore,
+	skills::SkillInvocationKind,
 };
 use omp_envd::{
 	docs::AcpDocumentBackend,
@@ -33,20 +38,25 @@ use omp_envd::{
 use omp_inference::call::{ContentPart, MediaInput};
 use omp_proto::{
 	env::v1 as env_wire,
-	inference::v1::{self as inference_wire, Effort, Reasoning, part_start, value},
-	thread::v1::{self as thread, Blob, Item, Message, Part, Role, item, part},
+	inference::v1::{self as inference_wire, Effort, Reasoning, part_start, turn_event, value},
+	thread::v1::{self as thread, Blob, Item, Message, Part, Role, blob, item, part},
 	ui::v1::{ui_effect, ui_request},
 };
 use omp_storage::index::{SessionFilter, SessionIndex};
 use omp_tool::{Presentation, ToolIdentity};
-use omp_tools::shell::{
-	ExecOutcome, ExecStatus, Fault as ShellFault, OutputChannel, RunEvent, Update,
+use omp_tools::{
+	ask,
+	shell::{ExecOutcome, ExecStatus, Fault as ShellFault, OutputChannel, RunEvent, Update},
 };
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use tokio::{
-	io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
+	io::{AsyncBufReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader, stdin, stdout},
+	process::Command,
 	sync::oneshot,
+	task::{self, JoinHandle},
+	time,
+	time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -70,16 +80,16 @@ enum AcpPromptIntercept {
 
 /// Runs ACP using stdin for NDJSON requests and stdout for NDJSON responses.
 pub async fn run(args: AcpArgs) -> miette::Result<()> {
-	if std::io::stdin().is_terminal() {
+	if io::stdin().is_terminal() {
 		eprintln!("warning: `omp acp` expects newline-delimited JSON on stdin");
 	}
-	let root = std::fs::canonicalize(&args.project).into_diagnostic()?;
+	let root = fs::canonicalize(&args.project).into_diagnostic()?;
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let state_dir = omp_env::project_state::directory(&data_dir, &root).into_diagnostic()?;
-	std::fs::create_dir_all(state_dir.join("sessions")).into_diagnostic()?;
+	fs::create_dir_all(state_dir.join("sessions")).into_diagnostic()?;
 	let index = Arc::new(SessionIndex::open(state_dir.join("sessions.sqlite3")).into_diagnostic()?);
 	let local_root = state_dir.join("local");
-	std::fs::create_dir_all(&local_root).into_diagnostic()?;
+	fs::create_dir_all(&local_root).into_diagnostic()?;
 	let content = omp_driver::discovery::active_content_snapshots(&root);
 	let configured_model = omp_driver::settings::current(&data_dir)
 		.into_diagnostic()?
@@ -89,14 +99,14 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 		.model
 		.or(configured_model)
 		.ok_or_else(|| miette!("acp mode requires --model or config.default_model"))?;
-	let catalog = omp_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
+	let catalog = snapshot::Catalog::try_embedded().into_diagnostic()?;
 	let models = catalog
 		.models()
 		.iter()
 		.map(|entry| entry.key.as_str().to_owned())
 		.collect();
 	let (output_tx, output_rx) = flume::unbounded();
-	let writer = tokio::spawn(write_ndjson(tokio::io::stdout(), output_rx));
+	let writer = tokio::spawn(write_ndjson(stdout(), output_rx));
 	let runtime = Arc::new(Runtime {
 		output: output_tx.clone(),
 		state:  Mutex::new(State {
@@ -146,7 +156,7 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 	for session in sessions {
 		let _ = session.close_adapters().await;
 	}
-	tokio::time::sleep(CANCEL_CLEANUP.min(Duration::from_millis(20))).await;
+	time::sleep(CANCEL_CLEANUP.min(Duration::from_millis(20))).await;
 	drop(runtime);
 	drop(output_tx);
 	writer.await.into_diagnostic()??;
@@ -154,7 +164,7 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 }
 
 async fn read_ndjson(runtime: Arc<Runtime>) -> miette::Result<()> {
-	let mut lines = BufReader::new(tokio::io::stdin()).lines();
+	let mut lines = BufReader::new(stdin()).lines();
 	while let Some(line) = lines.next_line().await.into_diagnostic()? {
 		if line.trim().is_empty() {
 			continue;
@@ -184,7 +194,7 @@ async fn read_ndjson(runtime: Arc<Runtime>) -> miette::Result<()> {
 	Ok(())
 }
 
-async fn write_ndjson<W: tokio::io::AsyncWrite + Unpin>(
+async fn write_ndjson<W: AsyncWrite + Unpin>(
 	mut output: W,
 	receiver: Receiver<Value>,
 ) -> miette::Result<()> {
@@ -233,16 +243,31 @@ struct PeerCapabilities {
 }
 
 struct AcpSession {
-	headless:         tokio::sync::Mutex<HeadlessSession>,
+	asynchronous:     AcpSessionAsync,
 	events:           EventSubscription,
 	meta:             Mutex<AcpSessionMeta>,
 	mapper:           Mutex<AcpEventMapper>,
-	mcp_update:       tokio::sync::Mutex<()>,
 	terminal_backend: AcpTerminalBackend,
 	capabilities:     PeerCapabilities,
 	root:             PathBuf,
-	forwarders:       Mutex<Vec<tokio::task::JoinHandle<()>>>,
+	forwarders:       Mutex<Vec<JoinHandle<()>>>,
 }
+mod acp_session_async {
+	use omp_driver::headless::HeadlessSession;
+	use tokio::sync::Mutex;
+
+	pub(super) struct AcpSessionAsync {
+		pub(super) headless:   Mutex<HeadlessSession>,
+		pub(super) mcp_update: Mutex<()>,
+	}
+
+	impl AcpSessionAsync {
+		pub(super) fn new(headless: HeadlessSession) -> Self {
+			Self { headless: Mutex::new(headless), mcp_update: Mutex::new(()) }
+		}
+	}
+}
+use acp_session_async::AcpSessionAsync;
 
 #[derive(Clone)]
 struct AcpDocumentBridge {
@@ -260,13 +285,8 @@ impl omp_tools::ask::AskPresenter for AcpAskPresenter {
 	fn present<'p>(
 		&'p self,
 		questions: &'p [omp_tools::ask::Question],
-	) -> Pin<
-		Box<
-			dyn Future<Output = Result<omp_tools::ask::Presentation, omp_tools::ask::Fault>>
-				+ Send
-				+ 'p,
-		>,
-	> {
+	) -> Pin<Box<dyn Future<Output = Result<omp_tools::ask::Presentation, ask::Fault>> + Send + 'p>>
+	{
 		let runtime = self.runtime.upgrade();
 		Box::pin(async move {
 			let runtime = runtime.ok_or_else(|| ask_fault("ACP peer disconnected"))?;
@@ -274,9 +294,7 @@ impl omp_tools::ask::AskPresenter for AcpAskPresenter {
 			let response = runtime
 				.peer_request("session/unstable_createElicitation", params)
 				.await
-				.map_err(|error| omp_tools::ask::Fault::Presenter {
-					message: Str::from(error.to_string()),
-				})?;
+				.map_err(|error| ask::Fault::Presenter { message: Str::from(error.to_string()) })?;
 			let accepted = response.get("action").and_then(Value::as_str) == Some("accept");
 			let content = response.get("content").and_then(Value::as_object);
 			if !accepted || content.is_none() {
@@ -363,10 +381,10 @@ impl AcpSession {
 		for task in self.forwarders.lock().drain(..) {
 			task.abort();
 		}
-		let _update = self.mcp_update.lock().await;
+		let _update = self.asynchronous.mcp_update.lock().await;
 		self.terminal_backend.close_all().await;
 		let (client, mut mounts) = {
-			let headless = self.headless.lock().await;
+			let headless = self.asynchronous.headless.lock().await;
 			headless.bind_acp_exec(None);
 			headless.bind_acp_documents(None);
 			headless.bind_approval_authority(None, None);
@@ -405,7 +423,7 @@ impl SessionMcpMountSet {
 			.into_iter()
 			.filter(|entry| entry.scope == env_wire::McpConfigScope::Project as i32)
 			.map(|entry| Str::from(entry.name))
-			.collect::<std::collections::BTreeSet<_>>();
+			.collect::<BTreeSet<_>>();
 		let next_generation = self.generation.wrapping_add(1).max(1);
 		let mut next = BTreeMap::new();
 		let session_prefix = scoped_mcp_prefix(session_id);
@@ -539,7 +557,7 @@ impl AcpTerminalBackend {
 					self.cleanup_late_create(create);
 					return Err(miette!("ACP terminal execution was cancelled before creation"));
 				},
-				() = tokio::time::sleep(limit) => {
+				() = time::sleep(limit) => {
 					self.cleanup_late_create(create);
 					return Err(miette!("ACP terminal creation timed out"));
 				},
@@ -561,7 +579,7 @@ impl AcpTerminalBackend {
 		if let Some(events) = events {
 			let _ = events.send(Ok(RunEvent::Started { exec_id: exec_id.clone() }));
 		}
-		let started = tokio::time::Instant::now();
+		let started = Instant::now();
 		let mut last = TerminalSnapshot::default();
 		let mut delivered = String::new();
 		let mut sequence = 0;
@@ -604,7 +622,7 @@ impl AcpTerminalBackend {
 				});
 			tokio::select! {
 				() = cancel.cancelled() => continue,
-				() = tokio::time::sleep(wait) => {},
+				() = time::sleep(wait) => {},
 			}
 			last = self.snapshot_bounded(&runtime, &terminal_id, last).await;
 			if let Some(events) = events {
@@ -637,7 +655,7 @@ impl AcpTerminalBackend {
 		}
 	}
 
-	fn cleanup_late_create(&self, create: tokio::task::JoinHandle<miette::Result<Str>>) {
+	fn cleanup_late_create(&self, create: JoinHandle<miette::Result<Str>>) {
 		let backend = self.clone();
 		tokio::spawn(async move {
 			let Ok(Ok(terminal_id)) = create.await else {
@@ -658,7 +676,7 @@ impl AcpTerminalBackend {
 		fallback: TerminalSnapshot,
 	) -> TerminalSnapshot {
 		let operation = RemoteOperation::PollTerminal { terminal_id: terminal_id.clone() };
-		match tokio::time::timeout(
+		match time::timeout(
 			Duration::from_secs(2),
 			runtime.peer_operation(&self.session_id, &operation),
 		)
@@ -671,7 +689,7 @@ impl AcpTerminalBackend {
 
 	async fn kill_bounded(&self, runtime: &Runtime, terminal_id: &Str) {
 		let operation = RemoteOperation::KillTerminal { terminal_id: terminal_id.clone() };
-		let _ = tokio::time::timeout(
+		let _ = time::timeout(
 			Duration::from_secs(1),
 			runtime.peer_operation(&self.session_id, &operation),
 		)
@@ -680,7 +698,7 @@ impl AcpTerminalBackend {
 
 	async fn release_bounded(&self, runtime: &Runtime, terminal_id: &Str) {
 		let operation = RemoteOperation::ReleaseTerminal { terminal_id: terminal_id.clone() };
-		let _ = tokio::time::timeout(
+		let _ = time::timeout(
 			Duration::from_secs(1),
 			runtime.peer_operation(&self.session_id, &operation),
 		)
@@ -907,13 +925,13 @@ impl AcpEventMapper {
 
 	fn map_turn(&mut self, event: &inference_wire::TurnEvent) -> Vec<Value> {
 		match event.event.as_ref() {
-			Some(inference_wire::turn_event::Event::PartStart(start)) => {
+			Some(turn_event::Event::PartStart(start)) => {
 				if let Ok(kind) = part_start::Kind::try_from(start.kind) {
 					self.parts.insert(start.index, kind);
 				}
 				Vec::new()
 			},
-			Some(inference_wire::turn_event::Event::PartDelta(delta)) => {
+			Some(turn_event::Event::PartDelta(delta)) => {
 				let text = String::from_utf8_lossy(&delta.chunk);
 				match self.parts.get(&delta.index) {
 					Some(part_start::Kind::Text) => {
@@ -928,11 +946,11 @@ impl AcpEventMapper {
 					_ => Vec::new(),
 				}
 			},
-			Some(inference_wire::turn_event::Event::PartEnd(end)) => {
+			Some(turn_event::Event::PartEnd(end)) => {
 				self.parts.remove(&end.index);
 				Vec::new()
 			},
-			Some(inference_wire::turn_event::Event::Outcome(outcome)) => {
+			Some(turn_event::Event::Outcome(outcome)) => {
 				let Some(usage) = outcome.usage.as_ref() else {
 					return Vec::new();
 				};
@@ -940,7 +958,7 @@ impl AcpEventMapper {
 				self.usage = Some(usage.clone());
 				vec![json!({"sessionUpdate":"usage_update","usage":usage})]
 			},
-			Some(inference_wire::turn_event::Event::Error(error)) => {
+			Some(turn_event::Event::Error(error)) => {
 				self.terminal_fault_seen = true;
 				vec![
 					json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":bounded_text(&error.detail)},"error":true}),
@@ -1252,7 +1270,7 @@ impl Runtime {
 			}),
 		);
 		let session = Arc::new(AcpSession {
-			headless: tokio::sync::Mutex::new(headless),
+			asynchronous: AcpSessionAsync::new(headless),
 			events,
 			meta: Mutex::new(AcpSessionMeta {
 				title: None,
@@ -1265,7 +1283,6 @@ impl Runtime {
 				session_generation: generation,
 			}),
 			mapper: Mutex::new(AcpEventMapper::default()),
-			mcp_update: tokio::sync::Mutex::new(()),
 			terminal_backend,
 			capabilities,
 			root,
@@ -1428,6 +1445,7 @@ impl Runtime {
 					},
 					Some(ui_effect::Kind::SetTitle(title)) => {
 						session
+							.asynchronous
 							.headless
 							.lock()
 							.await
@@ -1603,7 +1621,7 @@ impl Runtime {
 			speech_catalog::{SpeechArtifactManifests, SpeechCatalog},
 		};
 		let root = self.state.lock().data_dir.join("models");
-		std::fs::create_dir_all(&root).into_diagnostic()?;
+		fs::create_dir_all(&root).into_diagnostic()?;
 		let store = ArtifactStore::open(&root).into_diagnostic()?;
 		let manifests = SpeechArtifactManifests::pi_parity().into_diagnostic()?;
 		let snapshot = SpeechCatalog
@@ -1669,6 +1687,7 @@ impl Runtime {
 		let supplied_title = params.get("title").and_then(Value::as_str);
 		let session = self.session(&session_id)?;
 		let plan_state = session
+			.asynchronous
 			.headless
 			.lock()
 			.await
@@ -1696,7 +1715,7 @@ impl Runtime {
 			.and_then(Value::as_str)
 			.map_or(!session.capabilities.elicitation, |decision| decision == "execute");
 		{
-			let headless = session.headless.lock().await;
+			let headless = session.asynchronous.headless.lock().await;
 			headless
 				.campaigns()
 				.set_plan_artifact(artifact.url.clone())
@@ -1759,7 +1778,7 @@ impl Runtime {
 		let session = self.session(&session_id)?;
 		let generation = session.meta.lock().session_generation;
 		{
-			let headless = session.headless.lock().await;
+			let headless = session.asynchronous.headless.lock().await;
 			let from = if headless.campaigns().holds_mode("plan") {
 				PlanState::Active
 			} else {
@@ -1812,6 +1831,7 @@ impl Runtime {
 		}
 		let session = self.session(&session_id)?;
 		session
+			.asynchronous
 			.headless
 			.lock()
 			.await
@@ -1830,6 +1850,7 @@ impl Runtime {
 		let model = session.meta.lock().model.clone();
 		let thinking = clamp_thinking_level(&model, requested)?.to_owned();
 		session
+			.asynchronous
 			.headless
 			.lock()
 			.await
@@ -1872,8 +1893,8 @@ impl Runtime {
 			.cloned()
 			.ok_or_else(|| miette!("missing `mcpServers`"))?;
 		let session = self.session(&session_id)?;
-		let _update = session.mcp_update.lock().await;
-		let client = session.headless.lock().await.env().clone();
+		let _update = session.asynchronous.mcp_update.lock().await;
+		let client = session.asynchronous.headless.lock().await.env().clone();
 		let mut mounts = session.meta.lock().mcp_mounts.clone();
 		let mounted = mounts.replace(&client, &session_id, &servers).await?;
 		{
@@ -1890,7 +1911,7 @@ impl Runtime {
 		let title = required_text(params, "title")?;
 		let body = required_text(params, "body")?;
 		let (ticket, supported) = {
-			let mut state = self.state.lock();
+			let state = self.state.lock();
 			let ticket = state.approvals.file(
 				params
 					.get("invocationId")
@@ -1999,7 +2020,7 @@ impl Runtime {
 			let rendered = omp_driver::skills::render_invocation(
 				&skill,
 				invocation.args.as_str(),
-				omp_driver::skills::SkillInvocationKind::User,
+				SkillInvocationKind::User,
 			);
 			self.command_output(session_id, sf!("Skill `{}` loaded for this turn.", skill.name))?;
 			return Ok(Some(AcpPromptIntercept::Prompt(rendered)));
@@ -2170,6 +2191,7 @@ impl Runtime {
 		};
 		if let Some(title) = proposed_title.filter(|_| session.meta.lock().title.is_none()) {
 			session
+				.asynchronous
 				.headless
 				.lock()
 				.await
@@ -2273,7 +2295,7 @@ impl Runtime {
 		session: Arc<AcpSession>,
 		cancellation: CancellationToken,
 	) -> miette::Result<(&'static str, Option<Str>)> {
-		let headless = session.headless.lock().await;
+		let headless = session.asynchronous.headless.lock().await;
 		let interrupt = headless.interrupt_handle();
 		let retry = headless.retry_last_turn(omp_agent::TurnId::new(format!("retry-{}", turn_id())));
 		tokio::pin!(retry);
@@ -2315,7 +2337,7 @@ impl Runtime {
 		instructions: Option<Str>,
 		cancellation: CancellationToken,
 	) -> miette::Result<(&'static str, Option<Str>)> {
-		let headless = session.headless.lock().await;
+		let headless = session.asynchronous.headless.lock().await;
 		let interrupt = headless.interrupt_handle();
 		let handoff = headless
 			.compact_manual(omp_agent::ManualCompactionRequest { mode: None, focus: instructions });
@@ -2352,7 +2374,7 @@ impl Runtime {
 		items: Vec<Item>,
 		cancellation: CancellationToken,
 	) -> miette::Result<&'static str> {
-		let mut headless = session.headless.lock().await;
+		let mut headless = session.asynchronous.headless.lock().await;
 		let interrupt = headless.interrupt_handle();
 		let submit = headless.submit(items, omp_agent::TurnId::new(turn_id()));
 		tokio::pin!(submit);
@@ -2404,7 +2426,7 @@ impl Runtime {
 			if drained == 0 {
 				break;
 			}
-			tokio::task::yield_now().await;
+			task::yield_now().await;
 		}
 		Ok(())
 	}
@@ -2532,15 +2554,15 @@ impl Runtime {
 }
 
 #[cfg(unix)]
-async fn spawn_terminal_auth(provider: &str) -> miette::Result<std::process::ExitStatus> {
-	let terminal = std::fs::OpenOptions::new()
+async fn spawn_terminal_auth(provider: &str) -> miette::Result<process::ExitStatus> {
+	let terminal = OpenOptions::new()
 		.read(true)
 		.write(true)
 		.open("/dev/tty")
 		.into_diagnostic()?;
 	let input = terminal.try_clone().into_diagnostic()?;
 	let output = terminal.try_clone().into_diagnostic()?;
-	tokio::process::Command::new(std::env::current_exe().into_diagnostic()?)
+	Command::new(env::current_exe().into_diagnostic()?)
 		.args(["auth", "login", provider])
 		.stdin(Stdio::from(input))
 		.stdout(Stdio::from(output))
@@ -2551,7 +2573,7 @@ async fn spawn_terminal_auth(provider: &str) -> miette::Result<std::process::Exi
 }
 
 #[cfg(not(unix))]
-async fn spawn_terminal_auth(_provider: &str) -> miette::Result<std::process::ExitStatus> {
+async fn spawn_terminal_auth(_provider: &str) -> miette::Result<process::ExitStatus> {
 	Err(miette!(
 		"terminal authentication is unavailable: this platform has no isolated terminal spawning \
 		 backend"
@@ -2592,7 +2614,7 @@ fn prompt_items(parts: Vec<ContentPart>) -> Vec<Item> {
 							mime:   media_type.to_string(),
 							size:   data.len() as u64,
 							inline: data,
-							detail: thread::blob::Detail::Auto as i32,
+							detail: blob::Detail::Auto as i32,
 						})),
 					});
 				}
@@ -2618,8 +2640,8 @@ fn replay_updates(items: &[Item], root: &Path) -> Vec<Value> {
 				};
 				for part in &message.parts {
 					match part.kind.as_ref() {
-						Some(thread::part::Kind::Text(text)) => replay.push(json!({"sessionUpdate":update,"content":{"type":"text","text":bounded_text(text)}})),
-						Some(thread::part::Kind::Blob(blob)) if blob.mime.starts_with("image/") => replay.push(json!({"sessionUpdate":update,"content":{"type":"image","mimeType":blob.mime,"data":omp_core::base64::encode(&blob.inline)}})),
+						Some(part::Kind::Text(text)) => replay.push(json!({"sessionUpdate":update,"content":{"type":"text","text":bounded_text(text)}})),
+						Some(part::Kind::Blob(blob)) if blob.mime.starts_with("image/") => replay.push(json!({"sessionUpdate":update,"content":{"type":"image","mimeType":blob.mime,"data":omp_core::base64::encode(&blob.inline)}})),
 						_ => {},
 					}
 				}
@@ -2851,8 +2873,8 @@ fn tool_result_content(result: &thread::ToolResult, details: &Value, root: &Path
 	}
 	for part in &result.parts {
 		match part.kind.as_ref() {
-			Some(thread::part::Kind::Text(text)) => content.push(json!({"type":"content","content":{"type":"text","text":bounded_text(text)}})),
-			Some(thread::part::Kind::Blob(blob)) if blob.mime.starts_with("image/") => content.push(json!({"type":"content","content":{"type":"image","mimeType":blob.mime,"data":omp_core::base64::encode(&blob.inline)}})),
+			Some(part::Kind::Text(text)) => content.push(json!({"type":"content","content":{"type":"text","text":bounded_text(text)}})),
+			Some(part::Kind::Blob(blob)) if blob.mime.starts_with("image/") => content.push(json!({"type":"content","content":{"type":"image","mimeType":blob.mime,"data":omp_core::base64::encode(&blob.inline)}})),
 			_ => {},
 		}
 	}
@@ -3078,7 +3100,7 @@ fn clamp_thinking_level(model: &str, requested: &str) -> miette::Result<&'static
 	let requested = requested
 		.parse::<ThinkingEffort>()
 		.map_err(|_| miette!("unknown thinking level `{requested}`"))?;
-	let catalog = omp_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
+	let catalog = snapshot::Catalog::try_embedded().into_diagnostic()?;
 	let model = catalog
 		.model(ModelKey::from_ref(model))
 		.ok_or_else(|| miette!("unknown model `{model}`"))?;
@@ -3212,8 +3234,8 @@ fn ask_answers(
 		.collect()
 }
 
-fn ask_fault(message: &'static str) -> omp_tools::ask::Fault {
-	omp_tools::ask::Fault::Presenter { message: Str::new_static(message) }
+fn ask_fault(message: &'static str) -> ask::Fault {
+	ask::Fault::Presenter { message: Str::new_static(message) }
 }
 
 fn required_text<'a>(params: &'a Map<String, Value>, name: &str) -> miette::Result<&'a str> {
@@ -3270,23 +3292,51 @@ fn terminal_snapshot(value: Value) -> Option<TerminalSnapshot> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteOperation {
 	/// Read a remote UTF-8 file.
-	ReadText { path: Str, line: Option<u64>, limit: Option<u64> },
+	ReadText {
+		/// ACP `fs/read_text_file.path`, resolved to an absolute workspace path.
+		path:  Str,
+		/// Optional one-based ACP `fs/read_text_file.line` at which reading
+		/// begins.
+		line:  Option<u64>,
+		/// Optional ACP `fs/read_text_file.limit` maximum number of lines to
+		/// return.
+		limit: Option<u64>,
+	},
 	/// Write a remote UTF-8 file.
-	WriteText { path: Str, content: Str },
+	WriteText {
+		/// ACP `fs/write_text_file.path`, resolved to an absolute workspace path.
+		path:    Str,
+		/// UTF-8 payload carried by ACP `fs/write_text_file.content`.
+		content: Str,
+	},
 	/// Spawn a remote terminal command through the host user's shell.
 	StartTerminal {
+		/// Executable carried by ACP `terminal/create.command`.
 		command:           Str,
+		/// Argument vector carried by ACP `terminal/create.args`.
 		args:              Vec<Str>,
+		/// Environment name-value pairs projected into ACP `terminal/create.env`.
 		env:               BTreeMap<Str, Str>,
+		/// Optional working directory carried by ACP `terminal/create.cwd`.
 		cwd:               Option<Str>,
+		/// ACP `terminal/create.outputByteLimit` cap in bytes.
 		output_byte_limit: u64,
 	},
 	/// Poll a remote terminal's output and exit state.
-	PollTerminal { terminal_id: Str },
+	PollTerminal {
+		/// ACP `terminal/output.terminalId` returned by `terminal/create`.
+		terminal_id: Str,
+	},
 	/// Kill a previously spawned remote terminal.
-	KillTerminal { terminal_id: Str },
+	KillTerminal {
+		/// ACP `terminal/kill.terminalId` returned by `terminal/create`.
+		terminal_id: Str,
+	},
 	/// Release a remote terminal after its final output snapshot.
-	ReleaseTerminal { terminal_id: Str },
+	ReleaseTerminal {
+		/// ACP `terminal/release.terminalId` returned by `terminal/create`.
+		terminal_id: Str,
+	},
 }
 
 impl RemoteOperation {
@@ -3300,12 +3350,12 @@ impl RemoteOperation {
 	) -> Self {
 		#[cfg(windows)]
 		let (shell, args) = {
-			let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned());
+			let shell = env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned());
 			(Str::from(shell), vec![sf!("/D"), sf!("/S"), sf!("/C"), command])
 		};
 		#[cfg(not(windows))]
 		let (shell, args) = {
-			let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+			let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
 			(Str::from(shell), vec![sf!("-l"), sf!("-c"), command])
 		};
 		Self::StartTerminal { command: shell, args, env, cwd, output_byte_limit }
@@ -3341,6 +3391,9 @@ impl RemoteOperation {
 
 #[cfg(test)]
 mod tests {
+
+	use std::slice;
+
 	use super::*;
 
 	#[test]
@@ -3458,8 +3511,8 @@ mod tests {
 			multi:       false,
 			recommended: None,
 		};
-		assert!(omp_tools::ask::validate(std::slice::from_ref(&free_text)).is_ok());
-		let free_schema = ask_elicitation_schema(std::slice::from_ref(&free_text));
+		assert!(omp_tools::ask::validate(slice::from_ref(&free_text)).is_ok());
+		let free_schema = ask_elicitation_schema(slice::from_ref(&free_text));
 		assert!(free_schema["properties"].get("q0").is_none());
 		assert_eq!(
 			free_schema["properties"]["q0__other"],

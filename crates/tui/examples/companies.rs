@@ -4,7 +4,7 @@
 //! cargo run -p omp-tui --example companies
 //! ```
 
-use std::{collections::HashMap, io, time::Duration};
+use std::{collections::HashMap, env, fs, io, time::Duration};
 
 use omp_tui::{
 	App, AppEvent, AppOptions, Cached, Elements, Graphics, Prop, Props, Size, TerminalCaps, Ui,
@@ -175,7 +175,7 @@ fn show_stats(app: &mut App, chosen: Option<&str>) {
 
 fn forced_from_args(caps: &TerminalCaps) -> Option<Graphics> {
 	let mut forced = None;
-	for argument in std::env::args().skip(1) {
+	for argument in env::args().skip(1) {
 		forced = match argument.as_str() {
 			"--cells" => Some(Graphics::Cells),
 			"--kitty" if caps.kitty_placeholders => Some(Graphics::KittyPlaceholders),
@@ -203,7 +203,7 @@ async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 	if app.caps().graphics != Graphics::Cells {
 		for (index, provider) in PROVIDERS.iter().enumerate() {
 			let path = format!("{ASSET_DIR}/{}.png", provider.id);
-			let png = executor.unblock(move || std::fs::read(path)).await?;
+			let png = executor.unblock(move || fs::read(path)).await?;
 			app.renderer_mut().register_image(
 				u32::try_from(index + 1).expect("provider count fits image IDs"),
 				png,
@@ -238,13 +238,16 @@ const fn graphics_label(graphics: Graphics) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+	use std::{fs, mem, time};
+
 	use omp_tui::{Key, Mouse, Renderer, Size, test_support::TerminalModel};
 
 	use super::{CARD_W, PROVIDERS, build_ui, scroll_height};
 
 	fn replay(renderer: &mut Renderer<Vec<u8>>, terminal: &mut TerminalModel) {
 		let output =
-			String::from_utf8(std::mem::take(renderer.writer_mut())).expect("renderer emits UTF-8");
+			String::from_utf8(mem::take(renderer.writer_mut())).expect("renderer emits UTF-8");
 		terminal.apply(&output);
 	}
 
@@ -352,7 +355,7 @@ mod tests {
 			renderer
 				.register_image(
 					u32::try_from(index + 1).expect("provider count fits image IDs"),
-					std::fs::read(path).unwrap(),
+					fs::read(path).unwrap(),
 				)
 				.unwrap();
 		}
@@ -392,7 +395,7 @@ mod tests {
 
 		// Enter the first card, then advance the clock past the 220ms ease.
 		ui.handle_mouse(column + 2, rest_top as u16 + 2, Mouse::Move);
-		ui.tick(std::time::Duration::from_millis(400));
+		ui.tick(time::Duration::from_millis(400));
 		let lifted = rows(&ui);
 		let lifted_top = lifted.iter().position(|row| row.contains('╭')).unwrap();
 		assert_eq!(lifted_top + 1, rest_top, "the hovered card rises into its headroom");
@@ -424,7 +427,7 @@ mod tests {
 		// Initial focus sits on the scroll pane; one Tab reaches the first
 		// card.
 		ui.handle_key(Key::Tab);
-		ui.tick(std::time::Duration::from_millis(400));
+		ui.tick(time::Duration::from_millis(400));
 		let focused_top = rows(&ui).iter().position(|row| row.contains('╭')).unwrap();
 		assert_eq!(focused_top + 1, rest_top, "keyboard focus lifts the card like hover");
 		assert_eq!(
@@ -450,7 +453,7 @@ mod tests {
 		// to the end of the roster.
 		ui.handle_key(Key::Tab);
 		ui.handle_key(Key::Right);
-		ui.tick(std::time::Duration::from_millis(400));
+		ui.tick(time::Duration::from_millis(400));
 		let grid = rows(&ui);
 		assert!(
 			grid.iter().any(|row| row.contains(PROVIDERS[0].name)),

@@ -7,7 +7,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::io::{SettingsIoError, atomic_replace};
+use crate::{
+	deep_merge,
+	io::{SettingsIoError, atomic_replace},
+};
 
 const MARKER: &str = ".settings-migration-v1";
 const RECORD: &str = "settings-migration.toml";
@@ -75,7 +78,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 			.map_err(|source| MigrationError::Read { path: settings_json.clone(), source })?;
 		let value: serde_json::Value = omp_slopjson::from_str(&source)?;
 		let table = json_table(value)?;
-		crate::deep_merge(&mut document, table);
+		deep_merge(&mut document, table);
 		record.sources.push("settings.json".to_owned());
 		backup_file(&settings_json)?;
 	}
@@ -83,7 +86,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 	let database = data_dir.join("agent.db");
 	if database.exists() {
 		if let Some(table) = read_database_settings(&database)? {
-			crate::deep_merge(&mut document, table);
+			deep_merge(&mut document, table);
 			record.sources.push("agent.db:settings".to_owned());
 			backup_file(&database)?;
 		}
@@ -103,7 +106,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 		};
 		// Native values already chosen by the user win over imported legacy data.
 		let mut imported = document;
-		crate::deep_merge(&mut imported, current);
+		deep_merge(&mut imported, current);
 		current = imported;
 		atomic_replace(&config, &toml::to_string_pretty(&current)?)?;
 	}
@@ -398,7 +401,7 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 				&["openai", "openai-codex", "antigravity", "xai", "openrouter", "gemini"]
 			};
 			if order.contains(&provider.as_str()) {
-				let values = std::iter::once(provider.as_str())
+				let values = iter::once(provider.as_str())
 					.chain(
 						order
 							.iter()
@@ -607,7 +610,10 @@ fn value_at_mut<'a>(document: &'a mut toml::Table, path: &str) -> Option<&'a mut
 	None
 }
 
+use std::iter;
+
 use rusqlite::OptionalExtension as _;
+use toml::{de, ser};
 
 /// Legacy settings migration failure.
 #[derive(Debug, thiserror::Error)]
@@ -615,23 +621,30 @@ pub enum MigrationError {
 	/// Migration directory creation failed.
 	#[error("failed to create migration directory {path}")]
 	CreateDirectory {
+		/// Data directory that stores migration outputs and markers.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while creating the data directory.
 		source: io::Error,
 	},
 	/// A legacy source could not be read.
 	#[error("failed to read legacy settings source {path}")]
 	Read {
+		/// Legacy JSON source or existing native TOML file being loaded.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while reading the source file.
 		source: io::Error,
 	},
 	/// A source backup could not be created.
 	#[error("failed to back up legacy settings source {path} to {backup}")]
 	Backup {
+		/// Legacy settings source preserved before migration.
 		path:   PathBuf,
+		/// Migration-specific backup receiving a copy of the source.
 		backup: PathBuf,
 		#[source]
+		/// I/O failure returned while copying the source to its backup.
 		source: io::Error,
 	},
 	/// JSONC parsing failed.
@@ -643,9 +656,12 @@ pub enum MigrationError {
 	/// Existing native configuration was invalid and cannot safely be merged.
 	#[error("existing native settings file {path} is invalid")]
 	ExistingConfig {
+		/// Existing native settings file that must be merged with imported
+		/// values.
 		path:   PathBuf,
 		#[source]
-		source: toml::de::Error,
+		/// TOML failure returned while parsing the existing settings.
+		source: de::Error,
 	},
 	/// Legacy database access failed.
 	#[error(transparent)]
@@ -653,13 +669,15 @@ pub enum MigrationError {
 	/// One database setting did not contain valid JSON.
 	#[error("legacy database setting {key} is invalid JSON")]
 	DatabaseValue {
+		/// Legacy database setting whose stored value is malformed JSON.
 		key:    String,
 		#[source]
+		/// JSON failure returned while decoding the stored setting.
 		source: serde_json::Error,
 	},
 	/// Native TOML encoding failed.
 	#[error(transparent)]
-	Encode(#[from] toml::ser::Error),
+	Encode(#[from] ser::Error),
 	/// Atomic persistence failed.
 	#[error(transparent)]
 	Io(#[from] SettingsIoError),

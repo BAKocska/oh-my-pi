@@ -1,5 +1,6 @@
 //! Application execution modes and autonomous goal-loop policy.
 
+/// Durable encoding and restoration of autonomous campaign state.
 pub mod persistence;
 
 use std::sync::{

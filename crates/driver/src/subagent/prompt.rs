@@ -10,6 +10,7 @@ use omp_scribe::{
 use serde_json::Value;
 
 use super::settings::TaskEagerMode;
+use crate::prompt_templates::schema::render as render_schema;
 /// Returns the driver-side prompt engine with schema-domain functions
 /// installed.
 ///
@@ -21,7 +22,7 @@ pub fn engine() -> &'static Engine {
 		let mut engine = Engine::new();
 		engine.add_function("jtd_ts", |args| {
 			let schema = schema_argument("jtd_ts", args)?;
-			let rendered = crate::prompt_templates::schema::render(&schema);
+			let rendered = render_schema(&schema);
 			let declarations = rendered
 				.split_once("type YieldEnvelope")
 				.map_or(rendered.as_str(), |(declarations, _)| declarations)
@@ -30,7 +31,7 @@ pub fn engine() -> &'static Engine {
 		});
 		engine.add_function("yield_schema", |args| {
 			let schema = schema_argument("yield_schema", args)?;
-			Ok(ScribeValue::from(crate::prompt_templates::schema::render(&schema)))
+			Ok(ScribeValue::from(render_schema(&schema)))
 		});
 		engine
 	});
@@ -136,7 +137,7 @@ pub fn props(input: &SubagentPromptInput<'_>, parent: &Props) -> Props {
 	patch.set("workspace_root", input.workspace_root.to_string_lossy().into_owned());
 	if let Some(schema) = input.output_schema {
 		patch.set("output_schema", ScribeValue::from(schema));
-		patch.set("output_schema_ts", crate::prompt_templates::schema::render(schema));
+		patch.set("output_schema_ts", render_schema(schema));
 	}
 	patch.set("self_name", input.self_name.to_owned());
 	patch.set("self_role", input.self_role.to_owned());

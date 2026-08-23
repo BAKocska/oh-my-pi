@@ -3,11 +3,14 @@
 use std::{
 	collections::VecDeque,
 	convert::Infallible,
+	error,
 	future::Future,
+	io, mem,
 	pin::Pin,
+	str,
 	sync::{Arc, LazyLock},
 	task::{Context, Poll},
-	time::Instant,
+	time,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -22,10 +25,13 @@ use hyper_util::{
 };
 use omp_core::Str;
 use parking_lot::Mutex;
+use rustls::crypto::ring;
 use smallvec::SmallVec;
 use tokio::{
 	io::{AsyncReadExt as _, AsyncWriteExt as _},
 	net::TcpStream,
+	runtime,
+	time::{Instant, sleep_until},
 };
 use tower::{Service, ServiceExt as _};
 use url::Url;
@@ -36,19 +42,21 @@ use crate::{
 		AttemptBodyEvidence, AttemptEvidenceHandle, BodyFactoryHandle, BodyOpenError, BodyReader,
 		BodySource, byte_stream,
 	},
+	catalog::OperationKind,
 	codec::{
-		Cancellation, HandshakeMeta, HandshakenResponse, RawEvent, RawEventStream, RequestHeader,
-		RequestMethod, TransportAttempt, TransportRequest,
+		Cancellation, DecoderState, HandshakeMeta, HandshakenResponse, RawEvent, RawEventStream,
+		RequestHeader, RequestMethod, TransportAttempt, TransportRequest,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	receipt::{
 		AttemptOutcome, AttemptReceipt, Cost, ExecutionReceipt, ProviderEvidence, ReasonId, Usage,
 	},
 	transport::{
-		ConnectDecoder, EventStreamDecoder, Frame, FramingError, FramingProtocol, NdjsonDecoder,
-		RawChunkFramer, SseDecoder,
+		ConnectDecoder, CrcScope, EventStreamDecoder, Frame, FramingError, FramingProtocol,
+		NdjsonDecoder, RawChunkFramer, SseDecoder,
 		browser::{
-			BrowserFetch, BrowserFetchError, BrowserFetchRequest, BrowserHeader, MAX_BROWSER_DEADLINE,
+			BrowserFetch, BrowserFetchError, BrowserFetchRequest, BrowserHeader,
+			MAX_BROWSER_BODY_BYTES as BROWSER_MAX_BROWSER_BODY_BYTES, MAX_BROWSER_DEADLINE,
 		},
 		cassette::{CapturedFrame, capture_frame, is_commit_candidate},
 		proxy,
@@ -93,7 +101,7 @@ const PUBLIC_REQUEST_ID_HEADERS: [&str; 5] =
 type Connector = HttpsConnector<EnvProxyConnector>;
 type RequestBody = UnsyncBoxBody<Bytes, Error>;
 type PooledClient = Client<Connector, RequestBody>;
-type ConnectorError = Box<dyn std::error::Error + Send + Sync>;
+type ConnectorError = Box<dyn error::Error + Send + Sync>;
 
 #[derive(Clone, Debug)]
 struct EnvProxyConnector {
@@ -165,7 +173,7 @@ impl Service<Uri> for EnvProxyConnector {
 }
 
 fn connector_error(message: &'static str) -> ConnectorError {
-	Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, message))
+	Box::new(io::Error::new(io::ErrorKind::InvalidInput, message))
 }
 
 fn proxy_basic_authorization(proxy: &Url) -> Result<Option<Zeroizing<String>>, ConnectorError> {
@@ -284,7 +292,7 @@ async fn connect_tunnel(
 	let first_line = response
 		.split(|byte| *byte == b'\n')
 		.next()
-		.and_then(|line| std::str::from_utf8(line).ok())
+		.and_then(|line| str::from_utf8(line).ok())
 		.unwrap_or_default();
 	let accepted = first_line
 		.split_ascii_whitespace()
@@ -297,7 +305,7 @@ async fn connect_tunnel(
 }
 
 static POOLED_CLIENT: LazyLock<PooledClient> = LazyLock::new(|| {
-	let _ = rustls::crypto::ring::default_provider().install_default();
+	let _ = ring::default_provider().install_default();
 	let connector = HttpsConnectorBuilder::new()
 		.with_webpki_roots()
 		.https_or_http()
@@ -412,7 +420,7 @@ impl HttpTransport {
 		let Ok(uri) = target.as_str().parse::<Uri>() else {
 			return PreconnectLaunch::InvalidEndpoint;
 		};
-		let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+		let Ok(runtime) = runtime::Handle::try_current() else {
 			return PreconnectLaunch::NoRuntime;
 		};
 		let body = Full::new(Bytes::new())
@@ -473,7 +481,7 @@ impl Service<TransportRequest> for HttpTransport {
 	}
 
 	fn call(&mut self, request: TransportRequest) -> Self::Future {
-		let permit = std::mem::take(&mut self.ready_permit);
+		let permit = mem::take(&mut self.ready_permit);
 		let client = if permit { self.inner.take() } else { None };
 		if let Some(client) = &client {
 			self.inner = Some(client.clone());
@@ -500,7 +508,7 @@ async fn execute(
 	let browser_retry = browser_retry_request(&transport, browser);
 	let mut body_attempt = transport.encoded.body.begin_attempt();
 	let mut evidence = body_attempt.evidence_handle();
-	let deadline = tokio::time::Instant::now() + attempt.timeout;
+	let deadline = Instant::now() + attempt.timeout;
 	if !matches!((transport.decoder.is_some(), transport.realtime.is_some()), (true, false)) {
 		return Err(record_failure(
 			protocol_error(ErrorPhase::Handshake, false, "http-decoder-cardinality"),
@@ -589,7 +597,7 @@ async fn execute(
 		() = poll_fn(|context| transport.cancel.poll_cancelled(context)) => {
 			return Err(record_failure(cancelled(false), &attempt, &evidence, None, None, started, false));
 		},
-		() = tokio::time::sleep_until(deadline) => {
+		() = sleep_until(deadline) => {
 			transport.cancel.cancel();
 			return Err(record_failure(deadline_exceeded(false), &attempt, &evidence, None, None, started, false));
 		},
@@ -665,7 +673,7 @@ async fn execute(
 		() = poll_fn(|context| transport.cancel.poll_cancelled(context)) => {
 			return Err(record_failure(cancelled(false), &attempt, &evidence, None, None, started, false));
 		},
-		() = tokio::time::sleep_until(deadline) => {
+		() = sleep_until(deadline) => {
 			transport.cancel.cancel();
 			return Err(record_failure(deadline_exceeded(false), &attempt, &evidence, None, None, started, false));
 		},
@@ -947,7 +955,7 @@ async fn collect_request_body(
 	mut reader: BodyReader,
 	limit: u64,
 	cancel: &Cancellation,
-	deadline: tokio::time::Instant,
+	deadline: Instant,
 ) -> Result<Bytes, Error> {
 	let capacity = usize::try_from(limit.min(64 * 1024)).unwrap_or(64 * 1024);
 	let mut output = BytesMut::with_capacity(capacity);
@@ -955,7 +963,7 @@ async fn collect_request_body(
 		let next = tokio::select! {
 			next = reader.next() => next,
 			() = poll_fn(|context| cancel.poll_cancelled(context)) => return Err(cancelled(false)),
-			() = tokio::time::sleep_until(deadline) => {
+			() = sleep_until(deadline) => {
 				cancel.cancel();
 				return Err(deadline_exceeded(false));
 			},
@@ -978,7 +986,7 @@ async fn collect_error_response_body(
 	mut incoming: Incoming,
 	limit: u64,
 	cancel: &Cancellation,
-	deadline: tokio::time::Instant,
+	deadline: Instant,
 ) -> Result<Bytes, Error> {
 	let limit = usize::try_from(limit).unwrap_or(usize::MAX);
 	let mut output = BytesMut::with_capacity(limit.min(8 * 1024));
@@ -986,7 +994,7 @@ async fn collect_error_response_body(
 		let next = tokio::select! {
 			next = incoming.frame() => next,
 			() = poll_fn(|context| cancel.poll_cancelled(context)) => return Err(cancelled(false)),
-			() = tokio::time::sleep_until(deadline) => {
+			() = sleep_until(deadline) => {
 				cancel.cancel();
 				return Err(deadline_exceeded(false));
 			},
@@ -1006,17 +1014,17 @@ async fn collect_error_response_body(
 }
 
 fn classify_http_error(status: u16, body: &[u8]) -> Error {
-	use std::time::Duration;
-
 	let (kind, action) = match status {
 		401 | 403 => (ErrorKind::Authentication, RetryAction::Never),
-		408 => (ErrorKind::DeadlineExceeded, RetryAction::SameRoute { after: Duration::ZERO }),
-		429 => (ErrorKind::RateLimited, RetryAction::SameRoute { after: Duration::from_secs(30) }),
+		408 => (ErrorKind::DeadlineExceeded, RetryAction::SameRoute { after: time::Duration::ZERO }),
+		429 => {
+			(ErrorKind::RateLimited, RetryAction::SameRoute { after: time::Duration::from_secs(30) })
+		},
 		400 | 404 | 405 | 413 | 422 => (ErrorKind::InvalidRequest, RetryAction::Never),
 		402 => (ErrorKind::PaymentRequired, RetryAction::Never),
 		409 => (ErrorKind::SessionConflict, RetryAction::Never),
 		500..=599 => (ErrorKind::ResourceExhausted, RetryAction::SameRoute {
-			after: Duration::from_millis(500),
+			after: time::Duration::from_millis(500),
 		}),
 		_ => (ErrorKind::ProviderContractMismatch, RetryAction::Never),
 	};
@@ -1100,7 +1108,7 @@ fn browser_retry_request(
 ) -> Option<(Arc<dyn BrowserFetch>, BrowserFetchRequest)> {
 	let browser = browser?;
 	if transport.credentials.is_some()
-		|| transport.encoded.operation != crate::catalog::OperationKind::Search
+		|| transport.encoded.operation != OperationKind::Search
 		|| transport.encoded.method != RequestMethod::Get
 		|| transport.encoded.framing != FramingProtocol::Raw
 	{
@@ -1108,7 +1116,7 @@ fn browser_retry_request(
 	}
 	let max_bytes = usize::try_from(transport.encoded.bounds.response)
 		.ok()?
-		.min(crate::transport::browser::MAX_BROWSER_BODY_BYTES);
+		.min(BROWSER_MAX_BROWSER_BODY_BYTES);
 	let deadline = transport.attempt.timeout.min(MAX_BROWSER_DEADLINE);
 	if max_bytes == 0 || deadline.is_zero() {
 		return None;
@@ -1149,7 +1157,7 @@ fn decode_stream(
 	protocol: FramingProtocol,
 	frame_limit: usize,
 	response_limit: u64,
-	mut decoder: crate::codec::DecoderState,
+	mut decoder: DecoderState,
 	cancel: Cancellation,
 	capture_limit: u64,
 	capture: Arc<Mutex<HttpCapture>>,
@@ -1157,7 +1165,7 @@ fn decode_stream(
 	evidence: AttemptEvidenceHandle,
 	status: u16,
 	provider_request_id: Option<Str>,
-	deadline: tokio::time::Instant,
+	deadline: Instant,
 	started: Instant,
 	browser_retry: Option<(Arc<dyn BrowserFetch>, BrowserFetchRequest)>,
 ) -> impl Stream<Item = Result<RawEvent, Error>> + Send + 'static {
@@ -1175,7 +1183,7 @@ fn decode_stream(
 					yield Err(record_failure(cancelled(emitted), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
 					break;
 				},
-				() = tokio::time::sleep_until(deadline) => {
+				() = sleep_until(deadline) => {
 					cancel.cancel();
 					yield Err(record_failure(deadline_exceeded(emitted), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
 					break;
@@ -1474,10 +1482,10 @@ fn framing_error(error: FramingError, committed: bool) -> Error {
 		FramingError::InvalidWebSocketControl => (ErrorKind::StreamCorruption, "websocket-control"),
 		FramingError::InvalidWebSocketClose => (ErrorKind::StreamCorruption, "websocket-close"),
 		FramingError::InvalidUtf8 { .. } => (ErrorKind::StreamCorruption, "framing-invalid-utf8"),
-		FramingError::CrcMismatch { scope: crate::transport::CrcScope::Prelude, .. } => {
+		FramingError::CrcMismatch { scope: CrcScope::Prelude, .. } => {
 			(ErrorKind::StreamCorruption, "eventstream-prelude-crc")
 		},
-		FramingError::CrcMismatch { scope: crate::transport::CrcScope::Message, .. } => {
+		FramingError::CrcMismatch { scope: CrcScope::Message, .. } => {
 			(ErrorKind::StreamCorruption, "eventstream-message-crc")
 		},
 		FramingError::InvalidEventStreamLengths { .. } => {
@@ -1497,7 +1505,7 @@ fn framing_error(error: FramingError, committed: bool) -> Error {
 	};
 	let mut error = structured_error(kind, phase, committed, reason).code(Str::new(reason));
 	if !committed && error.kind != ErrorKind::Cancelled {
-		error.action = RetryAction::SameRoute { after: std::time::Duration::ZERO };
+		error.action = RetryAction::SameRoute { after: time::Duration::ZERO };
 	}
 	error
 }
@@ -1587,7 +1595,7 @@ fn authentication_error(reason: &'static str) -> Error {
 fn connectivity(phase: ErrorPhase, committed: bool, reason: &'static str) -> Error {
 	let mut error = structured_error(ErrorKind::Connectivity, phase, committed, reason);
 	if !committed {
-		error.action = RetryAction::SameRoute { after: std::time::Duration::ZERO };
+		error.action = RetryAction::SameRoute { after: time::Duration::ZERO };
 	}
 	error
 }
@@ -1746,7 +1754,7 @@ mod tests {
 		let inner = Error::new(
 			ErrorKind::RateLimited,
 			ErrorPhase::Admission,
-			RetryAction::SameRoute { after: std::time::Duration::from_secs(3) },
+			RetryAction::SameRoute { after: time::Duration::from_secs(3) },
 			ExecutionReceipt::default(),
 		)
 		.detail(ErrorDetail::protocol(ReasonId(sf!("factory-rate-window"))));
@@ -1816,7 +1824,7 @@ mod tests {
 			Error::new(
 				ErrorKind::RateLimited,
 				ErrorPhase::Handshake,
-				RetryAction::SameRoute { after: std::time::Duration::from_secs(30) },
+				RetryAction::SameRoute { after: time::Duration::from_secs(30) },
 				ExecutionReceipt::default(),
 			)
 		};

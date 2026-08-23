@@ -2,23 +2,31 @@
 
 use std::{
 	collections::BTreeMap,
-	fmt,
+	error, fmt,
+	fmt::Display,
 	pin::Pin,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	},
+	task,
 	task::{Context, Poll},
 	time::{Duration, Instant, SystemTime},
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use futures::{Stream, StreamExt as _};
 use omp_core::{SecretString, Str};
+use parking_lot::Mutex;
 use strum::IntoStaticStr;
+use tokio::sync::Notify;
 
 use crate::{
 	body::ByteStream,
+	call::{
+		AuthInput, RawJson, RealtimeContextAppend, RealtimeDelegationReceipt, ToolResultContent,
+	},
 	catalog::{ModelKey, ModelSpec, ProviderId, RouteId},
 	error::Error,
 	event::{ChatEvent, WorkflowResponse},
@@ -58,8 +66,8 @@ impl ChatStream {
 			events,
 			control: Some(ChatControl {
 				responses,
-				state: Arc::new(parking_lot::Mutex::new(ChatControlState::default())),
-				closed: Arc::new(tokio::sync::Notify::new()),
+				state: Arc::new(Mutex::new(ChatControlState::default())),
+				closed: Arc::new(Notify::new()),
 			}),
 		}
 	}
@@ -115,8 +123,8 @@ struct ChatControlState {
 #[derive(Clone)]
 pub struct ChatControl {
 	responses: flume::Sender<WorkflowResponse>,
-	state:     Arc<parking_lot::Mutex<ChatControlState>>,
-	closed:    Arc<tokio::sync::Notify>,
+	state:     Arc<Mutex<ChatControlState>>,
+	closed:    Arc<Notify>,
 }
 
 impl ChatControl {
@@ -576,8 +584,8 @@ impl<T> Stream for GenerationSession<T> {
 
 	fn poll_next(
 		mut self: Pin<&mut Self>,
-		context: &mut std::task::Context<'_>,
-	) -> std::task::Poll<Option<Self::Item>> {
+		context: &mut task::Context<'_>,
+	) -> task::Poll<Option<Self::Item>> {
 		self.events.as_mut().poll_next(context)
 	}
 }
@@ -589,13 +597,13 @@ pub enum GenerationSessionError {
 	JobMismatch,
 }
 
-impl fmt::Display for GenerationSessionError {
+impl Display for GenerationSessionError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("generation checkpoint and cancellation handle identify different jobs")
 	}
 }
 
-impl std::error::Error for GenerationSessionError {}
+impl error::Error for GenerationSessionError {}
 
 /// Final summary for a long-running generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -779,12 +787,12 @@ pub enum RealtimeInput {
 		/// Tool name when required by the wire protocol.
 		name:     Option<Str>,
 		/// Ordered typed result content.
-		content:  Arc<[crate::call::ToolResultContent]>,
+		content:  Arc<[ToolResultContent]>,
 		/// Whether tool execution failed.
 		is_error: bool,
 	},
 	/// Append provider-neutral context to the session or active delegation.
-	AppendContext(crate::call::RealtimeContextAppend),
+	AppendContext(RealtimeContextAppend),
 	/// Enable or disable caller microphone input.
 	SetMuted(bool),
 	/// Cancel one delegated agent turn without closing the session.
@@ -793,7 +801,7 @@ pub enum RealtimeInput {
 		id: Str,
 	},
 	/// Settle one delegated agent turn exactly once.
-	SettleDelegation(crate::call::RealtimeDelegationReceipt),
+	SettleDelegation(RealtimeDelegationReceipt),
 	/// Commit current input and request a response.
 	Commit,
 	/// Cancel the active response.
@@ -833,7 +841,7 @@ pub enum RealtimeEvent {
 /// single terminal close transition.
 pub struct RealtimeSession {
 	pub(crate) outbound: flume::Sender<RealtimeInput>,
-	pub(crate) inbound:  flume::Receiver<Result<RealtimeEvent, Error>>,
+	pub(crate) inbound:  Receiver<Result<RealtimeEvent, Error>>,
 	pub(crate) closed:   Arc<AtomicBool>,
 }
 
@@ -842,7 +850,7 @@ impl RealtimeSession {
 	/// state.
 	pub(crate) const fn from_channels(
 		outbound: flume::Sender<RealtimeInput>,
-		inbound: flume::Receiver<Result<RealtimeEvent, Error>>,
+		inbound: Receiver<Result<RealtimeEvent, Error>>,
 		closed: Arc<AtomicBool>,
 	) -> Self {
 		Self { outbound, inbound, closed }
@@ -1254,7 +1262,7 @@ pub struct AuthResponse {
 	/// Login session receiving the response.
 	pub session: LoginSessionId,
 	/// Secret or control input.
-	pub input:   crate::call::AuthInput,
+	pub input:   AuthInput,
 }
 
 /// Owned channels for an interactive authentication flow.
@@ -1262,7 +1270,7 @@ pub struct AuthSession {
 	/// Stable login session identity.
 	pub id:        LoginSessionId,
 	/// Stream-like channel of authentication events or structured errors.
-	pub events:    flume::Receiver<Result<AuthEvent, Error>>,
+	pub events:    Receiver<Result<AuthEvent, Error>>,
 	/// Response channel back to the authentication engine.
 	pub responses: flume::Sender<AuthResponse>,
 }
@@ -1284,7 +1292,7 @@ pub enum AuthAnswer {
 /// Bounded native response body.
 pub enum NativeResponseBody {
 	/// Exact validated JSON response bytes preserved without reserialization.
-	Json(crate::call::RawJson),
+	Json(RawJson),
 	/// Immutable binary response.
 	Bytes(Bytes),
 	/// Incremental opaque response bytes, including native SSE framing.

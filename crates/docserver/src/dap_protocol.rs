@@ -1,9 +1,13 @@
 //! Bounded Content-Length framed Debug Adapter Protocol engine.
 
+#[cfg(target_os = "linux")]
+use std::env;
 use std::{
 	collections::HashMap,
 	io,
-	path::Path,
+	net::SocketAddr,
+	path::{Path, PathBuf},
+	process,
 	sync::{
 		Arc,
 		atomic::{AtomicI64, Ordering},
@@ -12,23 +16,25 @@ use std::{
 };
 
 use omp_core::{Str, sf};
-use parking_lot::Mutex;
-use serde_json::{Value, json};
-use thiserror::Error;
+use serde_json::json;
 use tokio::{
 	io::{AsyncRead, AsyncWrite},
+	net::{self, TcpListener, TcpStream, UnixStream},
 	process::{Child, Command},
-	sync::{Mutex as AsyncMutex, broadcast, oneshot},
+	sync::{Mutex, broadcast, oneshot},
+	time,
+	time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::{DapTransport, lsp_process, lsp_process::LspFrameError};
 const MAX_DAP_HEADER_BYTES: usize = 8 * 1024;
 const MAX_DAP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_CAPACITY: usize = 512;
 
-type PendingResponse = (Str, oneshot::Sender<Result<Value, DapProtocolError>>);
+type PendingResponse = (Str, oneshot::Sender<Result<serde_json::Value, DapProtocolError>>);
 type PendingRequests = HashMap<i64, PendingResponse>;
 
 /// An event or reverse request received from a debug adapter.
@@ -39,7 +45,7 @@ pub enum DapInbound {
 		/// Event name.
 		event: Str,
 		/// Opaque event body.
-		body:  Value,
+		body:  serde_json::Value,
 	},
 	/// Adapter-to-client request.
 	ReverseRequest {
@@ -48,12 +54,12 @@ pub enum DapInbound {
 		/// Requested client command.
 		command:   Str,
 		/// Opaque arguments.
-		arguments: Value,
+		arguments: serde_json::Value,
 	},
 }
 
 /// Framing, transport, or adapter response failure.
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum DapProtocolError {
 	/// The transport ended before completion.
 	#[error("DAP transport closed")]
@@ -69,7 +75,7 @@ pub enum DapProtocolError {
 	Frame {
 		/// The underlying frame decoding failure.
 		#[source]
-		source: crate::lsp_process::LspFrameError,
+		source: LspFrameError,
 	},
 	/// The adapter returned `success: false`.
 	#[error("DAP adapter rejected {command}: {message}")]
@@ -90,8 +96,8 @@ pub enum DapProtocolError {
 struct OutgoingRequest {
 	seq:       i64,
 	command:   Str,
-	arguments: Value,
-	response:  oneshot::Sender<Result<Value, DapProtocolError>>,
+	arguments: serde_json::Value,
+	response:  oneshot::Sender<Result<serde_json::Value, DapProtocolError>>,
 }
 
 enum Outgoing {
@@ -100,7 +106,7 @@ enum Outgoing {
 		request_seq: i64,
 		command:     Str,
 		success:     bool,
-		body:        Value,
+		body:        serde_json::Value,
 		message:     Option<Str>,
 	},
 	Shutdown,
@@ -126,9 +132,9 @@ pub struct SpawnedDap {
 	/// Active framed protocol.
 	pub protocol:     DapProtocol,
 	/// Owned adapter process.
-	pub child:        Arc<AsyncMutex<Child>>,
+	pub child:        Arc<Mutex<Child>>,
 	/// Unix socket removed when the owning session tears down.
-	pub cleanup_path: Option<std::path::PathBuf>,
+	pub cleanup_path: Option<PathBuf>,
 }
 
 impl DapProtocol {
@@ -143,7 +149,9 @@ impl DapProtocol {
 		let closed = CancellationToken::new();
 		let inner = Arc::new(ProtocolInner { next_seq: AtomicI64::new(1), outgoing, events, closed });
 		let actor = Arc::clone(&inner);
-		tokio::spawn(async move { run_protocol(reader, writer, receiver, actor).await });
+		tokio::spawn(
+			async move { protocol_actor::run_protocol(reader, writer, receiver, actor).await },
+		);
 		Self { inner }
 	}
 
@@ -157,9 +165,9 @@ impl DapProtocol {
 		process
 			.args(args.iter().map(Str::as_str))
 			.current_dir(cwd)
-			.stdin(std::process::Stdio::piped())
-			.stdout(std::process::Stdio::piped())
-			.stderr(std::process::Stdio::null())
+			.stdin(process::Stdio::piped())
+			.stdout(process::Stdio::piped())
+			.stderr(process::Stdio::null())
 			.kill_on_drop(true)
 			.env("CI", "1")
 			.env("TERM", "dumb")
@@ -188,21 +196,21 @@ impl DapProtocol {
 			.ok_or_else(|| io::Error::other("adapter stdin unavailable"))?;
 		Ok(SpawnedDap {
 			protocol:     Self::from_streams(reader, writer),
-			child:        Arc::new(AsyncMutex::new(child)),
+			child:        Arc::new(Mutex::new(child)),
 			cleanup_path: None,
 		})
 	}
 
 	/// Connects an existing TCP debug adapter.
-	pub async fn connect_tcp(address: std::net::SocketAddr) -> Result<Self, DapProtocolError> {
-		let stream = tokio::net::TcpStream::connect(address).await?;
+	pub async fn connect_tcp(address: SocketAddr) -> Result<Self, DapProtocolError> {
+		let stream = TcpStream::connect(address).await?;
 		let (reader, writer) = stream.into_split();
 		Ok(Self::from_streams(reader, writer))
 	}
 
 	/// Resolves and connects a configured remote adapter endpoint.
 	pub async fn connect_tcp_host(host: &str, port: u16) -> Result<Self, DapProtocolError> {
-		let mut addresses = tokio::net::lookup_host((host, port)).await?;
+		let mut addresses = net::lookup_host((host, port)).await?;
 		let address = addresses
 			.next()
 			.ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no DAP address"))?;
@@ -212,7 +220,7 @@ impl DapProtocol {
 	/// Connects an existing Unix-domain debug adapter.
 	#[cfg(unix)]
 	pub async fn connect_unix(path: &Path) -> Result<Self, DapProtocolError> {
-		let stream = tokio::net::UnixStream::connect(path).await?;
+		let stream = UnixStream::connect(path).await?;
 		let (reader, writer) = stream.into_split();
 		Ok(Self::from_streams(reader, writer))
 	}
@@ -221,8 +229,8 @@ impl DapProtocol {
 	pub async fn request(
 		&self,
 		command: impl AsRef<str>,
-		arguments: Value,
-	) -> Result<Value, DapProtocolError> {
+		arguments: serde_json::Value,
+	) -> Result<serde_json::Value, DapProtocolError> {
 		if self.inner.closed.is_cancelled() {
 			return Err(DapProtocolError::TransportClosed);
 		}
@@ -242,7 +250,7 @@ impl DapProtocol {
 			}))
 			.await
 			.map_err(|_| DapProtocolError::TransportClosed)?;
-		match tokio::time::timeout(REQUEST_TIMEOUT, receiver).await {
+		match time::timeout(REQUEST_TIMEOUT, receiver).await {
 			Ok(Ok(result)) => result,
 			Ok(Err(_)) => Err(DapProtocolError::TransportClosed),
 			Err(_) => Err(DapProtocolError::Timeout),
@@ -255,7 +263,7 @@ impl DapProtocol {
 		request_seq: i64,
 		command: impl AsRef<str>,
 		success: bool,
-		body: Value,
+		body: serde_json::Value,
 		message: Option<Str>,
 	) -> Result<(), DapProtocolError> {
 		self
@@ -270,34 +278,6 @@ impl DapProtocol {
 			})
 			.await
 			.map_err(|_| DapProtocolError::TransportClosed)
-	}
-
-	/// Subscribes before a launch request to avoid stop-on-entry and initialized
-	/// races.
-	pub fn subscribe(&self) -> broadcast::Receiver<DapInbound> {
-		self.inner.events.subscribe()
-	}
-
-	/// Waits for an event with an exact name.
-	pub async fn wait_for_event(
-		mut receiver: broadcast::Receiver<DapInbound>,
-		event_name: &str,
-		timeout: Duration,
-	) -> Result<Value, DapProtocolError> {
-		let wait = async {
-			loop {
-				match receiver.recv().await {
-					Ok(DapInbound::Event { event, body }) if event == event_name => return Ok(body),
-					Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
-					Err(broadcast::error::RecvError::Closed) => {
-						return Err(DapProtocolError::TransportClosed);
-					},
-				}
-			}
-		};
-		tokio::time::timeout(timeout, wait)
-			.await
-			.map_err(|_| DapProtocolError::Timeout)?
 	}
 
 	/// Resolves when the byte transport closes or the actor shuts down.
@@ -320,15 +300,15 @@ impl DapProtocol {
 	pub async fn spawn_adapter(
 		command: &str,
 		args: &[Str],
-		transport: &crate::DapTransport,
+		transport: &DapTransport,
 		cwd: &Path,
 	) -> Result<SpawnedDap, DapProtocolError> {
 		match transport {
-			crate::DapTransport::Stdio => Self::spawn_stdio(command, args, cwd),
-			crate::DapTransport::Tcp { port_argument } => {
+			DapTransport::Stdio => Self::spawn_stdio(command, args, cwd),
+			DapTransport::Tcp { port_argument } => {
 				Self::spawn_tcp(command, args, port_argument, cwd).await
 			},
-			crate::DapTransport::Unix { socket_argument } => {
+			DapTransport::Unix { socket_argument } => {
 				#[cfg(target_os = "linux")]
 				{
 					Self::spawn_unix(command, args, socket_argument, cwd).await
@@ -347,16 +327,16 @@ impl DapProtocol {
 		port_argument: &str,
 		cwd: &Path,
 	) -> Result<SpawnedDap, DapProtocolError> {
-		let reservation = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+		let reservation = TcpListener::bind(("127.0.0.1", 0)).await?;
 		let port = reservation.local_addr()?.port();
 		drop(reservation);
 		let replacement = port.to_string();
 		let args = substituted_args(args, port_argument, &replacement);
 		let child = spawn_socket_process(command, &args, cwd)?;
-		let child = Arc::new(AsyncMutex::new(child));
-		let deadline = tokio::time::Instant::now() + ADAPTER_READY_TIMEOUT;
+		let child = Arc::new(Mutex::new(child));
+		let deadline = Instant::now() + ADAPTER_READY_TIMEOUT;
 		loop {
-			match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+			match TcpStream::connect(("127.0.0.1", port)).await {
 				Ok(stream) => {
 					let (reader, writer) = stream.into_split();
 					return Ok(SpawnedDap {
@@ -365,11 +345,11 @@ impl DapProtocol {
 						cleanup_path: None,
 					});
 				},
-				Err(error) if tokio::time::Instant::now() < deadline => {
+				Err(error) if Instant::now() < deadline => {
 					if child.lock().await.try_wait()?.is_some() {
 						return Err(DapProtocolError::Io(error));
 					}
-					tokio::time::sleep(ADAPTER_READY_POLL).await;
+					time::sleep(ADAPTER_READY_POLL).await;
 				},
 				Err(_error) => {
 					kill_child(&child).await;
@@ -386,17 +366,14 @@ impl DapProtocol {
 		socket_argument: &str,
 		cwd: &Path,
 	) -> Result<SpawnedDap, DapProtocolError> {
-		let socket_path = std::env::temp_dir().join(format!(
-			"omp-dap-{}-{}.sock",
-			std::process::id(),
-			rand::random::<u64>()
-		));
+		let socket_path =
+			env::temp_dir().join(format!("omp-dap-{}-{}.sock", process::id(), rand::random::<u64>()));
 		let replacement = socket_path.to_string_lossy();
 		let args = substituted_args(args, socket_argument, replacement.as_ref());
-		let child = Arc::new(AsyncMutex::new(spawn_socket_process(command, &args, cwd)?));
-		let deadline = tokio::time::Instant::now() + ADAPTER_READY_TIMEOUT;
+		let child = Arc::new(Mutex::new(spawn_socket_process(command, &args, cwd)?));
+		let deadline = Instant::now() + ADAPTER_READY_TIMEOUT;
 		loop {
-			match tokio::net::UnixStream::connect(&socket_path).await {
+			match UnixStream::connect(&socket_path).await {
 				Ok(stream) => {
 					let (reader, writer) = stream.into_split();
 					return Ok(SpawnedDap {
@@ -405,11 +382,11 @@ impl DapProtocol {
 						cleanup_path: Some(socket_path),
 					});
 				},
-				Err(error) if tokio::time::Instant::now() < deadline => {
+				Err(error) if Instant::now() < deadline => {
 					if child.lock().await.try_wait()?.is_some() {
 						return Err(DapProtocolError::Io(error));
 					}
-					tokio::time::sleep(ADAPTER_READY_POLL).await;
+					time::sleep(ADAPTER_READY_POLL).await;
 				},
 				Err(_error) => {
 					kill_child(&child).await;
@@ -427,12 +404,12 @@ impl DapProtocol {
 		client_argument: &str,
 		cwd: &Path,
 	) -> Result<SpawnedDap, DapProtocolError> {
-		let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+		let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
 		let address = listener.local_addr()?;
 		let replacement = address.to_string();
 		let args = substituted_args(args, client_argument, &replacement);
-		let child = Arc::new(AsyncMutex::new(spawn_socket_process(command, &args, cwd)?));
-		let accepted = tokio::time::timeout(ADAPTER_READY_TIMEOUT, listener.accept()).await;
+		let child = Arc::new(Mutex::new(spawn_socket_process(command, &args, cwd)?));
+		let accepted = time::timeout(ADAPTER_READY_TIMEOUT, listener.accept()).await;
 		match accepted {
 			Ok(Ok((stream, peer))) if peer.ip().is_loopback() => {
 				let (reader, writer) = stream.into_split();
@@ -482,9 +459,9 @@ fn spawn_socket_process(
 	process
 		.args(args.iter().map(Str::as_str))
 		.current_dir(cwd)
-		.stdin(std::process::Stdio::null())
-		.stdout(std::process::Stdio::null())
-		.stderr(std::process::Stdio::null())
+		.stdin(process::Stdio::null())
+		.stdout(process::Stdio::null())
+		.stderr(process::Stdio::null())
 		.kill_on_drop(true)
 		.env("CI", "1")
 		.env("TERM", "dumb")
@@ -505,7 +482,7 @@ fn spawn_socket_process(
 	Ok(process.spawn()?)
 }
 
-async fn kill_child(child: &Arc<AsyncMutex<Child>>) {
+async fn kill_child(child: &Arc<Mutex<Child>>) {
 	let mut child = child.lock().await;
 	if child.try_wait().ok().flatten().is_none() {
 		let _ = child.kill().await;
@@ -519,105 +496,161 @@ impl Drop for DapProtocol {
 		}
 	}
 }
+mod inbound {
+	use tokio::sync::broadcast::{Receiver, error};
 
-async fn run_protocol<R, W>(
-	reader: R,
-	mut writer: W,
-	outgoing: flume::Receiver<Outgoing>,
-	inner: Arc<ProtocolInner>,
-) where
-	R: AsyncRead + Unpin,
-	W: AsyncWrite + Unpin,
-{
-	let mut reader = reader;
-	let pending = Mutex::new(PendingRequests::new());
-	loop {
-		tokio::select! {
-			outbound = outgoing.recv_async() => match outbound {
-				Ok(Outgoing::Request(request)) => {
-					let message = json!({"seq": request.seq, "type": "request", "command": request.command, "arguments": request.arguments});
-					pending.lock().insert(request.seq, (request.command, request.response));
-					if write_message(&mut writer, &message).await.is_err() { break; }
-				},
-				Ok(Outgoing::Response { request_seq, command, success, body, message }) => {
-					let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
-					let value = json!({"seq": seq, "type": "response", "request_seq": request_seq, "command": command, "success": success, "body": body, "message": message});
-					if write_message(&mut writer, &value).await.is_err() { break; }
-				},
-				Ok(Outgoing::Shutdown) | Err(_) => break,
-			},
-			message = read_message(&mut reader) => match message {
-				Ok(message) => dispatch_message(message, &pending, &inner.events),
-				Err(_) => break,
-			},
+	use super::*;
+
+	impl DapProtocol {
+		/// Subscribes before a launch request to avoid stop-on-entry and
+		/// initialized races.
+		pub fn subscribe(&self) -> Receiver<DapInbound> {
+			self.inner.events.subscribe()
+		}
+
+		/// Waits for an event with an exact name.
+		pub async fn wait_for_event(
+			mut receiver: Receiver<DapInbound>,
+			event_name: &str,
+			timeout: Duration,
+		) -> Result<serde_json::Value, DapProtocolError> {
+			let wait = async {
+				loop {
+					match receiver.recv().await {
+						Ok(DapInbound::Event { event, body }) if event == event_name => return Ok(body),
+						Ok(_) | Err(error::RecvError::Lagged(_)) => {},
+						Err(error::RecvError::Closed) => {
+							return Err(DapProtocolError::TransportClosed);
+						},
+					}
+				}
+			};
+			time::timeout(timeout, wait)
+				.await
+				.map_err(|_| DapProtocolError::Timeout)?
 		}
 	}
-	inner.closed.cancel();
-	for (_, (_, response)) in pending.into_inner() {
-		let _ = response.send(Err(DapProtocolError::TransportClosed));
+}
+
+mod protocol_actor {
+	use flume::Receiver;
+	use parking_lot::Mutex;
+
+	use super::*;
+
+	pub(super) async fn run_protocol<R, W>(
+		reader: R,
+		mut writer: W,
+		outgoing: Receiver<Outgoing>,
+		inner: Arc<ProtocolInner>,
+	) where
+		R: AsyncRead + Unpin,
+		W: AsyncWrite + Unpin,
+	{
+		let mut reader = reader;
+		let pending = Mutex::new(PendingRequests::new());
+		loop {
+			tokio::select! {
+				outbound = outgoing.recv_async() => match outbound {
+					Ok(Outgoing::Request(request)) => {
+						let message = json!({"seq": request.seq, "type": "request", "command": request.command, "arguments": request.arguments});
+						pending.lock().insert(request.seq, (request.command, request.response));
+						if write_message(&mut writer, &message).await.is_err() { break; }
+					},
+					Ok(Outgoing::Response { request_seq, command, success, body, message }) => {
+						let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
+						let value = json!({"seq": seq, "type": "response", "request_seq": request_seq, "command": command, "success": success, "body": body, "message": message});
+						if write_message(&mut writer, &value).await.is_err() { break; }
+					},
+					Ok(Outgoing::Shutdown) | Err(_) => break,
+				},
+				message = read_message(&mut reader) => match message {
+					Ok(message) => dispatch_message(message, &pending, &inner.events),
+					Err(_) => break,
+				},
+			}
+		}
+		inner.closed.cancel();
+		for (_, (_, response)) in pending.into_inner() {
+			let _ = response.send(Err(DapProtocolError::TransportClosed));
+		}
+	}
+
+	fn dispatch_message(
+		message: serde_json::Value,
+		pending: &Mutex<PendingRequests>,
+		events: &broadcast::Sender<DapInbound>,
+	) {
+		match message.get("type").and_then(serde_json::Value::as_str) {
+			Some("response") => {
+				let Some(request_seq) = message
+					.get("request_seq")
+					.and_then(serde_json::Value::as_i64)
+				else {
+					return;
+				};
+				let Some((command, response)) = pending.lock().remove(&request_seq) else {
+					return;
+				};
+				let result = if message
+					.get("success")
+					.and_then(serde_json::Value::as_bool)
+					.unwrap_or(false)
+				{
+					Ok(message
+						.get("body")
+						.cloned()
+						.unwrap_or(serde_json::Value::Null))
+				} else {
+					Err(DapProtocolError::Adapter {
+						command,
+						message: Str::new(
+							message
+								.get("message")
+								.and_then(serde_json::Value::as_str)
+								.unwrap_or("adapter request failed"),
+						),
+					})
+				};
+				let _ = response.send(result);
+			},
+			Some("event") => {
+				let Some(event) = message.get("event").and_then(serde_json::Value::as_str) else {
+					return;
+				};
+				let _ = events.send(DapInbound::Event {
+					event: Str::new(event),
+					body:  message
+						.get("body")
+						.cloned()
+						.unwrap_or(serde_json::Value::Null),
+				});
+			},
+			Some("request") => {
+				let (Some(seq), Some(command)) = (
+					message.get("seq").and_then(serde_json::Value::as_i64),
+					message.get("command").and_then(serde_json::Value::as_str),
+				) else {
+					return;
+				};
+				let _ = events.send(DapInbound::ReverseRequest {
+					seq,
+					command: Str::new(command),
+					arguments: message
+						.get("arguments")
+						.cloned()
+						.unwrap_or(serde_json::Value::Null),
+				});
+			},
+			_ => {},
+		}
 	}
 }
 
-fn dispatch_message(
-	message: Value,
-	pending: &Mutex<PendingRequests>,
-	events: &broadcast::Sender<DapInbound>,
-) {
-	match message.get("type").and_then(Value::as_str) {
-		Some("response") => {
-			let Some(request_seq) = message.get("request_seq").and_then(Value::as_i64) else {
-				return;
-			};
-			let Some((command, response)) = pending.lock().remove(&request_seq) else {
-				return;
-			};
-			let result = if message
-				.get("success")
-				.and_then(Value::as_bool)
-				.unwrap_or(false)
-			{
-				Ok(message.get("body").cloned().unwrap_or(Value::Null))
-			} else {
-				Err(DapProtocolError::Adapter {
-					command,
-					message: Str::new(
-						message
-							.get("message")
-							.and_then(Value::as_str)
-							.unwrap_or("adapter request failed"),
-					),
-				})
-			};
-			let _ = response.send(result);
-		},
-		Some("event") => {
-			let Some(event) = message.get("event").and_then(Value::as_str) else {
-				return;
-			};
-			let _ = events.send(DapInbound::Event {
-				event: Str::new(event),
-				body:  message.get("body").cloned().unwrap_or(Value::Null),
-			});
-		},
-		Some("request") => {
-			let (Some(seq), Some(command)) = (
-				message.get("seq").and_then(Value::as_i64),
-				message.get("command").and_then(Value::as_str),
-			) else {
-				return;
-			};
-			let _ = events.send(DapInbound::ReverseRequest {
-				seq,
-				command: Str::new(command),
-				arguments: message.get("arguments").cloned().unwrap_or(Value::Null),
-			});
-		},
-		_ => {},
-	}
-}
-
-async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Value, DapProtocolError> {
-	let body = crate::lsp_process::read_frame(reader, MAX_DAP_HEADER_BYTES, MAX_DAP_MESSAGE_BYTES)
+async fn read_message<R: AsyncRead + Unpin>(
+	reader: &mut R,
+) -> Result<serde_json::Value, DapProtocolError> {
+	let body = lsp_process::read_frame(reader, MAX_DAP_HEADER_BYTES, MAX_DAP_MESSAGE_BYTES)
 		.await
 		.map_err(|source| DapProtocolError::Frame { source })?;
 	Ok(serde_json::from_slice(&body)?)
@@ -625,14 +658,14 @@ async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Value, Dap
 
 async fn write_message<W: AsyncWrite + Unpin>(
 	writer: &mut W,
-	message: &Value,
+	message: &serde_json::Value,
 ) -> Result<(), DapProtocolError> {
 	let body = serde_json::to_vec(message)?;
 	if body.len() > MAX_DAP_MESSAGE_BYTES {
 		return Err(DapProtocolError::InvalidFrame(sf!("message exceeds size bound")));
 	}
-	let write = crate::lsp_process::write_frame(writer, &body);
-	tokio::time::timeout(WRITE_TIMEOUT, write)
+	let write = lsp_process::write_frame(writer, &body);
+	time::timeout(WRITE_TIMEOUT, write)
 		.await
 		.map_err(|_| DapProtocolError::Timeout)??;
 	Ok(())
@@ -640,12 +673,19 @@ async fn write_message<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+
 	use super::*;
 
 	#[tokio::test]
 	async fn correlates_response_and_publishes_event() {
-		let (client, mut adapter) = tokio::io::duplex(16 * 1024);
-		let (reader, writer) = tokio::io::split(client);
+		let (client, mut adapter) = {
+			use tokio::io;
+			io::duplex(16 * 1024)
+		};
+		let (reader, writer) = {
+			use tokio::io;
+			io::split(client)
+		};
 		let protocol = DapProtocol::from_streams(reader, writer);
 		let mut events = protocol.subscribe();
 		tokio::spawn(async move {

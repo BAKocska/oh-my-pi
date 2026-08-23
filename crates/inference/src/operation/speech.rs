@@ -11,7 +11,7 @@ use tower::Service;
 
 use crate::{
 	answer::{Answer, AnswerBody, AudioChunk, AudioStream},
-	call::{AudioFormat, OperationCall, Setting, SpeechRequest, TimestampGranularity},
+	call::{AudioFormat, Call, OperationCall, Setting, SpeechRequest, TimestampGranularity},
 	catalog::OperationKind,
 	error::Error,
 	operation::{
@@ -202,7 +202,7 @@ impl<S> SpeechService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for SpeechService<S>
+impl<S> Service<Call> for SpeechService<S>
 where
 	S: Service<
 			OperationRequest<SpeechRequest>,
@@ -220,7 +220,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::Speak(request) => Some(Arc::clone(request)),
 			_ => None,

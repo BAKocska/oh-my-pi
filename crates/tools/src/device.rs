@@ -6,6 +6,7 @@
 
 use std::{
 	collections::BTreeMap,
+	str,
 	sync::{
 		Arc, OnceLock, Weak,
 		atomic::{AtomicU64, Ordering},
@@ -450,7 +451,7 @@ fn render_device_docs(device: &MountedDevice<'_>, path: &str) -> String {
 	output.push_str("\nRevision: ");
 	output.push_str(&device.rev.to_string());
 	output.push_str("\n\nSchema:\n");
-	output.push_str(std::str::from_utf8(device.schema).unwrap_or("{}"));
+	output.push_str(str::from_utf8(device.schema).unwrap_or("{}"));
 	output.push('\n');
 	output
 }
@@ -777,7 +778,7 @@ impl<I: DeviceInvoker + 'static> DynTool<I> {
 			 transport.\n\nOperations: search, docs/<path>, invoke/<path>\nSearch parameters: q, \
 			 tags, provenance, offset, limit, depth.\n\nSchema:\n",
 		);
-		output.push_str(std::str::from_utf8(&self.spec.schema).unwrap_or("{}"));
+		output.push_str(str::from_utf8(&self.spec.schema).unwrap_or("{}"));
 		Str::new(output)
 	}
 
@@ -875,7 +876,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 					let mut events = match target.route {
 						ToolRoute::Native => {
 							let (feed, nested) = IncomingParams::channel();
-							let raw = Str::new(std::str::from_utf8(&args_json).expect("serialized JSON is UTF-8"));
+							let raw = Str::new(str::from_utf8(&args_json).expect("serialized JSON is UTF-8"));
 							if feed.args_committed(raw).is_err() {
 								yield done(Err(self.unknown_path_fault(path.to_string().as_str(), &registry)));
 								return;
@@ -1075,16 +1076,17 @@ mod tests {
 	use omp_tool::{
 		Claims, Constraint, Effects, ErasedEv, ErasedOutcome, Ev, IncomingParams, MountedDevice,
 		Precedence, Presentation, Registry, Rev, Tool, ToolRoute, ToolSpec, ToolTerminal,
-		ToolsPolicy,
+		ToolsPolicy, Verdict,
 	};
 	use parking_lot::Mutex;
 	use serde_json::json;
 
 	use super::{
 		AUTO_QA_PROMPT_GUIDANCE, CatalogQuery, DOCS_TOTAL_BUDGET, DeviceCatalog, DeviceInvokeRequest,
-		DeviceInvoker, DocsMode, DynPayload, EXTERNAL_SUMMARY_CAP, Operation, OperationError,
-		PER_DEVICE_DOCS_CAP, PROMPT_GUIDANCE, dyn_enabled, dyn_tool, flatten_slots, parse_operation,
-		render_catalog, render_catalog_query, render_prompt_docs, renest_args, reserved_parameter,
+		DeviceInvoker, DocsMode, DynPayload, DynUpdate, EXTERNAL_SUMMARY_CAP, Operation,
+		OperationError, PER_DEVICE_DOCS_CAP, PROMPT_GUIDANCE, dyn_enabled, dyn_tool, flatten_slots,
+		parse_operation, render_catalog, render_catalog_query, render_prompt_docs, renest_args,
+		reserved_parameter,
 	};
 
 	#[derive(Clone, Default)]
@@ -1131,17 +1133,9 @@ mod tests {
 		(catalog, registry)
 	}
 
-	async fn invoke<T>(
-		tool: &T,
-		args: &str,
-	) -> Vec<Ev<super::DynUpdate, DynPayload, omp_tool::Verdict>>
+	async fn invoke<T>(tool: &T, args: &str) -> Vec<Ev<DynUpdate, DynPayload, omp_tool::Verdict>>
 	where
-		T: Tool<
-				Params = Value,
-				Update = super::DynUpdate,
-				Payload = DynPayload,
-				Fault = omp_tool::Verdict,
-			>,
+		T: Tool<Params = Value, Update = DynUpdate, Payload = DynPayload, Fault = Verdict>,
 	{
 		let (feed, params) = IncomingParams::channel();
 		feed
@@ -1397,7 +1391,9 @@ mod tests {
 			Ev::Done(ToolTerminal::Done {
 				result: Err(omp_tool::Verdict::Device { issue, .. }),
 				..
-			}) => assert_eq!(issue.expected, "one of search, docs, invoke"),
+			}) => {
+				assert_eq!(issue.expected, "one of search, docs, invoke")
+			},
 			event => panic!("unexpected event: {event:?}"),
 		}
 	}

@@ -1,8 +1,17 @@
 //! Error facilities
 
-use std::path::PathBuf;
+use std::{error, fmt, io, num, path::PathBuf, str, string, time};
 
-use crate::{Shell, ShellFd, extensions, results, sys};
+use tokio::task;
+
+use crate::{
+	Shell, ShellFd, SourceInfo,
+	arithmetic::EvalError,
+	env::EnvironmentScope,
+	extensions,
+	parser::{ParseError, TestCommandParseError, WordParseError},
+	results, sys,
+};
 
 /// Unified error type for this crate. Contains just a kind for now,
 /// but will be extended later with additional context.
@@ -44,7 +53,7 @@ pub enum ErrorKind {
 
 	/// An error occurred while sourcing the indicated script file.
 	#[error("failed to source file: {0}")]
-	FailedSourcingFile(PathBuf, #[source] std::io::Error),
+	FailedSourcingFile(PathBuf, #[source] io::Error),
 
 	/// The shell failed to send a signal to a process.
 	#[error("failed to send signal to process")]
@@ -76,7 +85,7 @@ pub enum ErrorKind {
 
 	/// Failed to execute command.
 	#[error("failed to execute command '{0}': {1}")]
-	FailedToExecuteCommand(String, #[source] std::io::Error),
+	FailedToExecuteCommand(String, #[source] io::Error),
 
 	/// History item was not found.
 	#[error("history item not found")]
@@ -103,9 +112,9 @@ pub enum ErrorKind {
 	#[error("unexpected environment scope type: expected '{expected}', found '{actual}'")]
 	UnexpectedScopeType {
 		/// The expected scope type.
-		expected: crate::env::EnvironmentScope,
+		expected: EnvironmentScope,
 		/// The actual scope type.
-		actual:   crate::env::EnvironmentScope,
+		actual:   EnvironmentScope,
 	},
 
 	/// The given path is not a directory.
@@ -134,7 +143,7 @@ pub enum ErrorKind {
 
 	/// An error occurred evaluating an arithmetic expression.
 	#[error("arithmetic evaluation error: {0}")]
-	EvalError(#[from] crate::arithmetic::EvalError),
+	EvalError(#[from] EvalError),
 
 	/// The given string could not be parsed as an integer.
 	#[error("failed to parse '{s}' as a {int_type_name}, base-{radix} integer: {inner}")]
@@ -146,20 +155,20 @@ pub enum ErrorKind {
 		/// The radix (base) used for parsing.
 		radix:         u32,
 		/// The underlying parse error.
-		inner:         std::num::ParseIntError,
+		inner:         num::ParseIntError,
 	},
 
 	/// The given integer could not be converted to the target type.
 	#[error("integer conversion error")]
-	TryIntParseError(#[from] std::num::TryFromIntError),
+	TryIntParseError(#[from] num::TryFromIntError),
 
 	/// A byte sequence could not be decoded as a valid UTF-8 string.
 	#[error("failed to decode utf-8")]
-	FromUtf8Error(#[from] std::string::FromUtf8Error),
+	FromUtf8Error(#[from] string::FromUtf8Error),
 
 	/// A byte sequence could not be decoded as a valid UTF-8 string.
 	#[error("failed to decode utf-8")]
-	Utf8Error(#[from] std::str::Utf8Error),
+	Utf8Error(#[from] str::Utf8Error),
 
 	/// An attempt was made to modify a readonly variable.
 	#[error("cannot mutate readonly variable")]
@@ -179,7 +188,7 @@ pub enum ErrorKind {
 
 	/// An I/O error occurred.
 	#[error("i/o error: {0}")]
-	IoError(#[from] std::io::Error),
+	IoError(#[from] io::Error),
 
 	/// Invalid substitution syntax.
 	#[error("bad substitution: {0}")]
@@ -191,27 +200,27 @@ pub enum ErrorKind {
 
 	/// An error occurred while formatting a string.
 	#[error(transparent)]
-	FormattingError(#[from] std::fmt::Error),
+	FormattingError(#[from] fmt::Error),
 
 	/// An error occurred while parsing.
 	#[error("{1}: {0}")]
-	ParseError(crate::parser::ParseError, crate::SourceInfo),
+	ParseError(ParseError, SourceInfo),
 
 	/// An error occurred while parsing a function body.
 	#[error("{0}: {1}")]
-	FunctionParseError(String, crate::parser::ParseError),
+	FunctionParseError(String, ParseError),
 
 	/// An error occurred while parsing a word.
 	#[error(transparent)]
-	WordParseError(#[from] crate::parser::WordParseError),
+	WordParseError(#[from] WordParseError),
 
 	/// Unable to parse a test command.
 	#[error("invalid test command")]
-	TestCommandParseError(#[from] crate::parser::TestCommandParseError),
+	TestCommandParseError(#[from] TestCommandParseError),
 
 	/// A threading error occurred.
 	#[error("threading error")]
-	ThreadingError(#[from] tokio::task::JoinError),
+	ThreadingError(#[from] task::JoinError),
 
 	/// An invalid signal was referenced.
 	#[error("{0}: invalid signal specification")]
@@ -255,7 +264,7 @@ pub enum ErrorKind {
 
 	/// System time error.
 	#[error("system time error: {0}")]
-	TimeError(#[from] std::time::SystemTimeError),
+	TimeError(#[from] time::SystemTimeError),
 
 	/// Array index out of range.
 	#[error("array index out of range: {0}")]
@@ -318,18 +327,18 @@ pub enum ErrorKind {
 }
 
 /// Trait implementable by built-in commands to represent errors.
-pub trait BuiltinError: std::error::Error + ConvertibleToExitCode + Send + Sync {
+pub trait BuiltinError: error::Error + ConvertibleToExitCode + Send + Sync {
 	/// Try to extract a reference to the underlying `std::io::Error`, if any.
 	/// Implementations should return `None` if there is no inner I/O error.
 	/// They should not attempt to *synthesize* an I/O error if one does not
 	/// naturally exist.
-	fn as_io_error(&self) -> Option<&std::io::Error> {
+	fn as_io_error(&self) -> Option<&io::Error> {
 		None
 	}
 }
 
 impl BuiltinError for Error {
-	fn as_io_error(&self) -> Option<&std::io::Error> {
+	fn as_io_error(&self) -> Option<&io::Error> {
 		self.as_io_error()
 	}
 }
@@ -368,9 +377,9 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
 	}
 }
 
-impl From<&std::io::Error> for results::ExecutionExitCode {
-	fn from(io_err: &std::io::Error) -> Self {
-		if io_err.kind() == std::io::ErrorKind::BrokenPipe {
+impl From<&io::Error> for results::ExecutionExitCode {
+	fn from(io_err: &io::Error) -> Self {
+		if io_err.kind() == io::ErrorKind::BrokenPipe {
 			Self::BrokenPipe
 		} else {
 			Self::GeneralError
@@ -411,7 +420,7 @@ impl Error {
 	}
 
 	/// Try to extract a reference to the underlying `std::io::Error`, if any.
-	pub fn as_io_error(&self) -> Option<&std::io::Error> {
+	pub fn as_io_error(&self) -> Option<&io::Error> {
 		match &self.kind {
 			ErrorKind::IoError(io_err) => Some(io_err),
 			ErrorKind::BuiltinError(inner, _) => inner.as_io_error(),

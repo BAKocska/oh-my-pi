@@ -1,8 +1,9 @@
 //! Parse and deserialization errors.
 
-use std::fmt;
+use std::fmt::Display;
 
 use omp_core::{Str, sf};
+use serde::de;
 
 use crate::parser::MAX_DEPTH;
 
@@ -56,8 +57,8 @@ pub enum ParseError {
 	Custom(Str),
 }
 
-impl serde::de::Error for ParseError {
-	fn custom<T: fmt::Display>(msg: T) -> Self {
+impl de::Error for ParseError {
+	fn custom<T: Display>(msg: T) -> Self {
 		Self::Custom(sf!("{msg}"))
 	}
 }

@@ -6,17 +6,21 @@ use std::sync::{
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use omp_core::{Str, ToolPath};
 use omp_inference::TurnId;
 use omp_proto::{
-	inference::v1::{TurnEvent, turn_event},
+	inference::{
+		v1,
+		v1::{TurnEvent, turn_event},
+	},
 	thread::v1::Item,
 };
 use omp_storage::transcript::TitleSource;
 use omp_tool::{Rev, ToolIdentity};
 use parking_lot::Mutex;
 
-use crate::state::AgentSnapshot;
+use crate::{Receipt, state::AgentSnapshot};
 
 /// Observable phase of the agent loop.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -135,7 +139,7 @@ pub struct PeerRelayObservation {
 	/// Exact peer-visible body.
 	pub text:    Str,
 	/// Delivery state shown beside the body.
-	pub outcome: crate::Receipt,
+	pub outcome: Receipt,
 }
 
 /// One immutable observation emitted by the agent loop.
@@ -236,7 +240,7 @@ pub enum AgentEvent {
 		/// Canonical result item staged for the next delta.
 		item:    Item,
 		/// Cumulative session usage observed before this tool boundary.
-		usage:   omp_proto::inference::v1::Usage,
+		usage:   v1::Usage,
 	},
 	/// A detached job began settlement tracking.
 	JobRegistered {
@@ -360,8 +364,6 @@ impl EventBus {
 		self.publish_shared(Arc::new(event))
 	}
 
-	/// Publishes an already shared event without another event allocation.
-
 	/// Adds a bounded subscriber receiving only explicitly allowlisted peer
 	/// facts.
 	pub fn subscribe_collab(&self, capacity: usize) -> CollabEventSubscription {
@@ -376,6 +378,7 @@ impl EventBus {
 		CollabEventSubscription { rx, dropped }
 	}
 
+	/// Publishes an already shared event without another event allocation.
 	pub fn publish_shared(&self, event: Arc<AgentEvent>) -> Arc<AgentEvent> {
 		let mut subscribers = self.inner.subscribers.lock();
 		subscribers
@@ -507,7 +510,7 @@ fn collab_visibility(event: &AgentEvent) -> Option<CollabEventVisibility> {
 
 /// Receiving half of an ordered lossless event subscription.
 pub struct EventSubscription {
-	rx: flume::Receiver<Arc<AgentEvent>>,
+	rx: Receiver<Arc<AgentEvent>>,
 }
 
 impl EventSubscription {
@@ -534,7 +537,7 @@ impl EventSubscription {
 
 /// Receiving half of an ordered bounded collaboration projection.
 pub struct CollabEventSubscription {
-	rx:      flume::Receiver<Arc<CollabEvent>>,
+	rx:      Receiver<Arc<CollabEvent>>,
 	dropped: Arc<AtomicU64>,
 }
 
@@ -568,7 +571,7 @@ impl CollabEventSubscription {
 
 /// Receiving half of an ordered bounded UI event subscription.
 pub struct LossyEventSubscription {
-	rx:      flume::Receiver<Arc<AgentEvent>>,
+	rx:      Receiver<Arc<AgentEvent>>,
 	dropped: Arc<AtomicU64>,
 }
 

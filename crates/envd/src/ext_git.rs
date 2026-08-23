@@ -9,14 +9,14 @@ use std::{
 	sync::atomic::{AtomicU64, Ordering},
 };
 
-use omp_core::{Hash32, Str};
-use omp_ext::{ExtensionCode, ExtensionError};
+use omp_core::Hash32;
+use omp_ext::{ExtensionCode, ExtensionError, config::SourceSpec};
 use tokio_util::sync::CancellationToken;
 
 use super::vcs::git::{
-	commands::GitCommands,
+	commands::{CommandError, GitCommands},
 	repo::Repository,
-	runner::{GitDeadline, GitRunOptions, GitRunner},
+	runner::{GitDeadline, GitRunError, GitRunOptions, GitRunner},
 };
 
 static GIT_MATERIALIZATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -40,11 +40,11 @@ impl NativeGitResolver {
 	/// source tree. Returns the validated contained subdirectory when declared.
 	pub async fn materialize(
 		&self,
-		source: &omp_ext::config::SourceSpec,
+		source: &SourceSpec,
 		destination: &Path,
 		cancel: &CancellationToken,
 	) -> Result<PathBuf, ExtensionError> {
-		let omp_ext::config::SourceSpec::Git { repository, revision, subdirectory } = source else {
+		let SourceSpec::Git { repository, revision, subdirectory } = source else {
 			return Err(ext_git_error("native Git resolver requires a git: source"));
 		};
 		if destination.exists() {
@@ -188,11 +188,11 @@ fn git_io(error: io::Error) -> ExtensionError {
 	ExtensionError::new(ExtensionCode::EIntegrity, format!("Git materialization I/O: {error}"))
 }
 
-fn git_run(error: super::vcs::git::runner::GitRunError) -> ExtensionError {
+fn git_run(error: GitRunError) -> ExtensionError {
 	ExtensionError::new(ExtensionCode::EIntegrity, format!("Environment Git failed: {error}"))
 }
 
-fn git_command(error: super::vcs::git::commands::CommandError) -> ExtensionError {
+fn git_command(error: CommandError) -> ExtensionError {
 	ExtensionError::new(ExtensionCode::EIntegrity, format!("Environment Git failed: {error}"))
 }
 

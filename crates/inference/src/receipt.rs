@@ -485,7 +485,7 @@ pub struct ServingModelAttribution {
 	/// Concrete serving provider.
 	pub provider: ProviderId,
 	/// Concrete serving model.
-	pub model:    crate::catalog::ModelKey,
+	pub model:    ModelKey,
 	/// Successful attempt index that settled this attribution.
 	pub attempt:  u32,
 }
@@ -578,19 +578,20 @@ impl ExecutionReceipt {
 #[cfg(test)]
 mod tests {
 	use super::{Cost, ExecutionReceipt, ServingModelAttribution, Usage, UsageSource};
+	use crate::catalog::{ModelKey as CatalogModelKey, ProviderId as CatalogProviderId};
 
 	#[test]
 	fn serving_model_settles_once_and_replay_is_idempotent() {
 		let attribution = ServingModelAttribution {
-			provider: crate::catalog::ProviderId::from("provider"),
-			model:    crate::catalog::ModelKey::from("model"),
+			provider: CatalogProviderId::from("provider"),
+			model:    CatalogModelKey::from("model"),
 			attempt:  2,
 		};
 		let mut receipt = ExecutionReceipt::default();
 		assert_eq!(receipt.settle_serving_model(attribution.clone()), Ok(()));
 		assert_eq!(receipt.settle_serving_model(attribution.clone()), Ok(()));
 		let conflicting =
-			ServingModelAttribution { model: crate::catalog::ModelKey::from("other"), ..attribution };
+			ServingModelAttribution { model: CatalogModelKey::from("other"), ..attribution };
 		assert_eq!(receipt.settle_serving_model(conflicting.clone()), Err(conflicting));
 	}
 

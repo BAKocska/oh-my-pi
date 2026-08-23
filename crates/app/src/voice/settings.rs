@@ -187,7 +187,7 @@ const TTS_PROVIDER_OPTIONS: &[SettingOption] = &[
 	Serialize,
 )]
 #[serde(rename_all = "kebab-case")]
-#[strum(serialize_all = "kebab-case", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 pub enum SttSubmitTrigger {
 	/// Never submit automatically.
 	#[default]
@@ -215,7 +215,7 @@ pub enum SttSubmitTrigger {
 	Serialize,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum SpeechMode {
 	/// Speak assistant messages and thinking.
 	All,
@@ -241,7 +241,7 @@ pub enum SpeechMode {
 	Serialize,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum TtsProvider {
 	/// Prefer local synthesis while allowing credentialed hosted routing when
 	/// appropriate.

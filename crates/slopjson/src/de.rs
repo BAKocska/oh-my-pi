@@ -4,6 +4,8 @@
 //! intermediate tree. [`Value`] is just one visitor: [`parse`] is
 //! `from_str::<Value>`.
 
+use std::mem;
+
 use omp_core::{CowStr, Str};
 use serde::{
 	de::{
@@ -16,6 +18,7 @@ use serde::{
 use crate::{
 	error::ParseError,
 	parser::{Atom, MAX_DEPTH, Mode, Parser, Repair, RepairLog, RepairPathSegment},
+	raw,
 	value::Value,
 };
 
@@ -137,7 +140,7 @@ impl<'de> Deserializer<'de> {
 
 	/// Run `f` with bareword recovery enabled (value position).
 	fn in_value_position<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-		let prev = std::mem::replace(&mut self.allow_bareword, true);
+		let prev = mem::replace(&mut self.allow_bareword, true);
 		let result = f(self);
 		self.allow_bareword = prev;
 		result
@@ -222,7 +225,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
 		name: &'static str,
 		visitor: V,
 	) -> Result<V::Value, ParseError> {
-		if name == crate::raw::TOKEN {
+		if name == raw::TOKEN {
 			self.p.ws();
 			let start = self.p.pos();
 			(&mut *self).deserialize_any(de::IgnoredAny)?;

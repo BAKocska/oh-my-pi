@@ -1,6 +1,9 @@
 //! Lenient token-driven state machine for hashline section bodies.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+	collections::{BTreeSet, HashMap, HashSet},
+	mem,
+};
 
 use omp_core::{IntoStr, Str, sf};
 
@@ -139,7 +142,7 @@ impl Executor {
 	}
 
 	fn consume_skippable_comments(&mut self) -> Result<(), ParseError> {
-		for (text, line_num) in std::mem::take(&mut self.skippable_comments) {
+		for (text, line_num) in mem::take(&mut self.skippable_comments) {
 			self.handle_raw(text, line_num)?;
 		}
 		Ok(())

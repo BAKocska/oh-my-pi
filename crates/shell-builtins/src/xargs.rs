@@ -3,10 +3,12 @@
 //! Ported from uutils findutils 0.8.0.
 
 use std::{
+	borrow,
 	collections::HashMap,
+	convert,
 	error::Error,
 	ffi::{OsStr, OsString},
-	fmt::Display,
+	fmt::{self, Display},
 	fs,
 	io::{self, Read, Write},
 	process::Command,
@@ -304,7 +306,7 @@ enum CommandExecutionError {
 }
 
 impl Display for CommandExecutionError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::UrgentlyFailed => write!(f, "Command exited with code 255"),
 			Self::Killed { signal } => {
@@ -338,7 +340,7 @@ impl CommandBuilderOptions {
 		replace: Option<String>,
 	) -> Result<Self, ExhaustedCommandSpace> {
 		let initial_args = match &action {
-			ExecAction::Command(args) => args.iter().map(std::convert::AsRef::as_ref).collect(),
+			ExecAction::Command(args) => args.iter().map(convert::AsRef::as_ref).collect(),
 			ExecAction::Echo => vec![OsStr::new("echo")],
 		};
 
@@ -666,7 +668,7 @@ enum XargsError {
 }
 
 impl Display for XargsError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::ArgumentTooLarge => write!(f, "Argument too large"),
 			Self::CommandExecution(e) => write!(f, "{e}"),
@@ -990,7 +992,7 @@ fn do_xargs(matches: &ArgMatches, host: &mut Host) -> Result<CommandResult, Xarg
 	let options = Options {
 		arg_file:                matches
 			.get_one::<String>(options::ARG_FILE)
-			.map(std::borrow::ToOwned::to_owned),
+			.map(borrow::ToOwned::to_owned),
 		delimiter:               matches.get_one::<u8>(options::DELIMITER).copied(),
 		interactive:             matches.get_flag(options::INTERACTIVE),
 		exit_if_pass_char_limit: matches.get_flag(options::EXIT),
@@ -1005,7 +1007,7 @@ fn do_xargs(matches: &ArgMatches, host: &mut Host) -> Result<CommandResult, Xarg
 				matches.contains_id(option).then(|| {
 					matches
 						.get_one::<String>(option)
-						.map_or_else(|| "{}".to_string(), std::borrow::ToOwned::to_owned)
+						.map_or_else(|| "{}".to_string(), borrow::ToOwned::to_owned)
 				})
 			}),
 		verbose:                 matches.get_flag(options::VERBOSE),
@@ -1015,7 +1017,7 @@ fn do_xargs(matches: &ArgMatches, host: &mut Host) -> Result<CommandResult, Xarg
 
 	let action = match matches.get_many::<OsString>(options::COMMAND) {
 		Some(args) if args.len() > 0 => {
-			ExecAction::Command(args.map(std::borrow::ToOwned::to_owned).collect())
+			ExecAction::Command(args.map(borrow::ToOwned::to_owned).collect())
 		},
 		_ => ExecAction::Echo,
 	};
@@ -1105,7 +1107,10 @@ pub(crate) fn xargs_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
+	use std::cmp;
+
 	use super::*;
+	use crate::host::run_util;
 
 	fn make_arg_init(s: &str) -> Argument {
 		Argument { arg: s.to_owned().into(), kind: ArgumentKind::Initial }
@@ -1164,7 +1169,7 @@ mod tests {
 
 			match &mut self.chunks[self.current] {
 				Chunk::Data(data) => {
-					let byte_count = std::cmp::min(data.len(), buf.len());
+					let byte_count = cmp::min(data.len(), buf.len());
 					buf[..byte_count].copy_from_slice(&(*data)[..byte_count]);
 					if byte_count == data.len() {
 						self.current += 1;
@@ -1390,7 +1395,7 @@ mod tests {
 	}
 
 	fn run_simple(argv: &[&str], stdin: &str) -> (i32, String, String) {
-		let (code, capture) = crate::host::run_util::<Xargs>(argv, stdin, ".");
+		let (code, capture) = run_util::<Xargs>(argv, stdin, ".");
 		(code, capture.out(), capture.err())
 	}
 
@@ -1509,11 +1514,8 @@ mod tests {
 	#[test]
 	fn children_run_in_host_cwd() {
 		let dir = tempfile::TempDir::new().expect("tempdir");
-		let (code, capture) = crate::host::run_util::<Xargs>(
-			&["sh", "-c", "touch \"$1\"", "_"],
-			"made.txt\n",
-			dir.path(),
-		);
+		let (code, capture) =
+			run_util::<Xargs>(&["sh", "-c", "touch \"$1\"", "_"], "made.txt\n", dir.path());
 		assert_eq!(code, 0, "stderr: {:?}", capture.err());
 		assert!(dir.path().join("made.txt").exists());
 	}
@@ -1533,9 +1535,8 @@ mod tests {
 	#[test]
 	fn arg_file_resolves_against_host_cwd() {
 		let dir = tempfile::TempDir::new().expect("tempdir");
-		std::fs::write(dir.path().join("items.txt"), "a b\n").expect("write items");
-		let (code, capture) =
-			crate::host::run_util::<Xargs>(&["-a", "items.txt", "echo"], "", dir.path());
+		fs::write(dir.path().join("items.txt"), "a b\n").expect("write items");
+		let (code, capture) = run_util::<Xargs>(&["-a", "items.txt", "echo"], "", dir.path());
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "a b\n");
 	}
@@ -1543,9 +1544,9 @@ mod tests {
 	#[test]
 	fn interactive_confirmation_reads_stdin_and_prompts_stderr() {
 		let dir = tempfile::TempDir::new().expect("tempdir");
-		std::fs::write(dir.path().join("items.txt"), "a\n").expect("write items");
+		fs::write(dir.path().join("items.txt"), "a\n").expect("write items");
 		let (code, capture) =
-			crate::host::run_util::<Xargs>(&["-a", "items.txt", "-p", "echo"], "y\n", dir.path());
+			run_util::<Xargs>(&["-a", "items.txt", "-p", "echo"], "y\n", dir.path());
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "a\n");
 		assert_eq!(capture.err(), "echo a ?...");

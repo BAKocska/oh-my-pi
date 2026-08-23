@@ -1,7 +1,7 @@
 //! Session-scoped lowering of opaque text-edit intents into canonical byte
 //! edits.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, str, sync::Arc};
 
 use bytes::Bytes;
 use omp_core::{IntoStr, Str, sf};
@@ -239,7 +239,7 @@ impl TextEditAdapter for HashlineAdapter {
 		parse_hashline_options(&options_json)?;
 		let path = path_key(path)?;
 		let text =
-			std::str::from_utf8(&payload).map_err(|source| Error::HashlinePayloadUtf8 { source })?;
+			str::from_utf8(&payload).map_err(|source| Error::HashlinePayloadUtf8 { source })?;
 		let patch = Patch::parse_default(text).map_err(|source| Error::HashlineParse { source })?;
 		if patch.sections.len() != 1 {
 			return Err(Error::InvalidContent {

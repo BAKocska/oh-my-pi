@@ -1,5 +1,8 @@
+//! Proves extension-scoped MCP mounts project, list, invoke, and remove through
+//! CONTROL.
 use std::{
 	collections::BTreeSet,
+	env, fs,
 	future::Future,
 	pin::Pin,
 	sync::{Arc, Mutex},
@@ -25,6 +28,7 @@ use omp_envd::{
 	},
 };
 use serde_json::{Value, json};
+use tokio::task;
 use tokio_util::sync::CancellationToken;
 
 struct Connector {
@@ -154,9 +158,8 @@ async fn extension_scoped_mount_projects_lists_invokes_and_removes() {
 		.duration_since(UNIX_EPOCH)
 		.expect("wall clock")
 		.as_nanos();
-	let directory =
-		std::env::temp_dir().join(format!("omp-mcp-control-{}-{nonce}", std::process::id()));
-	std::fs::create_dir_all(&directory).expect("temporary environment");
+	let directory = env::temp_dir().join(format!("omp-mcp-control-{}-{nonce}", std::process::id()));
+	fs::create_dir_all(&directory).expect("temporary environment");
 	let service = McpService::open(directory.join("mcp.sqlite3")).expect("MCP service");
 	let connector = Arc::new(Connector {
 		transport: Arc::new(FixtureTransport),
@@ -293,6 +296,6 @@ async fn extension_scoped_mount_projects_lists_invokes_and_removes() {
 	drop(manager);
 	drop(service);
 	cancellation.cancel();
-	tokio::task::yield_now().await;
-	std::fs::remove_dir_all(directory).expect("remove temporary environment");
+	task::yield_now().await;
+	fs::remove_dir_all(directory).expect("remove temporary environment");
 }

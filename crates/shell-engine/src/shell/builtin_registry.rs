@@ -2,9 +2,9 @@
 
 use im::HashMap;
 
-use crate::{builtins, extensions};
+use crate::{Shell, builtins, extensions};
 
-impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
+impl<SE: extensions::ShellExtensions> Shell<SE> {
 	/// Register a builtin to the shell's environment, replacing any existing
 	/// registration with the same name.
 	///

@@ -5,10 +5,15 @@
 
 use std::{
 	collections::VecDeque,
+	env,
 	fs::{self, OpenOptions},
 	future::{Future, ready},
-	io::{BufRead as _, BufReader, Read as _, Write as _},
-	os::unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
+	io::{self, BufRead as _, BufReader, Read as _, Write as _},
+	iter,
+	os::{
+		fd,
+		unix::{fs::PermissionsExt as _, net::UnixStream, process::CommandExt as _},
+	},
 	path::{Path, PathBuf},
 	pin::Pin,
 	process::{Child, Command, ExitStatus, Stdio},
@@ -23,11 +28,14 @@ use std::{
 
 use async_stream::stream;
 use bytes::Bytes;
+use flume::Receiver;
 use futures::{Stream, StreamExt as _};
 use nix::{
+	errno::Errno,
 	fcntl::{FcntlArg, OFlag, fcntl},
 	pty::{Winsize, openpty},
-	unistd::ttyname,
+	sys::signal,
+	unistd::{Pid, ttyname},
 };
 use omp_agent::{
 	Agent, AgentError, AgentEvent, AgentSnapshot, AgentState, Error as TurnError, InvokeFrame,
@@ -60,7 +68,11 @@ use omp_inference::{
 	session::ConversationSessionPlanner,
 };
 use omp_proto::{
-	SCHEMA_REV, env::v1::ClientHello, inference::v1 as pb, prost::Message as _, thread::v1 as thread,
+	SCHEMA_REV,
+	env::v1::ClientHello,
+	inference::v1::{self as pb, part_start, turn_event, value},
+	prost::Message as _,
+	thread::v1::{self as thread, item},
 };
 use omp_storage::transcript::{self, AmendPatch, Entry, Header, Kind, SessionId};
 use omp_tool::{
@@ -70,6 +82,7 @@ use omp_tool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::time;
 use tower::Service;
 
 const TEST_NAME: &str = "crash_resume_replays_exact_durable_truth";
@@ -80,7 +93,7 @@ fn file_write_effects() -> Effects {
 	Effects {
 		documents: Some(DocEffects {
 			read:        false,
-			write_globs: std::iter::once(sf!("**")).collect(),
+			write_globs: iter::once(sf!("**")).collect(),
 		}),
 		exec:      None,
 		inference: None,
@@ -310,7 +323,7 @@ impl Service<LayerCall<Call>> for FakeRoute {
 async fn rpc_host(
 	root: &Path,
 	first: bool,
-) -> (DaemonHandle, RpcTurnClient, String, flume::Receiver<WorkflowResponse>) {
+) -> (DaemonHandle, RpcTurnClient, String, Receiver<WorkflowResponse>) {
 	let mut compiled: CompiledCatalog =
 		serde_json::from_str(include_str!("../../catalog/data/catalog.normalized.json"))
 			.expect("normalized catalog");
@@ -393,7 +406,7 @@ async fn rpc_host(
 }
 
 async fn next_rpc(session: &mut RpcTurnSession) -> pb::TurnEvent {
-	tokio::time::timeout(Duration::from_secs(3), async {
+	time::timeout(Duration::from_secs(3), async {
 		session
 			.events()
 			.next()
@@ -408,7 +421,7 @@ async fn next_rpc(session: &mut RpcTurnSession) -> pb::TurnEvent {
 async fn rpc_outcome(session: &mut RpcTurnSession) -> pb::Outcome {
 	loop {
 		let event = next_rpc(session).await;
-		if let Some(pb::turn_event::Event::Outcome(outcome)) = event.event {
+		if let Some(turn_event::Event::Outcome(outcome)) = event.event {
 			return outcome;
 		}
 	}
@@ -417,7 +430,7 @@ async fn rpc_outcome(session: &mut RpcTurnSession) -> pb::Outcome {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_resume_replays_exact_durable_truth() {
 	assert_fixed_turn_ids();
-	if let (Ok(stage), Ok(root)) = (std::env::var(CHILD_ENV), std::env::var(ROOT_ENV)) {
+	if let (Ok(stage), Ok(root)) = (env::var(CHILD_ENV), env::var(ROOT_ENV)) {
 		Box::pin(run_child(&stage, Path::new(&root))).await;
 		return;
 	}
@@ -521,7 +534,7 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 	assert_fixed_turn_ids();
 	install_omp_binary_env().expect("expose worker-capable host");
 	let scratch = Scratch::new().expect("binary resume scratch");
-	let project = std::fs::canonicalize(scratch.project()).expect("canonical scratch project");
+	let project = fs::canonicalize(scratch.project()).expect("canonical scratch project");
 	let omp_dir = project.join(".omp");
 	fs::create_dir(&omp_dir).expect("create project metadata directory");
 	fs::set_permissions(&omp_dir, fs::Permissions::from_mode(0o755))
@@ -690,7 +703,7 @@ async fn wait_pending_turn(path: &Path, limit: Duration) -> String {
 			}
 		}
 		assert!(Instant::now() < deadline, "binary chat did not durably start a turn");
-		tokio::time::sleep(Duration::from_millis(10)).await;
+		time::sleep(Duration::from_millis(10)).await;
 	}
 }
 
@@ -718,7 +731,7 @@ fn assert_binary_resume_journal(path: &Path, turn_id: &str) {
 		.filter(|item| {
 			matches!(
 				item.kind.as_ref(),
-				Some(thread::item::Kind::Message(message))
+				Some(item::Kind::Message(message))
 					if message.role == thread::Role::Assistant as i32
 						&& message.parts.iter().any(|part| matches!(
 							part.kind.as_ref(),
@@ -825,8 +838,8 @@ impl ChatDebug {
 }
 struct ChatPty {
 	child:       Child,
-	_master:     std::os::fd::OwnedFd,
-	_slave:      std::os::fd::OwnedFd,
+	_master:     fd::OwnedFd,
+	_slave:      fd::OwnedFd,
 	stop_reader: Arc<AtomicUsize>,
 	reader:      Option<std_thread::JoinHandle<()>>,
 	envd_log:    PathBuf,
@@ -848,13 +861,13 @@ impl ChatPty {
 				match nix::unistd::read(&reader_fd, &mut buffer) {
 					Ok(0) if reader_stop.load(Ordering::Acquire) != 0 => break,
 					Ok(_) => {},
-					Err(nix::errno::Errno::EAGAIN) if reader_stop.load(Ordering::Acquire) != 0 => {
+					Err(Errno::EAGAIN) if reader_stop.load(Ordering::Acquire) != 0 => {
 						break;
 					},
-					Err(nix::errno::Errno::EAGAIN) => {
+					Err(Errno::EAGAIN) => {
 						std_thread::sleep(Duration::from_millis(5));
 					},
-					Err(nix::errno::Errno::EIO) => break,
+					Err(Errno::EIO) => break,
 					Err(error) => panic!("binary chat PTY read failed: {error}"),
 				}
 			}
@@ -893,17 +906,17 @@ impl ChatPty {
 	}
 
 	fn stop(&self) {
-		nix::sys::signal::killpg(
-			nix::unistd::Pid::from_raw(i32::try_from(self.child.id()).expect("chat pid")),
-			Some(nix::sys::signal::Signal::SIGSTOP),
+		signal::killpg(
+			Pid::from_raw(i32::try_from(self.child.id()).expect("chat pid")),
+			Some(signal::Signal::SIGSTOP),
 		)
 		.expect("freeze binary chat process group");
 	}
 
 	fn kill(&mut self) {
-		let _ = nix::sys::signal::killpg(
-			nix::unistd::Pid::from_raw(i32::try_from(self.child.id()).expect("chat pid")),
-			Some(nix::sys::signal::Signal::SIGKILL),
+		let _ = signal::killpg(
+			Pid::from_raw(i32::try_from(self.child.id()).expect("chat pid")),
+			Some(signal::Signal::SIGKILL),
 		);
 		let _ = self.child.wait();
 		self.finish_reader();
@@ -933,9 +946,9 @@ impl ChatPty {
 impl Drop for ChatPty {
 	fn drop(&mut self) {
 		if self.child.try_wait().ok().flatten().is_none() {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(i32::try_from(self.child.id()).unwrap_or(i32::MAX)),
-				Some(nix::sys::signal::Signal::SIGKILL),
+			let _ = signal::killpg(
+				Pid::from_raw(i32::try_from(self.child.id()).unwrap_or(i32::MAX)),
+				Some(signal::Signal::SIGKILL),
 			);
 			let _ = self.child.wait();
 		}
@@ -994,14 +1007,14 @@ async fn replay_child(root: &Path, create: bool, _mutated: bool) {
 			.expect("open real RPC turn");
 		assert!(matches!(
 			next_rpc(&mut session).await.event,
-			Some(pb::turn_event::Event::Accepted(pb::Accepted { replay: false }))
+			Some(turn_event::Event::Accepted(pb::Accepted { replay: false }))
 		));
 		let outcome = rpc_outcome(&mut session).await;
 		fs::write(root.join("rpc-outcome.bin"), outcome.encode_to_vec())
 			.expect("persist expected RPC outcome");
 		write_marker(&root.join("accepted"));
 		loop {
-			std::thread::park();
+			std_thread::park();
 		}
 	}
 	let journal = Journal::open(&journal_path).expect("reopen pending RPC journal");
@@ -1038,7 +1051,7 @@ async fn replay_child(root: &Path, create: bool, _mutated: bool) {
 	while let Ok(event) = events.try_recv() {
 		if let AgentEvent::Turn { turn_id, event } = event.as_ref()
 			&& matches!(event.as_ref(), pb::TurnEvent {
-				event: Some(pb::turn_event::Event::Accepted(pb::Accepted { replay: true })),
+				event: Some(turn_event::Event::Accepted(pb::Accepted { replay: true })),
 			}) && turn_id.as_str() == ROOT_TURN
 		{
 			replay_accepted = true;
@@ -1095,7 +1108,7 @@ fn receipt_child(root: &Path, crash: bool) {
 			.expect("durable terminal receipt");
 		write_marker(&root.join("receipt"));
 		loop {
-			std::thread::park();
+			std_thread::park();
 		}
 	}
 	let journal = Journal::open(&journal_path).expect("recover missing sequence amendments");
@@ -1179,7 +1192,7 @@ async fn batch_child(root: &Path, create: bool) {
 }
 
 fn spawn_child(stage: &str, root: &Path) -> Child {
-	let mut command = Command::new(std::env::current_exe().expect("current P6 test executable"));
+	let mut command = Command::new(env::current_exe().expect("current P6 test executable"));
 	command.process_group(0);
 	command
 		.arg(TEST_NAME)
@@ -1206,7 +1219,7 @@ async fn run_child_process(stage: &str, root: &Path) -> ExitStatus {
 			let _ = child.wait();
 			panic!("child stage {stage} exceeded its bounded deadline");
 		}
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		time::sleep(Duration::from_millis(20)).await;
 	}
 }
 
@@ -1218,10 +1231,7 @@ fn kill_at_boundary(child: &mut Child) {
 
 fn kill_process_group(child: &mut Child) {
 	if let Ok(group) = i32::try_from(child.id()) {
-		let _ = nix::sys::signal::killpg(
-			nix::unistd::Pid::from_raw(group),
-			Some(nix::sys::signal::Signal::SIGKILL),
-		);
+		let _ = signal::killpg(Pid::from_raw(group), Some(signal::Signal::SIGKILL));
 		return;
 	}
 	let _ = child.kill();
@@ -1231,7 +1241,7 @@ async fn wait_for_file(path: &Path) {
 	let deadline = Instant::now() + Duration::from_secs(10);
 	while !path.exists() {
 		assert!(Instant::now() < deadline, "timed out waiting for {}", path.display());
-		tokio::time::sleep(Duration::from_millis(10)).await;
+		time::sleep(Duration::from_millis(10)).await;
 	}
 }
 
@@ -1245,7 +1255,7 @@ async fn wait_for_lines(path: &Path, count: usize) {
 			return;
 		}
 		assert!(Instant::now() < deadline, "timed out waiting for {count} durable effects");
-		tokio::time::sleep(Duration::from_millis(10)).await;
+		time::sleep(Duration::from_millis(10)).await;
 	}
 }
 
@@ -1276,7 +1286,7 @@ fn assert_single_receipt(path: &Path, turn_id: &str) {
 		(&projected.items[1], thread::Role::User, "survive this RPC host crash"),
 		(&projected.items[2], thread::Role::Assistant, "the durable RPC outcome"),
 	] {
-		let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+		let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
 			panic!("replay projected a non-message canonical item");
 		};
 		assert_eq!(message.role, role as i32);
@@ -1333,7 +1343,7 @@ fn assert_batch_recovery(journal_path: &Path, gateway_path: &Path) {
 		project_journal(&log, log.as_ref(), &registry, &caps()).expect("project interrupted batch");
 	let mut result_ids = Vec::new();
 	for item in &projected.items {
-		if let Some(thread::item::Kind::ToolResult(result)) = &item.kind {
+		if let Some(item::Kind::ToolResult(result)) = &item.kind {
 			result_ids.push(result.call_id.as_str());
 			assert!(result.is_error, "synthesized interrupted result must be an error");
 			assert_crash_abort(result);
@@ -1355,7 +1365,7 @@ fn assert_batch_recovery(journal_path: &Path, gateway_path: &Path) {
 fn assert_interrupted_follow_up(input: &TurnInput) {
 	let mut ids = Vec::new();
 	for item in input_items(input) {
-		if let Some(thread::item::Kind::ToolResult(result)) = &item.kind {
+		if let Some(item::Kind::ToolResult(result)) = &item.kind {
 			assert!(result.is_error, "unfinished call did not synthesize an interrupted error");
 			assert_crash_abort(result);
 			ids.push(result.call_id.as_str());
@@ -1388,20 +1398,20 @@ fn assert_crash_abort(result: &thread::ToolResult) {
 
 fn proto_json(value: &pb::Value) -> Option<Value> {
 	Some(match value.kind.as_ref()? {
-		pb::value::Kind::Null(_) => Value::Null,
-		pb::value::Kind::Bool(value) => (*value).into(),
-		pb::value::Kind::Int(value) => (*value).into(),
-		pb::value::Kind::Uint(value) => (*value).into(),
-		pb::value::Kind::Double(value) => serde_json::Number::from_f64(*value)?.into(),
-		pb::value::Kind::String(value) => value.clone().into(),
-		pb::value::Kind::List(values) => Value::Array(
+		value::Kind::Null(_) => Value::Null,
+		value::Kind::Bool(value) => (*value).into(),
+		value::Kind::Int(value) => (*value).into(),
+		value::Kind::Uint(value) => (*value).into(),
+		value::Kind::Double(value) => serde_json::Number::from_f64(*value)?.into(),
+		value::Kind::String(value) => value.clone().into(),
+		value::Kind::List(values) => Value::Array(
 			values
 				.values
 				.iter()
 				.map(proto_json)
 				.collect::<Option<Vec<_>>>()?,
 		),
-		pb::value::Kind::Map(values) => Value::Object(
+		value::Kind::Map(values) => Value::Object(
 			values
 				.fields
 				.iter()
@@ -1459,7 +1469,7 @@ fn end_outcome(input: &TurnInput, text: &str) -> pb::Outcome {
 		output: vec![thread::Item {
 			seq:           head + 1,
 			created_at_ms: 9,
-			kind:          Some(thread::item::Kind::Message(thread::Message {
+			kind:          Some(item::Kind::Message(thread::Message {
 				role:  thread::Role::Assistant as i32,
 				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_owned())) }],
 			})),
@@ -1488,13 +1498,13 @@ fn batch_outcome(input: &TurnInput) -> pb::Outcome {
 fn batch_events(outcome: pb::Outcome) -> Vec<pb::TurnEvent> {
 	let mut events = vec![accepted(false)];
 	for (index, id) in [(0, "durable-a"), (1, "durable-b"), (2, "ghost-absent")] {
-		events.push(event(pb::turn_event::Event::PartStart(pb::PartStart {
+		events.push(event(turn_event::Event::PartStart(pb::PartStart {
 			index,
-			kind: pb::part_start::Kind::ToolCall as i32,
+			kind: part_start::Kind::ToolCall as i32,
 			tool_call_id: id.to_owned(),
 			tool_name: TOOL_NAME.to_owned(),
 		})));
-		events.push(event(pb::turn_event::Event::PartDelta(pb::PartDelta {
+		events.push(event(turn_event::Event::PartDelta(pb::PartDelta {
 			index,
 			chunk: Bytes::from(format!(r#"{{"call":"{id}"}}"#)),
 		})));
@@ -1507,15 +1517,15 @@ fn tool_call(seq: u64, id: &str) -> thread::Item {
 	thread::Item {
 		seq,
 		created_at_ms: 8,
-		kind: Some(thread::item::Kind::ToolCall(thread::ToolCall {
+		kind: Some(item::Kind::ToolCall(thread::ToolCall {
 			id: id.to_owned(),
 			name: TOOL_NAME.to_owned(),
 			args_json: Bytes::from(format!(r#"{{"call":"{id}"}}"#)),
 			..thread::ToolCall::default()
 		})),
 		props: Some(pb::ValueMap {
-			fields: std::iter::once((TOOL_REV_PROP.to_owned(), pb::Value {
-				kind: Some(pb::value::Kind::String("p6.1".to_owned())),
+			fields: iter::once((TOOL_REV_PROP.to_owned(), pb::Value {
+				kind: Some(value::Kind::String("p6.1".to_owned())),
 			}))
 			.collect(),
 		}),
@@ -1524,7 +1534,7 @@ fn tool_call(seq: u64, id: &str) -> thread::Item {
 
 fn message(role: thread::Role, text: &str) -> thread::Item {
 	thread::Item {
-		kind: Some(thread::item::Kind::Message(thread::Message {
+		kind: Some(item::Kind::Message(thread::Message {
 			role:  role as i32,
 			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_owned())) }],
 		})),
@@ -1533,14 +1543,14 @@ fn message(role: thread::Role, text: &str) -> thread::Item {
 }
 
 const fn accepted(replay: bool) -> pb::TurnEvent {
-	event(pb::turn_event::Event::Accepted(pb::Accepted { replay }))
+	event(turn_event::Event::Accepted(pb::Accepted { replay }))
 }
 
 const fn outcome_event(outcome: pb::Outcome) -> pb::TurnEvent {
-	event(pb::turn_event::Event::Outcome(outcome))
+	event(turn_event::Event::Outcome(outcome))
 }
 
-const fn event(event: pb::turn_event::Event) -> pb::TurnEvent {
+const fn event(event: turn_event::Event) -> pb::TurnEvent {
 	pb::TurnEvent { event: Some(event) }
 }
 
@@ -1575,7 +1585,7 @@ fn header(root: &Path, id: &str) -> Header {
 fn load_gateway(path: &Path) -> GatewayState {
 	match fs::read(path) {
 		Ok(bytes) => serde_json::from_slice(&bytes).expect("decode durable gateway state"),
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => GatewayState::default(),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => GatewayState::default(),
 		Err(error) => panic!("read durable gateway state: {error}"),
 	}
 }

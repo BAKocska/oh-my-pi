@@ -1,6 +1,6 @@
 //! Streaming Markdown-to-speech normalization and bounded segmentation.
 
-use std::sync::LazyLock;
+use std::{mem, sync::LazyLock};
 
 use omp_core::Str;
 use regex::Regex;
@@ -226,12 +226,12 @@ impl SpeakableStream {
 
 	fn emit_prefix(&mut self, byte_cut: usize, output: &mut Vec<Str>) {
 		let tail = self.buffer.split_off(byte_cut.min(self.buffer.len()));
-		let raw = std::mem::replace(&mut self.buffer, tail);
+		let raw = mem::replace(&mut self.buffer, tail);
 		self.emit(raw.as_str(), output);
 	}
 
 	fn emit_buffer(&mut self, output: &mut Vec<Str>) {
-		let raw = std::mem::take(&mut self.buffer);
+		let raw = mem::take(&mut self.buffer);
 		self.emit(raw.as_str(), output);
 	}
 

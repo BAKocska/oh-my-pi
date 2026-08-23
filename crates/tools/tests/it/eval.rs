@@ -1,8 +1,10 @@
 //! Exact Python-only eval schema and rendering goldens.
 
 use std::{
+	future,
 	future::{Future, ready},
 	sync::{Arc, LazyLock},
+	time,
 };
 
 use bytes::Bytes;
@@ -16,7 +18,7 @@ use omp_tools::{
 	auto_background::DetachedJob,
 	eval::{
 		self, CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, Language,
-		OutputChannel, OutputFrame, Payload, RunEvent, RunRequest, Session,
+		OutputChannel, OutputFrame, Payload, RunEvent, RunRequest, Session, kernel::EmbeddedPython,
 	},
 };
 use serde_json::json;
@@ -69,7 +71,7 @@ impl EvalRun for DetachingRun {
 	}
 
 	async fn next_event(&mut self) -> Result<Option<RunEvent>, Fault> {
-		std::future::pending().await
+		future::pending().await
 	}
 
 	fn cancel(&self) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
@@ -112,20 +114,16 @@ static PYTHON: LazyLock<Arc<omp_py::Engine>> = LazyLock::new(|| {
 	)
 });
 
-async fn execute(tool: &eval::EvalTool<eval::kernel::EmbeddedPython>, code: &str) -> Payload {
+async fn execute(tool: &eval::EvalTool<EmbeddedPython>, code: &str) -> Payload {
 	execute_params(tool, IncomingParams::channel(), code).await
 }
 
-async fn execute_owned(
-	tool: &eval::EvalTool<eval::kernel::EmbeddedPython>,
-	owner: &str,
-	code: &str,
-) -> Payload {
+async fn execute_owned(tool: &eval::EvalTool<EmbeddedPython>, owner: &str, code: &str) -> Payload {
 	execute_params(tool, IncomingParams::owned_channel(Str::new(owner)), code).await
 }
 
 async fn execute_params(
-	tool: &eval::EvalTool<eval::kernel::EmbeddedPython>,
+	tool: &eval::EvalTool<EmbeddedPython>,
 	(feed, params): (omp_tool::InvocationFeed, IncomingParams<'static>),
 	code: &str,
 ) -> Payload {
@@ -322,7 +320,7 @@ Prior top-level names survive into the next cell — reuse; NEVER re-import/re-d
 }
 #[tokio::test]
 async fn eval_auto_backgrounds_through_the_managed_job_contract() {
-	let tool = eval::eval(DetachingExec).with_auto_background_threshold(std::time::Duration::ZERO);
+	let tool = eval::eval(DetachingExec).with_auto_background_threshold(time::Duration::ZERO);
 	let (feed, params) = IncomingParams::channel();
 	feed
 		.args_committed(sf!(r#"{{"language":"py","code":"slow()"}}"#))
@@ -459,7 +457,7 @@ fn invalid_timeout_fault_projection_is_exact() {
 
 #[tokio::test]
 async fn external_session_reset_separates_chat_state_and_preserves_the_new_session() {
-	let runtime = eval::kernel::EmbeddedPython::new(Arc::clone(&PYTHON), TEST_INTERRUPT_GRACE)
+	let runtime = EmbeddedPython::new(Arc::clone(&PYTHON), TEST_INTERRUPT_GRACE)
 		.expect("test interrupt grace is representable");
 	let (tool, control) = eval::eval_controlled(runtime);
 
@@ -481,7 +479,7 @@ async fn external_session_reset_separates_chat_state_and_preserves_the_new_sessi
 
 #[tokio::test]
 async fn authenticated_owners_have_isolated_persistent_namespaces() {
-	let runtime = eval::kernel::EmbeddedPython::new(Arc::clone(&PYTHON), TEST_INTERRUPT_GRACE)
+	let runtime = EmbeddedPython::new(Arc::clone(&PYTHON), TEST_INTERRUPT_GRACE)
 		.expect("test interrupt grace is representable");
 	let tool = eval::eval(runtime);
 

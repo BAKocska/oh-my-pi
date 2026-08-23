@@ -1,7 +1,10 @@
 //! Executable P5 proof for delta-only context and provider-request prefix
 //! stability.
 
-use std::{collections::BTreeMap, future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{
+	collections::BTreeMap, fs, future::Future, num::NonZeroUsize, path::Path, sync::Arc,
+	time::Duration,
+};
 
 use bytes::Bytes;
 use futures::{FutureExt as _, Stream};
@@ -21,7 +24,7 @@ use omp_inference::{
 	answer::AuthSession,
 	auth::{
 		AuthLoginEngine, AuthManager, AuthRefreshEngine, CredentialBroker, CredentialBrokerEngines,
-		CredentialStore, HeadlessKeySource, KeyId,
+		CredentialShaperRegistry, CredentialStore, HeadlessKeySource, KeyId,
 	},
 	call::{AuthMethod, LoginRequest},
 	codec::{
@@ -40,7 +43,11 @@ use omp_inference::{
 		websocket_transport::WebSocketTransport,
 	},
 };
-use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread};
+use omp_proto::{
+	inference::v1::{self as pb, tool_def},
+	prost::Message as _,
+	thread::v1::{self as thread, item, part},
+};
 use omp_serve::inference::InferenceRpc;
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{
@@ -201,7 +208,7 @@ fn tool_def(revision: u16) -> pb::ToolDef {
 	pb::ToolDef {
 		name:        "probe".to_owned(),
 		description: format!("prefix probe revision {revision}"),
-		input:       Some(pb::tool_def::Input::JsonSchema(pb::tool_def::JsonSchema {
+		input:       Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
 			schema_json: tool_schema(revision),
 			strict:      None,
 		})),
@@ -255,7 +262,7 @@ fn cassette_attempt() -> CassetteAttempt {
 
 fn auth_manager(
 	catalog: Arc<Catalog>,
-	path: &std::path::Path,
+	path: &Path,
 	broker: CredentialBroker,
 	accounts: AccountPool,
 ) -> AuthManager {
@@ -318,7 +325,7 @@ async fn gateway(
 		AdmissionController::new(8, 8),
 		Duration::from_secs(2),
 		Arc::new(BTreeMap::new()),
-		Arc::new(omp_inference::auth::CredentialShaperRegistry::new()),
+		Arc::new(CredentialShaperRegistry::new()),
 	)
 	.with_local_routes([(
 		ROUTE.into(),
@@ -349,8 +356,8 @@ fn journal(scratch: &Scratch) -> Journal {
 	.expect("create agent journal")
 }
 
-fn context_file(path: &std::path::Path) -> ContextFile {
-	ContextFile::new("AGENTS.md", std::fs::read(path).expect("read context file"))
+fn context_file(path: &Path) -> ContextFile {
+	ContextFile::new("AGENTS.md", fs::read(path).expect("read context file"))
 }
 
 fn array_contents<'a>(body: &'a [u8], field: &[u8]) -> &'a [u8] {
@@ -607,14 +614,14 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 		.append
 		.iter()
 		.map(|item| {
-			let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+			let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
 				panic!("prompt rewind append must contain only canonical messages")
 			};
 			let text = message
 				.parts
 				.iter()
 				.map(|part| match part.kind.as_ref() {
-					Some(thread::part::Kind::Text(text)) => text.as_str(),
+					Some(part::Kind::Text(text)) => text.as_str(),
 					_ => panic!("P5 prompt history is text-only"),
 				})
 				.collect::<String>();

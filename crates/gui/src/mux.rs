@@ -4,6 +4,8 @@
 //! Everything here is host-agnostic geometry: no winit, no wgpu. The host
 //! owns pane state and calls [`layout`] whenever the tree or window changes.
 
+use std::mem;
+
 use smallvec::SmallVec;
 
 /// Minimum pane extent on a split axis, physical px.
@@ -115,9 +117,9 @@ impl Node {
 			},
 			Self::Split { children, .. } => {
 				let keep = if matches!(children.0, Self::Leaf(leaf) if leaf == id) {
-					Some(std::mem::replace(&mut children.1, Self::Leaf(id)))
+					Some(mem::replace(&mut children.1, Self::Leaf(id)))
 				} else if matches!(children.1, Self::Leaf(leaf) if leaf == id) {
-					Some(std::mem::replace(&mut children.0, Self::Leaf(id)))
+					Some(mem::replace(&mut children.0, Self::Leaf(id)))
 				} else {
 					None
 				};

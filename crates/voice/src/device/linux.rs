@@ -2,11 +2,11 @@
 
 use std::{
 	ffi::{CStr, c_char, c_int, c_long, c_uint, c_void},
-	ptr,
+	mem, ptr,
 	sync::{
 		Arc, Mutex, OnceLock,
 		atomic::{AtomicBool, Ordering},
-		mpsc,
+		mpsc::{self, Receiver},
 	},
 	thread::{self, JoinHandle},
 	time::Duration,
@@ -30,6 +30,20 @@ const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
 const SND_PCM_FORMAT_FLOAT_NATIVE: c_int = 14;
 #[cfg(target_endian = "big")]
 const SND_PCM_FORMAT_FLOAT_NATIVE: c_int = 15;
+
+mod delivery {
+	use std::sync::atomic::AtomicBool;
+
+	use parking_lot::Mutex;
+
+	pub(super) type DeliveryGate = (AtomicBool, Mutex<()>);
+
+	pub(super) fn armed() -> DeliveryGate {
+		(AtomicBool::new(true), Mutex::new(()))
+	}
+}
+
+use delivery::DeliveryGate;
 
 #[repr(C)]
 struct PaSampleSpec {
@@ -83,24 +97,21 @@ impl PulseApi {
 		let pulse = open_library(c"libpulse.so.0", libc::RTLD_NOW | libc::RTLD_GLOBAL)?;
 
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
-		let simple_new = unsafe {
-			std::mem::transmute::<*mut c_void, PaSimpleNew>(symbol(simple, c"pa_simple_new")?)
-		};
+		let simple_new =
+			unsafe { mem::transmute::<*mut c_void, PaSimpleNew>(symbol(simple, c"pa_simple_new")?) };
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
-		let simple_free = unsafe {
-			std::mem::transmute::<*mut c_void, PaSimpleFree>(symbol(simple, c"pa_simple_free")?)
-		};
+		let simple_free =
+			unsafe { mem::transmute::<*mut c_void, PaSimpleFree>(symbol(simple, c"pa_simple_free")?) };
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let simple_write = unsafe {
-			std::mem::transmute::<*mut c_void, PaSimpleWrite>(symbol(simple, c"pa_simple_write")?)
+			mem::transmute::<*mut c_void, PaSimpleWrite>(symbol(simple, c"pa_simple_write")?)
 		};
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
-		let simple_read = unsafe {
-			std::mem::transmute::<*mut c_void, PaSimpleRead>(symbol(simple, c"pa_simple_read")?)
-		};
+		let simple_read =
+			unsafe { mem::transmute::<*mut c_void, PaSimpleRead>(symbol(simple, c"pa_simple_read")?) };
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let strerror =
-			unsafe { std::mem::transmute::<*mut c_void, PaStrerror>(symbol(pulse, c"pa_strerror")?) };
+			unsafe { mem::transmute::<*mut c_void, PaStrerror>(symbol(pulse, c"pa_strerror")?) };
 
 		Ok(Box::leak(Box::new(Self { simple_new, simple_free, simple_write, simple_read, strerror })))
 	}
@@ -144,44 +155,36 @@ impl AlsaApi {
 	fn load() -> Result<&'static Self, String> {
 		let library = open_library(c"libasound.so.2", libc::RTLD_NOW | libc::RTLD_GLOBAL)?;
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
-		let pcm_open = unsafe {
-			std::mem::transmute::<*mut c_void, SndPcmOpen>(symbol(library, c"snd_pcm_open")?)
-		};
+		let pcm_open =
+			unsafe { mem::transmute::<*mut c_void, SndPcmOpen>(symbol(library, c"snd_pcm_open")?) };
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let pcm_set_params = unsafe {
-			std::mem::transmute::<*mut c_void, SndPcmSetParams>(symbol(
-				library,
-				c"snd_pcm_set_params",
-			)?)
+			mem::transmute::<*mut c_void, SndPcmSetParams>(symbol(library, c"snd_pcm_set_params")?)
 		};
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
-		let pcm_writei = unsafe {
-			std::mem::transmute::<*mut c_void, SndPcmIo>(symbol(library, c"snd_pcm_writei")?)
-		};
+		let pcm_writei =
+			unsafe { mem::transmute::<*mut c_void, SndPcmIo>(symbol(library, c"snd_pcm_writei")?) };
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
-		let pcm_readi = unsafe {
-			std::mem::transmute::<*mut c_void, SndPcmIo>(symbol(library, c"snd_pcm_readi")?)
-		};
+		let pcm_readi =
+			unsafe { mem::transmute::<*mut c_void, SndPcmIo>(symbol(library, c"snd_pcm_readi")?) };
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let pcm_recover = unsafe {
-			std::mem::transmute::<*mut c_void, SndPcmRecover>(symbol(library, c"snd_pcm_recover")?)
+			mem::transmute::<*mut c_void, SndPcmRecover>(symbol(library, c"snd_pcm_recover")?)
 		};
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
-		let pcm_wait = unsafe {
-			std::mem::transmute::<*mut c_void, SndPcmWait>(symbol(library, c"snd_pcm_wait")?)
-		};
+		let pcm_wait =
+			unsafe { mem::transmute::<*mut c_void, SndPcmWait>(symbol(library, c"snd_pcm_wait")?) };
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let pcm_start = unsafe {
-			std::mem::transmute::<*mut c_void, SndPcmControl>(symbol(library, c"snd_pcm_start")?)
+			mem::transmute::<*mut c_void, SndPcmControl>(symbol(library, c"snd_pcm_start")?)
 		};
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let pcm_close = unsafe {
-			std::mem::transmute::<*mut c_void, SndPcmControl>(symbol(library, c"snd_pcm_close")?)
+			mem::transmute::<*mut c_void, SndPcmControl>(symbol(library, c"snd_pcm_close")?)
 		};
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
-		let strerror = unsafe {
-			std::mem::transmute::<*mut c_void, SndStrerror>(symbol(library, c"snd_strerror")?)
-		};
+		let strerror =
+			unsafe { mem::transmute::<*mut c_void, SndStrerror>(symbol(library, c"snd_strerror")?) };
 
 		Ok(Box::leak(Box::new(Self {
 			pcm_open,
@@ -398,8 +401,6 @@ fn remember_error(slot: &Mutex<Option<String>>, error: String) {
 		*stored = Some(error);
 	}
 }
-
-type DeliveryGate = (AtomicBool, parking_lot::Mutex<()>);
 
 fn fill_if_armed(gate: &DeliveryGate, fill: &mut PlaybackFill, buffer: &mut [f32]) -> bool {
 	if !gate.0.load(Ordering::Acquire) {
@@ -676,7 +677,7 @@ struct RunningDevice {
 fn finish(
 	device: &Arc<RunningDevice>,
 	thread: &mut Option<JoinHandle<()>>,
-	done: &mut Option<mpsc::Receiver<()>>,
+	done: &mut Option<Receiver<()>>,
 ) -> VoiceResult<()> {
 	device.delivery.0.store(false, Ordering::Release);
 	device.stop.store(true, Ordering::Release);
@@ -722,7 +723,7 @@ fn finish(
 pub struct PlaybackDevice {
 	device: Arc<RunningDevice>,
 	thread: Option<JoinHandle<()>>,
-	done:   Option<mpsc::Receiver<()>>,
+	done:   Option<Receiver<()>>,
 }
 
 impl PlaybackDevice {
@@ -733,7 +734,7 @@ impl PlaybackDevice {
 		let timeout_ms = c_int::try_from(config.period_ms)
 			.unwrap_or(c_int::MAX)
 			.max(1);
-		let delivery = Arc::new((AtomicBool::new(true), parking_lot::Mutex::new(())));
+		let delivery = Arc::new(delivery::armed());
 		let device = Arc::new(RunningDevice {
 			stop: AtomicBool::new(false),
 			delivery,
@@ -822,7 +823,7 @@ impl Drop for PlaybackDevice {
 pub struct CaptureDevice {
 	device: Arc<RunningDevice>,
 	thread: Option<JoinHandle<()>>,
-	done:   Option<mpsc::Receiver<()>>,
+	done:   Option<Receiver<()>>,
 }
 
 impl CaptureDevice {
@@ -833,7 +834,7 @@ impl CaptureDevice {
 		let timeout_ms = c_int::try_from(config.period_ms)
 			.unwrap_or(c_int::MAX)
 			.max(1);
-		let delivery = Arc::new((AtomicBool::new(true), parking_lot::Mutex::new(())));
+		let delivery = Arc::new(delivery::armed());
 		let device = Arc::new(RunningDevice {
 			stop: AtomicBool::new(false),
 			delivery,

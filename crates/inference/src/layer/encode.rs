@@ -9,10 +9,11 @@ use std::{
 
 use omp_core::sf;
 use parking_lot::Mutex;
+use tokio::time;
 use tower::{Layer, Service};
 
 use crate::{
-	auth::{AuthSpec, CredentialLease},
+	auth::{AuthSpec, CredentialLease, lease::AppliedCredentials},
 	codec::{Cancellation, TransportRequest},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	layer::{
@@ -31,7 +32,7 @@ pub trait AttemptEncoder<R, L>: Clone + Send + 'static {
 		&self,
 		request: &R,
 		lease: &L,
-		execution: &crate::layer::ExecutionContext,
+		execution: &ExecutionContext,
 		attempt: u32,
 		provisional: bool,
 		cancel: Cancellation,
@@ -161,11 +162,11 @@ pub trait CredentialApplier<A, L>: Clone + Send + 'static {
 /// secrets.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AttachCredentials;
-impl<A> CredentialApplier<A, crate::auth::lease::AppliedCredentials> for AttachCredentials {
+impl<A> CredentialApplier<A, AppliedCredentials> for AttachCredentials {
 	fn apply(
 		&self,
 		_: &A,
-		credentials: crate::auth::lease::AppliedCredentials,
+		credentials: AppliedCredentials,
 		request: &mut TransportRequest,
 		_: &ExecutionContext,
 	) -> Result<(), Error> {
@@ -283,7 +284,7 @@ where
 			async move {
 				if let Some(hook) = hook {
 					let budget = hook.sign_budget();
-					match tokio::time::timeout(budget, hook.provider_sign(&transport, &context)).await {
+					match time::timeout(budget, hook.provider_sign(&transport, &context)).await {
 						Ok(Ok(())) => {},
 						Ok(Err(error)) => return Err(error),
 						Err(_) => return Err(provider_sign_timeout(&context, budget)),
@@ -320,10 +321,10 @@ fn provider_sign_timeout(context: &ExecutionContext, budget: Duration) -> Error 
 #[cfg(test)]
 mod tests {
 	use std::{
-		future::Future,
+		future::{self, Future},
 		sync::Arc,
 		task::{Context, Poll},
-		time::Duration,
+		time::{self, Duration},
 	};
 
 	use bytes::Bytes;
@@ -341,7 +342,12 @@ mod tests {
 			TransportAttempt, TransportRequest,
 		},
 		error::{Error, ErrorKind, RetryAction},
-		layer::{ExecutionContext, LayerCall, auth::Authorized, hook::HookHandle},
+		id::RequestId,
+		layer::{
+			ExecutionContext, LayerCall,
+			auth::Authorized,
+			hook::{HookHandle, NoHookHandle},
+		},
 		receipt::ExecutionBudget,
 		transport::{Frame, FramingProtocol},
 	};
@@ -373,7 +379,7 @@ mod tests {
 			realtime:    None,
 			cancel:      Cancellation::default(),
 			attempt:     TransportAttempt {
-				request_id:    crate::id::RequestId::from("request"),
+				request_id:    RequestId::from("request"),
 				provider:      omp_catalog::ProviderId::from("provider"),
 				route:         omp_catalog::RouteId::from("route"),
 				account:       None,
@@ -381,7 +387,7 @@ mod tests {
 				index:         0,
 				provisional:   false,
 				capture_limit: 0,
-				timeout:       std::time::Duration::from_secs(1),
+				timeout:       time::Duration::from_secs(1),
 			},
 		}
 	}
@@ -438,7 +444,7 @@ mod tests {
 			&self,
 			_: &ExecutionContext,
 		) -> impl Future<Output = Result<(), Error>> + Send {
-			std::future::ready(Ok(()))
+			ready(Ok(()))
 		}
 
 		fn provider_error(
@@ -446,7 +452,7 @@ mod tests {
 			_: &Error,
 			_: &ExecutionContext,
 		) -> impl Future<Output = Option<RetryAction>> + Send {
-			std::future::ready(None)
+			ready(None)
 		}
 
 		fn provider_sign(
@@ -454,7 +460,7 @@ mod tests {
 			_: &TransportRequest,
 			_: &ExecutionContext,
 		) -> impl Future<Output = Result<(), Error>> + Send {
-			std::future::pending()
+			future::pending()
 		}
 
 		fn sign_budget(&self) -> Duration {
@@ -489,12 +495,12 @@ mod tests {
 		let credential = CredentialApplyService {
 			inner:   Arc::new(Mutex::new(Wire(trace.clone()))),
 			applier: Applier(trace.clone()),
-			hook:    None::<crate::layer::hook::NoHookHandle>,
+			hook:    None::<NoHookHandle>,
 		};
 		let mut service = EncodeService {
 			inner:       Arc::new(Mutex::new(credential)),
 			encoder:     Encoder(trace.clone()),
-			hook:        None::<crate::layer::hook::NoHookHandle>,
+			hook:        None::<NoHookHandle>,
 			provisional: false,
 		};
 		futures::future::poll_fn(|cx| service.poll_ready(cx))

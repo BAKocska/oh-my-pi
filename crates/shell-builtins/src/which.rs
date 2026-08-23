@@ -81,14 +81,18 @@ pub(crate) fn which_builtin<SE: ShellExtensions>() -> Registration<SE> {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
-	use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+	use std::{
+		env, fs, iter,
+		os::unix::fs::PermissionsExt,
+		path::{Path, PathBuf},
+	};
 
 	use clap::Parser;
 
 	use super::WhichCli;
 	use crate::host::{Host, Utility};
 
-	fn place_file(dir: &Path, name: &str, executable: bool) -> std::path::PathBuf {
+	fn place_file(dir: &Path, name: &str, executable: bool) -> PathBuf {
 		let path = dir.join(name);
 		fs::write(&path, b"#!/bin/sh\n").expect("file should be written");
 		let mode = if executable { 0o755 } else { 0o644 };
@@ -98,7 +102,7 @@ mod tests {
 	}
 
 	fn run_which(argv: &[&str], path: &str, cwd: &Path) -> (i32, String) {
-		let cli = WhichCli::try_parse_from(std::iter::once("which").chain(argv.iter().copied()))
+		let cli = WhichCli::try_parse_from(iter::once("which").chain(argv.iter().copied()))
 			.expect("test arguments should parse");
 		let (mut host, capture) = Host::for_test("which", Vec::new(), cwd);
 		host.set_test_var("PATH", path);
@@ -161,7 +165,7 @@ mod tests {
 		fs::create_dir_all(&dir_b).expect("second PATH directory should be created");
 		let tool_a = place_file(&dir_a, "tool", true);
 		let tool_b = place_file(&dir_b, "tool", true);
-		let path_var = std::env::join_paths([&dir_a, &dir_b])
+		let path_var = env::join_paths([&dir_a, &dir_b])
 			.expect("PATH should join")
 			.to_string_lossy()
 			.into_owned();

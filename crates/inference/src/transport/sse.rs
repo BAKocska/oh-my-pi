@@ -4,9 +4,12 @@ use bytes::{Bytes, BytesMut};
 use omp_core::Str;
 use smallvec::SmallVec;
 
-use super::frame::{
-	DEFAULT_MAX_FRAME_BYTES, FramerState, FramingError, FramingProtocol, IncrementalFramer,
-	Utf8Field, validate_utf8,
+use super::{
+	capture,
+	frame::{
+		DEFAULT_MAX_FRAME_BYTES, FramerState, FramingError, FramingProtocol, IncrementalFramer,
+		Utf8Field, validate_utf8,
+	},
 };
 
 /// One assembled Server-Sent Event.
@@ -265,11 +268,7 @@ impl IncrementalFramer for SseDecoder {
 		}
 		self.state.ensure_open(FramingProtocol::Sse)?;
 		if self.capture {
-			super::capture::global_provider_capture().capture(
-				None,
-				"sse",
-				&String::from_utf8_lossy(&chunk),
-			);
+			capture::global_provider_capture().capture(None, "sse", &String::from_utf8_lossy(&chunk));
 		}
 		self.append(chunk);
 		let mut output = SmallVec::new();

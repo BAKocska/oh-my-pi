@@ -2,7 +2,9 @@
 
 use std::{
 	collections::BTreeMap,
+	fmt,
 	io::{Read as _, Write as _},
+	str,
 };
 
 use bytes::Bytes;
@@ -86,8 +88,8 @@ impl DevinSealedBody {
 	}
 }
 
-impl std::fmt::Debug for DevinSealedBody {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for DevinSealedBody {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let kind = match self {
 			Self::Chat(_) => "chat",
 			Self::Discovery(_) => "discovery",
@@ -199,6 +201,8 @@ use wire::exa::{
 		ImageData, Metadata, StopReason,
 	},
 };
+
+use crate::{call::ProviderProof, codec::ProviderStateEvent};
 
 /// Non-secret identity fields sent by official Devin clients.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -620,7 +624,7 @@ fn message_prompt(
 					}
 					signature.clear();
 					signature.push_str(
-						std::str::from_utf8(&proof.value)
+						str::from_utf8(&proof.value)
 							.map_err(|_| invalid_request("devin.reasoning.proof_utf8"))?,
 					);
 				}
@@ -709,10 +713,7 @@ fn append_tool_result(
 	Ok(())
 }
 
-fn validate_proof(
-	proof: Option<&crate::call::ProviderProof>,
-	context: &EncodeContext<'_>,
-) -> Result<(), Error> {
+fn validate_proof(proof: Option<&ProviderProof>, context: &EncodeContext<'_>) -> Result<(), Error> {
 	if let Some(proof) = proof
 		&& (proof.provider != context.route.provider || proof.codec != wire_target(context)?.codec)
 	{
@@ -850,7 +851,7 @@ impl CascadeDecoder {
 				text: response.delta_thinking.into(),
 			}));
 			if !response.delta_signature.is_empty() {
-				emit(RawEvent::ProviderState(crate::codec::ProviderStateEvent::ReasoningSignature {
+				emit(RawEvent::ProviderState(ProviderStateEvent::ReasoningSignature {
 					index,
 					signature: Bytes::from(response.delta_signature),
 				}));

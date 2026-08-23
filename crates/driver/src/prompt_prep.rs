@@ -1,6 +1,10 @@
 //! Immutable prompt-input preparation at the application composition boundary.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+	path::{Path, PathBuf},
+	sync::Arc,
+	time::Duration,
+};
 
 use omp_agent::{
 	ContextFile, EagerTaskPolicy, HostInfoInput, Journal, ModelPromptInput, MutationPromptInput,
@@ -11,11 +15,21 @@ use omp_agent::{
 use omp_core::{Hash32, Str};
 use omp_env::{ClientError, EnvClient};
 use omp_proto::{SCHEMA_REV, env::v1 as pb};
-use omp_scribe::{Props, Value, map};
+use omp_scribe::Props;
 use omp_tool::Registry;
 use thiserror::Error;
+use tokio::{time, time::Instant};
 
-use crate::workspace_roots::{WorkspaceRootDiagnostic, WorkspaceRootError, WorkspaceRootGuard};
+use crate::{
+	discovery::{
+		ActiveContentSnapshots,
+		context::{ContextSnapshot, prompt_files},
+		project::{ProjectSnapshot, prompt_active_repository, prompt_repositories, prompt_trees},
+	},
+	rulebook,
+	skills::prompt_inputs,
+	workspace_roots::{WorkspaceRootDiagnostic, WorkspaceRootError, WorkspaceRootGuard},
+};
 
 #[path = "prompt_prep/settings.rs"]
 pub mod settings;
@@ -291,10 +305,10 @@ pub async fn prepare_environment_inputs_bounded(
 			.workspace_roots(pb::WorkspaceRootSetRequest { wire_revision: SCHEMA_REV })
 			.await
 	});
-	let deadline = tokio::time::Instant::now() + PROMPT_PREP_DEADLINE;
+	let deadline = Instant::now() + PROMPT_PREP_DEADLINE;
 	let mut diagnostics = Vec::new();
 
-	let host = match tokio::time::timeout_at(deadline, &mut host_task).await {
+	let host = match time::timeout_at(deadline, &mut host_task).await {
 		Ok(Ok(Ok(host))) => host.into(),
 		Ok(Ok(Err(_))) | Ok(Err(_)) => {
 			warn_prep_fallback("host");
@@ -307,7 +321,7 @@ pub async fn prepare_environment_inputs_bounded(
 			HostInfoInput::default()
 		},
 	};
-	let roots = match tokio::time::timeout_at(deadline, &mut roots_task).await {
+	let roots = match time::timeout_at(deadline, &mut roots_task).await {
 		Ok(Ok(Ok(roots))) => match WorkspaceRootGuard::from_environment(roots)
 			.and_then(|guard| guard.snapshot(journal, primary))
 		{
@@ -356,7 +370,7 @@ fn warn_prep_fallback(step: &str) {
 /// Creates the initial workspace input from already-frozen facets.
 #[allow(clippy::too_many_arguments, reason = "the helper makes every PromptFacts facet explicit")]
 pub fn workspace_input(
-	cwd: impl Into<std::path::PathBuf>,
+	cwd: impl Into<PathBuf>,
 	context_files: impl Into<Arc<[ContextFile]>>,
 	environment: EnvironmentPromptInputs,
 	repositories: impl Into<Arc<[RepositoryInput]>>,
@@ -382,17 +396,17 @@ pub fn workspace_input(
 /// This projection performs no filesystem, process, registry, or model I/O.
 pub fn apply_discovery_snapshots(
 	workspace: &mut PromptFacts,
-	context: &crate::discovery::context::ContextSnapshot,
-	project: &crate::discovery::project::ProjectSnapshot,
-	content: &crate::discovery::ActiveContentSnapshots,
+	context: &ContextSnapshot,
+	project: &ProjectSnapshot,
+	content: &ActiveContentSnapshots,
 ) {
-	workspace.context_files = crate::discovery::context::prompt_files(context);
-	workspace.repositories = crate::discovery::project::prompt_repositories(project);
+	workspace.context_files = prompt_files(context);
+	workspace.repositories = prompt_repositories(project);
 	workspace.directory_context = Arc::clone(&project.directory_context);
-	workspace.workspace_trees = crate::discovery::project::prompt_trees(project);
-	workspace.active_repository = crate::discovery::project::prompt_active_repository(project);
-	workspace.rules = crate::rulebook::prompt_inputs(&content.rules);
-	workspace.skills = crate::skills::prompt_inputs(&content.skills);
+	workspace.workspace_trees = prompt_trees(project);
+	workspace.active_repository = prompt_active_repository(project);
+	workspace.rules = rulebook::prompt_inputs(&content.rules);
+	workspace.skills = prompt_inputs(&content.skills);
 }
 
 fn freeze_registry(registry: &Registry, selected_tools: Option<&[Str]>) -> RegistryPromptInput {
@@ -524,10 +538,10 @@ mod tests {
 		assert_eq!(snapshot.delegation.queued, 1);
 		assert_eq!(snapshot.clone(), snapshot);
 		let props = snapshot.props();
-		assert_eq!(props.get("cwd").and_then(Value::as_str), Some("/workspace"));
+		assert_eq!(props.get("cwd").and_then(omp_scribe::Value::as_str), Some("/workspace"));
 		assert_eq!(
 			props.get("model"),
-			Some(&map! {
+			Some(&omp_scribe::map! {
 				"identifier" => "provider/model".to_owned(),
 				"codex_task_policy" => true,
 			})

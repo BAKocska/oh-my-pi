@@ -1,12 +1,13 @@
 //! Alibaba `QwenCloud` Token Plan credential shaping and interactive login.
 
 use std::{
+	collections::BTreeSet,
 	fmt,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::SystemTime,
+	time::{Instant, SystemTime},
 };
 
 use futures::{
@@ -19,8 +20,8 @@ use omp_core::{ExposeSecret as _, SecretBox, SecretString, Str, sf};
 use serde::{Deserialize, Serialize};
 
 use super::{
-	AuthLoginEngine, CredentialOrigin, CredentialStore, CredentialWrite, KeyError, OAuthHttpClient,
-	OAuthHttpRequest, StoreError, default_login_channels,
+	AuthLoginEngine, CredentialOrigin, CredentialStore, CredentialWrite, KeyError, LoginDriver,
+	OAuthHttpClient, OAuthHttpRequest, StoreError, default_login_channels,
 	shape::{ProviderShapeFuture, ShapedCredential},
 };
 use crate::{
@@ -191,7 +192,7 @@ impl AlibabaTokenPlanShaper {
 		&'a self,
 		raw: &'a SecretString,
 		route_base_url: &'a str,
-		_deadline: Option<std::time::Instant>,
+		_deadline: Option<Instant>,
 	) -> ProviderShapeFuture<'a> {
 		let exposed = raw.expose_secret();
 		let shaped = if exposed.trim().starts_with('{') {
@@ -324,13 +325,13 @@ impl AuthLoginEngine for AlibabaTokenPlanLoginEngine {
 }
 
 async fn run_login(
-	driver: super::LoginDriver,
+	driver: LoginDriver,
 	provider_id: ProviderId,
-	routes: std::collections::BTreeSet<omp_catalog::RouteId>,
+	routes: BTreeSet<omp_catalog::RouteId>,
 	store: Arc<CredentialStore>,
 	accounts: AccountPool,
 	http: Arc<dyn OAuthHttpClient>,
-) -> Result<(), (super::LoginDriver, AlibabaTokenPlanLoginError)> {
+) -> Result<(), (LoginDriver, AlibabaTokenPlanLoginError)> {
 	match run_login_inner(&driver, provider_id, routes, store, accounts, http).await {
 		Ok(()) => Ok(()),
 		Err(error) => Err((driver, error)),
@@ -338,9 +339,9 @@ async fn run_login(
 }
 
 async fn run_login_inner(
-	driver: &super::LoginDriver,
+	driver: &LoginDriver,
 	provider_id: ProviderId,
-	routes: std::collections::BTreeSet<omp_catalog::RouteId>,
+	routes: BTreeSet<omp_catalog::RouteId>,
 	store: Arc<CredentialStore>,
 	accounts: AccountPool,
 	http: Arc<dyn OAuthHttpClient>,
@@ -440,7 +441,7 @@ async fn run_login_inner(
 }
 
 async fn emit_prompt(
-	driver: &super::LoginDriver,
+	driver: &LoginDriver,
 	id: &'static str,
 	message: &'static str,
 	input: AuthPromptKind,
@@ -452,7 +453,7 @@ async fn emit_prompt(
 }
 
 async fn receive_text(
-	driver: &super::LoginDriver,
+	driver: &LoginDriver,
 	expected: AuthPromptKind,
 ) -> Result<String, AlibabaTokenPlanLoginError> {
 	match (
@@ -554,10 +555,21 @@ fn login_error(error: AlibabaTokenPlanLoginError) -> Error {
 
 #[cfg(test)]
 mod tests {
+	use std::{env, fs, path::PathBuf, time::Duration};
+
 	use futures::future::Either;
 	use omp_core::SecretString;
+	use parking_lot::Mutex;
+	use tokio::time;
 
-	use super::*;
+	use super::{
+		super::{
+			CredentialNeed, CredentialSource, HeadlessKeySource, KeyId, OAuthHttpResponse,
+			OAuthTransportError, StoredCredentialSource,
+		},
+		*,
+	};
+	use crate::answer::AuthResponse;
 
 	#[test]
 	fn unavailable_credential_key_has_distinct_login_error() {
@@ -637,15 +649,14 @@ mod tests {
 	}
 
 	struct FixtureHttp {
-		requests: parking_lot::Mutex<Vec<(String, String)>>,
+		requests: Mutex<Vec<(String, String)>>,
 	}
 
 	impl OAuthHttpClient for FixtureHttp {
 		fn execute(
 			&self,
 			request: OAuthHttpRequest,
-		) -> BoxFuture<'_, Result<super::super::OAuthHttpResponse, super::super::OAuthTransportError>>
-		{
+		) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
 			let (method, url, headers, _) = request.into_parts();
 			assert_eq!(method, Method::GET);
 			let authorization = headers
@@ -655,7 +666,7 @@ mod tests {
 				.to_owned();
 			self.requests.lock().push((url.to_string(), authorization));
 			async {
-				Ok(super::super::OAuthHttpResponse {
+				Ok(OAuthHttpResponse {
 					status:  200,
 					headers: HeaderMap::new(),
 					body:    SecretString::from(String::new()),
@@ -666,7 +677,7 @@ mod tests {
 	}
 
 	async fn next_event(session: &AuthSession) -> AuthEvent {
-		tokio::time::timeout(std::time::Duration::from_secs(1), session.events.recv_async())
+		time::timeout(Duration::from_secs(1), session.events.recv_async())
 			.await
 			.expect("login event timeout")
 			.expect("login event channel")
@@ -676,24 +687,21 @@ mod tests {
 	async fn respond(session: &AuthSession, input: AuthInput) {
 		session
 			.responses
-			.send_async(crate::answer::AuthResponse { session: session.id.clone(), input })
+			.send_async(AuthResponse { session: session.id.clone(), input })
 			.await
 			.expect("login response");
 	}
 
-	fn test_store(label: &str) -> (Arc<CredentialStore>, std::path::PathBuf) {
+	fn test_store(label: &str) -> (Arc<CredentialStore>, PathBuf) {
 		let suffix = SystemTime::now()
 			.duration_since(SystemTime::UNIX_EPOCH)
 			.expect("current timestamp")
 			.as_nanos();
-		let path = std::env::temp_dir()
+		let path = env::temp_dir()
 			.join(format!("omp-alibaba-token-plan-{label}-{}-{suffix}.sqlite", std::process::id()));
 		let store = CredentialStore::open(
 			&path,
-			Arc::new(super::super::HeadlessKeySource::new(
-				super::super::KeyId::new(format!("alibaba-{label}")),
-				[7; 32],
-			)),
+			Arc::new(HeadlessKeySource::new(KeyId::new(format!("alibaba-{label}")), [7; 32])),
 		)
 		.expect("test credential store");
 		(Arc::new(store), path)
@@ -704,9 +712,9 @@ mod tests {
 		region: &str,
 		custom_url: Option<&str>,
 		cookie: &str,
-	) -> (String, Vec<(String, String)>, String, String, std::path::PathBuf) {
+	) -> (String, Vec<(String, String)>, String, String, PathBuf) {
 		let (store, path) = test_store(label);
-		let http = Arc::new(FixtureHttp { requests: parking_lot::Mutex::new(Vec::new()) });
+		let http = Arc::new(FixtureHttp { requests: Mutex::new(Vec::new()) });
 		let (session, driver, _) =
 			default_login_channels(LoginSessionId::from(format!("test-{label}")));
 		let task_store = Arc::clone(&store);
@@ -715,7 +723,7 @@ mod tests {
 			run_login_inner(
 				&driver,
 				ProviderId::from(PROVIDER),
-				std::collections::BTreeSet::new(),
+				BTreeSet::new(),
 				task_store,
 				AccountPool::new(),
 				task_http,
@@ -751,8 +759,8 @@ mod tests {
 		respond(&session, AuthInput::OptionalSecret(SecretString::from(cookie.to_owned()))).await;
 		assert!(matches!(next_event(&session).await, AuthEvent::Complete(_)));
 		task.await.expect("login task").expect("successful login");
-		let source = super::super::StoredCredentialSource::new(Arc::clone(&store));
-		let lease = super::super::CredentialSource::lease(&source, super::super::CredentialNeed {
+		let source = StoredCredentialSource::new(Arc::clone(&store));
+		let lease = CredentialSource::lease(&source, CredentialNeed {
 			spec:        AuthSpecId::from("test"),
 			account:     Some(AccountId::from(format!("{PROVIDER}:{PROVIDER}"))),
 			principal:   None,
@@ -781,7 +789,7 @@ mod tests {
 		)]);
 		assert!(cookie_prompt.contains("cs-data.qwencloud.com/data/api.json"));
 		assert_eq!(stored, "sk-sp-test");
-		let _ = std::fs::remove_file(path);
+		let _ = fs::remove_file(path);
 	}
 
 	#[tokio::test]
@@ -797,7 +805,7 @@ mod tests {
 			stored,
 			format!(r#"{{"token":"sk-sp-test","baseUrl":"{ALIBABA_TOKEN_PLAN_CN_BASE_URL}"}}"#)
 		);
-		let _ = std::fs::remove_file(path);
+		let _ = fs::remove_file(path);
 	}
 
 	#[tokio::test]
@@ -806,20 +814,20 @@ mod tests {
 			drive_successful_login("custom", "3", Some("https://custom.example/v1///"), "").await;
 		assert_eq!(requests[0].0, "https://custom.example/v1/models");
 		assert_eq!(stored, r#"{"token":"sk-sp-test","baseUrl":"https://custom.example/v1"}"#);
-		let _ = std::fs::remove_file(path);
+		let _ = fs::remove_file(path);
 	}
 
 	#[tokio::test]
 	async fn malformed_cookie_reports_exact_host_message() {
 		let (store, path) = test_store("bad-cookie");
 		let http: Arc<dyn OAuthHttpClient> =
-			Arc::new(FixtureHttp { requests: parking_lot::Mutex::new(Vec::new()) });
+			Arc::new(FixtureHttp { requests: Mutex::new(Vec::new()) });
 		let (session, driver, _) = default_login_channels(LoginSessionId::from("test-bad-cookie"));
 		let task = tokio::spawn(async move {
 			run_login_inner(
 				&driver,
 				ProviderId::from(PROVIDER),
-				std::collections::BTreeSet::new(),
+				BTreeSet::new(),
 				store,
 				AccountPool::new(),
 				http,
@@ -840,6 +848,6 @@ mod tests {
 			"Invalid QwenCloud Cookie header. Copy the complete Cookie request header from the \
 			 bailian-cs.console.aliyun.com usage request, not a single cookie value."
 		);
-		let _ = std::fs::remove_file(path);
+		let _ = fs::remove_file(path);
 	}
 }

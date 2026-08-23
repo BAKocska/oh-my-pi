@@ -1,3 +1,5 @@
+use std::fmt;
+
 use omp_core::{SecretString, Str, base64_url};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use sha2::{Digest as _, Sha256};
@@ -27,8 +29,8 @@ impl PkceMaterial {
 	}
 }
 
-impl std::fmt::Debug for PkceMaterial {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PkceMaterial {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("PkceMaterial")
 			.field("verifier", &"[REDACTED]")
@@ -79,12 +81,14 @@ use omp_core::ExposeSecret as _;
 
 #[cfg(test)]
 mod tests {
+	use std::convert;
+
 	use super::*;
 
 	#[test]
 	fn pkce_is_deterministic_with_injected_entropy() {
 		let mut next = 0_u8;
-		let material = generate_pkce::<std::convert::Infallible>(|bytes| {
+		let material = generate_pkce::<convert::Infallible>(|bytes| {
 			for byte in bytes {
 				*byte = next;
 				next = next.wrapping_add(1);

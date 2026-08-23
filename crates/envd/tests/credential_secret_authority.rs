@@ -1,3 +1,5 @@
+//! Proves masking ownership, audited credential reveal, and request-bound
+//! scoped tokens.
 use std::{
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},

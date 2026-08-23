@@ -1,10 +1,13 @@
 //! Apply-patch, patch, and sloppy edit revisions over `EditDocuments`.
 
+use std::path::Path;
+
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
 use omp_core::{Str, sf};
 use omp_hashline::{
+	diff_preview::CompactDiffOptions,
 	foreign_patch::{ForeignPatchFile, parse_foreign_patch},
 	sloppy::{apply_sloppy, split_sloppy_sections},
 	unified_hunk::apply_file_operation,
@@ -19,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use super::{
 	AppliedOp, CommittedSection, EditAction, EditCommitError, EditDocuments, EditPrepared,
 	EditProposal, EditUpdate, Fault, FormatPolicy, Payload, PrepareRequest, ResolvedEdit, SectionOp,
-	SectionPayload, StalePolicy, commit_event, done_fault, param_event,
+	SectionPayload, StalePolicy, commit_event, done_fault, param_event, rejection_text,
 };
 use crate::{
 	path::{HostPaths, normalize_target},
@@ -339,7 +342,7 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 									yield done_fault(Fault::invalid(format!(
 										"apply-patch partially committed {prior}; stopped before {current_path} \
 										 after the first per-file failure: {}",
-										super::rejection_text(&fault),
+										rejection_text(&fault),
 									)));
 									return;
 								},
@@ -401,7 +404,7 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 				}
 			},
 			Err(fault) => {
-				let _ = out.push(&super::rejection_text(fault));
+				let _ = out.push(&rejection_text(fault));
 			},
 		}
 		out.finish()
@@ -467,11 +470,11 @@ fn preview<P: EditPrepared>(works: &[Work<P>], projections: &[Projection]) -> (S
 		if let Ok(diff) = omp_hashline::numbered_diff(
 			work.prepared.base_bytes(),
 			after,
-			Some(std::path::Path::new(work.prepared.display_path().as_str())),
+			Some(Path::new(work.prepared.display_path().as_str())),
 		) {
 			let compact = omp_hashline::diff_preview::build_compact_diff_preview(
 				&diff.text,
-				omp_hashline::diff_preview::CompactDiffOptions::default(),
+				CompactDiffOptions::default(),
 			);
 			if !text.is_empty() && !compact.preview.is_empty() {
 				text.push('\n');
@@ -503,13 +506,13 @@ fn payload<P: EditPrepared>(
 				let diff = omp_hashline::numbered_diff(
 					work.prepared.base_bytes(),
 					&after,
-					Some(std::path::Path::new(work.prepared.display_path().as_str())),
+					Some(Path::new(work.prepared.display_path().as_str())),
 				)
 				.ok();
 				let compact = diff.as_ref().map(|diff| {
 					omp_hashline::diff_preview::build_compact_diff_preview(
 						&diff.text,
-						omp_hashline::diff_preview::CompactDiffOptions::default(),
+						CompactDiffOptions::default(),
 					)
 				});
 				SectionPayload {

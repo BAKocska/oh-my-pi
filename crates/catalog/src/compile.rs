@@ -1,12 +1,16 @@
 //! Deterministic offline compilation of checked-in catalog oracle records.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	io, str, time,
+};
 
 use omp_core::{Str, hex, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, value::RawValue};
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
+use toml::de;
 
 use crate::{
 	capability::{
@@ -20,13 +24,13 @@ use crate::{
 	},
 	cascade::{AxisMap, CascadeError, CompatCascade, ResolveTarget},
 	classify::{
-		ClassificationInput, ClassificationPhase, ModelClassification, classify, strip_effort_lane,
-		supports_dynamic_effort_siblings,
+		ClassificationInput, ClassificationPhase, EffortTier, ModelClassification, classify,
+		strip_effort_lane, supports_dynamic_effort_siblings,
 	},
 	discover::DiscoveryDefaults,
 	id::{
 		AuthSpecId, CatalogRevision, CodecId, DiscoverySpecId, ModelKey, OAuthSpecId, ProviderId,
-		RouteId, WireModelId, WirePolicyId,
+		RouteId, ThinkingPolicyId, WireModelId, WirePolicyId,
 	},
 	model::{
 		ContextStrategy, EvidenceConfidence, ModelAvailability, ModelLimits, ModelProvenance,
@@ -917,13 +921,13 @@ impl CompiledCatalog {
 pub enum CompileError {
 	/// Provider TOML did not match the closed schema.
 	#[error("provider oracle is invalid: {0}")]
-	Provider(#[from] toml::de::Error),
+	Provider(#[from] de::Error),
 	/// Model JSON did not match the closed schema.
 	#[error("model oracle is invalid: {0}")]
 	Json(#[from] serde_json::Error),
 	/// Compressed model source could not be decoded.
 	#[error("model oracle compression is invalid: {0}")]
-	Compression(#[from] std::io::Error),
+	Compression(#[from] io::Error),
 	/// Compatibility cascade parsing or resolution failed.
 	#[error("compatibility cascade is invalid: {0}")]
 	Cascade(#[from] CascadeError),
@@ -3297,7 +3301,7 @@ fn compile_models(
 	model_routes: &BTreeMap<(Str, Str), Vec<RouteId>>,
 	provider_policies: &BTreeMap<Str, WirePolicyId>,
 	policies: &mut BTreeMap<WirePolicyId, WirePolicy>,
-	thinking_policies: &mut BTreeMap<crate::id::ThinkingPolicyId, ThinkingPolicy>,
+	thinking_policies: &mut BTreeMap<ThinkingPolicyId, ThinkingPolicy>,
 	provider_facets: &BTreeMap<Str, Vec<SourceFacet>>,
 	cascade: &CompatCascade,
 ) -> Result<(Vec<ModelSpec>, Vec<CatalogAlias>), CompileError> {
@@ -3693,7 +3697,7 @@ fn retarget_collapsed_model_reference(
 
 fn collapsible_groups(classified: &BTreeMap<Str, ModelClassification>) -> BTreeSet<Str> {
 	let raw: BTreeSet<&str> = classified.keys().map(Str::as_str).collect();
-	let mut tiers: BTreeMap<&str, Vec<crate::classify::EffortTier>> = BTreeMap::new();
+	let mut tiers: BTreeMap<&str, Vec<EffortTier>> = BTreeMap::new();
 	let mut result = BTreeSet::new();
 	for value in classified.values() {
 		if value.thinking_variant && raw.contains(value.logical_model.as_str()) {
@@ -3909,7 +3913,7 @@ fn compile_wire_policy(
 
 fn parse_policy<T>(source: Option<&str>, inherited: Option<T>) -> Result<Option<T>, CompileError>
 where
-	T: std::str::FromStr,
+	T: str::FromStr,
 {
 	source
 		.map(|value| {
@@ -3943,7 +3947,7 @@ fn compile_thinking(
 			.filter(|effort| *effort != ThinkingEffort::Off)
 			.collect::<SmallVec<_, 6>>();
 		let has_off_route = members.iter().any(|(_, _, classified)| {
-			classified.effort == Some(crate::classify::EffortTier::Off)
+			classified.effort == Some(EffortTier::Off)
 				|| (classified.effort.is_none() && !classified.thinking_variant)
 		});
 		let default_level = (!has_off_route).then(|| {
@@ -4061,15 +4065,15 @@ fn compile_thinking(
 	Ok((profile, routing))
 }
 
-const fn translate_effort(effort: crate::classify::EffortTier) -> ThinkingEffort {
+const fn translate_effort(effort: EffortTier) -> ThinkingEffort {
 	match effort {
-		crate::classify::EffortTier::Off => ThinkingEffort::Off,
-		crate::classify::EffortTier::Minimal => ThinkingEffort::Minimal,
-		crate::classify::EffortTier::Low => ThinkingEffort::Low,
-		crate::classify::EffortTier::Medium => ThinkingEffort::Medium,
-		crate::classify::EffortTier::High => ThinkingEffort::High,
-		crate::classify::EffortTier::XHigh => ThinkingEffort::XHigh,
-		crate::classify::EffortTier::Max => ThinkingEffort::Max,
+		EffortTier::Off => ThinkingEffort::Off,
+		EffortTier::Minimal => ThinkingEffort::Minimal,
+		EffortTier::Low => ThinkingEffort::Low,
+		EffortTier::Medium => ThinkingEffort::Medium,
+		EffortTier::High => ThinkingEffort::High,
+		EffortTier::XHigh => ThinkingEffort::XHigh,
+		EffortTier::Max => ThinkingEffort::Max,
 	}
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4853,7 +4857,7 @@ fn compile_discovery(source: &SourceDiscovery) -> Result<DiscoverySpec, CompileE
 		path: sf!("/models"),
 		pagination: DiscoveryPagination::SinglePage,
 		authoritative: source.authoritative,
-		interval: source.interval_ms.map(std::time::Duration::from_millis),
+		interval: source.interval_ms.map(time::Duration::from_millis),
 	})
 }
 
@@ -4940,7 +4944,9 @@ fn revision_for(
 
 #[cfg(test)]
 mod tests {
+
 	use super::*;
+	use crate::pricing::{NanoUsd, UsageDimensions};
 	fn source_model(value: Value) -> SourceModelRecord {
 		serde_json::from_value(value).expect("source model")
 	}
@@ -5080,23 +5086,23 @@ mod tests {
 			compile_pricing("openai-codex", "gpt-5.6-sol", &cost, resolved.catalog.get("longContext"))
 				.expect("tier compiles");
 		let boundary = pricing
-			.cost(crate::pricing::UsageDimensions {
+			.cost(UsageDimensions {
 				input_tokens: 72_000,
 				output_tokens: 10_000,
 				cache_read_tokens: 200_000,
-				..crate::pricing::UsageDimensions::default()
+				..UsageDimensions::default()
 			})
 			.expect("boundary price");
-		assert_eq!(boundary, crate::pricing::NanoUsd::from_nanos(760_000_000));
+		assert_eq!(boundary, NanoUsd::from_nanos(760_000_000));
 		let above = pricing
-			.cost(crate::pricing::UsageDimensions {
+			.cost(UsageDimensions {
 				input_tokens: 72_001,
 				output_tokens: 10_000,
 				cache_read_tokens: 200_000,
-				..crate::pricing::UsageDimensions::default()
+				..UsageDimensions::default()
 			})
 			.expect("premium price");
-		assert_eq!(above, crate::pricing::NanoUsd::from_nanos(1_370_010_000));
+		assert_eq!(above, NanoUsd::from_nanos(1_370_010_000));
 	}
 
 	#[test]

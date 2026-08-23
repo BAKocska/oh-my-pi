@@ -2,13 +2,19 @@
 
 use std::{
 	collections::BTreeMap,
+	env,
+	env::consts,
+	fs,
 	future::Future,
+	io,
 	io::IsTerminal as _,
 	path::Path,
+	sync,
 	sync::{Arc, LazyLock},
 	time::Duration,
 };
 
+use omp_catalog::snapshot;
 use omp_core::{SecretString, Str, sf};
 use omp_envd::browser_fetch::BrowserFetchAdapter;
 #[cfg(target_os = "macos")]
@@ -29,6 +35,7 @@ use omp_inference::{
 		OAuthLoginEngine, OAuthLoginEngineError, OsCredentialKeySource, ProviderShaper,
 		SecretLoginEngine, SecretLoginEngineError, StoreError, StoredOAuthRefreshEngine,
 		SystemOAuthClock, SystemOAuthHttpClient, UnavailableKeySource,
+		oauth::OAuthCustomDispatchError,
 	},
 	call::AuthMethod,
 	codec::google_cca::{
@@ -38,12 +45,20 @@ use omp_inference::{
 	layer::{admission::AdmissionController, stack::BuiltinConfig},
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageManager, UsageFetcherRegistry,
-		alibaba_token_plan::AlibabaTokenPlanUsageFetcher, claude::ClaudeUsageFetcher,
-		cursor::CursorUsageFetcher, gemini::GeminiUsageFetcher,
-		github_copilot::GithubCopilotUsageFetcher, google_antigravity::GoogleAntigravityUsageFetcher,
-		kimi::KimiUsageFetcher, minimax_code::MiniMaxCodeUsageFetcher, ollama::OllamaUsageFetcher,
-		openai_codex::OpenAiCodexUsageFetcher, opencode_go::OpenCodeGoUsageFetcher,
-		synthetic::SyntheticUsageFetcher, umans::UmansUsageFetcher, xai_oauth::XaiOauthUsageFetcher,
+		alibaba_token_plan::AlibabaTokenPlanUsageFetcher,
+		claude::ClaudeUsageFetcher,
+		cursor::CursorUsageFetcher,
+		gemini::GeminiUsageFetcher,
+		github_copilot::GithubCopilotUsageFetcher,
+		google_antigravity::GoogleAntigravityUsageFetcher,
+		kimi::KimiUsageFetcher,
+		minimax_code::MiniMaxCodeUsageFetcher,
+		ollama::OllamaUsageFetcher,
+		openai_codex::{CodexRedemption, OpenAiCodexUsageFetcher},
+		opencode_go::OpenCodeGoUsageFetcher,
+		synthetic::SyntheticUsageFetcher,
+		umans::UmansUsageFetcher,
+		xai_oauth::XaiOauthUsageFetcher,
 		zai::ZaiUsageFetcher,
 	},
 	provider::builtin::{
@@ -54,6 +69,13 @@ use omp_inference::{
 	transport::{http::HttpTransport, websocket_transport::WebSocketTransport},
 };
 use omp_serve::inference::InferenceRpc;
+use omp_settings::manager::{SettingsManager, SettingsManagerError, SettingsPaths};
+use tokio::time;
+
+use crate::{
+	auth_backend, auth_backend::GithubCredentialAuthority,
+	codex_redemption::CodexRedemptionAuthority,
+};
 
 const KEYCHAIN_OPT_IN_ENV: &str = "OMP_LLM_KEYCHAIN";
 const KEYCHAIN_SERVICE: &str = "dev.omp.llm";
@@ -70,7 +92,7 @@ const ANTIGRAVITY_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum RegistryError {
 	/// Durable state directory could not be prepared.
 	#[error("could not prepare inference state directory")]
-	PrepareState(#[source] std::io::Error),
+	PrepareState(#[source] io::Error),
 	/// The checked-in catalog snapshot is invalid.
 	#[error("embedded catalog snapshot is invalid")]
 	Catalog(#[source] &'static omp_catalog::snapshot::SnapshotError),
@@ -88,7 +110,7 @@ pub enum RegistryError {
 	CredentialKeyFile(#[from] FileKeyError),
 	/// Native settings authority could not be opened.
 	#[error(transparent)]
-	SettingsManager(#[from] omp_settings::manager::SettingsManagerError),
+	SettingsManager(#[from] SettingsManagerError),
 	/// Web-search settings could not be projected.
 	#[error(transparent)]
 	SettingsSnapshot(#[from] omp_settings::SnapshotError),
@@ -106,7 +128,7 @@ pub enum RegistryError {
 	OAuthLogin(#[from] OAuthLoginEngineError),
 	/// A custom OAuth exchange handler could not be registered.
 	#[error(transparent)]
-	OAuthCustom(#[from] omp_inference::auth::oauth::OAuthCustomDispatchError),
+	OAuthCustom(#[from] OAuthCustomDispatchError),
 	/// Refresh coordination policy was invalid.
 	#[error(transparent)]
 	RefreshPolicy(#[from] omp_inference::account::RefreshPolicyError),
@@ -139,8 +161,8 @@ pub enum CredentialKeyMode {
 impl CredentialKeyMode {
 	/// Selects the key source from the environment and process interactivity.
 	pub fn from_environment() -> Self {
-		let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-		match std::env::var_os(KEYCHAIN_OPT_IN_ENV).as_deref() {
+		let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+		match env::var_os(KEYCHAIN_OPT_IN_ENV).as_deref() {
 			Some(value) if value == "1" => Self::OsKeychain,
 			None if interactive && cfg!(target_os = "macos") => Self::LocalFile,
 			_ => Self::Unavailable,
@@ -161,6 +183,8 @@ fn placeholder_affinity_key() -> &'static str {
 	KEY.as_str()
 }
 
+/// Opens the encrypted credential database using the environment-selected key
+/// source.
 pub fn open_credential_store(
 	database: impl AsRef<Path>,
 ) -> Result<Arc<CredentialStore>, RegistryError> {
@@ -237,10 +261,10 @@ pub async fn production_usage_manager(
 /// embedded catalog carries an `openai-codex` route.
 pub fn production_redemption_authority(
 	data_dir: &Path,
-) -> Result<Option<std::sync::Arc<dyn omp_agent::RedemptionAuthority>>, RegistryError> {
-	let catalog = omp_catalog::snapshot::Catalog::try_embedded().map_err(RegistryError::Catalog)?;
+) -> Result<Option<sync::Arc<dyn omp_agent::RedemptionAuthority>>, RegistryError> {
+	let catalog = snapshot::Catalog::try_embedded().map_err(RegistryError::Catalog)?;
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
-	let stored = Arc::new(crate::auth_backend::combined_authority(credential_store));
+	let stored = Arc::new(auth_backend::combined_authority(credential_store));
 	let credentials = CredentialBroker::system(catalog, CredentialBrokerEngines {
 		stored: Some(stored),
 		..CredentialBrokerEngines::default()
@@ -256,16 +280,9 @@ pub fn production_redemption_authority(
 		&data_dir.join("credentials.db"),
 	)?))?;
 	let http = Arc::new(SystemOAuthHttpClient::new());
-	Ok(omp_inference::operation::usage::openai_codex::CodexRedemption::from_catalog(
-		catalog,
-		credentials,
-		accounts,
-		http,
-	)
-	.map(|service| {
-		std::sync::Arc::new(crate::codex_redemption::CodexRedemptionAuthority::new(
-			std::sync::Arc::new(service),
-		)) as std::sync::Arc<dyn omp_agent::RedemptionAuthority>
+	Ok(CodexRedemption::from_catalog(catalog, credentials, accounts, http).map(|service| {
+		sync::Arc::new(CodexRedemptionAuthority::new(sync::Arc::new(service)))
+			as sync::Arc<dyn omp_agent::RedemptionAuthority>
 	}))
 }
 
@@ -348,9 +365,7 @@ pub async fn production_inference_for_session(
 	};
 	let (registry, sessions, authority, auth_manager, _, builtins) =
 		production_assembly_for_session(data_dir, credential_store, invocation_key).await?;
-	let settings = omp_settings::manager::SettingsManager::open(
-		omp_settings::manager::SettingsPaths::discover(data_dir, project_root),
-	)?;
+	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, project_root))?;
 	let search_settings = settings
 		.snapshot()
 		.project::<omp_inference::search_settings::WebSearchSettings>()?
@@ -402,9 +417,9 @@ async fn production_assembly_for_session(
 	),
 	RegistryError,
 > {
-	std::fs::create_dir_all(data_dir).map_err(RegistryError::PrepareState)?;
+	fs::create_dir_all(data_dir).map_err(RegistryError::PrepareState)?;
 	let catalog = Arc::new(
-		omp_catalog::snapshot::Catalog::try_embedded()
+		snapshot::Catalog::try_embedded()
 			.map_err(RegistryError::Catalog)?
 			.clone(),
 	);
@@ -418,7 +433,7 @@ async fn production_assembly_for_session(
 		})
 		.map(|route| route.id.clone())
 		.collect::<Vec<_>>();
-	let stored = Arc::new(crate::auth_backend::combined_authority(credential_store.clone()));
+	let stored = Arc::new(auth_backend::combined_authority(credential_store.clone()));
 	let credentials = CredentialBroker::system(&catalog, CredentialBrokerEngines {
 		stored: Some(stored.clone()),
 		..CredentialBrokerEngines::default()
@@ -573,8 +588,8 @@ async fn production_assembly_for_session(
 		arch:    env_override(ANTIGRAVITY_ARCH_ENV).unwrap_or_else(|| sf!(DEFAULT_ANTIGRAVITY_ARCH)),
 	};
 	let google_cca = GoogleCcaConfig {
-		gemini_cli_platform: Str::from(std::env::consts::OS),
-		gemini_cli_arch:     Str::from(std::env::consts::ARCH),
+		gemini_cli_platform: Str::from(consts::OS),
+		gemini_cli_arch:     Str::from(consts::ARCH),
 		antigravity_headers: CcaHeaders::antigravity(&antigravity_fingerprint, false, None),
 		antigravity_policy:  AntigravityPolicy::default(),
 	};
@@ -621,7 +636,7 @@ async fn production_assembly_for_session(
 		.with_builtins(builtins.clone())?
 		.build()?;
 	let authority: Arc<dyn omp_envd::github_url::CredentialAuthority> =
-		Arc::new(crate::auth_backend::GithubCredentialAuthority::new(stored));
+		Arc::new(GithubCredentialAuthority::new(stored));
 	Ok((registry, sessions, authority, exposed_auth_manager, exposed_usage_manager, builtins))
 }
 
@@ -637,7 +652,7 @@ fn antigravity_version_task(
 	let cache_path = data_dir.join(ANTIGRAVITY_VERSION_CACHE_FILE);
 	let fetch = override_version.is_none().then(|| {
 		tokio::spawn(async move {
-			tokio::time::timeout(
+			time::timeout(
 				ANTIGRAVITY_VERSION_FETCH_TIMEOUT,
 				discover_antigravity_version(client.as_ref()),
 			)
@@ -654,13 +669,13 @@ fn antigravity_version_task(
 			&& let Ok(Some(version)) = fetch.await
 		{
 			// Best-effort persistence so offline boots keep the discovered release.
-			let _ = std::fs::write(&cache_path, version.as_str());
+			let _ = fs::write(&cache_path, version.as_str());
 			return version;
 		}
 		// Discovery failed: prefer the persisted release over the pinned default
 		// only when it is actually newer (a stale cache must not undo a shipped
 		// fallback bump).
-		let cached = std::fs::read_to_string(&cache_path).ok().and_then(|raw| {
+		let cached = fs::read_to_string(&cache_path).ok().and_then(|raw| {
 			let raw = raw.trim();
 			release_ordinal(raw).map(|ordinal| (Str::from(raw), ordinal))
 		});
@@ -689,7 +704,7 @@ fn release_ordinal(version: &str) -> Option<[u64; 3]> {
 
 /// Reads a non-empty trimmed environment override.
 fn env_override(name: &str) -> Option<Str> {
-	std::env::var(name).ok().and_then(|value| {
+	env::var(name).ok().and_then(|value| {
 		let value = value.trim();
 		(!value.is_empty()).then(|| Str::from(value))
 	})

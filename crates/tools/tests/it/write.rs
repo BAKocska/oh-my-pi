@@ -1,7 +1,7 @@
 //! Pi-equivalent `write@1` schema, guards, transactions, and exact output
 //! contracts.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future, future::Future, sync::Arc, time::Duration};
 
 use futures::{StreamExt, executor::block_on};
 use omp_core::{Str, sf};
@@ -12,11 +12,12 @@ use omp_tools::{
 	read::selector::LiteralPathProbe,
 	write::{
 		self, Fault, PlainWriteRequest, PlainWriteResult, SpecialWriteControl, WriteCommitError,
-		WriteDisposition, WriteDocuments, WriteOperation,
+		WriteDisposition, WriteDocuments, WriteOperation, backends,
 	},
 };
 use parking_lot::Mutex;
 use serde_json::json;
+use tokio::time;
 
 #[derive(Clone)]
 struct FakeDocuments {
@@ -74,14 +75,14 @@ impl WriteDocuments for StalledSpecialDocuments {
 		&self,
 		_path: Str,
 	) -> impl Future<Output = Result<LiteralPathProbe, Fault>> + Send + '_ {
-		std::future::ready(Ok(LiteralPathProbe::Unknown))
+		future::ready(Ok(LiteralPathProbe::Unknown))
 	}
 
 	fn write_plain(
 		&self,
 		_request: PlainWriteRequest,
 	) -> impl Future<Output = Result<PlainWriteResult, WriteCommitError>> + Send + '_ {
-		std::future::ready(Err(WriteCommitError::Rejected(Fault::Document {
+		future::ready(Err(WriteCommitError::Rejected(Fault::Document {
 			message: "plain write unexpectedly reached".into(),
 		})))
 	}
@@ -91,9 +92,8 @@ impl WriteDocuments for StalledSpecialDocuments {
 		_display_path: Str,
 		_content: bytes::Bytes,
 		control: SpecialWriteControl,
-	) -> impl Future<Output = Result<Option<write::backends::ResultPayload>, write::backends::Fault>>
-	+ Send
-	+ '_ {
+	) -> impl Future<Output = Result<Option<backends::ResultPayload>, backends::Fault>> + Send + '_
+	{
 		let phase = self.phase;
 		let started = self.started.clone();
 		async move {
@@ -101,7 +101,7 @@ impl WriteDocuments for StalledSpecialDocuments {
 				assert!(control.begin_effects());
 			}
 			started.send(()).expect("test observes special write phase");
-			std::future::pending().await
+			future::pending().await
 		}
 	}
 }
@@ -490,7 +490,7 @@ async fn interrupt_stalled_special_write(
 	feed
 		.interrupt(Interrupt { class: sf!("immediate"), reason: sf!("stop special write") })
 		.expect("write invocation accepts interruption");
-	tokio::time::timeout(Duration::from_secs(1), &mut events)
+	time::timeout(Duration::from_secs(1), &mut events)
 		.await
 		.expect("special write interruption remains responsive")
 }

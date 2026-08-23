@@ -3,6 +3,7 @@
 use std::{
 	collections::{HashMap, HashSet},
 	ffi::OsString,
+	fmt,
 	fs::{self, File, OpenOptions},
 	future::Future,
 	io::{self, Read, Seek as _, SeekFrom, Write as _},
@@ -22,15 +23,20 @@ use http_body_util::Empty;
 use hyper::body::{Body as _, Incoming};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
-	client::legacy::{Client, connect::HttpConnector},
+	client::{
+		legacy,
+		legacy::{Client, connect::HttpConnector},
+	},
 	rt::TokioExecutor,
 };
 use omp_core::{Str, sf};
 use parking_lot::Mutex as ParkingMutex;
+use rustls::crypto::ring;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use strum::{Display, EnumString, IntoStaticStr};
 use tokio::sync::Mutex;
+use url::Url;
 
 use super::runtime::{LocalCancellation, LocalError, LocalErrorKind, LocalResult};
 
@@ -100,7 +106,7 @@ impl ArtifactManifest {
 			if !paths.insert(shard.spec.path.clone()) {
 				return Err(ArtifactError::DuplicatePath { path: shard.spec.path.clone() });
 			}
-			let source = url::Url::parse(shard.source.as_str())
+			let source = Url::parse(shard.source.as_str())
 				.map_err(|source| ArtifactError::InvalidUrl { source })?;
 			if !matches!(source.scheme(), "http" | "https")
 				|| !source.username().is_empty()
@@ -344,7 +350,7 @@ pub enum ArtifactError {
 	HttpRequest {
 		/// Hyper client failure.
 		#[source]
-		source: hyper_util::client::legacy::Error,
+		source: legacy::Error,
 	},
 	/// HTTP response body failed while streaming.
 	#[error("artifact HTTP response stream failed")]
@@ -992,8 +998,8 @@ impl VerifiedArtifact {
 	}
 }
 
-impl std::fmt::Debug for VerifiedArtifact {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for VerifiedArtifact {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("VerifiedArtifact")
 			.field("receipt", &self.receipt)
@@ -1012,7 +1018,7 @@ pub struct SystemArtifactFetcher {
 impl SystemArtifactFetcher {
 	/// Constructs a pooled HTTP/1.1 and HTTP/2 artifact fetcher.
 	pub fn new() -> Self {
-		let _ = rustls::crypto::ring::default_provider().install_default();
+		let _ = ring::default_provider().install_default();
 		let connector = HttpsConnectorBuilder::new()
 			.with_webpki_roots()
 			.https_or_http()
@@ -1029,8 +1035,8 @@ impl Default for SystemArtifactFetcher {
 	}
 }
 
-impl std::fmt::Debug for SystemArtifactFetcher {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SystemArtifactFetcher {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("SystemArtifactFetcher(..)")
 	}
 }
@@ -1043,7 +1049,7 @@ impl ArtifactFetcher for SystemArtifactFetcher {
 
 	fn fetch(&self, request: ArtifactFetchRequest) -> Self::FetchFuture<'_> {
 		async move {
-			let mut url = url::Url::parse(request.source.as_str())
+			let mut url = Url::parse(request.source.as_str())
 				.map_err(|source| ArtifactError::InvalidUrl { source })?;
 			for redirect in 0..=5 {
 				let uri: http::Uri = url
@@ -1176,11 +1182,12 @@ mod tests {
 			Arc,
 			atomic::{AtomicUsize, Ordering},
 		},
+		vec,
 	};
 
 	use futures::stream;
 	use parking_lot::Mutex as ParkingMutex;
-	use sha2::{Digest as _, Sha256};
+	use sha2::Sha256;
 	use tempfile::tempdir;
 
 	use super::*;
@@ -1194,7 +1201,7 @@ mod tests {
 	}
 
 	impl ArtifactFetcher for FixtureFetcher {
-		type Body = stream::Iter<std::vec::IntoIter<ArtifactResult<Bytes>>>;
+		type Body = stream::Iter<vec::IntoIter<ArtifactResult<Bytes>>>;
 		type FetchFuture<'a> = Ready<ArtifactResult<ArtifactFetchResponse<Self::Body>>>;
 
 		fn fetch(&self, request: ArtifactFetchRequest) -> Self::FetchFuture<'_> {
@@ -1377,7 +1384,7 @@ mod tests {
 		manifest.shards[1].source = Str::from("https://fixtures.invalid/model?second");
 		struct TwoFetcher;
 		impl ArtifactFetcher for TwoFetcher {
-			type Body = stream::Iter<std::vec::IntoIter<ArtifactResult<Bytes>>>;
+			type Body = stream::Iter<vec::IntoIter<ArtifactResult<Bytes>>>;
 			type FetchFuture<'a> = Ready<ArtifactResult<ArtifactFetchResponse<Self::Body>>>;
 
 			fn fetch(&self, request: ArtifactFetchRequest) -> Self::FetchFuture<'_> {

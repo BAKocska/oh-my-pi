@@ -7,6 +7,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use omp_core::Str;
+use url::Url;
 
 use crate::codec::Cancellation;
 
@@ -40,7 +41,7 @@ pub struct BrowserFetchRequest {
 impl BrowserFetchRequest {
 	/// Validates limits before crossing into the browser daemon.
 	pub fn validate(&self) -> Result<(), BrowserFetchError> {
-		let url = url::Url::parse(self.url.as_str()).map_err(|_| BrowserFetchError::InvalidUrl)?;
+		let url = Url::parse(self.url.as_str()).map_err(|_| BrowserFetchError::InvalidUrl)?;
 		if !matches!(url.scheme(), "http" | "https")
 			|| url.username() != ""
 			|| url.password().is_some()

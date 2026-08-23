@@ -13,6 +13,8 @@ use http::{
 use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::time;
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -21,7 +23,7 @@ use crate::{
 		UsageWindowKind,
 	},
 	auth::{
-		OAuthHttpClient, OAuthHttpRequest,
+		OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse as AuthOAuthHttpResponse,
 		github_copilot::{COPILOT_USER_AGENT, parse_copilot_api_key},
 	},
 	catalog::ProviderId,
@@ -224,7 +226,7 @@ async fn fetch_github_copilot_usage_until(
 			account_id = username.clone();
 		}
 		if let Some(username) = username {
-			let mut url = url::Url::parse(&base).map_err(|_| UsageFetchError::Protocol)?;
+			let mut url = Url::parse(&base).map_err(|_| UsageFetchError::Protocol)?;
 			url.path_segments_mut()
 				.map_err(|()| UsageFetchError::Protocol)?
 				.extend(["users", username.as_str()])
@@ -330,9 +332,9 @@ async fn execute(
 	http: &dyn OAuthHttpClient,
 	request: OAuthHttpRequest,
 	deadline: Option<Instant>,
-) -> Option<crate::auth::OAuthHttpResponse> {
+) -> Option<AuthOAuthHttpResponse> {
 	match deadline {
-		Some(deadline) => tokio::time::timeout_at(deadline.into(), http.execute(request))
+		Some(deadline) => time::timeout_at(deadline.into(), http.execute(request))
 			.await
 			.ok()?
 			.ok(),

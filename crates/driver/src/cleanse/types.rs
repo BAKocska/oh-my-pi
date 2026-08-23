@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use omp_core::Str;
 
+use super::parsers::ParserKind;
+
 /// Severity normalized across checker formats.
 #[derive(
 	Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -70,7 +72,7 @@ pub struct Checker {
 	/// Arguments excluding the executable.
 	pub args:     Vec<Str>,
 	/// Output parser.
-	pub parser:   super::parsers::ParserKind,
+	pub parser:   ParserKind,
 	/// Execution effect.
 	pub effect:   CheckerEffect,
 	/// Whether this is a project test suite.

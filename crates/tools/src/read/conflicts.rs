@@ -1,6 +1,6 @@
 //! Pure detection and rendering of unresolved git conflict markers.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops, sync::Arc};
 
 use omp_core::{CowBytes, Str, sf};
 use parking_lot::Mutex;
@@ -829,7 +829,7 @@ const MAX_ECHO_LINES: usize = 12;
 fn trim_boundary_echo(
 	replacement: &mut Vec<String>,
 	current: &str,
-	range: &std::ops::Range<usize>,
+	range: &ops::Range<usize>,
 	block: &ConflictBlock,
 ) -> (usize, usize) {
 	if replacement.len() <= 1 {
@@ -973,7 +973,7 @@ fn line_byte_range(
 	input: &str,
 	start_line: usize,
 	end_line: usize,
-) -> Result<std::ops::Range<usize>, Fault> {
+) -> Result<ops::Range<usize>, Fault> {
 	let mut starts = Vec::with_capacity(input.bytes().filter(|byte| *byte == b'\n').count() + 1);
 	starts.push(0);
 	for (index, byte) in input.bytes().enumerate() {

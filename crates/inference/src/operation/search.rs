@@ -13,11 +13,11 @@ use omp_core::{Str, sf};
 use tower::Service;
 
 use crate::{
-	answer::{Answer, AnswerBody, SearchResult, SearchResults},
+	answer::{Answer, AnswerBody, SearchMetadata, SearchResult, SearchResults},
 	body::{AttemptBodyEvidence, RetryDecision},
 	call::{
-		EmulationPolicy, HostedTool, MismatchPolicy, OperationCall, SearchRecency, SearchRequest,
-		Setting,
+		Call, EmulationPolicy, HostedTool, MismatchPolicy, OperationCall, SearchRecency,
+		SearchRequest, Setting,
 	},
 	catalog::{Emulation, OperationKind, SearchCapabilities, SearchFeatureBits},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
@@ -148,7 +148,7 @@ impl SearchPlan {
 	}
 }
 
-impl<S> Service<crate::call::Call> for SearchService<S>
+impl<S> Service<Call> for SearchService<S>
 where
 	S: Service<
 			OperationRequest<SearchRequest>,
@@ -166,7 +166,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let prepared = match &call.operation {
 			OperationCall::Search(request) => self.plan(request).map(|plan| {
 				let backend = OperationRequest::from_call(&call, Arc::clone(&plan.backend_request));
@@ -427,7 +427,7 @@ pub fn finalize_search(plan: &SearchPlan, mut page: SearchPage) -> Result<Search
 		results,
 		answer: page.answer,
 		usage: page.usage,
-		metadata: crate::answer::SearchMetadata { warnings, ..Default::default() },
+		metadata: SearchMetadata { warnings, ..Default::default() },
 	})
 }
 
@@ -786,7 +786,7 @@ fn domain_eq(left: &str, right: &str) -> bool {
 		.eq_ignore_ascii_case(right.trim_start_matches('.'))
 }
 
-fn wrong_operation(call: &crate::call::Call) -> Error {
+fn wrong_operation(call: &Call) -> Error {
 	Error::new(
 		ErrorKind::InternalInvariant,
 		ErrorPhase::Internal,

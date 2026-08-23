@@ -1,11 +1,15 @@
 //! Error taxonomy shared by every engine backend.
 
-use std::path::PathBuf;
+use std::{io, path::PathBuf, result};
 
 use omp_core::Str;
+use png::DecodingError;
+use tokio_tungstenite::tungstenite;
+
+use crate::SurfaceKind;
 
 /// Crate-wide result alias.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = result::Result<T, E>;
 
 /// Everything that can go wrong while creating or driving a web surface.
 #[derive(Debug, thiserror::Error)]
@@ -13,13 +17,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Error {
 	/// No installed browser satisfies the requested engine/surface combination.
 	#[error("no usable browser engine found for `{0}` surface")]
-	NoEngine(crate::SurfaceKind),
+	NoEngine(SurfaceKind),
 
 	/// The engine binary failed to start.
 	#[error("failed to launch `{binary}`: {source}")]
 	Launch {
 		/// Underlying spawn failure.
-		source: std::io::Error,
+		source: io::Error,
 		/// Binary that was being launched.
 		binary: PathBuf,
 	},
@@ -55,7 +59,7 @@ pub enum Error {
 
 	/// A PNG frame could not be decoded.
 	#[error("png: {0}")]
-	Png(#[source] png::DecodingError),
+	Png(#[source] DecodingError),
 
 	/// A captured RGBA frame could not be encoded as PNG.
 	#[error("png encode: {0}")]
@@ -66,7 +70,7 @@ pub enum Error {
 
 	/// Websocket transport failure while talking to a remote engine.
 	#[error("websocket error: {0}")]
-	WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+	WebSocket(#[from] tungstenite::Error),
 
 	/// The operation is not supported by this engine/surface combination.
 	/// See the capability matrix in the crate docs.
@@ -87,5 +91,5 @@ pub enum Error {
 
 	/// Filesystem or process I/O failure (profile dirs, port files, ...).
 	#[error(transparent)]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 }

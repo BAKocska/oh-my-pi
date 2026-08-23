@@ -1,9 +1,12 @@
 //! Generic OAuth PKCE, device, paste, and refresh protocol engines.
+
 mod callback;
 mod custom;
 
 use std::{
+	fmt,
 	future::Future,
+	str,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -16,10 +19,11 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
 };
-use omp_catalog::provider::PrincipalResolution;
+use omp_catalog::provider::{OAuthExchangeKind, PrincipalResolution};
 use omp_core::{ExposeSecret, SecretBox, SecretString, Str, base64_url, sf};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
+use tokio::time;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -62,7 +66,7 @@ impl OAuthClock for SystemOAuthClock {
 	}
 
 	fn sleep(&self, duration: Duration) -> BoxFuture<'_, ()> {
-		async move { tokio::time::sleep(duration).await }.boxed()
+		async move { time::sleep(duration).await }.boxed()
 	}
 }
 
@@ -95,7 +99,7 @@ impl OAuthEntropy for SystemEntropySource {
 /// One typed custom OAuth exchange implementation.
 pub trait OAuthCustomHandler: Send + Sync {
 	/// Exact catalog engine discriminator handled by this implementation.
-	fn exchange_kind(&self) -> omp_catalog::provider::OAuthExchangeKind;
+	fn exchange_kind(&self) -> OAuthExchangeKind;
 
 	/// Runs the typed exchange over the bounded login channel.
 	fn exchange<'a>(
@@ -185,8 +189,8 @@ impl OAuthCustomDispatcher {
 	}
 }
 
-impl std::fmt::Debug for OAuthCustomDispatcher {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for OAuthCustomDispatcher {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("OAuthCustomDispatcher")
 			.field(
@@ -206,10 +210,10 @@ impl std::fmt::Debug for OAuthCustomDispatcher {
 pub enum OAuthCustomDispatchError {
 	/// A handler for the exact catalog exchange was already registered.
 	#[error("duplicate custom OAuth exchange handler for {0}")]
-	Duplicate(omp_catalog::provider::OAuthExchangeKind),
+	Duplicate(OAuthExchangeKind),
 	/// No handler constructs the exact advertised exchange.
 	#[error("custom OAuth exchange handler is unavailable for {0}")]
-	Unavailable(omp_catalog::provider::OAuthExchangeKind),
+	Unavailable(OAuthExchangeKind),
 	/// The selected exchange failed with secret-free protocol evidence.
 	#[error(transparent)]
 	Protocol(#[from] OAuthError),
@@ -753,8 +757,8 @@ where
 	}
 }
 
-impl std::fmt::Debug for PkcePending {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PkcePending {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("PkcePending")
 			.field("verifier", &"[REDACTED]")
@@ -773,8 +777,8 @@ pub struct DevicePending {
 	polls:       u16,
 }
 
-impl std::fmt::Debug for DevicePending {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for DevicePending {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("DevicePending")
 			.field("device_code", &"[REDACTED]")
@@ -844,7 +848,7 @@ impl OAuthTokenSet {
 			},
 			PrincipalResolution::IdTokenClaim { claim } => {
 				let id_token = json_string_at(self.identity_response.expose_secret(), "/id_token")?;
-				jwt_claim(&id_token, std::slice::from_ref(claim))?
+				jwt_claim(&id_token, slice::from_ref(claim))?
 			},
 			PrincipalResolution::AccessTokenClaims { claims } => {
 				jwt_claim(self.access_token.expose_secret(), claims)?
@@ -936,7 +940,7 @@ impl StoredOAuthBundle {
 				.map_or(u64::MAX, |value| value.as_secs())
 				.to_be_bytes(),
 		);
-		Ok(SecretBox::new(Box::new(std::mem::take(&mut *encoded))))
+		Ok(SecretBox::new(Box::new(mem::take(&mut *encoded))))
 	}
 
 	/// Decodes an authenticated store payload without exposing token text.
@@ -995,8 +999,8 @@ pub(crate) fn encode_imported_bundle(
 	.encode()
 }
 
-impl std::fmt::Debug for StoredOAuthBundle {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for StoredOAuthBundle {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("StoredOAuthBundle([REDACTED])")
 	}
 }
@@ -1023,8 +1027,8 @@ fn decode_field(input: &mut &[u8]) -> Result<Vec<u8>, OAuthError> {
 	Ok(value.to_vec())
 }
 
-impl std::fmt::Debug for OAuthTokenSet {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for OAuthTokenSet {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("OAuthTokenSet([REDACTED])")
 	}
 }
@@ -1065,8 +1069,13 @@ mod oauth_provider_code {
 	}
 }
 
+use std::{mem, slice};
+
 #[doc(inline)]
 pub use oauth_provider_code::OAuthProviderCode;
+use url::form_urlencoded;
+
+use super::{lease::CredentialError, store::StoredOAuthCredential};
 
 impl OAuthProviderCode {
 	/// Stable machine-readable string representation of this error code.
@@ -1183,19 +1192,19 @@ impl From<LoginChannelError> for OAuthError {
 /// Converts a stored opaque OAuth bundle into a lease without exposing its
 /// encoding or token material to the store-backed credential source.
 pub(crate) fn lease_stored_bundle(
-	stored: super::store::StoredOAuthCredential,
+	stored: StoredOAuthCredential,
 	valid_after: SystemTime,
-) -> Result<CredentialLease, super::lease::CredentialError> {
-	let bundle = StoredOAuthBundle::decode(&stored.bundle)
-		.map_err(|_| super::lease::CredentialError::SourceFailure)?;
+) -> Result<CredentialLease, CredentialError> {
+	let bundle =
+		StoredOAuthBundle::decode(&stored.bundle).map_err(|_| CredentialError::SourceFailure)?;
 	let expires_at = stored
 		.metadata
 		.expires_at_ms
 		.map(system_time_from_millis)
 		.transpose()
-		.map_err(|_| super::lease::CredentialError::SourceFailure)?;
+		.map_err(|_| CredentialError::SourceFailure)?;
 	if expires_at.is_some_and(|expires_at| expires_at <= valid_after) {
-		return Err(super::lease::CredentialError::Expired);
+		return Err(CredentialError::Expired);
 	}
 	let meta = LeaseMeta {
 		account: stored.metadata.account_id,
@@ -1366,7 +1375,7 @@ fn jwt_claim(token: &str, claims: &[Str]) -> Result<Str, OAuthError> {
 			.into_vec()
 			.map_err(|_| OAuthError::PrincipalUnresolved)?,
 	);
-	let document = std::str::from_utf8(&decoded).map_err(|_| OAuthError::PrincipalUnresolved)?;
+	let document = str::from_utf8(&decoded).map_err(|_| OAuthError::PrincipalUnresolved)?;
 	for claim in claims {
 		let value = if claim.starts_with('/') {
 			json_string_at(document, claim)
@@ -1489,7 +1498,7 @@ fn callback_code(
 			if decoded.is_empty() {
 				return Err(OAuthError::MalformedCallback);
 			}
-			code = Some(SecretString::from(std::mem::take(&mut *decoded)));
+			code = Some(SecretString::from(mem::take(&mut *decoded)));
 		}
 	}
 	if !state_seen {
@@ -1521,8 +1530,8 @@ fn decode_form_component(value: &str) -> Result<Zeroizing<String>, OAuthError> {
 			},
 		}
 	}
-	let decoded = String::from_utf8(std::mem::take(&mut *decoded))
-		.map_err(|_| OAuthError::MalformedCallback)?;
+	let decoded =
+		String::from_utf8(mem::take(&mut *decoded)).map_err(|_| OAuthError::MalformedCallback)?;
 	Ok(Zeroizing::new(decoded))
 }
 
@@ -1541,7 +1550,7 @@ fn form_request(
 	extra: &[OAuthParameter],
 ) -> Result<OAuthHttpRequest, OAuthError> {
 	let url = parse_http_url(url)?;
-	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+	let mut serializer = form_urlencoded::Serializer::new(String::new());
 	for (name, value) in fields {
 		serializer.append_pair(name, value.expose());
 	}
@@ -1583,7 +1592,7 @@ fn decode<T: for<'de> Deserialize<'de>>(body: &SecretString) -> Result<T, OAuthE
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::VecDeque, sync::Arc};
+	use std::{collections::VecDeque, net, net::TcpListener, sync::Arc};
 
 	use futures::FutureExt;
 	use parking_lot::Mutex;
@@ -1596,7 +1605,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		account::{CredentialFreshness, RefreshCoordinator, RefreshPolicy, RefreshRequest},
-		answer::{AuthPrompt, AuthResponse},
+		answer::{AuthPrompt, AuthResponse, AuthSession as AnswerAuthSession},
 		auth::{
 			CredentialOrigin, CredentialSourceSpec, CredentialStore, HeadlessKeySource, KeyId,
 			OAuthRefreshSpec, login::default_login_channels, spec::HeaderPlacement,
@@ -1708,15 +1717,14 @@ mod tests {
 	}
 
 	fn available_redirect_uri() -> (u16, Str) {
-		let listener =
-			std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
+		let listener = TcpListener::bind((net::Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
 		let port = listener.local_addr().expect("local address").port();
 		drop(listener);
 		(port, sf!("http://127.0.0.1:{port}/callback"))
 	}
 
 	async fn raw_callback(port: u16, target: &str) -> String {
-		let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+		let mut stream = TcpStream::connect((net::Ipv4Addr::LOCALHOST, port))
 			.await
 			.expect("connect callback");
 		let request =
@@ -1743,7 +1751,7 @@ mod tests {
 		}])))
 	}
 
-	async fn pkce_timeline(session: &crate::answer::AuthSession) -> (Url, AuthPrompt) {
+	async fn pkce_timeline(session: &AnswerAuthSession) -> (Url, AuthPrompt) {
 		let AuthEvent::OpenUrl(url) = session
 			.events
 			.recv_async()
@@ -1939,8 +1947,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn callback_bind_conflict_degrades_to_paste_prompt() {
-		let listener =
-			std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("occupy port");
+		let listener = TcpListener::bind((net::Ipv4Addr::LOCALHOST, 0)).expect("occupy port");
 		let port = listener.local_addr().expect("local address").port();
 		let redirect_uri = sf!("http://127.0.0.1:{port}/callback");
 		let http = token_http();
@@ -2042,7 +2049,7 @@ mod tests {
 		let spec = OAuthCustomSpec {
 			client:        client(),
 			authorize_url: "https://auth.example/custom".into(),
-			exchange:      omp_catalog::provider::OAuthExchangeKind::ApiKeyPaste,
+			exchange:      OAuthExchangeKind::ApiKeyPaste,
 			parameters:    Vec::new(),
 			polling:       None,
 		};
@@ -2053,9 +2060,7 @@ mod tests {
 			.expect_err("missing handler");
 		assert!(matches!(
 			error,
-			OAuthCustomDispatchError::Unavailable(
-				omp_catalog::provider::OAuthExchangeKind::ApiKeyPaste
-			)
+			OAuthCustomDispatchError::Unavailable(OAuthExchangeKind::ApiKeyPaste)
 		));
 	}
 

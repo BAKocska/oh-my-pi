@@ -8,13 +8,16 @@
 //! native targets retain and export `CPython`'s global C API so native wheels
 //! can resolve code and data symbols when they are loaded.
 
-use std::path::{Path, PathBuf};
+use std::{
+	env,
+	path::{Path, PathBuf},
+};
 
 fn main() {
 	println!("cargo::rerun-if-env-changed=PYO3_CONFIG_FILE");
 
 	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-	let vendor = std::env::var_os("PYO3_CONFIG_FILE")
+	let vendor = env::var_os("PYO3_CONFIG_FILE")
 		.map(PathBuf::from)
 		.and_then(|p| {
 			p.canonicalize()
@@ -43,9 +46,9 @@ fn main() {
 	// ld64's spelling to an ELF linker is parsed as `-e xport_dynamic`, which
 	// produces a binary with no valid entry point. Other object formats have no
 	// compatible flag.
-	let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
-	let target_family = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
-	let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+	let target_vendor = env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
+	let target_family = env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
+	let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 	let link_arg = if target_vendor == "apple" {
 		Some("-Wl,-export_dynamic")
 	} else if target_os != "aix" && target_family.split(',').any(|family| family == "unix") {

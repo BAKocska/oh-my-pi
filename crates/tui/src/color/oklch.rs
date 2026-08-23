@@ -16,7 +16,7 @@ pub(super) fn parse(body: &str) -> Option<CssColor> {
 #[cfg(test)]
 mod tests {
 	use super::parse;
-	use crate::color::CssColor;
+	use crate::color::{CssColor, oklab::to_srgb};
 
 	fn assert_rgb_near(actual: Option<CssColor>, expected: (u8, u8, u8)) {
 		let Some(CssColor::Rgba(red, green, blue, _)) = actual else {
@@ -56,7 +56,7 @@ mod tests {
 	fn polar_coordinates_match_cartesian_oklab() {
 		let chroma = 0.2_f32;
 		let hue = 60.0_f32.to_radians();
-		let (red, green, blue) = super::oklab::to_srgb(0.5, chroma * hue.cos(), chroma * hue.sin());
+		let (red, green, blue) = to_srgb(0.5, chroma * hue.cos(), chroma * hue.sin());
 		assert_eq!(parse("0.5 0.2 60deg"), Some(CssColor::rgb(red, green, blue)));
 	}
 

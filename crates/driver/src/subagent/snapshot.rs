@@ -1,6 +1,6 @@
 //! Monotonic child snapshot attenuation and reasoning-effort resolution.
 
-use std::{path::Path, sync::Arc};
+use std::{ffi, path::Path, sync::Arc};
 
 use omp_agent::{AgentDefinition, AgentSnapshot};
 use omp_core::Str;
@@ -196,8 +196,7 @@ fn tool_allowed(name: &str, options: &ChildSnapshotOptions<'_>) -> bool {
 }
 
 fn context_applies(path: &Path, cwd: &Path) -> bool {
-	if path.file_name().and_then(std::ffi::OsStr::to_str) != Some("AGENTS.md") || path.is_relative()
-	{
+	if path.file_name().and_then(ffi::OsStr::to_str) != Some("AGENTS.md") || path.is_relative() {
 		return true;
 	}
 	path.parent().is_some_and(|parent| cwd.starts_with(parent))

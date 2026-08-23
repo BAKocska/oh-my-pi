@@ -4,12 +4,17 @@
 //! decoders, and utilities for formatting and parsing hex strings.
 
 use core::{mem::MaybeUninit, slice, str};
-use std::{cmp::Ordering, fmt, io, iter::FusedIterator};
+use std::{
+	cmp::Ordering,
+	fmt::{self, Display},
+	hint, io,
+	iter::FusedIterator,
+};
 
 use bytes::{BufMut, Bytes};
 
-use super::fixed_arr::serialize;
 pub use super::{Array, ArrayStr, DecodeError, Result};
+use super::{ascii_to_str, ascii_to_str_owned, fixed_arr::serialize, format_with_precision};
 
 // ============================================================================
 // HEX DECODER
@@ -323,7 +328,7 @@ impl<const N: usize> TryFrom<Decoder<'_>> for [u8; N] {
 	}
 }
 
-impl fmt::Display for Decoder<'_> {
+impl Display for Decoder<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		for byte in self.clone() {
 			if let Ok(byte) = byte {
@@ -492,7 +497,7 @@ pub const fn parse_nibble(b: u8) -> Option<u8> {
 	if v.cast_signed() >= 0 {
 		Some(v)
 	} else {
-		std::hint::cold_path();
+		hint::cold_path();
 		None
 	}
 }
@@ -513,7 +518,7 @@ pub const fn parse_byte([h, l]: [u8; 2]) -> Result<u8> {
 	if (hv | lv).cast_signed() >= 0 {
 		Ok((hv << 4) | lv)
 	} else {
-		std::hint::cold_path();
+		hint::cold_path();
 		let inv = if hv.cast_signed() >= 0 { l } else { h };
 		Err(DecodeError::InvalidCharacter(inv))
 	}
@@ -753,7 +758,7 @@ impl<'a> Encoder<'a> {
 
 	/// Collects into a String.
 	pub fn into_string(self) -> String {
-		super::ascii_to_str_owned(self.into_vec())
+		ascii_to_str_owned(self.into_vec())
 	}
 
 	/// Extends into an existing buffer.
@@ -843,7 +848,7 @@ impl<'a> Encoder<'a> {
 	/// Writes to a `fmt::Write`.
 	pub fn format_into<W: fmt::Write + ?Sized>(self, writer: &mut W) -> fmt::Result {
 		for bytes in self {
-			writer.write_str(super::ascii_to_str(&[bytes]))?;
+			writer.write_str(ascii_to_str(&[bytes]))?;
 		}
 		Ok(())
 	}
@@ -933,21 +938,21 @@ impl ExactSizeIterator for Encoder<'_> {
 
 impl FusedIterator for Encoder<'_> {}
 
-impl fmt::Display for Encoder<'_> {
+impl Display for Encoder<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		super::format_with_precision(self.clone(), f)
+		format_with_precision(self.clone(), f)
 	}
 }
 
 impl fmt::LowerHex for Encoder<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		fmt::Display::fmt(&self.clone().lower(), f)
+		Display::fmt(&self.clone().lower(), f)
 	}
 }
 
 impl fmt::UpperHex for Encoder<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		fmt::Display::fmt(&self.clone().upper(), f)
+		Display::fmt(&self.clone().upper(), f)
 	}
 }
 

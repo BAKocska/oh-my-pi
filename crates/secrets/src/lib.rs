@@ -26,6 +26,8 @@ pub mod stream;
 /// Origin-aware fixed-point text transforms.
 pub mod tracked;
 
+use std::mem;
+
 use obfuscator::SecretObfuscator;
 use rule::SecretRule;
 
@@ -112,7 +114,7 @@ impl SecretMaskingAuthority {
 			.lock()
 			.map_err(|_| SecretMaskingError::Unavailable)?;
 		if !state.sealed {
-			let rules = std::mem::take(&mut state.rules);
+			let rules = mem::take(&mut state.rules);
 			state.transform = Some(SecretObfuscator::new(rules, self.key.clone()));
 			state.sealed = true;
 		}

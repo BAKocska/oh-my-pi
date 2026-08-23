@@ -1,5 +1,7 @@
 //! Stateful line tokenization.
 
+use std::iter;
+
 use omp_core::{Str, StrMut};
 
 use crate::{
@@ -181,7 +183,7 @@ impl Token {
 
 /// Lazily splits LF or CRLF text into physical lines without retaining
 /// terminators.
-pub fn split_hashline_lines(text: &str) -> impl Clone + std::iter::FusedIterator<Item = &str> {
+pub fn split_hashline_lines(text: &str) -> impl Clone + iter::FusedIterator<Item = &str> {
 	text
 		.split_terminator('\n')
 		.map(|line| line.strip_suffix('\r').unwrap_or(line))

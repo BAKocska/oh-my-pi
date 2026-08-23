@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use omp_agent::{BandHash, PromptError, PromptSource, SlotClass, SlotDecl, SlotId};
 use omp_core::{Hash32, hash32::Hasher};
+use omp_envd::worker::ExtHostSpec;
 use omp_scribe::Props;
 use parking_lot::Mutex;
 
@@ -100,7 +101,7 @@ impl ProductionPromptHead {
 	/// Class and priority properties are used when present; otherwise the
 	/// canonical extension slot catalog supplies the class and priority zero.
 	/// A malformed declared class fails closed as frozen.
-	pub fn from_extension_specs(specs: &[omp_envd::worker::ExtHostSpec]) -> Self {
+	pub fn from_extension_specs(specs: &[ExtHostSpec]) -> Self {
 		let declarations = specs
 			.iter()
 			.flat_map(|spec| {

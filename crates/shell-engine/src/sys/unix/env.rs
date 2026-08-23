@@ -1,5 +1,6 @@
 //! Environment variable retrieval for Unix platforms.
 
+use std::env;
 /// Retrieves environment variables from the host process.
 ///
 /// This is a best-effort passthrough to [`std::env::vars()`], skipping entries
@@ -7,7 +8,7 @@
 /// meaning, and a naive [`std::env::vars()`] call panics on the first one
 /// before any command can run.
 pub(crate) fn get_host_env_vars() -> impl Iterator<Item = (String, String)> {
-	std::env::vars_os().filter_map(|(key, value)| {
+	env::vars_os().filter_map(|(key, value)| {
 		let key = key.into_string().ok()?;
 		let value = value.into_string().ok()?;
 		Some((key, value))
@@ -16,7 +17,7 @@ pub(crate) fn get_host_env_vars() -> impl Iterator<Item = (String, String)> {
 
 #[cfg(test)]
 mod tests {
-	use std::os::unix::ffi::OsStrExt;
+	use std::{ffi, os::unix::ffi::OsStrExt};
 
 	use super::*;
 
@@ -29,12 +30,9 @@ mod tests {
 		// SAFETY: the corrupt + sentinel keys are unique to this test and the
 		// environment is not contended elsewhere in this process.
 		unsafe {
-			std::env::set_var(
-				"OMP_TEST_BAD_VALUE_8925",
-				std::ffi::OsStr::from_bytes(&[0x9d, 0xd9, 0x50]),
-			);
-			std::env::set_var(std::ffi::OsStr::from_bytes(b"\xffOMP_TEST_BAD_KEY_8925"), "value");
-			std::env::set_var("OMP_TEST_KEEP_8925", "kept");
+			env::set_var("OMP_TEST_BAD_VALUE_8925", ffi::OsStr::from_bytes(&[0x9d, 0xd9, 0x50]));
+			env::set_var(ffi::OsStr::from_bytes(b"\xffOMP_TEST_BAD_KEY_8925"), "value");
+			env::set_var("OMP_TEST_KEEP_8925", "kept");
 		}
 
 		let entries: Vec<(String, String)> = get_host_env_vars().collect();
@@ -60,9 +58,9 @@ mod tests {
 
 		// SAFETY: reads are done; restore the host environment.
 		unsafe {
-			std::env::remove_var("OMP_TEST_BAD_VALUE_8925");
-			std::env::remove_var(std::ffi::OsStr::from_bytes(b"\xffOMP_TEST_BAD_KEY_8925"));
-			std::env::remove_var("OMP_TEST_KEEP_8925");
+			env::remove_var("OMP_TEST_BAD_VALUE_8925");
+			env::remove_var(ffi::OsStr::from_bytes(b"\xffOMP_TEST_BAD_KEY_8925"));
+			env::remove_var("OMP_TEST_KEEP_8925");
 		}
 	}
 }

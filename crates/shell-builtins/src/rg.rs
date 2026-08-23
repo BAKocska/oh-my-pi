@@ -635,7 +635,7 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 				true
 			})
 			.map_err(|error| io::Error::other(error.to_string()))?;
-		let mut output = std::mem::take(&mut self.scratch);
+		let mut output = mem::take(&mut self.scratch);
 		let result = self.write_line(&output);
 		output.clear();
 		self.scratch = output;
@@ -935,7 +935,7 @@ fn build_pcre_matcher(host: &Host, patterns: &[String], cli: &Rg) -> Result<Pcre
 		.crlf(cli.crlf && !cli.no_crlf && !cli.null_data)
 		.utf(unicode)
 		.ucp(unicode)
-		.jit_if_available(crate::grep::pcre2_jit_enabled(host));
+		.jit_if_available(pcre2_jit_enabled(host));
 	builder
 		.build_many(patterns)
 		.map_err(|error| error.to_string())
@@ -1173,7 +1173,7 @@ impl PathFilters {
 			return false;
 		}
 		if let Some(limit) = self.max_filesize {
-			let size = size.or_else(|| std::fs::metadata(path).ok().map(|meta| meta.len() as f64));
+			let size = size.or_else(|| fs::metadata(path).ok().map(|meta| meta.len() as f64));
 			if size.is_some_and(|size| size > limit as f64) {
 				return false;
 			}
@@ -1469,13 +1469,13 @@ fn search_dir<M: Matcher, W: Write>(
 			return Ok(SearchOutcome { any_match: false, had_error: true });
 		},
 	};
-	let any_match = std::cell::Cell::new(false);
-	let had_error = std::cell::Cell::new(false);
+	let any_match = cell::Cell::new(false);
+	let had_error = cell::Cell::new(false);
 	let cancel = host.cancel_flag();
 	let mut walk_err = host.stderr_clone();
 	let streamed = match walk.request.for_each_entry_with_heartbeat(
 		|| {
-			if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+			if cancel.load(atomic::Ordering::Relaxed) {
 				Err(io::Error::from(io::ErrorKind::Interrupted))
 			} else {
 				Ok::<(), io::Error>(())
@@ -1549,7 +1549,7 @@ fn collect_filtered_files(host: &mut Host, cli: &Rg, root: &Path) -> Result<Vec<
 	let walk = build_walk(host, cli, root)?;
 	let cancel = host.cancel_flag();
 	let outcome = match walk.request.collect_with_heartbeat(|| {
-		if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+		if cancel.load(atomic::Ordering::Relaxed) {
 			Err(io::Error::from(io::ErrorKind::Interrupted))
 		} else {
 			Ok::<(), io::Error>(())
@@ -1591,7 +1591,7 @@ fn list_files<W: Write>(
 		}
 		processed_operand = true;
 		let resolved = host.resolve(operand);
-		match std::fs::metadata(&resolved) {
+		match fs::metadata(&resolved) {
 			Ok(meta) if meta.is_dir() => {
 				let mut files = match collect_filtered_files(host, cli, &resolved) {
 					Ok(files) => files,
@@ -1706,7 +1706,7 @@ fn execute_search<M: Matcher, W: Write>(
 	};
 	let recursive = paths.iter().any(|path| {
 		path.as_os_str() != OsStr::new("-")
-			&& std::fs::metadata(host.resolve(path)).is_ok_and(|meta| meta.is_dir())
+			&& fs::metadata(host.resolve(path)).is_ok_and(|meta| meta.is_dir())
 	});
 	let show_names = show_names_for(paths, recursive, cli, opts);
 	let mut stats = Stats::new();
@@ -1751,7 +1751,7 @@ fn execute_search<M: Matcher, W: Write>(
 			continue;
 		}
 		let resolved = host.resolve(operand);
-		match std::fs::metadata(&resolved) {
+		match fs::metadata(&resolved) {
 			Ok(meta) if meta.is_dir() => {
 				match search_dir(
 					host,
@@ -1952,6 +1952,10 @@ impl Utility for Rg {
 
 #[cfg(test)]
 mod tests {
+	use std::{fs, io};
+
+	use omp_shell_engine::openfiles::OpenFile;
+
 	use super::*;
 	use crate::host::{Host, run_util};
 
@@ -1963,12 +1967,12 @@ mod tests {
 	#[test]
 	fn broken_pipe_on_stdout_is_silent_and_exits_141() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("match.txt"), "hit\n").unwrap();
+		fs::write(tree.path().join("match.txt"), "hit\n").unwrap();
 		let parsed = Rg::try_parse_from(["rg", "hit", "match.txt"]).unwrap();
 		let (mut host, capture) = Host::for_test("rg", "", tree.path());
-		let (reader, writer) = std::io::pipe().unwrap();
+		let (reader, writer) = io::pipe().unwrap();
 		drop(reader);
-		host.stdout = omp_shell_engine::openfiles::OpenFile::from(writer);
+		host.stdout = OpenFile::from(writer);
 
 		let code = parsed.run(&mut host);
 
@@ -2015,9 +2019,9 @@ mod tests {
 	#[test]
 	fn ignore_file_is_resolved_against_shell_cwd() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("keep.txt"), "hit\n").unwrap();
-		std::fs::write(tree.path().join("skip.txt"), "hit\n").unwrap();
-		std::fs::write(tree.path().join("rules.ignore"), "skip.txt\n").unwrap();
+		fs::write(tree.path().join("keep.txt"), "hit\n").unwrap();
+		fs::write(tree.path().join("skip.txt"), "hit\n").unwrap();
+		fs::write(tree.path().join("rules.ignore"), "skip.txt\n").unwrap();
 		let (code, capture) =
 			run_util::<Rg>(&["--ignore-file=rules.ignore", "hit", "."], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
@@ -2028,8 +2032,8 @@ mod tests {
 	#[test]
 	fn files_mode_preserves_relative_paths() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::create_dir(tree.path().join("sub")).unwrap();
-		std::fs::write(tree.path().join("sub/file.txt"), "x\n").unwrap();
+		fs::create_dir(tree.path().join("sub")).unwrap();
+		fs::write(tree.path().join("sub/file.txt"), "x\n").unwrap();
 		let (code, capture) = run_util::<Rg>(&["--files", "sub"], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "sub/file.txt\n");
@@ -2038,8 +2042,8 @@ mod tests {
 	#[test]
 	fn recursive_walk_observes_cancellation() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::create_dir(tree.path().join("root")).unwrap();
-		std::fs::write(tree.path().join("root/file"), "hit\n").unwrap();
+		fs::create_dir(tree.path().join("root")).unwrap();
+		fs::write(tree.path().join("root/file"), "hit\n").unwrap();
 		let parsed = Rg::try_parse_from(["rg", "hit", "root"]).unwrap();
 		let (mut host, capture) = Host::for_test("rg", Vec::new(), tree.path());
 		host.cancel_for_test();
@@ -2061,12 +2065,12 @@ mod tests {
 	#[test]
 	fn encoding_and_case_insensitive_globs_apply_to_files() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("utf16.txt"), b"h\0i\0t\0\n\0").unwrap();
+		fs::write(tree.path().join("utf16.txt"), b"h\0i\0t\0\n\0").unwrap();
 		let (code, capture) =
 			run_util::<Rg>(&["--encoding=utf-16le", "hit", "utf16.txt"], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "hit\n");
-		std::fs::write(tree.path().join("UPPER.TXT"), "hit\n").unwrap();
+		fs::write(tree.path().join("UPPER.TXT"), "hit\n").unwrap();
 		let (code, capture) =
 			run_util::<Rg>(&["--glob-case-insensitive", "--glob=*.txt", "hit", "."], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
@@ -2080,7 +2084,7 @@ mod tests {
 			31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 203, 205, 44, 46, 230, 202, 200, 44, 225, 2, 0, 26, 30,
 			21, 140, 9, 0, 0, 0,
 		];
-		std::fs::write(tree.path().join("sample.gz"), gzip).unwrap();
+		fs::write(tree.path().join("sample.gz"), gzip).unwrap();
 		let (code, capture) = run_util::<Rg>(&["--search-zip", "hit", "sample.gz"], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "hit\n");
@@ -2089,7 +2093,7 @@ mod tests {
 	#[test]
 	fn line_numbers_stay_off_when_piped_unless_requested() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("a.txt"), "miss\nhit\n").unwrap();
+		fs::write(tree.path().join("a.txt"), "miss\nhit\n").unwrap();
 		let (code, capture) = run_util::<Rg>(&["hit", "."], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "a.txt:hit\n");
@@ -2104,7 +2108,7 @@ mod tests {
 	#[test]
 	fn null_terminates_paths_without_trailing_newline() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("a.txt"), "hit\n").unwrap();
+		fs::write(tree.path().join("a.txt"), "hit\n").unwrap();
 		let (code, capture) = run_util::<Rg>(&["-l0", "hit", "."], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "a.txt\0");
@@ -2145,8 +2149,8 @@ mod tests {
 	#[test]
 	fn path_separator_replaces_slash() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::create_dir(tree.path().join("sub")).unwrap();
-		std::fs::write(tree.path().join("sub/a.txt"), "hit\n").unwrap();
+		fs::create_dir(tree.path().join("sub")).unwrap();
+		fs::write(tree.path().join("sub/a.txt"), "hit\n").unwrap();
 		let (code, capture) = run_util::<Rg>(&["--path-separator", "|", "hit", "."], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "sub|a.txt:hit\n");
@@ -2157,9 +2161,11 @@ mod tests {
 	}
 }
 
+use std::{cell, fs, mem, sync::atomic};
+
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 
-use crate::host::util;
+use crate::{grep::pcre2_jit_enabled, host::util};
 
 /// Creates the ripgrep-compatible `rg` builtin registration.
 pub(crate) fn rg_builtin<SE: ShellExtensions>() -> Registration<SE> {

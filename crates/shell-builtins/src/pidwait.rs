@@ -26,15 +26,16 @@ impl builtins::Command for PidwaitCommand {
 
 #[cfg(test)]
 mod tests {
-	use std::{process::Command as ProcessCommand, time::Duration};
+	use std::{error, process::Command as ProcessCommand, time::Duration};
 
 	use omp_shell_engine::builtins::Command as _;
+	use tokio::time;
 
 	use super::PidwaitCommand;
 
 	async fn execute_bounded(
 		argv: Vec<String>,
-	) -> Result<omp_shell_engine::ExecutionResult, Box<dyn std::error::Error>> {
+	) -> Result<omp_shell_engine::ExecutionResult, Box<dyn error::Error>> {
 		let mut shell = omp_shell_engine::Shell::builder().build().await?;
 		let params = shell.default_exec_params();
 		let command = PidwaitCommand { argv };
@@ -43,13 +44,13 @@ mod tests {
 			command_name: "pidwait".to_string(),
 			params,
 		};
-		Ok(tokio::time::timeout(Duration::from_secs(2), command.execute(context))
+		Ok(time::timeout(Duration::from_secs(2), command.execute(context))
 			.await
 			.expect("pidwait exceeded its two-second test bound")?)
 	}
 
 	#[tokio::test]
-	async fn exits_one_when_nothing_matches() -> Result<(), Box<dyn std::error::Error>> {
+	async fn exits_one_when_nothing_matches() -> Result<(), Box<dyn error::Error>> {
 		let result = execute_bounded(vec!["-p".to_string(), i32::MAX.to_string()]).await?;
 
 		assert_eq!(u8::from(&result.exit_code), 1);
@@ -57,7 +58,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn already_exited_pid_returns_promptly() -> Result<(), Box<dyn std::error::Error>> {
+	async fn already_exited_pid_returns_promptly() -> Result<(), Box<dyn error::Error>> {
 		#[cfg(unix)]
 		let mut child = ProcessCommand::new("sh").args(["-c", "exit 0"]).spawn()?;
 		#[cfg(windows)]
@@ -66,7 +67,7 @@ mod tests {
 
 		// Leave the child unreaped so it remains visible in the process snapshot,
 		// while giving the trivial command enough time to reach its exited state.
-		tokio::time::sleep(Duration::from_millis(100)).await;
+		time::sleep(Duration::from_millis(100)).await;
 		let outcome = execute_bounded(vec!["-p".to_string(), pid.to_string()]).await;
 		let _ = child.kill();
 		let _ = child.wait();

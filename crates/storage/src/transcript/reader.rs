@@ -1,5 +1,7 @@
 //! Transcript loading and live-chain reconstruction.
 
+#[cfg(not(unix))]
+use std::time;
 use std::{
 	fs::{self, File, Metadata},
 	io::{self, BufRead as _, BufReader, Seek as _, SeekFrom},
@@ -716,12 +718,14 @@ struct FileIdentity {
 #[cfg(not(unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
-	created: Option<std::time::SystemTime>,
+	created: Option<time::SystemTime>,
 }
 
 #[cfg(unix)]
 fn file_identity(metadata: &Metadata) -> FileIdentity {
-	use std::os::unix::fs::MetadataExt as _;
+	use std::os;
+
+	use os::unix::fs::MetadataExt as _;
 
 	FileIdentity { device: metadata.dev(), inode: metadata.ino() }
 }

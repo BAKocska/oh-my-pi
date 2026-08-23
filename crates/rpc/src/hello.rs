@@ -111,13 +111,15 @@ async fn handshake_at(
 
 #[cfg(test)]
 mod tests {
-	use std::path::Path;
+	use std::path::{Path, PathBuf};
 
 	use omp_core::IntoStr;
 	use omp_proto::gateway::v1::gateway_server::GatewayServer;
 	use tempfile::TempDir;
 	use tonic::transport::Server;
-	use tonic_health::pb::{HealthCheckRequest, health_check_response::ServingStatus};
+	use tonic_health::pb::{
+		HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+	};
 
 	use super::*;
 	use crate::{health_service, uds};
@@ -138,7 +140,7 @@ mod tests {
 		});
 	}
 
-	fn socket(tempdir: &TempDir) -> std::path::PathBuf {
+	fn socket(tempdir: &TempDir) -> PathBuf {
 		tempdir.path().join("rpc.sock")
 	}
 
@@ -183,7 +185,7 @@ mod tests {
 		let socket = socket(&tempdir);
 		serve(&socket).await;
 		let channel = uds::connect(&socket).await.expect("client should connect");
-		let response = tonic_health::pb::health_client::HealthClient::new(channel)
+		let response = HealthClient::new(channel)
 			.check(HealthCheckRequest { service: String::new() })
 			.await
 			.expect("health check should succeed")

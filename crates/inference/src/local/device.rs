@@ -1,12 +1,14 @@
 //! Named tiny-inference device preference and safe fallback ordering.
 
+use std::env;
+
 use strum::{EnumString, IntoStaticStr};
 
 use super::{LocalError, LocalErrorKind, LocalResult};
 
 /// Stable device names accepted by `OMP_TINY_DEVICE` and settings surfaces.
 #[derive(Clone, Copy, Debug, Default, EnumString, Eq, IntoStaticStr, PartialEq)]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum TinyDevice {
 	/// Safe CPU-only default.
 	#[default]
@@ -55,7 +57,7 @@ impl TinyDevice {
 
 	/// Resolves `OMP_TINY_DEVICE`, defaulting to CPU-only inference.
 	pub fn from_environment() -> LocalResult<Self> {
-		match std::env::var_os("OMP_TINY_DEVICE") {
+		match env::var_os("OMP_TINY_DEVICE") {
 			None => Ok(Self::Cpu),
 			Some(value) => Self::parse(value.to_str().ok_or_else(|| {
 				LocalError::new(LocalErrorKind::InvalidInput, "OMP_TINY_DEVICE is not UTF-8")

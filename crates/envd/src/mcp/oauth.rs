@@ -1,6 +1,7 @@
 //! Combined MCP OAuth discovery, authorization, and refresh coordination.
 
 use std::{
+	fmt,
 	future::Future,
 	pin::Pin,
 	sync::Arc,
@@ -10,7 +11,7 @@ use std::{
 use http::HeaderMap;
 use omp_core::{SecretString, Str};
 use omp_inference::{
-	auth::{CredentialLease, HeaderPlacement},
+	auth::{self, CredentialLease, HeaderPlacement},
 	id::PrincipalId,
 };
 use omp_oauth::{
@@ -22,18 +23,20 @@ use omp_oauth::{
 	validate_redirect_pair,
 };
 use parking_lot::RwLock;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use super::{
 	auth_authority::{AuthAffinity, CombinedAuthAuthority},
-	config::McpServerConfig,
+	config::{McpServerConfig, OauthConfig},
 	http::RefreshableHeaders,
 };
 
 /// Live Streamable-HTTP header adapter backed by sealed credential leases.
 pub struct AuthorityHeaders {
 	flow:    Arc<McpOAuth>,
-	state:   tokio::sync::Mutex<OAuthCredentialState>,
+	state:   Mutex<OAuthCredentialState>,
 	lease:   RwLock<CredentialLease>,
 	headers: RwLock<HeaderMap>,
 }
@@ -52,7 +55,7 @@ impl AuthorityHeaders {
 		let headers = bearer_headers(&lease)?;
 		Ok(Arc::new(Self {
 			flow,
-			state: tokio::sync::Mutex::new(state),
+			state: Mutex::new(state),
 			lease: RwLock::new(lease),
 			headers: RwLock::new(headers),
 		}))
@@ -146,8 +149,8 @@ pub struct OAuthCredentialState {
 	pub generation:     u64,
 }
 
-impl std::fmt::Debug for OAuthCredentialState {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for OAuthCredentialState {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("OAuthCredentialState")
 			.field("affinity", &self.affinity)
@@ -416,9 +419,9 @@ pub enum OAuthFailureClass {
 
 fn callback_listener_uri(
 	default_uri: &str,
-	overrides: Option<&super::config::OauthConfig>,
+	overrides: Option<&OauthConfig>,
 ) -> Result<Str, OAuthFlowError> {
-	let mut url = url::Url::parse(default_uri).map_err(|_| OAuthFlowError::InvalidCallbackConfig)?;
+	let mut url = Url::parse(default_uri).map_err(|_| OAuthFlowError::InvalidCallbackConfig)?;
 	if let Some(port) = overrides.and_then(|oauth| oauth.callback_port) {
 		url.set_port(Some(port))
 			.map_err(|()| OAuthFlowError::InvalidCallbackConfig)?;
@@ -481,7 +484,7 @@ pub enum OAuthFlowError {
 	Browser(#[from] BrowserError),
 	/// Encrypted store update failed.
 	#[error(transparent)]
-	Store(#[from] omp_inference::auth::StoreError),
+	Store(#[from] auth::StoreError),
 	/// Encrypted-store credential acquisition failed.
 	#[error(transparent)]
 	Credential(#[from] omp_inference::auth::CredentialError),

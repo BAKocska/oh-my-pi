@@ -1,5 +1,7 @@
 //! `/autoresearch` parsing and completion contract.
 
+use std::iter;
+
 use omp_core::Str;
 
 use super::engine::ClearTree;
@@ -75,7 +77,7 @@ pub fn parse(arguments: &str) -> Result<Command, ParseError> {
 		_ => {
 			let mut unisolated = false;
 			let mut goal = Vec::new();
-			for word in std::iter::once(first).chain(words) {
+			for word in iter::once(first).chain(words) {
 				match word {
 					"--unisolated" => unisolated = true,
 					"--keep-tree" | "--reset-tree" => return Err(ParseError::TreeFlagOutsideClear),

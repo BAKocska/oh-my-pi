@@ -16,7 +16,7 @@ use crate::{
 	codec::ProviderStateEvent,
 	error::{Error, RetryAction},
 	event::ChatEvent,
-	layer::LayerCall,
+	layer::{ExecutionContext, LayerCall},
 	plan::ReplayPlan,
 	receipt::ExecutionReceipt,
 };
@@ -42,18 +42,14 @@ pub enum SessionAction {
 pub trait SessionCompletion: Send + Sync + 'static {
 	/// Incrementally records one recovered canonical event in the private
 	/// assistant-message builder.
-	fn record_chat_event(
-		&self,
-		event: &ChatEvent,
-		context: &crate::layer::ExecutionContext,
-	) -> Result<(), Error>;
+	fn record_chat_event(&self, event: &ChatEvent, context: &ExecutionContext) -> Result<(), Error>;
 	/// Atomically commits the successful turn, provider-state evidence, and any
 	/// staged terminal replay outcome.
 	fn commit(
 		&self,
 		provider_state: Vec<ProviderStateEvent>,
 		receipt: &ExecutionReceipt,
-		context: &crate::layer::ExecutionContext,
+		context: &ExecutionContext,
 	) -> Result<(), Error>;
 	/// Aborts the private draft; `retain_preparation` preserves original input
 	/// for one reseed.
@@ -63,18 +59,10 @@ pub trait SessionCompletion: Send + Sync + 'static {
 /// Selects context strategy and validates typed provider-state scope.
 pub trait SessionPlanner: Clone + Send + 'static {
 	/// Applies an initial session decision and records non-secret evidence.
-	fn prepare(
-		&self,
-		call: &mut Call,
-		context: &crate::layer::ExecutionContext,
-	) -> Result<SessionAction, Error>;
+	fn prepare(&self, call: &mut Call, context: &ExecutionContext) -> Result<SessionAction, Error>;
 	/// Removes invalid provider state and deterministically replays canonical
 	/// history.
-	fn reseed(
-		&self,
-		call: &mut Call,
-		context: &crate::layer::ExecutionContext,
-	) -> Result<(), Error> {
+	fn reseed(&self, call: &mut Call, context: &ExecutionContext) -> Result<(), Error> {
 		self.prepare(call, context).map(|_| ())
 	}
 	/// Creates the private terminal transaction after preparation. The default
@@ -82,7 +70,7 @@ pub trait SessionPlanner: Clone + Send + 'static {
 	fn completion(
 		&self,
 		_call: &Call,
-		_context: &crate::layer::ExecutionContext,
+		_context: &ExecutionContext,
 	) -> Result<Option<Arc<dyn SessionCompletion>>, Error> {
 		Ok(None)
 	}

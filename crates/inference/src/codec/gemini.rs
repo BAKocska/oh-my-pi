@@ -2,7 +2,11 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	error,
+	fmt::{self, Display},
+	str,
 	sync::Arc,
+	time,
 };
 
 use bytes::Bytes;
@@ -21,8 +25,8 @@ use crate::{
 	call::{
 		ChatRequest, ContentPart, CountTokensRequest, EmbedRequest, EmbeddingInput, HostedTool,
 		MediaInput, Message, OpaqueJson, OperationCall, ProviderProof, ReasoningRequest,
-		ReasoningVisibility, Role, SafetySetting, SafetyThreshold, Setting, StructuredOutput,
-		ToolChoice, ToolDefinition, ToolResultContent, TruncationPolicy,
+		ReasoningVisibility, Role, SafetySetting, SafetyThreshold, Sampling, Setting,
+		StructuredOutput, ToolChoice, ToolDefinition, ToolResultContent, TruncationPolicy,
 	},
 	codec::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
@@ -33,6 +37,7 @@ use crate::{
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
 	id::ToolCallId,
 	receipt::{ExecutionReceipt, ReasonId, Usage, UsageSource},
+	recovery::thinking::ThinkingFenceStripper,
 	transport::{Frame, FramingProtocol},
 };
 
@@ -502,7 +507,7 @@ impl<'de> Deserialize<'de> for GoogleSchema {
 		impl<'de> serde::de::Visitor<'de> for GoogleSchemaVisitor {
 			type Value = GoogleSchema;
 
-			fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 				formatter.write_str("a JSON Schema object")
 			}
 
@@ -1396,11 +1401,9 @@ fn proof_string(
 			"Google continuation proof belongs to a different provider or codec",
 		));
 	}
-	std::str::from_utf8(&proof.value)
-		.map(Str::new)
-		.map_err(|error| {
-			GoogleCodecError::encoding(format!("Google thought signature is not UTF-8: {error}"))
-		})
+	str::from_utf8(&proof.value).map(Str::new).map_err(|error| {
+		GoogleCodecError::encoding(format!("Google thought signature is not UTF-8: {error}"))
+	})
 }
 
 fn wire_function_arguments(args: &RawValue) -> Result<(Bytes, bool), GoogleCodecError> {
@@ -1861,7 +1864,7 @@ pub struct GeminiDecoder {
 	response_id:     Option<Str>,
 	/// Heals leaked ```` ```thinking ```` opener lines that Gemini thought
 	/// summaries emit as between-summary delimiters (pi #8719).
-	thinking_fence:  crate::recovery::thinking::ThinkingFenceStripper,
+	thinking_fence:  ThinkingFenceStripper,
 }
 
 impl GeminiDecoder {
@@ -2269,7 +2272,7 @@ fn encode_google_count_tokens(
 		verbosity:         Setting::Unset,
 		cache_retention:   Setting::Unset,
 		service_tier:      Setting::Unset,
-		sampling:          crate::call::Sampling::default(),
+		sampling:          Sampling::default(),
 		max_output_tokens: None,
 		top_logprobs:      None,
 		safety:            Arc::from([]),
@@ -3032,7 +3035,7 @@ impl GoogleCodecError {
 			match self.kind {
 				GoogleCodecErrorKind::RateLimited | GoogleCodecErrorKind::Overloaded => {
 					RetryAction::SameRoute {
-						after: std::time::Duration::from_millis(self.retry_after_ms.max(1)),
+						after: time::Duration::from_millis(self.retry_after_ms.max(1)),
 					}
 				},
 				GoogleCodecErrorKind::QuotaExhausted => RetryAction::RotateAccount,
@@ -3047,13 +3050,13 @@ impl GoogleCodecError {
 	}
 }
 
-impl std::fmt::Display for GoogleCodecError {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for GoogleCodecError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.detail.as_str())
 	}
 }
 
-impl std::error::Error for GoogleCodecError {}
+impl error::Error for GoogleCodecError {}
 
 #[cfg(test)]
 mod tests {
@@ -3062,7 +3065,7 @@ mod tests {
 	use serde_json::Value;
 
 	use super::*;
-	use crate::call::ToolInputConstraint;
+	use crate::call::{Sampling as CallSampling, ToolInputConstraint};
 
 	fn opaque(source: &str) -> OpaqueJson {
 		OpaqueJson(Arc::new(serde_json::from_str(source).expect("valid test JSON")))
@@ -3111,7 +3114,7 @@ mod tests {
 			verbosity:         Setting::Unset,
 			cache_retention:   Setting::Unset,
 			service_tier:      Setting::Unset,
-			sampling:          crate::call::Sampling::default(),
+			sampling:          CallSampling::default(),
 			max_output_tokens: None,
 			top_logprobs:      None,
 			safety:            Arc::from([]),
@@ -3672,7 +3675,7 @@ mod tests {
 					verbosity:         Setting::Unset,
 					cache_retention:   Setting::Unset,
 					service_tier:      Setting::Unset,
-					sampling:          crate::call::Sampling::default(),
+					sampling:          CallSampling::default(),
 					max_output_tokens: None,
 					top_logprobs:      None,
 					safety:            Arc::from([]),
@@ -3841,7 +3844,7 @@ mod tests {
 			verbosity:         Setting::Unset,
 			cache_retention:   Setting::Unset,
 			service_tier:      Setting::Unset,
-			sampling:          crate::call::Sampling {
+			sampling:          CallSampling {
 				temperature:        Some(0.2),
 				top_p:              Some(0.9),
 				top_k:              Some(32),

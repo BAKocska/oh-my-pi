@@ -4,7 +4,7 @@
 //! session transform. This keeps placeholder keys and restoration mappings out
 //! of payloads, receipts, URLs, and transport diagnostics.
 
-use std::{future::Future, io::Write as _};
+use std::{fmt, future::Future, io, io::Write as _, mem, sync};
 
 use bytes::BytesMut;
 use flate2::{Compression, write::GzEncoder};
@@ -25,6 +25,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use url::Url;
+use wreq::redirect;
 use zeroize::Zeroizing;
 
 use crate::{secrets::session::SecretSessionSnapshot, settings::ExportSettings};
@@ -86,7 +87,7 @@ pub enum ShareError {
 	Json(#[from] serde_json::Error),
 	/// Gzip compression failed.
 	#[error("share compression failed")]
-	Compress(#[from] std::io::Error),
+	Compress(#[from] io::Error),
 	/// Cryptographic randomness was unavailable.
 	#[error("operating system randomness is unavailable")]
 	Random,
@@ -190,7 +191,7 @@ pub trait ShareStore {
 /// authority. This never shells out to `gh`.
 pub struct DirectShareStore {
 	http_base:   Url,
-	credentials: std::sync::Arc<GithubCredentialBridge>,
+	credentials: sync::Arc<GithubCredentialBridge>,
 	client:      wreq::Client,
 }
 
@@ -198,7 +199,7 @@ impl DirectShareStore {
 	/// Constructs the production store from a validated HTTP(S) share base.
 	pub fn new(
 		http_base: &str,
-		credentials: std::sync::Arc<GithubCredentialBridge>,
+		credentials: sync::Arc<GithubCredentialBridge>,
 	) -> Result<Self, ShareError> {
 		let mut http_base = Url::parse(http_base.trim())?;
 		if !matches!(http_base.scheme(), "http" | "https")
@@ -215,7 +216,7 @@ impl DirectShareStore {
 		let path = http_base.path().trim_end_matches('/').to_owned();
 		http_base.set_path(&path);
 		let client = wreq::Client::builder()
-			.redirect(wreq::redirect::Policy::none())
+			.redirect(redirect::Policy::none())
 			.build()?;
 		Ok(Self { http_base, credentials, client })
 	}
@@ -441,15 +442,15 @@ fn percent_encode(value: &str) -> String {
 		if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
 			out.push(char::from(byte));
 		} else {
-			use std::fmt::Write as _;
+			use fmt::Write as _;
 			let _ = write!(out, "%{byte:02X}");
 		}
 	}
 	out
 }
 
-impl std::fmt::Debug for ShareProjection {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ShareProjection {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("ShareProjection")
 			.finish_non_exhaustive()
@@ -618,7 +619,7 @@ fn redact_value(value: &mut Value, redactor: &mut SecretRedactor) {
 		},
 		Value::Object(object) => {
 			let mut redacted = Map::with_capacity(object.len());
-			for (key, mut value) in std::mem::take(object) {
+			for (key, mut value) in mem::take(object) {
 				redact_value(&mut value, redactor);
 				redacted.insert(redactor.redact(&key), value);
 			}

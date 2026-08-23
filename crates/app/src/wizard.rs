@@ -1,6 +1,6 @@
 //! Retained first-run setup flow for interactive chat.
 
-use std::{path::Path, time::Duration};
+use std::{fs, path::Path, time::Duration};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_catalog::{ProviderDef, ProviderId, provider::AuthSpecKind, snapshot::Catalog};
@@ -67,7 +67,7 @@ enum AuthLocation {
 #[expect(clippy::future_not_send, reason = "the setup wizard owns a thread-confined omp_tui::App")]
 pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<Str>> {
 	let executor = omp_executor::Executor::new(None);
-	std::fs::create_dir_all(data_dir).into_diagnostic()?;
+	fs::create_dir_all(data_dir).into_diagnostic()?;
 	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;
 	let registry = omp_driver::registry::production_registry(data_dir, store)

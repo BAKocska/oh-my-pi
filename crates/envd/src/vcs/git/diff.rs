@@ -1,6 +1,6 @@
 //! Complete bounded Git status, numstat, and unified-diff read models.
 
-use std::path::Path;
+use std::{path::Path, str};
 
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -419,7 +419,7 @@ fn make_hunk(raw: &Bytes, start: usize, end: usize, range: (u64, u64, u64, u64))
 }
 
 fn parse_hunk_header(line: &[u8]) -> Option<(u64, u64, u64, u64)> {
-	let text = std::str::from_utf8(line).ok()?;
+	let text = str::from_utf8(line).ok()?;
 	let mut fields = text.split_whitespace();
 	(fields.next()? == "@@").then_some(())?;
 	let old = parse_range(fields.next()?.strip_prefix('-')?)?;
@@ -438,7 +438,7 @@ fn parse_count(bytes: &[u8]) -> Result<LineCount, CommandError> {
 	if bytes == b"-" {
 		return Ok(LineCount::Binary);
 	}
-	let text = std::str::from_utf8(bytes).map_err(|_| CommandError::NonUtf8)?;
+	let text = str::from_utf8(bytes).map_err(|_| CommandError::NonUtf8)?;
 	text
 		.parse()
 		.map(LineCount::Lines)

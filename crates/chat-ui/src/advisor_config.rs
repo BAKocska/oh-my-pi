@@ -39,9 +39,18 @@ pub enum WatchdogEditorAction {
 	/// Input was consumed while editing remains active.
 	Consumed,
 	/// Persist exact YAML to the selected WATCHDOG path.
-	Write { path: Str, yaml: Str },
+	Write {
+		/// Canonical WATCHDOG file selected when the editor was opened.
+		path: Str,
+		/// Complete block-scalar YAML serialized from the edited document.
+		yaml: Str,
+	},
 	/// Delete all known config paths after an empty document was saved.
-	Delete { paths: Arc<[Str]> },
+	Delete {
+		/// Current and legacy WATCHDOG files whose contents would otherwise
+		/// revive configuration.
+		paths: Arc<[Str]>,
+	},
 	/// Close without changing files.
 	Cancel,
 }

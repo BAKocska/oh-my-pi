@@ -67,7 +67,12 @@
 //! `<option>` accepts the same `<td>` cells and the hosting `<select>`
 //! owns cursor, filter, hover, and activation over aligned rows.
 
-use std::{num::ParseIntError, str::FromStr};
+use std::{
+	error,
+	fmt::{self, Display, Formatter},
+	num::ParseIntError,
+	str::FromStr,
+};
 
 use omp_core::{Str, StrMut};
 use strum::{EnumString, IntoStaticStr};
@@ -81,6 +86,7 @@ use crate::{
 		TextLeaf, Todo, TodoTask, Tree, TreeNode, Wizard,
 	},
 	context::{Charset, UiContext},
+	markdown,
 	props::{Prop, PropValue, Props},
 };
 
@@ -198,13 +204,13 @@ pub struct ParseError {
 	pub at:      usize,
 }
 
-impl std::fmt::Display for ParseError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ParseError {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		write!(f, "markup error at byte {}: {}", self.at, self.message)
 	}
 }
 
-impl std::error::Error for ParseError {}
+impl error::Error for ParseError {}
 
 /// Origin of a TML document.
 ///
@@ -906,7 +912,7 @@ fn in_math_span(text: &str, offset: usize) -> bool {
 		if start >= offset {
 			return false;
 		}
-		match crate::markdown::math_span(&text[start..]) {
+		match markdown::math_span(&text[start..]) {
 			Some((_, consumed)) if offset < start + consumed => return true,
 			Some((_, consumed)) => at = start + consumed,
 			None => at = start + 1,
@@ -1702,7 +1708,11 @@ impl<'a> Iterator for AttrIter<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::frame::{Color, Style};
+	use crate::{
+		Ui,
+		frame::{Color, Style},
+		test_support::frame_row_text,
+	};
 
 	fn child(node: &Cached, index: usize) -> &Cached {
 		&node.comp().children()[index]
@@ -1859,15 +1869,14 @@ mod tests {
 	#[test]
 	fn diff_markup_classifies_unified_body() {
 		let ctx = UiContext::default();
-		let ui =
-			crate::Ui::from_markup("<diff>@@ -1 +1 @@\n-old\n+new\n same</diff>", 20, ctx).unwrap();
+		let ui = Ui::from_markup("<diff>@@ -1 +1 @@\n-old\n+new\n same</diff>", 20, ctx).unwrap();
 		assert_eq!(ui.height(), 4);
 	}
 
 	#[test]
 	fn diff_markup_context_limits_unchanged_lines() {
 		let ctx = UiContext::default();
-		let ui = crate::Ui::from_markup(
+		let ui = Ui::from_markup(
 			"<diff context=1>@@ -1 +1 @@\n old far\n old near\n-old\n+new\n new near\n new far</diff>",
 			20,
 			ctx,
@@ -1877,7 +1886,7 @@ mod tests {
 		// at 20 columns each marker wraps to two rows.
 		assert_eq!(ui.height(), 9);
 		let rendered = (0..ui.height())
-			.map(|row| crate::test_support::frame_row_text(ui.frame(), row))
+			.map(|row| frame_row_text(ui.frame(), row))
 			.collect::<Vec<_>>()
 			.join("\n");
 		assert!(!rendered.contains("old far"));

@@ -11,8 +11,14 @@ use omp_proto::inference::v1::{
 	inference_server::{Inference, InferenceServer},
 };
 use parking_lot::Mutex;
-use tokio::{io::DuplexStream, task::JoinHandle};
-use tonic::transport::{Channel, Endpoint, Server};
+use tokio::{
+	io::{DuplexStream, duplex},
+	task::JoinHandle,
+};
+use tonic::{
+	transport,
+	transport::{Channel, Endpoint, Server},
+};
 use tower::service_fn;
 
 use crate::turn::{
@@ -119,7 +125,7 @@ impl InProcTurnClient {
 	where
 		S: Inference,
 	{
-		let (client_io, server_io) = tokio::io::duplex(INPROC_IO_CAPACITY);
+		let (client_io, server_io) = duplex(INPROC_IO_CAPACITY);
 		let incoming = tokio_stream::once(Ok::<DuplexStream, io::Error>(server_io));
 		let server = tokio::spawn(
 			Server::builder()
@@ -154,7 +160,7 @@ impl InProcTurnClient {
 }
 
 struct ServerTask {
-	handle: JoinHandle<Result<(), tonic::transport::Error>>,
+	handle: JoinHandle<Result<(), transport::Error>>,
 }
 
 impl Drop for ServerTask {

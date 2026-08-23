@@ -4,6 +4,7 @@
 use std::{
 	future::{Future, ready},
 	io::{self, Write},
+	sync,
 	sync::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
@@ -12,10 +13,12 @@ use std::{
 
 use async_stream::stream;
 use bytes::Bytes;
+use flume::Receiver;
 use futures::{FutureExt, Stream, StreamExt, executor::block_on};
 use omp_catalog::GrammarBits;
 use omp_core::{Hash32, Str, sf};
 use omp_inference::{Adjustment, ToolGrammarSyntax};
+use omp_proto::policy::v1;
 use omp_tool::{
 	Abort, AbortKind, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry,
 	ArgSpecRegistryError, ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails,
@@ -30,7 +33,7 @@ use omp_tool::{
 	ToolSpec, ToolTerminal, Usd, call_outcome_details,
 	render::{RenderFold, RenderRegistryError, ViewState},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser};
 use serde_json::json;
 use smallvec::smallvec;
 
@@ -1360,7 +1363,7 @@ impl Write for RecordingStage {
 
 struct RecordingSpill {
 	tx:            flume::Sender<Bytes>,
-	rx:            flume::Receiver<Bytes>,
+	rx:            Receiver<Bytes>,
 	opens:         AtomicUsize,
 	finalizes:     AtomicUsize,
 	writes:        Arc<AtomicUsize>,
@@ -1488,7 +1491,7 @@ impl Serialize for FailingSerialize {
 	where
 		S: serde::Serializer,
 	{
-		Err(serde::ser::Error::custom("injected serializer failure"))
+		Err(ser::Error::custom("injected serializer failure"))
 	}
 }
 
@@ -1684,7 +1687,7 @@ fn effects_are_exact_deny_safe_and_wire_stable() {
 	assert!(!widened.is_subset_of(&maximum));
 	assert!(!maximum.is_subset_of(&Effects::empty()));
 
-	let wire = omp_proto::policy::v1::EffectEnvelope::from(&narrowed);
+	let wire = v1::EffectEnvelope::from(&narrowed);
 	assert_eq!(wire.inference.as_ref().unwrap().max_usd, "0.5");
 	assert_eq!(Effects::try_from(&wire).unwrap(), narrowed);
 	assert_eq!(serde_json::to_string(&Usd::ZERO).unwrap(), r#""0""#);
@@ -2041,7 +2044,7 @@ fn detached_job_owner_and_generation_survive_lifecycle_projection_round_trip() {
 	let process = JobRef {
 		id:       sf!("process:web:7"),
 		owner:    JobOwner::NamedProcess { name: sf!("web"), generation: 7 },
-		metadata: std::sync::Arc::new(JobMetadata {
+		metadata: sync::Arc::new(JobMetadata {
 			kind:          JobKind::Shell,
 			status:        JobStatus::Running,
 			label:         sf!("web server"),
@@ -2085,7 +2088,7 @@ fn detached_artifact_lifetime_is_explicit_and_session_is_the_conservative_defaul
 		let job = JobRef {
 			id:       sf!("job-7"),
 			owner:    JobOwner::NamedProcess { name: sf!("render"), generation: 3 },
-			metadata: std::sync::Arc::default(),
+			metadata: sync::Arc::default(),
 			artifact: ExpectedArtifact {
 				description: sf!("rendered video"),
 				media_type: Some(sf!("video/mp4")),

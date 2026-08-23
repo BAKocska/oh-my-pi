@@ -1,24 +1,27 @@
 //! Transport-neutral contracts for one inference turn.
 
 use std::{
-	fmt,
+	error,
+	fmt::{self, Display},
 	future::Future,
 	pin::Pin,
 	task::{Context, Poll},
 	time::Duration,
 };
 
+use flume::Receiver;
 use futures::Stream;
 use omp_core::Str;
 use omp_inference::TurnId;
 use omp_proto::{
 	inference::v1::{
 		self as pb, ChatParams, ContextRef, Executor, InvokeComplete, InvokeInput, ThreadDelta,
-		TurnError, TurnEvent, TurnFrame, ValueMap,
+		TurnError, TurnEvent, TurnFrame, ValueMap, turn_error, turn_event, turn_frame, turn_request,
+		value,
 	},
 	thread::v1::Thread,
 };
-
+use tonic::transport;
 /// Internal turn property carrying a one-shot provider-reset hint.
 pub const PROVIDER_RESET_PROP: &str = "omp/session-provider-reset";
 
@@ -86,14 +89,14 @@ impl From<InvokeFrame> for TurnFrame {
 	#[inline]
 	fn from(frame: InvokeFrame) -> Self {
 		let frame = match frame {
-			InvokeFrame::Input(frame) => pb::turn_frame::Frame::Input(*frame),
-			InvokeFrame::Complete(frame) => pb::turn_frame::Frame::Complete(*frame),
+			InvokeFrame::Input(frame) => turn_frame::Frame::Input(*frame),
+			InvokeFrame::Complete(frame) => turn_frame::Frame::Complete(*frame),
 		};
 		Self { frame: Some(frame) }
 	}
 }
 
-/// Stable diagnostic codes attached to [`pb::turn_error::Kind::EmptyOutput`]
+/// Stable diagnostic codes attached to [`TurnErrorKind::EmptyOutput`]
 /// terminal errors.
 ///
 /// The arbiter classifies why a completed provider turn carried no actionable
@@ -138,7 +141,7 @@ pub enum Error {
 	/// The tonic request or response stream failed.
 	Rpc(tonic::Status),
 	/// An RPC channel could not be established.
-	Connect(tonic::transport::Error),
+	Connect(transport::Error),
 	/// The peer violated the turn framing contract.
 	Protocol(&'static str),
 	/// The local request is invalid before it reaches the service.
@@ -163,13 +166,11 @@ impl Error {
 	pub fn recovery(&self) -> Option<Recovery> {
 		match self {
 			Self::Conflict(_) | Self::NeedFull(_) => None,
-			Self::Terminal(error) => match pb::turn_error::Kind::try_from(error.kind).ok()? {
-				pb::turn_error::Kind::RateLimited => {
+			Self::Terminal(error) => match turn_error::Kind::try_from(error.kind).ok()? {
+				turn_error::Kind::RateLimited => {
 					Some(Recovery::RetryAfter(Duration::from_millis(error.retry_after_ms)))
 				},
-				pb::turn_error::Kind::Overloaded | pb::turn_error::Kind::Upstream => {
-					Some(Recovery::Backoff)
-				},
+				turn_error::Kind::Overloaded | turn_error::Kind::Upstream => Some(Recovery::Backoff),
 				_ => None,
 			},
 			Self::Rpc(_) => Some(Recovery::Backoff),
@@ -184,10 +185,9 @@ impl Error {
 	}
 
 	pub(crate) fn from_turn(error: TurnError) -> Self {
-		match pb::turn_error::Kind::try_from(error.kind).unwrap_or(pb::turn_error::Kind::Unspecified)
-		{
-			pb::turn_error::Kind::Conflict => Self::Conflict(Box::new(error)),
-			pb::turn_error::Kind::NeedFull => Self::NeedFull(Box::new(error)),
+		match turn_error::Kind::try_from(error.kind).unwrap_or(turn_error::Kind::Unspecified) {
+			turn_error::Kind::Conflict => Self::Conflict(Box::new(error)),
+			turn_error::Kind::NeedFull => Self::NeedFull(Box::new(error)),
 			_ => Self::Terminal(Box::new(error)),
 		}
 	}
@@ -195,11 +195,11 @@ impl Error {
 
 impl fmt::Debug for Error {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		fmt::Display::fmt(self, formatter)
+		Display::fmt(self, formatter)
 	}
 }
 
-impl fmt::Display for Error {
+impl Display for Error {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Conflict(_) => formatter.write_str("turn context conflict"),
@@ -208,8 +208,8 @@ impl fmt::Display for Error {
 				write!(
 					formatter,
 					"terminal turn error ({:?})",
-					pb::turn_error::Kind::try_from(error.kind)
-						.unwrap_or(pb::turn_error::Kind::Unspecified)
+					omp_proto::inference::v1::turn_error::Kind::try_from(error.kind)
+						.unwrap_or(omp_proto::inference::v1::turn_error::Kind::Unspecified)
 				)?;
 				if !error.detail.is_empty() {
 					write!(formatter, ": {}", error.detail)?;
@@ -231,7 +231,7 @@ impl fmt::Display for Error {
 	}
 }
 
-impl std::error::Error for Error {}
+impl error::Error for Error {}
 
 impl From<tonic::Status> for Error {
 	#[inline]
@@ -240,9 +240,9 @@ impl From<tonic::Status> for Error {
 	}
 }
 
-impl From<tonic::transport::Error> for Error {
+impl From<transport::Error> for Error {
 	#[inline]
-	fn from(error: tonic::transport::Error) -> Self {
+	fn from(error: transport::Error) -> Self {
 		Self::Connect(error)
 	}
 }
@@ -297,14 +297,14 @@ pub fn open_frame(
 	}
 
 	let input = match input {
-		TurnInput::Full(thread) => pb::turn_request::Input::Seed(pb::Seed {
+		TurnInput::Full(thread) => turn_request::Input::Seed(pb::Seed {
 			context_id: options
 				.context_id
 				.as_ref()
 				.map_or_else(String::new, |id| id.as_str().to_owned()),
 			thread:     Some(thread),
 		}),
-		TurnInput::Delta(context, delta) => pb::turn_request::Input::Incremental(pb::Incremental {
+		TurnInput::Delta(context, delta) => turn_request::Input::Incremental(pb::Incremental {
 			context: Some(context),
 			delta:   Some(delta),
 		}),
@@ -314,12 +314,10 @@ pub fn open_frame(
 		props
 			.get_or_insert_default()
 			.fields
-			.insert(PROVIDER_RESET_PROP.to_owned(), pb::Value {
-				kind: Some(pb::value::Kind::Bool(true)),
-			});
+			.insert(PROVIDER_RESET_PROP.to_owned(), pb::Value { kind: Some(value::Kind::Bool(true)) });
 	}
 	Ok(TurnFrame {
-		frame: Some(pb::turn_frame::Frame::Open(pb::TurnRequest {
+		frame: Some(turn_frame::Frame::Open(pb::TurnRequest {
 			turn_id: turn_id.as_str().to_owned(),
 			input: Some(input),
 			params: Some(options.params.clone()),
@@ -330,7 +328,7 @@ pub fn open_frame(
 }
 
 pub fn invocation_stream(
-	receiver: flume::Receiver<TurnFrame>,
+	receiver: Receiver<TurnFrame>,
 ) -> impl Stream<Item = TurnFrame> + Send + 'static {
 	futures::stream::unfold(receiver, |receiver| async move {
 		let frame = receiver.recv_async().await.ok()?;
@@ -366,11 +364,11 @@ impl Stream for EventStream<'_> {
 				Poll::Ready(Some(Err(Error::Rpc(status))))
 			},
 			Poll::Ready(Some(Ok(event))) => match event.event {
-				Some(pb::turn_event::Event::Error(error)) => {
+				Some(turn_event::Event::Error(error)) => {
 					*self.terminal = true;
 					Poll::Ready(Some(Err(Error::from_turn(error))))
 				},
-				event @ Some(pb::turn_event::Event::Outcome(_)) => {
+				event @ Some(turn_event::Event::Outcome(_)) => {
 					*self.terminal = true;
 					Poll::Ready(Some(Ok(TurnEvent { event })))
 				},

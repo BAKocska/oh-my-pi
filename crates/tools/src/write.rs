@@ -2,7 +2,8 @@
 
 use std::{
 	collections::BTreeMap,
-	fmt::{self, Write as _},
+	fmt::{self, Display, Write as _},
+	future,
 	future::Future,
 	sync::{
 		Arc,
@@ -24,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+	edit::FormatPolicy,
 	path::{HostPaths, normalize_target},
 	read::{
 		conflicts::{
@@ -32,6 +34,7 @@ use crate::{
 		},
 		mutation::{ResourceMutationReceipt, ResourceMutationRequest, route_resource_mutation},
 		resolver::Scheme,
+		selector,
 		selector::{LiteralPathProbe, parse_uri},
 	},
 	render::TextProjection,
@@ -152,7 +155,7 @@ pub struct PlainWriteRequest {
 	/// Exact text to persist, after display-prefix stripping.
 	pub content:       Str,
 	/// Frozen formatter policy for this transaction.
-	pub format_policy: crate::edit::FormatPolicy,
+	pub format_policy: FormatPolicy,
 }
 
 /// Resource-owned truth returned after one atomic plain-file transaction.
@@ -283,7 +286,7 @@ pub enum Fault {
 	},
 }
 
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::UnsupportedScheme { scheme } => {
@@ -421,7 +424,7 @@ pub trait WriteDocuments: Send + Sync + 'static {
 		_request: ResourceMutationRequest,
 	) -> impl Future<Output = Result<Option<ResourceMutationReceipt>, WriteCommitError>> + Send + '_
 	{
-		std::future::ready(Ok(None))
+		future::ready(Ok(None))
 	}
 
 	/// Probe the exact literal spelling without following a trailing read
@@ -447,7 +450,7 @@ pub trait WriteDocuments: Send + Sync + 'static {
 		&self,
 		_request: ConflictSpliceRequest,
 	) -> impl Future<Output = Result<Option<ConflictSpliceResult>, WriteCommitError>> + Send + '_ {
-		std::future::ready(Ok(None))
+		future::ready(Ok(None))
 	}
 
 	/// Preflights every selected block for one file and commits the resulting
@@ -457,7 +460,7 @@ pub trait WriteDocuments: Send + Sync + 'static {
 		_request: ConflictBulkFileRequest,
 	) -> impl Future<Output = Result<Option<ConflictBulkFileResult>, WriteCommitError>> + Send + '_
 	{
-		std::future::ready(Ok(None))
+		future::ready(Ok(None))
 	}
 	/// Attempts an archive-member write after commitment. Implementations MUST
 	/// honor `control` and call [`SpecialWriteControl::begin_effects`] before
@@ -469,7 +472,7 @@ pub trait WriteDocuments: Send + Sync + 'static {
 		_control: SpecialWriteControl,
 	) -> impl Future<Output = Result<Option<backends::ResultPayload>, backends::Fault>> + Send + '_
 	{
-		std::future::ready(Ok(None))
+		future::ready(Ok(None))
 	}
 
 	/// Attempts a SQLite-row mutation after archive dispatch. Implementations
@@ -483,7 +486,7 @@ pub trait WriteDocuments: Send + Sync + 'static {
 		_control: SpecialWriteControl,
 	) -> impl Future<Output = Result<Option<backends::ResultPayload>, backends::Fault>> + Send + '_
 	{
-		std::future::ready(Ok(None))
+		future::ready(Ok(None))
 	}
 }
 
@@ -491,7 +494,7 @@ pub trait WriteDocuments: Send + Sync + 'static {
 pub struct WriteTool<D> {
 	documents:     D,
 	conflicts:     Arc<ConflictRegistry>,
-	format_policy: crate::edit::FormatPolicy,
+	format_policy: FormatPolicy,
 	spec:          ToolSpec,
 }
 
@@ -505,14 +508,14 @@ pub fn tool_with_conflicts<D: WriteDocuments>(
 	documents: D,
 	conflicts: Arc<ConflictRegistry>,
 ) -> WriteTool<D> {
-	tool_with_policy_and_conflicts(documents, conflicts, crate::edit::FormatPolicy::BestEffort)
+	tool_with_policy_and_conflicts(documents, conflicts, FormatPolicy::BestEffort)
 }
 
 /// Constructs `write@1` with frozen formatting policy and shared conflicts.
 pub fn tool_with_policy_and_conflicts<D: WriteDocuments>(
 	documents: D,
 	conflicts: Arc<ConflictRegistry>,
-	format_policy: crate::edit::FormatPolicy,
+	format_policy: FormatPolicy,
 ) -> WriteTool<D> {
 	WriteTool {
 		documents,
@@ -1163,7 +1166,7 @@ fn read_selector_list_misfire(target: &str) -> Option<usize> {
 	for segment in target.split(';') {
 		let trimmed = segment.trim();
 		if trimmed.is_empty()
-			|| crate::read::selector::split_path_and_selector(trimmed)
+			|| selector::split_path_and_selector(trimmed)
 				.selector
 				.is_none()
 		{

@@ -1,4 +1,5 @@
 use std::{
+	mem,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -362,7 +363,7 @@ fn cloud_code_request(
 fn json_body<T: Serialize>(value: &T) -> Result<SecretString, OAuthError> {
 	let mut body =
 		Zeroizing::new(serde_json::to_string(value).map_err(|_| OAuthError::MalformedResponse)?);
-	Ok(SecretString::from(std::mem::take(&mut *body)))
+	Ok(SecretString::from(mem::take(&mut *body)))
 }
 
 #[cfg(test)]
@@ -371,6 +372,7 @@ mod tests {
 
 	use futures::FutureExt;
 	use parking_lot::Mutex;
+	use url::Url;
 
 	use super::*;
 	use crate::{
@@ -555,7 +557,7 @@ mod tests {
 			else {
 				panic!("callback prompt expected");
 			};
-			let authorization = url::Url::parse(&url).expect("authorization URL parses");
+			let authorization = Url::parse(&url).expect("authorization URL parses");
 			let state = authorization
 				.query_pairs()
 				.find(|(name, _)| name == "state")

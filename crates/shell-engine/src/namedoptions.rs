@@ -1,6 +1,6 @@
 //! Defines shell options.
 
-use std::{collections::HashMap, sync::LazyLock};
+use std::{collections::HashMap, iter, sync::LazyLock};
 
 use crate::options::RuntimeOptions;
 
@@ -88,8 +88,7 @@ impl ShellOptionSet {
 	/// Returns an iterator over the options defined in this set.
 	pub fn iter(
 		&self,
-	) -> impl Iterator<Item = ShellOption> + ExactSizeIterator + Clone + std::iter::FusedIterator + '_
-	{
+	) -> impl Iterator<Item = ShellOption> + ExactSizeIterator + Clone + iter::FusedIterator + '_ {
 		self
 			.inner
 			.iter()

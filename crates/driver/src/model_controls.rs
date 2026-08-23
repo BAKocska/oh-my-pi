@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	net, ops,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -9,17 +10,28 @@ use std::{
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::StreamExt as _;
-use omp_catalog::{ModelKey, ThinkingEffort};
+use http::header::{HeaderName, HeaderValue};
+use omp_catalog::{
+	AccountScope, AuthSpecKind, CredentialSourceSpec, EndpointSpec, ModelKey, ProvenanceKind,
+	ThinkingEffort, capability,
+	capability::{AudioFormatBits, SearchFeatureBits},
+	provider::CodexTransportPreference,
+	snapshot,
+};
 use omp_core::{InvocationPhase, LifecyclePhase, Str, sf};
 use omp_envd::exthost::control::{
 	ControlAuthority, ControlAuthorityFactory, ControlCompositionError, ControlConnectionIdentity,
 	ControlEffect, ControlProtocolError, ControlRequestContext,
 };
+use omp_inference::{call, layer::stack::BuiltinConfig};
 use omp_storage::blob::{BlobRef, BlobStore};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use url::Url;
+
+use crate::chat::ProviderApplicationOwner;
 
 /// Direction for model and role cycling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,103 +219,183 @@ fn cycle_index(current: usize, len: usize, direction: CycleDirection) -> usize {
 /// Stable catalog projection consumed by `omp.provider.models`.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderModelCard {
+	/// Stable normalized catalog key used to select this deployment.
 	pub id:                Str,
+	/// Provider owning the first eligible route selected in catalog order.
 	pub provider:          Str,
+	/// Normalized model key passed through the provider protocol.
 	pub model:             Str,
+	/// Human-readable catalog display name.
 	pub name:              Str,
+	/// Normalized vendor lineage, or `None` when the catalog has no class.
 	pub family:            Option<Str>,
+	/// Supported operation names, such as `chat`, `speak`, or `image_gen`.
 	pub facets:            Box<[Str]>,
+	/// Supported chat input modalities; empty means the catalog has no
+	/// constraints.
 	pub inputs:            Box<[Str]>,
+	/// Output modalities derived from the model's declared operations.
 	pub outputs:           Box<[Str]>,
+	/// Whether the catalog attaches a reasoning policy to the model.
 	pub reasoning:         bool,
+	/// Reasoning effort names in the attached policy; empty when reasoning is
+	/// absent.
 	pub efforts:           Box<[Str]>,
+	/// Total input-plus-output context capacity in tokens, or `None` when
+	/// unknown.
 	pub context_window:    Option<u64>,
+	/// Maximum generated output in tokens, or `None` when unknown.
 	pub max_output_tokens: Option<u64>,
+	/// Settled catalog prices, with one entry per billing dimension.
 	pub pricing:           Box<[ProviderPrice]>,
+	/// Snake-case catalog availability state controlling model selection.
 	pub availability:      Str,
+	/// Winning provenance class: `1` bundled, `2` discovered, or `3` configured.
 	pub source:            u8,
+	/// Temporary selection block expiry in Unix milliseconds, or `None`.
 	pub blocked_until_ms:  Option<u64>,
+	/// Whether the winning catalog evidence marks the deployment deprecated.
 	pub deprecated:        bool,
+	/// Latest known provider update time in Unix milliseconds, or `None`.
 	pub updated_at_ms:     Option<u64>,
+	/// `Some(false)` when tools are explicitly unsupported; `None` means
+	/// unspecified.
 	pub supports_tools:    Option<bool>,
+	/// Reserved provider-specific properties; the built-in projection leaves
+	/// this empty.
 	pub props:             Map<String, Value>,
 }
 
 /// One settled catalog price component.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderPrice {
+	/// Serialized billing dimension, such as tokens, requests, or media
+	/// duration.
 	pub unit:      Str,
+	/// Charge for one billing unit in billionths of a US dollar.
 	pub nanos_usd: u64,
 }
 
 /// Resumable catalog position.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderCatalogCursor {
+	/// Opaque catalog-revision bytes that identify the snapshot lineage.
 	pub epoch:      Box<[u8]>,
+	/// Registry generation paired with the epoch to detect stale snapshots.
 	pub generation: u64,
 }
 
 /// One ordered model-catalog delta.
 #[derive(Clone, Debug)]
 pub enum ProviderModelEvent {
-	Upsert { cursor: ProviderCatalogCursor, card: ProviderModelCard },
-	Remove { cursor: ProviderCatalogCursor, id: Str },
-	Reset { cursor: ProviderCatalogCursor },
+	/// Inserts or replaces a model card at the supplied catalog position.
+	Upsert {
+		/// Catalog position after applying this replacement.
+		cursor: ProviderCatalogCursor,
+		/// Complete replacement card keyed by its stable `id`.
+		card:   ProviderModelCard,
+	},
+	/// Removes a model key at the supplied catalog position.
+	Remove {
+		/// Catalog position after applying this removal.
+		cursor: ProviderCatalogCursor,
+		/// Stable normalized key of the model to remove.
+		id:     Str,
+	},
+	/// Invalidates all prior cards so consumers rebuild from subsequent upserts.
+	Reset {
+		/// Catalog position from which the replacement snapshot begins.
+		cursor: ProviderCatalogCursor,
+	},
 }
 
 /// Complete non-secret frozen provider declaration.
 #[derive(Clone, Debug)]
 pub struct ProviderDeclarationDocument {
+	/// Stable provider identity, which must match the document's `id`.
 	pub provider: Str,
+	/// Complete provider specification used to rebuild the runtime catalog.
 	pub document: Value,
 }
 
 /// Closed provider request vocabulary admitted by Python.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderRequestKind {
+	/// Generates one or more images and stores final artifacts in the
+	/// application blob owner.
 	GenerateImage,
+	/// Synthesizes text to encoded audio for a declared provider model.
 	Speak,
+	/// Transcribes an application-owned audio blob with a declared provider
+	/// model.
 	Transcribe,
+	/// Mints a single-use, application-owned realtime transport lease.
 	Realtime,
 }
 
 /// Exact provider request passed to the application inference facade.
 #[derive(Clone, Debug)]
 pub struct ProviderControlRequest {
+	/// Provider to target; the caller must own its runtime declaration.
 	pub provider:  Str,
+	/// Media operation that determines payload validation and lowering defaults.
 	pub operation: ProviderRequestKind,
+	/// Operation-specific values; unsupported keys are rejected rather than
+	/// merged.
 	pub payload:   Map<String, Value>,
 }
 
 /// Blob reference whose bytes remain in the application blob owner.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderBlobRef {
+	/// Lowercase hexadecimal content hash understood by the application blob
+	/// store.
 	pub hash: Str,
+	/// Exact blob length in bytes, used with the hash to reopen the content.
 	pub size: u64,
 }
 
 /// Typed provider request settlement.
 #[derive(Clone, Debug)]
 pub enum ProviderControlResult {
+	/// Final image artifacts and their settled provider charge.
 	Image {
+		/// Non-empty final artifacts stored in the application blob owner.
 		images:         Box<[ProviderBlobRef]>,
+		/// Total settled charge in billionths of a US dollar.
 		cost_nanos_usd: u64,
 	},
+	/// Encoded speech artifact, selected format, and settled provider charge.
 	Speech {
+		/// Complete encoded audio stored in the application blob owner.
 		audio:          ProviderBlobRef,
+		/// Requested audio format, defaulting to `mp3` when none was supplied.
 		format:         Str,
+		/// Total settled charge in billionths of a US dollar.
 		cost_nanos_usd: u64,
 	},
+	/// Final transcript, optional detected language, and settled provider
+	/// charge.
 	Transcription {
+		/// Final provider-settled transcript, excluding streaming deltas.
 		text:           Str,
+		/// Provider-detected language identifier, or `None` when not reported.
 		language:       Option<Str>,
+		/// Total settled charge in billionths of a US dollar.
 		cost_nanos_usd: u64,
 	},
+	/// Single-use realtime session coordinates owned by the application.
 	Realtime {
+		/// Opaque lease identifier, currently identical to `endpoint`.
 		id:            Str,
+		/// Application endpoint identifier used to claim the transport session.
 		endpoint:      Str,
+		/// Single-use credential required alongside the endpoint identifier.
 		credential:    Str,
+		/// Lease expiry as Unix time in milliseconds, defaulting to 30 minutes
+		/// after minting.
 		expires_at_ms: u64,
+		/// Transport protocol name; realtime leases currently use `websocket`.
 		transport:     Str,
 	},
 }
@@ -311,20 +403,32 @@ pub enum ProviderControlResult {
 /// Structured failure from the real provider owner.
 #[derive(Clone, Debug, Error)]
 pub enum ProviderControlError {
+	/// The caller does not own the declaration or realtime lease it addressed.
 	#[error("provider operation is not authorized")]
 	Authorization,
+	/// A new declaration collides with an existing built-in or runtime provider.
 	#[error("provider declaration conflicts with an existing owner")]
 	Conflict,
+	/// The supplied declaration could not be parsed or compiled into the
+	/// catalog.
 	#[error("provider declaration is invalid: {0}")]
 	InvalidDeclaration(Str),
+	/// The owned provider declares neither management nor model support for the
+	/// operation.
 	#[error("provider capability is not declared")]
 	CapabilityDenied,
+	/// The requested provider, model, lease, or catalog resource does not exist.
 	#[error("provider resource is not found")]
 	NotFound,
+	/// The provider requires an account but no authenticated principal is
+	/// available.
 	#[error("provider is not authenticated")]
 	Unauthenticated,
+	/// A gateway mutation expected an older catalog generation than the current
+	/// one.
 	#[error("provider catalog generation is stale")]
 	StaleGeneration,
+	/// Request validation, inference routing, transport, or settlement failed.
 	#[error("{0}")]
 	Request(Str),
 }
@@ -372,9 +476,9 @@ struct ProviderApplicationState {
 /// production dependencies, preserving credential, account, admission, and
 /// conversation-session owners.
 pub struct ProductionProviderApplicationOwner {
-	base_catalog: Arc<omp_catalog::snapshot::Catalog>,
+	base_catalog: Arc<snapshot::Catalog>,
 	registry:     omp_inference::RegistryHandle,
-	builtins:     omp_inference::layer::stack::BuiltinConfig,
+	builtins:     BuiltinConfig,
 	blobs:        BlobStore,
 	state:        Mutex<ProviderApplicationState>,
 }
@@ -384,7 +488,7 @@ impl ProductionProviderApplicationOwner {
 	/// and the application blob owner.
 	pub fn new(
 		registry: omp_inference::Registry,
-		builtins: omp_inference::layer::stack::BuiltinConfig,
+		builtins: BuiltinConfig,
 		blobs: BlobStore,
 	) -> Self {
 		let base_catalog = Arc::new(registry.catalog().clone());
@@ -449,7 +553,7 @@ impl ProductionProviderApplicationOwner {
 
 	fn registry_snapshot(&self) -> omp_inference::Registry {
 		let snapshot = self.registry.load();
-		std::ops::Deref::deref(&snapshot).clone()
+		ops::Deref::deref(&snapshot).clone()
 	}
 
 	fn rebuild(
@@ -552,7 +656,7 @@ impl ProductionProviderApplicationOwner {
 		match answer.body {
 			omp_inference::AnswerBody::Images(mut stream) => {
 				let mut images = Vec::new();
-				let mut completed_cost = None;
+				let completed_cost = None;
 				while let Some(event) = stream.next().await {
 					match event.map_err(provider_inference_error)? {
 						omp_inference::GenerationEvent::Artifact(image) => {
@@ -692,7 +796,7 @@ impl ProductionProviderApplicationOwner {
 }
 
 #[async_trait]
-impl crate::chat::ProviderApplicationOwner for ProductionProviderApplicationOwner {
+impl ProviderApplicationOwner for ProductionProviderApplicationOwner {
 	fn registry(&self) -> omp_inference::Registry {
 		self.registry_snapshot()
 	}
@@ -1084,7 +1188,7 @@ struct RawRealtimeCaps {
 /// records. The compiler accepts only routes supported by the production
 /// composer and never invents credential or trust policy.
 pub fn lower_provider_declaration(
-	base: &omp_catalog::snapshot::Catalog,
+	base: &snapshot::Catalog,
 	declaration: &ProviderDeclarationDocument,
 ) -> Result<omp_catalog::RuntimeProviderRecords, ProviderControlError> {
 	let raw: RawProviderSpec = serde_json::from_value(declaration.document.clone())
@@ -1187,7 +1291,7 @@ pub fn lower_provider_declaration(
 			codec_profile: parse_codec_profile(&raw_route.codec_profile)?,
 			codec: omp_catalog::CodecId::from(codec),
 			transport,
-			endpoint: omp_catalog::provider::EndpointSpec {
+			endpoint: EndpointSpec {
 				base_url: Str::from(raw_route.base_url.as_str()),
 				region:   raw_route.region.as_deref().map(Str::from),
 			},
@@ -1196,7 +1300,7 @@ pub fn lower_provider_declaration(
 			discovery: None,
 			capability_limits: limits,
 			trust_domain: trust,
-			codex_transport: omp_catalog::provider::CodexTransportPreference::HttpOnly,
+			codex_transport: CodexTransportPreference::HttpOnly,
 			use_responses_lite: None,
 			priority: raw_route.priority,
 		});
@@ -1306,7 +1410,7 @@ pub fn lower_provider_declaration(
 			availability: omp_catalog::ModelAvailability::Available,
 			provenance: omp_catalog::ModelProvenance {
 				sources:          Box::new([omp_catalog::ProvenanceSource {
-					kind:           omp_catalog::ProvenanceKind::Configured,
+					kind:           ProvenanceKind::Configured,
 					origin:         declaration.provider.clone(),
 					revision:       None,
 					confidence:     omp_catalog::EvidenceConfidence::Declared,
@@ -1424,8 +1528,8 @@ fn compile_trust(
 	route: &RawRouteSpec,
 	transport: omp_catalog::TransportKind,
 ) -> Result<omp_catalog::TrustDomain, ProviderControlError> {
-	let url = url::Url::parse(&route.base_url)
-		.map_err(|_| invalid_declaration("route base URL is invalid"))?;
+	let url =
+		Url::parse(&route.base_url).map_err(|_| invalid_declaration("route base URL is invalid"))?;
 	let scheme = url.scheme();
 	if transport != omp_catalog::TransportKind::Websocket && !matches!(scheme, "https" | "http") {
 		return Err(invalid_declaration("HTTP route has a non-HTTP URL"));
@@ -1438,7 +1542,7 @@ fn compile_trust(
 	let loopback = url.host_str().is_some_and(|host| {
 		host.eq_ignore_ascii_case("localhost")
 			|| host
-				.parse::<std::net::IpAddr>()
+				.parse::<net::IpAddr>()
 				.is_ok_and(|address| address.is_loopback())
 	});
 	let plaintext = matches!(scheme, "http" | "ws");
@@ -1472,9 +1576,9 @@ fn compile_trust(
 
 fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), ProviderControlError> {
 	for (name, value) in headers {
-		let parsed = http::header::HeaderName::from_bytes(name.as_bytes())
+		let parsed = HeaderName::from_bytes(name.as_bytes())
 			.map_err(|_| invalid_declaration("static provider header name is invalid"))?;
-		http::header::HeaderValue::from_bytes(value.as_bytes())
+		HeaderValue::from_bytes(value.as_bytes())
 			.map_err(|_| invalid_declaration("static provider header value is invalid"))?;
 		if parsed == http::header::AUTHORIZATION
 			|| parsed == http::header::COOKIE
@@ -1500,11 +1604,11 @@ fn compile_auth(
 		));
 	}
 	let kind = match raw.mode.as_str() {
-		"none" => omp_catalog::AuthSpecKind::None,
-		"api_key" => omp_catalog::AuthSpecKind::ApiKey,
-		"bearer" => omp_catalog::AuthSpecKind::Bearer,
-		"gcp_adc" => omp_catalog::AuthSpecKind::GcpAdc,
-		"omp_session" => omp_catalog::AuthSpecKind::OmpSession,
+		"none" => AuthSpecKind::None,
+		"api_key" => AuthSpecKind::ApiKey,
+		"bearer" => AuthSpecKind::Bearer,
+		"gcp_adc" => AuthSpecKind::GcpAdc,
+		"omp_session" => AuthSpecKind::OmpSession,
 		_ => return Err(invalid_declaration("authentication mode is not supported")),
 	};
 	if raw.header.is_some() && raw.query.is_some() {
@@ -1513,13 +1617,13 @@ fn compile_auth(
 		));
 	}
 	if let Some(header) = &raw.header {
-		http::header::HeaderName::from_bytes(header.as_bytes())
+		HeaderName::from_bytes(header.as_bytes())
 			.map_err(|_| invalid_declaration("authentication header is invalid"))?;
 	}
 	let account_scope = match raw.account_scope.as_str() {
-		"provider" => omp_catalog::AccountScope::Provider,
-		"route" => omp_catalog::AccountScope::Route,
-		"region" => omp_catalog::AccountScope::Region,
+		"provider" => AccountScope::Provider,
+		"route" => AccountScope::Route,
+		"region" => AccountScope::Region,
 		_ => return Err(invalid_declaration("authentication account scope is invalid")),
 	};
 	let sources = raw
@@ -1527,7 +1631,7 @@ fn compile_auth(
 		.iter()
 		.map(|source| match source.kind.as_str() {
 			"environment" if !source.ordered_names.is_empty() => {
-				Ok(omp_catalog::CredentialSourceSpec::Environment {
+				Ok(CredentialSourceSpec::Environment {
 					ordered_names: source
 						.ordered_names
 						.iter()
@@ -1535,18 +1639,18 @@ fn compile_auth(
 						.collect(),
 				})
 			},
-			"stored" => Ok(omp_catalog::CredentialSourceSpec::Stored),
-			"session" => Ok(omp_catalog::CredentialSourceSpec::Session),
-			"aws_chain" => Ok(omp_catalog::CredentialSourceSpec::AwsChain),
+			"stored" => Ok(CredentialSourceSpec::Stored),
+			"session" => Ok(CredentialSourceSpec::Session),
+			"aws_chain" => Ok(CredentialSourceSpec::AwsChain),
 			_ => {
 				Err(invalid_declaration("credential source is malformed or not application-composed"))
 			},
 		})
 		.collect::<Result<Vec<_>, _>>()?;
-	if kind == omp_catalog::AuthSpecKind::None && !sources.is_empty() {
+	if kind == AuthSpecKind::None && !sources.is_empty() {
 		return Err(invalid_declaration("unauthenticated routes cannot declare credential sources"));
 	}
-	if kind != omp_catalog::AuthSpecKind::None && sources.is_empty() {
+	if kind != AuthSpecKind::None && sources.is_empty() {
 		return Err(invalid_declaration("authenticated routes require a credential source"));
 	}
 	if raw.sources.iter().any(|source| !source.options.is_empty()) {
@@ -1575,23 +1679,22 @@ fn compile_auth(
 }
 
 fn operation_kind(value: &str) -> Option<omp_catalog::OperationKind> {
-	use omp_catalog::OperationKind;
 	match value {
-		"chat" => Some(OperationKind::Chat),
-		"count_tokens" => Some(OperationKind::CountTokens),
-		"tokenize" => Some(OperationKind::Tokenize),
-		"detokenize" => Some(OperationKind::Detokenize),
-		"embed" => Some(OperationKind::Embed),
-		"generate_image" => Some(OperationKind::GenerateImage),
-		"generate_video" => Some(OperationKind::GenerateVideo),
-		"speak" => Some(OperationKind::Speak),
-		"transcribe" => Some(OperationKind::Transcribe),
-		"realtime" => Some(OperationKind::Realtime),
-		"search" => Some(OperationKind::Search),
-		"usage" => Some(OperationKind::Usage),
-		"discover_models" => Some(OperationKind::DiscoverModels),
-		"auth" => Some(OperationKind::Auth),
-		"native" => Some(OperationKind::Native),
+		"chat" => Some(omp_catalog::OperationKind::Chat),
+		"count_tokens" => Some(omp_catalog::OperationKind::CountTokens),
+		"tokenize" => Some(omp_catalog::OperationKind::Tokenize),
+		"detokenize" => Some(omp_catalog::OperationKind::Detokenize),
+		"embed" => Some(omp_catalog::OperationKind::Embed),
+		"generate_image" => Some(omp_catalog::OperationKind::GenerateImage),
+		"generate_video" => Some(omp_catalog::OperationKind::GenerateVideo),
+		"speak" => Some(omp_catalog::OperationKind::Speak),
+		"transcribe" => Some(omp_catalog::OperationKind::Transcribe),
+		"realtime" => Some(omp_catalog::OperationKind::Realtime),
+		"search" => Some(omp_catalog::OperationKind::Search),
+		"usage" => Some(omp_catalog::OperationKind::Usage),
+		"discover_models" => Some(omp_catalog::OperationKind::DiscoverModels),
+		"auth" => Some(omp_catalog::OperationKind::Auth),
+		"native" => Some(omp_catalog::OperationKind::Native),
 		_ => None,
 	}
 }
@@ -1672,17 +1775,13 @@ fn operation_kinds(bits: &omp_catalog::OperationBits) -> Vec<omp_catalog::Operat
 	.collect()
 }
 fn compile_model_capabilities(
-	base: &omp_catalog::snapshot::Catalog,
+	base: &snapshot::Catalog,
 	raw: &RawModelSpec,
 	operations: omp_catalog::OperationBits,
 ) -> Result<omp_catalog::ModelCapabilities, ProviderControlError> {
-	use omp_catalog::{
-		OperationKind,
-		capability::{
-			AudioFormatBits, ImageCapabilities, ImageFeatureBits, ModalityBits, RealtimeCapabilities,
-			RealtimeFeatureBits, SpeechCapabilities, SpeechFeatureBits, TranscriptionCapabilities,
-			TranscriptionFeatureBits,
-		},
+	use omp_catalog::capability::{
+		ImageCapabilities, ImageFeatureBits, RealtimeCapabilities, RealtimeFeatureBits,
+		SpeechCapabilities, SpeechFeatureBits, TranscriptionCapabilities, TranscriptionFeatureBits,
 	};
 	let seed = base
 		.models()
@@ -1699,7 +1798,7 @@ fn compile_model_capabilities(
 	capabilities.realtime = None;
 	capabilities.search = None;
 	capabilities.tokenization = None;
-	if operations.contains_kind(OperationKind::Chat) {
+	if operations.contains_kind(omp_catalog::OperationKind::Chat) {
 		capabilities.chat = base
 			.models()
 			.iter()
@@ -1707,7 +1806,7 @@ fn compile_model_capabilities(
 			.ok_or_else(|| invalid_declaration("catalog has no chat capability template"))?
 			.into();
 	}
-	if operations.contains_kind(OperationKind::Embed) {
+	if operations.contains_kind(omp_catalog::OperationKind::Embed) {
 		capabilities.embeddings = base
 			.models()
 			.iter()
@@ -1715,21 +1814,21 @@ fn compile_model_capabilities(
 			.ok_or_else(|| invalid_declaration("catalog has no embedding capability template"))?
 			.into();
 	}
-	if operations.contains_kind(OperationKind::Search) {
+	if operations.contains_kind(omp_catalog::OperationKind::Search) {
 		capabilities.search = base
 			.models()
 			.iter()
 			.find_map(|model| model.capabilities.search)
 			.or_else(|| {
-				Some(omp_catalog::capability::SearchCapabilities {
-					features:        omp_catalog::capability::SearchFeatureBits::empty(),
+				Some(omp_catalog::SearchCapabilities {
+					features:        SearchFeatureBits::empty(),
 					maximum_results: None,
 				})
 			});
 	}
-	if operations.contains_kind(OperationKind::CountTokens)
-		|| operations.contains_kind(OperationKind::Tokenize)
-		|| operations.contains_kind(OperationKind::Detokenize)
+	if operations.contains_kind(omp_catalog::OperationKind::CountTokens)
+		|| operations.contains_kind(omp_catalog::OperationKind::Tokenize)
+		|| operations.contains_kind(omp_catalog::OperationKind::Detokenize)
 	{
 		capabilities.tokenization = base
 			.models()
@@ -1738,7 +1837,7 @@ fn compile_model_capabilities(
 			.ok_or_else(|| invalid_declaration("catalog has no tokenization capability template"))?
 			.into();
 	}
-	if operations.contains_kind(OperationKind::GenerateImage) {
+	if operations.contains_kind(omp_catalog::OperationKind::GenerateImage) {
 		let image = raw
 			.image
 			.as_ref()
@@ -1773,7 +1872,7 @@ fn compile_model_capabilities(
 			maximum_pixels,
 		});
 	}
-	if operations.contains_kind(OperationKind::Speak) {
+	if operations.contains_kind(omp_catalog::OperationKind::Speak) {
 		let raw = raw
 			.speech
 			.as_ref()
@@ -1802,7 +1901,7 @@ fn compile_model_capabilities(
 			output_formats: audio_format_bits(&raw.formats)?,
 		});
 	}
-	if operations.contains_kind(OperationKind::Transcribe) {
+	if operations.contains_kind(omp_catalog::OperationKind::Transcribe) {
 		let raw = raw.transcription.as_ref().ok_or_else(|| {
 			invalid_declaration("transcription operation requires transcription capabilities")
 		})?;
@@ -1830,7 +1929,7 @@ fn compile_model_capabilities(
 			maximum_duration_ms: None,
 		});
 	}
-	if operations.contains_kind(OperationKind::Realtime) {
+	if operations.contains_kind(omp_catalog::OperationKind::Realtime) {
 		let raw = raw
 			.realtime
 			.as_ref()
@@ -1871,26 +1970,22 @@ fn compile_model_capabilities(
 
 fn modality_bits(
 	values: &BTreeSet<String>,
-) -> Result<omp_catalog::capability::ModalityBits, ProviderControlError> {
-	use omp_catalog::capability::ModalityBits;
-	let mut bits = ModalityBits::empty();
+) -> Result<capability::ModalityBits, ProviderControlError> {
+	let mut bits = capability::ModalityBits::empty();
 	for value in values {
 		bits.insert(match value.as_str() {
-			"text" => ModalityBits::TEXT,
-			"image" => ModalityBits::IMAGE,
-			"audio" => ModalityBits::AUDIO,
-			"video" => ModalityBits::VIDEO,
-			"document" => ModalityBits::DOCUMENT,
+			"text" => capability::ModalityBits::TEXT,
+			"image" => capability::ModalityBits::IMAGE,
+			"audio" => capability::ModalityBits::AUDIO,
+			"video" => capability::ModalityBits::VIDEO,
+			"document" => capability::ModalityBits::DOCUMENT,
 			_ => return Err(invalid_declaration("model input modality is invalid")),
 		});
 	}
 	Ok(bits)
 }
 
-fn audio_format_bits(
-	values: &BTreeSet<String>,
-) -> Result<omp_catalog::capability::AudioFormatBits, ProviderControlError> {
-	use omp_catalog::capability::AudioFormatBits;
+fn audio_format_bits(values: &BTreeSet<String>) -> Result<AudioFormatBits, ProviderControlError> {
 	let mut bits = AudioFormatBits::empty();
 	for value in values {
 		bits.insert(match value.as_str() {
@@ -1982,9 +2077,8 @@ fn lower_control_request(
 	request: ProviderControlRequest,
 ) -> Result<(omp_inference::Target, omp_inference::OperationCall), ProviderControlError> {
 	use omp_inference::call::{
-		AudioFormat, Background, Dimensions, ImageFormat, ImageQuality, ImageRequest,
-		NegotiationPolicy, RealtimeModality, RealtimeRequest, Setting, SpeechRequest,
-		TimestampGranularity, TranscriptionRequest,
+		Background, Dimensions, ImageQuality, ImageRequest, NegotiationPolicy, RealtimeModality,
+		RealtimeRequest, SpeechRequest, TimestampGranularity, TranscriptionRequest,
 	};
 	match request.operation {
 		ProviderRequestKind::GenerateImage => {
@@ -2015,11 +2109,11 @@ fn lower_control_request(
 					references: Arc::from([]),
 					mask: None,
 					count,
-					dimensions: Setting::Require(Dimensions { width, height }),
-					quality: Setting::<ImageQuality>::Unset,
-					background: Setting::<Background>::Unset,
-					format: Setting::Require(format),
-					style: Setting::Unset,
+					dimensions: call::Setting::Require(Dimensions { width, height }),
+					quality: call::Setting::<ImageQuality>::Unset,
+					background: call::Setting::<Background>::Unset,
+					format: call::Setting::Require(format),
+					style: call::Setting::Unset,
 					safety: Arc::from([]),
 					seed: None,
 					negotiation: NegotiationPolicy::default(),
@@ -2036,16 +2130,16 @@ fn lower_control_request(
 				.and_then(Value::as_str)
 				.map(parse_audio_format)
 				.transpose()?
-				.map_or(Setting::Unset, Setting::Require);
+				.map_or(call::Setting::Unset, call::Setting::Require);
 			Ok((
 				omp_inference::Target::Provider { provider: provider.clone(), model },
 				omp_inference::OperationCall::Speak(Arc::new(SpeechRequest {
 					text: Str::from(required_string(&request.payload, "text")?),
 					voice: Str::from(required_string(&request.payload, "voice")?),
 					format,
-					sample_rate_hz: Setting::Unset,
-					speed: Setting::Unset,
-					timestamps: Setting::<TimestampGranularity>::Unset,
+					sample_rate_hz: call::Setting::Unset,
+					speed: call::Setting::Unset,
+					timestamps: call::Setting::<TimestampGranularity>::Unset,
 					negotiation: NegotiationPolicy::default(),
 				})),
 			))
@@ -2084,8 +2178,8 @@ fn lower_control_request(
 						.and_then(Value::as_str)
 						.map(Str::from),
 					translate_to_english: false,
-					diarization:          Setting::Unset,
-					timestamps:           Setting::Unset,
+					diarization:          call::Setting::Unset,
+					timestamps:           call::Setting::Unset,
 					prompt:               None,
 					negotiation:          NegotiationPolicy::default(),
 				})),
@@ -2160,7 +2254,7 @@ fn lower_control_request(
 						.map(Str::from),
 					input_audio,
 					output_audio,
-					turn_detection: Setting::Unset,
+					turn_detection: call::Setting::Unset,
 					tools: Arc::from([]),
 					negotiation: NegotiationPolicy::default(),
 				})),
@@ -2220,54 +2314,48 @@ fn invalid_request(message: impl Into<Str>) -> ProviderControlError {
 	ProviderControlError::Request(message.into())
 }
 
-fn parse_image_format(
-	value: &str,
-) -> Result<omp_inference::call::ImageFormat, ProviderControlError> {
+fn parse_image_format(value: &str) -> Result<call::ImageFormat, ProviderControlError> {
 	match value {
-		"png" => Ok(omp_inference::call::ImageFormat::Png),
-		"jpeg" => Ok(omp_inference::call::ImageFormat::Jpeg),
-		"webp" => Ok(omp_inference::call::ImageFormat::Webp),
+		"png" => Ok(call::ImageFormat::Png),
+		"jpeg" => Ok(call::ImageFormat::Jpeg),
+		"webp" => Ok(call::ImageFormat::Webp),
 		_ => Err(invalid_request("image format is invalid")),
 	}
 }
 
-fn parse_audio_format(
-	value: &str,
-) -> Result<omp_inference::call::AudioFormat, ProviderControlError> {
-	use omp_inference::call::AudioFormat;
+fn parse_audio_format(value: &str) -> Result<call::AudioFormat, ProviderControlError> {
 	match value {
-		"pcm16" => Ok(AudioFormat::Pcm16),
-		"pcm24" => Ok(AudioFormat::Pcm24),
-		"f32" => Ok(AudioFormat::F32),
-		"mp3" => Ok(AudioFormat::Mp3),
-		"aac" => Ok(AudioFormat::Aac),
-		"opus" => Ok(AudioFormat::Opus),
-		"flac" => Ok(AudioFormat::Flac),
-		"wav" => Ok(AudioFormat::Wav),
+		"pcm16" => Ok(call::AudioFormat::Pcm16),
+		"pcm24" => Ok(call::AudioFormat::Pcm24),
+		"f32" => Ok(call::AudioFormat::F32),
+		"mp3" => Ok(call::AudioFormat::Mp3),
+		"aac" => Ok(call::AudioFormat::Aac),
+		"opus" => Ok(call::AudioFormat::Opus),
+		"flac" => Ok(call::AudioFormat::Flac),
+		"wav" => Ok(call::AudioFormat::Wav),
 		_ => Err(invalid_request("audio format is invalid")),
 	}
 }
 
 fn parse_audio_setting(
 	value: Option<&Value>,
-) -> Result<omp_inference::call::Setting<omp_inference::call::AudioFormat>, ProviderControlError> {
-	use omp_inference::call::Setting;
+) -> Result<call::Setting<call::AudioFormat>, ProviderControlError> {
 	let Some(setting) = value.and_then(Value::as_object) else {
-		return Ok(Setting::Unset);
+		return Ok(call::Setting::Unset);
 	};
 	match setting
 		.get("kind")
 		.and_then(Value::as_str)
 		.unwrap_or("unset")
 	{
-		"unset" => Ok(Setting::Unset),
-		"require" => Ok(Setting::Require(parse_audio_format(
+		"unset" => Ok(call::Setting::Unset),
+		"require" => Ok(call::Setting::Require(parse_audio_format(
 			setting
 				.get("value")
 				.and_then(Value::as_str)
 				.ok_or_else(|| invalid_request("required audio setting has no value"))?,
 		)?)),
-		"prefer" => Ok(Setting::Prefer(parse_audio_format(
+		"prefer" => Ok(call::Setting::Prefer(parse_audio_format(
 			setting
 				.get("value")
 				.and_then(Value::as_str)
@@ -2294,25 +2382,35 @@ fn answer_audio_format(_operation: omp_catalog::OperationKind) -> Str {
 /// Application-owned provider catalog, authentication, and inference seam.
 #[async_trait]
 pub trait ProviderControlBackend: Send + Sync + 'static {
+	/// Returns the current model cards, optionally restricted to one provider.
 	async fn models(
 		&self,
 		provider: Option<&str>,
 	) -> Result<Vec<ProviderModelCard>, ProviderControlError>;
+	/// Returns ordered changes since a cursor, or a reset snapshot when it
+	/// differs.
 	async fn watch_models(
 		&self,
 		since: Option<ProviderCatalogCursor>,
 	) -> Result<Vec<ProviderModelEvent>, ProviderControlError>;
+	/// Reports whether a provider needs no credentials or has at least one
+	/// account.
 	async fn is_authenticated(&self, provider: &str) -> Result<bool, ProviderControlError>;
+	/// Atomically replaces the caller-owned runtime declaration and advances the
+	/// catalog.
 	async fn replace(
 		&self,
 		identity: &ControlConnectionIdentity,
 		declaration: ProviderDeclarationDocument,
 	) -> Result<(), ProviderControlError>;
+	/// Removes the caller-owned runtime declaration and advances the catalog.
 	async fn retract(
 		&self,
 		identity: &ControlConnectionIdentity,
 		provider: &str,
 	) -> Result<(), ProviderControlError>;
+	/// Validates and dispatches an effect-authorized request through the
+	/// application owner.
 	async fn request(
 		&self,
 		identity: &ControlConnectionIdentity,

@@ -4,13 +4,15 @@
 
 use std::{
 	ffi::OsString,
-	fmt,
+	fmt::{self, Display},
 	io::{self, Write},
-	path::Path,
+	path::{self, Path},
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, parser::ValuesRef};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
+#[cfg(unix)]
+use rustix::fs;
 
 #[cfg(not(windows))]
 use crate::support::mode;
@@ -18,7 +20,7 @@ use crate::support::mode;
 use crate::support::xattr as fsxattr;
 use crate::{
 	host::{Host, Utility, format_usage, matches_parser, util},
-	support::{fsutil as fs, quote::Quotable},
+	support::{fsutil, quote::Quotable},
 };
 
 const DEFAULT_PERM: u32 = 0o777;
@@ -70,7 +72,7 @@ impl MkdirError {
 	}
 }
 
-impl fmt::Display for MkdirError {
+impl Display for MkdirError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Message(message) => formatter.write_str(message),
@@ -222,7 +224,7 @@ fn mkdir(path: &Path, config: &Config, host: &mut Host) -> Result<(), MkdirError
 		));
 	}
 	// `mkdir -p foo/.` succeeds, although `std::fs::create_dir("foo/.")` does not.
-	let path = fs::dir_strip_dot_for_creation(path);
+	let path = fsutil::dir_strip_dot_for_creation(path);
 	create_dir(&path, false, config, host)
 }
 
@@ -281,11 +283,11 @@ fn create_dir(
 /// Restores the process umask when directory creation finishes or unwinds.
 #[cfg(unix)]
 #[must_use]
-struct UmaskGuard(rustix::fs::Mode);
+struct UmaskGuard(fs::Mode);
 
 #[cfg(unix)]
 impl UmaskGuard {
-	fn set(new_mask: rustix::fs::Mode) -> Self {
+	fn set(new_mask: fs::Mode) -> Self {
 		let old_mask = rustix::process::umask(new_mask);
 		Self(old_mask)
 	}
@@ -300,17 +302,20 @@ impl Drop for UmaskGuard {
 
 #[cfg(unix)]
 fn create_dir_with_mode(path: &Path, mode: u32) -> io::Result<()> {
-	use std::os::unix::fs::DirBuilderExt;
+	use std::{fs::DirBuilder, os::unix::fs::DirBuilderExt};
+
+	use rustix::fs;
 
 	// GNU mkdir creates with the exact requested mode atomically by temporarily
 	// disabling the process umask.
-	let _guard = UmaskGuard::set(rustix::fs::Mode::empty());
-	std::fs::DirBuilder::new().mode(mode).create(path)
+	let _guard = UmaskGuard::set(fs::Mode::empty());
+	DirBuilder::new().mode(mode).create(path)
 }
 
 #[cfg(not(unix))]
 fn create_dir_with_mode(path: &Path, _mode: u32) -> io::Result<()> {
-	std::fs::create_dir(path)
+	use std::fs;
+	fs::create_dir(path)
 }
 
 fn create_single_dir(
@@ -352,7 +357,7 @@ fn create_single_dir(
 		},
 		Err(_) if fs_path.is_dir() => {
 			let ends_with_parent_dir =
-				matches!(path.components().next_back(), Some(std::path::Component::ParentDir));
+				matches!(path.components().next_back(), Some(path::Component::ParentDir));
 			if config.verbose && is_parent && config.recursive && !ends_with_parent_dir {
 				writeln!(host.stdout, "mkdir: created directory {}", path.quote())
 					.map_err(MkdirError::io)?;
@@ -370,6 +375,8 @@ pub(crate) fn mkdir_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use super::Mkdir;
 	use crate::host::run_util;
 
@@ -400,7 +407,7 @@ mod tests {
 	#[test]
 	fn reports_existing_directory_and_continues() {
 		let cwd = tempfile::tempdir().unwrap();
-		std::fs::create_dir(cwd.path().join("exists")).unwrap();
+		fs::create_dir(cwd.path().join("exists")).unwrap();
 		let (code, capture) = run_util::<Mkdir>(&["exists", "created"], "", cwd.path());
 		assert_eq!(code, 1);
 		assert_eq!(capture.err(), "mkdir: exists: File exists\n");
@@ -415,13 +422,13 @@ mod tests {
 		let cwd = tempfile::tempdir().unwrap();
 		let (code, capture) = run_util::<Mkdir>(&["-p", "-m", "000", "parent/leaf"], "", cwd.path());
 		assert_eq!(code, 0, "{}", capture.err());
-		let leaf_mode = std::fs::metadata(cwd.path().join("parent/leaf"))
+		let leaf_mode = fs::metadata(cwd.path().join("parent/leaf"))
 			.unwrap()
 			.permissions()
 			.mode()
 			& 0o777;
 		assert_eq!(leaf_mode, 0o000);
-		let parent_mode = std::fs::metadata(cwd.path().join("parent"))
+		let parent_mode = fs::metadata(cwd.path().join("parent"))
 			.unwrap()
 			.permissions()
 			.mode()

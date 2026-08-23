@@ -1,15 +1,17 @@
 //! Standalone Kokoro sentence synthesis with speaker or atomic WAV output.
 
-use std::{cell::Cell, sync::Arc, time::Duration};
+use std::{cell::Cell, fs, path::Path, sync::Arc, time::Duration};
 
 use miette::{IntoDiagnostic as _, miette};
+use omp_core::Str;
 use omp_inference::local::{
 	ArtifactStore, LocalCancellation, MemoryPool, SystemArtifactFetcher,
 	speech_catalog::{DEFAULT_KOKORO_VOICE, SpeechArtifactManifests},
 	tts::{KokoroAdapter, KokoroConfig, KokoroDevice, SynthesisOptions},
 };
+use omp_voice::audio::PlaybackStream;
 
-use crate::cli::SayArgs;
+use crate::{cli::SayArgs, progress_reporter::ProgressReporter};
 
 /// Synthesizes text with one verified Kokoro model/voice.
 pub async fn run(args: SayArgs) -> miette::Result<()> {
@@ -19,7 +21,7 @@ pub async fn run(args: SayArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
 	let text = match (args.text, args.file) {
 		(Some(text), None) => text,
-		(None, Some(path)) => omp_core::Str::from(std::fs::read_to_string(path).into_diagnostic()?),
+		(None, Some(path)) => Str::from(fs::read_to_string(path).into_diagnostic()?),
 		(None, None) => return Err(miette!("provide text or --file PATH")),
 		(Some(_), Some(_)) => return Err(miette!("text and --file cannot be used together")),
 	};
@@ -31,17 +33,13 @@ pub async fn run(args: SayArgs) -> miette::Result<()> {
 		return Err(miette!("unknown local TTS model `{model}`; available: kokoro"));
 	}
 	let root = data_dir.join("models");
-	std::fs::create_dir_all(&root).into_diagnostic()?;
+	fs::create_dir_all(&root).into_diagnostic()?;
 	let store = ArtifactStore::open(&root).into_diagnostic()?;
 	let artifacts = SpeechArtifactManifests::pi_parity().into_diagnostic()?;
 	let cancel = LocalCancellation::new();
 	let manifest = artifacts.kokoro_manifest();
 	let total = manifest.total_bytes().into_diagnostic()?;
-	let progress = crate::progress_reporter::ProgressReporter::bounded(
-		total,
-		"downloading kokoro".to_owned(),
-		false,
-	);
+	let progress = ProgressReporter::bounded(total, "downloading kokoro".to_owned(), false);
 	let prior = Cell::new(0_u64);
 	store
 		.acquire(manifest, &SystemArtifactFetcher::new(), &cancel, |update| {
@@ -77,7 +75,7 @@ pub async fn run(args: SayArgs) -> miette::Result<()> {
 		println!("wrote {} samples to {}", output.samples.len(), path.display());
 		return Ok(());
 	}
-	let mut playback = omp_voice::audio::PlaybackStream::start(24_000).into_diagnostic()?;
+	let mut playback = PlaybackStream::start(24_000).into_diagnostic()?;
 	let writer = playback.writer().into_diagnostic()?;
 	let mut playback_error = None;
 	let receipt = adapter
@@ -110,20 +108,16 @@ const fn device() -> KokoroDevice {
 	}
 }
 
-fn write_wav_atomic(
-	path: &std::path::Path,
-	sample_rate: u32,
-	samples: &[f32],
-) -> miette::Result<()> {
+fn write_wav_atomic(path: &Path, sample_rate: u32, samples: &[f32]) -> miette::Result<()> {
 	let wav = omp_voice::wav::encode_wav(samples, sample_rate).into_diagnostic()?;
 	if let Some(parent) = path
 		.parent()
 		.filter(|parent| !parent.as_os_str().is_empty())
 	{
-		std::fs::create_dir_all(parent).into_diagnostic()?;
+		fs::create_dir_all(parent).into_diagnostic()?;
 	}
 	let temporary = path.with_extension(format!("wav.tmp-{}", std::process::id()));
-	std::fs::write(&temporary, wav).into_diagnostic()?;
-	std::fs::rename(&temporary, path).into_diagnostic()?;
+	fs::write(&temporary, wav).into_diagnostic()?;
+	fs::rename(&temporary, path).into_diagnostic()?;
 	Ok(())
 }

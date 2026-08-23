@@ -4,7 +4,7 @@
 //! from rendering so a recognized URL may decline and fall through to the
 //! generic bounded fetch pipeline.
 
-use std::fmt::Write as _;
+use std::{fmt::Write as _, str};
 
 use omp_core::USER_AGENT;
 use serde_json::Value;
@@ -176,7 +176,7 @@ pub(super) async fn render<C: HttpClient + Sync>(
 		};
 		render_json(&mut markdown, &value, 0);
 	} else {
-		let Ok(text) = std::str::from_utf8(&response.body) else {
+		let Ok(text) = str::from_utf8(&response.body) else {
 			return Ok(None);
 		};
 		if text.trim().is_empty() || text.contains("<html") || text.contains("<!DOCTYPE") {

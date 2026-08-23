@@ -1,6 +1,7 @@
 use omp_core::{IntoStr, Str};
 
 use crate::{
+	UiContext,
 	component::{Component, PaintCtx, Slot, next_slot},
 	frame::Rect,
 	props::{Prop, PropValue, Props},
@@ -36,7 +37,7 @@ impl Icon {
 		self.with(prop, value)
 	}
 
-	fn glyph<'a>(&'a self, ctx: &'a crate::UiContext) -> &'a str {
+	fn glyph<'a>(&'a self, ctx: &'a UiContext) -> &'a str {
 		ctx.charset.icon_named(&self.name).unwrap_or(&self.name)
 	}
 }
@@ -60,12 +61,12 @@ impl Component for Icon {
 		self.slot
 	}
 
-	fn measure(&mut self, ctx: &crate::UiContext) -> (u16, u16) {
+	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {
 		let width = cell_width(self.glyph(ctx));
 		(width, width)
 	}
 
-	fn height(&mut self, _ctx: &crate::UiContext, _width: u16) -> u16 {
+	fn height(&mut self, _ctx: &UiContext, _width: u16) -> u16 {
 		1
 	}
 

@@ -17,8 +17,9 @@ use omp_ext::{
 	index::SignedIndex,
 	lock::{InstalledExtension, InstalledRecord, LockFile, LockedExtension, Wheel, index_source},
 	trust::{GrantsFile, KeysFile, verify_artifact_signature},
-	upgrade::{PinsFile, apply_uninstall, gc_generations, plan_uninstall, set_enabled},
+	upgrade::{Generation, PinsFile, apply_uninstall, gc_generations, plan_uninstall, set_enabled},
 };
+use toml::map;
 
 /// Shared options accepted by every `omp ext` operation.
 #[derive(Clone, Debug, Args)]
@@ -649,7 +650,7 @@ async fn install(state: &StatePaths, args: ExtInstallArgs) -> miette::Result<()>
 					.file_name()
 					.and_then(|name| name.to_str())
 					.ok_or_else(|| miette!("extension path has no valid identity"))?;
-				let mut source = toml::map::Map::new();
+				let mut source = map::Map::new();
 				source.insert("path".to_owned(), toml::Value::String(path.display().to_string()));
 				upsert_installed(&mut installed, InstalledExtension {
 					id:      Str::new(id),
@@ -695,7 +696,7 @@ fn link(state: &StatePaths, args: ExtLinkArgs) -> miette::Result<()> {
 				.unwrap_or("extension"),
 		)
 	});
-	let mut source = toml::map::Map::new();
+	let mut source = map::Map::new();
 	source.insert("link".to_owned(), toml::Value::String(path.display().to_string()));
 	let mut installed =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
@@ -1083,7 +1084,7 @@ struct StatePaths {
 }
 
 impl StatePaths {
-	fn new(data_dir: &std::path::Path, project: &std::path::Path) -> Self {
+	fn new(data_dir: &Path, project: &Path) -> Self {
 		let workspace = project.join(".omp");
 		Self {
 			client_installed:    data_dir.join("ext/installed.toml"),
@@ -1128,7 +1129,6 @@ async fn sync(state: &StatePaths, args: ExtSyncArgs) -> miette::Result<()> {
 }
 
 /// Encodes a Resolver-provided deployment snapshot as an air-gap bundle.
-#[expect(dead_code, reason = "Resolver package snapshot output is landing separately")]
 fn pack_airgap_bundle(targets: Vec<Str>, files: Vec<BundleFile>) -> miette::Result<bytes::Bytes> {
 	pack_bundle("omp ext", targets, files).map_err(|error| miette!("{error}"))
 }
@@ -1251,7 +1251,7 @@ fn install_index_source(
 	if args.no_lock {
 		installed.write(&state.client_installed).into_diagnostic()?;
 	} else {
-		let generation = omp_ext::upgrade::Generation { lock, installed: installed.clone() };
+		let generation = Generation { lock, installed: installed.clone() };
 		omp_ext::upgrade::commit_generation(
 			&state.client_lock,
 			&state.client_installed,

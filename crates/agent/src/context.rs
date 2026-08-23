@@ -4,12 +4,12 @@
 //! against stable transcript-event ids.  The original journal projection is
 //! never mutated.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use omp_core::{Str, sf};
 use omp_proto::{
-	inference::v1 as inference,
-	thread::v1::{self as thread, Item, Thread},
+	inference::v1::{self as inference, value},
+	thread::v1::{self as thread, Item, Thread, item, part},
 };
 use serde_json::Value;
 use smallvec::SmallVec;
@@ -369,7 +369,7 @@ pub fn demote_interrupted_reasoning(
 		.iter_mut()
 		.rev()
 		.find_map(|item| match item.kind.as_mut() {
-			Some(thread::item::Kind::Message(message))
+			Some(item::Kind::Message(message))
 				if thread::Role::try_from(message.role) == Ok(thread::Role::Assistant) =>
 			{
 				Some(message)
@@ -383,7 +383,7 @@ pub fn demote_interrupted_reasoning(
 	let mut kept = Vec::with_capacity(message.parts.len());
 	for part in message.parts.drain(..) {
 		match part.kind {
-			Some(thread::part::Kind::Thinking(thinking)) if !thinking.text.trim().is_empty() => {
+			Some(part::Kind::Thinking(thinking)) if !thinking.text.trim().is_empty() => {
 				if !reasoning.is_empty() {
 					reasoning = sf!("{}\n{}", reasoning.as_str(), thinking.text);
 				} else {
@@ -404,15 +404,14 @@ pub fn demote_interrupted_reasoning(
 	thread.items.push(Item {
 		seq:           0,
 		created_at_ms: 0,
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.into())) }],
+			parts: vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
 		})),
 		props:         Some(inference::ValueMap {
-			fields: std::collections::BTreeMap::from([(
-				"omp/hidden-continuity".to_owned(),
-				inference::Value { kind: Some(inference::value::Kind::Bool(true)) },
-			)]),
+			fields: BTreeMap::from([("omp/hidden-continuity".to_owned(), inference::Value {
+				kind: Some(value::Kind::Bool(true)),
+			})]),
 		}),
 	});
 	true
@@ -439,33 +438,31 @@ pub fn inject_first_turn_metadata(thread: &mut Thread, date: &str, cwd: &str) ->
 			.as_ref()
 			.and_then(|props| props.fields.get("omp/session-metadata"))
 			.and_then(|value| value.kind.as_ref())
-			.is_some_and(|kind| matches!(kind, inference::value::Kind::Bool(true)))
+			.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)))
 	}) {
 		return false;
 	}
 	let Some(item) = thread.items.iter_mut().find(|item| {
 		matches!(
 			item.kind.as_ref(),
-			Some(thread::item::Kind::Message(message))
+			Some(item::Kind::Message(message))
 				if thread::Role::try_from(message.role) == Ok(thread::Role::User)
 		)
 	}) else {
 		return false;
 	};
-	let Some(thread::item::Kind::Message(message)) = item.kind.as_mut() else {
+	let Some(item::Kind::Message(message)) = item.kind.as_mut() else {
 		return false;
 	};
 	message.parts.insert(0, thread::Part {
-		kind: Some(thread::part::Kind::Text(
-			sf!("<session-context date=\"{date}\" cwd=\"{cwd}\">").into(),
-		)),
+		kind: Some(part::Kind::Text(sf!("<session-context date=\"{date}\" cwd=\"{cwd}\">").into())),
 	});
 	item
 		.props
 		.get_or_insert_default()
 		.fields
 		.insert("omp/session-metadata".to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::Bool(true)),
+			kind: Some(value::Kind::Bool(true)),
 		});
 	true
 }
@@ -745,23 +742,22 @@ fn apply_plan(slots: &mut Vec<Slot>, synthetic: &mut Vec<Item>, plan: Plan) {
 
 fn message_kind(item: &Item) -> MessageKind {
 	match item.kind.as_ref() {
-		Some(thread::item::Kind::Message(message)) => match thread::Role::try_from(message.role).ok()
-		{
+		Some(item::Kind::Message(message)) => match thread::Role::try_from(message.role).ok() {
 			Some(thread::Role::System) => MessageKind::System,
 			Some(thread::Role::User) => MessageKind::User,
 			Some(thread::Role::Assistant) => MessageKind::Assistant,
 			_ => MessageKind::Other,
 		},
-		Some(thread::item::Kind::ToolCall(_)) => MessageKind::ToolCall,
-		Some(thread::item::Kind::ToolResult(_)) => MessageKind::ToolResult,
+		Some(item::Kind::ToolCall(_)) => MessageKind::ToolCall,
+		Some(item::Kind::ToolResult(_)) => MessageKind::ToolResult,
 		None => MessageKind::Other,
 	}
 }
 fn clear_parts(item: &mut Item) {
 	match item.kind.as_mut() {
-		Some(thread::item::Kind::Message(message)) => message.parts.clear(),
-		Some(thread::item::Kind::ToolResult(result)) => result.parts.clear(),
-		Some(thread::item::Kind::ToolCall(_)) | None => {},
+		Some(item::Kind::Message(message)) => message.parts.clear(),
+		Some(item::Kind::ToolResult(result)) => result.parts.clear(),
+		Some(item::Kind::ToolCall(_)) | None => {},
 	}
 }
 
@@ -769,9 +765,9 @@ fn synthetic_item(text: Str, role: thread::Role) -> Item {
 	Item {
 		seq:           0,
 		created_at_ms: 0,
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role:  role as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.into())) }],
+			parts: vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
 		})),
 		props:         None,
 	}
@@ -805,9 +801,9 @@ mod tests {
 			.items
 			.iter()
 			.map(|item| match item.kind.as_ref().expect("item kind") {
-				thread::item::Kind::Message(message) => {
+				item::Kind::Message(message) => {
 					match message.parts[0].kind.as_ref().expect("part kind") {
-						thread::part::Kind::Text(text) => text.as_str(),
+						part::Kind::Text(text) => text.as_str(),
 						_ => "",
 					}
 				},
@@ -822,17 +818,17 @@ mod tests {
 			items: vec![Item {
 				seq:           1,
 				created_at_ms: 1,
-				kind:          Some(thread::item::Kind::Message(thread::Message {
+				kind:          Some(item::Kind::Message(thread::Message {
 					role:  thread::Role::Assistant as i32,
 					parts: vec![
 						thread::Part {
-							kind: Some(thread::part::Kind::Thinking(thread::Thinking {
+							kind: Some(part::Kind::Thinking(thread::Thinking {
 								text:      "inspect the failure".to_owned(),
 								signature: vec![7].into(),
 								redacted:  false,
 							})),
 						},
-						thread::Part { kind: Some(thread::part::Kind::Text("partial".to_owned())) },
+						thread::Part { kind: Some(part::Kind::Text("partial".to_owned())) },
 					],
 				})),
 				props:         None,
@@ -840,14 +836,14 @@ mod tests {
 		};
 		assert!(demote_interrupted_reasoning(&mut thread, InterruptedReasoningDialect::Other,));
 		let assistant = match thread.items[0].kind.as_ref().unwrap() {
-			thread::item::Kind::Message(message) => message,
+			item::Kind::Message(message) => message,
 			_ => unreachable!(),
 		};
 		assert!(
 			assistant
 				.parts
 				.iter()
-				.all(|part| !matches!(part.kind, Some(thread::part::Kind::Thinking(_))))
+				.all(|part| !matches!(part.kind, Some(part::Kind::Thinking(_))))
 		);
 		let hidden = thread.items.last().unwrap();
 		assert!(
@@ -864,19 +860,17 @@ mod tests {
 	fn anthropic_dialect_drops_reasoning_without_hidden_continuity() {
 		let mut thread = Thread {
 			items: vec![Item {
-				kind: Some(thread::item::Kind::Message(thread::Message {
+				kind: Some(item::Kind::Message(thread::Message {
 					role:  i32::from(thread::Role::Assistant),
 					parts: vec![
 						thread::Part {
-							kind: Some(thread::part::Kind::Thinking(thread::Thinking {
+							kind: Some(part::Kind::Thinking(thread::Thinking {
 								text:      "private reasoning".to_owned(),
 								signature: vec![9].into(),
 								redacted:  false,
 							})),
 						},
-						thread::Part {
-							kind: Some(thread::part::Kind::Text("partial answer".to_owned())),
-						},
+						thread::Part { kind: Some(part::Kind::Text("partial answer".to_owned())) },
 					],
 				})),
 				..Item::default()
@@ -884,11 +878,11 @@ mod tests {
 		};
 		assert!(demote_interrupted_reasoning(&mut thread, InterruptedReasoningDialect::Anthropic,));
 		assert_eq!(thread.items.len(), 1);
-		let Some(thread::item::Kind::Message(message)) = thread.items[0].kind.as_ref() else {
+		let Some(item::Kind::Message(message)) = thread.items[0].kind.as_ref() else {
 			panic!("assistant message remains");
 		};
 		assert_eq!(message.parts.len(), 1);
-		assert!(matches!(message.parts[0].kind, Some(thread::part::Kind::Text(_))));
+		assert!(matches!(message.parts[0].kind, Some(part::Kind::Text(_))));
 	}
 
 	#[test]
@@ -966,25 +960,23 @@ mod tests {
 
 	#[test]
 	fn drop_parts_preserves_item_metadata() {
-		let details = pb::Value { kind: Some(pb::value::Kind::String("details".to_owned())) };
+		let details = pb::Value { kind: Some(value::Kind::String("details".to_owned())) };
 		let props = pb::ValueMap {
 			fields: BTreeMap::from([("omp/tool-rev".to_owned(), pb::Value {
-				kind: Some(pb::value::Kind::String("read.1".to_owned())),
+				kind: Some(value::Kind::String("read.1".to_owned())),
 			})]),
 		};
 		let provider_metadata = pb::ValueMap {
 			fields: BTreeMap::from([("provider/key".to_owned(), pb::Value {
-				kind: Some(pb::value::Kind::String("verbatim".to_owned())),
+				kind: Some(value::Kind::String("verbatim".to_owned())),
 			})]),
 		};
 		let tool_result = Item {
 			seq:           7,
 			created_at_ms: 99,
-			kind:          Some(thread::item::Kind::ToolResult(thread::ToolResult {
+			kind:          Some(item::Kind::ToolResult(thread::ToolResult {
 				call_id: "call-1".to_owned(),
-				parts: vec![thread::Part {
-					kind: Some(thread::part::Kind::Text("large result".to_owned())),
-				}],
+				parts: vec![thread::Part { kind: Some(part::Kind::Text("large result".to_owned())) }],
 				is_error: true,
 				name: "read".to_owned(),
 				details: Some(details),
@@ -998,11 +990,9 @@ mod tests {
 		let message = Item {
 			seq:           8,
 			created_at_ms: 100,
-			kind:          Some(thread::item::Kind::Message(thread::Message {
+			kind:          Some(item::Kind::Message(thread::Message {
 				role:  thread::Role::Assistant as i32,
-				parts: vec![thread::Part {
-					kind: Some(thread::part::Kind::Text("assistant text".to_owned())),
-				}],
+				parts: vec![thread::Part { kind: Some(part::Kind::Text("assistant text".to_owned())) }],
 			})),
 			props:         None,
 		};

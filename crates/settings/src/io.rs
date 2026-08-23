@@ -8,6 +8,8 @@ use std::{
 	time::{SystemTime, UNIX_EPOCH},
 };
 
+use toml::{de, ser};
+
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A corrupt source moved out of the writer's way without losing its bytes.
@@ -316,13 +318,15 @@ fn unlock(file: &File) -> io::Result<()> {
 #[cfg(windows)]
 fn lock_exclusive(file: &File) -> io::Result<()> {
 	use std::os::windows::io::AsRawHandle as _;
+
+	use windows_sys::Win32::Storage::FileSystem;
 	// SAFETY: OVERLAPPED is a plain C record for synchronous range locking.
-	let mut overlapped = unsafe { std::mem::zeroed() };
+	let mut overlapped = unsafe { mem::zeroed() };
 	// SAFETY: the handle and OVERLAPPED pointer remain valid for this call.
 	let result = unsafe {
-		windows_sys::Win32::Storage::FileSystem::LockFileEx(
+		FileSystem::LockFileEx(
 			file.as_raw_handle() as _,
-			windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK,
+			FileSystem::LOCKFILE_EXCLUSIVE_LOCK,
 			0,
 			u32::MAX,
 			u32::MAX,
@@ -337,17 +341,13 @@ fn lock_exclusive(file: &File) -> io::Result<()> {
 #[cfg(windows)]
 fn unlock(file: &File) -> io::Result<()> {
 	use std::os::windows::io::AsRawHandle as _;
+
+	use windows_sys::Win32::Storage::FileSystem;
 	// SAFETY: OVERLAPPED is a plain C record for synchronous range unlocking.
-	let mut overlapped = unsafe { std::mem::zeroed() };
+	let mut overlapped = unsafe { mem::zeroed() };
 	// SAFETY: the handle and OVERLAPPED pointer remain valid for this call.
 	let result = unsafe {
-		windows_sys::Win32::Storage::FileSystem::UnlockFileEx(
-			file.as_raw_handle() as _,
-			0,
-			u32::MAX,
-			u32::MAX,
-			&mut overlapped,
-		)
+		FileSystem::UnlockFileEx(file.as_raw_handle() as _, 0, u32::MAX, u32::MAX, &mut overlapped)
 	};
 	(result != 0)
 		.then_some(())
@@ -394,82 +394,105 @@ pub enum SettingsIoError {
 	/// A parent directory could not be created.
 	#[error("failed to create settings directory {path}")]
 	CreateDirectory {
+		/// Parent directory required to persist the settings file.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while creating the parent directory.
 		source: io::Error,
 	},
 	/// The settings lock could not be acquired.
 	#[error("failed to lock settings file {path}")]
 	Lock {
+		/// Sidecar lock file used to serialize settings updates.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while opening or locking the sidecar file.
 		source: io::Error,
 	},
 	/// A settings source could not be read.
 	#[error("failed to read settings file {path}")]
 	Read {
+		/// Native settings file being loaded.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while reading the settings file.
 		source: io::Error,
 	},
 	/// A settings source was malformed.
 	#[error("failed to parse settings file {path}")]
 	Parse {
+		/// Native settings file containing malformed TOML.
 		path:   PathBuf,
 		#[source]
-		source: toml::de::Error,
+		/// TOML failure returned while parsing the settings file.
+		source: de::Error,
 	},
 	/// Corrupt settings could not be moved aside.
 	#[error("refusing to overwrite corrupt settings file {path}; quarantine {backup_path} failed")]
 	Quarantine {
+		/// Corrupt native settings file being moved aside.
 		path:        PathBuf,
+		/// Unique backup destination chosen for the corrupt file.
 		backup_path: PathBuf,
 		#[source]
+		/// I/O failure returned while renaming the corrupt file.
 		source:      io::Error,
 	},
 	/// A temporary file could not be created.
 	#[error("failed to create temporary settings file {path}")]
 	CreateTemporary {
+		/// PID-isolated temporary file used for atomic persistence.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while creating the temporary file.
 		source: io::Error,
 	},
 	/// A temporary file could not be written.
 	#[error("failed to write temporary settings file {path}")]
 	WriteTemporary {
+		/// Temporary settings file receiving the encoded TOML.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while writing the encoded settings.
 		source: io::Error,
 	},
 	/// A temporary file could not be synced.
 	#[error("failed to sync temporary settings file {path}")]
 	SyncTemporary {
+		/// Temporary settings file being flushed before replacement.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while syncing the temporary file.
 		source: io::Error,
 	},
 	/// TOML encoding failed.
 	#[error(transparent)]
-	Encode(#[from] toml::ser::Error),
+	Encode(#[from] ser::Error),
 	/// The containing directory could not be synced after replacement.
 	#[error("failed to sync settings directory {path}")]
 	SyncDirectory {
+		/// Parent directory containing the atomically replaced settings file.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while syncing the parent directory.
 		source: io::Error,
 	},
 	/// Atomic replacement failed.
 	#[error("failed to atomically replace settings file {path}")]
 	Replace {
+		/// Native settings file targeted by the atomic replacement.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while renaming the temporary file into place.
 		source: io::Error,
 	},
 	/// Windows rollback after replacement failure also failed.
 	#[error("failed to roll back settings file {path} after replacement failure")]
 	Rollback {
+		/// Native settings file whose failed replacement is being restored.
 		path:   PathBuf,
 		#[source]
+		/// I/O failure returned while restoring the Windows backup.
 		source: io::Error,
 	},
 }

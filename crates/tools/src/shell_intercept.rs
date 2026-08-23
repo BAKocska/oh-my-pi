@@ -1,6 +1,6 @@
 //! Conservative shell-intent guidance derived from BashIR command segments.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, iter};
 
 use omp_core::{Str, sf};
 
@@ -91,7 +91,7 @@ pub fn analyze(command: &str, live_tools: &[Str]) -> Option<Guidance> {
 }
 
 fn candidates(command: &str) -> impl Iterator<Item = &str> {
-	std::iter::once(command.trim()).chain(
+	iter::once(command.trim()).chain(
 		omp_shell_engine::parser::flat_shell_segments(command)
 			.into_iter()
 			.filter(|segment| !segment.piped_stdin)

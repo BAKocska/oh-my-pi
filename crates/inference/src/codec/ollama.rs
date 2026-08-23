@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use omp_catalog::{
-	ClassId, OperationBits, OperationKind, ProviderId, RouteId, WireModelId,
+	ClassId, OperationBits, OperationKind, ProviderId, RouteId, ThinkingEffort, WireModelId,
 	discover::DiscoveredModel,
 };
 use omp_core::{Str, encoding::base64, sf};
@@ -13,8 +13,9 @@ use crate::{
 	answer::{AnswerBody, Embedding, EmbeddingBatch},
 	body::BodySource,
 	call::{
-		ChatRequest, ContentPart, EmbeddingInput, MediaInput, Message, OperationCall, Role, Setting,
-		ToolChoice, ToolResultContent, TruncationPolicy,
+		ChatRequest, ContentPart, EmbedRequest, EmbeddingInput, MediaInput, Message, OperationCall,
+		ProviderProof, ReasoningRequest, Role, Setting, ToolChoice, ToolResultContent,
+		TruncationPolicy,
 	},
 	codec::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawCompletion,
@@ -305,7 +306,7 @@ impl Codec for OllamaCodec {
 
 fn encode_embed(
 	context: &EncodeContext<'_>,
-	request: &crate::call::EmbedRequest,
+	request: &EmbedRequest,
 ) -> Result<EncodedRequest, Error> {
 	let target = context
 		.target
@@ -486,7 +487,7 @@ fn encode_chat(
 
 fn encode_think<'a>(
 	context: &'a EncodeContext<'_>,
-	setting: &Setting<crate::call::ReasoningRequest>,
+	setting: &Setting<ReasoningRequest>,
 ) -> Result<Option<OllamaThink<'a>>, Error> {
 	if matches!(setting, Setting::Unset) {
 		return Ok(None);
@@ -497,17 +498,17 @@ fn encode_think<'a>(
 	if selection.suppress_when_off {
 		return Ok(None);
 	}
-	if selection.effort == omp_catalog::ThinkingEffort::Off {
+	if selection.effort == ThinkingEffort::Off {
 		return Ok(Some(OllamaThink::Disabled(false)));
 	}
 	let default = match selection.effort {
-		omp_catalog::ThinkingEffort::Off => "off",
-		omp_catalog::ThinkingEffort::Minimal => "minimal",
-		omp_catalog::ThinkingEffort::Low => "low",
-		omp_catalog::ThinkingEffort::Medium => "medium",
-		omp_catalog::ThinkingEffort::High => "high",
-		omp_catalog::ThinkingEffort::XHigh => "xhigh",
-		omp_catalog::ThinkingEffort::Max => "max",
+		ThinkingEffort::Off => "off",
+		ThinkingEffort::Minimal => "minimal",
+		ThinkingEffort::Low => "low",
+		ThinkingEffort::Medium => "medium",
+		ThinkingEffort::High => "high",
+		ThinkingEffort::XHigh => "xhigh",
+		ThinkingEffort::Max => "max",
 	};
 	let wire = selection
 		.native_effort
@@ -599,10 +600,7 @@ fn encode_message<'a>(
 	})
 }
 
-fn reject_proof(
-	context: &EncodeContext<'_>,
-	proof: Option<&crate::call::ProviderProof>,
-) -> Result<(), Error> {
+fn reject_proof(context: &EncodeContext<'_>, proof: Option<&ProviderProof>) -> Result<(), Error> {
 	if let Some(proof) = proof {
 		let target = context
 			.target

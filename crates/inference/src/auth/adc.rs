@@ -1,6 +1,7 @@
 //! Catalog-ordered application-default credential resolution.
 
 use std::{
+	env, fmt, fs, io, mem,
 	path::{Path, PathBuf},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,6 +13,7 @@ use ring::{
 	signature::{RSA_PKCS1_SHA256, RsaKeyPair},
 };
 use serde::{Deserialize, Serialize};
+use url::form_urlencoded;
 use zeroize::Zeroizing;
 
 use super::{
@@ -41,19 +43,17 @@ pub struct SystemAdcRuntime;
 
 impl AdcRuntime for SystemAdcRuntime {
 	fn environment(&self, name: &str) -> Result<Option<SecretString>, AdcRuntimeError> {
-		match std::env::var(name) {
+		match env::var(name) {
 			Ok(value) => Ok(Some(SecretString::from(value))),
-			Err(std::env::VarError::NotPresent) => Ok(None),
-			Err(std::env::VarError::NotUnicode(_)) => Err(AdcRuntimeError::InvalidEnvironment),
+			Err(env::VarError::NotPresent) => Ok(None),
+			Err(env::VarError::NotUnicode(_)) => Err(AdcRuntimeError::InvalidEnvironment),
 		}
 	}
 
 	fn read_secret_file(&self, path: &Path) -> Result<SecretString, AdcRuntimeError> {
-		match std::fs::read_to_string(path) {
+		match fs::read_to_string(path) {
 			Ok(value) => Ok(SecretString::from(value)),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-				Err(AdcRuntimeError::NotFound)
-			},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Err(AdcRuntimeError::NotFound),
 			Err(_) => Err(AdcRuntimeError::Io),
 		}
 	}
@@ -62,7 +62,7 @@ impl AdcRuntime for SystemAdcRuntime {
 		let Some(rest) = path.strip_prefix("~/") else {
 			return Ok(PathBuf::from(path));
 		};
-		let home = std::env::var_os("HOME").ok_or(AdcRuntimeError::NoHome)?;
+		let home = env::var_os("HOME").ok_or(AdcRuntimeError::NoHome)?;
 		Ok(PathBuf::from(home).join(rest))
 	}
 }
@@ -260,7 +260,7 @@ where
 	}
 
 	fn form_request(url: &str, fields: &[(&str, &str)]) -> Result<OAuthHttpRequest, AdcError> {
-		let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+		let mut serializer = form_urlencoded::Serializer::new(String::new());
 		for (name, value) in fields {
 			serializer.append_pair(name, value);
 		}
@@ -302,8 +302,8 @@ pub struct AdcResolution {
 	pub quota_project: Option<Str>,
 }
 
-impl std::fmt::Debug for AdcResolution {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for AdcResolution {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("AdcResolution")
 			.field("lease", &self.lease)
@@ -538,7 +538,7 @@ fn service_account_assertion(
 	let encoded_signature = base64_url::encode_raw(&signature[..]).into_string();
 	signed.push('.');
 	signed.push_str(&encoded_signature);
-	Ok(SecretString::from(std::mem::take(&mut *signed)))
+	Ok(SecretString::from(mem::take(&mut *signed)))
 }
 
 fn decode_private_key(pem: &str) -> Result<Zeroizing<Vec<u8>>, AdcError> {
@@ -564,7 +564,13 @@ mod tests {
 	use futures::{FutureExt, future::BoxFuture};
 	use parking_lot::Mutex;
 
-	use super::*;
+	use super::{
+		super::{
+			oauth::OAuthTransportError as OauthOAuthTransportError,
+			spec::HeaderPlacement as SpecHeaderPlacement,
+		},
+		*,
+	};
 	use crate::id::{AccountId, PrincipalId};
 
 	#[derive(Default)]
@@ -597,7 +603,7 @@ mod tests {
 		fn execute(
 			&self,
 			_: OAuthHttpRequest,
-		) -> BoxFuture<'_, Result<OAuthHttpResponse, super::super::oauth::OAuthTransportError>> {
+		) -> BoxFuture<'_, Result<OAuthHttpResponse, OauthOAuthTransportError>> {
 			async move { Ok(self.0.lock().remove(0)) }.boxed()
 		}
 	}
@@ -632,7 +638,7 @@ mod tests {
 			location_env: Vec::new(),
 			scopes:       Vec::new(),
 			audience:     None,
-			placement:    super::super::spec::HeaderPlacement::bearer().into(),
+			placement:    SpecHeaderPlacement::bearer().into(),
 		};
 		let resolution = engine
 			.resolve(&spec, meta(), UNIX_EPOCH)
@@ -659,7 +665,7 @@ mod tests {
 			location_env: Vec::new(),
 			scopes:       Vec::new(),
 			audience:     None,
-			placement:    super::super::spec::HeaderPlacement::bearer().into(),
+			placement:    SpecHeaderPlacement::bearer().into(),
 		};
 		assert!(matches!(
 			engine.resolve(&spec, meta(), UNIX_EPOCH).await,
@@ -693,7 +699,7 @@ mod tests {
 			location_env: Vec::new(),
 			scopes:       vec!["scope".into()],
 			audience:     None,
-			placement:    super::super::spec::HeaderPlacement::bearer().into(),
+			placement:    SpecHeaderPlacement::bearer().into(),
 		};
 		let resolution = engine
 			.resolve(&spec, meta(), UNIX_EPOCH)

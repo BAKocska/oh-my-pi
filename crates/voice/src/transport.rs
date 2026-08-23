@@ -2,18 +2,23 @@
 
 use std::{
 	collections::{HashSet, VecDeque},
+	error,
 	future::Future,
+	io,
 	sync::Arc,
 	time::Duration,
 };
 
 use futures::{SinkExt as _, StreamExt as _};
-use http::Request;
+use http::{
+	Request,
+	header::{HeaderName, HeaderValue},
+};
 use omp_core::{Str, sf};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time};
 use tokio_tungstenite::{
 	MaybeTlsStream, WebSocketStream, connect_async,
 	tungstenite::{self, Message, client::IntoClientRequest as _},
@@ -112,7 +117,7 @@ pub struct LiveSignalingResponse {
 /// HTTP transport (including its proxy and OAuth refresh policy).
 pub trait LiveSignalingClient {
 	/// Typed signaling error.
-	type Error: std::error::Error + Send + Sync + 'static;
+	type Error: error::Error + Send + Sync + 'static;
 
 	/// Posts one SDP offer.
 	fn signal(
@@ -128,7 +133,7 @@ pub trait SidebandConnector {
 	/// Connected websocket type.
 	type Socket;
 	/// Typed connection failure.
-	type Error: std::error::Error + Send + Sync + 'static;
+	type Error: error::Error + Send + Sync + 'static;
 
 	/// Connects the authenticated sideband request through `proxy` when present.
 	fn connect(
@@ -182,8 +187,8 @@ impl SidebandConnector for DirectSidebandConnector {
 #[derive(Debug, Error)]
 pub enum LiveTransportError<S, W>
 where
-	S: std::error::Error + Send + Sync + 'static,
-	W: std::error::Error + Send + Sync + 'static,
+	S: error::Error + Send + Sync + 'static,
+	W: error::Error + Send + Sync + 'static,
 {
 	/// Native media initialization or SDP answer failed.
 	#[error(transparent)]
@@ -310,7 +315,7 @@ where
 			Err(error) => last = Some(error),
 		}
 		if attempt + 1 < SIDEBAND_ATTEMPTS {
-			tokio::time::sleep(delay).await;
+			time::sleep(delay).await;
 			delay = delay.saturating_mul(2);
 		}
 	}
@@ -348,18 +353,16 @@ fn sideband_request<S, W>(
 	attestation: Option<&str>,
 ) -> Result<Request<()>, LiveTransportError<S, W>>
 where
-	S: std::error::Error + Send + Sync + 'static,
-	W: std::error::Error + Send + Sync + 'static,
+	S: error::Error + Send + Sync + 'static,
+	W: error::Error + Send + Sync + 'static,
 {
 	let url = format!("wss://api.openai.com/v1/live/{call_id}");
 	let mut request = url
 		.into_client_request()
 		.map_err(|_| LiveTransportError::Header)?;
 	for (name, value) in session_headers(options, attestation) {
-		let name = http::header::HeaderName::from_bytes(name.as_bytes())
-			.map_err(|_| LiveTransportError::Header)?;
-		let value = http::header::HeaderValue::from_str(value.as_str())
-			.map_err(|_| LiveTransportError::Header)?;
+		let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| LiveTransportError::Header)?;
+		let value = HeaderValue::from_str(value.as_str()).map_err(|_| LiveTransportError::Header)?;
 		request.headers_mut().insert(name, value);
 	}
 	Ok(request)
@@ -474,9 +477,8 @@ pub async fn send_sideband(
 	socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
 	value: &impl Serialize,
 ) -> Result<(), tungstenite::Error> {
-	let payload = serde_json::to_string(value).map_err(|error| {
-		tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-	})?;
+	let payload = serde_json::to_string(value)
+		.map_err(|error| tungstenite::Error::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
 	socket.send(Message::Text(payload.into())).await
 }
 

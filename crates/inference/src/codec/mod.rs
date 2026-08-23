@@ -27,13 +27,14 @@ use crate::{
 		AnswerBody, AudioChunk, GenerationEvent, ImageArtifact, RealtimeEvent, RealtimeInput,
 		RealtimeSession, TranscriptEvent, VideoArtifact,
 	},
-	auth::{BodyPlacement, lease::AppliedCredentials},
+	auth::{AuthScheme, BodyPlacement, CredentialApplyError, lease::AppliedCredentials},
 	body::{AttemptEvidenceHandle, BodySource},
 	call::{AccountRoutingContext, OperationCall, SessionRequest},
 	error::Error,
-	event::{ChatEvent, FinishReason},
+	event::{ChatEvent, FinishReason, WorkflowResponse},
 	id::{AccountId, PrincipalId, RequestId, ToolCallId},
 	receipt::Usage,
+	session::ServerStateBinding,
 	transport::{Frame, FramingProtocol},
 };
 
@@ -141,7 +142,7 @@ impl SealedBodyTemplate {
 		}
 	}
 
-	pub(crate) fn bind(self, secret: &str) -> Result<Bytes, crate::auth::CredentialApplyError> {
+	pub(crate) fn bind(self, secret: &str) -> Result<Bytes, CredentialApplyError> {
 		match self {
 			Self::Devin(template) => template.bind(secret),
 		}
@@ -275,7 +276,7 @@ pub struct EncodeContext<'a> {
 	/// Logical request identity used by protocols with stable reconnect keys.
 	pub request_id:         &'a RequestId,
 	/// Non-secret authentication scheme selected for the resolved lease.
-	pub auth_scheme:        Option<crate::auth::AuthScheme>,
+	pub auth_scheme:        Option<AuthScheme>,
 	/// Complete selected route definition.
 	pub route:              &'a RouteDef,
 	/// Optional codec-facing target. Model-less management operations carry
@@ -296,7 +297,7 @@ pub struct EncodeContext<'a> {
 	/// Optional canonical session identity and revision.
 	pub session:            Option<&'a SessionRequest>,
 	/// Compatible typed provider-side state selected by session planning.
-	pub server_state:       Option<&'a crate::session::ServerStateBinding>,
+	pub server_state:       Option<&'a ServerStateBinding>,
 	/// Non-secret account/project/tenant routing metadata.
 	pub account:            Option<&'a AccountRoutingContext>,
 	/// Attempt metadata that may affect idempotency fields.
@@ -376,7 +377,7 @@ pub struct DecodeContext<'a> {
 	/// Logical request identity.
 	pub request_id:         &'a RequestId,
 	/// Non-secret authentication scheme used for this attempt.
-	pub auth_scheme:        Option<crate::auth::AuthScheme>,
+	pub auth_scheme:        Option<AuthScheme>,
 	/// Selected provider domain.
 	pub provider:           &'a ProviderId,
 	/// Selected route.
@@ -729,7 +730,7 @@ pub enum ProviderControlEvent {
 }
 
 /// Client response accepted only by a live bidirectional provider attempt.
-pub type ProviderControlInput = crate::event::WorkflowResponse;
+pub type ProviderControlInput = WorkflowResponse;
 
 /// Codec-emitted terminal facts before final accounting is merged.
 #[derive(Clone, Debug, Eq, PartialEq)]

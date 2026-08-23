@@ -4,6 +4,8 @@
 //! cargo run -p omp-webview --example child -- https://example.com
 //! ```
 
+use std::{env, error};
+
 use omp_webview::{Engine, Rect, WebView, WebViewBuilder};
 use winit::{
 	application::ApplicationHandler,
@@ -79,8 +81,8 @@ impl ApplicationHandler for App {
 	}
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let url = std::env::args()
+fn main() -> Result<(), Box<dyn error::Error>> {
+	let url = env::args()
 		.nth(1)
 		.unwrap_or_else(|| "https://example.com".into());
 	let event_loop = EventLoop::new()?;

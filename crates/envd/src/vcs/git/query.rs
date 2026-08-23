@@ -1,6 +1,6 @@
 //! NUL-safe repository file and history queries.
 
-use std::path::Path;
+use std::{path::Path, str};
 
 use bytes::Bytes;
 use omp_core::{IntoStr, Str};
@@ -234,7 +234,7 @@ impl GitQuery {
 		let mut fields = bytes.split(|byte| *byte == 0);
 		let mut next = || -> Result<Str, CommandError> {
 			let field = fields.next().ok_or(CommandError::NonUtf8)?;
-			std::str::from_utf8(field)
+			str::from_utf8(field)
 				.map(|value| value.to_str())
 				.map_err(|_| CommandError::NonUtf8)
 		};
@@ -270,7 +270,7 @@ fn parse_nul_paths(bytes: Bytes) -> Vec<GitPath> {
 }
 
 fn parse_lines(bytes: Bytes) -> Result<Vec<Str>, CommandError> {
-	let text = std::str::from_utf8(&bytes).map_err(|_| CommandError::NonUtf8)?;
+	let text = str::from_utf8(&bytes).map_err(|_| CommandError::NonUtf8)?;
 	Ok(text
 		.lines()
 		.filter(|line| !line.is_empty())

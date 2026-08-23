@@ -1,5 +1,7 @@
 //! Construction-time composition of the one fixed inference service stack.
 
+use std::sync;
+
 use omp_catalog::{provider::RouteDef, snapshot::Catalog};
 use tower::Layer;
 
@@ -21,7 +23,14 @@ use super::{
 	semantic::{SemanticLayer, SemanticService},
 	session::{SessionLayer, SessionService},
 };
-use crate::{Answer, Call, Error, layer::LayerCall, registry::RouteUnavailable};
+use crate::{
+	Answer, Call, Error,
+	auth::manager::AuthManager,
+	layer::{LayerCall, budget::InferenceLedger},
+	operation::usage::ConsoleUsageManager,
+	provider::builtin::{ProductionDependencies, ProductionRouteComposer},
+	registry::RouteUnavailable,
+};
 
 /// Construction-time erased route service that reuses the outer logical
 /// execution context.
@@ -54,26 +63,24 @@ pub trait RouteComposer: Send + Sync + 'static {
 /// Production configuration for built-in route construction.
 #[derive(Clone)]
 pub struct BuiltinConfig {
-	composer:      std::sync::Arc<dyn RouteComposer>,
-	auth_manager:  Option<crate::auth::manager::AuthManager>,
-	usage_manager: Option<crate::operation::usage::ConsoleUsageManager>,
+	composer:      sync::Arc<dyn RouteComposer>,
+	auth_manager:  Option<AuthManager>,
+	usage_manager: Option<ConsoleUsageManager>,
 }
 impl BuiltinConfig {
 	/// Creates configuration from a production composer owning all route-scoped
 	/// dependencies.
-	pub fn new(composer: std::sync::Arc<dyn RouteComposer>) -> Self {
+	pub fn new(composer: sync::Arc<dyn RouteComposer>) -> Self {
 		Self { composer, auth_manager: None, usage_manager: None }
 	}
 
 	/// Creates the canonical production composer from explicit shared
 	/// dependencies.
-	pub fn production(dependencies: crate::provider::builtin::ProductionDependencies) -> Self {
+	pub fn production(dependencies: ProductionDependencies) -> Self {
 		let auth_manager = dependencies.auth_manager();
 		let usage_manager = dependencies.usage_manager();
 		Self {
-			composer: std::sync::Arc::new(crate::provider::builtin::ProductionRouteComposer::new(
-				dependencies,
-			)),
+			composer: sync::Arc::new(ProductionRouteComposer::new(dependencies)),
 			auth_manager: Some(auth_manager),
 			usage_manager,
 		}
@@ -81,30 +88,25 @@ impl BuiltinConfig {
 
 	/// Attaches the comprehensive auth-management service used by provider-level
 	/// auth operations.
-	pub fn with_auth_manager(mut self, auth_manager: crate::auth::manager::AuthManager) -> Self {
+	pub fn with_auth_manager(mut self, auth_manager: AuthManager) -> Self {
 		self.auth_manager = Some(auth_manager);
 		self
 	}
 
 	/// Attaches provider console usage backends used by usage operations.
-	pub fn with_usage_manager(
-		mut self,
-		usage_manager: crate::operation::usage::ConsoleUsageManager,
-	) -> Self {
+	pub fn with_usage_manager(mut self, usage_manager: ConsoleUsageManager) -> Self {
 		self.usage_manager = Some(usage_manager);
 		self
 	}
 
 	/// Borrows the auth manager for registry management-service injection.
-	pub(crate) const fn auth_manager(&self) -> Option<&crate::auth::manager::AuthManager> {
+	pub(crate) const fn auth_manager(&self) -> Option<&AuthManager> {
 		self.auth_manager.as_ref()
 	}
 
 	/// Borrows the console usage manager for registry management-service
 	/// injection.
-	pub(crate) const fn usage_manager(
-		&self,
-	) -> Option<&crate::operation::usage::ConsoleUsageManager> {
+	pub(crate) const fn usage_manager(&self) -> Option<&ConsoleUsageManager> {
 		self.usage_manager.as_ref()
 	}
 }
@@ -261,7 +263,7 @@ where
 pub fn build_execution_stack<S, O>(
 	dispatch: S,
 	observer: ObserveLayer<O>,
-	ledger: crate::layer::budget::InferenceLedger,
+	ledger: InferenceLedger,
 ) -> OuterExecutionService<S, O>
 where
 	O: Clone,

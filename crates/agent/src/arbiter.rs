@@ -1,5 +1,8 @@
 //! Named decision-point seams for the closed agent loop.
 
+use std::{array, mem, sync};
+
+use flume::Receiver;
 use omp_core::{Point, PointSet, Str};
 use serde::{Deserialize, Serialize};
 
@@ -90,7 +93,7 @@ pub struct Fold {
 struct RegisteredLane {
 	id:         Str,
 	precedence: i16,
-	lane:       std::sync::Arc<dyn Lane>,
+	lane:       sync::Arc<dyn Lane>,
 }
 
 /// One behavior-preserving core lane at fixed decision points.
@@ -121,7 +124,7 @@ pub struct Arbiter {
 	pending_facts:      Vec<FoldFact>,
 	subscribed:         PointSet,
 	fact_tx:            flume::Sender<FoldFact>,
-	fact_rx:            flume::Receiver<FoldFact>,
+	fact_rx:            Receiver<FoldFact>,
 }
 
 impl Default for Arbiter {
@@ -133,7 +136,7 @@ impl Default for Arbiter {
 			empty_output_retry: settle::EmptyOutputRetry::default(),
 			checkpoint_notice: context::CheckpointNotice::default(),
 			retry_chain: None,
-			lanes: std::array::from_fn(|_| Vec::new()),
+			lanes: array::from_fn(|_| Vec::new()),
 			pending_facts: Vec::new(),
 			subscribed: PointSet::EMPTY,
 			fact_tx,
@@ -195,7 +198,7 @@ impl Arbiter {
 	/// Engages and journals one lane as a single lifecycle operation.
 	pub fn engage(
 		&mut self,
-		spec: std::sync::Arc<CampaignSpec>,
+		spec: sync::Arc<CampaignSpec>,
 		machine: Box<dyn CampaignMachine>,
 		journal: &mut Journal,
 		options: EngageOptions,
@@ -315,7 +318,7 @@ impl Arbiter {
 		now_ms: u64,
 	) -> Result<RevivalReport, JournalError>
 	where
-		F: FnMut(&str) -> Option<(std::sync::Arc<CampaignSpec>, Box<dyn CampaignMachine>)>,
+		F: FnMut(&str) -> Option<(sync::Arc<CampaignSpec>, Box<dyn CampaignMachine>)>,
 	{
 		let entries = journal.recover_campaign_entries()?;
 		let report = self.campaigns.revive(entries, |id| resolve(id));
@@ -332,7 +335,7 @@ impl Arbiter {
 	}
 
 	/// Registers one lane into every subscribed per-point list.
-	pub fn register(&mut self, lane: std::sync::Arc<dyn Lane>) {
+	pub fn register(&mut self, lane: sync::Arc<dyn Lane>) {
 		let points = lane.points();
 		let id = Str::new(lane.id());
 		let precedence = lane.precedence();
@@ -341,11 +344,7 @@ impl Arbiter {
 				continue;
 			}
 			let list = &mut self.lanes[usize::from(point.ordinal())];
-			list.push(RegisteredLane {
-				id: id.clone(),
-				precedence,
-				lane: std::sync::Arc::clone(&lane),
-			});
+			list.push(RegisteredLane { id: id.clone(), precedence, lane: sync::Arc::clone(&lane) });
 			list.sort_by(|left, right| {
 				right
 					.precedence
@@ -418,7 +417,7 @@ impl Arbiter {
 
 	/// Flushes facts buffered while a durable turn was pending.
 	pub fn flush(&mut self, journal: &mut Journal, now_ms: u64) -> Result<(), JournalError> {
-		for fact in std::mem::take(&mut self.pending_facts) {
+		for fact in mem::take(&mut self.pending_facts) {
 			journal.append_arbiter_fold(now_ms, &fact)?;
 		}
 		self.checkpoint(journal, now_ms)
@@ -449,7 +448,7 @@ pub enum ArbiterError {
 /// CONTEXT-point core lanes.
 pub(crate) mod context {
 	use omp_core::{Point, Str};
-	use omp_proto::thread::v1::{self as thread, Item};
+	use omp_proto::thread::v1::{self as thread, Item, item};
 	use omp_storage::transcript::{Entry, Kind};
 	use serde::Deserialize;
 
@@ -457,6 +456,8 @@ pub(crate) mod context {
 	use crate::{
 		Journal, JournalError,
 		campaign::{CampaignMachine, CampaignStateError, Reaction, Verdict},
+		journal_kinds::{CHECKPOINT_KIND, REWIND_REPORT_KIND},
+		r#loop::now_ms,
 	};
 
 	/// Session-scoped checkpoint notice campaign.
@@ -554,7 +555,7 @@ pub(crate) mod context {
 				continue;
 			};
 			match custom.kind() {
-				crate::journal_kinds::CHECKPOINT_KIND => {
+				CHECKPOINT_KIND => {
 					let Some(data) = custom.data() else { continue };
 					let Ok(record) = serde_json::from_str::<CheckpointRecord>(data.get()) else {
 						continue;
@@ -567,7 +568,7 @@ pub(crate) mod context {
 					});
 					state.rewind_scheduled = false;
 				},
-				crate::journal_kinds::REWIND_REPORT_KIND => {
+				REWIND_REPORT_KIND => {
 					let Some(data) = custom.data() else { continue };
 					let Ok(record) = serde_json::from_str::<RewindRecord>(data.get()) else {
 						continue;
@@ -611,8 +612,8 @@ pub(crate) mod context {
 
 	fn message(role: thread::Role, text: String) -> Item {
 		Item {
-			created_at_ms: crate::r#loop::now_ms(),
-			kind: Some(thread::item::Kind::Message(thread::Message {
+			created_at_ms: now_ms(),
+			kind: Some(item::Kind::Message(thread::Message {
 				role:  role as i32,
 				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
 			})),
@@ -627,12 +628,13 @@ pub(crate) mod settle {
 	use omp_core::{Point, Str};
 	use omp_proto::{
 		inference::v1 as pb,
-		thread::v1::{self as thread, Item},
+		thread::v1::{self as thread, Item, item},
 	};
 
 	use crate::{
 		campaign::{BindSlot, CampaignMachine, CampaignStateError, Reaction, ScopedBinding, Verdict},
 		continuation::{Continuation, ContinuationPolicy, ContinuationSource, LoopSignal},
+		r#loop::now_ms,
 		turn::empty_stop,
 	};
 
@@ -642,6 +644,7 @@ pub(crate) mod settle {
 		spent: u8,
 	}
 	use super::PointCx;
+	use crate::prompt_assets::render_empty_stop_retry;
 
 	impl EmptyOutputRetry {
 		pub(crate) const CAP: u8 = 3;
@@ -774,11 +777,7 @@ pub(crate) mod settle {
 	impl EmptyOutputRetry {
 		pub(crate) fn item(attempt: u8) -> Item {
 			let mut text = String::new();
-			crate::prompt_assets::render_empty_stop_retry(
-				&mut text,
-				usize::from(attempt),
-				usize::from(Self::CAP),
-			);
+			render_empty_stop_retry(&mut text, usize::from(attempt), usize::from(Self::CAP));
 			message(text)
 		}
 
@@ -813,8 +812,8 @@ pub(crate) mod settle {
 	fn message(text: String) -> Item {
 		Item {
 			seq:           0,
-			created_at_ms: crate::r#loop::now_ms(),
-			kind:          Some(thread::item::Kind::Message(thread::Message {
+			created_at_ms: now_ms(),
+			kind:          Some(item::Kind::Message(thread::Message {
 				role:  thread::Role::User as i32,
 				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
 			})),
@@ -839,9 +838,9 @@ pub(crate) mod stream {
 	use std::fmt::Write as _;
 
 	use omp_core::{Point, Str, sf};
-	use omp_proto::thread::v1::{self as thread, Item};
+	use omp_proto::thread::v1::{self as thread, Item, item};
 
-	use crate::{TtsrMatch, TtsrMatchContext, TtsrRegistry, TtsrSource};
+	use crate::{TtsrMatch, TtsrMatchContext, TtsrRegistry, TtsrSource, r#loop::now_ms};
 
 	#[derive(Clone)]
 	pub(crate) struct TtsrCampaignCut {
@@ -878,6 +877,10 @@ pub(crate) mod stream {
 		deferred:    Vec<DeferredTtsr>,
 		pending_cut: Option<TtsrCampaignCut>,
 	}
+	use std::mem;
+
+	use omp_inference::recovery::repetition::StreamRecoveryKind;
+
 	use super::PointCx;
 	use crate::campaign::{CampaignMachine, CampaignStateError, Reaction, Verdict};
 
@@ -971,7 +974,7 @@ pub(crate) mod stream {
 			if self.deferred.is_empty() {
 				return None;
 			}
-			let deferred = std::mem::take(&mut self.deferred);
+			let deferred = mem::take(&mut self.deferred);
 			let source = deferred[0].source;
 			let matches = deferred
 				.into_iter()
@@ -1113,8 +1116,8 @@ pub(crate) mod stream {
 	pub(crate) fn ttsr_reminder_item(text: String) -> Item {
 		Item {
 			seq:           0,
-			created_at_ms: crate::r#loop::now_ms(),
-			kind:          Some(thread::item::Kind::Message(thread::Message {
+			created_at_ms: now_ms(),
+			kind:          Some(item::Kind::Message(thread::Message {
 				role:  thread::Role::User as i32,
 				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
 			})),
@@ -1122,24 +1125,22 @@ pub(crate) mod stream {
 		}
 	}
 
-	pub(crate) fn stream_recovery_item(
-		kind: omp_inference::recovery::repetition::StreamRecoveryKind,
-	) -> Item {
+	pub(crate) fn stream_recovery_item(kind: StreamRecoveryKind) -> Item {
 		let reason = match kind {
-			omp_inference::recovery::repetition::StreamRecoveryKind::Http2Reset => {
+			StreamRecoveryKind::Http2Reset => {
 				"the provider reset the response stream before output committed"
 			},
-			omp_inference::recovery::repetition::StreamRecoveryKind::FirstEventStall => {
+			StreamRecoveryKind::FirstEventStall => {
 				"the provider produced no first response event before the watchdog expired"
 			},
-			omp_inference::recovery::repetition::StreamRecoveryKind::PostToolIdleStall => {
+			StreamRecoveryKind::PostToolIdleStall => {
 				"the provider stalled after tool results before producing another event"
 			},
 		};
 		Item {
 			seq:           0,
-			created_at_ms: crate::r#loop::now_ms(),
-			kind:          Some(thread::item::Kind::Message(thread::Message {
+			created_at_ms: now_ms(),
+			kind:          Some(item::Kind::Message(thread::Message {
 				role:  thread::Role::User as i32,
 				parts: vec![thread::Part {
 					kind: Some(thread::part::Kind::Text(format!(

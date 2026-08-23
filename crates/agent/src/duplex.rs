@@ -1,7 +1,8 @@
 //! Concurrent server-initiated tool invocations for a live arbiter turn.
 
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{collections::HashMap, error, fmt, fmt::Display, str, sync::Arc, time::Duration};
 
+use flume::Receiver;
 use omp_core::{IntoStr, Str, sf};
 use omp_env::EnvClient;
 use omp_proto::{
@@ -9,7 +10,7 @@ use omp_proto::{
 	thread::v1::item,
 };
 use omp_tool::{CapsBase, Registry, RegistryError, ToolIdentity};
-use tokio::sync::watch;
+use tokio::{sync::watch, task};
 
 use crate::{
 	BatchError, EventBus, SpeculativeCall, ToolBatch, batch::BatchUpdate, turn::InvokeFrame,
@@ -26,7 +27,7 @@ pub enum DuplexError {
 	MissingToolResult,
 }
 
-impl fmt::Display for DuplexError {
+impl Display for DuplexError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Batch(error) => write!(formatter, "duplex tool invocation failed: {error}"),
@@ -36,8 +37,8 @@ impl fmt::Display for DuplexError {
 	}
 }
 
-impl std::error::Error for DuplexError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for DuplexError {
+	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		match self {
 			Self::Batch(error) => Some(error),
 			Self::Registry(error) => Some(error),
@@ -78,7 +79,7 @@ pub struct DuplexManager {
 	interrupt_grace: Duration,
 	active:          HashMap<String, ActiveInvocation>,
 	completion_tx:   flume::Sender<Completion>,
-	completion_rx:   flume::Receiver<Completion>,
+	completion_rx:   Receiver<Completion>,
 	next_token:      u64,
 }
 
@@ -189,107 +190,119 @@ impl Drop for DuplexManager {
 	}
 }
 
-async fn run_invocation(
-	invoke: Invoke,
-	env: EnvClient,
-	registry: Arc<Registry>,
-	events: EventBus,
-	caps: CapsBase,
-	interrupt: watch::Receiver<Option<Str>>,
-	grace: Duration,
-	frames: flume::Sender<Completion>,
-	token: u64,
-) -> Result<InvokeComplete, DuplexError> {
-	let invocation_id = invoke.invocation_id;
-	let frame_invocation_id = invocation_id.clone();
-	let Some(call) = invoke.tool_call else {
-		return Ok(failed_completion(invocation_id, "control invocation has no canonical tool call"));
-	};
-	if invocation_id.is_empty() {
-		return Ok(failed_completion(invocation_id, "invocation id is empty"));
-	}
-	if invoke.timeout_ms == 0 {
-		return Ok(failed_completion(invocation_id, "invocation deadline is zero"));
-	}
-	if call.id.is_empty() || call.name.is_empty() || invoke.name.is_empty() {
-		return Ok(failed_completion(invocation_id, "canonical tool call is incomplete"));
-	}
-	if invoke.name != call.name {
-		return Ok(failed_completion(
-			invocation_id,
-			"dispatch name differs from canonical tool call",
-		));
-	}
-	let Some((name, rev)) = registry.live_identity(&invoke.name) else {
-		return Ok(failed_completion(invocation_id, "invocation names an unknown tool"));
-	};
-	let identity = ToolIdentity { name: name.clone(), rev: rev.clone() };
-	let raw_args = call.args_json.clone();
-	let fragment = match std::str::from_utf8(&call.args_json) {
-		Ok(fragment) => fragment.to_str(),
-		Err(_) => return Ok(failed_completion(invocation_id, "tool arguments are not UTF-8")),
-	};
-	let deadline = Duration::from_millis(invoke.timeout_ms);
-	let mut speculative =
-		SpeculativeCall::open(&env, &events, Str::new(call.id.as_str()), identity, deadline).await?;
-	speculative.relay_fragment(fragment).await?;
-	// In-process relays can stay ready throughout; poll owner cancellation once
-	// before crossing the effect-authorization boundary.
-	tokio::task::yield_now().await;
-	if interrupt.borrow().is_some() {
-		return Ok(failed_completion(invocation_id, "invocation interrupted before execution"));
-	}
-	let committed = speculative.commit(raw_args);
-	let (updates_tx, updates_rx) = flume::unbounded();
-	let drive = ToolBatch::new(vec![committed]).drive_streaming(
-		registry.as_ref(),
-		&caps,
-		interrupt,
-		grace,
-		updates_tx,
-	);
-	tokio::pin!(drive);
-	let mut results = loop {
-		tokio::select! {
-			biased;
-			update = updates_rx.recv_async() => {
-				let Ok(update) = update else {
-					break drive.await;
-				};
-				send_update(
-					&registry,
-					&frame_invocation_id,
-					token,
-					&frames,
-					update,
-				).await?;
-			},
-			results = &mut drive => break results,
+mod invocation {
+	use tokio::sync::watch::Receiver;
+
+	use super::*;
+
+	pub(super) async fn run_invocation(
+		invoke: Invoke,
+		env: EnvClient,
+		registry: Arc<Registry>,
+		events: EventBus,
+		caps: CapsBase,
+		interrupt: Receiver<Option<Str>>,
+		grace: Duration,
+		frames: flume::Sender<Completion>,
+		token: u64,
+	) -> Result<InvokeComplete, DuplexError> {
+		let invocation_id = invoke.invocation_id;
+		let frame_invocation_id = invocation_id.clone();
+		let Some(call) = invoke.tool_call else {
+			return Ok(failed_completion(
+				invocation_id,
+				"control invocation has no canonical tool call",
+			));
+		};
+		if invocation_id.is_empty() {
+			return Ok(failed_completion(invocation_id, "invocation id is empty"));
 		}
-	};
-	while let Ok(update) = updates_rx.try_recv() {
-		send_update(&registry, &frame_invocation_id, token, &frames, update).await?;
-	}
-	let result = results.pop().ok_or(DuplexError::MissingToolResult)?;
-	let tool_result = match result.item().kind.as_ref() {
-		Some(item::Kind::ToolResult(result)) => result.clone(),
-		_ => return Err(DuplexError::MissingToolResult),
-	};
-	let is_error = tool_result.is_error;
-	Ok(InvokeComplete {
-		invocation_id,
-		tool_result: Some(tool_result),
-		status: Some(ExecStatus {
-			outcome: if is_error {
-				exec_status::Outcome::Failed as i32
-			} else {
-				exec_status::Outcome::Exited as i32
-			},
+		if invoke.timeout_ms == 0 {
+			return Ok(failed_completion(invocation_id, "invocation deadline is zero"));
+		}
+		if call.id.is_empty() || call.name.is_empty() || invoke.name.is_empty() {
+			return Ok(failed_completion(invocation_id, "canonical tool call is incomplete"));
+		}
+		if invoke.name != call.name {
+			return Ok(failed_completion(
+				invocation_id,
+				"dispatch name differs from canonical tool call",
+			));
+		}
+		let Some((name, rev)) = registry.live_identity(&invoke.name) else {
+			return Ok(failed_completion(invocation_id, "invocation names an unknown tool"));
+		};
+		let identity = ToolIdentity { name: name.clone(), rev: rev.clone() };
+		let raw_args = call.args_json.clone();
+		let fragment = match str::from_utf8(&call.args_json) {
+			Ok(fragment) => fragment.to_str(),
+			Err(_) => return Ok(failed_completion(invocation_id, "tool arguments are not UTF-8")),
+		};
+		let deadline = Duration::from_millis(invoke.timeout_ms);
+		let mut speculative =
+			SpeculativeCall::open(&env, &events, Str::new(call.id.as_str()), identity, deadline)
+				.await?;
+		speculative.relay_fragment(fragment).await?;
+		// In-process relays can stay ready throughout; poll owner cancellation once
+		// before crossing the effect-authorization boundary.
+		task::yield_now().await;
+		if interrupt.borrow().is_some() {
+			return Ok(failed_completion(invocation_id, "invocation interrupted before execution"));
+		}
+		let committed = speculative.commit(raw_args);
+		let (updates_tx, updates_rx) = flume::unbounded();
+		let drive = ToolBatch::new(vec![committed]).drive_streaming(
+			registry.as_ref(),
+			&caps,
+			interrupt,
+			grace,
+			updates_tx,
+		);
+		tokio::pin!(drive);
+		let mut results = loop {
+			tokio::select! {
+				biased;
+				update = updates_rx.recv_async() => {
+					let Ok(update) = update else {
+						break drive.await;
+					};
+					send_update(
+						&registry,
+						&frame_invocation_id,
+						token,
+						&frames,
+						update,
+					).await?;
+				},
+				results = &mut drive => break results,
+			}
+		};
+		while let Ok(update) = updates_rx.try_recv() {
+			send_update(&registry, &frame_invocation_id, token, &frames, update).await?;
+		}
+		let result = results.pop().ok_or(DuplexError::MissingToolResult)?;
+		let tool_result = match result.item().kind.as_ref() {
+			Some(item::Kind::ToolResult(result)) => result.clone(),
+			_ => return Err(DuplexError::MissingToolResult),
+		};
+		let is_error = tool_result.is_error;
+		Ok(InvokeComplete {
+			invocation_id,
+			tool_result: Some(tool_result),
+			status: Some(ExecStatus {
+				outcome: if is_error {
+					exec_status::Outcome::Failed as i32
+				} else {
+					exec_status::Outcome::Exited as i32
+				},
+				..Default::default()
+			}),
 			..Default::default()
-		}),
-		..Default::default()
-	})
+		})
+	}
 }
+
+use invocation::run_invocation;
 
 async fn send_update(
 	registry: &Registry,

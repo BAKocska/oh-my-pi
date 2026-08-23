@@ -1,4 +1,10 @@
-use std::sync::{Arc, Barrier};
+//! Verifies concurrent key creation converges on one persisted owner-only
+//! secret.
+
+use std::{
+	sync::{Arc, Barrier},
+	thread,
+};
 
 #[test]
 fn exclusive_key_creators_converge_on_one_owner_only_file() {
@@ -13,7 +19,7 @@ fn exclusive_key_creators_converge_on_one_owner_only_file() {
 		.map(|_| {
 			let path = Arc::clone(&path);
 			let barrier = Arc::clone(&barrier);
-			std::thread::spawn(move || {
+			thread::spawn(move || {
 				barrier.wait();
 				omp_storage::secret_key::load_or_create_at(&path).expect("creator")
 			})

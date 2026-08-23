@@ -1,5 +1,6 @@
 use std::{
 	collections::{HashMap, VecDeque},
+	io, str,
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -17,6 +18,7 @@ use url::Url;
 
 use crate::{
 	DocumentId, DocumentKind, DocumentSnapshot, LanguageId, Revision,
+	lsp_process::LspFrameError,
 	position::{PositionEncoding, PositionError, PositionRange, TextEdit, apply_text_edits},
 };
 
@@ -58,14 +60,14 @@ pub enum LspTransportError {
 		operation: &'static str,
 		/// The underlying I/O failure.
 		#[source]
-		source:    Arc<std::io::Error>,
+		source:    Arc<io::Error>,
 	},
 	/// Reading an LSP frame failed.
 	#[error("LSP transport closed: {source}")]
 	Frame {
 		/// The frame decoding failure.
 		#[source]
-		source: Arc<crate::lsp_process::LspFrameError>,
+		source: Arc<LspFrameError>,
 	},
 	/// The peer returned malformed JSON where raw JSON was required.
 	#[error("invalid LSP response JSON")]
@@ -1499,7 +1501,7 @@ fn document_text(snapshot: &DocumentSnapshot) -> Result<&str, LspError> {
 }
 
 fn bytes_text(content: &Bytes) -> Result<&str, LspError> {
-	std::str::from_utf8(content).map_err(|_| LspError::InvalidUtf8)
+	str::from_utf8(content).map_err(|_| LspError::InvalidUtf8)
 }
 
 fn changed_span(old: &str, new: &str) -> (usize, usize, usize) {
@@ -1696,7 +1698,7 @@ pub enum LspError {
 mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 
-	use tokio::sync::Notify;
+	use tokio::{sync::Notify, time};
 
 	use super::*;
 	use crate::{DocumentHead, DocumentPresence};
@@ -1979,7 +1981,7 @@ mod tests {
 		});
 		transport.started.notified().await;
 
-		tokio::time::timeout(std::time::Duration::from_secs(1), async {
+		time::timeout(Duration::from_secs(1), async {
 			server.register_capabilities(Bytes::from_static(br#"{"registrations":[{"id":"during","method":"textDocument/didChange","registerOptions":{"documentSelector":null,"syncKind":2}}]}"#)).unwrap();
 			server.unregister_capabilities(Bytes::from_static(br#"{"unregistrations":[{"id":"during","method":"textDocument/didChange"}]}"#)).unwrap();
 			server.register_capabilities(Bytes::from_static(br#"{"registrations":[{"id":"after","method":"textDocument/didChange","registerOptions":{"documentSelector":null,"syncKind":1}}]}"#)).unwrap();
@@ -2021,8 +2023,8 @@ mod tests {
 
 		let cancellation = CancellationToken::new();
 		cancellation.cancel();
-		let result = tokio::time::timeout(
-			std::time::Duration::from_secs(1),
+		let result = time::timeout(
+			Duration::from_secs(1),
 			server.synchronize(
 				LspDocument { snapshot: &first, uri: &uri, language_id: None },
 				cancellation,

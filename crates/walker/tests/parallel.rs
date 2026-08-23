@@ -2,7 +2,9 @@
 use std::{
 	collections::BTreeMap,
 	convert::Infallible,
-	fs,
+	env,
+	ffi::OsStr,
+	fs, io,
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
@@ -32,7 +34,7 @@ impl TempTree {
 			.duration_since(UNIX_EPOCH)
 			.expect("system time should be after UNIX epoch")
 			.as_nanos();
-		let root = std::env::temp_dir().join(format!("pi-walker-parallel-{name}-{unique}"));
+		let root = env::temp_dir().join(format!("pi-walker-parallel-{name}-{unique}"));
 		fs::create_dir(&root).expect("temporary root should be created");
 		Self { root }
 	}
@@ -57,7 +59,7 @@ fn write_file(path: impl AsRef<Path>) {
 }
 
 #[cfg(unix)]
-fn write_file_if_supported(path: impl AsRef<Path>) -> std::io::Result<()> {
+fn write_file_if_supported(path: impl AsRef<Path>) -> io::Result<()> {
 	let path = path.as_ref();
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent)?;
@@ -244,8 +246,11 @@ fn parallel_follow_links_always_returns_same_candidates_as_serial_collection() {
 	let tree = TempTree::new("follow-links");
 	write_file(tree.path().join("target/child.txt"));
 	write_file(tree.path().join("target/deeper/grandchild.txt"));
-	std::os::unix::fs::symlink(tree.path().join("target"), tree.path().join("link"))
-		.expect("directory symlink should be created");
+	{
+		use std::os::unix::fs;
+		fs::symlink(tree.path().join("target"), tree.path().join("link"))
+			.expect("directory symlink should be created");
+	}
 	let request = WalkRequest::new(tree.path())
 		.follow_links(FollowLinks::Always)
 		.filter(WalkFilter::files_only());
@@ -345,12 +350,12 @@ impl EntryVisitor for DirectoryOrderVisitor {
 }
 
 #[cfg(unix)]
-fn sort_key(name: &std::ffi::OsStr) -> Vec<u8> {
+fn sort_key(name: &OsStr) -> Vec<u8> {
 	name.as_bytes().to_vec()
 }
 
 #[cfg(not(unix))]
-fn sort_key(name: &std::ffi::OsStr) -> Vec<u8> {
+fn sort_key(name: &OsStr) -> Vec<u8> {
 	name.to_string_lossy().into_owned().into_bytes()
 }
 

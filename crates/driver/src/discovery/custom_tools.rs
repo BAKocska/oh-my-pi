@@ -5,7 +5,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	fs,
+	fs, io,
 	path::{Component, Path, PathBuf},
 };
 
@@ -71,7 +71,7 @@ pub struct CustomToolDiscovery {
 pub enum ToolDiscoveryError {
 	/// Source could not be read.
 	#[error("custom tool source could not be read")]
-	Io(#[source] std::io::Error),
+	Io(#[source] io::Error),
 	/// JSON declaration was malformed.
 	#[error("custom tool JSON declaration is malformed")]
 	Json(#[source] serde_json::Error),

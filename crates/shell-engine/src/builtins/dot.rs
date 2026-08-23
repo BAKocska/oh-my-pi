@@ -2,7 +2,7 @@ use std::path::Path;
 
 use clap::Parser;
 
-use crate::builtins;
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 /// Evaluate the provided script in the current shell environment.
 #[derive(Parser)]
@@ -16,12 +16,12 @@ pub(crate) struct DotCommand {
 }
 
 impl builtins::Command for DotCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		// TODO(dot): Handle trap inheritance.
 		context
 			.shell

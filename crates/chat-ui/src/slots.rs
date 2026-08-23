@@ -3,10 +3,13 @@
 //! Effects are applied synchronously at the host boundary. The registry owns
 //! one [`Ui`] per mount, so composing a frame never reparses extension markup.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, str};
 
 use omp_core::Str;
-use omp_proto::omp::ui::v1::{UiEffect, ui_effect};
+use omp_proto::omp::ui::{
+	v1,
+	v1::{UiEffect, ui_effect},
+};
 use omp_tui::{Rect, Ui, UiContext};
 use smallvec::SmallVec;
 use xxhash_rust::xxh3::xxh3_64;
@@ -235,11 +238,11 @@ impl Slots {
 		self.mounts.values()
 	}
 
-	fn mount(&mut self, wire: &omp_proto::omp::ui::v1::MountSlot) -> Apply {
+	fn mount(&mut self, wire: &v1::MountSlot) -> Apply {
 		let id = MountId::new(wire.key.clone());
 		let content = wire.content.as_ref();
 
-		let source = content.map_or("", |tml| std::str::from_utf8(&tml.source).unwrap_or(""));
+		let source = content.map_or("", |tml| str::from_utf8(&tml.source).unwrap_or(""));
 		let hash = content.map_or(0, |tml| {
 			if tml.hash == 0 {
 				xxh3_64(tml.source.as_ref())

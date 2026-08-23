@@ -12,13 +12,15 @@ use http::{
 };
 use omp_core::{ExposeSecret as _, SecretString, Str, format_rfc3339, sf};
 use serde_json::{Map, Value};
+use tokio::time;
+use url::Url;
 
 use crate::{
 	answer::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageStatus, UsageUnit, UsageWindow,
 		UsageWindowKind,
 	},
-	auth::{OAuthHttpClient, OAuthHttpRequest},
+	auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse},
 	catalog::ProviderId,
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
@@ -46,7 +48,7 @@ impl ZaiUsageFetcher {
 	}
 
 	fn with_base_url(http: Arc<dyn OAuthHttpClient>, base: &str) -> Self {
-		let origin = url::Url::parse(base.trim())
+		let origin = Url::parse(base.trim())
 			.ok()
 			.map_or_else(|| BASE.to_owned(), |url| url.origin().ascii_serialization());
 		Self { provider: ProviderId::from(PROVIDER), http, base_url: Str::new(origin) }
@@ -142,14 +144,14 @@ async fn execute(
 	http: &dyn OAuthHttpClient,
 	request: OAuthHttpRequest,
 	deadline: Option<Instant>,
-) -> Result<crate::auth::OAuthHttpResponse, UsageFetchError> {
-	let timeout = deadline
+) -> Result<OAuthHttpResponse, UsageFetchError> {
+	let timeout_duration = deadline
 		.map_or(TIMEOUT, |end| end.saturating_duration_since(Instant::now()))
 		.min(TIMEOUT);
-	if timeout.is_zero() {
+	if timeout_duration.is_zero() {
 		return Err(UsageFetchError::Unavailable);
 	}
-	tokio::time::timeout(timeout, http.execute(request))
+	time::timeout(timeout_duration, http.execute(request))
 		.await
 		.map_err(|_| UsageFetchError::Unavailable)?
 		.map_err(|_| UsageFetchError::Unavailable)

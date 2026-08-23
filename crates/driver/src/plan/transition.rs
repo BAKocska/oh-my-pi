@@ -3,7 +3,7 @@
 use omp_agent::AgentState;
 use omp_catalog::{SelectionError, ThinkingEffort};
 use omp_core::Str;
-use omp_proto::inference::v1::Reasoning;
+use omp_proto::inference::v1::{Effort, Reasoning};
 use parking_lot::Mutex;
 
 /// One complete model/thinking selection.
@@ -133,15 +133,15 @@ fn queue_or_apply(
 	}
 }
 
-const fn catalog_effort(effort: ThinkingEffort) -> omp_proto::inference::v1::Effort {
+const fn catalog_effort(effort: ThinkingEffort) -> Effort {
 	match effort {
-		ThinkingEffort::Off => omp_proto::inference::v1::Effort::Off,
-		ThinkingEffort::Minimal => omp_proto::inference::v1::Effort::Minimal,
-		ThinkingEffort::Low => omp_proto::inference::v1::Effort::Low,
-		ThinkingEffort::Medium => omp_proto::inference::v1::Effort::Medium,
-		ThinkingEffort::High => omp_proto::inference::v1::Effort::High,
-		ThinkingEffort::XHigh => omp_proto::inference::v1::Effort::Xhigh,
-		ThinkingEffort::Max => omp_proto::inference::v1::Effort::Max,
+		ThinkingEffort::Off => Effort::Off,
+		ThinkingEffort::Minimal => Effort::Minimal,
+		ThinkingEffort::Low => Effort::Low,
+		ThinkingEffort::Medium => Effort::Medium,
+		ThinkingEffort::High => Effort::High,
+		ThinkingEffort::XHigh => Effort::Xhigh,
+		ThinkingEffort::Max => Effort::Max,
 	}
 }
 

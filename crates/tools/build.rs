@@ -2,6 +2,7 @@
 //! requirements.
 
 use std::{
+	env,
 	fmt::Write as _,
 	fs,
 	io::{self, Write as _},
@@ -15,7 +16,7 @@ fn main() {
 	generate_docs_manifest(&manifest).expect("generate compressed omp:// documentation manifest");
 	println!("cargo::rerun-if-env-changed=PYO3_CONFIG_FILE");
 
-	let vendor = std::env::var_os("PYO3_CONFIG_FILE")
+	let vendor = env::var_os("PYO3_CONFIG_FILE")
 		.map(PathBuf::from)
 		.and_then(|p| {
 			p.canonicalize()
@@ -45,7 +46,7 @@ fn main() {
 fn generate_docs_manifest(manifest: &Path) -> io::Result<()> {
 	let docs_root = manifest.join("../../docs");
 	println!("cargo::rerun-if-changed={}", docs_root.display());
-	let output_root = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+	let output_root = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
 	let mut paths = Vec::new();
 	collect_markdown(&docs_root, &docs_root, &mut paths)?;
 	paths.sort();

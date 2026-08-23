@@ -1,8 +1,9 @@
 //! Dynamic model and session candidates used by generated shell completions.
 
-use std::path::Path;
+use std::{fs, path::Path};
 
 use miette::IntoDiagnostic as _;
+use omp_catalog::snapshot;
 use omp_storage::index::{SessionFilter, SessionIndex};
 
 /// Dynamic completion candidate class.
@@ -23,8 +24,8 @@ pub fn run(kind: CompletionKind, prefix: &str) -> miette::Result<()> {
 }
 
 fn models(prefix: &str) -> miette::Result<()> {
-	let catalog = omp_catalog::snapshot::Catalog::try_embedded()
-		.map_err(|error| miette::miette!(error.to_string()))?;
+	let catalog =
+		snapshot::Catalog::try_embedded().map_err(|error| miette::miette!(error.to_string()))?;
 	let needle = prefix.to_ascii_lowercase();
 	let mut rows = Vec::new();
 	for model in catalog.models() {
@@ -41,7 +42,7 @@ fn models(prefix: &str) -> miette::Result<()> {
 
 fn sessions(prefix: &str) -> miette::Result<()> {
 	let data = omp_core::dirs::data_dir(None).into_diagnostic()?;
-	let project = std::fs::canonicalize(".").into_diagnostic()?;
+	let project = fs::canonicalize(".").into_diagnostic()?;
 	let state = omp_env::project_state::directory(&data, &project).into_diagnostic()?;
 	let path = state.join("sessions.sqlite3");
 	if !Path::new(&path).is_file() {

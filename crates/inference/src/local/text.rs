@@ -1,6 +1,12 @@
 //! llama.cpp-backed local text generation.
 
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+	num::NonZeroU32,
+	path::PathBuf,
+	str,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use llama_cpp_2::{
 	TokenToStringError,
@@ -435,7 +441,7 @@ impl TextAdapter {
 	}
 
 	/// Unloads the model when no call is active and its idle interval elapsed.
-	pub fn unload_if_idle(&self, now: std::time::Instant) -> bool {
+	pub fn unload_if_idle(&self, now: Instant) -> bool {
 		self.runtime.unload_if_idle(now)
 	}
 
@@ -642,7 +648,7 @@ impl TokenUtf8Decoder {
 		output: &mut String,
 	) {
 		while !bytes.is_empty() {
-			match std::str::from_utf8(bytes) {
+			match str::from_utf8(bytes) {
 				Ok(valid) => {
 					output.push_str(valid);
 					return;
@@ -650,7 +656,7 @@ impl TokenUtf8Decoder {
 				Err(error) => {
 					let valid_len = error.valid_up_to();
 					output.push_str(
-						std::str::from_utf8(&bytes[..valid_len])
+						str::from_utf8(&bytes[..valid_len])
 							.expect("UTF-8 validator reported an invalid prefix"),
 					);
 					bytes = &bytes[valid_len..];

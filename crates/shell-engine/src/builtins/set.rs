@@ -3,55 +3,49 @@ use std::{collections::HashMap, io::Write};
 use clap::Parser;
 use itertools::Itertools;
 
-use crate::{ExecutionExitCode, ExecutionResult, builtins, variables};
+use crate::{
+	Error, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions, builtins,
+	builtins::try_parse_known,
+	minus_or_plus_flag_arg,
+	namedoptions::{ShellOptionKind, options},
+	variables,
+};
 
-crate::minus_or_plus_flag_arg!(
-	ExportVariablesOnModification,
-	'a',
-	"Export variables on modification"
-);
-crate::minus_or_plus_flag_arg!(
-	NotifyJobTerminationImmediately,
-	'b',
-	"Notify job termination immediately"
-);
-crate::minus_or_plus_flag_arg!(ExitOnNonzeroCommandExit, 'e', "Exit on nonzero command exit");
-crate::minus_or_plus_flag_arg!(DisableFilenameGlobbing, 'f', "Disable filename globbing");
-crate::minus_or_plus_flag_arg!(RememberCommandLocations, 'h', "Remember command locations");
-crate::minus_or_plus_flag_arg!(
+minus_or_plus_flag_arg!(ExportVariablesOnModification, 'a', "Export variables on modification");
+minus_or_plus_flag_arg!(NotifyJobTerminationImmediately, 'b', "Notify job termination immediately");
+minus_or_plus_flag_arg!(ExitOnNonzeroCommandExit, 'e', "Exit on nonzero command exit");
+minus_or_plus_flag_arg!(DisableFilenameGlobbing, 'f', "Disable filename globbing");
+minus_or_plus_flag_arg!(RememberCommandLocations, 'h', "Remember command locations");
+minus_or_plus_flag_arg!(
 	PlaceAllAssignmentArgsInCommandEnv,
 	'k',
 	"Place all assignment args in command environment"
 );
-crate::minus_or_plus_flag_arg!(EnableJobControl, 'm', "Enable job control");
-crate::minus_or_plus_flag_arg!(DoNotExecuteCommands, 'n', "Do not execute commands");
-crate::minus_or_plus_flag_arg!(RealEffectiveUidMismatch, 'p', "Real effective UID mismatch");
-crate::minus_or_plus_flag_arg!(ExitAfterOneCommand, 't', "Exit after one command");
-crate::minus_or_plus_flag_arg!(TreatUnsetVariablesAsError, 'u', "Treat unset variables as error");
-crate::minus_or_plus_flag_arg!(PrintShellInputLines, 'v', "Print shell input lines");
-crate::minus_or_plus_flag_arg!(PrintCommandsAndArguments, 'x', "Print commands and arguments");
-crate::minus_or_plus_flag_arg!(PerformBraceExpansion, 'B', "Perform brace expansion");
-crate::minus_or_plus_flag_arg!(
+minus_or_plus_flag_arg!(EnableJobControl, 'm', "Enable job control");
+minus_or_plus_flag_arg!(DoNotExecuteCommands, 'n', "Do not execute commands");
+minus_or_plus_flag_arg!(RealEffectiveUidMismatch, 'p', "Real effective UID mismatch");
+minus_or_plus_flag_arg!(ExitAfterOneCommand, 't', "Exit after one command");
+minus_or_plus_flag_arg!(TreatUnsetVariablesAsError, 'u', "Treat unset variables as error");
+minus_or_plus_flag_arg!(PrintShellInputLines, 'v', "Print shell input lines");
+minus_or_plus_flag_arg!(PrintCommandsAndArguments, 'x', "Print commands and arguments");
+minus_or_plus_flag_arg!(PerformBraceExpansion, 'B', "Perform brace expansion");
+minus_or_plus_flag_arg!(
 	DisallowOverwritingRegularFilesViaOutputRedirection,
 	'C',
 	"Disallow overwriting regular files via output redirection"
 );
-crate::minus_or_plus_flag_arg!(
-	ShellFunctionsInheritErrTrap,
-	'E',
-	"Shell functions inherit ERR trap"
-);
-crate::minus_or_plus_flag_arg!(
+minus_or_plus_flag_arg!(ShellFunctionsInheritErrTrap, 'E', "Shell functions inherit ERR trap");
+minus_or_plus_flag_arg!(
 	EnableBangStyleHistorySubstitution,
 	'H',
 	"Enable bang style history substitution"
 );
-crate::minus_or_plus_flag_arg!(
+minus_or_plus_flag_arg!(
 	DoNotResolveSymlinksWhenChangingDir,
 	'P',
 	"Do not resolve symlinks when changing dir"
 );
-crate::minus_or_plus_flag_arg!(
+minus_or_plus_flag_arg!(
 	ShellFunctionsInheritDebugAndReturnTraps,
 	'T',
 	"Shell functions inherit DEBUG and RETURN traps"
@@ -121,7 +115,7 @@ pub(crate) struct SetCommand {
 }
 
 impl builtins::Command for SetCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
 	fn takes_plus_options() -> bool {
 		true
@@ -168,7 +162,7 @@ impl builtins::Command for SetCommand {
 			}
 		}
 
-		let (mut this, rest_args) = crate::builtins::try_parse_known::<Self>(updated_args)?;
+		let (mut this, rest_args) = try_parse_known::<Self>(updated_args)?;
 		if let Some(args) = rest_args {
 			this.positional_args.extend(args);
 		}
@@ -177,9 +171,9 @@ impl builtins::Command for SetCommand {
 
 	#[expect(clippy::too_many_lines, reason = "option handling mirrors the shell's public surface")]
 	#[allow(clippy::useless_let_if_seq, reason = "sequential option effects are intentional")]
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		let mut result = ExecutionResult::success();
 
@@ -313,7 +307,7 @@ impl builtins::Command for SetCommand {
 		if let Some(option_names) = &self.set_option.disable {
 			saw_option = true;
 			if option_names.is_empty() {
-				for option in crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO)
+				for option in options(ShellOptionKind::SetO)
 					.iter()
 					.sorted_by_key(|option| option.name)
 				{
@@ -330,7 +324,7 @@ impl builtins::Command for SetCommand {
 		if let Some(option_names) = &self.set_option.enable {
 			saw_option = true;
 			if option_names.is_empty() {
-				for option in crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO)
+				for option in options(ShellOptionKind::SetO)
 					.iter()
 					.sorted_by_key(|option| option.name)
 				{
@@ -346,10 +340,7 @@ impl builtins::Command for SetCommand {
 		}
 
 		for (option_name, value) in named_options {
-			if let Some(option_def) =
-				crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO)
-					.get(option_name.as_str())
-			{
+			if let Some(option_def) = options(ShellOptionKind::SetO).get(option_name.as_str()) {
 				option_def.set(context.shell.options_mut(), value);
 			} else {
 				result = ExecutionExitCode::InvalidUsage.into();
@@ -392,9 +383,7 @@ impl builtins::Command for SetCommand {
 	}
 }
 
-fn display_all(
-	context: &crate::ExecutionContext<'_, impl crate::ShellExtensions>,
-) -> Result<(), crate::Error> {
+fn display_all(context: &ExecutionContext<'_, impl ShellExtensions>) -> Result<(), Error> {
 	// Display variables.
 	for (name, var) in context.shell.env().iter().sorted_by_key(|v| v.0) {
 		if !var.is_enumerable() {

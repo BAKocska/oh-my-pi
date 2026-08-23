@@ -1,9 +1,12 @@
 //! Bounded backwards reader for dated and per-process debug logs.
 
 use std::{
+	fs,
 	fs::File,
+	io,
 	io::{Read, Seek, SeekFrom},
 	path::{Path, PathBuf},
+	process,
 	time::SystemTime,
 };
 
@@ -43,7 +46,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A selected log file could not be read.
 	#[error("cannot read debug log {path}")]
@@ -52,7 +55,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 }
 
@@ -66,7 +69,7 @@ pub struct LogSource {
 impl LogSource {
 	/// Discovers regular `.log` files beneath one bounded directory level.
 	pub fn discover(directory: &Path, process_start: SystemTime) -> Result<Self, Error> {
-		let entries = std::fs::read_dir(directory)
+		let entries = fs::read_dir(directory)
 			.map_err(|source| Error::Enumerate { path: directory.to_path_buf(), source })?;
 		let mut files = Vec::new();
 		for entry in entries.filter_map(Result::ok) {
@@ -74,7 +77,7 @@ impl LogSource {
 			if path.is_file() && path.extension().is_some_and(|extension| extension == "log") {
 				files.push(path);
 			} else if path.is_dir()
-				&& let Ok(children) = std::fs::read_dir(path)
+				&& let Ok(children) = fs::read_dir(path)
 			{
 				files.extend(
 					children
@@ -94,7 +97,7 @@ impl LogSource {
 			.duration_since(SystemTime::UNIX_EPOCH)
 			.unwrap_or_default()
 			.as_millis() as u64;
-		Ok(Self { files, process_start_ms, process_pid: std::process::id() })
+		Ok(Self { files, process_start_ms, process_pid: process::id() })
 	}
 
 	/// Returns the newest cursor, if any log exists.

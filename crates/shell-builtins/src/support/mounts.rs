@@ -106,9 +106,11 @@ pub(crate) struct MountInfo {
 pub(crate) fn read_fs_list() -> io::Result<Vec<MountInfo>> {
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	{
-		let (bytes, mountinfo) = match std::fs::read("/proc/self/mountinfo") {
+		use std::fs;
+
+		let (bytes, mountinfo) = match fs::read("/proc/self/mountinfo") {
 			Ok(bytes) => (bytes, true),
-			Err(_) => (std::fs::read("/proc/mounts")?, false),
+			Err(_) => (fs::read("/proc/mounts")?, false),
 		};
 		return Ok(parse_linux_mounts(&bytes, mountinfo));
 	}
@@ -136,8 +138,8 @@ pub(crate) fn read_fs_list() -> io::Result<Vec<MountInfo>> {
 
 #[cfg(unix)]
 fn mount_device_id(path: &OsStr) -> String {
-	use std::os::unix::fs::MetadataExt;
-	std::fs::metadata(path)
+	use std::{fs, os::unix::fs::MetadataExt};
+	fs::metadata(path)
 		.map(|metadata| metadata.dev().to_string())
 		.unwrap_or_default()
 }
@@ -251,8 +253,8 @@ fn is_remote_filesystem(device: &str, fs_type: &str) -> bool {
 	target_os = "openbsd"
 ))]
 fn read_bsd_mounts() -> io::Result<Vec<MountInfo>> {
-	use std::{ffi::CStr, os::unix::ffi::OsStringExt, slice};
-	let mut mounts = std::ptr::null_mut::<StatFs>();
+	use std::{ffi::CStr, os::unix::ffi::OsStringExt, ptr, slice};
+	let mut mounts = ptr::null_mut::<StatFs>();
 	// SAFETY: `getmntinfo` initializes `mounts` to a process-owned array valid
 	// until its next call.
 	let count = unsafe { libc::getmntinfo(&raw mut mounts, libc::MNT_NOWAIT) };
@@ -376,7 +378,8 @@ impl FsMeta for StatFs {
 
 	fn fsid(&self) -> u64 {
 		// SAFETY: Linux `fsid_t` is exactly two 32-bit words.
-		let words: [u32; 2] = unsafe { std::mem::transmute(self.f_fsid) };
+		let words: [u32; 2] = unsafe { mem::transmute(self.f_fsid) };
+		use std::mem;
 		(u64::from(words[0]) << 32) | u64::from(words[1])
 	}
 
@@ -421,7 +424,8 @@ impl FsMeta for StatFs {
 
 	fn fsid(&self) -> u64 {
 		// SAFETY: Darwin `fsid_t` is exactly two 32-bit words.
-		let words: [u32; 2] = unsafe { std::mem::transmute(self.f_fsid) };
+		let words: [u32; 2] = unsafe { mem::transmute(self.f_fsid) };
+		use std::mem;
 		(u64::from(words[0]) << 32) | u64::from(words[1])
 	}
 
@@ -466,7 +470,8 @@ impl FsMeta for StatFs {
 
 	fn fsid(&self) -> u64 {
 		// SAFETY: FreeBSD `fsid_t` is exactly two 32-bit words.
-		let words: [u32; 2] = unsafe { std::mem::transmute(self.f_fsid) };
+		let words: [u32; 2] = unsafe { mem::transmute(self.f_fsid) };
+		use std::mem;
 		(u64::from(words[0]) << 32) | u64::from(words[1])
 	}
 
@@ -511,7 +516,8 @@ impl FsMeta for StatFs {
 
 	fn fsid(&self) -> u64 {
 		// SAFETY: OpenBSD `fsid_t` is exactly two 32-bit words.
-		let words: [u32; 2] = unsafe { std::mem::transmute(self.f_fsid) };
+		let words: [u32; 2] = unsafe { mem::transmute(self.f_fsid) };
+		use std::mem;
 		(u64::from(words[0]) << 32) | u64::from(words[1])
 	}
 
@@ -566,9 +572,9 @@ impl FsMeta for StatFs {
 /// Reads native filesystem statistics for `path`.
 #[cfg(unix)]
 pub(crate) fn statfs(path: &OsStr) -> Result<StatFs, String> {
-	use std::os::unix::ffi::OsStrExt;
-	let path = std::ffi::CString::new(path.as_bytes()).map_err(|error| error.to_string())?;
-	let mut stat = std::mem::MaybeUninit::<StatFs>::uninit();
+	use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+	let path = CString::new(path.as_bytes()).map_err(|error| error.to_string())?;
+	let mut stat = MaybeUninit::<StatFs>::uninit();
 	#[cfg(any(
 		target_os = "linux",
 		target_os = "android",

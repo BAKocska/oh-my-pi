@@ -9,9 +9,9 @@ use omp_tools::read::{
 	selector::ParsedSelector,
 };
 
-use crate::ssh::SshService;
+use crate::ssh::{SshError, SshService};
 
-pub(super) struct SshResolver {
+pub(crate) struct SshResolver {
 	service: SshService,
 	lines:   LineOffsetCache,
 }
@@ -28,6 +28,7 @@ impl Resolve for SshResolver {
 		resource: &'a str,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
+		use super::select_bytes;
 		let (alias, path) = parse_resource(resource)?;
 		if path == "/" {
 			let listing = self.list(resource, 1_000, 1024 * 1024).await?;
@@ -37,19 +38,14 @@ impl Resolve for SshResolver {
 				body.push_str(entry.name.as_str());
 				body.push('\n');
 			}
-			return super::select_bytes(
-				&self.lines,
-				resource,
-				CowBytes::from(body.into_bytes()),
-				selector,
-			);
+			return select_bytes(&self.lines, resource, CowBytes::from(body.into_bytes()), selector);
 		}
 		let bytes = self
 			.service
 			.read(alias.as_str(), path.as_str(), 8 * 1024 * 1024)
 			.await
 			.map_err(ssh_fault)?;
-		super::select_bytes(&self.lines, resource, bytes, selector)
+		select_bytes(&self.lines, resource, bytes, selector)
 	}
 
 	async fn read_query<'a>(
@@ -58,6 +54,7 @@ impl Resolve for SshResolver {
 		query: Option<&'a str>,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
+		use super::select_bytes;
 		let Some(query) = query else {
 			return self.read(resource, selector).await;
 		};
@@ -119,7 +116,7 @@ impl Resolve for SshResolver {
 				});
 			},
 		};
-		super::select_bytes(&self.lines, resource, bytes, selector)
+		select_bytes(&self.lines, resource, bytes, selector)
 	}
 
 	async fn list(
@@ -280,6 +277,6 @@ fn encode_component(value: &str) -> String {
 	out
 }
 
-fn ssh_fault(error: crate::ssh::SshError) -> Fault {
+fn ssh_fault(error: SshError) -> Fault {
 	Fault::Source { message: Str::new(error.to_string()) }
 }

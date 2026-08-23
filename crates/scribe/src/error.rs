@@ -1,5 +1,7 @@
 //! Cold, span-carrying template errors with underlined source snippets.
 
+use core::error;
+
 use omp_core::{IntoStr, Str, StrMut};
 use thiserror::Error;
 
@@ -74,7 +76,7 @@ pub enum Error {
 		name:   Str,
 		/// Typed failure raised by the helper.
 		#[source]
-		source: Box<dyn core::error::Error + Send + Sync>,
+		source: Box<dyn error::Error + Send + Sync>,
 	},
 }
 
@@ -102,10 +104,7 @@ impl Error {
 
 	/// Wraps a typed failure raised by a registered filter, function, or
 	/// block helper.
-	pub fn helper(
-		name: impl IntoStr,
-		source: impl core::error::Error + Send + Sync + 'static,
-	) -> Self {
+	pub fn helper(name: impl IntoStr, source: impl error::Error + Send + Sync + 'static) -> Self {
 		Self::Helper { name: name.into_str(), source: Box::new(source) }
 	}
 }

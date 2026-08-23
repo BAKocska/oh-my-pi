@@ -5,11 +5,16 @@
 //! beside the client rather than in any one composition.
 
 use std::{
-	io,
+	env, fs, io,
 	path::{Path, PathBuf},
 };
 
 use omp_core::{Hash32, encoding::hex};
+
+#[cfg(any(unix, windows))]
+use crate::build_id::current;
+#[cfg(windows)]
+use crate::windows::current_user_pipe_scope;
 
 /// Returns the canonical per-project state directory below an owner's private
 /// data directory.
@@ -21,7 +26,7 @@ use omp_core::{Hash32, encoding::hex};
 ///
 /// Fails when `project_root` cannot be canonicalized.
 pub fn directory(data_dir: &Path, project_root: &Path) -> io::Result<PathBuf> {
-	let root = std::fs::canonicalize(project_root)?;
+	let root = fs::canonicalize(project_root)?;
 	let digest = Hash32::sum(root.as_os_str().as_encoded_bytes());
 	Ok(data_dir
 		.join("projects")
@@ -37,7 +42,7 @@ pub fn directory(data_dir: &Path, project_root: &Path) -> io::Result<PathBuf> {
 #[cfg(unix)]
 #[must_use]
 pub fn environment_socket(state_dir: &Path) -> PathBuf {
-	let build = crate::build_id::current();
+	let build = current();
 	let key = if build.is_empty() {
 		"unknown"
 	} else {
@@ -53,7 +58,7 @@ pub fn environment_socket(state_dir: &Path) -> PathBuf {
 #[cfg(windows)]
 #[must_use]
 pub fn environment_socket(state_dir: &Path) -> PathBuf {
-	let build = crate::build_id::current();
+	let build = current();
 	let key = if build.is_empty() {
 		"unknown"
 	} else {
@@ -83,7 +88,7 @@ pub fn document_socket(state_dir: &Path) -> PathBuf {
 /// `<data_dir>/worktrees`.
 #[must_use]
 pub fn worktree_base(data_dir: &Path, configured: Option<&Path>) -> PathBuf {
-	if let Some(path) = std::env::var_os("OMP_WORKTREE_DIR").filter(|value| !value.is_empty()) {
+	if let Some(path) = env::var_os("OMP_WORKTREE_DIR").filter(|value| !value.is_empty()) {
 		return PathBuf::from(path);
 	}
 	match configured {
@@ -138,8 +143,8 @@ fn socket_path(state_dir: &Path, kind: &str) -> PathBuf {
 
 #[cfg(windows)]
 fn windows_pipe_path(state_dir: &Path, kind: &str) -> PathBuf {
-	let owner = crate::windows::current_user_pipe_scope()
-		.expect("the process has an authenticated Windows user SID");
+	let owner =
+		current_user_pipe_scope().expect("the process has an authenticated Windows user SID");
 	let mut digest = Hash32::hasher();
 	digest.update(b"omp/project-owner-pipe/v1");
 	digest.update(&(owner.len() as u64).to_le_bytes());
@@ -155,7 +160,7 @@ fn windows_pipe_path(state_dir: &Path, kind: &str) -> PathBuf {
 
 #[cfg(all(test, unix))]
 mod tests {
-	use std::path::PathBuf;
+	use std::{mem, path::PathBuf};
 
 	use super::{document_socket, environment_socket};
 
@@ -166,7 +171,7 @@ mod tests {
 		let docs = document_socket(&state_dir);
 		// SAFETY: every all-zero bit pattern is valid for libc's sockaddr_un
 		// integer fields and fixed-size character array.
-		let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+		let address: libc::sockaddr_un = unsafe { mem::zeroed() };
 		let capacity = address.sun_path.len();
 
 		assert_ne!(env, docs);
@@ -177,11 +182,12 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
+
 	use super::{document_socket, environment_socket};
 
 	#[test]
 	fn pipe_names_are_local_deterministic_and_domain_separated() {
-		let state = std::path::Path::new(r"C:\Users\owner\AppData\Local\omp\project");
+		let state = Path::new(r"C:\Users\owner\AppData\Local\omp\project");
 		let first = environment_socket(state);
 		assert_eq!(first, environment_socket(state));
 		assert_ne!(first, document_socket(state));
@@ -190,8 +196,8 @@ mod windows_tests {
 
 	#[test]
 	fn project_identity_changes_the_pipe_name() {
-		let first = std::path::Path::new(r"C:\omp\projects\one");
-		let second = std::path::Path::new(r"C:\omp\projects\two");
+		let first = Path::new(r"C:\omp\projects\one");
+		let second = Path::new(r"C:\omp\projects\two");
 		assert_ne!(environment_socket(first), environment_socket(second));
 		assert_ne!(document_socket(first), document_socket(second));
 	}

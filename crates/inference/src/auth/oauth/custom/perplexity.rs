@@ -3,7 +3,9 @@
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::{
+	env,
 	ffi::OsStr,
+	fmt,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -50,8 +52,8 @@ struct PerplexityEmailOtp {
 	borrow: fn() -> Option<SecretString>,
 }
 
-impl std::fmt::Debug for PerplexityEmailOtp {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PerplexityEmailOtp {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("PerplexityEmailOtp")
 			.field("http", &"[REDACTED]")
@@ -72,7 +74,7 @@ impl OAuthCustomHandler for PerplexityEmailOtp {
 		driver: &'a LoginDriver,
 	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
 		async move {
-			if std::env::var_os("OMP_AUTH_NO_BORROW").as_deref() != Some(OsStr::new("1"))
+			if env::var_os("OMP_AUTH_NO_BORROW").as_deref() != Some(OsStr::new("1"))
 				&& let Some(token) = (self.borrow)()
 			{
 				return token_set(token, None, self.clock.now());
@@ -241,8 +243,8 @@ struct CookieJar {
 	values: Vec<(String, SecretString)>,
 }
 
-impl std::fmt::Debug for CookieJar {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CookieJar {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("CookieJar")
 			.field("count", &self.values.len())
@@ -458,15 +460,16 @@ fn borrow_native_token() -> Option<SecretString> {
 	}
 	#[cfg(target_os = "macos")]
 	{
+		use std::{mem, str};
 		let mut output = Command::new("defaults")
 			.args(["read", NATIVE_APP_BUNDLE, "authToken"])
 			.output()
 			.ok()?;
-		let stdout = Zeroizing::new(std::mem::take(&mut output.stdout));
+		let stdout = Zeroizing::new(mem::take(&mut output.stdout));
 		if !output.status.success() {
 			return None;
 		}
-		let token = std::str::from_utf8(&stdout).ok()?.trim();
+		let token = str::from_utf8(&stdout).ok()?.trim();
 		if token.is_empty() || token == "(null)" {
 			return None;
 		}
@@ -485,8 +488,9 @@ mod tests {
 	use crate::{
 		answer::{AuthResponse, AuthSession},
 		auth::{
-			CredentialSourceSpec, OAuthHttpResponse, OAuthRefreshSpec, OAuthTransportError,
-			login::default_login_channels, spec::HeaderPlacement,
+			CredentialSourceSpec, OAuthClientSpec as AuthOAuthClientSpec, OAuthHttpResponse,
+			OAuthRefreshSpec, OAuthTransportError, login::default_login_channels,
+			spec::HeaderPlacement,
 		},
 		id::LoginSessionId,
 	};
@@ -544,7 +548,7 @@ mod tests {
 
 	fn spec() -> OAuthCustomSpec {
 		OAuthCustomSpec {
-			client:        crate::auth::OAuthClientSpec {
+			client:        AuthOAuthClientSpec {
 				sources:      vec![CredentialSourceSpec::Interactive],
 				client_id:    "perplexity".into(),
 				refresh:      OAuthRefreshSpec::TokenEndpoint,

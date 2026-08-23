@@ -48,15 +48,33 @@ pub enum SecretConfigError {
 	},
 	/// An entry contains an unknown kind.
 	#[error("secret configuration `{path}` entry {index} has unknown kind `{value}`")]
-	Kind { path: PathBuf, index: usize, value: Str },
+	Kind {
+		/// Configuration file containing the invalid declaration.
+		path:  PathBuf,
+		/// Zero-based position of the declaration in the YAML sequence.
+		index: usize,
+		/// Unsupported rule-kind token, not the configured secret content.
+		value: Str,
+	},
 	/// An entry contains an unknown mode.
 	#[error("secret configuration `{path}` entry {index} has unknown mode `{value}`")]
-	Mode { path: PathBuf, index: usize, value: Str },
+	Mode {
+		/// Configuration file containing the invalid declaration.
+		path:  PathBuf,
+		/// Zero-based position of the declaration in the YAML sequence.
+		index: usize,
+		/// Unsupported masking-mode token, not the configured secret content.
+		value: Str,
+	},
 	/// Core rule validation failed.
 	#[error("secret configuration `{path}` entry {index} is invalid")]
 	Rule {
+		/// Configuration file containing the rejected rule.
 		path:   PathBuf,
+		/// Zero-based position of the rule in the YAML sequence.
 		index:  usize,
+		/// Validation failure whose public display omits configured secret
+		/// content.
 		#[source]
 		source: SecretRuleError,
 	},

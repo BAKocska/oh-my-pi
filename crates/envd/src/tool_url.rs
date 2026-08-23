@@ -19,10 +19,11 @@ pub(super) mod ssh;
 #[path = "tool_url/vault.rs"]
 pub(super) mod vault;
 
-use std::sync::Arc;
+use std::{fmt::Display, fs, path::PathBuf, str, sync::Arc};
 
 use omp_agent::{AgentKind, AgentRegistry};
 use omp_core::{CowBytes, Str};
+use omp_storage::{blob::BlobStore, github_cache::GithubCache};
 use omp_tools::read::{
 	Fault,
 	conflicts::{ConflictRegistry, ConflictResolver},
@@ -33,6 +34,15 @@ use omp_tools::read::{
 	},
 	selector::ParsedSelector,
 };
+use url::Url;
+
+use super::{
+	github_url::{GithubCredentialBridge, GithubResolver, GithubScheme},
+	mcp::McpService,
+	ssh::SshService,
+	vault::VaultService,
+};
+use crate::{ContentResolver, HostResources};
 
 #[derive(Clone, Copy, Debug)]
 enum RegistryResource {
@@ -122,10 +132,10 @@ impl Resolve for RegistryResolver {
 		let Some(path) = record.history.output_path else {
 			return Ok(None);
 		};
-		let path = std::fs::canonicalize(path).map_err(|_| Fault::Source {
+		let path = fs::canonicalize(path).map_err(|_| Fault::Source {
 			message: Str::new_static("Agent output path was not found."),
 		})?;
-		let uri = url::Url::from_file_path(path).map_err(|()| Fault::Invalid {
+		let uri = Url::from_file_path(path).map_err(|()| Fault::Invalid {
 			message: Str::new_static("Agent output path cannot be represented as a file URI."),
 		})?;
 		Ok(Some(Str::from(uri.to_string())))
@@ -214,9 +224,9 @@ pub(super) enum UrlResolver {
 	/// Read-only agent transcript index and bodies.
 	History(RegistryResolver),
 	/// Direct GitHub issue views.
-	Issue(super::github_url::GithubResolver),
+	Issue(GithubResolver),
 	/// Direct GitHub pull-request views and diffs.
-	Pr(super::github_url::GithubResolver),
+	Pr(GithubResolver),
 	/// Session-local scratch files.
 	Local(local::LocalResolver),
 	/// Active-session bounded memory projections.
@@ -228,7 +238,7 @@ pub(super) enum UrlResolver {
 	/// Resources exposed by mounted MCP servers.
 	Mcp(mcp::McpUrlResolver),
 	/// Composition-owned active content.
-	Content(Arc<dyn crate::ContentResolver>),
+	Content(Arc<dyn ContentResolver>),
 	/// Session-registered merge conflict regions.
 	Conflict(ConflictResolver),
 	/// Packaged harness documentation.
@@ -366,17 +376,17 @@ impl Resolve for UrlResolver {
 /// Builds the production internal URL table and shared conflict registry.
 pub(super) fn production_url_resolvers(
 	conflicts: Arc<ConflictRegistry>,
-	blob_store: omp_storage::blob::BlobStore,
+	blob_store: BlobStore,
 	session_id: &str,
-	local_root: std::path::PathBuf,
-	workspace_root: std::path::PathBuf,
-	github_cache: Arc<omp_storage::github_cache::GithubCache>,
-	github_credentials: Arc<super::github_url::GithubCredentialBridge>,
-	content: Vec<Arc<dyn crate::ContentResolver>>,
-	host_resources: Option<Arc<dyn crate::HostResources>>,
-	mcp: Arc<super::mcp::McpService>,
-	ssh: super::ssh::SshService,
-	vault: super::vault::VaultService,
+	local_root: PathBuf,
+	workspace_root: PathBuf,
+	github_cache: Arc<GithubCache>,
+	github_credentials: Arc<GithubCredentialBridge>,
+	content: Vec<Arc<dyn ContentResolver>>,
+	host_resources: Option<Arc<dyn HostResources>>,
+	mcp: Arc<McpService>,
+	ssh: SshService,
+	vault: VaultService,
 ) -> Arc<ResolverTable<UrlResolver>> {
 	let mut builder = ResolverTable::builder();
 	if let Some(resources) = host_resources.as_ref() {
@@ -423,8 +433,8 @@ pub(super) fn production_url_resolvers(
 	builder
 		.register(
 			SchemeEntry::new(Scheme::Issue, true, false, "direct GitHub issues"),
-			UrlResolver::Issue(super::github_url::GithubResolver::new(
-				super::github_url::GithubScheme::Issue,
+			UrlResolver::Issue(GithubResolver::new(
+				GithubScheme::Issue,
 				workspace_root.clone(),
 				Arc::clone(&github_cache),
 				Arc::clone(&github_credentials),
@@ -434,8 +444,8 @@ pub(super) fn production_url_resolvers(
 	builder
 		.register(
 			SchemeEntry::new(Scheme::Pr, true, false, "direct GitHub pull requests and diffs"),
-			UrlResolver::Pr(super::github_url::GithubResolver::new(
-				super::github_url::GithubScheme::PullRequest,
+			UrlResolver::Pr(GithubResolver::new(
+				GithubScheme::PullRequest,
 				workspace_root,
 				github_cache,
 				github_credentials,
@@ -575,7 +585,7 @@ fn render_history(resource: &str, bytes: Vec<u8>) -> Result<Vec<u8>, Fault> {
 	if resource.trim_matches('/').is_empty() {
 		return Ok(bytes);
 	}
-	let text = std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
+	let text = str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
 		message: Str::new_static("Agent transcript is not UTF-8 text."),
 	})?;
 	let mut output = format!("# {} transcript\n\n", resource.trim_matches('/'));
@@ -621,11 +631,11 @@ fn find_json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a s
 	}
 }
 
-fn registry_fault(error: impl std::fmt::Display) -> Fault {
+fn registry_fault(error: impl Display) -> Fault {
 	Fault::Source { message: Str::new(error.to_string()) }
 }
 
-fn json_fault(error: impl std::fmt::Display) -> Fault {
+fn json_fault(error: impl Display) -> Fault {
 	Fault::Invalid { message: Str::new(error.to_string()) }
 }
 

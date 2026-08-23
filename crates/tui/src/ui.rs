@@ -1,13 +1,17 @@
 //! Retained component tree layout, painting, updates, and input routing.
 
-use std::time::Duration;
+use std::{io, time::Duration};
 
 use omp_core::{IntoStr, Str};
 use serde_json::Value;
 use smallvec::SmallVec;
 
 use crate::{
-	component::{Cached, EventCtx, Flow, Hit, HitTag, IntoComponent, PaintCtx, Slot, Wake},
+	PaintStats, Renderer,
+	component::{
+		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoComponent, PaintCtx, Slot, Wake,
+		horizontal_inset, vertical_inset,
+	},
 	components::{Img, ImgState, Row, Scroll, Tabs, Wizard},
 	context::UiContext,
 	frame::{Color, Frame, Rect, Size, Style},
@@ -16,6 +20,7 @@ use crate::{
 	overlay::{self, OverlayBand, OverlayId, OverlayOptions},
 	props::{Prop, PropValue},
 	renderer::ResolvedLayer,
+	rich,
 };
 
 #[derive(Clone, Debug)]
@@ -220,7 +225,7 @@ impl Ui {
 		}
 		// Keep the process-wide width policy in sync; a Jamo change also
 		// advances the width epoch geometry memos key on.
-		crate::rich::set_jamo_width(ctx.jamo_width);
+		rich::set_jamo_width(ctx.jamo_width);
 		self.apply_context(&ctx);
 		true
 	}
@@ -313,7 +318,7 @@ impl Ui {
 	/// Locates a named component, downcasts it to `T`, and applies `update`.
 	/// If the component exists, matches `T`, and the closure returns `true`,
 	/// this invalidates cached geometry and schedules a relayout/repaint.
-	pub fn update_component<T: crate::component::Component>(
+	pub fn update_component<T: Component>(
 		&mut self,
 		id: &str,
 		update: impl FnOnce(&mut T) -> bool,
@@ -596,12 +601,12 @@ impl Ui {
 	///
 	/// # Errors
 	/// Propagates the renderer's contract and writer errors.
-	pub fn present<W: std::io::Write>(
+	pub fn present<W: io::Write>(
 		&mut self,
-		renderer: &mut crate::Renderer<W>,
+		renderer: &mut Renderer<W>,
 		viewport_height: u16,
 		stable_rows: u16,
-	) -> std::io::Result<crate::PaintStats> {
+	) -> io::Result<PaintStats> {
 		renderer.set_graphics(self.ctx.graphics);
 		let viewport = Size::new(self.width, viewport_height);
 		self.viewport = Some(viewport);
@@ -639,12 +644,12 @@ impl Ui {
 	///
 	/// # Errors
 	/// Propagates the renderer's contract and writer errors.
-	pub fn preview<W: std::io::Write>(
+	pub fn preview<W: io::Write>(
 		&mut self,
-		renderer: &mut crate::Renderer<W>,
+		renderer: &mut Renderer<W>,
 		viewport_height: u16,
 		leading_sequence: &str,
-	) -> std::io::Result<crate::PaintStats> {
+	) -> io::Result<PaintStats> {
 		renderer.set_graphics(self.ctx.graphics);
 		let viewport = Size::new(self.width, viewport_height);
 		self.viewport = Some(viewport);
@@ -681,8 +686,8 @@ impl Ui {
 			return None;
 		}
 		let paints_border = self.root.comp().paints_border();
-		let x_inset = crate::component::horizontal_inset(self.root.comp().props(), paints_border);
-		let y_inset = crate::component::vertical_inset(self.root.comp().props(), paints_border);
+		let x_inset = horizontal_inset(self.root.comp().props(), paints_border);
+		let y_inset = vertical_inset(self.root.comp().props(), paints_border);
 		let content_width = viewport
 			.width
 			.saturating_sub(x_inset.saturating_mul(2))
@@ -1966,11 +1971,11 @@ impl Ui {
 fn compose_tail(
 	frame: &mut Frame,
 	ctx: &UiContext,
-	now: std::time::Duration,
+	now: Duration,
 	focus: Option<Slot>,
 	hits: &mut Vec<Hit>,
 	wakes: &mut Vec<Wake>,
-	comp: &mut dyn crate::component::Component,
+	comp: &mut dyn Component,
 	x: u16,
 	width: u16,
 	start_bottom: u16,
@@ -1983,8 +1988,8 @@ fn compose_tail(
 			break;
 		}
 		let paints_border = child.comp().paints_border();
-		let x_inset = crate::component::horizontal_inset(child.comp().props(), paints_border);
-		let y_inset = crate::component::vertical_inset(child.comp().props(), paints_border);
+		let x_inset = horizontal_inset(child.comp().props(), paints_border);
+		let y_inset = vertical_inset(child.comp().props(), paints_border);
 		let nested = compose_tail(
 			frame,
 			ctx,
@@ -2230,12 +2235,19 @@ fn predicate_value_equal(value: &Value, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+	use std::{cell, io, mem, rc};
+
 	use omp_core::sf;
 
 	use super::*;
 	use crate::{
+		OverlayAnchor,
+		component::next_slot,
+		components::{Col, EditInput},
 		dom,
 		frame::CellContent,
+		markup::Dim,
 		props::{Prop, PropValue, Props},
 		test_support::frame_row_text,
 	};
@@ -2248,9 +2260,9 @@ mod tests {
 		struct PlaceProbe {
 			props:  Props,
 			slot:   Slot,
-			places: std::rc::Rc<std::cell::Cell<usize>>,
+			places: rc::Rc<cell::Cell<usize>>,
 		}
-		impl crate::component::Component for PlaceProbe {
+		impl Component for PlaceProbe {
 			fn props(&self) -> &Props {
 				&self.props
 			}
@@ -2278,17 +2290,17 @@ mod tests {
 			fn paint(&mut self, _pc: &mut PaintCtx<'_>, _rect: Rect) {}
 		}
 
-		let places = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+		let places = rc::Rc::new(cell::Cell::new(0_usize));
 		// The column's intrinsic height (the 4-row input) is stretched to
 		// the probe's 8 rows, so its placed rect exceeds its own height().
 		let mut ui = Ui::from_root(
-			crate::components::Row::new()
+			Row::new()
 				.child(PlaceProbe {
 					props:  Props::new(),
-					slot:   crate::component::next_slot(),
-					places: std::rc::Rc::clone(&places),
+					slot:   next_slot(),
+					places: rc::Rc::clone(&places),
 				})
-				.child(crate::components::Col::new().child(crate::components::EditInput::new())),
+				.child(Col::new().child(EditInput::new())),
 			40,
 			UiContext::default(),
 		);
@@ -2432,11 +2444,11 @@ mod tests {
 		props:   Props,
 		slot:    Slot,
 		label:   String,
-		heights: std::rc::Rc<std::cell::Cell<usize>>,
-		paints:  std::rc::Rc<std::cell::Cell<usize>>,
+		heights: rc::Rc<cell::Cell<usize>>,
+		paints:  rc::Rc<cell::Cell<usize>>,
 	}
 
-	impl crate::component::Component for MeteredLeaf {
+	impl Component for MeteredLeaf {
 		fn props(&self) -> &Props {
 			&self.props
 		}
@@ -2458,7 +2470,7 @@ mod tests {
 			1
 		}
 
-		fn paint(&mut self, pc: &mut crate::component::PaintCtx<'_>, rect: Rect) {
+		fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 			self.paints.set(self.paints.get() + 1);
 			pc.frame.put(rect.x, rect.y, &self.label, Style::default());
 		}
@@ -2469,19 +2481,19 @@ mod tests {
 		// A 10k-entry transcript inside a nested bare column (mirroring the
 		// implicit markup root wrapper): a drag frame may only measure and
 		// paint about one viewport of entries.
-		let heights = std::rc::Rc::new(std::cell::Cell::new(0));
-		let paints = std::rc::Rc::new(std::cell::Cell::new(0));
-		let mut transcript = crate::components::Col::new();
+		let heights = rc::Rc::new(cell::Cell::new(0));
+		let paints = rc::Rc::new(cell::Cell::new(0));
+		let mut transcript = Col::new();
 		for index in 0..10_000 {
 			transcript = transcript.child(Cached::new(Box::new(MeteredLeaf {
 				props:   Props::new(),
-				slot:    crate::component::next_slot(),
+				slot:    next_slot(),
 				label:   format!("entry {index}"),
-				heights: std::rc::Rc::clone(&heights),
-				paints:  std::rc::Rc::clone(&paints),
+				heights: rc::Rc::clone(&heights),
+				paints:  rc::Rc::clone(&paints),
 			})));
 		}
-		let root = crate::components::Col::new().child(Cached::new(Box::new(transcript)));
+		let root = Col::new().child(Cached::new(Box::new(transcript)));
 		let mut ui = Ui::from_root(root, 24, UiContext::default());
 		heights.set(0);
 		paints.set(0);
@@ -2541,12 +2553,11 @@ mod tests {
 		// must still reach the main screen after a clean release (no resize):
 		// the runtime re-marks everything via `damage_all` and presents.
 		let mut ui = Ui::from_markup("<text id=msg>before</text>", 20, UiContext::default()).unwrap();
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		ui.present(&mut renderer, 4, 0)
 			.expect("baseline main-buffer present");
 
-		let overlay =
-			ui.show_overlay(dom! { <text>{"modal"}</text> }, crate::OverlayOptions::default());
+		let overlay = ui.show_overlay(dom! { <text>{"modal"}</text> }, OverlayOptions::default());
 		ui.set_text("msg", "supplanted");
 		ui.preview(&mut renderer, 4, "\x1b[?1049h")
 			.expect("held preview consumes the damage");
@@ -2595,7 +2606,7 @@ mod tests {
 			.sum::<usize>()
 	}
 
-	fn contains_component<T: crate::component::Component>(cached: &Cached) -> bool {
+	fn contains_component<T: Component>(cached: &Cached) -> bool {
 		cached.comp().is::<T>() || cached.comp().children().iter().any(contains_component::<T>)
 	}
 
@@ -3875,7 +3886,7 @@ mod tests {
 			}
 			src.push_str("</col>");
 			let mut ui = Ui::from_markup(src, 120, UiContext::default()).unwrap();
-			let mut renderer = Renderer::new(std::io::sink());
+			let mut renderer = Renderer::new(io::sink());
 			ui.present(&mut renderer, 40, 0).unwrap();
 			const FRAMES: u32 = 2000;
 			let t0 = Instant::now();
@@ -3990,7 +4001,7 @@ cd</pre>"##,
 		let mode = 2;
 		let labels = ["loop-a", "loop-b"];
 		let ui = Ui::from_root(
-			crate::dom! {
+			dom! {
 				<col>
 					for label in labels {
 						<text>{label}</text>
@@ -4059,11 +4070,11 @@ cd</pre>"##,
 
 	impl Blinker {
 		fn until(stop: Duration) -> Self {
-			Self { props: Props::new(), slot: crate::component::next_slot(), stop }
+			Self { props: Props::new(), slot: next_slot(), stop }
 		}
 	}
 
-	impl crate::component::Component for Blinker {
+	impl Component for Blinker {
 		fn props(&self) -> &Props {
 			&self.props
 		}
@@ -4140,10 +4151,10 @@ cd</pre>"##,
 	struct MouseRecorder {
 		props: Props,
 		slot:  Slot,
-		seen:  std::rc::Rc<std::cell::RefCell<Vec<Mouse>>>,
+		seen:  rc::Rc<cell::RefCell<Vec<Mouse>>>,
 	}
 
-	impl crate::component::Component for MouseRecorder {
+	impl Component for MouseRecorder {
 		fn props(&self) -> &Props {
 			&self.props
 		}
@@ -4184,12 +4195,9 @@ cd</pre>"##,
 
 	#[test]
 	fn right_click_reaches_the_hit_component() {
-		let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-		let root = MouseRecorder {
-			props: Props::new(),
-			slot:  crate::component::next_slot(),
-			seen:  std::rc::Rc::clone(&seen),
-		};
+		let seen = rc::Rc::new(cell::RefCell::new(Vec::new()));
+		let root =
+			MouseRecorder { props: Props::new(), slot: next_slot(), seen: rc::Rc::clone(&seen) };
 		let mut ui = Ui::from_root(root, 4, UiContext::default());
 		let hit = ui.hits()[0];
 		assert_eq!(ui.handle_mouse(hit.rect.x, hit.rect.y, Mouse::RightClick), UiEvent::None);
@@ -4202,10 +4210,10 @@ cd</pre>"##,
 	struct SharedLabel {
 		props: Props,
 		slot:  Slot,
-		text:  std::rc::Rc<std::cell::RefCell<&'static str>>,
+		text:  rc::Rc<cell::RefCell<&'static str>>,
 	}
 
-	impl crate::component::Component for SharedLabel {
+	impl Component for SharedLabel {
 		fn props(&self) -> &Props {
 			&self.props
 		}
@@ -4234,14 +4242,10 @@ cd</pre>"##,
 
 	#[test]
 	fn invalidate_refreshes_a_component_reading_shared_state() {
-		let text = std::rc::Rc::new(std::cell::RefCell::new("before"));
+		let text = rc::Rc::new(cell::RefCell::new("before"));
 		let mut props = Props::new();
 		props.set(Prop::Id, "label");
-		let root = SharedLabel {
-			props,
-			slot: crate::component::next_slot(),
-			text: std::rc::Rc::clone(&text),
-		};
+		let root = SharedLabel { props, slot: next_slot(), text: rc::Rc::clone(&text) };
 		let mut ui = Ui::from_root(root, 8, UiContext::default());
 		assert_eq!(frame_text(&ui)[0], "before");
 
@@ -4482,8 +4486,8 @@ cd</pre>"##,
 		assert_eq!(ui.frame().size().height, 11, "a rebuild-bound frame matches content");
 	}
 
-	fn overlay_paint(renderer: &mut crate::Renderer<Vec<u8>>) -> String {
-		let bytes = std::mem::take(renderer.writer_mut());
+	fn overlay_paint(renderer: &mut Renderer<Vec<u8>>) -> String {
+		let bytes = mem::take(renderer.writer_mut());
 		String::from_utf8(bytes).expect("renderer output is UTF-8")
 	}
 
@@ -4497,11 +4501,11 @@ cd</pre>"##,
 			UiContext::default(),
 		)
 		.unwrap();
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		let mut terminal = TerminalModel::new(11, 3);
 		let id = ui.show_overlay(
 			dom! { <text>{"OV"}</text> },
-			OverlayOptions::default().width(crate::markup::Dim::Cells(2)),
+			OverlayOptions::default().width(Dim::Cells(2)),
 		);
 		assert!(ui.has_damage(), "showing an overlay schedules a present");
 		ui.present(&mut renderer, 3, 0).unwrap();
@@ -4527,17 +4531,15 @@ cd</pre>"##,
 			UiContext::default(),
 		)
 		.unwrap();
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		let mut terminal = TerminalModel::new(11, 3);
 		let a_id = ui.show_overlay(
 			dom! { <text>{"AA"}</text> },
-			OverlayOptions::default().width(crate::markup::Dim::Cells(2)),
+			OverlayOptions::default().width(Dim::Cells(2)),
 		);
 		ui.show_overlay(
 			dom! { <text>{"BB"}</text> },
-			OverlayOptions::default()
-				.width(crate::markup::Dim::Cells(2))
-				.z(-1),
+			OverlayOptions::default().width(Dim::Cells(2)).z(-1),
 		);
 
 		ui.present(&mut renderer, 3, 0).unwrap();
@@ -4614,11 +4616,11 @@ cd</pre>"##,
 		let id = ui.show_overlay(
 			dom! { <text>{"overlay"}</text> },
 			OverlayOptions::default()
-				.width(crate::markup::Dim::Cells(right_hit.rect.x))
-				.col(crate::markup::Dim::Cells(0))
-				.row(crate::markup::Dim::Cells(0)),
+				.width(Dim::Cells(right_hit.rect.x))
+				.col(Dim::Cells(0))
+				.row(Dim::Cells(0)),
 		);
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		ui.present(&mut renderer, 1, 0).unwrap();
 
 		assert_eq!(
@@ -4639,11 +4641,11 @@ cd</pre>"##,
 		use crate::test_support::TerminalModel;
 
 		let mut ui = Ui::from_markup("<input id=base/>", 12, UiContext::default()).unwrap();
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		let mut terminal = TerminalModel::new(12, 1);
 		let id = ui.show_overlay(
 			dom! { <text>{"OV"}</text> },
-			OverlayOptions::default().width(crate::markup::Dim::Cells(2)),
+			OverlayOptions::default().width(Dim::Cells(2)),
 		);
 		ui.present(&mut renderer, 1, 0).unwrap();
 		terminal.apply(&overlay_paint(&mut renderer));
@@ -4740,11 +4742,11 @@ cd</pre>"##,
 			dom! { <input id=side/> },
 			OverlayOptions::default()
 				.non_modal()
-				.width(crate::markup::Dim::Cells(6))
-				.col(crate::markup::Dim::Cells(14))
-				.row(crate::markup::Dim::Cells(0)),
+				.width(Dim::Cells(6))
+				.col(Dim::Cells(14))
+				.row(Dim::Cells(0)),
 		);
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		ui.present(&mut renderer, 1, 0).unwrap();
 
 		ui.handle_mouse(15, 0, Mouse::Click);
@@ -4786,7 +4788,7 @@ cd</pre>"##,
 			UiContext::default(),
 		)
 		.unwrap();
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		let mut terminal = TerminalModel::new(11, 4);
 		ui.show_overlay(
 			dom! {
@@ -4799,8 +4801,8 @@ cd</pre>"##,
 			OverlayOptions::default()
 				.non_modal()
 				.fill_height()
-				.anchor(crate::OverlayAnchor::Right)
-				.width(crate::markup::Dim::Cells(1)),
+				.anchor(OverlayAnchor::Right)
+				.width(Dim::Cells(1)),
 		);
 		ui.present(&mut renderer, 4, 0).unwrap();
 		terminal.apply(&overlay_paint(&mut renderer));
@@ -4854,11 +4856,11 @@ cd</pre>"##,
 			dom! { <input id=side/> },
 			OverlayOptions::default()
 				.non_modal()
-				.width(crate::markup::Dim::Cells(6))
-				.col(crate::markup::Dim::Cells(14))
-				.row(crate::markup::Dim::Cells(0)),
+				.width(Dim::Cells(6))
+				.col(Dim::Cells(14))
+				.row(Dim::Cells(0)),
 		);
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 
 		ui.present(&mut renderer, 1, 0).unwrap();
 		let col = shown_cursor_col(&overlay_paint(&mut renderer))
@@ -4887,7 +4889,7 @@ cd</pre>"##,
 		let view = TranscriptView::new().with(Prop::Id, "transcript");
 		let mut ui = Ui::from_root(view, 40, UiContext::default());
 
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		ui.present(&mut renderer, 10, 0).unwrap();
 		let initial_height = ui.frame.size().height;
 
@@ -4896,7 +4898,7 @@ cd</pre>"##,
 			let mut child = Col::new();
 			child.props_mut().set(Prop::H, 2_u16);
 			first_child_slot = child.slot();
-			view.push(crate::component::Cached::new(Box::new(child)));
+			view.push(Cached::new(Box::new(child)));
 			true
 		});
 		assert!(changed);
@@ -4905,7 +4907,7 @@ cd</pre>"##,
 
 		ui.update_component::<TranscriptView>("transcript", |view| {
 			let child = Col::new();
-			view.push(crate::component::Cached::new(Box::new(child)));
+			view.push(Cached::new(Box::new(child)));
 			true
 		});
 		ui.present(&mut renderer, 10, 0).unwrap();
@@ -4914,7 +4916,7 @@ cd</pre>"##,
 		let changed = ui.update_component::<TranscriptView>("transcript", |view| {
 			let child = Col::new();
 			tail_child_slot = child.slot();
-			view.replace_tail(crate::component::Cached::new(Box::new(child)));
+			view.replace_tail(Cached::new(Box::new(child)));
 			true
 		});
 		assert!(changed);

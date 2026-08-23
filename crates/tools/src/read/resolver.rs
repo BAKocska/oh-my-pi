@@ -3,10 +3,11 @@
 use std::{
 	fs,
 	future::Future,
+	io,
 	io::Read as _,
 	ops::Range,
 	path::{Component, Path, PathBuf},
-	str::FromStr as _,
+	str::{self, FromStr as _},
 	sync::Arc,
 };
 
@@ -77,7 +78,7 @@ impl DocsArchive {
 	fn read_dev_fallback(&self, relative: &str) -> Result<Option<CowBytes<'static>>, Fault> {
 		let root = match self.dev_root.canonicalize() {
 			Ok(root) => root,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
 			Err(source) => {
 				return Err(Fault::Source {
 					message: Str::new(format!("Cannot open development documentation root: {source}")),
@@ -87,7 +88,7 @@ impl DocsArchive {
 		let candidate = self.dev_root.join(relative);
 		let canonical = match candidate.canonicalize() {
 			Ok(canonical) => canonical,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
 			Err(source) => {
 				return Err(Fault::Source {
 					message: Str::new(format!("Cannot open development documentation: {source}")),
@@ -1043,7 +1044,7 @@ impl<C: ArtifactCatalog, B: BlobAuthority> ArtifactResolver<C, B> {
 	) -> Result<CowBytes<'static>, Fault> {
 		let Some(offsets) = self.lines.get(&record.digest) else {
 			let bytes = self.all_bytes(record, size).await?;
-			std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
+			str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
 				message: sf!("Artifact selectors require UTF-8 text"),
 			})?;
 			let offsets = self.lines.index(&record.digest, &bytes);

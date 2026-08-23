@@ -1,4 +1,5 @@
 use std::{
+	future,
 	num::NonZeroUsize,
 	sync::{
 		Arc,
@@ -11,6 +12,8 @@ use futures::{FutureExt as _, StreamExt as _, stream};
 use omp_catalog::{OperationKind, ProviderId, RouteId};
 use omp_core::{Str, sf};
 use serde::Deserialize;
+use tokio::{net::TcpListener, sync::oneshot, time};
+use tokio_tungstenite::tungstenite;
 use tower::{Service as _, ServiceExt as _};
 
 use super::{
@@ -22,7 +25,7 @@ use crate::{
 	body::{
 		BodyFactoryHandle, BodySource, ByteStream, OneShotBody, RetryDecision, RetryDecisionReason,
 	},
-	call::{RealtimeModality, RealtimeRequest, Setting},
+	call::{NegotiationPolicy, RealtimeModality, RealtimeRequest, Setting},
 	codec::{
 		Cancellation, Decoder, EncodedRequest, ProviderMetadataEvent, ProviderStateEvent,
 		RawCompletion, RawEvent, RealtimeEvents, RealtimeWireCodec, RealtimeWireFrames,
@@ -217,7 +220,7 @@ fn request(
 			principal:     None,
 			index:         0,
 			provisional:   false,
-			timeout:       std::time::Duration::from_secs(5),
+			timeout:       time::Duration::from_secs(5),
 			capture_limit: 10,
 		},
 	}
@@ -440,7 +443,7 @@ async fn drain_captures_exact_multi_chunk_request_body() {
 			Ok(Bytes::from_static(b"first-")),
 			Ok(Bytes::from_static(b"second")),
 		]));
-		std::future::ready(Ok(body))
+		future::ready(Ok(body))
 	});
 	let mut service = CassetteTransport::new(Arc::from([attempt(
 		CassetteBodyAction::Drain,
@@ -470,7 +473,7 @@ async fn bounded_request_body_capture_reports_observed_bytes_and_truncation() {
 	let factory = BodyFactoryHandle::new(|| {
 		let body: ByteStream =
 			Box::pin(stream::iter([Ok(Bytes::from_static(b"ab")), Ok(Bytes::from_static(b"cdef"))]));
-		std::future::ready(Ok(body))
+		future::ready(Ok(body))
 	});
 	let mut service = CassetteTransport::new(Arc::from([attempt(
 		CassetteBodyAction::Drain,
@@ -506,7 +509,7 @@ async fn request_body_capture_finalizes_on_stream_error() {
 		);
 		let body: ByteStream =
 			Box::pin(stream::iter([Ok(Bytes::from_static(b"prefix")), Err(error)]));
-		std::future::ready(Ok(body))
+		future::ready(Ok(body))
 	});
 	let mut service = CassetteTransport::new(Arc::from([attempt(
 		CassetteBodyAction::Drain,
@@ -536,10 +539,10 @@ async fn request_body_capture_finalizes_on_stream_error() {
 async fn request_body_capture_finalizes_when_in_flight_attempt_is_dropped() {
 	let factory = BodyFactoryHandle::new(|| {
 		let body: ByteStream = Box::pin(
-			stream::once(std::future::ready(Ok(Bytes::from_static(b"observed"))))
+			stream::once(future::ready(Ok(Bytes::from_static(b"observed"))))
 				.chain(stream::pending::<Result<Bytes, Error>>()),
 		);
-		std::future::ready(Ok(body))
+		future::ready(Ok(body))
 	});
 	let mut service = CassetteTransport::new(Arc::from([attempt(
 		CassetteBodyAction::Drain,
@@ -574,7 +577,7 @@ async fn replayable_factory_opens_a_fresh_body_for_every_attempt() {
 		factory_opens.fetch_add(1, Ordering::SeqCst);
 		let body: ByteStream =
 			Box::pin(stream::iter([Ok(Bytes::from_static(b"a")), Ok(Bytes::from_static(b"b"))]));
-		std::future::ready(Ok(body))
+		future::ready(Ok(body))
 	});
 	let source = BodySource::Factory(factory);
 	let attempts: Arc<[CassetteAttempt]> = Arc::from([
@@ -705,7 +708,7 @@ async fn retryable_factory_error_keeps_its_retry_action() {
 		Err::<ByteStream, Error>(Error::new(
 			ErrorKind::Connectivity,
 			ErrorPhase::Connecting,
-			RetryAction::SameRoute { after: std::time::Duration::from_millis(7) },
+			RetryAction::SameRoute { after: time::Duration::from_millis(7) },
 			ExecutionReceipt::default(),
 		))
 	});
@@ -835,7 +838,7 @@ async fn metadata_before_visible_event_is_returned_in_order() {
 
 #[tokio::test]
 async fn consumed_one_shot_preamble_failure_suppresses_retry_evidence() {
-	let one_shot = Arc::new(OneShotBody::new(Box::pin(stream::once(std::future::ready(Ok(
+	let one_shot = Arc::new(OneShotBody::new(Box::pin(stream::once(future::ready(Ok(
 		Bytes::from_static(b"live"),
 	))))));
 	let mut service = CassetteTransport::new(Arc::from([attempt(
@@ -893,7 +896,7 @@ async fn private_preamble_stall_times_out_precommit() {
 	service.ready().await.expect("cassette ready");
 	let mut call =
 		request(BodySource::Bytes(Bytes::new()), MetadataOnlyDecoder, Cancellation::default());
-	call.attempt.timeout = std::time::Duration::from_millis(5);
+	call.attempt.timeout = time::Duration::from_millis(5);
 	let error = service
 		.call(call)
 		.await
@@ -912,7 +915,7 @@ async fn postcommit_stall_times_out_as_partial() {
 	)]));
 	service.ready().await.expect("cassette ready");
 	let mut call = request(BodySource::Bytes(Bytes::new()), EmitDecoder, Cancellation::default());
-	call.attempt.timeout = std::time::Duration::from_millis(5);
+	call.attempt.timeout = time::Duration::from_millis(5);
 	let response = service.call(call).await.expect("visible event commits");
 	let mut events = response.events.expect("ordinary event stream");
 	assert!(matches!(events.next().await, Some(Ok(RawEvent::Chat(_)))));
@@ -934,7 +937,7 @@ async fn stalled_body_preserves_factory_replay_and_suppresses_consumed_one_shot(
 	)]));
 	replayable.ready().await.expect("cassette ready");
 	let mut call = request(BodySource::Factory(factory), EmitDecoder, Cancellation::default());
-	call.attempt.timeout = std::time::Duration::from_millis(5);
+	call.attempt.timeout = time::Duration::from_millis(5);
 	let error = replayable.call(call).await.err().expect("body timeout");
 	let body = error
 		.receipt()
@@ -953,7 +956,7 @@ async fn stalled_body_preserves_factory_replay_and_suppresses_consumed_one_shot(
 	.with_request_body_capture(NonZeroUsize::new(8).expect("nonzero capture bound"));
 	consumed.ready().await.expect("cassette ready");
 	let mut call = request(BodySource::OneShot(one_shot), EmitDecoder, Cancellation::default());
-	call.attempt.timeout = std::time::Duration::from_millis(5);
+	call.attempt.timeout = time::Duration::from_millis(5);
 	let error = consumed.call(call).await.err().expect("body timeout");
 	let body = error
 		.receipt()
@@ -1059,7 +1062,7 @@ async fn openai_realtime_cassette_preserves_normal_response_through_done() {
 		output_audio:   Setting::Unset,
 		turn_detection: Setting::Unset,
 		tools:          Arc::from([]),
-		negotiation:    crate::call::NegotiationPolicy::default(),
+		negotiation:    NegotiationPolicy::default(),
 	});
 	let mut service = CassetteTransport::new(Arc::from([scripted]));
 	service.ready().await.expect("cassette ready");
@@ -1095,7 +1098,7 @@ async fn openai_realtime_cassette_preserves_normal_response_through_done() {
 
 #[tokio::test]
 async fn websocket_upgrade_sends_initial_frame_before_first_decodable_event() {
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+	let listener = TcpListener::bind("127.0.0.1:0")
 		.await
 		.expect("bind websocket fixture");
 	let address = listener.local_addr().expect("websocket fixture address");
@@ -1112,7 +1115,7 @@ async fn websocket_upgrade_sends_initial_frame_before_first_decodable_event() {
 		assert_eq!(initial.into_data(), Bytes::from_static(b"session"));
 		use futures::SinkExt as _;
 		socket
-			.send(tokio_tungstenite::tungstenite::Message::text("provider-ready"))
+			.send(tungstenite::Message::text("provider-ready"))
 			.await
 			.expect("send provider frame");
 	});
@@ -1137,13 +1140,13 @@ async fn websocket_upgrade_sends_initial_frame_before_first_decodable_event() {
 
 #[tokio::test]
 async fn stalled_http_connect_or_headers_honors_attempt_timeout() {
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+	let listener = TcpListener::bind("127.0.0.1:0")
 		.await
 		.expect("bind fixture");
 	let address = listener.local_addr().expect("fixture address");
 	let server = tokio::spawn(async move {
 		let (_socket, _) = listener.accept().await.expect("accept fixture");
-		std::future::pending::<()>().await;
+		future::pending::<()>().await;
 	});
 	let mut service = HttpTransport::new();
 	service.ready().await.expect("http ready");
@@ -1153,7 +1156,7 @@ async fn stalled_http_connect_or_headers_honors_attempt_timeout() {
 		Cancellation::default(),
 	);
 	call.encoded.uri = sf!("http://{address}/stall");
-	call.attempt.timeout = std::time::Duration::from_millis(10);
+	call.attempt.timeout = time::Duration::from_millis(10);
 	let error = service.call(call).await.err().expect("headers timeout");
 	assert_eq!(error.kind, ErrorKind::DeadlineExceeded);
 	assert!(!error.committed);
@@ -1163,15 +1166,15 @@ async fn stalled_http_connect_or_headers_honors_attempt_timeout() {
 
 #[tokio::test]
 async fn stalled_http_headers_honor_in_flight_cancellation() {
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+	let listener = TcpListener::bind("127.0.0.1:0")
 		.await
 		.expect("bind fixture");
 	let address = listener.local_addr().expect("fixture address");
-	let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+	let (accepted_tx, accepted_rx) = oneshot::channel();
 	let server = tokio::spawn(async move {
 		let (_socket, _) = listener.accept().await.expect("accept fixture");
 		let _ = accepted_tx.send(());
-		std::future::pending::<()>().await;
+		future::pending::<()>().await;
 	});
 	let mut service = HttpTransport::new();
 	service.ready().await.expect("http ready");
@@ -1179,7 +1182,7 @@ async fn stalled_http_headers_honor_in_flight_cancellation() {
 	let mut call =
 		request(BodySource::Bytes(Bytes::from_static(b"request")), EmitDecoder, cancellation.clone());
 	call.encoded.uri = sf!("http://{address}/stall");
-	call.attempt.timeout = std::time::Duration::from_secs(5);
+	call.attempt.timeout = time::Duration::from_secs(5);
 	let response = service.call(call);
 	tokio::pin!(response);
 	tokio::select! {
@@ -1187,7 +1190,7 @@ async fn stalled_http_headers_honor_in_flight_cancellation() {
 		result = accepted_rx => result.expect("fixture accepted request"),
 	}
 	cancellation.cancel();
-	let error = tokio::time::timeout(std::time::Duration::from_secs(1), response)
+	let error = time::timeout(time::Duration::from_secs(1), response)
 		.await
 		.expect("cancellation bound")
 		.err()

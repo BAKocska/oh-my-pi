@@ -1,8 +1,11 @@
 //! Protobuf request conversion and dispatch for one document-server session.
 
 use std::{
+	collections::HashSet,
 	future::Future,
+	io,
 	path::PathBuf,
+	str,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,22 +13,36 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use omp_core::Str;
-use omp_proto::{document::v1 as proto, prost::Message};
+use omp_proto::{
+	document::v1::{
+		self as proto, client_frame, commit_transaction_response, document_mutation,
+		document_summary_segment, document_target, lsp_response, read_document_response,
+		read_selection, server_frame, summarize_document_response, text_mutation,
+	},
+	prost::Message,
+};
+use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-	ByteEdit, ByteRange, DapAction, DapApprovalTier, DapInbound, DapProtocol, DapSession,
-	DapSessionError, DapSessionRegistry, DocumentHead, DocumentId, DocumentKind, DocumentLocator,
-	DocumentPresence, DocumentSnapshot, EnvironmentSession, Error, FileKind, FollowSymlinks,
-	LanguageId, LeaseId, LineRange, PathMetadata, PortablePermissions, ReadBody, ReadSelection,
-	Revision, SymlinkTarget, SymlinkTargetForm, SymlinkTargetKind, TransactionId,
+	ByteEdit, ByteRange, DapAction, DapApprovalTier, DapInbound, DapProtocol,
+	DapReverseRequestHandler, DapSession, DapSessionError, DapSessionRegistry,
+	DestinationOverwritePolicy, DocumentEvent, DocumentEventKind, DocumentHead, DocumentId,
+	DocumentKind, DocumentLocator, DocumentPresence, DocumentSnapshot,
+	Environment as DocserverEnvironment, EnvironmentSession, Error, ExistingDirectoryPolicy,
+	FileKind, FollowSymlinks, LanguageId, LeaseId, LineRange, PathMetadata, PortablePermissions,
+	ReadBody, ReadSelection, Result as CoreResult, Revision, SymlinkTarget, SymlinkTargetForm,
+	SymlinkTargetKind, TransactionId,
+	diagnostics::{Range, Severity, normalize, parse_push},
+	environment::{WorkspaceLeaseId, WorkspaceMutationGuard},
 	lsp::{LspError, LspResponseOutcome, LspTransportError, TextDocumentSyncKind},
 	lsp_registry::{
-		DocumentEventStreamError, LspBindingId, LspRegistryError, LspRegistryEvent,
-		StaleResponsePolicy,
+		DocumentEventStreamError, LspBindingEventKind, LspBindingId, LspLeaseBinding,
+		LspRegistryError, LspRegistryEvent, StaleResponsePolicy,
 	},
 	path_ops::PathMutationResult,
+	position::{Position, PositionEncoding},
 	summary::{
 		DocumentSummary, SummaryFallback, SummaryOptions, SummaryOutcome, SummaryRenderMode,
 		SummarySegment, SummaryUnavailableReason,
@@ -40,7 +57,7 @@ use crate::{
 
 #[derive(Clone)]
 struct EnvironmentDapReverseHandler {
-	environment: crate::Environment,
+	environment: DocserverEnvironment,
 	workspace:   PathBuf,
 	read:        bool,
 	execute:     bool,
@@ -48,7 +65,7 @@ struct EnvironmentDapReverseHandler {
 }
 
 #[async_trait]
-impl crate::DapReverseRequestHandler for EnvironmentDapReverseHandler {
+impl DapReverseRequestHandler for EnvironmentDapReverseHandler {
 	async fn handle(
 		&self,
 		parent: Arc<DapSession>,
@@ -167,7 +184,7 @@ impl EnvironmentDapReverseHandler {
 pub async fn dispatch_request(
 	session: EnvironmentSession,
 	request_id: u64,
-	body: proto::client_frame::Body,
+	body: client_frame::Body,
 	protocol_minor: u32,
 	events: flume::Sender<proto::ServerFrame>,
 	event_frame_limit: usize,
@@ -179,7 +196,7 @@ pub async fn dispatch_request(
 		request_id,
 		body: Some(match result {
 			Ok(body) => body,
-			Err(error) => proto::server_frame::Body::Error(error.into_proto()),
+			Err(error) => server_frame::Body::Error(error.into_proto()),
 		}),
 	}
 }
@@ -243,7 +260,7 @@ pub async fn registry_event_frame(
 					id:  Bytes::copy_from_slice(document_id.as_bytes()),
 					uri: uri.to_string(),
 				});
-			proto::server_frame::Body::LspEvent(proto::LspEvent {
+			server_frame::Body::LspEvent(proto::LspEvent {
 				server_id: binding_id_bytes(event.binding_id()),
 				method: event.method().to_owned(),
 				params_json: event.params_json().clone(),
@@ -301,18 +318,12 @@ pub async fn registry_event_frame(
 				Some(document_id) => document_ref_to_proto(session, document_id).await,
 				None => None,
 			};
-			proto::server_frame::Body::LspBindingEvent(proto::LspBindingEvent {
+			server_frame::Body::LspBindingEvent(proto::LspBindingEvent {
 				kind: match event.kind() {
-					crate::lsp_registry::LspBindingEventKind::Ready => proto::LspBindingEventKind::Ready,
-					crate::lsp_registry::LspBindingEventKind::PolicyChanged => {
-						proto::LspBindingEventKind::PolicyChanged
-					},
-					crate::lsp_registry::LspBindingEventKind::Restarted => {
-						proto::LspBindingEventKind::Restarted
-					},
-					crate::lsp_registry::LspBindingEventKind::Stopped => {
-						proto::LspBindingEventKind::Stopped
-					},
+					LspBindingEventKind::Ready => proto::LspBindingEventKind::Ready,
+					LspBindingEventKind::PolicyChanged => proto::LspBindingEventKind::PolicyChanged,
+					LspBindingEventKind::Restarted => proto::LspBindingEventKind::Restarted,
+					LspBindingEventKind::Stopped => proto::LspBindingEventKind::Stopped,
 				} as i32,
 				binding,
 				document,
@@ -326,7 +337,7 @@ pub async fn registry_event_frame(
 			}))
 			.ok()
 			.map(Bytes::from)?;
-			proto::server_frame::Body::LspEvent(proto::LspEvent {
+			server_frame::Body::LspEvent(proto::LspEvent {
 				server_id: Bytes::new(),
 				method: "omp/lspStartup".to_owned(),
 				params_json,
@@ -416,7 +427,7 @@ fn event_stream_error_frame(
 	legacy_code: proto::ProtocolErrorCode,
 ) -> proto::ServerFrame {
 	let body = if protocol_minor >= EVENT_STREAM_ERROR_PROTOCOL_MINOR {
-		proto::server_frame::Body::EventStreamError(proto::EventStreamError {
+		server_frame::Body::EventStreamError(proto::EventStreamError {
 			stream: stream as i32,
 			failure: failure as i32,
 			lease_id,
@@ -424,19 +435,19 @@ fn event_stream_error_frame(
 			message,
 		})
 	} else {
-		proto::server_frame::Body::Error(proto::ProtocolError { code: legacy_code as i32, message })
+		server_frame::Body::Error(proto::ProtocolError { code: legacy_code as i32, message })
 	};
 	proto::ServerFrame { request_id: 0, body: Some(body) }
 }
 
 async fn dispatch(
 	session: &EnvironmentSession,
-	body: proto::client_frame::Body,
+	body: client_frame::Body,
 	protocol_minor: u32,
 	events: flume::Sender<proto::ServerFrame>,
 	event_frame_limit: usize,
 	cancellation: CancellationToken,
-) -> DispatchResult<proto::server_frame::Body> {
+) -> DispatchResult<server_frame::Body> {
 	use proto::{client_frame::Body as Request, server_frame::Body as Response};
 	match body {
 		Request::Hello(_) => Err(Failure::invalid("ClientHello is connection-owned")),
@@ -600,7 +611,7 @@ async fn dap_start(
 	let root = workspace
 		.to_file_path()
 		.map_err(|()| Failure::invalid("DAP workspace is not a local file URI"))?;
-	let reverse_handler: Arc<dyn crate::DapReverseRequestHandler> =
+	let reverse_handler: Arc<dyn DapReverseRequestHandler> =
 		Arc::new(EnvironmentDapReverseHandler {
 			environment: connection.environment().clone(),
 			workspace: root.clone(),
@@ -681,7 +692,7 @@ async fn dap_start(
 	send_dap_frame(
 		events,
 		event_frame_limit,
-		proto::server_frame::Body::DapEvent(proto::DapEvent {
+		server_frame::Body::DapEvent(proto::DapEvent {
 			session:   Some(session_ref.clone()),
 			sequence:  debug_session.next_event_sequence(),
 			event:     "started".to_owned(),
@@ -941,7 +952,7 @@ async fn forward_dap_inbound(
 			send_dap_frame(
 				events,
 				event_frame_limit,
-				proto::server_frame::Body::DapEvent(proto::DapEvent {
+				server_frame::Body::DapEvent(proto::DapEvent {
 					session:   Some(session_ref.clone()),
 					sequence:  session.next_event_sequence(),
 					event:     event.into(),
@@ -967,7 +978,7 @@ async fn send_dap_output(
 	send_dap_frame(
 		events,
 		event_frame_limit,
-		proto::server_frame::Body::DapOutput(proto::DapOutput {
+		server_frame::Body::DapOutput(proto::DapOutput {
 			session: Some(session_ref.clone()),
 			sequence: session.next_event_sequence(),
 			category: category.to_owned(),
@@ -981,7 +992,7 @@ async fn send_dap_output(
 async fn send_dap_frame(
 	events: &flume::Sender<proto::ServerFrame>,
 	event_frame_limit: usize,
-	body: proto::server_frame::Body,
+	body: server_frame::Body,
 ) -> DispatchResult<()> {
 	let frame = proto::ServerFrame { request_id: 0, body: Some(body) };
 	if frame.encoded_len() > event_frame_limit {
@@ -1044,10 +1055,8 @@ fn release_workspace_lease(
 	session: &EnvironmentSession,
 	request: proto::ReleaseWorkspaceLeaseRequest,
 ) -> DispatchResult<proto::ReleaseWorkspaceLeaseResponse> {
-	let id = crate::environment::WorkspaceLeaseId::from_bytes(exact_array(
-		&request.workspace_lease_id,
-		"workspace lease id",
-	)?);
+	let id =
+		WorkspaceLeaseId::from_bytes(exact_array(&request.workspace_lease_id, "workspace lease id")?);
 	if !session.release_workspace_lease(id) {
 		return Err(Failure::invalid("workspace lease is missing or owned by another connection"));
 	}
@@ -1122,7 +1131,7 @@ async fn open_document(
 				},
 			};
 			let body = match document_event_to_proto(&event_session, &event) {
-				Ok(event) => proto::server_frame::Body::DocumentEvent(event),
+				Ok(event) => server_frame::Body::DocumentEvent(event),
 				Err(error) => {
 					let frame = document_event_stream_error_frame(
 						protocol_minor,
@@ -1226,19 +1235,17 @@ async fn read_document(
 		.record_snapshot(&path, snapshot, &selection)
 		.map_err(Failure::from_core)?;
 	let body = match selected.body() {
-		ReadBody::Whole(content) => proto::read_document_response::Body::Content(content.clone()),
-		ReadBody::Slices(slices) => {
-			proto::read_document_response::Body::Slices(proto::ContentSlices {
-				slices: slices
-					.iter()
-					.map(|slice| proto::ContentSlice {
-						start:   slice.start(),
-						end:     slice.end(),
-						content: slice.content().clone(),
-					})
-					.collect(),
-			})
-		},
+		ReadBody::Whole(content) => read_document_response::Body::Content(content.clone()),
+		ReadBody::Slices(slices) => read_document_response::Body::Slices(proto::ContentSlices {
+			slices: slices
+				.iter()
+				.map(|slice| proto::ContentSlice {
+					start:   slice.start(),
+					end:     slice.end(),
+					content: slice.content().clone(),
+				})
+				.collect(),
+		}),
 	};
 	Ok(proto::ReadDocumentResponse {
 		head: Some(head_to_proto(session, selected.head(), &cancellation).await?),
@@ -1280,10 +1287,10 @@ async fn summarize_document(
 		.await;
 	let outcome = match outcome {
 		SummaryOutcome::Available(summary) => {
-			proto::summarize_document_response::Outcome::Summary(summary_to_proto(&summary))
+			summarize_document_response::Outcome::Summary(summary_to_proto(&summary))
 		},
 		SummaryOutcome::Fallback(fallback) => {
-			proto::summarize_document_response::Outcome::Unavailable(fallback_to_proto(&fallback))
+			summarize_document_response::Outcome::Unavailable(fallback_to_proto(&fallback))
 		},
 		SummaryOutcome::Cancelled => return Err(Failure::cancelled("summary request cancelled")),
 	};
@@ -1347,25 +1354,25 @@ async fn build_operations(
 			.operation
 			.ok_or_else(|| build_invalid("document mutation operation is required"))?
 		{
-			proto::document_mutation::Operation::Text(text) => MutationOperation::Text(
+			document_mutation::Operation::Text(text) => MutationOperation::Text(
 				build_text_mutation(&session, &target, text, &cancellation).await?,
 			),
-			proto::document_mutation::Operation::Create(create) => {
+			document_mutation::Operation::Create(create) => {
 				MutationOperation::Create(build_create_mutation(create)?)
 			},
-			proto::document_mutation::Operation::Delete(delete) => {
+			document_mutation::Operation::Delete(delete) => {
 				let revision = delete
 					.base_revision
 					.ok_or_else(|| build_invalid("delete base revision is required"))
 					.and_then(|revision| parse_revision(revision).map_err(build_from_failure))?;
 				MutationOperation::Delete(DeleteMutation::new(revision))
 			},
-			proto::document_mutation::Operation::Move(moved) => {
+			document_mutation::Operation::Move(moved) => {
 				let moved = build_move_mutation(moved)?;
 				check_workspace_uris(&session, [moved.destination()]).map_err(build_from_failure)?;
 				MutationOperation::Move(moved)
 			},
-			proto::document_mutation::Operation::MoveWithContent(moved) => {
+			document_mutation::Operation::MoveWithContent(moved) => {
 				let moved = build_move_with_content_mutation(moved)?;
 				check_workspace_uris(&session, [moved.destination()]).map_err(build_from_failure)?;
 				MutationOperation::MoveWithContent(moved)
@@ -1392,8 +1399,8 @@ async fn build_text_mutation(
 		.change
 		.ok_or_else(|| build_invalid("text mutation change is required"))?;
 	let proposal = match change {
-		proto::text_mutation::Change::ProposedContent(content) => TextProposal::Content(content),
-		proto::text_mutation::Change::Edits(edits) => {
+		text_mutation::Change::ProposedContent(content) => TextProposal::Content(content),
+		text_mutation::Change::Edits(edits) => {
 			let edits = edits
 				.edits
 				.into_iter()
@@ -1401,11 +1408,11 @@ async fn build_text_mutation(
 					ByteRange::new(edit.start, edit.end)
 						.map(|range| ByteEdit::new(range, edit.replacement))
 				})
-				.collect::<crate::Result<Vec<_>>>()
+				.collect::<CoreResult<Vec<_>>>()
 				.map_err(|error| build_invalid(error.to_string()))?;
 			TextProposal::Edits(edits)
 		},
-		proto::text_mutation::Change::Proposal(proposal) => {
+		text_mutation::Change::Proposal(proposal) => {
 			if proposal.format.is_empty() {
 				return Err(build_invalid("edit proposal format must not be empty"));
 			}
@@ -1459,6 +1466,7 @@ fn build_create_mutation(
 }
 
 fn build_move_mutation(moved: proto::MoveMutation) -> Result<MoveMutation, TransactionBuildError> {
+	use omp_proto::document::v1::move_mutation::DestinationPrecondition;
 	let base = moved
 		.base_revision
 		.ok_or_else(|| build_invalid("move base revision is required"))
@@ -1468,15 +1476,15 @@ fn build_move_mutation(moved: proto::MoveMutation) -> Result<MoveMutation, Trans
 		.destination_precondition
 		.ok_or_else(|| build_invalid("move destination precondition is required"))?
 	{
-		proto::move_mutation::DestinationPrecondition::DestinationRevision(revision) => {
+		DestinationPrecondition::DestinationRevision(revision) => {
 			MoveDestinationPrecondition::Revision(
 				parse_revision(revision).map_err(build_from_failure)?,
 			)
 		},
-		proto::move_mutation::DestinationPrecondition::DestinationMustNotExist(true) => {
+		DestinationPrecondition::DestinationMustNotExist(true) => {
 			MoveDestinationPrecondition::MustNotExist
 		},
-		proto::move_mutation::DestinationPrecondition::DestinationMustNotExist(false) => {
+		DestinationPrecondition::DestinationMustNotExist(false) => {
 			return Err(build_invalid("destination_must_not_exist must be true"));
 		},
 	};
@@ -1486,6 +1494,7 @@ fn build_move_mutation(moved: proto::MoveMutation) -> Result<MoveMutation, Trans
 fn build_move_with_content_mutation(
 	moved: proto::MoveWithContentMutation,
 ) -> Result<MoveWithContentMutation, TransactionBuildError> {
+	use omp_proto::document::v1::move_with_content_mutation::DestinationPrecondition;
 	let base = moved
 		.base_revision
 		.ok_or_else(|| build_invalid("move base revision is required"))
@@ -1495,17 +1504,15 @@ fn build_move_with_content_mutation(
 		.destination_precondition
 		.ok_or_else(|| build_invalid("move destination precondition is required"))?
 	{
-		proto::move_with_content_mutation::DestinationPrecondition::DestinationRevision(revision) => {
+		DestinationPrecondition::DestinationRevision(revision) => {
 			MoveDestinationPrecondition::Revision(
 				parse_revision(revision).map_err(build_from_failure)?,
 			)
 		},
-		proto::move_with_content_mutation::DestinationPrecondition::DestinationMustNotExist(true) => {
+		DestinationPrecondition::DestinationMustNotExist(true) => {
 			MoveDestinationPrecondition::MustNotExist
 		},
-		proto::move_with_content_mutation::DestinationPrecondition::DestinationMustNotExist(
-			false,
-		) => {
+		DestinationPrecondition::DestinationMustNotExist(false) => {
 			return Err(build_invalid("destination_must_not_exist must be true"));
 		},
 	};
@@ -1588,9 +1595,9 @@ async fn lsp_request(
 	match result {
 		Ok(response) => {
 			let outcome = match response.outcome {
-				LspResponseOutcome::Result(result) => proto::lsp_response::Outcome::ResultJson(result),
+				LspResponseOutcome::Result(result) => lsp_response::Outcome::ResultJson(result),
 				LspResponseOutcome::Error { code, message, data } => {
-					proto::lsp_response::Outcome::Error(proto::LspError {
+					lsp_response::Outcome::Error(proto::LspError {
 						code,
 						message: message.to_string(),
 						data_json: data.unwrap_or_default(),
@@ -1686,9 +1693,9 @@ async fn create_directory(
 	let existing = match proto::ExistingDirectoryPolicy::try_from(request.existing_leaf)
 		.map_err(|_| Failure::invalid("unknown existing directory policy"))?
 	{
-		proto::ExistingDirectoryPolicy::FailIfExists => crate::ExistingDirectoryPolicy::FailIfExists,
+		proto::ExistingDirectoryPolicy::FailIfExists => ExistingDirectoryPolicy::FailIfExists,
 		proto::ExistingDirectoryPolicy::AllowExistingDirectory => {
-			crate::ExistingDirectoryPolicy::AllowExistingDirectory
+			ExistingDirectoryPolicy::AllowExistingDirectory
 		},
 	};
 	let metadata = completed_path_result(
@@ -1880,11 +1887,11 @@ async fn set_permissions(
 fn begin_workspace_mutation<'a>(
 	session: &EnvironmentSession,
 	uris: impl IntoIterator<Item = &'a Url>,
-) -> DispatchResult<crate::environment::WorkspaceMutationGuard> {
+) -> DispatchResult<WorkspaceMutationGuard> {
 	let paths = uris
 		.into_iter()
 		.map(|uri| session.environment().store().resolve_entry_path(uri))
-		.collect::<std::result::Result<Vec<_>, _>>()
+		.collect::<Result<Vec<_>, _>>()
 		.map_err(Failure::from_core)?;
 	session
 		.environment()
@@ -1900,7 +1907,7 @@ fn check_workspace_uris<'a>(
 	let paths = uris
 		.into_iter()
 		.map(|uri| session.environment().store().resolve_entry_path(uri))
-		.collect::<std::result::Result<Vec<_>, _>>()
+		.collect::<Result<Vec<_>, _>>()
 		.map_err(Failure::from_core)?;
 	session
 		.check_workspace_paths(paths)
@@ -1948,13 +1955,11 @@ const fn transaction_reject_code(reason: TransactionRejectReason) -> proto::Prot
 
 fn parse_target(target: proto::DocumentTarget) -> DispatchResult<DocumentTarget> {
 	match required(target.target, "document target")? {
-		proto::document_target::Target::DocumentId(bytes) => {
+		document_target::Target::DocumentId(bytes) => {
 			Ok(DocumentTarget::Document(parse_document_id(&bytes)?))
 		},
-		proto::document_target::Target::LeaseId(bytes) => {
-			Ok(DocumentTarget::Lease(parse_lease_id(&bytes)?))
-		},
-		proto::document_target::Target::Uri(uri) => Ok(DocumentTarget::Uri(parse_file_uri(&uri)?)),
+		document_target::Target::LeaseId(bytes) => Ok(DocumentTarget::Lease(parse_lease_id(&bytes)?)),
+		document_target::Target::Uri(uri) => Ok(DocumentTarget::Uri(parse_file_uri(&uri)?)),
 	}
 }
 
@@ -2070,15 +2075,15 @@ async fn connection_lease_for_target(
 
 fn parse_read_selection(selection: proto::ReadSelection) -> DispatchResult<ReadSelection> {
 	match required(selection.selection, "read selection kind")? {
-		proto::read_selection::Selection::Whole(_) => Ok(ReadSelection::Whole),
-		proto::read_selection::Selection::Bytes(bytes) => Ok(ReadSelection::Bytes(
+		read_selection::Selection::Whole(_) => Ok(ReadSelection::Whole),
+		read_selection::Selection::Bytes(bytes) => Ok(ReadSelection::Bytes(
 			bytes
 				.ranges
 				.into_iter()
 				.map(|range| ByteRange::new(range.start, range.end).map_err(Failure::from_core))
 				.collect::<DispatchResult<_>>()?,
 		)),
-		proto::read_selection::Selection::Lines(lines) => Ok(ReadSelection::Lines(
+		read_selection::Selection::Lines(lines) => Ok(ReadSelection::Lines(
 			lines
 				.ranges
 				.into_iter()
@@ -2122,13 +2127,13 @@ fn summary_to_proto(summary: &DocumentSummary) -> proto::DocumentSummaryResult {
 			.iter()
 			.map(|segment| match segment {
 				SummarySegment::Kept { start_line, end_line, text } => proto::DocumentSummarySegment {
-					kind:       proto::document_summary_segment::Kind::Kept as i32,
+					kind:       document_summary_segment::Kind::Kept as i32,
 					start_line: *start_line,
 					end_line:   *end_line,
 					text:       Some(text.clone()),
 				},
 				SummarySegment::Elided { start_line, end_line } => proto::DocumentSummarySegment {
-					kind:       proto::document_summary_segment::Kind::Elided as i32,
+					kind:       document_summary_segment::Kind::Elided as i32,
 					start_line: *start_line,
 					end_line:   *end_line,
 					text:       None,
@@ -2195,19 +2200,17 @@ async fn enrich_transaction_diagnostics(
 		TransactionOutcome::Rejected { .. } => return,
 	};
 	let response_operations = match response.outcome.as_mut() {
-		Some(proto::commit_transaction_response::Outcome::Committed(committed)) => {
-			&mut committed.operations
-		},
-		Some(proto::commit_transaction_response::Outcome::PartiallyCommitted(partial)) => {
+		Some(commit_transaction_response::Outcome::Committed(committed)) => &mut committed.operations,
+		Some(commit_transaction_response::Outcome::PartiallyCommitted(partial)) => {
 			&mut partial.committed_operations
 		},
 		_ => return,
 	};
-	let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+	let deadline = Instant::now() + Duration::from_millis(500);
 	let mut pending = operations
 		.iter()
 		.map(|operation| operation.operation_index())
-		.collect::<std::collections::HashSet<_>>();
+		.collect::<HashSet<_>>();
 	while !pending.is_empty() {
 		for operation in operations {
 			if !pending.contains(&operation.operation_index()) {
@@ -2228,9 +2231,7 @@ async fn enrich_transaction_diagnostics(
 					.environment()
 					.lsp()
 					.diagnostic_position_encoding(&event);
-				if let Ok((_, _, batch)) =
-					crate::diagnostics::parse_push(event.params_json(), event.binding_name())
-				{
+				if let Ok((_, _, batch)) = parse_push(event.params_json(), event.binding_name()) {
 					encodings.extend(
 						batch
 							.iter()
@@ -2239,7 +2240,7 @@ async fn enrich_transaction_diagnostics(
 					diagnostics.extend(batch);
 				}
 			}
-			let diagnostics = crate::diagnostics::normalize(diagnostics);
+			let diagnostics = normalize(diagnostics);
 			let diagnostics = session
 				.environment()
 				.lsp()
@@ -2280,12 +2281,10 @@ async fn enrich_transaction_diagnostics(
 								diagnostic_byte_range(content, diagnostic.range, encoding)
 							}),
 							severity: match diagnostic.severity {
-								crate::diagnostics::Severity::Error => proto::DiagnosticSeverity::Error,
-								crate::diagnostics::Severity::Warning => proto::DiagnosticSeverity::Warning,
-								crate::diagnostics::Severity::Information => {
-									proto::DiagnosticSeverity::Information
-								},
-								crate::diagnostics::Severity::Hint => proto::DiagnosticSeverity::Hint,
+								Severity::Error => proto::DiagnosticSeverity::Error,
+								Severity::Warning => proto::DiagnosticSeverity::Warning,
+								Severity::Information => proto::DiagnosticSeverity::Information,
+								Severity::Hint => proto::DiagnosticSeverity::Hint,
 							} as i32,
 							code:     diagnostic.code.unwrap_or_default().into(),
 							source:   diagnostic.source.into(),
@@ -2298,10 +2297,10 @@ async fn enrich_transaction_diagnostics(
 			}
 			pending.remove(&operation.operation_index());
 		}
-		if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+		if pending.is_empty() || Instant::now() >= deadline {
 			break;
 		}
-		tokio::time::sleep(Duration::from_millis(25)).await;
+		time::sleep(Duration::from_millis(25)).await;
 	}
 	for result in response_operations {
 		if pending.contains(&result.operation_index)
@@ -2314,19 +2313,19 @@ async fn enrich_transaction_diagnostics(
 
 fn diagnostic_byte_range(
 	content: &[u8],
-	range: crate::diagnostics::Range,
-	encoding: crate::position::PositionEncoding,
+	range: Range,
+	encoding: PositionEncoding,
 ) -> Option<proto::ByteRange> {
-	let text = std::str::from_utf8(content).ok()?;
+	let text = str::from_utf8(content).ok()?;
 	let start = encoding
-		.position_to_offset(text, crate::position::Position {
+		.position_to_offset(text, Position {
 			line:      range.start.line,
 			character: range.start.character,
 		})
 		.ok()
 		.and_then(|offset| u64::try_from(offset).ok())?;
 	let end = encoding
-		.position_to_offset(text, crate::position::Position {
+		.position_to_offset(text, Position {
 			line:      range.end.line,
 			character: range.end.character,
 		})
@@ -2338,7 +2337,7 @@ fn diagnostic_byte_range(
 fn transaction_outcome_to_proto(outcome: &TransactionOutcome) -> proto::CommitTransactionResponse {
 	let outcome = match outcome {
 		TransactionOutcome::Committed { transaction_id, operations } => {
-			proto::commit_transaction_response::Outcome::Committed(proto::TransactionCommitted {
+			commit_transaction_response::Outcome::Committed(proto::TransactionCommitted {
 				transaction_id: Bytes::copy_from_slice(transaction_id.as_bytes()),
 				operations:     operation_results_to_proto(operations),
 			})
@@ -2358,7 +2357,7 @@ fn transaction_outcome_to_proto(outcome: &TransactionOutcome) -> proto::CommitTr
 						.collect(),
 				})
 				.collect();
-			proto::commit_transaction_response::Outcome::Rejected(proto::TransactionRejected {
+			commit_transaction_response::Outcome::Rejected(proto::TransactionRejected {
 				transaction_id: Bytes::copy_from_slice(transaction_id.as_bytes()),
 				reason:         reject_reason_to_proto(*reason) as i32,
 				message:        message.to_string(),
@@ -2371,7 +2370,7 @@ fn transaction_outcome_to_proto(outcome: &TransactionOutcome) -> proto::CommitTr
 			failed_operation_index,
 			reason,
 			message,
-		} => proto::commit_transaction_response::Outcome::PartiallyCommitted(
+		} => commit_transaction_response::Outcome::PartiallyCommitted(
 			proto::TransactionPartiallyCommitted {
 				transaction_id:         Bytes::copy_from_slice(transaction_id.as_bytes()),
 				committed_operations:   operation_results_to_proto(committed_operations),
@@ -2517,7 +2516,7 @@ fn head_at_uri_to_proto(head: &DocumentHead, uri: &Url) -> proto::DocumentHead {
 
 fn document_event_to_proto(
 	session: &EnvironmentSession,
-	event: &crate::DocumentEvent,
+	event: &DocumentEvent,
 ) -> DispatchResult<proto::DocumentEvent> {
 	let previous_uri = match event.previous_path() {
 		Some(path) => session
@@ -2536,12 +2535,12 @@ fn document_event_to_proto(
 	Ok(proto::DocumentEvent {
 		event_sequence: event.event_sequence(),
 		kind: match event.kind() {
-			crate::DocumentEventKind::Committed => proto::DocumentEventKind::Committed,
-			crate::DocumentEventKind::ExternalCreated => proto::DocumentEventKind::ExternalCreated,
-			crate::DocumentEventKind::ExternalModified => proto::DocumentEventKind::ExternalModified,
-			crate::DocumentEventKind::ExternalDeleted => proto::DocumentEventKind::ExternalDeleted,
-			crate::DocumentEventKind::ExternalRenamed => proto::DocumentEventKind::ExternalRenamed,
-			crate::DocumentEventKind::WatchRescanned => proto::DocumentEventKind::WatchRescanned,
+			DocumentEventKind::Committed => proto::DocumentEventKind::Committed,
+			DocumentEventKind::ExternalCreated => proto::DocumentEventKind::ExternalCreated,
+			DocumentEventKind::ExternalModified => proto::DocumentEventKind::ExternalModified,
+			DocumentEventKind::ExternalDeleted => proto::DocumentEventKind::ExternalDeleted,
+			DocumentEventKind::ExternalRenamed => proto::DocumentEventKind::ExternalRenamed,
+			DocumentEventKind::WatchRescanned => proto::DocumentEventKind::WatchRescanned,
 		} as i32,
 		head: Some(head_at_uri_to_proto(event.head(), &uri)),
 		previous_revision: Some(revision_to_proto(event.previous_revision())),
@@ -2557,7 +2556,7 @@ fn document_event_to_proto(
 	})
 }
 
-fn binding_to_proto(binding: &crate::lsp_registry::LspLeaseBinding) -> proto::LspServerBinding {
+fn binding_to_proto(binding: &LspLeaseBinding) -> proto::LspServerBinding {
 	let policy = binding.sync_policy();
 	proto::LspServerBinding {
 		server_id:         binding_id_bytes(binding.info().id()),
@@ -2658,18 +2657,18 @@ fn parse_follow(value: i32) -> DispatchResult<FollowSymlinks> {
 fn parse_overwrite(
 	value: i32,
 	allow_empty_directory: bool,
-) -> DispatchResult<crate::DestinationOverwritePolicy> {
+) -> DispatchResult<DestinationOverwritePolicy> {
 	match proto::DestinationOverwritePolicy::try_from(value)
 		.map_err(|_| Failure::invalid("unknown destination overwrite policy"))?
 	{
 		proto::DestinationOverwritePolicy::FailIfExists => {
-			Ok(crate::DestinationOverwritePolicy::FailIfExists)
+			Ok(DestinationOverwritePolicy::FailIfExists)
 		},
 		proto::DestinationOverwritePolicy::ReplaceNonDirectory => {
-			Ok(crate::DestinationOverwritePolicy::ReplaceNonDirectory)
+			Ok(DestinationOverwritePolicy::ReplaceNonDirectory)
 		},
 		proto::DestinationOverwritePolicy::ReplaceEmptyDirectory if allow_empty_directory => {
-			Ok(crate::DestinationOverwritePolicy::ReplaceEmptyDirectory)
+			Ok(DestinationOverwritePolicy::ReplaceEmptyDirectory)
 		},
 		proto::DestinationOverwritePolicy::ReplaceEmptyDirectory => {
 			Err(Failure::invalid("replace-empty-directory is valid only for rename"))
@@ -2880,7 +2879,7 @@ impl Failure {
 			| Error::StaleDiskState { .. } => proto::ProtocolErrorCode::ContentModified,
 			Error::Watch { .. } => proto::ProtocolErrorCode::Io,
 			Error::Persistence { source, .. } | Error::Io { source, .. }
-				if source.kind() == std::io::ErrorKind::Interrupted =>
+				if source.kind() == io::ErrorKind::Interrupted =>
 			{
 				proto::ProtocolErrorCode::Cancelled
 			},
@@ -2968,17 +2967,17 @@ impl Failure {
 	}
 }
 
-const fn io_code(kind: std::io::ErrorKind) -> proto::ProtocolErrorCode {
+const fn io_code(kind: io::ErrorKind) -> proto::ProtocolErrorCode {
 	match kind {
-		std::io::ErrorKind::NotFound => proto::ProtocolErrorCode::NotFound,
-		std::io::ErrorKind::PermissionDenied => proto::ProtocolErrorCode::PermissionDenied,
-		std::io::ErrorKind::AlreadyExists => proto::ProtocolErrorCode::AlreadyExists,
-		std::io::ErrorKind::NotADirectory => proto::ProtocolErrorCode::NotADirectory,
-		std::io::ErrorKind::IsADirectory => proto::ProtocolErrorCode::IsADirectory,
-		std::io::ErrorKind::DirectoryNotEmpty => proto::ProtocolErrorCode::DirectoryNotEmpty,
-		std::io::ErrorKind::CrossesDevices => proto::ProtocolErrorCode::CrossDevice,
-		std::io::ErrorKind::Unsupported => proto::ProtocolErrorCode::Unsupported,
-		std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+		io::ErrorKind::NotFound => proto::ProtocolErrorCode::NotFound,
+		io::ErrorKind::PermissionDenied => proto::ProtocolErrorCode::PermissionDenied,
+		io::ErrorKind::AlreadyExists => proto::ProtocolErrorCode::AlreadyExists,
+		io::ErrorKind::NotADirectory => proto::ProtocolErrorCode::NotADirectory,
+		io::ErrorKind::IsADirectory => proto::ProtocolErrorCode::IsADirectory,
+		io::ErrorKind::DirectoryNotEmpty => proto::ProtocolErrorCode::DirectoryNotEmpty,
+		io::ErrorKind::CrossesDevices => proto::ProtocolErrorCode::CrossDevice,
+		io::ErrorKind::Unsupported => proto::ProtocolErrorCode::Unsupported,
+		io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
 			proto::ProtocolErrorCode::InvalidArgument
 		},
 		_ => proto::ProtocolErrorCode::Io,
@@ -3055,7 +3054,7 @@ mod tests {
 			document_event_stream_error_frame(1, lease_id, DocumentEventStreamError::Lagged {
 				skipped: 3,
 			});
-		let Some(proto::server_frame::Body::EventStreamError(error)) = frame.body else {
+		let Some(server_frame::Body::EventStreamError(error)) = frame.body else {
 			panic!("minor one must use the dedicated event stream error");
 		};
 		assert_eq!(error.stream(), proto::EventStreamKind::Document);
@@ -3103,13 +3102,11 @@ mod tests {
 		);
 		let operation = proto::DocumentMutation {
 			document:  Some(proto::DocumentTarget {
-				target: Some(proto::document_target::Target::LeaseId(Bytes::copy_from_slice(
+				target: Some(document_target::Target::LeaseId(Bytes::copy_from_slice(
 					lease_id.as_bytes(),
 				))),
 			}),
-			operation: Some(proto::document_mutation::Operation::Create(
-				proto::CreateMutation::default(),
-			)),
+			operation: Some(document_mutation::Operation::Create(proto::CreateMutation::default())),
 		};
 		let error = build_operations(other, vec![operation], CancellationToken::new())
 			.await

@@ -4,9 +4,14 @@
 //! the demo binary's tests can replay emitted ANSI against one cell-accurate
 //! model instead of trusting the renderer's own bookkeeping.
 
+use std::{fs, io, path::Path};
+
 use xutf::Text;
 
-use crate::frame::{CellContent, Frame, Style};
+use crate::{
+	frame::{CellContent, Frame, Style},
+	kitty,
+};
 
 /// Returns a frame row as visible text, exactly as [`TerminalModel`] renders
 /// rows: grapheme heads concatenated, continuations skipped, right-trimmed.
@@ -20,7 +25,7 @@ pub fn frame_row_text(frame: &Frame, row: u16) -> String {
 			CellContent::Blank => text.push(' '),
 			CellContent::Grapheme { text: glyph, .. } => text.push_str(glyph),
 			CellContent::Image { id, row, col, rows, cols } => {
-				let (placeholder, _) = crate::kitty::placeholder_cell(*id, *row, *col, *rows, *cols);
+				let (placeholder, _) = kitty::placeholder_cell(*id, *row, *col, *rows, *cols);
 				text.push_str(&placeholder);
 			},
 			CellContent::Continuation => {},
@@ -39,9 +44,9 @@ pub fn frame_cell_style(frame: &Frame, x: u16, y: u16) -> Style {
 
 /// Writes a `width`x`height` opaque single-color PNG, for tests that
 /// exercise image-path decoding across crates.
-pub fn write_test_png(path: &std::path::Path, width: u32, height: u32, rgb: [u8; 3]) {
-	let file = std::fs::File::create(path).expect("create test PNG");
-	let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+pub fn write_test_png(path: &Path, width: u32, height: u32, rgb: [u8; 3]) {
+	let file = fs::File::create(path).expect("create test PNG");
+	let mut encoder = png::Encoder::new(io::BufWriter::new(file), width, height);
 	encoder.set_color(png::ColorType::Rgba);
 	encoder.set_depth(png::BitDepth::Eight);
 	let mut writer = encoder.write_header().expect("PNG header");

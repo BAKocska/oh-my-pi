@@ -1,4 +1,7 @@
-use std::path::Path;
+//! Verifies current-worktree queries across creation, isolation, and
+//! destruction.
+
+use std::{fs, path::Path};
 
 use omp_docserver::{
 	Environment, ServerConfig,
@@ -11,12 +14,14 @@ use omp_envd::{
 };
 use omp_proto::env::v1::{CreateWorktree, DestroyWorktree};
 use tempfile::TempDir;
+use tokio::io;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 async fn operations(root: &Path, state: &Path) -> (WorkspaceOperations, DocumentHost, BlobHost) {
 	let environment = Environment::new(ServerConfig::new(root).expect("document config"))
 		.expect("document authority");
-	let (client, server) = tokio::io::duplex(256 * 1024);
+	let (client, server) = io::duplex(256 * 1024);
 	tokio::spawn(serve_connection(environment, server, ConnectionConfig::default()));
 	let documents = DocumentHost::connect(client).await.expect("document host");
 	let blobs = BlobHost::open(state.join("blobs")).expect("blob host");
@@ -35,7 +40,7 @@ async fn operations(root: &Path, state: &Path) -> (WorkspaceOperations, Document
 async fn current_worktree_follows_the_registered_worktree_lifecycle() {
 	let root = TempDir::new().expect("workspace");
 	let state = TempDir::new().expect("state");
-	std::fs::write(root.path().join("tracked.txt"), b"primary\n").expect("fixture");
+	fs::write(root.path().join("tracked.txt"), b"primary\n").expect("fixture");
 	let (primary, documents, blobs) = operations(root.path(), state.path()).await;
 	let cancel = CancellationToken::new();
 
@@ -44,7 +49,7 @@ async fn current_worktree_follows_the_registered_worktree_lifecycle() {
 	let created = primary
 		.create_worktree(&CreateWorktree { name: "query".to_owned(), ..Default::default() }, &cancel)
 		.expect("create worktree");
-	let worktree_root = url::Url::parse(&created.root_uri)
+	let worktree_root = Url::parse(&created.root_uri)
 		.expect("worktree root URI")
 		.to_file_path()
 		.expect("worktree file URI");

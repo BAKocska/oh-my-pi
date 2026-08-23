@@ -1,9 +1,10 @@
 //! Fence-aware enhanced-speech rewriting with bounded local-model fallback.
 
-use std::{future::Future, time::Duration};
+use std::{error, future::Future, mem, time::Duration};
 
 use omp_core::Str;
 use thiserror::Error;
+use tokio::time;
 
 use crate::segmentation::normalize_speakable;
 
@@ -40,7 +41,7 @@ pub struct RewriteOutput {
 #[derive(Debug, Error)]
 pub enum SpeechRewriteError<E>
 where
-	E: std::error::Error + Send + Sync + 'static,
+	E: error::Error + Send + Sync + 'static,
 {
 	/// The local rewrite backend failed.
 	#[error("local speech rewrite failed")]
@@ -54,7 +55,7 @@ where
 /// Unboxed local-model contract used by [`rewrite_for_speech`].
 pub trait SpeechRewriteBackend {
 	/// Typed inference failure.
-	type Error: std::error::Error + Send + Sync + 'static;
+	type Error: error::Error + Send + Sync + 'static;
 
 	/// Runs the stable speech prompt against one complete prose block.
 	fn rewrite(
@@ -81,11 +82,8 @@ pub async fn rewrite_for_speech<B: SpeechRewriteBackend>(
 			fallback: Some(RewriteFallback::Disabled),
 		});
 	}
-	match tokio::time::timeout(
-		timeout,
-		backend.rewrite(SPEECH_REWRITE_PROMPT, Str::from(text.trim())),
-	)
-	.await
+	match time::timeout(timeout, backend.rewrite(SPEECH_REWRITE_PROMPT, Str::from(text.trim())))
+		.await
 	{
 		Ok(Ok(rewritten)) => {
 			let rewritten = normalize_speakable(rewritten.as_str());
@@ -153,7 +151,7 @@ impl RewriteBlockAccumulator {
 	}
 
 	fn finish_line(&mut self, output: &mut Vec<Str>) {
-		let line = std::mem::take(&mut self.line);
+		let line = mem::take(&mut self.line);
 		let trimmed = line.trim_start();
 		if let Some(marker) = fence_marker(trimmed) {
 			if self.fence == Some(marker) {

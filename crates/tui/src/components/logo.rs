@@ -4,9 +4,10 @@
 use omp_core::IntoStr;
 
 use crate::{
-	Component, Dim, Graphics, PaintCtx, Prop, Props, Rect, Slot, UiContext,
+	Component, Dim, Graphics, PaintCtx, Prop, Props, Rect, Slot, UiContext, assets, component,
 	components::{Col, Img},
-	imagereg,
+	dom, imagereg,
+	props::PropValue,
 };
 
 /// A provider logo cell using packaged assets.
@@ -36,7 +37,7 @@ impl Logo {
 	/// Creates an unresolved logo cell; the backing image or monogram is
 	/// chosen on first layout from the packaged asset table.
 	pub fn new() -> Self {
-		Self { props: Props::new(), slot: crate::component::next_slot(), inner: LogoInner::Pending }
+		Self { props: Props::new(), slot: component::next_slot(), inner: LogoInner::Pending }
 	}
 
 	/// Sets a string property on the logo element.
@@ -46,7 +47,7 @@ impl Logo {
 	}
 
 	/// Sets a property on the logo element.
-	pub fn with(mut self, prop: Prop, value: impl Into<crate::props::PropValue>) -> Self {
+	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
 		self.props.set(prop, value);
 		self
 	}
@@ -64,7 +65,7 @@ impl Logo {
 			_ => 4,
 		};
 		let height = self.props.h().unwrap_or(2);
-		self.inner = if crate::assets::provider_logo(provider_id).is_some() {
+		self.inner = if assets::provider_logo(provider_id).is_some() {
 			let source = format!("asset://login/{provider_id}");
 			let mut img = Img::new()
 				.with_str(Prop::Src, &source)
@@ -90,7 +91,7 @@ impl Logo {
 			} else {
 				monogram
 			};
-			LogoInner::Monogram(crate::dom! {
+			LogoInner::Monogram(dom! {
 				<col w={width} h={height} align=center valign=middle>
 					<text bold fg="accent..info">{monogram.to_uppercase()}</text>
 				</col>

@@ -2,8 +2,10 @@
 
 use std::{
 	collections::BTreeMap,
-	fmt,
+	error,
+	fmt::{self, Display},
 	future::Future,
+	mem,
 	pin::Pin,
 	sync::{Arc, LazyLock},
 	time::{Duration, SystemTime},
@@ -12,6 +14,7 @@ use std::{
 use futures::channel::oneshot;
 use omp_core::Str;
 use parking_lot::Mutex;
+use tokio::time;
 
 use crate::id::{AccountId, PrincipalId};
 
@@ -90,7 +93,7 @@ pub enum RefreshPolicyError {
 	RenewalNotBeforeExpiry,
 }
 
-impl fmt::Display for RefreshPolicyError {
+impl Display for RefreshPolicyError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(match self {
 			Self::ZeroLeaseTtl => "refresh lease TTL must be nonzero",
@@ -100,7 +103,7 @@ impl fmt::Display for RefreshPolicyError {
 	}
 }
 
-impl std::error::Error for RefreshPolicyError {}
+impl error::Error for RefreshPolicyError {}
 
 /// Request to atomically acquire a metadata-only persistent refresh lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,13 +166,13 @@ pub struct RefreshStoreError {
 	pub summary: Str,
 }
 
-impl fmt::Display for RefreshStoreError {
+impl Display for RefreshStoreError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "refresh coordination {}: {}", self.code, self.summary)
 	}
 }
 
-impl std::error::Error for RefreshStoreError {}
+impl error::Error for RefreshStoreError {}
 
 /// Cold persistent lease boundary; implementations may box one I/O future per
 /// method.
@@ -232,13 +235,13 @@ pub struct RefreshOperationError {
 	pub summary: Str,
 }
 
-impl fmt::Display for RefreshOperationError {
+impl Display for RefreshOperationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "credential refresh {}: {}", self.code, self.summary)
 	}
 }
 
-impl std::error::Error for RefreshOperationError {}
+impl error::Error for RefreshOperationError {}
 
 /// One observable step in refresh coordination.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -384,7 +387,7 @@ pub struct RefreshError {
 	pub receipt: Box<RefreshReceipt>,
 }
 
-impl fmt::Display for RefreshError {
+impl Display for RefreshError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match &self.kind {
 			RefreshErrorKind::Store(error) => error.fmt(formatter),
@@ -407,7 +410,7 @@ impl fmt::Display for RefreshError {
 	}
 }
 
-impl std::error::Error for RefreshError {}
+impl error::Error for RefreshError {}
 
 type SharedResult = Result<RefreshResult, RefreshError>;
 
@@ -434,7 +437,7 @@ impl FlightGuard {
 	fn finish(mut self, result: SharedResult) {
 		self.finished = true;
 		remove_flight(&self.account, &self.flight);
-		let waiters = std::mem::take(&mut *self.flight.waiters.lock());
+		let waiters = mem::take(&mut *self.flight.waiters.lock());
 		for waiter in waiters {
 			let _ = waiter.send(result.clone());
 		}
@@ -451,7 +454,7 @@ impl Drop for FlightGuard {
 			kind:    RefreshErrorKind::LeaderCancelled,
 			receipt: Box::new(self.fallback.lock().clone()),
 		};
-		let waiters = std::mem::take(&mut *self.flight.waiters.lock());
+		let waiters = mem::take(&mut *self.flight.waiters.lock());
 		for waiter in waiters {
 			let _ = waiter.send(Err(error.clone()));
 		}
@@ -694,7 +697,7 @@ impl RefreshCoordinator {
 		let interval = self.policy.renew_interval;
 		tokio::pin!(future);
 		loop {
-			let sleep = tokio::time::sleep(interval);
+			let sleep = time::sleep(interval);
 			tokio::pin!(sleep);
 			tokio::select! {
 				result = &mut future => {

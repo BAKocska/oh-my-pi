@@ -1,3 +1,4 @@
+use std::mem;
 /// Incrementally withholds only a trailing byte sequence that can still become
 /// a placeholder.
 #[derive(Debug, Default)]
@@ -18,12 +19,12 @@ impl PlaceholderStream {
 		let keep = possible_placeholder_suffix_len(&self.pending);
 		let emit_len = self.pending.len() - keep;
 		let suffix = self.pending.split_off(emit_len);
-		std::mem::replace(&mut self.pending, suffix)
+		mem::replace(&mut self.pending, suffix)
 	}
 
 	/// Flushes any terminal literal suffix that never completed a placeholder.
 	pub fn finish(&mut self) -> String {
-		std::mem::take(&mut self.pending)
+		mem::take(&mut self.pending)
 	}
 
 	/// Returns the currently withheld possible placeholder prefix.

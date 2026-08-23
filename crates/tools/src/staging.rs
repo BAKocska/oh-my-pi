@@ -3,6 +3,7 @@
 use std::{
 	collections::BTreeMap,
 	future::Future,
+	io,
 	path::PathBuf,
 	pin::Pin,
 	sync::{
@@ -96,7 +97,7 @@ pub enum PreviewActionError {
 		path:   PathBuf,
 		/// Typed I/O source.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// The terminal action payload could not be encoded.
 	#[error("staged proposal result could not be encoded")]

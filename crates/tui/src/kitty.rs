@@ -1,6 +1,6 @@
 //! Kitty graphics protocol image transmission and Unicode placeholders.
 
-use std::{fmt::Write as _, ops::Deref};
+use std::{fmt::Write as _, ops::Deref, str};
 
 use crate::{Color, Style, escape::esc};
 
@@ -333,7 +333,7 @@ impl Placeholder {
 	pub fn as_str(&self) -> &str {
 		// SAFETY: `placeholder_cell` fills the prefix exclusively through
 		// `char::encode_utf8`.
-		unsafe { std::str::from_utf8_unchecked(&self.bytes[..usize::from(self.len)]) }
+		unsafe { str::from_utf8_unchecked(&self.bytes[..usize::from(self.len)]) }
 	}
 }
 
@@ -437,7 +437,7 @@ pub fn append_transmission(output: &mut String, id: u32, png: &[u8], tmux_passth
 		} else {
 			let _ = write!(output, "m={};", u8::from(index + 1 < count));
 		}
-		output.push_str(std::str::from_utf8(&encoded[..length]).expect("base64 is ASCII"));
+		output.push_str(str::from_utf8(&encoded[..length]).expect("base64 is ASCII"));
 		append_apc_end(output, tmux_passthrough);
 	}
 }

@@ -8,6 +8,8 @@
 //! full span; pointing at a continuation line or a lone closing delimiter
 //! resolves to nothing.
 
+use std::cmp;
+
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Point, TreeCursor};
@@ -235,11 +237,11 @@ fn is_visible(merged: &[LineRange], line: u32) -> bool {
 	merged
 		.binary_search_by(|range| {
 			if line < range.start_line {
-				std::cmp::Ordering::Greater
+				cmp::Ordering::Greater
 			} else if line > range.end_line {
-				std::cmp::Ordering::Less
+				cmp::Ordering::Less
 			} else {
-				std::cmp::Ordering::Equal
+				cmp::Ordering::Equal
 			}
 		})
 		.is_ok()
@@ -352,6 +354,9 @@ pub fn enclosing_block_boundaries(options: EnclosingBoundaryOptions) -> Result<O
 
 #[cfg(test)]
 mod tests {
+
+	use std::fs;
+
 	use super::*;
 
 	fn resolve(code: &str, path: &str, line: u32) -> Option<BlockRange> {
@@ -986,6 +991,7 @@ mod tests {
 	/// instead of one directory, skipping anything over 64 KiB.
 	fn repo_files(byte_budget: Option<usize>) -> Vec<PathBuf> {
 		let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
 		let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(&root)
 			.build()
 			.filter_map(Result::ok)
@@ -1003,7 +1009,7 @@ mod tests {
 		let mut picked = Vec::new();
 		let mut used = 0;
 		for path in files.iter().step_by(stride) {
-			let Ok(meta) = std::fs::metadata(path) else {
+			let Ok(meta) = fs::metadata(path) else {
 				continue;
 			};
 			let len = meta.len() as usize;
@@ -1023,7 +1029,7 @@ mod tests {
 		let mut comparisons = 0;
 		let mut none_verdicts = 0;
 		for path in files {
-			let Ok(code) = std::fs::read_to_string(path) else {
+			let Ok(code) = fs::read_to_string(path) else {
 				continue; // non-UTF-8 source; nothing to compare
 			};
 			let (n, nones) = assert_prune_equivalent(&code, path.to_str().expect("utf-8 path"));

@@ -1,6 +1,11 @@
 //! External-tool GitHub release asset selection and atomic installation.
 
-use std::path::{Path, PathBuf};
+use std::{
+	env,
+	env::consts,
+	io,
+	path::{Path, PathBuf},
+};
 
 use futures::StreamExt as _;
 use omp_core::Str;
@@ -42,7 +47,7 @@ pub enum ToolInstallError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// The release response and streamed body disagree on asset size.
 	#[error("release asset size changed: expected {expected} bytes, received {actual}")]
@@ -60,12 +65,12 @@ pub enum ToolInstallError {
 /// preserve release order so publishers retain control over equivalent archive
 /// formats.
 pub fn select_release_asset(assets: &[ReleaseAsset]) -> Result<&ReleaseAsset, ToolInstallError> {
-	let os = match std::env::consts::OS {
+	let os = match consts::OS {
 		"macos" => &["darwin", "macos", "apple"] as &[&str],
 		"windows" => &["windows", "win32", "pc-windows"],
 		_ => &["linux", "unknown-linux"],
 	};
-	let arch = match std::env::consts::ARCH {
+	let arch = match consts::ARCH {
 		"aarch64" => &["aarch64", "arm64"] as &[&str],
 		"x86_64" => &["x86_64", "amd64", "x64"],
 		"arm" => &["armv7", "armhf"],
@@ -82,7 +87,7 @@ pub fn select_release_asset(assets: &[ReleaseAsset]) -> Result<&ReleaseAsset, To
 	});
 	selected.ok_or_else(|| {
 		let platform = Str::from(format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
-		let termux = std::env::var_os("PREFIX")
+		let termux = env::var_os("PREFIX")
 			.is_some_and(|prefix| prefix.to_string_lossy().contains("com.termux"));
 		let hint = if termux {
 			Str::new_static("; Termux users should install the package with pkg or pip/uv")

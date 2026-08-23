@@ -35,10 +35,10 @@ use std::{
 	env,
 	error::Error,
 	ffi::CString,
-	fmt,
+	fmt::{self, Display},
 	mem::MaybeUninit,
 	os::unix::ffi::OsStrExt,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	ptr::{null, null_mut},
 	sync::atomic::{AtomicBool, Ordering},
 };
@@ -98,7 +98,7 @@ pub enum InitError {
 	InvalidPath(PathBuf),
 }
 
-impl fmt::Display for InitError {
+impl Display for InitError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::AlreadyInitialized => f.write_str("python engine already initialized"),
@@ -169,7 +169,7 @@ impl Engine {
 	///
 	/// The returned path is read-only; changing the search path after isolated
 	/// initialization would violate the one-entry embedding contract.
-	pub fn site_packages(&self) -> &std::path::Path {
+	pub fn site_packages(&self) -> &Path {
 		&self.site_packages
 	}
 }

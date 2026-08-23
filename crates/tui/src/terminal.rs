@@ -1,7 +1,7 @@
 //! Process-wide terminal lifecycle, raw-mode ownership, and emergency restore.
 
 use std::{
-	fs::File,
+	fs::{self, File},
 	io::{self, Write as _},
 	panic,
 	sync::{
@@ -76,7 +76,7 @@ mod platform {
 	};
 
 	use super::{CapturedStderr, emergency_restore_inner};
-	use crate::Size;
+	use crate::{Size, tty::open};
 	pub(super) const fn set_title(_: &str) -> io::Result<()> {
 		Ok(())
 	}
@@ -332,7 +332,7 @@ mod platform {
 	}
 
 	pub(super) fn prepare() -> io::Result<(File, State)> {
-		let tty = crate::tty::open(OpenOptions::new().read(true).write(true))?;
+		let tty = open(OpenOptions::new().read(true).write(true))?;
 		let original = tcgetattr(&tty).map_err(errno_to_io)?;
 		Ok((tty, State { original: Some(original) }))
 	}
@@ -393,7 +393,10 @@ mod platform {
 	/// override or in tests, where stdin is never the terminal.
 	fn input_fd(tty: &File) -> RawFd {
 		#[cfg(not(test))]
-		if !crate::tty::overridden() {
+		use crate::tty::overridden;
+
+		#[cfg(not(test))]
+		if !overridden() {
 			return libc::STDIN_FILENO;
 		}
 		tty.as_raw_fd()
@@ -555,12 +558,14 @@ mod platform {
 #[cfg(windows)]
 mod platform {
 	use std::{
+		env,
 		ffi::c_void,
 		fs::{File, OpenOptions, remove_file},
 		io::{self, Read as _},
+		mem,
 		os::windows::io::AsRawHandle as _,
 		path::PathBuf,
-		ptr,
+		process, ptr,
 		sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 		thread,
 		time::{Duration, Instant},
@@ -632,8 +637,8 @@ mod platform {
 				});
 			}
 			let sequence = STDERR_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-			let path = std::env::temp_dir()
-				.join(format!("omp-tui-stderr-{}-{sequence}.tmp", std::process::id()));
+			let path =
+				env::temp_dir().join(format!("omp-tui-stderr-{}-{sequence}.tmp", process::id()));
 			let writer = OpenOptions::new()
 				.write(true)
 				.create_new(true)
@@ -794,7 +799,7 @@ mod platform {
 	}
 
 	pub(super) fn size(_: &File, state: &State) -> io::Result<Size> {
-		let mut info = unsafe { std::mem::zeroed::<CONSOLE_SCREEN_BUFFER_INFO>() };
+		let mut info = unsafe { mem::zeroed::<CONSOLE_SCREEN_BUFFER_INFO>() };
 		if unsafe { GetConsoleScreenBufferInfo(state.output, &mut info) } == 0 {
 			return Err(io::Error::last_os_error());
 		}
@@ -820,7 +825,7 @@ mod platform {
 	) -> io::Result<()> {
 		let started = Instant::now();
 		let mut last_data = started;
-		let mut records = [unsafe { std::mem::zeroed::<INPUT_RECORD>() }; 64];
+		let mut records = [unsafe { mem::zeroed::<INPUT_RECORD>() }; 64];
 		loop {
 			let now = Instant::now();
 			let wait = maximum
@@ -910,19 +915,26 @@ pub fn alt_screen_active() -> bool {
 /// with a real signal, so the event is injected through the live actor.
 pub fn simulate_resize_signal() {
 	record_resize_signal();
-	let _ = crate::pump::send_event(crate::pump::TerminalEvent::Resize);
+	let _ = pump::send_event(TerminalEvent::Resize);
 }
 
 pub(crate) fn record_resize_signal() {
 	RESIZE_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
+use std::mem;
+
 use crate::{
 	InputDecoder, InputEvent, Keymap, ProbeResults, Renderer, Size, TerminalCaps, TerminalResponse,
 	context::Appearance,
+	debug,
 	escape::esc,
 	graphics::negotiate,
+	notify::{Notification, notify},
+	paste,
 	paste::{PasteEvents, PasteProgress, Pasted},
+	pump,
+	pump::{Input, Pump, TerminalEvent},
 };
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -1249,9 +1261,9 @@ pub struct Terminal {
 	keymap: Keymap,
 	resize_ready: bool,
 	resize_live: bool,
-	events: flume::Receiver<crate::pump::TerminalEvent>,
+	events: flume::Receiver<TerminalEvent>,
 	resize_watch: tokio::sync::watch::Receiver<u64>,
-	pump: crate::pump::Pump,
+	pump: Pump,
 	cell_pixel_size: Option<(u16, u16)>,
 	progress: Option<ProgressWorker>,
 	paste_events: PasteEvents,
@@ -1267,7 +1279,7 @@ impl Terminal {
 	) -> io::Result<Self> {
 		ensure_restore_hooks()?;
 		let (caps, probe) = match options.caps {
-			Some(caps) => (caps, std::mem::take(&mut options.probe)),
+			Some(caps) => (caps, mem::take(&mut options.probe)),
 			None => negotiate(options.probe_timeout),
 		};
 		#[cfg(unix)]
@@ -1286,7 +1298,7 @@ impl Terminal {
 		// Debug server thread: started here so every host kind serves
 		// `OMP_TUI_DEBUG`; the socket binds before the thread spawns so a
 		// bad path fails loudly.
-		if let Err(error) = crate::debug::ensure_server() {
+		if let Err(error) = debug::ensure_server() {
 			deactivate_emergency_state();
 			return Err(error);
 		}
@@ -1334,9 +1346,9 @@ impl Terminal {
 		let keymap = decoder.keymap().clone();
 		// Event actor: an async task owns the decoder, the input handle,
 		// and the resize self-pipe, and publishes decoded events on the
-		let channels = match Self::acquire_input().and_then(|input| {
-			crate::pump::spawn(&executor, input, decoder, &probe.preserved_input, true)
-		}) {
+		let channels = match Self::acquire_input()
+			.and_then(|input| pump::spawn(&executor, input, decoder, &probe.preserved_input, true))
+		{
 			Ok(channels) => channels,
 			Err(error) => {
 				emergency_restore_inner();
@@ -1386,18 +1398,22 @@ impl Terminal {
 	/// `OMP_TTY` override device when set. Non-macOS Unix handles are
 	/// readiness-pollable; macOS `/dev/tty` and Windows `CONIN$` bridge
 	/// through a reader thread.
-	fn acquire_input() -> io::Result<crate::pump::Input> {
+	fn acquire_input() -> io::Result<Input> {
 		#[cfg(all(unix, not(target_os = "macos")))]
 		{
-			use std::fs::OpenOptions;
-			Ok(crate::pump::Input::Pollable(crate::tty::open(OpenOptions::new().read(true))?))
+			use fs::OpenOptions;
+
+			use crate::tty::open;
+			Ok(Input::Pollable(open(OpenOptions::new().read(true))?))
 		}
 		#[cfg(target_os = "macos")]
 		{
-			use std::fs::OpenOptions;
+			use fs::OpenOptions;
+
+			use crate::tty::{open, overridden};
 			// SAFETY: isatty reads only the fixed stdin descriptor.
 			let stdin_is_tty = unsafe { nix::libc::isatty(nix::libc::STDIN_FILENO) } == 1;
-			let input = if stdin_is_tty && !crate::tty::overridden() {
+			let input = if stdin_is_tty && !overridden() {
 				// SAFETY: duplicating stdin does not affect Rust aliasing.
 				let fd = unsafe { nix::libc::dup(nix::libc::STDIN_FILENO) };
 				if fd < 0 {
@@ -1409,13 +1425,13 @@ impl Terminal {
 					File::from_raw_fd(fd)
 				}
 			} else {
-				crate::tty::open(OpenOptions::new().read(true))?
+				open(OpenOptions::new().read(true))?
 			};
-			Ok(crate::pump::Input::Bridged(input))
+			Ok(Input::Bridged(input))
 		}
 		#[cfg(windows)]
 		{
-			Ok(crate::pump::Input::Bridged(std::fs::OpenOptions::new().read(true).open("CONIN$")?))
+			Ok(Input::Bridged(fs::OpenOptions::new().read(true).open("CONIN$")?))
 		}
 	}
 
@@ -1543,7 +1559,7 @@ impl Terminal {
 	/// # Errors
 	///
 	/// Fails once the terminal input closed.
-	pub async fn next(&mut self) -> io::Result<crate::pump::TerminalEvent> {
+	pub async fn next(&mut self) -> io::Result<TerminalEvent> {
 		use crate::pump::TerminalEvent;
 		self.stderr.drain();
 		loop {
@@ -1566,7 +1582,7 @@ impl Terminal {
 							return Ok(TerminalEvent::Resize);
 						},
 						Ok(TerminalEvent::Closed) | Err(_) => {
-							return Err(io::Error::new(
+							return Err(std::io::Error::new(
 								io::ErrorKind::UnexpectedEof,
 								"terminal input closed",
 							));
@@ -1789,10 +1805,10 @@ impl Terminal {
 		terminal_write_all(&mut self.tty, sequence.as_bytes())?;
 		self.tty.flush()?;
 		let text = text.to_owned();
-		std::thread::Builder::new()
+		thread::Builder::new()
 			.name("omp-tui-clipboard".into())
 			.spawn(move || {
-				let _ = crate::paste::write_clipboard_text(&text);
+				let _ = paste::write_clipboard_text(&text);
 			})?;
 		Ok(())
 	}
@@ -1858,7 +1874,7 @@ impl Terminal {
 			return Ok(());
 		}
 		let mut batch = SmallVec::<u8, 48>::new();
-		if std::mem::take(&mut self.alt_mouse) {
+		if mem::take(&mut self.alt_mouse) {
 			batch.extend_from_slice(MOUSE_TRACKING_OFF);
 		}
 		if matches!(self.keyboard, KeyboardMode::Kitty(_)) {
@@ -1962,7 +1978,7 @@ impl Terminal {
 		self.alt_screen = false;
 		ALT_SCREEN_ACTIVE.store(false, Ordering::Release);
 		self.cursor_visible = None;
-		let mouse = std::mem::take(&mut self.alt_mouse);
+		let mouse = mem::take(&mut self.alt_mouse);
 		Some(match (self.keyboard, mouse) {
 			(KeyboardMode::Kitty(_), true) => {
 				esc!(!mouse_sgr, !mouse_any_event, !mouse_vt200, kitty_keyboard_pop, !alt_screen)
@@ -2012,8 +2028,8 @@ impl Terminal {
 
 	/// Delivers one structured attention notification through the negotiated
 	/// terminal protocol and platform fallback.
-	pub fn notify(&mut self, notification: &crate::notify::Notification) -> io::Result<()> {
-		crate::notify::notify(&mut self.tty, &self.caps, notification)?;
+	pub fn notify(&mut self, notification: &Notification) -> io::Result<()> {
+		notify(&mut self.tty, &self.caps, notification)?;
 		self.tty.flush()
 	}
 
@@ -2358,11 +2374,12 @@ fn deactivate_emergency_state() {
 #[cfg(all(test, unix))]
 mod tests {
 	use std::{
-		fs::{File, OpenOptions},
+		env,
+		fs::{self, File, OpenOptions},
 		future::Future,
 		mem::MaybeUninit,
 		os::fd::AsRawFd as _,
-		process::{Command, Output},
+		process::{self, Command, Output},
 		sync::{
 			Arc,
 			atomic::{AtomicU64, Ordering},
@@ -2391,8 +2408,11 @@ mod tests {
 		rounded_cell_pixels,
 	};
 	use crate::{
-		Appearance, InputDecoder, InputEvent, Key, Mods, Mouse, MouseButton, MouseReport,
-		ProbeResults, Renderer, Size, TerminalResponse, escape::esc, paste::Pasted,
+		Appearance, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
+		ProbeResults, Renderer, Size, TerminalResponse, detect,
+		escape::esc,
+		paste::{PasteEvents, Pasted},
+		pump::{Input, TerminalEvent, spawn},
 	};
 
 	async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
@@ -2417,10 +2437,10 @@ mod tests {
 	#[test]
 	fn enhanced_paste_offer_replies_and_stages_the_payload() {
 		futures_lite::future::block_on(async {
-			let dir = std::env::temp_dir().join(format!("omp-tui-5522-{}", std::process::id()));
-			std::fs::create_dir_all(&dir).expect("temp dir");
+			let dir = env::temp_dir().join(format!("omp-tui-5522-{}", process::id()));
+			fs::create_dir_all(&dir).expect("temp dir");
 			let path = dir.join("tty");
-			std::fs::write(&path, b"").expect("tty file");
+			fs::write(&path, b"").expect("tty file");
 			let tty = OpenOptions::new()
 				.read(true)
 				.write(true)
@@ -2450,7 +2470,7 @@ mod tests {
 				);
 			}
 			assert!(terminal.take_paste().is_none(), "listing DONE only requests the payload");
-			let request = std::fs::read_to_string(&path).expect("request written");
+			let request = fs::read_to_string(&path).expect("request written");
 			assert!(request.contains("pw=123"), "read request echoes the grant: {request:?}");
 			assert!(request.contains(&mime));
 
@@ -2467,7 +2487,7 @@ mod tests {
 				);
 			}
 			assert_eq!(terminal.take_paste(), Some(Pasted::Text("hello".into())));
-			std::fs::remove_dir_all(&dir).ok();
+			fs::remove_dir_all(&dir).ok();
 		});
 	}
 
@@ -2556,7 +2576,7 @@ mod tests {
 
 	#[test]
 	fn inherited_modes_drive_entry_ownership_and_restoration() {
-		let mut caps = crate::detect();
+		let mut caps = detect();
 		caps.appearance_notifications = true;
 		caps.in_band_resize = true;
 		let probe = ProbeResults {
@@ -2814,7 +2834,7 @@ mod tests {
 
 	#[test]
 	fn stderr_guard_subprocess() {
-		match std::env::var("OMP_TUI_STDERR_GUARD_CASE").as_deref() {
+		match env::var("OMP_TUI_STDERR_GUARD_CASE").as_deref() {
 			Ok("leave") => {
 				let before = stderr_stat();
 				let mut terminal = test_terminal(
@@ -2845,7 +2865,7 @@ mod tests {
 	}
 
 	fn run_stderr_guard_child(case: &str) -> Output {
-		Command::new(std::env::current_exe().expect("current test executable"))
+		Command::new(env::current_exe().expect("current test executable"))
 			.args(["--exact", "terminal::tests::stderr_guard_subprocess", "--nocapture"])
 			.env("OMP_TUI_STDERR_GUARD_CASE", case)
 			.output()
@@ -2943,8 +2963,8 @@ mod tests {
 	}
 	#[test]
 	fn resize_pipe_wakes_coalesces_and_preserves_input() {
-		if std::env::var_os("OMP_TUI_RESIZE_PIPE_CHILD").is_none() {
-			let output = Command::new(std::env::current_exe().expect("test executable resolves"))
+		if env::var_os("OMP_TUI_RESIZE_PIPE_CHILD").is_none() {
+			let output = Command::new(env::current_exe().expect("test executable resolves"))
 				.args(["--exact", "terminal::tests::resize_pipe_wakes_coalesces_and_preserves_input"])
 				.env("OMP_TUI_RESIZE_PIPE_CHILD", "1")
 				.output()
@@ -2972,7 +2992,7 @@ mod tests {
 				.await
 				.expect("resize wakes the event loop")
 				.expect("resize event arrives");
-			assert_eq!(event, crate::pump::TerminalEvent::Resize);
+			assert_eq!(event, TerminalEvent::Resize);
 			assert!(started.elapsed() < Duration::from_millis(500));
 			assert!(terminal.resize_ready);
 			assert_eq!(terminal.take_resize().expect("resize size reads"), Some(Size::new(80, 24)));
@@ -2986,7 +3006,7 @@ mod tests {
 				.await
 				.expect("burst wakes the event loop")
 				.expect("burst resize arrives");
-			assert_eq!(event, crate::pump::TerminalEvent::Resize);
+			assert_eq!(event, TerminalEvent::Resize);
 			assert_eq!(
 				terminal.take_resize().expect("coalesced resize reads"),
 				Some(Size::new(80, 24))
@@ -2996,7 +3016,7 @@ mod tests {
 			while let Ok(event) = timeout(Duration::from_millis(30), terminal.next()).await {
 				assert_eq!(
 					event.expect("drained event decodes"),
-					crate::pump::TerminalEvent::Resize,
+					TerminalEvent::Resize,
 					"only resize echoes remain queued"
 				);
 				let _ = terminal.take_resize();
@@ -3007,7 +3027,7 @@ mod tests {
 				.await
 				.expect("key wakes the event loop")
 				.expect("key decodes");
-			assert_eq!(event, crate::pump::TerminalEvent::Input(InputEvent::Key(Key::Char('x'))));
+			assert_eq!(event, TerminalEvent::Input(InputEvent::Key(Key::Char('x'))));
 			platform::deactivate();
 		});
 	}
@@ -3026,13 +3046,13 @@ mod tests {
 				.expect("event arrives")
 				.expect("event decodes");
 			match event {
-				crate::pump::TerminalEvent::Input(InputEvent::Response(response)) => {
+				TerminalEvent::Input(InputEvent::Response(response)) => {
 					terminal
 						.handle_response(&response, renderer)
 						.expect("response applies");
 				},
-				crate::pump::TerminalEvent::Input(event) => events.push(event),
-				crate::pump::TerminalEvent::Resize => {
+				TerminalEvent::Input(event) => events.push(event),
+				TerminalEvent::Resize => {
 					// Process-wide SIGWINCH tests can race this terminal.
 					terminal.resize_ready = false;
 				},
@@ -3085,7 +3105,7 @@ mod tests {
 				.await
 				.expect("response arrives")
 				.expect("response decodes");
-			let crate::pump::TerminalEvent::Input(InputEvent::Response(response)) = event else {
+			let TerminalEvent::Input(InputEvent::Response(response)) = event else {
 				panic!("expected the trailing terminal response, got {event:?}");
 			};
 			terminal
@@ -3337,18 +3357,18 @@ mod tests {
 
 	fn test_terminal_seeded_resize(tty: File, preserved: &[u8], watch_resize: bool) -> Terminal {
 		let source = tty.try_clone().expect("test tty clones");
-		let channels = match crate::pump::spawn(
+		let channels = match spawn(
 			&omp_executor::Executor::new(None),
-			crate::pump::Input::Pollable(source),
+			Input::Pollable(source),
 			InputDecoder::new(),
 			preserved,
 			watch_resize,
 		) {
 			Ok(channels) => channels,
 			// `/dev/null` and friends are not readiness-pollable; bridge.
-			Err(_) => crate::pump::spawn(
+			Err(_) => spawn(
 				&omp_executor::Executor::new(None),
-				crate::pump::Input::Bridged(tty.try_clone().expect("test tty clones")),
+				Input::Bridged(tty.try_clone().expect("test tty clones")),
 				InputDecoder::new(),
 				preserved,
 				watch_resize,
@@ -3356,7 +3376,7 @@ mod tests {
 			.expect("bridged test actor spawns"),
 		};
 		Terminal {
-			caps: crate::detect(),
+			caps: detect(),
 			tty,
 			platform: platform::state_for_test(),
 			stderr: platform::StderrGuard::new(false).expect("disabled stderr guard"),
@@ -3377,7 +3397,7 @@ mod tests {
 			appearance_callbacks: Vec::new(),
 			appearance_query_generation: Arc::new(AtomicU64::new(0)),
 			in_band_size: None,
-			keymap: crate::Keymap::default(),
+			keymap: Keymap::default(),
 			resize_ready: false,
 			resize_live: true,
 			events: channels.events,
@@ -3385,7 +3405,7 @@ mod tests {
 			pump: channels.pump,
 			cell_pixel_size: None,
 			progress: None,
-			paste_events: crate::paste::PasteEvents::default(),
+			paste_events: PasteEvents::default(),
 			pending_paste: None,
 		}
 	}

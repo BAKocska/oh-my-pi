@@ -1,9 +1,12 @@
+//! Proves credential reveal authority is provider-scoped and fenced to its
+//! bound host session.
+
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	sync::Arc,
 };
 
-use omp_core::{Principal, SecretString, sf};
+use omp_core::{Principal, SecretString, Str, sf};
 use omp_driver::auth_backend::{CredentialControlGrant, gateway_credential_control_factory};
 use omp_envd::exthost::control::{
 	ControlAuthorityFactory as _, ControlConnectionIdentity, ControlRequestContext,
@@ -36,7 +39,7 @@ fn arguments(provider: &str) -> Map<String, Value> {
 fn factory(reveal: &[&str]) -> omp_driver::auth_backend::GatewayCredentialSecretControlFactory {
 	let reveal = reveal
 		.iter()
-		.map(|value| omp_core::Str::new(*value))
+		.map(|value| Str::new(*value))
 		.collect::<Vec<_>>();
 	let grant = CredentialControlGrant {
 		grants:    CredentialGrants {

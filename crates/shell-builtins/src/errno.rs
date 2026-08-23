@@ -5,7 +5,7 @@
 //! arguments reverse-map to the first-listed canonical name. Lists include
 //! aliases and are sorted by number, then name.
 
-use std::io::Write;
+use std::{io, io::Write};
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
@@ -176,7 +176,7 @@ fn command() -> Command {
 /// Formats the OS description for an errno number without std's
 /// ` (os error N)` suffix.
 fn description(number: i32) -> String {
-	let text = std::io::Error::from_raw_os_error(number).to_string();
+	let text = io::Error::from_raw_os_error(number).to_string();
 	match text.rfind(" (os error ") {
 		Some(index) => text[..index].to_string(),
 		None => text,

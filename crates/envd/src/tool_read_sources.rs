@@ -2,7 +2,7 @@
 
 use std::{
 	borrow::Cow,
-	fs,
+	fmt, fs,
 	future::{Future, ready},
 	io,
 	path::{Component, Path, PathBuf},
@@ -32,7 +32,7 @@ use omp_tools::read::{
 	},
 };
 use omp_walker::{FileType, WalkDetail, WalkOrder, WalkRequest};
-use tokio::io::AsyncReadExt as _;
+use tokio::{io::AsyncReadExt as _, time};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -45,7 +45,13 @@ use super::{
 const MAX_REDIRECTS: usize = 20;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+use std::env;
+
+use omp_storage::atomic;
 use thiserror::Error;
+use tokio::task;
+use wreq::redirect;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 static MEDIA_COMMIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -58,7 +64,7 @@ pub enum DocumentMediaCommitError {
 	DestinationExists,
 	/// A storage commit failed.
 	#[error("document media file commit failed")]
-	Atomic(#[from] omp_storage::atomic::Error),
+	Atomic(#[from] atomic::Error),
 	/// Directory creation, cleanup, or rename failed.
 	#[error("document media directory transaction failed")]
 	Io(#[from] io::Error),
@@ -135,7 +141,7 @@ struct SystemHttpClient {
 impl SystemHttpClient {
 	fn new() -> Self {
 		let inner = wreq::Client::builder()
-			.redirect(wreq::redirect::Policy::limited(MAX_REDIRECTS))
+			.redirect(redirect::Policy::limited(MAX_REDIRECTS))
 			.referer(false)
 			.build()
 			.expect("build read HTTP client");
@@ -147,7 +153,7 @@ impl SystemHttpClient {
 			.map_err(|error| WebError::InvalidUrl(error.to_string().into()))?;
 		validate_http_url(&authored_url)?;
 		authored_url.set_fragment(None);
-		tokio::time::timeout(HTTP_TIMEOUT, self.request_with_retries(authored_url, request))
+		time::timeout(HTTP_TIMEOUT, self.request_with_retries(authored_url, request))
 			.await
 			.map_err(|_| WebError::request("request timed out after 30s"))?
 	}
@@ -181,7 +187,7 @@ impl SystemHttpClient {
 					retried_429 = true;
 					let delay = retry_after(response.headers().get(RETRY_AFTER));
 					drop(response);
-					tokio::time::sleep(delay).await;
+					time::sleep(delay).await;
 					continue;
 				}
 
@@ -207,8 +213,8 @@ impl SystemHttpClient {
 	}
 }
 
-impl std::fmt::Debug for SystemHttpClient {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SystemHttpClient {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("SystemHttpClient(..)")
 	}
 }
@@ -547,7 +553,7 @@ impl HttpClient for ReadSourceAdapter {
 
 	async fn document_cache_get(&self, request: DocumentCacheRequest) -> Option<CachedDocument> {
 		let cache = self.document_cache.clone();
-		let result = tokio::task::spawn_blocking(move || {
+		let result = task::spawn_blocking(move || {
 			let key = document_cache_key(request)?;
 			let entry = cache.get(key, SystemTime::now())?;
 			Ok::<_, omp_storage::document_cache::DocumentCacheError>(entry.map(|entry| {
@@ -581,7 +587,7 @@ impl HttpClient for ReadSourceAdapter {
 	) -> Option<CachedDocument> {
 		let cache = self.document_cache.clone();
 		let published = content.clone();
-		let result = tokio::task::spawn_blocking(move || {
+		let result = task::spawn_blocking(move || {
 			let key = document_cache_key(request)?;
 			let metadata = cache.put(key, &published, SystemTime::now(), None)?;
 			Ok::<_, omp_storage::document_cache::DocumentCacheError>(DocumentCacheLocation {
@@ -833,9 +839,9 @@ impl ReadSources for ReadSourceAdapter {
 
 fn resolve_authored_path(root: &Path, authored: &str) -> PathBuf {
 	let expanded = if authored == "~" {
-		std::env::var_os("HOME").map(PathBuf::from)
+		env::var_os("HOME").map(PathBuf::from)
 	} else if let Some(rest) = authored.strip_prefix("~/") {
-		std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
+		env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
 	} else {
 		None
 	};
@@ -855,7 +861,7 @@ fn display_path(root: &Path, canonical: &Path) -> Result<Str, Fault> {
 			utf8_slash_path(relative)
 		};
 	}
-	if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+	if let Some(home) = env::var_os("HOME").map(PathBuf::from)
 		&& let Ok(relative) = canonical.strip_prefix(home)
 	{
 		let suffix = utf8_slash_path(relative)?;
@@ -911,7 +917,7 @@ fn path_has_suffix(candidate: &str, suffix: &str) -> bool {
 			.is_some_and(|prefix| prefix.ends_with('/'))
 }
 
-fn modified_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+fn modified_ms(metadata: &fs::Metadata) -> Option<u64> {
 	metadata
 		.modified()
 		.ok()?
@@ -952,12 +958,12 @@ mod external_path_tests {
 	async fn absolute_filesystem_lease_keeps_opened_bytes_pinned() {
 		let sandbox = tempfile::tempdir().expect("sandbox");
 		let path = sandbox.path().join("plain.txt");
-		std::fs::write(&path, b"before").expect("write file");
-		let canonical = std::fs::canonicalize(&path).expect("canonical file");
+		fs::write(&path, b"before").expect("write file");
+		let canonical = fs::canonicalize(&path).expect("canonical file");
 		let lease = open_filesystem_lease(utf8_path(&canonical).expect("UTF-8 path"))
 			.await
 			.expect("open external lease");
-		std::fs::write(&path, b"after").expect("replace file");
+		fs::write(&path, b"after").expect("replace file");
 		assert_eq!(lease.read_all().await.expect("read pinned bytes"), Bytes::from_static(b"before"));
 	}
 
@@ -965,11 +971,11 @@ mod external_path_tests {
 	async fn parent_relative_external_path_resolves_to_filesystem_lease() {
 		let sandbox = tempfile::tempdir().expect("sandbox");
 		let root = sandbox.path().join("root");
-		std::fs::create_dir(&root).expect("workspace root");
+		fs::create_dir(&root).expect("workspace root");
 		let path = sandbox.path().join("outside.txt");
-		std::fs::write(&path, b"outside").expect("write file");
+		fs::write(&path, b"outside").expect("write file");
 		let authored = resolve_authored_path(&root, "../outside.txt");
-		let canonical = std::fs::canonicalize(authored).expect("canonical file");
+		let canonical = fs::canonicalize(authored).expect("canonical file");
 		let lease = open_filesystem_lease(utf8_path(&canonical).expect("UTF-8 path"))
 			.await
 			.expect("open parent-relative lease");

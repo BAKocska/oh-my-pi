@@ -1,8 +1,10 @@
 //! Bounded discovery of native static assets.
 
 use std::{
+	fs, io,
 	io::Read,
 	path::{Path, PathBuf},
+	str,
 };
 
 use omp_core::Str;
@@ -71,7 +73,7 @@ pub enum DiscoveryError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A source file is not UTF-8.
 	#[error("discovered asset is not UTF-8: {path:?}")]
@@ -80,7 +82,7 @@ pub enum DiscoveryError {
 		path:   PathBuf,
 		/// UTF-8 validation failure.
 		#[source]
-		source: std::str::Utf8Error,
+		source: str::Utf8Error,
 	},
 	/// One asset exceeds the per-file byte ceiling.
 	#[error("discovered asset exceeds {limit} bytes: {path:?}")]
@@ -173,7 +175,7 @@ impl Default for DiscoveryLoader {
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<String, DiscoveryError> {
-	let file = std::fs::File::open(path)
+	let file = fs::File::open(path)
 		.map_err(|source| DiscoveryError::Read { path: path.to_owned(), source })?;
 	let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
 	file
@@ -183,7 +185,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<String, DiscoveryError> {
 	if bytes.len() > limit {
 		return Err(DiscoveryError::AssetBudget { path: path.to_owned(), limit });
 	}
-	let content = std::str::from_utf8(&bytes)
+	let content = str::from_utf8(&bytes)
 		.map_err(|source| DiscoveryError::Encoding { path: path.to_owned(), source })?;
 	Ok(content.to_owned())
 }

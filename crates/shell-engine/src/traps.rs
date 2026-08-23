@@ -1,17 +1,21 @@
 //! Facilities for configuring trap handlers.
 
-use std::{fmt::Display, str::FromStr};
+use std::{
+	fmt::{self, Display},
+	io, iter,
+	str::FromStr,
+};
 
 use im::HashMap;
 use itertools::Itertools as _;
 
-use crate::{error, sys};
+use crate::{SourceInfo, error, sys::signal};
 
 /// Type of signal that can be trapped in the shell.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TrapSignal {
 	/// A system signal.
-	Signal(sys::signal::Signal),
+	Signal(signal::Signal),
 	/// The `DEBUG` trap.
 	Debug,
 	/// The `ERR` trap.
@@ -23,7 +27,7 @@ pub enum TrapSignal {
 }
 
 impl Display for TrapSignal {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(self.as_str())
 	}
 }
@@ -35,7 +39,7 @@ impl TrapSignal {
 
 		let iter = itertools::chain!(
 			SIGNALS.iter().copied(),
-			sys::signal::Signal::iterator().map(TrapSignal::Signal)
+			signal::Signal::iterator().map(TrapSignal::Signal)
 		);
 
 		iter
@@ -61,7 +65,7 @@ impl TrapSignal {
 /// * `f` - Any type that implements [`std::io::Write`].
 /// * `it` - An iterator over the signals that will be formatted into the `f`.
 pub fn format_signals(
-	mut f: impl std::io::Write,
+	mut f: impl io::Write,
 	it: impl Iterator<Item = TrapSignal>,
 ) -> Result<(), error::Error> {
 	let it = it
@@ -96,7 +100,7 @@ impl TryFrom<i32> for TrapSignal {
 		Ok(match value {
 			0 => Self::Exit,
 			value => Self::Signal(
-				sys::signal::Signal::try_from(value)
+				signal::Signal::try_from(value)
 					.map_err(|_| error::ErrorKind::InvalidSignal(value.to_string()))?,
 			),
 		})
@@ -123,7 +127,7 @@ impl TryFrom<&str> for TrapSignal {
 				if !s.starts_with("SIG") {
 					s.insert_str(0, "SIG");
 				}
-				sys::signal::Signal::from_str(s.as_str())
+				signal::Signal::from_str(s.as_str())
 					.map(TrapSignal::Signal)
 					.map_err(|_| error::ErrorKind::InvalidSignal(value.into()))?
 			},
@@ -153,7 +157,7 @@ pub struct TrapHandler {
 	/// The source text of the command to invoke.
 	pub command:     String,
 	/// Source information for where the trap handler was defined.
-	pub source_info: crate::SourceInfo,
+	pub source_info: SourceInfo,
 }
 
 /// Configuration for trap handlers in the shell.
@@ -167,10 +171,8 @@ impl TrapHandlerConfig {
 	/// Iterates over the registered handlers for trap signals.
 	pub fn iter_handlers(
 		&self,
-	) -> impl Iterator<Item = (TrapSignal, &TrapHandler)>
-	+ ExactSizeIterator
-	+ std::iter::FusedIterator
-	+ '_ {
+	) -> impl Iterator<Item = (TrapSignal, &TrapHandler)> + ExactSizeIterator + iter::FusedIterator + '_
+	{
 		self
 			.handlers
 			.iter()
@@ -202,7 +204,7 @@ impl TrapHandlerConfig {
 		&mut self,
 		signal_type: TrapSignal,
 		command: String,
-		source_info: crate::SourceInfo,
+		source_info: SourceInfo,
 	) {
 		let _ = self
 			.handlers

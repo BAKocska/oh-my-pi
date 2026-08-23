@@ -1,6 +1,9 @@
 //! DOCX to Markdown conversion.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+	collections::{HashMap, HashSet},
+	iter, mem,
+};
 
 use omp_core::Str;
 use quick_xml::{Reader, XmlVersion, events::Event};
@@ -1548,22 +1551,22 @@ fn render_table(table: &Node, context: &mut Context) -> Result<String, MarkitErr
 						}
 						origin.push_str(&content);
 					}
-					cells.extend(std::iter::repeat_n(String::new(), span));
+					cells.extend(iter::repeat_n(String::new(), span));
 				} else {
 					last_horizontal_origin = Some(cells.len());
 					cells.push(content);
-					cells.extend(std::iter::repeat_n(String::new(), span - 1));
+					cells.extend(iter::repeat_n(String::new(), span - 1));
 				}
 			} else if merge_continues && active_merges.contains(&column) {
 				last_horizontal_origin = None;
-				cells.extend(std::iter::repeat_n(String::new(), span));
+				cells.extend(iter::repeat_n(String::new(), span));
 				for merged_column in column..column.saturating_add(span) {
 					next_merges.insert(merged_column);
 				}
 			} else {
 				last_horizontal_origin = Some(cells.len());
 				cells.push(content);
-				cells.extend(std::iter::repeat_n(String::new(), span - 1));
+				cells.extend(iter::repeat_n(String::new(), span - 1));
 				if vertical_merge.is_some() {
 					for merged_column in column..column.saturating_add(span) {
 						next_merges.insert(merged_column);
@@ -1572,7 +1575,7 @@ fn render_table(table: &Node, context: &mut Context) -> Result<String, MarkitErr
 			}
 			column = column.saturating_add(span);
 		}
-		cells.extend(std::iter::repeat_n(String::new(), after));
+		cells.extend(iter::repeat_n(String::new(), after));
 		rows.push(cells);
 		active_merges = next_merges;
 	}
@@ -1686,8 +1689,7 @@ fn render_notes(
 			.map(|xml| parse_relationships(&xml))
 			.transpose()?
 			.unwrap_or_default();
-		let document_relationships =
-			std::mem::replace(&mut context.relationships, note_relationships);
+		let document_relationships = mem::replace(&mut context.relationships, note_relationships);
 		for note in notes
 			.elements()
 			.filter(|node| local(&node.name) == note_name)
@@ -1820,7 +1822,10 @@ fn marker_followed_by_whitespace(content: &str, marker: &str) -> bool {
 mod tests {
 	use omp_ar::zip::Writer;
 
-	use super::convert;
+	use super::{
+		MAX_XML_CONTENT_NODES, MAX_XML_DEPTH, check_table_grid_budget, collect_table_children,
+		convert, count_xml_content_node, descendant, parse_xml,
+	};
 
 	fn docx(parts: &[(&str, &str)]) -> Vec<u8> {
 		let mut archive = Writer::new(Vec::new());
@@ -2099,19 +2104,19 @@ mod tests {
 		assert_eq!(convert(&bytes, false).unwrap().as_str(), "Choice");
 		let malformed = docx(&[("word/document.xml", "<w:document><w:body>")]);
 		assert!(convert(&malformed, false).is_err());
-		let mut count = super::MAX_XML_CONTENT_NODES - 1;
-		super::count_xml_content_node(&mut count).unwrap();
-		assert!(super::count_xml_content_node(&mut count).is_err());
-		let deeply_nested = "<w:p>".repeat(super::MAX_XML_DEPTH);
-		assert!(super::parse_xml(&deeply_nested).is_err());
-		let table_xml = super::parse_xml(
+		let mut count = MAX_XML_CONTENT_NODES - 1;
+		count_xml_content_node(&mut count).unwrap();
+		assert!(count_xml_content_node(&mut count).is_err());
+		let deeply_nested = "<w:p>".repeat(MAX_XML_DEPTH);
+		assert!(parse_xml(&deeply_nested).is_err());
+		let table_xml = parse_xml(
 			r#"<w:tbl xmlns:w="w"><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr></w:tc></w:tr><w:tr><w:tc/></w:tr></w:tbl>"#,
 		)
 		.unwrap();
-		let table = super::descendant(&table_xml, "tbl").unwrap();
+		let table = descendant(&table_xml, "tbl").unwrap();
 		let mut rows = Vec::new();
-		super::collect_table_children(table, "tr", &mut rows);
-		super::check_table_grid_budget(&rows, 4).unwrap();
-		assert!(super::check_table_grid_budget(&rows, 3).is_err());
+		collect_table_children(table, "tr", &mut rows);
+		check_table_grid_budget(&rows, 4).unwrap();
+		assert!(check_table_grid_budget(&rows, 3).is_err());
 	}
 }

@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{f32::consts, time::Duration};
 
 use smallvec::SmallVec;
 
 use super::{Bvh, Camera, Hit, Material, Object, Ray, Trace, Vec3, vec3};
 
-const PI: f32 = std::f32::consts::PI;
+const PI: f32 = consts::PI;
 const INLINE_LIGHTS: usize = 4;
 
 /// An analytic light evaluated without sampling noise.

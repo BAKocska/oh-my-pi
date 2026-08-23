@@ -11,7 +11,11 @@ use omp_core::Hash32;
 use omp_storage::document_cache::{
 	DocumentCache, DocumentCacheError, DocumentCacheGcReport, DocumentCachePolicy,
 };
-use tokio::sync::watch;
+use tokio::{
+	sync::watch::Receiver,
+	task::JoinHandle,
+	time::{self, MissedTickBehavior},
+};
 use tokio_util::sync::CancellationToken;
 
 /// Default interval between bounded document-cache collection passes.
@@ -73,11 +77,11 @@ impl DocumentCacheCollector {
 	pub fn spawn(
 		self,
 		shutdown: CancellationToken,
-		reachable_blobs: watch::Receiver<Arc<HashSet<Hash32>>>,
-	) -> tokio::task::JoinHandle<()> {
+		reachable_blobs: Receiver<Arc<HashSet<Hash32>>>,
+	) -> JoinHandle<()> {
 		tokio::spawn(async move {
-			let mut ticker = tokio::time::interval(self.interval);
-			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			let mut ticker = time::interval(self.interval);
+			ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 			loop {
 				tokio::select! {
 					_ = shutdown.cancelled() => break,
@@ -95,6 +99,8 @@ impl DocumentCacheCollector {
 
 #[cfg(test)]
 mod tests {
+	use tokio::sync::watch;
+
 	use super::*;
 
 	#[tokio::test]

@@ -3,6 +3,7 @@
 use std::{
 	ffi::OsString,
 	path::PathBuf,
+	process,
 	sync::atomic::{AtomicU64, Ordering},
 	time::Duration,
 };
@@ -12,6 +13,7 @@ use tokio::{
 	io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
 	process::{Child, ChildStdin, ChildStdout, Command},
 	sync::Mutex,
+	time,
 };
 
 use super::protocol::{InboundFrame, MAX_FRAME_BYTES, ModelId, OutboundFrame};
@@ -146,7 +148,7 @@ impl EmbeddingSupervisor {
 				}
 			}
 		};
-		match tokio::time::timeout(self.config.request_timeout, future).await {
+		match time::timeout(self.config.request_timeout, future).await {
 			Ok(Ok(vectors)) => Ok(vectors),
 			Ok(Err(error)) => {
 				reap_locked(&mut guard).await;
@@ -191,7 +193,7 @@ impl EmbeddingSupervisor {
 				return Ok(response);
 			}
 		};
-		match tokio::time::timeout(timeout, future).await {
+		match time::timeout(timeout, future).await {
 			Ok(Ok(response)) if !matches!(response, OutboundFrame::Error { .. }) => Ok(response),
 			Ok(Ok(_)) | Ok(Err(_)) => {
 				reap_locked(&mut guard).await;
@@ -231,9 +233,9 @@ impl WorkerProcess {
 		command
 			.args(&config.args)
 			.env("OMP_MEMORY_WORKER_GENERATION", generation.to_string())
-			.stdin(std::process::Stdio::piped())
-			.stdout(std::process::Stdio::piped())
-			.stderr(std::process::Stdio::inherit())
+			.stdin(process::Stdio::piped())
+			.stdout(process::Stdio::piped())
+			.stderr(process::Stdio::inherit())
 			.kill_on_drop(true);
 		let mut child = command.spawn()?;
 		let stdin = child.stdin.take().ok_or(Error::EmbeddingWorker)?;

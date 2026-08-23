@@ -1,5 +1,7 @@
 //! PostgreSQL, MySQL, and SQLite exact-byte journal protocol.
 
+use std::error;
+
 use strum::{Display, EnumString, IntoStaticStr};
 use thiserror::Error;
 
@@ -88,7 +90,7 @@ pub enum Reply {
 /// Minimal SQL adapter boundary used by all dialects.
 pub trait Transport {
 	/// Typed database failure.
-	type Error: std::error::Error + Send + Sync + 'static;
+	type Error: error::Error + Send + Sync + 'static;
 
 	/// Executes one prepared operation.
 	fn execute(&mut self, command: Command<'_>) -> Result<Reply, Self::Error>;
@@ -96,7 +98,7 @@ pub trait Transport {
 
 /// SQL journal protocol failure.
 #[derive(Debug, Error)]
-pub enum SqlError<E: std::error::Error + 'static> {
+pub enum SqlError<E: error::Error + 'static> {
 	/// Database adapter operation failed.
 	#[error("SQL journal transport failed")]
 	Transport(#[source] E),

@@ -1,6 +1,10 @@
 //! `PowerPoint` Open XML to deterministic Markdown conversion.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+	collections::{HashMap, HashSet},
+	fmt::Display,
+	str,
+};
 
 use omp_core::{IntoStr, Str};
 use quick_xml::{
@@ -539,7 +543,7 @@ fn parse_shape(reader: &mut Reader<&[u8]>) -> Result<Shape, String> {
 
 fn level_property_number(name: &[u8]) -> Option<usize> {
 	let middle = name.strip_prefix(b"lvl")?.strip_suffix(b"pPr")?;
-	let level = std::str::from_utf8(middle).ok()?.parse::<usize>().ok()?;
+	let level = str::from_utf8(middle).ok()?.parse::<usize>().ok()?;
 	(1..=9).contains(&level).then_some(level - 1)
 }
 
@@ -1212,7 +1216,7 @@ fn escape_alt(value: &str) -> String {
 	value.replace(']', "\\]")
 }
 
-fn xml_error(error: impl std::fmt::Display) -> String {
+fn xml_error(error: impl Display) -> String {
 	format!("invalid PPTX XML: {error}")
 }
 fn failure(error: impl IntoStr) -> MarkitError {

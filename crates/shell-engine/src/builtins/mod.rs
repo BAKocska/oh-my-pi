@@ -55,7 +55,7 @@ mod unalias;
 mod unset;
 mod wait;
 
-use std::io::Write;
+use std::{ffi, future, io::Write, iter, marker, string};
 
 use clap::builder::styling;
 pub use factory::default_builtins;
@@ -139,8 +139,7 @@ pub trait Command: clap::Parser {
 	fn execute<SE: extensions::ShellExtensions>(
 		&self,
 		context: commands::ExecutionContext<'_, SE>,
-	) -> impl std::future::Future<Output = Result<results::ExecutionResult, Self::Error>>
-	+ std::marker::Send;
+	) -> impl future::Future<Output = Result<results::ExecutionResult, Self::Error>> + marker::Send;
 
 	/// Returns the textual help content associated with the command.
 	///
@@ -251,7 +250,7 @@ fn get_builtin_man_page(name: &str, command: &clap::Command) -> Result<String, e
 	append_man_section(&mut man_page, "NAME");
 	let description = command
 		.get_about()
-		.map_or_else(String::new, std::string::ToString::to_string);
+		.map_or_else(String::new, string::ToString::to_string);
 	if description.is_empty() {
 		man_page.push_str(name);
 		man_page.push('\n');
@@ -515,7 +514,7 @@ pub fn parse_known<T: clap::Parser, S>(
 	args: impl IntoIterator<Item = S>,
 ) -> (T, Option<impl Iterator<Item = S>>)
 where
-	S: Into<std::ffi::OsString> + Clone + PartialEq<&'static str>,
+	S: Into<ffi::OsString> + Clone + PartialEq<&'static str>,
 {
 	let mut args = args.into_iter();
 	// the best way to save `--` is to get it out with a side effect while `clap`
@@ -530,7 +529,7 @@ where
 		!is_hyphen
 	});
 	let parsed_args = T::parse_from(args_before_hyphen);
-	let raw_args = hyphen.map(|hyphen| std::iter::once(hyphen).chain(args));
+	let raw_args = hyphen.map(|hyphen| iter::once(hyphen).chain(args));
 	(parsed_args, raw_args)
 }
 
@@ -551,7 +550,7 @@ pub fn try_parse_known<T: clap::Parser>(
 	});
 	let parsed_args = T::try_parse_from(args_before_hyphen)?;
 
-	let raw_args = hyphen.map(|hyphen| std::iter::once(hyphen).chain(args));
+	let raw_args = hyphen.map(|hyphen| iter::once(hyphen).chain(args));
 	Ok((parsed_args, raw_args))
 }
 

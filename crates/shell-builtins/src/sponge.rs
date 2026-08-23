@@ -10,6 +10,7 @@ use std::{
 	fs::{self, File, OpenOptions},
 	io::{self, Read, Write},
 	path::{Path, PathBuf},
+	process,
 	sync::atomic::{AtomicU64, Ordering},
 	time::{SystemTime, UNIX_EPOCH},
 };
@@ -179,7 +180,7 @@ fn create_sibling_temp(target: &Path) -> io::Result<(PathBuf, File)> {
 		let tag = nanos
 			.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 			.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
-			.wrapping_add(std::process::id() as u64);
+			.wrapping_add(process::id() as u64);
 		let path = dir.join(format!(".{base}.sponge.{tag:016x}"));
 		match OpenOptions::new().write(true).create_new(true).open(&path) {
 			Ok(file) => return Ok((path, file)),
@@ -197,7 +198,7 @@ pub(crate) fn sponge_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
-	use std::{ffi::OsString, fs};
+	use std::{ffi::OsString, fs, str};
 
 	use super::Sponge;
 	use crate::host::run_util;
@@ -271,7 +272,7 @@ mod tests {
 		let target = dir.path().join("data");
 		fs::write(&target, b"original file bytes").unwrap();
 		let redirected_stdin = fs::read(&target).unwrap();
-		let stdin = std::str::from_utf8(&redirected_stdin).unwrap();
+		let stdin = str::from_utf8(&redirected_stdin).unwrap();
 
 		let (code, capture) = run_util::<Sponge>(&["data"], stdin, dir.path());
 

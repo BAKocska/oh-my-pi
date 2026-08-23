@@ -1,6 +1,6 @@
 //! Bounded subagent result projection with durable full-output persistence.
 
-use std::{fs, path::Path};
+use std::{fs, io, path::Path};
 
 use omp_agent::SubagentDisposition;
 use omp_core::{Str, sf};
@@ -20,13 +20,13 @@ pub const MAX_CANCELLATION_SALVAGE_CHARS: usize = 500;
 pub enum OutputError {
 	/// The output parent directory could not be created.
 	#[error("subagent artifact directory could not be created")]
-	CreateDirectory(#[source] std::io::Error),
+	CreateDirectory(#[source] io::Error),
 	/// The complete output could not be written.
 	#[error("subagent artifact could not be written")]
-	Write(#[source] std::io::Error),
+	Write(#[source] io::Error),
 	/// The temporary artifact could not be atomically published.
 	#[error("subagent artifact could not be published")]
-	Publish(#[source] std::io::Error),
+	Publish(#[source] io::Error),
 }
 
 /// Persists complete output atomically and returns a bounded disposition.

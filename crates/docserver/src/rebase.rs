@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+	result,
+	time::{Duration, Instant},
+};
 
 use bytes::{Bytes, BytesMut};
 use omp_core::sf;
@@ -167,7 +170,7 @@ pub fn rebase_edits(
 	base: &Bytes,
 	head: &Bytes,
 	edits: &[ByteEdit],
-) -> Result<std::result::Result<AppliedEdits, RebaseConflict>> {
+) -> Result<result::Result<AppliedEdits, RebaseConflict>> {
 	validate_edits(usize_to_u64(base.len())?, edits)?;
 	if base == head {
 		return apply_edits(head, edits).map(Ok);
@@ -196,7 +199,7 @@ pub fn rebase_content(
 	base: &Bytes,
 	head: &Bytes,
 	proposed: &Bytes,
-) -> Result<std::result::Result<AppliedEdits, RebaseConflict>> {
+) -> Result<result::Result<AppliedEdits, RebaseConflict>> {
 	let edits = canonical_edits(base, proposed)?;
 	rebase_edits(base, head, &edits)
 }

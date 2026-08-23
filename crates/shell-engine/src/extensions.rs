@@ -1,5 +1,7 @@
 //! Definition of shell behavior traits and defaults.
 
+use std::marker;
+
 use crate::{Shell, error, extensions};
 
 /// Trait for static shell extensions. Collects all associated types needed to
@@ -12,7 +14,7 @@ pub trait ShellExtensions: Clone + Default + Send + Sync + 'static {
 /// Shell extensions implementation constructed from component types.
 #[derive(Clone, Default)]
 pub struct ShellExtensionsImpl<EF: ErrorFormatter = DefaultErrorFormatter> {
-	_marker: std::marker::PhantomData<EF>,
+	_marker: marker::PhantomData<EF>,
 }
 
 impl<EF: ErrorFormatter> ShellExtensions for ShellExtensionsImpl<EF> {

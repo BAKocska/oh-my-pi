@@ -2,16 +2,16 @@
 
 use std::{
 	collections::BTreeMap,
+	fs, io,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
 
 use omp_core::Str;
 use serde::Deserialize;
-use serde_json::{Map, Value};
-use thiserror::Error;
+use serde_json::Map;
 
-use crate::dap_adapter::{DapAdapterSpec, DapTransport};
+use crate::dap_adapter::{DapAdapterError, DapAdapterSpec, DapTransport};
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const CONFIG_NAMES: [&str; 6] =
@@ -64,13 +64,13 @@ pub struct DapConfigSource {
 impl DapConfigSource {
 	/// Reads one bounded source.
 	pub fn read(kind: DapConfigSourceKind, path: &Path) -> Result<Self, DapConfigError> {
-		let metadata = std::fs::metadata(path)
+		let metadata = fs::metadata(path)
 			.map_err(|source| DapConfigError::Read { path: path.to_owned(), source })?;
 		if metadata.len() > MAX_CONFIG_BYTES {
 			return Err(DapConfigError::TooLarge { path: path.to_owned() });
 		}
-		let bytes = std::fs::read(path)
-			.map_err(|source| DapConfigError::Read { path: path.to_owned(), source })?;
+		let bytes =
+			fs::read(path).map_err(|source| DapConfigError::Read { path: path.to_owned(), source })?;
 		Ok(Self {
 			provenance: DapConfigProvenance { kind, source: Str::new(path.to_string_lossy()) },
 			yaml:       matches!(
@@ -102,8 +102,8 @@ struct DapAdapterPatch {
 	languages: Option<Vec<Str>>,
 	file_types: Option<Vec<Str>>,
 	root_markers: Option<Vec<Str>>,
-	launch_defaults: Option<Map<String, Value>>,
-	attach_defaults: Option<Map<String, Value>>,
+	launch_defaults: Option<Map<String, serde_json::Value>>,
+	attach_defaults: Option<Map<String, serde_json::Value>>,
 	accepts_directory_program: Option<bool>,
 	connect_mode: Option<Str>,
 	preference: Option<u16>,
@@ -116,8 +116,8 @@ struct MergedAdapter {
 	languages: Option<DapProvenanced<Vec<Str>>>,
 	file_types: Option<DapProvenanced<Vec<Str>>>,
 	root_markers: Option<DapProvenanced<Vec<Str>>>,
-	launch_defaults: Option<DapProvenanced<Map<String, Value>>>,
-	attach_defaults: Option<DapProvenanced<Map<String, Value>>>,
+	launch_defaults: Option<DapProvenanced<Map<String, serde_json::Value>>>,
+	attach_defaults: Option<DapProvenanced<Map<String, serde_json::Value>>>,
 	accepts_directory_program: Option<DapProvenanced<bool>>,
 	connect_mode: Option<DapProvenanced<Option<Str>>>,
 	preference: Option<DapProvenanced<u16>>,
@@ -139,11 +139,11 @@ pub struct ResolvedDapAdapter {
 	/// Project markers.
 	pub root_markers: DapProvenanced<Vec<Str>>,
 	/// Launch defaults.
-	pub launch_defaults: DapProvenanced<Map<String, Value>>,
+	pub launch_defaults: DapProvenanced<Map<String, serde_json::Value>>,
 	/// Attach defaults.
 	/// `skipAttachRequest: true` marks an adapter that connected before DAP
 	/// startup.
-	pub attach_defaults: DapProvenanced<Map<String, Value>>,
+	pub attach_defaults: DapProvenanced<Map<String, serde_json::Value>>,
 	/// Directory launch support.
 	pub accepts_directory_program: DapProvenanced<bool>,
 	/// Optional socket/TCP connection mode.
@@ -255,7 +255,7 @@ pub fn load_dap_config(
 				path: PathBuf::from(source.provenance.source.as_str()),
 			});
 		}
-		let value: Value = if source.yaml {
+		let value: serde_json::Value = if source.yaml {
 			serde_yaml::from_slice(&source.bytes).map_err(|error| DapConfigError::ParseYaml {
 				source_name: source.provenance.source.clone(),
 				source:      error,
@@ -271,7 +271,7 @@ pub fn load_dap_config(
 			.cloned()
 			.ok_or(DapConfigError::TopLevelObject)?;
 		let adapters = match object.remove("adapters") {
-			Some(Value::Object(value)) => value,
+			Some(serde_json::Value::Object(value)) => value,
 			Some(_) => return Err(DapConfigError::AdaptersObject),
 			None => object,
 		};
@@ -375,7 +375,7 @@ fn resolve_adapter(
 }
 
 /// Native DAP configuration failure.
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum DapConfigError {
 	/// Read failure.
 	#[error("cannot read DAP configuration {}: {source}", path.display())]
@@ -384,7 +384,7 @@ pub enum DapConfigError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// Byte bound exceeded.
 	#[error("DAP configuration {} exceeds its byte bound", path.display())]
@@ -441,12 +441,16 @@ pub enum DapConfigError {
 	},
 	/// Runtime declaration validation failed.
 	#[error(transparent)]
-	Adapter(#[from] crate::dap_adapter::DapAdapterError),
+	Adapter(#[from] DapAdapterError),
 }
 
 #[cfg(test)]
 mod tests {
+
+	use std::iter::empty;
+
 	use super::*;
+	use crate::dap_adapter::builtin_adapters;
 
 	#[test]
 	fn yaml_field_merge_preserves_object_members_and_provenance() {
@@ -460,7 +464,7 @@ mod tests {
 			),
 			yaml:       true,
 		};
-		let adapters = load_dap_config(crate::dap_adapter::builtin_adapters(), &[source]).unwrap();
+		let adapters = load_dap_config(builtin_adapters(), &[source]).unwrap();
 		let debugpy = &adapters["debugpy"];
 		assert_eq!(debugpy.launch_defaults.value["request"], "launch");
 		assert_eq!(debugpy.launch_defaults.value["stopOnEntry"], false);
@@ -489,7 +493,7 @@ mod tests {
 			),
 			yaml:       false,
 		};
-		let adapters = load_dap_config(std::iter::empty::<DapAdapterSpec>(), &[source]).unwrap();
+		let adapters = load_dap_config(empty::<DapAdapterSpec>(), &[source]).unwrap();
 		let adapter = adapters["pico-openocd"].to_spec().unwrap();
 
 		assert!(adapter.skip_attach_request());

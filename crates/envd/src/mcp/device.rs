@@ -1,7 +1,7 @@
 //! Deterministic projection of one MCP server beneath a dynamic device
 //! namespace.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, str, sync::Arc};
 
 use bytes::Bytes;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -298,7 +298,7 @@ fn base36(mut value: u64, encoded: &mut [u8; 13]) -> &str {
 			break;
 		}
 	}
-	std::str::from_utf8(&encoded[cursor..]).expect("base-36 alphabet is UTF-8")
+	str::from_utf8(&encoded[cursor..]).expect("base-36 alphabet is UTF-8")
 }
 
 /// Dynamic device projection failure.

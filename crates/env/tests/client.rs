@@ -9,7 +9,11 @@ use std::{
 };
 
 use bytes::Bytes;
-use frame::{client_frame, data_event, data_request, document_op, document_result, server_frame};
+use flume::Receiver;
+use frame::{
+	client_frame, data_event, data_request, data_response, document_op, document_result,
+	server_frame,
+};
 use omp_core::{EnvPath, sf};
 use omp_env::{
 	ClientError, DataScope, EnvClient, InvocationEvent, InvocationGrant, LspStreamEvent,
@@ -44,7 +48,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 	}
 }
 
-fn receive(requests: &flume::Receiver<frame::ClientFrame>) -> frame::ClientFrame {
+fn receive(requests: &Receiver<frame::ClientFrame>) -> frame::ClientFrame {
 	requests
 		.recv_timeout(RECEIVE_TIMEOUT)
 		.expect("client frame")
@@ -96,7 +100,7 @@ fn data_scope() -> DataScope {
 
 fn data_response(result: document_result::Result) -> server_frame::Body {
 	server_frame::Body::Data(frame::DataResponse {
-		body: Some(frame::data_response::Body::Document(frame::DocumentResult {
+		body: Some(data_response::Body::Document(frame::DocumentResult {
 			result: Some(result),
 			..frame::DocumentResult::default()
 		})),
@@ -168,7 +172,7 @@ fn hello_and_concurrent_requests_are_correlated_while_events_remain_observable()
 	let server = thread::spawn(move || {
 		let hello = receive(&requests);
 		assert_eq!(hello.request_id, 0);
-		assert!(matches!(hello.body, Some(client_frame::Body::Hello(_))));
+		assert!(matches!(hello.body, Some(frame::client_frame::Body::Hello(_))));
 		respond(
 			&responses,
 			0,
@@ -278,19 +282,19 @@ fn invocation_frames_preserve_commit_and_event_order() {
 	}
 	assert!(matches!(
 		frames[0].body.as_ref(),
-		Some(client_frame::Body::ArgText(fragment)) if fragment.invocation_id == "ordered" && fragment.fragment == "{\"path\":"
+		Some(frame::client_frame::Body::ArgText(fragment)) if fragment.invocation_id == "ordered" && fragment.fragment == "{\"path\":"
 	));
 	assert!(matches!(
 		frames[1].body.as_ref(),
-		Some(client_frame::Body::ArgText(fragment)) if fragment.invocation_id == "ordered" && fragment.fragment == "\"a\"}"
+		Some(frame::client_frame::Body::ArgText(fragment)) if fragment.invocation_id == "ordered" && fragment.fragment == "\"a\"}"
 	));
 	assert!(matches!(
 		frames[2].body.as_ref(),
-		Some(client_frame::Body::ArgsCommitted(commit)) if commit.invocation_id == "ordered" && commit.raw == Bytes::from_static(b"{\"path\":\"a\"}")
+		Some(frame::client_frame::Body::ArgsCommitted(commit)) if commit.invocation_id == "ordered" && commit.raw == Bytes::from_static(b"{\"path\":\"a\"}")
 	));
 	assert!(matches!(
 		frames[3].body.as_ref(),
-		Some(client_frame::Body::Interrupt(interrupt)) if interrupt.invocation_id == "ordered" && interrupt.reason == "please stop"
+		Some(frame::client_frame::Body::Interrupt(interrupt)) if interrupt.invocation_id == "ordered" && interrupt.reason == "please stop"
 	));
 
 	respond(
@@ -376,7 +380,7 @@ fn command_guard_cancels_only_its_request_and_does_not_own_the_session() {
 	let server_session = session.clone();
 	let server = thread::spawn(move || {
 		let open = receive(&requests);
-		assert!(matches!(open.body, Some(client_frame::Body::OpenSession(_))));
+		assert!(matches!(open.body, Some(frame::client_frame::Body::OpenSession(_))));
 		respond(
 			&responses,
 			open.request_id,
@@ -400,7 +404,7 @@ fn command_guard_cancels_only_its_request_and_does_not_own_the_session() {
 	let exec = receive(&requests);
 	let exec_id = exec.request_id;
 	assert!(
-		matches!(exec.body, Some(client_frame::Body::Exec(request)) if request.session == session)
+		matches!(exec.body, Some(frame::client_frame::Body::Exec(request)) if request.session == session)
 	);
 
 	let mut other = block_on(client.invoke(invoke_request("other"))).expect("other request");
@@ -425,7 +429,7 @@ fn command_guard_cancels_only_its_request_and_does_not_own_the_session() {
 		assert_ne!(close.request_id, exec_id);
 		assert!(matches!(
 			close.body,
-			Some(client_frame::Body::CloseSession(request)) if request.session == server_session
+			Some(frame::client_frame::Body::CloseSession(request)) if request.session == server_session
 		));
 		respond(
 			&responses,
@@ -474,7 +478,7 @@ fn admission_and_authorization_frames_carry_typed_phase_data() {
 	assert_eq!(admission.request_id, request_id);
 	assert!(matches!(
 		admission.body,
-		Some(client_frame::Body::Admission(reply)) if reply.invocation_id == "phase" && reply.allow
+		Some(frame::client_frame::Body::Admission(reply)) if reply.invocation_id == "phase" && reply.allow
 	));
 
 	block_on(invocation.commit_args(
@@ -488,7 +492,7 @@ fn admission_and_authorization_frames_carry_typed_phase_data() {
 	assert_eq!(authorized.request_id, request_id);
 	assert!(matches!(
 		authorized.body,
-		Some(client_frame::Body::ArgsCommitted(commit))
+		Some(frame::client_frame::Body::ArgsCommitted(commit))
 			if commit.effect_token == Bytes::from_static(b"phase-token")
 				&& commit.authorized_at_ms == 456
 	));
@@ -514,8 +518,8 @@ fn scoped_walk_and_search_interleave_and_fuse_after_completion() {
 	));
 	assert!(matches!(
 		walk_request.body,
-		Some(client_frame::Body::Data(frame::DataRequest {
-			body: Some(data_request::Body::Walk(frame::WalkRequest { root_uri, .. })),
+		Some(frame::client_frame::Body::Data(frame::DataRequest {
+			body: Some(frame::data_request::Body::Walk(frame::WalkRequest { root_uri, .. })),
 			..
 		})) if root_uri == "file:///workspace"
 	));
@@ -591,9 +595,9 @@ fn document_stream_loss_is_terminal_and_drop_closes_connection_owned_lease() {
 		let open = receive(&requests);
 		assert!(matches!(
 			open.body,
-			Some(client_frame::Body::Data(frame::DataRequest {
-				body: Some(data_request::Body::Document(frame::DocumentOp {
-					op: Some(document_op::Op::Open(_)),
+			Some(frame::client_frame::Body::Data(frame::DataRequest {
+				body: Some(frame::data_request::Body::Document(frame::DocumentOp {
+					op: Some(frame::document_op::Op::Open(_)),
 					..
 				})),
 				..
@@ -643,9 +647,9 @@ fn document_stream_loss_is_terminal_and_drop_closes_connection_owned_lease() {
 	let close = receive(&requests);
 	assert!(matches!(
 		close.body,
-		Some(client_frame::Body::Data(frame::DataRequest {
-			body: Some(data_request::Body::Document(frame::DocumentOp {
-				op: Some(document_op::Op::Close(document::CloseDocumentRequest { lease_id })),
+		Some(frame::client_frame::Body::Data(frame::DataRequest {
+			body: Some(frame::data_request::Body::Document(frame::DocumentOp {
+				op: Some(frame::document_op::Op::Close(document::CloseDocumentRequest { lease_id })),
 				..
 			})),
 			..
@@ -688,9 +692,9 @@ fn lsp_stream_loss_requires_reconnect_and_requery() {
 	let subscription = receive(&requests);
 	assert!(matches!(
 		subscription.body,
-		Some(client_frame::Body::Data(frame::DataRequest {
-			body: Some(data_request::Body::Document(frame::DocumentOp {
-				op: Some(document_op::Op::GetLspBindings(_)),
+		Some(frame::client_frame::Body::Data(frame::DataRequest {
+			body: Some(frame::data_request::Body::Document(frame::DocumentOp {
+				op: Some(frame::document_op::Op::GetLspBindings(_)),
 				..
 			})),
 			..
@@ -854,8 +858,8 @@ fn owner_worktree_api_preserves_typed_merge_disposition() {
 		let request_id = request.request_id;
 		assert!(matches!(
 			request.body,
-			Some(client_frame::Body::Data(frame::DataRequest {
-				body: Some(data_request::Body::Worktree(frame::WorktreeOp {
+			Some(frame::client_frame::Body::Data(frame::DataRequest {
+				body: Some(frame::data_request::Body::Worktree(frame::WorktreeOp {
 					op: Some(frame::worktree_op::Op::Merge(frame::MergeWorktree {
 						mode,
 						..
@@ -869,7 +873,7 @@ fn owner_worktree_api_preserves_typed_merge_disposition() {
 			&responses,
 			request_id,
 			server_frame::Body::Data(frame::DataResponse {
-				body: Some(frame::data_response::Body::Worktree(frame::WorktreeResult {
+				body: Some(data_response::Body::Worktree(frame::WorktreeResult {
 					worktree: Some(frame::WorktreeInfo { id: "agent-1".into(), ..Default::default() }),
 					artifact_hash: Bytes::from_static(b"hash"),
 					artifact_size: 42,
@@ -901,8 +905,8 @@ fn host_info_api_preserves_versioned_bounded_facts() {
 		let request_id = request.request_id;
 		assert!(matches!(
 			request.body,
-			Some(client_frame::Body::Data(frame::DataRequest {
-				body: Some(data_request::Body::HostInfo(frame::HostInfoRequest {
+			Some(frame::client_frame::Body::Data(frame::DataRequest {
+				body: Some(frame::data_request::Body::HostInfo(frame::HostInfoRequest {
 					wire_revision: 9,
 					max_field_bytes: 256,
 					..
@@ -914,7 +918,7 @@ fn host_info_api_preserves_versioned_bounded_facts() {
 			&responses,
 			request_id,
 			server_frame::Body::Data(frame::DataResponse {
-				body: Some(frame::data_response::Body::HostInfo(frame::HostInfo {
+				body: Some(data_response::Body::HostInfo(frame::HostInfo {
 					wire_revision: 9,
 					os: "Darwin".into(),
 					architecture: "arm64".into(),
@@ -949,8 +953,8 @@ fn resource_completion_is_scoped_streamed_and_cancellable() {
 	assert!(request.scope.is_some());
 	assert!(matches!(
 		request.body,
-		Some(client_frame::Body::Data(frame::DataRequest {
-			body: Some(data_request::Body::Resource(frame::ResourceOp {
+		Some(frame::client_frame::Body::Data(frame::DataRequest {
+			body: Some(frame::data_request::Body::Resource(frame::ResourceOp {
 				op: Some(frame::resource_op::Op::Complete(frame::ResourceCompleteRequest {
 					max_results: 5,
 					..

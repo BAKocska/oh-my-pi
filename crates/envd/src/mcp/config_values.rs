@@ -4,7 +4,7 @@
 //! whose executor crosses the Environment boundary. This module never spawns a
 //! shell or owns a second command cache.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use omp_core::{ExposeSecret as _, SecretString, Str};
 use omp_inference::auth::command::{CommandCredentialError, CommandCredentialResolver};
@@ -31,8 +31,8 @@ impl ResolvedConfigValue {
 	}
 }
 
-impl std::fmt::Debug for ResolvedConfigValue {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ResolvedConfigValue {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Public(value) => formatter.debug_tuple("Public").field(value).finish(),
 			Self::Secret(_) => formatter.write_str("Secret([REDACTED])"),

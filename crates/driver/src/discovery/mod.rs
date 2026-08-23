@@ -24,7 +24,12 @@ pub mod settings;
 pub mod skills;
 pub mod slash_commands;
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+	collections::BTreeMap,
+	env,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use futures::future::join_all;
 use omp_catalog::{
@@ -34,8 +39,15 @@ use omp_catalog::{
 use omp_core::Str;
 
 use self::{
-	manifest::{CapabilityKind, CapabilityRecord},
+	foreign::ForeignContentSettings,
+	manifest::{CapabilityKind, CapabilityPayload, CapabilityRecord, SourceScope},
+	native::NativeDiscoveryOptions,
 	registry::{CAPABILITY_KINDS, CapabilityResult, DiscoveryRegistry, LoadContext, LoadOptions},
+	skills::SkillDiscoverySettings,
+};
+use crate::{
+	rulebook::{RuleSnapshot, RulebookSettings},
+	skills::SkillSnapshot,
 };
 /// One command contributed by native content discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,9 +92,9 @@ fn embedded_workflow_commands() -> [CommandContribution; 1] {
 #[derive(Clone, Debug)]
 pub struct ActiveContentSnapshots {
 	/// Active skills.
-	pub skills:   Arc<crate::skills::SkillSnapshot>,
+	pub skills:   Arc<SkillSnapshot>,
 	/// Active declarative rules.
-	pub rules:    Arc<crate::rulebook::RuleSnapshot>,
+	pub rules:    Arc<RuleSnapshot>,
 	/// Active native Markdown slash commands in discovery precedence order.
 	pub commands: Arc<[CommandContribution]>,
 	/// Bounded non-fatal diagnostics emitted while loading static content.
@@ -92,16 +104,16 @@ pub struct ActiveContentSnapshots {
 /// Discovers native repository/user content once and freezes the skill/rule
 /// winners used by a session composition.
 pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
-	let home = std::env::var_os("HOME").map_or_else(|| root.to_path_buf(), std::path::PathBuf::from);
+	let home = env::var_os("HOME").map_or_else(|| root.to_path_buf(), PathBuf::from);
 	let mut discovered =
-		native::discover_capabilities(root, &home, 64, &native::NativeDiscoveryOptions::default());
-	let foreign = foreign::discover(root, &foreign::ForeignContentSettings::default());
+		native::discover_capabilities(root, &home, 64, &NativeDiscoveryOptions::default());
+	let foreign = foreign::discover(root, &ForeignContentSettings::default());
 	discovered.declarations.extend(foreign.skills);
 	discovered.declarations.extend(foreign.rules);
 	discovered.warnings.extend(foreign.warnings);
 	let managed = managed_skills::discover_dead_last(
 		&native::user_config_root(&home),
-		&skills::SkillDiscoverySettings::default(),
+		&SkillDiscoverySettings::default(),
 	);
 	discovered.declarations.extend(managed.declarations);
 	discovered
@@ -111,12 +123,12 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 		.declarations
 		.iter()
 		.filter_map(|declaration| {
-			let manifest::CapabilityPayload::SlashCommands(command) = &declaration.payload else {
+			let CapabilityPayload::SlashCommands(command) = &declaration.payload else {
 				return None;
 			};
 			let origin = match declaration.source.scope {
-				manifest::SourceScope::Project => "Project .omp",
-				manifest::SourceScope::User => "User .omp",
+				SourceScope::Project => "Project .omp",
+				SourceScope::User => "User .omp",
 				_ => "OMP command",
 			};
 			Some(CommandContribution {
@@ -136,10 +148,10 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 		commands.extend(embedded_workflow_commands());
 	}
 	ActiveContentSnapshots {
-		skills:   Arc::new(crate::skills::SkillSnapshot::from_declarations(&discovered.declarations)),
-		rules:    Arc::new(crate::rulebook::RuleSnapshot::from_declarations(
+		skills:   Arc::new(SkillSnapshot::from_declarations(&discovered.declarations)),
+		rules:    Arc::new(RuleSnapshot::from_declarations(
 			&discovered.declarations,
-			&crate::rulebook::RulebookSettings::default(),
+			&RulebookSettings::default(),
 		)),
 		commands: commands.into(),
 		warnings: discovered.warnings.into(),

@@ -7,6 +7,21 @@ use omp_tool::{
 };
 use serde::Deserialize;
 
+use crate::{
+	edit::{EditUpdate, Fault as EditFault, Payload as EditPayload},
+	eval::{Fault as EvalFault, Payload as EvalPayload, Update as EvalUpdate},
+	glob::{Fault as GlobFault, Payload as GlobPayload, Update as GlobUpdate},
+	grep::{Fault as GrepFault, Payload as GrepPayload, Update as GrepUpdate},
+	hub::{Fault as HubFault, Response as HubResponse},
+	read::{Fault as ReadFault, Payload as ReadPayload, PayloadPart, Update as ReadUpdate},
+	shell::{
+		ExecOutcome, Fault as ShellFault, Payload as ShellPayload, TranscriptFrame,
+		Update as ShellUpdate,
+	},
+	web_search::{Fault as WebSearchFault, Payload as WebSearchPayload, Update as WebSearchUpdate},
+	write::{Fault as WriteFault, Payload as WritePayload, Update as WriteUpdate},
+};
+
 /// Bounded JSON-tree previews shared by structured tool views.
 pub mod json_tree;
 /// Grouped path and directory-tree rendering.
@@ -84,15 +99,15 @@ pub fn register_builtin_renderers(
 
 #[derive(Default)]
 struct EditState {
-	latest: Option<crate::edit::EditUpdate>,
+	latest: Option<EditUpdate>,
 }
 
 struct EditRenderer;
 
 impl RenderFold for EditRenderer {
-	type Outcome = CallOutcome<crate::edit::Payload, crate::edit::Fault>;
+	type Outcome = CallOutcome<EditPayload, EditFault>;
 	type State = EditState;
-	type Update = crate::edit::EditUpdate;
+	type Update = EditUpdate;
 
 	fn fold(&self, state: &mut Self::State, update: Self::Update) {
 		state.latest = Some(update);
@@ -111,9 +126,9 @@ impl RenderFold for EditRenderer {
 struct GrepRenderer;
 
 impl RenderFold for GrepRenderer {
-	type Outcome = CallOutcome<crate::grep::Payload, crate::grep::Fault>;
+	type Outcome = CallOutcome<GrepPayload, GrepFault>;
 	type State = ();
-	type Update = crate::grep::Update;
+	type Update = GrepUpdate;
 
 	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
 		match update {}
@@ -132,9 +147,9 @@ impl RenderFold for GrepRenderer {
 struct WebSearchRenderer;
 
 impl RenderFold for WebSearchRenderer {
-	type Outcome = CallOutcome<crate::web_search::Payload, crate::web_search::Fault>;
+	type Outcome = CallOutcome<WebSearchPayload, WebSearchFault>;
 	type State = ();
-	type Update = crate::web_search::Update;
+	type Update = WebSearchUpdate;
 
 	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
 		match update {}
@@ -153,9 +168,9 @@ impl RenderFold for WebSearchRenderer {
 struct GlobRenderer;
 
 impl RenderFold for GlobRenderer {
-	type Outcome = CallOutcome<crate::glob::Payload, crate::glob::Fault>;
+	type Outcome = CallOutcome<GlobPayload, GlobFault>;
 	type State = ();
-	type Update = crate::glob::Update;
+	type Update = GlobUpdate;
 
 	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
 		match update {}
@@ -182,8 +197,8 @@ struct StreamState {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ShellRenderOutcome {
-	Call(CallOutcome<crate::shell::Payload, crate::shell::Fault>),
-	Terminal(omp_tool::ToolTerminal<crate::shell::Payload, crate::shell::Fault>),
+	Call(CallOutcome<ShellPayload, ShellFault>),
+	Terminal(omp_tool::ToolTerminal<ShellPayload, ShellFault>),
 }
 
 struct ShellRenderer;
@@ -191,7 +206,7 @@ struct ShellRenderer;
 impl RenderFold for ShellRenderer {
 	type Outcome = ShellRenderOutcome;
 	type State = StreamState;
-	type Update = crate::shell::Update;
+	type Update = ShellUpdate;
 
 	fn fold(&self, state: &mut Self::State, update: Self::Update) {
 		state.bytes = state
@@ -231,15 +246,15 @@ impl RenderFold for ShellRenderer {
 }
 #[derive(Default)]
 struct HubState {
-	latest: Option<crate::hub::Response>,
+	latest: Option<HubResponse>,
 }
 
 struct HubRenderer;
 
 impl RenderFold for HubRenderer {
-	type Outcome = CallOutcome<crate::hub::Response, crate::hub::Fault>;
+	type Outcome = CallOutcome<HubResponse, HubFault>;
 	type State = HubState;
-	type Update = crate::hub::Response;
+	type Update = HubResponse;
 
 	fn fold(&self, state: &mut Self::State, update: Self::Update) {
 		state.latest = Some(update);
@@ -262,9 +277,9 @@ impl RenderFold for HubRenderer {
 struct WriteRenderer;
 
 impl RenderFold for WriteRenderer {
-	type Outcome = CallOutcome<crate::write::Payload, crate::write::Fault>;
+	type Outcome = CallOutcome<WritePayload, WriteFault>;
 	type State = ();
-	type Update = crate::write::Update;
+	type Update = WriteUpdate;
 
 	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
 		match update {}
@@ -288,9 +303,9 @@ struct ReadState {
 struct ReadRenderer;
 
 impl RenderFold for ReadRenderer {
-	type Outcome = CallOutcome<crate::read::Payload, crate::read::Fault>;
+	type Outcome = CallOutcome<ReadPayload, ReadFault>;
 	type State = ReadState;
-	type Update = crate::read::Update;
+	type Update = ReadUpdate;
 
 	fn fold(&self, state: &mut Self::State, update: Self::Update) {
 		state.phase = Some(update.phase);
@@ -309,9 +324,9 @@ impl RenderFold for ReadRenderer {
 struct EvalRenderer;
 
 impl RenderFold for EvalRenderer {
-	type Outcome = CallOutcome<crate::eval::Payload, crate::eval::Fault>;
+	type Outcome = CallOutcome<EvalPayload, EvalFault>;
 	type State = StreamState;
-	type Update = crate::eval::Update;
+	type Update = EvalUpdate;
 
 	fn fold(&self, state: &mut Self::State, update: Self::Update) {
 		state.bytes = state
@@ -387,7 +402,7 @@ fn render_shell_live(state: &StreamState) -> Str {
 	Str::new(output)
 }
 
-fn render_hub_response(response: &crate::hub::Response) -> Option<Str> {
+fn render_hub_response(response: &HubResponse) -> Option<Str> {
 	let value = serde_json::from_str::<serde_json::Value>(&response.text).ok()?;
 	let object = value.as_object()?;
 	if let Some(peers) = object.get("peers").and_then(serde_json::Value::as_array) {
@@ -697,7 +712,7 @@ fn fault_view(name: &str, message: &str) -> Str {
 /// Physical wrapped-row budget for collapsed edit diff cards.
 const COLLAPSED_EDIT_DIFF_ROWS: u16 = omp_hashline::diff_preview::COLLAPSED_DIFF_ROWS;
 
-fn render_edit_live(update: Option<&crate::edit::EditUpdate>) -> Str {
+fn render_edit_live(update: Option<&EditUpdate>) -> Str {
 	let Some(update) = update else {
 		return live_view("edit", "preparing");
 	};
@@ -724,7 +739,7 @@ fn render_edit_live(update: Option<&crate::edit::EditUpdate>) -> Str {
 	Str::new(output)
 }
 
-fn render_edit_payload(payload: &crate::edit::Payload) -> Str {
+fn render_edit_payload(payload: &EditPayload) -> Str {
 	let (added, removed) = payload
 		.sections
 		.iter()
@@ -778,7 +793,7 @@ fn render_edit_payload(payload: &crate::edit::Payload) -> Str {
 	Str::new(output)
 }
 
-fn edit_fault(fault: &crate::edit::Fault) -> String {
+fn edit_fault(fault: &EditFault) -> String {
 	use crate::edit::RejectionReason;
 	let mut output = match &fault.reason {
 		RejectionReason::Conflict => String::from("edit conflict"),
@@ -797,7 +812,7 @@ fn edit_fault(fault: &crate::edit::Fault) -> String {
 	output
 }
 
-fn render_grep_payload(payload: &crate::grep::Payload) -> Str {
+fn render_grep_payload(payload: &GrepPayload) -> Str {
 	let matches = payload
 		.files
 		.iter()
@@ -826,7 +841,7 @@ fn render_grep_payload(payload: &crate::grep::Payload) -> Str {
 	Str::new(output)
 }
 
-fn render_glob_payload(payload: &crate::glob::Payload) -> Str {
+fn render_glob_payload(payload: &GlobPayload) -> Str {
 	let mut output = String::from("<col gap=0><row gap=1><text bold>glob</text><text>");
 	write!(output, "{} paths", payload.matches.len()).expect("writing to String cannot fail");
 	if payload.truncated {
@@ -850,16 +865,14 @@ fn render_glob_payload(payload: &crate::glob::Payload) -> Str {
 	Str::new(output)
 }
 
-fn shell_fault(fault: &crate::shell::Fault) -> String {
+fn shell_fault(fault: &ShellFault) -> String {
 	match fault {
-		crate::shell::Fault::Resource { operation, message } => format!("{operation}: {message}"),
-		crate::shell::Fault::PtyDenied => String::from("PTY allocation denied by invocation scope"),
-		crate::shell::Fault::InvalidEnvironmentKey { key } => {
+		ShellFault::Resource { operation, message } => format!("{operation}: {message}"),
+		ShellFault::PtyDenied => String::from("PTY allocation denied by invocation scope"),
+		ShellFault::InvalidEnvironmentKey { key } => {
 			format!("invalid shell environment key {key:?}")
 		},
-		crate::shell::Fault::AsyncNameRequired => {
-			String::from("async shell execution requires a name")
-		},
+		ShellFault::AsyncNameRequired => String::from("async shell execution requires a name"),
 	}
 }
 
@@ -877,7 +890,7 @@ fn render_shell_detached(job: &omp_tool::JobRef) -> Str {
 	Str::new(output)
 }
 
-fn render_shell_payload(payload: &crate::shell::Payload) -> Str {
+fn render_shell_payload(payload: &ShellPayload) -> Str {
 	const PREVIEW_LINES: usize = 20;
 	let retained = payload
 		.transcript
@@ -886,14 +899,11 @@ fn render_shell_payload(payload: &crate::shell::Payload) -> Str {
 		.sum::<usize>();
 	let outcome = debug_label(payload.status.outcome);
 	let color = match payload.status.outcome {
-		crate::shell::ExecOutcome::Exited if payload.status.exit_code.unwrap_or_default() == 0 => {
-			"success"
+		ExecOutcome::Exited if payload.status.exit_code.unwrap_or_default() == 0 => "success",
+		ExecOutcome::Timeout => "warning",
+		ExecOutcome::Exited | ExecOutcome::Failed | ExecOutcome::Cancelled | ExecOutcome::Denied => {
+			"error"
 		},
-		crate::shell::ExecOutcome::Timeout => "warning",
-		crate::shell::ExecOutcome::Exited
-		| crate::shell::ExecOutcome::Failed
-		| crate::shell::ExecOutcome::Cancelled
-		| crate::shell::ExecOutcome::Denied => "error",
 	};
 	let mut output = String::from("<box border=round pad=\"0 1\" bc=");
 	output.push_str(color);
@@ -967,10 +977,7 @@ fn render_shell_payload(payload: &crate::shell::Payload) -> Str {
 	Str::new(output)
 }
 
-fn bounded_transcript_tail(
-	transcript: &[crate::shell::TranscriptFrame],
-	retain_all: bool,
-) -> Vec<u8> {
+fn bounded_transcript_tail(transcript: &[TranscriptFrame], retain_all: bool) -> Vec<u8> {
 	const MAX_RENDER_BYTES: usize = 64 * 1024;
 	let total = transcript
 		.iter()
@@ -996,7 +1003,7 @@ fn bounded_transcript_tail(
 	output
 }
 
-fn render_write_payload(payload: &crate::write::Payload) -> Str {
+fn render_write_payload(payload: &WritePayload) -> Str {
 	let disposition = debug_label(payload.disposition);
 	let mut output = String::from("<row gap=1><text bold>write</text><text>");
 	push_text(&mut output, &disposition);
@@ -1014,16 +1021,16 @@ fn render_write_payload(payload: &crate::write::Payload) -> Str {
 	Str::new(output)
 }
 
-fn render_read_payload(payload: &crate::read::Payload) -> Str {
+fn render_read_payload(payload: &ReadPayload) -> Str {
 	let mut text_bytes = 0usize;
 	let mut blobs = 0usize;
 	let mut blob_bytes = 0u64;
 	for part in &payload.parts {
 		match part {
-			crate::read::PayloadPart::Text { text } => {
+			PayloadPart::Text { text } => {
 				text_bytes = text_bytes.saturating_add(text.len());
 			},
-			crate::read::PayloadPart::Blob { blob, .. } => {
+			PayloadPart::Blob { blob, .. } => {
 				blobs = blobs.saturating_add(1);
 				blob_bytes = blob_bytes.saturating_add(blob.byte_len);
 			},
@@ -1040,17 +1047,17 @@ fn render_read_payload(payload: &crate::read::Payload) -> Str {
 	Str::new(output)
 }
 
-fn eval_fault(fault: &crate::eval::Fault) -> String {
+fn eval_fault(fault: &EvalFault) -> String {
 	match fault {
-		crate::eval::Fault::InvalidTimeout => String::from("timeout must be non-negative and finite"),
-		crate::eval::Fault::Resource { operation, message } => {
+		EvalFault::InvalidTimeout => String::from("timeout must be non-negative and finite"),
+		EvalFault::Resource { operation, message } => {
 			format!("{operation}: {message}")
 		},
-		crate::eval::Fault::SessionLost { message } => message.to_string(),
+		EvalFault::SessionLost { message } => message.to_string(),
 	}
 }
 
-fn render_eval_payload(payload: &crate::eval::Payload) -> Str {
+fn render_eval_payload(payload: &EvalPayload) -> Str {
 	let mut status = debug_label(payload.status.outcome);
 	if let Some(code) = payload.status.exit_code {
 		write!(status, " · exit {code}").expect("writing to String cannot fail");
@@ -1091,7 +1098,7 @@ fn render_eval_payload(payload: &crate::eval::Payload) -> Str {
 	Str::new(output)
 }
 
-fn render_web_search_payload(payload: &crate::web_search::Payload) -> Str {
+fn render_web_search_payload(payload: &WebSearchPayload) -> Str {
 	let response = &payload.response;
 	let mut output = String::from("<col gap=0><row gap=1><text bold>web_search</text>");
 	if !response.engine.is_empty() {
@@ -1262,6 +1269,12 @@ mod tests {
 	};
 
 	use super::{BuiltinRendererIdentities, register_builtin_renderers};
+	use crate::{
+		edit::{EditUpdate, Fault as EditFault, Payload as EditPayload},
+		hub::{Fault as HubFault, Response as HubResponse},
+		read::{Fault as ReadFault, Payload as ReadPayload},
+		write::{Fault as WriteFault, Payload as WritePayload, WriteDisposition, WriteOperation},
+	};
 
 	fn identity(name: &str, revision: u16) -> ToolIdentity {
 		ToolIdentity { name: Str::new(name), rev: Rev { family: sf!("test"), n: revision } }
@@ -1339,7 +1352,7 @@ mod tests {
 	#[test]
 	fn edit_update_reduces_to_compact_state_then_settles() {
 		let (registry, identities) = registry(identities());
-		let update = crate::edit::EditUpdate {
+		let update = EditUpdate {
 			applied_ops:   2,
 			paths:         vec![sf!("src/lib.rs"), sf!("src/other.rs")],
 			preview:       sf!("+&lt;already-markup"),
@@ -1364,10 +1377,7 @@ mod tests {
 			 preview · 2 ops · +3 -1</text></row><diff max=40>+&amp;lt;already-markup</diff></col>",
 		);
 
-		let outcome =
-			CallOutcome::<crate::edit::Payload, crate::edit::Fault>::Ok(crate::edit::Payload {
-				sections: Vec::new(),
-			});
+		let outcome = CallOutcome::<EditPayload, EditFault>::Ok(EditPayload { sections: Vec::new() });
 		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");
 		assert_eq!(
 			registry
@@ -1384,10 +1394,8 @@ mod tests {
 		let (registry, identities) = registry(identities());
 		let hub = identities.hub.as_ref().expect("hub identity");
 		let mut state = ViewState::new();
-		let progress = crate::hub::Response {
-			text:    Str::from(r#"{"waitingMs":500,"jobs":[]}"#),
-			useless: true,
-		};
+		let progress =
+			HubResponse { text: Str::from(r#"{"waitingMs":500,"jobs":[]}"#), useless: true };
 		registry
 			.fold(
 				hub,
@@ -1401,15 +1409,14 @@ mod tests {
 		assert!(live.contains("<spinner>"));
 		assert!(live.contains("waiting 500 ms"));
 
-		let response = crate::hub::Response {
+		let response = HubResponse {
 			text:    Str::from(
 				r#"{"peers":[{"name":"Scout","status":"running","unreadCount":2,"parent":"Main"}]}"#,
 			),
 			useless: false,
 		};
-		let encoded =
-			serde_json::to_vec(&CallOutcome::<crate::hub::Response, crate::hub::Fault>::Ok(response))
-				.expect("outcome serializes");
+		let encoded = serde_json::to_vec(&CallOutcome::<HubResponse, HubFault>::Ok(response))
+			.expect("outcome serializes");
 		let roster = registry
 			.view(hub, &state, Some(&encoded))
 			.expect("roster renders");
@@ -1422,9 +1429,9 @@ mod tests {
 	fn typed_fault_renders_while_args_and_abort_use_generic_facts() {
 		let (registry, identities) = registry(identities());
 		let state = ViewState::new();
-		let fault = CallOutcome::<crate::read::Payload, crate::read::Fault>::Faulted(
-			crate::read::Fault::Source { message: sf!("missing <file> & owner") },
-		);
+		let fault = CallOutcome::<ReadPayload, ReadFault>::Faulted(ReadFault::Source {
+			message: sf!("missing <file> & owner"),
+		});
 		let encoded_fault = serde_json::to_vec(&fault).expect("fault serializes");
 		assert_eq!(
 			registry
@@ -1435,7 +1442,7 @@ mod tests {
 			 owner</text></row>",
 		);
 
-		let args = CallOutcome::<crate::read::Payload, crate::read::Fault>::ArgsRejected(ArgIssue {
+		let args = CallOutcome::<ReadPayload, ReadFault>::ArgsRejected(ArgIssue {
 			path:     Vec::new(),
 			expected: sf!("path"),
 			kind:     ArgIssueKind::Missing,
@@ -1451,10 +1458,9 @@ mod tests {
 			std::str::from_utf8(&encoded_args).expect("JSON is UTF-8"),
 		);
 
-		let abort =
-			CallOutcome::<crate::read::Payload, crate::read::Fault>::aborted(Abort::Interrupted {
-				reason: sf!("cancelled"),
-			});
+		let abort = CallOutcome::<ReadPayload, ReadFault>::aborted(Abort::Interrupted {
+			reason: sf!("cancelled"),
+		});
 		let encoded_abort = serde_json::to_vec(&abort).expect("abort serializes");
 		assert_eq!(
 			registry
@@ -1468,19 +1474,18 @@ mod tests {
 	#[test]
 	fn settled_output_is_deterministic_and_escapes_payload_text() {
 		let (registry, identities) = registry(identities());
-		let outcome =
-			CallOutcome::<crate::write::Payload, crate::write::Fault>::Ok(crate::write::Payload {
-				resolved_path:      sf!("/tmp/a<&.txt"),
-				display_path:       sf!("a<&.txt"),
-				canonical_recovery: None,
-				byte_len:           9,
-				reported_len:       9,
-				disposition:        crate::write::WriteDisposition::Created,
-				stripped_wrapper:   false,
-				made_executable:    true,
-				snapshot_tag:       Some(sf!("ABCD")),
-				operation:          crate::write::WriteOperation::Plain,
-			});
+		let outcome = CallOutcome::<WritePayload, WriteFault>::Ok(WritePayload {
+			resolved_path:      sf!("/tmp/a<&.txt"),
+			display_path:       sf!("a<&.txt"),
+			canonical_recovery: None,
+			byte_len:           9,
+			reported_len:       9,
+			disposition:        WriteDisposition::Created,
+			stripped_wrapper:   false,
+			made_executable:    true,
+			snapshot_tag:       Some(sf!("ABCD")),
+			operation:          WriteOperation::Plain,
+		});
 		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");
 		let state = ViewState::new();
 		let write_identity = identities

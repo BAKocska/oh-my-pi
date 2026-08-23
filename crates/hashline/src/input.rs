@@ -1,8 +1,8 @@
 //! Pure in-memory splitting and section-header recovery for authored patches.
 
 use std::{
-	collections::HashMap,
-	path::{Component, Path, PathBuf},
+	collections::{BTreeSet, HashMap},
+	path::{self, Component, Path, PathBuf},
 };
 
 use omp_core::{IntoStr, Str, StrMut, sf};
@@ -13,7 +13,8 @@ use crate::{
 	parser::parse_patch,
 	tokenizer::{Token, Tokenizer, is_read_metadata_line},
 	types::{
-		BlockMode, Diagnostic, DiagnosticCode, Edit, FileOp, ParseError, ParsedPatch, SplitOptions,
+		BlockMode, Cursor, Diagnostic, DiagnosticCode, Edit, FileOp, ParseError, ParsedPatch,
+		PasteTarget, SplitOptions,
 	},
 };
 
@@ -70,8 +71,8 @@ impl PatchSection {
 		Ok(self.parse()?.edits.iter().any(|edit| match edit {
 			Edit::Delete { .. } | Edit::Cut { .. } | Edit::Block { .. } => true,
 			Edit::Paste { at, .. } => match at {
-				crate::types::PasteTarget::Span { .. } => true,
-				crate::types::PasteTarget::Gap { cursor } => matches!(
+				PasteTarget::Span { .. } => true,
+				PasteTarget::Gap { cursor } => matches!(
 					cursor,
 					crate::types::Cursor::BeforeAnchor { .. } | crate::types::Cursor::AfterAnchor { .. }
 				),
@@ -85,23 +86,22 @@ impl PatchSection {
 
 	/// Collects all concrete anchor lines in ascending deduplicated order.
 	pub fn collect_anchor_lines(&self) -> Result<Vec<usize>, ParseError> {
-		let mut lines = std::collections::BTreeSet::new();
+		let mut lines = BTreeSet::new();
 		for edit in self.parse()?.edits {
 			match edit {
 				Edit::Delete { anchor, .. } | Edit::Block { anchor, .. } => {
 					lines.insert(anchor.line);
 				},
-				Edit::Cut { range, .. }
-				| Edit::Paste { at: crate::types::PasteTarget::Span { range }, .. } => {
+				Edit::Cut { range, .. } | Edit::Paste { at: PasteTarget::Span { range }, .. } => {
 					lines.extend(range.start.line..=range.end.line);
 				},
-				Edit::Paste { at: crate::types::PasteTarget::Gap { cursor }, .. }
-				| Edit::Insert { cursor, .. } => match cursor {
-					crate::types::Cursor::BeforeAnchor { anchor }
-					| crate::types::Cursor::AfterAnchor { anchor } => {
-						lines.insert(anchor.line);
-					},
-					crate::types::Cursor::Bof | crate::types::Cursor::Eof => {},
+				Edit::Paste { at: PasteTarget::Gap { cursor }, .. } | Edit::Insert { cursor, .. } => {
+					match cursor {
+						Cursor::BeforeAnchor { anchor } | Cursor::AfterAnchor { anchor } => {
+							lines.insert(anchor.line);
+						},
+						Cursor::Bof | Cursor::Eof => {},
+					}
 				},
 			}
 		}
@@ -404,9 +404,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 fn path_to_slashes(path: &Path) -> String {
-	path
-		.to_string_lossy()
-		.replace(std::path::MAIN_SEPARATOR, "/")
+	path.to_string_lossy().replace(path::MAIN_SEPARATOR, "/")
 }
 
 fn invalid_header(line_num: usize, message: impl IntoStr) -> ParseError {

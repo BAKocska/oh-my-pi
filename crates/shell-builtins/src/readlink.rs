@@ -4,7 +4,7 @@
 
 use std::{
 	ffi::OsString,
-	fs,
+	fs, io,
 	io::Write,
 	path::{Path, PathBuf},
 };
@@ -204,9 +204,9 @@ fn app() -> Command {
 }
 
 /// Writes a resolved path verbatim, followed by the selected delimiter.
-fn show(out: &mut impl Write, path: &Path, line_ending: Option<LineEnding>) -> std::io::Result<()> {
+fn show(out: &mut impl Write, path: &Path, line_ending: Option<LineEnding>) -> io::Result<()> {
 	let bytes = os_bytes(path.as_os_str())
-		.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
 	out.write_all(bytes)?;
 	if let Some(line_ending) = line_ending {
 		write!(out, "{line_ending}")?;
@@ -243,7 +243,10 @@ mod tests {
 	#[test]
 	fn resolves_relative_operand_against_host_cwd() {
 		let (_dir, root) = canonical_tempdir();
-		std::os::unix::fs::symlink("target-file", root.join("link")).unwrap();
+		{
+			use std::os::unix::fs;
+			fs::symlink("target-file", root.join("link")).unwrap();
+		}
 
 		let (code, stdout, stderr) = run_in(root, &["link"]);
 		assert_eq!(code, 0);
@@ -256,7 +259,10 @@ mod tests {
 	fn canonicalize_follows_symlink_to_absolute_path() {
 		let (_dir, root) = canonical_tempdir();
 		fs::write(root.join("target"), b"x").unwrap();
-		std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+		{
+			use std::os::unix::fs;
+			fs::symlink("target", root.join("link")).unwrap();
+		}
 
 		let (code, stdout, stderr) = run_in(root.clone(), &["-f", "link"]);
 		assert_eq!(code, 0);
@@ -304,8 +310,11 @@ mod tests {
 	#[test]
 	fn no_newline_with_multiple_args_warns_and_keeps_delimiter() {
 		let (_dir, root) = canonical_tempdir();
-		std::os::unix::fs::symlink("a", root.join("l1")).unwrap();
-		std::os::unix::fs::symlink("b", root.join("l2")).unwrap();
+		{
+			use std::os::unix::fs;
+			fs::symlink("a", root.join("l1")).unwrap();
+			fs::symlink("b", root.join("l2")).unwrap();
+		}
 
 		let (code, stdout, stderr) = run_in(root, &["-n", "l1", "l2"]);
 		assert_eq!(code, 0);
@@ -317,7 +326,10 @@ mod tests {
 	#[test]
 	fn zero_terminates_with_nul_and_no_newline_drops_delimiter() {
 		let (_dir, root) = canonical_tempdir();
-		std::os::unix::fs::symlink("a", root.join("l1")).unwrap();
+		{
+			use std::os::unix::fs;
+			fs::symlink("a", root.join("l1")).unwrap();
+		}
 
 		let (code, stdout, _) = run_in(root.clone(), &["-z", "l1"]);
 		assert_eq!((code, stdout.as_str()), (0, "a\0"));

@@ -6,6 +6,7 @@ use omp_core::{IntoStr, Str};
 use tokio_util::sync::CancellationToken;
 
 use self::git::{
+	commands::CommandError,
 	diff::{GitDiff, StatusCounts},
 	refs,
 	repo::{self, RepositoryError},
@@ -57,7 +58,7 @@ pub enum SnapshotError {
 	Ref(#[from] refs::RefError),
 	/// Status capture failed.
 	#[error(transparent)]
-	Command(#[from] git::commands::CommandError),
+	Command(#[from] CommandError),
 }
 
 /// Captures one complete immutable repository snapshot asynchronously.

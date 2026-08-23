@@ -1,6 +1,6 @@
 //! Active model-discovery probing over an injected HTTP boundary.
 
-use std::{collections::BTreeMap, future::Future, pin::Pin, time::Duration};
+use std::{collections::BTreeMap, future::Future, mem, pin::Pin, time::Duration};
 
 use bytes::Bytes;
 use omp_catalog::{
@@ -303,10 +303,10 @@ fn decode_json_rows(payload: &[u8]) -> Result<Vec<serde_json::Value>, ProbeError
 	let mut envelope: serde_json::Value =
 		serde_json::from_slice(payload).map_err(|_| ProbeError::Protocol)?;
 	if let Some(serde_json::Value::Array(rows)) = envelope.get_mut("data") {
-		return Ok(std::mem::take(rows));
+		return Ok(mem::take(rows));
 	}
 	if let Some(serde_json::Value::Array(rows)) = envelope.get_mut("models") {
-		return Ok(std::mem::take(rows));
+		return Ok(mem::take(rows));
 	}
 	Err(ProbeError::Protocol)
 }

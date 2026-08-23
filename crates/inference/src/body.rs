@@ -2,7 +2,9 @@
 
 use std::{
 	collections::VecDeque,
-	fmt,
+	error,
+	fmt::{self, Display},
+	future,
 	future::Future,
 	pin::Pin,
 	sync::{
@@ -306,7 +308,7 @@ pub struct NativeDeclarationError {
 	pub actual:   Replayability,
 }
 
-impl fmt::Display for NativeDeclarationError {
+impl Display for NativeDeclarationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(
 			formatter,
@@ -316,7 +318,7 @@ impl fmt::Display for NativeDeclarationError {
 	}
 }
 
-impl std::error::Error for NativeDeclarationError {}
+impl error::Error for NativeDeclarationError {}
 
 /// A native body coupled to its mandatory explicit replay declaration.
 #[derive(Clone, Debug)]
@@ -387,7 +389,7 @@ pub enum BodyOpenError {
 	Factory(Error),
 }
 
-impl fmt::Display for BodyOpenError {
+impl Display for BodyOpenError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::AttemptAlreadyOpened => {
@@ -405,8 +407,8 @@ impl fmt::Display for BodyOpenError {
 	}
 }
 
-impl std::error::Error for BodyOpenError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for BodyOpenError {
+	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		match self {
 			Self::Factory(error) => Some(error),
 			_ => None,
@@ -757,7 +759,7 @@ impl BodyAttempt {
 	async fn open_leaf(&self) -> Result<BodyReader, BodyOpenError> {
 		let (stream, one_shot) = match &self.source {
 			BodySource::Bytes(bytes) => {
-				let stream: ByteStream = Box::pin(stream::once(std::future::ready(Ok(bytes.clone()))));
+				let stream: ByteStream = Box::pin(stream::once(future::ready(Ok(bytes.clone()))));
 				(stream, None)
 			},
 			BodySource::Stored(stored) => (
@@ -893,7 +895,7 @@ pub fn aggregate_replay_evidence<'a>(
 
 /// Creates a convenient single-chunk stream for factories and one-shot callers.
 pub fn byte_stream(bytes: Bytes) -> ByteStream {
-	Box::pin(stream::once(std::future::ready(Ok(bytes))))
+	Box::pin(stream::once(future::ready(Ok(bytes))))
 }
 
 /// Creates a stream that never produces a frame until cancelled or dropped.

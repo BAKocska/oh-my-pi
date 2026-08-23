@@ -13,6 +13,8 @@ use std::{
 	path::Path,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use rustix::fs::RawDir;
 use rustix::fs::{AtFlags, CWD, Mode, OFlags};
 
 /// Selects whether descriptor-relative operations follow a final symlink.
@@ -95,7 +97,7 @@ impl DirFd {
 	fn read_dir_raw(&self) -> io::Result<Vec<OsString>> {
 		let duplicate = rustix::io::dup(&self.fd).map_err(io::Error::from)?;
 		let mut buffer = [MaybeUninit::<u8>::uninit(); 8192];
-		let mut directory = rustix::fs::RawDir::new(duplicate, &mut buffer);
+		let mut directory = RawDir::new(duplicate, &mut buffer);
 		let mut entries = Vec::new();
 		while let Some(entry) = directory.next() {
 			let entry = entry.map_err(io::Error::from)?;
@@ -187,13 +189,15 @@ fn set_errno_zero() {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use super::*;
 
 	#[test]
 	fn traverses_and_unlinks_temp_tree_by_descriptor() {
 		let root = tempfile::tempdir().unwrap();
-		std::fs::create_dir(root.path().join("child")).unwrap();
-		std::fs::write(root.path().join("child/file"), b"data").unwrap();
+		fs::create_dir(root.path().join("child")).unwrap();
+		fs::write(root.path().join("child/file"), b"data").unwrap();
 
 		let root_fd = DirFd::open(root.path(), SymlinkBehavior::NoFollow).unwrap();
 		assert_eq!(root_fd.read_dir().unwrap(), [OsString::from("child")]);

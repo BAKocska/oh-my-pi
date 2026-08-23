@@ -7,6 +7,7 @@
 use std::{
 	collections::{BTreeMap, HashSet},
 	fs::{self, File, FileTimes},
+	io,
 	io::{Read as _, Write},
 	path::{Path, PathBuf},
 	time::{Duration, SystemTime, UNIX_EPOCH},
@@ -157,7 +158,7 @@ pub enum DocumentCacheError {
 		path:   PathBuf,
 		/// Underlying filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A cache file has an invalid or unsupported envelope.
 	#[error("document cache entry is corrupt at {path}")]
@@ -197,7 +198,7 @@ impl DocumentCache {
 		let path = self.entry_path(key);
 		let mut file = match File::open(&path) {
 			Ok(file) => file,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
 			Err(source) => return Err(io_error(path, source)),
 		};
 		let metadata = file
@@ -279,7 +280,7 @@ impl DocumentCache {
 		let mut report = DocumentCacheGcReport::default();
 		let read_dir = match fs::read_dir(&self.root) {
 			Ok(entries) => entries,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
 			Err(source) => return Err(io_error(self.root.clone(), source)),
 		};
 		let mut entries = Vec::new();
@@ -289,7 +290,7 @@ impl DocumentCache {
 			let metadata = match entry.metadata() {
 				Ok(metadata) if metadata.is_file() => metadata,
 				Ok(_) => continue,
-				Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+				Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
 				Err(source) => return Err(io_error(path, source)),
 			};
 			let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
@@ -307,7 +308,7 @@ impl DocumentCache {
 			};
 			let mut file = match File::open(&path) {
 				Ok(file) => file,
-				Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+				Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
 				Err(source) => return Err(io_error(path, source)),
 			};
 			let mut header = [0_u8; HEADER_BYTES];
@@ -353,7 +354,7 @@ impl DocumentCache {
 					report.evicted += 1;
 					report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(entry.bytes);
 				},
-				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 				Err(source) => return Err(io_error(entry.path.clone(), source)),
 			}
 		}
@@ -443,7 +444,7 @@ fn unix_millis(time: SystemTime) -> Result<u64, DocumentCacheError> {
 	u64::try_from(duration.as_millis()).map_err(|_| DocumentCacheError::InvalidTimestamp)
 }
 
-fn io_error(path: PathBuf, source: std::io::Error) -> DocumentCacheError {
+fn io_error(path: PathBuf, source: io::Error) -> DocumentCacheError {
 	DocumentCacheError::Io { path, source }
 }
 

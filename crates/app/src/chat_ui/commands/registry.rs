@@ -1,11 +1,15 @@
 //! Immutable structural command router shared by every presentation surface.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, fmt, future::Future, pin::Pin, sync::Arc};
 
 use omp_core::{Str, sf};
 
 use super::{
-	CommandHost,
+	super::{
+		input::{expand_arguments_with_fallback, tokenize_args},
+		template::{TemplateArguments, compile, references_arguments, render_compiled},
+	},
+	CommandHandler, CommandHost,
 	result::{CommandResult, DispatchResult, PromptResult},
 };
 
@@ -101,13 +105,13 @@ pub struct ArgumentHint {
 #[derive(Clone)]
 pub enum CommandImplementation {
 	/// Structural handler whose generated wrapper parses the declared grammar.
-	Handler(super::CommandHandler),
+	Handler(CommandHandler),
 	/// Prompt template. `$ARGUMENTS` is replaced exactly once.
 	Prompt(Str),
 }
 
-impl std::fmt::Debug for CommandImplementation {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CommandImplementation {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Handler(_) => formatter.write_str("Handler(..)"),
 			Self::Prompt(template) => formatter.debug_tuple("Prompt").field(template).finish(),
@@ -450,20 +454,17 @@ impl CommandRoster {
 					handler(host, args, &declaration.provenance).await?
 				},
 				CommandImplementation::Prompt(template) => {
-					let words = super::super::input::tokenize_args(args)
-						.map_err(|error| miette::miette!("{error}"))?;
-					let compiled = super::super::template::compile(template)?;
-					let fallback = if super::super::template::references_arguments(&compiled) {
+					let words = tokenize_args(args).map_err(|error| miette::miette!("{error}"))?;
+					let compiled = compile(template)?;
+					let fallback = if references_arguments(&compiled) {
 						""
 					} else {
 						args
 					};
-					let rendered = super::super::template::render_compiled(
-						&compiled,
-						super::super::template::TemplateArguments { raw: args, words: &words },
-					)?;
+					let rendered =
+						render_compiled(&compiled, TemplateArguments { raw: args, words: &words })?;
 					CommandResult::Prompt(PromptResult {
-						text:       Str::from(super::super::input::expand_arguments_with_fallback(
+						text:       Str::from(expand_arguments_with_fallback(
 							rendered.as_str(),
 							&words,
 							fallback,

@@ -4,6 +4,10 @@ use jiff::{Zoned, fmt::strtime};
 
 use crate::{
 	ExecutionParameters, error, expansion, extensions,
+	parser::{
+		WordParseError,
+		prompt::{PromptDateFormat, PromptPiece, PromptTimeFormat, parse},
+	},
 	shell::Shell,
 	sys::{self, users},
 };
@@ -50,35 +54,33 @@ pub(crate) async fn expand_prompt(
 }
 
 #[omp_macros::cached(size = 64, result = true)]
-fn parse_prompt(
-	spec: String,
-) -> Result<Vec<crate::parser::prompt::PromptPiece>, crate::parser::WordParseError> {
-	crate::parser::prompt::parse(spec.as_str())
+fn parse_prompt(spec: String) -> Result<Vec<PromptPiece>, WordParseError> {
+	parse(spec.as_str())
 }
 
 fn format_prompt_piece(
 	shell: &Shell<impl extensions::ShellExtensions>,
-	piece: crate::parser::prompt::PromptPiece,
+	piece: PromptPiece,
 ) -> Result<String, error::Error> {
 	let formatted = match piece {
-		crate::parser::prompt::PromptPiece::EscapedSequence(s) => s,
-		crate::parser::prompt::PromptPiece::Literal(l) => l,
-		crate::parser::prompt::PromptPiece::AsciiCharacter(c) => {
+		PromptPiece::EscapedSequence(s) => s,
+		PromptPiece::Literal(l) => l,
+		PromptPiece::AsciiCharacter(c) => {
 			char::from_u32(c).map_or_else(String::new, |c| c.to_string())
 		},
-		crate::parser::prompt::PromptPiece::Backslash => "\\".to_owned(),
-		crate::parser::prompt::PromptPiece::BellCharacter => "\x07".to_owned(),
-		crate::parser::prompt::PromptPiece::CarriageReturn => "\r".to_owned(),
-		crate::parser::prompt::PromptPiece::CurrentCommandNumber => {
+		PromptPiece::Backslash => "\\".to_owned(),
+		PromptPiece::BellCharacter => "\x07".to_owned(),
+		PromptPiece::CarriageReturn => "\r".to_owned(),
+		PromptPiece::CurrentCommandNumber => {
 			return error::unimp("prompt: current command number");
 		},
-		crate::parser::prompt::PromptPiece::CurrentHistoryNumber => String::new(),
-		crate::parser::prompt::PromptPiece::CurrentUser => users::get_current_username()?,
-		crate::parser::prompt::PromptPiece::CurrentWorkingDirectory { tilde_replaced, basename } => {
+		PromptPiece::CurrentHistoryNumber => String::new(),
+		PromptPiece::CurrentUser => users::get_current_username()?,
+		PromptPiece::CurrentWorkingDirectory { tilde_replaced, basename } => {
 			format_current_working_directory(shell, tilde_replaced, basename)
 		},
-		crate::parser::prompt::PromptPiece::Date(format) => format_date(&Zoned::now(), &format),
-		crate::parser::prompt::PromptPiece::DollarOrPound => {
+		PromptPiece::Date(format) => format_date(&Zoned::now(), &format),
+		PromptPiece::DollarOrPound => {
 			if users::is_root() {
 				"#".to_owned()
 			} else {
@@ -90,15 +92,15 @@ fn format_prompt_piece(
 		// also has the important (compatible) side effect of ensuring the text on either
 		// side of it is not concatenated together, potentially resulting in incompatible
 		// variable expansions. Also, we *only* do this if the shell is interactive.
-		crate::parser::prompt::PromptPiece::EndNonPrintingSequence => {
+		PromptPiece::EndNonPrintingSequence => {
 			if shell.options().interactive {
 				"\x02".to_owned()
 			} else {
 				String::new()
 			}
 		},
-		crate::parser::prompt::PromptPiece::EscapeCharacter => "\x1b".to_owned(),
-		crate::parser::prompt::PromptPiece::Hostname { only_up_to_first_dot } => {
+		PromptPiece::EscapeCharacter => "\x1b".to_owned(),
+		PromptPiece::Hostname { only_up_to_first_dot } => {
 			let hn = sys::network::get_hostname()
 				.unwrap_or_default()
 				.to_string_lossy()
@@ -108,11 +110,9 @@ fn format_prompt_piece(
 			}
 			hn
 		},
-		crate::parser::prompt::PromptPiece::Newline => "\n".to_owned(),
-		crate::parser::prompt::PromptPiece::NumberOfManagedJobs => {
-			shell.jobs().jobs.len().to_string()
-		},
-		crate::parser::prompt::PromptPiece::ShellBaseName => {
+		PromptPiece::Newline => "\n".to_owned(),
+		PromptPiece::NumberOfManagedJobs => shell.jobs().jobs.len().to_string(),
+		PromptPiece::ShellBaseName => {
 			if let Some(shell_name) = shell.current_shell_name() {
 				Path::new(shell_name.as_ref())
 					.file_name()
@@ -122,26 +122,24 @@ fn format_prompt_piece(
 				String::new()
 			}
 		},
-		crate::parser::prompt::PromptPiece::ShellRelease => {
+		PromptPiece::ShellRelease => {
 			std::format!("{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}")
 		},
-		crate::parser::prompt::PromptPiece::ShellVersion => {
+		PromptPiece::ShellVersion => {
 			std::format!("{VERSION_MAJOR}.{VERSION_MINOR}")
 		},
 		// NOTE: See above note for EndNonPrintingSequence
-		crate::parser::prompt::PromptPiece::StartNonPrintingSequence => {
+		PromptPiece::StartNonPrintingSequence => {
 			if shell.options().interactive {
 				"\x01".to_owned()
 			} else {
 				String::new()
 			}
 		},
-		crate::parser::prompt::PromptPiece::TerminalDeviceBaseName => {
-			sys::terminal::try_get_terminal_device_path()
-				.and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
-				.unwrap_or_default()
-		},
-		crate::parser::prompt::PromptPiece::Time(time_fmt) => format_time(&Zoned::now(), &time_fmt),
+		PromptPiece::TerminalDeviceBaseName => sys::terminal::try_get_terminal_device_path()
+			.and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+			.unwrap_or_default(),
+		PromptPiece::Time(time_fmt) => format_time(&Zoned::now(), &time_fmt),
 	};
 
 	Ok(formatted)
@@ -169,23 +167,23 @@ fn format_current_working_directory(
 	working_dir_str
 }
 
-fn format_time(datetime: &Zoned, format: &crate::parser::prompt::PromptTimeFormat) -> String {
+fn format_time(datetime: &Zoned, format: &PromptTimeFormat) -> String {
 	let format = match format {
-		crate::parser::prompt::PromptTimeFormat::TwelveHourAM => "%I:%M %p",
-		crate::parser::prompt::PromptTimeFormat::TwelveHourHHMMSS => "%I:%M:%S",
-		crate::parser::prompt::PromptTimeFormat::TwentyFourHourHHMM => "%H:%M",
-		crate::parser::prompt::PromptTimeFormat::TwentyFourHourHHMMSS => "%H:%M:%S",
+		PromptTimeFormat::TwelveHourAM => "%I:%M %p",
+		PromptTimeFormat::TwelveHourHHMMSS => "%I:%M:%S",
+		PromptTimeFormat::TwentyFourHourHHMM => "%H:%M",
+		PromptTimeFormat::TwentyFourHourHHMMSS => "%H:%M:%S",
 	};
 
 	strtime::format(format, datetime).unwrap_or_default()
 }
 
-fn format_date(datetime: &Zoned, format: &crate::parser::prompt::PromptDateFormat) -> String {
+fn format_date(datetime: &Zoned, format: &PromptDateFormat) -> String {
 	match format {
-		crate::parser::prompt::PromptDateFormat::WeekdayMonthDate => {
+		PromptDateFormat::WeekdayMonthDate => {
 			strtime::format("%a %b %d", datetime).unwrap_or_default()
 		},
-		crate::parser::prompt::PromptDateFormat::Custom(format) => {
+		PromptDateFormat::Custom(format) => {
 			// Chrono's bare `%f` always emitted nine digits, while jiff trims
 			// trailing zeroes. Preserve the prompt escape's established output.
 			let chrono_compatible = format.replace("%f", "%9f");
@@ -196,6 +194,8 @@ fn format_date(datetime: &Zoned, format: &crate::parser::prompt::PromptDateForma
 
 #[cfg(test)]
 mod tests {
+	use jiff::tz::TimeZone;
+
 	use super::*;
 
 	#[test]
@@ -204,7 +204,7 @@ mod tests {
 		let dt = "2024-12-25T13:34:56.789Z"
 			.parse::<jiff::Timestamp>()
 			.unwrap()
-			.to_zoned(jiff::tz::TimeZone::UTC);
+			.to_zoned(TimeZone::UTC);
 
 		assert_eq!(
 			format_time(&dt, &crate::parser::prompt::PromptTimeFormat::TwelveHourAM),
@@ -228,7 +228,7 @@ mod tests {
 		let dt = "2024-12-25T12:34:56.789Z"
 			.parse::<jiff::Timestamp>()
 			.unwrap()
-			.to_zoned(jiff::tz::TimeZone::UTC);
+			.to_zoned(TimeZone::UTC);
 
 		assert_eq!(
 			format_date(&dt, &crate::parser::prompt::PromptDateFormat::WeekdayMonthDate),

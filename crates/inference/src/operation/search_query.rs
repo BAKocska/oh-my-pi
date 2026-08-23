@@ -1,5 +1,7 @@
 //! Google-style search query parsing and deterministic constraint lowering.
 
+use std::{iter, mem};
+
 use omp_core::Str;
 
 /// One free-text search term.
@@ -337,7 +339,7 @@ pub fn parse_date_value(value: &str) -> Option<Str> {
 		_ => return None,
 	};
 	if month > 12 && day <= 12 {
-		std::mem::swap(&mut month, &mut day);
+		mem::swap(&mut month, &mut day);
 	}
 	if !(1000..=9999).contains(&year) || !(1..=12).contains(&month) {
 		return None;
@@ -512,7 +514,7 @@ fn split_parens(value: &str) -> Vec<&str> {
 	if !value.is_empty() {
 		output.push(value);
 	}
-	output.extend(std::iter::repeat_n(")", trailing));
+	output.extend(iter::repeat_n(")", trailing));
 	output
 }
 
@@ -634,7 +636,7 @@ fn push_term(
 	group_sequence: &mut u32,
 	all_mode: Option<AllMode>,
 ) {
-	let negated = std::mem::take(negate_next);
+	let negated = mem::take(negate_next);
 	if let Some(mode) = all_mode {
 		push_constraint(query, mode.field(), text, negated);
 		return;

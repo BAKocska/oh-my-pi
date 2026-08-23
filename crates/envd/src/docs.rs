@@ -4,6 +4,7 @@ use std::{
 	collections::HashMap,
 	fmt,
 	future::Future,
+	mem,
 	path::Path,
 	pin::Pin,
 	sync::{
@@ -20,11 +21,19 @@ use omp_docserver::{
 	wire::{self, FrameConfig},
 };
 use omp_hashline::{Clipboard, NoopLoopGuard, SnapshotStore};
-use omp_proto::document::v1 as pb;
+use omp_proto::document::v1::{
+	self as pb, client_frame, commit_transaction_response, document_target, server_frame,
+};
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+	io,
+	io::{AsyncRead, AsyncWrite},
+	net::UnixStream,
+};
 use tokio_util::sync::CancellationToken;
+
+use super::{ssh::SshService, vault::VaultService};
 /// Editor-client document authority installed for an ACP session.
 ///
 /// The boxed futures are confined to this cold dynamic RPC boundary; ordinary
@@ -234,9 +243,9 @@ impl Drop for WorkspaceLease {
 		}
 		let _ = self.host.writer.try_send(pb::ClientFrame {
 			request_id,
-			body: Some(pb::client_frame::Body::ReleaseWorkspaceLease(
-				pb::ReleaseWorkspaceLeaseRequest { workspace_lease_id: self.lease_id.clone() },
-			)),
+			body: Some(client_frame::Body::ReleaseWorkspaceLease(pb::ReleaseWorkspaceLeaseRequest {
+				workspace_lease_id: self.lease_id.clone(),
+			})),
 		});
 	}
 }
@@ -253,7 +262,7 @@ impl Drop for DocumentLease {
 		}
 		let _ = self.host.writer.try_send(pb::ClientFrame {
 			request_id,
-			body: Some(pb::client_frame::Body::CloseDocument(pb::CloseDocumentRequest {
+			body: Some(client_frame::Body::CloseDocument(pb::CloseDocumentRequest {
 				lease_id: self.lease_id.clone(),
 			})),
 		});
@@ -305,11 +314,11 @@ struct Inner {
 	noop_loop_guard:          Mutex<NoopLoopGuard>,
 }
 
-/// Concrete env-side owner of one multiplexed `document/v1` client connection.
+/// App-owned SSH and vault authorities used by document resource writes.
 #[derive(Clone, Debug)]
 pub(super) struct ResourceMutationServices {
-	pub(super) ssh:   super::ssh::SshService,
-	pub(super) vault: super::vault::VaultService,
+	pub(super) ssh:   SshService,
+	pub(super) vault: VaultService,
 }
 
 #[derive(Clone, Debug)]
@@ -354,13 +363,13 @@ impl DocumentHost {
 		S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	{
 		let config = FrameConfig::default();
-		let (mut reader, mut writer) = tokio::io::split(stream);
+		let (mut reader, mut writer) = io::split(stream);
 		let mut write_scratch = BytesMut::new();
 		wire::write_client_frame(
 			&mut writer,
 			&pb::ClientFrame {
 				request_id: 0,
-				body:       Some(pb::client_frame::Body::Hello(pb::ClientHello {
+				body:       Some(client_frame::Body::Hello(pb::ClientHello {
 					protocol_major: PROTOCOL_MAJOR,
 					protocol_minor: PROTOCOL_MINOR,
 					client_id:      Bytes::new(),
@@ -376,8 +385,8 @@ impl DocumentHost {
 			.await?
 			.ok_or(DocumentError::Disconnected)?;
 		let hello = match hello_frame.body {
-			Some(pb::server_frame::Body::Hello(hello)) if hello_frame.request_id == 0 => hello,
-			Some(pb::server_frame::Body::Error(error)) => {
+			Some(server_frame::Body::Hello(hello)) if hello_frame.request_id == 0 => hello,
+			Some(server_frame::Body::Error(error)) => {
 				return Err(DocumentError::Protocol {
 					code:    error.code,
 					message: Str::from(error.message),
@@ -475,12 +484,12 @@ impl DocumentHost {
 				}
 			}
 			reader_shutdown.cancel();
-			let waiters = std::mem::take(&mut *reader_pending.lock());
+			let waiters = mem::take(&mut *reader_pending.lock());
 			for (request_id, waiter) in waiters {
 				let _ = waiter.send(disconnected_frame(request_id));
 			}
 			let closed = closed_stream_error(pb::EventStreamKind::Document);
-			let document_events = std::mem::take(&mut *reader_document_events.lock());
+			let document_events = mem::take(&mut *reader_document_events.lock());
 			for (_, sender) in document_events.into_values() {
 				let _ = sender.send(Err(closed.clone()));
 			}
@@ -494,7 +503,7 @@ impl DocumentHost {
 	#[cfg(unix)]
 	pub async fn connect_uds(path: impl AsRef<Path>) -> Result<Self, DocumentError> {
 		Self::connect(
-			tokio::net::UnixStream::connect(path)
+			UnixStream::connect(path)
 				.await
 				.map_err(wire::WireError::from)?,
 		)
@@ -561,9 +570,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<(DocumentLease, pb::OpenDocumentResponse), DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::OpenDocument(request), cancel)
+			.request(client_frame::Body::OpenDocument(request), cancel)
 			.await?;
-		let pb::server_frame::Body::DocumentOpened(opened) = body else {
+		let server_frame::Body::DocumentOpened(opened) = body else {
 			return Err(unexpected("OpenDocumentResponse"));
 		};
 		let head = opened
@@ -648,9 +657,9 @@ impl DocumentHost {
 			return Err(unexpected("ReadDocumentRequest.selection"));
 		}
 		let body = self
-			.request(pb::client_frame::Body::ReadDocument(request), cancel)
+			.request(client_frame::Body::ReadDocument(request), cancel)
 			.await?;
-		let pb::server_frame::Body::DocumentRead(response) = body else {
+		let server_frame::Body::DocumentRead(response) = body else {
 			return Err(unexpected("ReadDocumentResponse"));
 		};
 		ensure_pinned_head(response.head.as_ref(), lease)?;
@@ -690,9 +699,9 @@ impl DocumentHost {
 			return Err(unexpected("SummarizeDocumentRequest.options"));
 		}
 		let body = self
-			.request(pb::client_frame::Body::SummarizeDocument(request), cancel)
+			.request(client_frame::Body::SummarizeDocument(request), cancel)
 			.await?;
-		let pb::server_frame::Body::DocumentSummarized(response) = body else {
+		let server_frame::Body::DocumentSummarized(response) = body else {
 			return Err(unexpected("SummarizeDocumentResponse"));
 		};
 		ensure_pinned_head(response.head.as_ref(), lease)?;
@@ -715,7 +724,7 @@ impl DocumentHost {
 		mutation.base_revision = Some(lease.revision()?);
 		let body = self
 			.request(
-				pb::client_frame::Body::CommitTransaction(pb::CommitTransactionRequest {
+				client_frame::Body::CommitTransaction(pb::CommitTransactionRequest {
 					transaction_id,
 					operations: vec![pb::DocumentMutation {
 						document:  Some(lease_target(lease)),
@@ -725,12 +734,10 @@ impl DocumentHost {
 				cancel,
 			)
 			.await?;
-		let pb::server_frame::Body::TransactionResult(response) = body else {
+		let server_frame::Body::TransactionResult(response) = body else {
 			return Err(unexpected("CommitTransactionResponse"));
 		};
-		if let Some(pb::commit_transaction_response::Outcome::Committed(committed)) =
-			&response.outcome
-		{
+		if let Some(commit_transaction_response::Outcome::Committed(committed)) = &response.outcome {
 			let Some(head) = (committed.operations.len() == 1)
 				.then(|| committed.operations[0].head.clone())
 				.flatten()
@@ -769,9 +776,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::CommitTransactionResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::CommitTransaction(request), cancel)
+			.request(client_frame::Body::CommitTransaction(request), cancel)
 			.await?;
-		let pb::server_frame::Body::TransactionResult(response) = body else {
+		let server_frame::Body::TransactionResult(response) = body else {
 			return Err(unexpected("CommitTransactionResponse"));
 		};
 		Ok(response)
@@ -784,9 +791,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::CanonicalizePathResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::CanonicalizePath(request), cancel)
+			.request(client_frame::Body::CanonicalizePath(request), cancel)
 			.await?;
-		let pb::server_frame::Body::PathCanonicalized(response) = body else {
+		let server_frame::Body::PathCanonicalized(response) = body else {
 			return Err(unexpected("CanonicalizePathResponse"));
 		};
 		Ok(response)
@@ -799,9 +806,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::StatPathResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::StatPath(request), cancel)
+			.request(client_frame::Body::StatPath(request), cancel)
 			.await?;
-		let pb::server_frame::Body::PathStat(response) = body else {
+		let server_frame::Body::PathStat(response) = body else {
 			return Err(unexpected("StatPathResponse"));
 		};
 		Ok(response)
@@ -814,9 +821,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::ListDirectoryResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::ListDirectory(request), cancel)
+			.request(client_frame::Body::ListDirectory(request), cancel)
 			.await?;
-		let pb::server_frame::Body::DirectoryListed(response) = body else {
+		let server_frame::Body::DirectoryListed(response) = body else {
 			return Err(unexpected("ListDirectoryResponse"));
 		};
 		Ok(response)
@@ -829,9 +836,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::CreateDirectoryResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::CreateDirectory(request), cancel)
+			.request(client_frame::Body::CreateDirectory(request), cancel)
 			.await?;
-		let pb::server_frame::Body::DirectoryCreated(response) = body else {
+		let server_frame::Body::DirectoryCreated(response) = body else {
 			return Err(unexpected("CreateDirectoryResponse"));
 		};
 		Ok(response)
@@ -844,9 +851,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::RemovePathResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::RemovePath(request), cancel)
+			.request(client_frame::Body::RemovePath(request), cancel)
 			.await?;
-		let pb::server_frame::Body::PathRemoved(response) = body else {
+		let server_frame::Body::PathRemoved(response) = body else {
 			return Err(unexpected("RemovePathResponse"));
 		};
 		Ok(response)
@@ -859,9 +866,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::RenamePathResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::RenamePath(request), cancel)
+			.request(client_frame::Body::RenamePath(request), cancel)
 			.await?;
-		let pb::server_frame::Body::PathRenamed(response) = body else {
+		let server_frame::Body::PathRenamed(response) = body else {
 			return Err(unexpected("RenamePathResponse"));
 		};
 		Ok(response)
@@ -874,9 +881,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::CopyPathResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::CopyPath(request), cancel)
+			.request(client_frame::Body::CopyPath(request), cancel)
 			.await?;
-		let pb::server_frame::Body::PathCopied(response) = body else {
+		let server_frame::Body::PathCopied(response) = body else {
 			return Err(unexpected("CopyPathResponse"));
 		};
 		Ok(response)
@@ -889,9 +896,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::ReadLinkResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::ReadLink(request), cancel)
+			.request(client_frame::Body::ReadLink(request), cancel)
 			.await?;
-		let pb::server_frame::Body::LinkRead(response) = body else {
+		let server_frame::Body::LinkRead(response) = body else {
 			return Err(unexpected("ReadLinkResponse"));
 		};
 		Ok(response)
@@ -904,9 +911,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::CreateSymlinkResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::CreateSymlink(request), cancel)
+			.request(client_frame::Body::CreateSymlink(request), cancel)
 			.await?;
-		let pb::server_frame::Body::SymlinkCreated(response) = body else {
+		let server_frame::Body::SymlinkCreated(response) = body else {
 			return Err(unexpected("CreateSymlinkResponse"));
 		};
 		Ok(response)
@@ -919,9 +926,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::CreateHardLinkResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::CreateHardLink(request), cancel)
+			.request(client_frame::Body::CreateHardLink(request), cancel)
 			.await?;
-		let pb::server_frame::Body::HardLinkCreated(response) = body else {
+		let server_frame::Body::HardLinkCreated(response) = body else {
 			return Err(unexpected("CreateHardLinkResponse"));
 		};
 		Ok(response)
@@ -934,9 +941,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::SetPermissionsResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::SetPermissions(request), cancel)
+			.request(client_frame::Body::SetPermissions(request), cancel)
 			.await?;
-		let pb::server_frame::Body::PermissionsSet(response) = body else {
+		let server_frame::Body::PermissionsSet(response) = body else {
 			return Err(unexpected("SetPermissionsResponse"));
 		};
 		Ok(response)
@@ -950,9 +957,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<(pb::DapSessionResponse, Vec<DapRegistryEvent>), DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::DapLaunch(request), cancel)
+			.request(client_frame::Body::DapLaunch(request), cancel)
 			.await?;
-		let pb::server_frame::Body::DapSession(response) = body else {
+		let server_frame::Body::DapSession(response) = body else {
 			return Err(unexpected("DAP session response"));
 		};
 		let events = self.take_dap_events(response.session.as_ref())?;
@@ -967,9 +974,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<(pb::DapSessionResponse, Vec<DapRegistryEvent>), DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::DapAttach(request), cancel)
+			.request(client_frame::Body::DapAttach(request), cancel)
 			.await?;
-		let pb::server_frame::Body::DapSession(response) = body else {
+		let server_frame::Body::DapSession(response) = body else {
 			return Err(unexpected("DAP session response"));
 		};
 		let events = self.take_dap_events(response.session.as_ref())?;
@@ -984,9 +991,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<(pb::DapActionResponse, Vec<DapRegistryEvent>), DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::DapAction(request), cancel)
+			.request(client_frame::Body::DapAction(request), cancel)
 			.await?;
-		let pb::server_frame::Body::DapAction(response) = body else {
+		let server_frame::Body::DapAction(response) = body else {
 			return Err(unexpected("DAP action response"));
 		};
 		let events = self.take_dap_events(response.session.as_ref())?;
@@ -1016,9 +1023,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::GetLspBindingsResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::GetLspBindings(request), cancel)
+			.request(client_frame::Body::GetLspBindings(request), cancel)
 			.await?;
-		let pb::server_frame::Body::LspBindings(response) = body else {
+		let server_frame::Body::LspBindings(response) = body else {
 			return Err(unexpected("GetLspBindingsResponse"));
 		};
 		Ok(response)
@@ -1031,9 +1038,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::LspResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::LspRequest(request), cancel)
+			.request(client_frame::Body::LspRequest(request), cancel)
 			.await?;
-		let pb::server_frame::Body::LspResponse(response) = body else {
+		let server_frame::Body::LspResponse(response) = body else {
 			return Err(unexpected("LspResponse"));
 		};
 		Ok(response)
@@ -1046,9 +1053,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<pb::LspNotificationResponse, DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::LspNotification(request), cancel)
+			.request(client_frame::Body::LspNotification(request), cancel)
 			.await?;
-		let pb::server_frame::Body::LspNotificationAccepted(response) = body else {
+		let server_frame::Body::LspNotificationAccepted(response) = body else {
 			return Err(unexpected("LspNotificationResponse"));
 		};
 		Ok(response)
@@ -1061,9 +1068,9 @@ impl DocumentHost {
 		cancel: &CancellationToken,
 	) -> Result<(Option<WorkspaceLease>, pb::AcquireWorkspaceLeaseResponse), DocumentError> {
 		let body = self
-			.request(pb::client_frame::Body::AcquireWorkspaceLease(request), cancel)
+			.request(client_frame::Body::AcquireWorkspaceLease(request), cancel)
 			.await?;
-		let pb::server_frame::Body::WorkspaceLeaseAcquired(response) = body else {
+		let server_frame::Body::WorkspaceLeaseAcquired(response) = body else {
 			return Err(unexpected("AcquireWorkspaceLeaseResponse"));
 		};
 		if response
@@ -1095,13 +1102,13 @@ impl DocumentHost {
 		}
 		let body = self
 			.request(
-				pb::client_frame::Body::ReleaseWorkspaceLease(pb::ReleaseWorkspaceLeaseRequest {
+				client_frame::Body::ReleaseWorkspaceLease(pb::ReleaseWorkspaceLeaseRequest {
 					workspace_lease_id: lease.lease_id.clone(),
 				}),
 				cancel,
 			)
 			.await?;
-		let pb::server_frame::Body::WorkspaceLeaseReleased(response) = body else {
+		let server_frame::Body::WorkspaceLeaseReleased(response) = body else {
 			return Err(unexpected("ReleaseWorkspaceLeaseResponse"));
 		};
 		lease.released = true;
@@ -1131,10 +1138,10 @@ impl DocumentHost {
 			return Err(unexpected("connection-owned CloseDocumentRequest.lease_id"));
 		}
 		let body = self
-			.request(pb::client_frame::Body::CloseDocument(request), cancel)
+			.request(client_frame::Body::CloseDocument(request), cancel)
 			.await?;
 		match body {
-			pb::server_frame::Body::DocumentClosed(response) => {
+			server_frame::Body::DocumentClosed(response) => {
 				lease.released = true;
 				Ok(response)
 			},
@@ -1151,7 +1158,7 @@ impl DocumentHost {
 		self.ensure_owned(lease)?;
 		let lease_target = matches!(
 			target.and_then(|target| target.target.as_ref()),
-			Some(pb::document_target::Target::LeaseId(id)) if id == lease.id()
+			Some(omp_proto::document::v1::document_target::Target::LeaseId(id)) if id == lease.id()
 		);
 		if !lease_target || revision != lease.head.revision.as_ref() {
 			return Err(unexpected("connection-owned lease and pinned revision"));
@@ -1171,9 +1178,9 @@ impl DocumentHost {
 
 	async fn request(
 		&self,
-		body: pb::client_frame::Body,
+		body: client_frame::Body,
 		cancel: &CancellationToken,
-	) -> Result<pb::server_frame::Body, DocumentError> {
+	) -> Result<server_frame::Body, DocumentError> {
 		if self.inner.shutdown.is_cancelled() {
 			return Err(DocumentError::Disconnected);
 		}
@@ -1197,7 +1204,7 @@ impl DocumentHost {
 		};
 		pending.armed = false;
 		match frame.body {
-			Some(pb::server_frame::Body::Error(error)) => {
+			Some(server_frame::Body::Error(error)) => {
 				Err(DocumentError::Protocol { code: error.code, message: Str::from(error.message) })
 			},
 			Some(body) => Ok(body),
@@ -1226,7 +1233,7 @@ impl Drop for PendingRequest {
 		}
 		let _ = self.inner.writer.try_send(pb::ClientFrame {
 			request_id: 0,
-			body:       Some(pb::client_frame::Body::Cancel(pb::CancelRequest {
+			body:       Some(client_frame::Body::Cancel(pb::CancelRequest {
 				target_request_id: self.request_id,
 			})),
 		});
@@ -1248,10 +1255,10 @@ fn ensure_pinned_head(
 }
 
 pub(crate) fn lease_target(lease: &DocumentLease) -> pb::DocumentTarget {
-	pb::DocumentTarget { target: Some(pb::document_target::Target::LeaseId(lease.lease_id.clone())) }
+	pb::DocumentTarget { target: Some(document_target::Target::LeaseId(lease.lease_id.clone())) }
 }
 fn dispatch_event_frame(
-	body: pb::server_frame::Body,
+	body: server_frame::Body,
 	document_events: &Mutex<DocumentEventSubscribers>,
 	pending_document_events: &Mutex<PendingDocumentEvents>,
 	document_event_sequences: &Mutex<HashMap<Bytes, u64>>,
@@ -1259,7 +1266,7 @@ fn dispatch_event_frame(
 	lsp_events: &flume::Sender<Result<LspRegistryEvent, EventStreamError>>,
 ) {
 	match body {
-		pb::server_frame::Body::DocumentEvent(event) => {
+		server_frame::Body::DocumentEvent(event) => {
 			let Some(document_id) = event
 				.head
 				.as_ref()
@@ -1295,7 +1302,7 @@ fn dispatch_event_frame(
 					.push(Ok(event));
 			}
 		},
-		pb::server_frame::Body::DapOutput(output) => {
+		server_frame::Body::DapOutput(output) => {
 			if let Some(session) = output
 				.session
 				.as_ref()
@@ -1308,7 +1315,7 @@ fn dispatch_event_frame(
 					.push(DapRegistryEvent::Output(output));
 			}
 		},
-		pb::server_frame::Body::DapEvent(event) => {
+		server_frame::Body::DapEvent(event) => {
 			if let Some(session) = event
 				.session
 				.as_ref()
@@ -1321,13 +1328,13 @@ fn dispatch_event_frame(
 					.push(DapRegistryEvent::Event(event));
 			}
 		},
-		pb::server_frame::Body::LspEvent(event) => {
+		server_frame::Body::LspEvent(event) => {
 			let _ = lsp_events.send(Ok(LspRegistryEvent::Event(event)));
 		},
-		pb::server_frame::Body::LspBindingEvent(event) => {
+		server_frame::Body::LspBindingEvent(event) => {
 			let _ = lsp_events.send(Ok(LspRegistryEvent::Binding(event)));
 		},
-		pb::server_frame::Body::EventStreamError(error) => {
+		server_frame::Body::EventStreamError(error) => {
 			let terminal = EventStreamError {
 				stream:         pb::EventStreamKind::try_from(error.stream)
 					.unwrap_or(pb::EventStreamKind::Unspecified),
@@ -1374,7 +1381,7 @@ fn unexpected(expected: &'static str) -> DocumentError {
 fn disconnected_frame(request_id: u64) -> pb::ServerFrame {
 	pb::ServerFrame {
 		request_id,
-		body: Some(pb::server_frame::Body::Error(pb::ProtocolError {
+		body: Some(server_frame::Body::Error(pb::ProtocolError {
 			code:    pb::ProtocolErrorCode::Internal.into(),
 			message: "document-server connection closed".to_owned(),
 		})),

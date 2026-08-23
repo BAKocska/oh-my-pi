@@ -1,11 +1,15 @@
 //! Canonical web-search tool over an application-owned inference backend.
 
-use std::{fmt, sync::Arc};
+use std::{
+	error,
+	fmt::{self, Display},
+	sync::Arc,
+};
 
 use async_stream::stream;
 use futures::Stream;
 use omp_core::{Str, sf};
-use omp_proto::inference::v1 as pb;
+use omp_proto::inference::v1::{self as pb, search_request};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, ExecEffects,
 	IncomingParams, InferenceEffects, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
@@ -89,7 +93,7 @@ pub enum Fault {
 	},
 }
 
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Search { code, message } => {
@@ -99,7 +103,7 @@ impl fmt::Display for Fault {
 	}
 }
 
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// Application-owned canonical search execution boundary.
 ///
@@ -207,10 +211,10 @@ fn into_request(params: Params) -> pb::SearchRequest {
 		query: params.query.to_string(),
 		limit: params.limit.unwrap_or(0),
 		recency: params.recency.map_or(0, |recency| match recency {
-			Recency::Day => pb::search_request::Recency::Day as i32,
-			Recency::Week => pb::search_request::Recency::Week as i32,
-			Recency::Month => pb::search_request::Recency::Month as i32,
-			Recency::Year => pb::search_request::Recency::Year as i32,
+			Recency::Day => search_request::Recency::Day as i32,
+			Recency::Week => search_request::Recency::Week as i32,
+			Recency::Month => search_request::Recency::Month as i32,
+			Recency::Year => search_request::Recency::Year as i32,
 		}),
 		engine: params
 			.provider

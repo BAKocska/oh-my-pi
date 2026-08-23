@@ -6,17 +6,22 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::Instant,
+	time,
+	time::{Duration, Instant},
 };
 
+use flume::Receiver;
 use omp_agent::JournalCustomEntry;
 use omp_core::{CowBytes, InvocationPhase, LifecyclePhase, SparseMap, Str, sf};
-use omp_proto::toolhost::v1::{
-	CampaignHostEnvelope, CampaignReact, CampaignReaction, CampaignWorkerEnvelope,
-	Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId, HookHostEnvelope,
-	LifecycleEventContext, RetryLifecycleEventV1, TodoReminderEventV1, TtsrTriggeredEventV1,
-	WorkerFrame, campaign_host_envelope, campaign_worker_envelope, hook_host_envelope,
-	lifecycle_worker_envelope, ui_worker_envelope, worker_frame,
+use omp_proto::toolhost::{
+	v1,
+	v1::{
+		CampaignHostEnvelope, CampaignReact, CampaignReaction, CampaignWorkerEnvelope,
+		Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId, HookHostEnvelope,
+		LifecycleEventContext, RetryLifecycleEventV1, TodoReminderEventV1, TtsrTriggeredEventV1,
+		WorkerFrame, campaign_host_envelope, campaign_worker_envelope, hook_host_envelope,
+		lifecycle_worker_envelope, ui_worker_envelope, worker_frame,
+	},
 };
 use parking_lot::{Mutex, RwLock};
 use prost::Message;
@@ -133,7 +138,7 @@ impl NestedCallbackDispatcher {
 		operation: &'static str,
 		arguments: serde_json::Map<String, serde_json::Value>,
 		policy: CallbackConcurrency,
-		timeout: std::time::Duration,
+		timeout: Duration,
 		event: Option<Str>,
 		device: Option<Str>,
 	) -> Result<serde_json::Value, ControlProtocolError> {
@@ -256,7 +261,7 @@ impl LifecycleEvent {
 				event_id: self.id as i32,
 				event_rev: self.revision,
 				dispatch_id,
-				phase: omp_proto::toolhost::v1::HookPhase::Observe as i32,
+				phase: v1::HookPhase::Observe as i32,
 				payload: self.payload.clone().into_bytes(),
 				deadline_ms,
 				subscription_ids: Vec::new(),
@@ -431,7 +436,7 @@ pub struct DispatchRequest {
 }
 
 /// Submission-latency deadline shared by extension campaign callbacks.
-pub const CAMPAIGN_SUBMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const CAMPAIGN_SUBMISSION_TIMEOUT: Duration = time::Duration::from_secs(30);
 
 /// One revisioned campaign callback routed through the ordinary actor.
 #[derive(Clone, Debug)]
@@ -488,15 +493,16 @@ pub fn decode_campaign_reaction(payload: &[u8]) -> Result<CampaignReaction, Camp
 
 /// Correlated completion receiver returned to the caller.
 pub struct DispatchPending {
-	response: flume::Receiver<Result<CowBytes<'static>, DispatchError>>,
+	response: Receiver<Result<CowBytes<'static>, DispatchError>>,
 	deadline: EventDeadline,
 }
 
 impl DispatchPending {
 	/// Waits for the terminal worker response.
 	pub async fn response(self) -> Result<CowBytes<'static>, DispatchError> {
-		let deadline = tokio::time::Instant::from_std(self.deadline.at);
-		tokio::time::timeout_at(deadline, self.response.recv_async())
+		use tokio::time::{self, Instant};
+		let deadline = Instant::from_std(self.deadline.at);
+		time::timeout_at(deadline, self.response.recv_async())
 			.await
 			.map_err(|_| DispatchError::Deadline)?
 			.map_err(|_| DispatchError::HostGone)?

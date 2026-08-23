@@ -38,10 +38,13 @@
 //! passes both.
 
 use std::{
-	fmt,
+	any, error,
+	fmt::{self, Display},
 	future::poll_fn,
 	marker::PhantomData,
+	mem,
 	ops::{Deref, Range},
+	slice,
 	sync::Arc,
 	task::{Poll, Waker},
 };
@@ -53,8 +56,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
-	Number, Object, ParseError, Value, parse,
-	parser::{MAX_DEPTH, Mode, Parser, RepairLog, RepairPathSegment},
+	Deserializer, Number, Object, ParseError, Value, from_str, parse,
+	parser::{Atom, MAX_DEPTH, Mode, Parser, RepairLog, RepairPathSegment},
 };
 
 /// Failure while awaiting an incoming JSON value.
@@ -83,13 +86,13 @@ pub struct PullIssue {
 	pub kind:     PullIssueKind,
 }
 
-impl fmt::Display for PullIssue {
+impl Display for PullIssue {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "invalid JSON pull {:?}: expected {} ({})", self.path, self.expected, self.kind)
 	}
 }
 
-impl std::error::Error for PullIssue {}
+impl error::Error for PullIssue {}
 
 /// Location component in a pulled JSON path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +111,7 @@ pub enum PullPathSegment {
 impl PullPathSegment {
 	fn key_names(&self) -> Option<&[Str]> {
 		match self {
-			Self::Key(key) => Some(std::slice::from_ref(key)),
+			Self::Key(key) => Some(slice::from_ref(key)),
 			Self::Keys(keys) => Some(keys),
 			Self::Index(_) => None,
 		}
@@ -133,7 +136,7 @@ pub enum PullIssueKind {
 	},
 }
 
-impl fmt::Display for PullIssueKind {
+impl Display for PullIssueKind {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Missing => f.write_str("missing"),
@@ -205,7 +208,7 @@ impl IncomingFeed {
 			return Err(FeedClosed);
 		}
 		state.text.push_str(fragment);
-		let wakers = std::mem::take(&mut state.wakers);
+		let wakers = mem::take(&mut state.wakers);
 		drop(state);
 		wake_all(wakers);
 		Ok(())
@@ -228,7 +231,7 @@ impl IncomingFeed {
 		self.closed = true;
 		let mut state = self.shared.state.lock();
 		state.end = end;
-		let wakers = std::mem::take(&mut state.wakers);
+		let wakers = mem::take(&mut state.wakers);
 		drop(state);
 		wake_all(wakers);
 	}
@@ -280,7 +283,7 @@ impl IncomingDoc {
 	pub async fn whole<T: DeserializeOwned>(&mut self) -> Result<T, IncomingError> {
 		self.finished().await?;
 		let mut state = self.shared.state.lock();
-		let mut deserializer = crate::Deserializer::new(&state.text);
+		let mut deserializer = Deserializer::new(&state.text);
 		let value = serde::Deserialize::deserialize(&mut deserializer)?;
 		deserializer.end()?;
 		let repairs = deserializer.into_repairs();
@@ -557,10 +560,10 @@ impl<'doc> IncomingJson<'doc> {
 	/// typed validation. A malformed or mistyped subtree is reported at this
 	/// cursor's structured pull path.
 	pub async fn whole<T: DeserializeOwned>(&mut self) -> Result<T, IncomingError> {
-		let expected = std::any::type_name::<T>();
+		let expected = any::type_name::<T>();
 		let located = wait_for(&self.shared, &self.path, PullMode::Complete, expected).await?;
 		let state = self.shared.state.lock();
-		crate::from_str(&state.text[located.start..located.end.expect("complete wait has an end")])
+		from_str(&state.text[located.start..located.end.expect("complete wait has an end")])
 			.map_err(|_| pull_issue(&self.path, expected, PullIssueKind::Malformed))
 	}
 
@@ -1346,8 +1349,8 @@ fn scan_value(parser: &mut Parser<'_>, ended: bool, depth: u32) -> Probe {
 				let end = parser.pos();
 				let complete = scalar_complete(parser, ended);
 				let kind = match atom {
-					crate::parser::Atom::Bool(value) => Kind::Bool(value),
-					crate::parser::Atom::Null => Kind::Null,
+					Atom::Bool(value) => Kind::Bool(value),
+					Atom::Null => Kind::Null,
 				};
 				Probe::Located(Located { start, end: complete.then_some(end), kind, matched_key: None })
 			} else if let Ok(word) = parser.bareword() {

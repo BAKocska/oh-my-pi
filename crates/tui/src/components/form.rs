@@ -4,10 +4,13 @@ use omp_core::{IntoStr, Str};
 use serde_json::{Map, Value};
 use smallvec::SmallVec;
 
+use super::wizard;
 use crate::{
-	component::{Component, EventCtx, Flow, Hit, HitTag, IntoChildren, PaintCtx, Slot, next_slot},
+	component::{
+		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoChildren, PaintCtx, Slot, next_slot,
+	},
 	context::{Theme, UiContext},
-	frame::{Rect, Style},
+	frame::{Frame, Rect, Style},
 	input::{Key, Mouse, sanitize_paste, word_rubout_start},
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
@@ -36,7 +39,7 @@ enum FieldValue {
 pub struct Field {
 	props:    Props,
 	label:    Str,
-	children: Vec<crate::component::Cached>,
+	children: Vec<Cached>,
 }
 
 impl Field {
@@ -575,13 +578,13 @@ impl Component for Form {
 	fn validation_error(&self) -> Option<String> {
 		for field in &self.fields {
 			let value = field_value(field);
-			let text = super::wizard::display_value(&value);
+			let text = wizard::display_value(&value);
 			if field.required && text.trim().is_empty() {
 				return Some(format!("{} is required", field.id));
 			}
 			if let Some(pattern) = &field.pattern
 				&& !text.trim().is_empty()
-				&& !super::wizard::match_simple(pattern, text.trim())
+				&& !wizard::match_simple(pattern, text.trim())
 			{
 				return Some(format!("{} must match {}", field.id, pattern));
 			}
@@ -680,7 +683,7 @@ const fn dim(theme: &Theme) -> Style {
 
 fn paint_field_value(
 	ctx: &UiContext,
-	frame: &mut crate::frame::Frame,
+	frame: &mut Frame,
 	x: u16,
 	y: u16,
 	field: &FieldData,

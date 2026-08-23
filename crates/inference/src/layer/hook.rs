@@ -1,11 +1,16 @@
 //! Cold-path inference hook handle contract.
 
-use std::{future::Future, time::Duration};
+use std::{
+	future::{self, Future},
+	task,
+	time::Duration,
+};
 
 use crate::{
+	Call,
 	codec::TransportRequest,
 	error::{Error, RetryAction},
-	layer::ExecutionContext,
+	layer::{ExecutionContext, LayerCall},
 };
 
 /// Injected cold-path hook dispatcher for one inference service stack.
@@ -85,10 +90,10 @@ where
 	}
 }
 
-impl<S, H> tower::Service<crate::layer::LayerCall<crate::Call>> for ProviderErrorService<S, H>
+impl<S, H> tower::Service<LayerCall<Call>> for ProviderErrorService<S, H>
 where
 	H: HookHandle,
-	S: tower::Service<crate::layer::LayerCall<crate::Call>, Error = Error> + Send,
+	S: tower::Service<LayerCall<Call>, Error = Error> + Send,
 	S::Future: Send,
 	S::Response: Send,
 {
@@ -97,14 +102,11 @@ where
 
 	type Future = impl Future<Output = Result<Self::Response, Error>> + Send;
 
-	fn poll_ready(
-		&mut self,
-		context: &mut std::task::Context<'_>,
-	) -> std::task::Poll<Result<(), Error>> {
+	fn poll_ready(&mut self, context: &mut task::Context<'_>) -> task::Poll<Result<(), Error>> {
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, request: crate::layer::LayerCall<crate::Call>) -> Self::Future {
+	fn call(&mut self, request: LayerCall<Call>) -> Self::Future {
 		let context = request.context.clone();
 		let hook = self.hook.clone();
 		let future = self.inner.call(request);
@@ -133,7 +135,7 @@ impl HookHandle for NoHookHandle {
 		&self,
 		_: &ExecutionContext,
 	) -> impl Future<Output = Result<(), Error>> + Send {
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 
 	fn provider_error(
@@ -141,7 +143,7 @@ impl HookHandle for NoHookHandle {
 		_: &Error,
 		_: &ExecutionContext,
 	) -> impl Future<Output = Option<RetryAction>> + Send {
-		std::future::ready(None)
+		future::ready(None)
 	}
 
 	fn provider_sign(
@@ -149,7 +151,7 @@ impl HookHandle for NoHookHandle {
 		_: &TransportRequest,
 		_: &ExecutionContext,
 	) -> impl Future<Output = Result<(), Error>> + Send {
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 
 	fn sign_budget(&self) -> Duration {

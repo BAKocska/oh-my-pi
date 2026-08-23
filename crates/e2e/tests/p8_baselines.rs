@@ -3,7 +3,7 @@
 #[path = "../src/bin/baseline.rs"]
 mod baseline;
 
-use std::time::Duration;
+use std::{fs, time::Duration};
 
 use baseline::{BaselineMetrics, duration_rate, measure, slowdown_ratio, write_metrics};
 
@@ -34,7 +34,7 @@ async fn artifact_schema_is_stable_and_frame_metric_is_record_only() {
 	let scratch = tempfile::tempdir().expect("artifact scratch directory");
 	let artifact = scratch.path().join("nested/p8.json");
 	write_metrics(&artifact, &metrics).expect("write metrics");
-	let encoded = std::fs::read_to_string(&artifact).expect("read metrics");
+	let encoded = fs::read_to_string(&artifact).expect("read metrics");
 	let value: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
 	let root = value.as_object().expect("metrics object");
 	assert_eq!(root.keys().collect::<Vec<_>>(), ["schema_version", "frame", "loop"]);

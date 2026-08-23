@@ -14,6 +14,7 @@
 //! `TIOCSWINSZ` on the master.
 
 use std::{
+	env,
 	fs::{File, OpenOptions},
 	io::{self, IoSlice, Write},
 	path::PathBuf,
@@ -25,7 +26,7 @@ pub const TTY_OVERRIDE: &str = "OMP_TTY";
 
 /// The overriding device path, when [`TTY_OVERRIDE`] is set and non-empty.
 pub fn override_path() -> Option<PathBuf> {
-	std::env::var_os(TTY_OVERRIDE)
+	env::var_os(TTY_OVERRIDE)
 		.filter(|value| !value.is_empty())
 		.map(PathBuf::from)
 }

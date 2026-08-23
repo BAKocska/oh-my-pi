@@ -27,7 +27,8 @@
 //! own `tokio::select!`; `examples/chat` is the reference.
 
 use std::{
-	fmt, io,
+	collections::VecDeque,
+	fmt, future, io,
 	time::{Duration, Instant},
 };
 
@@ -36,14 +37,16 @@ use smallvec::SmallVec;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	Appearance, Chord, CursorStyle, Graphics, InputEvent, Key, OverlayId, PaintStats, ProbeResults,
-	Renderer, Size, Terminal, TerminalCaps, TerminalOptions, TerminalResponse, Theme, TtyOut, Ui,
-	UiContext, UiEvent,
+	AltScreenUse, Appearance, Chord, CursorStyle, Graphics, InputEvent, Key, OverlayId, PaintStats,
+	ProbeResults, Renderer, Size, Terminal, TerminalCaps, TerminalOptions, TerminalResponse, Theme,
+	TtyOut, Ui, UiContext, UiEvent,
 	component::Slot,
+	components,
 	components::ImgState,
-	detect, negotiate_async,
+	debug, detect, imagereg, negotiate_async, paste,
 	paste::{Clipboard, ClipboardRead, Pasted, PastedImage},
 	pump::{DebugOp, DebugQuery, TerminalEvent},
+	test_support,
 };
 
 const RESIZE_SETTLE: Duration = Duration::from_millis(120);
@@ -63,7 +66,7 @@ pub enum Msg {
 	/// A finished background system-clipboard read, tagged with its
 	/// [`ClipboardGate`] generation; `raw` requests verbatim insertion and
 	/// `None` means the clipboard was empty.
-	Pasted { generation: u64, raw: bool, clipboard: Option<crate::paste::Clipboard> },
+	Pasted { generation: u64, raw: bool, clipboard: Option<Clipboard> },
 }
 
 /// Ordering discipline for one in-flight background clipboard read.
@@ -79,7 +82,7 @@ pub enum Msg {
 struct ClipboardGate {
 	in_flight:  Option<InFlightRead>,
 	generation: u64,
-	pending:    std::collections::VecDeque<InputEvent>,
+	pending:    VecDeque<InputEvent>,
 }
 
 struct InFlightRead {
@@ -178,9 +181,9 @@ impl ImageLoader {
 			.executor
 			.unblock(move || {
 				if prepare_kitty {
-					let _ = crate::imagereg::prepare_png(&source);
+					let _ = imagereg::prepare_png(&source);
 				}
-				let state = crate::components::decode_source(&source, width, height, trim);
+				let state = components::decode_source(&source, width, height, trim);
 				let _ = tx.send(Msg::ImageDecoded { slot, state });
 			})
 			.detach();
@@ -378,7 +381,7 @@ impl AppOptions {
 		// (and unseeded) until release.
 		let initial_hold = hold_alt || ui.has_overlay();
 		let last_stats = if initial_hold {
-			let alt_enter = terminal.stage_alt_enter(crate::AltScreenUse::Interactive);
+			let alt_enter = terminal.stage_alt_enter(AltScreenUse::Interactive);
 			ui.preview(&mut renderer, viewport.height, alt_enter.as_deref().unwrap_or(""))?
 		} else {
 			renderer.rebuild(ui.frame().clone(), viewport.height, 0, "")?
@@ -650,9 +653,7 @@ impl App {
 						self.ui.resize(self.viewport.width);
 					}
 					self.held_damage |= self.ui.has_damage();
-					let alt_enter = self
-						.terminal
-						.stage_alt_enter(crate::AltScreenUse::Interactive);
+					let alt_enter = self.terminal.stage_alt_enter(AltScreenUse::Interactive);
 					self.last_stats = self.ui.preview(
 						&mut self.renderer,
 						self.viewport.height,
@@ -984,7 +985,7 @@ impl App {
 		let Some(generation) = self.clipboard.begin(Instant::now()) else {
 			return;
 		};
-		let rx = crate::paste::spawn_clipboard_read(scope);
+		let rx = paste::spawn_clipboard_read(scope);
 		let raw = scope == ClipboardRead::Text;
 		let tx = self.tx.clone();
 		self
@@ -1073,7 +1074,7 @@ impl App {
 			let alt_enter = if self.caps.inside_multiplexer {
 				None
 			} else if width_changed && !self.resize_alt {
-				let staged = self.terminal.stage_alt_enter(crate::AltScreenUse::Resize);
+				let staged = self.terminal.stage_alt_enter(AltScreenUse::Resize);
 				self.resize_alt |= staged.is_some();
 				staged
 			} else {
@@ -1104,7 +1105,7 @@ impl App {
 			DebugOp::Frame => {
 				let frame = self.ui.frame();
 				let lines: Vec<String> = (0..frame.size().height)
-					.map(|row| crate::test_support::frame_row_text(frame, row))
+					.map(|row| test_support::frame_row_text(frame, row))
 					.collect();
 				json!({ "ok": true, "lines": lines })
 			},
@@ -1118,7 +1119,7 @@ impl App {
 			// never surface here.
 			DebugOp::Info | DebugOp::Text | DebugOp::Resize | DebugOp::Quit => return,
 		};
-		crate::debug::respond_debug_query(query.id, response);
+		debug::respond_debug_query(query.id, response);
 	}
 }
 
@@ -1223,13 +1224,19 @@ async fn deadline(executor: &omp_executor::Executor, at: Option<Instant>) {
 				.timer(at.saturating_duration_since(Instant::now()))
 				.await
 		},
-		None => std::future::pending().await,
+		None => future::pending().await,
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::time::{Duration, Instant};
+	use std::{
+		env, fs, io, process, thread, time,
+		time::{Duration, Instant},
+	};
+
+	#[cfg(unix)]
+	use crate::tty::TTY_OVERRIDE;
 
 	/// Flag routing the re-executed test binary into the PTY helper below.
 	#[cfg(unix)]
@@ -1291,7 +1298,7 @@ mod tests {
 		use super::AppOptions;
 		use crate::Ui;
 
-		if std::env::var_os(HOLD_HELPER_FLAG).is_none() {
+		if env::var_os(HOLD_HELPER_FLAG).is_none() {
 			return;
 		}
 		let executor = omp_executor::Executor::new(None);
@@ -1324,28 +1331,28 @@ mod tests {
 		let winsize = nix::pty::Winsize { ws_row: 12, ws_col: 40, ws_xpixel: 0, ws_ypixel: 0 };
 		let pty = nix::pty::openpty(Some(&winsize), None).expect("openpty succeeds");
 		let device = nix::unistd::ttyname(&pty.slave).expect("the pty slave has a device path");
-		let mut master = std::fs::File::from(pty.master);
+		let mut master = fs::File::from(pty.master);
 		nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
 			.expect("master goes nonblocking");
 
-		let exe = std::env::current_exe().expect("test binary path");
-		let mut child = std::process::Command::new(exe)
+		let exe = env::current_exe().expect("test binary path");
+		let mut child = process::Command::new(exe)
 			.args(["runtime::tests::hold_alt_pty_helper", "--exact", "--test-threads=1"])
 			.env(HOLD_HELPER_FLAG, "1")
-			.env(crate::tty::TTY_OVERRIDE, &device)
-			.stdout(std::process::Stdio::null())
-			.stderr(std::process::Stdio::null())
+			.env(TTY_OVERRIDE, &device)
+			.stdout(process::Stdio::null())
+			.stderr(process::Stdio::null())
 			.spawn()
 			.expect("helper process spawns");
 
 		let mut stream = Vec::new();
 		let mut buffer = [0_u8; 4096];
-		let deadline = std::time::Instant::now() + Duration::from_secs(20);
+		let deadline = time::Instant::now() + Duration::from_secs(20);
 		loop {
 			match master.read(&mut buffer) {
 				Ok(0) => break,
 				Ok(read) => stream.extend_from_slice(&buffer[..read]),
-				Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+				Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
 					if let Some(status) = child.try_wait().expect("helper status readable") {
 						assert!(status.success(), "helper scenario passes");
 						// One final drain after exit.
@@ -1357,8 +1364,8 @@ mod tests {
 						}
 						break;
 					}
-					assert!(std::time::Instant::now() < deadline, "helper finishes in time");
-					std::thread::sleep(Duration::from_millis(20));
+					assert!(Instant::now() < deadline, "helper finishes in time");
+					thread::sleep(Duration::from_millis(20));
 				},
 				Err(_) => break,
 			}
@@ -1558,9 +1565,8 @@ mod tests {
 	fn image_decode_delivers_without_blocking_initial_layout() {
 		let executor = omp_executor::Executor::new(None);
 		executor.clone().block_on(async {
-			let dir =
-				std::env::temp_dir().join(format!("omp-tui-runtime-image-{}", std::process::id()));
-			std::fs::create_dir_all(&dir).unwrap();
+			let dir = env::temp_dir().join(format!("omp-tui-runtime-image-{}", process::id()));
+			fs::create_dir_all(&dir).unwrap();
 			let path = dir.join("async.ppm");
 			let mut ppm = b"P6\n4 4\n255\n".to_vec();
 			for y in 0..4 {
@@ -1568,7 +1574,7 @@ mod tests {
 					ppm.extend(if y < 2 { [255, 0, 0] } else { [0, 0, 255] });
 				}
 			}
-			std::fs::write(&path, ppm).unwrap();
+			fs::write(&path, ppm).unwrap();
 
 			let loader = ImageLoader::new(executor.clone());
 			let ctx = UiContext { loader: Some(loader.clone()), ..UiContext::default() };
@@ -1602,8 +1608,8 @@ mod tests {
 				(0..custom_ui.height()).any(|row| frame_row_text(custom_ui.frame(), row).contains('▀'))
 			);
 
-			std::fs::remove_file(path).unwrap();
-			std::fs::remove_dir(dir).unwrap();
+			fs::remove_file(path).unwrap();
+			fs::remove_dir(dir).unwrap();
 		});
 	}
 
@@ -1615,7 +1621,7 @@ mod tests {
 			Ui::from_markup(r#"<text id="message">before</text>"#, 20, UiContext::default()).unwrap();
 		let before = frame_row_text(ui.frame(), 0);
 
-		std::thread::spawn(move || handle.set_text("message", "after"))
+		thread::spawn(move || handle.set_text("message", "after"))
 			.join()
 			.expect("update thread finishes");
 		let Msg::Update(update) = rx.recv().expect("thread queues one mutation") else {

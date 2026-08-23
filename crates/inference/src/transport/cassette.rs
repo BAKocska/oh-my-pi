@@ -4,6 +4,7 @@
 use std::{
 	collections::VecDeque,
 	future::Future,
+	mem,
 	num::NonZeroUsize,
 	pin::Pin,
 	sync::{
@@ -11,18 +12,36 @@ use std::{
 		atomic::{AtomicBool, Ordering},
 	},
 	task::{Context, Poll},
-	time::Instant,
+	time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt as _, future::poll_fn};
 use omp_core::Str;
 use parking_lot::Mutex;
+use tokio::time::{self, Instant, Sleep};
 use tower::Service;
+
+mod attempt_deadline {
+	use std::time::Duration;
+
+	use tokio::time::Instant;
+
+	#[derive(Clone, Copy)]
+	pub(super) struct AttemptDeadline(pub(super) Instant);
+
+	impl AttemptDeadline {
+		pub(super) fn after(duration: Duration) -> Self {
+			Self(Instant::now() + duration)
+		}
+	}
+}
+
+use attempt_deadline::AttemptDeadline;
 
 use crate::{
 	answer::{RealtimeEvent, RealtimeInput, RealtimeSession},
-	body::{AttemptBodyEvidence, AttemptEvidenceHandle, BodyOpenError},
+	body::{AttemptBodyEvidence, AttemptEvidenceHandle, BodyAttempt, BodyOpenError},
 	catalog::OperationKind,
 	codec::{
 		Cancellation, HandshakeMeta, HandshakenResponse, RawEvent, RawEventStream, RequestHeader,
@@ -30,7 +49,10 @@ use crate::{
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	receipt::{ExecutionReceipt, ReasonId},
-	transport::{Frame, FramingError, SseDecoder, capture::CaptureSnapshot, http::record_failure},
+	transport::{
+		Frame, FramingError, SseDecoder, WebSocketMessage, capture::CaptureSnapshot,
+		http::record_failure,
+	},
 };
 
 /// Request-body behavior performed by one scripted attempt.
@@ -299,7 +321,7 @@ impl Drop for CassetteCaptureFinalizer {
 			uri:          self.uri.clone(),
 			body:         self.evidence.evidence(),
 			request_body: self.request_body.take().map(RequestBodyCaptureSink::finish),
-			frames:       std::mem::take(&mut self.frames).into_boxed_slice(),
+			frames:       mem::take(&mut self.frames).into_boxed_slice(),
 		});
 	}
 }
@@ -364,7 +386,7 @@ impl Service<TransportRequest> for CassetteTransport {
 	}
 
 	fn call(&mut self, request: TransportRequest) -> Self::Future {
-		let permit = std::mem::take(&mut self.ready_permit);
+		let permit = mem::take(&mut self.ready_permit);
 		let index = self.cursor;
 		if permit {
 			self.cursor += 1;
@@ -421,7 +443,7 @@ async fn run_attempt(
 	let transport_attempt = request.attempt.clone();
 	let mut body_attempt = request.encoded.body.begin_attempt();
 	let evidence = body_attempt.evidence_handle();
-	let deadline = tokio::time::Instant::now() + transport_attempt.timeout;
+	let deadline = AttemptDeadline::after(transport_attempt.timeout);
 	let mut capture = CassetteCaptureFinalizer {
 		log:          captures,
 		attempt:      index,
@@ -557,7 +579,7 @@ async fn run_attempt(
 		},
 		CassetteTerminal::Stall if !output.iter().any(is_commit_candidate) => {
 			tokio::select! {
-				() = tokio::time::sleep_until(deadline) => {
+				() = time::sleep_until(deadline.0) => {
 					request.cancel.cancel();
 					return Err(record_failure(deadline_exceeded(false), &transport_attempt, &evidence, attempt.status, attempt.provider_request_id.as_ref(), started, false));
 				},
@@ -631,7 +653,7 @@ async fn run_realtime_attempt(
 ) -> Result<HandshakenResponse, Error> {
 	let started = Instant::now();
 	let transport_attempt = request.attempt.clone();
-	let deadline = tokio::time::Instant::now() + transport_attempt.timeout;
+	let deadline = AttemptDeadline::after(transport_attempt.timeout);
 	let mut body_attempt = request.encoded.body.begin_attempt();
 	let evidence = body_attempt.evidence_handle();
 	let mut capture = CassetteCaptureFinalizer {
@@ -819,7 +841,7 @@ async fn run_realtime_attempt(
 					Err(_) => break,
 				},
 				() = poll_fn(|context| cancel.poll_cancelled(context)) => break,
-				() = tokio::time::sleep_until(deadline) => {
+				() = time::sleep_until(deadline.0) => {
 					cancel.cancel();
 					let error = record_failure(deadline_exceeded(true), &transport_attempt, &pump_evidence, status, provider_request_id.as_ref(), started, true);
 					let _ = inbound_tx.send_async(Err(error)).await;
@@ -913,14 +935,11 @@ impl Drop for RealtimeClosedGuard {
 fn realtime_payload(frame: Frame) -> Result<Option<Bytes>, Error> {
 	match frame {
 		Frame::Raw(payload) | Frame::Ndjson(payload) => Ok(Some(payload)),
-		Frame::WebSocket(
-			crate::transport::WebSocketMessage::Text(payload)
-			| crate::transport::WebSocketMessage::Binary(payload),
-		) => Ok(Some(payload)),
-		Frame::WebSocket(
-			crate::transport::WebSocketMessage::Ping(_) | crate::transport::WebSocketMessage::Pong(_),
-		) => Ok(None),
-		Frame::WebSocket(crate::transport::WebSocketMessage::Close { .. }) => {
+		Frame::WebSocket(WebSocketMessage::Text(payload) | WebSocketMessage::Binary(payload)) => {
+			Ok(Some(payload))
+		},
+		Frame::WebSocket(WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_)) => Ok(None),
+		Frame::WebSocket(WebSocketMessage::Close { .. }) => {
 			Err(transport_error(ErrorPhase::Handshake, false, "realtime-close-before-handshake"))
 		},
 		Frame::Sse(_) | Frame::Connect(_) | Frame::EventStream(_) => {
@@ -930,10 +949,10 @@ fn realtime_payload(frame: Frame) -> Result<Option<Bytes>, Error> {
 }
 
 async fn consume_body(
-	attempt: &mut crate::body::BodyAttempt,
+	attempt: &mut BodyAttempt,
 	action: CassetteBodyAction,
 	cancel: &Cancellation,
-	deadline: tokio::time::Instant,
+	deadline: AttemptDeadline,
 	mut capture: Option<&mut RequestBodyCaptureSink>,
 ) -> Result<(), Error> {
 	if action == CassetteBodyAction::Unopened {
@@ -947,7 +966,7 @@ async fn consume_body(
 			BodyOpenError::Consumed => transport_error(ErrorPhase::Connecting, false, "body-consumed"),
 			BodyOpenError::ReacquisitionUnavailable => transport_error(ErrorPhase::Connecting, false, "body-reacquisition-unavailable"),
 		})?,
-		() = tokio::time::sleep_until(deadline) => {
+		() = time::sleep_until(deadline.0) => {
 			cancel.cancel();
 			return Err(deadline_exceeded(false));
 		},
@@ -966,7 +985,7 @@ async fn consume_body(
 		let next = tokio::select! {
 			next = reader.next() => next,
 			() = poll_fn(|context| cancel.poll_cancelled(context)) => return Err(cancelled(false)),
-			() = tokio::time::sleep_until(deadline) => {
+			() = time::sleep_until(deadline.0) => {
 				cancel.cancel();
 				return Err(deadline_exceeded(false));
 			},
@@ -1017,13 +1036,13 @@ const fn frame_metadata(frame: &Frame) -> (&'static str, usize) {
 	}
 }
 
-const fn websocket_payload_len(message: &crate::transport::WebSocketMessage) -> usize {
+const fn websocket_payload_len(message: &WebSocketMessage) -> usize {
 	match message {
-		crate::transport::WebSocketMessage::Text(data)
-		| crate::transport::WebSocketMessage::Binary(data)
-		| crate::transport::WebSocketMessage::Ping(data)
-		| crate::transport::WebSocketMessage::Pong(data) => data.len(),
-		crate::transport::WebSocketMessage::Close { reason, .. } => reason.len(),
+		WebSocketMessage::Text(data)
+		| WebSocketMessage::Binary(data)
+		| WebSocketMessage::Ping(data)
+		| WebSocketMessage::Pong(data) => data.len(),
+		WebSocketMessage::Close { reason, .. } => reason.len(),
 	}
 }
 
@@ -1090,7 +1109,7 @@ fn transport_error(phase: ErrorPhase, committed: bool, reason: &'static str) -> 
 	let action = if committed {
 		RetryAction::Never
 	} else {
-		RetryAction::SameRoute { after: std::time::Duration::ZERO }
+		RetryAction::SameRoute { after: Duration::ZERO }
 	};
 	Error::new(ErrorKind::Connectivity, phase, action, ExecutionReceipt::default())
 		.committed(committed)
@@ -1105,7 +1124,7 @@ struct CassetteEventStream {
 	status:              Option<u16>,
 	provider_request_id: Option<Str>,
 	stall_after_commit:  bool,
-	deadline:            Pin<Box<tokio::time::Sleep>>,
+	deadline:            Pin<Box<Sleep>>,
 	started:             Instant,
 	emitted:             bool,
 	finished:            bool,
@@ -1120,7 +1139,7 @@ impl CassetteEventStream {
 		status: Option<u16>,
 		provider_request_id: Option<Str>,
 		stall_after_commit: bool,
-		deadline: tokio::time::Instant,
+		deadline: AttemptDeadline,
 		started: Instant,
 	) -> Self {
 		Self {
@@ -1131,7 +1150,7 @@ impl CassetteEventStream {
 			status,
 			provider_request_id,
 			stall_after_commit,
-			deadline: Box::pin(tokio::time::sleep_until(deadline)),
+			deadline: Box::pin(time::sleep_until(deadline.0)),
 			started,
 			emitted: false,
 			finished: false,

@@ -5,7 +5,13 @@ use std::task::{Context, Poll};
 
 use tower::{Layer, Service};
 
-use crate::{error::Error, layer::LayerCall};
+use crate::{
+	account::{AccountPool, AccountSelection, AccountSelectionRequest, QuotaReservePolicy},
+	call::AccountRoutingContext as CallAccountRoutingContext,
+	error::{Error, ErrorKind, ErrorPhase, RetryAction},
+	layer::{AttemptAction, ExecutionContext, LayerCall, SessionAffinity as LayerSessionAffinity},
+	session::CredentialGenerationPolicy,
+};
 
 /// Request paired with a selected non-secret account handle.
 #[derive(Clone)]
@@ -23,13 +29,9 @@ pub trait AccountSelector<R>: Clone + Send + 'static {
 	/// Non-secret account selection passed to the auth boundary.
 	type Account: Clone + Send + 'static;
 	/// Selects and revalidates an account immediately before authentication.
-	fn select(
-		&self,
-		request: &R,
-		context: &crate::layer::ExecutionContext,
-	) -> Result<Self::Account, Error>;
+	fn select(&self, request: &R, context: &ExecutionContext) -> Result<Self::Account, Error>;
 	/// Returns canonical non-secret routing metadata propagated to encoding.
-	fn routing(&self, _: &Self::Account) -> Option<crate::call::AccountRoutingContext> {
+	fn routing(&self, _: &Self::Account) -> Option<CallAccountRoutingContext> {
 		None
 	}
 }
@@ -38,56 +40,38 @@ pub trait AccountSelector<R>: Clone + Send + 'static {
 /// account pool.
 #[derive(Clone)]
 pub struct SharedAccountPool<M> {
-	pool: crate::account::AccountPool,
+	pool: AccountPool,
 	map:  M,
 }
 impl<M> SharedAccountPool<M> {
 	/// Creates an adapter whose mapper consumes the typed outer-attempt action.
-	pub const fn new(pool: crate::account::AccountPool, map: M) -> Self {
+	pub const fn new(pool: AccountPool, map: M) -> Self {
 		Self { pool, map }
 	}
 }
 impl<R, M> AccountSelector<R> for SharedAccountPool<M>
 where
-	M: Fn(
-			&R,
-			crate::layer::AttemptAction,
-			Option<&crate::layer::SessionAffinity>,
-		) -> crate::account::AccountSelectionRequest
+	M: Fn(&R, AttemptAction, Option<&LayerSessionAffinity>) -> AccountSelectionRequest
 		+ Clone
 		+ Send
 		+ 'static,
 {
-	type Account = crate::account::AccountSelection;
+	type Account = AccountSelection;
 
-	fn select(
-		&self,
-		request: &R,
-		context: &crate::layer::ExecutionContext,
-	) -> Result<Self::Account, Error> {
+	fn select(&self, request: &R, context: &ExecutionContext) -> Result<Self::Account, Error> {
 		let affinity = context.session_affinity();
 		let selection = (self.map)(request, context.attempt_action(), affinity.as_ref());
 		self.pool.select(&selection).map_err(|failure| {
 			let action = match failure.reserve_policy {
-				Some(crate::account::QuotaReservePolicy::FallbackPercent(_)) => {
-					crate::error::RetryAction::ReselectRoute
-				},
-				Some(
-					crate::account::QuotaReservePolicy::FailClosedPercent(_)
-					| crate::account::QuotaReservePolicy::Disabled,
-				)
-				| None => crate::error::RetryAction::Never,
+				Some(QuotaReservePolicy::FallbackPercent(_)) => RetryAction::ReselectRoute,
+				Some(QuotaReservePolicy::FailClosedPercent(_) | QuotaReservePolicy::Disabled)
+				| None => RetryAction::Never,
 			};
-			Error::new(
-				crate::error::ErrorKind::QuotaExhausted,
-				crate::error::ErrorPhase::Admission,
-				action,
-				context.receipt(),
-			)
+			Error::new(ErrorKind::QuotaExhausted, ErrorPhase::Admission, action, context.receipt())
 		})
 	}
 
-	fn routing(&self, selection: &Self::Account) -> Option<crate::call::AccountRoutingContext> {
+	fn routing(&self, selection: &Self::Account) -> Option<CallAccountRoutingContext> {
 		Some(selection.routing.clone())
 	}
 }
@@ -148,16 +132,16 @@ where
 }
 
 fn validate_session_affinity(
-	context: &crate::layer::ExecutionContext,
-	routing: &crate::call::AccountRoutingContext,
+	context: &ExecutionContext,
+	routing: &CallAccountRoutingContext,
 ) -> Result<(), Error> {
 	let Some(binding) = context.session_affinity() else {
 		return Ok(());
 	};
 	let principal_matches = routing.principal.as_ref() == Some(&binding.principal);
 	let generation_matches = match binding.credential_policy {
-		crate::session::CredentialGenerationPolicy::PrincipalBound => true,
-		crate::session::CredentialGenerationPolicy::CredentialGenerationBound => {
+		CredentialGenerationPolicy::PrincipalBound => true,
+		CredentialGenerationPolicy::CredentialGenerationBound => {
 			routing.credential_generation == Some(binding.credential_generation)
 		},
 	};
@@ -165,9 +149,9 @@ fn validate_session_affinity(
 		return Ok(());
 	}
 	Err(Error::new(
-		crate::error::ErrorKind::SessionExpired,
-		crate::error::ErrorPhase::Session,
-		crate::error::RetryAction::ReseedSession,
+		ErrorKind::SessionExpired,
+		ErrorPhase::Session,
+		RetryAction::ReseedSession,
 		context.receipt(),
 	))
 }

@@ -4,6 +4,7 @@ use std::{
 	collections::HashMap,
 	error::Error as StdError,
 	future::Future,
+	mem,
 	path::PathBuf,
 	sync::Arc,
 	time::{Duration, Instant},
@@ -113,7 +114,7 @@ where
 			return None;
 		};
 		entries.remove(key);
-		match std::mem::replace(&mut *entry, PoolEntry::Empty) {
+		match mem::replace(&mut *entry, PoolEntry::Empty) {
 			PoolEntry::Ready(client) => Some(client),
 			PoolEntry::Empty | PoolEntry::Failed { .. } => None,
 		}
@@ -166,6 +167,8 @@ pub enum LspPoolError<E: StdError + Send + Sync + 'static> {
 mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 
+	use tokio::task;
+
 	use super::*;
 
 	#[derive(Debug, Error)]
@@ -192,7 +195,7 @@ mod tests {
 				pool
 					.get_or_try_init(key(), || async move {
 						calls.fetch_add(1, Ordering::SeqCst);
-						tokio::task::yield_now().await;
+						task::yield_now().await;
 						Ok(41)
 					})
 					.await

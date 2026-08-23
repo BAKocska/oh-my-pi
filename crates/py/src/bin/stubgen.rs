@@ -1,10 +1,10 @@
 //! Generates `_omp.pyi` from PyO3 metadata in the statically linked demo.
 
-use std::{env, fs, path::Path};
+use std::{env, error, fs, path::Path};
 
 use pyo3_introspection::{introspect_cdylib, module_stub_files};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn error::Error>> {
 	let mut args = env::args_os().skip(1);
 	let binary = args.next().ok_or("missing binary path")?;
 	let output = args.next().ok_or("missing output directory")?;

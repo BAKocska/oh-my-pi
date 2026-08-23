@@ -1,6 +1,7 @@
 //! Integration coverage for journal request persistence and recovery.
 
 use std::{
+	env, fs,
 	path::PathBuf,
 	sync::atomic::{AtomicU64, Ordering},
 };
@@ -22,7 +23,7 @@ use serde_json::{json, value::to_raw_value};
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
 fn path(name: &str) -> PathBuf {
-	std::env::temp_dir().join(format!(
+	env::temp_dir().join(format!(
 		"omp-journal-requests-{name}-{}-{}.jsonl",
 		std::process::id(),
 		NEXT_PATH.fetch_add(1, Ordering::Relaxed),
@@ -97,7 +98,7 @@ fn atomic_replay_returns_recorded_indexes_and_core_stamps_authorship() {
 		.append_custom_atomic(10, vec![entry(1), entry(2)], &stamp, &author)
 		.expect("atomic append");
 	assert_eq!(indexes, vec![1, 2]);
-	let bytes = std::fs::read(&path).expect("journal bytes");
+	let bytes = fs::read(&path).expect("journal bytes");
 
 	let replayed = journal
 		.append_custom_atomic(99, vec![entry(1), entry(2)], &stamp, &author)

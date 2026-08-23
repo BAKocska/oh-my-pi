@@ -1,5 +1,6 @@
 use std::{
 	collections::HashSet,
+	fmt::Display,
 	process::{Command, Stdio},
 	thread,
 	time::{Duration, Instant},
@@ -268,7 +269,7 @@ impl MacCapture {
 	}
 }
 
-fn metadata_error(error: impl std::fmt::Display) -> DesktopError {
+fn metadata_error(error: impl Display) -> DesktopError {
 	DesktopError::capture_failed(format!("failed to read native display metadata: {error}"))
 }
 

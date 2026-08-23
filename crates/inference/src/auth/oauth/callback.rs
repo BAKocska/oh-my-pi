@@ -1,18 +1,18 @@
 use std::{
-	io,
-	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+	io, mem,
+	net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+	str,
 	time::Duration,
 };
 
-use flume::Receiver;
 use omp_core::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use tokio::{
 	io::{AsyncReadExt as _, AsyncWriteExt as _},
 	net::{TcpListener, TcpStream},
-	sync::watch,
+	sync::watch::Receiver,
+	time,
 };
-use url::{Host, Url};
 use zeroize::Zeroizing;
 
 use super::{OAuthError, callback_code, decode_form_component};
@@ -23,71 +23,83 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const OAUTH_HTML: &str = include_str!("oauth.html");
 const STATE_MARKER: &str = "__OAUTH_STATE__";
 
-/// A successfully bound loopback callback listener.
-pub(super) struct CallbackServer {
-	result:   Receiver<CallbackOutcome>,
-	shutdown: watch::Sender<()>,
-}
+mod callback_server {
+	use std::net::{IpAddr, SocketAddr};
 
-impl CallbackServer {
-	/// Binds the HTTP redirect URI when it addresses the local loopback.
-	pub(super) async fn bind(
-		redirect_uri: &str,
-		expected_state: &str,
-	) -> Result<Option<Self>, CallbackBindError> {
-		let url = Url::parse(redirect_uri).map_err(|_| CallbackBindError::InvalidRedirect)?;
-		if url.scheme() != "http" {
-			return Ok(None);
+	use flume::Receiver;
+	use tokio::sync::watch;
+	use url::{Host, Url};
+
+	use super::{CallbackBindError, CallbackListeners, CallbackOutcome, OAuthError, serve};
+
+	/// A successfully bound loopback callback listener.
+	pub(in crate::auth::oauth) struct CallbackServer {
+		result:   Receiver<CallbackOutcome>,
+		shutdown: watch::Sender<()>,
+	}
+
+	impl CallbackServer {
+		/// Binds the HTTP redirect URI when it addresses the local loopback.
+		pub(in crate::auth::oauth) async fn bind(
+			redirect_uri: &str,
+			expected_state: &str,
+		) -> Result<Option<Self>, CallbackBindError> {
+			let url = Url::parse(redirect_uri).map_err(|_| CallbackBindError::InvalidRedirect)?;
+			if url.scheme() != "http" {
+				return Ok(None);
+			}
+			let port = url
+				.port_or_known_default()
+				.ok_or(CallbackBindError::InvalidRedirect)?;
+			let host = url.host().ok_or(CallbackBindError::InvalidRedirect)?;
+			let listeners = match host {
+				Host::Domain(host) if host.eq_ignore_ascii_case("localhost") => {
+					CallbackListeners::localhost(port).await?
+				},
+				Host::Ipv4(address) if address.is_loopback() => {
+					CallbackListeners::one(SocketAddr::new(IpAddr::V4(address), port)).await?
+				},
+				Host::Ipv6(address) if address.is_loopback() => {
+					CallbackListeners::one(SocketAddr::new(IpAddr::V6(address), port)).await?
+				},
+				_ => return Ok(None),
+			};
+			let callback_path = url.path().to_owned();
+			let callback_origin = url.origin().ascii_serialization();
+			let expected_state = expected_state.to_owned();
+			let (sender, result) = flume::bounded(1);
+			let (shutdown, shutdown_receiver) = watch::channel(());
+			tokio::spawn(async move {
+				serve(
+					listeners,
+					&callback_path,
+					&callback_origin,
+					&expected_state,
+					&sender,
+					shutdown_receiver,
+				)
+				.await;
+			});
+			Ok(Some(Self { result, shutdown }))
 		}
-		let port = url
-			.port_or_known_default()
-			.ok_or(CallbackBindError::InvalidRedirect)?;
-		let host = url.host().ok_or(CallbackBindError::InvalidRedirect)?;
-		let listeners = match host {
-			Host::Domain(host) if host.eq_ignore_ascii_case("localhost") => {
-				CallbackListeners::localhost(port).await?
-			},
-			Host::Ipv4(address) if address.is_loopback() => {
-				CallbackListeners::one(SocketAddr::new(IpAddr::V4(address), port)).await?
-			},
-			Host::Ipv6(address) if address.is_loopback() => {
-				CallbackListeners::one(SocketAddr::new(IpAddr::V6(address), port)).await?
-			},
-			_ => return Ok(None),
-		};
-		let callback_path = url.path().to_owned();
-		let callback_origin = url.origin().ascii_serialization();
-		let expected_state = expected_state.to_owned();
-		let (sender, result) = flume::bounded(1);
-		let (shutdown, shutdown_receiver) = watch::channel(());
-		tokio::spawn(async move {
-			serve(
-				listeners,
-				&callback_path,
-				&callback_origin,
-				&expected_state,
-				&sender,
-				shutdown_receiver,
-			)
-			.await;
-		});
-		Ok(Some(Self { result, shutdown }))
+
+		pub(super) async fn receive(&self) -> Result<CallbackOutcome, OAuthError> {
+			self
+				.result
+				.recv_async()
+				.await
+				.map_err(|_| OAuthError::CallbackUnavailable)
+		}
 	}
 
-	async fn receive(&self) -> Result<CallbackOutcome, OAuthError> {
-		self
-			.result
-			.recv_async()
-			.await
-			.map_err(|_| OAuthError::CallbackUnavailable)
+	impl Drop for CallbackServer {
+		fn drop(&mut self) {
+			let _ = self.shutdown.send(());
+		}
 	}
 }
 
-impl Drop for CallbackServer {
-	fn drop(&mut self) {
-		let _ = self.shutdown.send(());
-	}
-}
+pub(super) use callback_server::CallbackServer;
 
 /// Loopback callback bind failure. Callers deliberately degrade to manual
 /// paste.
@@ -136,7 +148,7 @@ impl CallbackListeners {
 		Ok(Self { primary, companion })
 	}
 
-	async fn accept(&self, shutdown: &mut watch::Receiver<()>) -> Option<io::Result<TcpStream>> {
+	async fn accept(&self, shutdown: &mut Receiver<()>) -> Option<io::Result<TcpStream>> {
 		if let Some(companion) = &self.companion {
 			tokio::select! {
 				biased;
@@ -160,7 +172,7 @@ async fn serve(
 	callback_origin: &str,
 	expected_state: &str,
 	result: &flume::Sender<CallbackOutcome>,
-	mut shutdown: watch::Receiver<()>,
+	mut shutdown: Receiver<()>,
 ) {
 	while let Some(accepted) = listeners.accept(&mut shutdown).await {
 		let Ok(mut stream) = accepted else {
@@ -182,7 +194,7 @@ async fn serve(
 			Zeroizing::new(String::with_capacity(callback_origin.len() + request_target.len()));
 		callback.push_str(callback_origin);
 		callback.push_str(&request_target);
-		let callback = SecretString::from(std::mem::take(&mut *callback));
+		let callback = SecretString::from(mem::take(&mut *callback));
 		let decision = callback_decision(&callback, expected_state);
 		let (status, page, outcome) = match decision {
 			CallbackDecision::Success { code, state } => (
@@ -296,7 +308,7 @@ async fn read_request_target(stream: &mut TcpStream) -> io::Result<String> {
 			break;
 		}
 	}
-	let request = std::str::from_utf8(&request[..length])
+	let request = str::from_utf8(&request[..length])
 		.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request is not UTF-8"))?;
 	let mut request_line = request
 		.lines()
@@ -353,7 +365,7 @@ pub(super) async fn receive_callback(
 	driver: &LoginDriver,
 	server: Option<CallbackServer>,
 ) -> Result<AuthInput, OAuthError> {
-	let timeout = tokio::time::sleep(CALLBACK_TIMEOUT);
+	let timeout = time::sleep(CALLBACK_TIMEOUT);
 	tokio::pin!(timeout);
 	let Some(server) = server else {
 		return tokio::select! {

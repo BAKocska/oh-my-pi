@@ -3,7 +3,8 @@ use std::io::Write;
 use clap::Parser;
 
 use crate::{
-	ErrorKind, ExecutionExitCode, ExecutionParameters, ExecutionResult, Shell, builtins, tests,
+	Error, ErrorKind, ExecutionContext, ExecutionExitCode, ExecutionParameters, ExecutionResult,
+	Shell, ShellExtensions, builtins, builtins::try_parse_known, parser::test_command::parse, tests,
 };
 
 /// Evaluate test expression.
@@ -15,7 +16,7 @@ pub(crate) struct TestCommand {
 }
 
 impl builtins::Command for TestCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
 	/// Override the default [`builtins::Command::new`] function to handle clap's
 	/// limitation related to `--`. See [`builtins::parse_known`] for more
@@ -25,17 +26,17 @@ impl builtins::Command for TestCommand {
 	where
 		I: IntoIterator<Item = String>,
 	{
-		let (mut this, rest_args) = crate::builtins::try_parse_known::<Self>(args)?;
+		let (mut this, rest_args) = try_parse_known::<Self>(args)?;
 		if let Some(args) = rest_args {
 			this.args.extend(args);
 		}
 		Ok(this)
 	}
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let mut args = self.args.as_slice();
 
 		if context.command_name == "[" {
@@ -59,11 +60,10 @@ impl builtins::Command for TestCommand {
 }
 
 fn execute_test(
-	shell: &mut Shell<impl crate::ShellExtensions>,
+	shell: &mut Shell<impl ShellExtensions>,
 	params: &ExecutionParameters,
 	args: &[String],
-) -> Result<bool, crate::Error> {
-	let test_command =
-		crate::parser::test_command::parse(args).map_err(ErrorKind::TestCommandParseError)?;
+) -> Result<bool, Error> {
+	let test_command = parse(args).map_err(ErrorKind::TestCommandParseError)?;
 	tests::eval_expr(&test_command, shell, params)
 }

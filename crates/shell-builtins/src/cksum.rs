@@ -6,9 +6,12 @@
 use std::{
 	borrow::Borrow,
 	ffi::{OsStr, OsString},
-	fmt::{Display, Formatter},
+	fmt::{self, Display, Formatter},
 	fs::File,
 	io::{self, BufReader, Read, Write},
+	num,
+	path::Path,
+	str,
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command, ValueHint, builder::ValueParser};
@@ -35,7 +38,7 @@ use crate::{
 struct Failure(String);
 
 impl Display for Failure {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.0)
 	}
 }
@@ -481,7 +484,7 @@ fn sanitize_cksum_length(
 			// inputs, unlike a plain parse failure.
 			let parsed = match len.parse::<usize>() {
 				Ok(parsed) => Some(parsed),
-				Err(error) if *error.kind() == std::num::IntErrorKind::PosOverflow => None,
+				Err(error) if *error.kind() == num::IntErrorKind::PosOverflow => None,
 				Err(_) => return Err(failure(ChecksumError::InvalidLength(len.into()))),
 			};
 			match parsed {
@@ -806,7 +809,7 @@ where
 			return Err(failure(ChecksumError::RawMultipleFiles));
 		}
 
-		let filepath = std::path::Path::new(filename);
+		let filepath = Path::new(filename);
 		let resolved_filepath = host.resolve(filepath);
 		let stdin_buf;
 		let file_buf;
@@ -1080,7 +1083,7 @@ impl FileChecksumResult {
 }
 
 impl Display for FileChecksumResult {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Ok => write!(f, "OK"),
 			Self::Failed => write!(f, "FAILED"),
@@ -1150,7 +1153,7 @@ impl LineFormat {
 		// Parse algo_bits if present
 		let algo_bits = algo_parts
 			.next()
-			.and_then(|s| std::str::from_utf8(s).ok()?.parse::<usize>().ok());
+			.and_then(|s| str::from_utf8(s).ok()?.parse::<usize>().ok());
 
 		// Check algo format: uppercase ASCII or digits or "BLAKE2b"
 		let is_valid_algo = algo == b"BLAKE2b"

@@ -1,4 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::{
+	io,
+	path::{Path, PathBuf},
+	str,
+};
 
 use ast_grep_core::{
 	MatchStrictness,
@@ -348,7 +352,7 @@ pub fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
 		{
 			return Err(AstError::EditRangeOutOfBounds);
 		}
-		std::str::from_utf8(&edit.inserted_text)
+		str::from_utf8(&edit.inserted_text)
 			.map_err(|source| AstError::NonUtf8Replacement { source })?;
 		prev_end = end;
 	}
@@ -356,7 +360,7 @@ pub fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
 	let mut output = content.to_string();
 	for edit in sorted.into_iter().rev() {
 		let end = edit.position + edit.deleted_length;
-		let replacement = std::str::from_utf8(&edit.inserted_text)
+		let replacement = str::from_utf8(&edit.inserted_text)
 			.expect("replacement UTF-8 was validated before applying edits");
 		output.replace_range(edit.position..end, replacement);
 	}
@@ -367,7 +371,7 @@ pub fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
 pub fn collect_matched_files(
 	cwd: &Path,
 	patterns: &[String],
-) -> Result<Vec<MatchedFile>, std::io::Error> {
+) -> Result<Vec<MatchedFile>, io::Error> {
 	let globset = build_globset(patterns)?;
 	let mut builder = WalkBuilder::new(cwd);
 	builder
@@ -379,7 +383,7 @@ pub fn collect_matched_files(
 	for entry in builder.build() {
 		let entry = match entry {
 			Ok(entry) => entry,
-			Err(error) => return Err(std::io::Error::other(error)),
+			Err(error) => return Err(io::Error::other(error)),
 		};
 		if !entry.file_type().is_some_and(|ft| ft.is_file()) {
 			continue;
@@ -406,13 +410,12 @@ pub fn collect_matched_files(
 	Ok(files)
 }
 
-fn build_globset(patterns: &[String]) -> Result<CompiledGlobSet, std::io::Error> {
+fn build_globset(patterns: &[String]) -> Result<CompiledGlobSet, io::Error> {
 	let globby = patterns
 		.iter()
 		.filter(|pattern| has_glob_syntax(pattern))
 		.map(String::as_str);
-	CompiledGlobSet::new(globby)
-		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+	CompiledGlobSet::new(globby).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
 /// Reports whether a path pattern contains supported glob syntax.

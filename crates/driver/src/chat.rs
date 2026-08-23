@@ -1,18 +1,22 @@
 //! Durable project-chat composition.
 
 mod agents;
-use crate::hub as hub_backend;
+use crate::hub::{self as hub_backend};
 
 pub(crate) fn chat_hub_tool() -> impl omp_tool::Tool {
 	hub_backend::tool()
 }
 
 use std::{
+	cmp,
 	collections::{BTreeMap, BTreeSet},
+	env, ffi, fs,
 	fs::File,
 	io::{self, BufRead as _, BufReader},
+	iter, num,
 	path::{Path, PathBuf},
 	pin::Pin,
+	process,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -21,18 +25,28 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flume::Receiver;
 use futures::StreamExt as _;
 use omp_agent::{
 	Agent, AgentKind, AgentNode, AgentSnapshot, AgentState, AgentStatus, AgentTree, Budget,
-	ChildKind, CompletionError, CompletionRequest, InProcTurnClient, Journal,
-	MAX_YIELD_SCHEMA_RETRIES, PromptFacts, RegistryStatus, RpcTurnClient, SubagentDisposition,
-	SubagentLifecycle, SubagentProgressSnapshot, SubagentRunState, SubagentTerminalKind,
-	SubagentTerminalStatus, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession as _,
-	WorkspaceRootInput, WorkspaceRootsInput, YieldPayloadValidator, project_journal,
-	resolve_completion,
+	ChildKind, CompletionError, CompletionRequest, Journal, MAX_YIELD_SCHEMA_RETRIES, PromptFacts,
+	RegistryStatus, SubagentDisposition, SubagentLifecycle, SubagentProgressSnapshot,
+	SubagentRunState, SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId, TurnInput,
+	TurnOptions, TurnSession as _, WorkspaceRootInput, WorkspaceRootsInput, YieldPayloadValidator,
+	project_journal, resolve_completion, scheduler::BudgetReservation,
 };
-use omp_catalog::GrammarBits;
+use omp_catalog::{AuthSpecKind, GrammarBits, model::ProvenanceKind, snapshot};
 use omp_core::{ExposeSecret as _, Str, sf};
+use omp_envd::{
+	eval::{
+		BridgeHostError, ParentSessionHost,
+		spawn::{SpawnRequestV1, SpawnSchemaMode},
+	},
+	exthost::control::{
+		self, ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
+		ControlConnectionIdentity, ControlEffect, ControlProtocolError, FixedControlAuthorityFactory,
+	},
+};
 use omp_inference::{
 	Client, Registry as InferenceRegistry, ToolDefinition, ToolGrammarSyntax, ToolInputConstraint,
 	answer::{AuthAnswer, AuthEvent, AuthPromptKind as InferenceAuthPromptKind, AuthResponse},
@@ -43,24 +57,71 @@ use omp_inference::{
 	router::Router,
 };
 use omp_proto::{
-	inference::v1 as inference_pb,
-	thread::v1::{Item, Message, Part, Role, Thread, item, part},
+	env::v1 as env_pb,
+	inference::v1::{
+		self as inference_pb, Effort, response_format, tool_def, tool_def::grammar, turn_event,
+	},
+	thread::{
+		v1,
+		v1::{Item, Message, Part, Role, Thread, item, part},
+	},
 };
 use omp_sdk::{SessionBlueprint, SessionBuilder, SessionOptions};
+use omp_settings::manager::SettingsManagerError;
 use omp_storage::{
 	atomic,
-	blob::BlobStore,
-	index::{IndexedWriteError, NewSession, SessionIndex, SessionKind},
+	blob::{self, BlobStore},
+	gc,
+	index::{self, IndexedWriteError, NewSession, SessionIndex, SessionKind},
+	transcript,
 	transcript::{Header, Kind, SessionId, read_header, read_line},
 };
+use omp_telemetry::firehose::Firehose;
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry};
+use omp_tools::memory::{ReflectionHost, ReflectionHostError};
 use parking_lot::Mutex;
 use prost::Message as _;
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use thiserror::Error;
+use tokio::{task::JoinHandle, time, time::MissedTickBehavior};
+use url::Url;
 use xutf::IntoAnsiStripped as _;
 
-use crate::auth_flow::{AuthPromptKind, ChatAuth, ChatAuthCommand, ChatAuthEvent};
+use crate::{
+	auth_flow::{AuthPromptKind, ChatAuth, ChatAuthCommand, ChatAuthEvent},
+	discovery,
+	memory::InferenceExtractionLane,
+	model_controls::{
+		ProviderCatalogCursor, ProviderControlBackend, ProviderControlError, ProviderControlRequest,
+		ProviderControlResult, ProviderDeclarationDocument, ProviderModelCard, ProviderModelEvent,
+		ProviderPrice,
+	},
+	modes::{CampaignHandle, RegimeError},
+	plan::{OverallPlanReference, PlanArtifactStore},
+	prompt_prep::PromptSnapshot,
+	rulebook,
+	security_review::{
+		profile,
+		result::{ReviewScope, validate_and_retain},
+	},
+	session_state::SessionResolveError,
+	session_title::OnlineTitleCompletion,
+	settings::AutoThinkingSettings,
+	subagent::{
+		artifacts,
+		output::persist_bounded,
+		prewalk::PrewalkGate,
+		prompt::{
+			ModelFamilyCapabilities, PromptPeer, SubagentPromptInput, compose, peer_from_node, props,
+		},
+		settings::{LiveTaskSettings, TaskIsolationMerge, TaskIsolationMode, TaskSettings},
+		snapshot::{ChildSnapshotOptions, child_snapshot},
+		supervisor::{
+			ChildReviver, RevivalFuture, SessionSupervisor, SupervisedRuntime, SupervisorError,
+		},
+		yield_driver,
+	},
+};
 
 /// Reasoning effort selected for one composed chat session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString)]
@@ -113,7 +174,7 @@ impl PinStore {
 
 	/// Loads the complete deterministic pin set.
 	pub fn load(&self) -> Result<BTreeSet<Str>, PinError> {
-		let bytes = match std::fs::read(&self.path) {
+		let bytes = match fs::read(&self.path) {
 			Ok(bytes) => bytes,
 			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
 			Err(error) => return Err(error.into()),
@@ -194,7 +255,7 @@ pub enum ChatError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// The canonical project path is not a directory.
 	#[error("project root is not a directory: {0}")]
@@ -206,7 +267,7 @@ pub enum ChatError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// The requested resume identity is not a canonical ULID or lowercase UUID.
 	#[error("invalid chat session id: {0}")]
@@ -228,13 +289,13 @@ pub enum ChatError {
 	Journal(#[from] omp_agent::JournalError),
 	/// Durable compaction blob placement could not be initialized.
 	#[error(transparent)]
-	Blob(#[from] omp_storage::blob::Error),
+	Blob(#[from] blob::Error),
 	/// Session artifact metadata authority could not be initialized.
 	#[error(transparent)]
-	Artifact(#[from] omp_storage::gc::Error),
+	Artifact(#[from] gc::Error),
 	/// Owner-local session discovery state failed.
 	#[error(transparent)]
-	SessionResolve(#[from] crate::session_state::SessionResolveError),
+	SessionResolve(#[from] SessionResolveError),
 	/// Owner-local session pin metadata failed.
 	#[error(transparent)]
 	Pin(#[from] PinError),
@@ -243,7 +304,7 @@ pub enum ChatError {
 	Revival(#[from] omp_agent::RevivalError),
 	/// The authoritative write-time sessions index failed.
 	#[error(transparent)]
-	SessionIndex(#[from] omp_storage::index::Error),
+	SessionIndex(#[from] index::Error),
 	/// A durable session was requested without an authoritative write-time
 	/// index.
 	#[error("durable session storage has no authoritative index")]
@@ -259,7 +320,7 @@ pub enum ChatError {
 	TurnClient(#[from] omp_agent::Error),
 	/// Typed settings projection failed while composing a session boundary.
 	#[error(transparent)]
-	Settings(#[from] omp_settings::manager::SettingsManagerError),
+	Settings(#[from] SettingsManagerError),
 	/// A tool schema could not be encoded for the turn protocol.
 	#[error("could not encode tool schema")]
 	ToolSchema(#[source] serde_json::Error),
@@ -321,7 +382,7 @@ pub enum ChatError {
 	Memory(#[from] omp_memory::Error),
 	/// Startup automation mode conflicts with the active execution state.
 	#[error(transparent)]
-	Mode(#[from] crate::modes::RegimeError),
+	Mode(#[from] RegimeError),
 	/// Campaign recovery or durable lifecycle mutation failed.
 	#[error(transparent)]
 	Campaign(#[from] omp_agent::AgentError),
@@ -333,7 +394,7 @@ pub enum ChatError {
 #[derive(Debug, Error)]
 enum ChildInitError {
 	#[error(transparent)]
-	Blob(#[from] omp_storage::blob::Error),
+	Blob(#[from] blob::Error),
 	#[error(transparent)]
 	Journal(#[from] omp_agent::JournalError),
 	#[error("child output schema could not be encoded")]
@@ -349,7 +410,7 @@ pub struct Session {
 	/// Append-only session journal.
 	pub journal:       Journal,
 	/// Canonical items projected before live execution.
-	pub initial_items: Vec<omp_proto::thread::v1::Item>,
+	pub initial_items: Vec<v1::Item>,
 }
 
 /// Durable session operation selected by the composition layer.
@@ -375,7 +436,7 @@ pub struct EphemeralSessions {
 impl EphemeralSessions {
 	/// Creates an isolated temporary sessions directory.
 	pub fn create() -> Result<Self, ChatError> {
-		let path = std::env::temp_dir()
+		let path = env::temp_dir()
 			.join("omp")
 			.join("sessions")
 			.join(omp_core::Ulid::generate().to_string());
@@ -395,7 +456,7 @@ impl EphemeralSessions {
 impl Drop for EphemeralSessions {
 	fn drop(&mut self) {
 		if let Some(path) = self.path.take() {
-			let _ = std::fs::remove_dir_all(path);
+			let _ = fs::remove_dir_all(path);
 		}
 	}
 }
@@ -403,7 +464,7 @@ impl Drop for EphemeralSessions {
 /// Durable chat resources borrowed by one interactive host.
 pub struct ChatScope<'a> {
 	/// Embedded model catalog.
-	pub catalog:          &'a omp_catalog::snapshot::Catalog,
+	pub catalog:          &'a snapshot::Catalog,
 	/// Canonical project root.
 	pub root:             &'a Path,
 	/// Session journal directory.
@@ -418,7 +479,7 @@ pub struct ChatScope<'a> {
 /// Background provider-authentication worker used by interactive chat.
 pub struct ChatAuthWorker {
 	ui:   ChatAuth,
-	task: Option<tokio::task::JoinHandle<()>>,
+	task: Option<JoinHandle<()>>,
 }
 
 impl ChatAuthWorker {
@@ -525,7 +586,7 @@ async fn run_chat_login(
 	registry: &InferenceRegistry,
 	provider: Str,
 	events: &flume::Sender<ChatAuthEvent>,
-	commands: &flume::Receiver<ChatAuthCommand>,
+	commands: &Receiver<ChatAuthCommand>,
 ) -> Result<Str, ChatLoginFailure> {
 	let provider = omp_catalog::ProviderId::from(provider);
 	let planner = Router::new(registry.clone(), Duration::from_secs(30));
@@ -651,21 +712,26 @@ async fn send_auth_response(
 		})
 }
 
-fn drain_auth_commands(commands: &flume::Receiver<ChatAuthCommand>) {
+fn drain_auth_commands(commands: &Receiver<ChatAuthCommand>) {
 	while commands.try_recv().is_ok() {}
 }
 
 #[cfg(test)]
 mod auth_worker_tests {
+	use omp_inference::{
+		error::{ErrorPhase, RetryAction},
+		receipt::ExecutionReceipt,
+	};
+
 	use super::*;
 
 	#[test]
 	fn credential_storage_failure_keeps_typed_ui_signal() {
 		let error = omp_inference::Error::new(
 			ErrorKind::CredentialStorageUnavailable,
-			omp_inference::error::ErrorPhase::Authentication,
-			omp_inference::error::RetryAction::Never,
-			omp_inference::receipt::ExecutionReceipt::default(),
+			ErrorPhase::Authentication,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
 		);
 		let provider = omp_catalog::ProviderId::from_ref("test-provider");
 		assert!(matches!(
@@ -712,8 +778,8 @@ struct ChatParentContext {
 	session_index: Arc<SessionIndex>,
 	definitions:   Arc<BTreeMap<Str, omp_agent::AgentDefinition>>,
 	tree:          Arc<AgentTree>,
-	task_settings: crate::subagent::settings::LiveTaskSettings,
-	campaigns:     Option<Arc<crate::modes::CampaignHandle>>,
+	task_settings: LiveTaskSettings,
+	campaigns:     Option<Arc<CampaignHandle>>,
 }
 /// Core-backed facts consumed by the retained agent-hub presentation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -764,7 +830,7 @@ pub struct ChatParentHost<C: TurnClient + Clone + Send + 'static> {
 	client:     C,
 	env:        omp_env::EnvClient,
 	broker:     omp_agent::Broker,
-	supervisor: Arc<crate::subagent::supervisor::SessionSupervisor<C>>,
+	supervisor: Arc<SessionSupervisor<C>>,
 	context:    Mutex<ChatParentContext>,
 	revival:    Mutex<BTreeMap<Str, flume::Sender<omp_agent::RevivalRequest>>>,
 	inboxes:    Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
@@ -774,7 +840,7 @@ struct ProductionChildReviver<C: TurnClient + Clone + Send + 'static> {
 	client:         C,
 	base_env:       omp_env::EnvClient,
 	broker:         omp_agent::Broker,
-	supervisor:     Arc<crate::subagent::supervisor::SessionSupervisor<C>>,
+	supervisor:     Arc<SessionSupervisor<C>>,
 	node:           Arc<AgentNode>,
 	snapshot:       AgentSnapshot,
 	journal_path:   PathBuf,
@@ -807,10 +873,8 @@ struct RecoveredRetryPolicy {
 	max_backoff_ms:     u64,
 }
 
-impl<C: TurnClient + Clone + Send + 'static> crate::subagent::supervisor::ChildReviver<C>
-	for ProductionChildReviver<C>
-{
-	fn revive(&self) -> crate::subagent::supervisor::RevivalFuture<C> {
+impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChildReviver<C> {
+	fn revive(&self) -> RevivalFuture<C> {
 		let client = self.client.clone();
 		let base_env = self.base_env.clone();
 		let broker = self.broker.clone();
@@ -836,9 +900,7 @@ impl<C: TurnClient + Clone + Send + 'static> crate::subagent::supervisor::ChildR
 					.await
 					.map_err(|error| {
 						tracing::warn!(agent = %node.id, %error, "isolated child revival failed");
-						crate::subagent::supervisor::SupervisorError::RevivalFailed {
-							id: node.id.clone(),
-						}
+						SupervisorError::RevivalFailed { id: node.id.clone() }
 					})?,
 				)
 			} else {
@@ -857,10 +919,10 @@ impl<C: TurnClient + Clone + Send + 'static> crate::subagent::supervisor::ChildR
 			)
 			.map_err(|error| {
 				tracing::warn!(agent = %node.id, %error, "child journal revival failed");
-				crate::subagent::supervisor::SupervisorError::RevivalFailed { id: node.id.clone() }
+				SupervisorError::RevivalFailed { id: node.id.clone() }
 			})?;
-			let child_content = crate::discovery::active_content_snapshots(&workspace_root);
-			let (ttsr, diagnostics) = crate::rulebook::ttsr_registry(child_content.rules.as_ref());
+			let child_content = discovery::active_content_snapshots(&workspace_root);
+			let (ttsr, diagnostics) = rulebook::ttsr_registry(child_content.rules.as_ref());
 			for error in diagnostics {
 				tracing::warn!(%error, agent = %node.id, "revived subagent TTSR rule was rejected");
 			}
@@ -880,9 +942,7 @@ impl<C: TurnClient + Clone + Send + 'static> crate::subagent::supervisor::ChildR
 					.bind_agent_control(child.control())
 					.map_err(|error| {
 						tracing::warn!(agent = %node.id, %error, "revived child control bind failed");
-						crate::subagent::supervisor::SupervisorError::RevivalFailed {
-							id: node.id.clone(),
-						}
+						SupervisorError::RevivalFailed { id: node.id.clone() }
 					})?;
 				environment.bind_device_availability(child.mailbox());
 				Some(binding)
@@ -893,14 +953,12 @@ impl<C: TurnClient + Clone + Send + 'static> crate::subagent::supervisor::ChildR
 				.registry()
 				.record(node.id.as_str())
 				.map(|(_, revision)| revision)
-				.ok_or_else(|| crate::subagent::supervisor::SupervisorError::RevivalFailed {
-					id: node.id.clone(),
-				})?;
+				.ok_or_else(|| SupervisorError::RevivalFailed { id: node.id.clone() })?;
 			let inbox = broker
 				.attach_live(node.id.as_str(), revision, child.mailbox())
 				.map_err(|error| {
 					tracing::warn!(agent = %node.id, %error, "revived child broker bind failed");
-					crate::subagent::supervisor::SupervisorError::RevivalFailed { id: node.id.clone() }
+					SupervisorError::RevivalFailed { id: node.id.clone() }
 				})?;
 			let inbox = hub_backend::share_inbox(inbox);
 			inboxes.lock().insert(node.id.clone(), Arc::clone(&inbox));
@@ -917,7 +975,7 @@ impl<C: TurnClient + Clone + Send + 'static> crate::subagent::supervisor::ChildR
 					Some(supervisor),
 				)),
 			);
-			let mut runtime = crate::subagent::supervisor::SupervisedRuntime::new(child);
+			let mut runtime = SupervisedRuntime::new(child);
 			if let Some(binding) = control_binding {
 				runtime.retain(binding);
 			}
@@ -948,14 +1006,12 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			DEFAULT_EVAL_CONCURRENCY_LIMIT,
 			omp_agent::DEFAULT_MAX_ADMISSION_QUEUE,
 		));
-		if let Err(error) = crate::subagent::artifacts::reserve_historical_stems(
-			tree.as_ref(),
-			&sessions_dir.join("eval-agents"),
-		) {
+		if let Err(error) =
+			artifacts::reserve_historical_stems(tree.as_ref(), &sessions_dir.join("eval-agents"))
+		{
 			tracing::warn!(error = %error, "could not reserve historical subagent artifact names");
 		}
-		let supervisor =
-			Arc::new(crate::subagent::supervisor::SessionSupervisor::new(Arc::clone(&tree)));
+		let supervisor = Arc::new(SessionSupervisor::new(Arc::clone(&tree)));
 		Self {
 			client,
 			env,
@@ -968,8 +1024,8 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				root,
 				session_index,
 				definitions,
-				task_settings: crate::subagent::settings::LiveTaskSettings::new(
-					Arc::new(crate::subagent::settings::TaskSettings::default()),
+				task_settings: LiveTaskSettings::new(
+					Arc::new(TaskSettings::default()),
 					Arc::clone(&tree),
 				),
 				campaigns: None,
@@ -1001,33 +1057,30 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 
 	/// Applies a reloaded task projection to admission and later child
 	/// snapshots.
-	pub(crate) fn apply_task_settings(
-		&self,
-		settings: Arc<crate::subagent::settings::TaskSettings>,
-	) {
+	pub(crate) fn apply_task_settings(&self, settings: Arc<TaskSettings>) {
 		self.supervisor.apply_settings(Arc::clone(&settings));
 		self.context.lock().task_settings.apply(settings);
 	}
 
 	/// Binds campaign authority used by child composition.
-	pub fn bind_campaigns(&self, campaigns: Arc<crate::modes::CampaignHandle>) {
+	pub fn bind_campaigns(&self, campaigns: Arc<CampaignHandle>) {
 		self.context.lock().campaigns = Some(campaigns);
 	}
 
-	fn approved_plan_reference(&self) -> Option<crate::plan::OverallPlanReference> {
+	fn approved_plan_reference(&self) -> Option<OverallPlanReference> {
 		let context = self.context.lock();
 		let state = context.campaigns.as_ref()?.plan()?;
 		if state.enabled {
 			return None;
 		}
-		let store = crate::plan::PlanArtifactStore::new(
+		let store = PlanArtifactStore::new(
 			context
 				.sessions_dir
 				.join(context.session_id.as_str())
 				.join("local"),
 		);
 		let artifact = store.resolve(None, state.artifact.as_str()).ok()?;
-		crate::plan::OverallPlanReference::resolve(&state, &artifact).ok()
+		OverallPlanReference::resolve(&state, &artifact).ok()
 	}
 
 	/// Binds the main agent job board into child supervision.
@@ -1053,7 +1106,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	}
 
 	/// Returns the session child supervisor for hub attachment.
-	pub fn supervisor(&self) -> Arc<crate::subagent::supervisor::SessionSupervisor<C>> {
+	pub fn supervisor(&self) -> Arc<SessionSupervisor<C>> {
 		Arc::clone(&self.supervisor)
 	}
 
@@ -1073,7 +1126,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		self.context.lock().session_id.clone()
 	}
 
-	pub(crate) fn task_settings(&self) -> Arc<crate::subagent::settings::TaskSettings> {
+	pub(crate) fn task_settings(&self) -> Arc<TaskSettings> {
 		self.context.lock().task_settings.snapshot()
 	}
 
@@ -1273,30 +1326,29 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		context: &ChatParentContext,
 		blob_store: &BlobStore,
 		record: omp_agent::AgentRecord,
-	) -> Result<(), crate::subagent::supervisor::SupervisorError> {
-		let journal_path = record.transcript.clone().ok_or_else(|| {
-			crate::subagent::supervisor::SupervisorError::RevivalFailed { id: record.id.clone() }
-		})?;
+	) -> Result<(), SupervisorError> {
+		let journal_path = record
+			.transcript
+			.clone()
+			.ok_or_else(|| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 		let journal = Journal::open(&journal_path).map_err(|error| {
 			tracing::warn!(agent = %record.id, %error, "recovered child journal open failed");
-			crate::subagent::supervisor::SupervisorError::RevivalFailed { id: record.id.clone() }
+			SupervisorError::RevivalFailed { id: record.id.clone() }
 		})?;
 		let log = journal.load().map_err(|error| {
 			tracing::warn!(agent = %record.id, %error, "recovered child journal read failed");
-			crate::subagent::supervisor::SupervisorError::RevivalFailed { id: record.id.clone() }
+			SupervisorError::RevivalFailed { id: record.id.clone() }
 		})?;
 		let revival = (0..log.len() as u64)
 			.filter_map(|index| log.get(index))
 			.find_map(|entry| match entry {
-				omp_storage::transcript::Entry::Ok(event) => match &event.kind {
+				transcript::Entry::Ok(event) => match &event.kind {
 					Kind::Init { revival: Some(revival), .. } => Some(revival.clone()),
 					_ => None,
 				},
 				_ => None,
 			})
-			.ok_or_else(|| crate::subagent::supervisor::SupervisorError::RevivalFailed {
-				id: record.id.clone(),
-			})?;
+			.ok_or_else(|| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 		let definition = context
 			.definitions
 			.iter()
@@ -1306,15 +1358,11 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 					.eq_ignore_ascii_case(revival.definition.as_str())
 			})
 			.map(|(_, definition)| definition.clone())
-			.ok_or_else(|| crate::subagent::supervisor::SupervisorError::RevivalFailed {
-				id: record.id.clone(),
-			})?;
-		let workspace_root = url::Url::parse(revival.workspace.root_uri.as_str())
+			.ok_or_else(|| SupervisorError::RevivalFailed { id: record.id.clone() })?;
+		let workspace_root = Url::parse(revival.workspace.root_uri.as_str())
 			.ok()
 			.and_then(|url| url.to_file_path().ok())
-			.ok_or_else(|| crate::subagent::supervisor::SupervisorError::RevivalFailed {
-				id: record.id.clone(),
-			})?;
+			.ok_or_else(|| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 		let mut snapshot = context.state.snapshot().as_ref().clone();
 		snapshot
 			.props
@@ -1324,49 +1372,38 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			.get(&revival.grant_snapshot_ref)
 			.ok()
 			.and_then(|bytes| serde_json::from_slice::<RecoveredChildGrants>(&bytes).ok())
-			.ok_or_else(|| crate::subagent::supervisor::SupervisorError::RevivalFailed {
-				id: record.id.clone(),
-			})?;
+			.ok_or_else(|| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 		snapshot.enabled_tools = grants.enabled_tools.into();
 		let tools = blob_store
 			.get(&revival.tool_snapshot_ref)
 			.ok()
 			.and_then(|bytes| inference_pb::ChatParams::decode(bytes).ok())
-			.ok_or_else(|| crate::subagent::supervisor::SupervisorError::RevivalFailed {
-				id: record.id.clone(),
-			})?;
+			.ok_or_else(|| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 		snapshot.turn.params.tools = tools.tools;
 		let policy = blob_store
 			.get(&revival.policy_snapshot_ref)
 			.ok()
 			.and_then(|bytes| serde_json::from_slice::<RecoveredChildPolicy>(&bytes).ok())
-			.ok_or_else(|| crate::subagent::supervisor::SupervisorError::RevivalFailed {
-				id: record.id.clone(),
-			})?;
+			.ok_or_else(|| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 		snapshot.defer_interrupts = policy.defer_interrupts;
-		let max_attempts = std::num::NonZeroU32::new(policy.retry.max_attempts).ok_or_else(|| {
-			crate::subagent::supervisor::SupervisorError::RevivalFailed { id: record.id.clone() }
-		})?;
+		let max_attempts = num::NonZeroU32::new(policy.retry.max_attempts)
+			.ok_or_else(|| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 		snapshot.retry = omp_agent::RetryPolicy::new(
 			max_attempts,
 			Duration::from_millis(policy.retry.initial_backoff_ms),
 			Duration::from_millis(policy.retry.max_backoff_ms),
 		)
-		.map_err(|_| crate::subagent::supervisor::SupervisorError::RevivalFailed {
-			id: record.id.clone(),
-		})?;
+		.map_err(|_| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 		if let Some(schema_ref) = revival.schema_ref.as_ref() {
-			let schema = blob_store.get(schema_ref).map_err(|_| {
-				crate::subagent::supervisor::SupervisorError::RevivalFailed { id: record.id.clone() }
-			})?;
+			let schema = blob_store
+				.get(schema_ref)
+				.map_err(|_| SupervisorError::RevivalFailed { id: record.id.clone() })?;
 			snapshot.turn.params.response_format = Some(inference_pb::ResponseFormat {
-				kind:           Some(inference_pb::response_format::Kind::JsonSchema(
-					inference_pb::response_format::JsonSchema {
-						name:        "subagent_output".to_owned(),
-						schema_json: schema.to_vec().into(),
-						strict:      Some(true),
-					},
-				)),
+				kind:           Some(response_format::Kind::JsonSchema(response_format::JsonSchema {
+					name:        "subagent_output".to_owned(),
+					schema_json: schema.to_vec().into(),
+					strict:      Some(true),
+				})),
 				on_unsupported: inference_pb::Fallback::Error as i32,
 			});
 		}
@@ -1381,7 +1418,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				record.session.clone(),
 				Budget::default(),
 			)
-			.map_err(crate::subagent::supervisor::SupervisorError::Admission)?;
+			.map_err(SupervisorError::Admission)?;
 		node.set_status(AgentStatus::Settled);
 		let isolated_state = revival.workspace.isolation_id.as_ref().map(|_| {
 			context
@@ -1389,23 +1426,22 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				.join("eval-agents")
 				.join(format!("{}-env", record.id))
 		});
-		let reviver: Arc<dyn crate::subagent::supervisor::ChildReviver<C>> =
-			Arc::new(ProductionChildReviver {
-				client: self.client.clone(),
-				base_env: self.env.clone(),
-				broker: self.broker.clone(),
-				supervisor: Arc::clone(&self.supervisor),
-				node: Arc::clone(&node),
-				snapshot,
-				journal_path,
-				project_root: context.root.clone(),
-				workspace_root,
-				isolated_state,
-				session_index: Arc::clone(&context.session_index),
-				parent_session: SessionId(record.session.clone()),
-				inboxes: Arc::clone(&self.inboxes),
-				controls: Arc::clone(&self.controls),
-			});
+		let reviver: Arc<dyn ChildReviver<C>> = Arc::new(ProductionChildReviver {
+			client: self.client.clone(),
+			base_env: self.env.clone(),
+			broker: self.broker.clone(),
+			supervisor: Arc::clone(&self.supervisor),
+			node: Arc::clone(&node),
+			snapshot,
+			journal_path,
+			project_root: context.root.clone(),
+			workspace_root,
+			isolated_state,
+			session_index: Arc::clone(&context.session_index),
+			parent_session: SessionId(record.session.clone()),
+			inboxes: Arc::clone(&self.inboxes),
+			controls: Arc::clone(&self.controls),
+		});
 		self.supervisor.register_parked(node, reviver)?;
 		self.ensure_revival_transport(&record.id);
 		self.bind_parked_transport(record);
@@ -1414,7 +1450,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 
 	pub(crate) async fn release_child(&self, id: &str) {
 		let _ = self.supervisor.cancel(id);
-		let settled = tokio::time::timeout(Duration::from_secs(5), async {
+		let settled = time::timeout(Duration::from_secs(5), async {
 			loop {
 				let Some(state) = self.supervisor.state(id) else {
 					return false;
@@ -1422,7 +1458,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				if state.lifecycle() == SubagentLifecycle::Settled {
 					return true;
 				}
-				tokio::time::sleep(Duration::from_millis(25)).await;
+				time::sleep(Duration::from_millis(25)).await;
 			}
 		})
 		.await
@@ -1462,8 +1498,8 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	pub fn start_idle_parking(self: &Arc<Self>) {
 		let parent = Arc::downgrade(self);
 		drop(tokio::spawn(async move {
-			let mut tick = tokio::time::interval(Duration::from_secs(1));
-			tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			let mut tick = time::interval(Duration::from_secs(1));
+			tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 			loop {
 				tick.tick().await;
 				let Some(parent) = parent.upgrade() else {
@@ -1484,7 +1520,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		id: &str,
 		items: Vec<Item>,
 		turn_id: TurnId,
-	) -> Result<omp_agent::AgentRunSummary, omp_envd::eval::BridgeHostError> {
+	) -> Result<omp_agent::AgentRunSummary, BridgeHostError> {
 		let mut budget = self.context.lock().state.subscribe();
 		let _ = self.broker.set_idle(id, false);
 		let before = self
@@ -1553,7 +1589,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		schema: Option<Value>,
 		strict: bool,
 		mut summary: omp_agent::AgentRunSummary,
-	) -> Result<(String, Option<Value>, Option<Value>), omp_envd::eval::BridgeHostError> {
+	) -> Result<(String, Option<Value>, Option<Value>), BridgeHostError> {
 		let Some(schema) = schema else {
 			let text = summary
 				.outcome
@@ -1588,7 +1624,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 				Ok(None) => {},
 				Err(error) if retries >= MAX_YIELD_SCHEMA_RETRIES => {
 					let warning = matches!(&error, omp_agent::YieldPayloadError::MissingData)
-						.then_some(crate::subagent::yield_driver::WARNING_NULL_YIELD);
+						.then_some(yield_driver::WARNING_NULL_YIELD);
 					return Ok((
 						text,
 						None,
@@ -1636,7 +1672,7 @@ fn bridge_message(role: Role, text: &str) -> Item {
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(Message {
 			role:  i32::from(role),
-			parts: vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+			parts: vec![Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())) }],
 		})),
 		props:         None,
 	}
@@ -1645,7 +1681,7 @@ fn deterministic_isolation_recovery(
 	worktree: &str,
 	artifact: Option<&str>,
 	branch: Option<&str>,
-	conflicts: &[omp_proto::env::v1::WorkspaceConflict],
+	conflicts: &[env_pb::WorkspaceConflict],
 ) -> Str {
 	use std::fmt::Write as _;
 
@@ -1662,8 +1698,8 @@ fn deterministic_isolation_recovery(
 	}
 	summary.push_str(". Conflicts:");
 	for conflict in conflicts.iter().take(8) {
-		let reason = omp_proto::env::v1::ConflictReason::try_from(conflict.reason)
-			.unwrap_or(omp_proto::env::v1::ConflictReason::Unspecified);
+		let reason = env_pb::ConflictReason::try_from(conflict.reason)
+			.unwrap_or(env_pb::ConflictReason::Unspecified);
 		let _ = write!(summary, " {} ({})", conflict.path, reason.as_str_name());
 	}
 	if conflicts.len() > 8 {
@@ -1706,6 +1742,8 @@ struct ChatScheduleDelivery<C: TurnClient + Clone + Send + 'static> {
 }
 
 impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
+	/// Pins a CONTROL authority to the parent's current durable session
+	/// generation.
 	pub fn new(parent: Arc<ChatParentHost<C>>) -> Self {
 		let expected_session_id = parent.session_id();
 		Self { expected_session_id, parent }
@@ -1713,20 +1751,16 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 
 	/// Returns the app/driver agents-domain factory required by envd CONTROL
 	/// composition.
-	pub fn factory(
-		parent: Arc<ChatParentHost<C>>,
-	) -> Arc<dyn omp_envd::exthost::control::ControlAuthorityFactory> {
-		Arc::new(omp_envd::exthost::control::FixedControlAuthorityFactory::new(Arc::new(Self::new(
-			parent,
-		))))
+	pub fn factory(parent: Arc<ChatParentHost<C>>) -> Arc<dyn ControlAuthorityFactory> {
+		Arc::new(FixedControlAuthorityFactory::new(Arc::new(Self::new(parent))))
 	}
 
-	fn ensure_current(&self) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+	fn ensure_current(&self) -> Result<(), ControlProtocolError> {
 		if self.parent.session_id() == self.expected_session_id {
 			Ok(())
 		} else {
 			Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"StaleGeneration",
 					"the agents authority belongs to a replaced chat session",
 				)
@@ -1735,54 +1769,40 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		}
 	}
 
-	fn caller(
-		context: &omp_envd::exthost::control::ControlRequestContext,
-	) -> Result<Str, omp_envd::exthost::control::ControlProtocolError> {
+	fn caller(context: &control::ControlRequestContext) -> Result<Str, ControlProtocolError> {
 		context
 			.invocation
 			.as_ref()
 			.map(|invocation| invocation.session.clone())
 			.ok_or_else(|| {
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"PhaseConflict",
 					"agent operation requires a session invocation",
 				)
 			})
 	}
 
-	fn split_run_id(
-		run_id: &str,
-	) -> Result<(&str, u64), omp_envd::exthost::control::ControlProtocolError> {
+	fn split_run_id(run_id: &str) -> Result<(&str, u64), ControlProtocolError> {
 		let (id, generation) = run_id.rsplit_once('#').ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"AgentGone",
-				"invalid or stale subagent run handle",
-			)
-			.with_details(json!({"ref": run_id, "status": "aborted", "transcript_url": ""}))
+			ControlProtocolError::new("AgentGone", "invalid or stale subagent run handle")
+				.with_details(json!({"ref": run_id, "status": "aborted", "transcript_url": ""}))
 		})?;
 		let generation = generation.parse::<u64>().map_err(|_| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"AgentGone",
-				"invalid or stale subagent run handle",
-			)
-			.with_details(json!({"ref": run_id, "status": "aborted", "transcript_url": ""}))
+			ControlProtocolError::new("AgentGone", "invalid or stale subagent run handle")
+				.with_details(json!({"ref": run_id, "status": "aborted", "transcript_url": ""}))
 		})?;
 		Ok((id, generation))
 	}
 
 	fn owned_state(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 		run_id: &str,
-	) -> Result<(Str, Arc<SubagentRunState>), omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<(Str, Arc<SubagentRunState>), ControlProtocolError> {
 		let caller = Self::caller(context)?;
 		let (id, generation) = Self::split_run_id(run_id)?;
 		let node = self.parent.tree().node(id).ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"AgentGone",
-				"subagent run was not found",
-			)
-			.with_details(json!({
+			ControlProtocolError::new("AgentGone", "subagent run was not found").with_details(json!({
 				"ref": run_id,
 				"status": "aborted",
 				"transcript_url": format!("history://{id}"),
@@ -1790,15 +1810,12 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		})?;
 		if node.parent.as_deref() != Some(caller.as_str()) {
 			return Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"AgentGone",
-					"subagent run is not owned by this caller",
-				)
-				.with_details(json!({
-					"ref": run_id,
-					"status": "aborted",
-					"transcript_url": format!("history://{id}"),
-				})),
+				ControlProtocolError::new("AgentGone", "subagent run is not owned by this caller")
+					.with_details(json!({
+						"ref": run_id,
+						"status": "aborted",
+						"transcript_url": format!("history://{id}"),
+					})),
 			);
 		}
 		let state = self
@@ -1806,26 +1823,25 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.supervisor
 			.state_at_generation(id, generation)
 			.map_err(|error| match error {
-				crate::subagent::supervisor::SupervisorError::StaleGeneration {
-					expected,
-					current,
-					..
-				} => omp_envd::exthost::control::ControlProtocolError::new(
-					"StaleGeneration",
-					format!("subagent generation {expected} is stale; current generation is {current}"),
-				)
-				.with_details(json!({
-					"ref": run_id,
-					"expected_generation": expected,
-					"current_generation": current,
-				})),
+				SupervisorError::StaleGeneration { expected, current, .. } => {
+					ControlProtocolError::new(
+						"StaleGeneration",
+						format!(
+							"subagent generation {expected} is stale; current generation is {current}"
+						),
+					)
+					.with_details(json!({
+						"ref": run_id,
+						"expected_generation": expected,
+						"current_generation": current,
+					}))
+				},
 				error => {
-					omp_envd::exthost::control::ControlProtocolError::new("AgentGone", error.to_string())
-						.with_details(json!({
-							"ref": run_id,
-							"status": "aborted",
-							"transcript_url": format!("history://{id}"),
-						}))
+					ControlProtocolError::new("AgentGone", error.to_string()).with_details(json!({
+						"ref": run_id,
+						"status": "aborted",
+						"transcript_url": format!("history://{id}"),
+					}))
 				},
 			})?;
 		Ok((Str::from(id), state))
@@ -2002,11 +2018,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		}))
 	}
 
-	fn unavailable(
-		operation: &str,
-		owner: &'static str,
-	) -> omp_envd::exthost::control::ControlProtocolError {
-		omp_envd::exthost::control::ControlProtocolError::new(
+	fn unavailable(operation: &str, owner: &'static str) -> ControlProtocolError {
+		ControlProtocolError::new(
 			"AgentsError",
 			format!("{operation} has no bound authoritative {owner}"),
 		)
@@ -2072,10 +2085,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		)
 	}
 
-	fn capability(
-		context: &omp_envd::exthost::control::ControlRequestContext,
-		capability: &str,
-	) -> bool {
+	fn capability(context: &control::ControlRequestContext, capability: &str) -> bool {
 		context
 			.connection
 			.capabilities
@@ -2084,14 +2094,14 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 	}
 
 	fn require_capability(
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 		capability: &str,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<(), ControlProtocolError> {
 		if Self::capability(context, capability) {
 			Ok(())
 		} else {
 			Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"permission_denied",
 					format!("omp.agents operation requires manifest capability {capability}"),
 				)
@@ -2101,10 +2111,10 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 	}
 
 	fn require_effects_authorized(
-		context: &omp_envd::exthost::control::ControlRequestContext,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+		context: &control::ControlRequestContext,
+	) -> Result<(), ControlProtocolError> {
 		let Some(invocation) = context.invocation.as_ref() else {
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+			return Err(ControlProtocolError::new(
 				"effects_not_authorized",
 				"operation requires an active effects-authorized invocation",
 			));
@@ -2116,7 +2126,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			Ok(())
 		} else {
 			Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"effects_not_authorized",
 					"invocation has not reached EFFECTS_AUTHORIZED",
 				)
@@ -2127,7 +2137,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 
 	fn delivery_mode(
 		arguments: &serde_json::Map<String, Value>,
-	) -> Result<omp_agent::DeliveryMode, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<omp_agent::DeliveryMode, ControlProtocolError> {
 		match arguments
 			.get("mode")
 			.and_then(Value::as_str)
@@ -2136,7 +2146,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			"aside" => Ok(omp_agent::DeliveryMode::Aside),
 			"steer" => Ok(omp_agent::DeliveryMode::Steer),
 			"next_turn" => Ok(omp_agent::DeliveryMode::NextTurn),
-			mode => Err(omp_envd::exthost::control::ControlProtocolError::new(
+			mode => Err(ControlProtocolError::new(
 				"ValueError",
 				format!("unknown agent delivery mode {mode:?}"),
 			)),
@@ -2152,15 +2162,9 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		}
 	}
 
-	fn preflight_spec(
-		&self,
-		spec: &Value,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+	fn preflight_spec(&self, spec: &Value) -> Result<(), ControlProtocolError> {
 		let spec = spec.as_object().ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"SpawnDenied",
-				"subagent spec must be an object",
-			)
+			ControlProtocolError::new("SpawnDenied", "subagent spec must be an object")
 		})?;
 		if !spec
 			.get("task")
@@ -2168,11 +2172,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.is_some_and(|task| !task.trim().is_empty())
 		{
 			return Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"SpawnDenied",
-					"subagent task must be non-empty",
-				)
-				.with_details(json!({"reason": "empty task", "field": "task"})),
+				ControlProtocolError::new("SpawnDenied", "subagent task must be non-empty")
+					.with_details(json!({"reason": "empty task", "field": "task"})),
 			);
 		}
 		let agent = spec.get("agent").and_then(Value::as_str).unwrap_or("task");
@@ -2184,7 +2185,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.map(|(_, definition)| definition);
 		if definition.is_none() {
 			return Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"SpawnDenied",
 					format!("agent type {agent:?} is not available in this session"),
 				)
@@ -2199,7 +2200,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.any(|name| name.as_str().eq_ignore_ascii_case(agent))
 		{
 			return Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"SpawnDenied",
 					"requested agent is disabled by live task settings",
 				)
@@ -2215,11 +2216,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.is_some_and(|budget| budget.remaining_tokens == Some(0))
 		{
 			return Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"SpawnDenied",
-					"hard turn token budget is exhausted",
-				)
-				.with_details(json!({"reason": "budget exhausted", "field": "budget"})),
+				ControlProtocolError::new("SpawnDenied", "hard turn token budget is exhausted")
+					.with_details(json!({"reason": "budget exhausted", "field": "budget"})),
 			);
 		}
 		for (field, unsupported) in [
@@ -2283,7 +2281,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		] {
 			if unsupported {
 				return Err(
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"SpawnDenied",
 						format!(
 							"subagent field {field:?} is not supported by the active child authority"
@@ -2298,9 +2296,9 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 
 	async fn spawn_one(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 		spec: Value,
-	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		let caller = Self::caller(context)?;
 		self.spawn_one_for(caller, None, spec).await
 	}
@@ -2310,14 +2308,11 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		caller: Str,
 		stable_id: Option<Str>,
 		spec: Value,
-	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		self.preflight_spec(&spec)?;
 		let spec_object = spec.as_object().ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"SpawnDenied",
-				"subagent spec must be an object",
-			)
-			.with_details(json!({"reason": "invalid subagent spec", "field": "spec"}))
+			ControlProtocolError::new("SpawnDenied", "subagent spec must be an object")
+				.with_details(json!({"reason": "invalid subagent spec", "field": "spec"}))
 		})?;
 		let task = spec_object
 			.get("task")
@@ -2325,23 +2320,17 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.unwrap_or_default();
 		if task.trim().is_empty() {
 			return Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"SpawnDenied",
-					"subagent task must be non-empty",
-				)
-				.with_details(json!({"reason": "empty task", "field": "task"})),
+				ControlProtocolError::new("SpawnDenied", "subagent task must be non-empty")
+					.with_details(json!({"reason": "empty task", "field": "task"})),
 			);
 		}
 		let parent_node = self.parent.tree().node(caller.as_str()).ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"AgentGone",
-				"spawning agent is no longer registered",
-			)
-			.with_details(json!({
-				"ref": caller,
-				"status": "aborted",
-				"transcript_url": format!("history://{caller}"),
-			}))
+			ControlProtocolError::new("AgentGone", "spawning agent is no longer registered")
+				.with_details(json!({
+					"ref": caller,
+					"status": "aborted",
+					"transcript_url": format!("history://{caller}"),
+				}))
 		})?;
 		let parent_max_depth = self
 			.parent
@@ -2352,7 +2341,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.unwrap_or_else(|| self.parent.supervisor.limits().max_depth);
 		if parent_node.depth >= parent_max_depth {
 			return Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"DepthExceeded",
 					"spawning agent reached its effective depth ceiling",
 				)
@@ -2367,7 +2356,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.and_then(Value::as_u64)
 			.and_then(|depth| u16::try_from(depth).ok())
 			.ok_or_else(|| {
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"SpawnDenied",
 					"subagent max_depth must be a non-negative 16-bit integer",
 				)
@@ -2396,11 +2385,10 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				"hi" => "high",
 				_ => {
 					return Err(
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"SpawnDenied",
-							"subagent thinking level is invalid",
-						)
-						.with_details(json!({"reason": "invalid thinking level", "field": "thinking"})),
+						ControlProtocolError::new("SpawnDenied", "subagent thinking level is invalid")
+							.with_details(
+								json!({"reason": "invalid thinking level", "field": "thinking"}),
+							),
 					);
 				},
 			};
@@ -2428,7 +2416,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		let child_id = id.clone();
 		let result_id = child_id.clone();
 		let mut task = tokio::spawn(async move {
-			let result = omp_envd::eval::ParentSessionHost::agent(
+			let result = ParentSessionHost::agent(
 				parent.as_ref(),
 				Value::Object(bridge),
 				&omp_envd::eval::NoopBridgeProgress,
@@ -2464,7 +2452,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		drop(task);
 		let generation = admitted.generation().0;
 		let node = self.parent.tree().node(id.as_str()).ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
+			ControlProtocolError::new(
 				"SpawnDenied",
 				"child admission omitted its authoritative tree node",
 			)
@@ -2487,16 +2475,14 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.parent
 			.supervisor
 			.set_metadata(id.as_str(), handle.clone())
-			.map_err(|error| {
-				omp_envd::exthost::control::ControlProtocolError::new("SpawnDenied", error.to_string())
-			})?;
+			.map_err(|error| ControlProtocolError::new("SpawnDenied", error.to_string()))?;
 		Ok(handle)
 	}
 
 	async fn completion(
 		&self,
 		arguments: serde_json::Map<String, Value>,
-	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		let mut bridge = arguments.clone();
 		if bridge.get("schema").is_some_and(Value::is_null) {
 			bridge.remove("schema");
@@ -2515,7 +2501,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			.unwrap_or(10_000);
 		if deadline_ms == 0 {
 			return Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"CompletionFailed",
 					"unbounded completion deadlines require an explicit host grant",
 				)
@@ -2527,12 +2513,12 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			);
 		}
 		let started = Instant::now();
-		let request = omp_envd::eval::ParentSessionHost::completion(
+		let request = ParentSessionHost::completion(
 			self.parent.as_ref(),
 			Value::Object(bridge),
 			&omp_envd::eval::NoopBridgeProgress,
 		);
-		match tokio::time::timeout(Duration::from_millis(deadline_ms), request).await {
+		match time::timeout(Duration::from_millis(deadline_ms), request).await {
 			Ok(Ok(value)) => Ok(value),
 			Ok(Err(error)) if arguments.contains_key("default") => Ok(json!({
 				"text": "",
@@ -2553,11 +2539,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				"fault": {"reason": "provider", "detail": error.to_string()},
 			})),
 			Ok(Err(error)) => Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"CompletionFailed",
-					error.to_string(),
-				)
-				.with_details(json!({
+				ControlProtocolError::new("CompletionFailed", error.to_string()).with_details(json!({
 					"reason": error.to_string(),
 					"raw": null,
 					"usage": {
@@ -2591,43 +2573,34 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				"fault": {"reason": "deadline"},
 			})),
 			Err(_) => Err(
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"CompletionFailed",
-					"completion deadline exceeded",
-				)
-				.retryable(true)
-				.with_details(json!({
-					"reason": "deadline",
-					"raw": null,
-					"usage": {
-						"input_tokens": 0,
-						"cached_input_tokens": 0,
-						"output_tokens": 0,
-						"reasoning_tokens": 0,
-						"cache_write_tokens": 0,
-						"requests": 0,
-						"cost_usd": 0.0,
-						"wall_ms": deadline_ms,
-					},
-				})),
+				ControlProtocolError::new("CompletionFailed", "completion deadline exceeded")
+					.retryable(true)
+					.with_details(json!({
+						"reason": "deadline",
+						"raw": null,
+						"usage": {
+							"input_tokens": 0,
+							"cached_input_tokens": 0,
+							"output_tokens": 0,
+							"reasoning_tokens": 0,
+							"cache_write_tokens": 0,
+							"requests": 0,
+							"cost_usd": 0.0,
+							"wall_ms": deadline_ms,
+						},
+					})),
 			),
 		}
 	}
 
 	fn route_message(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 		arguments: &serde_json::Map<String, Value>,
 		to: Str,
-	) -> Result<
-		(Str, smallvec::SmallVec<omp_agent::DeliveryReceipt, 4>),
-		omp_envd::exthost::control::ControlProtocolError,
-	> {
+	) -> Result<(Str, smallvec::SmallVec<omp_agent::DeliveryReceipt, 4>), ControlProtocolError> {
 		let invocation = context.invocation.as_ref().ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"PhaseConflict",
-				"agent messaging requires a session invocation",
-			)
+			ControlProtocolError::new("PhaseConflict", "agent messaging requires a session invocation")
 		})?;
 		let id = Str::from(omp_core::Ulid::generate().to_string());
 		let deliveries = self
@@ -2655,12 +2628,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 					.and_then(Value::as_bool)
 					.unwrap_or(false),
 			})
-			.map_err(|error| {
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"AgentsMessagingFailed",
-					error.to_string(),
-				)
-			})?;
+			.map_err(|error| ControlProtocolError::new("AgentsMessagingFailed", error.to_string()))?;
 		Ok((id, deliveries))
 	}
 
@@ -2677,7 +2645,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		})
 	}
 
-	fn snapshot_json(snapshot: omp_proto::env::v1::WorkspaceSnapshot) -> Value {
+	fn snapshot_json(snapshot: env_pb::WorkspaceSnapshot) -> Value {
 		json!({
 			"id": snapshot.snapshot_id,
 			"generation": snapshot.generation,
@@ -2692,7 +2660,7 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		})
 	}
 
-	fn restore_json(restored: omp_proto::env::v1::WorkspaceRestored) -> Value {
+	fn restore_json(restored: env_pb::WorkspaceRestored) -> Value {
 		json!({
 			"from_generation": restored.from_generation,
 			"to_generation": restored.to_generation,
@@ -2700,14 +2668,14 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			"deleted": restored.deleted,
 			"unchanged": restored.unchanged,
 			"conflicts": restored.conflicts.into_iter().map(|conflict| {
-				let reason = omp_proto::env::v1::ConflictReason::try_from(conflict.reason)
-					.unwrap_or(omp_proto::env::v1::ConflictReason::Unspecified);
+				let reason = env_pb::ConflictReason::try_from(conflict.reason)
+					.unwrap_or(env_pb::ConflictReason::Unspecified);
 				json!({
 					"path": conflict.path,
 					"reason": match reason {
-						omp_proto::env::v1::ConflictReason::OpenLease => "open_lease",
-						omp_proto::env::v1::ConflictReason::OutsideRoot => "outside_root",
-						omp_proto::env::v1::ConflictReason::Permission => "permission",
+						env_pb::ConflictReason::OpenLease => "open_lease",
+						env_pb::ConflictReason::OutsideRoot => "outside_root",
+						env_pb::ConflictReason::Permission => "permission",
 						_ => "modified_after_snapshot",
 					},
 					"lease_holder": conflict.lease_holder,
@@ -2720,25 +2688,20 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 
 	async fn host_request(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 		operation: &str,
 		mut arguments: serde_json::Map<String, Value>,
-	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		let caller = Self::caller(context)?;
 		arguments
 			.insert("_owner".to_owned(), Value::String(context.connection.extension.to_string()));
 		let control = self.parent.host_control(caller.as_str()).ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"AgentsError",
-				"calling agent loop is no longer live",
-			)
+			ControlProtocolError::new("AgentsError", "calling agent loop is no longer live")
 		})?;
 		control
 			.request(operation, arguments)
 			.await
-			.map_err(|error| {
-				omp_envd::exthost::control::ControlProtocolError::new("AgentsError", error.to_string())
-			})
+			.map_err(|error| ControlProtocolError::new("AgentsError", error.to_string()))
 	}
 }
 
@@ -2764,7 +2727,7 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> omp_envd::schedules::Schedul
 	async fn estimate(
 		&self,
 		request: &omp_envd::schedules::ScheduleDeliveryRequest,
-	) -> Result<omp_agent::scheduler::BudgetReservation, Str> {
+	) -> Result<BudgetReservation, Str> {
 		if request
 			.schedule
 			.delivery
@@ -2772,7 +2735,7 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> omp_envd::schedules::Schedul
 			.and_then(Value::as_str)
 			!= Some("spawn")
 		{
-			return Ok(omp_agent::scheduler::BudgetReservation::default());
+			return Ok(BudgetReservation::default());
 		}
 		let soft_budget = u64::from(self.parent.task_settings().soft_request_budget);
 		let requests = if soft_budget == 0 {
@@ -2795,7 +2758,7 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> omp_envd::schedules::Schedul
 		} else {
 			0
 		};
-		Ok(omp_agent::scheduler::BudgetReservation { cost_micros, requests })
+		Ok(BudgetReservation { cost_micros, requests })
 	}
 
 	async fn deliver(
@@ -2893,9 +2856,7 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> omp_envd::schedules::Schedul
 }
 
 #[async_trait]
-impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::ControlAuthority
-	for AgentsControlAuthority<C>
-{
+impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlAuthority<C> {
 	fn handles(&self, operation: &str) -> bool {
 		matches!(
 			operation,
@@ -2932,16 +2893,16 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 
 	fn authorize(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 		operation: &str,
 		arguments: &serde_json::Map<String, Value>,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<(), ControlProtocolError> {
 		self.ensure_current()?;
 		match operation {
 			"omp.agents.completion" => {
 				Self::require_capability(context, "inference:completion")?;
 				let invocation = context.invocation.as_ref().ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"PhaseConflict",
 						"completion requires an active authorized invocation",
 					)
@@ -2955,7 +2916,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					Ok(())
 				} else {
 					Err(
-						omp_envd::exthost::control::ControlProtocolError::new(
+						ControlProtocolError::new(
 							"PhaseConflict",
 							"completion is not legal in the current invocation phase",
 						)
@@ -2991,10 +2952,10 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 
 	async fn request(
 		&self,
-		context: omp_envd::exthost::control::ControlRequestContext,
+		context: control::ControlRequestContext,
 		operation: Str,
 		arguments: serde_json::Map<String, Value>,
-	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		self.ensure_current()?;
 		match operation.as_str() {
 			"omp.agents.completion" => self.completion(arguments).await,
@@ -3025,13 +2986,13 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.get("snapshot_id")
 					.and_then(Value::as_str)
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
+						ControlProtocolError::new(
 							"SnapshotUnsupported",
 							"workspace rewind requires snapshot_id",
 						)
 					})?
 					.to_owned();
-				let restore_request = |dry_run| omp_proto::env::v1::RestoreWorkspace {
+				let restore_request = |dry_run| env_pb::RestoreWorkspace {
 					snapshot_id: snapshot_id.clone(),
 					dry_run,
 					scope: "workspace".to_owned(),
@@ -3046,10 +3007,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.restore_workspace(restore_request(true))
 					.await
 					.map_err(|error| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"SnapshotUnsupported",
-							error.to_string(),
-						)
+						ControlProtocolError::new("SnapshotUnsupported", error.to_string())
 					})?;
 				let mut thread_preflight = if scope == "both" {
 					let mut preflight = arguments.clone();
@@ -3080,10 +3038,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.restore_workspace(restore_request(false))
 					.await
 					.map_err(|error| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"SnapshotUnsupported",
-							error.to_string(),
-						)
+						ControlProtocolError::new("SnapshotUnsupported", error.to_string())
 					})?;
 				let undo = restored.undo_snapshot_id.clone();
 				let mut thread = if scope == "both" {
@@ -3096,7 +3051,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 							let _ = self
 								.parent
 								.env
-								.restore_workspace(omp_proto::env::v1::RestoreWorkspace {
+								.restore_workspace(env_pb::RestoreWorkspace {
 									snapshot_id:         undo,
 									dry_run:             false,
 									scope:               "workspace".to_owned(),
@@ -3127,10 +3082,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 			},
 			"omp.agents.spawn" => {
 				let spec = arguments.get("spec").cloned().ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
-						"SpawnDenied",
-						"subagent spec is required",
-					)
+					ControlProtocolError::new("SpawnDenied", "subagent spec is required")
 				})?;
 				self.spawn_one(&context, spec).await
 			},
@@ -3139,10 +3091,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.get("specs")
 					.and_then(Value::as_array)
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"SpawnDenied",
-							"subagent specs are required",
-						)
+						ControlProtocolError::new("SpawnDenied", "subagent specs are required")
 					})?;
 				if specs.is_empty() {
 					return Ok(Value::Array(Vec::new()));
@@ -3154,7 +3103,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 						.and_then(Value::as_str)
 						.is_some_and(|task| !task.trim().is_empty())
 					{
-						return Err(omp_envd::exthost::control::ControlProtocolError::new(
+						return Err(ControlProtocolError::new(
 							"SpawnDenied",
 							"every subagent spec requires a non-empty task",
 						));
@@ -3164,7 +3113,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 						&& !names.insert(name.to_ascii_lowercase())
 					{
 						return Err(
-							omp_envd::exthost::control::ControlProtocolError::new(
+							ControlProtocolError::new(
 								"SpawnDenied",
 								"subagent names must be unique within a batch",
 							)
@@ -3202,10 +3151,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.get("run_id")
 					.and_then(Value::as_str)
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"UnknownRun",
-							"subagent run handle is required",
-						)
+						ControlProtocolError::new("UnknownRun", "subagent run handle is required")
 					})?;
 				let (id, state) = self.owned_state(&context, run_id)?;
 				match operation {
@@ -3277,15 +3223,13 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 							.cancel_with_grace(id.as_str(), generation, Str::new(reason), grace)
 							.await
 							.map_err(|error| {
-								omp_envd::exthost::control::ControlProtocolError::new(
-									"AgentGone",
-									error.to_string(),
+								ControlProtocolError::new("AgentGone", error.to_string()).with_details(
+									json!({
+										"ref": run_id,
+										"status": Self::run_status(&state),
+										"transcript_url": format!("history://{id}"),
+									}),
 								)
-								.with_details(json!({
-									"ref": run_id,
-									"status": Self::run_status(&state),
-									"transcript_url": format!("history://{id}"),
-								}))
 							})?;
 						Ok(Value::Null)
 					},
@@ -3299,14 +3243,14 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 								if let Some(result) = self.result_json(id.as_str(), &state) {
 									break result;
 								}
-								tokio::time::sleep(Duration::from_millis(10)).await;
+								time::sleep(Duration::from_millis(10)).await;
 							}
 						};
 						if let Some(timeout) = timeout {
-							tokio::time::timeout(Duration::from_millis(timeout), wait)
+							time::timeout(Duration::from_millis(timeout), wait)
 								.await
 								.map_err(|_| {
-									omp_envd::exthost::control::ControlProtocolError::new(
+									ControlProtocolError::new(
 										"TimeoutError",
 										"subagent wait deadline exceeded",
 									)
@@ -3323,15 +3267,13 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 							.release_at_generation(id.as_str(), generation)
 							.await
 							.map_err(|error| {
-								omp_envd::exthost::control::ControlProtocolError::new(
-									"AgentGone",
-									error.to_string(),
+								ControlProtocolError::new("AgentGone", error.to_string()).with_details(
+									json!({
+										"ref": run_id,
+										"status": Self::run_status(&state),
+										"transcript_url": format!("history://{id}"),
+									}),
 								)
-								.with_details(json!({
-									"ref": run_id,
-									"status": Self::run_status(&state),
-									"transcript_url": format!("history://{id}"),
-								}))
 							})?;
 						Ok(Value::Null)
 					},
@@ -3345,47 +3287,39 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.and_then(Value::as_str)
 					.filter(|reference| !reference.is_empty())
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"AgentGone",
-							"subagent reference is required",
-						)
-						.with_details(json!({
-							"ref": "",
-							"status": "aborted",
-							"transcript_url": "",
-						}))
+						ControlProtocolError::new("AgentGone", "subagent reference is required")
+							.with_details(json!({
+								"ref": "",
+								"status": "aborted",
+								"transcript_url": "",
+							}))
 					})?;
 				let id = self.parent.supervisor.resolve(reference).ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
-						"AgentGone",
-						"subagent was not found",
+					ControlProtocolError::new("AgentGone", "subagent was not found").with_details(
+						json!({
+							"ref": reference,
+							"status": "aborted",
+							"transcript_url": format!(
+								"history://{}",
+								reference.strip_prefix("agent://").unwrap_or(reference)
+							),
+						}),
 					)
-					.with_details(json!({
-						"ref": reference,
-						"status": "aborted",
-						"transcript_url": format!(
-							"history://{}",
-							reference.strip_prefix("agent://").unwrap_or(reference)
-						),
-					}))
 				})?;
 				let node = self.parent.tree().node(id.as_str()).ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"AgentGone",
 						"subagent roster identity is no longer retained",
 					)
 				})?;
 				if node.parent.as_deref() != Some(caller.as_str()) {
 					return Err(
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"AgentGone",
-							"subagent is not owned by this caller",
-						)
-						.with_details(json!({
-							"ref": reference,
-							"status": "aborted",
-							"transcript_url": format!("history://{id}"),
-						})),
+						ControlProtocolError::new("AgentGone", "subagent is not owned by this caller")
+							.with_details(json!({
+								"ref": reference,
+								"status": "aborted",
+								"transcript_url": format!("history://{id}"),
+							})),
 					);
 				}
 				if operation == "omp.agents.revive" {
@@ -3395,11 +3329,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 						.revive(id.as_str())
 						.await
 						.map_err(|error| {
-							omp_envd::exthost::control::ControlProtocolError::new(
-								"AgentGone",
-								error.to_string(),
-							)
-							.with_details(json!({
+							ControlProtocolError::new("AgentGone", error.to_string()).with_details(json!({
 								"ref": reference,
 								"status": "aborted",
 								"transcript_url": format!("history://{id}"),
@@ -3411,7 +3341,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.supervisor
 					.resolved_metadata(id.as_str())
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
+						ControlProtocolError::new(
 							"AgentGone",
 							"subagent handle metadata is no longer retained",
 						)
@@ -3476,10 +3406,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					.and_then(Value::as_str)
 					.map(Str::from)
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"ValueError",
-							"agent message recipient is required",
-						)
+						ControlProtocolError::new("ValueError", "agent message recipient is required")
 					})?;
 				let await_reply = arguments
 					.get("await_reply")
@@ -3492,13 +3419,10 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 						.first()
 						.map(|delivery| delivery.to.clone())
 						.ok_or_else(|| {
-							omp_envd::exthost::control::ControlProtocolError::new(
-								"AgentsMessagingFailed",
-								"message had no recipient",
-							)
+							ControlProtocolError::new("AgentsMessagingFailed", "message had no recipient")
 						})?;
 					let inbox = self.parent.inbox(caller.as_str()).ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
+						ControlProtocolError::new(
 							"AgentsMessagingFailed",
 							"calling agent mailbox is no longer live",
 						)
@@ -3513,10 +3437,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 						.wait_for_timeout(Some(recipient.as_str()), Some(message_id.as_str()), timeout)
 						.await
 						.map_err(|error| {
-							omp_envd::exthost::control::ControlProtocolError::new(
-								"AgentsMessagingFailed",
-								error.to_string(),
-							)
+							ControlProtocolError::new("AgentsMessagingFailed", error.to_string())
 						})?;
 					return Ok(reply.map_or(Value::Null, Self::message_json));
 				}
@@ -3548,7 +3469,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 			},
 			"omp.agents.inject" => {
 				let invocation = context.invocation.as_ref().ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"PhaseConflict",
 						"agent injection requires a session invocation",
 					)
@@ -3569,7 +3490,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 			"omp.agents.inbox" => {
 				let caller = Self::caller(&context)?;
 				let inbox = self.parent.inbox(caller.as_str()).ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"AgentsMessagingFailed",
 						"calling agent mailbox is no longer live",
 					)
@@ -3591,7 +3512,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 			"omp.agents.wait_for" => {
 				let caller = Self::caller(&context)?;
 				let inbox = self.parent.inbox(caller.as_str()).ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"AgentsMessagingFailed",
 						"calling agent mailbox is no longer live",
 					)
@@ -3610,10 +3531,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					)
 					.await
 					.map_err(|error| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"AgentsMessagingFailed",
-							error.to_string(),
-						)
+						ControlProtocolError::new("AgentsMessagingFailed", error.to_string())
 					})?;
 				Ok(message.map_or(Value::Null, Self::message_json))
 			},
@@ -3629,7 +3547,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				let snapshot = self
 					.parent
 					.env
-					.snapshot_workspace(omp_proto::env::v1::SnapshotWorkspace {
+					.snapshot_workspace(env_pb::SnapshotWorkspace {
 						scope: "workspace".to_owned(),
 						paths,
 						label: arguments
@@ -3642,10 +3560,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					})
 					.await
 					.map_err(|error| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"SnapshotUnsupported",
-							error.to_string(),
-						)
+						ControlProtocolError::new("SnapshotUnsupported", error.to_string())
 					})?;
 				Ok(Self::snapshot_json(snapshot))
 			},
@@ -3653,7 +3568,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				let list = self
 					.parent
 					.env
-					.list_workspace_snapshots(omp_proto::env::v1::ListWorkspaceSnapshots {
+					.list_workspace_snapshots(env_pb::ListWorkspaceSnapshots {
 						limit:         arguments
 							.get("limit")
 							.and_then(Value::as_u64)
@@ -3664,10 +3579,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					})
 					.await
 					.map_err(|error| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"SnapshotUnsupported",
-							error.to_string(),
-						)
+						ControlProtocolError::new("SnapshotUnsupported", error.to_string())
 					})?;
 				Ok(Value::Array(
 					list
@@ -3693,7 +3605,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 				let restored = self
 					.parent
 					.env
-					.restore_workspace(omp_proto::env::v1::RestoreWorkspace {
+					.restore_workspace(env_pb::RestoreWorkspace {
 						snapshot_id: snapshot_id.to_owned(),
 						dry_run: arguments
 							.get("dry_run")
@@ -3707,10 +3619,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 					})
 					.await
 					.map_err(|error| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"SnapshotUnsupported",
-							error.to_string(),
-						)
+						ControlProtocolError::new("SnapshotUnsupported", error.to_string())
 					})?;
 				Ok(Self::restore_json(restored))
 			},
@@ -3720,11 +3629,11 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::exthost::control::Control
 
 	async fn effect(
 		&self,
-		_context: omp_envd::exthost::control::ControlRequestContext,
-		_effect: omp_envd::exthost::control::ControlEffect,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+		_context: control::ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
 		self.ensure_current()?;
-		Err(omp_envd::exthost::control::ControlProtocolError::new(
+		Err(ControlProtocolError::new(
 			"unsupported_effect",
 			"agents authority does not own CONTROL effects",
 		))
@@ -3776,10 +3685,10 @@ fn append_production_child_init(
 		.map(|bytes| blob_store.put(bytes))
 		.transpose()?;
 	let output_schema = schema
-		.map(serde_json::value::RawValue::from_string)
+		.map(RawValue::from_string)
 		.transpose()
 		.map_err(ChildInitError::Schema)?;
-	let root_uri = url::Url::from_file_path(child_root)
+	let root_uri = Url::from_file_path(child_root)
 		.map_err(|()| ChildInitError::WorkspaceRoot)?
 		.to_string();
 	let revival = omp_storage::transcript::ChildSessionInit {
@@ -3844,48 +3753,35 @@ fn retain_security_review_result(
 	root: &Path,
 	blobs: &BlobStore,
 	id: &str,
-) -> Result<Option<(Value, Str, Str)>, omp_envd::eval::BridgeHostError> {
-	if definition.name != crate::security_review::profile::PROFILE_ID {
+) -> Result<Option<(Value, Str, Str)>, BridgeHostError> {
+	if definition.name != profile::PROFILE_ID {
 		return Ok(None);
 	}
 	let Some(data) = data else {
 		return Ok(None);
 	};
-	let scope = crate::security_review::result::ReviewScope::resolve(root, None)
-		.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
-	let validated = crate::security_review::result::validate_and_retain(
-		data.clone(),
-		&scope,
-		sf!("agent://{}", id),
-		blobs,
-	)
-	.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+	let scope = ReviewScope::resolve(root, None)
+		.map_err(|error| BridgeHostError::message(error.to_string()))?;
+	let validated = validate_and_retain(data.clone(), &scope, sf!("agent://{}", id), blobs)
+		.map_err(|error| BridgeHostError::message(error.to_string()))?;
 	let data = serde_json::to_value(validated.output)
-		.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+		.map_err(|error| BridgeHostError::message(error.to_string()))?;
 	Ok(Some((data, validated.report, validated.artifact_uri)))
 }
 
 #[async_trait]
-impl<C: TurnClient + Clone + Send + 'static> omp_tools::memory::ReflectionHost
-	for ChatParentHost<C>
-{
+impl<C: TurnClient + Clone + Send + 'static> ReflectionHost for ChatParentHost<C> {
 	async fn reflect(
 		&self,
 		request: omp_tools::memory::ReflectionRequest,
-	) -> Result<Str, omp_tools::memory::ReflectionHostError> {
+	) -> Result<Str, ReflectionHostError> {
 		let params = self.context.lock().state.snapshot().turn.params.clone();
-		let lane = crate::memory::InferenceExtractionLane::with_selector(
-			self.client.clone(),
-			params,
-			"@memory",
-		);
-		omp_tools::memory::ReflectionHost::reflect(&lane, request).await
+		let lane = InferenceExtractionLane::with_selector(self.client.clone(), params, "@memory");
+		ReflectionHost::reflect(&lane, request).await
 	}
 }
 
-impl<C: TurnClient + Clone + Send + 'static> crate::session_title::OnlineTitleCompletion
-	for ChatParentHost<C>
-{
+impl<C: TurnClient + Clone + Send + 'static> OnlineTitleCompletion for ChatParentHost<C> {
 	fn complete_title<'a>(
 		&'a self,
 		roles: &'static [&'static str],
@@ -3923,10 +3819,10 @@ impl<C: TurnClient + Clone + Send + 'static> crate::session_title::OnlineTitleCo
 			while let Some(event) = events.next().await {
 				let event = event.map_err(|error| Str::from(error.to_string()))?;
 				match event.event {
-					Some(inference_pb::turn_event::Event::Outcome(outcome)) => {
+					Some(turn_event::Event::Outcome(outcome)) => {
 						return Ok(Some(Str::from(bridge_outcome_text(&outcome))));
 					},
-					Some(inference_pb::turn_event::Event::Error(error)) => {
+					Some(turn_event::Event::Error(error)) => {
 						return Err(Str::from(error.detail));
 					},
 					_ => {},
@@ -3938,12 +3834,8 @@ impl<C: TurnClient + Clone + Send + 'static> crate::session_title::OnlineTitleCo
 }
 
 #[async_trait]
-impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
-	for ChatParentHost<C>
-{
-	fn eval_session_config(
-		&self,
-	) -> Result<omp_envd::eval::EvalSessionConfig, omp_envd::eval::BridgeHostError> {
+impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHost<C> {
+	fn eval_session_config(&self) -> Result<omp_envd::eval::EvalSessionConfig, BridgeHostError> {
 		let context = self.context.lock();
 		let session_root = context.sessions_dir.join(context.session_id.as_str());
 		Ok(omp_envd::eval::EvalSessionConfig {
@@ -3966,7 +3858,8 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 		&self,
 		args: Value,
 		_progress: &dyn omp_envd::eval::BridgeProgressSink,
-	) -> Result<Value, omp_envd::eval::BridgeHostError> {
+	) -> Result<Value, BridgeHostError> {
+		use omp_proto::thread::v1::blob;
 		let started = Instant::now();
 		let choices = args.get("choices").and_then(Value::as_array).map_or_else(
 			smallvec::SmallVec::new,
@@ -3983,16 +3876,14 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			default: args.get("default").and_then(Value::as_str).map(Str::from),
 			max_usd_micros: None,
 		};
-		let prompt = args.get("prompt").ok_or_else(|| {
-			omp_envd::eval::BridgeHostError::message("completion prompt is required")
-		})?;
+		let prompt = args
+			.get("prompt")
+			.ok_or_else(|| BridgeHostError::message("completion prompt is required"))?;
 		let user_parts = if let Some(text) = prompt.as_str() {
-			vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }]
+			vec![Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())) }]
 		} else {
 			let rows = prompt.as_array().ok_or_else(|| {
-				omp_envd::eval::BridgeHostError::message(
-					"completion prompt must be text or typed media parts",
-				)
+				BridgeHostError::message("completion prompt must be text or typed media parts")
 			})?;
 			let mut parts = Vec::with_capacity(rows.len());
 			for row in rows {
@@ -4007,30 +3898,26 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 					}),
 					Some("blob") => {
 						let blob = row.get("blob").and_then(Value::as_object).ok_or_else(|| {
-							omp_envd::eval::BridgeHostError::message(
-								"completion blob part omitted its blob reference",
-							)
+							BridgeHostError::message("completion blob part omitted its blob reference")
 						})?;
 						let hash = blob
 							.get("hash")
 							.and_then(Value::as_str)
 							.ok_or_else(|| {
-								omp_envd::eval::BridgeHostError::message(
-									"completion blob reference omitted its hash",
-								)
+								BridgeHostError::message("completion blob reference omitted its hash")
 							})
 							.and_then(|hash| {
-								omp_core::hex::decode(hash).into_vec().map_err(|error| {
-									omp_envd::eval::BridgeHostError::message(error.to_string())
-								})
+								omp_core::hex::decode(hash)
+									.into_vec()
+									.map_err(|error| BridgeHostError::message(error.to_string()))
 							})?;
 						parts.push(Part {
-							kind: Some(part::Kind::Blob(omp_proto::thread::v1::Blob {
+							kind: Some(part::Kind::Blob(v1::Blob {
 								hash:   hash.into(),
 								mime:   String::new(),
 								size:   blob.get("size").and_then(Value::as_u64).unwrap_or(0),
 								inline: Default::default(),
-								detail: omp_proto::thread::v1::blob::Detail::Auto as i32,
+								detail: blob::Detail::Auto as i32,
 							})),
 						});
 						if let Some(alt) = row.get("alt").and_then(Value::as_str)
@@ -4040,7 +3927,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 						}
 					},
 					_ => {
-						return Err(omp_envd::eval::BridgeHostError::message(
+						return Err(BridgeHostError::message(
 							"completion prompt contains an unknown typed part",
 						));
 					},
@@ -4061,22 +3948,20 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			"default" => params.model,
 			model @ ("smol" | "slow") => format!("@{model}"),
 			other => {
-				return Err(omp_envd::eval::BridgeHostError::message(format!(
+				return Err(BridgeHostError::message(format!(
 					"unsupported completion model tier: {other}"
 				)));
 			},
 		};
 		if let Some(schema) = args.get("schema") {
 			let schema_json = serde_json::to_vec(schema)
-				.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			params.response_format = Some(inference_pb::ResponseFormat {
-				kind:           Some(inference_pb::response_format::Kind::JsonSchema(
-					inference_pb::response_format::JsonSchema {
-						name:        "eval_completion".to_owned(),
-						schema_json: schema_json.into(),
-						strict:      Some(true),
-					},
-				)),
+				kind:           Some(response_format::Kind::JsonSchema(response_format::JsonSchema {
+					name:        "eval_completion".to_owned(),
+					schema_json: schema_json.into(),
+					strict:      Some(true),
+				})),
 				on_unsupported: inference_pb::Fallback::Error as i32,
 			});
 		}
@@ -4112,13 +3997,12 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				&options,
 			)
 			.await
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+			.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		let mut events = turn.events();
 		while let Some(event) = events.next().await {
-			let event =
-				event.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+			let event = event.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			match event.event {
-				Some(inference_pb::turn_event::Event::Outcome(outcome)) => {
+				Some(turn_event::Event::Outcome(outcome)) => {
 					let spent = outcome.usage.as_ref().map_or(0, |usage| {
 						usage
 							.output_tokens
@@ -4142,7 +4026,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 					let usage = completion_usage(&outcome, started.elapsed());
 					let model = outcome.model.clone();
 					let completion = resolve_completion(&completion, Ok(text))
-						.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+						.map_err(|error| BridgeHostError::message(error.to_string()))?;
 					return Ok(json!({
 						"text": completion.text,
 						"choice": completion.choice,
@@ -4153,13 +4037,13 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 						"fault": completion.fell_back.then(|| json!({"reason": "no_choice"})),
 					}));
 				},
-				Some(inference_pb::turn_event::Event::Error(error)) => {
+				Some(turn_event::Event::Error(error)) => {
 					let detail = error.detail;
 					let completion = resolve_completion(
 						&completion,
 						Err(CompletionError::Provider(Str::from(&detail))),
 					)
-					.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+					.map_err(|error| BridgeHostError::message(error.to_string()))?;
 					return Ok(json!({
 						"text": completion.text,
 						"choice": completion.choice,
@@ -4182,16 +4066,16 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				_ => {},
 			}
 		}
-		Err(omp_envd::eval::BridgeHostError::message("completion turn ended without an outcome"))
+		Err(BridgeHostError::message("completion turn ended without an outcome"))
 	}
 
 	async fn agent(
 		&self,
 		args: Value,
 		progress: &dyn omp_envd::eval::BridgeProgressSink,
-	) -> Result<Value, omp_envd::eval::BridgeHostError> {
-		let mut request = omp_envd::eval::spawn::SpawnRequestV1::from_bridge_args(&args)
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+	) -> Result<Value, BridgeHostError> {
+		let mut request = SpawnRequestV1::from_bridge_args(&args)
+			.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		if let Some(plan) = self.approved_plan_reference() {
 			request.prompt = sf!(
 				"{}\n\nApproved overall plan: {}. Read and follow only this approved plan reference; \
@@ -4210,7 +4094,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			.find(|(name, _)| name.as_str().eq_ignore_ascii_case(kind))
 			.map(|(_, definition)| definition.clone())
 			.ok_or_else(|| {
-				omp_envd::eval::BridgeHostError::message(format!(
+				BridgeHostError::message(format!(
 					"agent type '{kind}' is not available in this session"
 				))
 			})?;
@@ -4219,9 +4103,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			.iter()
 			.any(|name| name.as_str().eq_ignore_ascii_case(definition.name.as_str()))
 		{
-			return Err(omp_envd::eval::BridgeHostError::message(
-				"requested agent is disabled by live task settings",
-			));
+			return Err(BridgeHostError::message("requested agent is disabled by live task settings"));
 		}
 		let session_schema = context
 			.state
@@ -4232,10 +4114,10 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			.as_ref()
 			.and_then(|format| format.kind.as_ref())
 			.and_then(|kind| match kind {
-				inference_pb::response_format::Kind::JsonSchema(schema) => {
+				response_format::Kind::JsonSchema(schema) => {
 					serde_json::from_slice(&schema.schema_json).ok()
 				},
-				inference_pb::response_format::Kind::Grammar(_) => None,
+				response_format::Kind::Grammar(_) => None,
 			});
 		let schema_resolution = omp_agent::resolve_output_schema(
 			request.output_schema.as_ref(),
@@ -4243,35 +4125,31 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			session_schema.as_ref(),
 		);
 		request.output_schema = schema_resolution.schema;
-		if definition.name == crate::security_review::profile::PROFILE_ID {
-			if !crate::security_review::profile::is_canonical(&definition) {
-				return Err(omp_envd::eval::BridgeHostError::message(
+		if definition.name == profile::PROFILE_ID {
+			if !profile::is_canonical(&definition) {
+				return Err(BridgeHostError::message(
 					"security reviewer profile authority was widened",
 				));
 			}
 			if request.isolation.requested || request.isolation.apply || request.isolation.merge {
-				return Err(omp_envd::eval::BridgeHostError::message(
+				return Err(BridgeHostError::message(
 					"local security reviews use the current workspace",
 				));
 			}
 			request.output_schema = definition.output_schema.clone();
-			request.schema_mode = omp_envd::eval::spawn::SpawnSchemaMode::Strict;
+			request.schema_mode = SpawnSchemaMode::Strict;
 			request.enable_lsp = true;
 		}
 		let explicit_patch = request.isolation.apply;
 		let explicit_branch = request.isolation.merge;
-		let isolated = request.isolation.requested
-			|| task_settings.isolation.mode != crate::subagent::settings::TaskIsolationMode::None;
+		let isolated =
+			request.isolation.requested || task_settings.isolation.mode != TaskIsolationMode::None;
 		let auto_apply =
 			isolated && !explicit_patch && !explicit_branch && task_settings.isolation.apply;
 		let apply = explicit_patch
-			|| (auto_apply
-				&& task_settings.isolation.merge
-					== crate::subagent::settings::TaskIsolationMerge::Patch);
+			|| (auto_apply && task_settings.isolation.merge == TaskIsolationMerge::Patch);
 		let merge = explicit_branch
-			|| (auto_apply
-				&& task_settings.isolation.merge
-					== crate::subagent::settings::TaskIsolationMerge::Branch);
+			|| (auto_apply && task_settings.isolation.merge == TaskIsolationMerge::Branch);
 		let id = request
 			.stable_id
 			.clone()
@@ -4285,9 +4163,9 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			.tree
 			.node(id.as_str())
 			.and_then(|node| node.definition.clone())
-			.is_some_and(|name| name == crate::security_review::profile::PROFILE_ID);
-		if security_follow_up && definition.name != crate::security_review::profile::PROFILE_ID {
-			return Err(omp_envd::eval::BridgeHostError::message(
+			.is_some_and(|name| name == profile::PROFILE_ID);
+		if security_follow_up && definition.name != profile::PROFILE_ID {
+			return Err(BridgeHostError::message(
 				"security reviewer follow-up must retain its canonical profile",
 			));
 		}
@@ -4300,7 +4178,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 		}))?;
 		if self.supervisor.state(&id).is_some() {
 			if request.isolation.requested || explicit_patch || explicit_branch {
-				return Err(omp_envd::eval::BridgeHostError::message(
+				return Err(BridgeHostError::message(
 					"follow-up turns retain their existing workspace disposition",
 				));
 			}
@@ -4324,7 +4202,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				.parent()
 				.unwrap_or(context.sessions_dir.as_path());
 			let blob_store = BlobStore::open(blob_root)
-				.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			let mut security_artifact = None;
 			if let Some((validated, report, artifact)) = retain_security_review_result(
 				&definition,
@@ -4339,14 +4217,8 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			}
 			let artifact_dir = context.sessions_dir.join(context.session_id.as_str());
 			let artifact = artifact_dir.join(format!("{id}.md"));
-			let bounded = crate::subagent::output::persist_bounded(
-				&artifact,
-				sf!("agent://{}", id),
-				&text,
-				None,
-				false,
-			)
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+			let bounded = persist_bounded(&artifact, sf!("agent://{}", id), &text, None, false)
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			let visible_text = bounded.preview.unwrap_or_default();
 			progress.progress(json!({
 				"op": "agent",
@@ -4378,7 +4250,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			.task_budget
 			.is_some_and(|budget| budget.remaining_tokens == Some(0))
 		{
-			return Err(omp_envd::eval::BridgeHostError::message(
+			return Err(BridgeHostError::message(
 				"hard turn token budget is exhausted; subagent spawn refused",
 			));
 		}
@@ -4386,24 +4258,20 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 		let (worktree_id, child_root, isolated_state, isolated_environment) = if isolated {
 			let created = self
 				.env
-				.create_worktree(omp_proto::env::v1::CreateWorktree {
+				.create_worktree(env_pb::CreateWorktree {
 					name: id.to_string(),
-					owner_pid: std::process::id(),
+					owner_pid: process::id(),
 					..Default::default()
 				})
 				.await
-				.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			let worktree = created.worktree.ok_or_else(|| {
-				omp_envd::eval::BridgeHostError::message(
-					"Environment omitted the created worktree identity",
-				)
+				BridgeHostError::message("Environment omitted the created worktree identity")
 			})?;
-			let root_url = url::Url::parse(&worktree.root_uri)
-				.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+			let root_url = Url::parse(&worktree.root_uri)
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			let root = root_url.to_file_path().map_err(|()| {
-				omp_envd::eval::BridgeHostError::message(
-					"Environment returned a non-file worktree root",
-				)
+				BridgeHostError::message("Environment returned a non-file worktree root")
 			})?;
 			let child_state = context
 				.sessions_dir
@@ -4415,7 +4283,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				omp_envd::RegistryBridges::default(),
 			)
 			.await
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+			.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			(Some(Str::from(worktree.id)), root, Some(child_state), Some(environment))
 		} else {
 			(None, context.root.clone(), None, None)
@@ -4442,9 +4310,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			.or_else(|| context.tree.node(context.session_id.as_str()))
 			.map(|parent| parent.id.clone())
 			.ok_or_else(|| {
-				omp_envd::eval::BridgeHostError::message(
-					"parent agent is not registered for subagent admission",
-				)
+				BridgeHostError::message("parent agent is not registered for subagent admission")
 			})?;
 		let node = context
 			.tree
@@ -4456,10 +4322,10 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				context.session_id.clone(),
 				child_budget,
 			)
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+			.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		display_name = node.name.clone();
-		std::fs::create_dir_all(&directory)
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+		fs::create_dir_all(&directory)
+			.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		let parent = SessionId(context.session_id.clone());
 		let journal_path = directory.join(format!("{id}.jsonl"));
 		let mut journal = create_indexed_journal(
@@ -4470,55 +4336,51 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			SessionKind::Subagent,
 			Some(&parent),
 		)
-		.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+		.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		let parent_snapshot = context.state.snapshot();
 		let selected_model = definition.effective_model(&task_settings.agent_model_overrides);
 		let inherited_pattern = parent_snapshot.turn.params.model.as_str();
-		let prewalk = crate::subagent::prewalk::PrewalkGate::resolve(&definition, &task_settings);
+		let prewalk = PrewalkGate::resolve(&definition, &task_settings);
 		let inference_role = sf!("subagent:{}", id);
-		let security_task_settings = (definition.name == crate::security_review::profile::PROFILE_ID)
-			.then(|| {
-				let mut settings = task_settings.as_ref().clone();
-				settings.enable_lsp = true;
-				settings
-			});
+		let security_task_settings = (definition.name == profile::PROFILE_ID).then(|| {
+			let mut settings = task_settings.as_ref().clone();
+			settings.enable_lsp = true;
+			settings
+		});
 		let child_settings = security_task_settings
 			.as_ref()
 			.unwrap_or(task_settings.as_ref());
 
-		let mut child_snapshot = crate::subagent::snapshot::child_snapshot(
-			parent_snapshot.as_ref(),
-			crate::subagent::snapshot::ChildSnapshotOptions {
-				definition: &definition,
-				settings: child_settings,
-				cwd: &child_root,
-				selected_model,
-				inference_role: Some(inference_role.as_str()),
-				inherited_pattern: Some(inherited_pattern),
-				caller_effort: request.effort,
-				model_ceiling: None,
-				plan_mode: false,
-				enable_lsp: request.enable_lsp,
-				prewalk_gate: prewalk.armed(),
-			},
-		);
+		let mut child_snapshot = child_snapshot(parent_snapshot.as_ref(), ChildSnapshotOptions {
+			definition: &definition,
+			settings: child_settings,
+			cwd: &child_root,
+			selected_model,
+			inference_role: Some(inference_role.as_str()),
+			inherited_pattern: Some(inherited_pattern),
+			caller_effort: request.effort,
+			model_ceiling: None,
+			plan_mode: false,
+			enable_lsp: request.enable_lsp,
+			prewalk_gate: prewalk.armed(),
+		});
 		let child_env = isolated_environment
 			.as_ref()
 			.map_or_else(|| self.env.clone(), |environment| environment.client().clone());
-		let child_content = crate::discovery::active_content_snapshots(&child_root);
+		let child_content = discovery::active_content_snapshots(&child_root);
 		let (child_ttsr, child_ttsr_diagnostics) =
-			crate::rulebook::ttsr_registry(child_content.rules.as_ref());
+			rulebook::ttsr_registry(child_content.rules.as_ref());
 		for error in child_ttsr_diagnostics {
 			tracing::warn!(%error, agent = %id, "subagent TTSR rule condition was rejected");
 		}
 		let peer_values = context
 			.tree
 			.roster()
-			.map(|node| crate::subagent::prompt::peer_from_node(node))
+			.map(|node| peer_from_node(node))
 			.collect::<Vec<_>>();
 		let peers = peer_values
 			.iter()
-			.map(|(name, role, status, activity)| crate::subagent::prompt::PromptPeer {
+			.map(|(name, role, status, activity)| PromptPeer {
 				name:     name.as_str(),
 				role:     role.as_str(),
 				status:   status.as_str(),
@@ -4530,7 +4392,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			let model = model.to_ascii_lowercase();
 			model.contains("codex") || model.contains("gpt-5")
 		};
-		let prompt_input = crate::subagent::prompt::SubagentPromptInput {
+		let prompt_input = SubagentPromptInput {
 			definition:        &definition,
 			shared_context:    None,
 			plan_path:         None,
@@ -4543,7 +4405,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				|| i32::from(node.depth) < i32::from(child_settings.max_recursion_depth),
 			roster_generation: context.tree.roster_generation(),
 			peers:             &peers,
-			capabilities:      crate::subagent::prompt::ModelFamilyCapabilities {
+			capabilities:      ModelFamilyCapabilities {
 				codex_style,
 				parallel_tool_calls: true,
 				structured_yield: request.output_schema.is_some(),
@@ -4551,14 +4413,14 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			plan_mode:         false,
 			eager:             task_settings.eager,
 		};
-		child_snapshot.props = crate::subagent::prompt::props(&prompt_input, &parent_snapshot.props);
-		let system_prompt = crate::subagent::prompt::compose(prompt_input, &parent_snapshot.props);
+		child_snapshot.props = props(&prompt_input, &parent_snapshot.props);
+		let system_prompt = compose(prompt_input, &parent_snapshot.props);
 		let blob_root = context
 			.sessions_dir
 			.parent()
 			.unwrap_or(context.sessions_dir.as_path());
-		let blob_store = BlobStore::open(blob_root)
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+		let blob_store =
+			BlobStore::open(blob_root).map_err(|error| BridgeHostError::message(error.to_string()))?;
 		append_production_child_init(
 			&mut journal,
 			&blob_store,
@@ -4571,7 +4433,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			&child_root,
 			worktree_id.clone(),
 		)
-		.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+		.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		let mut child = Agent::new(
 			self.client.clone(),
 			child_env.clone(),
@@ -4584,7 +4446,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 		let control_binding = if let Some(environment) = &isolated_environment {
 			let binding = environment
 				.bind_agent_control(child.control())
-				.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			environment.bind_device_availability(child.mailbox());
 			Some(binding)
 		} else {
@@ -4593,7 +4455,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 		let inbox = self
 			.broker
 			.register(&node, child.mailbox())
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+			.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		let inbox = hub_backend::share_inbox(inbox);
 		self.bind_inbox(id.clone(), Arc::clone(&inbox));
 		let _ = self.broker.registry().set_history(
@@ -4616,7 +4478,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				Some(self.supervisor.clone()),
 			)),
 		);
-		let mut runtime = crate::subagent::supervisor::SupervisedRuntime::new(child);
+		let mut runtime = SupervisedRuntime::new(child);
 		if let Some(binding) = control_binding {
 			runtime.retain(binding);
 		}
@@ -4624,27 +4486,26 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 		if let Some(environment) = isolated_environment {
 			runtime.retain(environment);
 		}
-		let reviver: Arc<dyn crate::subagent::supervisor::ChildReviver<C>> =
-			Arc::new(ProductionChildReviver {
-				client: self.client.clone(),
-				base_env: self.env.clone(),
-				broker: self.broker.clone(),
-				supervisor: Arc::clone(&self.supervisor),
-				node: Arc::clone(&node),
-				snapshot: child_snapshot,
-				journal_path,
-				project_root: context.root.clone(),
-				workspace_root: child_root.clone(),
-				isolated_state,
-				session_index: Arc::clone(&context.session_index),
-				parent_session: parent,
-				inboxes: Arc::clone(&self.inboxes),
-				controls: Arc::clone(&self.controls),
-			});
+		let reviver: Arc<dyn ChildReviver<C>> = Arc::new(ProductionChildReviver {
+			client: self.client.clone(),
+			base_env: self.env.clone(),
+			broker: self.broker.clone(),
+			supervisor: Arc::clone(&self.supervisor),
+			node: Arc::clone(&node),
+			snapshot: child_snapshot,
+			journal_path,
+			project_root: context.root.clone(),
+			workspace_root: child_root.clone(),
+			isolated_state,
+			session_index: Arc::clone(&context.session_index),
+			parent_session: parent,
+			inboxes: Arc::clone(&self.inboxes),
+			controls: Arc::clone(&self.controls),
+		});
 		self
 			.supervisor
 			.register(Arc::clone(&node), runtime, Some(reviver))
-			.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+			.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		self.ensure_revival_transport(&id);
 		let summary = self
 			.run_eval_agent(
@@ -4682,19 +4543,19 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 			&& (apply || merge)
 		{
 			let mode = if apply {
-				omp_proto::env::v1::MergeMode::Patch
+				env_pb::MergeMode::Patch
 			} else {
-				omp_proto::env::v1::MergeMode::Branch
+				env_pb::MergeMode::Branch
 			};
 			let merged = self
 				.env
-				.merge_worktree(omp_proto::env::v1::MergeWorktree {
+				.merge_worktree(env_pb::MergeWorktree {
 					id: worktree_id.to_string(),
 					mode: mode as i32,
 					..Default::default()
 				})
 				.await
-				.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			let mut conflicts = merged.conflicts;
 			conflicts.sort_by(|left, right| {
 				left
@@ -4704,7 +4565,7 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 					.then_with(|| left.detail.cmp(&right.detail))
 			});
 			let artifact_hash = (!merged.artifact_hash.is_empty())
-				.then(|| omp_core::encoding::hex::encode(&merged.artifact_hash).into_string());
+				.then(|| omp_core::hex::encode(&merged.artifact_hash).into_string());
 			let artifact_uri = artifact_hash
 				.as_deref()
 				.map(|hash| sf!("artifact://b3/{}", hash));
@@ -4715,8 +4576,8 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				.map(|conflict| {
 					json!({
 						"path": conflict.path.as_str(),
-						"reason": omp_proto::env::v1::ConflictReason::try_from(conflict.reason)
-							.unwrap_or(omp_proto::env::v1::ConflictReason::Unspecified)
+						"reason": env_pb::ConflictReason::try_from(conflict.reason)
+							.unwrap_or(env_pb::ConflictReason::Unspecified)
 							.as_str_name(),
 						"detail": conflict.detail.as_deref(),
 					})
@@ -4747,14 +4608,9 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 		}
 		let artifact_dir = context.sessions_dir.join(context.session_id.as_str());
 		let artifact = artifact_dir.join(format!("{id}.md"));
-		let bounded = crate::subagent::output::persist_bounded(
-			&artifact,
-			sf!("agent://{}", id),
-			&text,
-			worktree_id.clone(),
-			false,
-		)
-		.map_err(|error| omp_envd::eval::BridgeHostError::message(error.to_string()))?;
+		let bounded =
+			persist_bounded(&artifact, sf!("agent://{}", id), &text, worktree_id.clone(), false)
+				.map_err(|error| BridgeHostError::message(error.to_string()))?;
 		let visible_text = bounded.preview.unwrap_or_default();
 		let disposition_failed = disposition_conflict.is_some();
 		if let Some((summary, artifact_uri, branch)) = disposition_conflict {
@@ -4815,12 +4671,12 @@ impl<C: TurnClient + Clone + Send + 'static> omp_envd::eval::ParentSessionHost
 				}))
 	}
 
-	async fn concurrency(&self, _args: Value) -> Result<Value, omp_envd::eval::BridgeHostError> {
+	async fn concurrency(&self, _args: Value) -> Result<Value, BridgeHostError> {
 		let context = self.context.lock();
 		Ok(json!({ "limit": context.tree.max_concurrency() }))
 	}
 
-	async fn budget(&self, _args: Value) -> Result<Value, omp_envd::eval::BridgeHostError> {
+	async fn budget(&self, _args: Value) -> Result<Value, BridgeHostError> {
 		let context = self.context.lock();
 		let budget = context.state.snapshot().turn.params.task_budget;
 		let Some(budget) = budget else {
@@ -4845,26 +4701,23 @@ pub trait ProviderApplicationOwner: Send + Sync + 'static {
 	/// Atomically compiles and publishes one caller-owned declaration.
 	async fn replace_provider(
 		&self,
-		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
-		declaration: crate::model_controls::ProviderDeclarationDocument,
-	) -> Result<(), crate::model_controls::ProviderControlError>;
+		identity: &ControlConnectionIdentity,
+		declaration: ProviderDeclarationDocument,
+	) -> Result<(), ProviderControlError>;
 
 	/// Retracts one caller-owned declaration and publishes a new generation.
 	async fn retract_provider(
 		&self,
-		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
+		identity: &ControlConnectionIdentity,
 		provider: &str,
-	) -> Result<(), crate::model_controls::ProviderControlError>;
+	) -> Result<(), ProviderControlError>;
 
 	/// Routes a typed request through the application inference/data facade.
 	async fn provider_request(
 		&self,
-		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
-		request: crate::model_controls::ProviderControlRequest,
-	) -> Result<
-		crate::model_controls::ProviderControlResult,
-		crate::model_controls::ProviderControlError,
-	>;
+		identity: &ControlConnectionIdentity,
+		request: ProviderControlRequest,
+	) -> Result<ProviderControlResult, ProviderControlError>;
 }
 
 /// Provider CONTROL backend over the application's live inference owner.
@@ -4878,15 +4731,15 @@ impl ChatProviderControlBackend {
 		Self { owner }
 	}
 
-	fn cursor(registry: &InferenceRegistry) -> crate::model_controls::ProviderCatalogCursor {
-		crate::model_controls::ProviderCatalogCursor {
+	fn cursor(registry: &InferenceRegistry) -> ProviderCatalogCursor {
+		ProviderCatalogCursor {
 			epoch:      registry.catalog_revision().as_str().as_bytes().into(),
 			generation: registry.generation(),
 		}
 	}
 
 	fn provider_for_model<'a>(
-		catalog: &'a omp_catalog::snapshot::Catalog,
+		catalog: &'a snapshot::Catalog,
 		model: &omp_catalog::ModelSpec,
 	) -> Option<&'a omp_catalog::ProviderDef> {
 		catalog.providers().iter().find(|provider| {
@@ -4898,10 +4751,10 @@ impl ChatProviderControlBackend {
 	}
 
 	fn model_card(
-		catalog: &omp_catalog::snapshot::Catalog,
+		catalog: &snapshot::Catalog,
 		model: &omp_catalog::ModelSpec,
 		provider: &omp_catalog::ProviderDef,
-	) -> crate::model_controls::ProviderModelCard {
+	) -> ProviderModelCard {
 		use omp_catalog::capability::{Availability, ModalityBits};
 		let mut facets = Vec::new();
 		if model.capabilities.chat.is_some() {
@@ -4968,9 +4821,9 @@ impl ChatProviderControlBackend {
 			.sources
 			.last()
 			.map_or(1, |source| match source.kind {
-				omp_catalog::model::ProvenanceKind::Bundled => 1,
-				omp_catalog::model::ProvenanceKind::Discovered => 2,
-				omp_catalog::model::ProvenanceKind::Configured => 3,
+				ProvenanceKind::Bundled => 1,
+				ProvenanceKind::Discovered => 2,
+				ProvenanceKind::Configured => 3,
 			});
 		let efforts = model
 			.thinking
@@ -4983,7 +4836,7 @@ impl ChatProviderControlBackend {
 					.map(|effort| Str::from(effort.to_string()))
 					.collect()
 			});
-		crate::model_controls::ProviderModelCard {
+		ProviderModelCard {
 			id: model.key.as_str().into(),
 			provider: provider.id.as_str().into(),
 			model: model.key.as_str().into(),
@@ -5000,7 +4853,7 @@ impl ChatProviderControlBackend {
 				.pricing
 				.components
 				.iter()
-				.map(|price| crate::model_controls::ProviderPrice {
+				.map(|price| ProviderPrice {
 					unit:      price.unit.to_string().into(),
 					nanos_usd: price.nanos_usd,
 				})
@@ -5017,14 +4870,11 @@ impl ChatProviderControlBackend {
 }
 
 #[async_trait]
-impl crate::model_controls::ProviderControlBackend for ChatProviderControlBackend {
+impl ProviderControlBackend for ChatProviderControlBackend {
 	async fn models(
 		&self,
 		provider: Option<&str>,
-	) -> Result<
-		Vec<crate::model_controls::ProviderModelCard>,
-		crate::model_controls::ProviderControlError,
-	> {
+	) -> Result<Vec<ProviderModelCard>, ProviderControlError> {
 		let registry = self.owner.registry();
 		let catalog = registry.catalog();
 		if provider.is_some_and(|provider| {
@@ -5033,7 +4883,7 @@ impl crate::model_controls::ProviderControlBackend for ChatProviderControlBacken
 				.iter()
 				.any(|candidate| candidate.id.as_str() == provider)
 		}) {
-			return Err(crate::model_controls::ProviderControlError::NotFound);
+			return Err(ProviderControlError::NotFound);
 		}
 		Ok(catalog
 			.models()
@@ -5051,11 +4901,8 @@ impl crate::model_controls::ProviderControlBackend for ChatProviderControlBacken
 
 	async fn watch_models(
 		&self,
-		since: Option<crate::model_controls::ProviderCatalogCursor>,
-	) -> Result<
-		Vec<crate::model_controls::ProviderModelEvent>,
-		crate::model_controls::ProviderControlError,
-	> {
+		since: Option<ProviderCatalogCursor>,
+	) -> Result<Vec<ProviderModelEvent>, ProviderControlError> {
 		let registry = self.owner.registry();
 		let cursor = Self::cursor(&registry);
 		if since.as_ref() == Some(&cursor) {
@@ -5063,26 +4910,27 @@ impl crate::model_controls::ProviderControlBackend for ChatProviderControlBacken
 		}
 		let mut events =
 			vec![crate::model_controls::ProviderModelEvent::Reset { cursor: cursor.clone() }];
-		events.extend(self.models(None).await?.into_iter().map(|card| {
-			crate::model_controls::ProviderModelEvent::Upsert { cursor: cursor.clone(), card }
-		}));
+		events.extend(
+			self
+				.models(None)
+				.await?
+				.into_iter()
+				.map(|card| ProviderModelEvent::Upsert { cursor: cursor.clone(), card }),
+		);
 		Ok(events)
 	}
 
-	async fn is_authenticated(
-		&self,
-		provider: &str,
-	) -> Result<bool, crate::model_controls::ProviderControlError> {
+	async fn is_authenticated(&self, provider: &str) -> Result<bool, ProviderControlError> {
 		let registry = self.owner.registry();
 		let provider_id = omp_catalog::ProviderId::from(provider);
 		let Some(provider_definition) = registry.catalog().provider(&provider_id) else {
-			return Err(crate::model_controls::ProviderControlError::NotFound);
+			return Err(ProviderControlError::NotFound);
 		};
 		if provider_definition.auth.iter().all(|auth| {
 			registry
 				.catalog()
 				.auth_spec(auth)
-				.is_some_and(|spec| spec.kind == omp_catalog::AuthSpecKind::None)
+				.is_some_and(|spec| spec.kind == AuthSpecKind::None)
 		}) {
 			return Ok(true);
 		}
@@ -5098,11 +4946,10 @@ impl crate::model_controls::ProviderControlBackend for ChatProviderControlBacken
 		match client
 			.execute(AuthRequest::ListAccounts { provider: Some(provider_id) })
 			.await
-			.map_err(|error| {
-				crate::model_controls::ProviderControlError::Request(auth_error_message(&error))
-			})? {
+			.map_err(|error| ProviderControlError::Request(auth_error_message(&error)))?
+		{
 			AuthAnswer::Accounts(accounts) => Ok(!accounts.is_empty()),
-			_ => Err(crate::model_controls::ProviderControlError::Request(sf!(
+			_ => Err(ProviderControlError::Request(sf!(
 				"authentication owner returned an unexpected answer"
 			))),
 		}
@@ -5110,28 +4957,25 @@ impl crate::model_controls::ProviderControlBackend for ChatProviderControlBacken
 
 	async fn replace(
 		&self,
-		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
-		declaration: crate::model_controls::ProviderDeclarationDocument,
-	) -> Result<(), crate::model_controls::ProviderControlError> {
+		identity: &ControlConnectionIdentity,
+		declaration: ProviderDeclarationDocument,
+	) -> Result<(), ProviderControlError> {
 		self.owner.replace_provider(identity, declaration).await
 	}
 
 	async fn retract(
 		&self,
-		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
+		identity: &ControlConnectionIdentity,
 		provider: &str,
-	) -> Result<(), crate::model_controls::ProviderControlError> {
+	) -> Result<(), ProviderControlError> {
 		self.owner.retract_provider(identity, provider).await
 	}
 
 	async fn request(
 		&self,
-		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
-		request: crate::model_controls::ProviderControlRequest,
-	) -> Result<
-		crate::model_controls::ProviderControlResult,
-		crate::model_controls::ProviderControlError,
-	> {
+		identity: &ControlConnectionIdentity,
+		request: ProviderControlRequest,
+	) -> Result<ProviderControlResult, ProviderControlError> {
 		self.owner.provider_request(identity, request).await
 	}
 }
@@ -5159,12 +5003,12 @@ pub trait CampaignControlResolver: Send + Sync + 'static {
 	/// Resolves a declaration owned by the authenticated extension.
 	fn resolve(
 		&self,
-		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
+		identity: &ControlConnectionIdentity,
 		campaign: &str,
 		state: Option<&str>,
 	) -> Result<
 		(Arc<omp_agent::CampaignSpec>, Box<dyn omp_agent::CampaignMachine>),
-		omp_envd::exthost::control::ControlProtocolError,
+		ControlProtocolError,
 	>;
 
 	/// Returns the owning extension for a frozen declaration.
@@ -5190,12 +5034,9 @@ impl AgentCampaignControlBackend {
 	async fn entries(
 		&self,
 		extension: Option<&str>,
-	) -> Result<Vec<CampaignControlEntry>, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Vec<CampaignControlEntry>, ControlProtocolError> {
 		let entries = self.control.active_campaigns().await.map_err(|error| {
-			omp_envd::exthost::control::ControlProtocolError::new(
-				"CampaignOwnerError",
-				Str::from(error.to_string()),
-			)
+			ControlProtocolError::new("CampaignOwnerError", Str::from(error.to_string()))
 		})?;
 		let mut projected = Vec::new();
 		for entry in entries {
@@ -5235,18 +5076,15 @@ impl CampaignControlAuthorityFactory {
 }
 
 struct CampaignControlAuthority {
-	identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
+	identity: Arc<ControlConnectionIdentity>,
 	backend:  Arc<AgentCampaignControlBackend>,
 }
 
-impl omp_envd::exthost::control::ControlAuthorityFactory for CampaignControlAuthorityFactory {
+impl ControlAuthorityFactory for CampaignControlAuthorityFactory {
 	fn bind(
 		&self,
-		identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
-	) -> Result<
-		Arc<dyn omp_envd::exthost::control::ControlAuthority>,
-		omp_envd::exthost::control::ControlCompositionError,
-	> {
+		identity: Arc<ControlConnectionIdentity>,
+	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
 		Ok(Arc::new(CampaignControlAuthority { identity, backend: Arc::clone(&self.backend) }))
 	}
 }
@@ -5254,12 +5092,12 @@ impl omp_envd::exthost::control::ControlAuthorityFactory for CampaignControlAuth
 impl CampaignControlAuthority {
 	fn validate(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+		context: &control::ControlRequestContext,
+	) -> Result<(), ControlProtocolError> {
 		if Arc::ptr_eq(&context.connection, &self.identity) {
 			Ok(())
 		} else {
-			Err(omp_envd::exthost::control::ControlProtocolError::new(
+			Err(ControlProtocolError::new(
 				"StaleGeneration",
 				"campaign CONTROL authority belongs to a replaced connection",
 			))
@@ -5278,7 +5116,7 @@ impl CampaignControlAuthority {
 }
 
 #[async_trait]
-impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
+impl ControlAuthority for CampaignControlAuthority {
 	fn handles(&self, operation: &str) -> bool {
 		matches!(
 			operation,
@@ -5288,17 +5126,17 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 
 	fn authorize(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 		operation: &str,
 		arguments: &serde_json::Map<String, Value>,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<(), ControlProtocolError> {
 		self.validate(context)?;
 		if context
 			.invocation
 			.as_ref()
 			.is_some_and(|invocation| invocation.lifecycle != omp_core::LifecyclePhase::Active)
 		{
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+			return Err(ControlProtocolError::new(
 				"PhaseError",
 				"campaign operations require an active extension lifecycle",
 			));
@@ -5308,13 +5146,13 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 				.get("extension")
 				.and_then(Value::as_str)
 				.unwrap_or(self.identity.extension.as_str());
-			omp_envd::exthost::control::authorize_campaign_read(
+			control::authorize_campaign_read(
 				self.identity.extension.as_str(),
 				target,
 				&self.identity.capabilities,
 			)
 			.map_err(|_| {
-				omp_envd::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"CapabilityError",
 					"cross-extension campaign reads require campaigns.read",
 				)
@@ -5325,10 +5163,10 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 
 	async fn request(
 		&self,
-		context: omp_envd::exthost::control::ControlRequestContext,
+		context: control::ControlRequestContext,
 		operation: Str,
 		arguments: serde_json::Map<String, Value>,
-	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		self.validate(&context)?;
 		match operation.as_str() {
 			"omp.campaigns.engage" => {
@@ -5337,10 +5175,7 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 					.and_then(Value::as_str)
 					.filter(|campaign| !campaign.is_empty())
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"InvalidCampaign",
-							"campaign identity is required",
-						)
+						ControlProtocolError::new("InvalidCampaign", "campaign identity is required")
 					})?;
 				let state = arguments.get("state").and_then(Value::as_str);
 				let queue = arguments
@@ -5357,10 +5192,7 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 					.engage_campaign(spec, machine, omp_agent::EngageOptions { now_ms: now_ms(), queue })
 					.await
 					.map_err(|error| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"CampaignEngageError",
-							Str::from(error.to_string()),
-						)
+						ControlProtocolError::new("CampaignEngageError", Str::from(error.to_string()))
 					})?;
 				let entry = self
 					.backend
@@ -5369,7 +5201,7 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 					.into_iter()
 					.find(|entry| entry.id == receipt.engagement)
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
+						ControlProtocolError::new(
 							"CampaignOwnerError",
 							"accepted campaign is absent from the live agent owner",
 						)
@@ -5397,10 +5229,7 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 					.and_then(Value::as_str)
 					.filter(|engagement| !engagement.is_empty())
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
-							"InvalidCampaign",
-							"engagement identity is required",
-						)
+						ControlProtocolError::new("InvalidCampaign", "engagement identity is required")
 					})?;
 				let owned = self
 					.backend
@@ -5409,7 +5238,7 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 					.into_iter()
 					.any(|entry| entry.id.as_str() == engagement);
 				if !owned {
-					return Err(omp_envd::exthost::control::ControlProtocolError::new(
+					return Err(ControlProtocolError::new(
 						"AuthorizationError",
 						"engagement is not owned by the calling extension",
 					));
@@ -5421,14 +5250,14 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 						.disengage_campaign(Str::from(engagement))
 						.await
 						.map_err(|error| {
-							omp_envd::exthost::control::ControlProtocolError::new(
+							ControlProtocolError::new(
 								"CampaignDisengageError",
 								Str::from(error.to_string()),
 							)
 						})?,
 				))
 			},
-			_ => Err(omp_envd::exthost::control::ControlProtocolError::new(
+			_ => Err(ControlProtocolError::new(
 				"UnknownOperation",
 				"campaign authority does not own this operation",
 			)),
@@ -5437,11 +5266,11 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 
 	async fn effect(
 		&self,
-		context: omp_envd::exthost::control::ControlRequestContext,
-		_effect: omp_envd::exthost::control::ControlEffect,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+		context: control::ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
 		self.validate(&context)?;
-		Err(omp_envd::exthost::control::ControlProtocolError::new(
+		Err(ControlProtocolError::new(
 			"UnsupportedEffect",
 			"campaign mutations are correlated CONTROL operations",
 		))
@@ -5453,7 +5282,7 @@ impl omp_envd::exthost::control::ControlAuthority for CampaignControlAuthority {
 /// Absent providers, routes, or policies leave both bounds unset, which
 /// disables the loop's stream watchdog entirely.
 pub(crate) fn model_stream_watchdog(
-	catalog: &omp_catalog::snapshot::Catalog,
+	catalog: &snapshot::Catalog,
 	model: &str,
 ) -> omp_agent::StreamWatchdog {
 	let watchdog = catalog
@@ -5471,7 +5300,7 @@ pub(crate) fn model_stream_watchdog(
 }
 
 /// Resolves the selected model's total context window.
-pub fn model_context_window(catalog: &omp_catalog::snapshot::Catalog, model: &str) -> Option<u64> {
+pub fn model_context_window(catalog: &snapshot::Catalog, model: &str) -> Option<u64> {
 	catalog
 		.model(omp_catalog::ModelKey::from_ref(model))
 		.or_else(|| catalog.resolve_alias(model))
@@ -5482,7 +5311,7 @@ pub fn model_context_window(catalog: &omp_catalog::snapshot::Catalog, model: &st
 ///
 /// Unknown or missing capability evidence keeps tools advertised; only
 /// explicit `Unsupported` evidence (e.g. Apple's on-device model) strips them.
-fn model_rejects_tools(catalog: &omp_catalog::snapshot::Catalog, model: &str) -> bool {
+fn model_rejects_tools(catalog: &snapshot::Catalog, model: &str) -> bool {
 	catalog
 		.model(omp_catalog::ModelKey::from_ref(model))
 		.or_else(|| catalog.resolve_alias(model))
@@ -5493,7 +5322,7 @@ fn model_rejects_tools(catalog: &omp_catalog::snapshot::Catalog, model: &str) ->
 /// Resolves the interrupted-reasoning continuity dialect from typed catalog
 /// policy.
 pub fn interrupted_reasoning_dialect(
-	catalog: &omp_catalog::snapshot::Catalog,
+	catalog: &snapshot::Catalog,
 	model: &str,
 ) -> omp_agent::InterruptedReasoningDialect {
 	let anthropic = catalog
@@ -5511,10 +5340,7 @@ pub fn interrupted_reasoning_dialect(
 }
 
 /// Reports whether a model selector resolves to an available catalog model.
-pub fn model_selector_is_selectable(
-	catalog: &omp_catalog::snapshot::Catalog,
-	selector: &str,
-) -> bool {
+pub fn model_selector_is_selectable(catalog: &snapshot::Catalog, selector: &str) -> bool {
 	if selector.starts_with('@') {
 		return true;
 	}
@@ -5531,7 +5357,7 @@ pub fn model_selector_is_selectable(
 }
 
 /// Chooses the catalog's deterministic fallback model selector.
-pub fn fallback_model_selector(catalog: &omp_catalog::snapshot::Catalog) -> Option<Str> {
+pub fn fallback_model_selector(catalog: &snapshot::Catalog) -> Option<Str> {
 	let mru = BTreeMap::new();
 	omp_catalog::find_smol(catalog.models(), catalog.routes(), &mru)
 		.or_else(|| omp_catalog::pick_default(catalog.models(), catalog.routes(), &mru))
@@ -5545,7 +5371,7 @@ pub fn fallback_model_selector(catalog: &omp_catalog::snapshot::Catalog) -> Opti
 /// unknown selector fails fast instead of surfacing as a mid-turn
 /// `TargetNotFound`.
 pub fn resolve_model_selector(
-	catalog: &omp_catalog::snapshot::Catalog,
+	catalog: &snapshot::Catalog,
 	selector: &str,
 ) -> Result<Str, ChatError> {
 	if selector.starts_with('@')
@@ -5613,7 +5439,7 @@ pub fn resolve_model_selector(
 }
 /// Selects the exact provider domain receiving an invocation credential.
 pub fn resolve_model_provider(
-	catalog: &omp_catalog::snapshot::Catalog,
+	catalog: &snapshot::Catalog,
 	model: &str,
 	requested: Option<&str>,
 ) -> Result<omp_catalog::ProviderId, ChatError> {
@@ -5645,7 +5471,7 @@ pub fn resolve_model_provider(
 
 /// Canonicalizes and validates a project directory.
 pub fn canonical_project(path: &Path) -> Result<PathBuf, ChatError> {
-	let root = std::fs::canonicalize(path)
+	let root = fs::canonicalize(path)
 		.map_err(|source| ChatError::Project { path: path.to_owned(), source })?;
 	if !root.is_dir() {
 		return Err(ChatError::ProjectNotDirectory(root));
@@ -5673,10 +5499,10 @@ pub fn open_session(
 		Str::from(omp_core::Ulid::generate().to_string())
 	};
 	let path = sessions_dir.join(format!("{}.jsonl", id.as_str()));
-	let mut journal = match open {
+	let journal = match open {
 		SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_) => {
 			validate_session_file(&path).map_err(|source_error| {
-				if source_error.kind() == std::io::ErrorKind::NotFound {
+				if source_error.kind() == io::ErrorKind::NotFound {
 					ChatError::MissingResume(id.clone())
 				} else {
 					ChatError::ProjectState { path: path.clone(), source: source_error }
@@ -5704,7 +5530,7 @@ pub fn open_session(
 			let source_id = source.as_ref().expect("fork has a validated source");
 			let source_path = sessions_dir.join(format!("{}.jsonl", source_id.as_str()));
 			validate_session_file(&source_path).map_err(|source_error| {
-				if source_error.kind() == std::io::ErrorKind::NotFound {
+				if source_error.kind() == io::ErrorKind::NotFound {
 					ChatError::MissingResume(source_id.clone())
 				} else {
 					ChatError::ProjectState { path: source_path.clone(), source: source_error }
@@ -5894,7 +5720,7 @@ pub fn resume_choices(
 	current_id: Option<&Str>,
 ) -> Result<Vec<ResumeChoice>, ChatError> {
 	let pins = PinStore::new(sessions_dir).load()?;
-	let entries = std::fs::read_dir(sessions_dir)
+	let entries = fs::read_dir(sessions_dir)
 		.map_err(|source| ChatError::ProjectState { path: sessions_dir.to_owned(), source })?;
 	let mut choices = Vec::new();
 	for entry in entries {
@@ -5902,12 +5728,12 @@ pub fn resume_choices(
 			continue;
 		};
 		let path = entry.path();
-		if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl")
+		if path.extension().and_then(ffi::OsStr::to_str) != Some("jsonl")
 			|| validate_session_file(&path).is_err()
 		{
 			continue;
 		}
-		let Some(stem) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
+		let Some(stem) = path.file_stem().and_then(ffi::OsStr::to_str) else {
 			continue;
 		};
 		let id = Str::from(stem);
@@ -5939,12 +5765,7 @@ pub fn resume_choices(
 			sf!("{age} · {id}")
 		};
 		let pinned = pins.contains(&id);
-		choices.push((!pinned, std::cmp::Reverse(modified), ResumeChoice {
-			id,
-			label,
-			detail,
-			pinned,
-		}));
+		choices.push((!pinned, cmp::Reverse(modified), ResumeChoice { id, label, detail, pinned }));
 	}
 	choices.sort_by_key(|(unpinned, modified, _)| (*unpinned, *modified));
 	Ok(choices.into_iter().map(|(_, _, choice)| choice).collect())
@@ -6064,7 +5885,7 @@ pub fn strict_session_id(id: &Str) -> Result<Str, ChatError> {
 /// journal identity used by chat and print construction.
 pub fn session_blueprint(
 	model: &str,
-	catalog: &omp_catalog::snapshot::Catalog,
+	catalog: &snapshot::Catalog,
 	root: &Path,
 	additional_roots: &[PathBuf],
 	session_id: &Str,
@@ -6074,8 +5895,7 @@ pub fn session_blueprint(
 	options.additional_roots = additional_roots
 		.iter()
 		.map(|path| {
-			std::fs::canonicalize(path)
-				.map_err(|source| ChatError::Project { path: path.clone(), source })
+			fs::canonicalize(path).map_err(|source| ChatError::Project { path: path.clone(), source })
 		})
 		.collect::<Result<Vec<_>, _>>()?
 		.into_boxed_slice();
@@ -6083,11 +5903,11 @@ pub fn session_blueprint(
 	options.model_selectors = Box::new([Str::new(model)]);
 	let mut workspace = PromptFacts::new(root, Arc::from([]));
 	let mut roots = Vec::with_capacity(options.additional_roots.len() + 1);
-	for (index, path) in std::iter::once(&options.cwd)
+	for (index, path) in iter::once(&options.cwd)
 		.chain(options.additional_roots.iter())
 		.enumerate()
 	{
-		let uri = omp_sdk::Url::from_directory_path(path).map_err(|()| {
+		let uri = Url::from_directory_path(path).map_err(|()| {
 			ChatError::SessionBuild(omp_sdk::SessionBuildError::InvalidRoot { path: path.clone() })
 		})?;
 		let grant = if index == 0 {
@@ -6103,7 +5923,7 @@ pub fn session_blueprint(
 	workspace.roots =
 		WorkspaceRootsInput { revision: 0, primary: roots.first().cloned(), roots: roots.into() };
 	SessionBuilder::new(options, registry)
-		.firehose(Arc::new(omp_telemetry::firehose::Firehose::new()))
+		.firehose(Arc::new(Firehose::new()))
 		.build(catalog, &workspace)
 		.map_err(Into::into)
 }
@@ -6113,18 +5933,18 @@ fn protocol_tool_definition(tool: ToolDefinition) -> Result<inference_pb::ToolDe
 		ToolInputConstraint::JsonSchema { parameters, strict } => {
 			let schema_json =
 				serde_json::to_vec(parameters.as_value()).map_err(ChatError::ToolSchema)?;
-			inference_pb::tool_def::Input::JsonSchema(inference_pb::tool_def::JsonSchema {
+			tool_def::Input::JsonSchema(tool_def::JsonSchema {
 				schema_json: schema_json.into(),
 				strict:      Some(strict),
 			})
 		},
 		ToolInputConstraint::Grammar(grammar) => {
 			let syntax = match grammar.syntax {
-				ToolGrammarSyntax::Lark => inference_pb::tool_def::grammar::Syntax::Lark,
-				ToolGrammarSyntax::Regex => inference_pb::tool_def::grammar::Syntax::Regex,
-				ToolGrammarSyntax::Ebnf => inference_pb::tool_def::grammar::Syntax::Ebnf,
+				ToolGrammarSyntax::Lark => grammar::Syntax::Lark,
+				ToolGrammarSyntax::Regex => grammar::Syntax::Regex,
+				ToolGrammarSyntax::Ebnf => grammar::Syntax::Ebnf,
 			};
-			inference_pb::tool_def::Input::Grammar(inference_pb::tool_def::Grammar {
+			tool_def::Input::Grammar(tool_def::Grammar {
 				syntax:     syntax as i32,
 				definition: grammar.definition.to_string(),
 			})
@@ -6142,7 +5962,7 @@ fn protocol_tool_definition(tool: ToolDefinition) -> Result<inference_pb::ToolDe
 /// Projects a configured session blueprint into initial mutable agent state.
 pub fn agent_snapshot(
 	blueprint: &SessionBlueprint,
-	catalog: &omp_catalog::snapshot::Catalog,
+	catalog: &snapshot::Catalog,
 ) -> Result<AgentSnapshot, ChatError> {
 	let model = blueprint
 		.model_plan()
@@ -6183,7 +6003,7 @@ pub fn agent_snapshot(
 		stream_watchdog: model_stream_watchdog(catalog, model),
 		..TurnOptions::default()
 	};
-	let prepared = crate::prompt_prep::PromptSnapshot::freeze(
+	let prepared = PromptSnapshot::freeze(
 		blueprint.prompt_facts().clone(),
 		registry,
 		Some(&enabled_tools),
@@ -6255,18 +6075,15 @@ pub fn apply_launch_tool_selection(
 }
 
 /// Resolves one CLI reasoning selection against automatic-thinking policy.
-pub fn thinking_effort(
-	level: ThinkingLevel,
-	auto: crate::settings::AutoThinkingSettings,
-) -> inference_pb::Effort {
+pub fn thinking_effort(level: ThinkingLevel, auto: AutoThinkingSettings) -> Effort {
 	match level {
-		ThinkingLevel::Off => inference_pb::Effort::Off,
-		ThinkingLevel::Minimal => inference_pb::Effort::Minimal,
-		ThinkingLevel::Low => inference_pb::Effort::Low,
-		ThinkingLevel::Medium => inference_pb::Effort::Medium,
-		ThinkingLevel::High => inference_pb::Effort::High,
-		ThinkingLevel::Extreme | ThinkingLevel::Max => inference_pb::Effort::Max,
-		ThinkingLevel::XHigh => inference_pb::Effort::Xhigh,
+		ThinkingLevel::Off => Effort::Off,
+		ThinkingLevel::Minimal => Effort::Minimal,
+		ThinkingLevel::Low => Effort::Low,
+		ThinkingLevel::Medium => Effort::Medium,
+		ThinkingLevel::High => Effort::High,
+		ThinkingLevel::Extreme | ThinkingLevel::Max => Effort::Max,
+		ThinkingLevel::XHigh => Effort::Xhigh,
 		ThinkingLevel::Auto => auto
 			.for_turn()
 			.provisional
@@ -6287,24 +6104,27 @@ pub fn now_ms() -> u64 {
 
 /// Creates a private state directory and maps filesystem failures.
 pub fn ensure_state_directory(path: &Path) -> Result<(), ChatError> {
-	std::fs::create_dir_all(path)
+	fs::create_dir_all(path)
 		.map_err(|source| ChatError::ProjectState { path: path.to_owned(), source })
 }
 
-fn validate_session_file(path: &Path) -> std::io::Result<()> {
-	if std::fs::metadata(path)?.is_file() {
+fn validate_session_file(path: &Path) -> io::Result<()> {
+	if fs::metadata(path)?.is_file() {
 		Ok(())
 	} else {
-		Err(std::io::Error::new(
-			std::io::ErrorKind::InvalidData,
-			"session journal is not a regular file",
-		))
+		Err(io::Error::new(io::ErrorKind::InvalidData, "session journal is not a regular file"))
 	}
 }
 
 #[cfg(all(test, unix))]
 mod tests {
-	use std::collections::VecDeque;
+	use std::{
+		collections::VecDeque,
+		fs::{self, OpenOptions},
+		future,
+		io::Write as _,
+		mem,
+	};
 
 	use futures::{Stream, stream};
 	use omp_agent::{InvokeFrame, TurnSession};
@@ -6316,18 +6136,18 @@ mod tests {
 
 	#[test]
 	fn auto_thinking_installs_a_clamped_provisional_effort() {
-		let auto = crate::settings::AutoThinkingSettings {
+		let auto = AutoThinkingSettings {
 			provisional: omp_inference::Difficulty::Max,
 			ceiling: omp_inference::Difficulty::Max,
-			..crate::settings::AutoThinkingSettings::default()
+			..AutoThinkingSettings::default()
 		};
-		assert_eq!(thinking_effort(ThinkingLevel::Auto, auto), inference_pb::Effort::High);
-		assert_eq!(thinking_effort(ThinkingLevel::XHigh, auto), inference_pb::Effort::Xhigh,);
+		assert_eq!(thinking_effort(ThinkingLevel::Auto, auto), Effort::High);
+		assert_eq!(thinking_effort(ThinkingLevel::XHigh, auto), Effort::Xhigh,);
 	}
 
 	#[test]
 	fn model_selector_resolution_covers_keys_aliases_routes_and_unknowns() {
-		let catalog = omp_catalog::snapshot::Catalog::try_embedded().expect("embedded catalog");
+		let catalog = snapshot::Catalog::try_embedded().expect("embedded catalog");
 		assert_eq!(
 			resolve_model_selector(catalog, "apple-intelligence/apple-intelligence")
 				.expect("exact key resolves")
@@ -6376,7 +6196,7 @@ mod tests {
 	/// aggregator instead of failing a misconfigured provider.
 	#[test]
 	fn provider_qualified_selectors_never_shadow_onto_aggregator_flat_ids() {
-		let catalog = omp_catalog::snapshot::Catalog::try_embedded().expect("embedded catalog");
+		let catalog = snapshot::Catalog::try_embedded().expect("embedded catalog");
 
 		// Explicit precedence pair: the same flat id exists both as a canonical
 		// provider key and verbatim under the aggregator.
@@ -6406,7 +6226,7 @@ mod tests {
 		// exact lookups (key, then declared alias) before failing closed, so the
 		// matrix checks them directly instead of paying the unknown-selector
 		// suggestion scan a thousand times over.
-		let mut flat_ids = std::collections::BTreeSet::new();
+		let mut flat_ids = BTreeSet::new();
 		for spec in catalog.models() {
 			let Some((_aggregator, flat_id)) = spec.key.as_str().split_once('/') else {
 				continue;
@@ -6456,14 +6276,14 @@ mod tests {
 			&mut self,
 		) -> impl Stream<Item = Result<inference_pb::TurnEvent, omp_agent::Error>> + Send + Unpin + '_
 		{
-			stream::iter(std::mem::take(&mut self.events))
+			stream::iter(mem::take(&mut self.events))
 		}
 
 		fn submit(
 			&mut self,
 			_frame: InvokeFrame,
 		) -> impl Future<Output = Result<(), omp_agent::Error>> + Send + '_ {
-			std::future::ready(Ok(()))
+			future::ready(Ok(()))
 		}
 	}
 
@@ -6484,9 +6304,9 @@ mod tests {
 				.lock()
 				.pop_front()
 				.expect("one scripted parent outcome");
-			std::future::ready(Ok(ScriptedParentSession {
+			future::ready(Ok(ScriptedParentSession {
 				events: vec![Ok(inference_pb::TurnEvent {
-					event: Some(inference_pb::turn_event::Event::Outcome(outcome)),
+					event: Some(turn_event::Event::Outcome(outcome)),
 				})],
 			}))
 		}
@@ -6580,31 +6400,31 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let root = scratch.path().join("project");
 		let metadata_dir = root.join(".omp");
-		std::fs::create_dir_all(&metadata_dir).expect("project metadata");
-		std::fs::set_permissions(&metadata_dir, std::fs::Permissions::from_mode(0o755))
+		fs::create_dir_all(&metadata_dir).expect("project metadata");
+		fs::set_permissions(&metadata_dir, fs::Permissions::from_mode(0o755))
 			.expect("standard project metadata permissions");
 
 		let state_dir = omp_env::project_state::directory(&scratch.path().join("data"), &root)
 			.expect("project state path");
 		let sessions_dir = state_dir.join("sessions");
 		ensure_state_directory(&sessions_dir).expect("project state");
-		std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755))
+		fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755))
 			.expect("standard project state permissions");
-		std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o755))
+		fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o755))
 			.expect("standard session directory permissions");
 		ensure_state_directory(&state_dir).expect("existing project state directory");
 		ensure_state_directory(&sessions_dir).expect("existing session directory");
 
 		assert!(!state_dir.starts_with(&root));
 		assert_eq!(
-			std::fs::metadata(&metadata_dir)
+			fs::metadata(&metadata_dir)
 				.expect("project metadata")
 				.permissions()
 				.mode() & 0o777,
 			0o755
 		);
 		assert_eq!(
-			std::fs::metadata(&state_dir)
+			fs::metadata(&state_dir)
 				.expect("project state")
 				.permissions()
 				.mode() & 0o777,
@@ -6613,7 +6433,7 @@ mod tests {
 
 		let id = write_session(&sessions_dir, &root, "resume me", None);
 		let path = sessions_dir.join(format!("{id}.jsonl"));
-		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
 			.expect("standard journal permissions");
 		let session = open_session(
 			&root,
@@ -6627,7 +6447,7 @@ mod tests {
 		.expect("resume session");
 		assert_eq!(session.id, id);
 		assert_eq!(
-			std::fs::metadata(path)
+			fs::metadata(path)
 				.expect("session journal")
 				.permissions()
 				.mode() & 0o777,
@@ -6640,7 +6460,7 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let root = scratch.path().join("project");
 		let sessions_dir = root.join("sessions");
-		std::fs::create_dir_all(&sessions_dir).expect("session directory");
+		fs::create_dir_all(&sessions_dir).expect("session directory");
 		let prompt_id = write_session(&sessions_dir, &root, "  first prompt\nignored", None);
 		let titled_id = write_session(
 			&sessions_dir,
@@ -6680,7 +6500,7 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let root = scratch.path().join("project");
 		let sessions_dir = root.join("sessions");
-		std::fs::create_dir_all(&sessions_dir).expect("session directory");
+		fs::create_dir_all(&sessions_dir).expect("session directory");
 		let id = write_session(&sessions_dir, &root, "first prompt", Some("Early title"));
 		let path = sessions_dir.join(format!("{id}.jsonl"));
 
@@ -6697,11 +6517,11 @@ mod tests {
 		)
 		.expect("title line encodes");
 		fixture.extend_from_slice(b"\n{\"ts\":5,\"k\":\"title\",\"title\":\"torn");
-		let mut file = std::fs::OpenOptions::new()
+		let mut file = OpenOptions::new()
 			.append(true)
 			.open(&path)
 			.expect("append fixture");
-		std::io::Write::write_all(&mut file, &fixture).expect("append torn records");
+		file.write_all(&fixture).expect("append torn records");
 		drop(file);
 
 		let metadata = session_metadata(&path).expect("probe survives torn records");
@@ -6719,7 +6539,7 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let root = scratch.path().join("project");
 		let sessions_dir = root.join("sessions");
-		std::fs::create_dir_all(&sessions_dir).expect("session directory");
+		fs::create_dir_all(&sessions_dir).expect("session directory");
 
 		// An eagerly created, immediately abandoned session: header only.
 		let empty_id = Str::from(omp_core::Ulid::generate().to_string());
@@ -6753,11 +6573,11 @@ mod tests {
 	fn session_metadata_rejects_files_without_a_valid_header() {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let empty = scratch.path().join("empty.jsonl");
-		std::fs::write(&empty, b"").expect("empty fixture");
+		fs::write(&empty, b"").expect("empty fixture");
 		assert!(session_metadata(&empty).is_none());
 
 		let garbage = scratch.path().join("garbage.jsonl");
-		std::fs::write(&garbage, b"{not a header}\n{\"ts\":1,\"k\":\"reset\"}\n")
+		fs::write(&garbage, b"{not a header}\n{\"ts\":1,\"k\":\"reset\"}\n")
 			.expect("garbage fixture");
 		assert!(session_metadata(&garbage).is_none());
 	}
@@ -6767,14 +6587,15 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let root = scratch.path().join("project");
 		let sessions_dir = root.join("sessions");
-		std::fs::create_dir_all(&sessions_dir).expect("session directory");
+		fs::create_dir_all(&sessions_dir).expect("session directory");
 		let id = write_session(&sessions_dir, &root, "resume me", None);
 		let path = sessions_dir.join(format!("{id}.jsonl"));
-		let mut file = std::fs::OpenOptions::new()
+		let mut file = OpenOptions::new()
 			.append(true)
 			.open(&path)
 			.expect("append torn fragment");
-		std::io::Write::write_all(&mut file, br#"{"ts":9,"k":"title","title":"tor"#)
+		file
+			.write_all(br#"{"ts":9,"k":"title","title":"tor"#)
 			.expect("write torn fragment");
 		drop(file);
 
@@ -6798,7 +6619,7 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("chat parent scratch");
 		let root = scratch.path().join("project");
 		let sessions_dir = root.join("sessions");
-		std::fs::create_dir_all(&sessions_dir).expect("session directory");
+		fs::create_dir_all(&sessions_dir).expect("session directory");
 		let inputs = Arc::new(Mutex::new(Vec::new()));
 		let options = Arc::new(Mutex::new(Vec::new()));
 		let client = ScriptedParentClient {
@@ -6845,7 +6666,7 @@ mod tests {
 			)
 			.expect("root registration");
 
-		let completion = omp_envd::eval::ParentSessionHost::completion(
+		let completion = ParentSessionHost::completion(
 			&host,
 			json!({"prompt":"complete this","model":"default"}),
 			&omp_envd::eval::NoopBridgeProgress,
@@ -6854,14 +6675,14 @@ mod tests {
 		.expect("live completion call");
 		assert_eq!(completion, json!({"text":"completion answer"}));
 
-		let concurrency = omp_envd::eval::ParentSessionHost::concurrency(&host, json!({}))
+		let concurrency = ParentSessionHost::concurrency(&host, json!({}))
 			.await
 			.expect("concurrency bridge call");
 		assert_eq!(concurrency, json!({ "limit": DEFAULT_EVAL_CONCURRENCY_LIMIT }));
 
-		let agent = tokio::time::timeout(
-			std::time::Duration::from_secs(1),
-			omp_envd::eval::ParentSessionHost::agent(
+		let agent = time::timeout(
+			Duration::from_secs(1),
+			ParentSessionHost::agent(
 				&host,
 				json!({"prompt":"delegate this","agent":"task"}),
 				&omp_envd::eval::NoopBridgeProgress,
@@ -6876,7 +6697,7 @@ mod tests {
 			.as_str()
 			.filter(|id| !id.is_empty())
 			.expect("agent bridge did not return its durable child id");
-		let follow_up = omp_envd::eval::ParentSessionHost::agent(
+		let follow_up = ParentSessionHost::agent(
 			&host,
 			json!({"prompt":"follow up","agent":"task","stableId":stable_id}),
 			&omp_envd::eval::NoopBridgeProgress,
@@ -6950,10 +6771,10 @@ mod protocol_tests {
 		};
 
 		let projected = protocol_tool_definition(tool).expect("edit grammar projects");
-		let Some(inference_pb::tool_def::Input::Grammar(grammar)) = projected.input else {
+		let Some(tool_def::Input::Grammar(grammar)) = projected.input else {
 			panic!("edit must remain a native grammar tool");
 		};
-		assert_eq!(grammar.syntax, inference_pb::tool_def::grammar::Syntax::Lark as i32);
+		assert_eq!(grammar.syntax, grammar::Syntax::Lark as i32);
 		assert_eq!(grammar.definition, EDIT_GRAMMAR);
 	}
 }

@@ -3,7 +3,8 @@
 use std::{
 	collections::HashMap,
 	future::Future,
-	path::Path,
+	io,
+	path::{Path, PathBuf},
 	sync::{Arc, LazyLock},
 };
 
@@ -12,8 +13,8 @@ use omp_core::{Hash32, Str, hex, sf};
 #[cfg(test)]
 use omp_proto::thread::v1::Item;
 use omp_proto::{
-	inference::v1 as inference,
-	thread::v1::{self as thread, Thread},
+	inference::v1::{self as inference, value},
+	thread::v1::{self as thread, Thread, item, part},
 };
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -58,14 +59,14 @@ impl AttachmentIndex {
 			.iter()
 			.rev()
 			.find_map(|item| match item.kind.as_ref() {
-				Some(thread::item::Kind::Message(message))
+				Some(item::Kind::Message(message))
 					if thread::Role::try_from(message.role) == Ok(thread::Role::User) =>
 				{
 					let blobs: Vec<_> = message
 						.parts
 						.iter()
 						.filter_map(|part| match part.kind.as_ref() {
-							Some(thread::part::Kind::Blob(blob)) if blob.mime.starts_with("image/") => {
+							Some(part::Kind::Blob(blob)) if blob.mime.starts_with("image/") => {
 								Some(blob.clone())
 							},
 							_ => None,
@@ -159,19 +160,19 @@ pub enum ImageDescriptionError {
 	#[error("could not create image fallback directory {path:?}")]
 	CreateDirectory {
 		/// Directory that could not be created.
-		path:   std::path::PathBuf,
+		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// One content-addressed image could not be persisted.
 	#[error("could not persist image fallback artifact {path:?}")]
 	Write {
 		/// Artifact path that could not be written.
-		path:   std::path::PathBuf,
+		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 }
 
@@ -260,7 +261,7 @@ pub fn normalize_latest_inline_images<E>(
 		.iter_mut()
 		.rev()
 		.find_map(|item| match item.kind.as_mut() {
-			Some(thread::item::Kind::Message(message))
+			Some(item::Kind::Message(message))
 				if thread::Role::try_from(message.role) == Ok(thread::Role::User)
 					&& message.parts.iter().any(is_image_part) =>
 			{
@@ -272,7 +273,7 @@ pub fn normalize_latest_inline_images<E>(
 		return Ok(());
 	};
 	for part in &mut message.parts {
-		let Some(thread::part::Kind::Blob(blob)) = part.kind.as_mut() else {
+		let Some(part::Kind::Blob(blob)) = part.kind.as_mut() else {
 			continue;
 		};
 		if !blob.mime.starts_with("image/") || blob.inline.is_empty() {
@@ -330,17 +331,17 @@ pub fn clamp_provider_images(thread: &mut Thread, provider: Option<&str>) -> usi
 		.iter()
 		.filter_map(|item| item.kind.as_ref())
 		.map(|kind| match kind {
-			thread::item::Kind::Message(message) => message
+			item::Kind::Message(message) => message
 				.parts
 				.iter()
 				.filter(|part| is_image_part(part))
 				.count(),
-			thread::item::Kind::ToolResult(result) => result
+			item::Kind::ToolResult(result) => result
 				.parts
 				.iter()
 				.filter(|part| is_image_part(part))
 				.count(),
-			thread::item::Kind::ToolCall(_) => 0,
+			item::Kind::ToolCall(_) => 0,
 		})
 		.sum::<usize>();
 	let mut remaining = total.saturating_sub(budget);
@@ -350,7 +351,7 @@ pub fn clamp_provider_images(thread: &mut Thread, provider: Option<&str>) -> usi
 			break;
 		}
 		match item.kind.as_mut() {
-			Some(thread::item::Kind::Message(message)) => {
+			Some(item::Kind::Message(message)) => {
 				message.parts.retain(|part| {
 					if remaining != 0 && is_image_part(part) {
 						remaining -= 1;
@@ -360,7 +361,7 @@ pub fn clamp_provider_images(thread: &mut Thread, provider: Option<&str>) -> usi
 					}
 				});
 			},
-			Some(thread::item::Kind::ToolResult(result)) => {
+			Some(item::Kind::ToolResult(result)) => {
 				result.parts.retain(|part| {
 					if remaining != 0 && is_image_part(part) {
 						remaining -= 1;
@@ -371,13 +372,11 @@ pub fn clamp_provider_images(thread: &mut Thread, provider: Option<&str>) -> usi
 				});
 				if result.parts.is_empty() {
 					result.parts.push(thread::Part {
-						kind: Some(thread::part::Kind::Text(
-							"[image omitted: provider image limit]".to_owned(),
-						)),
+						kind: Some(part::Kind::Text("[image omitted: provider image limit]".to_owned())),
 					});
 				}
 			},
-			Some(thread::item::Kind::ToolCall(_)) | None => {},
+			Some(item::Kind::ToolCall(_)) | None => {},
 		}
 	}
 	dropped
@@ -399,7 +398,7 @@ pub fn describe_images_for_text_model(
 	let mut ordinal = 0_usize;
 	let mut replaced = 0_usize;
 	for item in &mut thread.items {
-		let Some(thread::item::Kind::Message(message)) = item.kind.as_mut() else {
+		let Some(item::Kind::Message(message)) = item.kind.as_mut() else {
 			continue;
 		};
 		let mut parts = Vec::with_capacity(message.parts.len());
@@ -410,7 +409,7 @@ pub fn describe_images_for_text_model(
 					|| sf!("[Image #{number}: description unavailable]"),
 					|text| sf!("[Image #{number}: {}]", text.as_str()),
 				);
-				parts.push(thread::Part { kind: Some(thread::part::Kind::Text(description.into())) });
+				parts.push(thread::Part { kind: Some(part::Kind::Text(description.into())) });
 				ordinal += 1;
 				replaced += 1;
 			} else {
@@ -424,7 +423,7 @@ pub fn describe_images_for_text_model(
 				.get_or_insert_default()
 				.fields
 				.insert("omp/hidden-image-description".to_owned(), inference::Value {
-					kind: Some(inference::value::Kind::Bool(true)),
+					kind: Some(value::Kind::Bool(true)),
 				});
 		}
 	}
@@ -432,7 +431,7 @@ pub fn describe_images_for_text_model(
 }
 
 fn is_image_part(part: &thread::Part) -> bool {
-	matches!(part.kind.as_ref(), Some(thread::part::Kind::Blob(blob)) if blob.mime.starts_with("image/"))
+	matches!(part.kind.as_ref(), Some(part::Kind::Blob(blob)) if blob.mime.starts_with("image/"))
 }
 
 #[cfg(test)]
@@ -441,7 +440,7 @@ mod tests {
 
 	fn image(byte: u8) -> thread::Part {
 		thread::Part {
-			kind: Some(thread::part::Kind::Blob(thread::Blob {
+			kind: Some(part::Kind::Blob(thread::Blob {
 				hash: vec![byte; 32].into(),
 				mime: "image/png".to_owned(),
 				size: 1,
@@ -455,7 +454,7 @@ mod tests {
 		Item {
 			seq:           0,
 			created_at_ms: 0,
-			kind:          Some(thread::item::Kind::Message(thread::Message {
+			kind:          Some(item::Kind::Message(thread::Message {
 				role: thread::Role::User as i32,
 				parts,
 			})),

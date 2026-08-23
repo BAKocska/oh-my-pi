@@ -1,3 +1,6 @@
+//! Verifies environment protocol envelopes preserve effect identity and
+//! privileged attribution.
+
 use omp_proto::{
 	env::v1::{
 		DataRequest, PrivilegedMutationIntent, PrivilegedWriteIntent, ResourceCompleteRequest,

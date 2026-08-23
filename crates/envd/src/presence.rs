@@ -1,5 +1,7 @@
 //! Daemon-owned project client-presence leases.
 
+#[cfg(not(any(unix, windows)))]
+use std::process;
 use std::{
 	collections::HashMap,
 	fs, io,
@@ -14,7 +16,7 @@ use thiserror::Error;
 
 /// Failure to maintain daemon-owned client presence.
 #[derive(Debug, Error)]
-pub(crate) enum PresenceError {
+pub enum PresenceError {
 	/// The private client directory could not be created.
 	#[error("failed to create daemon client-presence directory at {path}")]
 	CreateDirectory {
@@ -264,11 +266,13 @@ fn process_is_live(pid: u32) -> bool {
 
 #[cfg(not(any(unix, windows)))]
 fn process_is_live(pid: u32) -> bool {
-	pid == std::process::id()
+	pid == process::id()
 }
 
 #[cfg(test)]
 mod tests {
+	use std::process;
+
 	use omp_core::sf;
 
 	use super::*;
@@ -292,13 +296,13 @@ mod tests {
 		let project = tempfile::tempdir().expect("project directory");
 		let registry = PresenceRegistry::new(state.path(), project.path());
 		let lease = registry
-			.register(sf!("client-a"), std::process::id(), sf!("interactive"))
+			.register(sf!("client-a"), process::id(), sf!("interactive"))
 			.expect("register presence");
 
 		let records = records(&state.path().join("clients"));
 		assert_eq!(records.len(), 1);
 		assert_eq!(records[0].client_id, sf!("client-a"));
-		assert_eq!(records[0].pid, std::process::id());
+		assert_eq!(records[0].pid, process::id());
 		assert_eq!(records[0].kind, sf!("interactive"));
 		assert_eq!(records[0].project_dir, project.path());
 		assert_eq!(records[0].id, *lease.id());
@@ -310,7 +314,7 @@ mod tests {
 		let project = tempfile::tempdir().expect("project directory");
 		let registry = PresenceRegistry::new(state.path(), project.path());
 		let lease = registry
-			.register(sf!("client-a"), std::process::id(), sf!("print"))
+			.register(sf!("client-a"), process::id(), sf!("print"))
 			.expect("register presence");
 
 		lease.release().expect("release presence");
@@ -337,7 +341,7 @@ mod tests {
 		.expect("write stale record");
 		let registry = PresenceRegistry::new(state.path(), project.path());
 		let _live = registry
-			.register(sf!("client-a"), std::process::id(), sf!("rpc"))
+			.register(sf!("client-a"), process::id(), sf!("rpc"))
 			.expect("register live presence");
 
 		let records = records(&clients);
@@ -351,10 +355,10 @@ mod tests {
 		let project = tempfile::tempdir().expect("project directory");
 		let registry = PresenceRegistry::new(state.path(), project.path());
 		let _first = registry
-			.register(sf!("client-a"), std::process::id(), sf!("interactive"))
+			.register(sf!("client-a"), process::id(), sf!("interactive"))
 			.expect("register first presence");
 		let _second = registry
-			.register(sf!("client-b"), std::process::id(), sf!("rpc"))
+			.register(sf!("client-b"), process::id(), sf!("rpc"))
 			.expect("register second presence");
 
 		let records = records(&state.path().join("clients"));

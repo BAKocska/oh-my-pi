@@ -5,9 +5,12 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
+use super::openai_chat;
 use crate::{
 	answer::{AudioChunk, RealtimeEvent, RealtimeInput},
+	body::BodySource,
 	call::{
 		AudioFormat, OpaqueJson, RealtimeEagerness, RealtimeModality, RealtimeRequest, Setting,
 		ToolDefinition, ToolResultContent, TurnDetection,
@@ -18,7 +21,9 @@ use crate::{
 		RequestMethod, SizeBounds,
 	},
 	error::{Error, ErrorKind, ErrorPhase, RetryAction},
-	receipt::ExecutionReceipt,
+	event::{BlockKind, ChatEvent, Completion, FinishReason, ToolCall},
+	id::ToolCallId,
+	receipt::{ExecutionReceipt, Usage},
 	transport::FramingProtocol,
 };
 
@@ -29,8 +34,8 @@ pub fn encode_handshake(
 	wire_model: &str,
 	maximum_frame_bytes: u64,
 ) -> Result<EncodedRequest, Error> {
-	let endpoint = super::openai_chat::join_uri(base_url, "/realtime");
-	let mut uri = url::Url::parse(endpoint.as_str()).map_err(|_| capability_error())?;
+	let endpoint = openai_chat::join_uri(base_url, "/realtime");
+	let mut uri = Url::parse(endpoint.as_str()).map_err(|_| capability_error())?;
 	uri.set_query(None);
 	uri.query_pairs_mut().append_pair("model", wire_model);
 	Ok(EncodedRequest::new(
@@ -39,7 +44,7 @@ pub fn encode_handshake(
 		Str::new(&uri),
 		vec![RequestHeader { name: sf!("openai-beta"), value: sf!("realtime=v1") }]
 			.into_boxed_slice(),
-		crate::body::BodySource::Bytes(Bytes::new()),
+		BodySource::Bytes(Bytes::new()),
 		FramingProtocol::WebSocket,
 		SizeBounds { request_body: 0, frame: maximum_frame_bytes, response: u64::MAX },
 	))
@@ -150,10 +155,7 @@ impl RealtimeWireCodec for OpenAiRealtimeWireCodec {
 			| ServerEvent::AudioTranscriptDelta { item_id, output_index, delta } => {
 				let index = output_index.unwrap_or_else(|| stable_index(item_id.as_str()));
 				self.next_call_index = self.next_call_index.max(index.saturating_add(1));
-				events.push(RealtimeEvent::Chat(crate::event::ChatEvent::TextDelta {
-					index,
-					text: delta,
-				}));
+				events.push(RealtimeEvent::Chat(ChatEvent::TextDelta { index, text: delta }));
 			},
 			ServerEvent::ContentPartAdded {
 				item_id,
@@ -162,10 +164,8 @@ impl RealtimeWireCodec for OpenAiRealtimeWireCodec {
 			} => {
 				let index = output_index.unwrap_or_else(|| stable_index(item_id.as_str()));
 				self.next_call_index = self.next_call_index.max(index.saturating_add(1));
-				events.push(RealtimeEvent::Chat(crate::event::ChatEvent::BlockStarted {
-					index,
-					kind: crate::event::BlockKind::Text,
-				}));
+				events
+					.push(RealtimeEvent::Chat(ChatEvent::BlockStarted { index, kind: BlockKind::Text }));
 			},
 			ServerEvent::ContentPartAdded { part: RealtimeContentPart::Audio, .. } => {},
 			ServerEvent::OutputItemAdded {
@@ -179,13 +179,13 @@ impl RealtimeWireCodec for OpenAiRealtimeWireCodec {
 					arguments: String::new(),
 				});
 				self.next_call_index = self.next_call_index.max(index.saturating_add(1));
-				events.push(RealtimeEvent::Chat(crate::event::ChatEvent::BlockStarted {
+				events.push(RealtimeEvent::Chat(ChatEvent::BlockStarted {
 					index,
-					kind: crate::event::BlockKind::ToolCall,
+					kind: BlockKind::ToolCall,
 				}));
-				events.push(RealtimeEvent::Chat(crate::event::ChatEvent::ToolCallStarted {
+				events.push(RealtimeEvent::Chat(ChatEvent::ToolCallStarted {
 					index,
-					id: crate::id::ToolCallId::from(call_id),
+					id: ToolCallId::from(call_id),
 					name,
 				}));
 			},
@@ -193,7 +193,7 @@ impl RealtimeWireCodec for OpenAiRealtimeWireCodec {
 			ServerEvent::FunctionCallDelta { call_id, delta } => {
 				let call = self.calls.get_mut(&call_id).ok_or_else(protocol_error)?;
 				call.arguments.push_str(delta.as_str());
-				events.push(RealtimeEvent::Chat(crate::event::ChatEvent::ToolArgumentsDelta {
+				events.push(RealtimeEvent::Chat(ChatEvent::ToolArgumentsDelta {
 					index: call.index,
 					bytes: Bytes::copy_from_slice(delta.as_bytes()),
 				}));
@@ -211,23 +211,23 @@ impl RealtimeWireCodec for OpenAiRealtimeWireCodec {
 					call.arguments = arguments.to_string();
 				}
 				let value = serde_json::from_str(&call.arguments).map_err(|_| protocol_error())?;
-				events.push(RealtimeEvent::Chat(crate::event::ChatEvent::ToolCallReady {
+				events.push(RealtimeEvent::Chat(ChatEvent::ToolCallReady {
 					index: call.index,
-					call:  crate::event::ToolCall {
-						id:        crate::id::ToolCallId::from(call_id),
+					call:  ToolCall {
+						id:        ToolCallId::from(call_id),
 						name:      call.name,
 						arguments: OpaqueJson::new(value),
 					},
 				}));
 			},
-			ServerEvent::ResponseDone => events.push(RealtimeEvent::Chat(
-				crate::event::ChatEvent::Completed(crate::event::Completion {
-					reason:  crate::event::FinishReason::Stop,
+			ServerEvent::ResponseDone => {
+				events.push(RealtimeEvent::Chat(ChatEvent::Completed(Completion {
+					reason:  FinishReason::Stop,
 					blocks:  self.next_call_index,
-					usage:   crate::receipt::Usage::default(),
+					usage:   Usage::default(),
 					receipt: ExecutionReceipt::default().into(),
-				}),
-			)),
+				})))
+			},
 			ServerEvent::Error { error } => return Err(provider_error(error)),
 		}
 		Ok(events)
@@ -592,19 +592,24 @@ fn protocol_error() -> Error {
 
 #[cfg(test)]
 mod tests {
+	use std::sync;
+
 	use super::*;
-	use crate::event::{BlockKind, ChatEvent};
+	use crate::{
+		call::NegotiationPolicy,
+		event::{BlockKind, ChatEvent},
+	};
 
 	fn codec() -> OpenAiRealtimeWireCodec {
 		OpenAiRealtimeWireCodec::new(RealtimeRequest {
 			instructions:   None,
-			modalities:     std::sync::Arc::from([RealtimeModality::Text]),
+			modalities:     sync::Arc::from([RealtimeModality::Text]),
 			voice:          None,
 			input_audio:    Setting::Unset,
 			output_audio:   Setting::Unset,
 			turn_detection: Setting::Unset,
-			tools:          std::sync::Arc::from([]),
-			negotiation:    crate::call::NegotiationPolicy::default(),
+			tools:          sync::Arc::from([]),
+			negotiation:    NegotiationPolicy::default(),
 		})
 	}
 

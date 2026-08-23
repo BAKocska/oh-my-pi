@@ -1,6 +1,7 @@
 //! Callback-capable native session construction.
 
 use std::{
+	iter,
 	path::PathBuf,
 	sync::Arc,
 	time::{Instant, SystemTime, UNIX_EPOCH},
@@ -19,8 +20,8 @@ use url::Url;
 
 use super::{
 	LaunchDiagnostic, LspSessionBinding, ModelCandidateState, ModelFallbackDiagnostic,
-	ServiceTierDiagnostic, SessionDiagnostics, SessionHandle, SessionIdentity, SessionOptions,
-	SessionRevivalFactory, SessionRuntime, ThinkingCeiling, ThinkingDiagnostic,
+	ServiceTierDiagnostic, SessionDiagnostics, SessionHandle, SessionHandleError, SessionIdentity,
+	SessionOptions, SessionRevivalFactory, SessionRuntime, ThinkingCeiling, ThinkingDiagnostic,
 };
 use crate::{
 	CallbackSet, ContextPatchHandler, CredentialCallback, EventCallback, FirstDispatchCallback,
@@ -138,7 +139,7 @@ impl SessionBlueprint {
 		identity: SessionIdentity,
 		runtime: SessionRuntime,
 		revival: Option<SessionRevivalFactory>,
-	) -> Result<SessionHandle, super::SessionHandleError> {
+	) -> Result<SessionHandle, SessionHandleError> {
 		SessionHandle::launch(
 			identity,
 			self.diagnostics,
@@ -156,7 +157,7 @@ impl SessionBlueprint {
 		self,
 		identity: SessionIdentity,
 		revival: SessionRevivalFactory,
-	) -> Result<SessionHandle, super::SessionHandleError> {
+	) -> Result<SessionHandle, SessionHandleError> {
 		SessionHandle::launch(
 			identity,
 			self.diagnostics,
@@ -552,7 +553,7 @@ fn prepare_roots(
 	options: &SessionOptions,
 ) -> Result<Box<[WorkspaceRootDescriptor]>, SessionBuildError> {
 	let mut roots = Vec::with_capacity(options.additional_roots.len() + 1);
-	for (index, path) in std::iter::once(&options.cwd)
+	for (index, path) in iter::once(&options.cwd)
 		.chain(options.additional_roots.iter())
 		.enumerate()
 	{

@@ -6,8 +6,11 @@ pub mod types;
 
 use std::{
 	collections::BTreeSet,
+	convert,
 	error::Error as StdError,
+	fs,
 	future::Future,
+	io,
 	path::{Path, PathBuf},
 };
 
@@ -126,7 +129,7 @@ pub enum Error<E: StdError + 'static> {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// Restricted session or document authority failed.
 	#[error("compress runtime host failed")]
@@ -141,7 +144,7 @@ pub enum Error<E: StdError + 'static> {
 pub fn resolve_targets(
 	patterns: &[Str],
 	cwd: &Path,
-) -> Result<Vec<PathBuf>, Error<std::convert::Infallible>> {
+) -> Result<Vec<PathBuf>, Error<convert::Infallible>> {
 	let all_files = walk_files(cwd)?;
 	let mut targets = BTreeSet::new();
 	for pattern in patterns {
@@ -161,7 +164,7 @@ pub fn resolve_targets(
 		} else {
 			let path = cwd.join(pattern.as_str());
 			let metadata =
-				std::fs::metadata(&path).map_err(|source| Error::Io { path: path.clone(), source })?;
+				fs::metadata(&path).map_err(|source| Error::Io { path: path.clone(), source })?;
 			if !metadata.is_file() {
 				return Err(Error::NotFile { path });
 			}
@@ -175,11 +178,11 @@ pub fn resolve_targets(
 	Ok(targets.into_iter().collect())
 }
 
-fn walk_files(root: &Path) -> Result<Vec<PathBuf>, Error<std::convert::Infallible>> {
+fn walk_files(root: &Path) -> Result<Vec<PathBuf>, Error<convert::Infallible>> {
 	let mut files = Vec::new();
 	let mut pending = vec![root.to_path_buf()];
 	while let Some(directory) = pending.pop() {
-		let entries = std::fs::read_dir(&directory)
+		let entries = fs::read_dir(&directory)
 			.map_err(|source| Error::Io { path: directory.clone(), source })?;
 		for entry in entries {
 			let entry = entry.map_err(|source| Error::Io { path: directory.clone(), source })?;
@@ -286,9 +289,7 @@ fn validate<E: StdError + 'static>(args: &CompressArgs) -> Result<(), Error<E>> 
 	}
 }
 
-fn convert_discovery_error<E: StdError + 'static>(
-	error: Error<std::convert::Infallible>,
-) -> Error<E> {
+fn convert_discovery_error<E: StdError + 'static>(error: Error<convert::Infallible>) -> Error<E> {
 	match error {
 		Error::MissingFiles => Error::MissingFiles,
 		Error::InvalidRounds => Error::InvalidRounds,

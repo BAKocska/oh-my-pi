@@ -3,12 +3,16 @@ pub mod profile;
 
 use std::{
 	collections::BTreeMap,
+	env, fs, io,
 	path::{Component, Path, PathBuf},
+	str,
 	time::SystemTime,
 };
 
 use serde::Serialize;
 use thiserror::Error;
+
+use crate::debug;
 
 /// Default maximum uncompressed bytes admitted to one bundle.
 pub const DEFAULT_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -86,7 +90,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// Destination archive could not be written.
 	#[error("cannot write diagnostic archive {path}")]
@@ -95,7 +99,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A caller supplied an unsafe archive member path.
 	#[error("unsafe diagnostic member path {path}")]
@@ -147,7 +151,7 @@ pub fn create_bundle(spec: BundleSpec) -> Result<BundleSummary, Error> {
 	}
 	let settings = serde_json::to_vec_pretty(&sanitize_json(spec.settings))?;
 	collector.add_bytes("facts/settings.json", settings, true)?;
-	let system = serde_json::to_vec_pretty(&crate::debug::collect_system_facts())?;
+	let system = serde_json::to_vec_pretty(&debug::collect_system_facts())?;
 	collector.add_bytes("facts/system.json", system, true)?;
 	let environment = serde_json::to_vec_pretty(&sanitized_environment())?;
 	collector.add_bytes("facts/environment.json", environment, true)?;
@@ -174,10 +178,10 @@ pub fn create_bundle(spec: BundleSpec) -> Result<BundleSummary, Error> {
 		.parent()
 		.filter(|parent| !parent.as_os_str().is_empty())
 	{
-		std::fs::create_dir_all(parent)
+		fs::create_dir_all(parent)
 			.map_err(|source| Error::Write { path: spec.output.clone(), source })?;
 	}
-	std::fs::write(&spec.output, archive)
+	fs::write(&spec.output, archive)
 		.map_err(|source| Error::Write { path: spec.output.clone(), source })?;
 	Ok(BundleSummary { output: spec.output, files, uncompressed_bytes, omitted: collector.omitted })
 }
@@ -204,20 +208,20 @@ impl Collector {
 
 	fn add_file(&mut self, member: &str, source_path: &Path, textual: bool) -> Result<(), Error> {
 		validate_member(member)?;
-		let metadata = std::fs::metadata(source_path)
+		let metadata = fs::metadata(source_path)
 			.map_err(|source| Error::Read { path: source_path.to_path_buf(), source })?;
 		if metadata.len() > self.file_max || metadata.len() > self.max.saturating_sub(self.used) {
 			self.omitted += 1;
 			return Ok(());
 		}
-		let bytes = std::fs::read(source_path)
+		let bytes = fs::read(source_path)
 			.map_err(|source| Error::Read { path: source_path.to_path_buf(), source })?;
 		self.add_bytes(member, bytes, textual)
 	}
 
 	fn add_bytes(&mut self, member: &str, mut bytes: Vec<u8>, textual: bool) -> Result<(), Error> {
 		validate_member(member)?;
-		if textual || std::str::from_utf8(&bytes).is_ok() {
+		if textual || str::from_utf8(&bytes).is_ok() {
 			let text = String::from_utf8_lossy(&bytes);
 			bytes = omp_telemetry::redact::redact_sensitive_credentials(&text).into_bytes();
 		}
@@ -276,7 +280,7 @@ fn sanitized_environment() -> BTreeMap<&'static str, String> {
 	SAFE
 		.iter()
 		.filter_map(|name| {
-			std::env::var(name)
+			env::var(name)
 				.ok()
 				.map(|value| (*name, omp_telemetry::redact::redact_sensitive_credentials(&value)))
 		})

@@ -1,5 +1,7 @@
 //! Parsers for GNU size, signed-count, and duration arguments.
 
+#[cfg(target_os = "macos")]
+use std::{mem, ptr};
 use std::{num::IntErrorKind, time::Duration};
 
 use bigdecimal::BigDecimal;
@@ -442,15 +444,15 @@ fn total_physical_memory_bytes() -> Option<u128> {
 
 #[cfg(target_os = "macos")]
 fn total_physical_memory_bytes() -> Option<u128> {
-	let mut size = std::mem::size_of::<u64>();
+	let mut size = mem::size_of::<u64>();
 	let mut bytes = 0_u64;
 	// SAFETY: The output buffer is a `u64`, and `size` accurately describes it.
 	let result = unsafe {
 		libc::sysctlbyname(
 			c"hw.memsize".as_ptr(),
-			std::ptr::from_mut(&mut bytes).cast(),
+			ptr::from_mut(&mut bytes).cast(),
 			&mut size,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			0,
 		)
 	};

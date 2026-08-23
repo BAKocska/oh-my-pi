@@ -4,7 +4,14 @@
 /// Linux zero-copy pipe helpers.
 pub(crate) mod pipes {
 	#[cfg(any(target_os = "linux", target_os = "android"))]
-	use std::{fs::File, io, os::fd::AsFd};
+	use std::{
+		fs::{self, File, OpenOptions},
+		io,
+		os::fd::AsFd,
+	};
+
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	use rustix::pipe::SpliceFlags;
 
 	/// Largest pipe capacity an unprivileged Linux process may normally request.
 	#[cfg(any(target_os = "linux", target_os = "android"))]
@@ -27,7 +34,7 @@ pub(crate) mod pipes {
 		target: &impl AsFd,
 		length: usize,
 	) -> io::Result<usize> {
-		rustix::pipe::splice(source, None, target, None, length, rustix::pipe::SpliceFlags::empty())
+		rustix::pipe::splice(source, None, target, None, length, SpliceFlags::empty())
 			.map_err(io::Error::from)
 	}
 
@@ -55,10 +62,7 @@ pub(crate) mod pipes {
 	/// Opens `/dev/null` only when it has the expected Linux device number.
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	pub(crate) fn dev_null() -> Option<File> {
-		let null = std::fs::OpenOptions::new()
-			.write(true)
-			.open("/dev/null")
-			.ok()?;
+		let null = OpenOptions::new().write(true).open("/dev/null").ok()?;
 		let stat = rustix::fs::fstat(&null).ok()?;
 		(rustix::fs::major(stat.st_rdev) == 1 && rustix::fs::minor(stat.st_rdev) == 3).then_some(null)
 	}
@@ -66,15 +70,17 @@ pub(crate) mod pipes {
 
 /// Signal-adjacent stdout health probes.
 pub(crate) mod signals {
+	#[cfg(target_os = "linux")]
+	use std::{io, mem};
 	/// Returns whether stdout is not a FIFO with a broken or hung-up reader.
 	#[cfg(target_os = "linux")]
-	pub(crate) fn ensure_stdout_not_broken() -> std::io::Result<bool> {
+	pub(crate) fn ensure_stdout_not_broken() -> io::Result<bool> {
 		use std::os::fd::AsRawFd;
-		let fd = std::io::stdout().as_raw_fd();
-		let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+		let fd = io::stdout().as_raw_fd();
+		let mut stat = mem::MaybeUninit::<libc::stat>::uninit();
 		// SAFETY: `fd` is live and `stat` points to writable storage.
 		if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-			return Err(std::io::Error::last_os_error());
+			return Err(io::Error::last_os_error());
 		}
 		// SAFETY: successful `fstat` initialized the structure.
 		let stat = unsafe { stat.assume_init() };
@@ -87,7 +93,7 @@ pub(crate) mod signals {
 		// nonblocking.
 		let result = unsafe { libc::poll(&raw mut poll_fd, 1, 0) };
 		if result < 0 {
-			Err(std::io::Error::last_os_error())
+			Err(io::Error::last_os_error())
 		} else {
 			Ok(poll_fd.revents & (libc::POLLERR | libc::POLLHUP) as libc::c_short == 0)
 		}
@@ -96,7 +102,7 @@ pub(crate) mod signals {
 
 /// Runtime CPU feature detection and environment policy.
 pub(crate) mod hardware {
-	use std::{collections::BTreeSet, sync::LazyLock};
+	use std::{arch, collections::BTreeSet, env, sync::LazyLock};
 
 	use strum::EnumString;
 
@@ -195,7 +201,7 @@ pub(crate) mod hardware {
 		/// Detects and caches the process-wide SIMD policy.
 		pub(crate) fn detect() -> &'static Self {
 			static POLICY: LazyLock<SimdPolicy> = LazyLock::new(|| SimdPolicy {
-				disabled: parse_disabled_features(&std::env::var("GLIBC_TUNABLES").unwrap_or_default()),
+				disabled: parse_disabled_features(&env::var("GLIBC_TUNABLES").unwrap_or_default()),
 				hardware: CpuFeatures::detect(),
 			});
 			&POLICY
@@ -231,8 +237,8 @@ pub(crate) mod hardware {
 	#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 	fn detect_avx512() -> bool {
 		!cfg!(target_os = "android")
-			&& std::arch::is_x86_feature_detected!("avx512f")
-			&& std::arch::is_x86_feature_detected!("avx512bw")
+			&& arch::is_x86_feature_detected!("avx512f")
+			&& arch::is_x86_feature_detected!("avx512bw")
 	}
 	#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 	const fn detect_avx512() -> bool {
@@ -240,7 +246,7 @@ pub(crate) mod hardware {
 	}
 	#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 	fn detect_avx2() -> bool {
-		!cfg!(target_os = "android") && std::arch::is_x86_feature_detected!("avx2")
+		!cfg!(target_os = "android") && arch::is_x86_feature_detected!("avx2")
 	}
 	#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 	const fn detect_avx2() -> bool {
@@ -248,7 +254,7 @@ pub(crate) mod hardware {
 	}
 	#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 	fn detect_pclmul() -> bool {
-		!cfg!(target_os = "android") && std::arch::is_x86_feature_detected!("pclmulqdq")
+		!cfg!(target_os = "android") && arch::is_x86_feature_detected!("pclmulqdq")
 	}
 	#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 	const fn detect_pclmul() -> bool {
@@ -256,7 +262,7 @@ pub(crate) mod hardware {
 	}
 	#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 	fn detect_sse2() -> bool {
-		!cfg!(target_os = "android") && std::arch::is_x86_feature_detected!("sse2")
+		!cfg!(target_os = "android") && arch::is_x86_feature_detected!("sse2")
 	}
 	#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 	const fn detect_sse2() -> bool {
@@ -264,7 +270,7 @@ pub(crate) mod hardware {
 	}
 	#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 	fn detect_asimd() -> bool {
-		!cfg!(target_os = "android") && std::arch::is_aarch64_feature_detected!("asimd")
+		!cfg!(target_os = "android") && arch::is_aarch64_feature_detected!("asimd")
 	}
 	#[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
 	const fn detect_asimd() -> bool {

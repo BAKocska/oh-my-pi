@@ -1,6 +1,6 @@
 //! Terminal presentation adapter for the driver-owned compression workflow.
 
-use std::{path::Path, sync::Arc};
+use std::{env, path::Path, sync::Arc};
 
 use miette::IntoDiagnostic as _;
 use omp_driver::compress::{
@@ -19,7 +19,7 @@ impl CompressProgress for TerminalCompressProgress {
 
 /// Runs the driver-owned compression workflow with terminal progress.
 pub async fn run(args: CompressArgs) -> miette::Result<()> {
-	let root = std::env::current_dir().into_diagnostic()?;
+	let root = env::current_dir().into_diagnostic()?;
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let host =
 		ProductionCompressHost::open(root.clone(), data_dir, Arc::new(TerminalCompressProgress))

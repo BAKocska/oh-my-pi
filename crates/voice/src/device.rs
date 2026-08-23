@@ -27,6 +27,9 @@ use linux as imp;
 	any(target_os = "macos", target_os = "windows", target_os = "linux")
 )))]
 mod unsupported {
+
+	use std::env::consts;
+
 	use super::{CaptureSink, DeviceConfig, PlaybackFill};
 	use crate::{VoiceError, VoiceResult};
 
@@ -36,7 +39,7 @@ mod unsupported {
 		pub(super) fn start(config: DeviceConfig, _fill: PlaybackFill) -> VoiceResult<Self> {
 			let _ = config.period_samples();
 
-			Err(VoiceError::UnsupportedPlatform { platform: std::env::consts::OS })
+			Err(VoiceError::UnsupportedPlatform { platform: consts::OS })
 		}
 
 		pub(super) fn stop(&mut self) -> VoiceResult<()> {
@@ -50,7 +53,7 @@ mod unsupported {
 		pub(super) fn start(config: DeviceConfig, _sink: CaptureSink) -> VoiceResult<Self> {
 			let _ = config.period_samples();
 
-			Err(VoiceError::UnsupportedPlatform { platform: std::env::consts::OS })
+			Err(VoiceError::UnsupportedPlatform { platform: consts::OS })
 		}
 
 		pub(super) fn stop(&mut self) -> VoiceResult<()> {
@@ -72,7 +75,7 @@ use crate::VoiceResult;
 	feature = "native-audio",
 	any(target_os = "macos", target_os = "windows", target_os = "linux")
 ))]
-pub(super) type BackendResult<T> = std::result::Result<T, String>;
+pub(super) type BackendResult<T> = Result<T, String>;
 
 pub(super) type PlaybackFill = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 pub(super) type CaptureSink = Box<dyn FnMut(&[f32]) + Send + 'static>;

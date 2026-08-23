@@ -1,7 +1,7 @@
 //! Leaf value types used by transcript events.
 
 use omp_core::{InvocationPhase, Str};
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{
 	Value,
 	value::{RawValue, to_raw_value},
@@ -134,24 +134,27 @@ impl<'de> Deserialize<'de> for Stop {
 		D: Deserializer<'de>,
 	{
 		let raw = Box::<RawValue>::deserialize(deserializer)?;
-		let probe: StopProbe = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+		let probe: StopProbe = serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 		match probe.reason.as_str() {
 			"end_turn" => Ok(Self::EndTurn),
 			"max_tokens" => Ok(Self::MaxTokens),
 			"tool_use" => Ok(Self::ToolUse),
 			"refusal" => {
-				let payload: StopDetails = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+				let payload: StopDetails =
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::Refusal { details: payload.details })
 			},
 			"aborted" => {
-				let payload: StopDetails = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+				let payload: StopDetails =
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::Aborted { details: payload.details })
 			},
 			"content_filter" => {
-				let payload: StopDetails = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+				let payload: StopDetails =
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::ContentFilter { details: payload.details })
 			},
-			reason => Err(D::Error::custom(format_args!("unknown stop reason `{reason}`"))),
+			reason => Err(de::Error::custom(format_args!("unknown stop reason `{reason}`"))),
 		}
 	}
 }
@@ -371,17 +374,17 @@ impl<'de> Deserialize<'de> for AmendPatch {
 		D: Deserializer<'de>,
 	{
 		let raw = Box::<RawValue>::deserialize(deserializer)?;
-		let probe: AmendProbe = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+		let probe: AmendProbe = serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 		match probe.op.as_str() {
 			"prune" => {
 				let payload: PrunePayload =
-					serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::Prune { keep_blocks: payload.keep_blocks })
 			},
 			"drop_parts" => Ok(Self::DropParts),
 			"retry_recovery" => {
 				let payload: RetryRecoveryPayload =
-					serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::RetryRecovery {
 					content:     payload.content,
 					stop:        payload.stop,
@@ -390,7 +393,7 @@ impl<'de> Deserialize<'de> for AmendPatch {
 				})
 			},
 			"seq" => {
-				let payload: SeqPayload = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+				let payload: SeqPayload = serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::Seq { seq: payload.seq })
 			},
 			_ => Ok(Self::Unknown(raw)),

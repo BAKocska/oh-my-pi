@@ -1,6 +1,6 @@
 //! Pi-equivalent `glob@1` schema, traversal, and model-facing output contracts.
 
-use std::sync::Arc;
+use std::{future, str, sync::Arc};
 
 use bytes::Bytes;
 use futures::{StreamExt, executor::block_on};
@@ -26,9 +26,7 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 		&self,
 		_request: grep::SearchRequest,
 	) -> impl Future<Output = Result<grep::SearchResult, grep::Fault>> + Send + '_ {
-		std::future::ready(Err(grep::Fault::Workspace {
-			message: sf!("unused fake search boundary"),
-		}))
+		future::ready(Err(grep::Fault::Workspace { message: sf!("unused fake search boundary") }))
 	}
 
 	fn record_snapshots(&self, _records: Vec<grep::SnapshotRecord>) -> Result<(), grep::Fault> {
@@ -355,7 +353,7 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 	let [full] = stored.as_slice() else {
 		panic!("glob must store exactly one complete pre-truncation output");
 	};
-	let full = std::str::from_utf8(full).expect("rendered glob output is UTF-8");
+	let full = str::from_utf8(full).expect("rendered glob output is UTF-8");
 	assert!(full.starts_with("# dir/\n199-"));
 	assert!(full.to_ascii_lowercase().ends_with(".rs"));
 	assert_eq!(payload.output_total_lines, 201);

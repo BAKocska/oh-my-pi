@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use flume::Sender;
+use omp_core::Str;
 
 /// A nonblocking cancellation guard for one invocation or command request.
 ///
@@ -73,19 +74,15 @@ pub struct WorkerLease {
 
 #[derive(Debug)]
 struct WorkerLeaseState {
-	name:       omp_core::Str,
+	name:       Str,
 	generation: u64,
 	armed:      AtomicBool,
-	terminate:  Sender<(omp_core::Str, u64)>,
+	terminate:  Sender<(Str, u64)>,
 }
 
 impl WorkerLease {
 	/// Creates an armed lease for one worker generation.
-	pub fn new(
-		name: impl Into<omp_core::Str>,
-		generation: u64,
-		terminate: Sender<(omp_core::Str, u64)>,
-	) -> Self {
+	pub fn new(name: impl Into<Str>, generation: u64, terminate: Sender<(Str, u64)>) -> Self {
 		Self {
 			state: WorkerLeaseState {
 				name: name.into(),

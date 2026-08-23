@@ -1,7 +1,8 @@
 //! Stable operating-system process identities for detached-process re-adoption.
 
-use std::{io, path::PathBuf, time::SystemTime};
+use std::{io, mem, path::PathBuf, process, time::SystemTime};
 
+use omp_proto::env::v1;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -27,7 +28,7 @@ impl ProcessIdentity {
 
 	/// Captures the current daemon identity.
 	pub fn current() -> Result<Self, IdentityError> {
-		Self::capture(std::process::id())
+		Self::capture(process::id())
 	}
 
 	/// Re-reads the PID and verifies its start generation and executable.
@@ -42,8 +43,8 @@ impl ProcessIdentity {
 
 	/// Projects this verified identity into the additive env v1 supervision
 	/// schema.
-	pub fn to_wire(&self) -> omp_proto::env::v1::ProcessIdentity {
-		omp_proto::env::v1::ProcessIdentity {
+	pub fn to_wire(&self) -> v1::ProcessIdentity {
+		v1::ProcessIdentity {
 			pid:              u64::from(self.pid),
 			started_at_ms:    self.started_at_ms,
 			start_generation: self.start_generation.to_le_bytes().to_vec().into(),
@@ -53,7 +54,7 @@ impl ProcessIdentity {
 
 	/// Verifies a wire identity against the currently running operating-system
 	/// process.
-	pub fn verify_wire(wire: &omp_proto::env::v1::ProcessIdentity) -> bool {
+	pub fn verify_wire(wire: &v1::ProcessIdentity) -> bool {
 		let Ok(pid) = u32::try_from(wire.pid) else {
 			return false;
 		};
@@ -112,7 +113,7 @@ mod platform {
 	pub fn capture(pid: u32) -> Result<ProcessIdentity, IdentityError> {
 		let pid_i32 = i32::try_from(pid).map_err(|_| IdentityError::NotFound { pid })?;
 		// SAFETY: proc_bsdinfo is an integer C record valid when zeroed.
-		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+		let mut info = unsafe { mem::zeroed::<libc::proc_bsdinfo>() };
 		// SAFETY: `info` is writable for the exact size supplied.
 		let actual = unsafe {
 			libc::proc_pidinfo(
@@ -204,7 +205,7 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-	use std::{os::windows::ffi::OsStringExt as _, ptr};
+	use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, ptr};
 
 	use windows_sys::Win32::{
 		Foundation::{CloseHandle, FILETIME, HANDLE},
@@ -260,7 +261,7 @@ mod platform {
 			pid,
 			started_at_ms,
 			start_generation,
-			executable: PathBuf::from(std::ffi::OsString::from_wide(&path)),
+			executable: PathBuf::from(OsString::from_wide(&path)),
 		})
 	}
 }

@@ -1,5 +1,7 @@
 //! Builtin filters, functions, and block helpers.
 
+use std::iter;
+
 use omp_core::{Str, sf};
 
 use crate::{
@@ -158,7 +160,7 @@ pub fn install(engine: &mut Engine) {
 		for row in rows {
 			let columns = match row {
 				Value::List(cells) => write_table_row(&mut out, cells.iter()),
-				cell => write_table_row(&mut out, std::iter::once(cell)),
+				cell => write_table_row(&mut out, iter::once(cell)),
 			};
 			if !separated {
 				write_table_separator(&mut out, columns);

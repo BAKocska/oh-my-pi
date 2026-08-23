@@ -1,6 +1,9 @@
 //! Incremental, deterministic, bounded recovery stages.
 
-use std::fmt;
+use std::{
+	error,
+	fmt::{self, Display},
+};
 
 use bytes::Bytes;
 use omp_core::Str;
@@ -113,7 +116,7 @@ pub enum RecoveryError {
 	},
 }
 
-impl fmt::Display for RecoveryError {
+impl Display for RecoveryError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::LimitExceeded { stage, limit } => {
@@ -133,7 +136,7 @@ impl fmt::Display for RecoveryError {
 	}
 }
 
-impl std::error::Error for RecoveryError {}
+impl error::Error for RecoveryError {}
 
 pub mod dialect;
 pub mod empty;

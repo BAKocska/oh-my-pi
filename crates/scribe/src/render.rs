@@ -1,6 +1,6 @@
 //! Engine construction, template compilation, and pure rendering.
 
-use std::collections::HashMap;
+use std::{cmp, collections::HashMap};
 
 use omp_core::Str;
 use smallvec::SmallVec;
@@ -653,7 +653,7 @@ fn value_eq(left: &Value, right: &Value) -> bool {
 }
 
 /// Ordering for numbers (coerced) and strings; `None` elsewhere.
-fn value_cmp(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+fn value_cmp(left: &Value, right: &Value) -> Option<cmp::Ordering> {
 	match (left, right) {
 		(Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
 		(Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {

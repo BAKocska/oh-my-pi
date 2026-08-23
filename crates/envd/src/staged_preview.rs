@@ -7,10 +7,10 @@ use std::{
 
 use omp_agent::{
 	CampaignMachine, CampaignScope, CampaignSpec, CampaignStateError, ExhaustPolicy, Ladder,
-	LadderStep, Reaction, Verdict,
+	LadderStep, PointCx, Reaction, Verdict,
 };
 use omp_core::{Point, Str, sf};
-use omp_proto::thread::v1::{self as thread, Item};
+use omp_proto::thread::v1::{self as thread, Item, item};
 use omp_tools::staging::{
 	PREVIEW_PENDING_NOTICE, PendingPreview, PreviewDecision, PreviewObserver, PreviewObserverError,
 	PreviewRejection, parse_resolution_invoke,
@@ -127,7 +127,7 @@ impl StagedPreviewCampaign {
 			self.pending.source_tool.as_str()
 		);
 		Item {
-			kind: Some(thread::item::Kind::Message(thread::Message {
+			kind: Some(item::Kind::Message(thread::Message {
 				role:  thread::Role::User as i32,
 				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
 			})),
@@ -157,7 +157,7 @@ impl StagedPreviewCampaign {
 }
 
 impl CampaignMachine for StagedPreviewCampaign {
-	fn react(&mut self, point: Point, cx: &omp_agent::arbiter::PointCx<'_>) -> Reaction {
+	fn react(&mut self, point: Point, cx: &PointCx<'_>) -> Reaction {
 		if cx
 			.pending_invoker
 			.is_none_or(|head| head.id != self.pending.id.as_str())
@@ -201,9 +201,7 @@ impl CampaignMachine for StagedPreviewCampaign {
 mod tests {
 	use std::sync::Arc;
 
-	use omp_agent::{
-		CampaignMachine as _, CampaignStack, EngageOptions, Verdict, tool_choice::ToolChoiceQueue,
-	};
+	use omp_agent::{CampaignStack, EngageOptions, Verdict, tool_choice::ToolChoiceQueue};
 	use omp_tools::staging::{PreviewError, PreviewObserver, PreviewRegistry, StagedAction};
 	use parking_lot::Mutex;
 	use serde_json::{Value, json};
@@ -239,12 +237,12 @@ mod tests {
 			.await
 			.expect("proposal staged");
 		let mut machine = StagedPreviewCampaign::new(pending.clone());
-		let cx = omp_agent::arbiter::PointCx {
+		let cx = PointCx {
 			pending_invoker: Some(omp_agent::arbiter::PendingInvokerCx {
 				id:          pending.id.as_str(),
 				source_tool: pending.source_tool.as_str(),
 			}),
-			..omp_agent::arbiter::PointCx::default()
+			..PointCx::default()
 		};
 		let notice = machine.react(Point::Context, &cx);
 		assert!(matches!(notice.verdicts.as_slice(), [Verdict::Inject(_)]));
@@ -299,13 +297,13 @@ mod tests {
 				queue:  false,
 			})
 			.expect("campaign engaged");
-		let cx = omp_agent::arbiter::PointCx {
+		let cx = PointCx {
 			now_ms: 1,
 			pending_invoker: Some(omp_agent::arbiter::PendingInvokerCx {
 				id:          pending.id.as_str(),
 				source_tool: pending.source_tool.as_str(),
 			}),
-			..omp_agent::arbiter::PointCx::default()
+			..PointCx::default()
 		};
 		let notice = campaigns.fold(Point::Context, &cx, Some(&mut choices));
 		assert_eq!(notice.injects.len(), 1);
@@ -327,7 +325,7 @@ mod tests {
 		choices.resolve();
 		let done = campaigns.fold(
 			Point::Context,
-			&omp_agent::arbiter::PointCx { now_ms: 2, ..Default::default() },
+			&PointCx { now_ms: 2, ..Default::default() },
 			Some(&mut choices),
 		);
 		assert_eq!(done.terminated.as_slice(), &[receipt.engagement.clone()]);

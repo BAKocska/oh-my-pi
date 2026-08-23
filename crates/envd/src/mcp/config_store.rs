@@ -373,14 +373,20 @@ pub enum ConfigStoreError {
 	/// Filesystem operation failed.
 	#[error("MCP configuration filesystem operation failed for `{path}`")]
 	Io {
+		/// Exact config, temporary, lock, or parent-directory path whose
+		/// filesystem operation failed.
 		path:   PathBuf,
+		/// Operating-system error returned for that path.
 		#[source]
 		source: io::Error,
 	},
 	/// JSON operation failed.
 	#[error("MCP configuration JSON operation failed for `{path}`")]
 	Json {
+		/// Production `~/.omp/mcp.json`, project `.omp/mcp.json`, or project-root
+		/// `.mcp.json` being decoded or encoded.
 		path:   PathBuf,
+		/// JSON parser or serializer error for the scoped configuration document.
 		#[source]
 		source: serde_json::Error,
 	},
@@ -389,16 +395,37 @@ pub enum ConfigStoreError {
 	Validation(Box<[config::ConfigValidationError]>),
 	/// Path has no owning directory.
 	#[error("MCP configuration path `{path}` has no parent directory")]
-	NoParent { path: PathBuf },
+	NoParent {
+		/// Requested scoped config path that cannot be locked or atomically
+		/// replaced without a parent.
+		path: PathBuf,
+	},
 	/// Another writer held the directory lock past the bounded wait.
 	#[error("timed out acquiring MCP configuration directory lock `{path}`")]
-	LockTimeout { path: PathBuf },
+	LockTimeout {
+		/// Scope-local `.mcp-config.lock` directory still held after the
+		/// ten-second wait.
+		path: PathBuf,
+	},
 	/// Add would replace an existing server.
 	#[error("MCP server `{name}` already exists in `{path}`")]
-	AlreadyExists { name: Str, path: PathBuf },
+	AlreadyExists {
+		/// Server key already owned by the writable configuration document.
+		name: Str,
+		/// Exact `~/.omp/mcp.json`, project `.omp/mcp.json`, or project-root
+		/// `.mcp.json` file that owns the key.
+		path: PathBuf,
+	},
 	/// Requested server does not exist.
 	#[error("MCP server `{name}` was not found in `{path}`")]
-	NotFound { name: Str, path: PathBuf },
+	NotFound {
+		/// Server key requested for removal from the writable configuration
+		/// document.
+		name: Str,
+		/// Exact `~/.omp/mcp.json`, project `.omp/mcp.json`, or project-root
+		/// `.mcp.json` searched without resolving other scopes.
+		path: PathBuf,
+	},
 	/// Direct validation failure.
 	#[error(transparent)]
 	Config(#[from] config::ConfigValidationError),

@@ -10,6 +10,7 @@ use std::{
 
 use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CGPoint, CGSize};
+use parking_lot::Mutex;
 
 use super::super::{
 	ax::{AxBounds, AxHandle, AxProps, normalize_role_macos},
@@ -36,8 +37,8 @@ static GET_WINDOW_ID: LazyLock<Option<GetWindowIdFn>> = LazyLock::new(|| {
 });
 
 /// Processes already asked to expose their renderer accessibility tree.
-static MANUAL_ACCESSIBILITY: LazyLock<parking_lot::Mutex<HashSet<libc::pid_t>>> =
-	LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
+static MANUAL_ACCESSIBILITY: LazyLock<Mutex<HashSet<libc::pid_t>>> =
+	LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {

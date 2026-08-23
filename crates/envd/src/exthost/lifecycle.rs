@@ -10,6 +10,7 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use flume::Receiver;
 use omp_agent::{HookPhase, MailboxSender, OnFailure, device_availability_interrupt};
 pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason, sf};
 use omp_core::{InvocationPhase, Provenance, Str};
@@ -91,7 +92,7 @@ pub enum HeadlessLifecycleKind {
 
 /// Lossless receiving half of a [`HeadlessLifecycleSink`].
 pub struct HeadlessLifecycleSubscription {
-	rx: flume::Receiver<Arc<HeadlessLifecycleEvent>>,
+	rx: Receiver<Arc<HeadlessLifecycleEvent>>,
 }
 
 impl HeadlessLifecycleSubscription {

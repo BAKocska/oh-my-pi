@@ -1,6 +1,6 @@
 //! Catalog-aware credential acquisition across typed source engines.
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{collections::BTreeMap, env, fmt, sync::Arc};
 
 use futures::future::{BoxFuture, FutureExt as _};
 use omp_catalog::{AuthSpecId, Catalog, provider::AuthSpecKind};
@@ -10,6 +10,7 @@ use super::lease::{
 	AuthRejection, CredentialError, CredentialKind, CredentialLease, CredentialNeed,
 	CredentialSource, LeaseMeta,
 };
+use crate::{AccountId, PrincipalId};
 
 const ENVIRONMENT_TAG: &str = "environment";
 const STORED_TAG: &str = "stored";
@@ -35,11 +36,11 @@ impl CredentialEnvironment for SystemCredentialEnvironment {
 		if !name.starts_with("OMP_") {
 			return Err(CredentialError::InvalidSource);
 		}
-		match std::env::var(name) {
+		match env::var(name) {
 			Ok(value) if value.is_empty() => Err(CredentialError::InvalidSource),
 			Ok(value) => Ok(Some(SecretString::from(value))),
-			Err(std::env::VarError::NotPresent) => Ok(None),
-			Err(std::env::VarError::NotUnicode(_)) => Err(CredentialError::SourceFailure),
+			Err(env::VarError::NotPresent) => Ok(None),
+			Err(env::VarError::NotUnicode(_)) => Err(CredentialError::SourceFailure),
 		}
 	}
 }
@@ -247,11 +248,11 @@ impl CredentialBroker {
 		let account = need
 			.account
 			.clone()
-			.unwrap_or_else(|| crate::AccountId::from("invocation"));
+			.unwrap_or_else(|| AccountId::from("invocation"));
 		let principal = need
 			.principal
 			.clone()
-			.unwrap_or_else(|| crate::PrincipalId::from("invocation"));
+			.unwrap_or_else(|| PrincipalId::from("invocation"));
 		let meta = LeaseMeta { account, principal, generation: 0, expires_at: None };
 		let lease = match kind {
 			CredentialKind::ApiKey => CredentialLease::api_key(meta, invocation.secret.clone()),
@@ -310,7 +311,7 @@ impl CredentialBroker {
 		password_names: &[Str],
 		need: &CredentialNeed,
 	) -> Result<CredentialLease, CredentialError> {
-		let mut read_first = |names: &[Str]| {
+		let read_first = |names: &[Str]| {
 			for name in names {
 				if let Some(secret) = self.environment.read(name)? {
 					return Ok(secret);

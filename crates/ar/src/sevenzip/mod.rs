@@ -3,6 +3,7 @@
 use std::{
 	collections::HashSet,
 	io::{Read, Seek, SeekFrom, Write},
+	str,
 };
 
 use omp_core::Str;
@@ -1110,7 +1111,7 @@ fn build_entries(
 				.and_then(|size| start.checked_add(size))
 				.filter(|end| *end <= buffer.len())
 				.ok_or_else(|| invalid("invalid 7z symlink payload range"))?;
-			let raw_target = std::str::from_utf8(&buffer[start..end])
+			let raw_target = str::from_utf8(&buffer[start..end])
 				.map_err(|_| invalid("invalid UTF-8 7z symlink target"))?;
 			let (target_path, resolve_target) = canonical_link_target(&path, raw_target);
 			Storage::Link { target_path, resolve_target }

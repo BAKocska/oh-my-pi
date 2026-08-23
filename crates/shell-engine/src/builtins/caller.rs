@@ -2,7 +2,7 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins, callstack};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins, callstack};
 
 /// Return the context of the current subroutine call.
 #[derive(Parser)]
@@ -12,11 +12,11 @@ pub(crate) struct CallerCommand {
 }
 
 impl builtins::Command for CallerCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		let stack = context.shell.call_stack();
 

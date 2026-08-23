@@ -1,6 +1,10 @@
 //! Atomic reversible obfuscation and irreversible redaction pipeline.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+	cmp,
+	collections::{HashMap, HashSet},
+	fmt,
+};
 
 use omp_core::Str;
 
@@ -36,8 +40,8 @@ pub struct SecretObfuscator {
 	has_secrets:         bool,
 }
 
-impl std::fmt::Debug for SecretObfuscator {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SecretObfuscator {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("SecretObfuscator")
 			.field("rule_count", &self.rules.len())
@@ -186,7 +190,7 @@ impl SecretObfuscator {
 			.iter()
 			.filter(|rule| rule.kind() == SecretKind::Plain && rule.mode() == SecretMode::Replace)
 			.collect::<Vec<_>>();
-		plain_replace.sort_unstable_by_key(|rule| std::cmp::Reverse(rule.content().len()));
+		plain_replace.sort_unstable_by_key(|rule| cmp::Reverse(rule.content().len()));
 		for rule in plain_replace {
 			let replacement = rule.replacement().map_or_else(
 				|| {
@@ -211,7 +215,7 @@ impl SecretObfuscator {
 		}
 
 		let mut plain_obfuscate = self.plain_placeholders.iter().collect::<Vec<_>>();
-		plain_obfuscate.sort_unstable_by_key(|(secret, _)| std::cmp::Reverse(secret.len()));
+		plain_obfuscate.sort_unstable_by_key(|(secret, _)| cmp::Reverse(secret.len()));
 		for (secret, placeholder) in plain_obfuscate {
 			replace_literal_outside(&mut tracked, secret.as_str(), placeholder, |token| {
 				self.trusted_placeholder(token)

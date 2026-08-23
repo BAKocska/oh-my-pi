@@ -1,6 +1,11 @@
 //! Git-isolated autoresearch transactions and crash recovery.
 
-use std::{collections::BTreeMap, error::Error as StdError, future::Future};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	error::Error as StdError,
+	future::Future,
+	str,
+};
 
 use omp_core::{Str, sf};
 use omp_envd::vcs::git::mutation::{GitMutation, IsolationCommit, MutationError, MutationOutcome};
@@ -228,7 +233,7 @@ fn parse_status_lines(status: &[u8]) -> Vec<StatusPath> {
 }
 
 fn add_path(entries: &mut BTreeMap<Str, bool>, raw: &[u8], untracked: bool) {
-	let Ok(path) = std::str::from_utf8(raw) else {
+	let Ok(path) = str::from_utf8(raw) else {
 		return;
 	};
 	let path = path.trim().trim_matches('"');
@@ -243,10 +248,7 @@ fn add_path(entries: &mut BTreeMap<Str, bool>, raw: &[u8], untracked: bool) {
 
 /// Computes exact paths introduced or changed since the run started.
 pub fn run_delta(before: &[Str], current_status: &[u8], session: &SessionConfig) -> ScopeDelta {
-	let before = before
-		.iter()
-		.map(Str::as_str)
-		.collect::<std::collections::BTreeSet<_>>();
+	let before = before.iter().map(Str::as_str).collect::<BTreeSet<_>>();
 	let changed = parse_status(current_status)
 		.into_iter()
 		.filter(|entry| !before.contains(entry.path.as_str()))

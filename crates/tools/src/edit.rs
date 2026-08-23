@@ -4,7 +4,7 @@
 pub mod apply_patch;
 pub mod projection;
 pub mod replace;
-use std::{fmt::Write as _, future::Future};
+use std::{fmt::Write as _, future, future::Future, ops, path::Path};
 
 pub use apply_patch::{
 	FreeformEditParams, FreeformEditTool, apply_patch_tool, patch_tool, sloppy_tool,
@@ -281,7 +281,7 @@ impl EditSnapshotStore for NoSnapshotStore {
 		&self,
 		_bytes: Bytes,
 	) -> impl Future<Output = Result<omp_tool::BlobRef, SnapshotFault>> + Send + '_ {
-		std::future::ready(Err(SnapshotFault::Unavailable))
+		future::ready(Err(SnapshotFault::Unavailable))
 	}
 }
 
@@ -465,7 +465,7 @@ pub enum EditDiagnosticSeverity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EditDiagnostic {
 	/// Committed byte range when the LSP position could be converted.
-	pub range:    Option<std::ops::Range<u64>>,
+	pub range:    Option<ops::Range<u64>>,
 	/// Diagnostic severity.
 	pub severity: EditDiagnosticSeverity,
 	/// Optional provider code.
@@ -821,7 +821,7 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 						let Ok(diff) = numbered_diff(
 							work.prepared.base_bytes(),
 							&projection.after,
-							Some(std::path::Path::new(work.section_path.as_str())),
+							Some(Path::new(work.section_path.as_str())),
 						) else {
 							continue;
 						};
@@ -1117,7 +1117,7 @@ async fn build_payload<P: EditPrepared, S: EditSnapshotStore>(
 		let numbered = numbered_diff(
 			work.prepared.base_bytes(),
 			&exact_after,
-			Some(std::path::Path::new(output_path.as_str())),
+			Some(Path::new(output_path.as_str())),
 		)
 		.ok();
 		let diff = numbered
@@ -1240,10 +1240,13 @@ fn rejection_text(fault: &Fault) -> Str {
 
 #[cfg(test)]
 mod tests {
+
+	use parking_lot::Mutex;
+
 	use super::*;
 
 	#[derive(Default)]
-	struct RecordingSnapshots(parking_lot::Mutex<Vec<Bytes>>);
+	struct RecordingSnapshots(Mutex<Vec<Bytes>>);
 
 	impl EditSnapshotStore for RecordingSnapshots {
 		async fn store_snapshot(&self, bytes: Bytes) -> Result<omp_tool::BlobRef, SnapshotFault> {
@@ -1444,7 +1447,7 @@ mod tests {
 			&self,
 			_request: PrepareRequest,
 		) -> impl Future<Output = Result<Self::Prepared, Fault>> + Send + '_ {
-			std::future::ready(Err(Fault::invalid("not invoked by registry lift test")))
+			future::ready(Err(Fault::invalid("not invoked by registry lift test")))
 		}
 
 		fn start_clipboard_batch(&self) -> Clipboard {
@@ -1468,7 +1471,7 @@ mod tests {
 			_proposals: Vec<EditProposal>,
 			_clipboard: Clipboard,
 		) -> impl Future<Output = Result<CommitResult, EditCommitError>> + Send + 'a {
-			std::future::ready(Err(EditCommitError::EffectsUnknown {
+			future::ready(Err(EditCommitError::EffectsUnknown {
 				reason: "not invoked by registry lift test".into(),
 			}))
 		}

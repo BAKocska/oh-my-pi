@@ -1,6 +1,11 @@
 //! Cloneable structured failures with explicit retry scope.
 
-use std::{fmt, mem, time::Duration};
+use std::{
+	error,
+	fmt::{self, Display},
+	mem, sync,
+	time::Duration,
+};
 
 use omp_core::Str;
 
@@ -249,7 +254,7 @@ pub enum ErrorDetail {
 	#[error("all search providers failed")]
 	SearchFailures {
 		/// Secret-free failure summary in attempt order.
-		failures: std::sync::Arc<[SearchProviderFailure]>,
+		failures: sync::Arc<[SearchProviderFailure]>,
 	},
 	/// Local availability evidence.
 	#[error("local backend unavailable ({})", .reason.0)]
@@ -306,7 +311,7 @@ impl ErrorDetail {
 	}
 
 	/// Records ordered, secret-free search-provider failures.
-	pub fn search_failures(failures: impl Into<std::sync::Arc<[SearchProviderFailure]>>) -> Self {
+	pub fn search_failures(failures: impl Into<sync::Arc<[SearchProviderFailure]>>) -> Self {
 		Self::SearchFailures { failures: failures.into() }
 	}
 
@@ -505,7 +510,7 @@ impl Error {
 	}
 }
 
-impl fmt::Display for Error {
+impl Display for Error {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "inference {:?} error during {:?}", self.kind, self.phase)?;
 		if let Some(code) = &self.code {
@@ -521,13 +526,13 @@ impl fmt::Display for Error {
 	}
 }
 
-impl std::error::Error for Error {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for Error {
+	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		self
 			.evidence
 			.source
 			.as_ref()
-			.map(|source| source as &(dyn std::error::Error + 'static))
+			.map(|source| source as &(dyn error::Error + 'static))
 	}
 }
 
@@ -558,7 +563,7 @@ pub fn search_provider_failure(error: &Error) -> SearchProviderFailure {
 			.provider
 			.as_deref()
 			.cloned()
-			.unwrap_or_else(|| crate::catalog::ProviderId::from("unknown")),
+			.unwrap_or_else(|| ProviderId::from("unknown")),
 		kind,
 		status: error.status,
 		code: error.code.clone(),
@@ -600,7 +605,7 @@ mod tests {
 
 	use omp_core::sf;
 
-	use super::{Error, ErrorKind, ErrorPhase, RetryAction};
+	use super::{Error, ErrorDetail as SuperErrorDetail, ErrorKind, ErrorPhase, RetryAction};
 	use crate::receipt::ExecutionReceipt;
 
 	#[test]
@@ -633,7 +638,7 @@ mod tests {
 		)
 		.code(sf!("model_archived"))
 		.status(Some(404))
-		.detail(super::ErrorDetail::Provider { sanitized_message: sf!("model does not exist") });
+		.detail(SuperErrorDetail::Provider { sanitized_message: sf!("model does not exist") });
 		let rendered = error.to_string();
 		assert!(rendered.contains("(model_archived)"));
 		assert!(rendered.contains("[http 404]"));

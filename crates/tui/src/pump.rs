@@ -25,7 +25,9 @@
 //! [`crate::Terminal::leave`] stops it before the teardown drain reclaims
 //! the descriptor.
 
-use std::{fs::File, io};
+#[cfg(unix)]
+use std::os::fd;
+use std::{fs::File, future, io, mem, sync, sync::atomic, thread, time};
 
 #[cfg(unix)]
 use futures_lite::StreamExt as _;
@@ -137,7 +139,7 @@ pub fn publish_ingress_for_test() -> flume::Receiver<TerminalEvent> {
 	let (ctl_tx, ctl_rx) = flume::unbounded();
 	let (event_tx, event_rx) = flume::unbounded();
 	*SHARED_CTL.lock() = Some(ctl_tx);
-	std::thread::spawn(move || {
+	thread::spawn(move || {
 		while let Ok(ctl) = ctl_rx.recv() {
 			if let Ctl::Event(event) = ctl
 				&& event_tx.send(event).is_err()
@@ -159,8 +161,8 @@ pub struct Pump {
 
 /// A reader thread bridging a non-pollable input handle into the actor.
 struct Bridge {
-	stop:   std::sync::Arc<std::sync::atomic::AtomicBool>,
-	worker: Option<std::thread::JoinHandle<()>>,
+	stop:   sync::Arc<atomic::AtomicBool>,
+	worker: Option<thread::JoinHandle<()>>,
 }
 
 impl Pump {
@@ -184,9 +186,7 @@ impl Pump {
 	pub(crate) fn stop(&mut self) {
 		drop(self.task.take());
 		if let Some(bridge) = self.bridge.as_mut() {
-			bridge
-				.stop
-				.store(true, std::sync::atomic::Ordering::Release);
+			bridge.stop.store(true, atomic::Ordering::Release);
 			if let Some(worker) = bridge.worker.take() {
 				let _ = worker.join();
 			}
@@ -216,7 +216,7 @@ enum ByteSource {
 	/// Readiness-pollable handle (non-macOS Unix terminals; test pipes and
 	/// ptys everywhere on Unix).
 	#[cfg(unix)]
-	Fd(async_io::Async<std::os::fd::OwnedFd>),
+	Fd(async_io::Async<fd::OwnedFd>),
 	/// Reader-thread bridge for handles the OS cannot poll.
 	Thread(flume::Receiver<Vec<u8>>),
 }
@@ -246,7 +246,7 @@ impl ByteSource {
 
 /// Reads once from a raw descriptor, retrying `EINTR`.
 #[cfg(unix)]
-fn read_fd(fd: &std::os::fd::OwnedFd, bytes: &mut [u8]) -> io::Result<usize> {
+fn read_fd(fd: &fd::OwnedFd, bytes: &mut [u8]) -> io::Result<usize> {
 	use std::os::fd::AsRawFd as _;
 	loop {
 		// SAFETY: `fd` is open for reading and `bytes` is a writable slice.
@@ -284,7 +284,7 @@ pub fn spawn(
 	let resize = ();
 
 	let mut events = Vec::new();
-	decoder.feed(preserved, std::time::Instant::now(), &mut events);
+	decoder.feed(preserved, time::Instant::now(), &mut events);
 
 	let task = executor.spawn(actor(source, decoder, events, events_tx, ctl_rx, resize, resize_tx));
 	Ok(PumpChannels {
@@ -321,14 +321,14 @@ impl Input {
 				{
 					return Err(io::Error::last_os_error());
 				}
-				let fd = async_io::Async::new(std::os::fd::OwnedFd::from(file))?;
+				let fd = async_io::Async::new(fd::OwnedFd::from(file))?;
 				Ok((ByteSource::Fd(fd), None))
 			},
 			Self::Bridged(file) => {
 				let (tx, rx) = flume::unbounded();
-				let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-				let bridge_stop = std::sync::Arc::clone(&stop);
-				let worker = std::thread::Builder::new()
+				let stop = sync::Arc::new(atomic::AtomicBool::new(false));
+				let bridge_stop = sync::Arc::clone(&stop);
+				let worker = thread::Builder::new()
 					.name("omp-tui-input".into())
 					.spawn(move || bridge_loop(file, &tx, &bridge_stop))?;
 				Ok((ByteSource::Thread(rx), Some(Bridge { stop, worker: Some(worker) })))
@@ -340,8 +340,7 @@ impl Input {
 /// Blocking bridge for non-pollable handles: `read` → flume until EOF,
 /// error, or stop. The 50ms cadence exists only to observe `stop`; it never
 /// delays delivery of ready bytes.
-fn bridge_loop(input: File, tx: &flume::Sender<Vec<u8>>, stop: &std::sync::atomic::AtomicBool) {
-	use std::sync::atomic::Ordering;
+fn bridge_loop(input: File, tx: &flume::Sender<Vec<u8>>, stop: &atomic::AtomicBool) {
 	let mut bytes = [0_u8; 4096];
 	#[cfg(unix)]
 	{
@@ -349,7 +348,7 @@ fn bridge_loop(input: File, tx: &flume::Sender<Vec<u8>>, stop: &std::sync::atomi
 		let mut input = input;
 		let mut descriptor =
 			nix::libc::pollfd { fd: input.as_raw_fd(), events: nix::libc::POLLIN, revents: 0 };
-		while !stop.load(Ordering::Acquire) {
+		while !stop.load(atomic::Ordering::Acquire) {
 			descriptor.revents = 0;
 			// SAFETY: single pollfd, valid for the call.
 			let ready = unsafe { nix::libc::poll(&mut descriptor, 1, 50) };
@@ -375,7 +374,7 @@ fn bridge_loop(input: File, tx: &flume::Sender<Vec<u8>>, stop: &std::sync::atomi
 				Err(error)
 					if matches!(
 						error.kind(),
-						io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+						std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
 					) => {},
 				Err(_) => return,
 			}
@@ -386,7 +385,7 @@ fn bridge_loop(input: File, tx: &flume::Sender<Vec<u8>>, stop: &std::sync::atomi
 		use std::{io::Read as _, os::windows::io::AsRawHandle as _};
 		let mut input = input;
 		let handle = input.as_raw_handle();
-		while !stop.load(Ordering::Acquire) {
+		while !stop.load(atomic::Ordering::Acquire) {
 			let ready =
 				unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(handle, 50) };
 			if ready == windows_sys::Win32::Foundation::WAIT_TIMEOUT {
@@ -425,7 +424,7 @@ async fn actor(
 	// wakes never fire.
 	let mut resize_wakes = 0_u64;
 	loop {
-		for event in std::mem::take(&mut events) {
+		for event in mem::take(&mut events) {
 			if events_tx.send(TerminalEvent::Input(event)).is_err() {
 				return;
 			}
@@ -478,7 +477,7 @@ fn apply_ctl(
 ) -> bool {
 	match ctl {
 		Ctl::Bytes(bytes) => {
-			decoder.feed(&bytes, std::time::Instant::now(), events);
+			decoder.feed(&bytes, time::Instant::now(), events);
 			true
 		},
 		Ctl::Event(event) => {
@@ -500,22 +499,22 @@ fn apply_ctl(
 #[cfg(unix)]
 async fn resize_readable(resize: &mut Option<omp_executor::signal::Signals>) {
 	let Some(resize) = resize else {
-		return std::future::pending().await;
+		return future::pending().await;
 	};
 	let _ = resize.next().await;
 }
 
 #[cfg(windows)]
 async fn resize_readable(_resize: ()) {
-	std::future::pending().await
+	future::pending().await
 }
 
 /// Sleeps until `at`; `None` disables the branch.
-async fn deadline(at: Option<std::time::Instant>) {
+async fn deadline(at: Option<time::Instant>) {
 	match at {
 		Some(at) => {
 			async_io::Timer::at(at).await;
 		},
-		None => std::future::pending().await,
+		None => future::pending().await,
 	}
 }

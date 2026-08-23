@@ -1,14 +1,16 @@
 use std::{
 	io::{self, ErrorKind, Write},
+	mem,
 	str::FromStr,
 };
 
 use clap::{
-	Parser,
+	Parser, builder,
 	builder::{IntoResettable, StyledStr},
 };
+use nix::{sys::resource, unistd::PathconfVar};
 
-use crate::{ExecutionResult, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 #[derive(Clone, Copy)]
 enum Unit {
@@ -38,19 +40,19 @@ enum Virtual {
 }
 
 impl Virtual {
-	fn get(self) -> std::io::Result<(u64, u64)> {
+	fn get(self) -> io::Result<(u64, u64)> {
 		match self {
 			Self::Pipe => {
-				let lim = nix::unistd::PathconfVar::PIPE_BUF as u64 * 512;
+				let lim = PathconfVar::PIPE_BUF as u64 * 512;
 				Ok((lim, lim))
 			},
 			Self::VMem => Physical::AS.get().or_else(|_| Physical::VMEM.get()),
 		}
 	}
 
-	fn set(self, soft: u64, hard: u64) -> std::io::Result<()> {
+	fn set(self, soft: u64, hard: u64) -> io::Result<()> {
 		match self {
-			Self::Pipe => Err(std::io::Error::from(ErrorKind::Unsupported)),
+			Self::Pipe => Err(io::Error::from(ErrorKind::Unsupported)),
 			Self::VMem => Physical::AS
 				.set(soft, hard)
 				.or_else(|_| Physical::VMEM.set(soft, hard)),
@@ -91,21 +93,20 @@ enum Physical {
 }
 
 impl Physical {
-	const fn nix(self) -> Option<nix::sys::resource::Resource> {
-		use nix::sys::resource::Resource;
+	const fn nix(self) -> Option<resource::Resource> {
 		match self {
-			Self::CORE => Some(Resource::RLIMIT_CORE),
-			Self::CPU => Some(Resource::RLIMIT_CPU),
-			Self::DATA => Some(Resource::RLIMIT_DATA),
-			Self::FSIZE => Some(Resource::RLIMIT_FSIZE),
-			Self::NOFILE => Some(Resource::RLIMIT_NOFILE),
-			Self::STACK => Some(Resource::RLIMIT_STACK),
+			Self::CORE => Some(resource::Resource::RLIMIT_CORE),
+			Self::CPU => Some(resource::Resource::RLIMIT_CPU),
+			Self::DATA => Some(resource::Resource::RLIMIT_DATA),
+			Self::FSIZE => Some(resource::Resource::RLIMIT_FSIZE),
+			Self::NOFILE => Some(resource::Resource::RLIMIT_NOFILE),
+			Self::STACK => Some(resource::Resource::RLIMIT_STACK),
 			#[cfg(not(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")))]
-			Self::AS => Some(Resource::RLIMIT_AS),
+			Self::AS => Some(resource::Resource::RLIMIT_AS),
 			#[cfg(target_os = "freebsd")]
-			Self::KQUEUES => Some(Resource::RLIMIT_KQUEUES),
+			Self::KQUEUES => Some(resource::Resource::RLIMIT_KQUEUES),
 			#[cfg(any(target_os = "linux", target_os = "android"))]
-			Self::LOCKS => Some(Resource::RLIMIT_LOCKS),
+			Self::LOCKS => Some(resource::Resource::RLIMIT_LOCKS),
 			#[cfg(any(
 				target_os = "linux",
 				target_os = "android",
@@ -113,11 +114,11 @@ impl Physical {
 				target_os = "netbsd",
 				target_os = "openbsd"
 			))]
-			Self::MEMLOCK => Some(Resource::RLIMIT_MEMLOCK),
+			Self::MEMLOCK => Some(resource::Resource::RLIMIT_MEMLOCK),
 			#[cfg(any(target_os = "linux", target_os = "android"))]
-			Self::MSGQUEUE => Some(Resource::RLIMIT_MSGQUEUE),
+			Self::MSGQUEUE => Some(resource::Resource::RLIMIT_MSGQUEUE),
 			#[cfg(any(target_os = "linux", target_os = "android"))]
-			Self::NICE => Some(Resource::RLIMIT_NICE),
+			Self::NICE => Some(resource::Resource::RLIMIT_NICE),
 			#[cfg(any(
 				target_os = "linux",
 				target_os = "android",
@@ -125,9 +126,9 @@ impl Physical {
 				target_os = "netbsd",
 				target_os = "openbsd"
 			))]
-			Self::NPROC => Some(Resource::RLIMIT_NPROC),
+			Self::NPROC => Some(resource::Resource::RLIMIT_NPROC),
 			#[cfg(target_os = "freebsd")]
-			Self::NPTS => Some(Resource::RLIMIT_NPTS),
+			Self::NPTS => Some(resource::Resource::RLIMIT_NPTS),
 			#[cfg(any(
 				target_os = "linux",
 				target_os = "android",
@@ -135,17 +136,17 @@ impl Physical {
 				target_os = "netbsd",
 				target_os = "openbsd"
 			))]
-			Self::RSS => Some(Resource::RLIMIT_RSS),
+			Self::RSS => Some(resource::Resource::RLIMIT_RSS),
 			#[cfg(any(target_os = "linux", target_os = "android"))]
-			Self::RTPRIO => Some(Resource::RLIMIT_RTPRIO),
+			Self::RTPRIO => Some(resource::Resource::RLIMIT_RTPRIO),
 			#[cfg(target_os = "linux")]
-			Self::RTTIME => Some(Resource::RLIMIT_RTTIME),
+			Self::RTTIME => Some(resource::Resource::RLIMIT_RTTIME),
 			#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-			Self::SBSIZE => Some(Resource::RLIMIT_SBSIZE),
+			Self::SBSIZE => Some(resource::Resource::RLIMIT_SBSIZE),
 			#[cfg(any(target_os = "linux", target_os = "android"))]
-			Self::SIGPENDING => Some(Resource::RLIMIT_SIGPENDING),
+			Self::SIGPENDING => Some(resource::Resource::RLIMIT_SIGPENDING),
 			#[cfg(target_os = "freebsd")]
-			Self::VMEM => Some(Resource::RLIMIT_VMEM),
+			Self::VMEM => Some(resource::Resource::RLIMIT_VMEM),
 			_ => None,
 		}
 	}
@@ -162,11 +163,11 @@ impl Physical {
 
 	fn get(self) -> io::Result<(u64, u64)> {
 		if let Some(resource) = self.nix() {
-			return nix::sys::resource::getrlimit(resource).map_err(io::Error::from);
+			return resource::getrlimit(resource).map_err(io::Error::from);
 		}
 		#[cfg(target_os = "macos")]
 		if let Some(resource) = self.macos_raw() {
-			let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+			let mut limits = mem::MaybeUninit::<libc::rlimit>::uninit();
 			// SAFETY: `limits` points to writable storage for getrlimit.
 			if unsafe { libc::getrlimit(resource, limits.as_mut_ptr()) } == 0 {
 				// SAFETY: a successful getrlimit initialized the structure.
@@ -180,7 +181,7 @@ impl Physical {
 
 	fn set(self, soft: u64, hard: u64) -> io::Result<()> {
 		if let Some(resource) = self.nix() {
-			return nix::sys::resource::setrlimit(resource, soft, hard).map_err(io::Error::from);
+			return resource::setrlimit(resource, soft, hard).map_err(io::Error::from);
 		}
 		#[cfg(target_os = "macos")]
 		if let Some(resource) = self.macos_raw() {
@@ -211,14 +212,14 @@ enum Resource {
 }
 
 impl Resource {
-	fn get(self) -> std::io::Result<(u64, u64)> {
+	fn get(self) -> io::Result<(u64, u64)> {
 		match self {
 			Self::Phy(res) => res.get(),
 			Self::Virt(res) => res.get(),
 		}
 	}
 
-	fn set(self, soft: u64, hard: u64) -> std::io::Result<()> {
+	fn set(self, soft: u64, hard: u64) -> io::Result<()> {
 		match self {
 			Self::Phy(res) => res.set(soft, hard),
 			Self::Virt(res) => res.set(soft, hard),
@@ -391,23 +392,23 @@ impl ResourceDescription {
 		unit:        Unit::KBytes,
 	};
 
-	fn get(&self, hard: bool) -> std::io::Result<String> {
+	fn get(&self, hard: bool) -> io::Result<String> {
 		let (soft_limit, hard_limit) = self.resource.get()?;
 		let val = if hard { hard_limit } else { soft_limit };
 
-		if val == nix::sys::resource::RLIM_INFINITY {
+		if val == resource::RLIM_INFINITY {
 			Ok("unlimited".into())
 		} else {
 			Ok(format!("{}", val / self.unit.scale()))
 		}
 	}
 
-	fn set(&self, set_hard: bool, value: LimitValue) -> std::io::Result<()> {
+	fn set(&self, set_hard: bool, value: LimitValue) -> io::Result<()> {
 		let (soft, hard) = self.resource.get()?;
 		let value = match value {
 			LimitValue::Soft => soft,
 			LimitValue::Hard => hard,
-			LimitValue::Unlimited => nix::sys::resource::RLIM_INFINITY,
+			LimitValue::Unlimited => resource::RLIM_INFINITY,
 			LimitValue::Value(v) => v * self.unit.scale(),
 			LimitValue::Unset => return Ok(()),
 		};
@@ -422,7 +423,7 @@ impl ResourceDescription {
 	/// Print either soft or hard limit
 	fn print(
 		&self,
-		context: &crate::ExecutionContext<'_, impl crate::ShellExtensions>,
+		context: &ExecutionContext<'_, impl ShellExtensions>,
 		hard: bool,
 	) -> io::Result<()> {
 		if !self.resource.is_supported() {
@@ -456,8 +457,8 @@ impl ResourceDescription {
 }
 
 impl IntoResettable<StyledStr> for ResourceDescription {
-	fn into_resettable(self) -> clap::builder::Resettable<StyledStr> {
-		clap::builder::Resettable::Value(self.help().into())
+	fn into_resettable(self) -> builder::Resettable<StyledStr> {
+		builder::Resettable::Value(self.help().into())
 	}
 }
 
@@ -569,12 +570,12 @@ pub(crate) struct ULimitCommand {
 }
 
 impl builtins::Command for ULimitCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let exit_code = ExecutionResult::success();
 		let mut resources_to_set = Vec::new();
 		let mut resources_to_get = Vec::new();

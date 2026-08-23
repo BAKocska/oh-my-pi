@@ -125,7 +125,7 @@ impl Component for Scene {
 
 #[cfg(test)]
 mod tests {
-	use std::time::Duration;
+	use std::{f32::consts, time::Duration};
 
 	use super::*;
 	use crate::{
@@ -185,7 +185,7 @@ mod tests {
 		struct Turntable;
 		impl Trace for Turntable {
 			fn advance(&mut self, now: Duration) -> Camera {
-				Camera { yaw: now.as_secs_f32() * std::f32::consts::FRAC_PI_2, ..Camera::default() }
+				Camera { yaw: now.as_secs_f32() * consts::FRAC_PI_2, ..Camera::default() }
 			}
 
 			fn shade(&self, ray: Ray) -> (Vec3, f32) {

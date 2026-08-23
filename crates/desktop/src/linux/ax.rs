@@ -1,6 +1,14 @@
-use atspi::{CoordType, ObjectRefOwned, Role, State, proxy::accessible::ObjectRefExt};
+use atspi::{
+	CoordType, ObjectRefOwned, Role, State,
+	proxy::{
+		accessible::ObjectRefExt, action::ActionProxy, component::ComponentProxy,
+		editable_text::EditableTextProxy, text::TextProxy, value::ValueProxy,
+	},
+	zbus::fdo::DBusProxy,
+};
 use tokio::runtime::{Builder, Runtime};
 
+use super::actor;
 use crate::{
 	ax::{AxBounds, AxHandle, AxProps, normalize_role_atspi},
 	backend::AxBackend,
@@ -66,9 +74,7 @@ impl ActorAx {
 					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI application: {err}")))?;
 				let app_name = app_proxy.name().await.unwrap_or_default();
 				let pid = if let Some(bus_name) = app.name() {
-					let dbus = atspi::zbus::fdo::DBusProxy::new(self.connection().connection())
-						.await
-						.ok();
+					let dbus = DBusProxy::new(self.connection().connection()).await.ok();
 					if let Some(dbus) = dbus {
 						dbus
 							.get_connection_unix_process_id(bus_name.clone().into())
@@ -153,7 +159,7 @@ impl ActorAx {
 				let Some(bus_name) = app.name() else {
 					continue;
 				};
-				let dbus = atspi::zbus::fdo::DBusProxy::new(connection.connection())
+				let dbus = DBusProxy::new(connection.connection())
 					.await
 					.map_err(|err| err.to_string())?;
 				if dbus
@@ -193,12 +199,12 @@ impl ActorAx {
 	async fn component<'a>(
 		connection: &'a atspi::AccessibilityConnection,
 		object: &'a ObjectRefOwned,
-	) -> Result<atspi::proxy::component::ComponentProxy<'a>, String> {
+	) -> Result<ComponentProxy<'a>, String> {
 		let name = object
 			.name()
 			.ok_or_else(|| "AT-SPI object has no bus name".to_string())?
 			.clone();
-		atspi::proxy::component::ComponentProxy::builder(connection.connection())
+		ComponentProxy::builder(connection.connection())
 			.destination(name)
 			.map_err(|err| err.to_string())?
 			.path(object.path().clone())
@@ -211,12 +217,12 @@ impl ActorAx {
 	async fn action<'a>(
 		connection: &'a atspi::AccessibilityConnection,
 		object: &'a ObjectRefOwned,
-	) -> Result<atspi::proxy::action::ActionProxy<'a>, String> {
+	) -> Result<ActionProxy<'a>, String> {
 		let name = object
 			.name()
 			.ok_or_else(|| "AT-SPI object has no bus name".to_string())?
 			.clone();
-		atspi::proxy::action::ActionProxy::builder(connection.connection())
+		ActionProxy::builder(connection.connection())
 			.destination(name)
 			.map_err(|err| err.to_string())?
 			.path(object.path().clone())
@@ -300,7 +306,7 @@ impl AxBackend for ActorAx {
 				.as_ref()
 				.is_some_and(|states| states.contains(State::MultiLine));
 			let value = if let Some(name) = object.name().cloned() {
-				let builder = atspi::proxy::text::TextProxy::builder(self.connection().connection())
+				let builder = TextProxy::builder(self.connection().connection())
 					.destination(name)
 					.and_then(|builder| builder.path(object.path().clone()));
 				if let Ok(builder) = builder {
@@ -438,13 +444,12 @@ impl AxBackend for ActorAx {
 				.name()
 				.ok_or_else(|| DesktopError::ax_failed("AT-SPI object has no bus name"))?
 				.clone();
-			let editable =
-				atspi::proxy::editable_text::EditableTextProxy::builder(self.connection().connection())
-					.destination(name.clone())
-					.and_then(|b| b.path(object.path().clone()))
-					.map_err(|err| DesktopError::ax_failed(err.to_string()))?
-					.build()
-					.await;
+			let editable = EditableTextProxy::builder(self.connection().connection())
+				.destination(name.clone())
+				.and_then(|b| b.path(object.path().clone()))
+				.map_err(|err| DesktopError::ax_failed(err.to_string()))?
+				.build()
+				.await;
 			if let Ok(editable) = editable
 				&& editable
 					.set_text_contents(value)
@@ -456,7 +461,7 @@ impl AxBackend for ActorAx {
 			let numeric = value.parse::<f64>().map_err(|_| {
 				DesktopError::ax_failed("AT-SPI value is not editable text or a number")
 			})?;
-			let proxy = atspi::proxy::value::ValueProxy::builder(self.connection().connection())
+			let proxy = ValueProxy::builder(self.connection().connection())
 				.destination(name)
 				.and_then(|b| b.path(object.path().clone()))
 				.map_err(|err| DesktopError::ax_failed(err.to_string()))?
@@ -566,7 +571,7 @@ pub struct AtSpiAx;
 
 impl AtSpiAx {
 	pub(crate) fn new() -> CoreResult<Self> {
-		super::actor::ax_init()?;
+		actor::ax_init()?;
 		Ok(Self)
 	}
 
@@ -579,48 +584,48 @@ impl AtSpiAx {
 	}
 
 	pub(crate) fn windows(&self) -> CoreResult<Vec<DesktopWindow>> {
-		super::actor::ax_windows()
+		actor::ax_windows()
 	}
 }
 
 impl AxBackend for AtSpiAx {
 	fn window_root(&mut self, win: &DesktopWindow) -> CoreResult<AxHandle> {
-		super::actor::ax_window_root(win.clone())
+		actor::ax_window_root(win.clone())
 	}
 
 	fn props(&mut self, h: &AxHandle) -> CoreResult<AxProps> {
-		super::actor::ax_props(Self::object(h).clone())
+		actor::ax_props(Self::object(h).clone())
 	}
 
 	fn children(&mut self, h: &AxHandle) -> CoreResult<Vec<AxHandle>> {
-		super::actor::ax_children(Self::object(h).clone())
+		actor::ax_children(Self::object(h).clone())
 	}
 
 	fn parent(&mut self, h: &AxHandle) -> CoreResult<Option<AxHandle>> {
-		super::actor::ax_parent(Self::object(h).clone())
+		actor::ax_parent(Self::object(h).clone())
 	}
 
 	fn perform(&mut self, h: &AxHandle, action: &str) -> CoreResult<()> {
-		super::actor::ax_perform(Self::object(h).clone(), action.to_string())
+		actor::ax_perform(Self::object(h).clone(), action.to_string())
 	}
 
 	fn set_value(&mut self, h: &AxHandle, value: &str) -> CoreResult<()> {
-		super::actor::ax_set_value(Self::object(h).clone(), value.to_string())
+		actor::ax_set_value(Self::object(h).clone(), value.to_string())
 	}
 
 	fn focus(&mut self, h: &AxHandle) -> CoreResult<()> {
-		super::actor::ax_focus(Self::object(h).clone())
+		actor::ax_focus(Self::object(h).clone())
 	}
 
 	fn element_at(&mut self, x: f64, y: f64) -> CoreResult<Option<AxHandle>> {
-		super::actor::ax_element_at(x, y)
+		actor::ax_element_at(x, y)
 	}
 
 	fn focused_element(&mut self) -> CoreResult<Option<AxHandle>> {
-		super::actor::ax_focused_element()
+		actor::ax_focused_element()
 	}
 
 	fn attributes(&mut self, h: &AxHandle) -> CoreResult<Vec<(String, String)>> {
-		super::actor::ax_attributes(Self::object(h).clone())
+		actor::ax_attributes(Self::object(h).clone())
 	}
 }

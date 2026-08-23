@@ -14,9 +14,13 @@ use omp_memory::{
 	extract::{ExtractionLane, ExtractionReport, ExtractionRequest, extract_and_store},
 };
 use omp_proto::{
-	inference::v1::{ChatParams, turn_event},
+	inference::{
+		v1,
+		v1::{ChatParams, turn_event},
+	},
 	thread::v1::{Item, Message, Part, Role, Thread, item, part},
 };
+use omp_tools::memory::{ReflectionHost, ReflectionHostError, ReflectionRequest};
 use parking_lot::RwLock;
 
 /// Memory runtime exposed to presentation without leaking its owning crate.
@@ -189,13 +193,8 @@ impl<C: TurnClient + Clone> ExtractionLane for InferenceExtractionLane<C> {
 }
 
 #[async_trait::async_trait]
-impl<C: TurnClient + Clone + Send + Sync + 'static> omp_tools::memory::ReflectionHost
-	for InferenceExtractionLane<C>
-{
-	async fn reflect(
-		&self,
-		request: omp_tools::memory::ReflectionRequest,
-	) -> Result<Str, omp_tools::memory::ReflectionHostError> {
+impl<C: TurnClient + Clone + Send + Sync + 'static> ReflectionHost for InferenceExtractionLane<C> {
+	async fn reflect(&self, request: ReflectionRequest) -> Result<Str, ReflectionHostError> {
 		let mut prompt = String::from("Question:\n");
 		prompt.push_str(request.query.as_str());
 		if let Some(context) = request
@@ -222,7 +221,7 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> omp_tools::memory::Reflectio
 				&prompt,
 			)
 			.await
-			.map_err(|_| omp_tools::memory::ReflectionHostError::Inference)
+			.map_err(|_| ReflectionHostError::Inference)
 	}
 }
 
@@ -232,13 +231,13 @@ fn memory_message(role: Role, text: &str) -> Item {
 		created_at_ms: 0,
 		kind:          Some(item::Kind::Message(Message {
 			role:  i32::from(role),
-			parts: vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+			parts: vec![Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())) }],
 		})),
 		props:         None,
 	}
 }
 
-fn memory_outcome_text(outcome: &omp_proto::inference::v1::Outcome) -> String {
+fn memory_outcome_text(outcome: &v1::Outcome) -> String {
 	let mut text = String::new();
 	for item in &outcome.output {
 		if let Some(item::Kind::Message(message)) = &item.kind {

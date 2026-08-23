@@ -3,15 +3,16 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use async_trait::async_trait;
+use flume::Receiver;
 use omp_core::{Hash32, Str, sf};
 use omp_tools::browser::{Action, BrowserHost, Fault, Params, Payload, RunOperation};
 use omp_webview::{
 	Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder,
-	automation::{ElementHandle, ExtractFormat, ObserveOptions, Selector},
+	automation::{ExtractFormat, ObserveOptions, Selector},
 };
 use serde_json::{Value, json};
 
-use crate::blobs::BlobHost;
+use crate::blobs::{BlobError, BlobHost};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TIMEOUT: Duration = Duration::from_mins(5);
@@ -52,7 +53,7 @@ impl BrowserHost for BrowserDaemon {
 	}
 }
 
-fn run(receiver: flume::Receiver<Request>, blobs: BlobHost) {
+fn run(receiver: Receiver<Request>, blobs: BlobHost) {
 	let mut tabs = HashMap::<Str, WebView>::new();
 	while let Ok(request) = receiver.recv() {
 		let result = execute(&mut tabs, &blobs, request.params);
@@ -330,6 +331,6 @@ fn webview_fault(error: omp_webview::Error) -> Fault {
 	Fault { code: sf!("browser_automation_failed"), message: Str::new(error.to_string()) }
 }
 
-fn blob_fault(error: crate::blobs::BlobError) -> Fault {
+fn blob_fault(error: BlobError) -> Fault {
 	Fault { code: sf!("browser_artifact_failed"), message: Str::new(error.to_string()) }
 }

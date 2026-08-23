@@ -5,8 +5,10 @@
 
 use std::{
 	fs::File,
+	io,
 	io::{BufRead as _, BufReader},
 	path::{Path, PathBuf},
+	time,
 };
 
 use omp_core::{Str, sf, time::parse_rfc3339};
@@ -16,7 +18,8 @@ use thiserror::Error;
 
 use super::{
 	Attribution, Block, BlockKind, CallId, Event, Header, Kind, ModelId, ModelRef, Msg, ProviderId,
-	Stop, Timing, TitleSource, Usage, UserBlock, Writer, load, writer::JournalError,
+	Stop, Timing, TitleSource, Usage, UserBlock, Writer, codec::Error as CodecError, load,
+	writer::JournalError,
 };
 
 /// Supported foreign transcript dialects.
@@ -372,7 +375,7 @@ fn parse_timestamp(value: Option<&Value>) -> Option<u64> {
 	match value? {
 		Value::Number(number) => number.as_u64(),
 		Value::String(value) => parse_rfc3339(value)
-			.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+			.and_then(|time| time.duration_since(time::UNIX_EPOCH).ok())
 			.and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
 		_ => None,
 	}
@@ -407,13 +410,13 @@ pub struct PiImportReport {
 pub enum PiImportError {
 	/// Source or destination filesystem operation failed.
 	#[error("pi session migration filesystem operation failed")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// The source declared a schema newer than v2.
 	#[error("unsupported pi session version {0}; importer accepts v1 and v2")]
 	UnsupportedVersion(u32),
 	/// Transcript encoding or validation failed.
 	#[error(transparent)]
-	Transcript(#[from] super::codec::Error),
+	Transcript(#[from] CodecError),
 	/// Atomic v4 journal publication failed.
 	#[error(transparent)]
 	Journal(#[from] JournalError),

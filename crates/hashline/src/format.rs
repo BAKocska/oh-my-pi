@@ -1,6 +1,6 @@
 //! Hashline sigils, display helpers, and snapshot-tag computation.
 
-use std::fmt::Write;
+use std::{fmt::Write, str};
 
 use omp_core::{Str, encoding::ArrayStr, hex, sf};
 use xxhash_rust::xxh32::Xxh32;
@@ -128,7 +128,7 @@ pub fn format_numbered_line(line: usize, text: &str) -> Str {
 ///
 /// A terminal newline terminates the preceding row; its empty split sentinel
 /// is not content. Genuine blank rows before that terminator remain visible.
-pub fn split_addressable_file_lines(text: &str) -> std::str::Split<'_, char> {
+pub fn split_addressable_file_lines(text: &str) -> str::Split<'_, char> {
 	text.strip_suffix('\n').unwrap_or(text).split('\n')
 }
 

@@ -1,9 +1,11 @@
 //! End-to-end environment daemon contract tests.
 
 use std::{
+	env, fs, future, io,
 	path::{Path, PathBuf},
+	process,
 	sync::Arc,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use async_stream::stream;
@@ -25,27 +27,36 @@ use omp_envd::{
 use omp_proto::{
 	SCHEMA_REV,
 	blob::v1::{Chunk, GetRequest},
-	env::v1::{
-		Admission, AdmitInvocation, ClientHello, ExecOutcome, ExecRequest, InvokeTool, ListProcesses,
-		OpenSessionRequest, ProcessSpec, RegisterPresence, ReleasePresence, Script, StartProcess,
-		StopProcess,
+	env::{
+		v1,
+		v1::{
+			Admission, AdmitInvocation, ClientHello, ExecOutcome, ExecRequest, InvokeTool,
+			ListProcesses, OpenSessionRequest, ProcessSpec, RegisterPresence, ReleasePresence, Script,
+			StartProcess, StopProcess,
+		},
 	},
 };
 use omp_tool::{
 	Abort, CallOutcome, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams, LoweringCaps,
 	Part, Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute, ToolSpec,
 };
+use omp_tools::{eval, eval::OutputChannel};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::{
+	net::UnixStream,
+	task::{self, JoinHandle},
+	time,
+};
 use tokio_util::sync::CancellationToken;
-
+use url::Url;
 struct AllowAdmission;
 
 impl Admitter for AllowAdmission {
-	type Future<'client> = std::future::Ready<Admission>;
+	type Future<'client> = future::Ready<Admission>;
 
 	fn admit(&self, query: AdmitInvocation) -> Self::Future<'_> {
-		std::future::ready(Admission {
+		future::ready(Admission {
 			invocation_id: query.invocation_id,
 			allow: true,
 			..Admission::default()
@@ -113,7 +124,7 @@ impl Tool for EffectTool {
 		stream! {
 			match params.whole::<Value>().await {
 				Ok(value) => {
-					std::fs::write(&self.marker, b"committed").expect("write effect marker");
+					fs::write(&self.marker, b"committed").expect("write effect marker");
 					yield Ev::Done(omp_tool::ToolTerminal::Done { result: Ok(value), useless: true });
 				},
 				Err(error) => yield Ev::Done(omp_tool::ToolTerminal::Done {
@@ -134,7 +145,7 @@ struct SpeculativeLease {
 
 impl Drop for SpeculativeLease {
 	fn drop(&mut self) {
-		let _ = std::fs::remove_file(&self.marker);
+		let _ = fs::remove_file(&self.marker);
 	}
 }
 
@@ -185,14 +196,14 @@ impl Tool for StreamingTool {
 				yield Ev::Aborted(Abort::InputDropped);
 				return;
 			};
-			std::fs::write(&self.lease, path.as_bytes()).expect("open speculative lease");
+			fs::write(&self.lease, path.as_bytes()).expect("open speculative lease");
 			let _lease = SpeculativeLease { marker: self.lease.clone() };
 			yield Ev::Update(json!({"state": "prepared", "path": path}));
 			if params.committed().await.is_err() {
 				yield Ev::Aborted(Abort::InputDropped);
 				return;
 			}
-			std::fs::write(&self.effect, path.as_bytes()).expect("record committed effect");
+			fs::write(&self.effect, path.as_bytes()).expect("record committed effect");
 			tokio::time::sleep(Duration::from_millis(100)).await;
 			yield Ev::Done(omp_tool::ToolTerminal::Done {
 				result: Ok(json!({"path": path})),
@@ -245,9 +256,9 @@ impl Tool for BlockingTool {
 		stream! {
 			match params.committed().await {
 				Ok(_) => {
-					std::fs::write(&self.started, b"started").expect("write native start marker");
+					fs::write(&self.started, b"started").expect("write native start marker");
 					yield Ev::Update(json!({"state": "started"}));
-					std::future::pending::<()>().await;
+					future::pending::<()>().await;
 				},
 				Err(_) => yield Ev::Aborted(Abort::InputDropped),
 			}
@@ -301,7 +312,7 @@ impl Tool for CooperativeInterruptTool {
 			yield Ev::Update(json!({"state": "waiting"}));
 			let interrupted: Result<(), omp_tool::ParamError> = params
 				.interruptable()
-				.pull(|_| async { std::future::pending().await })
+				.pull(|_| async { future::pending().await })
 				.await;
 			match interrupted {
 				Err(omp_tool::ParamError::Interrupted(interrupt)) => {
@@ -458,7 +469,7 @@ struct Harness {
 	server:      Arc<EnvServer>,
 	root:        TempDir,
 	state:       TempDir,
-	server_task: tokio::task::JoinHandle<()>,
+	server_task: JoinHandle<()>,
 }
 
 impl Harness {
@@ -499,7 +510,7 @@ impl Harness {
 		&self.client
 	}
 
-	async fn connect(&self, name: &str) -> (EnvClient, tokio::task::JoinHandle<()>) {
+	async fn connect(&self, name: &str) -> (EnvClient, JoinHandle<()>) {
 		let (client, transport) = EnvClient::in_process(64);
 		client.set_admitter(AllowAdmission);
 		let host = Arc::clone(&self.server);
@@ -529,7 +540,7 @@ async fn presence_rpc_publishes_coexisting_leases_and_releases_them() {
 		.client()
 		.register_presence(RegisterPresence {
 			client_id: Bytes::from_static(b"client-a"),
-			pid: std::process::id(),
+			pid: process::id(),
 			kind: "interactive".to_owned(),
 			..RegisterPresence::default()
 		})
@@ -539,47 +550,32 @@ async fn presence_rpc_publishes_coexisting_leases_and_releases_them() {
 	let second = second_client
 		.register_presence(RegisterPresence {
 			client_id: Bytes::from_static(b"client-b"),
-			pid: std::process::id(),
+			pid: process::id(),
 			kind: "rpc".to_owned(),
 			..RegisterPresence::default()
 		})
 		.await
 		.expect("register second presence");
 	let clients = harness.state.path().join("clients");
-	assert_eq!(
-		std::fs::read_dir(&clients)
-			.expect("presence directory")
-			.count(),
-		2
-	);
+	assert_eq!(fs::read_dir(&clients).expect("presence directory").count(), 2);
 
 	harness
 		.client()
 		.release_presence(ReleasePresence { lease_id: first.lease_id, ..ReleasePresence::default() })
 		.await
 		.expect("release first presence");
-	assert_eq!(
-		std::fs::read_dir(&clients)
-			.expect("presence directory")
-			.count(),
-		1
-	);
+	assert_eq!(fs::read_dir(&clients).expect("presence directory").count(), 1);
 
 	second_client
 		.release_presence(ReleasePresence { lease_id: second.lease_id, ..ReleasePresence::default() })
 		.await
 		.expect("release second presence");
-	assert_eq!(
-		std::fs::read_dir(&clients)
-			.expect("presence directory")
-			.count(),
-		0
-	);
+	assert_eq!(fs::read_dir(&clients).expect("presence directory").count(), 0);
 	second_task.abort();
 }
 
 fn cwd_uri(path: &Path) -> String {
-	url::Url::from_directory_path(path)
+	Url::from_directory_path(path)
 		.expect("directory file URI")
 		.to_string()
 }
@@ -592,10 +588,10 @@ fn exec_request(session: &[u8], script: impl Into<String>) -> ExecRequest {
 	}
 }
 
-async fn collect_exec(run: &mut omp_env::ExecRun) -> (Vec<u8>, omp_proto::env::v1::ExecStatusMsg) {
+async fn collect_exec(run: &mut omp_env::ExecRun) -> (Vec<u8>, v1::ExecStatusMsg) {
 	let mut output = Vec::new();
 	loop {
-		match tokio::time::timeout(Duration::from_secs(10), run.next_event())
+		match time::timeout(Duration::from_secs(10), run.next_event())
 			.await
 			.expect("exec event timeout")
 			.expect("exec event")
@@ -614,7 +610,7 @@ async fn invoke_builtin(
 	name: &str,
 	rev: &str,
 	args: Value,
-) -> omp_proto::env::v1::Verdict {
+) -> v1::Verdict {
 	let mut invocation = client
 		.invoke(InvokeTool {
 			invocation_id: invocation_id.into(),
@@ -652,7 +648,7 @@ async fn invoke_builtin(
 	}
 }
 
-fn ok_builtin_payload(verdict: omp_proto::env::v1::Verdict, operation: &str) -> Value {
+fn ok_builtin_payload(verdict: v1::Verdict, operation: &str) -> Value {
 	assert!(
 		!verdict.is_error,
 		"{operation} returned an error: {}",
@@ -684,10 +680,7 @@ fn hashline_tag<'o>(output: &'o str, path: &str) -> &'o str {
 		.expect("read minted a hashline tag")
 }
 
-fn eval_output(
-	payload: &omp_tools::eval::Payload,
-	channel: omp_tools::eval::OutputChannel,
-) -> Vec<u8> {
+fn eval_output(payload: &eval::Payload, channel: OutputChannel) -> Vec<u8> {
 	payload
 		.frames
 		.iter()
@@ -722,7 +715,7 @@ async fn write_name_is_reserved_before_production_registry_assembly() {
 #[tokio::test]
 async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 	let harness = Harness::start(Registry::new()).await;
-	std::fs::write(harness.root.path().join("note.txt"), "before\n").expect("workspace fixture");
+	fs::write(harness.root.path().join("note.txt"), "before\n").expect("workspace fixture");
 	let registry = harness.server.registry();
 	let agent_registry = harness.server.registry();
 	assert!(Arc::ptr_eq(&registry, &agent_registry));
@@ -1038,7 +1031,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		String::from_utf8_lossy(&edit.json)
 	);
 	assert_eq!(
-		std::fs::read_to_string(harness.root.path().join("note.txt")).expect("edited fixture"),
+		fs::read_to_string(harness.root.path().join("note.txt")).expect("edited fixture"),
 		"after\n"
 	);
 
@@ -1083,7 +1076,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		String::from_utf8_lossy(&write_edit.json)
 	);
 	assert_eq!(
-		std::fs::read_to_string(harness.root.path().join("nested/written.txt"))
+		fs::read_to_string(harness.root.path().join("nested/written.txt"))
 			.expect("write/edit fixture"),
 		"changed through shared snapshot\n"
 	);
@@ -1132,7 +1125,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 #[tokio::test]
 async fn special_writes_round_trip_through_production_read_backends() {
 	let harness = Harness::start(Registry::new()).await;
-	std::fs::write(
+	fs::write(
 		harness.root.path().join("bundle.zip"),
 		include_bytes!("../../../tools/tests/fixtures/special-sources/archives/bundle.zip"),
 	)
@@ -1162,7 +1155,7 @@ async fn special_writes_round_trip_through_production_read_backends() {
 		"changed through write\n"
 	);
 
-	std::fs::write(
+	fs::write(
 		harness.root.path().join("catalog.sqlite"),
 		include_bytes!("../../../tools/tests/fixtures/special-sources/database/catalog.sqlite"),
 	)
@@ -1239,11 +1232,11 @@ async fn special_writes_round_trip_through_production_read_backends() {
 async fn edit_rejects_a_stale_tag_after_an_external_file_change() {
 	let harness = Harness::start(Registry::new()).await;
 	let path = harness.root.path().join("stale.txt");
-	std::fs::write(&path, "before\n").expect("seed stale edit fixture");
+	fs::write(&path, "before\n").expect("seed stale edit fixture");
 	let first = read_builtin_text(harness.client(), "read-stale-base", "stale.txt").await;
 	let tag = hashline_tag(&first, "stale.txt").to_owned();
 
-	std::fs::write(&path, "changed outside\n").expect("modify fixture outside document host");
+	fs::write(&path, "changed outside\n").expect("modify fixture outside document host");
 	let current = read_builtin_text(harness.client(), "read-stale-current", "stale.txt").await;
 	assert!(current.contains("1:changed outside"));
 	let edit = invoke_builtin(
@@ -1267,7 +1260,7 @@ async fn edit_rejects_a_stale_tag_after_an_external_file_change() {
 		.as_str()
 		.expect("stale mismatch message");
 	assert!(message.contains(&tag), "stale message omitted authored tag: {message}");
-	assert_eq!(std::fs::read_to_string(path).expect("unchanged stale fixture"), "changed outside\n");
+	assert_eq!(fs::read_to_string(path).expect("unchanged stale fixture"), "changed outside\n");
 }
 
 #[tokio::test]
@@ -1276,7 +1269,7 @@ async fn edit_named_register_spans_sections_and_persists_after_commit() {
 	for (path, content) in
 		[("source.txt", "carry\nstay\n"), ("destination.txt", "before\n"), ("later.txt", "again\n")]
 	{
-		std::fs::write(harness.root.path().join(path), content).expect("seed clipboard fixture");
+		fs::write(harness.root.path().join(path), content).expect("seed clipboard fixture");
 	}
 	let source = read_builtin_text(harness.client(), "read-clipboard-source", "source.txt").await;
 	let destination =
@@ -1300,11 +1293,11 @@ async fn edit_named_register_spans_sections_and_persists_after_commit() {
 	.await;
 	let _ = ok_builtin_payload(batch, "edit clipboard batch");
 	assert_eq!(
-		std::fs::read_to_string(harness.root.path().join("source.txt")).expect("read cut source"),
+		fs::read_to_string(harness.root.path().join("source.txt")).expect("read cut source"),
 		"stay\n"
 	);
 	assert_eq!(
-		std::fs::read_to_string(harness.root.path().join("destination.txt"))
+		fs::read_to_string(harness.root.path().join("destination.txt"))
 			.expect("read paste destination"),
 		"before\ncarry\n"
 	);
@@ -1321,7 +1314,7 @@ async fn edit_named_register_spans_sections_and_persists_after_commit() {
 	.await;
 	let _ = ok_builtin_payload(persisted, "edit persisted clipboard");
 	assert_eq!(
-		std::fs::read_to_string(harness.root.path().join("later.txt")).expect("read persisted paste"),
+		fs::read_to_string(harness.root.path().join("later.txt")).expect("read persisted paste"),
 		"again\ncarry\n"
 	);
 }
@@ -1329,13 +1322,12 @@ async fn edit_named_register_spans_sections_and_persists_after_commit() {
 #[tokio::test]
 async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_and_recovery() {
 	let harness = Harness::start(Registry::new()).await;
-	std::fs::write(harness.root.path().join("bridge-note.txt"), "bridge\n")
-		.expect("eval bridge fixture");
+	fs::write(harness.root.path().join("bridge-note.txt"), "bridge\n").expect("eval bridge fixture");
 	let changed_cwd = harness.root.path().join("eval-mutated-cwd");
-	std::fs::create_dir(&changed_cwd).expect("eval cwd mutation fixture");
+	fs::create_dir(&changed_cwd).expect("eval cwd mutation fixture");
 	let changed_cwd_literal =
 		serde_json::to_string(&changed_cwd.to_string_lossy()).expect("encode eval cwd fixture");
-	let expected_cwd = std::env::current_dir().expect("current test directory");
+	let expected_cwd = env::current_dir().expect("current test directory");
 	let expected_cwd_literal =
 		serde_json::to_string(&expected_cwd.to_string_lossy()).expect("encode expected cwd");
 
@@ -1358,7 +1350,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!seed.is_error, "embedded Python seed cell failed");
-	let seed: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let seed: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&seed.json).expect("typed eval seed verdict");
 	let CallOutcome::Ok(seed) = seed else {
 		panic!("embedded Python seed cell returned a fault");
@@ -1383,7 +1375,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!isolated.is_error, "unrelated eval owner failed");
-	let isolated: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let isolated: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&isolated.json).expect("typed owner-isolation verdict");
 	let CallOutcome::Ok(isolated) = isolated else {
 		panic!("unrelated eval owner returned a fault");
@@ -1411,7 +1403,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		 Path({left_ready_literal}).exists():\n    time.sleep(0.01)\nshared_name = \
 		 'right'\npeer_state = 73\nshared_name"
 	);
-	let (left, right) = tokio::time::timeout(Duration::from_secs(5), async {
+	let (left, right) = time::timeout(Duration::from_secs(5), async {
 		tokio::join!(
 			invoke_builtin(
 				harness.client(),
@@ -1433,9 +1425,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	.expect("independent Python kernels serialized behind one another");
 	assert!(!left.is_error, "left independent Python kernel failed");
 	assert!(!right.is_error, "right independent Python kernel failed");
-	let left: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let left: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&left.json).expect("typed left parallel eval verdict");
-	let right: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let right: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&right.json).expect("typed right parallel eval verdict");
 	let (CallOutcome::Ok(left), CallOutcome::Ok(right)) = (left, right) else {
 		panic!("independent Python kernels returned a resource fault");
@@ -1452,7 +1444,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!bridged_glob.is_error, "eval tool bridge call failed");
-	let bridged_glob: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let bridged_glob: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&bridged_glob.json).expect("typed eval bridge verdict");
 	let CallOutcome::Ok(bridged_glob) = bridged_glob else {
 		panic!("eval tool bridge returned a fault");
@@ -1480,7 +1472,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!denied_completion.is_error, "completion denial cell failed");
-	let denied_completion: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let denied_completion: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&denied_completion.json).expect("typed completion denial verdict");
 	let CallOutcome::Ok(denied_completion) = denied_completion else {
 		panic!("completion denial returned a resource fault");
@@ -1499,7 +1491,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!continued.is_error, "embedded Python continuation cell failed");
-	let continued: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let continued: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&continued.json).expect("typed eval continuation verdict");
 	let CallOutcome::Ok(continued) = continued else {
 		panic!("embedded Python continuation cell returned a fault");
@@ -1529,7 +1521,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!reset.is_error, "embedded Python reset cell failed");
-	let reset: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let reset: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&reset.json).expect("typed eval reset verdict");
 	let CallOutcome::Ok(reset) = reset else {
 		panic!("embedded Python reset cell returned a fault");
@@ -1550,7 +1542,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!peer_after_reset.is_error, "peer kernel failed after another kernel reset");
-	let peer_after_reset: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let peer_after_reset: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&peer_after_reset.json).expect("typed peer post-reset verdict");
 	let CallOutcome::Ok(peer_after_reset) = peer_after_reset else {
 		panic!("peer kernel returned a fault after another kernel reset");
@@ -1570,7 +1562,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		 Path\nPath({timeout_marker_literal}).write_text('started')\ntime.sleep(5)"
 	);
 	let timed_out = async {
-		let started = std::time::Instant::now();
+		let started = Instant::now();
 		let verdict = invoke_builtin(
 			harness.client(),
 			"eval-timeout",
@@ -1583,7 +1575,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	};
 	let queued_after_timeout = async {
 		while !timeout_marker.exists() {
-			tokio::time::sleep(Duration::from_millis(1)).await;
+			time::sleep(Duration::from_millis(1)).await;
 		}
 		invoke_builtin(
 			harness.client(),
@@ -1594,14 +1586,14 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		)
 		.await
 	};
-	let ((timed_out, timeout_elapsed), recovered) = tokio::time::timeout(
+	let ((timed_out, timeout_elapsed), recovered) = time::timeout(
 		Duration::from_secs(5),
 		Box::pin(async { tokio::join!(timed_out, queued_after_timeout) }),
 	)
 	.await
 	.expect("queued cell deadlocked behind timed-out Python kernel");
 	assert!(!timed_out.is_error, "timed-out Python cell did not return typed cell truth");
-	let timed_out: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let timed_out: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&timed_out.json).expect("typed eval timeout verdict");
 	let CallOutcome::Ok(timed_out) = timed_out else {
 		panic!("timed-out Python cell returned a resource fault");
@@ -1621,7 +1613,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	);
 
 	assert!(!recovered.is_error, "Python kernel did not recover after timeout");
-	let recovered: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let recovered: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&recovered.json).expect("typed post-timeout eval verdict");
 	let CallOutcome::Ok(recovered) = recovered else {
 		panic!("post-timeout Python cell returned a fault");
@@ -1670,15 +1662,15 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		)
 		.await
 		.expect("commit cancellable eval arguments");
-	tokio::time::timeout(Duration::from_secs(2), async {
+	time::timeout(Duration::from_secs(2), async {
 		while !started.exists() {
-			tokio::task::yield_now().await;
+			task::yield_now().await;
 		}
 	})
 	.await
 	.expect("embedded Python cancellation cell never became active");
 	cancelled.guard().cancel();
-	let terminal = tokio::time::timeout(Duration::from_secs(2), cancelled.next_event())
+	let terminal = time::timeout(Duration::from_secs(2), cancelled.next_event())
 		.await
 		.expect("eval cancellation terminal timeout")
 		.expect("eval cancellation terminal event")
@@ -1699,7 +1691,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(!after_cancel.is_error, "Python kernel did not recover after cancellation");
-	let after_cancel: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let after_cancel: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&after_cancel.json).expect("typed post-cancel eval verdict");
 	let CallOutcome::Ok(after_cancel) = after_cancel else {
 		panic!("post-cancel Python cell returned a fault");
@@ -1719,7 +1711,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	)
 	.await;
 	assert!(crashed.is_error, "eval child crash was reported as a successful cell");
-	let crashed: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let crashed: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&crashed.json).expect("typed eval crash verdict");
 	assert!(matches!(crashed, CallOutcome::Faulted(omp_tools::eval::Fault::SessionLost { .. })));
 
@@ -1731,7 +1723,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		json!({"language":"py","code":"8 * 8"}),
 	)
 	.await;
-	let after_crash: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let after_crash: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&after_crash.json).expect("typed post-crash eval verdict");
 	let CallOutcome::Ok(after_crash) = after_crash else {
 		panic!("post-crash Python cell returned a fault");
@@ -1743,8 +1735,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 #[tokio::test]
 async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools() {
 	let harness = Harness::start(Registry::new()).await;
-	std::fs::write(harness.root.path().join("uds-note.txt"), "uds read\n")
-		.expect("UDS read fixture");
+	fs::write(harness.root.path().join("uds-note.txt"), "uds read\n").expect("UDS read fixture");
 	let advertised = harness
 		.server
 		.registry()
@@ -1783,9 +1774,9 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 			.serve_uds(&socket_for_server, serve_shutdown, None)
 			.await
 	});
-	tokio::time::timeout(Duration::from_secs(2), async {
+	time::timeout(Duration::from_secs(2), async {
 		while !socket.exists() {
-			tokio::task::yield_now().await;
+			task::yield_now().await;
 		}
 	})
 	.await
@@ -1867,7 +1858,7 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 #[tokio::test]
 async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
 	let site = tempfile::tempdir().expect("prelude helper extension scratch");
-	std::fs::write(
+	fs::write(
 		site
 			.path()
 			.join(format!("{PRELUDE_HELPER_EXTENSION_MODULE}.py")),
@@ -1904,7 +1895,7 @@ async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
 	)
 	.await;
 	assert!(!verdict.is_error, "prelude helper eval returned an error");
-	let verdict: CallOutcome<omp_tools::eval::Payload, omp_tools::eval::Fault> =
+	let verdict: CallOutcome<eval::Payload, eval::Fault> =
 		serde_json::from_slice(&verdict.json).expect("typed prelude helper eval verdict");
 	let CallOutcome::Ok(payload) = verdict else {
 		panic!("prelude helper eval returned a resource fault");
@@ -1930,7 +1921,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 
 	let mut cancelled = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "stream-cancel".into(),
 			name: "streaming_probe".into(),
 			rev: "test.1".into(),
@@ -1950,13 +1941,13 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		.arg_text(sf!(r#"th":"cancel"}}"#))
 		.await
 		.expect("second cancellable argument fragment");
-	let update = tokio::time::timeout(Duration::from_secs(1), cancelled.next_event())
+	let update = time::timeout(Duration::from_secs(1), cancelled.next_event())
 		.await
 		.expect("speculative update timeout")
 		.expect("speculative update event")
 		.expect("speculative stream closed");
 	assert!(matches!(update, InvocationEvent::Update(_)));
-	assert_eq!(std::fs::read(&lease).expect("speculative lease marker"), b"cancel");
+	assert_eq!(fs::read(&lease).expect("speculative lease marker"), b"cancel");
 	assert!(!effect.exists(), "streamed preparation performed an effect before commit");
 
 	cancelled.guard().cancel();
@@ -1980,9 +1971,9 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 			.is_none(),
 		"precommit cancellation emitted more than one terminal",
 	);
-	tokio::time::timeout(Duration::from_secs(1), async {
+	time::timeout(Duration::from_secs(1), async {
 		while lease.exists() {
-			tokio::task::yield_now().await;
+			task::yield_now().await;
 		}
 	})
 	.await
@@ -1991,7 +1982,7 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 
 	let mut committed = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "stream-commit".into(),
 			name: "streaming_probe".into(),
 			rev: "test.1".into(),
@@ -2034,13 +2025,13 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		.expect("committed verdict")
 		.expect("committed stream closed");
 	assert!(matches!(terminal, InvocationEvent::Verdict(_)));
-	assert_eq!(std::fs::read(&effect).expect("committed effect marker"), b"committed");
+	assert_eq!(fs::read(&effect).expect("committed effect marker"), b"committed");
 	assert!(!lease.exists(), "committed speculative lease was not released");
-	std::fs::remove_file(&effect).expect("clear committed effect marker");
+	fs::remove_file(&effect).expect("clear committed effect marker");
 
 	let mut duplicate = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "stream-duplicate".into(),
 			name: "streaming_probe".into(),
 			rev: "test.1".into(),
@@ -2072,9 +2063,9 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		)
 		.await
 		.expect("first duplicate commit");
-	tokio::time::timeout(Duration::from_secs(1), async {
-		while !std::fs::read(&effect).is_ok_and(|contents| contents == b"duplicate") {
-			tokio::task::yield_now().await;
+	time::timeout(Duration::from_secs(1), async {
+		while !fs::read(&effect).is_ok_and(|contents| contents == b"duplicate") {
+			task::yield_now().await;
 		}
 	})
 	.await
@@ -2096,12 +2087,12 @@ async fn native_streaming_prepares_before_commit_and_fuses_commit_cancel_termina
 		panic!("duplicate ArgsCommitted returned a non-protocol error");
 	};
 	assert_eq!(error.code, omp_proto::env::v1::ProtocolErrorCode::AlreadyExists as i32);
-	tokio::time::sleep(Duration::from_millis(200)).await;
-	assert_eq!(std::fs::read(&effect).expect("duplicate committed effect"), b"duplicate");
+	time::sleep(Duration::from_millis(200)).await;
+	assert_eq!(fs::read(&effect).expect("duplicate committed effect"), b"duplicate");
 	assert!(!lease.exists(), "duplicate-commit request leaked its speculative lease");
 	let mut reopened = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "stream-duplicate".into(),
 			name: "streaming_probe".into(),
 			rev: "test.1".into(),
@@ -2132,7 +2123,7 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 
 	let mut blocked = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "native-cancel".into(),
 			name: "native_block".into(),
 			rev: "test.1".into(),
@@ -2160,7 +2151,7 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 	assert!(started.exists(), "native invocation did not enter its committed body");
 
 	blocked.guard().cancel();
-	let terminal = tokio::time::timeout(Duration::from_secs(2), blocked.next_event())
+	let terminal = time::timeout(Duration::from_secs(2), blocked.next_event())
 		.await
 		.expect("native structural cancellation exceeded its bound")
 		.expect("native cancellation event")
@@ -2184,7 +2175,7 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 
 	let mut next = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "native-next".into(),
 			name: "effect_probe".into(),
 			rev: "test.1".into(),
@@ -2209,7 +2200,7 @@ async fn native_cancel_emits_one_bounded_effects_unknown_verdict_and_next_reques
 		next.next_event().await.expect("next native verdict"),
 		Some(InvocationEvent::Verdict(_))
 	));
-	assert_eq!(std::fs::read(completed).expect("follow-up native effect"), b"committed");
+	assert_eq!(fs::read(completed).expect("follow-up native effect"), b"committed");
 }
 
 #[tokio::test]
@@ -2221,7 +2212,7 @@ async fn native_interrupt_is_steering_only_and_preserves_cooperative_truth() {
 	let harness = Harness::start(registry).await;
 	let mut invocation = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "native-interrupt".into(),
 			name: "cooperative_interrupt".into(),
 			rev: "test.1".into(),
@@ -2253,7 +2244,7 @@ async fn native_interrupt_is_steering_only_and_preserves_cooperative_truth() {
 		.interrupt(sf!("steer cooperatively"))
 		.await
 		.expect("send cooperative interrupt");
-	let terminal = tokio::time::timeout(Duration::from_secs(1), invocation.next_event())
+	let terminal = time::timeout(Duration::from_secs(1), invocation.next_event())
 		.await
 		.expect("cooperative interrupt terminal timeout")
 		.expect("cooperative interrupt event")
@@ -2281,7 +2272,7 @@ async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() 
 	let harness = Harness::start(registry).await;
 	let mut invocation = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "native-deadline".into(),
 			name: "native_block".into(),
 			rev: "test.1".into(),
@@ -2313,7 +2304,7 @@ async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() 
 			.expect("deadline native update"),
 		Some(InvocationEvent::Update(_))
 	));
-	let terminal = tokio::time::timeout(Duration::from_secs(2), invocation.next_event())
+	let terminal = time::timeout(Duration::from_secs(2), invocation.next_event())
 		.await
 		.expect("native deadline plus grace exceeded bound")
 		.expect("native deadline event")
@@ -2330,7 +2321,7 @@ async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() 
 #[tokio::test]
 async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_request() {
 	let site = tempfile::tempdir().expect("worker extension scratch");
-	std::fs::write(site.path().join("envd_cancel_tools.py"), WORKER_CANCEL_EXTENSION)
+	fs::write(site.path().join("envd_cancel_tools.py"), WORKER_CANCEL_EXTENSION)
 		.expect("write worker cancellation extension");
 	let mut worker = extension_worker("envd_cancel_tools", Some(site.path().to_owned()));
 	worker.health_timeout = Duration::from_secs(5);
@@ -2342,7 +2333,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 
 	let mut blocked = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "worker-cancel".into(),
 			name: "worker_block".into(),
 			rev: "r.1".into(),
@@ -2369,16 +2360,16 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		)
 		.await
 		.expect("commit blocking worker invocation");
-	tokio::time::timeout(Duration::from_secs(3), async {
+	time::timeout(Duration::from_secs(3), async {
 		while !started.exists() {
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			time::sleep(Duration::from_millis(10)).await;
 		}
 	})
 	.await
 	.expect("worker invocation did not enter native sleep");
 
 	blocked.guard().cancel();
-	let terminal = tokio::time::timeout(Duration::from_secs(3), blocked.next_event())
+	let terminal = time::timeout(Duration::from_secs(3), blocked.next_event())
 		.await
 		.expect("worker cancellation terminal timeout")
 		.expect("worker cancellation event")
@@ -2402,7 +2393,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 
 	let mut next = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "worker-next".into(),
 			name: "worker_echo".into(),
 			rev: "r.1".into(),
@@ -2423,7 +2414,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		)
 		.await
 		.expect("commit next worker request");
-	let next_terminal = tokio::time::timeout(Duration::from_secs(5), async {
+	let next_terminal = time::timeout(Duration::from_secs(5), async {
 		loop {
 			match next
 				.next_event()
@@ -2453,7 +2444,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 
 	let mut fault = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "worker-fault".into(),
 			name: "worker_fail".into(),
 			rev: "r.1".into(),
@@ -2474,7 +2465,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		)
 		.await
 		.expect("commit worker fault request");
-	let fault_terminal = tokio::time::timeout(Duration::from_secs(5), async {
+	let fault_terminal = time::timeout(Duration::from_secs(5), async {
 		loop {
 			match fault
 				.next_event()
@@ -2505,7 +2496,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 #[tokio::test]
 async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 	let site = tempfile::tempdir().expect("worker collision scratch");
-	std::fs::write(site.path().join("envd_cancel_tools.py"), WORKER_CANCEL_EXTENSION)
+	fs::write(site.path().join("envd_cancel_tools.py"), WORKER_CANCEL_EXTENSION)
 		.expect("write worker collision extension");
 	let mut worker = extension_worker("envd_cancel_tools", Some(site.path().to_owned()));
 	worker.health_timeout = Duration::from_secs(5);
@@ -2519,7 +2510,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 
 	let mut invocation_a = harness
 		.client()
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "shared-id".into(),
 			name: "worker_block".into(),
 			rev: "r.1".into(),
@@ -2546,16 +2537,16 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 		)
 		.await
 		.expect("commit worker A");
-	tokio::time::timeout(Duration::from_secs(3), async {
+	time::timeout(Duration::from_secs(3), async {
 		while !started_a.exists() {
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			time::sleep(Duration::from_millis(10)).await;
 		}
 	})
 	.await
 	.expect("worker A did not start");
 
 	let mut invocation_b = client_b
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "shared-id".into(),
 			name: "worker_block".into(),
 			rev: "r.1".into(),
@@ -2584,7 +2575,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 		.expect("commit worker B");
 	invocation_b.guard().cancel();
 
-	let terminal_b = tokio::time::timeout(Duration::from_secs(2), invocation_b.next_event())
+	let terminal_b = time::timeout(Duration::from_secs(2), invocation_b.next_event())
 		.await
 		.expect("worker B queued cancellation timeout")
 		.expect("worker B cancellation event")
@@ -2604,7 +2595,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 	);
 
 	invocation_a.guard().cancel();
-	let terminal_a = tokio::time::timeout(Duration::from_secs(3), invocation_a.next_event())
+	let terminal_a = time::timeout(Duration::from_secs(3), invocation_a.next_event())
 		.await
 		.expect("worker A cancellation timeout")
 		.expect("worker A cancellation event")
@@ -2617,7 +2608,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 	assert!(matches!(verdict_a, CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }));
 
 	let mut next = client_b
-		.invoke(omp_proto::env::v1::InvokeTool {
+		.invoke(v1::InvokeTool {
 			invocation_id: "shared-id".into(),
 			name: "worker_echo".into(),
 			rev: "r.1".into(),
@@ -2676,7 +2667,7 @@ async fn cancelled_exec_preserves_session_cwd_and_kills_term_ignoring_tree() {
 		if child_pid.exists() && grandchild_pid.exists() {
 			break;
 		}
-		tokio::time::sleep(Duration::from_millis(10)).await;
+		time::sleep(Duration::from_millis(10)).await;
 	}
 	assert!(child_pid.exists() && grandchild_pid.exists(), "child tree did not start");
 	drop(run);
@@ -2685,7 +2676,7 @@ async fn cancelled_exec_preserves_session_cwd_and_kills_term_ignoring_tree() {
 		// a parseable pid instead of racing the first byte.
 		let mut parsed = None;
 		for _ in 0..100 {
-			if let Ok(pid) = std::fs::read_to_string(pid_file)
+			if let Ok(pid) = fs::read_to_string(pid_file)
 				.expect("pid file")
 				.trim()
 				.parse::<i32>()
@@ -2693,7 +2684,7 @@ async fn cancelled_exec_preserves_session_cwd_and_kills_term_ignoring_tree() {
 				parsed = Some(pid);
 				break;
 			}
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			time::sleep(Duration::from_millis(10)).await;
 		}
 		let pid: i32 = parsed.expect("pid");
 		let mut dead = false;
@@ -2703,7 +2694,7 @@ async fn cancelled_exec_preserves_session_cwd_and_kills_term_ignoring_tree() {
 				dead = true;
 				break;
 			}
-			tokio::time::sleep(Duration::from_millis(25)).await;
+			time::sleep(Duration::from_millis(25)).await;
 		}
 		assert!(dead, "cancelled process {pid} is still alive");
 	}
@@ -2773,7 +2764,7 @@ async fn blob_and_named_process_frames_route_through_one_host() {
 		["contract-process"]
 	);
 	let mut attachment = client
-		.attach_output(omp_proto::env::v1::AttachOutput {
+		.attach_output(v1::AttachOutput {
 			name: "contract-process".into(),
 			generation: 1,
 			..Default::default()
@@ -2794,7 +2785,7 @@ async fn blob_and_named_process_frames_route_through_one_host() {
 		.await
 		.expect("stop process");
 	loop {
-		let event = tokio::time::timeout(Duration::from_secs(10), attachment.next_event())
+		let event = time::timeout(Duration::from_secs(10), attachment.next_event())
 			.await
 			.expect("named process stop timeout")
 			.expect("process state");
@@ -2809,7 +2800,7 @@ async fn blob_and_named_process_frames_route_through_one_host() {
 		}
 	}
 	let mut exited_attachment = client
-		.attach_output(omp_proto::env::v1::AttachOutput {
+		.attach_output(v1::AttachOutput {
 			name: "contract-process".into(),
 			generation: 1,
 			..Default::default()
@@ -2821,7 +2812,7 @@ async fn blob_and_named_process_frames_route_through_one_host() {
 		Some(ProcessAttachmentEvent::Attached(_))
 	));
 	loop {
-		let event = tokio::time::timeout(Duration::from_secs(2), exited_attachment.next_event())
+		let event = time::timeout(Duration::from_secs(2), exited_attachment.next_event())
 			.await
 			.expect("already-terminal attachment state timeout")
 			.expect("already-terminal process state");
@@ -2860,7 +2851,7 @@ async fn named_process_attach_has_no_gap_between_backlog_and_future_output() {
 		.await
 		.expect("start racing named process");
 	let mut attachment = client
-		.attach_output(omp_proto::env::v1::AttachOutput {
+		.attach_output(v1::AttachOutput {
 			name: "attach-race".into(),
 			generation: 1,
 			..Default::default()
@@ -2874,7 +2865,7 @@ async fn named_process_attach_has_no_gap_between_backlog_and_future_output() {
 
 	let mut sequences = Vec::new();
 	loop {
-		let event = tokio::time::timeout(Duration::from_secs(10), attachment.next_event())
+		let event = time::timeout(Duration::from_secs(10), attachment.next_event())
 			.await
 			.expect("attach race timeout")
 			.expect("attachment event")
@@ -2905,7 +2896,7 @@ async fn named_process_attach_has_no_gap_between_backlog_and_future_output() {
 #[tokio::test]
 async fn timeout_cancel_and_workspace_cancel_have_distinct_truth() {
 	let root = tempfile::tempdir().expect("workspace");
-	std::fs::write(root.path().join("data"), b"needle").expect("workspace file");
+	fs::write(root.path().join("data"), b"needle").expect("workspace file");
 	let workspace = WorkspaceHost::open(root.path()).expect("workspace host");
 	let cancelled = CancellationToken::new();
 	cancelled.cancel();
@@ -2972,13 +2963,13 @@ async fn queued_session_cancel_never_enters_execution() {
 		.expect("queued run");
 	queued.cancel();
 	active.cancel();
-	tokio::time::timeout(Duration::from_secs(5), async {
+	time::timeout(Duration::from_secs(5), async {
 		while !matches!(active.next_event().await, Some(HostExecEvent::Exit(_))) {}
 	})
 	.await
 	.expect("active cancellation timeout");
 
-	let event = tokio::time::timeout(Duration::from_secs(5), queued.next_event())
+	let event = time::timeout(Duration::from_secs(5), queued.next_event())
 		.await
 		.expect("queued cancellation timeout")
 		.expect("queued terminal event");
@@ -3009,7 +3000,7 @@ async fn active_cancel_allows_queued_cancel_to_propagate_before_execution() {
 	));
 
 	active.cancel();
-	tokio::time::timeout(Duration::from_secs(5), async {
+	time::timeout(Duration::from_secs(5), async {
 		while !matches!(active.next_event().await, Some(HostExecEvent::Exit(_))) {}
 	})
 	.await
@@ -3026,7 +3017,7 @@ async fn active_cancel_allows_queued_cancel_to_propagate_before_execution() {
 		"queued command started before its batch cancellation could propagate"
 	);
 	queued.cancel();
-	let event = tokio::time::timeout(Duration::from_secs(5), queued.next_event())
+	let event = time::timeout(Duration::from_secs(5), queued.next_event())
 		.await
 		.expect("queued cancellation timeout")
 		.expect("queued terminal event");
@@ -3040,7 +3031,7 @@ async fn active_cancel_allows_queued_cancel_to_propagate_before_execution() {
 #[tokio::test]
 async fn real_embedded_python_worker_registers_configured_extensions_when_available() {
 	let (Some(site), Some(module)) =
-		(std::env::var_os("OMP_TEST_PY_SITE"), std::env::var_os("OMP_TEST_PY_MODULE"))
+		(env::var_os("OMP_TEST_PY_SITE"), env::var_os("OMP_TEST_PY_MODULE"))
 	else {
 		return;
 	};
@@ -3055,6 +3046,7 @@ async fn real_embedded_python_worker_registers_configured_extensions_when_availa
 
 #[tokio::test]
 async fn uds_retire_unlinks_listener_and_drains_existing_clients() {
+	use std::os::unix::fs::PermissionsExt as _;
 	let harness = Harness::start(Registry::new()).await;
 	let socket = harness.state.path().join("env-retire.sock");
 	let shutdown = CancellationToken::new();
@@ -3066,18 +3058,18 @@ async fn uds_retire_unlinks_listener_and_drains_existing_clients() {
 			.serve_uds(&socket_for_server, serve_shutdown, None)
 			.await
 	});
-	tokio::time::timeout(Duration::from_secs(2), async {
+	time::timeout(Duration::from_secs(2), async {
 		loop {
 			if socket.exists()
-				&& std::os::unix::fs::PermissionsExt::mode(
-					&std::fs::metadata(&socket)
-						.expect("socket metadata")
-						.permissions(),
-				) & 0o077 == 0
+				&& fs::metadata(&socket)
+					.expect("socket metadata")
+					.permissions()
+					.mode() & 0o077
+					== 0
 			{
 				break;
 			}
-			tokio::task::yield_now().await;
+			task::yield_now().await;
 		}
 	})
 	.await
@@ -3109,18 +3101,18 @@ async fn uds_retire_unlinks_listener_and_drains_existing_clients() {
 	assert_eq!(retiring_hello.server_build, remaining_hello.server_build);
 
 	retiring.retire().await.expect("retire acknowledgement");
-	tokio::time::timeout(Duration::from_secs(2), async {
+	time::timeout(Duration::from_secs(2), async {
 		loop {
-			match tokio::net::UnixStream::connect(&socket).await {
+			match UnixStream::connect(&socket).await {
 				Err(error)
 					if matches!(
 						error.kind(),
-						std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+						io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
 					) =>
 				{
 					break;
 				},
-				_ => tokio::task::yield_now().await,
+				_ => task::yield_now().await,
 			}
 		}
 	})
@@ -3141,7 +3133,7 @@ async fn uds_retire_unlinks_listener_and_drains_existing_clients() {
 	);
 	drop(remaining);
 	remaining_bridge.abort();
-	tokio::time::timeout(Duration::from_secs(2), server_task)
+	time::timeout(Duration::from_secs(2), server_task)
 		.await
 		.expect("retired server did not finish draining")
 		.expect("retired server task panicked")

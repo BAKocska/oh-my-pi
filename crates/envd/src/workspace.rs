@@ -2,7 +2,8 @@
 
 use std::{
 	convert::Infallible,
-	fmt, io,
+	fmt::Display,
+	io,
 	ops::ControlFlow,
 	path::{Path, PathBuf},
 	sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -45,12 +46,12 @@ pub async fn sync_session_roots(
 	ts: u64,
 ) -> Result<Vec<u64>, WorkspaceRootSyncError> {
 	let snapshot = environment
-		.workspace_roots(omp_proto::env::v1::WorkspaceRootSetRequest { wire_revision: 1 })
+		.workspace_roots(v1::WorkspaceRootSetRequest { wire_revision: 1 })
 		.await?;
 	let mut desired = Vec::with_capacity(snapshot.granted.len());
 	for grant in snapshot.granted {
 		let uri =
-			url::Url::parse(&grant.canonical_uri).map_err(|_| WorkspaceRootSyncError::InvalidRoot)?;
+			Url::parse(&grant.canonical_uri).map_err(|_| WorkspaceRootSyncError::InvalidRoot)?;
 		let path = uri
 			.to_file_path()
 			.map_err(|()| WorkspaceRootSyncError::InvalidRoot)?;
@@ -76,7 +77,11 @@ use tokio_util::sync::CancellationToken;
 #[path = "workspace_ops.rs"]
 mod operations;
 
+use std::{fs, num, thread};
+
+use omp_proto::env::v1;
 pub use operations::{WorkspaceOperationError, WorkspaceOperations, WorktreeMerge};
+use url::Url;
 
 const SEARCH_CHANNEL_DEPTH: usize = 16;
 const SEARCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -179,7 +184,7 @@ pub struct WorkspaceHost {
 impl WorkspaceHost {
 	/// Opens a workspace rooted at a canonical existing path.
 	pub fn open(root: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
-		let root = std::fs::canonicalize(root).map_err(WorkspaceError::Root)?;
+		let root = fs::canonicalize(root).map_err(WorkspaceError::Root)?;
 		Ok(Self { root })
 	}
 
@@ -298,8 +303,8 @@ impl WorkspaceHost {
 		candidates.sort_unstable_by(|left, right| left.relative.cmp(&right.relative));
 
 		let mut outcome = WorkspaceSearchOutcome::default();
-		let in_flight = std::thread::available_parallelism()
-			.map_or(1, std::num::NonZeroUsize::get)
+		let in_flight = thread::available_parallelism()
+			.map_or(1, num::NonZeroUsize::get)
 			.clamp(1, 8);
 		search_candidates_ordered(
 			&candidates,
@@ -318,7 +323,7 @@ impl WorkspaceHost {
 	}
 
 	fn check_request(&self, request: &WalkRequest) -> Result<(), WorkspaceError> {
-		let root = std::fs::canonicalize(request.root()).map_err(WorkspaceError::RequestRoot)?;
+		let root = fs::canonicalize(request.root()).map_err(WorkspaceError::RequestRoot)?;
 		if root.starts_with(&self.root) {
 			Ok(())
 		} else {
@@ -335,7 +340,7 @@ fn cancellation_heartbeat(cancel: &CancellationToken) -> Result<(), &'static str
 	}
 }
 
-fn map_walk_error<E: fmt::Display>(error: WalkError<E>) -> WorkspaceError {
+fn map_walk_error<E: Display>(error: WalkError<E>) -> WorkspaceError {
 	match error {
 		WalkError::Interrupted(message) if message.to_string() == CANCELLED => {
 			WorkspaceError::Cancelled
@@ -421,7 +426,7 @@ fn search_candidates_ordered(
 	let files_scanned = AtomicU64::new(0);
 	let skipped_oversized = AtomicU64::new(0);
 	let stop = AtomicBool::new(false);
-	let result = std::thread::scope(|scope| {
+	let result = thread::scope(|scope| {
 		let mut receivers = Vec::with_capacity(lane_count);
 		for lane in 0..lane_count {
 			let (sender, receiver) = flume::bounded(SEARCH_CHANNEL_DEPTH);
@@ -537,8 +542,7 @@ mod tests {
 	#[test]
 	fn regex_and_pcre2_lookaround_report_exact_offsets() {
 		let workspace = tempfile::tempdir().expect("workspace");
-		std::fs::write(workspace.path().join("regex.txt"), b"abc 123\nkey=41\n")
-			.expect("regex fixture");
+		fs::write(workspace.path().join("regex.txt"), b"abc 123\nkey=41\n").expect("regex fixture");
 		let host = WorkspaceHost::open(workspace.path()).expect("workspace host");
 		let cancel = CancellationToken::new();
 
@@ -562,8 +566,8 @@ mod tests {
 	#[test]
 	fn zero_and_boundary_limits_stop_globally() {
 		let workspace = tempfile::tempdir().expect("workspace");
-		std::fs::write(workspace.path().join("a.txt"), b"hit hit\n").expect("first fixture");
-		std::fs::write(workspace.path().join("b.txt"), b"hit\n").expect("second fixture");
+		fs::write(workspace.path().join("a.txt"), b"hit hit\n").expect("first fixture");
+		fs::write(workspace.path().join("b.txt"), b"hit\n").expect("second fixture");
 		let host = WorkspaceHost::open(workspace.path()).expect("workspace host");
 		let cancel = CancellationToken::new();
 
@@ -619,8 +623,7 @@ mod tests {
 	#[test]
 	fn cancellation_stops_matching_mid_file() {
 		let workspace = tempfile::tempdir().expect("workspace");
-		std::fs::write(workspace.path().join("many.txt"), "hit\n".repeat(100_000))
-			.expect("large fixture");
+		fs::write(workspace.path().join("many.txt"), "hit\n".repeat(100_000)).expect("large fixture");
 		let host = WorkspaceHost::open(workspace.path()).expect("workspace host");
 		let cancel = CancellationToken::new();
 		let mut seen = 0_u64;
@@ -638,7 +641,7 @@ mod tests {
 	fn parallel_matching_is_emitted_in_path_and_offset_order() {
 		let workspace = tempfile::tempdir().expect("workspace");
 		for index in (0..64).rev() {
-			std::fs::write(workspace.path().join(format!("file-{index:03}.txt")), b"hit\nhit\n")
+			fs::write(workspace.path().join(format!("file-{index:03}.txt")), b"hit\nhit\n")
 				.expect("parallel fixture");
 		}
 		let host = WorkspaceHost::open(workspace.path()).expect("workspace host");
@@ -658,7 +661,7 @@ mod tests {
 	fn search_rejects_a_request_root_outside_the_workspace() {
 		let workspace = tempfile::tempdir().expect("workspace");
 		let outside = tempfile::tempdir().expect("outside directory");
-		std::fs::write(outside.path().join("escape.txt"), b"hit\n").expect("outside fixture");
+		fs::write(outside.path().join("escape.txt"), b"hit\n").expect("outside fixture");
 		let host = WorkspaceHost::open(workspace.path()).expect("workspace host");
 		let outside_request = WalkRequest::new(outside.path());
 		assert!(matches!(

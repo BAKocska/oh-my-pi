@@ -1,7 +1,7 @@
 //! Content-addressed env blob storage and hash-only result references.
 
 use std::{
-	io,
+	fs, io,
 	path::Path,
 	sync::Arc,
 	time::{SystemTime, UNIX_EPOCH},
@@ -9,11 +9,15 @@ use std::{
 
 use bytes::Bytes;
 use omp_core::{Hash32, Str, sf};
-use omp_proto::{blob::v1 as blob_pb, thread::v1 as thread_pb};
-use omp_storage::blob::{BlobRef, BlobStage, BlobStore};
+use omp_proto::blob::v1 as blob_pb;
+use omp_storage::{
+	blob,
+	blob::{BlobRef, BlobStage, BlobStore},
+};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
+use tokio::task;
 
 /// Stable content identity returned by blob host operations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -50,10 +54,10 @@ pub struct BlobRead {
 pub enum BlobError {
 	/// Backing blob storage error.
 	#[error(transparent)]
-	Store(#[from] omp_storage::blob::Error),
+	Store(#[from] blob::Error),
 	/// Blocking blob finalization task failed.
 	#[error("blob finalization task failed: {0}")]
-	FinalizeTask(#[from] tokio::task::JoinError),
+	FinalizeTask(#[from] task::JoinError),
 	/// Blob hash format was not 32 bytes.
 	#[error("blob hash must be exactly 32 bytes")]
 	InvalidHash,
@@ -242,7 +246,7 @@ impl BlobHost {
 	pub fn stat(&self, hash: &[u8]) -> Result<blob_pb::StatResponse, BlobError> {
 		let hash = parse_hash(hash)?;
 		let probe = BlobRef { hash: Hash32::new(hash), size: 0 };
-		match std::fs::metadata(self.store.path(&probe)) {
+		match fs::metadata(self.store.path(&probe)) {
 			Ok(metadata) if metadata.is_file() => {
 				Ok(blob_pb::StatResponse { present: true, size: metadata.len() })
 			},
@@ -264,7 +268,7 @@ impl BlobHost {
 		let hash = parse_hash(&request.hash)?;
 		let stat = self.stat(&request.hash)?;
 		if !stat.present {
-			return Err(BlobError::Store(omp_storage::blob::Error::NotFound));
+			return Err(BlobError::Store(blob::Error::NotFound));
 		}
 		if request.offset > stat.size {
 			return Err(BlobError::InvalidRange);
@@ -290,7 +294,7 @@ impl BlobHost {
 	pub fn delete(&self, hash: &[u8]) -> Result<blob_pb::DeleteResponse, BlobError> {
 		let hash = parse_hash(hash)?;
 		let probe = BlobRef { hash: Hash32::new(hash), size: 0 };
-		match std::fs::remove_file(self.store.path(&probe)) {
+		match fs::remove_file(self.store.path(&probe)) {
 			Ok(()) => Ok(blob_pb::DeleteResponse { deleted: true }),
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {
 				Ok(blob_pb::DeleteResponse { deleted: false })
@@ -298,32 +302,38 @@ impl BlobHost {
 			Err(error) => Err(BlobError::Remove(error)),
 		}
 	}
+}
 
-	/// Creates the canonical hash-only media/result shape used by thread parts.
-	pub fn reference(
-		&self,
-		id: BlobId,
-		mime: Str,
-		detail: thread_pb::blob::Detail,
-	) -> thread_pb::Blob {
-		thread_pb::Blob {
-			hash:   Bytes::copy_from_slice(&id.hash),
-			mime:   mime.into(),
-			size:   id.size,
-			inline: Bytes::new(),
-			detail: detail.into(),
+mod references {
+	use bytes::Bytes;
+	use omp_core::Str;
+	use omp_proto::thread::v1::{self as thread_pb, blob};
+
+	use super::{BlobError, BlobHost, BlobId};
+
+	impl BlobHost {
+		/// Creates the canonical hash-only media/result shape used by thread
+		/// parts.
+		pub fn reference(&self, id: BlobId, mime: Str, detail: blob::Detail) -> thread_pb::Blob {
+			thread_pb::Blob {
+				hash:   Bytes::copy_from_slice(&id.hash),
+				mime:   mime.into(),
+				size:   id.size,
+				inline: Bytes::new(),
+				detail: detail.into(),
+			}
 		}
-	}
 
-	/// Stores media/result bytes and returns their canonical hash-only shape.
-	pub fn put_reference(
-		&self,
-		data: &[u8],
-		mime: Str,
-		detail: thread_pb::blob::Detail,
-	) -> Result<thread_pb::Blob, BlobError> {
-		let id = self.put(data)?;
-		Ok(self.reference(id, mime, detail))
+		/// Stores media/result bytes and returns their canonical hash-only shape.
+		pub fn put_reference(
+			&self,
+			data: &[u8],
+			mime: Str,
+			detail: blob::Detail,
+		) -> Result<thread_pb::Blob, BlobError> {
+			let id = self.put(data)?;
+			Ok(self.reference(id, mime, detail))
+		}
 	}
 }
 
@@ -336,7 +346,7 @@ impl omp_tool::CallOutcomeSpill for BlobHost {
 	}
 
 	async fn finish<'a>(&'a self, stage: Self::Stage<'a>) -> Result<omp_tool::BlobRef, Self::Error> {
-		let reference = tokio::task::spawn_blocking(move || stage.finish()).await??;
+		let reference = task::spawn_blocking(move || stage.finish()).await??;
 		Ok(call_outcome_reference(reference))
 	}
 }
@@ -362,7 +372,7 @@ mod tests {
 		path::{Path, PathBuf},
 	};
 
-	use omp_core::Hash32;
+	use omp_core::{Hash32, Str};
 	use omp_tool::{CallOutcome, CallOutcomeDetails, CallOutcomeDetailsError, call_outcome_details};
 	use tempfile::TempDir;
 
@@ -400,9 +410,7 @@ mod tests {
 	#[tokio::test]
 	async fn spilled_outcome_retains_exact_bytes_digest_and_size() {
 		let (_root, host) = open_host();
-		let outcome = CallOutcome::<omp_core::Str, omp_core::Str>::Ok(omp_core::sf!(
-			"payload beyond the inline limit",
-		));
+		let outcome = CallOutcome::<Str, Str>::Ok(omp_core::sf!("payload beyond the inline limit",));
 		let expected = serde_json::to_vec(&outcome).expect("serialize expected outcome");
 		let expected_hash = Hash32::sum(&expected);
 

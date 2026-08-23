@@ -7,10 +7,11 @@ use omp_app::chat_ui::template::{TemplateArguments, render as render_command};
 use omp_core::sf;
 use omp_driver::subagent::{
 	prompt::{
-		ModelFamilyCapabilities, PromptPeer, SubagentPromptInput, compose, props as child_props,
+		self, ModelFamilyCapabilities, PromptPeer, SubagentPromptInput, compose, props as child_props,
 	},
 	settings::TaskEagerMode,
 };
+use omp_proto::thread::v1::{item, part};
 use serde_json::json;
 
 fn definition() -> AgentDefinition {
@@ -74,8 +75,8 @@ fn subagent_props_inherit_parent_secrets_policy() {
 		.render(&child)
 		.expect("child canonical prompt");
 	let text = match &items[0].kind {
-		Some(omp_proto::thread::v1::item::Kind::Message(message)) => match &message.parts[0].kind {
-			Some(omp_proto::thread::v1::part::Kind::Text(text)) => text,
+		Some(item::Kind::Message(message)) => match &message.parts[0].kind {
+			Some(part::Kind::Text(text)) => text,
 			_ => panic!("text part"),
 		},
 		_ => panic!("system message"),
@@ -201,7 +202,7 @@ fn native_command_helper_matrix() {
 
 #[test]
 fn driver_schema_helpers_are_registered() {
-	let engine = omp_driver::subagent::prompt::engine();
+	let engine = prompt::engine();
 	let template = engine
 		.compile(
 			"schema-helper-golden",

@@ -1,19 +1,21 @@
 //! Integration coverage for the document authority client protocol.
 
+use std::fs;
+
 use bytes::{Bytes, BytesMut};
 use omp_docserver::{
 	Environment, ServerConfig,
 	connection::{ConnectionConfig, PROTOCOL_MAJOR, PROTOCOL_MINOR, serve_connection},
 	wire::{FrameConfig, read_server_frame, write_client_frame},
 };
-use omp_proto::document::v1 as pb;
+use omp_proto::document::v1::{self as pb, client_frame, server_frame};
 use tempfile::TempDir;
-use tokio::io::DuplexStream;
+use tokio::{io, io::DuplexStream};
 
 async fn send(
 	stream: &mut DuplexStream,
 	request_id: u64,
-	body: pb::client_frame::Body,
+	body: client_frame::Body,
 	scratch: &mut BytesMut,
 ) {
 	write_client_frame(
@@ -30,7 +32,7 @@ async fn receive(
 	stream: &mut DuplexStream,
 	request_id: u64,
 	scratch: &mut BytesMut,
-) -> pb::server_frame::Body {
+) -> server_frame::Body {
 	loop {
 		let frame = read_server_frame(stream, FrameConfig::default(), scratch)
 			.await
@@ -46,7 +48,7 @@ async fn receive(
 async fn receive_ordinary(
 	stream: &mut DuplexStream,
 	scratch: &mut BytesMut,
-) -> (u64, pb::server_frame::Body) {
+) -> (u64, server_frame::Body) {
 	loop {
 		let frame = read_server_frame(stream, FrameConfig::default(), scratch)
 			.await
@@ -63,8 +65,8 @@ fn commit(
 	lease_id: Bytes,
 	base_revision: pb::Revision,
 	content: &'static [u8],
-) -> pb::client_frame::Body {
-	pb::client_frame::Body::CommitTransaction(pb::CommitTransactionRequest {
+) -> client_frame::Body {
+	client_frame::Body::CommitTransaction(pb::CommitTransactionRequest {
 		transaction_id,
 		operations: vec![pb::DocumentMutation {
 			document:  Some(pb::DocumentTarget {
@@ -87,11 +89,11 @@ async fn transaction_race_replays_one_outcome_and_stale_retry_conflicts() {
 	let root = TempDir::new().expect("temporary root");
 	let config = ServerConfig::new(root.path()).expect("server config");
 	let path = config.environment_root().join("race.txt");
-	std::fs::write(&path, b"before").expect("fixture");
+	fs::write(&path, b"before").expect("fixture");
 	let uri = config.file_uri(&path).expect("file URI").to_string();
 	let environment = Environment::new(config).expect("environment");
 	let epoch = *environment.server_epoch();
-	let (mut client, server) = tokio::io::duplex(64 * 1024);
+	let (mut client, server) = io::duplex(64 * 1024);
 	let authority = environment.clone();
 	let server_task = tokio::spawn(async move {
 		serve_connection(authority, server, ConnectionConfig::default()).await
@@ -102,7 +104,7 @@ async fn transaction_race_replays_one_outcome_and_stale_retry_conflicts() {
 	send(
 		&mut client,
 		0,
-		pb::client_frame::Body::Hello(pb::ClientHello {
+		client_frame::Body::Hello(pb::ClientHello {
 			protocol_major: PROTOCOL_MAJOR,
 			protocol_minor: PROTOCOL_MINOR,
 			client_id:      Bytes::from_static(b"authority-race-test"),
@@ -110,8 +112,7 @@ async fn transaction_race_replays_one_outcome_and_stale_retry_conflicts() {
 		&mut write_scratch,
 	)
 	.await;
-	let pb::server_frame::Body::Hello(hello) = receive(&mut client, 0, &mut read_scratch).await
-	else {
+	let server_frame::Body::Hello(hello) = receive(&mut client, 0, &mut read_scratch).await else {
 		panic!("server hello");
 	};
 	assert_eq!(hello.server_epoch.as_ref(), epoch.as_slice());
@@ -119,14 +120,11 @@ async fn transaction_race_replays_one_outcome_and_stale_retry_conflicts() {
 	send(
 		&mut client,
 		1,
-		pb::client_frame::Body::OpenDocument(pb::OpenDocumentRequest {
-			uri,
-			language_id: String::new(),
-		}),
+		client_frame::Body::OpenDocument(pb::OpenDocumentRequest { uri, language_id: String::new() }),
 		&mut write_scratch,
 	)
 	.await;
-	let pb::server_frame::Body::DocumentOpened(opened) =
+	let server_frame::Body::DocumentOpened(opened) =
 		receive(&mut client, 1, &mut read_scratch).await
 	else {
 		panic!("open response");
@@ -166,7 +164,7 @@ async fn transaction_race_replays_one_outcome_and_stale_retry_conflicts() {
 		&mut write_scratch,
 	)
 	.await;
-	let pb::server_frame::Body::TransactionResult(stale) =
+	let server_frame::Body::TransactionResult(stale) =
 		receive(&mut client, 4, &mut read_scratch).await
 	else {
 		panic!("stale transaction response");

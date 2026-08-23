@@ -1,15 +1,20 @@
+//! Verifies Unix extension clients preserve handshake, invocation scope,
+//! cancellation, and errors.
+
 #![cfg(unix)]
 
 use std::{
-	io,
+	env, fs, io,
 	path::PathBuf,
+	process,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{Bytes, BytesMut};
 use omp_env::{ClientError, DataScope, ExtensionEnvClient, frame, prost::Message as _};
+use omp_proto::env::v1::{client_frame, data_request, server_frame};
 use tokio::{
-	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+	io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
 	net::{UnixListener, UnixStream},
 };
 
@@ -18,7 +23,7 @@ fn socket_path(label: &str) -> PathBuf {
 		.duration_since(UNIX_EPOCH)
 		.expect("clock after epoch")
 		.as_nanos();
-	std::env::temp_dir().join(format!("omp-env-{label}-{}-{nonce}.sock", std::process::id()))
+	env::temp_dir().join(format!("omp-env-{label}-{}-{nonce}.sock", process::id()))
 }
 
 fn scope() -> DataScope {
@@ -43,10 +48,10 @@ async fn uds_client_handshakes_once_and_scopes_data_and_cancellation() {
 		let hello = read_frame(&mut stream).await.expect("read hello");
 		assert_eq!(hello.request_id, 0);
 		assert!(hello.scope.is_none(), "the constructor handshake is not invocation traffic");
-		assert!(matches!(hello.body, Some(frame::client_frame::Body::Hello(_))));
+		assert!(matches!(hello.body, Some(client_frame::Body::Hello(_))));
 		write_frame(&mut stream, &frame::ServerFrame {
 			request_id: 0,
-			body: Some(frame::server_frame::Body::Hello(frame::ServerHello {
+			body: Some(server_frame::Body::Hello(frame::ServerHello {
 				server_epoch: Bytes::from_static(b"epoch"),
 				..Default::default()
 			})),
@@ -57,11 +62,11 @@ async fn uds_client_handshakes_once_and_scopes_data_and_cancellation() {
 
 		let request = read_frame(&mut stream).await.expect("read DATA request");
 		assert_scope(&request);
-		assert!(matches!(request.body, Some(frame::client_frame::Body::Data(_))));
+		assert!(matches!(request.body, Some(client_frame::Body::Data(_))));
 		let cancel = read_frame(&mut stream).await.expect("read cancellation");
 		assert_scope(&cancel);
 		match cancel.body {
-			Some(frame::client_frame::Body::Cancel(cancel)) => {
+			Some(client_frame::Body::Cancel(cancel)) => {
 				assert_eq!(
 					cancel.target,
 					Some(frame::cancel_request::Target::TargetRequestId(request.request_id))
@@ -81,14 +86,14 @@ async fn uds_client_handshakes_once_and_scopes_data_and_cancellation() {
 	assert_eq!(client.info().expect("cached handshake").server_epoch, Bytes::from_static(b"epoch"));
 	let stream = client
 		.stream(frame::DataRequest {
-			body: Some(frame::data_request::Body::HostInfo(frame::HostInfoRequest::default())),
+			body: Some(data_request::Body::HostInfo(frame::HostInfoRequest::default())),
 			..Default::default()
 		})
 		.await
 		.expect("open DATA stream");
 	stream.cancel();
 	server.await.expect("server task");
-	std::fs::remove_file(path).expect("remove extension socket");
+	fs::remove_file(path).expect("remove extension socket");
 }
 
 #[tokio::test]
@@ -100,17 +105,17 @@ async fn scoped_http_preserves_typed_remote_errors() {
 		let _hello = read_frame(&mut stream).await.expect("read hello");
 		write_frame(&mut stream, &frame::ServerFrame {
 			request_id: 0,
-			body: Some(frame::server_frame::Body::Hello(frame::ServerHello::default())),
+			body: Some(server_frame::Body::Hello(frame::ServerHello::default())),
 			..Default::default()
 		})
 		.await
 		.expect("write hello");
 		let request = read_frame(&mut stream).await.expect("read HTTP request");
 		assert_scope(&request);
-		assert!(matches!(request.body, Some(frame::client_frame::Body::HttpRequest(_))));
+		assert!(matches!(request.body, Some(client_frame::Body::HttpRequest(_))));
 		write_frame(&mut stream, &frame::ServerFrame {
 			request_id: request.request_id,
-			body: Some(frame::server_frame::Body::Error(frame::ProtocolError {
+			body: Some(server_frame::Body::Error(frame::ProtocolError {
 				code: frame::ProtocolErrorCode::PermissionDenied as i32,
 				message: "policy denied upstream".into(),
 				..Default::default()
@@ -144,7 +149,7 @@ async fn scoped_http_preserves_typed_remote_errors() {
 		other => panic!("expected typed protocol error, got {other:?}"),
 	}
 	server.await.expect("server task");
-	std::fs::remove_file(path).expect("remove extension socket");
+	fs::remove_file(path).expect("remove extension socket");
 }
 
 async fn read_frame(stream: &mut UnixStream) -> io::Result<frame::ClientFrame> {

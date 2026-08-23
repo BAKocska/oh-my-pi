@@ -1,6 +1,6 @@
 //! Model-facing behavioral contracts for pi-compatible `grep@1`.
 
-use std::{future::Future, sync::Arc};
+use std::{future, future::Future, str, sync::Arc};
 
 use bytes::Bytes;
 use futures::{StreamExt, executor::block_on};
@@ -40,7 +40,7 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 		&self,
 		_request: glob::WalkRequest,
 	) -> impl Future<Output = Result<glob::WalkResult, glob::Fault>> + Send + '_ {
-		std::future::ready(Err(glob::Fault::Workspace { message: sf!("unused fake glob boundary") }))
+		future::ready(Err(glob::Fault::Workspace { message: sf!("unused fake glob boundary") }))
 	}
 }
 
@@ -376,7 +376,7 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 	let [full] = stored.as_slice() else {
 		panic!("grep must store exactly one complete pre-truncation output");
 	};
-	let full = std::str::from_utf8(full).expect("rendered grep output is UTF-8");
+	let full = str::from_utf8(full).expect("rendered grep output is UTF-8");
 	assert!(full.starts_with("[large.rs#B10B]\n*1:needle "));
 	let expected_tail = format!("*200:needle {}", "x".repeat(400));
 	assert!(full.ends_with(expected_tail.as_str()));

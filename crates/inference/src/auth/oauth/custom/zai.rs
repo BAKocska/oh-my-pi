@@ -1,5 +1,6 @@
 use std::{
 	fmt::{self, Write as _},
+	mem,
 	sync::Arc,
 };
 
@@ -22,7 +23,7 @@ use super::super::{
 };
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
-	auth::OAuthCustomSpec,
+	auth::{LoginDriver, OAuthCustomSpec},
 	call::AuthInput,
 };
 
@@ -55,7 +56,7 @@ impl ZaiApiKeyHandler {
 	async fn run(
 		&self,
 		spec: &OAuthCustomSpec,
-		driver: &crate::auth::LoginDriver,
+		driver: &LoginDriver,
 	) -> Result<OAuthTokenSet, OAuthError> {
 		let redirect_uri = required_parameter(spec, REDIRECT_PARAMETER)?;
 		parse_http_url(redirect_uri)?;
@@ -214,7 +215,7 @@ impl ZaiApiKeyHandler {
 		durable.push_str(api_key_text);
 		durable.push('.');
 		durable.push_str(secret_key);
-		Ok(SecretString::from(std::mem::take(&mut *durable)))
+		Ok(SecretString::from(mem::take(&mut *durable)))
 	}
 
 	fn state(&self) -> Result<Str, OAuthError> {
@@ -247,7 +248,7 @@ impl OAuthCustomHandler for ZaiApiKeyHandler {
 	fn exchange<'a>(
 		&'a self,
 		spec: &'a OAuthCustomSpec,
-		driver: &'a crate::auth::LoginDriver,
+		driver: &'a LoginDriver,
 	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
 		async move { self.run(spec, driver).await }.boxed()
 	}
@@ -547,7 +548,7 @@ struct CopiedKey<'a> {
 mod tests {
 	use std::{collections::VecDeque, sync::Arc};
 
-	use http::header::ACCEPT;
+	use http::header::{ACCEPT, HeaderName};
 	use parking_lot::Mutex;
 
 	use super::*;
@@ -627,7 +628,7 @@ mod tests {
 		}
 	}
 
-	fn header(headers: &HeaderMap, name: http::header::HeaderName) -> Option<String> {
+	fn header(headers: &HeaderMap, name: HeaderName) -> Option<String> {
 		headers
 			.get(name)
 			.and_then(|value| value.to_str().ok())
@@ -686,7 +687,7 @@ mod tests {
 			.expect("callback response");
 		let result = handler.run(&spec(), &driver).await;
 		let events = session.events.try_iter().map(Result::unwrap).collect();
-		let requests = std::mem::take(&mut *http.requests.lock());
+		let requests = mem::take(&mut *http.requests.lock());
 		(result, requests, events)
 	}
 	#[test]

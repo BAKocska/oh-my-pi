@@ -13,6 +13,8 @@ use http::{
 };
 use omp_core::{ExposeSecret as _, IntoStr, SecretString, Str, parse_rfc3339, sf};
 use serde_json::{Map, Value};
+use tokio::time;
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -85,7 +87,7 @@ pub fn normalize_claude_base_url(base_url: Option<&str>) -> Str {
 	if trimmed.to_ascii_lowercase().ends_with("/api/oauth") {
 		return Str::new(trimmed);
 	}
-	let Ok(mut url) = url::Url::parse(trimmed) else {
+	let Ok(mut url) = Url::parse(trimmed) else {
 		return sf!(DEFAULT_ENDPOINT);
 	};
 	let mut path = url.path().trim_end_matches('/').to_owned();
@@ -191,7 +193,7 @@ async fn execute(
 	deadline: Option<Instant>,
 ) -> Result<OAuthHttpResponse, UsageFetchError> {
 	match deadline {
-		Some(deadline) => tokio::time::timeout_at(deadline.into(), http.execute(request))
+		Some(deadline) => time::timeout_at(deadline.into(), http.execute(request))
 			.await
 			.map_err(|_| UsageFetchError::Unavailable)?
 			.map_err(|_| UsageFetchError::Unavailable),
@@ -618,6 +620,7 @@ mod tests {
 
 	use super::{ANTHROPIC_BETA, fetch_claude_usage, normalize_claude_base_url};
 	use crate::{
+		answer::UsageStatus as AnswerUsageStatus,
 		auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError},
 		operation::usage::UsageFetchError,
 	};
@@ -761,10 +764,10 @@ mod tests {
 	#[tokio::test]
 	async fn current_spend_preserves_minor_units_thresholds_and_precedence() {
 		for (used, expected) in [
-			(0, crate::answer::UsageStatus::Ok),
-			(45_000, crate::answer::UsageStatus::Warning),
-			(50_000, crate::answer::UsageStatus::Exhausted),
-			(62_500, crate::answer::UsageStatus::Exhausted),
+			(0, AnswerUsageStatus::Ok),
+			(45_000, AnswerUsageStatus::Warning),
+			(50_000, AnswerUsageStatus::Exhausted),
+			(62_500, AnswerUsageStatus::Exhausted),
 		] {
 			let body = format!(
 				r#"{{"account_id":"a","email":"e","spend":{{"enabled":true,"used":{{"amount_minor":{used},"currency":"usd","exponent":2}},"limit":{{"amount_minor":50000,"currency":"USD","exponent":2}}}},"extra_usage":{{"is_enabled":true,"used_credits":9900,"monthly_limit":10000}}}}"#

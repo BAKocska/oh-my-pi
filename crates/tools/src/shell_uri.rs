@@ -1,6 +1,6 @@
 //! Quote-aware discovery and replacement of path-backed internal resource URIs.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops};
 
 use omp_core::Str;
 
@@ -8,7 +8,7 @@ use omp_core::Str;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Occurrence {
 	/// Byte range in the original value.
-	pub range: std::ops::Range<usize>,
+	pub range: ops::Range<usize>,
 	/// Exact registered URI spelling.
 	pub uri:   Str,
 	/// Quoting context at the start of the URI.

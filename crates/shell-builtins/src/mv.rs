@@ -12,7 +12,8 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::windows;
 use std::{
 	ffi::OsString,
-	fmt, fs,
+	fmt::{self, Display},
+	fs,
 	io::{self, Write},
 	path::{Path, PathBuf},
 };
@@ -25,6 +26,8 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use thiserror::Error;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation;
 
 #[cfg(unix)]
 use self::hardlink::{
@@ -103,7 +106,7 @@ impl fmt::Debug for ProgressTerminal {
 }
 
 impl ProgressTerminal {
-	fn write_control(&self, value: impl fmt::Display) -> io::Result<()> {
+	fn write_control(&self, value: impl Display) -> io::Result<()> {
 		write!(self.writer.lock(), "{value}")
 	}
 
@@ -298,7 +301,7 @@ impl Utility for Mv {
 	}
 }
 
-fn show(host: &mut Host, err: impl fmt::Display) {
+fn show(host: &mut Host, err: impl Display) {
 	host.error(err, 1);
 }
 
@@ -1050,7 +1053,7 @@ fn rename_with_fallback(
 
 	fs::rename(&from_fs, &to_fs).or_else(|err| {
 		#[cfg(windows)]
-		const EXDEV: i32 = windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE as _;
+		const EXDEV: i32 = Foundation::ERROR_NOT_SAME_DEVICE as _;
 		#[cfg(unix)]
 		const EXDEV: i32 = libc::EXDEV as _;
 		#[cfg(target_os = "wasi")]
@@ -1663,6 +1666,9 @@ pub(crate) fn mv_builtin<SE: ShellExtensions>() -> Registration<SE> {
 #[cfg(unix)]
 mod hardlink {
 	use std::{
+		error,
+		fmt::{self, Display},
+		fs,
 		io::{self, Write},
 		path::{Path, PathBuf},
 	};
@@ -1711,8 +1717,8 @@ mod hardlink {
 		Metadata { path: PathBuf, error: io::Error },
 	}
 
-	impl std::fmt::Display for HardlinkError {
-		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	impl Display for HardlinkError {
+		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 			match self {
 				Self::Io(e) => write!(f, "I/O error during hardlink operation: {e}"),
 				Self::Scan(msg) => {
@@ -1728,8 +1734,8 @@ mod hardlink {
 		}
 	}
 
-	impl std::error::Error for HardlinkError {
-		fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+	impl error::Error for HardlinkError {
+		fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 			match self {
 				Self::Io(e) => Some(e),
 				Self::Metadata { error, .. } => Some(error),
@@ -1893,7 +1899,7 @@ mod hardlink {
 		fn scan_directory_recursive(&mut self, host: &mut Host, dir: &Path) -> io::Result<()> {
 			use std::os::unix::fs::MetadataExt;
 
-			let entries = std::fs::read_dir(host.resolve(dir))?;
+			let entries = fs::read_dir(host.resolve(dir))?;
 			for entry in entries {
 				let entry = entry?;
 				let path = entry.path();

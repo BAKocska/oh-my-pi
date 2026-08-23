@@ -3,14 +3,17 @@
 //! Embedding daemons can observe the socket connection gauge to drive idle
 //! detection without inspecting document protocol traffic.
 
+#[cfg(all(test, unix))]
+use std::fs::Permissions;
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
 use std::{
+	env, ffi, fs,
 	fs::{File, OpenOptions},
 	os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
 };
-use std::{path::PathBuf, time::Duration};
+use std::{io, mem, path::PathBuf, result, time::Duration};
 
 #[cfg(unix)]
 use omp_core::Hash32;
@@ -18,16 +21,28 @@ use omp_core::Str;
 #[cfg(unix)]
 use rustix::fs::{FlockOperation, flock};
 #[cfg(unix)]
+use rustix::{io::Errno, process::geteuid};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 #[cfg(unix)]
+use tokio::signal::unix::{self, SignalKind};
+#[cfg(unix)]
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+#[cfg(unix)]
+use tokio::time::sleep;
+use tokio::{
+	io::{stdin, stdout},
+	signal::ctrl_c,
+	sync::watch,
+	task::JoinError,
+	time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
 	Environment, LspProcess, LspProcessError, ServerConfig,
 	connection::{ConnectionConfig, ConnectionError, serve_io_until},
-	load_lsp_process_configs,
+	error, load_lsp_process_configs,
 };
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -55,7 +70,7 @@ pub struct ServeOptions {
 	/// Executable-generation identity advertised in `ServerHello`.
 	pub server_build:     Str,
 	/// Socket-connection gauge receiving the live accepted-connection count.
-	pub connections:      Option<tokio::sync::watch::Sender<usize>>,
+	pub connections:      Option<watch::Sender<usize>>,
 }
 
 /// An error that prevents the document authority from starting or serving its
@@ -65,13 +80,13 @@ pub struct ServeOptions {
 pub enum Error {
 	/// The document Environment could not be configured.
 	#[error(transparent)]
-	Document(#[from] crate::Error),
+	Document(#[from] error::Error),
 	/// A standard-I/O connection failed.
 	#[error(transparent)]
 	Connection(#[from] ConnectionError),
 	/// An operating-system operation failed.
 	#[error(transparent)]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// A configured language-server process failed to start or stop.
 	#[error(transparent)]
 	LspProcess(#[from] LspProcessError),
@@ -86,7 +101,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Underlying I/O error.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 
 	/// Cannot set permissions on an authority lock file.
@@ -96,7 +111,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Underlying I/O error.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 
 	/// An authority lock is unavailable because another instance is running.
@@ -109,7 +124,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Underlying file locking error.
 		#[source]
-		source: rustix::io::Errno,
+		source: Errno,
 	},
 
 	/// Cannot set permissions on the lock directory.
@@ -119,7 +134,7 @@ pub enum Error {
 		directory: PathBuf,
 		/// Underlying I/O error.
 		#[source]
-		source:    std::io::Error,
+		source:    io::Error,
 	},
 
 	/// Cannot create the lock directory.
@@ -129,7 +144,7 @@ pub enum Error {
 		directory: PathBuf,
 		/// Underlying I/O error.
 		#[source]
-		source:    std::io::Error,
+		source:    io::Error,
 	},
 
 	/// Cannot stat or inspect the lock directory.
@@ -139,7 +154,7 @@ pub enum Error {
 		directory: PathBuf,
 		/// Underlying I/O error.
 		#[source]
-		source:    std::io::Error,
+		source:    io::Error,
 	},
 
 	/// The lock directory has invalid ownership or permissions.
@@ -179,7 +194,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Underlying I/O error.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 
 	/// Environment root URI cannot be converted to a local file path.
@@ -201,7 +216,7 @@ pub enum Error {
 }
 
 /// The result of a document-authority operation.
-pub type Result<T = ()> = std::result::Result<T, Error>;
+pub type Result<T = ()> = result::Result<T, Error>;
 
 /// Serves the document authority rooted at `root` on `transport`.
 ///
@@ -249,7 +264,7 @@ async fn run_with_shutdown(root: PathBuf, transport: Transport, options: ServeOp
 		// Keep the directory handle locked until process exit: returning a
 		// reusable authority while an actor may still persist would permit a
 		// split brain.
-		std::mem::forget(authority_lock);
+		mem::forget(authority_lock);
 		return Err(Error::ShutdownDeadlineExceeded);
 	}
 	serve_result?;
@@ -286,7 +301,7 @@ impl InstanceLock {
 			.truncate(false)
 			.open(&path)
 			.map_err(|source| Error::OpenAuthorityLock { path: path.clone(), source })?;
-		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
 			.map_err(|source| Error::SecureAuthorityLock { path: path.clone(), source })?;
 		flock(&file, FlockOperation::NonBlockingLockExclusive)
 			.map_err(|source| Error::AcquireAuthorityLock { kind, path: path.clone(), source })?;
@@ -297,19 +312,19 @@ impl InstanceLock {
 #[cfg(unix)]
 fn lock_directory() -> Result<PathBuf> {
 	let user_id = rustix::process::geteuid().as_raw();
-	let directory = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+	let directory = match env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
 		Some(runtime) if runtime.is_absolute() => runtime.join("omp-docserver"),
-		_ => std::env::temp_dir().join(format!("omp-docserver-{user_id}")),
+		_ => env::temp_dir().join(format!("omp-docserver-{user_id}")),
 	};
-	match std::fs::create_dir(&directory) {
-		Ok(()) => std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+	match fs::create_dir(&directory) {
+		Ok(()) => fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
 			.map_err(|source| Error::SecureLockDirectory { directory: directory.clone(), source })?,
-		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
 		Err(source) => {
 			return Err(Error::CreateLockDirectory { directory, source });
 		},
 	}
-	let metadata = std::fs::symlink_metadata(&directory)
+	let metadata = fs::symlink_metadata(&directory)
 		.map_err(|source| Error::InspectLockDirectory { directory: directory.clone(), source })?;
 	if !metadata.is_dir() || metadata.uid() != user_id || metadata.mode() & 0o077 != 0 {
 		return Err(Error::InvalidLockDirectoryPermissions { directory, user_id });
@@ -330,32 +345,26 @@ async fn serve_stdio(environment: Environment) -> Result {
 }
 
 async fn serve_stdio_until(environment: Environment, shutdown: CancellationToken) -> Result {
-	serve_io_until(
-		environment.session(),
-		tokio::io::stdin(),
-		tokio::io::stdout(),
-		ConnectionConfig::default(),
-		shutdown,
-	)
-	.await
-	.map_err(Into::into)
+	serve_io_until(environment.session(), stdin(), stdout(), ConnectionConfig::default(), shutdown)
+		.await
+		.map_err(Into::into)
 }
 
 #[cfg(unix)]
 async fn bind_socket(path: PathBuf) -> Result<(UnixListener, SocketCleanup)> {
 	let name = path
 		.file_name()
-		.map(std::ffi::OsStr::to_owned)
+		.map(ffi::OsStr::to_owned)
 		.ok_or_else(|| Error::SocketPathMissingFileName { path: path.clone() })?;
 	let parent = path
 		.parent()
 		.filter(|parent| !parent.as_os_str().is_empty())
 		.unwrap_or_else(|| Path::new("."));
-	let canonical_parent = std::fs::canonicalize(parent)?;
+	let canonical_parent = fs::canonicalize(parent)?;
 	let path = canonical_parent.join(name);
 	let identity = path.clone();
 	let lock = InstanceLock::acquire("socket", &identity)?;
-	match std::fs::symlink_metadata(&path) {
+	match fs::symlink_metadata(&path) {
 		Ok(metadata) if !metadata.file_type().is_socket() => {
 			return Err(Error::ReplaceNonSocketPath { path });
 		},
@@ -366,21 +375,21 @@ async fn bind_socket(path: PathBuf) -> Result<(UnixListener, SocketCleanup)> {
 			Err(error)
 				if matches!(
 					error.kind(),
-					std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+					io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
 				) =>
 			{
-				std::fs::remove_file(&path)?;
+				fs::remove_file(&path)?;
 			},
 			Err(error) => {
 				return Err(Error::ProbeActiveSocket { path, source: error });
 			},
 		},
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 		Err(error) => return Err(error.into()),
 	}
 	let listener = UnixListener::bind(&path)?;
-	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-	let metadata = std::fs::symlink_metadata(&path)?;
+	fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+	let metadata = fs::symlink_metadata(&path)?;
 	let cleanup = SocketCleanup { path, dev: metadata.dev(), ino: metadata.ino(), _lock: lock };
 	Ok((listener, cleanup))
 }
@@ -391,7 +400,7 @@ fn validate_socket_location(path: &Path, root: &Path) -> Result {
 		.parent()
 		.filter(|parent| !parent.as_os_str().is_empty())
 		.unwrap_or_else(|| Path::new("."));
-	let canonical_parent = std::fs::canonicalize(parent)?;
+	let canonical_parent = fs::canonicalize(parent)?;
 	if canonical_parent.starts_with(root) {
 		Err(Error::SocketInsideEnvironmentRoot { path: path.to_owned(), root: root.to_owned() })
 	} else {
@@ -403,7 +412,7 @@ fn validate_socket_location(path: &Path, root: &Path) -> Result {
 async fn serve_socket(
 	environment: Environment,
 	path: PathBuf,
-	connections: Option<tokio::sync::watch::Sender<usize>>,
+	connections: Option<watch::Sender<usize>>,
 ) -> Result {
 	let shutdown = CancellationToken::new();
 	let signal_shutdown = shutdown.clone();
@@ -421,7 +430,7 @@ async fn serve_socket_until(
 	environment: Environment,
 	path: PathBuf,
 	shutdown: CancellationToken,
-	connection_gauge: Option<tokio::sync::watch::Sender<usize>>,
+	connection_gauge: Option<watch::Sender<usize>>,
 ) -> Result {
 	let root = environment
 		.root_uri()
@@ -442,12 +451,12 @@ async fn serve_socket_until(
 					Ok(connection) => connection,
 					Err(error) => {
 						eprintln!("omp-docserver: socket accept failed: {error}");
-						tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+						sleep(ACCEPT_RETRY_DELAY).await;
 						continue;
 					},
 				};
 				match stream.peer_cred() {
-					Ok(credentials) if credentials.uid() == rustix::process::geteuid().as_raw() => {},
+					Ok(credentials) if credentials.uid() == geteuid().as_raw() => {},
 					Ok(credentials) => {
 						eprintln!(
 							"omp-docserver: rejected socket peer owned by uid {}",
@@ -505,7 +514,7 @@ async fn serve_socket_until(
 async fn serve_socket(
 	_environment: Environment,
 	_path: PathBuf,
-	_connections: Option<tokio::sync::watch::Sender<usize>>,
+	_connections: Option<watch::Sender<usize>>,
 ) -> Result {
 	Err(Error::UnsupportedSocket)
 }
@@ -515,21 +524,19 @@ async fn serve_socket_until(
 	_environment: Environment,
 	_path: PathBuf,
 	_shutdown: CancellationToken,
-	_connections: Option<tokio::sync::watch::Sender<usize>>,
+	_connections: Option<watch::Sender<usize>>,
 ) -> Result {
 	Err(Error::UnsupportedSocket)
 }
 
 #[cfg(unix)]
-fn publish_connection_count(gauge: Option<&tokio::sync::watch::Sender<usize>>, count: usize) {
+fn publish_connection_count(gauge: Option<&watch::Sender<usize>>, count: usize) {
 	if let Some(gauge) = gauge {
 		gauge.send_replace(count);
 	}
 }
 
-fn report_connection(
-	result: std::result::Result<std::result::Result<(), ConnectionError>, tokio::task::JoinError>,
-) {
+fn report_connection(result: result::Result<result::Result<(), ConnectionError>, JoinError>) {
 	match result {
 		Ok(Ok(())) => {},
 		Ok(Err(error)) => {
@@ -542,19 +549,18 @@ fn report_connection(
 	}
 }
 
-async fn shutdown_signal() -> std::io::Result<()> {
+async fn shutdown_signal() -> io::Result<()> {
 	#[cfg(unix)]
 	{
-		let mut terminate =
-			tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+		let mut terminate = unix::signal(SignalKind::terminate())?;
 		tokio::select! {
-			result = tokio::signal::ctrl_c() => result,
+			result = ctrl_c() => result,
 			_ = terminate.recv() => Ok(()),
 		}
 	}
 	#[cfg(not(unix))]
 	{
-		tokio::signal::ctrl_c().await
+		ctrl_c().await
 	}
 }
 
@@ -570,14 +576,14 @@ struct SocketCleanup {
 #[cfg(unix)]
 impl Drop for SocketCleanup {
 	fn drop(&mut self) {
-		let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
+		let Ok(metadata) = fs::symlink_metadata(&self.path) else {
 			return;
 		};
 		if metadata.file_type().is_socket()
 			&& metadata.dev() == self.dev
 			&& metadata.ino() == self.ino
 		{
-			let _ = std::fs::remove_file(&self.path);
+			let _ = fs::remove_file(&self.path);
 		}
 	}
 }
@@ -586,9 +592,12 @@ impl Drop for SocketCleanup {
 mod tests {
 	use bytes::{Bytes, BytesMut};
 	use omp_core::sf;
-	use omp_proto::document::v1 as proto;
+	use omp_proto::document::v1::{self as proto, client_frame, server_frame};
 	use tempfile::TempDir;
-	use tokio::sync::watch;
+	use tokio::{
+		sync::{watch, watch::Receiver},
+		time::Instant,
+	};
 
 	use super::*;
 	use crate::{
@@ -622,7 +631,7 @@ mod tests {
 			"a second workspace authority must be rejected"
 		);
 		drop(first);
-		second_config
+		let _reacquired_authority = second_config
 			.try_lock_authority()
 			.expect("released workspace authority is reusable");
 	}
@@ -630,7 +639,7 @@ mod tests {
 	#[tokio::test]
 	async fn socket_binding_replaces_stale_socket_but_not_live_listener() {
 		let root = TempDir::new().expect("temporary directory");
-		std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+		fs::set_permissions(root.path(), Permissions::from_mode(0o700))
 			.expect("secure socket parent");
 		let path = root.path().join("document.sock");
 		let stale = UnixListener::bind(&path).expect("stale listener");
@@ -653,19 +662,19 @@ mod tests {
 		let live = UnixListener::bind(&path).expect("live listener");
 		assert!(bind_socket(path.clone()).await.is_err(), "a live listener must never be displaced");
 		drop(live);
-		std::fs::remove_file(path).expect("remove live test socket");
+		fs::remove_file(path).expect("remove live test socket");
 	}
 
 	#[tokio::test]
 	async fn socket_cleanup_preserves_a_replacement_entry() {
 		let root = TempDir::new().expect("temporary directory");
-		std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+		fs::set_permissions(root.path(), Permissions::from_mode(0o700))
 			.expect("secure socket parent");
 		let path = root.path().join("document.sock");
 		let (listener, cleanup) = bind_socket(path.clone()).await.expect("bind socket");
 		drop(listener);
-		std::fs::remove_file(&path).expect("remove original socket");
-		std::fs::write(&path, b"replacement").expect("write replacement");
+		fs::remove_file(&path).expect("remove original socket");
+		fs::write(&path, b"replacement").expect("write replacement");
 
 		drop(cleanup);
 		assert_eq!(std::fs::read(path).expect("replacement remains"), b"replacement");
@@ -675,8 +684,8 @@ mod tests {
 	async fn socket_binding_accepts_standard_parent_permissions() {
 		let root = TempDir::new().expect("temporary directory");
 		let shared = root.path().join("shared");
-		std::fs::create_dir(&shared).expect("create shared directory");
-		std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755))
+		fs::create_dir(&shared).expect("create shared directory");
+		fs::set_permissions(&shared, Permissions::from_mode(0o755))
 			.expect("set standard parent permissions");
 		let path = shared.join("document.sock");
 
@@ -698,8 +707,8 @@ mod tests {
 		let scratch = TempDir::new().expect("temporary directory");
 		let project = scratch.path().join("project");
 		let runtime = scratch.path().join("runtime");
-		std::fs::create_dir(&project).expect("project directory");
-		std::fs::create_dir(&runtime).expect("runtime directory");
+		fs::create_dir(&project).expect("project directory");
+		fs::create_dir(&runtime).expect("runtime directory");
 		let socket = runtime.join("document.sock");
 		let shutdown = CancellationToken::new();
 		let task_shutdown = shutdown.clone();
@@ -714,13 +723,13 @@ mod tests {
 			})
 			.await
 		});
-		let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + Duration::from_secs(5);
 		loop {
 			if UnixStream::connect(&socket).await.is_ok() {
 				break;
 			}
-			assert!(tokio::time::Instant::now() < deadline, "document socket did not start");
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			assert!(Instant::now() < deadline, "document socket did not start");
+			sleep(Duration::from_millis(10)).await;
 		}
 
 		shutdown.cancel();
@@ -737,8 +746,8 @@ mod tests {
 		let scratch = TempDir::new().expect("temporary directory");
 		let project = scratch.path().join("project");
 		let runtime = scratch.path().join("runtime");
-		std::fs::create_dir(&project).expect("project directory");
-		std::fs::create_dir(&runtime).expect("runtime directory");
+		fs::create_dir(&project).expect("project directory");
+		fs::create_dir(&runtime).expect("runtime directory");
 		let socket = runtime.join("document.sock");
 		let shutdown = CancellationToken::new();
 		let (connection_tx, mut connection_rx) = watch::channel(usize::MAX);
@@ -758,7 +767,7 @@ mod tests {
 			&mut stream,
 			&proto::ClientFrame {
 				request_id: 0,
-				body:       Some(proto::client_frame::Body::Hello(proto::ClientHello {
+				body:       Some(client_frame::Body::Hello(proto::ClientHello {
 					protocol_major: PROTOCOL_MAJOR,
 					protocol_minor: PROTOCOL_MINOR,
 					client_id:      Bytes::from_static(b"daemon-test"),
@@ -773,7 +782,7 @@ mod tests {
 			.await
 			.expect("read server hello")
 			.expect("server hello frame");
-		let Some(proto::server_frame::Body::Hello(hello)) = response.body else {
+		let Some(server_frame::Body::Hello(hello)) = response.body else {
 			panic!("expected server hello");
 		};
 		assert_eq!(hello.server_build, "test-build");
@@ -792,8 +801,8 @@ mod tests {
 		let scratch = TempDir::new().expect("temporary directory");
 		let project = scratch.path().join("project");
 		let runtime = scratch.path().join("runtime");
-		std::fs::create_dir(&project).expect("project directory");
-		std::fs::create_dir(&runtime).expect("runtime directory");
+		fs::create_dir(&project).expect("project directory");
+		fs::create_dir(&runtime).expect("runtime directory");
 		let socket = runtime.join("document.sock");
 		let shutdown = CancellationToken::new();
 		let (connection_tx, mut connection_rx) = watch::channel(usize::MAX);
@@ -820,7 +829,7 @@ mod tests {
 			.expect("document authority result");
 	}
 
-	async fn wait_for_connection_count(receiver: &mut watch::Receiver<usize>, expected: usize) {
+	async fn wait_for_connection_count(receiver: &mut Receiver<usize>, expected: usize) {
 		timeout(Duration::from_secs(5), async {
 			loop {
 				let current = *receiver.borrow_and_update();
@@ -840,9 +849,9 @@ mod tests {
 		let project = scratch.path().join("project");
 		let metadata = project.join(".omp");
 		let runtime = scratch.path().join("runtime");
-		std::fs::create_dir_all(&metadata).expect("project metadata directory");
-		std::fs::create_dir(&runtime).expect("runtime directory");
-		let project = std::fs::canonicalize(project).expect("canonical project");
+		fs::create_dir_all(&metadata).expect("project metadata directory");
+		fs::create_dir(&runtime).expect("runtime directory");
+		let project = fs::canonicalize(project).expect("canonical project");
 
 		let error = validate_socket_location(&metadata.join("document.sock"), &project)
 			.expect_err("workspace socket must be rejected");

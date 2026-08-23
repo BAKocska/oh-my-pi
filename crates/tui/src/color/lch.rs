@@ -18,6 +18,7 @@ pub(super) fn parse(body: &str) -> Option<CssColor> {
 #[cfg(test)]
 mod tests {
 	use super::{super::CssColor, parse};
+	use crate::color::lab::to_srgb;
 
 	fn assert_achromatic(actual: Option<CssColor>, tolerance: u8) {
 		let Some(CssColor::Rgba(red, green, blue, 1.0)) = actual else {
@@ -30,7 +31,7 @@ mod tests {
 	#[test]
 	fn polar_channels_match_direct_lab_conversion() {
 		let hue = 22.0_f32.to_radians();
-		let expected = super::super::lab::to_srgb(52.0, 58.0 * hue.cos(), 58.0 * hue.sin());
+		let expected = to_srgb(52.0, 58.0 * hue.cos(), 58.0 * hue.sin());
 		assert_eq!(parse("52 58 22"), Some(CssColor::Rgba(expected.0, expected.1, expected.2, 1.0)));
 	}
 

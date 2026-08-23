@@ -1,6 +1,11 @@
 //! Actor-aware Environment path operations.
 
-use std::{path::Path, sync::Arc};
+use std::{
+	fmt, io,
+	path::{Path, PathBuf},
+	result,
+	sync::Arc,
+};
 
 use bytes::Bytes;
 use omp_core::{Str, sf};
@@ -37,7 +42,7 @@ pub enum PathMutationResult<T> {
 
 impl<T> PathMutationResult<T> {
 	/// Returns the completed value, or the exact rejected transaction outcome.
-	pub fn into_result(self) -> std::result::Result<T, Arc<TransactionOutcome>> {
+	pub fn into_result(self) -> result::Result<T, Arc<TransactionOutcome>> {
 		match self {
 			Self::Completed(value) => Ok(value),
 			Self::TransactionRejected(outcome) => Err(outcome),
@@ -60,8 +65,8 @@ pub struct PathService {
 	transactions: TransactionCoordinator<LspRegistry>,
 }
 
-impl std::fmt::Debug for PathService {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PathService {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("PathService")
 			.finish_non_exhaustive()
@@ -82,7 +87,7 @@ impl PathService {
 	pub(crate) fn begin_workspace_mutation(
 		&self,
 		owner: [u8; 16],
-		paths: Vec<std::path::PathBuf>,
+		paths: Vec<PathBuf>,
 	) -> Result<WorkspaceMutationGuard> {
 		self.store.workspace_leases().begin_mutation(owner, paths)
 	}
@@ -290,7 +295,7 @@ impl PathService {
 				return Err(path_io_error(
 					&destination,
 					"copy path",
-					std::io::ErrorKind::AlreadyExists,
+					io::ErrorKind::AlreadyExists,
 					"copy destination already exists",
 				));
 			}
@@ -543,7 +548,7 @@ impl PathService {
 				return Err(path_io_error(
 					source,
 					"copy path",
-					std::io::ErrorKind::NotFound,
+					io::ErrorKind::NotFound,
 					"copy source is missing",
 				));
 			}
@@ -558,7 +563,7 @@ impl PathService {
 			DiskState::Missing => Err(path_io_error(
 				source,
 				"copy path",
-				std::io::ErrorKind::NotFound,
+				io::ErrorKind::NotFound,
 				"copy source is missing",
 			)),
 		}
@@ -637,14 +642,14 @@ impl PathService {
 	) -> Result<MoveDestinationPrecondition> {
 		ensure_not_cancelled(cancellation, destination, "inspect rename destination")?;
 		match self.store.local_fs().stat(destination, FollowSymlinks::No) {
-			Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+			Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
 				Ok(MoveDestinationPrecondition::MustNotExist)
 			},
 			Err(error) => Err(error),
 			Ok(_) if overwrite == DestinationOverwritePolicy::FailIfExists => Err(path_io_error(
 				destination,
 				"rename path",
-				std::io::ErrorKind::AlreadyExists,
+				io::ErrorKind::AlreadyExists,
 				"rename destination already exists",
 			)),
 			Ok(metadata) if metadata.kind == FileKind::RegularFile => {
@@ -713,13 +718,13 @@ fn require_revision(
 fn path_io_error(
 	path: &Path,
 	operation: &'static str,
-	kind: std::io::ErrorKind,
+	kind: io::ErrorKind,
 	message: &'static str,
 ) -> Error {
 	Error::Io {
 		operation: sf!(operation),
 		path:      path.to_path_buf(),
-		source:    std::io::Error::new(kind, message),
+		source:    io::Error::new(kind, message),
 	}
 }
 
@@ -735,7 +740,7 @@ fn ensure_not_cancelled(
 }
 
 fn cancelled_path_operation(path: &Path, operation: &'static str) -> Error {
-	path_io_error(path, operation, std::io::ErrorKind::Interrupted, "path operation was cancelled")
+	path_io_error(path, operation, io::ErrorKind::Interrupted, "path operation was cancelled")
 }
 
 fn precondition_failed(path: &Path, reason: &str) -> Error {
@@ -748,8 +753,11 @@ fn invalid_target(path: &Path, reason: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+	use std::{fs, time::Duration};
+
 	use bytes::Bytes;
 	use tempfile::TempDir;
+	use tokio::{task, time};
 
 	use super::*;
 	use crate::{DocumentEventKind, ServerConfig, fs::DiskExpectation};
@@ -814,9 +822,8 @@ mod tests {
 			loop {
 				let event = events.recv().await.expect("source event stream");
 				if event.kind() == DocumentEventKind::Committed {
-					std::fs::remove_file(&replaced_destination)
-						.expect("remove committed rename destination");
-					std::fs::write(&replaced_destination, b"native replacement")
+					fs::remove_file(&replaced_destination).expect("remove committed rename destination");
+					fs::write(&replaced_destination, b"native replacement")
 						.expect("replace committed rename destination");
 					break;
 				}
@@ -834,7 +841,7 @@ mod tests {
 			)
 			.await
 			.expect("committed rename remains successful");
-		tokio::time::timeout(std::time::Duration::from_secs(5), replace_after_commit)
+		time::timeout(Duration::from_secs(5), replace_after_commit)
 			.await
 			.expect("committed rename event arrives")
 			.expect("destination replacer");
@@ -919,9 +926,8 @@ mod tests {
 			loop {
 				let event = events.recv().await.expect("destination event stream");
 				if event.kind() == DocumentEventKind::Committed {
-					std::fs::remove_file(&replaced_destination)
-						.expect("remove committed copy destination");
-					std::fs::write(&replaced_destination, b"native replacement")
+					fs::remove_file(&replaced_destination).expect("remove committed copy destination");
+					fs::write(&replaced_destination, b"native replacement")
 						.expect("replace committed copy destination");
 					break;
 				}
@@ -939,7 +945,7 @@ mod tests {
 			)
 			.await
 			.expect("committed copy remains successful");
-		tokio::time::timeout(std::time::Duration::from_secs(5), replace_after_commit)
+		time::timeout(Duration::from_secs(5), replace_after_commit)
 			.await
 			.expect("committed copy event arrives")
 			.expect("destination replacer");
@@ -967,23 +973,23 @@ mod tests {
 			.expect("open destination");
 		let (_, destination_head, _) = destination_open.into_parts();
 		let post_reload = vec![b'r'; 4 * 1024 * 1024];
-		std::fs::write(&source, &post_reload).expect("replace active source natively");
+		fs::write(&source, &post_reload).expect("replace active source natively");
 		let source_handle = store
 			.actor_handle_for_path(&source)
 			.expect("active source actor");
-		tokio::time::timeout(std::time::Duration::from_secs(5), async {
+		time::timeout(Duration::from_secs(5), async {
 			loop {
 				if source_handle.state().await.expect("source state").reloading {
 					break;
 				}
-				tokio::task::yield_now().await;
+				task::yield_now().await;
 			}
 		})
 		.await
 		.expect("watcher invalidates source before reload settles");
 
-		let result = tokio::time::timeout(
-			std::time::Duration::from_secs(5),
+		let result = time::timeout(
+			Duration::from_secs(5),
 			service.copy(
 				&store.file_uri(&source).expect("source uri"),
 				&store.file_uri(&destination).expect("destination uri"),
@@ -997,13 +1003,11 @@ mod tests {
 		.expect("copy completes after source reload")
 		.expect("copy waits for source reload");
 		assert!(matches!(result, PathMutationResult::Completed(_)));
-		let copied = tokio::time::timeout(
-			std::time::Duration::from_secs(5),
-			store.read(destination, None, ReadSelection::Whole),
-		)
-		.await
-		.expect("destination read completes")
-		.expect("read copied destination");
+		let copied =
+			time::timeout(Duration::from_secs(5), store.read(destination, None, ReadSelection::Whole))
+				.await
+				.expect("destination read completes")
+				.expect("read copied destination");
 		let ReadBody::Whole(content) = copied.body() else {
 			panic!("whole read should return whole body");
 		};

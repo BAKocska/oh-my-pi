@@ -1,6 +1,7 @@
 //! `uv` resolver driver and deterministic resolution-policy checks.
 
 use std::{
+	collections::BTreeSet,
 	ffi::OsString,
 	io,
 	path::PathBuf,
@@ -130,7 +131,7 @@ impl ResolvePlan {
 				"at least one target is required",
 			));
 		}
-		let mut ids = std::collections::BTreeSet::new();
+		let mut ids = BTreeSet::new();
 		for extension in enabled {
 			if !ids.insert(&extension.extension_id) {
 				return Err(ExtensionError::new(

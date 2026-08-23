@@ -273,6 +273,7 @@ mod tests {
 			.with(Prop::Options, "one two three");
 		let ctx = UiContext::default();
 		assert_eq!(radio.key(&mut event_ctx(&ctx), Key::Left), Flow::Consumed);
+
 		let mut values = serde_json::Map::new();
 		radio.value(&mut values);
 		assert_eq!(values["mode"], serde_json::json!("three"));

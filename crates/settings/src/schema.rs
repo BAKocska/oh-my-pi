@@ -1,11 +1,13 @@
 //! Type-owned settings reflection.
 
 use std::{
+	fmt,
 	num::{ParseFloatError, ParseIntError},
 	sync::Arc,
 };
 
 use serde::{Serialize, de::DeserializeOwned};
+use toml::de;
 
 /// A persistent settings layer that may own a field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,8 +75,8 @@ pub enum OptionProvider {
 	Dynamic(fn() -> Arc<[DynamicOption]>),
 }
 
-impl std::fmt::Debug for OptionProvider {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for OptionProvider {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Static(options) => formatter.debug_tuple("Static").field(options).finish(),
 			Self::Dynamic(_) => formatter.write_str("Dynamic(..)"),
@@ -382,7 +384,7 @@ pub enum ValidationError {
 		path:   &'static str,
 		/// TOML parser failure.
 		#[source]
-		source: toml::de::Error,
+		source: de::Error,
 	},
 	/// A parsed wrapper unexpectedly omitted its value.
 	#[error("setting {path} did not produce a value")]
@@ -403,7 +405,7 @@ pub enum ValidationError {
 		domain: &'static str,
 		/// Typed TOML decode failure.
 		#[source]
-		source: toml::de::Error,
+		source: de::Error,
 	},
 	/// A domain-specific invariant failed.
 	#[error("settings domain invariant failed for {domain}")]

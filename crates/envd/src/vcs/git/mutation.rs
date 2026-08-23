@@ -1,14 +1,16 @@
 //! Consumer-facing Git mutation primitives serialized by primary repository
 //! root.
 
-use std::{collections::HashSet, fmt::Write as _, path::Path};
+use std::{collections::HashSet, fmt::Write as _, path::Path, str};
 
 use bytes::{Bytes, BytesMut};
 use omp_core::{IntoStr, Str};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-	diff::{DiffOptions, FileDiff, GitDiff},
+	commands::CommandError,
+	diff,
+	diff::{DiffHunk, DiffOptions, FileDiff, GitDiff},
 	lock,
 	repo::Repository,
 	runner::{GitDeadline, GitRunError, GitRunOptions, GitRunOutput, GitRunner},
@@ -98,7 +100,7 @@ pub enum MutationError {
 	Selection(#[from] SelectionError),
 	/// Complete diff capture was rejected by Git.
 	#[error(transparent)]
-	Diff(#[from] super::commands::CommandError),
+	Diff(#[from] CommandError),
 	/// Git emitted a non-UTF-8 scalar where its plumbing contract requires text.
 	#[error("Git emitted a non-UTF-8 scalar")]
 	NonUtf8,
@@ -749,7 +751,7 @@ impl GitMutation {
 		let _guard = lock::write(&self.repository, cancel).await?;
 		let output = self.invoke(&["write-tree"], None, cancel).await?;
 		if output.exit_code == 0 {
-			let tree = std::str::from_utf8(&output.stdout)
+			let tree = str::from_utf8(&output.stdout)
 				.map_err(|_| MutationError::NonUtf8)?
 				.trim();
 			return Ok(WriteTreeOutcome::Written(tree.to_str()));
@@ -957,7 +959,7 @@ impl GitMutation {
 			.split(|byte| *byte == 0)
 			.filter(|path| !path.is_empty())
 			.map(|path| {
-				std::str::from_utf8(path)
+				str::from_utf8(path)
 					.map(Str::from)
 					.map_err(|_| MutationError::NonUtf8)
 			})
@@ -997,9 +999,9 @@ fn isolation_commit_message(record: IsolationCommit<'_>) -> String {
 
 fn stash_tracked_paths(patch: &Bytes) -> Result<Vec<Str>, MutationError> {
 	let mut paths = Vec::new();
-	for file in super::diff::parse_unified(patch.clone()) {
+	for file in diff::parse_unified(patch.clone()) {
 		for path in [file.old_path, file.path].into_iter().flatten() {
-			let path = std::str::from_utf8(&path)
+			let path = str::from_utf8(&path)
 				.map_err(|_| MutationError::NonUtf8)?
 				.to_str();
 			if !paths.contains(&path) {
@@ -1036,7 +1038,7 @@ fn build_selected_patch(
 	raw: &Bytes,
 	selections: &[HunkSelection],
 ) -> Result<Bytes, SelectionError> {
-	let files = super::diff::parse_unified(raw.clone());
+	let files = diff::parse_unified(raw.clone());
 	let mut seen = HashSet::with_capacity(selections.len());
 	let mut patch = BytesMut::with_capacity(raw.len());
 	for selection in selections {
@@ -1103,7 +1105,7 @@ fn file_matches_path(file: &FileDiff, path: &[u8]) -> bool {
 fn append_selected_hunks(
 	patch: &mut BytesMut,
 	file: &FileDiff,
-	hunks: &[&super::diff::DiffHunk],
+	hunks: &[&DiffHunk],
 	path: &Str,
 ) -> Result<(), SelectionError> {
 	if hunks.is_empty() {

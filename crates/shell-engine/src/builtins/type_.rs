@@ -6,7 +6,7 @@ use std::{
 use clap::Parser;
 
 use crate::{
-	ExecutionResult, Shell, builtins,
+	Error, ExecutionContext, ExecutionResult, Shell, ShellExtensions, builtins,
 	parser::ast,
 	sys::{self, fs::PathExt},
 };
@@ -48,12 +48,12 @@ enum ResolvedType<'a> {
 }
 
 impl builtins::Command for TypeCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let mut result = ExecutionResult::success();
 
 		for name in &self.names {
@@ -145,7 +145,7 @@ impl builtins::Command for TypeCommand {
 }
 
 impl TypeCommand {
-	fn resolve_types<'a, SE: crate::ShellExtensions>(
+	fn resolve_types<'a, SE: ShellExtensions>(
 		&self,
 		shell: &'a Shell<SE>,
 		name: &str,

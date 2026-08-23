@@ -1,9 +1,11 @@
 use omp_core::{Str, StrMut};
 use smallvec::SmallVec;
 
-use super::MdTheme;
+use super::{MdTheme, ordinal_marker};
 use crate::{
+	Icon,
 	frame::{Color, Style},
+	latex, markup,
 	rich::RichSink,
 };
 
@@ -141,7 +143,7 @@ fn render_range(
 		if tail.starts_with('<') {
 			// `<ico:name/>` icon: the charset picks the glyph. Checked before
 			// autolinks because `ico:…` also parses as an absolute-URI scheme.
-			if let Some((name, consumed)) = crate::markup::ico_tag(tail) {
+			if let Some((name, consumed)) = markup::ico_tag(tail) {
 				flush_plain_marked(&text[plain_start..offset], style, html, sink);
 				sink.run(style, theme.charset.icon_named(name).unwrap_or(name));
 				html.has_content = true;
@@ -288,12 +290,12 @@ pub fn math_span(text: &str) -> Option<(&str, usize)> {
 		return Some((&rest[..end], end + 4));
 	}
 	let rest = text.strip_prefix('$')?;
-	let end = crate::latex::inline_math_span_end(rest)?;
+	let end = latex::inline_math_span_end(rest)?;
 	Some((&rest[..end], end + 2))
 }
 
 fn push_math(expr: &str, style: Style, sink: &mut dyn RichSink) {
-	crate::latex::latex_inline(expr, style, sink);
+	latex::latex_inline(expr, style, sink);
 }
 
 fn escaped_punctuation(text: &str) -> Option<&str> {
@@ -685,11 +687,11 @@ fn render_html_tag(
 			sink.run(style, "  ");
 		}
 		if let Some(HtmlList::Ordered(next)) = state.lists.last_mut() {
-			let marker = super::ordinal_marker(*next);
+			let marker = ordinal_marker(*next);
 			sink.run(style, marker.as_str());
 			*next = next.saturating_add(1);
 		} else {
-			sink.run(style, theme.charset.icon(crate::Icon::Bullet));
+			sink.run(style, theme.charset.icon(Icon::Bullet));
 			sink.run(style, " ");
 		}
 		state.at_line_start = false;

@@ -1,3 +1,4 @@
-pub(crate) fn get_hostname() -> std::io::Result<std::ffi::OsString> {
+use std::{ffi, io};
+pub(crate) fn get_hostname() -> io::Result<ffi::OsString> {
 	Ok("".into())
 }

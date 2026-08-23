@@ -1,27 +1,35 @@
 //! Typed `OpenAI` Chat Completions request and incremental response codec.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+	collections::{BTreeMap, btree_map::Entry},
+	str,
+	time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use omp_catalog::{
 	OperationKind, ReasoningEffort, ServiceTier, ThinkingEffort,
 	policy::{
-		MaxTokensField as CatalogMaxTokensField, ReasoningWireFormat as CatalogReasoningWireFormat,
-		ThinkingToolChoiceConflict, ToolCallIdProfile as CatalogToolCallIdProfile, ToolStrictMode,
+		self, MaxTokensField as CatalogMaxTokensField,
+		ReasoningWireFormat as CatalogReasoningWireFormat, ThinkingToolChoiceConflict,
+		ToolCallIdProfile as CatalogToolCallIdProfile, ToolStrictMode,
 	},
 };
 use omp_core::{IntoStr, Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 
 use crate::{
+	body::BodySource,
 	call::{
-		ChatRequest, ContentPart, HostedTool, MediaInput, Message, OperationCall, Role, Setting,
-		StructuredOutput, ToolChoice, ToolDefinition, ToolResultContent,
+		ChatRequest, ContentPart, HostedTool, MediaInput, Message, OperationCall, ReasoningRequest,
+		ReasoningVisibility, Role, Setting, StructuredOutput, ToolChoice, ToolDefinition,
+		ToolResultContent,
 	},
 	codec::{
-		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawCompletion,
-		RawEvent, RequestHeader, RequestMethod, SizeBounds, UnvalidatedToolCall,
+		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
+		ProviderStateEvent, RawCompletion, RawEvent, RequestHeader, RequestMethod, SizeBounds,
+		ToolInputKind, UnvalidatedToolCall,
 	},
 	error::{Error, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
@@ -202,7 +210,7 @@ impl Default for OpenAiChatProfile {
 	}
 }
 impl OpenAiChatProfile {
-	const fn apply_policy(&mut self, policy: &omp_catalog::policy::WirePolicy) {
+	const fn apply_policy(&mut self, policy: &policy::WirePolicy) {
 		if let Some(value) = policy.role.supports_developer_role {
 			self.system_role = if value {
 				WireRole::Developer
@@ -353,7 +361,7 @@ impl OpenAiChatCodec {
 	}
 
 	/// Returns the exact route-policy-adjusted response frame bound.
-	pub(crate) fn maximum_frame_bytes(&self, policy: &omp_catalog::policy::WirePolicy) -> u64 {
+	pub(crate) fn maximum_frame_bytes(&self, policy: &policy::WirePolicy) -> u64 {
 		let mut profile = self.profile.clone();
 		profile.apply_policy(policy);
 		profile.max_frame_bytes
@@ -516,7 +524,7 @@ impl Codec for OpenAiChatCodec {
 				value: sf!("application/json"),
 			}]
 			.into_boxed_slice(),
-			body: crate::body::BodySource::Bytes(body),
+			body: BodySource::Bytes(body),
 			framing: FramingProtocol::Sse,
 			bounds: SizeBounds {
 				request_body: selected.profile.max_request_bytes,
@@ -692,7 +700,7 @@ struct WireAssistantFunction {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum WireReasoningReplay {
-	Opaque(Box<serde_json::value::RawValue>),
+	Opaque(Box<RawValue>),
 	Encrypted {
 		#[serde(rename = "type")]
 		kind: ReasoningEncryptedTag,
@@ -1058,11 +1066,11 @@ const fn canonical_thinking_effort(effort: ReasoningEffort) -> ThinkingEffort {
 }
 
 fn proof_detail(value: &[u8], id: Option<Str>) -> WireReasoningReplay {
-	if let Ok(raw) = serde_json::from_slice::<Box<serde_json::value::RawValue>>(value) {
+	if let Ok(raw) = serde_json::from_slice::<Box<RawValue>>(value) {
 		return WireReasoningReplay::Opaque(raw);
 	}
-	let data = std::str::from_utf8(value)
-		.map_or_else(|_| base64::encode(value).into_string(), str::to_owned);
+	let data =
+		str::from_utf8(value).map_or_else(|_| base64::encode(value).into_string(), str::to_owned);
 	WireReasoningReplay::Encrypted { kind: ReasoningEncryptedTag::Encrypted, id, data }
 }
 
@@ -1093,7 +1101,7 @@ fn project_call_id(profile: ToolIdWireProfile, value: &str) -> Str {
 				};
 				hash /= 36;
 			}
-			Str::new(std::str::from_utf8(&output).expect("ASCII identifier"))
+			Str::new(str::from_utf8(&output).expect("ASCII identifier"))
 		},
 	}
 }
@@ -1404,7 +1412,7 @@ fn lower_output(output: &Setting<StructuredOutput>) -> Result<Option<ResponseFor
 
 fn lower_reasoning(
 	profile: &OpenAiChatProfile,
-	reasoning: &Setting<crate::call::ReasoningRequest>,
+	reasoning: &Setting<ReasoningRequest>,
 ) -> Result<ReasoningFields, Error> {
 	let reasoning = match reasoning {
 		Setting::Unset => {
@@ -1430,7 +1438,7 @@ fn lower_reasoning(
 			effort:     None,
 			openrouter: Some(OpenRouterReasoning {
 				effort,
-				exclude: reasoning.visibility == crate::call::ReasoningVisibility::Hidden,
+				exclude: reasoning.visibility == ReasoningVisibility::Hidden,
 				max_tokens: reasoning.max_tokens,
 			}),
 			zai:        None,
@@ -1691,7 +1699,7 @@ impl OpenAiChatDecoder {
 		for detail in payload.reasoning_details {
 			if let Some(signature) = detail.data {
 				let block = state.thinking_block.unwrap_or(0);
-				emit(RawEvent::ProviderState(crate::codec::ProviderStateEvent::ReasoningSignature {
+				emit(RawEvent::ProviderState(ProviderStateEvent::ReasoningSignature {
 					index:     block,
 					signature: Bytes::from(signature.into_bytes()),
 				}));
@@ -1699,7 +1707,7 @@ impl OpenAiChatDecoder {
 		}
 		for (position, call) in payload.tool_calls.into_iter().enumerate() {
 			let wire_index = call.index.unwrap_or(position as u32);
-			if let std::collections::btree_map::Entry::Vacant(e) = state.tools.entry(wire_index) {
+			if let Entry::Vacant(e) = state.tools.entry(wire_index) {
 				let block = self.next_block;
 				self.next_block = self.next_block.saturating_add(1);
 				let id = call
@@ -1790,7 +1798,7 @@ impl OpenAiChatDecoder {
 				if !tool.started || tool.name.is_empty() {
 					return Err(protocol_error(committed, None));
 				}
-				serde_json::from_slice::<Box<serde_json::value::RawValue>>(&tool.arguments)
+				serde_json::from_slice::<Box<RawValue>>(&tool.arguments)
 					.map_err(|_| protocol_error(committed, None))?;
 				tool.completed = true;
 				emit(RawEvent::ToolCallComplete {
@@ -1798,7 +1806,7 @@ impl OpenAiChatDecoder {
 					call:  UnvalidatedToolCall {
 						id:         tool.id.clone(),
 						name:       tool.name.clone(),
-						input_kind: crate::codec::ToolInputKind::Json,
+						input_kind: ToolInputKind::Json,
 						arguments:  tool.arguments.clone().freeze(),
 					},
 				});
@@ -2322,18 +2330,24 @@ mod tests {
 	use std::{sync::Arc, time::Duration};
 
 	use bytes::Bytes;
+	use omp_catalog::policy;
 	use serde::Deserialize;
 
-	use super::{OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile, ToolIdWireProfile};
+	use super::{
+		ErrorCode, OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile, ReasoningWireFormat,
+		ToolIdWireProfile, WireError, classify_error, flatten_exclusive_required_root_union,
+	};
 	use crate::{
 		call::{
-			ChatRequest, ContentPart, Message, NegotiationPolicy, OpaqueJson, Role, Sampling, Setting,
-			ToolDefinition, ToolInputConstraint, ToolResultContent,
+			ChatRequest, ContentPart, Message, NegotiationPolicy, OpaqueJson, ReasoningRequest,
+			ReasoningVisibility, Role, Sampling, Setting, ToolChoice, ToolDefinition,
+			ToolInputConstraint, ToolResultContent,
 		},
+		catalog::ReasoningEffort,
 		codec::{Decoder, RawEvent},
-		error::{ErrorKind, RetryAction},
+		error::{Error, ErrorKind, RetryAction},
 		event::{ChatEvent, FinishReason},
-		transport::{Frame, SseDecoder},
+		transport::{Frame, SseDecoder, SseEvent},
 	};
 
 	fn request(messages: Arc<[Message]>) -> ChatRequest {
@@ -2363,7 +2377,7 @@ mod tests {
 		}
 	}
 
-	fn decode_fixture(source: &str) -> Result<Vec<RawEvent>, crate::error::Error> {
+	fn decode_fixture(source: &str) -> Result<Vec<RawEvent>, Error> {
 		let mut framer = SseDecoder::new();
 		let mut decoder = OpenAiChatDecoder::default();
 		let mut events = Vec::new();
@@ -2519,10 +2533,7 @@ mod tests {
 
 	fn flatten_codec() -> OpenAiChatCodec {
 		OpenAiChatCodec::new(
-			super::OpenAiChatProfile {
-				flatten_root_unions: true,
-				..super::OpenAiChatProfile::default()
-			},
+			OpenAiChatProfile { flatten_root_unions: true, ..OpenAiChatProfile::default() },
 			None,
 		)
 	}
@@ -2530,7 +2541,7 @@ mod tests {
 	fn encode_union_request(
 		codec: &OpenAiChatCodec,
 		tools: Arc<[ToolDefinition]>,
-		tool_choice: Setting<crate::call::ToolChoice>,
+		tool_choice: Setting<ToolChoice>,
 	) -> UnionEnvelope {
 		let mut request = request(Arc::from([text_message("check coverage")]));
 		request.tools = tools;
@@ -2620,7 +2631,7 @@ mod tests {
 		let envelope = encode_union_request(
 			&flatten_codec(),
 			Arc::from([leftover_tool(), good_tool()]),
-			Setting::Require(crate::call::ToolChoice::Named("mcp__leftover_union".into())),
+			Setting::Require(ToolChoice::Named("mcp__leftover_union".into())),
 		);
 		assert_eq!(tool_names(&envelope), ["read_file"]);
 		assert!(envelope.tool_choice.is_none());
@@ -2631,7 +2642,7 @@ mod tests {
 		let envelope = encode_union_request(
 			&flatten_codec(),
 			Arc::from([leftover_tool()]),
-			Setting::Require(crate::call::ToolChoice::Required),
+			Setting::Require(ToolChoice::Required),
 		);
 		assert!(envelope.tools.is_empty());
 		assert!(envelope.tool_choice.is_none());
@@ -2655,10 +2666,10 @@ mod tests {
 			},
 			"required": ["outputSchema"]
 		});
-		assert_eq!(super::flatten_exclusive_required_root_union(&nested), None);
+		assert_eq!(flatten_exclusive_required_root_union(&nested), None);
 		assert!(!super::leftover_root_object_union(&nested));
 
-		let flattened = super::flatten_exclusive_required_root_union(
+		let flattened = flatten_exclusive_required_root_union(
 			coverage_tool()
 				.input
 				.json_schema()
@@ -2681,7 +2692,7 @@ mod tests {
 				{"properties": {"kind": {"const": "b"}}}
 			]
 		});
-		assert_eq!(super::flatten_exclusive_required_root_union(&constraining), None);
+		assert_eq!(flatten_exclusive_required_root_union(&constraining), None);
 		assert!(super::leftover_root_object_union(&constraining));
 	}
 
@@ -2789,10 +2800,7 @@ mod tests {
 			let mut events = Vec::new();
 			decoder
 				.push(
-					Frame::Sse(crate::transport::SseEvent {
-						name: None,
-						data: Bytes::copy_from_slice(fixture),
-					}),
+					Frame::Sse(SseEvent { name: None, data: Bytes::copy_from_slice(fixture) }),
 					&mut |event| events.push(event),
 				)
 				.expect("typed provider error decodes");
@@ -2812,9 +2820,9 @@ mod tests {
 	#[test]
 	fn dashscope_token_limit_requires_anchor_and_exact_billing_wording() {
 		let classify = |message: &str| {
-			super::classify_error(
-				super::WireError {
-					code:            Some(super::ErrorCode::Text("insufficient_quota".into())),
+			classify_error(
+				WireError {
+					code:            Some(ErrorCode::Text("insufficient_quota".into())),
 					message:         Some(message.into()),
 					param:           None,
 					metadata:        None,
@@ -2862,9 +2870,9 @@ mod tests {
 	#[test]
 	fn transient_provider_blips_retry_same_route_and_deterministic_denials_do_not() {
 		let classify = |code: &str, message: &str| {
-			super::classify_error(
-				super::WireError {
-					code:            Some(super::ErrorCode::Text(code.into())),
+			classify_error(
+				WireError {
+					code:            Some(ErrorCode::Text(code.into())),
 					message:         Some(message.into()),
 					param:           None,
 					metadata:        None,
@@ -2912,9 +2920,9 @@ mod tests {
 		// skip the transport's same-route sleep so the router's fallback walk
 		// owns retry/fallback immediately (pi #8854).
 		let classify = |code: Option<&str>, rate_limit_type: Option<&str>| {
-			super::classify_error(
-				super::WireError {
-					code:            code.map(|value| super::ErrorCode::Text(value.into())),
+			classify_error(
+				WireError {
+					code:            code.map(|value| ErrorCode::Text(value.into())),
 					message:         Some("Max parallel request limit reached".into()),
 					param:           None,
 					metadata:        None,
@@ -2951,7 +2959,7 @@ mod tests {
 		let mut events = Vec::new();
 		decoder
 			.push(
-				Frame::Sse(crate::transport::SseEvent {
+				Frame::Sse(SseEvent {
 					name: None,
 					data: Bytes::from_static(
 						br#"{"error":{"message":"Max parallel request limit reached","type":"rate_limit_error","rate_limit_type":"max_parallel_requests","code":"429"}}"#,
@@ -2978,9 +2986,9 @@ mod tests {
 		// caller) must see a fail-fast `ContextOverflow` rather than a transient
 		// classification that burns the attempt budget on identical calls.
 		let classify = |code: &str, message: &str| {
-			super::classify_error(
-				super::WireError {
-					code:            Some(super::ErrorCode::Text(code.into())),
+			classify_error(
+				WireError {
+					code:            Some(ErrorCode::Text(code.into())),
 					message:         Some(message.into()),
 					param:           None,
 					metadata:        None,
@@ -3038,7 +3046,7 @@ mod tests {
 		let mut decoder = OpenAiChatDecoder::default();
 		let error = decoder
 			.push(
-				Frame::Sse(crate::transport::SseEvent {
+				Frame::Sse(SseEvent {
 					name: None,
 					data: Bytes::from_static(
 						br#"{"choices":[{"index":0,"delta":{"content":7},"finish_reason":null}]}"#,
@@ -3149,10 +3157,10 @@ mod tests {
 		assert_eq!(wire["messages"][2]["tool_call_id"].as_str(), Some(id));
 	}
 
-	fn thinking_request(effort: crate::catalog::ReasoningEffort) -> ChatRequest {
+	fn thinking_request(effort: ReasoningEffort) -> ChatRequest {
 		let mut request = request(Arc::from([text_message("think")]));
-		request.reasoning = Setting::Require(crate::call::ReasoningRequest {
-			visibility:          crate::call::ReasoningVisibility::Visible,
+		request.reasoning = Setting::Require(ReasoningRequest {
+			visibility:          ReasoningVisibility::Visible,
 			effort:              Some(effort),
 			max_tokens:          None,
 			preserve_signatures: false,
@@ -3166,15 +3174,13 @@ mod tests {
 		// template's `reasoning_effort` kwarg, `enable_thinking` alone leaves
 		// the model reasoning at its xhigh default. Twin emission: top-level
 		// for newer llama.cpp builds, kwargs for older builds.
-		let mut profile = OpenAiChatProfile {
-			reasoning: super::ReasoningWireFormat::Qwen,
-			..OpenAiChatProfile::default()
-		};
-		let mut policy = omp_catalog::policy::WirePolicy::overrides();
+		let mut profile =
+			OpenAiChatProfile { reasoning: ReasoningWireFormat::Qwen, ..OpenAiChatProfile::default() };
+		let mut policy = policy::WirePolicy::overrides();
 		policy.reasoning.template_reasoning_effort = Some(true);
 		profile.apply_policy(&policy);
 		let body = OpenAiChatCodec::new(profile, None)
-			.encode_chat("qwen3.8-27b", &thinking_request(crate::catalog::ReasoningEffort::Medium))
+			.encode_chat("qwen3.8-27b", &thinking_request(ReasoningEffort::Medium))
 			.expect("request encodes");
 		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
 		assert_eq!(wire["enable_thinking"], true);
@@ -3193,16 +3199,16 @@ mod tests {
 	#[test]
 	fn reasoning_conflict_drops_only_redundant_auto_tool_choice() {
 		let mut conflict_profile = OpenAiChatProfile::default();
-		let mut policy = omp_catalog::policy::WirePolicy::baseline();
+		let mut policy = policy::WirePolicy::baseline();
 		policy.tool.disable_reasoning_on_choice = Some(true);
 		conflict_profile.apply_policy(&policy);
 		let encode = |profile: OpenAiChatProfile, reasoning: bool, choice| {
 			let mut request = request(Arc::from([text_message("think")]));
 			request.tools = Arc::from([good_tool()]);
 			if reasoning {
-				request.reasoning = Setting::Require(crate::call::ReasoningRequest {
-					visibility:          crate::call::ReasoningVisibility::Visible,
-					effort:              Some(crate::catalog::ReasoningEffort::Medium),
+				request.reasoning = Setting::Require(ReasoningRequest {
+					visibility:          ReasoningVisibility::Visible,
+					effort:              Some(ReasoningEffort::Medium),
 					max_tokens:          None,
 					preserve_signatures: false,
 				});
@@ -3214,20 +3220,19 @@ mod tests {
 			serde_json::from_slice::<serde_json::Value>(&body).expect("wire body is JSON")
 		};
 
-		let dropped = encode(conflict_profile.clone(), true, crate::call::ToolChoice::Auto);
+		let dropped = encode(conflict_profile.clone(), true, ToolChoice::Auto);
 		assert!(dropped.get("tool_choice").is_none());
 
-		let no_reasoning = encode(conflict_profile.clone(), false, crate::call::ToolChoice::Auto);
+		let no_reasoning = encode(conflict_profile.clone(), false, ToolChoice::Auto);
 		assert_eq!(no_reasoning["tool_choice"], "auto");
 
-		let no_axis = encode(OpenAiChatProfile::default(), true, crate::call::ToolChoice::Auto);
+		let no_axis = encode(OpenAiChatProfile::default(), true, ToolChoice::Auto);
 		assert_eq!(no_axis["tool_choice"], "auto");
 
-		let forced = encode(conflict_profile.clone(), true, crate::call::ToolChoice::Required);
+		let forced = encode(conflict_profile.clone(), true, ToolChoice::Required);
 		assert_eq!(forced["tool_choice"], "required");
 
-		let named =
-			encode(conflict_profile, true, crate::call::ToolChoice::Named("read_file".into()));
+		let named = encode(conflict_profile, true, ToolChoice::Named("read_file".into()));
 		assert_eq!(named["tool_choice"]["function"]["name"], "read_file");
 	}
 
@@ -3235,12 +3240,10 @@ mod tests {
 	fn qwen_pre_38_templates_keep_the_bare_enable_thinking_toggle() {
 		// Older Qwen templates have no `reasoning_effort` kwarg; leaking one
 		// would inject an undefined template variable.
-		let profile = OpenAiChatProfile {
-			reasoning: super::ReasoningWireFormat::Qwen,
-			..OpenAiChatProfile::default()
-		};
+		let profile =
+			OpenAiChatProfile { reasoning: ReasoningWireFormat::Qwen, ..OpenAiChatProfile::default() };
 		let body = OpenAiChatCodec::new(profile, None)
-			.encode_chat("qwen3.6-27b", &thinking_request(crate::catalog::ReasoningEffort::High))
+			.encode_chat("qwen3.6-27b", &thinking_request(ReasoningEffort::High))
 			.expect("request encodes");
 		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
 		assert_eq!(wire["enable_thinking"], true);
@@ -3253,12 +3256,12 @@ mod tests {
 		// vLLM/NIM-style schemas reject unknown top-level fields; the effort
 		// rides `chat_template_kwargs` alone on the kwargs dialect.
 		let profile = OpenAiChatProfile {
-			reasoning: super::ReasoningWireFormat::Nvidia,
+			reasoning: ReasoningWireFormat::Nvidia,
 			template_reasoning_effort: true,
 			..OpenAiChatProfile::default()
 		};
 		let body = OpenAiChatCodec::new(profile, None)
-			.encode_chat("qwen3.8-27b", &thinking_request(crate::catalog::ReasoningEffort::Xhigh))
+			.encode_chat("qwen3.8-27b", &thinking_request(ReasoningEffort::Xhigh))
 			.expect("request encodes");
 		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
 		assert!(wire.get("reasoning_effort").is_none());
@@ -3274,9 +3277,9 @@ mod tests {
 		// the canonical adaptation code and a zero-delay same-route retry so
 		// the next encode hoists the effort onto the top-level field.
 		let classify = |code: Option<&str>, message: Option<&str>, param: Option<&str>| {
-			super::classify_error(
-				super::WireError {
-					code:            code.map(|value| super::ErrorCode::Text(value.into())),
+			classify_error(
+				WireError {
+					code:            code.map(|value| ErrorCode::Text(value.into())),
 					message:         message.map(Into::into),
 					param:           param.map(Into::into),
 					metadata:        None,
@@ -3325,13 +3328,13 @@ mod tests {
 		// servers accept, and the kwargs object disappears entirely when the
 		// effort was its only member.
 		let profile = OpenAiChatProfile {
-			reasoning: super::ReasoningWireFormat::Qwen,
+			reasoning: ReasoningWireFormat::Qwen,
 			template_reasoning_effort: true,
 			template_effort_top_level_only: true,
 			..OpenAiChatProfile::default()
 		};
 		let body = OpenAiChatCodec::new(profile, None)
-			.encode_chat("qwen3.8-27b", &thinking_request(crate::catalog::ReasoningEffort::Medium))
+			.encode_chat("qwen3.8-27b", &thinking_request(ReasoningEffort::Medium))
 			.expect("request encodes");
 		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
 		assert_eq!(wire["enable_thinking"], true);
@@ -3345,13 +3348,13 @@ mod tests {
 		// rejection the effort selection must survive by hoisting, while
 		// `enable_thinking` keeps riding the kwargs the endpoint accepts.
 		let profile = OpenAiChatProfile {
-			reasoning: super::ReasoningWireFormat::Nvidia,
+			reasoning: ReasoningWireFormat::Nvidia,
 			template_reasoning_effort: true,
 			template_effort_top_level_only: true,
 			..OpenAiChatProfile::default()
 		};
 		let body = OpenAiChatCodec::new(profile, None)
-			.encode_chat("qwen3.8-27b", &thinking_request(crate::catalog::ReasoningEffort::Xhigh))
+			.encode_chat("qwen3.8-27b", &thinking_request(ReasoningEffort::Xhigh))
 			.expect("request encodes");
 		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
 		assert_eq!(wire["reasoning_effort"], "xhigh");

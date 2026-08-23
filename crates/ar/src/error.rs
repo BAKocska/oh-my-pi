@@ -1,11 +1,11 @@
 //! Archive parsing, policy, codec, and I/O failures.
 
-use std::io;
+use std::{io, result};
 
 use omp_core::Str;
 
 /// Result type used by `omp-ar` operations.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = result::Result<T, E>;
 
 /// Failure produced while reading or writing an archive.
 #[derive(Debug, thiserror::Error)]

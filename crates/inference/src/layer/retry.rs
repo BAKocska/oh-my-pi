@@ -2,41 +2,38 @@
 //! account.
 
 use std::{
-	mem,
+	future, mem,
 	task::{Context, Poll},
+	time,
 };
 
-use futures::future::poll_fn;
 use ring::rand::{SecureRandom as _, SystemRandom};
+use tokio::task;
 use tower::{Layer, Service};
 
 use crate::{
 	body::RetryDecision,
 	error::{Error, ErrorPhase, RetryAction},
-	layer::LayerCall,
+	layer::{ExecutionContext, LayerCall},
 };
 
 /// Full-jitter exponential backoff policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetryBackoff {
 	/// First exponential ceiling.
-	pub base:    std::time::Duration,
+	pub base:    time::Duration,
 	/// Largest exponential ceiling.
-	pub maximum: std::time::Duration,
+	pub maximum: time::Duration,
 }
 
 impl RetryBackoff {
 	#[cfg(test)]
-	const ZERO: Self =
-		Self { base: std::time::Duration::ZERO, maximum: std::time::Duration::ZERO };
+	const ZERO: Self = Self { base: time::Duration::ZERO, maximum: time::Duration::ZERO };
 }
 
 impl Default for RetryBackoff {
 	fn default() -> Self {
-		Self {
-			base:    std::time::Duration::from_millis(500),
-			maximum: std::time::Duration::from_secs(8),
-		}
+		Self { base: time::Duration::from_millis(500), maximum: time::Duration::from_secs(8) }
 	}
 }
 
@@ -53,8 +50,8 @@ impl TransportRetryLayer {
 		Self {
 			max_retries,
 			backoff: RetryBackoff {
-				base:    std::time::Duration::from_millis(500),
-				maximum: std::time::Duration::from_secs(8),
+				base:    time::Duration::from_millis(500),
+				maximum: time::Duration::from_secs(8),
 			},
 		}
 	}
@@ -150,7 +147,7 @@ where
 					wait_retry_delay(request.context.clone(), delay).await?;
 				}
 				retry_index += 1;
-				poll_fn(|cx| service.poll_ready(cx)).await?;
+				future::poll_fn(|cx| service.poll_ready(cx)).await?;
 			}
 		}
 	}
@@ -159,7 +156,7 @@ where
 /// Calculates `Uniform(0, min(maximum, base * 2^attempt))`.
 ///
 /// `sample` is injected for deterministic tests; production uses OS entropy.
-pub fn full_jitter_delay(policy: RetryBackoff, attempt: u32, sample: u64) -> std::time::Duration {
+pub fn full_jitter_delay(policy: RetryBackoff, attempt: u32, sample: u64) -> time::Duration {
 	let factor = 1_u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
 	let ceiling = policy
 		.base
@@ -168,9 +165,9 @@ pub fn full_jitter_delay(policy: RetryBackoff, attempt: u32, sample: u64) -> std
 		.min(policy.maximum);
 	let nanos = ceiling.as_nanos().min(u128::from(u64::MAX)) as u64;
 	if nanos == 0 {
-		return std::time::Duration::ZERO;
+		return time::Duration::ZERO;
 	}
-	std::time::Duration::from_nanos(sample % nanos.saturating_add(1))
+	time::Duration::from_nanos(sample % nanos.saturating_add(1))
 }
 
 fn random_u64() -> u64 {
@@ -182,10 +179,7 @@ fn random_u64() -> u64 {
 	}
 }
 
-async fn wait_retry_delay(
-	context: crate::layer::ExecutionContext,
-	delay: std::time::Duration,
-) -> Result<(), Error> {
+async fn wait_retry_delay(context: ExecutionContext, delay: time::Duration) -> Result<(), Error> {
 	let remaining = context
 		.budget()
 		.max_elapsed
@@ -204,9 +198,9 @@ async fn wait_retry_delay(
 	}
 }
 
-async fn wait_cancelled(context: crate::layer::ExecutionContext) {
+async fn wait_cancelled(context: ExecutionContext) {
 	while !context.is_cancelled() {
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 	}
 }
 

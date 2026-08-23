@@ -1,6 +1,12 @@
 //! Source info.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+	fmt::{self, Display},
+	path::PathBuf,
+	sync::Arc,
+};
+
+use crate::SourcePosition;
 
 /// Source context.
 #[derive(Clone, Debug, Default)]
@@ -9,7 +15,7 @@ pub struct SourceInfo {
 	pub source: String,
 	/// Optionally indicates a starting location after the beginning of the
 	/// source. If `None`, the start is the beginning of the source.
-	pub start:  Option<Arc<crate::SourcePosition>>,
+	pub start:  Option<Arc<SourcePosition>>,
 }
 
 impl From<&str> for SourceInfo {
@@ -24,8 +30,8 @@ impl From<PathBuf> for SourceInfo {
 	}
 }
 
-impl std::fmt::Display for SourceInfo {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for SourceInfo {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "{}", self.source)?;
 
 		if let Some(pos) = &self.start {

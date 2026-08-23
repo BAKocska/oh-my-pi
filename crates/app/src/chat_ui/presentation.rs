@@ -9,20 +9,29 @@
 use std::{
 	collections::BTreeMap,
 	future::Future,
+	mem,
 	pin::Pin,
 	sync::{Arc, Weak},
+	time::{self, Instant},
 };
 
 use async_trait::async_trait;
+use flume::Receiver;
 use omp_core::{Str, sf};
+use omp_envd::exthost::{
+	CallbackConcurrency,
+	control::{ControlConnectionIdentity, ControlDispatch, ControlInvocationAuthority},
+	dispatch::CallbackDispatcher,
+};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
 use super::presentation_authority::{
-	PresentationAuthorityError, PresentationCallback, PresentationCallbackDispatcher,
-	PresentationCallbackKind, PresentationClient, PresentationEffect, PresentationIdentity,
-	PresentationRequest, PresentationResponse,
+	COMPLETION_CALLBACK_DEADLINE, PresentationAuthorityError, PresentationCallback,
+	PresentationCallbackDispatcher, PresentationCallbackKind, PresentationClient,
+	PresentationEffect, PresentationIdentity, PresentationRequest, PresentationResponse,
+	RENDER_CALLBACK_DEADLINE,
 };
 
 /// One data-only operation delivered to the attached presentation surface.
@@ -98,7 +107,7 @@ impl PresentationBridge {
 			state.generation = state.generation.wrapping_add(1).max(1);
 			state.sender = Some(sender);
 			let generation = state.generation;
-			let pending = std::mem::take(&mut state.pending);
+			let pending = mem::take(&mut state.pending);
 			(generation, pending)
 		};
 		fail_pending(pending, PresentationAuthorityError::Unavailable);
@@ -173,7 +182,7 @@ impl PresentationClient for PresentationBridge {
 pub struct PresentationEndpoint {
 	inner:      Weak<BridgeInner>,
 	generation: u64,
-	receiver:   flume::Receiver<PresentationDispatch>,
+	receiver:   Receiver<PresentationDispatch>,
 }
 
 impl PresentationEndpoint {
@@ -224,7 +233,7 @@ impl Drop for PresentationEndpoint {
 				return;
 			}
 			state.sender = None;
-			std::mem::take(&mut state.pending)
+			mem::take(&mut state.pending)
 		};
 		fail_pending(pending, PresentationAuthorityError::Unavailable);
 	}
@@ -392,7 +401,7 @@ impl PresentationCallbackDispatcher for PresentationCallbackRegistry {
 	async fn dispatch(
 		&self,
 		identity: Arc<PresentationIdentity>,
-		_invocation: omp_envd::exthost::control::ControlInvocationAuthority,
+		_invocation: ControlInvocationAuthority,
 		callback: PresentationCallback,
 	) -> Result<Value, PresentationAuthorityError> {
 		if identity.as_ref() != self.inner.identity.as_ref() {
@@ -418,16 +427,16 @@ impl PresentationCallbackDispatcher for PresentationCallbackRegistry {
 /// CONTROL-backed dispatcher which forwards callbacks to the exact live
 /// extension worker.
 pub struct ControlPresentationCallbackDispatcher {
-	target:     Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
-	dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
+	target:     Arc<ControlConnectionIdentity>,
+	dispatcher: Arc<dyn CallbackDispatcher>,
 }
 
 impl ControlPresentationCallbackDispatcher {
 	/// Binds an authenticated generation to the live supervisor dispatcher.
 	#[must_use]
 	pub fn new(
-		target: Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
-		dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
+		target: Arc<ControlConnectionIdentity>,
+		dispatcher: Arc<dyn CallbackDispatcher>,
 	) -> Self {
 		Self { target, dispatcher }
 	}
@@ -438,7 +447,7 @@ impl PresentationCallbackDispatcher for ControlPresentationCallbackDispatcher {
 	async fn dispatch(
 		&self,
 		identity: Arc<PresentationIdentity>,
-		invocation: omp_envd::exthost::control::ControlInvocationAuthority,
+		invocation: ControlInvocationAuthority,
 		callback: PresentationCallback,
 	) -> Result<Value, PresentationAuthorityError> {
 		if self.target.principal.id() != identity.principal.as_str()
@@ -454,22 +463,18 @@ impl PresentationCallbackDispatcher for ControlPresentationCallbackDispatcher {
 			value => serde_json::Map::from_iter([("value".to_owned(), value)]),
 		};
 		let timeout = match callback.kind {
-			PresentationCallbackKind::Completion => {
-				super::presentation_authority::COMPLETION_CALLBACK_DEADLINE
-			},
-			PresentationCallbackKind::Renderer => {
-				super::presentation_authority::RENDER_CALLBACK_DEADLINE
-			},
-			PresentationCallbackKind::Action => std::time::Duration::from_secs(365 * 24 * 60 * 60),
+			PresentationCallbackKind::Completion => COMPLETION_CALLBACK_DEADLINE,
+			PresentationCallbackKind::Renderer => RENDER_CALLBACK_DEADLINE,
+			PresentationCallbackKind::Action => time::Duration::from_secs(365 * 24 * 60 * 60),
 		};
 		self
 			.dispatcher
-			.dispatch(self.target.clone(), omp_envd::exthost::control::ControlDispatch {
+			.dispatch(self.target.clone(), ControlDispatch {
 				operation: callback.operation,
 				arguments,
 				authority: invocation,
-				policy: omp_envd::exthost::CallbackConcurrency::Serialized,
-				deadline: omp_envd::exthost::EventDeadline { at: std::time::Instant::now() + timeout },
+				policy: CallbackConcurrency::Serialized,
+				deadline: omp_envd::exthost::EventDeadline { at: Instant::now() + timeout },
 			})
 			.await
 			.map_err(|error| PresentationAuthorityError::Owner(Str::new(error.to_string())))

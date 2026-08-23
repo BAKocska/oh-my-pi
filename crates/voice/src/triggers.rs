@@ -4,7 +4,7 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 /// Automatic composer-submission policy for one completed utterance.
 #[derive(Clone, Copy, Debug, Default, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
-#[strum(serialize_all = "kebab-case", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 pub enum SubmitTrigger {
 	/// Insert dictation and remain in the editor.
 	#[default]

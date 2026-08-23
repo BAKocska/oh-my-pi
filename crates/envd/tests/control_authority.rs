@@ -1,5 +1,8 @@
+//! Proves configured CONTROL authority composition routes every owned operation
+//! namespace.
 use std::{
 	collections::BTreeSet,
+	path::PathBuf,
 	sync::{Arc, Mutex},
 };
 
@@ -7,11 +10,11 @@ use async_trait::async_trait;
 use omp_core::{Principal, Str, sf};
 use omp_envd::{
 	exthost::control::{
-		ControlAuthority, ControlConnectionIdentity, ControlEffect, ControlProtocolError,
-		ControlRequestContext, EnvdControlAuthorities, ExternalControlAuthorities,
-		FixedControlAuthorityFactory, HostControlAuthorityFactory, PersistenceControlAuthorities,
-		PolicyControlAuthorities, PresentationControlAuthorities, ProviderControlAuthorities,
-		RegistryControlAuthorities,
+		ControlAuthority, ControlAuthorityFactory, ControlConnectionIdentity, ControlEffect,
+		ControlProtocolError, ControlRequestContext, EnvdControlAuthorities,
+		ExternalControlAuthorities, FixedControlAuthorityFactory, HostControlAuthorityFactory,
+		PersistenceControlAuthorities, PolicyControlAuthorities, PresentationControlAuthorities,
+		ProviderControlAuthorities, RegistryControlAuthorities,
 	},
 	worker::{ExtHostConfig, ExtHostSupervisor},
 };
@@ -73,7 +76,7 @@ impl ControlAuthority for RecordingAuthority {
 fn factory(
 	name: &'static str,
 	calls: &Arc<Mutex<Vec<String>>>,
-) -> Arc<dyn omp_envd::exthost::control::ControlAuthorityFactory> {
+) -> Arc<dyn ControlAuthorityFactory> {
 	Arc::new(FixedControlAuthorityFactory::new(Arc::new(RecordingAuthority {
 		name,
 		calls: Arc::clone(calls),
@@ -130,7 +133,7 @@ async fn configured_composition_routes_every_owned_namespace() {
 		ExternalControlAuthorities::new(factory("agents", &calls), factory("mcp", &calls)),
 	));
 	let mut config = ExtHostConfig::new(
-		std::path::PathBuf::from("unused"),
+		PathBuf::from("unused"),
 		Principal::new(sf!("test"), sf!("Test")),
 		sf!("test-session"),
 		11,

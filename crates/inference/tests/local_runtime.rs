@@ -14,7 +14,8 @@ use std::{
 #[cfg(feature = "local-applefm")]
 use omp_inference::local::applefm::{AppleFm, AppleFmFeatureEvidence, AppleFmSupportState};
 use omp_inference::local::{
-	ArtifactSpec, ArtifactStore, LocalCancellation, LocalErrorKind, LocalRuntime, MemoryPool,
+	ArtifactSpec, ArtifactStore, LocalCancellation, LocalError, LocalErrorKind, LocalRuntime,
+	MemoryPool,
 };
 use sha2::{Digest, Sha256};
 
@@ -58,7 +59,7 @@ fn memory_reservations_and_failed_loads_release_capacity() {
 	assert_eq!(memory.used(), 0);
 
 	let runtime = LocalRuntime::<()>::new(
-		|| Err(omp_inference::local::LocalError::new(LocalErrorKind::Backend, "load failed")),
+		|| Err(LocalError::new(LocalErrorKind::Backend, "load failed")),
 		Arc::clone(&memory),
 		64,
 		1,
@@ -136,11 +137,9 @@ fn artifacts_require_confined_exact_size_and_digest() {
 
 	#[cfg(unix)]
 	{
-		std::os::unix::fs::symlink(
-			directory.path().join("model.bin"),
-			directory.path().join("link.bin"),
-		)
-		.unwrap();
+		use std::os::unix::fs;
+
+		fs::symlink(directory.path().join("model.bin"), directory.path().join("link.bin")).unwrap();
 		let symlink = store
 			.verify(
 				&ArtifactSpec {

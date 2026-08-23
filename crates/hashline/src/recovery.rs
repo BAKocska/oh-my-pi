@@ -1,7 +1,7 @@
 //! Conservative exact-byte recovery of edits authored against retained
 //! snapshots.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops};
 
 use bytes::Bytes;
 use similar::{Algorithm, DiffOp, capture_diff_slices};
@@ -450,7 +450,7 @@ fn validate_authored_edits(base_len: usize, edits: &[RecoveryEdit]) -> Result<()
 fn collect_edit_anchors(
 	lines: &[LineRecord<'_>],
 	edits: &[RecoveryEdit],
-) -> Result<Vec<std::ops::RangeInclusive<usize>>, RecoveryError> {
+) -> Result<Vec<ops::RangeInclusive<usize>>, RecoveryError> {
 	edits
 		.iter()
 		.map(|edit| {
@@ -527,7 +527,7 @@ fn raw_line_map(base: &[LineRecord<'_>], current: &[LineRecord<'_>]) -> BTreeMap
 fn validate_and_map_lines(
 	base: &[LineRecord<'_>],
 	current: &[LineRecord<'_>],
-	edit_anchors: &[std::ops::RangeInclusive<usize>],
+	edit_anchors: &[ops::RangeInclusive<usize>],
 ) -> Result<BTreeMap<usize, usize>, RecoveryError> {
 	let raw = raw_line_map(base, current);
 	let mut anchors = edit_anchors
@@ -651,7 +651,7 @@ fn map_position(
 }
 
 fn validate_mapped_edits(
-	mapped: &[(&RecoveryEdit, ByteRange, std::ops::RangeInclusive<usize>, LineRange)],
+	mapped: &[(&RecoveryEdit, ByteRange, ops::RangeInclusive<usize>, LineRange)],
 ) -> Result<(), RecoveryError> {
 	let mut previous: Option<ByteRange> = None;
 	for (_, range, ..) in mapped {

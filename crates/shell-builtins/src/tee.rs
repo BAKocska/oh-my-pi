@@ -11,6 +11,7 @@ use std::{
 	ffi::OsString,
 	fs::{File, OpenOptions},
 	io::{self, Error, ErrorKind, Read, Write},
+	path::Path,
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::PossibleValue};
@@ -157,7 +158,7 @@ fn copy(
 	}
 }
 
-fn open(name: &OsString, path: &std::path::Path, append: bool) -> io::Result<NamedWriter> {
+fn open(name: &OsString, path: &Path, append: bool) -> io::Result<NamedWriter> {
 	let mut options = OpenOptions::new();
 	if append {
 		options.append(true);
@@ -351,6 +352,7 @@ pub(crate) fn tee_builtin<SE: ShellExtensions>() -> Registration<SE> {
 mod tests {
 	use std::{
 		ffi::OsString,
+		fs,
 		io::{self, Read, Write},
 	};
 
@@ -396,7 +398,7 @@ mod tests {
 	#[test]
 	fn append_preserves_existing_contents() {
 		let cwd = tempfile::tempdir().unwrap();
-		std::fs::write(cwd.path().join("output"), "before").unwrap();
+		fs::write(cwd.path().join("output"), "before").unwrap();
 		let (code, capture) = run_util::<Tee>(&["-a", "output"], "after", cwd.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(std::fs::read(cwd.path().join("output")).unwrap(), b"beforeafter");

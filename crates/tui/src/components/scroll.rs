@@ -309,7 +309,7 @@ fn translated_intersection(source: Rect, x: i32, y: i32, clip: Rect) -> Option<R
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{components::Pre, test_support::frame_row_text};
+	use crate::{Ui, UiContext, components::Pre, test_support::frame_row_text};
 
 	#[test]
 	fn scroll_clamps_and_blits_from_scratch() {
@@ -402,10 +402,10 @@ mod tests {
 
 	#[test]
 	fn scrollbar_hit_zone_routes_through_ui_mouse_handling() {
-		let mut ui = crate::Ui::from_markup(
+		let mut ui = Ui::from_markup(
 			"<scroll h=4><pre>l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12</pre></scroll>",
 			10,
-			crate::UiContext::default(),
+			UiContext::default(),
 		)
 		.unwrap();
 		assert!(crate::test_support::frame_row_text(ui.frame(), 0).starts_with("l1"));

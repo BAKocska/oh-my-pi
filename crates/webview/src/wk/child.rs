@@ -14,8 +14,8 @@ use omp_core::Str;
 use raw_window_handle::RawWindowHandle;
 
 use super::{
-	ConfiguredPage, IpcHandler, NavDelegate, TitleObserver, check_main, configure_page,
-	install_observers, style_webview,
+	ConfiguredPage, IpcHandler, NavDelegate, TitleObserver, check_main, configure_page, eval,
+	initial_load, install_observers, load_html, navigate, style_webview,
 };
 use crate::{
 	error::{Error, Result},
@@ -88,20 +88,20 @@ impl WkView {
 		ns_view.addSubview(&webview);
 
 		let view = Self { webview, manager, _ipc: ipc, _nav: nav, _title: title };
-		super::initial_load(&view.webview, page)?;
+		initial_load(&view.webview, page)?;
 		Ok(view)
 	}
 
 	/// Navigate to `url`.
 	pub(crate) fn navigate(&self, url: &str) -> Result<()> {
 		check_main()?;
-		super::navigate(&self.webview, url)
+		navigate(&self.webview, url)
 	}
 
 	/// Replace the document with `html` (null origin).
 	pub(crate) fn load_html(&self, html: &str) -> Result<()> {
 		check_main()?;
-		super::load_html(&self.webview, html);
+		load_html(&self.webview, html);
 		Ok(())
 	}
 
@@ -110,7 +110,7 @@ impl WkView {
 	/// fragments allowed) on the main thread.
 	pub(crate) fn eval(&self, js: &str, reply: Option<Box<dyn FnOnce(Str) + Send>>) -> Result<()> {
 		check_main()?;
-		super::eval(&self.webview, js, reply);
+		eval(&self.webview, js, reply);
 		Ok(())
 	}
 

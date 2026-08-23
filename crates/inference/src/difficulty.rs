@@ -7,11 +7,15 @@ use std::{
 };
 
 use omp_core::{Str, sf};
+use omp_proto::omp::inference::v1::Effort;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use strum::IntoStaticStr;
+
+#[cfg(feature = "local-text")]
+use crate::local::{LocalCancellation, LocalResult, text::TextAdapter};
 
 const INPUT_LIMIT: usize = 16 * 1024;
 const MEMO_LIMIT: usize = 256;
@@ -78,8 +82,7 @@ impl Difficulty {
 	}
 
 	/// Converts this classifier rung to the canonical reasoning effort.
-	pub const fn effort(self) -> omp_proto::omp::inference::v1::Effort {
-		use omp_proto::omp::inference::v1::Effort;
+	pub const fn effort(self) -> Effort {
 		match self {
 			Self::Minimal => Effort::Minimal,
 			Self::Low => Effort::Low,
@@ -267,9 +270,9 @@ impl DifficultyClassifier {
 		&self,
 		input: &str,
 		auto: AutoDifficulty,
-		adapter: &crate::local::text::TextAdapter,
-		cancel: &crate::local::LocalCancellation,
-	) -> crate::local::LocalResult<DifficultyDecision> {
+		adapter: &TextAdapter,
+		cancel: &LocalCancellation,
+	) -> LocalResult<DifficultyDecision> {
 		use crate::local::text::{ChatMessage, ChatRole, ClassifierDecisionSource, ClassifierLadder};
 
 		let sanitized = sanitize_classifier_input(input);
@@ -443,6 +446,8 @@ fn memo_key(input: &Str, backend: DifficultyBackend, auto: AutoDifficulty) -> [u
 
 #[cfg(test)]
 mod tests {
+	use std::future;
+
 	use super::*;
 
 	#[test]
@@ -460,7 +465,7 @@ mod tests {
 		let decision = classifier
 			.classify_online("build it", AutoDifficulty::default(), |_| {
 				attempts += 1;
-				std::future::ready(if attempts == 1 {
+				future::ready(if attempts == 1 {
 					Err(OnlineDifficultyError::new("busy", true))
 				} else {
 					Ok(sf!("high after low"))

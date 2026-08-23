@@ -51,8 +51,9 @@ mod imp {
 		cell::OnceCell,
 		ffi::{OsStr, OsString},
 		fs::{self, FileType, Metadata},
-		io::Write,
+		io::{self, Write},
 		path::Path,
+		str,
 	};
 
 	use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
@@ -223,7 +224,7 @@ for details about the options it supports.";
 		left: bool,
 		width: usize,
 		precision: Precision,
-	) -> Result<(), std::io::Error> {
+	) -> Result<(), io::Error> {
 		let display_bytes = match precision {
 			Precision::Number(p) if p < bytes.len() => &bytes[..p],
 			_ => bytes,
@@ -253,7 +254,7 @@ for details about the options it supports.";
 	/// writer is genric to be any buffer like: `std::io::stdout`
 	/// n is the calculated padding size
 	#[cfg(unix)]
-	fn write_padding<W: Write>(writer: &mut W, n: usize) -> Result<(), std::io::Error> {
+	fn write_padding<W: Write>(writer: &mut W, n: usize) -> Result<(), io::Error> {
 		for _ in 0..n {
 			writer.write_all(b" ")?;
 		}
@@ -285,7 +286,7 @@ for details about the options it supports.";
 		Quote,
 	}
 
-	impl std::str::FromStr for QuotingStyle {
+	impl str::FromStr for QuotingStyle {
 		type Err = StatError;
 
 		fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -316,7 +317,7 @@ for details about the options it supports.";
 	trait ScanUtil {
 		fn scan_num<F>(&self) -> Option<(F, usize)>
 		where
-			F: std::str::FromStr;
+			F: str::FromStr;
 		fn scan_char(&self, radix: u32) -> Option<(char, usize)>;
 	}
 
@@ -327,7 +328,7 @@ for details about the options it supports.";
 		/// equals byte count
 		fn scan_num<F>(&self) -> Option<(F, usize)>
 		where
-			F: std::str::FromStr,
+			F: str::FromStr,
 		{
 			let mut chars = self.chars();
 			let count = chars
@@ -1819,7 +1820,9 @@ for details about the options it supports.";
 	#[cfg(unix)]
 	fn bsd_shell_line(meta: &Metadata, _resolved: &Path) -> String {
 		#[cfg(target_os = "macos")]
-		let flags = std::os::macos::fs::MetadataExt::st_flags(meta);
+		use std::os::macos::fs;
+		#[cfg(target_os = "macos")]
+		let flags = fs::MetadataExt::st_flags(meta);
 		#[cfg(not(target_os = "macos"))]
 		let flags = 0u32;
 		let birth =
@@ -2143,7 +2146,13 @@ for details about the options it supports.";
 	#[cfg(windows)]
 	mod win {
 		use std::{
-			ffi::OsStr, fs::Metadata, os::windows::fs::MetadataExt, path::Path, time::SystemTime,
+			ffi::OsStr,
+			fs::{self, Metadata, OpenOptions},
+			io, iter, mem,
+			os::windows::fs::MetadataExt,
+			path::Path,
+			ptr,
+			time::SystemTime,
 		};
 
 		/// `FILE_ATTRIBUTE_READONLY`.
@@ -2236,15 +2245,14 @@ for details about the options it supports.";
 			let wide: Vec<u16> = path
 				.as_os_str()
 				.encode_wide()
-				.chain(std::iter::once(0))
+				.chain(iter::once(0))
 				.collect();
 			let mut high: u32 = 0;
 			// SAFETY: `wide` is NUL-terminated and `high` is a valid `&mut u32`.
 			let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
 			// A low dword of INVALID_FILE_SIZE is ambiguous (a real 4 GiB-1 low
 			// word or an error); MSDN says to disambiguate via GetLastError.
-			if low == INVALID_FILE_SIZE
-				&& std::io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0
+			if low == INVALID_FILE_SIZE && io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0
 			{
 				return logical;
 			}
@@ -2278,14 +2286,14 @@ for details about the options it supports.";
 			if !follow_links {
 				flags |= FILE_FLAG_OPEN_REPARSE_POINT;
 			}
-			let file = std::fs::OpenOptions::new()
+			let file = OpenOptions::new()
 				.access_mode(0)
 				.custom_flags(flags)
 				.open(path)
 				.ok()?;
 			// SAFETY: zeroed BY_HANDLE_FILE_INFORMATION is a valid out
 			// buffer, and the handle stays open across the call.
-			let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
 			if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
 				return None;
 			}
@@ -2317,7 +2325,7 @@ for details about the options it supports.";
 			};
 
 			fn wide(s: &OsStr) -> Vec<u16> {
-				s.encode_wide().chain(std::iter::once(0)).collect()
+				s.encode_wide().chain(iter::once(0)).collect()
 			}
 
 			fn wide_to_string(buf: &[u16]) -> String {
@@ -2333,7 +2341,7 @@ for details about the options it supports.";
 			if unsafe { GetVolumePathNameW(file_wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) }
 				== 0
 			{
-				return Err(std::io::Error::last_os_error().to_string());
+				return Err(io::Error::last_os_error().to_string());
 			}
 
 			let mut fs_name = [0u16; 260];
@@ -2346,7 +2354,7 @@ for details about the options it supports.";
 			if unsafe {
 				GetVolumeInformationW(
 					root.as_ptr(),
-					std::ptr::null_mut(),
+					ptr::null_mut(),
 					0,
 					&mut serial,
 					&mut max_component,
@@ -2356,7 +2364,7 @@ for details about the options it supports.";
 				)
 			} == 0
 			{
-				return Err(std::io::Error::last_os_error().to_string());
+				return Err(io::Error::last_os_error().to_string());
 			}
 
 			let mut sectors_per_cluster: u32 = 0;
@@ -2375,7 +2383,7 @@ for details about the options it supports.";
 				)
 			} == 0
 			{
-				return Err(std::io::Error::last_os_error().to_string());
+				return Err(io::Error::last_os_error().to_string());
 			}
 
 			let cluster_size = u64::from(sectors_per_cluster) * u64::from(bytes_per_sector);
@@ -2691,9 +2699,10 @@ mod tests {
 
 	#[test]
 	fn dereference_switches_between_link_and_target() {
+		use std::{fs::write, os::unix::fs};
 		let (_dir, root) = canonical_tempdir();
-		fs::write(root.join("target"), b"abc").unwrap();
-		std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+		write(root.join("target"), b"abc").unwrap();
+		fs::symlink("target", root.join("link")).unwrap();
 
 		let (code, stdout, stderr) = run_in(root.clone(), vec!["-c", "%F", "link"]);
 		assert_eq!((code, stdout.as_str(), stderr.as_str()), (0, "symbolic link\n", ""));
@@ -2803,9 +2812,10 @@ mod tests {
 
 	#[test]
 	fn bsd_flag_cluster_follows_symlink_and_suppresses_newline() {
+		use std::{fs::write, os::unix::fs};
 		let (_dir, root) = canonical_tempdir();
-		fs::write(root.join("target"), b"abc").unwrap();
-		std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+		write(root.join("target"), b"abc").unwrap();
+		fs::symlink("target", root.join("link")).unwrap();
 
 		// `-Lnf`: BSD boolean flags clustered with `-f`; `-n` drops the
 		// trailing newline (mapped to --printf), `-L` follows the link.

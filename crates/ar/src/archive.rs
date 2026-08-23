@@ -3,8 +3,10 @@
 use std::{
 	cmp,
 	collections::{BTreeMap, HashMap, hash_map::Entry as MapEntry},
-	fs::File,
+	fs::{self, File},
+	io,
 	io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
+	iter,
 	path::{Path, PathBuf},
 };
 
@@ -471,7 +473,7 @@ impl<R: Read + Seek> Archive<R> {
 	/// directories.
 	pub fn entries(
 		&self,
-	) -> impl DoubleEndedIterator<Item = &Entry> + ExactSizeIterator + std::iter::FusedIterator {
+	) -> impl DoubleEndedIterator<Item = &Entry> + ExactSizeIterator + iter::FusedIterator {
 		self.entries.iter()
 	}
 
@@ -623,10 +625,14 @@ impl<R: Read + Seek> Archive<R> {
 				use std::os::unix::fs::PermissionsExt;
 				let permissions = mode & 0o777;
 				if permissions != 0 {
-					destination.set_permissions(
-						Path::new(path.as_str()),
-						cap_std::fs::Permissions::from_std(std::fs::Permissions::from_mode(permissions)),
-					)?;
+					let permissions = fs::Permissions::from_mode(permissions);
+					{
+						use cap_std::fs;
+						destination.set_permissions(
+							Path::new(path.as_str()),
+							fs::Permissions::from_std(permissions),
+						)?;
+					}
 				}
 			}
 			written += 1;
@@ -1046,7 +1052,7 @@ fn copy_source_range<W: Write>(
 	output: &mut W,
 ) -> Result<u64> {
 	source.seek(SeekFrom::Start(data_offset))?;
-	let copied = std::io::copy(&mut source.take(stored_size), output)?;
+	let copied = io::copy(&mut source.take(stored_size), output)?;
 	if copied != stored_size {
 		return Err(Error::InvalidArchive("truncated member data"));
 	}

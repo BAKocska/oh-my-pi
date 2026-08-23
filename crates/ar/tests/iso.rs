@@ -4,6 +4,7 @@ mod support;
 
 use std::{
 	cell::Cell,
+	io,
 	io::{Cursor, Read, Seek, SeekFrom},
 	rc::Rc,
 };
@@ -334,7 +335,7 @@ struct TrackingReader {
 }
 
 impl Read for TrackingReader {
-	fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+	fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
 		let start = self.inner.position();
 		let requested_end = start.saturating_add(buffer.len() as u64);
 		if start < self.tracked_end && requested_end > self.tracked_start {
@@ -345,7 +346,7 @@ impl Read for TrackingReader {
 }
 
 impl Seek for TrackingReader {
-	fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+	fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
 		self.inner.seek(position)
 	}
 }

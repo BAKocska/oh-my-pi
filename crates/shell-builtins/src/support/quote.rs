@@ -6,8 +6,9 @@ use std::{
 	borrow::Cow,
 	env,
 	ffi::{OsStr, OsString},
-	fmt::{self, Write as _},
+	fmt::{self, Display, Write as _},
 	path::Path,
+	str,
 };
 
 /// A lazily formatted, shell-safe string.
@@ -58,12 +59,12 @@ where
 	}
 }
 
-impl fmt::Display for Quoted<'_> {
+impl Display for Quoted<'_> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		#[cfg(unix)]
 		{
 			let bytes = self.text.as_bytes();
-			match std::str::from_utf8(bytes) {
+			match str::from_utf8(bytes) {
 				Ok(text) => write_shell_diagnostic(formatter, text, self.force_quote),
 				Err(_) => write_ansi_c_escaped(formatter, bytes),
 			}
@@ -250,7 +251,7 @@ impl<'a> Iterator for Utf8Chunks<'a> {
 		if self.remaining.is_empty() {
 			return None;
 		}
-		match std::str::from_utf8(self.remaining) {
+		match str::from_utf8(self.remaining) {
 			Ok(text) => {
 				self.remaining = &[];
 				Some(Ok(text))
@@ -263,7 +264,7 @@ impl<'a> Iterator for Utf8Chunks<'a> {
 			Err(error) => {
 				let (valid, remaining) = self.remaining.split_at(error.valid_up_to());
 				self.remaining = remaining;
-				Some(Ok(std::str::from_utf8(valid).expect("prefix was validated")))
+				Some(Ok(str::from_utf8(valid).expect("prefix was validated")))
 			},
 		}
 	}
@@ -337,7 +338,7 @@ impl QuotingStyle {
 	}
 }
 
-impl fmt::Display for QuotingStyle {
+impl Display for QuotingStyle {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match *self {
 			Self::Shell { escape, always_quote, show_control } => {

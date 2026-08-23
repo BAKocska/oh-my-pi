@@ -2,14 +2,18 @@
 //! version.
 
 use std::{
-	fs,
+	env, fs,
 	io::{self, IsTerminal as _},
 	path::Path,
 	sync::LazyLock,
+	thread,
 	time::{Duration, Instant},
 };
 
 use omp_core::Str;
+use parking_lot::Mutex;
+
+use crate::update_cmd;
 
 const NOTICE_VERSION_FILE: &str = "startup-notice-version";
 const MAX_CHANGELOG_BYTES: usize = 64 * 1024;
@@ -21,8 +25,8 @@ struct StartupWatchdog {
 	started: Instant,
 }
 
-static STARTUP_WATCHDOG: LazyLock<parking_lot::Mutex<Option<StartupWatchdog>>> =
-	LazyLock::new(|| parking_lot::Mutex::new(None));
+static STARTUP_WATCHDOG: LazyLock<Mutex<Option<StartupWatchdog>>> =
+	LazyLock::new(|| Mutex::new(None));
 
 /// Arms the process startup watchdog until CLI dispatch hands control to a
 /// mode owner.
@@ -33,7 +37,7 @@ pub fn start_watchdog() {
 	}
 	let started = Instant::now();
 	let (stop, stopped) = flume::bounded::<()>(1);
-	std::thread::Builder::new()
+	thread::Builder::new()
 		.name("omp-startup-watchdog".to_owned())
 		.spawn(move || {
 			while stopped.recv_timeout(WATCHDOG_INTERVAL).is_err() {
@@ -55,7 +59,7 @@ pub fn stop_watchdog() {
 		return;
 	};
 	let _ = watchdog.stop.send(());
-	if std::env::var_os("OMP_TIMING").is_some() {
+	if env::var_os("OMP_TIMING").is_some() {
 		eprintln!("OMP_TIMING startup_dispatch_ms={}", watchdog.started.elapsed().as_millis());
 	}
 }
@@ -106,15 +110,15 @@ pub fn show_once(
 	thinking: Option<&str>,
 	eligibility: Eligibility,
 ) -> io::Result<()> {
-	if !eligibility.allows(std::io::stderr().is_terminal()) {
+	if !eligibility.allows(io::stderr().is_terminal()) {
 		return Ok(());
 	}
 	if omp_driver::settings::current(data_dir)
 		.ok()
 		.is_some_and(|settings| settings.updates.check_on_startup)
 	{
-		std::thread::spawn(|| {
-			if let Some(version) = crate::update_cmd::startup_available() {
+		thread::spawn(|| {
+			if let Some(version) = update_cmd::startup_available() {
 				eprintln!("OMP {version} is available; run `omp update`");
 			}
 		});
@@ -151,7 +155,7 @@ fn unseen_releases<'a>(changelog: &'a str, seen_version: Option<&str>) -> Vec<Re
 	let changelog = &changelog[..changelog.len().min(MAX_CHANGELOG_BYTES)];
 	let mut releases = Vec::with_capacity(MAX_UNSEEN_RELEASES);
 	let mut current: Option<(&str, usize)> = None;
-	for (offset, line) in changelog.match_indices('\n') {
+	for (offset, _) in changelog.match_indices('\n') {
 		let line_start = offset + 1;
 		let rest = &changelog[line_start..];
 		let Some(line_end) = rest.find('\n') else {

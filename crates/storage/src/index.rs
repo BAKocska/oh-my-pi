@@ -5,14 +5,25 @@
 //! through SQLite's transaction-serialized WAL writer path. Foreign and legacy
 //! journals enter through the explicitly named [`SessionIndex::repair`] API.
 
-use std::{collections::BTreeMap, fmt, path::Path, str::FromStr, time::Duration};
+use std::{
+	collections::BTreeMap,
+	error,
+	fmt::{self, Display},
+	path::Path,
+	str::FromStr,
+	time::Duration,
+};
 
 use omp_core::Str;
-use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1 as pb,
+	prost::Message as _,
+	thread::v1::{self as thread_pb, item},
+};
 use parking_lot::Mutex;
 use rusqlite::{
 	Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
-	params_from_iter, types::Value,
+	params_from_iter, types, types::Value,
 };
 use smallvec::SmallVec;
 use strum::{Display, EnumString, IntoStaticStr};
@@ -288,7 +299,7 @@ pub enum IndexedWriteError<T, E> {
 	},
 }
 
-impl<T, E: fmt::Display> fmt::Display for IndexedWriteError<T, E> {
+impl<T, E: Display> Display for IndexedWriteError<T, E> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::IndexBeforeJournal(error) => {
@@ -302,12 +313,12 @@ impl<T, E: fmt::Display> fmt::Display for IndexedWriteError<T, E> {
 	}
 }
 
-impl<T, E> std::error::Error for IndexedWriteError<T, E>
+impl<T, E> error::Error for IndexedWriteError<T, E>
 where
 	T: fmt::Debug,
-	E: std::error::Error + 'static,
+	E: error::Error + 'static,
 {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		match self {
 			Self::IndexBeforeJournal(error) => Some(error),
 			Self::Journal(error) => Some(error),
@@ -1493,7 +1504,7 @@ fn insert_item_outcome(
 	let mut tool_results = 0_u8;
 	let mut tool_errors = 0_u8;
 	match item.kind.as_ref() {
-		Some(thread_pb::item::Kind::Message(message)) => {
+		Some(item::Kind::Message(message)) => {
 			match thread_pb::Role::try_from(message.role).unwrap_or(thread_pb::Role::Unspecified) {
 				thread_pb::Role::User => user_messages = 1,
 				thread_pb::Role::Assistant => assistant_messages = 1,
@@ -1501,8 +1512,8 @@ fn insert_item_outcome(
 				thread_pb::Role::Unspecified => {},
 			}
 		},
-		Some(thread_pb::item::Kind::ToolCall(_)) => tool_calls = 1,
-		Some(thread_pb::item::Kind::ToolResult(result)) => {
+		Some(item::Kind::ToolCall(_)) => tool_calls = 1,
+		Some(item::Kind::ToolResult(result)) => {
 			tool_results = 1;
 			tool_errors = u8::from(result.is_error);
 		},
@@ -1599,7 +1610,7 @@ fn decode_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
 			TitleSource::from_str(&value).map_err(|_| {
 				rusqlite::Error::FromSqlConversionFailure(
 					2,
-					rusqlite::types::Type::Text,
+					types::Type::Text,
 					Box::new(Error::UnknownVocabulary {
 						field: "title_source",
 						value: Str::from(value),
@@ -1611,14 +1622,14 @@ fn decode_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
 	let status = SessionStatus::from_str(&status_text).map_err(|_| {
 		rusqlite::Error::FromSqlConversionFailure(
 			7,
-			rusqlite::types::Type::Text,
+			types::Type::Text,
 			Box::new(Error::UnknownVocabulary { field: "status", value: Str::from(status_text) }),
 		)
 	})?;
 	let kind = SessionKind::from_str(&kind_text).map_err(|_| {
 		rusqlite::Error::FromSqlConversionFailure(
 			8,
-			rusqlite::types::Type::Text,
+			types::Type::Text,
 			Box::new(Error::UnknownVocabulary { field: "kind", value: Str::from(kind_text) }),
 		)
 	})?;

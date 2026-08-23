@@ -2,9 +2,10 @@
 
 use std::{
 	collections::BTreeMap,
-	fs,
+	env, ffi, fs,
 	path::{Path, PathBuf},
 	sync::Arc,
+	time,
 };
 
 use omp_agent::advisor::{
@@ -214,7 +215,7 @@ impl AdvisorConfigSnapshot {
 /// Files are applied user-first and then project ancestor-to-leaf. Duplicate
 /// advisor slugs therefore resolve to the closest project declaration.
 pub fn discover(cwd: &Path, agent_dir: Option<&Path>) -> AdvisorConfigSnapshot {
-	let home = std::env::var_os("HOME").map_or_else(|| cwd.to_path_buf(), PathBuf::from);
+	let home = env::var_os("HOME").map_or_else(|| cwd.to_path_buf(), PathBuf::from);
 	let agent_dir = agent_dir.map_or_else(|| user_config_root(&home), Path::to_path_buf);
 	let (candidates, mut diagnostics) = collect_candidates(cwd, &agent_dir, &home);
 	let mut rules = Vec::<WatchdogRuleSet>::new();
@@ -229,7 +230,7 @@ pub fn discover(cwd: &Path, agent_dir: Option<&Path>) -> AdvisorConfigSnapshot {
 				continue;
 			},
 		};
-		match candidate.path.extension().and_then(std::ffi::OsStr::to_str) {
+		match candidate.path.extension().and_then(ffi::OsStr::to_str) {
 			Some("md") => match expand_at_paths(&candidate.path) {
 				Ok(expanded) => {
 					attention.push(Str::from(format!(
@@ -344,7 +345,7 @@ fn collect_candidates(
 	for (directory, depth) in levels.into_iter().rev() {
 		let hidden_owner = directory
 			.file_name()
-			.and_then(std::ffi::OsStr::to_str)
+			.and_then(ffi::OsStr::to_str)
 			.is_some_and(|name| name.starts_with('.'));
 		for filename in WATCHDOG_FILENAMES {
 			let native = directory.join(".omp").join(filename);
@@ -439,8 +440,8 @@ impl AdvisorProviderSessions {
 }
 
 fn uuid_v7() -> Str {
-	let timestamp = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	let timestamp = time::SystemTime::now()
+		.duration_since(time::UNIX_EPOCH)
 		.map_or(0, |duration| duration.as_millis() as u64);
 	let mut bytes = rand::rng().random::<[u8; 16]>();
 	let stamp = timestamp.to_be_bytes();

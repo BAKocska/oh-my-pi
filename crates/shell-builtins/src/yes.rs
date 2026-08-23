@@ -3,6 +3,7 @@
 //! Ported from uutils coreutils 0.8.0.
 
 use std::{
+	cmp,
 	ffi::OsString,
 	io::{self, Write},
 };
@@ -124,7 +125,7 @@ fn prepare_buffer(buffer: &mut Vec<u8>) {
 	let target_size = line_len * (BUF_SIZE / line_len);
 
 	while buffer.len() < target_size {
-		let to_copy = std::cmp::min(target_size - buffer.len(), buffer.len());
+		let to_copy = cmp::min(target_size - buffer.len(), buffer.len());
 		debug_assert_eq!(to_copy % line_len, 0);
 		buffer.extend_from_within(..to_copy);
 	}
@@ -167,14 +168,20 @@ pub(crate) fn yes_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)]
+	use std::os::fd;
 	use std::{
 		io::{self, Read, Write},
+		iter,
 		path::Path,
 		sync::Arc,
 	};
 
 	use clap::Parser;
-	use omp_shell_engine::openfiles::{OpenFile, Stream};
+	use omp_shell_engine::{
+		error,
+		openfiles::{OpenFile, Stream},
+	};
 	use parking_lot::Mutex;
 
 	use super::*;
@@ -220,13 +227,13 @@ mod tests {
 		}
 
 		#[cfg(unix)]
-		fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, omp_shell_engine::Error> {
-			Err(omp_shell_engine::error::ErrorKind::CannotConvertToNativeFd.into())
+		fn try_clone_to_owned(&self) -> Result<fd::OwnedFd, omp_shell_engine::Error> {
+			Err(error::ErrorKind::CannotConvertToNativeFd.into())
 		}
 
 		#[cfg(unix)]
-		fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, omp_shell_engine::Error> {
-			Err(omp_shell_engine::error::ErrorKind::CannotConvertToNativeFd.into())
+		fn try_borrow_as_fd(&self) -> Result<fd::BorrowedFd<'_>, omp_shell_engine::Error> {
+			Err(error::ErrorKind::CannotConvertToNativeFd.into())
 		}
 	}
 
@@ -235,7 +242,7 @@ mod tests {
 		budget: usize,
 		fail_kind: io::ErrorKind,
 	) -> (i32, String, String) {
-		let argv: Vec<OsString> = std::iter::once("yes")
+		let argv: Vec<OsString> = iter::once("yes")
 			.chain(arguments.iter().copied())
 			.map(OsString::from)
 			.collect();
@@ -362,7 +369,7 @@ mod tests {
 		];
 
 		for (line, final_len) in tests {
-			let mut buffer = std::iter::repeat_n(b'a', line).collect::<Vec<_>>();
+			let mut buffer = iter::repeat_n(b'a', line).collect::<Vec<_>>();
 			prepare_buffer(&mut buffer);
 			assert_eq!(buffer.len(), final_len);
 		}

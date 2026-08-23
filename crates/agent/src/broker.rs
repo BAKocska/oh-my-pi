@@ -2,7 +2,7 @@
 
 use std::{
 	collections::{HashMap, VecDeque},
-	fs,
+	ffi, fs, io,
 	io::{BufRead as _, Read as _},
 	path::{Path, PathBuf},
 	sync::{
@@ -17,8 +17,12 @@ use omp_proto::thread::v1::{Item, Message as ThreadMessage, Part, Role, item, pa
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use thiserror::Error;
+use tokio::sync::{Notify, broadcast, watch, watch::Receiver};
 
-use crate::{AgentKind, AgentNode, Interrupt, InterruptClass, InterruptSource, MailboxSender};
+use crate::{
+	AgentKind, AgentNode, Interrupt, InterruptClass, InterruptSource, MailboxSender,
+	SubagentDisposition, SubagentTerminalStatus, prompt_assets::render_parent_irc,
+};
 
 const MAILBOX_CAPACITY: usize = 100;
 const ACTIVITY_MAX_CHARS: usize = 80;
@@ -120,7 +124,7 @@ pub struct AgentHistory {
 	pub branch:        Option<Str>,
 	/// Historical terminal outcome; cancellation and failure never destroy
 	/// identity.
-	pub terminal:      Option<crate::SubagentTerminalStatus>,
+	pub terminal:      Option<SubagentTerminalStatus>,
 }
 
 /// Clone-cheap process-global roster projection.
@@ -235,7 +239,7 @@ pub enum RegistryError {
 	QueryMultiple,
 	/// A transcript or artifact could not be read.
 	#[error("agent resource I/O failed: {0}")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 }
 
 struct RegistryEntry {
@@ -247,7 +251,7 @@ struct RegistryEntry {
 struct RegistryInner {
 	records:     Mutex<HashMap<Str, RegistryEntry>>,
 	diagnostics: Mutex<VecDeque<DiscoveryDiagnostic>>,
-	generation:  tokio::sync::watch::Sender<u64>,
+	generation:  watch::Sender<u64>,
 }
 
 /// Process-global CAS registry for live, parked, and disk-recovered agents.
@@ -272,7 +276,7 @@ impl AgentRegistry {
 	/// Creates an independent registry, primarily for an isolated daemon or
 	/// test.
 	pub fn new() -> Self {
-		let (generation, _) = tokio::sync::watch::channel(0_u64);
+		let (generation, _) = watch::channel(0_u64);
 		Self {
 			inner: Arc::new(RegistryInner {
 				records: Mutex::new(HashMap::new()),
@@ -284,7 +288,7 @@ impl AgentRegistry {
 
 	/// Subscribes to every registration, lifecycle, activity, and history
 	/// change.
-	pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+	pub fn subscribe(&self) -> Receiver<u64> {
 		self.inner.generation.subscribe()
 	}
 
@@ -469,7 +473,7 @@ impl AgentRegistry {
 	pub fn set_terminal(
 		&self,
 		id: &str,
-		terminal: crate::SubagentTerminalStatus,
+		terminal: SubagentTerminalStatus,
 	) -> Result<u64, RegistryError> {
 		self.update(id, None, |record| {
 			record.history.terminal = Some(terminal.bounded());
@@ -511,7 +515,7 @@ impl AgentRegistry {
 		let mut imported = 0;
 		for entry in fs::read_dir(directory)? {
 			let path = entry?.path();
-			if path.extension().and_then(std::ffi::OsStr::to_str) != Some("jsonl") {
+			if path.extension().and_then(ffi::OsStr::to_str) != Some("jsonl") {
 				continue;
 			}
 			match cold_record(&path)? {
@@ -763,7 +767,7 @@ struct InboxState {
 	queue:       Mutex<VecDeque<PeerMessage>>,
 	waiter:      Mutex<Option<WaitFilter>>,
 	next_waiter: AtomicU64,
-	notify:      tokio::sync::Notify,
+	notify:      Notify,
 }
 
 impl InboxState {
@@ -906,8 +910,8 @@ struct BrokerInner {
 	project:    Str,
 	nodes:      Mutex<HashMap<Str, RegisteredNode>>,
 	deliveries: Mutex<DeliveryCache>,
-	events:     tokio::sync::broadcast::Sender<RoutedEvent>,
-	generation: tokio::sync::watch::Sender<u64>,
+	events:     broadcast::Sender<RoutedEvent>,
+	generation: watch::Sender<u64>,
 	registry:   AgentRegistry,
 }
 
@@ -925,8 +929,8 @@ impl Broker {
 
 	/// Creates a broker with an explicit registry.
 	pub fn with_registry(project: Str, registry: AgentRegistry) -> Self {
-		let (generation, _) = tokio::sync::watch::channel(0_u64);
-		let (events, _) = tokio::sync::broadcast::channel(MAILBOX_CAPACITY);
+		let (generation, _) = watch::channel(0_u64);
+		let (events, _) = broadcast::channel(MAILBOX_CAPACITY);
 		Self {
 			inner: Arc::new(BrokerInner {
 				project,
@@ -942,11 +946,6 @@ impl Broker {
 	/// Returns the registry shared with URL resolvers and roster projections.
 	pub fn registry(&self) -> &AgentRegistry {
 		&self.inner.registry
-	}
-
-	/// Subscribes to message-id-bearing delivery events.
-	pub fn subscribe_routes(&self) -> tokio::sync::broadcast::Receiver<RoutedEvent> {
-		self.inner.events.subscribe()
 	}
 
 	/// Registers a messageable live node and returns its bounded inbox.
@@ -1281,6 +1280,19 @@ impl Broker {
 	}
 }
 
+mod route_subscription {
+	use tokio::sync::broadcast::Receiver;
+
+	use super::{Broker, RoutedEvent};
+
+	impl Broker {
+		/// Subscribes to message-id-bearing delivery events.
+		pub fn subscribe_routes(&self) -> Receiver<RoutedEvent> {
+			self.inner.events.subscribe()
+		}
+	}
+}
+
 /// Why a blocking wait ended without a matching message.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum WaitError {
@@ -1300,8 +1312,8 @@ pub struct BrokerInbox {
 	owner:     Str,
 	state:     Arc<InboxState>,
 	broker:    Weak<BrokerInner>,
-	roster:    tokio::sync::watch::Receiver<u64>,
-	lifecycle: tokio::sync::watch::Receiver<u64>,
+	roster:    Receiver<u64>,
+	lifecycle: Receiver<u64>,
 }
 
 impl BrokerInbox {
@@ -1326,11 +1338,12 @@ impl BrokerInbox {
 		reply_to: Option<&str>,
 		timeout: Option<Duration>,
 	) -> Result<Option<PeerMessage>, WaitError> {
+		use tokio::time::{self, Instant};
 		if let Some(message) = self.state.matching(sender, reply_to) {
 			return Ok(Some(message));
 		}
 		let _registration = self.state.register_waiter(sender, reply_to);
-		let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
+		let deadline = timeout.map(|duration| Instant::now() + duration);
 		loop {
 			let notified = self.state.notify.notified();
 			if let Some(message) = self.state.matching(sender, reply_to) {
@@ -1353,7 +1366,7 @@ impl BrokerInbox {
 							return Err(WaitError::BrokerGone);
 						}
 					},
-					() = tokio::time::sleep_until(deadline) => return Err(WaitError::Timeout),
+					() = time::sleep_until(deadline) => return Err(WaitError::Timeout),
 				}
 			} else {
 				tokio::select! {
@@ -1451,7 +1464,7 @@ const fn class(mode: DeliveryMode) -> InterruptClass {
 /// Encodes a peer message as the canonical thread item journaled by the loop.
 pub fn peer_item(message: &PeerMessage) -> Item {
 	let mut text = String::new();
-	crate::prompt_assets::render_parent_irc(&mut text, message.from.as_str(), message.text.as_str());
+	render_parent_irc(&mut text, message.from.as_str(), message.text.as_str());
 	Item {
 		seq:           0,
 		created_at_ms: message.sent_ms,
@@ -1498,7 +1511,7 @@ fn cold_record(path: &Path) -> Result<ColdScan, RegistryError> {
 
 	let file = fs::File::open(path)?;
 	let mut reader =
-		std::io::BufReader::new(file).take(u64::try_from(PREFIX_MAX_BYTES).unwrap_or(u64::MAX));
+		io::BufReader::new(file).take(u64::try_from(PREFIX_MAX_BYTES).unwrap_or(u64::MAX));
 	let mut line = String::new();
 	if reader.read_line(&mut line)? == 0 {
 		return Ok(ColdScan::Skipped(DiscoveryDiagnosticKind::Incomplete));
@@ -1583,10 +1596,10 @@ fn cold_record(path: &Path) -> Result<ColdScan, RegistryError> {
 					.as_deref()
 					.and_then(|status| status.parse().ok())
 				{
-					history.terminal = Some(crate::SubagentTerminalStatus {
+					history.terminal = Some(SubagentTerminalStatus {
 						kind,
 						summary: lifecycle.terminal_status.unwrap_or_default(),
-						disposition: crate::SubagentDisposition::default(),
+						disposition: SubagentDisposition::default(),
 					});
 				}
 			},
@@ -1603,7 +1616,7 @@ fn cold_record(path: &Path) -> Result<ColdScan, RegistryError> {
 	let id = header.id.0.clone();
 	let name = path
 		.file_stem()
-		.and_then(std::ffi::OsStr::to_str)
+		.and_then(ffi::OsStr::to_str)
 		.map_or_else(|| id.clone(), Str::new);
 	let name = display_name.unwrap_or(name);
 	Ok(ColdScan::Record(AgentRecord {

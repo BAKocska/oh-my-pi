@@ -1,10 +1,16 @@
 //! Process management
 
-use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+#[cfg(windows)]
+use std::ptr;
+use std::{future, io, io::Write, pin, process};
 
 use futures::FutureExt;
+#[cfg(unix)]
+use nix::sys::signal;
+#[cfg(unix)]
+use nix::{errno::Errno, unistd::Pid};
 use tokio_util::sync::CancellationToken;
 
 use crate::{error, openfiles::OpenFile, sys};
@@ -39,36 +45,33 @@ pub enum ProcessSignal {
 /// Process groups are the cancellation ownership boundary used by embedders.
 /// A missing group is treated as already stopped.
 #[cfg(unix)]
-pub fn signal_process_group(pgid: i32, signal: ProcessSignal) -> Result<(), std::io::Error> {
+pub fn signal_process_group(pgid: i32, signal: ProcessSignal) -> Result<(), io::Error> {
 	if pgid <= 0 {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::InvalidInput,
-			"process-group id must be positive",
-		));
+		return Err(io::Error::new(io::ErrorKind::InvalidInput, "process-group id must be positive"));
 	}
 	let signal = match signal {
-		ProcessSignal::Hangup => nix::sys::signal::Signal::SIGHUP,
-		ProcessSignal::Interrupt => nix::sys::signal::Signal::SIGINT,
-		ProcessSignal::Quit => nix::sys::signal::Signal::SIGQUIT,
-		ProcessSignal::Terminate => nix::sys::signal::Signal::SIGTERM,
-		ProcessSignal::Kill => nix::sys::signal::Signal::SIGKILL,
-		ProcessSignal::User1 => nix::sys::signal::Signal::SIGUSR1,
-		ProcessSignal::User2 => nix::sys::signal::Signal::SIGUSR2,
-		ProcessSignal::Continue => nix::sys::signal::Signal::SIGCONT,
-		ProcessSignal::Stop => nix::sys::signal::Signal::SIGSTOP,
-		ProcessSignal::WindowChanged => nix::sys::signal::Signal::SIGWINCH,
+		ProcessSignal::Hangup => signal::Signal::SIGHUP,
+		ProcessSignal::Interrupt => signal::Signal::SIGINT,
+		ProcessSignal::Quit => signal::Signal::SIGQUIT,
+		ProcessSignal::Terminate => signal::Signal::SIGTERM,
+		ProcessSignal::Kill => signal::Signal::SIGKILL,
+		ProcessSignal::User1 => signal::Signal::SIGUSR1,
+		ProcessSignal::User2 => signal::Signal::SIGUSR2,
+		ProcessSignal::Continue => signal::Signal::SIGCONT,
+		ProcessSignal::Stop => signal::Signal::SIGSTOP,
+		ProcessSignal::WindowChanged => signal::Signal::SIGWINCH,
 	};
-	match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pgid), signal) {
-		Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-		Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+	match signal::kill(Pid::from_raw(-pgid), signal) {
+		Ok(()) | Err(Errno::ESRCH) => Ok(()),
+		Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
 	}
 }
 
 /// Sends `signal` to a process when process groups are unavailable.
 #[cfg(not(unix))]
-pub fn signal_process_group(_pgid: i32, _signal: ProcessSignal) -> Result<(), std::io::Error> {
-	Err(std::io::Error::new(
-		std::io::ErrorKind::Unsupported,
+pub fn signal_process_group(_pgid: i32, _signal: ProcessSignal) -> Result<(), io::Error> {
+	Err(io::Error::new(
+		io::ErrorKind::Unsupported,
 		"process-group signalling is unsupported on this platform",
 	))
 }
@@ -81,9 +84,8 @@ struct CompletionMarker {
 
 /// A waitable future that will yield the results of a child process's
 /// execution.
-pub(crate) type WaitableChildProcess = std::pin::Pin<
-	Box<dyn futures::Future<Output = Result<std::process::Output, std::io::Error>> + Send + Sync>,
->;
+pub(crate) type WaitableChildProcess =
+	pin::Pin<Box<dyn futures::Future<Output = Result<process::Output, io::Error>> + Send + Sync>>;
 
 /// Tracks a child process being awaited.
 pub struct ChildProcess {
@@ -190,7 +192,7 @@ impl ChildProcess {
 		let cancelled = async {
 			match &cancel_token {
 				Some(token) => token.cancelled().await,
-				None => std::future::pending().await,
+				None => future::pending().await,
 			}
 		};
 		tokio::pin!(cancelled);
@@ -238,10 +240,7 @@ impl ChildProcess {
 		#[cfg(unix)]
 		{
 			let Some(pid) = self.pid else { return };
-			let _ = nix::sys::signal::kill(
-				nix::unistd::Pid::from_raw(pid),
-				nix::sys::signal::Signal::SIGKILL,
-			);
+			let _ = signal::kill(Pid::from_raw(pid), signal::Signal::SIGKILL);
 		}
 
 		#[cfg(windows)]
@@ -269,7 +268,7 @@ impl ChildProcess {
 		}
 	}
 
-	pub(crate) fn poll(&mut self) -> Option<Result<std::process::Output, error::Error>> {
+	pub(crate) fn poll(&mut self) -> Option<Result<process::Output, error::Error>> {
 		let result = self.exec_future.as_mut().now_or_never()?;
 		Some(match result {
 			Ok(output) => {
@@ -301,7 +300,7 @@ fn duplicate_handle(handle: RawHandle) -> Option<OwnedHandle> {
 	// SAFETY: GetCurrentProcess returns a pseudo-handle for the current process
 	// and has no preconditions.
 	let current = unsafe { GetCurrentProcess() };
-	let mut out_handle = std::ptr::null_mut();
+	let mut out_handle = ptr::null_mut();
 	// SAFETY: `current` is a valid current-process pseudo-handle, `handle` is
 	// an OS process handle owned by Tokio's child process object, and
 	// `out_handle` is a valid out pointer checked below before ownership is
@@ -369,7 +368,7 @@ fn terminate_process_id(pid: sys::process::ProcessId) -> bool {
 	terminated
 }
 
-fn completion_exit_code(status: &std::process::ExitStatus) -> i32 {
+fn completion_exit_code(status: &process::ExitStatus) -> i32 {
 	if let Some(code) = status.code() {
 		return code;
 	}
@@ -388,7 +387,7 @@ fn completion_exit_code(status: &std::process::ExitStatus) -> i32 {
 /// Represents the result of waiting for an executing process.
 pub enum ProcessWaitResult {
 	/// The process completed.
-	Completed(std::process::Output),
+	Completed(process::Output),
 	/// The process stopped and has not yet completed.
 	Stopped,
 	/// The process was killed due to cancellation.

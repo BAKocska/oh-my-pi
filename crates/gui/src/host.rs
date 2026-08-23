@@ -25,8 +25,10 @@
 //! | ⌘Q | quit |
 
 use std::{
+	env,
 	ops::Range,
 	sync::Arc,
+	thread,
 	time::{Duration, Instant},
 };
 
@@ -42,9 +44,11 @@ use winit::{
 	event::{ElementState, Ime, KeyEvent, MouseScrollDelta, WindowEvent},
 	event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
 	keyboard::{KeyCode, ModifiersState, PhysicalKey},
-	window::{CursorIcon, Window, WindowId},
+	window::{self, CursorIcon, Window, WindowId},
 };
 
+#[cfg(target_os = "macos")]
+use crate::macos::polish;
 use crate::{
 	cells::{CellMetrics, Compositor, Selection, View},
 	fonts::Fonts,
@@ -97,7 +101,7 @@ pub struct HostConfig {
 
 impl Default for HostConfig {
 	fn default() -> Self {
-		let opacity = std::env::var("OMP_GUI_OPACITY")
+		let opacity = env::var("OMP_GUI_OPACITY")
 			.ok()
 			.and_then(|value| value.parse::<f32>().ok())
 			.unwrap_or(0.84);
@@ -1120,8 +1124,8 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 		let window = Arc::new(el.create_window(attrs).expect("window"));
 		window.set_ime_allowed(true);
 		#[cfg(target_os = "macos")]
-		if std::env::var_os("OMP_GUI_NO_CHROME").is_none() {
-			crate::macos::polish(&window);
+		if env::var_os("OMP_GUI_NO_CHROME").is_none() {
+			polish(&window);
 		}
 
 		if self.gpu.is_none() {
@@ -1309,7 +1313,7 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 
 	fn request_clipboard(&self, window: WindowId, pane: PaneId, scope: ClipboardRead) {
 		let proxy = self.proxy.clone();
-		std::thread::spawn(move || {
+		thread::spawn(move || {
 			let receiver = paste::spawn_clipboard_read(scope);
 			let clipboard = receiver.blocking_recv().ok().flatten();
 			let _ = proxy.send_event(UserEvent::Clipboard(window, pane, clipboard, scope));
@@ -1792,7 +1796,7 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 						};
 						if icon != win.cursor {
 							win.cursor = icon;
-							win.window.set_cursor(winit::window::Cursor::Icon(icon));
+							win.window.set_cursor(window::Cursor::Icon(icon));
 						}
 						if icon != CursorIcon::Default {
 							return;
@@ -1966,7 +1970,7 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 /// Writes clipboard text on a detached thread: the native backend's CLI
 /// bridges may block for seconds and must never stall the event loop.
 fn write_clipboard_detached(text: String) {
-	let _ = std::thread::Builder::new()
+	let _ = thread::Builder::new()
 		.name("clipboard-write".into())
 		.spawn(move || {
 			let _ = paste::write_clipboard_text(&text);

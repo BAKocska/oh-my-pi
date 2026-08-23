@@ -1,9 +1,10 @@
 //! Declared extension journal-kind registry and Rust-enforced read scoping.
 
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, ptr};
 
 use omp_core::{IntoStr, Str};
 use omp_tool::{Rev, RevParseError};
+use serde_json::value::RawValue;
 use thiserror::Error;
 pub(crate) const CORE_EXTENSION: &str = "dev.omp.core";
 pub(crate) const CHECKPOINT_KIND: &str = "dev.omp.core.checkpoint";
@@ -40,7 +41,7 @@ pub(crate) fn core_checkpoint_declarations() -> Vec<EntryKindDecl> {
 ///
 /// The hook receives the recorded revision and canonical JSON bytes. Returning
 /// `None` preserves the record at its original revision.
-pub type LiftHook = fn(from_rev: &Rev, raw: &[u8]) -> Option<Box<serde_json::value::RawValue>>;
+pub type LiftHook = fn(from_rev: &Rev, raw: &[u8]) -> Option<Box<RawValue>>;
 
 /// One entry-kind declaration received while loading an extension.
 #[derive(Clone)]
@@ -119,7 +120,7 @@ impl KindRecord {
 			&& self.projects == declaration.projects
 			&& match (self.lift, declaration.lift) {
 				(None, None) => true,
-				(Some(left), Some(right)) => std::ptr::fn_addr_eq(left, right),
+				(Some(left), Some(right)) => ptr::fn_addr_eq(left, right),
 				_ => false,
 			}
 	}
@@ -253,7 +254,7 @@ fn same_declaration(left: &EntryKindDecl, right: &EntryKindDecl) -> bool {
 		&& left.projects == right.projects
 		&& match (left.lift, right.lift) {
 			(None, None) => true,
-			(Some(left), Some(right)) => std::ptr::fn_addr_eq(left, right),
+			(Some(left), Some(right)) => ptr::fn_addr_eq(left, right),
 			_ => false,
 		}
 }

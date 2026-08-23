@@ -1338,7 +1338,7 @@ fn unexpected<T>(file: &str, node: &str, context: &str) -> Result<T, CascadeErro
 mod tests {
 	use omp_core::semver;
 
-	use super::*;
+	use super::{taxonomy as bundled_taxonomy, *};
 
 	fn parse(sources: &[(&str, &str)]) -> Taxonomy {
 		Taxonomy::parse(sources).expect("valid taxonomy")
@@ -1814,7 +1814,7 @@ mod tests {
 		assert_eq!(taxonomy.billing_variant_plain("kimi-k3"), None);
 		// pi #8957: the bundled inventory declares the OpenCode gateway group
 		// and the billing-variant suffixes runtime discovery hints with.
-		let bundled = super::taxonomy();
+		let bundled = bundled_taxonomy();
 		assert!(
 			bundled
 				.responses_hint_group("opencode-go")

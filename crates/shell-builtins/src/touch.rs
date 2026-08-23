@@ -6,12 +6,15 @@
 use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::ptr;
 use std::{
 	borrow::Cow,
 	ffi::{OsStr, OsString},
+	fmt::{self, Display},
 	fs::{self, File},
 	io::{self, Error, ErrorKind},
-	path::{Path, PathBuf},
+	path::{self, Path, PathBuf},
 	time::SystemTime,
 };
 
@@ -73,8 +76,8 @@ impl FileTime {
 	}
 }
 
-impl std::fmt::Display for FileTime {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for FileTime {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}.{:09}s", self.seconds, self.nanos)
 	}
 }
@@ -86,7 +89,7 @@ enum TouchError {
 	#[error("Source has invalid access or modification time: {0}")]
 	InvalidFiletime(FileTime),
 	#[error("failed to get attributes of {}: {}", .0.quote(), io_error(.1))]
-	ReferenceFileInaccessible(PathBuf, std::io::Error),
+	ReferenceFileInaccessible(PathBuf, io::Error),
 	#[cfg(windows)]
 	#[error("GetFinalPathNameByHandleW failed with code {0}")]
 	WindowsStdoutPathError(String),
@@ -94,7 +97,7 @@ enum TouchError {
 	Message(String),
 }
 
-fn io_error(error: &std::io::Error) -> String {
+fn io_error(error: &io::Error) -> String {
 	if error.raw_os_error().is_some() {
 		match error.kind() {
 			ErrorKind::NotFound => "No such file or directory".into(),
@@ -113,7 +116,7 @@ fn io_error(error: &std::io::Error) -> String {
 	}
 }
 
-fn io_context(error: std::io::Error, context: impl std::fmt::Display) -> TouchError {
+fn io_context(error: io::Error, context: impl Display) -> TouchError {
 	TouchError::Message(format!("{context}: {}", io_error(&error)))
 }
 
@@ -608,7 +611,7 @@ fn touch_file(
 				.to_string_lossy()
 				.chars()
 				.next_back()
-				.is_some_and(|last| last == std::path::MAIN_SEPARATOR);
+				.is_some_and(|last| last == path::MAIN_SEPARATOR);
 			let error = if is_directory {
 				io_context(
 					Error::other("No such file or directory"),
@@ -734,7 +737,10 @@ fn set_path_times(path: &Path, atime: FileTime, mtime: FileTime, follow: bool) -
 
 #[cfg(windows)]
 fn set_path_times(path: &Path, atime: FileTime, mtime: FileTime, follow: bool) -> io::Result<()> {
-	use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+	use std::{
+		fs::OpenOptions,
+		os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+	};
 
 	use windows_sys::Win32::{
 		Foundation::FILETIME,
@@ -752,7 +758,7 @@ fn set_path_times(path: &Path, atime: FileTime, mtime: FileTime, follow: bool) -
 		FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 }
 	}
 
-	let mut options = fs::OpenOptions::new();
+	let mut options = OpenOptions::new();
 	options.access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(
 		FILE_FLAG_BACKUP_SEMANTICS
 			| if follow {
@@ -764,7 +770,7 @@ fn set_path_times(path: &Path, atime: FileTime, mtime: FileTime, follow: bool) -
 	let file = options.open(path)?;
 	let atime = as_filetime(atime);
 	let mtime = as_filetime(mtime);
-	if unsafe { SetFileTime(file.as_raw_handle(), std::ptr::null(), &atime, &mtime) } == 0 {
+	if unsafe { SetFileTime(file.as_raw_handle(), ptr::null(), &atime, &mtime) } == 0 {
 		Err(Error::last_os_error())
 	} else {
 		Ok(())
@@ -807,7 +813,7 @@ fn timestamps(atime: FileTime, mtime: FileTime) -> Timestamps {
 /// This opens the file write-only and uses the POSIX `futimens` call to set
 /// access and modification times on the open FD (not by path), which also
 /// triggers `IN_CLOSE_WRITE` on Linux when the FD is closed.
-fn try_futimens_via_write_fd(path: &Path, atime: FileTime, mtime: FileTime) -> std::io::Result<()> {
+fn try_futimens_via_write_fd(path: &Path, atime: FileTime, mtime: FileTime) -> io::Result<()> {
 	let file = OpenOptions::new()
 		.write(true)
 		// Avoid blocking on special files (e.g. FIFOs) before we can inspect metadata.
@@ -822,7 +828,7 @@ fn try_futimens_via_write_fd(path: &Path, atime: FileTime, mtime: FileTime) -> s
 /// If `follow` is `true`, the function will try to follow symlinks. Errors if
 /// the symlink is dangling, otherwise defaults to symlink metadata. If `follow`
 /// is `false`, the function will return metadata of the symlink itself
-fn stat(path: &Path, follow: bool) -> std::io::Result<(FileTime, FileTime)> {
+fn stat(path: &Path, follow: bool) -> io::Result<(FileTime, FileTime)> {
 	let metadata = if follow {
 		match fs::metadata(path) {
 			// Successfully followed symlink
@@ -1002,7 +1008,7 @@ fn pathbuf_from_stdout() -> Result<PathBuf, TouchError> {
 			Storage::FileSystem::{FILE_NAME_OPENED, GetFinalPathNameByHandleW},
 		};
 
-		let handle = std::io::stdout().lock().as_raw_handle() as HANDLE;
+		let handle = io::stdout().lock().as_raw_handle() as HANDLE;
 		let mut file_path_buffer: [u16; MAX_PATH as usize] = [0; MAX_PATH as usize];
 
 		// https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlea#examples
@@ -1057,7 +1063,7 @@ pub(crate) fn touch_builtin<SE: ShellExtensions>() -> Registration<SE> {
 #[cfg(test)]
 mod tests {
 	use std::{
-		fs,
+		env, fs, iter,
 		path::{Path, PathBuf},
 	};
 
@@ -1066,7 +1072,7 @@ mod tests {
 	use super::{
 		ChangeTimes, FileTime, Touch, Utility, determine_atime_mtime_change, set_file_times, uu_app,
 	};
-	use crate::host::{Host, run_util};
+	use crate::host::{Capture, Host, run_util};
 
 	fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
 		let dir = tempfile::tempdir().unwrap();
@@ -1079,10 +1085,10 @@ mod tests {
 		(FileTime::from_last_access_time(&metadata), FileTime::from_last_modification_time(&metadata))
 	}
 
-	fn run_with_tz(cwd: &Path, args: &[&str], tz: &str) -> (i32, crate::host::Capture) {
+	fn run_with_tz(cwd: &Path, args: &[&str], tz: &str) -> (i32, Capture) {
 		let (mut host, capture) = Host::for_test("touch", Vec::new(), cwd);
 		host.set_test_var("TZ", tz);
-		let argv = std::iter::once("touch").chain(args.iter().copied());
+		let argv = iter::once("touch").chain(args.iter().copied());
 		let parsed = Touch::try_parse_from(argv).unwrap();
 		let code = parsed.run(&mut host);
 		(code, capture)
@@ -1092,7 +1098,7 @@ mod tests {
 	fn relative_operand_creates_file_under_host_cwd() {
 		let (_dir, root) = canonical_tempdir();
 		let filename = format!("touch-host-cwd-regression-{}", std::process::id());
-		let process_path = std::env::current_dir().unwrap().join(&filename);
+		let process_path = env::current_dir().unwrap().join(&filename);
 		assert!(!process_path.exists());
 
 		let (code, capture) = run_util::<Touch>(&[&filename], "", &root);

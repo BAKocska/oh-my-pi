@@ -1,3 +1,5 @@
+use std::{fmt::Display, iter};
+
 use uiautomation::{
 	UIAutomation, UIElement,
 	patterns::{
@@ -83,7 +85,7 @@ impl Win32Ax {
 	}
 }
 
-fn ax_error(error: impl std::fmt::Display) -> DesktopError {
+fn ax_error(error: impl Display) -> DesktopError {
 	DesktopError::ax_failed(format!("UI Automation failed: {error}"))
 }
 
@@ -138,11 +140,7 @@ fn truncate(value: impl ToString) -> String {
 	if value.chars().count() <= 200 {
 		value
 	} else {
-		value
-			.chars()
-			.take(199)
-			.chain(std::iter::once('.'))
-			.collect()
+		value.chars().take(199).chain(iter::once('.')).collect()
 	}
 }
 

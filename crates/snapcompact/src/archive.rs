@@ -1,6 +1,6 @@
 //! Provider-aware frame geometry and bounded text chunking.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, result, str};
 
 use crate::{
 	Result as RenderResult, SnapcompactError, SnapcompactRenderOptions, cell_units,
@@ -135,7 +135,7 @@ fn parse_elided_marker(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
 	if at == digits || !bytes.get(at..)?.starts_with(b"ch elided") {
 		return None;
 	}
-	let count = std::str::from_utf8(&bytes[digits..at])
+	let count = str::from_utf8(&bytes[digits..at])
 		.ok()?
 		.parse::<usize>()
 		.ok()?;
@@ -382,7 +382,7 @@ pub enum ArchiveError {
 }
 
 /// Archive construction result.
-pub type ArchiveResult<T, E = ArchiveError> = std::result::Result<T, E>;
+pub type ArchiveResult<T, E = ArchiveError> = result::Result<T, E>;
 
 /// Resolves a wire API name to its image billing family.
 pub fn billing_family(api: Option<&str>) -> BillingFamily {

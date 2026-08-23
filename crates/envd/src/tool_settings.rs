@@ -316,6 +316,7 @@ omp_settings::inventory::submit! {
 }
 
 mod optional_duration {
+
 	use super::*;
 
 	pub fn serialize<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>

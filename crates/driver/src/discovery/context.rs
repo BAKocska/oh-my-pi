@@ -3,7 +3,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	fs,
-	path::{Path, PathBuf},
+	path::PathBuf,
 	sync::Arc,
 };
 

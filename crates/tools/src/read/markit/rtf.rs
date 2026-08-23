@@ -6,6 +6,7 @@
 //! document model and deterministic Markdown renderer. Binary and object
 //! payloads are parsed as inert data and never executed.
 
+use anydoc::Format;
 use omp_core::Str;
 
 use super::{MarkitError, convert_with_anydoc};
@@ -14,12 +15,16 @@ const FORMAT: &str = "rtf";
 
 /// Converts Rich Text Format bytes to deterministic Markdown.
 pub(super) fn convert(bytes: &[u8]) -> Result<Str, MarkitError> {
-	convert_with_anydoc(bytes, anydoc::Format::Rtf, FORMAT)
+	convert_with_anydoc(bytes, Format::Rtf, FORMAT)
 }
 
 #[cfg(test)]
 mod tests {
+
+	use std::path::Path;
+
 	use super::*;
+	use crate::read::markit;
 
 	fn markdown(source: &[u8]) -> String {
 		convert(source)
@@ -29,10 +34,9 @@ mod tests {
 
 	#[test]
 	fn rtf_extension_dispatches_case_insensitively() {
-		let conversion =
-			super::super::convert(std::path::Path::new("note.RTF"), br"{\rtf1\ansi Dispatched\par}")
-				.expect("dispatch succeeds")
-				.expect("RTF is supported");
+		let conversion = markit::convert(Path::new("note.RTF"), br"{\rtf1\ansi Dispatched\par}")
+			.expect("dispatch succeeds")
+			.expect("RTF is supported");
 		assert_eq!(conversion.text.as_str(), "Dispatched\n");
 		assert_eq!(conversion.note, None);
 		assert_eq!(conversion.title, None);

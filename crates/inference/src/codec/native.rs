@@ -317,6 +317,8 @@ fn protocol_error(reason: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
+	use std::sync;
+
 	use futures::{future, stream};
 
 	use super::*;
@@ -387,7 +389,7 @@ mod tests {
 	fn one_shot_native_bodies_retain_physical_replay_evidence() {
 		let stream: ByteStream =
 			Box::pin(stream::once(future::ready(Ok(Bytes::from_static(b"body")))));
-		let source = BodySource::OneShot(std::sync::Arc::new(OneShotBody::new(stream)));
+		let source = BodySource::OneShot(sync::Arc::new(OneShotBody::new(stream)));
 		let native = NativeBodySource::new(source, NativeStreamDeclaration::OneShot)
 			.expect("one-shot declaration");
 		assert_eq!(native.replay_evidence().replayability, crate::body::Replayability::OneShot);

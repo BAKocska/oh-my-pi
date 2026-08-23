@@ -3,8 +3,10 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	future::Future,
+	iter,
 	mem::size_of,
 	pin::Pin,
+	slice,
 	sync::Arc,
 	task::{Context, Poll},
 };
@@ -18,7 +20,7 @@ use omp_inference::{
 	Adjustment, FeatureId, OpaqueJson, ReasonId, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
 	ToolInputConstraint,
 };
-use omp_proto::inference::v1::InvokeInput;
+use omp_proto::inference::{v1, v1::InvokeInput};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,9 +28,10 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
-	Abort, ArgIssueKind, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError, CallOutcome, Constraint,
-	DeviceIssue, DevicePath, GrammarSyntax, IncomingParams, LiftedCall, Part, Presentation,
-	PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool, ToolIdentity,
+	Abort, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError,
+	CallOutcome, Constraint, DeviceIssue, DevicePath, Effects, GrammarSyntax, IncomingParams,
+	JobRef, LiftedCall, Part, Presentation, PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool,
+	ToolIdentity, ToolPromptExample, ToolSpec,
 	render::{RenderEntry, RenderFold, RenderRegistry, RenderRegistryError, ViewState},
 };
 
@@ -238,7 +241,7 @@ pub struct MountedDevice<'a> {
 	/// Complete JSON Schema bytes.
 	pub schema:   &'a [u8],
 	/// Maximum declared authority before per-invocation narrowing.
-	pub effects:  &'a crate::Effects,
+	pub effects:  &'a Effects,
 	/// Long-form documentation, when supplied by the declaration surface.
 	pub docs:     Option<&'a str>,
 	/// Execution placement, independent of device presentation.
@@ -706,7 +709,7 @@ pub struct ToolPromptEntry<'a> {
 	/// Authoritative JSON Schema bytes.
 	pub schema:      &'a Bytes,
 	/// Declared examples; empty when the tool supplies none.
-	pub examples:    &'a [crate::ToolPromptExample],
+	pub examples:    &'a [ToolPromptExample],
 	/// Optional long-form documentation.
 	pub docs:        Option<&'a str>,
 }
@@ -782,7 +785,7 @@ pub enum ErasedOutcome {
 		useless: bool,
 	},
 	/// Detached work.
-	Detached(crate::JobRef),
+	Detached(JobRef),
 }
 
 /// Cold dispatch stream allocated once for an erased invocation.
@@ -1100,8 +1103,8 @@ pub enum RegistryError {
 }
 
 trait ErasedTool: Send + Sync {
-	fn spec(&self) -> &crate::ToolSpec;
-	fn prompt_examples(&self) -> &[crate::ToolPromptExample];
+	fn spec(&self) -> &ToolSpec;
+	fn prompt_examples(&self) -> &[ToolPromptExample];
 	fn prompt_docs(&self) -> Option<&str>;
 	fn route(&self) -> &ToolRoute;
 	fn schema(&self) -> &OpaqueJson;
@@ -1119,7 +1122,7 @@ trait ErasedTool: Send + Sync {
 static NATIVE_TOOL_ROUTE: ToolRoute = ToolRoute::Native;
 
 struct Worker {
-	spec:     crate::ToolSpec,
+	spec:     ToolSpec,
 	schema:   OpaqueJson,
 	route:    ToolRoute,
 	cache:    Arc<ProjectionCache>,
@@ -1127,11 +1130,11 @@ struct Worker {
 }
 
 impl ErasedTool for Worker {
-	fn spec(&self) -> &crate::ToolSpec {
+	fn spec(&self) -> &ToolSpec {
 		&self.spec
 	}
 
-	fn prompt_examples(&self) -> &[crate::ToolPromptExample] {
+	fn prompt_examples(&self) -> &[ToolPromptExample] {
 		&[]
 	}
 
@@ -1219,11 +1222,11 @@ impl<T: Tool> Registered<T> {
 }
 
 impl<T: Tool> ErasedTool for Registered<T> {
-	fn spec(&self) -> &crate::ToolSpec {
+	fn spec(&self) -> &ToolSpec {
 		self.tool.spec()
 	}
 
-	fn prompt_examples(&self) -> &[crate::ToolPromptExample] {
+	fn prompt_examples(&self) -> &[ToolPromptExample] {
 		self.tool.prompt_examples()
 	}
 
@@ -1520,7 +1523,7 @@ impl Registry {
 
 	/// Borrows one exact-revision argument declaration by canonical or alias
 	/// path.
-	pub fn arg_spec(&self, rev: &Rev, path: &[crate::ArgPath]) -> Option<&ArgSpec> {
+	pub fn arg_spec(&self, rev: &Rev, path: &[ArgPath]) -> Option<&ArgSpec> {
 		self.arg_specs.get(rev, path)
 	}
 
@@ -1609,7 +1612,7 @@ impl Registry {
 	/// environment worker whose name matches the device token.
 	pub fn register_worker(
 		&mut self,
-		spec: crate::ToolSpec,
+		spec: ToolSpec,
 		presentation: Presentation,
 		claims: Claims,
 	) -> Result<(), RegistryError> {
@@ -1621,7 +1624,7 @@ impl Registry {
 	/// placement.
 	pub fn register_worker_at(
 		&mut self,
-		spec: crate::ToolSpec,
+		spec: ToolSpec,
 		presentation: Presentation,
 		claims: Claims,
 		site: WorkerSiteKind,
@@ -1707,12 +1710,12 @@ impl Registry {
 	/// Borrows the complete policy-resolved specification.
 	///
 	/// Claimant-qualified names resolve their shadow without promoting it.
-	pub fn live_spec(&self, name: &str) -> Result<&crate::ToolSpec, RegistryError> {
+	pub fn live_spec(&self, name: &str) -> Result<&ToolSpec, RegistryError> {
 		Ok(self.live_entry(name)?.tool.spec())
 	}
 
 	/// Borrows the declared maximum effect envelope of a resolved tool.
-	pub fn effects(&self, name: &str) -> Result<&crate::Effects, RegistryError> {
+	pub fn effects(&self, name: &str) -> Result<&Effects, RegistryError> {
 		Ok(&self.live_spec(name)?.effects)
 	}
 
@@ -2099,10 +2102,7 @@ impl Registry {
 		if let Some(projected) = entry.tool.project_cached(&request.key) {
 			return Ok(projected);
 		}
-		entry
-			.tool
-			.warm(std::slice::from_ref(&request))
-			.into_ready()?;
+		entry.tool.warm(slice::from_ref(&request)).into_ready()?;
 		entry
 			.tool
 			.project_cached(&request.key)
@@ -2287,7 +2287,7 @@ fn claim_revision<'a>(claim: &'a Claim, claimant: Option<&str>) -> Option<&'a Re
 }
 
 fn claim_entries(claim: &Claim) -> impl Iterator<Item = ClaimRef<'_>> {
-	std::iter::once(ClaimRef {
+	iter::once(ClaimRef {
 		rev:        &claim.rev,
 		precedence: claim.precedence,
 		claimant:   &claim.claimant,
@@ -2360,16 +2360,16 @@ fn hash_field(hasher: &mut Hasher, field: &[u8]) {
 	hasher.update(field);
 }
 
-fn render_arg_issue(issue: &crate::ArgIssue) -> Str {
+fn render_arg_issue(issue: &ArgIssue) -> Str {
 	let mut path = String::from("$");
 	for segment in &issue.path {
 		match segment {
-			crate::ArgPath::Key(key) => {
+			ArgPath::Key(key) => {
 				path.push('[');
 				path.push_str(&serde_json::to_string(key.as_str()).unwrap_or_else(|_| "\"?\"".into()));
 				path.push(']');
 			},
-			crate::ArgPath::Index(index) => {
+			ArgPath::Index(index) => {
 				path.push('[');
 				path.push_str(&index.to_string());
 				path.push(']');
@@ -2420,7 +2420,7 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, Regi
 			Some(*priority),
 		),
 		Constraint::Schema { priority, on_unsupported } => {
-			if *on_unsupported == omp_proto::inference::v1::Fallback::Error {
+			if *on_unsupported == v1::Fallback::Error {
 				return Err(RegistryError::UnsupportedConstraint {
 					name:    spec.name.clone(),
 					rev:     spec.rev.clone(),
@@ -2450,7 +2450,7 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, Regi
 			)
 		},
 		Constraint::Grammar { syntax, priority, on_unsupported, .. } => {
-			if *on_unsupported == omp_proto::inference::v1::Fallback::Error {
+			if *on_unsupported == v1::Fallback::Error {
 				return Err(RegistryError::UnsupportedConstraint {
 					name:    spec.name.clone(),
 					rev:     spec.rev.clone(),
@@ -2503,7 +2503,7 @@ fn advertisement_priority(entry: &RegistryEntry) -> u8 {
 	}
 }
 
-const fn constraint_requires_capacity(spec: &crate::ToolSpec) -> bool {
+const fn constraint_requires_capacity(spec: &ToolSpec) -> bool {
 	matches!(
 		&spec.constraint,
 		Constraint::Schema { on_unsupported: omp_proto::inference::v1::Fallback::Error, .. }
@@ -2511,7 +2511,7 @@ const fn constraint_requires_capacity(spec: &crate::ToolSpec) -> bool {
 	)
 }
 
-fn budget_constraint_error(spec: &crate::ToolSpec, feature: &'static str) -> RegistryError {
+fn budget_constraint_error(spec: &ToolSpec, feature: &'static str) -> RegistryError {
 	RegistryError::UnsupportedConstraint { name: spec.name.clone(), rev: spec.rev.clone(), feature }
 }
 
@@ -2531,7 +2531,7 @@ fn downgrade_strict(tool: &mut LoweredTool) {
 	));
 }
 
-fn external_error(spec: &crate::ToolSpec, operation: &'static str) -> RegistryError {
+fn external_error(spec: &ToolSpec, operation: &'static str) -> RegistryError {
 	RegistryError::UnsupportedExternal { name: spec.name.clone(), rev: spec.rev.clone(), operation }
 }
 
@@ -2568,8 +2568,9 @@ fn dropped(name: &Str, feature: &str, reason: &'static str) -> Adjustment {
 
 #[cfg(test)]
 mod tests {
+
 	use super::*;
-	use crate::{Effects, Ev, ToolSpec};
+	use crate::{Dialect, Effects, Ev, ModelClass, ToolSpec};
 
 	struct LiftTool {
 		spec: ToolSpec,
@@ -2621,8 +2622,8 @@ mod tests {
 			maximum_parts:      1,
 			maximum_text_bytes: 1,
 			media:              false,
-			dialect:            crate::Dialect::Native,
-			model_class:        crate::ModelClass::Standard,
+			dialect:            Dialect::Native,
+			model_class:        ModelClass::Standard,
 		}
 	}
 

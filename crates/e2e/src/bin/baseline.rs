@@ -2,8 +2,9 @@
 //! loop.
 
 #[cfg(not(test))]
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 use std::{
+	fs,
 	future::{self, Future},
 	path::Path,
 	pin::Pin,
@@ -22,8 +23,8 @@ use omp_core::Str;
 use omp_e2e::{Context as _, Result, error};
 use omp_env::{EnvClient, InProcessEnvTransport};
 use omp_proto::{
-	inference::v1::{self as pb, TurnEvent},
-	thread::v1::{self as thread, Item},
+	inference::v1::{self as pb, TurnEvent, part_start, turn_event},
+	thread::v1::{self as thread, Item, item},
 };
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{CapsBase, ModelClass};
@@ -94,25 +95,25 @@ struct ScriptedTurnClient {
 impl ScriptedTurnClient {
 	fn token_storm(tokens: usize) -> Self {
 		let mut events = Vec::with_capacity(tokens.saturating_add(4));
-		events.push(turn_event(pb::turn_event::Event::Accepted(pb::Accepted { replay: false })));
-		events.push(turn_event(pb::turn_event::Event::PartStart(pb::PartStart {
+		events.push(turn_event(turn_event::Event::Accepted(pb::Accepted { replay: false })));
+		events.push(turn_event(turn_event::Event::PartStart(pb::PartStart {
 			index:        0,
-			kind:         pb::part_start::Kind::Text.into(),
+			kind:         part_start::Kind::Text.into(),
 			tool_call_id: String::new(),
 			tool_name:    String::new(),
 		})));
 		let chunk = Bytes::from_static(TOKEN.as_bytes());
 		for _ in 0..tokens {
-			events.push(turn_event(pb::turn_event::Event::PartDelta(pb::PartDelta {
+			events.push(turn_event(turn_event::Event::PartDelta(pb::PartDelta {
 				index: 0,
 				chunk: chunk.clone(),
 			})));
 		}
-		events.push(turn_event(pb::turn_event::Event::PartEnd(pb::PartEnd {
+		events.push(turn_event(turn_event::Event::PartEnd(pb::PartEnd {
 			index:     0,
 			signature: Bytes::new(),
 		})));
-		events.push(turn_event(pb::turn_event::Event::Outcome(pb::Outcome {
+		events.push(turn_event(turn_event::Event::Outcome(pb::Outcome {
 			stop: pb::StopReason::StopEndTurn.into(),
 			provider: "scripted".to_owned(),
 			model: "baseline".to_owned(),
@@ -271,7 +272,7 @@ fn measure_frames(tokens: usize) -> Result<FrameMetrics> {
 	let root = TextLeaf::new().with(Prop::Id, "stream").text("");
 	let mut ui = Ui::from_root(root, 80, UiContext::default());
 	let mut renderer = Renderer::new(Vec::<u8>::with_capacity(tokens.saturating_mul(16)));
-	ui.present(&mut renderer, 24, 0)
+	ui.present(&mut renderer, 24)
 		.context("paint warmup frame")?;
 
 	let mut text = String::with_capacity(tokens.saturating_mul(TOKEN.len()));
@@ -282,7 +283,7 @@ fn measure_frames(tokens: usize) -> Result<FrameMetrics> {
 		if !ui.set_text("stream", text.as_str()) {
 			return Err(error(format!("token-storm text component stopped accepting updates")));
 		}
-		ui.present(&mut renderer, 24, 0)
+		ui.present(&mut renderer, 24)
 			.context("paint token-storm frame")?;
 		elapsed.push(started.elapsed().as_nanos());
 	}
@@ -347,7 +348,7 @@ pub fn slowdown_ratio(raw_rate: f64, full_rate: f64) -> Result<f64> {
 
 fn user_item(text: &str) -> Item {
 	Item {
-		kind: Some(thread::item::Kind::Message(thread::Message {
+		kind: Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::User.into(),
 			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_owned())) }],
 		})),
@@ -355,7 +356,7 @@ fn user_item(text: &str) -> Item {
 	}
 }
 
-const fn turn_event(event: pb::turn_event::Event) -> TurnEvent {
+const fn turn_event(event: turn_event::Event) -> TurnEvent {
 	TurnEvent { event: Some(event) }
 }
 
@@ -364,18 +365,17 @@ pub fn write_metrics(path: &Path, metrics: &BaselineMetrics) -> Result<()> {
 	if let Some(parent) = path.parent()
 		&& !parent.as_os_str().is_empty()
 	{
-		std::fs::create_dir_all(parent)
+		fs::create_dir_all(parent)
 			.with_context(|| format!("create artifact directory {}", parent.display()))?;
 	}
 	let bytes = serde_json::to_vec_pretty(metrics).context("serialize baseline metrics")?;
-	std::fs::write(path, bytes)
-		.with_context(|| format!("write baseline artifact {}", path.display()))?;
+	fs::write(path, bytes).with_context(|| format!("write baseline artifact {}", path.display()))?;
 	Ok(())
 }
 
 #[cfg(not(test))]
 fn artifact_argument() -> Result<PathBuf> {
-	let mut args = std::env::args_os().skip(1);
+	let mut args = env::args_os().skip(1);
 	let Some(flag) = args.next() else {
 		return Err(error(format!("usage: baseline --artifact <path>")));
 	};

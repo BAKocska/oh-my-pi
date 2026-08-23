@@ -1,6 +1,8 @@
 //! Terminal utilities.
 
-use crate::{builtins::terminal, error, openfiles, sys};
+use std::{io, path::PathBuf};
+
+use crate::{builtins::terminal, error, openfiles::OpenFile, sys};
 
 /// Terminal configuration.
 #[derive(Clone, Debug)]
@@ -17,7 +19,7 @@ impl Config {
 	/// # Arguments
 	///
 	/// * `_file` - A reference to the open terminal.
-	pub(crate) fn from_term(_file: &openfiles::OpenFile) -> Result<Self, error::Error> {
+	pub(crate) fn from_term(_file: &OpenFile) -> Result<Self, error::Error> {
 		Ok(Self)
 	}
 
@@ -27,7 +29,7 @@ impl Config {
 	/// # Arguments
 	///
 	/// * `_file` - A reference to the open terminal.
-	pub(crate) fn apply_to_term(&self, _file: &openfiles::OpenFile) -> Result<(), error::Error> {
+	pub(crate) fn apply_to_term(&self, _file: &OpenFile) -> Result<(), error::Error> {
 		Ok(())
 	}
 
@@ -72,7 +74,7 @@ pub fn move_to_foreground(_pid: sys::process::ProcessId) -> Result<(), error::Er
 /// Moves the current process to the foreground of the attached terminal.
 ///
 /// This is a stub implementation that returns `None`.
-pub fn move_self_to_foreground() -> Result<(), std::io::Error> {
+pub fn move_self_to_foreground() -> Result<(), io::Error> {
 	Ok(())
 }
 
@@ -80,6 +82,6 @@ pub fn move_self_to_foreground() -> Result<(), std::io::Error> {
 /// terminal.
 ///
 /// This is a stub implementation that always returns `None`.
-pub fn try_get_terminal_device_path() -> Option<std::path::PathBuf> {
+pub fn try_get_terminal_device_path() -> Option<PathBuf> {
 	None
 }

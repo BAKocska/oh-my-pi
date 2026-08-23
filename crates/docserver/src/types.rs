@@ -1,8 +1,10 @@
 use std::{
 	collections::HashMap,
-	fmt, fs, io,
+	fmt::{self, Display},
+	fs, io,
 	num::{NonZeroU64, NonZeroUsize},
 	path::{Path, PathBuf},
+	str,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -67,7 +69,7 @@ macro_rules! opaque_id {
 			}
 		}
 
-		impl fmt::Display for $name {
+		impl Display for $name {
 			fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 				for byte in self.0 {
 					write!(formatter, "{byte:02x}")?;
@@ -124,7 +126,7 @@ impl Revision {
 	}
 }
 
-impl fmt::Display for Revision {
+impl Display for Revision {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}@", self.sequence)?;
 		for byte in &self.content_hash[..6] {
@@ -154,7 +156,7 @@ impl LanguageId {
 	}
 }
 
-impl fmt::Display for LanguageId {
+impl Display for LanguageId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.as_str())
 	}
@@ -398,7 +400,7 @@ impl DocumentSnapshot {
 				reason: sf!("a missing document cannot have content"),
 			});
 		}
-		if matches!(&head.kind, DocumentKind::Text(_)) && std::str::from_utf8(&content).is_err() {
+		if matches!(&head.kind, DocumentKind::Text(_)) && str::from_utf8(&content).is_err() {
 			return Err(Error::InvalidContent {
 				reason: sf!("text document content is not valid UTF-8"),
 			});
@@ -675,6 +677,8 @@ impl ServerConfig {
 
 	/// Acquires process authority on the opened project directory.
 	pub fn try_lock_authority(&self) -> Result<AuthorityLock> {
+		use cap_std::fs;
+
 		if self
 			.authority_held
 			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -693,7 +697,7 @@ impl ServerConfig {
 			let root = self
 				.root
 				.try_clone()
-				.map(cap_std::fs::Dir::into_std_file)
+				.map(fs::Dir::into_std_file)
 				.map_err(|source| Error::Io {
 					operation: sf!("clone Environment authority handle"),
 					path: self.environment_root.clone(),
@@ -828,7 +832,7 @@ impl ServerConfig {
 				}
 				Ok(canonical)
 			},
-			Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+			Err(source) if source.kind() == io::ErrorKind::NotFound => {
 				if fs::symlink_metadata(&entry).is_ok_and(|metadata| metadata.file_type().is_symlink())
 				{
 					return Err(Error::InvalidTarget {
@@ -934,7 +938,7 @@ mod tests {
 		let lock = config.try_lock_authority().expect("first authority");
 		assert!(config.try_lock_authority().is_err());
 		drop(lock);
-		config.try_lock_authority().expect("released authority");
+		let _reacquired_authority = config.try_lock_authority().expect("released authority");
 	}
 
 	#[cfg(unix)]
@@ -954,7 +958,7 @@ mod tests {
 			"renaming a live root must not create another authority"
 		);
 		drop(lock);
-		replacement
+		let _reacquired_authority = replacement
 			.try_lock_authority()
 			.expect("released renamed authority");
 	}

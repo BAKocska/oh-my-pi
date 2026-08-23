@@ -8,6 +8,7 @@ use std::{
 	time::Duration,
 };
 
+use flume::Receiver;
 use omp_agent::RpcTurnClient;
 use omp_app::{
 	daemon::{DaemonConfig, DaemonError, DaemonHandle},
@@ -79,7 +80,7 @@ pub struct ScriptedGateway {
 	sessions:       ConversationSessionPlanner,
 	response_gate:  Option<Gate>,
 	live_responses: flume::Sender<WorkflowResponse>,
-	responses:      flume::Receiver<WorkflowResponse>,
+	responses:      Receiver<WorkflowResponse>,
 	shutdown:       Option<flume::Sender<()>>,
 	actor:          Option<JoinHandle<Result<(), DaemonError>>>,
 }
@@ -205,7 +206,8 @@ impl ScriptedGateway {
 				{
 					return Ok(replay);
 				}
-				tokio::time::sleep(Duration::from_millis(10)).await;
+				use tokio::time;
+				time::sleep(Duration::from_millis(10)).await;
 			}
 		})
 		.await?

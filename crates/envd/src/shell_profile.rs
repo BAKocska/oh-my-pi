@@ -3,13 +3,16 @@
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::{
-	fs, io,
+	env,
+	fs::{self, OpenOptions},
+	io,
 	path::{Path, PathBuf},
 	process::Stdio,
 	time::Duration,
 };
 
 use omp_core::Str;
+use tokio::{process, time};
 
 const CAPTURE_LIMIT: usize = 1024 * 1024;
 
@@ -30,7 +33,7 @@ pub(crate) async fn capture(executable: &str, home: &Path) -> io::Result<Option<
 		"alias -p; declare -f; printf 'export PATH=%q\\n' \"$PATH\""
 	};
 	let script = format!("umask 077; [ ! -f {rc} ] || . {rc} </dev/null 2>/dev/null; {introspect}");
-	let mut command = tokio::process::Command::new(executable);
+	let mut command = process::Command::new(executable);
 	command
 		.args(["-c", &script])
 		.env_remove("BASH_ENV")
@@ -39,20 +42,20 @@ pub(crate) async fn capture(executable: &str, home: &Path) -> io::Result<Option<
 		.stdout(Stdio::piped())
 		.stderr(Stdio::null())
 		.kill_on_drop(true);
-	let output = tokio::time::timeout(Duration::from_secs(2), command.output())
+	let output = time::timeout(Duration::from_secs(2), command.output())
 		.await
 		.map_err(io::Error::other)??;
 	if !output.status.success() || output.stdout.len() > CAPTURE_LIMIT {
 		return Ok(None);
 	}
 	let sanitized = sanitize(&String::from_utf8_lossy(&output.stdout));
-	let directory = std::env::temp_dir().join(format!("omp-shell-snapshots-{}", std::process::id()));
+	let directory = env::temp_dir().join(format!("omp-shell-snapshots-{}", std::process::id()));
 	fs::create_dir_all(&directory)?;
 	#[cfg(unix)]
 	fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
 	let path = directory.join(format!("snapshot-{shell}-{}.sh", monotonic_name()));
 	use std::io::Write as _;
-	let mut options = fs::OpenOptions::new();
+	let mut options = OpenOptions::new();
 	options.write(true).create_new(true);
 	#[cfg(unix)]
 	options.mode(0o600);

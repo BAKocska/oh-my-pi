@@ -11,7 +11,7 @@ use std::{
 use omp_catalog::{OperationKind, provider::RouteDef, snapshot::Catalog};
 use omp_core::sf;
 use omp_inference::{
-	answer::{Answer, AnswerBody, ResponseMeta},
+	answer::{Answer, AnswerBody, ChatStream, ResponseMeta},
 	call::{Call, OperationCall},
 	error::Error,
 	layer::{
@@ -86,9 +86,7 @@ impl Service<LayerCall<Call>> for CountingRoute {
 			provider_request_id: Some(sf!("route-probe")),
 			created_at:          SystemTime::UNIX_EPOCH,
 		};
-		let body = AnswerBody::Chat(omp_inference::answer::ChatStream::ordinary(Box::pin(
-			futures::stream::empty(),
-		)));
+		let body = AnswerBody::Chat(ChatStream::ordinary(Box::pin(futures::stream::empty())));
 		ready(Ok(Answer { meta, receipt: context.receipt(), body }))
 	}
 }

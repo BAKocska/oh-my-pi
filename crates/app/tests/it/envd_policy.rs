@@ -10,6 +10,7 @@ use omp_envd::{
 	},
 	worker::HostKey,
 };
+use omp_proto::policy::v1;
 
 fn host() -> HostKey {
 	HostKey::new("workspace", "sandboxed", "dev.example.policy")
@@ -28,13 +29,13 @@ fn hello_grants_are_requested_intersection_without_wildcards() {
 
 #[test]
 fn core_effect_envelope_maps_to_exact_worker_data_bounds() {
-	let envelope = omp_proto::policy::v1::EffectEnvelope {
-		documents: Some(omp_proto::policy::v1::DocEffects {
+	let envelope = v1::EffectEnvelope {
+		documents: Some(v1::DocEffects {
 			read:        true,
 			write_globs: Vec::new(),
 			props:       Default::default(),
 		}),
-		exec:      Some(omp_proto::policy::v1::ExecEffects {
+		exec:      Some(v1::ExecEffects {
 			commands: vec!["ruff".to_owned()],
 			network:  false,
 			props:    Default::default(),

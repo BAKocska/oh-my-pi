@@ -8,6 +8,7 @@ use std::{
 		Arc,
 		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
+	thread,
 };
 
 use super::{CaptureSink, DeviceConfig, PlaybackFill};
@@ -354,7 +355,7 @@ impl PlaybackDevice {
 		let current_thread = unsafe { pthread_self() };
 		if current_thread != 0 && self.callback_thread.load(Ordering::Acquire) == current_thread {
 			let stopped = Arc::clone(&self.stopped);
-			drop(std::thread::spawn(move || {
+			drop(thread::spawn(move || {
 				stopped.store(true, Ordering::Release);
 				let _ = queue.stop_and_dispose();
 				drop(context);
@@ -455,7 +456,7 @@ impl CaptureDevice {
 		let current_thread = unsafe { pthread_self() };
 		if current_thread != 0 && self.callback_thread.load(Ordering::Acquire) == current_thread {
 			let stopped = Arc::clone(&self.stopped);
-			drop(std::thread::spawn(move || {
+			drop(thread::spawn(move || {
 				stopped.store(true, Ordering::Release);
 				let _ = queue.stop_and_dispose();
 				drop(context);

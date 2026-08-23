@@ -3,7 +3,10 @@ use std::io::Write;
 use clap::Parser;
 
 use super::printf_engine;
-use crate::{ErrorKind, ExecutionResult, builtins, escape, expansion};
+use crate::{
+	Error, ErrorKind, ExecutionContext, ExecutionResult, ShellExtensions, builtins, escape,
+	expansion,
+};
 
 /// Format a string.
 #[derive(Parser)]
@@ -19,11 +22,11 @@ pub(crate) struct PrintfCommand {
 }
 
 impl builtins::Command for PrintfCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		if let Some(variable_name) = &self.output_variable {
 			// Format to a u8 vector.
@@ -32,7 +35,7 @@ impl builtins::Command for PrintfCommand {
 
 			// Convert to a string.
 			let result_str = String::from_utf8(result)
-				.map_err(|_| crate::ErrorKind::PrintfInvalidUsage("invalid UTF-8 output".into()))?;
+				.map_err(|_| ErrorKind::PrintfInvalidUsage("invalid UTF-8 output".into()))?;
 
 			// Assign to the selected variable.
 			expansion::assign_to_named_parameter(
@@ -51,7 +54,7 @@ impl builtins::Command for PrintfCommand {
 	}
 }
 
-fn format(format_and_args: &[String], writer: impl Write) -> Result<(), crate::Error> {
+fn format(format_and_args: &[String], writer: impl Write) -> Result<(), Error> {
 	match format_and_args {
 		// Special-case invocation of printf with %q-based format string from bash-completion.
 		// It has hard-coded expectation of backslash-style escaping instead of quoting.
@@ -72,7 +75,7 @@ fn format_special_case_for_percent_q(
 	prefix: Option<&str>,
 	arg: &str,
 	mut writer: impl Write,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
 	let mut result = escape::quote_if_needed(arg, escape::QuoteMode::BackslashEscape).to_string();
 
 	if let Some(prefix) = prefix {

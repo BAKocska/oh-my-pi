@@ -2,7 +2,7 @@
 
 use std::{
 	cmp::Ordering,
-	fmt,
+	fmt::{self, Display},
 	ops::{Add, Neg, Sub},
 };
 
@@ -183,7 +183,7 @@ impl PartialOrd for ExtendedBigDecimal {
 	}
 }
 
-impl fmt::Display for ExtendedBigDecimal {
+impl Display for ExtendedBigDecimal {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::BigDecimal(value) => value.fmt(formatter),

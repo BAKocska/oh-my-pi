@@ -1,5 +1,7 @@
 //! Irreversible secret projection for export and other leakage boundaries.
 
+use std::fmt;
+
 use crate::{obfuscator::SecretObfuscator, rule::SecretRule};
 
 /// A one-way secret transform with no placeholder key or restoration registry.
@@ -11,8 +13,8 @@ pub struct SecretRedactor {
 	transform: SecretObfuscator,
 }
 
-impl std::fmt::Debug for SecretRedactor {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SecretRedactor {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("SecretRedactor")
 			.finish_non_exhaustive()

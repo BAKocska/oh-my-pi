@@ -1,6 +1,7 @@
 //! Explicit extension upgrade, rollback, pin, uninstall, and generation GC.
 
 use std::{
+	cmp,
 	collections::BTreeSet,
 	fs, io,
 	path::{Path, PathBuf},
@@ -10,7 +11,7 @@ use omp_core::Str;
 use serde::{Deserialize, Serialize};
 
 use super::{
-	ExtensionCode, ExtensionError,
+	ExtensionCode, ExtensionError, Layer,
 	lock::{InstalledRecord, LockFile, atomic_toml},
 };
 
@@ -199,7 +200,7 @@ pub fn commit_generation(
 pub fn load_generation(
 	generation_root: &Path,
 	generation_id: &str,
-	layer: super::Layer,
+	layer: Layer,
 ) -> Result<Generation, ExtensionError> {
 	let root = generation_root.join(generation_id);
 	Ok(Generation {
@@ -229,7 +230,7 @@ pub fn gc_generations(root: &Path, keep: usize, apply: bool) -> Result<GcReport,
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
 		.collect::<Vec<_>>();
-	entries.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+	entries.sort_by_key(|entry| cmp::Reverse(entry.file_name()));
 	let mut report = GcReport::default();
 	for entry in entries.into_iter().skip(keep) {
 		let path = entry.path();

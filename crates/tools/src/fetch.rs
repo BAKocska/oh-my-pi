@@ -1,7 +1,11 @@
 //! URL fetching through the shared reader-mode and document conversion
 //! pipeline.
 
-use std::{fmt, sync::Arc};
+use std::{
+	error,
+	fmt::{self, Display},
+	sync::Arc,
+};
 
 use async_stream::stream;
 use futures::Stream;
@@ -13,7 +17,10 @@ use omp_tool::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::read::{selector::ParsedSelector, web};
+use crate::read::{
+	selector::ParsedSelector,
+	web::{self, types::WebError},
+};
 
 /// Arguments accepted by `fetch@1`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -54,14 +61,14 @@ pub enum Fault {
 	},
 }
 
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Fetch { message } => f.write_str(message),
 		}
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// Fetch executor using the exact HTTP and markit pipeline owned by `read`.
 pub struct Fetch<C> {
@@ -222,13 +229,15 @@ fn protocol_issue(message: Str) -> ArgIssue {
 	}
 }
 
-fn fetch_fault(error: web::types::WebError) -> Fault {
+fn fetch_fault(error: WebError) -> Fault {
 	Fault::Fetch { message: error.message() }
 }
 
 #[cfg(test)]
 mod tests {
+
 	use super::*;
+	use crate::read::web::types::{HttpRequest, HttpResponse};
 
 	#[test]
 	fn raw_selector_bypasses_conversion_and_is_removed_from_url() {
@@ -250,11 +259,8 @@ mod tests {
 	#[derive(Clone)]
 	struct Client;
 	impl web::types::HttpClient for Client {
-		async fn get(
-			&self,
-			request: web::types::HttpRequest,
-		) -> Result<web::types::HttpResponse, web::types::WebError> {
-			Ok(web::types::HttpResponse {
+		async fn get(&self, request: HttpRequest) -> Result<HttpResponse, WebError> {
+			Ok(HttpResponse {
 				final_url:    request.url,
 				status:       200,
 				content_type: Some(sf!("text/html")),

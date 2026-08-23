@@ -5,8 +5,11 @@
 //! `warn`, …) and structural markup; the context decides what a border,
 //! cursor, or `warn` actually looks like on this terminal.
 
+use std::{time, time::Duration};
+
 use crate::{
-	color::SystemColor, component::Elements, frame::Color, markup::Border, runtime::ImageLoader,
+	Icon, TerminalCaps, anim::Frames, color::SystemColor, component::Elements, frame::Color,
+	markup::Border, rich, runtime::ImageLoader,
 };
 /// Terminal policy for Hangul Compatibility Jamo (`U+3131..=U+318E`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -95,13 +98,13 @@ impl Charset {
 	}
 
 	/// Resolves a semantic icon through this terminal's capability tier.
-	pub const fn icon(self, icon: crate::Icon) -> &'static str {
+	pub const fn icon(self, icon: Icon) -> &'static str {
 		icon.glyph(self)
 	}
 
 	/// Resolves a short icon name or qualified compatibility alias.
 	pub fn icon_named(self, name: &str) -> Option<&'static str> {
-		crate::Icon::from_name(name).map(|icon| self.icon(icon))
+		Icon::from_name(name).map(|icon| self.icon(icon))
 	}
 
 	/// Border glyph set for a box: `(tl, tr, bl, br, horizontal, vertical)`.
@@ -295,10 +298,10 @@ impl Charset {
 	}
 
 	/// Spinner animation frames for this tier.
-	pub const fn spinner(self) -> crate::anim::Frames {
+	pub const fn spinner(self) -> Frames {
 		match self {
-			Self::Ascii => crate::anim::Frames::SPINNER_ASCII,
-			_ => crate::anim::Frames::SPINNER,
+			Self::Ascii => Frames::SPINNER_ASCII,
+			_ => Frames::SPINNER,
 		}
 	}
 
@@ -587,7 +590,7 @@ pub struct UiContext {
 	/// it so size transitions can be sampled during layout, where no
 	/// [`crate::PaintCtx`] exists. Excluded from equality — a moving clock
 	/// must never read as a context change.
-	pub now:          std::time::Duration,
+	pub now:          Duration,
 	/// Cache-invalidation revision, advanced by [`crate::Ui::set_context`]
 	/// when a differing context is applied. Geometry and render memos fold
 	/// it into their keys so output derived from the previous context is
@@ -606,10 +609,10 @@ impl Default for UiContext {
 			charset:      Charset::default(),
 			graphics:     Graphics::default(),
 			native_decor: false,
-			jamo_width:   crate::rich::jamo_width(),
+			jamo_width:   rich::jamo_width(),
 			theme:        Theme::default(),
 			elements:     Elements::default(),
-			now:          std::time::Duration::default(),
+			now:          time::Duration::default(),
 			revision:     0,
 			loader:       None,
 		}
@@ -623,7 +626,7 @@ impl UiContext {
 	/// caches observe that change through [`crate::rich::width_config_epoch`].
 	pub fn set_jamo_width(&mut self, width: JamoWidth) -> bool {
 		self.jamo_width = width;
-		crate::rich::set_jamo_width(width)
+		rich::set_jamo_width(width)
 	}
 
 	/// Applies the detected terminal's capabilities: graphics tier, color
@@ -632,7 +635,7 @@ impl UiContext {
 	///
 	/// Capability values are `0` for platform default, `1` for narrow, and `2`
 	/// for wide.
-	pub fn apply_terminal_caps(&mut self, caps: &crate::TerminalCaps) -> bool {
+	pub fn apply_terminal_caps(&mut self, caps: &TerminalCaps) -> bool {
 		self.graphics = caps.graphics;
 		let mut changed = self.charset != caps.charset;
 		self.charset = caps.charset;
@@ -654,7 +657,7 @@ impl UiContext {
 	}
 
 	/// Returns this context configured for the detected terminal.
-	pub fn with_terminal_caps(mut self, caps: &crate::TerminalCaps) -> Self {
+	pub fn with_terminal_caps(mut self, caps: &TerminalCaps) -> Self {
 		self.apply_terminal_caps(caps);
 		self
 	}

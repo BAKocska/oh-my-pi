@@ -10,7 +10,8 @@ use std::{
 	borrow::Cow,
 	collections::HashSet,
 	ffi::OsString,
-	fs,
+	fmt::Display,
+	fs, io,
 	io::{Read, Write},
 	path::{Path, PathBuf},
 };
@@ -75,7 +76,7 @@ enum LnError {
 	Message(String),
 
 	#[error("{0}")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 }
 
 mod options {
@@ -103,7 +104,7 @@ matches_parser!(Ln, uu_app);
 
 type LnResult<T> = Result<T, LnError>;
 
-fn show_error(host: &mut Host, msg: impl std::fmt::Display) {
+fn show_error(host: &mut Host, msg: impl Display) {
 	let rendered = msg.to_string();
 	if !rendered.is_empty() {
 		let _ = writeln!(host.stderr, "ln: {rendered}");
@@ -130,7 +131,7 @@ fn read_yes(host: &mut Host) -> bool {
 	matches!(first, Some(b'y' | b'Y'))
 }
 
-fn prompt_yes(host: &mut Host, prompt: impl std::fmt::Display) -> bool {
+fn prompt_yes(host: &mut Host, prompt: impl Display) -> bool {
 	let _ = write!(host.stderr, "ln: {prompt} ");
 	let _ = host.stderr.flush();
 	read_yes(host)
@@ -576,7 +577,7 @@ fn link(host: &mut Host, src: &Path, dst: &Path, settings: &Settings) -> LnResul
 	Ok(())
 }
 
-fn strip_errno(error: &std::io::Error) -> String {
+fn strip_errno(error: &io::Error) -> String {
 	let rendered = error.to_string();
 	rendered
 		.rsplit_once(" (os error ")
@@ -589,16 +590,12 @@ fn make_symlink<P1: AsRef<Path>, P2: AsRef<Path>>(
 	_host: &Host,
 	src: P1,
 	dst: P2,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
 	symlink(src, dst)
 }
 
 #[cfg(windows)]
-fn make_symlink<P1: AsRef<Path>, P2: AsRef<Path>>(
-	host: &Host,
-	src: P1,
-	dst: P2,
-) -> std::io::Result<()> {
+fn make_symlink<P1: AsRef<Path>, P2: AsRef<Path>>(host: &Host, src: P1, dst: P2) -> io::Result<()> {
 	if host.resolve(src.as_ref()).is_dir() {
 		symlink_dir(src, dst)
 	} else {
@@ -611,11 +608,8 @@ fn make_symlink<P1: AsRef<Path>, P2: AsRef<Path>>(
 	_host: &Host,
 	_src: P1,
 	_dst: P2,
-) -> std::io::Result<()> {
-	Err(std::io::Error::new(
-		std::io::ErrorKind::Unsupported,
-		"symlinks not supported on this platform",
-	))
+) -> io::Result<()> {
+	Err(io::Error::new(io::ErrorKind::Unsupported, "symlinks not supported on this platform"))
 }
 
 #[cfg(test)]
@@ -657,7 +651,10 @@ mod tests {
 		let (_dir, root) = canonical_tempdir();
 		fs::create_dir(root.join("dir_a")).unwrap();
 		fs::create_dir(root.join("dir_b")).unwrap();
-		std::os::unix::fs::symlink("dir_a", root.join("cur")).unwrap();
+		{
+			use std::os::unix::fs;
+			fs::symlink("dir_a", root.join("cur")).unwrap();
+		}
 		let (code, stdout, stderr) = run_in(root.clone(), &["-sfh", "dir_b", "cur"]);
 		assert_eq!((code, stdout.as_str(), stderr.as_str()), (0, "", ""));
 		assert_eq!(fs::read_link(root.join("cur")).unwrap(), PathBuf::from("dir_b"));

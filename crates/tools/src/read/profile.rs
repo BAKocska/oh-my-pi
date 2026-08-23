@@ -4,6 +4,7 @@ use std::{
 	cmp::Reverse,
 	collections::{HashMap, HashSet},
 	fmt::Write as _,
+	mem,
 	path::Path,
 };
 
@@ -78,7 +79,7 @@ fn merge_into(a: &mut ProfileNode, b: ProfileNode) {
 fn flatten_recursion(node: &mut ProfileNode) {
 	while node.children.iter().any(|child| child.key == node.key) {
 		node.recursion += 1;
-		let children = std::mem::take(&mut node.children);
+		let children = mem::take(&mut node.children);
 		let mut next: Vec<ProfileNode> = Vec::new();
 		for child in children {
 			let promoted = if child.key == node.key {
@@ -947,6 +948,8 @@ pub fn render_sample_profile(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+	use std::iter;
+
 	use super::*;
 
 	const CPU_PROFILE: &str = r#"{"nodes":[{"id":1,"callFrame":{"functionName":"(root)"},"children":[2]},{"id":2,"callFrame":{"functionName":"work","url":"file:///tmp/work.js","lineNumber":0},"hitCount":1,"children":[]}],"startTime":0,"endTime":1,"samples":[2],"timeDeltas":[1]}"#;
@@ -1012,7 +1015,7 @@ mod tests {
 	#[test]
 	fn summary_cap_is_inclusive_and_oversized_input_falls_through() {
 		let mut at_cap = CPU_PROFILE.to_owned();
-		at_cap.extend(std::iter::repeat_n(' ', MAX_PROFILE_SUMMARY_BYTES as usize - at_cap.len()));
+		at_cap.extend(iter::repeat_n(' ', MAX_PROFILE_SUMMARY_BYTES as usize - at_cap.len()));
 		assert!(render_profile(Path::new("profile.cpuprofile"), &at_cap).is_some());
 
 		at_cap.push(' ');

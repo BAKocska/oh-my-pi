@@ -1,12 +1,13 @@
 //! Durable session exports from one canonical live-journal projection.
 
 use std::{
-	fs,
+	fs, io,
 	path::{Path, PathBuf},
 };
 
+use omp_core::Str;
 use omp_storage::{
-	index::{SessionIndex, SessionInfo},
+	index::{self, SessionIndex, SessionInfo},
 	transcript::{
 		SessionId, codec,
 		reader::{self, Entry},
@@ -18,25 +19,36 @@ use thiserror::Error;
 
 const MAX_EMBEDDED_ARTIFACT: u64 = 8 * 1024 * 1024;
 
+/// Failure to project, serialize, or write a durable session export.
 #[derive(Debug, Error)]
 pub enum ExportError {
+	/// A journal record could not be decoded into the live projection.
 	#[error("failed to read session journal: {0}")]
 	Journal(#[from] codec::Error),
+	/// An input path, lineage database, or export output could not be accessed.
 	#[error("failed to read export input: {0}")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
+	/// The session tree could not be encoded as JSON for the HTML viewer.
 	#[error("failed to serialize export: {0}")]
 	Json(#[from] serde_json::Error),
+	/// The session tree could not be encoded as YAML.
 	#[error("failed to serialize YAML export: {0}")]
 	Yaml(#[from] serde_yaml::Error),
+	/// Durable lineage metadata could not be queried.
 	#[error("failed to query durable session lineage: {0}")]
-	Index(#[from] omp_storage::index::Error),
+	Index(#[from] index::Error),
 }
 
+/// Sanitized live-journal projection with any indexed descendant sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTree {
+	/// Durable session identifier from the journal header.
 	pub id:       String,
+	/// Session creation time in Unix epoch milliseconds.
 	pub created:  u64,
+	/// Peer-visible live events in journal order, with local paths removed.
 	pub entries:  Vec<Value>,
+	/// Descendant sessions whose indexed journal files remain available.
 	pub children: Vec<SessionTree>,
 }
 
@@ -53,7 +65,7 @@ impl SessionTree {
 			.join("sessions.sqlite3");
 		if index_path.is_file() {
 			let index = SessionIndex::open_authoritative_reader(index_path)?;
-			let root_id = SessionId(omp_core::Str::new(root.id.as_str()));
+			let root_id = SessionId(Str::new(root.id.as_str()));
 			let lineage = index.subagent_tree(&root_id)?;
 			root.children = load_indexed_children(&root_id, &lineage, sessions_dir)?;
 		}
@@ -152,7 +164,7 @@ fn sanitize_value(value: &mut Value) {
 
 /// Resolves an artifact only when it remains under `root`, is a regular file,
 /// and is bounded.
-pub fn safe_artifact(root: &Path, relative: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
+pub fn safe_artifact(root: &Path, relative: &Path) -> Result<Option<Vec<u8>>, io::Error> {
 	if relative.is_absolute() {
 		return Ok(None);
 	}
@@ -298,10 +310,12 @@ let dragging=false;grip.onpointerdown=e=>{dragging=true;grip.setPointerCapture(e
 buildFilters();drawNav(model);draw();
 "#;
 
+/// Serializes a session tree as YAML while preserving entry and child order.
 pub fn render_yaml(tree: &SessionTree) -> Result<String, ExportError> {
 	Ok(serde_yaml::to_string(tree)?)
 }
 
+/// Renders presentable text from the session hierarchy as Markdown headings.
 pub fn render_markdown(tree: &SessionTree) -> String {
 	fn append_tree(output: &mut String, tree: &SessionTree, depth: usize) {
 		let heading = "#".repeat(depth.saturating_add(1).min(6));
@@ -366,10 +380,14 @@ pub enum ExportFormat {
 	Html,
 }
 
+/// Loads a journal and its indexed descendants, then writes a self-contained
+/// HTML viewer.
 pub fn export_session(path: &Path, output: &Path) -> Result<PathBuf, ExportError> {
 	export_session_as(path, output, ExportFormat::Html)
 }
 
+/// Loads a journal tree and writes the requested durable representation to
+/// `output`.
 pub fn export_session_as(
 	path: &Path,
 	output: &Path,

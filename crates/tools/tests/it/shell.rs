@@ -1,11 +1,11 @@
 //! Behavioral contracts for the persistent native `shell@1` executor.
 
-use std::{collections::VecDeque, io::Cursor, sync::Arc};
+use std::{collections::VecDeque, convert, future, io::Cursor, sync::Arc, thread, time::Duration};
 
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, executor::block_on, pin_mut};
 use omp_core::{CowBytes, Str, sf};
-use omp_proto::inference::v1::invoke_input;
+use omp_proto::inference::v1::invoke_input::{self, chunk};
 use omp_tool::{
 	Abort, ArtifactLifetime, CallOutcome, CallOutcomeDetails, CallOutcomeSpill, CapsBase, Claims,
 	ErasedEv, ErasedOutcome, Ev, IncomingParams, Interrupt, JobOwner, ModelClass, Part, Precedence,
@@ -19,6 +19,7 @@ use omp_tools::{
 	},
 };
 use parking_lot::Mutex;
+use tokio::{task, time};
 
 #[derive(Default)]
 struct State {
@@ -38,7 +39,7 @@ struct RecordingSpill {
 }
 
 impl CallOutcomeSpill for RecordingSpill {
-	type Error = std::convert::Infallible;
+	type Error = convert::Infallible;
 	type Stage<'a> = Cursor<Vec<u8>>;
 
 	fn open(&self) -> Result<Self::Stage<'_>, Self::Error> {
@@ -82,11 +83,11 @@ impl ShellRun for FakeRun {
 	fn cancel(&self) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
 		self.state.lock().cancels += 1;
 		*self.cancelled.lock() = Some(RunEvent::Exit(status(ExecOutcome::Cancelled)));
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 
 	fn detach(&self, name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
-		std::future::ready(Ok(DetachedJob {
+		future::ready(Ok(DetachedJob {
 			id:    sf!("process:{name}:1"),
 			owner: JobOwner::NamedProcess { name, generation: 1 },
 		}))
@@ -106,12 +107,12 @@ impl ShellExec for FakeExec {
 		if state.cwd.is_empty() {
 			state.cwd = "/workspace".into();
 		}
-		std::future::ready(Ok(Session { id: Bytes::from(format!("session-{}", state.opens)) }))
+		future::ready(Ok(Session { id: Bytes::from(format!("session-{}", state.opens)) }))
 	}
 
 	fn close_session(&self, _: &Session) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
 		self.state.lock().closes += 1;
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 
 	fn run<'a>(
@@ -187,7 +188,7 @@ impl ShellExec for FakeExec {
 			},
 			_ => events.push_back(RunEvent::Exit(status(ExecOutcome::Exited))),
 		}
-		std::future::ready(Ok(FakeRun {
+		future::ready(Ok(FakeRun {
 			events,
 			cancelled: Arc::new(Mutex::new(None)),
 			state: Arc::clone(&self.state),
@@ -428,8 +429,7 @@ fn async_returns_a_named_session_lifetime_job_reference() {
 
 #[tokio::test]
 async fn foreground_wait_threshold_detaches_the_exact_running_command() {
-	let tool =
-		shell::shell(FakeExec::default()).with_auto_background(true, std::time::Duration::ZERO);
+	let tool = shell::shell(FakeExec::default()).with_auto_background(true, Duration::ZERO);
 	let (feed, params) = IncomingParams::channel();
 	feed
 		.args_committed(sf!(r#"{{"command":"wait"}}"#))
@@ -452,9 +452,9 @@ fn interrupt_during_async_setup_reports_effect_uncertainty() {
 		.args_committed(sf!(r#"{{"command":"pending-detach","async":true,"name":"pending"}}"#,))
 		.unwrap();
 	let wait_state = Arc::clone(&exec.state);
-	let interrupter = std::thread::spawn(move || {
+	let interrupter = thread::spawn(move || {
 		while wait_state.lock().detaches.is_empty() {
-			std::thread::yield_now();
+			thread::yield_now();
 		}
 		feed
 			.interrupt(Interrupt { class: sf!("immediate"), reason: sf!("stop detach") })
@@ -489,9 +489,9 @@ fn output_update_clones_share_owned_bytes() {
 fn shell_updates_map_exactly_to_live_invoke_input_chunks() {
 	let tool = shell::shell(FakeExec::default());
 	for (source, expected) in [
-		(OutputChannel::Stdout, invoke_input::chunk::Channel::Stdout),
-		(OutputChannel::Stderr, invoke_input::chunk::Channel::Stderr),
-		(OutputChannel::Pty, invoke_input::chunk::Channel::Stdout),
+		(OutputChannel::Stdout, chunk::Channel::Stdout),
+		(OutputChannel::Stderr, chunk::Channel::Stderr),
+		(OutputChannel::Pty, chunk::Channel::Stdout),
 	] {
 		let update = Update {
 			channel:  source,
@@ -567,7 +567,7 @@ async fn overlapping_foreground_runs_use_isolated_sessions() {
 			.await
 	});
 	while exec.state.lock().runs.is_empty() {
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 	}
 
 	let isolated_registry = Arc::clone(&registry);
@@ -579,7 +579,7 @@ async fn overlapping_foreground_runs_use_isolated_sessions() {
 			.collect::<Vec<_>>()
 			.await
 	});
-	let isolated_events = tokio::time::timeout(std::time::Duration::from_secs(1), isolated)
+	let isolated_events = time::timeout(Duration::from_secs(1), isolated)
 		.await
 		.expect("isolated execution timeout")
 		.expect("isolated invocation");
@@ -593,7 +593,7 @@ async fn overlapping_foreground_runs_use_isolated_sessions() {
 	active_feed
 		.interrupt(Interrupt { class: sf!("immediate"), reason: sf!("stop active") })
 		.unwrap();
-	let active_events = tokio::time::timeout(std::time::Duration::from_secs(1), active)
+	let active_events = time::timeout(Duration::from_secs(1), active)
 		.await
 		.expect("active interrupt timeout")
 		.expect("active invocation");

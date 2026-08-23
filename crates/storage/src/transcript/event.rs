@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 
 use omp_core::{Hash32, Principal, Provenance, Str};
-use omp_proto::thread::v1::Item;
+use omp_proto::{
+	inference::v1,
+	thread::v1::{Item, Thread},
+};
 use serde_json::{
 	Value,
 	value::{RawValue, to_raw_value},
@@ -59,7 +62,7 @@ pub struct TurnReceipt {
 	/// Physical event indexes of canonical items emitted by the outcome.
 	pub item_events:        Vec<u64>,
 	/// Complete authoritative terminal gateway outcome.
-	pub outcome:            omp_proto::inference::v1::Outcome,
+	pub outcome:            v1::Outcome,
 }
 
 impl Eq for TurnReceipt {}
@@ -70,14 +73,14 @@ pub enum TurnInputRecord {
 	/// Complete thread for a stateless turn or context seed.
 	Full {
 		/// Exact submitted canonical thread.
-		thread: omp_proto::thread::v1::Thread,
+		thread: Thread,
 	},
 	/// Atomic delta against one held gateway context revision.
 	Delta {
 		/// Exact context identity and optimistic-concurrency stamp.
-		context: omp_proto::inference::v1::ContextRef,
+		context: v1::ContextRef,
 		/// Exact submitted truncate-and-append delta.
-		delta:   omp_proto::inference::v1::ThreadDelta,
+		delta:   v1::ThreadDelta,
 	},
 }
 
@@ -89,11 +92,11 @@ pub struct TurnOptionsRecord {
 	/// Context seeded by a full input, absent for stateless turns.
 	pub context_id: Option<Str>,
 	/// Canonical chat parameters.
-	pub params:     omp_proto::inference::v1::ChatParams,
+	pub params:     v1::ChatParams,
 	/// In-turn invocation capability.
-	pub executor:   Option<omp_proto::inference::v1::Executor>,
+	pub executor:   Option<v1::Executor>,
 	/// Namespaced turn-level properties.
-	pub props:      Option<omp_proto::inference::v1::ValueMap>,
+	pub props:      Option<v1::ValueMap>,
 }
 
 impl Eq for TurnOptionsRecord {}

@@ -1,7 +1,7 @@
 //! `omp-sh`: the standalone omp shell binary (`-c command`, script file, or
 //! stdin).
 
-use std::{env, io::Read as _, process::ExitCode};
+use std::{env, io, io::Read as _, mem, process::ExitCode};
 
 use omp_shell::{
 	Error, ExecutionExitCode, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellExtensions,
@@ -50,7 +50,7 @@ async fn run() -> u8 {
 
 	let reads_stdin = matches!(invocation, Invocation::Stdin);
 	let (shell_name, shell_args) = match &mut invocation {
-		Invocation::Command { name, args, .. } => (std::mem::take(name), std::mem::take(args)),
+		Invocation::Command { name, args, .. } => (mem::take(name), mem::take(args)),
 		Invocation::Script { path, .. } => (path.clone(), Vec::new()),
 		Invocation::Stdin => ("omp-sh".into(), Vec::new()),
 	};
@@ -86,7 +86,7 @@ async fn run() -> u8 {
 		Invocation::Script { path, args } => shell.run_script(path, args.into_iter()).await,
 		Invocation::Stdin => {
 			let mut command = String::new();
-			if let Err(error) = std::io::stdin().read_to_string(&mut command) {
+			if let Err(error) = io::stdin().read_to_string(&mut command) {
 				return report_error(&shell, error.into());
 			}
 			let params = shell.default_exec_params();
@@ -105,6 +105,6 @@ async fn run() -> u8 {
 }
 
 fn report_error(shell: &Shell<impl ShellExtensions>, error: Error) -> u8 {
-	let _ = shell.display_error(&mut std::io::stderr().lock(), &error);
+	let _ = shell.display_error(&mut io::stderr().lock(), &error);
 	error.into_result(shell).exit_code.into()
 }

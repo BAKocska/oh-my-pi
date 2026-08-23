@@ -2,8 +2,9 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet, btree_map::Entry},
-	sync::{Arc, Weak},
-	time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+	mem,
+	sync::{Arc, Weak, atomic},
+	time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -15,12 +16,17 @@ use omp_proto::{
 		AttachOutput, ExecStatusMsg, ListProcesses, ProcessInfo, ProcessOutput, ProcessState,
 		StopProcess,
 	},
-	thread::v1 as thread,
+	thread::v1::{self as thread, item},
 };
 use omp_tool::{ArtifactLifetime, JobOwner, JobRef, JobStatus};
 use parking_lot::{Mutex, MutexGuard};
 use serde::Serialize;
-use tokio::{sync::watch, task::AbortHandle};
+use tokio::{
+	runtime,
+	sync::{watch, watch::Receiver},
+	task::AbortHandle,
+	time,
+};
 
 use crate::mailbox::{Interrupt, InterruptClass, InterruptSource, MailboxSender};
 
@@ -58,16 +64,16 @@ struct JobBoardInner {
 	recent:       Mutex<BTreeMap<Str, JobRef>>,
 	max_running:  usize,
 	retention:    StdDuration,
-	next_id:      std::sync::atomic::AtomicU64,
+	next_id:      atomic::AtomicU64,
 	poll:         Mutex<BTreeMap<Str, PollState>>,
 	dead_letters: Mutex<BTreeMap<Str, JobRef>>,
-	generation:   tokio::sync::watch::Sender<u64>,
+	generation:   watch::Sender<u64>,
 }
 
 #[derive(Clone, Copy)]
 struct PollState {
 	level:    usize,
-	last_end: std::time::Instant,
+	last_end: Instant,
 }
 
 struct JobEntry {
@@ -80,7 +86,7 @@ struct JobEntry {
 
 impl Drop for JobBoardInner {
 	fn drop(&mut self) {
-		for (_, watcher) in std::mem::take(self.watchers.get_mut()) {
+		for (_, watcher) in mem::take(self.watchers.get_mut()) {
 			watcher.abort();
 		}
 	}
@@ -111,7 +117,7 @@ impl JobBoard {
 				recent: Mutex::new(BTreeMap::new()),
 				max_running,
 				retention,
-				next_id: std::sync::atomic::AtomicU64::new(1),
+				next_id: atomic::AtomicU64::new(1),
 				poll: Mutex::new(BTreeMap::new()),
 				dead_letters: Mutex::new(BTreeMap::new()),
 				generation: watch::channel(0).0,
@@ -125,7 +131,7 @@ impl JobBoard {
 			self
 				.inner
 				.next_id
-				.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+				.fetch_add(1, atomic::Ordering::Relaxed)
 				.to_string(),
 		)
 	}
@@ -411,7 +417,7 @@ impl JobBoard {
 
 	/// Selects the next adaptive smart-wait deadline for one owner.
 	pub fn next_smart_wait(&self, owner: &str) -> StdDuration {
-		let now = std::time::Instant::now();
+		let now = Instant::now();
 		let mut states = self.inner.poll.lock();
 		match states.entry(Str::new(owner)) {
 			Entry::Vacant(entry) => {
@@ -435,8 +441,8 @@ impl JobBoard {
 		let mut states = self.inner.poll.lock();
 		let state = states
 			.entry(Str::new(owner))
-			.or_insert(PollState { level: 0, last_end: std::time::Instant::now() });
-		state.last_end = std::time::Instant::now();
+			.or_insert(PollState { level: 0, last_end: Instant::now() });
+		state.last_end = Instant::now();
 	}
 
 	/// Cancels owner-scoped named processes and waits through actual settlement.
@@ -491,7 +497,7 @@ impl JobBoard {
 			}
 		};
 		match timeout {
-			Some(timeout) => tokio::time::timeout(timeout, wait).await.unwrap_or(false),
+			Some(timeout) => time::timeout(timeout, wait).await.unwrap_or(false),
 			None => wait.await,
 		}
 	}
@@ -789,7 +795,7 @@ impl Drop for SettlementLease {
 pub struct JobWatch {
 	inner:      Arc<JobBoardInner>,
 	ids:        BTreeSet<Str>,
-	generation: tokio::sync::watch::Receiver<u64>,
+	generation: Receiver<u64>,
 }
 
 impl JobWatch {
@@ -851,11 +857,11 @@ fn schedule_retention(inner: Weak<JobBoardInner>, job_id: Str, retention: StdDur
 		}
 		return;
 	}
-	let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+	let Ok(runtime) = runtime::Handle::try_current() else {
 		return;
 	};
 	runtime.spawn(async move {
-		tokio::time::sleep(retention).await;
+		time::sleep(retention).await;
 		let Some(inner) = inner.upgrade() else { return };
 		inner.recent.lock().remove(&job_id);
 		let removed = {
@@ -917,7 +923,7 @@ fn schedule_delivery_retry(inner: Weak<JobBoardInner>, job_id: Str) {
 	);
 	let weak = Arc::downgrade(&inner);
 	tokio::spawn(async move {
-		tokio::time::sleep(exponential.saturating_add(jitter)).await;
+		time::sleep(exponential.saturating_add(jitter)).await;
 		let Some(inner) = weak.upgrade() else { return };
 		let mut pending = inner.pending.lock();
 		if inner.flush_locked(&job_id, &mut pending).is_err() {
@@ -1127,7 +1133,7 @@ const fn system_item(parts: Vec<thread::Part>) -> thread::Item {
 	thread::Item {
 		seq:           0,
 		created_at_ms: 0,
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role: thread::Role::System as i32,
 			parts,
 		})),
@@ -1198,6 +1204,7 @@ impl<'a> From<&'a ExecStatusMsg> for StatusRecord<'a> {
 #[cfg(test)]
 mod tests {
 	use std::{
+		sync,
 		sync::atomic::{AtomicUsize, Ordering},
 		thread as std_thread,
 	};
@@ -1212,7 +1219,7 @@ mod tests {
 		JobRef {
 			id:       Str::new(id),
 			owner:    JobOwner::NamedProcess { name: Str::new(id), generation: 1 },
-			metadata: std::sync::Arc::default(),
+			metadata: sync::Arc::default(),
 			artifact: ExpectedArtifact {
 				description: sf!("detached output"),
 				media_type: None,
@@ -1317,13 +1324,15 @@ mod tests {
 		assert!(board.register(job("recent", ArtifactLifetime::Session)));
 		assert!(board.settle("recent", thread::Item::default()).unwrap());
 		assert_eq!(board.snapshot().len(), 1);
-		tokio::time::sleep(StdDuration::from_millis(30)).await;
+		time::sleep(StdDuration::from_millis(30)).await;
 		assert!(board.snapshot().is_empty());
 	}
 }
 
 #[cfg(test)]
 mod watch_tests {
+	use std::sync;
+
 	use omp_core::sf;
 	use omp_tool::{ArtifactLifetime, ExpectedArtifact};
 
@@ -1334,7 +1343,7 @@ mod watch_tests {
 		JobRef {
 			id:       Str::new(id),
 			owner:    JobOwner::NamedProcess { name: Str::new(id), generation: 1 },
-			metadata: std::sync::Arc::default(),
+			metadata: sync::Arc::default(),
 			artifact: ExpectedArtifact {
 				description: sf!("detached output"),
 				media_type:  None,

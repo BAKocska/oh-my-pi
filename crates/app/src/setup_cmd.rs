@@ -1,8 +1,9 @@
 //! Standalone onboarding, embedded-Python, and speech-asset setup.
 
-use std::{cell::Cell, io::IsTerminal as _, str::FromStr as _};
+use std::{cell::Cell, fs, io, io::IsTerminal as _, path::Path, str::FromStr as _};
 
 use miette::{IntoDiagnostic as _, miette};
+use omp_catalog::snapshot;
 use omp_chat_ui::ListRow;
 use omp_core::Str;
 use omp_inference::local::{
@@ -12,17 +13,22 @@ use omp_inference::local::{
 };
 use serde_json::json;
 
-use crate::cli::{SetupArgs, SetupCommand};
+use crate::{
+	cli::{SetupArgs, SetupCommand},
+	pickers,
+	progress_reporter::ProgressReporter,
+	wizard,
+};
 
 /// Executes one standalone setup flow.
 pub async fn run(args: SetupArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
-	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
+	fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command.unwrap_or(SetupCommand::Wizard) {
 		SetupCommand::Wizard => {
-			let catalog = omp_catalog::snapshot::Catalog::try_embedded()
-				.map_err(|error| miette!(error.to_string()))?;
-			crate::wizard::run(&data_dir, catalog).await?;
+			let catalog =
+				snapshot::Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
+			wizard::run(&data_dir, catalog).await?;
 			Ok(())
 		},
 		SetupCommand::Python { json } => python(json),
@@ -56,14 +62,14 @@ fn python(json_output: bool) -> miette::Result<()> {
 }
 
 async fn speech(
-	data_dir: &std::path::Path,
+	data_dir: &Path,
 	mut model: Option<String>,
 	check: bool,
 	json_output: bool,
 	quiet: bool,
 ) -> miette::Result<()> {
 	let root = data_dir.join("models");
-	std::fs::create_dir_all(&root).into_diagnostic()?;
+	fs::create_dir_all(&root).into_diagnostic()?;
 	let store = ArtifactStore::open(&root).into_diagnostic()?;
 	let manifests = SpeechArtifactManifests::pi_parity().into_diagnostic()?;
 	let cancel = LocalCancellation::new();
@@ -96,7 +102,7 @@ async fn speech(
 			.ok_or_else(|| miette!("one or more speech assets are missing"));
 	}
 	if model.is_none() {
-		if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+		if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
 			return Err(miette!("speech setup requires MODEL when standard I/O is not a terminal"));
 		}
 		let mut rows = snapshot
@@ -114,7 +120,7 @@ async fn speech(
 			label:  Str::new_static("Kokoro-82M"),
 			detail: Str::new_static("Local text-to-speech model and curated voices"),
 		});
-		model = crate::pickers::run_list("Select speech model", &rows)
+		model = pickers::run_list("Select speech model", &rows)
 			.await
 			.into_diagnostic()?
 			.map(|index| rows[index].key.to_string());
@@ -131,11 +137,8 @@ async fn speech(
 		manifests.stt_manifest(preset)
 	};
 	let total = manifest.total_bytes().into_diagnostic()?;
-	let progress = crate::progress_reporter::ProgressReporter::bounded(
-		total,
-		format!("downloading {model}"),
-		quiet || json_output,
-	);
+	let progress =
+		ProgressReporter::bounded(total, format!("downloading {model}"), quiet || json_output);
 	let prior = Cell::new(0_u64);
 	store
 		.acquire(manifest, &SystemArtifactFetcher::new(), &cancel, |update| {

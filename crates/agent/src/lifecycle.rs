@@ -7,7 +7,10 @@ use std::{
 
 use omp_core::Str;
 use thiserror::Error;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::{
+	task::{JoinError, JoinHandle},
+	time,
+};
 
 use crate::PromptMemoryInput;
 
@@ -249,7 +252,7 @@ pub async fn shutdown_ordered(
 			}
 			break;
 		}
-		match tokio::time::timeout(remaining, &mut task.task).await {
+		match time::timeout(remaining, &mut task.task).await {
 			Ok(Ok(())) => outcomes.push(ShutdownOutcome::Settled(task.stage)),
 			Ok(Err(source)) => outcomes.push(ShutdownOutcome::Failed { stage: task.stage, source }),
 			Err(_) => {

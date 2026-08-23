@@ -11,6 +11,7 @@ use std::{
 use clap::{
 	Arg, ArgAction, ArgMatches, Command,
 	builder::{TypedValueParser, ValueParserFactory},
+	error,
 };
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 
@@ -49,10 +50,10 @@ impl TypedValueParser for NonEmptyOsStringParser {
 		value: &OsStr,
 	) -> Result<Self::Value, clap::Error> {
 		if value.is_empty() {
-			let mut err = clap::Error::new(clap::error::ErrorKind::ValueValidation);
+			let mut err = clap::Error::new(error::ErrorKind::ValueValidation);
 			err.insert(
-				clap::error::ContextKind::Custom,
-				clap::error::ContextValue::String("invalid operand: empty string".to_string()),
+				error::ContextKind::Custom,
+				error::ContextValue::String("invalid operand: empty string".to_string()),
 			);
 			return Err(err);
 		}
@@ -370,9 +371,10 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn resolves_relative_operand_against_host_cwd() {
+		use std::{fs::write, os::unix::fs};
 		let (_dir, root) = canonical_tempdir();
-		fs::write(root.join("target"), b"x").unwrap();
-		std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+		write(root.join("target"), b"x").unwrap();
+		fs::symlink("target", root.join("link")).unwrap();
 
 		let (code, capture) = run_util::<Realpath>(&["link"], "", root.clone());
 		assert_eq!(code, 0);
@@ -438,9 +440,10 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn strip_keeps_symlinks_unresolved() {
+		use std::{fs::write, os::unix::fs};
 		let (_dir, root) = canonical_tempdir();
-		fs::write(root.join("target"), b"x").unwrap();
-		std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+		write(root.join("target"), b"x").unwrap();
+		fs::symlink("target", root.join("link")).unwrap();
 
 		let (code, capture) = run_util::<Realpath>(&["-s", "link"], "", root.clone());
 		assert_eq!(code, 0);

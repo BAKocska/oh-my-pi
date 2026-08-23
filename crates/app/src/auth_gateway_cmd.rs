@@ -1,6 +1,7 @@
 //! Credential-injecting gateway administration over the canonical daemon.
 
 use std::{
+	fs, io,
 	net::SocketAddr,
 	path::{Path, PathBuf},
 };
@@ -16,6 +17,7 @@ use tonic::{Request, metadata::MetadataValue};
 use zeroize::Zeroizing;
 
 use crate::{
+	auth_broker_cmd,
 	cli::{AuthGatewayArgs, AuthGatewayCommand},
 	daemon::{DaemonConfig, DaemonHandle},
 	endpoint::LocalEndpoint,
@@ -26,7 +28,7 @@ const TOKEN_FILE: &str = "auth-gateway.token";
 /// Starts, rotates, and health-checks the gateway without owning credentials.
 pub async fn run(args: AuthGatewayArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
-	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
+	fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command {
 		AuthGatewayCommand::Serve { bind, no_auth } => {
 			let config = if no_auth {
@@ -55,7 +57,7 @@ pub async fn run(args: AuthGatewayArgs) -> miette::Result<()> {
 					token: &'a str,
 					path:  &'a Path,
 				}
-				serde_json::to_writer(std::io::stdout().lock(), &TokenOutput {
+				serde_json::to_writer(io::stdout().lock(), &TokenOutput {
 					token: &token,
 					path:  &path,
 				})
@@ -101,7 +103,7 @@ async fn status(data_dir: &Path, bind: SocketAddr, json: bool) -> miette::Result
 		));
 	}
 	if json {
-		serde_json::to_writer(std::io::stdout().lock(), &response).into_diagnostic()?;
+		serde_json::to_writer(io::stdout().lock(), &response).into_diagnostic()?;
 		println!();
 	} else {
 		println!(
@@ -134,7 +136,7 @@ async fn check(data_dir: &Path, bind: SocketAddr, strict: bool, json: bool) -> m
 		.filter(|health| !health.healthy)
 		.count();
 	if json {
-		serde_json::to_writer(std::io::stdout().lock(), &response).into_diagnostic()?;
+		serde_json::to_writer(io::stdout().lock(), &response).into_diagnostic()?;
 		println!();
 	} else {
 		for health in &response.credentials {
@@ -174,7 +176,7 @@ fn token_path(data_dir: &Path) -> PathBuf {
 }
 
 fn read_token(data_dir: &Path) -> miette::Result<Zeroizing<String>> {
-	let token = Zeroizing::new(std::fs::read_to_string(token_path(data_dir)).into_diagnostic()?);
+	let token = Zeroizing::new(fs::read_to_string(token_path(data_dir)).into_diagnostic()?);
 	if token.trim().is_empty() {
 		return Err(miette!("gateway bearer token file is empty"));
 	}
@@ -191,7 +193,7 @@ fn ensure_token(data_dir: &Path, regenerate: bool) -> miette::Result<Zeroizing<S
 		.fill(bytes.as_mut())
 		.map_err(|_| miette!("system random source failed"))?;
 	let token = Zeroizing::new(omp_core::hex::encode(&*bytes).into_string());
-	crate::auth_broker_cmd::write_owner_only(&path, token.as_bytes())?;
+	auth_broker_cmd::write_owner_only(&path, token.as_bytes())?;
 	Ok(token)
 }
 

@@ -5,6 +5,8 @@ pub mod fd;
 pub mod fs;
 pub(crate) mod network;
 pub mod poll;
+use nix::errno::Errno;
+
 use crate::error;
 pub use crate::sys::tokio_process as process;
 pub mod resource;
@@ -17,11 +19,11 @@ pub(crate) mod users;
 pub enum PlatformError {
 	/// A system error occurred.
 	#[error("system error: {0}")]
-	ErrnoError(#[from] nix::errno::Errno),
+	ErrnoError(#[from] Errno),
 }
 
-impl From<nix::errno::Errno> for error::ErrorKind {
-	fn from(err: nix::errno::Errno) -> Self {
+impl From<Errno> for error::ErrorKind {
+	fn from(err: Errno) -> Self {
 		PlatformError::ErrnoError(err).into()
 	}
 }

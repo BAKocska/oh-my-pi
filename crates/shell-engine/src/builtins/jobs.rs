@@ -2,7 +2,7 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins, jobs};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins, jobs};
 
 /// Manage jobs.
 #[derive(Parser)]
@@ -33,12 +33,12 @@ pub(crate) struct JobsCommand {
 }
 
 impl builtins::Command for JobsCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		if self.list_changed_only {
 			for (job, result) in context.shell.jobs_mut().poll()? {
 				result?;
@@ -71,9 +71,9 @@ impl builtins::Command for JobsCommand {
 impl JobsCommand {
 	fn display_job(
 		&self,
-		context: &crate::ExecutionContext<'_, impl crate::ShellExtensions>,
+		context: &ExecutionContext<'_, impl ShellExtensions>,
 		job: &jobs::Job,
-	) -> Result<(), crate::Error> {
+	) -> Result<(), Error> {
 		if self.running_jobs_only && !matches!(job.state, jobs::JobState::Running) {
 			return Ok(());
 		}

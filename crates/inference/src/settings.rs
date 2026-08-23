@@ -3,17 +3,22 @@
 
 #![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 
-use std::{collections::BTreeMap, sync::LazyLock, time::Duration};
+use std::{collections::BTreeMap, sync, sync::LazyLock, time::Duration};
 
-use omp_catalog::{ModelKey, ProviderId, settings::FallbackChains};
+use omp_catalog::{
+	ModelKey, ProviderId,
+	settings::{CacheRetentionSetting, FallbackChains},
+};
 use omp_core::Str;
 use omp_settings::{
 	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::{
+	Call,
 	call::{CacheRetention, ChatRequest, OperationCall, Setting, TextVerbosity},
 	layer::retry::RetryBackoff,
 	receipt::ExecutionBudget,
@@ -117,7 +122,7 @@ impl Default for RetrySettings {
 	}
 }
 
-static ACTIVE_FALLBACKS: LazyLock<parking_lot::Mutex<BTreeMap<ModelKey, ModelKey>>> =
+static ACTIVE_FALLBACKS: LazyLock<Mutex<BTreeMap<ModelKey, ModelKey>>> =
 	LazyLock::new(Default::default);
 
 pub(crate) fn record_fallback(primary: &ModelKey<str>, fallback: &ModelKey<str>) {
@@ -507,13 +512,13 @@ pub struct InferenceSettings {
 
 impl InferenceSettings {
 	/// Applies budget projections before side-effect-free planning.
-	pub fn apply_planning_call(&self, call: &mut crate::Call) {
+	pub fn apply_planning_call(&self, call: &mut Call) {
 		self.retry.apply_budget(&mut call.budget);
 		self.providers.apply_budget(&mut call.budget);
 	}
 
 	/// Applies request-level projections once before encoding.
-	pub fn apply_call(&self, call: &mut crate::Call) {
+	pub fn apply_call(&self, call: &mut Call) {
 		self.apply_planning_call(call);
 		let codec = call
 			.execution
@@ -528,7 +533,7 @@ impl InferenceSettings {
 			)
 		});
 		if let OperationCall::Chat(chat) = &mut call.operation {
-			let chat = std::sync::Arc::make_mut(chat);
+			let chat = sync::Arc::make_mut(chat);
 			let openai_chat = codec == Some("openai-chat");
 			let openai_responses = codec == Some("openai-responses");
 			let top_k =
@@ -539,16 +544,10 @@ impl InferenceSettings {
 				.apply(chat, top_k, penalties, openai_chat, openai_responses);
 			if matches!(chat.cache_retention, Setting::Unset) {
 				chat.cache_retention = match self.model.cache_retention {
-					omp_catalog::settings::CacheRetentionSetting::Auto => Setting::Unset,
-					omp_catalog::settings::CacheRetentionSetting::None => {
-						Setting::Require(CacheRetention::Request)
-					},
-					omp_catalog::settings::CacheRetentionSetting::Short => {
-						Setting::Prefer(CacheRetention::Short)
-					},
-					omp_catalog::settings::CacheRetentionSetting::Long => {
-						Setting::Prefer(CacheRetention::Long)
-					},
+					CacheRetentionSetting::Auto => Setting::Unset,
+					CacheRetentionSetting::None => Setting::Require(CacheRetention::Request),
+					CacheRetentionSetting::Short => Setting::Prefer(CacheRetention::Short),
+					CacheRetentionSetting::Long => Setting::Prefer(CacheRetention::Long),
 				};
 			}
 			if matches!(chat.service_tier, Setting::Unset)

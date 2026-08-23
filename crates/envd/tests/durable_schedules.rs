@@ -1,6 +1,9 @@
+//! Proves durable schedule recovery, clocks, idempotency, budgets, backfill,
+//! and overlap policy.
 use std::{
 	collections::BTreeSet,
 	sync::{Arc, Mutex},
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use omp_agent::scheduler::BudgetReservation;
@@ -10,6 +13,7 @@ use omp_envd::schedules::{
 	open_durable_scheduler, open_durable_scheduler_manual,
 };
 use serde_json::{Map, Value, json};
+use tokio::{task, time};
 
 #[derive(Default)]
 struct DeliveryState {
@@ -130,7 +134,7 @@ async fn project_schedule_recovers_after_session_exit_and_deduplicates_restart()
 	.await;
 	handle.expire_session().await.expect("session exit");
 	drop(handle);
-	tokio::task::yield_now().await;
+	task::yield_now().await;
 
 	let restarted =
 		open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
@@ -139,7 +143,7 @@ async fn project_schedule_recovers_after_session_exit_and_deduplicates_restart()
 	assert_eq!(rows[0].get("outcome").and_then(Value::as_str), Some("injected"));
 	assert_eq!(delivery.state.lock().expect("state").effects, 1);
 	drop(restarted);
-	tokio::task::yield_now().await;
+	task::yield_now().await;
 
 	let restarted_again =
 		open_durable_scheduler_manual(&path, delivery.clone()).expect("second restart");
@@ -154,8 +158,8 @@ async fn owned_clock_fires_without_a_chat_timer() {
 	let path = temp.path().join("clock.sqlite");
 	let delivery = Delivery::new(BudgetReservation::default());
 	let handle = open_durable_scheduler(&path, delivery.clone()).expect("open clock scheduler");
-	let at_ms: u64 = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	let at_ms: u64 = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
 		.expect("clock")
 		.as_millis()
 		.try_into()
@@ -165,7 +169,7 @@ async fn owned_clock_fires_without_a_chat_timer() {
 	arguments
 		.insert("trigger".to_owned(), json!({"kind": "at", "epoch_ms": at_ms.saturating_add(25)}));
 	let id = schedule_id(&handle, arguments).await;
-	tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	time::sleep(Duration::from_millis(100)).await;
 	let rows = history(&handle, &id).await;
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0].get("outcome").and_then(Value::as_str), Some("injected"));
@@ -184,7 +188,7 @@ async fn pending_intent_replay_uses_idempotency_key_without_repeating_effect() {
 	)
 	.await;
 	drop(handle);
-	tokio::task::yield_now().await;
+	task::yield_now().await;
 
 	let key = format!("{id}:1");
 	{
@@ -257,7 +261,7 @@ async fn recovery_honors_skip_and_hard_budget_refusal() {
 	);
 	let refused = schedule_id(&handle, refused_args).await;
 	drop(handle);
-	tokio::task::yield_now().await;
+	task::yield_now().await;
 
 	let restarted =
 		open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
@@ -281,7 +285,7 @@ async fn coalesce_backfill_and_overlap_are_projected_durably() {
 	let coalesced = schedule_id(&handle, every_schedule("coalesced", "coalesce", "queue")).await;
 	let backfilled = schedule_id(&handle, every_schedule("backfilled", "backfill", "queue")).await;
 	drop(handle);
-	tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+	time::sleep(Duration::from_millis(80)).await;
 
 	let restarted =
 		open_durable_scheduler_manual(&path, delivery.clone()).expect("restart scheduler");
@@ -303,11 +307,11 @@ async fn coalesce_backfill_and_overlap_are_projected_durably() {
 	let overlap = open_durable_scheduler_manual(&overlap_path, delivery.clone())
 		.expect("open overlap scheduler");
 	let overlap_id = schedule_id(&overlap, every_schedule("overlap", "coalesce", "skip")).await;
-	tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+	time::sleep(Duration::from_millis(5)).await;
 	overlap
 		.process_due(
-			std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
 				.expect("clock")
 				.as_millis()
 				.try_into()

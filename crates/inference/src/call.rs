@@ -1,7 +1,8 @@
 //! Clone-cheap request envelopes and the closed operation vocabulary.
 
 use std::{
-	fmt,
+	error,
+	fmt::{self, Display},
 	sync::Arc,
 	time::{Duration, Instant, SystemTime},
 };
@@ -19,7 +20,7 @@ use crate::{
 		AccountId, ConversationId, LoginSessionId, OrganizationId, PrincipalId, ProjectId, RegionId,
 		RequestId, Revision, TenantId, ToolCallId, TurnId,
 	},
-	operation::parallel_extract::ParallelExtractRequest,
+	operation::{parallel_extract::ParallelExtractRequest, search_query, search_query::SearchQuery},
 	plan::ExecutionPlan,
 	receipt::ExecutionBudget,
 };
@@ -86,7 +87,7 @@ pub enum RawJsonError {
 	Invalid,
 }
 
-impl fmt::Display for RawJsonError {
+impl Display for RawJsonError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(match self {
 			Self::TooLarge => "native JSON exceeds size bound",
@@ -95,7 +96,7 @@ impl fmt::Display for RawJsonError {
 	}
 }
 
-impl std::error::Error for RawJsonError {}
+impl error::Error for RawJsonError {}
 
 /// Selects the catalog domain within which routing must occur.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1179,7 +1180,7 @@ pub struct SearchRequest {
 	/// Search query as authored.
 	pub query:                Str,
 	/// Parsed directives shared across route attempts.
-	pub parsed_query:         Arc<crate::operation::search_query::SearchQuery>,
+	pub parsed_query:         Arc<SearchQuery>,
 	/// Included domains supplied outside query text; empty means unrestricted.
 	pub include_domains:      Arc<[Str]>,
 	/// Excluded domains supplied outside query text.
@@ -1219,7 +1220,7 @@ impl SearchRequest {
 	pub fn new(query: impl Into<Str>, max_results: u32) -> Self {
 		let query = query.into();
 		Self {
-			parsed_query: Arc::new(crate::operation::search_query::parse_search_query(&query)),
+			parsed_query: Arc::new(search_query::parse_search_query(&query)),
 			query,
 			include_domains: Arc::new([]),
 			exclude_domains: Arc::new([]),

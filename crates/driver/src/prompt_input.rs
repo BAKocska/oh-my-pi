@@ -1,12 +1,15 @@
 //! File-or-inline prompt customization resolution.
 
 use std::{
-	io,
+	fs, io, iter,
 	path::{Path, PathBuf},
 };
 
+use omp_agent::prompt_assets::PromptAssetId;
 use omp_core::Str;
 use thiserror::Error;
+
+use crate::discovery::native;
 
 /// A prompt customization file could not be read.
 #[derive(Debug, Error)]
@@ -34,7 +37,7 @@ pub fn resolve_prompt_input(input: Option<&str>) -> Result<Option<Str>, PromptIn
 	if input.contains('\n') {
 		return Ok(Some(Str::new(input)));
 	}
-	match std::fs::read_to_string(input) {
+	match fs::read_to_string(input) {
 		Ok(content) => Ok(Some(content.into())),
 		Err(source) if tolerant_literal_error(&source) => Ok(Some(Str::new(input))),
 		Err(source) => Err(PromptInputError::Read { path: input.into(), source }),
@@ -47,14 +50,14 @@ pub fn discover_prompt_file(
 	home: &Path,
 	name: &str,
 ) -> Result<Option<Str>, PromptInputError> {
-	let roots = crate::discovery::native::discover_roots(cwd, home, 32);
+	let roots = native::discover_roots(cwd, home, 32);
 	for path in roots
 		.project
 		.iter()
 		.map(|root| root.join(name))
-		.chain(std::iter::once(roots.user.join(name)))
+		.chain(iter::once(roots.user.join(name)))
 	{
-		match std::fs::read_to_string(&path) {
+		match fs::read_to_string(&path) {
 			Ok(content) => return Ok(Some(content.into())),
 			Err(source) if tolerant_literal_error(&source) => {},
 			Err(source) => return Err(PromptInputError::Read { path, source }),
@@ -69,10 +72,8 @@ pub fn discover_user_prompt_file(
 	home: &Path,
 	name: &str,
 ) -> Result<Option<Str>, PromptInputError> {
-	let path = crate::discovery::native::discover_roots(cwd, home, 32)
-		.user
-		.join(name);
-	match std::fs::read_to_string(&path) {
+	let path = native::discover_roots(cwd, home, 32).user.join(name);
+	match fs::read_to_string(&path) {
 		Ok(content) if !content.trim().is_empty() => Ok(Some(content.into())),
 		Ok(_) => Ok(None),
 		Err(source) if tolerant_literal_error(&source) => Ok(None),
@@ -99,12 +100,7 @@ pub fn resolve_system_inputs(
 /// `TITLE_SYSTEM.md` precedence and the embedded native prompt as fallback.
 pub fn resolve_title_system_prompt(cwd: &Path, home: &Path) -> Result<Str, PromptInputError> {
 	Ok(discover_prompt_file(cwd, home, "TITLE_SYSTEM.md")?.unwrap_or_else(|| {
-		Str::new_static(
-			omp_agent::prompt_assets::prompt_asset(
-				omp_agent::prompt_assets::PromptAssetId::TitleSystem,
-			)
-			.content,
-		)
+		Str::new_static(omp_agent::prompt_assets::prompt_asset(PromptAssetId::TitleSystem).content)
 	}))
 }
 
@@ -114,6 +110,8 @@ fn tolerant_literal_error(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use super::*;
 
 	#[test]
@@ -121,10 +119,10 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let home = scratch.path().join("home");
 		let project = scratch.path().join("repo");
-		std::fs::create_dir_all(home.join(".omp")).expect("user config directory");
-		std::fs::create_dir_all(project.join(".omp")).expect("project config directory");
-		std::fs::write(home.join(".omp/SYSTEM.md"), "user").expect("user system prompt");
-		std::fs::write(project.join(".omp/SYSTEM.md"), "project").expect("project system prompt");
+		fs::create_dir_all(home.join(".omp")).expect("user config directory");
+		fs::create_dir_all(project.join(".omp")).expect("project config directory");
+		fs::write(home.join(".omp/SYSTEM.md"), "user").expect("user system prompt");
+		fs::write(project.join(".omp/SYSTEM.md"), "project").expect("project system prompt");
 
 		assert_eq!(
 			resolve_prompt_input(Some("not-a-real-prompt-file"))
@@ -148,7 +146,7 @@ mod tests {
 			.content
 		);
 
-		std::fs::write(project.join(".omp/TITLE_SYSTEM.md"), "project title")
+		fs::write(project.join(".omp/TITLE_SYSTEM.md"), "project title")
 			.expect("project title system prompt");
 		assert_eq!(
 			resolve_title_system_prompt(&project, &home)

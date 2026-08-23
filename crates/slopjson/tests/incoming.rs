@@ -1,5 +1,7 @@
 //! Behavioral coverage for the growing-document cursor.
 
+use std::{pin, task};
+
 use futures::{FutureExt, executor::block_on};
 use omp_core::sf;
 use omp_slopjson::{
@@ -170,8 +172,8 @@ fn unterminated_comment_after_edge_close_only_appends_to_chunks() {
 }
 
 /// Poll `future` once with a no-op waker.
-fn poll_once<T>(future: std::pin::Pin<&mut impl Future<Output = T>>) -> std::task::Poll<T> {
-	future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+fn poll_once<T>(future: pin::Pin<&mut impl Future<Output = T>>) -> task::Poll<T> {
+	future.poll(&mut task::Context::from_waker(task::Waker::noop()))
 }
 
 #[test]
@@ -186,10 +188,10 @@ fn finish_alone_completes_an_edge_closed_string_pending_mid_poll() {
 	// Hold a pending pull across finish(): the wake carries no new text, only
 	// the Open→Finished transition, which must re-evaluate the edge-closed
 	// quote as final instead of reporting Incomplete.
-	let mut pending = std::pin::pin!(text.next_chunk());
+	let mut pending = pin::pin!(text.next_chunk());
 	assert!(poll_once(pending.as_mut()).is_pending());
 	feed.finish();
-	let std::task::Poll::Ready(result) = poll_once(pending.as_mut()) else {
+	let task::Poll::Ready(result) = poll_once(pending.as_mut()) else {
 		panic!("finish must settle the pending chunk pull")
 	};
 	assert_eq!(result.unwrap(), None);
@@ -204,10 +206,10 @@ fn finish_alone_still_reports_truly_unterminated_string_incomplete() {
 	let mut text = object.key("text").string();
 	assert_eq!(block_on(text.next_chunk()).unwrap().as_deref(), Some("a"));
 
-	let mut pending = std::pin::pin!(text.next_chunk());
+	let mut pending = pin::pin!(text.next_chunk());
 	assert!(poll_once(pending.as_mut()).is_pending());
 	feed.finish();
-	let std::task::Poll::Ready(result) = poll_once(pending.as_mut()) else {
+	let task::Poll::Ready(result) = poll_once(pending.as_mut()) else {
 		panic!("finish must settle the pending chunk pull")
 	};
 	let IncomingError::Pull(issue) = result.unwrap_err() else {
@@ -227,10 +229,10 @@ fn pending_chunk_poll_becomes_ready_from_a_single_push() {
 
 	// Waker registration and chunk readiness are decided under one lock, so
 	// one push must make the held pull ready on its next evaluation.
-	let mut pending = std::pin::pin!(text.next_chunk());
+	let mut pending = pin::pin!(text.next_chunk());
 	assert!(poll_once(pending.as_mut()).is_pending());
 	feed.push("lo").unwrap();
-	let std::task::Poll::Ready(result) = poll_once(pending.as_mut()) else {
+	let task::Poll::Ready(result) = poll_once(pending.as_mut()) else {
 		panic!("push must make the chunk pull ready")
 	};
 	assert_eq!(result.unwrap().as_deref(), Some("lo"));
@@ -429,7 +431,7 @@ fn cancelled_pull_releases_the_linear_cursor() {
 	{
 		let mut object = doc.json().object();
 		let mut a = object.key("a");
-		let mut pending = std::pin::pin!(a.number());
+		let mut pending = pin::pin!(a.number());
 		assert!(poll_once(pending.as_mut()).is_pending());
 		// Cancelling a plain pull future releases the exclusive reborrow. It
 		// leaves no subscription, snapshot, or field event to drain.

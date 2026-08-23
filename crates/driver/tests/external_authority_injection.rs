@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+//! Proves every external control domain for an extension shares one atomically
+//! leased host session.
+
+#[cfg(unix)]
+use std::fs;
+use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
@@ -134,8 +139,8 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 	let scratch = tempfile::tempdir().expect("scratch");
 	let root = scratch.path().join("project");
 	let state = scratch.path().join("state");
-	std::fs::create_dir_all(&root).expect("project root");
-	std::fs::create_dir_all(&state).expect("state root");
+	fs::create_dir_all(&root).expect("project root");
+	fs::create_dir_all(&state).expect("state root");
 	let environment = ProjectEnvironment::connect_or_start(
 		&root,
 		&state,

@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
+	fmt,
 	path::PathBuf,
 	sync::Arc,
 };
@@ -12,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-	DapAdapterRegistry, DapSessionRegistry, DocumentId, DocumentStore, EditAdapterRegistry, LeaseId,
-	PathService, Result, ServerConfig, lsp_registry::LspRegistry, summary::SummaryService,
+	DapAdapterRegistry, DapSessionRegistry, DocumentId, DocumentStore, EditAdapterRegistry, Error,
+	LeaseId, PathService, Result, ServerConfig, lsp_registry::LspRegistry, summary::SummaryService,
 	transaction::TransactionCoordinator,
 };
 
@@ -112,7 +113,7 @@ impl WorkspaceLeaseTable {
 									.then_some(*mutation_owner)
 							});
 					if Some(lease.owner) != owner.or(mutation_owner) {
-						return Err(crate::Error::InvalidTarget {
+						return Err(Error::InvalidTarget {
 							target: Str::new(path.to_string_lossy()),
 							reason: sf!("path is held by an exclusive workspace lease"),
 						});
@@ -136,7 +137,7 @@ impl WorkspaceLeaseTable {
 				if (path.starts_with(reserved) || reserved.starts_with(path))
 					&& state.leases[lease_id].owner != owner
 				{
-					return Err(crate::Error::InvalidTarget {
+					return Err(Error::InvalidTarget {
 						target: Str::new(path.to_string_lossy()),
 						reason: sf!("path is held by an exclusive workspace lease"),
 					});
@@ -145,7 +146,7 @@ impl WorkspaceLeaseTable {
 			for (mutating, (mutation_owner, _)) in &state.mutations {
 				let overlaps = path.starts_with(mutating) || mutating.starts_with(path);
 				if overlaps && *mutation_owner != owner {
-					return Err(crate::Error::InvalidTarget {
+					return Err(Error::InvalidTarget {
 						target: Str::new(path.to_string_lossy()),
 						reason: sf!("path has an in-flight workspace mutation"),
 					});
@@ -278,8 +279,8 @@ struct EnvironmentInner {
 	server_build:     Str,
 }
 
-impl std::fmt::Debug for Environment {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Environment {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("Environment")
 			.field("root_uri", &self.inner.root_uri)
@@ -424,8 +425,8 @@ struct OwnedLease {
 	events_ready: CancellationToken,
 }
 
-impl std::fmt::Debug for EnvironmentSession {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for EnvironmentSession {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("EnvironmentSession")
 			.finish_non_exhaustive()
@@ -575,6 +576,9 @@ impl EnvironmentSession {
 
 #[cfg(test)]
 mod tests {
+
+	use std::{fs, slice};
+
 	use tempfile::TempDir;
 
 	use super::*;
@@ -610,7 +614,7 @@ mod tests {
 		let root = TempDir::new().expect("temporary directory");
 		let config = ServerConfig::new(root.path()).expect("server config");
 		let path = config.environment_root().join("active.txt");
-		std::fs::write(&path, b"active").expect("fixture");
+		fs::write(&path, b"active").expect("fixture");
 		let uri = config.file_uri(&path).expect("file URI");
 		let environment = Environment::new(config).expect("environment");
 		let owner = environment.session();
@@ -637,21 +641,21 @@ mod tests {
 		let root = TempDir::new().expect("temporary directory");
 		let config = ServerConfig::new(root.path()).expect("server config");
 		let path = config.environment_root().join("restore.txt");
-		std::fs::write(&path, b"restore").expect("fixture");
+		fs::write(&path, b"restore").expect("fixture");
 		let uri = config.file_uri(&path).expect("file URI");
 		let environment = Environment::new(config).expect("environment");
 		let left = environment.session();
 		let right = environment.session();
 		let dry_run = left
-			.acquire_workspace_lease(std::slice::from_ref(&uri), [2; 16], true)
+			.acquire_workspace_lease(slice::from_ref(&uri), [2; 16], true)
 			.await
 			.expect("dry run");
 		assert!(dry_run.lease_id.is_none());
 		assert!(dry_run.conflicts.is_empty());
 
 		let (left_outcome, right_outcome) = tokio::join!(
-			left.acquire_workspace_lease(std::slice::from_ref(&uri), [3; 16], false),
-			right.acquire_workspace_lease(std::slice::from_ref(&uri), [4; 16], false),
+			left.acquire_workspace_lease(slice::from_ref(&uri), [3; 16], false),
+			right.acquire_workspace_lease(slice::from_ref(&uri), [4; 16], false),
 		);
 		let left_outcome = left_outcome.expect("left acquire");
 		let right_outcome = right_outcome.expect("right acquire");
@@ -679,7 +683,7 @@ mod tests {
 		let first = environment.session();
 		let second = environment.session();
 		let held = first
-			.acquire_workspace_lease(std::slice::from_ref(&uri), [5; 16], false)
+			.acquire_workspace_lease(slice::from_ref(&uri), [5; 16], false)
 			.await
 			.expect("first acquire");
 		assert!(held.lease_id.is_some());

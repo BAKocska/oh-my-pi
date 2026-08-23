@@ -1,6 +1,7 @@
 //! Kimi Code quota retrieval.
 
 use std::{
+	env::{self, consts},
 	fmt::Write as _,
 	sync::Arc,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -9,18 +10,19 @@ use std::{
 use futures::FutureExt as _;
 use http::{
 	HeaderMap, HeaderValue, Method,
-	header::{AUTHORIZATION, USER_AGENT},
+	header::{AUTHORIZATION, HeaderName, USER_AGENT},
 };
 use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use serde_json::{Map, Value};
+use tokio::time;
 
 use crate::{
 	answer::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageStatus, UsageUnit, UsageWindow,
 		UsageWindowKind,
 	},
-	auth::{OAuthHttpClient, OAuthHttpRequest},
+	auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse as AuthOAuthHttpResponse},
 	catalog::ProviderId,
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
@@ -137,14 +139,14 @@ fn request(url: &str, token: &str, device_id: &str) -> Result<OAuthHttpRequest, 
 		("x-msh-version", VERSION.to_owned()),
 		(
 			"x-msh-device-name",
-			sanitize(&std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned())),
+			sanitize(&env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned())),
 		),
 		("x-msh-device-model", device_model().to_owned()),
-		("x-msh-os-version", sanitize(std::env::consts::OS)),
+		("x-msh-os-version", sanitize(consts::OS)),
 		("x-msh-device-id", device_id.to_owned()),
 	] {
 		h.insert(
-			http::header::HeaderName::from_static(n),
+			HeaderName::from_static(n),
 			HeaderValue::from_str(&v).map_err(|_| UsageFetchError::Protocol)?,
 		);
 	}
@@ -187,14 +189,14 @@ async fn execute(
 	http: &dyn OAuthHttpClient,
 	r: OAuthHttpRequest,
 	d: Option<Instant>,
-) -> Result<crate::auth::OAuthHttpResponse, UsageFetchError> {
+) -> Result<AuthOAuthHttpResponse, UsageFetchError> {
 	let t = d
 		.map_or(TIMEOUT, |e| e.saturating_duration_since(Instant::now()))
 		.min(TIMEOUT);
 	if t.is_zero() {
 		return Err(UsageFetchError::Unavailable);
 	}
-	tokio::time::timeout(t, http.execute(r))
+	time::timeout(t, http.execute(r))
 		.await
 		.map_err(|_| UsageFetchError::Unavailable)?
 		.map_err(|_| UsageFetchError::Unavailable)

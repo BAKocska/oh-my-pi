@@ -45,6 +45,8 @@ pub(crate) fn base64_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use super::Base64;
 	use crate::host::run_util;
 
@@ -101,7 +103,7 @@ mod tests {
 	#[test]
 	fn file_operand_resolves_against_shell_working_directory() {
 		let dir = tempfile::tempdir().unwrap();
-		std::fs::write(dir.path().join("input"), b"hello").unwrap();
+		fs::write(dir.path().join("input"), b"hello").unwrap();
 
 		let (code, capture) = run_util::<Base64>(&["input"], "ignored", dir.path());
 		assert_eq!(code, 0);

@@ -1,6 +1,6 @@
 //! Cached structural summaries over immutable document snapshots.
 
-use std::{collections::VecDeque, path::Path, sync::Arc};
+use std::{collections::VecDeque, path::Path, str, sync::Arc};
 
 use omp_ast::{
 	SupportLang,
@@ -8,6 +8,7 @@ use omp_ast::{
 };
 use omp_core::{Str, sf};
 use parking_lot::{Mutex, MutexGuard};
+use tokio::task;
 use tokio_util::sync::CancellationToken;
 
 use crate::types::{DocumentKind, DocumentPresence, DocumentSnapshot};
@@ -325,7 +326,7 @@ impl SummaryService {
 		let snapshot_for_parse = Arc::clone(&snapshot);
 		let language = inferred_language.expect("unsupported language returned above");
 		let parse_options = options;
-		let task = tokio::task::spawn_blocking(move || {
+		let task = task::spawn_blocking(move || {
 			parse_snapshot(&snapshot_for_parse, &language, &parse_options)
 		});
 		let value = tokio::select! {
@@ -395,7 +396,7 @@ fn parse_snapshot(
 	language: &Str,
 	options: &SummaryOptions,
 ) -> CachedSummary {
-	let Ok(source) = std::str::from_utf8(snapshot.content()) else {
+	let Ok(source) = str::from_utf8(snapshot.content()) else {
 		return fallback(SummaryUnavailableReason::Binary, 0, Some(language.clone()), false);
 	};
 	let total_lines = count_lines(source);

@@ -1,8 +1,18 @@
-use std::{collections::HashMap, io::Write};
+use std::{
+	collections::{HashMap, hash_map::Entry},
+	io::Write,
+};
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins, env, variables};
+use crate::{
+	Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins,
+	builtins::try_parse_known,
+	env,
+	env::{EnvironmentLookup, EnvironmentScope},
+	int_utils::parse,
+	variables,
+};
 
 /// Parse command options.
 #[derive(Parser)]
@@ -69,7 +79,7 @@ fn parse_option_spec(spec: &str) -> OptionSpec {
 			continue;
 		}
 
-		if let std::collections::hash_map::Entry::Vacant(e) = defs.entry(c) {
+		if let Entry::Vacant(e) = defs.entry(c) {
 			e.insert(false);
 			last_char = Some(c);
 		} else {
@@ -83,7 +93,7 @@ fn parse_option_spec(spec: &str) -> OptionSpec {
 }
 
 impl builtins::Command for GetOptsCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
 	/// Override the default [`builtins::Command::new`] function to handle clap's
 	/// limitation related to `--`. See [`builtins::parse_known`] for more
@@ -93,17 +103,17 @@ impl builtins::Command for GetOptsCommand {
 	where
 		I: IntoIterator<Item = String>,
 	{
-		let (mut this, rest_args) = crate::builtins::try_parse_known::<Self>(args)?;
+		let (mut this, rest_args) = try_parse_known::<Self>(args)?;
 		if let Some(args) = rest_args {
 			this.args.extend(args);
 		}
 		Ok(this)
 	}
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		mut context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		mut context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		// Validate the target variable name.
 		if !env::valid_variable_name(&self.variable_name) {
 			writeln!(
@@ -121,7 +131,7 @@ impl builtins::Command for GetOptsCommand {
 		let next_index_signed = context
 			.shell
 			.env_str("OPTIND")
-			.and_then(|s| crate::int_utils::parse::<i32>(s.as_ref(), 10).ok())
+			.and_then(|s| parse::<i32>(s.as_ref(), 10).ok())
 			.unwrap_or(1);
 
 		// Detect external OPTIND modifications (e.g., `OPTIND=1` to restart
@@ -161,12 +171,12 @@ impl builtins::Command for GetOptsCommand {
 /// `-pVALUE` and `-p VALUE` forms), and error reporting for unknown options or
 /// missing arguments. Tracks position within combined flags via the
 /// `__GETOPTS_NEXT_CHAR` shell variable.
-fn parse_next_option<SE: crate::ShellExtensions>(
-	context: &mut crate::ExecutionContext<'_, SE>,
+fn parse_next_option<SE: ShellExtensions>(
+	context: &mut ExecutionContext<'_, SE>,
 	spec: &OptionSpec,
 	args_to_parse: &[String],
 	mut next_index: usize,
-) -> Result<GetOptsResult, crate::Error> {
+) -> Result<GetOptsResult, Error> {
 	// See if there are any args left to parse.
 	if next_index > args_to_parse.len() {
 		return Ok(GetOptsResult {
@@ -261,8 +271,8 @@ fn parse_next_option<SE: crate::ShellExtensions>(
 				v.hide_from_enumeration();
 				Ok(())
 			},
-			crate::env::EnvironmentLookup::Anywhere,
-			crate::env::EnvironmentScope::Global,
+			EnvironmentLookup::Anywhere,
+			EnvironmentScope::Global,
 		)?;
 		next_index
 	};
@@ -273,8 +283,8 @@ fn parse_next_option<SE: crate::ShellExtensions>(
 /// Resolves the argument for an option that takes a value. Returns the updated
 /// `(variable_value, optarg, is_last_char, next_index)` tuple.
 #[allow(clippy::too_many_arguments, reason = "option parsing state is explicit at this boundary")]
-fn resolve_option_argument<SE: crate::ShellExtensions>(
-	context: &crate::ExecutionContext<'_, SE>,
+fn resolve_option_argument<SE: ShellExtensions>(
+	context: &ExecutionContext<'_, SE>,
 	spec: &OptionSpec,
 	c: char,
 	arg: &str,
@@ -282,7 +292,7 @@ fn resolve_option_argument<SE: crate::ShellExtensions>(
 	next_char_index: usize,
 	is_last_char_in_option: bool,
 	mut next_index: usize,
-) -> Result<(String, Option<String>, bool, usize), crate::Error> {
+) -> Result<(String, Option<String>, bool, usize), Error> {
 	// If this is the last character in the token, the argument value comes from
 	// the next token. Otherwise, the remainder of the current token is the value.
 	if is_last_char_in_option {
@@ -308,11 +318,11 @@ fn resolve_option_argument<SE: crate::ShellExtensions>(
 }
 
 /// Handles an unknown option character, reporting an error if appropriate.
-fn report_unknown_option<SE: crate::ShellExtensions>(
-	context: &crate::ExecutionContext<'_, SE>,
+fn report_unknown_option<SE: ShellExtensions>(
+	context: &ExecutionContext<'_, SE>,
 	spec: &OptionSpec,
 	c: char,
-) -> Result<(String, Option<String>), crate::Error> {
+) -> Result<(String, Option<String>), Error> {
 	if !spec.silent_errors && is_opterr_enabled(context) {
 		writeln!(context.stderr(), "getopts: illegal option -- {c}")?;
 	}
@@ -328,18 +338,18 @@ fn report_unknown_option<SE: crate::ShellExtensions>(
 
 /// Writes the parsing result back into shell variables: the target variable,
 /// OPTARG, OPTIND, and the internal `__GETOPTS_LAST_OPTIND` tracker.
-fn update_variables<SE: crate::ShellExtensions>(
-	context: &mut crate::ExecutionContext<'_, SE>,
+fn update_variables<SE: ShellExtensions>(
+	context: &mut ExecutionContext<'_, SE>,
 	variable_name: &str,
 	result: GetOptsResult,
-) -> Result<ExecutionResult, crate::Error> {
+) -> Result<ExecutionResult, Error> {
 	// Update variable value.
 	context.shell.env_mut().update_or_add(
 		variable_name,
 		variables::ShellValueLiteral::Scalar(result.variable_value),
 		|_| Ok(()),
-		crate::env::EnvironmentLookup::Anywhere,
-		crate::env::EnvironmentScope::Global,
+		EnvironmentLookup::Anywhere,
+		EnvironmentScope::Global,
 	)?;
 
 	// Update OPTARG
@@ -348,8 +358,8 @@ fn update_variables<SE: crate::ShellExtensions>(
 			"OPTARG",
 			variables::ShellValueLiteral::Scalar(optarg),
 			|_| Ok(()),
-			crate::env::EnvironmentLookup::Anywhere,
-			crate::env::EnvironmentScope::Global,
+			EnvironmentLookup::Anywhere,
+			EnvironmentScope::Global,
 		)?;
 	} else {
 		context.shell.env_mut().unset("OPTARG")?;
@@ -361,8 +371,8 @@ fn update_variables<SE: crate::ShellExtensions>(
 		"OPTIND",
 		variables::ShellValueLiteral::Scalar(optind_str.clone()),
 		|_| Ok(()),
-		crate::env::EnvironmentLookup::Anywhere,
-		crate::env::EnvironmentScope::Global,
+		EnvironmentLookup::Anywhere,
+		EnvironmentScope::Global,
 	)?;
 	context.shell.env_mut().update_or_add(
 		VAR_GETOPTS_LAST_OPTIND,
@@ -371,8 +381,8 @@ fn update_variables<SE: crate::ShellExtensions>(
 			v.hide_from_enumeration();
 			Ok(())
 		},
-		crate::env::EnvironmentLookup::Anywhere,
-		crate::env::EnvironmentScope::Global,
+		EnvironmentLookup::Anywhere,
+		EnvironmentScope::Global,
 	)?;
 
 	Ok(result.exit_code)
@@ -380,9 +390,7 @@ fn update_variables<SE: crate::ShellExtensions>(
 
 /// Returns whether OPTERR is enabled (i.e., getopts should print error
 /// messages). OPTERR defaults to 1; any nonzero value means errors are enabled.
-fn is_opterr_enabled<SE: crate::ShellExtensions>(
-	context: &crate::ExecutionContext<'_, SE>,
-) -> bool {
+fn is_opterr_enabled<SE: ShellExtensions>(context: &ExecutionContext<'_, SE>) -> bool {
 	context
 		.shell
 		.env_str("OPTERR")

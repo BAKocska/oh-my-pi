@@ -1,8 +1,11 @@
 //! Owner-local Unix-socket and Windows named-pipe transport for daemon RPC.
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::Path;
+use std::{
+	fs,
+	os::unix::fs::{FileTypeExt, PermissionsExt},
+};
+use std::{io, path::Path};
 
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
@@ -10,7 +13,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
-use tonic::transport::Channel;
+use tonic::transport::{self, Channel};
 #[cfg(unix)]
 use tower::service_fn;
 #[cfg(windows)]
@@ -19,10 +22,12 @@ use {
 	std::{
 		pin::Pin,
 		task::{Context, Poll},
+		time::Duration,
 	},
 	tokio::{
 		io::{AsyncRead, AsyncWrite, ReadBuf},
 		net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions},
+		time,
 	},
 	tonic::transport::server::Connected,
 	tower::service_fn,
@@ -36,8 +41,7 @@ pub type Incoming = UnixListenerStream;
 
 /// A stream of accepted owner-local Windows named-pipe connections.
 #[cfg(windows)]
-pub type Incoming =
-	flume::r#async::RecvStream<'static, Result<NamedPipeConnection, std::io::Error>>;
+pub type Incoming = flume::r#async::RecvStream<'static, Result<NamedPipeConnection, io::Error>>;
 
 /// Bind an owner-only Unix-domain socket and return its incoming connection
 /// stream.
@@ -57,8 +61,8 @@ pub async fn listen(path: &Path) -> Result<Incoming, Error> {
 		Ok(metadata) if metadata.file_type().is_socket() => {
 			if UnixStream::connect(path).await.is_ok() {
 				return Err(
-					std::io::Error::new(
-						std::io::ErrorKind::AddrInUse,
+					io::Error::new(
+						io::ErrorKind::AddrInUse,
 						"Unix socket is already accepting connections",
 					)
 					.into(),
@@ -68,12 +72,12 @@ pub async fn listen(path: &Path) -> Result<Incoming, Error> {
 			tokio::fs::remove_file(path).await?;
 		},
 		Ok(_) => {},
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 		Err(error) => return Err(error.into()),
 	}
 
 	let listener = UnixListener::bind(path)?;
-	tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+	tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o600)).await?;
 	Ok(UnixListenerStream::new(listener))
 }
 
@@ -81,7 +85,7 @@ pub async fn listen(path: &Path) -> Result<Incoming, Error> {
 #[cfg(unix)]
 pub async fn connect(path: &Path) -> Result<Channel, Error> {
 	let path = path.to_owned();
-	let endpoint = tonic::transport::Endpoint::from_static("http://[::]:50051");
+	let endpoint = transport::Endpoint::from_static("http://[::]:50051");
 	let channel = endpoint
 		.connect_with_connector(service_fn(move |_| {
 			let path = path.clone();
@@ -130,16 +134,16 @@ pub async fn listen(path: &Path) -> Result<Incoming, Error> {
 #[cfg(windows)]
 pub async fn connect(path: &Path) -> Result<Channel, Error> {
 	let name = path.to_string_lossy().into_owned();
-	let endpoint = tonic::transport::Endpoint::from_static("http://[::]:50051");
+	let endpoint = transport::Endpoint::from_static("http://[::]:50051");
 	let channel = endpoint
 		.connect_with_connector(service_fn(move |_| {
 			let name = name.clone();
 			async move {
 				loop {
 					match ClientOptions::new().open(&name) {
-						Ok(client) => return Ok::<_, std::io::Error>(TokioIo::new(client)),
+						Ok(client) => return Ok::<_, io::Error>(TokioIo::new(client)),
 						Err(error) if error.raw_os_error() == Some(231) => {
-							tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+							time::sleep(Duration::from_millis(10)).await;
 						},
 						Err(error) => return Err(error),
 					}
@@ -168,7 +172,7 @@ impl AsyncRead for NamedPipeConnection {
 		self: Pin<&mut Self>,
 		context: &mut Context<'_>,
 		buffer: &mut ReadBuf<'_>,
-	) -> Poll<std::io::Result<()>> {
+	) -> Poll<io::Result<()>> {
 		Pin::new(&mut self.get_mut().0).poll_read(context, buffer)
 	}
 }
@@ -179,15 +183,15 @@ impl AsyncWrite for NamedPipeConnection {
 		self: Pin<&mut Self>,
 		context: &mut Context<'_>,
 		buffer: &[u8],
-	) -> Poll<std::io::Result<usize>> {
+	) -> Poll<io::Result<usize>> {
 		Pin::new(&mut self.get_mut().0).poll_write(context, buffer)
 	}
 
-	fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+	fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
 		Pin::new(&mut self.get_mut().0).poll_flush(context)
 	}
 
-	fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+	fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
 		Pin::new(&mut self.get_mut().0).poll_shutdown(context)
 	}
 }

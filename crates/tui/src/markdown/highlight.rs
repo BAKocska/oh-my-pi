@@ -370,8 +370,9 @@ fn scope(name: &str) -> Scope {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::Color;
 
-	fn color_containing(lines: &crate::rich::RichText, needle: &str) -> crate::Color {
+	fn color_containing(lines: &RichText, needle: &str) -> Color {
 		(0..lines.rows())
 			.flat_map(|row| lines.row_runs(row))
 			.find_map(|(style, text)| text.contains(needle).then(|| style.foreground_color()))
@@ -392,7 +393,7 @@ mod tests {
 		let palette = Theme::default();
 		let styles = HighlightStyles::from_theme(&palette);
 		let nix = "let message = \"hello\"; in message # greeting";
-		let mut rendered = crate::rich::RichText::default();
+		let mut rendered = RichText::default();
 		assert!(render(nix, "nix", 1, &styles, &mut rendered));
 		assert_eq!(color_containing(&rendered, "let"), palette.accent);
 		assert_eq!(color_containing(&rendered, "hello"), palette.ok);

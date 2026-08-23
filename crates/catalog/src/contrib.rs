@@ -4,7 +4,13 @@
 //! [`OverlayStack`] is immutable, so consumers can rebuild a registry for its
 //! generation and keep executing requests that captured an older generation.
 
-use std::{collections::BTreeMap, error::Error, fmt, mem::size_of, sync::Arc};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	error::Error,
+	fmt::{self, Display},
+	mem::size_of,
+	sync::Arc,
+};
 
 use arc_swap::ArcSwap;
 use omp_core::Str;
@@ -238,7 +244,7 @@ impl ProviderDeclarationId {
 	}
 }
 
-impl fmt::Display for ProviderDeclarationId {
+impl Display for ProviderDeclarationId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}/{}/{}", self.publisher(), self.extension_id(), self.declaration_id())
 	}
@@ -319,7 +325,7 @@ pub enum ProviderActivationError {
 	},
 }
 
-impl fmt::Display for ProviderActivationError {
+impl Display for ProviderActivationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::EqualPriority { provider, first, second } => write!(
@@ -480,7 +486,7 @@ impl ProviderDeclarations {
 			.declarations
 			.iter()
 			.map(|declaration| declaration.provider.clone())
-			.collect::<std::collections::BTreeSet<_>>();
+			.collect::<BTreeSet<_>>();
 		let mut activated = BTreeMap::new();
 		for provider in providers {
 			if let Some(value) = self.activate(&provider)? {
@@ -496,7 +502,7 @@ mod tests {
 	use omp_core::IntoStr;
 
 	use super::*;
-	use crate::{EvidenceConfidence, ProvenanceKind, ProvenanceSource};
+	use crate::{Catalog, EvidenceConfidence, ProvenanceKind, ProvenanceSource};
 
 	fn overlay(origin: &str) -> CatalogOverlay {
 		CatalogOverlay {
@@ -615,7 +621,7 @@ mod tests {
 
 	#[test]
 	fn admitted_runtime_provider_registers_oauth_into_a_new_catalog_generation() {
-		let catalog = crate::Catalog::embedded();
+		let catalog = Catalog::embedded();
 		let provider = catalog
 			.providers()
 			.iter()

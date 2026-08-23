@@ -5,6 +5,7 @@ use std::sync::{
 	atomic::{AtomicBool, Ordering},
 };
 
+use flume::Receiver;
 use omp_core::Str;
 use omp_inference::call::AuthInput;
 
@@ -73,7 +74,7 @@ pub enum ChatAuthCommand {
 #[derive(Clone)]
 pub struct ChatAuth {
 	commands: flume::Sender<ChatAuthCommand>,
-	events:   flume::Receiver<ChatAuthEvent>,
+	events:   Receiver<ChatAuthEvent>,
 	active:   Arc<AtomicBool>,
 }
 
@@ -81,7 +82,7 @@ impl ChatAuth {
 	/// Creates a handle over a composition-owned authentication worker.
 	pub const fn new(
 		commands: flume::Sender<ChatAuthCommand>,
-		events: flume::Receiver<ChatAuthEvent>,
+		events: Receiver<ChatAuthEvent>,
 		active: Arc<AtomicBool>,
 	) -> Self {
 		Self { commands, events, active }

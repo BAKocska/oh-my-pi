@@ -3,7 +3,7 @@
 //! The daemon owns clocks, storage, and delivery.  Keeping the arithmetic here
 //! makes restart recovery deterministic and independently testable.
 
-use std::time::Duration;
+use std::{fs, path::Path, time::Duration};
 
 use omp_core::Str;
 use thiserror::Error;
@@ -215,7 +215,7 @@ impl Zone {
 		}
 		let bytes = ["/usr/share/zoneinfo", "/usr/share/lib/zoneinfo"]
 			.into_iter()
-			.find_map(|root| std::fs::read(std::path::Path::new(root).join(timezone)).ok())
+			.find_map(|root| fs::read(Path::new(root).join(timezone)).ok())
 			.ok_or_else(|| PlannerError::UnsupportedTimezone(Str::from(timezone)))?;
 		parse_tzif(&bytes).ok_or_else(|| PlannerError::UnsupportedTimezone(Str::from(timezone)))
 	}

@@ -1,13 +1,18 @@
 //! Direct Git HEAD and ref resolution with reftable fallback and invalidation
 //! polling.
 
+#[cfg(unix)]
+use std::os::unix::fs;
 use std::{
 	io,
 	path::{Path, PathBuf},
+	str,
 	time::{Duration, SystemTime},
 };
 
+use flume::Receiver;
 use omp_core::{IntoStr, Str};
+use tokio::{time, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -99,7 +104,7 @@ pub enum RefError {
 
 /// Parses one exact ref from `packed-refs`, ignoring comments and peeled lines.
 pub fn parse_packed_refs(bytes: &[u8], target: &str) -> Result<Option<Str>, RefError> {
-	let text = std::str::from_utf8(bytes)
+	let text = str::from_utf8(bytes)
 		.map_err(|_| RefError::Malformed { path: PathBuf::from("packed-refs") })?;
 	for line in text.lines() {
 		let line = line.trim();
@@ -125,7 +130,7 @@ pub async fn is_reftable(repository: &Repository) -> Result<bool, RefError> {
 	let Some(bytes) = read_optional(&config).await? else {
 		return Ok(false);
 	};
-	let text = std::str::from_utf8(&bytes).map_err(|_| RefError::Malformed { path: config })?;
+	let text = str::from_utf8(&bytes).map_err(|_| RefError::Malformed { path: config })?;
 	let mut extensions = false;
 	for raw in text.lines() {
 		let line = strip_config_comment(raw).trim();
@@ -162,7 +167,7 @@ pub async fn resolve_head(
 	let head_path = repository.git_dir.join("HEAD");
 	let bytes = read_required(&head_path).await?;
 	let text =
-		std::str::from_utf8(&bytes).map_err(|_| RefError::Malformed { path: head_path.clone() })?;
+		str::from_utf8(&bytes).map_err(|_| RefError::Malformed { path: head_path.clone() })?;
 	let head = single_line(text).ok_or_else(|| RefError::Malformed { path: head_path.clone() })?;
 	if let Some(reference) = head.strip_prefix("ref:") {
 		let reference = reference.trim();
@@ -192,7 +197,7 @@ pub async fn read_ref(repository: &Repository, reference: &str) -> Result<Option
 		let path = directory.join(reference);
 		if let Some(bytes) = read_optional(&path).await? {
 			let text =
-				std::str::from_utf8(&bytes).map_err(|_| RefError::Malformed { path: path.clone() })?;
+				str::from_utf8(&bytes).map_err(|_| RefError::Malformed { path: path.clone() })?;
 			let value = single_line(text).ok_or_else(|| RefError::Malformed { path: path.clone() })?;
 			if value.is_empty() {
 				return Err(RefError::Malformed { path });
@@ -255,7 +260,7 @@ async fn resolve_reftable(
 /// Coalescing HEAD invalidation stream. The bounded receiver holds at most one
 /// pending invalidation while consumers refresh a snapshot.
 pub struct HeadInvalidations {
-	receiver: flume::Receiver<()>,
+	receiver: Receiver<()>,
 	cancel:   CancellationToken,
 }
 
@@ -273,8 +278,8 @@ impl HeadInvalidations {
 		let task_cancel = cancel.clone();
 		tokio::spawn(async move {
 			let mut previous = fingerprint(&target).await;
-			let mut interval = tokio::time::interval(POLL_INTERVAL);
-			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			let mut interval = time::interval(POLL_INTERVAL);
+			interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 			loop {
 				tokio::select! {
 					() = task_cancel.cancelled() => break,
@@ -313,7 +318,7 @@ struct Fingerprint {
 async fn fingerprint(path: &Path) -> Option<Fingerprint> {
 	let metadata = tokio::fs::metadata(path).await.ok()?;
 	#[cfg(unix)]
-	let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+	let inode = fs::MetadataExt::ino(&metadata);
 	#[cfg(not(unix))]
 	let inode = 0;
 	Some(Fingerprint { modified: metadata.modified().ok(), len: metadata.len(), inode })
@@ -347,7 +352,7 @@ fn single_line(text: &str) -> Option<&str> {
 }
 
 fn output_scalar(bytes: &[u8]) -> Result<Str, RefError> {
-	let text = std::str::from_utf8(bytes)
+	let text = str::from_utf8(bytes)
 		.map_err(|_| RefError::Malformed { path: PathBuf::from("Git output") })?;
 	let scalar = single_line(text)
 		.filter(|value| !value.is_empty())

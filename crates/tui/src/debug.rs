@@ -40,9 +40,12 @@
 //! | `resize` | | re-read tty geometry (pair with `TIOCSWINSZ`) |
 //! | `quit` | | inject the conventional `C-c` quit chord |
 
-use std::sync::{
-	LazyLock,
-	atomic::{AtomicBool, Ordering},
+use std::{
+	env, io,
+	sync::{
+		LazyLock,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
 use omp_core::Str;
@@ -51,7 +54,9 @@ use parking_lot::Mutex;
 use crate::{
 	frame::Frame,
 	input::{InputEvent, Key, Mouse, MouseButton, MouseReport},
+	pump,
 	pump::{DebugOp, DebugQuery, TerminalEvent},
+	terminal, test_support,
 };
 
 /// Environment variable naming the debug socket path.
@@ -67,7 +72,7 @@ static RESPONSES: Mutex<Option<flume::Sender<(u64, serde_json::Value)>>> = Mutex
 /// Whether `OMP_TUI_DEBUG` names a socket path (checked once).
 pub fn enabled() -> bool {
 	static ENABLED: LazyLock<bool> =
-		LazyLock::new(|| std::env::var_os(DEBUG_ENV).is_some_and(|value| !value.is_empty()));
+		LazyLock::new(|| env::var_os(DEBUG_ENV).is_some_and(|value| !value.is_empty()));
 	*ENABLED
 }
 
@@ -129,7 +134,7 @@ pub fn frame_text(frame: &Frame) -> String {
 		if row != 0 {
 			text.push('\n');
 		}
-		text.push_str(&crate::test_support::frame_row_text(frame, row));
+		text.push_str(&test_support::frame_row_text(frame, row));
 	}
 	text
 }
@@ -166,7 +171,7 @@ fn direct_response(request: DebugRequest) -> Result<serde_json::Value, DebugOp> 
 		DebugRequest::Values => return Err(DebugOp::Values),
 		DebugRequest::Slots => return Err(DebugOp::Slots),
 		DebugRequest::Effect(effect) => {
-			if crate::pump::send_event(TerminalEvent::Effect(effect)) {
+			if pump::send_event(TerminalEvent::Effect(effect)) {
 				json!({ "ok": true, "injected": "effect" })
 			} else {
 				json!({ "ok": false, "error": "no live terminal to inject into" })
@@ -178,7 +183,7 @@ fn direct_response(request: DebugRequest) -> Result<serde_json::Value, DebugOp> 
 			let injected = events.len();
 			if events
 				.into_iter()
-				.all(|event| crate::pump::send_event(TerminalEvent::Input(event)))
+				.all(|event| pump::send_event(TerminalEvent::Input(event)))
 			{
 				json!({ "ok": true, "injected": injected })
 			} else {
@@ -187,7 +192,7 @@ fn direct_response(request: DebugRequest) -> Result<serde_json::Value, DebugOp> 
 		},
 		DebugRequest::Events(events) => {
 			let injected = events.len();
-			if events.into_iter().all(crate::pump::send_event) {
+			if events.into_iter().all(pump::send_event) {
 				json!({ "ok": true, "injected": injected })
 			} else {
 				json!({ "ok": false, "error": "no live terminal to inject into" })
@@ -197,7 +202,7 @@ fn direct_response(request: DebugRequest) -> Result<serde_json::Value, DebugOp> 
 			// Raw bytes are a debug action the event actor decodes, so they
 			// run through the live decoder state before emitting input.
 			let fed = bytes.len();
-			if crate::pump::inject_bytes(bytes) {
+			if pump::inject_bytes(bytes) {
 				json!({ "ok": true, "fed": fed })
 			} else {
 				json!({ "ok": false, "error": "no live terminal to inject into" })
@@ -241,7 +246,7 @@ pub fn terminal_response(op: DebugOp) -> Option<serde_json::Value> {
 			})
 		})),
 		DebugOp::Resize => {
-			crate::terminal::simulate_resize_signal();
+			terminal::simulate_resize_signal();
 			Some(json!({ "ok": true, "signalled": true }))
 		},
 		DebugOp::Quit => Some(json!({ "ok": true, "injected": "C-c" })),
@@ -474,7 +479,7 @@ static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 /// thread then owns the listener and answers requests on its own async
 /// loop. Idempotent; called on terminal entry.
 #[cfg(unix)]
-pub fn ensure_server() -> std::io::Result<()> {
+pub fn ensure_server() -> io::Result<()> {
 	if !enabled() || SERVER_STARTED.swap(true, Ordering::AcqRel) {
 		return Ok(());
 	}
@@ -482,16 +487,19 @@ pub fn ensure_server() -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn ensure_server() -> std::io::Result<()> {
+pub(crate) fn ensure_server() -> io::Result<()> {
 	Ok(())
 }
 
 #[cfg(unix)]
 mod server {
 	use std::{
+		env, fs, future,
 		io::{self, Read as _, Write as _},
+		os::unix::net,
 		path::PathBuf,
 		task::Poll,
+		thread,
 		time::{Duration, Instant},
 	};
 
@@ -511,18 +519,18 @@ mod server {
 	/// error rather than a silently missing socket.
 	pub(super) fn spawn_thread() -> io::Result<()> {
 		let path = PathBuf::from(
-			std::env::var_os(DEBUG_ENV).expect("enabled() checked the variable before spawning"),
+			env::var_os(DEBUG_ENV).expect("enabled() checked the variable before spawning"),
 		);
-		match std::fs::remove_file(&path) {
+		match fs::remove_file(&path) {
 			Ok(()) => {},
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 			Err(error) => return Err(error),
 		}
-		let listener = std::os::unix::net::UnixListener::bind(&path)?;
+		let listener = net::UnixListener::bind(&path)?;
 		listener.set_nonblocking(true)?;
 		let (responses_tx, responses_rx) = flume::unbounded();
 		*RESPONSES.lock() = Some(responses_tx);
-		std::thread::Builder::new()
+		thread::Builder::new()
 			.name("omp-tui-debug".into())
 			.spawn(move || {
 				async_io::block_on(async move {
@@ -622,13 +630,13 @@ mod server {
 			Some(at) => {
 				async_io::Timer::at(at).await;
 			},
-			None => std::future::pending().await,
+			None => future::pending().await,
 		}
 	}
 
 	/// Line-framed JSON server owned by the debug thread.
 	struct DebugServer {
-		listener:  async_io::Async<std::os::unix::net::UnixListener>,
+		listener:  async_io::Async<net::UnixListener>,
 		conns:     Vec<Conn>,
 		next_conn: u64,
 	}
@@ -637,7 +645,7 @@ mod server {
 		/// Stable client id; survives [`DebugServer::recv`]'s compaction of
 		/// dead connections, so pending queries can hold it across calls.
 		id:     u64,
-		stream: async_io::Async<std::os::unix::net::UnixStream>,
+		stream: async_io::Async<net::UnixStream>,
 		buf:    Vec<u8>,
 		out:    Vec<u8>,
 		dead:   bool,
@@ -694,7 +702,7 @@ mod server {
 	}
 
 	impl DebugServer {
-		const fn new(listener: async_io::Async<std::os::unix::net::UnixListener>) -> Self {
+		const fn new(listener: async_io::Async<net::UnixListener>) -> Self {
 			Self { listener, conns: Vec::new(), next_conn: 1 }
 		}
 
@@ -755,7 +763,7 @@ mod server {
 	/// writable while holding buffered response output; pending while none
 	/// are (including the empty set, leaving `accept` to wake).
 	async fn ready(conns: &[Conn]) -> usize {
-		std::future::poll_fn(|cx| {
+		future::poll_fn(|cx| {
 			for (index, conn) in conns.iter().enumerate() {
 				if conn.stream.poll_readable(cx).is_ready()
 					|| (!conn.out.is_empty() && conn.stream.poll_writable(cx).is_ready())
@@ -770,11 +778,12 @@ mod server {
 
 	#[cfg(test)]
 	mod tests {
-		use std::time::Duration;
+		use std::{env, fs, os::unix::net, time::Duration};
 
 		use futures_lite::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
 		use super::{DebugServer, serve_loop};
+		use crate::pump::publish_ingress_for_test;
 
 		/// A disconnect must not reroute a pending query's reply: client A
 		/// parks a retained query and dies, client B occupies A's compacted
@@ -784,14 +793,13 @@ mod server {
 		fn pending_query_replies_follow_stable_client_ids() {
 			let executor = omp_executor::Executor::new(None);
 			executor.clone().block_on(async move {
-				let ingress = crate::pump::publish_ingress_for_test();
+				let ingress = publish_ingress_for_test();
 				let (responses_tx, responses_rx) = flume::unbounded();
 
-				let path = std::env::temp_dir()
-					.join(format!("omp-tui-debug-idtest-{}.sock", std::process::id()));
-				let _ = std::fs::remove_file(&path);
-				let listener =
-					std::os::unix::net::UnixListener::bind(&path).expect("test socket binds");
+				let path =
+					env::temp_dir().join(format!("omp-tui-debug-idtest-{}.sock", std::process::id()));
+				let _ = fs::remove_file(&path);
+				let listener = net::UnixListener::bind(&path).expect("test socket binds");
 				listener
 					.set_nonblocking(true)
 					.expect("nonblocking listener");
@@ -800,7 +808,7 @@ mod server {
 				let serve = executor.spawn(async move { serve_loop(&mut server, responses_rx).await });
 
 				// Client A parks a retained query (id 1), then disconnects.
-				let mut first = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
+				let mut first = async_io::Async::<net::UnixStream>::connect(&path)
 					.await
 					.expect("first client connects");
 				first
@@ -816,7 +824,7 @@ mod server {
 
 				// Client B lands on the compacted slot an index token would
 				// still name and gets its own answer.
-				let second = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
+				let second = async_io::Async::<net::UnixStream>::connect(&path)
 					.await
 					.expect("second client connects");
 				let mut second = BufReader::new(second);
@@ -847,7 +855,7 @@ mod server {
 				);
 
 				drop(serve);
-				let _ = std::fs::remove_file(&path);
+				let _ = fs::remove_file(&path);
 			});
 		}
 	}

@@ -2,6 +2,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use flume::Receiver;
+
 /// Creates a producer and terminal receiver for an ordered protocol event
 /// stream.
 ///
@@ -18,7 +20,7 @@ pub fn terminal_event_channel<T, E>() -> (flume::Sender<Result<T, E>>, TerminalE
 /// error.
 #[derive(Debug)]
 pub struct TerminalEventReceiver<T, E> {
-	receiver: flume::Receiver<Result<T, E>>,
+	receiver: Receiver<Result<T, E>>,
 	terminal: AtomicBool,
 }
 

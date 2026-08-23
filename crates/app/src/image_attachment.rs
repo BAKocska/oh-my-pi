@@ -80,11 +80,13 @@ fn media_type(format: ImageFormat) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+	use image::DynamicImage;
+
 	use super::*;
 
 	#[test]
 	fn small_png_is_not_reencoded() {
-		let image = image::DynamicImage::new_rgba8(4, 3);
+		let image = DynamicImage::new_rgba8(4, 3);
 		let mut output = Cursor::new(Vec::new());
 		image.write_to(&mut output, ImageFormat::Png).expect("png");
 		let bytes = Bytes::from(output.into_inner());

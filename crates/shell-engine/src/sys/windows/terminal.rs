@@ -1,6 +1,6 @@
 //! Terminal utilities.
 
-use std::path::PathBuf;
+use std::{io, mem, path::PathBuf};
 
 use windows_sys::Win32::{
 	Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
@@ -19,7 +19,12 @@ use windows_sys::Win32::{
 	UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow},
 };
 
-use crate::{builtins::terminal, error, openfiles, sys};
+use crate::{
+	builtins::terminal,
+	error,
+	openfiles::{self, OpenFile},
+	sys,
+};
 
 struct Snapshot(HANDLE);
 
@@ -42,11 +47,12 @@ pub(crate) struct Config {
 impl Config {
 	/// Creates a new `Config` from the actual terminal attributes of the
 	/// terminal associated with the given file descriptor.
-	///
+
 	/// # Arguments
 	///
 	/// * `_file` - A reference to the open terminal.
-	pub(crate) fn from_term(_file: &openfiles::OpenFile) -> Result<Self, error::Error> {
+
+	pub(crate) fn from_term(_file: &OpenFile) -> Result<Self, error::Error> {
 		let input_handle = console_input_handle()?;
 		let output_handle = console_output_handle()?;
 
@@ -62,7 +68,7 @@ impl Config {
 	/// # Arguments
 	///
 	/// * `_file` - A reference to the open terminal.
-	pub(crate) fn apply_to_term(&self, _file: &openfiles::OpenFile) -> Result<(), error::Error> {
+	pub(crate) fn apply_to_term(&self, _file: &OpenFile) -> Result<(), error::Error> {
 		let input_handle = console_input_handle()?;
 		let output_handle = console_output_handle()?;
 
@@ -120,10 +126,10 @@ pub fn get_parent_process_id() -> Option<sys::process::ProcessId> {
 	let snapshot = create_process_snapshot()?;
 
 	let mut entry = PROCESSENTRY32W {
-		dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+		dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
 		// SAFETY: `PROCESSENTRY32W` is a plain C data structure, and zeroed fields
 		// are accepted by the ToolHelp APIs as long as `dwSize` is initialized.
-		..unsafe { std::mem::zeroed() }
+		..unsafe { mem::zeroed() }
 	};
 
 	// SAFETY: `snapshot.0` is a valid snapshot handle owned by `snapshot`, and
@@ -180,10 +186,10 @@ pub fn move_to_foreground(_pid: sys::process::ProcessId) -> Result<(), error::Er
 }
 
 /// Moves the current process to the foreground of the attached terminal.
-pub fn move_self_to_foreground() -> Result<(), std::io::Error> {
+pub fn move_self_to_foreground() -> Result<(), io::Error> {
 	let pid = current_process_id();
 	move_to_foreground(pid as sys::process::ProcessId)
-		.map_err(|err| std::io::Error::other(err.to_string()))
+		.map_err(|err| io::Error::other(err.to_string()))
 }
 
 /// Tries to get the path of the terminal device associated with the attached
@@ -224,7 +230,7 @@ fn console_output_handle() -> Result<HANDLE, error::Error> {
 
 fn validate_handle(handle: HANDLE) -> Result<HANDLE, error::Error> {
 	if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-		return Err(std::io::Error::last_os_error().into());
+		return Err(io::Error::last_os_error().into());
 	}
 
 	Ok(handle)
@@ -236,7 +242,7 @@ fn console_mode(handle: HANDLE) -> Result<u32, error::Error> {
 	// `validate_handle`, and `mode` points to writable storage for the console
 	// mode output.
 	if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-		return Err(std::io::Error::last_os_error().into());
+		return Err(io::Error::last_os_error().into());
 	}
 
 	Ok(mode)
@@ -247,7 +253,7 @@ fn set_console_mode(handle: HANDLE, mode: u32) -> Result<(), error::Error> {
 	// `validate_handle`; `mode` is a bitset obtained from or derived from Win32
 	// console mode flags, and the OS validates unsupported combinations.
 	if unsafe { SetConsoleMode(handle, mode) } == 0 {
-		return Err(std::io::Error::last_os_error().into());
+		return Err(io::Error::last_os_error().into());
 	}
 
 	Ok(())

@@ -2,6 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
+	env,
 	path::{Path, PathBuf},
 };
 
@@ -9,6 +10,8 @@ use omp_core::{Str, sf};
 use parking_lot::RwLock;
 use serde_json::{Map, Value};
 use thiserror::Error;
+
+use crate::lsp_registry;
 
 pub(crate) const SKIP_ATTACH_REQUEST: &str = "skipAttachRequest";
 
@@ -271,9 +274,9 @@ impl DapAdapterRegistry {
 
 	/// Resolves js-debug using `JS_DEBUG_DAP_SERVER`, XDG data, and HOME.
 	pub fn discover_js_debug_from_env(&self, project_root: &Path) -> Option<DapAdapterId> {
-		let home = std::env::var_os("HOME").map(PathBuf::from)?;
-		let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-		let configured = std::env::var_os("JS_DEBUG_DAP_SERVER").map(PathBuf::from);
+		let home = env::var_os("HOME").map(PathBuf::from)?;
+		let xdg = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+		let configured = env::var_os("JS_DEBUG_DAP_SERVER").map(PathBuf::from);
 		self.discover_js_debug(project_root, &home, xdg.as_deref(), configured.as_deref())
 	}
 
@@ -298,7 +301,7 @@ impl DapAdapterRegistry {
 					.iter()
 					.any(|candidate| candidate.trim_start_matches('.') == extension);
 				let marker_rank =
-					crate::lsp_registry::root_marker_ancestor(program, &adapter.spec.root_markers)
+					lsp_registry::root_marker_ancestor(program, &adapter.spec.root_markers)
 						.is_some_and(|root| root.starts_with(project_root));
 				if !extension_rank && !marker_rank && !extension.is_empty() {
 					return None;
@@ -370,8 +373,8 @@ fn resolve_path_command(command: &str) -> Option<PathBuf> {
 	if path.components().count() > 1 {
 		return path.is_file().then(|| path.to_owned());
 	}
-	std::env::var_os("PATH").and_then(|paths| {
-		std::env::split_paths(&paths).find_map(|directory| {
+	env::var_os("PATH").and_then(|paths| {
+		env::split_paths(&paths).find_map(|directory| {
 			executable_candidates(&directory, command)
 				.into_iter()
 				.find(|path| path.is_file())
@@ -436,7 +439,7 @@ fn unavailable_guidance(adapter: &str) -> Option<Str> {
 fn executable_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
 	let mut candidates = vec![directory.join(command)];
 	if Path::new(command).extension().is_none() {
-		for extension in std::env::var_os("PATHEXT")
+		for extension in env::var_os("PATHEXT")
 			.unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
 			.to_string_lossy()
 			.split(';')
@@ -699,10 +702,10 @@ mod tests {
 			.unwrap();
 		let root = tempfile::tempdir().unwrap();
 		let source = root.path().join("main.go");
-		std::fs::write(&source, b"package main").unwrap();
+		fs::write(&source, b"package main").unwrap();
 		assert_eq!(dlv.spec.launch_arguments(&source, &Map::new())["mode"], "debug");
 		let binary = root.path().join("app");
-		std::fs::write(&binary, b"").unwrap();
+		fs::write(&binary, b"").unwrap();
 		assert_eq!(dlv.spec.launch_arguments(&binary, &Map::new())["mode"], "exec");
 	}
 
@@ -711,13 +714,13 @@ mod tests {
 		let root = tempfile::tempdir().unwrap();
 		let home = tempfile::tempdir().unwrap();
 		let configured = root.path().join("configured/dapDebugServer.js");
-		std::fs::create_dir_all(configured.parent().unwrap()).unwrap();
-		std::fs::write(&configured, b"").unwrap();
+		fs::create_dir_all(configured.parent().unwrap()).unwrap();
+		fs::write(&configured, b"").unwrap();
 		let mason = home
 			.path()
 			.join(".local/share/nvim/mason/packages/js-debug-adapter/js-debug/src/dapDebugServer.js");
-		std::fs::create_dir_all(mason.parent().unwrap()).unwrap();
-		std::fs::write(&mason, b"").unwrap();
+		fs::create_dir_all(mason.parent().unwrap()).unwrap();
+		fs::write(&mason, b"").unwrap();
 		assert_eq!(
 			discover_js_debug_server(
 				root.path(),

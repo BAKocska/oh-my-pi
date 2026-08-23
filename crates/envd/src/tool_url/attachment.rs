@@ -8,7 +8,7 @@ use omp_tools::read::{
 	selector::ParsedSelector,
 };
 
-pub(super) struct AttachmentUrlResolver {
+pub(crate) struct AttachmentUrlResolver {
 	store:   BlobStore,
 	session: Str,
 	lines:   LineOffsetCache,
@@ -26,6 +26,7 @@ impl Resolve for AttachmentUrlResolver {
 		resource: &'a str,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
+		use super::select_bytes;
 		let snapshot =
 			omp_agent::attachments::session_attachments(&self.session).ok_or_else(|| {
 				Fault::Source { message: Str::new_static("No live attachment snapshot is available.") }
@@ -45,6 +46,6 @@ impl Resolve for AttachmentUrlResolver {
 				message: Str::new_static("Attachment content is unavailable."),
 			})?)
 		};
-		super::select_bytes(&self.lines, resource, bytes, selector)
+		select_bytes(&self.lines, resource, bytes, selector)
 	}
 }

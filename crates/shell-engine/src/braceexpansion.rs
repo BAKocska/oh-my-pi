@@ -1,9 +1,11 @@
+use std::iter;
+
 use itertools::{Either, Itertools};
 
-use crate::parser::word;
+use crate::parser::{word, word::BraceExpressionOrText};
 
 pub(crate) fn generate_and_combine_brace_expansions(
-	pieces: Vec<crate::parser::word::BraceExpressionOrText>,
+	pieces: Vec<BraceExpressionOrText>,
 ) -> impl Iterator<Item = String> {
 	pieces
 		.into_iter()
@@ -17,7 +19,7 @@ fn expand_brace_expr_or_text(beot: word::BraceExpressionOrText) -> impl Iterator
 		word::BraceExpressionOrText::Expr(members) => {
 			Either::Left(members.into_iter().flat_map(expand_brace_expr_member))
 		},
-		word::BraceExpressionOrText::Text(text) => Either::Right(std::iter::once(text)),
+		word::BraceExpressionOrText::Text(text) => Either::Right(iter::once(text)),
 	}
 }
 
@@ -50,7 +52,7 @@ fn expand_number_sequence(start: i64, end: i64, increment: i64) -> impl Iterator
 		)]
 		let increment = increment as i64;
 		Either::Right(
-			std::iter::successors(Some(start), move |&n| {
+			iter::successors(Some(start), move |&n| {
 				let next = n - increment;
 				(next >= end).then_some(next)
 			})
@@ -67,7 +69,7 @@ fn expand_char_sequence(start: char, end: char, increment: i64) -> impl Iterator
 	} else {
 		let increment = increment as u32;
 		Either::Right(
-			std::iter::successors(Some(start), move |&c| {
+			iter::successors(Some(start), move |&c| {
 				let next = char::from_u32(c as u32 - increment)?;
 				(next >= end).then_some(next)
 			})

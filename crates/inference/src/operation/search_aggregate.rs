@@ -3,6 +3,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use omp_core::Str;
+use url::Url;
 
 use super::search::SearchDocument;
 
@@ -73,7 +74,7 @@ pub fn aggregate_public_web(pages: &[EngineResults], limit: usize) -> Vec<Consen
 }
 
 fn normalized_url(raw: &str) -> Option<String> {
-	let mut url = url::Url::parse(raw).ok()?;
+	let mut url = Url::parse(raw).ok()?;
 	url.set_fragment(None);
 	let retained: Vec<(String, String)> = url
 		.query_pairs()

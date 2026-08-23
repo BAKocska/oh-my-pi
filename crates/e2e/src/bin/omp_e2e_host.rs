@@ -1,10 +1,10 @@
 //! Worker-capable OMP executable used by cross-crate acceptance proofs.
 
-use std::process::ExitCode;
+use std::{env, process::ExitCode};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-	if std::env::args_os()
+	if env::args_os()
 		.nth(1)
 		.is_some_and(|arg| arg == omp_envd::exthost::EXT_HOST_ARG)
 	{
@@ -16,7 +16,7 @@ async fn main() -> ExitCode {
 			},
 		};
 	}
-	if std::env::args_os()
+	if env::args_os()
 		.nth(1)
 		.is_some_and(|arg| arg == omp_envd::worker::WORKER_ARG)
 	{

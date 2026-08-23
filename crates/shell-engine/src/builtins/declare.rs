@@ -4,8 +4,9 @@ use clap::Parser;
 use itertools::Itertools;
 
 use crate::{
-	ErrorKind, ExecutionResult, builtins,
+	CommandArg, Error, ErrorKind, ExecutionContext, ExecutionResult, ShellExtensions, builtins,
 	env::{self, EnvironmentLookup, EnvironmentScope},
+	minus_or_plus_flag_arg,
 	parser::ast,
 	variables::{
 		self, ArrayLiteral, ShellValue, ShellValueLiteral, ShellValueUnsetType, ShellVariable,
@@ -13,32 +14,28 @@ use crate::{
 	},
 };
 
-crate::minus_or_plus_flag_arg!(MakeIndexedArrayFlag, 'a', "Make the variable an indexed array.");
-crate::minus_or_plus_flag_arg!(
-	MakeAssociativeArrayFlag,
-	'A',
-	"Make the variable an associative array."
-);
-crate::minus_or_plus_flag_arg!(
+minus_or_plus_flag_arg!(MakeIndexedArrayFlag, 'a', "Make the variable an indexed array.");
+minus_or_plus_flag_arg!(MakeAssociativeArrayFlag, 'A', "Make the variable an associative array.");
+minus_or_plus_flag_arg!(
 	CapitalizeValueOnAssignmentFlag,
 	'c',
 	"Enable capitalize-on-assignment for the variable."
 );
-crate::minus_or_plus_flag_arg!(MakeIntegerFlag, 'i', "Mark the variable as integer-typed");
-crate::minus_or_plus_flag_arg!(
+minus_or_plus_flag_arg!(MakeIntegerFlag, 'i', "Mark the variable as integer-typed");
+minus_or_plus_flag_arg!(
 	LowercaseValueOnAssignmentFlag,
 	'l',
 	"Enable lowercase-on-assignment for the variable."
 );
-crate::minus_or_plus_flag_arg!(MakeNameRefFlag, 'n', "Mark the variable as a name reference");
-crate::minus_or_plus_flag_arg!(MakeReadonlyFlag, 'r', "Mark the variable as read-only.");
-crate::minus_or_plus_flag_arg!(MakeTracedFlag, 't', "Enable tracing for the variable.");
-crate::minus_or_plus_flag_arg!(
+minus_or_plus_flag_arg!(MakeNameRefFlag, 'n', "Mark the variable as a name reference");
+minus_or_plus_flag_arg!(MakeReadonlyFlag, 'r', "Mark the variable as read-only.");
+minus_or_plus_flag_arg!(MakeTracedFlag, 't', "Enable tracing for the variable.");
+minus_or_plus_flag_arg!(
 	UppercaseValueOnAssignmentFlag,
 	'u',
 	"Enable uppercase-on-assignment for the variable."
 );
-crate::minus_or_plus_flag_arg!(MakeExportedFlag, 'x', "Mark the variable for export.");
+minus_or_plus_flag_arg!(MakeExportedFlag, 'x', "Mark the variable for export.");
 
 /// Display or update variables and their attributes.
 #[derive(Parser)]
@@ -94,7 +91,7 @@ pub(crate) struct DeclareCommand {
 	//
 	// N.B. These are skipped by clap, but filled in by the BuiltinDeclarationCommand trait.
 	#[clap(skip)]
-	declarations: Vec<crate::CommandArg>,
+	declarations: Vec<CommandArg>,
 }
 
 #[derive(Clone, Copy)]
@@ -105,22 +102,22 @@ enum DeclareVerb {
 }
 
 impl builtins::DeclarationCommand for DeclareCommand {
-	fn set_declarations(&mut self, declarations: Vec<crate::CommandArg>) {
+	fn set_declarations(&mut self, declarations: Vec<CommandArg>) {
 		self.declarations = declarations;
 	}
 }
 
 impl builtins::Command for DeclareCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
 	fn takes_plus_options() -> bool {
 		true
 	}
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		mut context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		mut context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let verb = match context.command_name.as_str() {
 			"local" => DeclareVerb::Local,
 			"readonly" => DeclareVerb::Readonly,
@@ -166,13 +163,13 @@ impl builtins::Command for DeclareCommand {
 impl DeclareCommand {
 	fn try_display_declaration(
 		&self,
-		context: &crate::ExecutionContext<'_, impl crate::ShellExtensions>,
-		declaration: &crate::CommandArg,
+		context: &ExecutionContext<'_, impl ShellExtensions>,
+		declaration: &CommandArg,
 		verb: DeclareVerb,
-	) -> Result<bool, crate::Error> {
+	) -> Result<bool, Error> {
 		let name = match declaration {
-			crate::CommandArg::String(s) => s,
-			crate::CommandArg::Assignment(_) => {
+			CommandArg::String(s) => s,
+			CommandArg::Assignment(_) => {
 				writeln!(context.stderr(), "declare: {declaration}: not found")?;
 				return Ok(false);
 			},
@@ -228,10 +225,10 @@ impl DeclareCommand {
 
 	fn process_declaration(
 		&self,
-		context: &mut crate::ExecutionContext<'_, impl crate::ShellExtensions>,
-		declaration: &crate::CommandArg,
+		context: &mut ExecutionContext<'_, impl ShellExtensions>,
+		declaration: &CommandArg,
 		verb: DeclareVerb,
-	) -> Result<bool, crate::Error> {
+	) -> Result<bool, Error> {
 		let create_var_local = matches!(verb, DeclareVerb::Local)
 			|| (matches!(verb, DeclareVerb::Declare)
 				&& context.shell.in_function()
@@ -347,15 +344,15 @@ impl DeclareCommand {
 	}
 
 	fn declaration_to_name_and_value(
-		declaration: &crate::CommandArg,
-	) -> Result<(String, Option<String>, Option<ShellValueLiteral>, bool), crate::Error> {
+		declaration: &CommandArg,
+	) -> Result<(String, Option<String>, Option<ShellValueLiteral>, bool), Error> {
 		let name;
 		let assigned_index;
 		let initial_value;
 		let name_is_array;
 
 		match declaration {
-			crate::CommandArg::String(s) => {
+			CommandArg::String(s) => {
 				// We need to handle the case of someone invoking `declare array[index]`.
 				// In such case, we ignore the index and treat it as a declaration of
 				// the array.
@@ -370,7 +367,7 @@ impl DeclareCommand {
 				if let Some(captures) = ARRAY_AND_INDEX_RE.captures(s)? {
 					name = captures
 						.get(1)
-						.ok_or_else(|| crate::ErrorKind::InternalError("declaration parse error".into()))?
+						.ok_or_else(|| ErrorKind::InternalError("declaration parse error".into()))?
 						.as_str()
 						.to_owned();
 
@@ -383,7 +380,7 @@ impl DeclareCommand {
 				}
 				initial_value = None;
 			},
-			crate::CommandArg::Assignment(assignment) => {
+			CommandArg::Assignment(assignment) => {
 				match &assignment.name {
 					ast::AssignmentName::VariableName(var_name) => {
 						name = var_name.to_owned();
@@ -431,9 +428,9 @@ impl DeclareCommand {
 
 	fn display_matching_env_declarations(
 		&self,
-		context: &crate::ExecutionContext<'_, impl crate::ShellExtensions>,
+		context: &ExecutionContext<'_, impl ShellExtensions>,
 		verb: DeclareVerb,
-	) -> Result<(), crate::Error> {
+	) -> Result<(), Error> {
 		//
 		// Dump all declarations. Use attribute flags to filter which variables are
 		// dumped.
@@ -544,8 +541,8 @@ impl DeclareCommand {
 
 	fn display_matching_functions(
 		&self,
-		context: &crate::ExecutionContext<'_, impl crate::ShellExtensions>,
-	) -> Result<(), crate::Error> {
+		context: &ExecutionContext<'_, impl ShellExtensions>,
+	) -> Result<(), Error> {
 		for (name, registration) in context.shell.funcs().iter().sorted_by_key(|v| v.0) {
 			if self.function_names_only {
 				writeln!(context.stdout(), "declare -f {name}")?;
@@ -561,10 +558,7 @@ impl DeclareCommand {
 		clippy::unnecessary_wraps,
 		reason = "callers share the fallible attribute-update protocol"
 	)]
-	const fn apply_attributes_before_update(
-		&self,
-		var: &mut ShellVariable,
-	) -> Result<(), crate::Error> {
+	const fn apply_attributes_before_update(&self, var: &mut ShellVariable) -> Result<(), Error> {
 		if let Some(value) = self.make_integer.to_bool() {
 			if value {
 				var.treat_as_integer();
@@ -622,7 +616,7 @@ impl DeclareCommand {
 		&self,
 		var: &mut ShellVariable,
 		verb: DeclareVerb,
-	) -> Result<(), crate::Error> {
+	) -> Result<(), Error> {
 		if matches!(verb, DeclareVerb::Readonly) {
 			var.set_readonly();
 		} else if let Some(value) = self.make_readonly.to_bool() {

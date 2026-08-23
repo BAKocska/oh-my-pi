@@ -1,3 +1,5 @@
+//! Proves domain CONTROL routing preserves request, callback, and effect
+//! ownership.
 use std::{
 	collections::BTreeSet,
 	sync::{Arc, Mutex},

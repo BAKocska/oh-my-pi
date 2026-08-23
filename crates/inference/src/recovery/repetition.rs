@@ -568,6 +568,8 @@ pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+	use std::str;
+
 	use omp_core::sf;
 	use serde_json::json;
 
@@ -631,7 +633,7 @@ mod tests {
 		let mut guard = AttemptRepetitionGuard::new(RepetitionLimits::default());
 		let mut detected = None;
 		for chunk in runaway.as_bytes().chunks(23) {
-			let chunk = std::str::from_utf8(chunk).expect("ASCII fixture");
+			let chunk = str::from_utf8(chunk).expect("ASCII fixture");
 			if let Some(signal) = guard.observe(chunk, OutputVisibility::Gated) {
 				detected = Some(signal);
 				break;
@@ -679,7 +681,7 @@ mod tests {
 		assert_eq!(runaway.len(), 207);
 		let mut guard = AttemptRepetitionGuard::new(RepetitionLimits::default());
 		for chunk in runaway.as_bytes().chunks(9) {
-			let chunk = std::str::from_utf8(chunk).expect("ASCII fixture");
+			let chunk = str::from_utf8(chunk).expect("ASCII fixture");
 			assert!(
 				guard
 					.observe_exact_cycle(chunk, OutputVisibility::Gated)

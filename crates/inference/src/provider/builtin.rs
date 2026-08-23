@@ -1,6 +1,7 @@
 //! Canonical production construction for catalog-backed provider routes.
 
 use std::{
+	array,
 	collections::BTreeMap,
 	future::{Ready, ready},
 	num::NonZeroU32,
@@ -8,6 +9,7 @@ use std::{
 	time::{Duration, Instant, SystemTime},
 };
 
+use http::HeaderValue;
 use omp_catalog::{
 	OperationBits, OperationKind,
 	provider::{AuthSpecKind, CodecProfile, DiscoveryKind, RouteDef, TransportKind},
@@ -15,19 +17,24 @@ use omp_catalog::{
 };
 use omp_core::{ExposeSecret as _, Str, sf};
 use tower::{Service, util::BoxCloneSyncService};
+use url::Url;
 
 use crate::{
+	ProviderId,
 	account::{
 		AccountPool, AccountSelection, AccountSelectionRequest, RateAvailability, RotationPolicy,
 	},
 	auth::{
-		AuthManager, CredentialBroker, CredentialNeed, CredentialShaperRegistry, CredentialSource,
-		OAuthHttpClient, OAuthHttpRequest,
+		AuthManager, AuthScheme, CredentialApplyError, CredentialBroker, CredentialError,
+		CredentialKind, CredentialLease, CredentialNeed, CredentialShaperRegistry, CredentialSource,
+		OAuthHttpClient, OAuthHttpRequest, ProviderShaper, spec::AuthSpec,
 	},
-	call::{Call, NativeResponseFraming, OperationCall, Setting, ToolChoice},
+	call::{AccountRoutingContext, Call, NativeResponseFraming, OperationCall, Setting, ToolChoice},
+	catalog::{AuthSpecId, RouteId},
 	codec::{
 		Cancellation, Codec, DecodeContext, DecoderState, EncodeAttempt, EncodeContext,
-		EncodedRequest, HandshakenResponse, NativeResponseFormat, TransportAttempt, TransportRequest,
+		EncodedRequest, HandshakenResponse, NativeResponseFormat, RealtimeWireCodecState,
+		RequestHeader, TransportAttempt, TransportRequest,
 		anthropic::AnthropicCodec,
 		bedrock::BedrockConverseCodec,
 		cursor::CursorCodec,
@@ -39,9 +46,13 @@ use crate::{
 		gemini::GeminiCodec,
 		gitlab::GitLabWorkflowCodec,
 		glyph,
-		google_cca::{AntigravityPolicy, CcaHeaders, GoogleCcaCodec},
+		google_cca::{
+			ANTIGRAVITY_VERSION_MANIFEST_URL, AntigravityPolicy, CcaHeaders, GoogleCcaCodec,
+			parse_antigravity_manifest_version,
+		},
 		ollama::OllamaCodec,
 		openai::OpenAiCodec,
+		openai_chat,
 		openai_codex::OpenAiCodexCodec,
 		openai_embedding::OpenAiEmbeddingCodec,
 		openai_responses::OpenAiResponsesCodec,
@@ -69,7 +80,7 @@ use crate::{
 		account::{AccountPoolLayer, AccountSelector},
 		admission::{AdmissionController, AdmissionLayer},
 		auth::{AuthLeaseLayer, LeaseProvider},
-		encode::{AttemptEncoder, CredentialApplier, CredentialApplyLayer},
+		encode::{AttemptEncoder, CredentialApplier, CredentialApplyLayer, EncodeLayer},
 		hook::ProviderErrorLayer,
 		intent::{IntentLayer, IntentPlanner},
 		operation::{EmbeddingRoutePolicy, OperationPolicyConfig, OperationPolicyLayer},
@@ -81,12 +92,18 @@ use crate::{
 		stack::{RouteComposer, RouteProviderService, RouteStackLayers, build_route_stack},
 	},
 	operation::{
-		discovery::CatalogDiscoveryProjector, embedding::NormalizationSupport,
-		parallel_extract::ParallelExtractCodec, usage::UsageServiceConfig,
+		discovery::CatalogDiscoveryProjector,
+		embedding::NormalizationSupport,
+		parallel_extract::ParallelExtractCodec,
+		usage::{ConsoleUsageManager, UsageServiceConfig},
 	},
 	receipt::{ExecutionReceipt, ReasonId},
 	registry::RouteUnavailable,
-	transport::{http::HttpTransport, websocket_transport::WebSocketTransport},
+	session::ConversationSessionPlanner,
+	settings::InferenceSettings,
+	transport::{
+		global_provider_capture, http::HttpTransport, websocket_transport::WebSocketTransport,
+	},
 };
 
 /// Explicit route construction settings for the two Cloud Code Assist clients.
@@ -115,20 +132,16 @@ pub struct GoogleCcaConfig {
 /// [`DEFAULT_ANTIGRAVITY_VERSION`]: crate::codec::google_cca::DEFAULT_ANTIGRAVITY_VERSION
 pub async fn discover_antigravity_version(client: &dyn OAuthHttpClient) -> Option<Str> {
 	let mut headers = http::HeaderMap::new();
-	headers.insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-cache"));
-	headers.insert(http::header::USER_AGENT, http::HeaderValue::from_static("electron-builder"));
-	let request = OAuthHttpRequest::new(
-		http::Method::GET,
-		crate::codec::google_cca::ANTIGRAVITY_VERSION_MANIFEST_URL,
-		headers,
-		None,
-	)
-	.ok()?;
+	headers.insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+	headers.insert(http::header::USER_AGENT, HeaderValue::from_static("electron-builder"));
+	let request =
+		OAuthHttpRequest::new(http::Method::GET, ANTIGRAVITY_VERSION_MANIFEST_URL, headers, None)
+			.ok()?;
 	let response = client.execute(request).await.ok()?;
 	if response.status != 200 {
 		return None;
 	}
-	crate::codec::google_cca::parse_antigravity_manifest_version(response.body.expose_secret())
+	parse_antigravity_manifest_version(response.body.expose_secret())
 }
 
 /// Resolved non-secret signing regions supplied by the application.
@@ -169,7 +182,7 @@ pub struct ProductionDependencies {
 	credentials:          CredentialBroker,
 	auth_manager:         AuthManager,
 	accounts:             AccountPool,
-	sessions:             crate::session::ConversationSessionPlanner,
+	sessions:             ConversationSessionPlanner,
 	websocket:            WebSocketTransport,
 	http:                 HttpTransport,
 	admission:            AdmissionController,
@@ -177,12 +190,12 @@ pub struct ProductionDependencies {
 	transport_timeout:    Duration,
 	auth_application:     AuthApplicationConfig,
 	credential_shapers:   Arc<CredentialShaperRegistry>,
-	usage_manager:        Option<crate::operation::usage::ConsoleUsageManager>,
-	settings:             crate::settings::InferenceSettings,
-	provider_admission:   Arc<BTreeMap<crate::ProviderId, AdmissionController>>,
-	local_routes:         Arc<BTreeMap<crate::catalog::RouteId, LocalRouteBackend>>,
-	discovery_projectors: Arc<BTreeMap<crate::catalog::RouteId, Arc<dyn DiscoveryProjector>>>,
-	local_unavailable:    Arc<BTreeMap<crate::catalog::RouteId, ReasonId>>,
+	usage_manager:        Option<ConsoleUsageManager>,
+	settings:             InferenceSettings,
+	provider_admission:   Arc<BTreeMap<ProviderId, AdmissionController>>,
+	local_routes:         Arc<BTreeMap<RouteId, LocalRouteBackend>>,
+	discovery_projectors: Arc<BTreeMap<RouteId, Arc<dyn DiscoveryProjector>>>,
+	local_unavailable:    Arc<BTreeMap<RouteId, ReasonId>>,
 }
 
 impl ProductionDependencies {
@@ -191,14 +204,14 @@ impl ProductionDependencies {
 		credentials: CredentialBroker,
 		auth_manager: AuthManager,
 		accounts: AccountPool,
-		sessions: crate::session::ConversationSessionPlanner,
+		sessions: ConversationSessionPlanner,
 		websocket: WebSocketTransport,
 		google_cca: GoogleCcaConfig,
 		http: HttpTransport,
 		auth_application: AuthApplicationConfig,
 		admission: AdmissionController,
 		transport_timeout: Duration,
-		discovery_projectors: Arc<BTreeMap<crate::catalog::RouteId, Arc<dyn DiscoveryProjector>>>,
+		discovery_projectors: Arc<BTreeMap<RouteId, Arc<dyn DiscoveryProjector>>>,
 		credential_shapers: Arc<CredentialShaperRegistry>,
 	) -> Self {
 		Self {
@@ -214,7 +227,7 @@ impl ProductionDependencies {
 			transport_timeout,
 			credential_shapers,
 			usage_manager: None,
-			settings: crate::settings::InferenceSettings::default(),
+			settings: InferenceSettings::default(),
 			provider_admission: Arc::new(BTreeMap::new()),
 			discovery_projectors,
 			local_routes: Arc::new(BTreeMap::new()),
@@ -226,22 +239,19 @@ impl ProductionDependencies {
 		self.auth_manager.clone()
 	}
 
-	pub(crate) fn usage_manager(&self) -> Option<crate::operation::usage::ConsoleUsageManager> {
+	pub(crate) fn usage_manager(&self) -> Option<ConsoleUsageManager> {
 		self.usage_manager.clone()
 	}
 
 	/// Installs application-composed provider console usage backends.
-	pub fn with_usage_manager(
-		mut self,
-		manager: crate::operation::usage::ConsoleUsageManager,
-	) -> Self {
+	pub fn with_usage_manager(mut self, manager: ConsoleUsageManager) -> Self {
 		self.usage_manager = Some(manager);
 		self
 	}
 
 	/// Installs the immutable runtime settings projection used by every route
 	/// stack.
-	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
+	pub fn with_settings(mut self, settings: InferenceSettings) -> Self {
 		self.provider_admission = Arc::new(
 			settings
 				.providers
@@ -250,7 +260,7 @@ impl ProductionDependencies {
 				.filter(|(_, limit)| **limit > 0)
 				.map(|(provider, limit)| {
 					(
-						crate::ProviderId::from(provider.clone()),
+						ProviderId::from(provider.clone()),
 						AdmissionController::new(*limit, settings.providers.max_queued),
 					)
 				})
@@ -264,7 +274,7 @@ impl ProductionDependencies {
 	/// route.
 	pub fn with_local_routes(
 		mut self,
-		routes: impl IntoIterator<Item = (crate::RouteId, LocalRouteBackend)>,
+		routes: impl IntoIterator<Item = (RouteId, LocalRouteBackend)>,
 	) -> Self {
 		self.local_routes = Arc::new(routes.into_iter().collect());
 		self
@@ -274,7 +284,7 @@ impl ProductionDependencies {
 	/// local routes.
 	pub fn with_local_unavailable(
 		mut self,
-		routes: impl IntoIterator<Item = (crate::RouteId, ReasonId)>,
+		routes: impl IntoIterator<Item = (RouteId, ReasonId)>,
 	) -> Self {
 		self.local_unavailable = Arc::new(routes.into_iter().collect());
 		self
@@ -387,9 +397,8 @@ impl RouteComposer for ProductionRouteComposer {
 			.get(&route.id)
 			.cloned()
 			.or_else(|| route.endpoint.region.clone());
-		let runtime_auth =
-			crate::auth::spec::AuthSpec::from_catalog(auth, oauth, signing_region.clone())
-				.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
+		let runtime_auth = AuthSpec::from_catalog(auth, oauth, signing_region.clone())
+			.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
 		let mut auth_specs = vec![(route.auth.clone(), runtime_auth)];
 		if matches!(route.codec.as_str(), "anthropic" | "search-perplexity") {
 			let provider = catalog
@@ -406,9 +415,8 @@ impl RouteComposer for ProductionRouteComposer {
 					continue;
 				}
 				let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
-				let runtime =
-					crate::auth::spec::AuthSpec::from_catalog(auth, oauth, signing_region.clone())
-						.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
+				let runtime = AuthSpec::from_catalog(auth, oauth, signing_region.clone())
+					.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
 				if route.codec.as_str() == "search-perplexity" {
 					auth_specs.insert(0, (auth_id.clone(), runtime));
 				} else {
@@ -434,7 +442,7 @@ impl RouteComposer for ProductionRouteComposer {
 			route: route.clone(),
 			auth_schemes: auth_specs
 				.iter()
-				.map(|(_, auth)| crate::auth::AuthScheme::for_spec(auth))
+				.map(|(_, auth)| AuthScheme::for_spec(auth))
 				.collect(),
 			headers: catalog
 				.header_profile(&route.headers)
@@ -442,7 +450,7 @@ impl RouteComposer for ProductionRouteComposer {
 					profile
 						.headers
 						.iter()
-						.map(|header| crate::codec::RequestHeader {
+						.map(|header| RequestHeader {
 							name:  header.name.clone(),
 							value: header.value.clone(),
 						})
@@ -477,7 +485,7 @@ impl RouteComposer for ProductionRouteComposer {
 			retry: TransportRetryLayer::new(retry.max_attempts().saturating_sub(1))
 				.with_backoff(retry.backoff()),
 			rate: RateLayer::new(PoolRateLimiter { pool: self.dependencies.accounts.clone() }),
-			encode: crate::layer::encode::EncodeLayer::new(encoder, false),
+			encode: EncodeLayer::new(encoder, false),
 			credential_apply: CredentialApplyLayer::new(RouteCredentialApplier {
 				auth: auth_specs.into_iter().map(|(_, auth)| auth).collect(),
 			}),
@@ -824,7 +832,7 @@ impl RouteCodecSet {
 		discovery: Option<Arc<dyn Codec>>,
 	) -> Result<Self, RouteUnavailable> {
 		let embedding: Arc<dyn Codec> = Arc::new(OpenAiEmbeddingCodec::for_openai_protocol());
-		let mut operations: [Option<Arc<dyn Codec>>; OPERATION_COUNT] = std::array::from_fn(|_| None);
+		let mut operations: [Option<Arc<dyn Codec>>; OPERATION_COUNT] = array::from_fn(|_| None);
 		for operation in OPERATIONS {
 			if !advertised.contains_kind(operation) {
 				continue;
@@ -903,7 +911,7 @@ impl Codec for RouteCodecSet {
 	fn realtime(
 		&self,
 		context: &DecodeContext<'_>,
-	) -> Result<Option<crate::codec::RealtimeWireCodecState>, Error> {
+	) -> Result<Option<RealtimeWireCodecState>, Error> {
 		self.codec(context.operation)?.realtime(context)
 	}
 }
@@ -911,8 +919,8 @@ impl Codec for RouteCodecSet {
 #[derive(Clone)]
 struct RouteEncoder {
 	route:             RouteDef,
-	auth_schemes:      Box<[crate::auth::AuthScheme]>,
-	headers:           Box<[crate::codec::RequestHeader]>,
+	auth_schemes:      Box<[AuthScheme]>,
+	headers:           Box<[RequestHeader]>,
 	codec:             Arc<dyn Codec>,
 	transport_timeout: Duration,
 }
@@ -945,10 +953,7 @@ fn encode_wire_request(
 	}
 }
 
-fn scheme_for_credential(
-	schemes: &[crate::auth::AuthScheme],
-	kind: crate::auth::CredentialKind,
-) -> Option<crate::auth::AuthScheme> {
+fn scheme_for_credential(schemes: &[AuthScheme], kind: CredentialKind) -> Option<AuthScheme> {
 	schemes.iter().copied().find(|scheme| {
 		matches!(
 			(kind, scheme),
@@ -963,11 +968,11 @@ fn scheme_for_credential(
 	})
 }
 
-impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder {
+impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 	fn encode(
 		&self,
 		call: &Call,
-		lease: &Option<crate::auth::CredentialLease>,
+		lease: &Option<CredentialLease>,
 		execution: &ExecutionContext,
 		attempt: u32,
 		provisional: bool,
@@ -982,13 +987,11 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 		}
 		let account = execution.account_routing();
 		let server_state = execution.session_state();
-		let endpoint_override = lease
-			.as_ref()
-			.and_then(crate::auth::CredentialLease::endpoint_override);
+		let endpoint_override = lease.as_ref().and_then(CredentialLease::endpoint_override);
 		let (effective_route, effective_target) = if let Some(endpoint_override) = endpoint_override {
 			let mut route = self.route.clone();
 			route.endpoint.base_url = endpoint_override.clone();
-			route.trust_domain.origin = url::Url::parse(endpoint_override).map_or_else(
+			route.trust_domain.origin = Url::parse(endpoint_override).map_or_else(
 				|_| endpoint_override.clone(),
 				|url| Str::new(url.origin().ascii_serialization()),
 			);
@@ -1031,9 +1034,7 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 				.with_provisional(provisional)
 				.with_template_effort_rejected(
 					attempt > 0
-						&& execution.provider_error_code_seen(
-							crate::codec::openai_chat::TEMPLATE_EFFORT_REJECTED_CODE,
-						),
+						&& execution.provider_error_code_seen(openai_chat::TEMPLATE_EFFORT_REJECTED_CODE),
 				),
 		};
 		let mut encoded =
@@ -1049,7 +1050,7 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 			"{:?} {:?} {} headers=[{}] request_body_limit={}",
 			encoded.operation, encoded.method, encoded.uri, header_names, encoded.bounds.request_body,
 		);
-		crate::transport::global_provider_capture().capture(
+		global_provider_capture().capture(
 			call
 				.session
 				.as_ref()
@@ -1120,8 +1121,8 @@ impl AttemptEncoder<Call, Option<crate::auth::CredentialLease>> for RouteEncoder
 }
 
 fn merge_static_headers(
-	destination: &mut Box<[crate::codec::RequestHeader]>,
-	configured: &[crate::codec::RequestHeader],
+	destination: &mut Box<[RequestHeader]>,
+	configured: &[RequestHeader],
 	execution: &ExecutionContext,
 ) -> Result<(), Error> {
 	let mut values = BTreeMap::new();
@@ -1160,20 +1161,20 @@ enum RouteAccount {
 }
 #[derive(Clone, Debug)]
 struct AnonymousAccount {
-	_provider: crate::catalog::ProviderId,
-	_route:    crate::catalog::RouteId,
+	_provider: ProviderId,
+	_route:    RouteId,
 }
 #[derive(Clone, Debug)]
 struct BrokeredAccount {
-	_provider: crate::catalog::ProviderId,
-	_route:    crate::catalog::RouteId,
+	_provider: ProviderId,
+	_route:    RouteId,
 }
 
 #[derive(Clone)]
 struct RouteAccountSelector {
 	pool:          AccountPool,
-	provider:      crate::catalog::ProviderId,
-	route:         crate::catalog::RouteId,
+	provider:      ProviderId,
+	route:         RouteId,
 	authenticated: bool,
 }
 
@@ -1223,7 +1224,7 @@ impl AccountSelector<Call> for RouteAccountSelector {
 		}
 	}
 
-	fn routing(&self, account: &Self::Account) -> Option<crate::call::AccountRoutingContext> {
+	fn routing(&self, account: &Self::Account) -> Option<AccountRoutingContext> {
 		match account {
 			RouteAccount::Anonymous { .. } | RouteAccount::Brokered { .. } => None,
 			RouteAccount::Authenticated(selection) => Some(selection.routing.clone()),
@@ -1237,12 +1238,12 @@ struct RouteLeaseProvider {
 	shapers:        Arc<CredentialShaperRegistry>,
 	provider:       omp_catalog::ProviderId,
 	route_base_url: Str,
-	specs:          Box<[crate::catalog::AuthSpecId]>,
+	specs:          Box<[AuthSpecId]>,
 	authenticated:  bool,
 }
 
 impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
-	type Lease = Option<crate::auth::CredentialLease>;
+	type Lease = Option<CredentialLease>;
 
 	type Future<'a> = impl Future<Output = Result<Self::Lease, Error>> + Send + 'a;
 
@@ -1283,10 +1284,7 @@ impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
 						resolved = Some(lease);
 						break;
 					},
-					Err(
-						crate::auth::CredentialError::Unavailable
-						| crate::auth::CredentialError::InvalidSource,
-					) => {},
+					Err(CredentialError::Unavailable | CredentialError::InvalidSource) => {},
 					Err(_) => {
 						return Err(Error::new(
 							ErrorKind::Authentication,
@@ -1320,11 +1318,11 @@ impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
 }
 
 async fn shape_scalar_lease(
-	shaper: &crate::auth::ProviderShaper,
-	lease: crate::auth::CredentialLease,
+	shaper: &ProviderShaper,
+	lease: CredentialLease,
 	route_base_url: &str,
 	deadline: Option<Instant>,
-) -> crate::auth::CredentialLease {
+) -> CredentialLease {
 	let Some(raw) = lease.scalar_secret() else {
 		return lease;
 	};
@@ -1348,22 +1346,20 @@ fn shaper_deadline(call: &Call, context: &ExecutionContext) -> Option<Instant> {
 
 #[derive(Clone)]
 struct RouteCredentialApplier {
-	auth: Box<[crate::auth::AuthSpec]>,
+	auth: Box<[AuthSpec]>,
 }
 
-impl CredentialApplier<RouteAccount, Option<crate::auth::CredentialLease>>
-	for RouteCredentialApplier
-{
+impl CredentialApplier<RouteAccount, Option<CredentialLease>> for RouteCredentialApplier {
 	fn apply(
 		&self,
 		_: &RouteAccount,
-		lease: Option<crate::auth::CredentialLease>,
+		lease: Option<CredentialLease>,
 		request: &mut TransportRequest,
 		context: &ExecutionContext,
 	) -> Result<(), Error> {
 		match (self.auth.first(), lease) {
-			(Some(crate::auth::AuthSpec::None), None) => Ok(()),
-			(Some(crate::auth::AuthSpec::None), Some(_)) => {
+			(Some(AuthSpec::None), None) => Ok(()),
+			(Some(AuthSpec::None), Some(_)) => {
 				Err(authentication_error(context, "credential-on-anonymous-route"))
 			},
 			(None, _) => Err(authentication_error(context, "credential-auth-spec-missing")),
@@ -1375,7 +1371,7 @@ impl CredentialApplier<RouteAccount, Option<crate::auth::CredentialLease>>
 							request.credentials = Some(credentials);
 							return Ok(());
 						},
-						Err(crate::auth::CredentialApplyError::WrongKind { .. }) => {},
+						Err(CredentialApplyError::WrongKind { .. }) => {},
 						Err(_) => {
 							return Err(authentication_error(context, "credential-application-failed"));
 						},
@@ -1434,7 +1430,7 @@ impl<R> RateLimiter<R> for PoolRateLimiter {
 
 #[derive(Clone)]
 struct PlannedIntent {
-	route: crate::catalog::RouteId,
+	route: RouteId,
 }
 impl IntentPlanner for PlannedIntent {
 	fn negotiate(&self, call: &mut Call, _: &mut ExecutionReceipt) -> Result<(), Error> {
@@ -1526,8 +1522,12 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		auth::{CredentialLease, CredentialShaperRegistry, LeaseMeta, ShapedCredential},
-		call::{DiscoveryRequest, NegotiationPolicy, RealtimeRequest, Target},
+		auth::{
+			AuthScheme, AuthSpec, CredentialLease, CredentialShaperRegistry, LeaseMeta,
+			ShapedCredential,
+		},
+		call::{DiscoveryRequest, InferenceAttribution, NegotiationPolicy, RealtimeRequest, Target},
+		codec::google_cca::AntigravityFingerprint,
 		id::{AccountId, ConversationId, PrincipalId, RequestId, Revision},
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
@@ -1549,8 +1549,7 @@ mod tests {
 		)
 	}
 
-	fn discovery_fixture()
-	-> (RouteEncoder, Call, RouteAccount, crate::auth::AuthSpec, ProviderId, Str) {
+	fn discovery_fixture() -> (RouteEncoder, Call, RouteAccount, AuthSpec, ProviderId, Str) {
 		let catalog = Catalog::try_embedded().expect("embedded catalog");
 		let route = catalog
 			.routes()
@@ -1563,7 +1562,7 @@ mod tests {
 			gemini_cli_platform: sf!("test"),
 			gemini_cli_arch:     sf!("test"),
 			antigravity_headers: CcaHeaders::antigravity(
-				&crate::codec::google_cca::AntigravityFingerprint::default(),
+				&AntigravityFingerprint::default(),
 				false,
 				None,
 			),
@@ -1576,8 +1575,7 @@ mod tests {
 		let auth = catalog.auth_spec(&route.auth).expect("catalog auth");
 		let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
 		let runtime_auth =
-			crate::auth::AuthSpec::from_catalog(auth, oauth, route.endpoint.region.clone())
-				.expect("runtime auth");
+			AuthSpec::from_catalog(auth, oauth, route.endpoint.region.clone()).expect("runtime auth");
 		let budget = ExecutionBudget::default();
 		let operation = OperationCall::DiscoverModels(Arc::new(DiscoveryRequest {
 			provider:  Some(route.provider.clone()),
@@ -1628,7 +1626,7 @@ mod tests {
 			deadline: None,
 			budget,
 			session: None,
-			attribution: crate::call::InferenceAttribution::core(),
+			attribution: InferenceAttribution::core(),
 			execution: Some(Arc::new(plan)),
 			operation,
 		};
@@ -1642,7 +1640,7 @@ mod tests {
 		(
 			RouteEncoder {
 				route,
-				auth_schemes: Box::new([crate::auth::AuthScheme::for_spec(&runtime_auth)]),
+				auth_schemes: Box::new([AuthScheme::for_spec(&runtime_auth)]),
 				headers: Box::new([]),
 				codec,
 				transport_timeout: Duration::from_secs(30),
@@ -1658,7 +1656,7 @@ mod tests {
 	fn assert_applied_bearer(
 		mut transport: TransportRequest,
 		account: &RouteAccount,
-		auth: crate::auth::AuthSpec,
+		auth: AuthSpec,
 		lease: CredentialLease,
 		context: &ExecutionContext,
 		expected: &str,
@@ -1795,7 +1793,7 @@ mod tests {
 			gemini_cli_platform: sf!("test"),
 			gemini_cli_arch:     sf!("test"),
 			antigravity_headers: CcaHeaders::antigravity(
-				&crate::codec::google_cca::AntigravityFingerprint::default(),
+				&AntigravityFingerprint::default(),
 				false,
 				None,
 			),

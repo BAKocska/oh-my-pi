@@ -1039,6 +1039,8 @@ pub(crate) fn cut_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod integration_tests {
+	use std::fs;
+
 	use super::Cut;
 	use crate::host::run_util;
 
@@ -1053,7 +1055,7 @@ mod integration_tests {
 	#[test]
 	fn resolves_file_operands_against_shell_cwd() {
 		let dir = tempfile::tempdir().unwrap();
-		std::fs::write(dir.path().join("input"), b"abcdef\n").unwrap();
+		fs::write(dir.path().join("input"), b"abcdef\n").unwrap();
 		let (code, capture) = run_util::<Cut>(&["-b", "2-4", "input"], "", dir.path());
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "bcd\n");

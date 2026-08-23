@@ -1,6 +1,10 @@
 //! Native `models.toml` decoding for configured catalog overlays.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+	collections::BTreeMap,
+	fs, io,
+	path::{Path, PathBuf},
+};
 
 use omp_catalog::{
 	Availability, CatalogOverlay, CatalogOverlayBuilder, EvidenceConfidence, ModalityBits, ModelKey,
@@ -9,6 +13,7 @@ use omp_catalog::{
 };
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
+use toml::{de, ser};
 /// Native model configuration. The field names deliberately mirror the pi
 /// `models.yml` contract while TOML is OMP's native serialization.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -124,11 +129,11 @@ pub fn load_models_config(path: &Path) -> Result<ModelsConfig, ModelsConfigError
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelsConfigSource {
 	/// Canonical native TOML.
-	NativeToml(std::path::PathBuf),
+	NativeToml(PathBuf),
 	/// Imported legacy JSON.
-	LegacyJson(std::path::PathBuf),
+	LegacyJson(PathBuf),
 	/// Imported legacy YAML.
-	LegacyYaml(std::path::PathBuf),
+	LegacyYaml(PathBuf),
 }
 
 /// Typed model config paired with its explicit provenance label.
@@ -475,10 +480,10 @@ pub enum ModelsConfigError {
 	},
 	/// Reading the configured source failed.
 	#[error(transparent)]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// The TOML source was malformed.
 	#[error(transparent)]
-	Toml(#[from] toml::de::Error),
+	Toml(#[from] de::Error),
 	/// A legacy YAML source was malformed.
 	#[error(transparent)]
 	Yaml(#[from] serde_yaml::Error),
@@ -487,7 +492,7 @@ pub enum ModelsConfigError {
 	Json(#[from] omp_slopjson::ParseError),
 	/// Native TOML encoding failed.
 	#[error(transparent)]
-	Encode(#[from] toml::ser::Error),
+	Encode(#[from] ser::Error),
 	/// Atomic persistence failed.
 	#[error(transparent)]
 	Persist(#[from] omp_settings::io::SettingsIoError),
@@ -495,12 +500,12 @@ pub enum ModelsConfigError {
 	#[error("failed to back up model config {path} to {backup}")]
 	Backup {
 		/// Legacy source path.
-		path:   std::path::PathBuf,
+		path:   PathBuf,
 		/// Backup path.
-		backup: std::path::PathBuf,
+		backup: PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 }
 

@@ -1,11 +1,13 @@
 use std::{
-	collections::HashMap,
-	io,
+	collections::{HashMap, hash_map::Entry},
+	fmt::{self, Display},
+	fs, io,
 	path::Path,
 	sync::{
 		Arc, LazyLock, Weak,
 		atomic::{AtomicU64, Ordering},
 	},
+	thread,
 };
 
 use bytes::Bytes;
@@ -26,25 +28,31 @@ use omp_proto::{
 		TransactionCommitted, TransactionPartiallyCommitted, TransactionRejected,
 		commit_transaction_response, document_target, read_document_response,
 	},
-	env::v1::{
-		self as env_wire, Admission, AdmitInvocation, ArgText, ArgsCommitted, AttachOutput,
-		BlobGetComplete, CancelRequest, ClientFrame, ClientHello, CloseSessionRequest,
-		CloseSessionResponse, CommitBlobPut, CreateWorktree, CurrentWorktree, CurrentWorktreeResult,
-		DataEvent, DataRequest, DataResponse, DestroyWorktree, DetachExec, EventStreamError,
-		EventStreamKind, ExecRequest, ExecStarted, ExitEvent, GetProcess, HttpRequest, HttpResponse,
-		Interrupt, InvocationScope, InvokeAccepted, InvokeTool, ListProcesses, MaterializeSite,
-		MergeWorktree, OpenSessionRequest, OpenSessionResponse, OutputAttached, OutputFrame,
-		PresenceRegistered, PresenceReleased, ProcessCommandAccepted, ProcessInfo, ProcessList,
-		ProcessOutput, ProcessStarted, ProcessStateEvent, ProtocolError, ProtocolErrorCode,
-		RegisterPresence, ReleasePresence, RestartProcess, Retire, SearchComplete, SearchMatchMsg,
-		SearchRequest, SendInput, ServerFrame, ServerHello, SignalProcess, SignalRequest,
-		SiteMaterialized, StartProcess, StdinFrame, StopProcess, Update, Verdict, WalkComplete,
-		WalkEntry, WalkRequest, WorktreeResult, cancel_request, client_frame, data_event,
-		data_request, data_response, document_op, document_result, server_frame, worktree_op,
+	env::{
+		v1,
+		v1::{
+			self as env_wire, Admission, AdmitInvocation, ArgText, ArgsCommitted, AttachOutput,
+			BlobGetComplete, CancelRequest, ClientFrame, ClientHello, CloseSessionRequest,
+			CloseSessionResponse, CommitBlobPut, CreateWorktree, CurrentWorktree,
+			CurrentWorktreeResult, DataEvent, DataRequest, DataResponse, DestroyWorktree, DetachExec,
+			EventStreamError, EventStreamKind, ExecRequest, ExecStarted, ExitEvent, GetProcess,
+			HttpRequest, HttpResponse, Interrupt, InvocationScope, InvokeAccepted, InvokeTool,
+			ListProcesses, MaterializeSite, MergeWorktree, OpenSessionRequest, OpenSessionResponse,
+			OutputAttached, OutputFrame, PresenceRegistered, PresenceReleased, ProcessCommandAccepted,
+			ProcessInfo, ProcessList, ProcessOutput, ProcessStarted, ProcessStateEvent, ProtocolError,
+			ProtocolErrorCode, RegisterPresence, ReleasePresence, ResourceCompletion, RestartProcess,
+			Retire, SearchComplete, SearchMatchMsg, SearchRequest, SendInput, ServerFrame,
+			ServerHello, SignalProcess, SignalRequest, SiteMaterialized, StartProcess, StdinFrame,
+			StopProcess, Update, Verdict, WalkComplete, WalkEntry, WalkRequest, WorktreeResult,
+			cancel_request, client_frame, data_event, data_request, data_response, document_op,
+			document_result, exec_session_op, exec_session_result, mcp_op, mcp_result, resource_op,
+			server_frame, stdin_frame, workspace_op, workspace_result, worktree_op,
+		},
 	},
 };
 use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::runtime;
 #[cfg(unix)]
 use tokio::{
 	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
@@ -103,8 +111,8 @@ pub struct StreamLost {
 	pub reopen_guidance: &'static str,
 }
 
-impl std::fmt::Display for StreamLost {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for StreamLost {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(
 			formatter,
 			"environment {:?} stream lost continuity after {} skipped events: {}; {}",
@@ -230,7 +238,7 @@ pub fn client_for_project(
 	token: &[u8],
 	create: impl FnOnce() -> EnvClient,
 ) -> Result<EnvClient, ClientLeaseError> {
-	let canonical = std::fs::canonicalize(project_root)?;
+	let canonical = fs::canonicalize(project_root)?;
 	let key = sf!("project:{}", canonical.to_string_lossy());
 	lease_shared_client(key, token, create)
 }
@@ -275,11 +283,11 @@ fn lease_shared_client(
 	let client = create();
 	let mut clients = SHARED_CLIENTS.lock();
 	match clients.entry(key) {
-		std::collections::hash_map::Entry::Vacant(entry) => {
+		Entry::Vacant(entry) => {
 			entry.insert(SharedClientEntry { client: client.clone(), token_digest: candidate });
 			Ok(client)
 		},
-		std::collections::hash_map::Entry::Occupied(entry) => {
+		Entry::Occupied(entry) => {
 			if constant_time_digest_eq(&entry.get().token_digest, &candidate) {
 				Ok(entry.get().client.clone())
 			} else {
@@ -311,7 +319,7 @@ pub fn close_shared_clients() {
 pub enum ClientLeaseError {
 	/// Canonical project-root resolution failed.
 	#[error(transparent)]
-	Canonicalize(#[from] std::io::Error),
+	Canonicalize(#[from] io::Error),
 	/// Broker tokens carry at least 256 bits of entropy.
 	#[error("environment client token must contain at least 32 bytes")]
 	TokenTooShort,
@@ -345,9 +353,9 @@ impl ActiveExecControl {
 	pub async fn stdin(&self, data: Bytes) -> Result<bool, ClientError> {
 		self
 			.client
-			.exec_live_control(env_wire::exec_session_op::Op::Stdin(StdinFrame {
+			.exec_live_control(exec_session_op::Op::Stdin(StdinFrame {
 				exec:  self.exec.clone(),
-				input: Some(env_wire::stdin_frame::Input::Data(data)),
+				input: Some(stdin_frame::Input::Data(data)),
 				props: None,
 			}))
 			.await
@@ -357,9 +365,9 @@ impl ActiveExecControl {
 	pub async fn eof(&self) -> Result<bool, ClientError> {
 		self
 			.client
-			.exec_live_control(env_wire::exec_session_op::Op::Stdin(StdinFrame {
+			.exec_live_control(exec_session_op::Op::Stdin(StdinFrame {
 				exec:  self.exec.clone(),
-				input: Some(env_wire::stdin_frame::Input::Eof(true)),
+				input: Some(stdin_frame::Input::Eof(true)),
 				props: None,
 			}))
 			.await
@@ -369,7 +377,7 @@ impl ActiveExecControl {
 	pub async fn resize(&self, rows: u32, columns: u32) -> Result<bool, ClientError> {
 		self
 			.client
-			.exec_live_control(env_wire::exec_session_op::Op::Resize(env_wire::ResizeRequest {
+			.exec_live_control(exec_session_op::Op::Resize(env_wire::ResizeRequest {
 				exec: self.exec.clone(),
 				rows,
 				columns,
@@ -382,7 +390,7 @@ impl ActiveExecControl {
 	pub async fn signal(&self, signal: impl Into<String>) -> Result<bool, ClientError> {
 		self
 			.client
-			.exec_live_control(env_wire::exec_session_op::Op::Signal(SignalRequest {
+			.exec_live_control(exec_session_op::Op::Signal(SignalRequest {
 				exec:   self.exec.clone(),
 				signal: signal.into(),
 				props:  None,
@@ -427,7 +435,7 @@ trait AdmissionDispatcher: Send + Sync {
 
 struct AdmitterDispatcher<A> {
 	admitter: Arc<A>,
-	runtime:  tokio::runtime::Handle,
+	runtime:  runtime::Handle,
 }
 impl<A: Admitter> AdmissionDispatcher for AdmitterDispatcher<A> {
 	fn dispatch(&self, client: Arc<ClientInner>, request_id: u64, query: AdmitInvocation) {
@@ -449,8 +457,8 @@ impl<A: Admitter> AdmissionDispatcher for AdmitterDispatcher<A> {
 	}
 }
 
-impl std::fmt::Debug for ClientInner {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ClientInner {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("ClientInner")
 			.field("next_id", &self.next_id.load(Ordering::Relaxed))
@@ -733,7 +741,7 @@ pub struct DapStream {
 #[derive(Debug)]
 pub enum ResourceCompletionEvent {
 	/// One scored completion.
-	Completion(env_wire::ResourceCompletion),
+	Completion(ResourceCompletion),
 	/// Terminal completion accounting.
 	Complete(env_wire::ResourceCompletionComplete),
 }
@@ -781,11 +789,11 @@ impl EnvClient {
 			admitter: Mutex::new(None),
 		});
 		let router = Arc::downgrade(&inner);
-		let _ = std::thread::spawn(move || route_responses(router, incoming, events_tx));
+		let _ = thread::spawn(move || route_responses(router, incoming, events_tx));
 		let canceller = Arc::downgrade(&inner);
-		let _ = std::thread::spawn(move || route_cancellations(canceller, cancellations));
+		let _ = thread::spawn(move || route_cancellations(canceller, cancellations));
 		let closer = Arc::downgrade(&inner);
-		let _ = std::thread::spawn(move || route_lease_closes(closer, lease_closes));
+		let _ = thread::spawn(move || route_lease_closes(closer, lease_closes));
 		Self { inner, grant: InvocationGrant::unrestricted() }
 	}
 
@@ -861,7 +869,7 @@ impl EnvClient {
 	pub fn set_admitter<A: Admitter>(&self, admitter: A) {
 		*self.inner.admitter.lock() = Some(Arc::new(AdmitterDispatcher {
 			admitter: Arc::new(admitter),
-			runtime:  tokio::runtime::Handle::current(),
+			runtime:  runtime::Handle::current(),
 		}));
 	}
 
@@ -1002,10 +1010,10 @@ impl EnvClient {
 		request: env_wire::SnapshotWorkspace,
 	) -> Result<env_wire::WorkspaceSnapshot, ClientError> {
 		let result = self
-			.workspace_request(env_wire::workspace_op::Op::Snapshot(request))
+			.workspace_request(workspace_op::Op::Snapshot(request))
 			.await?;
 		match result.result {
-			Some(env_wire::workspace_result::Result::Snapshot(snapshot)) => Ok(snapshot),
+			Some(workspace_result::Result::Snapshot(snapshot)) => Ok(snapshot),
 			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceSnapshot" }),
 		}
 	}
@@ -1016,10 +1024,10 @@ impl EnvClient {
 		request: env_wire::ListWorkspaceSnapshots,
 	) -> Result<env_wire::WorkspaceSnapshotList, ClientError> {
 		let result = self
-			.workspace_request(env_wire::workspace_op::Op::List(request))
+			.workspace_request(workspace_op::Op::List(request))
 			.await?;
 		match result.result {
-			Some(env_wire::workspace_result::Result::List(list)) => Ok(list),
+			Some(workspace_result::Result::List(list)) => Ok(list),
 			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceSnapshotList" }),
 		}
 	}
@@ -1030,10 +1038,10 @@ impl EnvClient {
 		request: env_wire::RestoreWorkspace,
 	) -> Result<env_wire::WorkspaceRestored, ClientError> {
 		let result = self
-			.workspace_request(env_wire::workspace_op::Op::Restore(request))
+			.workspace_request(workspace_op::Op::Restore(request))
 			.await?;
 		match result.result {
-			Some(env_wire::workspace_result::Result::Restored(restored)) => Ok(restored),
+			Some(workspace_result::Result::Restored(restored)) => Ok(restored),
 			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceRestored" }),
 		}
 	}
@@ -1043,11 +1051,9 @@ impl EnvClient {
 		&self,
 		request: env_wire::McpStatusRequest,
 	) -> Result<env_wire::McpStatusResult, ClientError> {
-		let result = self
-			.mcp_request(env_wire::mcp_op::Op::Status(request))
-			.await?;
+		let result = self.mcp_request(mcp_op::Op::Status(request)).await?;
 		match result.result {
-			Some(env_wire::mcp_result::Result::Status(status)) => Ok(status),
+			Some(mcp_result::Result::Status(status)) => Ok(status),
 			_ => Err(ClientError::UnexpectedResponse { expected: "McpStatusResult" }),
 		}
 	}
@@ -1057,11 +1063,9 @@ impl EnvClient {
 		&self,
 		request: env_wire::McpConfigRequest,
 	) -> Result<env_wire::McpConfigResult, ClientError> {
-		let result = self
-			.mcp_request(env_wire::mcp_op::Op::Config(request))
-			.await?;
+		let result = self.mcp_request(mcp_op::Op::Config(request)).await?;
 		match result.result {
-			Some(env_wire::mcp_result::Result::Config(config)) => Ok(config),
+			Some(mcp_result::Result::Config(config)) => Ok(config),
 			_ => Err(ClientError::UnexpectedResponse { expected: "McpConfigResult" }),
 		}
 	}
@@ -1071,11 +1075,9 @@ impl EnvClient {
 		&self,
 		request: env_wire::McpResetRequest,
 	) -> Result<env_wire::McpResetResult, ClientError> {
-		let result = self
-			.mcp_request(env_wire::mcp_op::Op::Reset(request))
-			.await?;
+		let result = self.mcp_request(mcp_op::Op::Reset(request)).await?;
 		match result.result {
-			Some(env_wire::mcp_result::Result::Reset(reset)) => Ok(reset),
+			Some(mcp_result::Result::Reset(reset)) => Ok(reset),
 			_ => Err(ClientError::UnexpectedResponse { expected: "McpResetResult" }),
 		}
 	}
@@ -1085,11 +1087,9 @@ impl EnvClient {
 		&self,
 		request: env_wire::McpLiveHeaderRequest,
 	) -> Result<env_wire::McpLiveHeader, ClientError> {
-		let result = self
-			.mcp_request(env_wire::mcp_op::Op::LiveHeader(request))
-			.await?;
+		let result = self.mcp_request(mcp_op::Op::LiveHeader(request)).await?;
 		match result.result {
-			Some(env_wire::mcp_result::Result::LiveHeader(header)) => Ok(header),
+			Some(mcp_result::Result::LiveHeader(header)) => Ok(header),
 			_ => Err(ClientError::UnexpectedResponse { expected: "McpLiveHeader" }),
 		}
 	}
@@ -1099,11 +1099,9 @@ impl EnvClient {
 		&self,
 		request: env_wire::McpResourceRequest,
 	) -> Result<env_wire::McpResourceResult, ClientError> {
-		let result = self
-			.mcp_request(env_wire::mcp_op::Op::Resource(request))
-			.await?;
+		let result = self.mcp_request(mcp_op::Op::Resource(request)).await?;
 		match result.result {
-			Some(env_wire::mcp_result::Result::Resource(resource)) => Ok(resource),
+			Some(mcp_result::Result::Resource(resource)) => Ok(resource),
 			_ => Err(ClientError::UnexpectedResponse { expected: "McpResourceResult" }),
 		}
 	}
@@ -1113,11 +1111,9 @@ impl EnvClient {
 		&self,
 		request: env_wire::McpPromptRequest,
 	) -> Result<env_wire::McpPromptResult, ClientError> {
-		let result = self
-			.mcp_request(env_wire::mcp_op::Op::Prompt(request))
-			.await?;
+		let result = self.mcp_request(mcp_op::Op::Prompt(request)).await?;
 		match result.result {
-			Some(env_wire::mcp_result::Result::Prompt(prompt)) => Ok(prompt),
+			Some(mcp_result::Result::Prompt(prompt)) => Ok(prompt),
 			_ => Err(ClientError::UnexpectedResponse { expected: "McpPromptResult" }),
 		}
 	}
@@ -1127,11 +1123,9 @@ impl EnvClient {
 		&self,
 		request: env_wire::McpInvokeRequest,
 	) -> Result<env_wire::McpInvokeResult, ClientError> {
-		let result = self
-			.mcp_request(env_wire::mcp_op::Op::Invoke(request))
-			.await?;
+		let result = self.mcp_request(mcp_op::Op::Invoke(request)).await?;
 		match result.result {
-			Some(env_wire::mcp_result::Result::Invoke(invoke)) => Ok(invoke),
+			Some(mcp_result::Result::Invoke(invoke)) => Ok(invoke),
 			_ => Err(ClientError::UnexpectedResponse { expected: "McpInvokeResult" }),
 		}
 	}
@@ -1145,7 +1139,7 @@ impl EnvClient {
 			.open(
 				client_frame::Body::Data(DataRequest {
 					body: Some(data_request::Body::Mcp(env_wire::McpOp {
-						op: Some(env_wire::mcp_op::Op::Subscribe(request)),
+						op: Some(mcp_op::Op::Subscribe(request)),
 					})),
 					..DataRequest::default()
 				}),
@@ -1204,30 +1198,25 @@ impl EnvClient {
 		request: env_wire::ExecControlRequest,
 	) -> Result<env_wire::ExecControlResult, ClientError> {
 		let result = self
-			.exec_session_request(env_wire::exec_session_op::Op::Control(request))
+			.exec_session_request(exec_session_op::Op::Control(request))
 			.await?;
 		match result.result {
-			Some(env_wire::exec_session_result::Result::Controlled(controlled)) => Ok(controlled),
+			Some(exec_session_result::Result::Controlled(controlled)) => Ok(controlled),
 			_ => Err(ClientError::UnexpectedResponse { expected: "ExecControlResult" }),
 		}
 	}
 
-	async fn exec_live_control(
-		&self,
-		op: env_wire::exec_session_op::Op,
-	) -> Result<bool, ClientError> {
+	async fn exec_live_control(&self, op: exec_session_op::Op) -> Result<bool, ClientError> {
 		let result = self.exec_session_request(op).await?;
 		match result.result {
-			Some(env_wire::exec_session_result::Result::Controlled(controlled)) => {
-				Ok(controlled.accepted)
-			},
+			Some(exec_session_result::Result::Controlled(controlled)) => Ok(controlled.accepted),
 			_ => Err(ClientError::UnexpectedResponse { expected: "ExecControlResult" }),
 		}
 	}
 
 	async fn exec_session_request(
 		&self,
-		op: env_wire::exec_session_op::Op,
+		op: exec_session_op::Op,
 	) -> Result<env_wire::ExecSessionResult, ClientError> {
 		let response = self
 			.data_request_owned(DataRequest {
@@ -1241,10 +1230,7 @@ impl EnvClient {
 		}
 	}
 
-	async fn mcp_request(
-		&self,
-		op: env_wire::mcp_op::Op,
-	) -> Result<env_wire::McpResult, ClientError> {
+	async fn mcp_request(&self, op: mcp_op::Op) -> Result<env_wire::McpResult, ClientError> {
 		let response = self
 			.data_request_owned(DataRequest {
 				body: Some(data_request::Body::Mcp(env_wire::McpOp { op: Some(op) })),
@@ -1259,7 +1245,7 @@ impl EnvClient {
 
 	async fn workspace_request(
 		&self,
-		op: env_wire::workspace_op::Op,
+		op: workspace_op::Op,
 	) -> Result<env_wire::WorkspaceResult, ClientError> {
 		let response = self
 			.data_request_owned(DataRequest {
@@ -1281,7 +1267,7 @@ impl EnvClient {
 		operation: worktree_op::Op,
 	) -> Result<WorktreeResult, ClientError> {
 		let request = DataRequest {
-			body: Some(data_request::Body::Worktree(omp_proto::env::v1::WorktreeOp {
+			body: Some(data_request::Body::Worktree(v1::WorktreeOp {
 				op: Some(operation),
 				..Default::default()
 			})),
@@ -1788,10 +1774,10 @@ impl ExtensionEnvClient {
 		request: env_wire::SnapshotWorkspace,
 	) -> Result<env_wire::WorkspaceSnapshot, ClientError> {
 		let result = self
-			.extension_workspace_request(env_wire::workspace_op::Op::Snapshot(request))
+			.extension_workspace_request(workspace_op::Op::Snapshot(request))
 			.await?;
 		match result.result {
-			Some(env_wire::workspace_result::Result::Snapshot(snapshot)) => Ok(snapshot),
+			Some(workspace_result::Result::Snapshot(snapshot)) => Ok(snapshot),
 			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceSnapshot" }),
 		}
 	}
@@ -1802,10 +1788,10 @@ impl ExtensionEnvClient {
 		request: env_wire::ListWorkspaceSnapshots,
 	) -> Result<env_wire::WorkspaceSnapshotList, ClientError> {
 		let result = self
-			.extension_workspace_request(env_wire::workspace_op::Op::List(request))
+			.extension_workspace_request(workspace_op::Op::List(request))
 			.await?;
 		match result.result {
-			Some(env_wire::workspace_result::Result::List(list)) => Ok(list),
+			Some(workspace_result::Result::List(list)) => Ok(list),
 			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceSnapshotList" }),
 		}
 	}
@@ -1816,10 +1802,10 @@ impl ExtensionEnvClient {
 		request: env_wire::RestoreWorkspace,
 	) -> Result<env_wire::WorkspaceRestored, ClientError> {
 		let result = self
-			.extension_workspace_request(env_wire::workspace_op::Op::Restore(request))
+			.extension_workspace_request(workspace_op::Op::Restore(request))
 			.await?;
 		match result.result {
-			Some(env_wire::workspace_result::Result::Restored(restored)) => Ok(restored),
+			Some(workspace_result::Result::Restored(restored)) => Ok(restored),
 			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceRestored" }),
 		}
 	}
@@ -2036,7 +2022,7 @@ impl ExtensionEnvClient {
 
 	async fn extension_workspace_request(
 		&self,
-		op: env_wire::workspace_op::Op,
+		op: workspace_op::Op,
 	) -> Result<env_wire::WorkspaceResult, ClientError> {
 		let response = self
 			.request(DataRequest {
@@ -2095,12 +2081,12 @@ impl WorkerEnvClient {
 		language_id: Option<&str>,
 	) -> Result<DocumentLease, ClientError> {
 		let request = DataRequest {
-			body: Some(data_request::Body::Document(omp_proto::env::v1::DocumentOp {
+			body: Some(data_request::Body::Document(v1::DocumentOp {
 				op: Some(document_op::Op::Open(OpenDocumentRequest {
 					uri:         self.client.path_uri(path)?,
 					language_id: language_id.unwrap_or_default().to_owned(),
 				})),
-				..omp_proto::env::v1::DocumentOp::default()
+				..v1::DocumentOp::default()
 			})),
 			..DataRequest::default()
 		};
@@ -2271,10 +2257,10 @@ impl WorkerEnvClient {
 		request: env_wire::MaterializeRequest,
 	) -> Result<env_wire::MaterializationLease, ClientError> {
 		let result = self
-			.exec_session_request(env_wire::exec_session_op::Op::Materialize(request))
+			.exec_session_request(exec_session_op::Op::Materialize(request))
 			.await?;
 		match result.result {
-			Some(env_wire::exec_session_result::Result::Materialized(lease)) => Ok(lease),
+			Some(exec_session_result::Result::Materialized(lease)) => Ok(lease),
 			_ => Err(ClientError::UnexpectedResponse { expected: "MaterializationLease" }),
 		}
 	}
@@ -2285,12 +2271,10 @@ impl WorkerEnvClient {
 		request: env_wire::ReleaseMaterialization,
 	) -> Result<env_wire::MaterializationReleased, ClientError> {
 		let result = self
-			.exec_session_request(env_wire::exec_session_op::Op::ReleaseMaterialization(request))
+			.exec_session_request(exec_session_op::Op::ReleaseMaterialization(request))
 			.await?;
 		match result.result {
-			Some(env_wire::exec_session_result::Result::MaterializationReleased(released)) => {
-				Ok(released)
-			},
+			Some(exec_session_result::Result::MaterializationReleased(released)) => Ok(released),
 			_ => Err(ClientError::UnexpectedResponse { expected: "MaterializationReleased" }),
 		}
 	}
@@ -2301,10 +2285,10 @@ impl WorkerEnvClient {
 		request: env_wire::ExecControlRequest,
 	) -> Result<env_wire::ExecControlResult, ClientError> {
 		let result = self
-			.exec_session_request(env_wire::exec_session_op::Op::Control(request))
+			.exec_session_request(exec_session_op::Op::Control(request))
 			.await?;
 		match result.result {
-			Some(env_wire::exec_session_result::Result::Controlled(controlled)) => Ok(controlled),
+			Some(exec_session_result::Result::Controlled(controlled)) => Ok(controlled),
 			_ => Err(ClientError::UnexpectedResponse { expected: "ExecControlResult" }),
 		}
 	}
@@ -2315,12 +2299,10 @@ impl WorkerEnvClient {
 		request: env_wire::ExecCapabilitiesRequest,
 	) -> Result<env_wire::ExecBackendCapabilities, ClientError> {
 		let result = self
-			.exec_session_request(env_wire::exec_session_op::Op::Capabilities(request))
+			.exec_session_request(exec_session_op::Op::Capabilities(request))
 			.await?;
 		match result.result {
-			Some(env_wire::exec_session_result::Result::Capabilities(capabilities)) => {
-				Ok(capabilities)
-			},
+			Some(exec_session_result::Result::Capabilities(capabilities)) => Ok(capabilities),
 			_ => Err(ClientError::UnexpectedResponse { expected: "ExecBackendCapabilities" }),
 		}
 	}
@@ -2331,10 +2313,10 @@ impl WorkerEnvClient {
 		request: env_wire::ExecFinalCwdRequest,
 	) -> Result<env_wire::ExecFinalCwd, ClientError> {
 		let result = self
-			.exec_session_request(env_wire::exec_session_op::Op::FinalCwd(request))
+			.exec_session_request(exec_session_op::Op::FinalCwd(request))
 			.await?;
 		match result.result {
-			Some(env_wire::exec_session_result::Result::FinalCwd(final_cwd)) => Ok(final_cwd),
+			Some(exec_session_result::Result::FinalCwd(final_cwd)) => Ok(final_cwd),
 			_ => Err(ClientError::UnexpectedResponse { expected: "ExecFinalCwd" }),
 		}
 	}
@@ -2374,9 +2356,7 @@ impl WorkerEnvClient {
 		&self,
 		request: env_wire::ResourceReadRequest,
 	) -> Result<env_wire::ResourceResult, ClientError> {
-		self
-			.resource_request(env_wire::resource_op::Op::Read(request))
-			.await
+		self.resource_request(resource_op::Op::Read(request)).await
 	}
 
 	/// Lists one bounded internal resource.
@@ -2384,9 +2364,7 @@ impl WorkerEnvClient {
 		&self,
 		request: env_wire::ResourceListRequest,
 	) -> Result<env_wire::ResourceResult, ClientError> {
-		self
-			.resource_request(env_wire::resource_op::Op::List(request))
-			.await
+		self.resource_request(resource_op::Op::List(request)).await
 	}
 
 	/// Resolves one internal resource to canonical path metadata without bytes.
@@ -2394,9 +2372,7 @@ impl WorkerEnvClient {
 		&self,
 		request: env_wire::ResourcePathRequest,
 	) -> Result<env_wire::ResourceResult, ClientError> {
-		self
-			.resource_request(env_wire::resource_op::Op::Path(request))
-			.await
+		self.resource_request(resource_op::Op::Path(request)).await
 	}
 
 	/// Opens a cancellable, bounded internal-resource completion stream.
@@ -2409,7 +2385,7 @@ impl WorkerEnvClient {
 			.open(
 				client_frame::Body::Data(DataRequest {
 					body: Some(data_request::Body::Resource(env_wire::ResourceOp {
-						op: Some(env_wire::resource_op::Op::Complete(request)),
+						op: Some(resource_op::Op::Complete(request)),
 					})),
 					..DataRequest::default()
 				}),
@@ -2421,7 +2397,7 @@ impl WorkerEnvClient {
 
 	async fn exec_session_request(
 		&self,
-		op: env_wire::exec_session_op::Op,
+		op: exec_session_op::Op,
 	) -> Result<env_wire::ExecSessionResult, ClientError> {
 		let response = self
 			.request(DataRequest {
@@ -2437,7 +2413,7 @@ impl WorkerEnvClient {
 
 	async fn resource_request(
 		&self,
-		op: env_wire::resource_op::Op,
+		op: resource_op::Op,
 	) -> Result<env_wire::ResourceResult, ClientError> {
 		let response = self
 			.request(DataRequest {
@@ -2731,6 +2707,43 @@ impl Drop for RequestStream {
 	}
 }
 
+mod policy_effects {
+	use bytes::Bytes;
+	use omp_proto::policy::v1;
+
+	use super::{ArgsCommitted, ClientError, Invocation, client_frame};
+
+	impl Invocation {
+		/// Sends the exact committed argument bytes, authorizing effects
+		/// env-side.
+		pub async fn commit_args(
+			&self,
+			raw: Bytes,
+			effect_token: Bytes,
+			authorized_at_ms: u64,
+			effects: Option<v1::EffectEnvelope>,
+		) -> Result<(), ClientError> {
+			let mut scope = self.grant.wire(self.id.as_str());
+			scope.effect_token = effect_token.clone();
+			self
+				.client
+				.send_wire(
+					self.stream.request_id,
+					client_frame::Body::ArgsCommitted(ArgsCommitted {
+						invocation_id: self.id.to_string(),
+						raw,
+						effect_token,
+						authorized_at_ms,
+						effects,
+						..ArgsCommitted::default()
+					}),
+					Some(scope),
+				)
+				.await
+		}
+	}
+}
+
 impl Invocation {
 	/// Returns the invocation's logical identifier.
 	pub fn invocation_id(&self) -> &str {
@@ -2757,33 +2770,6 @@ impl Invocation {
 					..ArgText::default()
 				}),
 				None,
-			)
-			.await
-	}
-
-	/// Sends the exact committed argument bytes, authorizing effects env-side.
-	pub async fn commit_args(
-		&self,
-		raw: Bytes,
-		effect_token: Bytes,
-		authorized_at_ms: u64,
-		effects: Option<omp_proto::policy::v1::EffectEnvelope>,
-	) -> Result<(), ClientError> {
-		let mut scope = self.grant.wire(self.id.as_str());
-		scope.effect_token = effect_token.clone();
-		self
-			.client
-			.send_wire(
-				self.stream.request_id,
-				client_frame::Body::ArgsCommitted(ArgsCommitted {
-					invocation_id: self.id.to_string(),
-					raw,
-					effect_token,
-					authorized_at_ms,
-					effects,
-					..ArgsCommitted::default()
-				}),
-				Some(scope),
 			)
 			.await
 	}
@@ -2892,10 +2878,7 @@ impl ExecRun {
 	}
 
 	/// Resizes this command's PTY.
-	pub async fn resize(
-		&self,
-		request: omp_proto::env::v1::ResizeRequest,
-	) -> Result<(), ClientError> {
+	pub async fn resize(&self, request: v1::ResizeRequest) -> Result<(), ClientError> {
 		self
 			.client
 			.send(self.stream.request_id, client_frame::Body::Resize(request), self.scope.as_ref())
@@ -3394,9 +3377,9 @@ fn response_data_body(body: server_frame::Body) -> Result<DataResponse, ClientEr
 
 fn document_request(operation: document_op::Op) -> DataRequest {
 	DataRequest {
-		body: Some(data_request::Body::Document(omp_proto::env::v1::DocumentOp {
+		body: Some(data_request::Body::Document(v1::DocumentOp {
 			op: Some(operation),
-			..omp_proto::env::v1::DocumentOp::default()
+			..v1::DocumentOp::default()
 		})),
 		..DataRequest::default()
 	}
@@ -3498,7 +3481,10 @@ fn route_responses(
 		if frame.request_id == 0 {
 			let is_hello_response = matches!(
 				frame.body.as_ref(),
-				Some(server_frame::Body::Hello(_) | server_frame::Body::Error(_))
+				Some(
+					omp_proto::env::v1::server_frame::Body::Hello(_)
+						| omp_proto::env::v1::server_frame::Body::Error(_)
+				)
 			);
 			if is_hello_response && let Some(waiter) = client.hello_waiter.lock().take() {
 				let _ = waiter.send(frame);
@@ -3545,7 +3531,7 @@ fn route_cancellations(client: Weak<ClientInner>, cancellations: Receiver<u64>) 
 }
 fn scoped_cancel_sender(client: Weak<ClientInner>, scope: InvocationScope) -> Sender<u64> {
 	let (sender, cancellations) = flume::unbounded();
-	let _ = std::thread::spawn(move || {
+	let _ = thread::spawn(move || {
 		while let Ok(request_id) = cancellations.recv() {
 			let Some(client) = client.upgrade() else {
 				break;
@@ -3607,7 +3593,10 @@ async fn bridge_extension_frames<S>(
 where
 	S: AsyncRead + AsyncWrite + Unpin,
 {
-	let (mut reader, mut writer) = tokio::io::split(stream);
+	let (mut reader, mut writer) = {
+		use tokio::io;
+		io::split(stream)
+	};
 	let write = async {
 		let mut encoded = BytesMut::new();
 		while let Ok(frame) = requests.recv_async().await {

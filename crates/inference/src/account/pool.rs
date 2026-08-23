@@ -2,7 +2,8 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	fmt,
+	error, fmt,
+	fmt::Display,
 	sync::Arc,
 	time::SystemTime,
 };
@@ -75,6 +76,8 @@ mod cooldown_reason {
 		ModelPolicy,
 	}
 }
+
+use std::cmp;
 
 #[doc(inline)]
 pub use cooldown_reason::CooldownReason;
@@ -249,13 +252,13 @@ pub struct AccountPoolError {
 	pub reserve_policy: Option<QuotaReservePolicy>,
 }
 
-impl fmt::Display for AccountPoolError {
+impl Display for AccountPoolError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("no eligible account")
 	}
 }
 
-impl std::error::Error for AccountPoolError {}
+impl error::Error for AccountPoolError {}
 
 /// Failure registering metadata that would violate stable account routing
 /// identity.
@@ -300,7 +303,7 @@ pub enum AccountRegistrationError {
 	},
 }
 
-impl fmt::Display for AccountRegistrationError {
+impl Display for AccountRegistrationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::StateStore { summary } => formatter.write_str(summary.as_str()),
@@ -309,7 +312,7 @@ impl fmt::Display for AccountRegistrationError {
 	}
 }
 
-impl std::error::Error for AccountRegistrationError {}
+impl error::Error for AccountRegistrationError {}
 
 #[derive(Clone, Debug)]
 struct Cooldown {
@@ -769,7 +772,7 @@ impl AccountPool {
 					2
 				};
 				let quota_known_rank = u8::from(quota_remaining.is_none());
-				let quota_rank = std::cmp::Reverse(quota_remaining.unwrap_or(0));
+				let quota_rank = cmp::Reverse(quota_remaining.unwrap_or(0));
 				ranked.push((
 					affinity_rank,
 					quota_known_rank,

@@ -1,26 +1,31 @@
 use std::{
 	collections::VecDeque,
+	fs,
 	future::Future,
+	io,
 	io::Write,
+	iter,
 	path::{Path, PathBuf},
 	pin::Pin,
 	sync::Arc,
+	thread,
 };
 
 use itertools::Itertools;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	ShellFd,
+	ShellFd, SourceInfo,
 	arithmetic::{self, ExpandAndEvaluate},
 	commands::{self, CommandArg},
-	env::{EnvironmentLookup, EnvironmentScope, valid_variable_name},
+	env::{EnvironmentLookup, EnvironmentScope, ScopeGuard, valid_variable_name},
 	error, expansion, extendedtests, extensions, ioutils, jobs, openfiles,
-	openfiles::{OpenFile, OpenFiles},
+	openfiles::{OpenFile, OpenFileEntry, OpenFiles},
 	parser::ast::{self, CommandPrefixOrSuffixItem},
 	results::{ExecutionExitCode, ExecutionResult, ExecutionSpawnResult, ExecutionWaitResult},
 	shell::Shell,
 	sys, timing,
+	traps::TrapSignal,
 	variables::{ArrayLiteral, ShellValue, ShellValueLiteral, ShellValueUnsetType, ShellVariable},
 };
 
@@ -87,7 +92,7 @@ pub trait SpawnObserver: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ExecutionParameters {
 	/// The open files tracked by the current context.
-	open_files:               openfiles::OpenFiles,
+	open_files:               OpenFiles,
 	/// Policy for how to manage spawned external processes.
 	pub process_group_policy: ProcessGroupPolicy,
 	/// Whether external commands spawned in this context should reparent out of
@@ -162,10 +167,7 @@ impl ExecutionParameters {
 	/// # Arguments
 	///
 	/// * `shell` - The shell context.
-	pub fn stdin(
-		&self,
-		shell: &Shell<impl extensions::ShellExtensions>,
-	) -> impl std::io::Read + 'static {
+	pub fn stdin(&self, shell: &Shell<impl extensions::ShellExtensions>) -> impl io::Read + 'static {
 		self.try_stdin(shell).unwrap_or_else(|| {
 			ioutils::FailingReaderWriter::new("standard input not available").into()
 		})
@@ -177,7 +179,7 @@ impl ExecutionParameters {
 	///
 	/// * `shell` - The shell context.
 	pub fn try_stdin(&self, shell: &Shell<impl extensions::ShellExtensions>) -> Option<OpenFile> {
-		self.try_fd(shell, openfiles::OpenFiles::STDIN_FD)
+		self.try_fd(shell, OpenFiles::STDIN_FD)
 	}
 
 	/// Returns the standard output file; usable with `write!` et al. In the
@@ -191,7 +193,7 @@ impl ExecutionParameters {
 	pub fn stdout(
 		&self,
 		shell: &Shell<impl extensions::ShellExtensions>,
-	) -> impl std::io::Write + 'static {
+	) -> impl io::Write + 'static {
 		self.try_stdout(shell).unwrap_or_else(|| {
 			ioutils::FailingReaderWriter::new("standard output not available").into()
 		})
@@ -203,7 +205,7 @@ impl ExecutionParameters {
 	///
 	/// * `shell` - The shell context.
 	pub fn try_stdout(&self, shell: &Shell<impl extensions::ShellExtensions>) -> Option<OpenFile> {
-		self.try_fd(shell, openfiles::OpenFiles::STDOUT_FD)
+		self.try_fd(shell, OpenFiles::STDOUT_FD)
 	}
 
 	/// Returns the standard error file; usable with `write!` et al. In the event
@@ -216,7 +218,7 @@ impl ExecutionParameters {
 	pub fn stderr(
 		&self,
 		shell: &Shell<impl extensions::ShellExtensions>,
-	) -> impl std::io::Write + 'static {
+	) -> impl io::Write + 'static {
 		self.try_stderr(shell).unwrap_or_else(|| {
 			ioutils::FailingReaderWriter::new("standard error not available").into()
 		})
@@ -228,7 +230,7 @@ impl ExecutionParameters {
 	///
 	/// * `shell` - The shell context.
 	pub fn try_stderr(&self, shell: &Shell<impl extensions::ShellExtensions>) -> Option<OpenFile> {
-		self.try_fd(shell, openfiles::OpenFiles::STDERR_FD)
+		self.try_fd(shell, OpenFiles::STDERR_FD)
 	}
 
 	/// Returns the file descriptor with the given number. Returns `None`
@@ -242,11 +244,11 @@ impl ExecutionParameters {
 		&self,
 		shell: &Shell<impl extensions::ShellExtensions>,
 		fd: ShellFd,
-	) -> Option<openfiles::OpenFile> {
+	) -> Option<OpenFile> {
 		match self.open_files.fd_entry(fd) {
-			openfiles::OpenFileEntry::Open(f) => Some(f.clone()),
-			openfiles::OpenFileEntry::NotPresent => None,
-			openfiles::OpenFileEntry::NotSpecified => {
+			OpenFileEntry::Open(f) => Some(f.clone()),
+			OpenFileEntry::NotPresent => None,
+			OpenFileEntry::NotSpecified => {
 				// We didn't have this fd specified one way or the other; we fallback
 				// to what's represented in the shell's open files.
 				shell.persistent_open_files().try_fd(fd).cloned()
@@ -260,7 +262,7 @@ impl ExecutionParameters {
 	///
 	/// * `fd` - The file descriptor number to set.
 	/// * `file` - The open file to set.
-	pub fn set_fd(&mut self, fd: ShellFd, file: openfiles::OpenFile) {
+	pub fn set_fd(&mut self, fd: ShellFd, file: OpenFile) {
 		self.open_files.set_fd(fd, file);
 	}
 
@@ -272,10 +274,10 @@ impl ExecutionParameters {
 	pub fn iter_fds(
 		&self,
 		shell: &Shell<impl extensions::ShellExtensions>,
-	) -> impl DoubleEndedIterator<Item = (ShellFd, openfiles::OpenFile)>
+	) -> impl DoubleEndedIterator<Item = (ShellFd, OpenFile)>
 	+ ExactSizeIterator
 	+ Clone
-	+ std::iter::FusedIterator {
+	+ iter::FusedIterator {
 		let our_fds = self.open_files.iter_fds();
 		let shell_fds = shell
 			.persistent_open_files()
@@ -431,7 +433,7 @@ async fn spawn_async_ao_list_as_job<'a, SE: extensions::ShellExtensions>(
 
 	// Redirect stdin to null, per spec.
 	if let Ok(null) = openfiles::null() {
-		async_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
+		async_params.set_fd(OpenFiles::STDIN_FD, null);
 	}
 
 	let direct_pipeline =
@@ -705,10 +707,8 @@ impl Execute for ast::Pipeline {
 		// exactly the same contexts it suppresses errexit (conditionals, `!`-prefixed
 		// pipelines, etc.).
 		if !result.is_success() && !params.suppress_errexit && !self.bang {
-			if shell.traps().handles(crate::traps::TrapSignal::Err) {
-				shell
-					.invoke_trap_handler(crate::traps::TrapSignal::Err, &params)
-					.await?;
+			if shell.traps().handles(TrapSignal::Err) {
+				shell.invoke_trap_handler(TrapSignal::Err, &params).await?;
 			}
 		}
 
@@ -719,7 +719,7 @@ impl Execute for ast::Pipeline {
 
 		// If requested, report timing.
 		if let (Some(timed), Some(stopwatch)) = (&self.timed, &stopwatch)
-			&& let Some(mut stderr) = params.try_fd(shell, openfiles::OpenFiles::STDERR_FD)
+			&& let Some(mut stderr) = params.try_fd(shell, OpenFiles::STDERR_FD)
 		{
 			let timing = stopwatch.stop()?;
 			if timed.is_posix_output() {
@@ -761,7 +761,7 @@ async fn spawn_pipeline_processes(
 	// more than one command.
 	if pipeline_len > 1 {
 		for _ in 0..(pipeline_len - 1) {
-			let (reader, writer) = std::io::pipe()?;
+			let (reader, writer) = io::pipe()?;
 			pipe_readers.push(Some(reader.into()));
 			pipe_writers.push(Some(writer.into()));
 		}
@@ -1090,8 +1090,8 @@ fn execute_coprocess<'a, SE: extensions::ShellExtensions>(
 		}
 
 		// Set up the pipes that we'll use to communicate with the coprocess.
-		let (stdin_reader, stdin_writer) = std::io::pipe()?;
-		let (stdout_reader, stdout_writer) = std::io::pipe()?;
+		let (stdin_reader, stdin_writer) = io::pipe()?;
+		let (stdout_reader, stdout_writer) = io::pipe()?;
 
 		// Allocate new fds in the (parent) shell for the read end of the coprocess's
 		// stdout and the write end of the coprocess's stdin.
@@ -1495,7 +1495,7 @@ impl Execute for ast::FunctionDefinition {
 		let source_info = shell
 			.call_stack()
 			.current_frame()
-			.map_or_else(crate::SourceInfo::default, |frame| frame.adjusted_source_info());
+			.map_or_else(SourceInfo::default, |frame| frame.adjusted_source_info());
 		shell.define_func(func_name, self.clone(), &source_info);
 
 		let result = ExecutionResult::success();
@@ -1697,7 +1697,7 @@ async fn execute_command(
 	// Push a new ephemeral environment scope for the duration of the command. We'll
 	// set command-scoped variable assignments after doing so, and revert them
 	// before returning.
-	let mut guard = crate::env::ScopeGuard::new(&mut context.shell, EnvironmentScope::Command);
+	let mut guard = ScopeGuard::new(&mut context.shell, EnvironmentScope::Command);
 
 	for assignment in &assignments {
 		// Ensure it's tagged as exported and created in the command scope.
@@ -1987,7 +1987,7 @@ pub(crate) async fn setup_redirect(
 		ast::IoRedirect::File(specified_fd_num, kind, target) => {
 			match target {
 				ast::IoFileRedirectTarget::Filename(f) => {
-					let mut options = std::fs::File::options();
+					let mut options = fs::File::options();
 
 					let mut expanded_fields =
 						expansion::full_expand_and_split_word(shell, params, f).await?;
@@ -2228,7 +2228,7 @@ fn setup_redirect_output_and_error_to(
 ) -> Result<(), error::Error> {
 	let abs_file_path: PathBuf = shell.absolute_path(Path::new(file_path));
 
-	let mut file_options = std::fs::File::options();
+	let mut file_options = fs::File::options();
 	file_options
 		.create(true)
 		.write(true)
@@ -2289,7 +2289,7 @@ fn setup_process_substitution(
 	}
 
 	// Set up pipe so we can connect to the command.
-	let (reader, writer) = std::io::pipe()?;
+	let (reader, writer) = io::pipe()?;
 	let (reader, writer) = (reader.into(), writer.into());
 
 	let target_file = match kind {
@@ -2338,7 +2338,7 @@ fn setup_process_substitution(
 // Targets without OS thread support keep upstream's synchronous write path
 // so heredocs continue to work there instead of failing at thread spawn.
 fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Error> {
-	let (reader, mut writer) = std::io::pipe()?;
+	let (reader, mut writer) = io::pipe()?;
 	let bytes = contents.as_bytes();
 
 	// Linux fast path: grow the pipe so the entire body fits inline.
@@ -2349,8 +2349,10 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
 	{
 		use std::os::fd::AsFd as _;
 
+		use nix::fcntl::{self, FcntlArg};
+
 		if let Ok(len) = i32::try_from(bytes.len())
-			&& nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(len)).is_ok()
+			&& fcntl::fcntl(reader.as_fd(), FcntlArg::F_SETPIPE_SZ(len)).is_ok()
 		{
 			writer.write_all(bytes)?;
 			drop(writer);
@@ -2363,7 +2365,7 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
 		// macOS 16-64 KiB), neither of which has a `F_SETPIPE_SZ`
 		// equivalent.
 		let payload = bytes.to_vec();
-		std::thread::Builder::new()
+		thread::Builder::new()
 			.name("brush-heredoc-writer".into())
 			.spawn(move || {
 				// `BrokenPipe` is expected when the consumer drops the

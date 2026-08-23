@@ -26,7 +26,10 @@ impl builtins::Command for PgrepCommand {
 
 #[cfg(test)]
 mod tests {
-	use std::io::Read as _;
+	use std::{
+		io::{self, Read as _},
+		process,
+	};
 
 	use omp_shell_engine::{
 		ExecutionContext, Shell,
@@ -35,8 +38,8 @@ mod tests {
 	};
 
 	#[cfg(unix)]
-	fn matching_process() -> std::process::Child {
-		std::process::Command::new("/bin/sleep")
+	fn matching_process() -> process::Child {
+		process::Command::new("/bin/sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn matching process")
@@ -47,7 +50,7 @@ mod tests {
 	async fn execute(argv: Vec<String>) -> (omp_shell_engine::ExecutionResult, String) {
 		let mut shell = Shell::builder().build().await.expect("build test shell");
 		let mut params = shell.default_exec_params();
-		let (mut output, writer) = std::io::pipe().expect("create output pipe");
+		let (mut output, writer) = io::pipe().expect("create output pipe");
 		params.set_fd(OpenFiles::STDIN_FD, openfiles::null().expect("open null stdin"));
 		params.set_fd(OpenFiles::STDOUT_FD, writer.into());
 		params.set_fd(OpenFiles::STDERR_FD, openfiles::null().expect("open null stderr"));

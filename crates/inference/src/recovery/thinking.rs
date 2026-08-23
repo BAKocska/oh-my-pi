@@ -1,5 +1,7 @@
 //! Incremental synthesis of leaked in-band reasoning blocks.
 
+use std::mem;
+
 use bytes::{Buf, Bytes, BytesMut};
 use omp_catalog::{
 	id::{ThinkingPolicyId, WirePolicyId},
@@ -566,7 +568,7 @@ impl ThinkingFenceStripper {
 	/// Drains any held partial line at block end.
 	pub fn flush(&mut self) -> String {
 		self.passthrough = false;
-		let carry = std::mem::take(&mut self.carry);
+		let carry = mem::take(&mut self.carry);
 		if is_fence_opener_line(&carry) {
 			String::new()
 		} else {

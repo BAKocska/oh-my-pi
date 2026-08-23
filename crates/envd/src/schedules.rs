@@ -9,6 +9,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	fs,
 	path::Path,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
@@ -165,10 +166,20 @@ pub enum DurableScheduleError {
 	NotOwned,
 	/// A replaced durable scheduler owner received a command.
 	#[error("stale scheduler generation (expected {expected}, active {active})")]
-	StaleGeneration { expected: u64, active: u64 },
+	StaleGeneration {
+		/// Scheduler generation captured by the command-producing handle.
+		expected: u64,
+		/// Generation currently owned by the durable scheduler task.
+		active:   u64,
+	},
 	/// A declaration or operation field is invalid.
 	#[error("invalid schedule field `{field}`: {reason}")]
-	Invalid { field: &'static str, reason: Str },
+	Invalid {
+		/// Static wire-field name rejected by schedule validation.
+		field:  &'static str,
+		/// Human-readable validation failure produced by the scheduler.
+		reason: Str,
+	},
 	/// The host delivery owner is absent or refused routing.
 	#[error("schedule delivery owner is unavailable: {0}")]
 	Delivery(Str),
@@ -1255,7 +1266,7 @@ struct ScheduleJournal {
 impl ScheduleJournal {
 	fn open(path: &Path) -> Result<Self, DurableScheduleError> {
 		if let Some(parent) = path.parent() {
-			std::fs::create_dir_all(parent)
+			fs::create_dir_all(parent)
 				.map_err(|error| DurableScheduleError::Storage(Str::from(error.to_string())))?;
 		}
 		let connection = Connection::open(path)?;

@@ -18,7 +18,7 @@
 //! jump, the mouse wheel scrolls, and `q`, Escape, or Ctrl-C quits.
 
 use std::{
-	io,
+	io, slice,
 	time::{Duration, Instant},
 };
 
@@ -273,7 +273,7 @@ fn study_band_title(frame: &mut Frame, y: u16, scene: &Scene) {
 	let right_width = band_width(scene, &right);
 	let brand_seg = brand(scene);
 	let (_, separator, _) = band_chrome(scene.charset);
-	let fixed = band_width(scene, std::slice::from_ref(&brand_seg))
+	let fixed = band_width(scene, slice::from_ref(&brand_seg))
 		.saturating_add(width_of(separator).saturating_add(2));
 	let budget = scene
 		.width

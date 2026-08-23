@@ -1,6 +1,6 @@
 //! Rebuildable SQLite cache for direct GitHub issue and pull-request reads.
 
-use std::{path::Path, time::Duration};
+use std::{fmt, path::Path, time::Duration};
 
 use bytes::Bytes;
 use omp_core::Str;
@@ -218,8 +218,8 @@ impl GithubCache {
 	}
 }
 
-impl std::fmt::Debug for GithubCache {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for GithubCache {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("GithubCache")
 			.field("freshness", &self.freshness)

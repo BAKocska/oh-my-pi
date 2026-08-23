@@ -7,6 +7,7 @@
 
 use std::{
 	collections::HashSet,
+	env, fs,
 	path::{Path, PathBuf},
 };
 
@@ -335,7 +336,7 @@ const BROWSERS: &[BrowserDescriptor] = &[
 #[cfg(target_os = "macos")]
 fn candidate_paths(candidate: &BrowserDescriptor) -> Vec<PathBuf> {
 	let mut paths = Vec::new();
-	let home = std::env::var_os("HOME").map(PathBuf::from);
+	let home = env::var_os("HOME").map(PathBuf::from);
 
 	for &(app, exe) in candidate.mac_bundles {
 		let bundle_rel = format!("{app}.app/Contents/MacOS/{exe}");
@@ -351,12 +352,12 @@ fn candidate_paths(candidate: &BrowserDescriptor) -> Vec<PathBuf> {
 #[cfg(target_os = "linux")]
 fn candidate_paths(candidate: &BrowserDescriptor) -> Vec<PathBuf> {
 	let mut paths = Vec::new();
-	let path_var = std::env::var_os("PATH");
+	let path_var = env::var_os("PATH");
 	let path_dirs: Vec<PathBuf> = path_var
 		.as_ref()
-		.map(|p| std::env::split_paths(p).collect())
+		.map(|p| env::split_paths(p).collect())
 		.unwrap_or_default();
-	let home = std::env::var_os("HOME").map(PathBuf::from);
+	let home = env::var_os("HOME").map(PathBuf::from);
 
 	for &bin in candidate.linux_bins {
 		for dir in &path_dirs {
@@ -378,16 +379,16 @@ fn candidate_paths(candidate: &BrowserDescriptor) -> Vec<PathBuf> {
 #[cfg(target_os = "windows")]
 fn candidate_paths(candidate: &BrowserDescriptor) -> Vec<PathBuf> {
 	let mut roots = Vec::new();
-	if let Some(val) = std::env::var_os("LOCALAPPDATA") {
+	if let Some(val) = env::var_os("LOCALAPPDATA") {
 		roots.push(PathBuf::from(val));
 	}
-	if let Some(val) = std::env::var_os("PROGRAMFILES") {
+	if let Some(val) = env::var_os("PROGRAMFILES") {
 		roots.push(PathBuf::from(val));
 	}
-	if let Some(val) = std::env::var_os("PROGRAMFILES(X86)") {
+	if let Some(val) = env::var_os("PROGRAMFILES(X86)") {
 		roots.push(PathBuf::from(val));
 	}
-	if let Some(val) = std::env::var_os("PROGRAMW6432") {
+	if let Some(val) = env::var_os("PROGRAMW6432") {
 		roots.push(PathBuf::from(val));
 	}
 
@@ -418,7 +419,7 @@ pub fn discover() -> Vec<InstalledBrowser> {
 	for candidate in BROWSERS {
 		for path in candidate_paths(candidate) {
 			if path.is_file() {
-				let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+				let resolved = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
 				if seen.insert(resolved) {
 					results.push(InstalledBrowser {
 						kind: candidate.kind,

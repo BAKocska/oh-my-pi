@@ -1,6 +1,6 @@
 //! Compiles checked-in vendor protobuf schemas into `OUT_DIR`.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, env, fs, path::Path};
 
 use prost::Message as _;
 use serde::Deserialize;
@@ -26,7 +26,7 @@ fn main() {
 			.expect("protox failed to compile the verified Cursor schema");
 	let descriptor_bytes = descriptors.encode_to_vec();
 	fs::write(
-		Path::new(&std::env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"))
+		Path::new(&env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"))
 			.join("cursor-agent-descriptor.bin"),
 		descriptor_bytes,
 	)
@@ -155,7 +155,7 @@ fn compile_devin(manifest_dir: &Path) {
 	let descriptors = protox::compile(&roots, [&include])
 		.expect("protox failed to compile the verified Devin schema closure");
 	fs::write(
-		Path::new(&std::env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"))
+		Path::new(&env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"))
 			.join("devin-descriptor.bin"),
 		descriptors.encode_to_vec(),
 	)

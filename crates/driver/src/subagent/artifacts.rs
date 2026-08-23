@@ -1,16 +1,16 @@
 //! Historical artifact-name reservation for durable subagent aliases.
 
-use std::path::Path;
+use std::{ffi, fs, io, path::Path};
 
 use omp_agent::AgentTree;
 use omp_core::Str;
 
 /// Scans journal and output stems before the first new display-name allocation.
-pub fn reserve_historical_stems(tree: &AgentTree, directory: &Path) -> std::io::Result<usize> {
+pub fn reserve_historical_stems(tree: &AgentTree, directory: &Path) -> io::Result<usize> {
 	let mut stems = Vec::new();
-	let entries = match std::fs::read_dir(directory) {
+	let entries = match fs::read_dir(directory) {
 		Ok(entries) => entries,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
 		Err(error) => return Err(error),
 	};
 	for entry in entries {
@@ -22,7 +22,7 @@ pub fn reserve_historical_stems(tree: &AgentTree, directory: &Path) -> std::io::
 		if !matches!(path.extension().and_then(std::ffi::OsStr::to_str), Some("md" | "jsonl")) {
 			continue;
 		}
-		if let Some(stem) = path.file_stem().and_then(std::ffi::OsStr::to_str)
+		if let Some(stem) = path.file_stem().and_then(ffi::OsStr::to_str)
 			&& !stem.starts_with('.')
 		{
 			stems.push(Str::new(stem));

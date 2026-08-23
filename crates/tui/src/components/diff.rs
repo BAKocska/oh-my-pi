@@ -2,6 +2,7 @@ use omp_core::{IntoStr, Str};
 
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
+	components::text::paint_rich,
 	context::UiContext,
 	frame::{Color, Rect, Style},
 	props::{Prop, PropValue, Props},
@@ -359,7 +360,7 @@ impl Component for DiffView {
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		self.render(pc.ctx, rect.width);
-		crate::components::text::paint_rich(pc, rect, &self.rich, self.props.align());
+		paint_rich(pc, rect, &self.rich, self.props.align());
 	}
 }
 

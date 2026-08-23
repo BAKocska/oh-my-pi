@@ -1,3 +1,5 @@
+//! Proves UI, telemetry, and verdict control owners enforce identity fences and
+//! preserve results.
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;

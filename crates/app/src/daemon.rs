@@ -1,61 +1,27 @@
 //! Production typed inference registry construction and daemon lifecycle.
 
 use std::{
-	collections::BTreeMap,
-	io::{BufRead as _, IsTerminal as _},
+	env, fs, io,
+	io::BufRead as _,
+	net::SocketAddr,
 	path::{Path, PathBuf},
+	slice, str,
 	sync::Arc,
 	time::Duration,
 };
 
-use omp_core::{ExposeSecret as _, Hash32, SecretString, Str, sf};
-use omp_envd::browser_fetch::BrowserFetchAdapter;
-#[cfg(target_os = "macos")]
-use omp_inference::auth::FallbackKeySource;
+use omp_core::{ExposeSecret as _, Hash32, SecretString, sf};
 use omp_inference::{
 	Client, ProviderService, Registry,
-	account::{
-		AccountPool, AccountStateStore, AccountStateStoreError, RefreshCoordinator, RefreshPolicy,
-	},
+	account::AccountStateStoreError,
 	auth::{
-		AlibabaTokenPlanLoginEngine, AlibabaTokenPlanShaper, AuthLoginEngine, AuthManager,
-		AuthManagerBuildError, CredentialAcquisitionLoginEngine,
-		CredentialAcquisitionLoginEngineError, CredentialAffinityResolver, CredentialBroker,
-		CredentialBrokerEngines, CredentialShaperRegistry, CredentialStore, FileCredentialKeySource,
-		FileKeyError, GithubCopilotShaper, KeyError, KeySource, OAuthCustomDispatcher,
-		OAuthLoginEngine, OAuthLoginEngineError, OsCredentialKeySource, ProviderShaper,
-		SecretLoginEngine, SecretLoginEngineError, StoreError, StoredOAuthRefreshEngine,
-		SystemOAuthClock, SystemOAuthHttpClient, UnavailableKeySource,
+		AuthManagerBuildError, CredentialAcquisitionLoginEngineError, FileKeyError, KeyError,
+		OAuthLoginEngineError, SecretLoginEngineError, StoreError, oauth::OAuthCustomDispatchError,
 	},
-	call::AuthMethod,
-	codec::google_cca::{
-		AntigravityFingerprint, AntigravityPolicy, CcaHeaders, DEFAULT_ANTIGRAVITY_ARCH,
-		DEFAULT_ANTIGRAVITY_CL, DEFAULT_ANTIGRAVITY_OS, DEFAULT_ANTIGRAVITY_VERSION,
-	},
-	layer::{
-		admission::AdmissionController,
-		observe::{ExecutionFinished, ExecutionStarted, Observer},
-		stack::BuiltinConfig,
-	},
-	operation::usage::{
-		ConsoleUsageFetcher, ConsoleUsageManager, UsageFetcherRegistry,
-		alibaba_token_plan::AlibabaTokenPlanUsageFetcher, claude::ClaudeUsageFetcher,
-		cursor::CursorUsageFetcher, gemini::GeminiUsageFetcher,
-		github_copilot::GithubCopilotUsageFetcher, google_antigravity::GoogleAntigravityUsageFetcher,
-		kimi::KimiUsageFetcher, minimax_code::MiniMaxCodeUsageFetcher, ollama::OllamaUsageFetcher,
-		openai_codex::OpenAiCodexUsageFetcher, opencode_go::OpenCodeGoUsageFetcher,
-		synthetic::SyntheticUsageFetcher, umans::UmansUsageFetcher, xai_oauth::XaiOauthUsageFetcher,
-		zai::ZaiUsageFetcher,
-	},
-	provider::builtin::{
-		AuthApplicationConfig, GoogleCcaConfig, ProductionDependencies, discover_antigravity_version,
-	},
+	layer::observe::{ExecutionFinished, ExecutionStarted, Observer},
 	router::Router,
 	session::{ConversationError, ConversationSessionPlanner},
-	transport::{http::HttpTransport, websocket_transport::WebSocketTransport},
 };
-#[cfg(feature = "local-applefm")]
-use omp_inference::{ReasonId, provider::builtin::LocalRouteBackend};
 use omp_proto::{
 	auth::v1::auth_server::AuthServer,
 	blob::v1::blob_server::BlobServer,
@@ -65,14 +31,22 @@ use omp_proto::{
 	thread::v1::Item,
 };
 use omp_serve::{auth::AuthRpc, blob::BlobRpc, inference::InferenceRpc};
+use omp_settings::manager::SettingsManagerError;
 use omp_storage::{
+	blob,
 	blob::BlobStore,
+	transcript,
 	transcript::{Event, Header, ItemRecord, Kind, SessionId, Writer, writer::JournalError},
 };
 use parking_lot::{Mutex, RwLock};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{
+	net::TcpListener,
+	sync::watch::{self, Receiver},
+	task::{JoinError, JoinHandle},
+	time,
+};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Status, transport::Server};
+use tonic::{Request, Status, transport, transport::Server};
 use zeroize::Zeroizing;
 
 use crate::{endpoint::LocalEndpoint, gateway_rpc::GatewayRpc};
@@ -93,13 +67,13 @@ const ANTIGRAVITY_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum SessionAuthorityError {
 	/// Journal filesystem operation failed.
 	#[error("session journal I/O failed")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// Transcript append failed with a proven or indeterminate outcome.
 	#[error(transparent)]
 	Journal(#[from] JournalError),
 	/// Transcript header, codec, or recovery validation failed.
 	#[error(transparent)]
-	Transcript(#[from] omp_storage::transcript::Error),
+	Transcript(#[from] transcript::Error),
 	/// An RPC addressed a different session authority.
 	#[error("session RPC addressed an unknown session")]
 	SessionMismatch,
@@ -131,7 +105,7 @@ impl SessionJournalAuthority {
 	pub fn create(path: impl AsRef<Path>, header: &Header) -> Result<Self, SessionAuthorityError> {
 		let path = path.as_ref().to_owned();
 		if let Some(parent) = path.parent() {
-			std::fs::create_dir_all(parent)?;
+			fs::create_dir_all(parent)?;
 		}
 		Ok(Self {
 			id:    header.id.clone(),
@@ -146,7 +120,7 @@ impl SessionJournalAuthority {
 	/// Opens an existing journal and restores its monotonic revision.
 	pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionAuthorityError> {
 		let path = path.as_ref().to_owned();
-		let reader = omp_storage::transcript::Reader::open(&path)?;
+		let reader = transcript::Reader::open(&path)?;
 		let id = reader.log().header().id.clone();
 		let revision = reader.next_index();
 		drop(reader);
@@ -166,9 +140,9 @@ impl SessionJournalAuthority {
 			return Err(SessionAuthorityError::SessionMismatch);
 		}
 		let state = self.state.lock();
-		let journal = match std::fs::read(&self.path) {
+		let journal = match fs::read(&self.path) {
 			Ok(bytes) => bytes,
-			Err(source) if source.kind() == std::io::ErrorKind::NotFound && state.revision == 0 => {
+			Err(source) if source.kind() == io::ErrorKind::NotFound && state.revision == 0 => {
 				Vec::new()
 			},
 			Err(source) => return Err(source.into()),
@@ -208,8 +182,8 @@ impl SessionJournalAuthority {
 		} else {
 			request.maximum_entries.min(4_096)
 		};
-		let file = std::fs::File::open(&self.path)?;
-		let mut reader = std::io::BufReader::new(file);
+		let file = fs::File::open(&self.path)?;
+		let mut reader = io::BufReader::new(file);
 		let mut line = Vec::new();
 		reader.read_until(b'\n', &mut line)?;
 		let mut revision = 0_u64;
@@ -272,7 +246,7 @@ impl SessionJournalAuthority {
 			ts:   item.created_at_ms,
 			kind: Kind::Item(ItemRecord { item, turn_id: None, prompt_hash: None }),
 		};
-		match state.writer.append_atomic(std::slice::from_ref(&event)) {
+		match state.writer.append_atomic(slice::from_ref(&event)) {
 			Ok(indexes) => state.revision = indexes[0].saturating_add(1),
 			Err(JournalError::Indeterminate(_)) => {
 				return Ok(control_pb::SessionIngestResultMsg {
@@ -379,23 +353,21 @@ pub struct DaemonConfig {
 impl DaemonConfig {
 	/// Creates the standard owner-local daemon configuration.
 	pub fn local(endpoint: impl Into<LocalEndpoint>) -> Self {
-		let data_dir = std::env::var_os(DATA_DIR_ENV)
+		let data_dir = env::var_os(DATA_DIR_ENV)
 			.map(PathBuf::from)
-			.or_else(|| {
-				std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/omp"))
-			});
+			.or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/omp")));
 		Self { data_dir, endpoint: endpoint.into(), bearer_token_file: None }
 	}
 
 	/// Creates a bearer-authenticated TCP daemon configuration.
-	pub fn tcp(address: std::net::SocketAddr, bearer_token_file: impl Into<PathBuf>) -> Self {
+	pub fn tcp(address: SocketAddr, bearer_token_file: impl Into<PathBuf>) -> Self {
 		let mut config = Self::local(LocalEndpoint::tcp(address));
 		config.bearer_token_file = Some(bearer_token_file.into());
 		config
 	}
 
 	/// Creates an unauthenticated loopback TCP daemon configuration.
-	pub fn loopback_without_auth(address: std::net::SocketAddr) -> Result<Self, DaemonError> {
+	pub fn loopback_without_auth(address: SocketAddr) -> Result<Self, DaemonError> {
 		if !address.ip().is_loopback() {
 			return Err(DaemonError::UnauthenticatedRemoteTcp);
 		}
@@ -428,7 +400,7 @@ pub enum DaemonError {
 	MissingDataDirectory,
 	/// Durable state directory could not be prepared.
 	#[error("could not prepare daemon state directory")]
-	PrepareState(#[source] std::io::Error),
+	PrepareState(#[source] io::Error),
 	/// The checked-in catalog snapshot is invalid.
 	#[error("embedded catalog snapshot is invalid")]
 	Catalog(#[source] &'static omp_catalog::snapshot::SnapshotError),
@@ -446,7 +418,7 @@ pub enum DaemonError {
 	CredentialKeyFile(#[from] FileKeyError),
 	/// Native settings authority could not be opened.
 	#[error(transparent)]
-	SettingsManager(#[from] omp_settings::manager::SettingsManagerError),
+	SettingsManager(#[from] SettingsManagerError),
 	/// Web-search settings could not be projected.
 	#[error(transparent)]
 	SettingsSnapshot(#[from] omp_settings::SnapshotError),
@@ -465,7 +437,7 @@ pub enum DaemonError {
 	OAuthLogin(#[from] OAuthLoginEngineError),
 	/// A built-in custom OAuth exchange handler could not be registered.
 	#[error(transparent)]
-	OAuthCustom(#[from] omp_inference::auth::oauth::OAuthCustomDispatchError),
+	OAuthCustom(#[from] OAuthCustomDispatchError),
 	/// Refresh coordination policy was invalid.
 	#[error(transparent)]
 	RefreshPolicy(#[from] omp_inference::account::RefreshPolicyError),
@@ -478,34 +450,34 @@ pub enum DaemonError {
 	Conversation(#[from] ConversationError),
 	/// Content-addressed blob state could not be opened.
 	#[error(transparent)]
-	BlobStore(#[from] omp_storage::blob::Error),
+	BlobStore(#[from] blob::Error),
 	/// Owner-local RPC listener could not bind.
 	#[error("could not bind owner-local RPC endpoint")]
 	RpcListen(#[source] omp_rpc::Error),
 	/// TCP RPC listener could not bind.
 	#[error("could not bind TCP gateway endpoint")]
-	TcpListen(#[source] std::io::Error),
+	TcpListen(#[source] io::Error),
 	/// A TCP listener was configured without bearer authentication off loopback.
 	#[error("unauthenticated TCP gateway endpoints must bind to loopback")]
 	UnauthenticatedRemoteTcp,
 	/// The gateway bearer token could not be loaded.
 	#[error("could not load gateway bearer token")]
-	GatewayToken(#[source] std::io::Error),
+	GatewayToken(#[source] io::Error),
 	/// The gateway bearer token file contained no token.
 	#[error("gateway bearer token file is empty")]
 	EmptyGatewayToken,
 	/// Tonic RPC serving failed.
 	#[error("inference RPC server failed")]
-	RpcServe(#[source] tonic::transport::Error),
+	RpcServe(#[source] transport::Error),
 	/// The daemon RPC task failed to join.
 	#[error("inference RPC task failed")]
-	RpcTask(#[source] tokio::task::JoinError),
+	RpcTask(#[source] JoinError),
 	/// The RPC server exited before a shutdown request.
 	#[error("inference RPC server stopped unexpectedly")]
 	RpcStopped,
 	/// Signal handling failed.
 	#[error("shutdown signal handling failed")]
-	Signal(#[source] std::io::Error),
+	Signal(#[source] io::Error),
 	/// Driver-owned production registry composition failed.
 	#[error(transparent)]
 	Registry(#[from] omp_driver::registry::RegistryError),
@@ -544,11 +516,7 @@ impl BearerAuth {
 			.and_then(|value| value.strip_prefix("Bearer "));
 		let token = self.token.read();
 		let valid = supplied.is_some_and(|supplied| {
-			ring::constant_time::verify_slices_are_equal(
-				supplied.as_bytes(),
-				token.expose_secret().as_bytes(),
-			)
-			.is_ok()
+			omp_core::ct_eq(supplied.as_bytes(), token.expose_secret().as_bytes())
 		});
 		if valid {
 			Ok(request)
@@ -565,21 +533,21 @@ fn bearer_interceptor(
 }
 
 fn load_gateway_token(path: &Path) -> Result<SecretString, DaemonError> {
-	let bytes = Zeroizing::new(std::fs::read(path).map_err(DaemonError::GatewayToken)?);
+	let bytes = Zeroizing::new(fs::read(path).map_err(DaemonError::GatewayToken)?);
 	parse_gateway_token(&bytes).ok_or(DaemonError::EmptyGatewayToken)
 }
 
 fn parse_gateway_token(bytes: &[u8]) -> Option<SecretString> {
-	let value = std::str::from_utf8(bytes).ok()?.trim();
+	let value = str::from_utf8(bytes).ok()?.trim();
 	(!value.is_empty()).then(|| SecretString::from(value.to_owned()))
 }
 
 async fn watch_gateway_token(
 	path: PathBuf,
 	token: Arc<RwLock<SecretString>>,
-	mut shutdown: watch::Receiver<bool>,
+	mut shutdown: Receiver<bool>,
 ) {
-	let mut interval = tokio::time::interval(Duration::from_millis(250));
+	let mut interval = time::interval(Duration::from_millis(250));
 	loop {
 		tokio::select! {
 			_ = interval.tick() => {
@@ -606,7 +574,7 @@ pub struct DaemonHandle {
 	readiness:  DaemonReadiness,
 	registry:   Registry,
 	shutdown:   watch::Sender<bool>,
-	rpc_task:   JoinHandle<Result<(), tonic::transport::Error>>,
+	rpc_task:   JoinHandle<Result<(), transport::Error>>,
 	token_task: Option<JoinHandle<()>>,
 }
 
@@ -627,7 +595,7 @@ impl DaemonHandle {
 			.data_dir
 			.clone()
 			.ok_or(DaemonError::MissingDataDirectory)?;
-		std::fs::create_dir_all(&data_dir).map_err(DaemonError::PrepareState)?;
+		fs::create_dir_all(&data_dir).map_err(DaemonError::PrepareState)?;
 		let omp_driver::registry::ProductionInference {
 			registry, rpc: inference, auth_control, ..
 		} = omp_driver::registry::production_inference(&data_dir, tool_registry, None).await?;
@@ -648,7 +616,7 @@ impl DaemonHandle {
 			.data_dir
 			.clone()
 			.ok_or(DaemonError::MissingDataDirectory)?;
-		std::fs::create_dir_all(&data_dir).map_err(DaemonError::PrepareState)?;
+		fs::create_dir_all(&data_dir).map_err(DaemonError::PrepareState)?;
 		let inference =
 			InferenceRpc::new_for_test(registry.clone(), sessions, tool_registry, live_responses);
 		Self::start_rpc(config, data_dir, registry, inference, None).await
@@ -710,7 +678,7 @@ impl DaemonHandle {
 				if bearer_token_file.is_none() && !address.ip().is_loopback() {
 					return Err(DaemonError::UnauthenticatedRemoteTcp);
 				}
-				let listener = tokio::net::TcpListener::bind(address)
+				let listener = TcpListener::bind(address)
 					.await
 					.map_err(DaemonError::TcpListen)?;
 				let incoming = TcpListenerStream::new(listener);
@@ -827,7 +795,7 @@ impl DaemonHandle {
 		if let LocalEndpoint::Local(path) = &self.readiness.endpoint {
 			match tokio::fs::remove_file(path).await {
 				Ok(()) => {},
-				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 				Err(error) => return Err(DaemonError::PrepareState(error)),
 			}
 		}
@@ -875,13 +843,17 @@ mod gateway_bearer_tests {
 	}
 }
 #[cfg(unix)]
-async fn shutdown_signal() -> Result<(), std::io::Error> {
-	use tokio::signal::unix::{SignalKind, signal};
+async fn shutdown_signal() -> Result<(), io::Error> {
+	use tokio::signal::{
+		ctrl_c,
+		unix::{SignalKind, signal},
+	};
 	let mut terminate = signal(SignalKind::terminate())?;
-	tokio::select! { result = tokio::signal::ctrl_c() => result, _ = terminate.recv() => Ok(()) }
+	tokio::select! { result = ctrl_c() => result, _ = terminate.recv() => Ok(()) }
 }
 
 #[cfg(windows)]
-async fn shutdown_signal() -> Result<(), std::io::Error> {
-	tokio::signal::ctrl_c().await
+async fn shutdown_signal() -> Result<(), io::Error> {
+	use tokio::signal::ctrl_c;
+	ctrl_c().await
 }

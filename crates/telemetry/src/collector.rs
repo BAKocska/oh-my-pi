@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use omp_core::Str;
+use omp_proto::omp::inference::v1;
 use rustc_hash::FxHashMap;
 
 use crate::semconv::ToolStatus;
@@ -11,7 +12,7 @@ use crate::semconv::ToolStatus;
 ///
 /// [`Usage`] below is deliberately only a metrics projection; callers retain
 /// this type for firehose records and durable telemetry rows.
-pub type InferenceUsage = omp_proto::omp::inference::v1::Usage;
+pub type InferenceUsage = v1::Usage;
 
 /// Raw record for one completed chat step.
 #[derive(Clone, Debug, PartialEq)]

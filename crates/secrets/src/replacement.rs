@@ -1,3 +1,5 @@
+use std::str;
+
 use hmac::{Hmac, Mac as _};
 use regex::Regex;
 use sha2::Sha256;
@@ -163,7 +165,7 @@ pub fn find_non_matching_replacement(
 	for position in 0..length {
 		for &byte in NONMATCHING_REPLACEMENT_CHARS {
 			candidate[position] = byte;
-			let candidate = std::str::from_utf8(&candidate).expect("replacement alphabet is ASCII");
+			let candidate = str::from_utf8(&candidate).expect("replacement alphabet is ASCII");
 			if candidate != value && !regex_rematches_in_context(candidate, regex, context) {
 				return Some(candidate.to_owned());
 			}
@@ -172,21 +174,21 @@ pub fn find_non_matching_replacement(
 	}
 	for &byte in NONMATCHING_REPLACEMENT_CHARS {
 		candidate.fill(byte);
-		let candidate = std::str::from_utf8(&candidate).expect("replacement alphabet is ASCII");
+		let candidate = str::from_utf8(&candidate).expect("replacement alphabet is ASCII");
 		if candidate != value && !regex_rematches_in_context(candidate, regex, context) {
 			return Some(candidate.to_owned());
 		}
 	}
 	for whitespace in [b' ', b'\t'] {
 		candidate.fill(whitespace);
-		let full = std::str::from_utf8(&candidate).expect("replacement alphabet is ASCII");
+		let full = str::from_utf8(&candidate).expect("replacement alphabet is ASCII");
 		if full != value && !regex_rematches_in_context(full, regex, context) {
 			return Some(full.to_owned());
 		}
 		candidate.fill(NONMATCHING_REPLACEMENT_CHARS[0]);
 		for position in 0..length {
 			candidate[position] = whitespace;
-			let mixed = std::str::from_utf8(&candidate).expect("replacement alphabet is ASCII");
+			let mixed = str::from_utf8(&candidate).expect("replacement alphabet is ASCII");
 			if mixed != value && !regex_rematches_in_context(mixed, regex, context) {
 				return Some(mixed.to_owned());
 			}

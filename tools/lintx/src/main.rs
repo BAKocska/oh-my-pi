@@ -1,16 +1,18 @@
 //! lintx — omp's custom lint engine for path/style rules.
 //!
-//! Rules (one module each under `lints/`):
-//!   long-path      inline qualified path with more than N segments (default 2)
-//!   relative-path  inline `crate::` / `super::` / `self::` qualified path
-//!   arc-struct     struct where most fields are Arc-wrapped
-//!   mutex-arc      `Mutex<Arc<T>>` / `RwLock<Option<Arc<T>>>` → arc-swap
+//! Rules:
+//! - `long-path`: paths with more than two `::`, plus explicit name policy.
+//! - `std-path`: `std::module::item` paths that should start at `module`.
+//! - `tokio-path`: `tokio::module::item` paths, except `tokio::fs`.
+//! - `relative-path`: inline `crate::`, `super::`, or `self::` paths.
+//! - `import-alias`: CamelCase `use … as Alias` bindings.
+//! - `arc-struct`: structs where most fields are `Arc`-wrapped.
+//! - `mutex-arc`: locks around swappable `Arc` handles.
 //!
-//! `--fix` rewrites offending paths to their tail and inserts a `use` into
-//! the nearest enclosing module scope, iterating each file to a fixpoint
-//! (nested paths need a second pass). Ambiguous cases — name collisions,
-//! glob/prelude shadowing, `#[cfg]`-gated code, alias-rooted paths — stay
-//! diagnostics. Run `cargo fmt` afterwards.
+//! `--fix` rewrites paths according to explicit bare/qualified-name policy and
+//! inserts a `use` into the nearest enclosing module scope, iterating each file
+//! to a fixpoint. `--only <rule>` restricts detection and fixes to one or more
+//! named rules. Ambiguous cases stay diagnostics. Run `cargo fmt` afterwards.
 
 mod bindings;
 mod fix;
@@ -18,30 +20,32 @@ mod lint;
 mod lints;
 mod scope;
 
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 
 use lint::FileContext;
 use walkdir::WalkDir;
 
 #[derive(Default)]
 struct Options {
-	fix: bool,
+	fix:          bool,
 	max_segments: usize,
-	paths: Vec<PathBuf>,
+	only:         Vec<String>,
+	paths:        Vec<PathBuf>,
 }
 
 fn main() {
-	let mut opts = Options { max_segments: 2, ..Options::default() };
+	let mut opts = Options { max_segments: 3, ..Options::default() };
 	let mut args = std::env::args().skip(1);
 	while let Some(arg) = args.next() {
 		match arg.as_str() {
 			"--fix" => opts.fix = true,
 			"--max-segments" => {
-				opts.max_segments =
-					args.next().and_then(|v| v.parse().ok()).expect("--max-segments <N>");
-			}
+				opts.max_segments = args
+					.next()
+					.and_then(|value| value.parse().ok())
+					.expect("--max-segments <N>");
+			},
+			"--only" => opts.only.push(args.next().expect("--only <rule>")),
 			_ => opts.paths.push(PathBuf::from(arg)),
 		}
 	}
@@ -49,23 +53,36 @@ fn main() {
 		opts.paths.push(PathBuf::from("."));
 	}
 
-	let rules = lints::all(opts.max_segments);
+	let mut rules = lints::all(opts.max_segments);
+	for requested in &opts.only {
+		assert!(rules.iter().any(|rule| rule.name() == requested), "unknown lint rule `{requested}`");
+	}
+	if !opts.only.is_empty() {
+		rules.retain(|rule| opts.only.iter().any(|requested| requested == rule.name()));
+	}
+
 	let mut totals: BTreeMap<&'static str, usize> = BTreeMap::new();
 	let mut fixed_files = 0usize;
 	let mut fixes_applied = 0usize;
 	for root in &opts.paths {
 		for entry in WalkDir::new(root)
 			.into_iter()
-			.filter_entry(|e| {
-				let name = e.file_name().to_string_lossy();
+			.filter_entry(|entry| {
+				let name = entry.file_name().to_string_lossy();
 				name != "target" && name != "vendor" && !name.starts_with('.')
 			})
 			.filter_map(Result::ok)
-			.filter(|e| e.file_type().is_file())
-			.filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
-		{
+			.filter(|entry| entry.file_type().is_file())
+			.filter(|entry| {
+				entry
+					.path()
+					.extension()
+					.is_some_and(|extension| extension == "rs")
+			}) {
 			let path = entry.path();
-			let Ok(mut text) = std::fs::read_to_string(path) else { continue };
+			let Ok(mut text) = std::fs::read_to_string(path) else {
+				continue;
+			};
 			let own_crate = crate_name_for(path);
 			// Nested fixes (a linted path inside another's generic args) are
 			// deferred to the next pass; iterate to a fixpoint.
@@ -101,35 +118,44 @@ fn main() {
 		}
 	}
 	let mut summary = String::new();
-	for (rule, n) in &totals {
-		let _ = write!(summary, "{rule}: {n}  ");
+	for (rule, count) in &totals {
+		let _ = write!(summary, "{rule}: {count}  ");
 	}
 	eprintln!("\n== {summary}");
 	if opts.fix {
 		eprintln!("== applied {fixes_applied} fixes across {fixed_files} files");
 	}
 }
+
 /// `lib` name (hyphens normalized) of the crate containing `file`, from the
 /// nearest ancestor Cargo.toml. The fixer imports self-referencing paths via
 /// `crate::` instead.
 ///
-/// Only files under the crate's `src/` qualify: integration tests, benches,
-/// and examples are separate crates where the lib is named, not `crate`.
+/// Only lib-module files under the crate's `src/` qualify: integration
+/// tests, benches, examples, and bin targets (`src/main.rs`, `src/bin/*`)
+/// are separate crates where the lib is named, not `crate`.
 fn crate_name_for(file: &std::path::Path) -> String {
 	let mut dir = file.parent();
-	while let Some(d) = dir {
-		if let Ok(manifest) = std::fs::read_to_string(d.join("Cargo.toml")) {
-			if !file.strip_prefix(d).is_ok_and(|rel| rel.starts_with("src")) {
+	while let Some(directory) = dir {
+		if let Ok(manifest) = std::fs::read_to_string(directory.join("Cargo.toml")) {
+			let is_lib_module = file.strip_prefix(directory).is_ok_and(|relative| {
+				relative.starts_with("src")
+					&& relative != std::path::Path::new("src/main.rs")
+					&& !relative.starts_with("src/bin")
+			});
+			if !is_lib_module {
 				return String::new();
 			}
-			if let Some(name) = manifest
-				.lines()
-				.find_map(|l| l.trim().strip_prefix("name").and_then(|r| r.trim().strip_prefix('=')))
-			{
+			if let Some(name) = manifest.lines().find_map(|line| {
+				line
+					.trim()
+					.strip_prefix("name")
+					.and_then(|rest| rest.trim().strip_prefix('='))
+			}) {
 				return name.trim().trim_matches('"').replace('-', "_");
 			}
 		}
-		dir = d.parent();
+		dir = directory.parent();
 	}
 	String::new()
 }

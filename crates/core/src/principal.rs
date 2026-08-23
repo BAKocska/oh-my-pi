@@ -2,13 +2,14 @@
 //! records.
 
 use std::{
-	fmt,
+	cmp,
+	fmt::{self, Display},
 	hash::{Hash, Hasher},
 	str::FromStr,
 	sync::Arc,
 };
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 use crate::{Hash32, Str, hex};
@@ -172,16 +173,16 @@ impl ArtifactDigest {
 	}
 }
 
-impl fmt::Display for ArtifactDigest {
+impl Display for ArtifactDigest {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("b3:")?;
-		fmt::Display::fmt(&hex::encode(&self.0), formatter)
+		Display::fmt(&hex::encode(&self.0), formatter)
 	}
 }
 
 impl fmt::Debug for ArtifactDigest {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		fmt::Display::fmt(self, formatter)
+		Display::fmt(self, formatter)
 	}
 }
 
@@ -236,7 +237,7 @@ impl<'de> Deserialize<'de> for ArtifactDigest {
 		D: Deserializer<'de>,
 	{
 		let value = Str::deserialize(deserializer)?;
-		value.as_str().parse().map_err(D::Error::custom)
+		value.as_str().parse().map_err(de::Error::custom)
 	}
 }
 
@@ -343,13 +344,13 @@ impl PartialEq for Provenance {
 impl Eq for Provenance {}
 
 impl PartialOrd for Provenance {
-	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+	fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for Provenance {
-	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+	fn cmp(&self, other: &Self) -> cmp::Ordering {
 		self.0.cmp(&other.0)
 	}
 }

@@ -1,7 +1,7 @@
 //! Canonical Git repository and linked-worktree discovery.
 
 use std::{
-	io,
+	fs, io,
 	path::{Path, PathBuf},
 };
 
@@ -270,7 +270,7 @@ async fn canonicalize_pointer_target(
 		})
 }
 
-async fn metadata(path: &Path) -> Result<std::fs::Metadata, RepositoryError> {
+async fn metadata(path: &Path) -> Result<fs::Metadata, RepositoryError> {
 	tokio::fs::metadata(path)
 		.await
 		.map_err(|source| RepositoryError::Io { path: path.to_path_buf(), source })

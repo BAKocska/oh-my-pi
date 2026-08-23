@@ -1,6 +1,9 @@
 //! Subagent terminal and incremental structured-output submission.
 
-use std::fmt;
+use std::{
+	error,
+	fmt::{self, Display},
+};
 
 use async_stream::stream;
 use futures::Stream;
@@ -72,12 +75,12 @@ pub enum Update {}
 pub struct Fault {
 	message: Str,
 }
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.message)
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// Yield executor. Caller-side `YieldPayloadValidator` validates original raw
 /// call arguments against the caller schema using omp-tool argument machinery.

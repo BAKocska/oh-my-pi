@@ -1,3 +1,6 @@
+//! Proves prompt-head invalidations honor slot ownership and advance
+//! generations atomically.
+
 use std::sync::Arc;
 
 use omp_agent::{CanonicalPromptSource, SlotClass, SlotDecl, SlotId, render_prompt};

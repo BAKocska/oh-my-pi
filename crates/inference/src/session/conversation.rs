@@ -2,7 +2,8 @@
 
 use std::{
 	collections::{HashMap, HashSet},
-	fmt,
+	error,
+	fmt::{self, Display},
 	hash::{DefaultHasher, Hash, Hasher},
 	sync::Arc,
 };
@@ -23,6 +24,7 @@ use crate::{
 		CacheRetention, ContentPart, MediaInput, Message, OpaqueJson, ProviderProof, Role,
 		ToolResultContent,
 	},
+	catalog::{CodecId, ProviderId},
 	id::{ConversationId, Revision, ToolCallId, TurnId},
 };
 
@@ -48,7 +50,7 @@ pub enum ConversationError {
 	Persistence,
 }
 
-impl fmt::Display for ConversationError {
+impl Display for ConversationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::UnknownConversation(id) => write!(formatter, "unknown conversation {id}"),
@@ -65,7 +67,7 @@ impl fmt::Display for ConversationError {
 	}
 }
 
-impl std::error::Error for ConversationError {}
+impl error::Error for ConversationError {}
 
 /// Why a canonical message cannot be durably committed without implicit
 /// buffering.
@@ -77,7 +79,7 @@ pub enum MessagePersistenceError {
 	InvalidOpaqueJson,
 }
 
-impl fmt::Display for MessagePersistenceError {
+impl Display for MessagePersistenceError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::UnstagedBody => formatter
@@ -89,7 +91,7 @@ impl fmt::Display for MessagePersistenceError {
 	}
 }
 
-impl std::error::Error for MessagePersistenceError {}
+impl error::Error for MessagePersistenceError {}
 
 /// Postcard-safe canonical message persisted by durable conversation stores.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -214,9 +216,9 @@ pub enum StoredToolResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StoredProof {
 	/// Provider that issued the proof.
-	pub provider: crate::catalog::ProviderId,
+	pub provider: ProviderId,
 	/// Codec that defines the proof representation.
-	pub codec:    crate::catalog::CodecId,
+	pub codec:    CodecId,
 	/// Opaque proof bytes.
 	pub value:    Bytes,
 }

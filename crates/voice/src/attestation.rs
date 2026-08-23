@@ -1,6 +1,6 @@
 //! Codex DeviceCheck attestation envelope and deterministic CBOR encoder.
 
-use std::{sync::LazyLock, time::Duration};
+use std::{env, sync::LazyLock, time::Duration};
 
 use omp_core::{Str, base64_url};
 use thiserror::Error;
@@ -75,12 +75,12 @@ pub async fn generate_codex_attestation() -> Option<Str> {
 }
 
 fn attestation_signals() -> Result<Vec<u8>, AttestationError> {
-	let locale = std::env::var("LANG")
+	let locale = env::var("LANG")
 		.ok()
 		.and_then(|value| value.split('.').next().map(str::to_owned))
 		.filter(|value| !value.is_empty())
 		.unwrap_or_else(|| "unknown".to_owned());
-	let timezone = std::env::var("TZ")
+	let timezone = env::var("TZ")
 		.ok()
 		.filter(|value| !value.is_empty())
 		.unwrap_or_else(|| "unknown".to_owned());
@@ -163,6 +163,7 @@ mod macos {
 		runtime::{AnyClass, AnyObject},
 	};
 	use objc2_foundation::NSError;
+	use omp_core::Str;
 	use thiserror::Error;
 
 	use super::DeviceCheckResult;
@@ -209,7 +210,7 @@ mod macos {
 			.map_err(|_| DeviceCheckError::CompletionClosed)?;
 		Ok(DeviceCheckResult {
 			supported:    true,
-			token_base64: token.map(omp_core::Str::from),
+			token_base64: token.map(Str::from),
 			latency:      Some(started.elapsed()),
 		})
 	}

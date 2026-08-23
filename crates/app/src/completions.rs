@@ -5,9 +5,11 @@ use std::io;
 use clap::CommandFactory as _;
 use clap_complete::{Shell, generate};
 
+use crate::cli::OmpCli;
+
 /// Writes a complete shell script for `omp`.
 pub fn generate_script(shell: Shell, output: &mut dyn io::Write) {
-	let mut command = crate::cli::OmpCli::command();
+	let mut command = OmpCli::command();
 	generate(shell, &mut command, "omp", output);
 }
 

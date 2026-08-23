@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{env, fs, sync::Arc};
 
 use omp_agent::{
 	AgentEvent, AgentRunSummary, ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalSource,
@@ -6,7 +6,10 @@ use omp_agent::{
 };
 use omp_core::{ToolPath, sf};
 use omp_proto::{
-	inference::v1::{Outcome, StopReason},
+	inference::{
+		v1,
+		v1::{Outcome, StopReason},
+	},
 	thread::v1::{self as thread, Item, Message, Part, Role, item, part},
 };
 use omp_storage::transcript::{Header, SessionId};
@@ -42,7 +45,7 @@ fn approval_spec() -> ApprovalSpec {
 
 #[tokio::test]
 async fn headless_runtime() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-headless-runtime-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -51,7 +54,7 @@ async fn headless_runtime() {
 		v:       4,
 		id:      SessionId(sf!("headless-runtime")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create v4 journal");
 	journal
@@ -92,7 +95,7 @@ async fn headless_runtime() {
 			})),
 			..Item::default()
 		},
-		usage:   omp_proto::inference::v1::Usage::default(),
+		usage:   v1::Usage::default(),
 	});
 	assert!(matches!(events.try_recv().unwrap().as_ref(), AgentEvent::ToolObserved {
 		session_generation: 9,
@@ -144,5 +147,5 @@ async fn headless_runtime() {
 	assert_eq!(summary.final_assistant(), Some("scripted complete"));
 	assert_eq!(AgentRunSummary::terminal_fault().settlement, RunSettlement::TerminalFault);
 
-	std::fs::remove_file(path).expect("remove journal fixture");
+	fs::remove_file(path).expect("remove journal fixture");
 }

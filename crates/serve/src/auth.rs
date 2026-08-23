@@ -8,18 +8,20 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::{Duration, Instant},
+	time::{self, Duration, Instant},
 };
 
+use flume::Receiver;
 use futures::{Stream, StreamExt as _};
 use omp_catalog::ProviderId;
-use omp_core::{Secret, SecretString};
+use omp_core::{Secret, SecretString, Str};
 use omp_inference::{
 	Client, Error as InferenceError, ErrorKind, Registry,
 	answer::{
 		AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthSession, UsageQuantity, UsageReport,
 		UsageStatus, UsageUnit, UsageWindowKind,
 	},
+	auth,
 	auth::{AuthControlHandle, CredentialControlWrite, OAuthControlImport},
 	call::{
 		AuthInput, AuthMethod, AuthRequest, CallMeta, LoginRequest, Target, UsageRequest, UsageScope,
@@ -28,7 +30,13 @@ use omp_inference::{
 	receipt::{ExecutionBudget, UsageSource},
 	router::Router,
 };
-use omp_proto::omp::auth::v1 as pb;
+use omp_proto::omp::{
+	auth::v1::{
+		self as pb, begin_login_response, credential_event, credential_health, credential_meta,
+		usage_report::reset_credits, usage_window,
+	},
+	inference::v1::usage,
+};
 use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 
@@ -88,10 +96,10 @@ impl AuthRpc {
 			.map_err(store_status)?
 			.ok_or_else(|| Status::not_found("credential not found"))?;
 		let kind = match metadata.kind.as_str() {
-			"api_key" | "api-key" => pb::credential_meta::Kind::ApiKey,
-			"oauth" | "oauth-renewable-v1" | "bearer" => pb::credential_meta::Kind::Oauth,
-			"aws" => pb::credential_meta::Kind::Aws,
-			_ => pb::credential_meta::Kind::Unspecified,
+			"api_key" | "api-key" => credential_meta::Kind::ApiKey,
+			"oauth" | "oauth-renewable-v1" | "bearer" => credential_meta::Kind::Oauth,
+			"aws" => credential_meta::Kind::Aws,
+			_ => credential_meta::Kind::Unspecified,
 		};
 		let blocks = self
 			.control()?
@@ -109,9 +117,9 @@ impl AuthRpc {
 			kind: kind as i32,
 			identity: account.principal.as_str().to_owned(),
 			state: if account.enabled {
-				pb::credential_meta::State::Active as i32
+				credential_meta::State::Active as i32
 			} else {
-				pb::credential_meta::State::Disabled as i32
+				credential_meta::State::Disabled as i32
 			},
 			blocks,
 			disabled_cause: String::new(),
@@ -196,7 +204,7 @@ impl AuthRpc {
 			AuthAnswer::Refreshed(account) => account_meta(account),
 			AuthAnswer::LoggedOut(account) => Ok(pb::CredentialMeta {
 				id: parse_account_id(&account)?,
-				state: pb::credential_meta::State::Disabled as i32,
+				state: credential_meta::State::Disabled as i32,
 				..pb::CredentialMeta::default()
 			}),
 			_ => Err(Status::internal("auth operation returned the wrong typed answer")),
@@ -227,7 +235,7 @@ impl AuthRpc {
 				healthy: true,
 				status_code: Some(200),
 				latency_ms: elapsed_ms(started.elapsed()),
-				error_class: pb::credential_health::ErrorClass::Unspecified as i32,
+				error_class: credential_health::ErrorClass::Unspecified as i32,
 			},
 			Err(error) => failed_health(credential_id, provider, started.elapsed(), &error),
 		})
@@ -274,7 +282,7 @@ impl pb::auth_server::Auth for AuthRpc {
 		let stream = futures::stream::once(async {
 			Ok(pb::CredentialEvent {
 				cursor: None,
-				event:  Some(pb::credential_event::Event::Reset(pb::credential_event::Reset {})),
+				event:  Some(credential_event::Event::Reset(pb::credential_event::Reset {})),
 			})
 		});
 		Ok(Response::new(Box::pin(stream)))
@@ -500,11 +508,8 @@ impl pb::auth_server::Auth for AuthRpc {
 		let request = request.into_inner();
 		let provider = ProviderId::from(request.provider.as_str());
 		let identity = (!request.identity.is_empty()).then(|| request.identity.into());
-		let principal = omp_inference::PrincipalId::from(
-			identity
-				.as_ref()
-				.map_or(provider.as_str(), omp_core::Str::as_str),
-		);
+		let principal =
+			omp_inference::PrincipalId::from(identity.as_ref().map_or(provider.as_str(), Str::as_str));
 		let (_, account) = self
 			.control()?
 			.import_oauth(OAuthControlImport {
@@ -556,7 +561,7 @@ impl pb::auth_server::Auth for AuthRpc {
 		let block = request
 			.block
 			.ok_or_else(|| Status::invalid_argument("credential block is missing"))?;
-		let until = std::time::UNIX_EPOCH
+		let until = time::UNIX_EPOCH
 			.checked_add(Duration::from_millis(block.until_ms))
 			.ok_or_else(|| Status::invalid_argument("credential block time is invalid"))?;
 		self
@@ -636,7 +641,7 @@ impl pb::auth_server::Auth for AuthRpc {
 }
 
 async fn await_account(
-	events: flume::Receiver<Result<AuthEvent, omp_inference::Error>>,
+	events: Receiver<Result<AuthEvent, omp_inference::Error>>,
 ) -> Result<AccountSummary, Status> {
 	while let Ok(event) = events.recv_async().await {
 		if let AuthEvent::Complete(account) = event.map_err(inference_status)? {
@@ -646,15 +651,15 @@ async fn await_account(
 	Err(Status::unavailable("auth flow ended without account completion"))
 }
 
-fn login_step(event: AuthEvent) -> Result<pb::begin_login_response::Step, Status> {
+fn login_step(event: AuthEvent) -> Result<begin_login_response::Step, Status> {
 	match event {
 		AuthEvent::OpenUrl(url) => {
-			Ok(pb::begin_login_response::Step::Browse(pb::begin_login_response::Browse {
+			Ok(begin_login_response::Step::Browse(begin_login_response::Browse {
 				url: url.as_str().to_owned(),
 			}))
 		},
 		AuthEvent::ShowDeviceCode { code, verification_url } => {
-			Ok(pb::begin_login_response::Step::Device(pb::begin_login_response::DeviceCode {
+			Ok(begin_login_response::Step::Device(begin_login_response::DeviceCode {
 				user_code:  omp_core::ExposeSecret::expose_secret(&code).to_owned(),
 				verify_url: verification_url.as_str().to_owned(),
 			}))
@@ -676,7 +681,7 @@ fn account_meta(account: AccountSummary) -> Result<pb::CredentialMeta, Status> {
 	Ok(pb::CredentialMeta {
 		id:             parse_account_id(&account.account)?,
 		provider:       account.provider.as_str().to_owned(),
-		kind:           pb::credential_meta::Kind::Unspecified as i32,
+		kind:           credential_meta::Kind::Unspecified as i32,
 		identity:       account
 			.principal
 			.map_or_else(String::new, |value| value.as_str().to_owned()),
@@ -710,14 +715,13 @@ fn reveal_audit(
 	}
 }
 
-fn store_status(error: omp_inference::auth::StoreError) -> Status {
+fn store_status(error: auth::StoreError) -> Status {
 	match error {
-		omp_inference::auth::StoreError::NotFound => Status::not_found(error.to_string()),
-		omp_inference::auth::StoreError::GenerationConflict
-		| omp_inference::auth::StoreError::RevealAuditConflict => Status::aborted(error.to_string()),
-		omp_inference::auth::StoreError::InvalidRevealAudit => {
-			Status::permission_denied(error.to_string())
+		auth::StoreError::NotFound => Status::not_found(error.to_string()),
+		auth::StoreError::GenerationConflict | auth::StoreError::RevealAuditConflict => {
+			Status::aborted(error.to_string())
 		},
+		auth::StoreError::InvalidRevealAudit => Status::permission_denied(error.to_string()),
 		_ => Status::internal(error.to_string()),
 	}
 }
@@ -791,7 +795,7 @@ fn usage_report(report: UsageReport) -> pb::UsageReport {
 					.credits
 					.into_vec()
 					.into_iter()
-					.map(|credit| pb::usage_report::reset_credits::Credit {
+					.map(|credit| reset_credits::Credit {
 						granted_at_ms: credit.granted_at.map(usage_time_ms),
 						expires_at_ms: credit.expires_at.map(usage_time_ms),
 						status:        credit.status.map(|value| value.as_str().to_owned()),
@@ -822,23 +826,23 @@ fn usage_report(report: UsageReport) -> pb::UsageReport {
 					resets_at_ms: window.resets_at.map_or(0, usage_time_ms),
 					id: window.id.as_str().to_owned(),
 					kind: match window.kind {
-						UsageWindowKind::RateLimit => pb::usage_window::Kind::RateLimit,
-						UsageWindowKind::Quota => pb::usage_window::Kind::Quota,
-						UsageWindowKind::Billing => pb::usage_window::Kind::Billing,
-						UsageWindowKind::Balance => pb::usage_window::Kind::Balance,
+						UsageWindowKind::RateLimit => usage_window::Kind::RateLimit,
+						UsageWindowKind::Quota => usage_window::Kind::Quota,
+						UsageWindowKind::Billing => usage_window::Kind::Billing,
+						UsageWindowKind::Balance => usage_window::Kind::Balance,
 					} as i32,
 					dimension: window.dimension.as_str().to_owned(),
 					consumed: window.amount.consumed.map(|value| value.units),
 					remaining: window.amount.remaining.map(|value| value.units),
 					limit: window.amount.limit.map(|value| value.units),
 					unit: match window.amount.unit {
-						UsageUnit::Percent => pb::usage_window::Unit::Percent,
-						UsageUnit::Tokens => pb::usage_window::Unit::Tokens,
-						UsageUnit::Requests => pb::usage_window::Unit::Requests,
-						UsageUnit::Usd => pb::usage_window::Unit::Usd,
-						UsageUnit::Minutes => pb::usage_window::Unit::Minutes,
-						UsageUnit::Bytes => pb::usage_window::Unit::Bytes,
-						UsageUnit::Unknown => pb::usage_window::Unit::Unknown,
+						UsageUnit::Percent => usage_window::Unit::Percent,
+						UsageUnit::Tokens => usage_window::Unit::Tokens,
+						UsageUnit::Requests => usage_window::Unit::Requests,
+						UsageUnit::Usd => usage_window::Unit::Usd,
+						UsageUnit::Minutes => usage_window::Unit::Minutes,
+						UsageUnit::Bytes => usage_window::Unit::Bytes,
+						UsageUnit::Unknown => usage_window::Unit::Unknown,
 					} as i32,
 					consumed_decimal_exponent: window
 						.amount
@@ -858,10 +862,10 @@ fn usage_report(report: UsageReport) -> pb::UsageReport {
 						.map(|value| value.as_millis().try_into().unwrap_or(u64::MAX)),
 					reset_label: window.reset_label.map(|value| value.as_str().to_owned()),
 					status: window.status.map(|status| match status {
-						UsageStatus::Ok => pb::usage_window::Status::Ok,
-						UsageStatus::Warning => pb::usage_window::Status::Warning,
-						UsageStatus::Exhausted => pb::usage_window::Status::Exhausted,
-						UsageStatus::Unknown => pb::usage_window::Status::Unknown,
+						UsageStatus::Ok => usage_window::Status::Ok,
+						UsageStatus::Warning => usage_window::Status::Warning,
+						UsageStatus::Exhausted => usage_window::Status::Exhausted,
+						UsageStatus::Unknown => usage_window::Status::Unknown,
 					} as i32),
 					notes: window
 						.notes
@@ -871,16 +875,10 @@ fn usage_report(report: UsageReport) -> pb::UsageReport {
 						.collect(),
 					observed_at_ms: usage_time_ms(window.observed_at),
 					accuracy: match window.source {
-						UsageSource::Provider | UsageSource::Measured => {
-							omp_proto::omp::inference::v1::usage::Accuracy::Exact
-						},
-						UsageSource::Estimated => {
-							omp_proto::omp::inference::v1::usage::Accuracy::Estimated
-						},
-						UsageSource::Mixed => omp_proto::omp::inference::v1::usage::Accuracy::Mixed,
-						UsageSource::Unknown => {
-							omp_proto::omp::inference::v1::usage::Accuracy::Unspecified
-						},
+						UsageSource::Provider | UsageSource::Measured => usage::Accuracy::Exact,
+						UsageSource::Estimated => usage::Accuracy::Estimated,
+						UsageSource::Mixed => usage::Accuracy::Mixed,
+						UsageSource::Unknown => usage::Accuracy::Unspecified,
 					} as i32,
 				}
 			})
@@ -890,9 +888,9 @@ fn usage_report(report: UsageReport) -> pb::UsageReport {
 	}
 }
 
-fn usage_time_ms(time: std::time::SystemTime) -> u64 {
+fn usage_time_ms(time: time::SystemTime) -> u64 {
 	time
-		.duration_since(std::time::UNIX_EPOCH)
+		.duration_since(time::UNIX_EPOCH)
 		.map_or(0, |duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
@@ -919,36 +917,38 @@ fn elapsed_ms(elapsed: Duration) -> u64 {
 	elapsed.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn error_class(error: &InferenceError) -> pb::credential_health::ErrorClass {
-	use pb::credential_health::ErrorClass;
-
+fn error_class(error: &InferenceError) -> credential_health::ErrorClass {
 	match error.status {
-		Some(401) => return ErrorClass::Authentication,
-		Some(403) => return ErrorClass::Authorization,
-		Some(408) => return ErrorClass::Timeout,
-		Some(429) => return ErrorClass::RateLimited,
-		Some(500..=599) => return ErrorClass::Upstream,
+		Some(401) => return credential_health::ErrorClass::Authentication,
+		Some(403) => return credential_health::ErrorClass::Authorization,
+		Some(408) => return credential_health::ErrorClass::Timeout,
+		Some(429) => return credential_health::ErrorClass::RateLimited,
+		Some(500..=599) => return credential_health::ErrorClass::Upstream,
 		_ => {},
 	}
 	match error.kind {
 		ErrorKind::Authentication
 		| ErrorKind::CredentialStorageUnavailable
-		| ErrorKind::AccountDisabled => ErrorClass::Authentication,
-		ErrorKind::Authorization | ErrorKind::PaymentRequired => ErrorClass::Authorization,
-		ErrorKind::RateLimited => ErrorClass::RateLimited,
-		ErrorKind::QuotaExhausted | ErrorKind::BudgetExhausted => ErrorClass::Quota,
+		| ErrorKind::AccountDisabled => credential_health::ErrorClass::Authentication,
+		ErrorKind::Authorization | ErrorKind::PaymentRequired => {
+			credential_health::ErrorClass::Authorization
+		},
+		ErrorKind::RateLimited => credential_health::ErrorClass::RateLimited,
+		ErrorKind::QuotaExhausted | ErrorKind::BudgetExhausted => {
+			credential_health::ErrorClass::Quota
+		},
 		ErrorKind::Dns
 		| ErrorKind::Tls
 		| ErrorKind::Connectivity
 		| ErrorKind::Protocol
-		| ErrorKind::StreamCorruption => ErrorClass::Connectivity,
-		ErrorKind::Cancelled | ErrorKind::DeadlineExceeded => ErrorClass::Timeout,
+		| ErrorKind::StreamCorruption => credential_health::ErrorClass::Connectivity,
+		ErrorKind::Cancelled | ErrorKind::DeadlineExceeded => credential_health::ErrorClass::Timeout,
 		ErrorKind::InvalidRequest
 		| ErrorKind::TargetNotFound
 		| ErrorKind::CapabilityUnknown
 		| ErrorKind::CodecMismatch
 		| ErrorKind::CapabilityMismatch
-		| ErrorKind::NativeRequestRejected => ErrorClass::InvalidRequest,
+		| ErrorKind::NativeRequestRejected => credential_health::ErrorClass::InvalidRequest,
 		ErrorKind::RouteUnavailable
 		| ErrorKind::StalePlan
 		| ErrorKind::ReplayRequired
@@ -967,8 +967,10 @@ fn error_class(error: &InferenceError) -> pb::credential_health::ErrorClass {
 		| ErrorKind::SessionExpired
 		| ErrorKind::SessionConflict
 		| ErrorKind::LocalModelUnavailable
-		| ErrorKind::ResourceExhausted => ErrorClass::Upstream,
-		ErrorKind::PolicyBufferExceeded | ErrorKind::InternalInvariant => ErrorClass::Internal,
+		| ErrorKind::ResourceExhausted => credential_health::ErrorClass::Upstream,
+		ErrorKind::PolicyBufferExceeded | ErrorKind::InternalInvariant => {
+			credential_health::ErrorClass::Internal
+		},
 	}
 }
 fn not_available(capability: &str) -> Status {
@@ -987,7 +989,7 @@ mod tests {
 		receipt::ExecutionReceipt,
 	};
 
-	use super::{error_class, pb, reveal_audit};
+	use super::{credential_health, error_class, pb, reveal_audit};
 
 	#[test]
 	fn reveal_rpc_preserves_authenticated_audit_evidence() {
@@ -1019,6 +1021,6 @@ mod tests {
 			ExecutionReceipt::default(),
 		)
 		.status(Some(401));
-		assert_eq!(error_class(&error), pb::credential_health::ErrorClass::Authentication,);
+		assert_eq!(error_class(&error), credential_health::ErrorClass::Authentication,);
 	}
 }

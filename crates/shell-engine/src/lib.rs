@@ -92,8 +92,12 @@ macro_rules! minus_or_plus_flag_arg {
 }
 
 #[cfg(test)]
-/// Result type for tests that propagate heterogeneous errors.
-pub(crate) type TestResult<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
+mod test_result {
+	use std::{error, result};
+
+	/// Result type for tests that propagate heterogeneous errors.
+	pub(crate) type TestResult<T, E = Box<dyn error::Error>> = result::Result<T, E>;
+}
 
 pub use commands::{CommandArg, ExecutionContext};
 pub use error::{BuiltinError, Error, ErrorKind};
@@ -109,4 +113,6 @@ pub use shell::{
 	ShellFd, ShellState,
 };
 pub use sourceinfo::SourceInfo;
+#[cfg(test)]
+pub(crate) use test_result::TestResult;
 pub use variables::{ShellValue, ShellVariable};

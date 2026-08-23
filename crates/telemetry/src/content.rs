@@ -9,6 +9,8 @@
 //! It is applied to each summarized string before its UTF-16 length bound, and
 //! again at final JSON serialization to cover full capture.
 
+use std::{iter, slice};
+
 use opentelemetry::KeyValue;
 use serde_json::{Map, Value, json};
 
@@ -176,9 +178,9 @@ fn serialize_full_system_instructions(system_prompt: Option<&Value>) -> Option<S
 
 fn system_prompt_parts(
 	system_prompt: Option<&Value>,
-) -> impl Clone + DoubleEndedIterator<Item = &str> + std::iter::FusedIterator + '_ {
+) -> impl Clone + DoubleEndedIterator<Item = &str> + iter::FusedIterator + '_ {
 	let parts = match system_prompt {
-		Some(value @ Value::String(text)) if !text.is_empty() => std::slice::from_ref(value),
+		Some(value @ Value::String(text)) if !text.is_empty() => slice::from_ref(value),
 		Some(Value::Array(parts)) => parts.as_slice(),
 		_ => &[],
 	};
@@ -399,6 +401,9 @@ fn json_string(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+
+	use std::{env, process};
+
 	use opentelemetry::Value as AttributeValue;
 	use serde_json::{Value, json};
 
@@ -575,10 +580,10 @@ mod tests {
 
 	fn run_redaction_test_isolated(test_name: &str) -> bool {
 		const CHILD_ENV: &str = "OMP_TELEMETRY_REDACTION_TEST_CHILD";
-		if std::env::var_os(CHILD_ENV).is_some() {
+		if env::var_os(CHILD_ENV).is_some() {
 			return false;
 		}
-		let status = std::process::Command::new(std::env::current_exe().unwrap())
+		let status = process::Command::new(env::current_exe().unwrap())
 			.args(["--exact", test_name])
 			.env(CHILD_ENV, "1")
 			.status()

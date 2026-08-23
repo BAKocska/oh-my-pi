@@ -1,6 +1,9 @@
 //! Compact, namespace-safe location value types.
 
-use std::fmt;
+use std::{
+	error,
+	fmt::{self, Display},
+};
 
 use crate::Str;
 
@@ -27,7 +30,7 @@ pub enum LocationError {
 	InvalidUri,
 }
 
-impl fmt::Display for LocationError {
+impl Display for LocationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Empty => formatter.write_str("location must not be empty"),
@@ -40,7 +43,7 @@ impl fmt::Display for LocationError {
 	}
 }
 
-impl std::error::Error for LocationError {}
+impl error::Error for LocationError {}
 
 macro_rules! path_type {
 	($name:ident, $doc:literal) => {
@@ -68,7 +71,7 @@ macro_rules! path_type {
 			}
 		}
 
-		impl fmt::Display for $name {
+		impl Display for $name {
 			fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 				formatter.write_str(self.as_str())
 			}
@@ -207,7 +210,7 @@ impl ToolPath {
 	}
 }
 
-impl fmt::Display for ToolPath {
+impl Display for ToolPath {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.as_str())
 	}
@@ -329,7 +332,7 @@ impl ArtifactUrl {
 	}
 }
 
-impl fmt::Display for ArtifactUrl {
+impl Display for ArtifactUrl {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.as_str())
 	}
@@ -404,7 +407,7 @@ macro_rules! typed_url {
 			}
 		}
 
-		impl fmt::Display for $name {
+		impl Display for $name {
 			fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 				formatter.write_str(self.as_str())
 			}
@@ -456,7 +459,7 @@ impl WorkspaceUri {
 	}
 }
 
-impl fmt::Display for WorkspaceUri {
+impl Display for WorkspaceUri {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.as_str())
 	}

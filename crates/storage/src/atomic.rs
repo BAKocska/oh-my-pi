@@ -5,7 +5,9 @@
 //! the destination untouched.
 
 use std::{
+	fs,
 	fs::{File, OpenOptions},
+	io,
 	io::Write as _,
 	path::{Path, PathBuf},
 };
@@ -25,7 +27,7 @@ pub enum Error {
 		path:   PathBuf,
 		/// Underlying filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// The synchronous guard refused publication.
 	#[error("atomic file commit guard refused publication")]
@@ -45,7 +47,7 @@ pub fn commit(path: &Path, bytes: &[u8], guard: impl FnOnce() -> bool) -> Result
 pub fn commit_with(
 	path: &Path,
 	guard: impl FnOnce() -> bool,
-	write: impl FnOnce(&mut File) -> std::io::Result<()>,
+	write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> Result<(), Error> {
 	let parent = path.parent().ok_or(Error::MissingParent)?;
 	let name = path
@@ -56,9 +58,9 @@ pub fn commit_with(
 	let temporary = parent.join(format!(".{name}.{nonce}.tmp"));
 	let result = commit_inner(path, &temporary, guard, write);
 	if result.is_err() {
-		match std::fs::remove_file(&temporary) {
+		match fs::remove_file(&temporary) {
 			Ok(()) => {},
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 			Err(_) => {},
 		}
 	}
@@ -69,7 +71,7 @@ fn commit_inner(
 	path: &Path,
 	temporary: &Path,
 	guard: impl FnOnce() -> bool,
-	write: impl FnOnce(&mut File) -> std::io::Result<()>,
+	write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> Result<(), Error> {
 	let mut file = OpenOptions::new()
 		.write(true)
@@ -83,8 +85,7 @@ fn commit_inner(
 	if !guard() {
 		return Err(Error::GuardRefused);
 	}
-	std::fs::rename(temporary, path)
-		.map_err(|source| Error::Io { path: path.to_owned(), source })?;
+	fs::rename(temporary, path).map_err(|source| Error::Io { path: path.to_owned(), source })?;
 	sync_parent(path)?;
 	Ok(())
 }
@@ -108,7 +109,7 @@ mod tests {
 	fn guard_refusal_keeps_prior_file() {
 		let directory = tempdir().expect("temporary directory");
 		let path = directory.path().join("state.json");
-		std::fs::write(&path, b"old").expect("seed file");
+		fs::write(&path, b"old").expect("seed file");
 		assert!(matches!(commit(&path, b"new", || false), Err(Error::GuardRefused)));
 		assert_eq!(std::fs::read(path).expect("read destination"), b"old");
 	}
@@ -117,7 +118,7 @@ mod tests {
 	fn accepted_commit_replaces_whole_file() {
 		let directory = tempdir().expect("temporary directory");
 		let path = directory.path().join("state.json");
-		std::fs::write(&path, b"old").expect("seed file");
+		fs::write(&path, b"old").expect("seed file");
 		commit(&path, b"new", || true).expect("commit");
 		assert_eq!(std::fs::read(path).expect("read destination"), b"new");
 	}

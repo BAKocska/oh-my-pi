@@ -120,7 +120,7 @@ impl Component for TranscriptView {
 mod tests {
 	use super::TranscriptView;
 	use crate::{
-		component::{Cached, Component},
+		component::{Cached, Component, PaintCtx, next_slot},
 		context::UiContext,
 		frame::Rect,
 		props::Props,
@@ -132,7 +132,7 @@ mod tests {
 	}
 	impl MockChild {
 		fn new() -> Self {
-			Self { props: Props::new(), slot: crate::component::next_slot() }
+			Self { props: Props::new(), slot: next_slot() }
 		}
 	}
 	impl Component for MockChild {
@@ -158,7 +158,7 @@ mod tests {
 
 		fn place(&mut self, _ctx: &UiContext, _content: Rect) {}
 
-		fn paint(&mut self, _pc: &mut crate::component::PaintCtx<'_>, _rect: Rect) {}
+		fn paint(&mut self, _pc: &mut PaintCtx<'_>, _rect: Rect) {}
 	}
 
 	#[test]

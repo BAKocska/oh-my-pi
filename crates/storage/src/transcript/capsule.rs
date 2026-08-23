@@ -1,6 +1,6 @@
 //! Peek-free dialect defaults and replay-capsule overlays.
 
-use std::{collections::BTreeMap, iter::FusedIterator};
+use std::{collections::BTreeMap, iter, iter::FusedIterator};
 
 use omp_core::{Str, sf};
 use serde_json::{Map, Value, json, value::RawValue};
@@ -315,7 +315,7 @@ fn source_texts<'a>(
 ) -> impl Clone + DoubleEndedIterator<Item = &'a str> + FusedIterator + 'a {
 	let kind = ctx.kind;
 	let following = ctx.following;
-	std::iter::once(kind)
+	iter::once(kind)
 		.chain(following.iter().copied())
 		.filter_map(block_text)
 }

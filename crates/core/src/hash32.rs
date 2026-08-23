@@ -5,7 +5,12 @@
 //! one buffer; [`Hash32::hasher`] returns an incremental [`Hasher`] for
 //! multi-part input.
 
-use std::{fmt, io, str::FromStr};
+use std::{
+	fmt::{self, Display},
+	io,
+	path::Path,
+	str::FromStr,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
@@ -75,7 +80,7 @@ impl Hasher {
 	///
 	/// # Errors
 	/// Propagates the underlying open/map failure.
-	pub fn update_mmap(&mut self, path: impl AsRef<std::path::Path>) -> io::Result<&mut Self> {
+	pub fn update_mmap(&mut self, path: impl AsRef<Path>) -> io::Result<&mut Self> {
 		self.0.update_mmap(path)?;
 		Ok(self)
 	}
@@ -111,7 +116,7 @@ impl From<Hash32> for [u8; 32] {
 	}
 }
 
-impl fmt::Display for Hash32 {
+impl Display for Hash32 {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.to_hex().as_str())
 	}
@@ -119,7 +124,7 @@ impl fmt::Display for Hash32 {
 
 impl fmt::Debug for Hash32 {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		fmt::Display::fmt(self, formatter)
+		Display::fmt(self, formatter)
 	}
 }
 
@@ -199,6 +204,9 @@ impl<'de> Deserialize<'de> for Hash32 {
 
 #[cfg(test)]
 mod tests {
+
+	use std::{array, str};
+
 	use super::{Hash32, Hash32ParseError};
 
 	const HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
@@ -213,7 +221,7 @@ mod tests {
 
 	#[test]
 	fn hash32_display_and_debug_are_lowercase_hex() {
-		let hash = Hash32::new(std::array::from_fn(|index| index as u8));
+		let hash = Hash32::new(array::from_fn(|index| index as u8));
 		assert_eq!(hash.to_string(), HEX);
 		assert_eq!(format!("{hash:?}"), HEX);
 	}
@@ -226,7 +234,7 @@ mod tests {
 
 		let mut non_hex = HEX.as_bytes().to_owned();
 		non_hex[0] = b'g';
-		let non_hex = std::str::from_utf8(&non_hex).unwrap();
+		let non_hex = str::from_utf8(&non_hex).unwrap();
 		assert_eq!(non_hex.parse::<Hash32>(), Err(Hash32ParseError::InvalidHex));
 
 		assert!(serde_json::from_str::<Hash32>(&format!("\"{uppercase}\"")).is_err());

@@ -1,9 +1,14 @@
 //! Reproducible extension locks and local installation records.
 
-use std::{collections::BTreeMap, fs, io, path::Path};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	fs, io,
+	path::{Path, PathBuf},
+};
 
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
+use toml::map;
 
 use super::{ExtensionCode, ExtensionError, Layer, TrustTier};
 
@@ -147,7 +152,7 @@ impl LockFile {
 				"lock does not use first-index",
 			));
 		}
-		let mut ids = std::collections::BTreeSet::new();
+		let mut ids = BTreeSet::new();
 		for extension in &self.extensions {
 			if !ids.insert(&extension.id) {
 				return Err(ExtensionError::new(
@@ -285,7 +290,7 @@ pub struct InstalledExtension {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedSite {
 	/// Absolute managed site-tree path.
-	pub path:       std::path::PathBuf,
+	pub path:       PathBuf,
 	/// Content-addressed site-tree key.
 	pub key:        Str,
 	/// Resolution layer.
@@ -297,7 +302,7 @@ pub struct MaterializedSite {
 	/// Resolution fingerprint.
 	pub resolution: Str,
 	/// Source lock path when a durable lock produced the tree.
-	pub lock:       Option<std::path::PathBuf>,
+	pub lock:       Option<PathBuf>,
 }
 
 /// Builds the verified UTF-8 JSON envelope consumed by
@@ -505,7 +510,7 @@ pub(crate) fn atomic_toml<T: Serialize>(path: &Path, value: &T) -> io::Result<()
 
 /// Builds the source table used by reproducible lock entries.
 pub fn index_source(index: &str, distribution: &Str) -> toml::Value {
-	let mut source = toml::map::Map::new();
+	let mut source = map::Map::new();
 	source.insert("index".to_owned(), toml::Value::String(index.to_owned()));
 	source.insert("dist".to_owned(), toml::Value::String(distribution.to_string()));
 	toml::Value::Table(source)

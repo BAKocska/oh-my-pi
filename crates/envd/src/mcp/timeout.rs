@@ -1,6 +1,6 @@
 //! Typed MCP timeout precedence and cancellation composition.
 
-use std::{future::Future, time::Duration};
+use std::{env, future::Future, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 
@@ -20,7 +20,7 @@ impl McpTimeout {
 	/// Resolves process override, then per-mount value, then global value, then
 	/// the pi thirty-second default. Invalid environment values are ignored.
 	pub fn resolve(global: Option<Duration>, mount_ms: Option<u64>) -> Self {
-		Self::resolve_with(std::env::var(MCP_TIMEOUT_ENV).ok().as_deref(), global, mount_ms)
+		Self::resolve_with(env::var(MCP_TIMEOUT_ENV).ok().as_deref(), global, mount_ms)
 	}
 
 	fn resolve_with(raw: Option<&str>, global: Option<Duration>, mount_ms: Option<u64>) -> Self {
@@ -84,6 +84,8 @@ pub enum McpDeadlineError {
 
 #[cfg(test)]
 mod tests {
+	use std::future;
+
 	use super::*;
 
 	#[test]
@@ -107,7 +109,7 @@ mod tests {
 		let cancel = CancellationToken::new();
 		cancel.cancel();
 		let result = McpTimeout::Disabled
-			.run(&cancel, std::future::pending::<()>())
+			.run(&cancel, future::pending::<()>())
 			.await;
 		assert_eq!(result, Err(McpDeadlineError::Cancelled));
 	}

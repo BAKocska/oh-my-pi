@@ -1,6 +1,6 @@
 //! Analytic geometry and a compact bounding-volume hierarchy for ray tracing.
 
-use std::f32::consts::PI;
+use std::{f32::consts::PI, mem};
 
 use super::{Material, Ray, Vec3, vec3};
 
@@ -120,7 +120,7 @@ impl Aabb {
 			let mut near = (slab_min - origin) * inverse;
 			let mut far = (slab_max - origin) * inverse;
 			if near > far {
-				std::mem::swap(&mut near, &mut far);
+				mem::swap(&mut near, &mut far);
 			}
 			t_min = t_min.max(near);
 			t_max = t_max.min(far);

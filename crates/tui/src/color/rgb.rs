@@ -1,21 +1,17 @@
-use super::{Components, CssColor};
+use super::{Components, CssColor, alpha, number_or_percent};
 
 /// Parses legacy and modern CSS RGB component syntax.
 pub(super) fn parse(body: &str) -> Option<CssColor> {
-	let (channels, alpha) = Components::split(body)?.three()?;
+	let (channels, alpha_token) = Components::split(body)?.three()?;
 	let red = channel(channels[0])?;
 	let green = channel(channels[1])?;
 	let blue = channel(channels[2])?;
-	let alpha = super::alpha(alpha)?;
+	let alpha = alpha(alpha_token)?;
 	Some(CssColor::Rgba(red, green, blue, alpha))
 }
 
 fn channel(token: &str) -> Option<u8> {
-	Some(
-		super::number_or_percent(token, 255.0)?
-			.clamp(0.0, 255.0)
-			.round() as u8,
-	)
+	Some(number_or_percent(token, 255.0)?.clamp(0.0, 255.0).round() as u8)
 }
 
 #[cfg(test)]

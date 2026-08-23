@@ -1,6 +1,6 @@
 //! Standalone inspection and testing for the active TTSR registry.
 
-use std::{io::Read as _, path::Path};
+use std::{env, fs, io, io::Read as _, path::Path};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{TtsrMatchContext, TtsrRegistry, TtsrSource};
@@ -11,9 +11,7 @@ use crate::cli::{TtsrArgs, TtsrCommand, TtsrSourceArg};
 
 /// Lists active rules or evaluates snippets/files without starting a session.
 pub fn run(args: TtsrArgs) -> miette::Result<()> {
-	let root = args
-		.root
-		.unwrap_or(std::env::current_dir().into_diagnostic()?);
+	let root = args.root.unwrap_or(env::current_dir().into_diagnostic()?);
 	let content = omp_driver::discovery::active_content_snapshots(&root);
 	let (mut registry, diagnostics) = omp_driver::rulebook::ttsr_registry(content.rules.as_ref());
 	for diagnostic in diagnostics {
@@ -25,7 +23,7 @@ pub fn run(args: TtsrArgs) -> miette::Result<()> {
 			let text = input(snippet, file.as_deref())?;
 			let candidate = path
 				.as_deref()
-				.or(file.as_deref().and_then(std::path::Path::to_str))
+				.or(file.as_deref().and_then(Path::to_str))
 				.unwrap_or("snippet.txt");
 			evaluate(&mut registry, &text, candidate, &rule, source, &tool, verbose, json)
 		},
@@ -136,11 +134,11 @@ fn scan(
 		if candidate.size.is_some_and(|size| size > max_bytes as f64) {
 			continue;
 		}
-		let metadata = std::fs::metadata(&candidate.path).into_diagnostic()?;
+		let metadata = fs::metadata(&candidate.path).into_diagnostic()?;
 		if metadata.len() > max_bytes {
 			continue;
 		}
-		let Ok(text) = std::fs::read_to_string(&candidate.path) else {
+		let Ok(text) = fs::read_to_string(&candidate.path) else {
 			continue;
 		};
 		let path = candidate.path.to_string_lossy();
@@ -186,17 +184,13 @@ fn input(snippet: Option<String>, file: Option<&Path>) -> miette::Result<String>
 		(Some(snippet), None) => Ok(snippet),
 		(None, Some(path)) if path == Path::new("-") => {
 			let mut text = String::new();
-			std::io::stdin()
-				.read_to_string(&mut text)
-				.into_diagnostic()?;
+			io::stdin().read_to_string(&mut text).into_diagnostic()?;
 			Ok(text)
 		},
-		(None, Some(path)) => std::fs::read_to_string(path).into_diagnostic(),
+		(None, Some(path)) => fs::read_to_string(path).into_diagnostic(),
 		(None, None) => {
 			let mut text = String::new();
-			std::io::stdin()
-				.read_to_string(&mut text)
-				.into_diagnostic()?;
+			io::stdin().read_to_string(&mut text).into_diagnostic()?;
 			Ok(text)
 		},
 	}

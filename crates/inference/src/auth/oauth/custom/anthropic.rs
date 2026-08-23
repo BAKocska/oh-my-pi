@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{mem, sync::Arc, time::Duration};
 
 use futures::{FutureExt, future::BoxFuture};
 use http::{
@@ -14,8 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::super::{
 	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthError,
-	OAuthHttpClient, OAuthHttpRequest, OAuthTokenSet, callback_code, parse_http_url, provider_error,
-	receive_callback_input, start_callback_server,
+	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTokenSet, callback_code,
+	parse_http_url, provider_error, receive_callback_input, start_callback_server,
 };
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
@@ -201,13 +201,13 @@ fn post_json<T: Serialize + ?Sized>(
 		Method::POST,
 		parse_http_url(url)?.as_str(),
 		headers,
-		Some(SecretString::from(std::mem::take(&mut *body))),
+		Some(SecretString::from(mem::take(&mut *body))),
 	)
 	.map_err(Into::into)
 }
 
 fn token_response(
-	response: super::super::OAuthHttpResponse,
+	response: OAuthHttpResponse,
 	fallback_refresh: Option<SecretString>,
 	require_refresh: bool,
 ) -> Result<OAuthTokenSet, OAuthError> {
@@ -300,7 +300,7 @@ async fn bootstrap_identity(
 		})
 		.map_err(|_| OAuthError::MalformedResponse)?,
 	);
-	Ok(Some(SecretString::from(std::mem::take(&mut *identity))))
+	Ok(Some(SecretString::from(mem::take(&mut *identity))))
 }
 
 fn authorization_code(
@@ -321,7 +321,7 @@ fn authorization_code(
 		return Err(OAuthError::StateMismatch);
 	}
 	let mut code = Zeroizing::new(code.to_owned());
-	Ok(SecretString::from(std::mem::take(&mut *code)))
+	Ok(SecretString::from(mem::take(&mut *code)))
 }
 
 fn required(value: Option<&str>) -> Result<&str, OAuthError> {
@@ -392,8 +392,12 @@ mod tests {
 	use omp_catalog::provider::PrincipalResolution;
 	use parking_lot::Mutex;
 	use serde_json::Value;
+	use url::Url;
 
-	use super::*;
+	use super::{
+		super::super::{OAuthHttpResponse, OAuthTransportError},
+		*,
+	};
 	use crate::{
 		answer::{AuthEvent, AuthResponse},
 		auth::{
@@ -412,7 +416,7 @@ mod tests {
 	}
 
 	struct ScriptedHttp {
-		response: Mutex<Option<super::super::super::OAuthHttpResponse>>,
+		response: Mutex<Option<OAuthHttpResponse>>,
 		request:  Mutex<RecordedRequest>,
 	}
 
@@ -420,10 +424,7 @@ mod tests {
 		fn execute(
 			&self,
 			request: OAuthHttpRequest,
-		) -> BoxFuture<
-			'_,
-			Result<super::super::super::OAuthHttpResponse, super::super::super::OAuthTransportError>,
-		> {
+		) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
 			let (method, url, headers, body) = request.into_parts();
 			*self.request.lock() = RecordedRequest {
 				method:  Some(method),
@@ -461,8 +462,8 @@ mod tests {
 		}
 	}
 
-	fn response(body: &str) -> super::super::super::OAuthHttpResponse {
-		super::super::super::OAuthHttpResponse {
+	fn response(body: &str) -> OAuthHttpResponse {
+		OAuthHttpResponse {
 			status:  200,
 			headers: HeaderMap::new(),
 			body:    SecretString::from(body.to_owned()),
@@ -485,7 +486,7 @@ mod tests {
 			let AuthEvent::OpenUrl(url) = session.events.recv_async().await.unwrap().unwrap() else {
 				panic!("expected authorization URL")
 			};
-			let url = url::Url::parse(&url).unwrap();
+			let url = Url::parse(&url).unwrap();
 			let query = url.query_pairs().collect::<Vec<_>>();
 			assert_eq!(query[0], ("code".into(), "true".into()));
 			assert!(
@@ -589,7 +590,7 @@ mod tests {
 				else {
 					panic!("authorization URL")
 				};
-				let state = url::Url::parse(&url)
+				let state = Url::parse(&url)
 					.unwrap()
 					.query_pairs()
 					.find(|(name, _)| name == "state")

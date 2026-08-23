@@ -9,7 +9,7 @@
 //! - Command substitution expressions.
 //! - Arithmetic expansion expressions.
 
-use std::fmt::{Debug, Display};
+use std::fmt::{self, Debug, Display};
 
 use omp_core::Str;
 
@@ -126,7 +126,7 @@ pub enum Parameter {
 }
 
 impl Display for Parameter {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Positional(n) => write!(f, "${n}"),
 			Self::Special(s) => write!(f, "${s}"),
@@ -169,7 +169,7 @@ pub enum SpecialParameter {
 }
 
 impl Display for SpecialParameter {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::AllPositionalParameters { concatenate } => {
 				if *concatenate {
@@ -1136,9 +1136,11 @@ peg::parser! {
 	reason = "parser tests intentionally panic on invalid test fixtures"
 )]
 mod tests {
+	use std::io;
+
 	use insta::assert_ron_snapshot;
 
-	use super::*;
+	use super::{parse_assignment_word as parse_assignment, *};
 	use crate::parser::TestResult as Result;
 
 	#[derive(serde::Serialize, serde::Deserialize)]
@@ -1148,7 +1150,7 @@ mod tests {
 	}
 
 	fn test_parse(word: &str) -> Result<ParseTestResults<'_>> {
-		let parsed = super::parse(word, &ParserOptions::default())?;
+		let parsed = parse(word, &ParserOptions::default())?;
 		Ok(ParseTestResults { input: word, result: parsed })
 	}
 
@@ -1168,7 +1170,7 @@ mod tests {
 	fn parse_tilde_after_colon() -> Result<()> {
 		let opts = ParserOptions { tilde_expansion_after_colon: true, ..ParserOptions::default() };
 
-		let parsed = super::parse("a:~", &opts)?;
+		let parsed = parse("a:~", &opts)?;
 
 		// Should have: Text("a:"), TildeExpansion("")
 		assert_eq!(parsed.len(), 2);
@@ -1198,10 +1200,10 @@ mod tests {
 
 	#[test]
 	fn parse_command_substitution() -> Result<()> {
-		super::expansion_parser::command_piece("echo", &ParserOptions::default())?;
-		super::expansion_parser::command_piece("hi", &ParserOptions::default())?;
-		super::expansion_parser::command("echo hi", &ParserOptions::default())?;
-		super::expansion_parser::command_substitution("$(echo hi)", &ParserOptions::default())?;
+		expansion_parser::command_piece("echo", &ParserOptions::default())?;
+		expansion_parser::command_piece("hi", &ParserOptions::default())?;
+		expansion_parser::command("echo hi", &ParserOptions::default())?;
+		expansion_parser::command_substitution("$(echo hi)", &ParserOptions::default())?;
 
 		assert_ron_snapshot!(test_parse("$(echo hi)")?);
 
@@ -1210,10 +1212,10 @@ mod tests {
 
 	#[test]
 	fn parse_command_substitution_with_embedded_quotes() -> Result<()> {
-		super::expansion_parser::command_piece("echo", &ParserOptions::default())?;
-		super::expansion_parser::command_piece(r#""hi""#, &ParserOptions::default())?;
-		super::expansion_parser::command(r#"echo "hi""#, &ParserOptions::default())?;
-		super::expansion_parser::command_substitution(r#"$(echo "hi")"#, &ParserOptions::default())?;
+		expansion_parser::command_piece("echo", &ParserOptions::default())?;
+		expansion_parser::command_piece(r#""hi""#, &ParserOptions::default())?;
+		expansion_parser::command(r#"echo "hi""#, &ParserOptions::default())?;
+		expansion_parser::command_substitution(r#"$(echo "hi")"#, &ParserOptions::default())?;
 
 		assert_ron_snapshot!(test_parse(r#"$(echo "hi")"#)?);
 		Ok(())
@@ -1327,7 +1329,7 @@ mod tests {
 		for input in inputs {
 			assert_ron_snapshot!(
 				super::parse_brace_expansions(input, &options)?
-					.ok_or_else(|| std::io::Error::other("expected parsed brace expansion"))?
+					.ok_or_else(|| io::Error::other("expected parsed brace expansion"))?
 			);
 		}
 
@@ -1336,11 +1338,11 @@ mod tests {
 
 	#[test]
 	fn parse_assignment_word() -> Result<()> {
-		super::parse_assignment_word("x=3")?;
-		super::parse_assignment_word("x=")?;
-		super::parse_assignment_word("x[3]=a")?;
-		super::parse_assignment_word("x[${y[3]}]=a")?;
-		super::parse_assignment_word("x[y[3]]=a")?;
+		parse_assignment("x=3")?;
+		parse_assignment("x=")?;
+		parse_assignment("x[3]=a")?;
+		parse_assignment("x[${y[3]}]=a")?;
+		parse_assignment("x[y[3]]=a")?;
 		Ok(())
 	}
 }

@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 use xutf::{TextBuf as _, Utf8};
 use zerocopy::FromBytes;
 
-use super::spec::{BLOCK_SIZE, GnuSparseContinuation, OldGnuHeader, UstarHeader};
+use super::spec::{BLOCK_SIZE, GnuSparseContinuation, GnuSparseEntry, OldGnuHeader, UstarHeader};
 use crate::{
 	Entry, Error, Limits, Result,
 	entry::{Storage, TarSparse, TarSparseExtent},
@@ -594,7 +594,7 @@ fn parse_old_gnu_sparse<R: Read + Seek>(
 }
 
 fn push_sparse_extent(
-	raw: &super::spec::GnuSparseEntry,
+	raw: &GnuSparseEntry,
 	extents: &mut SmallVec<TarSparseExtent, 4>,
 	logical_end: &mut u64,
 	stored_total: &mut u64,

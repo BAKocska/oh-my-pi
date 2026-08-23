@@ -1,6 +1,6 @@
 //! The `sleep` builtin, moved from `pi-shell`.
 
-use std::{future::Future, io::Write, time::Duration};
+use std::{future::Future, io::Write, result, time::Duration};
 
 use clap::Parser;
 use omp_shell_engine::{ExecutionContext, ExecutionExitCode, ExecutionResult, builtins};
@@ -22,8 +22,7 @@ impl builtins::Command for SleepCommand {
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,
 		context: ExecutionContext<'_, SE>,
-	) -> impl Future<Output = std::result::Result<ExecutionResult, omp_shell_engine::Error>> + Send
-	{
+	) -> impl Future<Output = result::Result<ExecutionResult, omp_shell_engine::Error>> + Send {
 		let durations = self.durations.clone();
 		async move {
 			if context.is_cancelled() {
@@ -54,7 +53,7 @@ impl builtins::Command for SleepCommand {
 
 #[cfg(test)]
 mod tests {
-	use std::io::Read;
+	use std::io::{self, Read};
 
 	use omp_shell_engine::{
 		ExecutionParameters, Shell,
@@ -129,7 +128,7 @@ mod tests {
 		let command = <SleepCommand as Command>::new(["sleep".into(), "-1".into()])
 			.expect("hyphenated operand should reach the builtin");
 
-		let (mut stderr_reader, stderr_writer) = std::io::pipe().expect("stderr pipe should open");
+		let (mut stderr_reader, stderr_writer) = io::pipe().expect("stderr pipe should open");
 		let mut params = ExecutionParameters::default();
 		params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(stderr_writer));
 		let mut shell = Shell::builder()
@@ -152,7 +151,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn invalid_duration_reports_original_diagnostic_and_exit_code() {
-		let (mut stderr_reader, stderr_writer) = std::io::pipe().expect("stderr pipe should open");
+		let (mut stderr_reader, stderr_writer) = io::pipe().expect("stderr pipe should open");
 		let mut params = ExecutionParameters::default();
 		params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(stderr_writer));
 		let mut shell = Shell::builder()

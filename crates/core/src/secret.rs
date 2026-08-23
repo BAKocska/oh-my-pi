@@ -4,9 +4,34 @@
 //! [`SecretString`] and [`SecretBox`] provide the import-compatible
 //! [`ExposeSecret`] surface used when a direct secret borrow is required.
 
-use std::fmt;
+use std::{fmt, fmt::Display, hint};
 
 use zeroize::{Zeroize, Zeroizing};
+
+/// Compares two byte strings in time independent of their contents.
+///
+/// Authentication paths (broker tokens, stats-server bearer secrets, token
+/// digests) must not leak how many leading bytes of a guess were correct.
+/// Lengths are treated as public and compared first; equal-length inputs are
+/// folded branch-free, so the running time depends only on the length.
+///
+/// ```
+/// use omp_core::secret::ct_eq;
+///
+/// assert!(ct_eq(b"token", b"token"));
+/// assert!(!ct_eq(b"token", b"toker"));
+/// assert!(!ct_eq(b"token", b"token-longer"));
+/// ```
+pub fn ct_eq(left: &[u8], right: &[u8]) -> bool {
+	if left.len() != right.len() {
+		return false;
+	}
+	let difference = left
+		.iter()
+		.zip(right)
+		.fold(0_u8, |difference, (left, right)| difference | (left ^ right));
+	hint::black_box(difference) == 0
+}
 
 /// Borrows the plaintext held by a secret wrapper.
 ///
@@ -139,7 +164,7 @@ impl fmt::Debug for Secret {
 	}
 }
 
-impl fmt::Display for Secret {
+impl Display for Secret {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("<redacted>")
 	}

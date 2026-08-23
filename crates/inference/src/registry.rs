@@ -2,9 +2,10 @@
 
 use std::{
 	collections::HashMap,
+	iter, ops,
 	sync::Arc,
 	task::{Context, Poll},
-	time::SystemTime,
+	time::{Instant, SystemTime},
 };
 
 use arc_swap::ArcSwap;
@@ -18,7 +19,7 @@ use crate::{
 	body::RetryDecision,
 	call::{Call, OperationCall},
 	catalog::{CatalogRevision, OperationKind, ProviderId, RouteDef, RouteId, snapshot::Catalog},
-	error::{Error, ErrorDetail, ErrorKind, RetryAction},
+	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	id::RequestId,
 	layer::{
 		ExecutionContext, LayerCall,
@@ -32,6 +33,7 @@ use crate::{
 	operation::usage::ConsoleUsageManager,
 	provider::ProviderService,
 	receipt::{AttemptOutcome, ExecutionReceipt, ReasonId},
+	settings,
 };
 
 /// Typed evidence explaining why a catalog route has no constructed service.
@@ -131,7 +133,7 @@ impl Registry {
 
 	/// Validates a planned call against current catalog and registry state
 	/// before route dispatch.
-	pub fn validate_plan(&self, call: &Call, now: std::time::Instant) -> Result<(), Error> {
+	pub fn validate_plan(&self, call: &Call, now: Instant) -> Result<(), Error> {
 		let plan = call.execution.as_ref().ok_or_else(|| {
 			Error::planning(
 				ErrorKind::InvalidRequest,
@@ -176,7 +178,7 @@ pub struct RegistrySnapshot {
 	registry: Arc<Registry>,
 }
 
-impl std::ops::Deref for RegistrySnapshot {
+impl ops::Deref for RegistrySnapshot {
 	type Target = Registry;
 
 	fn deref(&self) -> &Self::Target {
@@ -474,7 +476,7 @@ async fn dispatch_preplanned(
 	registry: Registry,
 	mut layered: LayerCall<Call>,
 ) -> Result<Answer, Error> {
-	registry.validate_plan(&layered.payload, std::time::Instant::now())?;
+	registry.validate_plan(&layered.payload, Instant::now())?;
 	let mut plan = layered
 		.payload
 		.execution
@@ -527,7 +529,7 @@ async fn dispatch_preplanned(
 		})?;
 		let deadline = layered.payload.deadline.or_else(|| {
 			layered.payload.budget.max_elapsed.and_then(|maximum| {
-				std::time::Instant::now().checked_add(maximum.saturating_sub(layered.context.elapsed()))
+				Instant::now().checked_add(maximum.saturating_sub(layered.context.elapsed()))
 			})
 		});
 		let body = match manager
@@ -555,7 +557,7 @@ async fn dispatch_preplanned(
 		});
 	}
 	let candidates = plan.fallbacks.iter().cloned().collect::<Vec<_>>();
-	for (index, fallback) in std::iter::once(None)
+	for (index, fallback) in iter::once(None)
 		.chain(candidates.iter().map(Some))
 		.enumerate()
 	{
@@ -592,7 +594,7 @@ async fn dispatch_preplanned(
 						(plan.fallback_scope.primary.as_ref(), plan.model.as_ref())
 					&& primary != selected
 				{
-					crate::settings::record_fallback(primary, selected);
+					settings::record_fallback(primary, selected);
 				}
 				return Ok(answer);
 			},
@@ -648,8 +650,7 @@ fn fallback_is_safe(error: &Error, has_next: bool) -> bool {
 		return false;
 	}
 	if error.receipt().attempts.is_empty() {
-		return error.phase == crate::error::ErrorPhase::Admission
-			&& error.kind == ErrorKind::QuotaExhausted;
+		return error.phase == ErrorPhase::Admission && error.kind == ErrorKind::QuotaExhausted;
 	}
 	error.receipt().attempts.last().is_some_and(|attempt| {
 		attempt.outcome != AttemptOutcome::FailedCommitted
@@ -701,6 +702,8 @@ fn duplicate_route_error(route: &RouteId<str>) -> Error {
 #[cfg(test)]
 mod tests {
 	use std::{
+		env, fs,
+		path::PathBuf,
 		sync::{
 			Arc,
 			atomic::{AtomicUsize, Ordering},
@@ -720,13 +723,21 @@ mod tests {
 			CredentialStore, HeadlessKeySource, KeyId,
 		},
 		body::{AttemptBodyEvidence, Replayability, RetryDecisionReason},
-		call::{AuthMethod, AuthRequest, LoginRequest, Target},
+		call::{
+			AuthMethod, AuthRequest, InferenceAttribution as CallInferenceAttribution, LoginRequest,
+			Target,
+		},
+		catalog::AuthSpecId as CatalogAuthSpecId,
 		error::ErrorPhase,
+		id::AccountId as IdAccountId,
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
 			RuntimeRouteEvidence,
 		},
-		receipt::{AttemptReceipt, Cost, ExecutionBudget, ProviderEvidence, Usage},
+		receipt::{
+			AttemptReceipt, Cost, ExecutionBudget as ReceiptExecutionBudget, ExecutionBudget,
+			ProviderEvidence, Usage,
+		},
 	};
 
 	#[derive(Clone, Copy)]
@@ -744,7 +755,7 @@ mod tests {
 		fn begin(
 			&self,
 			_request: LoginRequest,
-			_spec: crate::catalog::AuthSpecId,
+			_spec: CatalogAuthSpecId,
 		) -> futures::future::BoxFuture<'_, Result<AuthSession, Error>> {
 			async { Err(test_auth_error()) }.boxed()
 		}
@@ -755,7 +766,7 @@ mod tests {
 	impl AuthRefreshEngine for UnusedRefresh {
 		fn refresh(
 			&self,
-			_account: crate::id::AccountId,
+			_account: IdAccountId,
 		) -> futures::future::BoxFuture<'_, Result<AccountSummary, Error>> {
 			async { Err(test_auth_error()) }.boxed()
 		}
@@ -770,13 +781,13 @@ mod tests {
 		)
 	}
 
-	fn auth_manager(catalog: Arc<Catalog>) -> (AuthManager, std::path::PathBuf) {
+	fn auth_manager(catalog: Arc<Catalog>) -> (AuthManager, PathBuf) {
 		let suffix = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.unwrap()
 			.as_nanos();
-		let path = std::env::temp_dir()
-			.join(format!("omp-auth-manager-{}-{suffix}.sqlite", std::process::id()));
+		let path =
+			env::temp_dir().join(format!("omp-auth-manager-{}-{suffix}.sqlite", std::process::id()));
 		let store = Arc::new(
 			CredentialStore::open(
 				&path,
@@ -914,7 +925,7 @@ mod tests {
 
 	#[test]
 	fn failed_fallback_receipts_are_hidden_once_in_shared_context() {
-		let context = ExecutionContext::new(crate::receipt::ExecutionBudget::default());
+		let context = ExecutionContext::new(ReceiptExecutionBudget::default());
 		let mut failed = ExecutionReceipt::default();
 		failed.record_attempt(attempt(RetryDecision::Allow));
 		context.merge_receipt(&failed);
@@ -993,7 +1004,7 @@ mod tests {
 			deadline:    None,
 			budget:      budget.clone(),
 			session:     None,
-			attribution: crate::call::InferenceAttribution::core(),
+			attribution: CallInferenceAttribution::core(),
 			execution:   Some(Arc::new(plan)),
 			operation:   OperationCall::Auth(Arc::new(AuthRequest::ListAccounts { provider: None })),
 		};
@@ -1007,6 +1018,6 @@ mod tests {
 			matches!(answer.body, AnswerBody::Auth(AuthAnswer::Accounts(accounts)) if accounts.is_empty())
 		);
 		assert_eq!(wire_calls.load(Ordering::Relaxed), 0);
-		let _ = std::fs::remove_file(store_path);
+		let _ = fs::remove_file(store_path);
 	}
 }

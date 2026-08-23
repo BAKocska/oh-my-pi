@@ -1,8 +1,11 @@
 //! Ordered bounded finalization for non-interactive session owners.
 
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{future::Future, io, pin::Pin, time::Duration};
 
-use tokio::io::{AsyncWrite, AsyncWriteExt as _};
+use tokio::{
+	io::{AsyncWrite, AsyncWriteExt as _},
+	time,
+};
 
 /// Ordered finalization phase which exceeded its budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
@@ -64,7 +67,7 @@ pub struct FinalizerReport {
 	/// Phases cancelled after exceeding their bound, in execution order.
 	pub timed_out:    Vec<FinalizerPhase>,
 	/// Typed stdout flush failure, if flushing completed unsuccessfully.
-	pub stdout_error: Option<std::io::Error>,
+	pub stdout_error: Option<io::Error>,
 }
 
 /// Session-owned advisor, memory, stdout, and telemetry drain actions.
@@ -122,7 +125,7 @@ impl HeadlessFinalizerHandle {
 		let mut report = FinalizerReport::default();
 		run_action(self.advisor.take(), budget.advisor, FinalizerPhase::Advisor, &mut report).await;
 		run_action(self.mnemopi.take(), budget.mnemopi, FinalizerPhase::Mnemopi, &mut report).await;
-		match tokio::time::timeout(budget.stdout, stdout.flush()).await {
+		match time::timeout(budget.stdout, stdout.flush()).await {
 			Ok(Ok(())) => {},
 			Ok(Err(error)) => report.stdout_error = Some(error),
 			Err(_) => report.timed_out.push(FinalizerPhase::Stdout),
@@ -142,16 +145,17 @@ async fn run_action(
 	let Some(action) = action else {
 		return;
 	};
-	if tokio::time::timeout(budget, action()).await.is_err() {
+	if time::timeout(budget, action()).await.is_err() {
 		report.timed_out.push(phase);
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use std::{future, sync::Arc};
 
 	use parking_lot::Mutex;
+	use tokio::io::sink;
 
 	use super::*;
 
@@ -165,7 +169,7 @@ mod tests {
 		handle.set_mnemopi(move || async move { mnemopi.lock().push(FinalizerPhase::Mnemopi) });
 		let telemetry = Arc::clone(&order);
 		handle.set_telemetry(move || async move { telemetry.lock().push(FinalizerPhase::Telemetry) });
-		let mut stdout = tokio::io::sink();
+		let mut stdout = sink();
 		let report = handle
 			.finalize(&mut stdout, FinalizerBudget::success(Duration::from_secs(1)))
 			.await;
@@ -182,10 +186,10 @@ mod tests {
 	async fn timed_out_authority_does_not_skip_later_phases() {
 		let telemetry_ran = Arc::new(Mutex::new(false));
 		let mut handle = HeadlessFinalizerHandle::new();
-		handle.set_advisor(|| std::future::pending());
+		handle.set_advisor(|| future::pending());
 		let observed = Arc::clone(&telemetry_ran);
 		handle.set_telemetry(move || async move { *observed.lock() = true });
-		let mut stdout = tokio::io::sink();
+		let mut stdout = sink();
 		let report = handle
 			.finalize(&mut stdout, FinalizerBudget {
 				advisor:   Duration::from_millis(1),

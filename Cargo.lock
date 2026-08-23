@@ -6811,6 +6811,7 @@ dependencies = [
  "omp-tools",
  "omp-tui",
  "parking_lot",
+ "proptest",
  "prost",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
@@ -6867,6 +6868,7 @@ dependencies = [
  "strum",
  "thiserror 2.0.20",
  "tracing",
+ "url",
  "zeroize",
 ]
 
@@ -6890,7 +6892,9 @@ dependencies = [
  "parking_lot",
  "pipewire",
  "reis",
+ "strum",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "uiautomation",
  "windows-sys 0.61.2",

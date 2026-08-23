@@ -1,3 +1,4 @@
+use std::result;
 /// Errors that can occur during base-N encoding/decoding operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DecodeError {
@@ -16,4 +17,4 @@ pub enum DecodeError {
 }
 
 /// Result type for base-N operations.
-pub type Result<T, E = DecodeError> = std::result::Result<T, E>;
+pub type Result<T, E = DecodeError> = result::Result<T, E>;

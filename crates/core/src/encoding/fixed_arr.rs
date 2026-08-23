@@ -8,7 +8,7 @@
 
 use std::{
 	borrow::{Borrow, BorrowMut},
-	fmt::{self, Write},
+	fmt::{self, Display, Write},
 	ops::{Deref, DerefMut},
 };
 
@@ -200,13 +200,13 @@ impl<const N: usize> BorrowMut<str> for ArrayStr<N> {
 impl<const N: usize> fmt::Debug for ArrayStr<N> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str("\"")?;
-		fmt::Display::fmt(self, f)?;
+		Display::fmt(self, f)?;
 		f.write_str("\"")?;
 		Ok(())
 	}
 }
 
-impl<const N: usize> fmt::Display for ArrayStr<N> {
+impl<const N: usize> Display for ArrayStr<N> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		if self.1 as usize == N * 2 && f.alternate() {
 			f.write_str("0x")?;

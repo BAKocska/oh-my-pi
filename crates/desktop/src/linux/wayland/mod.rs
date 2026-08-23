@@ -5,6 +5,9 @@ mod portal;
 
 use image::RgbaImage;
 
+use self::libei::Libei;
+#[cfg(feature = "wayland-pipewire")]
+use super::actor::capture;
 use crate::{
 	backend::{AxBackend, Backend, DeliveryMode, PointerEvent},
 	error::{CoreResult, DesktopError},
@@ -24,7 +27,7 @@ pub struct WaylandBackend {
 	display:     DisplaySelector,
 	ax:          Option<AtSpiAx>,
 	ax_error:    Option<DesktopError>,
-	input:       Option<libei::Libei>,
+	input:       Option<Libei>,
 	input_error: Option<DesktopError>,
 	displays:    Vec<DesktopDisplay>,
 }
@@ -52,10 +55,10 @@ impl WaylandBackend {
 		Ok(())
 	}
 
-	fn prepare_input(&mut self, target: &Target, kind: &str) -> CoreResult<&mut libei::Libei> {
+	fn prepare_input(&mut self, target: &Target, kind: &str) -> CoreResult<&mut Libei> {
 		Self::window_input_error(target, kind)?;
 		if self.input.is_none() && self.input_error.is_none() {
-			match libei::Libei::new() {
+			match Libei::new() {
 				Ok(input) => self.input = Some(input),
 				Err(err) => self.input_error = Some(err),
 			}
@@ -165,7 +168,7 @@ impl Backend for WaylandBackend {
 		#[cfg(feature = "wayland-pipewire")]
 		{
 			self.selected_display_allowed()?;
-			let image = super::actor::capture()?;
+			let image = capture()?;
 			let display = Self::synthetic_display(&image);
 			self.displays = vec![display.clone()];
 			match target {
@@ -246,10 +249,11 @@ impl Backend for WaylandBackend {
 #[cfg(test)]
 mod tests {
 	use std::{
+		env, fs,
 		io::ErrorKind,
 		os::unix::net::UnixListener,
 		sync::{Mutex, mpsc},
-		thread,
+		thread, time,
 	};
 
 	use super::*;
@@ -268,8 +272,8 @@ mod tests {
 	}
 	fn with_fake_libei(action: impl FnOnce(&mut WaylandBackend)) -> bool {
 		let _guard = LIBEI_ENV_LOCK.lock().expect("lock LIBEI_SOCKET test");
-		let socket = std::env::temp_dir().join(format!("omp-libei-test-{}", std::process::id()));
-		let _ = std::fs::remove_file(&socket);
+		let socket = env::temp_dir().join(format!("omp-libei-test-{}", std::process::id()));
+		let _ = fs::remove_file(&socket);
 		let listener = UnixListener::bind(&socket).expect("bind fake libei socket");
 		listener
 			.set_nonblocking(true)
@@ -281,7 +285,7 @@ mod tests {
 					Ok(_) => return true,
 					Err(err) if err.kind() == ErrorKind::WouldBlock => {
 						if !matches!(
-							stop_rx.recv_timeout(std::time::Duration::from_millis(10)),
+							stop_rx.recv_timeout(time::Duration::from_millis(10)),
 							Err(mpsc::RecvTimeoutError::Timeout)
 						) {
 							return false;
@@ -291,18 +295,18 @@ mod tests {
 				}
 			}
 		});
-		let previous = std::env::var_os("LIBEI_SOCKET");
-		unsafe { std::env::set_var("LIBEI_SOCKET", &socket) };
+		let previous = env::var_os("LIBEI_SOCKET");
+		unsafe { env::set_var("LIBEI_SOCKET", &socket) };
 		let mut backend = WaylandBackend::new(DisplaySelector::All);
 		action(&mut backend);
 		let _ = stop_tx.send(());
 		if let Some(previous) = previous {
-			unsafe { std::env::set_var("LIBEI_SOCKET", previous) };
+			unsafe { env::set_var("LIBEI_SOCKET", previous) };
 		} else {
-			unsafe { std::env::remove_var("LIBEI_SOCKET") };
+			unsafe { env::remove_var("LIBEI_SOCKET") };
 		}
 		let connected = accepted.join().expect("fake libei listener");
-		let _ = std::fs::remove_file(socket);
+		let _ = fs::remove_file(socket);
 		connected
 	}
 
@@ -331,7 +335,7 @@ mod tests {
 		let err = backend
 			.type_text(&target, "hello", DeliveryMode::Foreground)
 			.expect_err("window foreground input must fail");
-		assert_eq!(err.code.as_str(), "BackgroundUnavailable");
+		assert_eq!(<&'static str>::from(err.code), "BackgroundUnavailable");
 		assert_eq!(
 			err.message,
 			"window w1 wayland-compositor-focus-only: Wayland cannot programmatically activate a \
@@ -346,7 +350,7 @@ mod tests {
 		let err = backend
 			.raise_window("w1")
 			.expect_err("Wayland window raise must fail");
-		assert_eq!(err.code.as_str(), "BackgroundUnavailable");
+		assert_eq!(<&'static str>::from(err.code), "BackgroundUnavailable");
 		assert_eq!(
 			err.message,
 			"window w1 wayland-compositor-focus-only: Wayland cannot programmatically activate a \
@@ -379,6 +383,6 @@ mod tests {
 		let err = backend
 			.capture(&Target::Desktop, &CaptureCaps::default())
 			.expect_err("capture must fail without the pipewire feature");
-		assert_eq!(err.code.as_str(), "CaptureFailed");
+		assert_eq!(<&'static str>::from(err.code), "CaptureFailed");
 	}
 }

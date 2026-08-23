@@ -4,14 +4,17 @@ use std::{
 	collections::BTreeMap,
 	env,
 	path::{Path, PathBuf},
+	slice,
 	sync::Arc,
 };
 
 use parking_lot::{Mutex, RwLock};
 
+use super::{migrate, migrate::MigrationError};
 use crate::{
-	DomainRevision, DynamicOption, FieldDescriptor, OptionProvider, Revision, SettingScope,
-	SettingsDomain, SettingsSnapshot, SnapshotPublisher, Subscription, deep_merge,
+	DomainRevision, DynamicOption, FieldDescriptor, LayerNormalizer, OptionProvider, Revision,
+	SettingScope, SettingsDomain, SettingsSnapshot, SnapshotError, SnapshotPublisher, Subscription,
+	ValidationError, deep_merge,
 	io::{
 		DocumentMutation, QuarantineDiagnostic, SettingsIoError, mutate_document, read_document,
 		read_or_quarantine,
@@ -107,7 +110,7 @@ impl SettingsManager {
 	pub fn open(paths: SettingsPaths) -> Result<Self, SettingsManagerError> {
 		let preflight = read_or_quarantine(&paths.global)?;
 		if let Some(data_dir) = paths.global.parent() {
-			super::migrate::migrate_legacy_settings(data_dir)?;
+			migrate::migrate_legacy_settings(data_dir)?;
 		}
 		let manager = Self::load(paths, false)?;
 		if let Some(diagnostic) = preflight.quarantine {
@@ -364,7 +367,7 @@ impl SettingsManager {
 		validate_document(&candidate)?;
 		match scope {
 			MutationScope::Global => {
-				let read = mutate_document(&self.paths.global, std::slice::from_ref(&mutation))?;
+				let read = mutate_document(&self.paths.global, slice::from_ref(&mutation))?;
 				if let Some(diagnostic) = read.quarantine {
 					self.record_quarantine(diagnostic);
 				}
@@ -375,7 +378,7 @@ impl SettingsManager {
 					.project
 					.as_ref()
 					.ok_or(SettingsManagerError::NoProjectScope)?;
-				let read = mutate_document(path, std::slice::from_ref(&mutation))?;
+				let read = mutate_document(path, slice::from_ref(&mutation))?;
 				if let Some(diagnostic) = read.quarantine {
 					self.record_quarantine(diagnostic);
 				}
@@ -482,7 +485,7 @@ fn panel_for_domain(domain: &str) -> &'static str {
 
 /// Applies every linked layer normalizer to one persisted document.
 fn normalize_layer(document: &mut toml::Table) {
-	for normalizer in inventory::iter::<crate::LayerNormalizer> {
+	for normalizer in inventory::iter::<LayerNormalizer> {
 		normalizer.apply(document);
 	}
 }
@@ -588,25 +591,37 @@ pub enum SettingsManagerError {
 	Io(#[from] SettingsIoError),
 	/// Legacy migration failed.
 	#[error(transparent)]
-	Migration(#[from] super::migrate::MigrationError),
+	Migration(#[from] MigrationError),
 	/// Typed schema validation failed.
 	#[error(transparent)]
-	Validation(#[from] crate::ValidationError),
+	Validation(#[from] ValidationError),
 	/// Typed snapshot projection failed.
 	#[error(transparent)]
 	Projection {
 		#[from]
-		source: crate::SnapshotError,
+		/// Snapshot conversion failure returned by a linked settings domain.
+		source: SnapshotError,
 	},
 	/// Linked domain fragments disagreed about a shared field contract.
 	#[error("conflicting linked settings field {path}")]
-	ConflictingField { path: &'static str },
+	ConflictingField {
+		/// Shared schema path claimed with incompatible field metadata.
+		path: &'static str,
+	},
 	/// No domain owns the requested path.
 	#[error("unsupported settings key {path}")]
-	UnsupportedKey { path: String },
+	UnsupportedKey {
+		/// Requested dotted key that no linked settings domain owns.
+		path: String,
+	},
 	/// The field cannot be written at the selected scope.
 	#[error("setting {path} cannot be written at scope {scope:?}")]
-	UnsupportedScope { path: &'static str, scope: MutationScope },
+	UnsupportedScope {
+		/// Owned schema path that rejects the requested persistence scope.
+		path:  &'static str,
+		/// Project or user scope selected for the rejected mutation.
+		scope: MutationScope,
+	},
 	/// Project scope was requested without a project root.
 	#[error("project settings scope is unavailable")]
 	NoProjectScope,
@@ -617,7 +632,7 @@ pub enum SettingsManagerError {
 
 #[cfg(test)]
 mod tests {
-	use std::collections::BTreeMap;
+	use std::{collections::BTreeMap, fs};
 
 	use serde::{Deserialize, Serialize};
 
@@ -724,11 +739,11 @@ mod tests {
 		let global = tree.path().join("global/config.toml");
 		let project = tree.path().join("project/.omp/config.toml");
 		let overlay = tree.path().join("overlay.toml");
-		std::fs::create_dir_all(global.parent().expect("global parent")).expect("global dir");
-		std::fs::create_dir_all(project.parent().expect("project parent")).expect("project dir");
-		std::fs::write(&global, "default_model = 'global'").expect("global");
-		std::fs::write(&project, "default_model = 'project'").expect("project");
-		std::fs::write(&overlay, "default_model = 'overlay'").expect("overlay");
+		fs::create_dir_all(global.parent().expect("global parent")).expect("global dir");
+		fs::create_dir_all(project.parent().expect("project parent")).expect("project dir");
+		fs::write(&global, "default_model = 'global'").expect("global");
+		fs::write(&project, "default_model = 'project'").expect("project");
+		fs::write(&overlay, "default_model = 'overlay'").expect("overlay");
 		let manager = SettingsManager::open(SettingsPaths {
 			global,
 			project: Some(project),

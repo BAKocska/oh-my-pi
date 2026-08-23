@@ -14,7 +14,8 @@ use crate::{
 	answer::{Answer, AnswerBody, NativeResponse, NativeResponseBody},
 	body::{AttemptBodyEvidence, RetryDecision},
 	call::{
-		NativeMethod, NativePath, NativePayload, NativeRequest, NativeResponseFraming, OperationCall,
+		Call, NativeMethod, NativePath, NativePayload, NativeRequest, NativeResponseFraming,
+		OperationCall,
 	},
 	catalog::OperationKind,
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
@@ -168,7 +169,7 @@ impl<S> NativeService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for NativeService<S>
+impl<S> Service<Call> for NativeService<S>
 where
 	S: Service<
 			OperationRequest<NativeRequest>,
@@ -186,7 +187,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let authorized = match &call.operation {
 			OperationCall::Native(request) => self
 				.policy
@@ -267,7 +268,7 @@ fn payload_len(payload: &NativePayload) -> Option<u64> {
 	}
 }
 
-fn wrong_operation(call: &crate::call::Call) -> Error {
+fn wrong_operation(call: &Call) -> Error {
 	Error::new(
 		ErrorKind::InternalInvariant,
 		ErrorPhase::Internal,

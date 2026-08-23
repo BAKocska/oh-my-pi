@@ -1,8 +1,10 @@
 //! Authenticated external CONTROL routing for session index and durable state.
 
 use std::{
-	collections::BTreeMap,
-	path::PathBuf,
+	collections::{BTreeMap, BTreeSet},
+	fmt::Display,
+	path::{Path, PathBuf},
+	str,
 	sync::Arc,
 	time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,9 +16,12 @@ use omp_agent::{
 	control::ControlSender,
 };
 use omp_core::{ArtifactUrl, Provenance, Str, sf};
-use omp_proto::toolhost::v1::{
-	ArtifactRow, JournalHostEnvelope, SessionRow, StateChanged as WireStateChanged,
-	StateValue as WireStateValue, UsageReport, journal_host_envelope,
+use omp_proto::{
+	inference::v1::{self, usage, value},
+	toolhost::v1::{
+		ArtifactRow, JournalHostEnvelope, SessionRow, StateChanged as WireStateChanged,
+		StateValue as WireStateValue, UsageReport, journal_host_envelope,
+	},
 };
 use omp_storage::{
 	blob::BlobRef,
@@ -29,6 +34,7 @@ use omp_storage::{
 		DurableRequest, GenerationFence, StateAuthority, StateChange, StateEntry, StateRevision,
 		StateScope, StateStore,
 	},
+	transcript,
 	transcript::SessionId,
 };
 use omp_tool::ArtifactLifetime;
@@ -36,18 +42,22 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value, json, value::RawValue};
 
 use super::{
-	blobs::{ArtifactMetadataStore, BlobHost, BlobId},
-	exthost::control::{
-		ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
-		ControlConnectionIdentity, ControlEffect, ControlProtocolError, ControlRequestContext,
-		ExternalJournalRequest, JournalConnectionIdentity, artifact_rows, journal_rows, session_rows,
-		usage_rows,
+	blobs::{ArtifactMetadata, ArtifactMetadataStore, BlobHost, BlobId},
+	exthost::{
+		context::LiveContextControlOwner,
+		control::{
+			ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
+			ControlConnectionIdentity, ControlEffect, ControlProtocolError, ControlRequestContext,
+			ExternalJournalRequest, JournalConnectionIdentity, artifact_rows, journal_rows,
+			session_rows, usage_rows,
+		},
 	},
 	schedules::{
 		DurableScheduleError, DurableScheduleHandle, ScheduleCaller, ScheduleDeliveryBackend,
 		open_durable_scheduler_unbound,
 	},
-	worker::ExternalJournalCall,
+	server::EnvdError,
+	worker::{ExternalJournalCall, WorkerError},
 };
 
 #[derive(Clone)]
@@ -88,10 +98,10 @@ impl ExternalJournalActor {
 		session_id: Str,
 		project_scope: Str,
 		project_path: Str,
-	) -> Result<Self, super::server::EnvdError> {
+	) -> Result<Self, EnvdError> {
 		let catalog = Arc::new(Mutex::new(
 			ArtifactCatalog::open(blobs.store())
-				.map_err(|error| super::server::EnvdError::Blob(Str::from(error.to_string())))?,
+				.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?,
 		));
 		let state_dir = blobs
 			.store()
@@ -101,13 +111,9 @@ impl ExternalJournalActor {
 			.to_path_buf();
 		let sessions_dir = state_dir.join("sessions");
 		let artifact_meta = ArtifactMetadataStore::open(blobs.store())
-			.map_err(|error| super::server::EnvdError::Blob(Str::from(error.to_string())))?;
+			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let schedules = open_durable_scheduler_unbound(&state_dir.join("agent-schedules.sqlite"))
-			.map_err(|error| {
-				super::server::EnvdError::Worker(super::worker::WorkerError::Protocol(Str::from(
-					error.to_string(),
-				)))
-			})?;
+			.map_err(|error| EnvdError::Worker(WorkerError::Protocol(Str::from(error.to_string()))))?;
 		let (sender, receiver) = flume::unbounded::<ExternalJournalCall>();
 		let agent = Arc::new(Mutex::new(None));
 		let actor_agent = Arc::clone(&agent);
@@ -175,11 +181,7 @@ impl ExternalJournalActor {
 	/// # Errors
 	///
 	/// Refuses a second binding rather than transferring session authority.
-	pub(crate) fn bind_agent(
-		&self,
-		id: u64,
-		sender: ControlSender,
-	) -> Result<(), super::server::EnvdError> {
+	pub(crate) fn bind_agent(&self, id: u64, sender: ControlSender) -> Result<(), EnvdError> {
 		self.bind_agent_with_host(id, sender, None)
 	}
 
@@ -188,13 +190,10 @@ impl ExternalJournalActor {
 		id: u64,
 		sender: ControlSender,
 		host: Option<AgentHostControl>,
-	) -> Result<(), super::server::EnvdError> {
+	) -> Result<(), EnvdError> {
 		let mut agent = self.agent.lock();
 		if agent.is_some() {
-			return Err(
-				super::worker::WorkerError::Protocol(sf!("agent journal CONTROL is already bound",))
-					.into(),
-			);
+			return Err(WorkerError::Protocol(sf!("agent journal CONTROL is already bound",)).into());
 		}
 		*agent = Some(AgentBinding { id, sender, host });
 		Ok(())
@@ -210,16 +209,12 @@ impl ExternalJournalActor {
 	pub(crate) async fn bind_schedule_delivery(
 		&self,
 		backend: Arc<dyn ScheduleDeliveryBackend>,
-	) -> Result<(), super::server::EnvdError> {
+	) -> Result<(), EnvdError> {
 		self
 			.schedules
 			.bind_delivery(backend)
 			.await
-			.map_err(|error| {
-				super::server::EnvdError::Worker(super::worker::WorkerError::Protocol(Str::from(
-					error.to_string(),
-				)))
-			})
+			.map_err(|error| EnvdError::Worker(WorkerError::Protocol(Str::from(error.to_string()))))
 	}
 
 	pub(crate) fn unbind_agent(&self, id: u64) {
@@ -269,7 +264,7 @@ impl ControlAuthorityFactory for PersistenceControlFactory {
 		let binding = self.actor.agent.lock().clone().ok_or_else(|| {
 			ControlCompositionError::unavailable("persistence", "active Agent owner is not bound")
 		})?;
-		let context = super::exthost::context::LiveContextControlOwner::new(
+		let context = LiveContextControlOwner::new(
 			Arc::clone(&identity),
 			self.actor.session_id.clone(),
 			binding.host.ok_or_else(|| {
@@ -297,7 +292,7 @@ struct PersistenceControlOwner {
 	actor:            ExternalJournalActor,
 	identity:         Arc<ControlConnectionIdentity>,
 	journal_identity: JournalConnectionIdentity,
-	context:          super::exthost::context::LiveContextControlOwner,
+	context:          LiveContextControlOwner,
 }
 
 impl PersistenceControlOwner {
@@ -915,7 +910,7 @@ impl PersistenceControlOwner {
 					.map_err(protocol_error)?;
 				let mut total_query = usage_query.clone();
 				total_query.group_by.clear();
-				total_query.bucket = omp_storage::index::UsageBucketWidth::None;
+				total_query.bucket = UsageBucketWidth::None;
 				let total = self
 					.actor
 					.sessions
@@ -1482,10 +1477,10 @@ fn artifact_row(record: &ArtifactRecord, session: &SessionId) -> Option<Artifact
 	})
 }
 
-fn cursor_props(cursor: u64) -> omp_proto::inference::v1::ValueMap {
-	omp_proto::inference::v1::ValueMap {
-		fields: BTreeMap::from([("next_cursor".to_owned(), omp_proto::inference::v1::Value {
-			kind: Some(omp_proto::inference::v1::value::Kind::Uint(cursor)),
+fn cursor_props(cursor: u64) -> v1::ValueMap {
+	v1::ValueMap {
+		fields: BTreeMap::from([("next_cursor".to_owned(), v1::Value {
+			kind: Some(value::Kind::Uint(cursor)),
 		})]),
 	}
 }
@@ -1521,11 +1516,12 @@ fn state_authority(
 }
 
 fn state_scope(scope: i32) -> Result<StateScope, Str> {
-	match omp_proto::toolhost::v1::StateScope::try_from(scope) {
-		Ok(omp_proto::toolhost::v1::StateScope::Session) => Ok(StateScope::Session),
-		Ok(omp_proto::toolhost::v1::StateScope::Project) => Ok(StateScope::Project),
-		Ok(omp_proto::toolhost::v1::StateScope::User) => Ok(StateScope::User),
-		Ok(omp_proto::toolhost::v1::StateScope::Organization) => Ok(StateScope::Organization),
+	use omp_proto::toolhost::v1;
+	match v1::StateScope::try_from(scope) {
+		Ok(v1::StateScope::Session) => Ok(StateScope::Session),
+		Ok(v1::StateScope::Project) => Ok(StateScope::Project),
+		Ok(v1::StateScope::User) => Ok(StateScope::User),
+		Ok(v1::StateScope::Organization) => Ok(StateScope::Organization),
 		_ => Err(sf!("Unsupported: invalid durable state scope")),
 	}
 }
@@ -1598,7 +1594,7 @@ fn artifact_error(error: ArtifactError) -> Str {
 	}
 }
 
-fn display_error(error: impl std::fmt::Display) -> Str {
+fn display_error(error: impl Display) -> Str {
 	Str::from(error.to_string())
 }
 fn required_string<'a>(
@@ -1617,7 +1613,7 @@ fn invalid_argument(name: &'static str, reason: &'static str) -> ControlProtocol
 		.with_details(json!({"field": name}))
 }
 
-fn protocol_error(message: impl std::fmt::Display) -> ControlProtocolError {
+fn protocol_error(message: impl Display) -> ControlProtocolError {
 	let message = message.to_string();
 	let code = message
 		.split_once(':')
@@ -1758,7 +1754,7 @@ fn state_journal_entry_json(
 }
 
 fn state_entry_json(entry: StateEntry) -> Result<Value, ControlProtocolError> {
-	let raw = std::str::from_utf8(entry.raw.as_ref())
+	let raw = str::from_utf8(entry.raw.as_ref())
 		.map_err(|_| ControlProtocolError::new("EntryUndecodable", "state entry is not UTF-8"))?;
 	let value = serde_json::from_str::<Value>(raw)
 		.map_err(|_| ControlProtocolError::new("EntryUndecodable", "state entry JSON is invalid"))?;
@@ -1927,11 +1923,11 @@ fn session_info_json(info: &SessionInfo) -> Value {
 	})
 }
 
-fn usage_json(usage: &omp_proto::inference::v1::Usage) -> Value {
-	let accuracy = match omp_proto::inference::v1::usage::Accuracy::try_from(usage.accuracy) {
-		Ok(omp_proto::inference::v1::usage::Accuracy::Exact) => "exact",
-		Ok(omp_proto::inference::v1::usage::Accuracy::Estimated) => "estimated",
-		Ok(omp_proto::inference::v1::usage::Accuracy::Mixed) => "mixed",
+fn usage_json(usage: &v1::Usage) -> Value {
+	let accuracy = match usage::Accuracy::try_from(usage.accuracy) {
+		Ok(usage::Accuracy::Exact) => "exact",
+		Ok(usage::Accuracy::Estimated) => "estimated",
+		Ok(usage::Accuracy::Mixed) => "mixed",
 		_ => "exact",
 	};
 	json!({
@@ -1951,7 +1947,7 @@ fn usage_json(usage: &omp_proto::inference::v1::Usage) -> Value {
 	})
 }
 
-fn cost_json(cost: &omp_proto::inference::v1::Cost) -> Value {
+fn cost_json(cost: &v1::Cost) -> Value {
 	json!({
 		"nanos_usd": cost.nanos_usd,
 		"estimated": cost.estimated,
@@ -1998,7 +1994,7 @@ fn empty_usage_bucket_json() -> Value {
 	})
 }
 
-fn artifact_ref_json(record: &ArtifactRecord, metadata: &super::blobs::ArtifactMetadata) -> Value {
+fn artifact_ref_json(record: &ArtifactRecord, metadata: &ArtifactMetadata) -> Value {
 	json!({
 		"id": record.ordinal.to_string(),
 		"hash": record.reference.hash.to_hex().as_str(),
@@ -2009,7 +2005,7 @@ fn artifact_ref_json(record: &ArtifactRecord, metadata: &super::blobs::ArtifactM
 
 fn artifact_stat_json(
 	record: &ArtifactRecord,
-	metadata: &super::blobs::ArtifactMetadata,
+	metadata: &ArtifactMetadata,
 	session: &SessionId,
 ) -> Value {
 	let lifetime: &'static str = record.lifetime.into();
@@ -2027,12 +2023,12 @@ fn artifact_stat_json(
 	})
 }
 fn historical_journal_page(
-	sessions_dir: &std::path::Path,
+	sessions_dir: &Path,
 	session: &SessionId,
 	arguments: &Map<String, Value>,
 ) -> Result<Value, ControlProtocolError> {
 	let path = sessions_dir.join(format!("{}.jsonl", session.0));
-	let reader = omp_storage::transcript::Reader::open(&path).map_err(protocol_error)?;
+	let reader = transcript::Reader::open(&path).map_err(protocol_error)?;
 	let since = arguments.get("since").and_then(Value::as_u64);
 	let cursor = arguments
 		.get("cursor")
@@ -2053,7 +2049,7 @@ fn historical_journal_page(
 			values
 				.iter()
 				.filter_map(Value::as_str)
-				.collect::<std::collections::BTreeSet<_>>()
+				.collect::<BTreeSet<_>>()
 		})
 		.unwrap_or_default();
 	let mut rows = Vec::with_capacity(201);
@@ -2064,10 +2060,10 @@ fn historical_journal_page(
 		{
 			continue;
 		}
-		let Some(omp_storage::transcript::Entry::Ok(event)) = reader.log().get(index) else {
+		let Some(transcript::Entry::Ok(event)) = reader.log().get(index) else {
 			continue;
 		};
-		let omp_storage::transcript::Kind::Custom(custom) = &event.kind else {
+		let transcript::Kind::Custom(custom) = &event.kind else {
 			continue;
 		};
 		if custom.kind().starts_with("omp.state.session.")
@@ -2110,7 +2106,7 @@ fn historical_journal_page(
 
 #[cfg(test)]
 mod tests {
-	use omp_agent::{Journal, JournalAuthor, JournalRequestStamp};
+	use omp_agent::{Journal, JournalAuthor, JournalRequestStamp, control::ControlMailboxEvent};
 	use omp_core::{ArtifactDigest, Principal, Provenance};
 	use omp_proto::toolhost::v1::{AdoptArtifact, PinArtifact, QueryJournal, StatArtifact};
 	use omp_storage::transcript::{Header, SessionId};
@@ -2213,10 +2209,9 @@ mod tests {
 		let owner = tokio::spawn(async move {
 			loop {
 				match mailbox.handle_next(&mut journal).await {
-					omp_agent::control::ControlMailboxEvent::Closed => break,
-					omp_agent::control::ControlMailboxEvent::JournalHandled
-					| omp_agent::control::ControlMailboxEvent::Rewind(_) => {},
-					omp_agent::control::ControlMailboxEvent::Campaign(command) => {
+					ControlMailboxEvent::Closed => break,
+					ControlMailboxEvent::JournalHandled | ControlMailboxEvent::Rewind(_) => {},
+					ControlMailboxEvent::Campaign(command) => {
 						command.reject_unavailable();
 					},
 				}

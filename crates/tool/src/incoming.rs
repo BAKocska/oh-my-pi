@@ -1,6 +1,7 @@
 //! Linear invocation framing layered over `omp-slopjson`.
 
 use std::{
+	any,
 	collections::VecDeque,
 	future::Future,
 	marker::PhantomData,
@@ -23,7 +24,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::{ArgIssue, ArgIssueKind, ArgPath, ArgSpecRegistry, Rev};
+use crate::{
+	ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry, Coerce, Repair, RepairKind, Rev,
+};
 
 /// One event in the client-to-executor invocation stream.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -246,7 +249,7 @@ pub struct FinalizedArgs {
 	raw:            Str,
 	effective:      Value,
 	effective_json: Str,
-	repairs:        SmallVec<crate::Repair, 4>,
+	repairs:        SmallVec<Repair, 4>,
 }
 
 impl FinalizedArgs {
@@ -267,7 +270,7 @@ impl FinalizedArgs {
 	}
 
 	/// Immutable parser, alias, coercion, and elision trail.
-	pub fn repairs(&self) -> &[crate::Repair] {
+	pub fn repairs(&self) -> &[Repair] {
 		&self.repairs
 	}
 }
@@ -404,11 +407,11 @@ enum CoercionResult {
 }
 
 struct AppliedCoercions {
-	steps:  SmallVec<(crate::Coerce, Str, Str), 2>,
+	steps:  SmallVec<(Coerce, Str, Str), 2>,
 	elided: bool,
 }
 
-fn apply_coercions(value: &mut Value, spec: &crate::ArgSpec) -> AppliedCoercions {
+fn apply_coercions(value: &mut Value, spec: &ArgSpec) -> AppliedCoercions {
 	let mut applied = AppliedCoercions { steps: SmallVec::new(), elided: false };
 	for coercion in &spec.coerce {
 		let before = Str::new(value.to_string());
@@ -431,11 +434,7 @@ fn apply_coercions(value: &mut Value, spec: &crate::ArgSpec) -> AppliedCoercions
 	applied
 }
 
-fn coerce_once(
-	coercion: crate::Coerce,
-	value: &Value,
-	allow_lossy: bool,
-) -> Option<CoercionResult> {
+fn coerce_once(coercion: Coerce, value: &Value, allow_lossy: bool) -> Option<CoercionResult> {
 	use crate::Coerce;
 	match coercion {
 		Coerce::LooseBool => match value {
@@ -592,17 +591,17 @@ fn canonicalize(
 	mut value: Value,
 	path: &SmallVec<ArgPath, 4>,
 	arg_specs: Option<(&Rev, &ArgSpecRegistry)>,
-	repairs: &mut SmallVec<crate::Repair, 4>,
+	repairs: &mut SmallVec<Repair, 4>,
 ) -> Option<Value> {
 	if let Some(spec) = arg_specs.and_then(|(rev, specs)| specs.get(rev, path)) {
 		let applied = apply_coercions(&mut value, spec);
 		for (coercion, before, after) in applied.steps {
-			repairs.push(crate::Repair {
+			repairs.push(Repair {
 				path:   spec.path.clone(),
-				kind:   if coercion == crate::Coerce::NullElision {
-					crate::RepairKind::Elision
+				kind:   if coercion == Coerce::NullElision {
+					RepairKind::Elision
 				} else {
-					crate::RepairKind::Coercion
+					RepairKind::Coercion
 				},
 				detail: sf!("{coercion}: {before} -> {after}"),
 			});
@@ -622,9 +621,9 @@ fn canonicalize(
 					&& parent
 						.is_some_and(|parent| !parent.additional_properties && !parent.from_union_branch)
 				{
-					repairs.push(crate::Repair {
+					repairs.push(Repair {
 						path:   candidate,
-						kind:   crate::RepairKind::Elision,
+						kind:   RepairKind::Elision,
 						detail: sf!("unrecognized key {key} -> <absent>"),
 					});
 					continue;
@@ -635,9 +634,9 @@ fn canonicalize(
 						_ => key.clone(),
 					};
 					if canonical_key != key {
-						repairs.push(crate::Repair {
+						repairs.push(Repair {
 							path:   spec.path.clone(),
-							kind:   crate::RepairKind::Alias,
+							kind:   RepairKind::Alias,
 							detail: sf!("{key} -> {canonical_key}"),
 						});
 					}
@@ -829,7 +828,7 @@ impl<'c> IncomingParams<'c> {
 			.await?
 			.effective()
 			.deserialize_into()
-			.map_err(|_| malformed_issue(std::any::type_name::<T>(), None))
+			.map_err(|_| malformed_issue(any::type_name::<T>(), None))
 	}
 
 	/// Waits for the explicit effect-authorization frame and returns the
@@ -922,9 +921,9 @@ impl<'c> IncomingParams<'c> {
 							omp_slopjson::RepairPathSegment::Index(index) => ArgPath::Index(*index as u64),
 						})
 						.collect();
-					repairs.push(crate::Repair {
+					repairs.push(Repair {
 						path,
-						kind: crate::RepairKind::Tolerance,
+						kind: RepairKind::Tolerance,
 						detail: sf!("{:?}: {} -> {}", repair.kind, repair.before, repair.after),
 					});
 				}
@@ -1105,7 +1104,7 @@ impl InterruptibleParams<'_, '_> {
 			.await?
 			.effective()
 			.deserialize_into()
-			.map_err(|_| malformed_issue(std::any::type_name::<T>(), None))
+			.map_err(|_| malformed_issue(any::type_name::<T>(), None))
 	}
 
 	/// Explicit commitment wait with interrupt observation.
@@ -1219,7 +1218,6 @@ mod tests {
 	use smallvec::smallvec;
 
 	use super::*;
-	use crate::ArgSpec;
 
 	const EXAMPLE: &str = r#"{"path":"résumé/💾"}"#;
 

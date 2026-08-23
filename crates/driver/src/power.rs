@@ -2,17 +2,16 @@
 
 mod settings;
 
-use std::{process::Child, sync::Arc};
+use std::{io, path::Path, process::Child, sync::Arc};
 
+use omp_settings::manager::SettingsManagerError;
 use parking_lot::Mutex;
 pub use settings::PowerSettings;
 use strum::{Display, EnumString};
 use thiserror::Error;
 
 /// Loads the configured sleep-prevention mode through the settings authority.
-pub fn configured(
-	data_dir: &std::path::Path,
-) -> Result<SleepPrevention, omp_settings::manager::SettingsManagerError> {
+pub fn configured(data_dir: &Path) -> Result<SleepPrevention, SettingsManagerError> {
 	Ok(settings::current(data_dir)?.sleep_prevention)
 }
 
@@ -48,7 +47,7 @@ pub enum SleepPrevention {
 pub enum PowerError {
 	/// The operating-system assertion helper could not be started.
 	#[error("failed to acquire macOS sleep-prevention assertion")]
-	Spawn(#[from] std::io::Error),
+	Spawn(#[from] io::Error),
 }
 
 /// RAII assertion released on success, failure, cancellation, panic unwind, or
@@ -72,11 +71,14 @@ impl PowerAssertion {
 				SleepPrevention::System => "-s",
 				SleepPrevention::Off => unreachable!("off returned above"),
 			};
-			let child = std::process::Command::new("/usr/bin/caffeinate")
-				.args([flag, "-w", &std::process::id().to_string()])
-				.stdin(std::process::Stdio::null())
-				.stdout(std::process::Stdio::null())
-				.stderr(std::process::Stdio::null())
+			#[cfg(target_os = "macos")]
+			use std::process;
+
+			let child = process::Command::new("/usr/bin/caffeinate")
+				.args([flag, "-w", &process::id().to_string()])
+				.stdin(process::Stdio::null())
+				.stdout(process::Stdio::null())
+				.stderr(process::Stdio::null())
 				.spawn()?;
 			Ok(Self { child: Some(child) })
 		}

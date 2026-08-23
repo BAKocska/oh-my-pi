@@ -22,6 +22,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
+	ffi, future, io, mem, ptr,
 	sync::{
 		Arc, LazyLock, Weak,
 		atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
@@ -41,6 +42,7 @@ use parking_lot::Mutex;
 use pyo3::{
 	Py, PyAny, PyResult, Python,
 	class::gc::{PyTraverseError, PyVisit},
+	exceptions::{PyKeyError, PyOSError, PyRuntimeError, PyValueError},
 	ffi::c_str,
 	prelude::*,
 	pyclass, pymethods,
@@ -48,7 +50,7 @@ use pyo3::{
 	types::{PyAnyMethods, PyByteArray, PyBytes, PyDict, PyDictMethods, PyModule, PyTuple},
 };
 use serde_json::Value;
-use tokio::{runtime::Handle, sync::Mutex as AsyncMutex};
+use tokio::{runtime::Handle, sync::Mutex as AsyncMutex, task::JoinHandle, time};
 
 #[cfg(test)]
 use super::RuntimeSnapshot;
@@ -60,7 +62,7 @@ use super::{
 
 const MAX_DISPLAY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
-const BOOTSTRAP: &std::ffi::CStr = c_str!(
+const BOOTSTRAP: &ffi::CStr = c_str!(
 	r#"
 import ast as _omp_ast
 import asyncio as _omp_asyncio
@@ -493,7 +495,7 @@ impl WorkerState {
 		if !self.begin_interrupt(target) {
 			return Ok(());
 		}
-		tokio::time::sleep(self.interrupt_grace).await;
+		time::sleep(self.interrupt_grace).await;
 		self.interrupt_if_active(target)
 	}
 
@@ -528,7 +530,7 @@ impl WorkerState {
 		};
 		let state = Arc::clone(self);
 		runtime.spawn(async move {
-			tokio::time::sleep(state.interrupt_grace).await;
+			time::sleep(state.interrupt_grace).await;
 			let _ = state.interrupt_if_active(&target);
 		});
 	}
@@ -828,7 +830,7 @@ impl DisplayCollector {
 	}
 
 	fn drain(&self, py: Python<'_>) -> PyResult<(Vec<DisplayOutput>, HashSet<usize>)> {
-		let entries = std::mem::take(&mut *self.entries.lock());
+		let entries = mem::take(&mut *self.entries.lock());
 		let mut outputs = Vec::with_capacity(entries.len());
 		let mut displayed_figures = HashSet::new();
 		for (value, raw) in entries {
@@ -866,13 +868,10 @@ impl DisplayCollector {
 	}
 }
 
-fn display_bundle(
-	py: Python<'_>,
-	bundle: &Bound<'_, PyDict>,
-) -> PyResult<Option<super::DisplayOutput>> {
+fn display_bundle(py: Python<'_>, bundle: &Bound<'_, PyDict>) -> PyResult<Option<DisplayOutput>> {
 	if let Some(status) = bundle.get_item("application/x-omp-status")? {
 		return python_to_json(py, &status)
-			.map(|event| event.map(|event| super::DisplayOutput::Status { event }));
+			.map(|event| event.map(|event| DisplayOutput::Status { event }));
 	}
 	if let Some(json) = bundle.get_item("application/json")? {
 		return python_to_json(py, &json).map(|data| data.map(|data| DisplayOutput::Json { data }));
@@ -886,19 +885,15 @@ fn display_bundle(
 	}
 	for mime in ["text/markdown", "text/html", "image/svg+xml"] {
 		if let Some(text) = bundle.get_item(mime)? {
-			return Ok(Some(super::DisplayOutput::Markdown {
-				text: Str::new(text.extract::<String>()?),
-			}));
+			return Ok(Some(DisplayOutput::Markdown { text: Str::new(text.extract::<String>()?) }));
 		}
 	}
 	if let Some(text) = bundle.get_item("text/latex")? {
 		let text = text.extract::<String>()?;
-		return Ok(Some(super::DisplayOutput::Markdown { text: sf!("$$\n{text}\n$$") }));
+		return Ok(Some(DisplayOutput::Markdown { text: sf!("$$\n{text}\n$$") }));
 	}
 	if let Some(text) = bundle.get_item("text/plain")? {
-		return Ok(Some(super::DisplayOutput::Markdown {
-			text: Str::new(text.extract::<String>()?),
-		}));
+		return Ok(Some(DisplayOutput::Markdown { text: Str::new(text.extract::<String>()?) }));
 	}
 	Ok(None)
 }
@@ -1183,9 +1178,9 @@ impl EvalExec for EmbeddedPython {
 		match self.spawn_worker(&number.to_string()) {
 			Ok(worker) => {
 				self.inner.workers.lock().insert(id.clone(), worker);
-				std::future::ready(Ok(Session { id }))
+				future::ready(Ok(Session { id }))
 			},
-			Err(error) => std::future::ready(Err(error)),
+			Err(error) => future::ready(Err(error)),
 		}
 	}
 
@@ -1282,8 +1277,8 @@ static SIGINT_PENDING: AtomicBool = AtomicBool::new(false);
 static SIGINT_TARGETS: LazyLock<Mutex<Vec<Weak<WorkerState>>>> =
 	LazyLock::new(|| Mutex::new(Vec::new()));
 #[cfg(unix)]
-static SIGINT_MONITOR: LazyLock<std::io::Result<()>> = LazyLock::new(|| {
-	std::thread::Builder::new()
+static SIGINT_MONITOR: LazyLock<io::Result<()>> = LazyLock::new(|| {
+	thread::Builder::new()
 		.name("omp-eval-sigint".to_owned())
 		.spawn(|| {
 			loop {
@@ -1297,7 +1292,7 @@ static SIGINT_MONITOR: LazyLock<std::io::Result<()>> = LazyLock::new(|| {
 						let _ = target.interrupt_thread();
 					}
 				}
-				std::thread::sleep(StdDuration::from_millis(1));
+				thread::sleep(StdDuration::from_millis(1));
 			}
 		})
 		.map(drop)
@@ -1311,10 +1306,10 @@ extern "C" fn record_active_sigint(_signal: libc::c_int) {
 #[cfg(unix)]
 fn set_sigint_action(action: &libc::sigaction) -> PyResult<()> {
 	// SAFETY: `action` is a fully initialized sigaction and the call borrows it.
-	if unsafe { libc::sigaction(libc::SIGINT, action, std::ptr::null_mut()) } == 0 {
+	if unsafe { libc::sigaction(libc::SIGINT, action, ptr::null_mut()) } == 0 {
 		Ok(())
 	} else {
-		Err(pyo3::exceptions::PyOSError::new_err(std::io::Error::last_os_error().to_string()))
+		Err(PyOSError::new_err(io::Error::last_os_error().to_string()))
 	}
 }
 
@@ -1322,7 +1317,7 @@ fn set_sigint_action(action: &libc::sigaction) -> PyResult<()> {
 fn active_sigint_action() -> libc::sigaction {
 	// SAFETY: zero is a valid starting state before sigemptyset initializes the
 	// mask.
-	let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+	let mut action: libc::sigaction = unsafe { mem::zeroed() };
 	action.sa_sigaction = record_active_sigint as *const () as usize;
 	// SAFETY: `sa_mask` points to initialized storage owned by `action`.
 	unsafe { libc::sigemptyset(&mut action.sa_mask) };
@@ -1333,7 +1328,7 @@ fn active_sigint_action() -> libc::sigaction {
 fn ignored_sigint_action() -> libc::sigaction {
 	// SAFETY: zero is a valid starting state before sigemptyset initializes the
 	// mask.
-	let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+	let mut action: libc::sigaction = unsafe { mem::zeroed() };
 	action.sa_sigaction = libc::SIG_IGN;
 	// SAFETY: `sa_mask` points to initialized storage owned by `action`.
 	unsafe { libc::sigemptyset(&mut action.sa_mask) };
@@ -1352,12 +1347,10 @@ impl IdleSigint {
 			let mut state = SIGINT_STATE.lock();
 			if state.workers == 0 {
 				// SAFETY: `current` is writable storage populated by sigaction.
-				let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+				let mut current: libc::sigaction = unsafe { mem::zeroed() };
 				// SAFETY: the null action queries SIGINT without changing it.
-				if unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) } != 0 {
-					return Err(pyo3::exceptions::PyOSError::new_err(
-						std::io::Error::last_os_error().to_string(),
-					));
+				if unsafe { libc::sigaction(libc::SIGINT, ptr::null(), &mut current) } != 0 {
+					return Err(PyOSError::new_err(io::Error::last_os_error().to_string()));
 				}
 				state.original = Some(current);
 				set_sigint_action(&ignored_sigint_action())?;
@@ -1370,7 +1363,7 @@ impl IdleSigint {
 				{
 					let _ = set_sigint_action(&original);
 				}
-				return Err(pyo3::exceptions::PyOSError::new_err(error.to_string()));
+				return Err(PyOSError::new_err(error.to_string()));
 			}
 		}
 		Ok(Self {
@@ -1719,7 +1712,7 @@ fn spawn_watchdog(
 	watchdog: &TimeoutHandle,
 	command: &Command,
 	state: &Arc<WorkerState>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<JoinHandle<()>> {
 	command.runtime.as_ref().map(|runtime| {
 		let watchdog = watchdog.clone();
 		let state = Arc::clone(state);
@@ -1761,9 +1754,7 @@ fn execute_cell(
 	let display = namespace
 		.bind(py)
 		.get_item("__omp_display")?
-		.ok_or_else(|| {
-			pyo3::exceptions::PyRuntimeError::new_err("eval namespace has no __omp_display collector")
-		})?
+		.ok_or_else(|| PyRuntimeError::new_err("eval namespace has no __omp_display collector"))?
 		.extract::<Py<DisplayCollector>>()?;
 	display.borrow(py).clear();
 	ensure_output_routers(py)?;
@@ -1795,7 +1786,7 @@ fn execute_cell(
 		"error" => CellOutcome::Error,
 		"cancelled" => CellOutcome::Cancelled,
 		other => {
-			return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+			return Err(PyRuntimeError::new_err(format!(
 				"eval runner returned unknown outcome {other:?}"
 			)));
 		},
@@ -1804,14 +1795,14 @@ fn execute_cell(
 	let result_json = get_optional_string(result, "result_json")?
 		.map(|json| serde_json::from_str::<Value>(&json))
 		.transpose()
-		.map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+		.map_err(|error| PyValueError::new_err(error.to_string()))?;
 	let cell_value = result_text.map(|text| CellValue { text: Str::new(text), json: result_json });
 	let error_name = get_optional_string(result, "error_name")?;
 	let exception = if let Some(name) = error_name {
 		let message = get_optional_string(result, "error_message")?.unwrap_or_default();
 		let traceback = result
 			.get_item("error_traceback")?
-			.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("error_traceback"))?
+			.ok_or_else(|| PyKeyError::new_err("error_traceback"))?
 			.extract::<Vec<String>>()?
 			.into_iter()
 			.map(Str::new)
@@ -1822,7 +1813,7 @@ fn execute_cell(
 	};
 	let duration_ms = result
 		.get_item("duration_ms")?
-		.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("duration_ms"))?
+		.ok_or_else(|| PyKeyError::new_err("duration_ms"))?
 		.extract::<u64>()?;
 
 	let (mut display_outputs, displayed_figures) = display.borrow(py).drain(py)?;
@@ -1852,14 +1843,14 @@ fn execute_cell(
 fn get_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
 	dict
 		.get_item(key)?
-		.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_owned()))?
+		.ok_or_else(|| PyKeyError::new_err(key.to_owned()))?
 		.extract()
 }
 
 fn get_optional_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
 	let value = dict
 		.get_item(key)?
-		.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_owned()))?;
+		.ok_or_else(|| PyKeyError::new_err(key.to_owned()))?;
 	if value.is_none() {
 		Ok(None)
 	} else {
@@ -1878,7 +1869,7 @@ fn python_to_json(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<V
 	};
 	serde_json::from_str(&encoded)
 		.map(Some)
-		.map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+		.map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 fn fail_worker(commands: &Receiver<Command>, message: Str) {
@@ -1903,7 +1894,11 @@ fn format_python_error(py: Python<'_>, error: pyo3::PyErr) -> String {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::{Arc, LazyLock};
+	use std::{
+		env,
+		path::Path,
+		sync::{Arc, LazyLock},
+	};
 
 	use parking_lot::RwLock;
 
@@ -1926,7 +1921,7 @@ mod tests {
 	#[cfg(unix)]
 	fn sigint_handler() -> usize {
 		// SAFETY: `current` is writable storage populated by sigaction.
-		let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+		let mut current: libc::sigaction = unsafe { mem::zeroed() };
 		// SAFETY: the null action queries SIGINT without changing it.
 		assert_eq!(unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) }, 0,);
 		current.sa_sigaction
@@ -1949,7 +1944,7 @@ mod tests {
 
 		let failed = (|| -> PyResult<()> {
 			let _executing = idle.executing(None)?;
-			Err(pyo3::exceptions::PyRuntimeError::new_err("cell failed"))
+			Err(PyRuntimeError::new_err("cell failed"))
 		})();
 		assert!(failed.is_err());
 		assert_eq!(sigint_handler(), libc::SIG_IGN);
@@ -2396,10 +2391,10 @@ print("right")"#
 		let _globals = PROCESS_GLOBALS.read();
 		let runtime = runtime();
 		let session = runtime.open_session().await.expect("session opens");
-		let original = std::env::current_dir().expect("current directory");
+		let original = env::current_dir().expect("current directory");
 		let first = tempfile::tempdir().expect("first runtime directory");
 		let second = tempfile::tempdir().expect("second runtime directory");
-		let snapshot = |cwd: &std::path::Path, session_file: Option<&str>| RuntimeSnapshot {
+		let snapshot = |cwd: &Path, session_file: Option<&str>| RuntimeSnapshot {
 			cwd:         Some(cwd.to_path_buf()),
 			managed_env: [
 				(sf!("OMP_ARTIFACTS_DIR"), None),
@@ -2646,7 +2641,7 @@ __omp_display(first)
 			timeout: Option<StdDuration>,
 		) -> PyResult<TimeoutHandle> {
 			if self.0.swap(false, Ordering::AcqRel) {
-				Err(pyo3::exceptions::PyRuntimeError::new_err("poisoned worker"))
+				Err(PyRuntimeError::new_err("poisoned worker"))
 			} else {
 				Ok(TimeoutHandle::new(timeout))
 			}

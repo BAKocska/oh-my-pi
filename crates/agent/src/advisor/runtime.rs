@@ -2,10 +2,12 @@
 
 use std::{
 	collections::VecDeque,
+	iter, mem,
 	sync::Arc,
 	time::{Duration, Instant},
 };
 
+use flume::Receiver;
 use omp_core::Str;
 use omp_secrets::{obfuscator::SecretObfuscator, replacement::bun_wyhash};
 use parking_lot::Mutex;
@@ -298,9 +300,7 @@ pub struct AdvisorDeliveryRouter {
 
 impl AdvisorDeliveryRouter {
 	/// Creates a router and its two externally consumed channels.
-	pub fn channel(
-		immune_turns: u32,
-	) -> (Self, flume::Receiver<RoutedAdvice>, flume::Receiver<RoutedAdvice>) {
+	pub fn channel(immune_turns: u32) -> (Self, Receiver<RoutedAdvice>, Receiver<RoutedAdvice>) {
 		let (steering, steering_rx) = flume::unbounded();
 		let (preserve, preserve_rx) = flume::unbounded();
 		(
@@ -466,7 +466,7 @@ impl AdvisorDeltaSync {
 			}
 			rounds += 1;
 		}
-		let reprime = std::mem::take(&mut self.reprime);
+		let reprime = mem::take(&mut self.reprime);
 		Some(AdvisorDeltaBatch {
 			revision: self.revision,
 			reprime,
@@ -484,7 +484,7 @@ impl Default for AdvisorDeltaSync {
 
 fn utf8_chunks(text: &str, limit: usize) -> impl Iterator<Item = &str> {
 	let mut start = 0;
-	std::iter::from_fn(move || {
+	iter::from_fn(move || {
 		if start >= text.len() {
 			return None;
 		}

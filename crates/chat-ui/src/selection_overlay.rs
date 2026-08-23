@@ -26,7 +26,12 @@ pub enum SelectionEvent {
 	/// Dismiss without choosing.
 	Close,
 	/// Commit one stable backend key.
-	Pick { purpose: SelectionPurpose, key: Str },
+	Pick {
+		/// Backend workflow that will consume the chosen key.
+		purpose: SelectionPurpose,
+		/// Stable backend identity of the selected row.
+		key:     Str,
+	},
 }
 
 /// Filterable retained selector that never owns workflow state.

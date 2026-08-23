@@ -1,6 +1,6 @@
 //! Transactional lowering for server-initiated `workspace/applyEdit` requests.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num, str};
 
 use bytes::Bytes;
 use omp_core::Str;
@@ -12,14 +12,16 @@ use url::Url;
 
 use crate::{
 	ByteEdit, ByteRange, DocumentHead, DocumentKind, DocumentLocator, DocumentPresence, Environment,
-	ReadBody, ReadSelection, TransactionId,
+	Error as DocserverError, ReadBody, ReadSelection, Revision, TransactionId,
 	lsp_process::InboundDispatch,
-	position::TextEdit,
+	lsp_registry::{LspBindingHandle, LspRegistryError},
+	position::{PositionError, TextEdit},
 	transaction::{
 		CreateMutation, DeleteMutation, DocumentMutation, DocumentTarget, ExistingDocumentPolicy,
 		FormatPolicy, MoveDestinationPrecondition, MoveMutation, MutationOperation, StalePolicy,
 		TextMutation, TextProposal, TransactionOutcome, TransactionRequest,
 	},
+	validate_edits,
 };
 /// Failures that can occur when lowering server-initiated `workspace/applyEdit`
 /// requests.
@@ -105,7 +107,7 @@ pub enum ApplyWorkspaceEditError {
 	EditStartOverflow {
 		/// Numeric conversion error.
 		#[source]
-		source: std::num::TryFromIntError,
+		source: num::TryFromIntError,
 	},
 
 	/// Edit end coordinate exceeded u64 limits.
@@ -113,7 +115,7 @@ pub enum ApplyWorkspaceEditError {
 	EditEndOverflow {
 		/// Numeric conversion error.
 		#[source]
-		source: std::num::TryFromIntError,
+		source: num::TryFromIntError,
 	},
 
 	/// Document length exceeded u64 limits.
@@ -121,7 +123,7 @@ pub enum ApplyWorkspaceEditError {
 	DocumentLengthOverflow {
 		/// Numeric conversion error.
 		#[source]
-		source: std::num::TryFromIntError,
+		source: num::TryFromIntError,
 	},
 
 	/// Recursive workspace deletes are not supported.
@@ -154,15 +156,15 @@ pub enum ApplyWorkspaceEditError {
 
 	/// Underlying document store error.
 	#[error(transparent)]
-	Store(#[from] crate::Error),
+	Store(#[from] DocserverError),
 
 	/// LSP registry error.
 	#[error(transparent)]
-	LspRegistry(#[from] crate::lsp_registry::LspRegistryError),
+	LspRegistry(#[from] LspRegistryError),
 
 	/// Position conversion error.
 	#[error(transparent)]
-	Position(#[from] crate::position::PositionError),
+	Position(#[from] PositionError),
 }
 
 #[derive(Deserialize)]
@@ -203,7 +205,7 @@ struct LoadedDocument {
 /// authority.
 pub async fn apply_workspace_edit(
 	environment: Environment,
-	handle: crate::lsp_registry::LspBindingHandle,
+	handle: LspBindingHandle,
 	params: Bytes,
 	cancellation: CancellationToken,
 ) -> InboundDispatch {
@@ -230,7 +232,7 @@ pub async fn apply_workspace_edit(
 
 async fn lower_workspace_edit(
 	environment: &Environment,
-	handle: crate::lsp_registry::LspBindingHandle,
+	handle: LspBindingHandle,
 	params: &[u8],
 	cancellation: &CancellationToken,
 ) -> Result<TransactionRequest, ApplyWorkspaceEditError> {
@@ -294,7 +296,7 @@ async fn lower_workspace_edit(
 
 async fn lower_text_edit(
 	environment: &Environment,
-	handle: crate::lsp_registry::LspBindingHandle,
+	handle: LspBindingHandle,
 	uri: String,
 	version: Option<i32>,
 	edits: Vec<TextEdit>,
@@ -327,7 +329,7 @@ async fn lower_text_edit(
 	let policy = environment
 		.lsp()
 		.sync_policy_for_handle(handle, &uri, language_id)?;
-	let text = std::str::from_utf8(&loaded.content)
+	let text = str::from_utf8(&loaded.content)
 		.map_err(|_| ApplyWorkspaceEditError::NonUtf8Document { uri: uri.clone() })?;
 	let mut byte_edits = Vec::with_capacity(edits.len());
 	for edit in edits {
@@ -343,7 +345,7 @@ async fn lower_text_edit(
 		byte_edits.push(ByteEdit::new(range, Bytes::from(edit.new_text)));
 	}
 	byte_edits.sort_by_key(|edit| edit.range().start());
-	crate::validate_edits(
+	validate_edits(
 		u64::try_from(loaded.content.len())
 			.map_err(|source| ApplyWorkspaceEditError::DocumentLengthOverflow { source })?,
 		&byte_edits,
@@ -456,7 +458,7 @@ async fn lower_rename(
 async fn load_document(
 	environment: &Environment,
 	uri: &Url,
-	revision: Option<crate::Revision>,
+	revision: Option<Revision>,
 	cancellation: &CancellationToken,
 ) -> Result<LoadedDocument, ApplyWorkspaceEditError> {
 	if cancellation.is_cancelled() {

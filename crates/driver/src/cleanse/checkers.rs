@@ -1,9 +1,12 @@
 //! Multi-language checker discovery and effect-aware execution.
 
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::BTreeSet,
+	env,
 	error::Error as StdError,
+	fs,
 	future::Future,
+	io,
 	path::{Path, PathBuf},
 };
 
@@ -43,8 +46,8 @@ impl BinaryResolver for FilesystemResolver {
 					}
 				}
 			}
-			if let Some(paths) = std::env::var_os("PATH") {
-				for directory in std::env::split_paths(&paths) {
+			if let Some(paths) = env::var_os("PATH") {
+				for directory in env::split_paths(&paths) {
 					let candidate = directory.join(name);
 					if runnable_file(&candidate) {
 						return Some(candidate);
@@ -76,11 +79,11 @@ fn runnable_file(path: &Path) -> bool {
 
 /// Recursively snapshots project files while pruning generated dependency and
 /// VCS directories.
-pub fn scan_project_files(project_root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+pub fn scan_project_files(project_root: &Path) -> Result<Vec<PathBuf>, io::Error> {
 	let mut files = Vec::new();
 	let mut pending = vec![project_root.to_path_buf()];
 	while let Some(directory) = pending.pop() {
-		for entry in std::fs::read_dir(directory)? {
+		for entry in fs::read_dir(directory)? {
 			let entry = entry?;
 			let kind = entry.file_type()?;
 			if kind.is_dir() {

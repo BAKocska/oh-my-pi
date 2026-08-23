@@ -323,11 +323,12 @@ mod tests {
 
 	use super::{InferenceBudget, InferenceBudgetPolicy, InferenceLedger, OverallBudgetLayer};
 	use crate::{
+		Error, ErrorKind,
 		call::{
 			Call, CallMeta, CountAccuracy, CountTokensRequest, InferenceAttribution, OperationCall,
 			Target,
 		},
-		id::RequestId,
+		id::{PrincipalId, RequestId},
 		receipt::ExecutionBudget,
 	};
 
@@ -350,7 +351,7 @@ mod tests {
 			})),
 		)
 		.with_attribution(InferenceAttribution {
-			principal: crate::id::PrincipalId::from("schedule-owner"),
+			principal: PrincipalId::from("schedule-owner"),
 			extension: omp_core::sf!("extension"),
 		})
 	}
@@ -366,7 +367,7 @@ mod tests {
 		let inner_calls = Arc::clone(&calls);
 		let inner = service_fn(move |_| {
 			inner_calls.fetch_add(1, Ordering::Relaxed);
-			async { Ok::<_, crate::Error>(()) }
+			async { Ok::<_, Error>(()) }
 		});
 		let mut service = OverallBudgetLayer::new(ledger).layer(inner);
 		service.call(call()).await.unwrap();
@@ -375,7 +376,7 @@ mod tests {
 			.await
 			.expect_err("second request must be rejected before provider dispatch");
 		assert_eq!(calls.load(Ordering::Relaxed), 1);
-		assert_eq!(error.kind, crate::ErrorKind::BudgetExhausted);
+		assert_eq!(error.kind, ErrorKind::BudgetExhausted);
 		assert_eq!(error.code.as_ref().map(|code| code.as_str()), Some("inference.budget_exhausted"));
 	}
 }

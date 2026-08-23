@@ -2,6 +2,7 @@
 
 use std::{
 	collections::HashMap,
+	path::{Path, PathBuf},
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -11,12 +12,20 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use omp_core::{InvocationPhase, LifecyclePhase, Str};
+use omp_proto::policy::v1;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use super::worker::HostKey;
+use super::{
+	admission,
+	exthost::control::{
+		ControlAuthority, ControlConnectionIdentity, ControlEffect, ControlInvocationAuthority,
+		ControlProtocolError, ControlRequestContext,
+	},
+	worker::HostKey,
+};
 
 /// Capabilities implemented by the environment DATA plane.
 pub const CAPABILITIES: &[&str] = &[
@@ -91,7 +100,7 @@ impl Grants {
 
 	/// Converts Core's narrowed effect envelope into exact DATA capability
 	/// bounds.
-	pub fn from_effect_envelope(envelope: &omp_proto::policy::v1::EffectEnvelope) -> Self {
+	pub fn from_effect_envelope(envelope: &v1::EffectEnvelope) -> Self {
 		let mut grants = Vec::with_capacity(10);
 		if let Some(documents) = &envelope.documents {
 			if documents.read {
@@ -609,7 +618,7 @@ pub enum PolicyControlFailure {
 }
 
 impl PolicyControlFailure {
-	fn protocol(&self) -> super::exthost::control::ControlProtocolError {
+	fn protocol(&self) -> ControlProtocolError {
 		let code = match self {
 			Self::StaleGeneration => "StaleGeneration",
 			Self::Capability(_) => "PermissionDenied",
@@ -622,7 +631,7 @@ impl PolicyControlFailure {
 			Self::DecisionConflict => "ApprovalDecisionConflict",
 			Self::Audit(_) => "PolicyAuditFailed",
 		};
-		super::exthost::control::ControlProtocolError::new(code, Str::from(self.to_string()))
+		ControlProtocolError::new(code, Str::from(self.to_string()))
 	}
 }
 
@@ -672,7 +681,7 @@ pub trait PolicyAuditSink: Send + Sync + 'static {
 /// Authoritative policy/profile/approval CONTROL owner for one authenticated
 /// extension-host connection.
 pub struct PolicyControlOwner {
-	identity:  Arc<super::exthost::control::ControlConnectionIdentity>,
+	identity:  Arc<ControlConnectionIdentity>,
 	runtime:   Arc<dyn SandboxPolicyRuntime>,
 	approvals: Arc<omp_agent::ApprovalBook>,
 	audit:     Arc<dyn PolicyAuditSink>,
@@ -681,7 +690,7 @@ pub struct PolicyControlOwner {
 impl PolicyControlOwner {
 	/// Binds policy authority to one authenticated connection generation.
 	pub fn new(
-		identity: Arc<super::exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		runtime: Arc<dyn SandboxPolicyRuntime>,
 		approvals: Arc<omp_agent::ApprovalBook>,
 		audit: Arc<dyn PolicyAuditSink>,
@@ -691,7 +700,7 @@ impl PolicyControlOwner {
 
 	fn validate_connection(
 		&self,
-		context: &super::exthost::control::ControlRequestContext,
+		context: &ControlRequestContext,
 	) -> Result<(), PolicyControlFailure> {
 		let actual = &context.connection;
 		if actual.extension == self.identity.extension
@@ -716,9 +725,9 @@ impl PolicyControlOwner {
 
 	fn require_active<'a>(
 		&self,
-		context: &'a super::exthost::control::ControlRequestContext,
+		context: &'a ControlRequestContext,
 		minimum: InvocationPhase,
-	) -> Result<&'a super::exthost::control::ControlInvocationAuthority, PolicyControlFailure> {
+	) -> Result<&'a ControlInvocationAuthority, PolicyControlFailure> {
 		let invocation = context
 			.invocation
 			.as_ref()
@@ -734,7 +743,7 @@ impl PolicyControlOwner {
 
 	fn session<'a>(
 		&'a self,
-		context: &'a super::exthost::control::ControlRequestContext,
+		context: &'a ControlRequestContext,
 		arguments: &'a serde_json::Map<String, Value>,
 	) -> Result<&'a str, PolicyControlFailure> {
 		if let Some(session) = arguments.get("session").and_then(Value::as_str) {
@@ -816,17 +825,17 @@ impl PolicyControlOwner {
 	}
 }
 #[async_trait]
-impl super::exthost::control::ControlAuthority for PolicyControlOwner {
+impl ControlAuthority for PolicyControlOwner {
 	fn handles(&self, operation: &str) -> bool {
 		operation.starts_with("omp.policy.")
 	}
 
 	fn authorize(
 		&self,
-		context: &super::exthost::control::ControlRequestContext,
+		context: &ControlRequestContext,
 		operation: &str,
 		_arguments: &serde_json::Map<String, Value>,
-	) -> Result<(), super::exthost::control::ControlProtocolError> {
+	) -> Result<(), ControlProtocolError> {
 		self
 			.validate_connection(context)
 			.map_err(|error| error.protocol())?;
@@ -870,10 +879,7 @@ impl super::exthost::control::ControlAuthority for PolicyControlOwner {
 					.map_err(|error| error.protocol())?;
 			},
 			_ => {
-				return Err(super::exthost::control::ControlProtocolError::new(
-					"UnknownOperation",
-					"unknown policy operation",
-				));
+				return Err(ControlProtocolError::new("UnknownOperation", "unknown policy operation"));
 			},
 		}
 		Ok(())
@@ -881,16 +887,16 @@ impl super::exthost::control::ControlAuthority for PolicyControlOwner {
 
 	async fn request(
 		&self,
-		context: super::exthost::control::ControlRequestContext,
+		context: ControlRequestContext,
 		operation: Str,
 		mut arguments: serde_json::Map<String, Value>,
-	) -> Result<Value, super::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		self.authorize(&context, operation.as_str(), &arguments)?;
 		match operation.as_str() {
 			"omp.policy.parse" => {
 				let script = take_string(&mut arguments, "script")?;
 				if script.len() > 262_144 {
-					return Err(super::exthost::control::ControlProtocolError::new(
+					return Err(ControlProtocolError::new(
 						"PolicyInputTooLarge",
 						"shell source exceeds 262144 bytes",
 					));
@@ -999,10 +1005,7 @@ impl super::exthost::control::ControlAuthority for PolicyControlOwner {
 			"omp.policy.decide" => {
 				let ticket_id = take_string(&mut arguments, "ticket_id")?;
 				let decision = arguments.remove("decision").ok_or_else(|| {
-					super::exthost::control::ControlProtocolError::new(
-						"InvalidArguments",
-						"approval decision is required",
-					)
+					ControlProtocolError::new("InvalidArguments", "approval decision is required")
 				})?;
 				self
 					.decide(&ticket_id, decision)
@@ -1016,65 +1019,49 @@ impl super::exthost::control::ControlAuthority for PolicyControlOwner {
 
 	async fn effect(
 		&self,
-		context: super::exthost::control::ControlRequestContext,
-		_effect: super::exthost::control::ControlEffect,
-	) -> Result<(), super::exthost::control::ControlProtocolError> {
+		context: ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
 		self
 			.validate_connection(&context)
 			.map_err(|error| error.protocol())?;
-		Err(super::exthost::control::ControlProtocolError::new(
-			"UnsupportedEffect",
-			"policy authority accepts requests only",
-		))
+		Err(ControlProtocolError::new("UnsupportedEffect", "policy authority accepts requests only"))
 	}
 }
 
 fn take_string(
 	arguments: &mut serde_json::Map<String, Value>,
 	name: &'static str,
-) -> Result<String, super::exthost::control::ControlProtocolError> {
+) -> Result<String, ControlProtocolError> {
 	arguments
 		.remove(name)
 		.and_then(|value| value.as_str().map(ToOwned::to_owned))
 		.filter(|value| !value.is_empty())
 		.ok_or_else(|| {
-			super::exthost::control::ControlProtocolError::new(
-				"InvalidArguments",
-				format!("{name} must be a non-empty string"),
-			)
+			ControlProtocolError::new("InvalidArguments", format!("{name} must be a non-empty string"))
 		})
 }
-fn policy_serialization(error: serde_json::Error) -> super::exthost::control::ControlProtocolError {
-	super::exthost::control::ControlProtocolError::new(
-		"PolicySerialization",
-		Str::from(error.to_string()),
-	)
+fn policy_serialization(error: serde_json::Error) -> ControlProtocolError {
+	ControlProtocolError::new("PolicySerialization", Str::from(error.to_string()))
 }
 
 fn take_typed<T: for<'de> Deserialize<'de>>(
 	arguments: &mut serde_json::Map<String, Value>,
 	name: &'static str,
-) -> Result<T, super::exthost::control::ControlProtocolError> {
+) -> Result<T, ControlProtocolError> {
 	let value = arguments.remove(name).ok_or_else(|| {
-		super::exthost::control::ControlProtocolError::new(
-			"InvalidArguments",
-			format!("{name} is required"),
-		)
+		ControlProtocolError::new("InvalidArguments", format!("{name} is required"))
 	})?;
-	serde_json::from_value(value).map_err(|error| {
-		super::exthost::control::ControlProtocolError::new(
-			"InvalidArguments",
-			format!("{name}: {error}"),
-		)
-	})
+	serde_json::from_value(value)
+		.map_err(|error| ControlProtocolError::new("InvalidArguments", format!("{name}: {error}")))
 }
 
 fn policy_cwd(
-	context: &super::exthost::control::ControlRequestContext,
+	context: &ControlRequestContext,
 	requested: Option<&Value>,
-) -> Result<std::path::PathBuf, super::exthost::control::ControlProtocolError> {
+) -> Result<PathBuf, ControlProtocolError> {
 	let invocation = context.invocation.as_ref().ok_or_else(|| {
-		super::exthost::control::ControlProtocolError::new(
+		ControlProtocolError::new(
 			"InvalidPhase",
 			"policy path analysis requires invocation workspace roots",
 		)
@@ -1082,10 +1069,10 @@ fn policy_cwd(
 	let roots = invocation
 		.roots
 		.iter()
-		.map(|root| std::path::PathBuf::from(root.as_str()))
+		.map(|root| PathBuf::from(root.as_str()))
 		.collect::<Vec<_>>();
 	let root = roots.first().ok_or_else(|| {
-		super::exthost::control::ControlProtocolError::new(
+		ControlProtocolError::new(
 			"WorkspaceScopeDenied",
 			"policy path analysis requires an authenticated workspace root",
 		)
@@ -1093,7 +1080,7 @@ fn policy_cwd(
 	let cwd = requested
 		.and_then(Value::as_str)
 		.filter(|value| !value.is_empty())
-		.map_or_else(|| root.clone(), std::path::PathBuf::from);
+		.map_or_else(|| root.clone(), PathBuf::from);
 	let cwd = if cwd.is_absolute() {
 		cwd
 	} else {
@@ -1102,34 +1089,32 @@ fn policy_cwd(
 	if roots.iter().any(|candidate| cwd.starts_with(candidate)) {
 		Ok(cwd)
 	} else {
-		Err(super::exthost::control::ControlProtocolError::new(
+		Err(ControlProtocolError::new(
 			"WorkspaceScopeDenied",
 			"policy cwd is outside authenticated workspace roots",
 		))
 	}
 }
-fn policy_root(
-	context: &super::exthost::control::ControlRequestContext,
-) -> Result<std::path::PathBuf, super::exthost::control::ControlProtocolError> {
+fn policy_root(context: &ControlRequestContext) -> Result<PathBuf, ControlProtocolError> {
 	context
 		.invocation
 		.as_ref()
 		.and_then(|invocation| invocation.roots.first())
-		.map(|root| std::path::PathBuf::from(root.as_str()))
+		.map(|root| PathBuf::from(root.as_str()))
 		.ok_or_else(|| {
-			super::exthost::control::ControlProtocolError::new(
+			ControlProtocolError::new(
 				"WorkspaceScopeDenied",
 				"policy analysis requires an authenticated workspace root",
 			)
 		})
 }
 
-fn span_json(span: Option<&omp_proto::policy::v1::Span>) -> Value {
+fn span_json(span: Option<&v1::Span>) -> Value {
 	let span = span.cloned().unwrap_or_default();
 	json!({"start": span.start, "end": span.end, "line": span.line, "column": span.column})
 }
 
-fn path_ref_json(path: &omp_proto::policy::v1::PathRef) -> Value {
+fn path_ref_json(path: &v1::PathRef) -> Value {
 	json!({
 		"lexical": path.lexical,
 		"resolved": path.resolved,
@@ -1153,7 +1138,7 @@ fn path_ref_json(path: &omp_proto::policy::v1::PathRef) -> Value {
 	})
 }
 
-fn net_ref_json(net: &omp_proto::policy::v1::NetRef) -> Value {
+fn net_ref_json(net: &v1::NetRef) -> Value {
 	json!({
 		"kind": match net.kind.as_str() {
 			"http" | "https" | "url" => "http",
@@ -1177,7 +1162,7 @@ fn net_ref_json(net: &omp_proto::policy::v1::NetRef) -> Value {
 	})
 }
 
-fn redirect_json(redirect: &omp_proto::policy::v1::BashRedirect) -> Value {
+fn redirect_json(redirect: &v1::BashRedirect) -> Value {
 	json!({
 		"fd": redirect.fd,
 		"op": match redirect.op.as_str() {
@@ -1208,7 +1193,7 @@ fn redirect_json(redirect: &omp_proto::policy::v1::BashRedirect) -> Value {
 	})
 }
 
-fn command_json(command: &omp_proto::policy::v1::BashCommand) -> Value {
+fn command_json(command: &v1::BashCommand) -> Value {
 	json!({
 		"index": command.index,
 		"name": command.name,
@@ -1275,8 +1260,8 @@ fn command_json(command: &omp_proto::policy::v1::BashCommand) -> Value {
 	})
 }
 
-fn bash_ir_json(script: &str, cwd: &std::path::Path, root: &std::path::Path) -> Value {
-	let ir = super::admission::bash_ir("shell", &json!({"command": script}), cwd, root)
+fn bash_ir_json(script: &str, cwd: &Path, root: &Path) -> Value {
+	let ir = admission::bash_ir("shell", &json!({"command": script}), cwd, root)
 		.expect("shell analysis always returns BashIr");
 	let parse_error = ir
 		.parse_error
@@ -1315,9 +1300,9 @@ fn bash_ir_json(script: &str, cwd: &std::path::Path, root: &std::path::Path) -> 
 }
 
 fn match_paths_json(
-	context: &super::exthost::control::ControlRequestContext,
+	context: &ControlRequestContext,
 	arguments: &mut serde_json::Map<String, Value>,
-) -> Result<Value, super::exthost::control::ControlProtocolError> {
+) -> Result<Value, ControlProtocolError> {
 	let lexical = take_string(arguments, "path")?;
 	let patterns = arguments
 		.remove("patterns")
@@ -1326,16 +1311,13 @@ fn match_paths_json(
 		.into_iter()
 		.map(|value| {
 			value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-				super::exthost::control::ControlProtocolError::new(
-					"InvalidArguments",
-					"path patterns must be strings",
-				)
+				ControlProtocolError::new("InvalidArguments", "path patterns must be strings")
 			})
 		})
 		.collect::<Result<Vec<_>, _>>()?;
 	let cwd = policy_cwd(context, arguments.remove("cwd").as_ref())?;
-	let resolved = if std::path::Path::new(&lexical).is_absolute() {
-		std::path::PathBuf::from(&lexical)
+	let resolved = if Path::new(&lexical).is_absolute() {
+		PathBuf::from(&lexical)
 	} else {
 		cwd.join(&lexical)
 	};
@@ -1345,17 +1327,11 @@ fn match_paths_json(
 		let mut builder = globset::GlobSetBuilder::new();
 		for pattern in &patterns {
 			builder.add(globset::Glob::new(pattern).map_err(|error| {
-				super::exthost::control::ControlProtocolError::new(
-					"InvalidPattern",
-					Str::from(error.to_string()),
-				)
+				ControlProtocolError::new("InvalidPattern", Str::from(error.to_string()))
 			})?);
 		}
 		let set = builder.build().map_err(|error| {
-			super::exthost::control::ControlProtocolError::new(
-				"InvalidPattern",
-				Str::from(error.to_string()),
-			)
+			ControlProtocolError::new("InvalidPattern", Str::from(error.to_string()))
 		})?;
 		set.is_match(&lexical) || set.is_match(&resolved)
 	};
@@ -1363,10 +1339,7 @@ fn match_paths_json(
 		return Ok(Value::Array(Vec::new()));
 	}
 	let invocation = context.invocation.as_ref().ok_or_else(|| {
-		super::exthost::control::ControlProtocolError::new(
-			"InvalidPhase",
-			"path matching requires invocation authority",
-		)
+		ControlProtocolError::new("InvalidPhase", "path matching requires invocation authority")
 	})?;
 	let within = invocation
 		.roots
@@ -1390,15 +1363,10 @@ fn match_paths_json(
 	})]))
 }
 
-fn approval_spec(
-	value: Value,
-) -> Result<omp_agent::ApprovalSpec, super::exthost::control::ControlProtocolError> {
-	let object = value.as_object().ok_or_else(|| {
-		super::exthost::control::ControlProtocolError::new(
-			"InvalidArguments",
-			"approval must be an object",
-		)
-	})?;
+fn approval_spec(value: Value) -> Result<omp_agent::ApprovalSpec, ControlProtocolError> {
+	let object = value
+		.as_object()
+		.ok_or_else(|| ControlProtocolError::new("InvalidArguments", "approval must be an object"))?;
 	let required = |name: &'static str| {
 		object
 			.get(name)
@@ -1406,10 +1374,7 @@ fn approval_spec(
 			.filter(|value| !value.is_empty())
 			.map(Str::from)
 			.ok_or_else(|| {
-				super::exthost::control::ControlProtocolError::new(
-					"InvalidArguments",
-					format!("approval {name} is required"),
-				)
+				ControlProtocolError::new("InvalidArguments", format!("approval {name} is required"))
 			})
 	};
 	let scopes = object

@@ -1,10 +1,11 @@
 //! Conversation messages stored by transcript events.
 use omp_core::Str;
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::value::RawValue;
 use xutf::{Encoding as _, Utf8};
 
 use super::{
+	BlockKind,
 	block::Block,
 	raweq::opt_raw_eq,
 	types::{Attribution, CallId, CtxSnapshot, FeatureId, ModelRef, Stop, Timing, Usage},
@@ -75,13 +76,13 @@ impl Msg {
 						continue;
 					}
 					match &mut block.kind {
-						super::BlockKind::Text { text } | super::BlockKind::Think { text } => {
+						BlockKind::Text { text } | BlockKind::Think { text } => {
 							*text = truncate_persisted_text(text);
 						},
-						super::BlockKind::Tool { args, .. } => {
+						BlockKind::Tool { args, .. } => {
 							*args = truncate_persisted_text(args);
 						},
-						super::BlockKind::Image { .. } | super::BlockKind::Opaque => {},
+						BlockKind::Image { .. } | BlockKind::Opaque => {},
 					}
 				}
 			},
@@ -299,10 +300,11 @@ impl<'de> Deserialize<'de> for Msg {
 		D: Deserializer<'de>,
 	{
 		let raw = Box::<RawValue>::deserialize(deserializer)?;
-		let probe: RoleProbe = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+		let probe: RoleProbe = serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 		match probe.role.as_str() {
 			"user" => {
-				let payload: UserPayload = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+				let payload: UserPayload =
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::User {
 					content:     payload.content,
 					synthetic:   payload.synthetic,
@@ -312,12 +314,12 @@ impl<'de> Deserialize<'de> for Msg {
 			},
 			"developer" => {
 				let payload: DeveloperPayload =
-					serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::Developer { content: payload.content, attribution: payload.attribution })
 			},
 			"assistant" => {
 				let payload: AssistantPayload =
-					serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::Assistant {
 					content:     payload.content,
 					model:       payload.model,
@@ -332,7 +334,7 @@ impl<'de> Deserialize<'de> for Msg {
 			},
 			"tool_result" => {
 				let payload: ToolResultPayload =
-					serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+					serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
 				Ok(Self::ToolResult {
 					call:          payload.call,
 					tool:          payload.tool,
@@ -343,7 +345,7 @@ impl<'de> Deserialize<'de> for Msg {
 					provider_meta: payload.provider_meta,
 				})
 			},
-			role => Err(D::Error::custom(format_args!("unknown message role `{role}`"))),
+			role => Err(de::Error::custom(format_args!("unknown message role `{role}`"))),
 		}
 	}
 }

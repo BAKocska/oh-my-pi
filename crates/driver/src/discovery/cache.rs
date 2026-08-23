@@ -5,7 +5,7 @@
 //! deliberately has no process-global singleton.
 
 use std::{
-	collections::HashMap,
+	collections::{BTreeSet, HashMap},
 	path::{Path, PathBuf},
 	sync::Arc,
 };
@@ -112,12 +112,12 @@ impl DiscoveryCache {
 		let providers = entries
 			.keys()
 			.map(|key| &key.provider_id)
-			.collect::<std::collections::BTreeSet<_>>()
+			.collect::<BTreeSet<_>>()
 			.len();
 		let installed_packages = entries
 			.keys()
 			.filter_map(|key| key.installed_package_id.as_ref())
-			.collect::<std::collections::BTreeSet<_>>()
+			.collect::<BTreeSet<_>>()
 			.len();
 		CacheStats { entries: entries.len(), providers, installed_packages }
 	}

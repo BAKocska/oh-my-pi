@@ -1,7 +1,10 @@
 //! Verbatim raw-value capture — the tolerant analogue of
 //! `serde_json::value::RawValue`.
 
-use std::fmt;
+use std::{
+	fmt::{self, Display},
+	ptr,
+};
 
 use serde::de::{Deserialize, Deserializer, Error, Visitor};
 
@@ -52,7 +55,7 @@ pub struct RawValue {
 impl RawValue {
 	const fn from_borrowed(json: &str) -> &Self {
 		// SAFETY: `RawValue` is `#[repr(transparent)]` over `str`.
-		unsafe { &*(std::ptr::from_ref::<str>(json) as *const Self) }
+		unsafe { &*(ptr::from_ref::<str>(json) as *const Self) }
 	}
 
 	fn from_boxed(json: Box<str>) -> Box<Self> {
@@ -72,7 +75,7 @@ impl fmt::Debug for RawValue {
 	}
 }
 
-impl fmt::Display for RawValue {
+impl Display for RawValue {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.json)
 	}

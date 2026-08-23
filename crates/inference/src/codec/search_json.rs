@@ -4,6 +4,7 @@ use bytes::{Bytes, BytesMut};
 use omp_catalog::OperationKind;
 use omp_core::{Str, sf};
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::{
 	answer::{AnswerBody, SearchResult, SearchResults},
@@ -70,8 +71,7 @@ pub(crate) fn encode(
 	if request.query.trim().is_empty() || !(1..=100).contains(&request.max_results) {
 		return Err(encoding_error("json_search_request_invalid"));
 	}
-	let mut url =
-		url::Url::parse(base).map_err(|_| encoding_error("json_search_base_url_invalid"))?;
+	let mut url = Url::parse(base).map_err(|_| encoding_error("json_search_base_url_invalid"))?;
 	if url.cannot_be_a_base()
 		|| url.fragment().is_some()
 		|| url.username() != ""

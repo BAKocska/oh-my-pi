@@ -10,7 +10,7 @@ use ring::digest::{SHA256, digest};
 
 use super::{
 	ExtensionCode, Layer,
-	lock::{InstalledRecord, LockFile},
+	lock::{InstalledRecord, LockFile, LockedExtension},
 	trust::{KeysFile, RevocationsFile, verify_artifact_signature},
 };
 
@@ -218,7 +218,7 @@ pub fn diagnose(request: &DoctorRequest<'_>, health: &impl RuntimeHealth) -> Vec
 	findings
 }
 
-fn verify_artifact(path: &Path, locked: &super::lock::LockedExtension) -> Result<(), Str> {
+fn verify_artifact(path: &Path, locked: &LockedExtension) -> Result<(), Str> {
 	let bytes = fs::read(path).map_err(|error| Str::new(error.to_string()))?;
 	if bytes.len() as u64 != locked.wheel.size {
 		return Err(Str::new_static("artifact byte length differs from lock"));

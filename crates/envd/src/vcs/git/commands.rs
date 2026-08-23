@@ -1,6 +1,6 @@
 //! Typed Git branch, ref, remote, configuration, and checkout commands.
 
-use std::path::Path;
+use std::{path::Path, str};
 
 use bytes::Bytes;
 use omp_core::{IntoStr, Str};
@@ -106,7 +106,7 @@ impl GitCommands {
 		if result.exit_code != 0 {
 			return Ok(None);
 		}
-		let value = std::str::from_utf8(&result.stdout)
+		let value = str::from_utf8(&result.stdout)
 			.map_err(|_| CommandError::NonUtf8)?
 			.trim();
 		Ok((!value.is_empty()).then(|| value.to_str()))
@@ -410,7 +410,7 @@ impl GitCommands {
 }
 
 fn lines(bytes: &[u8]) -> Result<Vec<Str>, CommandError> {
-	let text = std::str::from_utf8(bytes).map_err(|_| CommandError::NonUtf8)?;
+	let text = str::from_utf8(bytes).map_err(|_| CommandError::NonUtf8)?;
 	Ok(text
 		.lines()
 		.filter(|line| !line.is_empty())

@@ -8,7 +8,10 @@ use crate::{
 	answer::{Artifact, ArtifactBody, ArtifactRef, ResponseMeta},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{ChatEvent, ToolCall},
-	receipt::{Adjustment, AttemptReceipt, ExecutionReceipt, PlanSummary, ReasonId, RecoveryRecord},
+	receipt::{
+		Adjustment, AttemptReceipt, ExecutionReceipt, PlanSummary, ReasonId, RecoveryRecord,
+		StagingReceipt,
+	},
 };
 
 /// A semantic condition that must hold before provisional events become public.
@@ -624,9 +627,7 @@ fn receipt_heap_size(receipt: &ExecutionReceipt) -> u64 {
 	vector_allocation_size::<Adjustment>(receipt.adjustments.capacity())
 		.saturating_add(vector_allocation_size::<AttemptReceipt>(receipt.attempts.capacity()))
 		.saturating_add(vector_allocation_size::<RecoveryRecord>(receipt.recoveries.capacity()))
-		.saturating_add(vector_allocation_size::<crate::receipt::StagingReceipt>(
-			receipt.staging.capacity(),
-		))
+		.saturating_add(vector_allocation_size::<StagingReceipt>(receipt.staging.capacity()))
 		.saturating_add(plan_heap_size(&receipt.plan))
 		.saturating_add(adjustment_bytes)
 		.saturating_add(attempt_bytes)

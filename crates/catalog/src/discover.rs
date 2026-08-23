@@ -3,7 +3,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	error::Error,
-	fmt,
+	fmt::{self, Display},
 	sync::Arc,
 	time::Instant,
 };
@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	Availability, CatalogAlias, CatalogOverlay, CatalogOverlayBuilder, ChatCapabilities, ClassId,
 	ClassificationEvidence, ClassificationInput, ClassificationPhase, ContextStrategy,
-	DiscoveryPagination, DiscoverySpec, DiscoverySpecId, EvidenceConfidence, ExactSelector,
-	ExtendedContextMode, ModelAvailability, ModelCapabilities, ModelKey, ModelLimits, ModelOverlay,
-	ModelPatch, ModelProvenance, ModelSpec, OperationBits, OperationKind, Pricing, ProvenanceKind,
-	ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, ScopedAlias, ThinkingEffort,
-	ThinkingPolicyId, ThinkingRouting, WireModelId, WirePolicyId, classify,
+	DiscoveryPagination, DiscoverySpec, DiscoverySpecId, EffortTier, EvidenceConfidence,
+	ExactSelector, ExtendedContextMode, ModelAvailability, ModelCapabilities, ModelKey, ModelLimits,
+	ModelOverlay, ModelPatch, ModelProvenance, ModelSpec, OperationBits, OperationKind, Pricing,
+	ProvenanceKind, ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, ScopedAlias,
+	ThinkingEffort, ThinkingPolicyId, ThinkingRouting, WireModelId, WirePolicyId, classify,
 	classify::{strip_effort_lane, supports_dynamic_effort_siblings},
 };
 
@@ -145,7 +145,7 @@ pub enum DiscoveryError {
 	},
 }
 
-impl fmt::Display for DiscoveryError {
+impl Display for DiscoveryError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "discovery normalization failed: {self:?}")
 	}
@@ -732,15 +732,15 @@ fn dynamic_effort_metadata_matches(left: &ModelSpec, right: &ModelSpec) -> bool 
 		&& left.pricing == right.pricing
 		&& left.availability == right.availability
 }
-const fn discovery_effort(effort: crate::EffortTier) -> ThinkingEffort {
+const fn discovery_effort(effort: EffortTier) -> ThinkingEffort {
 	match effort {
-		crate::EffortTier::Off => ThinkingEffort::Off,
-		crate::EffortTier::Minimal => ThinkingEffort::Minimal,
-		crate::EffortTier::Low => ThinkingEffort::Low,
-		crate::EffortTier::Medium => ThinkingEffort::Medium,
-		crate::EffortTier::High => ThinkingEffort::High,
-		crate::EffortTier::XHigh => ThinkingEffort::XHigh,
-		crate::EffortTier::Max => ThinkingEffort::Max,
+		EffortTier::Off => ThinkingEffort::Off,
+		EffortTier::Minimal => ThinkingEffort::Minimal,
+		EffortTier::Low => ThinkingEffort::Low,
+		EffortTier::Medium => ThinkingEffort::Medium,
+		EffortTier::High => ThinkingEffort::High,
+		EffortTier::XHigh => ThinkingEffort::XHigh,
+		EffortTier::Max => ThinkingEffort::Max,
 	}
 }
 
@@ -930,6 +930,8 @@ fn conservative_min<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
 
 #[cfg(test)]
 mod tests {
+	use std::time;
+
 	use super::*;
 	use crate::{
 		AuthSpecId, CodecId, CodecProfile, CodexTransportPreference, DiscoveryKind, EndpointSpec,
@@ -1317,7 +1319,7 @@ mod tests {
 			path:          sf!("/models"),
 			pagination:    DiscoveryPagination::SinglePage,
 			authoritative: false,
-			interval:      Some(std::time::Duration::from_millis(1)),
+			interval:      Some(time::Duration::from_millis(1)),
 		};
 		assert_eq!(spec.polling_interval(), Some(std::time::Duration::from_secs(5)));
 		let key = DiscoveryPollKey {

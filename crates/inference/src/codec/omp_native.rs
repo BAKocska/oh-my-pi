@@ -4,9 +4,15 @@
 //! envelopes, frames protobuf messages, and projects server events without
 //! owning transport, authentication, retry, or conversation storage.
 
+use std::collections::BTreeMap;
+
 use bytes::{BufMut as _, Bytes, BytesMut};
 use omp_core::{Str, encoding::base64, sf};
-use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1::{self as pb, part_start, turn_error, turn_event, turn_request, usage},
+	prost::Message as _,
+	thread::v1 as thread_pb,
+};
 
 use crate::{
 	codec::{
@@ -102,17 +108,17 @@ impl OmpTurnReceipt {
 			return;
 		};
 		match event {
-			pb::turn_event::Event::Accepted(accepted) => {
+			turn_event::Event::Accepted(accepted) => {
 				self.accepted = true;
 				self.replay = accepted.replay;
 			},
-			pb::turn_event::Event::Outcome(outcome) => {
+			turn_event::Event::Outcome(outcome) => {
 				self.disposition = OmpTurnDisposition::Committed { revision: outcome.revision.clone() };
 			},
-			pb::turn_event::Event::Error(error) if error.kind() == pb::turn_error::Kind::Conflict => {
+			turn_event::Event::Error(error) if error.kind() == turn_error::Kind::Conflict => {
 				self.disposition = OmpTurnDisposition::Conflict { actual: error.actual.clone() };
 			},
-			pb::turn_event::Event::Error(_) => {
+			turn_event::Event::Error(_) => {
 				self.disposition =
 					OmpTurnDisposition::RolledBack { cause: OmpRollbackCause::TerminalError };
 			},
@@ -143,13 +149,13 @@ pub fn validate_turn_open(request: &pb::TurnRequest) -> Result<OmpTurnOpenRef<'_
 		return Err(protocol_error("omp_turn_id_missing", ErrorPhase::Encoding));
 	}
 	let input = match request.input.as_ref() {
-		Some(pb::turn_request::Input::Seed(seed)) => {
+		Some(turn_request::Input::Seed(seed)) => {
 			if seed.thread.is_none() {
 				return Err(protocol_error("omp_seed_thread_missing", ErrorPhase::Encoding));
 			}
 			OmpTurnInputRef::Seed(seed)
 		},
-		Some(pb::turn_request::Input::Incremental(incremental)) => {
+		Some(turn_request::Input::Incremental(incremental)) => {
 			let context = incremental.context.as_ref().ok_or_else(|| {
 				protocol_error("omp_incremental_context_missing", ErrorPhase::Encoding)
 			})?;
@@ -208,7 +214,7 @@ pub fn encode_turn_frame(frame: &pb::TurnFrame) -> Result<Bytes, Error> {
 /// Incremental protobuf event projector for an OMP turn stream.
 #[derive(Debug, Default)]
 pub struct OmpNativeDecoder {
-	parts:    std::collections::BTreeMap<u32, OmpOpenPart>,
+	parts:    BTreeMap<u32, OmpOpenPart>,
 	blocks:   u32,
 	terminal: bool,
 	receipt:  OmpTurnReceipt,
@@ -285,20 +291,20 @@ impl OmpNativeDecoder {
 			.event
 			.ok_or_else(|| protocol_error("omp_turn_event_empty", ErrorPhase::Streaming))?;
 		match event {
-			pb::turn_event::Event::Accepted(accepted) => {
+			turn_event::Event::Accepted(accepted) => {
 				emit(RawEvent::Control(ProviderControlEvent::Accepted { replay: accepted.replay }));
 			},
-			pb::turn_event::Event::PartStart(part) => self.part_start(part, emit)?,
-			pb::turn_event::Event::PartDelta(part) => self.part_delta(part, emit)?,
-			pb::turn_event::Event::PartEnd(part) => self.part_end(part, emit)?,
-			pb::turn_event::Event::Outcome(outcome) => self.outcome(outcome, emit),
-			pb::turn_event::Event::Error(error) => self.failure(error, emit),
-			pb::turn_event::Event::InvokeCancel(cancel) => {
+			turn_event::Event::PartStart(part) => self.part_start(part, emit)?,
+			turn_event::Event::PartDelta(part) => self.part_delta(part, emit)?,
+			turn_event::Event::PartEnd(part) => self.part_end(part, emit)?,
+			turn_event::Event::Outcome(outcome) => self.outcome(outcome, emit),
+			turn_event::Event::Error(error) => self.failure(error, emit),
+			turn_event::Event::InvokeCancel(cancel) => {
 				emit(RawEvent::Control(ProviderControlEvent::Cancel {
 					call: ToolCallId::new(cancel.invocation_id),
 				}));
 			},
-			pb::turn_event::Event::Attempt(_) | pb::turn_event::Event::Invoke(_) => {},
+			turn_event::Event::Attempt(_) | turn_event::Event::Invoke(_) => {},
 		}
 		Ok(())
 	}
@@ -309,10 +315,10 @@ impl OmpNativeDecoder {
 		emit: &mut dyn FnMut(RawEvent),
 	) -> Result<(), Error> {
 		let kind = match part.kind() {
-			pb::part_start::Kind::Text => BlockKind::Text,
-			pb::part_start::Kind::Thinking => BlockKind::Thinking,
-			pb::part_start::Kind::ToolCall => BlockKind::ToolCall,
-			pb::part_start::Kind::Unspecified => {
+			part_start::Kind::Text => BlockKind::Text,
+			part_start::Kind::Thinking => BlockKind::Thinking,
+			part_start::Kind::ToolCall => BlockKind::ToolCall,
+			part_start::Kind::Unspecified => {
 				return Err(protocol_error("omp_part_kind_unspecified", ErrorPhase::Streaming));
 			},
 		};
@@ -410,23 +416,21 @@ impl OmpNativeDecoder {
 	fn failure(&mut self, failure: pb::TurnError, emit: &mut dyn FnMut(RawEvent)) {
 		self.terminal = true;
 		let (kind, code) = match failure.kind() {
-			pb::turn_error::Kind::Conflict => (ErrorKind::SessionConflict, "omp_turn_conflict"),
-			pb::turn_error::Kind::NeedFull => (ErrorKind::SessionExpired, "omp_turn_need_full"),
-			pb::turn_error::Kind::Unsupported => {
-				(ErrorKind::CapabilityMismatch, "omp_turn_unsupported")
-			},
-			pb::turn_error::Kind::Auth => (ErrorKind::Authentication, "omp_turn_auth"),
-			pb::turn_error::Kind::RateLimited => (ErrorKind::RateLimited, "omp_turn_rate_limited"),
-			pb::turn_error::Kind::Overloaded => (ErrorKind::ResourceExhausted, "omp_turn_overloaded"),
-			pb::turn_error::Kind::InvokeTimeout => {
+			turn_error::Kind::Conflict => (ErrorKind::SessionConflict, "omp_turn_conflict"),
+			turn_error::Kind::NeedFull => (ErrorKind::SessionExpired, "omp_turn_need_full"),
+			turn_error::Kind::Unsupported => (ErrorKind::CapabilityMismatch, "omp_turn_unsupported"),
+			turn_error::Kind::Auth => (ErrorKind::Authentication, "omp_turn_auth"),
+			turn_error::Kind::RateLimited => (ErrorKind::RateLimited, "omp_turn_rate_limited"),
+			turn_error::Kind::Overloaded => (ErrorKind::ResourceExhausted, "omp_turn_overloaded"),
+			turn_error::Kind::InvokeTimeout => {
 				(ErrorKind::DeadlineExceeded, "omp_turn_invoke_timeout")
 			},
-			pb::turn_error::Kind::EmptyOutput => (ErrorKind::EmptyOutput, "omp_turn_empty_output"),
-			pb::turn_error::Kind::Upstream | pb::turn_error::Kind::Unspecified => {
+			turn_error::Kind::EmptyOutput => (ErrorKind::EmptyOutput, "omp_turn_empty_output"),
+			turn_error::Kind::Upstream | turn_error::Kind::Unspecified => {
 				(ErrorKind::Protocol, "omp_turn_upstream")
 			},
 		};
-		if failure.kind() == pb::turn_error::Kind::Conflict {
+		if failure.kind() == turn_error::Kind::Conflict {
 			let actual_revision = failure
 				.actual
 				.as_ref()
@@ -477,10 +481,10 @@ fn proto_usage(usage: &pb::Usage) -> Usage {
 		cache_read_tokens: usage.cache_read_tokens,
 		cache_write_tokens: usage.cache_write_tokens,
 		source: match usage.accuracy() {
-			pb::usage::Accuracy::Exact => UsageSource::Provider,
-			pb::usage::Accuracy::Estimated => UsageSource::Estimated,
-			pb::usage::Accuracy::Mixed => UsageSource::Mixed,
-			pb::usage::Accuracy::Unspecified => UsageSource::Provider,
+			usage::Accuracy::Exact => UsageSource::Provider,
+			usage::Accuracy::Estimated => UsageSource::Estimated,
+			usage::Accuracy::Mixed => UsageSource::Mixed,
+			usage::Accuracy::Unspecified => UsageSource::Provider,
 		},
 		..Usage::default()
 	}
@@ -493,6 +497,9 @@ fn protocol_error(reason: &'static str, phase: ErrorPhase) -> Error {
 
 #[cfg(test)]
 mod tests {
+
+	use omp_proto::inference::v1::turn_frame;
+
 	use super::*;
 
 	fn revision(head: u64, token: &[u8]) -> thread_pb::Revision {
@@ -503,7 +510,7 @@ mod tests {
 	fn seed_and_incremental_envelopes_validate() {
 		let seed = pb::TurnRequest {
 			turn_id: "turn-seed".into(),
-			input: Some(pb::turn_request::Input::Seed(pb::Seed {
+			input: Some(turn_request::Input::Seed(pb::Seed {
 				context_id: "ctx-seed".into(),
 				thread:     Some(Default::default()),
 			})),
@@ -513,7 +520,7 @@ mod tests {
 
 		let incremental = pb::TurnRequest {
 			turn_id: "turn-current".into(),
-			input: Some(pb::turn_request::Input::Incremental(pb::Incremental {
+			input: Some(turn_request::Input::Incremental(pb::Incremental {
 				context: Some(pb::ContextRef {
 					context_id: "ctx".into(),
 					expected:   Some(revision(0, b"")),
@@ -532,11 +539,11 @@ mod tests {
 	fn replay_conflict_rollback_and_cancel_are_explicit() {
 		let mut receipt = OmpTurnReceipt::default();
 		receipt.observe(&pb::TurnEvent {
-			event: Some(pb::turn_event::Event::Accepted(pb::Accepted { replay: true })),
+			event: Some(turn_event::Event::Accepted(pb::Accepted { replay: true })),
 		});
 		assert!(receipt.accepted && receipt.replay);
 		receipt.observe(&pb::TurnEvent {
-			event: Some(pb::turn_event::Event::Outcome(pb::Outcome {
+			event: Some(turn_event::Event::Outcome(pb::Outcome {
 				revision: Some(revision(1, b"one")),
 				..Default::default()
 			})),
@@ -545,8 +552,8 @@ mod tests {
 
 		let mut conflict = OmpTurnReceipt::default();
 		conflict.observe(&pb::TurnEvent {
-			event: Some(pb::turn_event::Event::Error(pb::TurnError {
-				kind: pb::turn_error::Kind::Conflict as i32,
+			event: Some(turn_event::Event::Error(pb::TurnError {
+				kind: turn_error::Kind::Conflict as i32,
 				actual: Some(revision(2, b"two")),
 				..Default::default()
 			})),
@@ -570,7 +577,7 @@ mod tests {
 		let mut decoder = OmpNativeDecoder::new();
 		let mut events = Vec::new();
 		decoder.failure(
-			pb::TurnError { kind: pb::turn_error::Kind::EmptyOutput as i32, ..Default::default() },
+			pb::TurnError { kind: turn_error::Kind::EmptyOutput as i32, ..Default::default() },
 			&mut |event| events.push(event),
 		);
 
@@ -583,9 +590,9 @@ mod tests {
 	#[test]
 	fn protobuf_framing_is_bounded_and_exact() {
 		let frame = pb::TurnFrame {
-			frame: Some(pb::turn_frame::Frame::Open(pb::TurnRequest {
+			frame: Some(turn_frame::Frame::Open(pb::TurnRequest {
 				turn_id: "turn".into(),
-				input: Some(pb::turn_request::Input::Seed(pb::Seed {
+				input: Some(turn_request::Input::Seed(pb::Seed {
 					context_id: String::new(),
 					thread:     Some(Default::default()),
 				})),

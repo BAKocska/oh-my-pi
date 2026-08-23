@@ -2,11 +2,12 @@
 
 use std::{
 	fmt::Write as _,
+	io,
 	path::{Component, Path, PathBuf},
 };
 
 use omp_core::{Str, sf};
-use omp_storage::blob::BlobStore;
+use omp_storage::{blob, blob::BlobStore};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -103,7 +104,7 @@ pub enum ReviewResultError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A canonical path escapes the workspace or requested scope.
 	#[error("security review location is outside the requested workspace scope: {path}")]
@@ -137,7 +138,7 @@ pub enum ReviewResultError {
 	Serialize(#[source] serde_json::Error),
 	/// The existing private blob authority could not retain the result.
 	#[error("security review result artifact could not be retained")]
-	Retain(#[source] omp_storage::blob::Error),
+	Retain(#[source] blob::Error),
 }
 
 /// Validates final structured output, renders findings first, and retains one
@@ -249,14 +250,16 @@ fn render_findings_first(output: &ReviewOutput) -> Str {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use super::{super::model::Severity, *};
 
 	#[test]
 	fn rejects_reversed_ranges_and_scope_escape() {
 		let workspace = tempfile::tempdir().unwrap();
-		std::fs::create_dir_all(workspace.path().join("src")).unwrap();
-		std::fs::write(workspace.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
-		std::fs::write(workspace.path().join("outside.rs"), "secret\n").unwrap();
+		fs::create_dir_all(workspace.path().join("src")).unwrap();
+		fs::write(workspace.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+		fs::write(workspace.path().join("outside.rs"), "secret\n").unwrap();
 		let scope = ReviewScope::resolve(workspace.path(), Some(Path::new("src"))).unwrap();
 		let malformed = serde_json::json!({
 			"findings": [{

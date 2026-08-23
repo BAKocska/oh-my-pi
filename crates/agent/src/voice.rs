@@ -5,7 +5,7 @@
 //! projects its existing event stream. It never owns a second turn loop,
 //! transcript, or journal.
 
-use std::{collections::BTreeMap, string::FromUtf8Error, sync::LazyLock, time::SystemTime};
+use std::{collections::BTreeMap, iter, string::FromUtf8Error, sync::LazyLock, time::SystemTime};
 
 use omp_core::Str;
 use omp_inference::{
@@ -20,7 +20,7 @@ use omp_scribe::{Props, Template};
 use strum::IntoStaticStr;
 use thiserror::Error;
 
-use crate::{AgentEvent, AgentRunSummary, broker::now_ms};
+use crate::{AgentEvent, AgentRunSummary, broker::now_ms, prompt_engine, prompt_keys};
 
 /// Voice-friendly provider instruction for the realtime half of the unified
 /// assistant. Placeholders are substituted by [`render_live_instructions`].
@@ -46,16 +46,15 @@ pub const LIVE_FINAL_MESSAGE_PREFIX: &str = "\"Agent Final Message\":\n\n";
 /// Renders live instructions with bounded user/account identity substitution.
 pub fn render_live_instructions(first_name: &str, username: &str) -> Str {
 	static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-		crate::prompt_engine::engine()
+		prompt_engine::engine()
 			.compile("voice/live-instructions", LIVE_VOICE_INSTRUCTIONS)
 			.expect("embedded voice instructions template")
 	});
 	let mut props = Props::new();
-	props
-		.set(crate::prompt_keys::FIRST_NAME, first_name.trim().chars().take(64).collect::<String>());
-	props.set(crate::prompt_keys::USERNAME, username.trim().chars().take(64).collect::<String>());
+	props.set(prompt_keys::FIRST_NAME, first_name.trim().chars().take(64).collect::<String>());
+	props.set(prompt_keys::USERNAME, username.trim().chars().take(64).collect::<String>());
 	TEMPLATE
-		.render_str(crate::prompt_engine::engine(), &props)
+		.render_str(prompt_engine::engine(), &props)
 		.expect("typed voice props satisfy embedded template")
 }
 
@@ -142,7 +141,7 @@ impl LiveAgentSettlement {
 			.final_context
 			.into_iter()
 			.map(RealtimeInput::AppendContext)
-			.chain(std::iter::once(RealtimeInput::SettleDelegation(self.receipt)))
+			.chain(iter::once(RealtimeInput::SettleDelegation(self.receipt)))
 	}
 }
 
@@ -384,7 +383,7 @@ fn final_response(outcome: Option<&Outcome>) -> Option<Str> {
 
 #[cfg(test)]
 mod tests {
-	use omp_proto::inference::v1::{Accepted, PartDelta, PartStart, TurnEvent};
+	use omp_proto::inference::v1::{self, Accepted, PartDelta, PartStart, TurnEvent};
 
 	use super::*;
 
@@ -403,11 +402,7 @@ mod tests {
 			}]
 		});
 		AgentRunSummary::settled(
-			Outcome {
-				output,
-				stop: omp_proto::inference::v1::StopReason::StopEndTurn as i32,
-				..Outcome::default()
-			},
+			Outcome { output, stop: v1::StopReason::StopEndTurn as i32, ..Outcome::default() },
 			1,
 			interrupted,
 		)

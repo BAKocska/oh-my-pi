@@ -1,6 +1,7 @@
 //! Devin CLI browser authorization and JSON token exchange.
 
 use std::{
+	mem,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -128,7 +129,7 @@ impl DevinCliTokenHandler {
 		})
 		.map_err(|_| OAuthError::MalformedResponse)?;
 		let mut encoded = Zeroizing::new(encoded);
-		let body = SecretString::from(std::mem::take(&mut *encoded));
+		let body = SecretString::from(mem::take(&mut *encoded));
 		let mut headers = HeaderMap::new();
 		headers.insert(ACCEPT, HeaderValue::from_static(JSON_CONTENT_TYPE));
 		headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
@@ -247,18 +248,19 @@ fn decode_jwt_expiry(token: &str, now: SystemTime) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use std::{fmt, sync::Arc};
 
 	use http::header::{ACCEPT, CONTENT_TYPE};
 	use parking_lot::Mutex;
 	use serde_json::Value;
+	use url::Url;
 
 	use super::{
 		super::super::{OAuthHttpResponse, OAuthTransportError},
 		*,
 	};
 	use crate::{
-		answer::{AuthEvent, AuthResponse},
+		answer::{AuthEvent, AuthResponse, AuthSession as AnswerAuthSession},
 		auth::{
 			CredentialSourceSpec, HeaderPlacement, OAuthClientSpec, OAuthParameter, OAuthRefreshSpec,
 			login::default_login_channels,
@@ -285,8 +287,8 @@ mod tests {
 		body:    SecretString,
 	}
 
-	impl std::fmt::Debug for RecordedRequest {
-		fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	impl fmt::Debug for RecordedRequest {
+		fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 			formatter.write_str("RecordedRequest([REDACTED])")
 		}
 	}
@@ -355,7 +357,7 @@ mod tests {
 		DevinCliTokenHandler { http, clock: Arc::new(FixedClock(now)) }
 	}
 
-	async fn answer_callback(session: &crate::answer::AuthSession) -> (String, String) {
+	async fn answer_callback(session: &AnswerAuthSession) -> (String, String) {
 		let AuthEvent::OpenUrl(url) = session
 			.events
 			.recv_async()
@@ -365,7 +367,7 @@ mod tests {
 		else {
 			panic!("expected URL event");
 		};
-		let parsed = url::Url::parse(&url).expect("authorization URL");
+		let parsed = Url::parse(&url).expect("authorization URL");
 		let state = parsed
 			.query_pairs()
 			.find(|(name, _)| name == "state")
@@ -411,7 +413,7 @@ mod tests {
 		let (result, (authorization_url, state)) = futures::join!(exchange, responder);
 		let tokens = result.expect("Devin tokens");
 
-		let parsed = url::Url::parse(&authorization_url).expect("authorization URL");
+		let parsed = Url::parse(&authorization_url).expect("authorization URL");
 		let pairs = parsed
 			.query_pairs()
 			.map(|(name, value)| (name.into_owned(), value.into_owned()))
@@ -556,7 +558,7 @@ mod tests {
 		else {
 			panic!("expected URL event");
 		};
-		let state = url::Url::parse(&url)
+		let state = Url::parse(&url)
 			.expect("authorization URL")
 			.query_pairs()
 			.find(|(name, _)| name == "state")

@@ -6,14 +6,16 @@
 
 use std::{
 	collections::VecDeque,
+	ffi,
 	fmt::Write as _,
-	io::{BufRead as _, BufReader, Read as _, Write as _},
+	fs,
+	io::{self, BufRead as _, BufReader, Read as _, Write as _},
 	os::{
-		fd::{AsFd as _, AsRawFd as _},
+		fd::{self, AsFd as _, AsRawFd as _},
 		unix::net::UnixStream,
 	},
 	path::Path,
-	process::{Child, Command, Stdio},
+	process::{self, Child, Command, Stdio},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -27,6 +29,7 @@ use bytes::Bytes;
 use flume::{Receiver, Sender};
 use futures::StreamExt as _;
 use nix::{
+	errno::Errno,
 	fcntl::{FcntlArg, OFlag, fcntl},
 	pty::{Winsize, openpty},
 	sys::termios::{Termios, cfgetispeed, cfgetospeed, tcgetattr},
@@ -41,6 +44,7 @@ use omp_catalog::{
 	snapshot::{Catalog, SnapshotProvenance},
 };
 use omp_core::{Str, sf};
+use omp_e2e::support::DocServerTask;
 use omp_inference::{
 	Answer, Error as InferenceError, Registry,
 	answer::{AnswerBody, ChatStream},
@@ -59,6 +63,7 @@ use omp_tool::{
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tokio::time;
 use tower::Service;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -263,7 +268,7 @@ impl ScriptedGateway {
 				.expect("proof tool registers");
 		}
 		let (responses, _ignored) = flume::bounded(32);
-		let handle = tokio::time::timeout(
+		let handle = time::timeout(
 			READY_TIMEOUT,
 			DaemonHandle::start_for_test(
 				DaemonConfig::local(LocalEndpoint::from(socket.to_path_buf()))
@@ -303,7 +308,7 @@ impl ScriptedGateway {
 	}
 
 	async fn await_preview(&self) {
-		tokio::time::timeout(CHECKPOINT_TIMEOUT, self.preview_reached.recv_async())
+		time::timeout(CHECKPOINT_TIMEOUT, self.preview_reached.recv_async())
 			.await
 			.expect("edit preview stream pause timed out")
 			.expect("edit preview stream observer closed");
@@ -632,8 +637,8 @@ fn lines(response: &Value) -> String {
 
 struct PtyChild {
 	child:      Child,
-	master:     std::os::fd::OwnedFd,
-	slave:      std::os::fd::OwnedFd,
+	master:     fd::OwnedFd,
+	slave:      fd::OwnedFd,
 	before:     Termios,
 	raw:        Arc<Mutex<Vec<u8>>>,
 	reader_end: Arc<AtomicBool>,
@@ -659,16 +664,16 @@ impl PtyChild {
 					Ok(0) if reader_stop.load(Ordering::Acquire) => break,
 					Ok(0) => thread::sleep(Duration::from_millis(5)),
 					Ok(count) => reader_raw.lock().extend_from_slice(&buffer[..count]),
-					Err(nix::errno::Errno::EAGAIN) if reader_stop.load(Ordering::Acquire) => break,
-					Err(nix::errno::Errno::EAGAIN) => thread::sleep(Duration::from_millis(5)),
-					Err(nix::errno::Errno::EIO) => break,
+					Err(Errno::EAGAIN) if reader_stop.load(Ordering::Acquire) => break,
+					Err(Errno::EAGAIN) => thread::sleep(Duration::from_millis(5)),
+					Err(Errno::EIO) => break,
 					Err(error) => panic!("PTY read failed: {error}"),
 				}
 			}
 		});
 
 		let home = project.parent().expect("project has parent").join("home");
-		std::fs::create_dir_all(&home).expect("create isolated home");
+		fs::create_dir_all(&home).expect("create isolated home");
 		let child = Command::new(binary)
 			.args(args)
 			.current_dir(project)
@@ -698,17 +703,14 @@ impl PtyChild {
 		// SAFETY: master is a live PTY and window is a valid winsize value.
 		let result =
 			unsafe { libc::ioctl(self.master.as_fd().as_raw_fd(), libc::TIOCSWINSZ, &window) };
-		assert_eq!(result, 0, "TIOCSWINSZ failed: {}", std::io::Error::last_os_error());
+		assert_eq!(result, 0, "TIOCSWINSZ failed: {}", io::Error::last_os_error());
 	}
 
 	fn raw(&self) -> Vec<u8> {
 		self.raw.lock().clone()
 	}
 
-	fn wait(
-		mut self,
-		timeout: Duration,
-	) -> (std::process::ExitStatus, Vec<u8>, String, String, Termios) {
+	fn wait(mut self, timeout: Duration) -> (process::ExitStatus, Vec<u8>, String, String, Termios) {
 		let deadline = Instant::now() + timeout;
 		let status = loop {
 			match self.child.try_wait().expect("poll omp chat") {
@@ -858,36 +860,27 @@ fn assert_restored(raw: &[u8], before: &Termios, after: &Termios, diagnostics: &
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
+	use std::os::unix::fs::PermissionsExt;
 	omp_e2e::support::install_omp_binary_env().expect("install Cargo-built omp binary");
 	let scratch = tempfile::tempdir().expect("scratch root");
-	std::fs::set_permissions(
-		scratch.path(),
-		<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-	)
-	.expect("secure scratch root");
+	fs::set_permissions(scratch.path(), <fs::Permissions>::from_mode(0o700))
+		.expect("secure scratch root");
 	let project = scratch.path().join("project");
-	std::fs::create_dir(&project).expect("project directory");
-	std::fs::write(project.join("scratch.txt"), "old\n").expect("write read/edit fixture");
+	fs::create_dir(&project).expect("project directory");
+	fs::write(project.join("scratch.txt"), "old\n").expect("write read/edit fixture");
 	let metadata_dir = project.join(".omp");
-	std::fs::create_dir(&metadata_dir).expect("project metadata directory");
-	std::fs::set_permissions(
-		&metadata_dir,
-		<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-	)
-	.expect("use standard project metadata permissions");
+	fs::create_dir(&metadata_dir).expect("project metadata directory");
+	fs::set_permissions(&metadata_dir, <fs::Permissions>::from_mode(0o755))
+		.expect("use standard project metadata permissions");
 	let state_dir = omp_env::project_state::directory(&scratch.path().join("home/data"), &project)
 		.expect("project state directory");
-	std::fs::create_dir_all(&state_dir).expect("create project state directory");
-	std::fs::set_permissions(
-		&state_dir,
-		<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-	)
-	.expect("use standard project state permissions");
+	fs::create_dir_all(&state_dir).expect("create project state directory");
+	fs::set_permissions(&state_dir, <fs::Permissions>::from_mode(0o755))
+		.expect("use standard project state permissions");
 	let docserver_socket = omp_env::project_state::document_socket(&state_dir);
-	let docserver =
-		omp_e2e::support::DocServerTask::spawn(project.clone(), docserver_socket.clone(), Vec::new())
-			.await
-			.expect("start real document authority");
+	let docserver = DocServerTask::spawn(project.clone(), docserver_socket.clone(), Vec::new())
+		.await
+		.expect("start real document authority");
 	let shell_release = scratch.path().join("release-shell");
 	let gateway_socket = scratch.path().join("gateway.sock");
 	let debug_socket = scratch.path().join("tui-debug.sock");
@@ -913,7 +906,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 			snapshot.text.contains("SESSION INDEX") && snapshot.text.contains("New session")
 		});
 	assert_surface(&index, "session index");
-	let journals: Vec<_> = std::fs::read_dir(state_dir.join("sessions"))
+	let journals: Vec<_> = fs::read_dir(state_dir.join("sessions"))
 		.expect("read session directory")
 		.map(|entry| entry.expect("read session entry").path())
 		.filter(|path| {
@@ -925,7 +918,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	assert_eq!(journals.len(), 1, "expected one eagerly-created journal: {journals:?}");
 	let initial_session_id = journals[0]
 		.file_stem()
-		.and_then(std::ffi::OsStr::to_str)
+		.and_then(ffi::OsStr::to_str)
 		.expect("journal has UTF-8 ULID stem")
 		.to_owned();
 	bootstrap_debug.keys("ctrl-c");
@@ -958,7 +951,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 			&& surface.contains("edit · scratch.txt")
 			&& surface.contains("[scratch.txt#5C9F]")
 			&& surface.contains("+new")
-			&& std::fs::read_to_string(project.join("scratch.txt")).is_ok_and(|text| text == "old\n")
+			&& fs::read_to_string(project.join("scratch.txt")).is_ok_and(|text| text == "old\n")
 	});
 	assert_surface(&preview, "edit preview");
 	gateway.release_preview();
@@ -967,7 +960,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		surface.contains("edit · scratch.txt")
 			&& surface.contains("edit 1 files changed · +1 -1")
 			&& surface.contains("scratch.txt 2 ops")
-			&& std::fs::read_to_string(project.join("scratch.txt")).is_ok_and(|text| text == "new\n")
+			&& fs::read_to_string(project.join("scratch.txt")).is_ok_and(|text| text == "new\n")
 	});
 	assert_surface(&final_edit, "edit final");
 
@@ -982,7 +975,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		"prior transcript vanished during shell stream: {}",
 		shell_live.frame
 	);
-	std::fs::write(&shell_release, b"release").expect("release shell fixture");
+	fs::write(&shell_release, b"release").expect("release shell fixture");
 	let shell_final = wait_snapshot(&mut debug, &raw_capture, "shell exit badge", |snapshot| {
 		snapshot.combined().contains("exit 7")
 	});
@@ -1114,7 +1107,7 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	);
 	assert!(status.success(), "omp chat did not exit cleanly\n{diagnostics}");
 	assert_restored(&raw, &before, &after, &diagnostics);
-	let journals: Vec<_> = std::fs::read_dir(state_dir.join("sessions"))
+	let journals: Vec<_> = fs::read_dir(state_dir.join("sessions"))
 		.expect("read session directory")
 		.map(|entry| entry.expect("read session entry").path())
 		.filter(|path| {
@@ -1126,13 +1119,13 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	assert_eq!(journals.len(), 2, "expected original and steering journals: {journals:?}");
 	assert!(
 		journals.iter().any(|path| {
-			path.file_stem().and_then(std::ffi::OsStr::to_str) == Some(initial_session_id.as_str())
+			path.file_stem().and_then(ffi::OsStr::to_str) == Some(initial_session_id.as_str())
 		}),
 		"original bootstrap journal missing: {journals:?}"
 	);
 	let steering_session_id = journals
 		.iter()
-		.filter_map(|path| path.file_stem().and_then(std::ffi::OsStr::to_str))
+		.filter_map(|path| path.file_stem().and_then(ffi::OsStr::to_str))
 		.find(|id| *id != initial_session_id.as_str())
 		.expect("steering journal has a distinct ULID")
 		.to_owned();

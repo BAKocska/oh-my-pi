@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, io, iter, mem, sync::Arc};
 
 use itertools::Itertools;
 use omp_core::Str;
@@ -147,7 +147,7 @@ pub enum TokenizerError {
 
 	/// An I/O error occurred while reading from the input stream.
 	#[error("failed to read input")]
-	ReadError(#[from] std::io::Error),
+	ReadError(#[from] io::Error),
 }
 
 impl TokenizerError {
@@ -250,8 +250,8 @@ impl Default for TokenizerOptions {
 }
 
 /// A tokenizer for shell scripts.
-pub(crate) struct Tokenizer<'a, R: ?Sized + std::io::BufRead> {
-	char_reader: std::iter::Peekable<xutf::Chars<'a, R>>,
+pub(crate) struct Tokenizer<'a, R: ?Sized + io::BufRead> {
+	char_reader: iter::Peekable<xutf::Chars<'a, R>>,
 	cross_state: CrossTokenParseState,
 	options:     TokenizerOptions,
 }
@@ -279,13 +279,12 @@ impl TokenParseState {
 
 	pub fn pop(&mut self, end_position: &SourcePosition) -> Token {
 		let end = Arc::new(end_position.to_owned());
-		let token_location =
-			SourceSpan { start: Arc::new(std::mem::take(&mut self.start_position)), end };
+		let token_location = SourceSpan { start: Arc::new(mem::take(&mut self.start_position)), end };
 
-		let token = if std::mem::take(&mut self.token_is_operator) {
-			Token::Operator(std::mem::take(&mut self.token_so_far).into(), token_location)
+		let token = if mem::take(&mut self.token_is_operator) {
+			Token::Operator(mem::take(&mut self.token_so_far).into(), token_location)
 		} else {
-			Token::Word(std::mem::take(&mut self.token_so_far).into(), token_location)
+			Token::Word(mem::take(&mut self.token_so_far).into(), token_location)
 		};
 
 		end_position.clone_into(&mut self.start_position);
@@ -344,7 +343,7 @@ impl TokenParseState {
 		}
 
 		// TODO(tokenizer): Make sure the here-tag meets criteria (and isn't a newline).
-		let current_here_state = std::mem::take(&mut cross_token_state.here_state);
+		let current_here_state = mem::take(&mut cross_token_state.here_state);
 		match current_here_state {
 			HereState::NextTokenIsHereTag { remove_tabs } => {
 				// Don't yield the operator as a token yet. We need to make sure we collect
@@ -641,8 +640,8 @@ pub fn uncached_tokenize_str(
 	input: &str,
 	options: &TokenizerOptions,
 ) -> Result<Vec<Token>, TokenizerError> {
-	let mut reader = std::io::BufReader::new(input.as_bytes());
-	let mut tokenizer = crate::parser::tokenizer::Tokenizer::new(&mut reader, options);
+	let mut reader = io::BufReader::new(input.as_bytes());
+	let mut tokenizer = Tokenizer::new(&mut reader, options);
 
 	let mut tokens = vec![];
 	loop {
@@ -656,7 +655,7 @@ pub fn uncached_tokenize_str(
 	Ok(tokens)
 }
 
-impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
+impl<'a, R: ?Sized + io::BufRead> Tokenizer<'a, R> {
 	pub fn new(reader: &'a mut R, options: &TokenizerOptions) -> Self {
 		Tokenizer {
 			options:     options.clone(),
@@ -1374,7 +1373,7 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
 	}
 }
 
-impl<R: ?Sized + std::io::BufRead> Iterator for Tokenizer<'_, R> {
+impl<R: ?Sized + io::BufRead> Iterator for Tokenizer<'_, R> {
 	type Item = Result<TokenizeResult, TokenizerError>;
 
 	fn next(&mut self) -> Option<Self::Item> {

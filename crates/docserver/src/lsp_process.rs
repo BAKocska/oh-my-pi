@@ -2,10 +2,14 @@
 
 use std::{
 	collections::{BTreeMap, HashMap, VecDeque},
+	env, fs,
 	future::Future,
+	io, mem,
 	path::{Path, PathBuf},
 	pin::Pin,
+	process,
 	process::Stdio,
+	str,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -15,7 +19,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use flume::{Receiver, Sender};
+use flume::Sender;
 use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -23,7 +27,10 @@ use serde_json::{Map, Value, value::RawValue};
 use tokio::{
 	io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
 	process::{Child, Command},
-	sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch},
+	sync::{
+		OwnedSemaphorePermit, Semaphore, oneshot,
+		watch::{self, Receiver},
+	},
 	task::JoinHandle,
 	time::{sleep, timeout},
 };
@@ -33,6 +40,7 @@ use url::Url;
 use crate::{
 	Environment, LanguageId,
 	lsp::{LspError, LspServer, LspTransport, LspTransportError},
+	lsp_apply_edit,
 	lsp_binary::{BinaryPlatform, LspBinaryError, resolve_lsp_binary},
 	lsp_registry::{
 		LspBindingHandle, LspBindingId, LspBindingSpec, LspRegistry, LspRegistryError, LspSelector,
@@ -53,6 +61,24 @@ const MAX_QUEUE_CAPACITY: usize = 4_096;
 const MAX_PENDING_REQUESTS: usize = 4_096;
 const MAX_SHUTDOWN_TIMEOUT_MS: u64 = 60_000;
 const JSON_RPC_VERSION: &str = "2.0";
+
+mod channel_receiver {
+	use flume::Receiver;
+
+	pub(super) struct ChannelReceiver<T>(Receiver<T>);
+
+	impl<T> ChannelReceiver<T> {
+		pub(super) const fn new(receiver: Receiver<T>) -> Self {
+			Self(receiver)
+		}
+
+		pub(super) async fn recv(&self) -> Option<T> {
+			self.0.recv_async().await.ok()
+		}
+	}
+}
+
+use channel_receiver::ChannelReceiver;
 
 /// Serializable selector for a process-backed LSP binding.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -225,7 +251,7 @@ pub enum LspProcessError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A configuration file did not contain the documented JSON shape.
 	#[error("invalid LSP configuration {}: {source}", path.display())]
@@ -271,7 +297,7 @@ pub enum LspProcessError {
 	InitializeTimeout,
 	/// The child could not be spawned or controlled.
 	#[error("LSP process I/O failed: {0}")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// The LSP transport failed.
 	#[error(transparent)]
 	Transport(#[from] LspTransportError),
@@ -297,7 +323,7 @@ pub fn load_lsp_process_configs(
 		.into_iter()
 		.map(|path| {
 			let path = path.as_ref();
-			let bytes = std::fs::read(path)
+			let bytes = fs::read(path)
 				.map_err(|source| LspProcessError::ReadConfig { path: path.to_owned(), source })?;
 			let config = serde_json::from_slice::<LspProcessConfig>(&bytes)
 				.map_err(|source| LspProcessError::ParseConfig { path: path.to_owned(), source })?;
@@ -342,8 +368,8 @@ impl LspProcess {
 			config.executable.to_string_lossy().as_ref(),
 			&config.args,
 			&local_roots,
-			std::env::var_os("PATH").as_deref(),
-			std::process::id(),
+			env::var_os("PATH").as_deref(),
+			process::id(),
 			platform,
 		)?;
 		let mut command = Command::new(&resolved.executable);
@@ -605,11 +631,11 @@ struct BoundedJson {
 	exceeded: bool,
 }
 
-impl std::io::Write for BoundedJson {
-	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+impl io::Write for BoundedJson {
+	fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
 		if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
 			self.exceeded = true;
-			return Err(std::io::Error::other("serialized JSON exceeds configured limit"));
+			return Err(io::Error::other("serialized JSON exceeds configured limit"));
 		}
 		let required = self.bytes.len() + bytes.len();
 		if required > self.bytes.capacity() {
@@ -619,7 +645,7 @@ impl std::io::Write for BoundedJson {
 		Ok(bytes.len())
 	}
 
-	fn flush(&mut self) -> std::io::Result<()> {
+	fn flush(&mut self) -> io::Result<()> {
 		Ok(())
 	}
 }
@@ -629,7 +655,7 @@ impl ProcessTransport {
 		reader: R,
 		writer: W,
 		settings: &LspTransportSettings,
-	) -> (Arc<Self>, Receiver<InboundMessage>, JoinHandle<()>, JoinHandle<()>)
+	) -> (Arc<Self>, ChannelReceiver<InboundMessage>, JoinHandle<()>, JoinHandle<()>)
 	where
 		R: AsyncRead + Unpin + Send + 'static,
 		W: AsyncWrite + Unpin + Send + 'static,
@@ -650,7 +676,12 @@ impl ProcessTransport {
 			max_message_bytes: settings.max_message_bytes,
 		});
 		let writer_transport = transport.clone();
-		let writer_task = tokio::spawn(writer_loop(writer, writer_rx, cancel_rx, writer_transport));
+		let writer_task = tokio::spawn(writer_loop(
+			writer,
+			ChannelReceiver::new(writer_rx),
+			ChannelReceiver::new(cancel_rx),
+			writer_transport,
+		));
 		let reader_transport = transport.clone();
 		let max_header_bytes = settings.max_header_bytes;
 		let max_message_bytes = settings.max_message_bytes;
@@ -664,7 +695,7 @@ impl ProcessTransport {
 			)
 			.await;
 		});
-		(transport, inbound_rx, reader_task, writer_task)
+		(transport, ChannelReceiver::new(inbound_rx), reader_task, writer_task)
 	}
 
 	fn close(&self, message: &str) {
@@ -677,7 +708,7 @@ impl ProcessTransport {
 			if state.closed.is_none() {
 				state.closed = Some(error.clone());
 			}
-			(std::mem::take(&mut state.pending), std::mem::take(&mut state.inbound))
+			(mem::take(&mut state.pending), mem::take(&mut state.inbound))
 		};
 		for (_, pending) in pending {
 			let _ = pending.response.send(Err(error.clone()));
@@ -939,8 +970,8 @@ impl RpcError {
 
 async fn writer_loop<W>(
 	mut writer: W,
-	commands: Receiver<WriteCommand>,
-	cancellations: Receiver<WriteCommand>,
+	commands: ChannelReceiver<WriteCommand>,
+	cancellations: ChannelReceiver<WriteCommand>,
 	transport: Arc<ProcessTransport>,
 ) where
 	W: AsyncWrite + Unpin,
@@ -948,10 +979,10 @@ async fn writer_loop<W>(
 	loop {
 		let command = tokio::select! {
 			biased;
-			command = cancellations.recv_async() => command,
-			command = commands.recv_async() => command,
+			command = cancellations.recv() => command,
+			command = commands.recv() => command,
 		};
-		let Ok(command) = command else {
+		let Some(command) = command else {
 			break;
 		};
 		let result = write_frame(&mut writer, &command.payload)
@@ -1087,7 +1118,7 @@ async fn reader_loop<R>(
 pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
 	writer: &mut W,
 	payload: &[u8],
-) -> std::io::Result<()> {
+) -> io::Result<()> {
 	let header = format!("Content-Length: {}\r\n\r\n", payload.len());
 	writer.write_all(header.as_bytes()).await?;
 	writer.write_all(payload).await?;
@@ -1111,7 +1142,7 @@ pub enum LspFrameError {
 	ReadHeader {
 		/// The underlying I/O failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// The frame header was not UTF-8.
 	#[error("LSP frame header is not ASCII-compatible UTF-8")]
@@ -1142,7 +1173,7 @@ pub enum LspFrameError {
 	ReadPayload {
 		/// The underlying I/O failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 }
 
@@ -1186,7 +1217,7 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
 		}
 	}
 	let header = scanned;
-	let header_text = std::str::from_utf8(&header).map_err(|_| LspFrameError::HeaderUtf8)?;
+	let header_text = str::from_utf8(&header).map_err(|_| LspFrameError::HeaderUtf8)?;
 	if !header.is_ascii() {
 		return Err(LspFrameError::HeaderNonAscii);
 	}
@@ -1280,7 +1311,7 @@ fn initialize_params(
 ) -> Result<Bytes, LspProcessError> {
 	let root_uri = environment.root_uri();
 	let mut params = Map::new();
-	params.insert("processId".to_owned(), Value::from(std::process::id()));
+	params.insert("processId".to_owned(), Value::from(process::id()));
 	params.insert("clientInfo".to_owned(), serde_json::json!({ "name": "omp-docserver" }));
 	params.insert("rootUri".to_owned(), Value::String(root_uri.as_str().to_owned()));
 	params.insert(
@@ -1377,8 +1408,8 @@ impl InboundDispatch {
 
 fn spawn_inbound_dispatch(
 	transport: Arc<ProcessTransport>,
-	inbound: Receiver<InboundMessage>,
-	mut binding: watch::Receiver<Option<LspBindingHandle>>,
+	inbound: ChannelReceiver<InboundMessage>,
+	mut binding: Receiver<Option<LspBindingHandle>>,
 	environment: Environment,
 	registry: LspRegistry,
 	root_uri: Url,
@@ -1399,7 +1430,7 @@ fn spawn_inbound_dispatch(
 					return;
 				}
 				let next = if deferred.is_empty() {
-					inbound.recv_async().await.ok()
+					inbound.recv().await
 				} else {
 					tokio::select! {
 						changed = binding.changed() => {
@@ -1408,7 +1439,7 @@ fn spawn_inbound_dispatch(
 							}
 							continue;
 						},
-						message = inbound.recv_async() => message.ok(),
+						message = inbound.recv() => message,
 					}
 				};
 				let Some(message) = next else {
@@ -1449,7 +1480,7 @@ fn spawn_inbound_dispatch(
 
 async fn dispatch_inbound(
 	message: &InboundMessage,
-	binding: &mut watch::Receiver<Option<LspBindingHandle>>,
+	binding: &mut Receiver<Option<LspBindingHandle>>,
 	registry: &LspRegistry,
 	environment: &Environment,
 	root_uri: &Url,
@@ -1464,7 +1495,7 @@ async fn dispatch_inbound(
 				post_response: None,
 			};
 		};
-		return crate::lsp_apply_edit::apply_workspace_edit(
+		return lsp_apply_edit::apply_workspace_edit(
 			environment.clone(),
 			handle,
 			message.params.clone(),
@@ -1480,7 +1511,7 @@ async fn dispatch_inbound(
 
 async fn dispatch_response(
 	message: &InboundMessage,
-	binding: &mut watch::Receiver<Option<LspBindingHandle>>,
+	binding: &mut Receiver<Option<LspBindingHandle>>,
 	registry: &LspRegistry,
 	root_uri: &Url,
 	root_name: &str,
@@ -1536,7 +1567,7 @@ async fn dispatch_response(
 }
 
 async fn await_binding(
-	binding: &mut watch::Receiver<Option<LspBindingHandle>>,
+	binding: &mut Receiver<Option<LspBindingHandle>>,
 ) -> Option<LspBindingHandle> {
 	loop {
 		let current = *binding.borrow();

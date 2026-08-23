@@ -1,11 +1,11 @@
-use crate::parser::tokenizer;
+use crate::parser::{SourcePosition, Token, tokenizer};
 
 /// Represents an error that occurred while parsing tokens.
 #[derive(thiserror::Error, Debug)]
 pub enum ParseError {
 	/// A parsing error occurred near the given position.
 	#[error("syntax error at line {} col {}", .0.line, .0.column)]
-	ParsingNear(crate::parser::SourcePosition),
+	ParsingNear(SourcePosition),
 
 	/// A parsing error occurred at the end of the input.
 	#[error("syntax error at end of input")]
@@ -17,7 +17,7 @@ pub enum ParseError {
 		/// The inner error.
 		inner:    tokenizer::TokenizerError,
 		/// Optionally provides the position of the error.
-		position: Option<crate::parser::SourcePosition>,
+		position: Option<SourcePosition>,
 	},
 }
 
@@ -65,7 +65,7 @@ pub struct TestCommandParseError(#[from] peg::error::ParseError<usize>);
 
 pub(crate) fn convert_peg_parse_error(
 	err: &peg::error::ParseError<usize>,
-	tokens: &[crate::parser::Token],
+	tokens: &[Token],
 ) -> ParseError {
 	let approx_token_index = err.location;
 

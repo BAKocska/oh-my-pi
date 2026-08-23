@@ -7,7 +7,10 @@ use std::{
 	time::Duration,
 };
 
-use tokio::sync::{Barrier as TokioBarrier, Notify};
+use tokio::{
+	sync::{Barrier as TokioBarrier, Notify},
+	time,
+};
 
 use crate::{Context as _, Result};
 
@@ -21,7 +24,7 @@ pub async fn within<T>(
 	limit: Duration,
 	future: impl Future<Output = T>,
 ) -> Result<T> {
-	tokio::time::timeout(limit, future)
+	time::timeout(limit, future)
 		.await
 		.with_context(|| format!("timed out waiting for {label} after {limit:?}"))
 }

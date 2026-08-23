@@ -5,6 +5,7 @@ use std::{net::IpAddr, time::Duration};
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
+use url::Url;
 
 /// Supported local or configured OpenAI-compatible endpoint families.
 #[derive(
@@ -57,7 +58,7 @@ impl DiscoveryEndpoint {
 
 	/// Reports whether the configured host is an IP loopback or `localhost`.
 	pub fn is_loopback(&self) -> bool {
-		url::Url::parse(self.base_url.as_str())
+		Url::parse(self.base_url.as_str())
 			.ok()
 			.and_then(|url| url.host_str().map(str::to_owned))
 			.is_some_and(|host| {
@@ -99,7 +100,7 @@ pub fn configured_endpoint(
 	kind: DiscoveryEndpointKind,
 	base_url: &str,
 ) -> Result<DiscoveryEndpoint, EndpointError> {
-	let parsed = url::Url::parse(base_url).map_err(|_| EndpointError::InvalidUrl)?;
+	let parsed = Url::parse(base_url).map_err(|_| EndpointError::InvalidUrl)?;
 	if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
 		return Err(EndpointError::InvalidUrl);
 	}

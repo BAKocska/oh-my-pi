@@ -12,12 +12,13 @@ pub fn root(agent_root: &Path) -> PathBuf {
 	agent_root.join("managed-skills")
 }
 
+use std::fs;
+
 /// Discovers generated skills independently of autolearn enablement.
 ///
 /// Callers append this provider after every authored source. The final
 /// first-wins merge therefore makes generated skills dead-last without giving
 /// the managed directory any way to override authored content.
-use std::fs;
 pub fn discover_dead_last(agent_root: &Path, settings: &SkillDiscoverySettings) -> SkillDiscovery {
 	let managed_root = root(agent_root);
 	let Ok(metadata) = fs::symlink_metadata(&managed_root) else {

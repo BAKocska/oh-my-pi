@@ -2,7 +2,7 @@
 
 use omp_core::Str;
 
-use super::types::{Action, Draft, Loss, Metrics};
+use super::types::{Action, Draft, Metrics};
 
 /// Protocol violation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -200,7 +200,10 @@ mod tests {
 			.apply_turn(vec![
 				Action::Rewrite {
 					text:   "short".into(),
-					losses: vec![Loss { content: "long".into(), reason: "redundant".into() }],
+					losses: vec![super::super::Loss {
+						content: "long".into(),
+						reason:  "redundant".into(),
+					}],
 				},
 				Action::Approve { verdict: "fine".into() },
 			])

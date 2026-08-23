@@ -14,6 +14,8 @@ use http::{
 use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use serde_json::{Value, json};
+use tokio::time;
+use url::form_urlencoded;
 
 use crate::{
 	answer::{
@@ -272,7 +274,7 @@ fn gateway_request(
 		"V": "1.0"
 	}))
 	.ok()?;
-	let body = url::form_urlencoded::Serializer::new(String::new())
+	let body = form_urlencoded::Serializer::new(String::new())
 		.append_pair("product", "sfm_bailian")
 		.append_pair("action", config.gateway_action)
 		.append_pair("region", config.region)
@@ -309,7 +311,7 @@ async fn execute_bounded(
 	if timeout.is_zero() {
 		return None;
 	}
-	tokio::time::timeout(timeout, http.execute(request))
+	time::timeout(timeout, http.execute(request))
 		.await
 		.ok()?
 		.ok()
@@ -508,7 +510,7 @@ fn parse_positive_timestamp(value: &Value) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
 	use std::{
-		collections::VecDeque,
+		collections::{BTreeMap, VecDeque},
 		sync::Arc,
 		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
@@ -577,7 +579,7 @@ mod tests {
 		UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 	}
 
-	fn form(body: &str) -> std::collections::BTreeMap<String, String> {
+	fn form(body: &str) -> BTreeMap<String, String> {
 		url::form_urlencoded::parse(body.as_bytes())
 			.into_owned()
 			.collect()

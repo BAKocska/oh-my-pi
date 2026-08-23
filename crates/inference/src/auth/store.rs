@@ -2,7 +2,9 @@
 
 use std::{
 	fmt,
+	fs::OpenOptions,
 	future::Future,
+	io,
 	path::{Path, PathBuf},
 	pin::Pin,
 	sync::Arc,
@@ -18,12 +20,20 @@ use thiserror::Error;
 
 use super::{
 	crypto::{CryptoError, EncryptedBlob, SecretContext, decrypt, encrypt},
-	key::{KeyError, KeyId, KeySource},
+	key::{EncryptionKey, KeyError, KeyId, KeySource},
 	lease::{
 		AuthRejection, CredentialError, CredentialLease, CredentialNeed, CredentialSource, LeaseMeta,
 	},
+	oauth,
+	oauth::OAuthError,
 };
-use crate::id::{AccountId, PrincipalId};
+use crate::{
+	account::{
+		CredentialFreshness, PersistentRefreshLease, RefreshLeaseAcquire, RefreshLeaseRequest,
+		RefreshLeaseStore, RefreshLeaseWait, RefreshReceipt, RefreshResult, RefreshStoreError,
+	},
+	id::{AccountId, PrincipalId},
+};
 
 const SCHEMA_VERSION: u32 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -238,7 +248,7 @@ pub struct PersistentLease {
 }
 
 impl PersistentLease {
-	fn from_refresh(lease: &crate::account::PersistentRefreshLease) -> Result<Self, StoreError> {
+	fn from_refresh(lease: &PersistentRefreshLease) -> Result<Self, StoreError> {
 		let epoch = lease
 			.id
 			.as_str()
@@ -313,7 +323,7 @@ pub enum StoreError {
 	Crypto(#[from] CryptoError),
 	/// An imported OAuth bundle could not be encoded canonically.
 	#[error(transparent)]
-	OAuth(#[from] super::oauth::OAuthError),
+	OAuth(#[from] OAuthError),
 	/// A supplied system time predates the Unix epoch or overflows milliseconds.
 	#[error("credential persistence time is out of range")]
 	InvalidTime,
@@ -335,7 +345,7 @@ pub enum StoreError {
 	MalformedLease,
 	/// A secret-free backup destination could not be created exclusively.
 	#[error("credential metadata backup destination could not be created")]
-	BackupIo(#[source] std::io::Error),
+	BackupIo(#[source] io::Error),
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -408,11 +418,8 @@ impl CredentialStore {
 			.expires_at
 			.duration_since(import.imported_at)
 			.unwrap_or(Duration::ZERO);
-		let bundle = super::oauth::encode_imported_bundle(
-			import.access_token,
-			import.refresh_token,
-			expires_in,
-		)?;
+		let bundle =
+			oauth::encode_imported_bundle(import.access_token, import.refresh_token, expires_in)?;
 		self.put_oauth_bundle(OAuthCredentialWrite {
 			account_id:          &import.account_id,
 			principal_id:        &import.principal_id,
@@ -451,7 +458,7 @@ impl CredentialStore {
 	pub(crate) fn put_oauth_bundle_under_refresh_lease(
 		&self,
 		write: OAuthCredentialWrite<'_>,
-		lease: &crate::account::PersistentRefreshLease,
+		lease: &PersistentRefreshLease,
 		now: SystemTime,
 	) -> Result<CredentialMetadata, StoreError> {
 		let persistent = PersistentLease::from_refresh(lease)?;
@@ -1080,7 +1087,7 @@ impl CredentialStore {
 		let metadata = self.list_metadata()?;
 		let destination = destination.as_ref();
 		drop(
-			std::fs::OpenOptions::new()
+			OpenOptions::new()
 				.write(true)
 				.create_new(true)
 				.open(destination)
@@ -1134,7 +1141,7 @@ impl CredentialSource for StoredCredentialSource {
 		async move {
 			let account = need.account.ok_or(CredentialError::Unavailable)?;
 			if let Ok(stored) = self.store.load_oauth_bundle(&account) {
-				let lease = super::oauth::lease_stored_bundle(stored, need.valid_after)?;
+				let lease = oauth::lease_stored_bundle(stored, need.valid_after)?;
 				if need
 					.principal
 					.as_ref()
@@ -1203,21 +1210,11 @@ impl CredentialSource for StoredCredentialSource {
 	}
 }
 
-impl crate::account::RefreshLeaseStore for CredentialStore {
+impl RefreshLeaseStore for CredentialStore {
 	fn try_acquire<'a>(
 		&'a self,
-		request: &'a crate::account::RefreshLeaseRequest,
-	) -> Pin<
-		Box<
-			dyn Future<
-					Output = Result<
-						crate::account::RefreshLeaseAcquire,
-						crate::account::RefreshStoreError,
-					>,
-				> + Send
-				+ 'a,
-		>,
-	> {
+		request: &'a RefreshLeaseRequest,
+	) -> Pin<Box<dyn Future<Output = Result<RefreshLeaseAcquire, RefreshStoreError>> + Send + 'a>> {
 		Box::pin(async move {
 			let outcome = self
 				.try_acquire_lease(
@@ -1229,20 +1226,18 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 				)
 				.map_err(refresh_store_error)?;
 			match outcome {
-				LeaseOutcome::Acquired(lease) => Ok(crate::account::RefreshLeaseAcquire::Acquired(
-					crate::account::PersistentRefreshLease {
+				LeaseOutcome::Acquired(lease) => {
+					Ok(RefreshLeaseAcquire::Acquired(PersistentRefreshLease {
 						id:         Str::new(lease.epoch.to_string()),
 						account:    lease.account_id,
 						owner:      lease.owner,
 						expires_at: system_time_from_ms(lease.expires_at_ms)
 							.map_err(refresh_store_error)?,
-					},
-				)),
-				LeaseOutcome::Held { expires_at_ms, .. } => {
-					Ok(crate::account::RefreshLeaseAcquire::HeldByPeer {
-						expires_at: system_time_from_ms(expires_at_ms).map_err(refresh_store_error)?,
-					})
+					}))
 				},
+				LeaseOutcome::Held { expires_at_ms, .. } => Ok(RefreshLeaseAcquire::HeldByPeer {
+					expires_at: system_time_from_ms(expires_at_ms).map_err(refresh_store_error)?,
+				}),
 			}
 		})
 	}
@@ -1252,21 +1247,14 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 		account: &'a AccountId<str>,
 		minimum_generation: u64,
 		lease_expires_at: SystemTime,
-	) -> Pin<
-		Box<
-			dyn Future<
-					Output = Result<crate::account::RefreshLeaseWait, crate::account::RefreshStoreError>,
-				> + Send
-				+ 'a,
-		>,
-	> {
+	) -> Pin<Box<dyn Future<Output = Result<RefreshLeaseWait, RefreshStoreError>> + Send + 'a>> {
 		Box::pin(async move {
 			loop {
 				let observed_at = SystemTime::now();
 				if let Some(metadata) = self.metadata(account).map_err(refresh_store_error)?
 					&& metadata.generation >= minimum_generation
 				{
-					let freshness = crate::account::CredentialFreshness {
+					let freshness = CredentialFreshness {
 						generation: metadata.generation,
 						issued_at: None,
 						expires_at: metadata
@@ -1276,7 +1264,7 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 							.map_err(refresh_store_error)?,
 						observed_at,
 					};
-					let receipt = crate::account::RefreshReceipt {
+					let receipt = RefreshReceipt {
 						account:              account.to_owned(),
 						principal:            metadata.principal_id.clone(),
 						rejected_generation:  minimum_generation.saturating_sub(1),
@@ -1285,34 +1273,32 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 							generation: metadata.generation,
 						}],
 					};
-					return Ok(crate::account::RefreshLeaseWait::Published(Box::new(
-						crate::account::RefreshResult {
-							account: account.to_owned(),
-							principal: metadata.principal_id,
-							freshness,
-							receipt,
-						},
-					)));
+					return Ok(RefreshLeaseWait::Published(Box::new(RefreshResult {
+						account: account.to_owned(),
+						principal: metadata.principal_id,
+						freshness,
+						receipt,
+					})));
 				}
 				if observed_at >= lease_expires_at {
-					return Ok(crate::account::RefreshLeaseWait::LeaseExpired { observed_at });
+					return Ok(RefreshLeaseWait::LeaseExpired { observed_at });
 				}
 				let remaining = lease_expires_at
 					.duration_since(observed_at)
 					.unwrap_or_default()
 					.min(Duration::from_millis(25));
-				tokio::time::sleep(remaining).await;
+				use tokio::time;
+				time::sleep(remaining).await;
 			}
 		})
 	}
 
 	fn renew<'a>(
 		&'a self,
-		lease: &'a mut crate::account::PersistentRefreshLease,
+		lease: &'a mut PersistentRefreshLease,
 		now: SystemTime,
 		ttl: Duration,
-	) -> Pin<Box<dyn Future<Output = Result<bool, crate::account::RefreshStoreError>> + Send + 'a>>
-	{
+	) -> Pin<Box<dyn Future<Output = Result<bool, RefreshStoreError>> + Send + 'a>> {
 		Box::pin(async move {
 			let epoch = lease
 				.id
@@ -1338,9 +1324,9 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 
 	fn publish<'a>(
 		&'a self,
-		lease: &'a crate::account::PersistentRefreshLease,
-		result: &'a crate::account::RefreshResult,
-	) -> Pin<Box<dyn Future<Output = Result<(), crate::account::RefreshStoreError>> + Send + 'a>> {
+		lease: &'a PersistentRefreshLease,
+		result: &'a RefreshResult,
+	) -> Pin<Box<dyn Future<Output = Result<(), RefreshStoreError>> + Send + 'a>> {
 		Box::pin(async move {
 			if lease.account != result.account {
 				return Err(refresh_contract_error("refresh result account does not match lease"));
@@ -1381,8 +1367,8 @@ impl crate::account::RefreshLeaseStore for CredentialStore {
 
 	fn release<'a>(
 		&'a self,
-		lease: &'a crate::account::PersistentRefreshLease,
-	) -> Pin<Box<dyn Future<Output = Result<(), crate::account::RefreshStoreError>> + Send + 'a>> {
+		lease: &'a PersistentRefreshLease,
+	) -> Pin<Box<dyn Future<Output = Result<(), RefreshStoreError>> + Send + 'a>> {
 		Box::pin(async move {
 			let epoch = lease
 				.id
@@ -1512,7 +1498,7 @@ fn metadata_from_row(
 }
 
 fn scoped_token_material(
-	key: &super::key::EncryptionKey,
+	key: &EncryptionKey,
 	account: &AccountId<str>,
 	grant: &ScopedCredentialGrant,
 ) -> String {
@@ -1550,7 +1536,7 @@ fn system_time_from_ms(millis: u64) -> Result<SystemTime, StoreError> {
 		.ok_or(StoreError::InvalidTime)
 }
 
-fn refresh_store_error(error: StoreError) -> crate::account::RefreshStoreError {
+fn refresh_store_error(error: StoreError) -> RefreshStoreError {
 	let code = match error {
 		StoreError::Database(_) => "database",
 		StoreError::NewerSchema { .. } => "schema",
@@ -1572,19 +1558,20 @@ fn refresh_store_error(error: StoreError) -> crate::account::RefreshStoreError {
 		StoreError::InvalidScopedGrant => "invalid-scoped-grant",
 		StoreError::BackupIo(_) => "backup",
 	};
-	crate::account::RefreshStoreError {
+	RefreshStoreError {
 		code:    Str::new(code),
 		summary: sf!("persistent credential coordination failed"),
 	}
 }
 
-fn refresh_contract_error(summary: &'static str) -> crate::account::RefreshStoreError {
-	crate::account::RefreshStoreError { code: sf!("contract"), summary: Str::new(summary) }
+fn refresh_contract_error(summary: &'static str) -> RefreshStoreError {
+	RefreshStoreError { code: sf!("contract"), summary: Str::new(summary) }
 }
 
 #[cfg(test)]
 mod tests {
 	use std::{
+		fs,
 		sync::{Arc, Barrier},
 		thread,
 		time::Duration,
@@ -1594,7 +1581,7 @@ mod tests {
 	use rusqlite::Connection;
 	use tempfile::tempdir;
 
-	use super::*;
+	use super::{super::oauth::StoredOAuthBundle as OauthStoredOAuthBundle, *};
 	use crate::auth::{
 		crypto::{SecretContext, encrypt},
 		key::{HeadlessKeySource, KeyId, UnavailableKeySource},
@@ -1646,7 +1633,7 @@ mod tests {
 		for artifact in
 			[&path, &path.with_extension("sqlite-wal"), &path.with_extension("sqlite-shm")]
 		{
-			if let Ok(bytes) = std::fs::read(artifact) {
+			if let Ok(bytes) = fs::read(artifact) {
 				assert!(
 					!bytes
 						.windows(b"roundtrip-secret-marker".len())
@@ -1722,7 +1709,7 @@ mod tests {
 		for artifact in
 			[&path, &path.with_extension("sqlite-wal"), &path.with_extension("sqlite-shm")]
 		{
-			if let Ok(bytes) = std::fs::read(artifact) {
+			if let Ok(bytes) = fs::read(artifact) {
 				assert!(
 					!bytes
 						.windows(b"new-refresh-marker".len())
@@ -1761,7 +1748,7 @@ mod tests {
 		let stored = store
 			.load_oauth_bundle(&account)
 			.expect("load imported OAuth bundle");
-		let refresh = super::super::oauth::StoredOAuthBundle::decode(&stored.bundle)
+		let refresh = OauthStoredOAuthBundle::decode(&stored.bundle)
 			.expect("decode canonical OAuth bundle")
 			.into_refresh()
 			.expect("imported bundle is renewable");
@@ -2132,7 +2119,7 @@ mod tests {
 		for artifact in
 			[&path, &path.with_extension("sqlite-wal"), &path.with_extension("sqlite-shm")]
 		{
-			if let Ok(bytes) = std::fs::read(artifact) {
+			if let Ok(bytes) = fs::read(artifact) {
 				assert!(
 					!bytes
 						.windows(b"ephemeral-marker".len())
@@ -2224,7 +2211,7 @@ mod tests {
 		assert!(!format!("{keys:?}").contains(&format!("{KEY_ONE:?}")));
 		store.backup_metadata(&backup).expect("metadata backup");
 		assert!(matches!(store.backup_metadata(&backup), Err(StoreError::BackupIo(_))));
-		let backup_bytes = std::fs::read(&backup).expect("read backup");
+		let backup_bytes = fs::read(&backup).expect("read backup");
 		assert!(
 			!backup_bytes
 				.windows(b"redaction-marker".len())

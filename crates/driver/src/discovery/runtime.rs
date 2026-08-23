@@ -10,27 +10,37 @@ use async_trait::async_trait;
 use omp_catalog::{
 	CatalogOverlayBuilder, DiscoveryNormalizer, DiscoveryPollGate, DiscoveryPollKey, DiscoverySpec,
 	EvidenceConfidence, ModelOverlay, ModelPatch, OverlaySource, OverlayStore, ProvenanceKind,
-	ProvenanceSource, ScopedAlias,
+	ProvenanceSource, ProviderId, ScopedAlias,
 };
 use omp_core::{Principal, Str, sf};
-use omp_envd::exthost::control::{ControlAuthorityFactory, ControlConnectionIdentity};
+use omp_envd::exthost::control::{
+	ControlAuthorityFactory, ControlConnectionIdentity, ControlProtocolError,
+};
 use omp_inference::discovery::{
 	DiscoveryCacheKey, DiscoveryHttpClient, DiscoveryProbe, DiscoveryStore, DiscoveryStoreError,
 	ProbeError, ProviderDiscoveryState, ProviderLifecycle,
 };
-use omp_proto::inference::v1 as pb;
+use omp_proto::inference::v1::{
+	self as pb, Effort, inference_client::InferenceClient, model_event, price,
+	provider_operation_request, provider_operation_response,
+};
 use serde_json::{Map, Value};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status, transport::Channel};
 
-use crate::chat::CampaignControlResolver;
+use crate::{
+	chat::{CampaignControlResolver, ChatProviderControlBackend},
+	model_controls::{
+		ProductionProviderApplicationOwner, ProviderCatalogCursor, ProviderControlAuthorityFactory,
+		ProviderControlBackend, ProviderControlError, ProviderControlRequest, ProviderControlResult,
+		ProviderDeclarationDocument, ProviderModelCard, ProviderModelEvent, ProviderPrice,
+		ProviderRequestKind,
+	},
+};
 
-type CampaignMachineConstructor = dyn Fn(
-		Option<&str>,
-	) -> Result<
-		Box<dyn omp_agent::CampaignMachine>,
-		omp_envd::exthost::control::ControlProtocolError,
-	> + Send
+type CampaignMachineConstructor = dyn Fn(Option<&str>) -> Result<Box<dyn omp_agent::CampaignMachine>, ControlProtocolError>
+	+ Send
 	+ Sync;
 
 /// One callback constructor bound to a declaration accepted at FREEZE.
@@ -58,12 +68,8 @@ impl SealedCampaignDeclaration {
 		constructor: F,
 	) -> Self
 	where
-		F: Fn(
-				Option<&str>,
-			) -> Result<
-				Box<dyn omp_agent::CampaignMachine>,
-				omp_envd::exthost::control::ControlProtocolError,
-			> + Send
+		F: Fn(Option<&str>) -> Result<Box<dyn omp_agent::CampaignMachine>, ControlProtocolError>
+			+ Send
 			+ Sync
 			+ 'static,
 	{
@@ -90,7 +96,7 @@ impl SealedCampaignControlResolver {
 	/// Seals one deterministic declaration table.
 	pub fn new(
 		declarations: impl IntoIterator<Item = SealedCampaignDeclaration>,
-	) -> Result<Self, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Self, ControlProtocolError> {
 		let mut table = BTreeMap::new();
 		for declaration in declarations {
 			if declaration.spec.id.is_empty()
@@ -100,7 +106,7 @@ impl SealedCampaignControlResolver {
 					.insert(declaration.spec.id.clone(), declaration)
 					.is_some()
 			{
-				return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				return Err(ControlProtocolError::new(
 					"InvalidCampaignDeclaration",
 					"sealed campaign declarations contain an invalid or duplicate identity",
 				));
@@ -113,21 +119,21 @@ impl SealedCampaignControlResolver {
 impl CampaignControlResolver for SealedCampaignControlResolver {
 	fn resolve(
 		&self,
-		identity: &omp_envd::exthost::control::ControlConnectionIdentity,
+		identity: &ControlConnectionIdentity,
 		campaign: &str,
 		state: Option<&str>,
 	) -> Result<
 		(Arc<omp_agent::CampaignSpec>, Box<dyn omp_agent::CampaignMachine>),
-		omp_envd::exthost::control::ControlProtocolError,
+		ControlProtocolError,
 	> {
 		let declaration = self.declarations.get(campaign).ok_or_else(|| {
-			omp_envd::exthost::control::ControlProtocolError::new(
+			ControlProtocolError::new(
 				"TargetNotFound",
 				"campaign is absent from the sealed declaration table",
 			)
 		})?;
 		if declaration.extension != identity.extension {
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+			return Err(ControlProtocolError::new(
 				"AuthorizationError",
 				"campaign declaration belongs to another extension",
 			));
@@ -135,7 +141,7 @@ impl CampaignControlResolver for SealedCampaignControlResolver {
 		if declaration.host_generation != identity.host_generation
 			|| declaration.session_generation != identity.session_generation
 		{
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
+			return Err(ControlProtocolError::new(
 				"StaleGeneration",
 				"campaign declaration belongs to a replaced host or session generation",
 			));
@@ -165,7 +171,7 @@ impl DiscoveryRuntime {
 	pub fn new(
 		cache: Arc<DiscoveryStore>,
 		overlays: Arc<OverlayStore>,
-		disabled: impl IntoIterator<Item = omp_catalog::ProviderId>,
+		disabled: impl IntoIterator<Item = ProviderId>,
 	) -> Self {
 		Self {
 			gate: DiscoveryPollGate::default(),
@@ -360,9 +366,9 @@ pub enum DiscoveryRuntimeError {
 	#[error("discovery cache provider {cache} does not match poll provider {poll}")]
 	CacheScopeMismatch {
 		/// Scheduled poll provider.
-		poll:  omp_catalog::ProviderId,
+		poll:  ProviderId,
 		/// Supplied cache provider.
-		cache: omp_catalog::ProviderId,
+		cache: ProviderId,
 	},
 	/// Endpoint probing failed.
 	#[error(transparent)]
@@ -378,19 +384,19 @@ pub enum DiscoveryRuntimeError {
 /// Server-side bridge from the gateway protocol to the one authoritative
 /// provider application owner.
 pub struct LocalProviderGatewayAuthority {
-	owner:   Arc<crate::model_controls::ProductionProviderApplicationOwner>,
-	backend: crate::chat::ChatProviderControlBackend,
-	serial:  tokio::sync::Mutex<()>,
+	owner:   Arc<ProductionProviderApplicationOwner>,
+	backend: ChatProviderControlBackend,
+	serial:  Mutex<()>,
 }
 
 /// Publishes a local provider owner on `InferenceRpc`.
 pub fn gateway_provider_rpc_authority(
-	owner: Arc<crate::model_controls::ProductionProviderApplicationOwner>,
+	owner: Arc<ProductionProviderApplicationOwner>,
 ) -> Arc<dyn omp_serve::inference::ProviderGatewayAuthority> {
 	Arc::new(LocalProviderGatewayAuthority {
-		backend: crate::chat::ChatProviderControlBackend::new(owner.clone()),
+		backend: ChatProviderControlBackend::new(owner.clone()),
 		owner,
-		serial: tokio::sync::Mutex::new(()),
+		serial: Mutex::new(()),
 	})
 }
 
@@ -449,10 +455,7 @@ impl LocalProviderGatewayAuthority {
 
 	fn declaration(
 		request: pb::ProviderDeclarationRequest,
-	) -> Result<
-		(ControlConnectionIdentity, crate::model_controls::ProviderDeclarationDocument, u64),
-		Status,
-	> {
+	) -> Result<(ControlConnectionIdentity, ProviderDeclarationDocument, u64), Status> {
 		if request.provider.is_empty() {
 			return Err(Status::invalid_argument("provider is required"));
 		}
@@ -461,10 +464,7 @@ impl LocalProviderGatewayAuthority {
 			.map_err(|error| Status::invalid_argument(format!("provider declaration: {error}")))?;
 		Ok((
 			caller,
-			crate::model_controls::ProviderDeclarationDocument {
-				provider: request.provider.into(),
-				document,
-			},
+			ProviderDeclarationDocument { provider: request.provider.into(), document },
 			request.expected_generation,
 		))
 	}
@@ -493,12 +493,10 @@ impl omp_serve::inference::ProviderGatewayAuthority for LocalProviderGatewayAuth
 		request: pb::WatchProviderCatalogRequest,
 	) -> Result<pb::WatchProviderCatalogResponse, Status> {
 		use crate::model_controls::ProviderControlBackend as _;
-		let since = request
-			.since
-			.map(|cursor| crate::model_controls::ProviderCatalogCursor {
-				epoch:      cursor.epoch.to_vec().into_boxed_slice(),
-				generation: cursor.generation,
-			});
+		let since = request.since.map(|cursor| ProviderCatalogCursor {
+			epoch:      cursor.epoch.to_vec().into_boxed_slice(),
+			generation: cursor.generation,
+		});
 		let events = self
 			.backend
 			.watch_models(since)
@@ -602,12 +600,12 @@ impl LocalProviderGatewayAuthority {
 			return Err(Status::invalid_argument("provider is required"));
 		}
 		let operation = provider_kind_from_pb(request.kind)?;
-		if session_only && operation != crate::model_controls::ProviderRequestKind::Realtime {
+		if session_only && operation != ProviderRequestKind::Realtime {
 			return Err(Status::invalid_argument(
 				"MintProviderSession requires a realtime provider operation",
 			));
 		}
-		if !session_only && operation == crate::model_controls::ProviderRequestKind::Realtime {
+		if !session_only && operation == ProviderRequestKind::Realtime {
 			return Err(Status::invalid_argument("realtime endpoints must use MintProviderSession"));
 		}
 		let payload: Map<String, Value> = serde_json::from_slice(&request.payload_json)
@@ -616,7 +614,7 @@ impl LocalProviderGatewayAuthority {
 		self.check_generation(request.expected_generation)?;
 		let result = self
 			.owner
-			.provider_request(&caller, crate::model_controls::ProviderControlRequest {
+			.provider_request(&caller, ProviderControlRequest {
 				provider: request.provider.into(),
 				operation,
 				payload,
@@ -635,15 +633,17 @@ pub struct RemoteProviderControlBackend {
 }
 
 impl RemoteProviderControlBackend {
+	/// Creates a backend that forwards provider CONTROL calls over this gateway
+	/// channel.
 	pub fn new(channel: Channel) -> Self {
 		Self { channel }
 	}
 
-	fn client(&self) -> pb::inference_client::InferenceClient<Channel> {
-		pb::inference_client::InferenceClient::new(self.channel.clone())
+	fn client(&self) -> InferenceClient<Channel> {
+		InferenceClient::new(self.channel.clone())
 	}
 
-	async fn generation(&self) -> Result<u64, crate::model_controls::ProviderControlError> {
+	async fn generation(&self) -> Result<u64, ProviderControlError> {
 		let response = self
 			.client()
 			.provider_catalog(pb::ProviderCatalogRequest { provider: None })
@@ -654,9 +654,7 @@ impl RemoteProviderControlBackend {
 			.cursor
 			.map(|cursor| cursor.generation)
 			.ok_or_else(|| {
-				crate::model_controls::ProviderControlError::Request(sf!(
-					"gateway omitted provider catalog cursor"
-				))
+				ProviderControlError::Request(sf!("gateway omitted provider catalog cursor"))
 			})
 	}
 }
@@ -664,20 +662,17 @@ impl RemoteProviderControlBackend {
 /// Constructs the connection-scoped provider CONTROL factory used in gateway
 /// mode.
 pub fn gateway_provider_control_factory(channel: Channel) -> Arc<dyn ControlAuthorityFactory> {
-	let backend: Arc<dyn crate::model_controls::ProviderControlBackend> =
+	let backend: Arc<dyn ProviderControlBackend> =
 		Arc::new(RemoteProviderControlBackend::new(channel));
-	Arc::new(crate::model_controls::ProviderControlAuthorityFactory::new(backend))
+	Arc::new(ProviderControlAuthorityFactory::new(backend))
 }
 
 #[async_trait]
-impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBackend {
+impl ProviderControlBackend for RemoteProviderControlBackend {
 	async fn models(
 		&self,
 		provider: Option<&str>,
-	) -> Result<
-		Vec<crate::model_controls::ProviderModelCard>,
-		crate::model_controls::ProviderControlError,
-	> {
+	) -> Result<Vec<ProviderModelCard>, ProviderControlError> {
 		let response = self
 			.client()
 			.provider_catalog(pb::ProviderCatalogRequest { provider: provider.map(ToOwned::to_owned) })
@@ -693,11 +688,8 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 
 	async fn watch_models(
 		&self,
-		since: Option<crate::model_controls::ProviderCatalogCursor>,
-	) -> Result<
-		Vec<crate::model_controls::ProviderModelEvent>,
-		crate::model_controls::ProviderControlError,
-	> {
+		since: Option<ProviderCatalogCursor>,
+	) -> Result<Vec<ProviderModelEvent>, ProviderControlError> {
 		let response = self
 			.client()
 			.watch_provider_catalog(pb::WatchProviderCatalogRequest {
@@ -716,10 +708,7 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 			.collect()
 	}
 
-	async fn is_authenticated(
-		&self,
-		provider: &str,
-	) -> Result<bool, crate::model_controls::ProviderControlError> {
+	async fn is_authenticated(&self, provider: &str) -> Result<bool, ProviderControlError> {
 		Ok(self
 			.client()
 			.provider_authenticated(pb::ProviderAuthenticatedRequest { provider: provider.to_owned() })
@@ -732,8 +721,8 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 	async fn replace(
 		&self,
 		identity: &ControlConnectionIdentity,
-		declaration: crate::model_controls::ProviderDeclarationDocument,
-	) -> Result<(), crate::model_controls::ProviderControlError> {
+		declaration: ProviderDeclarationDocument,
+	) -> Result<(), ProviderControlError> {
 		let generation = self.generation().await?;
 		let request = declaration_request(identity, declaration, generation)?;
 		self
@@ -748,7 +737,7 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 		&self,
 		identity: &ControlConnectionIdentity,
 		provider: &str,
-	) -> Result<(), crate::model_controls::ProviderControlError> {
+	) -> Result<(), ProviderControlError> {
 		let generation = self.generation().await?;
 		self
 			.client()
@@ -765,13 +754,10 @@ impl crate::model_controls::ProviderControlBackend for RemoteProviderControlBack
 	async fn request(
 		&self,
 		identity: &ControlConnectionIdentity,
-		request: crate::model_controls::ProviderControlRequest,
-	) -> Result<
-		crate::model_controls::ProviderControlResult,
-		crate::model_controls::ProviderControlError,
-	> {
+		request: ProviderControlRequest,
+	) -> Result<ProviderControlResult, ProviderControlError> {
 		let generation = self.generation().await?;
-		let realtime = request.operation == crate::model_controls::ProviderRequestKind::Realtime;
+		let realtime = request.operation == ProviderRequestKind::Realtime;
 		let request = operation_request(identity, request, generation)?;
 		let response = if realtime {
 			self.client().mint_provider_session(request).await
@@ -805,12 +791,11 @@ fn caller_to_pb(identity: &ControlConnectionIdentity) -> pb::ProviderCaller {
 
 fn declaration_request(
 	identity: &ControlConnectionIdentity,
-	declaration: crate::model_controls::ProviderDeclarationDocument,
+	declaration: ProviderDeclarationDocument,
 	expected_generation: u64,
-) -> Result<pb::ProviderDeclarationRequest, crate::model_controls::ProviderControlError> {
-	let document_json = serde_json::to_vec(&declaration.document).map_err(|error| {
-		crate::model_controls::ProviderControlError::Request(error.to_string().into())
-	})?;
+) -> Result<pb::ProviderDeclarationRequest, ProviderControlError> {
+	let document_json = serde_json::to_vec(&declaration.document)
+		.map_err(|error| ProviderControlError::Request(error.to_string().into()))?;
 	Ok(pb::ProviderDeclarationRequest {
 		caller: Some(caller_to_pb(identity)),
 		provider: declaration.provider.to_string(),
@@ -821,57 +806,42 @@ fn declaration_request(
 
 fn operation_request(
 	identity: &ControlConnectionIdentity,
-	request: crate::model_controls::ProviderControlRequest,
+	request: ProviderControlRequest,
 	expected_generation: u64,
-) -> Result<pb::ProviderOperationRequest, crate::model_controls::ProviderControlError> {
-	let payload_json = serde_json::to_vec(&request.payload).map_err(|error| {
-		crate::model_controls::ProviderControlError::Request(error.to_string().into())
-	})?;
+) -> Result<pb::ProviderOperationRequest, ProviderControlError> {
+	let payload_json = serde_json::to_vec(&request.payload)
+		.map_err(|error| ProviderControlError::Request(error.to_string().into()))?;
 	Ok(pb::ProviderOperationRequest {
 		caller: Some(caller_to_pb(identity)),
 		provider: request.provider.to_string(),
 		kind: match request.operation {
-			crate::model_controls::ProviderRequestKind::GenerateImage => {
-				pb::provider_operation_request::Kind::GenerateImage as i32
+			ProviderRequestKind::GenerateImage => {
+				provider_operation_request::Kind::GenerateImage as i32
 			},
-			crate::model_controls::ProviderRequestKind::Speak => {
-				pb::provider_operation_request::Kind::Speak as i32
-			},
-			crate::model_controls::ProviderRequestKind::Transcribe => {
-				pb::provider_operation_request::Kind::Transcribe as i32
-			},
-			crate::model_controls::ProviderRequestKind::Realtime => {
-				pb::provider_operation_request::Kind::Realtime as i32
-			},
+			ProviderRequestKind::Speak => provider_operation_request::Kind::Speak as i32,
+			ProviderRequestKind::Transcribe => provider_operation_request::Kind::Transcribe as i32,
+			ProviderRequestKind::Realtime => provider_operation_request::Kind::Realtime as i32,
 		},
 		payload_json: payload_json.into(),
 		expected_generation,
 	})
 }
 
-fn provider_kind_from_pb(kind: i32) -> Result<crate::model_controls::ProviderRequestKind, Status> {
-	match pb::provider_operation_request::Kind::try_from(kind)
-		.unwrap_or(pb::provider_operation_request::Kind::Unspecified)
+fn provider_kind_from_pb(kind: i32) -> Result<ProviderRequestKind, Status> {
+	match provider_operation_request::Kind::try_from(kind)
+		.unwrap_or(provider_operation_request::Kind::Unspecified)
 	{
-		pb::provider_operation_request::Kind::GenerateImage => {
-			Ok(crate::model_controls::ProviderRequestKind::GenerateImage)
-		},
-		pb::provider_operation_request::Kind::Speak => {
-			Ok(crate::model_controls::ProviderRequestKind::Speak)
-		},
-		pb::provider_operation_request::Kind::Transcribe => {
-			Ok(crate::model_controls::ProviderRequestKind::Transcribe)
-		},
-		pb::provider_operation_request::Kind::Realtime => {
-			Ok(crate::model_controls::ProviderRequestKind::Realtime)
-		},
-		pb::provider_operation_request::Kind::Unspecified => {
+		provider_operation_request::Kind::GenerateImage => Ok(ProviderRequestKind::GenerateImage),
+		provider_operation_request::Kind::Speak => Ok(ProviderRequestKind::Speak),
+		provider_operation_request::Kind::Transcribe => Ok(ProviderRequestKind::Transcribe),
+		provider_operation_request::Kind::Realtime => Ok(ProviderRequestKind::Realtime),
+		provider_operation_request::Kind::Unspecified => {
 			Err(Status::invalid_argument("provider operation kind is required"))
 		},
 	}
 }
 
-fn provider_status(error: crate::model_controls::ProviderControlError) -> Status {
+fn provider_status(error: ProviderControlError) -> Status {
 	use crate::model_controls::ProviderControlError;
 	match error {
 		ProviderControlError::Authorization => Status::permission_denied(error.to_string()),
@@ -885,7 +855,7 @@ fn provider_status(error: crate::model_controls::ProviderControlError) -> Status
 	}
 }
 
-fn provider_error(status: Status) -> crate::model_controls::ProviderControlError {
+fn provider_error(status: Status) -> ProviderControlError {
 	use crate::model_controls::ProviderControlError;
 	match status.code() {
 		Code::PermissionDenied if status.message().contains("capability") => {
@@ -901,61 +871,51 @@ fn provider_error(status: Status) -> crate::model_controls::ProviderControlError
 	}
 }
 
-fn provider_cursor_to_pb(cursor: crate::model_controls::ProviderCatalogCursor) -> pb::Cursor {
+fn provider_cursor_to_pb(cursor: ProviderCatalogCursor) -> pb::Cursor {
 	pb::Cursor { epoch: cursor.epoch.to_vec().into(), generation: cursor.generation }
 }
 
-fn provider_event_to_pb(event: crate::model_controls::ProviderModelEvent) -> pb::ModelEvent {
+fn provider_event_to_pb(event: ProviderModelEvent) -> pb::ModelEvent {
 	use crate::model_controls::ProviderModelEvent;
 	match event {
 		ProviderModelEvent::Upsert { cursor, card } => pb::ModelEvent {
 			cursor: Some(provider_cursor_to_pb(cursor)),
-			event:  Some(pb::model_event::Event::Upserted(provider_model_to_pb(card))),
+			event:  Some(model_event::Event::Upserted(provider_model_to_pb(card))),
 		},
 		ProviderModelEvent::Remove { cursor, id } => pb::ModelEvent {
 			cursor: Some(provider_cursor_to_pb(cursor)),
-			event:  Some(pb::model_event::Event::RemovedId(id.to_string())),
+			event:  Some(model_event::Event::RemovedId(id.to_string())),
 		},
 		ProviderModelEvent::Reset { cursor } => pb::ModelEvent {
 			cursor: Some(provider_cursor_to_pb(cursor)),
-			event:  Some(pb::model_event::Event::Reset(pb::model_event::Reset {})),
+			event:  Some(model_event::Event::Reset(pb::model_event::Reset {})),
 		},
 	}
 }
 
 fn provider_event_from_pb(
 	event: pb::ModelEvent,
-) -> Result<crate::model_controls::ProviderModelEvent, crate::model_controls::ProviderControlError>
-{
-	let cursor = event.cursor.ok_or_else(|| {
-		crate::model_controls::ProviderControlError::Request(sf!(
-			"gateway omitted provider event cursor"
-		))
-	})?;
-	let cursor = crate::model_controls::ProviderCatalogCursor {
+) -> Result<ProviderModelEvent, ProviderControlError> {
+	let cursor = event
+		.cursor
+		.ok_or_else(|| ProviderControlError::Request(sf!("gateway omitted provider event cursor")))?;
+	let cursor = ProviderCatalogCursor {
 		epoch:      cursor.epoch.to_vec().into_boxed_slice(),
 		generation: cursor.generation,
 	};
 	match event.event {
-		Some(pb::model_event::Event::Upserted(card)) => {
-			Ok(crate::model_controls::ProviderModelEvent::Upsert {
-				cursor,
-				card: provider_model_from_pb(card),
-			})
+		Some(model_event::Event::Upserted(card)) => {
+			Ok(ProviderModelEvent::Upsert { cursor, card: provider_model_from_pb(card) })
 		},
-		Some(pb::model_event::Event::RemovedId(id)) => {
-			Ok(crate::model_controls::ProviderModelEvent::Remove { cursor, id: id.into() })
+		Some(model_event::Event::RemovedId(id)) => {
+			Ok(ProviderModelEvent::Remove { cursor, id: id.into() })
 		},
-		Some(pb::model_event::Event::Reset(_)) => {
-			Ok(crate::model_controls::ProviderModelEvent::Reset { cursor })
-		},
-		None => Err(crate::model_controls::ProviderControlError::Request(sf!(
-			"gateway omitted provider event"
-		))),
+		Some(model_event::Event::Reset(_)) => Ok(ProviderModelEvent::Reset { cursor }),
+		None => Err(ProviderControlError::Request(sf!("gateway omitted provider event"))),
 	}
 }
 
-fn provider_model_to_pb(card: crate::model_controls::ProviderModelCard) -> pb::ModelCard {
+fn provider_model_to_pb(card: ProviderModelCard) -> pb::ModelCard {
 	pb::ModelCard {
 		id:                card.id.to_string(),
 		provider:          card.provider.to_string(),
@@ -1005,8 +965,8 @@ fn provider_model_to_pb(card: crate::model_controls::ProviderModelCard) -> pb::M
 	}
 }
 
-fn provider_model_from_pb(card: pb::ModelCard) -> crate::model_controls::ProviderModelCard {
-	crate::model_controls::ProviderModelCard {
+fn provider_model_from_pb(card: pb::ModelCard) -> ProviderModelCard {
+	ProviderModelCard {
 		id:                card.id.into(),
 		provider:          card.provider.into(),
 		model:             card.model.into(),
@@ -1034,7 +994,7 @@ fn provider_model_from_pb(card: pb::ModelCard) -> crate::model_controls::Provide
 		efforts:           card
 			.efforts
 			.into_iter()
-			.filter_map(|value| pb::Effort::try_from(value).ok())
+			.filter_map(|value| Effort::try_from(value).ok())
 			.map(|value| effort_name(value).into())
 			.collect(),
 		context_window:    (card.context_window != 0).then_some(card.context_window),
@@ -1042,8 +1002,8 @@ fn provider_model_from_pb(card: pb::ModelCard) -> crate::model_controls::Provide
 		pricing:           card
 			.pricing
 			.into_iter()
-			.map(|price| crate::model_controls::ProviderPrice {
-				unit:      pb::price::Unit::try_from(price.unit)
+			.map(|price| ProviderPrice {
+				unit:      price::Unit::try_from(price.unit)
 					.map_or("unknown", price_unit_name)
 					.into(),
 				nanos_usd: price.nanos_usd,
@@ -1107,28 +1067,28 @@ fn modality_name(value: pb::Modality) -> &'static str {
 		pb::Modality::Unspecified => "unspecified",
 	}
 }
-fn effort_from_str(value: &str) -> pb::Effort {
+fn effort_from_str(value: &str) -> Effort {
 	match value {
-		"off" => pb::Effort::Off,
-		"minimal" => pb::Effort::Minimal,
-		"low" => pb::Effort::Low,
-		"medium" => pb::Effort::Medium,
-		"high" => pb::Effort::High,
-		"max" => pb::Effort::Max,
-		"xhigh" => pb::Effort::Xhigh,
-		_ => pb::Effort::Unspecified,
+		"off" => Effort::Off,
+		"minimal" => Effort::Minimal,
+		"low" => Effort::Low,
+		"medium" => Effort::Medium,
+		"high" => Effort::High,
+		"max" => Effort::Max,
+		"xhigh" => Effort::Xhigh,
+		_ => Effort::Unspecified,
 	}
 }
-fn effort_name(value: pb::Effort) -> &'static str {
+fn effort_name(value: Effort) -> &'static str {
 	match value {
-		pb::Effort::Off => "off",
-		pb::Effort::Minimal => "minimal",
-		pb::Effort::Low => "low",
-		pb::Effort::Medium => "medium",
-		pb::Effort::High => "high",
-		pb::Effort::Max => "max",
-		pb::Effort::Xhigh => "xhigh",
-		pb::Effort::Unspecified => "unspecified",
+		Effort::Off => "off",
+		Effort::Minimal => "minimal",
+		Effort::Low => "low",
+		Effort::Medium => "medium",
+		Effort::High => "high",
+		Effort::Max => "max",
+		Effort::Xhigh => "xhigh",
+		Effort::Unspecified => "unspecified",
 	}
 }
 fn availability_from_str(value: &str) -> pb::Availability {
@@ -1149,42 +1109,40 @@ fn availability_name(value: pb::Availability) -> &'static str {
 		pb::Availability::Unspecified => "unspecified",
 	}
 }
-fn price_unit_from_str(value: &str) -> pb::price::Unit {
+fn price_unit_from_str(value: &str) -> price::Unit {
 	match value {
-		"mtok_input" => pb::price::Unit::MtokInput,
-		"mtok_output" => pb::price::Unit::MtokOutput,
-		"mtok_cache_read" => pb::price::Unit::MtokCacheRead,
-		"mtok_cache_write" => pb::price::Unit::MtokCacheWrite,
-		"image" => pb::price::Unit::Image,
-		"video_second" => pb::price::Unit::VideoSecond,
-		"audio_second" => pb::price::Unit::AudioSecond,
-		"mchar_input" => pb::price::Unit::McharInput,
-		"request" => pb::price::Unit::Request,
-		_ => pb::price::Unit::Unspecified,
+		"mtok_input" => price::Unit::MtokInput,
+		"mtok_output" => price::Unit::MtokOutput,
+		"mtok_cache_read" => price::Unit::MtokCacheRead,
+		"mtok_cache_write" => price::Unit::MtokCacheWrite,
+		"image" => price::Unit::Image,
+		"video_second" => price::Unit::VideoSecond,
+		"audio_second" => price::Unit::AudioSecond,
+		"mchar_input" => price::Unit::McharInput,
+		"request" => price::Unit::Request,
+		_ => price::Unit::Unspecified,
 	}
 }
-fn price_unit_name(value: pb::price::Unit) -> &'static str {
+fn price_unit_name(value: price::Unit) -> &'static str {
 	match value {
-		pb::price::Unit::MtokInput => "mtok_input",
-		pb::price::Unit::MtokOutput => "mtok_output",
-		pb::price::Unit::MtokCacheRead => "mtok_cache_read",
-		pb::price::Unit::MtokCacheWrite => "mtok_cache_write",
-		pb::price::Unit::Image => "image",
-		pb::price::Unit::VideoSecond => "video_second",
-		pb::price::Unit::AudioSecond => "audio_second",
-		pb::price::Unit::McharInput => "mchar_input",
-		pb::price::Unit::Request => "request",
-		pb::price::Unit::Unspecified => "unknown",
+		price::Unit::MtokInput => "mtok_input",
+		price::Unit::MtokOutput => "mtok_output",
+		price::Unit::MtokCacheRead => "mtok_cache_read",
+		price::Unit::MtokCacheWrite => "mtok_cache_write",
+		price::Unit::Image => "image",
+		price::Unit::VideoSecond => "video_second",
+		price::Unit::AudioSecond => "audio_second",
+		price::Unit::McharInput => "mchar_input",
+		price::Unit::Request => "request",
+		price::Unit::Unspecified => "unknown",
 	}
 }
 
-fn provider_result_to_pb(
-	result: crate::model_controls::ProviderControlResult,
-) -> pb::ProviderOperationResponse {
+fn provider_result_to_pb(result: ProviderControlResult) -> pb::ProviderOperationResponse {
 	use crate::model_controls::ProviderControlResult;
 	let result = match result {
 		ProviderControlResult::Image { images, cost_nanos_usd } => {
-			pb::provider_operation_response::Result::Image(pb::provider_operation_response::Image {
+			provider_operation_response::Result::Image(pb::provider_operation_response::Image {
 				images: images
 					.into_vec()
 					.into_iter()
@@ -1194,14 +1152,14 @@ fn provider_result_to_pb(
 			})
 		},
 		ProviderControlResult::Speech { audio, format, cost_nanos_usd } => {
-			pb::provider_operation_response::Result::Speech(pb::provider_operation_response::Speech {
+			provider_operation_response::Result::Speech(pb::provider_operation_response::Speech {
 				audio: Some(pb::ProviderBlob { hash: audio.hash.to_string(), size: audio.size }),
 				format: format.to_string(),
 				cost_nanos_usd,
 			})
 		},
 		ProviderControlResult::Transcription { text, language, cost_nanos_usd } => {
-			pb::provider_operation_response::Result::Transcription(
+			provider_operation_response::Result::Transcription(
 				pb::provider_operation_response::Transcription {
 					text: text.to_string(),
 					language: language.map(|value| value.to_string()),
@@ -1210,15 +1168,13 @@ fn provider_result_to_pb(
 			)
 		},
 		ProviderControlResult::Realtime { id, endpoint, credential, expires_at_ms, transport } => {
-			pb::provider_operation_response::Result::Realtime(
-				pb::provider_operation_response::Realtime {
-					id: id.to_string(),
-					endpoint: endpoint.to_string(),
-					credential: credential.to_string(),
-					expires_at_ms,
-					transport: transport.to_string(),
-				},
-			)
+			provider_operation_response::Result::Realtime(pb::provider_operation_response::Realtime {
+				id: id.to_string(),
+				endpoint: endpoint.to_string(),
+				credential: credential.to_string(),
+				expires_at_ms,
+				transport: transport.to_string(),
+			})
 		},
 	};
 	pb::ProviderOperationResponse { result: Some(result) }
@@ -1226,21 +1182,18 @@ fn provider_result_to_pb(
 
 fn provider_result_from_pb(
 	response: pb::ProviderOperationResponse,
-) -> Result<crate::model_controls::ProviderControlResult, crate::model_controls::ProviderControlError>
-{
+) -> Result<ProviderControlResult, ProviderControlError> {
 	use crate::model_controls::{ProviderBlobRef, ProviderControlError, ProviderControlResult};
 	match response.result {
-		Some(pb::provider_operation_response::Result::Image(image)) => {
-			Ok(ProviderControlResult::Image {
-				images:         image
-					.images
-					.into_iter()
-					.map(|blob| ProviderBlobRef { hash: blob.hash.into(), size: blob.size })
-					.collect(),
-				cost_nanos_usd: image.cost_nanos_usd,
-			})
-		},
-		Some(pb::provider_operation_response::Result::Speech(speech)) => {
+		Some(provider_operation_response::Result::Image(image)) => Ok(ProviderControlResult::Image {
+			images:         image
+				.images
+				.into_iter()
+				.map(|blob| ProviderBlobRef { hash: blob.hash.into(), size: blob.size })
+				.collect(),
+			cost_nanos_usd: image.cost_nanos_usd,
+		}),
+		Some(provider_operation_response::Result::Speech(speech)) => {
 			let audio = speech
 				.audio
 				.ok_or_else(|| ProviderControlError::Request(sf!("gateway omitted speech blob")))?;
@@ -1250,14 +1203,14 @@ fn provider_result_from_pb(
 				cost_nanos_usd: speech.cost_nanos_usd,
 			})
 		},
-		Some(pb::provider_operation_response::Result::Transcription(transcription)) => {
+		Some(provider_operation_response::Result::Transcription(transcription)) => {
 			Ok(ProviderControlResult::Transcription {
 				text:           transcription.text.into(),
 				language:       transcription.language.map(Into::into),
 				cost_nanos_usd: transcription.cost_nanos_usd,
 			})
 		},
-		Some(pb::provider_operation_response::Result::Realtime(realtime)) => {
+		Some(provider_operation_response::Result::Realtime(realtime)) => {
 			Ok(ProviderControlResult::Realtime {
 				id:            realtime.id.into(),
 				endpoint:      realtime.endpoint.into(),
@@ -1272,6 +1225,8 @@ fn provider_result_from_pb(
 
 #[cfg(test)]
 mod tests {
+	use std::iter;
+
 	use omp_catalog::{
 		ContextStrategy, DiscoveredModel, DiscoveryDefaults, ModelAvailability, OperationBits,
 		Pricing, RouteId, WireModelId, WirePolicyId,
@@ -1279,7 +1234,7 @@ mod tests {
 
 	use super::*;
 
-	fn row(provider: &omp_catalog::ProviderId<str>, model: &str) -> DiscoveredModel {
+	fn row(provider: &ProviderId<str>, model: &str) -> DiscoveredModel {
 		DiscoveredModel {
 			provider:              provider.to_owned(),
 			route:                 RouteId::from("configured-route"),
@@ -1311,14 +1266,14 @@ mod tests {
 
 	fn explicit_disable_is_authoritative_but_failure_is_not() {
 		let directory = tempfile::tempdir().expect("directory");
-		let disabled = omp_catalog::ProviderId::from("disabled");
+		let disabled = ProviderId::from("disabled");
 		let runtime = DiscoveryRuntime::new(
 			Arc::new(DiscoveryStore::open(&directory.path().join("models.db")).expect("store")),
 			Arc::new(OverlayStore::default()),
 			[disabled.clone()],
 		);
 		assert!(!runtime.provider_selectable(&disabled));
-		assert!(runtime.provider_selectable(omp_catalog::ProviderId::from_ref("offline")));
+		assert!(runtime.provider_selectable(ProviderId::from_ref("offline")));
 	}
 	#[test]
 	fn credential_cache_hydration_repeats_after_affinity_changes() {
@@ -1329,9 +1284,9 @@ mod tests {
 		let runtime = DiscoveryRuntime::new(
 			Arc::clone(&cache),
 			Arc::clone(&overlays),
-			std::iter::empty::<omp_catalog::ProviderId>(),
+			iter::empty::<ProviderId>(),
 		);
-		let provider = omp_catalog::ProviderId::from("opencode-go");
+		let provider = ProviderId::from("opencode-go");
 		let first = DiscoveryCacheKey::credential(provider.clone(), "affinity-first");
 		let second = DiscoveryCacheKey::credential(provider.clone(), "affinity-second");
 		cache

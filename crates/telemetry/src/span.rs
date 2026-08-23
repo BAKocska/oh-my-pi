@@ -1,6 +1,6 @@
 //! Span lifecycle helpers for agent, chat, tool, and handoff operations.
 
-use std::error::Error;
+use std::{error::Error, mem};
 
 use omp_core::Str;
 use opentelemetry::{
@@ -391,7 +391,7 @@ fn start_span(
 	let builder = tracer
 		.span_builder(name)
 		.with_kind(kind)
-		.with_attributes(std::mem::take(attributes));
+		.with_attributes(mem::take(attributes));
 	if let Some(parent) = parent {
 		let context = Context::current().with_remote_span_context(parent.span_context().clone());
 		tracer.build_with_context(builder, &context)

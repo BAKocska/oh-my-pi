@@ -2,6 +2,7 @@
 
 use std::{
 	fs::File,
+	io,
 	io::{BufRead as _, BufReader, Read as _, Write as _},
 	path::{Path, PathBuf},
 };
@@ -74,7 +75,7 @@ pub enum ReplicaError {
 	Atomic(#[from] atomic::Error),
 	/// Header I/O failed.
 	#[error("replica header I/O failed")]
-	Io(#[source] std::io::Error),
+	Io(#[source] io::Error),
 	/// The bounded replica header was not newline-terminated.
 	#[error("replica header exceeds 16 KiB or is unterminated")]
 	HeaderTooLarge,
@@ -273,7 +274,7 @@ fn write_replica(
 	guard: impl FnOnce() -> bool,
 ) -> Result<(), ReplicaError> {
 	atomic::commit_with(path, guard, |file| {
-		serde_json::to_writer(&mut *file, header).map_err(std::io::Error::other)?;
+		serde_json::to_writer(&mut *file, header).map_err(io::Error::other)?;
 		file.write_all(b"\n")?;
 		for record in records {
 			file.write_all(&record.json)?;

@@ -2,7 +2,7 @@
 //! fixtures.
 
 use std::{
-	fs,
+	error, fs,
 	path::{Path, PathBuf},
 };
 
@@ -27,7 +27,7 @@ struct SourceInput {
 	source: String,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn error::Error>> {
 	let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 	let workspace = crate_dir
 		.parent()
@@ -50,10 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	Ok(())
 }
 
-fn verify_sources(
-	workspace: &Path,
-	lock: &SourceLock,
-) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+fn verify_sources(workspace: &Path, lock: &SourceLock) -> Result<[u8; 32], Box<dyn error::Error>> {
 	let mut source_hasher = Sha256::new();
 	let mut previous: Option<&str> = None;
 	for input in &lock.inputs {

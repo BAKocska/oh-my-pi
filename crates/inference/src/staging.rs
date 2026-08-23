@@ -2,10 +2,12 @@
 
 use std::{
 	collections::VecDeque,
-	fmt,
+	error,
+	fmt::{self, Display},
 	fs::{File as StdFile, OpenOptions as StdOpenOptions},
 	future::Future,
 	io::{Read as _, Seek as _, SeekFrom, Write as _},
+	mem,
 	path::PathBuf,
 	sync::{
 		Arc, Weak,
@@ -35,6 +37,7 @@ use crate::{
 	answer::{Artifact, ArtifactBody, ArtifactRef, Digest, DigestAlgorithm, ResponseMeta},
 	body::{BodyFactory, BodyFactoryHandle, BodyOpenError, BodySource, ByteStream, Replayability},
 	call::OpaqueJson,
+	catalog::{ModelKey, ProviderId, RouteId},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, Completion, FinishReason, ToolCall, UsageUpdate},
 	gate::{GateSpoolError, SecureGateSpool},
@@ -88,13 +91,13 @@ pub trait OperatingSystemStagingKey: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StagingKeyUnavailable;
 
-impl fmt::Display for StagingKeyUnavailable {
+impl Display for StagingKeyUnavailable {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("secure staging key is unavailable")
 	}
 }
 
-impl std::error::Error for StagingKeyUnavailable {}
+impl error::Error for StagingKeyUnavailable {}
 
 /// Explicit source of temporary-file encryption key material.
 #[derive(Clone)]
@@ -207,7 +210,7 @@ pub enum StagingPolicyError {
 	},
 }
 
-impl fmt::Display for StagingPolicyError {
+impl Display for StagingPolicyError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::InvalidChunkBytes { provided, maximum } => {
@@ -217,7 +220,7 @@ impl fmt::Display for StagingPolicyError {
 	}
 }
 
-impl std::error::Error for StagingPolicyError {}
+impl error::Error for StagingPolicyError {}
 
 /// Cloneable cancellation signal shared by staging and every staged reader.
 #[derive(Clone, Debug, Default)]
@@ -244,13 +247,13 @@ impl StagingCancellation {
 			return;
 		}
 		self.0.notify.notify_waiters();
-		let staged = std::mem::take(&mut *self.0.staged.lock());
+		let staged = mem::take(&mut *self.0.staged.lock());
 		for state in staged {
 			if let Some(state) = state.upgrade() {
 				state.invalidate();
 			}
 		}
-		let gate_spools = std::mem::take(&mut *self.0.gate_spools.lock());
+		let gate_spools = mem::take(&mut *self.0.gate_spools.lock());
 		for state in gate_spools {
 			if let Some(state) = state.upgrade() {
 				state.invalidate();
@@ -1038,13 +1041,16 @@ fn tamper_error() -> Error {
 #[cfg(test)]
 mod tests {
 	use std::{
+		fs::{self, OpenOptions},
 		io::{self, Read, Seek, Write},
 		sync::atomic::{AtomicUsize, Ordering},
+		task,
 	};
 
 	use futures::stream;
 
 	use super::*;
+	use crate::body::OneShotBody as BodyOneShotBody;
 
 	fn budget(bytes: u64) -> ExecutionBudget {
 		ExecutionBudget { max_staging_bytes: bytes, ..ExecutionBudget::default() }
@@ -1055,7 +1061,7 @@ mod tests {
 			.iter()
 			.map(|chunk| Ok::<_, Error>(Bytes::from_static(chunk)))
 			.collect::<Vec<_>>();
-		BodySource::OneShot(Arc::new(crate::body::OneShotBody::new(Box::pin(stream::iter(chunks)))))
+		BodySource::OneShot(Arc::new(BodyOneShotBody::new(Box::pin(stream::iter(chunks)))))
 	}
 
 	async fn read_all(source: &BodySource) -> Result<Vec<u8>, Error> {
@@ -1167,15 +1173,15 @@ mod tests {
 		let stream = stream::poll_fn(move |_| {
 			let current = count.fetch_add(1, Ordering::SeqCst);
 			if current == 0 {
-				std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"first"))))
+				task::Poll::Ready(Some(Ok(Bytes::from_static(b"first"))))
 			} else {
 				cancel_after_first.cancel();
-				std::task::Poll::Pending
+				task::Poll::Pending
 			}
 		});
 		let mut receipt = ExecutionReceipt::default();
 		let error = stage_body(
-			&BodySource::OneShot(Arc::new(crate::body::OneShotBody::new(Box::pin(stream)))),
+			&BodySource::OneShot(Arc::new(BodyOneShotBody::new(Box::pin(stream)))),
 			&StagingPolicy::memory_only(32, 32),
 			&budget(32),
 			&signal,
@@ -1341,7 +1347,7 @@ mod tests {
 			StoredStage::Disk(disk) => disk.path.to_path_buf(),
 			StoredStage::Memory(_) => panic!("expected disk spill"),
 		};
-		let mut file = std::fs::OpenOptions::new()
+		let mut file = OpenOptions::new()
 			.read(true)
 			.write(true)
 			.open(&path)
@@ -1467,7 +1473,7 @@ mod tests {
 		spool
 			.push(ChatEvent::ThinkingDelta { index: 2, text: sf!("second") }, 11)
 			.unwrap();
-		let encrypted = std::fs::read(&path).unwrap();
+		let encrypted = fs::read(&path).unwrap();
 		assert!(
 			!encrypted
 				.windows(b"first".len())
@@ -1906,9 +1912,9 @@ fn decode_chat_event(input: &[u8]) -> Result<ChatEvent, GateSpoolError> {
 	let event = match cursor.u8()? {
 		0 => ChatEvent::Started(ResponseMeta {
 			request_id:          RequestId::from(cursor.string()?),
-			provider:            crate::catalog::ProviderId::from(cursor.string()?),
-			route:               crate::catalog::RouteId::from(cursor.string()?),
-			model:               cursor.option_string()?.map(crate::catalog::ModelKey::from),
+			provider:            ProviderId::from(cursor.string()?),
+			route:               RouteId::from(cursor.string()?),
+			model:               cursor.option_string()?.map(ModelKey::from),
 			provider_request_id: cursor.option_string()?.map(Str::new),
 			created_at:          cursor.system_time()?,
 		}),
@@ -2162,7 +2168,7 @@ impl<'a> GateCursor<'a> {
 	}
 
 	fn string(&mut self) -> Result<&'a str, GateSpoolError> {
-		std::str::from_utf8(self.bytes()?).map_err(|_| gate_corrupt("secure_gate_utf8_corrupt"))
+		str::from_utf8(self.bytes()?).map_err(|_| gate_corrupt("secure_gate_utf8_corrupt"))
 	}
 
 	fn option_string(&mut self) -> Result<Option<&'a str>, GateSpoolError> {

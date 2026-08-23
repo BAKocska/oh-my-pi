@@ -11,11 +11,13 @@ pub mod agent_hub;
 mod approval;
 pub mod ask;
 pub mod autoqa;
+pub mod blocks;
 pub mod completion;
 pub mod debug_selector;
 pub mod frame;
 pub mod gradient;
 pub mod host;
+pub mod inspector;
 pub mod log_viewer;
 pub mod modes;
 mod overlays;
@@ -39,10 +41,13 @@ pub mod slots;
 use std::{sync::Arc, time::Instant};
 
 pub use agent_hub::{AgentHub, AgentHubEvent};
+pub use blocks::{BlockOrdinal, BlockPhase, BlockTarget, Blocks, Overflow, Plan};
 pub mod image_overlay;
 pub use gradient::{EditorGradient, EditorHighlight, GradientStop};
 pub use image_overlay::{ImageOverlay, ImageOverlayEvent};
+pub use inspector::{HistoryInspector, HistoryInspectorEvent};
 use omp_core::Str;
+use omp_proto::omp::ui::v1;
 pub use omp_tui::components::Attachment;
 pub use overlays::{ListPicker, ListRow, OverlayPanel, PromptEvent, PromptOverlay, panel_divider};
 pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
@@ -50,7 +55,8 @@ pub use picker::{ModelPicker, PickerEvent};
 pub use provider_picker::ProviderPicker;
 pub use pty::{PtyEvent, PtyOutputQueue, PtyOverlay, PtyStatus, TerminalState};
 pub use scene::{
-	Chat, ChatKey, LiveVoiceAction, LiveVoicePhase, LiveVoiceVisualizer, RenderedFrame,
+	Chat, ChatKey, FinalSnapshotRef, LiveVoiceAction, LiveVoicePhase, LiveVoiceVisualizer,
+	RetirementBatch, ToolPresentation, ViewportFrame,
 };
 pub use selection_overlay::{SelectionEvent, SelectionOverlay, SelectionPurpose};
 pub use settings_overlay::{SettingChange, SettingsEvent, SettingsOverlay};
@@ -472,6 +478,11 @@ pub enum Intent {
 	},
 	/// Ask the backend for rewind targets.
 	RewindRequest,
+	/// Open the alternate-screen inspector over canonical conversation history.
+	///
+	/// The terminal host binds this to Alt+H because legacy terminal input
+	/// decodes Ctrl+H as Backspace.
+	InspectHistory,
 	/// Rewind the durable transcript to an event.
 	Rewind {
 		/// Event to keep as the new live-chain tail.
@@ -730,7 +741,7 @@ pub enum BackendEvent {
 	/// Append an error notice.
 	Error(Str),
 	/// Apply one bounded exact-key retained transcript frame.
-	RetainedFrame(omp_proto::omp::ui::v1::RetainedFrameEnvelope),
+	RetainedFrame(v1::RetainedFrameEnvelope),
 	/// Replace status facts.
 	Status(StatusFacts),
 	/// Preview a parsed theme without committing settings.
@@ -794,6 +805,11 @@ pub enum BackendEvent {
 	HistoryReplayFinished,
 	/// Remove all transcript history.
 	HistoryCleared,
+	/// Open canonical pre-rendered history in the alternate-screen inspector.
+	HistoryInspect {
+		/// History rendered through the app's headless canonical formatter.
+		frame: omp_tui::Frame,
+	},
 	/// Acknowledge the active submission.
 	Ack {
 		/// Whether the submission ended by interruption.

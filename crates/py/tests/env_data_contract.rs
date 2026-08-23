@@ -1,3 +1,6 @@
+//! Verifies Python environment calls remain invocation-scoped and
+//! generation-fenced.
+
 use omp_py::{Engine, pyo3::ffi::c_str};
 
 #[test]

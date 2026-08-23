@@ -1,13 +1,18 @@
 //! Native debug action catalog and diagnostic fact collectors.
 
 use std::{
+	env::{self, consts},
+	fs, io,
 	path::{Path, PathBuf},
+	process, thread, time,
 	time::Duration,
 };
 
 use omp_core::Str;
+use omp_storage::{blob::BlobStore, gc};
 use serde::Serialize;
 use strum::{Display, EnumString, IntoStaticStr};
+use url::Url;
 
 /// Stable action identifier selected by the debug overlay.
 #[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
@@ -181,20 +186,20 @@ pub struct SystemFacts {
 
 /// Collects bounded host facts without invoking platform debuggers.
 pub fn collect_system_facts() -> SystemFacts {
-	let shell = std::env::var("SHELL")
-		.or_else(|_| std::env::var("COMSPEC"))
+	let shell = env::var("SHELL")
+		.or_else(|_| env::var("COMSPEC"))
 		.unwrap_or_default();
-	let cwd = std::env::current_dir()
+	let cwd = env::current_dir()
 		.unwrap_or_else(|_| PathBuf::from("."))
 		.display()
 		.to_string();
 	SystemFacts {
-		os:            std::env::consts::OS,
-		architecture:  std::env::consts::ARCH,
-		logical_cpus:  std::thread::available_parallelism().map_or(1, usize::from),
+		os:            consts::OS,
+		architecture:  consts::ARCH,
+		logical_cpus:  thread::available_parallelism().map_or(1, usize::from),
 		memory_bytes:  platform_memory_bytes(),
 		omp_version:   env!("CARGO_PKG_VERSION"),
-		target_family: std::env::consts::FAMILY,
+		target_family: consts::FAMILY,
 		shell:         omp_telemetry::redact::redact_sensitive_credentials(&shell),
 		cwd:           omp_telemetry::redact::redact_sensitive_credentials(&cwd),
 	}
@@ -253,35 +258,35 @@ pub fn collect_terminal_facts(caps: omp_tui::TerminalCaps) -> TerminalFacts {
 
 /// Writes a redacted visible transcript into an environment-created temporary
 /// artifact.
-pub fn export_transcript(directory: &Path, text: &str) -> std::io::Result<PathBuf> {
-	std::fs::create_dir_all(directory)?;
-	let nonce = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+pub fn export_transcript(directory: &Path, text: &str) -> io::Result<PathBuf> {
+	fs::create_dir_all(directory)?;
+	let nonce = time::SystemTime::now()
+		.duration_since(time::UNIX_EPOCH)
 		.unwrap_or(Duration::ZERO)
 		.as_nanos();
-	let path = directory.join(format!("omp-transcript-{}-{nonce}.txt", std::process::id()));
+	let path = directory.join(format!("omp-transcript-{}-{nonce}.txt", process::id()));
 	let redacted = omp_telemetry::redact::redact_sensitive_credentials(text);
-	std::fs::write(&path, redacted)?;
+	fs::write(&path, redacted)?;
 	Ok(path)
 }
 
 /// Converts a generated artifact path into a safe OSC 8/open-action URL.
-pub fn artifact_url(path: &Path) -> Option<url::Url> {
-	url::Url::from_file_path(path).ok()
+pub fn artifact_url(path: &Path) -> Option<Url> {
+	Url::from_file_path(path).ok()
 }
 
 /// Sweeps only blobs unreachable from retained sessions and durable roots.
 pub fn garbage_collect(
-	store: &omp_storage::blob::BlobStore,
+	store: &BlobStore,
 	roots: &[omp_storage::transcript::SessionId],
 	min_age: Duration,
-) -> Result<omp_storage::gc::SweepReport, omp_storage::gc::Error> {
+) -> Result<omp_storage::gc::SweepReport, gc::Error> {
 	omp_storage::gc::sweep(store, roots, min_age)
 }
 
 #[cfg(target_os = "linux")]
 fn platform_memory_bytes() -> Option<u64> {
-	let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+	let text = fs::read_to_string("/proc/meminfo").ok()?;
 	let kb = text.lines().find_map(|line| {
 		line
 			.strip_prefix("MemTotal:")?

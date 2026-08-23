@@ -1,6 +1,10 @@
 //! Direct GitHub API device with isolated worktree mutation operations.
 
-use std::{fmt, sync::Arc};
+use std::{
+	error,
+	fmt::{self, Display},
+	sync::Arc,
+};
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -126,12 +130,12 @@ pub struct Fault {
 	/// Secret-free diagnostic.
 	pub message: Str,
 }
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(&self.message)
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// Run-watch currently settles as one bounded result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

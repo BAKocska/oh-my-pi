@@ -13,12 +13,13 @@ use tower::Service;
 
 use crate::{
 	answer::{Answer, AnswerBody, ModelDiscoveryPage},
-	call::{DiscoveryRequest, OperationCall},
+	call::{Call, DiscoveryRequest, OperationCall},
 	catalog::{
 		DiscoveredModel, DiscoveryNormalizer, ModelKey, ModelSpec, OperationKind, Pricing,
 		ProviderId, RouteDef, RouteId, WireModelId, snapshot::Catalog, taxonomy,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
+	layer::recover::DiscoveryProjector,
 	operation::{OperationRequest, OperationResponse},
 	receipt::{ExecutionReceipt, ReasonId},
 };
@@ -289,7 +290,7 @@ fn responses_route_hints(catalog: &Catalog, route: &RouteDef) -> Option<Response
 	Some(ResponsesRouteHints { wire_ids: Arc::new(wire_ids), target })
 }
 
-impl crate::layer::recover::DiscoveryProjector for CatalogDiscoveryProjector {
+impl DiscoveryProjector for CatalogDiscoveryProjector {
 	fn project(
 		&self,
 		request: &DiscoveryRequest,
@@ -550,7 +551,7 @@ impl<S> DiscoveryService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for DiscoveryService<S>
+impl<S> Service<Call> for DiscoveryService<S>
 where
 	S: Service<
 			OperationRequest<DiscoveryRequest>,
@@ -568,7 +569,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let prepared = match &call.operation {
 			OperationCall::DiscoverModels(request) => self.prepare(request).map(Arc::new),
 			_ => Err(wrong_operation(&call)),
@@ -648,7 +649,7 @@ pub fn normalize_page(
 	Ok(ModelDiscoveryPage { models, next_cursor: page.next_cursor })
 }
 
-fn wrong_operation(call: &crate::call::Call) -> Error {
+fn wrong_operation(call: &Call) -> Error {
 	Error::new(
 		ErrorKind::InternalInvariant,
 		ErrorPhase::Internal,
@@ -706,8 +707,8 @@ mod tests {
 		call::DiscoveryRequest,
 		catalog::{
 			ContextStrategy, DiscoveredModel, DiscoveryDefaults, DiscoveryNormalizer, ModelKey,
-			ModelSpec, OperationBits, OperationKind, Price, PriceUnit, Pricing, ProviderId, RouteId,
-			ThinkingPolicyId, WireModelId, WirePolicyId,
+			ModelLimits, ModelSpec, OperationBits, OperationKind, Price, PriceUnit, Pricing,
+			ProviderId, RouteId, ThinkingPolicyId, WireModelId, WirePolicyId, snapshot::Catalog,
 		},
 		layer::recover::DiscoveryProjector,
 	};
@@ -1167,7 +1168,7 @@ mod tests {
 		let (provider, route, normalizer, canonical) = gmi_fixture();
 		let mut row = discovered(&provider, &route, "deepseek-ai/DeepSeek-V4-Pro");
 		row.display_name = Some("GMI DeepSeek".into());
-		row.declared_limits = Some(crate::catalog::ModelLimits {
+		row.declared_limits = Some(ModelLimits {
 			context_window:        Some(131_072),
 			maximum_input_tokens:  None,
 			maximum_output_tokens: Some(8_192),
@@ -1318,7 +1319,7 @@ mod tests {
 			thinking:             None,
 			pricing:              Pricing::default(),
 		});
-		let canonical = crate::catalog::snapshot::Catalog::embedded()
+		let canonical = Catalog::embedded()
 			.model(ModelKey::from_ref("meta/muse-spark-1.2-contributor"))
 			.expect("canonical Muse contributor")
 			.clone();
@@ -1382,7 +1383,7 @@ mod tests {
 
 	#[test]
 	fn opencode_go_muse_discovery_recovers_intrinsic_parameters() {
-		let catalog = crate::catalog::snapshot::Catalog::embedded();
+		let catalog = Catalog::embedded();
 		let route = catalog
 			.route(RouteId::from_ref("opencode-go/primary"))
 			.expect("Go discovery route is bundled");

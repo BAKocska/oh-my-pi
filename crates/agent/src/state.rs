@@ -11,7 +11,7 @@ use omp_core::Str;
 use omp_scribe::Props;
 use omp_tool::Registry;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::watch::{self, Receiver};
 
 use crate::{
 	InterruptedReasoningDialect, TurnOptions,
@@ -181,7 +181,7 @@ impl AgentState {
 	/// The receiver's current value is the snapshot published at subscription
 	/// time; lagging readers observe the newest value without an update queue.
 	#[inline]
-	pub fn subscribe(&self) -> watch::Receiver<Arc<AgentSnapshot>> {
+	pub fn subscribe(&self) -> Receiver<Arc<AgentSnapshot>> {
 		self.sender.subscribe()
 	}
 

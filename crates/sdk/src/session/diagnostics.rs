@@ -1,6 +1,6 @@
 //! Typed, credential-free diagnostics produced during session construction.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use omp_core::Str;
 use omp_docserver::lsp_registry::LspBindingHandle;
@@ -118,8 +118,8 @@ impl LspSessionBinding {
 	}
 }
 
-impl std::fmt::Debug for LspSessionBinding {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for LspSessionBinding {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("LspSessionBinding")
 			.field("name", &self.name)

@@ -3,6 +3,7 @@
 use std::{
 	io,
 	path::{Path, PathBuf},
+	str,
 	time::Duration,
 };
 
@@ -352,7 +353,7 @@ pub(super) fn command_source(binary: &str, argv: &[&str], read_only: bool) -> St
 		push_shell_word(&mut source, argument);
 	}
 	source.push_str("; else printf '%s\\n' '");
-	source.push_str(std::str::from_utf8(MISSING_MARKER).expect("missing marker is ASCII"));
+	source.push_str(str::from_utf8(MISSING_MARKER).expect("missing marker is ASCII"));
 	source.push_str("' >&2; exit 127; fi");
 	source
 }

@@ -15,6 +15,7 @@ pub use bzip2::bzip2_decompress;
 pub use lzma::{lzma_alone_decompress, lzma_decompress, lzma2_decompress};
 pub use lzw::lzw_decompress;
 pub use xz::{x86_decode, xz_decompress};
+use zstd::stream::read;
 
 use crate::{Error, Limits, Result};
 
@@ -48,7 +49,7 @@ pub fn is_compress_z(bytes: &[u8]) -> bool {
 
 /// Decompresses one zstd frame sequence bounded by `limits.archive_size`.
 pub fn zstd_decompress(bytes: &[u8], limits: Limits) -> Result<Vec<u8>> {
-	let decoder = zstd::stream::read::Decoder::new(bytes)?;
+	let decoder = read::Decoder::new(bytes)?;
 	let mut output = Vec::new();
 	decoder
 		.take(limits.archive_size.saturating_add(1))

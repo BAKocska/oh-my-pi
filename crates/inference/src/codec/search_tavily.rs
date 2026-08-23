@@ -6,6 +6,7 @@ use bytes::{Bytes, BytesMut};
 use omp_catalog::OperationKind;
 use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::{
 	answer::{AnswerBody, SearchResult, SearchResults},
@@ -172,8 +173,7 @@ fn encode_search(base_url: &str, request: &SearchRequest) -> Result<EncodedReque
 }
 
 fn join_uri(base: &str, suffix: &str) -> Result<Str, Error> {
-	let mut url =
-		url::Url::parse(base).map_err(|_| encoding_error("tavily_search_base_url_invalid"))?;
+	let mut url = Url::parse(base).map_err(|_| encoding_error("tavily_search_base_url_invalid"))?;
 	if url.cannot_be_a_base() || url.query().is_some() || url.fragment().is_some() {
 		return Err(encoding_error("tavily_search_base_url_invalid"));
 	}

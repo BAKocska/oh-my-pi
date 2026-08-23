@@ -8,12 +8,15 @@
 //! Saves the first few frames as PNGs under the system temp dir, prints page
 //! events for a few seconds, then exits.
 
-use std::time::{Duration, Instant};
+use std::{
+	env, error, fs, io,
+	time::{Duration, Instant},
+};
 
 use omp_webview::{Engine, FrameConfig, SurfaceKind, WebViewBuilder, WebViewEvent};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let url = std::env::args()
+fn main() -> Result<(), Box<dyn error::Error>> {
+	let url = env::args()
 		.nth(1)
 		.unwrap_or_else(|| "https://example.com".into());
 	let engine = Engine::find(SurfaceKind::Frames)?;
@@ -35,10 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		match event {
 			WebViewEvent::Frame(frame) => {
 				if saved < 3 {
-					let path = std::env::temp_dir().join(format!("omp-webview-frame-{saved}.png"));
-					let file = std::fs::File::create(&path)?;
-					let mut enc =
-						png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
+					let path = env::temp_dir().join(format!("omp-webview-frame-{saved}.png"));
+					let file = fs::File::create(&path)?;
+					let mut enc = png::Encoder::new(io::BufWriter::new(file), frame.width, frame.height);
 					enc.set_color(png::ColorType::Rgba);
 					enc.set_depth(png::BitDepth::Eight);
 					enc.write_header()?.write_image_data(&frame.data)?;

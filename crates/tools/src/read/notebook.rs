@@ -1,6 +1,11 @@
 //! Jupyter notebook conversion into pi's editable virtual text.
 
-use std::{borrow::Cow, collections::HashSet, fmt};
+use std::{
+	borrow::Cow,
+	collections::HashSet,
+	error,
+	fmt::{self, Display},
+};
 
 use omp_core::{IntoStr, Str};
 use serde_json::Value;
@@ -72,13 +77,13 @@ impl NotebookError {
 	}
 }
 
-impl fmt::Display for NotebookError {
+impl Display for NotebookError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.message())
 	}
 }
 
-impl std::error::Error for NotebookError {}
+impl error::Error for NotebookError {}
 
 struct PreparedCell<'a> {
 	cell_type: NotebookCellType,

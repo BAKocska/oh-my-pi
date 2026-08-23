@@ -1,8 +1,10 @@
 //! Environment-owned worktree discovery and maintenance commands.
 
+#[cfg(not(any(unix, windows)))]
+use std::process;
 use std::{
 	collections::BTreeSet,
-	fs, io,
+	ffi, fs, io,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 };
@@ -359,9 +361,9 @@ fn remove_worktree(row: &WorktreeRow) -> io::Result<Option<PathBuf>> {
 		&& row.class == "pr-checkout"
 	{
 		match run_git(parent, &[
-			std::ffi::OsStr::new("worktree"),
-			std::ffi::OsStr::new("remove"),
-			std::ffi::OsStr::new("--force"),
+			ffi::OsStr::new("worktree"),
+			ffi::OsStr::new("remove"),
+			ffi::OsStr::new("--force"),
 			row.path.as_os_str(),
 		]) {
 			Ok(true) => {},
@@ -411,14 +413,14 @@ fn remove_path(path: &Path, record_path: Option<&Path>) -> io::Result<()> {
 }
 
 fn prune_git_worktrees(parent: &Path) -> io::Result<()> {
-	if run_git(parent, &[std::ffi::OsStr::new("worktree"), std::ffi::OsStr::new("prune")])? {
+	if run_git(parent, &[ffi::OsStr::new("worktree"), ffi::OsStr::new("prune")])? {
 		Ok(())
 	} else {
 		Err(io::Error::other("git worktree prune failed"))
 	}
 }
 
-fn run_git(cwd: &Path, args: &[&std::ffi::OsStr]) -> io::Result<bool> {
+fn run_git(cwd: &Path, args: &[&ffi::OsStr]) -> io::Result<bool> {
 	let mut command = Command::new("git");
 	command
 		.current_dir(cwd)
@@ -491,7 +493,7 @@ fn process_is_live(pid: u32) -> bool {
 
 #[cfg(not(any(unix, windows)))]
 fn process_is_live(pid: u32) -> bool {
-	pid == std::process::id()
+	pid == process::id()
 }
 
 #[cfg(test)]

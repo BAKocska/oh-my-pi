@@ -4,7 +4,7 @@ use bytes::Bytes;
 use omp_proto::{
 	omp::{
 		document::v1::{DocumentEvent, DocumentTarget, document_target},
-		inference::v1::{ToolDef, tool_def},
+		inference::v1::{ToolDef, tool_def, tool_def::grammar},
 		telemetry::v1::ToolCall,
 	},
 	prost::Message as _,
@@ -70,7 +70,7 @@ fn grammar_tool_survives_binary_protocol_roundtrip_losslessly() {
 		name:        "edit".to_owned(),
 		description: "Sparse edit".to_owned(),
 		input:       Some(tool_def::Input::Grammar(tool_def::Grammar {
-			syntax:     tool_def::grammar::Syntax::Lark as i32,
+			syntax:     grammar::Syntax::Lark as i32,
 			definition: EDIT_LARK.to_owned(),
 		})),
 	};
@@ -78,7 +78,7 @@ fn grammar_tool_survives_binary_protocol_roundtrip_losslessly() {
 	let Some(tool_def::Input::Grammar(grammar)) = decoded.input else {
 		panic!("grammar input");
 	};
-	assert_eq!(grammar.syntax, tool_def::grammar::Syntax::Lark as i32);
+	assert_eq!(grammar.syntax, grammar::Syntax::Lark as i32);
 	assert_eq!(grammar.definition, EDIT_LARK);
 }
 

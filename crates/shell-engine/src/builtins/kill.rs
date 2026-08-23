@@ -1,11 +1,16 @@
 //! The `kill` builtin, moved from `pi-shell`.
 
-use std::io::Write;
+use std::{io::Write, result};
 
 use clap::Parser;
 
+#[cfg(windows)]
+use crate::processes::{process_handle_is_running, terminate_process_handle};
 use crate::{
-	ExecutionContext, ExecutionExitCode, ExecutionResult, builtins, sys, traps::TrapSignal,
+	Error, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions, builtins,
+	int_utils::parse,
+	sys,
+	traps::{TrapSignal, format_signals},
 };
 
 /// Signal a job or process.
@@ -31,9 +36,9 @@ pub(crate) struct KillCommand {
 }
 
 impl builtins::Command for KillCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	fn new<I>(args: I) -> std::result::Result<Self, clap::Error>
+	fn new<I>(args: I) -> result::Result<Self, clap::Error>
 	where
 		I: IntoIterator<Item = String>,
 	{
@@ -45,10 +50,10 @@ impl builtins::Command for KillCommand {
 		clippy::unused_async_trait_impl,
 		reason = "the builtin Command trait declares execute as async"
 	)]
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
 		context: ExecutionContext<'_, SE>,
-	) -> std::result::Result<ExecutionResult, Self::Error> {
+	) -> result::Result<ExecutionResult, Self::Error> {
 		let default_signal = if let Some(signal_name) = &self.signal_name {
 			if let Ok(signal) = KillSignal::parse(signal_name) {
 				signal
@@ -194,8 +199,8 @@ impl builtins::Command for KillCommand {
 					let mut succeeded = expected_handles != 0 && handles.len() == expected_handles;
 					for handle in &handles {
 						let handled = match signal {
-							KillSignal::Probe => crate::processes::process_handle_is_running(handle),
-							KillSignal::Signal(_) => crate::processes::terminate_process_handle(handle),
+							KillSignal::Probe => process_handle_is_running(handle),
+							KillSignal::Signal(_) => terminate_process_handle(handle),
 						};
 						if !handled {
 							succeeded = false;
@@ -214,7 +219,7 @@ impl builtins::Command for KillCommand {
 				continue;
 			}
 
-			let pid = match crate::int_utils::parse(operand, 10) {
+			let pid = match parse(operand, 10) {
 				Ok(pid) => pid,
 				Err(err) => {
 					writeln!(context.stderr(), "{}: {}: {}", context.command_name, operand, err)?;
@@ -322,13 +327,13 @@ fn process_exists(pid: i32) -> bool {
 }
 
 fn print_kill_signals<'a>(
-	context: &ExecutionContext<'_, impl crate::ShellExtensions>,
+	context: &ExecutionContext<'_, impl ShellExtensions>,
 	signals: impl IntoIterator<Item = &'a String>,
-) -> std::result::Result<ExecutionResult, crate::Error> {
+) -> result::Result<ExecutionResult, Error> {
 	let mut result = ExecutionResult::success();
 	let mut signals = signals.into_iter().peekable();
 	if signals.peek().is_none() {
-		return crate::traps::format_signals(
+		return format_signals(
 			context.stdout(),
 			TrapSignal::iterator().filter(|signal| !matches!(signal, TrapSignal::Exit)),
 		)
@@ -353,7 +358,7 @@ enum PrintedSignal {
 	Number(i32),
 }
 
-fn printed_signal(value: &str) -> std::result::Result<PrintedSignal, crate::Error> {
+fn printed_signal(value: &str) -> result::Result<PrintedSignal, Error> {
 	if let Ok(number) = value.parse::<i32>() {
 		let signal = TrapSignal::try_from(number).or_else(|err| {
 			if number > 128 {
@@ -491,7 +496,7 @@ enum KillSignal {
 }
 
 impl KillSignal {
-	fn parse(value: &str) -> std::result::Result<Self, crate::Error> {
+	fn parse(value: &str) -> result::Result<Self, Error> {
 		if let Ok(number) = value.parse::<i32>() {
 			if number == 0 {
 				Ok(Self::Probe)

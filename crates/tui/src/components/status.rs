@@ -3,7 +3,7 @@ use smallvec::SmallVec;
 
 use super::hr::truncate_to_width;
 use crate::{
-	Icon,
+	Icon, Style,
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::{Charset, Theme, UiContext},
 	frame::{Color, Rect},
@@ -287,7 +287,7 @@ impl Component for Status {
 		}
 		let style = self.props.style(&pc.ctx.theme);
 		let (left_cap, separator, cap) = self.chrome(pc.ctx.charset);
-		let edge_style = crate::Style::new().fg(style.background_color());
+		let edge_style = Style::new().fg(style.background_color());
 		let left_width = cell_width(left_cap);
 		let cap_width = cell_width(cap);
 		let truncate_first = visible == 1 && self.group_width(visible, pc.ctx.charset) > rect.width;

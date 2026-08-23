@@ -2,12 +2,12 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	path::PathBuf,
 	str::FromStr as _,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::Instant,
 };
 
 /// Maximum raw terminal-input frame admitted from the interactive terminal.
@@ -129,7 +129,7 @@ impl RawInputAuthority {
 		generation: u64,
 		focus_token: &str,
 		data: &[u8],
-	) -> Result<omp_proto::toolhost::v1::RawTerminalInputFrame, RawInputError> {
+	) -> Result<v1::RawTerminalInputFrame, RawInputError> {
 		if generation != self.generation {
 			return Err(RawInputError::StaleGeneration);
 		}
@@ -140,7 +140,7 @@ impl RawInputAuthority {
 			return Err(RawInputError::FrameTooLarge);
 		}
 		self.sequence = self.sequence.saturating_add(1);
-		Ok(omp_proto::toolhost::v1::RawTerminalInputFrame {
+		Ok(v1::RawTerminalInputFrame {
 			sequence:    self.sequence,
 			data:        bytes::Bytes::copy_from_slice(data),
 			focus_token: focus_token.to_owned(),
@@ -187,7 +187,7 @@ pub struct AuditedDirectFilesystemRequest {
 	/// Requested operation from the closed vocabulary.
 	pub operation: Str,
 	/// Absolute local host path.
-	pub path:      std::path::PathBuf,
+	pub path:      PathBuf,
 	/// Optional bounded request bytes.
 	pub data:      bytes::Bytes,
 	/// Durable grant facts appended to the audit journal before execution.
@@ -217,7 +217,7 @@ pub enum DirectFilesystemError {
 /// Validates the exceptional filesystem protocol arm without translating it
 /// into an Environment operation.
 pub fn admit_direct_filesystem(
-	request: omp_proto::toolhost::v1::DirectFilesystemRequest,
+	request: v1::DirectFilesystemRequest,
 	declared: bool,
 	grant: Option<&DirectFilesystemGrant>,
 ) -> Result<AuditedDirectFilesystemRequest, DirectFilesystemError> {
@@ -238,7 +238,7 @@ pub fn admit_direct_filesystem(
 	if request.data.len() > MAX_DIRECT_FILESYSTEM_BYTES {
 		return Err(DirectFilesystemError::PayloadTooLarge);
 	}
-	let path = std::path::PathBuf::from(request.absolute_path);
+	let path = PathBuf::from(request.absolute_path);
 	if !path.is_absolute() {
 		return Err(DirectFilesystemError::RelativePath);
 	}
@@ -249,6 +249,8 @@ pub fn admit_direct_filesystem(
 		grant: grant.clone(),
 	})
 }
+
+use std::{env, io, iter, mem};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -266,12 +268,15 @@ use omp_proto::{
 	},
 	env::v1::{ArgText, ArgsCommitted, Interrupt},
 	thread::v1::{Part, part},
-	toolhost::v1::{
-		AdoptArtifact, AppendEntriesAtomic, AppendEntry, ArtifactRow, DeclareEntryKinds,
-		DeclareSecretRules, EntryAppended, JournalHostEnvelope, JournalRow, JournalWorkerEnvelope,
-		ListArtifacts, ListSessions, PinArtifact, PullReply, PullRequest, QueryJournal, QueryUsage,
-		SecretRuleDeclaration, SessionRow, StatArtifact, StateCas, StateGet, StateScope, StateWatch,
-		UsageReport, journal_host_envelope, journal_worker_envelope,
+	toolhost::{
+		v1,
+		v1::{
+			AdoptArtifact, AppendEntriesAtomic, AppendEntry, ArtifactRow, DeclareEntryKinds,
+			DeclareSecretRules, EntryAppended, JournalHostEnvelope, JournalRow, JournalWorkerEnvelope,
+			ListArtifacts, ListSessions, PinArtifact, PullReply, PullRequest, QueryJournal,
+			QueryUsage, SecretRuleDeclaration, SessionRow, StatArtifact, StateCas, StateGet,
+			StateScope, StateWatch, UsageReport, journal_host_envelope, journal_worker_envelope,
+		},
 	},
 };
 use omp_secrets::rule::{SecretKind, SecretMode, SecretRule, SecretRuleError};
@@ -279,6 +284,7 @@ use omp_storage::{
 	blob::BlobRef,
 	transcript::msg::{Content, UserBlock},
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use thiserror::Error;
@@ -288,7 +294,9 @@ use tokio::{
 		UnixStream,
 		unix::{OwnedReadHalf, OwnedWriteHalf},
 	},
+	runtime,
 	sync::Mutex as AsyncMutex,
+	task::AbortHandle,
 };
 
 use super::dispatch::{
@@ -386,7 +394,12 @@ pub enum SecretDeclarationError {
 	ExtensionMismatch,
 	/// A stale or future activation generation was supplied.
 	#[error("secret declaration generation {actual} does not match {expected}")]
-	GenerationMismatch { expected: u64, actual: u64 },
+	GenerationMismatch {
+		/// Activation generation retained by the declaration gate.
+		expected: u64,
+		/// Generation supplied by the extension-host frame.
+		actual:   u64,
+	},
 	/// The extension exceeded its declaration bound.
 	#[error("extension secret declaration limit exceeded")]
 	TooManyRules,
@@ -398,7 +411,7 @@ pub enum SecretDeclarationError {
 	InvalidKind,
 	/// A declared environment variable is absent or non-Unicode.
 	#[error("extension secret environment declaration cannot be resolved")]
-	Environment(#[source] std::env::VarError),
+	Environment(#[source] env::VarError),
 	/// A declaration used an unknown mode.
 	#[error("extension secret declaration mode is invalid")]
 	InvalidMode,
@@ -429,8 +442,7 @@ fn validate_secret_declaration(
 		return Err(SecretDeclarationError::FieldTooLong);
 	}
 	let (kind, content) = if declaration.kind.eq_ignore_ascii_case("env") {
-		let value =
-			std::env::var(&declaration.content).map_err(SecretDeclarationError::Environment)?;
+		let value = env::var(&declaration.content).map_err(SecretDeclarationError::Environment)?;
 		(SecretKind::Plain, value)
 	} else {
 		(
@@ -478,7 +490,12 @@ pub enum ContributedValueError {
 	Undeclared(Str),
 	/// Activation belongs to a different child generation.
 	#[error("extension CLI activation generation {actual} does not match {expected}")]
-	StaleGeneration { expected: u64, actual: u64 },
+	StaleGeneration {
+		/// Child generation retained by the activation delivery gate.
+		expected: u64,
+		/// Generation presented by the requesting extension host.
+		actual:   u64,
+	},
 	/// Values were requested twice for one activation.
 	#[error("extension CLI values were already delivered for this activation")]
 	AlreadyDelivered,
@@ -528,7 +545,7 @@ impl ContributedValueDelivery {
 			return Err(ContributedValueError::AlreadyDelivered);
 		}
 		self.delivered = true;
-		Ok(std::mem::take(&mut self.values))
+		Ok(mem::take(&mut self.values))
 	}
 }
 
@@ -1416,7 +1433,7 @@ fn fuse_rows<T: Default>(
 ) -> impl Iterator<Item = JournalHostEnvelope> {
 	let mut rows = rows.into_iter().peekable();
 	let mut emitted = false;
-	std::iter::from_fn(move || {
+	iter::from_fn(move || {
 		if let Some(row) = rows.next() {
 			emitted = true;
 			let terminal = rows.peek().is_none();
@@ -1431,10 +1448,12 @@ fn fuse_rows<T: Default>(
 }
 
 fn proto_part(block: &UserBlock) -> Part {
+	use omp_proto::thread::v1;
+
 	match block {
 		UserBlock::Text { text } => Part { kind: Some(part::Kind::Text(text.to_string())) },
 		UserBlock::Image { blob } => Part {
-			kind: Some(part::Kind::Blob(omp_proto::thread::v1::Blob {
+			kind: Some(part::Kind::Blob(v1::Blob {
 				hash: Bytes::copy_from_slice(blob.hash.as_bytes()),
 				size: blob.size,
 				..Default::default()
@@ -2209,10 +2228,10 @@ struct ControlShared {
 	writer:           AsyncMutex<OwnedWriteHalf>,
 	identity:         Arc<ControlConnectionIdentity>,
 	authority:        Arc<dyn ControlAuthority>,
-	router:           parking_lot::Mutex<DispatchRouter>,
-	invocations:      parking_lot::Mutex<BTreeMap<Str, ControlInvocationAuthority>>,
-	dispatch_by_id:   parking_lot::Mutex<BTreeMap<u64, Str>>,
-	child_requests:   parking_lot::Mutex<BTreeMap<u64, tokio::task::AbortHandle>>,
+	router:           Mutex<DispatchRouter>,
+	invocations:      Mutex<BTreeMap<Str, ControlInvocationAuthority>>,
+	dispatch_by_id:   Mutex<BTreeMap<u64, Str>>,
+	child_requests:   Mutex<BTreeMap<u64, AbortHandle>>,
 	next_dispatch_id: AtomicU64,
 }
 
@@ -2256,7 +2275,7 @@ impl Drop for LiveDispatchGuard {
 			self.shared.dispatch_by_id.lock().remove(&self.id);
 			return;
 		}
-		if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+		if let Ok(runtime) = runtime::Handle::try_current() {
 			let shared = Arc::clone(&self.shared);
 			let invocation = self.invocation.clone();
 			runtime.spawn(async move {
@@ -2325,7 +2344,7 @@ pub struct ControlDispatch {
 pub enum ControlRuntimeError {
 	/// The dedicated descriptor failed.
 	#[error("CONTROL transport failed: {0}")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// A frame was not valid JSON.
 	#[error("CONTROL JSON frame failed: {0}")]
 	Json(#[from] serde_json::Error),
@@ -2354,10 +2373,10 @@ impl ControlRuntime {
 			writer: AsyncMutex::new(writer),
 			identity: Arc::new(identity),
 			authority,
-			router: parking_lot::Mutex::new(DispatchRouter::new(host, generation)),
-			invocations: parking_lot::Mutex::new(BTreeMap::new()),
-			dispatch_by_id: parking_lot::Mutex::new(BTreeMap::new()),
-			child_requests: parking_lot::Mutex::new(BTreeMap::new()),
+			router: Mutex::new(DispatchRouter::new(host, generation)),
+			invocations: Mutex::new(BTreeMap::new()),
+			dispatch_by_id: Mutex::new(BTreeMap::new()),
+			child_requests: Mutex::new(BTreeMap::new()),
 			next_dispatch_id: AtomicU64::new(1),
 		});
 		(Self { reader, shared: Arc::clone(&shared) }, ControlHandle { shared })
@@ -2368,7 +2387,7 @@ impl ControlRuntime {
 		loop {
 			let Some(frame) = read_json_control_frame(&mut self.reader).await? else {
 				self.shared.router.lock().disconnect();
-				for (_, request) in std::mem::take(&mut *self.shared.child_requests.lock()) {
+				for (_, request) in mem::take(&mut *self.shared.child_requests.lock()) {
 					request.abort();
 				}
 				return Ok(());
@@ -2932,7 +2951,7 @@ async fn read_json_control_frame(
 	let mut header = [0_u8; 4];
 	match reader.read_exact(&mut header).await {
 		Ok(_) => {},
-		Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+		Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
 		Err(error) => return Err(error.into()),
 	}
 	let size = u32::from_be_bytes(header) as usize;

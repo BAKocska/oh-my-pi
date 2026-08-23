@@ -2,7 +2,7 @@ use std::{io::Write, path::PathBuf};
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 #[derive(Parser)]
 pub(crate) struct HashCommand {
@@ -31,12 +31,12 @@ pub(crate) struct HashCommand {
 }
 
 impl builtins::Command for HashCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let mut result = ExecutionResult::success();
 
 		if self.remove_all {

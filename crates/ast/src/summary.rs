@@ -1,6 +1,6 @@
 //! Structural source summaries powered by tree-sitter.
 
-use std::path::Path;
+use std::{mem, path::Path};
 
 use omp_core::SparseSet;
 use serde::{Deserialize, Serialize};
@@ -902,7 +902,7 @@ fn build_segments(source: &str, total_lines: u32, spans: &[LineSpan]) -> Vec<Sum
 				current_kind.expect("kind set"),
 				current_start,
 				line_number - 1,
-				std::mem::take(&mut current_text),
+				mem::take(&mut current_text),
 			);
 			current_start = line_number;
 			current_line_count = 0;

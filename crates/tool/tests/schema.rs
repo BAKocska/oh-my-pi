@@ -1,5 +1,7 @@
 //! Typed schema generation contract tests.
 
+use std::str;
+
 use omp_tool::schema;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -54,7 +56,7 @@ fn generated_schema_is_compact_inlined_and_model_facing() {
 		"generator settings and serde annotations must project exactly"
 	);
 
-	let encoded = std::str::from_utf8(&first).expect("JSON is UTF-8");
+	let encoded = str::from_utf8(&first).expect("JSON is UTF-8");
 	for forbidden in ["$schema", "$ref", "$defs", "title"] {
 		assert!(!encoded.contains(forbidden), "schema must not contain {forbidden}");
 	}

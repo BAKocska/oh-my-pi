@@ -1,6 +1,9 @@
 //! Universally Unique Lexicographically Sortable Identifiers.
 
-use core::{fmt, str::FromStr};
+use core::{
+	fmt::{self, Display},
+	str::FromStr,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::RngExt as _;
@@ -104,7 +107,7 @@ impl FromStr for Ulid {
 	}
 }
 
-impl fmt::Display for Ulid {
+impl Display for Ulid {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let encoded = self.encode();
 		// SAFETY: Every byte comes from the ASCII-only Crockford alphabet.

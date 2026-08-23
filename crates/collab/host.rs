@@ -4,8 +4,10 @@
 use std::{
 	collections::BTreeMap,
 	error::Error as StdError,
+	fs, io,
 	io::{Read, Seek, SeekFrom},
 	path::Path,
+	str,
 };
 
 use bytes::Bytes;
@@ -395,7 +397,7 @@ pub fn read_transcript_chunk(
 	request_id: u32,
 	from_byte: u64,
 ) -> Result<TranscriptChunk, TranscriptReadError> {
-	let mut file = std::fs::File::open(path)?;
+	let mut file = fs::File::open(path)?;
 	let size = file.metadata()?.len();
 	if size <= from_byte {
 		return Ok(TranscriptChunk {
@@ -418,7 +420,7 @@ pub fn read_transcript_chunk(
 		};
 		bytes.truncate(end + 1);
 	}
-	std::str::from_utf8(&bytes)?;
+	str::from_utf8(&bytes)?;
 	let new_size = if reached_eof {
 		size
 	} else {
@@ -471,13 +473,13 @@ pub enum AgentCommandError<E: StdError + 'static> {
 pub enum TranscriptReadError {
 	/// Transcript file access failed.
 	#[error(transparent)]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// A single JSONL row exceeded the reply cap.
 	#[error("transcript entry exceeds the 4 MiB collaboration fetch cap")]
 	EntryTooLarge,
 	/// Journal bytes were not valid UTF-8.
 	#[error(transparent)]
-	Utf8(#[from] std::str::Utf8Error),
+	Utf8(#[from] str::Utf8Error),
 }
 
 /// Classifies an agent registry row without exposing advisor identities.
@@ -514,6 +516,9 @@ fn sanitize_display_name(name: &str, peer_id: u32) -> Str {
 
 #[cfg(test)]
 mod tests {
+
+	use omp_proto::collab::v1::{self, ui_request};
+
 	use super::*;
 
 	fn admission() -> HostAdmission {
@@ -569,9 +574,7 @@ mod tests {
 			.begin(
 				UiRequest {
 					title: "Choose".to_owned(),
-					spec: Some(omp_proto::collab::v1::ui_request::Spec::Editor(
-						omp_proto::collab::v1::EditorSpec { prefill: None },
-					)),
+					spec: Some(ui_request::Spec::Editor(v1::EditorSpec { prefill: None })),
 					..UiRequest::default()
 				},
 				[(7, &writable)],

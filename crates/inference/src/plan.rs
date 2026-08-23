@@ -3,6 +3,7 @@
 use std::{
 	collections::BTreeMap,
 	sync::Arc,
+	time,
 	time::{Duration, Instant},
 };
 
@@ -10,13 +11,15 @@ use omp_core::{Str, sf};
 use parking_lot::Mutex;
 
 use crate::{
-	call::Call,
+	call::{Call, ChatRequest, ContentPart, Message, Role, Setting, ToolChoice},
 	catalog::{
 		CatalogRevision, CodecId, Emulation, ModelKey, OperationKind, PolicyModel, ProviderId,
 		RouteId, ThinkingPolicy, ThinkingSelection, WirePolicy, WireTarget,
 	},
 	error::{Error, ErrorDetail, ErrorKind},
-	receipt::{Adjustment, ExecutionBudget, ExecutionReceipt, FeatureId, ReasonId, Replayability},
+	receipt::{
+		Adjustment, ExecutionBudget, ExecutionReceipt, FeatureId, Penalty, ReasonId, Replayability,
+	},
 };
 
 /// Whether a caller expressed a hard requirement or an adjustable preference.
@@ -233,7 +236,7 @@ pub struct ForcedCallCaps {
 	/// Native tool-call capabilities declared by the selected route.
 	pub features:       omp_catalog::ToolFeatureBits,
 	/// Provider-declared price of setting native `tool_choice`.
-	pub native_penalty: Option<crate::receipt::Penalty>,
+	pub native_penalty: Option<Penalty>,
 }
 
 /// Chosen forced-call enforcement rung for one attempt.
@@ -249,7 +252,7 @@ pub struct ForcedCallDecision {
 
 /// Chooses the forced-call ladder without provider-name special cases.
 pub fn forced_call_ladder(
-	choice: &crate::call::Setting<crate::call::ToolChoice>,
+	choice: &Setting<ToolChoice>,
 	caps: ForcedCallCaps,
 	non_compliant: bool,
 	escalations_left: u8,
@@ -270,8 +273,7 @@ pub fn forced_call_ladder(
 		};
 	}
 	let native_supported = match choice {
-		crate::call::Setting::Require(crate::call::ToolChoice::Named(_))
-		| crate::call::Setting::Prefer(crate::call::ToolChoice::Named(_)) => caps
+		Setting::Require(ToolChoice::Named(_)) | Setting::Prefer(ToolChoice::Named(_)) => caps
 			.features
 			.contains(omp_catalog::ToolFeatureBits::NAMED_CHOICE),
 		_ => caps
@@ -282,7 +284,7 @@ pub fn forced_call_ladder(
 		(non_compliant && escalations_left != 0 && native_supported && caps.native_penalty.is_some())
 			.then(|| Adjustment::Escalated {
 				feature: FeatureId(sf!("tool_choice")),
-				penalty: crate::receipt::Penalty::CacheInvalidated,
+				penalty: Penalty::CacheInvalidated,
 			});
 	ForcedCallDecision {
 		soft_prompt: true,
@@ -293,24 +295,21 @@ pub fn forced_call_ladder(
 
 /// Applies a forced-call decision to canonical chat input before encoding.
 pub fn apply_forced_call_decision(
-	request: &crate::call::ChatRequest,
+	request: &ChatRequest,
 	decision: &ForcedCallDecision,
-) -> crate::call::ChatRequest {
+) -> ChatRequest {
 	let mut adjusted = request.clone();
 	if decision.soft_prompt {
 		let mut messages = Vec::with_capacity(request.messages.len().saturating_add(1));
-		messages.push(crate::call::Message {
-			role:    crate::call::Role::System,
-			content: Arc::from([crate::call::ContentPart::Text {
-				text:  sf!(FORCED_CALL_DIRECTIVE),
-				proof: None,
-			}]),
+		messages.push(Message {
+			role:    Role::System,
+			content: Arc::from([ContentPart::Text { text: sf!(FORCED_CALL_DIRECTIVE), proof: None }]),
 			name:    None,
 		});
 		messages.extend(request.messages.iter().cloned());
 		adjusted.messages = messages.into();
 		if !decision.native_choice {
-			adjusted.tool_choice = crate::call::Setting::Prefer(crate::call::ToolChoice::Auto);
+			adjusted.tool_choice = Setting::Prefer(ToolChoice::Auto);
 		}
 	}
 	adjusted
@@ -450,7 +449,7 @@ pub struct PlannedFallback {
 pub struct ExecutionPlan {
 	/// Wall-clock instant captured during side-effect-free planning for
 	/// time-sensitive policy.
-	pub planned_at:          std::time::SystemTime,
+	pub planned_at:          time::SystemTime,
 	/// Catalog revision against which selection and negotiation ran.
 	pub catalog_revision:    CatalogRevision,
 	/// Registry generation against which route services were inspected.
@@ -695,6 +694,7 @@ mod tests {
 
 	use super::*;
 	use crate::{
+		call::{Setting as CallSetting, ToolChoice as CallToolChoice},
 		catalog::{CatalogRevision, CodecId, Emulation, RouteId},
 		receipt::{Cost, ExecutionBudget, FeatureId, Penalty, ReasonId},
 	};
@@ -887,7 +887,7 @@ mod tests {
 	}
 	#[test]
 	fn forced_call_ladder_skips_paid_native_choice_then_records_escalation() {
-		let choice = crate::call::Setting::Require(crate::call::ToolChoice::Named(sf!("lookup")));
+		let choice = CallSetting::Require(CallToolChoice::Named(sf!("lookup")));
 		let caps = ForcedCallCaps {
 			features:       omp_catalog::ToolFeatureBits::NAMED_CHOICE,
 			native_penalty: Some(Penalty::CacheInvalidated),

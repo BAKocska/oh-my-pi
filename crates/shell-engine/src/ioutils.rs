@@ -1,6 +1,10 @@
 //! Internal I/O utilities.
 
-use crate::openfiles;
+use std::io;
+#[cfg(unix)]
+use std::os::fd;
+
+use crate::{error, openfiles, openfiles::OpenFile};
 
 /// Error type for `FailingReaderWriter`.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -43,33 +47,32 @@ impl openfiles::Stream for FailingReaderWriter {
 	}
 
 	#[cfg(unix)]
-	fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, crate::error::Error> {
-		Err(crate::error::ErrorKind::CannotConvertToNativeFd.into())
+	fn try_clone_to_owned(&self) -> Result<fd::OwnedFd, error::Error> {
+		Err(error::ErrorKind::CannotConvertToNativeFd.into())
 	}
 
 	#[cfg(unix)]
-	fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, crate::error::Error> {
-		Err(crate::error::ErrorKind::CannotConvertToNativeFd.into())
+	fn try_borrow_as_fd(&self) -> Result<fd::BorrowedFd<'_>, error::Error> {
+		Err(error::ErrorKind::CannotConvertToNativeFd.into())
 	}
 }
 
-impl std::io::Read for FailingReaderWriter {
-	fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-		Err(std::io::Error::other(ReaderWriterError::Read(self.message)))
+impl io::Read for FailingReaderWriter {
+	fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+		Err(io::Error::other(ReaderWriterError::Read(self.message)))
 	}
 }
 
-impl std::io::Write for FailingReaderWriter {
-	fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-		Err(std::io::Error::other(ReaderWriterError::Write(self.message)))
+impl io::Write for FailingReaderWriter {
+	fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+		Err(io::Error::other(ReaderWriterError::Write(self.message)))
 	}
 
-	fn flush(&mut self) -> std::io::Result<()> {
-		Err(std::io::Error::other(ReaderWriterError::Flush(self.message)))
+	fn flush(&mut self) -> io::Result<()> {
+		Err(io::Error::other(ReaderWriterError::Flush(self.message)))
 	}
 }
-
-impl From<FailingReaderWriter> for openfiles::OpenFile {
+impl From<FailingReaderWriter> for OpenFile {
 	fn from(frw: FailingReaderWriter) -> Self {
 		Self::Stream(Box::new(frw))
 	}

@@ -9,12 +9,15 @@ use std::{
 	boxed::Box,
 	cmp::Ordering,
 	convert::Infallible,
-	fmt,
+	ffi,
+	fmt::{self, Display},
 	hash::{self, Hash, Hasher},
-	intrinsics,
+	intrinsics, iter,
 	iter::FromIterator,
 	mem::{self, ManuallyDrop},
+	ops,
 	ops::{Add, Deref, DerefMut, Index},
+	path::Path,
 	ptr, slice, str,
 	string::String,
 	sync::Arc,
@@ -22,6 +25,7 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use bytes_utils::{Str as BytesStr, StrMut as BytesStrMut, string::StorageMut};
+use serde::de;
 
 /// A `Str` is a string type that has the following properties:
 ///
@@ -310,7 +314,7 @@ impl Str {
 	pub fn split<'s>(
 		&'s self,
 		separator: &'s str,
-	) -> impl Clone + std::iter::FusedIterator<Item = Self> + 's {
+	) -> impl Clone + iter::FusedIterator<Item = Self> + 's {
 		self
 			.as_str()
 			.split(separator)
@@ -538,9 +542,9 @@ impl fmt::Debug for Str {
 	}
 }
 
-impl fmt::Display for Str {
+impl Display for Str {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		fmt::Display::fmt(self.as_str(), f)
+		Display::fmt(self.as_str(), f)
 	}
 }
 
@@ -550,9 +554,9 @@ impl fmt::Debug for StrMut {
 	}
 }
 
-impl fmt::Display for StrMut {
+impl Display for StrMut {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		fmt::Display::fmt(self.as_str(), f)
+		Display::fmt(self.as_str(), f)
 	}
 }
 
@@ -687,17 +691,17 @@ impl AsRef<[u8]> for Str {
 	}
 }
 
-impl AsRef<std::ffi::OsStr> for Str {
+impl AsRef<ffi::OsStr> for Str {
 	#[inline(always)]
-	fn as_ref(&self) -> &std::ffi::OsStr {
-		AsRef::<std::ffi::OsStr>::as_ref(self.as_str())
+	fn as_ref(&self) -> &ffi::OsStr {
+		AsRef::<ffi::OsStr>::as_ref(self.as_str())
 	}
 }
 
-impl AsRef<std::path::Path> for Str {
+impl AsRef<Path> for Str {
 	#[inline(always)]
-	fn as_ref(&self) -> &std::path::Path {
-		AsRef::<std::path::Path>::as_ref(self.as_str())
+	fn as_ref(&self) -> &Path {
+		AsRef::<Path>::as_ref(self.as_str())
 	}
 }
 
@@ -738,17 +742,17 @@ impl AsRef<[u8]> for StrMut {
 	}
 }
 
-impl AsRef<std::ffi::OsStr> for StrMut {
+impl AsRef<ffi::OsStr> for StrMut {
 	#[inline(always)]
-	fn as_ref(&self) -> &std::ffi::OsStr {
-		AsRef::<std::ffi::OsStr>::as_ref(self.as_str())
+	fn as_ref(&self) -> &ffi::OsStr {
+		AsRef::<ffi::OsStr>::as_ref(self.as_str())
 	}
 }
 
-impl AsRef<std::path::Path> for StrMut {
+impl AsRef<Path> for StrMut {
 	#[inline(always)]
-	fn as_ref(&self) -> &std::path::Path {
-		AsRef::<std::path::Path>::as_ref(self.as_str())
+	fn as_ref(&self) -> &Path {
+		AsRef::<Path>::as_ref(self.as_str())
 	}
 }
 
@@ -1832,7 +1836,7 @@ impl StrMut {
 				// sufficient capacity, and `index` is a char boundary.
 				unsafe {
 					let ptr = inner.as_mut_ptr();
-					core::ptr::copy(ptr.add(index), ptr.add(index + string_len), len - index);
+					ptr::copy(ptr.add(index), ptr.add(index + string_len), len - index);
 				}
 
 				// SAFETY: Copy the new string slice into the vacated region if
@@ -1840,11 +1844,7 @@ impl StrMut {
 				// The source (s) and destination do not overlap because s is an
 				// independent string slice.
 				unsafe {
-					core::ptr::copy_nonoverlapping(
-						s.as_ptr(),
-						inner.as_mut_ptr().add(index),
-						string_len,
-					);
+					ptr::copy_nonoverlapping(s.as_ptr(), inner.as_mut_ptr().add(index), string_len);
 				}
 
 				// SAFETY: We've just initialized `string_len` bytes at position
@@ -1871,12 +1871,12 @@ impl fmt::Write for StrMut {
 // IntoStr
 // ============================
 
-/// Convert value to [`Str`]/[`StrMut`] using [`fmt::Display`],
+/// Convert value to [`Str`]/[`StrMut`] using [`Display`],
 /// potentially without allocating.
 ///
 /// Almost identical to [`ToString`], but converts to [`Str`]/[`StrMut`]
 /// instead.
-pub trait IntoStr: fmt::Display {
+pub trait IntoStr: Display {
 	/// Convert value to [`Str`].
 	fn into_str(self) -> Str
 	where
@@ -2157,7 +2157,7 @@ impl IntoStr for Arc<str> {
 
 impl<T> IntoStr for &T
 where
-	T: fmt::Display + ?Sized,
+	T: Display + ?Sized,
 {
 	default fn into_str(self) -> Str {
 		sf!("{}", self)
@@ -2567,7 +2567,7 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for CowStr<'a> {
 
 			fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
 			where
-				E: serde::de::Error,
+				E: de::Error,
 			{
 				match str::from_utf8(v) {
 					Ok(s) => Ok(CowStr::Borrowed(s)),
@@ -2659,7 +2659,7 @@ impl<'a> CowStr<'a> {
 				// so the result is valid UTF-8. The memory regions do not overlap
 				// because subset is an independent string slice.
 				unsafe {
-					std::ptr::copy(subset.as_ptr(), owned.as_mut_ptr(), subset.len());
+					ptr::copy(subset.as_ptr(), owned.as_mut_ptr(), subset.len());
 					owned.truncate(subset.len());
 				}
 			},
@@ -2669,7 +2669,7 @@ impl<'a> CowStr<'a> {
 
 	/// Assigns self to be equal to the range given within the `CowStr` itself.
 	#[inline]
-	pub fn assign_range(&mut self, range: impl Into<std::ops::Range<usize>>) {
+	pub fn assign_range(&mut self, range: impl Into<ops::Range<usize>>) {
 		let range = range.into();
 		match self {
 			CowStr::Owned(owned) => {
@@ -2682,7 +2682,7 @@ impl<'a> CowStr<'a> {
 				unsafe {
 					if range.start > 0 {
 						let base = owned.as_str_mut().as_mut_ptr();
-						std::ptr::copy(base.add(range.start).cast_const(), base, len);
+						ptr::copy(base.add(range.start).cast_const(), base, len);
 					}
 					owned.truncate(len);
 				}
@@ -2702,7 +2702,7 @@ impl<'a> CowStr<'a> {
 	///
 	/// Panics if the range is out of bounds.
 	#[inline]
-	pub fn into_range(self, range: impl Into<std::ops::Range<usize>>) -> Self {
+	pub fn into_range(self, range: impl Into<ops::Range<usize>>) -> Self {
 		let range = range.into();
 		match self {
 			CowStr::Borrowed(s) => CowStr::Borrowed(&s[range]),
@@ -2716,7 +2716,7 @@ impl<'a> CowStr<'a> {
 				unsafe {
 					if range.start > 0 {
 						let base = owned.as_str_mut().as_mut_ptr();
-						std::ptr::copy(base.add(range.start).cast_const(), base, len);
+						ptr::copy(base.add(range.start).cast_const(), base, len);
 					}
 					owned.truncate(len);
 				}
@@ -2743,7 +2743,7 @@ impl<'a> CowStr<'a> {
 				// so the result is valid UTF-8. The memory regions do not overlap
 				// because subset is an independent string slice.
 				unsafe {
-					std::ptr::copy(subset.as_ptr(), owned.as_mut_ptr(), subset.len());
+					ptr::copy(subset.as_ptr(), owned.as_mut_ptr(), subset.len());
 					owned.truncate(subset.len());
 				}
 				CowStr::Owned(owned)
@@ -2994,9 +2994,9 @@ impl Borrow<str> for CowStr<'_> {
 // Display and Debug
 // ============================
 
-impl fmt::Display for CowStr<'_> {
+impl Display for CowStr<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		fmt::Display::fmt(self.as_str(), f)
+		Display::fmt(self.as_str(), f)
 	}
 }
 
@@ -3163,6 +3163,8 @@ impl Default for CowStr<'_> {
 
 #[cfg(test)]
 mod tests {
+	use std::{ffi::OsStr, path::Path};
+
 	use serde_json as json;
 
 	use super::*;
@@ -3845,7 +3847,7 @@ mod tests {
 
 	#[test]
 	fn test_from_utf8_owned_valid() {
-		let valid = bytes::Bytes::from("hello world");
+		let valid = Bytes::from("hello world");
 		let s = Str::from_utf8_owned(valid).unwrap();
 		assert_eq!(s.as_str(), "hello world");
 		assert!(s.is_spilled());
@@ -3853,7 +3855,7 @@ mod tests {
 
 	#[test]
 	fn test_from_utf8_owned_invalid() {
-		let invalid = bytes::Bytes::from_static(&[0xff, 0xfe, 0xfd]);
+		let invalid = Bytes::from_static(&[0xff, 0xfe, 0xfd]);
 		assert!(Str::from_utf8_owned(invalid).is_err());
 	}
 
@@ -4132,7 +4134,7 @@ mod tests {
 
 	#[test]
 	fn test_from_arc_str() {
-		let arc: std::sync::Arc<str> = "hello world hello world".into();
+		let arc: Arc<str> = "hello world hello world".into();
 		let s = Str::from(arc);
 		assert!(s.is_spilled());
 		assert_eq!(s.as_str(), "hello world hello world");
@@ -4147,14 +4149,14 @@ mod tests {
 
 	#[test]
 	fn test_from_cow_borrowed() {
-		let cow = std::borrow::Cow::Borrowed("hello");
+		let cow = Cow::Borrowed("hello");
 		let s = Str::from(cow);
 		assert_eq!(s.as_str(), "hello");
 	}
 
 	#[test]
 	fn test_from_cow_owned() {
-		let cow = std::borrow::Cow::<str>::Owned(String::from("hello world hello world"));
+		let cow = Cow::<str>::Owned(String::from("hello world hello world"));
 		let s = Str::from(cow);
 		assert_eq!(s.as_str(), "hello world hello world");
 	}
@@ -4521,14 +4523,14 @@ mod tests {
 	#[test]
 	fn test_as_ref_os_str() {
 		let s = Str::new("hello");
-		let os_str: &std::ffi::OsStr = s.as_ref();
+		let os_str: &OsStr = s.as_ref();
 		assert_eq!(os_str, "hello");
 	}
 
 	#[test]
 	fn test_as_ref_path() {
 		let s = Str::new("/tmp/file.txt");
-		let path: &std::path::Path = s.as_ref();
+		let path: &Path = s.as_ref();
 		assert_eq!(path.to_str().unwrap(), "/tmp/file.txt");
 	}
 
@@ -4641,7 +4643,7 @@ mod tests {
 
 	#[test]
 	fn test_from_bytes_mut() {
-		let bytes_mut = bytes::BytesMut::from("hello world hello world");
+		let bytes_mut = BytesMut::from("hello world hello world");
 		let result = StrMut::from_utf8_owned(bytes_mut);
 		assert!(result.is_ok());
 		let m = result.unwrap();
@@ -4652,14 +4654,17 @@ mod tests {
 	#[test]
 	fn test_into_bytes_mut() {
 		let m = StrMut::new("hello world hello world");
-		let bytes_mut: bytes::BytesMut = m.into();
+		let bytes_mut: BytesMut = m.into();
 		assert_eq!(&bytes_mut[..], b"hello world hello world");
 	}
 
 	#[test]
 	fn test_str_to_str() {
 		let s = Str::new("hello");
-		let str_ref: bytes_utils::Str = s.into();
+		let str_ref = {
+			use bytes_utils::Str;
+			Str::from(s)
+		};
 		assert_eq!(&*str_ref, "hello");
 	}
 

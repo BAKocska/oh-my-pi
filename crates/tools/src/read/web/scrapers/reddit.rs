@@ -1,6 +1,6 @@
 //! Anonymous Reddit JSON renderer.
 
-use std::fmt::{self, Write as _};
+use std::fmt::{self, Display, Write as _};
 
 use omp_core::{Str, sf};
 use serde_json::Value;
@@ -156,19 +156,19 @@ fn render_listing(data: &Value) -> Option<String> {
 #[derive(Clone, Copy)]
 struct Field<'a>(Option<&'a Value>);
 
-impl fmt::Display for Field<'_> {
+impl Display for Field<'_> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self.0 {
 			None => formatter.write_str("undefined"),
 			Some(Value::Null) => formatter.write_str("null"),
-			Some(Value::Bool(value)) => fmt::Display::fmt(value, formatter),
+			Some(Value::Bool(value)) => Display::fmt(value, formatter),
 			Some(Value::Number(value)) => {
 				if let Some(number) = value.as_i64() {
-					fmt::Display::fmt(&number, formatter)
+					Display::fmt(&number, formatter)
 				} else if let Some(number) = value.as_u64() {
-					fmt::Display::fmt(&number, formatter)
+					Display::fmt(&number, formatter)
 				} else if let Some(number) = value.as_f64() {
-					fmt::Display::fmt(&number, formatter)
+					Display::fmt(&number, formatter)
 				} else {
 					formatter.write_str("NaN")
 				}

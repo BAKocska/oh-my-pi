@@ -2,6 +2,8 @@
 
 #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::{ffi, io, ptr};
 
 /// Returns whether a path has at least one extended ACL or attribute.
 #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
@@ -42,21 +44,20 @@ pub(crate) fn get_acl_perm_bits_from_xattr(path: impl AsRef<Path>) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-fn path_cstring(path: &Path) -> std::io::Result<std::ffi::CString> {
+fn path_cstring(path: &Path) -> io::Result<ffi::CString> {
 	use std::os::unix::ffi::OsStrExt;
-	std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-		std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
-	})
+	ffi::CString::new(path.as_os_str().as_bytes())
+		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
 #[cfg(target_os = "linux")]
-fn list_xattrs(path: &Path) -> std::io::Result<Vec<u8>> {
+fn list_xattrs(path: &Path) -> io::Result<Vec<u8>> {
 	let path = path_cstring(path)?;
 	// SAFETY: the C path is valid and a null buffer with length zero performs a
 	// size query.
-	let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+	let size = unsafe { libc::listxattr(path.as_ptr(), ptr::null_mut(), 0) };
 	if size < 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(io::Error::last_os_error());
 	}
 	if size == 0 {
 		return Ok(Vec::new());
@@ -65,22 +66,21 @@ fn list_xattrs(path: &Path) -> std::io::Result<Vec<u8>> {
 	// SAFETY: `names` is writable for its full reported capacity.
 	let read = unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
 	if read < 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(io::Error::last_os_error());
 	}
 	names.truncate(read as usize);
 	Ok(names)
 }
 
 #[cfg(target_os = "linux")]
-fn get_xattr(path: &Path, name: &[u8]) -> std::io::Result<Vec<u8>> {
+fn get_xattr(path: &Path, name: &[u8]) -> io::Result<Vec<u8>> {
 	let path = path_cstring(path)?;
-	let name = std::ffi::CStr::from_bytes_with_nul(name).map_err(|_| {
-		std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid attribute name")
-	})?;
+	let name = ffi::CStr::from_bytes_with_nul(name)
+		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid attribute name"))?;
 	// SAFETY: both C strings are valid; a null value pointer performs a size query.
-	let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+	let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), ptr::null_mut(), 0) };
 	if size < 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(io::Error::last_os_error());
 	}
 	let mut value = vec![0_u8; size as usize];
 	// SAFETY: `value` is writable for the queried size and all pointers remain
@@ -89,7 +89,7 @@ fn get_xattr(path: &Path, name: &[u8]) -> std::io::Result<Vec<u8>> {
 		libc::getxattr(path.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), value.len())
 	};
 	if read < 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(io::Error::last_os_error());
 	}
 	value.truncate(read as usize);
 	Ok(value)

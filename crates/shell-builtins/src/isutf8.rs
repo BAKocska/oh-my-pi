@@ -21,6 +21,7 @@ use std::{
 	ffi::{OsStr, OsString},
 	fs::File,
 	io::{self, Read, Write},
+	str,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -193,7 +194,7 @@ fn validate(input: &mut impl Read, cancel: &Arc<AtomicBool>) -> io::Result<Verdi
 
 		let mut pos = 0usize;
 		while pos < data_len {
-			match std::str::from_utf8(&buf[pos..data_len]) {
+			match str::from_utf8(&buf[pos..data_len]) {
 				Ok(_) => {
 					advance(&buf[pos..data_len], &mut line, &mut chars_in_line);
 					pos = data_len;
@@ -254,12 +255,12 @@ pub(crate) fn isutf8_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
-	use std::fs;
+	use std::{fs, path::Path};
 
 	use super::Isutf8;
 	use crate::host::run_util;
 
-	fn run_in(cwd: &std::path::Path, stdin: &str, args: &[&str]) -> (i32, String, String) {
+	fn run_in(cwd: &Path, stdin: &str, args: &[&str]) -> (i32, String, String) {
 		let (code, capture) = run_util::<Isutf8>(args, stdin, cwd);
 		(code, capture.out(), capture.err())
 	}

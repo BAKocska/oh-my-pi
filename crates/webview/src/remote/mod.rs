@@ -18,15 +18,19 @@ pub mod firefox;
 pub mod ws;
 
 use std::{
+	fs,
 	io::Cursor,
 	path::{Path, PathBuf},
 	sync::Arc,
-	thread::JoinHandle,
+	thread::{self, JoinHandle},
 	time::Duration,
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use omp_core::{IntoStr, Str, encoding::base64, sf};
+use tokio::runtime;
+use zune_jpeg::zune_core::{colorspace::ColorSpace, options::DecoderOptions};
 
 use crate::{
 	Error, Result,
@@ -98,7 +102,7 @@ pub enum Command {
 /// Everything a driver needs to run a session.
 pub struct DriverCtx {
 	/// Commands from the public handle; disconnect means shut down.
-	pub commands: flume::Receiver<Command>,
+	pub commands: Receiver<Command>,
 	/// Event sink towards the host.
 	pub events:   flume::Sender<WebViewEvent>,
 	/// Shared url/title cache to keep current.
@@ -161,7 +165,7 @@ impl Drop for RemoteView {
 pub fn spawn<F, Fut>(
 	page: PageOptions,
 	drive: F,
-) -> Result<(RemoteView, flume::Receiver<WebViewEvent>, SharedState)>
+) -> Result<(RemoteView, Receiver<WebViewEvent>, SharedState)>
 where
 	F: FnOnce(DriverCtx) -> Fut + Send + 'static,
 	Fut: Future<Output = Result<()>>,
@@ -179,13 +183,10 @@ where
 		ready: ready_tx,
 	};
 
-	let thread = std::thread::Builder::new()
+	let thread = thread::Builder::new()
 		.name("omp-webview-driver".into())
 		.spawn(move || {
-			let rt = match tokio::runtime::Builder::new_current_thread()
-				.enable_all()
-				.build()
-			{
+			let rt = match runtime::Builder::new_current_thread().enable_all().build() {
 				Ok(rt) => rt,
 				Err(err) => {
 					let _ = ctx.ready.send(Err(Error::Io(err)));
@@ -223,7 +224,7 @@ where
 /// Ephemeral profiles live in a temp dir removed when the driver exits.
 pub enum ProfileDir {
 	/// Caller-provided directory that persists across sessions.
-	Persistent(std::path::PathBuf),
+	Persistent(PathBuf),
 	/// RAII temp dir; deleted on drop.
 	Ephemeral(tempfile::TempDir),
 }
@@ -245,7 +246,7 @@ impl ProfileDir {
 /// automate, so private browsing means "leave nothing behind".
 pub fn resolve_profile(page: &PageOptions) -> Result<ProfileDir> {
 	if let (false, Some(path)) = (page.incognito, &page.profile) {
-		std::fs::create_dir_all(path)?;
+		fs::create_dir_all(path)?;
 		return Ok(ProfileDir::Persistent(path.clone()));
 	}
 	let dir = tempfile::Builder::new().prefix("omp-webview-").tempdir()?;
@@ -310,8 +311,7 @@ pub fn damage_rect(prev: &[u8], next: &[u8], width: u32) -> Option<[u32; 4]> {
 
 /// Decode a JPEG straight to RGBA8 (single pass; no expansion copy).
 fn decode_jpeg(data: &[u8]) -> Result<Frame> {
-	let options = zune_jpeg::zune_core::options::DecoderOptions::default()
-		.jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
+	let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
 	let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(data), options);
 	let pixels = decoder.decode().map_err(Error::Jpeg)?;
 	let (width, height) = decoder

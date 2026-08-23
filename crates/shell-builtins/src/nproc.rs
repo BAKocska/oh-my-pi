@@ -2,7 +2,7 @@
 //!
 //! Ported from uutils coreutils 0.8.0.
 
-use std::{io::Write, thread};
+use std::{cmp, io::Write, num, thread};
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
@@ -66,7 +66,7 @@ impl Utility for Nproc {
 			}
 		};
 
-		cores = std::cmp::min(limit, cores);
+		cores = cmp::min(limit, cores);
 		if cores <= ignore {
 			cores = 1;
 		} else {
@@ -124,7 +124,7 @@ fn num_cpus_all() -> usize {
 
 /// Returns the available parallelism, falling back to one like GNU `nproc`.
 fn available_parallelism() -> usize {
-	thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+	thread::available_parallelism().map_or(1, num::NonZeroUsize::get)
 }
 
 /// Creates the `nproc` builtin registration.
@@ -134,18 +134,19 @@ pub(crate) fn nproc_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
-	use std::ffi::OsString;
+	use std::{env, ffi::OsString, iter};
 
 	use clap::Parser;
 
 	use super::*;
+	use crate::host::Capture;
 
-	fn run_in(env: &[(&str, &str)], args: &[&str]) -> (i32, crate::host::Capture) {
+	fn run_in(env: &[(&str, &str)], args: &[&str]) -> (i32, Capture) {
 		let (mut host, capture) = Host::for_test("nproc", "", ".");
 		for (key, value) in env {
 			host.set_test_var(key, value);
 		}
-		let argv: Vec<OsString> = std::iter::once(OsString::from("nproc"))
+		let argv: Vec<OsString> = iter::once(OsString::from("nproc"))
 			.chain(args.iter().map(OsString::from))
 			.collect();
 		let parsed = Nproc::try_parse_from(argv).expect("test arguments should parse");
@@ -184,11 +185,11 @@ mod tests {
 		// builtin, whose exported environment lives on `Host`.
 		// SAFETY: the test restores this process-global environment variable before
 		// returning.
-		unsafe { std::env::set_var("OMP_NUM_THREADS", "1234") };
+		unsafe { env::set_var("OMP_NUM_THREADS", "1234") };
 		let (code, capture) = run_in(&[], &[]);
 		// SAFETY: the test restores the prior process-global environment state it
 		// introduced.
-		unsafe { std::env::remove_var("OMP_NUM_THREADS") };
+		unsafe { env::remove_var("OMP_NUM_THREADS") };
 		assert_eq!((code, capture.err()), (0, String::new()));
 		assert_ne!(capture.out(), "1234\n");
 		let n: usize = capture

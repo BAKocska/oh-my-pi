@@ -67,8 +67,9 @@ pub mod wizard;
 pub mod worktree_cmd;
 
 pub use miette::{IntoDiagnostic, Report, Result};
+use omp_driver::prompt_prep::settings::PromptOverrides;
 
-impl From<&cli::PromptArgs> for omp_driver::prompt_prep::settings::PromptOverrides {
+impl From<&cli::PromptArgs> for PromptOverrides {
 	fn from(args: &cli::PromptArgs) -> Self {
 		Self {
 			personality:             args.personality,

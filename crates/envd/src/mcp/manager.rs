@@ -5,7 +5,7 @@ use std::{
 	ffi::OsString,
 	path::{Path, PathBuf},
 	pin::Pin,
-	sync::{Arc, Weak},
+	sync::{Arc, Weak, atomic},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,11 +20,31 @@ use omp_tool::{LeafOwner, LeafVersion};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use tokio::{runtime, sync::Notify, task, time};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+mod control_gate {
+	use tokio::sync::{Mutex, MutexGuard};
+
+	pub(super) struct ControlGate(Mutex<()>);
+
+	impl ControlGate {
+		pub(super) fn new() -> Self {
+			Self(Mutex::new(()))
+		}
+
+		pub(super) async fn lock(&self) -> MutexGuard<'_, ()> {
+			self.0.lock().await
+		}
+	}
+}
+
+use control_gate::ControlGate;
+
 use super::{
-	McpServerBackend, McpService, McpServiceError,
+	super::exthost::control::ControlConnectionIdentity,
+	McpLeaf, McpServerBackend, McpService, McpServiceError,
 	client::{ClientError, InitializedServer, McpClient},
 	config::{
 		AuthConfig, AuthKind, EnvironmentPolicy, HeaderPolicy, McpServerConfig,
@@ -76,7 +96,7 @@ pub struct MountSpec {
 	pub restart:      McpRestartPolicy,
 	/// Authenticated extension owner for CONTROL mounts; native mounts have no
 	/// extension owner.
-	pub owner:        Option<Arc<super::super::exthost::control::ControlConnectionIdentity>>,
+	pub owner:        Option<Arc<ControlConnectionIdentity>>,
 }
 /// Credential requirement retained from one Python mount declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,9 +104,17 @@ pub enum ControlMountAuth {
 	/// No transport credential.
 	None,
 	/// Environment-owned OAuth flow with exact requested scopes.
-	OAuth { scopes: Box<[Str]> },
+	OAuth {
+		/// Exact scopes the authenticated extension asks the Environment
+		/// credential authority to grant.
+		scopes: Box<[Str]>,
+	},
 	/// Environment-owned named API key.
-	ApiKey { name: Str },
+	ApiKey {
+		/// Environment-owned credential name to resolve; this is an authority
+		/// lookup key, not secret bytes.
+		name: Str,
+	},
 }
 
 /// Automatic reconnect behavior retained from one Python mount.
@@ -104,7 +132,7 @@ pub enum McpRestartPolicy {
 /// Extension-scoped declaration resolver backed by the live MCP supervisor.
 pub struct ManagerControlMountResolver {
 	manager:      Arc<McpManager>,
-	identity:     Arc<super::super::exthost::control::ControlConnectionIdentity>,
+	identity:     Arc<ControlConnectionIdentity>,
 	cancellation: CancellationToken,
 }
 
@@ -112,10 +140,10 @@ impl ManagerControlMountResolver {
 	/// Binds Python declarations to one authenticated extension generation.
 	pub fn new(
 		manager: Arc<McpManager>,
-		identity: Arc<super::super::exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		cancellation: CancellationToken,
 	) -> Self {
-		if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+		if let Ok(runtime) = runtime::Handle::try_current() {
 			let weak = Arc::downgrade(&manager);
 			let owner = Arc::clone(&identity);
 			let cancelled = cancellation.clone();
@@ -130,7 +158,7 @@ impl ManagerControlMountResolver {
 	}
 
 	/// Returns the exact authenticated owner stamped onto resolved mounts.
-	pub fn identity(&self) -> &Arc<super::super::exthost::control::ControlConnectionIdentity> {
+	pub fn identity(&self) -> &Arc<ControlConnectionIdentity> {
 		&self.identity
 	}
 }
@@ -250,7 +278,7 @@ fn default_restart() -> Str {
 impl ControlMountDeclaration {
 	fn resolve(
 		self,
-		identity: Arc<super::super::exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		config_json: Bytes,
 	) -> Result<MountSpec, McpControlError> {
 		if !valid_device_segment(&self.server)
@@ -428,7 +456,7 @@ fn resolve_control_auth(
 }
 
 fn require_capability(
-	identity: &super::super::exthost::control::ControlConnectionIdentity,
+	identity: &ControlConnectionIdentity,
 	capability: &str,
 ) -> Result<(), McpControlError> {
 	if identity.capabilities.contains(capability) {
@@ -697,11 +725,11 @@ pub struct McpManager {
 	state:         Mutex<ManagerState>,
 	subscriptions: Mutex<SubscriptionState>,
 	auth:          RwLock<Option<Arc<dyn McpAuthChallengeHandler>>>,
-	control_gate:  tokio::sync::Mutex<()>,
-	changed:       tokio::sync::Notify,
+	control_gate:  ControlGate,
+	changed:       Notify,
 	shutdown:      CancellationToken,
-	generation:    std::sync::atomic::AtomicU64,
-	sequence:      std::sync::atomic::AtomicU64,
+	generation:    atomic::AtomicU64,
+	sequence:      atomic::AtomicU64,
 }
 
 impl McpManager {
@@ -725,11 +753,11 @@ impl McpManager {
 				active:  BTreeMap::new(),
 			}),
 			auth: RwLock::new(None),
-			control_gate: tokio::sync::Mutex::new(()),
-			changed: tokio::sync::Notify::new(),
+			control_gate: ControlGate::new(),
+			changed: Notify::new(),
 			shutdown: CancellationToken::new(),
-			generation: std::sync::atomic::AtomicU64::new(1),
-			sequence: std::sync::atomic::AtomicU64::new(1),
+			generation: atomic::AtomicU64::new(1),
+			sequence: atomic::AtomicU64::new(1),
 		})
 	}
 
@@ -776,7 +804,7 @@ impl McpManager {
 		}
 
 		let mut completed = true;
-		let deadline = tokio::time::sleep(STARTUP_RACE);
+		let deadline = time::sleep(STARTUP_RACE);
 		tokio::pin!(deadline);
 		while !completions.is_empty() {
 			tokio::select! {
@@ -930,7 +958,7 @@ impl McpManager {
 
 	/// Returns the immutable current MCP definition catalog for CONTROL and dyn
 	/// registry epoch consumers.
-	pub fn catalog_snapshot(&self) -> omp_tool::LeafCatalogSnapshot<super::McpLeaf> {
+	pub fn catalog_snapshot(&self) -> omp_tool::LeafCatalogSnapshot<McpLeaf> {
 		self.service.leaf_snapshot()
 	}
 
@@ -938,7 +966,7 @@ impl McpManager {
 	/// caller and no other extension generation owns the server name.
 	pub async fn control_mount(
 		self: &Arc<Self>,
-		identity: &super::super::exthost::control::ControlConnectionIdentity,
+		identity: &ControlConnectionIdentity,
 		spec: MountSpec,
 		cancellation: &CancellationToken,
 	) -> Result<pb::McpServerStatus, ManagerError> {
@@ -988,7 +1016,7 @@ impl McpManager {
 	/// Removes only a server owned by this exact extension generation.
 	pub async fn control_unmount(
 		&self,
-		identity: &super::super::exthost::control::ControlConnectionIdentity,
+		identity: &ControlConnectionIdentity,
 		name: &str,
 	) -> Result<bool, ManagerError> {
 		let _gate = self.control_gate.lock().await;
@@ -1007,11 +1035,7 @@ impl McpManager {
 	}
 
 	/// Returns whether one exact extension generation owns a mounted server.
-	pub fn control_owns(
-		&self,
-		identity: &super::super::exthost::control::ControlConnectionIdentity,
-		name: &str,
-	) -> bool {
+	pub fn control_owns(&self, identity: &ControlConnectionIdentity, name: &str) -> bool {
 		self
 			.state
 			.lock()
@@ -1022,10 +1046,7 @@ impl McpManager {
 	}
 
 	/// Returns deterministic server names owned by one extension generation.
-	pub fn control_server_names(
-		&self,
-		identity: &super::super::exthost::control::ControlConnectionIdentity,
-	) -> BTreeSet<Str> {
+	pub fn control_server_names(&self, identity: &ControlConnectionIdentity) -> BTreeSet<Str> {
 		self
 			.state
 			.lock()
@@ -1043,10 +1064,7 @@ impl McpManager {
 	}
 
 	/// Removes every mount owned by one cancelled extension generation.
-	pub async fn control_unmount_all(
-		&self,
-		identity: &super::super::exthost::control::ControlConnectionIdentity,
-	) {
+	pub async fn control_unmount_all(&self, identity: &ControlConnectionIdentity) {
 		let names = self.control_server_names(identity);
 		for name in names {
 			let _ = self.control_unmount(identity, &name).await;
@@ -1056,7 +1074,7 @@ impl McpManager {
 	/// Invokes only through a server owned by this exact extension generation.
 	pub async fn control_invoke_scoped(
 		self: &Arc<Self>,
-		identity: &super::super::exthost::control::ControlConnectionIdentity,
+		identity: &ControlConnectionIdentity,
 		server: &str,
 		tool: &str,
 		arguments: Value,
@@ -1210,7 +1228,7 @@ impl McpManager {
 		let cache_name = name.clone();
 		let config_json = spec.config_json.clone();
 		let loaded =
-			tokio::task::spawn_blocking(move || cache.get(&cache_name, &config_json, now_ms())).await;
+			task::spawn_blocking(move || cache.get(&cache_name, &config_json, now_ms())).await;
 		let Ok(Ok(Some(cached))) = loaded else {
 			return;
 		};
@@ -1348,7 +1366,7 @@ impl McpManager {
 		let cache_name = Str::from(name);
 		let config_json = spec.config_json;
 		if let Ok(definitions_json) = serde_json::to_vec(&tools) {
-			tokio::task::spawn_blocking(move || {
+			task::spawn_blocking(move || {
 				let _ = cache.put(&cache_name, &config_json, &definitions_json, now_ms());
 			});
 		}
@@ -1462,9 +1480,7 @@ impl McpManager {
 		if let Some(refresh) = refresh {
 			let _ = self.refresh_definitions(name, generation, refresh).await;
 		}
-		let sequence = self
-			.sequence
-			.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let sequence = self.sequence.fetch_add(1, atomic::Ordering::Relaxed);
 		let params_json = serde_json::to_vec(&params).unwrap_or_else(|_| b"null".to_vec());
 		let _ = self.service.notify(pb::McpNotification {
 			server: Some(pb::McpServerRef {
@@ -1767,9 +1783,7 @@ impl McpManager {
 	}
 
 	fn next_generation(&self) -> u64 {
-		self
-			.generation
-			.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+		self.generation.fetch_add(1, atomic::Ordering::Relaxed)
 	}
 }
 
@@ -1797,10 +1811,7 @@ fn leaf_owner(name: &str) -> LeafOwner {
 	LeafOwner { root: Str::from(name), claimant: Str::new_static("mcp") }
 }
 
-fn same_control_owner(
-	left: &super::super::exthost::control::ControlConnectionIdentity,
-	right: &super::super::exthost::control::ControlConnectionIdentity,
-) -> bool {
+fn same_control_owner(left: &ControlConnectionIdentity, right: &ControlConnectionIdentity) -> bool {
 	left.extension == right.extension
 		&& left.principal == right.principal
 		&& left.artifact_digest == right.artifact_digest
@@ -1834,7 +1845,7 @@ async fn list_tools(
 ) -> Result<Vec<Value>, ManagerError> {
 	let mut output = Vec::new();
 	let mut cursor: Option<Str> = None;
-	let mut seen = std::collections::BTreeSet::new();
+	let mut seen = BTreeSet::new();
 	for _ in 0..MAX_TOOL_PAGES {
 		let params = cursor
 			.as_ref()

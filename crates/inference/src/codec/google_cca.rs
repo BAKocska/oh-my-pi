@@ -1,6 +1,6 @@
 //! Typed Cloud Code Assist envelopes, discovery shapes, and stream adapter.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, mem, str};
 
 use bytes::Bytes;
 use omp_catalog::{
@@ -14,8 +14,9 @@ use serde_json::value::RawValue;
 
 use super::gemini::{
 	CanonicalGeminiDecoder, GeminiCodec, GeminiDecoder, GenerateContentRequest,
-	GenerateContentResponse, GoogleCodecError, GoogleCodecErrorKind, GoogleDecodedEvent,
-	GoogleProofScope, GoogleRequestOptions, GoogleThinkingPolicy,
+	GenerateContentResponse, GoogleCodecError, GoogleCodecErrorKind, GoogleContent,
+	GoogleDecodedEvent, GoogleErrorDetail, GoogleFunctionCallingConfig, GoogleFunctionCallingMode,
+	GoogleProofScope, GoogleRequestOptions, GoogleThinkingPolicy, GoogleToolConfig, GoogleWireError,
 };
 use crate::{
 	body::BodySource,
@@ -194,15 +195,15 @@ pub fn wrap_antigravity_request(
 		system.role = Some(sf!("user"));
 	}
 	if metadata.validated_tool_config {
-		request.tool_config = Some(super::gemini::GoogleToolConfig {
-			function_calling_config: super::gemini::GoogleFunctionCallingConfig {
-				mode:                   super::gemini::GoogleFunctionCallingMode::Validated,
+		request.tool_config = Some(GoogleToolConfig {
+			function_calling_config: GoogleFunctionCallingConfig {
+				mode:                   GoogleFunctionCallingMode::Validated,
 				allowed_function_names: Vec::new(),
 			},
 		});
 	}
 	if metadata.append_forced_tool_directive {
-		request.contents.push(super::gemini::GoogleContent {
+		request.contents.push(GoogleContent {
 			role:  sf!("user"),
 			parts: vec![super::gemini::GooglePart {
 				text: Some(sf!(ANTIGRAVITY_FORCED_TOOL_DIRECTIVE)),
@@ -760,7 +761,7 @@ pub struct CcaWireError {
 	pub status:  Option<Str>,
 	/// Structured Google RPC error evidence.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub details: Vec<super::gemini::GoogleErrorDetail>,
+	pub details: Vec<GoogleErrorDetail>,
 }
 
 /// Decodes and unwraps one CCA response envelope without generic JSON
@@ -775,7 +776,7 @@ pub fn unwrap_response(data: &[u8]) -> Result<GenerateContentResponse, GoogleCod
 		.map_err(|error| cca_decode_error(format!("invalid CCA response JSON: {error}")))?;
 	if let Some(error) = envelope.error {
 		if error.code == Some(429) || error.status.as_deref() == Some("RESOURCE_EXHAUSTED") {
-			return Err(GoogleCodecError::from_wire(super::gemini::GoogleWireError {
+			return Err(GoogleCodecError::from_wire(GoogleWireError {
 				code:    error.code,
 				message: error.message,
 				status:  error.status,
@@ -794,7 +795,7 @@ pub fn unwrap_response(data: &[u8]) -> Result<GenerateContentResponse, GoogleCod
 /// Converts opaque continuation-proof bytes to CCA's UTF-8 JSON string
 /// representation.
 pub fn thought_signature_to_wire(signature: &Bytes) -> Result<Str, GoogleCodecError> {
-	std::str::from_utf8(signature)
+	str::from_utf8(signature)
 		.map(Str::new)
 		.map_err(|error| cca_provider_error(format!("CCA thought signature is not UTF-8: {error}")))
 }
@@ -1194,7 +1195,7 @@ impl CcaVisibleTextFilter {
 		if self.pending.is_empty() {
 			return;
 		}
-		let text: Str = std::mem::take(&mut self.pending).into();
+		let text: Str = mem::take(&mut self.pending).into();
 		if matches!(self.mode, VisibleMode::ThinkingTag) {
 			output.push(GoogleDecodedEvent::Thinking {
 				index: self.pending_index,
@@ -1284,9 +1285,21 @@ fn cca_decode_error(detail: impl IntoStr) -> GoogleCodecError {
 
 #[cfg(test)]
 mod tests {
+	use std::sync;
+
 	use serde_json::Value;
 
-	use super::*;
+	use super::{
+		super::gemini::{
+			GoogleSchema as GeminiGoogleSchema,
+			GoogleSystemInstruction as GeminiGoogleSystemInstruction,
+		},
+		*,
+	};
+	use crate::{
+		call::{ChatRequest as CallChatRequest, Sampling as CallSampling, Setting as CallSetting},
+		catalog::CodecId as CatalogCodecId,
+	};
 
 	#[test]
 	fn request_and_response_envelopes_match_oracle() {
@@ -1309,7 +1322,7 @@ mod tests {
 
 	#[test]
 	fn parallel_function_responses_match_recorded_envelope() {
-		let request = crate::call::ChatRequest {
+		let request = CallChatRequest {
 			messages:          vec![
 				crate::call::Message {
 					role:    crate::call::Role::Tool,
@@ -1335,18 +1348,18 @@ mod tests {
 				},
 			]
 			.into(),
-			tools:             std::sync::Arc::from([]),
-			hosted_tools:      std::sync::Arc::from([]),
-			tool_choice:       crate::call::Setting::Unset,
-			output:            crate::call::Setting::Unset,
-			reasoning:         crate::call::Setting::Unset,
-			verbosity:         crate::call::Setting::Unset,
-			cache_retention:   crate::call::Setting::Unset,
-			service_tier:      crate::call::Setting::Unset,
-			sampling:          crate::call::Sampling::default(),
+			tools:             sync::Arc::from([]),
+			hosted_tools:      sync::Arc::from([]),
+			tool_choice:       CallSetting::Unset,
+			output:            CallSetting::Unset,
+			reasoning:         CallSetting::Unset,
+			verbosity:         CallSetting::Unset,
+			cache_retention:   CallSetting::Unset,
+			service_tier:      CallSetting::Unset,
+			sampling:          CallSampling::default(),
 			max_output_tokens: None,
 			top_logprobs:      None,
-			safety:            std::sync::Arc::from([]),
+			safety:            sync::Arc::from([]),
 			negotiation:       Default::default(),
 		};
 		let projected = GeminiCodec::cloud_code_assist(None)
@@ -1374,7 +1387,7 @@ mod tests {
 
 	#[test]
 	fn antigravity_adapter_matches_recorded_request() {
-		let schema: super::super::gemini::GoogleSchema =
+		let schema: GeminiGoogleSchema =
 			serde_json::from_str(r#"{"type":"object"}"#).expect("typed schema");
 		let request = GenerateContentRequest {
 			contents: vec![super::super::gemini::GoogleContent {
@@ -1384,7 +1397,7 @@ mod tests {
 					..Default::default()
 				}],
 			}],
-			system_instruction: Some(super::super::gemini::GoogleSystemInstruction {
+			system_instruction: Some(GeminiGoogleSystemInstruction {
 				role:  None,
 				parts: vec![super::super::gemini::GooglePart {
 					text: Some("Use the repository tools.".into()),
@@ -1882,8 +1895,8 @@ mod tests {
 	#[test]
 	fn antigravity_claude_projection_drops_only_unsigned_reasoning() {
 		let provider = ProviderId::from("google-antigravity");
-		let codec_id = crate::catalog::CodecId::from("google-cca");
-		let request = crate::call::ChatRequest {
+		let codec_id = CatalogCodecId::from("google-cca");
+		let request = CallChatRequest {
 			messages:          vec![
 				crate::call::Message {
 					role:    crate::call::Role::Assistant,
@@ -1916,18 +1929,18 @@ mod tests {
 				},
 			]
 			.into(),
-			tools:             std::sync::Arc::from([]),
-			hosted_tools:      std::sync::Arc::from([]),
-			tool_choice:       crate::call::Setting::Unset,
-			output:            crate::call::Setting::Unset,
-			reasoning:         crate::call::Setting::Unset,
-			verbosity:         crate::call::Setting::Unset,
-			cache_retention:   crate::call::Setting::Unset,
-			service_tier:      crate::call::Setting::Unset,
-			sampling:          crate::call::Sampling::default(),
+			tools:             sync::Arc::from([]),
+			hosted_tools:      sync::Arc::from([]),
+			tool_choice:       CallSetting::Unset,
+			output:            CallSetting::Unset,
+			reasoning:         CallSetting::Unset,
+			verbosity:         CallSetting::Unset,
+			cache_retention:   CallSetting::Unset,
+			service_tier:      CallSetting::Unset,
+			sampling:          CallSampling::default(),
 			max_output_tokens: None,
 			top_logprobs:      None,
-			safety:            std::sync::Arc::from([]),
+			safety:            sync::Arc::from([]),
 			negotiation:       Default::default(),
 		};
 		let scope = GoogleProofScope { provider, codec: codec_id };

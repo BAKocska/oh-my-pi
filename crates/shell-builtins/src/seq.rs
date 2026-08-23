@@ -19,7 +19,10 @@ use crate::{
 };
 
 mod seq_format {
-	use std::io::{self, Write};
+	use std::{
+		io::{self, Write},
+		iter,
+	};
 
 	use bigdecimal::{BigDecimal, num_bigint::ToBigInt};
 	use num_traits::{Signed, Zero};
@@ -375,7 +378,7 @@ mod seq_format {
 		} else {
 			if exponent < 0 {
 				output.push_str("0.");
-				output.extend(std::iter::repeat_n('0', -exponent as usize - 1));
+				output.extend(iter::repeat_n('0', -exponent as usize - 1));
 				output.push_str(&digits);
 			} else {
 				let split = exponent as usize + 1;
@@ -386,7 +389,7 @@ mod seq_format {
 					output.push_str(fraction);
 				} else {
 					output.push_str(&digits);
-					output.extend(std::iter::repeat_n('0', split - digits.len()));
+					output.extend(iter::repeat_n('0', split - digits.len()));
 					if force {
 						output.push('.');
 					}
@@ -974,6 +977,8 @@ mod error {
 	}
 }
 
+use std::io;
+
 use self::{
 	error::SeqError,
 	number::PreciseNumber,
@@ -1171,7 +1176,7 @@ fn seq_main(matches: &ArgMatches, host: &mut Host) -> Result<(), Box<dyn Error>>
 
 	match result {
 		Ok(()) => Ok(()),
-		Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+		Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
 			// GNU seq prints the Broken pipe message but still exits with status 0.
 			let _ = writeln!(host.stderr, "seq: write error: {err}");
 			Ok(())
@@ -1237,7 +1242,7 @@ fn fast_print_seq(
 	separator: &OsStr,
 	terminator: &OsStr,
 	padding: usize,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
 	// Nothing to do, just return.
 	if last < first {
 		return Ok(());
@@ -1315,7 +1320,7 @@ fn print_seq(
 	format: &SeqFormat,
 	fast_allowed: bool,
 	padding: usize, // Used by fast path only
-) -> std::io::Result<()> {
+) -> io::Result<()> {
 	let mut stdout = BufWriter::new(host.stdout_clone());
 	let (first, increment, last) = range;
 

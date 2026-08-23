@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use omp_scribe::{Props, Template};
 
-use crate::{SlotClass, SlotId};
+use crate::{SlotClass, SlotId, prompt_engine, prompt_keys};
 
 /// Semantic family of an immutable prompt asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,7 +229,7 @@ pub fn prompt_template(id: PromptAssetId) -> &'static Template {
 	static TEMPLATES: [OnceLock<Template>; ASSETS.len()] = [const { OnceLock::new() }; ASSETS.len()];
 	TEMPLATES[id as usize].get_or_init(|| {
 		let asset = prompt_asset(id);
-		crate::prompt_engine::engine()
+		prompt_engine::engine()
 			.compile(asset_name(id), asset.content)
 			.unwrap_or_else(|error| panic!("invalid embedded prompt asset: {error}"))
 	})
@@ -297,32 +297,32 @@ pub fn prompt_slot_asset(slot: &str) -> Option<&'static PromptAsset> {
 /// Renders the typed retry count into the empty-stop template.
 pub fn render_empty_stop_retry(out: &mut String, retry_count: usize, max_retries: usize) {
 	let mut props = Props::new();
-	props.set(crate::prompt_keys::RETRY_COUNT, retry_count);
-	props.set(crate::prompt_keys::MAX_RETRIES, max_retries);
+	props.set(prompt_keys::RETRY_COUNT, retry_count);
+	props.set(prompt_keys::MAX_RETRIES, max_retries);
 	render_into(PromptAssetId::EmptyStopRetry, &props, out);
 }
 
 /// Renders one parent-agent steering notice into an existing buffer.
 pub fn render_parent_irc(out: &mut String, from: &str, message: &str) {
 	let mut props = Props::new();
-	props.set(crate::prompt_keys::FROM, from.to_owned());
-	props.set(crate::prompt_keys::MESSAGE, message.to_owned());
+	props.set(prompt_keys::FROM, from.to_owned());
+	props.set(prompt_keys::MESSAGE, message.to_owned());
 	render_into(PromptAssetId::ParentIrc, &props, out);
 }
 
 /// Renders bounded loop evidence into the repeated-tool-call redirect.
 pub fn render_tool_call_loop_redirect(out: &mut String, count: u32, digest: &str) {
 	let mut props = Props::new();
-	props.set(crate::prompt_keys::TOOL_NAME, "the same tool");
-	props.set(crate::prompt_keys::COUNT, count);
-	props.set(crate::prompt_keys::ARGUMENTS_SUMMARY, digest.to_owned());
-	props.set(crate::prompt_keys::RESULT_SUMMARY, "See the immediately preceding tool result.");
+	props.set(prompt_keys::TOOL_NAME, "the same tool");
+	props.set(prompt_keys::COUNT, count);
+	props.set(prompt_keys::ARGUMENTS_SUMMARY, digest.to_owned());
+	props.set(prompt_keys::RESULT_SUMMARY, "See the immediately preceding tool result.");
 	render_into(PromptAssetId::ToolCallLoopRedirect, &props, out);
 }
 
 fn render_into(id: PromptAssetId, props: &Props, out: &mut String) {
 	prompt_template(id)
-		.render(crate::prompt_engine::engine(), props, out)
+		.render(prompt_engine::engine(), props, out)
 		.expect("typed prompt props satisfy the embedded template");
 }
 
@@ -331,13 +331,11 @@ mod tests {
 	use std::collections::HashSet;
 
 	use super::*;
+	use crate::prompt_keys::ALL;
 
 	#[test]
 	fn catalog_templates_parse_and_reference_registered_keys() {
-		let keys = crate::prompt_keys::ALL
-			.iter()
-			.copied()
-			.collect::<HashSet<_>>();
+		let keys = ALL.iter().copied().collect::<HashSet<_>>();
 		for asset in prompt_assets().filter(|asset| asset.id != PromptAssetId::ModeCompress) {
 			let template = prompt_template(asset.id);
 			for key in template.referenced_keys() {

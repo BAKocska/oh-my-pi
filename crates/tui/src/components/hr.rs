@@ -1,12 +1,14 @@
 //! Horizontal and vertical rules, including width-safe docked labels.
 
+use std::iter;
+
 use xutf::Text as _;
 
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::UiContext,
 	frame::Rect,
-	markup::Border,
+	markup::{Align, Border},
 	props::{Prop, PropValue, Props},
 };
 
@@ -174,11 +176,9 @@ impl Component for Hr {
 				.saturating_add(u16::from(left_pad))
 				.saturating_add(u16::from(right_pad));
 			let x = match self.props.title_align() {
-				crate::markup::Align::Start => rect.x.saturating_add(2),
-				crate::markup::Align::Center => {
-					rect.x.saturating_add(rect.width.saturating_sub(total) / 2)
-				},
-				crate::markup::Align::End => rect
+				Align::Start => rect.x.saturating_add(2),
+				Align::Center => rect.x.saturating_add(rect.width.saturating_sub(total) / 2),
+				Align::End => rect
 					.x
 					.saturating_add(rect.width.saturating_sub(2).saturating_sub(total)),
 			}
@@ -260,7 +260,7 @@ impl Component for Spacer {
 
 fn repeated_char(output: &mut String, character: char, count: usize) {
 	output.reserve(count.saturating_mul(character.len_utf8()));
-	output.extend(std::iter::repeat_n(character, count));
+	output.extend(iter::repeat_n(character, count));
 }
 
 #[cfg(test)]

@@ -1,6 +1,14 @@
 //! Typed authentication and encrypted credential-store construction.
 
-use std::{collections::BTreeMap, str::FromStr as _, sync::Arc, time::Duration};
+use std::{
+	collections::BTreeMap,
+	env,
+	str::{self, FromStr as _},
+	sync,
+	sync::Arc,
+	time,
+	time::Duration,
+};
 
 use omp_core::{EnvPath, ExposeSecret as _, InvocationPhase, Secret, SecretString, Str};
 use omp_env::{EnvClient, ExecEvent};
@@ -13,7 +21,7 @@ use omp_envd::{
 	mcp::auth_authority::CredentialAuthority,
 };
 use omp_inference::{
-	AccountId, PrincipalId,
+	AccountId, PrincipalId, auth,
 	auth::{
 		AuditedCredentialReveal, AuthControlHandle, CommandCredentialError,
 		CommandCredentialExecutor, CommandExecutionFuture, CredentialControlWrite, CredentialGrants,
@@ -24,11 +32,14 @@ use omp_proto::{
 	env::v1::{
 		CloseSessionRequest, ExecOutcome, ExecRequest, OpenSessionRequest, OutputChannel, Script,
 	},
-	omp::auth::v1::{
-		Block, DeleteCredentialRequest, DisableCredentialRequest, EnableCredentialRequest,
-		ImportOAuthRequest, ListCredentialsRequest, MintScopedTokenRequest, PutApiKeyRequest,
-		RefreshCredentialRequest, ReportBlockRequest, RevealCredentialRequest,
-		auth_client::AuthClient,
+	omp::auth::{
+		v1,
+		v1::{
+			Block, DeleteCredentialRequest, DisableCredentialRequest, EnableCredentialRequest,
+			ImportOAuthRequest, ListCredentialsRequest, MintScopedTokenRequest, PutApiKeyRequest,
+			RefreshCredentialRequest, ReportBlockRequest, RevealCredentialRequest,
+			auth_client::AuthClient, credential_meta,
+		},
 	},
 };
 use omp_secrets::{
@@ -40,9 +51,11 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, metadata::MetadataValue, transport::Channel};
 use zeroize::Zeroizing;
 
+use crate::secrets::{key, session::SecretSessionSnapshot};
+
 /// Composes provider and MCP leasing over the one encrypted credential store.
 pub fn combined_authority(
-	store: std::sync::Arc<omp_inference::auth::CredentialStore>,
+	store: sync::Arc<omp_inference::auth::CredentialStore>,
 ) -> CombinedAuthAuthority {
 	CombinedAuthAuthority::new(store)
 }
@@ -364,7 +377,7 @@ impl ControlAuthority for CredentialSecretControlAuthority {
 			"omp.creds.report_block" => {
 				let account = self.selected_account(&arguments)?;
 				let until_ms = required_u64(&arguments, "until_ms")?;
-				let until = std::time::UNIX_EPOCH
+				let until = time::UNIX_EPOCH
 					.checked_add(Duration::from_millis(until_ms))
 					.ok_or_else(|| control_error("InvalidBlock", "until_ms is out of range"))?;
 				self
@@ -388,8 +401,8 @@ impl ControlAuthority for CredentialSecretControlAuthority {
 					.map_err(|_| control_error("InvalidDuration", "scoped token ttl is invalid"))?
 					.unwrap_or(Duration::from_secs(300))
 					.min(Duration::from_secs(3600));
-				let now_ms: u64 = std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
+				let now_ms: u64 = time::SystemTime::now()
+					.duration_since(time::UNIX_EPOCH)
 					.map_err(|_| control_error("InvalidTime", "system time is invalid"))?
 					.as_millis()
 					.try_into()
@@ -612,14 +625,14 @@ pub fn gateway_credential_control_factory(
 pub fn gateway_credential_secret_control_factory(
 	channel: Channel,
 	grants: BTreeMap<Str, CredentialControlGrant>,
-	snapshot: &crate::secrets::session::SecretSessionSnapshot,
+	snapshot: &SecretSessionSnapshot,
 ) -> GatewayCredentialSecretControlFactory {
 	gateway_credential_control_factory(
 		channel,
 		None,
 		grants,
 		Arc::from(snapshot.rules().to_vec()),
-		Arc::<str>::from(crate::secrets::key::placeholder_key()),
+		Arc::<str>::from(key::placeholder_key()),
 	)
 }
 
@@ -825,10 +838,7 @@ impl GatewayCredentialSecretControlAuthority {
 		Ok(request)
 	}
 
-	async fn list(
-		&self,
-		provider: &str,
-	) -> Result<Vec<omp_proto::omp::auth::v1::CredentialMeta>, ControlProtocolError> {
+	async fn list(&self, provider: &str) -> Result<Vec<v1::CredentialMeta>, ControlProtocolError> {
 		self
 			.client
 			.clone()
@@ -1034,14 +1044,14 @@ impl GatewayCredentialSecretControlAuthority {
 	}
 }
 
-fn remote_metadata_value(metadata: omp_proto::omp::auth::v1::CredentialMeta) -> Value {
+fn remote_metadata_value(metadata: v1::CredentialMeta) -> Value {
 	let kind = match metadata.kind() {
-		omp_proto::omp::auth::v1::credential_meta::Kind::ApiKey => "api_key",
-		omp_proto::omp::auth::v1::credential_meta::Kind::Oauth => "oauth",
-		omp_proto::omp::auth::v1::credential_meta::Kind::Aws => "aws",
-		omp_proto::omp::auth::v1::credential_meta::Kind::Unspecified => "unspecified",
+		credential_meta::Kind::ApiKey => "api_key",
+		credential_meta::Kind::Oauth => "oauth",
+		credential_meta::Kind::Aws => "aws",
+		credential_meta::Kind::Unspecified => "unspecified",
 	};
-	let disabled = metadata.state() == omp_proto::omp::auth::v1::credential_meta::State::Disabled;
+	let disabled = metadata.state() == credential_meta::State::Disabled;
 	json!({
 		"id": metadata.id,
 		"provider": metadata.provider,
@@ -1076,7 +1086,7 @@ fn parse_secret_rule(arguments: &Map<String, Value>) -> Result<SecretRule, Contr
 	let raw_kind = required_str(rule, "kind")?;
 	let (kind, content) = if raw_kind.eq_ignore_ascii_case("env") {
 		let name = required_str(rule, "content")?;
-		let content = std::env::var(name)
+		let content = env::var(name)
 			.map_err(|_| control_error("SecretEnvironmentMissing", "secret environment is absent"))?;
 		(SecretKind::Plain, content)
 	} else {
@@ -1116,7 +1126,7 @@ fn unseal_secret(value: &Value) -> Result<Secret, ControlProtocolError> {
 fn unseal_string(value: &Value) -> Result<SecretString, ControlProtocolError> {
 	let secret = unseal_secret(value)?;
 	secret.expose(|bytes| {
-		std::str::from_utf8(bytes)
+		str::from_utf8(bytes)
 			.map(SecretString::from)
 			.map_err(|_| control_error("InvalidCredential", "credential secret is not UTF-8"))
 	})
@@ -1203,17 +1213,13 @@ fn control_error(code: impl Into<Str>, message: impl Into<Str>) -> ControlProtoc
 	ControlProtocolError::new(code, message)
 }
 
-fn store_control_error(error: omp_inference::auth::StoreError) -> ControlProtocolError {
+fn store_control_error(error: auth::StoreError) -> ControlProtocolError {
 	match error {
-		omp_inference::auth::StoreError::NotFound => {
-			control_error("CredentialNotFound", "credential was not found")
-		},
-		omp_inference::auth::StoreError::GenerationConflict
-		| omp_inference::auth::StoreError::RevealAuditConflict => {
+		auth::StoreError::NotFound => control_error("CredentialNotFound", "credential was not found"),
+		auth::StoreError::GenerationConflict | auth::StoreError::RevealAuditConflict => {
 			control_error("CredentialConflict", error.to_string())
 		},
-		omp_inference::auth::StoreError::InvalidRevealAudit
-		| omp_inference::auth::StoreError::InvalidScopedGrant => {
+		auth::StoreError::InvalidRevealAudit | auth::StoreError::InvalidScopedGrant => {
 			control_error("PermissionError", error.to_string())
 		},
 		_ => control_error("CredentialStoreError", error.to_string()),
@@ -1318,8 +1324,8 @@ impl EnvCommandCredentialExecutor {
 							{
 								break Err(CommandCredentialError::Execution);
 							}
-							let text = std::str::from_utf8(&stdout)
-								.map_err(|_| CommandCredentialError::InvalidUtf8)?;
+							let text =
+								str::from_utf8(&stdout).map_err(|_| CommandCredentialError::InvalidUtf8)?;
 							let trimmed = text.trim();
 							if trimmed.is_empty() {
 								break Err(CommandCredentialError::Empty);

@@ -2,6 +2,7 @@
 
 use std::io::{Cursor, Read as _, Seek as _, SeekFrom};
 
+use cfb::OpenOptions;
 use omp_core::Str;
 
 use super::MarkitError;
@@ -15,7 +16,7 @@ const MAX_CFB_STREAM_BUFFER: usize = 64 * 1024;
 /// `open_workbook_auto_from_rs` discards format-specific errors while probing,
 /// so this check runs before handing the stream to anydoc.
 fn workbook_is_encrypted(bytes: &[u8]) -> bool {
-	let Ok(mut compound) = cfb::OpenOptions::new()
+	let Ok(mut compound) = OpenOptions::new()
 		.max_buffer_size(MAX_CFB_STREAM_BUFFER)
 		.open_with(Cursor::new(bytes))
 	else {

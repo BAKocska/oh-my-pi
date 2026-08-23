@@ -1,6 +1,11 @@
 //! Pure HTTP content classification and rendering for `read` and `grep`.
 
-use std::{fmt::Write as _, io::Cursor, path::Path};
+use std::{
+	fmt::Write as _,
+	io::Cursor,
+	path::{Path, PathBuf},
+	str,
+};
 
 use bytes::Bytes;
 use encoding_rs::{Encoding, UTF_8};
@@ -599,7 +604,7 @@ fn charset_from_content_type(value: &str) -> Option<&str> {
 }
 
 fn charset_from_meta(bytes: &[u8]) -> Option<&str> {
-	let head = std::str::from_utf8(&bytes[..bytes.len().min(32 * 1024)]).ok()?;
+	let head = str::from_utf8(&bytes[..bytes.len().min(32 * 1024)]).ok()?;
 	let lower = head.to_ascii_lowercase();
 	let index = lower.find("charset")? + "charset".len();
 	let tail = head.get(index..)?.trim_start();
@@ -706,7 +711,7 @@ fn filename_extension(filename: &str) -> String {
 		.unwrap_or_default()
 }
 
-fn synthetic_path(extension: &str) -> std::path::PathBuf {
+fn synthetic_path(extension: &str) -> PathBuf {
 	Path::new("payload").with_extension(extension.trim_start_matches('.'))
 }
 

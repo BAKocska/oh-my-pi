@@ -4,9 +4,11 @@ use std::{
 	borrow::Cow,
 	ffi::{OsStr, OsString},
 	io::{self, BufRead, BufReader, Read, Write},
+	iter, str,
 };
 
 use digest::{ExtendableOutput, Update, VariableOutput};
+use omp_core::encoding::{base64, hex};
 use strum::{EnumProperty, EnumString, IntoStaticStr};
 use thiserror::Error;
 
@@ -38,7 +40,7 @@ pub(crate) mod sum {
 		/// Encodes a cryptographic digest as lowercase hexadecimal.
 		pub(crate) fn to_hex(&self) -> Result<String, ChecksumError> {
 			match self {
-				Self::Vec(bytes) => Ok(omp_core::encoding::hex::encode(bytes).into_string()),
+				Self::Vec(bytes) => Ok(hex::encode(bytes).into_string()),
 				_ => Err(ChecksumError::LegacyEncoding),
 			}
 		}
@@ -46,7 +48,7 @@ pub(crate) mod sum {
 		/// Encodes a cryptographic digest as padded RFC 4648 base64.
 		pub(crate) fn to_base64(&self) -> Result<String, ChecksumError> {
 			match self {
-				Self::Vec(bytes) => Ok(omp_core::encoding::base64::encode(bytes).into_string()),
+				Self::Vec(bytes) => Ok(base64::encode(bytes).into_string()),
 				_ => Err(ChecksumError::LegacyEncoding),
 			}
 		}
@@ -345,6 +347,8 @@ pub(crate) mod sum {
 		}
 	}
 }
+
+use std::num;
 
 pub(crate) use sum::DigestOutput;
 
@@ -690,7 +694,7 @@ pub(crate) fn parse_blake_length(
 	let bits = match length {
 		BlakeLength::Int(value) => value,
 		BlakeLength::String(value) => value.parse::<usize>().map_err(|error| {
-			if *error.kind() == std::num::IntErrorKind::PosOverflow {
+			if *error.kind() == num::IntErrorKind::PosOverflow {
 				ChecksumError::LengthTooBigForBlake(kind.to_uppercase().into())
 			} else {
 				ChecksumError::InvalidLength(value.into())
@@ -757,7 +761,7 @@ pub(crate) fn os_str_from_bytes(bytes: &[u8]) -> Result<Cow<'_, OsStr>, Checksum
 	}
 	#[cfg(not(unix))]
 	{
-		let text = std::str::from_utf8(bytes)
+		let text = str::from_utf8(bytes)
 			.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 		Ok(Cow::Owned(OsString::from(text)))
 	}
@@ -767,7 +771,7 @@ pub(crate) fn os_str_from_bytes(bytes: &[u8]) -> Result<Cow<'_, OsStr>, Checksum
 pub(crate) fn read_os_string_lines<R: Read>(
 	mut reader: BufReader<R>,
 ) -> impl Iterator<Item = io::Result<OsString>> {
-	std::iter::from_fn(move || {
+	iter::from_fn(move || {
 		let mut bytes = Vec::with_capacity(256);
 		match reader.read_until(b'\n', &mut bytes) {
 			Ok(0) => None,

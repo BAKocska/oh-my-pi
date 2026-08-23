@@ -17,6 +17,7 @@ use omp_tools::read::{
 	},
 	selector::ParsedSelector,
 };
+use url::Url;
 
 use crate::discovery::manifest::{
 	CapabilityPayload, CapabilityRecord, DiscoveredCapability, SkillPayload,
@@ -353,9 +354,9 @@ impl Resolve for SkillResolver {
 			})?,
 		};
 		let uri = if path.is_dir() {
-			url::Url::from_directory_path(path)
+			Url::from_directory_path(path)
 		} else {
-			url::Url::from_file_path(path)
+			Url::from_file_path(path)
 		}
 		.map_err(|()| Fault::Invalid {
 			message: Str::from("skill path cannot be represented as a file URI"),
@@ -449,7 +450,10 @@ fn select_snapshot_bytes(
 /// Skill prompt provenance mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SkillInvocationKind {
+	/// Explicit user invocation, including invocation arguments and containment
+	/// roots.
 	User,
+	/// Automatic prompt injection identified by its frozen source path.
 	Autoload,
 }
 

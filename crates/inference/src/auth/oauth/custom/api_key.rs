@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 
 use futures::{FutureExt, future::BoxFuture};
 use omp_catalog::provider::OAuthExchangeKind;
@@ -66,7 +66,7 @@ impl OAuthCustomHandler for ApiKeyPasteHandler {
 			// Keep the sole trimmed copy in zeroizing storage until ownership moves
 			// directly into the secret container.
 			let mut material = Zeroizing::new(trimmed.to_owned());
-			let access_token = SecretString::from(std::mem::take(&mut *material));
+			let access_token = SecretString::from(mem::take(&mut *material));
 
 			Ok(OAuthTokenSet {
 				access_token,

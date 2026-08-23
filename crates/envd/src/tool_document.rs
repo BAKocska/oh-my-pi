@@ -1,8 +1,13 @@
 //! `omp-tools` adapters over the app-owned document and blob hosts.
 
 use std::{
+	collections::{BTreeSet, HashSet},
+	env,
+	fs::{self as std_fs, OpenOptions},
 	future::{Future, ready},
-	path::{Component, Path, PathBuf},
+	io, iter,
+	path::{self, Component, Path, PathBuf},
+	process, str,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -11,11 +16,16 @@ use std::{
 };
 
 use bytes::Bytes;
+use flate2::{read::GzDecoder, write::GzEncoder};
 use omp_core::{Hash32, Str, encoding::hex, sf};
+use omp_docserver::fs::{self, LocalFs};
 use omp_hashline::{
 	Clipboard, MismatchDetails, MismatchError, RevisionToken, compute_snapshot_tag,
 };
-use omp_proto::document::v1 as pb;
+use omp_proto::document::v1::{
+	self as pb, commit_transaction_response, document_mutation, document_target,
+	read_document_response, read_selection, text_mutation,
+};
 use omp_tool::BlobRef;
 use omp_tools::{
 	edit::{
@@ -25,23 +35,26 @@ use omp_tools::{
 		StalePolicy,
 	},
 	read::{
-		Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES,
+		Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES, archive,
 		conflicts::{splice_registered, splice_registered_bulk},
 		mutation::{MutationCapability, ResourceMutationReceipt, ResourceMutationRequest},
+		notebook, selector,
 	},
 	write::{
 		ConflictBulkFileRequest, ConflictBulkFileResult, ConflictSpliceRequest, ConflictSpliceResult,
 		Fault as WriteFault, PlainWriteRequest, PlainWriteResult, SpecialWriteControl,
-		WriteCommitError, WriteDisposition, WriteDocuments,
+		WriteCommitError, WriteDisposition, WriteDocuments, WriteOperation, backends,
 	},
 };
 use parking_lot::Mutex;
+use tokio::task;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{
 	blobs::BlobHost,
-	docs::{DocumentHost, DocumentLease, lease_target},
+	docs::{DocumentError, DocumentHost, DocumentLease, lease_target},
+	tool_url::ssh,
 };
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
@@ -91,20 +104,20 @@ pub(super) fn privileged_write(
 	expected_present: bool,
 	expected_hash: Option<&[u8; 32]>,
 	mode: u32,
-) -> Result<omp_docserver::fs::DiskState, PrivilegedMutationFault> {
-	use omp_docserver::fs::{DiskExpectation, DiskState, LocalFs};
+) -> Result<fs::DiskState, PrivilegedMutationFault> {
+	use omp_docserver::fs::DiskExpectation;
 
 	let config = omp_docserver::ServerConfig::new(root).map_err(classify_privileged)?;
 	let filesystem = LocalFs::new(&config).map_err(classify_privileged)?;
 	let expected = match (expected_present, filesystem.stable_read(target)) {
-		(true, Ok(DiskState::Present { content, fingerprint })) => {
+		(true, Ok(fs::DiskState::Present { content, fingerprint })) => {
 			if expected_hash.is_some_and(|hash| Hash32::sum(&content).as_bytes() != hash) {
 				return Err(PrivilegedMutationFault::StaleRevision);
 			}
 			DiskExpectation::Present(fingerprint)
 		},
-		(false, Ok(DiskState::Missing)) => DiskExpectation::Missing,
-		(true, Ok(DiskState::Missing)) | (false, Ok(DiskState::Present { .. })) => {
+		(false, Ok(fs::DiskState::Missing)) => DiskExpectation::Missing,
+		(true, Ok(fs::DiskState::Missing)) | (false, Ok(fs::DiskState::Present { .. })) => {
 			return Err(PrivilegedMutationFault::StaleRevision);
 		},
 		(_, Err(error)) => return Err(classify_privileged(error)),
@@ -125,9 +138,9 @@ pub(super) fn privileged_unlink(
 	expected_present: bool,
 	expected_hash: Option<&[u8; 32]>,
 	recursive: bool,
-) -> Result<omp_docserver::fs::DiskState, PrivilegedMutationFault> {
+) -> Result<fs::DiskState, PrivilegedMutationFault> {
 	let config = omp_docserver::ServerConfig::new(root).map_err(classify_privileged)?;
-	let filesystem = omp_docserver::fs::LocalFs::new(&config).map_err(classify_privileged)?;
+	let filesystem = LocalFs::new(&config).map_err(classify_privileged)?;
 	if let Some(expected_hash) = expected_hash {
 		let state = filesystem
 			.stable_read(target)
@@ -295,7 +308,7 @@ impl EditDocuments for DocumentHost {
 		}
 		let notebook = canonical_path.ends_with(".ipynb");
 		let base_bytes = if notebook {
-			let rendered = omp_tools::read::notebook::render(&raw_base_bytes, &request.path)
+			let rendered = notebook::render(&raw_base_bytes, &request.path)
 				.map_err(|error| edit_invalid(error.to_string()))?;
 			Bytes::from(rendered.text)
 		} else {
@@ -386,7 +399,7 @@ impl EditDocuments for DocumentHost {
 					let raw = persisted_edit_bytes(prepared, content)?;
 					operations.push(pb::DocumentMutation {
 						document:  Some(target),
-						operation: Some(pb::document_mutation::Operation::Text(proposed_text_mutation(
+						operation: Some(document_mutation::Operation::Text(proposed_text_mutation(
 							raw.clone(),
 							revision.clone(),
 							proposal.stale_policy,
@@ -401,7 +414,7 @@ impl EditDocuments for DocumentHost {
 				EditAction::Delete => {
 					operations.push(pb::DocumentMutation {
 						document:  Some(target),
-						operation: Some(pb::document_mutation::Operation::Delete(pb::DeleteMutation {
+						operation: Some(document_mutation::Operation::Delete(pb::DeleteMutation {
 							base_revision: Some(revision),
 						})),
 					});
@@ -439,12 +452,12 @@ impl EditDocuments for DocumentHost {
 			.await
 			.map_err(|error| edit_unknown(error.to_string()))?;
 		let committed = match response.outcome {
-			Some(pb::commit_transaction_response::Outcome::Committed(committed))
+			Some(commit_transaction_response::Outcome::Committed(committed))
 				if committed.transaction_id == transaction_id =>
 			{
 				committed
 			},
-			Some(pb::commit_transaction_response::Outcome::Rejected(rejected))
+			Some(commit_transaction_response::Outcome::Rejected(rejected))
 				if rejected.transaction_id == transaction_id =>
 			{
 				let base = prepared
@@ -452,7 +465,7 @@ impl EditDocuments for DocumentHost {
 					.map_or_else(Bytes::new, |prepared| prepared.base_bytes.clone());
 				return Err(EditCommitError::Rejected(map_rejection(&rejected, &base)));
 			},
-			Some(pb::commit_transaction_response::Outcome::PartiallyCommitted(partial))
+			Some(commit_transaction_response::Outcome::PartiallyCommitted(partial))
 				if partial.transaction_id == transaction_id =>
 			{
 				let base = prepared
@@ -508,14 +521,14 @@ impl EditDocuments for DocumentHost {
 
 		let mut snapshots = self.snapshot_store().lock();
 		for (index, proposal) in proposals.iter().enumerate() {
-			omp_walker::invalidate_path(std::path::Path::new(&prepared[index].path));
+			omp_walker::invalidate_path(Path::new(&prepared[index].path));
 			match &proposal.action {
 				EditAction::Delete => snapshots.invalidate(&prepared[index].path),
 				EditAction::Move { .. } => {
 					let destination = move_paths[index]
 						.as_ref()
 						.expect("move proposals retain a canonical destination");
-					omp_walker::invalidate_path(std::path::Path::new(destination));
+					omp_walker::invalidate_path(Path::new(destination));
 					snapshots
 						.relocate(&prepared[index].path, destination.clone())
 						.map_err(|error| edit_unknown(error.to_string()))?;
@@ -558,8 +571,8 @@ async fn rollback_partial_commit(
 	partial: &pb::TransactionPartiallyCommitted,
 ) -> Result<(), Str> {
 	let mut compensation = Vec::new();
-	let mut restored_sections = std::collections::HashSet::new();
-	let mut affected_paths = std::collections::BTreeSet::new();
+	let mut restored_sections = HashSet::new();
+	let mut affected_paths = BTreeSet::new();
 	for operation in partial.committed_operations.iter().rev() {
 		let Some(role) = roles.get(operation.operation_index as usize).copied() else {
 			return Err(
@@ -601,7 +614,7 @@ async fn rollback_partial_commit(
 							.uri
 							.clone(),
 					)),
-					operation: Some(pb::document_mutation::Operation::Text(restore_text_mutation(
+					operation: Some(document_mutation::Operation::Text(restore_text_mutation(
 						source.raw_base_bytes.clone(),
 						head
 							.revision
@@ -613,7 +626,7 @@ async fn rollback_partial_commit(
 			BatchOperationRole::Delete(_) => {
 				compensation.push(pb::DocumentMutation {
 					document:  Some(uri_target(source_uri)),
-					operation: Some(pb::document_mutation::Operation::Create(pb::CreateMutation {
+					operation: Some(document_mutation::Operation::Create(pb::CreateMutation {
 						content:           source.raw_base_bytes.clone(),
 						existing_document: pb::ExistingDocumentPolicy::FailIfExists as i32,
 						format_policy:     pb::FormatPolicy::Disabled as i32,
@@ -638,7 +651,7 @@ async fn rollback_partial_commit(
 				}
 				compensation.push(pb::DocumentMutation {
 					document:  Some(uri_target(source_uri)),
-					operation: Some(pb::document_mutation::Operation::Create(pb::CreateMutation {
+					operation: Some(document_mutation::Operation::Create(pb::CreateMutation {
 						content:           source.raw_base_bytes.clone(),
 						existing_document: pb::ExistingDocumentPolicy::FailIfExists as i32,
 						format_policy:     pb::FormatPolicy::Disabled as i32,
@@ -646,7 +659,7 @@ async fn rollback_partial_commit(
 				});
 				compensation.push(pb::DocumentMutation {
 					document:  Some(uri_target(destination)),
-					operation: Some(pb::document_mutation::Operation::Delete(pb::DeleteMutation {
+					operation: Some(document_mutation::Operation::Delete(pb::DeleteMutation {
 						base_revision: Some(
 							head
 								.revision
@@ -677,12 +690,12 @@ async fn rollback_partial_commit(
 			)
 		})?;
 	match outcome.outcome {
-		Some(pb::commit_transaction_response::Outcome::Committed(committed))
+		Some(commit_transaction_response::Outcome::Committed(committed))
 			if committed.transaction_id == rollback_id =>
 		{
 			Ok(())
 		},
-		Some(pb::commit_transaction_response::Outcome::Rejected(rejected)) => Err(sf!(
+		Some(commit_transaction_response::Outcome::Rejected(rejected)) => Err(sf!(
 			"rollback rejected for paths {}: {}",
 			affected_paths
 				.iter()
@@ -691,7 +704,7 @@ async fn rollback_partial_commit(
 				.join(", "),
 			rejected.message
 		)),
-		Some(pb::commit_transaction_response::Outcome::PartiallyCommitted(rollback)) => Err(sf!(
+		Some(commit_transaction_response::Outcome::PartiallyCommitted(rollback)) => Err(sf!(
 			"rollback partially failed for paths {} before operation {}: {}",
 			affected_paths
 				.iter()
@@ -713,13 +726,13 @@ async fn rollback_partial_commit(
 }
 
 const fn uri_target(uri: String) -> pb::DocumentTarget {
-	pb::DocumentTarget { target: Some(pb::document_target::Target::Uri(uri)) }
+	pb::DocumentTarget { target: Some(document_target::Target::Uri(uri)) }
 }
 
 const fn restore_text_mutation(content: Bytes, revision: pb::Revision) -> pb::TextMutation {
 	pb::TextMutation {
 		base_revision: Some(revision),
-		change:        Some(pb::text_mutation::Change::ProposedContent(content)),
+		change:        Some(text_mutation::Change::ProposedContent(content)),
 		stale_policy:  pb::StalePolicy::Fail as i32,
 		format_policy: pb::FormatPolicy::Disabled as i32,
 	}
@@ -740,21 +753,21 @@ fn map_partial_rejection(partial: &pb::TransactionPartiallyCommitted, base: &[u8
 pub(super) async fn read_whole(
 	host: &DocumentHost,
 	lease: &DocumentLease,
-) -> Result<Bytes, super::docs::DocumentError> {
+) -> Result<Bytes, DocumentError> {
 	let response = host
 		.read(
 			lease,
 			pb::ReadSelection {
-				selection: Some(pb::read_selection::Selection::Whole(pb::WholeDocument {})),
+				selection: Some(read_selection::Selection::Whole(pb::WholeDocument {})),
 			},
 			&CancellationToken::new(),
 		)
 		.await?;
 	match response.body {
-		Some(pb::read_document_response::Body::Content(content)) => Ok(content),
-		_ => Err(super::docs::DocumentError::MalformedResponse(sf!(
-			"whole document read did not return content",
-		))),
+		Some(read_document_response::Body::Content(content)) => Ok(content),
+		_ => {
+			Err(DocumentError::MalformedResponse(sf!("whole document read did not return content",)))
+		},
 	}
 }
 
@@ -777,8 +790,8 @@ async fn read_committed_view(
 		.await
 		.map_err(|error| edit_unknown(error.to_string()))?;
 	if notebook {
-		let rendered = omp_tools::read::notebook::render(&raw, display_path)
-			.map_err(|error| edit_unknown(error.to_string()))?;
+		let rendered =
+			notebook::render(&raw, display_path).map_err(|error| edit_unknown(error.to_string()))?;
 		Ok(Bytes::from(rendered.text))
 	} else {
 		Ok(raw)
@@ -881,7 +894,7 @@ fn recover_workspace_suffix(
 	let mut matches = Vec::new();
 	let mut visited = 0_usize;
 	while let Some(directory) = pending.pop() {
-		let entries = match std::fs::read_dir(&directory) {
+		let entries = match std_fs::read_dir(&directory) {
 			Ok(entries) => entries,
 			Err(_) => continue,
 		};
@@ -967,12 +980,12 @@ fn resolve_move_destination(
 	if candidate == root_path || !candidate.starts_with(&root_path) {
 		return Err("document path escapes or names the workspace root".into());
 	}
-	let canonical_root = std::fs::canonicalize(&root_path)
+	let canonical_root = std_fs::canonicalize(&root_path)
 		.map_err(|error| format!("cannot canonicalize document workspace root: {error}"))?;
 	let parent = candidate
 		.parent()
 		.ok_or_else(|| "move destination has no parent directory".to_owned())?;
-	let canonical_parent = std::fs::canonicalize(parent)
+	let canonical_parent = std_fs::canonicalize(parent)
 		.map_err(|error| format!("cannot canonicalize move destination parent: {error}"))?;
 	if !canonical_parent.starts_with(&canonical_root) {
 		return Err("move destination escapes the canonical workspace root".into());
@@ -993,15 +1006,15 @@ fn ensure_canonical_containment(
 	candidate: &Path,
 	allow_missing: bool,
 ) -> Result<(), String> {
-	let canonical_root = std::fs::canonicalize(root)
+	let canonical_root = std_fs::canonicalize(root)
 		.map_err(|error| format!("cannot canonicalize document workspace root: {error}"))?;
-	let canonical_candidate = match std::fs::canonicalize(candidate) {
+	let canonical_candidate = match std_fs::canonicalize(candidate) {
 		Ok(candidate) => candidate,
-		Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+		Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {
 			let parent = candidate
 				.parent()
 				.ok_or_else(|| "document create target has no parent directory".to_owned())?;
-			let parent = std::fs::canonicalize(parent)
+			let parent = std_fs::canonicalize(parent)
 				.map_err(|error| format!("cannot canonicalize document create parent: {error}"))?;
 			if !parent.starts_with(&canonical_root) {
 				return Err("document create target escapes the canonical workspace root".into());
@@ -1046,7 +1059,7 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf, String> {
 	for component in path.components() {
 		match component {
 			Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-			Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+			Component::RootDir => normalized.push(Path::new(path::MAIN_SEPARATOR_STR)),
 			Component::CurDir => {},
 			Component::Normal(component) => normalized.push(component),
 			Component::ParentDir => {
@@ -1172,7 +1185,7 @@ const fn proposed_text_mutation(
 ) -> pb::TextMutation {
 	pb::TextMutation {
 		base_revision: Some(base_revision),
-		change:        Some(pb::text_mutation::Change::ProposedContent(content)),
+		change:        Some(text_mutation::Change::ProposedContent(content)),
 		stale_policy:  match stale_policy {
 			StalePolicy::RebaseNonOverlapping => pb::StalePolicy::RebaseNonOverlapping as i32,
 		},
@@ -1194,22 +1207,20 @@ fn proposed_move_mutation(
 	base_revision: pb::Revision,
 	destination_uri: String,
 	format_policy: FormatPolicy,
-) -> pb::document_mutation::Operation {
+) -> document_mutation::Operation {
 	if content.as_ref() == base_content {
-		pb::document_mutation::Operation::Move(pb::MoveMutation {
+		use omp_proto::document::v1::move_mutation::DestinationPrecondition;
+		document_mutation::Operation::Move(pb::MoveMutation {
 			base_revision: Some(base_revision),
 			destination_uri,
-			destination_precondition: Some(
-				pb::move_mutation::DestinationPrecondition::DestinationMustNotExist(true),
-			),
+			destination_precondition: Some(DestinationPrecondition::DestinationMustNotExist(true)),
 		})
 	} else {
-		pb::document_mutation::Operation::MoveWithContent(pb::MoveWithContentMutation {
+		use omp_proto::document::v1::move_with_content_mutation::DestinationPrecondition;
+		document_mutation::Operation::MoveWithContent(pb::MoveWithContentMutation {
 			base_revision: Some(base_revision),
 			destination_uri,
-			destination_precondition: Some(
-				pb::move_with_content_mutation::DestinationPrecondition::DestinationMustNotExist(true),
-			),
+			destination_precondition: Some(DestinationPrecondition::DestinationMustNotExist(true)),
 			content,
 			format_policy: protocol_format_policy(format_policy),
 		})
@@ -1233,10 +1244,10 @@ fn serialize_notebook_edit(
 	editable: &[u8],
 	display_path: &str,
 ) -> Result<Bytes, String> {
-	let editable = std::str::from_utf8(editable).map_err(|_| {
+	let editable = str::from_utf8(editable).map_err(|_| {
 		format!("Invalid notebook editable representation for {display_path}: text is not UTF-8")
 	})?;
-	omp_tools::read::notebook::round_trip(original, editable)
+	notebook::round_trip(original, editable)
 		.map(Bytes::from)
 		.map_err(|error| format!("Invalid notebook edit for {display_path}: {error}"))
 }
@@ -1376,7 +1387,7 @@ pub(super) fn transaction_id(server_epoch: &[u8]) -> Bytes {
 		.as_nanos();
 	let mut hasher = Hash32::hasher();
 	hasher.update(server_epoch);
-	hasher.update(std::process::id().to_le_bytes());
+	hasher.update(process::id().to_le_bytes());
 	hasher.update(sequence.to_le_bytes());
 	hasher.update(now.to_le_bytes());
 	Bytes::copy_from_slice(&hasher.finalize().as_bytes()[..16])
@@ -1502,14 +1513,14 @@ async fn run_special_write_blocking<T, F>(
 	control: SpecialWriteControl,
 	task_name: &'static str,
 	worker: F,
-) -> Result<T, omp_tools::write::backends::Fault>
+) -> Result<T, backends::Fault>
 where
 	T: Send + 'static,
-	F: FnOnce(&SpecialWriteControl) -> Result<T, omp_tools::write::backends::Fault> + Send + 'static,
+	F: FnOnce(&SpecialWriteControl) -> Result<T, backends::Fault> + Send + 'static,
 {
 	let task_control = control.clone();
 	let mut cancel_on_drop = CancelSpecialWriteOnDrop(Some(control));
-	let result = tokio::task::spawn_blocking(move || worker(&task_control)).await;
+	let result = task::spawn_blocking(move || worker(&task_control)).await;
 	cancel_on_drop.disarm();
 	result.map_err(|error| special_fault(format!("{task_name} write task failed: {error}")))?
 }
@@ -1519,6 +1530,7 @@ impl WriteDocuments for DocumentHost {
 		&self,
 		request: ResourceMutationRequest,
 	) -> Result<Option<ResourceMutationReceipt>, WriteCommitError> {
+		use super::tool_url::{host::write, vault::parse_resource};
 		let Some(services) = self.resource_mutations() else {
 			return Ok(None);
 		};
@@ -1528,7 +1540,7 @@ impl WriteDocuments for DocumentHost {
 				let Some(resource) = request.uri.strip_prefix("ssh://") else {
 					return Err(write_rejected("invalid SSH mutation URI".to_owned()));
 				};
-				let (alias, path) = super::tool_url::ssh::parse_resource(resource.as_str())
+				let (alias, path) = ssh::parse_resource(resource.as_str())
 					.map_err(|fault| write_rejected(fault.message().clone()))?;
 				services
 					.ssh
@@ -1542,8 +1554,8 @@ impl WriteDocuments for DocumentHost {
 				};
 				let resource = resource.as_str();
 				let resource = resource.split_once('?').map_or(resource, |(path, _)| path);
-				let (vault, path) = super::tool_url::vault::parse_resource(resource)
-					.map_err(|fault| write_rejected(fault.message().clone()))?;
+				let (vault, path) =
+					parse_resource(resource).map_err(|fault| write_rejected(fault.message().clone()))?;
 				services
 					.vault
 					.write(&vault, &path, request.content.as_bytes(), 8 * 1024 * 1024)
@@ -1551,7 +1563,7 @@ impl WriteDocuments for DocumentHost {
 			},
 			MutationCapability::Attachment => return Ok(None),
 			MutationCapability::Host => {
-				super::tool_url::host::write(&request.uri, request.content.to_string())
+				write(&request.uri, request.content.to_string())
 					.await
 					.map_err(|error| write_rejected(error.to_string()))?;
 			},
@@ -1566,23 +1578,21 @@ impl WriteDocuments for DocumentHost {
 	fn probe_literal(
 		&self,
 		path: Str,
-	) -> impl Future<Output = Result<omp_tools::read::selector::LiteralPathProbe, WriteFault>> + Send + '_
-	{
-		use omp_tools::read::selector::LiteralPathProbe;
+	) -> impl Future<Output = Result<selector::LiteralPathProbe, WriteFault>> + Send + '_ {
 		ready(
 			resolve_plain_write(self, &path)
 				.map_err(|message| WriteFault::Document { message: Str::from(message) })
-				.map(|resolved| match std::fs::symlink_metadata(resolved.path) {
-					Ok(_) => LiteralPathProbe::Exists,
+				.map(|resolved| match std_fs::symlink_metadata(resolved.path) {
+					Ok(_) => selector::LiteralPathProbe::Exists,
 					Err(error)
 						if matches!(
 							error.kind(),
-							std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+							io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
 						) =>
 					{
-						LiteralPathProbe::Missing
+						selector::LiteralPathProbe::Missing
 					},
-					Err(_) => LiteralPathProbe::Unknown,
+					Err(_) => selector::LiteralPathProbe::Unknown,
 				}),
 		)
 	}
@@ -1592,13 +1602,10 @@ impl WriteDocuments for DocumentHost {
 		request: PlainWriteRequest,
 	) -> Result<PlainWriteResult, WriteCommitError> {
 		let resolved = resolve_plain_write(self, &request.path).map_err(write_rejected)?;
-		let existed = match std::fs::symlink_metadata(&resolved.path) {
+		let existed = match std_fs::symlink_metadata(&resolved.path) {
 			Ok(_) => true,
 			Err(error)
-				if matches!(
-					error.kind(),
-					std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-				) =>
+				if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) =>
 			{
 				false
 			},
@@ -1677,9 +1684,9 @@ impl WriteDocuments for DocumentHost {
 				transaction_id.clone(),
 				vec![pb::DocumentMutation {
 					document:  Some(pb::DocumentTarget {
-						target: Some(pb::document_target::Target::Uri(resolved.uri.clone().into())),
+						target: Some(document_target::Target::Uri(resolved.uri.clone().into())),
 					}),
-					operation: Some(pb::document_mutation::Operation::Create(pb::CreateMutation {
+					operation: Some(document_mutation::Operation::Create(pb::CreateMutation {
 						content:           content.clone(),
 						existing_document: pb::ExistingDocumentPolicy::ReplaceExisting as i32,
 						format_policy:     protocol_format_policy(request.format_policy),
@@ -1692,17 +1699,17 @@ impl WriteDocuments for DocumentHost {
 				reason: Str::from(error.to_string()),
 			})?;
 		let committed = match response.outcome {
-			Some(pb::commit_transaction_response::Outcome::Committed(committed))
+			Some(commit_transaction_response::Outcome::Committed(committed))
 				if committed.transaction_id == transaction_id =>
 			{
 				committed
 			},
-			Some(pb::commit_transaction_response::Outcome::Rejected(rejected))
+			Some(commit_transaction_response::Outcome::Rejected(rejected))
 				if rejected.transaction_id == transaction_id =>
 			{
 				return Err(write_rejected(rejected.message));
 			},
-			Some(pb::commit_transaction_response::Outcome::PartiallyCommitted(partial))
+			Some(commit_transaction_response::Outcome::PartiallyCommitted(partial))
 				if partial.transaction_id == transaction_id =>
 			{
 				return Err(WriteCommitError::EffectsUnknown {
@@ -1784,8 +1791,7 @@ impl WriteDocuments for DocumentHost {
 		display_path: Str,
 		content: Bytes,
 		control: SpecialWriteControl,
-	) -> Result<Option<omp_tools::write::backends::ResultPayload>, omp_tools::write::backends::Fault>
-	{
+	) -> Result<Option<backends::ResultPayload>, backends::Fault> {
 		let host = self.clone();
 		run_special_write_blocking(control, "archive", move |task_control| {
 			write_archive_member_blocking(&host, &display_path, content, task_control)
@@ -1798,8 +1804,7 @@ impl WriteDocuments for DocumentHost {
 		display_path: Str,
 		content: Str,
 		control: SpecialWriteControl,
-	) -> Result<Option<omp_tools::write::backends::ResultPayload>, omp_tools::write::backends::Fault>
-	{
+	) -> Result<Option<backends::ResultPayload>, backends::Fault> {
 		let host = self.clone();
 		let interrupt = Arc::new(SqliteWriteInterrupt::default());
 		let task_interrupt = Arc::clone(&interrupt);
@@ -1832,7 +1837,7 @@ fn resolve_plain_write(host: &DocumentHost, input: &str) -> Result<ResolvedPlain
 }
 
 fn resolve_plain_write_from_root(root: &Path, input: &str) -> Result<ResolvedPlainWrite, String> {
-	let authored = omp_tools::read::selector::expand_tilde(input, None);
+	let authored = selector::expand_tilde(input, None);
 	let candidate = if authored.is_absolute() {
 		normalize_absolute(&authored)?
 	} else {
@@ -1841,17 +1846,14 @@ fn resolve_plain_write_from_root(root: &Path, input: &str) -> Result<ResolvedPla
 	if candidate == root {
 		return Err("document path must name a file".into());
 	}
-	let canonical_root = std::fs::canonicalize(root)
+	let canonical_root = std_fs::canonicalize(root)
 		.map_err(|error| format!("cannot canonicalize document workspace root: {error}"))?;
 	let mut ancestor = candidate.as_path();
 	let canonical_ancestor = loop {
-		match std::fs::canonicalize(ancestor) {
+		match std_fs::canonicalize(ancestor) {
 			Ok(canonical) => break canonical,
 			Err(error)
-				if matches!(
-					error.kind(),
-					std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-				) =>
+				if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) =>
 			{
 				ancestor = ancestor
 					.parent()
@@ -1884,7 +1886,7 @@ fn display_write_path(path: &Path, workspace_root: &Path) -> Str {
 	if let Ok(relative) = path.strip_prefix(workspace_root) {
 		return Str::from(relative.to_string_lossy().replace('\\', "/"));
 	}
-	if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+	if let Some(home) = env::var_os("HOME").map(PathBuf::from)
 		&& let Ok(relative) = path.strip_prefix(home)
 	{
 		let relative = relative.to_string_lossy().replace('\\', "/");
@@ -1898,9 +1900,9 @@ fn display_write_path(path: &Path, workspace_root: &Path) -> Str {
 }
 
 fn read_file_prefix(path: &Path, limit: u64) -> Result<Bytes, String> {
-	use std::io::Read as _;
+	use io::Read as _;
 
-	let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+	let file = std_fs::File::open(path).map_err(|error| error.to_string())?;
 	let mut prefix = Vec::with_capacity(usize::try_from(limit).unwrap_or(16 * 1024));
 	file
 		.take(limit)
@@ -1934,15 +1936,15 @@ fn auto_generated_file(path: &Path, prefix: &[u8]) -> bool {
 }
 
 fn atomic_write_plain(path: &Path, content: &Bytes) -> Result<(), String> {
-	use std::io::Write as _;
+	use io::Write as _;
 
-	let existing_permissions = match std::fs::metadata(path) {
+	let existing_permissions = match std_fs::metadata(path) {
 		Ok(metadata) => Some(metadata.permissions()),
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => None,
 		Err(error) => return Err(error.to_string()),
 	};
 	let temporary = unique_temp_path(path);
-	let mut output = std::fs::OpenOptions::new()
+	let mut output = OpenOptions::new()
 		.write(true)
 		.create_new(true)
 		.open(&temporary)
@@ -1960,15 +1962,15 @@ fn atomic_write_plain(path: &Path, content: &Bytes) -> Result<(), String> {
 		output.sync_all().map_err(|error| error.to_string())
 	})();
 	if let Err(error) = prepared {
-		let _ = std::fs::remove_file(&temporary);
+		let _ = std_fs::remove_file(&temporary);
 		return Err(error);
 	}
-	if let Err(error) = std::fs::rename(&temporary, path) {
-		let _ = std::fs::remove_file(&temporary);
+	if let Err(error) = std_fs::rename(&temporary, path) {
+		let _ = std_fs::remove_file(&temporary);
 		return Err(error.to_string());
 	}
 	if let Some(parent) = path.parent()
-		&& let Ok(directory) = std::fs::File::open(parent)
+		&& let Ok(directory) = std_fs::File::open(parent)
 	{
 		let _ = directory.sync_all();
 	}
@@ -2052,7 +2054,7 @@ async fn open_conflict_document(
 	let current = read_whole(host, &lease)
 		.await
 		.map_err(|error| write_rejected(error.to_string()))?;
-	let current = std::str::from_utf8(&current)
+	let current = str::from_utf8(&current)
 		.map_err(|_| write_rejected("conflict splices require a UTF-8 text document"))?
 		.to_owned();
 	Ok((lease, current))
@@ -2075,9 +2077,9 @@ async fn commit_conflict_content(
 			transaction_id.clone(),
 			vec![pb::DocumentMutation {
 				document:  Some(lease_target(lease)),
-				operation: Some(pb::document_mutation::Operation::Text(pb::TextMutation {
+				operation: Some(document_mutation::Operation::Text(pb::TextMutation {
 					base_revision: Some(revision),
-					change:        Some(pb::text_mutation::Change::ProposedContent(content.clone())),
+					change:        Some(text_mutation::Change::ProposedContent(content.clone())),
 					stale_policy:  pb::StalePolicy::Fail as i32,
 					format_policy: pb::FormatPolicy::Disabled as i32,
 				})),
@@ -2087,17 +2089,17 @@ async fn commit_conflict_content(
 		.await
 		.map_err(|error| WriteCommitError::EffectsUnknown { reason: Str::from(error.to_string()) })?;
 	let committed = match response.outcome {
-		Some(pb::commit_transaction_response::Outcome::Committed(committed))
+		Some(commit_transaction_response::Outcome::Committed(committed))
 			if committed.transaction_id == transaction_id =>
 		{
 			committed
 		},
-		Some(pb::commit_transaction_response::Outcome::Rejected(rejected))
+		Some(commit_transaction_response::Outcome::Rejected(rejected))
 			if rejected.transaction_id == transaction_id =>
 		{
 			return Err(write_rejected(rejected.message));
 		},
-		Some(pb::commit_transaction_response::Outcome::PartiallyCommitted(partial))
+		Some(commit_transaction_response::Outcome::PartiallyCommitted(partial))
 			if partial.transaction_id == transaction_id =>
 		{
 			return Err(WriteCommitError::EffectsUnknown {
@@ -2165,7 +2167,7 @@ fn mark_executable_for_shebang(path: &Path, content: &[u8]) -> bool {
 	if !content.starts_with(b"#!") {
 		return false;
 	}
-	let Ok(metadata) = std::fs::metadata(path) else {
+	let Ok(metadata) = std_fs::metadata(path) else {
 		return false;
 	};
 	let current = metadata.permissions().mode();
@@ -2175,7 +2177,7 @@ fn mark_executable_for_shebang(path: &Path, content: &[u8]) -> bool {
 	}
 	let mut permissions = metadata.permissions();
 	permissions.set_mode(next);
-	std::fs::set_permissions(path, permissions).is_ok()
+	std_fs::set_permissions(path, permissions).is_ok()
 }
 
 #[cfg(not(unix))]
@@ -2187,6 +2189,10 @@ fn mark_executable_for_shebang(_path: &Path, _content: &[u8]) -> bool {
 mod tests {
 	use std::fmt::Write as _;
 
+	use omp_proto::document::v1::{
+		client_frame, move_with_content_mutation::DestinationPrecondition, server_frame,
+	};
+
 	use super::*;
 
 	#[test]
@@ -2196,7 +2202,7 @@ mod tests {
 		{
 			let error = omp_docserver::Error::Persistence {
 				path:   PathBuf::from("/target"),
-				source: std::io::Error::from_raw_os_error(errno),
+				source: io::Error::from_raw_os_error(errno),
 			};
 			let classified = classify_privileged(error);
 			let actual = match classified {
@@ -2227,9 +2233,9 @@ mod tests {
 		let sandbox = tempfile::tempdir().expect("sandbox");
 		let root = sandbox.path().join("root");
 		let outside = sandbox.path().join("outside");
-		std::fs::create_dir_all(&root).expect("root");
-		std::fs::create_dir_all(&outside).expect("outside");
-		std::fs::write(outside.join("secret"), b"secret").expect("outside file");
+		std_fs::create_dir_all(&root).expect("root");
+		std_fs::create_dir_all(&outside).expect("outside");
+		std_fs::write(outside.join("secret"), b"secret").expect("outside file");
 		symlink(&outside, root.join("link")).expect("symlink");
 		assert!(ensure_canonical_containment(&root, &root.join("link/secret"), false).is_err());
 	}
@@ -2260,7 +2266,7 @@ mod tests {
 			StalePolicy::RebaseNonOverlapping,
 			FormatPolicy::BestEffort,
 		);
-		let Some(pb::text_mutation::Change::ProposedContent(content)) = mutation.change else {
+		let Some(text_mutation::Change::ProposedContent(content)) = mutation.change else {
 			panic!("expected proposed content");
 		};
 		assert_eq!(content, payload);
@@ -2280,7 +2286,7 @@ mod tests {
 			"file:///workspace/destination.txt".to_owned(),
 			FormatPolicy::BestEffort,
 		);
-		let pb::document_mutation::Operation::MoveWithContent(movement) = operation else {
+		let document_mutation::Operation::MoveWithContent(movement) = operation else {
 			panic!("changed move must be one atomic move-with-content mutation");
 		};
 		assert_eq!(movement.base_revision, Some(revision));
@@ -2289,9 +2295,7 @@ mod tests {
 		assert_eq!(movement.format_policy, pb::FormatPolicy::BestEffort as i32);
 		assert!(matches!(
 			movement.destination_precondition,
-			Some(pb::move_with_content_mutation::DestinationPrecondition::DestinationMustNotExist(
-				true
-			))
+			Some(DestinationPrecondition::DestinationMustNotExist(true))
 		));
 	}
 
@@ -2330,14 +2334,14 @@ mod tests {
 	fn plain_write_resolution_accepts_absolute_and_parent_relative_targets() {
 		let sandbox = tempfile::tempdir().expect("sandbox");
 		let root = sandbox.path().join("workspace");
-		std::fs::create_dir_all(&root).expect("workspace");
+		std_fs::create_dir_all(&root).expect("workspace");
 		let existing = root.join("existing.txt");
-		std::fs::write(&existing, "existing").expect("existing file");
+		std_fs::write(&existing, "existing").expect("existing file");
 		let resolved = resolve_plain_write_from_root(&root, "existing.txt").expect("existing target");
-		assert_eq!(resolved.path, std::fs::canonicalize(&existing).expect("canonical existing file"));
+		assert_eq!(resolved.path, std_fs::canonicalize(&existing).expect("canonical existing file"));
 		assert!(resolved.use_document_host);
 		let absolute = sandbox.path().join("outside").join("file.txt");
-		let canonical_sandbox = std::fs::canonicalize(sandbox.path()).expect("canonical sandbox");
+		let canonical_sandbox = std_fs::canonicalize(sandbox.path()).expect("canonical sandbox");
 		let resolved = resolve_plain_write_from_root(&root, absolute.to_str().expect("UTF-8 path"))
 			.expect("absolute target");
 		assert_eq!(resolved.path, canonical_sandbox.join("outside/file.txt"));
@@ -2368,12 +2372,12 @@ mod tests {
 
 		let sandbox = tempfile::tempdir().expect("sandbox");
 		let path = sandbox.path().join("script.sh");
-		std::fs::write(&path, b"old").expect("seed file");
-		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("seed mode");
+		std_fs::write(&path, b"old").expect("seed file");
+		std_fs::set_permissions(&path, std_fs::Permissions::from_mode(0o640)).expect("seed mode");
 		atomic_write_plain(&path, &Bytes::from_static(b"#!/bin/sh\nexit 0\n"))
 			.expect("atomic overwrite");
 		assert_eq!(
-			std::fs::metadata(&path)
+			std_fs::metadata(&path)
 				.expect("metadata")
 				.permissions()
 				.mode() & 0o777,
@@ -2381,19 +2385,19 @@ mod tests {
 		);
 		assert!(mark_executable_for_shebang(&path, b"#!/bin/sh\nexit 0\n"));
 		assert_eq!(
-			std::fs::metadata(&path)
+			std_fs::metadata(&path)
 				.expect("metadata")
 				.permissions()
 				.mode() & 0o777,
 			0o751
 		);
-		assert_eq!(std::fs::read(&path).expect("written bytes"), b"#!/bin/sh\nexit 0\n");
+		assert_eq!(std_fs::read(&path).expect("written bytes"), b"#!/bin/sh\nexit 0\n");
 
 		let created = sandbox.path().join("created.sh");
 		atomic_write_plain(&created, &Bytes::from_static(b"#!/bin/sh\n")).expect("atomic create");
 		assert!(mark_executable_for_shebang(&created, b"#!/bin/sh\n"));
 		assert_eq!(
-			std::fs::metadata(&created)
+			std_fs::metadata(&created)
 				.expect("created metadata")
 				.permissions()
 				.mode() & 0o111,
@@ -2414,14 +2418,16 @@ mod tests {
 		let b_path = root.path().join("b.txt");
 		let a_uri = Url::from_file_path(&a_path).expect("a URI").to_string();
 		let b_uri = Url::from_file_path(&b_path).expect("b URI").to_string();
-		let (client, server) = tokio::io::duplex(64 * 1024);
-		let (server_release, server_hold) = tokio::sync::oneshot::channel();
+		use tokio::{io, sync::oneshot};
+
+		let (client, server) = io::duplex(64 * 1024);
+		let (server_release, server_hold) = oneshot::channel();
 		let server_task = tokio::spawn({
 			let root_uri = root_uri.clone();
 			let a_uri = a_uri.clone();
 			let b_uri = b_uri.clone();
 			async move {
-				let (mut reader, mut writer) = tokio::io::split(server);
+				let (mut reader, mut writer) = io::split(server);
 				let config = FrameConfig::default();
 				let mut read_scratch = BytesMut::new();
 				let mut write_scratch = BytesMut::new();
@@ -2434,7 +2440,7 @@ mod tests {
 					&mut writer,
 					&pb::ServerFrame {
 						request_id: 0,
-						body:       Some(pb::server_frame::Body::Hello(pb::ServerHello {
+						body:       Some(server_frame::Body::Hello(pb::ServerHello {
 							protocol_major: omp_docserver::connection::PROTOCOL_MAJOR,
 							protocol_minor: omp_docserver::connection::PROTOCOL_MINOR,
 							workspace_id: Bytes::from_static(b"workspace"),
@@ -2458,7 +2464,7 @@ mod tests {
 						&mut writer,
 						&pb::ServerFrame {
 							request_id: open.request_id,
-							body:       Some(pb::server_frame::Body::DocumentOpened(
+							body:       Some(server_frame::Body::DocumentOpened(
 								pb::OpenDocumentResponse {
 									lease_id: Bytes::from(vec![index as u8 + 1; 16]),
 									head:     Some(test_document_head(
@@ -2482,7 +2488,7 @@ mod tests {
 					.await
 					.expect("read edit transaction")
 					.expect("edit transaction");
-				let Some(pb::client_frame::Body::CommitTransaction(first_request)) = first.body else {
+				let Some(client_frame::Body::CommitTransaction(first_request)) = first.body else {
 					panic!("expected edit transaction");
 				};
 				assert_eq!(first_request.operations.len(), 2);
@@ -2490,30 +2496,28 @@ mod tests {
 					&mut writer,
 					&pb::ServerFrame {
 						request_id: first.request_id,
-						body:       Some(pb::server_frame::Body::TransactionResult(
+						body:       Some(server_frame::Body::TransactionResult(
 							pb::CommitTransactionResponse {
-								outcome: Some(
-									pb::commit_transaction_response::Outcome::PartiallyCommitted(
-										pb::TransactionPartiallyCommitted {
-											transaction_id:         first_request.transaction_id,
-											committed_operations:   vec![pb::OperationResult {
-												operation_index: 0,
-												head: Some(test_document_head(
-													a_uri.clone(),
-													1,
-													2,
-													30,
-													b"new-a\n".len(),
-												)),
-												..Default::default()
-											}],
-											failed_operation_index: 1,
-											reason:
-												pb::TransactionRejectReason::PreconditionFailed as i32,
-											message:                "late rejection".into(),
-										},
-									),
-								),
+								outcome: Some(commit_transaction_response::Outcome::PartiallyCommitted(
+									pb::TransactionPartiallyCommitted {
+										transaction_id:         first_request.transaction_id,
+										committed_operations:   vec![pb::OperationResult {
+											operation_index: 0,
+											head: Some(test_document_head(
+												a_uri.clone(),
+												1,
+												2,
+												30,
+												b"new-a\n".len(),
+											)),
+											..Default::default()
+										}],
+										failed_operation_index: 1,
+										reason:
+											pb::TransactionRejectReason::PreconditionFailed as i32,
+										message:                "late rejection".into(),
+									},
+								)),
 							},
 						)),
 					},
@@ -2527,27 +2531,27 @@ mod tests {
 					.await
 					.expect("read rollback")
 					.expect("rollback frame");
-				let Some(pb::client_frame::Body::CommitTransaction(rollback_request)) = rollback.body
+				let Some(client_frame::Body::CommitTransaction(rollback_request)) = rollback.body
 				else {
 					panic!("expected rollback transaction");
 				};
 				assert_eq!(rollback_request.operations.len(), 1);
-				let Some(pb::document_mutation::Operation::Text(text)) =
+				let Some(document_mutation::Operation::Text(text)) =
 					rollback_request.operations[0].operation.as_ref()
 				else {
 					panic!("rollback must restore original text");
 				};
 				assert_eq!(
 					text.change,
-					Some(pb::text_mutation::Change::ProposedContent(Bytes::from_static(b"old\n")))
+					Some(text_mutation::Change::ProposedContent(Bytes::from_static(b"old\n")))
 				);
 				write_server_frame(
 					&mut writer,
 					&pb::ServerFrame {
 						request_id: rollback.request_id,
-						body:       Some(pb::server_frame::Body::TransactionResult(
+						body:       Some(server_frame::Body::TransactionResult(
 							pb::CommitTransactionResponse {
-								outcome: Some(pb::commit_transaction_response::Outcome::Committed(
+								outcome: Some(commit_transaction_response::Outcome::Committed(
 									pb::TransactionCommitted {
 										transaction_id: rollback_request.transaction_id,
 										operations:     vec![pb::OperationResult {
@@ -2863,13 +2867,10 @@ fn write_archive_member_blocking(
 	display_path: &str,
 	content: Bytes,
 	control: &SpecialWriteControl,
-) -> Result<Option<omp_tools::write::backends::ResultPayload>, omp_tools::write::backends::Fault> {
-	use omp_tools::{
-		read::archive::ArchiveFormat,
-		write::backends::{
-			ResultPayload, archive_targets, create_tar_member, create_zip_member,
-			empty_archive_selector_misfire, format_for_path, rewrite_tar_member, rewrite_zip_member,
-		},
+) -> Result<Option<backends::ResultPayload>, backends::Fault> {
+	use omp_tools::write::backends::{
+		ResultPayload, archive_targets, create_tar_member, create_zip_member,
+		empty_archive_selector_misfire, format_for_path, rewrite_tar_member, rewrite_zip_member,
 	};
 
 	let candidates = archive_targets(display_path)?;
@@ -2879,13 +2880,13 @@ fn write_archive_member_blocking(
 	let mut resolved = Vec::with_capacity(candidates.len());
 	for candidate in candidates {
 		let absolute = resolve_special_write_path(host, &candidate.archive_path)?;
-		match std::fs::metadata(&absolute) {
+		match std_fs::metadata(&absolute) {
 			Ok(metadata) if metadata.is_file() => {
 				resolved.push((candidate, absolute, true));
 				break;
 			},
 			Ok(_) => resolved.push((candidate, absolute, false)),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {
 				resolved.push((candidate, absolute, false));
 			},
 			Err(error) => return Err(special_fault(error.to_string())),
@@ -2898,11 +2899,11 @@ fn write_archive_member_blocking(
 		.or_else(|| resolved.last().cloned())
 		.expect("archive candidates are non-empty");
 	let final_path = if exists {
-		std::fs::canonicalize(&authored_path).unwrap_or_else(|_| authored_path.clone())
+		std_fs::canonicalize(&authored_path).unwrap_or_else(|_| authored_path.clone())
 	} else {
 		authored_path
 	};
-	if format_for_path(&final_path) == ArchiveFormat::Asar {
+	if format_for_path(&final_path) == archive::ArchiveFormat::Asar {
 		return Err(special_fault("ASAR archives are read-only"));
 	}
 	let member_existed = if exists {
@@ -2919,49 +2920,48 @@ fn write_archive_member_blocking(
 		return Err(special_write_cancelled());
 	}
 	if let Some(parent) = final_path.parent() {
-		std::fs::create_dir_all(parent).map_err(|error| special_fault(error.to_string()))?;
+		std_fs::create_dir_all(parent).map_err(|error| special_fault(error.to_string()))?;
 	}
 	atomic_replace(&final_path, |output| match (format_for_path(&final_path), exists) {
-		(ArchiveFormat::Zip, true) => {
+		(archive::ArchiveFormat::Zip, true) => {
 			let input =
-				std::fs::File::open(&final_path).map_err(|error| special_fault(error.to_string()))?;
+				std_fs::File::open(&final_path).map_err(|error| special_fault(error.to_string()))?;
 			rewrite_zip_member(input, output, &target.member_path, &content)
 		},
-		(ArchiveFormat::Zip, false) => create_zip_member(output, &target.member_path, &content),
-		(ArchiveFormat::Tar, true) => {
+		(archive::ArchiveFormat::Zip, false) => {
+			create_zip_member(output, &target.member_path, &content)
+		},
+		(archive::ArchiveFormat::Tar, true) => {
 			let input =
-				std::fs::File::open(&final_path).map_err(|error| special_fault(error.to_string()))?;
+				std_fs::File::open(&final_path).map_err(|error| special_fault(error.to_string()))?;
 			rewrite_tar_member(input, output, &target.member_path, &content)
 		},
-		(ArchiveFormat::Tar, false) => create_tar_member(output, &target.member_path, &content),
-		(ArchiveFormat::TarGz, true) => {
+		(archive::ArchiveFormat::Tar, false) => {
+			create_tar_member(output, &target.member_path, &content)
+		},
+		(archive::ArchiveFormat::TarGz, true) => {
 			let input =
-				std::fs::File::open(&final_path).map_err(|error| special_fault(error.to_string()))?;
-			let mut decoder = flate2::read::GzDecoder::new(input);
-			let limit = omp_tools::read::archive::MAX_TAR_ARCHIVE_BYTES;
+				std_fs::File::open(&final_path).map_err(|error| special_fault(error.to_string()))?;
+			let mut decoder = GzDecoder::new(input);
+			let limit = archive::MAX_TAR_ARCHIVE_BYTES;
 			let mut decoded = Vec::new();
-			let mut bounded = std::io::Read::take(&mut decoder, limit.saturating_add(1));
-			std::io::Read::read_to_end(&mut bounded, &mut decoded)
+			let mut bounded = io::Read::take(&mut decoder, limit.saturating_add(1));
+			io::Read::read_to_end(&mut bounded, &mut decoded)
 				.map_err(|error| special_fault(error.to_string()))?;
 			if decoded.len() as u64 > limit {
 				return Err(special_fault(
 					omp_ar::Error::ArchiveTooLarge { actual: decoded.len() as u64, limit }.to_string(),
 				));
 			}
-			let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
-			rewrite_tar_member(
-				std::io::Cursor::new(decoded),
-				&mut encoder,
-				&target.member_path,
-				&content,
-			)?;
+			let mut encoder = GzEncoder::new(output, flate2::Compression::default());
+			rewrite_tar_member(io::Cursor::new(decoded), &mut encoder, &target.member_path, &content)?;
 			encoder
 				.finish()
 				.map_err(|error| special_fault(error.to_string()))?;
 			Ok(())
 		},
-		(ArchiveFormat::TarGz, false) => {
-			let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
+		(archive::ArchiveFormat::TarGz, false) => {
+			let mut encoder = GzEncoder::new(output, flate2::Compression::default());
 			create_tar_member(&mut encoder, &target.member_path, &content)?;
 			encoder
 				.finish()
@@ -2973,7 +2973,7 @@ fn write_archive_member_blocking(
 		},
 	})?;
 
-	let canonical = std::fs::canonicalize(&final_path).unwrap_or(final_path);
+	let canonical = std_fs::canonicalize(&final_path).unwrap_or(final_path);
 	let canonical_key = canonical.to_string_lossy().into_owned();
 	let member_key = format!("{canonical_key}:{}", target.member_path);
 	let _snapshot_tag = {
@@ -2984,7 +2984,7 @@ fn write_archive_member_blocking(
 		if content.len() <= SNAPSHOT_MAX_BYTES {
 			let revision = RevisionToken::new(Hash32::sum(&content).as_bytes());
 			snapshots
-				.record(member_key, revision, content.clone(), std::iter::empty())
+				.record(member_key, revision, content.clone(), iter::empty())
 				.ok()
 		} else {
 			None
@@ -3000,23 +3000,23 @@ fn write_archive_member_blocking(
 		} else {
 			WriteDisposition::Created
 		},
-		operation:     omp_tools::write::WriteOperation::ArchiveMember,
+		operation:     WriteOperation::ArchiveMember,
 		snapshot_tag:  None,
 	}))
 }
 
 fn archive_member_exists(
 	path: &Path,
-	format: omp_tools::read::archive::ArchiveFormat,
+	format: archive::ArchiveFormat,
 	member: &str,
-) -> Result<bool, omp_tools::write::backends::Fault> {
+) -> Result<bool, backends::Fault> {
 	if !matches!(format, omp_ar::Format::Zip | omp_ar::Format::Tar | omp_ar::Format::TarGz) {
 		return Err(special_fault(format!(
 			"{} archives are read-only",
 			<&'static str>::from(format)
 		)));
 	}
-	let file = std::fs::File::open(path).map_err(|error| special_fault(error.to_string()))?;
+	let file = std_fs::File::open(path).map_err(|error| special_fault(error.to_string()))?;
 	let archive = omp_ar::Archive::with_format(file, format)
 		.map_err(|error| special_fault(error.to_string()))?;
 	Ok(archive
@@ -3030,7 +3030,7 @@ fn write_sqlite_row_blocking(
 	content: &str,
 	control: &SpecialWriteControl,
 	interrupt: &SqliteWriteInterrupt,
-) -> Result<Option<omp_tools::write::backends::ResultPayload>, omp_tools::write::backends::Fault> {
+) -> Result<Option<backends::ResultPayload>, backends::Fault> {
 	use omp_tools::{
 		read::looks_like_sqlite,
 		write::backends::{ResultPayload, mutate_sqlite_row, sqlite_targets},
@@ -3047,11 +3047,11 @@ fn write_sqlite_row_blocking(
 	for candidate in candidates {
 		let absolute = resolve_special_write_path(host, &candidate.sqlite_path)?;
 		fallback = Some((candidate.clone(), absolute.clone()));
-		match std::fs::metadata(&absolute) {
+		match std_fs::metadata(&absolute) {
 			Ok(metadata) if metadata.is_file() => {
 				let mut prefix = [0_u8; 16];
-				let sqlite = std::fs::File::open(&absolute)
-					.and_then(|mut file| std::io::Read::read_exact(&mut file, &mut prefix))
+				let sqlite = std_fs::File::open(&absolute)
+					.and_then(|mut file| io::Read::read_exact(&mut file, &mut prefix))
 					.is_ok() && looks_like_sqlite(&prefix);
 				if sqlite {
 					selected = Some((candidate, absolute));
@@ -3060,7 +3060,7 @@ fn write_sqlite_row_blocking(
 				saw_existing_non_sqlite = true;
 			},
 			Ok(_) => {},
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 			Err(error) => return Err(special_fault(error.to_string())),
 		}
 	}
@@ -3089,7 +3089,7 @@ fn write_sqlite_row_blocking(
 	}
 	let mutation = mutate_sqlite_row(&mut connection, &target, content)?;
 	drop(connection);
-	let canonical = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+	let canonical = std_fs::canonicalize(&absolute).unwrap_or(absolute);
 	let canonical_key = canonical.to_string_lossy().into_owned();
 	host.snapshot_store().lock().invalidate(&canonical_key);
 	Ok(Some(ResultPayload {
@@ -3105,7 +3105,7 @@ fn write_sqlite_row_blocking(
 fn resolve_special_write_path(
 	host: &DocumentHost,
 	input: &str,
-) -> Result<PathBuf, omp_tools::write::backends::Fault> {
+) -> Result<PathBuf, backends::Fault> {
 	let root_url = Url::parse(host.hello().root_uri.as_str()).map_err(|error| {
 		special_fault(format!("document workspace root is not a valid URI: {error}"))
 	})?;
@@ -3115,7 +3115,7 @@ fn resolve_special_write_path(
 			.map_err(|()| special_fault("document workspace root is not a local file URI"))?,
 	)
 	.map_err(special_fault)?;
-	let authored = omp_tools::read::selector::expand_tilde(input, None);
+	let authored = selector::expand_tilde(input, None);
 	let candidate = if authored.is_absolute() {
 		normalize_absolute(&authored)
 	} else {
@@ -3124,13 +3124,10 @@ fn resolve_special_write_path(
 	.map_err(special_fault)?;
 	let mut ancestor = candidate.as_path();
 	let canonical_ancestor = loop {
-		match std::fs::canonicalize(ancestor) {
+		match std_fs::canonicalize(ancestor) {
 			Ok(canonical) => break canonical,
 			Err(error)
-				if matches!(
-					error.kind(),
-					std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-				) =>
+				if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) =>
 			{
 				ancestor = ancestor
 					.parent()
@@ -3147,20 +3144,20 @@ fn resolve_special_write_path(
 
 fn atomic_replace(
 	path: &Path,
-	write: impl FnOnce(std::fs::File) -> Result<(), omp_tools::write::backends::Fault>,
-) -> Result<(), omp_tools::write::backends::Fault> {
+	write: impl FnOnce(std_fs::File) -> Result<(), backends::Fault>,
+) -> Result<(), backends::Fault> {
 	let tmp_path = unique_temp_path(path);
-	let output = std::fs::OpenOptions::new()
+	let output = OpenOptions::new()
 		.write(true)
 		.create_new(true)
 		.open(&tmp_path)
 		.map_err(|error| special_fault(error.to_string()))?;
 	if let Err(error) = write(output) {
-		let _ = std::fs::remove_file(&tmp_path);
+		let _ = std_fs::remove_file(&tmp_path);
 		return Err(error);
 	}
-	if let Err(error) = std::fs::rename(&tmp_path, path) {
-		let _ = std::fs::remove_file(&tmp_path);
+	if let Err(error) = std_fs::rename(&tmp_path, path) {
+		let _ = std_fs::remove_file(&tmp_path);
 		return Err(special_fault(error.to_string()));
 	}
 	Ok(())
@@ -3176,17 +3173,18 @@ fn unique_temp_path(path: &Path) -> PathBuf {
 	path.with_file_name(format!(".{name}.tmp-{}-{sequence}", std::process::id()))
 }
 
-fn special_write_cancelled() -> omp_tools::write::backends::Fault {
+fn special_write_cancelled() -> backends::Fault {
 	special_fault("special write cancelled before mutation began")
 }
 
-fn special_fault(message: impl Into<Str>) -> omp_tools::write::backends::Fault {
-	omp_tools::write::backends::Fault { message: message.into() }
+fn special_fault(message: impl Into<Str>) -> backends::Fault {
+	backends::Fault { message: message.into() }
 }
 
 #[cfg(test)]
 mod special_write_tests {
 	use std::{
+		fs as std_fs,
 		io::Write as _,
 		sync::{
 			Arc,
@@ -3196,9 +3194,11 @@ mod special_write_tests {
 	};
 
 	use omp_tools::write::{SpecialWriteCancellation, SpecialWriteControl};
+	use tokio::{task, time};
 
 	use super::{
-		atomic_replace, run_special_write_blocking, special_fault, special_write_cancelled,
+		SqliteWriteInterrupt, atomic_replace, run_special_write_blocking, special_fault,
+		special_write_cancelled,
 	};
 
 	#[tokio::test(flavor = "current_thread")]
@@ -3221,21 +3221,20 @@ mod special_write_tests {
 			})
 			.await
 		});
-
-		tokio::time::timeout(Duration::from_secs(1), started_rx.recv_async())
+		time::timeout(Duration::from_secs(1), started_rx.recv_async())
 			.await
 			.expect("blocking worker starts without pinning the runtime")
 			.expect("worker start channel remains live");
 		let heartbeat = tokio::spawn(async {
-			tokio::task::yield_now().await;
+			task::yield_now().await;
 		});
-		tokio::time::timeout(Duration::from_secs(1), heartbeat)
+		time::timeout(Duration::from_secs(1), heartbeat)
 			.await
 			.expect("runtime remains responsive while worker is stalled")
 			.expect("heartbeat joins");
 		assert_eq!(control.cancel(), SpecialWriteCancellation::BeforeEffects);
 		release_tx.send(()).expect("release worker");
-		let result = tokio::time::timeout(Duration::from_secs(1), task)
+		let result = time::timeout(Duration::from_secs(1), task)
 			.await
 			.expect("cancelled worker finishes")
 			.expect("worker task joins");
@@ -3265,13 +3264,13 @@ mod special_write_tests {
 			.await
 		});
 
-		tokio::time::timeout(Duration::from_secs(1), started_rx.recv_async())
+		time::timeout(Duration::from_secs(1), started_rx.recv_async())
 			.await
 			.expect("worker reaches effect boundary")
 			.expect("effect boundary channel remains live");
 		assert_eq!(control.cancel(), SpecialWriteCancellation::EffectsUnknown);
 		release_tx.send(()).expect("release worker");
-		tokio::time::timeout(Duration::from_secs(1), task)
+		time::timeout(Duration::from_secs(1), task)
 			.await
 			.expect("worker finishes")
 			.expect("worker task joins")
@@ -3282,10 +3281,10 @@ mod special_write_tests {
 	async fn sqlite_interrupt_handle_stops_an_active_operation() {
 		let (started_tx, started_rx) = flume::bounded(1);
 		let control = SpecialWriteControl::new();
-		let interrupt = Arc::new(super::SqliteWriteInterrupt::default());
+		let interrupt = Arc::new(SqliteWriteInterrupt::default());
 		let task_control = control.clone();
 		let task_interrupt = Arc::clone(&interrupt);
-		let worker = tokio::task::spawn_blocking(move || {
+		let worker = task::spawn_blocking(move || {
 			let connection = rusqlite::Connection::open_in_memory().expect("open SQLite fixture");
 			let progress = task_control.clone();
 			connection
@@ -3312,12 +3311,12 @@ mod special_write_tests {
 			waiter_interrupt.interrupt();
 		});
 
-		tokio::time::timeout(Duration::from_secs(1), started_rx.recv_async())
+		time::timeout(Duration::from_secs(1), started_rx.recv_async())
 			.await
 			.expect("SQLite worker starts")
 			.expect("SQLite start channel remains live");
 		assert_eq!(control.cancel(), SpecialWriteCancellation::EffectsUnknown);
-		let error = tokio::time::timeout(Duration::from_secs(1), worker)
+		let error = time::timeout(Duration::from_secs(1), worker)
 			.await
 			.expect("SQLite interrupt stops active operation promptly")
 			.expect("SQLite worker joins");
@@ -3336,21 +3335,21 @@ mod special_write_tests {
 	fn atomic_archive_swap_commits_complete_output() {
 		let directory = tempfile::tempdir().unwrap();
 		let archive = directory.path().join("fixture.zip");
-		std::fs::write(&archive, b"old archive").unwrap();
+		std_fs::write(&archive, b"old archive").unwrap();
 		atomic_replace(&archive, |mut output| {
 			output
 				.write_all(b"complete new archive")
 				.map_err(|error| special_fault(error.to_string()))
 		})
 		.unwrap();
-		assert_eq!(std::fs::read(&archive).unwrap(), b"complete new archive");
+		assert_eq!(std_fs::read(&archive).unwrap(), b"complete new archive");
 	}
 
 	#[test]
 	fn atomic_archive_swap_rolls_back_partial_output() {
 		let directory = tempfile::tempdir().unwrap();
 		let archive = directory.path().join("fixture.zip");
-		std::fs::write(&archive, b"old archive").unwrap();
+		std_fs::write(&archive, b"old archive").unwrap();
 		let result = atomic_replace(&archive, |mut output| {
 			output
 				.write_all(b"partial")
@@ -3358,7 +3357,7 @@ mod special_write_tests {
 			Err(special_fault("injected archive encoder failure"))
 		});
 		assert_eq!(result.unwrap_err().to_string(), "injected archive encoder failure");
-		assert_eq!(std::fs::read(&archive).unwrap(), b"old archive");
-		assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+		assert_eq!(std_fs::read(&archive).unwrap(), b"old archive");
+		assert_eq!(std_fs::read_dir(directory.path()).unwrap().count(), 1);
 	}
 }

@@ -1,13 +1,13 @@
 //! Owner-local and bearer-authenticated TCP OMP daemon endpoints.
 use std::{
-	fmt,
+	fmt::{self, Display},
 	net::{AddrParseError, SocketAddr},
 	path::{Path, PathBuf},
 	str::FromStr,
 };
 
 use omp_core::Str;
-use tonic::transport::Channel;
+use tonic::{transport, transport::Channel};
 
 /// RPC endpoint represented by an owner-local socket/pipe or authenticated TCP.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,7 +50,7 @@ impl LocalEndpoint {
 			Self::Local(path) => omp_rpc::uds::connect(path)
 				.await
 				.map_err(EndpointConnectError::Local),
-			Self::Tcp(address) => tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+			Self::Tcp(address) => transport::Endpoint::from_shared(format!("http://{address}"))
 				.map_err(EndpointConnectError::Uri)?
 				.connect()
 				.await
@@ -65,7 +65,7 @@ impl From<PathBuf> for LocalEndpoint {
 	}
 }
 
-impl fmt::Display for LocalEndpoint {
+impl Display for LocalEndpoint {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Local(path) => path.display().fmt(formatter),
@@ -93,10 +93,10 @@ pub enum EndpointConnectError {
 	Local(#[source] omp_rpc::Error),
 	/// TCP endpoint URI construction failed.
 	#[error("OMP TCP endpoint URI is invalid")]
-	Uri(#[source] tonic::transport::Error),
+	Uri(#[source] transport::Error),
 	/// TCP transport connection failed.
 	#[error("could not connect to OMP TCP endpoint")]
-	Tcp(#[source] tonic::transport::Error),
+	Tcp(#[source] transport::Error),
 }
 
 impl FromStr for LocalEndpoint {

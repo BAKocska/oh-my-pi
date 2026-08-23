@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-use std::{fmt::Write as _, sync::Arc};
+use std::{fmt::Write as _, str, sync::Arc};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
@@ -19,7 +19,10 @@ use omp_inference::{
 	provider::fake::FakeScript,
 	receipt::{ExecutionReceipt, Usage},
 };
-use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1::{self as pb, value},
+	thread::v1::{self as thread_pb, item},
+};
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{
 	CapsBase, Claims, Constraint, Effects, Ev, IncomingParams, LiftedCall, LoweringCaps, ModelClass,
@@ -192,22 +195,22 @@ fn core_claims() -> Claims {
 
 fn json_proto_value(value: Value) -> pb::Value {
 	let kind = match value {
-		Value::Null => pb::value::Kind::Null(true),
-		Value::Bool(value) => pb::value::Kind::Bool(value),
+		Value::Null => value::Kind::Null(true),
+		Value::Bool(value) => value::Kind::Bool(value),
 		Value::Number(value) => {
 			if let Some(value) = value.as_i64() {
-				pb::value::Kind::Int(value)
+				value::Kind::Int(value)
 			} else if let Some(value) = value.as_u64() {
-				pb::value::Kind::Uint(value)
+				value::Kind::Uint(value)
 			} else {
-				pb::value::Kind::Double(value.as_f64().expect("fixture numbers are finite"))
+				value::Kind::Double(value.as_f64().expect("fixture numbers are finite"))
 			}
 		},
-		Value::String(value) => pb::value::Kind::String(value),
-		Value::Array(values) => pb::value::Kind::List(pb::ValueList {
+		Value::String(value) => value::Kind::String(value),
+		Value::Array(values) => value::Kind::List(pb::ValueList {
 			values: values.into_iter().map(json_proto_value).collect(),
 		}),
-		Value::Object(fields) => pb::value::Kind::Map(pb::ValueMap {
+		Value::Object(fields) => value::Kind::Map(pb::ValueMap {
 			fields: fields
 				.into_iter()
 				.map(|(key, value)| (key, json_proto_value(value)))
@@ -227,7 +230,7 @@ fn props(fields: impl IntoIterator<Item = (&'static str, pb::Value)>) -> pb::Val
 }
 
 fn string_value(value: &str) -> pb::Value {
-	pb::Value { kind: Some(pb::value::Kind::String(value.to_owned())) }
+	pb::Value { kind: Some(value::Kind::String(value.to_owned())) }
 }
 
 fn recorded_verdict(branch: &str, marker: &str, line: i64) -> Value {
@@ -252,7 +255,7 @@ fn historical_items() -> Vec<thread_pb::Item> {
 			thread_pb::Item {
 				seq:           0,
 				created_at_ms: u64::try_from(line).expect("positive fixture line"),
-				kind:          Some(thread_pb::item::Kind::ToolCall(thread_pb::ToolCall {
+				kind:          Some(item::Kind::ToolCall(thread_pb::ToolCall {
 					id: id.to_owned(),
 					name: "edit".to_owned(),
 					args_json: Bytes::from(
@@ -270,7 +273,7 @@ fn historical_items() -> Vec<thread_pb::Item> {
 					(
 						"fixture/recorded-tool-schema",
 						string_value(
-							std::str::from_utf8(HL1_SCHEMA).expect("historical schema fixture is UTF-8"),
+							str::from_utf8(HL1_SCHEMA).expect("historical schema fixture is UTF-8"),
 						),
 					),
 				])),
@@ -278,7 +281,7 @@ fn historical_items() -> Vec<thread_pb::Item> {
 			thread_pb::Item {
 				seq:           0,
 				created_at_ms: u64::try_from(line + 1).expect("positive fixture line"),
-				kind:          Some(thread_pb::item::Kind::ToolResult(thread_pb::ToolResult {
+				kind:          Some(item::Kind::ToolResult(thread_pb::ToolResult {
 					call_id: id.to_owned(),
 					name: "edit".to_owned(),
 					parts: vec![thread_pb::Part {
@@ -439,7 +442,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 		.and_then(|value| value.kind.as_ref());
 	assert!(matches!(
 		recorded_schema,
-		Some(pb::value::Kind::String(schema))
+		Some(value::Kind::String(schema))
 			if schema.as_bytes() == HL1_SCHEMA
 	));
 	assert!(
@@ -528,11 +531,11 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 
 	for (ordinal, pair) in first.items.as_chunks::<2>().0.iter().enumerate() {
 		let call = match pair[0].kind.as_ref() {
-			Some(thread_pb::item::Kind::ToolCall(call)) => call,
+			Some(item::Kind::ToolCall(call)) => call,
 			other => panic!("expected lifted tool call, got {other:?}"),
 		};
 		let result = match pair[1].kind.as_ref() {
-			Some(thread_pb::item::Kind::ToolResult(result)) => result,
+			Some(item::Kind::ToolResult(result)) => result,
 			other => panic!("expected lifted tool result, got {other:?}"),
 		};
 		let expected_marker = if ordinal == 0 {
@@ -557,7 +560,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 				.as_ref()
 				.and_then(|props| props.fields.get("omp/tool-rev"))
 				.and_then(|value| value.kind.as_ref()),
-			Some(pb::value::Kind::String(rev)) if rev == "hl.2"
+			Some(value::Kind::String(rev)) if rev == "hl.2"
 		));
 		assert!(matches!(
 			pair[0]
@@ -565,7 +568,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 				.as_ref()
 				.and_then(|props| props.fields.get("fixture/call-meta"))
 				.and_then(|value| value.kind.as_ref()),
-			Some(pb::value::Kind::String(nonce)) if nonce == expected_nonce
+			Some(value::Kind::String(nonce)) if nonce == expected_nonce
 		));
 		assert_eq!(result.is_error, expected_error, "error branch must be recomputed");
 		assert_eq!(result.useless, Some(expected_useless), "recorded useless metadata survives");
@@ -575,7 +578,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 				.as_ref()
 				.and_then(|props| props.fields.get("omp/tool-rev"))
 				.and_then(|value| value.kind.as_ref()),
-			Some(pb::value::Kind::String(rev)) if rev == "hl.2"
+			Some(value::Kind::String(rev)) if rev == "hl.2"
 		));
 		assert_eq!(
 			result.details,
@@ -603,7 +606,7 @@ async fn historical_edit_schema_is_isolated_and_lifts_from_recorded_truth() {
 				.as_ref()
 				.and_then(|props| props.fields.get("fixture/result-meta"))
 				.and_then(|value| value.kind.as_ref()),
-			Some(pb::value::Kind::String(marker)) if marker == expected_marker
+			Some(value::Kind::String(marker)) if marker == expected_marker
 		));
 	}
 

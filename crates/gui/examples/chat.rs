@@ -5,10 +5,12 @@
 //! OUT.png`
 
 use std::{
+	env, fs, io,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
+	thread, time,
 	time::{Duration, Instant},
 };
 
@@ -20,15 +22,13 @@ use omp_chat_ui::{
 };
 use omp_core::{Str, sf};
 use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
-use omp_tui::{
-	Frame, Graphics, Key, Layer, Mouse, MouseReport, Size, UiContext, paste::ClipboardRead,
-};
+use omp_tui::{Graphics, Key, Layer, Mouse, MouseReport, Size, UiContext, paste::ClipboardRead};
 use smallvec::SmallVec;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 fn main() {
-	let mut args = std::env::args().skip(1);
+	let mut args = env::args().skip(1);
 	if args.next().as_deref() == Some("--shot") {
 		let scene = args.next().unwrap_or_else(|| "chat".to_string());
 		let out = args
@@ -60,12 +60,9 @@ enum Phase {
 }
 
 struct ChatState {
-	chat:         Chat,
-	sidebar:      Sidebar,
-	overlay:      Option<Overlay>,
-	doc_rows:     u16,
-	preview_size: Option<Size>,
-	preview:      Frame,
+	chat:    Chat,
+	sidebar: Sidebar,
+	overlay: Option<Overlay>,
 }
 
 impl ChatState {
@@ -74,14 +71,7 @@ impl ChatState {
 		let mut chat = Chat::new(ctx);
 		chat.set_status(facts.clone());
 		chat.set_right_inset(sidebar.reserved(viewport));
-		Self {
-			chat,
-			sidebar,
-			overlay: None,
-			doc_rows: 0,
-			preview_size: None,
-			preview: Frame::new(Size::new(0, 0)),
-		}
+		Self { chat, sidebar, overlay: None }
 	}
 }
 
@@ -247,11 +237,10 @@ impl ChatScene {
 }
 
 impl Scene for ChatScene {
-	fn resize(&mut self, viewport: Size, settled: bool) {
+	fn resize(&mut self, viewport: Size, _settled: bool) {
 		self.viewport = viewport;
 		if let Phase::Chat(state) = &mut self.phase {
 			state.chat.set_right_inset(state.sidebar.reserved(viewport));
-			state.preview_size = if settled { None } else { Some(viewport) };
 		}
 	}
 
@@ -274,14 +263,8 @@ impl Scene for ChatScene {
 					layers.push(overlay.layer(viewport));
 				}
 				let editor_rows = state.chat.composer_rows();
-				if state.preview_size.is_some() {
-					state.preview = state.chat.render_resize_preview(viewport);
-					SceneFrame { frame: &state.preview, viewport, editor_rows, layers }
-				} else {
-					let rendered = state.chat.render(viewport);
-					state.doc_rows = rendered.frame.size().height;
-					SceneFrame { frame: rendered.frame, viewport, editor_rows, layers }
-				}
+				let rendered = state.chat.render(viewport);
+				SceneFrame { frame: rendered.frame, viewport, editor_rows, layers }
 			},
 		}
 	}
@@ -373,10 +356,7 @@ impl Scene for ChatScene {
 			.sidebar
 			.handle_mouse(report.col, report.row, report.kind, self.viewport)
 		{
-			let window_top = state.doc_rows.saturating_sub(self.viewport.height);
-			state
-				.chat
-				.handle_mouse(&MouseReport { row: report.row.saturating_add(window_top), ..report });
+			state.chat.handle_mouse(&report);
 		}
 		Effect::Consumed
 	}
@@ -418,7 +398,7 @@ fn palette_entries() -> Vec<PaletteEntry> {
 fn mock_backend() -> (Receiver<BackendEvent>, Sender<Intent>) {
 	let (event_tx, event_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
-	std::thread::spawn(move || run_mock(event_tx, intent_rx));
+	thread::spawn(move || run_mock(event_tx, intent_rx));
 	(event_rx, intent_tx)
 }
 
@@ -449,7 +429,7 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 					}
 					let _ =
 						events.send(BackendEvent::AssistantDelta { id: id.clone(), text: sf!(text) });
-					std::thread::sleep(Duration::from_millis(120));
+					thread::sleep(Duration::from_millis(120));
 				}
 				let tool = Str::from(format!("tool-{turn}"));
 				if generation.load(Ordering::SeqCst) == turn {
@@ -609,15 +589,15 @@ fn shot(name: &str, out: &str) {
 		scene.paste("Show the designed chat scene", false);
 		scene.key(Key::Enter);
 	}
-	std::thread::sleep(wait);
+	thread::sleep(wait);
 	if name == "picker" {
 		scene.key(Key::Ctrl('p'));
 	}
 
 	// Wall-clock seed so successive shots capture different shimmer phases;
 	// the scene's own animations still run off `scene.started`.
-	let now = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	let now = time::SystemTime::now()
+		.duration_since(time::UNIX_EPOCH)
 		.unwrap_or_else(|_| scene.started.elapsed());
 	let frame = scene.render();
 	let view = View {
@@ -705,8 +685,8 @@ fn shot(name: &str, out: &str) {
 			rgba[row * row_bytes as usize..][..row_bytes as usize].copy_from_slice(src);
 		}
 	}
-	let file = std::fs::File::create(out).expect("create output png");
-	let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+	let file = fs::File::create(out).expect("create output png");
+	let mut encoder = png::Encoder::new(io::BufWriter::new(file), width, height);
 	encoder.set_color(png::ColorType::Rgba);
 	encoder.set_depth(png::BitDepth::Eight);
 	encoder

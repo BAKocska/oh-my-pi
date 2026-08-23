@@ -1,7 +1,9 @@
 //! External editor resolution and safe temporary-draft round trips.
 
 use std::{
+	env,
 	fs::{self, File, OpenOptions},
+	io,
 	io::{Read as _, Write as _},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
@@ -46,7 +48,7 @@ pub enum EditorError {
 		path:      PathBuf,
 		/// Underlying operating-system failure.
 		#[source]
-		source:    std::io::Error,
+		source:    io::Error,
 	},
 }
 
@@ -56,8 +58,8 @@ pub enum EditorError {
 /// no shell is invoked.
 pub fn resolve_editor_command() -> String {
 	resolve_editor_command_from(
-		std::env::var("VISUAL").ok().as_deref(),
-		std::env::var("EDITOR").ok().as_deref(),
+		env::var("VISUAL").ok().as_deref(),
+		env::var("EDITOR").ok().as_deref(),
 	)
 }
 
@@ -146,7 +148,7 @@ impl DraftFile {
 		{
 			return Err(EditorError::InvalidExtension);
 		}
-		let directory = std::env::temp_dir();
+		let directory = env::temp_dir();
 		for _ in 0..16 {
 			let path =
 				directory.join(format!("omp-editor-{}.{}", omp_core::Ulid::generate(), extension));
@@ -159,14 +161,14 @@ impl DraftFile {
 			}
 			match options.open(&path) {
 				Ok(file) => return Ok(Self { path, file }),
-				Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
 				Err(source) => return Err(io_error("temporary creation", path, source)),
 			}
 		}
 		Err(io_error(
 			"temporary creation",
 			directory,
-			std::io::Error::new(std::io::ErrorKind::AlreadyExists, "temporary name collision"),
+			io::Error::new(io::ErrorKind::AlreadyExists, "temporary name collision"),
 		))
 	}
 
@@ -203,7 +205,7 @@ impl Drop for DraftFile {
 	}
 }
 
-fn io_error(operation: &'static str, path: PathBuf, source: std::io::Error) -> EditorError {
+fn io_error(operation: &'static str, path: PathBuf, source: io::Error) -> EditorError {
 	EditorError::Io { operation, path, source }
 }
 
@@ -221,12 +223,12 @@ mod tests {
 	}
 
 	impl ExternalEditorTerminal for TerminalProbe {
-		fn suspend_for_external_editor(&mut self) -> std::io::Result<()> {
+		fn suspend_for_external_editor(&mut self) -> io::Result<()> {
 			self.suspended.fetch_add(1, Ordering::Relaxed);
 			Ok(())
 		}
 
-		fn restore_after_external_editor(&mut self) -> std::io::Result<()> {
+		fn restore_after_external_editor(&mut self) -> io::Result<()> {
 			self.restored.fetch_add(1, Ordering::Relaxed);
 			Ok(())
 		}

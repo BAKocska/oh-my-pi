@@ -1,18 +1,34 @@
 //! Typed `OpenAI` Responses wire shapes and sans-I/O event projection.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	mem,
+};
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{Str, sf};
+use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::{
+	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, ProviderStateEvent,
+	RawCompletion, RawEvent, RequestMethod, SizeBounds, ToolInputKind, UnvalidatedToolCall,
+	openai_chat,
+};
 use crate::{
 	answer::{Artifact, ArtifactBody},
-	call::OpaqueJson,
-	event::{BlockKind, ChatEvent, FinishReason, ToolCall},
-	id::ToolCallId,
+	body::BodySource,
+	call::{ChatRequest, MediaInput, OpaqueJson, OperationCall, ToolInputConstraint},
+	catalog::{
+		OperationKind, ProviderId, ReasoningEffort, RouteId, ThinkingEffort,
+		policy::{ApplyPatchWireKind, ComputerUseConfigSupport, ComputerUseWireSupport},
+	},
+	error::Error,
+	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
+	id::{RequestId, ToolCallId},
 	receipt::{Usage, UsageSource},
+	session::StoredProviderStateEvent,
+	transport::{Frame, FramingProtocol},
 };
 
 /// A typed metadata value accepted by the Responses API.
@@ -1111,7 +1127,7 @@ pub enum ResponsesProjection {
 	/// Canonical chat event.
 	Canonical(ChatEvent),
 	/// Terminal chat facts awaiting authoritative receipt accounting.
-	Completion(Box<super::RawCompletion>),
+	Completion(Box<RawCompletion>),
 	/// A provider tool call is complete but not yet schema-validated.
 	ToolCallComplete {
 		/// Output index.
@@ -1739,7 +1755,7 @@ impl OpenAiResponsesDecoder {
 				out.push(ResponsesProjection::HostedTool { index, kind: *kind, completed: *completed });
 			},
 			Some(OutputSlot::Image { encoded }) => {
-				if let Ok(bytes) = omp_core::encoding::base64::decode(encoded).into_vec() {
+				if let Ok(bytes) = base64::decode(encoded).into_vec() {
 					let bytes = Bytes::from(bytes);
 					out.push(ResponsesProjection::Canonical(ChatEvent::Artifact {
 						index,
@@ -1801,7 +1817,7 @@ impl OpenAiResponsesDecoder {
 			if let Some(usage) = &response.usage {
 				let mut usage = Usage::from(usage);
 				usage.search_calls = u32::from(self.saw_completed_hosted_tool);
-				out.push(ResponsesProjection::Canonical(ChatEvent::Usage(crate::event::UsageUpdate {
+				out.push(ResponsesProjection::Canonical(ChatEvent::Usage(UsageUpdate {
 					usage,
 					final_update: true,
 				})));
@@ -1837,7 +1853,7 @@ impl OpenAiResponsesDecoder {
 			.and_then(|value| value.usage.as_ref())
 			.map_or_else(Usage::default, Usage::from);
 		usage.search_calls = u32::from(self.saw_completed_hosted_tool);
-		out.push(ResponsesProjection::Completion(Box::new(super::RawCompletion {
+		out.push(ResponsesProjection::Completion(Box::new(RawCompletion {
 			reason,
 			blocks: self.outputs.len().try_into().unwrap_or(u32::MAX),
 			usage,
@@ -2180,7 +2196,7 @@ fn hoist_interleaved_tool_batch_messages(input: &mut Vec<ResponsesInputItem>) {
 		return;
 	}
 	let mut slots: Vec<Option<ResponsesInputItem>> =
-		std::mem::take(input).into_iter().map(Some).collect();
+		mem::take(input).into_iter().map(Some).collect();
 	for index in 0..slots.len() {
 		if let Some(pending) = insert_before.get(&index) {
 			for &message_index in pending {
@@ -2214,8 +2230,8 @@ impl OpenAiResponsesCodec {
 	/// Encodes a canonical chat request into a typed Responses body.
 	pub fn encode_chat(
 		&self,
-		context: &super::EncodeContext<'_>,
-		request: &crate::call::ChatRequest,
+		context: &EncodeContext<'_>,
+		request: &ChatRequest,
 	) -> Result<EncodedResponses, ResponsesEncodeError> {
 		use crate::call::{
 			CacheRetention, ContentPart, HostedTool, ReasoningVisibility, Role, Setting,
@@ -2241,18 +2257,18 @@ impl OpenAiResponsesCodec {
 			let mut output_items = Vec::new();
 			for event in state {
 				match event {
-					crate::session::StoredProviderStateEvent::Continuation { handle } => {
+					StoredProviderStateEvent::Continuation { handle } => {
 						if state_continuation.replace(handle).is_some() {
 							return Err(ResponsesEncodeError::MalformedServerState);
 						}
 					},
-					crate::session::StoredProviderStateEvent::OutputItem { id, .. } => {
+					StoredProviderStateEvent::OutputItem { id, .. } => {
 						output_items.push(id);
 					},
-					crate::session::StoredProviderStateEvent::ReasoningSignature { .. }
-					| crate::session::StoredProviderStateEvent::ToolCallProof { .. }
-					| crate::session::StoredProviderStateEvent::HistoryBlock { .. }
-					| crate::session::StoredProviderStateEvent::Checkpoint { .. } => {},
+					StoredProviderStateEvent::ReasoningSignature { .. }
+					| StoredProviderStateEvent::ToolCallProof { .. }
+					| StoredProviderStateEvent::HistoryBlock { .. }
+					| StoredProviderStateEvent::Checkpoint { .. } => {},
 				}
 			}
 			if state_continuation.is_none() {
@@ -2332,7 +2348,7 @@ impl OpenAiResponsesCodec {
 								continuation_id.get_or_insert(response);
 							}
 							if !content.is_empty() {
-								input.push(ResponsesInputItem::message(role, std::mem::take(&mut content)));
+								input.push(ResponsesInputItem::message(role, mem::take(&mut content)));
 							}
 							let mut item =
 								ResponsesInputItem::message(role, vec![ResponsesContent::input_text(
@@ -2346,7 +2362,7 @@ impl OpenAiResponsesCodec {
 					},
 					ContentPart::Reasoning { text, proof } => {
 						if !content.is_empty() {
-							input.push(ResponsesInputItem::message(role, std::mem::take(&mut content)));
+							input.push(ResponsesInputItem::message(role, mem::take(&mut content)));
 						}
 						// Policy-filtered reasoning history: some routes reject
 						// replayed `type: "reasoning"` wrappers outright
@@ -2407,7 +2423,7 @@ impl OpenAiResponsesCodec {
 					},
 					ContentPart::ToolCall { call, name, arguments, proof } => {
 						if !content.is_empty() {
-							input.push(ResponsesInputItem::message(role, std::mem::take(&mut content)));
+							input.push(ResponsesInputItem::message(role, mem::take(&mut content)));
 						}
 						let decoded = if let Some(proof) = proof {
 							if proof.provider != context.route.provider || proof.codec != target.codec {
@@ -2467,7 +2483,7 @@ impl OpenAiResponsesCodec {
 					},
 					ContentPart::ToolResult { call, content: result, .. } => {
 						if !content.is_empty() {
-							input.push(ResponsesInputItem::message(role, std::mem::take(&mut content)));
+							input.push(ResponsesInputItem::message(role, mem::take(&mut content)));
 						}
 						let mut output = String::new();
 						for (position, part) in result.iter().enumerate() {
@@ -2514,7 +2530,7 @@ impl OpenAiResponsesCodec {
 							CacheRetention::Long => "persistent",
 						};
 						if !content.is_empty() {
-							let mut item = ResponsesInputItem::message(role, std::mem::take(&mut content));
+							let mut item = ResponsesInputItem::message(role, mem::take(&mut content));
 							item.cache_control = Some(ResponsesCacheControl { kind: Str::new(kind) });
 							input.push(item);
 						} else if let Some(item) = input.last_mut() {
@@ -2554,32 +2570,29 @@ impl OpenAiResponsesCodec {
 			.tools
 			.iter()
 			.filter_map(|tool| {
-				let freeform_patch =
-					matches!(&tool.input, crate::call::ToolInputConstraint::JsonSchema { .. })
-						&& tool.name == "apply_patch"
-						&& apply_patch == Some(crate::catalog::policy::ApplyPatchWireKind::Freeform);
+				let freeform_patch = matches!(&tool.input, ToolInputConstraint::JsonSchema { .. })
+					&& tool.name == "apply_patch"
+					&& apply_patch == Some(ApplyPatchWireKind::Freeform);
 				let (kind, parameters, strict, format) = match &tool.input {
-					crate::call::ToolInputConstraint::JsonSchema { parameters, strict }
-						if !freeform_patch =>
-					{
+					ToolInputConstraint::JsonSchema { parameters, strict } if !freeform_patch => {
 						let mut schema = parameters.as_value().clone();
 						if flatten_root_unions {
 							if let Some(flattened) =
-								super::openai_chat::flatten_exclusive_required_root_union(&schema)
+								openai_chat::flatten_exclusive_required_root_union(&schema)
 							{
 								schema = flattened;
 							}
-							if super::openai_chat::leftover_root_object_union(&schema) {
+							if openai_chat::leftover_root_object_union(&schema) {
 								quarantined_tools.push(tool.name.clone());
 								return None;
 							}
 						}
 						(ResponsesToolKind::Function, Some(schema), Some(*strict), None)
 					},
-					crate::call::ToolInputConstraint::JsonSchema { .. } => {
+					ToolInputConstraint::JsonSchema { .. } => {
 						(ResponsesToolKind::Custom, None, None, None)
 					},
-					crate::call::ToolInputConstraint::Grammar(grammar) => (
+					ToolInputConstraint::Grammar(grammar) => (
 						ResponsesToolKind::Custom,
 						None,
 						None,
@@ -2610,7 +2623,7 @@ impl OpenAiResponsesCodec {
 			.collect::<Vec<_>>();
 		for custom in &self.options.custom_tools {
 			let function_patch = custom.name.as_deref() == Some("apply_patch")
-				&& apply_patch == Some(crate::catalog::policy::ApplyPatchWireKind::Function);
+				&& apply_patch == Some(ApplyPatchWireKind::Function);
 			if function_patch {
 				continue;
 			}
@@ -2620,9 +2633,7 @@ impl OpenAiResponsesCodec {
 			tools.push(custom.clone());
 		}
 		if let Some(computer) = &self.options.computer_tool {
-			if context.policy.tool.computer_use
-				== Some(crate::catalog::policy::ComputerUseWireSupport::Unsupported)
-			{
+			if context.policy.tool.computer_use == Some(ComputerUseWireSupport::Unsupported) {
 				return Err(ResponsesEncodeError::UnsupportedComputerUse);
 			}
 			let configured = computer.display_width.is_some()
@@ -2630,7 +2641,7 @@ impl OpenAiResponsesCodec {
 				|| computer.environment.is_some();
 			if configured
 				&& context.policy.tool.computer_use_config
-					== Some(crate::catalog::policy::ComputerUseConfigSupport::Unsupported)
+					== Some(ComputerUseConfigSupport::Unsupported)
 			{
 				return Err(ResponsesEncodeError::UnsupportedComputerUseConfig);
 			}
@@ -2981,18 +2992,16 @@ impl OpenAiResponsesCodec {
 /// (xAI clamps `minimal` to `low`) applies otherwise. Unknown spellings fall
 /// back to the canonical projection.
 fn wire_reasoning_effort(
-	context: &super::EncodeContext<'_>,
-	effort: crate::catalog::ReasoningEffort,
+	context: &EncodeContext<'_>,
+	effort: ReasoningEffort,
 ) -> ResponsesReasoningEffort {
 	let canonical = match effort {
-		crate::catalog::ReasoningEffort::Off => ResponsesReasoningEffort::None,
-		crate::catalog::ReasoningEffort::Minimal => ResponsesReasoningEffort::Minimal,
-		crate::catalog::ReasoningEffort::Low => ResponsesReasoningEffort::Low,
-		crate::catalog::ReasoningEffort::Medium => ResponsesReasoningEffort::Medium,
-		crate::catalog::ReasoningEffort::High => ResponsesReasoningEffort::High,
-		crate::catalog::ReasoningEffort::Xhigh | crate::catalog::ReasoningEffort::Max => {
-			ResponsesReasoningEffort::Xhigh
-		},
+		ReasoningEffort::Off => ResponsesReasoningEffort::None,
+		ReasoningEffort::Minimal => ResponsesReasoningEffort::Minimal,
+		ReasoningEffort::Low => ResponsesReasoningEffort::Low,
+		ReasoningEffort::Medium => ResponsesReasoningEffort::Medium,
+		ReasoningEffort::High => ResponsesReasoningEffort::High,
+		ReasoningEffort::Xhigh | ReasoningEffort::Max => ResponsesReasoningEffort::Xhigh,
 	};
 	if let Some(native) = context
 		.thinking_selection
@@ -3001,13 +3010,13 @@ fn wire_reasoning_effort(
 		return parse_reasoning_effort(native).unwrap_or(canonical);
 	}
 	let thinking = match effort {
-		crate::catalog::ReasoningEffort::Off => crate::catalog::ThinkingEffort::Off,
-		crate::catalog::ReasoningEffort::Minimal => crate::catalog::ThinkingEffort::Minimal,
-		crate::catalog::ReasoningEffort::Low => crate::catalog::ThinkingEffort::Low,
-		crate::catalog::ReasoningEffort::Medium => crate::catalog::ThinkingEffort::Medium,
-		crate::catalog::ReasoningEffort::High => crate::catalog::ThinkingEffort::High,
-		crate::catalog::ReasoningEffort::Xhigh => crate::catalog::ThinkingEffort::XHigh,
-		crate::catalog::ReasoningEffort::Max => crate::catalog::ThinkingEffort::Max,
+		ReasoningEffort::Off => ThinkingEffort::Off,
+		ReasoningEffort::Minimal => ThinkingEffort::Minimal,
+		ReasoningEffort::Low => ThinkingEffort::Low,
+		ReasoningEffort::Medium => ThinkingEffort::Medium,
+		ReasoningEffort::High => ThinkingEffort::High,
+		ReasoningEffort::Xhigh => ThinkingEffort::XHigh,
+		ReasoningEffort::Max => ThinkingEffort::Max,
 	};
 	context
 		.policy
@@ -3032,7 +3041,7 @@ fn parse_reasoning_effort(value: &str) -> Option<ResponsesReasoningEffort> {
 }
 
 fn encode_media_content(
-	media: &crate::call::MediaInput,
+	media: &MediaInput,
 	image: bool,
 ) -> Result<ResponsesContent, ResponsesEncodeError> {
 	use crate::call::MediaInput;
@@ -3043,7 +3052,7 @@ fn encode_media_content(
 	};
 	match media {
 		MediaInput::Bytes { media_type, data } => {
-			let encoded = omp_core::encoding::base64::encode(data).into_string();
+			let encoded = base64::encode(data).into_string();
 			let url = sf!("data:{media_type};base64,{encoded}");
 			Ok(ResponsesContent {
 				kind,
@@ -3088,52 +3097,42 @@ struct ContinuationCheckpoint<'a> {
 
 struct ResponsesDecoderAdapter {
 	inner:      OpenAiResponsesDecoder,
-	request_id: crate::id::RequestId,
-	provider:   crate::catalog::ProviderId,
-	route:      crate::catalog::RouteId,
+	request_id: RequestId,
+	provider:   ProviderId,
+	route:      RouteId,
 	wire_model: Option<Str>,
 }
 
 impl ResponsesDecoderAdapter {
-	fn emit_projection(
-		&self,
-		projection: ResponsesProjection,
-		emit: &mut dyn FnMut(super::RawEvent),
-	) {
+	fn emit_projection(&self, projection: ResponsesProjection, emit: &mut dyn FnMut(RawEvent)) {
 		match projection {
-			ResponsesProjection::Canonical(event) => emit(super::RawEvent::Chat(event)),
+			ResponsesProjection::Canonical(event) => emit(RawEvent::Chat(event)),
 			ResponsesProjection::Completion(completion) => {
-				emit(super::RawEvent::Completion(*completion));
+				emit(RawEvent::Completion(*completion));
 			},
 			ResponsesProjection::ToolCallComplete { index, id, name, arguments, custom } => {
-				emit(super::RawEvent::ToolCallComplete {
+				emit(RawEvent::ToolCallComplete {
 					index,
-					call: super::UnvalidatedToolCall {
+					call: UnvalidatedToolCall {
 						id,
 						name,
 						input_kind: if custom {
-							super::ToolInputKind::Freeform
+							ToolInputKind::Freeform
 						} else {
-							super::ToolInputKind::Json
+							ToolInputKind::Json
 						},
 						arguments,
 					},
 				});
 			},
 			ResponsesProjection::OutputItem { index, id } => {
-				emit(super::RawEvent::ProviderState(super::ProviderStateEvent::OutputItem {
-					index,
-					id,
-				}));
+				emit(RawEvent::ProviderState(ProviderStateEvent::OutputItem { index, id }));
 			},
 			ResponsesProjection::ReasoningSignature { index, item_id, signature } => {
 				if let Some(id) = item_id {
-					emit(super::RawEvent::ProviderState(super::ProviderStateEvent::OutputItem {
-						index,
-						id,
-					}));
+					emit(RawEvent::ProviderState(ProviderStateEvent::OutputItem { index, id }));
 				}
-				emit(super::RawEvent::ProviderState(super::ProviderStateEvent::ReasoningSignature {
+				emit(RawEvent::ProviderState(ProviderStateEvent::ReasoningSignature {
 					index,
 					signature,
 				}));
@@ -3141,13 +3140,10 @@ impl ResponsesDecoderAdapter {
 			ResponsesProjection::HostedTool { index, kind, completed } => {
 				let data = serde_json::to_vec(&HostedCheckpoint { index, kind, completed })
 					.map_or_else(|_| Bytes::new(), Bytes::from);
-				emit(super::RawEvent::ProviderState(super::ProviderStateEvent::Checkpoint {
-					id: None,
-					data,
-				}));
+				emit(RawEvent::ProviderState(ProviderStateEvent::Checkpoint { id: None, data }));
 			},
 			ResponsesProjection::Continuation { response_id, model, service_tier } => {
-				emit(super::RawEvent::ProviderState(super::ProviderStateEvent::Continuation {
+				emit(RawEvent::ProviderState(ProviderStateEvent::Continuation {
 					handle: response_id.clone(),
 				}));
 				let data = serde_json::to_vec(&ContinuationCheckpoint {
@@ -3156,18 +3152,18 @@ impl ResponsesDecoderAdapter {
 					service_tier: service_tier.as_ref(),
 				})
 				.map_or_else(|_| Bytes::new(), Bytes::from);
-				emit(super::RawEvent::ProviderState(super::ProviderStateEvent::Checkpoint {
+				emit(RawEvent::ProviderState(ProviderStateEvent::Checkpoint {
 					id: Some(response_id),
 					data,
 				}));
 			},
 			ResponsesProjection::Error(evidence) => {
-				emit(super::RawEvent::Failure(self.error_from_evidence(evidence)));
+				emit(RawEvent::Failure(self.error_from_evidence(evidence)));
 			},
 		}
 	}
 
-	fn error_from_evidence(&self, evidence: ResponsesErrorEvidence) -> crate::error::Error {
+	fn error_from_evidence(&self, evidence: ResponsesErrorEvidence) -> Error {
 		use crate::{
 			error::{Error, ErrorKind, ErrorPhase, RetryAction},
 			receipt::ExecutionReceipt,
@@ -3209,12 +3205,8 @@ impl ResponsesDecoderAdapter {
 	}
 }
 
-impl super::Decoder for ResponsesDecoderAdapter {
-	fn push(
-		&mut self,
-		frame: crate::transport::Frame,
-		emit: &mut dyn FnMut(super::RawEvent),
-	) -> Result<(), crate::error::Error> {
+impl Decoder for ResponsesDecoderAdapter {
+	fn push(&mut self, frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
 		use crate::transport::{Frame, WebSocketMessage};
 		let payload = match frame {
 			Frame::Raw(payload) | Frame::Ndjson(payload) => payload,
@@ -3239,7 +3231,7 @@ impl super::Decoder for ResponsesDecoderAdapter {
 		Ok(())
 	}
 
-	fn finish(&mut self, emit: &mut dyn FnMut(super::RawEvent)) -> Result<(), crate::error::Error> {
+	fn finish(&mut self, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
 		for projection in self.inner.finish() {
 			self.emit_projection(projection, emit);
 		}
@@ -3247,7 +3239,7 @@ impl super::Decoder for ResponsesDecoderAdapter {
 	}
 }
 
-fn encoding_error(code: &'static str) -> crate::error::Error {
+fn encoding_error(code: &'static str) -> Error {
 	use crate::{
 		error::{Error, ErrorKind, ErrorPhase, RetryAction},
 		receipt::ExecutionReceipt,
@@ -3262,16 +3254,16 @@ fn encoding_error(code: &'static str) -> crate::error::Error {
 }
 
 pub(super) fn responses_uri(base_url: &str) -> Str {
-	super::openai_chat::join_uri(base_url, "/responses")
+	openai_chat::join_uri(base_url, "/responses")
 }
 
-impl super::Codec for OpenAiResponsesCodec {
+impl Codec for OpenAiResponsesCodec {
 	fn encode(
 		&self,
-		context: &super::EncodeContext<'_>,
-		operation: &crate::call::OperationCall,
-	) -> Result<super::EncodedRequest, crate::error::Error> {
-		let crate::call::OperationCall::Chat(request) = operation else {
+		context: &EncodeContext<'_>,
+		operation: &OperationCall,
+	) -> Result<EncodedRequest, Error> {
+		let OperationCall::Chat(request) = operation else {
 			return Err(encoding_error("responses_chat_only"));
 		};
 		let encoded = self
@@ -3314,9 +3306,9 @@ impl super::Codec for OpenAiResponsesCodec {
 		let body = serde_json::to_vec(&encoded.request)
 			.map(Bytes::from)
 			.map_err(|_| encoding_error("responses_request_serialization"))?;
-		Ok(super::EncodedRequest {
-			operation:   crate::catalog::OperationKind::Chat,
-			method:      super::RequestMethod::Post,
+		Ok(EncodedRequest {
+			operation:   OperationKind::Chat,
+			method:      RequestMethod::Post,
 			uri:         responses_uri(
 				context
 					.target
@@ -3330,9 +3322,9 @@ impl super::Codec for OpenAiResponsesCodec {
 				super::RequestHeader { name: sf!("accept"), value: sf!("text/event-stream") },
 			]
 			.into_boxed_slice(),
-			body:        crate::body::BodySource::Bytes(body),
-			framing:     crate::transport::FramingProtocol::Sse,
-			bounds:      super::SizeBounds {
+			body:        BodySource::Bytes(body),
+			framing:     FramingProtocol::Sse,
+			bounds:      SizeBounds {
 				request_body: 64 * 1024 * 1024,
 				frame:        16 * 1024 * 1024,
 				response:     256 * 1024 * 1024,
@@ -3341,10 +3333,7 @@ impl super::Codec for OpenAiResponsesCodec {
 		})
 	}
 
-	fn decoder(
-		&self,
-		context: &super::DecodeContext<'_>,
-	) -> Result<super::DecoderState, crate::error::Error> {
+	fn decoder(&self, context: &DecodeContext<'_>) -> Result<DecoderState, Error> {
 		if context.operation != context.operation_call.kind()
 			|| !matches!(context.operation_call, crate::call::OperationCall::Chat(_))
 		{
@@ -3366,22 +3355,24 @@ impl super::Codec for OpenAiResponsesCodec {
 mod tests {
 	use std::sync::Arc;
 
-	use omp_catalog::{Catalog, ReasoningEffort, RouteDef, ThinkingEffort, WireTarget};
+	use omp_catalog::{Catalog, ReasoningEffort, RouteDef, ThinkingEffort, WireTarget, policy};
 	use omp_core::{Str, sf};
 
 	use super::{
-		OpenAiResponsesCodec, OpenAiResponsesDecoder, ResponsesContinuationFailure,
-		ResponsesInputItem, ResponsesInputItemKind, ResponsesProjection, ResponsesProviderProof,
-		ResponsesRole, classify_continuation_error, encode_provider_proof,
-		hoist_interleaved_tool_batch_messages,
+		EncodedResponses, OpenAiResponsesCodec, OpenAiResponsesDecoder, ResponsesContinuationFailure,
+		ResponsesDecoderAdapter, ResponsesErrorEvidence, ResponsesInputItem, ResponsesInputItemKind,
+		ResponsesProjection, ResponsesProviderProof, ResponsesRole, classify_continuation_error,
+		encode_provider_proof, hoist_interleaved_tool_batch_messages,
 	};
 	use crate::{
+		TurnId,
 		call::{
 			ChatRequest, ContentPart, ContextStrategy, Message, NegotiationPolicy, OpaqueJson,
 			ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling, SessionRequest,
-			Setting, ToolDefinition, ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
+			Setting, ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
 			ToolResultContent,
 		},
+		catalog::{ProviderId, RouteId},
 		codec::EncodeContext,
 		event::{ChatEvent, FinishReason},
 		id::{ConversationId, RequestId, Revision, ToolCallId},
@@ -3512,7 +3503,7 @@ mod tests {
 		let session = SessionRequest {
 			conversation:          ConversationId::new("cache-conversation"),
 			revision:              Revision::new("cache-revision"),
-			turn:                  crate::TurnId::new("cache-turn"),
+			turn:                  TurnId::new("cache-turn"),
 			strategy:              ContextStrategy::Replay,
 			prompt_cache_affinity: Some(sf!("invocation-cache")),
 			append_only:           true,
@@ -3548,9 +3539,9 @@ mod tests {
 	}
 
 	fn encode_with_policy(
-		policy: &omp_catalog::policy::WirePolicy,
+		policy: &policy::WirePolicy,
 		build: impl FnOnce(&RouteDef, &WireTarget) -> ChatRequest,
-	) -> super::EncodedResponses {
+	) -> EncodedResponses {
 		let catalog = Catalog::embedded();
 		let model = catalog
 			.models()
@@ -3598,8 +3589,8 @@ mod tests {
 
 	/// First-party xAI `/v1/responses` wire policy: no summary, no penalties,
 	/// encrypted reasoning requested and replayed, `minimal` clamped to `low`.
-	fn xai_like_policy() -> omp_catalog::policy::WirePolicy {
-		let mut policy = omp_catalog::policy::WirePolicy::baseline();
+	fn xai_like_policy() -> policy::WirePolicy {
+		let mut policy = policy::WirePolicy::baseline();
 		policy.structured.penalties = Some(false);
 		policy.reasoning.supports_summary = Some(false);
 		policy.reasoning.include_encrypted = Some(true);
@@ -3734,14 +3725,14 @@ mod tests {
 		// Console Go's Responses route rejects forced named selectors for
 		// DeepSeek V4 while thinking mode is active (#8244); the selector is
 		// dropped but the tool definitions stay on the wire.
-		let mut policy = omp_catalog::policy::WirePolicy::baseline();
+		let mut policy = policy::WirePolicy::baseline();
 		policy.tool.supports_tool_choice = Some(false);
 		let encoded = encode_with_policy(&policy, |_, _| {
 			let mut request = request_with_tool(ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
 				strict:     false,
 			});
-			request.tool_choice = Setting::Require(crate::call::ToolChoice::Named(sf!("match_input")));
+			request.tool_choice = Setting::Require(ToolChoice::Named(sf!("match_input")));
 			request
 		});
 		assert_eq!(encoded.request.tool_choice, None, "rejected selector is omitted");
@@ -3758,14 +3749,14 @@ mod tests {
 
 	#[test]
 	fn forced_choice_policy_keeps_auto_but_drops_required_selectors() {
-		let mut policy = omp_catalog::policy::WirePolicy::baseline();
+		let mut policy = policy::WirePolicy::baseline();
 		policy.tool.forced_choice = Some(false);
 		let encoded = encode_with_policy(&policy, |_, _| {
 			let mut request = request_with_tool(ToolInputConstraint::JsonSchema {
 				parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
 				strict:     false,
 			});
-			request.tool_choice = Setting::Require(crate::call::ToolChoice::Required);
+			request.tool_choice = Setting::Require(ToolChoice::Required);
 			request
 		});
 		assert_eq!(encoded.request.tool_choice, None);
@@ -3774,7 +3765,7 @@ mod tests {
 				parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
 				strict:     false,
 			});
-			request.tool_choice = Setting::Require(crate::call::ToolChoice::Auto);
+			request.tool_choice = Setting::Require(ToolChoice::Auto);
 			request
 		});
 		assert!(
@@ -3787,11 +3778,9 @@ mod tests {
 	}
 	#[test]
 	fn reasoning_conflict_drops_only_redundant_auto_tool_choice() {
-		let mut policy = omp_catalog::policy::WirePolicy::baseline();
+		let mut policy = policy::WirePolicy::baseline();
 		policy.tool.disable_reasoning_on_choice = Some(true);
-		let encode_choice = |policy: &omp_catalog::policy::WirePolicy,
-		                     reasoning: bool,
-		                     choice: crate::call::ToolChoice| {
+		let encode_choice = |policy: &policy::WirePolicy, reasoning: bool, choice: ToolChoice| {
 			encode_with_policy(policy, |_, _| {
 				let mut request = request_with_tool(ToolInputConstraint::JsonSchema {
 					parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
@@ -3812,26 +3801,26 @@ mod tests {
 			.tool_choice
 		};
 
-		assert_eq!(encode_choice(&policy, true, crate::call::ToolChoice::Auto), None);
+		assert_eq!(encode_choice(&policy, true, ToolChoice::Auto), None);
 		assert!(matches!(
-			encode_choice(&policy, false, crate::call::ToolChoice::Auto),
+			encode_choice(&policy, false, ToolChoice::Auto),
 			Some(super::ResponsesToolChoice::Mode(super::ResponsesToolChoiceMode::Auto))
 		));
 
-		let baseline = omp_catalog::policy::WirePolicy::baseline();
+		let baseline = policy::WirePolicy::baseline();
 		assert!(matches!(
-			encode_choice(&baseline, true, crate::call::ToolChoice::Auto),
+			encode_choice(&baseline, true, ToolChoice::Auto),
 			Some(super::ResponsesToolChoice::Mode(super::ResponsesToolChoiceMode::Auto))
 		));
 		assert!(matches!(
-			encode_choice(&policy, true, crate::call::ToolChoice::Required),
+			encode_choice(&policy, true, ToolChoice::Required),
 			Some(super::ResponsesToolChoice::Mode(super::ResponsesToolChoiceMode::Required))
 		));
 		assert!(matches!(
 			encode_choice(
 				&policy,
 				true,
-				crate::call::ToolChoice::Named(sf!("match_input"))
+				ToolChoice::Named(sf!("match_input"))
 			),
 			Some(super::ResponsesToolChoice::Named(named))
 				if named.name.as_deref() == Some("match_input")
@@ -4115,14 +4104,14 @@ mod tests {
 	#[test]
 	fn codex_model_denial_classifies_as_account_rotation() {
 		use crate::error::{ErrorKind, RetryAction};
-		let adapter = super::ResponsesDecoderAdapter {
+		let adapter = ResponsesDecoderAdapter {
 			inner:      OpenAiResponsesDecoder::default(),
 			request_id: RequestId::new("request"),
-			provider:   crate::catalog::ProviderId::from("openai-codex"),
-			route:      crate::catalog::RouteId::from("openai-codex/primary"),
+			provider:   ProviderId::from("openai-codex"),
+			route:      RouteId::from("openai-codex/primary"),
 			wire_model: Some(sf!("gpt-daybreak-blue-latest")),
 		};
-		let denial = adapter.error_from_evidence(super::ResponsesErrorEvidence {
+		let denial = adapter.error_from_evidence(ResponsesErrorEvidence {
 			code:         None,
 			message:      Str::new(CODEX_DENIAL),
 			continuation: ResponsesContinuationFailure::NotStale,
@@ -4134,7 +4123,7 @@ mod tests {
 
 		// The identical sentence naming another model stays a plain provider
 		// error with no rotation.
-		let unrelated = adapter.error_from_evidence(super::ResponsesErrorEvidence {
+		let unrelated = adapter.error_from_evidence(ResponsesErrorEvidence {
 			code:         None,
 			message:      sf!(
 				"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
@@ -4255,7 +4244,7 @@ mod tests {
 				name:    None,
 			},
 		]);
-		let policy = omp_catalog::policy::WirePolicy::baseline();
+		let policy = policy::WirePolicy::baseline();
 		let encoded = encode_with_policy(&policy, |_, _| request);
 		// Canonical message(s) → calls → outputs, byte-exact on the wire.
 		assert_eq!(
@@ -4282,7 +4271,7 @@ mod tests {
 			},
 			read_results(&[("call_a", "out a"), ("call_b", "out b")]),
 		]);
-		let policy = omp_catalog::policy::WirePolicy::baseline();
+		let policy = policy::WirePolicy::baseline();
 		let encoded = encode_with_policy(&policy, |_, _| request);
 		assert_eq!(
 			serde_json::to_string(&encoded.request.input).expect("input serializes"),
@@ -4309,7 +4298,7 @@ mod tests {
 			},
 			read_results(&[("call_a", "out a"), ("call_b", "out b")]),
 		]);
-		let policy = omp_catalog::policy::WirePolicy::baseline();
+		let policy = policy::WirePolicy::baseline();
 		let encoded = encode_with_policy(&policy, |_, _| request);
 		assert_eq!(input_item_kinds(&encoded.request.input), vec![
 			"message:assistant",

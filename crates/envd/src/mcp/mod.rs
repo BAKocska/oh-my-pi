@@ -37,8 +37,9 @@ use std::{
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use futures::future::BoxFuture;
-use omp_core::{Hash32, Str};
+use omp_core::Str;
 use omp_proto::env::v1 as pb;
 use omp_storage::mcp_cache::{McpCacheError, McpDefinitionCache};
 use omp_tool::{
@@ -46,7 +47,10 @@ use omp_tool::{
 	RegistryLeaf, Rev,
 };
 use parking_lot::RwLock;
+use tokio::task;
 use tokio_util::sync::CancellationToken;
+
+use super::exthost::control::ControlConnectionIdentity;
 
 const NOTIFICATION_HISTORY: usize = 256;
 const SUBSCRIBER_CAPACITY: usize = 64;
@@ -62,7 +66,7 @@ pub enum SubscriptionEvent {
 
 /// Live subscription receiver.
 pub struct ServiceSubscription {
-	receiver: flume::Receiver<SubscriptionEvent>,
+	receiver: Receiver<SubscriptionEvent>,
 }
 
 impl ServiceSubscription {
@@ -184,7 +188,7 @@ pub struct McpService {
 impl McpService {
 	/// Opens an empty, ready-to-mount Environment authority with its
 	/// storage-authority definition cache.
-	pub fn open(cache_path: impl AsRef<std::path::Path>) -> Result<Arc<Self>, McpCacheError> {
+	pub fn open(cache_path: impl AsRef<Path>) -> Result<Arc<Self>, McpCacheError> {
 		Ok(Arc::new(Self {
 			state:            RwLock::new(State {
 				servers:     BTreeMap::new(),
@@ -218,7 +222,7 @@ impl McpService {
 	/// Builds one extension-scoped MCP CONTROL projection over the live manager.
 	pub(crate) fn control(
 		self: &Arc<Self>,
-		identity: Arc<super::exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		cancellation: CancellationToken,
 	) -> Option<control::McpControl> {
 		let manager = self.manager.read().as_ref().and_then(Weak::upgrade)?;
@@ -243,7 +247,7 @@ impl McpService {
 		let action = pb::McpConfigAction::try_from(request.action)
 			.map_err(|_| McpServiceError::InvalidRequest)?;
 		let refresh_paths = paths.clone();
-		let result = tokio::task::spawn_blocking(move || config_request(paths, request))
+		let result = task::spawn_blocking(move || config_request(paths, request))
 			.await
 			.map_err(|_| McpServiceError::InvalidRequest)??;
 		let manager = self.manager.read().as_ref().and_then(Weak::upgrade);
@@ -256,7 +260,7 @@ impl McpService {
 				| pb::McpConfigAction::Disable
 		) && let Some(manager) = manager
 		{
-			let snapshot = tokio::task::spawn_blocking(move || {
+			let snapshot = task::spawn_blocking(move || {
 				config_request(refresh_paths, pb::McpConfigRequest {
 					action: pb::McpConfigAction::List as i32,
 					scope: pb::McpConfigScope::Unspecified as i32,
@@ -750,6 +754,8 @@ fn broadcast(state: &mut State, event: SubscriptionEvent) {
 
 #[cfg(test)]
 mod config_tests {
+	use std::fs;
+
 	use super::*;
 
 	#[tokio::test]
@@ -757,7 +763,7 @@ mod config_tests {
 		let scratch = tempfile::tempdir().expect("scratch");
 		let data = scratch.path().join("data");
 		let project = scratch.path().join("project");
-		std::fs::create_dir_all(&project).expect("project");
+		fs::create_dir_all(&project).expect("project");
 		let service = McpService::open(scratch.path().join("cache.sqlite3")).expect("service");
 		service.bind_config_paths(&data, &project);
 		service

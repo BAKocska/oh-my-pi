@@ -6,7 +6,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
-	fs,
+	env, fs, future, process,
 	process::{Command, ExitCode},
 	sync::Arc,
 	time::{Duration, Instant},
@@ -34,7 +34,7 @@ use omp_tool::{CallOutcome, Registry};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time};
 
 const CELL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -83,10 +83,10 @@ struct Measurements {
 struct AllowAdmission;
 
 impl Admitter for AllowAdmission {
-	type Future<'client> = std::future::Ready<Admission>;
+	type Future<'client> = future::Ready<Admission>;
 
 	fn admit<'client>(&'client self, query: AdmitInvocation) -> Self::Future<'client> {
-		std::future::ready(Admission {
+		future::ready(Admission {
 			invocation_id: query.invocation_id,
 			allow: true,
 			..Admission::default()
@@ -104,7 +104,7 @@ struct BenchEnvironment {
 impl BenchEnvironment {
 	async fn open(condition: Condition, site: &TempDir) -> Result<(Self, Duration, Duration)> {
 		let state = tempfile::tempdir().context("create pooling state directory")?;
-		let executable = std::env::current_exe().context("resolve pooling runner executable")?;
+		let executable = env::current_exe().context("resolve pooling runner executable")?;
 		let mut config = ExtHostConfig::new(
 			executable,
 			Principal::new(sf!("pooling-bench"), sf!("Pooling benchmark")),
@@ -160,7 +160,7 @@ impl BenchEnvironment {
 		});
 		controlled_link(condition.link_delay).await;
 		let prompt_at = Instant::now();
-		tokio::time::timeout(
+		time::timeout(
 			CELL_TIMEOUT,
 			client.hello(ClientHello {
 				client: "pooling-benchmark".to_owned(),
@@ -205,7 +205,7 @@ async fn async_main() -> Result<()> {
 
 	let hook = measure_hooks(&environment.client, condition).await?;
 	let collateral_loss = exercise_invocation_pattern(&environment.client, condition).await?;
-	let rss = process_tree_rss(std::process::id())?;
+	let rss = process_tree_rss(process::id())?;
 	let measurements = Measurements {
 		rss_bytes: rss,
 		// Darwin has no PSS accounting. Reporting RSS in both fields keeps the
@@ -222,7 +222,7 @@ async fn async_main() -> Result<()> {
 }
 
 fn main() -> ExitCode {
-	if std::env::args_os()
+	if env::args_os()
 		.nth(1)
 		.is_some_and(|argument| argument == WORKER_ARG)
 	{
@@ -285,7 +285,7 @@ impl Condition {
 }
 
 fn required(name: &str) -> Result<String> {
-	std::env::var(name).with_context(|| format!("{name} is required"))
+	env::var(name).with_context(|| format!("{name} is required"))
 }
 
 fn write_extensions(site: &TempDir, condition: Condition) -> Result<()> {
@@ -361,7 +361,7 @@ async fn exercise_invocation_pattern(client: &EnvClient, condition: Condition) -
 async fn cancellation_probe(client: &EnvClient) -> Result<u64> {
 	let cancelled = open_invocation(client, "cancelled-call".to_owned(), 1_000).await?;
 	let sibling = open_invocation(client, "collateral-call".to_owned(), 1_000).await?;
-	tokio::time::sleep(Duration::from_millis(25)).await;
+	time::sleep(Duration::from_millis(25)).await;
 	cancelled.guard().cancel();
 	let _ = finish_invocation(cancelled).await?;
 	let sibling_result = finish_invocation(sibling).await?;
@@ -378,7 +378,7 @@ async fn open_invocation(
 	id: String,
 	sleep_ms: u64,
 ) -> Result<omp_env::Invocation> {
-	let mut invocation = tokio::time::timeout(
+	let mut invocation = time::timeout(
 		CELL_TIMEOUT,
 		client.invoke(InvokeTool {
 			invocation_id: id,
@@ -390,7 +390,7 @@ async fn open_invocation(
 	)
 	.await
 	.context("open pooling invocation timed out")??;
-	match tokio::time::timeout(CELL_TIMEOUT, invocation.next_event()).await?? {
+	match time::timeout(CELL_TIMEOUT, invocation.next_event()).await?? {
 		Some(InvocationEvent::Accepted(_)) => {},
 		other => return Err(error(format!("pooling invocation was not accepted: {other:?}"))),
 	}
@@ -407,7 +407,7 @@ async fn open_invocation(
 
 async fn finish_invocation(mut invocation: omp_env::Invocation) -> Result<bool> {
 	loop {
-		match tokio::time::timeout(CELL_TIMEOUT, invocation.next_event()).await?? {
+		match time::timeout(CELL_TIMEOUT, invocation.next_event()).await?? {
 			Some(InvocationEvent::Verdict(verdict)) => {
 				let outcome: CallOutcome<Value, Value> = serde_json::from_slice(&verdict.json)?;
 				return Ok(matches!(outcome, CallOutcome::Ok(_)));
@@ -421,7 +421,7 @@ async fn finish_invocation(mut invocation: omp_env::Invocation) -> Result<bool> 
 
 async fn controlled_link(one_way: Duration) {
 	if !one_way.is_zero() {
-		tokio::time::sleep(one_way).await;
+		time::sleep(one_way).await;
 	}
 }
 

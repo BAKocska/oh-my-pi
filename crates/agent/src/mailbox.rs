@@ -2,10 +2,11 @@
 
 use std::collections::VecDeque;
 
+use flume::Receiver;
 use omp_core::{RemotePrincipal, Str, sf};
 use omp_proto::{
-	inference::v1 as inference,
-	thread::v1::{self as thread, Item},
+	inference::v1::{self as inference, value},
+	thread::v1::{self as thread, Item, item},
 };
 
 /// Durable item property identifying a deferred-diagnostics document.
@@ -133,22 +134,22 @@ pub fn remote_principal_interrupt(
 	props
 		.fields
 		.insert(REMOTE_PRINCIPAL_PROP.to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::Bool(true)),
+			kind: Some(value::Kind::Bool(true)),
 		});
 	props
 		.fields
 		.insert(REMOTE_PEER_ID_PROP.to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::Uint(u64::from(principal.peer_id()))),
+			kind: Some(value::Kind::Uint(u64::from(principal.peer_id()))),
 		});
 	props
 		.fields
 		.insert(REMOTE_DISPLAY_NAME_PROP.to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::String(principal.display_name().to_owned())),
+			kind: Some(value::Kind::String(principal.display_name().to_owned())),
 		});
 	props
 		.fields
 		.insert(REMOTE_ROOM_ID_PROP.to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::String(principal.room_id().to_owned())),
+			kind: Some(value::Kind::String(principal.room_id().to_owned())),
 		});
 	Interrupt { class, item, source: InterruptSource::Remote { principal } }
 }
@@ -181,22 +182,22 @@ pub fn deferred_diagnostics_interrupt(
 	props
 		.fields
 		.insert(DEFERRED_DIAGNOSTIC_DOCUMENT_PROP.to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::String(document.to_string())),
+			kind: Some(value::Kind::String(document.to_string())),
 		});
 	props
 		.fields
 		.insert(DEFERRED_DIAGNOSTIC_REVISION_PROP.to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::Uint(revision)),
+			kind: Some(value::Kind::Uint(revision)),
 		});
 	props
 		.fields
 		.insert(DEFERRED_DIAGNOSTIC_GENERATION_PROP.to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::Uint(server_generation)),
+			kind: Some(value::Kind::Uint(server_generation)),
 		});
 	let item = Item {
 		seq:           0,
 		created_at_ms: 0,
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::System as i32,
 			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
 		})),
@@ -399,9 +400,9 @@ enum MailboxCommand {
 /// `tokio::watch` receiver, so selecting shutdown never consumes an interrupt.
 pub struct Mailbox {
 	tx:          flume::Sender<Interrupt>,
-	rx:          flume::Receiver<Interrupt>,
+	rx:          Receiver<Interrupt>,
 	commands_tx: flume::Sender<MailboxCommand>,
-	commands_rx: flume::Receiver<MailboxCommand>,
+	commands_rx: Receiver<MailboxCommand>,
 	backlog:     VecDeque<Interrupt>,
 }
 impl Default for Mailbox {
@@ -582,7 +583,7 @@ impl Mailbox {
 
 #[cfg(test)]
 mod tests {
-	use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
+	use omp_proto::thread::v1::{Item, Message, Part, Role, part};
 
 	use super::*;
 

@@ -3,26 +3,30 @@
 use std::{
 	borrow::Cow,
 	ffi::OsStr,
-	fmt::Display,
+	fmt::{self, Display},
 	io::{self, Write},
+	iter, ops,
 	path::{Path, PathBuf},
 	pin::Pin,
+	process,
 };
 
 use itertools::Itertools;
 use sys::commands::{CommandExt, CommandFdInjectionExt, CommandFgControlExt, CommandSessionExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
 	ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionParameters, ExecutionResult, Shell,
-	ShellFd, builtins, commands, env, error, escape,
+	ShellFd, SourceInfo, builtins, commands, env, error, escape,
 	extensions::{self, ShellExtensions},
 	functions,
 	interp::{self, Execute, ExternalCommandInfo, ExternalCommandOutputMarkers, ProcessGroupPolicy},
-	openfiles::{self, OpenFiles},
+	openfiles::{OpenFile, OpenFiles},
 	parser::ast,
 	pathsearch, processes,
 	results::{ExecutionSpawnResult, ExecutionWaitResult},
-	sys, trace_categories, traps, variables,
+	sys::{self, async_pipe::AsyncPipeReader},
+	trace_categories, traps, variables,
 };
 
 /// Encapsulates the result of waiting for a command to complete.
@@ -34,7 +38,10 @@ pub enum CommandWaitResult {
 }
 
 /// Represents the context for executing a command.
-pub struct ExecutionContext<'a, SE: ShellExtensions = extensions::DefaultShellExtensions> {
+pub struct ExecutionContext<
+	'a,
+	SE: extensions::ShellExtensions = extensions::DefaultShellExtensions,
+> {
 	/// The shell in which the command is being executed.
 	pub shell:        &'a mut Shell<SE>,
 	/// The name of the command being executed.
@@ -45,22 +52,22 @@ pub struct ExecutionContext<'a, SE: ShellExtensions = extensions::DefaultShellEx
 
 impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
 	/// Returns the standard input file; usable with `write!` et al.
-	pub fn stdin(&self) -> impl std::io::Read + 'static {
+	pub fn stdin(&self) -> impl io::Read + 'static {
 		self.params.stdin(self.shell)
 	}
 
 	/// Returns the standard output file; usable with `write!` et al.
-	pub fn stdout(&self) -> impl std::io::Write + 'static {
+	pub fn stdout(&self) -> impl io::Write + 'static {
 		self.params.stdout(self.shell)
 	}
 
 	/// Returns the standard error file; usable with `write!` et al.
-	pub fn stderr(&self) -> impl std::io::Write + 'static {
+	pub fn stderr(&self) -> impl io::Write + 'static {
 		self.params.stderr(self.shell)
 	}
 
 	/// Returns the cancellation token, if one is configured.
-	pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+	pub fn cancel_token(&self) -> Option<CancellationToken> {
 		self.params.cancel_token()
 	}
 
@@ -75,17 +82,17 @@ impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
 	/// # Arguments
 	///
 	/// * `fd` - The file descriptor number to retrieve.
-	pub fn try_fd(&self, fd: ShellFd) -> Option<openfiles::OpenFile> {
+	pub fn try_fd(&self, fd: ShellFd) -> Option<OpenFile> {
 		self.params.try_fd(self.shell, fd)
 	}
 
 	/// Iterates over all open file descriptors.
 	pub fn iter_fds(
 		&self,
-	) -> impl DoubleEndedIterator<Item = (ShellFd, openfiles::OpenFile)>
+	) -> impl DoubleEndedIterator<Item = (ShellFd, OpenFile)>
 	+ ExactSizeIterator
 	+ Clone
-	+ std::iter::FusedIterator {
+	+ iter::FusedIterator {
 		self.params.iter_fds(self.shell)
 	}
 }
@@ -101,7 +108,7 @@ pub enum CommandArg {
 }
 
 impl Display for CommandArg {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::String(s) => f.write_str(s),
 			Self::Assignment(a) => write!(f, "{a}"),
@@ -153,7 +160,7 @@ pub enum ShellForCommand<'a, SE: extensions::ShellExtensions> {
 	},
 }
 
-impl<SE: extensions::ShellExtensions> std::ops::Deref for ShellForCommand<'_, SE> {
+impl<SE: extensions::ShellExtensions> ops::Deref for ShellForCommand<'_, SE> {
 	type Target = Shell<SE>;
 
 	fn deref(&self) -> &Self::Target {
@@ -164,7 +171,7 @@ impl<SE: extensions::ShellExtensions> std::ops::Deref for ShellForCommand<'_, SE
 	}
 }
 
-impl<SE: extensions::ShellExtensions> std::ops::DerefMut for ShellForCommand<'_, SE> {
+impl<SE: extensions::ShellExtensions> ops::DerefMut for ShellForCommand<'_, SE> {
 	fn deref_mut(&mut self) -> &mut Self::Target {
 		match self {
 			ShellForCommand::ParentShell(shell) => shell,
@@ -194,8 +201,8 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 	argv0: &str,
 	args: &[S],
 	empty_env: bool,
-) -> Result<std::process::Command, error::Error> {
-	let mut cmd = std::process::Command::new(command_name);
+) -> Result<process::Command, error::Error> {
+	let mut cmd = process::Command::new(command_name);
 
 	// Override argv[0].
 	// NOTE: Not supported on all platforms.
@@ -619,7 +626,7 @@ pub(crate) fn execute_external_command(
 	// Before we lose ownership of the open files, figure out if stdin will be a
 	// terminal.
 	let child_stdin_is_terminal = context
-		.try_fd(openfiles::OpenFiles::STDIN_FD)
+		.try_fd(OpenFiles::STDIN_FD)
 		.is_some_and(|f| f.is_terminal());
 
 	// Figure out if we should be setting up a new process group.
@@ -746,7 +753,7 @@ pub(crate) fn execute_external_command(
 				sys::terminal::move_self_to_foreground()?;
 			}
 
-			if spawn_err.kind() == std::io::ErrorKind::NotFound {
+			if spawn_err.kind() == io::ErrorKind::NotFound {
 				if !context.shell.working_dir().exists() {
 					Err(
 						error::ErrorKind::WorkingDirMissing(context.shell.working_dir().to_owned())
@@ -766,7 +773,7 @@ fn prepare_output_markers<SE: extensions::ShellExtensions>(
 	context: &ExecutionContext<'_, SE>,
 	executable_path: &str,
 	args: &[&String],
-) -> Option<(openfiles::OpenFile, ExternalCommandOutputMarkers)> {
+) -> Option<(OpenFile, ExternalCommandOutputMarkers)> {
 	let marker = context.params.command_output_marker()?;
 	let markers = marker.markers_for_external_command(ExternalCommandInfo {
 		command_name: context.command_name.as_str(),
@@ -784,7 +791,7 @@ fn prepare_output_markers<SE: extensions::ShellExtensions>(
 }
 
 fn write_completion_marker(
-	output: &mut openfiles::OpenFile,
+	output: &mut OpenFile,
 	markers: &ExternalCommandOutputMarkers,
 	exit_code: i32,
 ) -> io::Result<()> {
@@ -806,7 +813,7 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
 		Err(e) => {
 			// Broken pipe errors should silently return the appropriate exit code
 			if let Some(io_err) = e.as_io_error() {
-				if io_err.kind() == std::io::ErrorKind::BrokenPipe {
+				if io_err.kind() == io::ErrorKind::BrokenPipe {
 					return Ok(ExecutionExitCode::from(io_err).into());
 				}
 			}
@@ -911,10 +918,10 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 	params.disable_command_output_marking();
 
 	// Set up pipe so we can read the output.
-	let (reader, writer) = std::io::pipe()?;
+	let (reader, writer) = io::pipe()?;
 	params.set_fd(OpenFiles::STDOUT_FD, writer.into());
 
-	let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
+	let mut async_reader = AsyncPipeReader::new(reader)?;
 
 	let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
 
@@ -947,13 +954,13 @@ async fn run_substitution_command(
 	if let Ok(program) = &parse_result {
 		if let Some(redir) = try_unwrap_bare_input_redir_program(program) {
 			interp::setup_redirect(&mut shell, &mut params, redir).await?;
-			std::io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell))?;
+			io::copy(&mut params.stdin(&shell), &mut params.stdout(&shell))?;
 			return Ok(ExecutionResult::new(0));
 		}
 	}
 
 	// TODO(source-info): review this
-	let source_info = crate::SourceInfo::from("main");
+	let source_info = SourceInfo::from("main");
 
 	// Handle the parse result using default shell behavior.
 	shell
@@ -1009,7 +1016,7 @@ fn try_unwrap_bare_input_redir_program(program: &ast::Program) -> Option<&ast::I
 			fd,
 			ast::IoFileRedirectKind::Read,
 			ast::IoFileRedirectTarget::Filename(..),
-		) if fd.is_none_or(|fd| fd == openfiles::OpenFiles::STDIN_FD) => Some(redir),
+		) if fd.is_none_or(|fd| fd == OpenFiles::STDIN_FD) => Some(redir),
 		_ => None,
 	}
 }

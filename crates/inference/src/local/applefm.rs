@@ -23,6 +23,7 @@
 use std::{
 	collections::VecDeque,
 	pin::Pin,
+	result,
 	sync::{Arc, LazyLock},
 	task::{Context, Poll},
 	time::Duration,
@@ -31,7 +32,11 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use omp_core::{IntoStr, Str, sf};
-use tokio::task::JoinError;
+use tokio::{
+	runtime,
+	task::{self, JoinError},
+	time,
+};
 use tokio_util::sync::CancellationToken;
 use tower::Service;
 
@@ -39,7 +44,7 @@ use super::runtime::{AdmissionControl, AdmissionPermit};
 use crate::{
 	Error,
 	body::BodySource,
-	call::{ContentPart, OperationCall, Role, Setting, ToolChoice},
+	call::{ChatRequest, ContentPart, OperationCall, Role, Setting, ToolChoice},
 	catalog::{
 		DiscoveredModel, ModelAvailability, ModelLimits, OperationBits, OperationKind, ProviderId,
 		RouteId, WireModelId,
@@ -47,7 +52,7 @@ use crate::{
 	codec::{
 		Cancellation, Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
 		HandshakeMeta, HandshakenResponse, RawCompletion, RawEvent, RequestMethod, SizeBounds,
-		TransportRequest,
+		TransportAttempt, TransportRequest,
 	},
 	error::{ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason},
@@ -190,7 +195,7 @@ impl AppleFmError {
 }
 
 /// Result type used by Apple Foundation Models operations and streams.
-pub type Result<T, E = AppleFmError> = std::result::Result<T, E>;
+pub type Result<T, E = AppleFmError> = result::Result<T, E>;
 
 /// Current usability of Apple's on-device system language model.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -238,8 +243,12 @@ mod support_state {
 	}
 }
 
+use std::{env::consts, mem};
+
 #[doc(inline)]
 pub use support_state::AppleFmSupportState;
+
+use crate::id::RequestId;
 
 /// Native feature status distinguished from an unrecovered binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,7 +397,7 @@ impl AppleFm {
 
 	/// Checks whether Apple Foundation Models can generate on this machine.
 	pub async fn availability() -> Result<AppleFmAvailability> {
-		tokio::task::spawn_blocking(platform::availability)
+		task::spawn_blocking(platform::availability)
 			.await
 			.map_err(join_error)
 	}
@@ -405,7 +414,7 @@ impl AppleFm {
 		Ok(AppleFmAvailabilityEvidence {
 			state,
 			os_version: platform::os_version(),
-			architecture: std::env::consts::ARCH,
+			architecture: consts::ARCH,
 			detail,
 			streaming: true,
 			tool_evidence: AppleFmFeatureEvidence::RequiresCompiledSwiftToolConformance,
@@ -447,7 +456,7 @@ impl AppleFm {
 		permit: AdmissionPermit,
 		timeout: Duration,
 	) -> Result<AppleFmStream> {
-		let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+		let runtime = runtime::Handle::try_current().map_err(|_| {
 			AppleFmError::runtime("Apple Foundation Models streaming requires an active Tokio runtime")
 		})?;
 		let cancel = CancellationToken::new();
@@ -534,7 +543,7 @@ impl Codec for AppleFmCodec {
 		&self,
 		context: &EncodeContext<'_>,
 		operation: &OperationCall,
-	) -> std::result::Result<EncodedRequest, Error> {
+	) -> result::Result<EncodedRequest, Error> {
 		if let OperationCall::DiscoverModels(request) = operation {
 			if request.cursor.is_some() {
 				return Err(apple_codec_error(
@@ -618,7 +627,7 @@ impl Codec for AppleFmCodec {
 		})?;
 		let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
 		Ok(EncodedRequest::new(
-			crate::catalog::OperationKind::Chat,
+			OperationKind::Chat,
 			RequestMethod::Post,
 			sf!("local://apple-intelligence"),
 			Box::new([]),
@@ -632,7 +641,7 @@ impl Codec for AppleFmCodec {
 		))
 	}
 
-	fn decoder(&self, context: &DecodeContext<'_>) -> std::result::Result<DecoderState, Error> {
+	fn decoder(&self, context: &DecodeContext<'_>) -> result::Result<DecoderState, Error> {
 		if !matches!(context.operation, OperationKind::Chat | OperationKind::DiscoverModels) {
 			return Err(Error::new(
 				ErrorKind::CapabilityMismatch,
@@ -648,11 +657,7 @@ impl Codec for AppleFmCodec {
 struct AppleLocalDecoder;
 
 impl Decoder for AppleLocalDecoder {
-	fn push(
-		&mut self,
-		_frame: Frame,
-		_emit: &mut dyn FnMut(RawEvent),
-	) -> std::result::Result<(), Error> {
+	fn push(&mut self, _frame: Frame, _emit: &mut dyn FnMut(RawEvent)) -> result::Result<(), Error> {
 		Err(Error::new(
 			ErrorKind::InternalInvariant,
 			ErrorPhase::Internal,
@@ -661,7 +666,7 @@ impl Decoder for AppleLocalDecoder {
 		))
 	}
 
-	fn finish(&mut self, _emit: &mut dyn FnMut(RawEvent)) -> std::result::Result<(), Error> {
+	fn finish(&mut self, _emit: &mut dyn FnMut(RawEvent)) -> result::Result<(), Error> {
 		Ok(())
 	}
 }
@@ -683,7 +688,7 @@ impl AppleFmTransport {
 	/// Model availability is intentionally checked per request so discovery can
 	/// report a temporarily blocked system model and later observe it becoming
 	/// available without rebuilding the registry.
-	pub const fn new() -> std::result::Result<Self, AppleFmAvailabilityEvidence> {
+	pub const fn new() -> result::Result<Self, AppleFmAvailabilityEvidence> {
 		#[cfg(target_os = "macos")]
 		{
 			Ok(Self { ready: None })
@@ -704,12 +709,9 @@ impl Service<TransportRequest> for AppleFmTransport {
 	type Error = Error;
 	type Response = HandshakenResponse;
 
-	type Future = impl Future<Output = std::result::Result<HandshakenResponse, Error>> + Send;
+	type Future = impl Future<Output = result::Result<HandshakenResponse, Error>> + Send;
 
-	fn poll_ready(
-		&mut self,
-		_context: &mut Context<'_>,
-	) -> Poll<std::result::Result<(), Self::Error>> {
+	fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<result::Result<(), Self::Error>> {
 		if self.ready.is_none() {
 			match APPLE_ADMISSION.try_acquire() {
 				Ok(permit) => self.ready = Some(permit),
@@ -748,7 +750,7 @@ impl Service<TransportRequest> for AppleFmTransport {
 async fn execute_transport(
 	request: TransportRequest,
 	permit: AdmissionPermit,
-) -> std::result::Result<HandshakenResponse, Error> {
+) -> result::Result<HandshakenResponse, Error> {
 	if request.credentials.is_some() {
 		return Err(transport_error(
 			ErrorKind::ProviderContractMismatch,
@@ -803,7 +805,7 @@ async fn execute_transport(
 				false,
 			));
 		}
-		let availability = tokio::task::spawn_blocking(availability_evidence_sync)
+		let availability = task::spawn_blocking(availability_evidence_sync)
 			.await
 			.map_err(|error| {
 				transport_error(
@@ -1042,7 +1044,7 @@ impl AppleFmResponseCleaner {
 	fn take_body_delta(&mut self) -> (Option<Str>, bool) {
 		if let Some(boundary) = first_user_boundary(&self.pending) {
 			let tail = self.pending.split_off(boundary);
-			let text = std::mem::replace(&mut self.pending, tail);
+			let text = mem::replace(&mut self.pending, tail);
 			self.pending.clear();
 			self.truncated = true;
 			return ((!text.is_empty()).then(|| text.into()), true);
@@ -1053,7 +1055,7 @@ impl AppleFmResponseCleaner {
 			return (None, false);
 		}
 		let tail = self.pending.split_off(emit_len);
-		let text = std::mem::replace(&mut self.pending, tail);
+		let text = mem::replace(&mut self.pending, tail);
 		(Some(text.into()), false)
 	}
 }
@@ -1089,17 +1091,17 @@ fn append_native(
 	block_started: &mut bool,
 	cleaner: &mut AppleFmResponseCleaner,
 	output: &mut VecDeque<RawEvent>,
-) -> std::result::Result<bool, Error> {
+) -> result::Result<bool, Error> {
 	append_native_attempt(&request.attempt, event, block_started, cleaner, output)
 }
 
 fn append_native_attempt(
-	attempt: &crate::codec::TransportAttempt,
+	attempt: &TransportAttempt,
 	event: Result<AppleFmEvent>,
 	block_started: &mut bool,
 	cleaner: &mut AppleFmResponseCleaner,
 	output: &mut VecDeque<RawEvent>,
-) -> std::result::Result<bool, Error> {
+) -> result::Result<bool, Error> {
 	match event {
 		Ok(AppleFmEvent::Delta(text)) => {
 			let (text, truncated) = cleaner.push(text);
@@ -1189,11 +1191,11 @@ fn apple_discovered_model(
 }
 
 fn apple_prompt(
-	request: &crate::call::ChatRequest,
-	request_id: &crate::id::RequestId<str>,
+	request: &ChatRequest,
+	request_id: &RequestId<str>,
 	provider: &ProviderId<str>,
 	route: &RouteId<str>,
-) -> std::result::Result<(Str, Option<Str>, bool), Error> {
+) -> result::Result<(Str, Option<Str>, bool), Error> {
 	if !request.tools.is_empty()
 		|| !request.hosted_tools.is_empty()
 		|| !matches!(
@@ -1300,7 +1302,7 @@ fn apple_prompt(
 	}
 	let transcript_echo = !matches!(turns.as_slice(), [(Role::User, _)]);
 	let prompt = if let [(Role::User, only)] = turns.as_mut_slice() {
-		std::mem::take(only)
+		mem::take(only)
 	} else {
 		let mut transcript = String::new();
 		for (role, text) in &turns {
@@ -1333,7 +1335,7 @@ fn availability_evidence_sync() -> AppleFmAvailabilityEvidence {
 	AppleFmAvailabilityEvidence {
 		state,
 		os_version: platform::os_version(),
-		architecture: std::env::consts::ARCH,
+		architecture: consts::ARCH,
 		detail,
 		streaming: true,
 		tool_evidence: AppleFmFeatureEvidence::RequiresCompiledSwiftToolConformance,
@@ -1358,7 +1360,7 @@ fn apple_codec_error(kind: ErrorKind, message: &str, context: &EncodeContext<'_>
 fn codec_route_error(
 	kind: ErrorKind,
 	message: &str,
-	request_id: &crate::id::RequestId<str>,
+	request_id: &RequestId<str>,
 	provider: &ProviderId<str>,
 	route: &RouteId<str>,
 ) -> Error {
@@ -1383,7 +1385,7 @@ fn transport_attempt_error(
 	kind: ErrorKind,
 	phase: ErrorPhase,
 	message: &str,
-	attempt: &crate::codec::TransportAttempt,
+	attempt: &TransportAttempt,
 	committed: bool,
 ) -> Error {
 	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default())
@@ -1403,7 +1405,7 @@ fn native_transport_error(
 }
 
 fn native_attempt_error(
-	attempt: &crate::codec::TransportAttempt,
+	attempt: &TransportAttempt,
 	error: &AppleFmError,
 	committed: bool,
 ) -> Error {
@@ -1451,7 +1453,7 @@ async fn run_generation(
 	}
 	let work_cancel = cancel.child_token();
 	let blocking_cancel = work_cancel.clone();
-	let mut task = tokio::task::spawn_blocking(move || {
+	let mut task = task::spawn_blocking(move || {
 		let callback_cancel = blocking_cancel.clone();
 		platform::generate(options, move |delta| on_delta(delta, &callback_cancel), &blocking_cancel)
 	});
@@ -1459,7 +1461,7 @@ async fn run_generation(
 		biased;
 		result = &mut task => return result.map_err(join_error)?,
 		() = cancel.cancelled() => AppleFmError::cancelled(),
-		() = tokio::time::sleep(timeout) => AppleFmError::timed_out(timeout),
+		() = time::sleep(timeout) => AppleFmError::timed_out(timeout),
 	};
 	work_cancel.cancel();
 	let _ = task.await;
@@ -1535,21 +1537,23 @@ mod tests {
 	use std::{collections::VecDeque, time::Duration};
 
 	use omp_catalog::{ModelAvailability, OperationKind, ProviderId, RouteId};
+	use omp_core::Str;
 	use tokio_util::sync::CancellationToken;
 
 	use super::{
 		AppleFm, AppleFmAvailabilityEvidence, AppleFmError, AppleFmErrorCode, AppleFmEvent,
 		AppleFmFeatureEvidence, AppleFmGeneration, AppleFmOptions, AppleFmResponseCleaner,
-		AppleFmSupportState, append_native_attempt, apple_discovered_model, apple_prompt,
-		native_attempt_error, validate_options,
+		AppleFmStream, AppleFmSupportState, append_native_attempt, apple_discovered_model,
+		apple_prompt, native_attempt_error, validate_options,
 	};
 	use crate::{
 		call::{
-			ChatRequest, ContentPart, Message, NegotiationPolicy, Role, Sampling, Setting,
+			ChatRequest, ContentPart, Message, NegotiationPolicy, OpaqueJson, Role, Sampling, Setting,
 			ToolDefinition, ToolInputConstraint,
 		},
 		codec::{RawEvent, TransportAttempt},
 		error::ErrorKind,
+		event::ChatEvent,
 		id::RequestId,
 	};
 
@@ -1579,9 +1583,7 @@ mod tests {
 		}
 	}
 
-	fn prompt_of(
-		messages: &[(Role, &str)],
-	) -> Result<(omp_core::Str, Option<omp_core::Str>, bool), ErrorKind> {
+	fn prompt_of(messages: &[(Role, &str)]) -> Result<(Str, Option<Str>, bool), ErrorKind> {
 		let attempt = attempt();
 		apple_prompt(&chat_request(messages), &attempt.request_id, &attempt.provider, &attempt.route)
 			.map_err(|error| error.kind)
@@ -1627,7 +1629,7 @@ mod tests {
 			name:        omp_core::sf!("read"),
 			description: None,
 			input:       ToolInputConstraint::JsonSchema {
-				parameters: crate::call::OpaqueJson::new(serde_json::json!({"type": "object"})),
+				parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
 				strict:     false,
 			},
 		}]
@@ -1727,7 +1729,7 @@ mod tests {
 		output
 			.iter()
 			.filter_map(|event| match event {
-				RawEvent::Chat(crate::event::ChatEvent::TextDelta { text, .. }) => Some(text.as_str()),
+				RawEvent::Chat(ChatEvent::TextDelta { text, .. }) => Some(text.as_str()),
 				_ => None,
 			})
 			.collect()
@@ -1842,7 +1844,7 @@ mod tests {
 	fn dropping_stream_requests_native_cancellation() {
 		let cancel = CancellationToken::new();
 		let observed = cancel.clone();
-		let stream = super::AppleFmStream { rx: Box::pin(futures::stream::pending()), cancel };
+		let stream = AppleFmStream { rx: Box::pin(futures::stream::pending()), cancel };
 		drop(stream);
 		assert!(observed.is_cancelled());
 	}

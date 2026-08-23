@@ -14,6 +14,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use omp_core::{Str, sf};
 use omp_storage::{
 	blob::BlobRef,
@@ -25,16 +26,18 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
-	ArbiterError,
+	AgentHostControl, ArbiterError,
 	campaign::{
 		CampaignEntry, CampaignMachine, CampaignSpec, CampaignStepResult, DisengageError,
 		EngageError, EngageOptions, EngageReceipt,
 	},
+	core_regime,
 	journal::{
 		Journal, JournalCustomEntry, JournalError, JournalQuery, JournalReply, JournalRequest,
 		SessionStateValue, SessionStateWatchEvent,
 	},
 	journal_kinds::EntryKindDecl,
+	r#loop,
 	r#loop::{ActiveCheckpoint, CheckpointState},
 	tool_choice::Invoker,
 };
@@ -45,12 +48,12 @@ pub struct ControlSender {
 	commands:         flume::Sender<ControlCommand>,
 	next_receipt:     Arc<AtomicU64>,
 	checkpoint_state: Arc<Mutex<CheckpointState>>,
-	host_control:     Arc<Mutex<Option<crate::AgentHostControl>>>,
+	host_control:     Arc<Mutex<Option<AgentHostControl>>>,
 }
 
 /// The receive half retained by the sole mutable journal owner.
 pub struct ControlMailbox {
-	commands:         flume::Receiver<ControlCommand>,
+	commands:         Receiver<ControlCommand>,
 	checkpoint_state: Arc<Mutex<CheckpointState>>,
 }
 
@@ -272,12 +275,12 @@ impl ControlSender {
 		Arc::clone(&self.checkpoint_state)
 	}
 
-	pub(crate) fn bind_host_control(&self, host: crate::AgentHostControl) {
+	pub(crate) fn bind_host_control(&self, host: AgentHostControl) {
 		*self.host_control.lock() = Some(host);
 	}
 
 	/// Returns the generation-fenced live Agent projection mailbox.
-	pub fn host_control(&self) -> Option<crate::AgentHostControl> {
+	pub fn host_control(&self) -> Option<AgentHostControl> {
 		self.host_control.lock().clone()
 	}
 
@@ -514,7 +517,7 @@ impl ControlSender {
 		authority: StateAuthority,
 		key: Str,
 		since: Option<StateRevision>,
-	) -> Result<flume::Receiver<SessionStateWatchEvent>, ControlError> {
+	) -> Result<Receiver<SessionStateWatchEvent>, ControlError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
@@ -617,10 +620,10 @@ impl ControlSender {
 		spec_id: &str,
 		queue: bool,
 	) -> Result<EngageReceipt, ControlError> {
-		let (spec, machine) = crate::core_regime(spec_id)
+		let (spec, machine) = core_regime(spec_id)
 			.ok_or_else(|| ControlError::UnknownCoreCampaign { spec_id: Str::new(spec_id) })?;
 		self
-			.engage_campaign(spec, machine, EngageOptions { now_ms: crate::r#loop::now_ms(), queue })
+			.engage_campaign(spec, machine, EngageOptions { now_ms: r#loop::now_ms(), queue })
 			.await
 	}
 
@@ -726,7 +729,7 @@ impl ControlSender {
 
 	/// Disengages one campaign on the sole mutable agent owner.
 	pub async fn disengage_campaign(&self, engagement: Str) -> Result<bool, ControlError> {
-		let now_ms = crate::r#loop::now_ms();
+		let now_ms = r#loop::now_ms();
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
@@ -857,7 +860,7 @@ pub(crate) enum ControlCommand {
 		authority: StateAuthority,
 		key:       Str,
 		since:     Option<StateRevision>,
-		reply:     flume::Sender<JournalReplyResult<flume::Receiver<SessionStateWatchEvent>>>,
+		reply:     flume::Sender<JournalReplyResult<Receiver<SessionStateWatchEvent>>>,
 	},
 	SessionStateRootContent {
 		ts:        u64,
@@ -909,7 +912,7 @@ fn handle_command(
 				let _ = reply.send(Err(ControlError::CheckpointAlreadyActive));
 			} else {
 				let token = Str::from(omp_core::Ulid::generate().to_string());
-				let started_at = crate::r#loop::now_ms();
+				let started_at = r#loop::now_ms();
 				match journal.checkpoint(started_at, token.as_str(), goal.as_str(), started_at) {
 					Ok(event) => {
 						state.active = Some(ActiveCheckpoint {

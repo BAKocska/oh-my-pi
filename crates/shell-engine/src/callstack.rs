@@ -3,10 +3,12 @@
 use std::{
 	borrow::Cow,
 	collections::{HashSet, VecDeque},
+	fmt::{self, Display},
+	iter, ops,
 	sync::Arc,
 };
 
-use crate::{functions, parser::ast::SourceLocation, traps};
+use crate::{SourceInfo, SourcePosition, functions, parser::ast::SourceLocation, traps};
 
 /// Encapsulates info regarding a script call.
 #[derive(Clone, Debug)]
@@ -14,7 +16,7 @@ pub struct ScriptCall {
 	/// The type of script call.
 	pub call_type:   ScriptCallType,
 	/// The source info for the script called.
-	pub source_info: crate::SourceInfo,
+	pub source_info: SourceInfo,
 }
 
 impl ScriptCall {
@@ -33,8 +35,8 @@ pub enum ScriptCallType {
 	Run,
 }
 
-impl std::fmt::Display for ScriptCall {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ScriptCall {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self.call_type {
 			ScriptCallType::Source => write!(f, "source({})", self.source_info),
 			ScriptCallType::Run => write!(f, "script({})", self.source_info),
@@ -109,8 +111,8 @@ impl FrameType {
 	}
 }
 
-impl std::fmt::Display for FrameType {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for FrameType {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Script(call) => call.fmt(f),
 			Self::Function(call) => call.fmt(f),
@@ -138,8 +140,8 @@ impl FunctionCall {
 	}
 }
 
-impl std::fmt::Display for FunctionCall {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for FunctionCall {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "func({})", self.function_name)
 	}
 }
@@ -152,18 +154,18 @@ pub struct Frame {
 	/// The source information for the frame. The locations associated with AST
 	/// nodes executed in this frame should be interpreted as being relative to
 	/// this source info.
-	pub source_info:         crate::SourceInfo,
+	pub source_info:         SourceInfo,
 	/// The location of the entry point into this frame, within the frame of
 	/// reference of `source_info`. May be `None` if the entry point is not
 	/// known.
-	pub entry:               Option<Arc<crate::SourcePosition>>,
+	pub entry:               Option<Arc<SourcePosition>>,
 	/// Information about the currently executing location. For the topmost frame
 	/// on the stack, this represents the current execution location. For older
 	/// frames, this represents the site from which a control transfer was made
 	/// to the next younger frame. May be `None` if the current location is not
 	/// known. When present, it is relative to the frame of reference of
 	/// `source_info`.
-	pub current:             Option<Arc<crate::SourcePosition>>,
+	pub current:             Option<Arc<SourcePosition>>,
 	/// Positional arguments (not including $0). May not be present for all
 	/// frames.
 	pub args:                Vec<String>,
@@ -175,20 +177,20 @@ pub struct Frame {
 impl Frame {
 	/// Returns the adjusted source info for this frame, combining the
 	/// frame's `source_info` and `current_line_offset`, if present.
-	pub fn adjusted_source_info(&self) -> crate::SourceInfo {
+	pub fn adjusted_source_info(&self) -> SourceInfo {
 		self.pos_as_source_info(None)
 	}
 
 	/// Returns the current position as a new `SourceInfo`, combining the
 	/// frame's `source_info` and `current` position.
-	pub fn current_pos_as_source_info(&self) -> crate::SourceInfo {
+	pub fn current_pos_as_source_info(&self) -> SourceInfo {
 		self.pos_as_source_info(self.current.as_ref())
 	}
 
-	fn pos_as_source_info(&self, pos: Option<&Arc<crate::SourcePosition>>) -> crate::SourceInfo {
+	fn pos_as_source_info(&self, pos: Option<&Arc<SourcePosition>>) -> SourceInfo {
 		let mut new_start = if let Some(existing_start) = &self.source_info.start {
 			if let Some(current) = pos {
-				Some(Arc::new(crate::SourcePosition {
+				Some(Arc::new(SourcePosition {
 					index:  existing_start.index + current.index,
 					line:   existing_start.line + (current.line - 1),
 					column: if current.line <= 1 {
@@ -211,7 +213,7 @@ impl Frame {
 
 				Some(Arc::new(pos))
 			} else {
-				Some(Arc::new(crate::SourcePosition {
+				Some(Arc::new(SourcePosition {
 					index:  0,
 					line:   self.current_line_offset + 1,
 					column: 1,
@@ -219,7 +221,7 @@ impl Frame {
 			};
 		}
 
-		crate::SourceInfo { source: self.source_info.source.clone(), start: new_start }
+		SourceInfo { source: self.source_info.source.clone(), start: new_start }
 	}
 
 	/// Returns the current line number.
@@ -270,8 +272,8 @@ impl<'a> FormatCallStack<'a> {
 	}
 }
 
-impl std::fmt::Display for FormatCallStack<'_> {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for FormatCallStack<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		self.stack.fmt_with_options(f, self.options)
 	}
 }
@@ -301,11 +303,7 @@ impl CallStack {
 	///
 	/// * `f` - The formatter to write to.
 	/// * `options` - The formatting options.
-	fn fmt_with_options(
-		&self,
-		f: &mut std::fmt::Formatter<'_>,
-		options: &FormatOptions,
-	) -> std::fmt::Result {
+	fn fmt_with_options(&self, f: &mut fmt::Formatter<'_>, options: &FormatOptions) -> fmt::Result {
 		if self.is_empty() {
 			return Ok(());
 		}
@@ -345,13 +343,13 @@ impl CallStack {
 	}
 }
 
-impl std::fmt::Display for CallStack {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for CallStack {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		self.fmt_with_options(f, &FormatOptions::default())
 	}
 }
 
-impl std::ops::Index<usize> for CallStack {
+impl ops::Index<usize> for CallStack {
 	type Output = Frame;
 
 	fn index(&self, index: usize) -> &Self::Output {
@@ -395,16 +393,16 @@ impl CallStack {
 	/// expressed as a new `SourceInfo`. Note that this may not be identical
 	/// to that frame's `SourceInfo` since it may include an offset representing
 	/// the current execution position within that source.
-	pub fn current_pos_as_source_info(&self) -> crate::SourceInfo {
+	pub fn current_pos_as_source_info(&self) -> SourceInfo {
 		let Some(frame) = self.frames.front() else {
-			return crate::SourceInfo::default();
+			return SourceInfo::default();
 		};
 
 		frame.current_pos_as_source_info()
 	}
 
 	/// Updates the currently executing position in the top stack frame.
-	pub fn set_current_pos(&mut self, position: Option<Arc<crate::SourcePosition>>) {
+	pub fn set_current_pos(&mut self, position: Option<Arc<SourcePosition>>) {
 		if let Some(frame) = self.frames.front_mut() {
 			frame.current = position;
 		}
@@ -434,7 +432,7 @@ impl CallStack {
 	pub fn push_script(
 		&mut self,
 		call_type: ScriptCallType,
-		source_info: &crate::SourceInfo,
+		source_info: &SourceInfo,
 		args: impl IntoIterator<Item = String>,
 	) {
 		self.frames.push_front(Frame {
@@ -465,7 +463,7 @@ impl CallStack {
 		signal: traps::TrapSignal,
 		handler: Option<&traps::TrapHandler>,
 	) {
-		let source_info = handler.map_or_else(crate::SourceInfo::default, |h| h.source_info.clone());
+		let source_info = handler.map_or_else(SourceInfo::default, |h| h.source_info.clone());
 
 		self.frames.push_front(Frame {
 			frame_type: FrameType::TrapHandler(signal),
@@ -484,7 +482,7 @@ impl CallStack {
 		self.frames.push_front(Frame {
 			frame_type:          FrameType::Eval,
 			args:                vec![],
-			source_info:         crate::SourceInfo::from("eval"), // TODO(source-info): fill this out
+			source_info:         SourceInfo::from("eval"), // TODO(source-info): fill this out
 			current_line_offset: 0,
 			current:             None, // TODO(source-info): fill this out
 			entry:               None, // TODO(source-info): fill this out
@@ -496,7 +494,7 @@ impl CallStack {
 		self.frames.push_front(Frame {
 			frame_type:          FrameType::CommandString,
 			args:                vec![],
-			source_info:         crate::SourceInfo::from("environment"),
+			source_info:         SourceInfo::from("environment"),
 			current_line_offset: 0,
 			current:             None, // TODO(source-info): fill this out
 			entry:               None, // TODO(source-info): fill this out
@@ -509,7 +507,7 @@ impl CallStack {
 			frame_type:          FrameType::InteractiveSession,
 			args:                vec![],
 			current_line_offset: 0,
-			source_info:         crate::SourceInfo::from("main"),
+			source_info:         SourceInfo::from("main"),
 			current:             None, // TODO(source-info): fill this out
 			entry:               None, // TODO(source-info): fill this out
 		});
@@ -546,7 +544,7 @@ impl CallStack {
 	/// Iterates through the function calls on the stack.
 	pub fn iter_function_calls(
 		&self,
-	) -> impl DoubleEndedIterator<Item = &FunctionCall> + Clone + std::iter::FusedIterator + '_ {
+	) -> impl DoubleEndedIterator<Item = &FunctionCall> + Clone + iter::FusedIterator + '_ {
 		self.iter().filter_map(|frame| {
 			if let FrameType::Function(call) = &frame.frame_type {
 				Some(call)
@@ -559,7 +557,7 @@ impl CallStack {
 	/// Iterates through the script calls on the stack.
 	pub fn iter_script_calls(
 		&self,
-	) -> impl DoubleEndedIterator<Item = &ScriptCall> + Clone + std::iter::FusedIterator + '_ {
+	) -> impl DoubleEndedIterator<Item = &ScriptCall> + Clone + iter::FusedIterator + '_ {
 		self.iter().filter_map(|frame| {
 			if let FrameType::Script(call) = &frame.frame_type {
 				Some(call)
@@ -621,7 +619,7 @@ impl CallStack {
 	/// recent.
 	pub fn iter(
 		&self,
-	) -> impl DoubleEndedIterator<Item = &Frame> + ExactSizeIterator + Clone + std::iter::FusedIterator + '_
+	) -> impl DoubleEndedIterator<Item = &Frame> + ExactSizeIterator + Clone + iter::FusedIterator + '_
 	{
 		self.frames.iter()
 	}
@@ -630,7 +628,7 @@ impl CallStack {
 	/// recent.
 	pub fn iter_mut(
 		&mut self,
-	) -> impl DoubleEndedIterator<Item = &mut Frame> + ExactSizeIterator + std::iter::FusedIterator + '_
+	) -> impl DoubleEndedIterator<Item = &mut Frame> + ExactSizeIterator + iter::FusedIterator + '_
 	{
 		self.frames.iter_mut()
 	}

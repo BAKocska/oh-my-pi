@@ -1,6 +1,6 @@
 //! Interactive pseudo-terminal overlay and bounded terminal-state projection.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, mem, str};
 
 use bytes::Bytes;
 use omp_core::{Str, sf};
@@ -185,7 +185,7 @@ impl TerminalState {
 				},
 				ParseState::Csi(sequence) => {
 					if (0x40..=0x7e).contains(&byte) {
-						let sequence = std::mem::take(sequence);
+						let sequence = mem::take(sequence);
 						self.parse = ParseState::Ground;
 						self.apply_csi(&sequence, byte);
 					} else if sequence.len() < 4096 {
@@ -254,7 +254,7 @@ impl TerminalState {
 		}
 		self.utf8_pending.append(&mut self.text);
 		loop {
-			match std::str::from_utf8(&self.utf8_pending) {
+			match str::from_utf8(&self.utf8_pending) {
 				Ok(text) => {
 					let owned = text.to_owned();
 					self.utf8_pending.clear();
@@ -346,7 +346,7 @@ impl TerminalState {
 		let private = sequence.first() == Some(&b'?');
 		let body = if private { &sequence[1..] } else { sequence };
 		let mut values = body.split(|byte| *byte == b';').map(|part| {
-			std::str::from_utf8(part)
+			str::from_utf8(part)
 				.ok()
 				.and_then(|part| part.parse::<u16>().ok())
 		});

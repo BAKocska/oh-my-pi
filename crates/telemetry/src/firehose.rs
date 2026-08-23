@@ -11,12 +11,14 @@ use std::sync::{
 
 use flume::{Receiver, Sender, TryRecvError, TrySendError};
 use omp_core::{Hash32, Str};
+use omp_proto::omp::inference::v1;
 /// Existing tool-layer vocabularies consumed verbatim by firehose payloads.
 pub use omp_tool::{ArgIssueKind, ArtifactLifetime, PolicyDenied};
 use parking_lot::RwLock;
 use serde_json::Value;
 use smallvec::SmallVec;
 
+use crate::redact;
 pub use crate::semconv::{
 	BranchOp, Capture, CompactionReason, Consent, DegradeAction, ExportProtocol, IssueStatus, Kind,
 	RepairKind, RetentionTier, SpillReason, ToolStatus,
@@ -275,9 +277,9 @@ pub struct ModelRequest {
 	/// Selected provider.
 	pub provider:        Str,
 	/// Full-fidelity inference wire usage; this is the in-process truth.
-	pub usage:           omp_proto::omp::inference::v1::Usage,
+	pub usage:           v1::Usage,
 	/// Provider or catalog cost in nano-USD.
-	pub cost:            Option<omp_proto::omp::inference::v1::Cost>,
+	pub cost:            Option<v1::Cost>,
 	/// Prompt-cache identity from the assembler.
 	pub prompt:          PromptFingerprint,
 	/// Whether the accepted result was replayed.
@@ -511,8 +513,7 @@ impl Event {
 				if level != Capture::Content {
 					call.args_raw = None;
 				} else if let Some(raw) = &call.args_raw {
-					call.args_raw =
-						Some(Str::from(crate::redact::redact_sensitive_credentials(raw.as_str())));
+					call.args_raw = Some(Str::from(redact::redact_sensitive_credentials(raw.as_str())));
 				}
 			},
 			Self::IssueReport(issue) => {
@@ -522,8 +523,7 @@ impl Event {
 				if level != Capture::Content {
 					issue.args_raw = None;
 				} else if let Some(raw) = &issue.args_raw {
-					issue.args_raw =
-						Some(Str::from(crate::redact::redact_sensitive_credentials(raw.as_str())));
+					issue.args_raw = Some(Str::from(redact::redact_sensitive_credentials(raw.as_str())));
 				}
 			},
 			_ => {},
@@ -693,6 +693,8 @@ impl Drop for SubscriptionHandle {
 
 #[cfg(test)]
 mod tests {
+	use std::iter;
+
 	use omp_core::sf;
 
 	use super::*;
@@ -723,7 +725,7 @@ mod tests {
 			.subscribe_replay(SubscriptionOptions::new([Kind::TurnStart], 4).unwrap(), &replay, 4)
 			.unwrap();
 		firehose.publish(Event::TurnStart(TurnStart { turn: 3, ..TurnStart::default() }));
-		let turns = std::iter::from_fn(|| subscription.try_recv().ok())
+		let turns = iter::from_fn(|| subscription.try_recv().ok())
 			.map(|event| match &*event {
 				Event::TurnStart(turn) => turn.turn,
 				_ => unreachable!("kind filter admits only turn starts"),

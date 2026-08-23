@@ -262,18 +262,20 @@ impl QuotaState {
 
 #[cfg(test)]
 mod tests {
+	use std::time;
+
 	use super::*;
 
 	#[test]
 	fn reserve_preflight_uses_only_current_known_remaining_fraction() {
-		let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+		let now = SystemTime::UNIX_EPOCH + time::Duration::from_secs(100);
 		let mut quota = QuotaState::default();
 		quota.apply(QuotaObservation {
 			window:      QuotaWindowId::new("monthly"),
 			consumed:    Some(91),
 			remaining:   Some(9),
 			limit:       Some(100),
-			reset_at:    Some(now + std::time::Duration::from_secs(60)),
+			reset_at:    Some(now + time::Duration::from_secs(60)),
 			exhausted:   Some(false),
 			provenance:  QuotaProvenance::Provider,
 			observed_at: now,

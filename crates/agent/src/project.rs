@@ -1,9 +1,12 @@
 //! Pure transcript-to-thread projection and canonical tool-result lowering.
-use std::{collections::BTreeMap, sync::LazyLock};
+use std::{collections::BTreeMap, str, sync::LazyLock};
 
 use bytes::Bytes;
 use omp_core::{SparseMap, SparseSet, Str, encoding::hex};
-use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1::{self as pb, value},
+	thread::v1::{self as thread_pb, blob, item, part},
+};
 use omp_scribe::{Props, Template};
 use omp_storage::transcript::{AmendPatch, Entry, Kind, LiveSet, Log, truncate_persisted_text};
 use omp_tool::{
@@ -12,6 +15,8 @@ use omp_tool::{
 };
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::{journal_kinds, prompt_engine, prompt_keys};
 
 const COMPACTION_SUMMARY_CONTEXT: &str = "Prior model work/tool state available.\nMUST build on \
                                           prior work; NEVER duplicate prior \
@@ -24,12 +29,12 @@ const HANDOFF_SUMMARY_CONTEXT: &str =
 
 pub fn render_compaction_summary(summary: &str, method: Option<&str>) -> String {
 	static COMPACTION: LazyLock<Template> = LazyLock::new(|| {
-		crate::prompt_engine::engine()
+		prompt_engine::engine()
 			.compile("compaction/summary-context", COMPACTION_SUMMARY_CONTEXT)
 			.expect("embedded compaction summary template")
 	});
 	static HANDOFF: LazyLock<Template> = LazyLock::new(|| {
-		crate::prompt_engine::engine()
+		prompt_engine::engine()
 			.compile("compaction/handoff-summary-context", HANDOFF_SUMMARY_CONTEXT)
 			.expect("embedded handoff summary template")
 	});
@@ -39,9 +44,9 @@ pub fn render_compaction_summary(summary: &str, method: Option<&str>) -> String 
 		&*COMPACTION
 	};
 	let mut props = Props::new();
-	props.set(crate::prompt_keys::SUMMARY, summary.to_owned());
+	props.set(prompt_keys::SUMMARY, summary.to_owned());
 	let mut rendered = template
-		.render_str(crate::prompt_engine::engine(), &props)
+		.render_str(prompt_engine::engine(), &props)
 		.expect("typed summary props satisfy compaction template")
 		.to_string();
 	if !rendered.ends_with('\n') {
@@ -64,7 +69,7 @@ pub enum ProjectionError {
 	OutcomeJson(#[from] serde_json::Error),
 	/// A model-facing JSON part was not UTF-8.
 	#[error("tool JSON part is not UTF-8: {0}")]
-	PartUtf8(#[from] std::str::Utf8Error),
+	PartUtf8(#[from] str::Utf8Error),
 	/// A model-facing blob hash was not hexadecimal.
 	#[error("tool blob hash is not valid hexadecimal")]
 	BlobHash,
@@ -89,12 +94,12 @@ pub fn truncate_item_for_persistence(item: &mut thread_pb::Item) {
 		return;
 	};
 	match kind {
-		thread_pb::item::Kind::Message(message) => {
+		item::Kind::Message(message) => {
 			truncate_parts_for_persistence(&mut message.parts);
 		},
-		thread_pb::item::Kind::ToolCall(call) => {
+		item::Kind::ToolCall(call) => {
 			if call.thought_signature.is_empty()
-				&& let Ok(arguments) = std::str::from_utf8(&call.args_json)
+				&& let Ok(arguments) = str::from_utf8(&call.args_json)
 			{
 				let bounded = truncate_persisted_text(arguments);
 				if bounded.as_str() != arguments {
@@ -102,7 +107,7 @@ pub fn truncate_item_for_persistence(item: &mut thread_pb::Item) {
 				}
 			}
 		},
-		thread_pb::item::Kind::ToolResult(result) => {
+		item::Kind::ToolResult(result) => {
 			truncate_parts_for_persistence(&mut result.parts);
 		},
 	}
@@ -114,19 +119,19 @@ fn truncate_parts_for_persistence(parts: &mut [thread_pb::Part]) {
 			continue;
 		};
 		match kind {
-			thread_pb::part::Kind::Text(text) => {
+			part::Kind::Text(text) => {
 				let bounded = truncate_persisted_text(text);
 				if bounded.as_str() != text {
 					*text = bounded.as_str().to_owned();
 				}
 			},
-			thread_pb::part::Kind::Thinking(thinking) if thinking.signature.is_empty() => {
+			part::Kind::Thinking(thinking) if thinking.signature.is_empty() => {
 				let bounded = truncate_persisted_text(&thinking.text);
 				if bounded.as_str() != thinking.text {
 					thinking.text = bounded.as_str().to_owned();
 				}
 			},
-			thread_pb::part::Kind::Fallback(fallback) => {
+			part::Kind::Fallback(fallback) => {
 				let from = truncate_persisted_text(&fallback.from_model);
 				let to = truncate_persisted_text(&fallback.to_model);
 				if from.as_str() != fallback.from_model {
@@ -136,9 +141,7 @@ fn truncate_parts_for_persistence(parts: &mut [thread_pb::Part]) {
 					fallback.to_model = to.as_str().to_owned();
 				}
 			},
-			thread_pb::part::Kind::Thinking(_)
-			| thread_pb::part::Kind::Blob(_)
-			| thread_pb::part::Kind::ServerTool(_) => {},
+			part::Kind::Thinking(_) | part::Kind::Blob(_) | part::Kind::ServerTool(_) => {},
 		}
 	}
 }
@@ -206,33 +209,33 @@ pub fn project_journal(
 			},
 			Kind::Compact { summary, method, snapcompact, .. } => {
 				let mut parts = vec![thread_pb::Part {
-					kind: Some(thread_pb::part::Kind::Text(render_compaction_summary(
+					kind: Some(omp_proto::thread::v1::part::Kind::Text(render_compaction_summary(
 						summary,
 						method.as_deref(),
 					))),
 				}];
 				if let Some(archive) = snapcompact {
 					parts.extend(archive.frames.iter().map(|reference| thread_pb::Part {
-						kind: Some(thread_pb::part::Kind::Blob(thread_pb::Blob {
+						kind: Some(part::Kind::Blob(thread_pb::Blob {
 							hash:   Bytes::copy_from_slice(reference.hash.as_bytes()),
 							mime:   "image/png".to_owned(),
 							size:   reference.size,
 							inline: Bytes::new(),
-							detail: thread_pb::blob::Detail::Auto as i32,
+							detail: blob::Detail::Auto as i32,
 						})),
 					}));
 				}
 				positions.insert(index, items.len());
 				items.push(thread_pb::Item {
 					created_at_ms: event.ts,
-					kind: Some(thread_pb::item::Kind::Message(thread_pb::Message {
+					kind: Some(item::Kind::Message(thread_pb::Message {
 						role: thread_pb::Role::User as i32,
 						parts,
 					})),
 					..Default::default()
 				});
 			},
-			Kind::Custom(custom) if custom.kind() == crate::journal_kinds::REWIND_REPORT_KIND => {
+			Kind::Custom(custom) if custom.kind() == journal_kinds::REWIND_REPORT_KIND => {
 				#[derive(Deserialize)]
 				struct RewindReport<'a> {
 					#[serde(borrow)]
@@ -244,10 +247,10 @@ pub fn project_journal(
 				let report: RewindReport<'_> = serde_json::from_str(data.get())?;
 				items.push(thread_pb::Item {
 					created_at_ms: event.ts,
-					kind: Some(thread_pb::item::Kind::Message(thread_pb::Message {
+					kind: Some(item::Kind::Message(thread_pb::Message {
 						role:  thread_pb::Role::User as i32,
 						parts: vec![thread_pb::Part {
-							kind: Some(thread_pb::part::Kind::Text(format!(
+							kind: Some(omp_proto::thread::v1::part::Kind::Text(format!(
 								"Checkpoint called and rewound. Report retained below. Need explore again \
 								 → new `checkpoint`.\n\nReport:\n{}",
 								report.report
@@ -306,7 +309,7 @@ fn apply_amendment(item: &mut thread_pb::Item, amendment: &ItemAmendment) {
 		item.seq = seq;
 	}
 	if amendment.drop_parts
-		&& let Some(thread_pb::item::Kind::ToolResult(result)) = item.kind.as_mut()
+		&& let Some(item::Kind::ToolResult(result)) = item.kind.as_mut()
 	{
 		result.parts.clear();
 	}
@@ -324,8 +327,7 @@ pub fn project_thread_history(
 ) -> Result<thread_pb::Thread, ProjectionError> {
 	let mut projected = thread.clone();
 	for call_index in 0..projected.items.len() {
-		let Some(thread_pb::item::Kind::ToolCall(call)) = projected.items[call_index].kind.as_ref()
-		else {
+		let Some(item::Kind::ToolCall(call)) = projected.items[call_index].kind.as_ref() else {
 			continue;
 		};
 		let Some(rev) = tool_revision(&projected.items[call_index])? else {
@@ -348,7 +350,7 @@ pub fn project_thread_history(
 			.find_map(|(index, item)| {
 				matches!(
 					item.kind.as_ref(),
-					Some(thread_pb::item::Kind::ToolResult(result))
+					Some(omp_proto::thread::v1::item::Kind::ToolResult(result))
 						if result.call_id == call_id && result.details.is_some()
 				)
 				.then_some(index)
@@ -356,9 +358,7 @@ pub fn project_thread_history(
 		else {
 			continue;
 		};
-		let Some(thread_pb::item::Kind::ToolResult(result)) =
-			projected.items[result_index].kind.as_ref()
-		else {
+		let Some(item::Kind::ToolResult(result)) = projected.items[result_index].kind.as_ref() else {
 			unreachable!("result index came from ToolResult items")
 		};
 		let recorded_useless = result.useless.unwrap_or(false);
@@ -385,25 +385,22 @@ pub fn project_thread_history(
 		let lifted_details = json_proto_value(lifted_verdict);
 		let lifted_parts = tool_parts(&rendered.parts)?;
 
-		let Some(thread_pb::item::Kind::ToolCall(call)) = projected.items[call_index].kind.as_mut()
-		else {
+		let Some(item::Kind::ToolCall(call)) = projected.items[call_index].kind.as_mut() else {
 			unreachable!("call index came from ToolCall items")
 		};
 		call.args_json = live.raw_args.clone();
 		let props = projected.items[call_index].props.get_or_insert_default();
 		props.fields.insert(TOOL_REV_PROP.to_owned(), pb::Value {
-			kind: Some(pb::value::Kind::String(live.identity.rev.to_string())),
+			kind: Some(value::Kind::String(live.identity.rev.to_string())),
 		});
 		let result_props = projected.items[result_index].props.get_or_insert_default();
 		result_props
 			.fields
 			.insert(TOOL_REV_PROP.to_owned(), pb::Value {
-				kind: Some(pb::value::Kind::String(live.identity.rev.to_string())),
+				kind: Some(value::Kind::String(live.identity.rev.to_string())),
 			});
 
-		let Some(thread_pb::item::Kind::ToolResult(result)) =
-			projected.items[result_index].kind.as_mut()
-		else {
+		let Some(item::Kind::ToolResult(result)) = projected.items[result_index].kind.as_mut() else {
 			unreachable!("result index came from ToolResult items")
 		};
 		result.details = Some(lifted_details);
@@ -419,7 +416,7 @@ pub fn recovery_tool_result_item(
 	call_item: &thread_pb::Item,
 	abort: Abort,
 ) -> Result<thread_pb::Item, ProjectionError> {
-	let Some(thread_pb::item::Kind::ToolCall(call)) = call_item.kind.as_ref() else {
+	let Some(item::Kind::ToolCall(call)) = call_item.kind.as_ref() else {
 		return Err(ProjectionError::ExpectedToolCall);
 	};
 	let rev = tool_revision(call_item)?.ok_or(ProjectionError::MissingRevision)?;
@@ -485,13 +482,13 @@ fn build_tool_result_item(
 	let details = json_proto_value(serde_json::from_slice(verdict)?);
 	let props = pb::ValueMap {
 		fields: BTreeMap::from([(TOOL_REV_PROP.to_owned(), pb::Value {
-			kind: Some(pb::value::Kind::String(identity.rev.to_string())),
+			kind: Some(value::Kind::String(identity.rev.to_string())),
 		})]),
 	};
 	Ok(thread_pb::Item {
 		seq: 0,
 		created_at_ms,
-		kind: Some(thread_pb::item::Kind::ToolResult(thread_pb::ToolResult {
+		kind: Some(item::Kind::ToolResult(thread_pb::ToolResult {
 			call_id: call_id.to_owned(),
 			parts,
 			is_error,
@@ -512,7 +509,7 @@ fn tool_revision(item: &thread_pb::Item) -> Result<Option<Rev>, ProjectionError>
 	else {
 		return Ok(None);
 	};
-	let Some(pb::value::Kind::String(value)) = value.kind.as_ref() else {
+	let Some(value::Kind::String(value)) = value.kind.as_ref() else {
 		return Err(ProjectionError::RevisionType);
 	};
 	Ok(Some(
@@ -530,49 +527,49 @@ fn proto_json_bytes(value: &pb::Value) -> Option<Bytes> {
 
 fn proto_json_value(value: &pb::Value) -> Option<serde_json::Value> {
 	let value = match value.kind.as_ref()? {
-		pb::value::Kind::Null(_) => serde_json::Value::Null,
-		pb::value::Kind::Int(value) => serde_json::Value::from(*value),
-		pb::value::Kind::Double(value) => {
+		value::Kind::Null(_) => serde_json::Value::Null,
+		value::Kind::Int(value) => serde_json::Value::from(*value),
+		value::Kind::Double(value) => {
 			serde_json::Value::Number(serde_json::Number::from_f64(*value)?)
 		},
-		pb::value::Kind::Bool(value) => serde_json::Value::Bool(*value),
-		pb::value::Kind::String(value) => serde_json::Value::String(value.clone()),
-		pb::value::Kind::List(list) => serde_json::Value::Array(
+		value::Kind::Bool(value) => serde_json::Value::Bool(*value),
+		value::Kind::String(value) => serde_json::Value::String(value.clone()),
+		value::Kind::List(list) => serde_json::Value::Array(
 			list
 				.values
 				.iter()
 				.map(proto_json_value)
 				.collect::<Option<Vec<_>>>()?,
 		),
-		pb::value::Kind::Map(map) => serde_json::Value::Object(
+		value::Kind::Map(map) => serde_json::Value::Object(
 			map.fields
 				.iter()
 				.map(|(key, value)| Some((key.clone(), proto_json_value(value)?)))
 				.collect::<Option<serde_json::Map<_, _>>>()?,
 		),
-		pb::value::Kind::Uint(value) => serde_json::Value::from(*value),
+		value::Kind::Uint(value) => serde_json::Value::from(*value),
 	};
 	Some(value)
 }
 
 fn json_proto_value(value: serde_json::Value) -> pb::Value {
 	let kind = match value {
-		serde_json::Value::Null => pb::value::Kind::Null(true),
-		serde_json::Value::Bool(value) => pb::value::Kind::Bool(value),
+		serde_json::Value::Null => value::Kind::Null(true),
+		serde_json::Value::Bool(value) => value::Kind::Bool(value),
 		serde_json::Value::Number(value) => {
 			if let Some(value) = value.as_i64() {
-				pb::value::Kind::Int(value)
+				value::Kind::Int(value)
 			} else if let Some(value) = value.as_u64() {
-				pb::value::Kind::Uint(value)
+				value::Kind::Uint(value)
 			} else {
-				pb::value::Kind::Double(value.as_f64().expect("JSON numbers are finite"))
+				value::Kind::Double(value.as_f64().expect("JSON numbers are finite"))
 			}
 		},
-		serde_json::Value::String(value) => pb::value::Kind::String(value),
-		serde_json::Value::Array(values) => pb::value::Kind::List(pb::ValueList {
+		serde_json::Value::String(value) => value::Kind::String(value),
+		serde_json::Value::Array(values) => value::Kind::List(pb::ValueList {
 			values: values.into_iter().map(json_proto_value).collect(),
 		}),
-		serde_json::Value::Object(fields) => pb::value::Kind::Map(pb::ValueMap {
+		serde_json::Value::Object(fields) => value::Kind::Map(pb::ValueMap {
 			fields: fields
 				.into_iter()
 				.map(|(key, value)| (key, json_proto_value(value)))
@@ -586,17 +583,15 @@ fn tool_parts(parts: &[ToolPart]) -> Result<Vec<thread_pb::Part>, ProjectionErro
 	let mut projected = Vec::with_capacity(parts.len());
 	for part in parts {
 		match part {
-			ToolPart::Text { text } => projected.push(thread_pb::Part {
-				kind: Some(thread_pb::part::Kind::Text(text.as_str().to_owned())),
-			}),
+			ToolPart::Text { text } => projected
+				.push(thread_pb::Part { kind: Some(part::Kind::Text(text.as_str().to_owned())) }),
 			ToolPart::Json { json } => projected.push(thread_pb::Part {
-				kind: Some(thread_pb::part::Kind::Text(std::str::from_utf8(json)?.to_owned())),
+				kind: Some(part::Kind::Text(str::from_utf8(json)?.to_owned())),
 			}),
 			ToolPart::Blob { blob, alt } => {
 				if let Some(alt) = alt {
-					projected.push(thread_pb::Part {
-						kind: Some(thread_pb::part::Kind::Text(alt.as_str().to_owned())),
-					});
+					projected
+						.push(thread_pb::Part { kind: Some(part::Kind::Text(alt.as_str().to_owned())) });
 				}
 				let hash = hex::decode(blob.hash.as_str())
 					.into_vec()
@@ -605,7 +600,7 @@ fn tool_parts(parts: &[ToolPart]) -> Result<Vec<thread_pb::Part>, ProjectionErro
 					return Err(ProjectionError::BlobHash);
 				}
 				projected.push(thread_pb::Part {
-					kind: Some(thread_pb::part::Kind::Blob(thread_pb::Blob {
+					kind: Some(part::Kind::Blob(thread_pb::Blob {
 						hash: hash.into(),
 						mime: blob.media_type.as_str().to_owned(),
 						size: blob.byte_len,
@@ -622,11 +617,15 @@ fn tool_parts(parts: &[ToolPart]) -> Result<Vec<thread_pb::Part>, ProjectionErro
 mod tests {
 	use std::{
 		collections::BTreeMap,
+		env, fs,
 		sync::atomic::{AtomicU64, Ordering},
 	};
 
 	use bytes::Bytes;
-	use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
+	use omp_proto::{
+		inference::v1::{self as pb, value},
+		thread::v1::{self as thread_pb, blob, item},
+	};
 	use omp_storage::transcript::{
 		AmendPatch, Event, Header, ItemRecord, Kind, LiveSet, SessionId, Writer, load,
 	};
@@ -656,7 +655,7 @@ mod tests {
 
 	#[test]
 	fn user_blob_survives_projection_when_tool_media_is_disabled() {
-		let path = std::env::temp_dir().join(format!(
+		let path = env::temp_dir().join(format!(
 			"omp-agent-project-user-blob-{}-{}.jsonl",
 			std::process::id(),
 			NEXT_PATH.fetch_add(1, Ordering::Relaxed)
@@ -665,7 +664,7 @@ mod tests {
 			v:       4,
 			id:      SessionId(sf!("user-blob")),
 			created: 1,
-			cwd:     std::env::temp_dir(),
+			cwd:     env::temp_dir(),
 		})
 		.expect("create transcript");
 		let blob = thread_pb::Blob {
@@ -673,12 +672,14 @@ mod tests {
 			mime:   "image/png".to_owned(),
 			size:   4,
 			inline: Bytes::from_static(b"data"),
-			detail: thread_pb::blob::Detail::Auto as i32,
+			detail: blob::Detail::Auto as i32,
 		};
 		let item = thread_pb::Item {
-			kind: Some(thread_pb::item::Kind::Message(thread_pb::Message {
+			kind: Some(item::Kind::Message(thread_pb::Message {
 				role:  thread_pb::Role::User as i32,
-				parts: vec![thread_pb::Part { kind: Some(thread_pb::part::Kind::Blob(blob)) }],
+				parts: vec![thread_pb::Part {
+					kind: Some(omp_proto::thread::v1::part::Kind::Blob(blob)),
+				}],
 			})),
 			..Default::default()
 		};
@@ -705,12 +706,12 @@ mod tests {
 		})
 		.expect("project transcript");
 		assert_eq!(projected.items, vec![item]);
-		std::fs::remove_file(path).expect("remove transcript");
+		fs::remove_file(path).expect("remove transcript");
 	}
 
 	#[test]
 	fn drop_parts_preserves_tool_result_details_and_revision() {
-		let path = std::env::temp_dir().join(format!(
+		let path = env::temp_dir().join(format!(
 			"omp-agent-project-drop-parts-{}-{}.jsonl",
 			std::process::id(),
 			NEXT_PATH.fetch_add(1, Ordering::Relaxed)
@@ -719,16 +720,16 @@ mod tests {
 			v:       4,
 			id:      SessionId(sf!("drop-parts")),
 			created: 1,
-			cwd:     std::env::temp_dir(),
+			cwd:     env::temp_dir(),
 		})
 		.expect("create transcript");
-		let details = pb::Value { kind: Some(pb::value::Kind::String("recorded".to_owned())) };
+		let details = pb::Value { kind: Some(value::Kind::String("recorded".to_owned())) };
 		let item = thread_pb::Item {
-			kind: Some(thread_pb::item::Kind::ToolResult(thread_pb::ToolResult {
+			kind: Some(item::Kind::ToolResult(thread_pb::ToolResult {
 				call_id: "call-1".to_owned(),
 				name: "read".to_owned(),
 				parts: vec![thread_pb::Part {
-					kind: Some(thread_pb::part::Kind::Text("large result".to_owned())),
+					kind: Some(omp_proto::thread::v1::part::Kind::Text("large result".to_owned())),
 				}],
 				details: Some(details.clone()),
 				is_error: true,
@@ -737,7 +738,7 @@ mod tests {
 			})),
 			props: Some(pb::ValueMap {
 				fields: BTreeMap::from([(TOOL_REV_PROP.to_owned(), pb::Value {
-					kind: Some(pb::value::Kind::String("read.1".to_owned())),
+					kind: Some(value::Kind::String("read.1".to_owned())),
 				})]),
 			}),
 			..Default::default()
@@ -763,7 +764,7 @@ mod tests {
 			model_class:        ModelClass::Standard,
 		})
 		.expect("project transcript");
-		let Some(thread_pb::item::Kind::ToolResult(result)) = projected.items[0].kind.as_ref() else {
+		let Some(item::Kind::ToolResult(result)) = projected.items[0].kind.as_ref() else {
 			panic!("projected item is a tool result");
 		};
 		assert!(result.parts.is_empty());
@@ -775,8 +776,10 @@ mod tests {
 				.props
 				.as_ref()
 				.and_then(|props| props.fields.get(TOOL_REV_PROP)),
-			Some(&pb::Value { kind: Some(pb::value::Kind::String("read.1".to_owned())) })
+			Some(&pb::Value {
+				kind: Some(omp_proto::inference::v1::value::Kind::String("read.1".to_owned())),
+			})
 		);
-		std::fs::remove_file(path).expect("remove transcript");
+		fs::remove_file(path).expect("remove transcript");
 	}
 }

@@ -1,6 +1,7 @@
 //! Structured desktop notifications for terminal and native platform sinks.
 
 use std::{
+	env,
 	ffi::{OsStr, OsString},
 	fmt::Write as _,
 	fs,
@@ -269,7 +270,7 @@ struct RealSystem;
 
 impl System for RealSystem {
 	fn var(&self, name: &str) -> Option<OsString> {
-		std::env::var_os(name)
+		env::var_os(name)
 	}
 
 	fn is_linux(&self) -> bool {
@@ -286,7 +287,7 @@ impl System for RealSystem {
 
 	fn find_program(&self, name: &str) -> Option<PathBuf> {
 		let path = self.var("PATH")?;
-		std::env::split_paths(&path)
+		env::split_paths(&path)
 			.map(|directory| directory.join(name))
 			.find(|candidate| fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file()))
 	}

@@ -4,6 +4,7 @@ use std::{
 	collections::HashMap,
 	future::Future,
 	path::{Component, Path, PathBuf},
+	str,
 	sync::Arc,
 	time::Duration,
 };
@@ -11,13 +12,19 @@ use std::{
 use bytes::Bytes;
 use omp_core::Str;
 use omp_docserver::position::{PositionEncoding, TextEdit, apply_text_edits};
-use omp_proto::{document::v1 as pb, env::v1 as env_pb};
+use omp_proto::{
+	document::v1::{
+		self as pb, commit_transaction_response, document_mutation, lsp_response, text_mutation,
+	},
+	env::v1::{self as env_pb, OutputChannel},
+};
 use omp_tools::lsp::{
 	Action, Fault, LspControl, Params, Payload, actions,
 	checkers::{self, CheckerExecutor, CheckerFault, CheckerOutput, CheckerRequest, Preset},
 	diagnostics::{DiagnosticResult, render as render_diagnostics},
 	navigation, refactor, render,
 };
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -31,7 +38,7 @@ use super::{
 #[derive(Clone)]
 struct ExecChecker {
 	host:     ExecHost,
-	sessions: Arc<parking_lot::Mutex<HashMap<PathBuf, Bytes>>>,
+	sessions: Arc<Mutex<HashMap<PathBuf, Bytes>>>,
 }
 
 impl CheckerExecutor for ExecChecker {
@@ -99,14 +106,10 @@ impl CheckerExecutor for ExecChecker {
 					}
 				};
 				match event {
-					Some(ExecEvent::Output(frame))
-						if frame.channel == env_pb::OutputChannel::Stdout as i32 =>
-					{
+					Some(ExecEvent::Output(frame)) if frame.channel == OutputChannel::Stdout as i32 => {
 						stdout.extend_from_slice(&frame.data);
 					},
-					Some(ExecEvent::Output(frame))
-						if frame.channel == env_pb::OutputChannel::Stderr as i32 =>
-					{
+					Some(ExecEvent::Output(frame)) if frame.channel == OutputChannel::Stderr as i32 => {
 						stderr.extend_from_slice(&frame.data);
 					},
 					Some(ExecEvent::Exit(exit)) => break exit.status,
@@ -216,10 +219,7 @@ impl DocumentLspControl {
 	pub fn new(documents: DocumentHost, exec: ExecHost) -> Self {
 		Self {
 			documents,
-			checker: ExecChecker {
-				host:     exec,
-				sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-			},
+			checker: ExecChecker { host: exec, sessions: Arc::new(Mutex::new(HashMap::new())) },
 		}
 	}
 
@@ -268,16 +268,16 @@ impl DocumentLspControl {
 			let content = read_whole(&self.documents, &lease)
 				.await
 				.map_err(|_| Fault::WorkspaceEdit)?;
-			let text = std::str::from_utf8(&content).map_err(|_| Fault::WorkspaceEdit)?;
+			let text = str::from_utf8(&content).map_err(|_| Fault::WorkspaceEdit)?;
 			let edits = serde_json::from_value::<Vec<TextEdit>>(edits.clone())
 				.map_err(|_| Fault::WorkspaceEdit)?;
 			let content =
 				apply_text_edits(text, &edits, encoding).map_err(|_| Fault::WorkspaceEdit)?;
 			operations.push(pb::DocumentMutation {
 				document:  Some(lease_target(&lease)),
-				operation: Some(pb::document_mutation::Operation::Text(pb::TextMutation {
+				operation: Some(document_mutation::Operation::Text(pb::TextMutation {
 					base_revision: lease.head().revision.clone(),
-					change:        Some(pb::text_mutation::Change::ProposedContent(content)),
+					change:        Some(text_mutation::Change::ProposedContent(content)),
 					stale_policy:  pb::StalePolicy::Fail as i32,
 					format_policy: pb::FormatPolicy::BestEffort as i32,
 				})),
@@ -293,7 +293,7 @@ impl DocumentLspControl {
 			.await
 			.map_err(|_| Fault::WorkspaceEdit)?;
 		match response.outcome {
-			Some(pb::commit_transaction_response::Outcome::Committed(committed)) => {
+			Some(commit_transaction_response::Outcome::Committed(committed)) => {
 				Ok(committed.operations.len())
 			},
 			_ => Err(Fault::WorkspaceEdit),
@@ -511,7 +511,7 @@ impl LspControl for DocumentLspControl {
 						)
 						.await
 						.map_err(|_| Fault::Server)?;
-					if let Some(pb::lsp_response::Outcome::ResultJson(bytes)) = response.outcome {
+					if let Some(lsp_response::Outcome::ResultJson(bytes)) = response.outcome {
 						let edit: Value = serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?;
 						if !edit.is_null() {
 							edits.push(edit);
@@ -640,7 +640,7 @@ impl LspControl for DocumentLspControl {
 			let character = if let Some(symbol) = &params.symbol {
 				let target =
 					navigation::parse_symbol_target(symbol).map_err(|_| Fault::InvalidArguments)?;
-				let text = std::str::from_utf8(&content).map_err(|_| Fault::InvalidArguments)?;
+				let text = str::from_utf8(&content).map_err(|_| Fault::InvalidArguments)?;
 				let source_line = text
 					.lines()
 					.nth(line.saturating_sub(1) as usize)
@@ -696,10 +696,10 @@ impl LspControl for DocumentLspControl {
 					.await
 					.map_err(|_| Fault::Server)?;
 				match response.outcome {
-					Some(pb::lsp_response::Outcome::ResultJson(bytes)) => {
+					Some(lsp_response::Outcome::ResultJson(bytes)) => {
 						results.push(serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?)
 					},
-					Some(pb::lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
+					Some(lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
 				}
 			}
 			let mut data = if results.len() == 1 {
@@ -789,7 +789,7 @@ impl LspControl for DocumentLspControl {
 							)
 							.await
 							.map_err(|_| Fault::Server)?;
-						if let Some(pb::lsp_response::Outcome::ResultJson(bytes)) = response.outcome {
+						if let Some(lsp_response::Outcome::ResultJson(bytes)) = response.outcome {
 							action = serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?;
 						}
 					}
@@ -839,7 +839,7 @@ impl LspControl for DocumentLspControl {
 							)
 							.await
 							.map_err(|_| Fault::Server)?;
-						if !matches!(response.outcome, Some(pb::lsp_response::Outcome::ResultJson(_))) {
+						if !matches!(response.outcome, Some(lsp_response::Outcome::ResultJson(_))) {
 							return Err(Fault::Server);
 						}
 					}

@@ -1,13 +1,16 @@
 //! OMP command-line entry point.
 
-use std::process::ExitCode;
+use std::{env, panic, process::ExitCode};
+
+#[cfg(windows)]
+use windows_sys::Win32::System::Console;
 
 fn process_bootstrap() {
 	// Safety: this runs as the first statement in `main`, before OMP starts any
 	// daemon, worker, or application thread that could concurrently read env.
 	unsafe {
-		std::env::remove_var("MallocStackLogging");
-		std::env::remove_var("MallocStackLoggingNoCompact");
+		env::remove_var("MallocStackLogging");
+		env::remove_var("MallocStackLoggingNoCompact");
 	}
 	set_process_title();
 }
@@ -31,7 +34,7 @@ fn set_process_title() {
 	let title = "omp\0".encode_utf16().collect::<Vec<_>>();
 	// Safety: `title` is NUL terminated and remains alive for the call.
 	unsafe {
-		windows_sys::Win32::System::Console::SetConsoleTitleW(title.as_ptr());
+		Console::SetConsoleTitleW(title.as_ptr());
 	}
 }
 
@@ -45,7 +48,7 @@ fn set_process_title() {
 fn set_process_title() {}
 
 fn install_panic_hook() {
-	std::panic::set_hook(Box::new(|info| {
+	panic::set_hook(Box::new(|info| {
 		eprintln!("\x1b[31momp internal error:\x1b[0m {info}");
 	}));
 }
@@ -54,7 +57,7 @@ fn install_panic_hook() {
 async fn main() -> ExitCode {
 	process_bootstrap();
 	install_panic_hook();
-	if std::env::args_os()
+	if env::args_os()
 		.nth(1)
 		.is_some_and(|arg| arg == omp_envd::EVAL_CHILD_ARG)
 	{
@@ -66,7 +69,7 @@ async fn main() -> ExitCode {
 			},
 		};
 	}
-	if std::env::args_os()
+	if env::args_os()
 		.nth(1)
 		.is_some_and(|arg| arg == omp_envd::exthost::EXT_HOST_ARG)
 	{
@@ -78,7 +81,7 @@ async fn main() -> ExitCode {
 			},
 		};
 	}
-	if std::env::args_os()
+	if env::args_os()
 		.nth(1)
 		.is_some_and(|arg| arg == omp_envd::worker::WORKER_ARG)
 	{

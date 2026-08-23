@@ -4,6 +4,7 @@ use std::{
 	collections::{BTreeMap, HashSet},
 	io::Cursor,
 	path::{Component, Path, PathBuf},
+	str,
 };
 
 use omp_ar::{Archive as ArArchive, Format, Limits};
@@ -182,7 +183,7 @@ fn validate_entity_expansion_cap(xml: &[u8]) -> Result<(), String> {
 pub(super) fn decode_xml_bytes(bytes: &[u8]) -> Result<String, String> {
 	let (bom, skip) = xutf::detect_bom(bytes);
 	match bom {
-		xutf::Bom::None | xutf::Bom::Utf8 => std::str::from_utf8(&bytes[skip..])
+		xutf::Bom::None | xutf::Bom::Utf8 => str::from_utf8(&bytes[skip..])
 			.map(str::to_owned)
 			.map_err(|error| error.to_string()),
 		_ => {

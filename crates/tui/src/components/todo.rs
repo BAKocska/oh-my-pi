@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, slice};
 
 use omp_core::{IntoStr, Str, sf};
 use smallvec::SmallVec;
@@ -388,7 +388,7 @@ impl Component for Todo {
 					pc,
 					rect,
 					&glyphs,
-					std::slice::from_ref(active),
+					slice::from_ref(active),
 					&mut trail,
 					&mut spine,
 					&mut y,
@@ -400,7 +400,7 @@ impl Component for Todo {
 					pc,
 					rect,
 					&glyphs,
-					std::slice::from_ref(stage),
+					slice::from_ref(stage),
 					&mut trail,
 					&mut spine,
 					&mut y,

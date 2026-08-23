@@ -4,6 +4,7 @@ use std::{
 	collections::BTreeMap,
 	fs, io,
 	path::{Path, PathBuf},
+	str,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -11,10 +12,13 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{ArtifactDigest, Hash32, Str};
+use omp_core::{ArtifactDigest, Hash32, Str, encoding::hex};
 use omp_ext::{ExtensionCode, ExtensionError, config::StaticDeclarations};
 use omp_proto::env::v1 as pb;
-use omp_storage::blob::{BlobRef, BlobStore};
+use omp_storage::{
+	blob,
+	blob::{BlobRef, BlobStore},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 static SITE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -33,7 +37,7 @@ pub enum SiteError {
 	InvalidBlobHash,
 	/// The source or destination content-addressed store failed.
 	#[error(transparent)]
-	Store(#[from] omp_storage::blob::Error),
+	Store(#[from] blob::Error),
 	/// A filesystem operation failed.
 	#[error(transparent)]
 	Io(#[from] io::Error),
@@ -172,7 +176,7 @@ impl OwnershipMap {
 			if !is_record {
 				return Err(SiteError::InvalidFilePath(record_path));
 			}
-			let record = std::str::from_utf8(&record).map_err(|_| SiteError::InvalidRecord)?;
+			let record = str::from_utf8(&record).map_err(|_| SiteError::InvalidRecord)?;
 			for row in record.lines() {
 				let path = row.split(',').next().unwrap_or_default();
 				if let Some(module) = module_path(path) {
@@ -456,7 +460,7 @@ fn site_materialized(
 }
 
 fn hex16(hash: &[u8; 32]) -> String {
-	omp_core::encoding::hex::encode_n(hash)[..16].to_owned()
+	hex::encode_n(hash)[..16].to_owned()
 }
 
 fn safe_component(value: &str) -> bool {
@@ -496,31 +500,36 @@ fn module_path(path: &str) -> Option<String> {
 
 #[cfg(unix)]
 fn create_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
-	std::os::unix::fs::symlink(target, link)
+	use std::os::unix::fs;
+	fs::symlink(target, link)
 }
 
 #[cfg(windows)]
 fn create_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
-	std::os::windows::fs::symlink_file(target, link)
+	use std::os::windows::fs;
+	fs::symlink_file(target, link)
 }
 
 #[cfg(unix)]
 fn create_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
-	std::os::unix::fs::symlink(target, link)
+	use std::os::unix::fs;
+	fs::symlink(target, link)
 }
 
 #[cfg(windows)]
 fn create_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
-	std::os::windows::fs::symlink_dir(target, link)
+	use std::os::windows::fs;
+	fs::symlink_dir(target, link)
 }
 
 #[cfg(test)]
 mod tests {
 	use bytes::Bytes;
 	use omp_core::sf;
+	use omp_proto::env::v1;
 	use omp_storage::blob::BlobStore;
 
-	use super::{OwnershipMap, SiteError};
+	use super::{OwnershipMap, SiteError, SiteMaterializer};
 
 	#[test]
 	fn record_ownership_membership_is_exact() {
@@ -547,9 +556,8 @@ mod tests {
 		let record = source
 			.put(b"reviewer/__init__.py,,\nreviewer-1.0.dist-info/RECORD,,\n")
 			.unwrap();
-		let materializer =
-			super::SiteMaterializer::open(directory.path().join("ext"), source).unwrap();
-		let request = omp_proto::env::v1::MaterializeSite {
+		let materializer = SiteMaterializer::open(directory.path().join("ext"), source).unwrap();
+		let request = v1::MaterializeSite {
 			site_key: "workspace-sandboxed-reviewer".to_owned(),
 			files: vec![
 				omp_proto::env::v1::SiteFile {
@@ -563,7 +571,7 @@ mod tests {
 					mode:      0,
 				},
 			],
-			..omp_proto::env::v1::MaterializeSite::default()
+			..v1::MaterializeSite::default()
 		};
 
 		let first = materializer.materialize(request.clone()).unwrap();

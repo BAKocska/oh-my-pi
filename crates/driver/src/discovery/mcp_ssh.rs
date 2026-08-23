@@ -2,13 +2,14 @@
 
 use std::{
 	collections::BTreeMap,
-	env, fs, io,
+	env, fs, io, net,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
 
 use omp_core::Str;
 use serde_json::Value;
+use url::Url;
 
 use super::{
 	containment::{contained_existing, rebase_executable},
@@ -112,8 +113,9 @@ pub fn parse_mcp_file(
 		}
 		let url = object.get("url").and_then(Value::as_str).map(Str::from);
 		if let Some(endpoint) = &url {
-			let parsed = url::Url::parse(endpoint.as_str()).map_err(|_| {
-				DeclarationError::Invalid { path: path.to_path_buf(), reason: "MCP URL is invalid" }
+			let parsed = Url::parse(endpoint.as_str()).map_err(|_| DeclarationError::Invalid {
+				path:   path.to_path_buf(),
+				reason: "MCP URL is invalid",
 			})?;
 			if !matches!(parsed.scheme(), "http" | "https") {
 				return Err(DeclarationError::Invalid {
@@ -124,7 +126,7 @@ pub fn parse_mcp_file(
 			let loopback = parsed.host_str().is_some_and(|host| {
 				host.eq_ignore_ascii_case("localhost")
 					|| host
-						.parse::<std::net::IpAddr>()
+						.parse::<net::IpAddr>()
 						.is_ok_and(|address| address.is_loopback())
 			});
 			if parsed.scheme() != "https" && !loopback {

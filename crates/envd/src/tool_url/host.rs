@@ -10,10 +10,12 @@ use omp_tools::read::{
 };
 use parking_lot::RwLock;
 
-static BROKER: RwLock<Option<Weak<dyn crate::HostResources>>> = RwLock::new(None);
+use crate::HostResources;
+
+static BROKER: RwLock<Option<Weak<dyn HostResources>>> = RwLock::new(None);
 
 /// Installs the sole live RPC host-resource authority.
-pub fn bind(broker: &Arc<dyn crate::HostResources>) -> Result<(), ()> {
+pub fn bind(broker: &Arc<dyn HostResources>) -> Result<(), ()> {
 	let mut current = BROKER.write();
 	if current.as_ref().and_then(Weak::upgrade).is_some() {
 		return Err(());
@@ -23,7 +25,7 @@ pub fn bind(broker: &Arc<dyn crate::HostResources>) -> Result<(), ()> {
 }
 
 /// Removes the authority only when it still names this RPC generation owner.
-pub fn unbind(broker: &Arc<dyn crate::HostResources>) {
+pub fn unbind(broker: &Arc<dyn HostResources>) {
 	let mut current = BROKER.write();
 	if current
 		.as_ref()
@@ -38,11 +40,11 @@ pub fn unbind(broker: &Arc<dyn crate::HostResources>) {
 /// Resolver arm for the bounded set of schemes declared by the RPC host.
 pub(crate) struct HostUriResolver {
 	lines:  LineOffsetCache,
-	broker: Option<Arc<dyn crate::HostResources>>,
+	broker: Option<Arc<dyn HostResources>>,
 }
 
 impl HostUriResolver {
-	pub(crate) fn new(broker: Option<Arc<dyn crate::HostResources>>) -> Self {
+	pub(crate) fn new(broker: Option<Arc<dyn HostResources>>) -> Self {
 		Self { lines: LineOffsetCache::default(), broker }
 	}
 }
@@ -53,6 +55,7 @@ impl Resolve for HostUriResolver {
 		authored_uri: &'a str,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
+		use super::select_bytes;
 		let parsed = parse_uri(authored_uri)
 			.map_err(|_| Fault::Invalid {
 				message: Str::new_static("Host resource URI is malformed."),
@@ -78,7 +81,7 @@ impl Resolve for HostUriResolver {
 			.map_err(|message| Fault::Source { message })?;
 		let content = result.content.unwrap_or_default();
 		let selected =
-			super::select_bytes(&self.lines, &url, CowBytes::from(content.into_bytes()), selector)?;
+			select_bytes(&self.lines, &url, CowBytes::from(content.into_bytes()), selector)?;
 		if result.notes.is_empty() {
 			return Ok(selected);
 		}

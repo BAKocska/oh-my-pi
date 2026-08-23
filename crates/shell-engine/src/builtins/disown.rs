@@ -3,7 +3,7 @@ use std::io::Write as _;
 use clap::Parser;
 use smallvec::SmallVec;
 
-use crate::{ExecutionResult, builtins, jobs};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins, jobs};
 
 /// Removes jobs from the shell's managed job table.
 #[derive(Parser)]
@@ -26,11 +26,11 @@ pub(crate) struct DisownCommand {
 }
 
 impl builtins::Command for DisownCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		let mut ids = SmallVec::<usize, 4>::new();
 		let mut had_error = false;

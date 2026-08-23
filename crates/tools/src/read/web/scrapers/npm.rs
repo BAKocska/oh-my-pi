@@ -1,5 +1,7 @@
 //! npm package metadata renderer backed by the public registry APIs.
 
+use std::vec;
+
 use omp_core::{Str, sf};
 use serde::{Deserialize, Deserializer, de};
 use serde_json::{Map, Value};
@@ -187,7 +189,7 @@ impl Dependencies {
 }
 
 impl IntoIterator for Dependencies {
-	type IntoIter = std::vec::IntoIter<Self::Item>;
+	type IntoIter = vec::IntoIter<Self::Item>;
 	type Item = (String, String);
 
 	fn into_iter(self) -> Self::IntoIter {

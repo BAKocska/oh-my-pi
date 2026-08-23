@@ -2,8 +2,11 @@
 
 use std::{
 	collections::{HashMap, HashSet},
-	fmt::{self, Write as _},
+	error,
+	fmt::{self, Display, Write as _},
+	future,
 	future::Future,
+	mem,
 	sync::Arc,
 };
 
@@ -21,6 +24,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+	glob::{Fault as GlobFault, WalkRequest, WalkResult},
 	read::{
 		ReadBlobs,
 		resolver::Scheme,
@@ -316,7 +320,7 @@ pub enum Fault {
 	},
 }
 
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::EmptyPattern => formatter.write_str("Pattern must not be empty"),
@@ -340,8 +344,7 @@ impl fmt::Display for Fault {
 		}
 	}
 }
-
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// Zero-box workspace traversal boundary shared by `grep@1` and `glob@1`.
 pub trait WorkspaceSearch: Send + Sync + 'static {
@@ -358,16 +361,15 @@ pub trait WorkspaceSearch: Send + Sync + 'static {
 	/// Match paths in deterministic workspace traversal order.
 	fn glob(
 		&self,
-		request: crate::glob::WalkRequest,
-	) -> impl Future<Output = Result<crate::glob::WalkResult, crate::glob::Fault>> + Send + '_;
+		request: WalkRequest,
+	) -> impl Future<Output = Result<WalkResult, GlobFault>> + Send + '_;
 	/// Attempts a resolver-backed glob such as `ssh://`; `None` keeps ordinary
 	/// workspace dispatch or reports an unsupported scheme.
 	fn glob_resource(
 		&self,
-		_request: crate::glob::WalkRequest,
-	) -> impl Future<Output = Option<Result<crate::glob::WalkResult, crate::glob::Fault>>> + Send + '_
-	{
-		std::future::ready(None)
+		_request: WalkRequest,
+	) -> impl Future<Output = Option<Result<WalkResult, GlobFault>>> + Send + '_ {
+		future::ready(None)
 	}
 }
 
@@ -749,7 +751,7 @@ async fn prepare_payload<W: WorkspaceSearch, B: ReadBlobs>(
 	workspace: &W,
 	blobs: &B,
 ) -> Result<Payload, Fault> {
-	let snapshots = std::mem::take(&mut result.snapshots);
+	let snapshots = mem::take(&mut result.snapshots);
 	let mut payload = make_payload(result, roots, requested_skip);
 	let (rendered, source_rows) = render_payload(&payload);
 	let retained_bytes = truncate_head(&rendered, TruncationOptions::default())

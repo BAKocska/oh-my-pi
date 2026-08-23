@@ -9,20 +9,29 @@ use std::{
 use tower::{Layer, Service};
 
 use crate::{
-	answer::{Answer, AnswerBody},
-	call::{CountAccuracy, OperationCall},
+	answer::{Answer, AnswerBody, ModelDiscoveryPage, ResponseMeta as AnswerResponseMeta},
+	call::{Call as CallCall, CountAccuracy, DiscoveryRequest, OperationCall, Setting},
+	catalog::OperationKind,
 	error::Error,
 	layer::LayerCall,
 	operation::{
 		MediaOperationError,
 		embedding::{
-			EmbeddingServiceConfig, normalize_vector, plan_embedding, validate_embedding_batch,
+			EmbeddingServiceConfig, NormalizationSupport, normalize_vector, plan_embedding,
+			validate_embedding_batch,
 		},
+		media_protocol_error as operation_media_protocol_error,
+		media_validation_error as operation_media_validation_error,
 		native::{NativePolicy, validate_native_response},
-		search::{HostedSearchIntent, SearchPlan, finalize_search, plan_search},
+		search::{
+			HostedSearchIntent, SearchDocument, SearchPage, SearchPlan, finalize_search, plan_search,
+		},
 		tokens::validate_provenance,
 		usage::{UsageServiceConfig, normalize_report},
+		wrong_operation as operation_wrong_operation,
 	},
+	plan::ReplayPlan,
+	settings::InferenceSettings,
 };
 
 /// Route-executable embedding behavior not represented by per-model catalog
@@ -30,7 +39,7 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub struct EmbeddingRoutePolicy {
 	/// Backend normalization behavior.
-	pub normalization:          crate::operation::embedding::NormalizationSupport,
+	pub normalization:          NormalizationSupport,
 	/// Maximum pre-tokenized input length accepted by the constructed backend.
 	pub maximum_input_tokens:   Option<u32>,
 	/// Whether the backend implements requested text truncation.
@@ -58,18 +67,18 @@ pub struct OperationPolicyConfig {
 #[derive(Clone, Debug)]
 pub struct OperationPolicyLayer {
 	config:   OperationPolicyConfig,
-	settings: crate::settings::InferenceSettings,
+	settings: InferenceSettings,
 }
 
 impl OperationPolicyLayer {
 	/// Constructs route operation policy from catalog and executable service
 	/// facts.
 	pub fn new(config: OperationPolicyConfig) -> Self {
-		Self { config, settings: crate::settings::InferenceSettings::default() }
+		Self { config, settings: InferenceSettings::default() }
 	}
 
 	/// Installs the immutable runtime settings projection applied before policy.
-	pub fn with_settings(mut self, settings: crate::settings::InferenceSettings) -> Self {
+	pub fn with_settings(mut self, settings: InferenceSettings) -> Self {
 		self.settings = settings;
 		self
 	}
@@ -89,15 +98,12 @@ impl<S> Layer<S> for OperationPolicyLayer {
 pub struct OperationPolicyService<S> {
 	inner:    S,
 	config:   OperationPolicyConfig,
-	settings: crate::settings::InferenceSettings,
+	settings: InferenceSettings,
 }
 
-impl<S> Service<LayerCall<crate::call::Call>> for OperationPolicyService<S>
+impl<S> Service<LayerCall<CallCall>> for OperationPolicyService<S>
 where
-	S: Service<LayerCall<crate::call::Call>, Response = Answer, Error = Error>
-		+ Clone
-		+ Send
-		+ 'static,
+	S: Service<LayerCall<CallCall>, Response = Answer, Error = Error> + Clone + Send + 'static,
 	S::Future: Send + 'static,
 {
 	type Error = Error;
@@ -109,7 +115,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, mut request: LayerCall<crate::call::Call>) -> Self::Future {
+	fn call(&mut self, mut request: LayerCall<CallCall>) -> Self::Future {
 		self.settings.apply_call(&mut request.payload);
 		let original = request.payload.clone();
 		let config = self.config.clone();
@@ -125,7 +131,7 @@ where
 		async move {
 			let prepared = prepared?;
 			let Some(first) = first else {
-				return Err(crate::operation::wrong_operation(&original, original.operation.kind()));
+				return Err(operation_wrong_operation(&original, original.operation.kind()));
 			};
 			let mut answer = match first.await {
 				Ok(answer) => answer,
@@ -159,26 +165,26 @@ where
 
 #[derive(Clone, Debug)]
 struct PreparedOperation {
-	calls:               Vec<crate::call::Call>,
+	calls:               Vec<CallCall>,
 	embedding_normalize: bool,
 	search:              Option<SearchPlan>,
 }
 
 fn prepare(
-	request: &LayerCall<crate::call::Call>,
+	request: &LayerCall<CallCall>,
 	config: &OperationPolicyConfig,
 ) -> Result<PreparedOperation, Error> {
 	let mut calls = Vec::new();
 	let mut embedding_normalize = false;
 	let mut search = None;
 	let execution = request.payload.execution.as_ref().ok_or_else(|| {
-		crate::operation::media_validation_error(
+		operation_media_validation_error(
 			request.payload.operation.kind(),
 			MediaOperationError::OperationPolicyRequiresExecutionPlan,
 		)
 	})?;
 	if execution.operation != request.payload.operation.kind() {
-		return Err(crate::operation::wrong_operation(&request.payload, execution.operation));
+		return Err(operation_wrong_operation(&request.payload, execution.operation));
 	}
 	match &request.payload.operation {
 		OperationCall::Chat(chat) => {
@@ -188,7 +194,7 @@ fn prepare(
 		},
 		OperationCall::Embed(embed) => {
 			let Some(route_policy) = config.embedding else {
-				return Err(crate::operation::media_validation_error(
+				return Err(operation_media_validation_error(
 					request.payload.operation.kind(),
 					MediaOperationError::EmbeddingPolicyNotConstructed,
 				));
@@ -198,7 +204,7 @@ fn prepare(
 				.as_ref()
 				.and_then(|model| model.capabilities.embeddings.clone())
 				.ok_or_else(|| {
-					crate::operation::media_validation_error(
+					operation_media_validation_error(
 						request.payload.operation.kind(),
 						MediaOperationError::SelectedModelHasNoEmbeddingCapabilities,
 					)
@@ -211,16 +217,14 @@ fn prepare(
 			};
 			let maximum = NonZeroU32::new(embedding.capabilities.maximum_batch.unwrap_or(u32::MAX))
 				.ok_or_else(|| {
-					crate::operation::media_validation_error(
+					operation_media_validation_error(
 						request.payload.operation.kind(),
 						MediaOperationError::ZeroEmbeddingBatchCapacity,
 					)
 				})?;
 			let plan = plan_embedding(embed, &embedding, maximum)?;
-			if plan.pages.len() > 1
-				&& execution.replay == crate::plan::ReplayPlan::OneShotSingleAttempt
-			{
-				return Err(crate::operation::media_validation_error(
+			if plan.pages.len() > 1 && execution.replay == ReplayPlan::OneShotSingleAttempt {
+				return Err(operation_media_validation_error(
 					request.payload.operation.kind(),
 					MediaOperationError::OneShotEmbeddingCannotOpenMultipleBatches,
 				));
@@ -238,7 +242,7 @@ fn prepare(
 				.as_ref()
 				.and_then(|model| model.capabilities.search)
 				.ok_or_else(|| {
-					crate::operation::media_validation_error(
+					operation_media_validation_error(
 						request.payload.operation.kind(),
 						MediaOperationError::SelectedModelHasNoSearchCapabilities,
 					)
@@ -252,20 +256,20 @@ fn prepare(
 		OperationCall::CountTokens(count)
 			if count.accuracy == CountAccuracy::Exact && !config.exact_token_count =>
 		{
-			return Err(crate::operation::media_validation_error(
+			return Err(operation_media_validation_error(
 				request.payload.operation.kind(),
 				MediaOperationError::ExactTokenCountNotConstructed,
 			));
 		},
 		OperationCall::DiscoverModels(discovery) => {
 			let Some(maximum) = config.discovery_maximum_page else {
-				return Err(crate::operation::media_validation_error(
+				return Err(operation_media_validation_error(
 					request.payload.operation.kind(),
 					MediaOperationError::DiscoveryPolicyNotConstructed,
 				));
 			};
 			if discovery.page_size == 0 || discovery.page_size > maximum.get() {
-				return Err(crate::operation::media_validation_error(
+				return Err(operation_media_validation_error(
 					request.payload.operation.kind(),
 					MediaOperationError::InvalidDiscoveryPageSize,
 				));
@@ -273,7 +277,7 @@ fn prepare(
 		},
 		OperationCall::Native(native) => {
 			let Some(policy) = &config.native else {
-				return Err(crate::operation::media_validation_error(
+				return Err(operation_media_validation_error(
 					request.payload.operation.kind(),
 					MediaOperationError::NativePolicyNotConstructed,
 				));
@@ -293,30 +297,26 @@ fn merge_embedding_answer(target: &mut Answer, next: Answer) -> Result<(), Error
 		|| target.meta.route != next.meta.route
 		|| target.meta.model != next.meta.model
 	{
-		return Err(crate::operation::media_protocol_error(
-			crate::catalog::OperationKind::Embed,
+		return Err(operation_media_protocol_error(
+			OperationKind::Embed,
 			MediaOperationError::EmbeddingBatchRouteChanged,
 		));
 	}
 	let target_kind = target.body.kind();
 	let AnswerBody::Embeddings(target_batch) = &mut target.body else {
 		return Err(Error::body_variant_mismatch(
-			crate::catalog::OperationKind::Embed,
+			OperationKind::Embed,
 			target_kind,
 			target.receipt.clone(),
 		));
 	};
 	let Answer { receipt, body, .. } = next;
 	let AnswerBody::Embeddings(mut next_batch) = body else {
-		return Err(Error::body_variant_mismatch(
-			crate::catalog::OperationKind::Embed,
-			body.kind(),
-			receipt,
-		));
+		return Err(Error::body_variant_mismatch(OperationKind::Embed, body.kind(), receipt));
 	};
 	if target_batch.dimensions != next_batch.dimensions {
-		return Err(crate::operation::media_protocol_error(
-			crate::catalog::OperationKind::Embed,
+		return Err(operation_media_protocol_error(
+			OperationKind::Embed,
 			MediaOperationError::EmbeddingPageDimensionsChanged,
 		));
 	}
@@ -339,7 +339,7 @@ fn finish(
 		(OperationCall::CountTokens(request), AnswerBody::Tokens(count)) => {
 			validate_provenance(&count.provenance)?;
 			if request.accuracy == CountAccuracy::Exact && !count.provenance.exact {
-				return Err(crate::operation::media_protocol_error(
+				return Err(operation_media_protocol_error(
 					operation.kind(),
 					MediaOperationError::ExactTokenCountReturnedEstimate,
 				));
@@ -348,7 +348,7 @@ fn finish(
 		(OperationCall::Tokenize(_), AnswerBody::TokenIds(sequence)) => {
 			validate_provenance(&sequence.provenance)?;
 			if !sequence.provenance.exact {
-				return Err(crate::operation::media_protocol_error(
+				return Err(operation_media_protocol_error(
 					operation.kind(),
 					MediaOperationError::TokenizeReturnedEstimate,
 				));
@@ -357,7 +357,7 @@ fn finish(
 		(OperationCall::Detokenize(_), AnswerBody::Text(text)) => {
 			validate_provenance(&text.provenance)?;
 			if !text.provenance.exact {
-				return Err(crate::operation::media_protocol_error(
+				return Err(operation_media_protocol_error(
 					operation.kind(),
 					MediaOperationError::DetokenizeReturnedEstimate,
 				));
@@ -365,10 +365,10 @@ fn finish(
 		},
 		(OperationCall::Embed(request), AnswerBody::Embeddings(batch)) => {
 			validate_embedding_batch(batch, request.inputs.len())?;
-			if let crate::call::Setting::Require(dimensions) = &request.dimensions
+			if let Setting::Require(dimensions) = &request.dimensions
 				&& batch.dimensions != *dimensions
 			{
-				return Err(crate::operation::media_protocol_error(
+				return Err(operation_media_protocol_error(
 					operation.kind(),
 					MediaOperationError::RequiredEmbeddingDimensionsNotReturned,
 				));
@@ -381,11 +381,11 @@ fn finish(
 			}
 		},
 		(OperationCall::Search(_), AnswerBody::Search(results)) => {
-			let page = crate::operation::search::SearchPage {
+			let page = SearchPage {
 				documents: results
 					.results
 					.drain(..)
-					.map(|result| crate::operation::search::SearchDocument {
+					.map(|result| SearchDocument {
 						url:          result.url,
 						title:        result.title,
 						snippet:      result.snippet,
@@ -419,9 +419,9 @@ fn finish(
 }
 
 fn validate_discovery_page(
-	page: &crate::answer::ModelDiscoveryPage,
-	request: &crate::call::DiscoveryRequest,
-	meta: &crate::answer::ResponseMeta,
+	page: &ModelDiscoveryPage,
+	request: &DiscoveryRequest,
+	meta: &AnswerResponseMeta,
 ) -> Result<(), Error> {
 	if meta.model.is_some()
 		|| request
@@ -438,8 +438,8 @@ fn validate_discovery_page(
 			.as_ref()
 			.is_some_and(|cursor| cursor.is_empty())
 	{
-		return Err(crate::operation::media_protocol_error(
-			crate::catalog::OperationKind::DiscoverModels,
+		return Err(operation_media_protocol_error(
+			OperationKind::DiscoverModels,
 			MediaOperationError::InvalidNormalizedDiscoveryPage,
 		));
 	}
@@ -449,8 +449,8 @@ fn validate_discovery_page(
 			.iter()
 			.any(|model| !model.capabilities.operations.contains_kind(operation))
 	{
-		return Err(crate::operation::media_protocol_error(
-			crate::catalog::OperationKind::DiscoverModels,
+		return Err(operation_media_protocol_error(
+			OperationKind::DiscoverModels,
 			MediaOperationError::DiscoveryPageContainsUnrequestedOperation,
 		));
 	}
@@ -471,6 +471,7 @@ mod tests {
 
 	use super::{OperationPolicyConfig, OperationPolicyLayer, merge_embedding_answer};
 	use crate::{
+		Error as CrateError,
 		answer::{
 			Answer, AnswerBody, Embedding, EmbeddingBatch, ResponseMeta, TokenCount,
 			TokenizerProvenance,
@@ -478,7 +479,9 @@ mod tests {
 		body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
 		call::{Call, CallMeta, CountAccuracy, CountTokensRequest, OperationCall, Target},
 		catalog::{CatalogRevision, CodecId, OperationKind, ProviderId, RouteId, WirePolicy},
+		id::RequestId as IdRequestId,
 		layer::{ExecutionContext, LayerCall},
+		operation::usage::UsageServiceConfig as UsageUsageServiceConfig,
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
 			RuntimeRouteEvidence,
@@ -525,7 +528,7 @@ mod tests {
 		};
 		let mut call = Call::new(
 			CallMeta {
-				id:       crate::id::RequestId::from("request"),
+				id:       IdRequestId::from("request"),
 				target:   Target::Route {
 					route: plan.route.clone(),
 					model: omp_catalog::ModelKey::from("model"),
@@ -551,7 +554,7 @@ mod tests {
 		let raw = service_fn(move |call: LayerCall<Call>| {
 			raw_calls.fetch_add(1, Ordering::Relaxed);
 			async move {
-				Ok::<_, crate::Error>(Answer {
+				Ok::<_, CrateError>(Answer {
 					meta:    ResponseMeta {
 						request_id:          call.payload.id,
 						provider:            ProviderId::from("provider"),
@@ -585,7 +588,7 @@ mod tests {
 		let layer = OperationPolicyLayer::new(OperationPolicyConfig {
 			embedding:              None,
 			native:                 None,
-			usage:                  crate::operation::usage::UsageServiceConfig::new(Duration::MAX),
+			usage:                  UsageUsageServiceConfig::new(Duration::MAX),
 			discovery_maximum_page: None,
 			exact_token_count:      false,
 		});
@@ -630,7 +633,7 @@ mod tests {
 			let receipt = ExecutionReceipt { attempts, ..ExecutionReceipt::default() };
 			Answer {
 				meta: ResponseMeta {
-					request_id:          crate::id::RequestId::from("request"),
+					request_id:          IdRequestId::from("request"),
 					provider:            ProviderId::from("provider"),
 					route:               RouteId::from("route"),
 					model:               None,

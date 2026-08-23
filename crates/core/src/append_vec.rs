@@ -8,7 +8,7 @@ use std::{
 	alloc::{self, Layout},
 	hint,
 	iter::{FusedIterator, Iterator},
-	mem,
+	mem, ops,
 	ops::{Index, IndexMut},
 	ptr::{self, NonNull},
 	slice,
@@ -739,7 +739,7 @@ impl<T> AppendVec<T> {
 	/// assert_eq!(window.len(), 3);
 	/// assert_eq!(window[0], 2);
 	/// ```
-	pub fn slice(&self, range: std::ops::Range<usize>) -> AppendSlice<T> {
+	pub fn slice(&self, range: ops::Range<usize>) -> AppendSlice<T> {
 		assert!(range.start <= range.end, "range start must not exceed range end");
 		let len = self.len();
 		assert!(range.end <= len, "range end is out of bounds for AppendVec of length {len}");
@@ -1107,17 +1107,20 @@ impl<T: Clone> AppendVec<T> {
 mod tests {
 	use std::{
 		cell::RefCell,
+		collections::HashSet,
+		panic,
 		rc::Rc,
 		sync::{
 			Arc,
 			atomic::{AtomicUsize, Ordering},
 		},
+		thread, vec,
 	};
 
 	use super::*;
 
 	struct LyingLen<T> {
-		items:        std::vec::IntoIter<T>,
+		items:        vec::IntoIter<T>,
 		reported_len: usize,
 	}
 
@@ -1205,7 +1208,7 @@ mod tests {
 
 		let vec = Arc::new(AppendVec::<usize>::new());
 
-		std::thread::scope(|scope| {
+		thread::scope(|scope| {
 			for thread in 0..THREADS {
 				let vec = Arc::clone(&vec);
 				scope.spawn(move || {
@@ -1219,7 +1222,7 @@ mod tests {
 
 		assert_eq!(vec.len(), THREADS * ITEMS_PER_THREAD);
 
-		let values: std::collections::HashSet<usize> = vec.iter().copied().collect();
+		let values: HashSet<usize> = vec.iter().copied().collect();
 		assert_eq!(values.len(), THREADS * ITEMS_PER_THREAD);
 
 		for expected in 0..THREADS * ITEMS_PER_THREAD {
@@ -1335,7 +1338,7 @@ mod tests {
 	#[should_panic(expected = "ExactSizeIterator over-yielded relative to its reported length")]
 	fn test_extend_publishes_reported_prefix_before_over_yield_panic() {
 		let vec = AppendVec::<u32>::new();
-		let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		let panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
 			vec.extend(LyingLen::new(vec![10, 20, 30, 40], 2));
 		}))
 		.expect_err("over-yielding ExactSizeIterator must panic");
@@ -1343,7 +1346,7 @@ mod tests {
 		assert_eq!(vec.len(), 2);
 		assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![10, 20]);
 
-		std::panic::resume_unwind(panic);
+		panic::resume_unwind(panic);
 	}
 
 	#[test]
@@ -1354,7 +1357,7 @@ mod tests {
 		// A reported length of usize::MAX must panic BEFORE the reservation
 		// counter is touched; a wrapped counter would hand slot 0 to the next
 		// push.
-		std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		panic::catch_unwind(panic::AssertUnwindSafe(|| {
 			vec.extend(LyingLen::new(vec![2, 3], usize::MAX));
 		}))
 		.expect_err("overflowing reported length must panic");
@@ -1774,7 +1777,7 @@ mod tests {
 	fn test_concurrent_grow() {
 		let vec = Arc::new(AppendVec::<usize>::new());
 
-		std::thread::scope(|scope| {
+		thread::scope(|scope| {
 			for i in 0..10 {
 				let vec = Arc::clone(&vec);
 				scope.spawn(move || {

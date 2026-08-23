@@ -1,8 +1,9 @@
 //! Session-local scratch resource resolver.
 
 use std::{
-	fs,
-	path::{Component, Path, PathBuf},
+	ffi, fs, io,
+	path::{self, Component, Path, PathBuf},
+	str,
 };
 
 use omp_core::{CowBytes, Str};
@@ -26,7 +27,7 @@ pub(crate) fn migrate_session_artifacts(
 	sessions_dir: &Path,
 	source_session: &str,
 	destination_session: &str,
-) -> Result<(), std::io::Error> {
+) -> Result<(), io::Error> {
 	if source_session == destination_session {
 		return Ok(());
 	}
@@ -35,22 +36,22 @@ pub(crate) fn migrate_session_artifacts(
 	match fs::symlink_metadata(&source) {
 		Ok(metadata) if metadata.file_type().is_dir() => {},
 		Ok(_) => return Ok(()),
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
 		Err(error) => return Err(error),
 	}
 	fs::create_dir_all(&destination)?;
 	copy_artifact_entries(&source, &destination)
 }
 
-fn copy_artifact_entries(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+fn copy_artifact_entries(source: &Path, destination: &Path) -> Result<(), io::Error> {
 	for entry in fs::read_dir(source)? {
 		let entry = entry?;
 		let file_type = entry.file_type()?;
 		let destination = destination.join(entry.file_name());
 		if file_type.is_dir() {
 			if destination.exists() && !fs::symlink_metadata(&destination)?.file_type().is_dir() {
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::InvalidInput,
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
 					"local artifact destination collides with a non-directory",
 				));
 			}
@@ -58,8 +59,8 @@ fn copy_artifact_entries(source: &Path, destination: &Path) -> Result<(), std::i
 			copy_artifact_entries(&entry.path(), &destination)?;
 		} else if file_type.is_file() {
 			if destination.exists() && fs::symlink_metadata(&destination)?.file_type().is_symlink() {
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::InvalidInput,
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
 					"local artifact destination is a symbolic link",
 				));
 			}
@@ -71,13 +72,13 @@ fn copy_artifact_entries(source: &Path, destination: &Path) -> Result<(), std::i
 
 /// Confined resolver for one session's local scratch root.
 #[derive(Debug)]
-pub(super) struct LocalResolver {
+pub(crate) struct LocalResolver {
 	root:  PathBuf,
 	lines: LineOffsetCache,
 }
 
 impl LocalResolver {
-	pub(super) fn open(root: PathBuf) -> Result<Self, std::io::Error> {
+	pub(super) fn open(root: PathBuf) -> Result<Self, io::Error> {
 		fs::create_dir_all(&root)?;
 		let root = fs::canonicalize(root)?;
 		Ok(Self { root, lines: LineOffsetCache::default() })
@@ -117,7 +118,7 @@ impl LocalResolver {
 				.strip_prefix(&self.root)
 				.expect("contained local path")
 				.to_string_lossy()
-				.replace(std::path::MAIN_SEPARATOR, "/");
+				.replace(path::MAIN_SEPARATOR, "/");
 			let directory = metadata.is_dir();
 			let name = entry.file_name().to_string_lossy().into_owned();
 			entries.push(ResourceEntry {
@@ -149,7 +150,7 @@ impl LocalResolver {
 						.strip_prefix(&self.root)
 						.expect("contained local path")
 						.to_string_lossy()
-						.replace(std::path::MAIN_SEPARATOR, "/");
+						.replace(path::MAIN_SEPARATOR, "/");
 					output.push((Str::new(format!("local://{relative}")), Str::new(relative)));
 				}
 			}
@@ -165,6 +166,7 @@ impl Resolve for LocalResolver {
 		resource: &'a str,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
+		use super::select_bytes;
 		let target = self.target(resource)?;
 		let metadata = fs::metadata(&target).map_err(io_fault)?;
 		if metadata.is_dir() {
@@ -196,7 +198,7 @@ impl Resolve for LocalResolver {
 		}
 		let bytes = fs::read(&target).map_err(io_fault)?;
 		let sniff = &bytes[..bytes.len().min(SNIFF_BYTES)];
-		if sniff.contains(&0) || std::str::from_utf8(sniff).is_err() {
+		if sniff.contains(&0) || str::from_utf8(sniff).is_err() {
 			return Err(binary_fault(resource));
 		}
 		if metadata.len() > MAX_TEXT_BYTES
@@ -210,7 +212,7 @@ impl Resolve for LocalResolver {
 				)),
 			});
 		}
-		super::select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
+		select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
 	}
 
 	async fn list(
@@ -329,7 +331,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 fn known_binary(path: &Path) -> bool {
 	path
 		.extension()
-		.and_then(std::ffi::OsStr::to_str)
+		.and_then(ffi::OsStr::to_str)
 		.is_some_and(|extension| {
 			matches!(
 				extension.to_ascii_lowercase().as_str(),
@@ -353,6 +355,6 @@ fn binary_fault(resource: &str) -> Fault {
 	}
 }
 
-fn io_fault(source: std::io::Error) -> Fault {
+fn io_fault(source: io::Error) -> Fault {
 	Fault::Source { message: Str::new(format!("local:// I/O failed: {source}")) }
 }

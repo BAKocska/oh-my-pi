@@ -1,9 +1,13 @@
 //! Environment-owned NDJSON child-process MCP transport.
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::io;
 use std::{
 	collections::{BTreeMap, HashMap},
+	env,
 	ffi::{OsStr, OsString},
-	path::{Path, PathBuf},
+	iter,
+	path::{self, Path, PathBuf},
 	process::Stdio,
 	sync::{
 		Arc,
@@ -12,15 +16,22 @@ use std::{
 	time::Duration,
 };
 
+use flume::Receiver;
+#[cfg(unix)]
+use nix::{sys::signal, unistd::Pid};
 use omp_core::Str;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::{
 	io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+	process,
 	process::{Child, ChildStdin, Command},
 	sync::{Mutex as AsyncMutex, oneshot},
+	time,
 };
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading;
 
 use super::{
 	json_rpc::{RequestId, RequestIdAllocator, RequestIdFormat},
@@ -242,12 +253,12 @@ async fn resolve_windows_command(
 		.iter()
 		.find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
 		.map(|(_, value)| value.clone())
-		.or_else(|| std::env::var_os("PATH"));
+		.or_else(|| env::var_os("PATH"));
 	let path_ext = environment
 		.iter()
 		.find(|(name, _)| name.eq_ignore_ascii_case("PATHEXT"))
 		.and_then(|(_, value)| value.to_str().map(str::to_owned))
-		.or_else(|| std::env::var("PATHEXT").ok())
+		.or_else(|| env::var("PATHEXT").ok())
 		.unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned());
 	let extensions: Vec<&str> = path_ext
 		.split(';')
@@ -279,7 +290,7 @@ async fn resolve_windows_command(
 	let mut directories = vec![cwd.to_path_buf()];
 	if !has_segment {
 		if let Some(path) = path_value {
-			directories.extend(std::env::split_paths(&path));
+			directories.extend(env::split_paths(&path));
 		}
 	}
 	for directory in directories {
@@ -337,7 +348,7 @@ async fn resolve_windows_npm_shim(config: &StdioConfig) -> Option<SpawnPlan> {
 		.trim_start_matches("%~dp0")
 		.trim_start_matches("%dp0%")
 		.trim_start_matches(['\\', '/']);
-	let target = shim_dir.join(relative.replace('\\', std::path::MAIN_SEPARATOR_STR));
+	let target = shim_dir.join(relative.replace('\\', path::MAIN_SEPARATOR_STR));
 	let sibling_node = shim_dir.join("node.exe");
 	let executable = if tokio::fs::metadata(&sibling_node).await.is_ok() {
 		sibling_node.into_os_string()
@@ -346,7 +357,7 @@ async fn resolve_windows_npm_shim(config: &StdioConfig) -> Option<SpawnPlan> {
 	};
 	Some(SpawnPlan {
 		executable,
-		args: std::iter::once(target.into_os_string())
+		args: iter::once(target.into_os_string())
 			.chain(
 				config
 					.args
@@ -370,7 +381,7 @@ struct Inner {
 	child:       AsyncMutex<Option<Child>>,
 	pending:     Mutex<HashMap<RequestId, oneshot::Sender<PendingResult>>>,
 	incoming_tx: flume::Sender<IncomingMessage>,
-	incoming_rx: flume::Receiver<IncomingMessage>,
+	incoming_rx: Receiver<IncomingMessage>,
 	ids:         Mutex<RequestIdAllocator>,
 	id_format:   RequestIdFormat,
 	timeout:     Option<Duration>,
@@ -422,7 +433,7 @@ impl StdioTransport {
 			unsafe {
 				command.as_std_mut().pre_exec(|| {
 					if libc::setsid() == -1 {
-						Err(std::io::Error::last_os_error())
+						Err(io::Error::last_os_error())
 					} else {
 						Ok(())
 					}
@@ -438,7 +449,7 @@ impl StdioTransport {
 		}
 		#[cfg(windows)]
 		{
-			command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+			command.creation_flags(Threading::CREATE_NEW_PROCESS_GROUP);
 		}
 		let mut child = command
 			.spawn()
@@ -528,7 +539,7 @@ impl StdioTransport {
 		let pending = if let Some(timeout) = self.inner.timeout {
 			tokio::select! {
 				() = cancellation.cancelled() => { self.inner.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::Cancelled)); },
-				result = tokio::time::timeout(timeout, receive) => match result { Ok(value) => value, Err(_) => { self.inner.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::TimedOut)); } },
+				result = time::timeout(timeout, receive) => match result { Ok(value) => value, Err(_) => { self.inner.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::TimedOut)); } },
 			}
 		} else {
 			tokio::select! { () = cancellation.cancelled() => { self.inner.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::Cancelled)); }, value = receive => value }
@@ -555,11 +566,11 @@ impl StdioTransport {
 		};
 		let pid = child.id();
 		signal_child(pid, self.inner.detached, false);
-		let exited = tokio::time::timeout(TERM_GRACE, child.wait()).await.is_ok();
+		let exited = time::timeout(TERM_GRACE, child.wait()).await.is_ok();
 		if !exited || self.inner.detached {
 			signal_child(pid, self.inner.detached, true);
 			if !exited {
-				let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+				let _ = time::timeout(KILL_GRACE, child.wait()).await;
 			}
 		}
 		Ok(())
@@ -620,7 +631,7 @@ impl McpTransport for StdioTransport {
 	}
 }
 
-async fn read_stdout(inner: Arc<Inner>, stdout: tokio::process::ChildStdout) {
+async fn read_stdout(inner: Arc<Inner>, stdout: process::ChildStdout) {
 	let mut reader = BufReader::new(stdout);
 	let mut frame = Vec::new();
 	loop {
@@ -683,14 +694,14 @@ fn signal_child(pid: Option<u32>, detached: bool, hard: bool) {
 	#[cfg(unix)]
 	if let Some(pid) = pid {
 		let signal = if hard {
-			nix::sys::signal::Signal::SIGKILL
+			signal::Signal::SIGKILL
 		} else {
-			nix::sys::signal::Signal::SIGTERM
+			signal::Signal::SIGTERM
 		};
-		let raw = nix::unistd::Pid::from_raw(pid.cast_signed());
-		let _ = nix::sys::signal::kill(
+		let raw = Pid::from_raw(pid.cast_signed());
+		let _ = signal::kill(
 			if detached {
-				nix::unistd::Pid::from_raw(-raw.as_raw())
+				Pid::from_raw(-raw.as_raw())
 			} else {
 				raw
 			},
@@ -706,8 +717,6 @@ fn signal_child(pid: Option<u32>, detached: bool, hard: bool) {
 #[cfg(test)]
 mod tests {
 	use std::env;
-
-	use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 	use super::*;
 
@@ -824,29 +833,30 @@ mod tests {
 			.expect("request");
 		let pid = response.result["pid"].as_i64().expect("pid");
 		transport.close().await.expect("close");
-		let pid = nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid range"));
+		let pid = Pid::from_raw(i32::try_from(pid).expect("pid range"));
 		for _ in 0..20 {
-			if nix::sys::signal::kill(pid, None).is_err() {
+			if signal::kill(pid, None).is_err() {
 				return;
 			}
-			tokio::time::sleep(Duration::from_millis(25)).await;
+			time::sleep(Duration::from_millis(25)).await;
 		}
 		panic!("stdio descendant survived process-group teardown");
 	}
 
 	#[tokio::test]
 	async fn stdio_fixture_child() {
+		use tokio::io;
 		if env::var_os("OMP_MCP_STDIO_FIXTURE").is_none() {
 			return;
 		}
-		let mut input = BufReader::new(tokio::io::stdin()).lines();
-		let mut output = tokio::io::stdout();
+		let mut input = BufReader::new(io::stdin()).lines();
+		let mut output = io::stdout();
 		while let Ok(Some(line)) = input.next_line().await {
 			let request: Value = serde_json::from_str(&line).expect("request");
 			let result = if request["method"] == "spawn-grandchild" {
 				#[cfg(unix)]
 				{
-					let child = tokio::process::Command::new("/bin/sh")
+					let child = process::Command::new("/bin/sh")
 						.args(["-c", "trap '' TERM; exec sleep 30"])
 						.stdin(Stdio::null())
 						.stdout(Stdio::null())

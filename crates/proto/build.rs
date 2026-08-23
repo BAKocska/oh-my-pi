@@ -18,12 +18,12 @@
 //! emits gRPC client and server bindings into the same package files.
 
 use std::{
-	fs,
+	env, fs,
 	path::{Path, PathBuf},
 };
 
 fn main() {
-	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("proto");
+	let root = Path::new(std::env!("CARGO_MANIFEST_DIR")).join("proto");
 	println!("cargo::rerun-if-changed={}", root.display());
 
 	let mut protos = Vec::new();
@@ -42,7 +42,7 @@ fn main() {
 
 	let fds = protox::compile(&protos, [&root]).expect("protox failed to compile .proto sources");
 	let bytes_attributes = bytes_field_attributes(&fds);
-	let generate_services = std::env::var_os("CARGO_FEATURE_TONIC").is_some();
+	let generate_services = env::var_os("CARGO_FEATURE_TONIC").is_some();
 	let mut builder = tonic_prost_build::configure()
 		.build_client(generate_services)
 		.build_server(generate_services)

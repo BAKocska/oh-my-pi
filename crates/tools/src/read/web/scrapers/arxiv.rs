@@ -6,7 +6,7 @@ use omp_core::sf;
 use quick_xml::{
 	Reader,
 	escape::{resolve_xml_entity, unescape},
-	events::Event,
+	events::{Event, attributes},
 };
 use url::Url;
 
@@ -477,7 +477,7 @@ fn is_reference_name(name: &str) -> bool {
 
 fn decode_attribute(
 	reader: &Reader<&[u8]>,
-	attribute: &quick_xml::events::attributes::Attribute<'_>,
+	attribute: &attributes::Attribute<'_>,
 ) -> Option<String> {
 	let value = reader.decoder().decode(attribute.value.as_ref()).ok()?;
 	Some(decode_entities(&value))

@@ -9,10 +9,13 @@ use rand::RngExt as _;
 use serde::Deserialize;
 use strum::IntoStaticStr;
 use thiserror::Error;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time};
 use tokio_tungstenite::{
 	MaybeTlsStream, WebSocketStream, connect_async_with_config,
-	tungstenite::{self, Message, protocol::CloseFrame},
+	tungstenite::{
+		self, Message,
+		protocol::{CloseFrame, WebSocketConfig},
+	},
 };
 use url::Url;
 
@@ -257,7 +260,7 @@ impl RelayClient {
 			.query_pairs_mut()
 			.append_pair("role", role)
 			.append_pair("revision", "1");
-		let mut socket_config = tungstenite::protocol::WebSocketConfig::default();
+		let mut socket_config = WebSocketConfig::default();
 		socket_config.write_buffer_size = BACKPRESSURE_LOW_WATERMARK;
 		socket_config.max_write_buffer_size = BACKPRESSURE_HIGH_WATERMARK;
 
@@ -357,7 +360,7 @@ impl RelayClient {
 			}
 			loop {
 				let delay = self.reconnect_delay()?;
-				tokio::time::sleep(delay).await;
+				time::sleep(delay).await;
 				match self.connect().await {
 					Ok(()) => break,
 					Err(RelayError::Socket(_)) => {},
@@ -475,6 +478,7 @@ pub enum RelayError {
 
 #[cfg(test)]
 mod tests {
+	use omp_proto::collab::v1::{RelayControl, relay_control};
 	use prost::Message as _;
 
 	use super::*;
@@ -519,9 +523,8 @@ mod tests {
 
 	#[test]
 	fn relay_control_schema_contains_peer_left() {
-		let control = omp_proto::collab::v1::RelayControl {
-			kind: Some(omp_proto::collab::v1::relay_control::Kind::PeerLeft(PeerLeft { peer_id: 9 })),
-		};
+		let control =
+			RelayControl { kind: Some(relay_control::Kind::PeerLeft(PeerLeft { peer_id: 9 })) };
 		assert!(!control.encode_to_vec().is_empty());
 	}
 }

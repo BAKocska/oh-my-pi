@@ -2,12 +2,14 @@
 
 use std::io::Write;
 
+use super::parsing::create_parser;
 use crate::{
-	ExecutionParameters, commands, error, extensions, functions, jobs,
+	ExecutionParameters, Shell, SourceInfo, commands, error, extensions, functions, jobs,
+	parser::ast::FunctionDefinition,
 	results::{ExecutionResult, ExecutionWaitResult},
 };
 
-impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
+impl<SE: extensions::ShellExtensions> Shell<SE> {
 	/// Returns the function definition environment for this shell.
 	pub const fn funcs(&self) -> &functions::FunctionEnv {
 		&self.funcs
@@ -40,8 +42,8 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
 	pub fn define_func(
 		&mut self,
 		name: impl Into<String>,
-		definition: crate::parser::ast::FunctionDefinition,
-		source_info: &crate::SourceInfo,
+		definition: FunctionDefinition,
+		source_info: &SourceInfo,
 	) {
 		let reg = functions::Registration::new(definition, source_info);
 		self.funcs.update(name.into(), reg);
@@ -71,15 +73,14 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
 	) -> Result<(), error::Error> {
 		let name = name.into();
 
-		let mut parser = super::parsing::create_parser(body_text.as_bytes(), &self.parser_options());
+		let mut parser = create_parser(body_text.as_bytes(), &self.parser_options());
 		let func_body = parser
 			.parse_function_parens_and_body()
 			.map_err(|e| error::Error::from(error::ErrorKind::FunctionParseError(name.clone(), e)))?;
 
-		let def =
-			crate::parser::ast::FunctionDefinition { fname: name.clone().into(), body: func_body };
+		let def = FunctionDefinition { fname: name.clone().into(), body: func_body };
 
-		self.define_func(name, def, &crate::SourceInfo::default());
+		self.define_func(name, def, &SourceInfo::default());
 
 		Ok(())
 	}

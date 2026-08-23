@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flume::Receiver;
 use omp_core::{CowBytes, Duration, DurationUnit, LifecyclePhase, SparseMap, Str, sf};
 use omp_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
 use parking_lot::Mutex;
@@ -291,7 +292,7 @@ pub struct PendingServiceCall {
 	provider_generation: u64,
 	pending:             Arc<Mutex<SparseMap<u64, PendingRecord>>>,
 	cancellations:       flume::Sender<ServiceCancellation>,
-	response:            flume::Receiver<ServiceResponse>,
+	response:            Receiver<ServiceResponse>,
 	armed:               bool,
 }
 
@@ -341,7 +342,7 @@ pub struct ServiceBroker {
 	next_id:            AtomicU64,
 	pending:            Arc<Mutex<SparseMap<u64, PendingRecord>>>,
 	cancellations_tx:   flume::Sender<ServiceCancellation>,
-	cancellations_rx:   flume::Receiver<ServiceCancellation>,
+	cancellations_rx:   Receiver<ServiceCancellation>,
 }
 
 impl ServiceBroker {

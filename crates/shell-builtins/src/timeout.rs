@@ -1,6 +1,6 @@
 //! `timeout` builtin, moved from `pi-shell`.
 
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{future, io::Write, result, sync::Arc, time::Duration};
 
 use clap::Parser;
 use omp_shell_engine::{
@@ -147,7 +147,7 @@ impl builtins::Command for TimeoutCommand {
 	async fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,
 		context: ExecutionContext<'_, SE>,
-	) -> std::result::Result<ExecutionResult, omp_shell_engine::Error> {
+	) -> result::Result<ExecutionResult, omp_shell_engine::Error> {
 		if context.is_cancelled() {
 			return Ok(ExecutionExitCode::Interrupted.into());
 		}
@@ -225,7 +225,7 @@ impl builtins::Command for TimeoutCommand {
 		let outer_cancelled = async {
 			match &outer_cancel {
 				Some(token) => token.cancelled().await,
-				None => std::future::pending().await,
+				None => future::pending().await,
 			}
 		};
 		tokio::pin!(outer_cancelled);
@@ -233,7 +233,7 @@ impl builtins::Command for TimeoutCommand {
 		// GNU: a duration of zero disables the timeout entirely.
 		let deadline = async {
 			if limit.is_zero() {
-				std::future::pending::<()>().await;
+				future::pending::<()>().await;
 			} else {
 				time::sleep(limit).await;
 			}
@@ -285,7 +285,7 @@ impl builtins::Command for TimeoutCommand {
 		let kill_deadline = async {
 			match kill_after {
 				Some(duration) => time::sleep(duration).await,
-				None => std::future::pending().await,
+				None => future::pending().await,
 			}
 		};
 		tokio::pin!(kill_deadline);
@@ -355,6 +355,7 @@ mod tests {
 		ExecutionContext, ExecutionResult, Shell, SourceInfo, builtins,
 		extensions::DefaultShellExtensions, openfiles::OpenFiles,
 	};
+	use tokio::time;
 
 	use super::{TimeoutArgs, TimeoutCommand, parse_signal, signal_display};
 
@@ -387,7 +388,7 @@ mod tests {
 				.expect("timeout must provide its operand a cancellation token");
 			tokio::select! {
 				() = cancel_token.cancelled() => Ok(ExecutionResult::success()),
-				() = tokio::time::sleep(Duration::from_millis(500)) => {
+				() = time::sleep(Duration::from_millis(500)) => {
 					Ok(ExecutionResult::new(99))
 				},
 			}
@@ -406,7 +407,7 @@ mod tests {
 			&self,
 			_context: ExecutionContext<'_, SE>,
 		) -> Result<ExecutionResult, Self::Error> {
-			tokio::time::sleep(Duration::from_millis(300)).await;
+			time::sleep(Duration::from_millis(300)).await;
 			Ok(ExecutionResult::new(99))
 		}
 	}
@@ -429,7 +430,7 @@ mod tests {
 		for fd in [OpenFiles::STDIN_FD, OpenFiles::STDOUT_FD, OpenFiles::STDERR_FD] {
 			params.set_fd(fd, omp_shell_engine::openfiles::null().expect("null device"));
 		}
-		tokio::time::timeout(
+		time::timeout(
 			Duration::from_secs(1),
 			shell.run_string(command, &SourceInfo::default(), &params),
 		)
@@ -459,7 +460,7 @@ mod tests {
 		let mut params = shell.default_exec_params();
 		params.set_fd(OpenFiles::STDERR_FD, stderr.try_clone().expect("clone stderr capture").into());
 
-		let result = tokio::time::timeout(
+		let result = time::timeout(
 			Duration::from_secs(1),
 			shell.run_string("timeout invalid status-test", &SourceInfo::default(), &params),
 		)
@@ -577,7 +578,7 @@ mod tests {
 		for fd in [OpenFiles::STDIN_FD, OpenFiles::STDOUT_FD, OpenFiles::STDERR_FD] {
 			params.set_fd(fd, omp_shell_engine::openfiles::null().expect("null device"));
 		}
-		let result = tokio::time::timeout(
+		let result = time::timeout(
 			Duration::from_secs(1),
 			shell.run_string("timeout -k 0.075 0.010 stubborn-test", &SourceInfo::default(), &params),
 		)
@@ -617,7 +618,7 @@ mod tests {
 		let mut params = shell.default_exec_params();
 		params.set_fd(OpenFiles::STDERR_FD, stderr.try_clone().expect("clone stderr capture").into());
 
-		let result = tokio::time::timeout(
+		let result = time::timeout(
 			Duration::from_secs(1),
 			shell.run_string("timeout -v 0.010 slow-test", &SourceInfo::default(), &params),
 		)

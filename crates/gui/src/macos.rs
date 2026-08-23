@@ -8,6 +8,8 @@
 //! subviews composite *above* the view's backing `CAMetalLayer`, occluding
 //! everything wgpu renders.
 
+use std::ffi;
+
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -16,9 +18,9 @@ use winit::window::Window;
 // signatures mirror winit's own declarations (`ffi.rs`): the connection is
 // pointer-sized — a narrower return would truncate it on arm64.
 unsafe extern "C" {
-	fn CGSMainConnectionID() -> *mut std::ffi::c_void;
+	fn CGSMainConnectionID() -> *mut ffi::c_void;
 	fn CGSSetWindowBackgroundBlurRadius(
-		connection: *mut std::ffi::c_void,
+		connection: *mut ffi::c_void,
 		window: isize,
 		radius: i64,
 	) -> i32;

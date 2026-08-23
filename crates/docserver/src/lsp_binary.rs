@@ -2,6 +2,7 @@
 //! path and process authority.
 
 use std::{
+	env,
 	ffi::OsStr,
 	path::{Path, PathBuf},
 };
@@ -61,7 +62,7 @@ pub fn resolve_lsp_binary(
 			.find_map(|root| resolve_local(root, command, platform))
 			.or_else(|| {
 				path.and_then(|path| {
-					std::env::split_paths(path)
+					env::split_paths(path)
 						.find_map(|directory| resolve_candidate(&directory.join(command), platform))
 				})
 			})

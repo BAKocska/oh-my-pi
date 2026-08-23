@@ -8,14 +8,17 @@
 
 use std::{
 	ffi::OsString,
+	fs,
 	path::{Path, PathBuf},
 	process::Stdio,
 	time::{Duration, Instant},
 };
 
+use flume::Receiver;
 use omp_core::{IntoStr, Str, encoding::base64, sf};
 use serde_json::{Value, json};
 use tokio::{
+	process,
 	process::Child,
 	time::{sleep, timeout},
 };
@@ -147,7 +150,7 @@ async fn connect(
 ) -> Result<(WsLink, Child)> {
 	// A stale port file from a previous session in a persistent profile would
 	// win the poll below and point at a dead (or foreign) endpoint.
-	let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
+	let _ = fs::remove_file(profile.join("DevToolsActivePort"));
 	let mut child = spawn_browser(binary, profile, page, extra)?;
 	let connected = async {
 		let url = wait_devtools_port(profile).await?;
@@ -172,7 +175,7 @@ fn spawn_browser(
 ) -> Result<Child> {
 	let mut user_data = OsString::from("--user-data-dir=");
 	user_data.push(profile);
-	let mut cmd = tokio::process::Command::new(binary);
+	let mut cmd = process::Command::new(binary);
 	cmd.arg("--remote-debugging-port=0").arg(user_data).args([
 		"--no-first-run",
 		"--no-default-browser-check",
@@ -202,7 +205,7 @@ async fn wait_devtools_port(profile: &Path) -> Result<Str> {
 	let file = profile.join("DevToolsActivePort");
 	let deadline = Instant::now() + STARTUP_TIMEOUT;
 	loop {
-		if let Ok(text) = std::fs::read_to_string(&file) {
+		if let Ok(text) = fs::read_to_string(&file) {
 			let mut lines = text.lines();
 			if let (Some(port), Some(path)) = (lines.next(), lines.next())
 				&& let Ok(port) = port.trim().parse::<u16>()
@@ -475,7 +478,7 @@ impl Cdp {
 	}
 
 	/// Pump commands and protocol traffic until the session ends.
-	async fn run(mut self, commands: flume::Receiver<Command>, child: Child) -> Result<()> {
+	async fn run(mut self, commands: Receiver<Command>, child: Child) -> Result<()> {
 		loop {
 			if self.closed {
 				// Target destroyed or socket gone: reap without protocol.
@@ -601,7 +604,7 @@ impl Cdp {
 	async fn upload_files(
 		&mut self,
 		element: &str,
-		paths: &[std::path::PathBuf],
+		paths: &[PathBuf],
 		reply: flume::Sender<Result<()>>,
 	) -> Result<()> {
 		let result = async {

@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
+//! Proves Python agent controls preserve inbox messages and bind requests to
+//! the exact chat parent.
+
+use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures::{Stream, stream};
@@ -202,7 +205,7 @@ fn parent(
 ) -> Arc<ChatParentHost<NeverTurnClient>> {
 	let root = scratch.path().join(session);
 	let sessions = root.join("sessions");
-	std::fs::create_dir_all(&sessions).expect("session directory");
+	fs::create_dir_all(&sessions).expect("session directory");
 	let state = AgentState::new(AgentSnapshot::new(
 		TurnOptions::default(),
 		PromptFacts::new(&root, Arc::from([]))

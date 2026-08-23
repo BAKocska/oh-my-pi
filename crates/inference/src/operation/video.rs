@@ -3,6 +3,7 @@
 
 use std::{
 	future::Future,
+	mem,
 	sync::Arc,
 	task::{Context, Poll},
 	time::SystemTime,
@@ -21,7 +22,7 @@ use crate::{
 		Answer, AnswerBody, GenerationEvent, GenerationSession, GenerationStream, VideoArtifact,
 	},
 	body::ReplayEvidence,
-	call::{MediaInput, OperationCall, Setting, VideoRequest},
+	call::{Call, MediaInput, OperationCall, Setting, VideoRequest},
 	catalog::OperationKind,
 	error::Error,
 	operation::{
@@ -311,7 +312,7 @@ impl<S> VideoService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for VideoService<S>
+impl<S> Service<Call> for VideoService<S>
 where
 	S: Service<
 			OperationRequest<VideoRequest>,
@@ -329,7 +330,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::GenerateVideo(request) => Some(Arc::clone(request)),
 			_ => None,
@@ -365,7 +366,7 @@ where
 			Ok(response
 				.map(move |mut session| {
 					let mut output =
-						std::mem::replace(session.events_mut(), Box::pin(futures::stream::empty()));
+						mem::replace(session.events_mut(), Box::pin(futures::stream::empty()));
 					let stream = async_stream::stream! {
 						while let Some(event) = output.next().await {
 							match event.and_then(|event| {

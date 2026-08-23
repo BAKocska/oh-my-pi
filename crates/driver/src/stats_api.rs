@@ -2,6 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
+	fs::{self, OpenOptions},
 	path::PathBuf,
 	sync::Arc,
 	time::{SystemTime, UNIX_EPOCH},
@@ -12,6 +13,7 @@ use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use omp_core::Str;
+use omp_proto::omp::inference::v1;
 use omp_storage::{
 	index::{
 		SessionFilter, SessionIndex, SessionStatus, UsageBucket, UsageBucketWidth, UsageDimension,
@@ -25,7 +27,9 @@ use smallvec::SmallVec;
 /// its SQLite index.
 pub mod telemetry_backend {
 	use std::{
+		cmp,
 		collections::{BTreeMap, BTreeSet},
+		fmt::Display,
 		fs::File,
 		io::{Read as _, Seek as _, SeekFrom},
 		sync::Arc,
@@ -52,11 +56,15 @@ pub mod telemetry_backend {
 
 	impl TelemetryIndexQuery {
 		#[must_use]
+		/// Creates a query inventory containing one active session telemetry
+		/// index.
 		pub fn new(index: Arc<TelemetryIndex>, session: impl Into<Str>) -> Self {
 			let active = session.into();
 			Self { indexes: Arc::new(BTreeMap::from([(active.clone(), index)])), active }
 		}
 
+		/// Creates a project inventory and requires `active` to name one supplied
+		/// session.
 		pub fn with_sessions(
 			active: impl Into<Str>,
 			sessions: impl IntoIterator<Item = (Str, Arc<TelemetryIndex>)>,
@@ -247,7 +255,7 @@ pub mod telemetry_backend {
 					})
 				})
 				.collect();
-			rows.sort_by_key(|row| std::cmp::Reverse(row["rev"]["n"].as_u64().unwrap_or(0)));
+			rows.sort_by_key(|row| cmp::Reverse(row["rev"]["n"].as_u64().unwrap_or(0)));
 			Ok(Value::Array(rows))
 		}
 	}
@@ -398,24 +406,37 @@ pub mod telemetry_backend {
 		TelemetryAuthorityError::Invalid(message.into())
 	}
 
-	fn owner(error: impl std::fmt::Display) -> TelemetryAuthorityError {
+	fn owner(error: impl Display) -> TelemetryAuthorityError {
 		TelemetryAuthorityError::Owner(Str::new(error.to_string()))
 	}
 }
 
 /// Host-owned verdict projection and detached-job authority.
 pub mod verdict_authority {
-	use std::{collections::BTreeSet, sync::Arc, time::Duration};
+	use std::{
+		collections::BTreeSet,
+		sync::Arc,
+		time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+	};
 
 	use async_trait::async_trait;
 	use omp_agent::JobBoard;
 	use omp_core::{InvocationPhase, Str};
+	use omp_envd::exthost::{
+		CallbackConcurrency,
+		control::{
+			self, ControlConnectionIdentity, ControlDispatch, ControlInvocationAuthority,
+			ControlProtocolError,
+		},
+		dispatch::CallbackDispatcher,
+	};
 	use omp_tool::{
 		ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef, JobStatus,
 	};
 	use serde::{Deserialize, Serialize};
 	use serde_json::Value;
 	use thiserror::Error;
+	use tokio::time;
 
 	/// Maximum wall time allowed for a pure prompt projection callback.
 	pub const PROMPT_PROJECTION_DEADLINE: Duration = Duration::from_millis(50);
@@ -450,7 +471,7 @@ pub mod verdict_authority {
 		pub cancelled:  bool,
 		/// Exact host-issued callback authority, when projection calls back into
 		/// Python.
-		pub invocation: Option<&'a omp_envd::exthost::control::ControlInvocationAuthority>,
+		pub invocation: Option<&'a ControlInvocationAuthority>,
 	}
 
 	/// Structured verdict owner failure.
@@ -587,23 +608,23 @@ pub mod verdict_authority {
 		async fn project(
 			&self,
 			identity: Arc<VerdictAuthorityIdentity>,
-			invocation: omp_envd::exthost::control::ControlInvocationAuthority,
+			invocation: ControlInvocationAuthority,
 			request: PromptProjectionRequest,
 		) -> Result<Value, VerdictAuthorityError>;
 	}
 
 	/// CONTROL-backed projection dispatcher for the exact authenticated worker.
 	pub struct ControlPromptProjectionDispatcher {
-		target:     Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
-		dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
+		target:     Arc<ControlConnectionIdentity>,
+		dispatcher: Arc<dyn CallbackDispatcher>,
 	}
 
 	impl ControlPromptProjectionDispatcher {
 		/// Binds a live supervisor callback dispatcher to one worker generation.
 		#[must_use]
 		pub fn new(
-			target: Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
-			dispatcher: Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>,
+			target: Arc<ControlConnectionIdentity>,
+			dispatcher: Arc<dyn CallbackDispatcher>,
 		) -> Self {
 			Self { target, dispatcher }
 		}
@@ -614,7 +635,7 @@ pub mod verdict_authority {
 		async fn project(
 			&self,
 			identity: Arc<VerdictAuthorityIdentity>,
-			invocation: omp_envd::exthost::control::ControlInvocationAuthority,
+			invocation: ControlInvocationAuthority,
 			request: PromptProjectionRequest,
 		) -> Result<Value, VerdictAuthorityError> {
 			if self.target.principal.id() != identity.principal.as_str()
@@ -634,13 +655,13 @@ pub mod verdict_authority {
 			};
 			self
 				.dispatcher
-				.dispatch(self.target.clone(), omp_envd::exthost::control::ControlDispatch {
+				.dispatch(self.target.clone(), ControlDispatch {
 					operation: Str::new_static("omp.verdicts.project"),
 					arguments,
 					authority: invocation,
-					policy: omp_envd::exthost::CallbackConcurrency::Serialized,
+					policy: CallbackConcurrency::Serialized,
 					deadline: omp_envd::exthost::EventDeadline {
-						at: std::time::Instant::now() + PROMPT_PROJECTION_DEADLINE,
+						at: Instant::now() + PROMPT_PROJECTION_DEADLINE,
 					},
 				})
 				.await
@@ -732,7 +753,7 @@ pub mod verdict_authority {
 				.invocation
 				.cloned()
 				.ok_or(VerdictAuthorityError::Phase)?;
-			tokio::time::timeout(
+			time::timeout(
 				PROMPT_PROJECTION_DEADLINE,
 				self
 					.dispatcher
@@ -747,24 +768,21 @@ pub mod verdict_authority {
 	impl omp_envd::exthost::VerdictControlOwner for VerdictAuthority {
 		async fn register_job(
 			&self,
-			context: omp_envd::exthost::control::ControlRequestContext,
+			context: control::ControlRequestContext,
 			mut arguments: serde_json::Map<String, Value>,
-		) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+		) -> Result<Value, ControlProtocolError> {
 			let descriptor = arguments
 				.remove("job")
 				.unwrap_or_else(|| Value::Object(arguments));
 			let descriptor = descriptor.as_object().ok_or_else(|| {
-				omp_envd::exthost::control::ControlProtocolError::new(
-					"InvalidJob",
-					"job descriptor must be an object",
-				)
+				ControlProtocolError::new("InvalidJob", "job descriptor must be an object")
 			})?;
 			let owner_kind = descriptor
 				.get("owner_kind")
 				.and_then(Value::as_str)
 				.unwrap_or_default();
 			if owner_kind != "named_process" {
-				return Err(omp_envd::exthost::control::ControlProtocolError::new(
+				return Err(ControlProtocolError::new(
 					"JobOwnerDenied",
 					"extensions may register only Environment-owned named process generations",
 				));
@@ -776,7 +794,7 @@ pub mod verdict_authority {
 					.filter(|value| !value.is_empty())
 					.map(Str::new)
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
+						ControlProtocolError::new(
 							"InvalidJob",
 							format!("{name} must be a non-empty string"),
 						)
@@ -788,7 +806,7 @@ pub mod verdict_authority {
 				.unwrap_or("session")
 				.parse::<ArtifactLifetime>()
 				.map_err(|_| {
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"InvalidJob",
 						"lifetime must be ephemeral, session, or durable",
 					)
@@ -801,7 +819,7 @@ pub mod verdict_authority {
 					.and_then(Value::as_u64)
 					.filter(|generation| *generation != 0)
 					.ok_or_else(|| {
-						omp_envd::exthost::control::ControlProtocolError::new(
+						ControlProtocolError::new(
 							"InvalidJob",
 							"owner_generation must be a positive integer",
 						)
@@ -818,7 +836,7 @@ pub mod verdict_authority {
 				.as_ref()
 				.map(|invocation| invocation.phase)
 				.ok_or_else(|| {
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"InvalidPhase",
 						"job registration requires a live invocation",
 					)
@@ -835,7 +853,7 @@ pub mod verdict_authority {
 			let (owner_name, owner_generation) = match &job.owner {
 				JobOwner::NamedProcess { name, generation } => (name.as_str(), *generation),
 				JobOwner::AgentLoop { .. } => {
-					return Err(omp_envd::exthost::control::ControlProtocolError::new(
+					return Err(ControlProtocolError::new(
 						"JobOwnerDenied",
 						"job owner escaped the named-process authority",
 					));
@@ -853,9 +871,7 @@ pub mod verdict_authority {
 		}
 	}
 
-	fn control_error(
-		error: VerdictAuthorityError,
-	) -> omp_envd::exthost::control::ControlProtocolError {
+	fn control_error(error: VerdictAuthorityError) -> ControlProtocolError {
 		let code = match &error {
 			VerdictAuthorityError::Identity => "StaleGeneration",
 			VerdictAuthorityError::Cancelled => "Cancelled",
@@ -866,7 +882,7 @@ pub mod verdict_authority {
 			VerdictAuthorityError::ProjectionTimeout => "ProjectionTimeout",
 			VerdictAuthorityError::Projection(_) => "ProjectionFailed",
 		};
-		omp_envd::exthost::control::ControlProtocolError::new(code, error.to_string())
+		ControlProtocolError::new(code, error.to_string())
 	}
 
 	fn same_registration(left: &JobRef, right: &JobRef) -> bool {
@@ -879,8 +895,8 @@ pub mod verdict_authority {
 	}
 
 	fn now_ms() -> u64 {
-		std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
+		SystemTime::now()
+			.duration_since(UNIX_EPOCH)
 			.unwrap_or_default()
 			.as_millis() as u64
 	}
@@ -1081,13 +1097,13 @@ impl StatsApi {
 
 	/// Serializes manual synchronization through the same cross-process lock.
 	pub fn sync_document(&self) -> Result<Value, &'static str> {
-		let file = std::fs::OpenOptions::new()
+		let file = OpenOptions::new()
 			.write(true)
 			.create_new(true)
 			.open(&self.sync_lock)
 			.map_err(|_| "another process is synchronizing statistics")?;
 		drop(file);
-		let _ = std::fs::remove_file(&self.sync_lock);
+		let _ = fs::remove_file(&self.sync_lock);
 		Ok(json!({"version": API_VERSION, "data": {"processed": 0, "source": "write_time_index"}}))
 	}
 
@@ -1215,7 +1231,7 @@ fn key(row: &UsageBucket, dimension: UsageDimension) -> Option<&str> {
 		.iter()
 		.find_map(|(candidate, value)| (*candidate == dimension).then_some(value.as_str()))
 }
-fn usage_value(usage: &omp_proto::omp::inference::v1::Usage) -> Value {
+fn usage_value(usage: &v1::Usage) -> Value {
 	json!({
 		"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
 		"cache_read_tokens": usage.cache_read_tokens, "cache_write_tokens": usage.cache_write_tokens,

@@ -2,9 +2,11 @@
 
 use std::{
 	collections::VecDeque,
+	fmt,
 	sync::{Arc, LazyLock},
 };
 
+use flume::Receiver;
 use omp_core::Str;
 use omp_secrets::{builtins::credential_rules, redact::SecretRedactor};
 use parking_lot::Mutex;
@@ -83,8 +85,8 @@ pub struct RawProviderCapture {
 	subscriber_capacity: usize,
 }
 
-impl std::fmt::Debug for RawProviderCapture {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for RawProviderCapture {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("RawProviderCapture")
 			.field("capacity", &self.capacity)
@@ -180,7 +182,7 @@ impl RawProviderCapture {
 
 	/// Subscribes to global fan-out (`None`) or one exact session. The returned
 	/// channel is bounded and slow viewers never block inference.
-	pub fn subscribe(&self, session: Option<&str>) -> flume::Receiver<CapturedFrame> {
+	pub fn subscribe(&self, session: Option<&str>) -> Receiver<CapturedFrame> {
 		let (sender, receiver) = flume::bounded(self.subscriber_capacity);
 		self
 			.inner

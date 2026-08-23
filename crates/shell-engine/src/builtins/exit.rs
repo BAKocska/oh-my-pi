@@ -1,6 +1,8 @@
 use clap::Parser;
 
-use crate::{ExecutionControlFlow, ExecutionResult, builtins};
+use crate::{
+	Error, ExecutionContext, ExecutionControlFlow, ExecutionResult, ShellExtensions, builtins,
+};
 
 /// Exit the shell.
 #[derive(Parser)]
@@ -11,12 +13,12 @@ pub(crate) struct ExitCommand {
 }
 
 impl builtins::Command for ExitCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		#[expect(clippy::cast_sign_loss, reason = "shell exit status is defined modulo 256")]
 		let code_8bit = if let Some(code_32bit) = &self.code {
 			(code_32bit & 0xff) as u8

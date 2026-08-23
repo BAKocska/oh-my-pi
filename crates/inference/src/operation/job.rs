@@ -1,10 +1,12 @@
 //! Provider-neutral state machine for resumable asynchronous jobs.
 
 use std::{
+	fmt,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
 
+use flume::Receiver;
 use omp_core::Str;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -68,8 +70,8 @@ impl JobCheckpointHandle {
 	}
 }
 
-impl std::fmt::Debug for JobCheckpointHandle {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for JobCheckpointHandle {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_tuple("JobCheckpointHandle")
 			.field(&self.snapshot())
@@ -227,7 +229,7 @@ impl JobCancelHandle {
 	pub fn bounded(
 		job: JobRef,
 		capacity: usize,
-	) -> Result<(Self, flume::Receiver<JobCommand>), JobCancelError> {
+	) -> Result<(Self, Receiver<JobCommand>), JobCancelError> {
 		if capacity == 0 {
 			return Err(JobCancelError::ZeroCapacity);
 		}
@@ -270,8 +272,8 @@ impl JobCancelHandle {
 	}
 }
 
-impl std::fmt::Debug for JobCancelHandle {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for JobCancelHandle {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("JobCancelHandle")
 			.field("job", &self.job)

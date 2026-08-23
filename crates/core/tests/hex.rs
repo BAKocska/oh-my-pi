@@ -1,5 +1,8 @@
 //! Hex encode/decode contract tests.
-use std::{fmt, io::Cursor};
+use std::{
+	fmt::{self, Display},
+	io::Cursor,
+};
 
 use bytes::BytesMut;
 use omp_core::hex::*;
@@ -25,7 +28,7 @@ fn test_decode_const_odd_ascii() {
 	assert_eq!(s.as_bytes(), b"\x0fHello");
 }
 
-fn assert_fmt<I: fmt::Display + fmt::LowerHex + fmt::UpperHex>(s: &I) {
+fn assert_fmt<I: Display + fmt::LowerHex + fmt::UpperHex>(s: &I) {
 	assert_eq!(format!("{s}"), "48656c6c6f20576f726c6421");
 	assert_eq!(format!("{s:x}"), "48656c6c6f20576f726c6421");
 	assert_eq!(format!("{s:X}"), "48656C6C6F20576F726C6421");

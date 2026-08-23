@@ -1,3 +1,5 @@
+//! Proves verified manifests retain CONTROL declarations and runtime drift
+//! cannot gain authority.
 use std::collections::BTreeMap;
 
 use omp_agent::HookPhase;

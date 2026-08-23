@@ -1,6 +1,6 @@
 use omp_core::Str;
 
-use super::{McpRequest, command};
+use super::{ConfigScope, McpRequest, command};
 
 command!(mcp, 620, "mcp", [], "Manage Environment MCP servers", [Workspace, Owner], false, typed("list|add|remove|enable|disable|test|reconnect|reauth|unauth|help", ["list", "add", "remove", "enable", "disable", "test", "reconnect", "reauth", "unauth", "help"], parse_mcp) => |host, request| host.mcp(request));
 
@@ -35,13 +35,13 @@ fn parse_add(raw: &str) -> miette::Result<McpRequest> {
 			miette::miette!("usage: /mcp add [--scope user|project] <name> <server-json>")
 		})?;
 		let scope = match scope {
-			"user" => super::ConfigScope::User,
-			"project" => super::ConfigScope::Project,
+			"user" => ConfigScope::User,
+			"project" => ConfigScope::Project,
 			_ => return Err(miette::miette!("MCP scope must be `user` or `project`")),
 		};
 		(scope, raw.trim())
 	} else {
-		(super::ConfigScope::Project, raw)
+		(ConfigScope::Project, raw)
 	};
 	let (name, server_json) = raw.split_once(char::is_whitespace).ok_or_else(|| {
 		miette::miette!("usage: /mcp add [--scope user|project] <name> <server-json>")

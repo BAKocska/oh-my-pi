@@ -4,6 +4,7 @@ use std::{
 	mem::{self, offset_of},
 	panic::{AssertUnwindSafe, catch_unwind},
 	ptr::{self, null, null_mut},
+	result,
 	sync::{
 		Arc, LazyLock,
 		atomic::{AtomicPtr, Ordering},
@@ -11,6 +12,7 @@ use std::{
 	time::Duration,
 };
 
+use flume::Receiver;
 use omp_core::{Str, sf};
 use parking_lot::{Condvar, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -113,7 +115,7 @@ unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
 
 impl Runtime {
-	fn load() -> std::result::Result<Self, BridgeFailure> {
+	fn load() -> result::Result<Self, BridgeFailure> {
 		// SAFETY: FRAMEWORK_PATH is a permanent NUL-terminated path and flags are valid
 		// for dlopen.
 		let handle =
@@ -127,7 +129,7 @@ impl Runtime {
 		Ok(Self { handle })
 	}
 
-	unsafe fn symbol<T: Copy>(&self, name: &'static CStr) -> std::result::Result<T, BridgeFailure> {
+	unsafe fn symbol<T: Copy>(&self, name: &'static CStr) -> result::Result<T, BridgeFailure> {
 		// SAFETY: Both handles are valid for dlsym; callers provide the exact ABI type
 		// for each symbol.
 		let mut pointer = unsafe { libc::dlsym(self.handle, name.as_ptr()) };
@@ -147,7 +149,7 @@ impl Runtime {
 		Ok(unsafe { pointer_value(pointer) })
 	}
 
-	fn metadata(&self, name: &[u8]) -> std::result::Result<*const c_void, BridgeFailure> {
+	fn metadata(&self, name: &[u8]) -> result::Result<*const c_void, BridgeFailure> {
 		// SAFETY: The runtime function type matches
 		// swift_getTypeByMangledNameInContext2.
 		let resolve: MetadataResolver =
@@ -164,7 +166,7 @@ impl Runtime {
 		Ok(metadata)
 	}
 
-	fn error_metadata(&self) -> std::result::Result<*const c_void, BridgeFailure> {
+	fn error_metadata(&self) -> result::Result<*const c_void, BridgeFailure> {
 		// Swift's Error existential mangling uses an indirect symbolic reference to
 		// the protocol descriptor, matching Swift's C++ interop overlay.
 		let mut name = ErrorMetadataName {
@@ -188,7 +190,7 @@ impl Runtime {
 	fn metadata_accessor(
 		&self,
 		name: &'static CStr,
-	) -> std::result::Result<*const c_void, BridgeFailure> {
+	) -> result::Result<*const c_void, BridgeFailure> {
 		// SAFETY: Foundation Models metadata accessors accept a MetadataRequest in x0.
 		let accessor: MetadataAccessor = unsafe { self.symbol(name)? };
 		// SAFETY: Zero requests complete metadata, which is sufficient for value
@@ -203,7 +205,7 @@ impl Runtime {
 		Ok(metadata)
 	}
 
-	fn case_tag(&self, name: &'static CStr) -> std::result::Result<u32, BridgeFailure> {
+	fn case_tag(&self, name: &'static CStr) -> result::Result<u32, BridgeFailure> {
 		// SAFETY: Enum case descriptor symbols point to a stable 32-bit case tag.
 		let pointer: *const u32 = unsafe { self.symbol(name)? };
 		// SAFETY: dlsym returned the address of the case descriptor's aligned tag word.
@@ -211,12 +213,11 @@ impl Runtime {
 	}
 }
 
-static RUNTIME: LazyLock<std::result::Result<Runtime, BridgeFailure>> =
-	LazyLock::new(Runtime::load);
+static RUNTIME: LazyLock<result::Result<Runtime, BridgeFailure>> = LazyLock::new(Runtime::load);
 #[unsafe(no_mangle)]
 static APPLE_FM_ACTIVE_REQUEST: AtomicPtr<Request> = AtomicPtr::new(null_mut());
 
-fn runtime() -> std::result::Result<&'static Runtime, BridgeFailure> {
+fn runtime() -> result::Result<&'static Runtime, BridgeFailure> {
 	match &*RUNTIME {
 		Ok(runtime) => Ok(runtime),
 		Err(failure) => {
@@ -329,7 +330,7 @@ struct SwiftValue {
 }
 
 impl SwiftValue {
-	fn new(metadata: *const c_void) -> std::result::Result<Self, BridgeFailure> {
+	fn new(metadata: *const c_void) -> result::Result<Self, BridgeFailure> {
 		if metadata.is_null() {
 			return Err(BridgeFailure::runtime("Cannot allocate a Swift value without metadata"));
 		}
@@ -435,7 +436,7 @@ impl SwiftObject {
 		pointer: *mut c_void,
 		release: SwiftRelease,
 		kind: &str,
-	) -> std::result::Result<Self, BridgeFailure> {
+	) -> result::Result<Self, BridgeFailure> {
 		if pointer.is_null() {
 			Err(BridgeFailure::runtime(format!("Foundation Models returned a null {kind}")))
 		} else {
@@ -501,7 +502,7 @@ struct SnapshotStringBridge {
 }
 
 impl SnapshotStringBridge {
-	fn load(runtime: &Runtime) -> std::result::Result<Self, BridgeFailure> {
+	fn load(runtime: &Runtime) -> result::Result<Self, BridgeFailure> {
 		Ok(Self {
 			// SAFETY: Each symbol is resolved with its declared Foundation or runtime ABI.
 			to_ns_string:   unsafe {
@@ -520,7 +521,7 @@ impl SnapshotStringBridge {
 		})
 	}
 
-	fn to_rust(self, value: SwiftString) -> std::result::Result<String, BridgeFailure> {
+	fn to_rust(self, value: SwiftString) -> result::Result<String, BridgeFailure> {
 		let value = OwnedSwiftString::new(value, self.bridge_release);
 		// SAFETY: value is an initialized Swift String returned by the snapshot getter.
 		let ns_string = unsafe { (self.to_ns_string)(value.raw()) };
@@ -564,7 +565,7 @@ impl TaskControl {
 		}
 	}
 
-	fn begin_launch(&self) -> std::result::Result<(), BridgeFailure> {
+	fn begin_launch(&self) -> result::Result<(), BridgeFailure> {
 		let mut state = self.state.lock();
 		if state.launching || !state.task.is_null() {
 			return Err(BridgeFailure::runtime(
@@ -618,12 +619,12 @@ impl TaskControl {
 
 enum StreamMessage {
 	Snapshot(Str),
-	Complete(std::result::Result<(), BridgeFailure>),
+	Complete(result::Result<(), BridgeFailure>),
 }
 
 enum NextAction {
 	Continue,
-	Complete(std::result::Result<(), BridgeFailure>),
+	Complete(result::Result<(), BridgeFailure>),
 }
 
 #[repr(C)]
@@ -796,7 +797,7 @@ pub fn generate(
 	}
 }
 
-fn cancel_and_reap(control: &TaskControl, receiver: &flume::Receiver<StreamMessage>) {
+fn cancel_and_reap(control: &TaskControl, receiver: &Receiver<StreamMessage>) {
 	control.request_cancel();
 	while let Ok(message) = receiver.recv() {
 		if matches!(message, StreamMessage::Complete(_)) {
@@ -833,7 +834,7 @@ fn start_generation(
 	temperature: Option<f64>,
 	max_tokens: Option<u32>,
 	sender: flume::Sender<StreamMessage>,
-) -> std::result::Result<Arc<TaskControl>, BridgeFailure> {
+) -> result::Result<Arc<TaskControl>, BridgeFailure> {
 	let runtime = runtime()?;
 	let model = if permissive {
 		configured_model(runtime, true)?
@@ -946,7 +947,7 @@ fn start_generation(
 	Ok(control)
 }
 
-fn default_model(runtime: &Runtime) -> std::result::Result<SwiftObject, BridgeFailure> {
+fn default_model(runtime: &Runtime) -> result::Result<SwiftObject, BridgeFailure> {
 	// SAFETY: These symbols have the SystemLanguageModel.default getter and
 	// swift_release ABIs.
 	let getter: ModelDefault = unsafe { runtime.symbol(MODEL_DEFAULT)? };
@@ -959,7 +960,7 @@ fn default_model(runtime: &Runtime) -> std::result::Result<SwiftObject, BridgeFa
 fn configured_model(
 	runtime: &Runtime,
 	permissive: bool,
-) -> std::result::Result<SwiftObject, BridgeFailure> {
+) -> result::Result<SwiftObject, BridgeFailure> {
 	let use_case_metadata = runtime.metadata_accessor(USE_CASE_METADATA)?;
 	let guardrails_metadata = runtime.metadata_accessor(GUARDRAILS_METADATA)?;
 	let mut use_case = SwiftValue::new(use_case_metadata)?;
@@ -1001,7 +1002,7 @@ fn configured_model(
 fn availability_for_model(
 	runtime: &Runtime,
 	model: *mut c_void,
-) -> std::result::Result<AppleFmAvailability, BridgeFailure> {
+) -> result::Result<AppleFmAvailability, BridgeFailure> {
 	let availability_metadata = runtime.metadata_accessor(AVAILABILITY_METADATA)?;
 	let mut availability = SwiftValue::new(availability_metadata)?;
 	// SAFETY: The local bridge adapts the availability getter's x8/x20 convention.
@@ -1037,7 +1038,7 @@ fn create_session(
 	runtime: &'static Runtime,
 	mut model: SwiftObject,
 	system_prompt: Option<&str>,
-) -> std::result::Result<SwiftObject, BridgeFailure> {
+) -> result::Result<SwiftObject, BridgeFailure> {
 	let metadata = runtime.metadata_accessor(SESSION_METADATA)?;
 	// SAFETY: These symbols have the session initializer's declared Swift ABI.
 	let empty_tools = unsafe { runtime.symbol::<*const c_void>(c"_swiftEmptyArrayStorage")? };
@@ -1071,7 +1072,7 @@ fn create_options(
 	runtime: &Runtime,
 	temperature: Option<f64>,
 	max_tokens: Option<u32>,
-) -> std::result::Result<SwiftValue, BridgeFailure> {
+) -> result::Result<SwiftValue, BridgeFailure> {
 	let sampling_metadata = runtime.metadata_accessor(SAMPLING_METADATA)?;
 	let mut sampling = SwiftValue::new(sampling_metadata)?;
 	sampling.initialize_optional_none();
@@ -1106,7 +1107,7 @@ fn create_stream(
 	session: *mut c_void,
 	prompt: &str,
 	options: *mut c_void,
-) -> std::result::Result<SwiftValue, BridgeFailure> {
+) -> result::Result<SwiftValue, BridgeFailure> {
 	let stream_metadata = runtime.metadata(STREAM_METADATA_NAME)?;
 	let mut stream = SwiftValue::new(stream_metadata)?;
 	// SAFETY: STREAM_RESPONSE resolves to the compiled synchronous method.
@@ -1133,7 +1134,7 @@ fn create_stream(
 fn to_swift_string(
 	runtime: &Runtime,
 	value: &str,
-) -> std::result::Result<OwnedSwiftString, BridgeFailure> {
+) -> result::Result<OwnedSwiftString, BridgeFailure> {
 	// SAFETY: These symbols match their CoreFoundation and Swift Foundation ABIs.
 	let create: CFStringCreateWithBytes = unsafe { runtime.symbol(c"CFStringCreateWithBytes")? };
 	// SAFETY: The Swift bridge symbol has the declared Foundation ABI.
@@ -1165,7 +1166,7 @@ fn to_swift_string(
 fn ns_string_to_rust(
 	runtime: &Runtime,
 	value: *const c_void,
-) -> std::result::Result<String, BridgeFailure> {
+) -> result::Result<String, BridgeFailure> {
 	// SAFETY: These symbols match CFString's toll-free bridged C ABI.
 	// SAFETY: Each symbol matches CFString's toll-free bridged C ABI.
 	let length: CFStringGetLength = unsafe { runtime.symbol(c"CFStringGetLength")? };
@@ -1183,7 +1184,7 @@ fn ns_string_to_rust_with(
 	length: CFStringGetLength,
 	maximum: CFStringGetMaximumSizeForEncoding,
 	copy: CFStringGetCString,
-) -> std::result::Result<String, BridgeFailure> {
+) -> result::Result<String, BridgeFailure> {
 	// SAFETY: value is a live NSString/CFString.
 	let utf16_length = unsafe { length(value) };
 	// SAFETY: The returned bound excludes the trailing NUL byte.
@@ -1207,7 +1208,7 @@ fn ns_string_to_rust_with(
 	})
 }
 
-fn launch_next(request: *mut Request) -> std::result::Result<(), BridgeFailure> {
+fn launch_next(request: *mut Request) -> result::Result<(), BridgeFailure> {
 	// SAFETY: request belongs to APPLE_FM_ACTIVE_REQUEST until completion clears
 	// it.
 	let request_ref = unsafe { &*request };
@@ -1321,7 +1322,7 @@ impl Request {
 	}
 }
 
-fn complete_request(request: *mut Request, result: std::result::Result<(), BridgeFailure>) {
+fn complete_request(request: *mut Request, result: result::Result<(), BridgeFailure>) {
 	// SAFETY: request is still the unique active allocation at this point.
 	let request_ref = unsafe { &*request };
 	let cleared = APPLE_FM_ACTIVE_REQUEST
@@ -1352,7 +1353,7 @@ fn generation_failure(runtime: &Runtime, error: *mut c_void) -> BridgeFailure {
 fn classify_generation_error(
 	runtime: &Runtime,
 	error: *mut c_void,
-) -> std::result::Result<&'static str, BridgeFailure> {
+) -> result::Result<&'static str, BridgeFailure> {
 	let metadata = runtime.metadata_accessor(GENERATION_ERROR_METADATA)?;
 	let mut generation_error = SwiftValue::new(metadata)?;
 	let source_metadata = runtime.error_metadata()?;
@@ -1402,10 +1403,7 @@ fn classify_generation_error(
 	Ok(code)
 }
 
-fn error_message(
-	runtime: &Runtime,
-	error: *mut c_void,
-) -> std::result::Result<String, BridgeFailure> {
+fn error_message(runtime: &Runtime, error: *mut c_void) -> result::Result<String, BridgeFailure> {
 	// SAFETY: These symbols match Swift Foundation and Objective-C runtime ABIs.
 	let convert: ConvertErrorToNSError =
 		unsafe { runtime.symbol(c"$s10Foundation22_convertErrorToNSErrorySo0E0Cs0C0_pF")? };

@@ -1,6 +1,6 @@
 //! MCP projection of the app's combined encrypted credential authority.
 
-use std::{sync::Arc, time::SystemTime};
+use std::{fmt, sync::Arc, time::SystemTime};
 
 use futures::future::BoxFuture;
 use omp_catalog::AuthSpecId;
@@ -208,8 +208,8 @@ impl CredentialSource for CombinedAuthAuthority {
 	}
 }
 
-impl std::fmt::Debug for CombinedAuthAuthority {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CombinedAuthAuthority {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("CombinedAuthAuthority(..)")
 	}
 }

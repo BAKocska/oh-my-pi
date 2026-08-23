@@ -1,6 +1,7 @@
 //! `omp stats` command composition.
 
 use std::{
+	fs, io,
 	io::IsTerminal as _,
 	net::{IpAddr, SocketAddr},
 	sync::Arc,
@@ -9,6 +10,7 @@ use std::{
 use miette::{IntoDiagnostic as _, miette};
 use omp_driver::{stats_api::StatsApi, stats_server};
 use omp_storage::index::SessionIndex;
+use tokio::signal;
 
 use crate::cli::{StatsArgs, StatsCommand};
 
@@ -17,7 +19,7 @@ pub async fn run(args: StatsArgs) -> miette::Result<()> {
 	let state_dir = args
 		.state_dir
 		.unwrap_or(omp_core::dirs::data_dir(None).into_diagnostic()?);
-	std::fs::create_dir_all(&state_dir).into_diagnostic()?;
+	fs::create_dir_all(&state_dir).into_diagnostic()?;
 	let index = Arc::new(
 		SessionIndex::open_authoritative_reader(state_dir.join("sessions.sqlite3"))
 			.into_diagnostic()?,
@@ -34,11 +36,11 @@ pub async fn run(args: StatsArgs) -> miette::Result<()> {
 			Ok(())
 		},
 		Some(StatsCommand::Sync) => {
-			if std::io::stderr().is_terminal() {
+			if io::stderr().is_terminal() {
 				eprint!("Synchronizing write-time statistics... ");
 			}
 			let document = api.sync_document().map_err(|message| miette!(message))?;
-			if std::io::stderr().is_terminal() {
+			if io::stderr().is_terminal() {
 				eprintln!("done");
 			}
 			println!("{}", serde_json::to_string_pretty(&document).into_diagnostic()?);
@@ -65,7 +67,7 @@ pub async fn run(args: StatsArgs) -> miette::Result<()> {
 			if !no_open {
 				omp_core::open::open_path(&url);
 			}
-			tokio::signal::ctrl_c().await.into_diagnostic()?;
+			signal::ctrl_c().await.into_diagnostic()?;
 			server.shutdown().await;
 			Ok(())
 		},

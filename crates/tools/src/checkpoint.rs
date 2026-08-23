@@ -1,6 +1,10 @@
 //! Durable exploration checkpoint creation and turn-boundary rewind scheduling.
 
-use std::{fmt, future::Future};
+use std::{
+	error,
+	fmt::{self, Display},
+	future::Future,
+};
 
 use async_stream::stream;
 use futures::Stream;
@@ -131,12 +135,12 @@ pub struct Fault {
 	code:    FaultCode,
 	message: Str,
 }
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.message)
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// Creates durable checkpoint entries.
 pub struct Checkpoint<C> {
@@ -323,6 +327,8 @@ fn protocol_issue(message: Str) -> ArgIssue {
 
 #[cfg(test)]
 mod tests {
+	use std::future;
+
 	use super::*;
 
 	#[derive(Clone)]
@@ -332,7 +338,7 @@ mod tests {
 			&self,
 			_: Str,
 		) -> impl Future<Output = Result<CheckpointAck, CheckpointFault>> + Send {
-			std::future::ready(Ok(CheckpointAck { token: sf!("opaque"), started_at: 42 }))
+			future::ready(Ok(CheckpointAck { token: sf!("opaque"), started_at: 42 }))
 		}
 
 		fn schedule_rewind(
@@ -340,7 +346,7 @@ mod tests {
 			token: Str,
 			_: Str,
 		) -> impl Future<Output = Result<RewindAck, CheckpointFault>> + Send {
-			std::future::ready(Ok(RewindAck { token, receipt: sf!("rewind-1") }))
+			future::ready(Ok(RewindAck { token, receipt: sf!("rewind-1") }))
 		}
 	}
 

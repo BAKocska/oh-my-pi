@@ -6,15 +6,20 @@
 //! executes an extension module.
 
 use std::{
-	collections::BTreeMap,
+	cell,
+	collections::{BTreeMap, BTreeSet},
+	ffi, fs, io,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
 
 use omp_core::{Str, sf};
+use omp_ext::config::StaticDeclarations;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
+
+use super::native::scan_capability_dir;
 
 /// Static capability families understood by native OMP discovery.
 #[derive(
@@ -540,10 +545,11 @@ pub struct ExtensionPayload {
 	pub description: Option<Str>,
 	/// Supervised worker declaration, not imported by discovery.
 	pub worker:      Option<PythonWorkerDeclaration>,
-	/// Forward-compatible static manifest properties.
 	/// Static CLI flag contributions discovered before final argument parsing.
 	#[serde(default)]
 	pub cli:         Vec<omp_ext::config::CliContribution>,
+	/// Forward-compatible signed properties projected into typed CONTROL
+	/// declarations.
 	#[serde(default)]
 	pub manifest:    BTreeMap<Str, serde_json::Value>,
 }
@@ -551,10 +557,8 @@ pub struct ExtensionPayload {
 impl ExtensionPayload {
 	/// Projects the signed, data-only manifest properties into typed CONTROL
 	/// declaration tables without importing the declared worker.
-	pub fn static_declarations(
-		&self,
-	) -> Result<omp_ext::config::StaticDeclarations, serde_json::Error> {
-		omp_ext::config::StaticDeclarations::from_properties(&self.manifest)
+	pub fn static_declarations(&self) -> Result<StaticDeclarations, serde_json::Error> {
+		StaticDeclarations::from_properties(&self.manifest)
 	}
 }
 
@@ -882,7 +886,7 @@ pub struct AgentDiscoveryWarning {
 pub enum AgentDiscoveryWarningKind {
 	/// The definition file could not be read.
 	#[error("agent definition could not be read")]
-	Io(#[source] std::io::Error),
+	Io(#[source] io::Error),
 	/// The definition frontmatter was malformed.
 	#[error("agent definition could not be parsed")]
 	Parse(#[source] omp_agent::AgentDefinitionError),
@@ -902,16 +906,16 @@ pub struct AgentDiscovery {
 /// extension/project content is skipped with structured warning evidence.
 pub fn discover_agents(declarations: &[CapabilityDeclaration]) -> AgentDiscovery {
 	let ordered = priority_ordered(declarations.to_vec());
-	let warnings = std::cell::RefCell::new(Vec::new());
+	let warnings = cell::RefCell::new(Vec::new());
 	let definitions = dispatch_first(&ordered, CapabilityKind::Agents, |declaration| {
 		agent_files(&declaration.root)
 			.into_iter()
 			.filter_map(|path| {
 				let key = path
 					.file_stem()
-					.and_then(std::ffi::OsStr::to_str)
+					.and_then(ffi::OsStr::to_str)
 					.map(Str::from)?;
-				let markdown = match std::fs::read_to_string(&path) {
+				let markdown = match fs::read_to_string(&path) {
 					Ok(markdown) => markdown,
 					Err(source) => {
 						warnings.borrow_mut().push(AgentDiscoveryWarning {
@@ -996,7 +1000,7 @@ impl AgentDiscoveryCacheKey {
 	/// Canonicalizes a working directory without making a missing root fatal.
 	pub fn new(cwd: &Path, settings_generation: u64, extension_generation: u64) -> Self {
 		Self {
-			cwd: std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+			cwd: fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
 			settings_generation,
 			extension_generation,
 		}
@@ -1060,9 +1064,9 @@ fn agent_files(root: &Path) -> Vec<PathBuf> {
 	if root.is_file() {
 		return vec![root.to_path_buf()];
 	}
-	let mut paths = super::native::scan_capability_dir(root)
+	let mut paths = scan_capability_dir(root)
 		.into_iter()
-		.filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("md"))
+		.filter(|path| path.extension().and_then(ffi::OsStr::to_str) == Some("md"))
 		.collect::<Vec<_>>();
 	paths.sort();
 	paths
@@ -1088,7 +1092,7 @@ pub fn dispatch_first<'a, T>(
 	kind: CapabilityKind,
 	mut load: impl FnMut(&'a CapabilityDeclaration) -> Vec<(Str, T)>,
 ) -> Vec<(Str, T)> {
-	let mut claimed = std::collections::BTreeSet::new();
+	let mut claimed = BTreeSet::new();
 	let mut output = Vec::new();
 	for declaration in declarations
 		.iter()

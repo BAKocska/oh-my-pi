@@ -19,6 +19,8 @@ pub mod runtime;
 pub mod session;
 pub mod store;
 
+use std::{io, result};
+
 pub use bank::{BankId, BankScope, BankScopeInput};
 pub use config::{AutolearnSettings, MemoryBackend, MemorySettings, MnemopiSettings};
 pub use runtime::{Capabilities, MemoryRuntime, RuntimeRegistry};
@@ -31,7 +33,7 @@ pub const INACTIVE_MESSAGE: &str = "Memory is off. Set memory.backend = \"mnemop
 pub enum Error {
 	/// Filesystem operation failed.
 	#[error(transparent)]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// SQLite operation failed.
 	#[error(transparent)]
 	Sqlite(#[from] rusqlite::Error),
@@ -68,4 +70,4 @@ pub enum Error {
 }
 
 /// Crate-local result alias.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = result::Result<T, E>;

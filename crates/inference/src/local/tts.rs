@@ -2,9 +2,10 @@
 
 use std::{
 	collections::HashMap,
+	fs,
 	path::PathBuf,
 	sync::{Arc, LazyLock},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -191,7 +192,7 @@ impl KokoroAdapter {
 		let runtime = LocalRuntime::new(
 			move || {
 				let device = kokoro_device(config.device)?;
-				let config_bytes = std::fs::read(&config.config_path).map_err(|error| {
+				let config_bytes = fs::read(&config.config_path).map_err(|error| {
 					LocalError::new(
 						LocalErrorKind::Artifact,
 						format!("Kokoro config read failed: {error}"),
@@ -355,7 +356,7 @@ impl KokoroAdapter {
 	}
 
 	/// Unloads Kokoro when inactive for its configured interval.
-	pub fn unload_if_idle(&self, now: std::time::Instant) -> bool {
+	pub fn unload_if_idle(&self, now: Instant) -> bool {
 		self.runtime.unload_if_idle(now)
 	}
 

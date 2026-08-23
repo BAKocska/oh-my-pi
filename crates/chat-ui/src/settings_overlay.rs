@@ -10,7 +10,7 @@ use omp_tui::{
 };
 use serde_json::Value;
 
-use crate::{SettingRow, panel_divider};
+use crate::{OverlayPanel, SettingRow, panel_divider};
 
 /// One value mutation emitted by the settings surface.
 #[derive(Clone, Debug, PartialEq)]
@@ -241,7 +241,7 @@ fn build(rows: &[SettingRow], query: &str, width: u16, ctx: &UiContext) -> Ui {
 	}
 	let seed = Str::new(query);
 	Ui::from_root(
-		crate::OverlayPanel::new("Settings").child(dom! {
+		OverlayPanel::new("Settings").child(dom! {
 			<col>
 				<input id="settings-search" value={seed} placeholder="Search settings"/>
 				{panel_divider()}

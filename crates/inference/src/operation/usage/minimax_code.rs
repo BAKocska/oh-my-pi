@@ -9,13 +9,14 @@ use futures::FutureExt as _;
 use http::{HeaderMap, HeaderValue, Method, header::AUTHORIZATION};
 use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use serde_json::{Map, Value};
+use tokio::time;
 
 use crate::{
 	answer::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageStatus, UsageUnit, UsageWindow,
 		UsageWindowKind,
 	},
-	auth::{OAuthHttpClient, OAuthHttpRequest},
+	auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse},
 	catalog::ProviderId,
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
@@ -124,14 +125,14 @@ async fn execute(
 	http: &dyn OAuthHttpClient,
 	r: OAuthHttpRequest,
 	d: Option<Instant>,
-) -> Result<crate::auth::OAuthHttpResponse, UsageFetchError> {
+) -> Result<OAuthHttpResponse, UsageFetchError> {
 	let t = d
 		.map_or(TIMEOUT, |e| e.saturating_duration_since(Instant::now()))
 		.min(TIMEOUT);
 	if t.is_zero() {
 		return Err(UsageFetchError::Unavailable);
 	}
-	tokio::time::timeout(t, http.execute(r))
+	time::timeout(t, http.execute(r))
 		.await
 		.map_err(|_| UsageFetchError::Unavailable)?
 		.map_err(|_| UsageFetchError::Unavailable)

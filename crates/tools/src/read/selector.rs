@@ -3,7 +3,9 @@
 use std::{
 	borrow::Cow,
 	collections::HashMap,
-	fmt, io,
+	env, error,
+	fmt::{self, Display},
+	fs, io,
 	path::{Path, PathBuf},
 };
 
@@ -81,13 +83,13 @@ impl SelectorError {
 	}
 }
 
-impl fmt::Display for SelectorError {
+impl Display for SelectorError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(self.message())
 	}
 }
 
-impl std::error::Error for SelectorError {}
+impl error::Error for SelectorError {}
 
 /// Parse one `N`, `N-M`, `N-`, `N+K`, `N..M`, or `N..` range chunk.
 pub fn parse_line_range_chunk(input: &str) -> Result<Option<LineRange>, SelectorError> {
@@ -384,7 +386,7 @@ pub fn probe_literal_path(raw_path: &str, cwd: &Path) -> LiteralPathProbe {
 	} else {
 		cwd.join(expanded)
 	};
-	match std::fs::symlink_metadata(resolved) {
+	match fs::symlink_metadata(resolved) {
 		Ok(_) => LiteralPathProbe::Exists,
 		Err(error)
 			if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) =>
@@ -430,8 +432,8 @@ pub fn expand_tilde(path: &str, home: Option<&Path>) -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-	std::env::var_os("HOME")
-		.or_else(|| std::env::var_os("USERPROFILE"))
+	env::var_os("HOME")
+		.or_else(|| env::var_os("USERPROFILE"))
 		.map(PathBuf::from)
 }
 

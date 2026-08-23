@@ -1,5 +1,7 @@
 //! Bounded read-only `memory://` projections for the active session.
 
+use std::sync;
+
 use omp_core::{CowBytes, Str};
 use omp_memory::{runtime::MemoryProjection, store::MemoryTier};
 use omp_tools::read::{
@@ -11,16 +13,18 @@ use omp_tools::read::{
 };
 use serde::Serialize;
 
+use super::select_bytes;
+
 const MAX_RECORDS: usize = 100;
 const MAX_BYTES: usize = 1024 * 1024;
 
-pub(super) struct MemoryUrlResolver {
-	runtime: std::sync::Arc<omp_memory::MemoryRuntime>,
+pub(crate) struct MemoryUrlResolver {
+	runtime: sync::Arc<omp_memory::MemoryRuntime>,
 	lines:   LineOffsetCache,
 }
 
 impl MemoryUrlResolver {
-	pub(super) fn new(runtime: std::sync::Arc<omp_memory::MemoryRuntime>) -> Self {
+	pub(super) fn new(runtime: sync::Arc<omp_memory::MemoryRuntime>) -> Self {
 		Self { runtime, lines: LineOffsetCache::default() }
 	}
 
@@ -47,7 +51,7 @@ impl Resolve for MemoryUrlResolver {
 			.projection(resource, MAX_RECORDS, MAX_BYTES)
 			.map_err(memory_fault)?;
 		let bytes = render_projection(projection)?;
-		super::select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
+		select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
 	}
 
 	async fn list(

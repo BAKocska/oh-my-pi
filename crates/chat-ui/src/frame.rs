@@ -1,6 +1,6 @@
 //! Bounded retained-frame validation and exact-key storage.
 
-use std::{collections::BTreeMap, fmt::Write as _};
+use std::{collections::BTreeMap, fmt::Write as _, str};
 
 use omp_core::{IntoStr, Str, sf};
 use omp_proto::omp::ui::v1::{
@@ -252,7 +252,7 @@ pub fn render_frame_tml(frame: &RetainedFrame) -> Str {
 		frame
 			.fallback
 			.as_ref()
-			.and_then(|tml| std::str::from_utf8(&tml.source).ok())
+			.and_then(|tml| str::from_utf8(&tml.source).ok())
 			.map_or_else(|| sf!("<text fg=error>invalid retained-frame fallback</text>"), Str::from)
 	};
 	let Some(key) = frame.key.as_ref() else {

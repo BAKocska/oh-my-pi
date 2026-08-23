@@ -12,7 +12,12 @@
 //! `--shot` runs fully offscreen: first frame -> texture -> quad -> readback
 //! -> PNG, no window required.
 
-use std::sync::Arc;
+use std::{
+	env, error, fs, io,
+	sync::Arc,
+	thread,
+	time::{self, Instant},
+};
 
 use omp_gui::{Gpu, PixelDraw, PixelPainter, PixelSurface, WindowGpu};
 use omp_webview::{
@@ -21,14 +26,16 @@ use omp_webview::{
 };
 use winit::{
 	application::ApplicationHandler,
+	dpi::LogicalSize,
 	event::{ElementState, MouseScrollDelta, WindowEvent},
 	event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+	keyboard,
 	keyboard::NamedKey,
 	window::{Window, WindowId},
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let args: Vec<String> = std::env::args().skip(1).collect();
+fn main() -> Result<(), Box<dyn error::Error>> {
+	let args: Vec<String> = env::args().skip(1).collect();
 	if args.first().is_some_and(|a| a == "--shot") {
 		let url = args
 			.get(1)
@@ -72,12 +79,12 @@ struct App {
 }
 
 impl Pane {
-	fn create(event_loop: &ActiveEventLoop, url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+	fn create(event_loop: &ActiveEventLoop, url: &str) -> Result<Self, Box<dyn error::Error>> {
 		let window = Arc::new(
 			event_loop.create_window(
 				Window::default_attributes()
 					.with_title("omp browser pane")
-					.with_inner_size(winit::dpi::LogicalSize::new(1100.0, 750.0)),
+					.with_inner_size(LogicalSize::new(1100.0, 750.0)),
 			)?,
 		);
 		let gpu = Gpu::new(None)?;
@@ -240,11 +247,20 @@ impl ApplicationHandler for App {
 				let _ = pane.view.input(Input::MouseMove { x: p.x, y: p.y });
 			},
 			WindowEvent::MouseInput { state, button, .. } => {
+				let button = {
+					use winit::event::MouseButton;
+
+					match button {
+						MouseButton::Left => 0,
+						MouseButton::Middle => 1,
+						MouseButton::Right => 2,
+						_ => return,
+					}
+				};
 				let button = match button {
-					winit::event::MouseButton::Left => MouseButton::Left,
-					winit::event::MouseButton::Middle => MouseButton::Middle,
-					winit::event::MouseButton::Right => MouseButton::Right,
-					_ => return,
+					0 => MouseButton::Left,
+					1 => MouseButton::Middle,
+					_ => MouseButton::Right,
 				};
 				let (x, y) = pane.cursor;
 				let _ = pane.view.input(match state {
@@ -274,7 +290,7 @@ impl ApplicationHandler for App {
 			WindowEvent::KeyboardInput { event, .. } => {
 				let down = event.state == ElementState::Pressed;
 				match event.logical_key {
-					winit::keyboard::Key::Named(named) => {
+					keyboard::Key::Named(named) => {
 						if let Some(key) = named_key(named) {
 							let _ = pane.view.input(if down {
 								Input::KeyDown { key, modifiers: pane.mods }
@@ -283,7 +299,7 @@ impl ApplicationHandler for App {
 							});
 						}
 					},
-					winit::keyboard::Key::Character(text) if down => {
+					keyboard::Key::Character(text) if down => {
 						send_text(pane, text.as_str());
 					},
 					_ => {},
@@ -324,17 +340,17 @@ fn pump_wait() {
 			return;
 		}
 	}
-	std::thread::sleep(std::time::Duration::from_millis(20));
+	thread::sleep(time::Duration::from_millis(20));
 }
 
 /// Next webview event within `wait`, pumping the run loop while blocked.
-fn next_event(view: &omp_webview::WebView, wait: std::time::Duration) -> Option<WebViewEvent> {
-	let deadline = std::time::Instant::now() + wait;
+fn next_event(view: &omp_webview::WebView, wait: time::Duration) -> Option<WebViewEvent> {
+	let deadline = Instant::now() + wait;
 	loop {
 		if let Ok(event) = view.events().try_recv() {
 			return Some(event);
 		}
-		if std::time::Instant::now() >= deadline {
+		if Instant::now() >= deadline {
 			return None;
 		}
 		pump_wait();
@@ -342,12 +358,10 @@ fn next_event(view: &omp_webview::WebView, wait: std::time::Duration) -> Option<
 }
 
 /// First delivered frame within 20s; errors on crash or timeout.
-fn first_frame(
-	view: &omp_webview::WebView,
-) -> Result<omp_webview::Frame, Box<dyn std::error::Error>> {
-	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+fn first_frame(view: &omp_webview::WebView) -> Result<omp_webview::Frame, Box<dyn error::Error>> {
+	let deadline = Instant::now() + time::Duration::from_secs(20);
 	loop {
-		let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+		let remaining = deadline.saturating_duration_since(Instant::now());
 		match next_event(view, remaining) {
 			Some(WebViewEvent::Frame(frame)) => return Ok(frame),
 			Some(WebViewEvent::Crashed(err)) => return Err(format!("engine crashed: {err}").into()),
@@ -358,7 +372,7 @@ fn first_frame(
 }
 
 /// Offscreen proof path: first webview frame -> texture -> quad -> readback.
-fn shot(url: &str, out: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn shot(url: &str, out: &str) -> Result<(), Box<dyn error::Error>> {
 	let (width, height) = (800_u32, 600_u32);
 	let view = WebViewBuilder::new(Engine::find(SurfaceKind::Frames)?)
 		.url(url)
@@ -380,8 +394,8 @@ fn shot(url: &str, out: &str) -> Result<(), Box<dyn std::error::Error>> {
 	surface.upload(&gpu, &painter, frame.width, frame.height, &frame.data, None);
 	let pixels = render_to_pixels(&gpu, &painter, &surface, frame.width, frame.height)?;
 
-	let file = std::fs::File::create(out)?;
-	let mut enc = png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
+	let file = fs::File::create(out)?;
+	let mut enc = png::Encoder::new(io::BufWriter::new(file), frame.width, frame.height);
 	enc.set_color(png::ColorType::Rgba);
 	enc.set_depth(png::BitDepth::Eight);
 	enc.write_header()?.write_image_data(&pixels)?;
@@ -392,7 +406,7 @@ fn shot(url: &str, out: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Proves the damage-rect delta path: mutate a page region, region-upload
 /// every delivered frame, and assert the GPU readback is byte-identical to
 /// the engine's final frame.
-fn delta_proof() -> Result<(), Box<dyn std::error::Error>> {
+fn delta_proof() -> Result<(), Box<dyn error::Error>> {
 	const PAGE: &str = r#"<html><body style="margin:0;background:#dddddd">
 		<div id="box" style="position:fixed;left:300px;top:200px;width:60px;height:40px;background:#000"></div>
 		<script>
@@ -421,7 +435,7 @@ fn delta_proof() -> Result<(), Box<dyn std::error::Error>> {
 	// Mutate a small region, then region-upload every delivered frame.
 	view.eval("document.getElementById('box').style.background='#ff0000'")?;
 	let mut last = None;
-	let quiet = std::time::Duration::from_millis(1500);
+	let quiet = time::Duration::from_millis(1500);
 	while let Some(event) = next_event(&view, quiet) {
 		if let WebViewEvent::Frame(frame) = event {
 			assert_ne!(
@@ -453,9 +467,9 @@ fn delta_proof() -> Result<(), Box<dyn std::error::Error>> {
 		clicks: 1,
 	})?;
 	view.input(Input::MouseUp { button: MouseButton::Left, x: 330.0, y: 220.0 })?;
-	let click_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+	let click_deadline = Instant::now() + time::Duration::from_secs(10);
 	loop {
-		let remaining = click_deadline.saturating_duration_since(std::time::Instant::now());
+		let remaining = click_deadline.saturating_duration_since(Instant::now());
 		match next_event(&view, remaining) {
 			Some(WebViewEvent::Ipc(msg)) if msg == "clicked" => break,
 			Some(_) => {},
@@ -473,7 +487,7 @@ fn render_to_pixels(
 	surface: &PixelSurface,
 	width: u32,
 	height: u32,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, Box<dyn error::Error>> {
 	let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
 		label:           Some("readback-target"),
 		size:            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },

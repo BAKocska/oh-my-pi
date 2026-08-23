@@ -1,4 +1,5 @@
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+//! Proves normal server construction installs live production CONTROL owners.
+use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
 
 use omp_core::{Principal, sf};
 use omp_envd::{
@@ -7,6 +8,7 @@ use omp_envd::{
 	worker::ExtHostConfig,
 };
 use omp_tool::Registry;
+use url::Url;
 
 fn identity(principal: Principal) -> Arc<ControlConnectionIdentity> {
 	Arc::new(ControlConnectionIdentity {
@@ -37,7 +39,7 @@ async fn normal_server_construction_installs_live_control_owners() {
 		sf!("fixture-session"),
 		11,
 	);
-	std::fs::write(project.path().join("control.txt"), b"live-control").expect("control fixture");
+	fs::write(project.path().join("control.txt"), b"live-control").expect("control fixture");
 	let server = EnvServer::open_local(
 		project.path(),
 		state.path(),
@@ -63,7 +65,7 @@ async fn normal_server_construction_installs_live_control_owners() {
 		.expect("state owner response");
 	assert_eq!(state_dir, serde_json::Value::String(state.path().to_string_lossy().into_owned()));
 
-	let url = url::Url::from_file_path(project.path().join("control.txt"))
+	let url = Url::from_file_path(project.path().join("control.txt"))
 		.expect("fixture file URL")
 		.to_string();
 	let mut url_arguments = serde_json::Map::new();

@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Bytes, BytesMut};
+use flume::Receiver;
 use omp_core::{Str, sf};
 use omp_proto::toolhost::v1::HookEventId;
 use parking_lot::Mutex;
@@ -407,7 +408,7 @@ pub struct HookGate {
 
 impl HookGate {
 	/// Creates a gate and the bounded lossy observer-dispatch receiver.
-	pub fn channel() -> (Self, flume::Receiver<HookDispatch>) {
+	pub fn channel() -> (Self, Receiver<HookDispatch>) {
 		let (dispatch, receive) = flume::bounded(OBSERVE_HANDLER_CAP);
 		(
 			Self {
@@ -550,7 +551,7 @@ impl HookGate {
 		&'gate self,
 		event: &'gate E,
 	) -> DomainOutcome<E::Return> {
-		let mut result = E::Return::fail_open();
+		let mut result = DomainReturn::fail_open();
 		let mut contributions: SmallVec<(SourceRef, E::Return), 2> = SmallVec::new();
 		if !self.subscribed(E::ID) {
 			return DomainOutcome { winner: result, contributions };
@@ -588,7 +589,7 @@ impl HookGate {
 						continue;
 					}
 					if let GateDecision::Domain(bytes) = decision
-						&& let Some(next) = E::Return::decode_domain(&bytes)
+						&& let Some(next) = <E::Return as DomainReturn>::decode_domain(&bytes)
 					{
 						result = result.merge_domain(next.clone());
 						contributions.push((subscription.source.clone(), next));
@@ -691,8 +692,8 @@ mod tests {
 	use omp_proto::toolhost::v1::HookEventId;
 
 	use super::{
-		DomainReturn, GateDecision, GateEvent, HookGate, HookPatch, HookPhase, OnFailure,
-		ProviderFailover, SourceRef, Subscription, When,
+		AgentSettled, DomainReturn, GateDecision, GateError, GateEvent, GateOutcome, HookEvent,
+		HookGate, HookPatch, HookPhase, OnFailure, ProviderFailover, SourceRef, Subscription, When,
 	};
 
 	#[test]
@@ -753,7 +754,7 @@ mod tests {
 			}
 		};
 		let (outcome, ()) = tokio::join!(gate_future, driver);
-		let super::GateOutcome::Allow { event, trail } = outcome else {
+		let GateOutcome::Allow { event, trail } = outcome else {
 			panic!("expected allow");
 		};
 		assert_eq!(event.effective_args, Bytes::from_static(b"{\"n\":2}"));
@@ -777,7 +778,7 @@ mod tests {
 				.unwrap();
 		};
 		let (outcome, ()) = tokio::join!(work, driver);
-		assert!(matches!(outcome, super::GateOutcome::Deny { .. }));
+		assert!(matches!(outcome, GateOutcome::Deny { .. }));
 		assert!(rx.try_recv().is_err());
 	}
 	#[tokio::test]
@@ -796,15 +797,15 @@ mod tests {
 	}
 	#[derive(Clone)]
 	struct SettledEvent;
-	impl super::HookEvent for SettledEvent {
-		type Return = super::AgentSettled;
+	impl HookEvent for SettledEvent {
+		type Return = AgentSettled;
 
 		const ID: HookEventId = HookEventId::HookEventAgentSettled;
 		const REV: u32 = 1;
 
 		fn encode_into(&self, _: &mut bytes::BytesMut) {}
 
-		fn apply(&mut self, _: &super::HookPatch) -> Result<(), super::GateError> {
+		fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
 			Ok(())
 		}
 	}

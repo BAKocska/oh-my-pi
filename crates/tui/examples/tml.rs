@@ -8,7 +8,7 @@
 //! parse error shows as an error card until the next good save. Quit with
 //! `q`, Escape, or Ctrl-C.
 
-use std::{io, path::Path, time::Duration};
+use std::{env, fs, io, path::Path, time, time::Duration};
 
 use omp_tui::{AppOptions, Key, Ui, UiContext, dom};
 
@@ -32,10 +32,8 @@ fn build(source: &str, width: u16, ctx: &UiContext) -> Ui {
 	}
 }
 
-fn modified(path: &Path) -> Option<std::time::SystemTime> {
-	std::fs::metadata(path)
-		.and_then(|meta| meta.modified())
-		.ok()
+fn modified(path: &Path) -> Option<time::SystemTime> {
+	fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 fn main() -> io::Result<()> {
@@ -44,10 +42,8 @@ fn main() -> io::Result<()> {
 }
 
 async fn run(executor: omp_executor::Executor) -> io::Result<()> {
-	let path = std::env::args()
-		.nth(1)
-		.unwrap_or_else(|| "example.tml".into());
-	let source = std::fs::read_to_string(&path)?;
+	let path = env::args().nth(1).unwrap_or_else(|| "example.tml".into());
+	let source = fs::read_to_string(&path)?;
 
 	let mut ctx = None;
 	let mut app = AppOptions::new()
@@ -72,7 +68,7 @@ async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 					continue;
 				}
 				seen = stamp;
-				let Ok(source) = std::fs::read_to_string(&path) else {
+				let Ok(source) = fs::read_to_string(&path) else {
 					continue;
 				};
 				let ctx = ctx.clone();

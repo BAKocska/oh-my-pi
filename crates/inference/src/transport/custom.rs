@@ -2,6 +2,7 @@
 
 use omp_catalog::CodecId;
 use omp_core::Str;
+use url::Url;
 
 /// Explicit custom endpoint mode. No pi-native transport exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,7 +23,7 @@ pub struct CustomEndpoint {
 impl CustomEndpoint {
 	/// Validates an explicit HTTP(S) custom endpoint.
 	pub fn new(base_url: &str, mode: CustomEndpointMode) -> Result<Self, CustomEndpointError> {
-		let parsed = url::Url::parse(base_url).map_err(|_| CustomEndpointError::InvalidUrl)?;
+		let parsed = Url::parse(base_url).map_err(|_| CustomEndpointError::InvalidUrl)?;
 		if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
 			return Err(CustomEndpointError::InvalidUrl);
 		}

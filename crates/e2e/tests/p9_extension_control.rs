@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use extension::{ExtensionHarness, recording_ui_factory};
+use flume::Receiver;
 use omp_agent::HookPhase;
+use omp_app::chat_ui::presentation_authority::PresentationEffect;
 use omp_core::{ArtifactDigest, Principal, Provenance, sf};
 use omp_e2e::{
 	Context as _, Result, error,
@@ -31,6 +33,7 @@ use omp_proto::{
 };
 use omp_tool::CallOutcome;
 use serde_json::{Value, json};
+use tokio::time;
 
 const MODULE: &str = "p9_extension_control";
 const SESSION: &str = "p9-extension-control-session";
@@ -153,12 +156,7 @@ async def extension_block(params, ctx):
     await asyncio.Event().wait()
 "#;
 
-fn extension_config(
-	scratch: &Scratch,
-) -> Result<(
-	ExtHostConfig,
-	flume::Receiver<omp_app::chat_ui::presentation_authority::PresentationEffect>,
-)> {
+fn extension_config(scratch: &Scratch) -> Result<(ExtHostConfig, Receiver<PresentationEffect>)> {
 	install_omp_binary_env().context("exposing worker-capable e2e host")?;
 	let mut config = ExtHostConfig::new(
 		omp_binary().context("resolving worker-capable e2e host")?,
@@ -349,7 +347,7 @@ async fn p9_python_extension_exercises_joined_control_and_data_authorities() -> 
 			if started.exists() {
 				break;
 			}
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			time::sleep(Duration::from_millis(10)).await;
 		}
 	})
 	.await?;

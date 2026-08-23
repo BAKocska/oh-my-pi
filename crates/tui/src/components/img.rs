@@ -1,10 +1,14 @@
+use std::{io, str};
+
 use omp_core::IntoStr;
 
 use crate::{
+	Frame, Icon,
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::{Graphics, UiContext},
 	frame::{Color, Rect, Style},
 	imagefmt::{self, ImageDimensions},
+	imagereg,
 	kitty::PLACEHOLDER_LIMIT,
 	markup::{Border, Dim},
 	props::{Prop, PropValue, Props},
@@ -165,7 +169,7 @@ impl Img {
 			self.state.rows = 3;
 		} else {
 			if ctx.graphics == Graphics::KittyPlaceholders {
-				let _ = crate::imagereg::prepare_png(source);
+				let _ = imagereg::prepare_png(source);
 			}
 			self.state = decode_source(source, width, self.props.h(), trim);
 		}
@@ -185,7 +189,7 @@ impl Img {
 /// omitted, bounded by Kitty's diacritic table.
 fn resolve_placeholder_box(props: &Props) -> Option<(u32, u16, u16)> {
 	let source = props.str_of(Prop::Src)?;
-	let interned = crate::imagereg::intern(source.as_str())?;
+	let interned = imagereg::intern(source.as_str())?;
 	let cols = match props.w() {
 		Some(Dim::Cells(cells)) => cells,
 		Some(Dim::Pct(_)) => return None,
@@ -301,7 +305,7 @@ impl Component for Img {
 				} else if row + 1 == rows {
 					pc.frame.put(rect.x, y, &self.bottom, style);
 				} else {
-					let rail = pc.ctx.charset.icon(crate::Icon::PlaceholderRail);
+					let rail = pc.ctx.charset.icon(Icon::PlaceholderRail);
 					pc.frame.put(rect.x, y, rail, style);
 					if row == rows / 2 && width > 4 {
 						let mut x = pc.frame.put(rect.x + 2, y, "[img: ", style);
@@ -333,19 +337,19 @@ impl Component for Img {
 
 /// Half-block glyph and colors for one sampled cell. Transparent halves
 /// stay unpainted so the terminal or container background shows through.
-const fn half_block_cell(upper: Option<Rgb>, lower: Option<Rgb>) -> Option<(crate::Icon, Style)> {
+const fn half_block_cell(upper: Option<Rgb>, lower: Option<Rgb>) -> Option<(Icon, Style)> {
 	match (upper, lower) {
 		(Some(upper), Some(lower)) => Some((
-			crate::Icon::UpperHalf,
+			Icon::UpperHalf,
 			Style::new()
 				.fg(Color::Rgb(upper[0], upper[1], upper[2]))
 				.bg(Color::Rgb(lower[0], lower[1], lower[2])),
 		)),
 		(Some(upper), None) => {
-			Some((crate::Icon::UpperHalf, Style::new().fg(Color::Rgb(upper[0], upper[1], upper[2]))))
+			Some((Icon::UpperHalf, Style::new().fg(Color::Rgb(upper[0], upper[1], upper[2]))))
 		},
 		(None, Some(lower)) => {
-			Some((crate::Icon::LowerHalf, Style::new().fg(Color::Rgb(lower[0], lower[1], lower[2]))))
+			Some((Icon::LowerHalf, Style::new().fg(Color::Rgb(lower[0], lower[1], lower[2]))))
 		},
 		(None, None) => None,
 	}
@@ -376,7 +380,7 @@ pub fn image_cell_box(px: ImageDimensions, max_width: u16, max_rows: u16) -> (u1
 /// Returns the number of rows drawn; `0` when the source cannot be decoded,
 /// so callers keep their text fallback. Cells beyond the frame clip safely.
 pub fn draw_image_inline(
-	frame: &mut crate::Frame,
+	frame: &mut Frame,
 	ctx: &UiContext,
 	x: u16,
 	y: u16,
@@ -388,7 +392,7 @@ pub fn draw_image_inline(
 		return 0;
 	}
 	if ctx.graphics == Graphics::KittyPlaceholders {
-		let Some(interned) = crate::imagereg::intern(source) else {
+		let Some(interned) = imagereg::intern(source) else {
 			return 0;
 		};
 		let (cols, rows) = image_cell_box(
@@ -494,7 +498,7 @@ fn trim_transparent(pixels: Vec<Vec<[u8; 4]>>) -> Vec<Vec<[u8; 4]>> {
 }
 
 fn decode_image(source: &str) -> Option<DecodedImage> {
-	let bytes = crate::imagereg::source_bytes(source)?;
+	let bytes = imagereg::source_bytes(source)?;
 	if bytes.starts_with(b"P6") {
 		return decode_ppm(&bytes).map(DecodedImage::Pixels);
 	}
@@ -508,7 +512,7 @@ fn decode_image(source: &str) -> Option<DecodedImage> {
 }
 
 fn decode_png(bytes: &[u8]) -> Option<Vec<Vec<[u8; 4]>>> {
-	let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+	let mut decoder = png::Decoder::new(io::Cursor::new(bytes));
 	// Official logos frequently ship indexed palettes (with tRNS alpha) or
 	// 16-bit channels; normalize so `samples()` below always describes
 	// plain 8-bit gray/RGB(A) output instead of palette indices.
@@ -553,7 +557,7 @@ fn decode_ppm(bytes: &[u8]) -> Option<Vec<Vec<[u8; 4]>>> {
 			at += 1;
 		}
 		fields.push(
-			std::str::from_utf8(&bytes[start..at])
+			str::from_utf8(&bytes[start..at])
 				.ok()?
 				.parse::<usize>()
 				.ok()?,
@@ -665,10 +669,15 @@ fn average_pixels(
 
 #[cfg(test)]
 mod tests {
+
+	use std::{env, fs};
+
 	use super::*;
 	use crate::{
+		assets::provider_logo,
 		component::PaintCtx,
 		frame::{CellContent, Frame, Size},
+		imagereg::{bytes as registry_bytes, intern},
 		test_support::frame_row_text,
 	};
 
@@ -758,14 +767,14 @@ mod tests {
 			}
 			writer.write_image_data(&data).unwrap();
 		}
-		let path = std::env::temp_dir().join(format!("omp-tui-img-alpha-{}.png", std::process::id()));
-		std::fs::write(&path, bytes).unwrap();
+		let path = env::temp_dir().join(format!("omp-tui-img-alpha-{}.png", std::process::id()));
+		fs::write(&path, bytes).unwrap();
 		let mut image = Img::new()
 			.with(Prop::Src, path.to_string_lossy().as_ref())
 			.with(Prop::W, 2_u16);
 		let ctx = UiContext::default();
 		assert_eq!(image.height(&ctx, 2), 1);
-		std::fs::remove_file(path).unwrap();
+		fs::remove_file(path).unwrap();
 
 		let mut frame = Frame::new(Size::new(3, 1));
 		image.paint(
@@ -782,15 +791,15 @@ mod tests {
 
 	#[test]
 	fn jpeg_header_reserves_aspect_correct_placeholder() {
-		let path = std::env::temp_dir().join(format!("omp-tui-img-jpeg-{}.jpg", std::process::id()));
+		let path = env::temp_dir().join(format!("omp-tui-img-jpeg-{}.jpg", std::process::id()));
 		let jpeg = [0xff, 0xd8, 0xff, 0xc0, 0x00, 0x08, 8, 0x00, 80, 0x00, 160, 1];
-		std::fs::write(&path, jpeg).unwrap();
+		fs::write(&path, jpeg).unwrap();
 		let mut image = Img::new()
 			.with(Prop::Src, path.to_string_lossy().as_ref())
 			.with(Prop::W, 20_u16);
 		let ctx = UiContext::default();
 		assert_eq!(image.height(&ctx, 20), 5);
-		std::fs::remove_file(path).unwrap();
+		fs::remove_file(path).unwrap();
 
 		let mut frame = Frame::new(Size::new(20, 5));
 		image.paint(
@@ -839,8 +848,8 @@ mod tests {
 			panic!("src image paints typed placeholder cells: {:?}", frame.cell(1, 0).content);
 		};
 		assert!(id > 0x00f0_0000, "registry IDs allocate from the top of the 24-bit range");
-		let embedded = crate::assets::provider_logo("anthropic").expect("packaged test logo");
-		let registered = crate::imagereg::bytes(id).expect("interned image bytes");
+		let embedded = provider_logo("anthropic").expect("packaged test logo");
+		let registered = registry_bytes(id).expect("interned image bytes");
 		assert_eq!(
 			registered.as_ptr(),
 			embedded.as_ptr(),
@@ -881,14 +890,13 @@ mod tests {
 
 	#[test]
 	fn jpeg_attachment_converts_once_to_cached_png_for_kitty() {
-		let path =
-			std::env::temp_dir().join(format!("omp-tui-img-kitty-jpeg-{}.jpg", std::process::id()));
+		let path = env::temp_dir().join(format!("omp-tui-img-kitty-jpeg-{}.jpg", std::process::id()));
 		let pixels = image::RgbImage::from_pixel(2, 2, image::Rgb([20, 40, 60]));
-		let mut jpeg = std::io::Cursor::new(Vec::new());
+		let mut jpeg = io::Cursor::new(Vec::new());
 		image::DynamicImage::ImageRgb8(pixels)
 			.write_to(&mut jpeg, image::ImageFormat::Jpeg)
 			.unwrap();
-		std::fs::write(&path, jpeg.into_inner()).unwrap();
+		fs::write(&path, jpeg.into_inner()).unwrap();
 		let source = path.to_string_lossy().into_owned();
 		let ctx = UiContext { graphics: Graphics::KittyPlaceholders, ..UiContext::default() };
 
@@ -905,13 +913,13 @@ mod tests {
 		let CellContent::Image { id, .. } = frame.cell(0, 0).content else {
 			panic!("converted JPEG paints Kitty image cells");
 		};
-		let cached = crate::imagereg::bytes(id).expect("converted image is registry-cached");
+		let cached = registry_bytes(id).expect("converted image is registry-cached");
 		assert!(cached.starts_with(b"\x89PNG\r\n\x1a\n"), "Kitty f=100 receives PNG bytes");
 
-		let sibling = crate::imagereg::intern(&source).expect("same source reuses cached PNG");
+		let sibling = intern(&source).expect("same source reuses cached PNG");
 		assert_eq!(sibling.id, id);
 		assert_eq!(sibling.png.as_ptr(), cached.as_ptr(), "cache avoids a second conversion");
-		std::fs::remove_file(path).unwrap();
+		fs::remove_file(path).unwrap();
 	}
 
 	#[test]
@@ -941,9 +949,8 @@ mod tests {
 			}
 			writer.write_image_data(&data).unwrap();
 		}
-		let path =
-			std::env::temp_dir().join(format!("omp-tui-img-inline-{}.png", std::process::id()));
-		std::fs::write(&path, bytes).unwrap();
+		let path = env::temp_dir().join(format!("omp-tui-img-inline-{}.png", std::process::id()));
+		fs::write(&path, bytes).unwrap();
 		let source = path.to_string_lossy().into_owned();
 
 		// Every non-placeholder tier samples to colored half blocks.
@@ -966,7 +973,7 @@ mod tests {
 			cols: 4,
 			..
 		}));
-		std::fs::remove_file(path).unwrap();
+		fs::remove_file(path).unwrap();
 
 		// Undecodable sources report zero rows so callers keep their text
 		// fallback.

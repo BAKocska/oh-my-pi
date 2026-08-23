@@ -1,9 +1,11 @@
 //! Resource-owned extension-host cancellation escalation.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, io, time::Duration};
 
+#[cfg(unix)]
+use nix::{sys::signal, unistd::Pid};
 use thiserror::Error;
-use tokio::process::Child;
+use tokio::{process::Child, time};
 
 use crate::worker::HostKey;
 
@@ -55,7 +57,7 @@ pub enum CancellationError {
 	MissingPid,
 	/// The operating system refused the group kill.
 	#[error("process-group kill failed: {0}")]
-	Kill(#[from] std::io::Error),
+	Kill(#[from] io::Error),
 }
 
 /// Session-local cancellation state for one extension.
@@ -77,7 +79,7 @@ impl CancellationLadder {
 
 	/// Waits the fixed courtesy grace before escalating cancellation.
 	pub async fn grace_timer() {
-		tokio::time::sleep(CANCEL_GRACE).await;
+		time::sleep(CANCEL_GRACE).await;
 	}
 
 	/// Kills the child process group after the second grace, journals the event,
@@ -91,11 +93,8 @@ impl CancellationLadder {
 		let pid = child.id().ok_or(CancellationError::MissingPid)?;
 		#[cfg(unix)]
 		{
-			nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(pid.cast_signed()),
-				nix::sys::signal::Signal::SIGKILL,
-			)
-			.map_err(|error| CancellationError::Kill(std::io::Error::other(error)))?;
+			signal::killpg(Pid::from_raw(pid.cast_signed()), signal::Signal::SIGKILL)
+				.map_err(|error| CancellationError::Kill(io::Error::other(error)))?;
 		}
 		#[cfg(windows)]
 		child.start_kill()?;

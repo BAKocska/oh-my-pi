@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 
 use omp_slopjson::{
-	JsonPrefixState, ParseError, Value, classify_json_prefix, from_str, json, parse,
+	JsonPrefixState, ParseError, RawValue, Value, classify_json_prefix, from_str, json, parse,
 	parse_streaming, repair_json,
 };
 
@@ -412,7 +412,7 @@ fn raw_value_borrows_verbatim_span_including_slop() {
 	struct Envelope<'a> {
 		kind:    &'a str,
 		#[serde(borrow)]
-		payload: &'a omp_slopjson::RawValue,
+		payload: &'a RawValue,
 	}
 
 	// Slop payload survives verbatim and re-parses to the normalized tree.
@@ -431,7 +431,7 @@ fn raw_value_bareword_span_is_verbatim_but_not_standalone() {
 	#[derive(serde::Deserialize)]
 	struct Args<'a> {
 		#[serde(borrow)]
-		paths: &'a omp_slopjson::RawValue,
+		paths: &'a RawValue,
 	}
 
 	// Barewords are grammatical only in value position: the span is captured
@@ -450,11 +450,11 @@ fn raw_value_captures_every_value_kind_exactly() {
 		("[1, [2], {\"a\": 3}]", "[1, [2], {\"a\": 3}]"),
 		("[1,]", "[1,]"),
 	] {
-		let raw: &omp_slopjson::RawValue = from_str(input).unwrap();
+		let raw: &RawValue = from_str(input).unwrap();
 		assert_eq!(raw.get(), expected, "input: {input}");
 	}
 	// Owned capture copies the same span.
-	let boxed: Box<omp_slopjson::RawValue> = from_str("[1, 2]").unwrap();
+	let boxed: Box<RawValue> = from_str("[1, 2]").unwrap();
 	assert_eq!(boxed.get(), "[1, 2]");
 	assert_eq!(boxed.get(), "[1, 2]");
 }

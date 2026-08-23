@@ -1,8 +1,10 @@
 //! Structures for managing function registrations and calls.
 
-use std::sync::Arc;
+use std::{iter, sync::Arc};
 
 use im::HashMap;
+
+use crate::{SourceInfo, parser::ast::FunctionDefinition};
 
 /// An environment for defined, named functions.
 #[derive(Clone, Default)]
@@ -57,7 +59,7 @@ impl FunctionEnv {
 	/// Returns an iterator over the functions registered in this environment.
 	pub fn iter(
 		&self,
-	) -> impl Iterator<Item = (&String, &Registration)> + ExactSizeIterator + std::iter::FusedIterator + '_
+	) -> impl Iterator<Item = (&String, &Registration)> + ExactSizeIterator + iter::FusedIterator + '_
 	{
 		self.functions.iter()
 	}
@@ -67,18 +69,18 @@ impl FunctionEnv {
 #[derive(Clone, Debug)]
 pub struct Registration {
 	/// The parsed definition of the function.
-	definition:  Arc<crate::parser::ast::FunctionDefinition>,
+	definition:  Arc<FunctionDefinition>,
 	/// The source info for the function definition.
-	source_info: crate::SourceInfo,
+	source_info: SourceInfo,
 	/// Whether or not this function definition should be exported to children.
 	exported:    bool,
 }
 
-impl From<crate::parser::ast::FunctionDefinition> for Registration {
-	fn from(definition: crate::parser::ast::FunctionDefinition) -> Self {
+impl From<FunctionDefinition> for Registration {
+	fn from(definition: FunctionDefinition) -> Self {
 		Self {
 			definition:  Arc::new(definition),
-			source_info: crate::SourceInfo::default(),
+			source_info: SourceInfo::default(),
 			exported:    false,
 		}
 	}
@@ -91,10 +93,7 @@ impl Registration {
 	///
 	/// * `definition` - The function definition.
 	/// * `source_info` - Source information for the function definition.
-	pub fn new(
-		definition: crate::parser::ast::FunctionDefinition,
-		source_info: &crate::SourceInfo,
-	) -> Self {
+	pub fn new(definition: FunctionDefinition, source_info: &SourceInfo) -> Self {
 		Self {
 			definition:  Arc::new(definition),
 			source_info: source_info.clone(),
@@ -103,12 +102,12 @@ impl Registration {
 	}
 
 	/// Returns a reference to the function definition.
-	pub fn definition(&self) -> &crate::parser::ast::FunctionDefinition {
+	pub fn definition(&self) -> &FunctionDefinition {
 		&self.definition
 	}
 
 	/// Returns a reference to the source info for the function definition.
-	pub const fn source(&self) -> &crate::SourceInfo {
+	pub const fn source(&self) -> &SourceInfo {
 		&self.source_info
 	}
 

@@ -1,6 +1,6 @@
 //! Verified local tiny-model catalog and atomic installer.
 
-use std::{cell::Cell, collections::BTreeMap, path::PathBuf};
+use std::{cell::Cell, collections::BTreeMap, fs};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_inference::local::{
@@ -10,7 +10,10 @@ use omp_inference::local::{
 };
 use serde_json::json;
 
-use crate::cli::{TinyModelsArgs, TinyModelsCommand};
+use crate::{
+	cli::{TinyModelsArgs, TinyModelsCommand},
+	progress_reporter::ProgressReporter,
+};
 
 /// Lists, verifies, or installs title and Mnemopi-only embedding assets.
 pub async fn run(args: TinyModelsArgs) -> miette::Result<()> {
@@ -19,7 +22,7 @@ pub async fn run(args: TinyModelsArgs) -> miette::Result<()> {
 			.into_diagnostic()?
 			.join("models"),
 	);
-	std::fs::create_dir_all(&root).into_diagnostic()?;
+	fs::create_dir_all(&root).into_diagnostic()?;
 	let store = ArtifactStore::open(&root).into_diagnostic()?;
 	let models = unique_models();
 	match args
@@ -109,7 +112,7 @@ async fn download(
 	for model in selected {
 		let manifest = model.manifest().into_diagnostic()?;
 		let total = manifest.total_bytes().into_diagnostic()?;
-		let progress = crate::progress_reporter::ProgressReporter::bounded(
+		let progress = ProgressReporter::bounded(
 			total,
 			format!("downloading {}", model.id),
 			quiet || json_output,

@@ -1,6 +1,6 @@
 //! Anonymous GitHub Gist API renderer.
 
-use std::fmt::Write;
+use std::{cmp, fmt::Write};
 
 use omp_core::sf;
 use serde::{Deserialize, Deserializer, de};
@@ -76,8 +76,8 @@ impl<'de> Deserialize<'de> for GistFiles {
 			.collect::<Result<Vec<_>, _>>()?;
 		files.sort_by(|left, right| match (left.1, right.1) {
 			(Some(left), Some(right)) => left.cmp(&right),
-			(Some(_), None) => std::cmp::Ordering::Less,
-			(None, Some(_)) => std::cmp::Ordering::Greater,
+			(Some(_), None) => cmp::Ordering::Less,
+			(None, Some(_)) => cmp::Ordering::Greater,
 			(None, None) => left.0.cmp(&right.0),
 		});
 		Ok(Self(files.into_iter().map(|(_, _, file)| file).collect()))

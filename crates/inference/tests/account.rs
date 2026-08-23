@@ -26,6 +26,7 @@ use omp_inference::{
 	},
 };
 use parking_lot::Mutex;
+use tokio::time;
 
 fn at(seconds: u64) -> SystemTime {
 	UNIX_EPOCH + Duration::from_secs(seconds)
@@ -569,7 +570,7 @@ fn forbidden_rotation_retains_partial_candidate_evidence() {
 	pool.upsert(record("a", "principal-a", &route)).unwrap();
 	pool.upsert(record("b", "principal-b", &route)).unwrap();
 	pool
-		.cooldown(AccountId::new("a"), at(200), omp_inference::account::CooldownReason::Health)
+		.cooldown(AccountId::new("a"), at(200), CooldownReason::Health)
 		.unwrap();
 	let mut request = selection_request(&route, at(100));
 	request.previous_account = Some(AccountId::new("a"));
@@ -740,7 +741,7 @@ async fn concurrent_expiry_performs_one_refresh_and_waiters_share_exact_result()
 		refresh_request("single-flight", "principal"),
 		move |_| async move {
 			first_calls.fetch_add(1, Ordering::SeqCst);
-			tokio::time::sleep(Duration::from_millis(20)).await;
+			time::sleep(Duration::from_millis(20)).await;
 			Ok(refreshed("single-flight", "principal", 5))
 		},
 	);
@@ -773,7 +774,7 @@ async fn long_refresh_renews_the_persistent_lease() {
 	let outcome = RefreshCoordinator::new("process", policy)
 		.unwrap()
 		.refresh(Arc::clone(&store), refresh_request("renewal", "principal"), |_| async {
-			tokio::time::sleep(Duration::from_millis(12)).await;
+			time::sleep(Duration::from_millis(12)).await;
 			Ok(refreshed("renewal", "principal", 5))
 		})
 		.await

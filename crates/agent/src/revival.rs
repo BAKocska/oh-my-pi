@@ -1,6 +1,9 @@
 //! Cross-process reconstruction of durable session intent.
 
-use std::path::{Path, PathBuf};
+use std::{
+	iter,
+	path::{Path, PathBuf},
+};
 
 use omp_core::Str;
 use omp_proto::thread::v1::Item;
@@ -8,7 +11,7 @@ use omp_scribe::{Value, map};
 use omp_storage::transcript::{self, Kind, ModelChange};
 use thiserror::Error;
 
-use crate::{AgentSnapshot, Journal, JournalError};
+use crate::{AgentSnapshot, Journal, JournalError, prompt_keys};
 
 /// Cold-revival failure.
 #[derive(Debug, Error)]
@@ -76,25 +79,22 @@ pub fn revive_existing(
 	}
 	let roots = journal.workspace_roots(&log.header().cwd)?;
 	let primary_uri = roots.primary().to_string_lossy().into_owned();
-	snapshot
-		.props
-		.set(crate::prompt_keys::CWD, primary_uri.clone());
+	snapshot.props.set(prompt_keys::CWD, primary_uri.clone());
 	let primary = map! { "canonical_uri" => primary_uri };
 	let additional = roots
 		.secondary()
 		.iter()
 		.map(|root| map! { "canonical_uri" => root.as_os_str().to_string_lossy().into_owned() })
 		.collect::<Vec<_>>();
-	let all = std::iter::once(primary.clone())
+	let all = iter::once(primary.clone())
 		.chain(additional.iter().cloned())
 		.collect::<Vec<Value>>();
-	snapshot.props.set(
-		crate::prompt_keys::ROOTS,
-		map! { "revision" => 0_i64, "primary" => primary, "roots" => all },
-	);
 	snapshot
 		.props
-		.set(crate::prompt_keys::ADDITIONAL_ROOTS, additional);
+		.set(prompt_keys::ROOTS, map! { "revision" => 0_i64, "primary" => primary, "roots" => all });
+	snapshot
+		.props
+		.set(prompt_keys::ADDITIONAL_ROOTS, additional);
 	if let Some(start) = journal.latest_turn_start() {
 		let mounted = &snapshot.registry;
 		snapshot.enabled_tools = start

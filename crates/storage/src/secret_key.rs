@@ -1,6 +1,8 @@
 use std::{
+	env,
 	fs::{self, OpenOptions},
 	io::{self, Write as _},
+	mem,
 	path::{Path, PathBuf},
 	thread,
 	time::Duration,
@@ -17,10 +19,10 @@ const WINNER_READ_DELAY: Duration = Duration::from_millis(10);
 
 /// Resolves pi's native state path for the persistent placeholder key.
 pub fn native_path() -> Result<PathBuf, SecretKeyError> {
-	if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+	if let Some(state) = env::var_os("XDG_STATE_HOME") {
 		return Ok(PathBuf::from(state).join("omp").join(PLACEHOLDER_KEY_FILE));
 	}
-	let home = std::env::var_os("HOME").ok_or(SecretKeyError::MissingHome)?;
+	let home = env::var_os("HOME").ok_or(SecretKeyError::MissingHome)?;
 	Ok(PathBuf::from(home)
 		.join(".omp/agent")
 		.join(PLACEHOLDER_KEY_FILE))
@@ -74,7 +76,7 @@ pub fn load_or_create_at(path: &Path) -> Result<String, SecretKeyError> {
 				path: path.to_path_buf(),
 				source,
 			})?;
-			Ok(std::mem::take(&mut *encoded))
+			Ok(mem::take(&mut *encoded))
 		},
 		Err(source) if source.kind() == io::ErrorKind::AlreadyExists => read_winner(path),
 		Err(source) => Err(SecretKeyError::Io {
@@ -124,7 +126,7 @@ fn read_once(path: &Path, reject_invalid: bool) -> Result<Option<String>, Secret
 		},
 	};
 	validate_permissions(path)?;
-	let value = std::str::from_utf8(&bytes).ok().map(str::trim);
+	let value = str::from_utf8(&bytes).ok().map(str::trim);
 	if let Some(value) = value.filter(|value| valid_key(value)) {
 		return Ok(Some(value.to_owned()));
 	}
@@ -234,7 +236,7 @@ mod tests {
 			.map(|_| {
 				let path = Arc::clone(&path);
 				let barrier = Arc::clone(&barrier);
-				std::thread::spawn(move || {
+				thread::spawn(move || {
 					barrier.wait();
 					load_or_create_at(&path).expect("creator")
 				})

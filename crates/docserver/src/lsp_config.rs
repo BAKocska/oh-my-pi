@@ -3,6 +3,7 @@
 
 use std::{
 	collections::BTreeMap,
+	fs, io,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
@@ -12,6 +13,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+
+use crate::lsp_process::{LspProcessConfig, LspProcessSelectorConfig, LspTransportSettings};
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_VALUE_DEPTH: usize = 64;
@@ -67,13 +70,13 @@ pub struct LspConfigSource {
 impl LspConfigSource {
 	/// Reads a bounded native JSON/YAML source.
 	pub fn read(kind: LspConfigSourceKind, path: &Path) -> Result<Self, LspConfigError> {
-		let metadata = std::fs::metadata(path)
+		let metadata = fs::metadata(path)
 			.map_err(|source| LspConfigError::Read { path: path.to_owned(), source })?;
 		if metadata.len() > MAX_CONFIG_BYTES {
 			return Err(LspConfigError::TooLarge { path: path.to_owned(), limit: MAX_CONFIG_BYTES });
 		}
-		let bytes = std::fs::read(path)
-			.map_err(|source| LspConfigError::Read { path: path.to_owned(), source })?;
+		let bytes =
+			fs::read(path).map_err(|source| LspConfigError::Read { path: path.to_owned(), source })?;
 		let yaml = matches!(path.extension().and_then(|value| value.to_str()), Some("yaml" | "yml"));
 		Ok(Self {
 			provenance: LspConfigProvenance { kind, source: Str::new(path.to_string_lossy()) },
@@ -182,7 +185,7 @@ pub struct ResolvedLspConfig {
 
 impl ResolvedLspServer {
 	/// Lowers a resolved declaration into the process-owned startup shape.
-	pub fn to_process_config(&self) -> crate::lsp_process::LspProcessConfig {
+	pub fn to_process_config(&self) -> LspProcessConfig {
 		let path_patterns = self
 			.file_types
 			.value
@@ -199,12 +202,12 @@ impl ResolvedLspServer {
 			})
 			.collect();
 		let languages = self.language_id.value.iter().cloned().collect();
-		let mut transport = crate::lsp_process::LspTransportSettings::default();
+		let mut transport = LspTransportSettings::default();
 		transport.initialize_timeout_ms = self.warmup_timeout_ms.value.clamp(1, 120_000);
-		crate::lsp_process::LspProcessConfig {
+		LspProcessConfig {
 			name: self.name.clone(),
 			priority: self.priority.value,
-			selector: crate::lsp_process::LspProcessSelectorConfig {
+			selector: LspProcessSelectorConfig {
 				languages,
 				schemes: vec![Str::new_static("file")],
 				path_patterns,
@@ -503,7 +506,7 @@ pub enum LspConfigError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A source exceeds the byte bound.
 	#[error("LSP configuration {} exceeds {limit} bytes", path.display())]

@@ -1,13 +1,15 @@
 //! Tonic transport projection over the typed inference registry.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
+	mem,
 	pin::Pin,
 	sync::Arc,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use futures::{Stream, StreamExt as _, stream};
 use im::OrdMap;
 use omp_agent::{empty_stop, project_thread_history};
@@ -17,22 +19,22 @@ use omp_catalog::{
 };
 use omp_core::{Str, encoding::hex, sf};
 use omp_inference::{
-	Client, Registry,
+	Client, Registry, RetryAction,
 	answer::{
-		Artifact, ArtifactBody, AudioChunk, ChatControl, ChatControlError, GenerationEvent,
-		ImageArtifact, NativeResponse, NativeResponseBody, RealtimeEvent as CanonicalRealtimeEvent,
-		RealtimeInput, SearchFailureKind, SearchResults, TranscriptEvent, UsageReport, UsageStatus,
-		UsageUnit, UsageWindowKind, VideoArtifact,
+		Artifact, ArtifactBody, AudioChunk, ChatControl, ChatControlError, ChatStream,
+		GenerationEvent, ImageArtifact, NativeResponse, NativeResponseBody,
+		RealtimeEvent as CanonicalRealtimeEvent, RealtimeInput, SearchFailureKind, SearchResults,
+		TranscriptEvent, UsageReport, UsageStatus, UsageUnit, UsageWindowKind, VideoArtifact,
 	},
 	call::{
-		AudioFormat, Background, CallMeta, ContentPart, ContextStrategy, CountAccuracy,
-		CountTokensRequest, DetokenizeRequest, Dimensions, EmbedRequest, EmbeddingInput, ImageFormat,
-		ImageQuality, ImageRequest, MediaInput, Message, NativeMethod, NativePath, NativePayload,
-		NativeRequest, NativeResponseFraming, NegotiationPolicy, OpaqueJson, RawJson,
-		RealtimeModality, RealtimeRequest, Role, Sampling, SearchRecency, SearchRequest,
-		SessionRequest, Setting, SpeechRequest, Target, TimestampGranularity, TokenizeRequest,
-		ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
-		TranscriptionRequest, TruncationPolicy, UsageRequest, UsageScope, VideoRequest,
+		self, CallMeta, ContentPart, ContextStrategy, CountAccuracy, CountTokensRequest,
+		DetokenizeRequest, Dimensions, EmbedRequest, EmbeddingInput, ImageFormat, ImageQuality,
+		ImageRequest, MediaInput, Message, NativeMethod, NativePath, NativePayload, NativeRequest,
+		NativeResponseFraming, NegotiationPolicy, OpaqueJson, RawJson, RealtimeModality,
+		RealtimeRequest, Role, Sampling, SearchRecency, SearchRequest, SessionRequest, Setting,
+		SpeechRequest, Target, TimestampGranularity, TokenizeRequest, ToolChoice, ToolDefinition,
+		ToolGrammar, ToolGrammarSyntax, ToolInputConstraint, ToolResultContent, TranscriptionRequest,
+		TruncationPolicy, UsageRequest, UsageScope, VideoRequest,
 	},
 	error::{Error, ErrorDetail, ErrorKind, aggregate_search_failures, search_provider_failure},
 	event::{
@@ -50,11 +52,27 @@ use omp_inference::{
 	},
 	receipt::{Cost, ExecutionBudget, RecoveryKind, Usage, UsageSource},
 	router::Router,
-	session::{ConversationSessionPlanner, TurnReplay},
+	session::{ConversationError, ConversationSessionPlanner, TurnReplay},
 };
-use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1::{
+		self as pb, count_tokens_request, exec_status, generate_image_request, generation_status,
+		model_card, model_event,
+		native_request::{self, Path},
+		part_start, realtime_event, realtime_frame, realtime_open, search_request,
+		search_response::{self, failure},
+		speak_event, tool_choice,
+		tool_def::{self, grammar},
+		transcribe_request, turn_error, turn_event, turn_frame, turn_request, usage, usage_request,
+		usage_response::{reset_credits, window},
+		value,
+	},
+	prost::Message as _,
+	thread::v1::{self as thread_pb, blob, item, part},
+};
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry as ToolRegistry, TOOL_REV_PROP};
 use parking_lot::Mutex;
+use tokio::sync::{broadcast, oneshot};
 use tonic::{Request, Response, Status};
 
 // env/v1/turn carries no per-model projection caps; this bounded text-only
@@ -72,34 +90,46 @@ pub type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 's
 /// application installs its live provider owner.
 #[tonic::async_trait]
 pub trait ProviderGatewayAuthority: Send + Sync + 'static {
+	/// Returns the current model catalog, optionally filtered to one provider.
 	async fn catalog(
 		&self,
 		request: pb::ProviderCatalogRequest,
 	) -> Result<pb::ProviderCatalogResponse, Status>;
+	/// Returns catalog events after the request cursor for incremental
+	/// synchronization.
 	async fn watch_catalog(
 		&self,
 		request: pb::WatchProviderCatalogRequest,
 	) -> Result<pb::WatchProviderCatalogResponse, Status>;
+	/// Reports whether the named provider currently has usable credentials.
 	async fn authenticated(
 		&self,
 		request: pb::ProviderAuthenticatedRequest,
 	) -> Result<pb::ProviderAuthenticatedResponse, Status>;
+	/// Adds a provider declaration if the caller's expected catalog generation
+	/// is current.
 	async fn declare(
 		&self,
 		request: pb::ProviderDeclarationRequest,
 	) -> Result<pb::ProviderMutationResponse, Status>;
+	/// Atomically replaces a provider declaration at the expected catalog
+	/// generation.
 	async fn replace(
 		&self,
 		request: pb::ProviderDeclarationRequest,
 	) -> Result<pb::ProviderMutationResponse, Status>;
+	/// Removes a provider declaration at the expected catalog generation.
 	async fn retract(
 		&self,
 		request: pb::RetractProviderRequest,
 	) -> Result<pb::ProviderMutationResponse, Status>;
+	/// Executes one provider operation through the authoritative application
+	/// owner.
 	async fn request(
 		&self,
 		request: pb::ProviderOperationRequest,
 	) -> Result<pb::ProviderOperationResponse, Status>;
+	/// Creates a provider-backed session from an operation request.
 	async fn mint_session(
 		&self,
 		request: pb::ProviderOperationRequest,
@@ -151,9 +181,8 @@ struct TurnProjection {
 #[derive(Clone)]
 struct RpcGeneration {
 	status:  Arc<Mutex<pb::GenerationStatus>>,
-	updates: tokio::sync::broadcast::Sender<pb::GenerationStatus>,
-	cancel:
-		flume::Sender<tokio::sync::oneshot::Sender<Result<JobCancellationReceipt, JobCancelError>>>,
+	updates: broadcast::Sender<pb::GenerationStatus>,
+	cancel:  flume::Sender<oneshot::Sender<Result<JobCancellationReceipt, JobCancelError>>>,
 }
 
 impl InferenceRpc {
@@ -388,12 +417,12 @@ impl InferenceRpc {
 	fn resolve_turn_input(
 		&self,
 		turn: ProviderTurnId,
-		input: Option<&pb::turn_request::Input>,
+		input: Option<&turn_request::Input>,
 		provider_reset: bool,
 	) -> Result<ResolvedTurn, Status> {
 		let strategy = ContextStrategy::Replay;
 		match input {
-			Some(pb::turn_request::Input::Seed(seed)) => {
+			Some(turn_request::Input::Seed(seed)) => {
 				let thread = seed
 					.thread
 					.as_ref()
@@ -450,7 +479,7 @@ impl InferenceRpc {
 					provider_heads:        [(0u64, revision)].into_iter().collect(),
 				})
 			},
-			Some(pb::turn_request::Input::Incremental(incremental)) => {
+			Some(turn_request::Input::Incremental(incremental)) => {
 				let context = incremental
 					.context
 					.as_ref()
@@ -594,7 +623,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 			.message()
 			.await?
 			.ok_or_else(|| Status::invalid_argument("Turn requires an opening frame"))?;
-		let Some(pb::turn_frame::Frame::Open(open)) = first.frame else {
+		let Some(turn_frame::Frame::Open(open)) = first.frame else {
 			return Err(Status::invalid_argument("the first Turn frame must be open"));
 		};
 		if open.turn_id.is_empty() {
@@ -619,7 +648,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 			.as_ref()
 			.and_then(|props| props.fields.get(omp_agent::PROVIDER_RESET_PROP))
 			.and_then(|value| value.kind.as_ref())
-			.is_some_and(|kind| matches!(kind, pb::value::Kind::Bool(true)));
+			.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)));
 		let mut resolved =
 			match self.resolve_turn_input(turn.clone(), open.input.as_ref(), provider_reset) {
 				Ok(resolved) => resolved,
@@ -655,7 +684,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 			);
 		}
 		let chat =
-			chat_request(std::mem::take(&mut resolved.request_messages), params, &self.tool_registry)?;
+			chat_request(mem::take(&mut resolved.request_messages), params, &self.tool_registry)?;
 		let target = self.target(&params.model, OperationKind::Chat)?;
 		let mut client = self.turn_client(target, request_id, resolved.provider_session.clone());
 		let events = match client.execute(chat).await {
@@ -689,7 +718,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 			.message()
 			.await?
 			.ok_or_else(|| Status::invalid_argument("Realtime requires an opening frame"))?;
-		let Some(pb::realtime_frame::Frame::Open(open)) = first.frame else {
+		let Some(realtime_frame::Frame::Open(open)) = first.frame else {
 			return Err(Status::invalid_argument("the first Realtime frame must be open"));
 		};
 		if open.request_id.is_empty() || open.model.is_empty() {
@@ -701,12 +730,12 @@ impl pb::inference_server::Inference for InferenceRpc {
 				.modalities
 				.iter()
 				.map(|modality| {
-					match pb::realtime_open::Modality::try_from(*modality)
-						.unwrap_or(pb::realtime_open::Modality::Unspecified)
+					match realtime_open::Modality::try_from(*modality)
+						.unwrap_or(realtime_open::Modality::Unspecified)
 					{
-						pb::realtime_open::Modality::Text => Ok(RealtimeModality::Text),
-						pb::realtime_open::Modality::Audio => Ok(RealtimeModality::Audio),
-						pb::realtime_open::Modality::Unspecified => {
+						realtime_open::Modality::Text => Ok(RealtimeModality::Text),
+						realtime_open::Modality::Audio => Ok(RealtimeModality::Audio),
+						realtime_open::Modality::Unspecified => {
 							Err(Status::invalid_argument("RealtimeOpen modality is required"))
 						},
 					}
@@ -732,7 +761,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 		let input_session = Arc::clone(&session);
 		tokio::spawn(async move {
 			while let Ok(Some(frame)) = incoming.message().await {
-				let close = matches!(frame.frame, Some(pb::realtime_frame::Frame::Close(_)));
+				let close = matches!(frame.frame, Some(realtime_frame::Frame::Close(_)));
 				let input = match realtime_input(frame) {
 					Ok(input) => input,
 					Err(error) => {
@@ -847,8 +876,8 @@ impl pb::inference_server::Inference for InferenceRpc {
 	) -> Result<Response<pb::CountTokensResponse>, Status> {
 		let request = request.into_inner();
 		let messages = match request.input {
-			Some(pb::count_tokens_request::Input::Thread(thread)) => thread_messages(&thread)?,
-			Some(pb::count_tokens_request::Input::Context(context)) => {
+			Some(count_tokens_request::Input::Thread(thread)) => thread_messages(&thread)?,
+			Some(count_tokens_request::Input::Context(context)) => {
 				let held = self
 					.contexts
 					.lock()
@@ -877,9 +906,9 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(pb::CountTokensResponse {
 			tokens:     answer.tokens,
 			accuracy:   if answer.provenance.exact {
-				pb::usage::Accuracy::Exact as i32
+				usage::Accuracy::Exact as i32
 			} else {
-				pb::usage::Accuracy::Estimated as i32
+				usage::Accuracy::Estimated as i32
 			},
 			provenance: Some(tokenizer_provenance(answer.provenance)),
 		}))
@@ -962,33 +991,33 @@ impl pb::inference_server::Inference for InferenceRpc {
 		let dimensions = request.size.map_or(Setting::Unset, |size| {
 			Setting::Prefer(Dimensions { width: size.width, height: size.height })
 		});
-		let quality = match pb::generate_image_request::Quality::try_from(request.quality)
-			.unwrap_or(pb::generate_image_request::Quality::Unspecified)
+		let quality = match generate_image_request::Quality::try_from(request.quality)
+			.unwrap_or(generate_image_request::Quality::Unspecified)
 		{
-			pb::generate_image_request::Quality::Low => Setting::Prefer(ImageQuality::Draft),
-			pb::generate_image_request::Quality::Medium => Setting::Prefer(ImageQuality::Standard),
-			pb::generate_image_request::Quality::High => Setting::Prefer(ImageQuality::High),
-			pb::generate_image_request::Quality::Unspecified => Setting::Unset,
+			generate_image_request::Quality::Low => Setting::Prefer(ImageQuality::Draft),
+			generate_image_request::Quality::Medium => Setting::Prefer(ImageQuality::Standard),
+			generate_image_request::Quality::High => Setting::Prefer(ImageQuality::High),
+			generate_image_request::Quality::Unspecified => Setting::Unset,
 		};
-		let format = match pb::generate_image_request::Format::try_from(request.format)
-			.unwrap_or(pb::generate_image_request::Format::Unspecified)
+		let format = match generate_image_request::Format::try_from(request.format)
+			.unwrap_or(generate_image_request::Format::Unspecified)
 		{
-			pb::generate_image_request::Format::Png => Setting::Prefer(ImageFormat::Png),
-			pb::generate_image_request::Format::Webp => Setting::Prefer(ImageFormat::Webp),
-			pb::generate_image_request::Format::Jpeg => Setting::Prefer(ImageFormat::Jpeg),
-			pb::generate_image_request::Format::Svg => {
+			generate_image_request::Format::Png => Setting::Prefer(ImageFormat::Png),
+			generate_image_request::Format::Webp => Setting::Prefer(ImageFormat::Webp),
+			generate_image_request::Format::Jpeg => Setting::Prefer(ImageFormat::Jpeg),
+			generate_image_request::Format::Svg => {
 				return Err(Status::invalid_argument("SVG is not a canonical generated image format"));
 			},
-			pb::generate_image_request::Format::Unspecified => Setting::Unset,
+			generate_image_request::Format::Unspecified => Setting::Unset,
 		};
-		let background = match pb::generate_image_request::Background::try_from(request.background)
-			.unwrap_or(pb::generate_image_request::Background::Unspecified)
+		let background = match generate_image_request::Background::try_from(request.background)
+			.unwrap_or(generate_image_request::Background::Unspecified)
 		{
-			pb::generate_image_request::Background::Opaque => Setting::Prefer(Background::Opaque),
-			pb::generate_image_request::Background::Transparent => {
-				Setting::Prefer(Background::Transparent)
+			generate_image_request::Background::Opaque => Setting::Prefer(call::Background::Opaque),
+			generate_image_request::Background::Transparent => {
+				Setting::Prefer(call::Background::Transparent)
 			},
-			pb::generate_image_request::Background::Unspecified => Setting::Unset,
+			generate_image_request::Background::Unspecified => Setting::Unset,
 		};
 		let operation = ImageRequest {
 			prompt: request.prompt.as_str().into(),
@@ -1026,12 +1055,12 @@ impl pb::inference_server::Inference for InferenceRpc {
 		let format = match pb::AudioEncoding::try_from(request.encoding)
 			.unwrap_or(pb::AudioEncoding::Unspecified)
 		{
-			pb::AudioEncoding::Mp3 => Setting::Prefer(omp_inference::call::AudioFormat::Mp3),
-			pb::AudioEncoding::Pcm16 => Setting::Prefer(omp_inference::call::AudioFormat::Pcm16),
-			pb::AudioEncoding::Wav => Setting::Prefer(omp_inference::call::AudioFormat::Wav),
-			pb::AudioEncoding::Opus => Setting::Prefer(omp_inference::call::AudioFormat::Opus),
-			pb::AudioEncoding::Aac => Setting::Prefer(omp_inference::call::AudioFormat::Aac),
-			pb::AudioEncoding::Flac => Setting::Prefer(omp_inference::call::AudioFormat::Flac),
+			pb::AudioEncoding::Mp3 => Setting::Prefer(call::AudioFormat::Mp3),
+			pb::AudioEncoding::Pcm16 => Setting::Prefer(call::AudioFormat::Pcm16),
+			pb::AudioEncoding::Wav => Setting::Prefer(call::AudioFormat::Wav),
+			pb::AudioEncoding::Opus => Setting::Prefer(call::AudioFormat::Opus),
+			pb::AudioEncoding::Aac => Setting::Prefer(call::AudioFormat::Aac),
+			pb::AudioEncoding::Flac => Setting::Prefer(call::AudioFormat::Flac),
 			pb::AudioEncoding::Unspecified => Setting::Unset,
 		};
 		let operation = SpeechRequest {
@@ -1065,13 +1094,13 @@ impl pb::inference_server::Inference for InferenceRpc {
 			.ok_or_else(|| Status::invalid_argument("TranscribeRequest.audio is required"))
 			.and_then(media_input)?;
 		let granularity = if request.granularities.iter().any(|value| {
-			pb::transcribe_request::Granularity::try_from(*value)
-				.is_ok_and(|value| value == pb::transcribe_request::Granularity::Word)
+			transcribe_request::Granularity::try_from(*value)
+				.is_ok_and(|value| value == transcribe_request::Granularity::Word)
 		}) {
 			Setting::Prefer(TimestampGranularity::Word)
 		} else if request.granularities.iter().any(|value| {
-			pb::transcribe_request::Granularity::try_from(*value)
-				.is_ok_and(|value| value == pb::transcribe_request::Granularity::Segment)
+			transcribe_request::Granularity::try_from(*value)
+				.is_ok_and(|value| value == transcribe_request::Granularity::Segment)
 		}) {
 			Setting::Prefer(TimestampGranularity::Segment)
 		} else {
@@ -1136,14 +1165,14 @@ impl pb::inference_server::Inference for InferenceRpc {
 		if request.query.is_empty() {
 			return Err(Status::invalid_argument("SearchRequest.query is required"));
 		}
-		let recency = match pb::search_request::Recency::try_from(request.recency)
-			.unwrap_or(pb::search_request::Recency::Unspecified)
+		let recency = match search_request::Recency::try_from(request.recency)
+			.unwrap_or(search_request::Recency::Unspecified)
 		{
-			pb::search_request::Recency::Day => Some(SearchRecency::Day),
-			pb::search_request::Recency::Week => Some(SearchRecency::Week),
-			pb::search_request::Recency::Month => Some(SearchRecency::Month),
-			pb::search_request::Recency::Year => Some(SearchRecency::Year),
-			pb::search_request::Recency::Unspecified => None,
+			search_request::Recency::Day => Some(SearchRecency::Day),
+			search_request::Recency::Week => Some(SearchRecency::Week),
+			search_request::Recency::Month => Some(SearchRecency::Month),
+			search_request::Recency::Year => Some(SearchRecency::Year),
+			search_request::Recency::Unspecified => None,
 		};
 		let locale = match (request.language.is_empty(), request.country.is_empty()) {
 			(false, false) => Some(Str::from(format!("{}-{}", request.language, request.country))),
@@ -1302,7 +1331,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 		let created_at_ms = system_time_ms(checkpoint.created_at);
 		let initial = pb::GenerationStatus {
 			generation_id: generation_id.clone(),
-			state: pb::generation_status::State::Queued as i32,
+			state: generation_status::State::Queued as i32,
 			progress_percent: 0.0,
 			detail: String::new(),
 			artifacts: Vec::new(),
@@ -1314,7 +1343,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 			props: None,
 		};
 		let status = Arc::new(Mutex::new(initial.clone()));
-		let (updates, _) = tokio::sync::broadcast::channel(32);
+		let (updates, _) = broadcast::channel(32);
 		let (cancel, cancel_rx) = flume::bounded(1);
 		self
 			.generations
@@ -1350,10 +1379,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 				match receiver.recv().await {
 					Ok(status) => {
 						let terminal = matches!(
-							pb::generation_status::State::try_from(status.state),
-							Ok(pb::generation_status::State::Completed
-								| pb::generation_status::State::Failed
-								| pb::generation_status::State::Cancelled)
+							generation_status::State::try_from(status.state),
+							Ok(generation_status::State::Completed
+								| generation_status::State::Failed
+								| generation_status::State::Cancelled)
 						);
 						yield status;
 						if terminal { break; }
@@ -1373,7 +1402,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::CancelGenerationRequest>,
 	) -> Result<Response<pb::GenerationStatus>, Status> {
 		let generation = self.generation(&request.into_inner().generation_id)?;
-		let (reply, result) = tokio::sync::oneshot::channel();
+		let (reply, result) = oneshot::channel();
 		generation
 			.cancel
 			.send_async(reply)
@@ -1402,15 +1431,15 @@ impl pb::inference_server::Inference for InferenceRpc {
 			provider:    provider.clone(),
 			account:     (!request.account.is_empty())
 				.then(|| AccountId::from(request.account.as_str())),
-			scope:       match pb::usage_request::Scope::try_from(request.scope)
-				.unwrap_or(pb::usage_request::Scope::Unspecified)
+			scope:       match usage_request::Scope::try_from(request.scope)
+				.unwrap_or(usage_request::Scope::Unspecified)
 			{
-				pb::usage_request::Scope::Unspecified | pb::usage_request::Scope::Current => {
+				usage_request::Scope::Unspecified | usage_request::Scope::Current => {
 					UsageScope::Current
 				},
-				pb::usage_request::Scope::Billing => UsageScope::Billing,
-				pb::usage_request::Scope::RateLimit => UsageScope::RateLimit,
-				pb::usage_request::Scope::All => UsageScope::All,
+				usage_request::Scope::Billing => UsageScope::Billing,
+				usage_request::Scope::RateLimit => UsageScope::RateLimit,
+				usage_request::Scope::All => UsageScope::All,
 			},
 			allow_stale: request.allow_stale,
 		};
@@ -1425,50 +1454,48 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::NativeRequest>,
 	) -> Result<Response<Self::NativeStream>, Status> {
 		let request = request.into_inner();
-		let method = match pb::native_request::Method::try_from(request.method)
-			.unwrap_or(pb::native_request::Method::Unspecified)
+		let method = match native_request::Method::try_from(request.method)
+			.unwrap_or(native_request::Method::Unspecified)
 		{
-			pb::native_request::Method::Get => NativeMethod::Get,
-			pb::native_request::Method::Post => NativeMethod::Post,
-			pb::native_request::Method::Delete => NativeMethod::Delete,
-			pb::native_request::Method::Unspecified => {
+			native_request::Method::Get => NativeMethod::Get,
+			native_request::Method::Post => NativeMethod::Post,
+			native_request::Method::Delete => NativeMethod::Delete,
+			native_request::Method::Unspecified => {
 				return Err(Status::invalid_argument("NativeRequest.method is required"));
 			},
 		};
-		let path = match pb::native_request::Path::try_from(request.path)
-			.unwrap_or(pb::native_request::Path::Unspecified)
-		{
-			pb::native_request::Path::ChatCompletions => NativePath::ChatCompletions,
-			pb::native_request::Path::Responses => NativePath::Responses,
-			pb::native_request::Path::Messages => NativePath::Messages,
-			pb::native_request::Path::MessageTokenCounts => NativePath::MessageTokenCounts,
-			pb::native_request::Path::Embeddings => NativePath::Embeddings,
-			pb::native_request::Path::ImageGenerations => NativePath::ImageGenerations,
-			pb::native_request::Path::AudioSpeech => NativePath::AudioSpeech,
-			pb::native_request::Path::AudioTranscriptions => NativePath::AudioTranscriptions,
-			pb::native_request::Path::RealtimeSessions => NativePath::RealtimeSessions,
-			pb::native_request::Path::Models => NativePath::Models,
-			pb::native_request::Path::Usage => NativePath::Usage,
-			pb::native_request::Path::Unspecified => {
+		let path = match Path::try_from(request.path).unwrap_or(Path::Unspecified) {
+			Path::ChatCompletions => NativePath::ChatCompletions,
+			Path::Responses => NativePath::Responses,
+			Path::Messages => NativePath::Messages,
+			Path::MessageTokenCounts => NativePath::MessageTokenCounts,
+			Path::Embeddings => NativePath::Embeddings,
+			Path::ImageGenerations => NativePath::ImageGenerations,
+			Path::AudioSpeech => NativePath::AudioSpeech,
+			Path::AudioTranscriptions => NativePath::AudioTranscriptions,
+			Path::RealtimeSessions => NativePath::RealtimeSessions,
+			Path::Models => NativePath::Models,
+			Path::Usage => NativePath::Usage,
+			Path::Unspecified => {
 				return Err(Status::invalid_argument("NativeRequest.path is required"));
 			},
 		};
 		let maximum = request.max_response_bytes.max(1);
 		let payload = match request.payload {
-			Some(pb::native_request::Payload::Json(bytes)) => Some(NativePayload::Json(
+			Some(native_request::Payload::Json(bytes)) => Some(NativePayload::Json(
 				RawJson::new(bytes, maximum)
 					.map_err(|error| Status::invalid_argument(error.to_string()))?,
 			)),
-			Some(pb::native_request::Payload::Bytes(bytes)) => Some(NativePayload::Bytes(bytes)),
+			Some(native_request::Payload::Bytes(bytes)) => Some(NativePayload::Bytes(bytes)),
 			None => None,
 		};
-		let response_framing = match pb::native_request::Framing::try_from(request.framing)
-			.unwrap_or(pb::native_request::Framing::Unspecified)
+		let response_framing = match native_request::Framing::try_from(request.framing)
+			.unwrap_or(native_request::Framing::Unspecified)
 		{
-			pb::native_request::Framing::Json => NativeResponseFraming::Json,
-			pb::native_request::Framing::Sse => NativeResponseFraming::Sse,
-			pb::native_request::Framing::Bytes => NativeResponseFraming::Bytes,
-			pb::native_request::Framing::Unspecified => {
+			native_request::Framing::Json => NativeResponseFraming::Json,
+			native_request::Framing::Sse => NativeResponseFraming::Sse,
+			native_request::Framing::Bytes => NativeResponseFraming::Bytes,
+			native_request::Framing::Unspecified => {
 				return Err(Status::invalid_argument("NativeRequest.framing is required"));
 			},
 		};
@@ -1514,7 +1541,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 	) -> Result<Response<Self::WatchModelsStream>, Status> {
 		let event = pb::ModelEvent {
 			cursor: Some(self.cursor()),
-			event:  Some(pb::model_event::Event::Reset(pb::model_event::Reset {})),
+			event:  Some(model_event::Event::Reset(pb::model_event::Reset {})),
 		};
 		Ok(Response::new(Box::pin(stream::once(async move { Ok(event) }))))
 	}
@@ -1645,7 +1672,7 @@ fn provider_card(registry: &Registry, provider: &ProviderDef) -> pb::ProviderCar
 	let facets = models
 		.iter()
 		.flat_map(|model| model_facets(model))
-		.collect::<std::collections::BTreeSet<_>>()
+		.collect::<BTreeSet<_>>()
 		.into_iter()
 		.collect();
 	pb::ProviderCard {
@@ -1684,7 +1711,7 @@ fn model_card(model: &ModelSpec, provider: &str, facets: Vec<i32>) -> pb::ModelC
 			ModelAvailability::Blocked => pb::Availability::Blocked,
 			ModelAvailability::Disabled => pb::Availability::Disabled,
 		} as i32,
-		source: pb::model_card::Source::Bundled as i32,
+		source: model_card::Source::Bundled as i32,
 		blocked_until_ms: model.provenance.blocked_until_ms.unwrap_or_default(),
 		deprecated: model.provenance.deprecated,
 		updated_at_ms: model.provenance.updated_at_ms.unwrap_or_default(),
@@ -1786,11 +1813,11 @@ fn inference_turn_error(error: Error) -> pb::TurnEvent {
 		| ErrorKind::CredentialStorageUnavailable
 		| ErrorKind::Authorization
 		| ErrorKind::AccountDisabled
-		| ErrorKind::PaymentRequired => pb::turn_error::Kind::Auth,
-		ErrorKind::RateLimited | ErrorKind::QuotaExhausted => pb::turn_error::Kind::RateLimited,
-		ErrorKind::BudgetExhausted | ErrorKind::ResourceExhausted => pb::turn_error::Kind::Overloaded,
-		ErrorKind::EmptyOutput | ErrorKind::EmptyCompletion => pb::turn_error::Kind::EmptyOutput,
-		_ => pb::turn_error::Kind::Upstream,
+		| ErrorKind::PaymentRequired => turn_error::Kind::Auth,
+		ErrorKind::RateLimited | ErrorKind::QuotaExhausted => turn_error::Kind::RateLimited,
+		ErrorKind::BudgetExhausted | ErrorKind::ResourceExhausted => turn_error::Kind::Overloaded,
+		ErrorKind::EmptyOutput | ErrorKind::EmptyCompletion => turn_error::Kind::EmptyOutput,
+		_ => turn_error::Kind::Upstream,
 	};
 	let detail = if error.kind == ErrorKind::Authentication {
 		let mut detail = error.provider.as_ref().map_or_else(
@@ -1828,18 +1855,16 @@ fn inference_turn_error(error: Error) -> pb::TurnEvent {
 		detail
 	};
 	let retry_after_ms = match error.action {
-		omp_inference::RetryAction::SameRoute { after } => {
-			after.as_millis().try_into().unwrap_or(u64::MAX)
-		},
+		RetryAction::SameRoute { after } => after.as_millis().try_into().unwrap_or(u64::MAX),
 		_ => 0,
 	};
-	let diagnostics = if kind == pb::turn_error::Kind::EmptyOutput {
+	let diagnostics = if kind == turn_error::Kind::EmptyOutput {
 		vec![empty_stop_diagnostic(&error)]
 	} else {
 		Vec::new()
 	};
 	pb::TurnEvent {
-		event: Some(pb::turn_event::Event::Error(pb::TurnError {
+		event: Some(turn_event::Event::Error(pb::TurnError {
 			kind: kind as i32,
 			detail,
 			actual: None,
@@ -1896,14 +1921,12 @@ fn empty_stop_diagnostic(error: &Error) -> pb::Diagnostic {
 	}
 }
 
-fn conversation_status(error: omp_inference::session::ConversationError) -> Status {
+fn conversation_status(error: ConversationError) -> Status {
 	match error {
-		omp_inference::session::ConversationError::RevisionConflict { .. }
-		| omp_inference::session::ConversationError::TurnConflict(_) => {
+		ConversationError::RevisionConflict { .. } | ConversationError::TurnConflict(_) => {
 			Status::aborted(error.to_string())
 		},
-		omp_inference::session::ConversationError::UnknownConversation(_)
-		| omp_inference::session::ConversationError::UnknownRevision(_) => {
+		ConversationError::UnknownConversation(_) | ConversationError::UnknownRevision(_) => {
 			Status::not_found(error.to_string())
 		},
 		_ => Status::internal(error.to_string()),
@@ -1959,8 +1982,8 @@ fn items_messages(items: &[thread_pb::Item]) -> Result<Vec<Message>, Status> {
 	items
 		.iter()
 		.map(|item| match item.kind.as_ref() {
-			Some(thread_pb::item::Kind::Message(message)) => message_from_proto(message),
-			Some(thread_pb::item::Kind::ToolCall(call)) => Ok(Message {
+			Some(item::Kind::Message(message)) => message_from_proto(message),
+			Some(item::Kind::ToolCall(call)) => Ok(Message {
 				role:    Role::Assistant,
 				content: Arc::from([ContentPart::ToolCall {
 					call:      ToolCallId::from(call.id.as_str()),
@@ -1970,7 +1993,7 @@ fn items_messages(items: &[thread_pb::Item]) -> Result<Vec<Message>, Status> {
 				}]),
 				name:    None,
 			}),
-			Some(thread_pb::item::Kind::ToolResult(result)) => {
+			Some(item::Kind::ToolResult(result)) => {
 				let content = result
 					.parts
 					.iter()
@@ -2012,35 +2035,27 @@ fn message_from_proto(message: &thread_pb::Message) -> Result<Message, Status> {
 
 fn content_part(part: &thread_pb::Part) -> Result<ContentPart, Status> {
 	match part.kind.as_ref() {
-		Some(thread_pb::part::Kind::Text(text)) => {
+		Some(part::Kind::Text(text)) => {
 			Ok(ContentPart::Text { text: text.as_str().into(), proof: None })
 		},
-		Some(thread_pb::part::Kind::Thinking(thinking)) if thinking.signature.is_empty() => {
+		Some(part::Kind::Thinking(thinking)) if thinking.signature.is_empty() => {
 			Ok(ContentPart::Reasoning { text: thinking.text.as_str().into(), proof: None })
 		},
-		Some(thread_pb::part::Kind::Thinking(_)) => Err(Status::invalid_argument(
+		Some(part::Kind::Thinking(_)) => Err(Status::invalid_argument(
 			"unscoped reasoning signatures cannot enter canonical inference",
 		)),
-		Some(thread_pb::part::Kind::Blob(blob)) => Ok(ContentPart::Image(media_input(blob)?)),
-		Some(thread_pb::part::Kind::Fallback(_) | thread_pb::part::Kind::ServerTool(_)) => {
-			Err(Status::invalid_argument(
-				"legacy fallback/server-tool parts require an explicit canonical projection",
-			))
-		},
+		Some(part::Kind::Blob(blob)) => Ok(ContentPart::Image(media_input(blob)?)),
+		Some(part::Kind::Fallback(_) | part::Kind::ServerTool(_)) => Err(Status::invalid_argument(
+			"legacy fallback/server-tool parts require an explicit canonical projection",
+		)),
 		None => Err(Status::invalid_argument("message part kind is required")),
 	}
 }
 
-fn tool_result_part(
-	part: &thread_pb::Part,
-) -> Result<omp_inference::call::ToolResultContent, Status> {
+fn tool_result_part(part: &thread_pb::Part) -> Result<ToolResultContent, Status> {
 	match part.kind.as_ref() {
-		Some(thread_pb::part::Kind::Text(text)) => {
-			Ok(omp_inference::call::ToolResultContent::Text(text.as_str().into()))
-		},
-		Some(thread_pb::part::Kind::Blob(blob)) => {
-			Ok(omp_inference::call::ToolResultContent::Document(media_input(blob)?))
-		},
+		Some(part::Kind::Text(text)) => Ok(ToolResultContent::Text(text.as_str().into())),
+		Some(part::Kind::Blob(blob)) => Ok(ToolResultContent::Document(media_input(blob)?)),
 		_ => Err(Status::invalid_argument(
 			"tool result contains a part that has no canonical projection",
 		)),
@@ -2079,16 +2094,16 @@ fn tool_definition(tool: &pb::ToolDef) -> Result<ToolDefinition, Status> {
 		return Err(Status::invalid_argument("ToolDef.name is required"));
 	}
 	let input = match tool.input.as_ref() {
-		Some(pb::tool_def::Input::JsonSchema(schema)) => ToolInputConstraint::JsonSchema {
+		Some(tool_def::Input::JsonSchema(schema)) => ToolInputConstraint::JsonSchema {
 			parameters: opaque_json(&schema.schema_json, "ToolDef.json_schema.schema_json")?,
 			strict:     schema.strict.unwrap_or(false),
 		},
-		Some(pb::tool_def::Input::Grammar(grammar)) => {
-			let syntax = match pb::tool_def::grammar::Syntax::try_from(grammar.syntax) {
-				Ok(pb::tool_def::grammar::Syntax::Lark) => ToolGrammarSyntax::Lark,
-				Ok(pb::tool_def::grammar::Syntax::Regex) => ToolGrammarSyntax::Regex,
-				Ok(pb::tool_def::grammar::Syntax::Ebnf) => ToolGrammarSyntax::Ebnf,
-				Ok(pb::tool_def::grammar::Syntax::Unspecified) | Err(_) => {
+		Some(tool_def::Input::Grammar(grammar)) => {
+			let syntax = match grammar::Syntax::try_from(grammar.syntax) {
+				Ok(grammar::Syntax::Lark) => ToolGrammarSyntax::Lark,
+				Ok(grammar::Syntax::Regex) => ToolGrammarSyntax::Regex,
+				Ok(grammar::Syntax::Ebnf) => ToolGrammarSyntax::Ebnf,
+				Ok(grammar::Syntax::Unspecified) | Err(_) => {
 					return Err(Status::invalid_argument(
 						"ToolDef.grammar.syntax must be LARK, REGEX, or EBNF",
 					));
@@ -2156,16 +2171,16 @@ fn chat_request(
 		.tool_choice
 		.as_ref()
 		.map_or(Ok(Setting::Unset), |choice| {
-			let choice = match pb::tool_choice::Mode::try_from(choice.mode)
-				.unwrap_or(pb::tool_choice::Mode::Unspecified)
+			let choice = match tool_choice::Mode::try_from(choice.mode)
+				.unwrap_or(tool_choice::Mode::Unspecified)
 			{
-				pb::tool_choice::Mode::Unspecified | pb::tool_choice::Mode::Auto => ToolChoice::Auto,
-				pb::tool_choice::Mode::None => ToolChoice::Disabled,
-				pb::tool_choice::Mode::Required => ToolChoice::Required,
-				pb::tool_choice::Mode::Named if !choice.name.is_empty() => {
+				tool_choice::Mode::Unspecified | tool_choice::Mode::Auto => ToolChoice::Auto,
+				tool_choice::Mode::None => ToolChoice::Disabled,
+				tool_choice::Mode::Required => ToolChoice::Required,
+				tool_choice::Mode::Named if !choice.name.is_empty() => {
 					ToolChoice::Named(choice.name.as_str().into())
 				},
-				pb::tool_choice::Mode::Named => {
+				tool_choice::Mode::Named => {
 					return Err(Status::invalid_argument("named tool choice requires a name"));
 				},
 			};
@@ -2228,10 +2243,10 @@ fn proto_usage(usage: Usage) -> pb::Usage {
 		cache_read_tokens:  usage.cache_read_tokens,
 		cache_write_tokens: usage.cache_write_tokens,
 		accuracy:           match usage.source {
-			UsageSource::Provider | UsageSource::Measured => pb::usage::Accuracy::Exact,
-			UsageSource::Estimated => pb::usage::Accuracy::Estimated,
-			UsageSource::Mixed => pb::usage::Accuracy::Mixed,
-			UsageSource::Unknown => pb::usage::Accuracy::Unspecified,
+			UsageSource::Provider | UsageSource::Measured => usage::Accuracy::Exact,
+			UsageSource::Estimated => usage::Accuracy::Estimated,
+			UsageSource::Mixed => usage::Accuracy::Mixed,
+			UsageSource::Unknown => usage::Accuracy::Unspecified,
 		} as i32,
 		detail:             None,
 		total_tokens:       Some(usage.total_tokens()),
@@ -2277,7 +2292,7 @@ fn tool_revision_props(registry: &ToolRegistry, name: &str) -> Option<pb::ValueM
 	let (_, revision) = registry.live_identity(name)?;
 	Some(pb::ValueMap {
 		fields: BTreeMap::from([(TOOL_REV_PROP.to_owned(), pb::Value {
-			kind: Some(pb::value::Kind::String(revision.to_string())),
+			kind: Some(value::Kind::String(revision.to_string())),
 		})]),
 	})
 }
@@ -2293,10 +2308,10 @@ fn build_turn_outcome(
 		output.insert(0, thread_pb::Item {
 			seq:           0,
 			created_at_ms: 0,
-			kind:          Some(thread_pb::item::Kind::Message(thread_pb::Message {
+			kind:          Some(item::Kind::Message(thread_pb::Message {
 				role:  thread_pb::Role::Assistant as i32,
 				parts: vec![thread_pb::Part {
-					kind: Some(thread_pb::part::Kind::Text(projection.assistant_text.clone())),
+					kind: Some(part::Kind::Text(projection.assistant_text.clone())),
 				}],
 			})),
 			props:         None,
@@ -2439,10 +2454,8 @@ fn turn_replay_events(
 	let outcome = pb::Outcome::decode(replay.outcome)
 		.map_err(|_| Status::internal("stored turn outcome is corrupt"))?;
 	Ok(stream::iter([
-		Ok(pb::TurnEvent {
-			event: Some(pb::turn_event::Event::Accepted(pb::Accepted { replay: true })),
-		}),
-		Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) }),
+		Ok(pb::TurnEvent { event: Some(turn_event::Event::Accepted(pb::Accepted { replay: true })) }),
+		Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) }),
 	]))
 }
 
@@ -2469,7 +2482,7 @@ async fn route_live_turn_frame(
 ) -> Result<(), Status> {
 	let mut completion_result = None;
 	let response = match frame.frame {
-		Some(pb::turn_frame::Frame::Input(input)) if !input.invocation_id.is_empty() => {
+		Some(turn_frame::Frame::Input(input)) if !input.invocation_id.is_empty() => {
 			let Some(invocation) = pending.get(&input.invocation_id) else {
 				return Err(Status::invalid_argument("unknown or late invocation_id"));
 			};
@@ -2483,7 +2496,7 @@ async fn route_live_turn_frame(
 				payload:    Bytes::from(input.encode_to_vec()),
 			})
 		},
-		Some(pb::turn_frame::Frame::Complete(complete)) if !complete.invocation_id.is_empty() => {
+		Some(turn_frame::Frame::Complete(complete)) if !complete.invocation_id.is_empty() => {
 			let Some(invocation) = pending.get(&complete.invocation_id).cloned() else {
 				return Err(Status::invalid_argument("unknown or late invocation_id"));
 			};
@@ -2512,7 +2525,7 @@ async fn route_live_turn_frame(
 				}),
 			}
 		},
-		Some(pb::turn_frame::Frame::Open(_)) => {
+		Some(turn_frame::Frame::Open(_)) => {
 			return Err(Status::invalid_argument("Turn open frame may only appear first"));
 		},
 		Some(_) => return Err(Status::invalid_argument("invocation_id is required")),
@@ -2553,13 +2566,13 @@ async fn route_live_turn_frame(
 		projection.output.push(thread_pb::Item {
 			seq:           0,
 			created_at_ms: 0,
-			kind:          Some(thread_pb::item::Kind::ToolCall(call)),
+			kind:          Some(item::Kind::ToolCall(call)),
 			props:         invocation.tool_props,
 		});
 		projection.output.push(thread_pb::Item {
 			seq:           0,
 			created_at_ms: 0,
-			kind:          Some(thread_pb::item::Kind::ToolResult(result)),
+			kind:          Some(item::Kind::ToolResult(result)),
 			props:         None,
 		});
 	}
@@ -2571,7 +2584,7 @@ fn workflow_action_result(complete: &pb::InvokeComplete) -> Result<(Bytes, bool)
 		let mut text = String::new();
 		for part in &result.parts {
 			match part.kind.as_ref() {
-				Some(thread_pb::part::Kind::Text(part)) => text.push_str(part),
+				Some(part::Kind::Text(part)) => text.push_str(part),
 				_ => {
 					return Err(Status::invalid_argument(
 						"workflow action results accept text parts only",
@@ -2585,7 +2598,7 @@ fn workflow_action_result(complete: &pb::InvokeComplete) -> Result<(Bytes, bool)
 		let is_error = complete
 			.status
 			.as_ref()
-			.is_some_and(|status| status.outcome() != pb::exec_status::Outcome::Exited);
+			.is_some_and(|status| status.outcome() != exec_status::Outcome::Exited);
 		return Ok((complete.vendor.clone(), is_error));
 	}
 	Err(Status::invalid_argument(
@@ -2595,23 +2608,23 @@ fn workflow_action_result(complete: &pb::InvokeComplete) -> Result<(Bytes, bool)
 
 fn turn_recovery_event(
 	status: &Status,
-	input: Option<&pb::turn_request::Input>,
+	input: Option<&turn_request::Input>,
 	contexts: &Mutex<BTreeMap<String, RpcContext>>,
 ) -> Option<pb::TurnEvent> {
 	let kind = match status.code() {
-		tonic::Code::Aborted => pb::turn_error::Kind::Conflict,
-		tonic::Code::NotFound => pb::turn_error::Kind::NeedFull,
+		tonic::Code::Aborted => turn_error::Kind::Conflict,
+		tonic::Code::NotFound => turn_error::Kind::NeedFull,
 		_ => return None,
 	};
 	let context_id = match input {
-		Some(pb::turn_request::Input::Seed(seed)) => Some(seed.context_id.as_str()),
-		Some(pb::turn_request::Input::Incremental(incremental)) => incremental
+		Some(turn_request::Input::Seed(seed)) => Some(seed.context_id.as_str()),
+		Some(turn_request::Input::Incremental(incremental)) => incremental
 			.context
 			.as_ref()
 			.map(|context| context.context_id.as_str()),
 		None => None,
 	};
-	let actual = (kind == pb::turn_error::Kind::Conflict)
+	let actual = (kind == turn_error::Kind::Conflict)
 		.then(|| {
 			let context_id = context_id?;
 			let held = contexts.lock();
@@ -2620,7 +2633,7 @@ fn turn_recovery_event(
 		})
 		.flatten();
 	Some(pb::TurnEvent {
-		event: Some(pb::turn_event::Event::Error(pb::TurnError {
+		event: Some(turn_event::Event::Error(pb::TurnError {
 			kind: kind as i32,
 			detail: status.message().to_owned(),
 			actual,
@@ -2633,8 +2646,8 @@ fn turn_recovery_event(
 }
 fn invoke_timeout(invocation_id: &str) -> pb::TurnEvent {
 	pb::TurnEvent {
-		event: Some(pb::turn_event::Event::Error(pb::TurnError {
-			kind:           pb::turn_error::Kind::InvokeTimeout as i32,
+		event: Some(turn_event::Event::Error(pb::TurnError {
+			kind:           turn_error::Kind::InvokeTimeout as i32,
 			detail:         format!("invocation {invocation_id} exceeded its completion deadline"),
 			actual:         None,
 			unsupported:    Vec::new(),
@@ -2646,7 +2659,7 @@ fn invoke_timeout(invocation_id: &str) -> pb::TurnEvent {
 }
 
 fn turn_events(
-	mut events: omp_inference::answer::ChatStream,
+	mut events: ChatStream,
 	mut incoming: tonic::Streaming<pb::TurnFrame>,
 	contexts: Arc<Mutex<BTreeMap<String, RpcContext>>>,
 	sessions: ConversationSessionPlanner,
@@ -2660,7 +2673,7 @@ fn turn_events(
 	let control = events.control();
 	async_stream::try_stream! {
 		yield pb::TurnEvent {
-			event: Some(pb::turn_event::Event::Accepted(pb::Accepted { replay: false })),
+			event: Some(turn_event::Event::Accepted(pb::Accepted { replay: false })),
 		};
 		let mut pending = BTreeMap::<String, PendingInvocation>::new();
 		let mut incoming_open = true;
@@ -2688,8 +2701,8 @@ fn turn_events(
 					TurnMux::Frame(frame) => match frame? {
 						Some(frame) => {
 							let frame_id = match frame.frame.as_ref() {
-								Some(pb::turn_frame::Frame::Input(input)) => input.invocation_id.clone(),
-								Some(pb::turn_frame::Frame::Complete(complete)) => complete.invocation_id.clone(),
+								Some(turn_frame::Frame::Input(input)) => input.invocation_id.clone(),
+								Some(turn_frame::Frame::Complete(complete)) => complete.invocation_id.clone(),
 								_ => String::new(),
 							};
 							if let Err(status) = route_live_turn_frame(
@@ -2731,8 +2744,8 @@ fn turn_events(
 				ChatEvent::Started(_) => {},
 				ChatEvent::BlockStarted { index, kind } => {
 					let kind = match kind {
-						BlockKind::Text => pb::part_start::Kind::Text,
-						BlockKind::Thinking => pb::part_start::Kind::Thinking,
+						BlockKind::Text => part_start::Kind::Text,
+						BlockKind::Thinking => part_start::Kind::Thinking,
 						BlockKind::ToolCall => continue,
 						BlockKind::Artifact => {
 							Err(Status::failed_precondition(
@@ -2741,7 +2754,7 @@ fn turn_events(
 						},
 					};
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::PartStart(pb::PartStart {
+						event: Some(turn_event::Event::PartStart(pb::PartStart {
 							index,
 							kind: kind as i32,
 							tool_call_id: String::new(),
@@ -2752,7 +2765,7 @@ fn turn_events(
 				ChatEvent::TextDelta { index, text } => {
 					projection.lock().assistant_text.push_str(text.as_str());
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::PartDelta(pb::PartDelta {
+						event: Some(turn_event::Event::PartDelta(pb::PartDelta {
 							index,
 							chunk: Bytes::copy_from_slice(text.as_bytes()),
 						})),
@@ -2760,7 +2773,7 @@ fn turn_events(
 				},
 				ChatEvent::ThinkingDelta { index, text } => {
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::PartDelta(pb::PartDelta {
+						event: Some(turn_event::Event::PartDelta(pb::PartDelta {
 							index,
 							chunk: Bytes::copy_from_slice(text.as_bytes()),
 						})),
@@ -2768,9 +2781,9 @@ fn turn_events(
 				},
 				ChatEvent::ToolCallStarted { index, id, name } => {
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::PartStart(pb::PartStart {
+						event: Some(turn_event::Event::PartStart(pb::PartStart {
 							index,
-							kind: pb::part_start::Kind::ToolCall as i32,
+							kind: part_start::Kind::ToolCall as i32,
 							tool_call_id: id.as_str().to_owned(),
 							tool_name: name.as_str().to_owned(),
 						})),
@@ -2778,7 +2791,7 @@ fn turn_events(
 				},
 				ChatEvent::ToolArgumentsDelta { index, bytes } => {
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::PartDelta(pb::PartDelta {
+						event: Some(turn_event::Event::PartDelta(pb::PartDelta {
 							index,
 							chunk: bytes,
 						})),
@@ -2791,7 +2804,7 @@ fn turn_events(
 					projection.lock().output.push(thread_pb::Item {
 						seq: 0,
 						created_at_ms: 0,
-						kind: Some(thread_pb::item::Kind::ToolCall(thread_pb::ToolCall {
+						kind: Some(item::Kind::ToolCall(thread_pb::ToolCall {
 							id: call.id.as_str().to_owned(),
 							name: call.name.as_str().to_owned(),
 							args_json: arguments.into(),
@@ -2804,7 +2817,7 @@ fn turn_events(
 						props,
 					});
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::PartEnd(pb::PartEnd {
+						event: Some(turn_event::Event::PartEnd(pb::PartEnd {
 							index,
 							signature: Bytes::new(),
 						})),
@@ -2852,7 +2865,7 @@ fn turn_events(
 						},
 					);
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::Invoke(pb::Invoke {
+						event: Some(turn_event::Event::Invoke(pb::Invoke {
 							invocation_id,
 							name: action.name.as_str().to_owned(),
 							tool_call,
@@ -2867,7 +2880,7 @@ fn turn_events(
 					let invocation_id = invocation.as_str().to_owned();
 					pending.remove(&invocation_id);
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::InvokeCancel(pb::InvokeCancel {
+						event: Some(turn_event::Event::InvokeCancel(pb::InvokeCancel {
 							invocation_id,
 						})),
 					};
@@ -2936,7 +2949,7 @@ fn turn_events(
 						contexts.lock().insert(context_id, context);
 					}
 					yield pb::TurnEvent {
-						event: Some(pb::turn_event::Event::Outcome(outcome)),
+						event: Some(turn_event::Event::Outcome(outcome)),
 					};
 				},
 			}
@@ -3011,20 +3024,20 @@ fn artifact_blob(artifact: Artifact) -> Result<thread_pb::Blob, Status> {
 		mime: artifact.media_type.as_str().to_owned(),
 		size: artifact.size.unwrap_or(inline.len() as u64),
 		inline,
-		detail: thread_pb::blob::Detail::Original as i32,
+		detail: blob::Detail::Original as i32,
 	})
 }
 
 fn speak_event(chunk: AudioChunk) -> pb::SpeakEvent {
 	if chunk.final_chunk {
 		pb::SpeakEvent {
-			event: Some(pb::speak_event::Event::Done(pb::speak_event::Done {
+			event: Some(speak_event::Event::Done(pb::speak_event::Done {
 				audio:       Some(thread_pb::Blob {
 					hash:   Bytes::new(),
 					mime:   String::new(),
 					size:   chunk.bytes.len() as u64,
 					inline: chunk.bytes,
-					detail: thread_pb::blob::Detail::Original as i32,
+					detail: blob::Detail::Original as i32,
 				}),
 				duration_ms: chunk.end_ms.unwrap_or_default(),
 				usage:       None,
@@ -3035,7 +3048,7 @@ fn speak_event(chunk: AudioChunk) -> pb::SpeakEvent {
 		}
 	} else {
 		pb::SpeakEvent {
-			event: Some(pb::speak_event::Event::Chunk(pb::speak_event::Chunk {
+			event: Some(speak_event::Event::Chunk(pb::speak_event::Chunk {
 				audio:            chunk.bytes,
 				transcript_delta: String::new(),
 			})),
@@ -3054,7 +3067,7 @@ fn search_response(answer: SearchResults) -> pb::SearchResponse {
 		answer: answer.map_or_else(String::new, |answer| answer.as_str().to_owned()),
 		sources: results
 			.into_iter()
-			.map(|result| pb::search_response::Source {
+			.map(|result| search_response::Source {
 				url:          result.url.as_str().to_owned(),
 				title:        result.title.as_str().to_owned(),
 				snippet:      result
@@ -3121,14 +3134,14 @@ fn search_response(answer: SearchResults) -> pb::SearchResponse {
 	}
 }
 
-fn search_failure_kind(kind: SearchFailureKind) -> pb::search_response::failure::Kind {
+fn search_failure_kind(kind: SearchFailureKind) -> failure::Kind {
 	match kind {
-		SearchFailureKind::Authentication => pb::search_response::failure::Kind::Authentication,
-		SearchFailureKind::Quota => pb::search_response::failure::Kind::Quota,
-		SearchFailureKind::ModelNotFound => pb::search_response::failure::Kind::ModelNotFound,
-		SearchFailureKind::Transport => pb::search_response::failure::Kind::Transport,
-		SearchFailureKind::Timeout => pb::search_response::failure::Kind::Timeout,
-		SearchFailureKind::Provider => pb::search_response::failure::Kind::Provider,
+		SearchFailureKind::Authentication => failure::Kind::Authentication,
+		SearchFailureKind::Quota => failure::Kind::Quota,
+		SearchFailureKind::ModelNotFound => failure::Kind::ModelNotFound,
+		SearchFailureKind::Transport => failure::Kind::Transport,
+		SearchFailureKind::Timeout => failure::Kind::Timeout,
+		SearchFailureKind::Provider => failure::Kind::Provider,
 	}
 }
 fn usage_response(report: UsageReport) -> pb::UsageResponse {
@@ -3176,7 +3189,7 @@ fn usage_response(report: UsageReport) -> pb::UsageResponse {
 					.credits
 					.into_vec()
 					.into_iter()
-					.map(|credit| pb::usage_response::reset_credits::Credit {
+					.map(|credit| reset_credits::Credit {
 						granted_at_ms: credit.granted_at.map(system_time_ms),
 						expires_at_ms: credit.expires_at.map(system_time_ms),
 						status:        credit.status.map(|value| value.as_str().to_owned()),
@@ -3188,10 +3201,10 @@ fn usage_response(report: UsageReport) -> pb::UsageResponse {
 			.into_iter()
 			.map(|window| pb::usage_response::Window {
 				kind: match window.kind {
-					UsageWindowKind::RateLimit => pb::usage_response::window::Kind::RateLimit,
-					UsageWindowKind::Quota => pb::usage_response::window::Kind::Quota,
-					UsageWindowKind::Billing => pb::usage_response::window::Kind::Billing,
-					UsageWindowKind::Balance => pb::usage_response::window::Kind::Balance,
+					UsageWindowKind::RateLimit => window::Kind::RateLimit,
+					UsageWindowKind::Quota => window::Kind::Quota,
+					UsageWindowKind::Billing => window::Kind::Billing,
+					UsageWindowKind::Balance => window::Kind::Balance,
 				} as i32,
 				dimension: window.dimension.as_str().to_owned(),
 				consumed: window.amount.consumed.map(|value| value.units),
@@ -3199,23 +3212,23 @@ fn usage_response(report: UsageReport) -> pb::UsageResponse {
 				limit: window.amount.limit.map(|value| value.units),
 				resets_at_ms: window.resets_at.map(system_time_ms),
 				accuracy: match window.source {
-					UsageSource::Provider | UsageSource::Measured => pb::usage::Accuracy::Exact,
-					UsageSource::Estimated => pb::usage::Accuracy::Estimated,
-					UsageSource::Mixed => pb::usage::Accuracy::Mixed,
-					UsageSource::Unknown => pb::usage::Accuracy::Unspecified,
+					UsageSource::Provider | UsageSource::Measured => usage::Accuracy::Exact,
+					UsageSource::Estimated => usage::Accuracy::Estimated,
+					UsageSource::Mixed => usage::Accuracy::Mixed,
+					UsageSource::Unknown => usage::Accuracy::Unspecified,
 				} as i32,
 				observed_at_ms: system_time_ms(window.observed_at),
 				id: window.id.as_str().to_owned(),
 				label: window.label.map(|value| value.as_str().to_owned()),
 				scope: window.scope.map(|value| value.as_str().to_owned()),
 				unit: match window.amount.unit {
-					UsageUnit::Percent => pb::usage_response::window::Unit::Percent,
-					UsageUnit::Tokens => pb::usage_response::window::Unit::Tokens,
-					UsageUnit::Requests => pb::usage_response::window::Unit::Requests,
-					UsageUnit::Usd => pb::usage_response::window::Unit::Usd,
-					UsageUnit::Minutes => pb::usage_response::window::Unit::Minutes,
-					UsageUnit::Bytes => pb::usage_response::window::Unit::Bytes,
-					UsageUnit::Unknown => pb::usage_response::window::Unit::Unknown,
+					UsageUnit::Percent => window::Unit::Percent,
+					UsageUnit::Tokens => window::Unit::Tokens,
+					UsageUnit::Requests => window::Unit::Requests,
+					UsageUnit::Usd => window::Unit::Usd,
+					UsageUnit::Minutes => window::Unit::Minutes,
+					UsageUnit::Bytes => window::Unit::Bytes,
+					UsageUnit::Unknown => window::Unit::Unknown,
 				} as i32,
 				consumed_decimal_exponent: window
 					.amount
@@ -3230,10 +3243,10 @@ fn usage_response(report: UsageReport) -> pb::UsageResponse {
 					.limit
 					.map_or(0, |value| u32::from(value.decimal_exponent)),
 				status: window.status.map(|status| match status {
-					UsageStatus::Ok => pb::usage_response::window::Status::Ok,
-					UsageStatus::Warning => pb::usage_response::window::Status::Warning,
-					UsageStatus::Exhausted => pb::usage_response::window::Status::Exhausted,
-					UsageStatus::Unknown => pb::usage_response::window::Status::Unknown,
+					UsageStatus::Ok => window::Status::Ok,
+					UsageStatus::Warning => window::Status::Warning,
+					UsageStatus::Exhausted => window::Status::Exhausted,
+					UsageStatus::Unknown => window::Status::Unknown,
 				} as i32),
 				duration_ms: window
 					.duration
@@ -3249,23 +3262,23 @@ fn usage_response(report: UsageReport) -> pb::UsageResponse {
 			.collect(),
 	}
 }
-fn realtime_audio_format(encoding: i32) -> Setting<AudioFormat> {
+fn realtime_audio_format(encoding: i32) -> Setting<call::AudioFormat> {
 	match pb::AudioEncoding::try_from(encoding).unwrap_or(pb::AudioEncoding::Unspecified) {
-		pb::AudioEncoding::Mp3 => Setting::Prefer(AudioFormat::Mp3),
-		pb::AudioEncoding::Pcm16 => Setting::Prefer(AudioFormat::Pcm16),
-		pb::AudioEncoding::Wav => Setting::Prefer(AudioFormat::Wav),
-		pb::AudioEncoding::Opus => Setting::Prefer(AudioFormat::Opus),
-		pb::AudioEncoding::Aac => Setting::Prefer(AudioFormat::Aac),
-		pb::AudioEncoding::Flac => Setting::Prefer(AudioFormat::Flac),
+		pb::AudioEncoding::Mp3 => Setting::Prefer(call::AudioFormat::Mp3),
+		pb::AudioEncoding::Pcm16 => Setting::Prefer(call::AudioFormat::Pcm16),
+		pb::AudioEncoding::Wav => Setting::Prefer(call::AudioFormat::Wav),
+		pb::AudioEncoding::Opus => Setting::Prefer(call::AudioFormat::Opus),
+		pb::AudioEncoding::Aac => Setting::Prefer(call::AudioFormat::Aac),
+		pb::AudioEncoding::Flac => Setting::Prefer(call::AudioFormat::Flac),
 		pb::AudioEncoding::Unspecified => Setting::Unset,
 	}
 }
 
 fn realtime_input(frame: pb::RealtimeFrame) -> Result<RealtimeInput, Status> {
 	match frame.frame {
-		Some(pb::realtime_frame::Frame::Audio(bytes)) => Ok(RealtimeInput::Audio(bytes)),
-		Some(pb::realtime_frame::Frame::Text(text)) => Ok(RealtimeInput::Text(text.into())),
-		Some(pb::realtime_frame::Frame::ToolResult(result)) => Ok(RealtimeInput::ToolResult {
+		Some(realtime_frame::Frame::Audio(bytes)) => Ok(RealtimeInput::Audio(bytes)),
+		Some(realtime_frame::Frame::Text(text)) => Ok(RealtimeInput::Text(text.into())),
+		Some(realtime_frame::Frame::ToolResult(result)) => Ok(RealtimeInput::ToolResult {
 			call:     ToolCallId::from(result.call_id.as_str()),
 			name:     (!result.name.is_empty()).then(|| result.name.as_str().into()),
 			content:  result
@@ -3276,10 +3289,10 @@ fn realtime_input(frame: pb::RealtimeFrame) -> Result<RealtimeInput, Status> {
 				.into(),
 			is_error: result.is_error,
 		}),
-		Some(pb::realtime_frame::Frame::Commit(_)) => Ok(RealtimeInput::Commit),
-		Some(pb::realtime_frame::Frame::CancelResponse(_)) => Ok(RealtimeInput::CancelResponse),
-		Some(pb::realtime_frame::Frame::Close(_)) => Ok(RealtimeInput::Close),
-		Some(pb::realtime_frame::Frame::Open(_)) => {
+		Some(realtime_frame::Frame::Commit(_)) => Ok(RealtimeInput::Commit),
+		Some(realtime_frame::Frame::CancelResponse(_)) => Ok(RealtimeInput::CancelResponse),
+		Some(realtime_frame::Frame::Close(_)) => Ok(RealtimeInput::Close),
+		Some(realtime_frame::Frame::Open(_)) => {
 			Err(Status::invalid_argument("Realtime open may appear only once"))
 		},
 		None => Err(Status::invalid_argument("Realtime frame variant is required")),
@@ -3288,15 +3301,15 @@ fn realtime_input(frame: pb::RealtimeFrame) -> Result<RealtimeInput, Status> {
 
 fn realtime_event(event: CanonicalRealtimeEvent) -> Result<pb::RealtimeEvent, Status> {
 	let event = match event {
-		CanonicalRealtimeEvent::Ready => pb::realtime_event::Event::Ready(pb::RealtimeReady {}),
-		CanonicalRealtimeEvent::Audio(chunk) => pb::realtime_event::Event::Audio(pb::RealtimeAudio {
+		CanonicalRealtimeEvent::Ready => realtime_event::Event::Ready(pb::RealtimeReady {}),
+		CanonicalRealtimeEvent::Audio(chunk) => realtime_event::Event::Audio(pb::RealtimeAudio {
 			audio:    chunk.bytes,
 			start_ms: chunk.start_ms,
 			end_ms:   chunk.end_ms,
 			r#final:  chunk.final_chunk,
 		}),
 		CanonicalRealtimeEvent::InputCommitted => {
-			pb::realtime_event::Event::InputCommitted(pb::RealtimeInputCommitted {})
+			realtime_event::Event::InputCommitted(pb::RealtimeInputCommitted {})
 		},
 		CanonicalRealtimeEvent::Phase(_)
 		| CanonicalRealtimeEvent::Transcript(_)
@@ -3307,31 +3320,29 @@ fn realtime_event(event: CanonicalRealtimeEvent) -> Result<pb::RealtimeEvent, St
 			));
 		},
 		CanonicalRealtimeEvent::CloseReceipt(_) => {
-			pb::realtime_event::Event::Closed(pb::RealtimeClosed {})
+			realtime_event::Event::Closed(pb::RealtimeClosed {})
 		},
-		CanonicalRealtimeEvent::Closed => pb::realtime_event::Event::Closed(pb::RealtimeClosed {}),
-		CanonicalRealtimeEvent::Chat(chat) => {
-			pb::realtime_event::Event::Chat(realtime_chat_event(chat)?)
-		},
+		CanonicalRealtimeEvent::Closed => realtime_event::Event::Closed(pb::RealtimeClosed {}),
+		CanonicalRealtimeEvent::Chat(chat) => realtime_event::Event::Chat(realtime_chat_event(chat)?),
 	};
 	Ok(pb::RealtimeEvent { event: Some(event) })
 }
 
 fn realtime_chat_event(event: ChatEvent) -> Result<pb::TurnEvent, Status> {
 	let event = match event {
-		ChatEvent::Started(_) => pb::turn_event::Event::Accepted(pb::Accepted { replay: false }),
+		ChatEvent::Started(_) => turn_event::Event::Accepted(pb::Accepted { replay: false }),
 		ChatEvent::BlockStarted { index, kind } => {
 			let kind = match kind {
-				BlockKind::Text => pb::part_start::Kind::Text,
-				BlockKind::Thinking => pb::part_start::Kind::Thinking,
-				BlockKind::ToolCall => pb::part_start::Kind::ToolCall,
+				BlockKind::Text => part_start::Kind::Text,
+				BlockKind::Thinking => part_start::Kind::Thinking,
+				BlockKind::ToolCall => part_start::Kind::ToolCall,
 				BlockKind::Artifact => {
 					return Err(Status::failed_precondition(
 						"realtime chat artifacts require an explicit RPC artifact projection",
 					));
 				},
 			};
-			pb::turn_event::Event::PartStart(pb::PartStart {
+			turn_event::Event::PartStart(pb::PartStart {
 				index,
 				kind: kind as i32,
 				tool_call_id: String::new(),
@@ -3339,35 +3350,35 @@ fn realtime_chat_event(event: ChatEvent) -> Result<pb::TurnEvent, Status> {
 			})
 		},
 		ChatEvent::TextDelta { index, text } | ChatEvent::ThinkingDelta { index, text } => {
-			pb::turn_event::Event::PartDelta(pb::PartDelta {
+			turn_event::Event::PartDelta(pb::PartDelta {
 				index,
 				chunk: Bytes::copy_from_slice(text.as_bytes()),
 			})
 		},
 		ChatEvent::ToolCallStarted { index, id, name } => {
-			pb::turn_event::Event::PartStart(pb::PartStart {
+			turn_event::Event::PartStart(pb::PartStart {
 				index,
-				kind: pb::part_start::Kind::ToolCall as i32,
+				kind: part_start::Kind::ToolCall as i32,
 				tool_call_id: id.as_str().to_owned(),
 				tool_name: name.as_str().to_owned(),
 			})
 		},
 		ChatEvent::ToolArgumentsDelta { index, bytes } => {
-			pb::turn_event::Event::PartDelta(pb::PartDelta { index, chunk: bytes })
+			turn_event::Event::PartDelta(pb::PartDelta { index, chunk: bytes })
 		},
 		ChatEvent::ToolCallReady { index, .. } => {
-			pb::turn_event::Event::PartEnd(pb::PartEnd { index, signature: Bytes::new() })
+			turn_event::Event::PartEnd(pb::PartEnd { index, signature: Bytes::new() })
 		},
 		ChatEvent::Artifact { .. } => {
 			return Err(Status::failed_precondition(
 				"realtime chat artifacts require an explicit RPC artifact projection",
 			));
 		},
-		ChatEvent::Usage(update) => pb::turn_event::Event::Attempt(pb::Attempt {
+		ChatEvent::Usage(update) => turn_event::Event::Attempt(pb::Attempt {
 			number: 0,
 			reason: format!("usage:{}:{}", update.usage.input_tokens, update.usage.output_tokens),
 		}),
-		ChatEvent::Completed(completion) => pb::turn_event::Event::Outcome(build_turn_outcome(
+		ChatEvent::Completed(completion) => turn_event::Event::Outcome(build_turn_outcome(
 			&TurnProjection::default(),
 			&completion,
 			None,
@@ -3467,10 +3478,8 @@ const fn video_dimensions(resolution: i32, aspect_ratio: i32) -> Setting<Dimensi
 async fn run_generation(
 	mut session: omp_inference::answer::GenerationSession<VideoArtifact>,
 	status: Arc<Mutex<pb::GenerationStatus>>,
-	updates: tokio::sync::broadcast::Sender<pb::GenerationStatus>,
-	cancel: flume::Receiver<
-		tokio::sync::oneshot::Sender<Result<JobCancellationReceipt, JobCancelError>>,
-	>,
+	updates: broadcast::Sender<pb::GenerationStatus>,
+	cancel: Receiver<oneshot::Sender<Result<JobCancellationReceipt, JobCancelError>>>,
 ) {
 	let mut cancel_open = true;
 	loop {
@@ -3483,7 +3492,7 @@ async fn run_generation(
 				let result = session.cancel().await;
 				if result.as_ref().is_ok_and(|receipt| receipt.acknowledged) {
 					publish_generation(&status, &updates, |status| {
-						status.state = pb::generation_status::State::Cancelled as i32;
+						status.state = generation_status::State::Cancelled as i32;
 					});
 				}
 				let terminal = result.as_ref().is_ok_and(|receipt| receipt.acknowledged);
@@ -3494,7 +3503,7 @@ async fn run_generation(
 				let Some(event) = event else {
 					if !generation_terminal(status.lock().state) {
 						publish_generation(&status, &updates, |status| {
-							status.state = pb::generation_status::State::Failed as i32;
+							status.state = generation_status::State::Failed as i32;
 							status.detail = "generation stream ended before a terminal event".into();
 						});
 					}
@@ -3502,10 +3511,10 @@ async fn run_generation(
 				};
 				match event {
 					Ok(GenerationEvent::Queued { .. }) => publish_generation(&status, &updates, |status| {
-						status.state = pb::generation_status::State::Queued as i32;
+						status.state = generation_status::State::Queued as i32;
 					}),
 					Ok(GenerationEvent::Progress { completed, total }) => publish_generation(&status, &updates, |status| {
-						status.state = pb::generation_status::State::Running as i32;
+						status.state = generation_status::State::Running as i32;
 						status.progress_percent = total
 							.filter(|total| *total != 0)
 							.map_or(0.0, |total| completed as f64 * 100.0 / total as f64);
@@ -3522,7 +3531,7 @@ async fn run_generation(
 						}),
 						Err(error) => {
 							publish_generation(&status, &updates, |status| {
-								status.state = pb::generation_status::State::Failed as i32;
+								status.state = generation_status::State::Failed as i32;
 								status.detail = error.message().into();
 							});
 							break;
@@ -3530,7 +3539,7 @@ async fn run_generation(
 					},
 					Ok(GenerationEvent::Completed(summary)) => {
 						publish_generation(&status, &updates, |status| {
-							status.state = pb::generation_status::State::Completed as i32;
+							status.state = generation_status::State::Completed as i32;
 							status.progress_percent = 100.0;
 							status.usage = Some(proto_usage(summary.usage));
 							status.cost = Some(proto_cost(summary.cost));
@@ -3539,7 +3548,7 @@ async fn run_generation(
 					},
 					Err(error) => {
 						publish_generation(&status, &updates, |status| {
-							status.state = pb::generation_status::State::Failed as i32;
+							status.state = generation_status::State::Failed as i32;
 							status.detail = format!("{:?}", error.kind);
 						});
 						break;
@@ -3552,7 +3561,7 @@ async fn run_generation(
 
 fn publish_generation(
 	status: &Mutex<pb::GenerationStatus>,
-	updates: &tokio::sync::broadcast::Sender<pb::GenerationStatus>,
+	updates: &broadcast::Sender<pb::GenerationStatus>,
 	update: impl FnOnce(&mut pb::GenerationStatus),
 ) {
 	let snapshot = {
@@ -3566,10 +3575,10 @@ fn publish_generation(
 
 fn generation_terminal(state: i32) -> bool {
 	matches!(
-		pb::generation_status::State::try_from(state),
-		Ok(pb::generation_status::State::Completed
-			| pb::generation_status::State::Failed
-			| pb::generation_status::State::Cancelled)
+		generation_status::State::try_from(state),
+		Ok(generation_status::State::Completed
+			| generation_status::State::Failed
+			| generation_status::State::Cancelled)
 	)
 }
 
@@ -3584,6 +3593,7 @@ fn system_time_ms(time: SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
+	use omp_catalog::snapshot;
 	use omp_inference::{
 		RouteId,
 		error::{ErrorPhase, RetryAction},
@@ -3626,15 +3636,11 @@ mod tests {
 		}
 	}
 
-	fn grammar_tool(
-		name: &str,
-		syntax: pb::tool_def::grammar::Syntax,
-		definition: &'static str,
-	) -> pb::ToolDef {
+	fn grammar_tool(name: &str, syntax: grammar::Syntax, definition: &'static str) -> pb::ToolDef {
 		pb::ToolDef {
 			name:        name.to_owned(),
 			description: String::new(),
-			input:       Some(pb::tool_def::Input::Grammar(pb::tool_def::Grammar {
+			input:       Some(tool_def::Input::Grammar(pb::tool_def::Grammar {
 				syntax:     syntax as i32,
 				definition: definition.to_owned(),
 			})),
@@ -3669,7 +3675,7 @@ mod tests {
 			)
 			.expect("grammar fixture registers");
 		let params = pb::ChatParams {
-			tools: vec![grammar_tool("edit", pb::tool_def::grammar::Syntax::Lark, "stale: CALLER")],
+			tools: vec![grammar_tool("edit", grammar::Syntax::Lark, "stale: CALLER")],
 			..Default::default()
 		};
 
@@ -3687,13 +3693,9 @@ mod tests {
 	#[test]
 	fn tool_def_grammar_projection_preserves_supported_syntax_and_definition() {
 		let cases = [
-			(
-				pb::tool_def::grammar::Syntax::Lark,
-				ToolGrammarSyntax::Lark,
-				"start: WORD\n%import common.WORD",
-			),
-			(pb::tool_def::grammar::Syntax::Regex, ToolGrammarSyntax::Regex, r"^(yes|no)\s+\d+$"),
-			(pb::tool_def::grammar::Syntax::Ebnf, ToolGrammarSyntax::Ebnf, r#"root = "yes" | "no";"#),
+			(grammar::Syntax::Lark, ToolGrammarSyntax::Lark, "start: WORD\n%import common.WORD"),
+			(grammar::Syntax::Regex, ToolGrammarSyntax::Regex, r"^(yes|no)\s+\d+$"),
+			(grammar::Syntax::Ebnf, ToolGrammarSyntax::Ebnf, r#"root = "yes" | "no";"#),
 		];
 		for (wire_syntax, expected_syntax, definition) in cases {
 			let projected = tool_definition(&grammar_tool("constrained", wire_syntax, definition))
@@ -3708,10 +3710,9 @@ mod tests {
 
 	#[test]
 	fn tool_def_rejects_unspecified_unknown_and_missing_input() {
-		for syntax in [pb::tool_def::grammar::Syntax::Unspecified as i32, i32::MAX] {
-			let mut tool =
-				grammar_tool("constrained", pb::tool_def::grammar::Syntax::Lark, "start: WORD");
-			let Some(pb::tool_def::Input::Grammar(grammar)) = tool.input.as_mut() else {
+		for syntax in [grammar::Syntax::Unspecified as i32, i32::MAX] {
+			let mut tool = grammar_tool("constrained", grammar::Syntax::Lark, "start: WORD");
+			let Some(tool_def::Input::Grammar(grammar)) = tool.input.as_mut() else {
 				unreachable!();
 			};
 			grammar.syntax = syntax;
@@ -3730,7 +3731,7 @@ mod tests {
 			let tool = pb::ToolDef {
 				name:        "json".to_owned(),
 				description: String::new(),
-				input:       Some(pb::tool_def::Input::JsonSchema(pb::tool_def::JsonSchema {
+				input:       Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
 					schema_json: Bytes::from_static(br#"{"type":"object"}"#),
 					strict,
 				})),
@@ -3746,7 +3747,7 @@ mod tests {
 
 	#[test]
 	fn model_card_exposes_gateway_discovery_metadata() {
-		let mut model = omp_catalog::snapshot::Catalog::embedded()
+		let mut model = snapshot::Catalog::embedded()
 			.models()
 			.iter()
 			.find(|model| model.capabilities.chat.is_some())
@@ -3924,7 +3925,7 @@ mod tests {
 	#[track_caller]
 	fn expect_turn_error(event: pb::TurnEvent) -> pb::TurnError {
 		match event.event {
-			Some(pb::turn_event::Event::Error(error)) => error,
+			Some(turn_event::Event::Error(error)) => error,
 			other => panic!("expected a turn error event, got {other:?}"),
 		}
 	}
@@ -3935,14 +3936,14 @@ mod tests {
 		let no_content = empty_stop_error(ErrorKind::EmptyCompletion, ExecutionReceipt::default());
 
 		let thought_only = expect_turn_error(inference_turn_error(thought_only));
-		assert_eq!(thought_only.kind, pb::turn_error::Kind::EmptyOutput as i32);
+		assert_eq!(thought_only.kind, turn_error::Kind::EmptyOutput as i32);
 		assert_eq!(thought_only.diagnostics.len(), 1);
 		assert_eq!(thought_only.diagnostics[0].code, omp_agent::empty_stop::NO_FINAL_OUTPUT);
 
 		// Zero-block empty stops join the session-level bounded continuation
 		// instead of failing as opaque upstream errors.
 		let no_content = expect_turn_error(inference_turn_error(no_content));
-		assert_eq!(no_content.kind, pb::turn_error::Kind::EmptyOutput as i32);
+		assert_eq!(no_content.kind, turn_error::Kind::EmptyOutput as i32);
 		assert_eq!(no_content.diagnostics.len(), 1);
 		assert_eq!(no_content.diagnostics[0].code, omp_agent::empty_stop::EMPTY);
 	}
@@ -3952,7 +3953,7 @@ mod tests {
 		let error =
 			empty_stop_error(ErrorKind::EmptyCompletion, empty_stop_receipt("no-content", 42));
 		let error = expect_turn_error(inference_turn_error(error));
-		assert_eq!(error.kind, pb::turn_error::Kind::EmptyOutput as i32);
+		assert_eq!(error.kind, turn_error::Kind::EmptyOutput as i32);
 		assert_eq!(error.diagnostics.len(), 1);
 		assert_eq!(error.diagnostics[0].code, omp_agent::empty_stop::BILLED_OUTPUT);
 		assert_eq!(error.diagnostics[0].detail, "42");
@@ -3989,11 +3990,10 @@ mod tests {
 		)
 		.provider(ProviderId::from("kimi-code"))
 		.detail(ErrorDetail::provider(sf!("device authorization expired")));
-		let Some(pb::turn_event::Event::Error(error)) = inference_turn_error(authentication).event
-		else {
+		let Some(turn_event::Event::Error(error)) = inference_turn_error(authentication).event else {
 			panic!("authentication failure must project a turn error");
 		};
-		assert_eq!(error.kind, pb::turn_error::Kind::Auth as i32);
+		assert_eq!(error.kind, turn_error::Kind::Auth as i32);
 		assert!(error.detail.contains("/login kimi-code"));
 		assert!(error.detail.contains("omp auth login kimi-code"));
 		assert!(error.detail.contains("device authorization expired"));
@@ -4004,11 +4004,11 @@ mod tests {
 		let event = invoke_timeout("invoke-9");
 		assert!(matches!(
 			event.event,
-			Some(pb::turn_event::Event::Error(pb::TurnError {
+			Some(turn_event::Event::Error(pb::TurnError {
 				kind,
 				detail,
 				..
-			})) if kind == pb::turn_error::Kind::InvokeTimeout as i32
+			})) if kind == turn_error::Kind::InvokeTimeout as i32
 				&& detail.contains("invoke-9")
 		));
 	}
@@ -4025,8 +4025,8 @@ mod tests {
 			invocation_id: "invoke-1".to_owned(),
 			tool_result: Some(thread_pb::ToolResult {
 				parts: vec![
-					thread_pb::Part { kind: Some(thread_pb::part::Kind::Text("first".to_owned())) },
-					thread_pb::Part { kind: Some(thread_pb::part::Kind::Text(" second".to_owned())) },
+					thread_pb::Part { kind: Some(part::Kind::Text("first".to_owned())) },
+					thread_pb::Part { kind: Some(part::Kind::Text(" second".to_owned())) },
 				],
 				is_error: true,
 				..Default::default()
@@ -4054,12 +4054,12 @@ mod tests {
 			events.as_slice(),
 			[
 				Ok(pb::TurnEvent {
-					event: Some(pb::turn_event::Event::Accepted(pb::Accepted {
+					event: Some(turn_event::Event::Accepted(pb::Accepted {
 						replay: true
 					}))
 				}),
 				Ok(pb::TurnEvent {
-					event: Some(pb::turn_event::Event::Outcome(actual))
+					event: Some(turn_event::Event::Outcome(actual))
 				}),
 			] if actual == &outcome
 		));

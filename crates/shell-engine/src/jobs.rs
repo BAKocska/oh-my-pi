@@ -2,13 +2,18 @@
 
 #[cfg(windows)]
 use std::os::windows::io::OwnedHandle;
-use std::{collections::VecDeque, fmt::Display, time::Duration};
+use std::{
+	collections::VecDeque,
+	fmt::{self, Display},
+	iter,
+	time::Duration,
+};
 
 use futures::FutureExt;
+use tokio::{task::JoinHandle, time};
 
 use crate::{ExecutionResult, error, processes, sys, trace_categories, traps};
-
-pub(crate) type JobJoinHandle = tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>;
+pub(crate) type JobJoinHandle = JoinHandle<Result<ExecutionResult, error::Error>>;
 pub(crate) type JobResult = (Job, Result<ExecutionResult, error::Error>);
 
 const WAIT_NEXT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -375,7 +380,7 @@ impl JobManager {
 				return Ok(None);
 			}
 
-			tokio::time::sleep(WAIT_NEXT_POLL_INTERVAL).await;
+			time::sleep(WAIT_NEXT_POLL_INTERVAL).await;
 		}
 	}
 
@@ -430,7 +435,7 @@ pub enum JobState {
 }
 
 impl Display for JobState {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Unknown => write!(f, "Unknown"),
 			Self::Running => write!(f, "Running"),
@@ -452,7 +457,7 @@ pub enum JobAnnotation {
 }
 
 impl Display for JobAnnotation {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::None => write!(f, ""),
 			Self::Current => write!(f, "+"),
@@ -483,7 +488,7 @@ pub struct Job {
 }
 
 impl Display for Job {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(
 			f,
 			"[{}]{:3}{}\t{}",
@@ -706,7 +711,7 @@ impl Job {
 	/// Iterates over the external process IDs that make up this job.
 	pub fn process_ids(
 		&self,
-	) -> impl DoubleEndedIterator<Item = sys::process::ProcessId> + Clone + std::iter::FusedIterator + '_
+	) -> impl DoubleEndedIterator<Item = sys::process::ProcessId> + Clone + iter::FusedIterator + '_
 	{
 		self.tasks.iter().filter_map(|task| match task {
 			JobTask::External(process) => process.pid(),

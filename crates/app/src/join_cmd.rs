@@ -1,37 +1,40 @@
 //! Replica-backed standalone collaboration guest composition.
 
-use std::{io::IsTerminal as _, sync::Arc, time::Duration};
+use std::{env, io, io::IsTerminal as _, sync::Arc, time::Duration};
 
 use miette::IntoDiagnostic as _;
-use omp_collab::{guest::GuestRelayPump, link::CollabLink};
+use omp_collab::{guest::GuestRelayPump, link::CollabLink, presence::CollabRole};
 use omp_core::Str;
 use omp_driver::collab::session::{
 	CollabOwnerCommand, CollabSessionAuthority, spawn_session_owner,
 };
 use omp_executor::Executor;
 use omp_tool::Registry;
+use tokio::runtime;
+use tokio_util::context::TokioContext;
 
-use crate::cli::JoinArgs;
+use crate::{chat_ui, cli::JoinArgs};
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Parses, joins, projects, and presents one remote collaboration until quit.
 pub async fn run(executor: Executor, args: JoinArgs) -> miette::Result<()> {
-	if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+	if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
 		return Err(miette::miette!("omp join requires an interactive terminal"));
 	}
 	let link_text = args.link.trim();
 	let link = CollabLink::parse(link_text.as_str()).into_diagnostic()?;
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
-	let local_cwd = std::env::current_dir().into_diagnostic()?;
+	let local_cwd = env::current_dir().into_diagnostic()?;
 	let settings = omp_driver::settings::current(&data_dir).into_diagnostic()?;
 	let display_name = settings.collab.resolved_display_name();
 
-	let (pump, replica) =
-		GuestRelayPump::new(data_dir.join("collab"), local_cwd, crate::chat_ui::now_ms());
+	let (pump, replica) = GuestRelayPump::new(data_dir.join("collab"), local_cwd, chat_ui::now_ms());
 	let replica_shutdown = replica.clone();
-	let mut pump_task = executor.spawn(pump.run());
+	// Pool threads lack a tokio reactor; the relay pump's tokio timers need the
+	// app runtime re-entered on every poll.
+	let mut pump_task = executor.spawn(TokioContext::new(pump.run(), runtime::Handle::current()));
 	let (authority, collab) = CollabSessionAuthority::with_guest_replica(Some(replica.clone()));
 	let mut owner_task = spawn_session_owner(authority);
 
@@ -51,7 +54,7 @@ pub async fn run(executor: Executor, args: JoinArgs) -> miette::Result<()> {
 				})
 				.await
 				.map_err(|_| miette::miette!("timed out waiting for the collaboration snapshot"))??;
-			crate::chat_ui::run_guest(
+			chat_ui::run_guest(
 				executor.clone(),
 				replica,
 				collab.clone(),
@@ -66,7 +69,7 @@ pub async fn run(executor: Executor, args: JoinArgs) -> miette::Result<()> {
 
 	if collab
 		.presence()
-		.is_some_and(|facts| facts.role() == omp_collab::presence::CollabRole::Guest)
+		.is_some_and(|facts| facts.role() == CollabRole::Guest)
 	{
 		let _ = collab.request(CollabOwnerCommand::Leave).await;
 	}

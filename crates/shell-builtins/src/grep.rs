@@ -4,10 +4,13 @@
 
 use std::{
 	borrow::Cow,
+	cell,
 	ffi::{OsStr, OsString},
+	fs,
 	fs::File,
 	io::{self, Read, Write},
 	path::{Path, PathBuf},
+	sync::atomic,
 };
 
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
@@ -1079,12 +1082,12 @@ fn search_dir<M: Matcher, W: Write>(
 ) -> io::Result<bool> {
 	let request = grep_walk_request(resolved, follow_links);
 	let mut any = false;
-	let had_error_state = std::cell::Cell::new(*had_error);
+	let had_error_state = cell::Cell::new(*had_error);
 	let cancel = host.cancel_flag();
 	let mut walk_err = host.stderr_clone();
 	let walk = request.for_each_entry_with_heartbeat(
 		|| {
-			if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+			if cancel.load(atomic::Ordering::Relaxed) {
 				Err(io::Error::from(io::ErrorKind::Interrupted))
 			} else {
 				Ok::<(), io::Error>(())
@@ -1352,7 +1355,7 @@ fn execute_search<M: Matcher>(
 		}
 
 		let resolved = host.resolve(operand);
-		match std::fs::metadata(&resolved) {
+		match fs::metadata(&resolved) {
 			Ok(metadata) if metadata.is_dir() => match directory_action {
 				DirectoryAction::Recurse => {
 					if rules.allows_dir(Path::new(operand)) {
@@ -1565,12 +1568,18 @@ pub(crate) fn grep_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)]
+	use std::os::fd;
 	use std::{
+		fs,
 		io::{self, Read, Write},
 		sync::Arc,
 	};
 
-	use omp_shell_engine::openfiles;
+	use omp_shell_engine::{
+		error,
+		openfiles::{self, OpenFile},
+	};
 	use parking_lot::Mutex;
 
 	use super::*;
@@ -1631,13 +1640,13 @@ mod tests {
 		}
 
 		#[cfg(unix)]
-		fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, omp_shell_engine::Error> {
-			Err(omp_shell_engine::error::ErrorKind::CannotConvertToNativeFd.into())
+		fn try_clone_to_owned(&self) -> Result<fd::OwnedFd, omp_shell_engine::Error> {
+			Err(error::ErrorKind::CannotConvertToNativeFd.into())
 		}
 
 		#[cfg(unix)]
-		fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, omp_shell_engine::Error> {
-			Err(omp_shell_engine::error::ErrorKind::CannotConvertToNativeFd.into())
+		fn try_borrow_as_fd(&self) -> Result<fd::BorrowedFd<'_>, omp_shell_engine::Error> {
+			Err(error::ErrorKind::CannotConvertToNativeFd.into())
 		}
 	}
 
@@ -1663,9 +1672,9 @@ mod tests {
 	fn broken_pipe_on_stdout_is_silent_and_exits_141() {
 		let parsed = Grep::try_parse_from(["grep", "hit"]).unwrap();
 		let (mut host, capture) = Host::for_test("grep", "hit\nmiss\nhit\n", "/");
-		let (reader, writer) = std::io::pipe().unwrap();
+		let (reader, writer) = io::pipe().unwrap();
 		drop(reader);
-		host.stdout = openfiles::OpenFile::from(writer);
+		host.stdout = OpenFile::from(writer);
 
 		let code = parsed.run(&mut host);
 
@@ -1686,8 +1695,8 @@ mod tests {
 	#[test]
 	fn pattern_file_is_resolved_against_shell_cwd() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("patterns"), "alpha\nbeta\n").unwrap();
-		std::fs::write(tree.path().join("haystack"), "alpha\ngamma\nbeta\n").unwrap();
+		fs::write(tree.path().join("patterns"), "alpha\nbeta\n").unwrap();
+		fs::write(tree.path().join("haystack"), "alpha\ngamma\nbeta\n").unwrap();
 		let (code, capture) = run_util::<Grep>(&["-f", "patterns", "haystack"], "", tree.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "alpha\nbeta\n");
@@ -1711,10 +1720,10 @@ mod tests {
 	#[test]
 	fn recursive_rules_filter_walk_and_preserve_relative_names() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("keep.rs"), "hit\n").unwrap();
-		std::fs::write(tree.path().join("drop.txt"), "hit\n").unwrap();
-		std::fs::create_dir(tree.path().join("vendor")).unwrap();
-		std::fs::write(tree.path().join("vendor/hidden.rs"), "hit\n").unwrap();
+		fs::write(tree.path().join("keep.rs"), "hit\n").unwrap();
+		fs::write(tree.path().join("drop.txt"), "hit\n").unwrap();
+		fs::create_dir(tree.path().join("vendor")).unwrap();
+		fs::write(tree.path().join("vendor/hidden.rs"), "hit\n").unwrap();
 		let (code, capture) = run_util::<Grep>(
 			&["-r", "--include=*.rs", "--exclude-dir=vendor", "hit", "."],
 			"",
@@ -1729,7 +1738,7 @@ mod tests {
 	#[test]
 	fn quiet_match_wins_over_later_error() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("hit"), "needle\n").unwrap();
+		fs::write(tree.path().join("hit"), "needle\n").unwrap();
 		let (code, capture) = run_util::<Grep>(&["-q", "needle", "hit", "missing"], "", tree.path());
 		assert_eq!(code, 0);
 		assert!(capture.out().is_empty());
@@ -1739,8 +1748,8 @@ mod tests {
 	#[test]
 	fn recursive_walk_observes_cancellation() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::create_dir(tree.path().join("root")).unwrap();
-		std::fs::write(tree.path().join("root/file"), "hit\n").unwrap();
+		fs::create_dir(tree.path().join("root")).unwrap();
+		fs::write(tree.path().join("root/file"), "hit\n").unwrap();
 		let parsed = Grep::try_parse_from(["grep", "-r", "hit", "root"]).unwrap();
 		let (mut host, capture) = Host::for_test("grep", Vec::new(), tree.path());
 		host.cancel_for_test();

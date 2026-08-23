@@ -21,6 +21,7 @@ use xutf::Text;
 
 use super::DiagramStyles;
 use crate::{
+	Style,
 	context::Charset,
 	rich::{Pipeline, RichSink, cell_width},
 };
@@ -955,7 +956,7 @@ fn role_changed(current: CellRole, next: CellRole, run: &str) -> bool {
 	!run.is_empty() && current != next
 }
 
-const fn style_for(role: CellRole, styles: DiagramStyles) -> crate::Style {
+const fn style_for(role: CellRole, styles: DiagramStyles) -> Style {
 	match role {
 		CellRole::Text => styles.text,
 		CellRole::Line => styles.line,
@@ -1110,9 +1111,11 @@ mod tests {
 	}
 
 	fn raster_text(raster: &Raster, width: u16) -> String {
-		let style = crate::Style::default();
+		use crate::rich::RichText;
+
+		let style = Style::default();
 		let styles = DiagramStyles { text: style, line: style, accent: style };
-		let mut output = crate::rich::RichText::default();
+		let mut output = RichText::default();
 		assert!(raster.emit(width, styles, &mut output));
 		output.row_text(0).to_owned()
 	}

@@ -6,7 +6,7 @@
 
 use std::{fmt, iter::FusedIterator, marker::PhantomData};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use smol_bitmap::SmolBitmap;
 
 use crate::sparse_index::TrySparseIndex;
@@ -145,8 +145,8 @@ impl<'de, K: TrySparseIndex + Deserialize<'de>> Deserialize<'de> for SparseSet<K
 					while let Some(key) = seq.next_element::<K>()? {
 						let index = key.index();
 						if prev_index.is_some_and(|prev| prev >= index) {
-							return Err(serde::de::Error::invalid_value(
-								serde::de::Unexpected::Unsigned(index as u64),
+							return Err(de::Error::invalid_value(
+								de::Unexpected::Unsigned(index as u64),
 								&"indices must be in ascending order",
 							));
 						}
@@ -161,7 +161,7 @@ impl<'de, K: TrySparseIndex + Deserialize<'de>> Deserialize<'de> for SparseSet<K
 		} else {
 			let bits = Deserialize::deserialize(deserializer)?;
 			let set = Self { bits, _phantom: PhantomData };
-			K::validate_sorted(set.bits.iter()).map_err(serde::de::Error::custom)?;
+			K::validate_sorted(set.bits.iter()).map_err(de::Error::custom)?;
 			Ok(set)
 		}
 	}

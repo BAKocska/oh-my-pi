@@ -62,7 +62,9 @@
 
 use std::{
 	cell::{Cell, RefCell},
+	ptr,
 	rc::Rc,
+	slice,
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -105,13 +107,14 @@ use parking_lot::Mutex;
 
 use super::{
 	ConfiguredPage, IpcHandler, NavDelegate, TitleObserver, add_user_script, check_main,
-	configure_page, install_observers, preflight_screen_capture, style_webview,
+	configure_page, eval, initial_load, install_observers, load_html, navigate,
+	preflight_screen_capture, style_webview,
 };
 use crate::{
 	error::{Error, Result},
 	event::{Frame, SharedState, WebViewEvent},
 	input::{Input, Key, Modifiers, MouseButton},
-	options::FrameConfig,
+	options::{FrameConfig, PageOptions},
 	remote::damage_rect,
 };
 
@@ -443,7 +446,7 @@ impl WkFrames {
 	/// Must run on the main thread ([`Error::MainThread`] otherwise) and the
 	/// host must keep pumping the main run loop afterwards.
 	pub(crate) fn create(
-		page: &crate::options::PageOptions,
+		page: &PageOptions,
 		config: FrameConfig,
 		events: flume::Sender<WebViewEvent>,
 		state: SharedState,
@@ -559,20 +562,20 @@ impl WkFrames {
 			scale,
 			event_seq: Cell::new(0),
 		};
-		super::initial_load(&view.webview, page)?;
+		initial_load(&view.webview, page)?;
 		Ok(view)
 	}
 
 	/// Navigate to `url`.
 	pub(crate) fn navigate(&self, url: &str) -> Result<()> {
 		check_main()?;
-		super::navigate(&self.webview, url)
+		navigate(&self.webview, url)
 	}
 
 	/// Replace the document with `html` (null origin).
 	pub(crate) fn load_html(&self, html: &str) -> Result<()> {
 		check_main()?;
-		super::load_html(&self.webview, html);
+		load_html(&self.webview, html);
 		Ok(())
 	}
 
@@ -580,7 +583,7 @@ impl WkFrames {
 	/// on the main thread.
 	pub(crate) fn eval(&self, js: &str, reply: Option<Box<dyn FnOnce(Str) + Send>>) -> Result<()> {
 		check_main()?;
-		super::eval(&self.webview, js, reply);
+		eval(&self.webview, js, reply);
 		Ok(())
 	}
 
@@ -700,7 +703,7 @@ impl WkFrames {
 					 t=document.elementFromPoint({x},{y}){SCROLL_EVENT_TEMPLATE}{x},clientY:{y},deltaX:\
 					 {dx},deltaY:{dy}{SCROLL_ACTION_TEMPLATE}{dx},{dy})}})()"
 				);
-				super::eval(&self.webview, &js, None);
+				eval(&self.webview, &js, None);
 			},
 			Input::KeyDown { key, modifiers } => {
 				let (code, chars) = key_params(key);
@@ -1119,7 +1122,7 @@ fn shareable_window(window_number: isize) -> Option<Retained<SCWindow>> {
 fn start_snapshot_timer(state: &Rc<SnapState>, fps_cap: Option<f32>) -> Retained<NSTimer> {
 	let interval = 1.0 / f64::from(fps_cap.unwrap_or(10.0).clamp(0.2, 30.0));
 	let tick_state = Rc::clone(state);
-	let tick = RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
+	let tick = RcBlock::new(move |_timer: ptr::NonNull<NSTimer>| {
 		if tick_state.pending.get() {
 			return;
 		}
@@ -1203,7 +1206,7 @@ fn rgba_of_image(image: &NSImage, width: u32, height: u32) -> Option<Vec<u8>> {
 	let rep = unsafe {
 		NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
 			NSBitmapImageRep::alloc(),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			w as isize,
 			h as isize,
 			8,
@@ -1240,7 +1243,7 @@ fn rgba_of_image(image: &NSImage, width: u32, height: u32) -> Option<Vec<u8>> {
 	for row in 0..h {
 		// SAFETY: `bitmapData` covers `h` rows of `stride` bytes each (row 0
 		// is the top row); the stride bound was checked above.
-		let src = unsafe { std::slice::from_raw_parts(data.add(row * stride).cast_const(), w * 4) };
+		let src = unsafe { slice::from_raw_parts(data.add(row * stride).cast_const(), w * 4) };
 		rgba[row * w * 4..][..w * 4].copy_from_slice(src);
 	}
 	Some(rgba)

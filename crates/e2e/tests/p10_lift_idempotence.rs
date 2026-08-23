@@ -12,7 +12,7 @@ use omp_e2e::{
 	Context as _, Result,
 	support::{DocServerTask, Scratch, tool_call_item, tool_result_item},
 };
-use omp_proto::thread::v1 as thread;
+use omp_proto::thread::v1::{self as thread, item};
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{
 	CallOutcome, CapsBase, Claims, ModelClass, Precedence, Presentation, Registry, Rev, ToolIdentity,
@@ -35,10 +35,10 @@ fn projected_pair(projected: &thread::Thread) -> (&thread::ToolCall, &thread::To
 	let [call_item, result_item] = projected.items.as_slice() else {
 		panic!("projection must retain exactly one call and its result")
 	};
-	let Some(thread::item::Kind::ToolCall(call)) = call_item.kind.as_ref() else {
+	let Some(item::Kind::ToolCall(call)) = call_item.kind.as_ref() else {
 		panic!("first projected item was not a tool call")
 	};
-	let Some(thread::item::Kind::ToolResult(result)) = result_item.kind.as_ref() else {
+	let Some(item::Kind::ToolResult(result)) = result_item.kind.as_ref() else {
 		panic!("second projected item was not a tool result")
 	};
 	(call, result)

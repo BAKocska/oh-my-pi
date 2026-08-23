@@ -1,4 +1,6 @@
 //! GNU-compatible numeric and symbolic file-mode parsing.
+#[cfg(unix)]
+use rustix::fs;
 
 /// Applies an octal mode expression to `current_mode`.
 pub(crate) fn parse_numeric(
@@ -160,7 +162,7 @@ pub(crate) fn parse_chmod(
 pub(crate) fn get_umask() -> u32 {
 	#[cfg(unix)]
 	{
-		let mask = rustix::process::umask(rustix::fs::Mode::empty());
+		let mask = rustix::process::umask(fs::Mode::empty());
 		let _ = rustix::process::umask(mask);
 		mask.bits().into()
 	}

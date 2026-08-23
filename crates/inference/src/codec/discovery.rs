@@ -8,13 +8,14 @@ use omp_catalog::{
 };
 use omp_core::Str;
 use serde::Deserialize;
+use url::Url;
 
 use crate::{
 	body::BodySource,
 	call::{DiscoveryRequest, OperationCall},
 	codec::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawEvent,
-		RequestMethod, SizeBounds,
+		RequestMethod, SizeBounds, ollama,
 	},
 	error::{Error, ErrorKind, ErrorPhase, RetryAction},
 	receipt::ExecutionReceipt,
@@ -178,7 +179,7 @@ fn discovery_uri(
 		joined.push('/');
 	}
 	joined.push_str(path);
-	let mut uri = url::Url::parse(&joined).map_err(|_| invalid_request())?;
+	let mut uri = Url::parse(&joined).map_err(|_| invalid_request())?;
 	match pagination {
 		DiscoveryPagination::SinglePage => {
 			if request.cursor.is_some() {
@@ -398,7 +399,7 @@ impl DiscoveryDecoder {
 		&self,
 		payload: &[u8],
 	) -> Result<(Vec<DiscoveredModel>, ProviderCursor), Error> {
-		let envelope = crate::codec::ollama::decode_tags(payload)?;
+		let envelope = ollama::decode_tags(payload)?;
 		let rows = envelope
 			.models
 			.into_iter()
@@ -635,6 +636,9 @@ fn protocol_error() -> Error {
 
 #[cfg(test)]
 mod tests {
+
+	use std::time;
+
 	use omp_core::sf;
 
 	use super::*;
@@ -687,7 +691,7 @@ mod tests {
 			path:          sf!("/models"),
 			pagination:    DiscoveryPagination::SinglePage,
 			authoritative: false,
-			interval:      Some(std::time::Duration::from_secs(5)),
+			interval:      Some(time::Duration::from_secs(5)),
 		};
 		OpenAiModelsDiscoveryCodec::from_spec(&spec).expect("OpenAI models kind");
 		assert_eq!(
@@ -782,7 +786,7 @@ mod tests {
 			path:          "/v1beta/models".into(),
 			pagination:    DiscoveryPagination::Cursor { query_parameter: "pageToken".into() },
 			authoritative: false,
-			interval:      Some(std::time::Duration::from_secs(5)),
+			interval:      Some(time::Duration::from_secs(5)),
 		};
 		GoogleModelsDiscoveryCodec::from_spec(&spec).expect("Google discovery kind constructs");
 		spec.kind = DiscoveryKind::OpenAiModels;

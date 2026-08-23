@@ -11,6 +11,7 @@
 
 use std::{
 	io::{self, BufRead, BufReader, Write},
+	str,
 	sync::atomic::Ordering,
 	time::Instant,
 };
@@ -254,7 +255,7 @@ fn expand_subseconds(format: &str) -> String {
 			}
 		}
 		let len = utf8_len(bytes[i]);
-		out.push_str(std::str::from_utf8(&bytes[i..i + len]).unwrap_or("\u{fffd}"));
+		out.push_str(str::from_utf8(&bytes[i..i + len]).unwrap_or("\u{fffd}"));
 		i += len;
 	}
 	out
@@ -276,7 +277,7 @@ fn parse_leading_timestamp(line: &[u8], year: i16, tz: &TimeZone) -> Option<(usi
 		.iter()
 		.position(|b| b.is_ascii_whitespace())
 		.unwrap_or(line.len());
-	if let Ok(token) = std::str::from_utf8(&line[..token_len]) {
+	if let Ok(token) = str::from_utf8(&line[..token_len]) {
 		if let Ok(ts) = token.parse::<Timestamp>() {
 			return Some((token_len, ts));
 		}
@@ -296,7 +297,7 @@ fn parse_leading_timestamp(line: &[u8], year: i16, tz: &TimeZone) -> Option<(usi
 	if prefix[4] == b' ' {
 		prefix[4] = b'0';
 	}
-	let text = std::str::from_utf8(&prefix).ok()?;
+	let text = str::from_utf8(&prefix).ok()?;
 	let tm = strtime::parse("%Y %b %d %H:%M:%S", format!("{year} {text}")).ok()?;
 	let zoned = tm.to_datetime().ok()?.to_zoned(tz.clone()).ok()?;
 	Some((SYSLOG_LEN, zoned.timestamp()))

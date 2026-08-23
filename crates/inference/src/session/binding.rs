@@ -1,7 +1,8 @@
 //! Typed provider-side session bindings and deterministic reseed policy.
 
 use std::{
-	fmt,
+	error,
+	fmt::{self, Display},
 	time::{Duration, SystemTime},
 };
 
@@ -17,7 +18,8 @@ use strum::IntoStaticStr;
 use crate::{
 	account::AccountChangeEvidence,
 	body::{AttemptBodyEvidence, RetryDecision},
-	id::{ConversationId, PrincipalId, Revision},
+	codec::ProviderStateEvent,
+	id::{AccountId, ConversationId, PrincipalId, Revision},
 };
 
 /// Journal-safe opaque evidence identifying a credential affinity.
@@ -37,7 +39,7 @@ impl CredentialAffinityDigest {
 	pub fn derive(
 		key: &[u8; 32],
 		provider: &omp_catalog::ProviderId<str>,
-		account: &crate::id::AccountId<str>,
+		account: &AccountId<str>,
 		principal: &PrincipalId<str>,
 	) -> Self {
 		let mut hasher = Hash32::hasher();
@@ -205,23 +207,17 @@ pub enum StoredProviderStateEvent {
 	},
 }
 
-impl From<crate::codec::ProviderStateEvent> for StoredProviderStateEvent {
-	fn from(event: crate::codec::ProviderStateEvent) -> Self {
+impl From<ProviderStateEvent> for StoredProviderStateEvent {
+	fn from(event: ProviderStateEvent) -> Self {
 		match event {
-			crate::codec::ProviderStateEvent::Continuation { handle } => Self::Continuation { handle },
-			crate::codec::ProviderStateEvent::ReasoningSignature { index, signature } => {
+			ProviderStateEvent::Continuation { handle } => Self::Continuation { handle },
+			ProviderStateEvent::ReasoningSignature { index, signature } => {
 				Self::ReasoningSignature { index, signature }
 			},
-			crate::codec::ProviderStateEvent::ToolCallProof { index, value } => {
-				Self::ToolCallProof { index, value }
-			},
-			crate::codec::ProviderStateEvent::HistoryBlock { index, data } => {
-				Self::HistoryBlock { index, data }
-			},
-			crate::codec::ProviderStateEvent::OutputItem { index, id } => {
-				Self::OutputItem { index, id }
-			},
-			crate::codec::ProviderStateEvent::Checkpoint { id, data } => Self::Checkpoint { id, data },
+			ProviderStateEvent::ToolCallProof { index, value } => Self::ToolCallProof { index, value },
+			ProviderStateEvent::HistoryBlock { index, data } => Self::HistoryBlock { index, data },
+			ProviderStateEvent::OutputItem { index, id } => Self::OutputItem { index, id },
+			ProviderStateEvent::Checkpoint { id, data } => Self::Checkpoint { id, data },
 		}
 	}
 }
@@ -380,7 +376,7 @@ impl SessionExpiryError {
 	}
 }
 
-impl fmt::Display for SessionExpiryError {
+impl Display for SessionExpiryError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		if self.committed {
 			formatter.write_str("provider session expired after output commit")
@@ -390,7 +386,7 @@ impl fmt::Display for SessionExpiryError {
 	}
 }
 
-impl std::error::Error for SessionExpiryError {}
+impl error::Error for SessionExpiryError {}
 
 /// Outcome when a provider rejects server state during an attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,10 +1,12 @@
 //! Whisper.cpp-backed local speech recognition.
 
 use std::{
+	ffi,
 	path::PathBuf,
+	ptr,
 	str::FromStr as _,
 	sync::{Arc, LazyLock},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use omp_core::Str;
@@ -17,6 +19,8 @@ use super::{
 		LocalCancellation, LocalError, LocalErrorKind, LocalExecutionReceipt, LocalResult,
 		LocalRuntime, MemoryPool,
 	},
+	sherpa,
+	sherpa::{SherpaAdapter, SherpaConfig},
 	speech_catalog::{DEFAULT_STT_PRESET, SpeechArtifactManifests, SttPreset},
 };
 
@@ -160,7 +164,7 @@ pub enum SpeechToTextAdapter {
 		adapter: WhisperAdapter,
 	},
 	/// Default Parakeet TDT recognizer.
-	Parakeet(super::sherpa::SherpaAdapter),
+	Parakeet(SherpaAdapter),
 }
 
 impl SpeechToTextAdapter {
@@ -177,18 +181,18 @@ impl SpeechToTextAdapter {
 		let preset = resolve_stt_preset(selected_id);
 		match preset {
 			SttPreset::Parakeet => {
-				let evidence = super::sherpa::availability();
+				let evidence = sherpa::availability();
 				if !evidence.available {
 					return Err(LocalError::new(LocalErrorKind::Unsupported, evidence.detail));
 				}
-				let config = super::sherpa::SherpaConfig::from_verified_artifacts(
+				let config = SherpaConfig::from_verified_artifacts(
 					store,
 					artifacts,
 					options.threads,
 					options.idle_timeout,
 					cancel,
 				)?;
-				Ok(Self::Parakeet(super::sherpa::SherpaAdapter::new(config, memory)?))
+				Ok(Self::Parakeet(SherpaAdapter::new(config, memory)?))
 			},
 			SttPreset::Fast | SttPreset::Balanced | SttPreset::Turbo => {
 				let config = WhisperConfig::from_verified_artifacts(
@@ -236,7 +240,7 @@ impl SpeechToTextAdapter {
 	}
 
 	/// Unloads the selected engine after its configured idle interval.
-	pub fn unload_if_idle(&self, now: std::time::Instant) -> bool {
+	pub fn unload_if_idle(&self, now: Instant) -> bool {
 		match self {
 			Self::Whisper { adapter, .. } => adapter.unload_if_idle(now),
 			Self::Parakeet(adapter) => adapter.unload_if_idle(now),
@@ -255,7 +259,7 @@ pub struct WhisperAdapter {
 	runtime: LocalRuntime<WhisperEngine>,
 }
 
-unsafe extern "C" fn whisper_abort(user_data: *mut std::ffi::c_void) -> bool {
+unsafe extern "C" fn whisper_abort(user_data: *mut ffi::c_void) -> bool {
 	if user_data.is_null() {
 		return false;
 	}
@@ -345,7 +349,7 @@ impl WhisperAdapter {
 	}
 
 	/// Unloads the checkpoint when inactive for its configured interval.
-	pub fn unload_if_idle(&self, now: std::time::Instant) -> bool {
+	pub fn unload_if_idle(&self, now: Instant) -> bool {
 		self.runtime.unload_if_idle(now)
 	}
 
@@ -429,7 +433,7 @@ fn transcribe_window(
 	// remains at a stable address for that synchronous call.
 	unsafe {
 		parameters.set_abort_callback(Some(whisper_abort));
-		parameters.set_abort_callback_user_data(std::ptr::from_ref(cancel).cast_mut().cast());
+		parameters.set_abort_callback_user_data(ptr::from_ref(cancel).cast_mut().cast());
 	}
 	state.full(parameters, samples).map_err(|error| {
 		LocalError::new(LocalErrorKind::Backend, format!("Whisper inference failed: {error}"))

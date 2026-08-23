@@ -1,6 +1,6 @@
 //! Pi-compatible reads of local and special resources.
 
-use std::{borrow::Cow, future::Future, path::Path, sync::Arc};
+use std::{borrow::Cow, future::Future, path::Path, str, sync::Arc};
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -35,8 +35,14 @@ pub mod profile;
 pub mod resolver;
 pub mod selector;
 pub mod sqlite;
+
+use std::time;
+
 pub use sqlite::looks_like_sqlite;
+use tokio::task;
 pub mod web;
+use resolver::ResolverTable;
+use web::types::WebError;
 
 const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, documents, and web URLs via `path`.
 
@@ -186,7 +192,7 @@ pub trait ReadLease: Send + Sync {
 ///
 /// Rendering, document conversion, web fetching policy, and dispatch remain in
 /// `omp-tools`; implementations provide local resources plus the low-level HTTP
-/// transport inherited from [`web::types::HttpClient`].
+/// transport inherited from [`HttpClient`].
 pub trait ReadSources: web::types::HttpClient + Send + Sync + 'static {
 	/// Revision-pinned plain-file lease type.
 	type Lease: ReadLease;
@@ -351,7 +357,7 @@ impl Default for ReadPolicy {
 pub struct ReadTool<S, B, R = resolver::NoResolver> {
 	sources:   S,
 	blobs:     B,
-	resolvers: Arc<resolver::ResolverTable<R>>,
+	resolvers: Arc<ResolverTable<R>>,
 	conflicts: Arc<conflicts::ConflictRegistry>,
 	policy:    ReadPolicy,
 	spec:      ToolSpec,
@@ -381,7 +387,7 @@ pub fn tool<S: ReadSources, B: ReadBlobs>(
 	tool_with_resolvers_and_conflicts(
 		sources,
 		blobs,
-		Arc::new(resolver::ResolverTable::default()),
+		Arc::new(ResolverTable::default()),
 		Arc::new(conflicts::ConflictRegistry::default()),
 	)
 }
@@ -391,7 +397,7 @@ pub fn tool<S: ReadSources, B: ReadBlobs>(
 pub fn tool_with_resolvers<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	sources: S,
 	blobs: B,
-	resolvers: Arc<resolver::ResolverTable<R>>,
+	resolvers: Arc<ResolverTable<R>>,
 ) -> ReadTool<S, B, R> {
 	tool_with_resolvers_and_conflicts(
 		sources,
@@ -406,7 +412,7 @@ pub fn tool_with_resolvers<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 pub fn tool_with_resolvers_and_conflicts<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	sources: S,
 	blobs: B,
-	resolvers: Arc<resolver::ResolverTable<R>>,
+	resolvers: Arc<ResolverTable<R>>,
 	conflicts: Arc<conflicts::ConflictRegistry>,
 ) -> ReadTool<S, B, R> {
 	tool_with_policy(sources, blobs, resolvers, conflicts, ReadPolicy::default())
@@ -416,7 +422,7 @@ pub fn tool_with_resolvers_and_conflicts<S: ReadSources, B: ReadBlobs, R: resolv
 pub fn tool_with_policy<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	sources: S,
 	blobs: B,
-	resolvers: Arc<resolver::ResolverTable<R>>,
+	resolvers: Arc<ResolverTable<R>>,
 	conflicts: Arc<conflicts::ConflictRegistry>,
 	policy: ReadPolicy,
 ) -> ReadTool<S, B, R> {
@@ -643,7 +649,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		let recovery_candidates = normalized.recovery_candidates();
 		let authored = normalized.canonical.as_str();
 		if let Some(target) = web::parse_target(authored).map_err(|error| match error {
-			web::types::WebError::InvalidUrl(message) => Fault::Invalid { message },
+			WebError::InvalidUrl(message) => Fault::Invalid { message },
 			other => Fault::Web { message: other.message() },
 		})? {
 			if !self.policy.fetch_enabled {
@@ -673,7 +679,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 					});
 				};
 				let bytes = result?;
-				let text = std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
+				let text = str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
 					message: sf!("{}:// did not resolve to UTF-8 text", uri.raw_scheme),
 				})?;
 				return Ok(vec![PayloadPart::Text { text: Str::new(text) }]);
@@ -722,7 +728,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 						PayloadPart::Blob { blob, alt: loaded.description },
 					]);
 				}
-				let text = std::str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
+				let text = str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
 					message: sf!("{}://{} did not resolve to UTF-8 text", uri.raw_scheme, uri.resource),
 				})?;
 				return Ok(vec![PayloadPart::Text { text: Str::new(text) }]);
@@ -894,7 +900,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			&& (profile::is_cpu_profile_path(path) || profile::is_sample_profile_path(path))
 		{
 			let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
-			if let Ok(text) = std::str::from_utf8(&bytes)
+			if let Ok(text) = str::from_utf8(&bytes)
 				&& let Some(summary) = profile::render_profile(path, text)
 			{
 				return self.text_parts(&stat, &summary, &parsed, None, suffix_from);
@@ -971,7 +977,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		if !raw && is_probably_binary_header(&bytes[..bytes.len().min(BINARY_SNIFF_BYTES)]) {
 			return Err(Fault::Source { message: Str::new(binary_notice(&stat)) });
 		}
-		let text: Cow<'_, str> = match std::str::from_utf8(&bytes) {
+		let text: Cow<'_, str> = match str::from_utf8(&bytes) {
 			Ok(text) => Cow::Borrowed(text),
 			Err(_) if raw => String::from_utf8_lossy(&bytes),
 			Err(_) => {
@@ -1071,8 +1077,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		let (offset, limit) = parsed.offset_limit();
 		let offset = offset.and_then(|value| usize::try_from(value).ok());
 		let limit = limit.and_then(|value| usize::try_from(value).ok());
-		let now_ms = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
+		let now_ms = time::SystemTime::now()
+			.duration_since(time::UNIX_EPOCH)
 			.unwrap_or_default()
 			.as_millis() as u64;
 		let rendered = dirtree::render_directory(
@@ -1170,9 +1176,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		let authored = authored.to_owned();
 		let interrupt = Arc::new(sqlite::QueryInterrupt::default());
 		let task_interrupt = interrupt.clone();
-		let operation = tokio::task::spawn_blocking(move || {
-			sqlite::read_interruptible(&path, &authored, task_interrupt)
-		});
+		let operation =
+			task::spawn_blocking(move || sqlite::read_interruptible(&path, &authored, task_interrupt));
 		let mut interrupt_on_drop = InterruptSqliteOnDrop(Some(interrupt));
 		let result = operation.await;
 		interrupt_on_drop.disarm();
@@ -1478,7 +1483,7 @@ pub fn is_probably_binary_header(header: &[u8]) -> bool {
 	if header.contains(&0) {
 		return true;
 	}
-	match std::str::from_utf8(header) {
+	match str::from_utf8(header) {
 		Ok(_) => false,
 		// `error_len()` is `None` only for an unexpected end of input: an
 		// incomplete trailing sequence cut off by the sniff window.

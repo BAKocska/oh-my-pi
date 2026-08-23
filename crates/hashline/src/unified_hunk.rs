@@ -1,6 +1,10 @@
 //! Deterministic unified-hunk parsing and in-memory application.
 
+use std::iter;
+
 use omp_core::Str;
+
+use crate::foreign_patch::ForeignPatchFile;
 
 /// One parsed unified hunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,19 +26,36 @@ pub struct UnifiedHunk {
 pub enum UnifiedHunkError {
 	/// Content preceded the first hunk header.
 	#[error("unified patch content at line {line} must follow an '@@' header")]
-	MissingHeader { line: usize },
+	MissingHeader {
+		/// One-based input line containing content before any hunk header.
+		line: usize,
+	},
 	/// One body row used an unknown prefix.
 	#[error("invalid unified patch row at line {line}")]
-	InvalidRow { line: usize },
+	InvalidRow {
+		/// One-based input line containing the invalid hunk row.
+		line: usize,
+	},
 	/// A hunk had no source or replacement rows.
 	#[error("unified patch hunk at line {line} is empty")]
-	EmptyHunk { line: usize },
+	EmptyHunk {
+		/// One-based input line containing the empty hunk's header.
+		line: usize,
+	},
 	/// No bounded context variant matched.
 	#[error("hunk {hunk} did not match the source")]
-	NoMatch { hunk: usize },
+	NoMatch {
+		/// One-based position of the unmatched hunk.
+		hunk: usize,
+	},
 	/// More than one equally valid location matched.
 	#[error("hunk {hunk} is ambiguous at source lines {lines:?}")]
-	Ambiguous { hunk: usize, lines: Vec<usize> },
+	Ambiguous {
+		/// One-based position of the ambiguous hunk.
+		hunk:  usize,
+		/// One-based source lines where candidate matches begin.
+		lines: Vec<usize>,
+	},
 	/// Create would overwrite an existing file without explicit permission.
 	#[error("create operation would overwrite an existing file")]
 	CreateOverwrite,
@@ -288,7 +309,7 @@ fn adapt_indentation(old: &[Str], actual: &[String], new: &[Str]) -> Vec<String>
 			let indent = line.len() - line.trim_start().len();
 			let adjusted = indent.saturating_add_signed(delta);
 			let mut output = String::with_capacity(line.len().saturating_add_signed(delta));
-			output.extend(std::iter::repeat_n(' ', adjusted));
+			output.extend(iter::repeat_n(' ', adjusted));
 			output.push_str(line.trim_start().as_str());
 			output
 		})
@@ -306,21 +327,21 @@ fn scope_before(lines: &[String], start: usize, scope: &str) -> bool {
 /// Applies create/delete/update semantics without performing I/O.
 pub fn apply_file_operation(
 	existing: Option<&str>,
-	operation: &crate::foreign_patch::ForeignPatchFile,
+	operation: &ForeignPatchFile,
 	allow_create_overwrite: bool,
 ) -> Result<Option<String>, UnifiedHunkError> {
 	match operation {
-		crate::foreign_patch::ForeignPatchFile::Add { content, .. } => {
+		ForeignPatchFile::Add { content, .. } => {
 			if existing.is_some() && !allow_create_overwrite {
 				Err(UnifiedHunkError::CreateOverwrite)
 			} else {
 				Ok(Some(content.to_string()))
 			}
 		},
-		crate::foreign_patch::ForeignPatchFile::Delete { .. } => existing
+		ForeignPatchFile::Delete { .. } => existing
 			.map(|_| None)
 			.ok_or(UnifiedHunkError::DeleteMissing),
-		crate::foreign_patch::ForeignPatchFile::Update { hunks, .. } => {
+		ForeignPatchFile::Update { hunks, .. } => {
 			let source = existing.ok_or(UnifiedHunkError::UpdateMissing)?;
 			let parsed = parse_unified_hunks(hunks)?;
 			apply_unified_hunks(source, &parsed).map(Some)

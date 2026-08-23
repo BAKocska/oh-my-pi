@@ -13,9 +13,12 @@ use omp_collab::{
 	relay::{Handshake, RelayClient, RelayError, RelayInbound, RelayRole, SendDisposition},
 };
 use omp_core::Str;
-use omp_proto::collab::v1::{Bye, Hello, PromptRequest, Welcome, collab_frame};
+use omp_proto::collab::{
+	v1,
+	v1::{Bye, Hello, PromptRequest, Welcome, collab_frame},
+};
 use thiserror::Error;
-use tokio::{sync::watch, task::JoinHandle, time::error::Elapsed};
+use tokio::{sync::watch, task::JoinHandle, time, time::error::Elapsed};
 
 const COMMAND_CAPACITY: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -101,50 +104,58 @@ struct OwnerRequest {
 	reply:   Sender<Result<CollabCommandResult, CollabCommandFault>>,
 }
 
-/// Clone-cheap command/presence handle installed only when the production
-/// collaboration owner is constructed.
-#[derive(Clone)]
-pub struct CollabCommandHandle {
-	commands: Sender<OwnerRequest>,
-	presence: watch::Receiver<Option<PresenceFacts>>,
-	replica:  Option<GuestReplicaHandle>,
+mod command_handle {
+	use tokio::sync::watch::Receiver;
+
+	use super::*;
+
+	/// Clone-cheap command/presence handle installed only when the production
+	/// collaboration owner is constructed.
+	#[derive(Clone)]
+	pub struct CollabCommandHandle {
+		pub(super) commands: Sender<OwnerRequest>,
+		pub(super) presence: Receiver<Option<PresenceFacts>>,
+		pub(super) replica:  Option<GuestReplicaHandle>,
+	}
+
+	impl CollabCommandHandle {
+		/// Requests a serialized owner operation and awaits its settled result.
+		pub async fn request(
+			&self,
+			command: CollabOwnerCommand,
+		) -> Result<CollabCommandResult, CollabCommandFault> {
+			let (reply, result) = flume::bounded(1);
+			self
+				.commands
+				.send_async(OwnerRequest { command, reply })
+				.await
+				.map_err(|_| CollabCommandFault::OwnerStopped)?;
+			result
+				.recv_async()
+				.await
+				.map_err(|_| CollabCommandFault::OwnerStopped)?
+		}
+
+		/// Returns the most recently published role/connection/participant facts.
+		pub fn presence(&self) -> Option<PresenceFacts> {
+			*self.presence.borrow()
+		}
+
+		/// Subscribes to role and presence changes for command filtering and
+		/// status rendering.
+		pub fn subscribe_presence(&self) -> Receiver<Option<PresenceFacts>> {
+			self.presence.clone()
+		}
+
+		/// Returns the guest transcript projection handle when replica storage
+		/// was attached to this owner.
+		pub fn guest_replica(&self) -> Option<GuestReplicaHandle> {
+			self.replica.clone()
+		}
+	}
 }
 
-impl CollabCommandHandle {
-	/// Requests a serialized owner operation and awaits its settled result.
-	pub async fn request(
-		&self,
-		command: CollabOwnerCommand,
-	) -> Result<CollabCommandResult, CollabCommandFault> {
-		let (reply, result) = flume::bounded(1);
-		self
-			.commands
-			.send_async(OwnerRequest { command, reply })
-			.await
-			.map_err(|_| CollabCommandFault::OwnerStopped)?;
-		result
-			.recv_async()
-			.await
-			.map_err(|_| CollabCommandFault::OwnerStopped)?
-	}
-
-	/// Returns the most recently published role/connection/participant facts.
-	pub fn presence(&self) -> Option<PresenceFacts> {
-		*self.presence.borrow()
-	}
-
-	/// Subscribes to role and presence changes for command filtering and status
-	/// rendering.
-	pub fn subscribe_presence(&self) -> watch::Receiver<Option<PresenceFacts>> {
-		self.presence.clone()
-	}
-
-	/// Returns the guest transcript projection handle when replica storage was
-	/// attached to this owner.
-	pub fn guest_replica(&self) -> Option<GuestReplicaHandle> {
-		self.replica.clone()
-	}
-}
+pub use command_handle::CollabCommandHandle;
 
 /// Receiving half retained by the production host/guest lifecycle owner.
 pub struct CollabSessionAuthority {
@@ -202,7 +213,7 @@ enum ActiveSession {
 	Guest {
 		relay:    RelayClient,
 		sequence: u64,
-		hello:    omp_proto::collab::v1::CollabFrame,
+		hello:    v1::CollabFrame,
 		room_id:  Str,
 		replica:  GuestReplicaHandle,
 		result:   CollabCommandResult,
@@ -220,7 +231,7 @@ impl ActiveSession {
 		let relay = match self {
 			Self::Host { relay, .. } | Self::Guest { relay, .. } => relay,
 		};
-		let frame = omp_proto::collab::v1::CollabFrame {
+		let frame = v1::CollabFrame {
 			protocol_revision: omp_collab::PROTOCOL_REVISION,
 			sequence: 1,
 			payload: Some(collab_frame::Payload::Bye(Bye { reason: reason.to_owned() })),
@@ -440,7 +451,7 @@ impl CollabSessionAuthority {
 				if relay.send(RelayRoute { peer_id: 0 }, &hello).await? != SendDisposition::Sent {
 					return Err(CollabCommandFault::OutboundQueued);
 				}
-				let inbound = tokio::time::timeout(WELCOME_TIMEOUT, relay.receive())
+				let inbound = time::timeout(WELCOME_TIMEOUT, relay.receive())
 					.await
 					.map_err(|source| CollabCommandFault::WelcomeTimeout { source })??
 					.ok_or(CollabCommandFault::UnexpectedWelcome)?;
@@ -488,14 +499,14 @@ impl CollabSessionAuthority {
 					return Err(CollabCommandFault::ReadOnly);
 				}
 				*sequence = sequence.saturating_add(1);
-				let frame = omp_proto::collab::v1::CollabFrame {
+				let frame = v1::CollabFrame {
 					protocol_revision: omp_collab::PROTOCOL_REVISION,
 					sequence: *sequence,
 					payload: Some(collab_frame::Payload::Prompt(PromptRequest {
 						text:   text.to_string(),
 						images: images
 							.iter()
-							.map(|image| omp_proto::collab::v1::ImageAttachment {
+							.map(|image| v1::ImageAttachment {
 								data:      image.data.clone(),
 								mime_type: image.mime_type.to_string(),
 							})
@@ -522,7 +533,7 @@ impl CollabSessionAuthority {
 }
 
 async fn connect(relay: &mut RelayClient) -> Result<(), CollabCommandFault> {
-	tokio::time::timeout(CONNECT_TIMEOUT, relay.connect())
+	time::timeout(CONNECT_TIMEOUT, relay.connect())
 		.await
 		.map_err(|source| CollabCommandFault::ConnectTimeout { source })??;
 	Ok(())

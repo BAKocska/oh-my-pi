@@ -10,7 +10,7 @@ use omp_desktop::{
 use omp_tools::computer::{Action, ComputerHost, Fault, Params, Payload};
 use serde_json::{Value, json};
 
-use super::blobs::BlobHost;
+use super::blobs::{BlobError, BlobHost};
 
 /// Persistent native desktop owner shared by every `computer` invocation in a
 /// session-scoped Environment registry.
@@ -258,8 +258,8 @@ impl ComputerHost for ComputerSessionHost {
 fn target(params: &Params) -> Target {
 	params
 		.window
-		.as_ref()
-		.map_or(Target::Desktop, |id| Target::Window(id.to_string()))
+		.as_deref()
+		.map_or(Target::Desktop, Target::parse)
 }
 
 fn capabilities(value: omp_desktop::DesktopCapabilities) -> Value {
@@ -317,6 +317,6 @@ fn native_fault(error: omp_desktop::DesktopError) -> Fault {
 	Fault { code: sf!("desktop_operation_failed"), message: Str::new(error.to_string()) }
 }
 
-fn blob_fault(error: super::blobs::BlobError) -> Fault {
+fn blob_fault(error: BlobError) -> Fault {
 	Fault { code: sf!("desktop_artifact_failed"), message: Str::new(error.to_string()) }
 }

@@ -58,7 +58,11 @@ pub fn system_templates() -> [&'static Template; 10] {
 
 #[cfg(test)]
 mod tests {
-	use super::engine;
+
+	use std::collections::HashSet;
+
+	use super::{engine, system_templates};
+	use crate::prompt_keys::ALL;
 
 	#[test]
 	fn process_engine_is_shared() {
@@ -66,11 +70,8 @@ mod tests {
 	}
 	#[test]
 	fn embedded_templates_parse_and_use_registered_keys() {
-		let legal = crate::prompt_keys::ALL
-			.iter()
-			.copied()
-			.collect::<std::collections::HashSet<_>>();
-		for template in super::system_templates() {
+		let legal = ALL.iter().copied().collect::<HashSet<_>>();
+		for template in system_templates() {
 			for key in template.referenced_keys() {
 				assert!(
 					legal.contains(key),

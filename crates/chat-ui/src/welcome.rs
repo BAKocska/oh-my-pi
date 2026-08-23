@@ -20,6 +20,7 @@
 use std::{
 	f32::consts::{PI, TAU},
 	fmt::Write as _,
+	iter,
 	time::Duration,
 };
 
@@ -196,6 +197,7 @@ struct WelcomeDownload {
 	received:  Duration,
 	completed: Option<Duration>,
 }
+/// Animated launch surface for starting or resuming a chat session.
 
 pub struct Welcome {
 	frame:          Frame,
@@ -537,7 +539,7 @@ fn draw_sessions(
 		frame.put(panel_x, y, vertical.encode_utf8(&mut glyph), on_card(theme, theme.border));
 	}
 	let rows =
-		std::iter::once((sf!("New session"), sf!("NEW"))).chain(sessions.iter().take(3).map(|row| {
+		iter::once((sf!("New session"), sf!("NEW"))).chain(sessions.iter().take(3).map(|row| {
 			(
 				if row.pinned {
 					sf!("{} {}", charset.icon(Icon::Pin), row.label)

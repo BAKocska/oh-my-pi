@@ -1,6 +1,8 @@
 //! Bounded incremental AWS `EventStream` framing with CRC and header
 //! validation.
 
+use std::ops;
+
 use bytes::{Bytes, BytesMut};
 use omp_core::Str;
 use smallvec::SmallVec;
@@ -419,7 +421,7 @@ fn take_range(
 	end: usize,
 	len: usize,
 	offset: usize,
-) -> Result<std::ops::Range<usize>, FramingError> {
+) -> Result<ops::Range<usize>, FramingError> {
 	let next = cursor
 		.checked_add(len)
 		.filter(|next| *next <= end)

@@ -15,8 +15,8 @@ use xutf::BufReadCharsExt as _;
 use crate::{
 	answer::{Answer, AnswerBody, DetokenizedText, TokenCount, TokenSequence, TokenizerProvenance},
 	call::{
-		ContentPart, CountAccuracy, CountTokensRequest, DetokenizeRequest, MediaInput, OperationCall,
-		TokenizeRequest, ToolResultContent,
+		Call, ContentPart, CountAccuracy, CountTokensRequest, DetokenizeRequest, MediaInput,
+		OperationCall, TokenizeRequest, ToolResultContent,
 	},
 	catalog::OperationKind,
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
@@ -52,7 +52,7 @@ impl<S> CountTokensService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for CountTokensService<S>
+impl<S> Service<Call> for CountTokensService<S>
 where
 	S: Service<
 			OperationRequest<CountTokensRequest>,
@@ -70,7 +70,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::CountTokens(request) => {
 				Some(OperationRequest::from_call(&call, Arc::clone(request)))
@@ -114,7 +114,7 @@ impl<S> TokenizeService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for TokenizeService<S>
+impl<S> Service<Call> for TokenizeService<S>
 where
 	S: Service<
 			OperationRequest<TokenizeRequest>,
@@ -132,7 +132,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::Tokenize(request) => {
 				Some(OperationRequest::from_call(&call, Arc::clone(request)))
@@ -177,7 +177,7 @@ impl<S> DetokenizeService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for DetokenizeService<S>
+impl<S> Service<Call> for DetokenizeService<S>
 where
 	S: Service<
 			OperationRequest<DetokenizeRequest>,
@@ -195,7 +195,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::Detokenize(request) => {
 				Some(OperationRequest::from_call(&call, Arc::clone(request)))
@@ -449,7 +449,7 @@ fn serialized_len(value: &serde_json::Value) -> Result<u64, Error> {
 		.map_err(|_| protocol_error("opaque_json_serialization_failed"))
 }
 
-fn wrong_operation(call: &crate::call::Call, expected: OperationKind) -> Error {
+fn wrong_operation(call: &Call, expected: OperationKind) -> Error {
 	Error::new(
 		ErrorKind::InternalInvariant,
 		ErrorPhase::Internal,

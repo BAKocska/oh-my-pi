@@ -12,10 +12,11 @@ use omp_inference::{
 	event::ChatEvent,
 	id::RequestId,
 	receipt::ExecutionBudget,
+	router,
 };
 use serde::Serialize;
 
-use crate::cli::BenchArgs;
+use crate::{cli, cli::BenchArgs};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,7 +84,7 @@ async fn sample(
 	max_tokens: u64,
 	run: u32,
 ) -> miette::Result<Sample> {
-	let planner = omp_inference::router::Router::new(registry.clone(), Duration::from_secs(30));
+	let planner = router::Router::new(registry.clone(), Duration::from_secs(30));
 	let meta = CallMeta {
 		id:       RequestId::from(format!("omp-bench-{run}")),
 		target:   Target::Model(model),
@@ -91,7 +92,7 @@ async fn sample(
 		budget:   ExecutionBudget::default(),
 		session:  None,
 	};
-	let mut request = crate::cli::chat_request(prompt);
+	let mut request = cli::chat_request(prompt);
 	request.max_output_tokens = Some(max_tokens);
 	let mut events = Client::new(registry.service(), planner, meta)
 		.execute(request)

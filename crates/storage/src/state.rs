@@ -7,8 +7,9 @@
 //! truth.
 
 use std::{
+	cmp,
 	collections::{HashMap, HashSet},
-	fmt,
+	fmt::{self, Display},
 	fs::{self, File, OpenOptions},
 	io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
 	mem::size_of,
@@ -26,7 +27,7 @@ use smallvec::SmallVec;
 use strum::{AsRefStr, Display, EnumString};
 use thiserror::Error as ThisError;
 
-use crate::blob::{BlobRef, BlobStore};
+use crate::blob::{BlobRef, BlobStore, Error as BlobError};
 
 const CODEC: &str = "omp.state/1";
 const LOG_FILE: &str = "state-v1.jsonl";
@@ -70,7 +71,7 @@ impl StateRevision {
 	}
 }
 
-impl fmt::Display for StateRevision {
+impl Display for StateRevision {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		self.0.fmt(formatter)
 	}
@@ -115,12 +116,12 @@ impl StateEntryId {
 }
 
 impl PartialOrd for StateEntryId {
-	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+	fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
 		(self.scope == other.scope).then(|| self.revision.cmp(&other.revision))
 	}
 }
 
-impl fmt::Display for StateEntryId {
+impl Display for StateEntryId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}:{}:{}", self.scope.scope, self.scope.authority, self.revision)
 	}
@@ -400,7 +401,7 @@ pub enum Error {
 	Io(#[from] io::Error),
 	/// Content-addressed blob storage failed.
 	#[error(transparent)]
-	Blob(#[from] crate::blob::Error),
+	Blob(#[from] BlobError),
 	/// A durable record failed strict canonical encoding.
 	#[error("state codec failed: {0}")]
 	Codec(#[from] serde_json::Error),

@@ -2,6 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
+	env, fs,
 	path::{Path, PathBuf},
 	sync::{Arc, LazyLock},
 };
@@ -11,6 +12,10 @@ use omp_agent::{
 	prompt_assets::{PromptAssetId, prompt_asset},
 };
 use omp_core::{Str, sf};
+
+#[cfg(test)]
+use crate::security_review::profile::PROFILE_ID;
+use crate::{discovery::manifest, security_review::profile};
 
 static BUNDLED: LazyLock<Arc<BTreeMap<Str, AgentDefinition>>> = LazyLock::new(|| {
 	let definitions = [
@@ -37,11 +42,10 @@ static BUNDLED: LazyLock<Arc<BTreeMap<Str, AgentDefinition>>> = LazyLock::new(||
 /// Returns the complete native catalog using project → user → extension →
 /// bundled precedence.
 pub fn discover(root: &Path, security_enabled: bool) -> Arc<BTreeMap<Str, AgentDefinition>> {
-	let home = std::env::var_os("HOME").map(PathBuf::from);
+	let home = env::var_os("HOME").map(PathBuf::from);
 	let extensions = extension_roots(root, home.as_deref());
-	let declarations =
-		crate::discovery::manifest::agent_declarations(root, home.as_deref(), &extensions);
-	let discovery = crate::discovery::manifest::discover_agents(&declarations);
+	let declarations = manifest::agent_declarations(root, home.as_deref(), &extensions);
+	let discovery = manifest::discover_agents(&declarations);
 	for warning in &discovery.warnings {
 		tracing::warn!(path = %warning.path.display(), error = %warning.kind, "skipping malformed agent definition");
 	}
@@ -49,15 +53,11 @@ pub fn discover(root: &Path, security_enabled: bool) -> Arc<BTreeMap<Str, AgentD
 	for (name, definition) in discovery.definitions.into_iter().rev() {
 		definitions.insert(name, definition);
 	}
-	definitions.retain(|name, _| {
-		!name
-			.as_str()
-			.eq_ignore_ascii_case(crate::security_review::profile::PROFILE_ID)
-	});
+	definitions.retain(|name, _| !name.as_str().eq_ignore_ascii_case(profile::PROFILE_ID));
 	if security_enabled {
-		let definition = crate::security_review::profile::definition();
+		let definition = profile::definition();
 		debug_assert!(crate::security_review::profile::is_canonical(&definition));
-		definitions.insert(Str::new_static(crate::security_review::profile::PROFILE_ID), definition);
+		definitions.insert(Str::new_static(profile::PROFILE_ID), definition);
 	}
 	Arc::new(definitions)
 }
@@ -69,7 +69,7 @@ fn extension_roots(root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
 			.into_iter()
 			.flatten()
 	{
-		let Ok(entries) = std::fs::read_dir(extensions) else {
+		let Ok(entries) = fs::read_dir(extensions) else {
 			continue;
 		};
 		roots.extend(entries.filter_map(Result::ok).filter_map(|entry| {
@@ -170,16 +170,14 @@ mod tests {
 	fn security_setting_solely_owns_canonical_profile_registration() {
 		let root = tempfile::tempdir().unwrap();
 		let disabled = discover(root.path(), false);
-		assert!(disabled.keys().all(|name| {
-			!name
-				.as_str()
-				.eq_ignore_ascii_case(crate::security_review::profile::PROFILE_ID)
-		}));
+		assert!(
+			disabled
+				.keys()
+				.all(|name| { !name.as_str().eq_ignore_ascii_case(PROFILE_ID) })
+		);
 
 		let enabled = discover(root.path(), true);
-		let profile = enabled
-			.get(crate::security_review::profile::PROFILE_ID)
-			.expect("enabled security reviewer");
+		let profile = enabled.get(PROFILE_ID).expect("enabled security reviewer");
 		assert!(crate::security_review::profile::is_canonical(profile));
 	}
 }

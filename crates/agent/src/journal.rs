@@ -2,29 +2,34 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+	io, iter,
 	ops::Deref,
 	path::{Path, PathBuf},
+	slice,
 	sync::Arc,
 };
 
 use bytes::Bytes;
-use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str, sf};
+use flume::Receiver;
+use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str, phase, sf};
 use omp_proto::{
-	inference::v1::Outcome,
+	inference::{v1, v1::Outcome},
 	thread::v1::{Item, Role, item, part},
 };
 pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart};
 use omp_storage::{
 	blob::BlobRef,
 	index::{
-		ContextPosition, EventProjection, IndexedEvent, IndexedWriteError, JournalPosition,
+		self, ContextPosition, EventProjection, IndexedEvent, IndexedWriteError, JournalPosition,
 		SessionIndex,
 	},
+	state::{self, StateRevision},
 	transcript::{
-		self, AmendPatch, ApprovalDecided, ApprovalTicketFiled, ChildSessionInit, Event, Header,
-		HookOutcome, ItemRecord, JobRegistered, JobSettled, Kind, Log, ModelChange, Patch, Pin,
-		PolicyDecision, PromptRewriteCommit, PromptRewriteIntent, PromptRewriteStage, Reader,
-		RefreshState, RequestAudit, ToolBatchAuthorized, TurnAbort, TurnInputItem, Writer,
+		self, AmendPatch, ApprovalDecided, ApprovalTicketFiled, ChildLifecycleEntry,
+		ChildSessionInit, Event, Header, HookOutcome, ItemRecord, JobRegistered, JobSettled, Kind,
+		Log, ModelChange, Patch, Pin, PolicyDecision, PromptRewriteCommit, PromptRewriteIntent,
+		PromptRewriteStage, Reader, RefreshState, RequestAudit, ToolBatchAuthorized, TurnAbort,
+		TurnInputItem, Writer,
 		event::Custom,
 		msg::Content,
 		writer::{AppendManyError, IndexRun, JournalError as WriterError},
@@ -37,6 +42,7 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
+	ProjectionError,
 	arbiter::FoldFact,
 	campaign::CampaignEntry,
 	events::EventBus,
@@ -45,6 +51,7 @@ use crate::{
 		EntryKindDecl, EntryKindError, EntryKindRegistry, REWIND_REPORT_KIND, TTSR_INJECTION_KIND,
 		core_campaign_declarations, core_checkpoint_declarations, core_ttsr_declaration,
 	},
+	project,
 	prompt::PromptHash,
 	ttsr::TtsrSource,
 };
@@ -53,7 +60,7 @@ type PendingItem = (u64, Item, Option<Hash32>);
 type ReplayKey = (Str, Str, Str);
 struct IndexedAppend {
 	index:       u64,
-	index_error: Option<omp_storage::index::Error>,
+	index_error: Option<index::Error>,
 }
 type PendingItems = Vec<PendingItem>;
 struct CachedReader {
@@ -124,7 +131,7 @@ impl WorkspaceRoots {
 
 	/// Iterates the primary root followed by ordered secondary roots.
 	pub fn iter(&self) -> impl Iterator<Item = &Path> + Clone {
-		std::iter::once(self.primary.as_path()).chain(self.secondary.iter().map(PathBuf::as_path))
+		iter::once(self.primary.as_path()).chain(self.secondary.iter().map(PathBuf::as_path))
 	}
 }
 
@@ -365,7 +372,7 @@ pub enum ReplicationEvent {
 /// owner.
 pub struct ReplicationSubscription {
 	catch_up:      VecDeque<ReplicationRecord>,
-	live:          flume::Receiver<ReplicationEvent>,
+	live:          Receiver<ReplicationEvent>,
 	host_revision: u64,
 }
 
@@ -406,7 +413,7 @@ struct ReplicationSubscriber {
 #[derive(Clone, Debug)]
 pub struct SessionStateValue {
 	/// Physical journal event index, also the session state revision.
-	pub revision: omp_storage::state::StateRevision,
+	pub revision: StateRevision,
 	/// Namespaced state key.
 	pub key:      Str,
 	/// Verbatim canonical JSON value.
@@ -427,7 +434,7 @@ pub enum SessionStateWatchTerminal {
 	/// The bounded consumer fell behind; resubscribe after this revision.
 	Lagged {
 		/// Last revision offered before termination.
-		after: Option<omp_storage::state::StateRevision>,
+		after: Option<StateRevision>,
 	},
 	/// The owning journal actor closed.
 	Closed,
@@ -436,7 +443,7 @@ pub enum SessionStateWatchTerminal {
 struct SessionStateSubscriber {
 	namespace: Str,
 	key:       Str,
-	last:      Option<omp_storage::state::StateRevision>,
+	last:      Option<StateRevision>,
 	sender:    flume::Sender<SessionStateWatchEvent>,
 }
 
@@ -450,7 +457,7 @@ struct SessionCasRecord {
 #[derive(Deserialize, Serialize)]
 struct SessionContentRecord {
 	namespace: Str,
-	reference: omp_storage::blob::BlobRef,
+	reference: BlobRef,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
 #[strum(serialize_all = "snake_case")]
@@ -556,7 +563,7 @@ pub enum JournalError {
 	},
 	/// The sessions index rejected an event before its journal append.
 	#[error("sessions index rejected journal write: {0}")]
-	SessionIndex(#[source] omp_storage::index::Error),
+	SessionIndex(#[source] index::Error),
 	/// The journal committed but its rebuildable sessions-index update failed.
 	#[error("journal event {event_index} committed but sessions index failed: {source}")]
 	SessionIndexAfterJournal {
@@ -564,7 +571,7 @@ pub enum JournalError {
 		event_index: u64,
 		/// Rebuildable index failure.
 		#[source]
-		source:      omp_storage::index::Error,
+		source:      index::Error,
 	},
 	/// The journal committed but its collaboration projection could not be
 	/// encoded.
@@ -590,7 +597,7 @@ pub enum JournalError {
 	TurnStartMismatch(Str),
 	/// Session-scoped state routing or CAS validation failed.
 	#[error(transparent)]
-	State(#[from] omp_storage::state::Error),
+	State(#[from] state::Error),
 	/// A settled failed turn was opened again under the same identity.
 	#[error("turn {0} was already aborted")]
 	TurnAlreadyAborted(Str),
@@ -646,7 +653,7 @@ pub enum JournalError {
 	},
 	/// Canonical recovery-result construction failed.
 	#[error(transparent)]
-	Projection(#[from] crate::ProjectionError),
+	Projection(#[from] ProjectionError),
 	/// A requested checkpoint does not exist in the parent journal.
 	#[error("journal event index {index} does not exist")]
 	InvalidEventIndex {
@@ -893,7 +900,7 @@ impl Journal {
 		let mut claims = BTreeMap::new();
 		for (turn_id, (_, start)) in &starts {
 			for target in &start.item_events {
-				if !matches!(log.get(*target), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+				if !matches!(log.get(*target), Some(omp_storage::transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
 				{
 					return Err(JournalError::InvalidTurnInput(*target));
 				}
@@ -911,7 +918,7 @@ impl Journal {
 				.iter()
 				.chain(&start.sequence_targets)
 			{
-				if !matches!(log.get(*target), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+				if !matches!(log.get(*target), Some(omp_storage::transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
 				{
 					return Err(JournalError::InvalidTurnInput(*target));
 				}
@@ -1087,11 +1094,11 @@ impl Journal {
 
 	fn append(&mut self, event: &Event) -> Result<u64, JournalError> {
 		let expected = self.prepare_append()?;
-		match self.writer.append_atomic(std::slice::from_ref(event)) {
+		match self.writer.append_atomic(slice::from_ref(event)) {
 			Ok(indexes) => {
 				self.refresh_after_append(expected, 1)?;
 				let index = indexes[0];
-				self.publish_replication(std::slice::from_ref(&index), std::slice::from_ref(event))?;
+				self.publish_replication(slice::from_ref(&index), slice::from_ref(event))?;
 				Ok(index)
 			},
 			Err(WriterError::RolledBack { source }) => {
@@ -1134,7 +1141,7 @@ impl Journal {
 	pub fn append_child_lifecycle(
 		&mut self,
 		ts: u64,
-		entry: omp_storage::transcript::ChildLifecycleEntry,
+		entry: ChildLifecycleEntry,
 	) -> Result<u64, JournalError> {
 		self.append(&Event { ts, kind: Kind::ChildLifecycle(entry) })
 	}
@@ -1843,7 +1850,7 @@ impl Journal {
 		live: bool,
 	) -> Result<Vec<JournalCustomEntry>, JournalError> {
 		if authority.session_id() != self.session_id.0.as_str() {
-			return Err(omp_storage::state::Error::InvalidAuthority.into());
+			return Err(state::Error::InvalidAuthority.into());
 		}
 		let owner = self
 			.entry_kinds
@@ -1851,7 +1858,7 @@ impl Journal {
 			.extension
 			.clone();
 		if !authority.may_read_namespace(owner.as_str()) {
-			return Err(omp_storage::state::Error::NamespaceDenied.into());
+			return Err(state::Error::NamespaceDenied.into());
 		}
 		let granted_extensions: Vec<Str> = (owner != authority.namespace())
 			.then_some(owner)
@@ -1875,12 +1882,12 @@ impl Journal {
 		ts: u64,
 		authority: &omp_storage::state::StateAuthority,
 		key: Str,
-		expected: Option<omp_storage::state::StateRevision>,
+		expected: Option<StateRevision>,
 		value: Box<RawValue>,
 		request: &omp_storage::state::DurableRequest,
 	) -> Result<SessionStateValue, JournalError> {
 		if request.idempotency_key().is_none() {
-			return Err(omp_storage::state::Error::MissingIdempotencyKey.into());
+			return Err(state::Error::MissingIdempotencyKey.into());
 		}
 		let (stamp, author) = self.session_state_request(authority, request)?;
 		let record = SessionCasRecord {
@@ -1910,18 +1917,12 @@ impl Journal {
 				.first()
 				.copied()
 				.ok_or_else(|| JournalError::IdempotencyConflict(stamp.idempotency_key.clone()))?;
-			return Ok(SessionStateValue {
-				revision: omp_storage::state::StateRevision::new(revision),
-				key,
-				value,
-			});
+			return Ok(SessionStateValue { revision: StateRevision::new(revision), key, value });
 		}
 		let actual = self.latest_session_state_value(authority.namespace(), key.as_str())?;
 		let actual_revision = actual.as_ref().map(|state| state.revision);
 		if actual_revision != expected {
-			return Err(
-				omp_storage::state::Error::CasConflict { expected, actual: actual_revision }.into(),
-			);
+			return Err(state::Error::CasConflict { expected, actual: actual_revision }.into());
 		}
 		let indexes = self.append_request_atomic(
 			ts,
@@ -1931,11 +1932,7 @@ impl Journal {
 			&author,
 		)?;
 		let revision = indexes[0];
-		let state = SessionStateValue {
-			revision: omp_storage::state::StateRevision::new(revision),
-			key,
-			value,
-		};
+		let state = SessionStateValue { revision: StateRevision::new(revision), key, value };
 		self.publish_session_state(authority.namespace(), &state);
 		Ok(state)
 	}
@@ -1950,13 +1947,13 @@ impl Journal {
 		&mut self,
 		authority: &omp_storage::state::StateAuthority,
 		key: Str,
-		since: Option<omp_storage::state::StateRevision>,
-	) -> Result<flume::Receiver<SessionStateWatchEvent>, JournalError> {
+		since: Option<StateRevision>,
+	) -> Result<Receiver<SessionStateWatchEvent>, JournalError> {
 		if authority.session_id() != self.session_id.0.as_str() {
-			return Err(omp_storage::state::Error::InvalidAuthority.into());
+			return Err(state::Error::InvalidAuthority.into());
 		}
 		if !authority.may_read_namespace(authority.namespace()) {
-			return Err(omp_storage::state::Error::NamespaceDenied.into());
+			return Err(state::Error::NamespaceDenied.into());
 		}
 		let latest = self.latest_session_state_value(authority.namespace(), key.as_str())?;
 		let (sender, receiver) = flume::bounded(2);
@@ -2046,10 +2043,10 @@ impl Journal {
 		key: &str,
 	) -> Result<Option<SessionStateValue>, JournalError> {
 		if authority.session_id() != self.session_id.0.as_str() {
-			return Err(omp_storage::state::Error::InvalidAuthority.into());
+			return Err(state::Error::InvalidAuthority.into());
 		}
 		if !authority.may_read_namespace(authority.namespace()) {
-			return Err(omp_storage::state::Error::NamespaceDenied.into());
+			return Err(state::Error::NamespaceDenied.into());
 		}
 		self.latest_session_state_value(authority.namespace(), key)
 	}
@@ -2075,7 +2072,7 @@ impl Journal {
 				.map_err(|_| JournalError::CorruptSessionState(index))?;
 			if record.namespace == namespace && record.key == key {
 				return Ok(Some(SessionStateValue {
-					revision: omp_storage::state::StateRevision::new(index),
+					revision: StateRevision::new(index),
 					key:      record.key,
 					value:    record.value,
 				}));
@@ -2090,11 +2087,11 @@ impl Journal {
 		&mut self,
 		ts: u64,
 		authority: &omp_storage::state::StateAuthority,
-		reference: omp_storage::blob::BlobRef,
+		reference: BlobRef,
 		request: &omp_storage::state::DurableRequest,
 	) -> Result<omp_storage::state::ContentRoot, JournalError> {
 		if request.idempotency_key().is_none() {
-			return Err(omp_storage::state::Error::MissingIdempotencyKey.into());
+			return Err(state::Error::MissingIdempotencyKey.into());
 		}
 		let (stamp, author) = self.session_state_request(authority, request)?;
 		let record = SessionContentRecord { namespace: Str::new(authority.namespace()), reference };
@@ -2121,7 +2118,7 @@ impl Journal {
 				.copied()
 				.ok_or_else(|| JournalError::IdempotencyConflict(stamp.idempotency_key.clone()))?;
 			return Ok(omp_storage::state::ContentRoot {
-				revision: omp_storage::state::StateRevision::new(revision),
+				revision: StateRevision::new(revision),
 				reference,
 			});
 		}
@@ -2132,10 +2129,7 @@ impl Journal {
 			&stamp,
 			&author,
 		)?;
-		Ok(omp_storage::state::ContentRoot {
-			revision: omp_storage::state::StateRevision::new(indexes[0]),
-			reference,
-		})
+		Ok(omp_storage::state::ContentRoot { revision: StateRevision::new(indexes[0]), reference })
 	}
 
 	/// Reports whether a blob reference is rooted by a live SESSION journal
@@ -2147,10 +2141,10 @@ impl Journal {
 		reference: &omp_storage::blob::BlobRef,
 	) -> Result<bool, JournalError> {
 		if authority.session_id() != self.session_id.0.as_str() {
-			return Err(omp_storage::state::Error::InvalidAuthority.into());
+			return Err(state::Error::InvalidAuthority.into());
 		}
 		if !authority.may_read_namespace(namespace) {
-			return Err(omp_storage::state::Error::NamespaceDenied.into());
+			return Err(state::Error::NamespaceDenied.into());
 		}
 		let log = self.load()?;
 		for (index, event) in log.custom(log.as_ref(), "omp.state.session.content").rev() {
@@ -2178,7 +2172,7 @@ impl Journal {
 		request: &omp_storage::state::DurableRequest,
 	) -> Result<(JournalRequestStamp, JournalAuthor), JournalError> {
 		if authority.session_id() != self.session_id.0.as_str() {
-			return Err(omp_storage::state::Error::InvalidAuthority.into());
+			return Err(state::Error::InvalidAuthority.into());
 		}
 		let generation = request.generation();
 		let stamp = JournalRequestStamp {
@@ -2435,7 +2429,7 @@ impl Journal {
 		prompt_hash: Option<PromptHash>,
 	) -> Result<u64, JournalError> {
 		item.seq = 0;
-		crate::project::truncate_item_for_persistence(&mut item);
+		project::truncate_item_for_persistence(&mut item);
 		let event = Event {
 			ts,
 			kind: Kind::Item(ItemRecord {
@@ -2479,7 +2473,7 @@ impl Journal {
 		prompt_hash: Option<PromptHash>,
 	) -> Result<u64, JournalError> {
 		item.seq = 0;
-		crate::project::truncate_item_for_persistence(&mut item);
+		project::truncate_item_for_persistence(&mut item);
 		let turn_id = Str::new(turn_id);
 		let event = Event {
 			ts,
@@ -2607,7 +2601,7 @@ impl Journal {
 				.chain(&start.prompt_head_events)
 				.chain(&start.sequence_targets)
 			{
-				if !matches!(log.get(*target), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+				if !matches!(log.get(*target), Some(omp_storage::transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
 				{
 					return Err(JournalError::InvalidTurnInput(*target));
 				}
@@ -3058,7 +3052,7 @@ impl Journal {
 			.live()
 			.iter()
 			.filter(|index| {
-				matches!(reader.transcript.log().get(*index), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+				matches!(reader.transcript.log().get(*index), Some(omp_storage::transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
 			})
 			.collect())
 	}
@@ -3076,7 +3070,7 @@ impl Journal {
 		mut outcome: Outcome,
 	) -> Result<(TurnReceipt, bool), JournalError> {
 		for item in &mut outcome.output {
-			crate::project::truncate_item_for_persistence(item);
+			project::truncate_item_for_persistence(item);
 		}
 		if let Some(receipt) = self.receipts.get(turn_id) {
 			stamp_outcome_context(&mut outcome, self.context_position());
@@ -3256,7 +3250,7 @@ impl Journal {
 			let Ok(fact) = serde_json::from_str::<FoldFact>(data.get()) else {
 				continue;
 			};
-			if fact.point == omp_core::phase::Point::Settle
+			if fact.point == phase::Point::Settle
 				&& fact
 					.turn_id
 					.as_ref()
@@ -3525,7 +3519,7 @@ impl Journal {
 		}
 		{
 			let log = self.load()?;
-			if !matches!(log.get(target), Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
+			if !matches!(log.get(target), Some(omp_storage::transcript::Entry::Ok(event)) if event_item(&event.kind).is_some())
 			{
 				return Err(JournalError::InvalidItemTarget(target));
 			}
@@ -3684,7 +3678,7 @@ fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)
 			continue;
 		};
 		if let Some(item) = event_item(&event.kind)
-			&& let Some(omp_proto::thread::v1::item::Kind::ToolResult(result)) = item.kind.as_ref()
+			&& let Some(item::Kind::ToolResult(result)) = item.kind.as_ref()
 		{
 			let recovery_turn = match &event.kind {
 				Kind::TurnInput(input) => Some(input.turn_id.clone()),
@@ -3699,7 +3693,7 @@ fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)
 				authorized.insert(batch.turn_id.clone(), batch.call_ids.iter().cloned().collect());
 			},
 			Kind::TurnReceipt(receipt)
-				if receipt.outcome.stop == omp_proto::inference::v1::StopReason::StopToolUse as i32 =>
+				if receipt.outcome.stop == v1::StopReason::StopToolUse as i32 =>
 			{
 				receipts.push((event.ts, receipt));
 			},
@@ -3714,7 +3708,7 @@ fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)
 			.output
 			.iter()
 			.filter_map(|item| match item.kind.as_ref() {
-				Some(omp_proto::thread::v1::item::Kind::ToolCall(call)) => Some((item, call)),
+				Some(item::Kind::ToolCall(call)) => Some((item, call)),
 				_ => None,
 			})
 			.collect();
@@ -3732,7 +3726,7 @@ fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)
 			} else {
 				Abort::Skipped { reason: sf!("agent restarted before invocation authorization") }
 			};
-			let result = crate::project::recovery_tool_result_item(ts, item, abort)?;
+			let result = project::recovery_tool_result_item(ts, item, abort)?;
 			let recovery_turn =
 				recovery_turn.get_or_insert_with(|| Str::new(omp_core::Ulid::generate().to_string()));
 			let index = writer.append(&Event {
@@ -3808,7 +3802,7 @@ fn recover_sequence_amendments(log: &Log, writer: &mut Writer) -> Result<(), Jou
 		for (offset, target) in recovery.start.sequence_targets.iter().enumerate() {
 			if !matches!(
 				log.get(*target),
-				Some(transcript::Entry::Ok(event)) if event_item(&event.kind).is_some()
+				Some(omp_storage::transcript::Entry::Ok(event)) if event_item(&event.kind).is_some()
 			) {
 				return Err(JournalError::InvalidTurnInput(*target));
 			}
@@ -3931,10 +3925,7 @@ fn recover_prompt_rewrites(
 }
 
 fn refresh_invariant(message: &'static str) -> JournalError {
-	JournalError::Storage(transcript::Error::Io(std::io::Error::new(
-		std::io::ErrorKind::InvalidData,
-		message,
-	)))
+	JournalError::Storage(transcript::Error::Io(io::Error::new(io::ErrorKind::InvalidData, message)))
 }
 
 fn stamp_outcome_context(outcome: &mut Outcome, context: ContextPosition) {
@@ -3997,22 +3988,27 @@ const fn event_item(kind: &Kind) -> Option<&Item> {
 #[cfg(test)]
 mod tests {
 	use std::{
+		env, fs,
 		fs::OpenOptions,
 		io::Write as _,
 		sync::atomic::{AtomicU64, Ordering},
 	};
 
-	use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
+	use omp_proto::{
+		inference::v1 as pb,
+		prost::Message as _,
+		thread::v1::{self as thread_pb, item as thread_item, part as thread_part},
+	};
 	use omp_storage::transcript::{Entry, Header, SessionId};
 	use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobOwner};
 
 	use super::*;
-	use crate::{PromptHash, project_journal};
+	use crate::{PromptHash, project::recovery_tool_result_item, project_journal};
 
 	static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
 	fn path(name: &str) -> PathBuf {
-		std::env::temp_dir().join(format!(
+		env::temp_dir().join(format!(
 			"omp-agent-journal-{name}-{}-{}.jsonl",
 			std::process::id(),
 			NEXT_PATH.fetch_add(1, Ordering::Relaxed)
@@ -4024,17 +4020,15 @@ mod tests {
 			v:       4,
 			id:      SessionId(sf!("journal-test")),
 			created: 1,
-			cwd:     std::env::temp_dir(),
+			cwd:     env::temp_dir(),
 		}
 	}
 
 	fn message(text: &str) -> Item {
 		Item {
-			kind: Some(thread_pb::item::Kind::Message(thread_pb::Message {
-				role:  thread_pb::Role::User as i32,
-				parts: vec![thread_pb::Part {
-					kind: Some(thread_pb::part::Kind::Text(text.to_owned())),
-				}],
+			kind: Some(thread_item::Kind::Message(thread_pb::Message {
+				role:  Role::User as i32,
+				parts: vec![thread_pb::Part { kind: Some(thread_part::Kind::Text(text.to_owned())) }],
 			})),
 			..Default::default()
 		}
@@ -4084,7 +4078,7 @@ mod tests {
 		assert!(matches!(log.get(1), Some(Entry::Ok(event)) if event.kind == Kind::ProviderReset));
 		assert!(matches!(log.get(2), Some(Entry::Ok(event)) if event.kind == Kind::Reset));
 		for path in [parent_path, branch_path, fork_path] {
-			std::fs::remove_file(path).expect("remove journal");
+			fs::remove_file(path).expect("remove journal");
 		}
 	}
 
@@ -4121,7 +4115,7 @@ mod tests {
 				.secondary(),
 			[secondary_b]
 		);
-		let _ = std::fs::remove_file(path);
+		let _ = fs::remove_file(path);
 	}
 
 	fn outcome() -> Outcome {
@@ -4129,10 +4123,10 @@ mod tests {
 			output: vec![Item {
 				seq:           3,
 				created_at_ms: 9,
-				kind:          Some(thread_pb::item::Kind::Message(thread_pb::Message {
-					role:  thread_pb::Role::Assistant as i32,
+				kind:          Some(thread_item::Kind::Message(thread_pb::Message {
+					role:  Role::Assistant as i32,
 					parts: vec![thread_pb::Part {
-						kind: Some(thread_pb::part::Kind::Text("answer".to_owned())),
+						kind: Some(thread_part::Kind::Text("answer".to_owned())),
 					}],
 				})),
 				props:         None,
@@ -4160,7 +4154,7 @@ mod tests {
 			output: vec![Item {
 				seq:           3,
 				created_at_ms: 4,
-				kind:          Some(thread_pb::item::Kind::ToolCall(thread_pb::ToolCall {
+				kind:          Some(thread_item::Kind::ToolCall(thread_pb::ToolCall {
 					id: "call-1".to_owned(),
 					name: "read".to_owned(),
 					args_json: br#"{"path":"x"}"#.to_vec().into(),
@@ -4233,22 +4227,22 @@ mod tests {
 		let Kind::TurnInput(input) = &event.kind else {
 			panic!("recovery must be typed turn input");
 		};
-		let Some(thread_pb::item::Kind::ToolResult(result)) = input.item.kind.as_ref() else {
+		let Some(thread_item::Kind::ToolResult(result)) = input.item.kind.as_ref() else {
 			panic!("recovery input must be tool result");
 		};
 		assert_eq!(result.call_id, "call-1");
-		let Some(thread_pb::part::Kind::Text(text)) =
+		let Some(thread_part::Kind::Text(text)) =
 			result.parts.first().and_then(|part| part.kind.as_ref())
 		else {
 			panic!("recovery result text missing");
 		};
 		assert!(text.contains(expected_text));
 		drop(log);
-		let bytes = std::fs::read(&path).expect("read once-recovered journal");
+		let bytes = fs::read(&path).expect("read once-recovered journal");
 		drop(reopened);
 
 		let reopened = Journal::open(&path).expect("reopen recovered tool");
-		assert_eq!(std::fs::read(&path).expect("read twice-recovered journal"), bytes);
+		assert_eq!(fs::read(&path).expect("read twice-recovered journal"), bytes);
 		assert_eq!(
 			reopened
 				.pending_input_submission()
@@ -4257,7 +4251,7 @@ mod tests {
 				.len(),
 			1
 		);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 	#[test]
 	fn staged_turn_input_reopens_with_exact_turn_id() {
@@ -4275,7 +4269,7 @@ mod tests {
 		assert_eq!(durable_turn_id.as_str(), turn_id);
 		assert_eq!(indexes, &[index]);
 		assert_eq!(reopened.recoverable_input_events(), &[index]);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4310,7 +4304,7 @@ mod tests {
 		let mut outcome = tool_outcome();
 		let mut second = outcome.output[0].clone();
 		second.seq = 4;
-		let Some(thread_pb::item::Kind::ToolCall(call)) = second.kind.as_mut() else {
+		let Some(thread_item::Kind::ToolCall(call)) = second.kind.as_mut() else {
 			panic!("fixture call missing");
 		};
 		call.id = "call-2".to_owned();
@@ -4323,11 +4317,10 @@ mod tests {
 			.authorize_tool_batch(5, "turn", &[sf!("call-1"), sf!("call-2")])
 			.expect("authorize tool batch");
 		let follow_up = omp_core::Ulid::generate().to_string();
-		let first_result =
-			crate::project::recovery_tool_result_item(6, &outcome.output[0], Abort::Interrupted {
-				reason: sf!("fixture terminal result"),
-			})
-			.expect("build first terminal result");
+		let first_result = recovery_tool_result_item(6, &outcome.output[0], Abort::Interrupted {
+			reason: sf!("fixture terminal result"),
+		})
+		.expect("build first terminal result");
 		journal
 			.append_turn_input(6, &follow_up, first_result, Some(hash))
 			.expect("append first result");
@@ -4339,10 +4332,10 @@ mod tests {
 			.expect("recovery submission");
 		assert_eq!(turn_id.as_str(), follow_up);
 		assert_eq!(indexes.len(), 2);
-		let bytes = std::fs::read(&path).expect("read recovered batch");
+		let bytes = fs::read(&path).expect("read recovered batch");
 		drop(reopened);
 		let reopened = Journal::open(&path).expect("reopen recovered batch");
-		assert_eq!(std::fs::read(&path).expect("read idempotent batch"), bytes);
+		assert_eq!(fs::read(&path).expect("read idempotent batch"), bytes);
 		assert_eq!(
 			reopened
 				.pending_input_submission()
@@ -4351,7 +4344,7 @@ mod tests {
 				.len(),
 			2
 		);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4436,7 +4429,7 @@ mod tests {
 		let journal = Journal::open(&path).expect("final reopen");
 		assert!(journal.pending_input_submission().is_none());
 		assert_eq!(journal.recoverable_settlement_events(), no_events);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 	#[test]
 	fn tool_crash_recovery_distinguishes_authorized_effect_uncertainty() {
@@ -4488,14 +4481,14 @@ mod tests {
 		assert_eq!(receipt.prompt_hash, prompt_hash.digest());
 		assert_eq!(receipt.prompt_head_events, vec![prompt_event]);
 		assert_eq!(receipt.outcome, expected);
-		let bytes = std::fs::read(&path).expect("read committed journal");
+		let bytes = fs::read(&path).expect("read committed journal");
 
 		let (replayed, replay) = journal
 			.append_arbiter_outcome(6, "turn", expected.clone())
 			.expect("replay exact outcome");
 		assert!(replay);
 		assert_eq!(replayed, receipt);
-		assert_eq!(std::fs::read(&path).expect("read replayed journal"), bytes);
+		assert_eq!(fs::read(&path).expect("read replayed journal"), bytes);
 
 		let mut different = expected;
 		different.provider = "other".to_owned();
@@ -4503,7 +4496,7 @@ mod tests {
 			journal.append_arbiter_outcome(7, "turn", different),
 			Err(JournalError::TurnReplayMismatch(_))
 		));
-		assert_eq!(std::fs::read(&path).expect("read rejected replay journal"), bytes);
+		assert_eq!(fs::read(&path).expect("read rejected replay journal"), bytes);
 		drop(journal);
 
 		let reopened = Journal::open(&path).expect("reopen journal");
@@ -4513,7 +4506,7 @@ mod tests {
 		let projected = project_journal(&view, view.as_ref(), &omp_tool::Registry::new(), &caps())
 			.expect("project recovered");
 		assert_eq!(projected.items[1].seq, 2, "reopen must recover the missing sequence patch");
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4566,7 +4559,7 @@ mod tests {
 		let projected = project_journal(&view, view.as_ref(), &omp_tool::Registry::new(), &caps())
 			.expect("project partial");
 		assert_eq!(projected.items, vec![message("system"), message("input")]);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 	#[test]
 	fn aborted_turn_is_settled_and_counted_across_reopen() {
@@ -4624,7 +4617,7 @@ mod tests {
 			.expect("append successful receipt");
 		assert_eq!(reopened.trailing_aborts(), 0);
 		drop(reopened);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4650,7 +4643,7 @@ mod tests {
 		assert_eq!(projected.items[0].seq, 9);
 		drop(log);
 		drop(journal);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4723,7 +4716,7 @@ mod tests {
 			drop(view);
 			let projected_bytes = projected.encode_to_vec();
 			drop(recovered);
-			let recovered_bytes = std::fs::read(&path).expect("read recovered bytes");
+			let recovered_bytes = fs::read(&path).expect("read recovered bytes");
 
 			let reopened = Journal::open(&path).expect("reopen completed rewrite");
 			assert_eq!(
@@ -4740,11 +4733,11 @@ mod tests {
 			assert_eq!(reprojection.encode_to_vec(), projected_bytes);
 			drop(reopened);
 			assert_eq!(
-				std::fs::read(&path).expect("read idempotently reopened bytes"),
+				fs::read(&path).expect("read idempotently reopened bytes"),
 				recovered_bytes,
 				"reopening must not duplicate stages or commit"
 			);
-			std::fs::remove_file(path).expect("remove journal");
+			fs::remove_file(path).expect("remove journal");
 		}
 	}
 
@@ -4755,7 +4748,7 @@ mod tests {
 		let job = |id: &'static str| JobRef {
 			id:       sf!(id),
 			owner:    JobOwner::NamedProcess { name: sf!(id), generation: 1 },
-			metadata: std::sync::Arc::default(),
+			metadata: Arc::default(),
 			artifact: ExpectedArtifact {
 				description: sf!("artifact"),
 				media_type:  Some(sf!("text/plain")),
@@ -4800,7 +4793,7 @@ mod tests {
 			Err(JournalError::JobReplayMismatch(_))
 		));
 		drop(reopened);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 	#[test]
 	fn repeated_append_projection_cycles_keep_the_complete_live_prefix() {
@@ -4819,7 +4812,7 @@ mod tests {
 		}
 		assert_eq!(journal.load().expect("borrow final journal").len(), 128);
 		drop(journal);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4853,7 +4846,7 @@ mod tests {
 			vec![first, second, third]
 		);
 		drop(journal);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4884,7 +4877,7 @@ mod tests {
 			vec![message("before tear"), message("after repair")]
 		);
 		drop(journal);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 	#[test]
 	fn projection_fails_closed_after_foreign_truncation() {
@@ -4901,7 +4894,7 @@ mod tests {
 		assert!(matches!(journal.live_item_events(), Err(JournalError::Storage(_))));
 		assert!(matches!(journal.items_at(&[0]), Err(JournalError::Storage(_))));
 		drop(journal);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4949,6 +4942,6 @@ mod tests {
 			Err(JournalError::CompactWhilePending)
 		));
 		drop(journal);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 }

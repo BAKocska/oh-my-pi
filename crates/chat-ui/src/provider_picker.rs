@@ -7,7 +7,7 @@ use omp_tui::{
 };
 
 use crate::{
-	PickerEvent,
+	PickerEvent, SessionRow,
 	overlays::{OverlayPanel, panel_divider},
 };
 
@@ -19,7 +19,7 @@ const CARD_W: u16 = 16;
 /// Grid picker over login providers; Enter or click on a card picks it.
 pub struct ProviderPicker {
 	ui:        Ui,
-	rows:      Vec<crate::SessionRow>,
+	rows:      Vec<SessionRow>,
 	query:     String,
 	ctx:       UiContext,
 	options:   OverlayOptions,
@@ -30,7 +30,7 @@ pub struct ProviderPicker {
 impl ProviderPicker {
 	/// Opens the card grid over host-supplied provider rows; `row.id` is the
 	/// provider key and `row.label` the display name.
-	pub fn open(rows: Vec<crate::SessionRow>, ctx: &UiContext) -> Self {
+	pub fn open(rows: Vec<SessionRow>, ctx: &UiContext) -> Self {
 		let mut picker = Self {
 			ui: Ui::from_root(dom! { <text>{""}</text> }, 1, ctx.clone()),
 			rows,
@@ -116,7 +116,7 @@ impl ProviderPicker {
 		self.rows.get(index).map(|row| &row.id)
 	}
 
-	fn matches(&self, row: &crate::SessionRow) -> bool {
+	fn matches(&self, row: &SessionRow) -> bool {
 		if self.query.is_empty() {
 			return true;
 		}
@@ -222,8 +222,8 @@ pub fn provider_card_grid(
 
 #[cfg(test)]
 mod tests {
+
 	use super::*;
-	use crate::SessionRow;
 
 	fn rows() -> Vec<SessionRow> {
 		["anthropic", "github-copilot", "deepseek"]

@@ -36,7 +36,10 @@ mod unicode_table {
 mod simd {
 	//! I/O processing infrastructure for tr operations with SIMD optimizations
 
-	use std::io::{BufRead, Write};
+	use std::{
+		io,
+		io::{BufRead, Write},
+	};
 
 	use super::operation::ChunkProcessor;
 
@@ -104,7 +107,7 @@ mod simd {
 			let length = match input.read(&mut buf[..]) {
 				Ok(0) => break,
 				Ok(len) => len,
-				Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
 				Err(e) => {
 					return Err(format!("read error: {e}"));
 				},
@@ -132,13 +135,15 @@ mod simd {
 
 mod operation {
 	use std::{
-		char,
+		array, char,
 		error::Error,
-		fmt::{Debug, Display},
+		fmt::{self, Debug, Display},
+		io,
 		io::{BufRead, Write},
+		iter, str,
 	};
 
-	use super::unicode_table;
+	use super::{simd::write_output, unicode_table};
 
 	/// Common trait for operations that can process chunks of data
 	pub trait ChunkProcessor {
@@ -163,7 +168,7 @@ mod operation {
 	}
 
 	impl Display for BadSequence {
-		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 			match self {
 				Self::MissingCharClassName => write!(f, "missing character class name '[::]'"),
 				Self::InvalidCharClass(class) => write!(f, "invalid character class '{class}'"),
@@ -278,7 +283,7 @@ mod operation {
 		}
 	}
 
-	impl std::iter::FusedIterator for SequenceIter {}
+	impl iter::FusedIterator for SequenceIter {}
 
 	fn class_value(class: Class, index: usize) -> Option<u8> {
 		let ranges: &[(u8, u8)] = match class {
@@ -319,7 +324,7 @@ mod operation {
 	}
 
 	impl Sequence {
-		pub fn flatten(&self) -> impl Iterator<Item = u8> + Clone + std::iter::FusedIterator {
+		pub fn flatten(&self) -> impl Iterator<Item = u8> + Clone + iter::FusedIterator {
 			SequenceIter { sequence: *self, index: 0 }
 		}
 
@@ -494,13 +499,13 @@ mod operation {
 					end += 1;
 				}
 				let digits = &input[offset + 1..end];
-				if let Ok(text) = std::str::from_utf8(digits)
+				if let Ok(text) = str::from_utf8(digits)
 					&& let Ok(value) = u8::from_str_radix(text, 8)
 				{
 					return Some((value, end, None));
 				}
 				if warn_ambiguous_octal && digits.len() == 3 {
-					let value = u8::from_str_radix(std::str::from_utf8(&digits[..2]).ok()?, 8).ok()?;
+					let value = u8::from_str_radix(str::from_utf8(&digits[..2]).ok()?, 8).ok()?;
 					let warning = format!(
 						"the ambiguous octal escape \\{} is being interpreted as the 2-byte sequence \
 						 \\0{}, {}",
@@ -708,13 +713,13 @@ mod operation {
 	impl TranslateOperation {
 		pub fn new(set1: Vec<u8>, set2: Vec<u8>) -> Result<Self, BadSequence> {
 			// Initialize translation table with identity mapping
-			let mut translation_table = std::array::from_fn(|i| i as u8);
+			let mut translation_table = array::from_fn(|i| i as u8);
 
 			if let Some(fallback) = set2.last().copied() {
 				// Apply translations from set1 to set2
 				for (from, to) in set1
 					.into_iter()
-					.zip(set2.into_iter().chain(std::iter::repeat(fallback)))
+					.zip(set2.into_iter().chain(iter::repeat(fallback)))
 				{
 					translation_table[from as usize] = to;
 				}
@@ -797,7 +802,7 @@ mod operation {
 			let length = match input.read(&mut buf[..]) {
 				Ok(0) => break, // EOF reached
 				Ok(len) => len,
-				Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
 				Err(e) => {
 					return Err(format!("read error: {e}"));
 				},
@@ -812,7 +817,7 @@ mod operation {
 			}
 
 			if !output_buf.is_empty() {
-				super::simd::write_output(output, &output_buf)?;
+				write_output(output, &output_buf)?;
 			}
 		}
 

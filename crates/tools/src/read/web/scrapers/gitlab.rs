@@ -432,6 +432,7 @@ mod tests {
 	use std::{
 		collections::VecDeque,
 		future::{Future, ready},
+		iter::empty,
 	};
 
 	use bytes::Bytes;
@@ -651,7 +652,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn unsupported_route_falls_back_without_http_requests() {
-		let client = FakeClient::new(std::iter::empty::<Result<HttpResponse, WebError>>());
+		let client = FakeClient::new(empty::<Result<HttpResponse, WebError>>());
 		let result =
 			render(&client, &Url::parse("https://gitlab.com/group/project/-/commits/main").unwrap())
 				.await

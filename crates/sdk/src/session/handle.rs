@@ -1,7 +1,8 @@
 //! Durable embedded-session handle and cold-revival actor.
 
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Instant};
+use std::{error, future::Future, path::PathBuf, pin::Pin, sync, sync::Arc, time, time::Instant};
 
+use flume::Receiver;
 use omp_agent::{
 	AbortHandle, Agent, AgentError, AgentEvent, AgentRunSummary, CampaignEntry, CampaignMachine,
 	CampaignSpec, EngageOptions, EngageReceipt, EventSubscription, ManualCompactionOutcome,
@@ -12,6 +13,7 @@ use omp_proto::thread::v1::Item;
 use omp_telemetry::firehose::{Envelope, Event as TelemetryEvent, Firehose, SessionDispatch};
 use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::{runtime, sync::watch};
 
 use super::SessionDiagnostics;
 use crate::CallbackSet;
@@ -59,13 +61,13 @@ pub enum SessionRevivalError {
 	Composition {
 		/// Typed application error retained as the source.
 		#[source]
-		source: Box<dyn std::error::Error + Send + Sync>,
+		source: Box<dyn error::Error + Send + Sync>,
 	},
 }
 
 impl SessionRevivalError {
 	/// Wraps a typed application composition error.
-	pub fn composition(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+	pub fn composition(source: impl error::Error + Send + Sync + 'static) -> Self {
 		Self::Composition { source: Box::new(source) }
 	}
 }
@@ -94,26 +96,32 @@ pub enum SessionLifecycle {
 	Closed,
 }
 
-/// Lifecycle receiver that does not expose the mutable watch sender.
-#[derive(Clone)]
-pub struct SessionLifecycleSubscription {
-	rx: tokio::sync::watch::Receiver<SessionLifecycle>,
-}
+mod lifecycle_subscription {
+	use tokio::sync::watch::{Receiver, error};
 
-impl SessionLifecycleSubscription {
-	/// Returns the latest lifecycle state.
-	pub fn current(&self) -> SessionLifecycle {
-		*self.rx.borrow()
+	use super::SessionLifecycle;
+
+	/// Lifecycle receiver that does not expose the mutable watch sender.
+	#[derive(Clone)]
+	pub struct SessionLifecycleSubscription {
+		pub(super) rx: Receiver<SessionLifecycle>,
 	}
 
-	/// Waits for and returns the next lifecycle state.
-	pub async fn changed(
-		&mut self,
-	) -> Result<SessionLifecycle, tokio::sync::watch::error::RecvError> {
-		self.rx.changed().await?;
-		Ok(*self.rx.borrow())
+	impl SessionLifecycleSubscription {
+		/// Returns the latest lifecycle state.
+		pub fn current(&self) -> SessionLifecycle {
+			*self.rx.borrow()
+		}
+
+		/// Waits for and returns the next lifecycle state.
+		pub async fn changed(&mut self) -> Result<SessionLifecycle, error::RecvError> {
+			self.rx.changed().await?;
+			Ok(*self.rx.borrow())
+		}
 	}
 }
+
+pub use lifecycle_subscription::SessionLifecycleSubscription;
 
 /// Session-handle operation failure.
 #[derive(Debug, Error)]
@@ -278,7 +286,7 @@ struct HandleInner {
 	callbacks:   CallbackSet,
 	commands:    flume::Sender<Command>,
 	abort:       Mutex<Option<AbortHandle>>,
-	lifecycle:   tokio::sync::watch::Sender<SessionLifecycle>,
+	lifecycle:   watch::Sender<SessionLifecycle>,
 	firehose:    Option<Arc<Firehose>>,
 }
 
@@ -313,7 +321,7 @@ impl SessionHandle {
 			SessionLifecycle::Disposed
 		};
 		let (commands, rx) = flume::unbounded();
-		let (lifecycle, _) = tokio::sync::watch::channel(initial);
+		let (lifecycle, _) = watch::channel(initial);
 		let abort = runtime.as_ref().map(|runtime| runtime.abort.clone());
 		let inner = Arc::new(HandleInner {
 			identity,
@@ -326,7 +334,7 @@ impl SessionHandle {
 		});
 		let actor_inner = Arc::downgrade(&inner);
 		let runtime_handle =
-			tokio::runtime::Handle::try_current().map_err(|_| SessionHandleError::NoRuntime)?;
+			runtime::Handle::try_current().map_err(|_| SessionHandleError::NoRuntime)?;
 		runtime_handle.spawn(run_handle_actor(actor_inner, rx, runtime, revival, constructed_at));
 		Ok(Self { inner })
 	}
@@ -489,8 +497,8 @@ impl SessionHandle {
 }
 
 async fn run_handle_actor(
-	inner: std::sync::Weak<HandleInner>,
-	commands: flume::Receiver<Command>,
+	inner: sync::Weak<HandleInner>,
+	commands: Receiver<Command>,
 	mut runtime: Option<SessionRuntime>,
 	revival: Option<SessionRevivalFactory>,
 	constructed_at: Instant,
@@ -663,7 +671,7 @@ fn publish_event(inner: &HandleInner, event: Arc<AgentEvent>, constructed_at: In
 }
 
 fn now_ms() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	time::SystemTime::now()
+		.duration_since(time::UNIX_EPOCH)
 		.map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }

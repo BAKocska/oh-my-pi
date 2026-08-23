@@ -1,6 +1,9 @@
+use std::{fmt, net};
+
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use omp_core::{ExposeSecret as _, SecretString, Str};
 use serde::{Deserialize, Serialize};
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{OAuthHttpClient, OAuthHttpRequest, OAuthRequestError, OAuthTransportError};
@@ -55,8 +58,8 @@ pub struct ClientConfiguration<'a> {
 	pub client_name:           &'a str,
 }
 
-impl std::fmt::Debug for ClientRegistration {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ClientRegistration {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("ClientRegistration")
 			.field("client_id", &self.client_id)
@@ -163,7 +166,7 @@ pub async fn register_client(
 }
 
 fn valid_native_redirect(value: &str) -> bool {
-	let Ok(url) = url::Url::parse(value) else {
+	let Ok(url) = Url::parse(value) else {
 		return false;
 	};
 	if url.fragment().is_some() {
@@ -171,9 +174,7 @@ fn valid_native_redirect(value: &str) -> bool {
 	}
 	match (url.scheme(), url.host_str()) {
 		("http", Some("localhost")) => true,
-		("http", Some(host)) => host
-			.parse::<std::net::IpAddr>()
-			.is_ok_and(|ip| ip.is_loopback()),
+		("http", Some(host)) => host.parse::<net::IpAddr>().is_ok_and(|ip| ip.is_loopback()),
 		("https", Some(_)) => true,
 		_ => false,
 	}

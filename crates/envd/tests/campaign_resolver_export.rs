@@ -1,3 +1,5 @@
+//! Proves frozen campaign declarations resolve and dispatch only for their live
+//! host generation.
 use std::{collections::BTreeSet, sync::Arc};
 
 use omp_core::{ArtifactDigest, Point, Principal, Provenance, Str, sf};

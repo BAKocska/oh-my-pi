@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, process::Command};
+use std::{env, ffi::OsStr, os::unix::ffi::OsStrExt, process::Command};
 
 /// The corrupt bytes cmux/Ghostty staged as `GHOSTTY_BIN_DIR` on the
 /// reporter's host: `9d d9 50` has no valid UTF-8 encoding.
@@ -37,7 +37,7 @@ fn run_with_corrupt_env(script: &str) -> (String, String, i32) {
 /// still land in the shell.
 #[test]
 fn startup_skips_non_utf8_entries_and_preserves_valid_env() {
-	let path = std::env::var("PATH").unwrap_or_default();
+	let path = env::var("PATH").unwrap_or_default();
 
 	let (stdout, stderr, exit) =
 		run_with_corrupt_env("echo \"$OMP_TEST_SENTINEL_8925\"; echo \"$PATH\"");

@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::mcp::McpService;
 
 /// Environment-scoped MCP resource resolver.
-pub(super) struct McpUrlResolver {
+pub(crate) struct McpUrlResolver {
 	service: Arc<McpService>,
 }
 

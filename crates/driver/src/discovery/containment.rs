@@ -142,7 +142,8 @@ mod tests {
 		));
 		#[cfg(unix)]
 		{
-			std::os::unix::fs::symlink(tree.path().join("outside"), root.join("escape")).unwrap();
+			use std::os::unix::fs;
+			fs::symlink(tree.path().join("outside"), root.join("escape")).unwrap();
 			assert!(matches!(
 				contained_existing(&root, Path::new("escape")),
 				Err(ContainmentError::Escape { .. })

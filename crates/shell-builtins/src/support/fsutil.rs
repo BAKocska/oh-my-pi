@@ -89,11 +89,11 @@ pub(crate) enum ResolveMode {
 
 #[derive(Clone, Debug)]
 enum OwnedComponent {
-	Prefix(std::ffi::OsString),
+	Prefix(ffi::OsString),
 	Root,
 	Current,
 	Parent,
-	Normal(std::ffi::OsString),
+	Normal(ffi::OsString),
 }
 
 impl OwnedComponent {
@@ -158,7 +158,7 @@ pub(crate) fn canonicalize(
 	let absolute = if original.is_absolute() {
 		original.to_owned()
 	} else {
-		fs::canonicalize(std::env::current_dir()?)?.join(original)
+		fs::canonicalize(env::current_dir()?)?.join(original)
 	};
 	let path = if resolve == ResolveMode::Logical {
 		normalize_lexically(&absolute)
@@ -406,6 +406,8 @@ pub(crate) mod sane_blksize {
 		}
 	}
 }
+
+use std::{env, ffi};
 
 #[cfg(unix)]
 pub(crate) use libc::{major, minor};

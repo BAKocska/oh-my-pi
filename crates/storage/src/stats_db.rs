@@ -3,7 +3,10 @@
 //! The schema intentionally has no column capable of storing raw prompts.
 //! User-message rows contain derived counters only.
 
-use std::path::{Path, PathBuf};
+use std::{
+	fmt, fs, io,
+	path::{Path, PathBuf},
+};
 
 use omp_core::Str;
 use omp_telemetry::{sentiment::UserSentimentMetrics, stats::LocalAnalyticsConsent};
@@ -71,7 +74,7 @@ pub enum AgentType {
 pub enum StatsDbError {
 	/// Database parent directory could not be created.
 	#[error("failed to create statistics database directory")]
-	Directory(#[source] std::io::Error),
+	Directory(#[source] io::Error),
 	/// SQLite operation failed.
 	#[error("statistics database operation failed")]
 	Database(#[from] rusqlite::Error),
@@ -90,8 +93,8 @@ pub struct StatsDb {
 	path:       PathBuf,
 }
 
-impl std::fmt::Debug for StatsDb {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for StatsDb {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("StatsDb")
 			.field("path", &self.path)
@@ -113,7 +116,7 @@ impl StatsDb {
 	) -> Result<Self, StatsDbError> {
 		let path = path.as_ref();
 		if let Some(parent) = path.parent() {
-			std::fs::create_dir_all(parent).map_err(StatsDbError::Directory)?;
+			fs::create_dir_all(parent).map_err(StatsDbError::Directory)?;
 		}
 		let mut connection = Connection::open(path)?;
 		connection.pragma_update(None, "journal_mode", "WAL")?;

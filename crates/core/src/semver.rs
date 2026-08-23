@@ -99,10 +99,9 @@ macro_rules! semver {
 #[cfg(test)]
 mod tests {
 	use super::SemVer;
-
-	const TWO_COMPONENTS: SemVer = crate::semver!(5.6);
-	const THREE_COMPONENTS: SemVer = crate::semver!(5.6.7);
-	const MAX_COMPONENTS: SemVer = crate::semver!(255.255.255);
+	const TWO_COMPONENTS: SemVer = semver!(5.6);
+	const THREE_COMPONENTS: SemVer = semver!(5.6.7);
+	const MAX_COMPONENTS: SemVer = semver!(255.255.255);
 
 	#[test]
 	fn macro_defaults_patch_and_supports_three_components() {

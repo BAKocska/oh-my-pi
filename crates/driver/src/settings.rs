@@ -1,38 +1,31 @@
 //! Persisted application settings and layered extension configuration.
 
-use std::{
-	fmt,
-	path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use omp_agent::{CompactionMethodOrder, CompactionTier};
-use omp_core::{Duration, DurationError, Str, sf};
+use omp_core::{Str, sf};
 use omp_inference::{Difficulty, DifficultyBackend};
 mod domains;
 pub use domains::{
 	AppearanceSettings, CompletionSettings, DisplaySettings, ErrorNotificationSettings,
-	HyperlinkMode, InteractionSettings, LifecycleSettings, NotifyToggle, ResizeScrollbackMode,
-	RootDisplaySettings, ShareSettings, ShareStore, ShimmerMode, TitleSettings, TtsrContextMode,
-	TtsrInterruptMode, TtsrSettings, TuiSettings,
+	HyperlinkMode, InteractionSettings, LifecycleSettings, NotifyToggle, RootDisplaySettings,
+	ShareSettings, ShareStore, ShimmerMode, TitleSettings, TtsrContextMode, TtsrInterruptMode,
+	TtsrSettings, TuiSettings,
 };
 pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
-impl crate::prompt_prep::settings::PromptSettings {
+impl PromptSettings {
 	/// Applies CLI overrides supplied through a composition-layer conversion.
 	///
 	/// The owning application implements the conversion for its CLI argument
 	/// type, keeping command-line parsing out of the driver crate.
 	pub fn with_cli<'a, T>(self, cli: &'a T) -> Self
 	where
-		crate::prompt_prep::settings::PromptOverrides: From<&'a T>,
+		PromptOverrides: From<&'a T>,
 	{
-		self.with_overrides(&crate::prompt_prep::settings::PromptOverrides::from(cli))
+		self.with_overrides(&PromptOverrides::from(cli))
 	}
 }
-use omp_tool::DEFAULT_INTERRUPT_GRACE;
-use serde::{
-	Deserialize, Deserializer, Serialize, Serializer,
-	de::{self, Visitor},
-};
+use serde::{Deserialize, Serialize};
 
 /// Persisted composer chrome style selected independently of a TUI renderer.
 #[derive(
@@ -68,11 +61,17 @@ pub enum ComposerStyle {
 	Rail,
 }
 
+use std::env;
+
+use omp_collab::link::{RelayEndpoint, WebEndpoint};
 use omp_envd::{
 	host_settings::{RuntimeDurations, WorktreeSettings},
 	tool_settings::ToolSettings,
 };
 use omp_ext::config::{ExtensionOverlay, Scope, ScopedOverlay};
+use omp_settings::manager::{SettingsManager, SettingsManagerError, SettingsPaths};
+
+use crate::prompt_prep::settings::{PromptOverrides, PromptSettings};
 
 const PERSISTED_SCOPES: &[omp_settings::SettingScope] = &[
 	omp_settings::SettingScope::Global,
@@ -669,21 +668,17 @@ impl Default for CollabSettings {
 
 impl CollabSettings {
 	/// Validates and normalizes the relay origin.
-	pub fn relay_endpoint(
-		&self,
-	) -> Result<omp_collab::link::RelayEndpoint, omp_collab::link::EndpointError> {
-		omp_collab::link::RelayEndpoint::parse(&self.relay_url)
+	pub fn relay_endpoint(&self) -> Result<RelayEndpoint, omp_collab::link::EndpointError> {
+		RelayEndpoint::parse(&self.relay_url)
 	}
 
 	/// Validates the configured browser origin or derives it from the relay.
-	pub fn web_endpoint(
-		&self,
-	) -> Result<omp_collab::link::WebEndpoint, omp_collab::link::EndpointError> {
+	pub fn web_endpoint(&self) -> Result<WebEndpoint, omp_collab::link::EndpointError> {
 		let relay = self.relay_endpoint()?;
 		if self.web_url.trim().is_empty() {
-			Ok(omp_collab::link::WebEndpoint::from_relay(&relay))
+			Ok(WebEndpoint::from_relay(&relay))
 		} else {
-			omp_collab::link::WebEndpoint::parse(&self.web_url)
+			WebEndpoint::parse(&self.web_url)
 		}
 	}
 
@@ -741,12 +736,14 @@ fn os_username() -> Option<String> {
 
 #[cfg(windows)]
 fn os_username() -> Option<String> {
-	std::env::var("USERNAME").ok()
+	use std::env;
+	env::var("USERNAME").ok()
 }
 
 #[cfg(not(any(unix, windows)))]
 fn os_username() -> Option<String> {
-	std::env::var("USER").ok()
+	use std::env;
+	env::var("USER").ok()
 }
 
 /// Persisted client-scope preferences under `<data_dir>/config.toml`.
@@ -868,7 +865,7 @@ omp_settings::inventory::submit! {
 }
 
 /// Loads the current typed projection through the single settings authority.
-pub fn current(data_dir: &Path) -> Result<Settings, omp_settings::manager::SettingsManagerError> {
+pub fn current(data_dir: &Path) -> Result<Settings, SettingsManagerError> {
 	current_with_overlays(data_dir, &[])
 }
 
@@ -876,15 +873,15 @@ pub fn current(data_dir: &Path) -> Result<Settings, omp_settings::manager::Setti
 pub fn current_with_overlays(
 	data_dir: &Path,
 	overlays: &[PathBuf],
-) -> Result<Settings, omp_settings::manager::SettingsManagerError> {
-	let project = std::env::current_dir().ok();
-	let mut paths = omp_settings::manager::SettingsPaths::discover(data_dir, project.as_deref());
+) -> Result<Settings, SettingsManagerError> {
+	let project = env::current_dir().ok();
+	let mut paths = SettingsPaths::discover(data_dir, project.as_deref());
 	paths.overlays.extend_from_slice(overlays);
-	let manager = omp_settings::manager::SettingsManager::open(paths)?;
+	let manager = SettingsManager::open(paths)?;
 	let projection = manager
 		.snapshot()
 		.project::<Settings>()
-		.map_err(|error| omp_settings::manager::SettingsManagerError::Projection { source: error })?;
+		.map_err(|error| SettingsManagerError::Projection { source: error })?;
 	let mut settings = projection.get().clone();
 	settings.mnemopi = settings.mnemopi.normalize();
 	Ok(settings)
@@ -915,6 +912,8 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use omp_core::DurationUnit;
 
 	use super::*;
@@ -945,7 +944,10 @@ mod tests {
 		.expect("tool settings parse");
 		assert!(!settings.tools.enabled("ask"));
 		assert!(settings.tools.enabled("todo"));
-		assert_eq!(settings.tools.max_timeout, Some(Duration::new(30, DurationUnit::Seconds)));
+		assert_eq!(
+			settings.tools.max_timeout,
+			Some(omp_core::Duration::new(30, DurationUnit::Seconds))
+		);
 		assert_eq!(settings.tools.edit_dialect.as_deref(), Some("rep.1"));
 	}
 
@@ -1018,7 +1020,7 @@ mod tests {
 
 		assert_eq!(
 			settings.runtime_durations().interrupt_grace,
-			Duration::new(375, DurationUnit::Milliseconds),
+			omp_core::Duration::new(375, DurationUnit::Milliseconds),
 		);
 		assert_eq!(settings.runtime_durations().interrupt_grace.to_string(), "375ms");
 	}
@@ -1074,14 +1076,13 @@ mod tests {
 	fn corrupt_settings_are_quarantined_with_diagnostics() {
 		let data_dir = tempfile::tempdir().expect("create temporary data directory");
 		let path = data_dir.path().join("config.toml");
-		std::fs::write(&path, "not valid toml").expect("write corrupt settings");
-		let manager =
-			omp_settings::manager::SettingsManager::open(omp_settings::manager::SettingsPaths {
-				global:   path.clone(),
-				project:  None,
-				overlays: Vec::new(),
-			})
-			.expect("manager");
+		fs::write(&path, "not valid toml").expect("write corrupt settings");
+		let manager = SettingsManager::open(SettingsPaths {
+			global:   path.clone(),
+			project:  None,
+			overlays: Vec::new(),
+		})
+		.expect("manager");
 		let diagnostics = manager.diagnostics();
 		assert_eq!(diagnostics.len(), 1);
 		assert_eq!(diagnostics[0].path, path);

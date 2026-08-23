@@ -2,11 +2,13 @@
 
 mod support;
 
+use std::io;
+
 use omp_ar::{Archive, Error, Format, Limits};
 use support::fixtures::fixture_bytes;
 
-fn open(name: &str) -> omp_ar::Result<Archive<std::io::Cursor<Vec<u8>>>> {
-	Archive::with_format(std::io::Cursor::new(fixture_bytes(name)), Format::SevenZip)
+fn open(name: &str) -> omp_ar::Result<Archive<io::Cursor<Vec<u8>>>> {
+	Archive::with_format(io::Cursor::new(fixture_bytes(name)), Format::SevenZip)
 }
 
 #[test]

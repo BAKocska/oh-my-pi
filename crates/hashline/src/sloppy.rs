@@ -1,6 +1,6 @@
 //! Pi-compatible sparse-edit parsing and pure, atomic text transformation.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, mem};
 
 use omp_core::Str;
 
@@ -30,25 +30,50 @@ pub enum SloppyError {
 	MissingPath,
 	/// A section had no operations.
 	#[error("sloppy section for {path} has no operations")]
-	EmptySection { path: Str },
+	EmptySection {
+		/// Authored repository-relative path of the empty section.
+		path: Str,
+	},
 	/// An operation opener was malformed.
 	#[error("operation {operation} has an invalid § opener")]
-	InvalidOpener { operation: usize },
+	InvalidOpener {
+		/// One-based position of the operation whose opener was expected.
+		operation: usize,
+	},
 	/// Match/rewrite structure was malformed.
 	#[error("operation {operation} is malformed: {reason}")]
-	Malformed { operation: usize, reason: &'static str },
+	Malformed {
+		/// One-based position of the malformed operation.
+		operation: usize,
+		/// Static explanation of the violated syntax rule.
+		reason:    &'static str,
+	},
 	/// A pattern found no bounded exact or fuzzy match.
 	#[error("operation {operation} did not match the source")]
-	NoMatch { operation: usize },
+	NoMatch {
+		/// One-based position of the unmatched operation.
+		operation: usize,
+	},
 	/// A unique operation matched multiple locations.
 	#[error("operation {operation} is ambiguous at source lines {lines:?}; use §* or add context")]
-	Ambiguous { operation: usize, lines: Vec<usize> },
+	Ambiguous {
+		/// One-based position of the ambiguous operation.
+		operation: usize,
+		/// One-based source lines where candidate matches begin.
+		lines:     Vec<usize>,
+	},
 	/// Applying selected ranges would overlap incompatibly.
 	#[error("operation {operation} overlaps another operation incompatibly")]
-	Overlap { operation: usize },
+	Overlap {
+		/// One-based position of the operation that conflicts with another edit.
+		operation: usize,
+	},
 	/// An operation parsed cleanly but changed no bytes.
 	#[error("operation {operation} produced no change")]
-	NoChange { operation: usize },
+	NoChange {
+		/// One-based position of the operation reported as unchanged.
+		operation: usize,
+	},
 }
 
 /// Extracts path-bearing `§` openers from a possibly incomplete payload.
@@ -339,7 +364,7 @@ fn build_operation(
 				block_rewrite: (!redundant).then_some(rewrite),
 			})
 		},
-		Some(rewrite) if selections.bare > 0 => Err(SloppyError::Malformed {
+		Some(_) if selections.bare > 0 => Err(SloppyError::Malformed {
 			operation,
 			reason: "block rewrite may accompany exactly one bare ⟪current⟫ selection",
 		}),
@@ -459,7 +484,7 @@ fn embed_add_lines(pattern: &str) -> String {
 			&& let Some(anchor) = output.last_mut()
 			&& is_near_variant(anchor, &added[0])
 		{
-			let old = std::mem::take(anchor);
+			let old = mem::take(anchor);
 			*anchor = format!("{SELECT_OPEN}{old}{SELECT_DIVIDER}{}{SELECT_CLOSE}", added[0]);
 			continue;
 		}

@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use crate::{Shell, error, expansion, extensions, interp};
+use crate::{
+	Shell, error, expansion, extensions, interp,
+	sys::fs::{get_system_profile_path, get_system_rc_path},
+};
 
 /// Behavior for loading profile files.
 #[derive(Default)]
@@ -70,7 +73,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 			//     * ~/.bash_login
 			//     * ~/.profile
 			//
-			if let Some(system_profile) = crate::sys::fs::get_system_profile_path() {
+			if let Some(system_profile) = get_system_profile_path() {
 				self.source_if_exists(system_profile, &params).await?;
 			}
 			if let Some(home_path) = self.home_dir() {
@@ -110,7 +113,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 						//     system rc file (e.g. /etc/bash.bashrc on Unix)
 						//     ~/.bashrc
 						//
-						if let Some(system_rc) = crate::sys::fs::get_system_rc_path() {
+						if let Some(system_rc) = get_system_rc_path() {
 							self.source_if_exists(system_rc, &params).await?;
 						}
 						if let Some(home_path) = self.home_dir() {

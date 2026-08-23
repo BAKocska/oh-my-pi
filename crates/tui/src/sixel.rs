@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Write as _};
+use std::{collections::BTreeMap, fmt::Write as _, io};
 
 use crate::escape::esc;
 
@@ -35,7 +35,7 @@ impl SixelImage {
 	}
 
 	pub(crate) fn from_png(bytes: &[u8]) -> Option<Self> {
-		let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+		let mut decoder = png::Decoder::new(io::Cursor::new(bytes));
 		decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
 		let mut reader = decoder.read_info().ok()?;
 		let mut buffer = vec![0_u8; reader.output_buffer_size()?];

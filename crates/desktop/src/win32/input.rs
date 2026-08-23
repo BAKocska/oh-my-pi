@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 
 use super::{
@@ -17,7 +19,7 @@ pub(super) fn create_global_input() -> CoreResult<Enigo> {
 	)
 }
 
-fn enigo_error(error: impl std::fmt::Display) -> DesktopError {
+fn enigo_error(error: impl Display) -> DesktopError {
 	DesktopError::input_failed(format!("Win32 global input failed: {error}"))
 }
 
@@ -166,7 +168,7 @@ fn global_key_chord(input: &mut Enigo, keys: &[KeyName]) -> CoreResult<()> {
 }
 
 mod background {
-	use std::ffi::c_void;
+	use std::{ffi::c_void, ptr};
 
 	use windows_sys::Win32::{
 		Foundation::{GetLastError, HWND, LPARAM, POINT, WPARAM},
@@ -189,7 +191,10 @@ mod background {
 		},
 	};
 
-	use super::{CoreResult, DesktopError, KeyName, Modifiers, MouseButton, PointerEvent};
+	use super::{
+		CoreResult, DesktopError, KeyName, Modifiers, MouseButton, PointerEvent, modifier_keys,
+		scroll_steps,
+	};
 	use crate::win32::{
 		capture,
 		delivery::{EventKind, would_be_silently_dropped},
@@ -206,7 +211,7 @@ mod background {
 		let address = id
 			.parse::<usize>()
 			.map_err(|_| DesktopError::invalid_target(format!("invalid Win32 window id '{id}'")))?;
-		let hwnd = std::ptr::with_exposed_provenance_mut::<c_void>(address);
+		let hwnd = ptr::with_exposed_provenance_mut::<c_void>(address);
 		// SAFETY: IsWindow validates the opaque value before it is used.
 		if unsafe { IsWindow(hwnd) } == 0 {
 			return Err(DesktopError::window_not_found(format!(
@@ -333,8 +338,8 @@ mod background {
 			PointerEvent::Scroll { x, y, dx, dy } => {
 				let (physical_x, physical_y) = capture::logical_to_physical(x, y)?;
 				let location = packed_point(physical_x, physical_y)?;
-				let horizontal = super::scroll_steps(dx).saturating_mul(WHEEL_DELTA);
-				let vertical = super::scroll_steps(dy).saturating_mul(-WHEEL_DELTA);
+				let horizontal = scroll_steps(dx).saturating_mul(WHEEL_DELTA);
+				let vertical = scroll_steps(dy).saturating_mul(-WHEEL_DELTA);
 				if horizontal != 0 {
 					post(hwnd, WM_MOUSEHWHEEL, wheel_wparam(horizontal)?, location)?;
 				}
@@ -500,7 +505,7 @@ mod background {
 	) -> CoreResult<()> {
 		let mut emitter = KeyEmitter { hwnd, alt_depth: 0 };
 		let mut held = Vec::with_capacity(4);
-		for key in super::modifier_keys(modifiers) {
+		for key in modifier_keys(modifiers) {
 			if let Err(error) = emitter.key(key, true) {
 				for held_key in held.into_iter().rev() {
 					let _ = emitter.key(held_key, false);
@@ -568,28 +573,32 @@ mod background {
 mod foreground {
 	use std::{mem::size_of, thread, time::Duration};
 
-	use windows_sys::Win32::UI::{
-		Input::KeyboardAndMouse::{
-			INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-			KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-			MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-			MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-			MOUSEINPUT, SendInput,
-		},
-		WindowsAndMessaging::{
-			GetForegroundWindow, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-			SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetForegroundWindow,
+	use windows_sys::Win32::{
+		Foundation,
+		UI::{
+			Input::KeyboardAndMouse::{
+				INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
+				KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+				MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+				MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+				MOUSEINPUT, SendInput,
+			},
+			WindowsAndMessaging::{
+				GetForegroundWindow, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+				SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetForegroundWindow,
+			},
 		},
 	};
 
 	use super::{
 		CoreResult, DesktopError, KeyName, Modifiers, MouseButton, PointerEvent, background, capture,
+		modifier_keys, scroll_steps,
 	};
 
 	#[must_use]
 	struct ForegroundGuard {
-		previous: windows_sys::Win32::Foundation::HWND,
-		target:   windows_sys::Win32::Foundation::HWND,
+		previous: Foundation::HWND,
+		target:   Foundation::HWND,
 	}
 	impl ForegroundGuard {
 		fn activate(id: &str) -> CoreResult<Self> {
@@ -700,8 +709,8 @@ mod foreground {
 			},
 			PointerEvent::Scroll { x, y, dx, dy } => {
 				move_to(x, y)?;
-				let horizontal = super::scroll_steps(dx).saturating_mul(120);
-				let vertical = super::scroll_steps(dy).saturating_mul(-120);
+				let horizontal = scroll_steps(dx).saturating_mul(120);
+				let vertical = scroll_steps(dy).saturating_mul(-120);
 				if horizontal != 0 {
 					send(mouse_event(MOUSEEVENTF_HWHEEL, horizontal as u32))?;
 				}
@@ -733,7 +742,7 @@ mod foreground {
 		operation: impl FnOnce() -> CoreResult<()>,
 	) -> CoreResult<()> {
 		let mut held = Vec::with_capacity(4);
-		for key in super::modifier_keys(modifiers) {
+		for key in modifier_keys(modifiers) {
 			let vk = background::virtual_key(key)?.0;
 			if let Err(error) = send(key_event(vk, 0, 0)) {
 				for held_vk in held.into_iter().rev() {

@@ -1,10 +1,12 @@
-use std::{sync::LazyLock, thread};
+use std::sync::{LazyLock, mpsc};
 
 use atspi::ObjectRefOwned;
 use flume::{Receiver, Sender};
 #[cfg(feature = "wayland-pipewire")]
 use image::RgbaImage;
 
+#[cfg(feature = "wayland-pipewire")]
+use super::wayland::capture::capture as capture_frame;
 use super::{ax::ActorAx, wayland::libei::ActorLibei};
 use crate::{
 	ax::{AxHandle, AxProps},
@@ -44,7 +46,7 @@ struct DesktopActor {
 
 static DESKTOP_ACTOR: LazyLock<Result<DesktopActor, String>> = LazyLock::new(|| {
 	let (tx, rx) = flume::unbounded();
-	let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+	let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 	thread::Builder::new()
 		.name("omp-desktop".to_string())
 		.spawn(move || run(rx, ready_tx))
@@ -72,7 +74,7 @@ fn request<T>(make: impl FnOnce(Reply<T>) -> Command) -> CoreResult<T> {
 		.map_err(|_| DesktopError::internal("desktop actor dropped a reply"))?
 }
 
-fn run(rx: Receiver<Command>, ready: std::sync::mpsc::SyncSender<Result<(), String>>) {
+fn run(rx: Receiver<Command>, ready: mpsc::SyncSender<Result<(), String>>) {
 	let mut ax = match ActorAx::new() {
 		Ok(ax) => ax,
 		Err(err) => {
@@ -111,7 +113,7 @@ fn run(rx: Receiver<Command>, ready: std::sync::mpsc::SyncSender<Result<(), Stri
 			},
 			#[cfg(feature = "wayland-pipewire")]
 			Command::Capture(reply) => {
-				send_reply(reply, super::wayland::capture::capture(ax.runtime()));
+				send_reply(reply, capture_frame(ax.runtime()));
 			},
 			Command::LibeiInit(reply) => {
 				let result = if libei.is_some() {

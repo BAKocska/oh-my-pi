@@ -5,13 +5,14 @@ use std::{
 	fmt::Write as _,
 	future::Future,
 	io::{self, Write},
-	time::Duration,
+	mem, result,
+	time::{Duration, Instant},
 };
 
 use clap::Parser;
 use omp_core::Str;
 use omp_shell_engine::{ExecutionContext, ExecutionExitCode, ExecutionResult, builtins};
-use tokio::time;
+use tokio::time::sleep;
 
 use crate::proc_snapshot::{ProcInfo, sanitize_process_command};
 
@@ -213,8 +214,7 @@ impl builtins::Command for TopCommand {
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,
 		context: ExecutionContext<'_, SE>,
-	) -> impl Future<Output = std::result::Result<ExecutionResult, omp_shell_engine::Error>> + Send
-	{
+	) -> impl Future<Output = result::Result<ExecutionResult, omp_shell_engine::Error>> + Send {
 		let iterations = self.iterations;
 		let delay = self.delay;
 		let row_limit = self.rows;
@@ -246,7 +246,7 @@ impl builtins::Command for TopCommand {
 			let delay = Duration::from_secs_f64(delay);
 			let pid_filter: HashSet<i32> = pids.into_iter().collect();
 			let mut previous = HashMap::<i32, (u64, Duration)>::new();
-			let mut previous_sample = std::time::Instant::now();
+			let mut previous_sample = Instant::now();
 			let mut next_previous = HashMap::new();
 			let mut rows = Vec::new();
 			let mut output = String::new();
@@ -257,7 +257,7 @@ impl builtins::Command for TopCommand {
 					return Ok(ExecutionExitCode::Interrupted.into());
 				}
 
-				let now = std::time::Instant::now();
+				let now = Instant::now();
 				let elapsed = now.duration_since(previous_sample);
 				next_previous.clear();
 				rows.clear();
@@ -332,10 +332,10 @@ impl builtins::Command for TopCommand {
 				if iterations.is_some_and(|count| sample >= count) {
 					return Ok(ExecutionResult::success());
 				}
-				std::mem::swap(&mut previous, &mut next_previous);
+				mem::swap(&mut previous, &mut next_previous);
 				previous_sample = now;
 
-				let sleep = time::sleep(delay);
+				let sleep = sleep(delay);
 				tokio::pin!(sleep);
 				if let Some(cancel_token) = context.cancel_token() {
 					tokio::select! {

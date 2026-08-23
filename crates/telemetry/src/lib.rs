@@ -56,6 +56,8 @@ pub mod authority {
 	use serde_json::Value;
 	use thiserror::Error;
 
+	use super::{export, semconv};
+
 	/// Default number of canonical events retained for one extension sink.
 	pub const SUBSCRIPTION_RETENTION_DEFAULT: usize = 4_096;
 	/// Hard ceiling for a single extension telemetry ring.
@@ -505,9 +507,9 @@ pub mod authority {
 			for exporter in exporters {
 				exporter.flush()?;
 			}
-			if super::export::is_enabled() {
+			if export::is_enabled() {
 				attempted = true;
-				super::export::flush();
+				export::flush();
 			}
 			Ok(attempted)
 		}
@@ -575,7 +577,7 @@ pub mod authority {
 				)));
 			}
 			let attributes = scalar_attributes(attributes)?;
-			let tracer = global::tracer(super::semconv::TRACER_NAME);
+			let tracer = global::tracer(semconv::TRACER_NAME);
 			let builder = tracer
 				.span_builder(name.to_owned())
 				.with_kind(SpanKind::Internal)

@@ -4,6 +4,8 @@
 //! is a fence against accidental second writers; the daemon remains the only
 //! legitimate caller.
 
+use std::error;
+
 use thiserror::Error;
 
 use super::ByteJournalStore;
@@ -65,7 +67,7 @@ pub enum Reply {
 /// Minimal production transport seam; clients map their typed errors directly.
 pub trait Transport {
 	/// Typed client failure.
-	type Error: std::error::Error + Send + Sync + 'static;
+	type Error: error::Error + Send + Sync + 'static;
 
 	/// Executes one normalized command.
 	fn execute(&mut self, command: Command<'_>) -> Result<Reply, Self::Error>;
@@ -73,7 +75,7 @@ pub trait Transport {
 
 /// Redis journal protocol failure.
 #[derive(Debug, Error)]
-pub enum RedisError<E: std::error::Error + 'static> {
+pub enum RedisError<E: error::Error + 'static> {
 	/// Redis client operation failed.
 	#[error("Redis journal transport failed")]
 	Transport(#[source] E),

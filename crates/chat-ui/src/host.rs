@@ -3,8 +3,8 @@
 
 use std::{
 	collections::VecDeque,
-	io,
-	io::Write,
+	future,
+	io::{self, Write},
 	time::{Duration, Instant},
 };
 
@@ -13,23 +13,23 @@ use omp_core::{Str, sf};
 use omp_executor::Executor;
 use omp_tui::{
 	AltScreenUse, CursorStyle, DebugOp, DebugQuery, Frame, Icon, InputEvent, Key, Layer, Mouse,
-	MouseReport, Notification, PaintStats, Pasted, Renderer, ResizeScrollbackMode, Size, Terminal,
-	TerminalEvent, TerminalOptions, TtyOut, UiContext, Urgency, detect,
+	MouseReport, Notification, Pasted, Renderer, Size, Terminal, TerminalEvent, TerminalOptions,
+	TtyOut, UiContext, Urgency, detect,
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
-use tokio::sync::oneshot;
 
 use crate::{
-	AgentHub, AgentHubEvent, ApprovalAction, BackendEvent, Chat, ChatKey, CommandPalette,
-	ImageOverlay, ImageOverlayEvent, Intent, ListPicker, ListRow, ModelPicker, ModelRow,
-	PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, PromptEvent, PromptOverlay,
-	ProviderPicker, PtyEvent, PtyOverlay, RenderedFrame, RewindTargetRow, SessionRow, Sidebar,
-	SubmitMode, Welcome, WelcomeEvent,
+	AgentHub, AgentHubEvent, ApprovalAction, ApprovalTicketView, BackendEvent, Chat, ChatKey,
+	CommandPalette, HistoryInspector, HistoryInspectorEvent, ImageOverlay, ImageOverlayEvent,
+	Intent, ListPicker, ListRow, ModelPicker, ModelRow, PaletteAction, PaletteEntry, PaletteEvent,
+	PickerEvent, PromptEvent, PromptOverlay, ProviderPicker, PtyEvent, PtyOverlay, RewindTargetRow,
+	SelectionPurpose, SessionRow, SettingChange, SettingRow, Sidebar, SubmitMode, Welcome,
+	WelcomeEvent,
 	approval::{ApprovalEvent, ApprovalOverlay},
 	ask::{self, AskDialog, AskDialogEvent, AskRequest},
 	modes::{GuidedGoalEvent, GuidedGoalInterview},
-	plan_review::{PlanReviewEvent, PlanReviewOverlay},
+	plan_review::{PlanReviewEvent, PlanReviewOverlay, PlanReviewSection},
 	selection_overlay::{SelectionEvent, SelectionOverlay},
 	settings_overlay::{SettingsEvent, SettingsOverlay},
 };
@@ -65,21 +65,28 @@ fn answer_debug(query: DebugQuery, chat: &mut Chat) {
 	omp_tui::respond_debug_query(query.id, serde_json::json!({ "ok": true, "slots": slots }));
 }
 
-struct PasteRead {
-	clipboard:  oneshot::Receiver<Option<Clipboard>>,
-	scope:      ClipboardRead,
-	abandon_at: Instant,
-}
+mod paste_read {
+	use tokio::sync::oneshot::Receiver;
 
-impl PasteRead {
-	fn start(scope: ClipboardRead) -> Self {
-		Self {
-			clipboard: paste::spawn_clipboard_read(scope),
-			scope,
-			abandon_at: Instant::now() + PASTE_READ_TIMEOUT,
+	use super::{Clipboard, ClipboardRead, Instant, PASTE_READ_TIMEOUT, paste};
+
+	pub(super) struct PasteRead {
+		pub(super) clipboard:  Receiver<Option<Clipboard>>,
+		pub(super) scope:      ClipboardRead,
+		pub(super) abandon_at: Instant,
+	}
+
+	impl PasteRead {
+		pub(super) fn start(scope: ClipboardRead) -> Self {
+			Self {
+				clipboard: paste::spawn_clipboard_read(scope),
+				scope,
+				abandon_at: Instant::now() + PASTE_READ_TIMEOUT,
+			}
 		}
 	}
 }
+use paste_read::PasteRead;
 
 /// Interactive chat-host lifecycle controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,8 +101,6 @@ pub struct HostOptions {
 	pub error_notify:           bool,
 	/// Permit generated terminal-title escape sequences.
 	pub title_enabled:          bool,
-	/// Native-scrollback policy after a settled in-place width resize.
-	pub resize_scrollback:      ResizeScrollbackMode,
 }
 
 impl Default for HostOptions {
@@ -106,7 +111,6 @@ impl Default for HostOptions {
 			completion_notify:      true,
 			error_notify:           true,
 			title_enabled:          true,
-			resize_scrollback:      ResizeScrollbackMode::Append,
 		}
 	}
 }
@@ -154,7 +158,6 @@ pub async fn run(
 		completion_notify:      true,
 		error_notify:           true,
 		title_enabled:          true,
-		resize_scrollback:      ResizeScrollbackMode::Append,
 	})
 	.await
 	.map(|_| ())
@@ -201,7 +204,6 @@ pub async fn run_with_draft(
 	)?;
 	let mut renderer = Renderer::new(TtyOut::new()?);
 	renderer.apply_caps(&caps)?;
-	renderer.set_resize_scrollback(options.resize_scrollback);
 	let result = run_with_terminal(
 		&executor,
 		&mut terminal,
@@ -305,10 +307,11 @@ async fn run_welcome(
 		if let Some(size) = terminal.take_resize()? {
 			*viewport = size;
 		}
-		renderer.preview(
-			welcome.render(*viewport, started.elapsed()),
-			viewport.height,
+		renderer.repaint(
 			alt_enter.take().as_deref().unwrap_or(""),
+			welcome.render(*viewport, started.elapsed()).clone(),
+			viewport.height,
+			&[],
 		)?;
 		tokio::select! {
 					event = terminal.next() => match event? {
@@ -380,7 +383,7 @@ struct ChatHost {
 	last_left:               Option<Instant>,
 	left_taps:               u8,
 	pending_approvals:       usize,
-	approval_queue:          VecDeque<crate::ApprovalTicketView>,
+	approval_queue:          VecDeque<ApprovalTicketView>,
 	suppress_history_replay: bool,
 }
 
@@ -471,19 +474,17 @@ pub struct RetainedChat {
 	exit_on_session_change: bool,
 	ask_binding:            ask::AskBinding,
 	viewport:               Size,
-	settled:                bool,
-	preview:                Frame,
 	pending_exit:           Option<HostExit>,
 	pending_clipboard:      Option<Str>,
 }
 
 /// One retained chat paint for a non-terminal host.
 pub struct RetainedChatFrame<'a> {
-	/// Document grid, potentially taller than the live viewport.
+	/// Exactly viewport-sized live presentation grid.
 	pub frame:       &'a Frame,
 	/// Live viewport dimensions in cells.
 	pub viewport:    Size,
-	/// Document-tail rows reserved for the composer.
+	/// Viewport rows reserved for the composer.
 	pub editor_rows: u16,
 	/// Viewport-anchored overlays in paint order.
 	pub layers:      SmallVec<Layer<'a>, 4>,
@@ -524,17 +525,14 @@ impl RetainedChat {
 			exit_on_session_change: options.exit_on_session_change,
 			ask_binding: ask::bind(),
 			viewport,
-			settled: true,
-			preview: Frame::new(viewport),
 			pending_exit: None,
 			pending_clipboard: None,
 		}
 	}
 
-	/// Updates the cell viewport, deferring expensive layout until settled.
-	pub fn resize(&mut self, viewport: Size, settled: bool) {
+	/// Updates the fixed cell viewport.
+	pub fn resize(&mut self, viewport: Size, _settled: bool) {
 		self.viewport = viewport;
-		self.settled = settled;
 		self
 			.host
 			.chat
@@ -562,14 +560,6 @@ impl RetainedChat {
 	pub fn render(&mut self) -> RetainedChatFrame<'_> {
 		let viewport = self.viewport;
 		let editor_rows = self.host.chat.composer_rows();
-		if !self.settled {
-			self.preview = self.host.chat.render_resize_preview(viewport);
-			let mut layers = rail_layers(&mut self.host.sidebar, viewport);
-			if let Some(overlay) = self.host.overlay.as_mut() {
-				layers.push(overlay.layer(viewport));
-			}
-			return RetainedChatFrame { frame: &self.preview, viewport, editor_rows, layers };
-		}
 		let rendered = self.host.chat.render(viewport);
 		let mut layers = rail_layers(&mut self.host.sidebar, viewport);
 		if let Some(overlay) = self.host.overlay.as_mut() {
@@ -631,6 +621,10 @@ impl RetainedChat {
 		}
 		if key == Key::CtrlAlt('s') {
 			send(&self.intents, Intent::ToggleStt);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Alt('h') {
+			send(&self.intents, Intent::InspectHistory);
 			return RetainedChatEffect::Consumed;
 		}
 		if key == Key::Ctrl('k') {
@@ -819,8 +813,6 @@ fn rail_layers(sidebar: &mut Sidebar, viewport: Size) -> SmallVec<Layer<'_>, 4> 
 enum ListPurpose {
 	Resume,
 	Rewind,
-	Settings,
-	Agents,
 	Pause,
 }
 
@@ -835,6 +827,7 @@ enum Overlay {
 	Settings(SettingsOverlay),
 	Selection(SelectionOverlay),
 	Images(ImageOverlay),
+	History(HistoryInspector),
 	AgentPrompt { prompt: PromptOverlay, agent_id: Str, revive: bool },
 	Providers(ProviderPicker),
 	Prompt(PromptOverlay),
@@ -864,9 +857,9 @@ enum OverlayEvent {
 	ApprovalAmend(Str),
 	AskCancel,
 	AskSubmit(Vec<Str>),
-	SettingsPreview(Vec<crate::SettingChange>),
-	SettingsCommit(Vec<crate::SettingChange>),
-	Selection(crate::SelectionPurpose, Str),
+	SettingsPreview(Vec<SettingChange>),
+	SettingsCommit(Vec<SettingChange>),
+	Selection(SelectionPurpose, Str),
 }
 
 impl Overlay {
@@ -890,6 +883,7 @@ impl Overlay {
 			Self::Settings(settings) => settings_event(settings.handle_key(key)),
 			Self::Selection(selection) => selection_event(selection.handle_key(key)),
 			Self::Images(images) => image_overlay_event(images.handle_key(key)),
+			Self::History(inspector) => history_inspector_event(inspector.handle_key(key)),
 			Self::AgentPrompt { prompt, agent_id, revive } => {
 				match prompt_event(prompt.handle_key(key)) {
 					OverlayEvent::Prompt(value) if *revive => {
@@ -935,6 +929,7 @@ impl Overlay {
 			Self::Settings(settings) => settings_event(settings.handle_paste(text)),
 			Self::Selection(selection) => selection_event(selection.handle_paste(text)),
 			Self::AgentHub(_) | Self::Images(_) => OverlayEvent::Consumed,
+			Self::History(_) => OverlayEvent::Consumed,
 			Self::AgentPrompt { prompt, agent_id, revive } => {
 				match prompt_event(prompt.handle_paste(text)) {
 					OverlayEvent::Prompt(value) if *revive => {
@@ -982,6 +977,7 @@ impl Overlay {
 				selection_event(selection.handle_mouse(col, row, kind, viewport))
 			},
 			Self::Images(images) => image_overlay_event(images.handle_mouse(col, row, kind, viewport)),
+			Self::History(inspector) => history_inspector_event(inspector.handle_mouse(kind)),
 			Self::AgentPrompt { .. } => OverlayEvent::Consumed,
 			Self::Providers(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
 			Self::Prompt(prompt) => prompt_event(prompt.handle_mouse(col, row, kind, viewport)),
@@ -1012,6 +1008,7 @@ impl Overlay {
 			Self::Settings(settings) => settings.layer(viewport),
 			Self::Selection(selection) => selection.layer(viewport),
 			Self::Images(images) => images.layer(viewport),
+			Self::History(inspector) => inspector.layer(viewport),
 			Self::AgentPrompt { prompt, .. } => prompt.layer(viewport),
 			Self::Providers(picker) => picker.layer(viewport),
 			Self::Prompt(prompt) => prompt.layer(viewport),
@@ -1040,10 +1037,7 @@ fn guided_goal_event(event: GuidedGoalEvent) -> OverlayEvent {
 	}
 }
 
-fn plan_review_event(
-	event: PlanReviewEvent,
-	sections: &[crate::plan_review::PlanReviewSection],
-) -> OverlayEvent {
+fn plan_review_event(event: PlanReviewEvent, sections: &[PlanReviewSection]) -> OverlayEvent {
 	match event {
 		PlanReviewEvent::Consumed
 		| PlanReviewEvent::SectionChanged(_)
@@ -1067,6 +1061,12 @@ const fn image_overlay_event(event: ImageOverlayEvent) -> OverlayEvent {
 	match event {
 		ImageOverlayEvent::Consumed => OverlayEvent::Consumed,
 		ImageOverlayEvent::Close => OverlayEvent::Close,
+	}
+}
+const fn history_inspector_event(event: HistoryInspectorEvent) -> OverlayEvent {
+	match event {
+		HistoryInspectorEvent::Consumed => OverlayEvent::Consumed,
+		HistoryInspectorEvent::Close => OverlayEvent::Close,
 	}
 }
 
@@ -1121,18 +1121,16 @@ fn ask_event(event: AskDialogEvent) -> OverlayEvent {
 
 #[derive(Clone, Copy)]
 struct ResizeState {
-	last_event:    Instant,
-	width_changed: bool,
+	last_event: Instant,
 }
 
 impl ResizeState {
-	const fn new(last_event: Instant, width_changed: bool) -> Self {
-		Self { last_event, width_changed }
+	const fn new(last_event: Instant) -> Self {
+		Self { last_event }
 	}
 
-	const fn observe(&mut self, observed_at: Instant, width_changed: bool) {
+	const fn observe(&mut self, observed_at: Instant) {
 		self.last_event = observed_at;
-		self.width_changed |= width_changed;
 	}
 
 	fn deadline(self) -> Instant {
@@ -1166,14 +1164,8 @@ async fn run_chat(
 ) -> io::Result<HostOutcome> {
 	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model, true);
 	let ask_binding = ask::bind();
-	{
-		let rendered = host.chat.render(viewport);
-		let layers = rail_layers(&mut host.sidebar, viewport);
-		present(renderer, rendered, viewport, &layers)?;
-	}
+	paint_host(renderer, &mut host, viewport, false)?;
 
-	let mut drag_alt = false;
-	let mut overlay_stale = false;
 	let mut resize = None;
 	let mut paste_read: Option<PasteRead> = None;
 	let mut next_frame = chat_deadline(&host.chat);
@@ -1183,10 +1175,10 @@ async fn run_chat(
 		tokio::select! {
 							event = terminal.next(), if paste_read.is_none() => match event? {
 								TerminalEvent::Resize => {
-									let resized = observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
+									observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
 									host.chat.set_right_inset(host.sidebar.reserved(viewport));
-									if host.overlay.is_some() && resized { overlay_stale = true; }
 									send_pty_resize(&mut host, viewport, intents);
+									next_frame = Some(Instant::now());
 								},
 								TerminalEvent::Debug(query) => answer_debug(query, &mut host.chat),
 								TerminalEvent::Effect(effect) => {
@@ -1214,7 +1206,7 @@ async fn run_chat(
 													return Ok(host_outcome(&host, exit));
 												}
 												if host.overlay.is_none() {
-													close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
+													close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 												}
 											} else if key == Key::Ctrl('b') {
 												host.sidebar.toggle();
@@ -1225,11 +1217,12 @@ async fn run_chat(
 											} else if key == Key::Alt('l') {
 												terminal.refresh_appearance()?;
 												let rendered = host.chat.render(viewport);
-												renderer.rebuild(
+												let layers = rail_layers(&mut host.sidebar, viewport);
+												renderer.repaint(
+													"",
 													rendered.frame.clone(),
 													viewport.height,
-													rendered.stable_rows,
-													"",
+													&layers,
 												)?;
 											} else if key == Key::RestoreQueue {
 												send(intents, Intent::Dequeue);
@@ -1250,9 +1243,11 @@ async fn run_chat(
 												send(intents, Intent::ToggleLive);
 											} else if key == Key::CtrlAlt('s') {
 												send(intents, Intent::ToggleStt);
-		} else if key == Key::Ctrl('k') {
+											} else if key == Key::Alt('h') {
+												send(intents, Intent::InspectHistory);
+											} else if key == Key::Ctrl('k') {
 												host.overlay = Some(Overlay::Palette(CommandPalette::open(palette_entries(), ctx)));
-												open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
+												open_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 											} else if host.sidebar.focused() {
 												if key == Key::Ctrl('c') {
 													send(intents, Intent::Quit);
@@ -1266,14 +1261,12 @@ async fn run_chat(
 													renderer,
 													&mut host,
 													viewport,
-													&mut drag_alt,
-													&mut overlay_stale,
 													&mut resize,
 												)?;
 											} else if key == Key::Alt('m') || key == Key::Alt('p') {
 												host.open_models(ctx);
 												if host.overlay.is_some() {
-													open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
+													open_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 												}
 											} else if let Some(scope) = ClipboardRead::for_key(key) {
 												paste_read = Some(PasteRead::start(scope));
@@ -1299,8 +1292,6 @@ async fn run_chat(
 													renderer,
 													&mut host,
 													viewport,
-													&mut drag_alt,
-													&mut overlay_stale,
 													&mut resize,
 												)?;
 		} else {
@@ -1318,8 +1309,6 @@ async fn run_chat(
 															renderer,
 															&mut host,
 															viewport,
-															&mut drag_alt,
-															&mut overlay_stale,
 															&mut resize,
 														)?;
 														continue;
@@ -1347,7 +1336,7 @@ async fn run_chat(
 													return Ok(host_outcome(&host, exit));
 												}
 												if host.overlay.is_none() {
-													close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
+													close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 												}
 											} else if !host.sidebar.focused() {
 												host.chat.handle_paste(&text);
@@ -1368,7 +1357,7 @@ async fn run_chat(
 													return Ok(host_outcome(&host, exit));
 												}
 												if host.overlay.is_none() {
-													close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
+													close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 												}
 											} else if !host.sidebar.handle_mouse(report.col, report.row, report.kind, viewport) {
 												host.chat.handle_mouse(&report);
@@ -1391,8 +1380,6 @@ async fn run_chat(
 											renderer,
 											&mut host,
 											viewport,
-											&mut drag_alt,
-											&mut overlay_stale,
 											&mut resize,
 										)?;
 										next_frame = Some(Instant::now());
@@ -1454,12 +1441,12 @@ async fn run_chat(
 										_ => {},
 									}
 									let had_overlay = host.overlay.is_some();
-									apply_terminal_backend(&mut host, event, ctx, renderer);
+									apply_terminal_backend(&mut host, event, ctx);
 									send_pty_resize(&mut host, viewport, intents);
 									if !had_overlay && host.overlay.is_some() {
-										open_overlay(terminal, renderer, &mut host, viewport, &mut drag_alt, &mut overlay_stale, &mut resize)?;
+										open_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 									} else if had_overlay && host.overlay.is_none() {
-										close_overlay(terminal, renderer, &mut host, viewport, &mut overlay_stale, &mut resize)?;
+										close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 									}
 									next_frame = Some(Instant::now());
 								},
@@ -1481,61 +1468,29 @@ async fn run_chat(
 							},
 							() = deadline(executor, paste_deadline) => paste_read = None,
 							() = deadline(executor, next_frame) => {
-								let now = Instant::now();
-								let resized = observe_resize(terminal, &mut viewport, &mut resize, now)?;
+								observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
 								host.chat.set_right_inset(host.sidebar.reserved(viewport));
-								if host.overlay.is_some() && resized { overlay_stale = true; }
-								if resize.is_some() {
-									let preview = host.chat.render_resize_preview(viewport);
-									let mut layers = rail_layers(&mut host.sidebar, viewport);
-									if let Some(active) = host.overlay.as_mut() {
-										layers.push(active.layer(viewport));
-										renderer.preview_overlaid(&preview, &layers, viewport.height, "")?;
-									} else {
-										let width_changed = resize.is_some_and(|state| state.width_changed);
-										let alt_enter = if drag_alt || !width_changed { None } else {
-											let staged = terminal.stage_alt_enter(AltScreenUse::Resize);
-											drag_alt = staged.is_some();
-											staged
-										};
-										renderer.preview_overlaid(&preview, &layers, viewport.height, alt_enter.as_deref().unwrap_or(""))?;
-									}
-								} else if host.overlay.is_some() {
-									let rendered = host.chat.render(viewport);
-									let mut layers = rail_layers(&mut host.sidebar, viewport);
-									layers.push(host.overlay.as_mut().expect("overlay present").layer(viewport));
-									renderer.preview_overlaid(rendered.frame, &layers, viewport.height, "")?;
-								} else {
-									let rendered = host.chat.render(viewport);
-									let layers = rail_layers(&mut host.sidebar, viewport);
-									present(renderer, rendered, viewport, &layers)?;
-								}
+								paint_host(renderer, &mut host, viewport, true)?;
 								next_frame = chat_deadline(&host.chat);
 							},
 							() = deadline(executor, resize.map(ResizeState::deadline)) => {
 								let now = Instant::now();
 								if !resize.is_some_and(|state| state.settled(now)) { continue; }
-								if host.overlay.is_some() {
-									overlay_stale = true;
-									resize = None;
-									continue;
-								}
 								host.chat.set_right_inset(host.sidebar.reserved(viewport));
-								let rendered = host.chat.render(viewport);
-								let alt_exit = if drag_alt {
-									drag_alt = false;
-									terminal.stage_alt_leave().unwrap_or("")
-								} else { "" };
-								renderer.rebuild(rendered.frame.clone(), viewport.height, rendered.stable_rows, alt_exit)?;
-								let layers = rail_layers(&mut host.sidebar, viewport);
-								if !layers.is_empty() {
-									renderer.present_overlaid(rendered.frame, &[], viewport.height, rendered.stable_rows, &layers)?;
-								}
+								paint_host(renderer, &mut host, viewport, true)?;
 								resize = None;
 								next_frame = chat_deadline(&host.chat);
 							},
 						}
 	}
+	if host.overlay.take().is_some() {
+		close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
+	}
+	if requested_exit == HostExit::Quit {
+		host.chat.cancel_active("Host closed");
+		paint_host(renderer, &mut host, viewport, true)?;
+	}
+	renderer.repaint("", Frame::new(viewport), viewport.height, &[])?;
 	Ok(host_outcome(&host, requested_exit))
 }
 
@@ -1543,38 +1498,17 @@ fn host_outcome(host: &ChatHost, exit: HostExit) -> HostOutcome {
 	HostOutcome { exit, draft: Str::from(host.chat.composer_text()) }
 }
 
-fn apply_terminal_backend(
-	host: &mut ChatHost,
-	event: BackendEvent,
-	ctx: &UiContext,
-	renderer: &mut Renderer<TtyOut>,
-) {
+fn apply_terminal_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 	match event {
 		BackendEvent::HistoryRewind { user_index, text } => {
-			let rewind_floor = renderer.rewind_floor();
-			let truncated = host
-				.chat
-				.truncate_rewind_user(user_index, text.as_str(), rewind_floor)
-				.and_then(|stable_rows| {
-					renderer
-						.truncate_uncommitted_tail(stable_rows)
-						.ok()
-						.map(|()| stable_rows)
-				})
-				.is_some();
-			host.suppress_history_replay = truncated;
-			if !truncated {
-				host.chat.clear_history();
-			}
+			let _ = host.chat.rewind_user(user_index, text.as_str());
+			host.suppress_history_replay = true;
 		},
 		BackendEvent::HistoryReplayFinished => {
 			host.suppress_history_replay = false;
 		},
-		BackendEvent::HistoryCleared => {
-			host.suppress_history_replay = false;
-			apply_backend(host, BackendEvent::HistoryCleared, ctx);
-		},
-		event if host.suppress_history_replay => {},
+		BackendEvent::HistoryCleared => host.chat.clear_history(),
+		_ if host.suppress_history_replay => {},
 		event => apply_backend(host, event, ctx),
 	}
 }
@@ -1590,6 +1524,9 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 				Default::default(),
 				ctx,
 			)));
+		},
+		BackendEvent::HistoryInspect { frame } => {
+			host.overlay = Some(Overlay::History(HistoryInspector::open(frame)));
 		},
 		BackendEvent::ApprovalPending(ticket) => {
 			host.pending_approvals = host.pending_approvals.saturating_add(1);
@@ -1717,7 +1654,7 @@ fn open_login_providers(host: &mut ChatHost, providers: Vec<SessionRow>, ctx: &U
 	host.overlay = Some(Overlay::Providers(ProviderPicker::open(providers, ctx)));
 }
 
-fn open_settings(host: &mut ChatHost, fields: Vec<crate::SettingRow>, ctx: &UiContext) {
+fn open_settings(host: &mut ChatHost, fields: Vec<SettingRow>, ctx: &UiContext) {
 	host.overlay = Some(Overlay::Settings(SettingsOverlay::open(fields, ctx)));
 }
 
@@ -1845,7 +1782,7 @@ fn apply_overlay_event(
 								send(intents, Intent::Rewind { event });
 							}
 						},
-						ListPurpose::Settings | ListPurpose::Agents | ListPurpose::Pause => {},
+						ListPurpose::Pause => {},
 					}
 				}
 				host.overlay = None;
@@ -1963,6 +1900,12 @@ fn palette_entries() -> Vec<PaletteEntry> {
 			"Authenticate a provider",
 			PaletteAction::Intent(Intent::Login(None)),
 		),
+		PaletteEntry::new(
+			"Inspect history",
+			"Search or scroll canonical committed history",
+			PaletteAction::Intent(Intent::InspectHistory),
+		)
+		.key("Alt+H"),
 		PaletteEntry::new("Help", "Show chat controls", PaletteAction::Intent(Intent::Help)),
 		PaletteEntry::new("Quit", "Leave chat", PaletteAction::Intent(Intent::Quit)),
 	]
@@ -1977,20 +1920,19 @@ fn observe_resize(
 	viewport: &mut Size,
 	resize: &mut Option<ResizeState>,
 	observed_at: Instant,
-) -> io::Result<bool> {
+) -> io::Result<()> {
 	let Some(size) = terminal.take_resize()? else {
-		return Ok(false);
+		return Ok(());
 	};
 	if size == *viewport && resize.is_none() {
-		return Ok(false);
+		return Ok(());
 	}
-	let width_changed = size.width != viewport.width;
 	*viewport = size;
 	match resize {
-		Some(state) => state.observe(observed_at, width_changed),
-		None => *resize = Some(ResizeState::new(observed_at, width_changed)),
+		Some(state) => state.observe(observed_at),
+		None => *resize = Some(ResizeState::new(observed_at)),
 	}
-	Ok(true)
+	Ok(())
 }
 
 fn user_event(
@@ -2024,54 +1966,41 @@ fn clipboard_paste_text(clipboard: Clipboard) -> Option<String> {
 	}
 }
 
-fn present<W: Write>(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaintKind {
+	Presented,
+	Retired,
+}
+
+fn paint_host<W: Write>(
 	renderer: &mut Renderer<W>,
-	rendered: RenderedFrame<'_>,
+	host: &mut ChatHost,
 	viewport: Size,
-	layers: &[Layer<'_>],
-) -> io::Result<PaintStats> {
-	if rendered.stable_rows < renderer.committed_rows() {
-		let stats =
-			renderer.rebuild(rendered.frame.clone(), viewport.height, rendered.stable_rows, "")?;
-		if !layers.is_empty() {
-			renderer.present_overlaid(
-				rendered.frame,
-				&[],
-				viewport.height,
-				rendered.stable_rows,
-				layers,
-			)?;
-		}
-		return Ok(stats);
+	allow_retirement: bool,
+) -> io::Result<PaintKind> {
+	let batch = if allow_retirement && host.overlay.is_none() {
+		host.chat.retirement_batch(viewport.width)
+	} else {
+		None
+	};
+	let rendered = host.chat.render(viewport);
+	let mut layers = rail_layers(&mut host.sidebar, viewport);
+	if let Some(overlay) = host.overlay.as_mut() {
+		layers.push(overlay.layer(viewport));
 	}
-	match renderer.present_overlaid(
-		rendered.frame,
-		rendered.damage.as_slice(),
-		viewport.height,
-		rendered.stable_rows,
-		layers,
-	) {
-		Ok(stats) => Ok(stats),
-		Err(error) if Renderer::<W>::is_stable_mutation_error(&error) => {
-			tracing::warn!(
-				error = %error,
-				"chat scene mutated stable rows; rebuilding the renderer epoch once"
-			);
-			let stats =
-				renderer.rebuild(rendered.frame.clone(), viewport.height, rendered.stable_rows, "")?;
-			if !layers.is_empty() {
-				renderer.present_overlaid(
-					rendered.frame,
-					&[],
-					viewport.height,
-					rendered.stable_rows,
-					layers,
-				)?;
-			}
-			Ok(stats)
-		},
-		Err(error) => Err(error),
-	}
+	let Some(batch) = batch else {
+		renderer.present_damaged(
+			rendered.frame,
+			rendered.damage.as_slice(),
+			viewport.height,
+			&layers,
+		)?;
+		return Ok(PaintKind::Presented);
+	};
+	let upto = batch.range.end;
+	renderer.retire(&batch.frame, rendered.frame, viewport.height, &layers)?;
+	host.chat.mark_committed(upto);
+	Ok(PaintKind::Retired)
 }
 
 fn open_overlay(
@@ -2079,14 +2008,9 @@ fn open_overlay(
 	renderer: &mut Renderer<TtyOut>,
 	host: &mut ChatHost,
 	viewport: Size,
-	drag_alt: &mut bool,
-	overlay_stale: &mut bool,
 	resize: &mut Option<ResizeState>,
 ) -> io::Result<()> {
-	if *drag_alt || resize.take().is_some() {
-		*drag_alt = false;
-		*overlay_stale = true;
-	}
+	*resize = None;
 	let alt_enter = terminal.stage_alt_enter(AltScreenUse::Interactive);
 	let rendered = host.chat.render(viewport);
 	let mut layers = rail_layers(&mut host.sidebar, viewport);
@@ -2098,12 +2022,7 @@ fn open_overlay(
 			.layer(viewport),
 	);
 	renderer
-		.preview_overlaid(
-			rendered.frame,
-			&layers,
-			viewport.height,
-			alt_enter.as_deref().unwrap_or(""),
-		)
+		.repaint(alt_enter.as_deref().unwrap_or(""), rendered.frame.clone(), viewport.height, &layers)
 		.map(|_| ())
 }
 
@@ -2112,36 +2031,15 @@ fn close_overlay(
 	renderer: &mut Renderer<TtyOut>,
 	host: &mut ChatHost,
 	viewport: Size,
-	overlay_stale: &mut bool,
 	resize: &mut Option<ResizeState>,
 ) -> io::Result<()> {
 	*resize = None;
 	let rendered = host.chat.render(viewport);
 	let layers = rail_layers(&mut host.sidebar, viewport);
-	if *overlay_stale || rendered.stable_rows < renderer.committed_rows() {
-		*overlay_stale = false;
-		let alt_exit = terminal.stage_alt_leave().unwrap_or("");
-		renderer.rebuild(rendered.frame.clone(), viewport.height, rendered.stable_rows, alt_exit)?;
-		if !layers.is_empty() {
-			renderer.present_overlaid(
-				rendered.frame,
-				&[],
-				viewport.height,
-				rendered.stable_rows,
-				&layers,
-			)?;
-		}
-	} else {
-		terminal.leave_alt()?;
-		renderer.present_overlaid(
-			rendered.frame,
-			&[(0, rendered.frame.size().height)],
-			viewport.height,
-			rendered.stable_rows,
-			&layers,
-		)?;
-	}
-	Ok(())
+	let alt_exit = terminal.stage_alt_leave().unwrap_or("");
+	renderer
+		.repaint(alt_exit, rendered.frame.clone(), viewport.height, &layers)
+		.map(|_| ())
 }
 
 fn chat_deadline(chat: &Chat) -> Option<Instant> {
@@ -2155,26 +2053,31 @@ async fn deadline(executor: &Executor, at: Option<Instant>) {
 				.timer(at.saturating_duration_since(Instant::now()))
 				.await
 		},
-		None => std::future::pending().await,
+		None => future::pending().await,
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use omp_tui::{Key, Rect, Renderer, Size, Style, UiContext};
-	use smallvec::SmallVec;
+	use std::{
+		cell::Cell,
+		io::{self, Write},
+		rc::Rc,
+	};
+
+	use omp_tui::{Frame, Key, Renderer, Size, UiContext};
 
 	use super::{
-		Duration, HostExit, HostOptions, Instant, ResizeState, RetainedChat, RetainedChatEffect,
-		present,
+		ChatHost, Duration, HostExit, HostOptions, Instant, Overlay, PaintKind, ResizeState,
+		RetainedChat, RetainedChatEffect, paint_host,
 	};
-	use crate::{BackendEvent, Chat, RenderedFrame};
+	use crate::{BackendEvent, Chat, HistoryInspector};
 
 	#[test]
 	fn resize_settle_window_restarts_at_each_event() {
 		let started_at = Instant::now();
-		let mut state = ResizeState::new(started_at, false);
-		state.observe(started_at + Duration::from_millis(100), true);
+		let mut state = ResizeState::new(started_at);
+		state.observe(started_at + Duration::from_millis(100));
 		assert!(!state.settled(started_at + Duration::from_millis(219)));
 		assert!(state.settled(started_at + Duration::from_millis(220)));
 	}
@@ -2217,47 +2120,101 @@ mod tests {
 		assert_eq!(chat.render().layers.len(), 1);
 	}
 
-	#[test]
-	fn stable_mutation_rebuilds_once_instead_of_escaping_the_host() {
-		let viewport = Size::new(40, 8);
-		let mut chat = Chat::new(&UiContext::default());
-		for index in 0..12 {
-			chat.push_notice(format!("notice {index}"));
-		}
-		let mut renderer = Renderer::new(Vec::new());
-		present(&mut renderer, chat.render(viewport), viewport, &[]).unwrap();
-		assert!(renderer.committed_rows() > 0);
-
-		let initial = chat.render(viewport);
-		let mut changed = initial.frame.clone();
-		changed.fill(Rect::new(0, 0, viewport.width, 1), Style::default());
-		let mut damage = SmallVec::new();
-		damage.push((0, 1));
-		let rendered = RenderedFrame { frame: &changed, stable_rows: initial.stable_rows, damage };
-		let recovered = present(&mut renderer, rendered, viewport, &[])
-			.expect("stable mutation should trigger the one-time rebuild fallback");
-
-		assert!(recovered.full_repaint);
+	fn finalized_host(ctx: &UiContext, viewport: Size) -> ChatHost {
+		let mut chat = Chat::new(ctx);
+		chat.push_notice("finalized");
+		ChatHost::new(chat, ctx, viewport, Vec::new(), 0, false)
 	}
 
 	#[test]
-	fn stable_prefix_regression_rebuilds_visible_document() {
+	fn present_only_tick_leaves_finalized_blocks_pending() {
 		let viewport = Size::new(40, 8);
-		let mut chat = Chat::new(&UiContext::default());
-		for index in 0..12 {
-			chat.push_notice(format!("notice {index}"));
-		}
+		let ctx = UiContext::default();
+		let mut host = finalized_host(&ctx, viewport);
 		let mut renderer = Renderer::new(Vec::new());
-		let initial = present(&mut renderer, chat.render(viewport), viewport, &[]).unwrap();
-		assert!(initial.committed_rows > 0);
-		assert!(renderer.committed_rows() > 0);
 
-		chat.clear_history();
-		let rendered = chat.render(viewport);
-		assert_eq!(rendered.stable_rows, 0);
-		let repainted = present(&mut renderer, rendered, viewport, &[]).unwrap();
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, viewport, false).unwrap(),
+			PaintKind::Presented
+		);
+		assert!(host.chat.retirement_batch(viewport.width).is_some());
+	}
 
-		assert!(repainted.full_repaint);
-		assert_eq!(renderer.committed_rows(), 0);
+	#[test]
+	fn finalized_prefix_retires_once_and_advances_frontier() {
+		let viewport = Size::new(40, 8);
+		let ctx = UiContext::default();
+		let mut host = finalized_host(&ctx, viewport);
+		let mut renderer = Renderer::new(Vec::new());
+		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
+
+		assert_eq!(paint_host(&mut renderer, &mut host, viewport, true).unwrap(), PaintKind::Retired);
+		assert!(host.chat.retirement_batch(viewport.width).is_none());
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, viewport, true).unwrap(),
+			PaintKind::Presented
+		);
+	}
+
+	#[test]
+	fn retirement_waits_for_alt_overlay_and_runs_after_close() {
+		let viewport = Size::new(40, 8);
+		let ctx = UiContext::default();
+		let mut host = finalized_host(&ctx, viewport);
+		let mut renderer = Renderer::new(Vec::new());
+		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
+		host.overlay = Some(Overlay::History(HistoryInspector::open(Frame::new(viewport))));
+
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, viewport, true).unwrap(),
+			PaintKind::Presented
+		);
+		assert!(host.chat.retirement_batch(viewport.width).is_some());
+
+		host.overlay = None;
+		assert_eq!(paint_host(&mut renderer, &mut host, viewport, true).unwrap(), PaintKind::Retired);
+		assert!(host.chat.retirement_batch(viewport.width).is_none());
+	}
+
+	#[derive(Clone, Default)]
+	struct WriteControl {
+		fail:   Rc<Cell<bool>>,
+		writes: Rc<Cell<usize>>,
+	}
+
+	struct SwitchWriter(WriteControl);
+
+	impl Write for SwitchWriter {
+		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+			self.0.writes.set(self.0.writes.get() + 1);
+			if self.0.fail.get() {
+				Err(io::Error::other("surface lost"))
+			} else {
+				Ok(bytes.len())
+			}
+		}
+
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn retirement_write_error_is_fatal_without_advancing_or_retrying() {
+		let viewport = Size::new(40, 8);
+		let ctx = UiContext::default();
+		let mut host = finalized_host(&ctx, viewport);
+		let control = WriteControl::default();
+		let mut renderer = Renderer::new(SwitchWriter(control.clone()));
+		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
+		control.fail.set(true);
+		let writes_before = control.writes.get();
+
+		let error = paint_host(&mut renderer, &mut host, viewport, true)
+			.expect_err("retirement write failure must escape the host coordinator");
+
+		assert_eq!(error.kind(), io::ErrorKind::Other);
+		assert_eq!(control.writes.get(), writes_before + 1);
+		assert!(host.chat.retirement_batch(viewport.width).is_some());
 	}
 }

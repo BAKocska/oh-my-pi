@@ -16,6 +16,8 @@ pub mod memory;
 pub mod redis;
 pub mod sql;
 
+use std::{error, io};
+
 pub use memory::MemoryStore;
 pub use redis::RedisStore;
 pub use sql::{SqlDialect, SqlStore};
@@ -23,7 +25,7 @@ pub use sql::{SqlDialect, SqlStore};
 /// Exact-byte operations required by the daemon-owned journal writer.
 pub trait ByteJournalStore {
 	/// Typed backend failure.
-	type Error: std::error::Error + Send + Sync + 'static;
+	type Error: error::Error + Send + Sync + 'static;
 
 	/// Returns the current byte length.
 	fn len(&mut self) -> Result<u64, Self::Error>;
@@ -54,7 +56,7 @@ pub struct FileStore {
 
 impl FileStore {
 	/// Opens or creates a journal byte file without changing its contents.
-	pub fn open(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+	pub fn open(path: impl AsRef<Path>) -> Result<Self, io::Error> {
 		let path = path.as_ref().to_owned();
 		let file = OpenOptions::new()
 			.read(true)
@@ -72,7 +74,7 @@ impl FileStore {
 }
 
 impl ByteJournalStore for FileStore {
-	type Error = std::io::Error;
+	type Error = io::Error;
 
 	fn len(&mut self) -> Result<u64, Self::Error> {
 		Ok(self.file.metadata()?.len())
@@ -81,7 +83,7 @@ impl ByteJournalStore for FileStore {
 	fn read(&mut self, offset: u64, maximum: usize) -> Result<Vec<u8>, Self::Error> {
 		self.file.seek(SeekFrom::Start(offset))?;
 		let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
-		std::io::Read::by_ref(&mut self.file)
+		io::Read::by_ref(&mut self.file)
 			.take(u64::try_from(maximum).unwrap_or(u64::MAX))
 			.read_to_end(&mut bytes)?;
 		Ok(bytes)
@@ -106,7 +108,7 @@ impl ByteJournalStore for FileStore {
 
 /// Failure from one append-first daemon transaction.
 #[derive(Debug, Error)]
-pub enum DaemonWriteError<E: std::error::Error + 'static> {
+pub enum DaemonWriteError<E: error::Error + 'static> {
 	/// The append failed and rollback restored the original bytes.
 	#[error("journal append failed and was rolled back")]
 	RolledBack {

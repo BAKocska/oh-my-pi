@@ -12,6 +12,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
+	fs,
 	io::Cursor,
 	sync::LazyLock,
 };
@@ -19,7 +20,10 @@ use std::{
 use omp_core::{CowBytes, Str};
 use parking_lot::Mutex;
 
-use crate::imagefmt::{self, ImageDimensions};
+use crate::{
+	assets,
+	imagefmt::{self, ImageDimensions},
+};
 
 /// One interned source: terminal image ID, PNG bytes, and probed dimensions.
 #[derive(Clone)]
@@ -144,7 +148,7 @@ fn convert_to_png(source: &str) -> Option<CowBytes<'static>> {
 /// sources retain their owned read buffer.
 pub fn source_bytes(source: &str) -> Option<CowBytes<'static>> {
 	if let Some(provider_id) = source.strip_prefix("asset://login/") {
-		return crate::assets::provider_logo(provider_id).map(CowBytes::from_static);
+		return assets::provider_logo(provider_id).map(CowBytes::from_static);
 	}
-	std::fs::read(source).ok().map(CowBytes::from)
+	fs::read(source).ok().map(CowBytes::from)
 }

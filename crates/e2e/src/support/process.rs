@@ -1,6 +1,11 @@
-use std::{io, path::PathBuf, process::Stdio, sync::Once, time::Duration};
+use std::{env, io, path::PathBuf, process, process::Stdio, sync::Once, time::Duration};
 
-use tokio::process::{Child, Command};
+#[cfg(unix)]
+use nix::{errno::Errno, sys::signal, unistd::Pid};
+use tokio::{
+	process::{Child, Command},
+	time,
+};
 
 use super::within;
 use crate::{Context as _, Result};
@@ -15,7 +20,7 @@ pub fn install_omp_binary_env() -> io::Result<()> {
 		// Every proof installs the same immutable Cargo path before opening an
 		// environment authority, and the value is never changed or removed.
 		unsafe {
-			std::env::set_var("CARGO_BIN_EXE_omp", path);
+			env::set_var("CARGO_BIN_EXE_omp", path);
 		}
 	});
 	Ok(())
@@ -24,13 +29,13 @@ pub fn install_omp_binary_env() -> io::Result<()> {
 /// Resolves the worker-capable application binary Cargo builds with `omp-e2e`
 /// tests.
 pub fn omp_binary() -> io::Result<PathBuf> {
-	if let Some(path) = std::env::var_os("CARGO_BIN_EXE_omp_e2e_host") {
+	if let Some(path) = env::var_os("CARGO_BIN_EXE_omp_e2e_host") {
 		let path = PathBuf::from(path);
 		if path.is_file() {
 			return Ok(path);
 		}
 	}
-	let current = std::env::current_exe()?;
+	let current = env::current_exe()?;
 	if current
 		.file_stem()
 		.is_some_and(|name| name == "omp_e2e_host")
@@ -94,7 +99,7 @@ impl OwnedProcess {
 	}
 
 	/// Waits for normal process exit within `limit`.
-	pub async fn wait(&mut self, limit: Duration) -> Result<std::process::ExitStatus> {
+	pub async fn wait(&mut self, limit: Duration) -> Result<process::ExitStatus> {
 		let status = within("owned child exit", limit, self.child.wait()).await??;
 		self.exited = true;
 		Ok(status)
@@ -107,10 +112,7 @@ impl OwnedProcess {
 			return Ok(());
 		}
 		self.signal_group_terminate();
-		if tokio::time::timeout(grace, self.child.wait())
-			.await
-			.is_err()
-		{
+		if time::timeout(grace, self.child.wait()).await.is_err() {
 			self.signal_group_kill();
 			self
 				.child
@@ -125,10 +127,7 @@ impl OwnedProcess {
 	fn signal_group_terminate(&mut self) {
 		#[cfg(unix)]
 		if let Some(group) = self.group {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(group),
-				Some(nix::sys::signal::Signal::SIGTERM),
-			);
+			let _ = signal::killpg(Pid::from_raw(group), Some(signal::Signal::SIGTERM));
 			return;
 		}
 		let _ = self.child.start_kill();
@@ -137,10 +136,7 @@ impl OwnedProcess {
 	fn signal_group_kill(&mut self) {
 		#[cfg(unix)]
 		if let Some(group) = self.group {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(group),
-				Some(nix::sys::signal::Signal::SIGKILL),
-			);
+			let _ = signal::killpg(Pid::from_raw(group), Some(signal::Signal::SIGKILL));
 			return;
 		}
 		let _ = self.child.start_kill();
@@ -158,9 +154,9 @@ impl Drop for OwnedProcess {
 /// Reports whether any process remains in a Unix process group.
 #[cfg(unix)]
 pub fn process_group_alive(group: i32) -> bool {
-	match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), None) {
-		Ok(()) | Err(nix::errno::Errno::EPERM) => true,
-		Err(nix::errno::Errno::ESRCH) => false,
+	match signal::killpg(Pid::from_raw(group), None) {
+		Ok(()) | Err(Errno::EPERM) => true,
+		Err(Errno::ESRCH) => false,
 		Err(_) => true,
 	}
 }
@@ -171,7 +167,7 @@ pub fn process_group_alive(group: i32) -> bool {
 pub async fn wait_process_group_dead(group: i32, limit: Duration) -> Result<()> {
 	within("process-group death", limit, async move {
 		while process_group_alive(group) {
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			time::sleep(Duration::from_millis(10)).await;
 		}
 	})
 	.await

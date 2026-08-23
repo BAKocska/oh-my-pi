@@ -4,11 +4,14 @@
 //! appends assign consecutive indexes in write order.
 
 use std::{
+	fs,
 	fs::{File, OpenOptions},
+	io,
 	io::{Seek, SeekFrom, Write},
 	iter::FusedIterator,
 	mem::size_of,
 	path::{Path, PathBuf},
+	slice,
 };
 
 use bytes::BytesMut;
@@ -16,9 +19,11 @@ use smallvec::SmallVec;
 use thiserror::Error as ThisError;
 
 use super::{
+	Entry, Reader,
 	codec::{Error, Header, write_header, write_line},
 	event::{Event, Kind},
 };
+use crate::atomic;
 
 /// Maximum number of events in one atomic transcript append.
 pub const MAX_ATOMIC_ENTRIES: usize = 1_024;
@@ -127,23 +132,23 @@ pub struct Writer {
 }
 
 trait AppendTarget: Write {
-	fn append_len(&self) -> std::io::Result<u64>;
-	fn rollback_to(&mut self, len: u64) -> std::io::Result<()>;
-	fn sync_data(&mut self) -> std::io::Result<()>;
+	fn append_len(&self) -> io::Result<u64>;
+	fn rollback_to(&mut self, len: u64) -> io::Result<()>;
+	fn sync_data(&mut self) -> io::Result<()>;
 }
 
 impl AppendTarget for File {
-	fn append_len(&self) -> std::io::Result<u64> {
+	fn append_len(&self) -> io::Result<u64> {
 		Ok(self.metadata()?.len())
 	}
 
-	fn rollback_to(&mut self, len: u64) -> std::io::Result<()> {
+	fn rollback_to(&mut self, len: u64) -> io::Result<()> {
 		self.set_len(len)?;
 		self.seek(SeekFrom::Start(len))?;
 		Self::sync_data(self)
 	}
 
-	fn sync_data(&mut self) -> std::io::Result<()> {
+	fn sync_data(&mut self) -> io::Result<()> {
 		Self::sync_data(self)
 	}
 }
@@ -203,11 +208,7 @@ const _: () = assert!(size_of::<IndexRun>() == 16, "IndexRun must stay compact")
 const _: () = assert!(size_of::<JournalError>() <= 64, "JournalError must stay compact");
 const _: () = assert!(size_of::<AppendManyError>() <= 80, "AppendManyError must stay compact");
 
-fn rollback_error(
-	target: &mut impl AppendTarget,
-	original_len: u64,
-	write: std::io::Error,
-) -> Error {
+fn rollback_error(target: &mut impl AppendTarget, original_len: u64, write: io::Error) -> Error {
 	match target.rollback_to(original_len) {
 		Ok(()) => Error::Io(write),
 		Err(rollback) => Error::AppendRollback { write, rollback },
@@ -249,7 +250,7 @@ fn validate_event(event: &Event) -> Result<(), Error> {
 
 fn halted_error() -> JournalError {
 	JournalIndeterminate {
-		source:   Error::Io(std::io::Error::other(
+		source:   Error::Io(io::Error::other(
 			"transcript writer is halted after an indeterminate append",
 		)),
 		written:  IndexRun::default(),
@@ -291,8 +292,8 @@ impl Writer {
 			return Err(Error::InvalidHeaderVersion(header.v));
 		}
 		if path.exists() {
-			return Err(Error::Io(std::io::Error::new(
-				std::io::ErrorKind::AlreadyExists,
+			return Err(Error::Io(io::Error::new(
+				io::ErrorKind::AlreadyExists,
 				"transcript path already exists",
 			)));
 		}
@@ -310,11 +311,11 @@ impl Writer {
 	/// Every newline-terminated malformed record remains a stable tombstone.
 	/// Scanning is bounded by [`super::reader::READ_BUFFER_BYTES`].
 	pub fn open_append(path: &Path) -> Result<Self, Error> {
-		let reader = super::Reader::open(path)?;
+		let reader = Reader::open(path)?;
 		let next_index = reader.next_index();
 		let append_offset = reader.append_offset();
 		for index in 0..next_index {
-			if let Some(super::Entry::Tombstone(raw)) = reader.log().get(index)
+			if let Some(Entry::Tombstone(raw)) = reader.log().get(index)
 				&& let Ok(source) = serde_json::from_str::<String>(raw.get())
 				&& serde_json::from_str::<Header>(&source).is_ok()
 			{
@@ -322,11 +323,11 @@ impl Writer {
 			}
 		}
 		let header_terminated = append_offset != 0
-			&& std::fs::File::open(path)
+			&& fs::File::open(path)
 				.and_then(|mut file| {
 					file.seek(SeekFrom::Start(append_offset.saturating_sub(1)))?;
 					let mut byte = [0_u8; 1];
-					std::io::Read::read_exact(&mut file, &mut byte)?;
+					io::Read::read_exact(&mut file, &mut byte)?;
 					Ok(byte[0] == b'\n')
 				})
 				.unwrap_or(false);
@@ -360,7 +361,7 @@ impl Writer {
 	/// The event index is the physical line number minus one. Empty inference
 	/// patches are rejected because they encode no state transition.
 	pub fn append(&mut self, event: &Event) -> Result<u64, Error> {
-		match self.append_atomic(std::slice::from_ref(event)) {
+		match self.append_atomic(slice::from_ref(event)) {
 			Ok(mut indexes) => Ok(indexes.pop().expect("one event has one physical index")),
 			Err(JournalError::RolledBack { source }) => Err(source),
 			Err(JournalError::Indeterminate(indeterminate)) => Err(indeterminate.source),
@@ -533,7 +534,7 @@ impl Writer {
 	/// torn suffix has no trustworthy complete-line boundary.
 	pub fn byte_watermark(&self) -> Result<u64, Error> {
 		if self.poisoned {
-			return Err(Error::Io(std::io::Error::other(
+			return Err(Error::Io(io::Error::other(
 				"transcript byte watermark is unknown after an indeterminate append",
 			)));
 		}
@@ -555,10 +556,10 @@ impl Writer {
 		}
 		bytes.extend_from_slice(b"\n");
 		bytes.extend_from_slice(&self.line);
-		if let Err(source) = crate::atomic::commit(&path, &bytes, || !path.exists()) {
+		if let Err(source) = atomic::commit(&path, &bytes, || !path.exists()) {
 			self.pending = Some((path, header));
 			self.line.clear();
-			return Err(JournalError::RolledBack { source: Error::Io(std::io::Error::other(source)) });
+			return Err(JournalError::RolledBack { source: Error::Io(io::Error::other(source)) });
 		}
 		let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
 			Ok(file) => file,
@@ -674,7 +675,10 @@ fn run_including_next(indexes: &[u64], next: u64) -> IndexRun {
 
 #[cfg(test)]
 mod tests {
-	use std::io::{self, Write};
+	use std::{
+		fs::OpenOptions,
+		io::{self, Write},
+	};
 
 	use bytes::BytesMut;
 	use tempfile::tempdir;
@@ -812,7 +816,7 @@ mod tests {
 	#[test]
 	fn indeterminate_failure_poison_halts_the_writer() {
 		let directory = tempdir().expect("temporary directory");
-		let file = std::fs::OpenOptions::new()
+		let file = OpenOptions::new()
 			.read(true)
 			.write(true)
 			.create_new(true)

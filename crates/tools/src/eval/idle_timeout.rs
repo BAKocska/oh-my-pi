@@ -6,7 +6,7 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
-use tokio::{sync::Notify, time::Instant};
+use tokio::{sync::Notify, time, time::Instant};
 
 /// A cloneable handle shared with host-assisted eval operations.
 #[derive(Clone, Debug)]
@@ -114,7 +114,7 @@ impl TimeoutHandle {
 	pub async fn expiration_survives(&self, grace: Duration) -> bool {
 		let generation = self.inner.state.lock().generation;
 		self.expired().await;
-		tokio::time::sleep(grace).await;
+		time::sleep(grace).await;
 		self.inner.state.lock().generation == generation
 	}
 
@@ -142,7 +142,7 @@ impl TimeoutHandle {
 			};
 
 			tokio::pin!(changed);
-			let sleep = tokio::time::sleep_until(deadline);
+			let sleep = time::sleep_until(deadline);
 			tokio::pin!(sleep);
 			tokio::select! {
 				() = &mut sleep => {
@@ -197,22 +197,23 @@ fn normalize_window(window: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+
 	use super::*;
 
 	#[tokio::test]
 	async fn host_wait_pauses_then_resumes_with_a_fresh_window() {
 		let timeout = TimeoutHandle::new(Some(Duration::from_millis(40)));
 		timeout
-			.host_wait(tokio::time::sleep(Duration::from_millis(80)))
+			.host_wait(time::sleep(Duration::from_millis(80)))
 			.await;
 
 		assert!(
-			tokio::time::timeout(Duration::from_millis(15), timeout.expired())
+			time::timeout(Duration::from_millis(15), timeout.expired())
 				.await
 				.is_err()
 		);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(80), timeout.expired())
+			time::timeout(Duration::from_millis(80), timeout.expired())
 				.await
 				.is_ok()
 		);
@@ -223,21 +224,21 @@ mod tests {
 		let timeout = TimeoutHandle::new(Some(Duration::from_millis(30)));
 		let outer = timeout.pause();
 		let inner = timeout.pause();
-		tokio::time::sleep(Duration::from_millis(40)).await;
+		time::sleep(Duration::from_millis(40)).await;
 		drop(outer);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(40), timeout.expired())
+			time::timeout(Duration::from_millis(40), timeout.expired())
 				.await
 				.is_err()
 		);
 		drop(inner);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(15), timeout.expired())
+			time::timeout(Duration::from_millis(15), timeout.expired())
 				.await
 				.is_err()
 		);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(60), timeout.expired())
+			time::timeout(Duration::from_millis(60), timeout.expired())
 				.await
 				.is_ok()
 		);
@@ -246,17 +247,17 @@ mod tests {
 	#[tokio::test]
 	async fn pause_wins_a_deadline_boundary_race() {
 		let timeout = TimeoutHandle::new(Some(Duration::from_millis(25)));
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		time::sleep(Duration::from_millis(20)).await;
 		let pause = timeout.pause();
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		time::sleep(Duration::from_millis(20)).await;
 		assert!(
-			tokio::time::timeout(Duration::from_millis(10), timeout.expired())
+			time::timeout(Duration::from_millis(10), timeout.expired())
 				.await
 				.is_err()
 		);
 		drop(pause);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(60), timeout.expired())
+			time::timeout(Duration::from_millis(60), timeout.expired())
 				.await
 				.is_ok()
 		);
@@ -266,7 +267,7 @@ mod tests {
 	async fn disabled_and_disposed_watchdogs_never_expire() {
 		let disabled = TimeoutHandle::new(None);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(10), disabled.expired())
+			time::timeout(Duration::from_millis(10), disabled.expired())
 				.await
 				.is_err()
 		);
@@ -274,7 +275,7 @@ mod tests {
 		let disposed = TimeoutHandle::new(Some(Duration::from_millis(1)));
 		disposed.dispose();
 		assert!(
-			tokio::time::timeout(Duration::from_millis(10), disposed.expired())
+			time::timeout(Duration::from_millis(10), disposed.expired())
 				.await
 				.is_err()
 		);
@@ -289,12 +290,12 @@ mod tests {
 		drop(stale);
 
 		assert!(
-			tokio::time::timeout(Duration::from_millis(15), timeout.expired())
+			time::timeout(Duration::from_millis(15), timeout.expired())
 				.await
 				.is_err()
 		);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(60), timeout.expired())
+			time::timeout(Duration::from_millis(60), timeout.expired())
 				.await
 				.is_ok()
 		);
@@ -307,13 +308,13 @@ mod tests {
 		let expired = timeout.expired();
 		tokio::pin!(expired);
 		assert!(
-			tokio::time::timeout(Duration::from_millis(10), &mut expired)
+			time::timeout(Duration::from_millis(10), &mut expired)
 				.await
 				.is_err()
 		);
 		timeout.restart(Some(Duration::from_millis(25)));
 		assert!(
-			tokio::time::timeout(Duration::from_millis(60), &mut expired)
+			time::timeout(Duration::from_millis(60), &mut expired)
 				.await
 				.is_ok()
 		);
@@ -325,7 +326,7 @@ mod tests {
 		let generation = timeout.generation();
 		let left = timeout.expired();
 		let right = timeout.expired();
-		tokio::time::timeout(Duration::from_millis(80), async {
+		time::timeout(Duration::from_millis(80), async {
 			tokio::join!(left, right);
 		})
 		.await
@@ -339,7 +340,7 @@ mod tests {
 			let timeout = timeout.clone();
 			tokio::spawn(async move { timeout.expiration_survives(Duration::from_millis(30)).await })
 		};
-		tokio::time::sleep(Duration::from_millis(15)).await;
+		time::sleep(Duration::from_millis(15)).await;
 		timeout.dispose();
 		assert!(!escalation.await.expect("escalation task joins"));
 	}

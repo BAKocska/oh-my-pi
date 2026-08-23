@@ -1,4 +1,4 @@
-use std::{cell::RefCell, os::fd::OwnedFd, rc::Rc};
+use std::{cell::RefCell, io, os::fd::OwnedFd, rc::Rc};
 
 use ashpd::desktop::{
 	PersistMode,
@@ -6,7 +6,23 @@ use ashpd::desktop::{
 };
 use image::RgbaImage;
 use pipewire as pw;
-use pw::{properties::properties, spa};
+use pipewire::{
+	context::ContextRc,
+	main_loop::MainLoopRc,
+	spa::buffer,
+	stream::{StreamBox, StreamFlags},
+};
+use pw::properties::properties;
+use spa::{
+	param::{
+		self,
+		video::{self, VideoInfoRaw},
+	},
+	pod,
+	pod::serialize::PodSerializer,
+	utils,
+};
+use tokio::runtime::Runtime;
 
 use super::portal::{read_token, store_token};
 use crate::error::{CoreResult, DesktopError};
@@ -53,13 +69,10 @@ async fn open_screencast() -> Result<(u32, OwnedFd), String> {
 }
 
 struct UserData {
-	format: spa::param::video::VideoInfoRaw,
+	format: VideoInfoRaw,
 }
 
-fn rgba_from_buffer(
-	format: &spa::param::video::VideoInfoRaw,
-	data: &mut pw::spa::buffer::Data,
-) -> Result<RgbaImage, String> {
+fn rgba_from_buffer(format: &VideoInfoRaw, data: &mut buffer::Data) -> Result<RgbaImage, String> {
 	let size = format.size();
 	let width = size.width;
 	let height = size.height;
@@ -85,11 +98,11 @@ fn rgba_from_buffer(
 		.get(offset..end)
 		.ok_or_else(|| "PipeWire frame offset is outside the mapped buffer".to_string())?;
 	let pixel_size = match format.format() {
-		spa::param::video::VideoFormat::RGB | spa::param::video::VideoFormat::BGR => 3,
-		spa::param::video::VideoFormat::RGBA
-		| spa::param::video::VideoFormat::RGBx
-		| spa::param::video::VideoFormat::BGRA
-		| spa::param::video::VideoFormat::BGRx => 4,
+		video::VideoFormat::RGB | video::VideoFormat::BGR => 3,
+		video::VideoFormat::RGBA
+		| video::VideoFormat::RGBx
+		| video::VideoFormat::BGRA
+		| video::VideoFormat::BGRx => 4,
 		other => return Err(format!("PipeWire negotiated unsupported pixel format {other:?}")),
 	};
 	let row_bytes = (width as usize)
@@ -113,14 +126,12 @@ fn rgba_from_buffer(
 			let input = &row[x * pixel_size..];
 			let output = &mut rgba[(y * width as usize + x) * 4..];
 			match format.format() {
-				spa::param::video::VideoFormat::RGB
-				| spa::param::video::VideoFormat::RGBA
-				| spa::param::video::VideoFormat::RGBx => {
+				video::VideoFormat::RGB | video::VideoFormat::RGBA | video::VideoFormat::RGBx => {
 					output[..4].copy_from_slice(&[
 						input[0],
 						input[1],
 						input[2],
-						if pixel_size == 4 && format.format() == spa::param::video::VideoFormat::RGBA {
+						if pixel_size == 4 && format.format() == video::VideoFormat::RGBA {
 							input[3]
 						} else {
 							255
@@ -131,7 +142,7 @@ fn rgba_from_buffer(
 					input[2],
 					input[1],
 					input[0],
-					if pixel_size == 4 && format.format() == spa::param::video::VideoFormat::BGRA {
+					if pixel_size == 4 && format.format() == video::VideoFormat::BGRA {
 						input[3]
 					} else {
 						255
@@ -146,14 +157,13 @@ fn rgba_from_buffer(
 
 fn grab_pipewire_frame(node: u32, fd: OwnedFd) -> Result<RgbaImage, String> {
 	pw::init();
-	let mainloop =
-		pw::main_loop::MainLoopRc::new(None).map_err(|err| format!("PipeWire main loop: {err}"))?;
-	let context = pw::context::ContextRc::new(&mainloop, None)
-		.map_err(|err| format!("PipeWire context: {err}"))?;
+	let mainloop = MainLoopRc::new(None).map_err(|err| format!("PipeWire main loop: {err}"))?;
+	let context =
+		ContextRc::new(&mainloop, None).map_err(|err| format!("PipeWire context: {err}"))?;
 	let core = context
 		.connect_fd_rc(fd, None)
 		.map_err(|err| format!("PipeWire remote: {err}"))?;
-	let stream = pw::stream::StreamBox::new(&core, "omp-computer-capture", properties! {
+	let stream = StreamBox::new(&core, "omp-computer-capture", properties! {
 		*pw::keys::MEDIA_TYPE => "Video",
 		*pw::keys::MEDIA_CATEGORY => "Capture",
 		*pw::keys::MEDIA_ROLE => "Screen",
@@ -168,7 +178,7 @@ fn grab_pipewire_frame(node: u32, fd: OwnedFd) -> Result<RgbaImage, String> {
 			let Some(param) = param else {
 				return;
 			};
-			if id == spa::param::ParamType::Format.as_raw() {
+			if id == param::ParamType::Format.as_raw() {
 				let _ = user.format.parse(param);
 			}
 		})
@@ -186,7 +196,7 @@ fn grab_pipewire_frame(node: u32, fd: OwnedFd) -> Result<RgbaImage, String> {
 		.map_err(|err| format!("PipeWire listener: {err}"))?;
 	let object = spa::pod::object!(
 		spa::utils::SpaTypes::ObjectParamFormat,
-		spa::param::ParamType::EnumFormat,
+		spa::param::pw::spa::param::ParamType::EnumFormat,
 		spa::pod::property!(
 			spa::param::format::FormatProperties::MediaType,
 			Id,
@@ -198,17 +208,17 @@ fn grab_pipewire_frame(node: u32, fd: OwnedFd) -> Result<RgbaImage, String> {
 			spa::param::format::MediaSubtype::Raw
 		),
 		spa::pod::property!(
-			spa::param::format::FormatProperties::VideoFormat,
+			spa::param::format::FormatProperties::pw::spa::param::video::VideoFormat,
 			Choice,
 			Enum,
 			Id,
-			spa::param::video::VideoFormat::BGRx,
-			spa::param::video::VideoFormat::BGRx,
-			spa::param::video::VideoFormat::BGRA,
-			spa::param::video::VideoFormat::RGBx,
-			spa::param::video::VideoFormat::RGBA,
-			spa::param::video::VideoFormat::RGB,
-			spa::param::video::VideoFormat::BGR
+			spa::param::video::pw::spa::param::video::VideoFormat::BGRx,
+			spa::param::video::pw::spa::param::video::VideoFormat::BGRx,
+			spa::param::video::pw::spa::param::video::VideoFormat::BGRA,
+			spa::param::video::pw::spa::param::video::VideoFormat::RGBx,
+			spa::param::video::pw::spa::param::video::VideoFormat::RGBA,
+			spa::param::video::pw::spa::param::video::VideoFormat::RGB,
+			spa::param::video::pw::spa::param::video::VideoFormat::BGR
 		),
 		spa::pod::property!(
 			spa::param::format::FormatProperties::VideoSize,
@@ -220,20 +230,17 @@ fn grab_pipewire_frame(node: u32, fd: OwnedFd) -> Result<RgbaImage, String> {
 			spa::utils::Rectangle { width: 16384, height: 16384 }
 		)
 	);
-	let values = spa::pod::serialize::PodSerializer::serialize(
-		std::io::Cursor::new(Vec::new()),
-		&spa::pod::Value::Object(object),
-	)
-	.map_err(|err| format!("PipeWire format serialization: {err}"))?
-	.0
-	.into_inner();
-	let param = spa::pod::Pod::from_bytes(&values)
+	let values = PodSerializer::serialize(io::Cursor::new(Vec::new()), &pod::Value::Object(object))
+		.map_err(|err| format!("PipeWire format serialization: {err}"))?
+		.0
+		.into_inner();
+	let param = pod::Pod::from_bytes(&values)
 		.ok_or_else(|| "PipeWire rejected format parameters".to_string())?;
 	stream
 		.connect(
-			spa::utils::Direction::Input,
+			utils::Direction::Input,
 			Some(node),
-			pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+			StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
 			&mut [param],
 		)
 		.map_err(|err| format!("PipeWire connect: {err}"))?;
@@ -244,7 +251,7 @@ fn grab_pipewire_frame(node: u32, fd: OwnedFd) -> Result<RgbaImage, String> {
 		.unwrap_or_else(|| Err("PipeWire stream ended before producing a frame".to_string()))
 }
 
-pub(super) fn capture(runtime: &tokio::runtime::Runtime) -> CoreResult<RgbaImage> {
+pub(super) fn capture(runtime: &Runtime) -> CoreResult<RgbaImage> {
 	let (node, fd) = runtime.block_on(open_screencast()).map_err(|err| {
 		DesktopError::capture_failed(format!("wayland screencast unavailable: {err}"))
 	})?;

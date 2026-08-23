@@ -394,7 +394,7 @@ struct SyntheticCollapse {
 struct SyntheticCollapseExpected {
 	logical_model:  String,
 	efforts:        Vec<FixtureEffort>,
-	effort_routing: std::collections::BTreeMap<FixtureEffort, String>,
+	effort_routing: BTreeMap<FixtureEffort, String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -553,7 +553,7 @@ impl CompatShape {
 		policy.reasoning.effort_map = self
 			.reasoning_effort_map
 			.into_iter()
-			.map(|(effort, value)| (omp_catalog::thinking::ThinkingEffort::from(effort), value.into()))
+			.map(|(effort, value)| (ThinkingEffort::from(effort), value.into()))
 			.collect();
 		policy.reasoning.replay_unsigned = self.replay_unsigned_thinking;
 		policy.tool.requires_assistant_content = self.requires_assistant_content_for_tool_calls;
@@ -741,7 +741,7 @@ struct QwenThinking {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FixturePrice {
-	unit:      omp_catalog::pricing::PriceUnit,
+	unit:      PriceUnit,
 	nanos_usd: u64,
 }
 
@@ -766,7 +766,7 @@ impl From<FixtureEffort> for EffortTier {
 	}
 }
 
-impl From<FixtureEffort> for omp_catalog::thinking::ThinkingEffort {
+impl From<FixtureEffort> for ThinkingEffort {
 	fn from(value: FixtureEffort) -> Self {
 		match value {
 			FixtureEffort::Off => Self::Off,

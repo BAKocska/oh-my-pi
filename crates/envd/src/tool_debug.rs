@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::docs::{DapRegistryEvent, DocumentHost};
+use super::docs::{DapRegistryEvent, DocumentError, DocumentHost};
 
 /// Environment-owned implementation of the revisioned debugger tool.
 #[derive(Clone)]
@@ -107,7 +107,10 @@ impl DocumentDebugControl {
 	async fn start(&self, params: Params, cancel: &CancellationToken) -> Result<Payload, Fault> {
 		let adapter = params.adapter.as_deref().ok_or(Fault::InvalidArguments)?;
 		let configuration = start_arguments(&params);
-		let capabilities = vec![pb::DapCapability::Read as i32, pb::DapCapability::Execute as i32];
+		let capabilities = vec![
+			omp_proto::document::v1::DapCapability::Read as i32,
+			omp_proto::document::v1::DapCapability::Execute as i32,
+		];
 		let workspace_uri = self.documents.hello().root_uri.to_string();
 		let encoded =
 			Bytes::from(serde_json::to_vec(&configuration).map_err(|_| Fault::InvalidArguments)?);
@@ -284,25 +287,21 @@ fn merge_events(data: &mut Value, events: Vec<DapRegistryEvent>) {
 	}
 }
 
-fn map_document_error(error: super::docs::DocumentError) -> Fault {
+fn map_document_error(error: DocumentError) -> Fault {
 	match error {
-		super::docs::DocumentError::Cancelled => Fault::Cancelled,
-		super::docs::DocumentError::Disconnected => Fault::Unavailable,
-		super::docs::DocumentError::Protocol { code, .. } => {
-			match pb::ProtocolErrorCode::try_from(code).ok() {
-				Some(pb::ProtocolErrorCode::PermissionDenied) => Fault::Unauthorized,
-				Some(
-					pb::ProtocolErrorCode::RevisionExpired
-					| pb::ProtocolErrorCode::PreconditionFailed
-					| pb::ProtocolErrorCode::ContentModified,
-				) => Fault::Stale,
-				Some(pb::ProtocolErrorCode::NotFound) => Fault::Unavailable,
-				Some(pb::ProtocolErrorCode::Cancelled) => Fault::Cancelled,
-				_ => Fault::Adapter,
-			}
+		DocumentError::Cancelled => Fault::Cancelled,
+		DocumentError::Disconnected => Fault::Unavailable,
+		DocumentError::Protocol { code, .. } => match pb::ProtocolErrorCode::try_from(code).ok() {
+			Some(pb::ProtocolErrorCode::PermissionDenied) => Fault::Unauthorized,
+			Some(
+				pb::ProtocolErrorCode::RevisionExpired
+				| pb::ProtocolErrorCode::PreconditionFailed
+				| pb::ProtocolErrorCode::ContentModified,
+			) => Fault::Stale,
+			Some(pb::ProtocolErrorCode::NotFound) => Fault::Unavailable,
+			Some(pb::ProtocolErrorCode::Cancelled) => Fault::Cancelled,
+			_ => Fault::Adapter,
 		},
-		super::docs::DocumentError::Wire(_) | super::docs::DocumentError::MalformedResponse(_) => {
-			Fault::Adapter
-		},
+		DocumentError::Wire(_) | DocumentError::MalformedResponse(_) => Fault::Adapter,
 	}
 }

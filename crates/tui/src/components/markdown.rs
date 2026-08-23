@@ -2,9 +2,12 @@ use omp_core::{IntoStr, Str};
 
 use super::text::{append, paint_rich, truncate_rich};
 use crate::{
+	UiContext,
 	component::{Cached, Component, IntoChildren, MemoKey, PaintCtx, Slot, next_slot},
 	frame::Rect,
+	markdown,
 	markdown::MdTheme,
+	markup,
 	props::{Prop, PropValue, Props},
 	rich::{Measure, RichText},
 };
@@ -72,11 +75,11 @@ impl Markdown {
 		self
 	}
 
-	fn theme(&self, ctx: &crate::UiContext) -> MdTheme {
+	fn theme(&self, ctx: &UiContext) -> MdTheme {
 		MdTheme::from_context(ctx).cascade(self.props.style(&ctx.theme))
 	}
 
-	fn render(&mut self, ctx: &crate::UiContext, width: u16) {
+	fn render(&mut self, ctx: &UiContext, width: u16) {
 		let width = width.max(1);
 		let key = MemoKey::new(self.version, ctx);
 		let partial = self.props.partial();
@@ -87,9 +90,9 @@ impl Markdown {
 		let style = self.props.style(&ctx.theme);
 		self.rich.clear();
 		if partial {
-			crate::markdown::render_partial(&self.text, width, &theme, &mut self.rich);
+			markdown::render_partial(&self.text, width, &theme, &mut self.rich);
 		} else {
-			crate::markdown::render(&self.text, width, &theme, &mut self.rich);
+			markdown::render(&self.text, width, &theme, &mut self.rich);
 		}
 		truncate_rich(&mut self.rich, width, style, self.props.truncate());
 		self.cached_width = width;
@@ -125,13 +128,13 @@ impl Component for Markdown {
 		&mut self.embedded
 	}
 
-	fn measure(&mut self, ctx: &crate::UiContext) -> (u16, u16) {
+	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {
 		let theme = self.theme(ctx);
 		let mut natural = Measure::default();
 		if self.props.partial() {
-			crate::markdown::render_partial(&self.text, u16::MAX, &theme, &mut natural);
+			markdown::render_partial(&self.text, u16::MAX, &theme, &mut natural);
 		} else {
-			crate::markdown::render(&self.text, u16::MAX, &theme, &mut natural);
+			markdown::render(&self.text, u16::MAX, &theme, &mut natural);
 		}
 		let mut min = natural.widest.clamp(1, 12);
 		let mut nat = natural.widest.max(min);
@@ -145,7 +148,7 @@ impl Component for Markdown {
 		(min, nat)
 	}
 
-	fn height(&mut self, ctx: &crate::UiContext, width: u16) -> u16 {
+	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
 		self.render(ctx, width);
 		let mut height = if self.text.is_empty() {
 			0
@@ -166,7 +169,7 @@ impl Component for Markdown {
 		height
 	}
 
-	fn place(&mut self, ctx: &crate::UiContext, content: Rect) {
+	fn place(&mut self, ctx: &UiContext, content: Rect) {
 		self.render(ctx, content.width);
 		let mut cursor = content.y;
 		let mut placed = if self.text.is_empty() {
@@ -202,14 +205,13 @@ impl Component for Markdown {
 		}
 	}
 
-	fn set_text(&mut self, ctx: &crate::UiContext, text: Str) -> bool {
+	fn set_text(&mut self, ctx: &UiContext, text: Str) -> bool {
 		if self.source == text {
 			return false;
 		}
 		self.source = text.clone();
-		if crate::markup::md_embeds_markup(&text) {
-			if let Ok(children) = crate::markup::parse_md_fragment_inheriting(&text, ctx, &self.props)
-			{
+		if markup::md_embeds_markup(&text) {
+			if let Ok(children) = markup::parse_md_fragment_inheriting(&text, ctx, &self.props) {
 				self.text = Str::default();
 				self.embedded = children;
 			} else {

@@ -1,12 +1,16 @@
+//! Proves gateway provider mutations reject stale catalogs and incomplete
+//! caller identities.
+
 use std::sync::Arc;
 
+use omp_catalog::snapshot;
 use omp_driver::{
 	discovery::runtime::gateway_provider_rpc_authority,
 	model_controls::ProductionProviderApplicationOwner,
 };
-use omp_inference::layer::stack::{BuiltinConfig, RouteComposer};
+use omp_inference::layer::stack::{BuiltinConfig, RouteComposer, RouteProviderService};
 use omp_proto::inference::v1 as pb;
-use omp_serve::inference::ProviderGatewayAuthority as _;
+use omp_storage::blob::BlobStore;
 use tonic::Code;
 
 struct UnusedComposer;
@@ -14,22 +18,20 @@ struct UnusedComposer;
 impl RouteComposer for UnusedComposer {
 	fn compose(
 		&self,
-		_catalog: &omp_catalog::snapshot::Catalog,
+		_catalog: &snapshot::Catalog,
 		_route: &omp_catalog::RouteDef,
-	) -> Result<omp_inference::layer::stack::RouteProviderService, omp_inference::RouteUnavailable>
-	{
+	) -> Result<RouteProviderService, omp_inference::RouteUnavailable> {
 		panic!("stale and unauthenticated requests never compose a route")
 	}
 }
 
 fn authority() -> Arc<dyn omp_serve::inference::ProviderGatewayAuthority> {
-	let catalog = Arc::new(omp_catalog::snapshot::Catalog::embedded().clone());
+	let catalog = Arc::new(snapshot::Catalog::embedded().clone());
 	let registry = omp_inference::Registry::builder(catalog)
 		.build()
 		.expect("registry");
-	let blobs =
-		omp_storage::blob::BlobStore::open(tempfile::tempdir().expect("temporary blob root").keep())
-			.expect("blob store");
+	let blobs = BlobStore::open(tempfile::tempdir().expect("temporary blob root").keep())
+		.expect("blob store");
 	gateway_provider_rpc_authority(Arc::new(ProductionProviderApplicationOwner::new(
 		registry,
 		BuiltinConfig::new(Arc::new(UnusedComposer)),

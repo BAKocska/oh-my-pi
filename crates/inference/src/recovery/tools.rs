@@ -3,6 +3,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	io::Cursor,
+	iter, mem, str,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -238,7 +239,7 @@ impl<'a> ToolAssembler<'a> {
 
 	/// Rejects every call still incomplete at end-of-stream.
 	pub fn finish(&mut self) -> Vec<ToolAssemblyEvent> {
-		let open = std::mem::take(&mut self.open);
+		let open = mem::take(&mut self.open);
 		let mut events = Vec::with_capacity(open.len());
 		for (source_index, call) in open {
 			self.record(
@@ -259,7 +260,7 @@ impl<'a> ToolAssembler<'a> {
 
 	/// Drains bounded, secret-free recovery evidence.
 	pub fn take_evidence(&mut self) -> Vec<RecoveryRecord> {
-		std::mem::take(&mut self.evidence)
+		mem::take(&mut self.evidence)
 	}
 
 	fn start(
@@ -451,7 +452,7 @@ impl<'a> ToolAssembler<'a> {
 				arguments
 			},
 			ToolInputConstraint::Grammar(_) => {
-				let Ok(arguments) = std::str::from_utf8(&call.arguments) else {
+				let Ok(arguments) = str::from_utf8(&call.arguments) else {
 					return ToolAssemblyEvent::Rejected {
 						source_index,
 						reason: ToolRejection::MalformedArguments {
@@ -718,7 +719,7 @@ fn validate_node(
 		};
 		if !valid {
 			let expected_types = match types {
-				Value::String(kind) => std::iter::once(Str::new(kind.as_str())).collect(),
+				Value::String(kind) => iter::once(Str::new(kind.as_str())).collect(),
 				Value::Array(kinds) => kinds
 					.iter()
 					.filter_map(Value::as_str)
@@ -1197,8 +1198,7 @@ fn build_flattened_path(
 		FlattenedStep::Prop(name) => {
 			// Adopt an object copied from a plain sibling key.
 			if matches!(node, FlattenedNode::Value(Value::Object(_))) {
-				let FlattenedNode::Value(Value::Object(map)) =
-					std::mem::replace(node, FlattenedNode::Hole)
+				let FlattenedNode::Value(Value::Object(map)) = mem::replace(node, FlattenedNode::Hole)
 				else {
 					unreachable!("matched object value");
 				};
@@ -1222,8 +1222,7 @@ fn build_flattened_path(
 		FlattenedStep::Index(index) => {
 			// Adopt an array copied from a plain sibling key.
 			if matches!(node, FlattenedNode::Value(Value::Array(_))) {
-				let FlattenedNode::Value(Value::Array(items)) =
-					std::mem::replace(node, FlattenedNode::Hole)
+				let FlattenedNode::Value(Value::Array(items)) = mem::replace(node, FlattenedNode::Hole)
 				else {
 					unreachable!("matched array value");
 				};

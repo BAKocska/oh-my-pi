@@ -1,4 +1,5 @@
 use std::{
+	cmp,
 	collections::{HashMap, HashSet},
 	ops::Range,
 };
@@ -386,7 +387,7 @@ pub fn rules_need_placeholder_key(rules: &[SecretRule]) -> bool {
 			phase.push((rule.content(), replacement.to_owned()));
 		}
 	}
-	phase.sort_by_key(|(content, _)| std::cmp::Reverse(content.len()));
+	phase.sort_by_key(|(content, _)| cmp::Reverse(content.len()));
 	let apply_from = |text: &str, start: usize| {
 		phase[start..]
 			.iter()

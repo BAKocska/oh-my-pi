@@ -9,6 +9,8 @@ use ring::rand::{SecureRandom as _, SystemRandom};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use strum::{EnumString, IntoStaticStr};
+use tokio::time;
+use url::Url;
 use zeroize::Zeroizing;
 
 const MCP_ONE_OFF_TIMEOUT: Duration = Duration::from_secs(60);
@@ -193,7 +195,7 @@ pub async fn call_mcp<P: Serialize, T: DeserializeOwned>(
 		headers,
 		Some(SecretString::from(body.as_str().to_owned())),
 	)?);
-	let response = tokio::time::timeout(MCP_ONE_OFF_TIMEOUT, operation)
+	let response = time::timeout(MCP_ONE_OFF_TIMEOUT, operation)
 		.await
 		.map_err(|_| JsonRpcCallError::TimedOut)??;
 	if !(200..300).contains(&response.status) {
@@ -229,7 +231,7 @@ pub fn parse_sse(text: &str) -> Option<Value> {
 /// Redacts credential-shaped query parameters without altering non-sensitive
 /// parameters. Unparseable URLs lose their complete query string.
 pub fn redact_url_for_log(url: &str) -> Str {
-	let Ok(mut parsed) = url::Url::parse(url) else {
+	let Ok(mut parsed) = Url::parse(url) else {
 		return Str::from(url.split_once('?').map_or(url, |(base, _)| base));
 	};
 	let values = parsed

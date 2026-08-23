@@ -3,6 +3,7 @@
 use std::{
 	collections::BTreeSet,
 	fmt::Write as _,
+	mem,
 	path::{MAIN_SEPARATOR, Path},
 };
 
@@ -679,14 +680,14 @@ fn pad_unmapped_to_text(text: &str, source_lines: &mut Vec<SourceLines>) {
 
 fn normalize_map_to_text(text: &str, source_lines: &mut SourceLineMap) {
 	let desired = rendered_line_count(text);
-	let mut lines = std::mem::take(source_lines).into_vec();
+	let mut lines = mem::take(source_lines).into_vec();
 	lines.resize_with(desired, SmallVec::new);
 	lines.truncate(desired);
 	*source_lines = lines.into_boxed_slice();
 }
 
 fn prepend_unmapped_line(source_lines: &mut SourceLineMap) {
-	let mut lines = std::mem::take(source_lines).into_vec();
+	let mut lines = mem::take(source_lines).into_vec();
 	lines.insert(0, SmallVec::new());
 	*source_lines = lines.into_boxed_slice();
 }
@@ -698,7 +699,7 @@ fn append_unmapped_text(text: &mut String, source_lines: &mut SourceLineMap, suf
 	let previous_lines = rendered_line_count(text);
 	text.push_str(suffix);
 	let added = rendered_line_count(text).saturating_sub(previous_lines);
-	let mut lines = std::mem::take(source_lines).into_vec();
+	let mut lines = mem::take(source_lines).into_vec();
 	lines.resize_with(lines.len() + added, SmallVec::new);
 	*source_lines = lines.into_boxed_slice();
 }

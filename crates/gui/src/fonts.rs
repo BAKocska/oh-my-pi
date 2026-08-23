@@ -8,12 +8,12 @@
 //! coverage — a face is accepted only when it shapes the whole cluster
 //! without `.notdef` — never by maintained codepoint range tables.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, io, mem, sync::Arc};
 
 use omp_core::Str;
 use rustybuzz::Face as RustyFace;
 use smallvec::SmallVec;
-use swash::{FontRef, scale};
+use swash::{FontRef, scale, scale::image, zeno};
 use thiserror::Error;
 
 use crate::gpu::{ATLAS_SIZE, AtlasRegion};
@@ -338,7 +338,7 @@ impl Fonts {
 
 	/// Drains dirty atlas regions for the GPU upload.
 	pub fn take_uploads(&mut self) -> (Vec<AtlasRegion>, Vec<AtlasRegion>) {
-		(std::mem::take(&mut self.pending_mask), std::mem::take(&mut self.pending_color))
+		(mem::take(&mut self.pending_mask), mem::take(&mut self.pending_color))
 	}
 
 	/// Caches one registered image resized into the RGBA atlas.
@@ -632,14 +632,14 @@ impl Fonts {
 		let mut scaler = self.cx.builder(font).size(px).hint(true).build();
 		let mut render = scale::Render::new(SOURCES);
 		render
-			.format(swash::zeno::Format::Alpha)
-			.offset(swash::zeno::Point::new(bin.offset(), 0.0));
+			.format(zeno::Format::Alpha)
+			.offset(zeno::Point::new(bin.offset(), 0.0));
 		let image = render.render(&mut scaler, gid)?;
 		let (width, height) = (image.placement.width, image.placement.height);
 		if width == 0 || height == 0 {
 			return None;
 		}
-		let color = image.content != scale::image::Content::Mask;
+		let color = image.content != image::Content::Mask;
 		// Bitmap strikes come at their fixed size (Apple ships 160px);
 		// normalize the quad to the em box, scaling bearings alongside.
 		let (quad_w, quad_h, left, top) =
@@ -763,7 +763,7 @@ impl Fonts {
 }
 
 fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-	let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+	let mut decoder = png::Decoder::new(io::Cursor::new(bytes));
 	decoder.set_transformations(png::Transformations::EXPAND);
 	let mut reader = decoder.read_info().ok()?;
 	let mut buffer = vec![0_u8; reader.output_buffer_size()?];

@@ -2,6 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
+	fs,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,28 +15,31 @@ use omp_inference::{
 	discovery::{DiscoveryCacheKey, DiscoveryStore},
 	id::RequestId,
 	receipt::ExecutionBudget,
+	router,
 };
+
+use crate::cli::{ModelRole, ModelsArgs, ModelsCommand};
 
 /// Runs a model catalog operation. Refresh travels through the same inference
 /// routes and credentials used at call time, then atomically updates only the
 /// runtime discovery cache.
-pub async fn run(args: &crate::cli::ModelsArgs) -> miette::Result<()> {
+pub async fn run(args: &ModelsArgs) -> miette::Result<()> {
 	let catalog = Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
 	match args.command.as_ref() {
 		None => print_rows(&select(catalog, args.filter.as_deref(), args.role), args.json),
-		Some(crate::cli::ModelsCommand::List { filter, json, role }) => {
+		Some(ModelsCommand::List { filter, json, role }) => {
 			print_rows(&select(catalog, filter.as_deref(), *role), *json)
 		},
-		Some(crate::cli::ModelsCommand::Find { pattern, json }) => {
+		Some(ModelsCommand::Find { pattern, json }) => {
 			print_rows(&select(catalog, Some(pattern), None), *json)
 		},
-		Some(crate::cli::ModelsCommand::Refresh) => refresh().await,
+		Some(ModelsCommand::Refresh) => refresh().await,
 	}
 }
 
 async fn refresh() -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
-	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
+	fs::create_dir_all(&data_dir).into_diagnostic()?;
 	let credentials = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;
 	let registry = omp_driver::registry::production_registry(&data_dir, credentials)
@@ -65,8 +69,7 @@ async fn refresh() -> miette::Result<()> {
 	for (provider, provider_routes) in routes {
 		let mut rows = Vec::new();
 		for route in provider_routes {
-			let planner =
-				omp_inference::router::Router::new(registry.clone(), Duration::from_secs(30));
+			let planner = router::Router::new(registry.clone(), Duration::from_secs(30));
 			let meta = CallMeta {
 				id:       RequestId::from(format!("omp-model-refresh-{}", provider.as_str())),
 				target:   Target::ProviderService(provider.clone()),
@@ -155,7 +158,7 @@ fn discovered(
 fn select<'a>(
 	catalog: &'a Catalog,
 	filter: Option<&str>,
-	role: Option<crate::cli::ModelRole>,
+	role: Option<ModelRole>,
 ) -> Vec<&'a ModelSpec> {
 	let needle = filter.unwrap_or_default().to_ascii_lowercase();
 	let mut rows = catalog
@@ -184,10 +187,10 @@ fn select<'a>(
 		.collect::<Vec<_>>();
 	if let Some(role) = role {
 		let index = match role {
-			crate::cli::ModelRole::Primary => 0,
-			crate::cli::ModelRole::Smol => 1,
-			crate::cli::ModelRole::Slow => 2,
-			crate::cli::ModelRole::Plan => 3,
+			ModelRole::Primary => 0,
+			ModelRole::Smol => 1,
+			ModelRole::Slow => 2,
+			ModelRole::Plan => 3,
 		};
 		rows = rows
 			.get(index % rows.len().max(1))

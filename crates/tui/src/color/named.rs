@@ -3,6 +3,8 @@
 //! `currentcolor` specials, and the system colors with their deprecated
 //! aliases.
 
+use std::str;
+
 use super::CssColor;
 use crate::{context::Theme, frame::Color};
 
@@ -96,7 +98,7 @@ pub(super) fn parse(name: &str) -> Option<CssColor> {
 	for (slot, byte) in lower.iter_mut().zip(name.bytes()) {
 		*slot = byte.to_ascii_lowercase();
 	}
-	let needle = std::str::from_utf8(&lower[..name.len()]).ok()?;
+	let needle = str::from_utf8(&lower[..name.len()]).ok()?;
 	if needle == "transparent" {
 		return Some(CssColor::Rgba(0, 0, 0, 0.0));
 	}

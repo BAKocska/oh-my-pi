@@ -5,7 +5,11 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::manager::{McpManager, MountSpec};
+use super::{
+	super::exthost::control::ControlConnectionIdentity,
+	McpServiceError,
+	manager::{ManagerError, McpManager, MountSpec},
+};
 
 /// Cold declaration resolver which applies Environment config, secret, and auth
 /// policy before a Python mount reaches the lifecycle supervisor.
@@ -22,7 +26,7 @@ pub trait ControlMountResolver: Send + Sync {
 pub struct McpControl {
 	manager:  Arc<McpManager>,
 	resolver: Arc<dyn ControlMountResolver>,
-	identity: Arc<super::super::exthost::control::ControlConnectionIdentity>,
+	identity: Arc<ControlConnectionIdentity>,
 }
 
 impl McpControl {
@@ -31,7 +35,7 @@ impl McpControl {
 	pub fn new(
 		manager: Arc<McpManager>,
 		resolver: Arc<dyn ControlMountResolver>,
-		identity: Arc<super::super::exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 	) -> Self {
 		Self { manager, resolver, identity }
 	}
@@ -130,7 +134,7 @@ impl McpControl {
 
 	fn mount_result(&self, server: &str) -> Result<Value, McpControlError> {
 		if !self.manager.control_owns(&self.identity, server) {
-			return Err(McpControlError::Manager(super::manager::ManagerError::OwnershipDenied));
+			return Err(McpControlError::Manager(ManagerError::OwnershipDenied));
 		}
 		let snapshot = self.manager.catalog_snapshot();
 		let devices = snapshot
@@ -286,8 +290,8 @@ pub enum McpControlError {
 	InvalidResult,
 	/// Lifecycle manager rejected the operation.
 	#[error(transparent)]
-	Manager(#[from] super::manager::ManagerError),
+	Manager(#[from] ManagerError),
 	/// Shared MCP service rejected the operation.
 	#[error(transparent)]
-	Service(#[from] super::McpServiceError),
+	Service(#[from] McpServiceError),
 }

@@ -1,6 +1,8 @@
 mod capture;
 mod input;
 
+use std::env;
+
 use capture::X11Capture;
 use image::RgbaImage;
 use input::X11Input;
@@ -28,7 +30,7 @@ impl X11Backend {
 		let capture = X11Capture::new(display)?;
 		let input = X11Input::new(capture.connection(), capture.root())?;
 		let ax = AtSpiAx::new().ok();
-		Ok(Self { capture, input, ax, display_server: std::env::var("DISPLAY").ok() })
+		Ok(Self { capture, input, ax, display_server: env::var("DISPLAY").ok() })
 	}
 }
 

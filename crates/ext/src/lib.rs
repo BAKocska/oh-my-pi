@@ -13,7 +13,7 @@ pub mod resolver;
 pub mod trust;
 pub mod upgrade;
 
-use std::{error::Error, fmt};
+use std::error::Error;
 
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
@@ -168,9 +168,15 @@ impl ExtensionError {
 	}
 }
 
-impl fmt::Display for ExtensionError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{}: {}", self.code, self.detail)
+mod extension_error_display {
+	use std::fmt::{self, Display};
+
+	use super::ExtensionError;
+
+	impl Display for ExtensionError {
+		fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+			write!(formatter, "{}: {}", self.code, self.detail)
+		}
 	}
 }
 

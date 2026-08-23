@@ -2,7 +2,7 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 /// Manage aliases within the shell.
 #[derive(Parser)]
@@ -17,12 +17,12 @@ pub(crate) struct AliasCommand {
 }
 
 impl builtins::Command for AliasCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let mut exit_code = ExecutionResult::success();
 
 		if self.print || self.aliases.is_empty() {

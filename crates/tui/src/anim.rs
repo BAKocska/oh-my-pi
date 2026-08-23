@@ -27,7 +27,7 @@
 //! pointer-driven border chrome and elevation ease through their declared
 //! `anim`/`ease`, and snap without one.
 
-use std::time::Duration;
+use std::{f32::consts, time::Duration};
 
 use strum::{EnumString, IntoStaticStr};
 
@@ -292,7 +292,7 @@ impl Shimmer {
 		if distance >= Self::HALF_WIDTH {
 			return low;
 		}
-		let angle = std::f32::consts::PI * distance / Self::HALF_WIDTH;
+		let angle = consts::PI * distance / Self::HALF_WIDTH;
 		let intensity = f32::midpoint(1.0, angle.cos());
 		if intensity >= Self::HIGH {
 			high

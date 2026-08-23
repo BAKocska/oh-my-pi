@@ -3,7 +3,9 @@ use std::{cmp::Ordering, fmt::Write};
 use omp_core::{IntoStr, Str};
 use serde_json::Value;
 
+use super::Col;
 use crate::{
+	Icon,
 	component::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoChildren, IntoComponent, PaintCtx, Slot,
 		next_slot,
@@ -64,7 +66,7 @@ impl Wizard {
 
 	/// Appends a titled step pane.
 	pub fn step(mut self, title: impl IntoStr, children: impl IntoChildren) -> Self {
-		let pane = super::Col::new()
+		let pane = Col::new()
 			.with(Prop::Title, title.into_str())
 			.child(children);
 		self.steps.push(Cached::new(pane.into_component()));
@@ -257,9 +259,9 @@ impl Component for Wizard {
 			let error_y = y.saturating_sub(1);
 			if error_y < pc.clip {
 				let style = Style::new().fg(pc.ctx.theme.warn);
-				let mut x =
-					pc.frame
-						.put(rect.x, error_y, pc.ctx.charset.icon(crate::Icon::Warning), style);
+				let mut x = pc
+					.frame
+					.put(rect.x, error_y, pc.ctx.charset.icon(Icon::Warning), style);
 				x = pc.frame.put(x, error_y, " ", style);
 				pc.frame.put(x, error_y, error, style);
 			}

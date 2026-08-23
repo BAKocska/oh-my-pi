@@ -61,7 +61,7 @@ const MERGE_VALUES: &[&str] = &["patch", "branch"];
 	Serialize,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum TaskEagerMode {
 	/// Model chooses when delegation helps.
 	#[default]
@@ -87,7 +87,7 @@ pub enum TaskEagerMode {
 	Serialize,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum TaskEffortCeiling {
 	/// Minimal reasoning.
 	Minimal,
@@ -119,7 +119,7 @@ pub enum TaskEffortCeiling {
 	Serialize,
 )]
 #[serde(rename_all = "kebab-case")]
-#[strum(serialize_all = "kebab-case", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 pub enum TaskIsolationMode {
 	/// Run in the parent workspace.
 	#[default]
@@ -159,7 +159,7 @@ pub enum TaskIsolationMode {
 	Serialize,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum TaskIsolationMerge {
 	/// Apply a content-addressed patch.
 	#[default]
@@ -577,7 +577,8 @@ mod tests {
 		let first = tree.admit(1).await.unwrap();
 		let waiting_tree = Arc::clone(&tree);
 		let waiting = tokio::spawn(async move { waiting_tree.admit(1).await.unwrap() });
-		tokio::task::yield_now().await;
+		use tokio::task;
+		task::yield_now().await;
 		assert!(!waiting.is_finished());
 		live.apply(Arc::new(TaskSettings {
 			max_concurrency: 0,

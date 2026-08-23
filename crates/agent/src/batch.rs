@@ -2,6 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
+	future,
 	sync::{
 		Arc, OnceLock,
 		atomic::{AtomicBool, AtomicU128, Ordering},
@@ -10,12 +11,15 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::future::join_all;
+use flume::Receiver;
 use omp_core::{IntoStr, Str, StrMut, ToolPath, sf};
 use omp_env::{ClientError, EnvClient, Invocation, InvocationEvent};
 use omp_proto::{
-	env::v1::{Admission, AdmitInvocation, InvokeTool, Verdict as EnvVerdict},
-	inference::v1 as value_pb,
+	env::v1::{Admission, AdmitInvocation, InvokeTool},
+	inference::{
+		v1,
+		v1::{self as value_pb, value},
+	},
 	policy::v1::EffectEnvelope,
 	thread::v1::{Item, Part as CanonicalPart},
 	toolhost::v1::HookEventId,
@@ -25,11 +29,12 @@ use omp_tool::{
 	PromptCaps, Registry, ToolIdentity, ToolTerminal,
 };
 use serde_json::Value;
-use tokio::sync::{Notify, watch};
+use tokio::{sync::Notify, task, time};
 
 use crate::{
 	events::{AgentEvent, EventBus, EventProvenance, EventVisibility},
 	project::{tool_result_item, tool_result_item_canonical_parts},
+	tool_choice::Invoker,
 };
 
 /// Namespaced invocation property carrying the environment-enforced mode.
@@ -79,11 +84,11 @@ pub fn effects_mutate_environment(effects: &Effects) -> bool {
 }
 
 fn string_value(value: &str) -> value_pb::Value {
-	value_pb::Value { kind: Some(value_pb::value::Kind::String(value.to_owned())) }
+	value_pb::Value { kind: Some(value::Kind::String(value.to_owned())) }
 }
 
 const fn bool_value(value: bool) -> value_pb::Value {
-	value_pb::Value { kind: Some(value_pb::value::Kind::Bool(value)) }
+	value_pb::Value { kind: Some(value::Kind::Bool(value)) }
 }
 
 /// Failure to open, relay, decode, project, or lower a tool invocation.
@@ -162,7 +167,7 @@ pub struct InvocationHookBus {
 
 impl InvocationHookBus {
 	/// Creates a hook bus and its single CONTROL-side request receiver.
-	pub fn channel() -> (Self, flume::Receiver<InvocationHookRequest>) {
+	pub fn channel() -> (Self, Receiver<InvocationHookRequest>) {
 		let (tx, rx) = flume::unbounded();
 		(Self { union: Arc::new(AtomicU128::new(0)), tx }, rx)
 	}
@@ -267,7 +272,7 @@ enum AuthorizationState {
 	DeliveryIndeterminate,
 }
 
-struct AuthorizationReceipt(flume::Receiver<Result<AuthorizationState, ClientError>>);
+struct AuthorizationReceipt(Receiver<Result<AuthorizationState, ClientError>>);
 
 impl AuthorizationReceipt {
 	async fn wait(&self) -> Result<AuthorizationState, BatchError> {
@@ -279,7 +284,7 @@ impl AuthorizationReceipt {
 	}
 }
 
-struct CommandReceipt(flume::Receiver<Result<(), ClientError>>);
+struct CommandReceipt(Receiver<Result<(), ClientError>>);
 
 impl CommandReceipt {
 	async fn wait(&self) -> Result<(), BatchError> {
@@ -292,12 +297,18 @@ impl CommandReceipt {
 	}
 }
 
-enum PumpTerminal {
-	Verdict(EnvVerdict),
-	ClientError(ClientError),
-	Closed,
-	CancelUnobserved,
+mod pump_terminal {
+	use omp_env::ClientError;
+	use omp_proto::env::v1;
+
+	pub(super) enum PumpTerminal {
+		Verdict(v1::Verdict),
+		ClientError(ClientError),
+		Closed,
+		CancelUnobserved,
+	}
 }
+use pump_terminal::PumpTerminal;
 
 enum PumpOutput {
 	Update(Bytes),
@@ -310,7 +321,7 @@ struct InterruptRequest {
 
 struct InvocationPump {
 	commands:        flume::Sender<PumpCommand>,
-	outputs:         flume::Receiver<PumpOutput>,
+	outputs:         Receiver<PumpOutput>,
 	hooks:           Arc<OnceLock<InvocationHookBus>>,
 	maximum_effects: Arc<OnceLock<Effects>>,
 	maximum_ready:   Arc<Notify>,
@@ -380,7 +391,7 @@ async fn handle_interrupt(
 	invocation: &Invocation,
 	reason: Str,
 	ack: flume::Sender<Result<(), ClientError>>,
-	command_rx: &flume::Receiver<PumpCommand>,
+	command_rx: &Receiver<PumpCommand>,
 ) -> bool {
 	let action = {
 		let sent = invocation.interrupt(reason);
@@ -562,7 +573,7 @@ fn spawn_invocation_pump(
 								admission:     decision.admission.clone(),
 							});
 						}
-						tokio::task::yield_now().await;
+						task::yield_now().await;
 						if task_cancelled.load(Ordering::Acquire) {
 							invocation.guard().cancel();
 							break;
@@ -789,8 +800,8 @@ pub struct CommittedCall {
 	effects:          Effects,
 	pump:             InvocationPump,
 	events:           EventBus,
-	usage:            omp_proto::inference::v1::Usage,
-	override_invoker: Option<(crate::tool_choice::Invoker, Value)>,
+	usage:            v1::Usage,
+	override_invoker: Option<(Invoker, Value)>,
 }
 
 impl CommittedCall {
@@ -825,12 +836,12 @@ impl CommittedCall {
 	}
 
 	/// Attaches the cumulative usage receipt observed before tool execution.
-	pub fn set_cumulative_usage(&mut self, usage: omp_proto::inference::v1::Usage) {
+	pub fn set_cumulative_usage(&mut self, usage: v1::Usage) {
 		self.usage = usage;
 	}
 
 	/// Bypasses the registered executor with one directive-owned invocation.
-	pub fn set_override_invoker(&mut self, invoker: crate::tool_choice::Invoker, input: Value) {
+	pub fn set_override_invoker(&mut self, invoker: Invoker, input: Value) {
 		self.override_invoker = Some((invoker, input));
 	}
 }
@@ -925,83 +936,163 @@ impl ToolBatch {
 			.drive_inner(registry, caps, None, Duration::ZERO, None)
 			.await
 	}
+}
 
-	/// Drives the batch with one watch-broadcast cooperative interrupt source.
-	pub async fn drive_interruptible(
-		self,
-		registry: &Registry,
-		caps: &CapsBase,
-		interrupt: watch::Receiver<Option<Str>>,
-		grace: Duration,
-	) -> Vec<BatchResult> {
-		self
-			.drive_inner(registry, caps, Some(interrupt), grace, None)
-			.await
-	}
+mod interruptible {
+	use futures::future::join_all;
+	use omp_proto::env::v1;
+	use tokio::sync::watch::Receiver;
 
-	/// Drives an interruptible batch while forwarding each queued update once.
-	pub(crate) async fn drive_streaming(
-		self,
-		registry: &Registry,
-		caps: &CapsBase,
-		interrupt: watch::Receiver<Option<Str>>,
-		grace: Duration,
-		updates: flume::Sender<BatchUpdate>,
-	) -> Vec<BatchResult> {
-		self
-			.drive_inner(registry, caps, Some(interrupt), grace, Some(updates))
-			.await
-	}
+	use super::*;
 
-	async fn drive_inner(
-		self,
-		registry: &Registry,
-		caps: &CapsBase,
-		mut interrupt: Option<watch::Receiver<Option<Str>>>,
-		grace: Duration,
-		updates: Option<flume::Sender<BatchUpdate>>,
-	) -> Vec<BatchResult> {
-		if let Some(reason) = interrupt
-			.as_mut()
-			.and_then(|receiver| receiver.borrow_and_update().clone())
-		{
-			let reason = format!("interrupted before execution: {reason}").to_str();
-			return self
-				.calls
-				.iter()
-				.map(|call| lower_abort_total(call, Abort::Skipped { reason: reason.clone() }))
-				.collect();
+	impl ToolBatch {
+		/// Drives the batch with one watch-broadcast cooperative interrupt
+		/// source.
+		pub async fn drive_interruptible(
+			self,
+			registry: &Registry,
+			caps: &CapsBase,
+			interrupt: Receiver<Option<Str>>,
+			grace: Duration,
+		) -> Vec<BatchResult> {
+			self
+				.drive_inner(registry, caps, Some(interrupt), grace, None)
+				.await
 		}
 
-		let mut interrupt_senders = Vec::with_capacity(self.calls.len());
-		let mut calls = Vec::with_capacity(self.calls.len());
-		for (index, call) in self.calls.into_iter().enumerate() {
-			let (interrupt_tx, interrupt_rx) = flume::bounded(1);
-			interrupt_senders.push(interrupt_tx);
-			calls.push(run_call(index, call, registry, caps, interrupt_rx, grace, updates.clone()));
+		/// Drives an interruptible batch while forwarding each queued update
+		/// once.
+		pub(crate) async fn drive_streaming(
+			self,
+			registry: &Registry,
+			caps: &CapsBase,
+			interrupt: Receiver<Option<Str>>,
+			grace: Duration,
+			updates: flume::Sender<BatchUpdate>,
+		) -> Vec<BatchResult> {
+			self
+				.drive_inner(registry, caps, Some(interrupt), grace, Some(updates))
+				.await
 		}
 
-		let drive = join_all(calls);
-		let results = if let Some(mut interrupt) = interrupt {
-			let coordinate = coordinate_interrupts(&mut interrupt, &interrupt_senders, grace);
-			tokio::pin!(drive, coordinate);
-			tokio::select! {
-				results = &mut drive => results,
-				() = &mut coordinate => drive.await,
+		pub(super) async fn drive_inner(
+			self,
+			registry: &Registry,
+			caps: &CapsBase,
+			mut interrupt: Option<Receiver<Option<Str>>>,
+			grace: Duration,
+			updates: Option<flume::Sender<BatchUpdate>>,
+		) -> Vec<BatchResult> {
+			if let Some(reason) = interrupt
+				.as_mut()
+				.and_then(|receiver| receiver.borrow_and_update().clone())
+			{
+				let reason = format!("interrupted before execution: {reason}").to_str();
+				return self
+					.calls
+					.iter()
+					.map(|call| lower_abort_total(call, Abort::Skipped { reason: reason.clone() }))
+					.collect();
 			}
+
+			let mut interrupt_senders = Vec::with_capacity(self.calls.len());
+			let mut calls = Vec::with_capacity(self.calls.len());
+			for (index, call) in self.calls.into_iter().enumerate() {
+				let (interrupt_tx, interrupt_rx) = flume::bounded(1);
+				interrupt_senders.push(interrupt_tx);
+				calls.push(run_call(index, call, registry, caps, interrupt_rx, grace, updates.clone()));
+			}
+
+			let drive = join_all(calls);
+			let results = if let Some(mut interrupt) = interrupt {
+				let coordinate = coordinate_interrupts(&mut interrupt, &interrupt_senders, grace);
+				tokio::pin!(drive, coordinate);
+				tokio::select! {
+					results = &mut drive => results,
+					() = &mut coordinate => drive.await,
+				}
+			} else {
+				drive.await
+			};
+			results.into_iter().map(|(_, result)| result).collect()
+		}
+	}
+
+	pub(super) async fn coordinate_interrupts(
+		source: &mut Receiver<Option<Str>>,
+		targets: &[flume::Sender<InterruptRequest>],
+		grace: Duration,
+	) {
+		let reason = wait_for_interrupt(source).await;
+		for target in targets.iter().rev() {
+			let (acknowledged, acknowledgement) = flume::bounded(1);
+			if target
+				.send_async(InterruptRequest { reason: reason.clone(), acknowledged })
+				.await
+				.is_err()
+			{
+				continue;
+			}
+			if grace.is_zero() {
+				task::yield_now().await;
+			} else {
+				let _ = time::timeout(grace, acknowledgement.recv_async()).await;
+			}
+		}
+	}
+
+	async fn wait_for_interrupt(receiver: &mut Receiver<Option<Str>>) -> Str {
+		loop {
+			let reason = receiver.borrow_and_update().clone();
+			if let Some(reason) = reason {
+				return reason;
+			}
+			if receiver.changed().await.is_err() {
+				future::pending::<()>().await;
+			}
+		}
+	}
+
+	pub(super) fn lower_verdict(
+		call: &CommittedCall,
+		registry: &Registry,
+		caps: CapsBase,
+		wire: v1::Verdict,
+	) -> Result<BatchResult, BatchError> {
+		if let Ok(ToolTerminal::Detached(job)) =
+			serde_json::from_slice::<ToolTerminal<Value, Value>>(&wire.json)
+		{
+			return lower_detached(call, wire.json, job);
+		}
+
+		let outcome = serde_json::from_slice::<CallOutcome<Value, Value>>(&wire.json)
+			.map_err(BatchError::InvalidOutcome)?;
+		let durable = durable_outcome(&wire.json, &outcome);
+		let is_error = !matches!(outcome, CallOutcome::Ok(_));
+		let mut result = if let Some(parts) = harness_parts(&outcome) {
+			lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts)?
 		} else {
-			drive.await
+			let caps = PromptCaps::for_tool(caps, &call.identity.rev);
+			match registry.prompt(&call.identity, &wire.json, &caps) {
+				Ok(Some(parts)) => lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts)?,
+				Ok(None) => {
+					unreachable!("harness outcome branches were handled before registry projection")
+				},
+				Err(_) => lower_canonical_parts(call, &wire.json, is_error, wire.useless, wire.parts)?,
+			}
 		};
-		results.into_iter().map(|(_, result)| result).collect()
+		result.outcome = Some(durable);
+		Ok(result)
 	}
 }
+use interruptible::lower_verdict;
 
 async fn run_call(
 	index: usize,
 	mut call: CommittedCall,
 	registry: &Registry,
 	caps: &CapsBase,
-	interrupt: flume::Receiver<InterruptRequest>,
+	interrupt: Receiver<InterruptRequest>,
 	grace: Duration,
 	updates: Option<flume::Sender<BatchUpdate>>,
 ) -> (usize, BatchResult) {
@@ -1153,7 +1244,7 @@ async fn finish_interrupt_with_grace(
 		result?;
 		Ok::<_, BatchError>(drain_pump(call, updates).await)
 	};
-	match tokio::time::timeout(grace, cooperative).await {
+	match time::timeout(grace, cooperative).await {
 		Ok(Ok(terminal)) => terminal,
 		Ok(Err(_)) | Err(_) => force_cancel_with_grace(call, updates, grace).await,
 	}
@@ -1168,7 +1259,7 @@ async fn force_cancel_with_grace(
 		let _ = call.pump.cancel().await;
 		drain_pump(call, updates).await
 	};
-	match tokio::time::timeout(grace, forced).await {
+	match time::timeout(grace, forced).await {
 		Ok(PumpTerminal::Verdict(verdict)) => PumpTerminal::Verdict(verdict),
 		Ok(PumpTerminal::ClientError(error)) => PumpTerminal::ClientError(error),
 		Ok(PumpTerminal::Closed | PumpTerminal::CancelUnobserved) | Err(_) => {
@@ -1177,80 +1268,11 @@ async fn force_cancel_with_grace(
 	}
 }
 
-async fn coordinate_interrupts(
-	source: &mut watch::Receiver<Option<Str>>,
-	targets: &[flume::Sender<InterruptRequest>],
-	grace: Duration,
-) {
-	let reason = wait_for_interrupt(source).await;
-	for target in targets.iter().rev() {
-		let (acknowledged, acknowledgement) = flume::bounded(1);
-		if target
-			.send_async(InterruptRequest { reason: reason.clone(), acknowledged })
-			.await
-			.is_err()
-		{
-			continue;
-		}
-		if grace.is_zero() {
-			tokio::task::yield_now().await;
-		} else {
-			let _ = tokio::time::timeout(grace, acknowledgement.recv_async()).await;
-		}
-	}
-}
-
-async fn wait_for_ordered_interrupt(
-	receiver: &flume::Receiver<InterruptRequest>,
-) -> InterruptRequest {
+async fn wait_for_ordered_interrupt(receiver: &Receiver<InterruptRequest>) -> InterruptRequest {
 	match receiver.recv_async().await {
 		Ok(request) => request,
-		Err(_) => std::future::pending().await,
+		Err(_) => future::pending().await,
 	}
-}
-
-async fn wait_for_interrupt(receiver: &mut watch::Receiver<Option<Str>>) -> Str {
-	loop {
-		let reason = receiver.borrow_and_update().clone();
-		if let Some(reason) = reason {
-			return reason;
-		}
-		if receiver.changed().await.is_err() {
-			std::future::pending::<()>().await;
-		}
-	}
-}
-
-fn lower_verdict(
-	call: &CommittedCall,
-	registry: &Registry,
-	caps: CapsBase,
-	wire: omp_proto::env::v1::Verdict,
-) -> Result<BatchResult, BatchError> {
-	if let Ok(ToolTerminal::Detached(job)) =
-		serde_json::from_slice::<ToolTerminal<Value, Value>>(&wire.json)
-	{
-		return lower_detached(call, wire.json, job);
-	}
-
-	let outcome = serde_json::from_slice::<CallOutcome<Value, Value>>(&wire.json)
-		.map_err(BatchError::InvalidOutcome)?;
-	let durable = durable_outcome(&wire.json, &outcome);
-	let is_error = !matches!(outcome, CallOutcome::Ok(_));
-	let mut result = if let Some(parts) = harness_parts(&outcome) {
-		lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts)?
-	} else {
-		let caps = PromptCaps::for_tool(caps, &call.identity.rev);
-		match registry.prompt(&call.identity, &wire.json, &caps) {
-			Ok(Some(parts)) => lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts)?,
-			Ok(None) => {
-				unreachable!("harness outcome branches were handled before registry projection")
-			},
-			Err(_) => lower_canonical_parts(call, &wire.json, is_error, wire.useless, wire.parts)?,
-		}
-	};
-	result.outcome = Some(durable);
-	Ok(result)
 }
 
 fn lower_detached(
@@ -1396,8 +1418,9 @@ mod tests {
 	use std::collections::HashMap;
 
 	use omp_env::frame::{self, client_frame, server_frame};
-	use omp_proto::thread::v1::{Part as ThreadPart, part};
+	use omp_proto::thread::v1::{Part as ThreadPart, item, part};
 	use omp_tool::{ArgIssueKind, ModelClass, Rev};
+	use tokio::sync::watch;
 
 	use super::*;
 
@@ -1415,8 +1438,7 @@ mod tests {
 	}
 
 	fn terminal_text(result: &BatchResult) -> &str {
-		let Some(omp_proto::thread::v1::item::Kind::ToolResult(result)) = result.item().kind.as_ref()
-		else {
+		let Some(item::Kind::ToolResult(result)) = result.item().kind.as_ref() else {
 			panic!("batch completion was not a ToolResult");
 		};
 		let Some(ThreadPart { kind: Some(part::Kind::Text(text)) }) = result.parts.first() else {
@@ -1654,16 +1676,16 @@ mod tests {
 			})
 			.await
 			.expect("admit invocation");
-		tokio::time::timeout(Duration::from_secs(1), async {
+		time::timeout(Duration::from_secs(1), async {
 			while call.admission().is_none() {
-				tokio::task::yield_now().await;
+				task::yield_now().await;
 			}
 		})
 		.await
 		.expect("admission observed");
 		drop(call);
 
-		let cancelled = tokio::time::timeout(Duration::from_secs(1), requests.recv_async())
+		let cancelled = time::timeout(Duration::from_secs(1), requests.recv_async())
 			.await
 			.expect("cancel timeout")
 			.expect("cancel frame");
@@ -1770,7 +1792,7 @@ mod tests {
 		let mut update_count = 0;
 		let mut saw_update = false;
 		while !saw_update {
-			let event = tokio::time::timeout(Duration::from_secs(1), observed.recv())
+			let event = time::timeout(Duration::from_secs(1), observed.recv())
 				.await
 				.expect("speculative event timeout")
 				.expect("event subscriber");
@@ -1861,8 +1883,8 @@ mod tests {
 				.drive_interruptible(&Registry::new(), &caps(), interrupt_rx, Duration::from_millis(25))
 				.await
 		});
-		tokio::task::yield_now().await;
-		tokio::task::yield_now().await;
+		task::yield_now().await;
+		task::yield_now().await;
 		let blocker_frame = requests.recv().expect("queued blocker InvokeTool");
 		assert!(matches!(blocker_frame.body, Some(client_frame::Body::InvokeTool(_))));
 		let committed_frame = requests
@@ -1890,7 +1912,7 @@ mod tests {
 				})
 				.expect("authoritative verdict");
 		}
-		let results = tokio::time::timeout(Duration::from_secs(1), drive)
+		let results = time::timeout(Duration::from_secs(1), drive)
 			.await
 			.expect("commit race timeout")
 			.expect("batch task");
@@ -1909,7 +1931,8 @@ mod tests {
 			receivers.push(receiver);
 		}
 		let coordinator = tokio::spawn(async move {
-			coordinate_interrupts(&mut source_rx, &targets, Duration::from_secs(1)).await;
+			interruptible::coordinate_interrupts(&mut source_rx, &targets, Duration::from_secs(1))
+				.await;
 		});
 		source_tx
 			.send(Some(sf!("stop every call")))

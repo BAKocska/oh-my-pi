@@ -1,4 +1,5 @@
 //! Cross-provider inference conformance tests.
+
 #[path = "support/auth.rs"]
 mod auth;
 #[path = "support/oracle.rs"]
@@ -10,7 +11,8 @@ mod route_factory;
 
 use std::{
 	collections::{BTreeSet, HashMap},
-	sync::{Arc, atomic::Ordering},
+	str,
+	sync::{Arc, atomic, atomic::Ordering},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,20 +35,21 @@ use omp_inference::{
 		TokenSequence, TokenizerProvenance, UsageAccountMetadata, UsageReport,
 	},
 	body::{
-		AttemptBodyEvidence, BodySource, Replayability, RetryDecision, RetryDecisionReason,
-		aggregate_replay_evidence,
+		AttemptBodyEvidence, BodyFactoryHandle, BodySource, Replayability, RetryDecision,
+		RetryDecisionReason, aggregate_replay_evidence,
 	},
 	call::{
 		AccountRoutingContext, AuthRequest, CallMeta, ChatRequest, ContentPart, CountAccuracy,
 		CountTokensRequest, DetokenizeRequest, DiscoveryRequest, EmbedRequest, ImageRequest, Message,
-		NativeMethod, NativePath, NativeRequest, NativeResponseFraming, OperationCall, ProviderProof,
-		RealtimeRequest, Role, SearchRequest, SpeechRequest, Target, TokenizeRequest,
+		NativeMethod, NativePath, NativeRequest, NativeResponseFraming, OpaqueJson, OperationCall,
+		ProviderProof, RealtimeRequest, Role, SearchRequest, SpeechRequest, Target, TokenizeRequest,
 		TranscriptionRequest, UsageRequest, VideoRequest,
 	},
 	client::{Client, Operation},
 	codec::{
-		Cancellation, Codec, DecodeContext, EncodeContext, EncodedRequest, NativeResponseFormat,
-		RawEvent, RequestMethod, SizeBounds, TransportAttempt, TransportRequest,
+		self, Cancellation, Codec, DecodeContext, EncodeContext, EncodedRequest,
+		NativeResponseFormat, RawEvent, RequestMethod, SizeBounds, TransportAttempt,
+		TransportRequest,
 		anthropic::AnthropicCodec,
 		bedrock::BedrockConverseCodec,
 		cursor::CursorCodec,
@@ -86,6 +89,7 @@ use omp_inference::{
 		cassette::{CassetteAttempt, CassetteBodyAction, CassetteTerminal, CassetteTransport},
 	},
 };
+use tokio::time;
 use tower::{Service as _, ServiceExt as _};
 
 fn response_meta() -> ResponseMeta {
@@ -367,7 +371,7 @@ fn decode_hex(value: &str) -> Vec<u8> {
 		.0
 		.iter()
 		.map(|pair| {
-			let text = std::str::from_utf8(pair).expect("hex is ASCII");
+			let text = str::from_utf8(pair).expect("hex is ASCII");
 			u8::from_str_radix(text, 16).expect("fixture hex byte")
 		})
 		.collect()
@@ -432,7 +436,7 @@ fn forced_tool_and_structured_output_never_leak_provisional_events() {
 		call:  ToolCall {
 			id:        ToolCallId::from("call-fixture"),
 			name:      sf!("lookup"),
-			arguments: omp_inference::call::OpaqueJson::new(serde_json::json!({"q":"rust"})),
+			arguments: OpaqueJson::new(serde_json::json!({"q":"rust"})),
 		},
 	};
 	assert_eq!(
@@ -520,10 +524,10 @@ async fn consumed_one_shot_suppresses_every_automatic_action_and_factories_are_f
 		);
 	}
 
-	let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let opens = Arc::new(atomic::AtomicUsize::new(0));
 	let factory_opens = Arc::clone(&opens);
-	let factory = omp_inference::body::BodyFactoryHandle::new(move || {
-		let ordinal = factory_opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+	let factory = BodyFactoryHandle::new(move || {
+		let ordinal = factory_opens.fetch_add(1, atomic::Ordering::SeqCst);
 		async move {
 			let body: omp_inference::body::ByteStream =
 				Box::pin(stream::iter([Ok(Bytes::from(ordinal.to_string()))]));
@@ -1078,8 +1082,8 @@ fn every_real_codec_constructs_fresh_attempt_decoder_state_offline() {
 		let second = codec
 			.decoder(&context)
 			.unwrap_or_else(|error| panic!("{name} second decoder: {error:?}"));
-		let first_ptr = (&*first as *const dyn omp_inference::codec::Decoder) as *const ();
-		let second_ptr = (&*second as *const dyn omp_inference::codec::Decoder) as *const ();
+		let first_ptr = (&*first as *const dyn codec::Decoder) as *const ();
+		let second_ptr = (&*second as *const dyn codec::Decoder) as *const ();
 		assert_ne!(first_ptr, second_ptr, "{name} reused decoder state");
 	}
 	let first = OmpNativeDecoder::new();
@@ -1211,15 +1215,15 @@ async fn concurrent_auth_refresh_is_single_flight_and_waiters_share_the_exact_re
 	let store = refresh::shared();
 	let coordinator =
 		RefreshCoordinator::new("conformance-process", RefreshPolicy::default()).unwrap();
-	let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let calls = Arc::new(atomic::AtomicUsize::new(0));
 	let first_calls = Arc::clone(&calls);
 	let second_calls = Arc::clone(&calls);
 	let first = coordinator.refresh(
 		Arc::clone(&store),
 		refresh::request("fixture-account-alpha"),
 		move |_| async move {
-			first_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			first_calls.fetch_add(1, atomic::Ordering::SeqCst);
+			time::sleep(Duration::from_millis(10)).await;
 			Ok(refresh::refreshed("fixture-account-alpha"))
 		},
 	);
@@ -1227,7 +1231,7 @@ async fn concurrent_auth_refresh_is_single_flight_and_waiters_share_the_exact_re
 		Arc::clone(&store),
 		refresh::request("fixture-account-alpha"),
 		move |_| async move {
-			second_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			second_calls.fetch_add(1, atomic::Ordering::SeqCst);
 			Ok(refresh::refreshed("fixture-account-alpha"))
 		},
 	);
@@ -1359,7 +1363,7 @@ async fn client_plans_without_service_effects_executes_the_exact_route_and_rejec
 	assert_eq!(unknown_error.kind, ErrorKind::TargetNotFound);
 	let polls_before = probe.readiness_polls.load(Ordering::SeqCst);
 	let calls_before = probe.calls.load(Ordering::SeqCst);
-	tokio::time::sleep(Duration::from_millis(1)).await;
+	time::sleep(Duration::from_millis(1)).await;
 	let Err(error) = stale_client.execute_plan(stale).await else {
 		panic!("stale plan unexpectedly executed");
 	};

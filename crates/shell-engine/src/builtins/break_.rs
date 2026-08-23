@@ -1,6 +1,9 @@
 use clap::Parser;
 
-use crate::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, builtins};
+use crate::{
+	Error, ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
+	ShellExtensions, builtins,
+};
 
 /// Breaks out of a control-flow loop.
 #[derive(Parser)]
@@ -11,12 +14,12 @@ pub(crate) struct BreakCommand {
 }
 
 impl builtins::Command for BreakCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		_context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		_context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		// If specified, which_loop needs to be positive.
 		if self.which_loop <= 0 {
 			return Ok(ExecutionExitCode::InvalidUsage.into());

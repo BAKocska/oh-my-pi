@@ -1,6 +1,6 @@
 //! Capability-gated, bounded HTTP egress owned by the Environment.
 
-use std::time::Duration;
+use std::{env, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
@@ -13,6 +13,9 @@ use http::{
 use omp_proto::env::v1 as pb;
 use strum::Display;
 use thiserror::Error;
+use tokio::time;
+use url::Url;
+use wreq::redirect;
 
 use super::worker_pool::MAX_TUNNEL_BUFFER_BYTES;
 
@@ -28,7 +31,7 @@ pub struct HttpEgressHost {
 impl HttpEgressHost {
 	pub(crate) fn new() -> Self {
 		let client = wreq::Client::builder()
-			.redirect(wreq::redirect::Policy::none())
+			.redirect(redirect::Policy::none())
 			.build()
 			.expect("build Environment HTTP egress client");
 		Self { client }
@@ -43,7 +46,7 @@ impl HttpEgressHost {
 		if timeout_ms == 0 {
 			request.await
 		} else {
-			tokio::time::timeout(Duration::from_millis(timeout_ms), request)
+			time::timeout(Duration::from_millis(timeout_ms), request)
 				.await
 				.map_err(|_| HttpEgressError::TimedOut)?
 		}
@@ -172,7 +175,7 @@ fn configured_socks_proxy() -> Option<ProxyVariable> {
 	]
 	.into_iter()
 	.find_map(|(name, variable)| {
-		let value = std::env::var_os(name)?;
+		let value = env::var_os(name)?;
 		value
 			.to_str()
 			.is_some_and(|value| {
@@ -196,9 +199,9 @@ fn parse_method(method: &str) -> Result<Method, HttpEgressError> {
 	}
 }
 
-fn parse_url(value: &str) -> Result<url::Url, HttpEgressError> {
-	let url = url::Url::parse(value)
-		.map_err(|error| HttpEgressError::InvalidArgument(error.to_string()))?;
+fn parse_url(value: &str) -> Result<Url, HttpEgressError> {
+	let url =
+		Url::parse(value).map_err(|error| HttpEgressError::InvalidArgument(error.to_string()))?;
 	if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
 		return Err(HttpEgressError::InvalidArgument(
 			"HTTP egress URL must use http or https and include a host".to_owned(),
@@ -224,7 +227,7 @@ fn redirect_location(status: StatusCode, headers: &HeaderMap) -> Option<String> 
 		.map(str::to_owned)
 }
 
-fn parse_redirect_url(base: &url::Url, location: &str) -> Result<url::Url, HttpEgressError> {
+fn parse_redirect_url(base: &Url, location: &str) -> Result<Url, HttpEgressError> {
 	let url = base.join(location).map_err(|error| {
 		HttpEgressError::InvalidArgument(format!("invalid redirect URL: {error}"))
 	})?;
@@ -236,7 +239,7 @@ fn parse_redirect_url(base: &url::Url, location: &str) -> Result<url::Url, HttpE
 	Ok(url)
 }
 
-fn same_origin(left: &url::Url, right: &url::Url) -> bool {
+fn same_origin(left: &Url, right: &Url) -> bool {
 	left.scheme() == right.scheme()
 		&& left.host_str() == right.host_str()
 		&& left.port_or_known_default() == right.port_or_known_default()

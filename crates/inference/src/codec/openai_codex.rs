@@ -4,12 +4,26 @@
 use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 
-use super::openai_responses::{
-	OpenAiResponsesCodec, OpenAiResponsesDecoder, OpenAiResponsesOptions, ResponsesInputContent,
-	ResponsesInputItem, ResponsesInputItemKind, ResponsesMetadata, ResponsesMetadataValue,
-	ResponsesNamedToolKind, ResponsesOutputItem, ResponsesReasoning, ResponsesRequest,
-	ResponsesRole, ResponsesStreamEvent, ResponsesStreamEventKind, ResponsesStreamOptions,
-	ResponsesTool, ResponsesToolChoice, ResponsesToolChoiceMode, ResponsesToolKind,
+use super::{
+	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawEvent,
+	RequestHeader, RequestMethod, SizeBounds,
+	openai_responses::{
+		OpenAiResponsesCodec, OpenAiResponsesDecoder, OpenAiResponsesOptions, ResponsesInputContent,
+		ResponsesInputItem, ResponsesInputItemKind, ResponsesMetadata, ResponsesMetadataValue,
+		ResponsesNamedToolKind, ResponsesOutputItem, ResponsesOutputItemKind, ResponsesReasoning,
+		ResponsesRequest, ResponsesRole, ResponsesStreamEvent, ResponsesStreamEventKind,
+		ResponsesStreamOptions, ResponsesTool, ResponsesToolChoice, ResponsesToolChoiceMode,
+		ResponsesToolKind,
+	},
+};
+use crate::{
+	call::{AccountRoutingContext as CallAccountRoutingContext, OperationCall},
+	catalog::{
+		CodexTransportPreference, ModelCapabilities as CatalogModelCapabilities, OperationKind,
+		ProviderId, RouteId,
+	},
+	error::Error,
+	transport::Frame,
 };
 
 const CODEX_CLIENT_VERSION: &str = "0.144.1";
@@ -273,8 +287,8 @@ pub fn apply_codex_client_metadata(
 /// Adds a region-pinned workspace's residency to Codex request headers
 /// without replacing a caller-supplied value.
 pub fn apply_codex_residency_header(
-	headers: &mut Vec<super::RequestHeader>,
-	account: Option<&crate::call::AccountRoutingContext>,
+	headers: &mut Vec<RequestHeader>,
+	account: Option<&CallAccountRoutingContext>,
 ) {
 	if headers
 		.iter()
@@ -285,7 +299,7 @@ pub fn apply_codex_residency_header(
 	let Some(residency) = account.and_then(|account| account.region.as_ref()) else {
 		return;
 	};
-	headers.push(super::RequestHeader {
+	headers.push(RequestHeader {
 		name:  Str::new_static(CODEX_RESIDENCY_HEADER),
 		value: Str::new(residency.as_str()),
 	});
@@ -487,19 +501,19 @@ impl CodexContinuationState {
 
 fn output_matches_replay(output: &ResponsesOutputItem, input: &ResponsesInputItem) -> bool {
 	match output.kind {
-		super::openai_responses::ResponsesOutputItemKind::FunctionCall => {
+		ResponsesOutputItemKind::FunctionCall => {
 			input.kind == Some(ResponsesInputItemKind::FunctionCall)
 				&& input.call_id == output.call_id
 				&& input.name == output.name
 				&& input.arguments == output.arguments
 		},
-		super::openai_responses::ResponsesOutputItemKind::CustomToolCall => {
+		ResponsesOutputItemKind::CustomToolCall => {
 			input.kind == Some(ResponsesInputItemKind::CustomToolCall)
 				&& input.call_id == output.call_id
 				&& input.name == output.name
 				&& input.input == output.input
 		},
-		super::openai_responses::ResponsesOutputItemKind::ComputerCall => {
+		ResponsesOutputItemKind::ComputerCall => {
 			input.kind == Some(ResponsesInputItemKind::ComputerCall)
 				&& input.call_id == output.call_id
 				&& input.actions == output.actions
@@ -667,13 +681,13 @@ struct CodexModelRow {
 }
 
 struct CodexModelsDecoder {
-	provider: crate::catalog::ProviderId,
-	route:    crate::catalog::RouteId,
+	provider: ProviderId,
+	route:    RouteId,
 	done:     bool,
 }
 
 impl CodexModelsDecoder {
-	fn protocol_error(&self, code: &'static str) -> crate::error::Error {
+	fn protocol_error(&self, code: &'static str) -> Error {
 		use crate::{
 			error::{Error, ErrorKind, ErrorPhase, RetryAction},
 			receipt::ExecutionReceipt,
@@ -689,7 +703,7 @@ impl CodexModelsDecoder {
 		.code(Str::new(code))
 	}
 
-	fn capabilities(row: &CodexModelRow) -> crate::catalog::ModelCapabilities {
+	fn capabilities(row: &CodexModelRow) -> CatalogModelCapabilities {
 		use crate::catalog::{
 			Availability, ChatCapabilities, ModalityBits, ModelCapabilities, OperationBits,
 			OperationKind, ReasoningCapabilities, ReasoningEffort, ReasoningFeatureBits,
@@ -781,19 +795,15 @@ impl CodexModelsDecoder {
 	}
 }
 
-impl super::Decoder for CodexModelsDecoder {
-	fn push(
-		&mut self,
-		frame: crate::transport::Frame,
-		emit: &mut dyn FnMut(super::RawEvent),
-	) -> Result<(), crate::error::Error> {
+impl Decoder for CodexModelsDecoder {
+	fn push(&mut self, frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
 		use crate::catalog::{
 			DiscoveredModel, ModelAvailability, ModelLimits, OperationBits, OperationKind, WireModelId,
 		};
 		if self.done {
 			return Ok(());
 		}
-		let crate::transport::Frame::Raw(payload) = frame else {
+		let Frame::Raw(payload) = frame else {
 			return Err(self.protocol_error("codex_discovery_wrong_framing"));
 		};
 		let payload: CodexModelsPayload = serde_json::from_slice(&payload)
@@ -847,12 +857,12 @@ impl super::Decoder for CodexModelsDecoder {
 			});
 		}
 		rows.sort_by(|left, right| left.wire_model.cmp(&right.wire_model));
-		emit(super::RawEvent::DiscoveredModels { rows, next_cursor: None });
+		emit(RawEvent::DiscoveredModels { rows, next_cursor: None });
 		self.done = true;
 		Ok(())
 	}
 
-	fn finish(&mut self, _emit: &mut dyn FnMut(super::RawEvent)) -> Result<(), crate::error::Error> {
+	fn finish(&mut self, _emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
 		if self.done {
 			Ok(())
 		} else {
@@ -861,12 +871,12 @@ impl super::Decoder for CodexModelsDecoder {
 	}
 }
 
-impl super::Codec for OpenAiCodexCodec {
+impl Codec for OpenAiCodexCodec {
 	fn encode(
 		&self,
-		context: &super::EncodeContext<'_>,
-		operation: &crate::call::OperationCall,
-	) -> Result<super::EncodedRequest, crate::error::Error> {
+		context: &EncodeContext<'_>,
+		operation: &OperationCall,
+	) -> Result<EncodedRequest, Error> {
 		use bytes::Bytes;
 
 		use crate::{
@@ -884,7 +894,7 @@ impl super::Codec for OpenAiCodexCodec {
 			)
 			.code(Str::new(code))
 		};
-		if let crate::call::OperationCall::DiscoverModels(request) = operation {
+		if let OperationCall::DiscoverModels(request) = operation {
 			if request.cursor.is_some() {
 				return Err(fail("codex_discovery_cursor_unsupported"));
 			}
@@ -916,18 +926,17 @@ impl super::Codec for OpenAiCodexCodec {
 						.and_then(|identity| identity.account_id.clone())
 				});
 			if let Some(account_id) = account_id {
-				headers
-					.push(super::RequestHeader { name: sf!("chatgpt-account-id"), value: account_id });
+				headers.push(RequestHeader { name: sf!("chatgpt-account-id"), value: account_id });
 			}
 			apply_codex_residency_header(&mut headers, context.account);
-			return Ok(super::EncodedRequest {
-				operation: crate::catalog::OperationKind::DiscoverModels,
-				method: super::RequestMethod::Get,
+			return Ok(EncodedRequest {
+				operation: OperationKind::DiscoverModels,
+				method: RequestMethod::Get,
 				uri,
 				headers: headers.into_boxed_slice(),
 				body: BodySource::Bytes(Bytes::new()),
 				framing: FramingProtocol::Raw,
-				bounds: super::SizeBounds {
+				bounds: SizeBounds {
 					request_body: 0,
 					frame:        16 * 1024 * 1024,
 					response:     256 * 1024 * 1024,
@@ -935,7 +944,7 @@ impl super::Codec for OpenAiCodexCodec {
 				sealed_body: None,
 			});
 		}
-		let crate::call::OperationCall::Chat(chat) = operation else {
+		let OperationCall::Chat(chat) = operation else {
 			return Err(fail("codex_chat_only"));
 		};
 		let target = context
@@ -959,10 +968,8 @@ impl super::Codec for OpenAiCodexCodec {
 			.options
 			.transport
 			.unwrap_or(match context.route.codex_transport {
-				crate::catalog::CodexTransportPreference::WebsocketPreferred => {
-					CodexWireTransport::WebSocket
-				},
-				crate::catalog::CodexTransportPreference::HttpOnly => CodexWireTransport::Http,
+				CodexTransportPreference::WebsocketPreferred => CodexWireTransport::WebSocket,
+				CodexTransportPreference::HttpOnly => CodexWireTransport::Http,
 			});
 		if let Some(identity) = &self.options.identity {
 			apply_codex_client_metadata(
@@ -981,7 +988,7 @@ impl super::Codec for OpenAiCodexCodec {
 				serde_json::to_vec(&request).map(Bytes::from),
 				FramingProtocol::Sse,
 				"text/event-stream",
-				super::RequestMethod::Post,
+				RequestMethod::Post,
 			),
 			CodexWireTransport::WebSocket => (
 				codex_websocket_url(&endpoint).map_err(|_| fail("invalid_codex_websocket_endpoint"))?,
@@ -992,7 +999,7 @@ impl super::Codec for OpenAiCodexCodec {
 				.map(Bytes::from),
 				FramingProtocol::WebSocket,
 				"application/json",
-				super::RequestMethod::Get,
+				RequestMethod::Get,
 			),
 		};
 		let body = body.map_err(|_| fail("codex_request_serialization"))?;
@@ -1001,14 +1008,14 @@ impl super::Codec for OpenAiCodexCodec {
 			super::RequestHeader { name: sf!("accept"), value: Str::new(accept) },
 		];
 		apply_codex_residency_header(&mut headers, context.account);
-		Ok(super::EncodedRequest {
-			operation: crate::catalog::OperationKind::Chat,
+		Ok(EncodedRequest {
+			operation: OperationKind::Chat,
 			method,
 			uri,
 			headers: headers.into_boxed_slice(),
 			body: BodySource::Bytes(body),
 			framing,
-			bounds: super::SizeBounds {
+			bounds: SizeBounds {
 				request_body: 64 * 1024 * 1024,
 				frame:        16 * 1024 * 1024,
 				response:     256 * 1024 * 1024,
@@ -1017,12 +1024,9 @@ impl super::Codec for OpenAiCodexCodec {
 		})
 	}
 
-	fn decoder(
-		&self,
-		context: &super::DecodeContext<'_>,
-	) -> Result<super::DecoderState, crate::error::Error> {
+	fn decoder(&self, context: &DecodeContext<'_>) -> Result<DecoderState, Error> {
 		context.debug_assert_valid();
-		if context.operation == crate::catalog::OperationKind::DiscoverModels {
+		if context.operation == OperationKind::DiscoverModels {
 			if !matches!(context.operation_call, crate::call::OperationCall::DiscoverModels(_)) {
 				return Err(
 					CodexModelsDecoder {
@@ -1039,7 +1043,7 @@ impl super::Codec for OpenAiCodexCodec {
 				done:     false,
 			}));
 		}
-		<OpenAiResponsesCodec as super::Codec>::decoder(&self.responses, context)
+		<OpenAiResponsesCodec as Codec>::decoder(&self.responses, context)
 	}
 }
 
@@ -1051,7 +1055,9 @@ mod tests {
 	use super::{
 		CodexContinuationState, CodexFallbackEvidence, CodexFrameDisposition, CodexFrameRouter,
 		CodexModelsDecoder, CodexReplaySafety, CodexResponseCreate, CodexWebSocketFailure,
-		CodexWebSocketProtocolError, classify_codex_fallback, transform_codex_request,
+		CodexWebSocketProtocolError,
+		apply_codex_residency_header as super_apply_codex_residency_header, classify_codex_fallback,
+		transform_codex_request,
 	};
 	use crate::{
 		call::AccountRoutingContext,
@@ -1082,7 +1088,7 @@ mod tests {
 			..AccountRoutingContext::default()
 		};
 		let mut headers = Vec::new();
-		super::apply_codex_residency_header(&mut headers, Some(&account));
+		super_apply_codex_residency_header(&mut headers, Some(&account));
 		assert_eq!(headers, vec![RequestHeader {
 			name:  Str::new_static("x-openai-internal-codex-residency"),
 			value: Str::new_static("us"),
@@ -1092,11 +1098,11 @@ mod tests {
 			name:  Str::new_static("X-OpenAI-Internal-Codex-Residency"),
 			value: Str::new_static("eu"),
 		}];
-		super::apply_codex_residency_header(&mut configured, Some(&account));
+		super_apply_codex_residency_header(&mut configured, Some(&account));
 		assert_eq!(configured[0].value.as_str(), "eu");
 
 		let mut absent = Vec::new();
-		super::apply_codex_residency_header(&mut absent, Some(&AccountRoutingContext::default()));
+		super_apply_codex_residency_header(&mut absent, Some(&AccountRoutingContext::default()));
 		assert!(absent.is_empty());
 	}
 

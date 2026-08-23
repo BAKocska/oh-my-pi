@@ -8,10 +8,11 @@ use std::{
 	io, mem,
 	os::windows::io::AsRawHandle as _,
 	path::{Path, PathBuf},
-	ptr,
+	ptr, slice,
 };
 
 use bytes::BytesMut;
+use omp_core::Str;
 use omp_proto::{
 	env::v1::{ClientFrame, ServerFrame},
 	prost::Message,
@@ -59,7 +60,7 @@ pub fn open_owner_pipe(endpoint: impl AsRef<Path>) -> io::Result<NamedPipeClient
 ///
 /// # Errors
 /// Returns an OS error when the process token or user SID cannot be queried.
-pub fn current_user_pipe_scope() -> io::Result<omp_core::Str> {
+pub fn current_user_pipe_scope() -> io::Result<Str> {
 	let token = ProcessToken::current()?;
 	let storage = token_user_storage(token.0)?;
 	// SAFETY: token_user_storage initialized TOKEN_USER in aligned storage.
@@ -70,7 +71,7 @@ pub fn current_user_pipe_scope() -> io::Result<omp_core::Str> {
 		return Err(io::Error::last_os_error());
 	}
 	// SAFETY: GetLengthSid returned the readable byte length of this live SID.
-	let sid = unsafe { std::slice::from_raw_parts(user.User.Sid.cast::<u8>(), sid_bytes) };
+	let sid = unsafe { slice::from_raw_parts(user.User.Sid.cast::<u8>(), sid_bytes) };
 	let mut hasher = omp_core::Hash32::hasher();
 	hasher.update(b"omp/windows-user-pipe-scope/v1");
 	hasher.update(sid);
@@ -82,7 +83,7 @@ pub fn current_user_pipe_scope() -> io::Result<omp_core::Str> {
 ///
 /// # Errors
 /// Returns an OS error when Windows cannot resolve the process account name.
-pub fn current_user_name() -> io::Result<omp_core::Str> {
+pub fn current_user_name() -> io::Result<Str> {
 	use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
 
 	let mut units = 0_u32;
@@ -104,7 +105,7 @@ pub fn current_user_name() -> io::Result<omp_core::Str> {
 		.unwrap_or(name.len());
 	let name = String::from_utf16(&name[..length])
 		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-	Ok(omp_core::Str::from(name))
+	Ok(Str::from(name))
 }
 
 /// Connects an environment client to an owner-local Windows named pipe.
@@ -123,7 +124,10 @@ pub fn connect_owner_pipe(
 	let (client, transport) = EnvClient::in_process(64);
 	let (requests, responses) = transport.into_parts();
 	let task = tokio::spawn(async move {
-		let (mut reader, mut writer) = tokio::io::split(stream);
+		let (mut reader, mut writer) = {
+			use tokio::io;
+			io::split(stream)
+		};
 		let read = async move {
 			let mut scratch = BytesMut::new();
 			loop {
@@ -536,7 +540,7 @@ where
 
 #[cfg(test)]
 mod tests {
-	use omp_proto::env::v1::{ClientHello, client_frame};
+	use omp_proto::env::v1::ClientHello;
 
 	use super::*;
 
@@ -550,7 +554,9 @@ mod tests {
 			})),
 			..ClientFrame::default()
 		};
-		let (mut reader, mut writer) = tokio::io::duplex(4096);
+		use tokio::io;
+
+		let (mut reader, mut writer) = io::duplex(4096);
 		let mut encoded = BytesMut::new();
 		write_client_frame(&mut writer, &frame, &mut encoded)
 			.await
@@ -564,13 +570,13 @@ mod tests {
 
 	#[tokio::test]
 	async fn codec_rejects_oversized_prefix_before_body_allocation() {
-		let (mut reader, mut writer) = tokio::io::duplex(32);
+		let (mut reader, mut writer) = io::duplex(32);
 		let oversized = (FRAME_LIMIT as u64 + 1).encode_varint();
 		writer.write_all(&oversized).await.expect("write prefix");
 		let error = read_client_frame(&mut reader, &mut BytesMut::new())
 			.await
 			.expect_err("oversized frame");
-		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert_eq!(error.kind(), ErrorKind::InvalidData);
 	}
 
 	#[test]

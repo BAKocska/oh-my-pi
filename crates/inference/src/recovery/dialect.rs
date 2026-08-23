@@ -1,6 +1,6 @@
 //! Incremental catalog-selected dialect-envelope recognition.
 
-use std::fmt;
+use std::{fmt, str};
 
 use bytes::{Bytes, BytesMut};
 use omp_catalog::{id::WirePolicyId, policy::LeakedThinkingHealer};
@@ -361,7 +361,7 @@ fn parse_qwen_xml(raw: &[u8]) -> Vec<(Option<Str>, Bytes)> {
 	else {
 		return Vec::new();
 	};
-	let Ok(body) = std::str::from_utf8(body) else {
+	let Ok(body) = str::from_utf8(body) else {
 		return Vec::new();
 	};
 	let mut calls = Vec::new();
@@ -465,7 +465,7 @@ fn parse_token_pair(
 }
 
 fn parse_glm(raw: &[u8]) -> Option<(Option<Str>, Bytes)> {
-	let body = std::str::from_utf8(
+	let body = str::from_utf8(
 		raw.strip_prefix(b"<tool_call>")?
 			.strip_suffix(b"</tool_call>")?,
 	)
@@ -493,7 +493,7 @@ fn parse_glm(raw: &[u8]) -> Option<(Option<Str>, Bytes)> {
 }
 
 fn python_calls(body: &[u8]) -> Vec<(Str, Map<String, Value>)> {
-	let Ok(text) = std::str::from_utf8(body) else {
+	let Ok(text) = str::from_utf8(body) else {
 		return Vec::new();
 	};
 	let bytes = text.as_bytes();
@@ -627,7 +627,7 @@ fn unescape_python(text: &str, quote: u8) -> Option<String> {
 }
 
 fn parse_gemma(raw: &[u8]) -> Option<(Option<Str>, Bytes)> {
-	let body = std::str::from_utf8(
+	let body = str::from_utf8(
 		raw.strip_prefix(b"<|tool_call>")?
 			.strip_suffix(b"<tool_call|>")?,
 	)
@@ -758,7 +758,7 @@ fn gemma_balanced(text: &str) -> Option<bool> {
 }
 
 fn parse_xml(raw: &[u8]) -> Option<(Option<Str>, Bytes)> {
-	let text = std::str::from_utf8(raw).ok()?;
+	let text = str::from_utf8(raw).ok()?;
 	let name = text
 		.split_once("name=\"")
 		.and_then(|(_, rest)| rest.split_once('"').map(|(name, _)| name))

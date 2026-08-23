@@ -14,7 +14,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::ValueRef};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types, types::ValueRef};
 
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const DEFAULT_QUERY_LIMIT: usize = 20;
@@ -185,7 +185,7 @@ pub enum Value {
 }
 
 /// A row whose column order is stable and matches SQLite's result metadata.
-pub type Row = Vec<(String, Value)>;
+pub type Row = Vec<(String, types::Value)>;
 
 /// A rectangular query page.
 #[derive(Clone, Debug, PartialEq)]
@@ -696,11 +696,13 @@ fn row_from_sql(row: &rusqlite::Row<'_>, columns: &[String]) -> rusqlite::Result
 		.enumerate()
 		.map(|(index, name)| {
 			let value = match row.get_ref(index)? {
-				ValueRef::Null => Value::Null,
-				ValueRef::Integer(value) => Value::Integer(value),
-				ValueRef::Real(value) => Value::Real(value),
-				ValueRef::Text(value) => Value::Text(String::from_utf8_lossy(value).into_owned()),
-				ValueRef::Blob(value) => Value::Blob(value.to_vec()),
+				ValueRef::Null => types::Value::Null,
+				ValueRef::Integer(value) => types::Value::Integer(value),
+				ValueRef::Real(value) => types::Value::Real(value),
+				ValueRef::Text(value) => {
+					types::Value::Text(String::from_utf8_lossy(value).into_owned())
+				},
+				ValueRef::Blob(value) => types::Value::Blob(value.to_vec()),
 			};
 			Ok((name.clone(), value))
 		})
@@ -722,7 +724,7 @@ fn coerce_integer(key: &str, label: &str) -> Result<i64, Error> {
 		.map_err(|_| Error(format!("{label} must be an integer; got '{key}'")))
 }
 
-fn lookup_value(key: &str, declared_type: &str) -> Result<rusqlite::types::Value, Error> {
+fn lookup_value(key: &str, declared_type: &str) -> Result<types::Value, Error> {
 	let kind = declared_type.trim().to_ascii_uppercase();
 	if kind.contains("INT") {
 		return Ok(coerce_integer(key, &format!("Primary key '{key}'"))?.into());
@@ -939,16 +941,16 @@ fn format_bytes(bytes: usize) -> String {
 		format!("{:.1}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 	}
 }
-fn value_text(value: &Value) -> String {
+fn value_text(value: &types::Value) -> String {
 	match value {
-		Value::Null => "NULL".into(),
-		Value::Integer(value) => value.to_string(),
-		Value::Real(value) => value.to_string(),
-		Value::Text(value) => value.clone(),
-		Value::Blob(value) => format!("<BLOB {}>", format_bytes(value.len())),
+		types::Value::Null => "NULL".into(),
+		types::Value::Integer(value) => value.to_string(),
+		types::Value::Real(value) => value.to_string(),
+		types::Value::Text(value) => value.clone(),
+		types::Value::Blob(value) => format!("<BLOB {}>", format_bytes(value.len())),
 	}
 }
-fn row_value<'a>(row: &'a Row, column: &str) -> Option<&'a Value> {
+fn row_value<'a>(row: &'a Row, column: &str) -> Option<&'a types::Value> {
 	row.iter()
 		.find(|(name, _)| name == column)
 		.map(|(_, value)| value)
@@ -1237,6 +1239,8 @@ pub fn read(path: &Path, authored_target: &str) -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use super::*;
 
 	#[test]
@@ -1250,9 +1254,9 @@ mod tests {
 			.unwrap();
 		drop(writer);
 
-		assert_eq!(&std::fs::read(&path).unwrap()[18..20], &[2, 2]);
-		let _ = std::fs::remove_file(sidecar_path(&path, "-wal"));
-		let _ = std::fs::remove_file(sidecar_path(&path, "-shm"));
+		assert_eq!(&fs::read(&path).unwrap()[18..20], &[2, 2]);
+		let _ = fs::remove_file(sidecar_path(&path, "-wal"));
+		let _ = fs::remove_file(sidecar_path(&path, "-shm"));
 
 		let reader = open_read_only(&path).unwrap();
 		let value: String = reader

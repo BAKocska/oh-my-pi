@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	fmt,
 	future::Future,
 	io,
 	path::PathBuf,
@@ -13,6 +14,7 @@ use std::{
 use futures::future::join_all;
 use omp_core::Str;
 use strum::{Display, EnumString, IntoStaticStr};
+use tokio::time;
 
 use super::{
 	cache::DiscoveryCache,
@@ -435,8 +437,8 @@ pub struct DiscoveryRegistry {
 	cache:     Arc<DiscoveryCache>,
 }
 
-impl std::fmt::Debug for DiscoveryRegistry {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for DiscoveryRegistry {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("DiscoveryRegistry")
 			.field("providers", &self.providers.len())
@@ -524,7 +526,7 @@ impl DiscoveryRegistry {
 		let attempts = join_all(selected.iter().map(|provider| async move {
 			let started = Instant::now();
 			let deadline = bounded_deadline(provider.deadline());
-			let result = tokio::time::timeout(deadline, provider.load(kind, context)).await;
+			let result = time::timeout(deadline, provider.load(kind, context)).await;
 			(provider, started.elapsed(), result)
 		}))
 		.await;
@@ -787,6 +789,8 @@ fn provider_provenance(provider: &dyn CapabilityProvider) -> ProviderProvenance 
 
 #[cfg(test)]
 mod tests {
+	use tokio::time;
+
 	use super::*;
 	use crate::discovery::{
 		manifest::{CapabilityPayload, PromptPayload, SourceProvenance},
@@ -838,7 +842,7 @@ mod tests {
 					Behavior::Load(load) => Ok(load.clone()),
 					Behavior::Fail => Err(ProviderLoadError::Unavailable),
 					Behavior::Delay(load) => {
-						tokio::time::sleep(Duration::from_millis(50)).await;
+						time::sleep(Duration::from_millis(50)).await;
 						Ok(load.clone())
 					},
 				}

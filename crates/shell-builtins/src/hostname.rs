@@ -2,7 +2,14 @@
 //!
 //! Ported from uutils coreutils 0.8.0.
 
-use std::{collections::hash_set::HashSet, ffi::OsString, io::Write, net::ToSocketAddrs};
+#[cfg(not(any(unix, windows)))]
+use std::env;
+use std::{
+	collections::hash_set::HashSet,
+	ffi::OsString,
+	io::{self, Write},
+	net::ToSocketAddrs,
+};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
@@ -17,14 +24,14 @@ static OPT_HOST: &str = "host";
 
 #[cfg(windows)]
 mod wsa {
-	use std::io;
+	use std::{io, mem};
 
 	use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
 
 	pub(super) struct WsaHandle(());
 
 	pub(super) fn start() -> io::Result<WsaHandle> {
-		let mut data = std::mem::MaybeUninit::<WSADATA>::uninit();
+		let mut data = mem::MaybeUninit::<WSADATA>::uninit();
 		let err = unsafe { WSAStartup(0x0202, data.as_mut_ptr()) };
 		if err == 0 {
 			Ok(WsaHandle(()))
@@ -125,12 +132,12 @@ fn app() -> Command {
 }
 
 #[cfg(unix)]
-fn current_hostname() -> std::io::Result<OsString> {
-	nix::unistd::gethostname().map_err(std::io::Error::from)
+fn current_hostname() -> io::Result<OsString> {
+	nix::unistd::gethostname().map_err(io::Error::from)
 }
 
 #[cfg(windows)]
-fn current_hostname() -> std::io::Result<OsString> {
+fn current_hostname() -> io::Result<OsString> {
 	use std::os::windows::ffi::OsStringExt;
 
 	use windows_sys::Win32::System::SystemInformation::GetComputerNameW;
@@ -138,15 +145,15 @@ fn current_hostname() -> std::io::Result<OsString> {
 	let mut buffer = [0u16; 256];
 	let mut len = buffer.len() as u32;
 	if unsafe { GetComputerNameW(buffer.as_mut_ptr(), &mut len) } == 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(io::Error::last_os_error());
 	}
 	Ok(OsString::from_wide(&buffer[..len as usize]))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn current_hostname() -> std::io::Result<OsString> {
-	std::env::var_os("HOSTNAME")
-		.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOSTNAME is not set"))
+fn current_hostname() -> io::Result<OsString> {
+	env::var_os("HOSTNAME")
+		.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOSTNAME is not set"))
 }
 
 fn display_hostname(matches: &ArgMatches, host: &mut Host) -> Result<(), String> {

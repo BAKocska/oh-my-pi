@@ -1,8 +1,8 @@
 //! Provider usage-window and broker-fleet aggregation.
 
 use std::{
-	collections::{BTreeMap, BTreeSet},
-	fs,
+	collections::{BTreeMap, BTreeSet, btree_map::Entry},
+	fs, io,
 	path::{Path, PathBuf},
 };
 
@@ -66,7 +66,7 @@ pub struct SnapcompactSavingsStats {
 pub enum SnapcompactStatsError {
 	/// Journal I/O failed.
 	#[error("failed to read Snapcompact savings journal")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 }
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -77,7 +77,7 @@ pub fn read_snapcompact_savings(
 ) -> Result<Vec<SnapcompactSavingsRecord>, SnapcompactStatsError> {
 	let text = match fs::read_to_string(path) {
 		Ok(text) => text,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
 		Err(error) => return Err(error.into()),
 	};
 	Ok(text
@@ -241,11 +241,21 @@ pub struct UsageWindowSnapshot {
 	pub exhausted:     bool,
 }
 #[derive(Clone, Debug, PartialEq)]
+/// Derived reset, exhaustion, and capacity signals for one provider usage
+/// limit.
 pub struct UsageWindowAnalytics {
+	/// Number of observed reset-boundary transitions or usage-fraction
+	/// rollbacks.
 	pub resets:             u64,
+	/// Number of snapshots carrying explicit quota-exhaustion evidence.
 	pub exhaustion_count:   u64,
+	/// Timestamped maximum used fraction for each bounded chronological bucket.
 	pub peak_curve:         Vec<(u64, f64)>,
+	/// Largest reciprocal nonzero used fraction, representing inferred account
+	/// capacity.
 	pub estimated_capacity: Option<f64>,
+	/// Ceiling of the estimated capacity, expressed as a whole-account
+	/// recommendation.
 	pub ideal_accounts:     Option<u64>,
 }
 
@@ -325,10 +335,10 @@ pub fn group_usage_windows_by_limit_id(
 		};
 		let label = display_label(snapshot);
 		match groups.entry(key) {
-			std::collections::btree_map::Entry::Vacant(entry) => {
+			Entry::Vacant(entry) => {
 				entry.insert((label, vec![snapshot]));
 			},
-			std::collections::btree_map::Entry::Occupied(mut entry) => {
+			Entry::Occupied(mut entry) => {
 				let (current_label, group_snapshots) = entry.get_mut();
 				*current_label = label;
 				group_snapshots.push(snapshot);

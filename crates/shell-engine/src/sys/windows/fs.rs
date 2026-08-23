@@ -1,7 +1,10 @@
 //! Filesystem utilities for Windows.
 
 use std::{
+	borrow, env,
 	ffi::OsStr,
+	fs::{self, OpenOptions},
+	io, iter, mem,
 	os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
 	path::{Path, PathBuf},
 	sync::LazyLock,
@@ -14,9 +17,9 @@ use windows_sys::Win32::{
 	},
 };
 
-use crate::error;
 // Selectively re-export items from stubs that we don't override.
 pub(crate) use crate::sys::stubs::fs::MetadataExt;
+use crate::{error, sys::fs::PathExt};
 
 /// Cached list of executable extensions from the `PATHEXT` environment
 /// variable. Each entry retains its leading dot (e.g. `".exe"`) and is stored
@@ -33,7 +36,7 @@ static PATHEXT_EXTENSIONS: LazyLock<Vec<String>> = LazyLock::new(|| {
 			.collect::<Vec<_>>()
 	};
 
-	let Some(value) = std::env::var_os("PATHEXT") else {
+	let Some(value) = env::var_os("PATHEXT") else {
 		return fallback();
 	};
 
@@ -108,13 +111,13 @@ pub fn resolve_executable(path: PathBuf) -> Option<PathBuf> {
 	None
 }
 
-impl crate::sys::fs::PathExt for Path {
+impl PathExt for Path {
 	fn readable(&self) -> bool {
-		std::fs::OpenOptions::new().read(true).open(self).is_ok()
+		OpenOptions::new().read(true).open(self).is_ok()
 	}
 
 	fn writable(&self) -> bool {
-		std::fs::OpenOptions::new().write(true).open(self).is_ok()
+		OpenOptions::new().write(true).open(self).is_ok()
 	}
 
 	fn executable(&self) -> bool {
@@ -158,8 +161,8 @@ impl crate::sys::fs::PathExt for Path {
 		false
 	}
 
-	fn get_device_and_inode(&self) -> Result<(u64, u64), crate::error::Error> {
-		let file = std::fs::OpenOptions::new()
+	fn get_device_and_inode(&self) -> Result<(u64, u64), error::Error> {
+		let file = OpenOptions::new()
 			.access_mode(0)
 			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
 			.open(self)?;
@@ -167,7 +170,7 @@ impl crate::sys::fs::PathExt for Path {
 			// SAFETY: `BY_HANDLE_FILE_INFORMATION` is a plain C output buffer for
 			// `GetFileInformationByHandle`; all fields are overwritten before any
 			// successful read from the structure below.
-			..unsafe { std::mem::zeroed() }
+			..unsafe { mem::zeroed() }
 		};
 
 		let succeeded = {
@@ -177,7 +180,7 @@ impl crate::sys::fs::PathExt for Path {
 			(unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) }) != 0
 		};
 		if !succeeded {
-			return Err(std::io::Error::last_os_error().into());
+			return Err(io::Error::last_os_error().into());
 		}
 
 		let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
@@ -191,7 +194,7 @@ impl crate::sys::fs::PathExt for Path {
 /// surrounding double quotes removed. Quoted PATH entries are common on Windows
 /// and must resolve to the unquoted directory when searching for executables.
 pub fn split_paths<T: AsRef<OsStr> + ?Sized>(s: &T) -> impl Iterator<Item = PathBuf> + '_ {
-	std::env::split_paths(s).map(trim_surrounding_path_quotes)
+	env::split_paths(s).map(trim_surrounding_path_quotes)
 }
 
 fn trim_surrounding_path_quotes(path: PathBuf) -> PathBuf {
@@ -199,19 +202,16 @@ fn trim_surrounding_path_quotes(path: PathBuf) -> PathBuf {
 }
 
 /// Opens a null file that will discard all I/O.
-pub fn open_null_file() -> Result<std::fs::File, error::Error> {
-	let f = std::fs::File::options()
-		.read(true)
-		.write(true)
-		.open("NUL")?;
+pub fn open_null_file() -> Result<fs::File, error::Error> {
+	let f = fs::File::options().read(true).write(true).open("NUL")?;
 	Ok(f)
 }
 
 /// Gives the platform an opportunity to handle a special file path (e.g.
 /// `/dev/null`).
-pub fn try_open_special_file(path: &Path) -> Option<Result<std::fs::File, std::io::Error>> {
+pub fn try_open_special_file(path: &Path) -> Option<Result<fs::File, io::Error>> {
 	if path.ends_with("dev/null") && path.is_absolute() {
-		Some(open_null_file().map_err(std::io::Error::other))
+		Some(open_null_file().map_err(io::Error::other))
 	} else {
 		None
 	}
@@ -239,11 +239,11 @@ fn default_system_paths() -> Vec<PathBuf> {
 		paths.push(system32.join("WindowsPowerShell").join("v1.0"));
 	}
 	if paths.is_empty()
-		&& let Some(env_path) = std::env::var_os("PATH")
+		&& let Some(env_path) = env::var_os("PATH")
 	{
-		paths.extend(std::env::split_paths(&env_path));
+		paths.extend(env::split_paths(&env_path));
 	}
-	if let Ok(userprofile) = std::env::var("USERPROFILE") {
+	if let Ok(userprofile) = env::var("USERPROFILE") {
 		paths.push(
 			PathBuf::from(userprofile)
 				.join("AppData")
@@ -256,7 +256,7 @@ fn default_system_paths() -> Vec<PathBuf> {
 }
 
 fn system32_path() -> Option<PathBuf> {
-	let system_root = std::env::var_os("SystemRoot")?;
+	let system_root = env::var_os("SystemRoot")?;
 	Some(PathBuf::from(system_root).join("System32"))
 }
 
@@ -319,7 +319,7 @@ pub fn rfind_path_separator(s: &str) -> Option<usize> {
 /// On Windows, both `/` and `\` are used as separators.
 pub fn split_path_for_pattern(
 	s: &str,
-) -> impl DoubleEndedIterator<Item = &str> + Clone + std::iter::FusedIterator {
+) -> impl DoubleEndedIterator<Item = &str> + Clone + iter::FusedIterator {
 	s.split(PATH_SEPARATORS)
 }
 
@@ -377,11 +377,11 @@ pub fn push_path_for_pattern(path: &mut PathBuf, component: &str) {
 ///
 /// On Windows, replaces `\` with `/` since backslash is the shell escape
 /// character.
-pub fn normalize_path_separators(s: &str) -> std::borrow::Cow<'_, str> {
+pub fn normalize_path_separators(s: &str) -> borrow::Cow<'_, str> {
 	if s.contains('\\') {
-		std::borrow::Cow::Owned(s.replace('\\', "/"))
+		borrow::Cow::Owned(s.replace('\\', "/"))
 	} else {
-		std::borrow::Cow::Borrowed(s)
+		borrow::Cow::Borrowed(s)
 	}
 }
 

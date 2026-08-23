@@ -1,3 +1,5 @@
+use std::fmt;
+
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt as _, future::BoxFuture};
 use http::{
@@ -11,6 +13,7 @@ use hyper_util::{
 	rt::TokioExecutor,
 };
 use omp_core::{ExposeSecret as _, SecretString};
+use rustls::crypto::ring;
 use url::Url;
 
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
@@ -30,7 +33,7 @@ impl OAuthHttpRequest {
 	pub fn new(
 		method: Method,
 		url: &str,
-		mut headers: HeaderMap,
+		headers: HeaderMap,
 		body: Option<SecretString>,
 	) -> Result<Self, OAuthRequestError> {
 		let url = Url::parse(url).map_err(|_| OAuthRequestError::InvalidUrl)?;
@@ -97,7 +100,7 @@ pub struct SystemOAuthHttpClient {
 impl SystemOAuthHttpClient {
 	/// Constructs a pooled HTTP/1.1 and HTTP/2 client.
 	pub fn new() -> Self {
-		let _ = rustls::crypto::ring::default_provider().install_default();
+		let _ = ring::default_provider().install_default();
 		let connector = HttpsConnectorBuilder::new()
 			.with_webpki_roots()
 			.https_or_http()
@@ -114,8 +117,8 @@ impl Default for SystemOAuthHttpClient {
 	}
 }
 
-impl std::fmt::Debug for SystemOAuthHttpClient {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SystemOAuthHttpClient {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("SystemOAuthHttpClient(..)")
 	}
 }

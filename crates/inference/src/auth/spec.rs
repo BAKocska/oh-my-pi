@@ -2,8 +2,10 @@
 
 use std::time::Duration;
 
+use omp_catalog::provider::{OAuthCompletion, OAuthExchangeKind, SealedBodyPlacement};
 use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Complete data-only authentication description attached to a catalog route.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -133,13 +135,9 @@ impl AuthSpec {
 						authorize_url: authorize_url.clone(),
 						redirect_uri: redirect_uri.clone(),
 						completion: match completion {
-							omp_catalog::provider::OAuthCompletion::CallbackUrl => {
-								PkceCompletion::CallbackUrl
-							},
-							omp_catalog::provider::OAuthCompletion::PasteCallbackUrl => {
-								PkceCompletion::PasteCallbackUrl
-							},
-							omp_catalog::provider::OAuthCompletion::PasteCode => PkceCompletion::PasteCode,
+							OAuthCompletion::CallbackUrl => PkceCompletion::CallbackUrl,
+							OAuthCompletion::PasteCallbackUrl => PkceCompletion::PasteCallbackUrl,
+							OAuthCompletion::PasteCode => PkceCompletion::PasteCode,
 						},
 						authorize_params: convert_oauth_parameters(authorize_parameters),
 					}),
@@ -217,7 +215,7 @@ fn catalog_placement(
 			prefix: spec.prefix.clone().unwrap_or_default(),
 		})),
 		(None, Some(name), None) => Ok(KeyPlacement::Query(QueryPlacement { name: name.clone() })),
-		(None, None, Some(omp_catalog::provider::SealedBodyPlacement::DevinMetadata)) => {
+		(None, None, Some(SealedBodyPlacement::DevinMetadata)) => {
 			Ok(KeyPlacement::Body(BodyPlacement::DevinMetadata))
 		},
 		_ => Err(CatalogAuthSpecError::MissingOrAmbiguousPlacement),
@@ -234,34 +232,40 @@ fn require_sources(
 	}
 }
 
-fn convert_source(
-	source: &omp_catalog::provider::CredentialSourceSpec,
-) -> Result<CredentialSourceSpec, CatalogAuthSpecError> {
-	use omp_catalog::provider::CredentialSourceSpec as CatalogSource;
-	match source {
-		CatalogSource::Environment { ordered_names } => {
-			Ok(CredentialSourceSpec::Environment { variables: ordered_names.to_vec() })
-		},
-		CatalogSource::BasicEnvironment { username_names, password_names } => {
-			Ok(CredentialSourceSpec::BasicEnvironment {
-				username_variables: username_names.to_vec(),
-				password_variables: password_names.to_vec(),
-			})
-		},
-		CatalogSource::Stored => Ok(CredentialSourceSpec::Stored { profile: None }),
-		CatalogSource::AwsChain => Ok(CredentialSourceSpec::AwsChain { profile: None }),
-		CatalogSource::Oauth { .. } => Ok(CredentialSourceSpec::Interactive),
-		CatalogSource::Session => Ok(CredentialSourceSpec::Interactive),
-		CatalogSource::ApplicationDefault { .. } => {
-			Err(CatalogAuthSpecError::ApplicationDefaultSourceOutsideAdc)
-		},
-	}
-}
-
 fn convert_sources(
 	spec: &omp_catalog::provider::AuthSpec,
 ) -> Result<Vec<CredentialSourceSpec>, CatalogAuthSpecError> {
-	spec.credential_sources.iter().map(convert_source).collect()
+	let environment = |ordered_names: &[Str]| CredentialSourceSpec::Environment {
+		variables: ordered_names.to_vec(),
+	};
+	let basic_environment =
+		|username_names: &[Str], password_names: &[Str]| CredentialSourceSpec::BasicEnvironment {
+			username_variables: username_names.to_vec(),
+			password_variables: password_names.to_vec(),
+		};
+	let stored = || CredentialSourceSpec::Stored { profile: None };
+	let aws_chain = || CredentialSourceSpec::AwsChain { profile: None };
+	let interactive = || CredentialSourceSpec::Interactive;
+
+	spec
+		.credential_sources
+		.iter()
+		.map(|source| {
+			use omp_catalog::provider::CredentialSourceSpec;
+			match source {
+				CredentialSourceSpec::Environment { ordered_names } => Ok(environment(ordered_names)),
+				CredentialSourceSpec::BasicEnvironment { username_names, password_names } => {
+					Ok(basic_environment(username_names, password_names))
+				},
+				CredentialSourceSpec::Stored => Ok(stored()),
+				CredentialSourceSpec::AwsChain => Ok(aws_chain()),
+				CredentialSourceSpec::Oauth { .. } | CredentialSourceSpec::Session => Ok(interactive()),
+				CredentialSourceSpec::ApplicationDefault { .. } => {
+					Err(CatalogAuthSpecError::ApplicationDefaultSourceOutsideAdc)
+				},
+			}
+		})
+		.collect()
 }
 
 fn convert_oauth_parameters(
@@ -282,12 +286,17 @@ fn convert_oauth_client(
 	use omp_catalog::provider::{OAuthRefreshBehavior, OAuthTokenPlacement};
 	let mut found_link = false;
 	for source in &auth.credential_sources {
-		if let omp_catalog::provider::CredentialSourceSpec::Oauth { flow } = source {
-			if flow != &oauth.id {
-				return Err(CatalogAuthSpecError::MismatchedOAuthSpec);
-			}
-			found_link = true;
+		let flow = {
+			use omp_catalog::provider::CredentialSourceSpec;
+			let CredentialSourceSpec::Oauth { flow } = source else {
+				continue;
+			};
+			flow
+		};
+		if flow != &oauth.id {
+			return Err(CatalogAuthSpecError::MismatchedOAuthSpec);
 		}
+		found_link = true;
 	}
 	if !found_link {
 		return Err(CatalogAuthSpecError::MissingCredentialSource);
@@ -307,9 +316,9 @@ fn convert_oauth_client(
 		OAuthTokenPlacement::Query { parameter } => {
 			KeyPlacement::Query(QueryPlacement { name: parameter.clone() })
 		},
-		OAuthTokenPlacement::SealedBody {
-			placement: omp_catalog::provider::SealedBodyPlacement::DevinMetadata,
-		} => KeyPlacement::Body(BodyPlacement::DevinMetadata),
+		OAuthTokenPlacement::SealedBody { placement: SealedBodyPlacement::DevinMetadata } => {
+			KeyPlacement::Body(BodyPlacement::DevinMetadata)
+		},
 	};
 	Ok(OAuthClientSpec {
 		sources: require_sources(convert_sources(auth)?)?,
@@ -714,7 +723,7 @@ pub struct OAuthCustomSpec {
 	/// Public authorization or login endpoint.
 	pub authorize_url: Str,
 	/// Exact typed exchange engine discriminator.
-	pub exchange:      omp_catalog::provider::OAuthExchangeKind,
+	pub exchange:      OAuthExchangeKind,
 	/// Additional public exchange parameters.
 	pub parameters:    Vec<OAuthParameter>,
 	/// Optional polling bounds.
@@ -727,7 +736,7 @@ impl OAuthCustomSpec {
 		// legitimately omits the OAuth client id and token endpoint (the shared
 		// OpenCode console spec carries both empty), so only the credential
 		// sources and key placement are structural for that exchange.
-		if self.exchange == omp_catalog::provider::OAuthExchangeKind::ApiKeyPaste {
+		if self.exchange == OAuthExchangeKind::ApiKeyPaste {
 			validate_sources(&self.client.sources)?;
 			self.client.placement.validate()?;
 		} else {
@@ -945,7 +954,7 @@ const fn non_empty(value: &str, field: &'static str) -> Result<(), AuthSpecError
 }
 
 fn valid_url(value: &str, field: &'static str) -> Result<(), AuthSpecError> {
-	let parsed = url::Url::parse(value).map_err(|_| AuthSpecError::InvalidUrl(field))?;
+	let parsed = Url::parse(value).map_err(|_| AuthSpecError::InvalidUrl(field))?;
 	if matches!(parsed.scheme(), "http" | "https") && parsed.has_host() {
 		Ok(())
 	} else {
@@ -969,6 +978,7 @@ mod duration_millis {
 
 #[cfg(test)]
 mod tests {
+
 	use super::*;
 
 	#[test]
@@ -1021,30 +1031,33 @@ mod tests {
 				polling: None,
 			})
 		};
-		assert_eq!(spec(omp_catalog::provider::OAuthExchangeKind::ApiKeyPaste).validate(), Ok(()));
+		assert_eq!(spec(OAuthExchangeKind::ApiKeyPaste).validate(), Ok(()));
 		assert_eq!(
-			spec(omp_catalog::provider::OAuthExchangeKind::PerplexityEmailOtp).validate(),
+			spec(OAuthExchangeKind::PerplexityEmailOtp).validate(),
 			Err(AuthSpecError::EmptyField("OAuth client id"))
 		);
 	}
 
 	#[test]
 	fn catalog_devin_session_preserves_explicit_source_and_body_placement() {
-		let catalog = omp_catalog::provider::AuthSpec {
-			id:                 omp_catalog::AuthSpecId::new("devin-auth"),
-			kind:               omp_catalog::provider::AuthSpecKind::OmpSession,
-			header_name:        None,
-			query_parameter:    None,
-			prefix:             None,
-			sealed_body:        Some(omp_catalog::provider::SealedBodyPlacement::DevinMetadata),
-			scopes:             Box::new([]),
-			audience:           None,
-			account_scope:      omp_catalog::provider::AccountScope::Provider,
-			credential_sources: Box::new([omp_catalog::provider::CredentialSourceSpec::Environment {
-				ordered_names: Box::new(["OMP_DEVIN_API_KEY".into()]),
-			}]),
-			oauth:              None,
-			signing:            None,
+		let catalog = {
+			use omp_catalog::provider::{AccountScope, AuthSpecKind, CredentialSourceSpec};
+			omp_catalog::provider::AuthSpec {
+				id:                 omp_catalog::AuthSpecId::new("devin-auth"),
+				kind:               AuthSpecKind::OmpSession,
+				header_name:        None,
+				query_parameter:    None,
+				prefix:             None,
+				sealed_body:        Some(SealedBodyPlacement::DevinMetadata),
+				scopes:             Box::new([]),
+				audience:           None,
+				account_scope:      AccountScope::Provider,
+				credential_sources: Box::new([CredentialSourceSpec::Environment {
+					ordered_names: Box::new(["OMP_DEVIN_API_KEY".into()]),
+				}]),
+				oauth:              None,
+				signing:            None,
+			}
 		};
 		let source =
 			CredentialSourceSpec::Environment { variables: vec!["OMP_DEVIN_API_KEY".into()] };

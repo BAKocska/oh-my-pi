@@ -2,7 +2,9 @@
 
 use std::{
 	collections::VecDeque,
+	env,
 	fmt::Write as _,
+	fs,
 	future::{Future, ready},
 	ops::Range,
 	path::{Path, PathBuf},
@@ -17,6 +19,7 @@ use std::{
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt as _;
+use omp_ar::zip;
 use omp_core::{CowBytes, Str, sf};
 use omp_tool::{
 	Abort, ArtifactLifetime, BlobRef, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part,
@@ -34,6 +37,7 @@ use omp_tools::read::{
 };
 use parking_lot::Mutex;
 use serde_json::json;
+use tokio::time;
 
 #[derive(Clone)]
 struct FileSource {
@@ -461,7 +465,7 @@ fn canonical_url_vocabulary_matches_dense_rust_dispatch_and_selector_parser() {
 #[test]
 fn special_source_fixture_workspace_is_complete_and_self_contained() {
 	let manifest: serde_json::Value = serde_json::from_slice(
-		&std::fs::read(fixture_path("manifest.json")).expect("special-source manifest"),
+		&fs::read(fixture_path("manifest.json")).expect("special-source manifest"),
 	)
 	.expect("valid special-source manifest");
 	let expected_groups = [
@@ -486,7 +490,7 @@ fn special_source_fixture_workspace_is_complete_and_self_contained() {
 			assert!(fixture_path(relative).is_file(), "missing fixture '{relative}'");
 		}
 	}
-	let large = std::fs::read(fixture_path("plain/large-utf8.txt")).expect("large UTF-8 fixture");
+	let large = fs::read(fixture_path("plain/large-utf8.txt")).expect("large UTF-8 fixture");
 	assert!(large.len() > 50 * 1024);
 	assert!(std::str::from_utf8(&large).is_ok());
 	assert_eq!(
@@ -775,18 +779,18 @@ async fn files_over_twenty_thousand_lines_skip_structural_summary() {
 struct TempDb(PathBuf);
 impl Drop for TempDb {
 	fn drop(&mut self) {
-		let _ = std::fs::remove_file(&self.0);
+		let _ = fs::remove_file(&self.0);
 	}
 }
 
 fn sqlite_fixture() -> TempDb {
 	static NEXT: AtomicU64 = AtomicU64::new(0);
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-read-golden-{}-{}.sqlite",
 		std::process::id(),
 		NEXT.fetch_add(1, Ordering::Relaxed),
 	));
-	std::fs::write(&path, include_bytes!("../fixtures/special-sources/database/catalog.sqlite"))
+	fs::write(&path, include_bytes!("../fixtures/special-sources/database/catalog.sqlite"))
 		.expect("copy checked-in SQLite fixture");
 	TempDb(path)
 }
@@ -799,7 +803,7 @@ async fn sqlite_root_table_key_where_and_forbidden_where_are_model_text() {
 		"data.sqlite",
 		db.0.to_str().unwrap(),
 		"data.sqlite",
-		std::fs::read(&db.0).expect("read SQLite fixture bytes"),
+		fs::read(&db.0).expect("read SQLite fixture bytes"),
 	);
 	assert_eq!(
 		text(sources.clone(), r#"{"path":"data.sqlite"}"#).await,
@@ -867,7 +871,7 @@ async fn oversized_sqlite_output_spills_the_complete_rendered_table() {
 		"wide.sqlite",
 		db.0.to_str().unwrap(),
 		"wide.sqlite",
-		std::fs::read(&db.0).expect("read oversized SQLite fixture bytes"),
+		fs::read(&db.0).expect("read oversized SQLite fixture bytes"),
 	);
 	assert_truncated_text_spill(
 		sources,
@@ -885,7 +889,7 @@ async fn suffix_resolved_sqlite_container_dispatches_with_exact_notice() {
 		"resolved/data.sqlite",
 		db.0.to_str().unwrap(),
 		"resolved/data.sqlite",
-		std::fs::read(&db.0).expect("read SQLite fixture bytes"),
+		fs::read(&db.0).expect("read SQLite fixture bytes"),
 	);
 	sources.suffix("missing/data.sqlite", "resolved/data.sqlite");
 
@@ -923,7 +927,7 @@ async fn long_sqlite_query_is_interrupted_without_blocking_the_runtime() {
 		"data.sqlite",
 		db.0.to_str().unwrap(),
 		"data.sqlite",
-		std::fs::read(&db.0).expect("read SQLite fixture bytes"),
+		fs::read(&db.0).expect("read SQLite fixture bytes"),
 	);
 	let tool = read::tool(sources, Blobs::default());
 	let (feed, params) = IncomingParams::channel();
@@ -942,7 +946,7 @@ async fn long_sqlite_query_is_interrupted_without_blocking_the_runtime() {
 	feed
 		.interrupt(Interrupt { class: sf!("deadline"), reason: sf!("test deadline exceeded") })
 		.expect("read invocation accepts its deadline interrupt");
-	let events = tokio::time::timeout(Duration::from_secs(1), &mut events)
+	let events = time::timeout(Duration::from_secs(1), &mut events)
 		.await
 		.expect("SQLite query stops within the cancellation bound");
 	assert!(
@@ -1035,7 +1039,7 @@ async fn asar_root_subdirectory_and_packed_member_use_archive_routing() {
 
 #[tokio::test]
 async fn oversized_archive_listing_spills_every_complete_entry_line() {
-	let mut writer = omp_ar::zip::Writer::new(Vec::new());
+	let mut writer = zip::Writer::new(Vec::new());
 	let mut expected_lines = Vec::with_capacity(read::archive::DEFAULT_ARCHIVE_LIST_LIMIT);
 	for index in 0..read::archive::DEFAULT_ARCHIVE_LIST_LIMIT {
 		let name = format!("entry-{index:03}-{}.txt", "x".repeat(120));

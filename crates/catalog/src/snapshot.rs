@@ -1,13 +1,15 @@
 //! Validated, indexed access to the checked-in binary catalog snapshot.
 
-use std::{fs, path::Path, sync::LazyLock};
+use std::{fs, io, mem, path::Path, sync::LazyLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-	compile::{CatalogAlias, CompileError, CompiledCatalog},
+	CatalogOverlay,
+	compile::{CatalogAlias, CompileError, CompiledCatalog, CompilerCensus},
 	contrib::RuntimeProviderRecords,
+	discover::DiscoveryDefaults,
 	id::{
 		AuthSpecId, CatalogRevision, DiscoverySpecId, HeaderProfileId, ModelKey, OAuthSpecId,
 		ProviderId, RouteId, ThinkingPolicyId, WirePolicyId,
@@ -66,13 +68,13 @@ struct SnapshotPayload {
 #[derive(Serialize, Deserialize)]
 struct CachedOverlaySnapshot {
 	schema:  u32,
-	overlay: crate::CatalogOverlay,
+	overlay: CatalogOverlay,
 }
 
 /// Writes one complete credential-blind discovery overlay for restart recovery.
 pub fn write_discovery_overlay_cache(
 	path: &Path,
-	overlay: &crate::CatalogOverlay,
+	overlay: &CatalogOverlay,
 ) -> Result<(), OverlayCacheError> {
 	let encoded = serde_json::to_vec(&CachedOverlaySnapshot {
 		schema:  OVERLAY_CACHE_SCHEMA,
@@ -97,10 +99,10 @@ pub fn write_discovery_overlay_cache(
 /// schemas.
 pub fn read_discovery_overlay_cache(
 	path: &Path,
-) -> Result<Option<crate::CatalogOverlay>, OverlayCacheError> {
+) -> Result<Option<CatalogOverlay>, OverlayCacheError> {
 	let encoded = match fs::read(path) {
 		Ok(encoded) => encoded,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(error.into()),
 	};
 	let cached: CachedOverlaySnapshot = serde_json::from_slice(&encoded)?;
@@ -115,7 +117,7 @@ pub fn read_discovery_overlay_cache(
 pub enum OverlayCacheError {
 	/// Filesystem operation failed.
 	#[error(transparent)]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// The cache body was malformed.
 	#[error(transparent)]
 	Json(#[from] serde_json::Error),
@@ -347,12 +349,12 @@ impl Catalog {
 	}
 
 	/// Returns the immutable catalog revision.
-	pub const fn revision(&self) -> &crate::CatalogRevision {
+	pub const fn revision(&self) -> &CatalogRevision {
 		&self.compiled.revision
 	}
 
 	/// Returns the verified compiler census.
-	pub const fn census(&self) -> crate::compile::CompilerCensus {
+	pub const fn census(&self) -> CompilerCensus {
 		self.compiled.census
 	}
 
@@ -419,10 +421,7 @@ impl Catalog {
 	}
 
 	/// Returns authored conservative discovery defaults for one exact provider.
-	pub fn discovery_defaults(
-		&self,
-		id: &ProviderId<str>,
-	) -> Option<&crate::discover::DiscoveryDefaults> {
+	pub fn discovery_defaults(&self, id: &ProviderId<str>) -> Option<&DiscoveryDefaults> {
 		self.provider(id)?.discovery_defaults.as_ref()
 	}
 
@@ -546,7 +545,7 @@ impl Catalog {
 
 fn upsert_record<T, K: Ord>(records: &mut Box<[T]>, value: T, key: impl Fn(&T) -> K) {
 	let target = key(&value);
-	let mut values = std::mem::take(records).into_vec();
+	let mut values = mem::take(records).into_vec();
 	values.retain(|record| key(record) != target);
 	values.push(value);
 	values.sort_by_key(key);

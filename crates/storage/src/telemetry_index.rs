@@ -5,6 +5,7 @@
 //! indexes rather than copying settled outcomes into a second journal.
 
 use std::{
+	fs,
 	fs::{File, OpenOptions},
 	io::{self, Read as _, Seek as _, SeekFrom, Write as _},
 	path::{Path, PathBuf},
@@ -322,7 +323,7 @@ impl TelemetryIndex {
 	/// Returns file-system or SQLite errors when the durable index cannot be
 	/// opened or initialized.
 	pub fn open(session_dir: &Path, database_path: &Path) -> Result<Self, QueryError> {
-		std::fs::create_dir_all(session_dir)?;
+		fs::create_dir_all(session_dir)?;
 		let side_path = session_dir.join("telemetry.bin");
 		let side_file = OpenOptions::new()
 			.create(true)

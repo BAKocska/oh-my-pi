@@ -11,9 +11,10 @@ use omp_envd::vcs::git::mutation::{GitMutation, IsolationCommit};
 use tokio_util::sync::CancellationToken;
 
 use super::{
+	git,
 	git::{GitError, IsolationQueries, ensure_isolation, recover, run_delta, settle},
-	helpers::{infer_metric_unit, mad_confidence, parse_asi_lines, parse_metric_lines},
-	storage::{JournalAppender, RecordError, Storage, StorageError},
+	helpers::{Measurement, infer_metric_unit, mad_confidence, parse_asi_lines, parse_metric_lines},
+	storage::{JournalAppender, ProjectedSession, RecordError, Storage, StorageError},
 	types::{
 		Asi, DashboardMode, DispositionIntent, DispositionSettled, ExperimentStatus, JournalFact,
 		MetricDirection, Metrics, RunCompletion, RunStart, RuntimeState, SessionConfig,
@@ -368,7 +369,7 @@ where
 			}
 		});
 		let status = self.host.status(cancel).await.map_err(EngineError::Host)?;
-		let harness_paths = super::git::parse_status(&status)
+		let harness_paths = git::parse_status(&status)
 			.into_iter()
 			.map(|entry| entry.path)
 			.collect::<Vec<_>>();
@@ -449,7 +450,7 @@ where
 		}
 		let run_id = self.storage.next_run_id()?;
 		let pre_status = self.host.status(cancel).await.map_err(EngineError::Host)?;
-		let pre_dirty_paths = super::git::parse_status(&pre_status)
+		let pre_dirty_paths = git::parse_status(&pre_status)
 			.into_iter()
 			.map(|entry| entry.path)
 			.collect();
@@ -542,7 +543,7 @@ where
 		self.record(&JournalFact::DispositionStarted(intent.clone()))?;
 		let commit = self.execute_intent(&intent, false, cancel).await?;
 		let mut measurements = self.storage.measurements(session.id)?;
-		measurements.push(super::helpers::Measurement {
+		measurements.push(Measurement {
 			metric:  intent.metric,
 			status:  intent.status,
 			segment: session.config.segment,
@@ -791,7 +792,7 @@ where
 	async fn branch_gated_session(
 		&self,
 		cancel: &CancellationToken,
-	) -> Result<super::storage::ProjectedSession, EngineError<H::Error, J::Error>> {
+	) -> Result<ProjectedSession, EngineError<H::Error, J::Error>> {
 		if self.runtime.engagement.is_none() {
 			return Err(EngineError::Inactive);
 		}

@@ -7,20 +7,27 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use omp_core::{CowBytes, Str, encoding::hex};
 use omp_env::WorkerLease;
-use omp_proto::env::v1::WorkerData;
-use omp_storage::blob::BlobStore;
+use omp_proto::{env::v1::WorkerData, thread::v1};
+use omp_storage::blob::{self, BlobStore};
+use omp_tools::edit::SnapshotFault;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+use super::exthost::control::{
+	ControlAuthority, ControlConnectionIdentity, ControlEffect, ControlProtocolError,
+	ControlRequestContext,
+};
 
 /// Largest tunnel header accepted before any buffer allocation.
 pub const MAX_TUNNEL_HEADER_BYTES: usize = 64 * 1024;
@@ -124,10 +131,7 @@ pub trait VerdictSpill {
 	///
 	/// # Errors
 	/// Returns the blob-store error if durable placement fails.
-	fn spill_verdict(
-		&self,
-		reader: impl Read,
-	) -> Result<omp_proto::thread::v1::Blob, omp_storage::blob::Error>;
+	fn spill_verdict(&self, reader: impl Read) -> Result<v1::Blob, blob::Error>;
 }
 
 impl SpillDiverter {
@@ -140,32 +144,26 @@ impl SpillDiverter {
 	///
 	/// # Errors
 	/// Returns the blob-store error if durable placement fails.
-	pub fn put_reader(
-		&self,
-		reader: impl Read,
-	) -> Result<omp_proto::thread::v1::Blob, omp_storage::blob::Error> {
+	pub fn put_reader(&self, reader: impl Read) -> Result<v1::Blob, blob::Error> {
 		let reference = self.store.put_reader(reader)?;
-		Ok(omp_proto::thread::v1::Blob {
+		Ok(v1::Blob {
 			hash: reference.hash.as_bytes().to_vec().into(),
 			size: reference.size,
-			..omp_proto::thread::v1::Blob::default()
+			..v1::Blob::default()
 		})
 	}
 }
 
 impl omp_tools::edit::EditSnapshotStore for SpillDiverter {
-	async fn store_snapshot(
-		&self,
-		bytes: bytes::Bytes,
-	) -> Result<omp_tool::BlobRef, omp_tools::edit::SnapshotFault> {
+	async fn store_snapshot(&self, bytes: bytes::Bytes) -> Result<omp_tool::BlobRef, SnapshotFault> {
 		let blob = self
 			.put_reader(bytes.as_ref())
-			.map_err(|_| omp_tools::edit::SnapshotFault::Store)?;
+			.map_err(|_| SnapshotFault::Store)?;
 		let hash: &[u8; 32] = blob
 			.hash
 			.as_ref()
 			.try_into()
-			.map_err(|_| omp_tools::edit::SnapshotFault::Store)?;
+			.map_err(|_| SnapshotFault::Store)?;
 		Ok(omp_tool::BlobRef {
 			hash:       Str::from(hex::encode_n(hash).as_str()),
 			media_type: Str::new_static("application/octet-stream"),
@@ -175,10 +173,7 @@ impl omp_tools::edit::EditSnapshotStore for SpillDiverter {
 }
 
 impl VerdictSpill for SpillDiverter {
-	fn spill_verdict(
-		&self,
-		reader: impl Read,
-	) -> Result<omp_proto::thread::v1::Blob, omp_storage::blob::Error> {
+	fn spill_verdict(&self, reader: impl Read) -> Result<v1::Blob, blob::Error> {
 		self.put_reader(reader)
 	}
 }
@@ -262,7 +257,7 @@ pub struct RestartBackoff {
 	next:      Duration,
 	maximum:   Duration,
 	healthy:   Duration,
-	last_boot: std::time::Instant,
+	last_boot: Instant,
 }
 
 impl RestartBackoff {
@@ -272,7 +267,7 @@ impl RestartBackoff {
 			next:      Duration::from_secs(1),
 			maximum:   Duration::from_secs(30),
 			healthy:   Duration::from_secs(30),
-			last_boot: std::time::Instant::now(),
+			last_boot: Instant::now(),
 		}
 	}
 
@@ -288,7 +283,7 @@ impl RestartBackoff {
 
 	/// Starts the healthy-uptime window for a replacement generation.
 	pub fn booted(&mut self) {
-		self.last_boot = std::time::Instant::now();
+		self.last_boot = Instant::now();
 	}
 }
 
@@ -303,7 +298,7 @@ impl Default for RestartBackoff {
 pub struct WorkerSupervisor {
 	workers:         Mutex<BTreeMap<Str, WorkerRoute>>,
 	processes:       Mutex<BTreeMap<(Str, u64), SupervisedWorkerProcess>>,
-	process_changed: tokio::sync::Notify,
+	process_changed: Notify,
 	layer_live:      AtomicU64,
 	layer_ceiling:   u64,
 	spawn_live:      AtomicU64,
@@ -320,7 +315,7 @@ impl WorkerSupervisor {
 		Self {
 			workers: Mutex::new(BTreeMap::new()),
 			processes: Mutex::new(BTreeMap::new()),
-			process_changed: tokio::sync::Notify::new(),
+			process_changed: Notify::new(),
 			layer_live: AtomicU64::new(0),
 			layer_ceiling,
 			spawn_live: AtomicU64::new(0),
@@ -494,6 +489,8 @@ impl WorkerSupervisor {
 		Some(route.clone())
 	}
 
+	/// Returns the cumulative number of worker frames rejected for a stale
+	/// generation.
 	pub fn stale_frame_count(&self) -> u64 {
 		self.stale_frames.load(Ordering::Relaxed)
 	}
@@ -659,7 +656,7 @@ pub enum WorkerControlFailure {
 }
 
 impl WorkerControlFailure {
-	fn protocol(&self) -> super::exthost::control::ControlProtocolError {
+	fn protocol(&self) -> ControlProtocolError {
 		let code = match self {
 			Self::StaleConnection | Self::Evicted => "StaleGeneration",
 			Self::Capability => "PermissionDenied",
@@ -668,7 +665,7 @@ impl WorkerControlFailure {
 			Self::Process(_) => "WorkerUnavailable",
 			Self::Invalid(_) => "InvalidArguments",
 		};
-		super::exthost::control::ControlProtocolError::new(code, Str::from(self.to_string()))
+		ControlProtocolError::new(code, Str::from(self.to_string()))
 			.retryable(matches!(self, Self::Capacity | Self::Process(_)))
 	}
 }
@@ -804,7 +801,7 @@ impl WorkerProcessAuthority for WorkerSupervisor {
 
 /// Authoritative named-worker CONTROL owner for one extension connection.
 pub struct WorkerControlOwner {
-	identity:   Arc<super::exthost::control::ControlConnectionIdentity>,
+	identity:   Arc<ControlConnectionIdentity>,
 	supervisor: Arc<WorkerSupervisor>,
 	processes:  Arc<dyn WorkerProcessAuthority>,
 }
@@ -812,7 +809,7 @@ pub struct WorkerControlOwner {
 impl WorkerControlOwner {
 	/// Binds a worker namespace to one authenticated extension generation.
 	pub fn new(
-		identity: Arc<super::exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		supervisor: Arc<WorkerSupervisor>,
 		processes: Arc<dyn WorkerProcessAuthority>,
 	) -> Self {
@@ -821,7 +818,7 @@ impl WorkerControlOwner {
 
 	fn validate(
 		&self,
-		context: &super::exthost::control::ControlRequestContext,
+		context: &ControlRequestContext,
 		mutate: bool,
 	) -> Result<(), WorkerControlFailure> {
 		let connection = &context.connection;
@@ -892,17 +889,17 @@ impl Drop for CancelWorkerRequest {
 }
 
 #[async_trait]
-impl super::exthost::control::ControlAuthority for WorkerControlOwner {
+impl ControlAuthority for WorkerControlOwner {
 	fn handles(&self, operation: &str) -> bool {
 		operation.starts_with("omp.workers.")
 	}
 
 	fn authorize(
 		&self,
-		context: &super::exthost::control::ControlRequestContext,
+		context: &ControlRequestContext,
 		operation: &str,
 		_arguments: &serde_json::Map<String, Value>,
-	) -> Result<(), super::exthost::control::ControlProtocolError> {
+	) -> Result<(), ControlProtocolError> {
 		let mutate = matches!(
 			operation,
 			"omp.workers.get"
@@ -923,10 +920,7 @@ impl super::exthost::control::ControlAuthority for WorkerControlOwner {
 				| "omp.workers.restart"
 				| "omp.workers.session"
 		) {
-			return Err(super::exthost::control::ControlProtocolError::new(
-				"UnknownOperation",
-				"unknown worker operation",
-			));
+			return Err(ControlProtocolError::new("UnknownOperation", "unknown worker operation"));
 		}
 		self
 			.validate(context, mutate)
@@ -935,10 +929,10 @@ impl super::exthost::control::ControlAuthority for WorkerControlOwner {
 
 	async fn request(
 		&self,
-		context: super::exthost::control::ControlRequestContext,
+		context: ControlRequestContext,
 		operation: Str,
 		mut arguments: serde_json::Map<String, Value>,
-	) -> Result<Value, super::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		self.authorize(&context, operation.as_str(), &arguments)?;
 		let cancel = CancellationToken::new();
 		let _cancel_on_drop = CancelWorkerRequest(cancel.clone());
@@ -1115,22 +1109,19 @@ impl super::exthost::control::ControlAuthority for WorkerControlOwner {
 
 	async fn effect(
 		&self,
-		context: super::exthost::control::ControlRequestContext,
-		_effect: super::exthost::control::ControlEffect,
-	) -> Result<(), super::exthost::control::ControlProtocolError> {
+		context: ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
 		self
 			.validate(&context, false)
 			.map_err(|error| error.protocol())?;
-		Err(super::exthost::control::ControlProtocolError::new(
-			"UnsupportedEffect",
-			"worker authority accepts requests only",
-		))
+		Err(ControlProtocolError::new("UnsupportedEffect", "worker authority accepts requests only"))
 	}
 }
 
 fn worker_name(
 	arguments: &mut serde_json::Map<String, Value>,
-) -> Result<String, super::exthost::control::ControlProtocolError> {
+) -> Result<String, ControlProtocolError> {
 	arguments
 		.remove("name")
 		.and_then(|value| value.as_str().map(ToOwned::to_owned))
@@ -1147,7 +1138,7 @@ fn worker_name(
 
 fn worker_generation(
 	arguments: &mut serde_json::Map<String, Value>,
-) -> Result<u64, super::exthost::control::ControlProtocolError> {
+) -> Result<u64, ControlProtocolError> {
 	arguments
 		.remove("generation")
 		.and_then(|value| value.as_u64())
@@ -1159,7 +1150,7 @@ fn worker_generation(
 
 fn worker_grace(
 	arguments: &mut serde_json::Map<String, Value>,
-) -> Result<Duration, super::exthost::control::ControlProtocolError> {
+) -> Result<Duration, ControlProtocolError> {
 	let seconds = arguments
 		.remove("grace")
 		.and_then(|value| value.as_f64())
@@ -1172,11 +1163,8 @@ fn worker_grace(
 	Ok(Duration::from_secs_f64(seconds))
 }
 
-fn worker_serialization(error: serde_json::Error) -> super::exthost::control::ControlProtocolError {
-	super::exthost::control::ControlProtocolError::new(
-		"WorkerProtocol",
-		Str::from(error.to_string()),
-	)
+fn worker_serialization(error: serde_json::Error) -> ControlProtocolError {
+	ControlProtocolError::new("WorkerProtocol", Str::from(error.to_string()))
 }
 
 fn reserve(counter: &AtomicU64, limit: u64) -> bool {

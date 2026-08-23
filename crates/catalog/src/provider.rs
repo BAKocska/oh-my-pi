@@ -9,6 +9,7 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::{
 	capability::{OperationBits, OperationKind},
+	discover::DiscoveryDefaults,
 	id::{
 		AuthSpecId, CodecId, DiscoverySpecId, HeaderProfileId, OAuthSpecId, ProviderId, RouteId,
 		WirePolicyId,
@@ -695,7 +696,7 @@ pub struct ProviderDef {
 	/// Provider-default lowering policy for model-less management operations.
 	pub wire_policy:        WirePolicyId,
 	/// Authored defaults for conservative runtime model discovery.
-	pub discovery_defaults: Option<crate::discover::DiscoveryDefaults>,
+	pub discovery_defaults: Option<DiscoveryDefaults>,
 	/// Registry relationship used during deterministic normalization.
 	pub mapping:            RegistryMapping,
 }

@@ -9,8 +9,10 @@ use std::{
 	time::Duration,
 };
 
+use flume::Receiver;
 use omp_core::{Str, sf};
 use parking_lot::Mutex;
+use tokio::{sync::oneshot, time};
 
 /// One requirement merged into an invocation's single approval ticket.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,14 +198,14 @@ pub struct ApprovalRoute {
 
 /// Host-facing receiving half of an [`ApprovalRoute`].
 pub struct ApprovalInbox {
-	rx: flume::Receiver<ApprovalRequest>,
+	rx: Receiver<ApprovalRequest>,
 }
 
 /// One pending approval delivered to a host.
 pub struct ApprovalRequest {
 	/// Durable ticket awaiting a decision.
 	pub ticket: ApprovalTicket,
-	reply:      tokio::sync::oneshot::Sender<ApprovalDecision>,
+	reply:      oneshot::Sender<ApprovalDecision>,
 }
 
 impl ApprovalRequest {
@@ -253,7 +255,7 @@ impl ApprovalRoute {
 			.book
 			.guard(ticket.ticket_id.as_str())
 			.expect("newly filed approval ticket exists");
-		let (reply, response) = tokio::sync::oneshot::channel();
+		let (reply, response) = oneshot::channel();
 		let timeout_ms = ticket
 			.reasons
 			.iter()
@@ -269,7 +271,7 @@ impl ApprovalRoute {
 		}
 		let decision = match timeout_ms {
 			Some(timeout_ms) => {
-				match tokio::time::timeout(Duration::from_millis(timeout_ms), response).await {
+				match time::timeout(Duration::from_millis(timeout_ms), response).await {
 					Ok(Ok(decision)) => decision,
 					Ok(Err(_)) => {
 						return self.resolve_unreachable(&ticket, "approval host became unreachable");

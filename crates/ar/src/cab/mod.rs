@@ -2,7 +2,10 @@
 
 mod lzx;
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{
+	io::{Read, Seek, SeekFrom, Write},
+	str,
+};
 
 use flate2::{Decompress, FlushDecompress, Status};
 use omp_core::Str;
@@ -507,7 +510,7 @@ fn cab_checksum(bytes: &[u8], initial: u32) -> u32 {
 
 fn decode_name(bytes: &[u8], utf8: bool) -> Result<Str> {
 	if utf8 {
-		return std::str::from_utf8(bytes)
+		return str::from_utf8(bytes)
 			.map(Str::new)
 			.map_err(|_| Error::InvalidArchive("CAB file name is not valid UTF-8"));
 	}

@@ -18,6 +18,7 @@ use std::{
 	fs::{self, File},
 	io::{self, BufRead as _, BufReader},
 	path::Path,
+	str,
 	time::{Duration, SystemTime},
 };
 
@@ -1145,7 +1146,7 @@ fn mark_corrupt_line(
 				report.corrupt_references = report.corrupt_references.saturating_add(1);
 				continue;
 			}
-			match std::str::from_utf8(hash)
+			match str::from_utf8(hash)
 				.ok()
 				.and_then(|hash| BlobRef::parse_hex(hash, 0).ok())
 			{
@@ -1158,7 +1159,7 @@ fn mark_corrupt_line(
 			}
 		}
 	}
-	if let Ok(text) = std::str::from_utf8(line) {
+	if let Ok(text) = str::from_utf8(line) {
 		mark_artifact_urls(text, session, live, reachable, artifact_uses);
 	}
 }

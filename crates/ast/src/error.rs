@@ -1,7 +1,7 @@
 //! Error types for tree-sitter operations, AST pattern compilation, and
 //! structural rewrites.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, result, str};
 
 use omp_core::Str;
 use thiserror::Error;
@@ -55,9 +55,9 @@ pub enum AstError {
 	NonUtf8Replacement {
 		/// Underlying UTF-8 error.
 		#[source]
-		source: std::str::Utf8Error,
+		source: str::Utf8Error,
 	},
 }
 
 /// An AST result.
-pub type Result<T, E = AstError> = std::result::Result<T, E>;
+pub type Result<T, E = AstError> = result::Result<T, E>;

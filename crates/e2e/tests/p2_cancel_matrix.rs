@@ -36,7 +36,8 @@ use omp_envd::{
 use omp_proto::{
 	SCHEMA_REV,
 	env::v1::{
-		ClientHello, ExecOutcome, ExecRequest, ExecStatusMsg, InvokeTool, OpenSessionRequest, Script,
+		self, ClientHello, ExecOutcome, ExecRequest, ExecStatusMsg, InvokeTool, OpenSessionRequest,
+		Script,
 	},
 };
 use omp_tool::{
@@ -45,6 +46,8 @@ use omp_tool::{
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::{task::JoinHandle, time};
+use url::Url;
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const EVENT_DEADLINE: Duration = Duration::from_secs(5);
@@ -160,7 +163,7 @@ struct LocalEnv {
 	client:      EnvClient,
 	root:        TempDir,
 	_state:      TempDir,
-	server_task: tokio::task::JoinHandle<()>,
+	server_task: JoinHandle<()>,
 }
 
 impl LocalEnv {
@@ -263,7 +266,7 @@ impl Tool for CancellableSleeper {
 				let _: Value = doc.whole().await?;
 				fs::write(started, b"sleeping").expect("write sleeper start marker");
 				let _drop_probe = DropProbe(dropped);
-				tokio::time::sleep(NATIVE_SLEEP).await;
+				time::sleep(NATIVE_SLEEP).await;
 				fs::write(marker, b"mutated").expect("write forbidden mutation marker");
 				Ok(())
 			}).await;
@@ -377,7 +380,7 @@ async fn rust_drop_cancellation_is_exact_and_cannot_mutate_after_interrupt() {
 
 	// Wait beyond the original sleep. This catches implementations that detach the
 	// mutation instead of making the operation future genuinely drop-cancellable.
-	tokio::time::sleep(NATIVE_SLEEP + Duration::from_millis(200)).await;
+	time::sleep(NATIVE_SLEEP + Duration::from_millis(200)).await;
 	assert!(!marker.exists(), "a detached mutation escaped cancellation");
 }
 
@@ -513,10 +516,10 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 	within(EVENT_DEADLINE, blocked.interrupt(sf!("courtesy interpreter interrupt")))
 		.await
 		.expect("send courtesy worker interrupt");
-	tokio::time::sleep(hard_kill_grace + Duration::from_millis(75)).await;
+	time::sleep(hard_kill_grace + Duration::from_millis(75)).await;
 	assert!(process_alive(blocked_pid), "courtesy interrupt killed the native worker");
 	assert!(
-		tokio::time::timeout(Duration::from_millis(50), blocked.next_event())
+		time::timeout(Duration::from_millis(50), blocked.next_event())
 			.await
 			.is_err(),
 		"blocking ctypes call returned to the interpreter",
@@ -577,7 +580,7 @@ async fn python_native_sleep_requires_sigkill_then_respawns_and_serves() {
 }
 
 async fn within<T>(deadline: Duration, future: impl Future<Output = T>) -> T {
-	tokio::time::timeout(deadline, future)
+	time::timeout(deadline, future)
 		.await
 		.expect("operation exceeded its hard deadline")
 }
@@ -593,7 +596,7 @@ async fn expect_accepted(invocation: &mut Invocation) {
 	}
 }
 
-async fn next_verdict(invocation: &mut Invocation) -> omp_proto::env::v1::Verdict {
+async fn next_verdict(invocation: &mut Invocation) -> v1::Verdict {
 	within(EVENT_DEADLINE, async {
 		loop {
 			match invocation
@@ -612,18 +615,18 @@ async fn next_verdict(invocation: &mut Invocation) -> omp_proto::env::v1::Verdic
 	.await
 }
 
-fn decode_verdict(terminal: &omp_proto::env::v1::Verdict) -> CallOutcome<Value, Value> {
+fn decode_verdict(terminal: &v1::Verdict) -> CallOutcome<Value, Value> {
 	serde_json::from_slice(&terminal.json).expect("decode structured terminal call outcome")
 }
 
-fn assert_abort_envelope(terminal: &omp_proto::env::v1::Verdict) {
+fn assert_abort_envelope(terminal: &v1::Verdict) {
 	assert!(terminal.is_error);
 	assert!(!terminal.useless);
 	assert!(terminal.parts.is_empty());
 }
 
 fn file_uri(path: &Path) -> String {
-	url::Url::from_directory_path(path)
+	Url::from_directory_path(path)
 		.expect("temporary directory has a file URI")
 		.to_string()
 }
@@ -665,7 +668,7 @@ async fn collect_exec(run: &mut omp_env::ExecRun) -> (Vec<u8>, ExecStatusMsg) {
 async fn wait_for_file(path: &Path, deadline: Duration) {
 	within(deadline, async {
 		while !path.exists() {
-			tokio::time::sleep(POLL_INTERVAL).await;
+			time::sleep(POLL_INTERVAL).await;
 		}
 	})
 	.await;
@@ -679,7 +682,7 @@ async fn wait_for_pid(path: &Path, deadline: Duration) -> Pid {
 			{
 				return Pid::from_raw(pid);
 			}
-			tokio::time::sleep(POLL_INTERVAL).await;
+			time::sleep(POLL_INTERVAL).await;
 		}
 	})
 	.await
@@ -711,7 +714,7 @@ fn process_group_alive(group: Pid) -> bool {
 async fn wait_process_group_dead(group: Pid, deadline: Duration) {
 	within(deadline, async {
 		while process_group_alive(group) {
-			tokio::time::sleep(POLL_INTERVAL).await;
+			time::sleep(POLL_INTERVAL).await;
 		}
 	})
 	.await;

@@ -2,17 +2,23 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
+	mem, str,
 	sync::Arc,
+	time::Duration,
 };
 
+use flume::Receiver;
 use omp_core::{Point, PointSet, Str, Ulid};
 use omp_inference::call::ToolChoice;
-use omp_proto::thread::v1::Item;
+use omp_proto::thread::v1::{Item, item, part};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::{sync::Notify, time};
 
 use crate::{
-	ContextPatch,
+	ContextPatch, JobBoard,
+	arbiter::PointCx,
+	r#loop::now_ms,
 	tool_choice::{
 		DirectiveCallbacks, DirectivePriority, PushOptions, RejectOutcome, ToolChoiceQueue,
 	},
@@ -252,7 +258,7 @@ pub struct CampaignWhen {
 
 impl CampaignWhen {
 	/// Evaluates only immutable Core facts, without extension IPC.
-	pub fn matches(&self, point: Point, cx: &crate::arbiter::PointCx<'_>) -> bool {
+	pub fn matches(&self, point: Point, cx: &PointCx<'_>) -> bool {
 		self.point == point
 			&& self
 				.invocation_id
@@ -344,7 +350,7 @@ fn regime_spec<const N: usize>(id: &'static str, claims: [SlotClaim; N]) -> Camp
 /// Stateful core or extension adapter evaluated at subscribed points.
 pub trait CampaignMachine: Send + Sync + 'static {
 	/// Produces one atomic reaction without mutating any sibling lane.
-	fn react(&mut self, point: Point, cx: &crate::arbiter::PointCx<'_>) -> Reaction;
+	fn react(&mut self, point: Point, cx: &PointCx<'_>) -> Reaction;
 
 	/// Returns the durable state payload for journaling.
 	fn state(&self) -> Str;
@@ -354,7 +360,7 @@ pub trait CampaignMachine: Send + Sync + 'static {
 
 	/// Applies a live state update. Revival continues to call [`Self::restore`].
 	fn update(&mut self, payload: &[u8]) -> Result<(), CampaignStateError> {
-		let payload = std::str::from_utf8(payload).map_err(|_| CampaignStateError::InvalidPayload)?;
+		let payload = str::from_utf8(payload).map_err(|_| CampaignStateError::InvalidPayload)?;
 		self.restore(payload)
 	}
 }
@@ -364,7 +370,7 @@ pub trait CampaignMachine: Send + Sync + 'static {
 pub struct RegimeMachine;
 
 impl CampaignMachine for RegimeMachine {
-	fn react(&mut self, _: Point, _: &crate::arbiter::PointCx<'_>) -> Reaction {
+	fn react(&mut self, _: Point, _: &PointCx<'_>) -> Reaction {
 		Reaction::one(Verdict::Pass)
 	}
 
@@ -412,7 +418,7 @@ impl GoalCampaign {
 }
 
 impl CampaignMachine for GoalCampaign {
-	fn react(&mut self, point: Point, _: &crate::arbiter::PointCx<'_>) -> Reaction {
+	fn react(&mut self, point: Point, _: &PointCx<'_>) -> Reaction {
 		if point != Point::Context {
 			return Reaction::one(Verdict::Pass);
 		}
@@ -828,7 +834,7 @@ pub struct CampaignStack {
 	engagements: BTreeMap<EngagementId, Engagement>,
 	slots:       SlotRegistry,
 	force_tx:    flume::Sender<ForceEvent>,
-	force_rx:    flume::Receiver<ForceEvent>,
+	force_rx:    Receiver<ForceEvent>,
 }
 
 impl Default for CampaignStack {
@@ -901,7 +907,7 @@ impl CampaignStack {
 		machine: Box<dyn CampaignMachine>,
 		options: EngageOptions,
 		point: Point,
-		cx: &crate::arbiter::PointCx<'_>,
+		cx: &PointCx<'_>,
 	) -> Result<Option<EngageReceipt>, EngageError> {
 		if !spec
 			.when
@@ -1135,7 +1141,7 @@ impl CampaignStack {
 	pub fn fold(
 		&mut self,
 		point: Point,
-		cx: &crate::arbiter::PointCx<'_>,
+		cx: &PointCx<'_>,
 		tool_choices: Option<&mut ToolChoiceQueue>,
 	) -> CampaignFold {
 		self.apply_force_feedback();
@@ -1240,7 +1246,7 @@ impl CampaignStack {
 			}
 		}
 		let mut terminated = Vec::new();
-		for candidate in std::mem::take(&mut fold.terminated) {
+		for candidate in mem::take(&mut fold.terminated) {
 			if matches!(self.disengage(candidate.as_str(), cx.now_ms), Ok(true)) {
 				terminated.push(candidate);
 			}
@@ -1459,7 +1465,7 @@ impl CampaignStack {
 	fn apply_force_feedback(&mut self) {
 		while let Ok(event) = self.force_rx.try_recv() {
 			if matches!(event.outcome, ForceFeedback::Resolved) {
-				let _ = self.step(event.engagement.as_str(), crate::r#loop::now_ms());
+				let _ = self.step(event.engagement.as_str(), now_ms());
 			}
 		}
 	}
@@ -1517,7 +1523,7 @@ pub struct SubagentYieldCampaign {
 }
 
 impl CampaignMachine for SubagentYieldCampaign {
-	fn react(&mut self, point: Point, _: &crate::arbiter::PointCx<'_>) -> Reaction {
+	fn react(&mut self, point: Point, _: &PointCx<'_>) -> Reaction {
 		match (self.rung, point) {
 			(0, Point::Settle) => {
 				self.rung = 1;
@@ -1563,13 +1569,13 @@ impl CampaignMachine for SubagentYieldCampaign {
 
 /// SETTLE barrier that vetoes stop while agent-loop jobs remain pending.
 pub struct QuiescenceBarrier {
-	jobs:    Arc<crate::JobBoard>,
+	jobs:    Arc<JobBoard>,
 	pending: Vec<Item>,
 }
 
 impl QuiescenceBarrier {
 	/// Creates a barrier over the authoritative job board.
-	pub fn new(jobs: Arc<crate::JobBoard>) -> Self {
+	pub fn new(jobs: Arc<JobBoard>) -> Self {
 		Self { jobs, pending: Vec::new() }
 	}
 
@@ -1580,7 +1586,7 @@ impl QuiescenceBarrier {
 }
 
 impl CampaignMachine for QuiescenceBarrier {
-	fn react(&mut self, point: Point, _: &crate::arbiter::PointCx<'_>) -> Reaction {
+	fn react(&mut self, point: Point, _: &PointCx<'_>) -> Reaction {
 		if point != Point::Settle {
 			return Reaction::one(Verdict::Pass);
 		}
@@ -1615,7 +1621,7 @@ pub struct LegacySessionStopCampaign {
 }
 
 impl CampaignMachine for LegacySessionStopCampaign {
-	fn react(&mut self, point: Point, _: &crate::arbiter::PointCx<'_>) -> Reaction {
+	fn react(&mut self, point: Point, _: &PointCx<'_>) -> Reaction {
 		if point != Point::Settle {
 			return Reaction::one(Verdict::Pass);
 		}
@@ -1641,10 +1647,10 @@ impl CampaignMachine for LegacySessionStopCampaign {
 fn campaign_message(text: impl Into<String>) -> Item {
 	use omp_proto::thread::v1::{self as thread};
 	Item {
-		created_at_ms: crate::r#loop::now_ms(),
-		kind: Some(thread::item::Kind::Message(thread::Message {
+		created_at_ms: now_ms(),
+		kind: Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.into())) }],
+			parts: vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
 		})),
 		..Item::default()
 	}
@@ -1716,7 +1722,7 @@ pub struct HoldSet {
 #[derive(Default)]
 struct HoldSetInner {
 	tickets: Mutex<BTreeMap<Str, HoldTicket>>,
-	notify:  tokio::sync::Notify,
+	notify:  Notify,
 }
 
 impl HoldSet {
@@ -1738,36 +1744,42 @@ impl HoldSet {
 		}
 		removed
 	}
+}
 
-	/// Parks until every ticket resolves, a deadline elapses, or abort changes.
-	pub async fn wait_empty(
-		&self,
-		mut abort: tokio::sync::watch::Receiver<u64>,
-	) -> Result<(), HoldError> {
-		loop {
-			let deadline = {
-				let tickets = self.inner.tickets.lock();
-				if tickets.is_empty() {
-					return Ok(());
+mod hold_wait {
+	use tokio::sync::watch::Receiver;
+
+	use super::{Duration, HoldError, HoldSet, now_ms, time};
+
+	impl HoldSet {
+		/// Parks until every ticket resolves, a deadline elapses, or abort
+		/// changes.
+		pub async fn wait_empty(&self, mut abort: Receiver<u64>) -> Result<(), HoldError> {
+			loop {
+				let deadline = {
+					let tickets = self.inner.tickets.lock();
+					if tickets.is_empty() {
+						return Ok(());
+					}
+					tickets
+						.values()
+						.map(|ticket| ticket.deadline_ms)
+						.min()
+						.expect("nonempty")
+				};
+				let now = now_ms();
+				if now >= deadline {
+					return Err(HoldError::Deadline);
 				}
-				tickets
-					.values()
-					.map(|ticket| ticket.deadline_ms)
-					.min()
-					.expect("nonempty")
-			};
-			let now = crate::r#loop::now_ms();
-			if now >= deadline {
-				return Err(HoldError::Deadline);
-			}
-			let sleep = tokio::time::sleep(std::time::Duration::from_millis(deadline - now));
-			tokio::pin!(sleep);
-			tokio::select! {
-				() = self.inner.notify.notified() => {},
-				_ = &mut sleep => return Err(HoldError::Deadline),
-				changed = abort.changed() => {
-					if changed.is_ok() { return Err(HoldError::Aborted); }
-				},
+				let sleep = time::sleep(Duration::from_millis(deadline - now));
+				tokio::pin!(sleep);
+				tokio::select! {
+					() = self.inner.notify.notified() => {},
+					_ = &mut sleep => return Err(HoldError::Deadline),
+					changed = abort.changed() => {
+						if changed.is_ok() { return Err(HoldError::Aborted); }
+					},
+				}
 			}
 		}
 	}
@@ -1798,7 +1810,7 @@ mod builtin_tests {
 	#[test]
 	fn subagent_yield_exhausts_to_kill_after_force() {
 		let mut campaign = SubagentYieldCampaign::default();
-		let cx = crate::PointCx::default();
+		let cx = PointCx::default();
 		assert!(matches!(campaign.react(Point::Settle, &cx).verdicts.as_slice(), [
 			Verdict::Inject(_),
 			Verdict::Continue
@@ -1820,7 +1832,7 @@ mod builtin_tests {
 	fn quiescence_exhausts_when_the_last_job_settles() {
 		let mailbox = Mailbox::new();
 		let (env, _transport) = EnvClient::in_process(0);
-		let board = Arc::new(crate::JobBoard::new(env, mailbox.sender()));
+		let board = Arc::new(JobBoard::new(env, mailbox.sender()));
 		let job = JobRef {
 			id:       Str::new_static("job-1"),
 			owner:    JobOwner::AgentLoop { agent_id: Str::new_static("agent") },

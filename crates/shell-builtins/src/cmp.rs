@@ -640,11 +640,12 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn no_follow_compares_symlink_targets() {
+		use std::{fs::write, os::unix::fs};
 		let (_dir, root) = tempdir();
-		fs::write(root.join("a"), b"same").unwrap();
-		fs::write(root.join("b"), b"same").unwrap();
-		std::os::unix::fs::symlink("a", root.join("left")).unwrap();
-		std::os::unix::fs::symlink("b", root.join("right")).unwrap();
+		write(root.join("a"), b"same").unwrap();
+		write(root.join("b"), b"same").unwrap();
+		fs::symlink("a", root.join("left")).unwrap();
+		fs::symlink("b", root.join("right")).unwrap();
 
 		let (code, stdout, stderr) = run_in(root, "", &["-h", "left", "right"]);
 		assert_eq!(code, 1);

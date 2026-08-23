@@ -2,26 +2,35 @@
 
 use std::{
 	collections::{BTreeMap, HashMap},
+	env,
 	ffi::{OsStr, OsString},
+	fs, future,
 	future::Future,
 	io::{self, Write as _},
 	path::{Path, PathBuf},
-	process::Stdio,
+	process::{self, Stdio},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
+	thread,
 	time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use flume::Receiver;
+#[cfg(unix)]
+use nix::{sys::signal, unistd::Pid};
 use omp_core::{CowBytes, Duration as OmpDuration, DurationError, Str, Ulid, encoding::hex, sf};
 use omp_tool::BlobRef;
-use omp_tools::eval::{
-	CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, OutputChannel,
-	PythonException, RunCompletion, RunEvent, RunRequest, RuntimeSnapshot, Session, Update,
-	idle_timeout::TimeoutHandle, kernel::EmbeddedPython,
+use omp_tools::{
+	eval::{
+		CellOutcome, CellStatus, CellValue, DisplayOutput, EvalExec, EvalRun, Fault, OutputChannel,
+		PythonException, RunCompletion, RunEvent, RunRequest, RuntimeSnapshot, Session, Update,
+		idle_timeout::TimeoutHandle, kernel::EmbeddedPython,
+	},
+	read::image::{self, ImageKind},
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -29,9 +38,13 @@ use serde_json::Value;
 use tokio::{
 	io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
 	process::{Child, ChildStdin, ChildStdout, Command},
+	runtime,
 	sync::Mutex as AsyncMutex,
+	task, time,
 };
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console;
 
 use super::{
 	super::blobs::BlobHost,
@@ -92,7 +105,7 @@ struct ProcessSession {
 
 /// Active cell in a process-backed Python session.
 pub struct ProcessEvalRun {
-	events:          flume::Receiver<Result<RunEvent, Fault>>,
+	events:          Receiver<Result<RunEvent, Fault>>,
 	cancelled:       CancellationToken,
 	terminal:        bool,
 	effective_reset: bool,
@@ -107,8 +120,8 @@ impl ProcessEvalExec {
 		blobs: BlobHost,
 	) -> Result<Self, io::Error> {
 		let executable = resolve_omp_executable()?;
-		let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-		let explicit = std::env::var_os("OMP_PYTHON_INTERPRETER");
+		let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+		let explicit = env::var_os("OMP_PYTHON_INTERPRETER");
 		let interpreter = discover_external_python(&cwd, explicit.as_deref())
 			.unwrap_or_else(|| PathBuf::from("embedded:cpython-3.14t"));
 		Ok(Self::new_inner(executable, interpreter, host, interrupt_grace, Some(blobs)))
@@ -139,14 +152,14 @@ impl EvalExec for ProcessEvalExec {
 	type Run = ProcessEvalRun;
 
 	fn open_session(&self) -> impl Future<Output = Result<Session, Fault>> + Send + '_ {
-		std::future::ready(Ok(self.create_session("__direct_eval_owner__")))
+		future::ready(Ok(self.create_session("__direct_eval_owner__")))
 	}
 
 	fn open_session_for(
 		&self,
 		owner: &str,
 	) -> impl Future<Output = Result<Session, Fault>> + Send + '_ {
-		std::future::ready(Ok(self.create_session(owner)))
+		future::ready(Ok(self.create_session(owner)))
 	}
 
 	fn runtime_snapshot(&self, owner: &str, session: &Session) -> Result<RuntimeSnapshot, Fault> {
@@ -222,7 +235,7 @@ impl EvalExec for ProcessEvalExec {
 			.collect::<Vec<_>>();
 		for owned in sessions {
 			owned.needs_reset.store(true, Ordering::Release);
-			if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+			if let Ok(runtime) = runtime::Handle::try_current() {
 				runtime.spawn(async move {
 					if let Some(mut child) = owned.child.lock().await.take() {
 						child.terminate().await;
@@ -363,7 +376,7 @@ impl EvalRun for ProcessEvalRun {
 
 	fn cancel(&self) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
 		self.cancelled.cancel();
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 
 	fn reset(&self) -> bool {
@@ -436,7 +449,7 @@ impl OutputSpill {
 		let Some(stage) = self.stage else {
 			return Ok(None);
 		};
-		let reference = tokio::task::spawn_blocking(move || stage.finish())
+		let reference = task::spawn_blocking(move || stage.finish())
 			.await
 			.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?
 			.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?;
@@ -471,7 +484,7 @@ impl EvalChild {
 		let capabilities = host.capabilities()?.allowed_names();
 		let prelude = host.prelude_stubs();
 		let token = Str::from(Ulid::generate().to_string());
-		let parent_pid = std::process::id();
+		let parent_pid = process::id();
 		let mut command = Command::new(executable);
 		command
 			.arg(EVAL_CHILD_ARG)
@@ -526,7 +539,7 @@ impl EvalChild {
 		.await?;
 		// Cold start covers exec plus embedded-interpreter boot; tolerate load
 		// spikes that the per-frame runtime deadlines must not.
-		match tokio::time::timeout(Duration::from_secs(30), read_frame(&mut process.stdout)).await {
+		match time::timeout(Duration::from_secs(30), read_frame(&mut process.stdout)).await {
 			Ok(Ok(Some(ChildFrame::Ready))) => Ok(process),
 			Ok(Ok(Some(ChildFrame::Fatal { message }))) => Err(ProcessError::Protocol(message)),
 			Ok(Ok(Some(_))) => {
@@ -588,7 +601,7 @@ impl EvalChild {
 					needs_reset.store(true, Ordering::Release);
 					timeout.dispose();
 					self.interrupt();
-					tokio::time::sleep(self.interrupt_grace).await;
+					time::sleep(self.interrupt_grace).await;
 					let _ = events.send(Ok(RunEvent::Completed(cancelled_completion(
 						elapsed_ms(started),
 					))));
@@ -597,7 +610,7 @@ impl EvalChild {
 				() = timeout.expired() => {
 					needs_reset.store(true, Ordering::Release);
 					self.interrupt();
-					tokio::time::sleep(self.interrupt_grace).await;
+					time::sleep(self.interrupt_grace).await;
 					let _ = events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
 					return false;
 				},
@@ -801,25 +814,19 @@ impl EvalChild {
 	fn interrupt(&self) {
 		#[cfg(unix)]
 		if let Some(pid) = self.process_group {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(pid.cast_signed()),
-				nix::sys::signal::Signal::SIGINT,
-			);
+			let _ = signal::killpg(Pid::from_raw(pid.cast_signed()), signal::Signal::SIGINT);
 		}
 		#[cfg(windows)]
 		if let Some(pid) = self.process_group {
 			unsafe {
-				let _ = windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
-					windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
-					pid,
-				);
+				let _ = Console::GenerateConsoleCtrlEvent(Console::CTRL_BREAK_EVENT, pid);
 			}
 		}
 	}
 
 	async fn terminate(&mut self) {
 		let _ = write_frame(&mut self.stdin, &ParentFrame::Exit).await;
-		if tokio::time::timeout(self.interrupt_grace, self.child.wait())
+		if time::timeout(self.interrupt_grace, self.child.wait())
 			.await
 			.is_ok_and(|status| status.is_ok())
 		{
@@ -829,16 +836,13 @@ impl EvalChild {
 		let pid = self.process_group.take();
 		#[cfg(unix)]
 		if let Some(pid) = pid {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(pid.cast_signed()),
-				nix::sys::signal::Signal::SIGTERM,
-			);
+			let _ = signal::killpg(Pid::from_raw(pid.cast_signed()), signal::Signal::SIGTERM);
 		}
 		#[cfg(windows)]
 		if pid.is_some() {
 			let _ = self.child.start_kill();
 		}
-		if tokio::time::timeout(self.interrupt_grace, self.child.wait())
+		if time::timeout(self.interrupt_grace, self.child.wait())
 			.await
 			.is_ok_and(|status| status.is_ok())
 		{
@@ -846,10 +850,7 @@ impl EvalChild {
 		}
 		#[cfg(unix)]
 		if let Some(pid) = pid {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(pid.cast_signed()),
-				nix::sys::signal::Signal::SIGKILL,
-			);
+			let _ = signal::killpg(Pid::from_raw(pid.cast_signed()), signal::Signal::SIGKILL);
 		}
 		#[cfg(windows)]
 		{
@@ -863,10 +864,7 @@ impl Drop for EvalChild {
 		let pid = self.process_group;
 		#[cfg(unix)]
 		if let Some(pid) = pid {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(pid.cast_signed()),
-				nix::sys::signal::Signal::SIGKILL,
-			);
+			let _ = signal::killpg(Pid::from_raw(pid.cast_signed()), signal::Signal::SIGKILL);
 		}
 		#[cfg(windows)]
 		{
@@ -1034,7 +1032,7 @@ impl ChildBridgeTransport for ChildBridgeHost {
 type ProtocolInput = Box<dyn AsyncRead + Unpin + Send>;
 type ProtocolOutput = Box<dyn AsyncWrite + Unpin + Send>;
 #[cfg(unix)]
-type ProtocolCapture = Option<(std::fs::File, std::fs::File)>;
+type ProtocolCapture = Option<(fs::File, fs::File)>;
 #[cfg(not(unix))]
 type ProtocolCapture = ();
 
@@ -1076,7 +1074,7 @@ fn shield_protocol_fds() -> io::Result<ShieldedProtocol> {
 	let protocol_out = duplicate(libc::STDOUT_FILENO)?;
 	let stdout_pipe = pipe()?;
 	let stderr_pipe = pipe()?;
-	let null = std::fs::File::open("/dev/null")?;
+	let null = fs::File::open("/dev/null")?;
 	// Preserve private protocol duplicates, then make fd 0 inert and route all
 	// native/user child output into capture drains. This prevents `input()` and
 	// `os.write(1, ...)` from consuming or spoofing protocol frames.
@@ -1095,13 +1093,13 @@ fn shield_protocol_fds() -> io::Result<ShieldedProtocol> {
 		return Err(io::Error::last_os_error());
 	}
 	// SAFETY: every raw fd is uniquely owned after the operations above.
-	let input = unsafe { std::fs::File::from_raw_fd(protocol_in) };
+	let input = unsafe { fs::File::from_raw_fd(protocol_in) };
 	// SAFETY: see above.
-	let output = unsafe { std::fs::File::from_raw_fd(protocol_out) };
+	let output = unsafe { fs::File::from_raw_fd(protocol_out) };
 	// SAFETY: see above.
-	let stdout_capture = unsafe { std::fs::File::from_raw_fd(stdout_pipe[0]) };
+	let stdout_capture = unsafe { fs::File::from_raw_fd(stdout_pipe[0]) };
 	// SAFETY: see above.
-	let stderr_capture = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
+	let stderr_capture = unsafe { fs::File::from_raw_fd(stderr_pipe[0]) };
 	for capture in [&stdout_capture, &stderr_capture] {
 		// SAFETY: `capture` owns a valid descriptor and these operations only
 		// update its file-status flags.
@@ -1121,9 +1119,10 @@ fn shield_protocol_fds() -> io::Result<ShieldedProtocol> {
 
 #[cfg(not(unix))]
 fn shield_protocol_fds() -> io::Result<ShieldedProtocol> {
+	use tokio::io;
 	Ok(ShieldedProtocol {
-		input:   Box::new(tokio::io::stdin()),
-		output:  Box::new(tokio::io::stdout()),
+		input:   Box::new(io::stdin()),
+		output:  Box::new(io::stdout()),
 		capture: (),
 	})
 }
@@ -1159,7 +1158,7 @@ fn start_fd_capture(
 		let host = Arc::clone(host);
 		let (command_tx, command_rx) = flume::unbounded::<flume::Sender<()>>();
 		commands.push(command_tx);
-		std::thread::Builder::new()
+		thread::Builder::new()
 			.name(format!("omp-eval-fd-{channel:?}"))
 			.spawn(move || {
 				let mut buffer = [0_u8; 16 * 1024];
@@ -1188,7 +1187,7 @@ fn start_fd_capture(
 							while let Ok(acknowledge) = command_rx.try_recv() {
 								let _ = acknowledge.send(());
 							}
-							std::thread::sleep(Duration::from_millis(1));
+							thread::sleep(Duration::from_millis(1));
 						},
 						Err(_) => break,
 					}
@@ -1228,11 +1227,11 @@ fn validate_parent_identity(parent_pid: u32) -> Result<(), ProcessError> {
 fn start_parent_watchdog(parent_pid: u32) -> io::Result<()> {
 	#[cfg(unix)]
 	{
-		std::thread::Builder::new()
+		thread::Builder::new()
 			.name("omp-eval-parent-watchdog".to_owned())
 			.spawn(move || {
 				loop {
-					std::thread::sleep(Duration::from_millis(100));
+					thread::sleep(Duration::from_millis(100));
 					// SAFETY: getppid has no preconditions and does not access memory.
 					let actual = unsafe { libc::getppid() };
 					if actual <= 1 || u32::try_from(actual).ok() != Some(parent_pid) {
@@ -1259,11 +1258,11 @@ fn terminate_orphaned_process_group() {
 				libc::kill(-group, libc::SIGKILL);
 			}
 		} else {
-			std::process::exit(0);
+			process::exit(0);
 		}
 	}
 	#[cfg(not(unix))]
-	std::process::exit(0);
+	process::exit(0);
 }
 
 fn validate_runtime_snapshot(snapshot: RuntimeSnapshot) -> Result<RuntimeSnapshot, ProcessError> {
@@ -1340,7 +1339,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 		}
 		Ok::<(), ProcessError>(())
 	});
-	let runtime = tokio::runtime::Handle::current();
+	let runtime = runtime::Handle::current();
 	let transport: Arc<dyn ChildBridgeTransport> = child_host.clone();
 	let installer = Arc::new(BridgeNamespaceInstaller::new_child(transport, runtime, prelude));
 	let engine = omp_py::Engine::builder()
@@ -1401,12 +1400,8 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 							},
 							Ok(Some(RunEvent::Output(update))) => {
 								let frame = match update.channel {
-									omp_tools::eval::OutputChannel::Stdout => {
-										ChildFrame::Stdout { run_id, update }
-									},
-									omp_tools::eval::OutputChannel::Stderr => {
-										ChildFrame::Stderr { run_id, update }
-									},
+									OutputChannel::Stdout => ChildFrame::Stdout { run_id, update },
+									OutputChannel::Stderr => ChildFrame::Stderr { run_id, update },
 								};
 								let _ = outgoing.send(frame);
 							},
@@ -1560,7 +1555,7 @@ async fn write_encoded_frame<W: AsyncWrite + Unpin + Send>(
 	Ok(())
 }
 fn sanitized_spawn_env() -> Vec<(OsString, OsString)> {
-	std::env::vars_os()
+	env::vars_os()
 		.filter(|(name, _)| spawn_env_allowed(name))
 		.collect()
 }
@@ -1608,23 +1603,21 @@ pub fn discover_external_python(cwd: &Path, explicit: Option<&OsStr>) -> Option<
 		candidates.push(expand_home(PathBuf::from(explicit)));
 	}
 	for name in ["VIRTUAL_ENV", "CONDA_PREFIX", "UV_PROJECT_ENVIRONMENT"] {
-		if let Some(root) = std::env::var_os(name) {
+		if let Some(root) = env::var_os(name) {
 			candidates.push(interpreter_below(Path::new(&root), executable));
 		}
 	}
 	candidates.push(interpreter_below(&cwd.join(".venv"), executable));
 	candidates.push(interpreter_below(&cwd.join("venv"), executable));
-	if let (Some(root), Some(version)) =
-		(std::env::var_os("PYENV_ROOT"), std::env::var_os("PYENV_VERSION"))
-	{
+	if let (Some(root), Some(version)) = (env::var_os("PYENV_ROOT"), env::var_os("PYENV_VERSION")) {
 		candidates
 			.push(interpreter_below(&PathBuf::from(root).join("versions").join(version), executable));
 	}
-	if let Some(path) = std::env::var_os("PATH") {
-		candidates.extend(std::env::split_paths(&path).flat_map(|directory| {
+	if let Some(path) = env::var_os("PATH") {
+		candidates.extend(env::split_paths(&path).flat_map(|directory| {
 			["python3", executable]
 				.into_iter()
-				.map(move |name| directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+				.map(move |name| directory.join(format!("{name}{}", env::consts::EXE_SUFFIX)))
 		}));
 	}
 	candidates.into_iter().find(|candidate| candidate.is_file())
@@ -1643,12 +1636,12 @@ fn expand_home(path: PathBuf) -> PathBuf {
 		return path;
 	};
 	if text == "~" {
-		return std::env::var_os("HOME").map(PathBuf::from).unwrap_or(path);
+		return env::var_os("HOME").map(PathBuf::from).unwrap_or(path);
 	}
 	let Some(rest) = text.strip_prefix("~/") else {
 		return path;
 	};
-	std::env::var_os("HOME")
+	env::var_os("HOME")
 		.map(|home| PathBuf::from(home).join(rest))
 		.unwrap_or(path)
 }
@@ -1690,13 +1683,13 @@ async fn read_frame<R: AsyncBufRead + Unpin + Send, T: DeserializeOwned>(
 }
 
 fn resolve_omp_executable() -> io::Result<PathBuf> {
-	if let Some(path) = std::env::var_os("CARGO_BIN_EXE_omp") {
+	if let Some(path) = env::var_os("CARGO_BIN_EXE_omp") {
 		let path = PathBuf::from(path);
 		if path.is_file() {
 			return Ok(path);
 		}
 	}
-	let current = std::env::current_exe()?;
+	let current = env::current_exe()?;
 	if current.file_stem().is_some_and(|name| name == "omp") {
 		return Ok(current);
 	}
@@ -1708,7 +1701,7 @@ fn resolve_omp_executable() -> io::Result<PathBuf> {
 			io::Error::new(io::ErrorKind::NotFound, "target deps directory has no parent")
 		})?;
 	}
-	let sibling = directory.join(format!("omp{}", std::env::consts::EXE_SUFFIX));
+	let sibling = directory.join(format!("omp{}", env::consts::EXE_SUFFIX));
 	if sibling.is_file() {
 		return Ok(sibling);
 	}
@@ -1767,19 +1760,17 @@ fn normalize_display_output(output: DisplayOutput, blobs: Option<&BlobHost>) -> 
 		event: serde_json::json!({ "op": "display", "error": reason }),
 	};
 	let Some(expected_kind) = (match mime_type.as_str() {
-		"image/png" => Some(omp_tools::read::image::ImageKind::Png),
-		"image/jpeg" => Some(omp_tools::read::image::ImageKind::Jpeg),
+		"image/png" => Some(ImageKind::Png),
+		"image/jpeg" => Some(ImageKind::Jpeg),
 		_ => None,
 	}) else {
 		return reject("unsupported eval image media type");
 	};
 	let bytes = Bytes::copy_from_slice(data.as_ref());
-	if !omp_tools::read::image::sniff_metadata(&bytes)
-		.is_some_and(|metadata| metadata.kind == expected_kind)
-	{
+	if !image::sniff_metadata(&bytes).is_some_and(|metadata| metadata.kind == expected_kind) {
 		return reject("malformed eval image payload");
 	}
-	let processed = match omp_tools::read::image::process_image(bytes) {
+	let processed = match image::process_image(bytes) {
 		Ok(Some(processed)) => processed,
 		Ok(None) => return reject("malformed eval image payload"),
 		Err(_) => return reject("eval image payload exceeds the image limit"),
@@ -1882,7 +1873,7 @@ mod tests {
 
 	#[test]
 	fn runtime_snapshot_validation_requires_scoped_cwd_and_exact_managed_keys() {
-		let cwd = std::env::current_dir().expect("current directory");
+		let cwd = env::current_dir().expect("current directory");
 		assert!(validate_runtime_snapshot(runtime_snapshot(cwd.clone())).is_ok());
 
 		let mut missing = runtime_snapshot(cwd.clone());
@@ -1919,23 +1910,23 @@ mod tests {
 	#[ignore = "subprocess helper launched by \
 	            parent_death_watchdog_terminates_kernel_and_descendants"]
 	fn parent_watchdog_subprocess_helper() {
-		let parent_pid = std::env::var("OMP_EVAL_TEST_PARENT_PID")
+		let parent_pid = env::var("OMP_EVAL_TEST_PARENT_PID")
 			.expect("helper parent PID")
 			.parse::<u32>()
 			.expect("numeric helper parent PID");
-		let state = PathBuf::from(std::env::var_os("OMP_EVAL_TEST_STATE").expect("helper state"));
+		let state = PathBuf::from(env::var_os("OMP_EVAL_TEST_STATE").expect("helper state"));
 		// SAFETY: the helper has no descendants yet and moves itself into a new
 		// process group whose id is its own pid.
 		assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
-		let descendant = std::process::Command::new("/bin/sleep")
+		let descendant = process::Command::new("/bin/sleep")
 			.arg("60")
 			.spawn()
 			.expect("spawn descendant");
-		std::fs::write(state, format!("{}\n{}\n", std::process::id(), descendant.id()))
+		fs::write(state, format!("{}\n{}\n", process::id(), descendant.id()))
 			.expect("publish helper identities");
 		start_parent_watchdog(parent_pid).expect("start parent watchdog");
 		loop {
-			std::thread::sleep(Duration::from_secs(60));
+			thread::sleep(Duration::from_secs(60));
 		}
 	}
 
@@ -1944,17 +1935,17 @@ mod tests {
 	#[ignore = "subprocess helper launched by \
 	            parent_death_watchdog_terminates_kernel_and_descendants"]
 	fn parent_watchdog_intermediate_helper() {
-		let state = PathBuf::from(std::env::var_os("OMP_EVAL_TEST_STATE").expect("helper state"));
-		let executable = std::env::current_exe().expect("test executable");
-		let mut helper = std::process::Command::new(executable)
+		let state = PathBuf::from(env::var_os("OMP_EVAL_TEST_STATE").expect("helper state"));
+		let executable = env::current_exe().expect("test executable");
+		let mut helper = process::Command::new(executable)
 			.args(["--ignored", "parent_watchdog_subprocess_helper"])
-			.env("OMP_EVAL_TEST_PARENT_PID", std::process::id().to_string())
+			.env("OMP_EVAL_TEST_PARENT_PID", process::id().to_string())
 			.env("OMP_EVAL_TEST_STATE", &state)
 			.spawn()
 			.expect("spawn watchdog helper");
 		let deadline = Instant::now() + Duration::from_secs(5);
 		while !state.is_file() && Instant::now() < deadline {
-			std::thread::sleep(Duration::from_millis(10));
+			thread::sleep(Duration::from_millis(10));
 		}
 		if !state.is_file() {
 			let _ = helper.kill();
@@ -1968,13 +1959,13 @@ mod tests {
 	fn parent_death_watchdog_terminates_kernel_and_descendants() {
 		let scratch = tempfile::tempdir().expect("watchdog scratch");
 		let state = scratch.path().join("identities");
-		let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+		let status = process::Command::new(env::current_exe().expect("test executable"))
 			.args(["--ignored", "parent_watchdog_intermediate_helper"])
 			.env("OMP_EVAL_TEST_STATE", &state)
 			.status()
 			.expect("run intermediate parent");
 		assert!(status.success(), "intermediate parent must publish a live child");
-		let identities = std::fs::read_to_string(&state).expect("read helper identities");
+		let identities = fs::read_to_string(&state).expect("read helper identities");
 		let mut identities = identities
 			.lines()
 			.map(|line| line.parse::<u32>().expect("numeric helper identity"));
@@ -1982,7 +1973,7 @@ mod tests {
 		let descendant = identities.next().expect("descendant identity");
 		let deadline = Instant::now() + Duration::from_secs(5);
 		while (process_exists(kernel) || process_exists(descendant)) && Instant::now() < deadline {
-			std::thread::sleep(Duration::from_millis(10));
+			thread::sleep(Duration::from_millis(10));
 		}
 		if process_exists(kernel) {
 			// SAFETY: the PID was created by this test and is only cleaned up
@@ -2048,7 +2039,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn protocol_is_bounded_ndjson() {
-		let (mut writer, reader) = tokio::io::duplex(256);
+		let (mut writer, reader) = {
+			use tokio::io;
+			io::duplex(256)
+		};
 		write_frame(&mut writer, &ParentFrame::Exit)
 			.await
 			.expect("frame writes");

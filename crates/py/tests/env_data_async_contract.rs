@@ -1,3 +1,6 @@
+//! Verifies Python environment streams and blob writers preserve close and
+//! abort semantics.
+
 use omp_py::{Engine, pyo3::ffi::c_str};
 
 #[test]

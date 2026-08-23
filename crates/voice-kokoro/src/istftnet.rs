@@ -3,6 +3,8 @@
 //!
 //! Ported from kokoro/istftnet.py
 
+use std::{f32::consts, f64};
+
 use candle_core::{DType, Device, Module, Result, Shape, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 
@@ -242,7 +244,7 @@ impl SineGen {
 
 		// Transpose back to [B, T, dim]
 		let phase = phase_up.transpose(1, 2)?; // [B, T, dim]
-		let two_pi = Tensor::new(2.0f32 * std::f32::consts::PI, device)?.to_dtype(f0.dtype())?;
+		let two_pi = Tensor::new(2.0f32 * consts::PI, device)?.to_dtype(f0.dtype())?;
 		let phase = phase.broadcast_mul(&two_pi)?;
 
 		let sine_amp_t = Tensor::new(self.sine_amp as f32, device)?.to_dtype(f0.dtype())?;
@@ -354,9 +356,7 @@ impl TorchSTFT {
 
 		// Generate Hann window
 		let window: Vec<f32> = (0..win_length)
-			.map(|i| {
-				0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / win_length as f64).cos()) as f32
-			})
+			.map(|i| 0.5 * (1.0 - (2.0 * f64::consts::PI * i as f64 / win_length as f64).cos()) as f32)
 			.collect();
 
 		// Forward DFT kernels (windowed)
@@ -364,7 +364,7 @@ impl TorchSTFT {
 		let mut fwd_sin = Vec::with_capacity(n_bins * n_fft);
 		for k in 0..n_bins {
 			for n in 0..n_fft {
-				let angle = 2.0 * std::f64::consts::PI * k as f64 * n as f64 / n_fft as f64;
+				let angle = 2.0 * f64::consts::PI * k as f64 * n as f64 / n_fft as f64;
 				let w = window.get(n).copied().unwrap_or(0.0) as f64;
 				fwd_cos.push((angle.cos() * w) as f32);
 				fwd_sin.push((-angle.sin() * w) as f32);
@@ -389,7 +389,7 @@ impl TorchSTFT {
 			};
 			for n in 0..n_fft {
 				let w = window.get(n).copied().unwrap_or(0.0) as f64;
-				let angle = 2.0 * std::f64::consts::PI * k as f64 * n as f64 / n_fft as f64;
+				let angle = 2.0 * f64::consts::PI * k as f64 * n as f64 / n_fft as f64;
 				inv_cos.push((scale * w * angle.cos()) as f32);
 				inv_sin.push((scale * w * angle.sin()) as f32);
 			}

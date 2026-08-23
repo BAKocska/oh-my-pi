@@ -1,10 +1,13 @@
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::fs;
 use std::io::Write;
 
 use clap::Parser;
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-use nix::sys::stat::Mode;
+use nix::sys::stat;
 
-use crate::{ErrorKind, ExecutionResult, builtins};
+use crate::{
+	Error, ErrorKind, ExecutionContext, ExecutionResult, ShellExtensions, builtins, int_utils::parse,
+};
 
 /// Manage the process umask.
 #[derive(Parser)]
@@ -22,15 +25,15 @@ pub(crate) struct UmaskCommand {
 }
 
 impl builtins::Command for UmaskCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		if let Some(mode) = &self.mode {
 			if mode.starts_with(|c: char| c.is_digit(8)) {
-				let parsed = crate::int_utils::parse(mode.as_str(), 8)?;
+				let parsed = parse(mode.as_str(), 8)?;
 				set_umask(parsed)?;
 			} else {
 				let current_umask = get_umask()?;
@@ -61,13 +64,13 @@ impl builtins::Command for UmaskCommand {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn get_umask() -> Result<u32, crate::Error> {
-	let status = std::fs::read_to_string("/proc/self/status")?;
+fn get_umask() -> Result<u32, Error> {
+	let status = fs::read_to_string("/proc/self/status")?;
 	status
 		.lines()
 		.find_map(|line| line.strip_prefix("Umask:"))
 		.and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
-		.ok_or_else(|| crate::ErrorKind::InvalidUmask.into())
+		.ok_or_else(|| ErrorKind::InvalidUmask.into())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -75,16 +78,13 @@ fn get_umask() -> Result<u32, crate::Error> {
 	clippy::unnecessary_wraps,
 	reason = "platform-specific implementations share a fallible API"
 )]
-fn get_umask() -> Result<u32, crate::Error> {
-	let u = nix::sys::stat::umask(Mode::empty());
-	nix::sys::stat::umask(u);
+fn get_umask() -> Result<u32, Error> {
+	let u = stat::umask(stat::Mode::empty());
+	stat::umask(u);
 	Ok(u32::from(u.bits()))
 }
 
-fn parse_symbolic_umask(
-	mode: &str,
-	current_umask: u32,
-) -> Result<nix::sys::stat::mode_t, crate::Error> {
+fn parse_symbolic_umask(mode: &str, current_umask: u32) -> Result<stat::mode_t, Error> {
 	let mut umask = current_umask & 0o777;
 	let mut chars = mode.chars().peekable();
 	let mut saw_clause = false;
@@ -153,16 +153,16 @@ fn parse_symbolic_umask(
 	}
 
 	if saw_clause {
-		Ok(umask as nix::sys::stat::mode_t)
+		Ok(umask as stat::mode_t)
 	} else {
 		Err(ErrorKind::InvalidUmask.into())
 	}
 }
 
-fn set_umask(value: nix::sys::stat::mode_t) -> Result<(), crate::Error> {
+fn set_umask(value: stat::mode_t) -> Result<(), Error> {
 	// value of mode_t can be platform dependent
-	let mode = nix::sys::stat::Mode::from_bits(value).ok_or_else(|| ErrorKind::InvalidUmask)?;
-	nix::sys::stat::umask(mode);
+	let mode = stat::Mode::from_bits(value).ok_or_else(|| ErrorKind::InvalidUmask)?;
+	stat::umask(mode);
 	Ok(())
 }
 

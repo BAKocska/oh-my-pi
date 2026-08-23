@@ -2,6 +2,7 @@
 
 use std::{
 	convert::Infallible,
+	env, io,
 	net::{IpAddr, Ipv4Addr, SocketAddr},
 	path::PathBuf,
 	sync::Arc,
@@ -9,7 +10,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::{Request, Response, StatusCode, header};
+use http::{
+	Request, Response, StatusCode,
+	header::{self, HeaderName, HeaderValue},
+};
 use http_body_util::Full;
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -18,8 +22,9 @@ use thiserror::Error;
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	net::{TcpListener, TcpStream},
-	sync::watch,
-	task::JoinSet,
+	sync::{watch, watch::Receiver},
+	task::{JoinHandle, JoinSet},
+	time,
 };
 
 use crate::{
@@ -79,7 +84,7 @@ pub enum Error {
 		address: SocketAddr,
 		/// Operating-system socket failure.
 		#[source]
-		source:  std::io::Error,
+		source:  io::Error,
 	},
 }
 
@@ -87,7 +92,7 @@ pub enum Error {
 pub struct RunningServer {
 	address:  SocketAddr,
 	shutdown: watch::Sender<bool>,
-	task:     tokio::task::JoinHandle<()>,
+	task:     JoinHandle<()>,
 }
 
 impl RunningServer {
@@ -115,7 +120,7 @@ pub async fn start(config: Config, index: Arc<SessionIndex>) -> Result<RunningSe
 	}
 	let listener = match TcpListener::bind(config.address).await {
 		Ok(listener) => listener,
-		Err(source) if source.kind() == std::io::ErrorKind::AddrInUse => {
+		Err(source) if source.kind() == io::ErrorKind::AddrInUse => {
 			return Err(if is_omp_server(config.address).await {
 				Error::AlreadyRunning { address: config.address }
 			} else {
@@ -138,7 +143,7 @@ async fn serve(
 	listener: TcpListener,
 	api: Arc<StatsApi>,
 	security: Arc<Security>,
-	mut shutdown: watch::Receiver<bool>,
+	mut shutdown: Receiver<bool>,
 ) {
 	let mut connections = JoinSet::new();
 	loop {
@@ -216,8 +221,8 @@ struct Security {
 impl Security {
 	fn new(address: SocketAddr, auth_token: Option<String>) -> Self {
 		let host = address.to_string();
-		let hostname = std::env::var("HOSTNAME")
-			.or_else(|_| std::env::var("COMPUTERNAME"))
+		let hostname = env::var("HOSTNAME")
+			.or_else(|_| env::var("COMPUTERNAME"))
 			.unwrap_or_else(|_| "local".to_owned());
 		Self {
 			origin: format!("http://{host}"),
@@ -272,9 +277,7 @@ impl Security {
 				.and_then(|value| value.to_str().ok())
 				.and_then(|value| value.strip_prefix("Bearer "))
 				.unwrap_or_default();
-			if ring::constant_time::verify_slices_are_equal(supplied.as_bytes(), expected.as_bytes())
-				.is_err()
-			{
+			if !omp_core::ct_eq(supplied.as_bytes(), expected.as_bytes()) {
 				return Err(StatusCode::UNAUTHORIZED);
 			}
 		}
@@ -284,28 +287,26 @@ impl Security {
 
 fn secured(mut response: Response<Body>, security: &Security) -> Response<Body> {
 	let headers = response.headers_mut();
-	headers.insert("x-omp-stats-dashboard", header::HeaderValue::from_static("1"));
-	if let Ok(value) = header::HeaderValue::from_str(&security.hostname) {
+	headers.insert("x-omp-stats-dashboard", HeaderValue::from_static("1"));
+	if let Ok(value) = HeaderValue::from_str(&security.hostname) {
 		headers.insert("x-omp-stats-hostname", value);
 	}
 	headers.insert(
-		header::HeaderName::from_static("x-content-type-options"),
-		header::HeaderValue::from_static("nosniff"),
+		HeaderName::from_static("x-content-type-options"),
+		HeaderValue::from_static("nosniff"),
 	);
+	headers
+		.insert(HeaderName::from_static("referrer-policy"), HeaderValue::from_static("no-referrer"));
 	headers.insert(
-		header::HeaderName::from_static("referrer-policy"),
-		header::HeaderValue::from_static("no-referrer"),
-	);
-	headers.insert(
-		header::HeaderName::from_static("content-security-policy"),
-		header::HeaderValue::from_static(
+		HeaderName::from_static("content-security-policy"),
+		HeaderValue::from_static(
 			"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' \
 			 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
 		),
 	);
 	headers.insert(
-		header::HeaderName::from_static("permissions-policy"),
-		header::HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+		HeaderName::from_static("permissions-policy"),
+		HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
 	);
 	response
 }
@@ -333,7 +334,7 @@ async fn is_omp_server(address: SocketAddr) -> bool {
 		let response = String::from_utf8_lossy(&bytes[..read]);
 		response.contains("x-omp-stats-dashboard: 1") && response.contains("omp.stats.v1")
 	};
-	tokio::time::timeout(Duration::from_millis(300), probe)
+	time::timeout(Duration::from_millis(300), probe)
 		.await
 		.unwrap_or(false)
 }

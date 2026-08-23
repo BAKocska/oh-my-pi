@@ -1,10 +1,11 @@
-use std::path::PathBuf;
+use std::{env, env::consts, path::PathBuf, process, time};
 
 use im::OrdMap;
 use rand::RngExt as _;
 
 use crate::{
-	Shell, ShellValue, ShellVariable, error, extensions, shell::ShellState, sys, variables,
+	Shell, ShellValue, ShellVariable, callstack::FrameType, error, extensions, shell::ShellState,
+	sys, variables,
 };
 
 const BASH_MAJOR: u32 = 5;
@@ -82,7 +83,7 @@ pub(crate) fn init_well_known_vars(
 
 	// BASHPID
 	{
-		let mut bashpid_var = ShellVariable::new(ShellValue::String(std::process::id().to_string()));
+		let mut bashpid_var = ShellVariable::new(ShellValue::String(process::id().to_string()));
 		bashpid_var.treat_as_integer();
 		shell.env_mut().set_global("BASHPID", bashpid_var)?;
 	}
@@ -240,10 +241,8 @@ pub(crate) fn init_well_known_vars(
 		"EPOCHREALTIME",
 		ShellVariable::new(ShellValue::Dynamic {
 			getter: |_shell| {
-				let now = std::time::SystemTime::now();
-				let since_epoch = now
-					.duration_since(std::time::UNIX_EPOCH)
-					.unwrap_or_default();
+				let now = time::SystemTime::now();
+				let since_epoch = now.duration_since(time::UNIX_EPOCH).unwrap_or_default();
 				since_epoch.as_secs_f64().to_string().into()
 			},
 			setter: |_| (),
@@ -255,10 +254,8 @@ pub(crate) fn init_well_known_vars(
 		"EPOCHSECONDS",
 		ShellVariable::new(ShellValue::Dynamic {
 			getter: |_shell| {
-				let now = std::time::SystemTime::now();
-				let since_epoch = now
-					.duration_since(std::time::UNIX_EPOCH)
-					.unwrap_or_default();
+				let now = time::SystemTime::now();
+				let since_epoch = now.duration_since(time::UNIX_EPOCH).unwrap_or_default();
 				since_epoch.as_secs().to_string().into()
 			},
 			setter: |_| (),
@@ -320,7 +317,7 @@ pub(crate) fn init_well_known_vars(
 	// HOSTTYPE
 	shell
 		.env_mut()
-		.set_global("HOSTTYPE", ShellVariable::new(std::env::consts::ARCH.to_string()))?;
+		.set_global("HOSTTYPE", ShellVariable::new(consts::ARCH.to_string()))?;
 
 	// IFS
 	shell
@@ -365,7 +362,7 @@ pub(crate) fn init_well_known_vars(
 	// shellenv, nvm, asdf, ...) take the expected path. Real bash includes a
 	// kernel-version suffix on macOS/BSDs (e.g. `darwin24`); we omit the
 	// suffix for now since the common patterns all use prefix matching.
-	let os_type = match std::env::consts::OS {
+	let os_type = match consts::OS {
 		"linux" => "linux-gnu",
 		"android" => "linux-android",
 		"macos" | "ios" | "tvos" | "watchos" | "visionos" => "darwin",
@@ -383,7 +380,7 @@ pub(crate) fn init_well_known_vars(
 
 	// PATH (if not already set)
 	if !shell.env().is_set("PATH") {
-		let default_path_str = std::env::join_paths(sys::fs::get_default_executable_search_paths())
+		let default_path_str = env::join_paths(sys::fs::get_default_executable_search_paths())
 			.unwrap_or_else(|_| PathBuf::from("").into());
 		shell
 			.env_mut()
@@ -424,7 +421,7 @@ pub(crate) fn init_well_known_vars(
 		"SECONDS",
 		ShellVariable::new(ShellValue::Dynamic {
 			getter: |shell| {
-				let now = std::time::SystemTime::now();
+				let now = time::SystemTime::now();
 				let since_last = now
 					.duration_since(shell.last_stopwatch_time())
 					.unwrap_or_default();
@@ -556,8 +553,8 @@ fn get_funcname_value(shell: &dyn ShellState) -> variables::ShellValue {
 		stack
 			.iter()
 			.filter_map(|frame| match &frame.frame_type {
-				crate::callstack::FrameType::Function(func) => Some(func.function_name.as_str()),
-				crate::callstack::FrameType::Script(script) => {
+				FrameType::Function(func) => Some(func.function_name.as_str()),
+				FrameType::Script(script) => {
 					// Only include sourced scripts, not run scripts
 					if matches!(script.call_type, crate::callstack::ScriptCallType::Source) {
 						Some("source")
@@ -565,10 +562,10 @@ fn get_funcname_value(shell: &dyn ShellState) -> variables::ShellValue {
 						None
 					}
 				},
-				crate::callstack::FrameType::TrapHandler(_)
-				| crate::callstack::FrameType::Eval
-				| crate::callstack::FrameType::CommandString
-				| crate::callstack::FrameType::InteractiveSession => None,
+				FrameType::TrapHandler(_)
+				| FrameType::Eval
+				| FrameType::CommandString
+				| FrameType::InteractiveSession => None,
 			})
 			.collect::<Vec<_>>()
 			.into()
@@ -587,7 +584,7 @@ fn get_bash_lineno_value(shell: &dyn ShellState) -> variables::ShellValue {
 			.iter()
 			.enumerate()
 			.filter_map(|(frame_idx, frame)| match &frame.frame_type {
-				crate::callstack::FrameType::Function(..) | crate::callstack::FrameType::Script(..) => {
+				FrameType::Function(..) | FrameType::Script(..) => {
 					let caller_idx = frame_idx + 1;
 					if caller_idx < stack.depth() {
 						let caller_frame = &stack[caller_idx];
@@ -601,10 +598,10 @@ fn get_bash_lineno_value(shell: &dyn ShellState) -> variables::ShellValue {
 						None
 					}
 				},
-				crate::callstack::FrameType::TrapHandler(_)
-				| crate::callstack::FrameType::Eval
-				| crate::callstack::FrameType::CommandString
-				| crate::callstack::FrameType::InteractiveSession => None,
+				FrameType::TrapHandler(_)
+				| FrameType::Eval
+				| FrameType::CommandString
+				| FrameType::InteractiveSession => None,
 			})
 			.collect::<Vec<_>>()
 			.into()
@@ -625,10 +622,8 @@ fn get_bash_source_value(shell: &dyn ShellState) -> variables::ShellValue {
 		stack
 			.iter()
 			.filter_map(|frame| match &frame.frame_type {
-				crate::callstack::FrameType::Function(func) => {
-					Some(func.function.source().source.clone())
-				},
-				crate::callstack::FrameType::Script(script) => {
+				FrameType::Function(func) => Some(func.function.source().source.clone()),
+				FrameType::Script(script) => {
 					// Only include sourced scripts (matching the "source" in FUNCNAME)
 					if matches!(script.call_type, crate::callstack::ScriptCallType::Source) {
 						Some(script.source_info.source.clone())
@@ -636,9 +631,8 @@ fn get_bash_source_value(shell: &dyn ShellState) -> variables::ShellValue {
 						None
 					}
 				},
-				crate::callstack::FrameType::TrapHandler(_) | crate::callstack::FrameType::Eval => None,
-				crate::callstack::FrameType::CommandString
-				| crate::callstack::FrameType::InteractiveSession => None,
+				FrameType::TrapHandler(_) | FrameType::Eval => None,
+				FrameType::CommandString | FrameType::InteractiveSession => None,
 			})
 			.collect::<Vec<_>>()
 			.into()
@@ -654,11 +648,11 @@ fn get_bash_argc_value(shell: &dyn ShellState) -> variables::ShellValue {
 	stack
 		.iter()
 		.filter_map(|frame| match &frame.frame_type {
-			crate::callstack::FrameType::Function(..)
-			| crate::callstack::FrameType::Script(..)
-			| crate::callstack::FrameType::CommandString
-			| crate::callstack::FrameType::InteractiveSession => Some(frame.args.len().to_string()),
-			crate::callstack::FrameType::TrapHandler(_) | crate::callstack::FrameType::Eval => None,
+			FrameType::Function(..)
+			| FrameType::Script(..)
+			| FrameType::CommandString
+			| FrameType::InteractiveSession => Some(frame.args.len().to_string()),
+			FrameType::TrapHandler(_) | FrameType::Eval => None,
 		})
 		.collect::<Vec<_>>()
 		.into()
@@ -674,11 +668,11 @@ fn get_bash_argv_value(shell: &dyn ShellState) -> variables::ShellValue {
 
 	for frame in stack.iter() {
 		let include = match &frame.frame_type {
-			crate::callstack::FrameType::Function(..)
-			| crate::callstack::FrameType::Script(..)
-			| crate::callstack::FrameType::CommandString
-			| crate::callstack::FrameType::InteractiveSession => true,
-			crate::callstack::FrameType::TrapHandler(_) | crate::callstack::FrameType::Eval => false,
+			FrameType::Function(..)
+			| FrameType::Script(..)
+			| FrameType::CommandString
+			| FrameType::InteractiveSession => true,
+			FrameType::TrapHandler(_) | FrameType::Eval => false,
 		};
 
 		if include {

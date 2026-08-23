@@ -2,14 +2,19 @@
 
 use std::{
 	collections::BTreeMap,
+	fs,
 	fs::OpenOptions,
 	io::{Seek as _, SeekFrom, Write as _},
 	path::PathBuf,
+	str,
 };
 
 use bytes::Bytes;
 use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str, sf};
-use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1 as pb,
+	thread::v1::{self as thread_pb, item, part, server_tool},
+};
 use omp_storage::{
 	blob::BlobRef,
 	transcript::{
@@ -531,7 +536,7 @@ fn custom_data_is_canonical_and_stable() {
 	let mut first = Vec::new();
 	write_line(&event, &mut first).expect("custom event writes");
 	assert!(
-		std::str::from_utf8(&first)
+		str::from_utf8(&first)
 			.expect("JSON is UTF-8")
 			.contains(r#"{"z":[3,2],"a":"x&y"}"#)
 	);
@@ -586,7 +591,7 @@ fn header_is_single_and_torn_tail_is_truncated() {
 			kind:   None,
 			rev:    None,
 			value:  None,
-			raw:    raw(std::str::from_utf8(&duplicate).expect("header is UTF-8")),
+			raw:    raw(str::from_utf8(&duplicate).expect("header is UTF-8")),
 			reason: text("header in event position"),
 		}),
 	};
@@ -647,7 +652,7 @@ fn malformed_middle_line_is_a_tombstone() {
 	let mut bytes = Vec::new();
 	write_header(&header(), &mut bytes).expect("header writes");
 	bytes.extend_from_slice(b"\n{\"ts\":1,\"k\":\"reset\"}\n{not json}\n{\"ts\":3,\"k\":\"title\",\"title\":\"later\",\"source\":\"user\"}\n");
-	std::fs::write(&path, bytes).expect("fixture writes");
+	fs::write(&path, bytes).expect("fixture writes");
 	let log = load(&path).expect("fixture loads");
 	assert_eq!(log.len(), 3);
 	assert!(matches!(log.get(1), Some(Entry::Tombstone(_))));
@@ -662,8 +667,8 @@ fn oversized_tool_search_history_round_trips_byte_for_byte() {
 	let directory = tempdir().expect("temporary directory");
 	let path = directory.path().join("session.jsonl");
 	let oversized = "W".repeat(600_000);
-	let server_tool = |kind: thread_pb::server_tool::Kind, payload: Vec<u8>| thread_pb::Part {
-		kind: Some(thread_pb::part::Kind::ServerTool(thread_pb::ServerTool {
+	let server_tool = |kind: server_tool::Kind, payload: Vec<u8>| thread_pb::Part {
+		kind: Some(part::Kind::ServerTool(thread_pb::ServerTool {
 			provider:          "anthropic".to_owned(),
 			kind:              kind as i32,
 			id:                "srvtoolu_tool_search".to_owned(),
@@ -678,7 +683,7 @@ fn oversized_tool_search_history_round_trips_byte_for_byte() {
 			item:        thread_pb::Item {
 				seq:           0,
 				created_at_ms: 1,
-				kind:          Some(thread_pb::item::Kind::Message(thread_pb::Message {
+				kind:          Some(item::Kind::Message(thread_pb::Message {
 					role:  thread_pb::Role::Assistant as i32,
 					parts: vec![
 						server_tool(
@@ -864,7 +869,7 @@ fn reader_parses_only_new_complete_lines() {
 	drop(writer);
 	let mut reader = Reader::open(&path).expect("reader opens");
 
-	let bytes = std::fs::read(&path).expect("transcript reads");
+	let bytes = fs::read(&path).expect("transcript reads");
 	let title_offset = bytes
 		.windows(b"first".len())
 		.position(|window| window == b"first")
@@ -964,7 +969,7 @@ fn reader_rejects_replacement_without_discarding_prior_state() {
 	writer.append(&title(1, "first")).expect("first event");
 	drop(writer);
 	let mut reader = Reader::open(&path).expect("reader opens");
-	std::fs::rename(&path, &displaced).expect("old transcript moves");
+	fs::rename(&path, &displaced).expect("old transcript moves");
 	let mut replacement = Writer::create(&path, &header()).expect("replacement transcript");
 	replacement
 		.append(&title(2, "replacement"))

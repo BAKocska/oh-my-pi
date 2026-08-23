@@ -6,7 +6,7 @@
 
 use std::{
 	collections::BTreeMap,
-	fs,
+	fs, io, mem,
 	path::{Component, Path, PathBuf},
 };
 
@@ -53,7 +53,7 @@ pub enum BridgeError {
 		/// Path whose metadata or canonical form was requested.
 		path:   PathBuf,
 		/// Underlying filesystem failure.
-		source: std::io::Error,
+		source: io::Error,
 	},
 }
 
@@ -376,9 +376,9 @@ pub fn validate_write(
 				}
 			}
 		},
-		Err(error)
-			if error.kind() == std::io::ErrorKind::NotFound && policy == WritePolicy::Workspace => {},
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+		Err(error) if error.kind() == io::ErrorKind::NotFound && policy == WritePolicy::Workspace => {
+		},
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {
 			return Err(BridgeError::WriteRejected(sf!("policy permits existing files only",)));
 		},
 		Err(source) => return Err(BridgeError::Io { path: target, source }),
@@ -398,7 +398,7 @@ impl ShellDelta {
 		let delta = snapshot.strip_prefix(&self.previous).unwrap_or(snapshot);
 		self.previous.clear();
 		self.previous.push_str(snapshot);
-		let mut input = std::mem::take(&mut self.pending_escape);
+		let mut input = mem::take(&mut self.pending_escape);
 		input.push_str(delta);
 		let safe = complete_escape_prefix(&input);
 		self.pending_escape.push_str(&input[safe..]);

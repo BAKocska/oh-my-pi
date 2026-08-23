@@ -3,6 +3,7 @@
 use std::{future::poll_fn, thread};
 
 use bytes::Bytes;
+use omp_core::Str;
 use omp_inference::{
 	codec::Cancellation,
 	transport::browser::{
@@ -100,7 +101,7 @@ fn fetch_on_driver(
 		final_url:    view.url(),
 		status:       None,
 		body:         Bytes::copy_from_slice(body.as_bytes()),
-		content_type: Some(omp_core::Str::new_static("text/html")),
+		content_type: Some(Str::new_static("text/html")),
 	})
 }
 

@@ -2,6 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
+	fmt,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -44,8 +45,8 @@ impl Clone for AwsCredential {
 	}
 }
 
-impl std::fmt::Debug for AwsCredential {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for AwsCredential {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("AwsCredential([REDACTED])")
 	}
 }

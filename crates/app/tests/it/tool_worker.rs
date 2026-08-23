@@ -3,7 +3,7 @@
 use std::{
 	fs,
 	io::Write as _,
-	path::Path,
+	path::{Path, PathBuf},
 	process::{Command, Stdio},
 	time::{Duration, Instant},
 };
@@ -33,6 +33,7 @@ use omp_proto::{
 	},
 };
 use serde_json::{Value, json};
+use tokio::time;
 
 const EXTENSION: &str = r#"
 import ctypes
@@ -392,7 +393,7 @@ async fn trusted_cli_module_is_loaded_and_activated_from_its_exact_file() {
 	assert!(extension.manifest.resource_limits.is_empty());
 	let mut config = test_config(env!("CARGO_BIN_EXE_omp").into());
 	config.extensions.push(extension);
-	let supervisor = tokio::time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
+	let supervisor = time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
 		.await
 		.expect("trusted worker activation timed out")
 		.expect("activate exact trusted module");
@@ -434,7 +435,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		.to_std()
 		.expect("test interrupt grace");
 
-	let supervisor = tokio::time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
+	let supervisor = time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
 		.await
 		.expect("worker hello and registration timed out")
 		.expect("spawn same-binary Python worker");
@@ -460,7 +461,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 			.all(|registration| registration.declaration.rev == "1")
 	);
 
-	let (first_update, first_complete) = tokio::time::timeout(
+	let (first_update, first_complete) = time::timeout(
 		Duration::from_secs(5),
 		echo_roundtrip(&supervisor, "echo-before", "before kill"),
 	)
@@ -528,7 +529,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 			props:         None,
 		})
 		.expect("forward courtesy interrupt");
-	tokio::time::sleep(Duration::from_millis(75)).await;
+	time::sleep(Duration::from_millis(75)).await;
 	assert!(
 		signal::kill(Pid::from_raw(blocked_pid), None).is_ok(),
 		"courtesy interrupt structurally killed worker {blocked_pid}",
@@ -536,7 +537,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 
 	let cancelled_at = Instant::now();
 	blocked.cancel("integration cancellation");
-	let abort = match tokio::time::timeout(Duration::from_secs(3), blocked.next())
+	let abort = match time::timeout(Duration::from_secs(3), blocked.next())
 		.await
 		.expect("native cancellation exceeded grace plus kill window")
 		.expect("supervisor closed before reporting cancellation")
@@ -569,7 +570,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		sibling_after, sibling_pid,
 		"cancelling one extension restarted its independently supervised sibling"
 	);
-	let (second_update, second_complete) = tokio::time::timeout(
+	let (second_update, second_complete) = time::timeout(
 		Duration::from_secs(5),
 		echo_roundtrip(&supervisor, "echo-after", "after respawn"),
 	)
@@ -614,7 +615,7 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		.interrupt_grace
 		.to_std()
 		.expect("test interrupt grace");
-	let supervisor = tokio::time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
+	let supervisor = time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
 		.await
 		.expect("py_eval worker registration timed out")
 		.expect("spawn py_eval worker");
@@ -682,10 +683,10 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		py_eval_call("py-eval-sleep", "__import__('time').sleep(30)", Duration::from_secs(60)),
 	)
 	.expect("dispatch sleeping py_eval");
-	tokio::time::sleep(Duration::from_millis(100)).await;
+	time::sleep(Duration::from_millis(100)).await;
 	let cancelled_at = Instant::now();
 	sleeping.cancel("cancel sleeping evaluation");
-	let abort = match tokio::time::timeout(Duration::from_secs(3), sleeping.next())
+	let abort = match time::timeout(Duration::from_secs(3), sleeping.next())
 		.await
 		.expect("py_eval cancellation exceeded kill window")
 		.expect("supervisor closed before reporting py_eval cancellation")
@@ -705,7 +706,7 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		"sleeping evaluation did not terminate promptly: {cancel_elapsed:?}"
 	);
 
-	let second = tokio::time::timeout(
+	let second = time::timeout(
 		Duration::from_secs(5),
 		py_eval_roundtrip(&supervisor, "py-eval-after", "40 + 2"),
 	)
@@ -845,20 +846,20 @@ async fn stable_roundtrip(
 }
 
 async fn wait_for_marker(path: &Path) -> i32 {
-	tokio::time::timeout(Duration::from_secs(3), async {
+	time::timeout(Duration::from_secs(3), async {
 		loop {
 			if let Ok(pid) = fs::read_to_string(path) {
 				return pid.parse().expect("native marker contains worker pid");
 			}
 
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			time::sleep(Duration::from_millis(10)).await;
 		}
 	})
 	.await
 	.expect("native Python call did not enter ctypes sleep")
 }
 
-fn test_config(executable: std::path::PathBuf) -> ExtHostConfig {
+fn test_config(executable: PathBuf) -> ExtHostConfig {
 	ExtHostConfig::new(executable, Principal::new(sf!("test"), sf!("Test")), sf!("test-session"), 1)
 }
 

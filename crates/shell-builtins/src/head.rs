@@ -121,7 +121,7 @@ use cli::{options, uu_app};
 mod parse {
 	//
 
-	use std::ffi::OsString;
+	use std::{ffi::OsString, num, str};
 
 	use crate::support::parse::{ParseSizeError, SignPrefix, parse_signed_num_max};
 
@@ -165,11 +165,11 @@ mod parse {
 	fn process_num_block(
 		src: &str,
 		last_char: char,
-		chars: &mut std::str::CharIndices,
+		chars: &mut str::CharIndices,
 	) -> Result<Vec<OsString>, ParseError> {
 		let num = match src.parse::<usize>() {
 			Ok(n) => n,
-			Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => usize::MAX,
+			Err(e) if *e.kind() == num::IntErrorKind::PosOverflow => usize::MAX,
 			_ => return Err(ParseError),
 		};
 		let mut quiet = false;
@@ -328,6 +328,7 @@ mod take {
 	//! Take all but the last elements of an iterator.
 	use std::{
 		collections::VecDeque,
+		io,
 		io::{ErrorKind, Read, Write},
 	};
 
@@ -345,7 +346,7 @@ mod take {
 			Self { buffer: vec![], start_index: 0 }
 		}
 
-		fn fill_buffer(&mut self, reader: &mut impl Read) -> std::io::Result<usize> {
+		fn fill_buffer(&mut self, reader: &mut impl Read) -> io::Result<usize> {
 			self.buffer.resize(BUF_SIZE, 0);
 			self.start_index = 0;
 			loop {
@@ -362,11 +363,7 @@ mod take {
 			}
 		}
 
-		fn write_bytes_exact(
-			&mut self,
-			writer: &mut impl Write,
-			bytes: usize,
-		) -> std::io::Result<()> {
+		fn write_bytes_exact(&mut self, writer: &mut impl Write, bytes: usize) -> io::Result<()> {
 			let buffer_to_write = &self.remaining_buffer()[..bytes];
 			writer.write_all(buffer_to_write)?;
 			self.start_index += bytes;
@@ -374,7 +371,7 @@ mod take {
 			Ok(())
 		}
 
-		fn write_all(&mut self, writer: &mut impl Write) -> std::io::Result<usize> {
+		fn write_all(&mut self, writer: &mut impl Write) -> io::Result<usize> {
 			let remaining_bytes = self.remaining_bytes();
 			self.write_bytes_exact(writer, remaining_bytes)?;
 			Ok(remaining_bytes)
@@ -384,7 +381,7 @@ mod take {
 			&mut self,
 			writer: &mut impl Write,
 			max_bytes: usize,
-		) -> std::io::Result<usize> {
+		) -> io::Result<usize> {
 			let bytes_to_write = self.remaining_bytes().min(max_bytes);
 			self.write_bytes_exact(writer, bytes_to_write)?;
 			Ok(bytes_to_write)
@@ -424,7 +421,7 @@ mod take {
 		reader: &mut impl Read,
 		writer: &mut impl Write,
 		n: usize,
-	) -> std::io::Result<usize> {
+	) -> io::Result<usize> {
 		let mut buffers: VecDeque<TakeAllBuffer> = VecDeque::new();
 		let mut empty_buffer_pool: Vec<TakeAllBuffer> = vec![];
 		let mut buffered_bytes: usize = 0;
@@ -493,7 +490,7 @@ mod take {
 			&mut self,
 			reader: &mut impl Read,
 			separator: u8,
-		) -> std::io::Result<BytesAndLines> {
+		) -> io::Result<BytesAndLines> {
 			self.partial_line = false;
 			let bytes_read = self.inner.fill_buffer(reader)?;
 			// Count the number of lines...
@@ -511,7 +508,7 @@ mod take {
 			writer: &mut impl Write,
 			max_lines: usize,
 			separator: u8,
-		) -> std::io::Result<BytesAndLines> {
+		) -> io::Result<BytesAndLines> {
 			assert!(max_lines > 0, "Must request at least 1 line.");
 			let ret;
 			if max_lines > self.terminated_lines {
@@ -580,7 +577,7 @@ mod take {
 		writer: &mut W,
 		n: usize,
 		separator: u8,
-	) -> std::io::Result<usize> {
+	) -> io::Result<usize> {
 		// This function requires `n` > 0. Assert it!
 		assert!(n > 0);
 		let mut buffers: VecDeque<TakeAllLinesBuffer> = VecDeque::new();
@@ -650,7 +647,7 @@ mod take {
 
 	impl<T: Read> Read for TakeLines<T> {
 		/// Read bytes from a buffer up to the requested number of lines.
-		fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+		fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 			if self.limit == 0 {
 				return Ok(0);
 			}
@@ -686,7 +683,7 @@ mod take {
 	#[cfg(test)]
 	mod tests {
 
-		use std::io::{BufRead, BufReader};
+		use std::io::{self, BufRead, BufReader};
 
 		use super::{
 			TakeAllBuffer, TakeAllLinesBuffer, copy_all_but_n_bytes, copy_all_but_n_lines, take_lines,
@@ -695,14 +692,14 @@ mod take {
 		#[test]
 		fn test_take_all_buffer_exact_bytes() {
 			let input_buffer = "abc";
-			let mut input_reader = std::io::Cursor::new(input_buffer);
+			let mut input_reader = io::Cursor::new(input_buffer);
 			let mut take_all_buffer = TakeAllBuffer::new();
 			let bytes_read = take_all_buffer.fill_buffer(&mut input_reader).unwrap();
 			assert_eq!(bytes_read, input_buffer.len());
 			assert_eq!(take_all_buffer.remaining_bytes(), input_buffer.len());
 			assert_eq!(take_all_buffer.remaining_buffer(), input_buffer.as_bytes());
 			assert!(!take_all_buffer.is_empty());
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			for (index, c) in input_buffer.bytes().enumerate() {
 				take_all_buffer
 					.write_bytes_exact(&mut output_reader, 1)
@@ -722,12 +719,12 @@ mod take {
 		#[test]
 		fn test_take_all_buffer_all_bytes() {
 			let input_buffer = "abc";
-			let mut input_reader = std::io::Cursor::new(input_buffer);
+			let mut input_reader = io::Cursor::new(input_buffer);
 			let mut take_all_buffer = TakeAllBuffer::new();
 			let bytes_read = take_all_buffer.fill_buffer(&mut input_reader).unwrap();
 			assert_eq!(bytes_read, input_buffer.len());
 			assert_eq!(take_all_buffer.remaining_bytes(), input_buffer.len());
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_written = take_all_buffer.write_all(&mut output_reader).unwrap();
 			assert_eq!(bytes_written, input_buffer.len());
 			assert_eq!(output_reader.get_ref().as_slice(), input_buffer.as_bytes());
@@ -737,7 +734,7 @@ mod take {
 			assert_eq!(take_all_buffer.remaining_buffer(), "".as_bytes());
 
 			// Now do a write_all on an empty TakeAllBuffer. Confirm correct behavior.
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_written = take_all_buffer.write_all(&mut output_reader).unwrap();
 			assert_eq!(bytes_written, 0);
 			assert_eq!(output_reader.get_ref().as_slice().len(), 0);
@@ -746,12 +743,12 @@ mod take {
 		#[test]
 		fn test_take_all_buffer_limit_bytes() {
 			let input_buffer = "abc";
-			let mut input_reader = std::io::Cursor::new(input_buffer);
+			let mut input_reader = io::Cursor::new(input_buffer);
 			let mut take_all_buffer = TakeAllBuffer::new();
 			let bytes_read = take_all_buffer.fill_buffer(&mut input_reader).unwrap();
 			assert_eq!(bytes_read, input_buffer.len());
 			assert_eq!(take_all_buffer.remaining_bytes(), input_buffer.len());
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			// Write all but 1 bytes.
 			let bytes_to_write = input_buffer.len() - 1;
 			let bytes_written = take_all_buffer
@@ -775,7 +772,7 @@ mod take {
 			assert_eq!(take_all_buffer.remaining_buffer(), "".as_bytes());
 
 			// Write 1 more byte - i.e. confirm behavior on already empty buffer.
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_to_write = 1;
 			let bytes_written = take_all_buffer
 				.write_bytes_limit(&mut output_reader, bytes_to_write)
@@ -793,7 +790,7 @@ mod take {
 			// 3 lines with new-lines and one partial line.
 			let input_buffer = "a\nb\nc\ndef";
 			let separator = b'\n';
-			let mut input_reader = std::io::Cursor::new(input_buffer);
+			let mut input_reader = io::Cursor::new(input_buffer);
 			let mut take_all_lines_buffer = TakeAllLinesBuffer::new();
 			let fill_result = take_all_lines_buffer
 				.fill_buffer(&mut input_reader, separator)
@@ -805,7 +802,7 @@ mod take {
 			assert!(take_all_lines_buffer.partial_line());
 
 			// Write 1st line.
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let lines_to_write = 1;
 			let write_result = take_all_lines_buffer
 				.write_lines(&mut output_reader, lines_to_write, separator)
@@ -817,7 +814,7 @@ mod take {
 			assert_eq!(take_all_lines_buffer.terminated_lines(), 2);
 
 			// Write 2nd line.
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let lines_to_write = 1;
 			let write_result = take_all_lines_buffer
 				.write_lines(&mut output_reader, lines_to_write, separator)
@@ -830,7 +827,7 @@ mod take {
 
 			// Now try to write 3 lines even though we have only 1 line remaining. Should
 			// write everything left in the buffer.
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let lines_to_write = 3;
 			let write_result = take_all_lines_buffer
 				.write_lines(&mut output_reader, lines_to_write, separator)
@@ -843,7 +840,7 @@ mod take {
 
 			// Test empty buffer.
 			let input_buffer = "";
-			let mut input_reader = std::io::Cursor::new(input_buffer);
+			let mut input_reader = io::Cursor::new(input_buffer);
 			let mut take_all_lines_buffer = TakeAllLinesBuffer::new();
 			let fill_result = take_all_lines_buffer
 				.fill_buffer(&mut input_reader, separator)
@@ -856,7 +853,7 @@ mod take {
 
 			// Test buffer that ends with newline.
 			let input_buffer = "\n";
-			let mut input_reader = std::io::Cursor::new(input_buffer);
+			let mut input_reader = io::Cursor::new(input_buffer);
 			let mut take_all_lines_buffer = TakeAllLinesBuffer::new();
 			let fill_result = take_all_lines_buffer
 				.fill_buffer(&mut input_reader, separator)
@@ -874,8 +871,8 @@ mod take {
 			// 1 - Hold back more bytes than the input will provide. Should have nothing
 			// written to output.
 			let input_buffer = "a\nb\nc\ndef";
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_bytes(&mut input_reader, &mut output_reader, input_buffer.len() + 1)
 					.unwrap();
@@ -883,8 +880,8 @@ mod take {
 
 			// 2 - Hold back exactly the number of bytes the input will provide. Should have
 			// nothing written to output.
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_bytes(&mut input_reader, &mut output_reader, input_buffer.len())
 					.unwrap();
@@ -892,8 +889,8 @@ mod take {
 
 			// 3 - Hold back 1 fewer byte than input will provide. Should have one byte
 			// written to output.
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_bytes(&mut input_reader, &mut output_reader, input_buffer.len() - 1)
 					.unwrap();
@@ -908,24 +905,24 @@ mod take {
 			// written to output.
 			let input_buffer = "a\nb\nc\ndef";
 			let separator = b'\n';
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_lines(&mut input_reader, &mut output_reader, 5, separator).unwrap();
 			assert_eq!(bytes_copied, 0);
 
 			// 2 - Hold back exactly the number of lines the input will provide. Should have
 			// nothing written to output.
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_lines(&mut input_reader, &mut output_reader, 4, separator).unwrap();
 			assert_eq!(bytes_copied, 0);
 
 			// 3 - Hold back 1 fewer lines than input will provide. Should have one line
 			// written to output.
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_lines(&mut input_reader, &mut output_reader, 3, separator).unwrap();
 			assert_eq!(bytes_copied, 2);
@@ -935,24 +932,24 @@ mod take {
 			// 4 - Hold back more lines than the input will provide. Should have nothing
 			// written to output.
 			let input_buffer = "a\nb\nc\ndef\n";
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_lines(&mut input_reader, &mut output_reader, 5, separator).unwrap();
 			assert_eq!(bytes_copied, 0);
 
 			// 5 - Hold back exactly the number of lines the input will provide. Should have
 			// nothing written to output.
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_lines(&mut input_reader, &mut output_reader, 4, separator).unwrap();
 			assert_eq!(bytes_copied, 0);
 
 			// 6 - Hold back 1 fewer lines than input will provide. Should have one line
 			// written to output.
-			let mut input_reader = std::io::Cursor::new(input_buffer);
-			let mut output_reader = std::io::Cursor::new(vec![0x10; 0]);
+			let mut input_reader = io::Cursor::new(input_buffer);
+			let mut output_reader = io::Cursor::new(vec![0x10; 0]);
 			let bytes_copied =
 				copy_all_but_n_lines(&mut input_reader, &mut output_reader, 3, separator).unwrap();
 			assert_eq!(bytes_copied, 2);
@@ -961,7 +958,7 @@ mod take {
 
 		#[test]
 		fn test_zero_lines() {
-			let input_reader = std::io::Cursor::new("a\nb\nc\n");
+			let input_reader = io::Cursor::new("a\nb\nc\n");
 			let output_reader = BufReader::new(take_lines(input_reader, 0, b'\n'));
 			let mut iter = output_reader.lines().map(|l| l.unwrap());
 			assert_eq!(None, iter.next());
@@ -969,7 +966,7 @@ mod take {
 
 		#[test]
 		fn test_fewer_lines() {
-			let input_reader = std::io::Cursor::new("a\nb\nc\n");
+			let input_reader = io::Cursor::new("a\nb\nc\n");
 			let output_reader = BufReader::new(take_lines(input_reader, 2, b'\n'));
 			let mut iter = output_reader.lines().map(|l| l.unwrap());
 			assert_eq!(Some(String::from("a")), iter.next());
@@ -979,7 +976,7 @@ mod take {
 
 		#[test]
 		fn test_more_lines() {
-			let input_reader = std::io::Cursor::new("a\nb\nc\n");
+			let input_reader = io::Cursor::new("a\nb\nc\n");
 			let output_reader = BufReader::new(take_lines(input_reader, 4, b'\n'));
 			let mut iter = output_reader.lines().map(|l| l.unwrap());
 			assert_eq!(Some(String::from("a")), iter.next());
@@ -991,6 +988,8 @@ mod take {
 }
 
 use take::{copy_all_but_n_bytes, copy_all_but_n_lines, take_lines};
+
+use crate::support::fsutil::sane_blksize::sane_blksize_from_metadata;
 
 #[derive(Error, Debug)]
 enum HeadError {
@@ -1316,7 +1315,7 @@ fn head_backwards_file(
 ) -> io::Result<u64> {
 	let st = input.metadata()?;
 	let seekable = is_seekable(input);
-	let blksize_limit = crate::support::fsutil::sane_blksize::sane_blksize_from_metadata(&st);
+	let blksize_limit = sane_blksize_from_metadata(&st);
 	if !seekable || st.len() <= blksize_limit || options.presume_input_pipe {
 		head_backwards_without_seek_file(input, output, options)
 	} else {
@@ -1473,7 +1472,7 @@ pub(crate) fn head_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
-	use std::{ffi::OsString, io::Cursor};
+	use std::{ffi::OsString, fs, io::Cursor};
 
 	use clap::Parser;
 	use tempfile::tempdir;
@@ -1556,8 +1555,8 @@ mod tests {
 	#[test]
 	fn open_error_produces_no_separator_and_processing_continues() {
 		let dir = tempdir().unwrap();
-		std::fs::write(dir.path().join("f1"), b"a\n").unwrap();
-		std::fs::write(dir.path().join("f2"), b"b\n").unwrap();
+		fs::write(dir.path().join("f1"), b"a\n").unwrap();
+		fs::write(dir.path().join("f2"), b"b\n").unwrap();
 		let (code, capture) = run_util::<Head>(&["-n", "1", "missing", "f1", "f2"], "", dir.path());
 		assert_eq!(code, 1);
 		assert_eq!(capture.out(), "==> f1 <==\na\n\n==> f2 <==\nb\n");
@@ -1567,8 +1566,8 @@ mod tests {
 	#[test]
 	fn directory_operand_prints_header_before_error() {
 		let dir = tempdir().unwrap();
-		std::fs::create_dir(dir.path().join("d")).unwrap();
-		std::fs::write(dir.path().join("f"), b"a\n").unwrap();
+		fs::create_dir(dir.path().join("d")).unwrap();
+		fs::write(dir.path().join("f"), b"a\n").unwrap();
 		let (code, capture) = run_util::<Head>(&["-n", "1", "d", "f"], "", dir.path());
 		assert_eq!(code, 1);
 		assert_eq!(capture.out(), "==> d <==\n\n==> f <==\na\n");
@@ -1586,7 +1585,7 @@ mod tests {
 	#[test]
 	fn resolves_operands_against_host_cwd_but_prints_supplied_name() {
 		let dir = tempdir().unwrap();
-		std::fs::write(dir.path().join("input"), b"a\nb\n").unwrap();
+		fs::write(dir.path().join("input"), b"a\nb\n").unwrap();
 		let (code, capture) = run_util::<Head>(&["-v", "input"], "", dir.path());
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "==> input <==\na\nb\n");
@@ -1595,7 +1594,7 @@ mod tests {
 	#[test]
 	fn negative_line_count_on_file_uses_resolved_handle() {
 		let dir = tempdir().unwrap();
-		std::fs::write(dir.path().join("input"), b"a\nb\nc\n").unwrap();
+		fs::write(dir.path().join("input"), b"a\nb\nc\n").unwrap();
 		let (code, capture) = run_util::<Head>(&["-n", "-1", "input"], "", dir.path());
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "a\nb\n");

@@ -2,9 +2,10 @@
 //! factories.
 
 use std::{
+	any,
 	any::Any,
 	f32::consts::{PI, TAU},
-	fmt,
+	fmt, str,
 	sync::{
 		Arc,
 		atomic::{AtomicU32, Ordering},
@@ -23,6 +24,7 @@ use crate::{
 	input::{Key, Mouse, UiEvent},
 	markup::{Align, Border, Dim},
 	props::{Prop, PropValue, Props},
+	rich,
 };
 
 /// Stable component identity. A slot is never an arena index.
@@ -68,7 +70,7 @@ pub trait Component: Any {
 	/// type's full path via [`std::any::type_name`]. The `OMP_TUI_DEBUG`
 	/// tree dump trims it to the trailing path segment.
 	fn kind(&self) -> &'static str {
-		std::any::type_name::<Self>()
+		any::type_name::<Self>()
 	}
 	/// Every owned child, including embedded inactive subtrees.
 	fn children(&self) -> &[Cached] {
@@ -224,7 +226,7 @@ pub struct MemoKey {
 impl MemoKey {
 	/// Captures the key for a component at `version` under `ctx`.
 	pub(crate) fn new(version: u64, ctx: &UiContext) -> Self {
-		Self { version, width_epoch: crate::rich::width_config_epoch(), revision: ctx.revision }
+		Self { version, width_epoch: rich::width_config_epoch(), revision: ctx.revision }
 	}
 }
 
@@ -1219,14 +1221,14 @@ fn paint_border(
 	let inner = usize::from(rect.width) - 2;
 	assemble_border_line(&mut pc.border_scratch, tl, horizontal, tr, inner);
 	if rect.y < pc.clip {
-		let top = std::str::from_utf8(&pc.border_scratch)
+		let top = str::from_utf8(&pc.border_scratch)
 			.expect("border glyph assembly only appends valid UTF-8");
 		pc.frame.put(rect.x, rect.y, top, edge);
 	}
 	let bottom_y = rect.y.saturating_add(rect.height - 1);
 	if bottom_y < pc.clip {
 		assemble_border_line(&mut pc.border_scratch, bl, horizontal, br, inner);
-		let bottom = std::str::from_utf8(&pc.border_scratch)
+		let bottom = str::from_utf8(&pc.border_scratch)
 			.expect("border glyph assembly only appends valid UTF-8");
 		pc.frame.put(rect.x, bottom_y, bottom, edge);
 	}
@@ -1671,6 +1673,10 @@ mod tests {
 	use parking_lot::{Mutex, MutexGuard};
 
 	use super::*;
+	use crate::{
+		context::JamoWidth,
+		rich::{jamo_width, set_jamo_width},
+	};
 
 	struct Probe {
 		props:    Props,
@@ -1798,11 +1804,11 @@ mod tests {
 	#[test]
 	fn width_epoch_invalidates_cached_measurement() {
 		let _epoch = width_epoch_guard();
-		let original = crate::rich::jamo_width();
-		let next = if original == crate::context::JamoWidth::Narrow {
-			crate::context::JamoWidth::Wide
+		let original = jamo_width();
+		let next = if original == JamoWidth::Narrow {
+			JamoWidth::Wide
 		} else {
-			crate::context::JamoWidth::Narrow
+			JamoWidth::Narrow
 		};
 		let measures = Rc::new(Cell::new(0));
 		let mut cached = Cached::new(Box::new(Probe::new(measures.clone(), Vec::new())));
@@ -1812,10 +1818,10 @@ mod tests {
 		assert_eq!(cached.measure(&ctx), (1, 2));
 		assert_eq!(measures.get(), 1);
 
-		assert!(crate::rich::set_jamo_width(next));
+		assert!(set_jamo_width(next));
 		assert_eq!(cached.measure(&ctx), (1, 2));
 		assert_eq!(measures.get(), 2);
 
-		crate::rich::set_jamo_width(original);
+		set_jamo_width(original);
 	}
 }

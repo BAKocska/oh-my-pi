@@ -18,11 +18,13 @@ pub mod transcription;
 pub mod usage;
 pub mod video;
 
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, time, time::Instant};
+
+use omp_core::Str;
 
 use crate::{
 	answer::{Answer, AnswerBody, ResponseMeta},
-	call::{Call, OperationCall, SessionRequest, Target},
+	call::{Call, InferenceAttribution, OperationCall, SessionRequest, Target},
 	catalog::{ModelKey, OperationKind, ProviderId, RouteId},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	id::RequestId,
@@ -50,7 +52,7 @@ impl RouteIdentity {
 			route: self.route.clone(),
 			model: Some(self.model.clone()),
 			provider_request_id: None,
-			created_at: std::time::SystemTime::now(),
+			created_at: time::SystemTime::now(),
 		}
 	}
 }
@@ -70,7 +72,7 @@ pub struct OperationRequest<T> {
 	/// Optional conversation state.
 	pub session:     Option<SessionRequest>,
 	/// Principal and extension charged for this request.
-	pub attribution: crate::call::InferenceAttribution,
+	pub attribution: InferenceAttribution,
 	/// Immutable selected execution plan.
 	pub execution:   Option<Arc<ExecutionPlan>>,
 	/// Operation-specific immutable payload.
@@ -168,7 +170,7 @@ pub(crate) fn wrong_operation(call: &Call, expected: OperationKind) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.detail(ErrorDetail::capability(
-		omp_core::Str::new(expected.to_string()),
+		Str::new(expected.to_string()),
 		ReasonId(omp_core::sf!("operation_service_mismatch")),
 	))
 	.request_id(call.id.clone())
@@ -248,14 +250,14 @@ pub(crate) fn media_validation_error(
 ) -> Error {
 	let failure = failure.into();
 	let reason: &'static str = failure.clone().into();
-	let reason = ReasonId(omp_core::Str::new_static(reason));
+	let reason = ReasonId(Str::new_static(reason));
 	Error::new(
 		ErrorKind::InvalidRequest,
 		ErrorPhase::Planning,
 		RetryAction::Never,
 		ExecutionReceipt::default(),
 	)
-	.detail(ErrorDetail::capability(omp_core::Str::new(operation.to_string()), reason))
+	.detail(ErrorDetail::capability(Str::new(operation.to_string()), reason))
 	.typed_source(failure)
 }
 
@@ -265,7 +267,7 @@ pub(crate) fn media_protocol_error(
 ) -> Error {
 	let failure = failure.into();
 	let reason: &'static str = failure.clone().into();
-	let reason = ReasonId(omp_core::Str::new_static(reason));
+	let reason = ReasonId(Str::new_static(reason));
 	Error::new(
 		ErrorKind::ProviderContractMismatch,
 		ErrorPhase::Streaming,
@@ -273,6 +275,6 @@ pub(crate) fn media_protocol_error(
 		ExecutionReceipt::default(),
 	)
 	.committed(true)
-	.detail(ErrorDetail::capability(omp_core::Str::new(operation.to_string()), reason))
+	.detail(ErrorDetail::capability(Str::new(operation.to_string()), reason))
 	.typed_source(failure)
 }

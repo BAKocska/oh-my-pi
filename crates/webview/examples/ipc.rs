@@ -8,7 +8,10 @@
 //! Exits 0 once init-script IPC, page IPC, `eval_with`, and a synthetic click
 //! have all been observed; exits 1 on timeout.
 
-use std::time::{Duration, Instant};
+use std::{
+	error, process,
+	time::{Duration, Instant},
+};
 
 use omp_webview::{
 	Engine, FrameConfig, Input, MouseButton, SurfaceKind, WebViewBuilder, WebViewEvent,
@@ -21,7 +24,7 @@ document.getElementById('b').addEventListener('click', () => window.ipc.postMess
 window.addEventListener('load', () => window.ipc.postMessage('loaded'));
 </script></body></html>"#;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn error::Error>> {
 	let engine = Engine::find(SurfaceKind::Frames)?;
 	println!("engine: {engine:?}");
 
@@ -80,5 +83,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// Drop the view before exiting: `process::exit` skips destructors, and the
 	// engine teardown lives in the WebView drop.
 	drop(view);
-	std::process::exit(i32::from(!ok));
+	process::exit(i32::from(!ok));
 }

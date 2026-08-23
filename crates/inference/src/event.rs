@@ -1,5 +1,7 @@
 //! Canonical generative chat events and execution-authorization semantics.
 
+use std::time;
+
 use bytes::Bytes;
 use omp_core::Str;
 
@@ -96,7 +98,7 @@ pub struct WorkflowAction {
 	/// Exact provider action arguments.
 	pub arguments:     Bytes,
 	/// Provider completion deadline relative to this event.
-	pub timeout:       Option<std::time::Duration>,
+	pub timeout:       Option<time::Duration>,
 	/// Response vocabulary accepted by the requesting provider.
 	pub response_kind: WorkflowResponseKind,
 }

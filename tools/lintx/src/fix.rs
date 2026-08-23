@@ -6,29 +6,33 @@
 //! `use` inserts. Scope semantics live in [`crate::scope`]; name resolution
 //! in [`crate::bindings`].
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	ops::Range,
+};
 
 use ra_ap_syntax::ast::{self, AstNode, HasAttrs};
 
-use crate::bindings::Bindings;
-use crate::lint::{Diag, FileContext};
-use crate::scope::{self, ScopeKey};
+use crate::{
+	bindings::Bindings,
+	lint::{Diag, FileContext},
+	scope::{self, ScopeKey},
+};
 
 /// A planned rewrite: replace `range` with `replacement` and import `import`.
 pub struct PathFix {
 	/// Byte range of the qualified path being shortened.
-	range: Range<usize>,
+	range:       Range<usize>,
 	/// Source text kept at the use site (tail segments, generics intact).
 	replacement: String,
 	/// Path the inserted `use` names.
-	import: String,
+	import:      String,
 	/// Offset where the `use` line is inserted (start of a line).
-	insert_at: usize,
+	insert_at:   usize,
 	/// Ident the fix brings into scope; used for collision checks.
-	binds: String,
+	binds:       String,
 	/// Visibility chain of the fix site, innermost first.
-	scopes: Vec<ScopeKey>,
+	scopes:      Vec<ScopeKey>,
 }
 
 impl PathFix {
@@ -37,26 +41,36 @@ impl PathFix {
 	/// exists:
 	/// - the import path roots at a type or generic parameter
 	///   (`SE::ErrorFormatter`) — `use` paths resolve from a crate root;
-	/// - the path sits under a `#[cfg]`-gated ancestor — an inserted `use`
-	///   would be unconditional while the usage is not.
+	/// - the path sits under a `#[cfg]`-gated ancestor — an inserted `use` would
+	///   be unconditional while the usage is not.
 	pub fn plan(text: &str, path: &ast::Path, import_names: &[String], keep: usize) -> Option<Self> {
 		if import_names.len() < 2 {
 			return None;
 		}
-		if import_names[0].chars().next().is_some_and(char::is_uppercase) {
+		if import_names[0]
+			.chars()
+			.next()
+			.is_some_and(char::is_uppercase)
+		{
 			return None;
 		}
 		if path.syntax().ancestors().any(|a| {
 			ast::AnyHasAttrs::cast(a).is_some_and(|item| {
-				item.attrs().any(|attr| attr.simple_name().as_deref() == Some("cfg"))
+				item
+					.attrs()
+					.any(|attr| attr.simple_name().as_deref() == Some("cfg"))
 			})
 		}) {
 			return None;
 		}
 		// Keep the kept segments' *source* text so turbofish/generics survive.
 		let segs: Vec<ast::PathSegment> = path.segments().collect();
-		let kept_start: usize =
-			segs.get(segs.len().checked_sub(keep)?)?.syntax().text_range().start().into();
+		let kept_start: usize = segs
+			.get(segs.len().checked_sub(keep)?)?
+			.syntax()
+			.text_range()
+			.start()
+			.into();
 		let range = usize::from(path.syntax().text_range().start())
 			..usize::from(path.syntax().text_range().end());
 		Some(Self {
@@ -99,11 +113,7 @@ fn drop_nested(mut planned: Vec<PathFix>) -> Vec<PathFix> {
 
 /// Decide, per fix, whether it may bind its ident — and whether it needs a
 /// `use` insert (`false` = the identical import is already visible).
-fn admit(
-	planned: Vec<PathFix>,
-	bindings: &mut Bindings,
-	own_crate: &str,
-) -> Vec<(PathFix, bool)> {
+fn admit(planned: Vec<PathFix>, bindings: &mut Bindings, own_crate: &str) -> Vec<(PathFix, bool)> {
 	let mut admitted = Vec::with_capacity(planned.len());
 	for mut fix in planned {
 		// A self-referencing crate path must be imported via `crate::`.
@@ -126,7 +136,7 @@ fn admit(
 			// Already bound to the same path in a visible scope: rewrite only.
 			Some(existing) if existing == fix.import => admitted.push((fix, false)),
 			// Bound to something else (import, alias, or local item): skip.
-			Some(_) => {}
+			Some(_) => {},
 			None => {
 				if bindings.bare_used(&fix.binds) {
 					continue;
@@ -134,7 +144,7 @@ fn admit(
 				let scope = fix.scopes.last().copied().unwrap_or(ScopeKey::ROOT);
 				bindings.record(scope, fix.binds.clone(), fix.import.clone());
 				admitted.push((fix, true));
-			}
+			},
 		}
 	}
 	admitted
@@ -146,16 +156,24 @@ fn splice(text: &str, admitted: Vec<(PathFix, bool)>) -> (String, usize) {
 	let mut inserts: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
 	for (f, needs_insert) in &admitted {
 		if *needs_insert {
-			inserts.entry(f.insert_at).or_default().insert(format!("use {};\n", f.import));
+			inserts
+				.entry(f.insert_at)
+				.or_default()
+				.insert(format!("use {};\n", f.import));
 		}
 	}
 
 	let applied = admitted.len();
-	let mut edits: Vec<(Range<usize>, String)> =
-		admitted.into_iter().map(|(f, _)| (f.range, f.replacement)).collect();
+	let mut edits: Vec<(Range<usize>, String)> = admitted
+		.into_iter()
+		.map(|(f, _)| (f.range, f.replacement))
+		.collect();
 	for (at, lines) in inserts {
 		// Match the indentation of the line we insert before.
-		let indent: String = text[at..].chars().take_while(|c| *c == '\t' || *c == ' ').collect();
+		let indent: String = text[at..]
+			.chars()
+			.take_while(|c| *c == '\t' || *c == ' ')
+			.collect();
 		let block: String = lines.into_iter().map(|l| format!("{indent}{l}")).collect();
 		edits.push((at..at, block));
 	}

@@ -1,13 +1,14 @@
 //! I/O support for shell instances.
 
-use std::io::Write;
+use std::{io, io::Write};
 
-use crate::{error, extensions, ioutils};
+use super::ShellFd;
+use crate::{Shell, error, extensions, interp::ExecutionParameters, ioutils};
 
-impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
+impl<SE: extensions::ShellExtensions> Shell<SE> {
 	/// Returns a value that can be used to write to the shell's currently
 	/// configured standard output stream using `write!` et al.
-	pub fn stdout(&self) -> impl std::io::Write + 'static {
+	pub fn stdout(&self) -> impl io::Write + 'static {
 		self.open_files.try_stdout().cloned().unwrap_or_else(|| {
 			ioutils::FailingReaderWriter::new("standard output not available").into()
 		})
@@ -15,7 +16,7 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
 
 	/// Returns a value that can be used to write to the shell's currently
 	/// configured standard error stream using `write!` et al.
-	pub fn stderr(&self) -> impl std::io::Write + 'static {
+	pub fn stderr(&self) -> impl io::Write + 'static {
 		self.open_files.try_stderr().cloned().unwrap_or_else(|| {
 			ioutils::FailingReaderWriter::new("standard error not available").into()
 		})
@@ -31,7 +32,7 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
 	/// * `command` - The command to trace.
 	pub(crate) async fn trace_command<S: AsRef<str>>(
 		&mut self,
-		params: &crate::interp::ExecutionParameters,
+		params: &ExecutionParameters,
 		command: S,
 	) {
 		// Expand the PS4 prompt variable to get our prefix.
@@ -53,10 +54,7 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
 		// but if BASH_XTRACEFD is set and refers to a valid file descriptor, use that
 		// instead.
 		let trace_file = if let Some((_, xtracefd_var)) = self.env.get("BASH_XTRACEFD")
-			&& let Ok(fd) = xtracefd_var
-				.value()
-				.to_cow_str(self)
-				.parse::<super::ShellFd>()
+			&& let Ok(fd) = xtracefd_var.value().to_cow_str(self).parse::<ShellFd>()
 			&& let Some(file) = self.open_files.try_fd(fd)
 		{
 			Some(file.clone())
@@ -82,7 +80,7 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
 	/// * `err` - The error to display.
 	pub fn display_error(
 		&self,
-		file: &mut impl std::io::Write,
+		file: &mut impl io::Write,
 		err: &error::Error,
 	) -> Result<(), error::Error> {
 		use crate::extensions::ErrorFormatter as _;

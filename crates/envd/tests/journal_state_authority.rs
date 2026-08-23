@@ -1,5 +1,7 @@
 //! Durable session-index proof used by the JSON persistence authority.
 
+use std::io;
+
 use omp_core::Str;
 use omp_storage::{
 	index::{NewSession, SessionIndex, SessionKind},
@@ -24,7 +26,7 @@ fn indexed_get_and_lineage_are_authoritative_and_root_first() {
 				parent:     None,
 				remote:     false,
 			},
-			|| Ok::<_, std::io::Error>(((), 1)),
+			|| Ok::<_, io::Error>(((), 1)),
 		)
 		.expect("index root");
 	index
@@ -38,7 +40,7 @@ fn indexed_get_and_lineage_are_authoritative_and_root_first() {
 				parent:     Some(&root),
 				remote:     false,
 			},
-			|| Ok::<_, std::io::Error>(((), 1)),
+			|| Ok::<_, io::Error>(((), 1)),
 		)
 		.expect("index child");
 

@@ -1,12 +1,15 @@
 //! Opaque credential lease acquisition and refresh boundary.
 
-use std::task::{Context, Poll};
+use std::{
+	mem,
+	task::{Context, Poll},
+};
 
 use tower::{Layer, Service};
 
 use crate::{
 	error::{Error, ErrorPhase},
-	layer::{LayerCall, account::Accounted},
+	layer::{ExecutionContext, LayerCall, account::Accounted},
 };
 
 /// Authenticated request carrying an opaque lease type that outer layers cannot
@@ -38,7 +41,7 @@ pub trait LeaseProvider<R, A>: Clone + Send + 'static {
 		&'a self,
 		request: &'a R,
 		account: &'a A,
-		context: &'a crate::layer::ExecutionContext,
+		context: &'a ExecutionContext,
 	) -> Self::Future<'a>;
 }
 /// Adds credential lease acquisition.
@@ -83,7 +86,7 @@ where
 
 	fn call(&mut self, request: LayerCall<Accounted<R, A>>) -> Self::Future {
 		let replacement = self.inner.clone();
-		let mut ready_inner = std::mem::replace(&mut self.inner, replacement);
+		let mut ready_inner = mem::replace(&mut self.inner, replacement);
 		let provider = self.provider.clone();
 		async move {
 			request.context.checkpoint(ErrorPhase::Authentication)?;

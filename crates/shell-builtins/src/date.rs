@@ -36,7 +36,11 @@ mod format_modifiers {
 	//! - `%^B`: Month name in uppercase (JUNE)
 	//! - `%+4C`: Century with sign, padded to 4 characters (+019)
 
-	use std::{fmt, sync::LazyLock};
+	use std::{
+		fmt::{self, Display},
+		iter,
+		sync::LazyLock,
+	};
 
 	use jiff::{
 		Zoned,
@@ -53,7 +57,7 @@ mod format_modifiers {
 		FieldWidthTooLarge { width: usize, specifier: String },
 	}
 
-	impl fmt::Display for FormatError {
+	impl Display for FormatError {
 		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 			match self {
 				Self::JiffError(e) => write!(f, "{e}"),
@@ -402,13 +406,13 @@ mod format_modifiers {
 				let rest = &result[1..];
 				let mut padded = try_alloc_padded(result.len(), padding, effective_width, specifier)?;
 				padded.push(sign);
-				padded.extend(std::iter::repeat_n('0', padding));
+				padded.extend(iter::repeat_n('0', padding));
 				padded.push_str(rest);
 				result = padded;
 			} else {
 				// Default: pad on the left (e.g., "  -22" or "  1999")
 				let mut padded = try_alloc_padded(result.len(), padding, effective_width, specifier)?;
-				padded.extend(std::iter::repeat_n(pad_char, padding));
+				padded.extend(iter::repeat_n(pad_char, padding));
 				padded.push_str(&result);
 				result = padded;
 			}
@@ -776,15 +780,18 @@ use std::{
 	borrow::Cow,
 	collections::HashMap,
 	ffi::OsString,
+	fs,
 	fs::File,
+	io,
 	io::{BufRead, BufReader, Read, Write},
+	iter,
 	path::{Path, PathBuf},
-	sync::LazyLock,
+	sync::{LazyLock, atomic},
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use jiff::{
-	Span, Timestamp, Zoned,
+	Span, Timestamp, Zoned, civil,
 	fmt::strtime::{self, BrokenDownTime, Config, PosixCustom},
 	tz::{Offset, TimeZone, TimeZoneDatabase},
 };
@@ -1270,14 +1277,14 @@ fn parse_bsd_strptime(format: &str, value: &str, now: &Zoned) -> Result<Zoned, S
 	let date = broken
 		.to_date()
 		.or_else(|_| {
-			jiff::civil::Date::new(
+			civil::Date::new(
 				broken.year().unwrap_or(base.year()),
 				broken.month().unwrap_or(base.month()),
 				broken.day().unwrap_or(base.day()),
 			)
 		})
 		.map_err(convert_error)?;
-	let time = jiff::civil::Time::new(
+	let time = civil::Time::new(
 		broken.hour().unwrap_or(base.hour()),
 		broken.minute().unwrap_or(base.minute()),
 		broken.second().unwrap_or(base.second()),
@@ -1311,8 +1318,8 @@ impl DateError {
 	}
 }
 
-impl From<std::io::Error> for DateError {
-	fn from(error: std::io::Error) -> Self {
+impl From<io::Error> for DateError {
+	fn from(error: io::Error) -> Self {
 		Self::new(1, error.to_string())
 	}
 }
@@ -1613,7 +1620,7 @@ fn date_main(host: &mut Host, matches: &ArgMatches) -> Result<(), DateError> {
 				parse_date(input, &now, DebugOptions::new(settings.debug, true), &mut debug_stderr)
 			};
 
-			Dates::One(std::iter::once(date))
+			Dates::One(iter::once(date))
 		},
 		DateSource::Stdin => Dates::Stdin(parse_dates_from_reader(
 			&mut host.stdin,
@@ -1642,26 +1649,26 @@ fn date_main(host: &mut Host, matches: &ArgMatches) -> Result<(), DateError> {
 		},
 		DateSource::FileMtime(path) => {
 			// directory; `path` is kept for display.
-			let metadata = std::fs::metadata(host.resolve(path)).map_err(|error| {
+			let metadata = fs::metadata(host.resolve(path)).map_err(|error| {
 				DateError::new(1, format!("{}: {error}", path.as_os_str().maybe_quote()))
 			})?;
 			let mtime = metadata.modified()?;
 			let ts = Timestamp::try_from(mtime)
 				.map_err(|_| DateError::new(1, "cannot set date".to_string()))?;
 			let date = ts.to_zoned(local_time_zone.clone());
-			Dates::One(std::iter::once(Ok(date)))
+			Dates::One(iter::once(Ok(date)))
 		},
 		DateSource::Resolution => {
 			let resolution = get_clock_resolution();
 			let date = resolution.to_zoned(local_time_zone.clone());
-			Dates::One(std::iter::once(Ok(date)))
+			Dates::One(iter::once(Ok(date)))
 		},
 		DateSource::Strptime { format, value } => {
 			let date = parse_bsd_strptime(format, value, &now)
 				.map_err(|message| DateError::new(1, message))?;
-			Dates::One(std::iter::once(Ok(date)))
+			Dates::One(iter::once(Ok(date)))
 		},
-		DateSource::Now => Dates::One(std::iter::once(Ok(now.clone()))),
+		DateSource::Now => Dates::One(iter::once(Ok(now.clone()))),
 	};
 
 	let format_string = make_format_string(&settings);
@@ -1670,7 +1677,7 @@ fn date_main(host: &mut Host, matches: &ArgMatches) -> Result<(), DateError> {
 	let config = Config::new().custom(PosixCustom::new()).lenient(true);
 	for date in dates {
 		// host cancellation between lines.
-		if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+		if cancel.load(atomic::Ordering::Relaxed) {
 			break;
 		}
 		match date {
@@ -2121,10 +2128,10 @@ impl<R: Read, W: Write> Iterator for DateReader<'_, R, W> {
 	}
 }
 
-impl<R: Read, W: Write> std::iter::FusedIterator for DateReader<'_, R, W> {}
+impl<R: Read, W: Write> iter::FusedIterator for DateReader<'_, R, W> {}
 
 enum Dates<'a> {
-	One(std::iter::Once<DateResult>),
+	One(iter::Once<DateResult>),
 	Stdin(DateReader<'a, &'a mut Stdin, OpenFile>),
 	File(DateReader<'a, File, OpenFile>),
 }
@@ -2141,7 +2148,7 @@ impl Iterator for Dates<'_> {
 	}
 }
 
-impl std::iter::FusedIterator for Dates<'_> {}
+impl iter::FusedIterator for Dates<'_> {}
 
 /// Reads and parses dates while recycling one line buffer across successful
 /// inputs.
@@ -2236,6 +2243,7 @@ fn parse_date<S: AsRef<str> + Clone>(
 
 #[cfg(test)]
 mod tests {
+	use std::{env, process};
 
 	use super::*;
 	use crate::host::{Host, run_util};
@@ -2323,16 +2331,16 @@ mod tests {
 	/// reading of `-r` (GNU `--reference` semantics are primary).
 	#[test]
 	fn reference_prefers_existing_file_over_epoch() {
-		let dir = std::env::temp_dir().join(format!("pi-date-r-{}", std::process::id()));
-		std::fs::create_dir_all(&dir).unwrap();
+		let dir = env::temp_dir().join(format!("pi-date-r-{}", process::id()));
+		fs::create_dir_all(&dir).unwrap();
 		let file = dir.join("1700000000");
-		std::fs::write(&file, b"x").unwrap();
+		fs::write(&file, b"x").unwrap();
 
 		let (code, capture) =
 			run_util::<Date>(&["-u", "-r", "1700000000", "+%s"], "", dir.to_str().unwrap());
-		let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+		let mtime = fs::metadata(&file).unwrap().modified().unwrap();
 		let expected = Timestamp::try_from(mtime).unwrap().as_second();
-		std::fs::remove_dir_all(&dir).unwrap();
+		fs::remove_dir_all(&dir).unwrap();
 
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), format!("{expected}\n"));
@@ -2515,7 +2523,7 @@ fn set_system_datetime(date: Zoned) -> Result<(), DateError> {
 	let timespec =
 		Timespec { tv_sec: timestamp.as_second() as _, tv_nsec: timestamp.subsec_nanosecond() as _ };
 	clock_settime(ClockId::Realtime, timespec)
-		.map_err(std::io::Error::from)
+		.map_err(io::Error::from)
 		.map_err(|error| DateError::new(1, format!("cannot set date: {error}")))
 }
 

@@ -1,6 +1,6 @@
 //! Revision-keyed, synchronous tool renderer folds.
 
-use std::{any::Any, collections::BTreeMap, sync::Arc};
+use std::{any::Any, collections::BTreeMap, iter, str, sync::Arc};
 
 use bytes::Bytes;
 use omp_core::Str;
@@ -326,7 +326,7 @@ pub enum RenderRegistryError {
 		/// Exact requested identity.
 		identity: ToolIdentity,
 		/// UTF-8 decoder failure.
-		source:   std::str::Utf8Error,
+		source:   str::Utf8Error,
 	},
 }
 
@@ -355,7 +355,7 @@ struct RegisteredRender<R>(R);
 
 impl<R: RenderFold> ErasedRender for RegisteredRender<R> {
 	fn initial(&self) -> Box<dyn Any + Send + Sync> {
-		Box::new(R::State::default())
+		Box::new(<R::State as Default>::default())
 	}
 
 	fn fold(
@@ -471,8 +471,7 @@ impl RenderRegistry {
 	/// Iterates exact registered renderer identities in stable key order.
 	pub fn identities(
 		&self,
-	) -> impl DoubleEndedIterator<Item = &ToolIdentity> + ExactSizeIterator + std::iter::FusedIterator
-	{
+	) -> impl DoubleEndedIterator<Item = &ToolIdentity> + ExactSizeIterator + iter::FusedIterator {
 		self.entries.keys().map(Arc::as_ref)
 	}
 
@@ -598,7 +597,7 @@ fn generic_view(
 	let Some(data) = data else {
 		return Ok(Str::new_static("{}"));
 	};
-	let data = std::str::from_utf8(data)
+	let data = str::from_utf8(data)
 		.map_err(|source| RenderRegistryError::Utf8 { identity: identity.clone(), source })?;
 	Ok(Str::new(data))
 }

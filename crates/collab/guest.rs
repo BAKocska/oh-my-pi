@@ -2,14 +2,18 @@
 
 use std::{
 	collections::BTreeMap,
+	fs, io,
 	path::{Path, PathBuf},
 };
 
 use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
-use omp_proto::collab::v1::{
-	AgentSummary, ContextUsage, JournalRecord, ModelMetadata, RegistrySnapshot, SessionHeader,
-	SessionStateUpdate, SnapshotChunk, UiRequest, VisibilityClass, agent_summary, ui_request,
+use omp_proto::collab::{
+	v1,
+	v1::{
+		AgentSummary, ContextUsage, JournalRecord, ModelMetadata, RegistrySnapshot, SessionHeader,
+		SessionStateUpdate, SnapshotChunk, UiRequest, VisibilityClass, agent_summary, ui_request,
+	},
 };
 use omp_storage::transcript::{
 	SessionId,
@@ -201,19 +205,9 @@ impl GuestStateMirror {
 /// Guest UI presentation hook implemented by the interactive app boundary.
 pub trait GuestUiHooks {
 	/// Presents one host-owned select dialog.
-	fn present_select(
-		&mut self,
-		request_id: u32,
-		title: &str,
-		spec: &omp_proto::collab::v1::SelectSpec,
-	);
+	fn present_select(&mut self, request_id: u32, title: &str, spec: &v1::SelectSpec);
 	/// Presents one host-owned editor dialog.
-	fn present_editor(
-		&mut self,
-		request_id: u32,
-		title: &str,
-		spec: &omp_proto::collab::v1::EditorSpec,
-	);
+	fn present_editor(&mut self, request_id: u32, title: &str, spec: &v1::EditorSpec);
 	/// Dismisses a presented dialog without answering the host.
 	fn dismiss(&mut self, request_id: u32);
 }
@@ -466,82 +460,90 @@ enum GuestReplicaCommand {
 	Stop,
 }
 
-/// Clone-cheap producer and projection observer for [`GuestRelayPump`].
-#[derive(Clone)]
-pub struct GuestReplicaHandle {
-	commands: Sender<GuestReplicaCommand>,
-	updates:  watch::Receiver<GuestReplicaProjection>,
+mod replica_handle {
+	use tokio::sync::watch::Receiver;
+
+	use super::*;
+
+	/// Clone-cheap producer and projection observer for [`GuestRelayPump`].
+	#[derive(Clone)]
+	pub struct GuestReplicaHandle {
+		pub(super) commands: Sender<GuestReplicaCommand>,
+		pub(super) updates:  Receiver<GuestReplicaProjection>,
+	}
+
+	impl GuestReplicaHandle {
+		/// Starts an initial or reconnect snapshot for one authenticated room.
+		pub async fn begin_snapshot(
+			&self,
+			room_id: Str,
+			header: SessionHeader,
+			expected_records: usize,
+		) -> Result<GuestReplicaProjection, GuestReplicaError> {
+			let (reply, response) = flume::bounded(1);
+			self
+				.commands
+				.send_async(GuestReplicaCommand::Begin { room_id, header, expected_records, reply })
+				.await
+				.map_err(|_| GuestReplicaError::PumpStopped)?;
+			response
+				.recv_async()
+				.await
+				.map_err(|_| GuestReplicaError::PumpStopped)?
+		}
+
+		/// Applies one ordered snapshot chunk.
+		pub async fn push_snapshot_chunk(
+			&self,
+			chunk: SnapshotChunk,
+		) -> Result<GuestReplicaProjection, GuestReplicaError> {
+			let (reply, response) = flume::bounded(1);
+			self
+				.commands
+				.send_async(GuestReplicaCommand::Snapshot { chunk, reply })
+				.await
+				.map_err(|_| GuestReplicaError::PumpStopped)?;
+			response
+				.recv_async()
+				.await
+				.map_err(|_| GuestReplicaError::PumpStopped)?
+		}
+
+		/// Applies one ordered live record.
+		pub async fn append_live(
+			&self,
+			record: JournalRecord,
+		) -> Result<GuestReplicaProjection, GuestReplicaError> {
+			let (reply, response) = flume::bounded(1);
+			self
+				.commands
+				.send_async(GuestReplicaCommand::Live { record, reply })
+				.await
+				.map_err(|_| GuestReplicaError::PumpStopped)?;
+			response
+				.recv_async()
+				.await
+				.map_err(|_| GuestReplicaError::PumpStopped)?
+		}
+
+		/// Returns the most recently published durable projection state.
+		pub fn projection(&self) -> GuestReplicaProjection {
+			self.updates.borrow().clone()
+		}
+
+		/// Subscribes to coalesced durable projection updates.
+		pub fn subscribe(&self) -> Receiver<GuestReplicaProjection> {
+			self.updates.clone()
+		}
+
+		/// Stops the pump after the collaboration owner has detached.
+		pub async fn stop(&self) {
+			let _ = self.commands.send_async(GuestReplicaCommand::Stop).await;
+		}
+	}
 }
 
-impl GuestReplicaHandle {
-	/// Starts an initial or reconnect snapshot for one authenticated room.
-	pub async fn begin_snapshot(
-		&self,
-		room_id: Str,
-		header: SessionHeader,
-		expected_records: usize,
-	) -> Result<GuestReplicaProjection, GuestReplicaError> {
-		let (reply, response) = flume::bounded(1);
-		self
-			.commands
-			.send_async(GuestReplicaCommand::Begin { room_id, header, expected_records, reply })
-			.await
-			.map_err(|_| GuestReplicaError::PumpStopped)?;
-		response
-			.recv_async()
-			.await
-			.map_err(|_| GuestReplicaError::PumpStopped)?
-	}
-
-	/// Applies one ordered snapshot chunk.
-	pub async fn push_snapshot_chunk(
-		&self,
-		chunk: SnapshotChunk,
-	) -> Result<GuestReplicaProjection, GuestReplicaError> {
-		let (reply, response) = flume::bounded(1);
-		self
-			.commands
-			.send_async(GuestReplicaCommand::Snapshot { chunk, reply })
-			.await
-			.map_err(|_| GuestReplicaError::PumpStopped)?;
-		response
-			.recv_async()
-			.await
-			.map_err(|_| GuestReplicaError::PumpStopped)?
-	}
-
-	/// Applies one ordered live record.
-	pub async fn append_live(
-		&self,
-		record: JournalRecord,
-	) -> Result<GuestReplicaProjection, GuestReplicaError> {
-		let (reply, response) = flume::bounded(1);
-		self
-			.commands
-			.send_async(GuestReplicaCommand::Live { record, reply })
-			.await
-			.map_err(|_| GuestReplicaError::PumpStopped)?;
-		response
-			.recv_async()
-			.await
-			.map_err(|_| GuestReplicaError::PumpStopped)?
-	}
-
-	/// Returns the most recently published durable projection state.
-	pub fn projection(&self) -> GuestReplicaProjection {
-		self.updates.borrow().clone()
-	}
-
-	/// Subscribes to coalesced durable projection updates.
-	pub fn subscribe(&self) -> watch::Receiver<GuestReplicaProjection> {
-		self.updates.clone()
-	}
-
-	/// Stops the pump after the collaboration owner has detached.
-	pub async fn stop(&self) {
-		let _ = self.commands.send_async(GuestReplicaCommand::Stop).await;
-	}
-}
+pub use replica_handle::GuestReplicaHandle;
 
 /// Ordered guest snapshot/live actor.
 ///
@@ -608,8 +610,9 @@ impl GuestRelayPump {
 		expected_records: usize,
 	) -> Result<GuestReplicaProjection, GuestReplicaError> {
 		if self.room_id.as_ref() != Some(&room_id) {
-			std::fs::create_dir_all(&self.root).map_err(|source| {
-				GuestReplicaError::CreateDirectory { path: self.root.clone(), source }
+			fs::create_dir_all(&self.root).map_err(|source| GuestReplicaError::CreateDirectory {
+				path: self.root.clone(),
+				source,
 			})?;
 			let path = self.root.join(format!("{room_id}.jsonl"));
 			let replica = if path.exists() {
@@ -733,7 +736,7 @@ pub enum GuestReplicaError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A journal record carried an unknown visibility value.
 	#[error("collaboration journal record has an unknown visibility class")]
@@ -753,6 +756,7 @@ fn convert_record(record: JournalRecord) -> Result<RemoteRecord, GuestReplicaErr
 }
 #[cfg(test)]
 mod tests {
+
 	use super::*;
 
 	#[test]

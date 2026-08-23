@@ -1,7 +1,12 @@
 use std::{
+	env,
+	fmt::Display,
+	fs,
 	fs::{File, OpenOptions},
 	io::Write,
+	mem,
 	os::fd::AsRawFd,
+	slice,
 	sync::Arc,
 	thread,
 	time::{Duration, Instant},
@@ -697,7 +702,7 @@ impl X11Input {
 	}
 }
 
-fn input_failed(error: impl std::fmt::Display) -> DesktopError {
+fn input_failed(error: impl Display) -> DesktopError {
 	DesktopError::input_failed(format!("X11 input request failed: {error}"))
 }
 
@@ -848,7 +853,7 @@ fn mpx_cheap_probe(conn: &RustConnection) -> bool {
 	if OpenOptions::new().write(true).open("/dev/uinput").is_err() {
 		return false;
 	}
-	if std::env::var("DISPLAY").ok().as_deref().is_none() {
+	if env::var("DISPLAY").ok().as_deref().is_none() {
 		return false;
 	}
 	if x_server_exe_name().as_deref() == Some("Xvfb") {
@@ -862,11 +867,11 @@ fn mpx_cheap_probe(conn: &RustConnection) -> bool {
 }
 
 fn x_server_exe_name() -> Option<String> {
-	let display = std::env::var("DISPLAY").ok()?;
+	let display = env::var("DISPLAY").ok()?;
 	let number = display.split(':').nth(1)?.split('.').next()?;
-	let lock = std::fs::read_to_string(format!("/tmp/.X{number}-lock")).ok()?;
+	let lock = fs::read_to_string(format!("/tmp/.X{number}-lock")).ok()?;
 	let pid = lock.trim().parse::<u32>().ok()?;
-	std::fs::read_link(format!("/proc/{pid}/exe"))
+	fs::read_link(format!("/proc/{pid}/exe"))
 		.ok()?
 		.file_name()?
 		.to_str()
@@ -1154,9 +1159,9 @@ impl UInputDevice {
 		// SAFETY: InputEvent is a C-compatible plain-data kernel ABI struct and the
 		// slice is bounded to its exact size.
 		let bytes = unsafe {
-			std::slice::from_raw_parts(
+			slice::from_raw_parts(
 				(&event as *const InputEvent).cast::<u8>(),
-				std::mem::size_of::<InputEvent>(),
+				mem::size_of::<InputEvent>(),
 			)
 		};
 		self
@@ -1215,13 +1220,13 @@ const fn ioc(dir: u64, type_: u64, nr: u64, size: u64) -> libc::Ioctl {
 	((dir << 30) | (type_ << 8) | nr | (size << 16)) as libc::Ioctl
 }
 const fn ui_set_evbit() -> libc::Ioctl {
-	ioc(1, b'U' as u64, 100, std::mem::size_of::<libc::c_int>() as u64)
+	ioc(1, b'U' as u64, 100, mem::size_of::<libc::c_int>() as u64)
 }
 const fn ui_set_keybit() -> libc::Ioctl {
-	ioc(1, b'U' as u64, 101, std::mem::size_of::<libc::c_int>() as u64)
+	ioc(1, b'U' as u64, 101, mem::size_of::<libc::c_int>() as u64)
 }
 const fn ui_set_relbit() -> libc::Ioctl {
-	ioc(1, b'U' as u64, 102, std::mem::size_of::<libc::c_int>() as u64)
+	ioc(1, b'U' as u64, 102, mem::size_of::<libc::c_int>() as u64)
 }
 const fn ui_dev_create() -> libc::Ioctl {
 	ioc(0, b'U' as u64, 1, 0)
@@ -1230,7 +1235,7 @@ const fn ui_dev_destroy() -> libc::Ioctl {
 	ioc(0, b'U' as u64, 2, 0)
 }
 const fn ui_dev_setup() -> libc::Ioctl {
-	ioc(1, b'U' as u64, 3, std::mem::size_of::<UInputSetup>() as u64)
+	ioc(1, b'U' as u64, 3, mem::size_of::<UInputSetup>() as u64)
 }
 
 fn ioctl_int(fd: libc::c_int, request: libc::Ioctl, value: u16) -> CoreResult<()> {

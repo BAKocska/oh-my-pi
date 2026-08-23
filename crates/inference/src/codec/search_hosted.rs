@@ -5,6 +5,7 @@ use omp_catalog::OperationKind;
 use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
 
+use super::openai_chat;
 use crate::{
 	answer::{AnswerBody, SearchCitation, SearchMetadata, SearchResult, SearchResults},
 	body::BodySource,
@@ -138,7 +139,7 @@ fn encode_hosted(
 	Ok(EncodedRequest::new(
 		OperationKind::Search,
 		RequestMethod::Post,
-		super::openai_chat::join_uri(context.route.endpoint.base_url.as_str(), "/chat/completions"),
+		openai_chat::join_uri(context.route.endpoint.base_url.as_str(), "/chat/completions"),
 		Box::new([
 			RequestHeader { name: sf!("accept"), value: sf!("application/json") },
 			RequestHeader { name: sf!("content-type"), value: sf!("application/json") },

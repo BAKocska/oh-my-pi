@@ -5,10 +5,12 @@
 //!     --run-ignored ignored-only --no-capture --test-threads=1
 
 use std::{
+	env,
 	fmt::Write as _,
 	fs,
 	hint::black_box,
 	path::{Path, PathBuf},
+	process,
 	sync::LazyLock,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -120,8 +122,8 @@ fn unique_temp_root(prefix: &str) -> PathBuf {
 		.duration_since(UNIX_EPOCH)
 		.expect("system time is after UNIX_EPOCH")
 		.as_nanos();
-	let pid = std::process::id();
-	std::env::temp_dir().join(format!("{prefix}-{pid}-{timestamp}"))
+	let pid = process::id();
+	env::temp_dir().join(format!("{prefix}-{pid}-{timestamp}"))
 }
 
 fn create_directory_layout(root: &Path) -> Vec<PathBuf> {

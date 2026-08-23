@@ -35,12 +35,15 @@ use std::{
 	},
 	time::Duration,
 };
+#[cfg(unix)]
+use std::{ffi::OsStr, os::fd};
 
 use im::HashMap;
 use omp_shell_engine::{
 	Error, ExecutionContext, ExecutionResult, ShellExtensions,
 	builtins::{self, Registration},
 	openfiles::{self, OpenFile, OpenFiles},
+	sys::fs,
 };
 use parking_lot::Mutex;
 
@@ -130,7 +133,7 @@ impl Host {
 	/// filesystem: the host process's current directory is unrelated to the
 	/// shell's.
 	pub fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
-		let normalized_path = omp_shell_engine::sys::fs::normalize_shell_path(path.as_ref());
+		let normalized_path = fs::normalize_shell_path(path.as_ref());
 		let path = normalized_path.as_ref();
 		if path.is_absolute() {
 			path.to_path_buf()
@@ -151,7 +154,7 @@ impl Host {
 	/// environment (`env_clear().envs(host.env())`).
 	pub fn env(
 		&self,
-	) -> impl Iterator<Item = (&str, &str)> + ExactSizeIterator + std::iter::FusedIterator {
+	) -> impl Iterator<Item = (&str, &str)> + ExactSizeIterator + iter::FusedIterator {
 		self.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))
 	}
 
@@ -190,7 +193,7 @@ impl Host {
 	}
 
 	/// Writes `<name>: <message>` to stderr and records exit status `code`.
-	pub fn error(&mut self, message: impl std::fmt::Display, code: i32) {
+	pub fn error(&mut self, message: impl Display, code: i32) {
 		let _ = writeln!(self.stderr, "{}: {message}", self.name);
 		self.fail(code);
 	}
@@ -251,16 +254,16 @@ impl Host {
 	/// (`env_clear().envs(host.env())`).
 	pub fn run_captured(
 		&mut self,
-		command: &mut std::process::Command,
-	) -> io::Result<std::process::ExitStatus> {
+		command: &mut process::Command,
+	) -> io::Result<process::ExitStatus> {
 		command
-			.stdin(std::process::Stdio::null())
-			.stdout(std::process::Stdio::piped())
-			.stderr(std::process::Stdio::piped());
+			.stdin(process::Stdio::null())
+			.stdout(process::Stdio::piped())
+			.stderr(process::Stdio::piped());
 		let mut child = command.spawn()?;
 
 		let mut child_err = child.stderr.take();
-		let stderr_thread = std::thread::spawn(move || {
+		let stderr_thread = thread::spawn(move || {
 			let mut buf = Vec::new();
 			if let Some(err) = child_err.as_mut() {
 				let _ = err.read_to_end(&mut buf);
@@ -352,7 +355,7 @@ impl Write for StreamWriter {
 		}
 	}
 
-	fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+	fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> io::Result<()> {
 		match self {
 			Self::Block(writer) => writer.write_fmt(args),
 			Self::Line(writer) => writer.write_fmt(args),
@@ -394,12 +397,12 @@ pub(crate) fn is_regular_file(file: &OpenFile) -> bool {
 /// even when their device and inode match.
 #[cfg(unix)]
 fn same_destination(a: &OpenFile, b: &OpenFile) -> bool {
-	use std::os::unix::fs::MetadataExt;
+	use std::{fs, os::unix::fs::MetadataExt};
 
 	fn identity(file: &OpenFile) -> Option<(u64, u64)> {
 		let fd = file.try_borrow_as_fd().ok()?;
 		let owned = fd.try_clone_to_owned().ok()?;
-		let metadata = std::fs::File::from(owned).metadata().ok()?;
+		let metadata = fs::File::from(owned).metadata().ok()?;
 		if metadata.file_type().is_file() {
 			return None;
 		}
@@ -442,13 +445,13 @@ impl ChildEnv {
 	///
 	/// Stdin and stdout are left untouched for the caller to wire; they default
 	/// to inherited, so a caller that leaves them alone MUST redirect them.
-	pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-		let mut command = std::process::Command::new(program);
+	pub fn command(&self, program: impl AsRef<ffi::OsStr>) -> process::Command {
+		let mut command = process::Command::new(program);
 		command
 			.current_dir(&self.cwd)
 			.env_clear()
 			.envs(self.env.iter().map(|(k, v)| (k, v)))
-			.stderr(std::process::Stdio::piped());
+			.stderr(process::Stdio::piped());
 		command
 	}
 
@@ -459,12 +462,9 @@ impl ChildEnv {
 	/// diagnostic lands before the utility reports its own result. Dropping the
 	/// handle detaches the thread, which is only correct if nothing downstream
 	/// depends on the ordering.
-	pub fn forward_stderr(
-		&self,
-		mut child_stderr: std::process::ChildStderr,
-	) -> std::thread::JoinHandle<()> {
+	pub fn forward_stderr(&self, mut child_stderr: process::ChildStderr) -> thread::JoinHandle<()> {
 		let mut stderr = self.stderr.clone();
-		std::thread::spawn(move || {
+		thread::spawn(move || {
 			let _ = io::copy(&mut child_stderr, &mut stderr);
 		})
 	}
@@ -569,7 +569,7 @@ pub(crate) fn format_usage(usage: &str) -> String {
 /// Unix strings are arbitrary byte sequences, so this is free there. On Windows
 /// only well-formed UTF-16 has a UTF-8 byte view, so an ill-formed value yields
 /// `None`; callers report that as an invalid argument.
-pub(crate) fn os_bytes(value: &std::ffi::OsStr) -> Option<&[u8]> {
+pub(crate) fn os_bytes(value: &ffi::OsStr) -> Option<&[u8]> {
 	#[cfg(unix)]
 	{
 		use std::os::unix::ffi::OsStrExt;
@@ -584,10 +584,10 @@ pub(crate) fn os_bytes(value: &std::ffi::OsStr) -> Option<&[u8]> {
 /// Borrows an `OsStr` as raw bytes, substituting replacement characters for
 /// anything unrepresentable. For diagnostics, where losing a byte beats
 /// failing.
-pub(crate) fn os_bytes_lossy(value: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u8]> {
+pub(crate) fn os_bytes_lossy(value: &ffi::OsStr) -> borrow::Cow<'_, [u8]> {
 	match os_bytes(value) {
-		Some(bytes) => std::borrow::Cow::Borrowed(bytes),
-		None => std::borrow::Cow::Owned(value.to_string_lossy().into_owned().into_bytes()),
+		Some(bytes) => borrow::Cow::Borrowed(bytes),
+		None => borrow::Cow::Owned(value.to_string_lossy().into_owned().into_bytes()),
 	}
 }
 
@@ -743,7 +743,7 @@ async fn run_utility<U: Utility, SE: ShellExtensions>(
 	let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancel_flag));
 	drop(context);
 
-	let mut handle = tokio::task::spawn_blocking(move || {
+	let mut handle = task::spawn_blocking(move || {
 		#[cfg(unix)]
 		let _process_substitution_fds = process_substitution_fds;
 		run_caught::<U>(parsed, &mut host)
@@ -876,7 +876,7 @@ fn or_null(file: Option<OpenFile>) -> Result<OpenFile, Error> {
 
 /// Recognizes brush's process-substitution arguments (`/dev/fd/<shell fd>`).
 #[cfg(unix)]
-fn process_substitution_fd(arg: &std::ffi::OsStr) -> Option<omp_shell_engine::ShellFd> {
+fn process_substitution_fd(arg: &OsStr) -> Option<omp_shell_engine::ShellFd> {
 	arg.to_str()?
 		.strip_prefix("/dev/fd/")?
 		.parse::<omp_shell_engine::ShellFd>()
@@ -893,7 +893,7 @@ fn process_substitution_fd(arg: &std::ffi::OsStr) -> Option<omp_shell_engine::Sh
 fn materialize_process_substitution_fds<SE: ShellExtensions>(
 	context: &ExecutionContext<'_, SE>,
 	argv: &mut [OsString],
-) -> Result<Vec<std::os::fd::OwnedFd>, Error> {
+) -> Result<Vec<fd::OwnedFd>, Error> {
 	use std::os::fd::AsRawFd;
 
 	let mut fds = Vec::new();
@@ -955,11 +955,16 @@ pub(crate) use matches_parser;
 mod testing {
 	//! In-memory [`Host`] construction for unit tests.
 
+	use std::iter;
+	#[cfg(unix)]
+	use std::os::fd;
+
+	use omp_shell_engine::error;
 	use parking_lot::Mutex;
 
 	use super::{
-		Arc, AtomicBool, HashMap, Host, OpenFile, OsString, PathBuf, Read, Stdin, StreamWriter,
-		Utility, Write, io, openfiles, run_caught,
+		Arc, AtomicBool, Error, HashMap, Host, OpenFile, Ordering, OsString, PathBuf, Read, Stdin,
+		StreamWriter, Utility, Write, io, openfiles, run_caught,
 	};
 
 	/// Captured in-memory output from [`Host::for_test`].
@@ -1047,7 +1052,7 @@ mod testing {
 
 		/// Requests cancellation on a test host.
 		pub(crate) fn cancel_for_test(&self) {
-			self.cancel.store(true, super::Ordering::Relaxed);
+			self.cancel.store(true, Ordering::Relaxed);
 		}
 	}
 
@@ -1068,7 +1073,7 @@ mod testing {
 		cwd: impl Into<PathBuf>,
 	) -> (i32, Capture) {
 		let (mut host, capture) = Host::for_test(U::NAME, stdin.as_bytes().to_vec(), cwd);
-		let full: Vec<OsString> = std::iter::once(OsString::from(U::NAME))
+		let full: Vec<OsString> = iter::once(OsString::from(U::NAME))
 			.chain(argv.iter().map(OsString::from))
 			.collect();
 		let full = match U::rewrite_argv(full) {
@@ -1138,17 +1143,21 @@ mod testing {
 		}
 
 		#[cfg(unix)]
-		fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, super::Error> {
-			Err(omp_shell_engine::error::ErrorKind::CannotConvertToNativeFd.into())
+		fn try_clone_to_owned(&self) -> Result<fd::OwnedFd, Error> {
+			Err(error::ErrorKind::CannotConvertToNativeFd.into())
 		}
 
 		#[cfg(unix)]
-		fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, super::Error> {
-			Err(omp_shell_engine::error::ErrorKind::CannotConvertToNativeFd.into())
+		fn try_borrow_as_fd(&self) -> Result<fd::BorrowedFd<'_>, Error> {
+			Err(error::ErrorKind::CannotConvertToNativeFd.into())
 		}
 	}
 
 	mod stdout_policy {
+		use std::fs;
+		#[cfg(unix)]
+		use std::{io, os::fd};
+
 		use super::{Arc, MemStream, Mutex, OpenFile, StreamWriter, Write};
 
 		#[test]
@@ -1172,22 +1181,22 @@ mod testing {
 		fn regular_file_is_block_buffered() {
 			let dir = tempfile::tempdir().unwrap();
 			let path = dir.path().join("out.txt");
-			let file = std::fs::File::create(&path).unwrap();
+			let file = fs::File::create(&path).unwrap();
 			let mut out = StreamWriter::new(OpenFile::File(file));
 			assert!(matches!(out, StreamWriter::Block(_)));
 
 			out.write_all(b"hit\n").unwrap();
-			assert_eq!(std::fs::read(&path).unwrap(), b"");
+			assert_eq!(fs::read(&path).unwrap(), b"");
 
 			out.flush().unwrap();
-			assert_eq!(std::fs::read(&path).unwrap(), b"hit\n");
+			assert_eq!(fs::read(&path).unwrap(), b"hit\n");
 		}
 
 		#[cfg(unix)]
 		#[test]
 		fn pipe_wrapped_as_file_is_line_buffered() {
-			let (reader, writer) = std::io::pipe().unwrap();
-			let file = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
+			let (reader, writer) = io::pipe().unwrap();
+			let file = fs::File::from(fd::OwnedFd::from(writer));
 			assert!(matches!(StreamWriter::new(OpenFile::File(file)), StreamWriter::Line(_)));
 			drop(reader);
 		}
@@ -1213,20 +1222,20 @@ mod testing {
 		fn same_destination_detects_duplicated_pipe_only() {
 			use crate::host::same_destination;
 
-			let (reader, writer) = std::io::pipe().unwrap();
+			let (reader, writer) = io::pipe().unwrap();
 			let duplicate = writer.try_clone().unwrap();
-			let a = OpenFile::File(std::fs::File::from(std::os::fd::OwnedFd::from(writer)));
-			let b = OpenFile::File(std::fs::File::from(std::os::fd::OwnedFd::from(duplicate)));
+			let a = OpenFile::File(fs::File::from(fd::OwnedFd::from(writer)));
+			let b = OpenFile::File(fs::File::from(fd::OwnedFd::from(duplicate)));
 			assert!(same_destination(&a, &b));
 
-			let (other_reader, other_writer) = std::io::pipe().unwrap();
-			let other = OpenFile::File(std::fs::File::from(std::os::fd::OwnedFd::from(other_writer)));
+			let (other_reader, other_writer) = io::pipe().unwrap();
+			let other = OpenFile::File(fs::File::from(fd::OwnedFd::from(other_writer)));
 			assert!(!same_destination(&a, &other));
 
 			let dir = tempfile::tempdir().unwrap();
 			let path = dir.path().join("out.txt");
-			let first = OpenFile::File(std::fs::File::create(&path).unwrap());
-			let second = OpenFile::File(std::fs::File::create(&path).unwrap());
+			let first = OpenFile::File(fs::File::create(&path).unwrap());
+			let second = OpenFile::File(fs::File::create(&path).unwrap());
 			assert!(!same_destination(&first, &second));
 
 			drop((reader, other_reader));
@@ -1234,6 +1243,9 @@ mod testing {
 	}
 }
 
+use std::{borrow, ffi, fmt, fmt::Display, iter, process, thread};
+
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
 pub(crate) use testing::{Capture, run_util};
+use tokio::task;

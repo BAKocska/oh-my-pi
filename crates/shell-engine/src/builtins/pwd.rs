@@ -2,7 +2,7 @@ use std::{borrow::Cow, io::Write, path::Path};
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 /// Display the current working directory.
 #[derive(Parser)]
@@ -17,12 +17,12 @@ pub(crate) struct PwdCommand {
 }
 
 impl builtins::Command for PwdCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let mut cwd: Cow<'_, Path> = context.shell.working_dir().into();
 
 		let should_canonicalize = self.physical

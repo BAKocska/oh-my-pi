@@ -1,7 +1,7 @@
 //! Comprehensive tests for `SparseSet` and `SparseMap` covering edge cases and
 //! untested paths.
 
-use std::num::NonZeroU8;
+use std::{num, num::NonZeroU8};
 
 use omp_core::{
 	sparse_index::{NumericIndexError, TrySparseIndex},
@@ -490,9 +490,7 @@ fn sparse_map_into_parts_from_parts() {
 #[test]
 #[should_panic(expected = "bitmap and values length mismatch")]
 fn sparse_map_from_parts_mismatched() {
-	use smol_bitmap::SmolBitmap;
-
-	let mut bits = SmolBitmap::new();
+	let mut bits = smol_bitmap::SmolBitmap::new();
 	bits.insert(1);
 	bits.insert(2);
 
@@ -818,12 +816,12 @@ fn test_nonzero_u8_from_index_wrap_panics() {
 #[should_panic(expected = "index out of range")]
 fn test_nonzero_i8_from_index_truncation_panics() {
 	// 255 + 1 = 256 truncates to 0 as i8 despite the checked usize add.
-	let _ = std::num::NonZeroI8::from_index(255);
+	let _ = num::NonZeroI8::from_index(255);
 }
 
 #[test]
 fn test_nonzero_i8_from_index_upper_boundary() {
-	let v = std::num::NonZeroI8::from_index(126);
+	let v = num::NonZeroI8::from_index(126);
 	assert_eq!(v.get(), 127);
 	assert_eq!(v.index(), 126);
 }
@@ -832,7 +830,7 @@ fn test_nonzero_i8_from_index_upper_boundary() {
 #[should_panic(expected = "index out of range")]
 fn test_nonzero_usize_from_index_overflow_panics() {
 	// usize::MAX + 1 wraps to 0 in release builds.
-	let _ = std::num::NonZeroUsize::from_index(usize::MAX);
+	let _ = num::NonZeroUsize::from_index(usize::MAX);
 }
 
 #[test]

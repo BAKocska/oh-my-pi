@@ -1,6 +1,6 @@
 //! Exact pi-facing contracts for hashline edit execution and projection.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future, sync::Arc};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -10,7 +10,7 @@ use omp_hashline::{
 };
 use omp_tool::{CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal};
 use omp_tools::edit::{
-	CommitResult, CommittedSection, Conflict, EditAction, EditCommitError, EditDocuments,
+	self, CommitResult, CommittedSection, Conflict, EditAction, EditCommitError, EditDocuments,
 	EditPrepared, EditProposal, Fault, FormatPolicy, NoopResult, PrepareRequest, RejectionReason,
 	tool,
 };
@@ -79,15 +79,15 @@ impl EditDocuments for Fake {
 	) -> impl Future<Output = Result<Self::Prepared, Fault>> + Send + '_ {
 		self.state.lock().prepared.push(request.clone());
 		if let Some(fault) = &self.fault {
-			return std::future::ready(Err(fault.clone()));
+			return future::ready(Err(fault.clone()));
 		}
 		let Some(content) = self.files.get(&request.path).cloned() else {
-			return std::future::ready(Err(Fault {
+			return future::ready(Err(Fault {
 				reason:    RejectionReason::InvalidPatch { message: "file not found".into() },
 				conflicts: Vec::new(),
 			}));
 		};
-		std::future::ready(Ok(Lease {
+		future::ready(Ok(Lease {
 			path:     request.path,
 			revision: "r1".into(),
 			base:     content.clone(),
@@ -136,7 +136,7 @@ impl EditDocuments for Fake {
 			})
 			.collect();
 		self.state.lock().commits.extend(proposals);
-		std::future::ready(Ok(CommitResult { sections }))
+		future::ready(Ok(CommitResult { sections }))
 	}
 }
 
@@ -152,7 +152,7 @@ fn caps(tool: &impl Tool) -> PromptCaps {
 	)
 }
 
-async fn invoke(fake: Fake, input: &str) -> (omp_tools::edit::Payload, Vec<Part>) {
+async fn invoke(fake: Fake, input: &str) -> (edit::Payload, Vec<Part>) {
 	let edit = tool(fake, FormatPolicy::BestEffort);
 	let raw = serde_json::json!({ "input": input }).to_string();
 	let (feed, incoming) = IncomingParams::channel();

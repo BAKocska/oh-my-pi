@@ -1,6 +1,6 @@
 //! Origin-aware text replacement used by the secret transform pipeline.
 
-use std::ops::Range;
+use std::{iter, ops::Range};
 
 /// Origin of bytes in a transformed text buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +43,7 @@ impl TrackedText {
 		self.text.replace_range(range, replacement);
 		self
 			.origin
-			.splice(origin_range, std::iter::repeat_n(origin, replacement.len()));
+			.splice(origin_range, iter::repeat_n(origin, replacement.len()));
 	}
 
 	/// Replaces non-overlapping ranges from right to left.

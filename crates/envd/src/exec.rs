@@ -2,30 +2,37 @@
 
 use std::{
 	collections::{BTreeSet, HashMap, HashSet},
-	fs,
+	env, fs, future,
 	io::{self, Read, Write as _},
-	os::fd::{AsFd as _, AsRawFd as _},
+	net,
+	os::fd::{self, AsFd as _, AsRawFd as _},
 	path::{Path, PathBuf},
-	process::{Command, Stdio},
+	process::{self, Command, Stdio},
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
-	time::{Duration, Instant},
+	thread,
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{Buf as _, Bytes, BytesMut};
+use flume::Receiver;
 use futures::future::try_join_all;
+use nix::errno::Errno;
 use omp_core::{Hash32, Str, sf};
 use omp_proto::{
-	env::v1::{
-		AttachOutput, CloseSessionResponse, EnvironmentDelta, ExecBackendCapabilities,
-		ExecCapabilitiesRequest, ExecControlKind, ExecControlRequest, ExecControlResult,
-		ExecFinalCwd, ExecFinalCwdRequest, ExecOutcome, ExecRequest, ExecStarted, ExecStatusMsg,
-		ExitEvent, GetProcess, OpenSessionRequest, OpenSessionResponse, OutputAttached,
-		OutputChannel, OutputFrame, ProcessCommandAccepted, ProcessInfo, ProcessList, ProcessOutput,
-		ProcessSpec, ProcessStarted, ProcessState, PtySpec, ReadyProbe, RestartPolicy,
-		RestartProcess, StartProcess, ready_probe,
+	env::{
+		v1,
+		v1::{
+			AttachOutput, CloseSessionResponse, EnvironmentDelta, ExecBackendCapabilities,
+			ExecCapabilitiesRequest, ExecControlKind, ExecControlRequest, ExecControlResult,
+			ExecFinalCwd, ExecFinalCwdRequest, ExecOutcome, ExecRequest, ExecStarted, ExecStatusMsg,
+			ExitEvent, GetProcess, OpenSessionRequest, OpenSessionResponse, OutputAttached,
+			OutputChannel, OutputFrame, ProcessCommandAccepted, ProcessInfo, ProcessList,
+			ProcessOutput, ProcessSpec, ProcessStarted, ProcessState, PtySpec, ReadyProbe,
+			RestartPolicy, RestartProcess, StartProcess, ready_probe,
+		},
 	},
 	toolhost::v1::{HostFrame, Ping, WorkerFrame, host_frame, worker_frame},
 };
@@ -34,16 +41,22 @@ use omp_shell_engine::{
 	openfiles::{OpenFile, OpenFiles},
 	processes::{ProcessSignal, signal_process_group},
 };
+use omp_storage::github_cache::GithubCache;
 use parking_lot::Mutex;
 use prost::Message as _;
 use regex::bytes::Regex;
+use tokio::{net::TcpStream, runtime, task, time};
 use url::Url;
 
 use super::{
-	process_identity::ProcessIdentity,
-	process_log::ProcessLog,
+	admission,
+	admission::GithubMutationTarget,
+	process_identity::{IdentityError, ProcessIdentity},
+	process_log,
+	process_log::{LogChunk, ProcessLog},
 	process_store::{
-		DaemonLease, ProcessPhase, ProcessRecord, ProcessStore, ProcessStoreSnapshot, RestartRecord,
+		DaemonLease, LeaseError, ProcessPhase, ProcessRecord, ProcessStore, ProcessStoreSnapshot,
+		RestartRecord, StoreError,
 	},
 };
 
@@ -123,7 +136,7 @@ pub enum ExecError {
 	Readiness(Str),
 	/// An operating-system process primitive failed.
 	#[error("process I/O failed: {0}")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// The target actor has stopped.
 	#[error("exec session has closed")]
 	SessionClosed,
@@ -135,13 +148,13 @@ pub enum ExecError {
 	DetachedPty,
 	/// Durable process metadata could not be committed.
 	#[error(transparent)]
-	ProcessStore(#[from] super::process_store::StoreError),
+	ProcessStore(#[from] StoreError),
 	/// A durable operating-system identity could not be captured.
 	#[error(transparent)]
-	ProcessIdentity(#[from] super::process_identity::IdentityError),
+	ProcessIdentity(#[from] IdentityError),
 	/// Another daemon already owns the durable process namespace.
 	#[error(transparent)]
-	ProcessLease(#[from] super::process_store::LeaseError),
+	ProcessLease(#[from] LeaseError),
 }
 
 /// One ordered event emitted by an execution.
@@ -175,7 +188,7 @@ pub enum ProcessEvent {
 #[must_use]
 pub struct ExecRun {
 	id:      Bytes,
-	events:  flume::Receiver<ExecEvent>,
+	events:  Receiver<ExecEvent>,
 	control: Arc<RunControl>,
 }
 
@@ -220,7 +233,7 @@ pub struct ProcessAttachment {
 	/// Process state captured atomically with the backlog and subscription.
 	pub state:    ProcessInfo,
 	/// Future output and state transitions.
-	pub events:   flume::Receiver<ProcessEvent>,
+	pub events:   Receiver<ProcessEvent>,
 }
 
 /// Host for persistent shell sessions and named processes.
@@ -238,7 +251,7 @@ struct HostInner {
 	processes:     Mutex<HashMap<Str, Arc<NamedProcess>>>,
 	starting:      Mutex<HashSet<Str>>,
 	environment:   Mutex<WorkspaceEnvironment>,
-	github_cache:  Mutex<Option<Arc<omp_storage::github_cache::GithubCache>>>,
+	github_cache:  Mutex<Option<Arc<GithubCache>>>,
 	persistence:   Mutex<Option<ProcessPersistence>>,
 	next_order:    AtomicU64,
 }
@@ -313,7 +326,7 @@ pub struct RestartSupervisor {
 }
 
 impl RestartSupervisor {
-	fn from_spec(spec: Option<&omp_proto::env::v1::RestartSpec>) -> Self {
+	fn from_spec(spec: Option<&v1::RestartSpec>) -> Self {
 		let policy = spec
 			.and_then(|spec| RestartPolicy::try_from(spec.policy).ok())
 			.unwrap_or(RestartPolicy::Never);
@@ -329,7 +342,7 @@ impl RestartSupervisor {
 		}
 	}
 
-	fn recovered(record: &ProcessRecord, spec: Option<&omp_proto::env::v1::RestartSpec>) -> Self {
+	fn recovered(record: &ProcessRecord, spec: Option<&v1::RestartSpec>) -> Self {
 		let mut supervisor = Self::from_spec(spec);
 		supervisor.restart_count = record.restart_count;
 		supervisor.consecutive_failures = record.consecutive_failures;
@@ -393,8 +406,8 @@ struct WorkspaceEnvironment {
 }
 
 enum InputSink {
-	Pipe(std::io::PipeWriter),
-	Pty(std::fs::File),
+	Pipe(io::PipeWriter),
+	Pty(fs::File),
 }
 
 struct SpawnBook {
@@ -408,9 +421,9 @@ struct SessionCommand {
 	timeout:        Option<Duration>,
 	pty:            Option<PtySpec>,
 	control:        Arc<RunControl>,
-	cancel_rx:      flume::Receiver<CancelRequest>,
+	cancel_rx:      Receiver<CancelRequest>,
 	events:         flume::Sender<ExecEvent>,
-	github_targets: Vec<super::admission::GithubMutationTarget>,
+	github_targets: Vec<GithubMutationTarget>,
 }
 
 impl Default for ExecHost {
@@ -464,7 +477,7 @@ impl ExecHost {
 	}
 
 	/// Injects the production GitHub resource cache owned by the Environment.
-	pub fn with_github_cache(self, cache: Arc<omp_storage::github_cache::GithubCache>) -> Self {
+	pub fn with_github_cache(self, cache: Arc<GithubCache>) -> Self {
 		*self.inner.github_cache.lock() = Some(cache);
 		self
 	}
@@ -492,7 +505,7 @@ impl ExecHost {
 				});
 			}
 		}
-		let cwd = cwd_from_uri(&request.cwd_uri)?.map_or_else(std::env::current_dir, Ok)?;
+		let cwd = cwd_from_uri(&request.cwd_uri)?.map_or_else(env::current_dir, Ok)?;
 		let variables = Arc::clone(&self.inner.environment.lock().variables);
 		let mut builder = Shell::builder()
 			.profile(omp_shell_engine::ProfileLoadBehavior::Skip)
@@ -681,13 +694,13 @@ impl ExecHost {
 		let source = request
 			.source
 			.ok_or_else(|| ExecError::Shell(sf!("missing script")))?;
-		let github_targets = super::admission::bash_ir(
+		let github_targets = admission::bash_ir(
 			"shell",
 			&serde_json::json!({ "command": source.text.as_str() }),
 			Path::new("/"),
 			Path::new("/"),
 		)
-		.map_or_else(Vec::new, |bash| super::admission::github_mutation_targets(&bash));
+		.map_or_else(Vec::new, |bash| admission::github_mutation_targets(&bash));
 		let persistent_cd = simple_cd(&source.text);
 		let source = if session.command_prefix.is_empty() {
 			Str::from(source.text)
@@ -761,8 +774,8 @@ impl ExecHost {
 		let control = self.run(exec)?;
 		let input = control.input.lock();
 		let Some(InputSink::Pty(master)) = input.as_ref() else {
-			return Err(ExecError::Io(std::io::Error::new(
-				std::io::ErrorKind::Unsupported,
+			return Err(ExecError::Io(io::Error::new(
+				io::ErrorKind::Unsupported,
 				"execution has no PTY",
 			)));
 		};
@@ -934,7 +947,7 @@ impl ExecHost {
 			.ok_or_else(|| ExecError::Shell(sf!("missing process script")))?
 			.text
 			.clone();
-		let cwd = cwd_from_uri(&spec.cwd_uri)?.map_or_else(std::env::current_dir, Ok)?;
+		let cwd = cwd_from_uri(&spec.cwd_uri)?.map_or_else(env::current_dir, Ok)?;
 		let mut command = detached_command(&source);
 		command
 			.current_dir(cwd)
@@ -958,7 +971,7 @@ impl ExecHost {
 				return Err(error.into());
 			},
 		};
-		tokio::time::sleep(Duration::from_millis(10)).await;
+		time::sleep(Duration::from_millis(10)).await;
 		let identity = match ProcessIdentity::capture(pid) {
 			Ok(identity) if identity.start_generation == initial_identity.start_generation => identity,
 			Ok(_) => {
@@ -966,7 +979,7 @@ impl ExecHost {
 				let _ = child.wait();
 				return Err(ExecError::RunNotFound);
 			},
-			Err(super::process_identity::IdentityError::NotFound { .. }) => initial_identity,
+			Err(IdentityError::NotFound { .. }) => initial_identity,
 			Err(error) => {
 				let _ = signal_process_group(pid as i32, ProcessSignal::Kill);
 				let _ = child.wait();
@@ -1078,7 +1091,7 @@ impl ExecHost {
 			.lock()
 			.as_ref()
 			.map_or_else(
-				|| std::env::temp_dir().join(format!("omp-processes-{}", std::process::id())),
+				|| env::temp_dir().join(format!("omp-processes-{}", process::id())),
 				|persistence| persistence.store.process_root(),
 			)
 			.join(name)
@@ -1403,7 +1416,7 @@ impl ExecHost {
 		let (tx, events) = flume::unbounded();
 		let mut stream = process.stream.lock();
 		let max_bytes = if request.max_bytes == 0 {
-			super::process_log::MAX_LOG_READ_BYTES
+			process_log::MAX_LOG_READ_BYTES
 		} else {
 			request.max_bytes
 		};
@@ -1515,7 +1528,7 @@ impl ExecHost {
 				.info
 				.identity
 				.as_ref()
-				.is_some_and(super::process_identity::ProcessIdentity::verify_wire);
+				.is_some_and(ProcessIdentity::verify_wire);
 			if process.detached && process.persist && verified {
 				summary.spared = summary.spared.saturating_add(1);
 			} else {
@@ -1642,7 +1655,7 @@ impl SpawnObserver for SpawnBook {
 }
 
 impl SpawnBook {
-	fn signal(&self, signal: ProcessSignal) -> Result<(), std::io::Error> {
+	fn signal(&self, signal: ProcessSignal) -> Result<(), io::Error> {
 		for pgid in self.groups.lock().iter().copied() {
 			signal_process_group(pgid, signal)?;
 		}
@@ -1655,13 +1668,14 @@ impl SpawnBook {
 		}
 		let _ = self.signal(ProcessSignal::Terminate);
 		if !grace.is_zero() {
-			tokio::time::sleep(grace).await;
+			time::sleep(grace).await;
 		}
 		let _ = self.signal(ProcessSignal::Kill);
 	}
 }
 
-async fn session_loop(mut shell: Shell, commands: flume::Receiver<SessionCommand>) {
+async fn session_loop(mut shell: Shell, commands: Receiver<SessionCommand>) {
+	use tokio::time::Instant;
 	let mut cancellation_deadline = None;
 	loop {
 		let command = if let Some(deadline) = cancellation_deadline {
@@ -1670,7 +1684,7 @@ async fn session_loop(mut shell: Shell, commands: flume::Receiver<SessionCommand
 						 Ok(command) => command,
 						 Err(_) => break,
 				  },
-				  () = tokio::time::sleep_until(deadline) => {
+				  () = time::sleep_until(deadline) => {
 						 cancellation_deadline = None;
 						 continue;
 				  },
@@ -1683,7 +1697,7 @@ async fn session_loop(mut shell: Shell, commands: flume::Receiver<SessionCommand
 		};
 
 		if let Some(deadline) = cancellation_deadline {
-			match tokio::time::timeout_at(deadline, command.cancel_rx.recv_async()).await {
+			match time::timeout_at(deadline, command.cancel_rx.recv_async()).await {
 				Ok(Ok(_) | Err(_)) => {
 					finish_session_command(
 						&command,
@@ -1691,14 +1705,14 @@ async fn session_loop(mut shell: Shell, commands: flume::Receiver<SessionCommand
 						Duration::ZERO,
 						shell.working_dir(),
 					);
-					cancellation_deadline = Some(tokio::time::Instant::now() + CANCEL_GRACE);
+					cancellation_deadline = Some(Instant::now() + CANCEL_GRACE);
 					continue;
 				},
 				Err(_) => cancellation_deadline = None,
 			}
 		}
 		if run_session_command(&mut shell, command).await {
-			cancellation_deadline = Some(tokio::time::Instant::now() + CANCEL_GRACE);
+			cancellation_deadline = Some(Instant::now() + CANCEL_GRACE);
 		}
 	}
 }
@@ -1742,8 +1756,8 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 	let result = {
 		let timeout = async {
 			match command.timeout {
-				Some(timeout) => tokio::time::sleep(timeout).await,
-				None => std::future::pending().await,
+				Some(timeout) => time::sleep(timeout).await,
+				None => future::pending().await,
 			}
 		};
 		tokio::pin!(timeout);
@@ -1779,7 +1793,7 @@ fn finish_session_command(
 	command: &SessionCommand,
 	result: RunTerminal,
 	elapsed: Duration,
-	working_dir: &std::path::Path,
+	working_dir: &Path,
 ) {
 	let retained = command.control.retained.lock();
 	command.control.finished.store(true, Ordering::Release);
@@ -1880,7 +1894,7 @@ fn setup_io(
 	control: Arc<RunControl>,
 	exec: Bytes,
 	events: flume::Sender<ExecEvent>,
-) -> Result<(ExecutionParameters, Vec<tokio::task::JoinHandle<()>>), ExecError> {
+) -> Result<(ExecutionParameters, Vec<task::JoinHandle<()>>), ExecError> {
 	let mut params = ExecutionParameters::default();
 	let sequencer =
 		Arc::new(Mutex::new(OutputSequencer { next: 1, events, control: control.clone() }));
@@ -1895,27 +1909,26 @@ fn setup_io(
 		#[cfg(target_os = "macos")]
 		// SAFETY: fcntl on an owned, open descriptor with no memory arguments.
 		unsafe {
-			libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&opened.master), 73, 1);
+			libc::fcntl(fd::AsRawFd::as_raw_fd(&opened.master), 73, 1);
 		}
 		let master_read = opened.master.as_fd().try_clone_to_owned()?;
-		let master_write = std::fs::File::from(opened.master);
-		let slave = std::fs::File::from(opened.slave);
+		let master_write = fs::File::from(opened.master);
+		let slave = fs::File::from(opened.slave);
 		params.set_fd(OpenFiles::STDIN_FD, OpenFile::from(slave.try_clone()?));
 		params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(slave.try_clone()?));
 		params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(slave));
 		*control.input.lock() = Some(InputSink::Pty(master_write));
-		let reader =
-			spawn_reader(std::fs::File::from(master_read), OutputChannel::Pty, exec, sequencer);
+		let reader = spawn_reader(fs::File::from(master_read), OutputChannel::Pty, exec, sequencer);
 		Ok((params, vec![reader]))
 	} else {
-		let (stdin_read, stdin_write) = std::io::pipe()?;
-		let (stdout_read, stdout_write) = std::io::pipe()?;
-		let (stderr_read, stderr_write) = std::io::pipe()?;
+		let (stdin_read, stdin_write) = io::pipe()?;
+		let (stdout_read, stdout_write) = io::pipe()?;
+		let (stderr_read, stderr_write) = io::pipe()?;
 		#[cfg(target_os = "macos")]
 		for fd in [
-			std::os::fd::AsRawFd::as_raw_fd(&stdin_write),
-			std::os::fd::AsRawFd::as_raw_fd(&stdout_write),
-			std::os::fd::AsRawFd::as_raw_fd(&stderr_write),
+			fd::AsRawFd::as_raw_fd(&stdin_write),
+			fd::AsRawFd::as_raw_fd(&stdout_write),
+			fd::AsRawFd::as_raw_fd(&stderr_write),
 		] {
 			// `F_SETNOSIGPIPE` (73, absent from `libc`): writes into a closed pipe
 			// surface as `EPIPE` instead of raising `SIGPIPE`. The in-process shell
@@ -1948,8 +1961,8 @@ fn spawn_reader<R: Read + Send + 'static>(
 	channel: OutputChannel,
 	exec: Bytes,
 	sequencer: Arc<Mutex<OutputSequencer>>,
-) -> tokio::task::JoinHandle<()> {
-	tokio::task::spawn_blocking(move || {
+) -> task::JoinHandle<()> {
+	task::spawn_blocking(move || {
 		let mut buffer = vec![0_u8; OUTPUT_CHUNK_BYTES];
 		loop {
 			let read = match read_chunk(&mut reader, &mut buffer) {
@@ -2015,17 +2028,17 @@ async fn resume_recovered_readiness(process: Arc<NamedProcess>) {
 
 fn spawn_detached_monitor(
 	process: Arc<NamedProcess>,
-	mut child: Option<std::process::Child>,
-	cancel_rx: flume::Receiver<CancelRequest>,
+	mut child: Option<process::Child>,
+	cancel_rx: Receiver<CancelRequest>,
 ) {
-	let runtime = tokio::runtime::Handle::current();
-	tokio::task::spawn_blocking(move || {
+	let runtime = runtime::Handle::current();
+	task::spawn_blocking(move || {
 		let mut cancelled = false;
 		let exit_code = loop {
 			if let Ok(cancel) = cancel_rx.try_recv() {
 				cancelled = true;
 				let _ = process.control.spawns.signal(ProcessSignal::Terminate);
-				std::thread::sleep(cancel.grace);
+				thread::sleep(cancel.grace);
 				if process.identity.verify().unwrap_or(false) {
 					let _ = process.control.spawns.signal(ProcessSignal::Kill);
 				}
@@ -2048,7 +2061,7 @@ fn spawn_detached_monitor(
 			if let Some(code) = status {
 				break code;
 			}
-			std::thread::sleep(Duration::from_millis(100));
+			thread::sleep(Duration::from_millis(100));
 		};
 		process.control.finished.store(true, Ordering::Release);
 		runtime.spawn(async move {
@@ -2120,7 +2133,7 @@ fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, canc
 	let generation = process.generation.saturating_add(1);
 	let detached = process.detached;
 	tokio::spawn(async move {
-		tokio::time::sleep(delay).await;
+		time::sleep(delay).await;
 		if process.stopping.load(Ordering::Acquire) {
 			return;
 		}
@@ -2146,10 +2159,10 @@ fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, canc
 async fn wait_process_finished(process: &NamedProcess) -> Result<(), ExecError> {
 	let wait = async {
 		while !process.control.finished.load(Ordering::Acquire) {
-			tokio::time::sleep(Duration::from_millis(25)).await;
+			time::sleep(Duration::from_millis(25)).await;
 		}
 	};
-	tokio::time::timeout(CANCEL_GRACE.saturating_add(Duration::from_secs(5)), wait)
+	time::timeout(CANCEL_GRACE.saturating_add(Duration::from_secs(5)), wait)
 		.await
 		.map_err(|_| {
 			ExecError::Io(io::Error::new(
@@ -2159,7 +2172,7 @@ async fn wait_process_finished(process: &NamedProcess) -> Result<(), ExecError> 
 		})
 }
 
-fn route_log_chunk(process: &NamedProcess, chunk: super::process_log::LogChunk) {
+fn route_log_chunk(process: &NamedProcess, chunk: LogChunk) {
 	if chunk.data.is_empty() {
 		return;
 	}
@@ -2190,7 +2203,7 @@ fn trim_history(history: &mut Vec<ProcessOutput>) {
 		.map(|output| output.data.len())
 		.sum::<usize>();
 	let mut remove = 0;
-	while bytes > super::process_log::MAX_LOG_READ_BYTES as usize && remove < history.len() {
+	while bytes > process_log::MAX_LOG_READ_BYTES as usize && remove < history.len() {
 		bytes = bytes.saturating_sub(history[remove].data.len());
 		remove += 1;
 	}
@@ -2275,8 +2288,8 @@ fn configure_detached_group(command: &mut Command) {
 }
 
 fn unix_time_ms() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::SystemTime::UNIX_EPOCH)
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_millis()
 		.try_into()
@@ -2320,7 +2333,7 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 				}
 				Err(ExecError::Readiness(sf!("process output closed before its log probe passed",)))
 			};
-			tokio::time::timeout(timeout, wait)
+			time::timeout(timeout, wait)
 				.await
 				.map_err(|_| ExecError::Readiness(sf!("log probe timed out")))?
 		},
@@ -2334,17 +2347,14 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 							"process exited before its TCP probe passed",
 						)));
 					}
-					if tokio::net::TcpStream::connect((tcp.host.as_str(), port))
-						.await
-						.is_ok()
-					{
+					if TcpStream::connect((tcp.host.as_str(), port)).await.is_ok() {
 						record_tcp_ready(&process, &tcp.host, tcp.port);
 						return Ok(());
 					}
-					tokio::time::sleep(Duration::from_millis(50)).await;
+					time::sleep(Duration::from_millis(50)).await;
 				}
 			};
-			tokio::time::timeout(timeout, wait)
+			time::timeout(timeout, wait)
 				.await
 				.map_err(|_| ExecError::Readiness(sf!("TCP probe timed out")))?
 		},
@@ -2383,7 +2393,7 @@ async fn wait_ready_probe(process: Arc<NamedProcess>, probe: ReadyProbe) -> Resu
 				}
 				Err(ExecError::Readiness(sf!("process output closed before its Ping probe passed",)))
 			};
-			tokio::time::timeout(timeout, wait)
+			time::timeout(timeout, wait)
 				.await
 				.map_err(|_| ExecError::Readiness(sf!("Ping probe timed out")))?
 		},
@@ -2420,7 +2430,7 @@ fn clear_ready_pending(process: &NamedProcess, condition: &str) {
 fn record_tcp_ready(process: &NamedProcess, host: &str, port: u32) {
 	let loopback = host.eq_ignore_ascii_case("localhost")
 		|| host
-			.parse::<std::net::IpAddr>()
+			.parse::<net::IpAddr>()
 			.is_ok_and(|address| address.is_loopback());
 	let endpoint = loopback.then(|| {
 		let authority = if host.contains(':') && !host.starts_with('[') {
@@ -2442,7 +2452,7 @@ fn record_tcp_ready(process: &NamedProcess, host: &str, port: u32) {
 	stream.broadcast(ProcessEvent::State(info));
 }
 
-fn readiness_events(process: &NamedProcess) -> (Vec<ProcessOutput>, flume::Receiver<ProcessEvent>) {
+fn readiness_events(process: &NamedProcess) -> (Vec<ProcessOutput>, Receiver<ProcessEvent>) {
 	let (sender, receiver) = flume::unbounded();
 	let mut stream = process.stream.lock();
 	let backlog = stream.history.clone();
@@ -2587,7 +2597,7 @@ fn apply_env_delta(
 }
 
 fn read_workspace_environment() -> WorkspaceEnvironment {
-	let mut variables: Vec<_> = std::env::vars_os()
+	let mut variables: Vec<_> = env::vars_os()
 		.filter_map(|(name, value)| {
 			Some((Str::from(name.into_string().ok()?), Str::from(value.into_string().ok()?)))
 		})
@@ -2609,7 +2619,7 @@ fn read_workspace_environment() -> WorkspaceEnvironment {
 }
 
 fn github_repository(cwd: &Path) -> Option<Str> {
-	if let Ok(repo) = std::env::var("GH_REPO")
+	if let Ok(repo) = env::var("GH_REPO")
 		&& let Some(repo) = github_repo_from_remote(&repo)
 	{
 		return Some(repo);
@@ -2706,7 +2716,7 @@ fn cwd_from_uri(uri: &str) -> Result<Option<PathBuf>, ExecError> {
 	if !uri.contains("://") {
 		return Ok(Some(PathBuf::from(uri)));
 	}
-	let parsed = url::Url::parse(uri).map_err(|_| ExecError::InvalidCwd(Str::from(uri)))?;
+	let parsed = Url::parse(uri).map_err(|_| ExecError::InvalidCwd(Str::from(uri)))?;
 	parsed
 		.to_file_path()
 		.map(Some)
@@ -2731,7 +2741,7 @@ fn parse_signal(name: &str) -> Result<ProcessSignal, ExecError> {
 	}
 }
 
-fn resize_fd(fd: std::os::fd::BorrowedFd<'_>, rows: u32, columns: u32) -> Result<(), ExecError> {
+fn resize_fd(fd: fd::BorrowedFd<'_>, rows: u32, columns: u32) -> Result<(), ExecError> {
 	let winsize = libc::winsize {
 		ws_row:    clamp_u16(rows),
 		ws_col:    clamp_u16(columns),
@@ -2741,7 +2751,7 @@ fn resize_fd(fd: std::os::fd::BorrowedFd<'_>, rows: u32, columns: u32) -> Result
 	// SAFETY: fd is a live PTY master and the pointer references a valid winsize.
 	let result = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
 	if result == -1 {
-		return Err(ExecError::Io(std::io::Error::last_os_error()));
+		return Err(ExecError::Io(io::Error::last_os_error()));
 	}
 	Ok(())
 }
@@ -2754,8 +2764,8 @@ fn shell_error(error: omp_shell_engine::Error) -> ExecError {
 	ExecError::Shell(Str::from(error.to_string()))
 }
 
-fn errno_io(error: nix::errno::Errno) -> ExecError {
-	ExecError::Io(std::io::Error::from_raw_os_error(error as i32))
+fn errno_io(error: Errno) -> ExecError {
+	ExecError::Io(io::Error::from_raw_os_error(error as i32))
 }
 
 #[cfg(test)]
@@ -2784,12 +2794,12 @@ mod tests {
 	async fn exec_session_reports_capabilities_and_revision_fenced_final_cwd() {
 		let root = tempfile::tempdir().unwrap();
 		let nested = root.path().join("nested");
-		std::fs::create_dir(&nested).unwrap();
+		fs::create_dir(&nested).unwrap();
 		let host = ExecHost::new();
 		let opened = host
 			.open_session(OpenSessionRequest {
 				cwd_uri: Url::from_directory_path(root.path()).unwrap().to_string(),
-				shell_profile: Some(omp_proto::env::v1::ShellProfileInput {
+				shell_profile: Some(v1::ShellProfileInput {
 					profile: String::from("brush"),
 					wire_revision: omp_proto::SCHEMA_REV,
 					..Default::default()
@@ -2818,10 +2828,7 @@ mod tests {
 			.exec(
 				ExecRequest {
 					session: opened.session,
-					source: Some(omp_proto::env::v1::Script {
-						text: String::from("cd nested"),
-						..Default::default()
-					}),
+					source: Some(v1::Script { text: String::from("cd nested"), ..Default::default() }),
 					..Default::default()
 				},
 				None,

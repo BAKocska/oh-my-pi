@@ -5,7 +5,7 @@
 //! [`omp_env::project_state`].
 
 use std::{
-	io,
+	fs, io,
 	path::{Path, PathBuf},
 };
 
@@ -28,7 +28,7 @@ pub enum RelocateError {
 		destination_path: PathBuf,
 		/// Underlying filesystem failure.
 		#[source]
-		source:           std::io::Error,
+		source:           io::Error,
 	},
 }
 
@@ -70,11 +70,11 @@ impl TerminalBreadcrumbs {
 	/// Fails when the private directory cannot be created or restricted.
 	pub fn new(data_dir: &Path) -> Result<Self, SessionResolveError> {
 		let directory = data_dir.join("terminals");
-		std::fs::create_dir_all(&directory)?;
+		fs::create_dir_all(&directory)?;
 		#[cfg(unix)]
 		{
 			use std::os::unix::fs::PermissionsExt as _;
-			std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+			fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
 		}
 		Ok(Self { directory })
 	}
@@ -103,7 +103,7 @@ impl TerminalBreadcrumbs {
 	///
 	/// Fails when the breadcrumb exists but cannot be read.
 	pub fn read(&self, terminal: &str) -> Result<Option<SessionId>, SessionResolveError> {
-		match std::fs::read_to_string(self.path(terminal)) {
+		match fs::read_to_string(self.path(terminal)) {
 			Ok(value) => Ok(Some(SessionId(Str::from(value.trim())))),
 			Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
 			Err(error) => Err(error.into()),
@@ -171,13 +171,13 @@ pub fn relocate_journal(source: &Path, destination: &Path) -> Result<bool, Reloc
 		return Err(RelocateError::DestinationExists(destination.to_owned()));
 	}
 	if let Some(parent) = destination.parent() {
-		std::fs::create_dir_all(parent).map_err(|source_error| RelocateError::Io {
+		fs::create_dir_all(parent).map_err(|source_error| RelocateError::Io {
 			source_path:      source.to_owned(),
 			destination_path: destination.to_owned(),
 			source:           source_error,
 		})?;
 	}
-	std::fs::rename(source, destination).map_err(|source_error| RelocateError::Io {
+	fs::rename(source, destination).map_err(|source_error| RelocateError::Io {
 		source_path:      source.to_owned(),
 		destination_path: destination.to_owned(),
 		source:           source_error,

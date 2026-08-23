@@ -1,7 +1,12 @@
 //! Exact catalog selection, immutable overlays, aliases, fallback chains, and
 //! constraints.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+	collections::BTreeMap,
+	error::Error,
+	fmt::{self, Display},
+	iter,
+};
 
 use globset::GlobBuilder;
 use omp_core::{IntoStr, Str};
@@ -9,13 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	AuthSpecId, Availability, CatalogAlias, CatalogRevision, ClassId, CodecId, ContextStrategy,
-	EmbeddingFormatBits, EvidenceConfidence, GrammarBits, HostedToolBits, ModalityBits,
-	ModelAvailability, ModelCapabilities, ModelKey, ModelLimits, ModelRemoteCompaction, ModelSpec,
-	OperationKind, OverlaySource, OverlayStack, PolicyModel, PremiumMultiplier, Pricing,
-	ProvenanceKind, ProvenanceSource, ProviderDef, ProviderId, ReasoningFeatureBits, RoleBits,
-	RouteDef, RouteId, RouteRestrictions, SamplingControlBits, StructuredOutputBits,
-	TextVerbosityBits, ThinkingPolicyId, ThinkingRouting, ToolFeatureBits, TransportKind,
-	TrustDomain, WireModelId, WirePolicyId,
+	DiscoverySpecId, EmbeddingFormatBits, EndpointSpec, EvidenceConfidence, GrammarBits,
+	HeaderProfileId, HostedToolBits, ModalityBits, ModelAvailability, ModelCapabilities, ModelKey,
+	ModelLimits, ModelRemoteCompaction, ModelSpec, OperationKind, OverlaySource, OverlayStack,
+	PolicyModel, PremiumMultiplier, Pricing, ProvenanceKind, ProvenanceSource, ProviderDef,
+	ProviderId, ReasoningFeatureBits, RoleBits, RouteDef, RouteId, RouteRestrictions,
+	SamplingControlBits, StructuredOutputBits, TextVerbosityBits, ThinkingPolicyId, ThinkingRouting,
+	ToolFeatureBits, TransportKind, TrustDomain, WireModelId, WirePolicyId,
 };
 
 /// An exact provider and normalized-model selector.
@@ -80,7 +85,7 @@ impl FallbackChain {
 	/// Returns an iterator yielding the primary selector followed by any
 	/// fallbacks.
 	pub fn iter(&self) -> impl DoubleEndedIterator<Item = &ModelSelector> + '_ {
-		std::iter::once(&self.primary).chain(self.fallbacks.iter())
+		iter::once(&self.primary).chain(self.fallbacks.iter())
 	}
 }
 
@@ -282,13 +287,13 @@ pub struct RoutePatch {
 	/// Replacement transport.
 	pub transport:            Option<TransportKind>,
 	/// Replacement endpoint.
-	pub endpoint:             Option<crate::EndpointSpec>,
+	pub endpoint:             Option<EndpointSpec>,
 	/// Replacement authentication specification.
 	pub auth:                 Option<AuthSpecId>,
 	/// Replacement header profile.
-	pub headers:              Option<crate::HeaderProfileId>,
+	pub headers:              Option<HeaderProfileId>,
 	/// `Some(None)` explicitly disables discovery.
-	pub discovery:            Option<Option<crate::DiscoverySpecId>>,
+	pub discovery:            Option<Option<DiscoverySpecId>>,
 	/// Whether strict tool schemas are disabled on this route.
 	pub disable_strict_tools: Option<bool>,
 	/// Replacement route restrictions.
@@ -466,7 +471,7 @@ pub enum ResolveError {
 	FallbacksExhausted(Box<[Self]>),
 }
 
-impl fmt::Display for ResolveError {
+impl Display for ResolveError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "catalog resolution failed: {self:?}")
 	}
@@ -1225,8 +1230,9 @@ pub fn bundled_source(origin: impl IntoStr, revision: Option<CatalogRevision>) -
 mod tests {
 	use super::*;
 	use crate::{
-		CodexTransportPreference, EndpointSpec, HeaderProfileId, ManagementCapabilities,
-		ModelProvenance, RedirectTrust, RegistryMapping, StructuredOutputBits, TransportKind,
+		ChatCapabilities, CodecProfile, CodexTransportPreference, EndpointSpec, HeaderProfileId,
+		ManagementCapabilities, ModelProvenance, OperationBits, RedirectTrust, RegistryMapping,
+		StructuredOutputBits, TransportKind,
 	};
 
 	fn source(kind: ProvenanceKind, origin: &str) -> ProvenanceSource {
@@ -1245,7 +1251,7 @@ mod tests {
 			name:               id.into_str(),
 			auth:               Box::new([AuthSpecId::from("auth")]),
 			management:         ManagementCapabilities {
-				operations:        crate::OperationBits::empty(),
+				operations:        OperationBits::empty(),
 				multiple_accounts: false,
 				refresh:           false,
 				principal_quota:   false,
@@ -1266,7 +1272,7 @@ mod tests {
 			id:                 id.into(),
 			provider:           provider.into(),
 			codec:              CodecId::from("codec"),
-			codec_profile:      crate::CodecProfile::default(),
+			codec_profile:      CodecProfile::default(),
 			transport:          TransportKind::Http,
 			endpoint:           EndpointSpec {
 				base_url: format!("https://{id}.test").into(),
@@ -1288,10 +1294,10 @@ mod tests {
 	}
 
 	fn model(key: &str, route_ids: &[&str], chat: bool) -> ModelSpec {
-		let mut operations = crate::OperationBits::empty();
+		let mut operations = OperationBits::empty();
 		let chat_capabilities = chat.then(|| {
 			operations.insert_kind(OperationKind::Chat);
-			crate::ChatCapabilities {
+			ChatCapabilities {
 				roles:             Availability::Native(RoleBits::SYSTEM | RoleBits::DEVELOPER),
 				mid_session_roles: Availability::Unknown,
 				tools:             Availability::Unknown,

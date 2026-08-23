@@ -3,7 +3,7 @@
 use std::{
 	borrow::Cow,
 	ffi::OsString,
-	fmt::{Display, Write},
+	fmt::{self, Display, Write},
 };
 
 use im::OrdMap;
@@ -618,7 +618,7 @@ pub enum ShellValueLiteral {
 }
 
 impl ShellValueLiteral {
-	pub(crate) fn fmt_for_tracing(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	pub(crate) fn fmt_for_tracing(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Scalar(s) => Self::fmt_scalar_for_tracing(s.as_str(), f),
 			Self::Array(elements) => {
@@ -639,14 +639,14 @@ impl ShellValueLiteral {
 		}
 	}
 
-	fn fmt_scalar_for_tracing(s: &str, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt_scalar_for_tracing(s: &str, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let processed = escape::quote_if_needed(s, escape::QuoteMode::SingleQuote);
 		write!(f, "{processed}")
 	}
 }
 
 impl Display for ShellValueLiteral {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		self.fmt_for_tracing(f)
 	}
 }

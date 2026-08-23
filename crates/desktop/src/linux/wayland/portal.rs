@@ -1,5 +1,5 @@
 use std::{
-	fs,
+	env, fs,
 	path::{Path, PathBuf},
 };
 
@@ -11,9 +11,9 @@ const ORPHANED_REMOTE_DESKTOP_TOKEN: &str = "remote-desktop-token";
 /// Resolves the `omp` state directory (`$XDG_STATE_HOME/omp` or
 /// `~/.local/state/omp`) that holds portal tokens.
 fn omp_state_dir() -> Option<PathBuf> {
-	let base = std::env::var_os("XDG_STATE_HOME")
+	let base = env::var_os("XDG_STATE_HOME")
 		.map(PathBuf::from)
-		.or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
+		.or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
 	Some(base.join("omp"))
 }
 
@@ -64,7 +64,7 @@ mod tests {
 	/// removed, and a second removal on the now-missing file must stay a no-op.
 	#[test]
 	fn removes_orphaned_remote_desktop_token() {
-		let dir = std::env::temp_dir().join(format!("omp-token-test-{}", std::process::id()));
+		let dir = env::temp_dir().join(format!("omp-token-test-{}", std::process::id()));
 		fs::create_dir_all(&dir).expect("create token test dir");
 		let token = dir.join(ORPHANED_REMOTE_DESKTOP_TOKEN);
 		fs::write(&token, "cafef00d").expect("plant orphaned token");

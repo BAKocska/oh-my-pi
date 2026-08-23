@@ -1,19 +1,21 @@
 //! Runtime-facing typed settings subscriptions.
 
-use std::sync::Arc;
+use std::{marker, sync::Arc};
 
-use crate::{SettingsDomain, Subscription, TypedProjection, manager::SettingsManager};
+use crate::{
+	SettingsDomain, SnapshotError, Subscription, TypedProjection, manager::SettingsManager,
+};
 
 /// Typed revision stream installed into one owning runtime.
 pub struct DomainSubscription<D> {
 	inner:   Subscription,
-	_marker: std::marker::PhantomData<fn() -> D>,
+	_marker: marker::PhantomData<fn() -> D>,
 }
 
 impl<D: SettingsDomain> DomainSubscription<D> {
 	/// Subscribes to `D` without introducing settings reads in the runtime loop.
 	pub fn new(manager: &SettingsManager) -> Self {
-		Self { inner: manager.subscribe::<D>(), _marker: std::marker::PhantomData }
+		Self { inner: manager.subscribe::<D>(), _marker: marker::PhantomData }
 	}
 
 	/// Waits for and projects the next revision synchronously.
@@ -45,5 +47,5 @@ pub enum DomainSubscriptionError {
 	Closed(#[from] flume::RecvError),
 	/// The new snapshot did not decode as the owning domain.
 	#[error(transparent)]
-	Projection(#[from] crate::SnapshotError),
+	Projection(#[from] SnapshotError),
 }

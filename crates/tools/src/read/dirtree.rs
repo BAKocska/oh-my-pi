@@ -6,6 +6,7 @@
 use std::{
 	collections::{HashMap, HashSet},
 	fmt::Write as _,
+	iter,
 	time::{Duration, UNIX_EPOCH},
 };
 
@@ -414,10 +415,10 @@ fn format_lines(rows: &[RenderedLine]) -> String {
 			continue;
 		};
 		output.push_str(&row.label);
-		output.extend(std::iter::repeat_n(' ', max_label_len - xutf::width_str(&row.label) + 2));
+		output.extend(iter::repeat_n(' ', max_label_len - xutf::width_str(&row.label) + 2));
 		let size = row.size.as_deref().unwrap_or("");
 		output.push_str(size);
-		output.extend(std::iter::repeat_n(' ', 8usize.saturating_sub(size.len())));
+		output.extend(iter::repeat_n(' ', 8usize.saturating_sub(size.len())));
 		output.push_str("  ");
 		output.push_str(age);
 	}

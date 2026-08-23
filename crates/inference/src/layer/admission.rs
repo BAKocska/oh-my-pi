@@ -2,6 +2,7 @@
 //! backpressure.
 
 use std::{
+	pin,
 	sync::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
@@ -9,6 +10,7 @@ use std::{
 	task::{Context, Poll, Waker},
 };
 
+use parking_lot::Mutex;
 use tower::{Layer, Service};
 
 use crate::{
@@ -25,7 +27,7 @@ struct AdmissionState {
 	queue_limit: usize,
 	active:      AtomicUsize,
 	waiting:     AtomicUsize,
-	wakers:      parking_lot::Mutex<Vec<Waker>>,
+	wakers:      Mutex<Vec<Waker>>,
 }
 impl AdmissionController {
 	/// Creates a controller with nonzero concurrency and a bounded waiter count.
@@ -36,7 +38,7 @@ impl AdmissionController {
 			queue_limit,
 			active: AtomicUsize::new(0),
 			waiting: AtomicUsize::new(0),
-			wakers: parking_lot::Mutex::new(Vec::new()),
+			wakers: Mutex::new(Vec::new()),
 		}))
 	}
 
@@ -182,7 +184,7 @@ where
 {
 	type Output = Result<T, Error>;
 
-	fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+	fn poll(self: pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		self.project().inner.poll(cx)
 	}
 }

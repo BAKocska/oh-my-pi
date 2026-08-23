@@ -9,13 +9,18 @@ use std::{
 use omp_core::Str;
 use omp_settings::io::atomic_replace;
 use serde::{Deserialize, Serialize};
+use toml::{de, ser};
+
+use super::{KeyPlatform, fallback_chords};
 
 /// A named keybinding profile with action-to-chord mappings.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct KeybindingProfile {
-	/// Optional parent profile.
+	/// `profiles.<name>.extends` accepts a profile name; omission means no
+	/// inheritance.
 	pub extends:  Option<Str>,
-	/// Canonical action ids and their ordered chords.
+	/// `profiles.<name>.bindings` maps canonical action ids to ordered
+	/// `modifier+key` arrays; omission uses platform defaults.
 	#[serde(default)]
 	pub bindings: BTreeMap<Str, Vec<Str>>,
 }
@@ -23,9 +28,11 @@ pub struct KeybindingProfile {
 /// Canonical `keybindings.toml` document.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct KeybindingsConfig {
-	/// Selected named profile.
+	/// `active` accepts a profile name; omission leaves profile selection to the
+	/// caller.
 	pub active:   Option<Str>,
-	/// Named profiles.
+	/// `profiles` maps profile names to binding tables and defaults to an empty
+	/// map.
 	#[serde(default)]
 	pub profiles: BTreeMap<Str, KeybindingProfile>,
 }
@@ -73,7 +80,7 @@ impl ResolvedKeybindings {
 	pub fn chords_for<'a>(
 		&'a self,
 		action: &'a str,
-		platform: super::KeyPlatform,
+		platform: KeyPlatform,
 	) -> impl Iterator<Item = &'a str> + Clone {
 		let configured = self
 			.bindings
@@ -81,7 +88,7 @@ impl ResolvedKeybindings {
 			.map(Vec::as_slice)
 			.unwrap_or_default();
 		let fallback = if configured.is_empty() {
-			super::fallback_chords(action, platform)
+			fallback_chords(action, platform)
 		} else {
 			&[]
 		};
@@ -435,22 +442,28 @@ pub enum KeybindingsConfigError {
 	/// Reading a source failed.
 	#[error("failed to read keybindings source {path}")]
 	Read {
+		/// Source path whose bytes could not be read.
 		path:   PathBuf,
 		#[source]
+		/// Filesystem error returned while reading the source.
 		source: io::Error,
 	},
 	/// Canonical TOML was malformed.
 	#[error("failed to parse native keybindings TOML {path}")]
 	Toml {
+		/// Native `keybindings.toml` path containing invalid TOML.
 		path:   PathBuf,
 		#[source]
-		source: toml::de::Error,
+		/// TOML decoder error identifying the malformed input.
+		source: de::Error,
 	},
 	/// Legacy YAML was malformed.
 	#[error("failed to parse legacy keybindings YAML {path}")]
 	Yaml {
+		/// Legacy YAML path rejected during one-time import.
 		path:   PathBuf,
 		#[source]
+		/// YAML decoder error identifying the malformed input.
 		source: serde_yaml::Error,
 	},
 	/// Legacy JSON/JSONC was malformed.
@@ -458,16 +471,19 @@ pub enum KeybindingsConfigError {
 	Json(#[from] omp_slopjson::ParseError),
 	/// Native TOML encoding failed.
 	#[error(transparent)]
-	Encode(#[from] toml::ser::Error),
+	Encode(#[from] ser::Error),
 	/// Atomic persistence failed.
 	#[error(transparent)]
 	Persist(#[from] omp_settings::io::SettingsIoError),
 	/// A legacy source backup failed.
 	#[error("failed to back up keybindings source {path} to {backup}")]
 	Backup {
+		/// Legacy source retained after successful native conversion.
 		path:   PathBuf,
+		/// `.pre-omp-migration.bak` destination that could not be written.
 		backup: PathBuf,
 		#[source]
+		/// Filesystem error returned while copying the source.
 		source: io::Error,
 	},
 	/// No profile was explicitly requested or selected.
@@ -475,15 +491,28 @@ pub enum KeybindingsConfigError {
 	NoActiveProfile,
 	/// A selected or inherited profile does not exist.
 	#[error("unknown keybinding profile {profile}")]
-	UnknownProfile { profile: String },
+	UnknownProfile {
+		/// Name from the `active` or `profiles.<name>.extends` config key.
+		profile: String,
+	},
 	/// Profile inheritance contains a cycle.
 	#[error("keybinding profile inheritance cycle at {profile}")]
-	ProfileCycle { profile: String },
-	/// A chord has invalid modifiers, key spelling, or duplicate modifiers.
+	ProfileCycle {
+		/// Profile name revisited while following `profiles.<name>.extends`.
+		profile: String,
+	},
 	/// An action id is not present in either the application or TUI registry.
 	#[error("unknown keybinding action {action}")]
-	UnknownAction { action: String },
+	UnknownAction {
+		/// Unsupported `profiles.<name>.bindings` key; accepted keys are
+		/// canonical action ids.
+		action: String,
+	},
 	/// A chord has invalid modifiers, key spelling, or duplicate modifiers.
 	#[error("invalid keybinding chord {chord}")]
-	InvalidChord { chord: String },
+	InvalidChord {
+		/// Rejected `modifier+key` value; modifiers and key names are
+		/// case-insensitive.
+		chord: String,
+	},
 }

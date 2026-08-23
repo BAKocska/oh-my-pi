@@ -748,10 +748,7 @@ fn add_pipe_extension_redirection(c: &mut ast::Command) -> Result<(), &'static s
 }
 
 #[inline]
-fn locations_are_contiguous(
-	loc_left: &crate::parser::SourceSpan,
-	loc_right: &crate::parser::SourceSpan,
-) -> bool {
+fn locations_are_contiguous(loc_left: &SourceSpan, loc_right: &SourceSpan) -> bool {
 	loc_left.end.index == loc_right.start.index
 }
 

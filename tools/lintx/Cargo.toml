@@ -6,7 +6,7 @@
 name = "lintx"
 version = "0.1.0"
 edition = "2024"
-description = "omp path/style linter: bans long inline qualified paths and crate::/super:: paths (with autofix), flags Arc-field structs and Mutex<Arc<…>> for arc-swap"
+description = "omp import/path linter with explicit namespace policy and shared-state diagnostics"
 publish = false
 
 [dependencies]

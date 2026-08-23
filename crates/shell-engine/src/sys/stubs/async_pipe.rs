@@ -5,12 +5,14 @@
 
 use std::io::{self, Read};
 
+use tokio::task;
+
 pub(crate) struct AsyncPipeReader {
-	inner: Option<std::io::PipeReader>,
+	inner: Option<io::PipeReader>,
 }
 
 impl AsyncPipeReader {
-	pub(crate) fn new(fd: std::io::PipeReader) -> io::Result<Self> {
+	pub(crate) fn new(fd: io::PipeReader) -> io::Result<Self> {
 		Ok(Self { inner: Some(fd) })
 	}
 
@@ -19,7 +21,7 @@ impl AsyncPipeReader {
 			return Ok(String::new());
 		};
 
-		tokio::task::spawn_blocking(move || {
+		task::spawn_blocking(move || {
 			let mut s = String::new();
 			{ reader }.read_to_string(&mut s)?;
 			Ok(s)

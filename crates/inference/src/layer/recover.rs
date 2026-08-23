@@ -1,7 +1,7 @@
 //! Canonical response recovery before semantic output gating.
 
 use std::{
-	fmt, mem,
+	fmt, mem, str,
 	sync::Arc,
 	task::{Context, Poll},
 	time::SystemTime,
@@ -9,15 +9,24 @@ use std::{
 
 use futures::StreamExt;
 use omp_catalog::{PriceUnit, pricing::UsageDimensions};
+use omp_core::Str;
 use tower::{Layer, Service};
 
 use crate::{
 	answer::{AnswerBody, ModelDiscoveryPage},
-	call::{Call, OperationCall, Setting, StructuredOutput, ToolDefinition, ToolInputConstraint},
-	codec::{HandshakenResponse, RawCompletion, RawEvent, ToolInputKind, UnvalidatedToolCall},
+	body::AttemptBodyEvidence,
+	call::{
+		Call, DiscoveryRequest, OperationCall, Setting, StructuredOutput, ToolDefinition,
+		ToolInputConstraint,
+	},
+	codec::{
+		HandshakeMeta, HandshakenResponse, RawCompletion, RawEvent, ToolInputKind,
+		UnvalidatedToolCall,
+	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{ChatEvent, Completion},
-	layer::LayerCall,
+	layer::{ExecutionContext, LayerCall},
+	plan::ExecutionPlan,
 	receipt::{
 		AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, ReasonId, ServingModelAttribution,
 	},
@@ -26,7 +35,9 @@ use crate::{
 		empty::{EmptyCompletionKind, EmptyCompletionStage, EmptyEvent, EmptyInput},
 		json::{JsonEnforcement, JsonRepairLimits, JsonRepairStage},
 		reasoning::{ReasoningLimits, ReasoningObservation, ReasoningStallGuard},
-		repetition::{AttemptRepetitionGuard, OutputVisibility, RepetitionLimits, recovery_record},
+		repetition::{
+			AttemptRepetitionGuard, LoopSignal, OutputVisibility, RepetitionLimits, recovery_record,
+		},
 		tools::{
 			ToolAssembler, ToolAssemblyEvent, ToolAssemblyLimits, ToolFragment, validate_schema,
 		},
@@ -38,9 +49,9 @@ pub trait DiscoveryProjector: Send + Sync + 'static {
 	/// Normalizes one provider page without mutating the bundled catalog.
 	fn project(
 		&self,
-		request: &crate::call::DiscoveryRequest,
+		request: &DiscoveryRequest,
 		rows: Vec<omp_catalog::DiscoveredModel>,
-		next_cursor: Option<omp_core::Str>,
+		next_cursor: Option<Str>,
 	) -> Result<ModelDiscoveryPage, Error>;
 }
 
@@ -318,10 +329,10 @@ where
 }
 fn project_discovery(
 	projector: Option<&Arc<dyn DiscoveryProjector>>,
-	request: Option<&crate::call::DiscoveryRequest>,
+	request: Option<&DiscoveryRequest>,
 	rows: Vec<omp_catalog::DiscoveredModel>,
-	next_cursor: Option<omp_core::Str>,
-	context: &crate::layer::ExecutionContext,
+	next_cursor: Option<Str>,
+	context: &ExecutionContext,
 ) -> Result<RawEvent, Error> {
 	let result = match (projector, request) {
 		(Some(projector), Some(request)) => projector
@@ -340,7 +351,7 @@ fn observe_reasoning(
 	thinking_repetition: &mut AttemptRepetitionGuard,
 	text_repetition: &mut AttemptRepetitionGuard,
 	event: &ChatEvent,
-	context: &crate::layer::ExecutionContext,
+	context: &ExecutionContext,
 ) -> Result<(), Error> {
 	let exact = match event {
 		ChatEvent::ThinkingDelta { text, .. } => {
@@ -378,10 +389,7 @@ fn observe_reasoning(
 	Err(repetition_error(&signal, context))
 }
 
-fn repetition_error(
-	signal: &crate::recovery::repetition::LoopSignal,
-	context: &crate::layer::ExecutionContext,
-) -> Error {
+fn repetition_error(signal: &LoopSignal, context: &ExecutionContext) -> Error {
 	context.with_receipt(|receipt| {
 		receipt
 			.recoveries
@@ -400,7 +408,7 @@ fn repetition_error(
 fn observe_empty(
 	stage: &mut Option<EmptyCompletionStage>,
 	event: ChatEvent,
-	context: &crate::layer::ExecutionContext,
+	context: &ExecutionContext,
 ) -> Result<ChatEvent, Error> {
 	let Some(stage) = stage.as_mut() else {
 		return Ok(event);
@@ -419,7 +427,7 @@ fn observe_empty(
 
 fn finish_empty(
 	stage: &mut Option<EmptyCompletionStage>,
-	context: &crate::layer::ExecutionContext,
+	context: &ExecutionContext,
 ) -> Result<(), Error> {
 	let Some(stage) = stage.as_mut() else {
 		return Ok(());
@@ -458,7 +466,7 @@ fn finish_empty(
 
 fn finish_json(
 	stage: &mut Option<JsonRepairStage>,
-	context: &crate::layer::ExecutionContext,
+	context: &ExecutionContext,
 ) -> Result<String, Error> {
 	let Some(stage) = stage.as_mut() else {
 		return Err(structured_error("structured-output.repair-policy-missing", context));
@@ -479,7 +487,7 @@ fn finish_json(
 fn validate_structured_output(
 	output: &StructuredOutput,
 	text: &str,
-	context: &crate::layer::ExecutionContext,
+	context: &ExecutionContext,
 ) -> Result<(), Error> {
 	let value = serde_json::from_str::<serde_json::Value>(text)
 		.map_err(|_| structured_error("structured-output.invalid-json", context))?;
@@ -498,7 +506,7 @@ fn validate_structured_output(
 	}
 }
 
-fn structured_error(reason: &'static str, context: &crate::layer::ExecutionContext) -> Error {
+fn structured_error(reason: &'static str, context: &ExecutionContext) -> Error {
 	Error::new(
 		ErrorKind::StructuredOutputFailure,
 		ErrorPhase::Recovery,
@@ -510,10 +518,10 @@ fn structured_error(reason: &'static str, context: &crate::layer::ExecutionConte
 }
 fn finalize_completion(
 	terminal: RawCompletion,
-	plan: Option<&crate::plan::ExecutionPlan>,
-	handshake: &crate::codec::HandshakeMeta,
-	body: crate::body::AttemptBodyEvidence,
-	context: &crate::layer::ExecutionContext,
+	plan: Option<&ExecutionPlan>,
+	handshake: &HandshakeMeta,
+	body: AttemptBodyEvidence,
+	context: &ExecutionContext,
 ) -> Result<ChatEvent, Error> {
 	let plan = plan.ok_or_else(|| recovery_error("completion.missing-execution-plan", context))?;
 	let serving_model = plan
@@ -616,7 +624,7 @@ fn recover_tool(
 	index: u32,
 	call: UnvalidatedToolCall,
 	definitions: &[ToolDefinition],
-	context: &crate::layer::ExecutionContext,
+	context: &ExecutionContext,
 ) -> Result<ChatEvent, Error> {
 	let Some(definition) = definitions
 		.iter()
@@ -662,7 +670,7 @@ fn recover_tool(
 	Ok(ChatEvent::ToolCallReady { index, call })
 }
 
-fn recovery_error(reason: &'static str, context: &crate::layer::ExecutionContext) -> Error {
+fn recovery_error(reason: &'static str, context: &ExecutionContext) -> Error {
 	Error::new(
 		ErrorKind::MalformedModelOutput,
 		ErrorPhase::Recovery,
@@ -675,6 +683,9 @@ fn recovery_error(reason: &'static str, context: &crate::layer::ExecutionContext
 
 #[cfg(test)]
 mod tests {
+
+	use omp_catalog::id::WirePolicyId;
+
 	use super::*;
 	use crate::{
 		call::DiscoveryRequest,
@@ -690,7 +701,7 @@ mod tests {
 			&self,
 			_: &DiscoveryRequest,
 			_: Vec<omp_catalog::DiscoveredModel>,
-			next_cursor: Option<omp_core::Str>,
+			next_cursor: Option<Str>,
 		) -> Result<ModelDiscoveryPage, Error> {
 			if self.fail {
 				return Err(Error::new(
@@ -716,8 +727,7 @@ mod tests {
 
 	fn finish_empty_error(event: Option<ChatEvent>) -> Error {
 		let context = ExecutionContext::new(ExecutionBudget::default());
-		let mut stage =
-			Some(EmptyCompletionStage::new(omp_catalog::id::WirePolicyId::new("wire"), 0));
+		let mut stage = Some(EmptyCompletionStage::new(WirePolicyId::new("wire"), 0));
 		if let Some(event) = event {
 			observe_empty(&mut stage, event, &context).expect("empty observer accepts chat event");
 		}
@@ -766,7 +776,7 @@ mod tests {
 		for chunk in runaway.as_bytes().chunks(23) {
 			let event = ChatEvent::TextDelta {
 				index: 0,
-				text:  std::str::from_utf8(chunk).expect("ASCII fixture").into(),
+				text:  str::from_utf8(chunk).expect("ASCII fixture").into(),
 			};
 			if let Err(error) = observe_reasoning(
 				&mut reasoning,

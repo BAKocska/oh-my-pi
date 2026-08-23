@@ -3,11 +3,7 @@
 //! This provider deliberately has no code path for foreign commands, agents,
 //! plugins, MCP, settings, or user-home roots.
 
-use std::{
-	collections::BTreeSet,
-	fs,
-	path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use omp_core::Str;
 use omp_walker::WalkRequest;

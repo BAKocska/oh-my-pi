@@ -1,12 +1,15 @@
 //! Per-network-attempt rate reservation, deliberately inside transport retry.
 
-use std::task::{Context, Poll};
+use std::{
+	mem,
+	task::{Context, Poll},
+};
 
 use tower::{Layer, Service};
 
 use crate::{
 	error::{Error, ErrorPhase},
-	layer::LayerCall,
+	layer::{ExecutionContext, LayerCall},
 };
 
 /// Reserves one provider/account rate slot for an actual transport attempt.
@@ -18,11 +21,7 @@ pub trait RateLimiter<R>: Clone + Send + 'static {
 		R: 'a;
 	/// Waits for capacity; implementations must be cancellation-aware through
 	/// the execution context.
-	fn reserve<'a>(
-		&'a self,
-		request: &'a R,
-		context: &'a crate::layer::ExecutionContext,
-	) -> Self::Future<'a>;
+	fn reserve<'a>(&'a self, request: &'a R, context: &'a ExecutionContext) -> Self::Future<'a>;
 }
 
 /// Adds rate reservation.
@@ -66,7 +65,7 @@ where
 
 	fn call(&mut self, request: LayerCall<R>) -> Self::Future {
 		let replacement = self.inner.clone();
-		let mut ready_inner = std::mem::replace(&mut self.inner, replacement);
+		let mut ready_inner = mem::replace(&mut self.inner, replacement);
 		let limiter = self.limiter.clone();
 		async move {
 			request.context.checkpoint(ErrorPhase::Readiness)?;

@@ -1,10 +1,12 @@
 //! Production checker, repair-session, picker, and journal composition.
-
 use std::{
+	error,
 	future::Future,
+	io,
 	path::{Path, PathBuf},
 	pin::Pin,
 	sync::Arc,
+	time,
 };
 
 use futures::{StreamExt as _, stream};
@@ -14,7 +16,7 @@ use omp_agent::{
 };
 use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
-use omp_storage::index::{SessionIndex, SessionKind};
+use omp_storage::index::{self, SessionIndex, SessionKind};
 use parking_lot::Mutex;
 use serde_json::value::to_raw_value;
 use tokio::process::Command;
@@ -25,8 +27,15 @@ use super::{
 	ProcessOutput, RepairOutcome, Report, TargetChoice, assignment_prompt, discovery_schema,
 	scan_project_files,
 };
+#[cfg(test)]
+use crate::cleanse::{CheckerEffect, parsers::ParserKind};
+use crate::{
+	chat,
+	chat::ChatError,
+	headless::{HeadlessSession, HeadlessSessionOptions},
+};
 /// Boxed presentation failure retained as a typed error source.
-pub type PresentationError = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type PresentationError = Box<dyn error::Error + Send + Sync + 'static>;
 
 /// Presentation-owned target and free-form request collection for cleanse.
 pub trait CleansePresentation: Send + Sync + 'static {
@@ -58,7 +67,7 @@ pub enum ProductionError {
 		root:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A checker process could not be started or observed.
 	#[error("failed to run cleanse checker {binary:?}")]
@@ -67,7 +76,7 @@ pub enum ProductionError {
 		binary: PathBuf,
 		/// Process failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// Standalone target selection failed.
 	#[error(transparent)]
@@ -77,10 +86,10 @@ pub enum ProductionError {
 	Session,
 	/// The configured data directory or project state could not be opened.
 	#[error("cleanse transcript authority could not be opened")]
-	JournalOpen(#[source] crate::chat::ChatError),
+	JournalOpen(#[source] ChatError),
 	/// The session index could not be opened.
 	#[error("failed to open cleanse session index")]
-	SessionIndex(#[from] omp_storage::index::Error),
+	SessionIndex(#[from] index::Error),
 	/// A cleanse journal declaration or append failed.
 	#[error("cleanse journal operation failed")]
 	Journal(#[from] omp_agent::JournalError),
@@ -112,17 +121,17 @@ impl ProductionCleanseHost {
 		data_dir: PathBuf,
 		presentation: Arc<dyn CleansePresentation>,
 	) -> Result<Self, ProductionError> {
-		let root = crate::chat::canonical_project(&root).map_err(ProductionError::JournalOpen)?;
+		let root = chat::canonical_project(&root).map_err(ProductionError::JournalOpen)?;
 		let files = scan_project_files(&root)
 			.map_err(|source| ProductionError::Scan { root: root.clone(), source })?;
 		let state_dir = omp_env::project_state::directory(&data_dir, &root)
 			.map_err(|_| ProductionError::Session)?;
-		crate::chat::ensure_state_directory(&state_dir).map_err(ProductionError::JournalOpen)?;
+		chat::ensure_state_directory(&state_dir).map_err(ProductionError::JournalOpen)?;
 		let sessions_dir = state_dir.join("sessions");
-		crate::chat::ensure_state_directory(&sessions_dir).map_err(ProductionError::JournalOpen)?;
+		chat::ensure_state_directory(&sessions_dir).map_err(ProductionError::JournalOpen)?;
 		let index = Arc::new(SessionIndex::open(state_dir.join("sessions.sqlite3"))?);
 		let id = Str::from(omp_core::Ulid::generate().to_string());
-		let mut journal = crate::chat::create_indexed_journal(
+		let mut journal = chat::create_indexed_journal(
 			&sessions_dir.join(format!("{}.jsonl", id.as_str())),
 			&root,
 			&id,
@@ -157,24 +166,21 @@ impl ProductionCleanseHost {
 		prompt: Str,
 		cancel: &CancellationToken,
 	) -> Result<RepairOutcome, ProductionError> {
-		let mut session = crate::headless::HeadlessSession::open(
-			self.data_dir.clone(),
-			crate::headless::HeadlessSessionOptions {
-				project:               self.root.clone(),
-				additional_roots:      Box::new([]),
-				model:                 Str::new(model),
-				initial_campaign:      None,
-				initial_prompt_slot:   None,
-				resume:                None,
-				fork:                  None,
-				py_eval:               false,
-				pty_denied:            false,
-				credential_provider:   None,
-				api_key:               None,
-				prompt_cache_affinity: None,
-				session_generation:    1,
-			},
-		)
+		let mut session = HeadlessSession::open(self.data_dir.clone(), HeadlessSessionOptions {
+			project:               self.root.clone(),
+			additional_roots:      Box::new([]),
+			model:                 Str::new(model),
+			initial_campaign:      None,
+			initial_prompt_slot:   None,
+			resume:                None,
+			fork:                  None,
+			py_eval:               false,
+			pty_denied:            false,
+			credential_provider:   None,
+			api_key:               None,
+			prompt_cache_affinity: None,
+			session_generation:    1,
+		})
 		.await
 		.map_err(|_| ProductionError::Session)?;
 		session.set_response_schema(schema_name, schema)?;
@@ -425,8 +431,8 @@ fn message(role: Role, text: &str) -> Item {
 }
 
 fn now_ms() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	time::SystemTime::now()
+		.duration_since(time::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_millis()
 		.try_into()
@@ -434,6 +440,8 @@ fn now_ms() -> u64 {
 }
 #[cfg(test)]
 mod tests {
+	use std::env;
+
 	use super::*;
 
 	#[tokio::test]
@@ -444,11 +452,11 @@ mod tests {
 			id:       sf!("self-list"),
 			label:    sf!("test harness list"),
 			language: sf!("Rust"),
-			cwd:      std::env::current_dir().expect("test cwd"),
-			binary:   std::env::current_exe().expect("test executable"),
+			cwd:      env::current_dir().expect("test cwd"),
+			binary:   env::current_exe().expect("test executable"),
 			args:     vec![sf!("--list")],
-			parser:   crate::cleanse::parsers::ParserKind::Generic,
-			effect:   crate::cleanse::CheckerEffect::ReadOnly,
+			parser:   ParserKind::Generic,
+			effect:   CheckerEffect::ReadOnly,
 			test:     false,
 		};
 		let output = run_checker_process(&checker, &CancellationToken::new())

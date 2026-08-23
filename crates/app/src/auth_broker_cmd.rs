@@ -2,12 +2,15 @@
 
 use std::{
 	collections::BTreeSet,
+	env,
+	fs::{self, OpenOptions},
+	io,
 	path::{Path, PathBuf},
 	time::SystemTime,
 };
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_catalog::{ProviderId, provider::OAuthFlowSpec};
+use omp_catalog::{ProviderId, provider::OAuthFlowSpec, snapshot};
 use omp_core::SecretString;
 use omp_inference::{
 	account::{AccountRecord, AccountStateStore},
@@ -18,11 +21,14 @@ use omp_inference::{
 use ring::rand::{SecureRandom as _, SystemRandom};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
+	auth_cli,
 	cli::{AuthBrokerArgs, AuthBrokerCommand, AuthCommand},
 	daemon::{DaemonConfig, DaemonHandle},
+	ssh_cmd,
 };
 
 #[derive(Deserialize)]
@@ -53,7 +59,7 @@ struct ImportPlan {
 /// Executes one combined credential-authority operation.
 pub async fn run(args: AuthBrokerArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
-	std::fs::create_dir_all(&data_dir).into_diagnostic()?;
+	fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command {
 		AuthBrokerCommand::Serve { endpoint } => {
 			let handle = DaemonHandle::start(DaemonConfig::local(endpoint).with_data_dir(data_dir))
@@ -66,14 +72,12 @@ pub async fn run(args: AuthBrokerArgs) -> miette::Result<()> {
 			if let Some(alias) = via {
 				remote_login(&data_dir, provider.as_str(), alias.as_str(), dry_run).await
 			} else {
-				crate::auth_cli::run(data_dir.join("credentials.db"), AuthCommand::Login { provider })
-					.await
+				auth_cli::run(data_dir.join("credentials.db"), AuthCommand::Login { provider }).await
 			}
 		},
 		AuthBrokerCommand::Logout { provider } => logout(&data_dir, provider.as_str()).await,
 		AuthBrokerCommand::List => {
-			crate::auth_cli::run(data_dir.join("credentials.db"), AuthCommand::List { provider: None })
-				.await
+			auth_cli::run(data_dir.join("credentials.db"), AuthCommand::List { provider: None }).await
 		},
 		AuthBrokerCommand::Import { path, provider, include_disabled, dry_run } => {
 			import(&data_dir, &path, provider.as_deref(), include_disabled, dry_run)
@@ -86,7 +90,7 @@ pub async fn run(args: AuthBrokerArgs) -> miette::Result<()> {
 pub(crate) fn token(data_dir: &Path, regenerate: bool) -> miette::Result<()> {
 	let path = data_dir.join("auth-broker.token");
 	if !regenerate && path.is_file() {
-		let value = std::fs::read_to_string(&path).into_diagnostic()?;
+		let value = fs::read_to_string(&path).into_diagnostic()?;
 		println!("{}", value.trim());
 		return Ok(());
 	}
@@ -106,6 +110,7 @@ async fn remote_login(
 	alias: &str,
 	dry_run: bool,
 ) -> miette::Result<()> {
+	use tokio::io;
 	let callback_port = oauth_callback_port(provider)?;
 	let command = format!("omp auth-broker login {}", shell_quote(provider));
 	if dry_run {
@@ -116,11 +121,11 @@ async fn remote_login(
 		}
 		return Ok(());
 	}
-	let project = std::env::current_dir()
+	let project = env::current_dir()
 		.into_diagnostic()?
 		.join(".omp/hosts.toml");
 	let user = data_dir.join("hosts.toml");
-	let service = crate::ssh_cmd::service(alias, &project, &user)?;
+	let service = ssh_cmd::service(alias, &project, &user)?;
 	let forward = match callback_port {
 		Some(port) => Some(
 			service
@@ -134,9 +139,9 @@ async fn remote_login(
 		.open_interactive(alias, &command)
 		.await
 		.into_diagnostic()?;
-	let mut stdin = tokio::io::stdin();
-	let mut stdout = tokio::io::stdout();
-	let mut stderr = tokio::io::stderr();
+	let mut stdin = io::stdin();
+	let mut stdout = io::stdout();
+	let mut stderr = io::stderr();
 	let mut input = [0_u8; 8 * 1024];
 	let mut input_open = true;
 	let status = loop {
@@ -188,8 +193,7 @@ async fn remote_login(
 }
 
 fn oauth_callback_port(provider: &str) -> miette::Result<Option<u16>> {
-	let catalog =
-		omp_catalog::snapshot::Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
+	let catalog = snapshot::Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
 	let provider = catalog
 		.providers()
 		.iter()
@@ -210,7 +214,7 @@ fn oauth_callback_port(provider: &str) -> miette::Result<Option<u16>> {
 			OAuthFlowSpec::DeviceCode { .. } | OAuthFlowSpec::Paste { .. } => None,
 		})
 		.find_map(|redirect| {
-			url::Url::parse(redirect)
+			Url::parse(redirect)
 				.ok()
 				.and_then(|url| url.port_or_known_default())
 		});
@@ -238,7 +242,7 @@ async fn logout(data_dir: &Path, provider: &str) -> miette::Result<()> {
 		return Err(miette!("provider `{provider}` has no stored accounts"));
 	}
 	for account in accounts {
-		crate::auth_cli::run(data_dir.join("credentials.db"), AuthCommand::Logout {
+		auth_cli::run(data_dir.join("credentials.db"), AuthCommand::Logout {
 			account: account.into_inner(),
 		})
 		.await?;
@@ -253,8 +257,7 @@ fn import(
 	include_disabled: bool,
 	dry_run: bool,
 ) -> miette::Result<()> {
-	let catalog =
-		omp_catalog::snapshot::Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
+	let catalog = snapshot::Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
 	let plans = load_import_plan(path, override_provider, include_disabled, &catalog)?;
 	if plans.is_empty() {
 		println!("No importable credentials in {}.", path.display());
@@ -316,10 +319,10 @@ fn load_import_plan(
 	path: &Path,
 	override_provider: Option<&str>,
 	include_disabled: bool,
-	catalog: &omp_catalog::snapshot::Catalog,
+	catalog: &snapshot::Catalog,
 ) -> miette::Result<Vec<ImportPlan>> {
 	let mut sources = if path.is_dir() {
-		std::fs::read_dir(path)
+		fs::read_dir(path)
 			.into_diagnostic()?
 			.filter_map(|entry| entry.ok().map(|entry| entry.path()))
 			.filter(|entry| entry.is_file() && entry.extension().is_some_and(|ext| ext == "json"))
@@ -332,7 +335,7 @@ fn load_import_plan(
 	sources.sort();
 	let mut plans = Vec::with_capacity(sources.len());
 	for source in sources {
-		let input = match std::fs::read(&source) {
+		let input = match fs::read(&source) {
 			Ok(input) => Zeroizing::new(input),
 			Err(error) => {
 				eprintln!("skip {}: unreadable credential file: {error}", source.display());
@@ -484,7 +487,7 @@ fn hex(bytes: &[u8]) -> String {
 
 pub(crate) fn write_owner_only(path: &Path, bytes: &[u8]) -> miette::Result<()> {
 	let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-	let mut options = std::fs::OpenOptions::new();
+	let mut options = OpenOptions::new();
 	options.write(true).create_new(true);
 	#[cfg(unix)]
 	{
@@ -492,8 +495,8 @@ pub(crate) fn write_owner_only(path: &Path, bytes: &[u8]) -> miette::Result<()> 
 		options.mode(0o600);
 	}
 	let mut file = options.open(&temporary).into_diagnostic()?;
-	std::io::Write::write_all(&mut file, bytes).into_diagnostic()?;
+	io::Write::write_all(&mut file, bytes).into_diagnostic()?;
 	file.sync_all().into_diagnostic()?;
-	std::fs::rename(&temporary, path).into_diagnostic()?;
+	fs::rename(&temporary, path).into_diagnostic()?;
 	Ok(())
 }

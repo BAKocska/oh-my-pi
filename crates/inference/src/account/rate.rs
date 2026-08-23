@@ -1,7 +1,8 @@
 //! Independent request-rate windows and retry timing.
 
 use std::{
-	fmt,
+	error,
+	fmt::{self, Display},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -258,13 +259,13 @@ pub struct RetryAfterParseError {
 	pub kind:   RetryAfterParseErrorKind,
 }
 
-impl fmt::Display for RetryAfterParseError {
+impl Display for RetryAfterParseError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "invalid retry timing ({:?}): {:?}", self.source, self.kind)
 	}
 }
 
-impl std::error::Error for RetryAfterParseError {}
+impl error::Error for RetryAfterParseError {}
 
 /// Result of parsing several independent retry timing inputs.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

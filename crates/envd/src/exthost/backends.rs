@@ -2,6 +2,8 @@
 
 use std::{
 	collections::BTreeMap,
+	fmt::Display,
+	fs, io,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{SystemTime, UNIX_EPOCH},
@@ -14,7 +16,10 @@ use omp_tool::{ArgPath, IncomingCursor, IncomingParams, PullMode, PulledKind};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::{
+	io::{AsyncReadExt as _, AsyncWriteExt as _},
+	sync,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -23,10 +28,10 @@ use super::{
 		ControlRequestContext, MAX_DIRECT_FILESYSTEM_BYTES,
 	},
 	params::{
-		DirectFilesystemAuthorityError, DirectFilesystemEntry, DirectFilesystemExecutor,
-		DirectFilesystemJournal, DirectFilesystemOutput, DirectFilesystemStat,
-		ParameterAuthorityError, ParameterControlOwner, ParameterOperation, ParameterPathPart,
-		ParameterPullRequest, ParameterPullResult, ParameterSource,
+		DirectFilesystemAuthorityError, DirectFilesystemControlOwner, DirectFilesystemEntry,
+		DirectFilesystemExecutor, DirectFilesystemJournal, DirectFilesystemOutput,
+		DirectFilesystemStat, ParameterAuthorityError, ParameterControlOwner, ParameterOperation,
+		ParameterPathPart, ParameterPullRequest, ParameterPullResult, ParameterSource,
 	},
 };
 use crate::{
@@ -35,6 +40,7 @@ use crate::{
 		PolicyScope, SandboxCapabilities, SandboxEnforcement, SandboxMode, SandboxPolicyRuntime,
 		SandboxProfile,
 	},
+	worker_pool,
 	worker_pool::{WorkerControlOwner, WorkerProcessAuthority, WorkerSupervisor},
 };
 
@@ -57,300 +63,314 @@ pub fn detected_sandbox_capabilities() -> SandboxCapabilities {
 	}
 }
 
-#[derive(Clone)]
-struct SandboxContribution {
-	handle:  Str,
-	owner:   Str,
-	profile: SandboxProfile,
-	scope:   PolicyScope,
-}
+mod admission {
+	use parking_lot::Mutex;
 
-struct SandboxSession {
-	baseline:      SandboxProfile,
-	effective:     SandboxProfile,
-	enforcement:   SandboxEnforcement,
-	contributions: Vec<SandboxContribution>,
-}
+	use super::*;
 
-/// Authoritative admission state for sandbox processes activated by envd.
-///
-/// Activation publishes the real process receipt and baseline. Contributions
-/// are generation-independent opaque handles, strictly owner-fenced, and never
-/// allowed to widen the current effective profile.
-pub struct AdmissionSandboxRuntime {
-	capabilities: SandboxCapabilities,
-	sessions:     Mutex<BTreeMap<Str, SandboxSession>>,
-	handles:      Mutex<BTreeMap<Str, Str>>,
-}
-
-impl AdmissionSandboxRuntime {
-	/// Creates a runtime from facilities detected by the process launcher.
-	pub fn new(capabilities: SandboxCapabilities) -> Self {
-		Self {
-			capabilities,
-			sessions: Mutex::new(BTreeMap::new()),
-			handles: Mutex::new(BTreeMap::new()),
-		}
-	}
-
-	/// Publishes an already-installed native sandbox session.
-	pub fn activate(
-		&self,
-		session: Str,
+	#[derive(Clone)]
+	struct SandboxContribution {
+		handle:  Str,
+		owner:   Str,
 		profile: SandboxProfile,
-		enforcement: SandboxEnforcement,
-	) -> Result<(), PolicyControlFailure> {
-		let mut sessions = self.sessions.lock();
-		if sessions
-			.get(&session)
-			.is_some_and(|session| !session.contributions.is_empty())
-		{
-			return Err(PolicyControlFailure::ProfileWidened);
-		}
-		sessions.insert(session, SandboxSession {
-			baseline: profile.clone(),
-			effective: profile,
-			enforcement,
-			contributions: Vec::new(),
-		});
-		Ok(())
+		scope:   PolicyScope,
 	}
 
-	/// Drops admission state after the owning sandbox process terminates.
-	pub fn deactivate(&self, session: &str) {
-		let removed = self.sessions.lock().remove(session);
-		if let Some(removed) = removed {
-			let mut handles = self.handles.lock();
-			for contribution in removed.contributions {
-				handles.remove(&contribution.handle);
+	struct SandboxSession {
+		baseline:      SandboxProfile,
+		effective:     SandboxProfile,
+		enforcement:   SandboxEnforcement,
+		contributions: Vec<SandboxContribution>,
+	}
+
+	/// Authoritative admission state for sandbox processes activated by envd.
+	///
+	/// Activation publishes the real process receipt and baseline. Contributions
+	/// are generation-independent opaque handles, strictly owner-fenced, and
+	/// never allowed to widen the current effective profile.
+	pub struct AdmissionSandboxRuntime {
+		capabilities: SandboxCapabilities,
+		sessions:     Mutex<BTreeMap<Str, SandboxSession>>,
+		handles:      Mutex<BTreeMap<Str, Str>>,
+	}
+
+	impl AdmissionSandboxRuntime {
+		/// Creates a runtime from facilities detected by the process launcher.
+		pub fn new(capabilities: SandboxCapabilities) -> Self {
+			Self {
+				capabilities,
+				sessions: Mutex::new(BTreeMap::new()),
+				handles: Mutex::new(BTreeMap::new()),
 			}
 		}
-	}
 
-	/// Expires contributions at the authoritative call/turn/session boundary.
-	pub fn expire_scope(&self, session: &str, scope: PolicyScope) {
-		let mut sessions = self.sessions.lock();
-		let Some(session) = sessions.get_mut(session) else {
-			return;
-		};
-		let removed = session
-			.contributions
-			.iter()
-			.filter(|contribution| contribution.scope == scope)
-			.map(|contribution| contribution.handle.clone())
-			.collect::<Vec<_>>();
-		session
-			.contributions
-			.retain(|contribution| contribution.scope != scope);
-		session.effective = session
-			.contributions
-			.last()
-			.map_or_else(|| session.baseline.clone(), |value| value.profile.clone());
-		let mut handles = self.handles.lock();
-		for handle in removed {
-			handles.remove(&handle);
+		/// Publishes an already-installed native sandbox session.
+		pub fn activate(
+			&self,
+			session: Str,
+			profile: SandboxProfile,
+			enforcement: SandboxEnforcement,
+		) -> Result<(), PolicyControlFailure> {
+			let mut sessions = self.sessions.lock();
+			if sessions
+				.get(&session)
+				.is_some_and(|session| !session.contributions.is_empty())
+			{
+				return Err(PolicyControlFailure::ProfileWidened);
+			}
+			sessions.insert(session, SandboxSession {
+				baseline: profile.clone(),
+				effective: profile,
+				enforcement,
+				contributions: Vec::new(),
+			});
+			Ok(())
 		}
-	}
 
-	fn supports(&self, profile: &SandboxProfile) -> Result<(), PolicyControlFailure> {
-		if let Some(required) = profile.require.iter().find(|required| {
-			!self
-				.capabilities
-				.backends
+		/// Drops admission state after the owning sandbox process terminates.
+		pub fn deactivate(&self, session: &str) {
+			let removed = self.sessions.lock().remove(session);
+			if let Some(removed) = removed {
+				let mut handles = self.handles.lock();
+				for contribution in removed.contributions {
+					handles.remove(&contribution.handle);
+				}
+			}
+		}
+
+		/// Expires contributions at the authoritative call/turn/session boundary.
+		pub fn expire_scope(&self, session: &str, scope: PolicyScope) {
+			let mut sessions = self.sessions.lock();
+			let Some(session) = sessions.get_mut(session) else {
+				return;
+			};
+			let removed = session
+				.contributions
 				.iter()
-				.any(|backend| backend == *required)
-		}) {
-			return Err(PolicyControlFailure::EnforcementUnavailable(Str::from(format!(
-				"required sandbox backend {required} is unavailable"
-			))));
+				.filter(|contribution| contribution.scope == scope)
+				.map(|contribution| contribution.handle.clone())
+				.collect::<Vec<_>>();
+			session
+				.contributions
+				.retain(|contribution| contribution.scope != scope);
+			session.effective = session
+				.contributions
+				.last()
+				.map_or_else(|| session.baseline.clone(), |value| value.profile.clone());
+			let mut handles = self.handles.lock();
+			for handle in removed {
+				handles.remove(&handle);
+			}
 		}
-		if profile.mode == SandboxMode::Enforce
-			&& (!self.capabilities.filesystem
-				|| (!self.capabilities.network && profile.network.mode != "open")
-				|| (!self.capabilities.resource_limits && profile.resources != Default::default()))
-		{
-			return Err(PolicyControlFailure::EnforcementUnavailable(Str::new_static(
-				"active sandbox facilities cannot enforce the requested profile",
-			)));
+
+		fn supports(&self, profile: &SandboxProfile) -> Result<(), PolicyControlFailure> {
+			if let Some(required) = profile.require.iter().find(|required| {
+				!self
+					.capabilities
+					.backends
+					.iter()
+					.any(|backend| backend == *required)
+			}) {
+				return Err(PolicyControlFailure::EnforcementUnavailable(Str::from(format!(
+					"required sandbox backend {required} is unavailable"
+				))));
+			}
+			if profile.mode == SandboxMode::Enforce
+				&& (!self.capabilities.filesystem
+					|| (!self.capabilities.network && profile.network.mode != "open")
+					|| (!self.capabilities.resource_limits && profile.resources != Default::default()))
+			{
+				return Err(PolicyControlFailure::EnforcementUnavailable(Str::new_static(
+					"active sandbox facilities cannot enforce the requested profile",
+				)));
+			}
+			Ok(())
 		}
-		Ok(())
 	}
-}
 
-fn subset<T: PartialEq>(narrow: &[T], broad: &[T]) -> bool {
-	narrow.iter().all(|value| broad.contains(value))
-}
-
-fn superset<T: PartialEq>(narrow: &[T], broad: &[T]) -> bool {
-	subset(broad, narrow)
-}
-
-fn effect_narrows(narrow: &str, broad: &str) -> bool {
-	narrow == broad || (narrow == "deny" && broad == "allow")
-}
-
-fn ceiling_narrows<T: PartialOrd>(narrow: Option<T>, broad: Option<T>) -> bool {
-	match (narrow, broad) {
-		(Some(narrow), Some(broad)) => narrow <= broad,
-		(Some(_), None) | (None, None) => true,
-		(None, Some(_)) => false,
+	fn subset<T: PartialEq>(narrow: &[T], broad: &[T]) -> bool {
+		narrow.iter().all(|value| broad.contains(value))
 	}
-}
 
-fn profile_narrows(narrow: &SandboxProfile, broad: &SandboxProfile) -> bool {
-	let mode = |mode| match mode {
-		SandboxMode::Off => 0_u8,
-		SandboxMode::Observe => 1,
-		SandboxMode::Enforce => 2,
-	};
-	let network = |mode: &str| match mode {
-		"open" => 0_u8,
-		"proxy" => 1,
-		"deny" => 2,
-		_ => return 0,
-	};
-	mode(narrow.mode) >= mode(broad.mode)
-		&& effect_narrows(
-			narrow.filesystem.read_default.as_str(),
-			broad.filesystem.read_default.as_str(),
+	fn superset<T: PartialEq>(narrow: &[T], broad: &[T]) -> bool {
+		subset(broad, narrow)
+	}
+
+	fn effect_narrows(narrow: &str, broad: &str) -> bool {
+		narrow == broad || (narrow == "deny" && broad == "allow")
+	}
+
+	fn ceiling_narrows<T: PartialOrd>(narrow: Option<T>, broad: Option<T>) -> bool {
+		match (narrow, broad) {
+			(Some(narrow), Some(broad)) => narrow <= broad,
+			(Some(_), None) | (None, None) => true,
+			(None, Some(_)) => false,
+		}
+	}
+
+	fn profile_narrows(narrow: &SandboxProfile, broad: &SandboxProfile) -> bool {
+		let mode = |mode| match mode {
+			SandboxMode::Off => 0_u8,
+			SandboxMode::Observe => 1,
+			SandboxMode::Enforce => 2,
+		};
+		let network = |mode: &str| match mode {
+			"open" => 0_u8,
+			"proxy" => 1,
+			"deny" => 2,
+			_ => return 0,
+		};
+		mode(narrow.mode) >= mode(broad.mode)
+			&& effect_narrows(
+				narrow.filesystem.read_default.as_str(),
+				broad.filesystem.read_default.as_str(),
+			) && effect_narrows(
+			narrow.filesystem.write_default.as_str(),
+			broad.filesystem.write_default.as_str(),
 		) && effect_narrows(
-		narrow.filesystem.write_default.as_str(),
-		broad.filesystem.write_default.as_str(),
-	) && effect_narrows(
-		narrow.filesystem.exec_default.as_str(),
-		broad.filesystem.exec_default.as_str(),
-	) && (broad.filesystem.read_default == "allow"
-		|| subset(&narrow.filesystem.allow_read, &broad.filesystem.allow_read))
-		&& (broad.filesystem.write_default == "allow"
-			|| subset(&narrow.filesystem.allow_write, &broad.filesystem.allow_write))
-		&& (broad.filesystem.exec_default == "allow"
-			|| subset(&narrow.filesystem.allow_exec, &broad.filesystem.allow_exec))
-		&& superset(&narrow.filesystem.deny_read, &broad.filesystem.deny_read)
-		&& superset(&narrow.filesystem.deny_write, &broad.filesystem.deny_write)
-		&& superset(&narrow.filesystem.deny_exec, &broad.filesystem.deny_exec)
-		&& (broad.filesystem.tmpdir.is_none() || narrow.filesystem.tmpdir == broad.filesystem.tmpdir)
-		&& (!narrow.filesystem.follow_symlinks || broad.filesystem.follow_symlinks)
-		&& network(narrow.network.mode.as_str()) >= network(broad.network.mode.as_str())
-		&& (broad.network.mode == "open"
-			|| subset(&narrow.network.allow_domains, &broad.network.allow_domains))
-		&& superset(&narrow.network.deny_domains, &broad.network.deny_domains)
-		&& (broad.network.mode == "open"
-			|| subset(&narrow.network.allow_ports, &broad.network.allow_ports))
-		&& (!narrow.network.allow_localhost || broad.network.allow_localhost)
-		&& subset(&narrow.network.allow_unix_sockets, &broad.network.allow_unix_sockets)
-		&& subset(&narrow.network.allow_mach_lookup, &broad.network.allow_mach_lookup)
-		&& effect_narrows(narrow.exec.default.as_str(), broad.exec.default.as_str())
-		&& (broad.exec.default == "allow" || subset(&narrow.exec.allow, &broad.exec.allow))
-		&& superset(&narrow.exec.deny, &broad.exec.deny)
-		&& (!narrow.exec.allow_interpreters || broad.exec.allow_interpreters)
-		&& (!narrow.exec.allow_setuid || broad.exec.allow_setuid)
-		&& (!narrow.exec.allow_ptrace || broad.exec.allow_ptrace)
-		&& (!narrow.exec.allow_new_session || broad.exec.allow_new_session)
-		&& ceiling_narrows(narrow.exec.max_children, broad.exec.max_children)
-		&& ceiling_narrows(narrow.resources.wall, broad.resources.wall)
-		&& ceiling_narrows(narrow.resources.cpu, broad.resources.cpu)
-		&& ceiling_narrows(narrow.resources.memory_bytes, broad.resources.memory_bytes)
-		&& ceiling_narrows(narrow.resources.file_size_bytes, broad.resources.file_size_bytes)
-		&& ceiling_narrows(narrow.resources.open_files, broad.resources.open_files)
-		&& ceiling_narrows(narrow.resources.processes, broad.resources.processes)
-		&& ceiling_narrows(narrow.resources.disk_write_bytes, broad.resources.disk_write_bytes)
-		&& ceiling_narrows(narrow.resources.stdout_bytes, broad.resources.stdout_bytes)
-}
-
-#[async_trait]
-impl SandboxPolicyRuntime for AdmissionSandboxRuntime {
-	async fn capabilities(&self) -> Result<SandboxCapabilities, PolicyControlFailure> {
-		Ok(self.capabilities.clone())
+			narrow.filesystem.exec_default.as_str(),
+			broad.filesystem.exec_default.as_str(),
+		) && (broad.filesystem.read_default == "allow"
+			|| subset(&narrow.filesystem.allow_read, &broad.filesystem.allow_read))
+			&& (broad.filesystem.write_default == "allow"
+				|| subset(&narrow.filesystem.allow_write, &broad.filesystem.allow_write))
+			&& (broad.filesystem.exec_default == "allow"
+				|| subset(&narrow.filesystem.allow_exec, &broad.filesystem.allow_exec))
+			&& superset(&narrow.filesystem.deny_read, &broad.filesystem.deny_read)
+			&& superset(&narrow.filesystem.deny_write, &broad.filesystem.deny_write)
+			&& superset(&narrow.filesystem.deny_exec, &broad.filesystem.deny_exec)
+			&& (broad.filesystem.tmpdir.is_none()
+				|| narrow.filesystem.tmpdir == broad.filesystem.tmpdir)
+			&& (!narrow.filesystem.follow_symlinks || broad.filesystem.follow_symlinks)
+			&& network(narrow.network.mode.as_str()) >= network(broad.network.mode.as_str())
+			&& (broad.network.mode == "open"
+				|| subset(&narrow.network.allow_domains, &broad.network.allow_domains))
+			&& superset(&narrow.network.deny_domains, &broad.network.deny_domains)
+			&& (broad.network.mode == "open"
+				|| subset(&narrow.network.allow_ports, &broad.network.allow_ports))
+			&& (!narrow.network.allow_localhost || broad.network.allow_localhost)
+			&& subset(&narrow.network.allow_unix_sockets, &broad.network.allow_unix_sockets)
+			&& subset(&narrow.network.allow_mach_lookup, &broad.network.allow_mach_lookup)
+			&& effect_narrows(narrow.exec.default.as_str(), broad.exec.default.as_str())
+			&& (broad.exec.default == "allow" || subset(&narrow.exec.allow, &broad.exec.allow))
+			&& superset(&narrow.exec.deny, &broad.exec.deny)
+			&& (!narrow.exec.allow_interpreters || broad.exec.allow_interpreters)
+			&& (!narrow.exec.allow_setuid || broad.exec.allow_setuid)
+			&& (!narrow.exec.allow_ptrace || broad.exec.allow_ptrace)
+			&& (!narrow.exec.allow_new_session || broad.exec.allow_new_session)
+			&& ceiling_narrows(narrow.exec.max_children, broad.exec.max_children)
+			&& ceiling_narrows(narrow.resources.wall, broad.resources.wall)
+			&& ceiling_narrows(narrow.resources.cpu, broad.resources.cpu)
+			&& ceiling_narrows(narrow.resources.memory_bytes, broad.resources.memory_bytes)
+			&& ceiling_narrows(narrow.resources.file_size_bytes, broad.resources.file_size_bytes)
+			&& ceiling_narrows(narrow.resources.open_files, broad.resources.open_files)
+			&& ceiling_narrows(narrow.resources.processes, broad.resources.processes)
+			&& ceiling_narrows(narrow.resources.disk_write_bytes, broad.resources.disk_write_bytes)
+			&& ceiling_narrows(narrow.resources.stdout_bytes, broad.resources.stdout_bytes)
 	}
 
-	async fn effective_profile(
-		&self,
-		session: &str,
-	) -> Result<SandboxProfile, PolicyControlFailure> {
-		self
-			.sessions
-			.lock()
-			.get(session)
-			.map(|session| session.effective.clone())
-			.ok_or(PolicyControlFailure::UnknownHandle)
-	}
-
-	async fn enforcement(&self, session: &str) -> Result<SandboxEnforcement, PolicyControlFailure> {
-		self
-			.sessions
-			.lock()
-			.get(session)
-			.map(|session| session.enforcement.clone())
-			.ok_or(PolicyControlFailure::UnknownHandle)
-	}
-
-	async fn install(
-		&self,
-		owner: &str,
-		session: &str,
-		profile: SandboxProfile,
-		scope: PolicyScope,
-	) -> Result<InstalledSandboxProfile, PolicyControlFailure> {
-		self.supports(&profile)?;
-		let mut sessions = self.sessions.lock();
-		let session_state = sessions
-			.get_mut(session)
-			.ok_or(PolicyControlFailure::UnknownHandle)?;
-		if !profile_narrows(&profile, &session_state.effective) {
-			return Err(PolicyControlFailure::ProfileWidened);
+	#[async_trait]
+	impl SandboxPolicyRuntime for AdmissionSandboxRuntime {
+		async fn capabilities(&self) -> Result<SandboxCapabilities, PolicyControlFailure> {
+			Ok(self.capabilities.clone())
 		}
-		let handle = Str::from(format!("sandbox-{}", Ulid::generate()));
-		session_state.contributions.push(SandboxContribution {
-			handle: handle.clone(),
-			owner: Str::from(owner),
-			profile: profile.clone(),
-			scope,
-		});
-		session_state.effective = profile.clone();
-		self
-			.handles
-			.lock()
-			.insert(handle.clone(), Str::from(session));
-		Ok(InstalledSandboxProfile { handle_id: handle, profile })
-	}
 
-	async fn revoke(&self, owner: &str, handle_id: &str) -> Result<(), PolicyControlFailure> {
-		let session_id = self
-			.handles
-			.lock()
-			.get(handle_id)
-			.cloned()
-			.ok_or(PolicyControlFailure::UnknownHandle)?;
-		let mut sessions = self.sessions.lock();
-		let session = sessions
-			.get_mut(&session_id)
-			.ok_or(PolicyControlFailure::UnknownHandle)?;
-		let index = session
-			.contributions
-			.iter()
-			.position(|contribution| contribution.handle == handle_id && contribution.owner == owner)
-			.ok_or(PolicyControlFailure::UnknownHandle)?;
-		session.contributions.remove(index);
-		session.effective = session
-			.contributions
-			.last()
-			.map_or_else(|| session.baseline.clone(), |value| value.profile.clone());
-		self.handles.lock().remove(handle_id);
-		Ok(())
-	}
+		async fn effective_profile(
+			&self,
+			session: &str,
+		) -> Result<SandboxProfile, PolicyControlFailure> {
+			self
+				.sessions
+				.lock()
+				.get(session)
+				.map(|session| session.effective.clone())
+				.ok_or(PolicyControlFailure::UnknownHandle)
+		}
 
-	async fn amend(
-		&self,
-		owner: &str,
-		session: &str,
-		patch: SandboxProfile,
-		scope: PolicyScope,
-		_reason: Str,
-		_approval: Option<omp_agent::ApprovalSpec>,
-	) -> Result<(), PolicyControlFailure> {
-		self.install(owner, session, patch, scope).await.map(|_| ())
+		async fn enforcement(
+			&self,
+			session: &str,
+		) -> Result<SandboxEnforcement, PolicyControlFailure> {
+			self
+				.sessions
+				.lock()
+				.get(session)
+				.map(|session| session.enforcement.clone())
+				.ok_or(PolicyControlFailure::UnknownHandle)
+		}
+
+		async fn install(
+			&self,
+			owner: &str,
+			session: &str,
+			profile: SandboxProfile,
+			scope: PolicyScope,
+		) -> Result<InstalledSandboxProfile, PolicyControlFailure> {
+			self.supports(&profile)?;
+			let mut sessions = self.sessions.lock();
+			let session_state = sessions
+				.get_mut(session)
+				.ok_or(PolicyControlFailure::UnknownHandle)?;
+			if !profile_narrows(&profile, &session_state.effective) {
+				return Err(PolicyControlFailure::ProfileWidened);
+			}
+			let handle = Str::from(format!("sandbox-{}", Ulid::generate()));
+			session_state.contributions.push(SandboxContribution {
+				handle: handle.clone(),
+				owner: Str::from(owner),
+				profile: profile.clone(),
+				scope,
+			});
+			session_state.effective = profile.clone();
+			self
+				.handles
+				.lock()
+				.insert(handle.clone(), Str::from(session));
+			Ok(InstalledSandboxProfile { handle_id: handle, profile })
+		}
+
+		async fn revoke(&self, owner: &str, handle_id: &str) -> Result<(), PolicyControlFailure> {
+			let session_id = self
+				.handles
+				.lock()
+				.get(handle_id)
+				.cloned()
+				.ok_or(PolicyControlFailure::UnknownHandle)?;
+			let mut sessions = self.sessions.lock();
+			let session = sessions
+				.get_mut(&session_id)
+				.ok_or(PolicyControlFailure::UnknownHandle)?;
+			let index = session
+				.contributions
+				.iter()
+				.position(|contribution| {
+					contribution.handle == handle_id && contribution.owner == owner
+				})
+				.ok_or(PolicyControlFailure::UnknownHandle)?;
+			session.contributions.remove(index);
+			session.effective = session
+				.contributions
+				.last()
+				.map_or_else(|| session.baseline.clone(), |value| value.profile.clone());
+			self.handles.lock().remove(handle_id);
+			Ok(())
+		}
+
+		async fn amend(
+			&self,
+			owner: &str,
+			session: &str,
+			patch: SandboxProfile,
+			scope: PolicyScope,
+			_reason: Str,
+			_approval: Option<omp_agent::ApprovalSpec>,
+		) -> Result<(), PolicyControlFailure> {
+			self.install(owner, session, patch, scope).await.map(|_| ())
+		}
 	}
 }
+
+pub use admission::AdmissionSandboxRuntime;
 
 /// Live invocation argument cursors indexed by the host-issued invocation id.
 ///
@@ -359,7 +379,7 @@ impl SandboxPolicyRuntime for AdmissionSandboxRuntime {
 /// invocation stream.
 #[derive(Default)]
 pub struct LiveParameterSource {
-	invocations: Mutex<BTreeMap<Str, Arc<tokio::sync::Mutex<LiveParameters>>>>,
+	invocations: Mutex<BTreeMap<Str, Arc<sync::Mutex<LiveParameters>>>>,
 }
 
 struct LiveParameters {
@@ -382,7 +402,7 @@ impl LiveParameterSource {
 		}
 		invocations.insert(
 			invocation_id,
-			Arc::new(tokio::sync::Mutex::new(LiveParameters { params, cursor: None })),
+			Arc::new(sync::Mutex::new(LiveParameters { params, cursor: None })),
 		);
 		Ok(())
 	}
@@ -395,7 +415,7 @@ impl LiveParameterSource {
 	fn invocation(
 		&self,
 		invocation_id: &str,
-	) -> Result<Arc<tokio::sync::Mutex<LiveParameters>>, ParameterAuthorityError> {
+	) -> Result<Arc<sync::Mutex<LiveParameters>>, ParameterAuthorityError> {
 		self
 			.invocations
 			.lock()
@@ -558,7 +578,7 @@ async fn run_parameter_pull(
 	}
 }
 
-fn parameter_source_error(error: impl std::fmt::Display) -> ParameterAuthorityError {
+fn parameter_source_error(error: impl Display) -> ParameterAuthorityError {
 	ParameterAuthorityError::Source(Str::from(error.to_string()))
 }
 
@@ -585,13 +605,13 @@ impl ParameterSource for LiveParameterSource {
 /// Durable JSON-lines policy audit used immediately before approval mutation.
 pub struct DurablePolicyAuditSink {
 	path:   PathBuf,
-	append: tokio::sync::Mutex<()>,
+	append: sync::Mutex<()>,
 }
 
 impl DurablePolicyAuditSink {
 	/// Uses the session-owned audit path as the sole approval decision log.
 	pub fn new(path: PathBuf) -> Self {
-		Self { path, append: tokio::sync::Mutex::new(()) }
+		Self { path, append: sync::Mutex::new(()) }
 	}
 }
 
@@ -645,13 +665,13 @@ impl PolicyAuditSink for DurablePolicyAuditSink {
 /// escape. Each append is flushed before the executor is called.
 pub struct DurableDirectFilesystemJournal {
 	path:   PathBuf,
-	append: tokio::sync::Mutex<()>,
+	append: sync::Mutex<()>,
 }
 
 impl DurableDirectFilesystemJournal {
 	/// Creates a journal at the session-owned audit path.
 	pub fn new(path: PathBuf) -> Self {
-		Self { path, append: tokio::sync::Mutex::new(()) }
+		Self { path, append: sync::Mutex::new(()) }
 	}
 }
 
@@ -714,10 +734,10 @@ impl DirectFilesystemJournal for DurableDirectFilesystemJournal {
 
 async fn append_json_line(
 	path: &Path,
-	lock: &tokio::sync::Mutex<()>,
+	lock: &sync::Mutex<()>,
 	value: &impl Serialize,
-) -> std::io::Result<()> {
-	let mut bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+) -> io::Result<()> {
+	let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
 	bytes.push(b'\n');
 	let _guard = lock.lock().await;
 	if let Some(parent) = path.parent() {
@@ -755,7 +775,7 @@ async fn execute_filesystem(
 	request: AuditedDirectFilesystemRequest,
 ) -> Result<DirectFilesystemOutput, DirectFilesystemAuthorityError> {
 	let failure =
-		|error: std::io::Error| DirectFilesystemAuthorityError::Execute(Str::from(error.to_string()));
+		|error: io::Error| DirectFilesystemAuthorityError::Execute(Str::from(error.to_string()));
 	match request.operation.as_str() {
 		"read" => {
 			let file = tokio::fs::File::open(&request.path)
@@ -846,7 +866,7 @@ async fn execute_filesystem(
 	}
 }
 
-fn filesystem_stat(metadata: &std::fs::Metadata) -> DirectFilesystemStat {
+fn filesystem_stat(metadata: &fs::Metadata) -> DirectFilesystemStat {
 	DirectFilesystemStat {
 		kind:        Str::new_static(if metadata.file_type().is_symlink() {
 			"symlink"
@@ -863,7 +883,7 @@ fn filesystem_stat(metadata: &std::fs::Metadata) -> DirectFilesystemStat {
 	}
 }
 
-fn file_kind(kind: &std::fs::FileType) -> &'static str {
+fn file_kind(kind: &fs::FileType) -> &'static str {
 	if kind.is_symlink() {
 		"symlink"
 	} else if kind.is_file() {
@@ -917,8 +937,8 @@ impl EnvdHostOwnerBackends {
 			data_dir,
 			detected_sandbox_capabilities(),
 			approvals,
-			crate::worker_pool::DEFAULT_WORKER_LAYER_CEILING,
-			crate::worker_pool::DEFAULT_MAX_CONCURRENT_SPAWNS,
+			worker_pool::DEFAULT_WORKER_LAYER_CEILING,
+			worker_pool::DEFAULT_MAX_CONCURRENT_SPAWNS,
 		)
 	}
 
@@ -1007,7 +1027,7 @@ pub fn direct_filesystem_control_factory(
 	executor: Arc<dyn DirectFilesystemExecutor>,
 ) -> Arc<dyn ControlAuthorityFactory> {
 	Arc::new(move |identity| {
-		Ok(Arc::new(super::params::DirectFilesystemControlOwner::new(
+		Ok(Arc::new(DirectFilesystemControlOwner::new(
 			identity,
 			Arc::clone(&journal),
 			Arc::clone(&executor),

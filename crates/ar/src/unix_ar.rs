@@ -1,6 +1,10 @@
 //! Unix ar, BSD archive, GNU archive, and COFF import-library indexing.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{
+	io,
+	io::{Read, Seek, SeekFrom, Write},
+	str,
+};
 
 use omp_core::Str;
 
@@ -237,7 +241,7 @@ fn ascii_field(bytes: &[u8]) -> Result<&str> {
 	{
 		return Err(Error::InvalidArchive("invalid ar archive header field"));
 	}
-	std::str::from_utf8(&bytes[..end])
+	str::from_utf8(&bytes[..end])
 		.map_err(|_| Error::InvalidArchive("invalid ar archive header field"))
 }
 
@@ -323,7 +327,7 @@ fn read_exact_at(
 	}
 	source.seek(SeekFrom::Start(offset))?;
 	source.read_exact(bytes).map_err(|error| {
-		if error.kind() == std::io::ErrorKind::UnexpectedEof {
+		if error.kind() == io::ErrorKind::UnexpectedEof {
 			Error::InvalidArchive(message)
 		} else {
 			error.into()

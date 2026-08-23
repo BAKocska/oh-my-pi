@@ -1,18 +1,28 @@
 //! Filesystem interaction in the shell.
 
-use std::path::{Path, PathBuf};
+use std::{
+	fs::{self, OpenOptions},
+	io, mem,
+	path::{Path, PathBuf},
+};
 
 use omp_core::NormalizePath as _;
 
 use crate::{
-	ExecutionParameters, ShellFd,
+	ExecutionParameters, Shell, ShellFd,
 	env::{EnvironmentLookup, EnvironmentScope},
-	error, openfiles, pathsearch,
-	sys::users,
+	error,
+	extensions::ShellExtensions,
+	openfiles::{OpenFile, OpenFiles},
+	pathsearch,
+	sys::{
+		fs::{normalize_shell_path, split_paths, try_open_special_file},
+		users,
+	},
 	variables,
 };
 
-impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+impl<SE: ShellExtensions> Shell<SE> {
 	/// Sets the shell's current working directory to the given path.
 	///
 	/// # Arguments
@@ -21,7 +31,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	pub fn set_working_dir(&mut self, target_dir: impl AsRef<Path>) -> Result<(), error::Error> {
 		let abs_path = self.absolute_path(target_dir.as_ref());
 
-		match std::fs::metadata(&abs_path) {
+		match fs::metadata(&abs_path) {
 			Ok(m) => {
 				if !m.is_dir() {
 					return Err(error::ErrorKind::NotADirectory(abs_path).into());
@@ -44,7 +54,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 			EnvironmentLookup::Anywhere,
 			EnvironmentScope::Global,
 		)?;
-		let oldpwd = std::mem::replace(self.working_dir_mut(), cleaned_path);
+		let oldpwd = mem::replace(self.working_dir_mut(), cleaned_path);
 
 		self.env.update_or_add(
 			"OLDPWD",
@@ -93,7 +103,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		filename: &'a str,
 	) -> impl Iterator<Item = PathBuf> + 'a {
 		let path_var = self.env.get_str("PATH", self).unwrap_or_default();
-		let paths = crate::sys::fs::split_paths(path_var.as_ref());
+		let paths = split_paths(path_var.as_ref());
 
 		pathsearch::search_for_executable(paths, filename)
 	}
@@ -110,7 +120,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		case_insensitive: bool,
 	) -> impl Iterator<Item = PathBuf> {
 		let path_var = self.env.get_str("PATH", self).unwrap_or_default();
-		let paths = crate::sys::fs::split_paths(path_var.as_ref());
+		let paths = split_paths(path_var.as_ref());
 
 		pathsearch::search_for_executable_with_prefix(paths, filename_prefix, case_insensitive)
 	}
@@ -127,7 +137,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		candidate_name: S,
 	) -> Option<PathBuf> {
 		let path_var = self.env_str("PATH").unwrap_or_default();
-		let paths = crate::sys::fs::split_paths(path_var.as_ref());
+		let paths = split_paths(path_var.as_ref());
 		pathsearch::search_for_executable(paths, candidate_name.as_ref()).next()
 	}
 
@@ -164,7 +174,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	///
 	/// * `path` - The path to get the absolute form of.
 	pub fn absolute_path(&self, path: impl AsRef<Path>) -> PathBuf {
-		let normalized_path = crate::sys::fs::normalize_shell_path(path.as_ref());
+		let normalized_path = normalize_shell_path(path.as_ref());
 		let path = normalized_path.as_ref();
 		if path.as_os_str().is_empty() || path.is_absolute() {
 			path.to_owned()
@@ -184,16 +194,16 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	/// * `params` - Execution parameters.
 	pub(crate) fn open_file(
 		&self,
-		options: &std::fs::OpenOptions,
+		options: &OpenOptions,
 		path: impl AsRef<Path>,
 		params: &ExecutionParameters,
-	) -> Result<openfiles::OpenFile, std::io::Error> {
+	) -> Result<OpenFile, io::Error> {
 		// Give platform-specific code a chance to handle special files
 		// (e.g. /dev/null on Windows, which needs to open NUL instead).
 		// This is checked before absolute_path so that paths like /dev/null
 		// are intercepted on platforms where they aren't valid native paths.
-		if let Some(result) = crate::sys::fs::try_open_special_file(path.as_ref()) {
-			return result.map(openfiles::OpenFile::from);
+		if let Some(result) = try_open_special_file(path.as_ref()) {
+			return result.map(OpenFile::from);
 		}
 
 		let path_to_open = self.absolute_path(path.as_ref());
@@ -219,14 +229,11 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	/// # Arguments
 	///
 	/// * `open_files` - The new set of open files to use.
-	pub fn replace_open_files(
-		&mut self,
-		open_fds: impl Iterator<Item = (ShellFd, openfiles::OpenFile)>,
-	) {
-		self.open_files = openfiles::OpenFiles::from(open_fds);
+	pub fn replace_open_files(&mut self, open_fds: impl Iterator<Item = (ShellFd, OpenFile)>) {
+		self.open_files = OpenFiles::from(open_fds);
 	}
 
-	pub(crate) const fn persistent_open_files(&self) -> &openfiles::OpenFiles {
+	pub(crate) const fn persistent_open_files(&self) -> &OpenFiles {
 		&self.open_files
 	}
 }

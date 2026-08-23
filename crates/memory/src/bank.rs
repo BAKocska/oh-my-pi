@@ -2,7 +2,8 @@
 
 use std::{
 	collections::HashSet,
-	fmt,
+	fmt::{self, Display},
+	fs, io,
 	path::{Path, PathBuf},
 };
 
@@ -33,7 +34,7 @@ impl BankId {
 	}
 }
 
-impl fmt::Display for BankId {
+impl Display for BankId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.as_str())
 	}
@@ -130,9 +131,9 @@ pub fn discover_legacy_banks(
 	workspace_root: &Path,
 ) -> Result<Vec<BankId>> {
 	let banks_dir = db_dir.join("banks");
-	let entries = match std::fs::read_dir(banks_dir) {
+	let entries = match fs::read_dir(banks_dir) {
 		Ok(entries) => entries,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
 		Err(error) => return Err(error.into()),
 	};
 	let have = resolved.iter().map(BankId::as_str).collect::<HashSet<_>>();

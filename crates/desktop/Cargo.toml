@@ -17,6 +17,8 @@ bytes.workspace = true
 flume.workspace = true
 image.workspace = true
 parking_lot.workspace = true
+strum.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

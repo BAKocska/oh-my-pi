@@ -1,7 +1,10 @@
 //! Direct GitHub REST resolver for issue:// and pr:// resources.
 
 use std::{
+	fmt::{self, Display},
+	fs,
 	path::{Path, PathBuf},
+	str,
 	sync::{Arc, OnceLock},
 	time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,6 +26,9 @@ use omp_storage::github_cache::{
 };
 use omp_tools::read::{Fault, resolver::Resolve, selector::ParsedSelector};
 use serde_json::Value;
+use wreq::redirect;
+
+use super::tool_url;
 
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
@@ -81,8 +87,8 @@ impl GithubCredentialBridge {
 	}
 }
 
-impl std::fmt::Debug for GithubCredentialBridge {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for GithubCredentialBridge {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("GithubCredentialBridge")
 			.field("bound", &self.authority.get().is_some())
@@ -117,7 +123,7 @@ impl GithubResolver {
 			cache,
 			credentials,
 			client: wreq::Client::builder()
-				.redirect(wreq::redirect::Policy::none())
+				.redirect(redirect::Policy::none())
 				.build()
 				.expect("GitHub client"),
 		}
@@ -289,7 +295,7 @@ impl Resolve for GithubResolver {
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
 		let bytes = self.resolve(resource, None).await?;
-		super::tool_url::select_bytes(&Default::default(), resource, CowBytes::from(bytes), selector)
+		tool_url::select_bytes(&Default::default(), resource, CowBytes::from(bytes), selector)
 	}
 
 	async fn read_query<'a>(
@@ -299,12 +305,12 @@ impl Resolve for GithubResolver {
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
 		let bytes = self.resolve(resource, query).await?;
-		super::tool_url::select_bytes(&Default::default(), resource, CowBytes::from(bytes), selector)
+		tool_url::select_bytes(&Default::default(), resource, CowBytes::from(bytes), selector)
 	}
 }
 
-impl std::fmt::Debug for GithubResolver {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for GithubResolver {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str("GithubResolver(..)")
 	}
 }
@@ -490,7 +496,7 @@ impl Target {
 
 	fn render(&self, body: &[u8], comments: Option<&[Value]>) -> Result<Vec<u8>, Fault> {
 		if let View::Diff { mode } = &self.view {
-			let text = std::str::from_utf8(body).map_err(|_| invalid("GitHub diff is not UTF-8."))?;
+			let text = str::from_utf8(body).map_err(|_| invalid("GitHub diff is not UTF-8."))?;
 			return render_diff(text, mode, &self.repo, self.number.expect("diff number"));
 		}
 		let value: Value = serde_json::from_slice(body).map_err(|error| Fault::Invalid {
@@ -607,7 +613,7 @@ fn render_diff(text: &str, mode: &DiffMode, repo: &str, number: u64) -> Result<V
 	Ok(out.into_bytes())
 }
 pub(super) fn infer_repo(root: &Path) -> Result<Str, Fault> {
-	let config = std::fs::read_to_string(root.join(".git/config"))
+	let config = fs::read_to_string(root.join(".git/config"))
 		.map_err(|_| invalid("Cannot infer GitHub repo; use owner/repo explicitly."))?;
 	let url = config
 		.lines()
@@ -639,9 +645,9 @@ fn now_ms() -> u64 {
 fn invalid(message: &'static str) -> Fault {
 	Fault::Invalid { message: Str::new_static(message) }
 }
-fn cache_fault(error: impl std::fmt::Display) -> Fault {
+fn cache_fault(error: impl Display) -> Fault {
 	Fault::Source { message: Str::new(error.to_string()) }
 }
-fn http_fault(error: impl std::fmt::Display) -> Fault {
+fn http_fault(error: impl Display) -> Fault {
 	Fault::Source { message: Str::new(format!("GitHub API request failed: {error}")) }
 }

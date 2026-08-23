@@ -4,8 +4,12 @@
 //! Base64, Base32, Hex). These encodings use efficient bit manipulation
 //! algorithms instead of division.
 
-use core::{fmt, mem::MaybeUninit, slice, str};
-use std::{cmp::Ordering, intrinsics, io, iter::FusedIterator};
+use core::{
+	fmt::{self, Display},
+	mem::MaybeUninit,
+	slice, str,
+};
+use std::{cmp::Ordering, hint, intrinsics, io, iter::FusedIterator};
 
 use bytes::{BufMut, Bytes};
 
@@ -157,7 +161,7 @@ impl<const N: usize> Encoding<N> {
 	pub const fn decode(&self, ch: u8) -> Option<u8> {
 		let val = self.dtable[ch as usize];
 		if val >= 0xfe {
-			std::hint::cold_path();
+			hint::cold_path();
 			None
 		} else {
 			Some(val)
@@ -599,7 +603,7 @@ impl<const N: usize, const K: usize> TryFrom<Decoder<'_, N>> for [u8; K] {
 	}
 }
 
-impl<const N: usize> fmt::Display for Decoder<'_, N> {
+impl<const N: usize> Display for Decoder<'_, N> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		for byte in self.clone() {
 			if let Ok(byte) = byte {
@@ -862,7 +866,7 @@ impl<const N: usize> serde::Serialize for Encoder<'_, N> {
 	}
 }
 
-impl<const N: usize> fmt::Display for Encoder<'_, N> {
+impl<const N: usize> Display for Encoder<'_, N> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		format_with_precision(self.clone(), f)
 	}

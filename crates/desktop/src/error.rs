@@ -1,48 +1,54 @@
-use std::fmt;
-
 /// Stable category for a desktop operation failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
 pub enum ErrorCode {
+	/// The OS has not granted a required capture, input, or accessibility
+	/// permission.
 	PermissionDenied,
+	/// The backend could not enumerate, capture, compose, or encode the
+	/// requested image.
 	CaptureFailed,
+	/// The backend could not configure or deliver the requested pointer or
+	/// keyboard input.
 	InputFailed,
+	/// This backend cannot reliably deliver input to the requested background
+	/// window.
 	BackgroundUnavailable,
+	/// The requested window, focused window, or its owning application no longer
+	/// exists.
 	WindowNotFound,
+	/// A capture target, display selector, window id, or capture limit is
+	/// invalid.
 	InvalidTarget,
+	/// A key, chord, or modifier specification is malformed or unsupported.
 	InvalidKey,
+	/// Coordinates cannot be mapped through the latest capture frame.
 	InvalidCoordinateFrame,
+	/// An accessibility reference has expired and no longer resolves.
 	StaleRef,
+	/// The selected backend does not provide accessibility operations.
 	AxUnsupported,
+	/// The accessibility backend failed to inspect or operate on an element.
 	AxFailed,
+	/// A desktop worker operation exceeded its deadline.
 	Timeout,
+	/// The desktop session is already closed or its worker closed during
+	/// shutdown.
 	Closed,
+	/// The desktop worker could not start, panicked, or stopped communicating
+	/// unexpectedly.
 	Internal,
 }
 
-impl ErrorCode {
-	pub(crate) const fn as_str(self) -> &'static str {
-		match self {
-			Self::PermissionDenied => "PermissionDenied",
-			Self::CaptureFailed => "CaptureFailed",
-			Self::InputFailed => "InputFailed",
-			Self::BackgroundUnavailable => "BackgroundUnavailable",
-			Self::WindowNotFound => "WindowNotFound",
-			Self::InvalidTarget => "InvalidTarget",
-			Self::InvalidKey => "InvalidKey",
-			Self::InvalidCoordinateFrame => "InvalidCoordinateFrame",
-			Self::StaleRef => "StaleRef",
-			Self::AxUnsupported => "AxUnsupported",
-			Self::AxFailed => "AxFailed",
-			Self::Timeout => "Timeout",
-			Self::Closed => "Closed",
-			Self::Internal => "Internal",
-		}
-	}
-}
-
-#[derive(Debug, Clone)]
+/// A desktop operation failure with a stable category and backend-provided
+/// detail.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{code}: {message}")]
 pub struct DesktopError {
+	/// Machine-readable category suitable for branching independently of backend
+	/// details.
 	pub code:    ErrorCode,
+	/// Human-readable detail describing the failed operation and its native
+	/// cause.
 	pub message: String,
 }
 
@@ -107,14 +113,6 @@ impl DesktopError {
 		Self::new(ErrorCode::Internal, message)
 	}
 }
-
-impl fmt::Display for DesktopError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "{}: {}", self.code.as_str(), self.message)
-	}
-}
-
-impl std::error::Error for DesktopError {}
 
 /// Result returned by desktop operations.
 pub type DesktopResult<T> = Result<T, DesktopError>;

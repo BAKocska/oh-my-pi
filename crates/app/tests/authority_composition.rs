@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, sync::Arc};
+//! Verifies atomic binding, replacement, and revocation of composed session
+//! authorities.
+
+use std::{collections::BTreeSet, fs, sync::Arc};
 
 use async_trait::async_trait;
 use omp_app::chat_cmd::SessionControlFactories;
@@ -151,8 +154,8 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 	let scratch = tempfile::tempdir().expect("scratch");
 	let root = scratch.path().join("project");
 	let state = scratch.path().join("state");
-	std::fs::create_dir_all(&root).expect("project root");
-	std::fs::create_dir_all(&state).expect("state root");
+	fs::create_dir_all(&root).expect("project root");
+	fs::create_dir_all(&state).expect("state root");
 	let environment = ProjectEnvironment::connect_or_start(
 		&root,
 		&state,

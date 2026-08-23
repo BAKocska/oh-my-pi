@@ -1,6 +1,9 @@
 //! Typed device-tree paths shared by dispatch, journals, and provenance.
 
-use std::{fmt, str::FromStr};
+use std::{
+	fmt::{self, Display},
+	str::FromStr,
+};
 
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
@@ -72,7 +75,7 @@ impl FromStr for DevicePath {
 	}
 }
 
-impl fmt::Display for DevicePath {
+impl Display for DevicePath {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.name.as_str())?;
 		if let Some(sub) = &self.sub {

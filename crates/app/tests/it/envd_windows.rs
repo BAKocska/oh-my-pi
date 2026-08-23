@@ -13,7 +13,7 @@ use omp_proto::env::v1::{
 	ClientFrame, ClientHello, ServerFrame, ServerHello, client_frame, server_frame,
 };
 use omp_tool::Registry;
-use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::{net::windows::named_pipe::ClientOptions, time};
 
 fn unique_endpoint(test: &str) -> PathBuf {
 	PathBuf::from(format!(r"\\.\pipe\omp-env-test-{}-{test}", std::process::id()))
@@ -85,12 +85,12 @@ async fn typed_client_uses_shared_varint_codec_and_disconnects_cleanly() {
 		.expect("typed hello");
 	assert_eq!(hello.server_version, "windows-test");
 	drop(client);
-	tokio::time::timeout(Duration::from_secs(2), bridge)
+	time::timeout(Duration::from_secs(2), bridge)
 		.await
 		.expect("client bridge exits after disconnect")
 		.expect("client bridge task")
 		.expect("clean client bridge");
-	tokio::time::timeout(Duration::from_secs(2), server)
+	time::timeout(Duration::from_secs(2), server)
 		.await
 		.expect("server observes disconnect")
 		.expect("server task");
@@ -156,7 +156,7 @@ async fn unknown_frame_receives_the_same_protocol_error_as_stream_dispatch() {
 	assert!(matches!(response.body, Some(server_frame::Body::Error(_))));
 
 	drop(client);
-	tokio::time::timeout(Duration::from_secs(2), connection)
+	time::timeout(Duration::from_secs(2), connection)
 		.await
 		.expect("dispatch observes disconnect")
 		.expect("connection task");

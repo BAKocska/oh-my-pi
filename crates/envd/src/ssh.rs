@@ -2,26 +2,33 @@
 
 use std::{
 	collections::BTreeMap,
+	fs, io,
 	net::SocketAddr,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::Duration,
 };
 
+use flume::Receiver;
 use omp_core::{CowBytes, Str};
 use parking_lot::RwLock;
 use russh::{
-	client,
-	keys::{HashAlg, load_secret_key},
+	client, keys,
+	keys::{HashAlg, PrivateKeyWithHashAlg, agent::client::AgentClient, load_secret_key},
 };
-use russh_sftp::{client::SftpSession, protocol::OpenFlags};
+use russh_sftp::{
+	client::{SftpSession, error},
+	protocol::OpenFlags,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
-	io::{AsyncReadExt as _, AsyncWriteExt as _},
+	io::{AsyncReadExt as _, AsyncWriteExt as _, copy_bidirectional},
 	net::TcpListener,
-	task::{JoinHandle, JoinSet},
+	task::{JoinError, JoinHandle, JoinSet},
+	time,
 };
 use tokio_util::sync::CancellationToken;
+use toml::{de, ser};
 
 const DEFAULT_READ_LIMIT: usize = 8 * 1024 * 1024;
 const DEFAULT_WRITE_LIMIT: usize = 8 * 1024 * 1024;
@@ -68,7 +75,11 @@ pub enum AuthPolicy {
 	Agent,
 	/// Load one unencrypted private key after checking its filesystem
 	/// permissions.
-	Key { path: PathBuf },
+	Key {
+		/// Filesystem path passed to the key loader after rejecting unsafe
+		/// permissions.
+		path: PathBuf,
+	},
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -87,9 +98,9 @@ pub struct HostStore {
 impl HostStore {
 	/// Loads `hosts.toml`. A missing file produces an empty store.
 	pub fn load(path: &Path) -> Result<Self, SshError> {
-		let body = match std::fs::read_to_string(path) {
+		let body = match fs::read_to_string(path) {
 			Ok(body) => body,
-			Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+			Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
 			Err(source) => return Err(SshError::ConfigIo { path: path.to_path_buf(), source }),
 		};
 		let parsed: HostFile = toml::from_str(&body)
@@ -168,32 +179,46 @@ fn validate_host(host: &HostConfig) -> Result<(), SshError> {
 	Ok(())
 }
 
+/// Capabilities observed for a configured host and retained in the service
+/// cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HostCapabilities {
+	/// Whether an SFTP subsystem has been initialized successfully.
 	pub sftp: bool,
+	/// Whether execution succeeded or probing inferred support from SFTP
+	/// initialization.
 	pub exec: bool,
 }
 
-/// A bounded directory entry.
+/// A projection of one SFTP directory entry returned by a bounded listing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteEntry {
+	/// UTF-8 entry name returned by the SFTP directory listing.
 	pub name:      Str,
+	/// Whether the SFTP attributes identify this entry as a directory.
 	pub directory: bool,
+	/// SFTP-reported length in bytes, or zero when the server omits it.
 	pub size:      u64,
 }
 
-/// Bounded remote metadata.
+/// Projection of SFTP attributes for one remote path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteMetadata {
+	/// Whether the SFTP attributes identify the remote object as a directory.
 	pub directory: bool,
+	/// SFTP-reported length in bytes, or zero when the server omits it.
 	pub size:      u64,
 }
 
-/// Bounded command outcome.
+/// Projection of collected SSH exec-channel output and status messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecOutput {
+	/// Raw stdout bytes, bounded independently by the execution byte limit.
 	pub stdout:      CowBytes<'static>,
+	/// Raw stderr bytes, bounded independently by the execution byte limit.
 	pub stderr:      CowBytes<'static>,
+	/// Status sent by the SSH server, or `None` when the channel closed without
+	/// one.
 	pub exit_status: Option<u32>,
 }
 #[derive(Debug)]
@@ -217,7 +242,7 @@ pub enum InteractiveEvent {
 #[derive(Debug)]
 pub struct InteractiveChannel {
 	input:  flume::Sender<InteractiveInput>,
-	events: flume::Receiver<Result<InteractiveEvent, SshError>>,
+	events: Receiver<Result<InteractiveEvent, SshError>>,
 }
 
 impl InteractiveChannel {
@@ -255,7 +280,7 @@ impl InteractiveChannel {
 #[derive(Debug)]
 pub struct LocalForward {
 	local_addr: SocketAddr,
-	errors:     flume::Receiver<SshError>,
+	errors:     Receiver<SshError>,
 	shutdown:   CancellationToken,
 	task:       Option<JoinHandle<()>>,
 }
@@ -313,14 +338,19 @@ pub struct SshService {
 }
 
 impl SshService {
+	/// Creates a service backed by the supplied configured-host authority and an
+	/// empty capability cache.
 	pub fn new(hosts: HostStore) -> Self {
 		Self { hosts, capabilities: Arc::new(RwLock::new(BTreeMap::new())) }
 	}
 
+	/// Returns configured host aliases in deterministic lexical order.
 	pub fn aliases(&self) -> Vec<Str> {
 		self.hosts.aliases()
 	}
 
+	/// Returns capability flags recorded by SFTP initialization, execution, or
+	/// probing.
 	pub fn cached_capabilities(&self, alias: &str) -> Option<HostCapabilities> {
 		self.capabilities.read().get(alias).copied()
 	}
@@ -333,7 +363,7 @@ impl SshService {
 			(host.address.as_str(), host.port),
 			ClientHandler { expected: host.host_key.clone() },
 		);
-		let mut session = tokio::time::timeout(timeout, connect)
+		let mut session = time::timeout(timeout, connect)
 			.await
 			.map_err(|_| SshError::Timeout)??;
 		let authenticated = match &host.auth {
@@ -345,7 +375,7 @@ impl SshService {
 				session
 					.authenticate_publickey(
 						host.user.as_str(),
-						russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+						PrivateKeyWithHashAlg::new(Arc::new(key), hash),
 					)
 					.await?
 					.success()
@@ -372,6 +402,8 @@ impl SshService {
 		Ok(sftp)
 	}
 
+	/// Initializes SFTP, then marks both SFTP and exec available without running
+	/// a probe command.
 	pub async fn probe(&self, alias: &str) -> Result<HostCapabilities, SshError> {
 		let _ = self.sftp(alias).await?;
 		let mut caps = self.cached_capabilities(alias).unwrap_or_default();
@@ -380,6 +412,11 @@ impl SshService {
 		Ok(caps)
 	}
 
+	/// Reads a non-directory SFTP path without shell escaping or path rewriting.
+	///
+	/// The effective bound is the smaller of `max_bytes` and 8 MiB; metadata
+	/// known to exceed it, or a stream that crosses it, returns
+	/// [`SshError::Limit`].
 	pub async fn read(
 		&self,
 		alias: &str,
@@ -407,6 +444,11 @@ impl SshService {
 		Ok(CowBytes::from(bytes))
 	}
 
+	/// Creates or truncates an SFTP path and writes at most 8 MiB of bytes to
+	/// it.
+	///
+	/// The UTF-8 `path` is passed directly to SFTP, and completion includes a
+	/// server sync and channel shutdown.
 	pub async fn write(&self, alias: &str, path: &str, bytes: &[u8]) -> Result<(), SshError> {
 		if bytes.len() > DEFAULT_WRITE_LIMIT {
 			return Err(SshError::Limit { limit: DEFAULT_WRITE_LIMIT });
@@ -421,6 +463,11 @@ impl SshService {
 		Ok(())
 	}
 
+	/// Projects SFTP attributes for `path` into directory status and byte
+	/// length.
+	///
+	/// The UTF-8 path is passed directly to SFTP; an omitted server length is
+	/// reported as zero.
 	pub async fn stat(&self, alias: &str, path: &str) -> Result<RemoteMetadata, SshError> {
 		let metadata = self.sftp(alias).await?.metadata(path).await?;
 		Ok(RemoteMetadata {
@@ -429,6 +476,11 @@ impl SshService {
 		})
 	}
 
+	/// Lists an SFTP directory in entry-name order, without rewriting its UTF-8
+	/// path.
+	///
+	/// At most the smaller of `max_entries` and 1,000 entries are returned; the
+	/// boolean result reports whether additional entries were discarded.
 	pub async fn list(
 		&self,
 		alias: &str,
@@ -503,6 +555,11 @@ impl SshService {
 		Ok(LocalForward { local_addr, errors, shutdown, task: Some(task) })
 	}
 
+	/// Executes a non-interactive remote command and collects its raw channel
+	/// output.
+	///
+	/// NUL-containing commands are rejected. Stdout and stderr are each bounded
+	/// independently by the smaller of `max_bytes` and 1 MiB.
 	pub async fn exec(
 		&self,
 		alias: &str,
@@ -545,7 +602,7 @@ impl SshService {
 
 fn interactive_channel_pair() -> (
 	InteractiveChannel,
-	flume::Receiver<InteractiveInput>,
+	Receiver<InteractiveInput>,
 	flume::Sender<Result<InteractiveEvent, SshError>>,
 ) {
 	let (input, inputs) = flume::bounded(INTERACTIVE_CHANNEL_CAPACITY);
@@ -555,7 +612,7 @@ fn interactive_channel_pair() -> (
 
 async fn run_interactive_channel(
 	mut channel: russh::Channel<client::Msg>,
-	inputs: flume::Receiver<InteractiveInput>,
+	inputs: Receiver<InteractiveInput>,
 	events: flume::Sender<Result<InteractiveEvent, SshError>>,
 ) {
 	let result: Result<(), russh::Error> = async {
@@ -648,7 +705,7 @@ async fn run_local_forward(
 				};
 				connections.spawn(async move {
 					let mut stream = channel.into_stream();
-					tokio::io::copy_bidirectional(&mut socket, &mut stream).await?;
+					copy_bidirectional(&mut socket, &mut stream).await?;
 					Ok::<_, SshError>(())
 				});
 			},
@@ -673,7 +730,7 @@ fn append_bounded(target: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<()
 #[cfg(unix)]
 fn check_key_permissions(path: &Path) -> Result<(), SshError> {
 	use std::os::unix::fs::MetadataExt as _;
-	let metadata = std::fs::metadata(path)
+	let metadata = fs::metadata(path)
 		.map_err(|source| SshError::ConfigIo { path: path.to_path_buf(), source })?;
 	if metadata.mode() & 0o077 != 0 {
 		return Err(SshError::UnsafeKeyPermissions { path: path.to_path_buf() });
@@ -693,7 +750,7 @@ async fn authenticate_agent(
 	session: &mut client::Handle<ClientHandler>,
 	user: &str,
 ) -> Result<bool, SshError> {
-	let mut agent = russh::keys::agent::client::AgentClient::connect_env().await?;
+	let mut agent = AgentClient::connect_env().await?;
 	for identity in agent.request_identities().await? {
 		let key = identity.public_key().into_owned();
 		if session
@@ -717,74 +774,137 @@ async fn authenticate_agent(
 /// Native SSH operation failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
+	/// Reading host configuration or private-key metadata failed.
 	#[error("cannot read SSH host configuration {path}")]
 	ConfigIo {
+		/// Configuration or private-key path that could not be inspected.
 		path:   PathBuf,
+		/// Underlying filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
+	/// TOML host configuration could not be decoded.
 	#[error("invalid SSH host configuration {path}")]
 	ConfigParse {
+		/// Configuration file containing invalid TOML or fields.
 		path:   PathBuf,
+		/// TOML decoder failure.
 		#[source]
-		source: toml::de::Error,
+		source: de::Error,
 	},
+	/// The in-memory host map could not be serialized as TOML.
 	#[error("cannot encode SSH host configuration {path}")]
 	ConfigEncode {
+		/// Destination configuration path associated with the serialization
+		/// attempt.
 		path:   PathBuf,
+		/// TOML encoder failure.
 		#[source]
-		source: toml::ser::Error,
+		source: ser::Error,
 	},
+	/// Atomically replacing the persisted host configuration failed.
 	#[error("cannot atomically write SSH host configuration {path}")]
 	ConfigWrite {
+		/// Configuration path that could not be replaced.
 		path:   PathBuf,
+		/// Atomic settings-write failure.
 		#[source]
 		source: omp_settings::io::SettingsIoError,
 	},
+	/// A host alias was empty, exceeded 128 bytes, or contained a disallowed
+	/// ASCII character.
 	#[error("invalid configured SSH alias {alias}")]
-	InvalidAlias { alias: Str },
+	InvalidAlias {
+		/// Rejected alias supplied by the caller or configuration.
+		alias: Str,
+	},
+	/// A host lacked an address, user, nonzero port, or `SHA256:` host-key
+	/// fingerprint.
 	#[error("configured SSH host is missing an address, user, port, or SHA-256 host key")]
 	InvalidHostConfig,
+	/// No configured host matched the requested alias.
 	#[error("SSH host {alias} is not configured")]
-	UnknownHost { alias: Str },
+	UnknownHost {
+		/// Alias absent from the configured-host authority.
+		alias: Str,
+	},
+	/// A private key failed the platform filesystem-safety check.
 	#[error("private key {path} has unsafe permissions")]
-	UnsafeKeyPermissions { path: PathBuf },
+	UnsafeKeyPermissions {
+		/// Path with Unix group/other access bits, or a non-file path on other
+		/// platforms.
+		path: PathBuf,
+	},
+	/// Loading or decoding a configured private key failed.
 	#[error("cannot load private key {path}")]
 	Key {
+		/// Configured private-key path passed to the key loader.
 		path:   PathBuf,
+		/// Key loading or decoding failure.
 		#[source]
-		source: russh::keys::Error,
+		source: keys::Error,
 	},
+	/// The configured key or every available agent identity was rejected by the
+	/// host.
 	#[error("SSH authentication failed for configured host {alias}")]
-	Authentication { alias: Str },
+	Authentication {
+		/// Configured host whose authentication attempts were rejected.
+		alias: Str,
+	},
+	/// Establishing the SSH transport exceeded the host timeout, clamped to
+	/// 1–120 seconds.
 	#[error("SSH operation timed out")]
 	Timeout,
+	/// A bounded file-read request targeted a directory.
 	#[error("remote path is a directory")]
 	IsDirectory,
+	/// A file read, write, command stream, or interactive input exceeded its
+	/// byte bound.
 	#[error("remote operation exceeded its {limit}-byte/item bound")]
-	Limit { limit: usize },
+	Limit {
+		/// Maximum permitted bytes for the failing operation.
+		limit: usize,
+	},
+	/// A command was rejected locally because its byte representation contained
+	/// NUL.
 	#[error("remote command contains a NUL byte")]
 	InvalidCommand,
+	/// Interactive input could not be delivered because the command task had
+	/// closed.
 	#[error("interactive SSH command channel is closed")]
 	InteractiveClosed,
+	/// A forwarding target had an empty host name or zero port.
 	#[error("SSH local-forward target is invalid")]
 	InvalidForwardTarget,
+	/// A loopback forwarding listener already had the maximum 16 active
+	/// connections.
 	#[error("SSH local-forward connection limit {limit} was reached")]
-	ForwardCapacity { limit: usize },
+	ForwardCapacity {
+		/// Maximum number of simultaneous forwarded connections.
+		limit: usize,
+	},
+	/// SSH-agent authentication was requested on a platform without native agent
+	/// support.
 	#[error("native SSH agent authentication is unavailable on this platform")]
 	AgentUnavailable,
+	/// The underlying SSH transport or channel operation failed.
 	#[error(transparent)]
 	Ssh(#[from] russh::Error),
+	/// The underlying SFTP protocol or subsystem operation failed.
 	#[error(transparent)]
-	Sftp(#[from] russh_sftp::client::error::Error),
+	Sftp(#[from] error::Error),
+	/// Local socket or asynchronous stream I/O failed.
 	#[error(transparent)]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
+	/// Connecting to or querying the native SSH agent failed.
 	#[error(transparent)]
-	Agent(#[from] russh::keys::Error),
+	Agent(#[from] keys::Error),
+	/// The SSH agent could not complete a public-key authentication exchange.
 	#[error(transparent)]
 	AgentAuth(#[from] russh::AgentAuthError),
+	/// A spawned forwarding task panicked or was cancelled unexpectedly.
 	#[error(transparent)]
-	Join(#[from] tokio::task::JoinError),
+	Join(#[from] JoinError),
 }
 #[cfg(test)]
 mod tests {

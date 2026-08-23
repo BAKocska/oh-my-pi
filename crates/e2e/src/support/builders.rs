@@ -2,13 +2,16 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use omp_agent::ProjectionError;
-use omp_proto::{inference::v1 as inference, thread::v1 as thread};
+use omp_proto::{
+	inference::v1::{self as inference, turn_event, value},
+	thread::v1::{self as thread, item},
+};
 use omp_tool::{TOOL_REV_PROP, ToolIdentity};
 
 /// Builds one canonical text message item with no authority sequence stamp.
 pub fn message_item(role: thread::Role, text: impl Into<String>) -> thread::Item {
 	thread::Item {
-		kind: Some(thread::item::Kind::Message(thread::Message {
+		kind: Some(item::Kind::Message(thread::Message {
 			role:  role as i32,
 			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.into())) }],
 		})),
@@ -36,7 +39,7 @@ pub fn tool_call_item(
 	thread::Item {
 		seq: 0,
 		created_at_ms,
-		kind: Some(thread::item::Kind::ToolCall(thread::ToolCall {
+		kind: Some(item::Kind::ToolCall(thread::ToolCall {
 			id: call_id.into(),
 			name: identity.name.as_str().to_owned(),
 			args_json: args_json.into(),
@@ -70,23 +73,23 @@ pub fn tool_result_item(
 
 /// Builds the first successful event in an admitted turn.
 pub const fn accepted_event(replay: bool) -> inference::TurnEvent {
-	turn_event(inference::turn_event::Event::Accepted(inference::Accepted { replay }))
+	turn_event(turn_event::Event::Accepted(inference::Accepted { replay }))
 }
 
 /// Builds one terminal canonical turn outcome event.
 pub const fn outcome_event(outcome: inference::Outcome) -> inference::TurnEvent {
-	turn_event(inference::turn_event::Event::Outcome(outcome))
+	turn_event(turn_event::Event::Outcome(outcome))
 }
 
 /// Wraps a generated inference event body.
-pub const fn turn_event(event: inference::turn_event::Event) -> inference::TurnEvent {
+pub const fn turn_event(event: turn_event::Event) -> inference::TurnEvent {
 	inference::TurnEvent { event: Some(event) }
 }
 
 fn tool_revision_props(identity: &ToolIdentity) -> inference::ValueMap {
 	inference::ValueMap {
 		fields: BTreeMap::from([(TOOL_REV_PROP.to_owned(), inference::Value {
-			kind: Some(inference::value::Kind::String(identity.rev.to_string())),
+			kind: Some(value::Kind::String(identity.rev.to_string())),
 		})]),
 	}
 }

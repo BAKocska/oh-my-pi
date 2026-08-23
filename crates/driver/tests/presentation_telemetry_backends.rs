@@ -1,3 +1,6 @@
+//! Proves telemetry queries enforce installation floors and verdict jobs remain
+//! idempotent.
+
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
@@ -11,6 +14,7 @@ use omp_driver::stats_api::{
 	},
 };
 use omp_env::EnvClient;
+use omp_envd::exthost::control::ControlInvocationAuthority;
 use omp_storage::telemetry_index::TelemetryIndex;
 use omp_telemetry::authority::{DurableTelemetryQuery, TelemetryAuthorityIdentity};
 use omp_tool::ArtifactLifetime;
@@ -105,7 +109,7 @@ impl PromptProjectionDispatcher for UnusedProjection {
 	async fn project(
 		&self,
 		_identity: Arc<VerdictAuthorityIdentity>,
-		_invocation: omp_envd::exthost::control::ControlInvocationAuthority,
+		_invocation: ControlInvocationAuthority,
 		_request: PromptProjectionRequest,
 	) -> Result<Value, VerdictAuthorityError> {
 		Ok(Value::Null)

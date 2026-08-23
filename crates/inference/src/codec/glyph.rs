@@ -1,6 +1,6 @@
 //! Reversible private-use glyph projection at the provider wire boundary.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, mem, str, sync};
 
 use bytes::Bytes;
 use omp_core::{Str, sf};
@@ -9,8 +9,7 @@ use serde_json::{Map, Value};
 use super::{Decoder, DecoderState, ProviderControlInput, RawEvent, UnvalidatedToolCall};
 use crate::{
 	call::{
-		ChatRequest, ContentPart, Message, OpaqueJson, OperationCall, Role, ToolDefinition,
-		ToolResultContent,
+		ContentPart, Message, OpaqueJson, OperationCall, Role, ToolDefinition, ToolResultContent,
 	},
 	error::Error,
 	event::ChatEvent,
@@ -67,7 +66,7 @@ pub(crate) fn encode_operation(operation: &OperationCall) -> Option<OperationCal
 		}
 	}
 	encoded.messages = messages.into();
-	Some(OperationCall::Chat(std::sync::Arc::new(encoded)))
+	Some(OperationCall::Chat(sync::Arc::new(encoded)))
 }
 
 /// Wraps an ordinary decoder so provider-authored glyph tokens become canonical
@@ -309,7 +308,7 @@ fn decode_value(value: &mut Value) {
 		Value::String(text) => *text = decode_text(text).to_string(),
 		Value::Array(items) => items.iter_mut().for_each(decode_value),
 		Value::Object(fields) => {
-			let old = std::mem::take(fields);
+			let old = mem::take(fields);
 			for (key, mut value) in old {
 				decode_value(&mut value);
 				fields.insert(decode_text(&key).to_string(), value);
@@ -332,12 +331,12 @@ impl StreamingTextDecoder {
 			return None;
 		}
 		let suffix = self.held.split_off(split);
-		let visible = std::mem::replace(&mut self.held, suffix);
+		let visible = mem::replace(&mut self.held, suffix);
 		Some(decode_text(&visible))
 	}
 
 	fn finish(&mut self) -> Option<Str> {
-		(!self.held.is_empty()).then(|| decode_text(&std::mem::take(&mut self.held)))
+		(!self.held.is_empty()).then(|| decode_text(&mem::take(&mut self.held)))
 	}
 }
 
@@ -413,7 +412,7 @@ fn decode_unvalidated_call(call: &mut UnvalidatedToolCall) {
 		if let Ok(arguments) = serde_json::to_vec(&value) {
 			call.arguments = Bytes::from(arguments);
 		}
-	} else if let Ok(text) = std::str::from_utf8(&call.arguments) {
+	} else if let Ok(text) = str::from_utf8(&call.arguments) {
 		call.arguments = Bytes::copy_from_slice(decode_text(text).as_bytes());
 	}
 }
@@ -457,8 +456,11 @@ impl Decoder for GlyphDecoder {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::call::{ChatRequest, NegotiationPolicy, Sampling, Setting};
+	use super::{super::ToolInputKind as SuperToolInputKind, *};
+	use crate::{
+		call::{ChatRequest, NegotiationPolicy, Sampling, Setting},
+		id::ToolCallId as IdToolCallId,
+	};
 
 	#[test]
 	fn glyph_text_round_trips_private_use_planes_and_literal_tokens() {
@@ -486,7 +488,7 @@ mod tests {
 				},
 			}]
 			.into(),
-			hosted_tools:      std::sync::Arc::from([]),
+			hosted_tools:      sync::Arc::from([]),
 			tool_choice:       Setting::Unset,
 			output:            Setting::Unset,
 			reasoning:         Setting::Unset,
@@ -496,10 +498,10 @@ mod tests {
 			sampling:          Sampling::default(),
 			max_output_tokens: None,
 			top_logprobs:      None,
-			safety:            std::sync::Arc::from([]),
+			safety:            sync::Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
 		};
-		let operation = OperationCall::Chat(std::sync::Arc::new(request));
+		let operation = OperationCall::Chat(sync::Arc::new(request));
 		let OperationCall::Chat(encoded) = encode_operation(&operation).expect("active codec") else {
 			unreachable!()
 		};
@@ -532,9 +534,9 @@ mod tests {
 	#[test]
 	fn tool_argument_values_and_keys_decode_recursively() {
 		let mut call = UnvalidatedToolCall {
-			id:         crate::id::ToolCallId::new("call"),
+			id:         IdToolCallId::new("call"),
 			name:       sf!("write"),
-			input_kind: super::super::ToolInputKind::Json,
+			input_kind: SuperToolInputKind::Json,
 			arguments:  Bytes::from_static(r#"{"⟦Ue0a0⟧":"path/⟦Ue0a1⟧"}"#.as_bytes()),
 		};
 		decode_unvalidated_call(&mut call);

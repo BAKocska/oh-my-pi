@@ -2,7 +2,7 @@
 
 use std::{
 	collections::HashMap,
-	fs,
+	fs::{self, OpenOptions},
 	io::{self, Read as _, Write as _},
 	path::{Component, Path, PathBuf},
 	sync::{
@@ -18,6 +18,7 @@ use omp_proto::env::v1::{
 };
 use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::{task, time};
 use url::Url;
 
 const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -100,7 +101,7 @@ impl ResourceMaterializer {
 		request: MaterializeRequest,
 	) -> Result<MaterializationLease, MaterializationError> {
 		let inner = Arc::clone(&self.inner);
-		let lease = tokio::task::spawn_blocking(move || inner.materialize(request))
+		let lease = task::spawn_blocking(move || inner.materialize(request))
 			.await
 			.map_err(|source| io::Error::other(source))??;
 		self.schedule_cleanup(lease.lease_id.clone(), lease.expires_at_ms);
@@ -114,7 +115,7 @@ impl ResourceMaterializer {
 		let lease_id = request.lease_id;
 		let inner = Arc::clone(&self.inner);
 		let released = lease_id.clone();
-		tokio::task::spawn_blocking(move || inner.release(&lease_id))
+		task::spawn_blocking(move || inner.release(&lease_id))
 			.await
 			.map_err(|source| io::Error::other(source))??;
 		Ok(MaterializationReleased { lease_id: released })
@@ -125,11 +126,9 @@ impl ResourceMaterializer {
 		tokio::spawn(async move {
 			let now = now_ms();
 			if expires_at_ms > now {
-				tokio::time::sleep(Duration::from_millis(expires_at_ms - now)).await;
+				time::sleep(Duration::from_millis(expires_at_ms - now)).await;
 			}
-			let _ =
-				tokio::task::spawn_blocking(move || cleanup_expired(weak, lease_id, expires_at_ms))
-					.await;
+			let _ = task::spawn_blocking(move || cleanup_expired(weak, lease_id, expires_at_ms)).await;
 		});
 	}
 }
@@ -239,7 +238,7 @@ impl Inner {
 				if !canonical_parent.starts_with(&self.local_root) {
 					return Err(MaterializationError::OutsideGrant);
 				}
-				fs::OpenOptions::new()
+				OpenOptions::new()
 					.write(true)
 					.create_new(true)
 					.open(&candidate)?;

@@ -1,6 +1,12 @@
 //! Content-Length transport framing and protocol-v2 logical frame chunking.
 
-use std::{collections::HashSet, hash::BuildHasher};
+use std::{
+	collections::HashSet,
+	error,
+	fmt::{self, Display},
+	hash::BuildHasher,
+	mem, str,
+};
 
 use omp_core::base64;
 use serde_json::{Map, Value, json};
@@ -56,8 +62,8 @@ pub enum FramingError {
 	},
 }
 
-impl std::fmt::Display for FramingError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for FramingError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::FrameTooLarge { bytes } => {
 				write!(f, "physical RPC frame is {bytes} bytes; limit is {MAX_FRAME_BYTES}")
@@ -74,8 +80,8 @@ impl std::fmt::Display for FramingError {
 	}
 }
 
-impl std::error::Error for FramingError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for FramingError {
+	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		match self {
 			Self::Json(error) => Some(error),
 			_ => None,
@@ -178,7 +184,7 @@ impl ContentLengthDecoder {
 	pub fn take_remainder(&mut self) -> Vec<u8> {
 		self.body_length = None;
 		self.discard_remaining = 0;
-		std::mem::take(&mut self.buffer)
+		mem::take(&mut self.buffer)
 	}
 
 	/// Returns the lifetime number of non-fatal resynchronizations.
@@ -207,7 +213,7 @@ fn parse_content_length(header: &[u8]) -> Option<usize> {
 		if !name.eq_ignore_ascii_case(b"content-length") {
 			return None;
 		}
-		std::str::from_utf8(&value[1..]).ok()?.trim().parse().ok()
+		str::from_utf8(&value[1..]).ok()?.trim().parse().ok()
 	})
 }
 

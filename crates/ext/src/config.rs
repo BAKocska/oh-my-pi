@@ -3,11 +3,11 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	env,
-	path::PathBuf,
+	path::{Path, PathBuf},
 };
 
 use omp_core::{Str, sf};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 
 use super::{ExtensionCode, ExtensionError, Layer};
 
@@ -546,10 +546,7 @@ pub struct AmbientPaths {
 /// Builds ambient discovery paths. Workspace paths are included on the
 /// workspace side; callers do not invoke this for a remote workspace on the
 /// client. Compatibility roots are diagnostic-only (`W-FOREIGN-ROOT`).
-pub fn ambient_paths(
-	data_dir: &std::path::Path,
-	workspace: Option<&std::path::Path>,
-) -> AmbientPaths {
+pub fn ambient_paths(data_dir: &Path, workspace: Option<&Path>) -> AmbientPaths {
 	let mut paths = AmbientPaths {
 		manifest_roots:  Vec::new(),
 		config_files:    vec![data_dir.join("config.toml")],
@@ -870,10 +867,7 @@ impl StaticDeclarations {
 					| "eager-ui"
 					| "before_ui_input"
 			) {
-				return Err(serde::de::Error::custom(format!(
-					"unknown activation trigger `{}`",
-					row.trigger
-				)));
+				return Err(de::Error::custom(format!("unknown activation trigger `{}`", row.trigger)));
 			}
 			match row.kind.as_str() {
 				"soft" | "hard" | "tool" => tools.push(row.clone()),
@@ -895,9 +889,7 @@ impl StaticDeclarations {
 				"placement" => placement.push(row.clone()),
 				"skills" | "rules" | "context-files" | "prompts" => {},
 				kind => {
-					return Err(serde::de::Error::custom(format!(
-						"unknown static declaration kind `{kind}`"
-					)));
+					return Err(de::Error::custom(format!("unknown static declaration kind `{kind}`")));
 				},
 			}
 		}

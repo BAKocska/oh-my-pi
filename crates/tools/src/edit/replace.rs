@@ -1,5 +1,7 @@
 //! The historical replacement dialect and its lossless lift data.
 
+use std::{fmt, path::Path, str};
+
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
@@ -213,7 +215,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 					let mut added_lines = 0;
 					let mut removed_lines = 0;
 					for (work, projection) in works.iter().zip(&projections) {
-						if let Ok(diff) = numbered_diff(work.prepared.base_bytes(), &projection.after, Some(std::path::Path::new(work.prepared.display_path().as_str()))) {
+						if let Ok(diff) = numbered_diff(work.prepared.base_bytes(), &projection.after, Some(Path::new(work.prepared.display_path().as_str()))) {
 							let compact = build_compact_diff_preview(&diff.text, CompactDiffOptions::default());
 							if !preview.is_empty() && !compact.preview.is_empty() { preview.push('\n'); }
 							preview.push_str(&compact.preview);
@@ -309,7 +311,7 @@ fn payload<P: EditPrepared>(
 				let numbered = numbered_diff(
 					work.prepared.base_bytes(),
 					&after,
-					Some(std::path::Path::new(work.prepared.display_path().as_str())),
+					Some(Path::new(work.prepared.display_path().as_str())),
 				)
 				.ok();
 				let diff = numbered
@@ -379,7 +381,7 @@ fn replacement_error(error: ReplaceError) -> Str {
 				"found {occurrences} exact occurrences; provide more context or enable replace-all"
 			);
 			for (line, preview) in lines.into_iter().zip(previews) {
-				let _ = std::fmt::Write::write_fmt(&mut text, format_args!("\nline {line}: {preview}"));
+				let _ = fmt::Write::write_fmt(&mut text, format_args!("\nline {line}: {preview}"));
 			}
 			text.into()
 		},
@@ -388,7 +390,7 @@ fn replacement_error(error: ReplaceError) -> Str {
 }
 
 fn replacement_body(text: &[u8]) -> Vec<Str> {
-	let Ok(text) = std::str::from_utf8(text) else {
+	let Ok(text) = str::from_utf8(text) else {
 		return Vec::new();
 	};
 	if text.is_empty() {

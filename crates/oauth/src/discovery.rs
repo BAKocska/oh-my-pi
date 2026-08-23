@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use http::HeaderMap;
 use omp_core::Str;
 use serde_json::Value;
@@ -198,8 +200,8 @@ fn json_string(value: Option<&Value>) -> Option<&str> {
 		.filter(|value| !value.trim().is_empty())
 }
 
-fn parse_parameters(input: &str) -> std::collections::BTreeMap<String, String> {
-	let mut output = std::collections::BTreeMap::new();
+fn parse_parameters(input: &str) -> BTreeMap<String, String> {
+	let mut output = BTreeMap::new();
 	let bytes = input.as_bytes();
 	let mut cursor = 0;
 	while cursor < bytes.len() {

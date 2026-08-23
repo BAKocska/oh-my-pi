@@ -4,7 +4,7 @@
 //! opaque credential leases, and read-only events. They cannot replace provider
 //! message arrays or observe secret material after lease construction.
 
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{future, pin::Pin, sync::Arc, time::Duration};
 
 use futures::Future;
 use omp_agent::{AgentEvent, ContextView, EventBus, PatchOp, PromptError, PromptPatchSet, Props};
@@ -245,7 +245,7 @@ impl CredentialSource for SdkCredentialSource {
 		_lease: &'a CredentialLease,
 		_evidence: AuthRejection,
 	) -> futures::future::BoxFuture<'a, Result<(), CredentialError>> {
-		Box::pin(std::future::ready(Ok(())))
+		Box::pin(future::ready(Ok(())))
 	}
 }
 

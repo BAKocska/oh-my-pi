@@ -1,13 +1,14 @@
 #![cfg(unix)]
 
 use std::{
-	io,
+	fs, future, io,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::Duration,
 };
 
 use bytes::BytesMut;
+use flume::Receiver;
 use omp_env::{Admitter, BlobDownloadEvent, EnvClient};
 use omp_envd::{EnvServer, RegistryBridges, worker::ExtHostConfig};
 use omp_proto::{
@@ -18,10 +19,11 @@ use omp_proto::{
 };
 use omp_tool::Registry;
 use tokio::{
-	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, split},
 	net::UnixStream,
 	process::Command,
 	task::JoinHandle,
+	time,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -35,10 +37,10 @@ const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct AllowAdmission;
 
 impl Admitter for AllowAdmission {
-	type Future<'client> = std::future::Ready<Admission>;
+	type Future<'client> = future::Ready<Admission>;
 
 	fn admit(&self, query: AdmitInvocation) -> Self::Future<'_> {
-		std::future::ready(Admission {
+		future::ready(Admission {
 			invocation_id: query.invocation_id,
 			allow: true,
 			..Admission::default()
@@ -348,7 +350,7 @@ async fn wait_socket(path: &Path, limit: Duration) -> Result<()> {
 					if error.kind() == io::ErrorKind::NotFound
 						|| error.kind() == io::ErrorKind::ConnectionRefused =>
 				{
-					tokio::time::sleep(Duration::from_millis(10)).await;
+					time::sleep(Duration::from_millis(10)).await;
 				},
 				Err(error) => return Err(error),
 			}
@@ -360,13 +362,13 @@ async fn wait_socket(path: &Path, limit: Duration) -> Result<()> {
 
 async fn bridge_frames<S>(
 	stream: S,
-	requests: flume::Receiver<ClientFrame>,
+	requests: Receiver<ClientFrame>,
 	responses: flume::Sender<ServerFrame>,
 ) -> io::Result<()>
 where
 	S: AsyncRead + AsyncWrite + Unpin,
 {
-	let (mut reader, mut writer) = tokio::io::split(stream);
+	let (mut reader, mut writer) = split(stream);
 	let write = async {
 		let mut bytes = BytesMut::new();
 		while let Ok(frame) = requests.recv_async().await {
@@ -424,7 +426,7 @@ async fn read_length<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<
 }
 
 fn remove_socket(path: &Path) -> io::Result<()> {
-	match std::fs::remove_file(path) {
+	match fs::remove_file(path) {
 		Ok(()) => Ok(()),
 		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
 		Err(error) => Err(error),

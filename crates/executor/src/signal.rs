@@ -12,7 +12,7 @@ use std::{
 
 use futures_lite::{Stream, io::AsyncRead as _};
 pub use nix::sys::signal::Signal;
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet};
+use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet};
 
 const SIGNAL_SLOTS: usize = 128;
 static WRITERS: [AtomicI32; SIGNAL_SLOTS] = [const { AtomicI32::new(-1) }; SIGNAL_SLOTS];
@@ -71,7 +71,7 @@ impl Signals {
 				.compare_exchange(-1, writer_fd, Ordering::AcqRel, Ordering::Acquire)
 				.expect("signal already owned by another Signals stream");
 			// SAFETY: `action` uses an async-signal-safe handler with C ABI.
-			let previous = unsafe { nix::sys::signal::sigaction(signal, &action) }
+			let previous = unsafe { signal::sigaction(signal, &action) }
 				.expect("failed to install signal handler");
 			old.push((signal, previous));
 		}
@@ -114,7 +114,7 @@ impl Drop for Signals {
 		for (signal, previous) in self.old.iter().rev() {
 			// SAFETY: this restores the action returned by `sigaction` at install.
 			unsafe {
-				let _ = nix::sys::signal::sigaction(*signal, previous);
+				let _ = signal::sigaction(*signal, previous);
 			}
 			WRITERS[*signal as usize].store(-1, Ordering::Release);
 		}

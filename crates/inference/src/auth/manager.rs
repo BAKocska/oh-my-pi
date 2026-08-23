@@ -7,26 +7,26 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::{SystemTime, UNIX_EPOCH},
+	time::{self, SystemTime, UNIX_EPOCH},
 };
 
 use flume::Sender;
 use futures::future::{BoxFuture, FutureExt as _};
 use omp_catalog::{
 	AuthSpecId, Catalog, ProviderId,
-	provider::{AuthSpecKind, OAuthFlowSpec},
+	provider::{AuthSpecKind, OAuthExchangeKind, OAuthFlowSpec},
 };
 use omp_core::{ExposeSecret as _, Secret, SecretBox, SecretString, Str, sf};
 use parking_lot::Mutex;
 use zeroize::Zeroizing;
 
 use super::{
-	AuditedCredentialReveal, AuthSpec, CredentialBroker, CredentialError, CredentialNeed,
-	CredentialOrigin, CredentialSource, CredentialStore, CredentialWrite, KeyError,
-	LoginChannelError, OAuthClientSpec, OAuthClock, OAuthCredentialImport,
+	AuditedCredentialReveal, AuthSpec, CredentialBroker, CredentialError, CredentialMetadata,
+	CredentialNeed, CredentialOrigin, CredentialSource, CredentialStore, CredentialWrite, KeyError,
+	LeaseMeta, LoginChannelError, OAuthClientSpec, OAuthClock, OAuthCredentialImport,
 	OAuthCredentialManagerError, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomSpec,
-	OAuthEngine, OAuthError, OAuthHttpClient, OAuthParameter, PROVIDER_NAME_PARAMETER, StoreError,
-	default_login_channels,
+	OAuthEngine, OAuthError, OAuthHttpClient, OAuthParameter, PROVIDER_NAME_PARAMETER,
+	ScopedCredentialGrant, ScopedCredentialToken, StoreError, default_login_channels,
 };
 use crate::{
 	account::{
@@ -101,7 +101,7 @@ impl AuthControlHandle {
 	pub fn metadata(
 		&self,
 		account: &AccountId<str>,
-	) -> Result<Option<super::CredentialMetadata>, StoreError> {
+	) -> Result<Option<CredentialMetadata>, StoreError> {
 		self.manager.store.metadata(account)
 	}
 
@@ -109,7 +109,7 @@ impl AuthControlHandle {
 	pub fn store(
 		&self,
 		write: CredentialControlWrite,
-	) -> Result<(super::CredentialMetadata, AccountRecord), StoreError> {
+	) -> Result<(CredentialMetadata, AccountRecord), StoreError> {
 		let identity = write
 			.identity
 			.unwrap_or_else(|| Str::from(write.principal.as_str()));
@@ -151,7 +151,7 @@ impl AuthControlHandle {
 	pub fn import_oauth(
 		&self,
 		import: OAuthControlImport,
-	) -> Result<(super::CredentialMetadata, AccountRecord), StoreError> {
+	) -> Result<(CredentialMetadata, AccountRecord), StoreError> {
 		let identity = import
 			.identity
 			.unwrap_or_else(|| Str::from(import.principal.as_str()));
@@ -159,7 +159,7 @@ impl AuthControlHandle {
 		let imported_at = SystemTime::now();
 		let expires_at = match import.expires_at_ms {
 			Some(millis) => UNIX_EPOCH
-				.checked_add(std::time::Duration::from_millis(millis))
+				.checked_add(time::Duration::from_millis(millis))
 				.ok_or(StoreError::InvalidTime)?,
 			None => imported_at,
 		};
@@ -260,13 +260,13 @@ impl AuthControlHandle {
 	pub fn mint_scoped_token(
 		&self,
 		account: &AccountId<str>,
-		grant: &super::ScopedCredentialGrant,
-	) -> Result<super::ScopedCredentialToken, StoreError> {
+		grant: &ScopedCredentialGrant,
+	) -> Result<ScopedCredentialToken, StoreError> {
 		self.manager.store.mint_scoped_token(account, grant)
 	}
 
 	/// Forces refresh through the manager's existing single-flight engine.
-	pub async fn refresh(&self, account: AccountId) -> Result<super::CredentialMetadata, Error> {
+	pub async fn refresh(&self, account: AccountId) -> Result<CredentialMetadata, Error> {
 		self
 			.manager
 			.execute(AuthRequest::Refresh { account: account.clone() })
@@ -337,8 +337,8 @@ pub struct CredentialAffinityResolver {
 	key: Zeroizing<[u8; 32]>,
 }
 
-impl std::fmt::Debug for CredentialAffinityResolver {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CredentialAffinityResolver {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("CredentialAffinityResolver")
 			.field("key", &"[REDACTED]")
@@ -744,7 +744,7 @@ where
 				.provider(&request.provider)
 				.ok_or_else(auth_not_found)?;
 			if let AuthSpec::OAuthCustom(spec) = &mut runtime
-				&& spec.exchange == omp_catalog::provider::OAuthExchangeKind::ApiKeyPaste
+				&& spec.exchange == OAuthExchangeKind::ApiKeyPaste
 			{
 				// The API-key paste prompt addresses the user by provider: the
 				// shared OpenCode console mints keys for both Zen and Go, so the
@@ -813,7 +813,7 @@ where
 					let project = tokens.project().map(ToOwned::to_owned);
 					let account = AccountId::from(format!("{provider_id}:{principal}"));
 					let issued_at = clock.now();
-					let meta = super::LeaseMeta {
+					let meta = LeaseMeta {
 						account:    account.clone(),
 						principal:  principal.clone(),
 						generation: 0,
@@ -1404,7 +1404,7 @@ fn oauth_client(spec: &AuthSpec) -> Option<OAuthClientSpec> {
 
 fn system_time_from_millis(millis: u64) -> Result<SystemTime, Error> {
 	UNIX_EPOCH
-		.checked_add(std::time::Duration::from_millis(millis))
+		.checked_add(time::Duration::from_millis(millis))
 		.ok_or_else(auth_store_failure)
 }
 
@@ -1486,6 +1486,7 @@ fn credential_error(error: CredentialError) -> Error {
 mod tests {
 	use std::{
 		collections::{BTreeSet, VecDeque},
+		env, fs,
 		sync::Arc,
 		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
@@ -1495,6 +1496,7 @@ mod tests {
 	use omp_catalog::{ProviderId, provider::AuthSpecKind, snapshot::Catalog};
 	use omp_core::{ExposeSecret as _, SecretString};
 	use parking_lot::Mutex;
+	use tokio::time;
 
 	use super::{
 		AuthLoginEngine, AuthRefreshEngine, CredentialAffinityError, CredentialAffinityResolver,
@@ -1503,7 +1505,7 @@ mod tests {
 	};
 	use crate::{
 		account::{AccountPool, AccountRecord, RefreshCoordinator, RefreshPolicy},
-		answer::AuthEvent,
+		answer::{AuthEvent, AuthResponse as AnswerAuthResponse},
 		auth::{
 			AlibabaTokenPlanLoginEngine, CredentialStore, HeadlessKeySource, KeyError, KeyId,
 			OAuthClock, OAuthCustomDispatcher, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse,
@@ -1611,7 +1613,7 @@ mod tests {
 			.duration_since(UNIX_EPOCH)
 			.expect("current timestamp")
 			.as_nanos();
-		let path = std::env::temp_dir()
+		let path = env::temp_dir()
 			.join(format!("omp-alibaba-dispatch-{}-{suffix}.sqlite", std::process::id()));
 		let store = Arc::new(
 			CredentialStore::open(
@@ -1645,7 +1647,7 @@ mod tests {
 		assert!(Arc::ptr_eq(selected, &scoped));
 		drop(engines);
 		drop(scoped);
-		let _ = std::fs::remove_file(path);
+		let _ = fs::remove_file(path);
 	}
 
 	struct FixtureHttp {
@@ -1681,8 +1683,8 @@ mod tests {
 			.duration_since(UNIX_EPOCH)
 			.unwrap()
 			.as_nanos();
-		let store_path = std::env::temp_dir()
-			.join(format!("omp-kimi-login-{}-{suffix}.sqlite", std::process::id()));
+		let store_path =
+			env::temp_dir().join(format!("omp-kimi-login-{}-{suffix}.sqlite", std::process::id()));
 		let store = Arc::new(
 			CredentialStore::open(
 				&store_path,
@@ -1738,7 +1740,7 @@ mod tests {
 			.unwrap();
 		let mut saw_code = false;
 		let completed = loop {
-			let event = tokio::time::timeout(Duration::from_secs(1), session.events.recv_async())
+			let event = time::timeout(Duration::from_secs(1), session.events.recv_async())
 				.await
 				.expect("Kimi login event")
 				.expect("Kimi login event channel")
@@ -1802,7 +1804,7 @@ mod tests {
 		drop(requests);
 		drop(session);
 		drop(engine);
-		let _ = std::fs::remove_file(store_path);
+		let _ = fs::remove_file(store_path);
 	}
 
 	#[tokio::test]
@@ -1828,8 +1830,8 @@ mod tests {
 			.duration_since(UNIX_EPOCH)
 			.unwrap()
 			.as_nanos();
-		let store_path = std::env::temp_dir()
-			.join(format!("omp-opencode-login-{}-{suffix}.sqlite", std::process::id()));
+		let store_path =
+			env::temp_dir().join(format!("omp-opencode-login-{}-{suffix}.sqlite", std::process::id()));
 		let store = Arc::new(
 			CredentialStore::open(
 				&store_path,
@@ -1862,7 +1864,7 @@ mod tests {
 			.unwrap();
 		let mut saw_prompt = false;
 		loop {
-			let event = tokio::time::timeout(Duration::from_secs(1), session.events.recv_async())
+			let event = time::timeout(Duration::from_secs(1), session.events.recv_async())
 				.await
 				.expect("OpenCode login event")
 				.expect("OpenCode login event channel")
@@ -1874,7 +1876,7 @@ mod tests {
 					saw_prompt = true;
 					session
 						.responses
-						.send_async(crate::answer::AuthResponse {
+						.send_async(AnswerAuthResponse {
 							session: session.id.clone(),
 							input:   AuthInput::ApiKey(SecretString::from("sk-opencode".to_owned())),
 						})
@@ -1891,6 +1893,6 @@ mod tests {
 		assert!(saw_prompt);
 		drop(session);
 		drop(engine);
-		let _ = std::fs::remove_file(store_path);
+		let _ = fs::remove_file(store_path);
 	}
 }

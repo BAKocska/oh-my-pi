@@ -1,8 +1,10 @@
 //! Interactive provider-authentication command presentation.
 
 use std::{
+	fs,
 	io::{self, IsTerminal as _, Write as _},
 	path::{Path, PathBuf},
+	time,
 };
 
 use miette::{IntoDiagnostic as _, miette};
@@ -17,10 +19,12 @@ use omp_inference::{
 	call::{AuthInput, AuthRequest, CallMeta, LoginRequest, Target},
 	id::{AccountId, RequestId},
 	receipt::ExecutionBudget,
+	router,
 };
+use tokio::task;
 use zeroize::Zeroizing;
 
-use crate::cli::AuthCommand;
+use crate::{chat_ui, chat_ui::AuthPromptKind, cli::AuthCommand};
 
 /// Opens encrypted credential state and executes one typed authentication
 /// operation.
@@ -29,7 +33,7 @@ pub async fn run(database: PathBuf, command: AuthCommand) -> miette::Result<()> 
 		.parent()
 		.filter(|path| !path.as_os_str().is_empty())
 		.ok_or_else(|| miette!("HOME or OMP_DATA_DIR must be set"))?;
-	std::fs::create_dir_all(data_dir).into_diagnostic()?;
+	fs::create_dir_all(data_dir).into_diagnostic()?;
 	let store = omp_driver::registry::open_credential_store(&database).into_diagnostic()?;
 	let registry = omp_driver::registry::production_registry(data_dir, store)
 		.await
@@ -63,8 +67,7 @@ pub async fn run(database: PathBuf, command: AuthCommand) -> miette::Result<()> 
 		budget:   ExecutionBudget::default(),
 		session:  None,
 	};
-	let planner =
-		omp_inference::router::Router::new(registry.clone(), std::time::Duration::from_secs(30));
+	let planner = router::Router::new(registry.clone(), time::Duration::from_secs(30));
 	let mut client = Client::new(registry.service(), planner, meta);
 	print_auth(client.execute(operation).await.into_diagnostic()?, &database).await
 }
@@ -81,7 +84,7 @@ async fn print_auth(answer: AuthAnswer, database: &Path) -> miette::Result<()> {
 						code.expose_secret()
 					),
 					AuthEvent::Prompt(prompt) => {
-						let input = tokio::task::spawn_blocking(move || read_prompt(&prompt))
+						let input = task::spawn_blocking(move || read_prompt(&prompt))
 							.await
 							.into_diagnostic()??;
 						session
@@ -154,22 +157,18 @@ fn auth_input(prompt: &AuthPrompt, value: &str) -> miette::Result<AuthInput> {
 		return Err(miette!("authentication input must not be empty"));
 	}
 	let kind = match prompt.input {
-		InferenceAuthPromptKind::AuthorizationCode => {
-			crate::chat_ui::AuthPromptKind::AuthorizationCode
-		},
-		InferenceAuthPromptKind::ApiKey => crate::chat_ui::AuthPromptKind::ApiKey,
-		InferenceAuthPromptKind::SessionToken => crate::chat_ui::AuthPromptKind::SessionToken,
-		InferenceAuthPromptKind::PlainText => crate::chat_ui::AuthPromptKind::PlainText,
-		InferenceAuthPromptKind::OptionalSecret => crate::chat_ui::AuthPromptKind::OptionalSecret,
-		InferenceAuthPromptKind::Confirmation => crate::chat_ui::AuthPromptKind::Confirmation,
+		InferenceAuthPromptKind::AuthorizationCode => AuthPromptKind::AuthorizationCode,
+		InferenceAuthPromptKind::ApiKey => AuthPromptKind::ApiKey,
+		InferenceAuthPromptKind::SessionToken => AuthPromptKind::SessionToken,
+		InferenceAuthPromptKind::PlainText => AuthPromptKind::PlainText,
+		InferenceAuthPromptKind::OptionalSecret => AuthPromptKind::OptionalSecret,
+		InferenceAuthPromptKind::Confirmation => AuthPromptKind::Confirmation,
 	};
-	Ok(crate::chat_ui::auth_input(kind, value.to_owned()))
+	Ok(chat_ui::auth_input(kind, value.to_owned()))
 }
 
 #[cfg(test)]
 mod tests {
-	use omp_core::ExposeSecret as _;
-
 	use super::*;
 
 	#[test]

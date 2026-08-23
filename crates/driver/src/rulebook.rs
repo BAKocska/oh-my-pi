@@ -12,6 +12,10 @@ use omp_agent::{
 	PromptNamedInput, TtsrCompileError, TtsrInterruptMode, TtsrRegistry, TtsrRule, TtsrSettings,
 };
 use omp_core::{CowBytes, Str};
+use omp_envd::exthost::control::{
+	self, ControlAuthority, ControlConnectionIdentity, ControlEffect, ControlProtocolError,
+	ControlRequestContext,
+};
 use omp_settings::{
 	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
 };
@@ -25,11 +29,13 @@ use omp_tools::read::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use url::Url;
 
 use crate::{
 	discovery::{
 		manifest::{
-			CapabilityPayload, CapabilityRecord, DiscoveredCapability, RulePayload, SourceScope,
+			CapabilityPayload, CapabilityRecord, DiscoveredCapability, RuleInterruptMode, RulePayload,
+			SourceScope,
 		},
 		rules::{applies_to, parse_static},
 	},
@@ -302,8 +308,6 @@ impl RuleSnapshot {
 	}
 }
 
-/// Projects active rules into immutable prompt inputs without re-reading their
-/// declaration files.
 /// Compiles the frozen discovery winners into the agent stream matcher.
 pub fn ttsr_registry(snapshot: &RuleSnapshot) -> (TtsrRegistry, Vec<TtsrCompileError>) {
 	let mut authored = Vec::new();
@@ -318,12 +322,10 @@ pub fn ttsr_registry(snapshot: &RuleSnapshot) -> (TtsrRegistry, Vec<TtsrCompileE
 			scopes:         declaration.scopes.clone(),
 			globs:          declaration.globs.clone(),
 			interrupt_mode: declaration.interrupt_mode.map(|mode| match mode {
-				crate::discovery::manifest::RuleInterruptMode::Never => TtsrInterruptMode::Never,
-				crate::discovery::manifest::RuleInterruptMode::ProseOnly => {
-					TtsrInterruptMode::ProseOnly
-				},
-				crate::discovery::manifest::RuleInterruptMode::ToolOnly => TtsrInterruptMode::ToolOnly,
-				crate::discovery::manifest::RuleInterruptMode::Always => TtsrInterruptMode::Always,
+				RuleInterruptMode::Never => TtsrInterruptMode::Never,
+				RuleInterruptMode::ProseOnly => TtsrInterruptMode::ProseOnly,
+				RuleInterruptMode::ToolOnly => TtsrInterruptMode::ToolOnly,
+				RuleInterruptMode::Always => TtsrInterruptMode::Always,
 			}),
 		};
 		if active.builtin {
@@ -335,6 +337,8 @@ pub fn ttsr_registry(snapshot: &RuleSnapshot) -> (TtsrRegistry, Vec<TtsrCompileE
 	TtsrRegistry::from_layers(TtsrSettings::default(), authored, builtins)
 }
 
+/// Projects active rules into immutable prompt inputs without re-reading their
+/// declaration files.
 pub fn prompt_inputs(snapshot: &RuleSnapshot) -> Arc<[PromptNamedInput]> {
 	snapshot
 		.all()
@@ -403,7 +407,7 @@ impl Resolve for RuleResolver {
 		let path = fs::canonicalize(&rule.declaration.path).map_err(|_| Fault::Source {
 			message: Str::from(format!("rule resource not found: {name}")),
 		})?;
-		let uri = url::Url::from_file_path(path).map_err(|()| Fault::Invalid {
+		let uri = Url::from_file_path(path).map_err(|()| Fault::Invalid {
 			message: Str::from("rule path cannot be represented as a file URI"),
 		})?;
 		Ok(Some(Str::from(uri.to_string())))
@@ -496,7 +500,7 @@ pub enum PromptInvalidationError {
 }
 
 impl PromptInvalidationError {
-	fn protocol(&self) -> omp_envd::exthost::control::ControlProtocolError {
+	fn protocol(&self) -> ControlProtocolError {
 		let code = match self {
 			Self::StaleGeneration => "StaleGeneration",
 			Self::Capability | Self::NotOwner => "PermissionDenied",
@@ -505,7 +509,7 @@ impl PromptInvalidationError {
 			Self::FrozenSlot => "SlotClassConflict",
 			Self::Head(_) => "PromptInvalidationFailed",
 		};
-		omp_envd::exthost::control::ControlProtocolError::new(code, Str::from(self.to_string()))
+		ControlProtocolError::new(code, Str::from(self.to_string()))
 	}
 }
 
@@ -524,14 +528,14 @@ pub trait PromptHeadAuthority: Send + Sync + 'static {
 
 /// Authoritative `omp.prompts.invalidate` owner bound to one connection.
 pub struct PromptControlOwner {
-	identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
+	identity: Arc<ControlConnectionIdentity>,
 	head:     Arc<dyn PromptHeadAuthority>,
 }
 
 impl PromptControlOwner {
 	/// Binds the prompt head to one authenticated extension generation.
 	pub fn new(
-		identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		head: Arc<dyn PromptHeadAuthority>,
 	) -> Self {
 		Self { identity, head }
@@ -539,7 +543,7 @@ impl PromptControlOwner {
 
 	fn validate(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 	) -> Result<(), PromptInvalidationError> {
 		let connection = &context.connection;
 		if connection.extension != self.identity.extension
@@ -578,22 +582,19 @@ impl PromptControlOwner {
 }
 
 #[async_trait]
-impl omp_envd::exthost::control::ControlAuthority for PromptControlOwner {
+impl ControlAuthority for PromptControlOwner {
 	fn handles(&self, operation: &str) -> bool {
 		operation == "omp.prompts.invalidate"
 	}
 
 	fn authorize(
 		&self,
-		context: &omp_envd::exthost::control::ControlRequestContext,
+		context: &control::ControlRequestContext,
 		operation: &str,
 		arguments: &serde_json::Map<String, Value>,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<(), ControlProtocolError> {
 		if operation != "omp.prompts.invalidate" {
-			return Err(omp_envd::exthost::control::ControlProtocolError::new(
-				"UnknownOperation",
-				"unknown prompts operation",
-			));
+			return Err(ControlProtocolError::new("UnknownOperation", "unknown prompts operation"));
 		}
 		self.validate(context).map_err(|error| error.protocol())?;
 		Self::slot(arguments).map_err(|error| error.protocol())?;
@@ -602,10 +603,10 @@ impl omp_envd::exthost::control::ControlAuthority for PromptControlOwner {
 
 	async fn request(
 		&self,
-		context: omp_envd::exthost::control::ControlRequestContext,
+		context: ControlRequestContext,
 		operation: Str,
 		arguments: serde_json::Map<String, Value>,
-	) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+	) -> Result<Value, ControlProtocolError> {
 		self.authorize(&context, operation.as_str(), &arguments)?;
 		let slot = Self::slot(&arguments).map_err(|error| error.protocol())?;
 		let generation = self
@@ -618,11 +619,11 @@ impl omp_envd::exthost::control::ControlAuthority for PromptControlOwner {
 
 	async fn effect(
 		&self,
-		context: omp_envd::exthost::control::ControlRequestContext,
-		_effect: omp_envd::exthost::control::ControlEffect,
-	) -> Result<(), omp_envd::exthost::control::ControlProtocolError> {
+		context: ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
 		self.validate(&context).map_err(|error| error.protocol())?;
-		Err(omp_envd::exthost::control::ControlProtocolError::new(
+		Err(ControlProtocolError::new(
 			"UnsupportedEffect",
 			"prompt authority accepts invalidation requests only",
 		))
@@ -631,6 +632,10 @@ impl omp_envd::exthost::control::ControlAuthority for PromptControlOwner {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicU64, Ordering};
+
+	use serde_json::Map;
+
 	use super::*;
 
 	fn rule(name: &str, always: bool, description: Option<&str>, condition: &[&str]) -> ActiveRule {
@@ -676,7 +681,7 @@ mod tests {
 		let snapshot = RuleSnapshot::from_records(&[], &settings, &[]);
 		assert_eq!(snapshot.all().len(), 26);
 	}
-	struct PromptHead(std::sync::atomic::AtomicU64);
+	struct PromptHead(AtomicU64);
 
 	#[async_trait]
 	impl PromptHeadAuthority for PromptHead {
@@ -689,7 +694,7 @@ mod tests {
 			assert_eq!(extension, "fixture.extension");
 			assert_eq!(session_generation, 11);
 			assert_eq!(slot, "memory");
-			Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1)
+			Ok(self.0.fetch_add(1, Ordering::AcqRel) + 1)
 		}
 	}
 
@@ -730,21 +735,18 @@ mod tests {
 				remote:            false,
 				has_ui:            true,
 				headless:          false,
-				settings:          serde_json::Map::new(),
+				settings:          Map::new(),
 				secret_settings:   Box::new([]),
 				data:              None,
 				direct_filesystem: None,
 			}),
 		};
-		let owner = PromptControlOwner::new(
-			identity,
-			Arc::new(PromptHead(std::sync::atomic::AtomicU64::new(3))),
-		);
+		let owner = PromptControlOwner::new(identity, Arc::new(PromptHead(AtomicU64::new(3))));
 		let generation = ControlAuthority::request(
 			&owner,
 			context.clone(),
 			sf!("omp.prompts.invalidate"),
-			serde_json::Map::from_iter([("slot".to_owned(), Value::String("memory".to_owned()))]),
+			Map::from_iter([("slot".to_owned(), Value::String("memory".to_owned()))]),
 		)
 		.await
 		.expect("prompt head accepts owned mutable slot");

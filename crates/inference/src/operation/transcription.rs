@@ -13,7 +13,7 @@ use tower::Service;
 use crate::{
 	answer::{Answer, AnswerBody, TranscriptEvent, TranscriptStream},
 	body::{AttemptBodyEvidence, ReplayEvidence, RetryDecision, RetryDecisionReason},
-	call::{MediaInput, OperationCall, Setting, TimestampGranularity, TranscriptionRequest},
+	call::{Call, MediaInput, OperationCall, Setting, TimestampGranularity, TranscriptionRequest},
 	catalog::OperationKind,
 	error::Error,
 	operation::{
@@ -319,7 +319,7 @@ impl<S> TranscriptionService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for TranscriptionService<S>
+impl<S> Service<Call> for TranscriptionService<S>
 where
 	S: Service<
 			OperationRequest<TranscriptionRequest>,
@@ -337,7 +337,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::Transcribe(request) => Some(Arc::clone(request)),
 			_ => None,

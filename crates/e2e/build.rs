@@ -1,12 +1,15 @@
 //! Applies omp-py's final-link requirements to the executable acceptance host.
 
-use std::path::{Path, PathBuf};
+use std::{
+	env,
+	path::{Path, PathBuf},
+};
 
 fn main() {
 	println!("cargo::rerun-if-env-changed=PYO3_CONFIG_FILE");
 
 	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-	let vendor = std::env::var_os("PYO3_CONFIG_FILE")
+	let vendor = env::var_os("PYO3_CONFIG_FILE")
 		.map(PathBuf::from)
 		.and_then(|p| {
 			p.canonicalize()

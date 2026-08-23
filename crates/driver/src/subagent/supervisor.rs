@@ -3,11 +3,13 @@
 use std::{
 	collections::HashMap,
 	future::Future,
+	marker,
 	pin::Pin,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use flume::Receiver;
 use omp_agent::{
 	AbortHandle, Agent, AgentError, AgentEvent, AgentNode, AgentRunSummary, AgentStatus, AgentTree,
 	AgentTreeLimits, Interrupt, InterruptClass, InterruptSource, JobBoard, MailboxSender,
@@ -18,17 +20,19 @@ use omp_agent::{
 use omp_core::{Str, sf};
 use omp_proto::{
 	inference::v1::turn_event,
-	thread::v1::{self as thread, Item},
+	thread::v1::{self as thread, Item, item},
 };
 use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef};
+use omp_tools::yield_tool::YieldType;
 use parking_lot::RwLock;
 use thiserror::Error;
+use tokio::{time, time::Instant};
 
 use super::settings::TaskSettings;
 
 /// Cold revival future. This allocation occurs only after memory parking, not
 /// on a request, token, or tool-call path.
-pub type RevivalFuture<C: TurnClient + Clone> =
+pub type RevivalFuture<C> =
 	Pin<Box<dyn Future<Output = Result<SupervisedRuntime<C>, SupervisorError>> + Send + 'static>>;
 
 /// Reconstructs an equivalent child loop from its durable journal and
@@ -102,7 +106,7 @@ pub struct SessionSupervisor<C: TurnClient + Clone + Send + 'static> {
 	children:    RwLock<HashMap<Str, ChildHandle>>,
 	settings:    RwLock<Arc<TaskSettings>>,
 	parent_jobs: RwLock<Option<Arc<JobBoard>>>,
-	_marker:     std::marker::PhantomData<fn() -> C>,
+	_marker:     marker::PhantomData<fn() -> C>,
 }
 
 impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
@@ -113,7 +117,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			children: RwLock::new(HashMap::new()),
 			settings: RwLock::new(Arc::new(TaskSettings::default())),
 			parent_jobs: RwLock::new(None),
-			_marker: std::marker::PhantomData,
+			_marker: marker::PhantomData,
 		}
 	}
 
@@ -379,7 +383,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			});
 		}
 		if !grace.is_zero() {
-			tokio::time::sleep(grace).await;
+			time::sleep(grace).await;
 		}
 		if !matches!(state.lifecycle(), SubagentLifecycle::Settled | SubagentLifecycle::Parked)
 			&& let Some(abort) = abort.read().as_ref()
@@ -657,7 +661,7 @@ async fn child_loop<C: TurnClient + Clone + Send + 'static>(
 	abort: Arc<RwLock<Option<AbortHandle>>>,
 	mailbox: Arc<RwLock<Option<MailboxSender>>>,
 	state: Arc<SubagentRunState>,
-	commands: flume::Receiver<ChildCommand>,
+	commands: Receiver<ChildCommand>,
 ) {
 	while let Ok(command) = commands.recv_async().await {
 		match command {
@@ -921,8 +925,7 @@ async fn supervised_submit<C: TurnClient + Clone + Send + 'static>(
 	let mailbox = runtime.agent.mailbox();
 	let submission = runtime.agent.submit(items, turn_id);
 	tokio::pin!(submission);
-	let deadline =
-		tokio::time::Instant::now() + Duration::from_millis(settings.max_runtime_ms.max(1));
+	let deadline = Instant::now() + Duration::from_millis(settings.max_runtime_ms.max(1));
 	let mut runtime_limit_active = settings.max_runtime_ms != 0;
 	let mut pending_terminal_yield = None;
 	loop {
@@ -1049,7 +1052,7 @@ fn handle_event(
 			if pending_terminal_yield.as_deref() == Some(call_id.as_str()) {
 				let succeeded = matches!(
 					item.kind.as_ref(),
-					Some(thread::item::Kind::ToolResult(result))
+					Some(omp_proto::thread::v1::item::Kind::ToolResult(result))
 						if result.name == "yield" && !result.is_error
 				);
 				*pending_terminal_yield = None;
@@ -1078,7 +1081,7 @@ fn handle_event(
 }
 
 fn terminal_yield_call(item: &Item) -> Option<Str> {
-	let Some(thread::item::Kind::ToolCall(call)) = item.kind.as_ref() else {
+	let Some(item::Kind::ToolCall(call)) = item.kind.as_ref() else {
 		return None;
 	};
 	if call.name != "yield" {
@@ -1086,8 +1089,8 @@ fn terminal_yield_call(item: &Item) -> Option<Str> {
 	}
 	let params = serde_json::from_slice::<omp_tools::yield_tool::Params>(&call.args_json).ok()?;
 	let terminal = match params.kind {
-		Some(omp_tools::yield_tool::YieldType::Terminal(_)) => true,
-		Some(omp_tools::yield_tool::YieldType::Sections(_)) => false,
+		Some(YieldType::Terminal(_)) => true,
+		Some(YieldType::Sections(_)) => false,
 		None => params.result.is_some(),
 	};
 	terminal.then(|| Str::new(&call.id))
@@ -1106,9 +1109,11 @@ fn system_item(text: Str) -> Item {
 	Item {
 		seq:           0,
 		created_at_ms: now_ms(),
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::System as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
+			parts: vec![omp_proto::thread::v1::Part {
+				kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_string())),
+			}],
 		})),
 		props:         None,
 	}
@@ -1263,7 +1268,7 @@ mod tests {
 
 	fn yield_call(args: &'static [u8]) -> Item {
 		Item {
-			kind: Some(thread::item::Kind::ToolCall(thread::ToolCall {
+			kind: Some(item::Kind::ToolCall(thread::ToolCall {
 				id: sf!("yield-call").to_string(),
 				name: sf!("yield").to_string(),
 				args_json: bytes::Bytes::from_static(args),

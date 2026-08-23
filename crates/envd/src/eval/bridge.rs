@@ -1,12 +1,15 @@
 use std::{
 	collections::BTreeMap,
+	env,
 	ffi::CString,
-	fmt,
+	fmt::{self, Display},
 	path::PathBuf,
+	process,
 	sync::{
 		Arc, OnceLock,
 		atomic::{AtomicU64, Ordering},
 	},
+	time::Duration,
 };
 
 use async_trait::async_trait;
@@ -29,7 +32,7 @@ use pyo3::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, time};
 use tokio_util::sync::CancellationToken;
 
 use super::PYTHON_PRELUDE;
@@ -385,8 +388,11 @@ impl fmt::Debug for BridgeGrant {
 	}
 }
 
+/// Failure returned by the authenticated host operation serving an eval bridge
+/// call.
 #[derive(Debug, Error)]
 pub enum BridgeHostError {
+	/// Model-facing failure message produced by the host-side operation.
 	#[error("{0}")]
 	Message(Str),
 }
@@ -418,6 +424,10 @@ impl BridgeProgressSink for NoopBridgeProgress {
 /// passed grant authentication and capability checks.
 #[async_trait]
 pub trait BridgeHost: Send + Sync {
+	/// Dispatches one authenticated, capability-checked eval request into the
+	/// host.
+	///
+	/// Progress is emitted in request order before the returned terminal value.
 	async fn call(
 		&self,
 		name: &str,
@@ -454,6 +464,11 @@ struct DispatcherInner {
 	registrations: Mutex<BTreeMap<(Str, Str), Registration>>,
 }
 
+/// Cloneable dispatcher for generation-fenced eval bridge registrations.
+///
+/// Registrations remain live through their separate registration leases;
+/// cloning this handle only shares access to the routing table and does not
+/// extend a registration's lifetime.
 #[derive(Clone)]
 pub struct BridgeDispatcher {
 	inner: Arc<DispatcherInner>,
@@ -730,12 +745,11 @@ impl BridgeHost for RegistryBridgeHost {
 		while let Some(event) = events.next().await {
 			match event.map_err(registry_error)? {
 				ErasedEv::Update(update) => {
-					let update: serde_json::Value =
-						serde_json::from_slice(&update).map_err(|error| {
-							BridgeHostError::message(format!(
-								"tool {name} returned invalid update JSON: {error}"
-							))
-						})?;
+					let update: Value = serde_json::from_slice(&update).map_err(|error| {
+						BridgeHostError::message(format!(
+							"tool {name} returned invalid update JSON: {error}"
+						))
+					})?;
 					progress.progress(json!({ "op": "tool", "name": name, "update": update }))?;
 				},
 				ErasedEv::Done(ErasedOutcome::Detached(job)) => {
@@ -789,17 +803,25 @@ pub trait ParentSessionHost: Send + Sync {
 	/// parent session.
 	fn eval_session_config(&self) -> Result<EvalSessionConfig, BridgeHostError>;
 
+	/// Runs a parent-session model completion and forwards ordered progress to
+	/// the eval caller.
 	async fn completion(
 		&self,
 		args: Value,
 		progress: &dyn BridgeProgressSink,
 	) -> Result<Value, BridgeHostError>;
+	/// Runs a parent-session child agent and forwards ordered progress to the
+	/// eval caller.
 	async fn agent(
 		&self,
 		args: Value,
 		progress: &dyn BridgeProgressSink,
 	) -> Result<Value, BridgeHostError>;
+	/// Applies the parent session's concurrency operation to extension-supplied
+	/// arguments.
 	async fn concurrency(&self, args: Value) -> Result<Value, BridgeHostError>;
+	/// Reads or updates parent-session budget state using extension-supplied
+	/// arguments.
 	async fn budget(&self, args: Value) -> Result<Value, BridgeHostError>;
 }
 
@@ -972,7 +994,7 @@ impl SessionBridgeHost {
 		// so parent-backed helpers (completion/agent/budget) stay unavailable.
 		let Ok((binding_owner, generation, parent)) = self.parent_for(owner) else {
 			let cwd =
-				std::env::current_dir().map_err(|error| BridgeHostError::message(error.to_string()))?;
+				env::current_dir().map_err(|error| BridgeHostError::message(error.to_string()))?;
 			return Ok(RuntimeSnapshot {
 				cwd:         Some(cwd),
 				managed_env: [
@@ -1244,7 +1266,7 @@ impl NamespaceInstaller for BridgeNamespaceInstaller {
 		_py: Python<'_>,
 		globals: &Bound<'_, PyDict>,
 		cell_id: &Bytes,
-		timeout: Option<std::time::Duration>,
+		timeout: Option<Duration>,
 	) -> PyResult<TimeoutHandle> {
 		let state = self.namespaces.lock();
 		let namespace = state.get(&(globals.as_ptr() as usize)).ok_or_else(|| {
@@ -1258,9 +1280,9 @@ impl NamespaceInstaller for BridgeNamespaceInstaller {
 		let expiry = watchdog.clone();
 		self.runtime.spawn(async move {
 			expiry.expired().await;
-			tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+			time::sleep(Duration::from_millis(25)).await;
 			if expiry.is_current(generation) {
-				std::process::exit(124);
+				process::exit(124);
 			}
 		});
 		abort.begin(cell_id);
@@ -1295,7 +1317,7 @@ impl NamespaceInstaller for BridgeNamespaceInstaller {
 	}
 }
 
-fn registry_error(error: impl fmt::Display) -> BridgeHostError {
+fn registry_error(error: impl Display) -> BridgeHostError {
 	BridgeHostError::message(error.to_string())
 }
 
@@ -1420,7 +1442,7 @@ mod tests {
 	use omp_tool::{
 		Claims, Constraint, Effects, Ev, Precedence, Presentation, Rev, Tool, ToolSpec, ToolTerminal,
 	};
-	use serde::{Deserialize, Deserializer, Serialize};
+	use serde::{Deserialize, Deserializer, Serialize, ser};
 
 	use super::*;
 
@@ -1515,7 +1537,7 @@ mod tests {
 		fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
 			match self {
 				Self::Value(value) => value.serialize(serializer),
-				Self::Invalid => Err(<S::Error as serde::ser::Error>::custom("invalid probe update")),
+				Self::Invalid => Err(<S::Error as ser::Error>::custom("invalid probe update")),
 			}
 		}
 	}

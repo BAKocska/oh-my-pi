@@ -1,10 +1,12 @@
 //! Command execution utilities.
 
 pub use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::{io, process};
 
 use command_fds::{CommandFdExt, FdMapping};
+use nix::errno::Errno;
 
-use crate::{ShellFd, error, openfiles};
+use crate::{ShellFd, error, openfiles, openfiles::OpenFile};
 
 /// Extension trait for injecting file descriptors into commands.
 pub trait CommandFdInjectionExt {
@@ -15,14 +17,14 @@ pub trait CommandFdInjectionExt {
 	/// * `open_files` - A mapping of child file descriptors to open files.
 	fn inject_fds(
 		&mut self,
-		open_files: impl Iterator<Item = (ShellFd, openfiles::OpenFile)>,
+		open_files: impl Iterator<Item = (ShellFd, OpenFile)>,
 	) -> Result<(), error::Error>;
 }
 
-impl CommandFdInjectionExt for std::process::Command {
+impl CommandFdInjectionExt for process::Command {
 	fn inject_fds(
 		&mut self,
-		open_files: impl Iterator<Item = (ShellFd, openfiles::OpenFile)>,
+		open_files: impl Iterator<Item = (ShellFd, OpenFile)>,
 	) -> Result<(), error::Error> {
 		let fd_mappings: Vec<FdMapping> = open_files
 			.map(|(child_fd, open_file)| -> Result<FdMapping, error::Error> {
@@ -47,7 +49,7 @@ pub trait CommandFgControlExt {
 	fn lead_session(&mut self);
 }
 
-impl CommandFgControlExt for std::process::Command {
+impl CommandFgControlExt for process::Command {
 	fn take_foreground(&mut self) {
 		// SAFETY:
 		// This arranges for a provided function to run in the context of
@@ -81,7 +83,7 @@ pub trait CommandSessionExt {
 	fn detach_session_reparent(&mut self);
 }
 
-impl CommandSessionExt for std::process::Command {
+impl CommandSessionExt for process::Command {
 	fn detach_session(&mut self) {
 		// SAFETY:
 		// This arranges for a provided function to run in the forked child
@@ -101,16 +103,16 @@ impl CommandSessionExt for std::process::Command {
 	}
 }
 
-fn pre_exec_take_foreground() -> Result<(), std::io::Error> {
+fn pre_exec_take_foreground() -> Result<(), io::Error> {
 	use crate::sys;
 
 	sys::terminal::move_self_to_foreground()?;
 	Ok(())
 }
 
-fn pre_exec_lead_session() -> Result<(), std::io::Error> {
+fn pre_exec_lead_session() -> Result<(), io::Error> {
 	if let Err(e) = nix::unistd::setsid() {
-		return Err(std::io::Error::other(format!("failed to become session leader: {e}")));
+		return Err(io::Error::other(format!("failed to become session leader: {e}")));
 	}
 
 	#[cfg(not(target_os = "macos"))]
@@ -122,25 +124,25 @@ fn pre_exec_lead_session() -> Result<(), std::io::Error> {
 	// This is calling a libc function to set the controlling terminal.
 	let result = unsafe { libc::ioctl(0, control, 0) };
 	if result != 0 {
-		return Err(std::io::Error::other("failed to set controlling terminal"));
+		return Err(io::Error::other("failed to set controlling terminal"));
 	}
 
 	Ok(())
 }
 
-fn pre_exec_detach_session() -> Result<(), std::io::Error> {
+fn pre_exec_detach_session() -> Result<(), io::Error> {
 	match nix::unistd::setsid() {
-		Ok(_) | Err(nix::errno::Errno::EPERM) => Ok(()),
-		Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
+		Ok(_) | Err(Errno::EPERM) => Ok(()),
+		Err(errno) => Err(io::Error::from_raw_os_error(errno as i32)),
 	}
 }
 
-fn pre_exec_detach_session_reparent() -> Result<(), std::io::Error> {
+fn pre_exec_detach_session_reparent() -> Result<(), io::Error> {
 	// New session first: drop any controlling terminal. Ignore EPERM, which means
 	// the child is already a session leader from an outer policy.
 	match nix::unistd::setsid() {
-		Ok(_) | Err(nix::errno::Errno::EPERM) => {},
-		Err(errno) => return Err(std::io::Error::from_raw_os_error(errno as i32)),
+		Ok(_) | Err(Errno::EPERM) => {},
+		Err(errno) => return Err(io::Error::from_raw_os_error(errno as i32)),
 	}
 
 	// Double-fork: the intermediate child — the pid the parent's spawn machinery
@@ -153,7 +155,7 @@ fn pre_exec_detach_session_reparent() -> Result<(), std::io::Error> {
 	// async-signal-safe primitives (`fork`, `_exit`) run before `exec`.
 	let pid = unsafe { libc::fork() };
 	if pid < 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(io::Error::last_os_error());
 	}
 	if pid > 0 {
 		// Intermediate parent: exit now to orphan the grandchild. `_exit` avoids

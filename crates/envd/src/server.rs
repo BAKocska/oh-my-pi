@@ -2,9 +2,10 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
-	io,
+	fs, future, io, mem,
 	ops::ControlFlow,
 	path::{Path, PathBuf},
+	pin, process, str, sync,
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicU8, AtomicU64, Ordering},
@@ -13,66 +14,125 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use flume::Receiver;
 use futures::StreamExt as _;
-use omp_agent::{ApprovalBook, ApprovalRoute, ApprovalSpec, TicketState};
+use omp_agent::{ApprovalBook, ApprovalRoute, ApprovalSpec, TicketState, control::ControlSender};
 use omp_core::{Hash32, Str, Ulid, sf};
+#[cfg(any(unix, windows))]
+use omp_docserver::connection::ConnectionConfig;
+#[cfg(unix)]
+use omp_docserver::daemon;
+#[cfg(windows)]
+use omp_docserver::windows::OwnerPipeListener;
 use omp_env::{EnvClient, InProcessEnvTransport};
 use omp_proto::{
 	blob::v1 as blob_pb,
-	document::v1 as document_pb,
-	env::v1::{self as pb, client_frame, server_frame},
+	document::v1::{self as document_pb, commit_transaction_response, document_target},
+	env::v1::{
+		self as pb, client_frame, data_event, data_request, data_response, document_result,
+		exec_session_op, mcp_op, mcp_result, privileged_mutation_intent, send_input, server_frame,
+		stdin_frame, workspace_result,
+	},
+	inference::v1::{self, value},
+	policy::v1 as policy_pb,
 	prost::Message as _,
+	thread::v1 as thread_pb,
 };
-use omp_storage::{index::SessionIndex, state::StateStore};
+use omp_settings::manager::{SettingsManager, SettingsPaths};
+use omp_storage::{
+	blob, github_cache::GithubCache, index::SessionIndex, state::StateStore,
+	telemetry_index::TelemetryIndex,
+};
 use omp_tool::{
 	Abort, ArgIssue, ArgPath, CallOutcome, Effects, ErasedEv, ErasedOutcome, IncomingParams,
 	Interrupt, Registry, RegistryError, ToolRoute, ToolTerminal,
 };
-use omp_tools::device::{DeviceInvokeRequest, DeviceInvoker};
+use omp_tools::{
+	ask::PresenterSlot,
+	device::{DeviceInvokeRequest, DeviceInvoker},
+	eval::EvalSessionControl,
+	read,
+	read::{
+		resolver::{self as resolver, ResolverTable, ResourceCapability, ResourceCompletion},
+		selector::{self, ParsedUri},
+	},
+	staging::PreviewRegistry,
+};
 use omp_walker::{
 	CompiledWalkGlob, DirectoryErrorMode, FileType, FollowLinks, WalkDetail, WalkFilter,
 	WalkOptions, WalkOrder, WalkRequest, WalkStatus,
 };
+use parking_lot::Mutex;
+use serde_json::value::RawValue;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+#[cfg(any(unix, windows))]
+use tokio::sync::watch;
+use tokio::{
+	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, duplex, split},
+	task::{self, JoinError, JoinHandle},
+	time::{self, Instant, Sleep},
+};
+#[cfg(unix)]
+use tokio::{
+	net::{UnixListener, UnixStream},
+	signal::{
+		ctrl_c,
+		unix::{SignalKind, signal},
+	},
+	task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{
 	admission::{AdmissionDecision, AdmissionGate, effects_narrow_or_refuse},
-	blobs::{BlobError, BlobHost},
+	blobs::{BlobError, BlobHost, BlobRead},
 	docs::{
-		DapRegistryEvent, DocumentError, DocumentEvents, DocumentHost, DocumentLease, LspEvents,
-		LspRegistryEvent,
+		AcpDocumentBackend, DapRegistryEvent, DocumentError, DocumentEvents, DocumentHost,
+		DocumentLease, LspEvents, LspRegistryEvent,
 	},
 	eval::{BridgeHostError, PreludeInvoker, SessionBridgeHost},
-	exec::{ExecError, ExecEvent, ExecHost, ProcessEvent},
+	exec::{ExecError, ExecEvent, ExecHost, ExecRun, ProcessEvent},
 	exec_settings::{AcpSettings, ShellSettings},
+	exthost::{ExtensionManifest, control::CompositeControlAuthority, lifecycle::EscapeCapability},
+	github_url::GithubCredentialBridge,
 	host_info::HostInfoHost,
-	host_settings::HostSettings,
+	host_settings::{HostSettings, load as load_host_settings},
 	http_egress::{HttpEgressError, HttpEgressHost},
-	journal_runtime::ExternalJournalActor,
+	journal_runtime::{ExternalJournalActor, PersistenceControlFactory},
+	lsp_settings::{LspSettings, load as load_lsp_settings},
 	mcp::{
-		McpService,
+		McpService, McpServiceError, ServiceSubscription, SubscriptionEvent,
+		control::McpControl,
 		manager::{McpManager, ProductionConnector},
 	},
+	memory,
+	memory::{ReflectionBridgeHost, RegisteredMemoryRuntime},
 	policy::{
 		AuthorityTable, DataAuthority, Grants, PolicyError, QuotaAccount, dap_command_capability,
 		lsp_notification_tier, lsp_request_tier, lsp_tier_capability,
 	},
 	presence::{PresenceError, PresenceLease, PresenceRegistry},
+	process_store::{ProcessStore, ShutdownAcknowledgement},
 	resource_materializer::{MaterializationError, ResourceMaterializer},
+	schedules::ScheduleDeliveryBackend,
+	search_backend::SearchBridgeHost,
 	site::{SiteError, SiteMaterializer, record_modules},
+	staged_preview,
 	tool_document::{PrivilegedMutationFault, privileged_unlink, privileged_write},
 	tool_shell::{AcpExecBackend, AcpExecSlot},
-	tools::production_registry,
+	tool_url::UrlResolver,
+	tools::{AgentCheckpointControl, production_registry, with_invocation_scope},
 	vcs::{
 		self, RepositoryAvailability, SnapshotError,
 		git::{repo::RepositoryError, runner::GitRunner},
 	},
 	worker::{
-		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, JournalRuntime, OpenToolCall,
-		WorkerError, WorkerEvent, WorkerOutcomeKind,
+		DomainControlSlot, ExtHostConfig, ExtHostSpec, ExtHostSupervisor,
+		ExternalControlAuthorityBinding, ExternalDomainControlBinding,
+		ExternalDomainControlFactories, HostKey, JournalRuntime, OpenToolCall, PY_EVAL_MODULE,
+		SealedRegistryEvidence, WorkerCompletion, WorkerError, WorkerEvent, WorkerInvocation,
+		WorkerOutcomeKind,
 	},
 	worker_pool::{
 		DEFAULT_MAX_CONCURRENT_SPAWNS, DEFAULT_WORKER_LAYER_CEILING, WorkerKey, WorkerRoute,
@@ -85,7 +145,7 @@ use super::{
 	workspace_roots::WorkspaceRootHost,
 };
 use crate::{
-	EnvdConfig, RegistryBridges,
+	EnvdConfig, RegistryBridges, authenticated_runtime_identity,
 	exthost::{
 		ControlAuthority, ControlAuthorityFactory, ControlCompositionError, EnvdControlAuthorities,
 		ExternalControlAuthorities, HostControlAuthorityFactory, PersistenceControlAuthorities,
@@ -102,6 +162,7 @@ use crate::{
 		DynamicDeviceCatalogEntry, HookControlFactory, HookEventPolicy, HookFailurePolicy,
 		RegistryControlFactory,
 	},
+	worker::AgentsControlAuthorityBinding,
 };
 
 const MIN_SCHEMA_REV: u32 = 4;
@@ -134,13 +195,13 @@ impl InvocationExecutionPolicy {
 			.and_then(|props| props.fields.get(omp_agent::EXECUTION_MODE_PROP))
 			.and_then(|value| value.kind.as_ref())
 			.and_then(|kind| match kind {
-				omp_proto::inference::v1::value::Kind::String(value) => Some(value.as_str()),
+				value::Kind::String(value) => Some(value.as_str()),
 				_ => None,
 			});
 		let plan_yolo = props
 			.and_then(|props| props.fields.get(omp_agent::PLAN_YOLO_PROP))
 			.and_then(|value| value.kind.as_ref())
-			.is_some_and(|kind| matches!(kind, omp_proto::inference::v1::value::Kind::Bool(true)));
+			.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)));
 		Self { tool: Str::from(request.name.as_str()), plan: mode == Some("plan"), plan_yolo }
 	}
 
@@ -261,10 +322,10 @@ pub enum EnvdError {
 	Client(#[from] omp_env::ClientError),
 	/// Daemon-owned client presence could not be updated.
 	#[error(transparent)]
-	Presence(#[from] super::presence::PresenceError),
+	Presence(#[from] PresenceError),
 	/// A spawned environment connection task failed.
 	#[error("environment connection task failed: {0}")]
-	Task(#[from] tokio::task::JoinError),
+	Task(#[from] JoinError),
 	/// The embedded document authority exited before accepting a verified hello.
 	#[error("embedded document authority exited before its hello handshake")]
 	DocserverExited,
@@ -411,16 +472,14 @@ impl ExtensionDataBinding {
 struct DocumentAuthority {
 	shutdown: CancellationToken,
 	#[cfg(unix)]
-	task:     Option<tokio::task::JoinHandle<omp_docserver::daemon::Result>>,
+	task:     Option<JoinHandle<daemon::Result>>,
 	#[cfg(windows)]
-	task: Option<tokio::task::JoinHandle<Result<(), omp_docserver::windows::WindowsTransportError>>>,
+	task:     Option<JoinHandle<Result<(), omp_docserver::windows::WindowsTransportError>>>,
 }
 
 #[cfg(unix)]
 impl DocumentAuthority {
-	async fn finished_result(
-		&mut self,
-	) -> Option<Result<omp_docserver::daemon::Result, tokio::task::JoinError>> {
+	async fn finished_result(&mut self) -> Option<Result<daemon::Result, JoinError>> {
 		if !self.task.as_ref()?.is_finished() {
 			return None;
 		}
@@ -666,13 +725,12 @@ impl Drop for AgentControlBinding {
 	}
 }
 
-type ProductionResolverTable =
-	omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>;
+type ProductionResolverTable = ResolverTable<UrlResolver>;
 
 struct ProductionControlBindings {
 	factory:   Arc<HostControlAuthorityFactory>,
-	resources: Arc<std::sync::OnceLock<Arc<ProductionResolverTable>>>,
-	callbacks: Arc<super::exthost::dispatch::CallbackDispatcherSlot>,
+	resources: Arc<sync::OnceLock<Arc<ProductionResolverTable>>>,
+	callbacks: Arc<CallbackDispatcherSlot>,
 	registry:  Arc<RegistryControlFactory>,
 }
 
@@ -714,7 +772,7 @@ enum DeclaredExternalDomain {
 }
 
 impl DeclaredExternalDomain {
-	fn declared(self, manifest: &super::exthost::ExtensionManifest) -> bool {
+	fn declared(self, manifest: &ExtensionManifest) -> bool {
 		let declarations = manifest.static_declarations();
 		match self {
 			Self::Policy => {
@@ -731,7 +789,7 @@ impl DeclaredExternalDomain {
 			Self::Workers => !declarations.workers.is_empty() || !declarations.placement.is_empty(),
 			Self::DirectFilesystem => manifest
 				.declarations
-				.permits(super::exthost::lifecycle::EscapeCapability::DirectFilesystem),
+				.permits(EscapeCapability::DirectFilesystem),
 			Self::Credentials => {
 				!declarations.credentials.is_empty() || !declarations.secrets.is_empty()
 			},
@@ -775,7 +833,7 @@ impl DeclaredExternalDomain {
 
 	fn factory(
 		self,
-		factories: &super::worker::ExternalDomainControlFactories,
+		factories: &ExternalDomainControlFactories,
 	) -> Option<Arc<dyn ControlAuthorityFactory>> {
 		match self {
 			Self::Policy => factories.policy.clone(),
@@ -796,8 +854,8 @@ impl DeclaredExternalDomain {
 
 struct ManifestGatedControlFactory {
 	domain:    DeclaredExternalDomain,
-	manifests: Arc<BTreeMap<(Str, Str, Str), super::exthost::ExtensionManifest>>,
-	slot:      Arc<super::worker::DomainControlSlot>,
+	manifests: Arc<BTreeMap<(Str, Str, Str), ExtensionManifest>>,
+	slot:      Arc<DomainControlSlot>,
 }
 
 impl ControlAuthorityFactory for ManifestGatedControlFactory {
@@ -821,7 +879,7 @@ impl ControlAuthorityFactory for ManifestGatedControlFactory {
 			domain: self.domain,
 			identity,
 			slot: Arc::clone(&self.slot),
-			bound: parking_lot::Mutex::new(None),
+			bound: Mutex::new(None),
 		}))
 	}
 }
@@ -829,8 +887,8 @@ impl ControlAuthorityFactory for ManifestGatedControlFactory {
 struct LateBoundControlAuthority {
 	domain:   DeclaredExternalDomain,
 	identity: Arc<ControlConnectionIdentity>,
-	slot:     Arc<super::worker::DomainControlSlot>,
-	bound:    parking_lot::Mutex<Option<(u64, Arc<dyn ControlAuthority>)>>,
+	slot:     Arc<DomainControlSlot>,
+	bound:    Mutex<Option<(u64, Arc<dyn ControlAuthority>)>>,
 }
 
 impl LateBoundControlAuthority {
@@ -934,7 +992,7 @@ impl ControlAuthorityFactory for CompositeControlFactory {
 			owners.push(owner.bind(Arc::clone(&identity))?);
 		}
 		let effects = Arc::new(UndeclaredControlAuthority);
-		Ok(Arc::new(super::exthost::control::CompositeControlAuthority::new(owners, effects)))
+		Ok(Arc::new(CompositeControlAuthority::new(owners, effects)))
 	}
 }
 
@@ -1017,12 +1075,12 @@ impl DeviceInvocationAdmission for ProductionDeviceInvocationAdmission {
 struct ProductionEnvdControlFactory {
 	state_dir:  PathBuf,
 	session_id: Str,
-	telemetry:  Arc<omp_storage::telemetry_index::TelemetryIndex>,
-	intents:    Arc<parking_lot::Mutex<BTreeMap<(Str, Str, Str, Str), serde_json::Value>>>,
-	manifests:  Arc<BTreeMap<(Str, Str, Str), super::exthost::ExtensionManifest>>,
-	registries: Arc<parking_lot::Mutex<BTreeMap<(Str, Str, Str), serde_json::Value>>>,
+	telemetry:  Arc<TelemetryIndex>,
+	intents:    Arc<Mutex<BTreeMap<(Str, Str, Str, Str), serde_json::Value>>>,
+	manifests:  Arc<BTreeMap<(Str, Str, Str), ExtensionManifest>>,
+	registries: Arc<Mutex<BTreeMap<(Str, Str, Str), serde_json::Value>>>,
 	registry:   Arc<RegistryControlFactory>,
-	resources:  Arc<std::sync::OnceLock<Arc<ProductionResolverTable>>>,
+	resources:  Arc<sync::OnceLock<Arc<ProductionResolverTable>>>,
 }
 
 impl ControlAuthorityFactory for ProductionEnvdControlFactory {
@@ -1052,12 +1110,12 @@ struct ProductionEnvdControlAuthority {
 	identity:   Arc<ControlConnectionIdentity>,
 	state_dir:  PathBuf,
 	session_id: Str,
-	telemetry:  Arc<omp_storage::telemetry_index::TelemetryIndex>,
-	intents:    Arc<parking_lot::Mutex<BTreeMap<(Str, Str, Str, Str), serde_json::Value>>>,
-	manifest:   Option<super::exthost::ExtensionManifest>,
-	registries: Arc<parking_lot::Mutex<BTreeMap<(Str, Str, Str), serde_json::Value>>>,
+	telemetry:  Arc<TelemetryIndex>,
+	intents:    Arc<Mutex<BTreeMap<(Str, Str, Str, Str), serde_json::Value>>>,
+	manifest:   Option<ExtensionManifest>,
+	registries: Arc<Mutex<BTreeMap<(Str, Str, Str), serde_json::Value>>>,
 	registry:   Arc<RegistryControlFactory>,
-	resources:  Arc<std::sync::OnceLock<Arc<ProductionResolverTable>>>,
+	resources:  Arc<sync::OnceLock<Arc<ProductionResolverTable>>>,
 }
 
 impl ProductionEnvdControlAuthority {
@@ -1107,7 +1165,7 @@ impl ControlAuthority for ProductionEnvdControlAuthority {
 					.ok_or_else(|| {
 						ControlProtocolError::new("InvalidUrl", "omp.urls.read requires a non-empty url")
 					})?;
-				let parsed = omp_tools::read::selector::parse_uri(url)
+				let parsed = selector::parse_uri(url)
 					.map_err(|error| {
 						ControlProtocolError::new("InvalidUrl", Str::from(error.to_string()))
 					})?
@@ -1124,7 +1182,7 @@ impl ControlAuthority for ProductionEnvdControlAuthority {
 					)
 					.retryable(true)
 				})?;
-				let read = if parsed.scheme == omp_tools::read::resolver::Scheme::Unknown {
+				let read = if parsed.scheme == resolver::Scheme::Unknown {
 					resources.read_unknown(url, &parsed.selector).await
 				} else {
 					resources
@@ -1422,7 +1480,7 @@ impl ControlAuthorityFactory for ProductionMcpControlFactory {
 
 struct ProductionMcpControlAuthority {
 	identity:     Arc<ControlConnectionIdentity>,
-	control:      super::mcp::control::McpControl,
+	control:      McpControl,
 	cancellation: CancellationToken,
 }
 
@@ -1585,13 +1643,13 @@ fn same_control_connection(
 fn production_control_authorities(
 	state_dir: &Path,
 	session_id: &Str,
-	telemetry: &Arc<omp_storage::telemetry_index::TelemetryIndex>,
+	telemetry: &Arc<TelemetryIndex>,
 	mcp: &Arc<McpService>,
 	extensions: &[ExtHostSpec],
 	journal_external: &ExternalJournalActor,
-	domain_control: Arc<super::worker::DomainControlSlot>,
+	domain_control: Arc<DomainControlSlot>,
 ) -> ProductionControlBindings {
-	let resources = Arc::new(std::sync::OnceLock::new());
+	let resources = Arc::new(sync::OnceLock::new());
 	let manifests = Arc::new(
 		extensions
 			.iter()
@@ -1635,9 +1693,9 @@ fn production_control_authorities(
 		state_dir:  state_dir.to_path_buf(),
 		session_id: session_id.clone(),
 		telemetry:  Arc::clone(telemetry),
-		intents:    Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+		intents:    Arc::new(Mutex::new(BTreeMap::new())),
 		manifests:  Arc::clone(&manifests),
-		registries: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+		registries: Arc::new(Mutex::new(BTreeMap::new())),
 		registry:   Arc::clone(&registry_owner),
 		resources:  Arc::clone(&resources),
 	});
@@ -1657,9 +1715,8 @@ fn production_control_authorities(
 			})
 			.collect(),
 	);
-	let persistent: Arc<dyn ControlAuthorityFactory> = Arc::new(
-		super::journal_runtime::PersistenceControlFactory::new(journal_external.clone(), provenances),
-	);
+	let persistent: Arc<dyn ControlAuthorityFactory> =
+		Arc::new(PersistenceControlFactory::new(journal_external.clone(), provenances));
 	let gated = |domain| -> Arc<dyn ControlAuthorityFactory> {
 		Arc::new(ManifestGatedControlFactory {
 			domain,
@@ -1728,29 +1785,29 @@ pub struct EnvServer {
 	_mcp_manager:        Arc<McpManager>,
 	host_info:           HostInfoHost,
 	workspace_roots:     WorkspaceRootHost,
-	lsp_settings:        super::lsp_settings::LspSettings,
-	resources:           Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
-	_memory_runtime:     super::memory::RegisteredMemoryRuntime,
+	lsp_settings:        LspSettings,
+	resources:           Arc<ResolverTable<UrlResolver>>,
+	_memory_runtime:     RegisteredMemoryRuntime,
 	blobs:               BlobHost,
 	sites:               SiteMaterializer,
 	materializations:    ResourceMaterializer,
 	registry:            Arc<Registry>,
-	ask_presenter:       omp_tools::ask::PresenterSlot,
+	ask_presenter:       PresenterSlot,
 	workspace_ops:       WorkspaceOperations,
 	ext_hosts:           Arc<ExtHostSupervisor>,
 	eval_bridge:         Arc<SessionBridgeHost>,
-	reflection_bridge:   Arc<super::memory::ReflectionBridgeHost>,
-	eval_control:        omp_tools::eval::EvalSessionControl,
-	search_bridge:       Arc<super::search_backend::SearchBridgeHost>,
-	github_credentials:  Arc<super::github_url::GithubCredentialBridge>,
-	checkpoint_control:  super::tools::AgentCheckpointControl,
-	previews:            omp_tools::staging::PreviewRegistry,
+	reflection_bridge:   Arc<ReflectionBridgeHost>,
+	eval_control:        EvalSessionControl,
+	search_bridge:       Arc<SearchBridgeHost>,
+	github_credentials:  Arc<GithubCredentialBridge>,
+	checkpoint_control:  AgentCheckpointControl,
+	previews:            PreviewRegistry,
 	sessions_index:      Arc<SessionIndex>,
 	journal_external:    ExternalJournalActor,
 	workers:             Arc<WorkerSupervisor>,
 	authority:           Arc<AuthorityTable>,
 	repository_revision: AtomicU64,
-	process_store:       super::process_store::ProcessStore,
+	process_store:       ProcessStore,
 	presence:            PresenceRegistry,
 }
 
@@ -1758,10 +1815,8 @@ fn execution_settings(
 	data_dir: &Path,
 	project_root: &Path,
 ) -> Result<(HostSettings, ShellSettings, AcpSettings), EnvdError> {
-	let manager = omp_settings::manager::SettingsManager::open(
-		omp_settings::manager::SettingsPaths::discover(data_dir, Some(project_root)),
-	)
-	.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let snapshot = manager.snapshot();
 	let mut host = snapshot
 		.project::<HostSettings>()
@@ -1788,22 +1843,18 @@ async fn start_memory_runtime(
 	project_root: &Path,
 	session_id: &Str,
 	exec: &ExecHost,
-) -> Result<super::memory::RegisteredMemoryRuntime, EnvdError> {
+) -> Result<RegisteredMemoryRuntime, EnvdError> {
 	let snapshot = if settings.memory.backend == omp_memory::MemoryBackend::Off {
 		None
 	} else {
 		let cancel = CancellationToken::new();
 		Some(
-			super::vcs::snapshot(
-				project_root,
-				&super::vcs::git::runner::GitRunner::new(exec.clone()),
-				&cancel,
-			)
-			.await
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
+			vcs::snapshot(project_root, &GitRunner::new(exec.clone()), &cancel)
+				.await
+				.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
 		)
 	};
-	super::memory::start(
+	memory::start(
 		settings.memory.backend,
 		&settings.mnemopi,
 		data_dir,
@@ -1893,7 +1944,7 @@ impl ApprovalAuthoritySlot {
 				)
 				.await
 		} else {
-			let Ok(ticket_id) = std::str::from_utf8(ticket) else {
+			let Ok(ticket_id) = str::from_utf8(ticket) else {
 				return false;
 			};
 			let Some(ticket) = authority.book.ticket(ticket_id) else {
@@ -1971,9 +2022,9 @@ fn canonical_privileged_target(root: &Path, input: &str) -> Result<(String, Path
 	let parent = target
 		.parent()
 		.ok_or_else(|| "privileged target has no parent directory".to_owned())?;
-	let parent = std::fs::canonicalize(parent)
+	let parent = fs::canonicalize(parent)
 		.map_err(|error| format!("privileged target parent is not canonical: {error}"))?;
-	let root = std::fs::canonicalize(root)
+	let root = fs::canonicalize(root)
 		.map_err(|error| format!("Environment root is not canonical: {error}"))?;
 	if parent != root && !parent.starts_with(&root) {
 		return Err("privileged target escapes the Environment root".to_owned());
@@ -2043,23 +2094,23 @@ impl EnvServer {
 		workspace: WorkspaceHost,
 		mcp: Arc<McpService>,
 		mcp_manager: Arc<McpManager>,
-		resources: Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
-		memory_runtime: super::memory::RegisteredMemoryRuntime,
-		lsp_settings: super::lsp_settings::LspSettings,
+		resources: Arc<ResolverTable<UrlResolver>>,
+		memory_runtime: RegisteredMemoryRuntime,
+		lsp_settings: LspSettings,
 		blobs: BlobHost,
 		sites: SiteMaterializer,
 		materializations: ResourceMaterializer,
 		registry: Arc<Registry>,
-		ask_presenter: omp_tools::ask::PresenterSlot,
+		ask_presenter: PresenterSlot,
 		workspace_ops: WorkspaceOperations,
 		ext_hosts: Arc<ExtHostSupervisor>,
 		eval_bridge: Arc<SessionBridgeHost>,
-		reflection_bridge: Arc<super::memory::ReflectionBridgeHost>,
-		eval_control: omp_tools::eval::EvalSessionControl,
-		search_bridge: Arc<super::search_backend::SearchBridgeHost>,
-		github_credentials: Arc<super::github_url::GithubCredentialBridge>,
-		checkpoint_control: super::tools::AgentCheckpointControl,
-		previews: omp_tools::staging::PreviewRegistry,
+		reflection_bridge: Arc<ReflectionBridgeHost>,
+		eval_control: EvalSessionControl,
+		search_bridge: Arc<SearchBridgeHost>,
+		github_credentials: Arc<GithubCredentialBridge>,
+		checkpoint_control: AgentCheckpointControl,
+		previews: PreviewRegistry,
 		sessions_index: Arc<SessionIndex>,
 		journal_external: ExternalJournalActor,
 		authority: Arc<AuthorityTable>,
@@ -2107,9 +2158,7 @@ impl EnvServer {
 			)),
 			authority,
 			repository_revision: AtomicU64::new(0),
-			process_store: super::process_store::ProcessStore::new(
-				state_dir.join("processes").join("meta.json"),
-			),
+			process_store: ProcessStore::new(state_dir.join("processes").join("meta.json")),
 			presence,
 		}
 	}
@@ -2131,19 +2180,19 @@ impl EnvServer {
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		mcp.bind_config_paths(state_dir, workspace.root());
-		let lsp_settings = super::lsp_settings::load(state_dir, workspace.root())
+		let lsp_settings = load_lsp_settings(state_dir, workspace.root())
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		let doc_config = omp_docserver::ServerConfig::new(root)
 			.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?
 			.with_server_build(omp_env::build_id::current());
 		let environment = omp_docserver::Environment::new(doc_config)
 			.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?;
-		let (document_client, document_server) = tokio::io::duplex(64 * 1024);
+		let (document_client, document_server) = duplex(64 * 1024);
 		tokio::spawn(async move {
 			let _ = omp_docserver::connection::serve_connection(
 				environment,
 				document_server,
-				omp_docserver::connection::ConnectionConfig::default(),
+				ConnectionConfig::default(),
 			)
 			.await;
 		});
@@ -2156,24 +2205,16 @@ impl EnvServer {
 		ext_host_config.bind_workspace_root(workspace.root());
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
 		let github_cache = Arc::new(
-			omp_storage::github_cache::GithubCache::open(
-				state_dir.join("github-cache.sqlite3"),
-				Duration::from_secs(5 * 60),
-			)
-			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
+			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
+				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
 		let exec = ExecHost::new()
-			.with_process_store(super::process_store::ProcessStore::new(
-				state_dir.join("processes").join("meta.json"),
-			))?
+			.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
 			.with_github_cache(Arc::clone(&github_cache));
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let telemetry = Arc::new(
-			omp_storage::telemetry_index::TelemetryIndex::open(
-				&state_dir.join("telemetry"),
-				&state_dir.join("telemetry.sqlite3"),
-			)
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
+			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
+				.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
 		);
 		let mcp_manager = McpManager::new(
 			Arc::clone(&mcp),
@@ -2316,7 +2357,7 @@ impl EnvServer {
 		docserver_socket: &Path,
 		registry: Registry,
 		mut ext_host_config: ExtHostConfig,
-		doc_connections: Option<tokio::sync::watch::Sender<usize>>,
+		doc_connections: Option<watch::Sender<usize>>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
@@ -2324,7 +2365,7 @@ impl EnvServer {
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		mcp.bind_config_paths(state_dir, workspace.root());
-		let lsp_settings = super::lsp_settings::load(state_dir, &root)
+		let lsp_settings = load_lsp_settings(state_dir, &root)
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		let (documents, document_authority) =
 			connect_or_start_docserver(&root, docserver_socket, doc_connections.clone()).await?;
@@ -2337,24 +2378,16 @@ impl EnvServer {
 		ext_host_config.bind_workspace_root(&root);
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
 		let github_cache = Arc::new(
-			omp_storage::github_cache::GithubCache::open(
-				state_dir.join("github-cache.sqlite3"),
-				Duration::from_secs(5 * 60),
-			)
-			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
+			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
+				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
 		let exec = ExecHost::new()
-			.with_process_store(super::process_store::ProcessStore::new(
-				state_dir.join("processes").join("meta.json"),
-			))?
+			.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
 			.with_github_cache(Arc::clone(&github_cache));
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let telemetry = Arc::new(
-			omp_storage::telemetry_index::TelemetryIndex::open(
-				&state_dir.join("telemetry"),
-				&state_dir.join("telemetry.sqlite3"),
-			)
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
+			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
+				.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
 		);
 		let mcp_manager = McpManager::new(
 			Arc::clone(&mcp),
@@ -2493,7 +2526,7 @@ impl EnvServer {
 	#[cfg(unix)]
 	pub async fn connect_owner_uds(
 		path: &Path,
-	) -> Result<(EnvClient, tokio::task::JoinHandle<Result<(), EnvdError>>), EnvdError> {
+	) -> Result<(EnvClient, JoinHandle<Result<(), EnvdError>>), EnvdError> {
 		use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 
 		let metadata = tokio::fs::symlink_metadata(path).await?;
@@ -2509,7 +2542,7 @@ impl EnvServer {
 				.into(),
 			);
 		}
-		let stream = tokio::net::UnixStream::connect(path).await?;
+		let stream = UnixStream::connect(path).await?;
 		let (client, transport) = EnvClient::in_process(64);
 		let (requests, responses) = transport.into_parts();
 		let task = tokio::spawn(async move {
@@ -2576,9 +2609,7 @@ impl EnvServer {
 
 	/// Returns the generation-fenced callback transport shared by provider,
 	/// campaign, presentation, and verdict backends.
-	pub fn extension_callback_dispatcher(
-		&self,
-	) -> Arc<dyn super::exthost::dispatch::CallbackDispatcher> {
+	pub fn extension_callback_dispatcher(&self) -> Arc<dyn CallbackDispatcher> {
 		Arc::new(WeakExtensionCallbackDispatcher { supervisor: Arc::downgrade(&self.ext_hosts) })
 	}
 
@@ -2587,7 +2618,7 @@ impl EnvServer {
 	pub fn extension_control_manifest(
 		&self,
 		identity: &ControlConnectionIdentity,
-	) -> Option<super::exthost::ExtensionManifest> {
+	) -> Option<ExtensionManifest> {
 		self.ext_hosts.control_manifest(identity)
 	}
 
@@ -2596,7 +2627,7 @@ impl EnvServer {
 	pub fn extension_registry_evidence(
 		&self,
 		identity: &ControlConnectionIdentity,
-	) -> Option<Arc<super::worker::SealedRegistryEvidence>> {
+	) -> Option<Arc<SealedRegistryEvidence>> {
 		self.ext_hosts.sealed_registry_evidence(identity)
 	}
 
@@ -2604,9 +2635,9 @@ impl EnvServer {
 	/// connection.
 	pub(crate) fn mcp_control(
 		&self,
-		identity: Arc<super::exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		cancellation: CancellationToken,
-	) -> Option<super::mcp::control::McpControl> {
+	) -> Option<McpControl> {
 		self.mcp.control(identity, cancellation)
 	}
 
@@ -2631,10 +2662,7 @@ impl EnvServer {
 	}
 
 	/// Binds or clears the session-scoped ACP document authority.
-	pub(crate) fn bind_acp_documents(
-		&self,
-		backend: Option<Arc<dyn super::docs::AcpDocumentBackend>>,
-	) {
+	pub(crate) fn bind_acp_documents(&self, backend: Option<Arc<dyn AcpDocumentBackend>>) {
 		self.documents.bind_acp_documents(backend);
 	}
 
@@ -2653,21 +2681,21 @@ impl EnvServer {
 	}
 
 	/// Returns the late-bound memory reflection bridge.
-	pub(crate) fn reflection_bridge(&self) -> Arc<super::memory::ReflectionBridgeHost> {
+	pub(crate) fn reflection_bridge(&self) -> Arc<ReflectionBridgeHost> {
 		Arc::clone(&self.reflection_bridge)
 	}
 
-	pub(crate) fn eval_control(&self) -> omp_tools::eval::EvalSessionControl {
+	pub(crate) fn eval_control(&self) -> EvalSessionControl {
 		self.eval_control.clone()
 	}
 
 	/// Returns the late-bound canonical search bridge.
-	pub(crate) fn search_bridge(&self) -> Arc<super::search_backend::SearchBridgeHost> {
+	pub(crate) fn search_bridge(&self) -> Arc<SearchBridgeHost> {
 		Arc::clone(&self.search_bridge)
 	}
 
 	/// Returns the late-bound GitHub credential projection.
-	pub(crate) fn github_credentials(&self) -> Arc<super::github_url::GithubCredentialBridge> {
+	pub(crate) fn github_credentials(&self) -> Arc<GithubCredentialBridge> {
 		Arc::clone(&self.github_credentials)
 	}
 
@@ -2680,8 +2708,8 @@ impl EnvServer {
 	/// Atomically installs the chat-parent owner of `omp.agents.*`.
 	pub(crate) fn bind_agents_control_authority(
 		&self,
-		factory: Arc<dyn super::exthost::control::ControlAuthorityFactory>,
-	) -> crate::worker::AgentsControlAuthorityBinding {
+		factory: Arc<dyn ControlAuthorityFactory>,
+	) -> AgentsControlAuthorityBinding {
 		self.ext_hosts.bind_agents_control_authority(factory)
 	}
 
@@ -2689,8 +2717,8 @@ impl EnvServer {
 	/// bundle. Dropping the returned lease revokes only this exact binding.
 	pub fn bind_domain_control_factories(
 		&self,
-		mut factories: super::worker::ExternalDomainControlFactories,
-	) -> super::worker::ExternalDomainControlBinding {
+		mut factories: ExternalDomainControlFactories,
+	) -> ExternalDomainControlBinding {
 		factories.services = Some(self.ext_hosts.service_control_factory());
 		self.ext_hosts.bind_domain_control_factories(factories)
 	}
@@ -2700,8 +2728,8 @@ impl EnvServer {
 	pub fn bind_external_control_authorities(
 		&self,
 		agents: Arc<dyn ControlAuthorityFactory>,
-		mut domains: super::worker::ExternalDomainControlFactories,
-	) -> super::worker::ExternalControlAuthorityBinding {
+		mut domains: ExternalDomainControlFactories,
+	) -> ExternalControlAuthorityBinding {
 		domains.services = Some(self.ext_hosts.service_control_factory());
 		self
 			.ext_hosts
@@ -2717,7 +2745,7 @@ impl EnvServer {
 	/// attempted after extension child activation.
 	pub(crate) fn bind_agent_control(
 		self: &Arc<Self>,
-		sender: omp_agent::control::ControlSender,
+		sender: ControlSender,
 	) -> Result<AgentControlBinding, EnvdError> {
 		let id = NEXT_AGENT_CONTROL_BINDING.fetch_add(1, Ordering::Relaxed);
 		let host = sender.host_control().ok_or_else(|| {
@@ -2738,7 +2766,7 @@ impl EnvServer {
 		self.checkpoint_control.bind(id, sender.clone());
 		self
 			.previews
-			.bind_observer(super::staged_preview::observer(sender));
+			.bind_observer(staged_preview::observer(sender));
 		Ok(AgentControlBinding { server: Arc::clone(self), id })
 	}
 
@@ -2746,7 +2774,7 @@ impl EnvServer {
 	/// delivery. The backend is retained by envd independently of any chat UI.
 	pub(crate) async fn bind_schedule_delivery(
 		&self,
-		backend: Arc<dyn super::schedules::ScheduleDeliveryBackend>,
+		backend: Arc<dyn ScheduleDeliveryBackend>,
 	) -> Result<(), EnvdError> {
 		self.journal_external.bind_schedule_delivery(backend).await
 	}
@@ -2794,7 +2822,7 @@ impl EnvServer {
 	where
 		S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	{
-		let (mut reader, mut writer) = tokio::io::split(stream);
+		let (mut reader, mut writer) = split(stream);
 		let (request_tx, requests) = flume::bounded(64);
 		let (responses, response_rx) = flume::bounded(64);
 		let retire = policy.retire.clone();
@@ -2848,7 +2876,7 @@ impl EnvServer {
 		self: Arc<Self>,
 		path: &Path,
 		shutdown: CancellationToken,
-		connection_gauge: Option<tokio::sync::watch::Sender<usize>>,
+		connection_gauge: Option<watch::Sender<usize>>,
 	) -> Result<(), EnvdError> {
 		self
 			.serve_uds_with_policy(path, shutdown, None, connection_gauge)
@@ -2878,7 +2906,7 @@ impl EnvServer {
 		path: &Path,
 		shutdown: CancellationToken,
 		connection_policy: Option<ConnectionPolicy>,
-		connection_gauge: Option<tokio::sync::watch::Sender<usize>>,
+		connection_gauge: Option<watch::Sender<usize>>,
 	) -> Result<(), EnvdError> {
 		use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 
@@ -2888,7 +2916,7 @@ impl EnvServer {
 		ensure_directory(parent)?;
 		match tokio::fs::symlink_metadata(path).await {
 			Ok(metadata) if metadata.file_type().is_socket() => {
-				if tokio::net::UnixStream::connect(path).await.is_ok() {
+				if UnixStream::connect(path).await.is_ok() {
 					return Err(
 						io::Error::new(
 							io::ErrorKind::AddrInUse,
@@ -2913,19 +2941,19 @@ impl EnvServer {
 		}
 		// Bind under a staging name, restrict, then rename into place so the
 		// published path never exposes a permissive-mode window to connectors.
-		let staging = path.with_extension(format!("staging-{}", std::process::id()));
+		let staging = path.with_extension(format!("staging-{}", process::id()));
 		match tokio::fs::symlink_metadata(&staging).await {
 			Ok(_) => tokio::fs::remove_file(&staging).await?,
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 			Err(error) => return Err(error.into()),
 		}
-		let listener = tokio::net::UnixListener::bind(&staging)?;
-		tokio::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600)).await?;
+		let listener = UnixListener::bind(&staging)?;
+		tokio::fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).await?;
 		tokio::fs::rename(&staging, path).await?;
-		let socket_metadata = std::fs::symlink_metadata(path)?;
+		let socket_metadata = fs::symlink_metadata(path)?;
 		let retire = CancellationToken::new();
 		let mut listener = Some(listener);
-		let mut connections = tokio::task::JoinSet::new();
+		let mut connections = JoinSet::new();
 		let mut abort_connections = false;
 		if let Some(gauge) = &connection_gauge {
 			gauge.send_replace(0);
@@ -2933,7 +2961,7 @@ impl EnvServer {
 		loop {
 			if retire.is_cancelled() && listener.is_some() {
 				drop(listener.take());
-				if let Ok(metadata) = std::fs::symlink_metadata(path)
+				if let Ok(metadata) = fs::symlink_metadata(path)
 					&& metadata.dev() == socket_metadata.dev()
 					&& metadata.ino() == socket_metadata.ino()
 				{
@@ -2980,7 +3008,7 @@ impl EnvServer {
 			}
 		}
 		if listener.take().is_some()
-			&& let Ok(metadata) = std::fs::symlink_metadata(path)
+			&& let Ok(metadata) = fs::symlink_metadata(path)
 			&& metadata.dev() == socket_metadata.dev()
 			&& metadata.ino() == socket_metadata.ino()
 		{
@@ -3001,11 +3029,11 @@ impl EnvServer {
 
 	async fn serve_frames(
 		&self,
-		requests: flume::Receiver<pb::ClientFrame>,
+		requests: Receiver<pb::ClientFrame>,
 		responses: flume::Sender<pb::ServerFrame>,
 		policy: ConnectionPolicy,
 	) {
-		let first = match tokio::time::timeout(HANDSHAKE_TIMEOUT, requests.recv_async()).await {
+		let first = match time::timeout(HANDSHAKE_TIMEOUT, requests.recv_async()).await {
 			Ok(Ok(first)) => first,
 			Ok(Err(_)) => return,
 			Err(_) => {
@@ -3038,9 +3066,9 @@ impl EnvServer {
 				},
 				() = async {
 					if let Some(deadline) = admission_deadline {
-						tokio::time::sleep_until(deadline).await;
+						time::sleep_until(deadline).await;
 					} else {
-						std::future::pending::<()>().await;
+						future::pending::<()>().await;
 					}
 				} => Some(LoopEvent::AdmissionDeadline),
 			};
@@ -3270,15 +3298,15 @@ impl EnvServer {
 				}
 			},
 			client_frame::Body::Shutdown(request) => {
-				let accepted_at_ms = std::time::SystemTime::now()
-					.duration_since(std::time::SystemTime::UNIX_EPOCH)
+				let accepted_at_ms = SystemTime::now()
+					.duration_since(UNIX_EPOCH)
 					.unwrap_or_default()
 					.as_millis()
 					.try_into()
 					.unwrap_or(u64::MAX);
 				let grace = Duration::from_millis(request.grace_ms);
 				let summary = self.exec.shutdown_managed(grace);
-				let acknowledgement = super::process_store::ShutdownAcknowledgement {
+				let acknowledgement = ShutdownAcknowledgement {
 					accepted_at_ms,
 					stopped: summary.stopped,
 					spared: summary.spared,
@@ -3324,7 +3352,7 @@ impl EnvServer {
 					.await;
 					return;
 				}
-				let Ok(client_id) = std::str::from_utf8(&request.client_id) else {
+				let Ok(client_id) = str::from_utf8(&request.client_id) else {
 					send_error(
 						responses,
 						frame.request_id,
@@ -3708,8 +3736,8 @@ impl EnvServer {
 					.await
 				{
 					let data = match request.input {
-						Some(pb::stdin_frame::Input::Data(data)) => Some(data),
-						Some(pb::stdin_frame::Input::Eof(true)) => None,
+						Some(stdin_frame::Input::Data(data)) => Some(data),
+						Some(stdin_frame::Input::Eof(true)) => None,
 						_ => {
 							send_error(
 								responses,
@@ -3861,8 +3889,8 @@ impl EnvServer {
 			},
 			client_frame::Body::SendInput(request) => {
 				let data = match request.input {
-					Some(pb::send_input::Input::Data(data)) => Some(data),
-					Some(pb::send_input::Input::Eof(true)) => None,
+					Some(send_input::Input::Data(data)) => Some(data),
+					Some(send_input::Input::Eof(true)) => None,
 					_ => {
 						send_error(
 							responses,
@@ -3998,7 +4026,7 @@ impl EnvServer {
 		finished: &flume::Sender<Finished>,
 		connection: &mut ConnectionState,
 	) {
-		use pb::data_request::Body;
+		use data_request::Body;
 
 		match request.body {
 			Some(Body::Worker(request)) => {
@@ -4088,7 +4116,7 @@ impl EnvServer {
 						return;
 					},
 				};
-				let pattern = match std::str::from_utf8(&request.pattern) {
+				let pattern = match str::from_utf8(&request.pattern) {
 					Ok(pattern) if !pattern.is_empty() => Str::from(pattern),
 					_ => {
 						send_error(
@@ -4150,8 +4178,7 @@ impl EnvServer {
 					return;
 				}
 				let info = self.host_info.snapshot(request.max_field_bytes).await;
-				send_data_response(responses, request_id, pb::data_response::Body::HostInfo(info))
-					.await;
+				send_data_response(responses, request_id, data_response::Body::HostInfo(info)).await;
 			},
 			Some(Body::WorkspaceRoots(request)) => {
 				if request.wire_revision != omp_proto::SCHEMA_REV {
@@ -4167,7 +4194,7 @@ impl EnvServer {
 				send_data_response(
 					responses,
 					request_id,
-					pb::data_response::Body::WorkspaceRoots(self.workspace_roots.snapshot()),
+					data_response::Body::WorkspaceRoots(self.workspace_roots.snapshot()),
 				)
 				.await;
 			},
@@ -4207,17 +4234,15 @@ impl EnvServer {
 			},
 			Some(Body::ExecSession(request)) => {
 				let operation = match request.op.as_ref() {
-					Some(pb::exec_session_op::Op::Materialize(_)) => "omp.env.sh.exec",
-					Some(pb::exec_session_op::Op::ReleaseMaterialization(_)) => {
-						"omp.env.sh.close_session"
-					},
-					Some(pb::exec_session_op::Op::Control(_) | pb::exec_session_op::Op::Signal(_)) => {
+					Some(exec_session_op::Op::Materialize(_)) => "omp.env.sh.exec",
+					Some(exec_session_op::Op::ReleaseMaterialization(_)) => "omp.env.sh.close_session",
+					Some(exec_session_op::Op::Control(_) | exec_session_op::Op::Signal(_)) => {
 						"omp.env.sh.signal"
 					},
-					Some(pb::exec_session_op::Op::Stdin(_)) => "omp.env.sh.stdin",
-					Some(pb::exec_session_op::Op::Resize(_)) => "omp.env.sh.resize",
-					Some(pb::exec_session_op::Op::Capabilities(_))
-					| Some(pb::exec_session_op::Op::FinalCwd(_)) => "omp.env.sh.open_session",
+					Some(exec_session_op::Op::Stdin(_)) => "omp.env.sh.stdin",
+					Some(exec_session_op::Op::Resize(_)) => "omp.env.sh.resize",
+					Some(exec_session_op::Op::Capabilities(_))
+					| Some(exec_session_op::Op::FinalCwd(_)) => "omp.env.sh.open_session",
 					None => {
 						send_error(
 							responses,
@@ -4307,7 +4332,7 @@ impl EnvServer {
 						send_data_response(
 							responses,
 							request_id,
-							pb::data_response::Body::Site(materialized),
+							data_response::Body::Site(materialized),
 						)
 						.await;
 					},
@@ -4362,7 +4387,7 @@ impl EnvServer {
 						send_data_response(
 							responses,
 							request_id,
-							pb::data_response::Body::DetachedExec(response),
+							data_response::Body::DetachedExec(response),
 						)
 						.await;
 					},
@@ -4721,10 +4746,10 @@ impl EnvServer {
 			return;
 		};
 		let target_uri = match &mutation {
-			pb::privileged_mutation_intent::Mutation::Write(intent) => {
+			privileged_mutation_intent::Mutation::Write(intent) => {
 				intent.canonical_target_uri.as_str()
 			},
-			pb::privileged_mutation_intent::Mutation::Unlink(intent) => {
+			privileged_mutation_intent::Mutation::Unlink(intent) => {
 				intent.canonical_target_uri.as_str()
 			},
 		};
@@ -4738,8 +4763,8 @@ impl EnvServer {
 				},
 			};
 		let kind = match &mutation {
-			pb::privileged_mutation_intent::Mutation::Write(_) => "write",
-			pb::privileged_mutation_intent::Mutation::Unlink(_) => "unlink",
+			privileged_mutation_intent::Mutation::Write(_) => "write",
+			privileged_mutation_intent::Mutation::Unlink(_) => "unlink",
 		};
 		if !self
 			.approvals
@@ -4761,8 +4786,8 @@ impl EnvServer {
 			return;
 		}
 		let root = self.workspace.root().to_path_buf();
-		let operation = tokio::task::spawn_blocking(move || match mutation {
-			pb::privileged_mutation_intent::Mutation::Write(intent) => {
+		let operation = task::spawn_blocking(move || match mutation {
+			privileged_mutation_intent::Mutation::Write(intent) => {
 				let expected_present = privileged_presence(intent.expected_presence)?;
 				let expected = privileged_revision_hash(intent.expected_revision.as_ref())?;
 				privileged_write(
@@ -4776,7 +4801,7 @@ impl EnvServer {
 				.map_err(PrivilegedDispatchError::Mutation)?;
 				Ok((document_pb::DocumentPresence::Present, None))
 			},
-			pb::privileged_mutation_intent::Mutation::Unlink(intent) => {
+			privileged_mutation_intent::Mutation::Unlink(intent) => {
 				let expected_present = privileged_presence(intent.expected_presence)?;
 				let expected = privileged_revision_hash(intent.expected_revision.as_ref())?;
 				privileged_unlink(
@@ -4796,7 +4821,7 @@ impl EnvServer {
 				send_data_response(
 					responses,
 					request_id,
-					pb::data_response::Body::PrivilegedMutation(pb::PrivilegedMutationResult {
+					data_response::Body::PrivilegedMutation(pb::PrivilegedMutationResult {
 						canonical_target_uri: canonical_uri,
 						presence: presence as i32,
 						committed_revision,
@@ -4823,13 +4848,13 @@ impl EnvServer {
 	async fn dispatch_dap(
 		&self,
 		request_id: u64,
-		request: pb::data_request::Body,
+		request: data_request::Body,
 		scope: Option<&pb::InvocationScope>,
 		responses: &flume::Sender<pb::ServerFrame>,
 		finished: &flume::Sender<Finished>,
 		connection: &mut ConnectionState,
 	) {
-		use pb::data_request::Body;
+		use data_request::Body;
 
 		let (operation, capability) = match &request {
 			Body::DapLaunch(_) => ("omp.env.dap.launch", "env.dap.execute"),
@@ -4860,23 +4885,23 @@ impl EnvServer {
 				Body::DapLaunch(request) => documents
 					.dap_launch(request, &cancel)
 					.await
-					.map(|(response, events)| (pb::data_response::Body::DapSession(response), events)),
+					.map(|(response, events)| (data_response::Body::DapSession(response), events)),
 				Body::DapAttach(request) => documents
 					.dap_attach(request, &cancel)
 					.await
-					.map(|(response, events)| (pb::data_response::Body::DapSession(response), events)),
+					.map(|(response, events)| (data_response::Body::DapSession(response), events)),
 				Body::DapAction(request) => documents
 					.dap_action(request, &cancel)
 					.await
-					.map(|(response, events)| (pb::data_response::Body::DapAction(response), events)),
+					.map(|(response, events)| (data_response::Body::DapAction(response), events)),
 				_ => unreachable!("DAP dispatch receives only DAP request arms"),
 			};
 			match result {
 				Ok((response, events)) => {
 					for event in events {
 						let body = match event {
-							DapRegistryEvent::Output(output) => pb::data_event::Body::DapOutput(output),
-							DapRegistryEvent::Event(event) => pb::data_event::Body::DapEvent(event),
+							DapRegistryEvent::Output(output) => data_event::Body::DapOutput(output),
+							DapRegistryEvent::Event(event) => data_event::Body::DapEvent(event),
 						};
 						send_body(
 							&responses,
@@ -4966,8 +4991,8 @@ impl EnvServer {
 				match self
 					.exec
 					.stdin(&request.exec, match request.input.as_ref() {
-						Some(pb::stdin_frame::Input::Data(data)) => Some(data.as_ref()),
-						Some(pb::stdin_frame::Input::Eof(_)) => None,
+						Some(stdin_frame::Input::Data(data)) => Some(data.as_ref()),
+						Some(stdin_frame::Input::Eof(_)) => None,
 						None => {
 							send_error(
 								responses,
@@ -5041,7 +5066,7 @@ impl EnvServer {
 		send_data_response(
 			responses,
 			request_id,
-			pb::data_response::Body::ExecSession(pb::ExecSessionResult { result: Some(result) }),
+			data_response::Body::ExecSession(pb::ExecSessionResult { result: Some(result) }),
 		)
 		.await;
 	}
@@ -5054,7 +5079,7 @@ impl EnvServer {
 		finished: &flume::Sender<Finished>,
 		connection: &mut ConnectionState,
 	) {
-		use pb::mcp_op::Op;
+		use mcp_op::Op;
 
 		let Some(operation) = request.op else {
 			send_error(
@@ -5080,10 +5105,8 @@ impl EnvServer {
 			send_data_response(
 				responses,
 				request_id,
-				pb::data_response::Body::Mcp(pb::McpResult {
-					result: Some(pb::mcp_result::Result::Status(
-						self.mcp.status(request.name.as_deref()),
-					)),
+				data_response::Body::Mcp(pb::McpResult {
+					result: Some(mcp_result::Result::Status(self.mcp.status(request.name.as_deref()))),
 				}),
 			)
 			.await;
@@ -5265,12 +5288,8 @@ impl EnvServer {
 		snapshot: pb::RepositorySnapshot,
 		responses: &flume::Sender<pb::ServerFrame>,
 	) {
-		send_data_response(
-			responses,
-			request_id,
-			pb::data_response::Body::RepositorySnapshot(snapshot),
-		)
-		.await;
+		send_data_response(responses, request_id, data_response::Body::RepositorySnapshot(snapshot))
+			.await;
 	}
 
 	async fn dispatch_worker(
@@ -5343,7 +5362,7 @@ impl EnvServer {
 					responses,
 					request_id,
 					server_frame::Body::Data(pb::DataResponse {
-						body: Some(pb::data_response::Body::Worker(pb::WorkerResult {
+						body: Some(data_response::Body::Worker(pb::WorkerResult {
 							result: Some(result),
 							..pb::WorkerResult::default()
 						})),
@@ -5364,7 +5383,7 @@ impl EnvServer {
 		responses: &flume::Sender<pb::ServerFrame>,
 		connection: &mut ConnectionState,
 	) {
-		use pb::{workspace_op::Op, workspace_result};
+		use pb::workspace_op::Op;
 
 		let Some(operation) = request.op else {
 			send_error(
@@ -5414,7 +5433,7 @@ impl EnvServer {
 				send_data_response(
 					responses,
 					request_id,
-					pb::data_response::Body::Workspace(pb::WorkspaceResult {
+					data_response::Body::Workspace(pb::WorkspaceResult {
 						result: Some(result),
 						props:  Default::default(),
 					}),
@@ -5541,8 +5560,7 @@ impl EnvServer {
 		};
 		match result {
 			Ok(result) => {
-				send_data_response(responses, request_id, pb::data_response::Body::Worktree(result))
-					.await;
+				send_data_response(responses, request_id, data_response::Body::Worktree(result)).await;
 			},
 			Err(error) => send_workspace_operation_error(responses, request_id, &error).await,
 		}
@@ -5557,7 +5575,7 @@ impl EnvServer {
 		finished: &flume::Sender<Finished>,
 		connection: &mut ConnectionState,
 	) {
-		use pb::{document_op::Op, document_result};
+		use pb::document_op::Op;
 
 		let Some(operation) = request.op else {
 			send_error(
@@ -5795,9 +5813,8 @@ impl EnvServer {
 					.await
 				{
 					Ok(response) => {
-						if let Some(document_pb::commit_transaction_response::Outcome::Committed(
-							committed,
-						)) = &response.outcome
+						if let Some(commit_transaction_response::Outcome::Committed(committed)) =
+							&response.outcome
 						{
 							for operation in &committed.operations {
 								let Some(lease_id) = lease_ids.get(operation.operation_index as usize)
@@ -5909,7 +5926,7 @@ impl EnvServer {
 				send_data_response(
 					responses,
 					request_id,
-					pb::data_response::Body::Document(pb::DocumentResult {
+					data_response::Body::Document(pb::DocumentResult {
 						result: Some(result),
 						props:  Default::default(),
 					}),
@@ -6236,7 +6253,7 @@ impl EnvServer {
 		let result = connection.invocation_mut(request_id, &request.invocation_id);
 		match result {
 			Ok(InvocationState::Native { feed, lifecycle, .. }) => {
-				let Ok(raw) = std::str::from_utf8(&request.raw) else {
+				let Ok(raw) = str::from_utf8(&request.raw) else {
 					send_error(
 						responses,
 						request_id,
@@ -6487,7 +6504,7 @@ enum InvocationState {
 	Worker {
 		id:              Str,
 		owner:           HostKey,
-		invocation:      Option<super::worker::WorkerInvocation>,
+		invocation:      Option<WorkerInvocation>,
 		committed:       bool,
 		admission:       AdmissionGate,
 		pending_commit:  Option<pb::ArgsCommitted>,
@@ -6495,7 +6512,7 @@ enum InvocationState {
 		execution:       InvocationExecutionPolicy,
 		request_scope:   Option<bool>,
 		interrupt:       flume::Sender<pb::Interrupt>,
-		interrupts:      Option<flume::Receiver<pb::Interrupt>>,
+		interrupts:      Option<Receiver<pb::Interrupt>>,
 		cancel:          CancellationToken,
 	},
 }
@@ -6612,7 +6629,7 @@ impl ConnectionState {
 		}
 	}
 
-	fn next_admission_deadline(&self) -> Option<tokio::time::Instant> {
+	fn next_admission_deadline(&self) -> Option<Instant> {
 		self
 			.requests
 			.values()
@@ -6623,8 +6640,8 @@ impl ConnectionState {
 			.min()
 	}
 
-	fn take_expired_admissions(&mut self) -> Vec<(u64, Str, omp_proto::policy::v1::PolicyDenied)> {
-		let now = tokio::time::Instant::now();
+	fn take_expired_admissions(&mut self) -> Vec<(u64, Str, policy_pb::PolicyDenied)> {
+		let now = Instant::now();
 		self
 			.requests
 			.iter_mut()
@@ -6967,7 +6984,7 @@ impl ConnectionState {
 	}
 
 	fn cancel_all(&mut self, exec_host: &ExecHost) {
-		for (_, state) in std::mem::take(&mut self.requests) {
+		for (_, state) in mem::take(&mut self.requests) {
 			match state {
 				RequestState::Invocation(InvocationState::Native {
 					feed, lifecycle, cancel, ..
@@ -7026,7 +7043,7 @@ impl InvocationState {
 		}
 	}
 
-	fn pending_admission_deadline(&self) -> Option<tokio::time::Instant> {
+	fn pending_admission_deadline(&self) -> Option<Instant> {
 		match self {
 			Self::Native { admission, .. } | Self::Worker { admission, .. } => {
 				admission.pending_deadline()
@@ -7034,10 +7051,7 @@ impl InvocationState {
 		}
 	}
 
-	fn expire_admission(
-		&mut self,
-		now: tokio::time::Instant,
-	) -> Option<omp_proto::policy::v1::PolicyDenied> {
+	fn expire_admission(&mut self, now: Instant) -> Option<policy_pb::PolicyDenied> {
 		match self {
 			Self::Native { admission, .. } | Self::Worker { admission, .. } => admission.expire(now),
 		}
@@ -7084,13 +7098,13 @@ async fn spawn_native_invocation(
 	finished: flume::Sender<Finished>,
 ) {
 	let (started, start) = flume::bounded(1);
-	tokio::spawn(super::tools::with_invocation_scope(pty_denied, async move {
+	tokio::spawn(with_invocation_scope(pty_denied, async move {
 		let result = registry.invoke(&name, params);
 		let _ = started.send(());
 		match result {
 			Ok(mut stream) => {
-				let mut deadline = Box::pin(tokio::time::sleep(deadline));
-				let mut cancel_grace: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+				let mut deadline = Box::pin(time::sleep(deadline));
+				let mut cancel_grace: Option<pin::Pin<Box<Sleep>>> = None;
 				let mut timed_out = false;
 				let mut grace_expired = false;
 				loop {
@@ -7138,7 +7152,7 @@ async fn spawn_native_invocation(
 								});
 								if lifecycle.is_committed() {
 									timed_out = true;
-									cancel_grace = Some(Box::pin(tokio::time::sleep(
+									cancel_grace = Some(Box::pin(time::sleep(
 										NATIVE_CANCEL_GRACE,
 									)));
 								} else if lifecycle.claim_precommit_terminal() {
@@ -7156,7 +7170,7 @@ async fn spawn_native_invocation(
 							},
 							() = cancel.cancelled() => {
 								if lifecycle.is_committed() {
-									cancel_grace = Some(Box::pin(tokio::time::sleep(
+									cancel_grace = Some(Box::pin(time::sleep(
 										NATIVE_CANCEL_GRACE,
 									)));
 								} else {
@@ -7185,7 +7199,7 @@ async fn spawn_native_invocation(
 											),
 										});
 										if lifecycle.is_committed() {
-											cancel_grace = Some(Box::pin(tokio::time::sleep(
+											cancel_grace = Some(Box::pin(time::sleep(
 												NATIVE_CANCEL_GRACE,
 											)));
 										} else {
@@ -7324,9 +7338,9 @@ async fn forward_native_event(
 fn spawn_worker_invocation(
 	request_id: u64,
 	invocation_id: Str,
-	mut invocation: super::worker::WorkerInvocation,
+	mut invocation: WorkerInvocation,
 	cancel: CancellationToken,
-	interrupts: flume::Receiver<pb::Interrupt>,
+	interrupts: Receiver<pb::Interrupt>,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
 ) {
@@ -7489,7 +7503,7 @@ async fn send_policy_denied_verdict(
 	responses: &flume::Sender<pb::ServerFrame>,
 	request_id: u64,
 	invocation_id: &Str,
-	denied: omp_proto::policy::v1::PolicyDenied,
+	denied: policy_pb::PolicyDenied,
 ) {
 	let reason = Str::from(denied.reason);
 	let policy = omp_tool::PolicyDenied {
@@ -7571,7 +7585,7 @@ async fn send_invocation_stream_error(
 
 fn spawn_exec(
 	request_id: u64,
-	run: super::exec::ExecRun,
+	run: ExecRun,
 	cancel: CancellationToken,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
@@ -7618,7 +7632,7 @@ fn spawn_exec(
 fn spawn_process_attachment(
 	request_id: u64,
 	process_name: Str,
-	events: flume::Receiver<ProcessEvent>,
+	events: Receiver<ProcessEvent>,
 	cancel: CancellationToken,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
@@ -7675,7 +7689,7 @@ async fn parse_mounted_resource_uri<'a>(
 	input: &'a str,
 	responses: &flume::Sender<pb::ServerFrame>,
 	request_id: u64,
-) -> Option<omp_tools::read::selector::ParsedUri<'a>> {
+) -> Option<ParsedUri<'a>> {
 	if input.len() > MAX_RESOURCE_URI_BYTES {
 		send_error(
 			responses,
@@ -7686,7 +7700,7 @@ async fn parse_mounted_resource_uri<'a>(
 		.await;
 		return None;
 	}
-	match omp_tools::read::selector::parse_uri(input) {
+	match selector::parse_uri(input) {
 		Ok(Some(uri))
 			if !matches!(
 				uri.scheme,
@@ -7757,9 +7771,7 @@ fn resource_bound(value: u64, ceiling: usize, name: &'static str) -> Result<usiz
 	Ok(value)
 }
 
-fn resource_capability_wire(
-	capability: omp_tools::read::resolver::ResourceCapability,
-) -> pb::ResourceCapability {
+fn resource_capability_wire(capability: ResourceCapability) -> pb::ResourceCapability {
 	pb::ResourceCapability {
 		scheme:      capability.scheme.to_owned(),
 		read:        capability.read,
@@ -7779,7 +7791,7 @@ async fn send_resource_result(
 	send_data_response(
 		responses,
 		request_id,
-		pb::data_response::Body::Resource(pb::ResourceOpResult { result: Some(result) }),
+		data_response::Body::Resource(pb::ResourceOpResult { result: Some(result) }),
 	)
 	.await;
 }
@@ -7787,17 +7799,15 @@ async fn send_resource_result(
 async fn send_resource_fault(
 	responses: &flume::Sender<pb::ServerFrame>,
 	request_id: u64,
-	fault: &omp_tools::read::Fault,
+	fault: &read::Fault,
 ) {
 	let code = match fault {
-		omp_tools::read::Fault::Invalid { .. } => pb::ProtocolErrorCode::InvalidArgument,
-		omp_tools::read::Fault::UnknownScheme { .. }
-		| omp_tools::read::Fault::SchemeNotReadable { .. }
-		| omp_tools::read::Fault::Unsupported { .. } => pb::ProtocolErrorCode::Unsupported,
-		omp_tools::read::Fault::Source { .. } => pb::ProtocolErrorCode::NotFound,
-		omp_tools::read::Fault::Web { .. } | omp_tools::read::Fault::Blob { .. } => {
-			pb::ProtocolErrorCode::Internal
-		},
+		read::Fault::Invalid { .. } => pb::ProtocolErrorCode::InvalidArgument,
+		read::Fault::UnknownScheme { .. }
+		| read::Fault::SchemeNotReadable { .. }
+		| read::Fault::Unsupported { .. } => pb::ProtocolErrorCode::Unsupported,
+		read::Fault::Source { .. } => pb::ProtocolErrorCode::NotFound,
+		read::Fault::Web { .. } | read::Fault::Blob { .. } => pb::ProtocolErrorCode::Internal,
 	};
 	send_error(responses, request_id, code, fault.message()).await;
 }
@@ -7817,7 +7827,8 @@ async fn send_resource_capability_error(
 }
 
 const fn mcp_operation(request: &pb::McpOp) -> &'static str {
-	use pb::mcp_op::Op;
+	use mcp_op::Op;
+
 	match request.op.as_ref() {
 		Some(Op::Status(_)) => "omp.env.mcp.status",
 		Some(Op::Subscribe(_)) => "omp.env.mcp.subscribe",
@@ -7831,8 +7842,9 @@ const fn mcp_operation(request: &pb::McpOp) -> &'static str {
 	}
 }
 
-const fn mcp_wire_revision(operation: &pb::mcp_op::Op) -> u32 {
-	use pb::mcp_op::Op;
+const fn mcp_wire_revision(operation: &mcp_op::Op) -> u32 {
+	use mcp_op::Op;
+
 	match operation {
 		Op::Status(request) => request.wire_revision,
 		Op::Subscribe(request) => request.wire_revision,
@@ -7848,7 +7860,7 @@ const fn mcp_wire_revision(operation: &pb::mcp_op::Op) -> u32 {
 fn spawn_mcp_request(
 	request_id: u64,
 	service: Arc<McpService>,
-	operation: pb::mcp_op::Op,
+	operation: mcp_op::Op,
 	cancel: CancellationToken,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
@@ -7877,7 +7889,7 @@ fn spawn_mcp_request(
 				.await
 				.map(McpResult::Invoke),
 			Op::Config(request) => service.config(request).await.map(McpResult::Config),
-			Op::Status(_) | Op::Subscribe(_) => Err(super::mcp::McpServiceError::InvalidRequest),
+			Op::Status(_) | Op::Subscribe(_) => Err(McpServiceError::InvalidRequest),
 		};
 		if !cancel.is_cancelled() {
 			match result {
@@ -7885,7 +7897,7 @@ fn spawn_mcp_request(
 					send_data_response(
 						&responses,
 						request_id,
-						pb::data_response::Body::Mcp(pb::McpResult { result: Some(result) }),
+						data_response::Body::Mcp(pb::McpResult { result: Some(result) }),
 					)
 					.await;
 				},
@@ -7900,7 +7912,7 @@ fn spawn_mcp_request(
 
 fn spawn_mcp_subscription(
 	request_id: u64,
-	subscription: super::mcp::ServiceSubscription,
+	subscription: ServiceSubscription,
 	cancel: CancellationToken,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
@@ -7908,25 +7920,22 @@ fn spawn_mcp_subscription(
 	tokio::spawn(async move {
 		loop {
 			match subscription.next(&cancel).await {
-				Ok(Some(super::mcp::SubscriptionEvent::Notification(notification))) => {
+				Ok(Some(SubscriptionEvent::Notification(notification))) => {
 					if !send_data_event_sync(
 						&responses,
 						request_id,
-						pb::data_event::Body::McpNotification(notification),
+						data_event::Body::McpNotification(notification),
 					) {
 						break;
 					}
 				},
-				Ok(Some(super::mcp::SubscriptionEvent::Status(status))) => {
-					if !send_data_event_sync(
-						&responses,
-						request_id,
-						pb::data_event::Body::McpStatus(status),
-					) {
+				Ok(Some(SubscriptionEvent::Status(status))) => {
+					if !send_data_event_sync(&responses, request_id, data_event::Body::McpStatus(status))
+					{
 						break;
 					}
 				},
-				Err(super::mcp::McpServiceError::Cancelled) => break,
+				Err(McpServiceError::Cancelled) => break,
 				Ok(None) | Err(_) => {
 					let _ = responses
 						.send_async(server_frame(
@@ -7956,7 +7965,7 @@ fn spawn_mcp_subscription(
 async fn send_mcp_error(
 	responses: &flume::Sender<pb::ServerFrame>,
 	request_id: u64,
-	error: &super::mcp::McpServiceError,
+	error: &McpServiceError,
 ) {
 	use super::mcp::McpServiceError;
 	let code = match error {
@@ -7977,12 +7986,13 @@ fn spawn_resource_completion(
 	request_id: u64,
 	input: String,
 	max_results: usize,
-	resources: Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
+	resources: Arc<ResolverTable<UrlResolver>>,
 	cancel: CancellationToken,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
 ) {
 	tokio::spawn(async move {
+		use omp_proto::env::v1::{ResourceCapability, ResourceCompletion};
 		let result = tokio::select! {
 			() = cancel.cancelled() => None,
 			result = resource_completions(&resources, &input, max_results) => Some(result),
@@ -7998,14 +8008,20 @@ fn spawn_resource_completion(
 						let event = checked_server_frame(
 							request_id,
 							server_frame::Body::DataEvent(pb::DataEvent {
-								body:  Some(pb::data_event::Body::ResourceCompletion(
-									pb::ResourceCompletion {
-										value:       completion.value.to_string(),
-										description: completion.description.to_string(),
-										capability:  Some(resource_capability_wire(capability)),
-										score:       completion.score,
-									},
-								)),
+								body:  Some(data_event::Body::ResourceCompletion(ResourceCompletion {
+									value:       completion.value.to_string(),
+									description: completion.description.to_string(),
+									capability:  Some(ResourceCapability {
+										scheme:      capability.scheme.to_owned(),
+										read:        capability.read,
+										list:        capability.list,
+										path:        capability.path,
+										complete:    capability.complete,
+										device_hash: Bytes::copy_from_slice(&capability.stamp.device_hash),
+										revision:    capability.stamp.revision,
+									}),
+									score:       completion.score,
+								})),
 								props: Default::default(),
 							}),
 						);
@@ -8018,7 +8034,7 @@ fn spawn_resource_completion(
 						let terminal = checked_server_frame(
 							request_id,
 							server_frame::Body::DataEvent(pb::DataEvent {
-								body:  Some(pb::data_event::Body::ResourceCompletionComplete(
+								body:  Some(data_event::Body::ResourceCompletionComplete(
 									pb::ResourceCompletionComplete {
 										emitted,
 										truncated,
@@ -8057,24 +8073,15 @@ fn spawn_resource_completion(
 }
 
 async fn resource_completions(
-	resources: &omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>,
+	resources: &ResolverTable<UrlResolver>,
 	input: &str,
 	max_results: usize,
-) -> Result<
-	(
-		Vec<(
-			omp_tools::read::resolver::ResourceCompletion,
-			omp_tools::read::resolver::ResourceCapability,
-		)>,
-		bool,
-	),
-	String,
-> {
-	use omp_tools::read::resolver::{ResourceCompletion, Scheme, fuzzy_score};
+) -> Result<(Vec<(ResourceCompletion, ResourceCapability)>, bool), String> {
+	use omp_tools::read::resolver::fuzzy_score;
 
 	if let Some((raw_scheme, query)) = input.split_once("://") {
-		let scheme = Scheme::parse(raw_scheme);
-		if scheme == Scheme::Unknown {
+		let scheme = resolver::Scheme::parse(raw_scheme);
+		if scheme == resolver::Scheme::Unknown {
 			return Err(format!("resource completion scheme is not mounted: {raw_scheme}"));
 		}
 		let capability = resources
@@ -8139,7 +8146,7 @@ fn spawn_document_events(
 						.send_async(server_frame(
 							request_id,
 							server_frame::Body::DataEvent(pb::DataEvent {
-								body:  Some(pb::data_event::Body::Document(event)),
+								body:  Some(data_event::Body::Document(event)),
 								props: Default::default(),
 							}),
 						))
@@ -8191,8 +8198,8 @@ fn spawn_lsp_events(
 			match event {
 				Ok(event) => {
 					let body = match event {
-						LspRegistryEvent::Event(event) => pb::data_event::Body::Lsp(event),
-						LspRegistryEvent::Binding(event) => pb::data_event::Body::LspBinding(event),
+						LspRegistryEvent::Event(event) => data_event::Body::Lsp(event),
+						LspRegistryEvent::Binding(event) => data_event::Body::LspBinding(event),
 					};
 					if responses
 						.send_async(server_frame(
@@ -8242,7 +8249,7 @@ fn spawn_workspace_walk(
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
 ) {
-	tokio::task::spawn_blocking(move || {
+	task::spawn_blocking(move || {
 		let mut emitted = 0_u64;
 		let result = workspace.walk_stream(&request, &cancel, |entry| {
 			if cancel.is_cancelled() {
@@ -8253,7 +8260,7 @@ fn spawn_workspace_walk(
 				FileType::Dir => document_pb::FileKind::Directory,
 				FileType::Symlink => document_pb::FileKind::SymbolicLink,
 			};
-			let event = pb::data_event::Body::WalkEntry(pb::WalkEntry {
+			let event = data_event::Body::WalkEntry(pb::WalkEntry {
 				path:     entry.relative_path.to_owned(),
 				kind:     kind as i32,
 				mtime_ms: entry.mtime,
@@ -8273,7 +8280,7 @@ fn spawn_workspace_walk(
 				let _ = send_data_event_sync(
 					&responses,
 					request_id,
-					pb::data_event::Body::WalkComplete(pb::WalkComplete {
+					data_event::Body::WalkComplete(pb::WalkComplete {
 						scanned_entries:  emitted,
 						filtered_entries: 0,
 						limited_entries:  u64::from(status == WalkStatus::Stopped),
@@ -8306,7 +8313,7 @@ fn spawn_workspace_search(
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
 ) {
-	tokio::task::spawn_blocking(move || {
+	task::spawn_blocking(move || {
 		let borrowed = WorkspaceSearchOptions {
 			pattern: options.pattern.as_str(),
 			case:    options.case,
@@ -8319,7 +8326,7 @@ fn spawn_workspace_search(
 			if send_data_event_sync(
 				&responses,
 				request_id,
-				pb::data_event::Body::SearchMatch(pb::SearchMatchMsg {
+				data_event::Body::SearchMatch(pb::SearchMatchMsg {
 					path:        matched.path.to_string(),
 					line:        matched.line,
 					byte_offset: matched.byte_offset,
@@ -8337,7 +8344,7 @@ fn spawn_workspace_search(
 				let _ = send_data_event_sync(
 					&responses,
 					request_id,
-					pb::data_event::Body::SearchComplete(pb::SearchComplete {
+					data_event::Body::SearchComplete(pb::SearchComplete {
 						files_scanned: outcome.files_scanned,
 						matches:       outcome.matches,
 						limited:       outcome.limited,
@@ -8362,7 +8369,7 @@ fn spawn_workspace_search(
 fn send_data_event_sync(
 	responses: &flume::Sender<pb::ServerFrame>,
 	request_id: u64,
-	body: pb::data_event::Body,
+	body: data_event::Body,
 ) -> bool {
 	responses
 		.send(checked_server_frame(
@@ -8398,7 +8405,7 @@ fn send_workspace_stream_error_sync(
 
 fn spawn_blob_get(
 	request_id: u64,
-	read: super::blobs::BlobRead,
+	read: BlobRead,
 	cancel: CancellationToken,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
@@ -8460,8 +8467,8 @@ fn spawn_blob_get(
 }
 
 fn worker_completion_json(
-	complete: &super::worker::WorkerCompletion,
-) -> Result<(Bytes, Option<omp_proto::thread::v1::Blob>, bool), Str> {
+	complete: &WorkerCompletion,
+) -> Result<(Bytes, Option<thread_pb::Blob>, bool), Str> {
 	let is_error = complete.kind != WorkerOutcomeKind::Ok;
 	if let Some(blob) = &complete.details_blob {
 		return Ok((Bytes::new(), Some(blob.clone()), is_error));
@@ -8516,7 +8523,7 @@ fn worker_completion_json(
 }
 
 fn worker_verdict_json(details: Bytes, is_error: bool) -> Result<Bytes, serde_json::Error> {
-	let _: &serde_json::value::RawValue = serde_json::from_slice(&details)?;
+	let _: &RawValue = serde_json::from_slice(&details)?;
 	let prefix: &[u8] = if is_error {
 		br#"{"kind":"faulted","value":"#
 	} else {
@@ -8763,7 +8770,7 @@ async fn send_blob_error(
 		| BlobError::SizeMismatch { .. }
 		| BlobError::InvalidRange
 		| BlobError::LengthOverflow => pb::ProtocolErrorCode::InvalidArgument,
-		BlobError::Store(omp_storage::blob::Error::NotFound) => pb::ProtocolErrorCode::NotFound,
+		BlobError::Store(blob::Error::NotFound) => pb::ProtocolErrorCode::NotFound,
 		BlobError::Store(_)
 		| BlobError::Remove(_)
 		| BlobError::FinalizeTask(_)
@@ -8774,7 +8781,7 @@ async fn send_blob_error(
 }
 
 fn connection_lease_id(target: Option<&document_pb::DocumentTarget>) -> Option<&Bytes> {
-	let document_pb::document_target::Target::LeaseId(lease_id) = target?.target.as_ref()? else {
+	let document_target::Target::LeaseId(lease_id) = target?.target.as_ref()? else {
 		return None;
 	};
 	Some(lease_id)
@@ -8784,7 +8791,7 @@ fn connection_lease<'a>(
 	connection: &'a ConnectionState,
 	target: Option<&document_pb::DocumentTarget>,
 ) -> Option<&'a DocumentLease> {
-	let document_pb::document_target::Target::LeaseId(lease_id) = target?.target.as_ref()? else {
+	let document_target::Target::LeaseId(lease_id) = target?.target.as_ref()? else {
 		return None;
 	};
 	connection.document_leases.get(lease_id)
@@ -8975,17 +8982,13 @@ async fn send_policy_error(
 	error: PolicyError,
 ) {
 	if let PolicyError::QuotaExceeded { quota, limit, used } = &error {
-		let props = omp_proto::inference::v1::ValueMap {
+		let props = v1::ValueMap {
 			fields: BTreeMap::from([
-				("quota".to_owned(), omp_proto::inference::v1::Value {
-					kind: Some(omp_proto::inference::v1::value::Kind::String((*quota).to_owned())),
+				("quota".to_owned(), v1::Value {
+					kind: Some(value::Kind::String((*quota).to_owned())),
 				}),
-				("limit".to_owned(), omp_proto::inference::v1::Value {
-					kind: Some(omp_proto::inference::v1::value::Kind::Int(*limit as i64)),
-				}),
-				("used".to_owned(), omp_proto::inference::v1::Value {
-					kind: Some(omp_proto::inference::v1::value::Kind::Int(*used as i64)),
-				}),
+				("limit".to_owned(), v1::Value { kind: Some(value::Kind::Int(*limit as i64)) }),
+				("used".to_owned(), v1::Value { kind: Some(value::Kind::Int(*used as i64)) }),
 			]),
 		};
 		send_body(
@@ -9035,7 +9038,7 @@ async fn send_policy_error(
 async fn send_data_response(
 	responses: &flume::Sender<pb::ServerFrame>,
 	request_id: u64,
-	body: pb::data_response::Body,
+	body: data_response::Body,
 ) {
 	send_body(
 		responses,
@@ -9105,7 +9108,7 @@ async fn send_invocation_body(
 	body: server_frame::Body,
 ) -> bool {
 	matches!(
-		tokio::time::timeout(
+		time::timeout(
 			INVOCATION_RESPONSE_SEND_GRACE,
 			responses.send_async(checked_server_frame(request_id, body)),
 		)
@@ -9121,7 +9124,7 @@ async fn send_invocation_terminal_body(
 ) {
 	let frame = checked_server_frame(request_id, body);
 	let retry = frame.clone();
-	if tokio::time::timeout(INVOCATION_RESPONSE_SEND_GRACE, responses.send_async(frame))
+	if time::timeout(INVOCATION_RESPONSE_SEND_GRACE, responses.send_async(frame))
 		.await
 		.is_err()
 	{
@@ -9288,7 +9291,7 @@ pub async fn run_with_registry(
 	let workspace = WorkspaceHost::open(&args.root)?;
 	let root = workspace.root().to_path_buf();
 	let data_dir = omp_core::dirs::data_dir(None).map_err(io::Error::other)?;
-	let settings = super::host_settings::load(&data_dir, &root).map_err(io::Error::other)?;
+	let settings = load_host_settings(&data_dir, &root).map_err(io::Error::other)?;
 	let interrupt_grace = settings.runtime.interrupt_grace;
 	let state_dir = if let Some(path) = args.state_dir {
 		path
@@ -9306,8 +9309,7 @@ pub async fn run_with_registry(
 		ensure_document_socket_free(&socket).await?;
 		socket
 	};
-	let (principal_authority, session_id, session_generation) =
-		super::authenticated_runtime_identity()?;
+	let (principal_authority, session_id, session_generation) = authenticated_runtime_identity()?;
 	let mut ext_host_config = ExtHostConfig::current(
 		principal_authority.principal().clone(),
 		session_id.clone(),
@@ -9316,7 +9318,7 @@ pub async fn run_with_registry(
 	ext_host_config.interrupt_grace = interrupt_grace;
 	let mut extension_bindings = Vec::new();
 	if args.py_eval {
-		let key = HostKey::new("workspace", "trusted", crate::worker::PY_EVAL_MODULE);
+		let key = HostKey::new("workspace", "trusted", PY_EVAL_MODULE);
 		let binding = ExtensionDataBinding::built_in(
 			&state_dir,
 			key.clone(),
@@ -9326,7 +9328,7 @@ pub async fn run_with_registry(
 		let mut digest = Hash32::hasher();
 		digest.update(omp_env::build_id::current().as_bytes());
 		digest.update(env!("CARGO_PKG_VERSION").as_bytes());
-		digest.update(crate::worker::PY_EVAL_MODULE.as_bytes());
+		digest.update(PY_EVAL_MODULE.as_bytes());
 		let provenance = omp_core::Provenance::new(
 			sf!("omp-first-party"),
 			sf!(crate::worker::PY_EVAL_MODULE),
@@ -9336,15 +9338,15 @@ pub async fn run_with_registry(
 			sf!("trusted"),
 			1,
 		);
-		let manifest = super::exthost::ExtensionManifest::py_eval(provenance, []);
+		let manifest = ExtensionManifest::py_eval(provenance, []);
 		let mut spec = ExtHostSpec::new(key, manifest);
 		spec.data_grants = binding.grants().clone();
 		spec.data_socket = Some(binding.path().to_path_buf());
 		ext_host_config.extensions.push(spec);
 		extension_bindings.push(binding);
 	}
-	let (env_connections, env_connection_rx) = tokio::sync::watch::channel(0);
-	let (doc_connections, doc_connection_rx) = tokio::sync::watch::channel(0);
+	let (env_connections, env_connection_rx) = watch::channel(0);
+	let (doc_connections, doc_connection_rx) = watch::channel(0);
 	let server = Arc::new(
 		EnvServer::open_project(
 			&root,
@@ -9358,21 +9360,21 @@ pub async fn run_with_registry(
 		.await?,
 	);
 	let process_shutdown = CancellationToken::new();
-	let signal = process_shutdown.clone();
+	let signal_shutdown = process_shutdown.clone();
 	let signal_task = tokio::spawn(async move {
-		let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+		let mut terminate = signal(SignalKind::terminate());
 		match terminate.as_mut() {
 			Ok(terminate) => {
 				tokio::select! {
-					_ = tokio::signal::ctrl_c() => {},
+					_ = ctrl_c() => {},
 					_ = terminate.recv() => {},
 				}
 			},
 			Err(_) => {
-				let _ = tokio::signal::ctrl_c().await;
+				let _ = ctrl_c().await;
 			},
 		}
-		signal.cancel();
+		signal_shutdown.cancel();
 	});
 	let listener_shutdown = CancellationToken::new();
 	let serve_shutdown = listener_shutdown.clone();
@@ -9383,7 +9385,7 @@ pub async fn run_with_registry(
 			.serve_uds(&serve_socket, serve_shutdown, Some(env_connections))
 			.await
 	});
-	let mut extension_tasks = tokio::task::JoinSet::new();
+	let mut extension_tasks = JoinSet::new();
 	for binding in extension_bindings {
 		let extension_server = Arc::clone(&server);
 		let extension_shutdown = listener_shutdown.clone();
@@ -9396,7 +9398,7 @@ pub async fn run_with_registry(
 	let idle_timeout = Duration::from_secs(args.idle_timeout);
 	let idle = async move {
 		if idle_timeout.is_zero() {
-			std::future::pending::<()>().await;
+			future::pending::<()>().await;
 		} else {
 			wait_idle(env_connection_rx, doc_connection_rx, 1, idle_timeout).await;
 		}
@@ -9429,8 +9431,8 @@ pub async fn run_with_registry(
 
 #[cfg(unix)]
 async fn wait_idle(
-	mut env: tokio::sync::watch::Receiver<usize>,
-	mut docs: tokio::sync::watch::Receiver<usize>,
+	mut env: watch::Receiver<usize>,
+	mut docs: watch::Receiver<usize>,
 	reserved_docs: usize,
 	timeout: Duration,
 ) {
@@ -9441,10 +9443,10 @@ async fn wait_idle(
 			tokio::select! {
 				result = env.changed(), if env_open => env_open = result.is_ok(),
 				result = docs.changed(), if docs_open => docs_open = result.is_ok(),
-				else => std::future::pending::<()>().await,
+				else => future::pending::<()>().await,
 			}
 		}
-		let idle = tokio::time::sleep(timeout);
+		let idle = time::sleep(timeout);
 		tokio::pin!(idle);
 		loop {
 			tokio::select! {
@@ -9478,9 +9480,9 @@ pub async fn run(_args: EnvdConfig, _bridges: RegistryBridges) -> Result<(), Env
 async fn connect_or_start_docserver(
 	root: &Path,
 	socket: &Path,
-	connections: Option<tokio::sync::watch::Sender<usize>>,
+	connections: Option<watch::Sender<usize>>,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
-	if let Ok(stream) = tokio::net::UnixStream::connect(socket).await {
+	if let Ok(stream) = UnixStream::connect(socket).await {
 		let documents = DocumentHost::connect(stream).await?;
 		if omp_env::build_id::is_stale(
 			omp_env::build_id::current(),
@@ -9494,7 +9496,7 @@ async fn connect_or_start_docserver(
 		return Ok((documents, None));
 	}
 	if let Some(parent) = socket.parent() {
-		std::fs::create_dir_all(parent)?;
+		fs::create_dir_all(parent)?;
 	}
 
 	let shutdown = CancellationToken::new();
@@ -9504,7 +9506,7 @@ async fn connect_or_start_docserver(
 	let task = tokio::spawn(async move {
 		omp_docserver::daemon::serve(
 			task_root,
-			omp_docserver::daemon::Transport::Socket(task_socket),
+			daemon::Transport::Socket(task_socket),
 			omp_docserver::daemon::ServeOptions {
 				lsp_config_paths: Vec::new(),
 				shutdown: Some(task_shutdown),
@@ -9515,7 +9517,7 @@ async fn connect_or_start_docserver(
 		.await
 	});
 	let mut authority = DocumentAuthority { shutdown, task: Some(task) };
-	let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+	let deadline = Instant::now() + Duration::from_secs(10);
 	loop {
 		if let Some(result) = authority.finished_result().await {
 			match result? {
@@ -9523,16 +9525,16 @@ async fn connect_or_start_docserver(
 				Err(error) => return Err(EnvdError::Document(Str::from(error.to_string()))),
 			}
 		}
-		if let Ok(stream) = tokio::net::UnixStream::connect(socket).await {
+		if let Ok(stream) = UnixStream::connect(socket).await {
 			let documents = DocumentHost::connect(stream).await?;
 			return Ok((documents, Some(authority)));
 		}
-		if tokio::time::Instant::now() >= deadline {
+		if Instant::now() >= deadline {
 			return Err(
 				io::Error::new(io::ErrorKind::TimedOut, "document-server hello timed out").into(),
 			);
 		}
-		tokio::time::sleep(Duration::from_millis(25)).await;
+		time::sleep(Duration::from_millis(25)).await;
 	}
 }
 
@@ -9540,13 +9542,13 @@ async fn connect_or_start_docserver(
 async fn connect_or_start_docserver(
 	root: &Path,
 	socket: &Path,
-	connections: Option<tokio::sync::watch::Sender<usize>>,
+	connections: Option<watch::Sender<usize>>,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
 	if let Ok(stream) = omp_docserver::windows::connect_owner_pipe(socket) {
 		let documents = DocumentHost::connect(stream).await?;
 		return Ok((documents, None));
 	}
-	let listener = omp_docserver::windows::OwnerPipeListener::bind(socket)?;
+	let listener = OwnerPipeListener::bind(socket)?;
 	let config = omp_docserver::ServerConfig::new(root)
 		.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?
 		.with_server_build(omp_env::build_id::current());
@@ -9558,7 +9560,7 @@ async fn connect_or_start_docserver(
 		omp_docserver::windows::serve_owner_pipe(
 			environment,
 			listener,
-			omp_docserver::connection::ConnectionConfig::default(),
+			ConnectionConfig::default(),
 			task_shutdown,
 			connections,
 		)
@@ -9578,7 +9580,7 @@ async fn connect_or_start_docserver(
 /// generation alive forever through the successor's own connection.
 #[cfg(unix)]
 async fn ensure_document_socket_free(socket: &Path) -> Result<(), EnvdError> {
-	match tokio::net::UnixStream::connect(socket).await {
+	match UnixStream::connect(socket).await {
 		Ok(_) => Err(EnvdError::DocumentAuthorityHeld),
 		Err(_) => Ok(()),
 	}
@@ -9588,12 +9590,29 @@ async fn ensure_document_socket_free(socket: &Path) -> Result<(), EnvdError> {
 fn ensure_directory(path: &Path) -> io::Result<()> {
 	use std::os::unix::fs::PermissionsExt as _;
 
-	std::fs::create_dir_all(path)?;
-	std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+	fs::create_dir_all(path)?;
+	fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 #[cfg(all(test, unix))]
 mod tests {
-	use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+	use std::fs;
+
+	use flume::Receiver;
+	use omp_core::Principal;
+	use omp_docserver::{
+		Environment, ServerConfig,
+		connection::{ConnectionConfig, serve_connection},
+	};
+	use omp_proto::{
+		document::v1::{document_target, read_selection},
+		env::v1::{self as env_pb, document_op, document_result},
+	};
+	use tokio::{
+		io::{AsyncBufReadExt as _, BufReader, DuplexStream, duplex, split},
+		net::{UnixListener, UnixStream},
+		sync::watch,
+		time,
+	};
 
 	use super::*;
 
@@ -9604,29 +9623,25 @@ mod tests {
 		with_dap: bool,
 	) -> (
 		flume::Sender<pb::ClientFrame>,
-		flume::Receiver<pb::ServerFrame>,
+		Receiver<pb::ServerFrame>,
 		tempfile::TempDir,
 		tempfile::TempDir,
 	) {
 		let root = tempfile::tempdir().expect("workspace");
 		let state = tempfile::tempdir().expect("state");
 		let workspace = WorkspaceHost::open(root.path()).expect("workspace host");
-		let document_config = omp_docserver::ServerConfig::new(root.path())
+		let document_config = ServerConfig::new(root.path())
 			.expect("document config")
 			.with_server_build("envd-test");
-		let document_environment =
-			omp_docserver::Environment::new(document_config).expect("document environment");
+		let document_environment = Environment::new(document_config).expect("document environment");
 		if with_dap {
 			install_test_dap(&document_environment).await;
 		}
-		let (document_client, document_server) = tokio::io::duplex(64 * 1024);
+		let (document_client, document_server) = duplex(64 * 1024);
 		tokio::spawn(async move {
-			let _ = omp_docserver::connection::serve_connection(
-				document_environment,
-				document_server,
-				omp_docserver::connection::ConnectionConfig::default(),
-			)
-			.await;
+			let _ =
+				serve_connection(document_environment, document_server, ConnectionConfig::default())
+					.await;
 		});
 		let documents = DocumentHost::connect(document_client)
 			.await
@@ -9657,7 +9672,7 @@ mod tests {
 		.expect("workspace operations");
 		let ext_hosts = ExtHostSupervisor::spawn(ExtHostConfig::new(
 			PathBuf::from("unused"),
-			omp_core::Principal::new(sf!("test-principal"), sf!("Test Principal")),
+			Principal::new(sf!("test-principal"), sf!("Test Principal")),
 			sf!("test-session"),
 			1,
 		))
@@ -9695,24 +9710,24 @@ mod tests {
 			workspace.clone(),
 			mcp,
 			mcp_manager,
-			Arc::new(omp_tools::read::resolver::ResolverTable::default()),
+			Arc::new(ResolverTable::default()),
 			memory_runtime,
-			super::super::lsp_settings::LspSettings::default(),
+			LspSettings::default(),
 			blobs.clone(),
 			SiteMaterializer::open(state.path().join("ext"), blobs.store().clone())
 				.expect("site materializer"),
 			ResourceMaterializer::open(workspace.root(), state.path()).expect("resource materializer"),
 			Arc::new(Registry::new()),
-			omp_tools::ask::PresenterSlot::new(Arc::new(omp_tools::ask::HeadlessPresenter)),
+			PresenterSlot::new(Arc::new(omp_tools::ask::HeadlessPresenter)),
 			workspace_ops,
 			Arc::new(ext_hosts),
 			Arc::new(SessionBridgeHost::new()),
-			Arc::new(crate::memory::ReflectionBridgeHost::new()),
-			omp_tools::eval::EvalSessionControl::default(),
-			Arc::new(crate::search_backend::SearchBridgeHost::new(None)),
-			Arc::new(crate::github_url::GithubCredentialBridge::new()),
-			crate::tools::AgentCheckpointControl::default(),
-			omp_tools::staging::PreviewRegistry::new(),
+			Arc::new(ReflectionBridgeHost::new()),
+			EvalSessionControl::default(),
+			Arc::new(SearchBridgeHost::new(None)),
+			Arc::new(GithubCredentialBridge::new()),
+			AgentCheckpointControl::default(),
+			PreviewRegistry::new(),
 			sessions_index,
 			journal_external,
 			Arc::new(AuthorityTable::default()),
@@ -9765,10 +9780,10 @@ mod tests {
 		(requests, response_rx, root, state)
 	}
 
-	async fn install_test_dap(environment: &omp_docserver::Environment) {
-		let (client, adapter) = tokio::io::duplex(64 * 1024);
+	async fn install_test_dap(environment: &Environment) {
+		let (client, adapter) = duplex(64 * 1024);
 		tokio::spawn(fake_dap_adapter(adapter));
-		let (reader, writer) = tokio::io::split(client);
+		let (reader, writer) = split(client);
 		let session = omp_docserver::DapSession::start(
 			omp_core::hex::encode_n(&TEST_DAP_SESSION_ID).as_str(),
 			"test",
@@ -9783,8 +9798,8 @@ mod tests {
 		environment.dap_sessions().insert(session);
 	}
 
-	async fn fake_dap_adapter(stream: tokio::io::DuplexStream) {
-		let (reader, mut writer) = tokio::io::split(stream);
+	async fn fake_dap_adapter(stream: DuplexStream) {
+		let (reader, mut writer) = split(stream);
 		let mut reader = BufReader::new(reader);
 		let mut next_seq = 1_i64;
 		loop {
@@ -9893,7 +9908,7 @@ mod tests {
 		writer.flush().await
 	}
 
-	fn data_frame(request_id: u64, body: pb::data_request::Body) -> pb::ClientFrame {
+	fn data_frame(request_id: u64, body: data_request::Body) -> pb::ClientFrame {
 		pb::ClientFrame {
 			request_id,
 			body: Some(client_frame::Body::Data(pb::DataRequest {
@@ -9913,7 +9928,7 @@ mod tests {
 
 	/// App-authority DATA frame: no invocation scope, so admission rides the
 	/// connection grants rather than the worker effect envelope.
-	fn unscoped_data_frame(request_id: u64, body: pb::data_request::Body) -> pb::ClientFrame {
+	fn unscoped_data_frame(request_id: u64, body: data_request::Body) -> pb::ClientFrame {
 		pb::ClientFrame {
 			request_id,
 			body: Some(client_frame::Body::Data(pb::DataRequest {
@@ -9932,7 +9947,7 @@ mod tests {
 		requests
 			.send_async(unscoped_data_frame(
 				1,
-				pb::data_request::Body::DapAction(document_pb::DapActionRequest {
+				data_request::Body::DapAction(document_pb::DapActionRequest {
 					session:             Some(document_pb::DapSessionRef {
 						session_id: Bytes::copy_from_slice(&TEST_DAP_SESSION_ID),
 						generation: 1,
@@ -9951,7 +9966,7 @@ mod tests {
 		assert!(matches!(
 			output.body,
 			Some(server_frame::Body::DataEvent(pb::DataEvent {
-				body: Some(pb::data_event::Body::DapOutput(document_pb::DapOutput {
+				body: Some(data_event::Body::DapOutput(document_pb::DapOutput {
 					sequence: 1,
 					ref output,
 					..
@@ -9961,7 +9976,7 @@ mod tests {
 		));
 		let response = responses.recv_async().await.expect("DAP action response");
 		let Some(server_frame::Body::Data(pb::DataResponse {
-			body: Some(pb::data_response::Body::DapAction(response)),
+			body: Some(data_response::Body::DapAction(response)),
 			..
 		})) = response.body
 		else {
@@ -9983,7 +9998,7 @@ mod tests {
 		requests
 			.send_async(data_frame(
 				1,
-				pb::data_request::Body::DapAction(document_pb::DapActionRequest {
+				data_request::Body::DapAction(document_pb::DapActionRequest {
 					session:             Some(document_pb::DapSessionRef {
 						session_id: Bytes::copy_from_slice(&TEST_DAP_SESSION_ID),
 						generation: 1,
@@ -10008,7 +10023,7 @@ mod tests {
 	#[tokio::test]
 	async fn repository_snapshot_returns_only_granted_canonical_root_uris() {
 		let (requests, responses, root, _state) = test_connection(&["env.search"], false).await;
-		let initialized = std::process::Command::new("git")
+		let initialized = process::Command::new("git")
 			.current_dir(root.path())
 			.args(["init", "-b", "main"])
 			.output()
@@ -10021,7 +10036,7 @@ mod tests {
 		requests
 			.send_async(data_frame(
 				1,
-				pb::data_request::Body::RepositorySnapshot(pb::RepositorySnapshotRequest {
+				data_request::Body::RepositorySnapshot(pb::RepositorySnapshotRequest {
 					root_uri:          Url::from_directory_path(root.path())
 						.expect("workspace URI")
 						.to_string(),
@@ -10033,7 +10048,7 @@ mod tests {
 			.expect("send repository snapshot");
 		let response = responses.recv_async().await.expect("snapshot response");
 		let Some(server_frame::Body::Data(pb::DataResponse {
-			body: Some(pb::data_response::Body::RepositorySnapshot(snapshot)),
+			body: Some(data_response::Body::RepositorySnapshot(snapshot)),
 			..
 		})) = response.body
 		else {
@@ -10045,7 +10060,7 @@ mod tests {
 				.expect("worktree URI")
 				.to_file_path()
 				.expect("worktree file URI"),
-			std::fs::canonicalize(root.path()).expect("canonical workspace")
+			fs::canonicalize(root.path()).expect("canonical workspace")
 		);
 		assert_eq!(snapshot.worktree_root_uri, snapshot.primary_root_uri);
 		assert!(snapshot.revision > 0);
@@ -10054,7 +10069,7 @@ mod tests {
 		requests
 			.send_async(data_frame(
 				2,
-				pb::data_request::Body::RepositorySnapshot(pb::RepositorySnapshotRequest {
+				data_request::Body::RepositorySnapshot(pb::RepositorySnapshotRequest {
 					root_uri:          Url::from_directory_path(outside.path())
 						.expect("outside URI")
 						.to_string(),
@@ -10078,15 +10093,15 @@ mod tests {
 		let (requests, responses, root, _state) =
 			test_connection(&["env.doc.read", "env.site"], false).await;
 		let path = root.path().join("sample.txt");
-		std::fs::write(&path, b"hello document").expect("write document");
+		fs::write(&path, b"hello document").expect("write document");
 		let uri = Url::from_file_path(&path)
 			.expect("document URI")
 			.to_string();
 		requests
 			.send_async(data_frame(
 				1,
-				pb::data_request::Body::Document(pb::DocumentOp {
-					op:    Some(pb::document_op::Op::Open(document_pb::OpenDocumentRequest {
+				data_request::Body::Document(pb::DocumentOp {
+					op:    Some(document_op::Op::Open(document_pb::OpenDocumentRequest {
 						uri,
 						language_id: "text".to_owned(),
 					})),
@@ -10098,8 +10113,8 @@ mod tests {
 		let opened = responses.recv_async().await.expect("open response");
 		let Some(server_frame::Body::Data(pb::DataResponse {
 			body:
-				Some(pb::data_response::Body::Document(pb::DocumentResult {
-					result: Some(pb::document_result::Result::Opened(opened)),
+				Some(data_response::Body::Document(pb::DocumentResult {
+					result: Some(document_result::Result::Opened(opened)),
 					..
 				})),
 			..
@@ -10111,14 +10126,14 @@ mod tests {
 		requests
 			.send_async(data_frame(
 				2,
-				pb::data_request::Body::Document(pb::DocumentOp {
-					op:    Some(pb::document_op::Op::Read(document_pb::ReadDocumentRequest {
+				data_request::Body::Document(pb::DocumentOp {
+					op:    Some(document_op::Op::Read(document_pb::ReadDocumentRequest {
 						document: Some(document_pb::DocumentTarget {
-							target: Some(document_pb::document_target::Target::LeaseId(opened.lease_id)),
+							target: Some(document_target::Target::LeaseId(opened.lease_id)),
 						}),
 						revision,
 						selection: Some(document_pb::ReadSelection {
-							selection: Some(document_pb::read_selection::Selection::Whole(
+							selection: Some(read_selection::Selection::Whole(
 								document_pb::WholeDocument::default(),
 							)),
 						}),
@@ -10132,15 +10147,15 @@ mod tests {
 		assert!(matches!(
 			read.body,
 			Some(server_frame::Body::Data(pb::DataResponse {
-				body: Some(pb::data_response::Body::Document(pb::DocumentResult {
-					result: Some(pb::document_result::Result::Read(_)),
+				body: Some(data_response::Body::Document(pb::DocumentResult {
+					result: Some(document_result::Result::Read(_)),
 					..
 				})),
 				..
 			}))
 		));
 		requests
-			.send_async(data_frame(3, pb::data_request::Body::Site(pb::MaterializeSite::default())))
+			.send_async(data_frame(3, data_request::Body::Site(env_pb::MaterializeSite::default())))
 			.await
 			.expect("send extension site write");
 		let denied = responses.recv_async().await.expect("site refusal response");
@@ -10155,12 +10170,12 @@ mod tests {
 	async fn data_walk_and_search_stream_incrementally_to_completion() {
 		let (requests, responses, root, _state) =
 			test_connection(&["env.walk", "env.search"], false).await;
-		std::fs::write(root.path().join("a.txt"), b"needle\n").expect("write first");
-		std::fs::write(root.path().join("b.txt"), b"other needle\n").expect("write second");
+		fs::write(root.path().join("a.txt"), b"needle\n").expect("write first");
+		fs::write(root.path().join("b.txt"), b"other needle\n").expect("write second");
 		requests
 			.send_async(data_frame(
 				10,
-				pb::data_request::Body::Walk(pb::WalkRequest {
+				data_request::Body::Walk(pb::WalkRequest {
 					root_uri: String::new(),
 					options:  None,
 					include:  Vec::new(),
@@ -10175,11 +10190,11 @@ mod tests {
 		loop {
 			match responses.recv_async().await.expect("walk event").body {
 				Some(server_frame::Body::DataEvent(pb::DataEvent {
-					body: Some(pb::data_event::Body::WalkEntry(_)),
+					body: Some(data_event::Body::WalkEntry(_)),
 					..
 				})) => walk_entries += 1,
 				Some(server_frame::Body::DataEvent(pb::DataEvent {
-					body: Some(pb::data_event::Body::WalkComplete(_)),
+					body: Some(data_event::Body::WalkComplete(_)),
 					..
 				})) => break,
 				other => panic!("unexpected walk frame: {other:?}"),
@@ -10189,7 +10204,7 @@ mod tests {
 		requests
 			.send_async(data_frame(
 				11,
-				pb::data_request::Body::Search(pb::SearchRequest {
+				data_request::Body::Search(pb::SearchRequest {
 					walk:           Some(pb::WalkRequest {
 						root_uri: String::new(),
 						options:  None,
@@ -10210,11 +10225,11 @@ mod tests {
 		loop {
 			match responses.recv_async().await.expect("search event").body {
 				Some(server_frame::Body::DataEvent(pb::DataEvent {
-					body: Some(pb::data_event::Body::SearchMatch(_)),
+					body: Some(data_event::Body::SearchMatch(_)),
 					..
 				})) => matches += 1,
 				Some(server_frame::Body::DataEvent(pb::DataEvent {
-					body: Some(pb::data_event::Body::SearchComplete(_)),
+					body: Some(data_event::Body::SearchComplete(_)),
 					..
 				})) => break,
 				other => panic!("unexpected search frame: {other:?}"),
@@ -10266,7 +10281,7 @@ mod tests {
 
 		assert!(ensure_document_socket_free(&socket).await.is_ok(), "absent socket must be free");
 
-		let listener = tokio::net::UnixListener::bind(&socket).expect("bind document socket");
+		let listener = UnixListener::bind(&socket).expect("bind document socket");
 		assert!(
 			matches!(
 				ensure_document_socket_free(&socket).await,
@@ -10277,12 +10292,12 @@ mod tests {
 
 		// A stale socket file without a listener no longer refuses startup.
 		drop(listener);
-		tokio::time::timeout(Duration::from_secs(1), async {
+		time::timeout(Duration::from_secs(1), async {
 			loop {
 				if ensure_document_socket_free(&socket).await.is_ok() {
 					break;
 				}
-				tokio::time::sleep(Duration::from_millis(1)).await;
+				time::sleep(Duration::from_millis(1)).await;
 			}
 		})
 		.await
@@ -10291,30 +10306,30 @@ mod tests {
 	#[tokio::test]
 	async fn idle_wait_requires_one_continuous_quiet_window() {
 		let window = Duration::from_millis(30);
-		let (env_tx, env_rx) = tokio::sync::watch::channel(1);
-		let (docs_tx, docs_rx) = tokio::sync::watch::channel(2);
+		let (env_tx, env_rx) = watch::channel(1);
+		let (docs_tx, docs_rx) = watch::channel(2);
 		let busy = tokio::spawn(wait_idle(env_rx, docs_rx, 1, window));
-		tokio::time::sleep(Duration::from_millis(5)).await;
+		time::sleep(Duration::from_millis(5)).await;
 		assert!(!busy.is_finished(), "busy environment was considered idle");
 		env_tx.send_replace(0);
-		tokio::time::sleep(Duration::from_millis(5)).await;
+		time::sleep(Duration::from_millis(5)).await;
 		assert!(!busy.is_finished(), "external document client was considered idle");
 		docs_tx.send_replace(1);
-		tokio::time::sleep(Duration::from_millis(15)).await;
+		time::sleep(Duration::from_millis(15)).await;
 		assert!(!busy.is_finished(), "idle wait resolved before its full window");
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		time::sleep(Duration::from_millis(20)).await;
 		busy.await.expect("idle wait task");
 
-		let (env_tx, env_rx) = tokio::sync::watch::channel(0);
-		let (_docs_tx, docs_rx) = tokio::sync::watch::channel(1);
+		let (env_tx, env_rx) = watch::channel(0);
+		let (_docs_tx, docs_rx) = watch::channel(1);
 		let reset = tokio::spawn(wait_idle(env_rx, docs_rx, 1, window));
-		tokio::time::sleep(Duration::from_millis(15)).await;
+		time::sleep(Duration::from_millis(15)).await;
 		env_tx.send_replace(1);
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 		env_tx.send_replace(0);
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		time::sleep(Duration::from_millis(20)).await;
 		assert!(!reset.is_finished(), "activity did not reset the idle window");
-		tokio::time::sleep(Duration::from_millis(15)).await;
+		time::sleep(Duration::from_millis(15)).await;
 		reset.await.expect("reset idle wait task");
 	}
 
@@ -10330,7 +10345,7 @@ mod tests {
 		let task = tokio::spawn(async move {
 			omp_docserver::daemon::serve(
 				serve_root,
-				omp_docserver::daemon::Transport::Socket(serve_socket),
+				daemon::Transport::Socket(serve_socket),
 				omp_docserver::daemon::ServeOptions {
 					lsp_config_paths: Vec::new(),
 					shutdown:         Some(serve_shutdown),
@@ -10340,14 +10355,14 @@ mod tests {
 			)
 			.await
 		});
-		tokio::time::timeout(Duration::from_secs(2), async {
+		time::timeout(Duration::from_secs(2), async {
 			loop {
-				if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await
+				if let Ok(stream) = UnixStream::connect(&socket).await
 					&& DocumentHost::connect(stream).await.is_ok()
 				{
 					break;
 				}
-				tokio::task::yield_now().await;
+				task::yield_now().await;
 			}
 		})
 		.await

@@ -1,6 +1,7 @@
 //! Atomic detached-process metadata and the exclusive envd durable-owner lease.
 
 use std::{
+	cmp,
 	fs::{self, File, OpenOptions},
 	io::{self, BufReader, BufWriter, Seek as _, Write as _},
 	path::{Path, PathBuf},
@@ -58,7 +59,7 @@ impl ProcessStoreSnapshot {
 			}
 		}
 		active.sort_unstable_by_key(|record| record.started_order);
-		terminal.sort_unstable_by_key(|record| std::cmp::Reverse(record.recent_order));
+		terminal.sort_unstable_by_key(|record| cmp::Reverse(record.recent_order));
 		terminal.truncate(RECENT_TERMINAL_LIMIT);
 		active.extend(terminal);
 		active

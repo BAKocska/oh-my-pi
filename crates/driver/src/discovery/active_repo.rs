@@ -1,7 +1,7 @@
 //! Active repository adoption for a non-repository workspace directory.
 
 use std::{
-	fs, io,
+	env, fs, io,
 	path::{Component, Path, PathBuf},
 };
 
@@ -81,7 +81,7 @@ fn absolute_lexical(path: &Path) -> io::Result<PathBuf> {
 	let joined = if path.is_absolute() {
 		path.to_path_buf()
 	} else {
-		std::env::current_dir()?.join(path)
+		env::current_dir()?.join(path)
 	};
 	let mut normalized = PathBuf::new();
 	for component in joined.components() {

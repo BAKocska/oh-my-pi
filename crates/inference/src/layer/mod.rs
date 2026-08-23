@@ -21,10 +21,12 @@ pub mod session;
 pub mod stack;
 
 use std::{
+	mem,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 	},
+	time,
 	time::Instant,
 };
 
@@ -34,9 +36,13 @@ use parking_lot::Mutex;
 use crate::{
 	body::AttemptBodyEvidence,
 	call::AccountRoutingContext,
+	catalog::TrustDomain,
 	codec::{Cancellation, ProviderMetadataEvent, ProviderStateEvent, ProviderTelemetryEvent},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
+	event::ChatEvent,
+	id::{AccountId, PrincipalId},
 	receipt::{Cost, ExecutionBudget, ExecutionReceipt},
+	session::{CredentialGenerationPolicy, ServerStateBinding},
 };
 
 /// Clone-cheap execution state shared by every layer and hidden attempt.
@@ -52,12 +58,12 @@ pub enum AttemptAction {
 	/// Re-enter with the same account and an explicit credential refresh.
 	RefreshCredential {
 		/// Account selected before credential refresh.
-		previous_account: Option<crate::id::AccountId>,
+		previous_account: Option<AccountId>,
 	},
 	/// Re-enter while excluding/cooling the previous account.
 	RotateAccount {
 		/// Account excluded from the next rotation.
-		previous_account: Option<crate::id::AccountId>,
+		previous_account: Option<AccountId>,
 	},
 }
 
@@ -66,11 +72,11 @@ pub enum AttemptAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionAffinity {
 	/// Principal owning provider-side state.
-	pub principal:             crate::id::PrincipalId,
+	pub principal:             PrincipalId,
 	/// Credential generation captured with the binding.
 	pub credential_generation: u64,
 	/// Whether ordinary refresh may preserve the binding.
-	pub credential_policy:     crate::session::CredentialGenerationPolicy,
+	pub credential_policy:     CredentialGenerationPolicy,
 }
 
 struct ExecutionState {
@@ -90,10 +96,10 @@ struct ExecutionState {
 	transport_cancel:        Mutex<Option<Cancellation>>,
 	action:                  Mutex<AttemptAction>,
 	session_affinity:        Mutex<Option<SessionAffinity>>,
-	session_state:           Mutex<Option<crate::session::ServerStateBinding>>,
-	effective_trust_domain:  Mutex<Option<crate::catalog::TrustDomain>>,
+	session_state:           Mutex<Option<ServerStateBinding>>,
+	effective_trust_domain:  Mutex<Option<TrustDomain>>,
 	provider_state:          Mutex<Vec<ProviderStateEvent>>,
-	provider_response_id:    Mutex<Option<omp_core::Str>>,
+	provider_response_id:    Mutex<Option<Str>>,
 	session_completion:      Mutex<Option<Arc<dyn session::SessionCompletion>>>,
 	attempt_started:         Mutex<Vec<Instant>>,
 	structured_output_valid: AtomicBool,
@@ -136,7 +142,7 @@ impl ExecutionContext {
 	}
 
 	/// Returns elapsed wall time.
-	pub fn elapsed(&self) -> std::time::Duration {
+	pub fn elapsed(&self) -> time::Duration {
 		self.0.started.elapsed()
 	}
 
@@ -187,22 +193,22 @@ impl ExecutionContext {
 	}
 
 	/// Stores the compatible provider-side state selected by session planning.
-	pub fn set_session_state(&self, state: Option<crate::session::ServerStateBinding>) {
+	pub fn set_session_state(&self, state: Option<ServerStateBinding>) {
 		*self.0.session_state.lock() = state;
 	}
 
 	/// Returns the compatible provider-side state selected for encoding.
-	pub fn session_state(&self) -> Option<crate::session::ServerStateBinding> {
+	pub fn session_state(&self) -> Option<ServerStateBinding> {
 		self.0.session_state.lock().clone()
 	}
 
 	/// Stores the trust boundary of the endpoint used by the current attempt.
-	pub fn set_effective_trust_domain(&self, domain: crate::catalog::TrustDomain) {
+	pub fn set_effective_trust_domain(&self, domain: TrustDomain) {
 		*self.0.effective_trust_domain.lock() = Some(domain);
 	}
 
 	/// Returns the trust boundary of the endpoint used by the latest attempt.
-	pub fn effective_trust_domain(&self) -> Option<crate::catalog::TrustDomain> {
+	pub fn effective_trust_domain(&self) -> Option<TrustDomain> {
 		self.0.effective_trust_domain.lock().clone()
 	}
 
@@ -309,7 +315,7 @@ impl ExecutionContext {
 
 	/// Atomically consumes state captured by the successful response.
 	pub(crate) fn take_provider_state(&self) -> Vec<ProviderStateEvent> {
-		std::mem::take(&mut *self.0.provider_state.lock())
+		mem::take(&mut *self.0.provider_state.lock())
 	}
 
 	/// Aborts all uncommitted provider state.
@@ -339,7 +345,7 @@ impl ExecutionContext {
 
 	/// Streams one recovered canonical event into the private session message
 	/// builder.
-	pub(crate) fn record_session_event(&self, event: &crate::event::ChatEvent) -> Result<(), Error> {
+	pub(crate) fn record_session_event(&self, event: &ChatEvent) -> Result<(), Error> {
 		let completion = self.0.session_completion.lock().clone();
 		if let Some(completion) = completion {
 			completion.record_chat_event(event, self)
@@ -389,7 +395,7 @@ impl ExecutionContext {
 
 	/// Returns the codec-observed response identity, when more exact than the
 	/// handshake.
-	pub(crate) fn provider_response_id(&self) -> Option<omp_core::Str> {
+	pub(crate) fn provider_response_id(&self) -> Option<Str> {
 		self.0.provider_response_id.lock().clone()
 	}
 
@@ -498,7 +504,7 @@ impl ExecutionContext {
 	}
 
 	/// Returns elapsed wall time for a reserved attempt.
-	pub(crate) fn attempt_elapsed(&self, index: u32) -> std::time::Duration {
+	pub(crate) fn attempt_elapsed(&self, index: u32) -> time::Duration {
 		self
 			.0
 			.attempt_started

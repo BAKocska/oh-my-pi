@@ -1,10 +1,6 @@
 //! Installed, linked, and explicitly scoped native OMP package roots.
 
-use std::{
-	collections::BTreeSet,
-	fs,
-	path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use omp_core::Str;
 use omp_ext::lock::InstalledRecord;

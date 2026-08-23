@@ -441,6 +441,8 @@ pub fn rasterize<T: Trace + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+	use std::f32;
+
 	use super::*;
 
 	/// A hard-edged white unit sphere at the origin.
@@ -522,7 +524,7 @@ mod tests {
 			spots
 		};
 		let front = spots(&Camera::default());
-		let back = spots(&Camera { yaw: std::f32::consts::PI, ..Camera::default() });
+		let back = spots(&Camera { yaw: f32::consts::PI, ..Camera::default() });
 		assert_ne!(front.len(), 0);
 		assert_ne!(back.len(), 0);
 		assert_ne!(front, back, "orbiting the camera reframes the scene");

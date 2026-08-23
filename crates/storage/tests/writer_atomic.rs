@@ -1,6 +1,6 @@
 //! Atomic and staged transcript writer behavior.
 
-use std::path::PathBuf;
+use std::{fs, iter, path::PathBuf};
 
 use omp_core::Str;
 use omp_storage::transcript::{
@@ -58,7 +58,7 @@ fn atomic_validation_failure_leaves_journal_unchanged() {
 	let directory = tempdir().expect("temporary directory");
 	let path = directory.path().join("session.jsonl");
 	let mut writer = Writer::create(&path, &header()).expect("create transcript");
-	let before = std::fs::read(&path).expect("read header");
+	let before = fs::read(&path).expect("read header");
 	let duplicate_header =
 		RawValue::from_string(serde_json::to_string(&header()).expect("encode duplicate header"))
 			.expect("raw header");
@@ -111,8 +111,8 @@ fn oversized_atomic_group_is_rejected_before_writing() {
 	let directory = tempdir().expect("temporary directory");
 	let path = directory.path().join("session.jsonl");
 	let mut writer = Writer::create(&path, &header()).expect("create transcript");
-	let before = std::fs::read(&path).expect("read header");
-	let events = std::iter::repeat_with(|| title(2, "entry"))
+	let before = fs::read(&path).expect("read header");
+	let events = iter::repeat_with(|| title(2, "entry"))
 		.take(MAX_ATOMIC_ENTRIES + 1)
 		.collect::<Vec<_>>();
 

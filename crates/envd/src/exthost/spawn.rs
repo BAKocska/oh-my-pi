@@ -1,7 +1,8 @@
 //! Extension-host child spawning over a dedicated CONTROL descriptor.
 
 use std::{
-	io,
+	env, io, mem,
+	os::fd,
 	path::PathBuf,
 	process::Stdio,
 	sync::{
@@ -10,22 +11,25 @@ use std::{
 	},
 };
 
+use flume::Receiver;
+use omp_core::Str;
 use pyo3::{
 	prelude::*,
 	types::{PyList, PyModule},
 };
 use thiserror::Error;
 use tokio::{
-	io::AsyncReadExt,
+	io::{AsyncRead, AsyncReadExt},
 	net::UnixStream,
 	process::{Child, Command},
+	task,
 };
 
 use super::{
 	cancel::{CancellationError, CancellationLadder, CancellationOutcome},
 	control::{
 		ControlAuthority, ControlAuthoritySnapshot, ControlConnectionIdentity, ControlHandle,
-		ControlRuntime, ControlRuntimeError,
+		ControlProtocolError, ControlRuntime, ControlRuntimeError,
 	},
 };
 use crate::worker::HostKey;
@@ -83,11 +87,11 @@ pub struct SpawnSpec {
 	///
 	/// `None` identifies an anonymous or development extension and installs an
 	/// explicitly empty package snapshot in the child.
-	pub package_snapshot:    Option<omp_core::Str>,
+	pub package_snapshot:    Option<Str>,
 	/// Admitted declaration manifest, never inferred from runtime registration.
-	pub manifest_snapshot:   omp_core::Str,
+	pub manifest_snapshot:   Str,
 	/// Entry and declaration modules in deterministic manifest order.
-	pub declaration_modules: Box<[omp_core::Str]>,
+	pub declaration_modules: Box<[Str]>,
 }
 
 /// Owned parent ends for an extension-host child.
@@ -99,7 +103,7 @@ pub struct SpawnedHost {
 	/// Dedicated bidirectional CONTROL transport, never stdio.
 	pub control:  UnixStream,
 	/// Captured stdout/stderr records.
-	pub logs:     flume::Receiver<HostLog>,
+	pub logs:     Receiver<HostLog>,
 	restart_spec: SpawnSpec,
 }
 /// Live supervised child with its sole CONTROL pump and cancellation state.
@@ -108,8 +112,8 @@ pub struct RunningHost {
 	pub key:      HostKey,
 	child:        Child,
 	control:      ControlHandle,
-	logs:         flume::Receiver<HostLog>,
-	pump:         tokio::task::JoinHandle<Result<(), ControlRuntimeError>>,
+	logs:         Receiver<HostLog>,
+	pump:         task::JoinHandle<Result<(), ControlRuntimeError>>,
 	cancellation: CancellationLadder,
 	restart_spec: SpawnSpec,
 	identity:     ControlConnectionIdentity,
@@ -173,7 +177,7 @@ impl RunningHost {
 	}
 
 	/// Returns captured stdout/stderr records without mixing them into CONTROL.
-	pub const fn logs(&self) -> &flume::Receiver<HostLog> {
+	pub const fn logs(&self) -> &Receiver<HostLog> {
 		&self.logs
 	}
 
@@ -206,7 +210,7 @@ impl RunningHost {
 				.ok_or(RunningHostError::GenerationExhausted)?;
 			let mut identity = self.identity.clone();
 			identity.host_generation = spec.host_generation;
-			let cancellation = std::mem::take(&mut self.cancellation);
+			let cancellation = mem::take(&mut self.cancellation);
 			let spawned = spawn(spec).await?;
 			let mut replacement = spawned
 				.start_control(identity, Arc::clone(&self.authority), &self.snapshot)
@@ -222,7 +226,7 @@ impl RunningHost {
 		match self.pump.await {
 			Ok(result) => result.map_err(Into::into),
 			Err(error) => Err(
-				ControlRuntimeError::Protocol(super::control::ControlProtocolError::new(
+				ControlRuntimeError::Protocol(ControlProtocolError::new(
 					"control_task_failed",
 					error.to_string(),
 				))
@@ -294,7 +298,7 @@ impl HostChildLimit {
 pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	let restart_spec = spec.clone();
 	let (parent, child_control) = UnixStream::pair()?;
-	let fd = std::os::fd::AsRawFd::as_raw_fd(&child_control);
+	let fd = fd::AsRawFd::as_raw_fd(&child_control);
 	let mut command = Command::new(&spec.executable);
 	command
 		.arg(EXT_HOST_ARG)
@@ -312,7 +316,7 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 				&spec
 					.declaration_modules
 					.iter()
-					.map(omp_core::Str::as_str)
+					.map(Str::as_str)
 					.collect::<Vec<_>>(),
 			)
 			.map_err(|error| SpawnError::Python(error.to_string()))?,
@@ -362,7 +366,7 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 
 fn capture<R>(stream: R, source: HostLogStream, logs: flume::Sender<HostLog>)
 where
-	R: tokio::io::AsyncRead + Unpin + Send + 'static,
+	R: AsyncRead + Unpin + Send + 'static,
 {
 	tokio::spawn(async move {
 		let mut stream = stream;
@@ -390,7 +394,7 @@ where
 /// The Python runtime owns the protocol loop after this function establishes
 /// that CONTROL is an inherited descriptor rather than standard input.
 pub fn run_ext_host_entry() -> Result<(), SpawnError> {
-	let fd = std::env::var(CONTROL_FD_ENV)
+	let fd = env::var(CONTROL_FD_ENV)
 		.ok()
 		.and_then(|value| value.parse::<i32>().ok())
 		.filter(|fd| *fd >= 0)
@@ -423,12 +427,12 @@ pub fn run_ext_host_entry() -> Result<(), SpawnError> {
 /// Installs the private site tree and parent-verified snapshot before any
 /// extension module imports.
 fn install_package_snapshot(engine: &omp_py::Engine) -> Result<(), SpawnError> {
-	let snapshot = std::env::var(PACKAGE_SNAPSHOT_ENV).unwrap_or_else(|_| {
+	let snapshot = env::var(PACKAGE_SNAPSHOT_ENV).unwrap_or_else(|_| {
 		String::from(r#"{"distributions":[],"modules":{},"own":null,"tree":null}"#)
 	});
 	engine
 		.attach(|py| -> PyResult<()> {
-			if let Ok(site) = std::env::var(PY_SITE_ENV) {
+			if let Ok(site) = env::var(PY_SITE_ENV) {
 				let sys = PyModule::import(py, "sys")?;
 				let value = sys.getattr("path")?;
 				let path = value.cast::<PyList>()?;

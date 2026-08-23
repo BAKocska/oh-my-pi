@@ -1,6 +1,6 @@
 //! GitLab Duo direct-access delegation and typed Workflow WebSocket protocol.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, str};
 
 use bytes::Bytes;
 use omp_core::{IntoStr, SecretString, Str, sf};
@@ -12,7 +12,10 @@ use super::{
 };
 use crate::{
 	body::BodySource,
-	call::{ChatRequest, ContentPart, Message, OperationCall, Role, Setting, ToolResultContent},
+	call::{
+		ChatRequest, ContentPart, Message, OperationCall, ProviderProof, Role, Setting,
+		ToolResultContent,
+	},
 	codec::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
 		ProviderControlEvent, ProviderControlInput, ProviderStateEvent, RawCompletion, RawEvent,
@@ -818,10 +821,7 @@ const fn role_name(role: Role) -> &'static str {
 	}
 }
 
-fn validate_proof(
-	proof: Option<&crate::call::ProviderProof>,
-	context: &EncodeContext<'_>,
-) -> Result<(), Error> {
+fn validate_proof(proof: Option<&ProviderProof>, context: &EncodeContext<'_>) -> Result<(), Error> {
 	if let Some(proof) = proof
 		&& (proof.provider != context.route.provider || proof.codec != wire_target(context)?.codec)
 	{
@@ -958,7 +958,7 @@ impl Decoder for WorkflowDecoder {
 				"gitlab.workflow.control_kind_unsupported",
 			));
 		};
-		let text = std::str::from_utf8(&response.response)
+		let text = str::from_utf8(&response.response)
 			.map_err(|_| protocol_error(ErrorPhase::Streaming, "gitlab.action_response.utf8"))?;
 		WorkflowActionResult {
 			request_id: response.invocation,

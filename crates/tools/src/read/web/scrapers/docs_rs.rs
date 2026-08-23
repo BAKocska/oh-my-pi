@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, io::Read as _};
+use std::{collections::BTreeMap, fmt::Write as _, io::Read as _};
 
 use flate2::read::GzDecoder;
 use omp_core::{Str, sf};
@@ -703,8 +703,8 @@ fn render_module(
 	};
 
 	type ModuleItems = Vec<(String, String, Option<String>)>;
-	type ModuleGroups<'a> = std::collections::BTreeMap<&'a str, ModuleItems>;
-	let mut groups: ModuleGroups<'_> = std::collections::BTreeMap::new();
+	type ModuleGroups<'a> = BTreeMap<&'a str, ModuleItems>;
+	let mut groups: ModuleGroups<'_> = BTreeMap::new();
 	for id in items {
 		let Some(mut item) = id_string(id).and_then(|id| index.get(&id)) else {
 			continue;

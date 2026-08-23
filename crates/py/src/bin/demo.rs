@@ -9,14 +9,14 @@ use std::{env, process};
 
 use omp_py::{
 	Engine,
-	pyo3::{self, ffi::c_str, prelude::*},
+	pyo3::{self, exceptions::PyValueError, ffi::c_str, prelude::*},
 };
 
 /// Native primitive exposed to Python: returns the 1-based `n`-th prime.
 #[pyfunction]
 fn nth_prime(n: u64) -> PyResult<u64> {
 	if n == 0 {
-		return Err(pyo3::exceptions::PyValueError::new_err("n must be >= 1"));
+		return Err(PyValueError::new_err("n must be >= 1"));
 	}
 	let mut found = 0u64;
 	let mut candidate = 1u64;

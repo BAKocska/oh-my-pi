@@ -14,9 +14,10 @@ use std::{
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use opus::{Application, Channels, Decoder, Encoder};
 use parking_lot::Mutex;
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::JoinHandle, time, time::MissedTickBehavior};
 use webrtc::{
 	api::{
 		APIBuilder,
@@ -341,7 +342,7 @@ impl LivePeerCore {
 					.map_err(|_| "Native live WebRTC peer stopped before opening".to_owned())?;
 			}
 		};
-		tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), wait)
+		time::timeout(Duration::from_millis(u64::from(timeout_ms)), wait)
 			.await
 			.map_err(|_| "Timed out waiting for the live data channel to open".to_owned())?
 	}
@@ -447,7 +448,7 @@ impl LivePeerCore {
 			let _ = resources.input_tx.send(InputCommand::Close);
 			let _ = resources.peer.close().await;
 			let _ = resources.playback.stop();
-			let _ = tokio::time::timeout(CLOSE_TASK_TIMEOUT, resources.input_task).await;
+			let _ = time::timeout(CLOSE_TASK_TIMEOUT, resources.input_task).await;
 			resources.rtcp_task.abort();
 			let _ = resources.rtcp_task.await;
 			drop(resources.data_channel);
@@ -510,7 +511,7 @@ fn install_peer_callbacks(
 					core.report_failure("Live WebRTC peer connection closed unexpectedly".to_owned());
 				},
 				RTCPeerConnectionState::Disconnected => {
-					tokio::time::sleep(DISCONNECT_GRACE).await;
+					time::sleep(DISCONNECT_GRACE).await;
 					if peer.upgrade().is_some_and(|peer| {
 						peer.connection_state() == RTCPeerConnectionState::Disconnected
 					}) {
@@ -570,7 +571,7 @@ fn install_data_channel_callbacks(data_channel: &Arc<RTCDataChannel>, core: Weak
 
 async fn run_input_audio(
 	track: Arc<TrackLocalStaticSample>,
-	input_rx: flume::Receiver<InputCommand>,
+	input_rx: Receiver<InputCommand>,
 	core: Weak<LivePeerCore>,
 ) {
 	let mut encoder = match Encoder::new(INPUT_SAMPLE_RATE, Channels::Mono, Application::Voip) {
@@ -592,8 +593,8 @@ async fn run_input_audio(
 	let mut muted = false;
 	let mut pending = Vec::with_capacity(INPUT_FRAME_SAMPLES * 2);
 	let mut encoded = [0u8; MAX_ENCODED_OPUS_BYTES];
-	let mut ticker = tokio::time::interval(INPUT_FRAME_DURATION);
-	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+	let mut ticker = time::interval(INPUT_FRAME_DURATION);
+	ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
 	ticker.tick().await;
 	loop {
 		tokio::select! {

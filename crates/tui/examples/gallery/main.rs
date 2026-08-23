@@ -15,7 +15,7 @@ mod eclipse;
 mod overlay;
 mod render;
 
-use std::io;
+use std::{io, time};
 
 use omp_tui::{AppEvent, AppOptions, Key, OverlayId, Size, Ui, UiContext, dom};
 
@@ -108,7 +108,7 @@ async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 	let mut synced = String::new();
 	let mut lab = anim::Lab::new();
 	let mut layers = Layers::default();
-	let mut next_step = std::time::Instant::now() + anim::AUTOPLAY_STEP;
+	let mut next_step = time::Instant::now() + anim::AUTOPLAY_STEP;
 
 	loop {
 		let event = tokio::select! {

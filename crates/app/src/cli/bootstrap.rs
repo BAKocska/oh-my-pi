@@ -3,7 +3,7 @@
 use std::{
 	collections::BTreeMap,
 	ffi::OsString,
-	fs,
+	fs, io,
 	path::{Path, PathBuf},
 };
 
@@ -11,6 +11,7 @@ use omp_core::Str;
 use omp_ext::config::{CliCollision, CliContribution, CliContributionSet, CliValueKind};
 use serde::Deserialize;
 use thiserror::Error;
+use toml::de;
 
 /// One typed value delivered to an extension activation sink.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,7 +55,7 @@ pub enum BootstrapError {
 		path:   PathBuf,
 		/// Filesystem source.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// A manifest could not be decoded.
 	#[error("cannot parse extension CLI manifest `{path}`")]
@@ -63,7 +64,7 @@ pub enum BootstrapError {
 		path:   PathBuf,
 		/// TOML source.
 		#[source]
-		source: toml::de::Error,
+		source: de::Error,
 	},
 	/// A required extension value is absent.
 	#[error("extension CLI flag `--{0}` requires a value")]

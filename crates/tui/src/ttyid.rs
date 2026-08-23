@@ -1,15 +1,17 @@
 //! Stable identifiers for the terminal attached to standard input.
 
-use std::{ffi::OsString, path::Path};
+use std::{env, ffi::OsString, path::Path};
 
 use omp_core::{Str, sf};
 
 #[cfg(unix)]
 mod platform {
-	use std::path::PathBuf;
+	use std::{io, path::PathBuf};
+
+	use crate::tty::override_path;
 
 	pub(super) fn tty_path() -> Option<PathBuf> {
-		crate::tty::override_path().or_else(|| nix::unistd::ttyname(std::io::stdin()).ok())
+		override_path().or_else(|| nix::unistd::ttyname(io::stdin()).ok())
 	}
 }
 
@@ -43,11 +45,11 @@ pub fn terminal_id() -> Str {
 	#[cfg(unix)]
 	{
 		let tty_path = platform::tty_path();
-		terminal_id_with(tty_path.as_deref(), |name| std::env::var_os(name))
+		terminal_id_with(tty_path.as_deref(), |name| env::var_os(name))
 	}
 	#[cfg(windows)]
 	{
-		let id = terminal_id_with(None, |name| std::env::var_os(name));
+		let id = terminal_id_with(None, |name| env::var_os(name));
 		if id != UNKNOWN_TERMINAL_ID || !platform::has_console() {
 			return id;
 		}

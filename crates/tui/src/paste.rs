@@ -15,17 +15,19 @@
 //! from a hung native handle.
 
 use std::{
+	env, io,
 	io::{Read, Write},
+	mem,
 	path::PathBuf,
 	process::{Command, Stdio},
-	thread,
+	str, thread,
 	time::{Duration, Instant},
 };
 
 use omp_core::{Str, base64, hex, sf};
 use smallvec::SmallVec;
 
-use crate::{Key, imagefmt::ImageFormat};
+use crate::{Key, imagefmt, imagefmt::ImageFormat};
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(5);
 const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(8);
@@ -53,7 +55,7 @@ pub struct PastedImage {
 impl PastedImage {
 	/// Creates an image when `bytes` begin with a recognized container header.
 	pub fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
-		let format = crate::imagefmt::format(&bytes)?;
+		let format = imagefmt::format(&bytes)?;
 		Some(Self { bytes, format })
 	}
 
@@ -75,7 +77,7 @@ impl PastedImage {
 	/// pre-planted symlink at a guessable `/tmp` name can neither be
 	/// followed nor hijack the write. It persists (is not deleted on drop)
 	/// for the lifetime of the attachment that references it.
-	pub fn persist(&self) -> std::io::Result<PathBuf> {
+	pub fn persist(&self) -> io::Result<PathBuf> {
 		use std::io::Write as _;
 		let mut file = tempfile::Builder::new()
 			.prefix("omp-tui-paste-")
@@ -292,7 +294,7 @@ impl PasteEvents {
 						String::from_utf8_lossy(&bytes).as_ref(),
 					)));
 				}
-				let image = crate::imagefmt::format(&bytes)
+				let image = imagefmt::format(&bytes)
 					.or_else(|| mime_format(&mime))
 					.map(|format| PastedImage { bytes, format });
 				image.map_or(PasteProgress::Consumed, |image| PasteProgress::Done(Pasted::Image(image)))
@@ -407,7 +409,7 @@ fn split_path_tokens(text: &str) -> Option<Vec<Str>> {
 		}
 		if is_ascii_path_whitespace(ch) {
 			if !token.is_empty() {
-				tokens.push(Str::from(std::mem::take(&mut token)));
+				tokens.push(Str::from(mem::take(&mut token)));
 			}
 			continue;
 		}
@@ -443,7 +445,7 @@ fn normalize_path(raw: &str) -> Option<Str> {
 	let unescaped = shell_unescape(unquoted);
 	if let Some(rest) = unescaped.strip_prefix("~/") {
 		#[allow(deprecated, reason = "the standard-library home lookup matches shell path expansion")]
-		let home = std::env::home_dir()?;
+		let home = env::home_dir()?;
 		return Some(sf!("{}/{}", home.display(), rest));
 	}
 	Some(unescaped)
@@ -701,7 +703,7 @@ pub fn read_clipboard_text() -> Option<String> {
 		// codepages that mangled the legacy shell-out path.
 		return read_powershell_text().or_else(native_read_text);
 	}
-	if std::env::var_os("TERMUX_VERSION").is_some() {
+	if env::var_os("TERMUX_VERSION").is_some() {
 		return capture_text(&["termux-clipboard-get"], CLI_TIMEOUT);
 	}
 	if is_wsl()
@@ -709,13 +711,13 @@ pub fn read_clipboard_text() -> Option<String> {
 	{
 		return Some(text);
 	}
-	if std::env::var_os("WAYLAND_DISPLAY").is_some()
+	if env::var_os("WAYLAND_DISPLAY").is_some()
 		&& let Some(text) =
 			capture_text(&["wl-paste", "--type", "text/plain", "--no-newline"], CLI_TIMEOUT)
 	{
 		return Some(text);
 	}
-	if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some() {
+	if env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some() {
 		return read_x11_text().or_else(native_read_text);
 	}
 	None
@@ -724,7 +726,7 @@ pub fn read_clipboard_text() -> Option<String> {
 /// Writes clipboard text, native backend first with CLI bridges as fallback.
 pub fn write_clipboard_text(text: &str) -> bool {
 	let bytes = Some(text.as_bytes());
-	if std::env::var_os("TERMUX_VERSION").is_some()
+	if env::var_os("TERMUX_VERSION").is_some()
 		&& run_capture(&["termux-clipboard-set"], bytes, CLI_TIMEOUT).is_some()
 	{
 		return true;
@@ -738,12 +740,12 @@ pub fn write_clipboard_text(text: &str) -> bool {
 	if cfg!(windows) {
 		return run_capture(&["clip.exe"], bytes, CLI_TIMEOUT).is_some();
 	}
-	if std::env::var_os("WAYLAND_DISPLAY").is_some()
+	if env::var_os("WAYLAND_DISPLAY").is_some()
 		&& run_capture(&["wl-copy"], bytes, CLI_TIMEOUT).is_some()
 	{
 		return true;
 	}
-	if std::env::var_os("DISPLAY").is_some() {
+	if env::var_os("DISPLAY").is_some() {
 		return run_capture(&["xclip", "-selection", "clipboard", "-i"], bytes, CLI_TIMEOUT)
 			.is_some()
 			|| run_capture(&["xsel", "--clipboard", "--input"], bytes, CLI_TIMEOUT).is_some();
@@ -752,7 +754,7 @@ pub fn write_clipboard_text(text: &str) -> bool {
 }
 
 fn read_clipboard_image() -> Option<PastedImage> {
-	if std::env::var_os("TERMUX_VERSION").is_some() {
+	if env::var_os("TERMUX_VERSION").is_some() {
 		return None;
 	}
 	if is_wsl()
@@ -773,14 +775,14 @@ fn read_clipboard_image() -> Option<PastedImage> {
 		// `«class PNGf»` coercion would miss.
 		return native_read_image();
 	}
-	if std::env::var_os("WAYLAND_DISPLAY").is_some()
+	if env::var_os("WAYLAND_DISPLAY").is_some()
 		&& let Some(image) = read_wayland_image()
 	{
 		// wl-paste first: it hands over the original container bytes
 		// (PNG/JPEG/WebP/GIF) without an RGBA round-trip.
 		return Some(image);
 	}
-	if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some() {
+	if env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some() {
 		return native_read_image().or_else(read_x11_image);
 	}
 	None
@@ -859,7 +861,7 @@ fn read_wayland_image() -> Option<PastedImage> {
 		}
 		let bytes = run_capture(&["wl-paste", "--type", mime], None, CLI_TIMEOUT)?;
 		if !bytes.is_empty() {
-			let format = crate::imagefmt::format(&bytes).or_else(|| mime_format(mime))?;
+			let format = imagefmt::format(&bytes).or_else(|| mime_format(mime))?;
 			return Some(PastedImage { bytes, format });
 		}
 	}
@@ -901,7 +903,7 @@ fn read_powershell_image() -> Option<PastedImage> {
 		None,
 		POWERSHELL_TIMEOUT,
 	)?;
-	let encoded = std::str::from_utf8(&output).ok()?.trim();
+	let encoded = str::from_utf8(&output).ok()?.trim();
 	if encoded.is_empty() {
 		return None;
 	}
@@ -966,8 +968,7 @@ fn run_capture(argv: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> Option
 
 fn is_wsl() -> bool {
 	cfg!(target_os = "linux")
-		&& (std::env::var_os("WSL_DISTRO_NAME").is_some()
-			|| std::env::var_os("WSL_INTEROP").is_some())
+		&& (env::var_os("WSL_DISTRO_NAME").is_some() || env::var_os("WSL_INTEROP").is_some())
 }
 
 fn read_file_urls() -> Option<Vec<Str>> {
@@ -1247,10 +1248,8 @@ mod tests {
 		}
 	}
 
-	#[test]
 	fn expands_home_path_when_available() {
-		#[allow(deprecated, reason = "the production path expansion uses the same standard lookup")]
-		if let Some(home) = std::env::home_dir() {
+		if let Some(home) = env::home_dir() {
 			assert_eq!(dropped_paths("~/image.png").as_slice(), [sf!("{}/image.png", home.display())]);
 		}
 	}

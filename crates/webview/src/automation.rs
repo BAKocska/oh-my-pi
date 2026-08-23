@@ -12,7 +12,9 @@ use std::{
 use omp_core::{IntoStr, Str, sf};
 use serde_json::{Value, json};
 
-use crate::{EngineKind, Error, Frame, Result, WebView, remote::Command};
+use crate::{
+	EngineKind, Error, Frame, Inner, Input, Result, WebView, WebViewEvent, remote::Command,
+};
 
 const QUICK_TIMEOUT: Duration = Duration::from_secs(20);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(8);
@@ -356,7 +358,7 @@ impl<'view> TabHandle<'view> {
 
 	/// Scroll the frame surface at a viewport coordinate.
 	pub fn scroll(self, x: f64, y: f64, dx: f64, dy: f64) -> Result<()> {
-		self.view.input(crate::Input::Scroll { x, y, dx, dy })
+		self.view.input(Input::Scroll { x, y, dx, dy })
 	}
 
 	/// Receive the next composited frame.
@@ -368,8 +370,8 @@ impl<'view> TabHandle<'view> {
 				.events()
 				.recv_timeout(deadline.saturating_duration_since(Instant::now()))
 			{
-				Ok(crate::WebViewEvent::Frame(frame)) => return Ok(frame),
-				Ok(crate::WebViewEvent::Closed | crate::WebViewEvent::Crashed(_)) => {
+				Ok(WebViewEvent::Frame(frame)) => return Ok(frame),
+				Ok(WebViewEvent::Closed | WebViewEvent::Crashed(_)) => {
 					return Err(Error::Closed);
 				},
 				Ok(_) => {},
@@ -396,7 +398,7 @@ impl<'view> TabHandle<'view> {
 			None => None,
 		};
 		let data = if matches!(self.view.engine(), EngineKind::Chromium) {
-			let crate::Inner::Remote(remote) = &self.view.inner else {
+			let Inner::Remote(remote) = &self.view.inner else {
 				return Err(Error::Unsupported("direct screenshot requires remote Chromium"));
 			};
 			let (tx, rx) = flume::bounded(1);
@@ -437,7 +439,7 @@ impl<'view> TabHandle<'view> {
 		if !self.capabilities().native_accessibility {
 			return Ok(Value::String(self.document().aria_snapshot(None)?.to_string()));
 		}
-		let crate::Inner::Remote(remote) = &self.view.inner else {
+		let Inner::Remote(remote) = &self.view.inner else {
 			return Err(Error::Unsupported("native accessibility requires remote Chromium"));
 		};
 		let (tx, rx) = flume::bounded(1);
@@ -461,7 +463,7 @@ impl<'view> TabHandle<'view> {
 		if !self.capabilities().file_upload {
 			return Err(Error::Unsupported("file upload requires Chromium CDP"));
 		}
-		let crate::Inner::Remote(remote) = &self.view.inner else {
+		let Inner::Remote(remote) = &self.view.inner else {
 			return Err(Error::Unsupported("file upload requires remote Chromium"));
 		};
 		let spec = serde_json::to_string(&selector.wire())?;

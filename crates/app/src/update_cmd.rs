@@ -1,10 +1,13 @@
 //! Signed native package-registry inspection and rollback-safe self-update.
 
 use std::{
+	cmp,
+	env::{self, consts},
 	fs::{self, OpenOptions},
+	io,
 	io::Write as _,
 	path::{Path, PathBuf},
-	process::Command,
+	process::{self, Command},
 	time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -18,7 +21,10 @@ use omp_ext::{
 use ring::digest::{SHA256, digest};
 use serde::Serialize;
 
-use crate::cli::{RegistryArgs, UpdateArgs};
+use crate::{
+	cli::{RegistryArgs, UpdateArgs},
+	ext_cli,
+};
 
 const CORE_PACKAGE: &str = "omp-cli";
 const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
@@ -87,7 +93,7 @@ pub async fn run(args: UpdateArgs) -> miette::Result<()> {
 	let (index, _) = load_index(args.index.as_deref(), args.index_key.as_deref())?;
 	let target = platform_target();
 	let selected = select(&index, CORE_PACKAGE, &target)?;
-	let manager = classify_installation(&std::env::current_exe().into_diagnostic()?);
+	let manager = classify_installation(&env::current_exe().into_diagnostic()?);
 	let current = env!("CARGO_PKG_VERSION");
 	let newer = compare_versions(selected.release.version.as_str(), current).is_gt();
 	if args.check || (!newer && !args.force) {
@@ -116,7 +122,7 @@ pub fn registry(args: RegistryArgs) -> miette::Result<()> {
 		.iter()
 		.find(|package| package.id == args.package)
 		.ok_or_else(|| miette!("signed registry has no package `{}`", args.package))?;
-	let manager = classify_installation(&std::env::current_exe().into_diagnostic()?);
+	let manager = classify_installation(&env::current_exe().into_diagnostic()?);
 	let view = RegistryView {
 		package: package.id.as_str(),
 		target,
@@ -194,7 +200,7 @@ fn configured_path(
 	explicit
 		.map(Path::to_path_buf)
 		.or_else(|| {
-			std::env::var_os(variable)
+			env::var_os(variable)
 				.filter(|value| !value.is_empty())
 				.map(PathBuf::from)
 		})
@@ -238,18 +244,19 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 		return Err(miette!("signed update asset exceeds the 256 MiB safety ceiling"));
 	}
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
-	let cache = if let Some(cache) =
-		std::env::var_os("OMP_CACHE_DIR").filter(|value| !value.is_empty())
-	{
-		PathBuf::from(cache)
-	} else {
-		let home = std::env::var_os("HOME")
-			.filter(|value| !value.is_empty())
-			.map(PathBuf::from)
-			.ok_or_else(|| miette!("HOME or OMP_CACHE_DIR must be set for native update staging"))?;
-		omp_core::dirs::native_directories(&home).cache
-	}
-	.join("updates");
+	let cache =
+		if let Some(cache) = env::var_os("OMP_CACHE_DIR").filter(|value| !value.is_empty()) {
+			PathBuf::from(cache)
+		} else {
+			let home = env::var_os("HOME")
+				.filter(|value| !value.is_empty())
+				.map(PathBuf::from)
+				.ok_or_else(|| {
+					miette!("HOME or OMP_CACHE_DIR must be set for native update staging")
+				})?;
+			omp_core::dirs::native_directories(&home).cache
+		}
+		.join("updates");
 	fs::create_dir_all(&cache).into_diagnostic()?;
 	let lock_path = cache.join("update.lock");
 	OpenOptions::new()
@@ -262,7 +269,7 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 	let bytes = fetch_asset(selected.artifact).await?;
 	verify_bytes(&bytes, selected.artifact)?;
 	let executable = extract_executable(&bytes, selected.artifact.file.as_str())?;
-	let current = std::env::current_exe().into_diagnostic()?;
+	let current = env::current_exe().into_diagnostic()?;
 	let destination = renamed_destination(&current);
 	let install_dir = destination.parent().unwrap_or_else(|| Path::new("."));
 	prune_stale(install_dir)?;
@@ -270,7 +277,7 @@ async fn install(selected: Selected<'_>) -> miette::Result<()> {
 		.duration_since(UNIX_EPOCH)
 		.into_diagnostic()?
 		.as_millis();
-	let attempt = format!("{timestamp}.{}", std::process::id());
+	let attempt = format!("{timestamp}.{}", process::id());
 	let (staged, backup) = update_artifact_paths(&destination, &attempt)?;
 	write_executable(&staged, &executable)?;
 	let mut keys =
@@ -379,8 +386,8 @@ enum RenameFailureKind {
 	Other,
 }
 
-fn classify_rename_failure(error: &std::io::Error) -> RenameFailureKind {
-	if error.kind() == std::io::ErrorKind::PermissionDenied
+fn classify_rename_failure(error: &io::Error) -> RenameFailureKind {
+	if error.kind() == io::ErrorKind::PermissionDenied
 		|| matches!(error.raw_os_error(), Some(5 | 32 | 33))
 	{
 		RenameFailureKind::Denied
@@ -510,7 +517,7 @@ fn prune_stale(directory: &Path) -> miette::Result<()> {
 }
 
 fn classify_installation(executable: &Path) -> InstallManager {
-	if let Some(value) = std::env::var_os("OMP_INSTALL_MANAGER") {
+	if let Some(value) = env::var_os("OMP_INSTALL_MANAGER") {
 		return match value.to_string_lossy().to_ascii_lowercase().as_str() {
 			"npm" => InstallManager::Npm,
 			"homebrew" | "brew" => InstallManager::Homebrew,
@@ -545,12 +552,12 @@ const fn manager_instruction(manager: InstallManager) -> &'static str {
 }
 
 fn platform_target() -> String {
-	let arch = match std::env::consts::ARCH {
+	let arch = match consts::ARCH {
 		"x86_64" => "x86_64",
 		"aarch64" => "aarch64",
 		other => other,
 	};
-	match std::env::consts::OS {
+	match consts::OS {
 		"macos" => format!("{arch}-apple-darwin"),
 		"windows" => format!("{arch}-pc-windows-msvc"),
 		"linux" if cfg!(target_env = "musl") => format!("{arch}-unknown-linux-musl"),
@@ -559,14 +566,14 @@ fn platform_target() -> String {
 	}
 }
 
-fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+fn compare_versions(left: &str, right: &str) -> cmp::Ordering {
 	let mut left = left.trim_start_matches('v').split(['.', '-', '+']);
 	let mut right = right.trim_start_matches('v').split(['.', '-', '+']);
 	loop {
 		match (left.next(), right.next()) {
-			(None, None) => return std::cmp::Ordering::Equal,
-			(Some(_), None) => return std::cmp::Ordering::Greater,
-			(None, Some(_)) => return std::cmp::Ordering::Less,
+			(None, None) => return cmp::Ordering::Equal,
+			(Some(_), None) => return cmp::Ordering::Greater,
+			(None, Some(_)) => return cmp::Ordering::Less,
 			(Some(left), Some(right)) => {
 				let ordering = match (left.parse::<u64>(), right.parse::<u64>()) {
 					(Ok(left), Ok(right)) => left.cmp(&right),
@@ -582,7 +589,7 @@ fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
 
 async fn upgrade_extensions() -> miette::Result<()> {
 	use crate::ext_cli::{ExtArgs, ExtCommand, ExtUpgradeArgs, Scope};
-	crate::ext_cli::run(ExtArgs {
+	ext_cli::run(ExtArgs {
 		project:       PathBuf::from("."),
 		data_dir:      None,
 		store:         None,
@@ -651,11 +658,11 @@ mod tests {
 
 	#[test]
 	fn rename_denial_is_classified_without_a_helper_route() {
-		let portable = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+		let portable = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
 		assert_eq!(classify_rename_failure(&portable), RenameFailureKind::Denied);
-		let windows_sharing_violation = std::io::Error::from_raw_os_error(32);
+		let windows_sharing_violation = io::Error::from_raw_os_error(32);
 		assert_eq!(classify_rename_failure(&windows_sharing_violation), RenameFailureKind::Denied);
-		let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+		let missing = io::Error::new(io::ErrorKind::NotFound, "missing");
 		assert_eq!(classify_rename_failure(&missing), RenameFailureKind::Other);
 	}
 

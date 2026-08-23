@@ -1,6 +1,6 @@
 //! Native tool-renderer lifecycle gallery and PNG capture command.
 
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use bytes::Bytes;
 use clap::{Args, ValueEnum};
@@ -76,7 +76,7 @@ pub fn run(args: GalleryArgs) -> miette::Result<()> {
 	};
 	let width = args.width.clamp(40, 200);
 	if args.screenshot {
-		std::fs::create_dir_all(&args.out).into_diagnostic()?;
+		fs::create_dir_all(&args.out).into_diagnostic()?;
 	}
 	for fixture in fixtures {
 		for state in &states {
@@ -89,7 +89,7 @@ pub fn run(args: GalleryArgs) -> miette::Result<()> {
 				let path = args
 					.out
 					.join(format!("{}-{state_name}.png", fixture.identity.name));
-				std::fs::write(&path, png).into_diagnostic()?;
+				fs::write(&path, png).into_diagnostic()?;
 				println!("{}", path.display());
 			} else {
 				let state_name = state.to_string();

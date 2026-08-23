@@ -1,18 +1,23 @@
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, btree_map::Entry},
+	env,
 	fmt::Write as _,
 	io::{self, Write},
+	mem,
 	ops::Range,
 	path::Path,
+	ptr,
 };
 
 use omp_core::{CowBytes, Str};
 use smallvec::SmallVec;
 
 use crate::{
-	Graphics, TerminalCaps,
+	Graphics, TerminalCaps, debug,
+	debug::ScreenSnapshot,
 	escape::esc,
 	frame::{Cell, CellContent, Color, Frame, LinkId, Size, Style, with_link_url},
+	imagereg,
 	iterm2::{Iterm2Image, Iterm2Viewport, iterm2_output},
 	kitty::{
 		DirectPlacement, append_delete_image, append_direct_placement, append_placement,
@@ -20,7 +25,7 @@ use crate::{
 	},
 	overlay::Layer,
 	sixel::SixelImage,
-	terminal::terminal_write_all,
+	terminal::{alt_screen_active, terminal_write_all},
 };
 
 const RESET_STYLE: &str = esc!(style_reset);
@@ -55,7 +60,7 @@ const MAX_OUTPUT_BACKLOG_BYTES: usize = 64 * 1024 * 1024;
 	strum::IntoStaticStr,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum ResizeScrollbackMode {
 	/// Replay the transcript at the current width below existing history.
 	Append,
@@ -396,7 +401,7 @@ impl<W: Write> Renderer<W> {
 			#[cfg(any(windows, target_os = "linux"))]
 			conpty_hosted: is_conpty_hosted(),
 			images: BTreeMap::new(),
-			alt_screen: crate::terminal::alt_screen_active(),
+			alt_screen: alt_screen_active(),
 			graphics: Graphics::KittyPlaceholders,
 			cell_pixel_width: DEFAULT_CELL_PIXEL_WIDTH,
 			cell_pixel_height: DEFAULT_CELL_PIXEL_HEIGHT,
@@ -714,7 +719,7 @@ impl<W: Write> Renderer<W> {
 	/// # Errors
 	/// Propagates writer failures, which poison the renderer.
 	pub fn clear_layers(&mut self) -> io::Result<()> {
-		if self.poisoned || self.layers.is_empty() || crate::terminal::alt_screen_active() {
+		if self.poisoned || self.layers.is_empty() || alt_screen_active() {
 			return Ok(());
 		}
 		if self.previous.is_none() {
@@ -722,7 +727,7 @@ impl<W: Write> Renderer<W> {
 			return Ok(());
 		}
 		self.sync_screen_buffer();
-		let layers = std::mem::take(&mut self.layers);
+		let layers = mem::take(&mut self.layers);
 		let window = Window { top: self.window_top, height: self.viewport_height };
 		let mut stats = PaintStats::default();
 		let (output, next_cursor) = {
@@ -833,7 +838,7 @@ impl<W: Write> Renderer<W> {
 		}
 		self.sync_screen_buffer();
 		let image_prefix = self.image_prefix(next, layers);
-		let mut output = std::mem::take(&mut self.output_scratch);
+		let mut output = mem::take(&mut self.output_scratch);
 		output.clear();
 		output.push_str(&image_prefix);
 		self.prepare_sixels(next);
@@ -844,7 +849,7 @@ impl<W: Write> Renderer<W> {
 		let layout = layout(next.size().height, viewport_height, stable_rows, self.committed_rows);
 		let previous_window = Window { top: self.window_top, height: viewport_height };
 		let next_window = Window { top: layout.window_top, height: viewport_height };
-		let mut incoming = std::mem::take(&mut self.layer_scratch);
+		let mut incoming = mem::take(&mut self.layer_scratch);
 		store_layers_into(layers, next_window, next.size().width, &mut incoming);
 		let commit_to =
 			scroll_append_to(previous_window, next_window, self.committed_rows, layout.stable_limit);
@@ -907,7 +912,7 @@ impl<W: Write> Renderer<W> {
 		let previous_view = ComposedFrame { base: previous, layers: &self.layers };
 		let next_view = ComposedFrame { base: next, layers: &incoming };
 		let capacity = usize::from(next.size().width).saturating_mul(usize::from(viewport_height));
-		let mut paint = std::mem::take(&mut self.paint_scratch);
+		let mut paint = mem::take(&mut self.paint_scratch);
 		paint.clear();
 		paint.reserve(capacity);
 		if newly_committed > 0 {
@@ -1012,7 +1017,7 @@ impl<W: Write> Renderer<W> {
 		self.stable_rows = stable_rows;
 		self.cursor = next_cursor;
 		stats.bytes = bytes;
-		let previous_layers = std::mem::replace(&mut self.layers, incoming);
+		let previous_layers = mem::replace(&mut self.layers, incoming);
 		self.layer_scratch = previous_layers;
 		Ok(stats)
 	}
@@ -1209,11 +1214,11 @@ impl<W: Write> Renderer<W> {
 
 		stats.bytes = output.len();
 		self.write(&output)?;
-		if crate::debug::publishing() {
+		if debug::publishing() {
 			// A preview is what the terminal shows right now (alternate
 			// screen or drag frame); publish its composition, not the
 			// committed main-screen model.
-			crate::debug::publish_screen(crate::debug::ScreenSnapshot {
+			debug::publish_screen(ScreenSnapshot {
 				lines:      stored_text(next, &composited, window.top, viewport_height),
 				cursor:     cursor.map(|cursor| (cursor.row, cursor.col)),
 				window_top: window.top,
@@ -1299,13 +1304,13 @@ impl<W: Write> Renderer<W> {
 	/// Publishes the committed screen to the shared debug snapshot when a
 	/// stream-served `OMP_TUI_DEBUG` host is listening; no-op otherwise.
 	fn publish_debug_screen(&self) {
-		if !crate::debug::publishing() {
+		if !debug::publishing() {
 			return;
 		}
 		let Some(previous) = &self.previous else {
 			return;
 		};
-		crate::debug::publish_screen(crate::debug::ScreenSnapshot {
+		debug::publish_screen(ScreenSnapshot {
 			lines:      self.screen_text(),
 			cursor:     self.screen_cursor(),
 			window_top: self.window_top,
@@ -1606,7 +1611,7 @@ impl<W: Write> Renderer<W> {
 			top:    next.size().height.saturating_sub(viewport_height),
 			height: viewport_height,
 		};
-		let mut incoming = std::mem::take(&mut self.layer_scratch);
+		let mut incoming = mem::take(&mut self.layer_scratch);
 		store_layers_into(layers, next_window, next.size().width, &mut incoming);
 		let previous = self
 			.previous
@@ -1650,7 +1655,7 @@ impl<W: Write> Renderer<W> {
 			..PaintStats::default()
 		};
 		let next_view = ComposedFrame { base: next, layers: &incoming };
-		let mut paint = std::mem::take(&mut self.paint_scratch);
+		let mut paint = mem::take(&mut self.paint_scratch);
 		paint.clear();
 		if commit_to > commit_from {
 			let raw = ComposedFrame { base: next, layers: &[] };
@@ -1699,7 +1704,7 @@ impl<W: Write> Renderer<W> {
 			|| !sixels.is_empty()
 			|| !kitty_direct.is_empty()
 			|| !iterm2.is_empty();
-		let mut output = std::mem::take(&mut self.output_scratch);
+		let mut output = mem::take(&mut self.output_scratch);
 		output.clear();
 		if !paint.is_empty()
 			|| auxiliary
@@ -1750,7 +1755,7 @@ impl<W: Write> Renderer<W> {
 		self.stable_rows = stable_rows;
 		self.cursor = next_cursor;
 		stats.bytes = bytes;
-		let previous_layers = std::mem::replace(&mut self.layers, incoming);
+		let previous_layers = mem::replace(&mut self.layers, incoming);
 		self.layer_scratch = previous_layers;
 		Ok(stats)
 	}
@@ -1947,7 +1952,7 @@ impl<W: Write> Renderer<W> {
 
 	/// Reconciles graphics caches with the terminal's current screen buffer.
 	fn sync_screen_buffer(&mut self) {
-		self.set_screen_buffer(crate::terminal::alt_screen_active());
+		self.set_screen_buffer(alt_screen_active());
 	}
 
 	/// Records which screen buffer subsequent paints target.
@@ -2003,9 +2008,9 @@ impl<W: Write> Renderer<W> {
 		let mut output = String::new();
 		for (id, rows, cols) in needed {
 			let image = match self.images.entry(id) {
-				std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-				std::collections::btree_map::Entry::Vacant(entry) => {
-					let Some(png) = crate::imagereg::bytes(id) else {
+				Entry::Occupied(entry) => entry.into_mut(),
+				Entry::Vacant(entry) => {
+					let Some(png) = imagereg::bytes(id) else {
 						continue;
 					};
 					entry.insert(RegisteredImage::new(png))
@@ -2269,7 +2274,7 @@ const fn is_conpty_hosted() -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_conpty_hosted() -> bool {
-	std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some()
+	env::var_os("WSL_DISTRO_NAME").is_some() || env::var_os("WSL_INTEROP").is_some()
 }
 
 #[allow(clippy::too_many_arguments, reason = "rendering inputs are independent frame state")]
@@ -2525,7 +2530,7 @@ fn store_layers_into(
 		if rows == 0 {
 			continue;
 		}
-		let source_address = std::ptr::from_ref(layer.frame).addr();
+		let source_address = ptr::from_ref(layer.frame).addr();
 		let (source_id, source_revision) = layer.frame.source_stamp();
 		if let Some(slot) = stored.get_mut(len) {
 			let source_unchanged = slot.source_address == source_address
@@ -3441,13 +3446,15 @@ pub fn sanitize_link_target(target: &str) -> Option<&str> {
 		.then_some(target)
 }
 
-/// Builds an encoded `file://` OSC target with optional editor position
-/// parameters.
+/// Builds a percent-encoded `file://` OSC 8 target with optional `line` and `col` parameters.
+///
+/// Returns `None` when the current directory is unavailable for a relative path
+/// or the target contains terminal control bytes.
 pub fn file_link_target(path: &Path, line: Option<u32>, column: Option<u32>) -> Option<Str> {
 	let absolute = if path.is_absolute() {
 		path.to_path_buf()
 	} else {
-		std::env::current_dir().ok()?.join(path)
+		env::current_dir().ok()?.join(path)
 	};
 	let raw = absolute.to_string_lossy();
 	if sanitize_link_target(&raw).is_none() {
@@ -3559,7 +3566,7 @@ fn push_color_code(output: &mut String, first: &mut bool, color: Color, backgrou
 
 #[cfg(test)]
 mod tests {
-	use std::io::ErrorKind;
+	use std::{io::ErrorKind, iter, mem};
 
 	use super::{
 		ConptyChunks, MAX_CONPTY_WRITE_CHUNK_BYTES, MAX_OUTPUT_BACKLOG_BYTES, OutputBacklogGuard,
@@ -3597,7 +3604,7 @@ mod tests {
 	}
 
 	fn apply_paint(renderer: &mut Renderer<Vec<u8>>, terminal: &mut TerminalModel) {
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).expect("ANSI is UTF-8");
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("ANSI is UTF-8");
 		terminal.apply(&output);
 	}
 
@@ -3809,14 +3816,14 @@ mod tests {
 		renderer
 			.present_resolved(&base, &[], 3, 0, &[layer(true)])
 			.expect("active layer paint succeeds");
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).expect("UTF-8");
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
 		assert!(output.contains("\x1b[1A\r\x1b[4C\x1b[?25h"), "{output:?}");
 
 		// A passive layer lets the base document's caret show through.
 		renderer
 			.present_resolved(&base, &[], 3, 0, &[layer(false)])
 			.expect("passive layer paint succeeds");
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).expect("UTF-8");
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
 		assert!(output.contains("\x1b[2A\r\x1b[?25h"), "base caret at (0,0): {output:?}");
 
 		// An active layer without a frame cursor suppresses the base caret.
@@ -3832,7 +3839,7 @@ mod tests {
 				active:  true,
 			}])
 			.expect("cursorless active paint succeeds");
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).expect("UTF-8");
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
 		assert!(!output.contains("\x1b[?25h"), "no caret may show: {output:?}");
 	}
 
@@ -3967,7 +3974,7 @@ mod tests {
 	fn conpty_chunker_extends_past_an_escape_sequence_without_newlines() {
 		let mut payload = vec![b'x'; MAX_CONPTY_WRITE_CHUNK_BYTES - 2];
 		payload.extend_from_slice(b"\x1b]8;;https://example.test/a-very-long-link\x1b\\");
-		payload.extend(std::iter::repeat_n(b'y', MAX_CONPTY_WRITE_CHUNK_BYTES));
+		payload.extend(iter::repeat_n(b'y', MAX_CONPTY_WRITE_CHUNK_BYTES));
 		let chunks = ConptyChunks::new(&payload, MAX_CONPTY_WRITE_CHUNK_BYTES).collect::<Vec<_>>();
 		assert!(chunks[0].len() > MAX_CONPTY_WRITE_CHUNK_BYTES);
 		assert!(chunks[0].ends_with(b"\x1b\\"));
@@ -4054,9 +4061,8 @@ mod tests {
 			.present(initial, 2, 1)
 			.expect("plain full paint succeeds");
 		let synchronized_output =
-			String::from_utf8(std::mem::take(synchronized.writer_mut())).expect("ANSI is UTF-8");
-		let plain_output =
-			String::from_utf8(std::mem::take(plain.writer_mut())).expect("ANSI is UTF-8");
+			String::from_utf8(mem::take(synchronized.writer_mut())).expect("ANSI is UTF-8");
+		let plain_output = String::from_utf8(mem::take(plain.writer_mut())).expect("ANSI is UTF-8");
 		assert_eq!(without_sync_markers(&synchronized_output), plain_output);
 		assert!(!plain_output.contains(SYNC_OUTPUT_BEGIN));
 		assert!(!plain_output.contains(SYNC_OUTPUT_END));
@@ -4147,7 +4153,7 @@ mod tests {
 		renderer
 			.present(soft_document(&["one", "two", "three", "abcdefgh", "ij"], &[3]), 3, 5)
 			.expect("scroll paint succeeds");
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).expect("UTF-8");
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
 		terminal.apply(&output);
 		assert!(output.contains("\x1b[?7h"), "committing a joined pair enables autowrap");
 		assert!(output.contains("\x1b[?7l"), "autowrap is restored after the commit");
@@ -4193,7 +4199,7 @@ mod tests {
 		renderer
 			.present(document(&["abcdefgh", "ij"]), 2, 0)
 			.expect("hardening paint succeeds");
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).expect("UTF-8");
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("UTF-8");
 		terminal.apply(&output);
 		assert!(!output.contains("\x1b[H"), "reconciliation never clears the viewport");
 		assert!(output.contains("\x1b[2K"), "the stale soft rows are erased in place");
@@ -4774,7 +4780,7 @@ mod tests {
 		renderer
 			.rebuild(document(&["app0", "app1"]), 2, 0, "")
 			.expect("initial multiplexer paint succeeds");
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(!output.contains("\x1b[3J"));
 		terminal.apply(&output);
 		assert_eq!(terminal.history, ["shell-output"]);
@@ -4838,7 +4844,7 @@ mod tests {
 		let stats = renderer
 			.rebuild(settled, 3, 6, "")
 			.expect("settled multiplexer repaint succeeds");
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert_eq!(stats.committed_rows, 2);
 		assert!(!output.contains("\x1b[3J"));
 		assert!(!output.contains("\x1b[2J"));
@@ -5036,7 +5042,7 @@ mod tests {
 		renderer.preview(&resized, 3, "").unwrap();
 		renderer.writer_mut().clear();
 		renderer.rebuild(resized, 3, 0, "").unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 
 		assert!(output.contains("a=p"), "the visible direct placement is refreshed");
 		assert!(!output.contains("a=d"), "width repaint must not delete the placement");
@@ -5136,12 +5142,12 @@ mod tests {
 		let mut renderer = Renderer::new(Vec::new());
 		renderer.register_image(7, vec![1, 2, 3]).unwrap();
 		renderer.present(clipped_image(3), 4, 0).unwrap();
-		let initial = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let initial = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(initial.contains("\x1b_Ga=p,U=1,i=7,p=2056,r=4,c=8,q=2\x1b\\"));
 
 		for first_row in (0..3).rev() {
 			renderer.present(clipped_image(first_row), 4, 0).unwrap();
-			let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+			let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 			assert!(
 				!output.contains("\x1b_Ga=p"),
 				"declared 4x8 dimensions must not be re-placed when row {first_row} enters"
@@ -5166,7 +5172,7 @@ mod tests {
 			.register_image(7, b"\x89PNG\r\n\x1a\nsmall".to_vec())
 			.unwrap();
 		renderer.present(frame.clone(), 3, 0).unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert_eq!(output.matches("a=t").count(), 1, "one upload serves every box");
 		assert!(output.contains("\x1b_Ga=p,U=1,i=7,p=514,r=1,c=2,q=2\x1b\\"));
 		assert!(output.contains("\x1b_Ga=p,U=1,i=7,p=1028,r=2,c=4,q=2\x1b\\"));
@@ -5177,7 +5183,7 @@ mod tests {
 
 		// Identical re-present: placements are session-cached, never re-sent.
 		renderer.present(frame, 3, 0).unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(!output.contains("\x1b_G"), "no image traffic on a settled frame: {output:?}");
 	}
 
@@ -5196,16 +5202,16 @@ mod tests {
 			.register_image(7, b"\x89PNG\r\n\x1a\nsmall".to_vec())
 			.unwrap();
 		renderer.present(frame.clone(), 3, 0).unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert_eq!(output.matches("a=t").count(), 1, "first paint uploads: {output:?}");
 
 		renderer.preview(&frame, 3, "").unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(!output.contains("\x1b_G"), "no retransmit within one buffer: {output:?}");
 
 		renderer.set_screen_buffer(true);
 		renderer.preview(&frame, 3, "").unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert_eq!(
 			output.matches("a=t").count(),
 			1,
@@ -5217,7 +5223,7 @@ mod tests {
 		);
 
 		renderer.preview(&frame, 3, "").unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(!output.contains("\x1b_G"), "caches hold once settled: {output:?}");
 	}
 
@@ -5249,7 +5255,7 @@ mod tests {
 		renderer
 			.preview_resolved(&base, &[layer], 2, "\x1b[?1049h")
 			.unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		let switch = output
 			.find("\x1b[?1049h")
 			.expect("staged alt entry is emitted");
@@ -5263,7 +5269,7 @@ mod tests {
 		);
 
 		renderer.preview_resolved(&base, &[layer], 2, "").unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(!output.contains("\x1b_G"), "steady overlay preview stays quiet: {output:?}");
 
 		// Leaving the hold flips the tracked buffer again: the exit
@@ -5272,7 +5278,7 @@ mod tests {
 		renderer
 			.preview_resolved(&base, &[layer], 2, "\x1b[?1049l")
 			.unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		let switch = output
 			.find("\x1b[?1049l")
 			.expect("staged alt exit is emitted");
@@ -5300,7 +5306,7 @@ mod tests {
 
 		renderer.set_screen_buffer(true);
 		renderer.preview(&frame, 3, "\x1b[?1049h").unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		let switch = output.find("\x1b[?1049h").expect("staged entry is emitted");
 		let upload = output.find("a=t").expect("the new screen needs an upload");
 		assert!(switch < upload, "upload lands on the freshly entered screen: {output:?}");
@@ -5309,7 +5315,7 @@ mod tests {
 		// tests), so a fresh flip is needed to observe the exit switch.
 		renderer.set_screen_buffer(true);
 		renderer.rebuild(frame, 3, 0, "\x1b[?1049l").unwrap();
-		let output = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		let switch = output.find("\x1b[?1049l").expect("staged exit is emitted");
 		let upload = output
 			.find("a=t")
@@ -5356,7 +5362,7 @@ mod tests {
 		renderer.register_image(7, png_fixture()).unwrap();
 
 		renderer.present(image_frame(0), 4, 0).unwrap();
-		let clipped = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let clipped = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert_eq!(clipped.matches("a=t").count(), 1);
 		assert!(
 			clipped
@@ -5366,7 +5372,7 @@ mod tests {
 		assert!(!clipped.contains("\u{10eeee}"));
 
 		renderer.present(image_frame(2), 4, 0).unwrap();
-		let fully_visible = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let fully_visible = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(!fully_visible.contains("a=t"));
 		assert!(
 			fully_visible
@@ -5374,7 +5380,7 @@ mod tests {
 		);
 
 		renderer.present(Frame::new(Size::new(4, 6)), 4, 0).unwrap();
-		let offscreen = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let offscreen = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(offscreen.contains("\x1b_Ga=d,d=I,i=7,q=2\x1b\\"));
 	}
 
@@ -5443,7 +5449,7 @@ mod tests {
 		renderer.register_image(7, png_fixture()).unwrap();
 
 		renderer.present(image_frame(0, 6), 4, 0).unwrap();
-		let clipped = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let clipped = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(clipped.contains("\x1b[3A\r\x1b[1C\x1bP0;1;0q"));
 		assert!(clipped.contains("\"1;1;8;2"));
 		assert!(!clipped.contains("\x1b_G"));
@@ -5451,7 +5457,7 @@ mod tests {
 
 		let fully_visible = image_frame(4, 8);
 		renderer.present(fully_visible.clone(), 4, 0).unwrap();
-		let moved = String::from_utf8(std::mem::take(renderer.writer_mut())).unwrap();
+		let moved = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(moved.contains("\x1b[3A\r\x1b[1C\x1bP0;1;0q"));
 		assert!(moved.contains("\"1;1;8;4"));
 		assert!(!moved.contains("\x1b_G"));

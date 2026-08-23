@@ -1,20 +1,27 @@
 //! Deterministic construction of the canonical system-prompt head.
 
 use std::{
+	array,
 	collections::HashSet,
-	fmt::{self, Write as _},
+	fmt::{self, Display, Write as _},
 	path::PathBuf,
+	str::{self, Utf8Error},
 	sync::Arc,
 };
 
 use bytes::Bytes;
 use omp_core::{Hash32, Str, sf};
-use omp_proto::thread::v1::{self as thread, Item};
+use omp_proto::{
+	env::{v1, v1::HostInfo},
+	thread::v1::{self as thread, Item, item},
+};
 use omp_scribe::{Props, Value, map};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 use thiserror::Error;
+
+use crate::{prompt_assets, prompt_engine, prompt_keys};
 const CHECKPOINT_ACTIVE_NOTICE: &str = "<system-notice>\nExploration checkpoint active.\n- MUST \
                                         `rewind` with findings once exploration is done.\n- MUST \
                                         `rewind` before yielding.\n</system-notice>";
@@ -39,10 +46,12 @@ hardening, and defense-in-depth-only observations. An empty finding list is vali
 
 pub(crate) fn checkpoint_active_reminder() -> Item {
 	Item {
-		kind: Some(thread::item::Kind::Message(thread::Message {
+		kind: Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::User as i32,
 			parts: vec![thread::Part {
-				kind: Some(thread::part::Kind::Text(CHECKPOINT_ACTIVE_NOTICE.to_owned())),
+				kind: Some(omp_proto::thread::v1::part::Kind::Text(
+					CHECKPOINT_ACTIVE_NOTICE.to_owned(),
+				)),
 			}],
 		})),
 		..Default::default()
@@ -136,8 +145,8 @@ pub struct HostInfoInput {
 	pub terminal:     Str,
 }
 
-impl From<omp_proto::env::v1::HostInfo> for HostInfoInput {
-	fn from(info: omp_proto::env::v1::HostInfo) -> Self {
+impl From<v1::HostInfo> for HostInfoInput {
+	fn from(info: HostInfo) -> Self {
 		Self {
 			os:           info.os.into(),
 			kernel:       info.kernel.into(),
@@ -500,14 +509,14 @@ impl PromptFacts {
 	/// Derives the immutable template property bag consumed by prompt renderers.
 	pub fn props(&self) -> Result<Props, PromptError> {
 		let mut props = Props::new();
-		props.set(crate::prompt_keys::CWD, self.cwd.to_string_lossy().into_owned());
+		props.set(prompt_keys::CWD, self.cwd.to_string_lossy().into_owned());
 		if let Some(vcs) = &self.vcs {
-			props.set(crate::prompt_keys::VCS, map! {
+			props.set(prompt_keys::VCS, map! {
 				"root" => vcs.root.to_string_lossy().into_owned(),
 				"head" => vcs.head.clone(),
 			});
 		}
-		props.set(crate::prompt_keys::HOST, map! {
+		props.set(prompt_keys::HOST, map! {
 			"os" => self.host.os.clone(),
 			"distro" => "",
 			"kernel" => self.host.kernel.clone(),
@@ -516,12 +525,12 @@ impl PromptFacts {
 			"terminal" => self.host.terminal.clone(),
 			"gpus" => self.host.gpus.iter().cloned().collect::<Vec<_>>(),
 		});
-		props.set(crate::prompt_keys::MODEL, map! {
+		props.set(prompt_keys::MODEL, map! {
 			"identifier" => self.model.identifier.clone(),
 			"codex_task_policy" => self.model.codex_task_policy,
 		});
 		props.set(
-			crate::prompt_keys::REPOSITORIES,
+			prompt_keys::REPOSITORIES,
 			self
 				.repositories
 				.iter()
@@ -549,10 +558,10 @@ impl PromptFacts {
 		if let Some(primary) = &self.roots.primary {
 			root_fields.push(("primary", root_value(primary)));
 		}
-		props.set(crate::prompt_keys::ROOTS, root_fields.into_iter().collect::<Value>());
+		props.set(prompt_keys::ROOTS, root_fields.into_iter().collect::<Value>());
 		let primary = self.roots.primary.as_ref().map(|root| &root.canonical_uri);
 		props.set(
-			crate::prompt_keys::ADDITIONAL_ROOTS,
+			prompt_keys::ADDITIONAL_ROOTS,
 			self
 				.roots
 				.roots
@@ -563,7 +572,7 @@ impl PromptFacts {
 		);
 		if let Some(active) = &self.active_repository {
 			props.set(
-				crate::prompt_keys::ACTIVE_REPOSITORY,
+				prompt_keys::ACTIVE_REPOSITORY,
 				map! { "relative_root" => active.relative_root.clone() },
 			);
 		}
@@ -576,7 +585,7 @@ impl PromptFacts {
 			.map(|content| dedupe_prompt_source(content, &mut seen))
 			.filter(|content| !content.is_empty())
 		{
-			props.set(crate::prompt_keys::CUSTOM_PROMPT, content);
+			props.set(prompt_keys::CUSTOM_PROMPT, content);
 		}
 		if let Some(content) = self
 			.settings
@@ -585,10 +594,10 @@ impl PromptFacts {
 			.map(|content| dedupe_prompt_source(content, &mut seen))
 			.filter(|content| !content.is_empty())
 		{
-			props.set(crate::prompt_keys::APPEND_PROMPT, content);
+			props.set(prompt_keys::APPEND_PROMPT, content);
 		}
 		props.set(
-			crate::prompt_keys::CONTEXT_FILES,
+			prompt_keys::CONTEXT_FILES,
 			self
 				.context_files
 				.iter()
@@ -611,11 +620,11 @@ impl PromptFacts {
 				.collect::<Vec<_>>(),
 		);
 		props.set(
-			crate::prompt_keys::DIRECTORY_CONTEXT,
+			prompt_keys::DIRECTORY_CONTEXT,
 			self.directory_context.iter().cloned().collect::<Vec<_>>(),
 		);
 		props.set(
-			crate::prompt_keys::WORKSPACE_TREES,
+			prompt_keys::WORKSPACE_TREES,
 			self
 				.workspace_trees
 				.iter()
@@ -629,7 +638,7 @@ impl PromptFacts {
 				.collect::<Vec<_>>(),
 		);
 		props.set(
-			crate::prompt_keys::SKILLS,
+			prompt_keys::SKILLS,
 			self
 				.skills
 				.iter()
@@ -639,7 +648,7 @@ impl PromptFacts {
 				.collect::<Vec<_>>(),
 		);
 		props.set(
-			crate::prompt_keys::RULES,
+			prompt_keys::RULES,
 			self
 				.rules
 				.iter()
@@ -671,19 +680,19 @@ impl PromptFacts {
 				asset.map(|id| Str::new(prompt_asset(id).content))
 			});
 		if let Some(personality) = personality {
-			props.set(crate::prompt_keys::PERSONALITY, personality);
+			props.set(prompt_keys::PERSONALITY, personality);
 		}
-		props.set(crate::prompt_keys::RENDER_MERMAID, self.settings.render_mermaid);
-		props.set(crate::prompt_keys::INCLUDE_WORKSTATION, self.settings.include_workstation);
-		props.set(crate::prompt_keys::INCLUDE_MODEL, self.settings.include_model);
-		props.set(crate::prompt_keys::INCLUDE_WORKSPACE_TREE, self.settings.include_workspace_tree);
-		props.set(crate::prompt_keys::INCLUDE_SKILLS, self.settings.include_skills);
-		props.set(crate::prompt_keys::SECRETS_ENABLED, self.settings.secrets_enabled);
-		props.set(crate::prompt_keys::NULL_PROMPT, self.settings.null_prompt);
+		props.set(prompt_keys::RENDER_MERMAID, self.settings.render_mermaid);
+		props.set(prompt_keys::INCLUDE_WORKSTATION, self.settings.include_workstation);
+		props.set(prompt_keys::INCLUDE_MODEL, self.settings.include_model);
+		props.set(prompt_keys::INCLUDE_WORKSPACE_TREE, self.settings.include_workspace_tree);
+		props.set(prompt_keys::INCLUDE_SKILLS, self.settings.include_skills);
+		props.set(prompt_keys::SECRETS_ENABLED, self.settings.secrets_enabled);
+		props.set(prompt_keys::NULL_PROMPT, self.settings.null_prompt);
 		if let Some(field) = self.settings.intent_field.clone() {
-			props.set(crate::prompt_keys::INTENT_FIELD, field);
+			props.set(prompt_keys::INTENT_FIELD, field);
 		}
-		props.set(crate::prompt_keys::TOOL_INVENTORY, render_tool_inventory_prop(self)?);
+		props.set(prompt_keys::TOOL_INVENTORY, render_tool_inventory_prop(self)?);
 
 		let mut tool_names = self
 			.capabilities
@@ -696,7 +705,7 @@ impl PromptFacts {
 				tool_names.push(device.name.clone());
 			}
 		}
-		props.set(crate::prompt_keys::TOOLS, tool_names);
+		props.set(prompt_keys::TOOLS, tool_names);
 		const ALLOWED_SCHEMES: [&str; 10] =
 			["skill", "rule", "agent", "history", "artifact", "local", "mcp", "issue", "pr", "omp"];
 		let schemes = self
@@ -708,7 +717,7 @@ impl PromptFacts {
 			})
 			.collect::<Vec<_>>();
 		props.set(
-			crate::prompt_keys::SCHEMES,
+			prompt_keys::SCHEMES,
 			schemes
 				.iter()
 				.map(|scheme| {
@@ -722,17 +731,16 @@ impl PromptFacts {
 				})
 				.collect::<Vec<_>>(),
 		);
-		props
-			.set(crate::prompt_keys::SCHEME_SELECTORS, schemes.iter().any(|scheme| scheme.selectors));
-		props.set(crate::prompt_keys::COMPUTER, self.capabilities.computer);
+		props.set(prompt_keys::SCHEME_SELECTORS, schemes.iter().any(|scheme| scheme.selectors));
+		props.set(prompt_keys::COMPUTER, self.capabilities.computer);
 		if let Some(guidance) = self.capabilities.device_guidance.clone() {
-			props.set(crate::prompt_keys::DEVICE_GUIDANCE, guidance);
+			props.set(prompt_keys::DEVICE_GUIDANCE, guidance);
 		}
 		if let Some(guidance) = self.capabilities.auto_qa_guidance.clone() {
-			props.set(crate::prompt_keys::AUTO_QA_GUIDANCE, guidance);
+			props.set(prompt_keys::AUTO_QA_GUIDANCE, guidance);
 		}
 		let delegation = &self.capabilities.delegation;
-		props.set(crate::prompt_keys::DELEGATION, map! {
+		props.set(prompt_keys::DELEGATION, map! {
 			"enabled" => delegation.enabled,
 			"eager" => delegation.eager.to_string(),
 			"batch" => delegation.batch,
@@ -742,7 +750,7 @@ impl PromptFacts {
 			"coordination" => delegation.coordination,
 		});
 		let mutations = &self.capabilities.mutations;
-		props.set(crate::prompt_keys::MUTATIONS, map! {
+		props.set(prompt_keys::MUTATIONS, map! {
 			"format_on_write" => mutations.format_on_write,
 			"fetch" => mutations.fetch,
 			"editor" => mutations.editor,
@@ -757,7 +765,7 @@ impl PromptFacts {
 					.any(|device| device.name == name)
 		};
 		props.set(
-			crate::prompt_keys::EDIT_HASHLINE,
+			prompt_keys::EDIT_HASHLINE,
 			self
 				.capabilities
 				.tools
@@ -765,14 +773,14 @@ impl PromptFacts {
 				.any(|tool| tool.name == "edit" && tool.revision.family == "hl"),
 		);
 		props.set(
-			crate::prompt_keys::EDIT_APPLY_PATCH,
+			prompt_keys::EDIT_APPLY_PATCH,
 			has_available("apply_patch")
 				|| self.capabilities.tools.iter().any(|tool| {
 					tool.name == "edit" && matches!(tool.revision.family.as_str(), "patch" | "unified")
 				}),
 		);
 		props.set(
-			crate::prompt_keys::EDIT_SLOPPY,
+			prompt_keys::EDIT_SLOPPY,
 			has_available("sloppy")
 				|| self
 					.capabilities
@@ -789,7 +797,7 @@ impl PromptFacts {
 		.filter_map(|(name, content)| content.map(|content| (name, Value::from(content))))
 		.collect::<Value>();
 		if memory.is_truthy() {
-			props.set(crate::prompt_keys::MEMORY, memory);
+			props.set(prompt_keys::MEMORY, memory);
 		}
 		Ok(())
 	}
@@ -852,12 +860,12 @@ pub fn render_tool_inventory_prop(facts: &PromptFacts) -> Result<Str, PromptErro
 					if let Some(label) = &example.label {
 						let _ = writeln!(out, "// @example {label}");
 					}
-					let arguments = std::str::from_utf8(&example.arguments).map_err(|source| {
+					let arguments = str::from_utf8(&example.arguments).map_err(|source| {
 						PromptError::ToolMetadataEncoding { name: tool.name.clone(), source }
 					})?;
 					let _ = writeln!(out, "// {}({arguments})", tool.name);
 				}
-				let schema = std::str::from_utf8(&tool.schema).map_err(|source| {
+				let schema = str::from_utf8(&tool.schema).map_err(|source| {
 					PromptError::ToolMetadataEncoding { name: tool.name.clone(), source }
 				})?;
 				let _ = writeln!(out, "type {} = (_: {schema});", tool.name);
@@ -1070,7 +1078,7 @@ impl PromptSlotSource {
 
 impl SlotSource for PromptSlotSource {
 	fn render(&self, _workspace: &Props, out: &mut dyn PromptOut) -> Result<(), PromptError> {
-		let asset = crate::prompt_assets::prompt_slot_asset(self.slot.as_str())
+		let asset = prompt_assets::prompt_slot_asset(self.slot.as_str())
 			.ok_or_else(|| PromptError::UnknownPromptSlot { slot: self.slot.clone() })?;
 		out.write_str(asset.content);
 		Ok(())
@@ -1308,7 +1316,7 @@ impl SlotAssembler {
 	fn assemble(&self, workspace: &Props) -> Result<AssembledSlots, PromptError> {
 		const SLOT_COUNT: usize = SlotId::Delivery as usize + 1;
 		let mut slot_bytes: [[String; SLOT_COUNT]; 4] =
-			std::array::from_fn(|_| std::array::from_fn(|_| String::new()));
+			array::from_fn(|_| array::from_fn(|_| String::new()));
 		let mut prepend_bytes = [[0usize; SLOT_COUNT]; 4];
 		for registration in &self.registrations {
 			if self.dropped.lock().contains(&registration.decl.owner) {
@@ -1544,8 +1552,7 @@ impl RuntimePromptSource {
 
 impl SlotSource for RuntimePromptSource {
 	fn render(&self, props: &Props, out: &mut dyn PromptOut) -> Result<(), PromptError> {
-		let rendered =
-			crate::prompt_engine::runtime().render_str(crate::prompt_engine::engine(), props)?;
+		let rendered = prompt_engine::runtime().render_str(prompt_engine::engine(), props)?;
 		out.write_str(&rendered);
 		Ok(())
 	}
@@ -1572,8 +1579,7 @@ impl ProjectPromptSource {
 
 impl SlotSource for ProjectPromptSource {
 	fn render(&self, props: &Props, out: &mut dyn PromptOut) -> Result<(), PromptError> {
-		let rendered =
-			crate::prompt_engine::project().render_str(crate::prompt_engine::engine(), props)?;
+		let rendered = prompt_engine::project().render_str(prompt_engine::engine(), props)?;
 		out.write_str(&rendered);
 		Ok(())
 	}
@@ -1587,54 +1593,54 @@ pub struct CanonicalPromptSource;
 impl CanonicalPromptSource {
 	fn candidate(props: &Props) -> Result<(Vec<Item>, [BandHash; 4]), PromptError> {
 		if props
-			.get(crate::prompt_keys::NULL_PROMPT)
+			.get(prompt_keys::NULL_PROMPT)
 			.is_some_and(omp_scribe::Value::is_truthy)
 		{
 			return Ok((Vec::new(), [hash_band(&[]); 4]));
 		}
 
-		let engine = crate::prompt_engine::engine();
+		let engine = prompt_engine::engine();
 		let mut frozen = String::new();
-		crate::prompt_engine::conventions().render(engine, props, &mut frozen)?;
+		prompt_engine::conventions().render(engine, props, &mut frozen)?;
 
 		let mut system = frozen.clone();
 		if let Some(custom) = props
-			.get(crate::prompt_keys::CUSTOM_PROMPT)
+			.get(prompt_keys::CUSTOM_PROMPT)
 			.and_then(omp_scribe::Value::as_str)
 		{
 			system.push_str(custom);
 			system.push_str("\n\n");
 		} else {
-			crate::prompt_engine::role().render(engine, props, &mut system)?;
+			prompt_engine::role().render(engine, props, &mut system)?;
 		}
-		crate::prompt_engine::runtime().render(engine, props, &mut system)?;
-		crate::prompt_engine::tool_policy().render(engine, props, &mut system)?;
-		crate::prompt_engine::workflow().render(engine, props, &mut system)?;
+		prompt_engine::runtime().render(engine, props, &mut system)?;
+		prompt_engine::tool_policy().render(engine, props, &mut system)?;
+		prompt_engine::workflow().render(engine, props, &mut system)?;
 		if let Some(append) = props
-			.get(crate::prompt_keys::APPEND_PROMPT)
+			.get(prompt_keys::APPEND_PROMPT)
 			.and_then(omp_scribe::Value::as_str)
 		{
 			system.push_str("\n§ Guidance\n");
 			system.push_str(append);
 			system.push('\n');
 		}
-		crate::prompt_engine::delivery().render(engine, props, &mut system)?;
+		prompt_engine::delivery().render(engine, props, &mut system)?;
 
-		let project = crate::prompt_engine::project()
+		let project = prompt_engine::project()
 			.render_str(engine, props)?
 			.to_string();
-		let active = if props.get(crate::prompt_keys::ACTIVE_REPOSITORY).is_some() {
-			crate::prompt_engine::active_repo()
+		let active = if props.get(prompt_keys::ACTIVE_REPOSITORY).is_some() {
+			prompt_engine::active_repo()
 				.render_str(engine, props)?
 				.to_string()
 		} else {
 			String::new()
 		};
 		let computer = props
-			.get(crate::prompt_keys::COMPUTER)
+			.get(prompt_keys::COMPUTER)
 			.is_some_and(omp_scribe::Value::is_truthy);
 		let safety = if computer {
-			crate::prompt_engine::computer_safety()
+			prompt_engine::computer_safety()
 				.render_str(engine, props)?
 				.to_string()
 		} else {
@@ -1693,7 +1699,7 @@ impl PromptSource for CanonicalPromptSource {
 }
 
 fn memory_entries(props: &Props) -> [Option<&str>; 3] {
-	let Some(omp_scribe::Value::Map(memory)) = props.get(crate::prompt_keys::MEMORY) else {
+	let Some(omp_scribe::Value::Map(memory)) = props.get(prompt_keys::MEMORY) else {
 		return [None; 3];
 	};
 	["memory", "standing", "recall"].map(|name| {
@@ -1710,22 +1716,22 @@ pub struct WorkspacePromptSource;
 
 impl PromptSource for WorkspacePromptSource {
 	fn render(&self, props: &Props) -> Result<Vec<Item>, PromptError> {
-		let engine = crate::prompt_engine::engine();
-		let identity = crate::prompt_engine::workspace_fallback().render_str(engine, props)?;
+		let engine = prompt_engine::engine();
+		let identity = prompt_engine::workspace_fallback().render_str(engine, props)?;
 		let mut items = vec![system_text(identity.to_string())];
-		if let Some(omp_scribe::Value::List(files)) = props.get(crate::prompt_keys::CONTEXT_FILES) {
+		if let Some(omp_scribe::Value::List(files)) = props.get(prompt_keys::CONTEXT_FILES) {
 			for file in files {
 				let omp_scribe::Value::Map(file) = file else {
 					continue;
 				};
 				let Some(path) = file
-					.get(crate::prompt_keys::PATH)
+					.get(prompt_keys::PATH)
 					.and_then(omp_scribe::Value::as_str)
 				else {
 					continue;
 				};
 				let Some(content) = file
-					.get(crate::prompt_keys::CONTENT)
+					.get(prompt_keys::CONTENT)
 					.and_then(omp_scribe::Value::as_str)
 				else {
 					continue;
@@ -1782,7 +1788,7 @@ pub enum PromptError {
 		path:   PathBuf,
 		/// UTF-8 decoding failure.
 		#[source]
-		source: std::str::Utf8Error,
+		source: Utf8Error,
 	},
 	/// Tool metadata was not valid UTF-8.
 	#[error("tool metadata for {name} is not valid UTF-8")]
@@ -1791,7 +1797,7 @@ pub enum PromptError {
 		name:   Str,
 		/// UTF-8 decoding failure.
 		#[source]
-		source: std::str::Utf8Error,
+		source: Utf8Error,
 	},
 	/// Canonical item serialization failed.
 	#[error("failed to serialize canonical prompt items")]
@@ -1840,8 +1846,8 @@ fn validate_items(items: &[Item]) -> Result<(), PromptError> {
 			&& item.props.is_none()
 			&& matches!(
 				item.kind.as_ref(),
-				Some(thread::item::Kind::Message(message))
-					if message.role == thread::Role::System as i32
+				Some(omp_proto::thread::v1::item::Kind::Message(message))
+					if message.role == omp_proto::thread::v1::Role::System as i32
 			);
 		if !canonical {
 			return Err(PromptError::InvalidItem { index });
@@ -1854,15 +1860,15 @@ fn system_text(text: String) -> Item {
 	Item {
 		seq:           0,
 		created_at_ms: 0,
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::System as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+			parts: vec![thread::Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text)) }],
 		})),
 		props:         None,
 	}
 }
 
-impl fmt::Display for PromptHash {
+impl Display for PromptHash {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		self.0.fmt(formatter)
 	}

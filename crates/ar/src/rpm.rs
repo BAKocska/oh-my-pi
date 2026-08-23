@@ -1,6 +1,10 @@
 //! RPM lead/header parsing and compressed cpio payload indexing.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{
+	io,
+	io::{Read, Seek, SeekFrom, Write},
+	str,
+};
 
 use flate2::read::MultiGzDecoder;
 
@@ -289,7 +293,7 @@ fn parse_main_header(body: &[u8], intro: HeaderIntro) -> Result<Metadata> {
 		if relative_end > 4096 {
 			return Err(Error::InvalidArchive("RPM metadata string is too large"));
 		}
-		let value = std::str::from_utf8(&body[start..start + relative_end])
+		let value = str::from_utf8(&body[start..start + relative_end])
 			.map_err(|_| Error::InvalidArchive("RPM metadata string is not valid UTF-8"))?
 			.to_owned();
 		match tag {
@@ -413,7 +417,7 @@ fn read_vec_at(
 	let mut bytes = vec![0_u8; length];
 	source.seek(SeekFrom::Start(offset))?;
 	source.read_exact(&mut bytes).map_err(|error| {
-		if error.kind() == std::io::ErrorKind::UnexpectedEof {
+		if error.kind() == io::ErrorKind::UnexpectedEof {
 			Error::InvalidArchive(message)
 		} else {
 			error.into()

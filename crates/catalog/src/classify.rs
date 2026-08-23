@@ -2,6 +2,8 @@
 //! normalization.
 #![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 
+use std::borrow;
+
 use omp_core::{SemVer, Str, sf};
 use serde::{Deserialize, Serialize};
 use strum::IntoStaticStr;
@@ -155,7 +157,7 @@ fn classify_with_taxonomy(
 	let (logical, collapsed_effort, collapsed_thinking) = if trimmed.len() == input.model.len() {
 		taxonomy.collapse(input.provider, trimmed)
 	} else {
-		(std::borrow::Cow::Borrowed(trimmed), None, false)
+		(borrow::Cow::Borrowed(trimmed), None, false)
 	};
 	let (inferred_class, inferred_family, inferred_revision) =
 		classify_ranks(taxonomy, input.phase, &logical);

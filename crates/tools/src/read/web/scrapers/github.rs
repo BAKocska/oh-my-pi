@@ -1,6 +1,6 @@
 //! Anonymous GitHub API and raw-content renderer.
 
-use std::fmt::Write;
+use std::{cmp, cmp::Ordering, fmt::Write};
 
 use omp_core::{Str, base64, sf};
 use serde::Deserialize;
@@ -140,12 +140,12 @@ fn parse(url: &Url) -> Option<Target> {
 	Some(Target { owner, repo, kind, reference, path })
 }
 
-fn filename_order(left: &str, right: &str) -> std::cmp::Ordering {
+fn filename_order(left: &str, right: &str) -> Ordering {
 	let primary = left
 		.chars()
 		.flat_map(char::to_lowercase)
 		.cmp(right.chars().flat_map(char::to_lowercase));
-	if primary != std::cmp::Ordering::Equal {
+	if primary != cmp::Ordering::Equal {
 		return primary;
 	}
 	left
@@ -212,8 +212,8 @@ async fn render_tree<C: HttpClient + Sync>(
 	if let Some(mut items) = api_json::<_, Vec<ContentItem>>(client, &endpoint).await? {
 		items.sort_by(|left, right| match (left.kind.as_str(), right.kind.as_str()) {
 			("dir", "dir") | ("file", "file") => filename_order(&left.name, &right.name),
-			("dir", _) => std::cmp::Ordering::Less,
-			(_, "dir") => std::cmp::Ordering::Greater,
+			("dir", _) => cmp::Ordering::Less,
+			(_, "dir") => cmp::Ordering::Greater,
 			_ => filename_order(&left.name, &right.name),
 		});
 		markdown.push_str("## Contents\n\n```\n");

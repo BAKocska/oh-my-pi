@@ -1,8 +1,11 @@
 //! Shared credential-free HTML search codec.
 
+use std::str;
+
 use bytes::{Bytes, BytesMut};
 use omp_catalog::OperationKind;
 use omp_core::{Str, sf};
+use url::Url;
 
 use crate::{
 	answer::{AnswerBody, SearchResult, SearchResults},
@@ -39,7 +42,7 @@ impl Codec for ScraperSearchCodec {
 		let OperationCall::Search(request) = operation else {
 			return Err(error(ErrorKind::CodecMismatch, "scraper_search_operation_required"));
 		};
-		let mut url = url::Url::parse(context.route.endpoint.base_url.as_str())
+		let mut url = Url::parse(context.route.endpoint.base_url.as_str())
 			.map_err(|_| error(ErrorKind::InvalidRequest, "scraper_search_url_invalid"))?;
 		let path = match self.style {
 			ScraperStyle::DuckDuckGo => "/html/",
@@ -126,7 +129,7 @@ impl Decoder for ScraperDecoder {
 			return Ok(());
 		}
 		self.finished = true;
-		let html = std::str::from_utf8(&self.buffer).map_err(|_| {
+		let html = str::from_utf8(&self.buffer).map_err(|_| {
 			error(ErrorKind::ProviderContractMismatch, "scraper_search_response_not_utf8")
 		})?;
 		if challenged(html) {

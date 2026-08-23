@@ -1,12 +1,11 @@
 //! Encryption-key sources for persistent credentials.
 
-#[cfg(target_os = "macos")]
-use std::str;
 use std::{
-	fmt,
-	fs::{File, OpenOptions},
+	fmt::{self, Display},
+	fs::{self, File, OpenOptions},
 	io::{self, Read as _, Write as _},
 	path::{Path, PathBuf},
+	str,
 	sync::Arc,
 };
 
@@ -40,7 +39,7 @@ impl fmt::Debug for KeyId {
 	}
 }
 
-impl fmt::Display for KeyId {
+impl Display for KeyId {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.as_str())
 	}
@@ -315,7 +314,7 @@ impl FileCredentialKeySource {
 		file
 			.set_permissions({
 				use std::os::unix::fs::PermissionsExt as _;
-				std::fs::Permissions::from_mode(0o600)
+				fs::Permissions::from_mode(0o600)
 			})
 			.map_err(|source| FileKeyError::Io { path: path.to_path_buf(), source })?;
 		let mut material = Zeroizing::new(Vec::new());
@@ -510,6 +509,8 @@ impl KeySource for OsCredentialKeySource {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use super::{
 		FallbackKeySource, FileCredentialKeySource, FileKeyError, HeadlessKeySource, KeyId, KeySource,
 	};
@@ -561,7 +562,7 @@ mod tests {
 	fn malformed_file_key_is_rejected_without_replacement() {
 		let directory = tempfile::tempdir().expect("temporary directory");
 		let path = directory.path().join("credentials.key");
-		std::fs::write(&path, b"not-a-key").expect("malformed key");
+		fs::write(&path, b"not-a-key").expect("malformed key");
 		assert!(matches!(
 			FileCredentialKeySource::open(&path),
 			Err(FileKeyError::InvalidFormat { .. })

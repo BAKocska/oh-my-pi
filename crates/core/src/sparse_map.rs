@@ -8,11 +8,12 @@ use std::{
 	fmt,
 	iter::{self, FusedIterator},
 	marker::PhantomData,
+	mem,
 	ops::{Index, IndexMut},
 	slice,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use smol_bitmap::SmolBitmap;
 
 use crate::{sparse_index::TrySparseIndex, sparse_set::SparseSet};
@@ -160,8 +161,8 @@ impl<'de, K: TrySparseIndex + Deserialize<'de>, V: Deserialize<'de>> Deserialize
 					while let Some((index, value)) = seq.next_element::<(K, V)>()? {
 						let index = index.index();
 						if prev_index.is_some_and(|prev| prev >= index) {
-							return Err(serde::de::Error::invalid_value(
-								serde::de::Unexpected::Unsigned(index as u64),
+							return Err(de::Error::invalid_value(
+								de::Unexpected::Unsigned(index as u64),
 								&"indices must be in ascending order",
 							));
 						}
@@ -180,12 +181,12 @@ impl<'de, K: TrySparseIndex + Deserialize<'de>, V: Deserialize<'de>> Deserialize
 			// values (or panic in insert/remove) if the packed vector length does
 			// not equal the number of set bits.
 			if bits.count_ones() != values.len() {
-				return Err(serde::de::Error::invalid_length(
+				return Err(de::Error::invalid_length(
 					values.len(),
 					&"as many values as set bits in the occupancy bitmap",
 				));
 			}
-			K::validate_sorted(bits.iter()).map_err(serde::de::Error::custom)?;
+			K::validate_sorted(bits.iter()).map_err(de::Error::custom)?;
 			Ok(Self { bits, values, _phantom: PhantomData })
 		}
 	}
@@ -457,7 +458,7 @@ impl<K: TrySparseIndex, V> SparseMap<K, V> {
 			None
 		} else {
 			// Existing entry - replace value
-			Some(std::mem::replace(&mut self.values[pos], value))
+			Some(mem::replace(&mut self.values[pos], value))
 		}
 	}
 

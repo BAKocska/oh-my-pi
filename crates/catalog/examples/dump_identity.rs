@@ -1,7 +1,10 @@
 //! Dumps normalized model identities as deterministic TSV for regenerating
 //! `compat/`; see `compat/README.md`.
 
-use std::io::{self, Write};
+use std::{
+	error,
+	io::{self, Write},
+};
 
 use omp_catalog::{ClassificationInput, ClassificationPhase, classify};
 use serde::Deserialize;
@@ -28,7 +31,7 @@ struct Behavior {
 	thinking: Option<serde::de::IgnoredAny>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn error::Error>> {
 	let fixture: Fixture<'_> = serde_json::from_str(MODELS)?;
 	let stdout = io::stdout();
 	let mut output = io::BufWriter::new(stdout.lock());

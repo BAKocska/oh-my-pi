@@ -2,9 +2,10 @@
 #[path = "support/descriptors.rs"]
 mod descriptors;
 
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use descriptors::{DescriptorShape, MessageShape, shape};
+use omp_inference::codec::{cursor, devin};
 use prost_types::FileDescriptorSet;
 use serde::Deserialize;
 
@@ -70,7 +71,7 @@ fn recovered_cursor_and_devin_schemas_are_wire_compatible() {
 	verify_provider(
 		"cursor",
 		&cursor_recovered,
-		&omp_inference::codec::cursor::descriptor_set().expect("replacement Cursor descriptors"),
+		&cursor::descriptor_set().expect("replacement Cursor descriptors"),
 		&fixture.providers.cursor,
 	);
 
@@ -87,7 +88,7 @@ fn recovered_cursor_and_devin_schemas_are_wire_compatible() {
 	verify_provider(
 		"devin",
 		&devin_recovered,
-		&omp_inference::codec::devin::descriptor_set().expect("replacement Devin descriptors"),
+		&devin::descriptor_set().expect("replacement Devin descriptors"),
 		&fixture.providers.devin,
 	);
 }
@@ -183,7 +184,7 @@ fn resolve_enum<'a>(
 	recovered: &'a DescriptorShape,
 	short_name: &str,
 	values: &[OmittedValue],
-) -> &'a std::collections::BTreeSet<(i32, String)> {
+) -> &'a BTreeSet<(i32, String)> {
 	let suffix = format!(".{short_name}");
 	let mut matches = recovered.enums.iter().filter(|(full_name, descriptor)| {
 		(*full_name == short_name || full_name.ends_with(&suffix))

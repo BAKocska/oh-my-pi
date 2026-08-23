@@ -7,12 +7,13 @@
 use core::{
 	borrow::Borrow,
 	cmp::Ordering,
-	fmt,
+	fmt::{self, Display},
 	hash::{Hash, Hasher},
 	ops::{Bound, Deref, RangeBounds},
 };
 
 use bytes::{Bytes, BytesMut};
+use serde::de;
 
 /// Clone-on-write byte slice with `Bytes` as the owned variant.
 ///
@@ -682,21 +683,21 @@ impl<'a, 'de: 'a> serde::de::Visitor<'de> for CowBytesVisitor<'a> {
 
 	fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
 	where
-		E: serde::de::Error,
+		E: de::Error,
 	{
 		Ok(CowBytes::Borrowed(value))
 	}
 
 	fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
 	where
-		E: serde::de::Error,
+		E: de::Error,
 	{
 		Ok(CowBytes::copy_from_slice(value))
 	}
 
 	fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
 	where
-		E: serde::de::Error,
+		E: de::Error,
 	{
 		Ok(CowBytes::Owned(Bytes::from(value)))
 	}
@@ -714,21 +715,21 @@ impl<'a, 'de: 'a> serde::de::Visitor<'de> for CowBytesVisitor<'a> {
 
 	fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
 	where
-		E: serde::de::Error,
+		E: de::Error,
 	{
 		Ok(CowBytes::Borrowed(value.as_bytes()))
 	}
 
 	fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
 	where
-		E: serde::de::Error,
+		E: de::Error,
 	{
 		Ok(CowBytes::copy_from_slice(value.as_bytes()))
 	}
 
 	fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
 	where
-		E: serde::de::Error,
+		E: de::Error,
 	{
 		Ok(CowBytes::Owned(Bytes::from(value.into_bytes())))
 	}
@@ -750,7 +751,7 @@ impl fmt::Debug for CowBytes<'_> {
 	}
 }
 
-impl fmt::Display for CowBytes<'_> {
+impl Display for CowBytes<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "{:?}", self.as_slice())
 	}

@@ -1,8 +1,9 @@
 //! Tokio child-process SDK for the `omp rpc` stdio protocol.
 
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	ffi::OsString,
+	fmt, io, mem,
 	path::PathBuf,
 	process::Stdio,
 	sync::{
@@ -17,8 +18,13 @@ use serde_json::{Map, Value, json};
 use tokio::{
 	io::{AsyncReadExt as _, AsyncWriteExt as _},
 	process::{Child, Command},
-	sync::{Mutex, RwLock, broadcast, oneshot, watch},
+	sync::{
+		Mutex, RwLock,
+		broadcast::{self, Receiver},
+		oneshot, watch,
+	},
 	task::JoinHandle,
+	time,
 };
 
 use crate::{
@@ -27,9 +33,9 @@ use crate::{
 		encode_content_length, encode_json_v2,
 	},
 	protocol::{
-		Environment, EventCategory, ExtensionUiResponse, HostToolCall, HostToolCancel,
-		HostToolDefinition, HostToolResult, HostToolUpdate, HostUriCancel, HostUriContentType,
-		HostUriOperation, HostUriRequest, HostUriResult, HostUriScheme,
+		Environment, EventCategory, ExtensionUiRequest, ExtensionUiResponse, HostToolCall,
+		HostToolCancel, HostToolDefinition, HostToolResult, HostToolUpdate, HostUriCancel,
+		HostUriContentType, HostUriOperation, HostUriRequest, HostUriResult, HostUriScheme,
 		MAX_HOST_URI_DESCRIPTION_BYTES, MAX_HOST_URI_SCHEME_BYTES, MAX_HOST_URI_SCHEMES,
 		NegotiateProtocolParams, NegotiateProtocolResult, NewSessionParams, OAuthProvider,
 		PROTOCOL_V1, PROTOCOL_V2, PromptParams, ProtocolVersion, ReadyFrame, RequestId,
@@ -94,7 +100,7 @@ pub enum ClientError {
 	Disconnected(String),
 	/// Starting or communicating with the child failed.
 	#[error("RPC I/O failed: {0}")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// Physical or logical framing failed.
 	#[error("RPC framing failed: {0}")]
 	Framing(#[from] FramingError),
@@ -149,38 +155,70 @@ impl HostToolError {
 	}
 }
 
-/// Context passed to a host-tool handler.
-#[derive(Clone, Debug)]
-pub struct HostToolContext {
-	/// Model tool-call identifier.
-	pub tool_call_id: String,
-	cancellation:     watch::Receiver<bool>,
-	updates:          flume::Sender<Value>,
-}
+mod host_context {
+	use serde_json::Value;
+	use tokio::sync::watch::Receiver;
 
-impl HostToolContext {
-	/// Returns whether the server cancelled this invocation.
-	pub fn is_cancelled(&self) -> bool {
-		*self.cancellation.borrow()
+	/// Context passed to a host-tool handler.
+	#[derive(Clone, Debug)]
+	pub struct HostToolContext {
+		/// Model tool-call identifier.
+		pub tool_call_id:        String,
+		pub(super) cancellation: Receiver<bool>,
+		pub(super) updates:      flume::Sender<Value>,
 	}
 
-	/// Resolves when the server cancels this invocation.
-	pub async fn cancelled(&mut self) {
-		if *self.cancellation.borrow() {
-			return;
+	impl HostToolContext {
+		/// Returns whether the server cancelled this invocation.
+		pub fn is_cancelled(&self) -> bool {
+			*self.cancellation.borrow()
 		}
-		while self.cancellation.changed().await.is_ok() {
+
+		/// Resolves when the server cancels this invocation.
+		pub async fn cancelled(&mut self) {
 			if *self.cancellation.borrow() {
 				return;
 			}
+			while self.cancellation.changed().await.is_ok() {
+				if *self.cancellation.borrow() {
+					return;
+				}
+			}
+		}
+
+		/// Streams an application-native partial result to the server.
+		pub fn send_update(&self, partial_result: Value) -> Result<(), flume::SendError<Value>> {
+			self.updates.send(partial_result)
 		}
 	}
 
-	/// Streams an application-native partial result to the server.
-	pub fn send_update(&self, partial_result: Value) -> Result<(), flume::SendError<Value>> {
-		self.updates.send(partial_result)
+	/// Context passed to a host-resource handler.
+	#[derive(Clone, Debug)]
+	pub struct HostUriContext {
+		pub(super) cancellation: Receiver<bool>,
+	}
+
+	impl HostUriContext {
+		/// Returns whether the server cancelled this operation.
+		pub fn is_cancelled(&self) -> bool {
+			*self.cancellation.borrow()
+		}
+
+		/// Resolves when the server cancels this operation.
+		pub async fn cancelled(&mut self) {
+			if *self.cancellation.borrow() {
+				return;
+			}
+			while self.cancellation.changed().await.is_ok() {
+				if *self.cancellation.borrow() {
+					return;
+				}
+			}
+		}
 	}
 }
+
+pub use host_context::{HostToolContext, HostUriContext};
 
 /// Host-tool implementation stored by the SDK.
 ///
@@ -220,8 +258,8 @@ pub struct ClientHostTool {
 	pub handler:    Arc<dyn HostToolHandler>,
 }
 
-impl std::fmt::Debug for ClientHostTool {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ClientHostTool {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("ClientHostTool")
 			.field("definition", &self.definition)
@@ -236,31 +274,6 @@ impl ClientHostTool {
 		H: HostToolHandler,
 	{
 		Self { definition, handler: Arc::new(handler) }
-	}
-}
-
-/// Context passed to a host-resource handler.
-#[derive(Clone, Debug)]
-pub struct HostUriContext {
-	cancellation: watch::Receiver<bool>,
-}
-
-impl HostUriContext {
-	/// Returns whether the server cancelled this operation.
-	pub fn is_cancelled(&self) -> bool {
-		*self.cancellation.borrow()
-	}
-
-	/// Resolves when the server cancels this operation.
-	pub async fn cancelled(&mut self) {
-		if *self.cancellation.borrow() {
-			return;
-		}
-		while self.cancellation.changed().await.is_ok() {
-			if *self.cancellation.borrow() {
-				return;
-			}
-		}
 	}
 }
 
@@ -339,8 +352,8 @@ pub struct ClientHostUriScheme {
 	pub handler:    Arc<dyn HostUriHandler>,
 }
 
-impl std::fmt::Debug for ClientHostUriScheme {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ClientHostUriScheme {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("ClientHostUriScheme")
 			.field("definition", &self.definition)
@@ -371,13 +384,15 @@ struct HostUriCancellation {
 
 /// Filtered typed subscription over the client's event broadcast.
 pub struct EventStream {
-	receiver: broadcast::Receiver<RpcEvent>,
+	receiver: Receiver<RpcEvent>,
 	category: Option<EventCategory>,
 }
 
 impl EventStream {
 	/// Receives the next matching event.
 	pub async fn recv(&mut self) -> Result<RpcEvent, ClientError> {
+		use tokio::sync::broadcast::error;
+
 		loop {
 			match self.receiver.recv().await {
 				Ok(event)
@@ -388,10 +403,10 @@ impl EventStream {
 					return Ok(event);
 				},
 				Ok(_) => {},
-				Err(broadcast::error::RecvError::Closed) => {
+				Err(error::RecvError::Closed) => {
 					return Err(ClientError::Disconnected("event stream closed".into()));
 				},
-				Err(broadcast::error::RecvError::Lagged(count)) => {
+				Err(error::RecvError::Lagged(count)) => {
 					return Err(ClientError::EventLagged(count));
 				},
 			}
@@ -405,7 +420,7 @@ struct ClientState {
 	writer:             Mutex<Option<flume::Sender<Vec<u8>>>>,
 	pending:            Mutex<HashMap<RequestId, PendingSender>>,
 	events:             broadcast::Sender<RpcEvent>,
-	extension_ui:       broadcast::Sender<crate::protocol::ExtensionUiRequest>,
+	extension_ui:       broadcast::Sender<ExtensionUiRequest>,
 	host_tools:         RwLock<HashMap<String, Arc<dyn HostToolHandler>>>,
 	host_cancellations: Mutex<HashMap<String, watch::Sender<bool>>>,
 	host_uri_schemes:   RwLock<HostUriRegistry>,
@@ -656,15 +671,15 @@ impl ClientState {
 	async fn fail_all(&self, reason: impl Into<String>) {
 		let reason = reason.into();
 		self.ready.lock().await.take();
-		let pending = std::mem::take(&mut *self.pending.lock().await);
+		let pending = mem::take(&mut *self.pending.lock().await);
 		for (_, sender) in pending {
 			let _ = sender.send(Err(ClientError::Disconnected(reason.clone())));
 		}
-		let cancellations = std::mem::take(&mut *self.host_cancellations.lock().await);
+		let cancellations = mem::take(&mut *self.host_cancellations.lock().await);
 		for (_, cancellation) in cancellations {
 			let _ = cancellation.send(true);
 		}
-		let uri_cancellations = std::mem::take(&mut *self.host_uri_active.lock().await);
+		let uri_cancellations = mem::take(&mut *self.host_uri_active.lock().await);
 		for (_, cancellation) in uri_cancellations {
 			let _ = cancellation.sender.send(true);
 		}
@@ -830,7 +845,7 @@ impl RpcClient {
 			writer_task,
 			stderr_task,
 		};
-		let ready = match tokio::time::timeout(options.ready_timeout, ready_rx).await {
+		let ready = match time::timeout(options.ready_timeout, ready_rx).await {
 			Ok(Ok(ready)) => ready,
 			Ok(Err(_)) => {
 				client.shutdown().await?;
@@ -922,7 +937,7 @@ impl RpcClient {
 			self.state.pending.lock().await.remove(&id);
 			return Err(error);
 		}
-		let response = match tokio::time::timeout(timeout, receiver).await {
+		let response = match time::timeout(timeout, receiver).await {
 			Ok(Ok(response)) => response?,
 			Ok(Err(_)) => return Err(ClientError::Disconnected("response dispatcher stopped".into())),
 			Err(_) => {
@@ -1216,7 +1231,7 @@ impl RpcClient {
 		let mut messages = Vec::new();
 		let mut cursor = None;
 		let mut expected_total = None;
-		let mut seen = std::collections::HashSet::new();
+		let mut seen = HashSet::new();
 		loop {
 			let page = self
 				.get_messages_page(TranscriptPageParams { cursor, limit: Some(256) })
@@ -1366,7 +1381,7 @@ impl RpcClient {
 			.collect::<Vec<_>>();
 		let previous = {
 			let mut registry = self.state.host_uri_schemes.write().await;
-			std::mem::replace(&mut *registry, HostUriRegistry { generation, schemes: registered })
+			mem::replace(&mut *registry, HostUriRegistry { generation, schemes: registered })
 		};
 
 		#[derive(serde::Deserialize)]
@@ -1463,7 +1478,7 @@ impl RpcClient {
 	}
 
 	/// Subscribes to extension UI requests, including the OAuth `open_url` seam.
-	pub fn extension_ui_requests(&self) -> broadcast::Receiver<crate::protocol::ExtensionUiRequest> {
+	pub fn extension_ui_requests(&self) -> Receiver<ExtensionUiRequest> {
 		self.state.extension_ui.subscribe()
 	}
 
@@ -1481,7 +1496,7 @@ impl RpcClient {
 				}
 			}
 		};
-		match tokio::time::timeout(timeout, collect).await {
+		match time::timeout(timeout, collect).await {
 			Ok(result) => result,
 			Err(_) => Err(ClientError::EventTimeout),
 		}
@@ -1507,7 +1522,7 @@ impl RpcClient {
 				}
 			}
 		};
-		match tokio::time::timeout(timeout, collect).await {
+		match time::timeout(timeout, collect).await {
 			Ok(result) => result,
 			Err(_) => Err(ClientError::EventTimeout),
 		}
@@ -1527,7 +1542,7 @@ impl RpcClient {
 		let Some(mut child) = child else {
 			return Ok(());
 		};
-		if let Ok(status) = tokio::time::timeout(self.termination_grace, child.wait()).await {
+		if let Ok(status) = time::timeout(self.termination_grace, child.wait()).await {
 			status?;
 		} else {
 			child.start_kill()?;

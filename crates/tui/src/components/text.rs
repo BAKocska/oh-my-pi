@@ -5,10 +5,11 @@ use smallvec::SmallVec;
 use xutf::Text;
 
 use crate::{
-	anim,
+	Frame, UiContext,
+	anim::{self},
 	component::{Component, MemoKey, PaintCtx, Slot, next_slot},
 	frame::{Decor, DecorKind, Rect, Style},
-	markup::{TextWrap, Truncate},
+	markup::{Align, TextWrap, Truncate},
 	props::{Prop, PropValue, Props},
 	rich::{Pipeline, RichSink, RichText, cell_width},
 };
@@ -76,7 +77,7 @@ impl TextLeaf {
 		self
 	}
 
-	fn render(&mut self, ctx: &crate::UiContext, width: u16) {
+	fn render(&mut self, ctx: &UiContext, width: u16) {
 		let width = width.max(1);
 		let style = self.props.style(&ctx.theme);
 		let key = MemoKey::new(self.version, ctx);
@@ -175,7 +176,7 @@ impl Component for TextLeaf {
 		self.slot
 	}
 
-	fn measure(&mut self, _ctx: &crate::UiContext) -> (u16, u16) {
+	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
 		let mut widest_word = 0;
 		let mut total = 0u16;
 		for word in self.text.split_whitespace() {
@@ -192,7 +193,7 @@ impl Component for TextLeaf {
 		(widest_word, natural)
 	}
 
-	fn height(&mut self, ctx: &crate::UiContext, width: u16) -> u16 {
+	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
 		self.render(ctx, width);
 		RichText::rows(&self.rich)
 	}
@@ -229,7 +230,7 @@ impl Component for TextLeaf {
 		}
 	}
 
-	fn set_text(&mut self, _ctx: &crate::UiContext, text: Str) -> bool {
+	fn set_text(&mut self, _ctx: &UiContext, text: Str) -> bool {
 		if self.text == text {
 			return false;
 		}
@@ -411,12 +412,12 @@ impl Component for Pre {
 		self.slot
 	}
 
-	fn measure(&mut self, _ctx: &crate::UiContext) -> (u16, u16) {
+	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
 		let width = self.text.lines().map(cell_width).max().unwrap_or(0);
 		(width, width)
 	}
 
-	fn height(&mut self, _ctx: &crate::UiContext, _width: u16) -> u16 {
+	fn height(&mut self, _ctx: &UiContext, _width: u16) -> u16 {
 		u16::try_from(self.text.lines().count()).unwrap_or(u16::MAX)
 	}
 
@@ -458,7 +459,7 @@ impl Component for Pre {
 		Some(Rect::new(x, content.y, width, height))
 	}
 
-	fn set_text(&mut self, _ctx: &crate::UiContext, text: Str) -> bool {
+	fn set_text(&mut self, _ctx: &UiContext, text: Str) -> bool {
 		if self.text == text {
 			return false;
 		}
@@ -568,16 +569,16 @@ pub(super) fn truncate_rich(
 	}
 }
 
-pub(super) const fn alignment_slack(align: crate::markup::Align, slack: u16) -> u16 {
+pub(super) const fn alignment_slack(align: Align, slack: u16) -> u16 {
 	match align {
-		crate::markup::Align::Start => 0,
-		crate::markup::Align::Center => slack / 2,
-		crate::markup::Align::End => slack,
+		Align::Start => 0,
+		Align::Center => slack / 2,
+		Align::End => slack,
 	}
 }
 
 pub(super) fn put_clipped(
-	frame: &mut crate::Frame,
+	frame: &mut Frame,
 	x: u16,
 	y: u16,
 	right: u16,
@@ -592,12 +593,7 @@ pub(super) fn put_clipped(
 	frame.put(x, y, visible, style)
 }
 
-pub(super) fn paint_rich(
-	pc: &mut PaintCtx<'_>,
-	rect: Rect,
-	rich: &RichText,
-	align: crate::markup::Align,
-) {
+pub(super) fn paint_rich(pc: &mut PaintCtx<'_>, rect: Rect, rich: &RichText, align: Align) {
 	let right = rect.x.saturating_add(rect.width);
 	let clip = pc.clip.min(rect.y.saturating_add(rect.height));
 	// Only rows spanning the whole physical line can byte-join through
@@ -629,8 +625,8 @@ fn paint_rich_shimmer(
 	pc: &mut PaintCtx<'_>,
 	text_rect: Rect,
 	rich: &RichText,
-	align: crate::markup::Align,
-	period: std::time::Duration,
+	align: Align,
+	period: Duration,
 ) {
 	if pc.ctx.native_decor {
 		paint_rich(pc, text_rect, rich, align);

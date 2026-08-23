@@ -1,11 +1,14 @@
 //! Durable session substrate behavior tests.
 
-use std::io::Write as _;
+use std::{env, fs, fs::OpenOptions, io::Write as _};
 
 use omp_core::{Str, sf};
-use omp_storage::transcript::{
-	DiagnosticKind, Event, Header, Kind, MAX_PERSISTED_CHARS, Msg, SessionId, UserBlock, Writer,
-	import::import_pi_file, load, visit_batched,
+use omp_storage::{
+	transcript,
+	transcript::{
+		DiagnosticKind, Event, Header, Kind, MAX_PERSISTED_CHARS, Msg, SessionId, UserBlock, Writer,
+		import::import_pi_file, load, visit_batched,
+	},
 };
 use tempfile::tempdir;
 use xutf::Utf8;
@@ -15,7 +18,7 @@ fn header() -> Header {
 		v:       4,
 		id:      SessionId(sf!("session-p1")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	}
 }
 
@@ -70,7 +73,7 @@ fn bounded_visitor_preserves_indexes_and_reports_malformed_tail() {
 		.collect::<Vec<_>>();
 	writer.append_many(&events).expect("append large batch");
 	drop(writer);
-	let mut file = std::fs::OpenOptions::new()
+	let mut file = OpenOptions::new()
 		.append(true)
 		.open(&path)
 		.expect("open tail");
@@ -112,7 +115,7 @@ fn pi_v1_import_retains_source_and_records_dropped_fields() {
 		r#"{"type":"message","timestamp":2,"message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
 		"\n",
 	);
-	std::fs::write(&source, bytes).expect("write source");
+	fs::write(&source, bytes).expect("write source");
 	let report = import_pi_file(&source, &destination, &header()).expect("import pi v1");
 	assert_eq!(std::fs::read(&source).expect("source remains"), bytes.as_bytes());
 	assert_eq!(report.migration.source_version, 1);
@@ -139,8 +142,7 @@ fn unicode_truncation_preserves_newlines_and_is_replay_stable() {
 		.expect("append oversized message");
 	drop(writer);
 	let first_log = load(&first).expect("load bounded message");
-	let omp_storage::transcript::Entry::Ok(first_event) = first_log.get(0).expect("first event")
-	else {
+	let transcript::Entry::Ok(first_event) = first_log.get(0).expect("first event") else {
 		panic!("decoded event")
 	};
 	let persisted = message_text(first_event);
@@ -151,8 +153,7 @@ fn unicode_truncation_preserves_newlines_and_is_replay_stable() {
 	replay.append(first_event).expect("replay bounded event");
 	drop(replay);
 	let replay_log = load(&second).expect("load replay");
-	let omp_storage::transcript::Entry::Ok(replayed) = replay_log.get(0).expect("replayed event")
-	else {
+	let transcript::Entry::Ok(replayed) = replay_log.get(0).expect("replayed event") else {
 		panic!("decoded replay")
 	};
 	assert_eq!(message_text(replayed), persisted);

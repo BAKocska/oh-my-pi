@@ -1,6 +1,7 @@
 //! Bounded owned realtime session construction and typed control receipts.
 
 use std::{
+	fmt,
 	future::Future,
 	sync::{
 		Arc,
@@ -10,11 +11,12 @@ use std::{
 	time::SystemTime,
 };
 
+use flume::Receiver;
 use tower::Service;
 
 use crate::{
 	answer::{Answer, AnswerBody, RealtimeEvent, RealtimeInput, RealtimeSession},
-	call::{OperationCall, RealtimeModality, RealtimeRequest},
+	call::{Call, OperationCall, RealtimeModality, RealtimeRequest},
 	catalog::OperationKind,
 	error::Error,
 	operation::{
@@ -111,14 +113,14 @@ pub struct RealtimeSendReceipt {
 
 /// Provider-side endpoint paired with an owned caller session.
 pub struct RealtimeProviderEndpoint {
-	input:         flume::Receiver<RealtimeInput>,
-	output:        flume::Sender<Result<RealtimeEvent, crate::error::Error>>,
+	input:         Receiver<RealtimeInput>,
+	output:        flume::Sender<Result<RealtimeEvent, Error>>,
 	closed:        Arc<AtomicBool>,
 	terminal_sent: bool,
 }
 
-impl std::fmt::Debug for RealtimeProviderEndpoint {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for RealtimeProviderEndpoint {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("RealtimeProviderEndpoint")
 			.field("closed", &self.closed.load(Ordering::Acquire))
@@ -204,9 +206,7 @@ impl RealtimeSession {
 	}
 
 	/// Receives the next provider event without buffering it elsewhere.
-	pub async fn recv(
-		&self,
-	) -> Result<Result<RealtimeEvent, crate::error::Error>, RealtimeSessionError> {
+	pub async fn recv(&self) -> Result<Result<RealtimeEvent, Error>, RealtimeSessionError> {
 		let event = self
 			.inbound
 			.recv_async()
@@ -232,7 +232,7 @@ impl RealtimeProviderEndpoint {
 	/// Attempts to publish one provider event immediately.
 	pub fn try_send(
 		&mut self,
-		event: Result<RealtimeEvent, crate::error::Error>,
+		event: Result<RealtimeEvent, Error>,
 	) -> Result<(), RealtimeSessionError> {
 		if self.terminal_sent {
 			return Err(RealtimeSessionError::AlreadyClosed);
@@ -257,7 +257,7 @@ impl RealtimeProviderEndpoint {
 	/// available.
 	pub async fn send(
 		&mut self,
-		event: Result<RealtimeEvent, crate::error::Error>,
+		event: Result<RealtimeEvent, Error>,
 	) -> Result<(), RealtimeSessionError> {
 		if self.terminal_sent {
 			return Err(RealtimeSessionError::AlreadyClosed);
@@ -351,7 +351,7 @@ impl<S> RealtimeService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for RealtimeService<S>
+impl<S> Service<Call> for RealtimeService<S>
 where
 	S: Service<
 			OperationRequest<RealtimeRequest>,
@@ -369,7 +369,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::Realtime(request) => Some(Arc::clone(request)),
 			_ => None,

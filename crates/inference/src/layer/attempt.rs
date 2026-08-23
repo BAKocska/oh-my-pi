@@ -2,11 +2,10 @@
 //! retry.
 
 use std::{
-	mem,
+	future, mem,
 	task::{Context, Poll},
 };
 
-use futures::future::poll_fn;
 use tower::{Layer, Service};
 
 use crate::{
@@ -122,7 +121,7 @@ where
 				}
 				reentries += 1;
 				request.context.set_attempt_action(action);
-				poll_fn(|cx| service.poll_ready(cx)).await?;
+				future::poll_fn(|cx| service.poll_ready(cx)).await?;
 			}
 		}
 	}

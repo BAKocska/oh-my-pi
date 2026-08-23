@@ -1,7 +1,7 @@
 //! Cursor browser login with bounded PKCE polling.
 
 use std::{
-	fmt,
+	fmt, mem,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -18,6 +18,8 @@ use omp_catalog::provider::OAuthExchangeKind;
 use omp_core::{ExposeSecret, SecretString, Str, base64_url, sf};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+#[cfg(test)]
+use url::Url;
 use zeroize::Zeroizing;
 
 use super::super::{
@@ -238,7 +240,7 @@ impl fmt::Debug for CursorHandler {
 struct CursorPending {
 	verifier:      SecretString,
 	uuid:          String,
-	authorize_url: omp_core::Str,
+	authorize_url: Str,
 }
 
 impl fmt::Debug for CursorPending {
@@ -281,9 +283,9 @@ fn cursor_token_response(
 			fallback_refresh.ok_or(OAuthError::MalformedResponse)?
 		} else {
 			let mut refresh = Zeroizing::new(parsed.refresh_token.to_owned());
-			SecretString::from(std::mem::take(&mut *refresh))
+			SecretString::from(mem::take(&mut *refresh))
 		};
-		(SecretString::from(std::mem::take(&mut *access)), refresh)
+		(SecretString::from(mem::take(&mut *access)), refresh)
 	};
 	let expires_in = Some(cursor_token_lifetime(access_token.expose_secret(), now));
 	Ok(OAuthTokenSet {
@@ -365,7 +367,10 @@ mod tests {
 	use omp_core::ExposeSecret;
 	use parking_lot::Mutex;
 
-	use super::*;
+	use super::{
+		super::super::{OAuthClientSpec, OAuthTransportError},
+		*,
+	};
 	use crate::{
 		auth::{
 			CredentialSourceSpec, OAuthParameter, OAuthPollingSpec, OAuthRefreshSpec,
@@ -415,7 +420,7 @@ mod tests {
 		fn execute(
 			&self,
 			request: OAuthHttpRequest,
-		) -> BoxFuture<'_, Result<OAuthHttpResponse, super::super::super::OAuthTransportError>> {
+		) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
 			let (method, url, ..) = request.into_parts();
 			self.requests.lock().push((method, url.to_string()));
 			let step = self
@@ -430,15 +435,15 @@ mod tests {
 						headers: HeaderMap::new(),
 						body: SecretString::from(body),
 					}),
-					HttpStep::Transport => Err(super::super::super::OAuthTransportError),
+					HttpStep::Transport => Err(OAuthTransportError),
 				}
 			}
 			.boxed()
 		}
 	}
 
-	fn client() -> super::super::super::OAuthClientSpec {
-		super::super::super::OAuthClientSpec {
+	fn client() -> OAuthClientSpec {
+		OAuthClientSpec {
 			sources:      vec![CredentialSourceSpec::Interactive],
 			client_id:    "".into(),
 			refresh:      OAuthRefreshSpec::Unsupported,
@@ -506,7 +511,7 @@ mod tests {
 		else {
 			panic!("expected authorization URL")
 		};
-		let authorize_url = url::Url::parse(&authorize_url).expect("valid authorization URL");
+		let authorize_url = Url::parse(&authorize_url).expect("valid authorization URL");
 		let query = authorize_url.query_pairs().collect::<Vec<_>>();
 		let verifier = base64_url::encode_raw(&(0_u8..32).collect::<Vec<_>>()).into_string();
 		let challenge = base64_url::encode_raw(&Sha256::digest(verifier.as_bytes())).into_string();
@@ -522,7 +527,7 @@ mod tests {
 		assert_eq!(requests.len(), 6);
 		for (method, request_url) in requests.iter() {
 			assert_eq!(*method, Method::GET);
-			let request_url = url::Url::parse(request_url).expect("poll URL");
+			let request_url = Url::parse(request_url).expect("poll URL");
 			assert_eq!(request_url.path(), "/auth/poll");
 			assert_eq!(request_url.query_pairs().collect::<Vec<_>>(), vec![
 				("uuid".into(), "20212223-2425-4627-a829-2a2b2c2d2e2f".into()),

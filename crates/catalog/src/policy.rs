@@ -2,7 +2,8 @@
 
 use std::{
 	collections::{BTreeMap, btree_map},
-	fmt,
+	error,
+	fmt::{self, Display},
 	time::Duration,
 };
 
@@ -790,7 +791,7 @@ pub enum HeaderPolicyError {
 	DuplicateName(Str),
 }
 
-impl fmt::Display for HeaderPolicyError {
+impl Display for HeaderPolicyError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::InvalidName(name) => write!(formatter, "invalid static header name `{name}`"),
@@ -803,7 +804,7 @@ impl fmt::Display for HeaderPolicyError {
 	}
 }
 
-impl std::error::Error for HeaderPolicyError {}
+impl error::Error for HeaderPolicyError {}
 
 impl HeaderProfile {
 	/// Validates, lowercases, canonically orders, and interns static headers.

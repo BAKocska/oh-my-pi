@@ -2,8 +2,10 @@ use omp_core::{IntoStr, Str};
 
 use super::text::{append, paint_rich, truncate_rich};
 use crate::{
+	UiContext,
 	component::{Component, MemoKey, PaintCtx, Slot, next_slot},
 	frame::Rect,
+	latex,
 	props::{Prop, PropValue, Props},
 	rich::{Measure, RichText},
 };
@@ -52,7 +54,7 @@ impl Latex {
 		self
 	}
 
-	fn render(&mut self, ctx: &crate::UiContext, width: u16) {
+	fn render(&mut self, ctx: &UiContext, width: u16) {
 		let width = width.max(1);
 		let key = MemoKey::new(self.version, ctx);
 		if self.cached_width == width && self.cached == Some(key) {
@@ -60,8 +62,8 @@ impl Latex {
 		}
 		let style = self.props.style(&ctx.theme);
 		self.rich.clear();
-		if !crate::latex::latex_block(&self.text, style, &mut self.rich) {
-			crate::latex::latex_inline(&self.text, style, &mut self.rich);
+		if !latex::latex_block(&self.text, style, &mut self.rich) {
+			latex::latex_inline(&self.text, style, &mut self.rich);
 		}
 		truncate_rich(&mut self.rich, width, style, self.props.truncate());
 		self.cached_width = width;
@@ -88,17 +90,17 @@ impl Component for Latex {
 		self.slot
 	}
 
-	fn measure(&mut self, ctx: &crate::UiContext) -> (u16, u16) {
+	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {
 		let style = self.props.style(&ctx.theme);
 		let mut measure = Measure::default();
-		if !crate::latex::latex_block(&self.text, style, &mut measure) {
-			crate::latex::latex_inline(&self.text, style, &mut measure);
+		if !latex::latex_block(&self.text, style, &mut measure) {
+			latex::latex_inline(&self.text, style, &mut measure);
 		}
 		let width = measure.widest.max(1);
 		(width, width)
 	}
 
-	fn height(&mut self, ctx: &crate::UiContext, width: u16) -> u16 {
+	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
 		self.render(ctx, width);
 		RichText::rows(&self.rich)
 	}
@@ -108,7 +110,7 @@ impl Component for Latex {
 		paint_rich(pc, rect, &self.rich, self.props.align());
 	}
 
-	fn set_text(&mut self, _ctx: &crate::UiContext, text: Str) -> bool {
+	fn set_text(&mut self, _ctx: &UiContext, text: Str) -> bool {
 		if self.text == text {
 			return false;
 		}

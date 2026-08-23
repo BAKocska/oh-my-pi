@@ -1,5 +1,7 @@
 //! Pure exact and fuzzy text replacement over immutable byte snapshots.
 
+use std::{iter, mem, str};
+
 use bytes::{Bytes, BytesMut};
 use omp_core::Str;
 use xutf::IntoUnicodeNormalized as _;
@@ -325,7 +327,7 @@ fn no_match_error(
 		};
 	};
 	let actual_text =
-		std::str::from_utf8(&closest.actual_text).expect("match candidates are valid UTF-8");
+		str::from_utf8(&closest.actual_text).expect("match candidates are valid UTF-8");
 	let (expected_line, actual_line) = first_different_line(search_text, actual_text);
 	let similarity_percent = closest.confidence * 100.0;
 	if !options.allow_fuzzy {
@@ -510,7 +512,7 @@ pub fn levenshtein_distance(a: &str, b: &str) -> usize {
 				.min(current[j] + 1)
 				.min(previous[j] + cost);
 		}
-		std::mem::swap(&mut previous, &mut current);
+		mem::swap(&mut previous, &mut current);
 	}
 	previous[b.len()]
 }
@@ -1381,7 +1383,7 @@ fn convert_leading_tabs_to_spaces(text: &str, spaces_per_tab: usize) -> String {
 		if trimmed.is_empty() || !leading.contains('\t') || leading.contains(' ') {
 			output.push_str(line);
 		} else {
-			output.extend(std::iter::repeat_n(' ', leading.len() * spaces_per_tab));
+			output.extend(iter::repeat_n(' ', leading.len() * spaces_per_tab));
 			output.push_str(trimmed);
 		}
 	}
@@ -1435,7 +1437,7 @@ fn apply_indent_delta(text: &str, delta: isize, indent: u8) -> String {
 		if line.trim().is_empty() {
 			output.push_str(line);
 		} else if delta > 0 {
-			output.extend(std::iter::repeat_n(indent as char, delta as usize));
+			output.extend(iter::repeat_n(indent as char, delta as usize));
 			output.push_str(line);
 		} else {
 			let remove = (-delta) as usize;
@@ -1484,7 +1486,7 @@ struct NormalizedBase {
 }
 
 fn normalize_base(base: &[u8]) -> Result<NormalizedBase, ReplaceError> {
-	let exact = std::str::from_utf8(base).map_err(|_| ReplaceError::InvalidUtf8)?;
+	let exact = str::from_utf8(base).map_err(|_| ReplaceError::InvalidUtf8)?;
 	let bom_len = usize::from(exact.starts_with('\u{feff}')) * '\u{feff}'.len_utf8();
 	let body = &exact[bom_len..];
 	let ending = detect_line_ending(body);
@@ -1619,7 +1621,7 @@ pub fn apply_replace(
 				break;
 			}
 			let found = outcome.matched.expect("match presence checked");
-			let actual = std::str::from_utf8(&found.actual_text).expect("match slices valid UTF-8");
+			let actual = str::from_utf8(&found.actual_text).expect("match slices valid UTF-8");
 			let adjusted = adjust_indentation(old, actual, new);
 			if adjusted.as_bytes() == found.actual_text.as_ref() {
 				break;
@@ -1645,7 +1647,7 @@ pub fn apply_replace(
 			return Err(no_match_error(&outcome, old, options));
 		}
 		let found = outcome.matched.expect("match presence checked");
-		let actual = std::str::from_utf8(&found.actual_text).expect("match slices valid UTF-8");
+		let actual = str::from_utf8(&found.actual_text).expect("match slices valid UTF-8");
 		let adjusted = adjust_indentation(old, actual, new);
 		normalized_edits.push((found.start, found.end(), adjusted));
 	}

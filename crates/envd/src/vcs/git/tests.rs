@@ -1,6 +1,7 @@
-use std::{path::Path, process::Command, time::Duration};
+use std::{fs, path::Path, process::Command, time::Duration};
 
 use bytes::Bytes;
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -39,7 +40,7 @@ fn repository_fixture() -> tempfile::TempDir {
 	fixture_git(root.path(), &["init", "-b", "main"]);
 	fixture_git(root.path(), &["config", "user.name", "OMP Test"]);
 	fixture_git(root.path(), &["config", "user.email", "omp@example.invalid"]);
-	std::fs::write(root.path().join("seed.txt"), "seed\n").expect("seed file");
+	fs::write(root.path().join("seed.txt"), "seed\n").expect("seed file");
 	fixture_git(root.path(), &["add", "seed.txt"]);
 	fixture_git(root.path(), &["commit", "-m", "seed"]);
 	root
@@ -80,7 +81,7 @@ async fn linked_worktrees_share_primary_root_and_fair_operation_lock() {
 		.await
 		.expect("first bounded read");
 	let second_read =
-		tokio::time::timeout(Duration::from_millis(100), lock::read(&linked_repository, &cancel))
+		time::timeout(Duration::from_millis(100), lock::read(&linked_repository, &cancel))
 			.await
 			.expect("bounded reads should overlap")
 			.expect("second bounded read");
@@ -107,7 +108,7 @@ async fn linked_worktrees_share_primary_root_and_fair_operation_lock() {
 		"linked-worktree writer must wait for the primary writer"
 	);
 	drop(writer);
-	tokio::time::timeout(Duration::from_secs(1), acquired_rx.recv_async())
+	time::timeout(Duration::from_secs(1), acquired_rx.recv_async())
 		.await
 		.expect("queued writer should acquire after release")
 		.expect("acquisition signal");
@@ -128,8 +129,7 @@ async fn linked_worktrees_share_primary_root_and_fair_operation_lock() {
 #[tokio::test]
 async fn malformed_git_and_escaping_commondir_pointers_are_rejected() {
 	let fixture = tempfile::tempdir().expect("temporary pointer fixture");
-	std::fs::write(fixture.path().join(".git"), "gitdir: one\ntrailing\n")
-		.expect("malformed marker");
+	fs::write(fixture.path().join(".git"), "gitdir: one\ntrailing\n").expect("malformed marker");
 	assert!(matches!(
 		repo::discover(fixture.path()).await,
 		Err(RepositoryError::InvalidPointer { .. })
@@ -138,12 +138,12 @@ async fn malformed_git_and_escaping_commondir_pointers_are_rejected() {
 	let linked = tempfile::tempdir().expect("linked pointer fixture");
 	let admin = linked.path().join("admin");
 	let escaped = linked.path().join("escaped");
-	std::fs::create_dir_all(&admin).expect("admin directory");
-	std::fs::create_dir_all(&escaped).expect("escaped directory");
-	std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").expect("admin HEAD");
-	std::fs::write(escaped.join("HEAD"), "ref: refs/heads/main\n").expect("escaped HEAD");
-	std::fs::write(admin.join("commondir"), "../escaped\n").expect("escaping commondir");
-	std::fs::write(linked.path().join(".git"), "gitdir: admin\n").expect("gitdir pointer");
+	fs::create_dir_all(&admin).expect("admin directory");
+	fs::create_dir_all(&escaped).expect("escaped directory");
+	fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").expect("admin HEAD");
+	fs::write(escaped.join("HEAD"), "ref: refs/heads/main\n").expect("escaped HEAD");
+	fs::write(admin.join("commondir"), "../escaped\n").expect("escaping commondir");
+	fs::write(linked.path().join(".git"), "gitdir: admin\n").expect("gitdir pointer");
 	assert!(matches!(
 		repo::discover(linked.path()).await,
 		Err(RepositoryError::InvalidPointer { .. })
@@ -191,7 +191,7 @@ fn runner_builds_fixed_read_only_argv_and_sanitized_environment() {
 #[tokio::test]
 async fn runner_preserves_utf8_names_and_reports_missing_git_and_deleted_cwd() {
 	let fixture = repository_fixture();
-	std::fs::write(fixture.path().join("café.txt"), "coffee\n").expect("UTF-8 filename");
+	fs::write(fixture.path().join("café.txt"), "coffee\n").expect("UTF-8 filename");
 	fixture_git(fixture.path(), &["add", "café.txt"]);
 	let runner = GitRunner::new(ExecHost::new());
 	let cancel = CancellationToken::new();
@@ -290,10 +290,10 @@ async fn runner_caps_each_stream_rejects_incomplete_output_and_cancels_process_g
 	let slow_cancel = CancellationToken::new();
 	let cancel_trigger = slow_cancel.clone();
 	tokio::spawn(async move {
-		tokio::time::sleep(Duration::from_millis(50)).await;
+		time::sleep(Duration::from_millis(50)).await;
 		cancel_trigger.cancel();
 	});
-	let cancelled = tokio::time::timeout(
+	let cancelled = time::timeout(
 		Duration::from_secs(3),
 		runner.run(
 			fixture.path(),
@@ -426,7 +426,7 @@ async fn vcs_snapshots_cover_normal_linked_bare_detached_unborn_packed_and_refta
 	fixture_git(reftable.path(), &["init", "--ref-format=reftable", "-b", "table"]);
 	fixture_git(reftable.path(), &["config", "user.name", "OMP Test"]);
 	fixture_git(reftable.path(), &["config", "user.email", "omp@example.invalid"]);
-	std::fs::write(reftable.path().join("seed"), "table\n").unwrap();
+	fs::write(reftable.path().join("seed"), "table\n").unwrap();
 	fixture_git(reftable.path(), &["add", "seed"]);
 	fixture_git(reftable.path(), &["commit", "-m", "reftable"]);
 	let reftable_repository = repo::discover(reftable.path()).await.unwrap().unwrap();
@@ -442,12 +442,12 @@ async fn vcs_head_poll_survives_atomic_replacement_and_coalesces_invalidations()
 	let fixture = repository_fixture();
 	let repository = repo::discover(fixture.path()).await.unwrap().unwrap();
 	let invalidations = HeadInvalidations::start(&repository).await.unwrap();
-	tokio::time::sleep(Duration::from_millis(300)).await;
+	time::sleep(Duration::from_millis(300)).await;
 	let head = repository.git_dir.join("HEAD");
 	let replacement = repository.git_dir.join("HEAD.omp-replacement");
-	std::fs::write(&replacement, "ref: refs/heads/main\n").unwrap();
-	std::fs::rename(&replacement, &head).unwrap();
-	tokio::time::timeout(Duration::from_secs(2), invalidations.changed())
+	fs::write(&replacement, "ref: refs/heads/main\n").unwrap();
+	fs::rename(&replacement, &head).unwrap();
+	time::timeout(Duration::from_secs(2), invalidations.changed())
 		.await
 		.expect("atomic replacement invalidation")
 		.expect("watch remains live");
@@ -571,7 +571,7 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 			.as_str(),
 		"v1.10"
 	);
-	std::fs::create_dir(fixture.path().join("nested")).unwrap();
+	fs::create_dir(fixture.path().join("nested")).unwrap();
 	assert_eq!(
 		commands
 			.workdir_prefix(&fixture.path().join("nested"), &cancel)
@@ -582,7 +582,7 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 	);
 
 	let odd = "odd\nname.txt";
-	std::fs::write(fixture.path().join(odd), "odd\n").unwrap();
+	fs::write(fixture.path().join(odd), "odd\n").unwrap();
 	fixture_git(fixture.path(), &["add", odd]);
 	let head = commands
 		.resolve_ref(fixture.path(), "HEAD", &cancel)
@@ -647,8 +647,8 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 	assert_eq!(metadata.author_name.as_str(), "OMP Test");
 	assert!(metadata.body.as_str().starts_with("seed"));
 
-	std::fs::write(fixture.path().join("seed.txt"), "changed without newline").unwrap();
-	std::fs::write(fixture.path().join("untracked.bin"), [0, 1, 2, 0xff]).unwrap();
+	fs::write(fixture.path().join("seed.txt"), "changed without newline").unwrap();
+	fs::write(fixture.path().join("untracked.bin"), [0, 1, 2, 0xff]).unwrap();
 	let counts = diffs.status_counts(fixture.path(), &cancel).await.unwrap();
 	assert!(counts.staged >= 2);
 	assert_eq!(counts.unstaged, 1);

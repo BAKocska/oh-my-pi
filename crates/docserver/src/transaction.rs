@@ -4,21 +4,25 @@
 //! first durable operation, and final authorization remains inside actor
 //! mailboxes.
 
-use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
+use std::{
+	collections::HashMap, future, future::Future, mem, path::PathBuf, result, str, sync::Arc,
+};
 
 use bytes::Bytes;
 use omp_core::{Str, sf};
 use parking_lot::Mutex;
 use tokio::{
 	sync::oneshot,
-	time::{Duration, timeout},
+	task,
+	time::{self, Duration},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
 	ByteEdit, ByteRange, DocumentHead, DocumentId, DocumentKind, DocumentLocator, DocumentPresence,
-	DocumentSnapshot, DocumentStore, Error, LanguageId, LeaseId, Result, Revision, TransactionId,
+	DocumentSnapshot, DocumentStore, Error, LanguageId, LeaseId, ReadBody, ReadSelection, Result,
+	Revision, TransactionId,
 	actor::{
 		ActorHandle, CommittedSnapshotMetadata, DestinationExpectation, DocumentReservation,
 		PathReservation, ReservedDocument,
@@ -546,7 +550,7 @@ impl FormatCoordinator for NoFormatCoordinator {
 		request: FormatRequest,
 		_: CancellationToken,
 	) -> impl Future<Output = Result<FormatResult>> + Send + '_ {
-		std::future::ready(Ok(FormatResult::new(request.candidate)))
+		future::ready(Ok(FormatResult::new(request.candidate)))
 	}
 
 	fn publish_committed(
@@ -554,7 +558,7 @@ impl FormatCoordinator for NoFormatCoordinator {
 		_: PublishedDocument,
 		_: CancellationToken,
 	) -> impl Future<Output = Result<()>> + Send + '_ {
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 
 	fn revert_uncommitted(
@@ -562,7 +566,7 @@ impl FormatCoordinator for NoFormatCoordinator {
 		_: RevertedDocument,
 		_: CancellationToken,
 	) -> impl Future<Output = Result<()>> + Send + '_ {
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 }
 
@@ -845,7 +849,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 	) -> Arc<TransactionOutcome>
 	where
 		B: FnOnce() -> Fut + Send + 'static,
-		Fut: Future<Output = std::result::Result<Vec<DocumentMutation>, TransactionBuildError>>
+		Fut: Future<Output = result::Result<Vec<DocumentMutation>, TransactionBuildError>>
 			+ Send
 			+ 'static,
 	{
@@ -864,7 +868,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 	) -> Arc<TransactionOutcome>
 	where
 		B: FnOnce() -> Fut + Send + 'static,
-		Fut: Future<Output = std::result::Result<Vec<DocumentMutation>, TransactionBuildError>>
+		Fut: Future<Output = result::Result<Vec<DocumentMutation>, TransactionBuildError>>
 			+ Send
 			+ 'static,
 	{
@@ -883,7 +887,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 	) -> Arc<TransactionOutcome>
 	where
 		B: FnOnce() -> Fut + Send + 'static,
-		Fut: Future<Output = std::result::Result<Vec<DocumentMutation>, TransactionBuildError>>
+		Fut: Future<Output = result::Result<Vec<DocumentMutation>, TransactionBuildError>>
 			+ Send
 			+ 'static,
 	{
@@ -967,7 +971,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 			match ledger.get_mut(&transaction_id) {
 				Some(entry @ LedgerEntry::Running(_)) => {
 					let LedgerEntry::Running(waiters) =
-						std::mem::replace(entry, LedgerEntry::Complete(Arc::clone(&outcome)))
+						mem::replace(entry, LedgerEntry::Complete(Arc::clone(&outcome)))
 					else {
 						unreachable!("matched running ledger entry")
 					};
@@ -1019,7 +1023,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		cancellation: CancellationToken,
 		publish: bool,
 		workspace_owner: Option<[u8; 16]>,
-	) -> std::result::Result<TransactionOutcome, TransactionOutcome> {
+	) -> result::Result<TransactionOutcome, TransactionOutcome> {
 		let transaction_id = request.transaction_id;
 		if request.operations.is_empty() {
 			return Ok(TransactionOutcome::Committed { transaction_id, operations: Vec::new() });
@@ -1209,7 +1213,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		&self,
 		operations: &[DocumentMutation],
 		cancellation: &CancellationToken,
-	) -> std::result::Result<ResolvedOperations, PlanningFailure> {
+	) -> result::Result<ResolvedOperations, PlanningFailure> {
 		let mut owned_leases = Vec::new();
 		match self
 			.resolve_operations_inner(operations, &mut owned_leases, cancellation)
@@ -1228,7 +1232,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		operations: &[DocumentMutation],
 		owned_leases: &mut Vec<LeaseId>,
 		cancellation: &CancellationToken,
-	) -> std::result::Result<Vec<ResolvedOperation>, PlanningFailure> {
+	) -> result::Result<Vec<ResolvedOperation>, PlanningFailure> {
 		let mut resolved = Vec::with_capacity(operations.len());
 		let mut overlay_paths: HashMap<PathBuf, ActorHandle> = HashMap::new();
 		for (index, mutation) in operations.iter().enumerate() {
@@ -1331,7 +1335,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		&self,
 		transaction_id: TransactionId,
 		operations: &[ResolvedOperation],
-	) -> std::result::Result<Vec<DocumentPlan>, PlanningFailure> {
+	) -> result::Result<Vec<DocumentPlan>, PlanningFailure> {
 		let mut unique: HashMap<DocumentId, ActorHandle> = HashMap::new();
 		for operation in operations {
 			unique
@@ -1379,7 +1383,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		operations: &[ResolvedOperation],
 		plans: &mut [DocumentPlan],
 		cancellation: CancellationToken,
-	) -> std::result::Result<(), PlanningFailure> {
+	) -> result::Result<(), PlanningFailure> {
 		for operation in operations {
 			let plan = plans
 				.iter_mut()
@@ -1499,7 +1503,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 					}
 					let kind = if plan.presence == DocumentPresence::Present {
 						plan.kind.clone()
-					} else if std::str::from_utf8(&create.content).is_ok() {
+					} else if str::from_utf8(&create.content).is_ok() {
 						DocumentKind::Text(None)
 					} else {
 						DocumentKind::Binary
@@ -1663,7 +1667,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		candidate: Bytes,
 		policy: FormatPolicy,
 		cancellation: CancellationToken,
-	) -> std::result::Result<(Bytes, bool), PlanningFailure> {
+	) -> result::Result<(Bytes, bool), PlanningFailure> {
 		if policy == FormatPolicy::Disabled {
 			return Ok((candidate, false));
 		}
@@ -1685,7 +1689,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 			candidate.clone(),
 		);
 		let format_cancel = cancellation.child_token();
-		let formatted = timeout(
+		let formatted = time::timeout(
 			Duration::from_secs(5),
 			self
 				.inner
@@ -1710,7 +1714,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 						"transaction cancelled during formatting",
 					));
 				}
-				if std::str::from_utf8(result.content()).is_ok() {
+				if str::from_utf8(result.content()).is_ok() {
 					Ok((result.into_content(), true))
 				} else if policy == FormatPolicy::BestEffort {
 					Ok((candidate, false))
@@ -1731,11 +1735,11 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		let read = self
 			.inner
 			.store
-			.read(DocumentLocator::Document(document_id), Some(revision), crate::ReadSelection::Whole)
+			.read(DocumentLocator::Document(document_id), Some(revision), ReadSelection::Whole)
 			.await?;
 		let content = match read.body() {
-			crate::ReadBody::Whole(content) => content.clone(),
-			crate::ReadBody::Slices(_) => unreachable!("whole read returns whole bytes"),
+			ReadBody::Whole(content) => content.clone(),
+			ReadBody::Slices(_) => unreachable!("whole read returns whole bytes"),
 		};
 		Ok(Arc::new(DocumentSnapshot::new(read.head().clone(), content)?))
 	}
@@ -1744,7 +1748,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		&self,
 		transaction_id: TransactionId,
 		plans: &mut [DocumentPlan],
-	) -> std::result::Result<Vec<PreparedPlan>, PlanningFailure> {
+	) -> result::Result<Vec<PreparedPlan>, PlanningFailure> {
 		let filesystem = self.inner.store.local_fs();
 		let mut prepared = Vec::with_capacity(plans.len());
 		for (plan_index, plan) in plans.iter_mut().enumerate() {
@@ -1759,7 +1763,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 				let content =
 					(plan.content != plan.reserved.snapshot.content()).then(|| plan.content.clone());
 				let fs = filesystem.clone();
-				let move_capability = tokio::task::spawn_blocking(move || {
+				let move_capability = task::spawn_blocking(move || {
 					if let Some(content) = content {
 						fs.prepare_move_with_content(
 							source,
@@ -1784,7 +1788,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 					let expected = plan.reserved.disk_expectation.clone();
 					let fs = filesystem.clone();
 					PreparedAction::Delete(
-						tokio::task::spawn_blocking(move || fs.prepare_delete(path, expected))
+						task::spawn_blocking(move || fs.prepare_delete(path, expected))
 							.await
 							.map_err(join_failure)?
 							.map_err(|error| PlanningFailure::from_error(operation_index, error))?,
@@ -1800,7 +1804,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 				let content = plan.content.clone();
 				let fs = filesystem.clone();
 				PreparedAction::Write(
-					tokio::task::spawn_blocking(move || fs.prepare_write(path, content, expected))
+					task::spawn_blocking(move || fs.prepare_write(path, content, expected))
 						.await
 						.map_err(join_failure)?
 						.map_err(|error| PlanningFailure::from_error(operation_index, error))?,
@@ -1817,7 +1821,7 @@ impl<F: FormatCoordinator + 'static> TransactionCoordinator<F> {
 		plan: &DocumentPlan,
 		precondition: MoveDestinationPrecondition,
 		operation_index: u32,
-	) -> std::result::Result<(DiskExpectation, PathReservation), PlanningFailure> {
+	) -> result::Result<(DiskExpectation, PathReservation), PlanningFailure> {
 		let expectation = match precondition {
 			MoveDestinationPrecondition::MustNotExist => DestinationExpectation::Missing,
 			MoveDestinationPrecondition::Revision(revision) => {
@@ -2084,7 +2088,7 @@ fn finalized_ranges(base: &Bytes, finalized: &Bytes) -> Result<Vec<ByteRange>> {
 }
 
 fn validate_text(content: &Bytes) -> Result<()> {
-	std::str::from_utf8(content)
+	str::from_utf8(content)
 		.map(|_| ())
 		.map_err(|_| Error::InvalidContent { reason: sf!("text content is not valid UTF-8") })
 }
@@ -2139,14 +2143,16 @@ fn rejected(
 	}
 }
 
-fn join_failure(error: tokio::task::JoinError) -> PlanningFailure {
+fn join_failure(error: task::JoinError) -> PlanningFailure {
 	PlanningFailure::precondition(0, format!("filesystem preparation worker failed: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
 	use std::{
+		fs, future,
 		num::NonZeroUsize,
+		path::Path,
 		sync::{
 			Arc,
 			atomic::{AtomicUsize, Ordering},
@@ -2171,7 +2177,7 @@ mod tests {
 		DocumentStore::new(config).expect("document store")
 	}
 
-	fn file_uri(path: &std::path::Path) -> Url {
+	fn file_uri(path: &Path) -> Url {
 		Url::from_file_path(path).expect("fixture path has a file URI")
 	}
 
@@ -2218,7 +2224,7 @@ mod tests {
 	async fn stale_fail_rejects_and_disjoint_rebase_commits() {
 		let root = TempDir::new().expect("tempdir");
 		let path = root.path().join("stale.txt");
-		std::fs::write(&path, b"alpha beta").expect("fixture");
+		fs::write(&path, b"alpha beta").expect("fixture");
 		let store = setup(&root);
 		let opened = store.open(path).await.expect("open");
 		let document_id = opened.head().document_id();
@@ -2283,7 +2289,7 @@ mod tests {
 	async fn overlapping_rebase_and_force_replace_edits_are_rejected() {
 		let root = TempDir::new().expect("tempdir");
 		let path = root.path().join("overlap.txt");
-		std::fs::write(&path, b"abcdef").expect("fixture");
+		fs::write(&path, b"abcdef").expect("fixture");
 		let store = setup(&root);
 		let opened = store.open(path).await.expect("open");
 		let document_id = opened.head().document_id();
@@ -2340,7 +2346,7 @@ mod tests {
 	async fn duplicate_transaction_ids_share_one_terminal_commit() {
 		let root = TempDir::new().expect("tempdir");
 		let path = root.path().join("duplicate.txt");
-		std::fs::write(&path, b"before").expect("fixture");
+		fs::write(&path, b"before").expect("fixture");
 		let store = setup(&root);
 		let opened = store.open(path).await.expect("open");
 		let base = opened.head().revision();
@@ -2373,14 +2379,14 @@ mod tests {
 			coordinator.commit_lazy(id(15), CancellationToken::new(), move || {
 				left_calls.fetch_add(1, Ordering::SeqCst);
 				async {
-					tokio::task::yield_now().await;
+					task::yield_now().await;
 					Ok::<Vec<DocumentMutation>, TransactionBuildError>(Vec::new())
 				}
 			}),
 			coordinator.commit_lazy(id(15), CancellationToken::new(), move || {
 				right_calls.fetch_add(1, Ordering::SeqCst);
 				async {
-					tokio::task::yield_now().await;
+					task::yield_now().await;
 					Ok::<Vec<DocumentMutation>, TransactionBuildError>(Vec::new())
 				}
 			}),
@@ -2422,7 +2428,7 @@ mod tests {
 						.collect::<Vec<_>>(),
 				)))
 			};
-			std::future::ready(result)
+			future::ready(result)
 		}
 
 		fn publish_committed(
@@ -2431,9 +2437,9 @@ mod tests {
 			_: CancellationToken,
 		) -> impl Future<Output = Result<()>> + Send + '_ {
 			if let Some(path) = &self.invalidate_after_publish {
-				std::fs::write(path, b"external").expect("invalidate second prepared file");
+				fs::write(path, b"external").expect("invalidate second prepared file");
 			}
-			std::future::ready(Ok(()))
+			future::ready(Ok(()))
 		}
 
 		fn revert_uncommitted(
@@ -2443,7 +2449,7 @@ mod tests {
 		) -> impl Future<Output = Result<()>> + Send + '_ {
 			assert_eq!(document.uri().scheme(), "file");
 			self.reverts.fetch_add(1, Ordering::SeqCst);
-			std::future::ready(Ok(()))
+			future::ready(Ok(()))
 		}
 	}
 
@@ -2452,8 +2458,8 @@ mod tests {
 		let root = TempDir::new().expect("tempdir");
 		let first_path = root.path().join("z-declared-first.txt");
 		let second_path = root.path().join("a-declared-second.txt");
-		std::fs::write(&first_path, b"one").expect("first");
-		std::fs::write(&second_path, b"two").expect("second");
+		fs::write(&first_path, b"one").expect("first");
+		fs::write(&second_path, b"two").expect("second");
 		let store = setup(&root);
 		let first = store.open(first_path).await.expect("open first");
 		let second = store.open(second_path.clone()).await.expect("open second");
@@ -2547,7 +2553,7 @@ mod tests {
 			_: PublishedDocument,
 			_: CancellationToken,
 		) -> impl Future<Output = Result<()>> + Send + '_ {
-			std::future::ready(Ok(()))
+			future::ready(Ok(()))
 		}
 
 		fn revert_uncommitted(
@@ -2555,7 +2561,7 @@ mod tests {
 			_: RevertedDocument,
 			_: CancellationToken,
 		) -> impl Future<Output = Result<()>> + Send + '_ {
-			std::future::ready(Ok(()))
+			future::ready(Ok(()))
 		}
 	}
 
@@ -2563,7 +2569,7 @@ mod tests {
 	async fn stale_noop_release_rejects_the_transaction() {
 		let root = TempDir::new().expect("tempdir");
 		let path = root.path().join("stale-noop.txt");
-		std::fs::write(&path, b"original").expect("fixture");
+		fs::write(&path, b"original").expect("fixture");
 		let store = setup(&root);
 		let opened = store.open(path.clone()).await.expect("open");
 		let entered = Arc::new(Notify::new());
@@ -2584,14 +2590,14 @@ mod tests {
 		let committing =
 			tokio::spawn(async move { coordinator.commit(request, CancellationToken::new()).await });
 		entered.notified().await;
-		std::fs::write(&path, b"external").expect("external invalidation");
-		let observed = tokio::time::timeout(Duration::from_secs(5), async {
+		fs::write(&path, b"external").expect("external invalidation");
+		let observed = time::timeout(Duration::from_secs(5), async {
 			loop {
 				let bytes = current_bytes(&store, opened.head().document_id()).await;
 				if bytes == b"external".as_slice() {
 					return bytes;
 				}
-				tokio::time::sleep(Duration::from_millis(10)).await;
+				time::sleep(Duration::from_millis(10)).await;
 			}
 		})
 		.await
@@ -2609,7 +2615,7 @@ mod tests {
 	async fn uri_resolution_failure_closes_previously_opened_leases() {
 		let root = TempDir::new().expect("tempdir");
 		let path = root.path().join("lease-cleanup.txt");
-		std::fs::write(&path, b"original").expect("fixture");
+		fs::write(&path, b"original").expect("fixture");
 		let store = setup(&root);
 		let baseline = store.open(path.clone()).await.expect("baseline lease");
 		let handle = store
@@ -2655,7 +2661,7 @@ mod tests {
 		let root = TempDir::new().expect("tempdir");
 		let source_path = root.path().join("move-source.txt");
 		let destination_path = root.path().join("move-destination.txt");
-		std::fs::write(&source_path, b"unchanged").expect("fixture");
+		fs::write(&source_path, b"unchanged").expect("fixture");
 		let store = setup(&root);
 		let opened = store.open(source_path.clone()).await.expect("open");
 		let document_id = opened.head().document_id();
@@ -2691,7 +2697,7 @@ mod tests {
 				reason: TransactionRejectReason::PreconditionFailed,
 				..
 			}));
-			assert_eq!(std::fs::read(&source_path).expect("source remains"), b"unchanged");
+			assert_eq!(fs::read(&source_path).expect("source remains"), b"unchanged");
 			assert!(!destination_path.exists());
 		}
 	}
@@ -2701,7 +2707,7 @@ mod tests {
 		let root = TempDir::new().expect("tempdir");
 		let source_path = root.path().join("move-edit-source.txt");
 		let destination_path = root.path().join("move-edit-destination.txt");
-		std::fs::write(&source_path, b"before").expect("fixture");
+		fs::write(&source_path, b"before").expect("fixture");
 		let store = setup(&root);
 		let opened = store.open(source_path.clone()).await.expect("open");
 		let request = TransactionRequest::new(id(20), vec![DocumentMutation::new(
@@ -2720,7 +2726,7 @@ mod tests {
 		let moved = committed_head(&outcome);
 		assert_eq!(moved.document_id(), opened.head().document_id());
 		assert!(!source_path.exists());
-		assert_eq!(std::fs::read(&destination_path).expect("destination bytes"), b"after");
+		assert_eq!(fs::read(&destination_path).expect("destination bytes"), b"after");
 	}
 
 	#[tokio::test]
@@ -2728,7 +2734,7 @@ mod tests {
 		let root = TempDir::new().expect("tempdir");
 		let source_path = root.path().join("stale-move-edit-source.txt");
 		let destination_path = root.path().join("stale-move-edit-destination.txt");
-		std::fs::write(&source_path, b"before").expect("fixture");
+		fs::write(&source_path, b"before").expect("fixture");
 		let store = setup(&root);
 		let opened = store.open(source_path.clone()).await.expect("open");
 		let document_id = opened.head().document_id();
@@ -2765,7 +2771,7 @@ mod tests {
 			reason: TransactionRejectReason::PreconditionFailed,
 			..
 		}));
-		assert_eq!(std::fs::read(&source_path).expect("source bytes"), b"concurrent");
+		assert_eq!(fs::read(&source_path).expect("source bytes"), b"concurrent");
 		assert!(!destination_path.exists());
 	}
 
@@ -2773,7 +2779,7 @@ mod tests {
 	async fn cancellation_after_format_rolls_back_the_private_candidate() {
 		let root = TempDir::new().expect("tempdir");
 		let path = root.path().join("cancel.txt");
-		std::fs::write(&path, b"public").expect("fixture");
+		fs::write(&path, b"public").expect("fixture");
 		let store = setup(&root);
 		let opened = store.open(path.clone()).await.expect("open");
 		let reverts = Arc::new(AtomicUsize::new(0));
@@ -2802,7 +2808,7 @@ mod tests {
 			..
 		}));
 		assert_eq!(reverts.load(Ordering::SeqCst), 1);
-		assert_eq!(std::fs::read(path).expect("public bytes remain"), b"public");
+		assert_eq!(fs::read(path).expect("public bytes remain"), b"public");
 	}
 
 	#[tokio::test]
@@ -2811,7 +2817,7 @@ mod tests {
 		let source_path = root.path().join("created.txt");
 		let moved_path = root.path().join("moved.txt");
 		let active_path = root.path().join("active.txt");
-		std::fs::write(&active_path, b"occupied").expect("active fixture");
+		fs::write(&active_path, b"occupied").expect("active fixture");
 		let store = setup(&root);
 		let active = store
 			.open(active_path.clone())
@@ -2828,7 +2834,7 @@ mod tests {
 		)]);
 		let created = coordinator.commit(create, CancellationToken::new()).await;
 		let created_head = committed_head(&created);
-		assert_eq!(std::fs::read(&source_path).expect("created bytes"), b"created");
+		assert_eq!(fs::read(&source_path).expect("created bytes"), b"created");
 
 		let blocked_move = TransactionRequest::new(id(10), vec![DocumentMutation::new(
 			DocumentTarget::Document(created_head.document_id()),
@@ -2858,7 +2864,7 @@ mod tests {
 		let moved = coordinator.commit(movement, CancellationToken::new()).await;
 		let moved_head = committed_head(&moved);
 		assert!(!source_path.exists());
-		assert_eq!(std::fs::read(&moved_path).expect("moved bytes"), b"created");
+		assert_eq!(fs::read(&moved_path).expect("moved bytes"), b"created");
 		assert_eq!(moved_head.document_id(), created_head.document_id());
 
 		let delete = TransactionRequest::new(id(12), vec![DocumentMutation::new(

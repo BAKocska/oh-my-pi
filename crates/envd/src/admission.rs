@@ -3,6 +3,7 @@
 use std::{io::Cursor, path::Path, time::Duration};
 
 use bytes::{Bytes, BytesMut};
+use flume::Receiver;
 use omp_core::Str;
 use omp_proto::{
 	env::v1::{Admission, AdmitInvocation},
@@ -16,6 +17,7 @@ use omp_tool::Effects;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::{time, time::Instant};
 
 /// Default approval posture applied before one invocation reaches interactive
 /// admission.
@@ -304,12 +306,12 @@ fn inline_option<'a>(arguments: &[&'a str], prefix: &str) -> Option<&'a str> {
 pub struct AdmissionGate {
 	invocation_id: Str,
 	tool_name:     Str,
-	deadline:      tokio::time::Instant,
+	deadline:      Instant,
 	fragments:     BytesMut,
 	requested:     Option<Value>,
 	query_emitted: bool,
 	answer_tx:     Option<flume::Sender<Admission>>,
-	answer_rx:     flume::Receiver<Admission>,
+	answer_rx:     Receiver<Admission>,
 }
 
 impl AdmissionGate {
@@ -319,7 +321,7 @@ impl AdmissionGate {
 		Self {
 			invocation_id,
 			tool_name,
-			deadline: tokio::time::Instant::now() + deadline,
+			deadline: Instant::now() + deadline,
 			fragments: BytesMut::new(),
 			requested: None,
 			query_emitted: false,
@@ -377,7 +379,7 @@ impl AdmissionGate {
 			bash,
 			deadline_ms: self
 				.deadline
-				.saturating_duration_since(tokio::time::Instant::now())
+				.saturating_duration_since(Instant::now())
 				.as_millis()
 				.try_into()
 				.unwrap_or(u64::MAX),
@@ -407,13 +409,13 @@ impl AdmissionGate {
 	}
 
 	/// Returns the deadline for a query that is waiting on Core.
-	pub(crate) fn pending_deadline(&self) -> Option<tokio::time::Instant> {
+	pub(crate) fn pending_deadline(&self) -> Option<Instant> {
 		(self.query_emitted && self.answer_tx.is_some()).then_some(self.deadline)
 	}
 
 	/// Converts an unanswered query whose deadline has elapsed into env's
 	/// synthetic denial. The connection loop owns this transition.
-	pub(crate) fn expire(&mut self, now: tokio::time::Instant) -> Option<PolicyDenied> {
+	pub(crate) fn expire(&mut self, now: Instant) -> Option<PolicyDenied> {
 		(self.query_emitted && self.answer_tx.is_some() && now >= self.deadline).then(|| {
 			self.answer_tx.take();
 			timeout_denial(&self.invocation_id)
@@ -423,7 +425,7 @@ impl AdmissionGate {
 	/// Waits for Core's answer through the env-owned deadline, synthesizing the
 	/// structured fail-closed denial when it expires or the relay closes.
 	pub(crate) async fn decide(&self, cwd: &Path, root: &Path) -> AdmissionDecision {
-		let answer = tokio::time::timeout_at(self.deadline, self.answer_rx.recv_async()).await;
+		let answer = time::timeout_at(self.deadline, self.answer_rx.recv_async()).await;
 		let Ok(Ok(admission)) = answer else {
 			return AdmissionDecision::Denied(timeout_denial(&self.invocation_id));
 		};

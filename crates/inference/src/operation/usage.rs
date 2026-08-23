@@ -34,7 +34,7 @@ use crate::{
 		UsageResetCredits, UsageUnit, UsageWindow, UsageWindowKind,
 	},
 	auth::{AuthRejection, AuthRejectionKind, CredentialBroker, CredentialNeed, CredentialSource},
-	call::{OperationCall, UsageRequest, UsageScope},
+	call::{Call, OperationCall, UsageRequest, UsageScope},
 	catalog::{OperationKind, ProviderId, RouteId, snapshot::Catalog},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	id::{AccountId, PrincipalId},
@@ -320,7 +320,7 @@ impl<S> UsageService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for UsageService<S>
+impl<S> Service<Call> for UsageService<S>
 where
 	S: Service<
 			OperationRequest<UsageRequest>,
@@ -338,7 +338,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::Usage(request) => {
 				Some(OperationRequest::from_call(&call, Arc::clone(request)))
@@ -636,7 +636,7 @@ const fn window_kind_rank(kind: UsageWindowKind) -> u8 {
 	}
 }
 
-fn wrong_operation(call: &crate::call::Call) -> Error {
+fn wrong_operation(call: &Call) -> Error {
 	Error::new(
 		ErrorKind::InternalInvariant,
 		ErrorPhase::Internal,
@@ -672,7 +672,7 @@ fn protocol_error(reason: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use std::time::{Duration, UNIX_EPOCH};
+	use std::time::{self, Duration, UNIX_EPOCH};
 
 	use omp_core::sf;
 
@@ -685,10 +685,10 @@ mod tests {
 		id::AccountId,
 	};
 
-	fn now() -> std::time::SystemTime {
+	fn now() -> time::SystemTime {
 		UNIX_EPOCH + Duration::from_secs(120)
 	}
-	fn late() -> std::time::SystemTime {
+	fn late() -> time::SystemTime {
 		UNIX_EPOCH + Duration::from_secs(300)
 	}
 

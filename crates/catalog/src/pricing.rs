@@ -1,7 +1,10 @@
 //! Dimensioned integer pricing, long-context tiers, and checked cost
 //! arithmetic.
 
-use std::fmt;
+use std::{
+	error,
+	fmt::{self, Display},
+};
 
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
@@ -37,7 +40,7 @@ impl NanoUsd {
 	}
 }
 
-impl fmt::Display for NanoUsd {
+impl Display for NanoUsd {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{} nano-USD", self.0)
 	}
@@ -291,7 +294,7 @@ pub enum PricingError {
 	TiersNotStrictlyOrdered,
 }
 
-impl fmt::Display for PricingError {
+impl Display for PricingError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::ComponentsNotStrictlyOrdered => {
@@ -304,7 +307,7 @@ impl fmt::Display for PricingError {
 	}
 }
 
-impl std::error::Error for PricingError {}
+impl error::Error for PricingError {}
 
 /// Checked cost calculation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,7 +319,7 @@ pub enum CostError {
 	Overflow,
 }
 
-impl fmt::Display for CostError {
+impl Display for CostError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::InvalidSchedule(error) => write!(formatter, "invalid price schedule: {error}"),
@@ -325,7 +328,7 @@ impl fmt::Display for CostError {
 	}
 }
 
-impl std::error::Error for CostError {}
+impl error::Error for CostError {}
 
 #[cfg(test)]
 mod tests {

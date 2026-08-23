@@ -8,6 +8,8 @@ use std::{
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
+#[cfg(unix)]
+use nix::sys::utsname;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 
 use crate::{
@@ -40,7 +42,7 @@ struct UNameOutput {
 
 #[cfg(unix)]
 fn platform_fields() -> Result<[OsString; 6], ()> {
-	let uname = nix::sys::utsname::uname().map_err(|_| ())?;
+	let uname = utsname::uname().map_err(|_| ())?;
 	Ok([
 		uname.sysname().to_owned(),
 		uname.nodename().to_owned(),

@@ -1,8 +1,11 @@
 //! File descriptor utilities.
 
-use std::os::fd::RawFd;
+use std::{
+	fs,
+	os::fd::{self, RawFd},
+};
 
-use crate::{ShellFd, error, openfiles};
+use crate::{ShellFd, error, openfiles::OpenFile};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const FD_DIR_PATH: &str = "/proc/self/fd";
@@ -29,8 +32,8 @@ const FD_DIR_PATH: &str = "/dev/fd";
 	target_os = "netbsd",
 	target_os = "openbsd"
 ))]
-pub fn try_iter_open_fds() -> impl Iterator<Item = (ShellFd, openfiles::OpenFile)> {
-	std::fs::read_dir(FD_DIR_PATH)
+pub fn try_iter_open_fds() -> impl Iterator<Item = (ShellFd, OpenFile)> {
+	fs::read_dir(FD_DIR_PATH)
 		.into_iter()
 		.flatten()
 		.filter_map(Result::ok)
@@ -60,7 +63,7 @@ pub fn try_iter_open_fds() -> impl Iterator<Item = (ShellFd, openfiles::OpenFile
 /// # Arguments
 ///
 /// * `fd` - The file descriptor to open.
-pub fn try_get_file_for_open_fd(fd: RawFd) -> Option<openfiles::OpenFile> {
+pub fn try_get_file_for_open_fd(fd: RawFd) -> Option<OpenFile> {
 	// SAFETY:
 	// We are trying to open the file descriptor provided by the caller. There's a
 	// risk that the fd is invalid or has been closed since it was enumerated. For
@@ -71,12 +74,12 @@ pub fn try_get_file_for_open_fd(fd: RawFd) -> Option<openfiles::OpenFile> {
 	unsafe { open_file_by_fd(fd).ok() }
 }
 
-unsafe fn open_file_by_fd(fd: RawFd) -> Result<openfiles::OpenFile, error::Error> {
+unsafe fn open_file_by_fd(fd: RawFd) -> Result<OpenFile, error::Error> {
 	// SAFETY: We are creating a BorrowedFd from a file descriptor. Callers
 	// typically enumerate available file descriptors from procfs, devfs, or
 	// similar, but there's still a risk that the fd has become invalid or closed
 	// since then -- or that this function gets used incorrectly.
-	let borrowed_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+	let borrowed_fd = unsafe { fd::BorrowedFd::borrow_raw(fd) };
 	let owned_fd = borrowed_fd.try_clone_to_owned()?;
-	Ok(std::fs::File::from(owned_fd).into())
+	Ok(fs::File::from(owned_fd).into())
 }

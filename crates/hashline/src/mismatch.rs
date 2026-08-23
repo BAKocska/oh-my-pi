@@ -1,6 +1,9 @@
 //! Exact pi-compatible stale hash rejection diagnostics.
 
-use std::fmt;
+use std::{
+	error,
+	fmt::{self, Display},
+};
 
 use omp_core::{Str, sf};
 
@@ -66,13 +69,13 @@ impl MismatchError {
 	}
 }
 
-impl fmt::Display for MismatchError {
+impl Display for MismatchError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(&self.message)
 	}
 }
 
-impl std::error::Error for MismatchError {}
+impl error::Error for MismatchError {}
 
 /// Formats numbered current-file context around stale anchors.
 pub fn format_anchored_context(anchor_lines: &[usize], file_lines: &[Str]) -> Vec<Str> {

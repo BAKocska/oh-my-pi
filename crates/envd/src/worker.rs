@@ -4,10 +4,13 @@ use std::{
 	collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
 	env,
 	ffi::CString,
+	fmt,
 	io::{self, Read, Write},
+	iter, mem,
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
-	process::Stdio,
+	process::{self, Stdio},
+	str,
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -16,6 +19,12 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use flume::Receiver;
+#[cfg(unix)]
+use nix::sys::signal;
+#[cfg(unix)]
+use nix::unistd::Pid;
+use omp_agent::arbiter::PointCx;
 use omp_core::{
 	CowBytes, Duration as CoreDuration, DurationUnit, InvocationPhase, LifecyclePhase, Principal,
 	RestartReason, Str, sf,
@@ -25,18 +34,22 @@ use omp_proto::{
 	inference::v1::{ToolDef, Value, ValueMap, tool_def, value},
 	prost::Message,
 	thread::v1::{Blob, Part, part},
-	toolhost::v1::{
-		ActivateExtension, ActivateReason as WireActivateReason, AdmitExtensions, AdmittedExtension,
-		ArgIssue, ArgumentHostEnvelope, ArgumentWorkerEnvelope, CampaignHostEnvelope, CampaignReact,
-		CampaignReaction, CampaignVerdictKind, CampaignWorkerEnvelope, CancelTool,
-		ExtensionActivated, ExtensionDecl, FreezeDeclarations, HostFrame, InvokeTool,
-		JournalHostEnvelope, LifecycleHostEnvelope, OutcomeKind, Ping, Pong, PreludeParam,
-		PreludeParamKind, PrincipalRef, ProtocolError, ProtocolErrorCode, PullReply, PullRequest,
-		QuotaDrop, QuotaStatus, RegisterTools, ResourceUpdate, RestartReason as WireRestartReason,
-		ServiceDispatch as WireServiceDispatch, ServiceReply, ServiceResult, ToolAborted, ToolArgs,
-		ToolComplete, ToolDecl, ToolUpdate, WorkerFrame, WorkerHello, argument_host_envelope,
-		argument_worker_envelope, campaign_host_envelope, campaign_worker_envelope, host_frame,
-		lifecycle_host_envelope, lifecycle_worker_envelope, worker_frame,
+	toolhost::{
+		v1,
+		v1::{
+			ActivateExtension, ActivateReason as WireActivateReason, AdmitExtensions,
+			AdmittedExtension, ArgIssue, ArgumentHostEnvelope, ArgumentWorkerEnvelope,
+			CampaignHostEnvelope, CampaignReact, CampaignReaction, CampaignVerdictKind,
+			CampaignWorkerEnvelope, CancelTool, ExtensionActivated, ExtensionDecl, FreezeDeclarations,
+			HostFrame, InvokeTool, JournalHostEnvelope, LifecycleHostEnvelope, OutcomeKind, Ping,
+			Pong, PreludeParam, PreludeParamKind, PrincipalRef, ProtocolError, ProtocolErrorCode,
+			PullReply, PullRequest, QuotaDrop, QuotaStatus, RegisterTools, ResourceUpdate,
+			RestartReason as WireRestartReason, ServiceDispatch as WireServiceDispatch, ServiceReply,
+			ServiceResult, ToolAborted, ToolArgs, ToolComplete, ToolDecl, ToolUpdate, WorkerFrame,
+			WorkerHello, argument_host_envelope, argument_worker_envelope, campaign_host_envelope,
+			campaign_worker_envelope, host_frame, lifecycle_host_envelope, lifecycle_worker_envelope,
+			worker_frame,
+		},
 	},
 };
 use omp_tools::read::resolver::SchemeSnapshot;
@@ -53,10 +66,15 @@ use thiserror::Error;
 use tokio::{
 	io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
 	process::{Child, ChildStdin, ChildStdout, Command},
+	runtime, task,
 	task::JoinHandle,
+	time,
 	time::{Instant, MissedTickBehavior},
 };
+#[cfg(windows)]
+use windows_sys::Win32::System::Console;
 
+use super::exthost::{DispatchError, control::ControlRuntimeError, lifecycle::EscapeCapability};
 use crate::{
 	exthost::{
 		ActivationCause, ActivationEvent, ActivationTrigger, AvailabilityBatch, AvailabilitySink,
@@ -69,15 +87,18 @@ use crate::{
 			ControlAuthoritySnapshot, ControlConnectionIdentity, ControlDispatch, ControlEffect,
 			ControlHandle, ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
 			ExternalJournalRequest, JournalConnectionIdentity, JournalControl, JournalDispatch,
+			journal_rows,
 		},
-		dispatch::CallbackDispatcher,
+		dispatch::{CAMPAIGN_SUBMISSION_TIMEOUT, CallbackDispatcher},
 		services::{
 			ServiceControlAuthorityFactory, ServiceDispatch, ServiceDispatchBackend,
 			ServiceMethodSchema, ServiceProviderDeclaration,
 		},
+		spawn::spawn,
 	},
 	policy::{AuthorityTable, Grants},
 	tools::RegistryControlFactory,
+	worker_pool::WorkerUnavailable,
 };
 /// Child argv selector for the dedicated placed-Python worker runtime.
 pub const WORKER_ARG: &str = "__omp-py-worker";
@@ -104,8 +125,8 @@ struct HostKeyFields {
 	extension: Str,
 }
 
-impl std::fmt::Debug for HostKey {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for HostKey {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("HostKey")
 			.field("layer", self.layer())
@@ -281,7 +302,7 @@ impl ServiceDispatchBackend for ServiceRouter {
 			.send_async(SupervisorCommand::ServiceDispatch { request_id, frame: wire, reply })
 			.await
 			.map_err(|_| sf!("service provider command channel closed"))?;
-		let result = tokio::time::timeout(deadline, response.recv_async())
+		let result = time::timeout(deadline, response.recv_async())
 			.await
 			.map_err(|_| sf!("service call deadline elapsed"))?
 			.map_err(|_| sf!("service provider response channel closed"))?
@@ -550,7 +571,7 @@ impl ExtHostConfig {
 		session_id: Str,
 		session_generation: u64,
 	) -> io::Result<Self> {
-		std::env::current_exe()
+		env::current_exe()
 			.map(|executable| Self::new(executable, principal, session_id, session_generation))
 	}
 }
@@ -660,7 +681,7 @@ pub struct WorkerInvocation {
 	owner:              HostKey,
 	maximum_effects:    omp_tool::Effects,
 	data_authority:     Option<Arc<AuthorityTable>>,
-	events:             flume::Receiver<WorkerEvent>,
+	events:             Receiver<WorkerEvent>,
 	commands:           flume::Sender<SupervisorCommand>,
 	committed:          bool,
 	terminal:           bool,
@@ -913,20 +934,14 @@ struct DynamicAgentsControlAuthority {
 impl DynamicAgentsControlAuthority {
 	fn bound(
 		&self,
-	) -> Result<
-		(Arc<AgentsControlSlot>, u64, Arc<dyn ControlAuthority>),
-		super::exthost::control::ControlProtocolError,
-	> {
+	) -> Result<(Arc<AgentsControlSlot>, u64, Arc<dyn ControlAuthority>), ControlProtocolError> {
 		let slot = self.slot.upgrade().ok_or_else(|| {
-			super::exthost::control::ControlProtocolError::new(
-				"AgentsOwnerUnavailable",
-				"the extension host has shut down",
-			)
+			ControlProtocolError::new("AgentsOwnerUnavailable", "the extension host has shut down")
 		})?;
 		let (id, factory) = {
 			let binding = slot.binding.lock();
 			let binding = binding.as_ref().ok_or_else(|| {
-				super::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"AgentsOwnerUnavailable",
 					"no installed Agents lease owns this CONTROL connection",
 				)
@@ -935,14 +950,11 @@ impl DynamicAgentsControlAuthority {
 			(binding.id, Arc::clone(&binding.factory))
 		};
 		let authority = factory.bind(Arc::clone(&self.identity)).map_err(|error| {
-			super::exthost::control::ControlProtocolError::new(
-				"AgentsOwnerUnavailable",
-				Str::from(error.to_string()),
-			)
-			.retryable(true)
+			ControlProtocolError::new("AgentsOwnerUnavailable", Str::from(error.to_string()))
+				.retryable(true)
 		})?;
 		if !slot.is_live(id) {
-			return Err(super::exthost::control::ControlProtocolError::new(
+			return Err(ControlProtocolError::new(
 				"StaleGeneration",
 				"the Agents lease changed while binding the request",
 			));
@@ -950,10 +962,7 @@ impl DynamicAgentsControlAuthority {
 		Ok((slot, id, authority))
 	}
 
-	fn validate(
-		&self,
-		context: &ControlRequestContext,
-	) -> Result<(), super::exthost::control::ControlProtocolError> {
+	fn validate(&self, context: &ControlRequestContext) -> Result<(), ControlProtocolError> {
 		if context.connection.extension == self.identity.extension
 			&& context.connection.principal == self.identity.principal
 			&& context.connection.artifact_digest == self.identity.artifact_digest
@@ -966,7 +975,7 @@ impl DynamicAgentsControlAuthority {
 		{
 			Ok(())
 		} else {
-			Err(super::exthost::control::ControlProtocolError::new(
+			Err(ControlProtocolError::new(
 				"StaleGeneration",
 				"the Agents authority belongs to a replaced extension-host connection",
 			))
@@ -985,12 +994,12 @@ impl ControlAuthority for DynamicAgentsControlAuthority {
 		context: &ControlRequestContext,
 		operation: &str,
 		arguments: &serde_json::Map<String, serde_json::Value>,
-	) -> Result<(), super::exthost::control::ControlProtocolError> {
+	) -> Result<(), ControlProtocolError> {
 		self.validate(context)?;
 		let (slot, id, authority) = self.bound()?;
 		authority.authorize(context, operation, arguments)?;
 		if !slot.is_live(id) {
-			return Err(super::exthost::control::ControlProtocolError::new(
+			return Err(ControlProtocolError::new(
 				"StaleGeneration",
 				"the Agents lease changed while authorizing the request",
 			));
@@ -1007,26 +1016,23 @@ impl ControlAuthority for DynamicAgentsControlAuthority {
 		context: ControlRequestContext,
 		operation: Str,
 		arguments: serde_json::Map<String, serde_json::Value>,
-	) -> Result<serde_json::Value, super::exthost::control::ControlProtocolError> {
+	) -> Result<serde_json::Value, ControlProtocolError> {
 		self.validate(&context)?;
 		let (id, authority) = self
 			.requests
 			.lock()
 			.remove(&context.request_id)
 			.ok_or_else(|| {
-				super::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"AgentsOwnerUnavailable",
 					"the Agents request has no authorized lease",
 				)
 			})?;
 		let slot = self.slot.upgrade().ok_or_else(|| {
-			super::exthost::control::ControlProtocolError::new(
-				"AgentsOwnerUnavailable",
-				"the extension host has shut down",
-			)
+			ControlProtocolError::new("AgentsOwnerUnavailable", "the extension host has shut down")
 		})?;
 		if !slot.is_live(id) {
-			return Err(super::exthost::control::ControlProtocolError::new(
+			return Err(ControlProtocolError::new(
 				"StaleGeneration",
 				"the Agents lease changed before request dispatch",
 			));
@@ -1038,14 +1044,14 @@ impl ControlAuthority for DynamicAgentsControlAuthority {
 		&self,
 		context: ControlRequestContext,
 		effect: ControlEffect,
-	) -> Result<(), super::exthost::control::ControlProtocolError> {
+	) -> Result<(), ControlProtocolError> {
 		self.validate(&context)?;
 		let (slot, id, authority) = self.bound()?;
 		authority.effect(context, effect).await?;
 		if slot.is_live(id) {
 			Ok(())
 		} else {
-			Err(super::exthost::control::ControlProtocolError::new(
+			Err(ControlProtocolError::new(
 				"StaleGeneration",
 				"the Agents lease changed during effect dispatch",
 			))
@@ -1169,7 +1175,7 @@ fn missing_external_control_domains(
 	}
 	if manifest
 		.declarations
-		.permits(super::exthost::lifecycle::EscapeCapability::DirectFilesystem)
+		.permits(EscapeCapability::DirectFilesystem)
 		&& factories.direct_filesystem.is_none()
 	{
 		missing.push("direct-filesystem");
@@ -1292,12 +1298,14 @@ impl FrozenControlLifecycleHost {
 
 impl LifecycleHost for FrozenControlLifecycleHost {
 	fn freeze(&mut self) -> impl Future<Output = Result<(), Str>> + Send {
+		use std::time::Instant;
+
 		let dispatch = ControlDispatch {
 			operation: sf!("omp.lifecycle.freeze"),
 			arguments: serde_json::Map::new(),
 			authority: self.authority("freeze", InvocationPhase::Open, LifecyclePhase::Frozen),
 			policy:    CallbackConcurrency::Serialized,
-			deadline:  EventDeadline { at: std::time::Instant::now() + Duration::from_secs(10) },
+			deadline:  EventDeadline { at: Instant::now() + Duration::from_secs(10) },
 		};
 		async move {
 			let frozen = self
@@ -1331,7 +1339,10 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 		event: &ActivationEvent,
 		_principal: &Principal,
 	) -> impl Future<Output = Result<(), Str>> + Send {
+		use std::time::Instant;
+
 		let reason: &str = event.reason.into();
+
 		let trigger = match event.trigger {
 			ActivationTrigger::Static => "static",
 			ActivationTrigger::FirstReach => "first_reach",
@@ -1365,7 +1376,7 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 				LifecyclePhase::Active,
 			),
 			policy: CallbackConcurrency::Serialized,
-			deadline: EventDeadline { at: std::time::Instant::now() + Duration::from_secs(10) },
+			deadline: EventDeadline { at: Instant::now() + Duration::from_secs(10) },
 		};
 		async move {
 			self
@@ -1451,7 +1462,7 @@ impl ExtHostSupervisor {
 			let mut modules = Vec::with_capacity(extension.manifest.declaration_modules.len() + 1);
 			modules.push(extension.manifest.entry.clone());
 			modules.extend(extension.manifest.declaration_modules.iter().cloned());
-			let spawned = super::exthost::spawn::spawn(SpawnSpec {
+			let spawned = spawn(SpawnSpec {
 				key:                 extension.key.clone(),
 				executable:          config.executable.clone(),
 				python_site:         python_site.clone(),
@@ -1464,7 +1475,7 @@ impl ExtHostSupervisor {
 			})
 			.await
 			.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
-			let mut running = spawned
+			let running = spawned
 				.start_control((*identity).clone(), authority, &ControlAuthoritySnapshot::default())
 				.await
 				.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
@@ -1970,7 +1981,7 @@ impl ExtHostSupervisor {
 		let pending = {
 			let mut availability_sink = self.availability_sink.lock();
 			*availability_sink = Some(Arc::clone(&sink));
-			std::mem::take(&mut *self.availability_pending.lock())
+			mem::take(&mut *self.availability_pending.lock())
 		};
 		for batch in pending {
 			sink.set_availability(batch);
@@ -2051,14 +2062,14 @@ impl CallbackDispatcher for ExtHostSupervisor {
 		&self,
 		target: Arc<ControlConnectionIdentity>,
 		dispatch: ControlDispatch,
-	) -> Result<serde_json::Value, super::exthost::control::ControlProtocolError> {
+	) -> Result<serde_json::Value, ControlProtocolError> {
 		match self
 			.dispatch_extension_callback(target.as_ref(), dispatch)
 			.await
 		{
 			Ok(value) => Ok(value),
 			Err(ExtensionCallbackError::StaleHostGeneration { expected, actual }) => Err(
-				super::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"StaleGeneration",
 					format!("stale host generation: expected {expected}, got {actual}"),
 				)
@@ -2069,7 +2080,7 @@ impl CallbackDispatcher for ExtHostSupervisor {
 				})),
 			),
 			Err(ExtensionCallbackError::StaleSessionGeneration { expected, actual }) => Err(
-				super::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"StaleGeneration",
 					format!("stale session generation: expected {expected}, got {actual}"),
 				)
@@ -2079,42 +2090,31 @@ impl CallbackDispatcher for ExtHostSupervisor {
 					"actual": actual,
 				})),
 			),
-			Err(ExtensionCallbackError::Runtime(
-				super::exthost::control::ControlRuntimeError::Remote(error),
-			)) => Err(error),
-			Err(ExtensionCallbackError::Runtime(
-				super::exthost::control::ControlRuntimeError::Dispatch(
-					super::exthost::DispatchError::Deadline,
-				),
-			)) => Err(super::exthost::control::ControlProtocolError::new(
+			Err(ExtensionCallbackError::Runtime(ControlRuntimeError::Remote(error))) => Err(error),
+			Err(ExtensionCallbackError::Runtime(ControlRuntimeError::Dispatch(
+				DispatchError::Deadline,
+			))) => Err(ControlProtocolError::new(
 				"DeadlineExceeded",
 				"extension callback deadline elapsed",
 			)),
-			Err(ExtensionCallbackError::Session) => {
-				Err(super::exthost::control::ControlProtocolError::new(
-					"InvalidPhase",
-					"extension callback authority belongs to another session",
-				))
-			},
+			Err(ExtensionCallbackError::Session) => Err(ControlProtocolError::new(
+				"InvalidPhase",
+				"extension callback authority belongs to another session",
+			)),
 			Err(ExtensionCallbackError::UnknownHost) => Err(
-				super::exthost::control::ControlProtocolError::new(
+				ControlProtocolError::new(
 					"CallbackUnavailable",
 					"the registered extension callback host is unavailable",
 				)
 				.retryable(true),
 			),
-			Err(ExtensionCallbackError::InvalidOperation) => {
-				Err(super::exthost::control::ControlProtocolError::new(
-					"InvalidOperation",
-					"operation is not an extension device or hook callback",
-				))
-			},
+			Err(ExtensionCallbackError::InvalidOperation) => Err(ControlProtocolError::new(
+				"InvalidOperation",
+				"operation is not an extension device or hook callback",
+			)),
 			Err(ExtensionCallbackError::Runtime(error)) => Err(
-				super::exthost::control::ControlProtocolError::new(
-					"CallbackUnavailable",
-					Str::from(error.to_string()),
-				)
-				.retryable(true),
+				ControlProtocolError::new("CallbackUnavailable", Str::from(error.to_string()))
+					.retryable(true),
 			),
 		}
 	}
@@ -2176,7 +2176,7 @@ pub enum ExtensionCallbackError {
 	Session,
 	/// The live CONTROL runtime rejected or failed the callback.
 	#[error(transparent)]
-	Runtime(#[from] super::exthost::control::ControlRuntimeError),
+	Runtime(#[from] ControlRuntimeError),
 }
 
 /// Worker startup, transport, protocol, or embedded-Python failure.
@@ -2246,7 +2246,7 @@ pub enum WorkerError {
 	Unavailable,
 	/// Named-worker routing refused immediate placement.
 	#[error(transparent)]
-	WorkerUnavailable(#[from] crate::worker_pool::WorkerUnavailable),
+	WorkerUnavailable(#[from] WorkerUnavailable),
 }
 
 impl From<PyErr> for WorkerError {
@@ -2414,7 +2414,7 @@ impl ProcessConfig {
 		let mut modules = Vec::new();
 		for extension in extensions {
 			let key = extension.key;
-			for module in std::iter::once(extension.manifest.entry.clone())
+			for module in iter::once(extension.manifest.entry.clone())
 				.chain(extension.manifest.declaration_modules.iter().cloned())
 			{
 				if !modules_seen.insert(module.clone()) {
@@ -2601,7 +2601,7 @@ pub struct ExtensionCampaignResolver {
 	callbacks: Arc<dyn CallbackDispatcher>,
 	evidence:  Arc<CampaignEvidenceLookup>,
 	owners:    Mutex<BTreeMap<Str, Str>>,
-	runtime:   Option<tokio::runtime::Handle>,
+	runtime:   Option<runtime::Handle>,
 }
 
 impl ExtensionCampaignResolver {
@@ -2617,7 +2617,7 @@ impl ExtensionCampaignResolver {
 			callbacks,
 			evidence: Arc::new(evidence),
 			owners: Mutex::new(BTreeMap::new()),
-			runtime: tokio::runtime::Handle::try_current().ok(),
+			runtime: runtime::Handle::try_current().ok(),
 		})
 	}
 
@@ -2844,7 +2844,7 @@ struct ExtensionCampaignMachine {
 	exhaust:      omp_agent::ExhaustPolicy,
 	state:        Str,
 	engagement:   Str,
-	runtime:      Option<tokio::runtime::Handle>,
+	runtime:      Option<runtime::Handle>,
 }
 impl ExtensionCampaignMachine {
 	fn point_name(point: omp_core::Point) -> &'static str {
@@ -2933,12 +2933,11 @@ impl ExtensionCampaignMachine {
 }
 
 impl omp_agent::CampaignMachine for ExtensionCampaignMachine {
-	fn react(
-		&mut self,
-		point: omp_core::Point,
-		context: &omp_agent::arbiter::PointCx<'_>,
-	) -> omp_agent::Reaction {
+	fn react(&mut self, point: omp_core::Point, context: &PointCx<'_>) -> omp_agent::Reaction {
+		use std::time::Instant;
+
 		let event = serde_json::json!({
+
 			"turn_id": context.turn_id,
 			"invocation_id": context.invocation_id,
 			"stream_delta": context.stream_delta,
@@ -2998,9 +2997,7 @@ impl omp_agent::CampaignMachine for ExtensionCampaignMachine {
 				direct_filesystem: None,
 			},
 			policy: CallbackConcurrency::Serialized,
-			deadline: EventDeadline {
-				at: std::time::Instant::now() + crate::exthost::dispatch::CAMPAIGN_SUBMISSION_TIMEOUT,
-			},
+			deadline: EventDeadline { at: Instant::now() + CAMPAIGN_SUBMISSION_TIMEOUT },
 		};
 		let Some(runtime) = self.runtime.clone() else {
 			return self.failed("campaign callback runtime is unavailable");
@@ -3008,8 +3005,8 @@ impl omp_agent::CampaignMachine for ExtensionCampaignMachine {
 		let callback = self
 			.callbacks
 			.dispatch(Arc::clone(&self.identity), dispatch);
-		let result = if tokio::runtime::Handle::try_current().is_ok() {
-			tokio::task::block_in_place(|| runtime.block_on(callback))
+		let result = if runtime::Handle::try_current().is_ok() {
+			task::block_in_place(|| runtime.block_on(callback))
 		} else {
 			runtime.block_on(callback)
 		};
@@ -3294,7 +3291,7 @@ pub fn seal_registry_evidence(
 	{
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
-	let modules = std::iter::once(manifest.entry.as_str())
+	let modules = iter::once(manifest.entry.as_str())
 		.chain(manifest.declaration_modules.iter().map(Str::as_str))
 		.collect::<BTreeSet<_>>();
 	if snapshot
@@ -3568,7 +3565,7 @@ impl WorkerProcess {
 			.manifests
 			.iter()
 			.flat_map(|(key, manifest)| {
-				std::iter::once(&manifest.entry)
+				iter::once(&manifest.entry)
 					.chain(manifest.declaration_modules.iter())
 					.map(|module| AdmittedExtension {
 						extension_id: key.extension().to_string(),
@@ -3671,7 +3668,7 @@ impl WorkerProcess {
 		deadline: Duration,
 		config: &ProcessConfig,
 	) -> Result<WorkerFrame, WorkerError> {
-		tokio::time::timeout(
+		time::timeout(
 			deadline,
 			read_async_frame(&mut self.stdout, config.max_frame_bytes, &mut self.read_scratch),
 		)
@@ -3689,18 +3686,12 @@ impl WorkerProcess {
 		let pid = self.child.id();
 		#[cfg(unix)]
 		if let Some(pid) = pid {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(pid.cast_signed()),
-				nix::sys::signal::Signal::SIGINT,
-			);
+			let _ = signal::killpg(Pid::from_raw(pid.cast_signed()), signal::Signal::SIGINT);
 		}
 		#[cfg(windows)]
 		if let Some(pid) = pid {
 			unsafe {
-				let _ = windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
-					windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
-					pid,
-				);
+				let _ = Console::GenerateConsoleCtrlEvent(Console::CTRL_BREAK_EVENT, pid);
 			}
 		}
 	}
@@ -3708,15 +3699,12 @@ impl WorkerProcess {
 	async fn terminate(&mut self, grace: Duration) {
 		let pid = self.child.id();
 		self.courtesy_interrupt();
-		if tokio::time::timeout(grace, self.child.wait()).await.is_ok() {
+		if time::timeout(grace, self.child.wait()).await.is_ok() {
 			return;
 		}
 		#[cfg(unix)]
 		if let Some(pid) = pid {
-			let _ = nix::sys::signal::killpg(
-				nix::unistd::Pid::from_raw(pid.cast_signed()),
-				nix::sys::signal::Signal::SIGKILL,
-			);
+			let _ = signal::killpg(Pid::from_raw(pid.cast_signed()), signal::Signal::SIGKILL);
 		}
 		#[cfg(windows)]
 		{
@@ -3863,6 +3851,8 @@ async fn send_resource_update(
 	request_id: u64,
 	extension_id: &str,
 ) -> Result<(), WorkerError> {
+	use std::time::Instant;
+
 	let owner = config
 		.manifests
 		.keys()
@@ -3871,7 +3861,7 @@ async fn send_resource_update(
 	let receipt = config
 		.resources
 		.lock()
-		.resources(config.session_id.as_str(), owner, std::time::Instant::now())
+		.resources(config.session_id.as_str(), owner, Instant::now())
 		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
 	let quotas = receipt
 		.quotas
@@ -3949,9 +3939,12 @@ async fn run_control_supervisor(
 	owner: HostKey,
 	session_id: Str,
 	session_generation: u64,
-	mailbox: flume::Receiver<SupervisorCommand>,
+	mailbox: Receiver<SupervisorCommand>,
 ) {
+	use std::time::Instant;
+
 	let mut pending = BTreeMap::<u64, PendingInvocation>::new();
+
 	let in_flight = Arc::new(Mutex::new(BTreeMap::<u64, Str>::new()));
 	while let Ok(command) = mailbox.recv_async().await {
 		match command {
@@ -4023,7 +4016,7 @@ async fn run_control_supervisor(
 					arguments,
 					authority,
 					policy: CallbackConcurrency::Serialized,
-					deadline: EventDeadline { at: std::time::Instant::now() + invocation.call.deadline },
+					deadline: EventDeadline { at: Instant::now() + invocation.call.deadline },
 				};
 				in_flight
 					.lock()
@@ -4040,7 +4033,9 @@ async fn run_control_supervisor(
 								.send(WorkerEvent::Complete(WorkerCompletion {
 									call_id:      invocation.call.invocation_id,
 									kind:         WorkerOutcomeKind::Ok,
-									parts:        vec![Part { kind: Some(part::Kind::Text(text)) }],
+									parts:        vec![Part {
+										kind: Some(omp_proto::thread::v1::part::Kind::Text(text)),
+									}],
 									details_json: None,
 									details_blob: None,
 									args_issue:   None,
@@ -4101,14 +4096,14 @@ async fn run_supervisor(
 	config: ProcessConfig,
 	mut process: WorkerProcess,
 	expected_registrations: Arc<[ToolDecl]>,
-	mailbox: flume::Receiver<SupervisorCommand>,
+	mailbox: Receiver<SupervisorCommand>,
 	host_generation: Arc<AtomicU64>,
 	mut generation: u64,
 	service_router: Arc<ServiceRouter>,
 ) {
 	let mut pending = VecDeque::new();
 	let mut ping_nonce = 1_u64;
-	let mut ping_tick = tokio::time::interval(config.ping_interval);
+	let mut ping_tick = time::interval(config.ping_interval);
 	let mut healthy_since = Instant::now();
 	let mut backoff = initial_backoff(&config);
 	ping_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -4176,8 +4171,8 @@ async fn run_supervisor(
 							.write(
 								&HostFrame {
 									request_id,
-									body: Some(host_frame::Body::Lifecycle(LifecycleHostEnvelope {
-										body: Some(lifecycle_host_envelope::Body::ServiceDispatch(frame)),
+									body: Some(omp_proto::toolhost::v1::host_frame::Body::Lifecycle(LifecycleHostEnvelope {
+										body: Some(omp_proto::toolhost::v1::lifecycle_host_envelope::Body::ServiceDispatch(frame)),
 										props: None,
 									})),
 									props: None,
@@ -4186,12 +4181,12 @@ async fn run_supervisor(
 							)
 							.await?;
 						let response = process.read_timeout(&config).await?;
-						let Some(worker_frame::Body::Lifecycle(envelope)) = response.body else {
+						let Some(omp_proto::toolhost::v1::worker_frame::Body::Lifecycle(envelope)) = response.body else {
 							return Err(WorkerError::Protocol(sf!(
 								"provider did not return a lifecycle envelope",
 							)));
 						};
-						let Some(lifecycle_worker_envelope::Body::ServiceResult(result)) =
+						let Some(omp_proto::toolhost::v1::lifecycle_worker_envelope::Body::ServiceResult(result)) =
 							envelope.body
 						else {
 							return Err(WorkerError::Protocol(sf!(
@@ -4221,12 +4216,12 @@ async fn run_supervisor(
 			_ = ping_tick.tick() => {
 				let frame = HostFrame {
 					request_id: 0,
-					body: Some(host_frame::Body::Ping(Ping { nonce: ping_nonce, props: None })),
+					body: Some(omp_proto::toolhost::v1::host_frame::Body::Ping(Ping { nonce: ping_nonce, props: None })),
 					props: None,
 				};
 				let healthy = process.write(&frame, &config).await.is_ok()
 					&& matches!(process.read_timeout(&config).await,
-						Ok(WorkerFrame { body: Some(worker_frame::Body::Pong(Pong { nonce, .. })), .. }) if nonce == ping_nonce);
+						Ok(WorkerFrame { body: Some(omp_proto::toolhost::v1::worker_frame::Body::Pong(Pong { nonce, .. })), .. }) if nonce == ping_nonce);
 				ping_nonce = ping_nonce.wrapping_add(1).max(1);
 				if !healthy {
 					if healthy_since.elapsed() >= config.healthy_reset {
@@ -4261,7 +4256,7 @@ async fn dispatch_journal_control(
 	invocation: &PendingInvocation,
 	host_generation: u64,
 	request_id: u64,
-	envelope: omp_proto::toolhost::v1::JournalWorkerEnvelope,
+	envelope: v1::JournalWorkerEnvelope,
 ) -> Result<(), WorkerError> {
 	if request_id == 0 {
 		return Err(WorkerError::Protocol(sf!("journal CONTROL request_id must be nonzero",)));
@@ -4306,7 +4301,7 @@ async fn dispatch_journal_control(
 				.await
 		},
 		JournalDispatch::Rows { request_id, rows } => {
-			for reply in super::exthost::control::journal_rows(&rows) {
+			for reply in journal_rows(&rows) {
 				process
 					.write(
 						&HostFrame {
@@ -4352,7 +4347,7 @@ async fn dispatch_service_call(
 	router: &Arc<ServiceRouter>,
 	host_generation: u64,
 	request_id: u64,
-	call: omp_proto::toolhost::v1::ServiceCall,
+	call: v1::ServiceCall,
 ) -> Result<(), WorkerError> {
 	if request_id == 0
 		|| call.extension_id != invocation.owner.extension().as_str()
@@ -4423,11 +4418,10 @@ async fn dispatch_service_call(
 		})
 		.await
 		.map_err(|_| WorkerError::Unavailable)?;
-	let result =
-		tokio::time::timeout(Duration::from_millis(call.deadline_ms), response.recv_async())
-			.await
-			.map_err(|_| WorkerError::Protocol(sf!("service call deadline elapsed")))?
-			.map_err(|_| WorkerError::Unavailable)??;
+	let result = time::timeout(Duration::from_millis(call.deadline_ms), response.recv_async())
+		.await
+		.map_err(|_| WorkerError::Protocol(sf!("service call deadline elapsed")))?
+		.map_err(|_| WorkerError::Unavailable)??;
 	if result.caller_request_id != request_id || result.provider_generation != provider_generation {
 		return Err(WorkerError::Protocol(sf!("provider ServiceResult identity is stale",)));
 	}
@@ -4480,7 +4474,7 @@ async fn run_invocation(
 	config: &ProcessConfig,
 	process: &mut WorkerProcess,
 	mut invocation: PendingInvocation,
-	mailbox: &flume::Receiver<SupervisorCommand>,
+	mailbox: &Receiver<SupervisorCommand>,
 	pending: &mut VecDeque<PendingInvocation>,
 	service_router: &Arc<ServiceRouter>,
 	host_generation: u64,
@@ -4636,8 +4630,8 @@ async fn run_invocation(
 					send_abort(&invocation, WorkerAbortKind::Crashed, "worker exited during invocation");
 					return InvocationAction::ReplaceWorker(RestartReason::Crash);
 				};
-				if let Some(worker_frame::Body::Lifecycle(envelope)) = &frame.body
-					&& let Some(lifecycle_worker_envelope::Body::SetAvailability(availability)) =
+				if let Some(omp_proto::toolhost::v1::worker_frame::Body::Lifecycle(envelope)) = &frame.body
+					&& let Some(omp_proto::toolhost::v1::lifecycle_worker_envelope::Body::SetAvailability(availability)) =
 						&envelope.body
 				{
 					if availability.deltas.iter().any(|delta| !owns_availability(config, delta)) {
@@ -4656,8 +4650,8 @@ async fn run_invocation(
 					}
 					continue;
 				}
-				if let Some(worker_frame::Body::Lifecycle(envelope)) = &frame.body
-					&& let Some(lifecycle_worker_envelope::Body::ResourceQuery(query)) =
+				if let Some(omp_proto::toolhost::v1::worker_frame::Body::Lifecycle(envelope)) = &frame.body
+					&& let Some(omp_proto::toolhost::v1::lifecycle_worker_envelope::Body::ResourceQuery(query)) =
 						&envelope.body
 				{
 					if query.extension_id != invocation.owner.extension().as_str()
@@ -4679,7 +4673,7 @@ async fn run_invocation(
 					}
 					continue;
 				}
-				if let Some(worker_frame::Body::Journal(envelope)) = &frame.body {
+				if let Some(omp_proto::toolhost::v1::worker_frame::Body::Journal(envelope)) = &frame.body {
 					if dispatch_journal_control(
 						process,
 						config,
@@ -4700,7 +4694,7 @@ async fn run_invocation(
 					}
 					continue;
 				}
-				if let Some(worker_frame::Body::Lifecycle(envelope)) = &frame.body
+				if let Some(omp_proto::toolhost::v1::worker_frame::Body::Lifecycle(envelope)) = &frame.body
 					&& let Some(lifecycle_worker_envelope::Body::ServiceCall(call)) = &envelope.body
 				{
 					if let Err(error) = dispatch_service_call(
@@ -4718,8 +4712,8 @@ async fn run_invocation(
 							.write(
 								&HostFrame {
 									request_id: frame.request_id,
-									body: Some(host_frame::Body::Lifecycle(LifecycleHostEnvelope {
-										body: Some(lifecycle_host_envelope::Body::ServiceReply(
+									body: Some(omp_proto::toolhost::v1::host_frame::Body::Lifecycle(LifecycleHostEnvelope {
+										body: Some(omp_proto::toolhost::v1::lifecycle_host_envelope::Body::ServiceReply(
 											ServiceReply {
 												payload: Bytes::new(),
 												error: Some(ProtocolError {
@@ -4745,13 +4739,13 @@ async fn run_invocation(
 					return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
 				}
 				match frame.body {
-					Some(worker_frame::Body::ToolUpdate(update)) if update.call_id == call_id.as_str() => {
+					Some(omp_proto::toolhost::v1::worker_frame::Body::ToolUpdate(update)) if update.call_id == call_id.as_str() => {
 						if invocation.events.send(WorkerEvent::Update(update)).is_err() {
 							cancel_worker(process, config, request_id, &call_id, "invocation receiver dropped").await;
 							return InvocationAction::ReplaceWorker(RestartReason::CancelEscalation);
 						}
 					},
-					Some(worker_frame::Body::ToolComplete(complete)) if complete.call_id == call_id.as_str() => {
+					Some(omp_proto::toolhost::v1::worker_frame::Body::ToolComplete(complete)) if complete.call_id == call_id.as_str() => {
 						let Ok(complete) = WorkerCompletion::try_from(complete) else {
 							send_abort(
 								&invocation,
@@ -4763,7 +4757,7 @@ async fn run_invocation(
 						let _ = invocation.events.send(WorkerEvent::Complete(complete));
 						return InvocationAction::KeepWorker;
 					},
-					Some(worker_frame::Body::Arguments(arguments)) => match arguments.body {
+					Some(omp_proto::toolhost::v1::worker_frame::Body::Arguments(arguments)) => match arguments.body {
 						Some(omp_proto::toolhost::v1::argument_worker_envelope::Body::PullRequest(pull)) => {
 							if !invocation.streams_args || pull.call_id != call_id.as_str() || pull_open {
 								let message = if pull_open {
@@ -4803,7 +4797,7 @@ async fn run_invocation(
 							return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
 						},
 					},
-					Some(worker_frame::Body::ToolAborted(aborted)) if aborted.call_id == call_id.as_str() => {
+					Some(omp_proto::toolhost::v1::worker_frame::Body::ToolAborted(aborted)) if aborted.call_id == call_id.as_str() => {
 						let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
 							call_id,
 							kind: WorkerAbortKind::Crashed,
@@ -4812,7 +4806,7 @@ async fn run_invocation(
 						}));
 						return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
 					},
-					Some(worker_frame::Body::Error(error)) => {
+					Some(omp_proto::toolhost::v1::worker_frame::Body::Error(error)) => {
 						let _ = invocation.events.send(WorkerEvent::ProtocolError(error));
 						return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
 					},
@@ -4834,7 +4828,7 @@ async fn run_invocation(
 						send_host_protocol_error(&invocation, ProtocolErrorCode::InvalidArgument, "stale or illegal ArgText");
 						return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
 					}
-					if write_argument_frame(process, config, request_id, argument_host_envelope::Body::ArgText(frame)).await.is_err() {
+					if write_argument_frame(process, config, request_id, omp_proto::toolhost::v1::argument_host_envelope::Body::ArgText(frame)).await.is_err() {
 						send_abort(&invocation, WorkerAbortKind::Crashed, "worker exited during ArgText");
 						return InvocationAction::ReplaceWorker(RestartReason::Crash);
 					}
@@ -4844,7 +4838,7 @@ async fn run_invocation(
 						send_host_protocol_error(&invocation, ProtocolErrorCode::InvalidArgument, "stale or duplicate ArgsCommitted");
 						return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
 					}
-					if write_argument_frame(process, config, request_id, argument_host_envelope::Body::ArgsCommitted(frame.clone())).await.is_err() {
+					if write_argument_frame(process, config, request_id, omp_proto::toolhost::v1::argument_host_envelope::Body::ArgsCommitted(frame.clone())).await.is_err() {
 						send_abort(&invocation, WorkerAbortKind::Crashed, "worker exited during ArgsCommitted");
 						return InvocationAction::ReplaceWorker(RestartReason::Crash);
 					}
@@ -4856,7 +4850,7 @@ async fn run_invocation(
 						return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
 					}
 					let terminal = reply.complete || reply.issue.is_some();
-					if write_argument_frame(process, config, request_id, argument_host_envelope::Body::PullReply(reply)).await.is_err() {
+					if write_argument_frame(process, config, request_id, omp_proto::toolhost::v1::argument_host_envelope::Body::PullReply(reply)).await.is_err() {
 						send_abort(&invocation, WorkerAbortKind::Crashed, "worker exited during PullReply");
 						return InvocationAction::ReplaceWorker(RestartReason::Crash);
 					}
@@ -4866,7 +4860,7 @@ async fn run_invocation(
 				},
 				Ok(SupervisorCommand::Interrupt { id: interrupted, frame }) if interrupted == id => {
 					if frame.invocation_id != call_id.as_str()
-						|| write_argument_frame(process, config, request_id, argument_host_envelope::Body::Interrupt(frame)).await.is_err()
+						|| write_argument_frame(process, config, request_id, omp_proto::toolhost::v1::argument_host_envelope::Body::Interrupt(frame)).await.is_err()
 					{
 						send_host_protocol_error(&invocation, ProtocolErrorCode::InvalidArgument, "stale or undeliverable Interrupt");
 						return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
@@ -4887,7 +4881,7 @@ async fn run_invocation(
 				Ok(SupervisorCommand::Shutdown) | Err(_) => return InvocationAction::Shutdown,
 				Ok(command) => stage_pending(pending, command),
 			},
-			() = tokio::time::sleep_until(deadline) => {
+			() = time::sleep_until(deadline) => {
 				cancel_worker(process, config, request_id, &call_id, "worker invocation timed out").await;
 				send_abort(&invocation, WorkerAbortKind::TimedOut, "worker invocation timed out");
 				return InvocationAction::ReplaceWorker(RestartReason::CancelEscalation);
@@ -4896,10 +4890,7 @@ async fn run_invocation(
 	}
 }
 
-fn owns_availability(
-	config: &ProcessConfig,
-	delta: &omp_proto::toolhost::v1::AvailabilityDelta,
-) -> bool {
+fn owns_availability(config: &ProcessConfig, delta: &v1::AvailabilityDelta) -> bool {
 	config.manifests.values().any(|manifest| {
 		manifest
 			.declarations
@@ -5104,7 +5095,7 @@ async fn respawn(
 ) -> WorkerProcess {
 	let max_delay = config.max_backoff.max(Duration::from_millis(1));
 	loop {
-		tokio::time::sleep(*backoff).await;
+		time::sleep(*backoff).await;
 		*generation = generation.wrapping_add(1).max(1);
 		match WorkerProcess::spawn(config, *generation, ActivationCause::Restart(reason)).await {
 			Ok(process) if process.registrations.as_slice() == expected => {
@@ -5244,7 +5235,7 @@ fn parse_service_registrations(
 			.manifests
 			.iter()
 			.filter(|(_, manifest)| {
-				std::iter::once(&manifest.entry)
+				iter::once(&manifest.entry)
 					.chain(manifest.declaration_modules.iter())
 					.any(|module| module.as_str() == service.source_module)
 			})
@@ -5599,7 +5590,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			body:       Some(worker_frame::Body::Hello(WorkerHello {
 				schema_rev: omp_proto::SCHEMA_REV,
 				python_rev: PYTHON_REV.to_owned(),
-				worker_id: Bytes::copy_from_slice(&std::process::id().to_be_bytes()),
+				worker_id: Bytes::copy_from_slice(&process::id().to_be_bytes()),
 				api_level: 1,
 				layer,
 				tier: tier.clone(),
@@ -5710,7 +5701,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 		request_id: u64,
 		dispatch: &WireServiceDispatch,
 	) -> Result<Vec<u8>, WorkerError> {
-		let payload = std::str::from_utf8(&dispatch.payload)
+		let payload = str::from_utf8(&dispatch.payload)
 			.map_err(|_| WorkerError::Protocol(sf!("service payload is not UTF-8 JSON")))?;
 		engine
 			.attach(|py| -> PyResult<Vec<u8>> {
@@ -5776,20 +5767,18 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 					&mut writer,
 					&WorkerFrame {
 						request_id: frame.request_id,
-						body:       Some(worker_frame::Body::Lifecycle(
-							omp_proto::toolhost::v1::LifecycleWorkerEnvelope {
-								body:  Some(lifecycle_worker_envelope::Body::ExtensionActivated(
-									ExtensionActivated {
-										extension_id: activate.extension_id,
-										generation: activate.generation,
-										degraded,
-										error,
-										props: None,
-									},
-								)),
-								props: None,
-							},
-						)),
+						body:       Some(worker_frame::Body::Lifecycle(v1::LifecycleWorkerEnvelope {
+							body:  Some(lifecycle_worker_envelope::Body::ExtensionActivated(
+								ExtensionActivated {
+									extension_id: activate.extension_id,
+									generation: activate.generation,
+									degraded,
+									error,
+									props: None,
+								},
+							)),
+							props: None,
+						})),
 						props:      None,
 					},
 					limit,
@@ -5846,20 +5835,16 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 					&mut writer,
 					&WorkerFrame {
 						request_id: frame.request_id,
-						body:       Some(worker_frame::Body::Lifecycle(
-							omp_proto::toolhost::v1::LifecycleWorkerEnvelope {
-								body:  Some(lifecycle_worker_envelope::Body::ServiceResult(
-									ServiceResult {
-										caller_request_id: dispatch.caller_request_id,
-										provider_generation: dispatch.provider_generation,
-										payload: payload.into(),
-										error,
-										props: None,
-									},
-								)),
+						body:       Some(worker_frame::Body::Lifecycle(v1::LifecycleWorkerEnvelope {
+							body:  Some(lifecycle_worker_envelope::Body::ServiceResult(ServiceResult {
+								caller_request_id: dispatch.caller_request_id,
+								provider_generation: dispatch.provider_generation,
+								payload: payload.into(),
+								error,
 								props: None,
-							},
-						)),
+							})),
+							props: None,
+						})),
 						props:      None,
 					},
 					limit,
@@ -5989,7 +5974,7 @@ fn dispatch_python_campaign(
 	engine: &omp_py::Engine,
 	react: &CampaignReact,
 ) -> Result<CampaignReaction, WorkerError> {
-	let point = omp_proto::toolhost::v1::CampaignPoint::try_from(react.point)
+	let point = v1::CampaignPoint::try_from(react.point)
 		.map_err(|_| WorkerError::Protocol(sf!("CampaignReact has an invalid point")))?;
 	let point = point
 		.as_str_name()
@@ -6174,7 +6159,7 @@ fn load_tools(
 					)));
 				}
 				let schema = row.getattr("schema")?;
-				let schema_json = if schema.is_instance_of::<omp_py::pyo3::types::PyString>() {
+				let schema_json = if schema.is_instance_of::<PyString>() {
 					Bytes::from(schema.extract::<String>()?)
 				} else {
 					Bytes::from(
@@ -6366,7 +6351,7 @@ fn serve_invocation<W: Write>(
 	let call_id = invoke.call_id.clone();
 	let result = engine.attach(|py| -> Result<PythonCompletion, WorkerError> {
 		let json = PyModule::import(py, "json")?;
-		let args = std::str::from_utf8(invoke.args_json.as_ref())
+		let args = str::from_utf8(invoke.args_json.as_ref())
 			.map_err(|_| WorkerError::Python(sf!("committed args are not UTF-8")))?;
 		let params = json.getattr("loads")?.call1((args,))?;
 		let mut value = match &tool.kind {
@@ -6826,10 +6811,11 @@ mod tests {
 	use pyo3::ffi::c_str;
 
 	use super::*;
+	use crate::tools::python_engine;
 
 	#[test]
 	fn prelude_declaration_extracts_and_invokes_adapter() {
-		let engine = crate::tools::python_engine().expect("initialize embedded Python");
+		let engine = python_engine().expect("initialize embedded Python");
 		engine
 			.attach(|py| {
 				py.run(
@@ -6944,7 +6930,7 @@ async def worker_prelude_round_trip(patches, *, strategy: str = "sequential"):
 			&mut write_scratch,
 		)
 		.expect("invoke prelude helper");
-		let mut reader = std::io::Cursor::new(encoded);
+		let mut reader = io::Cursor::new(encoded);
 		let mut read_scratch = BytesMut::new();
 		let frame = read_sync_frame::<_, WorkerFrame>(&mut reader, limit, &mut read_scratch)
 			.expect("decode worker frame")

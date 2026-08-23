@@ -112,7 +112,7 @@ pub(crate) fn printenv_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
-	use std::ffi::OsString;
+	use std::{ffi::OsString, iter};
 
 	use clap::Parser;
 
@@ -126,8 +126,7 @@ mod tests {
 		for &(name, value) in env {
 			host.set_test_var(name, value);
 		}
-		let argv =
-			std::iter::once(OsString::from(Printenv::NAME)).chain(args.iter().map(OsString::from));
+		let argv = iter::once(OsString::from(Printenv::NAME)).chain(args.iter().map(OsString::from));
 		let parsed = Printenv::try_parse_from(argv).expect("test arguments must parse");
 		let code = parsed.run(&mut host);
 		(code, capture.out(), capture.err())

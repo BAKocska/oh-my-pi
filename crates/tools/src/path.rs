@@ -1,8 +1,12 @@
 //! Shared model-path normalization for workspace tools.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+	env,
+	path::{Component, Path, PathBuf},
+};
 
 use omp_core::Str;
+use url::Url;
 use xutf::IntoUnicodeNormalized as _;
 
 /// Host path vocabulary used for platform-specific aliases.
@@ -180,7 +184,7 @@ fn strip_file_url(input: &str) -> Option<String> {
 	{
 		return None;
 	}
-	let parsed = url::Url::parse(input).ok()?;
+	let parsed = Url::parse(input).ok()?;
 	if parsed.scheme() != "file" {
 		return None;
 	}
@@ -253,8 +257,8 @@ fn expand_home(input: &str, home: Option<&Path>) -> String {
 	}
 	let home = home
 		.map(Path::to_path_buf)
-		.or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-		.or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from));
+		.or_else(|| env::var_os("HOME").map(PathBuf::from))
+		.or_else(|| env::var_os("USERPROFILE").map(PathBuf::from));
 	let Some(mut home) = home else {
 		return input.to_owned();
 	};

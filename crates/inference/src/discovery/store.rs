@@ -6,7 +6,7 @@ use std::{path::Path, time::Duration};
 use omp_catalog::{DiscoveredModel, ProviderId};
 use omp_core::Str;
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{Connection, OptionalExtension as _, params, types};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -254,11 +254,7 @@ impl DiscoveryStore {
 				|row| {
 					let state: String = row.get(0)?;
 					let state = state.parse().map_err(|_| {
-						rusqlite::Error::InvalidColumnType(
-							0,
-							"state".to_owned(),
-							rusqlite::types::Type::Text,
-						)
+						rusqlite::Error::InvalidColumnType(0, "state".to_owned(), types::Type::Text)
 					})?;
 					Ok(ProviderLifecycle {
 						provider: provider.to_owned(),
@@ -310,6 +306,8 @@ pub enum DiscoveryStoreError {
 
 #[cfg(test)]
 mod tests {
+	use std::str;
+
 	use omp_catalog::{ModelAvailability, ModelLimits, OperationBits, RouteId, WireModelId};
 
 	use super::*;
@@ -439,7 +437,7 @@ mod tests {
 				|row| row.get(0),
 			)
 			.expect("cached row");
-		let encoded = std::str::from_utf8(&encoded).expect("JSON text");
+		let encoded = str::from_utf8(&encoded).expect("JSON text");
 		assert!(!encoded.contains("authorization"));
 		assert!(!encoded.contains("headers"));
 		assert!(!encoded.contains("credential-secret"));

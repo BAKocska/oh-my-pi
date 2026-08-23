@@ -1,7 +1,9 @@
 //! Background incremental transcript ingestion with durable byte watermarks.
 
 use std::{
+	fmt, fs,
 	fs::File,
+	io,
 	io::{Read as _, Seek as _, SeekFrom},
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -9,6 +11,7 @@ use std::{
 	time::UNIX_EPOCH,
 };
 
+use flume::Receiver;
 use omp_core::Str;
 use omp_telemetry::{sentiment::analyze_user_sentiment, stats::LocalAnalyticsConsent};
 use serde_json::Value;
@@ -38,7 +41,7 @@ pub struct ScanReport {
 pub enum StatsIngestError {
 	/// Journal I/O failed.
 	#[error("failed to scan statistics journal")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// Statistics database operation failed.
 	#[error(transparent)]
 	Database(#[from] StatsDbError),
@@ -58,8 +61,8 @@ pub struct StatsIngestor {
 	workers: Vec<thread::JoinHandle<()>>,
 }
 
-impl std::fmt::Debug for StatsIngestor {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for StatsIngestor {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("StatsIngestor")
 			.field("workers", &self.workers.len())
@@ -89,7 +92,7 @@ impl StatsIngestor {
 	pub fn scan(
 		&self,
 		path: impl Into<PathBuf>,
-	) -> Result<flume::Receiver<Result<ScanReport, StatsIngestError>>, StatsIngestError> {
+	) -> Result<Receiver<Result<ScanReport, StatsIngestError>>, StatsIngestError> {
 		let (response, receiver) = flume::bounded(1);
 		self
 			.sender
@@ -110,7 +113,7 @@ impl Drop for StatsIngestor {
 	}
 }
 
-fn worker(database: &StatsDb, receiver: &flume::Receiver<Job>) {
+fn worker(database: &StatsDb, receiver: &Receiver<Job>) {
 	while let Ok(job) = receiver.recv() {
 		let result = scan_journal(database, &job.path);
 		let _ = job.response.send(result);
@@ -125,7 +128,7 @@ pub fn scan_journal(database: &StatsDb, path: &Path) -> Result<ScanReport, Stats
 	if database.consent() == LocalAnalyticsConsent::Disabled {
 		return Ok(ScanReport::default());
 	}
-	let canonical = std::fs::canonicalize(path)?;
+	let canonical = fs::canonicalize(path)?;
 	let mut file = File::open(&canonical)?;
 	let size = file.metadata()?.len();
 	let prior = database.file_offset(&canonical)?.min(size);

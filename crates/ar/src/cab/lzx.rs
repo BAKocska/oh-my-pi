@@ -1,3 +1,5 @@
+use std::mem;
+
 use crate::{Error, Result};
 
 const FRAME_SIZE: usize = 32 * 1024;
@@ -384,10 +386,10 @@ impl Decoder {
 			let match_offset = if slot == 0 {
 				self.r0
 			} else if slot == 1 {
-				std::mem::swap(&mut self.r1, &mut self.r0);
+				mem::swap(&mut self.r1, &mut self.r0);
 				self.r0
 			} else if slot == 2 {
-				std::mem::swap(&mut self.r2, &mut self.r0);
+				mem::swap(&mut self.r2, &mut self.r0);
 				self.r0
 			} else {
 				let (&base, &extra) = self

@@ -48,6 +48,8 @@ enum HubView {
 
 /// Retained responsive Agent Hub overlay.
 const LEFT_TAP_WINDOW: Duration = Duration::from_millis(500);
+/// Retained overlay for navigating and acting on the backend-owned agent
+/// hierarchy.
 pub struct AgentHub {
 	ui:        Ui,
 	rows:      Vec<AgentRow>,

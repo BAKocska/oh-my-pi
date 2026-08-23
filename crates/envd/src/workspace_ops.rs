@@ -11,23 +11,32 @@ use std::{
 	io::{self, Cursor, Read, Write},
 	ops::ControlFlow,
 	path::{Component, Path, PathBuf},
+	process,
 	process::Command,
+	slice,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
+	time,
 };
 #[cfg(target_os = "linux")]
 use std::{fs::OpenOptions, os::fd::AsRawFd as _};
 
 use bytes::Bytes;
 use omp_core::{Hash32, Str, Ulid, encoding::hex, sf};
-use omp_proto::{document::v1 as document_pb, env::v1 as pb};
+use omp_proto::{
+	document::v1::{
+		self as document_pb, commit_transaction_response, document_mutation, text_mutation,
+	},
+	env::v1 as pb,
+};
 use omp_walker::{FileType, WalkOrder};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use super::{
 	super::{
@@ -160,10 +169,8 @@ struct OperationsInner {
 	documents:       DocumentHost,
 	blobs:           BlobHost,
 	worktree_root:   PathBuf,
-	cache:           Mutex<HashMap<PathBuf, CachedFile>>,
-	worktrees:       Mutex<HashMap<Str, WorktreeRecord>>,
-	snapshots:       Mutex<Vec<pb::WorkspaceSnapshot>>,
-	transition:      tokio::sync::Mutex<()>,
+	parking:         parking_state::State,
+	transition:      Mutex<()>,
 	next_generation: AtomicU64,
 }
 
@@ -171,6 +178,34 @@ struct OperationsInner {
 struct CachedFile {
 	fingerprint: FileFingerprint,
 	blob:        BlobId,
+}
+mod parking_state {
+	use std::{collections::HashMap, path::PathBuf};
+
+	use omp_core::Str;
+	use omp_proto::env::v1::WorkspaceSnapshot;
+	use parking_lot::Mutex;
+
+	use super::{CachedFile, WorktreeRecord};
+
+	pub(super) struct State {
+		pub(super) cache:     Mutex<HashMap<PathBuf, CachedFile>>,
+		pub(super) worktrees: Mutex<HashMap<Str, WorktreeRecord>>,
+		pub(super) snapshots: Mutex<Vec<WorkspaceSnapshot>>,
+	}
+
+	impl State {
+		pub(super) fn new(
+			worktrees: HashMap<Str, WorktreeRecord>,
+			snapshots: Vec<WorkspaceSnapshot>,
+		) -> Self {
+			Self {
+				cache:     Mutex::new(HashMap::new()),
+				worktrees: Mutex::new(worktrees),
+				snapshots: Mutex::new(snapshots),
+			}
+		}
+	}
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -373,10 +408,8 @@ impl WorkspaceOperations {
 				documents,
 				blobs,
 				worktree_root,
-				cache: Mutex::new(HashMap::new()),
-				worktrees: Mutex::new(worktrees),
-				snapshots: Mutex::new(snapshots),
-				transition: tokio::sync::Mutex::new(()),
+				parking: parking_state::State::new(worktrees, snapshots),
+				transition: Mutex::new(()),
 				next_generation: AtomicU64::new(next_generation),
 			}),
 		})
@@ -392,6 +425,7 @@ impl WorkspaceOperations {
 		};
 		let record = self
 			.inner
+			.parking
 			.worktrees
 			.lock()
 			.values()
@@ -425,6 +459,7 @@ impl WorkspaceOperations {
 		let root_uri = file_uri(&fs::canonicalize(self.inner.workspace.root())?)?;
 		let snapshots = self
 			.inner
+			.parking
 			.snapshots
 			.lock()
 			.iter()
@@ -578,7 +613,7 @@ impl WorkspaceOperations {
 		fs::create_dir(&root)?;
 		let mut build = WorktreeBuild { root: root.clone(), armed: true };
 		let owner_pid = if request.owner_pid == 0 {
-			std::process::id()
+			process::id()
 		} else {
 			request.owner_pid
 		};
@@ -617,7 +652,12 @@ impl WorkspaceOperations {
 		};
 		self.write_worktree_record(&record)?;
 		build.armed = false;
-		self.inner.worktrees.lock().insert(id, record.clone());
+		self
+			.inner
+			.parking
+			.worktrees
+			.lock()
+			.insert(id, record.clone());
 		worktree_info(&record)
 	}
 
@@ -630,6 +670,7 @@ impl WorkspaceOperations {
 		let key = Str::from(request.id.as_str());
 		let record = self
 			.inner
+			.parking
 			.worktrees
 			.lock()
 			.get(&key)
@@ -655,7 +696,7 @@ impl WorkspaceOperations {
 				.join(".branches")
 				.join(record.id.as_str()),
 		)?;
-		self.inner.worktrees.lock().remove(&key);
+		self.inner.parking.worktrees.lock().remove(&key);
 		worktree_info(&record)
 	}
 
@@ -670,6 +711,7 @@ impl WorkspaceOperations {
 		let key = Str::from(request.id.as_str());
 		let mut record = self
 			.inner
+			.parking
 			.worktrees
 			.lock()
 			.get(&key)
@@ -680,7 +722,10 @@ impl WorkspaceOperations {
 		let base = self.load_manifest(record.base.as_str())?;
 		let current = self.load_manifest(&current_snapshot.snapshot_id)?;
 		let mode = pb::MergeMode::try_from(request.mode).unwrap_or(pb::MergeMode::Unspecified);
-		if matches!(mode, pb::MergeMode::None | pb::MergeMode::Unspecified) {
+		if matches!(
+			mode,
+			omp_proto::env::v1::MergeMode::None | omp_proto::env::v1::MergeMode::Unspecified
+		) {
 			return Ok(WorktreeMerge {
 				worktree:  worktree_info(&record)?,
 				artifact:  None,
@@ -705,7 +750,12 @@ impl WorkspaceOperations {
 					current_snapshot.snapshot_id.as_bytes(),
 				)?;
 				self.write_worktree_record(&record)?;
-				self.inner.worktrees.lock().insert(key, record.clone());
+				self
+					.inner
+					.parking
+					.worktrees
+					.lock()
+					.insert(key, record.clone());
 			}
 			Some(branch)
 		} else {
@@ -851,7 +901,7 @@ impl WorkspaceOperations {
 
 	fn ensure_snapshot_owned(&self, snapshot_id: &str) -> Result<(), WorkspaceOperationError> {
 		let root_uri = file_uri(&fs::canonicalize(self.inner.workspace.root())?)?;
-		if self.inner.snapshots.lock().iter().any(|snapshot| {
+		if self.inner.parking.snapshots.lock().iter().any(|snapshot| {
 			snapshot.snapshot_id == snapshot_id && snapshot.root_uri == root_uri.as_str()
 		}) {
 			Ok(())
@@ -869,7 +919,7 @@ impl WorkspaceOperations {
 		expected_generation: u64,
 		advance_generation: bool,
 	) -> Result<pb::WorkspaceSnapshot, WorkspaceOperationError> {
-		let mut snapshots = self.inner.snapshots.lock();
+		let mut snapshots = self.inner.parking.snapshots.lock();
 		let previous = snapshots
 			.iter()
 			.rev()
@@ -931,7 +981,7 @@ impl WorkspaceOperations {
 			return Err(WorkspaceOperationError::OutsideRoot);
 		}
 		let fingerprint = file_fingerprint(&metadata);
-		if let Some(cached) = self.inner.cache.lock().get(path)
+		if let Some(cached) = self.inner.parking.cache.lock().get(path)
 			&& cached.fingerprint == fingerprint
 		{
 			return Ok((cached.blob, fingerprint.mode));
@@ -951,6 +1001,7 @@ impl WorkspaceOperations {
 		let blob = BlobId::from(stage.finish().map_err(BlobError::from)?);
 		self
 			.inner
+			.parking
 			.cache
 			.lock()
 			.insert(path.to_path_buf(), CachedFile { fingerprint, blob });
@@ -1079,16 +1130,11 @@ impl WorkspaceOperations {
 					.ok_or_else(|| before_commit(pb::ConflictReason::ModifiedAfterSnapshot))?;
 				let mutation = document_pb::TextMutation {
 					base_revision: Some(revision),
-					change:        Some(document_pb::text_mutation::Change::ProposedContent(bytes)),
+					change:        Some(text_mutation::Change::ProposedContent(bytes)),
 					stale_policy:  document_pb::StalePolicy::Fail as i32,
 					format_policy: document_pb::FormatPolicy::Disabled as i32,
 				};
-				(
-					entry.path,
-					lease,
-					document_pb::document_mutation::Operation::Text(mutation),
-					Some(entry.mode),
-				)
+				(entry.path, lease, document_mutation::Operation::Text(mutation), Some(entry.mode))
 			},
 			RestorePlan::Create { entry, lease } => {
 				let bytes = self
@@ -1099,12 +1145,7 @@ impl WorkspaceOperations {
 					existing_document: document_pb::ExistingDocumentPolicy::FailIfExists as i32,
 					format_policy:     document_pb::FormatPolicy::Disabled as i32,
 				};
-				(
-					entry.path,
-					lease,
-					document_pb::document_mutation::Operation::Create(mutation),
-					Some(entry.mode),
-				)
+				(entry.path, lease, document_mutation::Operation::Create(mutation), Some(entry.mode))
 			},
 			RestorePlan::Delete { path, lease } => {
 				let revision = lease
@@ -1115,7 +1156,7 @@ impl WorkspaceOperations {
 				(
 					path,
 					lease,
-					document_pb::document_mutation::Operation::Delete(document_pb::DeleteMutation {
+					document_mutation::Operation::Delete(document_pb::DeleteMutation {
 						base_revision: Some(revision),
 					}),
 					None,
@@ -1139,7 +1180,7 @@ impl WorkspaceOperations {
 				effects: true,
 			})?;
 		match response.outcome {
-			Some(document_pb::commit_transaction_response::Outcome::Committed(_)) => {
+			Some(commit_transaction_response::Outcome::Committed(_)) => {
 				if let Some(mode) = mode {
 					let absolute =
 						checked_join(self.inner.workspace.root(), path.as_str()).map_err(|_| {
@@ -1152,10 +1193,10 @@ impl WorkspaceOperations {
 				}
 				Ok(())
 			},
-			Some(document_pb::commit_transaction_response::Outcome::Rejected(rejected)) => {
+			Some(commit_transaction_response::Outcome::Rejected(rejected)) => {
 				Err(before_commit(map_reject_reason(rejected.reason)))
 			},
-			Some(document_pb::commit_transaction_response::Outcome::PartiallyCommitted(partial)) => {
+			Some(commit_transaction_response::Outcome::PartiallyCommitted(partial)) => {
 				Err(ApplyFailure { reason: map_reject_reason(partial.reason), effects: true })
 			},
 			None => Err(before_commit(pb::ConflictReason::GenerationChanged)),
@@ -1239,6 +1280,7 @@ impl WorkspaceOperations {
 			|| root.parent() != Some(self.inner.worktree_root.as_path())
 			|| !self
 				.inner
+				.parking
 				.worktrees
 				.lock()
 				.values()
@@ -1474,9 +1516,9 @@ fn restrict_manifest(
 	} else {
 		for captured in &manifest.prefixes {
 			for requested in &requested {
-				if selected(requested.as_str(), std::slice::from_ref(captured)) {
+				if selected(requested.as_str(), slice::from_ref(captured)) {
 					prefixes.push(requested.clone());
-				} else if selected(captured.as_str(), std::slice::from_ref(requested)) {
+				} else if selected(captured.as_str(), slice::from_ref(requested)) {
 					prefixes.push(captured.clone());
 				}
 			}
@@ -1663,7 +1705,7 @@ fn worktree_info(record: &WorktreeRecord) -> Result<pb::WorktreeInfo, WorkspaceO
 }
 
 fn file_uri(path: &Path) -> Result<Str, WorkspaceOperationError> {
-	url::Url::from_file_path(path)
+	Url::from_file_path(path)
 		.map(|url| Str::from(url.to_string()))
 		.map_err(|()| WorkspaceOperationError::OutsideRoot)
 }
@@ -1714,7 +1756,7 @@ fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
 	let modified_ns = metadata
 		.modified()
 		.ok()
-		.and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+		.and_then(|value| value.duration_since(time::UNIX_EPOCH).ok())
 		.map_or(0, |value| value.as_nanos());
 	FileFingerprint {
 		len: metadata.len(),
@@ -1878,8 +1920,8 @@ fn hardlink_copy_fallback(source: &Path, destination: &Path) -> io::Result<()> {
 	}
 }
 fn unix_epoch_ms() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	time::SystemTime::now()
+		.duration_since(time::UNIX_EPOCH)
 		.map_or(0, |duration| duration.as_millis() as u64)
 }
 

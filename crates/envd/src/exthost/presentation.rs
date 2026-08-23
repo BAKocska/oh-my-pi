@@ -1,6 +1,6 @@
 //! Identity-fenced UI, telemetry, and verdict CONTROL domain owners.
 
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 
 use async_trait::async_trait;
 use omp_core::{InvocationPhase, LifecyclePhase, Str};
@@ -21,23 +21,53 @@ pub enum UiControlRequest {
 	/// Current presentation facts.
 	Presentation,
 	/// Icon catalog prefix lookup.
-	Icons { prefix: Str },
+	Icons {
+		/// Optional name prefix supplied by the extension to filter the app-owned
+		/// catalog.
+		prefix: Str,
+	},
 	/// Current composer text.
 	EditorText,
 	/// Total dialog request.
-	Dialog { kind: Str, fields: Map<String, Value> },
+	Dialog {
+		/// Dialog operation name decoded from the extension's CONTROL request.
+		kind:   Str,
+		/// Operation-specific dialog arguments transferred to the app compositor.
+		fields: Map<String, Value>,
+	},
 	/// Open a retained overlay.
-	Overlay { fields: Map<String, Value> },
+	Overlay {
+		/// Overlay declaration and initial values transferred from the extension.
+		fields: Map<String, Value>,
+	},
 	/// Read a retained overlay's values.
-	OverlayValues { id: Str },
+	OverlayValues {
+		/// App-issued identifier of the retained overlay to inspect.
+		id: Str,
+	},
 	/// Wait for overlay settlement.
-	OverlayWait { id: Str },
+	OverlayWait {
+		/// App-issued identifier whose retained overlay remains owned by the
+		/// compositor while waiting.
+		id: Str,
+	},
 	/// Read watched overlay events.
-	OverlayEvents { id: Str },
+	OverlayEvents {
+		/// App-issued identifier of the retained overlay whose events are
+		/// requested.
+		id: Str,
+	},
 	/// Idempotently close an overlay.
-	OverlayClose { id: Str },
+	OverlayClose {
+		/// App-issued identifier of the compositor-owned overlay to release.
+		id: Str,
+	},
 	/// Install manifest-checked dynamic commands.
-	DynamicMount { commands: Vec<Value> },
+	DynamicMount {
+		/// Serialized command declarations supplied by the extension for
+		/// app-owned installation.
+		commands: Vec<Value>,
+	},
 }
 
 /// Typed response from the real app presentation owner.
@@ -186,18 +216,39 @@ pub enum TelemetryControlRequest {
 	/// Query the durable telemetry index.
 	Query(Value),
 	/// Read indexed revision metrics.
-	RevMetrics { tool: Str, family: Option<Str>, since: Option<Value>, scope: Str },
+	RevMetrics {
+		/// Extension-supplied tool wire name whose revision metrics are
+		/// requested.
+		tool:   Str,
+		/// Optional revision family filter supplied by the extension.
+		family: Option<Str>,
+		/// Optional serialized absolute or relative lower time bound supplied by
+		/// the extension.
+		since:  Option<Value>,
+		/// Extension-selected telemetry visibility scope.
+		scope:  Str,
+	},
 	/// Read one exporter worker's counters.
 	ExportStats(u64),
 	/// Stop one exporter idempotently.
 	ExportStop(u64),
 	/// Open a real extension span.
-	SpanOpen { name: Str, attributes: Map<String, Value> },
+	SpanOpen {
+		/// Extension-supplied span name recorded by the host telemetry owner.
+		name:       Str,
+		/// Initial span attributes transferred from the extension.
+		attributes: Map<String, Value>,
+	},
 	/// Close one retained extension span.
 	SpanClose {
+		/// Opaque host-issued identifier retaining ownership of the live span.
 		handle:     Str,
+		/// Final attributes supplied by the extension before the host releases
+		/// the span.
 		attributes: Map<String, Value>,
+		/// Ordered span events accumulated by the extension.
 		events:     Vec<SpanEvent>,
+		/// Optional terminal failure supplied by the extension.
 		fault:      Option<SpanFault>,
 	},
 }
@@ -416,9 +467,9 @@ fn decode_ui_request(
 		| "omp.ui.form"
 		| "omp.ui.ask_user" => UiControlRequest::Dialog {
 			kind:   Str::new(operation.trim_start_matches("omp.ui.")),
-			fields: std::mem::take(arguments),
+			fields: mem::take(arguments),
 		},
-		"omp.ui.overlay" => UiControlRequest::Overlay { fields: std::mem::take(arguments) },
+		"omp.ui.overlay" => UiControlRequest::Overlay { fields: mem::take(arguments) },
 		"omp.ui.overlay_values" => {
 			UiControlRequest::OverlayValues { id: required_string(arguments, "id")? }
 		},

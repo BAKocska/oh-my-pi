@@ -2,17 +2,21 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
+	str,
 	sync::Arc,
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures::StreamExt;
 use omp_core::{Hash32, IntoStr, InvocationPhase, Point, Str, sf};
 use omp_env::EnvClient;
-use omp_inference::{TurnId, layer::secrets::SecretStreamRestorer};
+use omp_inference::{TurnId, layer::secrets::SecretStreamRestorer, recovery::repetition};
 use omp_proto::{
-	inference::v1::{self as pb, ContextRef, Outcome, ThreadDelta},
-	thread::v1::{self as thread, Item, Thread},
+	inference::v1::{
+		self as pb, ContextRef, Outcome, ThreadDelta, part_start, tool_choice, turn_error,
+		turn_event, value,
+	},
+	thread::v1::{self as thread, Item, Thread, item, part},
 };
 use omp_secrets::{
 	json::{deobfuscate_json, obfuscate_json},
@@ -20,7 +24,7 @@ use omp_secrets::{
 	obfuscator::SecretObfuscator,
 };
 use omp_storage::{
-	blob::BlobStore,
+	blob::{self, BlobStore},
 	gc::{ArtifactCatalog, ArtifactLifetime},
 	transcript::{CallId, ChildLifecycleEntry, InvocationTransition, SnapcompactArchive},
 };
@@ -60,7 +64,7 @@ use crate::{
 		continues_loop, from_hook,
 	},
 	control::{
-		CampaignControl, ControlMailbox, ControlMailboxEvent, ControlSender, ScheduledRewind,
+		CampaignControl, ControlMailbox, ControlMailboxEvent, ControlSender, ScheduledRewind, channel,
 	},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
@@ -169,7 +173,7 @@ impl AgentRunSummary {
 		};
 		let mut payload = None;
 		for item in &outcome.output {
-			let Some(thread::item::Kind::ToolCall(call)) = item.kind.as_ref() else {
+			let Some(item::Kind::ToolCall(call)) = item.kind.as_ref() else {
 				continue;
 			};
 			if call.name != "yield" {
@@ -213,21 +217,47 @@ fn run_summary(
 
 fn authoritative_assistant(outcome: &Outcome) -> Option<Str> {
 	let message = outcome.output.iter().rev().find_map(|item| {
-		let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+		let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
 			return None;
 		};
 		(message.role() == thread::Role::Assistant).then_some(message)
 	})?;
 	let mut text = String::new();
 	for part in &message.parts {
-		if let Some(thread::part::Kind::Text(value)) = part.kind.as_ref() {
+		if let Some(part::Kind::Text(value)) = part.kind.as_ref() {
 			text.push_str(value);
 		}
 	}
 	(!text.is_empty()).then(|| Str::from(text))
 }
 
+use std::{future, iter, mem};
+
+use omp_inference::call::ToolChoice;
+use omp_proto::toolhost::v1;
+use omp_snapcompact::archive::DataUrlContext;
+use omp_storage::gc;
+use tokio::{
+	sync::{watch, watch::Receiver},
+	task::yield_now,
+	time,
+};
+
 pub(crate) use crate::arbiter::context::{ActiveCheckpoint, CheckpointState, CompletedCheckpoint};
+use crate::{
+	AgentSettled, AgentSnapshot, ArbiterError, AutolearnController, AutolearnSettings, BindSlot,
+	CampaignMachine, CampaignSpec, CaptureDecision, CommittedCall, ControlError, EngageOptions,
+	EngageReceipt, Fold, HoldError, HoldSet, Interrupt, InterruptClass, InterruptSource,
+	LegacySessionStopCampaign, PendingInvokerCx, ProviderErrorEvent, RevivalReport, ScopedBinding,
+	TurnOptions, TurnReceipt, Verdict, WinnerKind, attachments, batch, capture_interrupt,
+	demote_interrupted_reasoning, effects_mutate_environment, execute_snapcompact, hook_event_mask,
+	inject_first_turn_metadata, is_capture_item,
+	journal::Compact,
+	prompt_assets,
+	prompt_assets::PromptAssetId,
+	prompt_keys,
+	tool_choice::{RejectReason, ToolChoiceQueue},
+};
 
 /// A live user message that can be rewound and edited.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,7 +279,7 @@ pub enum AgentError {
 	Journal(#[from] JournalError),
 	/// Campaign arbitration or lifecycle journaling failed.
 	#[error(transparent)]
-	Arbiter(#[from] crate::ArbiterError),
+	Arbiter(#[from] ArbiterError),
 	/// Canonical thread projection failed.
 	#[error(transparent)]
 	Projection(#[from] ProjectionError),
@@ -258,10 +288,10 @@ pub enum AgentError {
 	Snapcompact(#[from] omp_snapcompact::archive::ArchiveError),
 	/// Durable blob placement failed before a journal commit.
 	#[error(transparent)]
-	Blob(#[from] omp_storage::blob::Error),
+	Blob(#[from] blob::Error),
 	/// Artifact metadata publication failed before a prompt rewrite.
 	#[error(transparent)]
-	Artifact(#[from] omp_storage::gc::Error),
+	Artifact(#[from] gc::Error),
 	/// Deterministic prompt rendering failed.
 	#[error(transparent)]
 	Prompt(#[from] PromptError),
@@ -276,7 +306,7 @@ pub enum AgentError {
 	Batch(#[from] BatchError),
 	/// A required-deadline campaign hold expired or was aborted.
 	#[error(transparent)]
-	CampaignHold(#[from] crate::HoldError),
+	CampaignHold(#[from] HoldError),
 	/// Manual compaction was cancelled before its history rewrite committed.
 	#[error(transparent)]
 	CompactionCancelled(#[from] CompactionCancellation),
@@ -307,7 +337,7 @@ const _: () = assert!(std::mem::size_of::<AgentError>() <= 128, "AgentError must
 /// Cloneable out-of-band stop signal for the active submission.
 #[derive(Clone, Debug)]
 pub struct AbortHandle {
-	tx: Arc<tokio::sync::watch::Sender<u64>>,
+	tx: Arc<watch::Sender<u64>>,
 }
 
 impl AbortHandle {
@@ -331,7 +361,7 @@ pub trait RunActivity: Send + Sync + 'static {
 struct RunActivityGuard(Arc<dyn RunActivity>);
 
 type TurnCompletion =
-	(Outcome, BTreeMap<Str, SpeculativeCall>, Option<String>, Arc<crate::AgentSnapshot>, Arc<[Str]>);
+	(Outcome, BTreeMap<Str, SpeculativeCall>, Option<String>, Arc<AgentSnapshot>, Arc<[Str]>);
 
 enum RunTurnResult {
 	Complete(TurnCompletion),
@@ -380,6 +410,37 @@ impl Drop for RunActivityGuard {
 	}
 }
 
+mod receiver_channels {
+	use flume::Receiver;
+
+	use super::*;
+
+	pub(super) struct ReceiverChannels {
+		pub(super) hook_requests:      Receiver<InvocationHookRequest>,
+		pub(super) invocation_fact_rx: Receiver<InvocationAdmissionFact>,
+		pub(super) host_commands:      Receiver<AgentHostCommand>,
+	}
+
+	impl<C: TurnClient> Agent<C> {
+		/// Returns the CONTROL-side receiver for invocation hook handoffs.
+		///
+		/// Clones compete for messages; one supervisor should own the receiver.
+		pub fn hook_requests(&self) -> Receiver<InvocationHookRequest> {
+			self.receivers.hook_requests.clone()
+		}
+	}
+}
+
+use receiver_channels::ReceiverChannels;
+
+mod wire_tool_choice {
+	use omp_proto::inference::v1::ToolChoice;
+
+	pub(super) fn from_parts(mode: i32, name: String) -> ToolChoice {
+		ToolChoice { mode, name, on_unsupported: 0 }
+	}
+}
+
 /// Durable agent loop composed from transport-neutral Phase 1 foundations.
 pub struct Agent<C: TurnClient> {
 	client: C,
@@ -389,23 +450,21 @@ pub struct Agent<C: TurnClient> {
 	caps: CapsBase,
 	events: EventBus,
 	hook_bus: InvocationHookBus,
-	hook_requests: flume::Receiver<InvocationHookRequest>,
 	invocation_fact_tx: flume::Sender<InvocationAdmissionFact>,
-	invocation_fact_rx: flume::Receiver<InvocationAdmissionFact>,
+	receivers: ReceiverChannels,
 	control_tx: ControlSender,
 	control_mailbox: ControlMailbox,
 	host_control: AgentHostControl,
-	host_commands: flume::Receiver<AgentHostCommand>,
 	checkpoint_state: Arc<Mutex<CheckpointState>>,
 	arbiter: Arbiter,
-	tool_choices: crate::tool_choice::ToolChoiceQueue,
-	holds: crate::HoldSet,
+	tool_choices: ToolChoiceQueue,
+	holds: HoldSet,
 	pending_rewinds: VecDeque<ScheduledRewind>,
 	mailbox: Mailbox,
 	jobs: Arc<JobBoard>,
 	jobs_restored: bool,
-	abort_tx: Arc<tokio::sync::watch::Sender<u64>>,
-	abort_rx: tokio::sync::watch::Receiver<u64>,
+	abort_tx: Arc<watch::Sender<u64>>,
+	abort_rx: Receiver<u64>,
 	phase: AgentPhase,
 	control_serviced_during_turn: bool,
 	context: Option<ContextRef>,
@@ -417,7 +476,7 @@ pub struct Agent<C: TurnClient> {
 	provider_error_gate: Option<Arc<HookGate>>,
 	continuations: ContinuationLedger,
 	continuation_policies: BTreeMap<Str, ContinuationPolicy>,
-	legacy_session_stop: crate::LegacySessionStopCampaign,
+	legacy_session_stop: LegacySessionStopCampaign,
 	continuation_source: Option<Arc<dyn ContinuationSource>>,
 	redemption_authority: Option<Arc<dyn RedemptionAuthority>>,
 	loop_signal: LoopSignal,
@@ -429,7 +488,7 @@ pub struct Agent<C: TurnClient> {
 	compaction: CompactionCoordinator,
 	blob_store: Option<BlobStore>,
 	artifact_catalog: Option<Arc<Mutex<ArtifactCatalog>>>,
-	autolearn: Option<crate::AutolearnController>,
+	autolearn: Option<AutolearnController>,
 }
 
 impl<C: TurnClient + Clone> Agent<C> {
@@ -444,10 +503,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let mailbox = Mailbox::new();
 		let jobs = Arc::new(JobBoard::new(env.clone(), mailbox.sender()));
 		let events = EventBus::new();
-		let (abort_tx, abort_rx) = tokio::sync::watch::channel(0_u64);
+		let (abort_tx, abort_rx) = watch::channel(0_u64);
 		let (hook_bus, hook_requests) = InvocationHookBus::channel();
 		let (invocation_fact_tx, invocation_fact_rx) = flume::unbounded();
-		let (control_tx, control_mailbox) = crate::control::channel();
+		let (control_tx, control_mailbox) = channel();
 		let (host_commands_tx, host_commands) = flume::unbounded();
 		let host_control = AgentHostControl { commands: host_commands_tx };
 		control_tx.bind_host_control(host_control.clone());
@@ -497,17 +556,15 @@ impl<C: TurnClient + Clone> Agent<C> {
 			caps,
 			events,
 			hook_bus,
-			hook_requests,
 			invocation_fact_tx,
-			invocation_fact_rx,
+			receivers: ReceiverChannels { hook_requests, invocation_fact_rx, host_commands },
 			control_tx,
 			control_mailbox,
 			host_control,
-			host_commands,
 			checkpoint_state,
 			arbiter: Arbiter::new(),
-			tool_choices: crate::tool_choice::ToolChoiceQueue::new(),
-			holds: crate::HoldSet::default(),
+			tool_choices: ToolChoiceQueue::new(),
+			holds: HoldSet::default(),
 			pending_rewinds: VecDeque::new(),
 			mailbox,
 			jobs,
@@ -525,7 +582,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			provider_error_gate: None,
 			continuations: ContinuationLedger::new(8),
 			continuation_policies: BTreeMap::new(),
-			legacy_session_stop: crate::LegacySessionStopCampaign::default(),
+			legacy_session_stop: LegacySessionStopCampaign::default(),
 			continuation_source: None,
 			redemption_authority: None,
 			loop_signal: LoopSignal::default(),
@@ -559,10 +616,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 	/// Engages and durably records one campaign.
 	pub fn engage_campaign(
 		&mut self,
-		spec: Arc<crate::CampaignSpec>,
-		machine: Box<dyn crate::CampaignMachine>,
-		options: crate::EngageOptions,
-	) -> Result<crate::EngageReceipt, AgentError> {
+		spec: Arc<CampaignSpec>,
+		machine: Box<dyn CampaignMachine>,
+		options: EngageOptions,
+	) -> Result<EngageReceipt, AgentError> {
 		Ok(self
 			.arbiter
 			.engage(spec, machine, &mut self.journal, options)?)
@@ -580,21 +637,21 @@ impl<C: TurnClient + Clone> Agent<C> {
 		&mut self,
 		resolve: F,
 		now_ms: u64,
-	) -> Result<crate::RevivalReport, AgentError>
+	) -> Result<RevivalReport, AgentError>
 	where
-		F: FnMut(&str) -> Option<(Arc<crate::CampaignSpec>, Box<dyn crate::CampaignMachine>)>,
+		F: FnMut(&str) -> Option<(Arc<CampaignSpec>, Box<dyn CampaignMachine>)>,
 	{
 		Ok(self.arbiter.recover(&mut self.journal, resolve, now_ms)?)
 	}
 
 	/// Returns mutable access to future-turn tool directives.
-	pub const fn tool_choices_mut(&mut self) -> &mut crate::tool_choice::ToolChoiceQueue {
+	pub const fn tool_choices_mut(&mut self) -> &mut ToolChoiceQueue {
 		&mut self.tool_choices
 	}
 
 	/// Returns a cloneable handle for resolving required-deadline campaign
 	/// holds.
-	pub fn holds(&self) -> crate::HoldSet {
+	pub fn holds(&self) -> HoldSet {
 		self.holds.clone()
 	}
 
@@ -612,13 +669,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 	/// control.
 	pub fn environment(&self) -> EnvClient {
 		self.env.clone()
-	}
-
-	/// Returns the CONTROL-side receiver for invocation hook handoffs.
-	///
-	/// Clones compete for messages; one supervisor should own the receiver.
-	pub fn hook_requests(&self) -> flume::Receiver<InvocationHookRequest> {
-		self.hook_requests.clone()
 	}
 
 	/// Replaces the registered hook union mask in one atomic publication.
@@ -654,16 +704,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.arbiter
 			.campaigns()
 			.slots()
-			.binding(&crate::BindSlot::PromptSlot)
+			.binding(&BindSlot::PromptSlot)
 	}
 
 	fn invocation_mode_props(arbiter: &mut Arbiter, effects: &omp_tool::Effects) -> pb::ValueMap {
 		let mode = arbiter
 			.campaigns()
 			.slots()
-			.binding(&crate::BindSlot::PromptSlot)
+			.binding(&BindSlot::PromptSlot)
 			.map(Str::new);
-		if crate::effects_mutate_environment(effects)
+		if effects_mutate_environment(effects)
 			&& mode
 				.as_ref()
 				.is_some_and(|mode| matches!(mode.as_str(), "plan-yolo" | "prewalk"))
@@ -671,9 +721,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 			arbiter
 				.campaigns_mut()
 				.slots_mut()
-				.pop_binding(&crate::BindSlot::PromptSlot);
+				.pop_binding(&BindSlot::PromptSlot);
 		}
-		crate::batch::invocation_mode_props(mode.as_deref(), effects)
+		batch::invocation_mode_props(mode.as_deref(), effects)
 	}
 
 	/// Installs one application-owned autonomous-mode continuation source.
@@ -774,15 +824,15 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let mut replaced_regions = 0_u64;
 			let mut removed_bytes = 0_u64;
 			for item in &mut items {
-				let Some(thread::item::Kind::Message(message)) = item.kind.as_mut() else {
+				let Some(item::Kind::Message(message)) = item.kind.as_mut() else {
 					continue;
 				};
 				if message.role != i32::from(thread::Role::Assistant) {
 					continue;
 				}
 				let mut kept = Vec::with_capacity(message.parts.len());
-				for part in std::mem::take(&mut message.parts) {
-					if matches!(part.kind, Some(thread::part::Kind::Thinking(_))) {
+				for part in mem::take(&mut message.parts) {
+					if matches!(part.kind, Some(part::Kind::Thinking(_))) {
 						replaced_regions = replaced_regions.saturating_add(1);
 						removed_bytes = removed_bytes.saturating_add(
 							u64::try_from(serde_json::to_vec(&part)?.len()).unwrap_or(u64::MAX),
@@ -916,24 +966,21 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let tokens_before = u64::try_from(total_bytes.div_ceil(4)).unwrap_or(u64::MAX);
 		let source_tokens = u64::try_from(prefix_bytes.div_ceil(4)).unwrap_or(u64::MAX);
 		let mode = match method {
-			crate::CompactionTier::Local => ManualCompactionMode::Soft,
-			crate::CompactionTier::Remote => ManualCompactionMode::Remote,
-			crate::CompactionTier::Snapcompact => ManualCompactionMode::Snapcompact,
-			crate::CompactionTier::Prune
-			| crate::CompactionTier::DropMedia
-			| crate::CompactionTier::Elide
-			| crate::CompactionTier::Handoff => {
+			CompactionTier::Local => ManualCompactionMode::Soft,
+			CompactionTier::Remote => ManualCompactionMode::Remote,
+			CompactionTier::Snapcompact => ManualCompactionMode::Snapcompact,
+			CompactionTier::Prune
+			| CompactionTier::DropMedia
+			| CompactionTier::Elide
+			| CompactionTier::Handoff => {
 				return Err(AgentError::Protocol("unsupported manual compaction method"));
 			},
 		};
 
 		let compact = if mode == ManualCompactionMode::Snapcompact {
 			let source = serde_json::to_string(&live_items[..prefix_end])?;
-			let source = omp_snapcompact::archive::elide_data_urls(
-				&source,
-				omp_snapcompact::archive::DataUrlContext::Source,
-			)
-			.into_owned();
+			let source =
+				omp_snapcompact::archive::elide_data_urls(&source, DataUrlContext::Source).into_owned();
 			let model = self.state.snapshot().turn.params.model.clone();
 			let preparation = SnapcompactPreparation {
 				text: Str::from(source),
@@ -947,7 +994,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				first_kept,
 				tokens_before,
 			};
-			let mut rendered = crate::execute_snapcompact(&preparation)?;
+			let mut rendered = execute_snapcompact(&preparation)?;
 			let store = self
 				.blob_store
 				.as_ref()
@@ -1035,7 +1082,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let summary = authoritative_assistant(&outcome)
 				.ok_or(AgentError::Protocol("compaction summarizer returned no text"))?;
 			let summary_tokens = u64::try_from(summary.len().div_ceil(4)).unwrap_or(u64::MAX);
-			crate::journal::Compact {
+			Compact {
 				summary,
 				short: None,
 				first_kept,
@@ -1098,7 +1145,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let mut targets = Vec::new();
 		let mut previous = None;
 		for (event, item) in events.into_iter().zip(items) {
-			let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+			let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
 				previous = Some(event);
 				continue;
 			};
@@ -1112,7 +1159,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.is_some_and(|props| props.fields.contains_key(omp_tool::TOOL_REV_PROP));
 			let mut text = String::new();
 			for part in &message.parts {
-				if let Some(thread::part::Kind::Text(part)) = part.kind.as_ref() {
+				if let Some(part::Kind::Text(part)) = part.kind.as_ref() {
 					text.push_str(part);
 				}
 			}
@@ -1141,9 +1188,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let item = Item {
 			seq:           0,
 			created_at_ms: now_ms(),
-			kind:          Some(thread::item::Kind::Message(thread::Message {
+			kind:          Some(item::Kind::Message(thread::Message {
 				role:  i32::from(thread::Role::User),
-				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
+				parts: vec![thread::Part { kind: Some(part::Kind::Text(text.to_string())) }],
 			})),
 			props:         None,
 		};
@@ -1168,22 +1215,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let mut decision = if let Some(controller) = self.autolearn.as_mut() {
 			if aborted {
 				controller.abort();
-				crate::CaptureDecision::None
+				CaptureDecision::None
 			} else {
 				controller.finish_primary(ending_prompt_slot.as_str(), false)
 			}
 		} else {
-			crate::CaptureDecision::None
+			CaptureDecision::None
 		};
 		let mut capture_index = 0_u32;
-		while decision == crate::CaptureDecision::Enqueue {
+		while decision == CaptureDecision::Enqueue {
 			capture_index = capture_index.saturating_add(1);
-			let _ = self
-				.mailbox
-				.sender()
-				.try_enqueue(crate::capture_interrupt());
+			let _ = self.mailbox.sender().try_enqueue(capture_interrupt());
 			let turn_id = TurnId::new(sf!("{}-autolearn-{}", capture_root.as_str(), capture_index));
-			let capture = self.submit_inner(std::iter::empty(), turn_id).await;
+			let capture = self.submit_inner(iter::empty(), turn_id).await;
 			let capture_aborted = capture.as_ref().map_or(true, |summary| summary.interrupted);
 			if let Err(error) = &capture {
 				let _ = error;
@@ -1191,9 +1235,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			decision = self
 				.autolearn
 				.as_mut()
-				.map_or(crate::CaptureDecision::None, |controller| {
-					controller.finish_capture(capture_aborted)
-				});
+				.map_or(CaptureDecision::None, |controller| controller.finish_capture(capture_aborted));
 		}
 		if result.is_err() {
 			self.transition(AgentPhase::Idle);
@@ -1206,7 +1248,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		items: impl IntoIterator<Item = Item>,
 		root_turn_id: TurnId,
 	) -> Result<AgentRunSummary, AgentError> {
-		self.abort_rx.mark_unchanged();
+		let mut abort_generation = *self.abort_rx.borrow_and_update();
 		if !self.jobs_restored {
 			for job in self.journal.pending_jobs() {
 				self.jobs.register(job.clone());
@@ -1338,7 +1380,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.context = None;
 					self.pending_reasoning_demotion = true;
-					self.abort_rx.mark_unchanged();
+					abort_generation = *self.abort_rx.borrow_and_update();
 					self.drain_control();
 					self.execute_scheduled_rewinds()?;
 					let snapshot = self.state.snapshot();
@@ -1361,8 +1403,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					return Ok(run_summary(last_outcome, committed_turns, true));
 				},
 				Err(AgentError::Turn(TurnError::Terminal(mut error)))
-					if pb::turn_error::Kind::try_from(error.kind)
-						== Ok(pb::turn_error::Kind::EmptyOutput) =>
+					if turn_error::Kind::try_from(error.kind) == Ok(turn_error::Kind::EmptyOutput) =>
 				{
 					self
 						.redeem_recovery(RedemptionEvidence::Restore {
@@ -1397,7 +1438,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.verdicts
 						.into_iter()
 						.find_map(|verdict| match verdict {
-							crate::Verdict::Inject(mut items) => items.pop(),
+							Verdict::Inject(mut items) => items.pop(),
 							_ => None,
 						})
 						.expect("empty-output retry campaign injects one retry item");
@@ -1425,7 +1466,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.arbiter.set_retry_chain(routes);
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
 					pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
-						crate::prompt_assets::PromptAssetId::AutoContinue,
+						PromptAssetId::AutoContinue,
 					)])?;
 					turn_id = next_turn_id;
 					continue;
@@ -1444,7 +1485,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						self.arbiter.set_retry_chain(routes);
 						let next_turn_id = follow_up_id(&turn_id, committed_turns);
 						pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
-							crate::prompt_assets::PromptAssetId::AutoContinue,
+							PromptAssetId::AutoContinue,
 						)])?;
 						turn_id = next_turn_id;
 						continue;
@@ -1473,10 +1514,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let turn_end =
 				self.fold_point(Point::TurnEnd, Some(turn_id.as_str()), None, None, false)?;
 			for item in turn_end.campaign.injects {
-				let _ = self.mailbox.sender().try_enqueue(crate::Interrupt {
-					class: crate::InterruptClass::Immediate,
+				let _ = self.mailbox.sender().try_enqueue(Interrupt {
+					class: InterruptClass::Immediate,
 					item,
-					source: crate::InterruptSource::Continuation { owner: sf!("campaign") },
+					source: InterruptSource::Continuation { owner: sf!("campaign") },
 				});
 			}
 			self.drain_control();
@@ -1487,7 +1528,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.mailbox
 				.drain(DrainPoint::TurnBoundary, snapshot.defer_interrupts);
 			if stop == pb::StopReason::StopToolUse {
-				self.transition(AgentPhase::ToolBatch);
 				if let Err(error) = self
 					.complete_missing_speculation(
 						&outcome.output,
@@ -1501,7 +1541,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.mailbox.requeue_front(immediate);
 					return Err(error);
 				}
-				tokio::task::yield_now().await;
 				self.drain_invocation_facts()?;
 				let calls = match committed_calls(
 					&outcome.output,
@@ -1544,13 +1583,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 				}
 				let made_environment_effect = calls
 					.iter()
-					.any(|call| crate::effects_mutate_environment(call.effects()));
+					.any(|call| effects_mutate_environment(call.effects()));
 				let call_digest = tool_call_digest(&outcome.output);
 				let call_ids: Vec<Str> = outcome
 					.output
 					.iter()
 					.filter_map(|item| match item.kind.as_ref() {
-						Some(thread::item::Kind::ToolCall(call)) => Some(call.id.as_str().to_str()),
+						Some(item::Kind::ToolCall(call)) => Some(call.id.as_str().to_str()),
 						_ => None,
 					})
 					.collect();
@@ -1581,22 +1620,35 @@ impl<C: TurnClient + Clone> Agent<C> {
 				let batch_fold =
 					self.fold_point(Point::Batch, Some(turn_id.as_str()), None, None, false)?;
 				for item in batch_fold.campaign.injects {
-					boundary.push(crate::Interrupt {
-						class: crate::InterruptClass::Immediate,
+					boundary.push(Interrupt {
+						class: InterruptClass::Immediate,
 						item,
-						source: crate::InterruptSource::Continuation { owner: sf!("campaign") },
+						source: InterruptSource::Continuation { owner: sf!("campaign") },
 					});
 				}
-				let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel(None);
-				let mut aborted = self.abort_rx.has_changed().unwrap_or(false);
+				let (interrupt_tx, interrupt_rx) = watch::channel(None);
+				let mut aborted = *self.abort_rx.borrow() != abort_generation;
 				if aborted {
 					interrupt_tx.send_replace(Some(sf!("user interrupt")));
 				}
-				if batch_fold.campaign.winner == crate::WinnerKind::Cut {
+				let campaign_cut = batch_fold.campaign.winner == WinnerKind::Cut;
+				if campaign_cut {
 					interrupt_tx.send_replace(Some(sf!("campaign cut")));
 				}
 				let mut deadline_elapsed = false;
 				let mut abort_rx = self.abort_rx.clone();
+				self.transition(AgentPhase::ToolBatch);
+				// Publish the batch boundary before polling the batch so event-driven
+				// control and abort producers can install their priority signals.
+				yield_now().await;
+				self.drain_control();
+				yield_now().await;
+				if !aborted && *self.abort_rx.borrow() != abort_generation {
+					aborted = true;
+					if !campaign_cut {
+						interrupt_tx.send_replace(Some(sf!("user interrupt")));
+					}
+				}
 				let results = {
 					let caps = self.caps;
 					let drive = ToolBatch::new(calls).drive_interruptible(
@@ -1617,7 +1669,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 								aborted = true;
 								interrupt_tx.send_replace(Some(sf!("user interrupt")));
 							},
-							command = self.host_commands.recv_async() => {
+							command = self.receivers.host_commands.recv_async() => {
 								if let Ok(command) = command {
 									self.handle_host_control(command);
 									self.control_serviced_during_turn = true;
@@ -1716,13 +1768,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 				let has_producer = boundary
 					.iter()
 					.any(|interrupt| continues_loop(&interrupt.source));
-				pending_indexes
-					.extend(self.stage_interrupts(&next_turn_id, std::mem::take(&mut boundary))?);
+				pending_indexes.extend(self.stage_interrupts(&next_turn_id, mem::take(&mut boundary))?);
 				if deadline_elapsed {
 					return Err(AgentError::Deadline);
 				}
 				if aborted {
-					self.abort_rx.mark_unchanged();
+					abort_generation = *self.abort_rx.borrow_and_update();
 					if has_producer {
 						last_outcome = Some(outcome);
 						turn_id = next_turn_id;
@@ -1745,10 +1796,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 			}
 			let idle_fold = self.fold_point(Point::Idle, Some(turn_id.as_str()), None, None, false)?;
 			for item in idle_fold.campaign.injects {
-				let _ = self.mailbox.sender().try_enqueue(crate::Interrupt {
-					class: crate::InterruptClass::Immediate,
+				let _ = self.mailbox.sender().try_enqueue(Interrupt {
+					class: InterruptClass::Immediate,
 					item,
-					source: crate::InterruptSource::Continuation { owner: sf!("campaign") },
+					source: InterruptSource::Continuation { owner: sf!("campaign") },
 				});
 			}
 			let mut idle = self
@@ -1859,7 +1910,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			return Vec::new();
 		};
 		gate
-			.gate_domain(&crate::ProviderErrorEvent {
+			.gate_domain(&ProviderErrorEvent {
 				code:    sf!("turn_failed"),
 				turn_id: Str::new(turn_id),
 			})
@@ -1892,14 +1943,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 		invocation_id: Option<&str>,
 		stream_delta: Option<&str>,
 		delivered: bool,
-	) -> Result<crate::Fold, AgentError> {
+	) -> Result<Fold, AgentError> {
 		let pending_invoker = self
 			.tool_choices
 			.pending_head()
-			.map(|head| crate::PendingInvokerCx {
-				id:          head.id,
-				source_tool: head.source_tool,
-			});
+			.map(|head| PendingInvokerCx { id: head.id, source_tool: head.source_tool });
 		let cx = PointCx {
 			turn_id,
 			invocation_id,
@@ -1919,7 +1967,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 	async fn settled_continuation(
 		&mut self,
 		turn_id: &TurnId<str>,
-	) -> Result<Option<crate::Interrupt>, AgentError> {
+	) -> Result<Option<Interrupt>, AgentError> {
 		let now = now_ms();
 		let mut builtins = SettledFold::new();
 		let (candidate, policy) =
@@ -1931,31 +1979,32 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let event =
 				AgentSettledEvent { agent_id: sf!("agent"), turn_id: Str::new(turn_id.as_str()) };
 			let outcome = gate.gate_domain(&event).await;
-			let winner = if outcome.winner == crate::AgentSettled::Continue {
-				let reaction = crate::CampaignMachine::react(
-					&mut self.legacy_session_stop,
-					Point::Settle,
-					&PointCx { turn_id: Some(turn_id.as_str()), now_ms: now, ..PointCx::default() },
-				);
+			let winner = if outcome.winner == AgentSettled::Continue {
+				let reaction =
+					CampaignMachine::react(&mut self.legacy_session_stop, Point::Settle, &PointCx {
+						turn_id: Some(turn_id.as_str()),
+						now_ms: now,
+						..PointCx::default()
+					});
 				if reaction
 					.verdicts
 					.iter()
 					.any(|verdict| matches!(verdict, crate::Verdict::Continue))
 				{
-					crate::AgentSettled::Continue
+					AgentSettled::Continue
 				} else {
-					crate::AgentSettled::Settle
+					AgentSettled::Settle
 				}
 			} else {
-				self.legacy_session_stop = crate::LegacySessionStopCampaign::default();
-				crate::AgentSettled::Settle
+				self.legacy_session_stop = LegacySessionStopCampaign::default();
+				AgentSettled::Settle
 			};
 			builtins.consider(
 				SettledParticipant::AgentSettled,
 				from_hook(
 					winner,
 					sf!("agent_settled"),
-					recovery_prompt_item(crate::prompt_assets::PromptAssetId::AutoContinue),
+					recovery_prompt_item(PromptAssetId::AutoContinue),
 				),
 				ContinuationPolicy::default(),
 			);
@@ -1967,7 +2016,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			None,
 			&mut self.journal,
 		)?;
-		if settle_fold.campaign.winner == crate::WinnerKind::Continue
+		if settle_fold.campaign.winner == WinnerKind::Continue
 			&& matches!(candidate, Continuation::Settle)
 		{
 			candidate = Continuation::Continue {
@@ -1975,7 +2024,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					.campaign
 					.winner_lane
 					.unwrap_or_else(|| sf!("campaign")),
-				item:           recovery_prompt_item(crate::prompt_assets::PromptAssetId::AutoContinue),
+				item:           recovery_prompt_item(PromptAssetId::AutoContinue),
 				label:          Some(sf!("campaign")),
 				collapse_prior: false,
 			};
@@ -1984,7 +2033,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		if self.loop_signal.no_progress_turns >= 3
 			&& let Continuation::Continue { item, .. } = &mut candidate
 		{
-			*item = recovery_prompt_item(crate::prompt_assets::PromptAssetId::ThinkingLoopRedirect);
+			*item = recovery_prompt_item(PromptAssetId::ThinkingLoopRedirect);
 		}
 		if let Continuation::Continue { owner, .. } = &candidate
 			&& let Some(owner_policy) = self.continuation_policies.get(owner)
@@ -1995,10 +2044,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.continuations
 			.decide_with_policy(candidate, now, policy)
 		{
-			Continuation::Continue { owner, item, .. } => Ok(Some(crate::Interrupt {
-				class: crate::InterruptClass::Immediate,
+			Continuation::Continue { owner, item, .. } => Ok(Some(Interrupt {
+				class: InterruptClass::Immediate,
 				item,
-				source: crate::InterruptSource::Continuation { owner },
+				source: InterruptSource::Continuation { owner },
 			})),
 			Continuation::Settle | Continuation::Refused { .. } => Ok(None),
 		}
@@ -2007,12 +2056,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 	fn stage_interrupts(
 		&mut self,
 		turn_id: &TurnId<str>,
-		interrupts: impl IntoIterator<Item = crate::Interrupt>,
+		interrupts: impl IntoIterator<Item = Interrupt>,
 	) -> Result<Vec<u64>, AgentError> {
 		let ts = now_ms();
 		let mut indexes = Vec::new();
 		for interrupt in interrupts {
-			if let crate::InterruptSource::Job { id } = &interrupt.source {
+			if let InterruptSource::Job { id } = &interrupt.source {
 				indexes.push(self.journal.settle_job(ts, id.as_str(), interrupt.item)?);
 				self
 					.events
@@ -2046,10 +2095,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 	}
 
 	/// Installs Pi-compatible substantive-turn detection and synthetic capture.
-	pub fn set_autolearn(&mut self, settings: crate::AutolearnSettings) {
-		self.autolearn = settings
-			.enabled
-			.then(|| crate::AutolearnController::new(settings));
+	pub fn set_autolearn(&mut self, settings: AutolearnSettings) {
+		self.autolearn = settings.enabled.then(|| AutolearnController::new(settings));
 	}
 
 	async fn run_turn(
@@ -2067,12 +2114,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.pending_turn()
 			.filter(|start| start.turn_id.as_str() == turn_id.as_str())
 			.cloned();
-		let capture_turn = durable.is_none()
-			&& self
-				.journal
-				.items_at(&pending)?
-				.iter()
-				.any(crate::is_capture_item);
+		let capture_turn =
+			durable.is_none() && self.journal.items_at(&pending)?.iter().any(is_capture_item);
 		if durable.is_none()
 			&& let Some(source) = &self.prompt_memory_source
 		{
@@ -2092,7 +2135,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					content.map(|content| (name, omp_scribe::Value::from(content)))
 				})
 				.collect::<omp_scribe::Value>();
-				snapshot.props.set(crate::prompt_keys::MEMORY, values);
+				snapshot.props.set(prompt_keys::MEMORY, values);
 			});
 		}
 		let snapshot = self.state.snapshot();
@@ -2128,7 +2171,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		if let Some(rendered) = rendered.as_ref()
 			&& (self.prompt_hash.is_none() || changed_prompt)
 		{
-			let old_head = std::mem::take(&mut self.prompt_head_events);
+			let old_head = mem::take(&mut self.prompt_head_events);
 			let live = self.journal.live_item_events()?;
 			let preserved_tail: Vec<_> = live
 				.into_iter()
@@ -2204,7 +2247,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let mut backoff = snapshot.retry.initial_backoff();
 		let mut frozen_options = durable.as_ref().map_or_else(
 			|| snapshot.turn.clone(),
-			|start| crate::TurnOptions {
+			|start| TurnOptions {
 				context_id:      start.options.context_id.clone(),
 				params:          start.options.params.clone(),
 				executor:        start.options.executor.clone(),
@@ -2225,7 +2268,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let latest = self.state.snapshot();
 			if latest
 				.deadline
-				.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+				.is_some_and(|deadline| Instant::now() >= deadline)
 			{
 				return Err(AgentError::Deadline);
 			}
@@ -2236,25 +2279,21 @@ impl<C: TurnClient + Clone> Agent<C> {
 				let projected =
 					project_journal(&journal, journal.as_ref(), snapshot.registry.as_ref(), &self.caps)?;
 				let context_handlers = self.hook_bus.union_mask()
-					& crate::hook_event_mask(
-						omp_proto::toolhost::v1::HookEventId::HookEventThreadProjection,
-					) != 0;
+					& hook_event_mask(v1::HookEventId::HookEventThreadProjection)
+					!= 0;
 				match project_context(projected, &all_live, context_handlers) {
 					ContextProjection::Unchanged(mut thread)
 					| ContextProjection::View { mut thread, .. } => {
 						if let Ok(date) = omp_core::display_time::local_calendar_date(SystemTime::now()) {
 							let cwd = snapshot
 								.props
-								.get(crate::prompt_keys::CWD)
+								.get(prompt_keys::CWD)
 								.and_then(omp_scribe::Value::as_str)
 								.unwrap_or_default();
-							let _ = crate::inject_first_turn_metadata(&mut thread, &date, cwd);
+							let _ = inject_first_turn_metadata(&mut thread, &date, cwd);
 						}
-						if std::mem::take(&mut self.pending_reasoning_demotion) {
-							let _ = crate::demote_interrupted_reasoning(
-								&mut thread,
-								snapshot.reasoning_dialect,
-							);
+						if mem::take(&mut self.pending_reasoning_demotion) {
+							let _ = demote_interrupted_reasoning(&mut thread, snapshot.reasoning_dialect);
 						}
 						TurnInput::Full(thread)
 					},
@@ -2289,13 +2328,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.tool_choices
 				.pending_head()
 				.map(|head| (Str::new(head.id), Str::new(head.source_tool)));
-			let pending_invoker =
-				pending_invoker
-					.as_ref()
-					.map(|(id, source_tool)| crate::PendingInvokerCx {
-						id:          id.as_str(),
-						source_tool: source_tool.as_str(),
-					});
+			let pending_invoker = pending_invoker
+				.as_ref()
+				.map(|(id, source_tool)| PendingInvokerCx {
+					id:          id.as_str(),
+					source_tool: source_tool.as_str(),
+				});
 			let choice_cx = PointCx {
 				turn_id: Some(turn_id.as_str()),
 				now_ms: now_ms(),
@@ -2309,12 +2347,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 				&mut self.journal,
 			)?;
 			if let Some(choice) = self.tool_choices.claim_next() {
-				frozen_options.params.tool_choice = Some(proto_tool_choice(choice));
+				let (mode, name) = match choice {
+					ToolChoice::Disabled => (tool_choice::Mode::None, String::new()),
+					ToolChoice::Auto => (tool_choice::Mode::Auto, String::new()),
+					ToolChoice::Required => (tool_choice::Mode::Required, String::new()),
+					ToolChoice::Named(name) => (tool_choice::Mode::Named, name.to_string()),
+				};
+				frozen_options.params.tool_choice =
+					Some(wire_tool_choice::from_parts(mode as i32, name));
 			}
 			let pre_model =
 				self.fold_point(Point::PreModel, Some(turn_id.as_str()), None, None, false)?;
 			for binding in pre_model.campaign.binds {
-				if let crate::ScopedBinding { slot: crate::BindSlot::ModelRoute, value } = binding {
+				if let ScopedBinding { slot: BindSlot::ModelRoute, value } = binding {
 					frozen_options.params.model = value.to_string();
 				}
 			}
@@ -2398,9 +2443,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			self.drain_invocation_facts()?;
 			let session_result = selected?;
 			if session_result.is_err() {
-				self
-					.tool_choices
-					.reject(crate::tool_choice::RejectReason::Error);
+				self.tool_choices.reject(RejectReason::Error);
 			}
 			match session_result {
 				Ok(DriveSessionResult::Complete(mut outcome, speculative)) => {
@@ -2451,9 +2494,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					)));
 				},
 				Ok(DriveSessionResult::Ttsr(trigger)) => {
-					self
-						.tool_choices
-						.reject(crate::tool_choice::RejectReason::Aborted);
+					self.tool_choices.reject(RejectReason::Aborted);
 					return Ok(RunTurnResult::Ttsr(trigger));
 				},
 				Err(TurnError::Conflict(error)) => {
@@ -2478,8 +2519,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 				},
 				Err(TurnError::Terminal(error))
 					if matches!(
-						pb::turn_error::Kind::try_from(error.kind),
-						Ok(pb::turn_error::Kind::RateLimited)
+						turn_error::Kind::try_from(error.kind),
+						Ok(turn_error::Kind::RateLimited)
 					) && attempts < latest.retry.max_attempts().get() =>
 				{
 					sleep_with_deadline(Duration::from_millis(error.retry_after_ms), latest.deadline)
@@ -2487,8 +2528,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 				},
 				Err(TurnError::Terminal(error))
 					if matches!(
-						pb::turn_error::Kind::try_from(error.kind),
-						Ok(pb::turn_error::Kind::Overloaded | pb::turn_error::Kind::Upstream)
+						turn_error::Kind::try_from(error.kind),
+						Ok(turn_error::Kind::Overloaded | turn_error::Kind::Upstream)
 					) && attempts < latest.retry.max_attempts().get() =>
 				{
 					sleep_with_deadline(backoff, latest.deadline).await?;
@@ -2540,7 +2581,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		&mut self,
 		turn_id: TurnId,
 		input: TurnInput,
-		options: &crate::TurnOptions,
+		options: &TurnOptions,
 		registry: Arc<ToolRegistry>,
 		enabled_tools: Arc<[Str]>,
 		enforce_ttsr: bool,
@@ -2557,7 +2598,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let mut session = loop {
 			tokio::select! {
 				session = &mut opening => break session?,
-				command = self.host_commands.recv_async() => {
+				command = self.receivers.host_commands.recv_async() => {
 					if let Ok(command) = command {
 						self.handle_host_control(command);
 						self.control_serviced_during_turn = true;
@@ -2610,7 +2651,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 							pending_tool_results,
 						));
 					},
-					command = self.host_commands.recv_async() => {
+					command = self.receivers.host_commands.recv_async() => {
 						match command {
 							Ok(command) => {
 								self.handle_host_control(command);
@@ -2658,7 +2699,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 								pending_tool_results,
 							));
 						},
-						command = self.host_commands.recv_async() => {
+						command = self.receivers.host_commands.recv_async() => {
 							match command {
 								Ok(command) => {
 									self.handle_host_control(command);
@@ -2712,16 +2753,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 					.publish(AgentEvent::Turn { turn_id: turn_id.clone(), event: Box::new(event) });
 			};
 			match event.event.as_ref() {
-				Some(pb::turn_event::Event::PartStart(part))
-					if part.kind() == pb::part_start::Kind::Text && self.secret_obfuscator.is_some() =>
+				Some(turn_event::Event::PartStart(part))
+					if part.kind() == part_start::Kind::Text && self.secret_obfuscator.is_some() =>
 				{
 					secret_streams.insert(part.index, SecretStreamRestorer::new());
 					publish(event.clone());
 				},
-				Some(pb::turn_event::Event::PartDelta(part))
+				Some(turn_event::Event::PartDelta(part))
 					if secret_streams.contains_key(&part.index) =>
 				{
-					let fragment = std::str::from_utf8(&part.chunk)
+					let fragment = str::from_utf8(&part.chunk)
 						.map_err(|_| TurnError::Protocol("stream fragment is not UTF-8"))?;
 					let restored = secret_streams
 						.get_mut(&part.index)
@@ -2736,15 +2777,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 						);
 					if !restored.is_empty() {
 						let mut display = event.clone();
-						if let Some(pb::turn_event::Event::PartDelta(delta)) = display.event.as_mut() {
+						if let Some(turn_event::Event::PartDelta(delta)) = display.event.as_mut() {
 							delta.chunk = bytes::Bytes::from(restored);
 						}
 						publish(display);
 					}
 				},
-				Some(pb::turn_event::Event::PartEnd(part))
-					if secret_streams.contains_key(&part.index) =>
-				{
+				Some(turn_event::Event::PartEnd(part)) if secret_streams.contains_key(&part.index) => {
 					let restored = secret_streams
 						.remove(&part.index)
 						.expect("checked stream")
@@ -2757,7 +2796,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						);
 					if !restored.is_empty() {
 						publish(pb::TurnEvent {
-							event: Some(pb::turn_event::Event::PartDelta(pb::PartDelta {
+							event: Some(turn_event::Event::PartDelta(pb::PartDelta {
 								index: part.index,
 								chunk: bytes::Bytes::from(restored),
 							})),
@@ -2768,15 +2807,15 @@ impl<C: TurnClient + Clone> Agent<C> {
 				_ => publish(event.clone()),
 			}
 			match event.event {
-				Some(pb::turn_event::Event::Outcome(outcome)) => {
+				Some(turn_event::Event::Outcome(outcome)) => {
 					return Ok(DriveSessionResult::Complete(outcome, speculative));
 				},
-				Some(pb::turn_event::Event::PartStart(part)) => {
+				Some(turn_event::Event::PartStart(part)) => {
 					let source = match part.kind() {
-						pb::part_start::Kind::Text => Some(TtsrSource::Text),
-						pb::part_start::Kind::Thinking => Some(TtsrSource::Thinking),
-						pb::part_start::Kind::ToolCall => Some(TtsrSource::Tool),
-						pb::part_start::Kind::Unspecified => None,
+						part_start::Kind::Text => Some(TtsrSource::Text),
+						part_start::Kind::Thinking => Some(TtsrSource::Thinking),
+						part_start::Kind::ToolCall => Some(TtsrSource::Tool),
+						part_start::Kind::Unspecified => None,
 					};
 					if enforce_ttsr && let Some(source) = source {
 						ttsr_parts.insert(
@@ -2788,7 +2827,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 							),
 						);
 					}
-					if part.kind() != pb::part_start::Kind::ToolCall {
+					if part.kind() != part_start::Kind::ToolCall {
 						continue;
 					}
 					if !enabled_tools
@@ -2819,7 +2858,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 							&mut self.journal,
 						)
 						.map_err(|_| TurnError::Protocol("failed to journal admission fold"))?;
-					if admission.campaign.winner == crate::WinnerKind::Deny {
+					if admission.campaign.winner == WinnerKind::Deny {
 						return Err(TurnError::Protocol("campaign denied tool admission"));
 					}
 					for ticket in admission.campaign.holds {
@@ -2864,8 +2903,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 					speculative.insert(call_id.clone(), opened);
 					part_calls.insert(part.index, call_id);
 				},
-				Some(pb::turn_event::Event::PartDelta(part)) => {
-					let fragment = std::str::from_utf8(&part.chunk)
+				Some(turn_event::Event::PartDelta(part)) => {
+					let fragment = str::from_utf8(&part.chunk)
 						.map_err(|_| TurnError::Protocol("stream fragment is not UTF-8"))?;
 					let trigger = if let Some(state) = ttsr_parts.get_mut(&part.index) {
 						self
@@ -2889,7 +2928,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 							&mut self.journal,
 						)
 						.map_err(|_| TurnError::Protocol("failed to journal stream campaign fold"))?;
-					if stream_fold.campaign.winner == crate::WinnerKind::Cut {
+					if stream_fold.campaign.winner == WinnerKind::Cut {
 						if let Some(trigger) = trigger {
 							return Ok(DriveSessionResult::Ttsr(trigger));
 						}
@@ -2904,12 +2943,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 							.map_err(|_| TurnError::Protocol("failed to relay speculative arguments"))?;
 					}
 				},
-				Some(pb::turn_event::Event::PartEnd(part)) => {
+				Some(turn_event::Event::PartEnd(part)) => {
 					part_calls.remove(&part.index);
 					ttsr_parts.remove(&part.index);
 				},
-				Some(pb::turn_event::Event::Invoke(invoke)) => duplex.start(invoke),
-				Some(pb::turn_event::Event::InvokeCancel(cancel)) => {
+				Some(turn_event::Event::Invoke(invoke)) => duplex.start(invoke),
+				Some(turn_event::Event::InvokeCancel(cancel)) => {
 					duplex.cancel(&cancel.invocation_id);
 				},
 				_ => {},
@@ -2925,7 +2964,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		enabled_tools: &[Str],
 	) -> Result<(), AgentError> {
 		for item in output {
-			let Some(thread::item::Kind::ToolCall(call)) = &item.kind else {
+			let Some(item::Kind::ToolCall(call)) = &item.kind else {
 				continue;
 			};
 			if speculative.contains_key(call.id.as_str()) {
@@ -2956,7 +2995,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				maximum_effects,
 			)?;
 			let restored = restored_argument_bytes(&call.args_json, self.secret_obfuscator.as_ref())?;
-			let fragment = std::str::from_utf8(&restored)
+			let fragment = str::from_utf8(&restored)
 				.map_err(|_| AgentError::Protocol("tool arguments are not UTF-8"))?;
 			opened.relay_fragment(fragment.to_str()).await?;
 			speculative.insert(call.id.as_str().to_str(), opened);
@@ -2975,7 +3014,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 	}
 
 	fn drain_control(&mut self) {
-		while let Ok(command) = self.host_commands.try_recv() {
+		while let Ok(command) = self.receivers.host_commands.try_recv() {
 			self.handle_host_control(command);
 		}
 		let mut campaigns = Vec::new();
@@ -3034,8 +3073,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 			"omp.context.epoch" => Ok(Value::from(self.journal.context_position().epoch)),
 			"omp.context.message.parts" => self.context_control_item(&command.arguments).map(|item| {
 				let parts = match item.kind.as_ref() {
-					Some(thread::item::Kind::Message(message)) => message.parts.as_slice(),
-					Some(thread::item::Kind::ToolResult(result)) => result.parts.as_slice(),
+					Some(item::Kind::Message(message)) => message.parts.as_slice(),
+					Some(item::Kind::ToolResult(result)) => result.parts.as_slice(),
 					_ => &[],
 				};
 				Value::Array(parts.iter().filter_map(context_part_json).collect())
@@ -3044,7 +3083,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self
 					.context_control_item(&command.arguments)
 					.map(|item| match item.kind {
-						Some(thread::item::Kind::ToolCall(call)) => call.raw.map_or(Value::Null, |raw| {
+						Some(item::Kind::ToolCall(call)) => call.raw.map_or(Value::Null, |raw| {
 							serde_json::json!({
 								"base64": omp_core::base64::encode(raw.as_ref())
 							})
@@ -3056,7 +3095,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self
 					.context_control_item(&command.arguments)
 					.and_then(|item| {
-						let Some(thread::item::Kind::ToolResult(result)) = item.kind else {
+						let Some(item::Kind::ToolResult(result)) = item.kind else {
 							return Err(sf!("NoVerdict: context item is not a tool result"));
 						};
 						result
@@ -3278,14 +3317,14 @@ impl<C: TurnClient + Clone> Agent<C> {
 	fn handle_campaign_control(
 		arbiter: &mut Arbiter,
 		journal: &mut Journal,
-		tool_choices: &mut crate::tool_choice::ToolChoiceQueue,
+		tool_choices: &mut ToolChoiceQueue,
 		command: CampaignControl,
 	) {
 		match command {
 			CampaignControl::Engage { spec, machine, options, reply } => {
 				let result = arbiter
 					.engage(spec, machine, journal, options)
-					.map_err(crate::ControlError::from);
+					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
 			CampaignControl::Active { reply } => {
@@ -3294,7 +3333,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			CampaignControl::Disengage { engagement, now_ms, reply } => {
 				let result = arbiter
 					.disengage(engagement.as_str(), now_ms, journal)
-					.map_err(crate::ControlError::from);
+					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
 			CampaignControl::RegisterPendingInvoker { id, source_tool, invoker, reply } => {
@@ -3309,19 +3348,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 				let _ = reason;
 				let result = arbiter
 					.step(engagement.as_str(), now_ms(), journal)
-					.map_err(crate::ControlError::from);
+					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
 			CampaignControl::Cut { engagement, reply } => {
 				let result = arbiter
 					.cut(engagement.as_str(), now_ms(), journal)
-					.map_err(crate::ControlError::from);
+					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
 			CampaignControl::UpdateState { engagement, payload, reply } => {
 				let result = arbiter
 					.update_state(engagement.as_str(), payload.as_ref(), now_ms(), journal)
-					.map_err(crate::ControlError::from);
+					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
 		}
@@ -3403,7 +3442,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 	}
 
 	fn drain_invocation_facts(&mut self) -> Result<(), AgentError> {
-		while let Ok(fact) = self.invocation_fact_rx.try_recv() {
+		while let Ok(fact) = self.receivers.invocation_fact_rx.try_recv() {
 			let requested =
 				restore_canonical_raw(fact.raw.as_bytes(), self.secret_obfuscator.as_ref())?;
 			let patch = (!fact.admission.args_patch.is_empty())
@@ -3462,10 +3501,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 		&mut self,
 		outcome: &Outcome,
 		speculative: &BTreeMap<Str, SpeculativeCall>,
-		receipt: &crate::TurnReceipt,
+		receipt: &TurnReceipt,
 	) -> Result<(), AgentError> {
 		for (position, item) in outcome.output.iter().enumerate() {
-			let Some(thread::item::Kind::ToolCall(call)) = item.kind.as_ref() else {
+			let Some(item::Kind::ToolCall(call)) = item.kind.as_ref() else {
 				continue;
 			};
 			let opened = speculative
@@ -3572,7 +3611,7 @@ fn context_ref_json(event: u64, item: &Item) -> Result<Value, Str> {
 	let bytes = serde_json::to_vec(item).map_err(|error| Str::from(error.to_string()))?;
 	let (kind, role, part_count, media_count, tool, is_error, useless, preview) =
 		match item.kind.as_ref() {
-			Some(thread::item::Kind::Message(message)) => {
+			Some(item::Kind::Message(message)) => {
 				let role = match thread::Role::try_from(message.role) {
 					Ok(thread::Role::System) => "system",
 					Ok(thread::Role::User) => "user",
@@ -3583,7 +3622,7 @@ fn context_ref_json(event: u64, item: &Item) -> Result<Value, Str> {
 					.parts
 					.iter()
 					.find_map(|part| match part.kind.as_ref() {
-						Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+						Some(part::Kind::Text(text)) => Some(text.as_str()),
 						_ => None,
 					});
 				(
@@ -3593,7 +3632,7 @@ fn context_ref_json(event: u64, item: &Item) -> Result<Value, Str> {
 					message
 						.parts
 						.iter()
-						.filter(|part| matches!(part.kind, Some(thread::part::Kind::Blob(_))))
+						.filter(|part| matches!(part.kind, Some(part::Kind::Blob(_))))
 						.count(),
 					Value::Null,
 					false,
@@ -3601,7 +3640,7 @@ fn context_ref_json(event: u64, item: &Item) -> Result<Value, Str> {
 					preview,
 				)
 			},
-			Some(thread::item::Kind::ToolCall(call)) => (
+			Some(item::Kind::ToolCall(call)) => (
 				"tool_call",
 				"assistant",
 				1,
@@ -3611,14 +3650,14 @@ fn context_ref_json(event: u64, item: &Item) -> Result<Value, Str> {
 				false,
 				Some(call.name.as_str()),
 			),
-			Some(thread::item::Kind::ToolResult(result)) => (
+			Some(item::Kind::ToolResult(result)) => (
 				"tool_result",
 				"user",
 				result.parts.len(),
 				result
 					.parts
 					.iter()
-					.filter(|part| matches!(part.kind, Some(thread::part::Kind::Blob(_))))
+					.filter(|part| matches!(part.kind, Some(part::Kind::Blob(_))))
 					.count(),
 				serde_json::json!({"name": result.name, "family": "", "rev": 0}),
 				result.is_error,
@@ -3627,7 +3666,7 @@ fn context_ref_json(event: u64, item: &Item) -> Result<Value, Str> {
 					.parts
 					.iter()
 					.find_map(|part| match part.kind.as_ref() {
-						Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+						Some(part::Kind::Text(text)) => Some(text.as_str()),
 						_ => None,
 					}),
 			),
@@ -3658,36 +3697,34 @@ fn context_ref_json(event: u64, item: &Item) -> Result<Value, Str> {
 
 fn context_part_json(part: &thread::Part) -> Option<Value> {
 	match part.kind.as_ref()? {
-		thread::part::Kind::Text(text) => Some(serde_json::json!({"kind": "text", "text": text})),
-		thread::part::Kind::Blob(blob) => Some(serde_json::json!({
+		part::Kind::Text(text) => Some(serde_json::json!({"kind": "text", "text": text})),
+		part::Kind::Blob(blob) => Some(serde_json::json!({
 			"kind": "blob",
 			"hash": omp_core::hex::encode(blob.hash.as_ref()).to_string(),
 			"size": blob.size,
 			"alt": Value::Null,
 		})),
-		thread::part::Kind::Thinking(_)
-		| thread::part::Kind::Fallback(_)
-		| thread::part::Kind::ServerTool(_) => None,
+		part::Kind::Thinking(_) | part::Kind::Fallback(_) | part::Kind::ServerTool(_) => None,
 	}
 }
 fn context_proto_value_json(value: &pb::Value) -> Option<Value> {
 	Some(match value.kind.as_ref()? {
-		pb::value::Kind::Null(_) => Value::Null,
-		pb::value::Kind::Bool(value) => Value::Bool(*value),
-		pb::value::Kind::Int(value) => Value::from(*value),
-		pb::value::Kind::Uint(value) => Value::from(*value),
-		pb::value::Kind::Double(value) => serde_json::Number::from_f64(*value)
+		value::Kind::Null(_) => Value::Null,
+		value::Kind::Bool(value) => Value::Bool(*value),
+		value::Kind::Int(value) => Value::from(*value),
+		value::Kind::Uint(value) => Value::from(*value),
+		value::Kind::Double(value) => serde_json::Number::from_f64(*value)
 			.map(Value::Number)
 			.unwrap_or(Value::Null),
-		pb::value::Kind::String(value) => Value::String(value.clone()),
-		pb::value::Kind::List(values) => Value::Array(
+		value::Kind::String(value) => Value::String(value.clone()),
+		value::Kind::List(values) => Value::Array(
 			values
 				.values
 				.iter()
 				.filter_map(context_proto_value_json)
 				.collect(),
 		),
-		pb::value::Kind::Map(values) => Value::Object(
+		value::Kind::Map(values) => Value::Object(
 			values
 				.fields
 				.iter()
@@ -3701,11 +3738,9 @@ fn context_proto_value_json(value: &pb::Value) -> Option<Value> {
 
 fn publish_input_attachments(session: &str, input: &TurnInput) {
 	match input {
-		TurnInput::Full(thread) => crate::attachments::publish_session_attachments(session, thread),
+		TurnInput::Full(thread) => attachments::publish_session_attachments(session, thread),
 		TurnInput::Delta(_, delta) => {
-			crate::attachments::publish_session_attachments(session, &Thread {
-				items: delta.append.clone(),
-			});
+			attachments::publish_session_attachments(session, &Thread { items: delta.append.clone() });
 		},
 	}
 }
@@ -3724,7 +3759,7 @@ fn obfuscate_provider_input(
 	};
 	for item in items {
 		match item.kind.as_mut() {
-			Some(thread::item::Kind::Message(message)) => {
+			Some(item::Kind::Message(message)) => {
 				let kind = match thread::Role::try_from(message.role) {
 					Ok(thread::Role::User) => MessageTextKind::User,
 					Ok(thread::Role::Assistant) => MessageTextKind::AssistantReplay,
@@ -3733,7 +3768,7 @@ fn obfuscate_provider_input(
 					},
 				};
 				for part in &mut message.parts {
-					if let Some(thread::part::Kind::Text(text)) = part.kind.as_mut() {
+					if let Some(part::Kind::Text(text)) = part.kind.as_mut() {
 						let mapped = obfuscate_message_text(&mut obfuscator, kind, text);
 						if mapped != *text {
 							*text = mapped;
@@ -3741,9 +3776,9 @@ fn obfuscate_provider_input(
 					}
 				}
 			},
-			Some(thread::item::Kind::ToolResult(result)) => {
+			Some(item::Kind::ToolResult(result)) => {
 				for part in &mut result.parts {
-					if let Some(thread::part::Kind::Text(text)) = part.kind.as_mut() {
+					if let Some(part::Kind::Text(text)) = part.kind.as_mut() {
 						let mapped =
 							obfuscate_message_text(&mut obfuscator, MessageTextKind::ToolResult, text);
 						if mapped != *text {
@@ -3752,7 +3787,7 @@ fn obfuscate_provider_input(
 					}
 				}
 			},
-			Some(thread::item::Kind::ToolCall(call)) => {
+			Some(item::Kind::ToolCall(call)) => {
 				let mut value: serde_json::Value = serde_json::from_slice(&call.args_json)
 					.map_err(|_| AgentError::Protocol("tool arguments are not one JSON document"))?;
 				obfuscate_json(&mut value, &mut obfuscator);
@@ -3777,11 +3812,11 @@ fn restore_provider_output(
 	let obfuscator = secret_obfuscator.lock();
 	for item in items {
 		match item.kind.as_mut() {
-			Some(thread::item::Kind::Message(message))
+			Some(item::Kind::Message(message))
 				if thread::Role::try_from(message.role) == Ok(thread::Role::Assistant) =>
 			{
 				for part in &mut message.parts {
-					if let Some(thread::part::Kind::Text(text)) = part.kind.as_mut() {
+					if let Some(part::Kind::Text(text)) = part.kind.as_mut() {
 						let restored =
 							restore_message_text(&obfuscator, MessageTextKind::AssistantOutput, text);
 						if restored != *text {
@@ -3790,7 +3825,7 @@ fn restore_provider_output(
 					}
 				}
 			},
-			Some(thread::item::Kind::ToolCall(call)) => {
+			Some(item::Kind::ToolCall(call)) => {
 				let mut value: serde_json::Value = serde_json::from_slice(&call.args_json)
 					.map_err(|_| AgentError::Protocol("tool arguments are not one JSON document"))?;
 				deobfuscate_json(&mut value, &obfuscator);
@@ -3806,8 +3841,7 @@ fn restore_provider_output(
 					}
 				}
 			},
-			Some(thread::item::Kind::Message(_)) | Some(thread::item::Kind::ToolResult(_)) | None => {
-			},
+			Some(item::Kind::Message(_)) | Some(item::Kind::ToolResult(_)) | None => {},
 		}
 	}
 	Ok(())
@@ -3880,10 +3914,10 @@ fn committed_calls(
 	output: &[Item],
 	speculative: &mut BTreeMap<Str, SpeculativeCall>,
 	secret_obfuscator: Option<&Arc<Mutex<SecretObfuscator>>>,
-) -> Result<Vec<crate::CommittedCall>, AgentError> {
+) -> Result<Vec<CommittedCall>, AgentError> {
 	let mut committed = Vec::new();
 	for item in output {
-		let Some(thread::item::Kind::ToolCall(call)) = &item.kind else {
+		let Some(item::Kind::ToolCall(call)) = &item.kind else {
 			continue;
 		};
 		let opened = speculative
@@ -3898,7 +3932,7 @@ fn committed_calls(
 			.and_then(|props| props.fields.get(omp_tool::TOOL_REV_PROP))
 			.and_then(|value| value.kind.as_ref())
 			.and_then(|kind| match kind {
-				pb::value::Kind::String(value) => Some(value.as_str()),
+				value::Kind::String(value) => Some(value.as_str()),
 				_ => None,
 			})
 			.ok_or(AgentError::Protocol("committed tool revision missing"))?;
@@ -3914,7 +3948,7 @@ fn validate_outcome(outcome: &Outcome) -> Result<(), AgentError> {
 	let tool_calls = outcome
 		.output
 		.iter()
-		.filter(|item| matches!(item.kind, Some(thread::item::Kind::ToolCall(_))))
+		.filter(|item| matches!(item.kind, Some(item::Kind::ToolCall(_))))
 		.count();
 	match outcome.stop() {
 		pb::StopReason::StopToolUse if tool_calls == 0 => {
@@ -3945,16 +3979,20 @@ fn telemetry_envelope() -> Envelope {
 	Envelope { occurred_at_ms: now_ms(), ..Envelope::default() }
 }
 
-async fn wait_deadline(deadline: Option<std::time::Instant>) {
+async fn wait_deadline(deadline: Option<Instant>) {
 	match deadline {
-		Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
-		None => std::future::pending().await,
+		Some(deadline) => {
+			use tokio::time::Instant;
+
+			time::sleep_until(Instant::from_std(deadline)).await
+		},
+		None => future::pending().await,
 	}
 }
 async fn wait_stream_watchdog(timeout_ms: Option<u64>) {
 	match timeout_ms {
-		Some(timeout_ms) => tokio::time::sleep(Duration::from_millis(timeout_ms)).await,
-		None => std::future::pending().await,
+		Some(timeout_ms) => time::sleep(Duration::from_millis(timeout_ms)).await,
+		None => future::pending().await,
 	}
 }
 
@@ -3965,23 +4003,20 @@ fn turn_input_has_tool_results(input: &TurnInput) -> bool {
 	};
 	items
 		.iter()
-		.any(|item| matches!(item.kind, Some(thread::item::Kind::ToolResult(_))))
+		.any(|item| matches!(item.kind, Some(item::Kind::ToolResult(_))))
 }
 fn stream_watchdog_error(
 	mailbox: &MailboxSender,
 	saw_event: bool,
 	pending_tool_results: bool,
 ) -> TurnError {
-	if let Some(kind) = omp_inference::recovery::repetition::classify_stream_recovery(
-		None,
-		false,
-		saw_event,
-		pending_tool_results,
-	) {
-		let _ = mailbox.try_enqueue(crate::Interrupt {
-			class:  crate::InterruptClass::TurnBoundary,
+	if let Some(kind) =
+		repetition::classify_stream_recovery(None, false, saw_event, pending_tool_results)
+	{
+		let _ = mailbox.try_enqueue(Interrupt {
+			class:  InterruptClass::TurnBoundary,
 			item:   stream_recovery_item(kind),
-			source: crate::InterruptSource::Continuation { owner: sf!("campaign") },
+			source: InterruptSource::Continuation { owner: sf!("campaign") },
 		});
 	}
 	TurnError::Rpc(tonic::Status::deadline_exceeded("stream watchdog elapsed"))
@@ -3989,10 +4024,10 @@ fn stream_watchdog_error(
 
 async fn sleep_with_deadline(
 	duration: Duration,
-	deadline: Option<std::time::Instant>,
+	deadline: Option<Instant>,
 ) -> Result<(), AgentError> {
 	tokio::select! {
-		() = tokio::time::sleep(duration) => Ok(()),
+		() = time::sleep(duration) => Ok(()),
 		() = wait_deadline(deadline) => Err(AgentError::Deadline),
 	}
 }
@@ -4007,13 +4042,13 @@ fn shake_item(
 	removed_bytes: &mut u64,
 ) -> Result<(), AgentError> {
 	let (parts, tool_result) = match item.kind.as_mut() {
-		Some(thread::item::Kind::Message(message)) => (&mut message.parts, false),
-		Some(thread::item::Kind::ToolResult(result)) => (&mut result.parts, true),
+		Some(item::Kind::Message(message)) => (&mut message.parts, false),
+		Some(item::Kind::ToolResult(result)) => (&mut result.parts, true),
 		_ => return Ok(()),
 	};
 	for part in parts {
 		let replacement = match part.kind.as_ref() {
-			Some(thread::part::Kind::Text(text))
+			Some(part::Kind::Text(text))
 				if tier == CompactionTier::Elide
 					&& text.len() >= 1_600
 					&& (tool_result || shake_block_candidate(text)) =>
@@ -4033,7 +4068,7 @@ fn shake_item(
 					artifact.url()
 				))
 			},
-			Some(thread::part::Kind::Blob(blob)) if tier == CompactionTier::DropMedia => {
+			Some(part::Kind::Blob(blob)) if tier == CompactionTier::DropMedia => {
 				let digest = <[u8; 32]>::try_from(blob.hash.as_ref())
 					.ok()
 					.map(Hash32::new)
@@ -4053,7 +4088,7 @@ fn shake_item(
 			_ => None,
 		};
 		if let Some(replacement) = replacement {
-			part.kind = Some(thread::part::Kind::Text(replacement));
+			part.kind = Some(part::Kind::Text(replacement));
 			*replaced_regions = replaced_regions.saturating_add(1);
 		}
 	}
@@ -4068,27 +4103,21 @@ fn shake_block_candidate(text: &str) -> bool {
 			.any(|line| line.starts_with('<') && line.ends_with('>'))
 }
 
-fn interrupt_reason(source: &crate::mailbox::InterruptSource) -> Str {
+fn interrupt_reason(source: &InterruptSource) -> Str {
 	match source {
-		crate::mailbox::InterruptSource::Job { id } => {
-			format!("job {} settled", id.as_str()).to_str()
-		},
-		crate::mailbox::InterruptSource::Continuation { owner } => {
+		InterruptSource::Job { id } => format!("job {} settled", id.as_str()).to_str(),
+		InterruptSource::Continuation { owner } => {
 			format!("continuation from {}", owner.as_str()).to_str()
 		},
-		crate::mailbox::InterruptSource::Schedule { id } => {
-			format!("schedule {} fired", id.as_str()).to_str()
-		},
-		crate::mailbox::InterruptSource::Peer { from } => {
-			format!("peer {} steered", from.as_str()).to_str()
-		},
-		crate::mailbox::InterruptSource::Remote { principal } => {
+		InterruptSource::Schedule { id } => format!("schedule {} fired", id.as_str()).to_str(),
+		InterruptSource::Peer { from } => format!("peer {} steered", from.as_str()).to_str(),
+		InterruptSource::Remote { principal } => {
 			sf!("remote guest {} steered", principal.display_name())
 		},
-		crate::mailbox::InterruptSource::DeferredDiagnostics { document, revision, .. } => {
+		InterruptSource::DeferredDiagnostics { document, revision, .. } => {
 			format!("deferred diagnostics for {} at revision {}", document.as_str(), revision).to_str()
 		},
-		crate::mailbox::InterruptSource::Producer(name) => name.clone(),
+		InterruptSource::Producer(name) => name.clone(),
 	}
 }
 
@@ -4096,7 +4125,7 @@ fn tool_call_digest(items: &[Item]) -> Option<Str> {
 	let mut hasher = Hash32::hasher();
 	let mut calls = 0_u32;
 	for item in items {
-		let Some(thread::item::Kind::ToolCall(call)) = &item.kind else {
+		let Some(item::Kind::ToolCall(call)) = &item.kind else {
 			continue;
 		};
 		calls = calls.saturating_add(1);
@@ -4108,14 +4137,14 @@ fn tool_call_digest(items: &[Item]) -> Option<Str> {
 	(calls != 0).then(|| Str::new(hasher.finalize().to_string()))
 }
 
-fn recovery_prompt_item(id: crate::prompt_assets::PromptAssetId) -> Item {
+fn recovery_prompt_item(id: PromptAssetId) -> Item {
 	Item {
 		seq:           0,
 		created_at_ms: now_ms(),
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::User as i32,
 			parts: vec![thread::Part {
-				kind: Some(thread::part::Kind::Text(format!(
+				kind: Some(part::Kind::Text(format!(
 					"<system-injection>\n{}\n</system-injection>",
 					crate::prompt_assets::prompt_asset(id).content.trim(),
 				))),
@@ -4127,13 +4156,13 @@ fn recovery_prompt_item(id: crate::prompt_assets::PromptAssetId) -> Item {
 
 fn tool_loop_redirect_item(count: u32, digest: &str) -> Item {
 	let mut content = String::new();
-	crate::prompt_assets::render_tool_call_loop_redirect(&mut content, count, digest);
+	prompt_assets::render_tool_call_loop_redirect(&mut content, count, digest);
 	Item {
 		seq:           0,
 		created_at_ms: now_ms(),
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(content)) }],
+			parts: vec![thread::Part { kind: Some(part::Kind::Text(content)) }],
 		})),
 		props:         None,
 	}
@@ -4148,17 +4177,6 @@ fn duplex_turn_error(error: DuplexError) -> TurnError {
 }
 fn follow_up_id(_root: &TurnId<str>, _ordinal: u32) -> TurnId {
 	TurnId::new(omp_core::Ulid::generate().to_string())
-}
-fn proto_tool_choice(choice: omp_inference::call::ToolChoice) -> pb::ToolChoice {
-	let (mode, name) = match choice {
-		omp_inference::call::ToolChoice::Disabled => (pb::tool_choice::Mode::None, String::new()),
-		omp_inference::call::ToolChoice::Auto => (pb::tool_choice::Mode::Auto, String::new()),
-		omp_inference::call::ToolChoice::Required => (pb::tool_choice::Mode::Required, String::new()),
-		omp_inference::call::ToolChoice::Named(name) => {
-			(pb::tool_choice::Mode::Named, name.to_string())
-		},
-	};
-	pb::ToolChoice { mode: mode as i32, name, on_unsupported: 0 }
 }
 
 fn accumulate_usage(target: &mut pb::Usage, source: &pb::Usage) {
@@ -4201,11 +4219,15 @@ pub fn now_ms() -> u64 {
 mod tests {
 	use std::{
 		collections::{BTreeMap, VecDeque},
+		env, fs, future,
+		path::PathBuf,
 		sync::Arc,
+		task,
 	};
 
 	use bytes::Bytes;
 	use futures::stream;
+	use omp_secrets::rule::{SecretKind, SecretMode, SecretRule};
 	use omp_storage::transcript::{Entry, Header, Kind, SessionId};
 	use omp_tool::{
 		Claims, Constraint, Effects, ModelClass, Precedence, Presentation, Rev, ToolSpec,
@@ -4213,9 +4235,10 @@ mod tests {
 	use parking_lot::Mutex;
 
 	use super::*;
+	use crate::InvokeFrame;
 
 	type Script = Vec<Result<pb::TurnEvent, TurnError>>;
-	type OpenedTurn = (TurnId, TurnInput, crate::TurnOptions);
+	type OpenedTurn = (TurnId, TurnInput, TurnOptions);
 	type OpenedTurns = Vec<OpenedTurn>;
 	#[test]
 	fn stream_watchdog_classifies_and_queues_recovery_guidance() {
@@ -4225,14 +4248,14 @@ mod tests {
 		assert!(matches!(error, TurnError::Rpc(_)));
 		let queued = mailbox.drain(DrainPoint::TurnBoundary, false);
 		assert_eq!(queued.len(), 1);
-		let Some(thread::item::Kind::Message(message)) = queued[0].item.kind.as_ref() else {
+		let Some(item::Kind::Message(message)) = queued[0].item.kind.as_ref() else {
 			panic!("watchdog guidance must be a canonical message");
 		};
 		let text = message
 			.parts
 			.iter()
 			.find_map(|part| match part.kind.as_ref() {
-				Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+				Some(part::Kind::Text(text)) => Some(text.as_str()),
 				_ => None,
 			});
 		assert!(text.is_some_and(|text| text.contains("no first response event")));
@@ -4253,16 +4276,16 @@ mod tests {
 			&mut self,
 		) -> impl futures::Stream<Item = Result<pb::TurnEvent, TurnError>> + Send + Unpin + '_ {
 			stream::poll_fn(move |_| match self.events.pop_front() {
-				Some(event) => std::task::Poll::Ready(Some(event)),
-				None => std::task::Poll::Pending,
+				Some(event) => task::Poll::Ready(Some(event)),
+				None => task::Poll::Pending,
 			})
 		}
 
 		fn submit(
 			&mut self,
-			_frame: crate::InvokeFrame,
+			_frame: InvokeFrame,
 		) -> impl Future<Output = Result<(), TurnError>> + Send + '_ {
-			std::future::ready(Ok(()))
+			future::ready(Ok(()))
 		}
 	}
 
@@ -4273,7 +4296,7 @@ mod tests {
 			&'client self,
 			turn_id: TurnId,
 			input: TurnInput,
-			options: &'client crate::TurnOptions,
+			options: &'client TurnOptions,
 		) -> impl Future<Output = Result<Self::Session<'client>, TurnError>> + Send + 'client {
 			self.opened.lock().push((turn_id, input, options.clone()));
 			let events = self
@@ -4281,26 +4304,26 @@ mod tests {
 				.lock()
 				.pop_front()
 				.expect("one script per turn");
-			std::future::ready(Ok(ScriptedSession { events: events.into() }))
+			future::ready(Ok(ScriptedSession { events: events.into() }))
 		}
 	}
 
 	fn outcome_script(outcome: Outcome) -> Vec<Result<pb::TurnEvent, TurnError>> {
-		vec![Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) })]
+		vec![Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) })]
 	}
 
 	fn pending_text_script() -> Vec<Result<pb::TurnEvent, TurnError>> {
 		vec![
 			Ok(pb::TurnEvent {
-				event: Some(pb::turn_event::Event::PartStart(pb::PartStart {
+				event: Some(turn_event::Event::PartStart(pb::PartStart {
 					index:        0,
-					kind:         pb::part_start::Kind::Text as i32,
+					kind:         part_start::Kind::Text as i32,
 					tool_call_id: String::new(),
 					tool_name:    String::new(),
 				})),
 			}),
 			Ok(pb::TurnEvent {
-				event: Some(pb::turn_event::Event::PartDelta(pb::PartDelta {
+				event: Some(turn_event::Event::PartDelta(pb::PartDelta {
 					index: 0,
 					chunk: Bytes::from_static(b"partial"),
 				})),
@@ -4316,37 +4339,37 @@ mod tests {
 			..thread::ToolCall::default()
 		};
 		let item = Item {
-			kind: Some(thread::item::Kind::ToolCall(call)),
+			kind: Some(item::Kind::ToolCall(call)),
 			props: Some(pb::ValueMap {
 				fields: BTreeMap::from([(omp_tool::TOOL_REV_PROP.to_owned(), pb::Value {
-					kind: Some(pb::value::Kind::String(identity.rev.to_string())),
+					kind: Some(value::Kind::String(identity.rev.to_string())),
 				})]),
 			}),
 			..Item::default()
 		};
 		vec![
 			Ok(pb::TurnEvent {
-				event: Some(pb::turn_event::Event::PartStart(pb::PartStart {
+				event: Some(turn_event::Event::PartStart(pb::PartStart {
 					index:        0,
-					kind:         pb::part_start::Kind::ToolCall as i32,
+					kind:         part_start::Kind::ToolCall as i32,
 					tool_call_id: call_id.to_owned(),
 					tool_name:    identity.name.to_string(),
 				})),
 			}),
 			Ok(pb::TurnEvent {
-				event: Some(pb::turn_event::Event::PartDelta(pb::PartDelta {
+				event: Some(turn_event::Event::PartDelta(pb::PartDelta {
 					index: 0,
 					chunk: Bytes::from_static(b"{}"),
 				})),
 			}),
 			Ok(pb::TurnEvent {
-				event: Some(pb::turn_event::Event::PartEnd(pb::PartEnd {
+				event: Some(turn_event::Event::PartEnd(pb::PartEnd {
 					index:     0,
 					signature: Bytes::new(),
 				})),
 			}),
 			Ok(pb::TurnEvent {
-				event: Some(pb::turn_event::Event::Outcome(Outcome {
+				event: Some(turn_event::Event::Outcome(Outcome {
 					output: vec![item],
 					stop: pb::StopReason::StopToolUse as i32,
 					..Outcome::default()
@@ -4357,9 +4380,9 @@ mod tests {
 
 	fn message(role: thread::Role, text: &str) -> Item {
 		Item {
-			kind: Some(thread::item::Kind::Message(thread::Message {
+			kind: Some(item::Kind::Message(thread::Message {
 				role:  i32::from(role),
-				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_owned())) }],
+				parts: vec![thread::Part { kind: Some(part::Kind::Text(text.to_owned())) }],
 			})),
 			..Item::default()
 		}
@@ -4373,8 +4396,8 @@ mod tests {
 		}
 	}
 
-	fn test_journal(name: &str) -> (Journal, std::path::PathBuf) {
-		let path = std::env::temp_dir().join(format!(
+	fn test_journal(name: &str) -> (Journal, PathBuf) {
+		let path = env::temp_dir().join(format!(
 			"omp-agent-loop-{name}-{}-{}.jsonl",
 			std::process::id(),
 			omp_core::Ulid::generate()
@@ -4383,7 +4406,7 @@ mod tests {
 			v:       4,
 			id:      SessionId(Str::new(name)),
 			created: 1,
-			cwd:     std::env::temp_dir(),
+			cwd:     env::temp_dir(),
 		})
 		.expect("create test journal");
 		(journal, path)
@@ -4403,7 +4426,7 @@ mod tests {
 			if opened.lock().len() >= count {
 				return;
 			}
-			tokio::task::yield_now().await;
+			yield_now().await;
 		}
 		panic!("scripted turn did not open");
 	}
@@ -4416,11 +4439,11 @@ mod tests {
 		items.iter().any(|item| {
 			matches!(
 				item.kind.as_ref(),
-				Some(thread::item::Kind::Message(message))
+				Some(item::Kind::Message(message))
 					if message.parts.iter().any(|part| {
 						matches!(
 							part.kind.as_ref(),
-							Some(thread::part::Kind::Text(text)) if text == expected
+							Some(part::Kind::Text(text)) if text == expected
 						)
 					})
 			)
@@ -4454,18 +4477,18 @@ mod tests {
 			.expect("register new");
 		let registry = Arc::new(registry);
 
-		let mut old_options = crate::TurnOptions::default();
+		let mut old_options = TurnOptions::default();
 		old_options.params.model = "durable-model".to_owned();
-		let mut new_options = crate::TurnOptions::default();
+		let mut new_options = TurnOptions::default();
 		new_options.params.model = "fresh-model".to_owned();
-		let state = AgentState::new(crate::AgentSnapshot {
+		let state = AgentState::new(AgentSnapshot {
 			turn: new_options.clone(),
 			enabled_tools: Arc::from([sf!("new")]),
 			registry: Arc::clone(&registry),
-			..crate::AgentSnapshot::default()
+			..AgentSnapshot::default()
 		});
 
-		let path = std::env::temp_dir().join(format!(
+		let path = env::temp_dir().join(format!(
 			"omp-agent-loop-allowlist-{}-{}.jsonl",
 			std::process::id(),
 			omp_core::Ulid::generate()
@@ -4474,10 +4497,10 @@ mod tests {
 			v:       4,
 			id:      SessionId(sf!("allowlist-test")),
 			created: 1,
-			cwd:     std::env::temp_dir(),
+			cwd:     env::temp_dir(),
 		})
 		.expect("create journal");
-		let durable_input = thread::Thread::default();
+		let durable_input = Thread::default();
 		journal
 			.start_turn(1, TurnStart {
 				turn_id:            sf!("durable-turn"),
@@ -4548,7 +4571,7 @@ mod tests {
 		);
 		drop(opened);
 		drop(agent);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[tokio::test]
@@ -4572,13 +4595,8 @@ mod tests {
 			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
-		let mut agent = Agent::new(
-			client,
-			env,
-			AgentState::new(crate::AgentSnapshot::default()),
-			journal,
-			test_caps(),
-		);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
 		let abort = agent.abort_handle();
 		let aborting = async {
 			wait_for_opened(&opened, 1).await;
@@ -4606,7 +4624,7 @@ mod tests {
 		assert!(!follow_up.interrupted);
 		assert_eq!(opened.lock().len(), 2);
 		drop(agent);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]
@@ -4614,24 +4632,24 @@ mod tests {
 		let (mut journal, path) = test_journal("shake-thinking");
 		let prompt_hash = PromptHash::from([7; 32]);
 		let assistant = Item {
-			kind: Some(thread::item::Kind::Message(thread::Message {
+			kind: Some(item::Kind::Message(thread::Message {
 				role:  i32::from(thread::Role::Assistant),
 				parts: vec![
 					thread::Part {
-						kind: Some(thread::part::Kind::Thinking(thread::Thinking {
+						kind: Some(part::Kind::Thinking(thread::Thinking {
 							text:      "plain reasoning".to_owned(),
 							signature: Bytes::new(),
 							redacted:  false,
 						})),
 					},
 					thread::Part {
-						kind: Some(thread::part::Kind::Thinking(thread::Thinking {
+						kind: Some(part::Kind::Thinking(thread::Thinking {
 							text:      String::new(),
 							signature: Bytes::from_static(b"opaque"),
 							redacted:  true,
 						})),
 					},
-					thread::Part { kind: Some(thread::part::Kind::Text("visible answer".to_owned())) },
+					thread::Part { kind: Some(part::Kind::Text("visible answer".to_owned())) },
 				],
 			})),
 			..Item::default()
@@ -4647,13 +4665,8 @@ mod tests {
 			opened:  Arc::new(Mutex::new(Vec::new())),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
-		let mut agent = Agent::new(
-			client,
-			env,
-			AgentState::new(crate::AgentSnapshot::default()),
-			journal,
-			test_caps(),
-		);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
 		agent.prompt_hash = Some(prompt_hash);
 		let outcome = agent
 			.shake_manual(ManualShakeMode::Thinking)
@@ -4664,16 +4677,16 @@ mod tests {
 		let events = agent.journal.live_item_events().expect("live item events");
 		let items = agent.journal.items_at(&events).expect("rewritten items");
 		assert!(items.iter().all(|item| {
-			let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+			let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
 				return true;
 			};
 			message
 				.parts
 				.iter()
-				.all(|part| !matches!(part.kind, Some(thread::part::Kind::Thinking(_))))
+				.all(|part| !matches!(part.kind, Some(part::Kind::Thinking(_))))
 		}));
 		drop(agent);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[tokio::test]
@@ -4688,13 +4701,8 @@ mod tests {
 			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
-		let mut agent = Agent::new(
-			client,
-			env,
-			AgentState::new(crate::AgentSnapshot::default()),
-			journal,
-			test_caps(),
-		);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
 		let abort = agent.abort_handle();
 		let aborting = async {
 			wait_for_opened(&opened, 1).await;
@@ -4732,7 +4740,7 @@ mod tests {
 		assert!(reopened.pending_input_submission().is_none());
 		assert!(reopened.recoverable_input_events().is_empty());
 		drop(reopened);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[tokio::test]
@@ -4747,22 +4755,17 @@ mod tests {
 			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
-		let mut agent = Agent::new(
-			client,
-			env,
-			AgentState::new(crate::AgentSnapshot::default()),
-			journal,
-			test_caps(),
-		);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
 		let abort = agent.abort_handle();
 		let mailbox = agent.mailbox();
 		let interrupting = async {
 			wait_for_opened(&opened, 1).await;
 			mailbox
-				.try_enqueue(crate::Interrupt {
-					class:  crate::InterruptClass::Immediate,
+				.try_enqueue(Interrupt {
+					class:  InterruptClass::Immediate,
 					item:   message(thread::Role::User, "queued user input"),
-					source: crate::InterruptSource::Producer(sf!("user")),
+					source: InterruptSource::Producer(sf!("user")),
 				})
 				.expect("enqueue producer input");
 			abort.abort();
@@ -4784,7 +4787,7 @@ mod tests {
 		assert!(input_contains_text(&opened[1].1, "queued user input"));
 		drop(opened);
 		drop(agent);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 	#[tokio::test]
 	async fn caller_abort_interrupts_tool_batch_and_stages_results() {
@@ -4795,10 +4798,10 @@ mod tests {
 			.register_worker(worker(identity.name.as_str()), Presentation::Device, worker_claims())
 			.expect("register pending tool");
 		let registry = Arc::new(registry);
-		let state = AgentState::new(crate::AgentSnapshot {
+		let state = AgentState::new(AgentSnapshot {
 			enabled_tools: Arc::from([identity.name.clone()]),
 			registry,
-			..crate::AgentSnapshot::default()
+			..AgentSnapshot::default()
 		});
 		let opened = Arc::new(Mutex::new(Vec::new()));
 		let client = ScriptedClient {
@@ -4842,7 +4845,7 @@ mod tests {
 		);
 		drop(agent);
 		env_task.abort();
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[tokio::test]
@@ -4858,13 +4861,8 @@ mod tests {
 			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
-		let mut agent = Agent::new(
-			client,
-			env,
-			AgentState::new(crate::AgentSnapshot::default()),
-			journal,
-			test_caps(),
-		);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
 		agent
 			.submit([message(thread::Role::User, "turn one")], TurnId::new("rewind-one"))
 			.await
@@ -4886,11 +4884,11 @@ mod tests {
 		assert!(projected.iter().any(|item| {
 			matches!(
 				item.kind.as_ref(),
-				Some(thread::item::Kind::Message(message))
+				Some(item::Kind::Message(message))
 					if message.parts.iter().any(|part| {
 						matches!(
 							part.kind.as_ref(),
-							Some(thread::part::Kind::Text(text)) if text == "turn one"
+							Some(part::Kind::Text(text)) if text == "turn one"
 						)
 					})
 			)
@@ -4898,11 +4896,11 @@ mod tests {
 		assert!(!projected.iter().any(|item| {
 			matches!(
 				item.kind.as_ref(),
-				Some(thread::item::Kind::Message(message))
+				Some(item::Kind::Message(message))
 					if message.parts.iter().any(|part| {
 						matches!(
 							part.kind.as_ref(),
-							Some(thread::part::Kind::Text(text)) if text == "turn two"
+							Some(part::Kind::Text(text)) if text == "turn two"
 						)
 					})
 			)
@@ -4922,7 +4920,7 @@ mod tests {
 		let cleared = agent.rewind(None).expect("rewind to root");
 		assert!(cleared.is_empty());
 		drop(agent);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[tokio::test]
@@ -4936,19 +4934,14 @@ mod tests {
 			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
-		let mut agent = Agent::new(
-			client,
-			env,
-			AgentState::new(crate::AgentSnapshot::default()),
-			journal,
-			test_caps(),
-		);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
 		agent
 			.mailbox()
-			.try_enqueue(crate::Interrupt {
-				class:  crate::InterruptClass::Immediate,
+			.try_enqueue(Interrupt {
+				class:  InterruptClass::Immediate,
 				item:   message(thread::Role::User, "stale steering"),
-				source: crate::InterruptSource::Producer(sf!("user")),
+				source: InterruptSource::Producer(sf!("user")),
 			})
 			.expect("enqueue stale steering");
 
@@ -4964,7 +4957,7 @@ mod tests {
 		assert!(!input_contains_text(&opened[0].1, "stale steering"));
 		drop(opened);
 		drop(agent);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[tokio::test]
@@ -4979,19 +4972,14 @@ mod tests {
 			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
-		let mut agent = Agent::new(
-			client,
-			env,
-			AgentState::new(crate::AgentSnapshot::default()),
-			journal,
-			test_caps(),
-		);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
 		let control = agent.control();
 		let idle_request = tokio::spawn({
 			let control = control.clone();
 			async move { control.query(Vec::new()).await }
 		});
-		tokio::task::yield_now().await;
+		yield_now().await;
 		agent
 			.submit([message(thread::Role::User, "idle")], TurnId::new("idle"))
 			.await
@@ -5012,7 +5000,7 @@ mod tests {
 			(agent, result)
 		});
 		wait_for_opened(&opened, 2).await;
-		let rows = tokio::time::timeout(Duration::from_secs(1), control.query(Vec::new()))
+		let rows = time::timeout(Duration::from_secs(1), control.query(Vec::new()))
 			.await
 			.expect("active CONTROL timeout")
 			.expect("active CONTROL request");
@@ -5021,7 +5009,7 @@ mod tests {
 		let (agent, result) = active.await.expect("active turn task");
 		assert!(matches!(result, Err(AgentError::Interrupted)));
 		drop(agent);
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[tokio::test]
@@ -5032,10 +5020,10 @@ mod tests {
 		registry
 			.register_worker(worker(identity.name.as_str()), Presentation::Device, worker_claims())
 			.expect("register pending tool");
-		let state = AgentState::new(crate::AgentSnapshot {
+		let state = AgentState::new(AgentSnapshot {
 			enabled_tools: Arc::from([identity.name.clone()]),
 			registry: Arc::new(registry),
-			..crate::AgentSnapshot::default()
+			..AgentSnapshot::default()
 		});
 		let client = ScriptedClient {
 			scripts: Arc::new(Mutex::new(VecDeque::from([pending_tool_script(&identity)]))),
@@ -5053,7 +5041,7 @@ mod tests {
 			let control = control.clone();
 			async move { control.checkpoint(sf!("before batch")).await }
 		});
-		tokio::task::yield_now().await;
+		yield_now().await;
 		agent.drain_control();
 		let checkpoint = checkpoint
 			.await
@@ -5121,12 +5109,12 @@ mod tests {
 		drop(log);
 		drop(agent);
 		env_task.abort();
-		std::fs::remove_file(path).expect("remove journal");
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[tokio::test]
 	async fn deadline_wait_wins_over_long_backoff() {
-		let deadline = std::time::Instant::now() + Duration::from_millis(1);
+		let deadline = Instant::now() + Duration::from_millis(1);
 		let result = sleep_with_deadline(Duration::from_secs(60), Some(deadline)).await;
 		assert!(matches!(result, Err(AgentError::Deadline)));
 	}
@@ -5162,10 +5150,7 @@ mod tests {
 		};
 		let summary = run_summary(
 			Some(Outcome {
-				output: vec![Item {
-					kind: Some(thread::item::Kind::ToolCall(call)),
-					..Item::default()
-				}],
+				output: vec![Item { kind: Some(item::Kind::ToolCall(call)), ..Item::default() }],
 				stop: pb::StopReason::StopEndTurn as i32,
 				..Outcome::default()
 			}),
@@ -5187,9 +5172,9 @@ mod tests {
 	}
 	#[test]
 	fn restores_nested_model_arguments_without_changing_operator_values() {
-		let rule = omp_secrets::rule::SecretRule::new(
-			omp_secrets::rule::SecretKind::Plain,
-			omp_secrets::rule::SecretMode::Obfuscate,
+		let rule = SecretRule::new(
+			SecretKind::Plain,
+			SecretMode::Obfuscate,
 			"model-secret",
 			None,
 			None,

@@ -1,6 +1,6 @@
 //! Typed component properties with allocation-free well-known slots.
 
-use std::{fmt, str::FromStr, time::Duration};
+use std::{error, fmt, str::FromStr, time::Duration};
 
 use omp_core::{IntoStr, Str, sf};
 use strum::{Display, EnumIter, EnumString};
@@ -456,7 +456,7 @@ impl fmt::Display for PropError {
 		write!(f, "bad value {:?} for property {:?}", self.value, self.prop)
 	}
 }
-impl std::error::Error for PropError {}
+impl error::Error for PropError {}
 
 trait ToPropValue {
 	fn to_prop_value(&self) -> PropValue;

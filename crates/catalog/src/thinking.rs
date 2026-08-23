@@ -3,7 +3,8 @@
 #![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 use std::{
 	collections::{BTreeMap, btree_map},
-	fmt,
+	error,
+	fmt::{self, Display},
 };
 
 use omp_core::Str;
@@ -499,7 +500,7 @@ pub enum ThinkingPolicyError {
 	UnknownBudget(ThinkingEffort),
 }
 
-impl fmt::Display for ThinkingPolicyError {
+impl Display for ThinkingPolicyError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::NoEfforts => {
@@ -521,7 +522,7 @@ impl fmt::Display for ThinkingPolicyError {
 	}
 }
 
-impl std::error::Error for ThinkingPolicyError {}
+impl error::Error for ThinkingPolicyError {}
 
 /// Invalid reasoning selection or model-specific routing table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -532,7 +533,7 @@ pub enum ThinkingSelectionError {
 	UnsupportedEffort(ThinkingEffort),
 }
 
-impl fmt::Display for ThinkingSelectionError {
+impl Display for ThinkingSelectionError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::RequiredEffortMissing => {
@@ -545,7 +546,7 @@ impl fmt::Display for ThinkingSelectionError {
 	}
 }
 
-impl std::error::Error for ThinkingSelectionError {}
+impl error::Error for ThinkingSelectionError {}
 
 /// Stable structural table that interns equal reasoning profiles once.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

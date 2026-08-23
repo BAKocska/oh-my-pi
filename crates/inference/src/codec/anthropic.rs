@@ -1,4 +1,5 @@
 //! Typed Anthropic Messages projection and incremental event decoding.
+use std::str;
 
 use bytes::{Bytes, BytesMut};
 use omp_catalog::{
@@ -11,22 +12,23 @@ use strum::IntoStaticStr;
 
 use super::{
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
-	ProviderMetadataEvent, RawCompletion, RawEvent, RequestHeader, RequestMethod, SizeBounds,
-	ToolInputKind, UnvalidatedToolCall,
+	ProviderMetadataEvent, ProviderStateEvent, RawCompletion, RawEvent, RequestHeader,
+	RequestMethod, SizeBounds, ToolInputKind, UnvalidatedToolCall,
 };
 use crate::{
 	answer::{AnswerBody, TokenCount, TokenizerProvenance},
+	auth::AuthScheme,
 	body::BodySource,
 	call::{
 		CacheRetention, ChatRequest, ContentPart as CanonicalPart, CountTokensRequest, HostedTool,
-		MediaInput, OpaqueJson, OperationCall, ProviderProof, ReasoningVisibility, Role, Setting,
-		StructuredOutput, ToolChoice, ToolResultContent,
+		MediaInput, OpaqueJson, OperationCall, ProviderProof, ReasoningRequest, ReasoningVisibility,
+		Role, Setting, StructuredOutput, ToolChoice, ToolResultContent,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
 	id::ToolCallId,
 	receipt::{ExecutionReceipt, ReasonId, Usage, UsageSource},
-	transport::{Frame, FramingProtocol},
+	transport::{EventStreamMessage, Frame, FramingProtocol},
 };
 
 /// Version sent in direct Messages headers.
@@ -745,8 +747,7 @@ pub fn project(
 }
 
 fn is_claude_code_oauth(context: &EncodeContext<'_>, adapter: AnthropicAdapter) -> bool {
-	adapter == AnthropicAdapter::Direct
-		&& context.auth_scheme == Some(crate::auth::AuthScheme::OAuth)
+	adapter == AnthropicAdapter::Direct && context.auth_scheme == Some(AuthScheme::OAuth)
 }
 
 fn prepend_claude_code_identity(system: &mut Vec<ContentBlock>) {
@@ -1109,8 +1110,8 @@ fn proof_signature(
 ) -> Result<Str, Error> {
 	let proof = proof.ok_or_else(|| capability_error("anthropic.reasoning.proof_required"))?;
 	validate_proof(proof, provider, codec)?;
-	let signature = std::str::from_utf8(&proof.value)
-		.map_err(|_| encoding_error("anthropic.reasoning.proof_utf8"))?;
+	let signature =
+		str::from_utf8(&proof.value).map_err(|_| encoding_error("anthropic.reasoning.proof_utf8"))?;
 	Ok(Str::new(signature))
 }
 
@@ -1149,7 +1150,7 @@ fn lower_tool_choice(setting: &Setting<ToolChoice>) -> Option<WireToolChoice> {
 
 fn lower_thinking(
 	selection: Option<&ThinkingSelection>,
-	request: &Setting<crate::call::ReasoningRequest>,
+	request: &Setting<ReasoningRequest>,
 ) -> Option<Thinking> {
 	let selection = selection?;
 	if selection.effort == ThinkingEffort::Off {
@@ -1387,7 +1388,7 @@ impl Codec for AnthropicCodec {
 			OperationKind::Chat => Ok(Box::new(AnthropicWireDecoder {
 				adapter:           self.adapter,
 				claude_code_oauth: self.adapter == AnthropicAdapter::Direct
-					&& context.auth_scheme == Some(crate::auth::AuthScheme::OAuth),
+					&& context.auth_scheme == Some(AuthScheme::OAuth),
 				inner:             AnthropicDecoder::new(),
 				signature_cursor:  0,
 				citation_cursor:   0,
@@ -1622,7 +1623,7 @@ impl Decoder for AnthropicWireDecoder {
 		}
 		while let Some((index, signature)) = self.inner.outcome.signatures.get(self.signature_cursor)
 		{
-			emit(RawEvent::ProviderState(super::ProviderStateEvent::ReasoningSignature {
+			emit(RawEvent::ProviderState(ProviderStateEvent::ReasoningSignature {
 				index:     *index,
 				signature: Bytes::copy_from_slice(signature.as_bytes()),
 			}));
@@ -1639,10 +1640,7 @@ impl Decoder for AnthropicWireDecoder {
 			let data = serde_json::to_vec(block)
 				.map(Bytes::from)
 				.map_err(|_| protocol_error("anthropic.history.serialize", true))?;
-			emit(RawEvent::ProviderState(super::ProviderStateEvent::HistoryBlock {
-				index: *index,
-				data,
-			}));
+			emit(RawEvent::ProviderState(ProviderStateEvent::HistoryBlock { index: *index, data }));
 			self.history_cursor += 1;
 		}
 		Ok(())
@@ -1715,7 +1713,7 @@ struct BedrockException {
 	message: Str,
 }
 
-fn bedrock_payload(message: &crate::transport::EventStreamMessage) -> Result<Option<Bytes>, Error> {
+fn bedrock_payload(message: &EventStreamMessage) -> Result<Option<Bytes>, Error> {
 	let message_type = message.string_header(":message-type").unwrap_or("event");
 	if message_type == "exception" || message_type == "error" {
 		let exception = message
@@ -2450,8 +2448,8 @@ mod tests {
 	use super::*;
 	use crate::{
 		auth::{
-			AuthSpec, BearerScheme, CredentialKind, CredentialLease, HeaderPlacement, KeyPlacement,
-			LeaseMeta,
+			AuthScheme as AuthAuthScheme, AuthSpec, BearerScheme, CredentialKind, CredentialLease,
+			HeaderPlacement, KeyPlacement, LeaseMeta,
 		},
 		call::{
 			ContentPart as CanonicalContentPart, Message as CanonicalMessage, NegotiationPolicy,
@@ -2555,8 +2553,8 @@ mod tests {
 		let context = EncodeContext {
 			request_id: &request_id,
 			auth_scheme: Some(match kind {
-				CredentialKind::Bearer => crate::auth::AuthScheme::OAuth,
-				CredentialKind::ApiKey => crate::auth::AuthScheme::ApiKey,
+				CredentialKind::Bearer => AuthAuthScheme::OAuth,
+				CredentialKind::ApiKey => AuthAuthScheme::ApiKey,
 				_ => panic!("unsupported test credential kind"),
 			}),
 			route,

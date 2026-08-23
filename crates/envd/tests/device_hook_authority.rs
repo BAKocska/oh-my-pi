@@ -1,3 +1,5 @@
+//! Proves dynamic device generation fencing and exact cancellation of queued
+//! hook callbacks.
 use std::{
 	sync::Arc,
 	time::{Duration, Instant},

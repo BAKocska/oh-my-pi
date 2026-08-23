@@ -1,6 +1,7 @@
 //! Per-advisor JSONL persistence and session-statistics attribution.
 
 use std::{
+	collections::BTreeMap,
 	fs::{self, File, OpenOptions},
 	io::{self, Write},
 	path::{Path, PathBuf},
@@ -88,7 +89,7 @@ pub struct AdvisorTranscriptStore<S = NoopAdvisorStatistics> {
 	root:            PathBuf,
 	primary_session: Str,
 	statistics:      S,
-	totals:          std::collections::BTreeMap<Str, AdvisorUsageTotals>,
+	totals:          BTreeMap<Str, AdvisorUsageTotals>,
 }
 
 impl<S: AdvisorStatisticsSink> AdvisorTranscriptStore<S> {

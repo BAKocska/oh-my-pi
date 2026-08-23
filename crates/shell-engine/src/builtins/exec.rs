@@ -1,11 +1,16 @@
 use std::{
 	borrow::Cow,
+	io,
 	os::unix::process::{CommandExt, ExitStatusExt},
 };
 
 use clap::Parser;
+use tokio::process;
 
-use crate::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands};
+use crate::{
+	Error, ErrorKind, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions,
+	builtins, builtins::command::CommandCommand, commands,
+};
 
 /// Exec the provided command.
 #[derive(Parser)]
@@ -28,11 +33,11 @@ pub(crate) struct ExecCommand {
 }
 
 impl builtins::Command for ExecCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		if self.args.is_empty() {
 			// When no arguments are present, then there's nothing for us to execute -- but
@@ -54,10 +59,7 @@ impl builtins::Command for ExecCommand {
 				return self.execute_external_in_subshell(context).await;
 			}
 
-			let cmd_cmd = crate::builtins::command::CommandCommand {
-				command_and_args: self.args.clone(),
-				..Default::default()
-			};
+			let cmd_cmd = CommandCommand { command_and_args: self.args.clone(), ..Default::default() };
 
 			return cmd_cmd.execute(context).await;
 		}
@@ -74,7 +76,7 @@ impl builtins::Command for ExecCommand {
 
 		let exec_error = cmd.exec();
 
-		if exec_error.kind() == std::io::ErrorKind::NotFound {
+		if exec_error.kind() == io::ErrorKind::NotFound {
 			Ok(ExecutionExitCode::NotFound.into())
 		} else {
 			Err(ErrorKind::from(exec_error).into())
@@ -96,10 +98,10 @@ impl ExecCommand {
 		}
 	}
 
-	async fn execute_external_in_subshell<SE: crate::ShellExtensions>(
+	async fn execute_external_in_subshell<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<ExecutionResult, crate::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Error> {
 		let argv0 = self.argv0();
 		let cmd = commands::compose_std_command(
 			&context,
@@ -109,13 +111,13 @@ impl ExecCommand {
 			self.empty_environment,
 		)?;
 
-		let mut cmd = tokio::process::Command::from(cmd);
+		let mut cmd = process::Command::from(cmd);
 		cmd.kill_on_drop(true);
 
 		let mut child = match cmd.spawn() {
 			Ok(child) => child,
 			Err(spawn_err) => {
-				if spawn_err.kind() == std::io::ErrorKind::NotFound {
+				if spawn_err.kind() == io::ErrorKind::NotFound {
 					return Ok(ExecutionExitCode::NotFound.into());
 				}
 

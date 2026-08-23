@@ -4,7 +4,10 @@
 //! canonical POSIX forms (e.g. `Path` → `PATH`), and `HOME` is synthesized
 //! from `USERPROFILE` or `HOMEDRIVE`+`HOMEPATH` if not already present.
 
-use std::collections::BTreeMap;
+use std::{
+	collections::{BTreeMap, btree_map::IntoIter},
+	env,
+};
 
 /// Retrieves environment variables from the host process, applying
 /// Windows-specific fixups.
@@ -22,7 +25,7 @@ use std::collections::BTreeMap;
 /// canonical name (e.g. both `Path` and `PATH` are set to different values),
 /// the conflict is logged and the last-seen value wins.
 pub(crate) fn get_host_env_vars() -> impl Iterator<Item = (String, String)> {
-	collect_host_env_vars(std::env::vars_os().filter_map(|(key, value)| {
+	collect_host_env_vars(env::vars_os().filter_map(|(key, value)| {
 		let key = key.into_string().ok()?;
 		let value = value.into_string().ok()?;
 		Some((key, value))
@@ -32,7 +35,7 @@ pub(crate) fn get_host_env_vars() -> impl Iterator<Item = (String, String)> {
 /// Collects and normalizes a set of environment variables. Exposed as a
 /// pure function (taking the source iterator) so it can be unit-tested
 /// without touching the process environment.
-fn collect_host_env_vars<I>(source: I) -> std::collections::btree_map::IntoIter<String, String>
+fn collect_host_env_vars<I>(source: I) -> IntoIter<String, String>
 where
 	I: IntoIterator<Item = (String, String)>,
 {

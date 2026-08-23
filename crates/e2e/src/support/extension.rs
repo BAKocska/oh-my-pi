@@ -18,7 +18,10 @@ use omp_envd::{
 	EnvServer, RegistryBridges,
 	exthost::{
 		UiControlAuthority,
-		control::{ControlAuthority, ControlAuthorityFactory},
+		control::{
+			ControlAuthority, ControlAuthorityFactory, ControlConnectionIdentity,
+			ControlInvocationAuthority,
+		},
 	},
 	worker::ExtHostConfig,
 };
@@ -97,7 +100,7 @@ impl Drop for ExtensionHarness {
 pub fn recording_ui_factory() -> (Arc<dyn ControlAuthorityFactory>, Receiver<PresentationEffect>) {
 	let (effects, received) = flume::unbounded();
 	let factory: Arc<dyn ControlAuthorityFactory> =
-		Arc::new(move |identity: Arc<omp_envd::exthost::control::ControlConnectionIdentity>| {
+		Arc::new(move |identity: Arc<ControlConnectionIdentity>| {
 			let presentation_identity = Arc::new(PresentationIdentity {
 				principal:          identity.principal.id().into(),
 				extension:          identity.extension.clone(),
@@ -150,7 +153,7 @@ impl PresentationCallbackDispatcher for UnusedPresentationCallbacks {
 	async fn dispatch(
 		&self,
 		_identity: Arc<PresentationIdentity>,
-		_invocation: omp_envd::exthost::control::ControlInvocationAuthority,
+		_invocation: ControlInvocationAuthority,
 		_callback: PresentationCallback,
 	) -> Result<serde_json::Value, PresentationAuthorityError> {
 		Err(PresentationAuthorityError::Unavailable)

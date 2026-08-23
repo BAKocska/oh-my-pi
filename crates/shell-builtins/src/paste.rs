@@ -10,6 +10,7 @@ use std::{
 	iter::Cycle,
 	rc::Rc,
 	slice::Iter,
+	str,
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -267,7 +268,7 @@ fn parse_delimiters(delimiters: &OsString) -> Result<Box<[Box<[u8]>]>, String> {
 }
 
 fn delimiter_char_len(bytes: &[u8]) -> usize {
-	std::str::from_utf8(bytes)
+	str::from_utf8(bytes)
 		.ok()
 		.and_then(|window| window.chars().next().map(char::len_utf8))
 		.unwrap_or(1)

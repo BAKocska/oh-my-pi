@@ -1,6 +1,8 @@
 //! MCP tool invocation normalization, retry accounting, and durable receipts.
 
 use std::{
+	collections::BTreeSet,
+	fs, io,
 	path::{Component, Path, PathBuf},
 	sync::Arc,
 };
@@ -13,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
 	McpServiceError,
-	manager::{LiveConnection, McpManager},
+	manager::{LiveConnection, ManagerError, McpManager},
 	timeout::{McpDeadlineError, McpTimeout},
 	transport::{DispatchState, TransportError, TransportFailure, TransportResponse},
 };
@@ -51,7 +53,7 @@ pub(crate) async fn invoke(
 	let idempotent = is_idempotent(&definition);
 	let mut connection = match manager.connection(&server, &cancel).await {
 		Ok(connection) => connection,
-		Err(super::manager::ManagerError::Cancelled) => return Err(McpServiceError::Cancelled),
+		Err(ManagerError::Cancelled) => return Err(McpServiceError::Cancelled),
 		Err(_) => manager
 			.reconnect_for_invoke(&server)
 			.await
@@ -175,7 +177,7 @@ fn normalize_args(value: Value, input_schema: &Value) -> Value {
 			required
 				.iter()
 				.filter_map(Value::as_str)
-				.collect::<std::collections::BTreeSet<_>>()
+				.collect::<BTreeSet<_>>()
 		})
 		.unwrap_or_default();
 	args.retain(|name, value| {
@@ -231,8 +233,8 @@ fn resolve_local_path(root: &Path, resource: &str) -> Result<PathBuf, LocalPathE
 	{
 		return Err(LocalPathError::Traversal);
 	}
-	let root = std::fs::canonicalize(root).map_err(LocalPathError::Io)?;
-	let target = std::fs::canonicalize(root.join(relative)).map_err(LocalPathError::Io)?;
+	let root = fs::canonicalize(root).map_err(LocalPathError::Io)?;
+	let target = fs::canonicalize(root.join(relative)).map_err(LocalPathError::Io)?;
 	if !target.starts_with(root) {
 		return Err(LocalPathError::Traversal);
 	}
@@ -416,9 +418,9 @@ fn failure_message(failure: &TransportFailure) -> &'static str {
 	}
 }
 
-fn manager_error(error: super::manager::ManagerError) -> McpServiceError {
+fn manager_error(error: ManagerError) -> McpServiceError {
 	match error {
-		super::manager::ManagerError::Cancelled => McpServiceError::Cancelled,
+		ManagerError::Cancelled => McpServiceError::Cancelled,
 		_ => McpServiceError::Backend,
 	}
 }
@@ -432,5 +434,5 @@ enum LocalPathError {
 	#[error("local MCP argument path is not UTF-8")]
 	NonUtf8,
 	#[error("local MCP argument path could not be resolved")]
-	Io(#[source] std::io::Error),
+	Io(#[source] io::Error),
 }

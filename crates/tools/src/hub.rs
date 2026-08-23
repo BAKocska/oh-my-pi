@@ -1,6 +1,6 @@
 //! Unified peer, job, and environment-owned named-process coordination.
 
-use std::{future::Future, sync::Arc};
+use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use async_stream::stream;
 use dashmap::DashMap;
@@ -134,8 +134,8 @@ pub struct Params {
 	#[schemars(with = "Option<Vec<String>>")]
 	pub args:                 Option<Vec<Str>>,
 	/// Process environment.
-	#[schemars(with = "Option<std::collections::BTreeMap<String, String>>")]
-	pub env:                  Option<std::collections::BTreeMap<Str, Str>>,
+	#[schemars(with = "Option<BTreeMap<String, String>>")]
+	pub env:                  Option<BTreeMap<Str, Str>>,
 	/// Process working directory.
 	#[schemars(with = "Option<String>")]
 	pub cwd:                  Option<Str>,

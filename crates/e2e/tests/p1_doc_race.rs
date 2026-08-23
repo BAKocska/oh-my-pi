@@ -5,7 +5,7 @@
 use std::{
 	collections::BTreeSet,
 	fmt::Write as _,
-	fs,
+	fs, io,
 	os::unix::fs::PermissionsExt as _,
 	path::{Path, PathBuf},
 	sync::{
@@ -29,7 +29,13 @@ use omp_env::{EnvClient, InvocationEvent};
 use omp_envd::docs::{DocumentHost, DocumentLease};
 use omp_hashline::compute_snapshot_tag;
 use omp_proto::{
-	document::v1 as document, env::v1::InvokeTool, inference::v1 as inference, thread::v1 as thread,
+	document::v1::{
+		self as document, commit_transaction_response, read_document_response, read_selection,
+		text_mutation,
+	},
+	env::v1::InvokeTool,
+	inference::v1::{self as inference, part_start, turn_event, value},
+	thread::v1::item,
 };
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{
@@ -37,7 +43,9 @@ use omp_tool::{
 };
 use omp_tools::edit::{self, FormatPolicy};
 use serde::Deserialize;
+use tokio::{sync::Barrier, task, time};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 macro_rules! ensure {
 	($condition:expr, $($message:tt)*) => {
@@ -182,10 +190,10 @@ async fn p1_real_docserver_rebases_two_agent_loops_and_survives_the_storm() -> R
 			.map(|bytes| String::from_utf8(bytes.to_vec()).expect("UTF-8 race fixture"))
 			.collect();
 		assert_lsp_publication(&race_records, &uri, &published_race, race_final)?;
-		let public_lsp_uri = url::Url::parse(&uri)?;
+		let public_lsp_uri = Url::parse(&uri)?;
 		ensure!(
 			race_records.iter().any(|record| {
-				let Ok(shadow_uri) = url::Url::parse(&record.uri) else {
+				let Ok(shadow_uri) = Url::parse(&record.uri) else {
 					return false;
 				};
 				record.kind == "format"
@@ -322,17 +330,17 @@ fn tool_turn(
 	args: Bytes,
 	gate: Option<Gate>,
 ) -> ScriptedTurn {
-	let start = turn_event(inference::turn_event::Event::PartStart(inference::PartStart {
+	let start = turn_event(turn_event::Event::PartStart(inference::PartStart {
 		index:        0,
-		kind:         inference::part_start::Kind::ToolCall as i32,
+		kind:         part_start::Kind::ToolCall as i32,
 		tool_call_id: call_id.to_owned(),
 		tool_name:    identity.name.to_string(),
 	}));
-	let delta = turn_event(inference::turn_event::Event::PartDelta(inference::PartDelta {
+	let delta = turn_event(turn_event::Event::PartDelta(inference::PartDelta {
 		index: 0,
 		chunk: args.clone(),
 	}));
-	let end = turn_event(inference::turn_event::Event::PartEnd(inference::PartEnd {
+	let end = turn_event(turn_event::Event::PartEnd(inference::PartEnd {
 		index:     0,
 		signature: Bytes::new(),
 	}));
@@ -376,7 +384,7 @@ async fn next_edit_payload(
 			if completed.as_str() != call_id {
 				continue;
 			}
-			let Some(thread::item::Kind::ToolResult(result)) = item.kind.as_ref() else {
+			let Some(item::Kind::ToolResult(result)) = item.kind.as_ref() else {
 				return Err(error(format!("ToolFinished did not carry ToolResult")));
 			};
 			let details = result
@@ -406,20 +414,20 @@ async fn next_edit_payload(
 
 fn proto_json(value: &inference::Value) -> Option<serde_json::Value> {
 	Some(match value.kind.as_ref()? {
-		inference::value::Kind::Null(_) => serde_json::Value::Null,
-		inference::value::Kind::Bool(value) => (*value).into(),
-		inference::value::Kind::Int(value) => (*value).into(),
-		inference::value::Kind::Uint(value) => (*value).into(),
-		inference::value::Kind::Double(value) => serde_json::Number::from_f64(*value)?.into(),
-		inference::value::Kind::String(value) => value.clone().into(),
-		inference::value::Kind::List(values) => serde_json::Value::Array(
+		value::Kind::Null(_) => serde_json::Value::Null,
+		value::Kind::Bool(value) => (*value).into(),
+		value::Kind::Int(value) => (*value).into(),
+		value::Kind::Uint(value) => (*value).into(),
+		value::Kind::Double(value) => serde_json::Number::from_f64(*value)?.into(),
+		value::Kind::String(value) => value.clone().into(),
+		value::Kind::List(values) => serde_json::Value::Array(
 			values
 				.values
 				.iter()
 				.map(proto_json)
 				.collect::<Option<Vec<_>>>()?,
 		),
-		inference::value::Kind::Map(values) => serde_json::Value::Object(
+		value::Kind::Map(values) => serde_json::Value::Object(
 			values
 				.fields
 				.iter()
@@ -492,7 +500,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 		.iter()
 		.filter(|record| record.kind == "format_done")
 		.count();
-	let barrier = Arc::new(tokio::sync::Barrier::new(STORM_COUNT + 1));
+	let barrier = Arc::new(Barrier::new(STORM_COUNT + 1));
 	let reader_gate = Gate::default();
 	let first_reads = Arc::new(AtomicUsize::new(0));
 	let mut reader_tasks = Vec::new();
@@ -512,7 +520,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 				if index == 0 {
 					first_reads.fetch_add(1, Ordering::Release);
 				}
-				tokio::task::yield_now().await;
+				task::yield_now().await;
 			}
 			Ok::<_, Error>(lease)
 		}));
@@ -538,15 +546,13 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 					Bytes::copy_from_slice(&(10_000_u128 + index as u128).to_be_bytes()),
 					document::TextMutation {
 						base_revision: None,
-						change:        Some(document::text_mutation::Change::Edits(
-							document::ByteEdits {
-								edits: vec![document::ByteEdit {
-									start:       start as u64,
-									end:         end as u64,
-									replacement: replacement.clone(),
-								}],
-							},
-						)),
+						change:        Some(text_mutation::Change::Edits(document::ByteEdits {
+							edits: vec![document::ByteEdit {
+								start:       start as u64,
+								end:         end as u64,
+								replacement: replacement.clone(),
+							}],
+						})),
 						stale_policy:  document::StalePolicy::RebaseNonOverlapping as i32,
 						format_policy: if index == 0 {
 							document::FormatPolicy::Required as i32
@@ -558,7 +564,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 				)
 				.await?;
 			match response.outcome {
-				Some(document::commit_transaction_response::Outcome::Committed(committed)) => {
+				Some(commit_transaction_response::Outcome::Committed(committed)) => {
 					let operation = committed
 						.operations
 						.into_iter()
@@ -578,7 +584,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 						rebased,
 					}))
 				},
-				Some(document::commit_transaction_response::Outcome::Rejected(rejected)) => {
+				Some(commit_transaction_response::Outcome::Rejected(rejected)) => {
 					ensure!(
 						matches!(
 							document::TransactionRejectReason::try_from(rejected.reason),
@@ -590,7 +596,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 					);
 					Ok(None)
 				},
-				Some(document::commit_transaction_response::Outcome::PartiallyCommitted(partial)) => {
+				Some(commit_transaction_response::Outcome::PartiallyCommitted(partial)) => {
 					Err(error(format!("single-operation storm partially committed: {partial:?}")))
 				},
 				None => Err(error(format!("storm transaction omitted outcome"))),
@@ -603,7 +609,7 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 	reader_gate.release();
 	within("pinned readers during formatter", TEST_TIMEOUT, async {
 		while first_reads.load(Ordering::Acquire) < PINNED_READERS {
-			tokio::task::yield_now().await;
+			task::yield_now().await;
 		}
 	})
 	.await?;
@@ -691,13 +697,13 @@ async fn read_whole(host: &DocumentHost, lease: &DocumentLease) -> Result<Bytes>
 		.read(
 			lease,
 			document::ReadSelection {
-				selection: Some(document::read_selection::Selection::Whole(document::WholeDocument {})),
+				selection: Some(read_selection::Selection::Whole(document::WholeDocument {})),
 			},
 			&CancellationToken::new(),
 		)
 		.await?;
 	match response.body {
-		Some(document::read_document_response::Body::Content(bytes)) => Ok(bytes),
+		Some(read_document_response::Body::Content(bytes)) => Ok(bytes),
 		_ => Err(error(format!("whole read returned slices or no body"))),
 	}
 }
@@ -705,7 +711,7 @@ async fn read_whole(host: &DocumentHost, lease: &DocumentLease) -> Result<Bytes>
 fn file_uri(scratch: &Scratch, relative: &str) -> Result<String> {
 	let path =
 		fs::canonicalize(scratch.project().join(relative)).context("canonicalize fixture path")?;
-	url::Url::from_file_path(path)
+	Url::from_file_path(path)
 		.map(String::from)
 		.map_err(|()| error(format!("fixture path is not an absolute file URI")))
 }
@@ -736,7 +742,7 @@ fn lsp_records(path: &Path) -> Result<Vec<LspRecord>> {
 			.filter(|line| !line.is_empty())
 			.map(|line| serde_json::from_str(line).context("decode LSP fixture record"))
 			.collect(),
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
 		Err(error) => Err(error.into()),
 	}
 }
@@ -751,7 +757,7 @@ async fn wait_lsp_kind(path: &Path, uri: &str, kind: &str, minimum: usize) -> Re
 			{
 				return Ok::<_, Error>(());
 			}
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			time::sleep(Duration::from_millis(10)).await;
 		}
 	})
 	.await?

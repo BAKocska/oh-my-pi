@@ -1,3 +1,6 @@
+//! Verifies nullable worktree queries and revision- and generation-fenced
+//! process operations.
+
 #![cfg(unix)]
 
 use std::{net::TcpListener, time::Duration};
@@ -7,6 +10,7 @@ use omp_proto::env::v1::{
 	CurrentWorktree, CurrentWorktreeResult, GetProcess, ProcessSpec, ReadyProbe, ReadyTcp,
 	RestartProcess, Script, StartProcess, WorktreeOp, WorktreeResult, ready_probe, worktree_op,
 };
+use url::Url;
 
 #[test]
 fn current_worktree_contract_preserves_nullable_primary() {
@@ -39,7 +43,7 @@ fn current_worktree_contract_preserves_nullable_primary() {
 #[tokio::test]
 async fn process_info_and_restart_are_revision_and_generation_fenced() {
 	let root = tempfile::tempdir().expect("workspace");
-	let cwd_uri = url::Url::from_directory_path(root.path())
+	let cwd_uri = Url::from_directory_path(root.path())
 		.expect("workspace URI")
 		.to_string();
 	let listener = TcpListener::bind(("127.0.0.1", 0)).expect("readiness listener");

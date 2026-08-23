@@ -2,7 +2,11 @@
 
 use std::borrow::Cow;
 
-use crate::{ExecutionParameters, Shell, env, expansion, extensions, parser::ast, variables};
+use crate::{
+	ExecutionParameters, Shell, env, expansion, extensions,
+	parser::{arithmetic::parse, ast},
+	variables,
+};
 
 /// Maximum recursion depth for arithmetic variable dereference chains
 /// (e.g., a=b, b=c, c=a would cycle through variable dereferences).
@@ -97,8 +101,7 @@ pub(crate) async fn expand_and_eval(
 		.map_err(|_e| EvalError::FailedToExpandExpression(expr.to_owned()))?;
 
 	// Now parse.
-	let expr = crate::parser::arithmetic::parse(&expanded_self)
-		.map_err(|_e| EvalError::ParseError(expanded_self))?;
+	let expr = parse(&expanded_self).map_err(|_e| EvalError::ParseError(expanded_self))?;
 
 	// Trace if applicable.
 	if trace_if_needed && shell.options().print_commands_and_arguments {
@@ -210,8 +213,8 @@ fn deref_lvalue(
 		},
 	};
 
-	let parsed_value = crate::parser::arithmetic::parse(value_str.as_ref())
-		.map_err(|_err| EvalError::ParseError(value_str.to_string()))?;
+	let parsed_value =
+		parse(value_str.as_ref()).map_err(|_err| EvalError::ParseError(value_str.to_string()))?;
 
 	// Literals don't need depth tracking — they can't cause recursion.
 	// Only increment depth when the parsed value requires further evaluation

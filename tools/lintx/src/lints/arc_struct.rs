@@ -5,16 +5,18 @@ use std::ops::Range;
 
 use ra_ap_syntax::ast::{self, AstNode, HasName};
 
-use crate::fix::PathFix;
-use crate::lint::{Diagnosis, FileContext, Lint, RealtimeSink};
+use crate::{
+	fix::PathFix,
+	lint::{Diagnosis, FileContext, Lint, RealtimeSink},
+};
 
 /// The lint: fires on ≥3 `Arc` fields covering at least half the struct.
 pub struct ArcStruct;
 
 /// One Arc-heavy struct.
 pub struct Finding {
-	span: Range<usize>,
-	name: String,
+	span:  Range<usize>,
+	name:  String,
 	arced: usize,
 	total: usize,
 }
@@ -43,11 +45,17 @@ impl Diagnosis for Finding {
 }
 
 impl Lint for ArcStruct {
-	const NAME: &'static str = "arc-struct";
 	type Instance = Finding;
 
+	const NAME: &'static str = "arc-struct";
+
 	fn detect(&self, ctx: &FileContext<'_>, sink: &mut RealtimeSink<'_, Finding>) {
-		for strukt in ctx.tree.syntax().descendants().filter_map(ast::Struct::cast) {
+		for strukt in ctx
+			.tree
+			.syntax()
+			.descendants()
+			.filter_map(ast::Struct::cast)
+		{
 			let Some(ast::FieldList::RecordFieldList(fields)) = strukt.field_list() else {
 				continue;
 			};
@@ -55,7 +63,9 @@ impl Lint for ArcStruct {
 			let mut arced = 0usize;
 			for field in fields.fields() {
 				total += 1;
-				let Some(ast::Type::PathType(pt)) = field.ty() else { continue };
+				let Some(ast::Type::PathType(pt)) = field.ty() else {
+					continue;
+				};
 				let tail = pt
 					.path()
 					.and_then(|p| p.segment())
@@ -69,7 +79,9 @@ impl Lint for ArcStruct {
 				let range = strukt.syntax().text_range();
 				sink.push(Finding {
 					span: range.start().into()..range.end().into(),
-					name: strukt.name().map_or_else(|| "_".into(), |n| n.text().to_string()),
+					name: strukt
+						.name()
+						.map_or_else(|| "_".into(), |n| n.text().to_string()),
 					arced,
 					total,
 				});

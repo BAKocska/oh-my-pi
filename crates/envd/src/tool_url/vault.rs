@@ -9,9 +9,9 @@ use omp_tools::read::{
 	selector::ParsedSelector,
 };
 
-use crate::vault::VaultService;
+use crate::vault::{VaultError, VaultService};
 
-pub(super) struct VaultResolver {
+pub(crate) struct VaultResolver {
 	service: VaultService,
 	lines:   LineOffsetCache,
 }
@@ -27,6 +27,7 @@ impl Resolve for VaultResolver {
 		resource: &'a str,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
+		use super::select_bytes;
 		if resource.is_empty() {
 			let mut body = String::new();
 			for name in self.service.names() {
@@ -34,19 +35,14 @@ impl Resolve for VaultResolver {
 				body.push_str(&name);
 				body.push('\n');
 			}
-			return super::select_bytes(
-				&self.lines,
-				resource,
-				CowBytes::from(body.into_bytes()),
-				selector,
-			);
+			return select_bytes(&self.lines, resource, CowBytes::from(body.into_bytes()), selector);
 		}
 		let (vault, path) = parse_resource(resource)?;
 		let bytes = self
 			.service
 			.read(&vault, &path, 8 * 1024 * 1024)
 			.map_err(vault_fault)?;
-		super::select_bytes(&self.lines, resource, bytes, selector)
+		select_bytes(&self.lines, resource, bytes, selector)
 	}
 
 	async fn read_query<'a>(
@@ -153,6 +149,6 @@ pub(crate) fn parse_resource(resource: &str) -> Result<(Str, Str), Fault> {
 	}
 	Ok((Str::new(vault), Str::new(path)))
 }
-fn vault_fault(error: crate::vault::VaultError) -> Fault {
+fn vault_fault(error: VaultError) -> Fault {
 	Fault::Source { message: Str::new(error.to_string()) }
 }

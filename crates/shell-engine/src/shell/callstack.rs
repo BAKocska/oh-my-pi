@@ -1,8 +1,15 @@
 //! Call stack management for the shell.
 
-use crate::{ExecutionParameters, callstack, env, error, functions, trace_categories};
+use crate::{
+	ExecutionParameters, Shell, callstack,
+	callstack::FrameType,
+	env, error,
+	extensions::ShellExtensions,
+	functions, trace_categories,
+	traps::{TrapHandler, TrapSignal},
+};
 
-impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+impl<SE: ShellExtensions> Shell<SE> {
 	/// Returns whether or not the shell is actively executing in a sourced
 	/// script.
 	pub fn in_sourced_script(&self) -> bool {
@@ -60,11 +67,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		Ok(())
 	}
 
-	pub(crate) fn enter_trap_handler(
-		&mut self,
-		signal: crate::traps::TrapSignal,
-		handler: Option<&crate::traps::TrapHandler>,
-	) {
+	pub(crate) fn enter_trap_handler(&mut self, signal: TrapSignal, handler: Option<&TrapHandler>) {
 		self.call_stack.push_trap_handler(signal, handler);
 	}
 
@@ -134,7 +137,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		for frame in self.call_stack.iter() {
 			match frame.frame_type {
 				// Function calls always shadow positional parameters.
-				crate::callstack::FrameType::Function(..) => return &frame.args,
+				FrameType::Function(..) => return &frame.args,
 				// Executed scripts always shadow positional parameters.
 				_ if frame.frame_type.is_run_script() => return &frame.args,
 				// Sourced scripts shadow positional parameters if they have arguments.
@@ -154,7 +157,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		for frame in self.call_stack.iter_mut() {
 			match frame.frame_type {
 				// Function calls always shadow positional parameters.
-				crate::callstack::FrameType::Function(..) => return &mut frame.args,
+				FrameType::Function(..) => return &mut frame.args,
 				// Executed scripts always shadow positional parameters.
 				_ if frame.frame_type.is_run_script() => return &mut frame.args,
 				// Sourced scripts shadow positional parameters if they have arguments.

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use omp_core::{SecretString, Str};
 use url::Url;
 
@@ -33,8 +35,8 @@ pub struct PendingAuthorization {
 	pub resource:     Option<Str>,
 }
 
-impl std::fmt::Debug for PendingAuthorization {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PendingAuthorization {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("PendingAuthorization")
 			.field("browser_url", &self.browser_url)

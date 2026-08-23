@@ -7,6 +7,7 @@
 //! the higher-level driver memory composition.
 
 use std::{
+	fmt,
 	path::{Path, PathBuf},
 	sync::{Arc, OnceLock},
 };
@@ -17,6 +18,7 @@ use omp_memory::{
 	MemoryBackend, MemoryRuntime, RuntimeRegistry, config::MnemopiSettings, runtime::RuntimeStart,
 	session::SessionMemory,
 };
+use omp_tools::memory::{ReflectionHost, ReflectionHostError};
 
 use super::vcs::RepositorySnapshot;
 
@@ -32,7 +34,7 @@ pub enum ReflectionBindingError {
 /// authority.
 #[derive(Default)]
 pub struct ReflectionBridgeHost {
-	host: OnceLock<Arc<dyn omp_tools::memory::ReflectionHost>>,
+	host: OnceLock<Arc<dyn ReflectionHost>>,
 }
 
 impl ReflectionBridgeHost {
@@ -42,10 +44,7 @@ impl ReflectionBridgeHost {
 	}
 
 	/// Installs the one app-owned reflection authority.
-	pub fn bind(
-		&self,
-		host: Arc<dyn omp_tools::memory::ReflectionHost>,
-	) -> Result<(), ReflectionBindingError> {
+	pub fn bind(&self, host: Arc<dyn ReflectionHost>) -> Result<(), ReflectionBindingError> {
 		self
 			.host
 			.set(host)
@@ -54,21 +53,18 @@ impl ReflectionBridgeHost {
 }
 
 #[async_trait::async_trait]
-impl omp_tools::memory::ReflectionHost for ReflectionBridgeHost {
+impl ReflectionHost for ReflectionBridgeHost {
 	async fn reflect(
 		&self,
 		request: omp_tools::memory::ReflectionRequest,
-	) -> Result<Str, omp_tools::memory::ReflectionHostError> {
-		let host = self
-			.host
-			.get()
-			.ok_or(omp_tools::memory::ReflectionHostError::Unavailable)?;
+	) -> Result<Str, ReflectionHostError> {
+		let host = self.host.get().ok_or(ReflectionHostError::Unavailable)?;
 		host.reflect(request).await
 	}
 }
 
-impl std::fmt::Debug for ReflectionBridgeHost {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ReflectionBridgeHost {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("ReflectionBridgeHost")
 			.field("bound", &self.host.get().is_some())

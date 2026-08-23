@@ -2,7 +2,14 @@ use std::borrow::Cow;
 
 use clap::Parser;
 
-use crate::{ExecutionResult, Shell, ShellValue, builtins, variables::ShellValueUnsetType};
+use crate::{
+	Error, ExecutionContext, ExecutionResult, Shell, ShellExtensions, ShellValue, builtins,
+	parser::{
+		arithmetic::parse,
+		word::{Parameter, parse_parameter},
+	},
+	variables::ShellValueUnsetType,
+};
 
 /// Unset a variable.
 #[derive(Parser)]
@@ -37,12 +44,12 @@ impl UnsetNameInterpretation {
 }
 
 impl builtins::Command for UnsetCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		if self.name_interpretation.name_references {
 			for name in &self.names {
 				unset_name_reference(context.shell, name)?;
@@ -61,22 +68,15 @@ impl builtins::Command for UnsetCommand {
 			if unspecified || self.name_interpretation.shell_variables {
 				// Try to parse the name as a parameter. If we can't, don't bail; it may not be
 				// a valid variable name/parameter but could still be a function name.
-				if let Ok(parameter) =
-					crate::parser::word::parse_parameter(name, &context.shell.parser_options())
-				{
+				if let Ok(parameter) = parse_parameter(name, &context.shell.parser_options()) {
 					let result = match parameter {
-						crate::parser::word::Parameter::Positional(_) => continue,
-						crate::parser::word::Parameter::Special(_) => continue,
-						crate::parser::word::Parameter::Named(name) => {
-							context.shell.env_mut().unset(name.as_str())?.is_some()
-						},
-						crate::parser::word::Parameter::NamedWithIndex { name, index } => {
+						Parameter::Positional(_) => continue,
+						Parameter::Special(_) => continue,
+						Parameter::Named(name) => context.shell.env_mut().unset(name.as_str())?.is_some(),
+						Parameter::NamedWithIndex { name, index } => {
 							unset_array_index(context.shell, name.as_str(), index.as_str())?
 						},
-						crate::parser::word::Parameter::NamedWithAllIndices {
-							name: _,
-							concatenate: _,
-						} => continue,
+						Parameter::NamedWithAllIndices { name: _, concatenate: _ } => continue,
 					};
 
 					if result {
@@ -97,12 +97,10 @@ impl builtins::Command for UnsetCommand {
 	}
 }
 fn unset_name_reference(
-	shell: &mut Shell<impl crate::ShellExtensions>,
+	shell: &mut Shell<impl ShellExtensions>,
 	name: &str,
-) -> Result<bool, crate::Error> {
-	let Ok(crate::parser::word::Parameter::Named(name)) =
-		crate::parser::word::parse_parameter(name, &shell.parser_options())
-	else {
+) -> Result<bool, Error> {
+	let Ok(Parameter::Named(name)) = parse_parameter(name, &shell.parser_options()) else {
 		return Ok(false);
 	};
 
@@ -118,10 +116,10 @@ fn unset_name_reference(
 }
 
 fn unset_array_index(
-	shell: &mut Shell<impl crate::ShellExtensions>,
+	shell: &mut Shell<impl ShellExtensions>,
 	name: &str,
 	index: &str,
-) -> Result<bool, crate::Error> {
+) -> Result<bool, Error> {
 	// First check to see if it's an associative array.
 	let is_assoc_array = if let Some((_, var)) = shell.env().get(name) {
 		matches!(
@@ -138,7 +136,7 @@ fn unset_array_index(
 		index.into()
 	} else {
 		// First evaluate the index expression.
-		let index_as_expr = crate::parser::arithmetic::parse(index)?;
+		let index_as_expr = parse(index)?;
 		let evaluated_index = shell.eval_arithmetic(&index_as_expr)?;
 		evaluated_index.to_string().into()
 	};

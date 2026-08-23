@@ -8,7 +8,9 @@ use std::{
 	cell::Cell,
 	cmp::Reverse,
 	collections::HashMap,
+	env, fs, iter, ops,
 	ops::Range,
+	path,
 	path::{Path, PathBuf},
 	sync::{Arc, LazyLock},
 };
@@ -227,7 +229,7 @@ impl EditBuffer {
 	/// Iterates logical lines without allocating.
 	pub fn logical_lines(
 		&self,
-	) -> impl DoubleEndedIterator<Item = &str> + Clone + std::iter::FusedIterator + '_ {
+	) -> impl DoubleEndedIterator<Item = &str> + Clone + iter::FusedIterator + '_ {
 		self.text.split('\n')
 	}
 
@@ -302,7 +304,7 @@ impl EditBuffer {
 	/// Replaces a byte range as one undoable edit. A non-empty range that
 	/// touches an atomic marker widens to the whole marker, so partial
 	/// replacements can never tear a unit apart.
-	pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+	pub fn replace_range(&mut self, range: ops::Range<usize>, replacement: &str) {
 		self.snapshot();
 		let (start, end) = if range.is_empty() {
 			(range.start, range.end)
@@ -329,7 +331,7 @@ impl EditBuffer {
 
 	/// Replaces `range` with `replacement`, shifting the atoms behind the
 	/// edit and dropping any atom the edit tears through.
-	fn splice(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+	fn splice(&mut self, range: ops::Range<usize>, replacement: &str) {
 		let inserted = replacement.len();
 		self
 			.atoms
@@ -1480,7 +1482,7 @@ pub struct Suggestions {
 /// with `insert` and leaves the cursor after it.
 pub struct CompletionEdit {
 	/// Byte range to replace.
-	pub range:  std::ops::Range<usize>,
+	pub range:  ops::Range<usize>,
 	/// Replacement text.
 	pub insert: Str,
 }
@@ -2425,7 +2427,7 @@ fn filesystem_path_arguments(partial: &str) -> Vec<CommandArgument> {
 		}];
 	}
 	let expanded = if let Some(rest) = partial.strip_prefix('~') {
-		let Some(home) = std::env::var_os("HOME") else {
+		let Some(home) = env::var_os("HOME") else {
 			return Vec::new();
 		};
 		PathBuf::from(home).join(rest.trim_start_matches(['/', '\\']))
@@ -2451,7 +2453,7 @@ fn filesystem_path_arguments(partial: &str) -> Vec<CommandArgument> {
 				.unwrap_or(""),
 		)
 	};
-	let Ok(entries) = std::fs::read_dir(directory) else {
+	let Ok(entries) = fs::read_dir(directory) else {
 		return Vec::new();
 	};
 	let typed_parent = partial
@@ -2472,7 +2474,7 @@ fn filesystem_path_arguments(partial: &str) -> Vec<CommandArgument> {
 		value.push_str(typed_parent);
 		value.push_str(name);
 		if is_directory {
-			value.push(std::path::MAIN_SEPARATOR);
+			value.push(path::MAIN_SEPARATOR);
 		}
 		candidates.push(CommandArgument {
 			value:       Str::new(value),
@@ -2713,6 +2715,7 @@ fn fuzzy_score(query: &str, target: &str) -> u16 {
 
 #[cfg(test)]
 mod tests {
+	use self::editor as make_editor;
 	use super::*;
 
 	fn type_slash(text: &str) -> EditBuffer {
@@ -2981,7 +2984,7 @@ mod tests {
 		assert_eq!(editor.inline_hint(), None);
 		// multi-word usages ghost only the remainder (pi counts whole and
 		// in-progress words alike)
-		let mut compare = self::editor();
+		let mut compare = make_editor();
 		type_text(&mut compare, "/security compare one");
 		assert_eq!(compare.inline_hint().as_deref(), Some("<run-b>"));
 		type_text(&mut compare, " two");
@@ -3095,7 +3098,7 @@ mod tests {
 		assert_eq!(editor.handle(Key::Ctrl('w')), EditOutcome::Changed);
 		assert_eq!(editor.text(), "firstsecond");
 
-		let mut forward = self::editor();
+		let mut forward = make_editor();
 		forward.insert_text("first\nsecond");
 		forward.buffer.set_cursor_line_column(0, 5);
 		assert_eq!(forward.handle(Key::WordDelete), EditOutcome::Changed);

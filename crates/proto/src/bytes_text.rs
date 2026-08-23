@@ -5,12 +5,15 @@
 //! serialize as `b64:` followed by standard padded Base64. Deserialization
 //! reverses that rule, so every byte sequence has one deterministic encoding.
 
-use std::fmt;
+use std::{
+	fmt::{self, Display},
+	str,
+};
 
 use bytes::Bytes;
 use omp_core::base64;
 use serde::{
-	Deserialize, Deserializer, Serialize, Serializer,
+	Deserialize, Deserializer, Serialize, Serializer, de,
 	de::{Unexpected, Visitor},
 	ser::SerializeSeq,
 };
@@ -88,7 +91,7 @@ impl Serialize for TextBytes<'_> {
 	where
 		S: Serializer,
 	{
-		match std::str::from_utf8(self.0) {
+		match str::from_utf8(self.0) {
 			Ok(text) if !text.starts_with("b64:") => serializer.serialize_str(text),
 			_ => serializer.collect_str(&Base64Bytes(self.0)),
 		}
@@ -97,7 +100,7 @@ impl Serialize for TextBytes<'_> {
 
 struct Base64Bytes<'a>(&'a [u8]);
 
-impl fmt::Display for Base64Bytes<'_> {
+impl Display for Base64Bytes<'_> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "b64:{}", base64::encode(self.0))
 	}
@@ -125,7 +128,7 @@ impl Visitor<'_> for BytesVisitor {
 
 	fn visit_str<E>(self, text: &str) -> Result<Self::Value, E>
 	where
-		E: serde::de::Error,
+		E: de::Error,
 	{
 		if let Some(encoded) = text.strip_prefix("b64:") {
 			return base64::decode(encoded).into_bytes().map_err(|_| {

@@ -46,6 +46,7 @@ mod tool_lsp;
 mod tool_read_sources;
 mod tool_search;
 pub mod tool_settings;
+/// Shell-tool execution, managed process sessions, and shell URI resolution.
 pub mod tool_shell;
 pub mod tool_url;
 mod tools;
@@ -57,7 +58,15 @@ pub mod worker;
 pub mod worker_pool;
 pub mod workspace;
 pub mod workspace_roots;
-use std::{io, path::Path, sync::Arc};
+use std::{
+	env,
+	fs::{self, OpenOptions},
+	io,
+	path::{Path, PathBuf},
+	process::{Stdio, id},
+	sync::Arc,
+	time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 #[doc(hidden)]
@@ -66,18 +75,39 @@ pub use exthost::{
 	ControlAuthorityFactory, EnvdControlAuthorities, ExternalControlAuthorities,
 	HostControlAuthorityFactory,
 };
+use exthost::{
+	ExtensionManifest,
+	control::{ControlAuthority, ControlCompositionError, ControlConnectionIdentity},
+	dispatch::CallbackDispatcher,
+};
+use github_url::GithubCredentialBridge;
 use miette::IntoDiagnostic as _;
+#[cfg(unix)]
+use nix::unistd::User;
+use omp_agent::control::ControlSender;
 use omp_core::{Hash32, Str, Ulid, sf};
 use omp_env::EnvClient;
 use omp_proto::env::v1::{ClientHello, RegisterPresence, ReleasePresence, ServerHello};
+use omp_storage::index::SessionIndex;
 use omp_tool::Registry;
+use omp_tools::eval::EvalSessionControl;
+pub use presence::PresenceError;
 pub use server::{AgentControlBinding, EnvServer, EnvdError};
 pub use site::validate_trusted_module;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio::{
+	process,
+	task::{AbortHandle, JoinHandle},
+	time::{self, Instant},
+};
 use tokio_util::sync::CancellationToken;
 pub use tools::{
 	ActiveContentInputs, ContentResolver, DynamicTool, GoalAuthority, HostResourceResult,
 	HostResources, RegistryBridges, SearchInference, TelemetryUpload,
 };
+#[cfg(windows)]
+use windows::OwnerPipeListener;
 #[doc(hidden)]
 pub use worker::run_py_worker_entry;
 
@@ -85,17 +115,19 @@ use self::{
 	server::ExtensionDataBinding,
 	worker::{ExtHostConfig, ExtHostSpec, HostKey, PY_EVAL_MODULE},
 };
+use crate::eval::{BridgeHostError, ParentSessionHost};
+
 /// Owned configuration for one project environment daemon.
 #[derive(Clone, Debug)]
 pub struct EnvdConfig {
 	/// Workspace root exposed by the environment.
-	pub root:             std::path::PathBuf,
+	pub root:             PathBuf,
 	/// Owner-only environment socket, or the state-directory default.
-	pub socket:           Option<std::path::PathBuf>,
+	pub socket:           Option<PathBuf>,
 	/// Document-server socket, or the state-directory default.
-	pub docserver_socket: Option<std::path::PathBuf>,
+	pub docserver_socket: Option<PathBuf>,
 	/// Environment state directory, or the project-keyed data-directory default.
-	pub state_dir:        Option<std::path::PathBuf>,
+	pub state_dir:        Option<PathBuf>,
 	/// Whether built-in Python expression evaluation is enabled.
 	pub py_eval:          bool,
 	/// Seconds without connected applications before the daemon exits.
@@ -110,7 +142,7 @@ pub struct EnvdConfig {
 pub struct ClientPresenceLease {
 	client:   EnvClient,
 	lease_id: Bytes,
-	bridge:   tokio::task::AbortHandle,
+	bridge:   AbortHandle,
 }
 
 impl ClientPresenceLease {
@@ -137,7 +169,7 @@ pub async fn register_project_presence(
 	data_dir: &Path,
 	kind: &'static str,
 ) -> Result<ClientPresenceLease, EnvdError> {
-	let root = std::fs::canonicalize(project_root)?;
+	let root = fs::canonicalize(project_root)?;
 	let state_dir = omp_env::project_state::directory(data_dir, &root)?;
 	let socket = omp_env::project_state::environment_socket(&state_dir);
 	let (client, bridge) = match connect_presence_owner(&socket).await {
@@ -164,7 +196,7 @@ pub async fn register_project_presence(
 	let registered = match client
 		.register_presence(RegisterPresence {
 			client_id: Bytes::copy_from_slice(client_id.as_bytes()),
-			pid:       std::process::id(),
+			pid:       id(),
 			kind:      kind.to_owned(),
 			props:     None,
 		})
@@ -197,9 +229,7 @@ pub async fn register_project_presence(
 }
 
 #[cfg(unix)]
-async fn connect_presence_owner(
-	socket: &Path,
-) -> Result<(EnvClient, tokio::task::AbortHandle), EnvdError> {
+async fn connect_presence_owner(socket: &Path) -> Result<(EnvClient, AbortHandle), EnvdError> {
 	let (client, bridge) = EnvServer::connect_owner_uds(socket).await?;
 	let abort = bridge.abort_handle();
 	drop(bridge);
@@ -207,10 +237,9 @@ async fn connect_presence_owner(
 }
 
 #[cfg(windows)]
-async fn connect_presence_owner(
-	socket: &Path,
-) -> Result<(EnvClient, tokio::task::AbortHandle), EnvdError> {
-	let (client, bridge) = crate::windows::connect_owner_pipe(socket)?;
+async fn connect_presence_owner(socket: &Path) -> Result<(EnvClient, AbortHandle), EnvdError> {
+	use crate::windows::connect_owner_pipe;
+	let (client, bridge) = connect_owner_pipe(socket)?;
 	let abort = bridge.abort_handle();
 	drop(bridge);
 	Ok((client, abort))
@@ -221,7 +250,7 @@ pub fn migrate_session_artifacts(
 	sessions_dir: &Path,
 	source_session: &str,
 	destination_session: &str,
-) -> Result<(), std::io::Error> {
+) -> Result<(), io::Error> {
 	tool_url::local::migrate_session_artifacts(sessions_dir, source_session, destination_session)
 }
 
@@ -252,15 +281,15 @@ pub struct ProjectEnvironment {
 	pub(crate) registry: Arc<Registry>,
 	eval_bridge:         Arc<eval::SessionBridgeHost>,
 	reflection_bridge:   Arc<memory::ReflectionBridgeHost>,
-	eval_control:        omp_tools::eval::EvalSessionControl,
+	eval_control:        EvalSessionControl,
 	search_bridge:       Arc<search_backend::SearchBridgeHost>,
-	github_credentials:  Arc<github_url::GithubCredentialBridge>,
+	github_credentials:  Arc<GithubCredentialBridge>,
 	lifecycle:           ProjectLifecycle,
 }
 
 struct ProjectLifecycle {
 	shutdown: Option<CancellationToken>,
-	tasks:    Vec<tokio::task::JoinHandle<()>>,
+	tasks:    Vec<JoinHandle<()>>,
 	server:   Arc<EnvServer>,
 }
 
@@ -303,9 +332,9 @@ impl ProjectEnvironment {
 						// briefly for the endpoint to be released.
 						let _ = owner_probe.retire().await;
 						bridge.abort();
-						let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+						let deadline = Instant::now() + Duration::from_secs(5);
 						loop {
-							match tokio::net::UnixStream::connect(socket).await {
+							match UnixStream::connect(socket).await {
 								Err(error)
 									if matches!(
 										error.kind(),
@@ -324,8 +353,8 @@ impl ProjectEnvironment {
 									)
 									.await;
 								},
-								_ if tokio::time::Instant::now() >= deadline => break,
-								_ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+								_ if Instant::now() >= deadline => break,
+								_ => time::sleep(Duration::from_millis(50)).await,
 							}
 						}
 						tracing::warn!(
@@ -416,7 +445,8 @@ impl ProjectEnvironment {
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
-		match crate::windows::connect_owner_pipe(socket) {
+		use crate::windows::{connect_owner_pipe, open_owner_pipe};
+		match connect_owner_pipe(socket) {
 			Ok((owner_probe, bridge)) => {
 				match hello(&owner_probe).await {
 					Ok(owner_hello)
@@ -427,9 +457,9 @@ impl ProjectEnvironment {
 					{
 						let _ = owner_probe.retire().await;
 						bridge.abort();
-						let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+						let deadline = Instant::now() + Duration::from_secs(5);
 						loop {
-							match crate::windows::open_owner_pipe(socket) {
+							match open_owner_pipe(socket) {
 								Err(error) if error.kind() == io::ErrorKind::NotFound => {
 									return Self::start(
 										root,
@@ -443,8 +473,8 @@ impl ProjectEnvironment {
 									)
 									.await;
 								},
-								_ if tokio::time::Instant::now() >= deadline => break,
-								_ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+								_ if Instant::now() >= deadline => break,
+								_ => time::sleep(Duration::from_millis(50)).await,
 							}
 						}
 					},
@@ -645,7 +675,7 @@ impl ProjectEnvironment {
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
-		let owner_listener = windows::OwnerPipeListener::bind(socket)?;
+		let owner_listener = OwnerPipeListener::bind(socket)?;
 		let (worker_config, data_bindings) =
 			worker_config(state_dir, py_eval, trusted_extensions, interrupt_grace)?;
 		let server = EnvServer::open_project(
@@ -791,8 +821,8 @@ impl ProjectEnvironment {
 	pub fn bind_eval_sdk_parent(
 		&self,
 		owner: Str,
-		parent: Arc<dyn eval::ParentSessionHost>,
-	) -> Result<impl Drop + use<>, eval::BridgeHostError> {
+		parent: Arc<dyn ParentSessionHost>,
+	) -> Result<impl Drop + use<>, BridgeHostError> {
 		self.eval_bridge.bind_sdk_parent(owner, parent)
 	}
 
@@ -802,7 +832,7 @@ impl ProjectEnvironment {
 	}
 
 	/// Returns the evaluation session control.
-	pub fn eval_control(&self) -> omp_tools::eval::EvalSessionControl {
+	pub fn eval_control(&self) -> EvalSessionControl {
 		self.eval_control.clone()
 	}
 
@@ -812,12 +842,12 @@ impl ProjectEnvironment {
 	}
 
 	/// Returns the Environment's provider credential projection.
-	pub fn github_credentials(&self) -> Arc<github_url::GithubCredentialBridge> {
+	pub fn github_credentials(&self) -> Arc<GithubCredentialBridge> {
 		Arc::clone(&self.github_credentials)
 	}
 
 	/// Returns the Environment-owned authoritative sessions index.
-	pub fn sessions_index(&self) -> Arc<omp_storage::index::SessionIndex> {
+	pub fn sessions_index(&self) -> Arc<SessionIndex> {
 		self.lifecycle.server.sessions_index()
 	}
 
@@ -825,15 +855,14 @@ impl ProjectEnvironment {
 	/// children to one authenticated connection.
 	pub fn extension_control_authority(
 		&self,
-		identity: Arc<exthost::control::ControlConnectionIdentity>,
-	) -> Result<Arc<dyn exthost::control::ControlAuthority>, exthost::control::ControlCompositionError>
-	{
+		identity: Arc<ControlConnectionIdentity>,
+	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
 		self.lifecycle.server.extension_control_authority(identity)
 	}
 
 	/// Returns the live generation-fenced extension callback transport used by
 	/// provider, campaign, presentation, and verdict owners.
-	pub fn extension_callback_dispatcher(&self) -> Arc<dyn exthost::dispatch::CallbackDispatcher> {
+	pub fn extension_callback_dispatcher(&self) -> Arc<dyn CallbackDispatcher> {
 		self.lifecycle.server.extension_callback_dispatcher()
 	}
 
@@ -841,8 +870,8 @@ impl ProjectEnvironment {
 	/// connection and generation fact exactly matches the live activation.
 	pub fn extension_control_manifest(
 		&self,
-		identity: &exthost::control::ControlConnectionIdentity,
-	) -> Option<exthost::ExtensionManifest> {
+		identity: &ControlConnectionIdentity,
+	) -> Option<ExtensionManifest> {
 		self.lifecycle.server.extension_control_manifest(identity)
 	}
 
@@ -850,7 +879,7 @@ impl ProjectEnvironment {
 	/// authenticated extension generation.
 	pub fn extension_registry_evidence(
 		&self,
-		identity: &exthost::control::ControlConnectionIdentity,
+		identity: &ControlConnectionIdentity,
 	) -> Option<Arc<worker::SealedRegistryEvidence>> {
 		self.lifecycle.server.extension_registry_evidence(identity)
 	}
@@ -868,7 +897,7 @@ impl ProjectEnvironment {
 	/// Constructs extension-scoped MCP CONTROL over this active Environment.
 	pub fn mcp_control(
 		&self,
-		identity: Arc<exthost::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		cancellation: CancellationToken,
 	) -> Option<mcp::control::McpControl> {
 		self.lifecycle.server.mcp_control(identity, cancellation)
@@ -881,7 +910,7 @@ impl ProjectEnvironment {
 	/// replacement. MCP retains its independently composed owner.
 	pub fn bind_agents_control_authority(
 		&self,
-		factory: Arc<dyn exthost::control::ControlAuthorityFactory>,
+		factory: Arc<dyn ControlAuthorityFactory>,
 	) -> worker::AgentsControlAuthorityBinding {
 		self.lifecycle.server.bind_agents_control_authority(factory)
 	}
@@ -903,7 +932,7 @@ impl ProjectEnvironment {
 	/// CONTROL domain under one generation fence and one teardown lease.
 	pub fn bind_external_control_authorities(
 		&self,
-		agents: Arc<dyn exthost::control::ControlAuthorityFactory>,
+		agents: Arc<dyn ControlAuthorityFactory>,
 		domains: worker::ExternalDomainControlFactories,
 	) -> worker::ExternalControlAuthorityBinding {
 		self
@@ -921,7 +950,7 @@ impl ProjectEnvironment {
 	/// is attempted after child activation began.
 	pub fn bind_agent_control(
 		&self,
-		sender: omp_agent::control::ControlSender,
+		sender: ControlSender,
 	) -> Result<server::AgentControlBinding, EnvdError> {
 		self.lifecycle.server.bind_agent_control(sender)
 	}
@@ -981,7 +1010,7 @@ fn worker_config(
 			sf!("trusted"),
 			1,
 		);
-		let manifest = exthost::ExtensionManifest::py_eval(provenance, []);
+		let manifest = ExtensionManifest::py_eval(provenance, []);
 		let mut extension = ExtHostSpec::new(key, manifest);
 		extension.data_grants = binding.grants().clone();
 		extension.data_socket = Some(extension_data_endpoint(&binding));
@@ -1002,8 +1031,8 @@ pub(crate) fn authenticated_runtime_identity()
 	let principal = omp_core::Principal::new(Str::from(format!("os:{user}")), user);
 	let authority = exthost::PrincipalAuthority::new(principal);
 	let session_id = Str::from(omp_core::Ulid::generate().to_string());
-	let session_generation = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	let session_generation = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
 		.map_err(io::Error::other)?
 		.as_millis()
 		.try_into()
@@ -1014,7 +1043,7 @@ pub(crate) fn authenticated_runtime_identity()
 #[cfg(unix)]
 fn authenticated_os_user() -> Result<Str, EnvdError> {
 	let uid = nix::unistd::geteuid();
-	let user = nix::unistd::User::from_uid(uid)
+	let user = User::from_uid(uid)
 		.map_err(io::Error::from)?
 		.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "current OS user has no account"))?;
 	Ok(Str::from(user.name))
@@ -1022,16 +1051,17 @@ fn authenticated_os_user() -> Result<Str, EnvdError> {
 
 #[cfg(windows)]
 fn authenticated_os_user() -> Result<Str, EnvdError> {
-	Ok(crate::windows::current_user_name()?)
+	use crate::windows::current_user_name;
+	Ok(current_user_name()?)
 }
 
 #[cfg(not(windows))]
-fn extension_data_endpoint(binding: &ExtensionDataBinding) -> std::path::PathBuf {
+fn extension_data_endpoint(binding: &ExtensionDataBinding) -> PathBuf {
 	binding.path().to_path_buf()
 }
 
 #[cfg(windows)]
-fn extension_data_endpoint(binding: &ExtensionDataBinding) -> std::path::PathBuf {
+fn extension_data_endpoint(binding: &ExtensionDataBinding) -> PathBuf {
 	windows::extension_pipe_endpoint(binding)
 }
 
@@ -1040,7 +1070,7 @@ fn spawn_extension_data_servers(
 	server: &Arc<EnvServer>,
 	bindings: Vec<ExtensionDataBinding>,
 	shutdown: &CancellationToken,
-	tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+	tasks: &mut Vec<JoinHandle<()>>,
 ) {
 	for binding in bindings {
 		let server = Arc::clone(server);
@@ -1058,7 +1088,7 @@ fn spawn_extension_data_servers(
 	server: &Arc<EnvServer>,
 	bindings: Vec<ExtensionDataBinding>,
 	shutdown: &CancellationToken,
-	tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+	tasks: &mut Vec<JoinHandle<()>>,
 ) {
 	for binding in bindings {
 		let server = Arc::clone(server);
@@ -1076,7 +1106,7 @@ fn spawn_extension_data_servers(
 	_server: &Arc<EnvServer>,
 	_bindings: Vec<ExtensionDataBinding>,
 	_shutdown: &CancellationToken,
-	_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+	_tasks: &mut Vec<JoinHandle<()>>,
 ) {
 }
 
@@ -1098,14 +1128,14 @@ async fn spawn_project_daemon(
 	socket: &Path,
 	docserver_socket: &Path,
 ) -> Result<(), EnvdError> {
-	let executable = std::env::current_exe()?;
+	let executable = env::current_exe()?;
 	spawn_project_daemon_with(
 		&executable,
 		root,
 		state_dir,
 		socket,
 		docserver_socket,
-		std::time::Duration::from_secs(10),
+		Duration::from_secs(10),
 	)
 	.await
 }
@@ -1123,15 +1153,15 @@ async fn spawn_project_daemon_with(
 	state_dir: &Path,
 	socket: &Path,
 	docserver_socket: &Path,
-	deadline: std::time::Duration,
+	deadline: Duration,
 ) -> Result<(), EnvdError> {
-	std::fs::create_dir_all(state_dir)?;
-	let log = std::fs::OpenOptions::new()
+	fs::create_dir_all(state_dir)?;
+	let log = OpenOptions::new()
 		.create(true)
 		.append(true)
 		.open(state_dir.join("envd.log"))?;
 	let errors = log.try_clone()?;
-	let mut command = tokio::process::Command::new(executable);
+	let mut command = process::Command::new(executable);
 	command
 		.arg("envd")
 		.arg("--root")
@@ -1142,7 +1172,7 @@ async fn spawn_project_daemon_with(
 		.arg(socket)
 		.arg("--docserver-socket")
 		.arg(docserver_socket)
-		.stdin(std::process::Stdio::null())
+		.stdin(Stdio::null())
 		.stdout(log)
 		.stderr(errors)
 		.kill_on_drop(false);
@@ -1152,7 +1182,7 @@ async fn spawn_project_daemon_with(
 		command.as_std_mut().process_group(0);
 	}
 	let mut child = command.spawn()?;
-	let deadline = tokio::time::Instant::now() + deadline;
+	let deadline = Instant::now() + deadline;
 	loop {
 		if let Some(status) = child.try_wait()? {
 			return Err(
@@ -1166,7 +1196,7 @@ async fn spawn_project_daemon_with(
 			});
 			return Ok(());
 		}
-		if tokio::time::Instant::now() >= deadline {
+		if Instant::now() >= deadline {
 			let _ = child.start_kill();
 			tokio::spawn(async move {
 				let _ = child.wait().await;
@@ -1175,7 +1205,7 @@ async fn spawn_project_daemon_with(
 				io::Error::new(io::ErrorKind::TimedOut, "project daemon did not become ready").into(),
 			);
 		}
-		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		time::sleep(Duration::from_millis(50)).await;
 	}
 }
 
@@ -1191,7 +1221,8 @@ async fn owner_endpoint_ready(socket: &Path) -> bool {
 
 #[cfg(windows)]
 async fn owner_endpoint_ready(socket: &Path) -> bool {
-	let Ok((probe, bridge)) = crate::windows::connect_owner_pipe(socket) else {
+	use crate::windows::connect_owner_pipe;
+	let Ok((probe, bridge)) = connect_owner_pipe(socket) else {
 		return false;
 	};
 	let ready = hello(&probe).await.is_ok();
@@ -1211,7 +1242,7 @@ mod tests {
 			scratch.path(),
 			&scratch.path().join("env.sock"),
 			&scratch.path().join("doc.sock"),
-			std::time::Duration::from_millis(deadline_ms),
+			Duration::from_millis(deadline_ms),
 		)
 		.await
 	}
@@ -1238,8 +1269,8 @@ mod tests {
 
 		let scratch = tempfile::tempdir().expect("scratch script directory");
 		let script = scratch.path().join("hang.sh");
-		std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("write hang script");
-		std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+		fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("write hang script");
+		fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
 			.expect("mark script executable");
 
 		let error = spawn_with(&script, 300)

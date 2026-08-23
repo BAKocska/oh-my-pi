@@ -1,5 +1,7 @@
 //! Typed settings owned by immutable prompt preparation.
 
+use std::{env, path::Path};
+
 use omp_agent::{Personality, PromptSettingsInput};
 use omp_core::Str;
 use omp_settings::{
@@ -7,6 +9,8 @@ use omp_settings::{
 	SettingsDomain,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::{prompt_input, prompt_input::PromptInputError};
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 const RUNTIME: &[SettingScope] = &[SettingScope::Runtime];
@@ -129,18 +133,14 @@ impl PromptSettings {
 		}
 		self.null_prompt = self.null_prompt
 			|| overrides.null_prompt
-			|| std::env::var("NULL_PROMPT").is_ok_and(|value| value.eq_ignore_ascii_case("true"));
+			|| env::var("NULL_PROMPT").is_ok_and(|value| value.eq_ignore_ascii_case("true"));
 		self
 	}
 
 	/// Resolves file-or-inline customization and project-over-user `SYSTEM.md`
 	/// discovery before the immutable settings projection is published.
-	pub fn resolve_inputs(
-		mut self,
-		cwd: &std::path::Path,
-		home: &std::path::Path,
-	) -> Result<Self, crate::prompt_input::PromptInputError> {
-		let (custom, append) = crate::prompt_input::resolve_system_inputs(
+	pub fn resolve_inputs(mut self, cwd: &Path, home: &Path) -> Result<Self, PromptInputError> {
+		let (custom, append) = prompt_input::resolve_system_inputs(
 			cwd,
 			home,
 			self.custom_prompt.as_deref(),
@@ -150,7 +150,7 @@ impl PromptSettings {
 		self.append_prompt = append;
 		if self.personality != Personality::None {
 			self.personality_override =
-				crate::prompt_input::discover_user_prompt_file(cwd, home, "PERSONALITY.md")?;
+				prompt_input::discover_user_prompt_file(cwd, home, "PERSONALITY.md")?;
 		} else {
 			self.personality_override = None;
 		}

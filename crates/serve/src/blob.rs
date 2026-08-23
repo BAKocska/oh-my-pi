@@ -1,17 +1,21 @@
 //! Tonic projection of the daemon's content-addressed blob store.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{fs, io, path::PathBuf, pin, sync::Arc};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use omp_core::Hash32;
-use omp_proto::omp::blob::v1 as pb;
-use omp_storage::blob::{BlobRef, BlobStore};
+use omp_proto::omp::blob::v1::{self as pb, blob_server};
+use omp_storage::{
+	blob,
+	blob::{BlobRef, BlobStore},
+};
+use tokio::task;
 use tonic::{Request, Response, Status};
 
 const CHUNK_SIZE: usize = 64 * 1024;
 const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
-type BlobStream = std::pin::Pin<Box<dyn Stream<Item = Result<pb::Chunk, Status>> + Send + 'static>>;
+type BlobStream = pin::Pin<Box<dyn Stream<Item = Result<pb::Chunk, Status>> + Send + 'static>>;
 
 /// RPC server backed by one daemon-owned content-addressed store.
 #[derive(Clone)]
@@ -27,7 +31,7 @@ impl BlobRpc {
 }
 
 #[tonic::async_trait]
-impl pb::blob_server::Blob for BlobRpc {
+impl blob_server::Blob for BlobRpc {
 	type GetStream = BlobStream;
 
 	async fn stat(
@@ -37,7 +41,7 @@ impl pb::blob_server::Blob for BlobRpc {
 		let hash = parse_hash(&request.into_inner().hash)?;
 		let reference = BlobRef { hash, size: 0 };
 		let path = self.store.path(&reference);
-		let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(path))
+		let metadata = task::spawn_blocking(move || fs::metadata(path))
 			.await
 			.map_err(join_status)?;
 		match metadata {
@@ -45,7 +49,7 @@ impl pb::blob_server::Blob for BlobRpc {
 				Ok(Response::new(pb::StatResponse { present: true, size: metadata.len() }))
 			},
 			Ok(_) => Ok(Response::new(pb::StatResponse { present: false, size: 0 })),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {
 				Ok(Response::new(pb::StatResponse { present: false, size: 0 }))
 			},
 			Err(error) => Err(io_status(error)),
@@ -59,11 +63,11 @@ impl pb::blob_server::Blob for BlobRpc {
 		let request = request.into_inner();
 		let hash = parse_hash(&request.hash)?;
 		let store = Arc::clone(&self.store);
-		let bytes = tokio::task::spawn_blocking(move || {
+		let bytes = task::spawn_blocking(move || {
 			let path = store.path(&BlobRef { hash, size: 0 });
-			let size = std::fs::metadata(&path)?.len();
-			let bytes = std::fs::read(path)?;
-			Ok::<_, std::io::Error>((size, Bytes::from(bytes)))
+			let size = fs::metadata(&path)?.len();
+			let bytes = fs::read(path)?;
+			Ok::<_, io::Error>((size, Bytes::from(bytes)))
 		})
 		.await
 		.map_err(join_status)?
@@ -135,7 +139,7 @@ impl pb::blob_server::Blob for BlobRpc {
 			return Err(Status::invalid_argument("uploaded blob size does not match declared size"));
 		}
 		let store = Arc::clone(&self.store);
-		let reference = tokio::task::spawn_blocking(move || store.put(&bytes))
+		let reference = task::spawn_blocking(move || store.put(&bytes))
 			.await
 			.map_err(join_status)?
 			.map_err(storage_status)?;
@@ -154,9 +158,9 @@ impl pb::blob_server::Blob for BlobRpc {
 	) -> Result<Response<pb::DeleteResponse>, Status> {
 		let hash = parse_hash(&request.into_inner().hash)?;
 		let path: PathBuf = self.store.path(&BlobRef { hash, size: 0 });
-		let deleted = tokio::task::spawn_blocking(move || match std::fs::remove_file(path) {
+		let deleted = task::spawn_blocking(move || match fs::remove_file(path) {
 			Ok(()) => Ok(true),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
 			Err(error) => Err(error),
 		})
 		.await
@@ -172,21 +176,21 @@ fn parse_hash(bytes: &[u8]) -> Result<Hash32, Status> {
 		.map_err(|_| Status::invalid_argument("blob hash must be exactly 32 bytes"))
 }
 
-fn join_status(error: tokio::task::JoinError) -> Status {
+fn join_status(error: task::JoinError) -> Status {
 	Status::internal(format!("blob worker failed: {error}"))
 }
 
-fn io_status(error: std::io::Error) -> Status {
-	if error.kind() == std::io::ErrorKind::NotFound {
+fn io_status(error: io::Error) -> Status {
+	if error.kind() == io::ErrorKind::NotFound {
 		Status::not_found("blob not found")
 	} else {
 		Status::internal(format!("blob store I/O failed: {error}"))
 	}
 }
 
-fn storage_status(error: omp_storage::blob::Error) -> Status {
+fn storage_status(error: blob::Error) -> Status {
 	match error {
-		omp_storage::blob::Error::NotFound => Status::not_found("blob not found"),
+		blob::Error::NotFound => Status::not_found("blob not found"),
 		other => Status::internal(format!("blob store failed: {other}")),
 	}
 }

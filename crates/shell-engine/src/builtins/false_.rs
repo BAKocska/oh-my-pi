@@ -1,4 +1,4 @@
-use crate::{ExecutionResult, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 /// Return exit code 1.
 pub(crate) struct FalseCommand {}
@@ -8,7 +8,7 @@ impl builtins::SimpleCommand for FalseCommand {
 		_name: &str,
 		content_type: builtins::ContentType,
 		_options: &builtins::ContentOptions,
-	) -> Result<String, crate::Error> {
+	) -> Result<String, Error> {
 		match content_type {
 			builtins::ContentType::DetailedHelp => Ok("Returns a failure exit status.".into()),
 			builtins::ContentType::ShortUsage => Ok("false".into()),
@@ -22,10 +22,10 @@ impl builtins::SimpleCommand for FalseCommand {
 		}
 	}
 
-	fn execute<SE: crate::ShellExtensions, I: Iterator<Item = S>, S: AsRef<str>>(
-		_context: crate::ExecutionContext<'_, SE>,
+	fn execute<SE: ShellExtensions, I: Iterator<Item = S>, S: AsRef<str>>(
+		_context: ExecutionContext<'_, SE>,
 		_args: I,
-	) -> Result<ExecutionResult, crate::Error> {
+	) -> Result<ExecutionResult, Error> {
 		Ok(ExecutionResult::general_error())
 	}
 }

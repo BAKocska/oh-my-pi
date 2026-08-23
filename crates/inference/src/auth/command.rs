@@ -1,10 +1,10 @@
 //! Secret-typed command credential resolution with process-local caching.
 
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use omp_core::{SecretString, Str};
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Boxed environment-execution future at the cold command-credential boundary.
@@ -48,7 +48,7 @@ pub enum CommandCredentialError {
 enum CacheEntry {
 	Resolving(Arc<Notify>),
 	Ready(SecretString),
-	FailedUntil(tokio::time::Instant),
+	FailedUntil(Instant),
 }
 
 /// Single-flight, process-lifetime successful command credential cache.
@@ -85,7 +85,7 @@ impl CommandCredentialResolver {
 				let mut cache = self.cache.lock();
 				match cache.get(&key) {
 					Some(CacheEntry::Ready(secret)) => return Ok(secret.clone()),
-					Some(CacheEntry::FailedUntil(until)) if *until > tokio::time::Instant::now() => {
+					Some(CacheEntry::FailedUntil(until)) if *until > Instant::now() => {
 						return Err(CommandCredentialError::FailureCached);
 					},
 					Some(CacheEntry::Resolving(notify)) => Some(Arc::clone(notify)),
@@ -119,7 +119,7 @@ impl CommandCredentialResolver {
 					Err(_) => {
 						cache.insert(
 							key.clone(),
-							CacheEntry::FailedUntil(tokio::time::Instant::now() + self.failure_ttl),
+							CacheEntry::FailedUntil(Instant::now() + self.failure_ttl),
 						);
 					},
 				}
@@ -136,6 +136,7 @@ mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	use omp_core::ExposeSecret as _;
+	use tokio::{task, time};
 
 	use super::*;
 
@@ -149,7 +150,7 @@ mod tests {
 			let call = self.calls.fetch_add(1, Ordering::SeqCst);
 			let fail = self.fail.load(Ordering::SeqCst);
 			Box::pin(async move {
-				tokio::task::yield_now().await;
+				task::yield_now().await;
 				if call < fail {
 					Err(CommandCredentialError::Execution)
 				} else {
@@ -192,7 +193,7 @@ mod tests {
 				.await,
 			Err(CommandCredentialError::FailureCached)
 		));
-		tokio::time::advance(Duration::from_millis(2)).await;
+		time::advance(Duration::from_millis(2)).await;
 		assert_eq!(
 			resolver
 				.resolve("credential command", CancellationToken::new())
@@ -205,8 +206,8 @@ mod tests {
 	}
 }
 
-impl std::fmt::Debug for CommandCredentialResolver {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CommandCredentialResolver {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("CommandCredentialResolver")
 			.field("failure_ttl", &self.failure_ttl)

@@ -4,7 +4,7 @@
 	reason = "Windows implementations retain the Unix-compatible fallible user API"
 )]
 
-use std::{path::PathBuf, ptr, sync::LazyLock};
+use std::{env, io, mem, path::PathBuf, ptr, sync::LazyLock};
 
 use crate::error;
 
@@ -28,7 +28,7 @@ static IS_ELEVATED: LazyLock<bool> = LazyLock::new(|| {
 	})
 });
 
-fn query_elevation() -> std::io::Result<bool> {
+fn query_elevation() -> io::Result<bool> {
 	use windows_sys::Win32::{
 		Foundation::{CloseHandle, HANDLE},
 		Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
@@ -39,7 +39,7 @@ fn query_elevation() -> std::io::Result<bool> {
 	// SAFETY: GetCurrentProcess returns a valid pseudo-handle and `token` is
 	// writable.
 	if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(io::Error::last_os_error());
 	}
 
 	let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
@@ -50,7 +50,7 @@ fn query_elevation() -> std::io::Result<bool> {
 			token,
 			TokenElevation,
 			(&raw mut elevation).cast(),
-			std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+			mem::size_of::<TOKEN_ELEVATION>() as u32,
 			&mut returned,
 		)
 	};
@@ -59,7 +59,7 @@ fn query_elevation() -> std::io::Result<bool> {
 		CloseHandle(token);
 	}
 	if succeeded == 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(io::Error::last_os_error());
 	}
 	Ok(elevation.TokenIsElevated != 0)
 }
@@ -71,7 +71,7 @@ pub(crate) fn get_user_home_dir(_username: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn get_current_user_home_dir() -> Option<PathBuf> {
-	std::env::home_dir()
+	env::home_dir()
 }
 
 pub(crate) fn get_current_user_default_shell() -> Option<PathBuf> {
@@ -111,19 +111,19 @@ pub(crate) fn get_current_username() -> Result<String, error::Error> {
 		GetUserNameW(ptr::null_mut(), &mut units);
 	}
 	if units == 0 {
-		return Err(std::io::Error::last_os_error().into());
+		return Err(io::Error::last_os_error().into());
 	}
 	let mut name = vec![0_u16; units as usize];
 	// SAFETY: `name` has `units` writable UTF-16 code units.
 	if unsafe { GetUserNameW(name.as_mut_ptr(), &mut units) } == 0 {
-		return Err(std::io::Error::last_os_error().into());
+		return Err(io::Error::last_os_error().into());
 	}
 	let length = name
 		.iter()
 		.position(|unit| *unit == 0)
 		.unwrap_or(name.len());
 	String::from_utf16(&name[..length])
-		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error).into())
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
 }
 
 pub(crate) fn get_user_group_ids() -> Result<Vec<u32>, error::Error> {

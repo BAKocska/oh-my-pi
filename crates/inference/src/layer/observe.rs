@@ -7,7 +7,11 @@ use std::{
 
 use tower::{Layer, Service};
 
-use crate::{call::Call, error::Error, id::RequestId};
+use crate::{
+	call::Call,
+	error::{Error, ErrorKind},
+	id::RequestId,
+};
 
 /// Sanitized execution-start observation; it intentionally excludes payloads
 /// and credentials.
@@ -27,7 +31,7 @@ pub struct ExecutionFinished {
 	/// Total observed service-call time.
 	pub elapsed:    Duration,
 	/// Structured failure category, if execution failed.
-	pub error:      Option<crate::error::ErrorKind>,
+	pub error:      Option<ErrorKind>,
 	/// Whether ordinary output committed before failure.
 	pub committed:  bool,
 }

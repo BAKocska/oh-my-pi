@@ -10,6 +10,9 @@ use http::{HeaderName, HeaderValue};
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
+use url::Url;
+
+use super::{header_policy, header_policy::HeaderPolicyError};
 
 /// Schema URL written into native OMP MCP configuration files.
 pub const MCP_CONFIG_SCHEMA_URL: &str =
@@ -441,7 +444,7 @@ pub fn validate_server(name: &str, server: &McpServerConfig) -> Vec<ConfigValida
 		_ => {},
 	}
 	if let Some(url) = server.url.as_ref() {
-		match url::Url::parse(url) {
+		match Url::parse(url) {
 			Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => {},
 			_ => errors.push(ConfigValidationError::InvalidUrl { name: Str::from(name) }),
 		}
@@ -458,8 +461,8 @@ pub fn validate_server(name: &str, server: &McpServerConfig) -> Vec<ConfigValida
 			}),
 		}
 	}
-	if let Err(super::header_policy::HeaderPolicyError::ReservedHeader { name: header }) =
-		super::header_policy::validate_configured_headers(&parsed_headers)
+	if let Err(HeaderPolicyError::ReservedHeader { name: header }) =
+		header_policy::validate_configured_headers(&parsed_headers)
 	{
 		errors.push(ConfigValidationError::ReservedHeader {
 			name:   Str::from(name),
@@ -496,25 +499,53 @@ pub fn validate_server(name: &str, server: &McpServerConfig) -> Vec<ConfigValida
 pub enum ConfigValidationError {
 	/// Name length is outside the portable range.
 	#[error("MCP server name must contain 1 through 100 characters (received {length})")]
-	NameLength { length: usize },
+	NameLength {
+		/// Number of Unicode scalar values in the rejected server name.
+		length: usize,
+	},
 	/// Name contains characters outside the portable vocabulary.
 	#[error("MCP server name `{name}` contains unsupported characters")]
-	NameCharacters { name: Str },
+	NameCharacters {
+		/// Server key from the configuration source that failed the portable-name
+		/// check.
+		name: Str,
+	},
 	/// Stdio and HTTP transport fields conflict.
 	#[error("MCP server `{name}` sets mutually exclusive command and URL transport fields")]
-	TransportConflict { name: Str },
+	TransportConflict {
+		/// Server key whose declaration mixes stdio command fields with an
+		/// HTTP/SSE URL.
+		name: Str,
+	},
 	/// Stdio transport lacks a command.
 	#[error("MCP stdio server `{name}` requires a command")]
-	MissingCommand { name: Str },
+	MissingCommand {
+		/// Server key whose stdio declaration has no non-empty executable
+		/// command.
+		name: Str,
+	},
 	/// HTTP transport lacks an endpoint.
 	#[error("MCP HTTP server `{name}` requires a URL")]
-	MissingUrl { name: Str },
+	MissingUrl {
+		/// Server key whose HTTP or SSE declaration has no non-empty endpoint
+		/// URL.
+		name: Str,
+	},
 	/// Endpoint is not an absolute HTTP(S) URL.
 	#[error("MCP server `{name}` has an invalid HTTP URL")]
-	InvalidUrl { name: Str },
+	InvalidUrl {
+		/// Server key whose remote endpoint is not an absolute HTTP(S) URL with a
+		/// host.
+		name: Str,
+	},
 	/// Header name or value is not valid HTTP syntax.
 	#[error("MCP server `{name}` has an invalid HTTP header `{header}`")]
-	InvalidHeader { name: Str, header: Str },
+	InvalidHeader {
+		/// Server key whose configured HTTP header is syntactically invalid.
+		name:   Str,
+		/// Rejected header name from the server declaration.
+		header: Str,
+	},
 	/// Header is owned by the transport protocol.
 	#[error("MCP server `{name}` configures reserved transport header `{header}`")]
 	ReservedHeader {
@@ -525,13 +556,30 @@ pub enum ConfigValidationError {
 	},
 	/// API-key auth lacks an authority reference.
 	#[error("MCP API-key server `{name}` requires a credential ID or secret reference")]
-	MissingCredentialReference { name: Str },
+	MissingCredentialReference {
+		/// Server key whose API-key mode names neither a credential authority nor
+		/// a secret reference.
+		name: Str,
+	},
 	/// Protocol revision is not explicitly supported.
 	#[error("MCP server `{name}` requests unsupported protocol revision `{revision}`")]
-	UnsupportedProtocolRevision { name: Str, revision: Str },
+	UnsupportedProtocolRevision {
+		/// Server key whose ordered protocol-negotiation preferences contain the
+		/// rejected revision.
+		name:     Str,
+		/// Configured revision that the client does not accept during MCP
+		/// initialization.
+		revision: Str,
+	},
 	/// Protocol preference repeats a revision.
 	#[error("MCP server `{name}` repeats protocol revision `{revision}`")]
-	DuplicateProtocolRevision { name: Str, revision: Str },
+	DuplicateProtocolRevision {
+		/// Server key whose ordered protocol-negotiation preferences repeat a
+		/// revision.
+		name:     Str,
+		/// Accepted revision that appears more than once in the preference list.
+		revision: Str,
+	},
 }
 
 #[cfg(test)]

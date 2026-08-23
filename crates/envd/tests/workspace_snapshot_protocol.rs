@@ -1,3 +1,5 @@
+//! Proves workspace snapshot protobuf metadata, restore fences, effects, and
+//! conflicts round-trip.
 use bytes::Bytes;
 use omp_proto::{
 	SCHEMA_REV,
@@ -107,5 +109,8 @@ fn workspace_requests_and_restore_report_keep_fences_and_effects() {
 	};
 	let decoded =
 		WorkspaceResult::decode(result.encode_to_vec().as_slice()).expect("decode restore");
-	assert_eq!(decoded.result, Some(workspace_result::Result::Restored(restored)));
+	assert_eq!(
+		decoded.result,
+		Some(omp_proto::env::v1::workspace_result::Result::Restored(restored))
+	);
 }

@@ -1,6 +1,6 @@
 //! Workspace-generation and detach-in-place integration contracts.
 
-use std::{future::Future, time::Duration};
+use std::{fs, future::Future, time::Duration};
 
 use bytes::Bytes;
 use omp_core::Str;
@@ -19,12 +19,14 @@ use omp_proto::env::v1::{
 	MergeWorktree, OpenSessionRequest, RestoreWorkspace, Script, SnapshotWorkspace,
 };
 use tempfile::TempDir;
+use tokio::{io, time};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
 async fn within<T>(future: impl Future<Output = T>) -> T {
-	tokio::time::timeout(DEADLINE, future)
+	time::timeout(DEADLINE, future)
 		.await
 		.expect("workspace operation exceeded its deterministic deadline")
 }
@@ -32,12 +34,12 @@ async fn within<T>(future: impl Future<Output = T>) -> T {
 async fn operations(root: &TempDir, state: &TempDir) -> (WorkspaceOperations, DocumentHost) {
 	let config = ServerConfig::new(root.path()).expect("document config");
 	let environment = Environment::new(config).expect("document authority");
-	let (client, server) = tokio::io::duplex(256 * 1024);
+	let (client, server) = io::duplex(256 * 1024);
 	tokio::spawn(serve_connection(environment.clone(), server, ConnectionConfig::default()));
 	let documents = within(DocumentHost::connect(client))
 		.await
 		.expect("document host");
-	let (external_client, external_server) = tokio::io::duplex(256 * 1024);
+	let (external_client, external_server) = io::duplex(256 * 1024);
 	tokio::spawn(serve_connection(environment, external_server, ConnectionConfig::default()));
 	let external = within(DocumentHost::connect(external_client))
 		.await
@@ -54,7 +56,7 @@ async fn operations(root: &TempDir, state: &TempDir) -> (WorkspaceOperations, Do
 async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 	let root = TempDir::new().expect("workspace");
 	let state = TempDir::new().expect("state");
-	std::fs::write(root.path().join("tracked.txt"), b"before\n").expect("fixture");
+	fs::write(root.path().join("tracked.txt"), b"before\n").expect("fixture");
 	let (operations, external) = operations(&root, &state).await;
 	let cancel = CancellationToken::new();
 
@@ -77,9 +79,9 @@ async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 	assert_eq!(snapshot.snapshot_id, duplicate.snapshot_id);
 	assert_eq!(snapshot.manifest_hash.as_ref(), duplicate.manifest_hash.as_ref());
 
-	std::fs::write(root.path().join("tracked.txt"), b"after\n").expect("mutate fixture");
+	fs::write(root.path().join("tracked.txt"), b"after\n").expect("mutate fixture");
 	let uri = Str::from(
-		url::Url::from_file_path(root.path().join("tracked.txt"))
+		Url::from_file_path(root.path().join("tracked.txt"))
 			.expect("tracked file URI")
 			.to_string(),
 	);
@@ -125,7 +127,7 @@ async fn snapshot_restore_is_content_addressed_and_always_produces_undo() {
 async fn snapshot_rejects_parent_escape_and_observes_cancellation() {
 	let root = TempDir::new().expect("workspace");
 	let state = TempDir::new().expect("state");
-	std::fs::write(root.path().join("tracked.txt"), b"content").expect("fixture");
+	fs::write(root.path().join("tracked.txt"), b"content").expect("fixture");
 	let (operations, _external) = operations(&root, &state).await;
 	let cancel = CancellationToken::new();
 	assert!(
@@ -155,17 +157,17 @@ async fn snapshot_rejects_parent_escape_and_observes_cancellation() {
 async fn worktree_isolation_applies_clean_patch_and_preserves_conflict_recovery() {
 	let root = TempDir::new().expect("workspace");
 	let state = TempDir::new().expect("state");
-	std::fs::write(root.path().join("tracked.txt"), b"parent\n").expect("fixture");
+	fs::write(root.path().join("tracked.txt"), b"parent\n").expect("fixture");
 	let (operations, external) = operations(&root, &state).await;
 	let cancel = CancellationToken::new();
 	let created = operations
 		.create_worktree(&CreateWorktree { name: "agent".to_owned(), ..Default::default() }, &cancel)
 		.expect("create worktree");
-	let worktree_root = url::Url::parse(&created.root_uri)
+	let worktree_root = Url::parse(&created.root_uri)
 		.expect("root URI")
 		.to_file_path()
 		.expect("file URI");
-	std::fs::write(worktree_root.join("tracked.txt"), b"child\n").expect("child mutation");
+	fs::write(worktree_root.join("tracked.txt"), b"child\n").expect("child mutation");
 	assert_eq!(std::fs::read(root.path().join("tracked.txt")).unwrap(), b"parent\n");
 	let reopened = WorkspaceOperations::open(
 		WorkspaceHost::open(root.path()).expect("reopened workspace"),
@@ -210,13 +212,13 @@ async fn worktree_isolation_applies_clean_patch_and_preserves_conflict_recovery(
 			&cancel,
 		)
 		.expect("conflicting worktree");
-	let conflicting_root = url::Url::parse(&conflicting.root_uri)
+	let conflicting_root = Url::parse(&conflicting.root_uri)
 		.expect("conflicting root URI")
 		.to_file_path()
 		.expect("conflicting file URI");
-	std::fs::write(conflicting_root.join("tracked.txt"), b"isolated\n")
+	fs::write(conflicting_root.join("tracked.txt"), b"isolated\n")
 		.expect("isolated conflicting mutation");
-	std::fs::write(root.path().join("tracked.txt"), b"parent-diverged\n")
+	fs::write(root.path().join("tracked.txt"), b"parent-diverged\n")
 		.expect("parent conflicting mutation");
 	let conflict = reopened
 		.merge_worktree(
@@ -271,7 +273,7 @@ async fn worktree_isolation_applies_clean_patch_and_preserves_conflict_recovery(
 async fn detach_reparents_the_exact_foreground_process_without_cancelling_it() {
 	let root = TempDir::new().expect("workspace");
 	let host = ExecHost::new();
-	let cwd_uri = url::Url::from_directory_path(root.path())
+	let cwd_uri = Url::from_directory_path(root.path())
 		.expect("cwd URI")
 		.to_string();
 	let opened = host

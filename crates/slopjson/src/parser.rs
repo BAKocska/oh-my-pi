@@ -21,12 +21,13 @@
 //!   unrecognized bareword such as `{"paths": packages/foo/*}` is recovered as
 //!   a string up to the next `,` / `}` / `]` / newline.
 
-use std::ops::Range;
+use std::{mem, ops, ops::Range};
 
 use omp_core::{CowStr, IntoStr, Str, StrMut};
 use smallvec::SmallVec;
 
 use crate::{
+	PullPathSegment,
 	error::ParseError,
 	hex4, is_whitespace,
 	value::{Number, Value},
@@ -110,7 +111,7 @@ impl RepairLog {
 		&self.0
 	}
 
-	pub(crate) fn append_unique(&mut self, mut other: Self, _path: &[crate::PullPathSegment]) {
+	pub(crate) fn append_unique(&mut self, mut other: Self, _path: &[PullPathSegment]) {
 		for repair in other.0.drain(..) {
 			if !self.0.contains(&repair) {
 				self.0.push(repair);
@@ -120,7 +121,7 @@ impl RepairLog {
 	}
 }
 
-impl std::ops::Deref for RepairLog {
+impl ops::Deref for RepairLog {
 	type Target = [Repair];
 
 	fn deref(&self) -> &Self::Target {
@@ -274,7 +275,7 @@ impl<'a> Parser<'a> {
 	}
 
 	pub(crate) fn take_repairs(&mut self) -> RepairLog {
-		std::mem::take(&mut self.repairs)
+		mem::take(&mut self.repairs)
 	}
 
 	pub(crate) fn record_comma(&mut self, at: usize, trailing: bool) {
@@ -293,15 +294,15 @@ impl<'a> Parser<'a> {
 		self.repairs.as_slice()
 	}
 
-	pub(crate) fn set_repair_path(&mut self, path: &[crate::PullPathSegment]) {
+	pub(crate) fn set_repair_path(&mut self, path: &[PullPathSegment]) {
 		self.track_structure = path.is_empty();
 		self.repair_path.clear();
 		self
 			.repair_path
 			.extend(path.iter().filter_map(|segment| match segment {
-				crate::PullPathSegment::Key(key) => Some(RepairPathSegment::Key(key.clone())),
-				crate::PullPathSegment::Keys(keys) => keys.first().cloned().map(RepairPathSegment::Key),
-				crate::PullPathSegment::Index(index) => Some(RepairPathSegment::Index(*index)),
+				PullPathSegment::Key(key) => Some(RepairPathSegment::Key(key.clone())),
+				PullPathSegment::Keys(keys) => keys.first().cloned().map(RepairPathSegment::Key),
+				PullPathSegment::Index(index) => Some(RepairPathSegment::Index(*index)),
 			}));
 	}
 

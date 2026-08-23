@@ -2,12 +2,14 @@
 
 use std::{
 	collections::BTreeMap,
+	env,
 	path::{Path, PathBuf},
 	process::Stdio,
 	time::Duration,
 };
 
 use omp_core::Str;
+use tokio::{process, time};
 
 /// Environment changes emitted by `direnv export json`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -40,7 +42,7 @@ pub(crate) async fn find_envrc(start: &Path) -> Option<PathBuf> {
 pub(crate) async fn load(cwd: &Path, limit: Duration) -> Option<DirenvDelta> {
 	let envrc = find_envrc(cwd).await?;
 	let directory = envrc.parent()?;
-	let mut command = tokio::process::Command::new("direnv");
+	let mut command = process::Command::new("direnv");
 	command
 		.args(["export", "json"])
 		.current_dir(directory)
@@ -48,15 +50,10 @@ pub(crate) async fn load(cwd: &Path, limit: Duration) -> Option<DirenvDelta> {
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.kill_on_drop(true);
-	for (key, _) in
-		std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("DIRENV_"))
-	{
+	for (key, _) in env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("DIRENV_")) {
 		command.env_remove(key);
 	}
-	let output = tokio::time::timeout(limit, command.output())
-		.await
-		.ok()?
-		.ok()?;
+	let output = time::timeout(limit, command.output()).await.ok()?.ok()?;
 	if !output.status.success() {
 		return None;
 	}

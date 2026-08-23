@@ -18,11 +18,12 @@ use http_body_util::{Full, StreamBody};
 use hyper::{
 	Request, Response,
 	body::{Frame, Incoming},
+	server::conn::http1,
 	service::service_fn,
 };
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time};
 
 use super::*;
 
@@ -56,7 +57,7 @@ async fn serve(
 					let response = handler(request);
 					async move { Ok::<_, Infallible>(response) }
 				});
-				let _ = hyper::server::conn::http1::Builder::new()
+				let _ = http1::Builder::new()
 					.serve_connection(TokioIo::new(stream), service)
 					.await;
 			});
@@ -311,12 +312,12 @@ async fn rejects_declared_oversize_from_headers_without_waiting_for_body() {
 					.expect("declared-size response"),
 			)
 		});
-		let _ = hyper::server::conn::http1::Builder::new()
+		let _ = http1::Builder::new()
 			.serve_connection(TokioIo::new(stream), service)
 			.await;
 	});
 
-	let result = tokio::time::timeout(
+	let result = time::timeout(
 		Duration::from_secs(2),
 		SystemHttpClient::new()
 			.get(HttpRequest::new(format!("http://{address}/declared")).with_max_bytes(8)),
@@ -342,7 +343,7 @@ async fn rejects_a_chunked_fifty_one_mibibyte_response_at_the_hard_cap() {
 			let body = StreamBody::new(futures::stream::iter(frames));
 			Ok::<_, Infallible>(Response::new(body))
 		});
-		let _ = hyper::server::conn::http1::Builder::new()
+		let _ = http1::Builder::new()
 			.serve_connection(TokioIo::new(stream), service)
 			.await;
 	});
@@ -407,14 +408,14 @@ async fn dropping_the_get_future_cancels_an_in_flight_stream() {
 				)
 			}
 		});
-		let _ = hyper::server::conn::http1::Builder::new()
+		let _ = http1::Builder::new()
 			.serve_connection(TokioIo::new(stream), service)
 			.await;
 	});
 
 	let client = SystemHttpClient::new();
 	let mut request = Box::pin(client.get(HttpRequest::new(format!("http://{address}/pending"))));
-	tokio::time::timeout(Duration::from_secs(2), async {
+	time::timeout(Duration::from_secs(2), async {
 		tokio::select! {
 			polled = &mut polled_rx => polled.expect("server body poll signal"),
 			result = &mut request => panic!("pending response unexpectedly completed: {result:?}"),
@@ -424,7 +425,7 @@ async fn dropping_the_get_future_cancels_an_in_flight_stream() {
 	.expect("transport must begin consuming the pending body");
 	drop(request);
 
-	tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+	time::timeout(Duration::from_secs(2), dropped_rx)
 		.await
 		.expect("dropping the request future must release the response stream")
 		.expect("server body drop signal");

@@ -2,7 +2,10 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::{ExecutionExitCode, ExecutionResult, arithmetic::Evaluatable, builtins};
+use crate::{
+	Error, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions,
+	arithmetic::Evaluatable, builtins, parser::arithmetic::parse,
+};
 
 /// Evaluate arithmetic expressions.
 #[derive(Parser)]
@@ -13,12 +16,12 @@ pub(crate) struct LetCommand {
 }
 
 impl builtins::Command for LetCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let mut result = ExecutionExitCode::InvalidUsage.into();
 
 		if self.exprs.is_empty() {
@@ -27,7 +30,7 @@ impl builtins::Command for LetCommand {
 		}
 
 		for expr in &self.exprs {
-			let parsed = crate::parser::arithmetic::parse(expr.as_str())?;
+			let parsed = parse(expr.as_str())?;
 			let evaluated = parsed.eval(context.shell)?;
 
 			if evaluated == 0 {

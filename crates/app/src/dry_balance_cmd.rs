@@ -3,6 +3,7 @@
 use std::{
 	collections::{BTreeMap, hash_map::DefaultHasher},
 	hash::{Hash as _, Hasher as _},
+	sync,
 	time::SystemTime,
 };
 
@@ -14,7 +15,10 @@ use omp_inference::account::{
 };
 use serde_json::json;
 
-use crate::cli::{BenchArgs, DryBalanceArgs};
+use crate::{
+	bench_cmd, cli,
+	cli::{BenchArgs, DryBalanceArgs},
+};
 
 /// Simulates the canonical account pool and optionally benchmarks through its
 /// normal credential/receipt path.
@@ -38,7 +42,7 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 		.route(&route)
 		.map(|route| route.provider.clone())
 		.ok_or_else(|| miette!("selected model route is absent from the catalog"))?;
-	let pool = AccountPool::with_store(std::sync::Arc::new(
+	let pool = AccountPool::with_store(sync::Arc::new(
 		AccountStateStore::open(data_dir.join("credentials.db")).into_diagnostic()?,
 	))
 	.into_diagnostic()?;
@@ -56,7 +60,7 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 		// pi samples a fresh randomized session id for every attempt. Feed the
 		// same distribution into the canonical pool by making the hashed
 		// session bucket the preferred preceding account.
-		let session_id = crate::cli::turn_id();
+		let session_id = cli::turn_id();
 		let mut hasher = DefaultHasher::new();
 		session_id.hash(&mut hasher);
 		let bucket = usize::try_from(hasher.finish()).unwrap_or_default() % accounts.len();
@@ -101,7 +105,7 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 		}
 	}
 	if args.bench {
-		crate::bench_cmd::run(BenchArgs {
+		bench_cmd::run(BenchArgs {
 			model:      model.key.as_str().into(),
 			data_dir:   args.data_dir,
 			runs:       args.count,

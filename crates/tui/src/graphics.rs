@@ -4,13 +4,14 @@
 //! can refine it from replies emitted by the terminal itself without losing
 //! application input that arrives during negotiation.
 
-#[cfg(unix)]
-use std::{fs::OpenOptions, os::fd::AsFd as _};
 use std::{
+	borrow, env,
 	io::{self, IsTerminal as _, Read, Write},
-	thread,
+	str, thread,
 	time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::{fs, os::fd::AsFd as _};
 
 #[cfg(unix)]
 use nix::{
@@ -20,7 +21,9 @@ use nix::{
 };
 use strum::Display;
 
-use crate::{Graphics, escape::esc};
+#[cfg(unix)]
+use crate::tty::open;
+use crate::{Charset, Graphics, escape::esc, tty::overridden};
 
 const FORCE_IMAGE_PROTOCOL: &str = "OMP_FORCE_IMAGE_PROTOCOL";
 /// Explicit glyph-tier override: `ascii`, `unicode`, or `nerd`.
@@ -114,7 +117,7 @@ pub struct TerminalCaps {
 	pub true_color: bool,
 	/// Glyph capability tier inferred from the emulator (`OMP_TUI_CHARSET`
 	/// overrides).
-	pub charset: crate::Charset,
+	pub charset: Charset,
 	/// Safe image rendering mode.
 	pub graphics: Graphics,
 	/// Whether Kitty Unicode placeholders are trusted for this terminal.
@@ -574,7 +577,7 @@ impl ProbeParser {
 
 fn parse_u16(bytes: &[u8]) -> Option<u16> {
 	(!bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit))
-		.then(|| std::str::from_utf8(bytes).ok()?.parse().ok())
+		.then(|| str::from_utf8(bytes).ok()?.parse().ok())
 		.flatten()
 }
 
@@ -616,7 +619,7 @@ fn parse_hex_component(component: &[u8]) -> Option<u16> {
 	if !(1..=4).contains(&component.len()) || !component.iter().all(u8::is_ascii_hexdigit) {
 		return None;
 	}
-	let value = u32::from_str_radix(std::str::from_utf8(component).ok()?, 16).ok()?;
+	let value = u32::from_str_radix(str::from_utf8(component).ok()?, 16).ok()?;
 	let maximum = 16_u32.pow(u32::try_from(component.len()).ok()?) - 1;
 	u16::try_from(value * u32::from(u16::MAX) / maximum).ok()
 }
@@ -657,17 +660,14 @@ const PROBE_BATCH_NO_OSC99: &[u8] = esc!(
 )
 .as_bytes();
 
-fn materialize_probe_batch(
-	inside_tmux: bool,
-	include_osc99: bool,
-) -> std::borrow::Cow<'static, [u8]> {
+fn materialize_probe_batch(inside_tmux: bool, include_osc99: bool) -> borrow::Cow<'static, [u8]> {
 	let batch = if include_osc99 {
 		PROBE_BATCH
 	} else {
 		PROBE_BATCH_NO_OSC99
 	};
 	if !inside_tmux {
-		return std::borrow::Cow::Borrowed(batch);
+		return borrow::Cow::Borrowed(batch);
 	}
 	let mut wrapped = Vec::with_capacity(batch.len() + 16);
 	wrapped.extend_from_slice(esc!(dcs, "tmux;").as_bytes());
@@ -678,7 +678,7 @@ fn materialize_probe_batch(
 		}
 	}
 	wrapped.extend_from_slice(esc!(st).as_bytes());
-	std::borrow::Cow::Owned(wrapped)
+	borrow::Cow::Owned(wrapped)
 }
 
 /// Performs a blocking startup capability probe.
@@ -751,7 +751,7 @@ pub async fn negotiate_async(
 }
 
 fn forced_graphics_from_environment(caps: TerminalCaps) -> Option<Graphics> {
-	let vars = |name: &str| std::env::var(name).ok();
+	let vars = |name: &str| env::var(name).ok();
 	forced_protocol(&vars).map(|protocol| match protocol {
 		ForcedProtocol::Force(ImageProtocol::Kitty) if caps.kitty_placeholders => {
 			Graphics::KittyPlaceholders
@@ -769,7 +769,7 @@ fn probe_controlling_terminal(
 	inside_tmux: bool,
 	include_osc99: bool,
 ) -> Option<ProbeResults> {
-	let mut tty = crate::tty::open(OpenOptions::new().read(true).write(true)).ok()?;
+	let mut tty = open(fs::OpenOptions::new().read(true).write(true)).ok()?;
 	let original_termios = tcgetattr(&tty).ok()?;
 	let mut raw_termios = original_termios.clone();
 	cfmakeraw(&mut raw_termios);
@@ -792,7 +792,7 @@ fn probe_controlling_terminal(
 
 #[cfg(unix)]
 fn probe_polled(
-	tty: &mut std::fs::File,
+	tty: &mut fs::File,
 	timeout: Duration,
 	inside_tmux: bool,
 	include_osc99: bool,
@@ -830,9 +830,9 @@ fn probe_polled(
 /// Detects terminal graphics capabilities from the process environment.
 pub fn detect() -> TerminalCaps {
 	detect_with(
-		&|name| std::env::var(name).ok(),
+		&|name| env::var(name).ok(),
 		TerminalPlatform::current(),
-		std::io::stdout().is_terminal() || crate::tty::overridden(),
+		io::stdout().is_terminal() || overridden(),
 	)
 }
 
@@ -903,27 +903,27 @@ fn detect_terminal_id(vars: &impl Fn(&str) -> Option<String>) -> TerminalId {
 /// absent `TERM` degrades to ASCII, emulators that bundle a Nerd Font
 /// symbol fallback (glyphs render regardless of the user's configured
 /// font) get the Nerd tier, and everything else keeps plain Unicode.
-fn detect_charset(vars: &impl Fn(&str) -> Option<String>, id: TerminalId) -> crate::Charset {
+fn detect_charset(vars: &impl Fn(&str) -> Option<String>, id: TerminalId) -> Charset {
 	if let Some(forced) = value(vars, FORCE_CHARSET) {
 		match forced.trim().to_ascii_lowercase().as_str() {
-			"ascii" => return crate::Charset::Ascii,
-			"unicode" => return crate::Charset::Unicode,
-			"nerd" | "nerdfont" | "nerd-font" => return crate::Charset::NerdFont,
+			"ascii" => return Charset::Ascii,
+			"unicode" => return Charset::Unicode,
+			"nerd" | "nerdfont" | "nerd-font" => return Charset::NerdFont,
 			_ => {},
 		}
 	}
 	if value(vars, "TERM").is_none_or(|term| term.eq_ignore_ascii_case("dumb")) {
-		return crate::Charset::Ascii;
+		return Charset::Ascii;
 	}
 	match id {
 		TerminalId::Kitty | TerminalId::Ghostty | TerminalId::Wezterm | TerminalId::Warp => {
-			crate::Charset::NerdFont
+			Charset::NerdFont
 		},
 		TerminalId::Base
 		| TerminalId::TrueColor
 		| TerminalId::Iterm2
 		| TerminalId::Vscode
-		| TerminalId::Alacritty => crate::Charset::Unicode,
+		| TerminalId::Alacritty => Charset::Unicode,
 	}
 }
 
@@ -1269,14 +1269,14 @@ mod tests {
 	use std::{
 		collections::HashMap,
 		io::{self, Read, Write},
-		time::Duration,
+		time::{self, Duration},
 	};
 
 	use super::{
-		NotifyProtocol, ProbeParser, ProbeResults, TerminalCaps, TerminalPlatform, detect_from,
-		probe_terminal,
+		NotifyProtocol, ProbeParser, ProbeResults, TerminalCaps, TerminalPlatform,
+		detect as detect_runtime, detect_from, materialize_probe_batch, probe_terminal,
 	};
-	use crate::{Graphics, InputDecoder, InputEvent, Key};
+	use crate::{Color, Graphics, InputDecoder, InputEvent, Key, TerminalId, Theme, UiContext};
 
 	fn detect(entries: &[(&str, &str)], platform: TerminalPlatform) -> TerminalCaps {
 		let vars = entries.iter().copied().collect::<HashMap<_, _>>();
@@ -1315,7 +1315,7 @@ mod tests {
 		);
 		assert_eq!(forced.charset, Charset::Ascii);
 		// Context threading: apply_terminal_caps adopts the tier.
-		let ctx = crate::UiContext::default().with_terminal_caps(&ghostty);
+		let ctx = UiContext::default().with_terminal_caps(&ghostty);
 		assert_eq!(ctx.charset, Charset::NerdFont);
 	}
 
@@ -1329,18 +1329,15 @@ mod tests {
 			],
 			TerminalPlatform::MacOs,
 		);
-		assert_eq!(caps.id, crate::TerminalId::Base);
+		assert_eq!(caps.id, TerminalId::Base);
 		assert!(!caps.true_color);
 
-		let context = crate::UiContext {
-			theme: crate::Theme {
-				accent: crate::Color::Rgb(0xf5, 0xe0, 0xac),
-				..crate::Theme::default()
-			},
-			..crate::UiContext::default()
+		let context = UiContext {
+			theme: Theme { accent: Color::Rgb(0xf5, 0xe0, 0xac), ..Theme::default() },
+			..UiContext::default()
 		}
 		.with_terminal_caps(&caps);
-		assert_eq!(context.theme.accent, crate::Color::Indexed(223));
+		assert_eq!(context.theme.accent, Color::Indexed(223));
 	}
 
 	#[test]
@@ -1410,7 +1407,7 @@ mod tests {
 		assert_eq!(preserved, b"x\x1b[Ayz");
 		let mut decoder = InputDecoder::new();
 		let mut events = Vec::new();
-		decoder.feed(&preserved, std::time::Instant::now(), &mut events);
+		decoder.feed(&preserved, time::Instant::now(), &mut events);
 		assert_eq!(events, [
 			InputEvent::Key(Key::Char('x')),
 			InputEvent::Key(Key::Up),
@@ -1767,7 +1764,7 @@ mod tests {
 
 	#[test]
 	fn osc99_probe_is_omitted_inside_multiplexers() {
-		let direct = super::materialize_probe_batch(false, true);
+		let direct = materialize_probe_batch(false, true);
 		assert!(
 			direct
 				.windows(b"]99;".len())
@@ -1778,9 +1775,7 @@ mod tests {
 				.windows(b"\x1b[?5522$p".len())
 				.any(|window| window == b"\x1b[?5522$p")
 		);
-		for batch in
-			[super::materialize_probe_batch(true, false), super::materialize_probe_batch(false, false)]
-		{
+		for batch in [materialize_probe_batch(true, false), materialize_probe_batch(false, false)] {
 			assert!(!batch.windows(b"]99;".len()).any(|window| window == b"]99;"));
 		}
 	}
@@ -1874,10 +1869,10 @@ mod tests {
 		let probe = probe_terminal(&mut tty, Duration::from_millis(2));
 		assert!(probe.timed_out);
 		assert!(probe.preserved_input.is_empty());
-		let detected = super::detect();
+		let detected = detect_runtime();
 		assert_eq!(
 			tty.0,
-			super::materialize_probe_batch(
+			materialize_probe_batch(
 				detected.inside_tmux,
 				detected.notify == NotifyProtocol::Osc99 && !detected.inside_multiplexer,
 			)

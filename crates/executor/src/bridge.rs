@@ -1,12 +1,17 @@
 use std::{
 	future::Future,
+	panic,
 	pin::Pin,
+	sync::atomic,
 	task::{Context, Poll},
+	thread,
 };
+
+use tokio::{runtime, task};
 
 /// The single embedded Tokio runtime hosting Tokio-bound edge subsystems.
 pub struct TokioBridge {
-	runtime: tokio::runtime::Runtime,
+	runtime: runtime::Runtime,
 }
 
 impl TokioBridge {
@@ -17,15 +22,15 @@ impl TokioBridge {
 	#[must_use]
 	pub fn new(workers: Option<usize>) -> Self {
 		let workers = workers.unwrap_or_else(|| {
-			std::thread::available_parallelism()
+			thread::available_parallelism()
 				.map_or(2, usize::from)
 				.clamp(2, 8)
 		});
-		let next_thread = std::sync::atomic::AtomicUsize::new(0);
-		let runtime = tokio::runtime::Builder::new_multi_thread()
+		let next_thread = atomic::AtomicUsize::new(0);
+		let runtime = runtime::Builder::new_multi_thread()
 			.worker_threads(workers.max(1))
 			.thread_name_fn(move || {
-				let index = next_thread.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				let index = next_thread.fetch_add(1, atomic::Ordering::Relaxed);
 				format!("omp-io-{index}")
 			})
 			.enable_all()
@@ -36,7 +41,7 @@ impl TokioBridge {
 
 	/// Returns a handle for explicitly composing Tokio-bound edge services.
 	#[must_use]
-	pub fn handle(&self) -> tokio::runtime::Handle {
+	pub fn handle(&self) -> runtime::Handle {
 		self.runtime.handle().clone()
 	}
 
@@ -63,7 +68,7 @@ impl TokioBridge {
 /// matching an unwrapped Tokio join handle.
 #[must_use = "dropping a bridge task cancels it; await it or call detach"]
 pub struct BridgeTask<T> {
-	handle: Option<tokio::task::JoinHandle<T>>,
+	handle: Option<task::JoinHandle<T>>,
 }
 
 impl<T> BridgeTask<T> {
@@ -88,11 +93,11 @@ impl<T> Future for BridgeTask<T> {
 			},
 			Poll::Ready(Err(error)) if error.is_panic() => {
 				self.handle.take();
-				std::panic::resume_unwind(error.into_panic());
+				panic::resume_unwind(error.into_panic());
 			},
 			Poll::Ready(Err(error)) => {
 				self.handle.take();
-				panic!("Tokio bridge task was cancelled: {error}");
+				std::panic!("Tokio bridge task was cancelled: {error}");
 			},
 			Poll::Pending => Poll::Pending,
 		}

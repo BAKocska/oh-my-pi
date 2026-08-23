@@ -5,9 +5,7 @@
 //! erases into a [`Diag`] the engine can render and (when a [`PathFix`] is
 //! attached) feed to the fixer.
 
-use std::marker::PhantomData;
-use std::ops::Range;
-use std::path::Path;
+use std::{marker::PhantomData, ops::Range, path::Path};
 
 use ra_ap_syntax::{Edition, SourceFile};
 
@@ -16,11 +14,11 @@ use crate::fix::PathFix;
 /// One parsed file handed to every lint.
 pub struct FileContext<'a> {
 	/// Path the file was read from, for rendering.
-	pub path: &'a Path,
+	pub path:    &'a Path,
 	/// Full source text.
-	pub text: &'a str,
+	pub text:    &'a str,
 	/// Parsed syntax tree (errors tolerated; lints see what parsed).
-	pub tree: SourceFile,
+	pub tree:    SourceFile,
 	line_starts: Vec<usize>,
 }
 
@@ -43,7 +41,10 @@ impl<'a> FileContext<'a> {
 	/// Source text of a 1-based line, without its newline.
 	pub fn line(&self, line: usize) -> &str {
 		let start = self.line_starts[line - 1];
-		let end = self.line_starts.get(line).map_or(self.text.len(), |s| s - 1);
+		let end = self
+			.line_starts
+			.get(line)
+			.map_or(self.text.len(), |s| s - 1);
 		self.text[start..end].trim_end_matches('\r')
 	}
 }
@@ -73,8 +74,8 @@ pub trait Lint {
 /// Streaming sink: findings are erased and forwarded the moment they are
 /// pushed, so output appears while large trees are still being scanned.
 pub struct RealtimeSink<'s, D: Diagnosis> {
-	rule: &'static str,
-	out: &'s mut dyn FnMut(Diag),
+	rule:      &'static str,
+	out:       &'s mut dyn FnMut(Diag),
 	_instance: PhantomData<D>,
 }
 
@@ -92,15 +93,15 @@ impl<D: Diagnosis> RealtimeSink<'_, D> {
 /// Erased finding: what every lint's [`Diagnosis`] reduces to.
 pub struct Diag {
 	/// Owning rule id.
-	pub rule: &'static str,
+	pub rule:        &'static str,
 	/// Byte span of the offending code.
-	pub span: Range<usize>,
+	pub span:        Range<usize>,
 	/// Rendered message.
-	pub message: String,
+	pub message:     String,
 	/// Whether a fix plan is attached.
 	pub autofixable: bool,
 	/// The fix plan, consumed by the fixer.
-	pub fix: Option<PathFix>,
+	pub fix:         Option<PathFix>,
 }
 
 impl Diag {
@@ -108,13 +109,21 @@ impl Diag {
 	pub fn render(&self, ctx: &FileContext<'_>) -> String {
 		let (line, col) = ctx.position(self.span.start);
 		let source = ctx.line(line);
-		let note = if self.autofixable { "" } else { " (no autofix)" };
+		let note = if self.autofixable {
+			""
+		} else {
+			" (no autofix)"
+		};
 		// Caret line: mirror tabs so the underline aligns under any indent.
 		let mut carets = String::with_capacity(source.len());
 		for ch in source.chars().take(col - 1) {
 			carets.push(if ch == '\t' { '\t' } else { ' ' });
 		}
-		let width = self.span.len().min(source.len().saturating_sub(col - 1)).max(1);
+		let width = self
+			.span
+			.len()
+			.min(source.len().saturating_sub(col - 1))
+			.max(1);
 		carets.extend(std::iter::repeat_n('^', width));
 		format!(
 			"{}:{line}:{col}: [{}] {}{note}\n{line:>5} | {source}\n      | {carets}",
@@ -127,11 +136,18 @@ impl Diag {
 
 /// Object-safe form of [`Lint`] so the engine can hold a mixed rule set.
 pub trait AnyLint {
+	/// Stable rule id used for CLI filtering.
+	fn name(&self) -> &'static str;
+
 	/// Run detection, forwarding erased findings to `out`.
 	fn detect_erased(&self, ctx: &FileContext<'_>, out: &mut dyn FnMut(Diag));
 }
 
 impl<L: Lint> AnyLint for L {
+	fn name(&self) -> &'static str {
+		L::NAME
+	}
+
 	fn detect_erased(&self, ctx: &FileContext<'_>, out: &mut dyn FnMut(Diag)) {
 		let mut sink = RealtimeSink { rule: L::NAME, out, _instance: PhantomData };
 		self.detect(ctx, &mut sink);

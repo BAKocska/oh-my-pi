@@ -1,3 +1,7 @@
+//! Proves sealed provider declarations lower without widening trust or codec
+//! capabilities.
+
+use omp_catalog::snapshot;
 use omp_core::sf;
 use omp_driver::model_controls::{
 	ProviderControlError, ProviderDeclarationDocument, lower_provider_declaration,
@@ -105,7 +109,7 @@ fn provider_spec() -> Value {
 
 #[test]
 fn sealed_python_provider_lowers_into_resolvable_runtime_records() {
-	let base = omp_catalog::snapshot::Catalog::embedded();
+	let base = snapshot::Catalog::embedded();
 	let records = lower_provider_declaration(base, &declaration(provider_spec()))
 		.expect("lower provider declaration");
 	assert_eq!(records.provider.id.as_str(), "acme");
@@ -125,7 +129,7 @@ fn sealed_python_provider_lowers_into_resolvable_runtime_records() {
 
 #[test]
 fn lowering_rejects_trust_widening_without_mutating_the_catalog() {
-	let base = omp_catalog::snapshot::Catalog::embedded();
+	let base = snapshot::Catalog::embedded();
 	let revision = base.revision().clone();
 	let mut spec = provider_spec();
 	spec["routes"][0]["base_url"] = json!("http://api.acme.test/v1");
@@ -142,7 +146,7 @@ fn lowering_rejects_trust_widening_without_mutating_the_catalog() {
 
 #[test]
 fn lowering_refuses_codec_capability_widening() {
-	let base = omp_catalog::snapshot::Catalog::embedded();
+	let base = snapshot::Catalog::embedded();
 	let mut spec = provider_spec();
 	spec["routes"][0]["api"] = json!("openai_responses");
 	spec["models"][0]["operations"] = json!(["generate_image"]);

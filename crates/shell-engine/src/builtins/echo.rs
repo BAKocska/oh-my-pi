@@ -2,7 +2,10 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins, escape};
+use crate::{
+	Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins, builtins::try_parse_known,
+	escape,
+};
 
 /// Echo text to standard output.
 #[derive(Parser)]
@@ -26,7 +29,7 @@ pub(crate) struct EchoCommand {
 }
 
 impl builtins::Command for EchoCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
 	/// Override the default [`builtins::Command::new`] function to handle clap's
 	/// limitation related to `--`. See [`builtins::parse_known`] for more
@@ -36,17 +39,17 @@ impl builtins::Command for EchoCommand {
 	where
 		I: IntoIterator<Item = String>,
 	{
-		let (mut this, rest_args) = crate::builtins::try_parse_known::<Self>(args)?;
+		let (mut this, rest_args) = try_parse_known::<Self>(args)?;
 		if let Some(args) = rest_args {
 			this.args.extend(args);
 		}
 		Ok(this)
 	}
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let mut trailing_newline = !self.no_trailing_newline;
 		let mut s;
 		if self.interpret_backslash_escapes {

@@ -1,14 +1,14 @@
 #![cfg(unix)]
 
 use std::{
-	io,
+	fs, io,
 	path::{Path, PathBuf},
 	time::Duration,
 };
 
 use omp_docserver::daemon::{self, ServeOptions, Transport};
 use omp_envd::docs::DocumentHost;
-use tokio::{net::UnixStream, task::JoinHandle};
+use tokio::{net::UnixStream, task::JoinHandle, time};
 
 use super::{DEFAULT_TIMEOUT, within};
 use crate::{Context as _, Result, error};
@@ -32,7 +32,7 @@ impl DocServerTask {
 		let project = project.into();
 		let socket = socket.into();
 		if let Some(parent) = socket.parent() {
-			std::fs::create_dir_all(parent).context("creating docserver socket directory")?;
+			fs::create_dir_all(parent).context("creating docserver socket directory")?;
 		}
 		let task_socket = socket.clone();
 		let task = tokio::spawn(async move {
@@ -63,7 +63,7 @@ impl DocServerTask {
 						if error.kind() == io::ErrorKind::NotFound
 							|| error.kind() == io::ErrorKind::ConnectionRefused =>
 					{
-						tokio::time::sleep(Duration::from_millis(10)).await;
+						time::sleep(Duration::from_millis(10)).await;
 					},
 					Err(error) => return Err(error).context("connecting to docserver socket"),
 				}
@@ -109,7 +109,7 @@ impl Drop for DocServerTask {
 }
 
 fn remove_socket(path: &Path) -> io::Result<()> {
-	match std::fs::remove_file(path) {
+	match fs::remove_file(path) {
 		Ok(()) => Ok(()),
 		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
 		Err(error) => Err(error),

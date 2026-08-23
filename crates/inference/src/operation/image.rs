@@ -13,7 +13,7 @@ use tower::Service;
 use crate::{
 	answer::{Answer, AnswerBody, GenerationEvent, GenerationStream, ImageArtifact},
 	body::ReplayEvidence,
-	call::{ImageRequest, MediaInput, OperationCall, Setting},
+	call::{Call, ImageRequest, MediaInput, OperationCall, Setting},
 	catalog::OperationKind,
 	error::Error,
 	operation::{
@@ -302,7 +302,7 @@ impl<S> ImageService<S> {
 	}
 }
 
-impl<S> Service<crate::call::Call> for ImageService<S>
+impl<S> Service<Call> for ImageService<S>
 where
 	S: Service<
 			OperationRequest<ImageRequest>,
@@ -320,7 +320,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let request = match &call.operation {
 			OperationCall::GenerateImage(request) => Some(Arc::clone(request)),
 			_ => None,
@@ -379,7 +379,7 @@ where
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use std::{error, sync::Arc};
 
 	use bytes::Bytes;
 	use omp_core::sf;
@@ -413,10 +413,10 @@ mod tests {
 	#[test]
 	fn validation_error_preserves_typed_source_chain() {
 		let error = media_validation_error(OperationKind::GenerateImage, ImageError::EmptyPrompt);
-		let media = std::error::Error::source(&error)
+		let media = error::Error::source(&error)
 			.and_then(|source| source.downcast_ref::<MediaOperationError>())
 			.expect("typed media operation source");
-		let image = std::error::Error::source(media)
+		let image = error::Error::source(media)
 			.and_then(|source| source.downcast_ref::<ImageError>())
 			.expect("typed image source");
 		assert_eq!(image, &ImageError::EmptyPrompt);

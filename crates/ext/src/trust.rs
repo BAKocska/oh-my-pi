@@ -307,6 +307,7 @@ impl RevocationsFile {
 		let parent = path.parent().unwrap_or_else(|| Path::new("."));
 		fs::create_dir_all(parent)?;
 		let temporary = path.with_extension("json.tmp");
+
 		fs::write(&temporary, serde_json::to_vec_pretty(self).map_err(io::Error::other)?)?;
 		fs::rename(temporary, path)
 	}

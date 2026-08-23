@@ -1,6 +1,7 @@
 //! Reflected, typed settings command handlers.
 
 use std::{
+	env,
 	fs::{self, OpenOptions},
 	io,
 	path::{Path, PathBuf},
@@ -10,6 +11,7 @@ use miette::IntoDiagnostic as _;
 use omp_envd::mcp::{
 	config::McpServerConfig,
 	config_store::{McpConfigStore, set_server_enabled},
+	json_rpc,
 };
 use omp_settings::{
 	FieldDescriptor,
@@ -21,7 +23,7 @@ use crate::cli::{ConfigCommand, ConfigScope, McpConfigCommand, McpConfigScope};
 
 /// Runs a reflected settings operation against the active native roots.
 pub fn run(data_dir: &Path, command: &ConfigCommand) -> miette::Result<()> {
-	let project = std::env::current_dir().into_diagnostic()?;
+	let project = env::current_dir().into_diagnostic()?;
 	if let ConfigCommand::InitXdg { json } = command {
 		return init_xdg(data_dir, *json);
 	}
@@ -64,7 +66,7 @@ struct XdgMigrationReport {
 }
 
 fn init_xdg(data_dir: &Path, json: bool) -> miette::Result<()> {
-	let home = std::env::var_os("HOME")
+	let home = env::var_os("HOME")
 		.filter(|value| !value.is_empty())
 		.map(PathBuf::from)
 		.ok_or_else(|| miette::miette!("HOME must be set for config init-xdg"))?;
@@ -153,7 +155,7 @@ fn migrate_without_overwrite(
 		.into_diagnostic()?
 		.collect::<Result<Vec<_>, _>>()
 		.into_diagnostic()?;
-	entries.sort_by_key(std::fs::DirEntry::file_name);
+	entries.sort_by_key(fs::DirEntry::file_name);
 	for entry in entries {
 		migrate_without_overwrite(&entry.path(), &destination.join(entry.file_name()), report)?;
 	}
@@ -274,8 +276,7 @@ fn redacted_server(server: &McpServerConfig) -> serde_json::Value {
 	if let Some(url) = value.get_mut("url")
 		&& let Some(raw) = url.as_str()
 	{
-		*url =
-			serde_json::Value::String(omp_envd::mcp::json_rpc::redact_url_for_log(raw).to_string());
+		*url = serde_json::Value::String(json_rpc::redact_url_for_log(raw).to_string());
 	}
 	for map_name in ["env", "headers"] {
 		if let Some(values) = value

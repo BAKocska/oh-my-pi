@@ -1,6 +1,8 @@
 #[cfg(not(target_vendor = "apple"))]
 use std::ffi::CString;
 use std::path::PathBuf;
+#[cfg(target_vendor = "apple")]
+use std::{io, ptr};
 
 use nix::unistd::{Gid, Group, Uid, User};
 
@@ -100,15 +102,15 @@ fn get_current_user_groups() -> Result<Vec<Gid>, error::Error> {
 fn get_current_user_groups() -> Result<Vec<Gid>, error::Error> {
 	let primary = Gid::current();
 	// SAFETY: a null buffer with zero length is the documented sizing query.
-	let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+	let count = unsafe { libc::getgroups(0, ptr::null_mut()) };
 	if count < 0 {
-		return Err(std::io::Error::last_os_error().into());
+		return Err(io::Error::last_os_error().into());
 	}
 	let mut raw_groups = vec![0 as libc::gid_t; count as usize];
 	// SAFETY: `raw_groups` contains `count` writable gid_t slots.
 	let filled = unsafe { libc::getgroups(count, raw_groups.as_mut_ptr()) };
 	if filled < 0 {
-		return Err(std::io::Error::last_os_error().into());
+		return Err(io::Error::last_os_error().into());
 	}
 	raw_groups.truncate(filled as usize);
 	let mut groups: Vec<Gid> = raw_groups.into_iter().map(Gid::from_raw).collect();

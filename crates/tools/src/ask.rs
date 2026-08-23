@@ -1,6 +1,14 @@
 //! Interactive question selection with a host-provided presentation seam.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{
+	collections::HashSet,
+	error,
+	fmt::{self, Display},
+	future,
+	future::Future,
+	pin::Pin,
+	sync::Arc,
+};
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -99,14 +107,14 @@ pub enum Fault {
 		message: Str,
 	},
 }
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Invalid { message } | Self::Presenter { message } => f.write_str(message),
 		}
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// UI bridge implemented by the environment's `omp.ui.v1.UiRequest` dispatcher.
 ///
@@ -184,7 +192,7 @@ impl AskPresenter for HeadlessPresenter {
 		&'p self,
 		questions: &'p [Question],
 	) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
-		Box::pin(std::future::ready(
+		Box::pin(future::ready(
 			questions
 				.iter()
 				.map(headless_answer)
@@ -304,7 +312,6 @@ impl Tool for Ask {
 		}]
 	}
 }
-/// Checks identifiers, choices, and defaults before a host sees a request.
 /// Projects questions, options, previews, and recommendations into
 /// deterministic speech order.
 pub fn spoken_lines(questions: &[Question]) -> Vec<SpokenLine> {
@@ -328,11 +335,13 @@ pub fn spoken_lines(questions: &[Question]) -> Vec<SpokenLine> {
 	lines
 }
 
+/// Validates a nonempty request, nonempty unique identifiers, permitted option
+/// labels, and headless default indexes.
 pub fn validate(questions: &[Question]) -> Result<(), Fault> {
 	if questions.is_empty() {
 		return Err(invalid("`questions` must not be empty"));
 	}
-	let mut ids = std::collections::HashSet::new();
+	let mut ids = HashSet::new();
 	for question in questions {
 		if question.id.trim().is_empty() || !ids.insert(question.id.clone()) {
 			return Err(invalid("question ids must be non-empty and unique"));
@@ -400,7 +409,10 @@ fn protocol_issue(message: Str) -> ArgIssue {
 
 #[cfg(test)]
 mod tests {
+	use std::time::Duration;
+
 	use futures::StreamExt as _;
+	use tokio::time;
 
 	use super::*;
 	fn question(recommended: Option<usize>) -> Question {
@@ -442,7 +454,7 @@ mod tests {
 			questions: &'p [Question],
 		) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
 			Box::pin(async move {
-				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+				time::sleep(Duration::from_millis(10)).await;
 				Ok(Presentation {
 					answers:  vec![Answer {
 						id:        questions[0].id.clone(),

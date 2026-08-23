@@ -1,11 +1,14 @@
 //! Air-gap extension bundles transferred through the existing blob service.
 
+use std::str;
+
 use bytes::Bytes;
 use omp_ar::{Archive, Format, zip::Writer};
 use omp_core::{Hash32, Str, encoding::hex, sf};
 use omp_proto::blob::v1::{Chunk, GetRequest, StatRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use toml::{de, ser};
 
 use crate::{BlobDownloadEvent, ClientError, EnvClient};
 
@@ -62,10 +65,10 @@ pub enum BundleError {
 	Archive(#[from] omp_ar::Error),
 	/// The bundle manifest could not be encoded or decoded as TOML.
 	#[error(transparent)]
-	TomlDe(#[from] toml::de::Error),
+	TomlDe(#[from] de::Error),
 	/// The bundle manifest could not be encoded as TOML.
 	#[error(transparent)]
-	TomlSer(#[from] toml::ser::Error),
+	TomlSer(#[from] ser::Error),
 	/// The existing environment blob transport rejected the transfer.
 	#[error(transparent)]
 	Client(#[from] ClientError),
@@ -136,7 +139,7 @@ pub fn unpack_bundle(bytes: &[u8]) -> Result<AirgapBundle, BundleError> {
 		.remove("bundle.toml")
 		.ok_or_else(|| BundleError::Layout(sf!("bundle.toml is missing")))?;
 	let manifest = toml::from_str::<BundleManifest>(
-		std::str::from_utf8(&manifest)
+		str::from_utf8(&manifest)
 			.map_err(|_| BundleError::Layout(sf!("bundle.toml is not UTF-8")))?,
 	)?;
 	if manifest.format != BUNDLE_FORMAT {

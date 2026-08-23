@@ -17,10 +17,11 @@
 //! blob.
 
 use std::{
-	fmt,
+	fmt::{self, Display},
 	fs::{self, File, OpenOptions},
 	io::{self, Read, Write},
 	path::{Path, PathBuf},
+	process,
 	sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -66,7 +67,7 @@ impl BlobRef {
 	}
 }
 
-impl fmt::Display for BlobRef {
+impl Display for BlobRef {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.to_hex().as_str())
 	}
@@ -382,7 +383,7 @@ impl BlobStore {
 		let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 		let temporary = self
 			.tmp_dir()
-			.join(format!("{}-{sequence:016x}.wheel", std::process::id()));
+			.join(format!("{}-{sequence:016x}.wheel", process::id()));
 		fs::create_dir(&temporary)?;
 		let extracted = (|| {
 			let bytes = self.get(reference)?;
@@ -434,7 +435,7 @@ impl BlobStore {
 		fs::create_dir_all(&directory)?;
 		loop {
 			let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-			let name = format!("{}-{sequence:016x}.blob", std::process::id());
+			let name = format!("{}-{sequence:016x}.blob", process::id());
 			let path = directory.join(name);
 			match OpenOptions::new().write(true).create_new(true).open(&path) {
 				Ok(file) => return Ok((file, TemporaryPath::new(path))),
@@ -656,6 +657,7 @@ fn map_read_error(error: io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
 
 	use omp_ar::zip::Writer;
 	use tempfile::tempdir;
@@ -709,7 +711,7 @@ mod tests {
 		let directory = tempdir().unwrap();
 		let store = BlobStore::open(directory.path()).unwrap();
 		let reference = store.put(b"original").unwrap();
-		std::fs::write(store.path(&reference), b"tampered").unwrap();
+		fs::write(store.path(&reference), b"tampered").unwrap();
 
 		assert!(!store.verify(&reference).unwrap());
 	}
@@ -745,6 +747,6 @@ mod tests {
 			first.file_name().unwrap().to_string_lossy(),
 			format!("example-1.2.3-py3-none-any-{}", &reference.to_hex()[..16])
 		);
-		assert_eq!(std::fs::read(first.join("example/__init__.py")).unwrap(), b"value = 1\n");
+		assert_eq!(fs::read(first.join("example/__init__.py")).unwrap(), b"value = 1\n");
 	}
 }

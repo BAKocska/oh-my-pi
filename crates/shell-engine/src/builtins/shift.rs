@@ -1,6 +1,8 @@
 use clap::Parser;
 
-use crate::{ExecutionExitCode, ExecutionResult, builtins};
+use crate::{
+	Error, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions, builtins,
+};
 
 /// Shift positional arguments.
 #[derive(Parser)]
@@ -10,12 +12,12 @@ pub(crate) struct ShiftCommand {
 }
 
 impl builtins::Command for ShiftCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		let n = self.n.unwrap_or(1);
 
 		if n < 0 {

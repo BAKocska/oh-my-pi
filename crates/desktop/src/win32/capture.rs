@@ -1,4 +1,4 @@
-use std::{collections::HashSet, ffi::c_void};
+use std::{collections::HashSet, ffi::c_void, fmt::Display, ptr};
 
 use image::{RgbaImage, imageops};
 use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
@@ -19,7 +19,7 @@ struct MonitorSnapshot {
 	display: DesktopDisplay,
 }
 
-fn metadata_error(what: &str, error: impl std::fmt::Display) -> DesktopError {
+fn metadata_error(what: &str, error: impl Display) -> DesktopError {
 	DesktopError::capture_failed(format!("Win32 {what} query failed: {error}"))
 }
 
@@ -153,7 +153,7 @@ pub(super) fn displays(selector: &DisplaySelector) -> CoreResult<Vec<DesktopDisp
 }
 
 fn hwnd_from_id(id: u32) -> *mut c_void {
-	std::ptr::with_exposed_provenance_mut(id as usize)
+	ptr::with_exposed_provenance_mut(id as usize)
 }
 
 fn process_id(id: u32) -> Option<u32> {

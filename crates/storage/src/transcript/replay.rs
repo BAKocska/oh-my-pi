@@ -1,6 +1,6 @@
 //! Forward capsule capture and reverse native-item reconstruction.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, iter};
 
 use omp_core::Str;
 use serde_json::{Value, value::RawValue};
@@ -8,6 +8,7 @@ use smallvec::SmallVec;
 
 use crate::transcript::{
 	block::{Block, BlockKind, Replay},
+	capsule,
 	capsule::{
 		DefaultCtx, Dialect, JoinMode, Oai, Rev, diff, insert_marker, overlay, split_markers,
 	},
@@ -42,7 +43,7 @@ pub fn capture<D: Dialect + ?Sized>(
 	let dialect_id = dialect.id();
 	let dialect_name = dialect_id.0.as_str();
 	let mut assigned = vec![false; blocks.len()];
-	let mut captured = std::iter::repeat_with(|| None)
+	let mut captured = iter::repeat_with(|| None)
 		.take(blocks.len())
 		.collect::<Vec<_>>();
 	let mut placements = Vec::with_capacity(items.len().min(blocks.len()));
@@ -179,9 +180,7 @@ pub fn rebuild_cross(blocks: &[Block]) -> Vec<Value> {
 	blocks
 		.iter()
 		.filter(|block| !matches!(&block.kind, BlockKind::Opaque))
-		.map(|block| {
-			dialect.default_item(DefaultCtx::single(&block.kind), crate::transcript::capsule::REV_1)
-		})
+		.map(|block| dialect.default_item(DefaultCtx::single(&block.kind), capsule::REV_1))
 		.collect()
 }
 

@@ -9,6 +9,7 @@ use std::{
 	borrow::Cow,
 	collections::{BTreeMap, VecDeque},
 	fmt::Write as _,
+	future,
 	future::Future,
 	io::Write as _,
 	path::PathBuf,
@@ -24,7 +25,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{FutureExt, Stream, future::Either, pin_mut};
 use omp_core::{CowBytes, Str, sf};
-use omp_proto::inference::v1::{InvokeInput, invoke_input};
+use omp_proto::inference::v1::{InvokeInput, invoke_input, invoke_input::chunk};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
 	ExecEffects, IncomingParams, InferenceEffects, Interrupt, InterruptWaitError, ParamError, Part,
@@ -615,7 +616,7 @@ pub trait EvalRun: Send {
 	/// may retain the default refusal; the tool then keeps waiting in the
 	/// foreground.
 	fn detach(&self, _name: Str) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_ {
-		std::future::ready(Err(Fault::Resource {
+		future::ready(Err(Fault::Resource {
 			operation: sf!("detach"),
 			message:   sf!("eval resource does not support managed detachment"),
 		}))
@@ -668,7 +669,7 @@ pub trait EvalExec: Clone + Send + Sync + 'static {
 		&self,
 		_session: &Session,
 	) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 
 	/// Requests disposal of every persistent session owned by this executor.
@@ -1317,8 +1318,8 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 
 	fn invoke_input(&self, update: &Update, invocation_id: &str) -> Option<InvokeInput> {
 		let channel = match update.channel {
-			OutputChannel::Stdout => invoke_input::chunk::Channel::Stdout,
-			OutputChannel::Stderr => invoke_input::chunk::Channel::Stderr,
+			OutputChannel::Stdout => chunk::Channel::Stdout,
+			OutputChannel::Stderr => chunk::Channel::Stderr,
 		};
 		Some(InvokeInput {
 			invocation_id: invocation_id.to_owned(),

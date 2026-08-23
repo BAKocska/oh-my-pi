@@ -1,6 +1,9 @@
 //! Excel Open XML to deterministic Markdown conversion.
 
-use std::collections::{BTreeMap, HashMap, btree_map::Entry};
+use std::{
+	collections::{BTreeMap, HashMap, btree_map::Entry},
+	fmt::Display,
+};
 
 use omp_core::{IntoStr, Str};
 use quick_xml::events::Event;
@@ -878,7 +881,7 @@ fn entity_ahead(text: &str) -> bool {
 	index > 1 && bytes.get(index) == Some(&b';')
 }
 
-fn xml_error(error: impl std::fmt::Display) -> String {
+fn xml_error(error: impl Display) -> String {
 	format!("invalid XML: {error}")
 }
 

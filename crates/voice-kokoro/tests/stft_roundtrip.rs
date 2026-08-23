@@ -1,5 +1,7 @@
 //! Integration coverage for short-window STFT reconstruction.
 
+use std::f32::consts;
+
 use candle_core::{DType, Device, Tensor};
 use omp_voice_kokoro::istftnet::TorchSTFT;
 
@@ -10,7 +12,7 @@ fn stft_roundtrip() {
 	// Simple 440Hz sine wave, 0.1 seconds at 24kHz
 	let n = 2400;
 	let samples: Vec<f32> = (0..n)
-		.map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 24000.0).sin())
+		.map(|i| (2.0 * consts::PI * 440.0 * i as f32 / 24000.0).sin())
 		.collect();
 
 	let x = Tensor::from_vec(samples.clone(), &[1, n], &device).unwrap();

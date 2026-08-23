@@ -1,9 +1,14 @@
-use std::{fmt::Display, io::Write, path::Path};
+use std::{
+	fmt::{self, Display},
+	io::Write,
+	path::Path,
+};
 
 use clap::Parser;
 
 use crate::{
-	ExecutionResult, builtins, commands, pathsearch,
+	Error, ExecutionContext, ExecutionResult, Shell, ShellExtensions, builtins, commands,
+	pathsearch,
 	sys::{self, fs::PathExt},
 };
 
@@ -35,11 +40,11 @@ impl CommandCommand {
 }
 
 impl builtins::Command for CommandCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		// Silently exit if no command was provided.
 		if let Some(command_name) = self.command() {
@@ -83,7 +88,7 @@ enum FoundCommand {
 }
 
 impl Display for FoundCommand {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Builtin(name) => write!(f, "{name}"),
 			Self::External(path) => write!(f, "{path}"),
@@ -93,7 +98,7 @@ impl Display for FoundCommand {
 
 impl CommandCommand {
 	fn try_find_command(
-		shell: &mut crate::Shell<impl crate::ShellExtensions>,
+		shell: &mut Shell<impl ShellExtensions>,
 		command_name: &str,
 		use_default_path: bool,
 	) -> Option<FoundCommand> {
@@ -128,10 +133,10 @@ impl CommandCommand {
 
 	async fn execute_command(
 		&self,
-		mut context: crate::ExecutionContext<'_, impl crate::ShellExtensions>,
+		mut context: ExecutionContext<'_, impl ShellExtensions>,
 		command_name: &str,
 		use_default_path: bool,
-	) -> Result<ExecutionResult, crate::Error> {
+	) -> Result<ExecutionResult, Error> {
 		command_name.clone_into(&mut context.command_name);
 		let command_and_args = self.command_and_args.iter().map(|arg| arg.into()).collect();
 

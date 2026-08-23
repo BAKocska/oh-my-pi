@@ -6,7 +6,7 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures::{FutureExt, pin_mut};
@@ -14,6 +14,7 @@ use omp_core::{Str, sf};
 use omp_tool::{
 	ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef, ToolTerminal,
 };
+use tokio::{runtime, time};
 
 /// Default time a managed tool waits in the foreground before detaching.
 pub const DEFAULT_AUTO_BACKGROUND_THRESHOLD: Duration = Duration::from_secs(60);
@@ -95,15 +96,13 @@ pub enum JobWait<S, I> {
 /// Reusing the absolute deadline prevents each output frame from restarting the
 /// threshold.
 pub struct ForegroundWait {
-	deadline: std::time::Instant,
+	deadline: Instant,
 }
 
 impl ForegroundWait {
 	/// Starts a foreground wait using the shared threshold/timeout policy.
 	pub fn new(threshold: Duration, timeout: Option<Duration>) -> Self {
-		Self {
-			deadline: std::time::Instant::now() + resolve_auto_background_wait(threshold, timeout),
-		}
+		Self { deadline: Instant::now() + resolve_auto_background_wait(threshold, timeout) }
 	}
 
 	/// Races the next resource event, invocation interrupt, and absolute
@@ -113,20 +112,23 @@ impl ForegroundWait {
 		S: Future,
 		I: Future,
 	{
-		if std::time::Instant::now() >= self.deadline {
+		if Instant::now() >= self.deadline {
 			return JobWait::Background;
 		}
 		let settled = settled.fuse();
 		let interrupted = interrupted.fuse();
 		pin_mut!(settled, interrupted);
-		if tokio::runtime::Handle::try_current().is_err() {
+		if runtime::Handle::try_current().is_err() {
 			return futures::select_biased! {
 				value = settled => JobWait::Settled(value),
 				value = interrupted => JobWait::Interrupted(value),
 			};
 		}
-		let threshold =
-			tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)).fuse();
+		let threshold = {
+			use tokio::time::Instant;
+
+			time::sleep_until(Instant::from_std(self.deadline)).fuse()
+		};
 		pin_mut!(threshold);
 		futures::select_biased! {
 			value = settled => JobWait::Settled(value),

@@ -10,6 +10,7 @@ use omp_proto::thread::v1::{Item, item, part};
 use omp_tool::{Claims, Constraint, GrammarSyntax, Presentation, Registry, RegistryError, Tool};
 pub use omp_tools::{BuiltinToolIdentity, builtin_tool_identities};
 use thiserror::Error;
+use tokio::{task, time};
 
 /// Converts one native SDK tool into its provider-neutral inference
 /// declaration.
@@ -139,7 +140,7 @@ impl AutoLearnCaptureRunner {
 
 /// Sole-owner handle for one detached auto-learn capture.
 pub struct AutoLearnCaptureHandle {
-	task: tokio::task::JoinHandle<Result<(), AutoLearnCaptureError>>,
+	task: task::JoinHandle<Result<(), AutoLearnCaptureError>>,
 }
 
 impl AutoLearnCaptureHandle {
@@ -150,7 +151,7 @@ impl AutoLearnCaptureHandle {
 
 	/// Waits within `budget`, aborting work that does not settle in time.
 	pub async fn drain(mut self, budget: Duration) -> Result<(), AutoLearnCaptureDrainError> {
-		match tokio::time::timeout(budget, &mut self.task).await {
+		match time::timeout(budget, &mut self.task).await {
 			Ok(Ok(result)) => result.map_err(AutoLearnCaptureDrainError::Capture),
 			Ok(Err(source)) => Err(AutoLearnCaptureDrainError::Join { source }),
 			Err(_) => {
@@ -173,7 +174,7 @@ pub enum AutoLearnCaptureDrainError {
 	Join {
 		/// Typed Tokio task failure.
 		#[source]
-		source: tokio::task::JoinError,
+		source: task::JoinError,
 	},
 	/// The task exceeded its bounded drain window.
 	#[error("detached auto-learn capture did not settle before its drain deadline")]

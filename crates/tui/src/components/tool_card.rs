@@ -1,6 +1,7 @@
 use omp_core::{IntoStr, Str};
 
 use crate::{
+	Icon,
 	component::{Cached, Component, IntoChildren, PaintCtx, Slot, next_slot},
 	components::layout::{stack_height, stack_measure, stack_place},
 	context::UiContext,
@@ -264,7 +265,7 @@ impl Component for ToolCard {
 			ToolState::Failure => {
 				x = pc
 					.frame
-					.put(x, y, pc.ctx.charset.icon(crate::Icon::Error), header_style);
+					.put(x, y, pc.ctx.charset.icon(Icon::Error), header_style);
 			},
 		}
 		x = pc.frame.put(x, y, " ", header_style);

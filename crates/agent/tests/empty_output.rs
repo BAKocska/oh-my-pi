@@ -2,8 +2,11 @@
 
 use std::{
 	collections::VecDeque,
+	env, fs,
 	future::{Future, pending, ready},
+	mem,
 	num::NonZeroU32,
+	path::{Path, PathBuf},
 	sync::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
@@ -20,8 +23,8 @@ use omp_agent::{
 use omp_core::{Hash32, Str, sf};
 use omp_env::EnvClient;
 use omp_proto::{
-	inference::v1 as pb,
-	thread::v1::{self as thread, Item},
+	inference::v1::{self as pb, turn_error, turn_event},
+	thread::v1::{self as thread, Item, item, part},
 };
 use omp_storage::transcript::{Header, SessionId};
 use omp_tool::{CapsBase, ModelClass};
@@ -49,7 +52,7 @@ impl TurnSession for ScriptedSession {
 	fn events(
 		&mut self,
 	) -> impl futures::Stream<Item = Result<pb::TurnEvent, Error>> + Send + Unpin + '_ {
-		stream::iter(std::mem::take(&mut self.events))
+		stream::iter(mem::take(&mut self.events))
 	}
 
 	fn submit(
@@ -76,7 +79,7 @@ impl TurnClient for ScriptedClient {
 			.pop_front()
 			.expect("one script entry per turn");
 		let event = match outcome {
-			Ok(outcome) => Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) }),
+			Ok(outcome) => Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) }),
 			Err(error) => Err(Error::Terminal(error)),
 		};
 		ready(Ok(ScriptedSession { events: vec![event] }))
@@ -104,7 +107,7 @@ impl TurnClient for RecoveryClient {
 			.pop_front()
 			.expect("one script entry per turn");
 		let event = match outcome {
-			Ok(outcome) => Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) }),
+			Ok(outcome) => Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) }),
 			Err(error) => Err(Error::Terminal(error)),
 		};
 		ready(Ok(ScriptedSession { events: vec![event] }))
@@ -132,7 +135,7 @@ impl TurnClient for CrashClient {
 			if call == 0 {
 				return Ok(ScriptedSession {
 					events: vec![Err(Error::Terminal(Box::new(pb::TurnError {
-						kind: pb::turn_error::Kind::EmptyOutput as i32,
+						kind: turn_error::Kind::EmptyOutput as i32,
 						detail: "provider detail".to_owned(),
 						..pb::TurnError::default()
 					})))],
@@ -147,15 +150,17 @@ fn user_text(text: &str) -> Item {
 	Item {
 		seq:           0,
 		created_at_ms: 1,
-		kind:          Some(thread::item::Kind::Message(thread::Message {
+		kind:          Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_owned())) }],
+			parts: vec![thread::Part {
+				kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())),
+			}],
 		})),
 		props:         None,
 	}
 }
 
-fn terminal(kind: pb::turn_error::Kind) -> ScriptOutcome {
+fn terminal(kind: turn_error::Kind) -> ScriptOutcome {
 	Err(Box::new(pb::TurnError {
 		kind: kind as i32,
 		detail: "provider detail".to_owned(),
@@ -164,7 +169,7 @@ fn terminal(kind: pb::turn_error::Kind) -> ScriptOutcome {
 }
 fn rate_limited(retry_after_ms: u64) -> ScriptOutcome {
 	Err(Box::new(pb::TurnError {
-		kind: pb::turn_error::Kind::RateLimited as i32,
+		kind: turn_error::Kind::RateLimited as i32,
 		detail: "provider detail".to_owned(),
 		retry_after_ms,
 		..pb::TurnError::default()
@@ -173,7 +178,7 @@ fn rate_limited(retry_after_ms: u64) -> ScriptOutcome {
 
 fn empty_stop_terminal(code: &str, detail: &str) -> ScriptOutcome {
 	Err(Box::new(pb::TurnError {
-		kind: pb::turn_error::Kind::EmptyOutput as i32,
+		kind: turn_error::Kind::EmptyOutput as i32,
 		detail: "provider detail".to_owned(),
 		diagnostics: vec![pb::Diagnostic {
 			provider:     "provider-a".to_owned(),
@@ -199,11 +204,11 @@ fn input_texts(input: &TurnInput) -> Vec<&str> {
 	items
 		.iter()
 		.flat_map(|item| match item.kind.as_ref() {
-			Some(thread::item::Kind::Message(message)) => message.parts.as_slice(),
+			Some(item::Kind::Message(message)) => message.parts.as_slice(),
 			_ => &[],
 		})
 		.filter_map(|part| match part.kind.as_ref() {
-			Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+			Some(part::Kind::Text(text)) => Some(text.as_str()),
 			_ => None,
 		})
 		.collect()
@@ -244,12 +249,12 @@ fn turn_start(id: &str) -> TurnStart {
 		},
 	}
 }
-fn exhausted_journal(path: &std::path::Path) -> Journal {
+fn exhausted_journal(path: &Path) -> Journal {
 	let mut journal = Journal::create(path, &Header {
 		v:       4,
 		id:      SessionId(sf!("empty-output-exhausted-test")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create journal");
 	journal
@@ -290,8 +295,8 @@ fn exhausted_journal(path: &std::path::Path) -> Journal {
 
 fn agent(
 	script: Vec<ScriptOutcome>,
-) -> (Agent<ScriptedClient>, Arc<Mutex<Vec<TurnInput>>>, std::path::PathBuf) {
-	let path = std::env::temp_dir().join(format!(
+) -> (Agent<ScriptedClient>, Arc<Mutex<Vec<TurnInput>>>, PathBuf) {
+	let path = env::temp_dir().join(format!(
 		"omp-agent-empty-output-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -300,7 +305,7 @@ fn agent(
 		v:       4,
 		id:      SessionId(sf!("empty-output-test")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create journal");
 	let (agent, opened) = build_agent(journal, script);
@@ -310,7 +315,7 @@ fn agent(
 #[tokio::test]
 async fn empty_output_continues_with_numbered_user_reminder() {
 	let (mut agent, opened, path) =
-		agent(vec![terminal(pb::turn_error::Kind::EmptyOutput), Ok(success())]);
+		agent(vec![terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput), Ok(success())]);
 	let result = agent
 		.submit([user_text("original")], TurnId::new("root"))
 		.await
@@ -323,16 +328,16 @@ async fn empty_output_continues_with_numbered_user_reminder() {
 	assert!(input_texts(&opened[1]).contains(&"original"));
 	drop(opened);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn fourth_empty_output_hits_cap_after_exactly_three_reminders() {
 	let (mut agent, opened, path) = agent(vec![
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
 		Ok(success()),
 	]);
 	let error = agent
@@ -371,12 +376,12 @@ async fn fourth_empty_output_hits_cap_after_exactly_three_reminders() {
 	assert_eq!(agent.events().phase(), AgentPhase::Idle);
 	assert_eq!(opened.lock().len(), 5);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn retry_count_survives_journal_reopen() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-agent-empty-output-reopen-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -385,7 +390,7 @@ async fn retry_count_survives_journal_reopen() {
 		v:       4,
 		id:      SessionId(sf!("empty-output-reopen-test")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create journal");
 	let original = user_text("original");
@@ -419,8 +424,8 @@ async fn retry_count_survives_journal_reopen() {
 
 	let reopened = Journal::open(&path).expect("reopen journal");
 	let (mut agent, opened) = build_agent(reopened, vec![
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
 	]);
 	let error = agent
 		.submit([], TurnId::new("root"))
@@ -448,12 +453,12 @@ async fn retry_count_survives_journal_reopen() {
 	}
 	drop(opened);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn crash_after_abort_reclaims_input_under_fresh_full_reseed() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-agent-empty-output-abort-gap-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -462,7 +467,7 @@ async fn crash_after_abort_reclaims_input_under_fresh_full_reseed() {
 		v:       4,
 		id:      SessionId(sf!("empty-output-abort-gap-test")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create journal");
 	let prior_revision = thread::Revision { head: 0, token: vec![1].into() };
@@ -505,8 +510,10 @@ async fn crash_after_abort_reclaims_input_under_fresh_full_reseed() {
 		.expect("released input remains startup-visible");
 	assert_ne!(recovery_id.as_str(), "failed");
 	assert_eq!(recovery_events, &[input_event]);
-	let (mut agent, opened) =
-		build_agent(reopened, vec![terminal(pb::turn_error::Kind::EmptyOutput), Ok(success())]);
+	let (mut agent, opened) = build_agent(reopened, vec![
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		Ok(success()),
+	]);
 	agent
 		.submit([], TurnId::new("restart"))
 		.await
@@ -525,11 +532,11 @@ async fn crash_after_abort_reclaims_input_under_fresh_full_reseed() {
 	);
 	drop(opened);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 #[tokio::test]
 async fn exhausted_chain_is_not_released_and_fresh_user_prompt_resets_cap() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-agent-empty-output-exhausted-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -541,8 +548,10 @@ async fn exhausted_chain_is_not_released_and_fresh_user_prompt_resets_cap() {
 	assert_eq!(reopened.trailing_aborts(), 0);
 	assert!(reopened.pending_turn().is_none());
 	assert!(reopened.pending_input_submission().is_none());
-	let (mut agent, opened) =
-		build_agent(reopened, vec![terminal(pb::turn_error::Kind::EmptyOutput), Ok(success())]);
+	let (mut agent, opened) = build_agent(reopened, vec![
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		Ok(success()),
+	]);
 	agent
 		.submit([user_text("fresh task")], TurnId::new("fresh"))
 		.await
@@ -569,12 +578,12 @@ async fn exhausted_chain_is_not_released_and_fresh_user_prompt_resets_cap() {
 	);
 	drop(opened);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn fresh_epoch_abort_releases_only_fresh_inputs_after_reopen() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-agent-empty-output-new-epoch-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -602,8 +611,10 @@ async fn fresh_epoch_abort_releases_only_fresh_inputs_after_reopen() {
 		.expect("fresh epoch remains startup-visible");
 	assert_ne!(recovery_id.as_str(), "fresh-failed");
 	assert_eq!(events, &[fresh_event], "old exhausted inputs stay fenced");
-	let (mut agent, opened) =
-		build_agent(reopened, vec![terminal(pb::turn_error::Kind::EmptyOutput), Ok(success())]);
+	let (mut agent, opened) = build_agent(reopened, vec![
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		Ok(success()),
+	]);
 	agent
 		.submit([], TurnId::new("restart"))
 		.await
@@ -619,12 +630,12 @@ async fn fresh_epoch_abort_releases_only_fresh_inputs_after_reopen() {
 	);
 	drop(opened);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-agent-empty-output-crash-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -633,7 +644,7 @@ async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
 		v:       4,
 		id:      SessionId(sf!("empty-output-crash-test")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create journal");
 	journal
@@ -677,9 +688,9 @@ async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
 	let reopened = Journal::open(&path).expect("reopen after interrupted continuation");
 	assert_eq!(reopened.trailing_aborts(), 1);
 	let (mut replayed, opened) = build_agent(reopened, vec![
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
 	]);
 	let error = replayed
 		.submit([], TurnId::new("restart"))
@@ -707,12 +718,12 @@ async fn crash_replay_reseeds_original_input_and_preserves_retry_count() {
 	);
 	drop(opened);
 	drop(replayed);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-agent-upstream-recovery-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -721,7 +732,7 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 		v:       4,
 		id:      SessionId(sf!("upstream-recovery-test")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create journal");
 	let opened = Arc::new(Mutex::new(Vec::new()));
@@ -729,9 +740,9 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 		script: Arc::new(Mutex::new(
 			vec![
 				rate_limited(15),
-				terminal(pb::turn_error::Kind::Upstream),
-				terminal(pb::turn_error::Kind::Upstream),
-				terminal(pb::turn_error::Kind::Auth),
+				terminal(omp_proto::inference::v1::turn_error::Kind::Upstream),
+				terminal(omp_proto::inference::v1::turn_error::Kind::Upstream),
+				terminal(omp_proto::inference::v1::turn_error::Kind::Auth),
 				Ok(success()),
 			]
 			.into(),
@@ -788,7 +799,7 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 		.await
 		.expect_err("authentication failures must surface immediately");
 	assert!(matches!(&auth, AgentError::Turn(Error::Terminal(error))
-		if pb::turn_error::Kind::try_from(error.kind) == Ok(pb::turn_error::Kind::Auth)));
+		if omp_proto::inference::v1::turn_error::Kind::try_from(error.kind) == Ok(omp_proto::inference::v1::turn_error::Kind::Auth)));
 	assert_eq!(opened.lock().len(), 4, "authentication failure must not retry");
 	agent
 		.submit([user_text("fresh")], TurnId::new("next"))
@@ -796,15 +807,15 @@ async fn upstream_recovery_replays_same_turn_with_bounded_backoff_then_fails() {
 		.expect("terminally failed turns must not block later caller input");
 	assert_eq!(opened.lock()[4].0.as_str(), "next");
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn capped_billed_zero_block_stop_names_the_dropped_output_tokens() {
 	let (mut agent, _opened, path) = agent(vec![
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
 		empty_stop_terminal(omp_agent::empty_stop::BILLED_OUTPUT, "42"),
 	]);
 	let error = agent
@@ -821,15 +832,15 @@ async fn capped_billed_zero_block_stop_names_the_dropped_output_tokens() {
 		 provider-side content filter or a lossy API translation rather than a context problem"
 	);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn capped_empty_stop_without_billed_output_keeps_the_context_hint() {
 	let (mut agent, _opened, path) = agent(vec![
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
 		empty_stop_terminal(omp_agent::empty_stop::EMPTY, ""),
 	]);
 	let error = agent
@@ -845,15 +856,15 @@ async fn capped_empty_stop_without_billed_output_keeps_the_context_hint() {
 		 attachments from recent context"
 	);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[tokio::test]
 async fn capped_thought_only_stop_reports_no_final_output() {
 	let (mut agent, _opened, path) = agent(vec![
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
-		terminal(pb::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
+		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
 		empty_stop_terminal(omp_agent::empty_stop::NO_FINAL_OUTPUT, ""),
 	]);
 	let error = agent
@@ -865,5 +876,5 @@ async fn capped_thought_only_stop_reports_no_final_output() {
 	};
 	assert_eq!(error.detail, CAP_DETAIL);
 	drop(agent);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }

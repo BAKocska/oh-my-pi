@@ -1,15 +1,17 @@
 //! Environment-owned bounded workstation fact collection.
 
 use std::{
+	env, io,
 	path::{Path, PathBuf},
 	process::Stdio,
+	str,
 	sync::Arc,
 	time::Duration,
 };
 
 use omp_proto::{SCHEMA_REV, env::v1 as pb};
 use serde_json::{Value, json};
-use tokio::{io::AsyncReadExt as _, process::Command, sync::OnceCell};
+use tokio::{io::AsyncReadExt as _, process::Command, sync::OnceCell, time};
 
 const MAX_FIELD_BYTES: usize = 4 * 1024;
 const MAX_PROBE_BYTES: u64 = 256 * 1024;
@@ -95,7 +97,7 @@ async fn cpu_model() -> Option<String> {
 			.read_to_end(&mut bytes)
 			.await
 			.ok()?;
-		return parse_linux_cpu(std::str::from_utf8(&bytes).ok()?);
+		return parse_linux_cpu(str::from_utf8(&bytes).ok()?);
 	}
 	#[cfg(target_os = "macos")]
 	{
@@ -147,7 +149,7 @@ async fn run_probe(command: &str, arguments: &[&str], timeout: Duration) -> Opti
 	let stdout = child.stdout.take()?;
 	let mut limited = stdout.take(MAX_PROBE_BYTES);
 	let mut bytes = Vec::new();
-	let completed = tokio::time::timeout(timeout, async {
+	let completed = time::timeout(timeout, async {
 		let (read, status) = tokio::join!(limited.read_to_end(&mut bytes), child.wait());
 		(read, status)
 	})
@@ -237,7 +239,7 @@ async fn load_gpu_cache(path: &Path) -> Option<Arc<[String]>> {
 	Some(parsed.into())
 }
 
-async fn save_gpu_cache(path: &Path, gpus: &[String]) -> std::io::Result<()> {
+async fn save_gpu_cache(path: &Path, gpus: &[String]) -> io::Result<()> {
 	let value = if gpus.is_empty() {
 		json!({ "gpus": null })
 	} else {
@@ -268,7 +270,7 @@ fn platform_name() -> &'static str {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn platform_name() -> &'static str {
-	std::env::consts::OS
+	env::consts::OS
 }
 
 #[cfg(target_os = "macos")]
@@ -288,7 +290,7 @@ fn os_type() -> &'static str {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn os_type() -> &'static str {
-	std::env::consts::OS
+	env::consts::OS
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -303,7 +305,7 @@ fn architecture_name() -> &'static str {
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn architecture_name() -> &'static str {
-	std::env::consts::ARCH
+	env::consts::ARCH
 }
 
 fn terminal_name() -> Option<String> {
@@ -322,7 +324,7 @@ fn terminal_name() -> Option<String> {
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
-	std::env::var(name)
+	env::var(name)
 		.ok()
 		.map(|value| value.trim().to_owned())
 		.filter(|value| !value.is_empty())

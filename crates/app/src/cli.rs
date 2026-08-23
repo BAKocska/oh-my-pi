@@ -1,10 +1,14 @@
 //! Command parsing and production dispatch for the `omp` executable.
 
+#[cfg(not(feature = "local-applefm"))]
+use std::future;
 use std::{
 	ffi::OsString,
-	fmt,
-	io::IsTerminal as _,
+	fmt::{self, Display},
+	io::{self, IsTerminal as _},
+	net::SocketAddr,
 	path::{Path, PathBuf},
+	process,
 	str::FromStr,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
@@ -14,12 +18,22 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::{SecretString, Str};
+use omp_core::{SecretString, Str, encoding::hex};
+use omp_driver::{cleanse::CleanseArgs, compress::CompressArgs};
+use omp_envd::{site::TrustedModule, worker::ExtHostSpec};
 
-fn parse_cli_secret(value: &str) -> Result<SecretString, std::convert::Infallible> {
+fn parse_cli_secret(value: &str) -> Result<SecretString, convert::Infallible> {
 	Ok(SecretString::from(value))
 }
+
+use std::{convert, env, fs, time};
+
 use omp_catalog::{ModelKey, compile::compile_oracle};
+use omp_driver::bridges::{AgentGoalControl, InferenceBridge};
+use omp_envd::{
+	exthost::{ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest},
+	worker::HostKey,
+};
 #[cfg(feature = "local-applefm")]
 use omp_inference::local::applefm::{AppleFm, AppleFmEvent, AppleFmOptions};
 use omp_inference::{
@@ -31,12 +45,32 @@ use omp_inference::{
 	event::ChatEvent,
 	id::RequestId,
 	receipt::ExecutionBudget,
+	router,
 };
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncWriteExt as _, stdout};
 
 use crate::{
+	acp_mode, auth_broker_cmd, auth_cli, auth_gateway_cmd, bench_cmd, chat_cmd,
+	chat_cmd::{ChatPresentation, ChatStart},
+	cleanse_cmd, complete_cmd,
+	complete_cmd::CompletionKind,
+	completions, compress_cmd, config_cmd,
 	daemon::{DaemonConfig, DaemonHandle},
+	dry_balance_cmd,
 	endpoint::LocalEndpoint,
+	ext_cli,
+	ext_cli::ExtArgs,
+	gallery_cmd,
+	gallery_cmd::GalleryArgs,
+	gc_cmd, grep_cmd, grievances_cmd, join_cmd, models_cmd, print_mode, profile_alias, render_cmd,
+	render_cmd::RenderArgs,
+	rpc_mode, say_cmd, setup_cmd, share_cmd, smoke_test, ssh_cmd,
+	ssh_cmd::SshArgs,
+	startup_notice,
+	startup_notice::Eligibility,
+	stats_cmd, tiny_models_cmd, ttsr_cmd, update_cmd, usage_cmd,
+	usage_error::CliUsageError,
+	worktree_cmd,
 };
 
 /// Validated reasoning effort accepted by launch-shaped commands.
@@ -197,7 +231,7 @@ impl FromStr for CliDuration {
 	}
 }
 
-impl fmt::Display for CliDuration {
+impl Display for CliDuration {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}s", self.0.as_secs())
 	}
@@ -879,7 +913,7 @@ pub enum Command {
 	#[command(alias = "p")]
 	Print(PrintArgs),
 	/// Replay a durable session through the production transcript renderer.
-	Render(crate::render_cmd::RenderArgs),
+	Render(RenderArgs),
 	/// Run the stateful Content-Length framed RPC server on standard I/O.
 	Rpc(RpcArgs),
 	/// Run RPC with retained UI frame support.
@@ -898,7 +932,7 @@ pub enum Command {
 	/// Run hardware-accelerated local inference.
 	Local(LocalArgs),
 	/// Manage Python extension resolution, trust, and site trees.
-	Ext(crate::ext_cli::ExtArgs),
+	Ext(ExtArgs),
 	/// Inspect or update the schema-validated application configuration.
 	Config(ConfigArgs),
 	/// Check or install a signed native OMP release.
@@ -917,7 +951,7 @@ pub enum Command {
 	/// Inspect or apply lock-safe session and blob maintenance.
 	Gc(GcArgs),
 	/// Render native tool lifecycle cards to text or PNG fixtures.
-	Gallery(crate::gallery_cmd::GalleryArgs),
+	Gallery(GalleryArgs),
 	/// Inspect or invalidate durable provider quota observations.
 	Usage(UsageArgs),
 	/// Benchmark model TTFT, throughput, concurrency, and cold/warm cache pairs.
@@ -937,7 +971,7 @@ pub enum Command {
 	/// View, clean, or manually push reported tool issues.
 	Grievances(GrievancesArgs),
 	/// Manage scoped native SSH hosts and run bounded client operations.
-	Ssh(crate::ssh_cmd::SshArgs),
+	Ssh(SshArgs),
 	/// Inspect and test active Time-Traveling Stream Rules.
 	Ttsr(TtsrArgs),
 	/// Detect, repair, and verify native project diagnostics.
@@ -953,7 +987,7 @@ pub enum Command {
 	Complete {
 		/// Candidate class.
 		#[arg(value_enum)]
-		kind:   crate::complete_cmd::CompletionKind,
+		kind:   CompletionKind,
 		/// Optional fuzzy prefix after `--`.
 		#[arg(last = true, default_value = "")]
 		prefix: Str,
@@ -1363,10 +1397,12 @@ pub struct ChatArgs {
 	#[arg(long = "prompt-cache-key")]
 	pub prompt_cache_key:   Option<Str>,
 	#[arg(long)]
+	/// Enable the built-in Python expression-evaluation tool for this chat's
+	/// environment.
 	pub py_eval:            bool,
 	/// Deployment-authenticated exact modules admitted by the CLI boundary.
 	#[arg(skip)]
-	pub trusted_extensions: Vec<omp_envd::worker::ExtHostSpec>,
+	pub trusted_extensions: Vec<ExtHostSpec>,
 	/// Typed prompt settings and invocation overrides.
 	#[command(flatten)]
 	pub prompt_settings:    PromptArgs,
@@ -1847,7 +1883,7 @@ pub enum AuthGatewayCommand {
 	Serve {
 		/// TCP bind address.
 		#[arg(long, default_value = "127.0.0.1:4000", value_name = "HOST:PORT")]
-		bind:    std::net::SocketAddr,
+		bind:    SocketAddr,
 		/// Disable bearer auth. Accepted only for loopback binds.
 		#[arg(long)]
 		no_auth: bool,
@@ -1865,7 +1901,7 @@ pub enum AuthGatewayCommand {
 	Status {
 		/// TCP gateway address.
 		#[arg(long, default_value = "127.0.0.1:4000", value_name = "HOST:PORT")]
-		bind: std::net::SocketAddr,
+		bind: SocketAddr,
 		/// Render machine-readable output.
 		#[arg(long)]
 		json: bool,
@@ -1874,7 +1910,7 @@ pub enum AuthGatewayCommand {
 	Check {
 		/// TCP gateway address.
 		#[arg(long, default_value = "127.0.0.1:4000", value_name = "HOST:PORT")]
-		bind:   std::net::SocketAddr,
+		bind:   SocketAddr,
 		/// Bypass cached health and require a live upstream HTTP probe.
 		#[arg(long)]
 		strict: bool,
@@ -2032,18 +2068,18 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 	}
 }
 
-fn chat_start(args: &mut ChatArgs) -> crate::chat_cmd::ChatStart {
+fn chat_start(args: &mut ChatArgs) -> ChatStart {
 	if args.resume.as_deref() == Some("__omp_picker__") {
 		args.resume = None;
-		crate::chat_cmd::ChatStart::SessionIndex
+		ChatStart::SessionIndex
 	} else {
-		crate::chat_cmd::ChatStart::Session
+		ChatStart::Session
 	}
 }
 
 /// Parses the process arguments and dispatches the selected operation.
 pub async fn run() -> miette::Result<()> {
-	let cli = parse_from_os(std::env::args_os()).into_diagnostic()?;
+	let cli = parse_from_os(env::args_os()).into_diagnostic()?;
 	dispatch(cli).await
 }
 
@@ -2054,7 +2090,7 @@ pub async fn run() -> miette::Result<()> {
 )]
 pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 	let executor = omp_executor::Executor::new(None);
-	crate::startup_notice::stop_watchdog();
+	startup_notice::stop_watchdog();
 	if let Some(journal) = cli.export.as_deref() {
 		let output = journal.with_extension("html");
 		let exported = omp_driver::export::export_session(journal, &output).into_diagnostic()?;
@@ -2062,13 +2098,14 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		return Ok(());
 	}
 	if cli.smoke_test {
-		return crate::smoke_test::run().await;
+		return smoke_test::run().await;
 	}
 	if let Some(alias) = cli.alias.as_deref() {
-		let profile = cli.profile.as_deref().ok_or_else(|| {
-			crate::usage_error::CliUsageError::new("--alias requires --profile or OMP_PROFILE")
-		})?;
-		let installed = crate::profile_alias::install(alias, profile, None).into_diagnostic()?;
+		let profile = cli
+			.profile
+			.as_deref()
+			.ok_or_else(|| CliUsageError::new("--alias requires --profile or OMP_PROFILE"))?;
+		let installed = profile_alias::install(alias, profile, None).into_diagnostic()?;
 		println!(
 			"installed {} profile wrapper `{}` in {}",
 			installed.shell,
@@ -2078,7 +2115,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		return Ok(());
 	}
 	if let Some(cwd) = cli.cwd.as_deref() {
-		std::env::set_current_dir(cwd).into_diagnostic()?;
+		env::set_current_dir(cwd).into_diagnostic()?;
 	}
 	if !cli.allow_home && cli.command.is_none() && is_home_dir()? {
 		return Err(miette!(
@@ -2103,8 +2140,8 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Envd(args) => {
 			let bridges = omp_driver::bridges::builtin(
 				&args.root,
-				Arc::new(omp_driver::bridges::InferenceBridge::default()),
-				omp_driver::bridges::AgentGoalControl::default(),
+				Arc::new(InferenceBridge::default()),
+				AgentGoalControl::default(),
 				None,
 			);
 			omp_envd::run(args.into_config(), bridges).await
@@ -2112,70 +2149,70 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Chat(mut args) => {
 			args.trusted_extensions = trusted_extensions;
 			let start = chat_start(&mut args);
-			crate::startup_notice::show_once(
+			startup_notice::show_once(
 				&omp_core::dirs::data_dir(None).into_diagnostic()?,
 				args.model.as_ref(),
 				args.thinking.map(<&'static str>::from),
-				crate::startup_notice::Eligibility {
+				Eligibility {
 					resume: args.resume.is_some()
 						|| args.continue_session.is_some()
 						|| args.fork.is_some(),
 					quiet:  false,
-					timing: std::env::var_os("OMP_TIMING").is_some(),
+					timing: env::var_os("OMP_TIMING").is_some(),
 				},
 			)
 			.into_diagnostic()?;
-			Box::pin(crate::chat_cmd::run(
+			Box::pin(chat_cmd::run(
 				executor.clone(),
 				args,
 				start,
 				if gui {
-					crate::chat_cmd::ChatPresentation::Gui
+					ChatPresentation::Gui
 				} else {
-					crate::chat_cmd::ChatPresentation::Terminal
+					ChatPresentation::Terminal
 				},
 			))
 			.await
 		},
-		Command::Print(args) => crate::print_mode::run(args).await,
+		Command::Print(args) => print_mode::run(args).await,
 		Command::Render(args) => {
-			crate::render_cmd::run(args, &omp_core::dirs::data_dir(None).into_diagnostic()?)
+			render_cmd::run(args, &omp_core::dirs::data_dir(None).into_diagnostic()?)
 		},
-		Command::Rpc(args) | Command::RpcUi(args) => crate::rpc_mode::run(args).await,
-		Command::Acp(args) => crate::acp_mode::run(args).await,
+		Command::Rpc(args) | Command::RpcUi(args) => rpc_mode::run(args).await,
+		Command::Acp(args) => acp_mode::run(args).await,
 		Command::Infer(args) => infer(args).await,
-		Command::Join(args) => crate::join_cmd::run(executor, args).await,
+		Command::Join(args) => join_cmd::run(executor, args).await,
 		Command::Auth(args) => auth(args).await,
 		Command::Catalog(CatalogArgs { command: CatalogCommand::Import(args) }) => {
 			catalog_import(&args)
 		},
 		Command::Local(LocalArgs { command: LocalCommand::Infer(args) }) => local_infer(args).await,
-		Command::Ext(args) => crate::ext_cli::run(args).await,
+		Command::Ext(args) => ext_cli::run(args).await,
 		Command::Config(args) => {
-			crate::config_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args.command)
+			config_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args.command)
 		},
-		Command::Update(args) => crate::update_cmd::run(args).await,
-		Command::Registry(args) => crate::update_cmd::registry(args),
-		Command::Share(args) => crate::share_cmd::run(args).await,
-		Command::Models(args) => crate::models_cmd::run(&args).await,
+		Command::Update(args) => update_cmd::run(args).await,
+		Command::Registry(args) => update_cmd::registry(args),
+		Command::Share(args) => share_cmd::run(args).await,
+		Command::Models(args) => models_cmd::run(&args).await,
 		Command::Worktree(args) => {
-			crate::worktree_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args)
+			worktree_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args)
 		},
-		Command::Stats(args) => crate::stats_cmd::run(args).await,
-		Command::Gc(args) => crate::gc_cmd::run(args),
-		Command::Gallery(args) => crate::gallery_cmd::run(args),
-		Command::Usage(args) => crate::usage_cmd::run(args).await,
-		Command::Bench(args) => crate::bench_cmd::run(args).await,
-		Command::DryBalance(args) => crate::dry_balance_cmd::run(args).await,
-		Command::TinyModels(args) => crate::tiny_models_cmd::run(args).await,
-		Command::Setup(args) => crate::setup_cmd::run(args).await,
-		Command::Say(args) => crate::say_cmd::run(args).await,
-		Command::Grep(args) => crate::grep_cmd::run(args),
-		Command::Grievances(args) => crate::grievances_cmd::run(args).await,
-		Command::Ssh(args) => crate::ssh_cmd::run(args).await,
-		Command::Ttsr(args) => crate::ttsr_cmd::run(args),
+		Command::Stats(args) => stats_cmd::run(args).await,
+		Command::Gc(args) => gc_cmd::run(args),
+		Command::Gallery(args) => gallery_cmd::run(args),
+		Command::Usage(args) => usage_cmd::run(args).await,
+		Command::Bench(args) => bench_cmd::run(args).await,
+		Command::DryBalance(args) => dry_balance_cmd::run(args).await,
+		Command::TinyModels(args) => tiny_models_cmd::run(args).await,
+		Command::Setup(args) => setup_cmd::run(args).await,
+		Command::Say(args) => say_cmd::run(args).await,
+		Command::Grep(args) => grep_cmd::run(args),
+		Command::Grievances(args) => grievances_cmd::run(args).await,
+		Command::Ssh(args) => ssh_cmd::run(args).await,
+		Command::Ttsr(args) => ttsr_cmd::run(args),
 		Command::Cleanse(args) => {
-			crate::cleanse_cmd::run(omp_driver::cleanse::CleanseArgs {
+			cleanse_cmd::run(CleanseArgs {
 				agents:  args.agents,
 				model:   args.model,
 				tests:   args.tests,
@@ -2185,12 +2222,12 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			.await
 		},
 		Command::Completions { shell } => {
-			let bytes = crate::completions::script(shell.into());
-			std::io::Write::write_all(&mut std::io::stdout(), &bytes).into_diagnostic()
+			let bytes = completions::script(shell.into());
+			io::Write::write_all(&mut io::stdout(), &bytes).into_diagnostic()
 		},
-		Command::Complete { kind, prefix } => crate::complete_cmd::run(kind, &prefix),
+		Command::Complete { kind, prefix } => complete_cmd::run(kind, &prefix),
 		Command::Compress(args) => {
-			crate::compress_cmd::run(omp_driver::compress::CompressArgs {
+			compress_cmd::run(CompressArgs {
 				files:       args.files,
 				model:       args.model,
 				rounds:      args.rounds,
@@ -2200,8 +2237,8 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			})
 			.await
 		},
-		Command::AuthBroker(args) => crate::auth_broker_cmd::run(args).await,
-		Command::AuthGateway(args) => crate::auth_gateway_cmd::run(args).await,
+		Command::AuthBroker(args) => auth_broker_cmd::run(args).await,
+		Command::AuthGateway(args) => auth_gateway_cmd::run(args).await,
 	}
 }
 
@@ -2221,7 +2258,7 @@ pub fn parse_from_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Om
 	profile_bootstrap::remove_boundaries(&mut bootstrap.arguments);
 	let mut arguments = bootstrap.arguments;
 	normalize_hidden_command(&mut arguments);
-	if !std::io::stdin().is_terminal()
+	if !io::stdin().is_terminal()
 		&& first_positional(&arguments).is_none()
 		&& !arguments.iter().skip(1).any(|argument| {
 			matches!(argument.to_string_lossy().as_ref(), "--help" | "-h" | "--version" | "-V")
@@ -2390,10 +2427,10 @@ fn trusted_extension_path(value: &str) -> Result<omp_envd::site::TrustedModule, 
 /// inter-extension services, and CONTROL quota classes stay empty because pi
 /// supplies no deployment-owned metadata for those sets. Python registration
 /// is never promoted into an authenticated manifest.
-pub fn trusted_extension(module: omp_envd::site::TrustedModule) -> omp_envd::worker::ExtHostSpec {
-	let encoded = omp_core::encoding::hex::encode_n(module.artifact_digest.as_bytes());
+pub fn trusted_extension(module: TrustedModule) -> ExtHostSpec {
+	let encoded = hex::encode_n(module.artifact_digest.as_bytes());
 	let extension_id = Str::from(format!("trusted.{}.{}", module.module, &encoded[..16],));
-	let key = omp_envd::worker::HostKey::new("invocation", "trusted", extension_id.clone());
+	let key = HostKey::new("invocation", "trusted", extension_id.clone());
 	let provenance = omp_core::Provenance::new(
 		Str::new_static("operator-cli"),
 		extension_id,
@@ -2403,24 +2440,24 @@ pub fn trusted_extension(module: omp_envd::site::TrustedModule) -> omp_envd::wor
 		Str::new_static("trusted"),
 		1,
 	);
-	let manifest = omp_envd::exthost::ExtensionManifest::new(
+	let manifest = ExtensionManifest::new(
 		provenance,
 		module.module,
 		[],
-		omp_envd::exthost::DeclarationSet::default(),
-		omp_envd::exthost::ServiceManifest::default(),
+		DeclarationSet::default(),
+		ServiceManifest::default(),
 		[],
-		[omp_envd::exthost::ActivationTrigger::FirstReach],
+		[ActivationTrigger::FirstReach],
 	);
-	let mut extension = omp_envd::worker::ExtHostSpec::new(key, manifest);
+	let mut extension = ExtHostSpec::new(key, manifest);
 	extension.python_site = module.path.parent().map(Path::to_path_buf);
 	extension.entry_path = Some(module.path);
 	extension
 }
 
 fn is_home_dir() -> miette::Result<bool> {
-	let home = std::env::var_os("HOME").ok_or_else(|| miette!("HOME must be set"))?;
-	Ok(std::env::current_dir().into_diagnostic()? == home)
+	let home = env::var_os("HOME").ok_or_else(|| miette!("HOME must be set"))?;
+	Ok(env::current_dir().into_diagnostic()? == home)
 }
 
 async fn serve(args: ServeArgs) -> miette::Result<()> {
@@ -2440,8 +2477,7 @@ async fn infer(args: InferArgs) -> miette::Result<()> {
 	let registry = omp_driver::registry::production_registry(&data_dir, store)
 		.await
 		.into_diagnostic()?;
-	let planner =
-		omp_inference::router::Router::new(registry.clone(), std::time::Duration::from_secs(30));
+	let planner = router::Router::new(registry.clone(), time::Duration::from_secs(30));
 	let meta = CallMeta {
 		id:       RequestId::from(turn_id()),
 		target:   Target::Model(ModelKey::from(args.model)),
@@ -2455,7 +2491,7 @@ async fn infer(args: InferArgs) -> miette::Result<()> {
 		.await
 		.into_diagnostic()?;
 	let mut completed = false;
-	let mut stdout = tokio::io::stdout();
+	let mut stdout = stdout();
 	while let Some(event) = events.next().await {
 		match event.into_diagnostic()? {
 			ChatEvent::TextDelta { text, .. } => {
@@ -2525,12 +2561,12 @@ pub(crate) fn turn_id() -> String {
 		.duration_since(UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_nanos();
-	format!("omp-cli-{}-{now}", std::process::id())
+	format!("omp-cli-{}-{now}", process::id())
 }
 
 async fn auth(args: AuthArgs) -> miette::Result<()> {
 	let data = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
-	crate::auth_cli::run(data.join("credentials.db"), args.command).await
+	auth_cli::run(data.join("credentials.db"), args.command).await
 }
 
 fn catalog_import(args: &CatalogImportArgs) -> miette::Result<()> {
@@ -2540,9 +2576,9 @@ fn catalog_import(args: &CatalogImportArgs) -> miette::Result<()> {
 	{
 		return Err(miette!("catalog inputs and destination must be different files"));
 	}
-	let providers = std::fs::read_to_string(&args.providers).into_diagnostic()?;
-	let oauth = std::fs::read_to_string(&args.oauth).into_diagnostic()?;
-	let models = std::fs::read(&args.models).into_diagnostic()?;
+	let providers = fs::read_to_string(&args.providers).into_diagnostic()?;
+	let oauth = fs::read_to_string(&args.oauth).into_diagnostic()?;
+	let models = fs::read(&args.models).into_diagnostic()?;
 	let payload = compile_oracle(&providers, &models, &oauth)
 		.into_diagnostic()?
 		.normalized_json()
@@ -2552,9 +2588,9 @@ fn catalog_import(args: &CatalogImportArgs) -> miette::Result<()> {
 		.parent()
 		.filter(|path| !path.as_os_str().is_empty())
 	{
-		std::fs::create_dir_all(parent).into_diagnostic()?;
+		fs::create_dir_all(parent).into_diagnostic()?;
 	}
-	std::fs::write(&args.destination, payload).into_diagnostic()?;
+	fs::write(&args.destination, payload).into_diagnostic()?;
 	Ok(())
 }
 
@@ -2574,7 +2610,7 @@ async fn local_infer(args: LocalInferArgs) -> miette::Result<()> {
 		.stream(AppleFmOptions::new(args.prompt))
 		.into_diagnostic()?;
 	let mut completed = false;
-	let mut stdout = tokio::io::stdout();
+	let mut stdout = stdout();
 	while let Some(event) = events.next().await {
 		match event.into_diagnostic()? {
 			AppleFmEvent::Delta(text) => stdout.write_all(text.as_bytes()).await.into_diagnostic()?,
@@ -2590,16 +2626,18 @@ async fn local_infer(args: LocalInferArgs) -> miette::Result<()> {
 }
 
 #[cfg(not(feature = "local-applefm"))]
-fn local_infer(_args: LocalInferArgs) -> std::future::Ready<miette::Result<()>> {
-	std::future::ready(Err(miette!("local inference requires the `local-applefm` feature")))
+fn local_infer(_args: LocalInferArgs) -> future::Ready<miette::Result<()>> {
+	future::ready(Err(miette!("local inference requires the `local-applefm` feature")))
 }
 
 #[cfg(test)]
 mod tests {
+
 	use clap::error::ErrorKind;
 	use omp_core::sf;
 
 	use super::*;
+	use crate::ext_cli::ExtCommand;
 
 	fn parse(arguments: &[&str]) -> OmpCli {
 		OmpCli::try_parse_from(arguments).expect("valid command")
@@ -2639,8 +2677,6 @@ mod tests {
 			"01K3A0",
 			"--width",
 			"96",
-			"--height",
-			"30",
 			"--timing",
 			"--repaint",
 			"3",
@@ -2652,7 +2688,6 @@ mod tests {
 		};
 		assert_eq!(args.session.as_deref(), Some("01K3A0"));
 		assert_eq!(args.width, Some(96));
-		assert_eq!(args.height, Some(30));
 		assert!(args.timing && args.plain);
 		assert_eq!(args.repaint, Some(3));
 		assert_eq!(dispatch_target(Some(&Command::Render(args))), DispatchTarget::Render);
@@ -2818,7 +2853,7 @@ mod tests {
 	fn trusted_extension_builds_exact_startup_activation_contract() {
 		let directory = tempfile::tempdir().unwrap();
 		let path = directory.path().join("policy.py");
-		std::fs::write(&path, b"activated = True\n").unwrap();
+		fs::write(&path, b"activated = True\n").unwrap();
 
 		let extension = trusted_extension(omp_envd::site::validate_trusted_module(&path).unwrap());
 		assert_eq!(extension.manifest.entry, "policy");
@@ -2879,7 +2914,7 @@ mod tests {
 			panic!("ext command");
 		};
 		assert_eq!(args.project, PathBuf::from("."));
-		let crate::ext_cli::ExtCommand::Install(install) = args.command else {
+		let ExtCommand::Install(install) = args.command else {
 			panic!("ext install command");
 		};
 		assert_eq!(install.pool, Some(sf!("shared")));

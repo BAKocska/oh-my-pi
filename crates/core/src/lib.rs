@@ -54,7 +54,7 @@ pub use phase::{ActivateReason, InvocationPhase, LifecyclePhase, Point, PointSet
 pub use principal::{
 	ArtifactDigest, ArtifactDigestError, CredentialTier, Principal, Provenance, RemotePrincipal,
 };
-pub use secret::{ExposeSecret, Secret, SecretBox, SecretString};
+pub use secret::{ExposeSecret, Secret, SecretBox, SecretString, ct_eq};
 pub use semver::SemVer;
 pub use sparse_map::SparseMap;
 pub use sparse_set::SparseSet;

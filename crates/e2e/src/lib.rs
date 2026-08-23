@@ -5,49 +5,49 @@
 //! Scenario bodies live in integration-test targets. This crate owns only the
 //! reusable lifecycle, transport, fixture, and canonical-data support they use.
 
-use std::fmt;
+use std::{error, fmt::Display, io, result};
 
 /// Boxed error used by executable acceptance proofs.
-pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type Error = Box<dyn error::Error + Send + Sync + 'static>;
 
 /// Result used by executable acceptance proofs.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = result::Result<T, E>;
 
 /// Adds a human-readable operation label to fallible fixture setup.
 pub trait Context<T> {
 	/// Adds a fixed operation label.
-	fn context(self, context: impl fmt::Display) -> Result<T>;
+	fn context(self, context: impl Display) -> Result<T>;
 
 	/// Lazily computes an operation label.
 	fn with_context(self, context: impl FnOnce() -> String) -> Result<T>;
 }
 
-impl<T, E> Context<T> for std::result::Result<T, E>
+impl<T, E> Context<T> for result::Result<T, E>
 where
-	E: fmt::Display + Send + Sync + 'static,
+	E: Display + Send + Sync + 'static,
 {
-	fn context(self, context: impl fmt::Display) -> Result<T> {
-		self.map_err(|error| std::io::Error::other(format!("{context}: {error}")).into())
+	fn context(self, context: impl Display) -> Result<T> {
+		self.map_err(|error| io::Error::other(format!("{context}: {error}")).into())
 	}
 
 	fn with_context(self, context: impl FnOnce() -> String) -> Result<T> {
-		self.map_err(|error| std::io::Error::other(format!("{}: {error}", context())).into())
+		self.map_err(|error| io::Error::other(format!("{}: {error}", context())).into())
 	}
 }
 
 impl<T> Context<T> for Option<T> {
-	fn context(self, context: impl fmt::Display) -> Result<T> {
-		self.ok_or_else(|| std::io::Error::other(context.to_string()).into())
+	fn context(self, context: impl Display) -> Result<T> {
+		self.ok_or_else(|| io::Error::other(context.to_string()).into())
 	}
 
 	fn with_context(self, context: impl FnOnce() -> String) -> Result<T> {
-		self.ok_or_else(|| std::io::Error::other(context()).into())
+		self.ok_or_else(|| io::Error::other(context()).into())
 	}
 }
 
 /// Creates a boxed test-harness error from a displayable message.
-pub fn error(message: impl fmt::Display) -> Error {
-	std::io::Error::other(message.to_string()).into()
+pub fn error(message: impl Display) -> Error {
+	io::Error::other(message.to_string()).into()
 }
 
 /// Reusable acceptance-test infrastructure.

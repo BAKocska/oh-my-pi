@@ -428,11 +428,13 @@ fn format_subject(operation: &str, subject: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+	use std::fmt;
+
 	use super::*;
 
 	fn assert_round_trip<T>(values: &[T])
 	where
-		T: Copy + std::fmt::Debug + Eq + FromStr<Err = ParseSemconvError>,
+		T: Copy + fmt::Debug + Eq + FromStr<Err = ParseSemconvError>,
 		T: AsWireStr,
 	{
 		for &value in values {

@@ -1,3 +1,5 @@
+//! Proves policy, placement, parameter, and filesystem domains delegate with
+//! authority fences.
 use std::{
 	collections::BTreeSet,
 	sync::{

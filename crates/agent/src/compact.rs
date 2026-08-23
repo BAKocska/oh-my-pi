@@ -1,10 +1,15 @@
 //! Context compaction tiers, usage accounting, and deterministic hook verdicts.
 
+use std::{mem, time};
+
 use bytes::{Bytes, BytesMut};
 use omp_core::{Str, sf};
 use omp_proto::{
 	prost::Message as _,
-	toolhost::v1::{CompactionRequest, CompactionVerdict as WireCompactionVerdict, HookEventId},
+	toolhost::{
+		v1,
+		v1::{CompactionRequest, CompactionVerdict as WireCompactionVerdict, HookEventId},
+	},
 };
 pub use omp_storage::transcript::SupersededCompaction;
 use omp_storage::{
@@ -26,7 +31,7 @@ pub const COMPACTION_RECOVERY_BAND: f64 = 0.8;
 /// Prompt-cache suffix retained verbatim during lossless pruning.
 pub const PROMPT_CACHE_WARM_SUFFIX_TOKENS: u64 = 8_192;
 /// Idle duration after which lossless pruning is reconsidered.
-pub const IDLE_PRUNE_AFTER: std::time::Duration = std::time::Duration::from_secs(90 * 60);
+pub const IDLE_PRUNE_AFTER: time::Duration = time::Duration::from_secs(90 * 60);
 
 /// Context rescue rungs available to the ordered ladder.
 ///
@@ -310,7 +315,7 @@ impl CompactionCoordinator {
 
 	/// Discards running or armed work, returning an in-flight run to abort.
 	pub fn cancel_speculation(&mut self) -> Option<u64> {
-		let previous = std::mem::replace(&mut self.slot, SpeculationSlot::Idle);
+		let previous = mem::replace(&mut self.slot, SpeculationSlot::Idle);
 		match previous {
 			SpeculationSlot::Running(request) => Some(request.run_id),
 			SpeculationSlot::Idle | SpeculationSlot::Armed(_) => None,
@@ -398,7 +403,7 @@ impl CompactionCoordinator {
 
 		let method = options.enabled.then(|| order.speculation_tier()).flatten();
 		if matches!(&self.slot, SpeculationSlot::Armed(_)) {
-			let armed = match std::mem::replace(&mut self.slot, SpeculationSlot::Idle) {
+			let armed = match mem::replace(&mut self.slot, SpeculationSlot::Idle) {
 				SpeculationSlot::Armed(result) => result,
 				SpeculationSlot::Idle | SpeculationSlot::Running(_) => unreachable!(),
 			};
@@ -710,7 +715,7 @@ pub enum CompactionBoundary {
 	/// The session became idle at the supplied instant.
 	Idle {
 		/// Time elapsed since the last activity.
-		elapsed: std::time::Duration,
+		elapsed: time::Duration,
 	},
 }
 
@@ -1100,9 +1105,9 @@ pub struct CompactionEvent {
 	/// Suggested first retained item id.
 	pub suggested_first_kept: Str,
 	/// Wire body-free refs selected for summarization.
-	pub to_summarize:         Vec<omp_proto::toolhost::v1::MessageRef>,
+	pub to_summarize:         Vec<v1::MessageRef>,
 	/// Wire body-free refs retained verbatim.
-	pub to_retain:            Vec<omp_proto::toolhost::v1::MessageRef>,
+	pub to_retain:            Vec<v1::MessageRef>,
 	/// Whether the suggested cut divides a turn.
 	pub split_turn:           bool,
 	/// Text of the preceding durable compact summary.
@@ -1505,8 +1510,8 @@ mod tests {
 		COMPACTION_RECOVERY_BAND, Compact, CompactionCoordinator, CompactionDecision,
 		CompactionHysteresis, CompactionMethodOrder, CompactionSpeculationOptions, CompactionTier,
 		CompactionVerdict, ContextUsage, CustomSummary, ItemUsage, ProjectionItem,
-		SPECULATION_LEAD_MIN_TOKENS, SpeculationResult, SpeculationState,
-		back_project_provider_usage, plan_lossless, resolve_verdicts,
+		SPECULATION_LEAD_MIN_TOKENS, SpeculationRequest, SpeculationResult, SpeculationState,
+		back_project_provider_usage, plan_lossless_with_warm_suffix, resolve_verdicts,
 	};
 	use crate::hooks::SourceRef;
 
@@ -1523,7 +1528,7 @@ mod tests {
 	}
 
 	fn speculative_compact(
-		request: &super::SpeculationRequest,
+		request: &SpeculationRequest,
 		summary: &'static str,
 	) -> SpeculationResult {
 		SpeculationResult {
@@ -1780,7 +1785,7 @@ mod tests {
 		};
 		let pruned = ProjectionItem { event: 2, useless: true, ..retained };
 		let projection = [retained, pruned];
-		let plan = super::plan_lossless_with_warm_suffix(&projection, 0, |_| false);
+		let plan = plan_lossless_with_warm_suffix(&projection, 0, |_| false);
 		assert_eq!(plan.prune, vec![2]);
 		assert_eq!(projection[0], retained);
 	}

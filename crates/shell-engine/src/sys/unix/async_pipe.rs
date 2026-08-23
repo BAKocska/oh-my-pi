@@ -1,14 +1,14 @@
 //! Async pipe reading utilities for Unix.
 
-use std::{io, os::unix::io::OwnedFd};
+use std::{fs, io, os::unix::io::OwnedFd};
 
-use tokio::net::unix::pipe;
+use tokio::net::unix::pipe::Receiver;
 
-pub(crate) struct AsyncPipeReader(pipe::Receiver);
+pub(crate) struct AsyncPipeReader(Receiver);
 
 impl AsyncPipeReader {
-	pub(crate) fn new(reader: std::io::PipeReader) -> io::Result<Self> {
-		Ok(Self(pipe::Receiver::from_file(std::fs::File::from(OwnedFd::from(reader)))?))
+	pub(crate) fn new(reader: io::PipeReader) -> io::Result<Self> {
+		Ok(Self(Receiver::from_file(fs::File::from(OwnedFd::from(reader)))?))
 	}
 
 	pub(crate) async fn read_to_string(&mut self) -> io::Result<String> {

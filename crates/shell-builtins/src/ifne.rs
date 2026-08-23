@@ -9,8 +9,10 @@
 use std::{
 	ffi::OsString,
 	io::{self, ErrorKind, Read, Write},
+	process,
 	process::{Command, Stdio},
 	sync::atomic::{AtomicBool, Ordering},
+	thread,
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, builder::ValueParser};
@@ -138,7 +140,7 @@ fn spawn_and_pump(host: &mut Host, command: &[OsString], first: Option<u8>) -> i
 	// Drain both child output streams while pumping its input, so no pipe can
 	// fill and deadlock the others. The buffers are forwarded to the host after
 	// the child exits; its in-process streams must never be inherited directly.
-	let (out_buf, err_buf, pump) = std::thread::scope(|scope| {
+	let (out_buf, err_buf, pump) = thread::scope(|scope| {
 		let out = scope.spawn(move || {
 			let mut buf = Vec::new();
 			let _ = child_stdout.read_to_end(&mut buf);
@@ -217,7 +219,7 @@ fn copy_cancellable(
 }
 
 /// Maps a child exit status to its code, or `128 + signal` on Unix.
-fn exit_code(status: std::process::ExitStatus) -> i32 {
+fn exit_code(status: process::ExitStatus) -> i32 {
 	if let Some(code) = status.code() {
 		return code;
 	}
@@ -238,11 +240,13 @@ pub(crate) fn ifne_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
+	use std::env;
+
 	use super::Ifne;
 	use crate::host::run_util;
 
 	fn run_in(stdin: &str, args: &[&str]) -> (i32, String, String) {
-		let (code, capture) = run_util::<Ifne>(args, stdin, std::env::temp_dir());
+		let (code, capture) = run_util::<Ifne>(args, stdin, env::temp_dir());
 		(code, capture.out(), capture.err())
 	}
 

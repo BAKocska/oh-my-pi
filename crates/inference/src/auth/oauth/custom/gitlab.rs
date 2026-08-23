@@ -1,5 +1,5 @@
 use std::{
-	fmt,
+	fmt, mem,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -13,8 +13,8 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::super::{
-	FormValue, callback_code, form_request, parse_http_url, provider_error, receive_callback_input,
-	start_callback_server,
+	FormValue, OAuthHttpResponse as SuperOAuthHttpResponse, callback_code, form_request,
+	parse_http_url, provider_error, receive_callback_input, start_callback_server,
 };
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
@@ -242,7 +242,7 @@ fn external_callback_code(
 		Zeroizing::new(String::with_capacity("https://oauth-callback.invalid/".len() + suffix.len()));
 	compatible.push_str("https://oauth-callback.invalid/");
 	compatible.push_str(suffix);
-	let compatible = SecretString::from(std::mem::take(&mut *compatible));
+	let compatible = SecretString::from(mem::take(&mut *compatible));
 	callback_code(&compatible, expected_state)
 }
 
@@ -255,7 +255,7 @@ struct GitlabTokenResponse {
 }
 
 fn gitlab_token_response(
-	response: super::super::OAuthHttpResponse,
+	response: SuperOAuthHttpResponse,
 	now: SystemTime,
 	fallback_refresh: Option<SecretString>,
 ) -> Result<OAuthTokenSet, OAuthError> {

@@ -1,10 +1,14 @@
 //! App-owned workspace adapter for the generic grep and glob executors.
 
 use std::{
+	cmp,
 	collections::{HashMap, HashSet, VecDeque},
-	fmt,
+	fmt::{self, Display},
+	fs,
 	future::Future,
+	io,
 	path::{Component, Path, PathBuf},
+	sync,
 	time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -27,9 +31,13 @@ use omp_walker::{
 	CompiledWalkGlob, FileType, FollowLinks, SizeHintPolicy, WalkDecision, WalkDetail, WalkError,
 	WalkFilter, WalkOrder, WalkRequest,
 };
+use tokio::{task, time};
 use tokio_util::sync::CancellationToken;
 
-use super::{docs::DocumentHost, tool_read_sources::ReadSourceAdapter, workspace::WorkspaceHost};
+use super::{
+	docs::DocumentHost, tool_read_sources::ReadSourceAdapter, tool_url::UrlResolver,
+	workspace::WorkspaceHost,
+};
 
 const CANCELLED_REASON: &str = "workspace traversal future was dropped";
 const SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -41,7 +49,7 @@ pub struct WorkspaceSearchAdapter {
 	host:         WorkspaceHost,
 	documents:    DocumentHost,
 	read_sources: ReadSourceAdapter,
-	resolvers:    std::sync::Arc<ResolverTable<super::tool_url::UrlResolver>>,
+	resolvers:    sync::Arc<ResolverTable<UrlResolver>>,
 }
 
 impl WorkspaceSearchAdapter {
@@ -51,7 +59,7 @@ impl WorkspaceSearchAdapter {
 		host: WorkspaceHost,
 		documents: DocumentHost,
 		read_sources: ReadSourceAdapter,
-		resolvers: std::sync::Arc<ResolverTable<super::tool_url::UrlResolver>>,
+		resolvers: sync::Arc<ResolverTable<UrlResolver>>,
 	) -> Self {
 		Self { host, documents, read_sources, resolvers }
 	}
@@ -72,7 +80,7 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 				.unwrap_or_else(Instant::now);
 			let external =
 				materialize_external_roots(&host, &read_sources, &request, deadline, &cancel).await?;
-			let operation = tokio::task::spawn_blocking(move || {
+			let operation = task::spawn_blocking(move || {
 				search_blocking(&host, request, external, deadline, &cancel)
 			});
 			let result = operation.await.map_err(|error| grep::Fault::Workspace {
@@ -106,8 +114,7 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 		async move {
 			let cancel = CancellationToken::new();
 			let cancel_on_drop = CancelOnDrop(cancel.clone());
-			let operation =
-				tokio::task::spawn_blocking(move || glob_blocking(&host, request, &cancel));
+			let operation = task::spawn_blocking(move || glob_blocking(&host, request, &cancel));
 			let result = operation.await.map_err(|error| glob::Fault::Workspace {
 				message: Str::from(format!("workspace walk task failed: {error}")),
 			})?;
@@ -120,7 +127,7 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 		&self,
 		request: glob::WalkRequest,
 	) -> impl Future<Output = Option<Result<WalkResult, glob::Fault>>> + Send + '_ {
-		let resolvers = std::sync::Arc::clone(&self.resolvers);
+		let resolvers = sync::Arc::clone(&self.resolvers);
 		async move {
 			if !request.path.as_str().split(';').any(|target| {
 				target.trim().to_ascii_lowercase().starts_with("ssh://")
@@ -134,7 +141,7 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 }
 
 async fn resource_glob(
-	resolvers: &ResolverTable<super::tool_url::UrlResolver>,
+	resolvers: &ResolverTable<UrlResolver>,
 	request: glob::WalkRequest,
 ) -> Result<WalkResult, glob::Fault> {
 	let mut matches = Vec::new();
@@ -193,7 +200,7 @@ async fn resource_glob(
 			};
 			let listed = match listed {
 				Ok(value) => value,
-				Err(error) if !listed_any => {
+				Err(_) if !listed_any => {
 					missing_paths.push(Str::new(target));
 					break;
 				},
@@ -274,12 +281,10 @@ async fn materialize_external_roots(
 		match root.kind {
 			SearchRootKind::Filesystem => {},
 			SearchRootKind::Archive => {
-				let archive = tokio::time::timeout(
-					remaining,
-					materialize_archive_root(host, sources, root, root_index),
-				)
-				.await
-				.map_err(|_| grep::Fault::TimedOut)?;
+				let archive =
+					time::timeout(remaining, materialize_archive_root(host, sources, root, root_index))
+						.await
+						.map_err(|_| grep::Fault::TimedOut)?;
 				match archive {
 					Ok((targets, unreadable)) => {
 						if !targets.is_empty() {
@@ -293,10 +298,9 @@ async fn materialize_external_roots(
 				}
 			},
 			SearchRootKind::Url => {
-				let target =
-					tokio::time::timeout(remaining, materialize_url_root(sources, root, root_index))
-						.await
-						.map_err(|_| grep::Fault::TimedOut)??;
+				let target = time::timeout(remaining, materialize_url_root(sources, root, root_index))
+					.await
+					.map_err(|_| grep::Fault::TimedOut)??;
 				materialized.by_root.insert(root_index, vec![target]);
 			},
 		}
@@ -331,7 +335,7 @@ async fn materialize_archive_root(
 		};
 		let archive_key = Str::from(archive_path.to_string_lossy().into_owned());
 		let root = root.clone();
-		return tokio::task::spawn_blocking(move || {
+		return task::spawn_blocking(move || {
 			materialize_archive_bytes(&root, root_index, candidate, archive_key, bytes)
 		})
 		.await
@@ -515,8 +519,7 @@ fn search_blocking(
 		let (display_path, glob) = match target {
 			GrepTarget::Filesystem { path, glob, is_file, .. } => {
 				if *is_file
-					&& std::fs::metadata(path)
-						.is_ok_and(|metadata| metadata.len() > omp_grep::MAX_FILE_BYTES)
+					&& fs::metadata(path).is_ok_and(|metadata| metadata.len() > omp_grep::MAX_FILE_BYTES)
 				{
 					oversized_files.push(workspace_relative(host.root(), path)?);
 				}
@@ -571,7 +574,7 @@ fn search_blocking(
 					} else {
 						path.join(matched.path.as_str())
 					};
-					let canonical = std::fs::canonicalize(&source_path).unwrap_or(source_path);
+					let canonical = fs::canonicalize(&source_path).unwrap_or(source_path);
 					let source_key = Str::from(canonical.to_string_lossy().into_owned());
 					pending_snapshots
 						.entry(source_key.clone())
@@ -629,12 +632,12 @@ fn resolve_literal_grep_target(
 ) -> Result<Option<GrepTarget>, grep::Fault> {
 	let input = normalize_input(input);
 	let literal = resolve_input_path(host.root(), &input);
-	let metadata = match std::fs::metadata(&literal) {
+	let metadata = match fs::metadata(&literal) {
 		Ok(metadata) => metadata,
 		Err(error) if is_missing(&error) => return Ok(None),
 		Err(error) => return Err(grep_workspace_message(error)),
 	};
-	let canonical = std::fs::canonicalize(&literal).map_err(grep_workspace_message)?;
+	let canonical = fs::canonicalize(&literal).map_err(grep_workspace_message)?;
 	Ok(Some(GrepTarget::Filesystem {
 		root_index: 0,
 		path:       canonical,
@@ -649,9 +652,9 @@ fn resolve_grep_target(
 ) -> Result<Option<GrepTarget>, grep::Fault> {
 	let input = normalize_input(input);
 	let literal = resolve_input_path(host.root(), &input);
-	match std::fs::metadata(&literal) {
+	match fs::metadata(&literal) {
 		Ok(metadata) => {
-			let canonical = std::fs::canonicalize(&literal).map_err(grep_workspace_message)?;
+			let canonical = fs::canonicalize(&literal).map_err(grep_workspace_message)?;
 			return Ok(Some(GrepTarget::Filesystem {
 				root_index: 0,
 				path:       canonical,
@@ -666,12 +669,12 @@ fn resolve_grep_target(
 		return Ok(None);
 	};
 	let base = resolve_input_path(host.root(), &parsed.base);
-	let metadata = match std::fs::metadata(&base) {
+	let metadata = match fs::metadata(&base) {
 		Ok(metadata) => metadata,
 		Err(error) if is_missing(&error) => return Ok(None),
 		Err(error) => return Err(grep_workspace_message(error)),
 	};
-	let canonical = std::fs::canonicalize(&base).map_err(grep_workspace_message)?;
+	let canonical = fs::canonicalize(&base).map_err(grep_workspace_message)?;
 	if !metadata.is_dir() {
 		return Ok(None);
 	}
@@ -684,11 +687,11 @@ fn resolve_grep_target(
 }
 
 fn prepare_grep_snapshot(source_key: Str, path: &Path) -> Option<SearchSnapshot> {
-	let metadata = std::fs::metadata(path).ok()?;
+	let metadata = fs::metadata(path).ok()?;
 	if metadata.len() > SNAPSHOT_MAX_BYTES {
 		return None;
 	}
-	let bytes = Bytes::from(std::fs::read(path).ok()?);
+	let bytes = Bytes::from(fs::read(path).ok()?);
 	let revision = Bytes::copy_from_slice(Hash32::sum(&bytes).as_bytes());
 	Some(SearchSnapshot { source_key, revision, bytes })
 }
@@ -799,7 +802,7 @@ fn glob_blocking(
 			return Err(glob::Fault::RootSearch);
 		}
 		let literal_path = resolve_input_path(host.root(), &input);
-		let (parsed, metadata, target_path) = match std::fs::metadata(&literal_path) {
+		let (parsed, metadata, target_path) = match fs::metadata(&literal_path) {
 			Ok(metadata) => (
 				FindPattern { base: input.clone(), pattern: "**/*".to_owned(), has_glob: false },
 				metadata,
@@ -811,7 +814,7 @@ fn glob_blocking(
 					return Err(glob::Fault::RootSearch);
 				}
 				let target_path = resolve_input_path(host.root(), &parsed.base);
-				match std::fs::metadata(&target_path) {
+				match fs::metadata(&target_path) {
 					Ok(metadata) => (parsed, metadata, target_path),
 					Err(error) if is_missing(&error) => {
 						missing_paths.push(Str::from(input));
@@ -822,7 +825,7 @@ fn glob_blocking(
 			},
 			Err(error) => return Err(glob_workspace_message(error)),
 		};
-		let canonical = std::fs::canonicalize(&target_path).map_err(glob_workspace_message)?;
+		let canonical = fs::canonicalize(&target_path).map_err(glob_workspace_message)?;
 		// Walk the canonical root, but retain an external absolute root's
 		// caller-visible spelling (notably `/var` versus `/private/var` on macOS) for
 		// result projection. Normalize only lexical `.`/`..` components so equivalent
@@ -928,7 +931,7 @@ fn glob_blocking(
 #[derive(Debug)]
 struct GlobTarget {
 	parsed:       FindPattern,
-	metadata:     std::fs::Metadata,
+	metadata:     fs::Metadata,
 	canonical:    PathBuf,
 	visible_root: Option<PathBuf>,
 }
@@ -947,7 +950,7 @@ enum WalkStop {
 	Workspace(Str),
 }
 
-impl fmt::Display for WalkStop {
+impl Display for WalkStop {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Cancelled => formatter.write_str("cancelled"),
@@ -1039,7 +1042,7 @@ fn retain_ranked(matches: &mut Vec<WalkMatch>, candidate: WalkMatch, limit: usiz
 	}
 }
 
-fn compare_glob_rank(left: &WalkMatch, right: &WalkMatch) -> std::cmp::Ordering {
+fn compare_glob_rank(left: &WalkMatch, right: &WalkMatch) -> cmp::Ordering {
 	left
 		.modified_ms
 		.cmp(&right.modified_ms)
@@ -1052,7 +1055,7 @@ fn split_glob_inputs(host: &WorkspaceHost, raw: &str) -> Result<Vec<String>, glo
 		return Err(glob::Fault::EmptyPath);
 	}
 	if !normalized.contains(';')
-		|| std::fs::metadata(resolve_input_path(host.root(), &normalized)).is_ok()
+		|| fs::metadata(resolve_input_path(host.root(), &normalized)).is_ok()
 	{
 		return Ok(vec![normalized]);
 	}
@@ -1123,7 +1126,7 @@ fn lexical_normalize_absolute(path: &Path) -> PathBuf {
 	normalized
 }
 
-fn is_missing(error: &std::io::Error) -> bool {
+fn is_missing(error: &io::Error) -> bool {
 	matches!(
 		error.kind(),
 		std::io::ErrorKind::NotFound
@@ -1143,7 +1146,7 @@ fn glob_display_path(
 	canonical_root: &Path,
 	visible_root: Option<&Path>,
 	path: &Path,
-) -> Result<String, std::io::Error> {
+) -> Result<String, io::Error> {
 	if path.strip_prefix(workspace_root).is_ok() {
 		return workspace_relative_raw(workspace_root, path);
 	}
@@ -1151,8 +1154,8 @@ fn glob_display_path(
 		return workspace_relative_raw(workspace_root, path);
 	};
 	let relative = path.strip_prefix(canonical_root).map_err(|_| {
-		std::io::Error::new(
-			std::io::ErrorKind::PermissionDenied,
+		io::Error::new(
+			io::ErrorKind::PermissionDenied,
 			"glob result escaped the canonical traversal root",
 		)
 	})?;
@@ -1162,7 +1165,7 @@ fn glob_display_path(
 		.replace('\\', "/"))
 }
 
-fn workspace_relative_raw(root: &Path, path: &Path) -> Result<String, std::io::Error> {
+fn workspace_relative_raw(root: &Path, path: &Path) -> Result<String, io::Error> {
 	let Ok(relative) = path.strip_prefix(root) else {
 		return Ok(path.to_string_lossy().replace('\\', "/"));
 	};
@@ -1177,8 +1180,8 @@ fn workspace_relative_raw(root: &Path, path: &Path) -> Result<String, std::io::E
 				normalized.push_str(&component.to_string_lossy());
 			},
 			Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::PermissionDenied,
+				return Err(io::Error::new(
+					io::ErrorKind::PermissionDenied,
 					"path is outside the workspace",
 				));
 			},
@@ -1187,7 +1190,7 @@ fn workspace_relative_raw(root: &Path, path: &Path) -> Result<String, std::io::E
 	Ok(normalized)
 }
 
-fn modified_millis(metadata: &std::fs::Metadata) -> u64 {
+fn modified_millis(metadata: &fs::Metadata) -> u64 {
 	metadata
 		.modified()
 		.ok()
@@ -1207,11 +1210,11 @@ fn float_millis(value: f64) -> u64 {
 	}
 }
 
-fn grep_workspace_message(error: impl fmt::Display) -> grep::Fault {
+fn grep_workspace_message(error: impl Display) -> grep::Fault {
 	grep::Fault::Workspace { message: Str::from(error.to_string()) }
 }
 
-fn glob_workspace_message(error: impl fmt::Display) -> glob::Fault {
+fn glob_workspace_message(error: impl Display) -> glob::Fault {
 	glob::Fault::Workspace { message: Str::from(error.to_string()) }
 }
 
@@ -1229,34 +1232,38 @@ fn cancelled_glob() -> glob::Fault {
 
 #[cfg(test)]
 mod tests {
+	use std::future;
+
 	use omp_core::sf;
 	use omp_docserver::{
 		Environment, ServerConfig,
 		connection::{ConnectionConfig, serve_connection},
 	};
-	use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+	use omp_tools::read::web::types::WebError;
+	use tokio::{
+		io::{AsyncReadExt as _, AsyncWriteExt as _, duplex},
+		net::TcpListener,
+	};
 
 	use super::*;
+	use crate::document_cache::project_document_cache;
 
 	async fn connected_search_adapter(root: &Path) -> WorkspaceSearchAdapter {
 		let config = ServerConfig::new(root).expect("docserver config");
 		let environment = Environment::new(config).expect("document authority");
-		let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+		let (client_stream, server_stream) = duplex(256 * 1024);
 		tokio::spawn(serve_connection(environment, server_stream, ConnectionConfig::default()));
 		let documents = DocumentHost::connect(client_stream)
 			.await
 			.expect("document hello");
 		let workspace = WorkspaceHost::open(root).expect("workspace host");
-		let read_sources = crate::tool_read_sources::ReadSourceAdapter::new(
-			documents.clone(),
-			workspace.clone(),
-			crate::document_cache::project_document_cache(root),
-		);
+		let read_sources =
+			ReadSourceAdapter::new(documents.clone(), workspace.clone(), project_document_cache(root));
 		WorkspaceSearchAdapter::new(
 			workspace,
 			documents,
 			read_sources,
-			std::sync::Arc::new(ResolverTable::default()),
+			sync::Arc::new(ResolverTable::default()),
 		)
 	}
 
@@ -1318,8 +1325,8 @@ mod tests {
 		let parent = tempfile::tempdir().expect("parent directory");
 		let workspace = parent.path().join("workspace");
 		let external = parent.path().join("external.txt");
-		std::fs::create_dir(&workspace).expect("workspace directory");
-		std::fs::write(&external, "alpha\nneedle\nomega\n").expect("external file");
+		fs::create_dir(&workspace).expect("workspace directory");
+		fs::write(&external, "alpha\nneedle\nomega\n").expect("external file");
 		let host = WorkspaceHost::open(&workspace).expect("workspace host");
 		let target = resolve_grep_target(&host, external.to_str().expect("UTF-8 external path"))
 			.expect("resolve target")
@@ -1346,10 +1353,10 @@ mod tests {
 		let parent = tempfile::tempdir().expect("parent directory");
 		let workspace = parent.path().join("workspace");
 		let external = parent.path().join("external");
-		std::fs::create_dir(&workspace).expect("workspace directory");
-		std::fs::create_dir(&external).expect("external directory");
+		fs::create_dir(&workspace).expect("workspace directory");
+		fs::create_dir(&external).expect("external directory");
 		let source = external.join("lib.rs");
-		std::fs::write(&source, "fn external() {}\n").expect("external source");
+		fs::write(&source, "fn external() {}\n").expect("external source");
 		let host = WorkspaceHost::open(&workspace).expect("workspace host");
 		let result = glob_blocking(
 			&host,
@@ -1372,7 +1379,7 @@ mod tests {
 	async fn grep_defers_line_authorization_until_final_visibility_is_supplied() {
 		let directory = tempfile::tempdir().expect("temp directory");
 		let source = directory.path().join("file.rs");
-		std::fs::write(&source, "before\nneedle\nafter\n").expect("write grep source");
+		fs::write(&source, "before\nneedle\nafter\n").expect("write grep source");
 		let adapter = connected_search_adapter(directory.path()).await;
 		let result = WorkspaceSearch::search(
 			&adapter,
@@ -1380,7 +1387,7 @@ mod tests {
 		)
 		.await
 		.expect("search file");
-		let canonical = std::fs::canonicalize(source).expect("canonical grep source");
+		let canonical = fs::canonicalize(source).expect("canonical grep source");
 		let source_key = Str::from(canonical.to_string_lossy().into_owned());
 		assert!(
 			adapter
@@ -1425,7 +1432,7 @@ mod tests {
 	fn archive_root_round_trips_real_zip_members_into_memory_search() {
 		let directory = tempfile::tempdir().expect("temp directory");
 		let archive_path = directory.path().join("fixture.zip");
-		std::fs::write(
+		fs::write(
 			&archive_path,
 			stored_zip(&[
 				("docs/readme.txt", b"first\nneedle\nthird\n"),
@@ -1433,7 +1440,7 @@ mod tests {
 			]),
 		)
 		.expect("write ZIP");
-		let bytes = Bytes::from(std::fs::read(&archive_path).expect("read ZIP"));
+		let bytes = Bytes::from(fs::read(&archive_path).expect("read ZIP"));
 		let root = SearchRoot {
 			original: sf!("fixture.zip:docs"),
 			path:     sf!("fixture.zip:docs"),
@@ -1445,7 +1452,7 @@ mod tests {
 			.next()
 			.expect("archive candidate");
 		let archive_key = Str::from(
-			std::fs::canonicalize(&archive_path)
+			fs::canonicalize(&archive_path)
 				.expect("canonical ZIP")
 				.to_string_lossy()
 				.into_owned(),
@@ -1475,10 +1482,9 @@ mod tests {
 		fn get(
 			&self,
 			request: web::types::HttpRequest,
-		) -> impl Future<Output = Result<web::types::HttpResponse, web::types::WebError>> + Send + '_
-		{
+		) -> impl Future<Output = Result<web::types::HttpResponse, WebError>> + Send + '_ {
 			assert_eq!(request.url, "https://example.test/data.txt");
-			std::future::ready(Ok(web::types::HttpResponse {
+			future::ready(Ok(web::types::HttpResponse {
 				final_url:    request.url,
 				status:       200,
 				content_type: Some(sf!("text/plain")),
@@ -1515,7 +1521,7 @@ mod tests {
 	#[tokio::test]
 	async fn archive_root_round_trips_through_the_real_search_adapter() {
 		let directory = tempfile::tempdir().expect("temp directory");
-		std::fs::write(
+		fs::write(
 			directory.path().join("fixture.zip"),
 			stored_zip(&[
 				("docs/readme.txt", b"first\nneedle\nthird\n"),
@@ -1547,11 +1553,11 @@ mod tests {
 	async fn external_archive_members_accept_absolute_and_parent_relative_roots() {
 		let parent = tempfile::tempdir().expect("parent directory");
 		let workspace = parent.path().join("workspace");
-		std::fs::create_dir(&workspace).expect("workspace directory");
+		fs::create_dir(&workspace).expect("workspace directory");
 		let archive_path = parent.path().join("fixture.zip");
-		std::fs::write(&archive_path, stored_zip(&[("docs/readme.txt", b"first\nneedle\nthird\n")]))
+		fs::write(&archive_path, stored_zip(&[("docs/readme.txt", b"first\nneedle\nthird\n")]))
 			.expect("write external ZIP");
-		let canonical_archive = std::fs::canonicalize(&archive_path).expect("canonical external ZIP");
+		let canonical_archive = fs::canonicalize(&archive_path).expect("canonical external ZIP");
 		let expected_source_key =
 			format!("archive:{}:docs/readme.txt", canonical_archive.to_string_lossy());
 		let adapter = connected_search_adapter(&workspace).await;
@@ -1581,10 +1587,10 @@ mod tests {
 		let parent = tempfile::tempdir().expect("parent directory");
 		let workspace = parent.path().join("workspace");
 		let external = parent.path().join("external");
-		std::fs::create_dir(&workspace).expect("workspace directory");
-		std::fs::create_dir_all(external.join("a")).expect("lexical parent directory");
-		std::fs::create_dir_all(external.join("b")).expect("external target directory");
-		std::fs::write(external.join("b/x.rs"), "fn external() {}\n").expect("external source");
+		fs::create_dir(&workspace).expect("workspace directory");
+		fs::create_dir_all(external.join("a")).expect("lexical parent directory");
+		fs::create_dir_all(external.join("b")).expect("external target directory");
+		fs::write(external.join("b/x.rs"), "fn external() {}\n").expect("external source");
 		let external = external.to_string_lossy().replace('\\', "/");
 		let authored = format!("{external}/a/../b/**/*.rs;{external}/b/**/*.rs");
 		let adapter = connected_search_adapter(&workspace).await;
@@ -1615,9 +1621,9 @@ mod tests {
 		let workspace = parent.path().join("workspace");
 		let real = parent.path().join("real");
 		let alias = parent.path().join("alias");
-		std::fs::create_dir(&workspace).expect("workspace directory");
-		std::fs::create_dir(&real).expect("external real directory");
-		std::fs::write(real.join("x.rs"), "fn external() {}\n").expect("external source");
+		fs::create_dir(&workspace).expect("workspace directory");
+		fs::create_dir(&real).expect("external real directory");
+		fs::write(real.join("x.rs"), "fn external() {}\n").expect("external source");
 		symlink(&real, &alias).expect("external directory symlink");
 		let alias = alias.to_string_lossy().replace('\\', "/");
 		let adapter = connected_search_adapter(&workspace).await;
@@ -1641,10 +1647,10 @@ mod tests {
 		let parent = tempfile::tempdir().expect("parent directory");
 		let workspace = parent.path().join("workspace");
 		let external = parent.path().join("external");
-		std::fs::create_dir(&workspace).expect("workspace directory");
-		std::fs::create_dir(&external).expect("external directory");
+		fs::create_dir(&workspace).expect("workspace directory");
+		fs::create_dir(&external).expect("external directory");
 		let source = external.join("lib.rs");
-		std::fs::write(&source, "fn external() {}\n").expect("external source");
+		fs::write(&source, "fn external() {}\n").expect("external source");
 		let adapter = connected_search_adapter(&workspace).await;
 		let result = WorkspaceSearch::glob(&adapter, glob::WalkRequest {
 			path:       sf!("../external/**/*.rs"),
@@ -1659,7 +1665,7 @@ mod tests {
 		assert_eq!(result.matches.len(), 1);
 		assert_eq!(
 			result.matches[0].path,
-			std::fs::canonicalize(source)
+			fs::canonicalize(source)
 				.expect("canonical external source")
 				.to_string_lossy()
 				.replace('\\', "/")
@@ -1671,7 +1677,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn url_root_round_trips_local_http_through_the_real_search_adapter() {
-		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+		let listener = TcpListener::bind("127.0.0.1:0")
 			.await
 			.expect("bind local HTTP fixture");
 		let address = listener.local_addr().expect("fixture address");
@@ -1701,7 +1707,7 @@ mod tests {
 			WorkspaceSearch::search(&adapter, search_request(url.clone(), SearchRootKind::Url, 5_000))
 				.await
 				.expect("search local URL through adapter");
-		tokio::time::timeout(Duration::from_secs(2), server)
+		time::timeout(Duration::from_secs(2), server)
 			.await
 			.expect("local HTTP fixture completed before its deadline")
 			.expect("local HTTP fixture task succeeded");

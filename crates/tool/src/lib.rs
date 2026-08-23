@@ -10,7 +10,17 @@ mod registry;
 pub mod render;
 mod spec_generated;
 
-use std::{collections::BTreeMap, fmt, future::Future, io::Write, mem::size_of, sync::Arc};
+use std::{
+	collections::BTreeMap,
+	fmt::{self, Display},
+	future::Future,
+	io,
+	io::Write,
+	mem,
+	mem::size_of,
+	str,
+	sync::Arc,
+};
 
 use bytes::Bytes;
 pub use device_path::{DevicePath, DevicePathError};
@@ -21,6 +31,7 @@ pub use incoming::{
 };
 use omp_core::{Hash32, InvocationPhase, SparseMap, Str};
 pub use omp_proto::inference::v1::Fallback;
+use omp_proto::{inference::v1::InvokeInput, policy::v1};
 pub use omp_slopjson::{PullMode, Pulled, PulledKind, PulledValueKind};
 pub use registry::{
 	AvailabilityDelta, Claim, Claims, ConstraintDisposition, DeviceTarget, ErasedEv, ErasedOutcome,
@@ -30,7 +41,8 @@ pub use registry::{
 	ProjectionRequest, PublishedLeaf, Registry, RegistryError, RegistryLeaf, ShadowClaim,
 	ToolPromptEntry, ToolPromptProjection, ToolRoute, WorkerSiteKind,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use schemars::generate::SchemaSettings;
+use serde::{Deserialize, Serialize, de, de::DeserializeOwned};
 use smallvec::SmallVec;
 pub use spec_generated::{
 	CallbackAbi, PhaseLegalityRow, RuntimeDurationMetadata, RuntimeSymbolSpec, operation_spec,
@@ -43,7 +55,7 @@ use thiserror::Error;
 /// Subschemas are inlined and generator metadata is omitted. Schemas describe
 /// deserialization, matching how tool parameters are consumed.
 pub fn schema<T: schemars::JsonSchema>() -> Bytes {
-	let generator = schemars::generate::SchemaSettings::draft2020_12()
+	let generator = SchemaSettings::draft2020_12()
 		.with(|settings| {
 			settings.inline_subschemas = true;
 			settings.meta_schema = None;
@@ -130,7 +142,7 @@ pub struct Rev {
 	pub n:      u16,
 }
 
-impl fmt::Display for Rev {
+impl Display for Rev {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		if self.family.is_empty() {
 			write!(f, "{}", self.n)
@@ -148,7 +160,7 @@ pub struct RevParseError {
 	pub value: Str,
 }
 
-impl std::str::FromStr for Rev {
+impl str::FromStr for Rev {
 	type Err = RevParseError;
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -197,7 +209,7 @@ pub struct UsdParseError {
 	pub value: Str,
 }
 
-impl std::str::FromStr for Usd {
+impl str::FromStr for Usd {
 	type Err = UsdParseError;
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -235,7 +247,7 @@ impl std::str::FromStr for Usd {
 	}
 }
 
-impl fmt::Display for Usd {
+impl Display for Usd {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let whole = self.0 / 1_000_000_000;
 		let fraction = self.0 % 1_000_000_000;
@@ -259,7 +271,7 @@ impl Serialize for Usd {
 impl<'de> Deserialize<'de> for Usd {
 	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
 		let value = Str::deserialize(deserializer)?;
-		value.parse().map_err(serde::de::Error::custom)
+		value.parse().map_err(de::Error::custom)
 	}
 }
 
@@ -453,59 +465,51 @@ pub enum EffectsWireError {
 	Usd(#[from] UsdParseError),
 }
 
-impl From<&Effects> for omp_proto::policy::v1::EffectEnvelope {
+impl From<&Effects> for v1::EffectEnvelope {
 	fn from(value: &Effects) -> Self {
 		Self {
-			documents: value
-				.documents
+			documents: value.documents.as_ref().map(|documents| v1::DocEffects {
+				read:        documents.read,
+				write_globs: documents
+					.write_globs
+					.iter()
+					.map(|glob| glob.as_str().to_owned())
+					.collect(),
+				props:       None,
+			}),
+			exec:      value.exec.as_ref().map(|exec| v1::ExecEffects {
+				commands: exec
+					.commands
+					.iter()
+					.map(|command| command.as_str().to_owned())
+					.collect(),
+				network:  exec.network,
+				props:    None,
+			}),
+			inference: value
+				.inference
 				.as_ref()
-				.map(|documents| omp_proto::policy::v1::DocEffects {
-					read:        documents.read,
-					write_globs: documents
-						.write_globs
-						.iter()
-						.map(|glob| glob.as_str().to_owned())
-						.collect(),
-					props:       None,
-				}),
-			exec:      value
-				.exec
-				.as_ref()
-				.map(|exec| omp_proto::policy::v1::ExecEffects {
-					commands: exec
-						.commands
-						.iter()
-						.map(|command| command.as_str().to_owned())
-						.collect(),
-					network:  exec.network,
-					props:    None,
-				}),
-			inference: value.inference.as_ref().map(|inference| {
-				omp_proto::policy::v1::InferenceEffects {
+				.map(|inference| v1::InferenceEffects {
 					max_requests: inference.max_requests,
 					max_usd:      inference.max_usd.to_string(),
 					props:        None,
-				}
-			}),
-			desktop:   value
-				.desktop
-				.as_ref()
-				.map(|desktop| omp_proto::policy::v1::DesktopEffects {
-					capture:       desktop.capture,
-					accessibility: desktop.accessibility,
-					input:         desktop.input,
-					props:         None,
 				}),
+			desktop:   value.desktop.as_ref().map(|desktop| v1::DesktopEffects {
+				capture:       desktop.capture,
+				accessibility: desktop.accessibility,
+				input:         desktop.input,
+				props:         None,
+			}),
 			subagents: value.subagents,
 			props:     None,
 		}
 	}
 }
 
-impl TryFrom<&omp_proto::policy::v1::EffectEnvelope> for Effects {
+impl TryFrom<&v1::EffectEnvelope> for Effects {
 	type Error = EffectsWireError;
 
-	fn try_from(value: &omp_proto::policy::v1::EffectEnvelope) -> Result<Self, Self::Error> {
+	fn try_from(value: &v1::EffectEnvelope) -> Result<Self, Self::Error> {
 		Ok(Self {
 			documents: value.documents.as_ref().map(|documents| DocEffects {
 				read:        documents.read,
@@ -962,11 +966,7 @@ pub trait Tool: Send + Sync + 'static {
 	/// frame.
 	///
 	/// The default keeps ordinary tool progress on the agent event feed only.
-	fn invoke_input(
-		&self,
-		_update: &Self::Update,
-		_invocation_id: &str,
-	) -> Option<omp_proto::inference::v1::InvokeInput> {
+	fn invoke_input(&self, _update: &Self::Update, _invocation_id: &str) -> Option<InvokeInput> {
 		None
 	}
 
@@ -1088,7 +1088,7 @@ where
 				});
 				let carries_policy = policy.is_some();
 				if (kind == AbortKind::PolicyDenied) != carries_policy {
-					return Err(serde::de::Error::custom(
+					return Err(de::Error::custom(
 						"policy is present if and only if abort kind is policy_denied",
 					));
 				}
@@ -1822,9 +1822,9 @@ impl<'a, S: CallOutcomeSpill> ThresholdWriter<'a, S> {
 }
 
 impl<S: CallOutcomeSpill> Write for ThresholdWriter<'_, S> {
-	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+	fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
 		if self.open_error.is_some() || self.spill_write_failed {
-			return Err(std::io::Error::other("call-outcome spill writer previously failed"));
+			return Err(io::Error::other("call-outcome spill writer previously failed"));
 		}
 		if let ThresholdState::Inline(inline) = &mut self.state
 			&& bytes.len() <= self.inline_limit.saturating_sub(inline.len())
@@ -1838,11 +1838,11 @@ impl<S: CallOutcomeSpill> Write for ThresholdWriter<'_, S> {
 				Ok(stage) => stage,
 				Err(error) => {
 					self.open_error = Some(error);
-					return Err(std::io::Error::other("call-outcome spill open failed"));
+					return Err(io::Error::other("call-outcome spill open failed"));
 				},
 			};
 			let ThresholdState::Inline(inline) =
-				std::mem::replace(&mut self.state, ThresholdState::Spilled(stage))
+				mem::replace(&mut self.state, ThresholdState::Spilled(stage))
 			else {
 				unreachable!("inline spill transition changed state")
 			};
@@ -1865,7 +1865,7 @@ impl<S: CallOutcomeSpill> Write for ThresholdWriter<'_, S> {
 		Ok(bytes.len())
 	}
 
-	fn flush(&mut self) -> std::io::Result<()> {
+	fn flush(&mut self) -> io::Result<()> {
 		match &mut self.state {
 			ThresholdState::Inline(_) => Ok(()),
 			ThresholdState::Spilled(stage) => stage.flush(),

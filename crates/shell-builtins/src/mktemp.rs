@@ -18,6 +18,7 @@ use std::{
 use clap::{
 	Arg, ArgAction, ArgMatches, Command,
 	builder::{TypedValueParser, ValueParserFactory},
+	error,
 };
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use rand::{
@@ -285,10 +286,10 @@ impl Utility for Mktemp {
 		// Upstream replaces clap's generic positional overflow diagnostic with
 		// GNU mktemp's concise message.
 		if let Err(err) = app().try_get_matches_from(&argv)
-			&& err.kind() == clap::error::ErrorKind::TooManyValues
+			&& err.kind() == error::ErrorKind::TooManyValues
 			&& err.context().any(|(kind, value)| {
-				kind == clap::error::ContextKind::InvalidArg
-					&& value == &clap::error::ContextValue::String("[template]".into())
+				kind == error::ContextKind::InvalidArg
+					&& value == &error::ContextValue::String("[template]".into())
 			}) {
 			return Err(MkTempError::TooManyTemplates.to_string());
 		}
@@ -550,7 +551,9 @@ mod tests {
 	use std::{
 		env,
 		ffi::OsString,
+		fs,
 		io::Write,
+		iter,
 		path::{Path, PathBuf},
 	};
 
@@ -561,7 +564,7 @@ mod tests {
 
 	fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
 		let dir = tempfile::tempdir().unwrap();
-		let canonical = std::fs::canonicalize(dir.path()).unwrap();
+		let canonical = fs::canonicalize(dir.path()).unwrap();
 		(dir, canonical)
 	}
 
@@ -570,7 +573,7 @@ mod tests {
 		for (key, value) in env {
 			host.set_test_var(key, value);
 		}
-		let argv: Vec<OsString> = std::iter::once(OsString::from(Mktemp::NAME))
+		let argv: Vec<OsString> = iter::once(OsString::from(Mktemp::NAME))
 			.chain(args.iter().map(OsString::from))
 			.collect();
 		let argv = match Mktemp::rewrite_argv(argv) {
@@ -633,7 +636,7 @@ mod tests {
 	#[test]
 	fn relative_tmpdir_resolves_against_host_cwd_but_prints_relative() {
 		let (_dir, root) = canonical_tempdir();
-		std::fs::create_dir(root.join("sub")).unwrap();
+		fs::create_dir(root.join("sub")).unwrap();
 		let (code, stdout, stderr) = run_in(root.clone(), &[], &["-p", "sub", "foo.XXXX"]);
 		assert_eq!(code, 0);
 		assert_eq!(stderr, "");
@@ -645,7 +648,7 @@ mod tests {
 	#[test]
 	fn relative_template_directory_resolves_against_host_cwd() {
 		let (_dir, root) = canonical_tempdir();
-		std::fs::create_dir(root.join("nested")).unwrap();
+		fs::create_dir(root.join("nested")).unwrap();
 		let (code, stdout, stderr) = run_in(root.clone(), &[], &["nested/foo.XXXX"]);
 		assert_eq!(code, 0);
 		assert_eq!(stderr, "");

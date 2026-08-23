@@ -6,6 +6,8 @@
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(not(unix))]
+use std::str;
 use std::{
 	ffi::{OsStr, OsString},
 	fmt,
@@ -71,7 +73,7 @@ mod platform {
 
 	// Unix-specific implementations for the rm utility
 
-	use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt, path::Path};
+	use std::{ffi::OsStr, fs, io, os::unix::fs::PermissionsExt, path::Path};
 
 	use indicatif::ProgressBar;
 
@@ -202,7 +204,7 @@ mod platform {
 				Some(false)
 			},
 			Err(e) => {
-				if e.kind() == std::io::ErrorKind::PermissionDenied {
+				if e.kind() == io::ErrorKind::PermissionDenied {
 					show_error!(host, "cannot remove {}: Permission denied", path.quote());
 				} else {
 					let _ = show_removal_error(host, e, path);
@@ -243,13 +245,13 @@ mod platform {
 	/// Helper to handle errors with force mode consideration
 	fn handle_error_with_force(
 		host: &mut Host,
-		e: std::io::Error,
+		e: io::Error,
 		path: &Path,
 		options: &Options,
 	) -> bool {
 		// Permission denied errors should be shown even in force mode
 		// This matches GNU rm behavior
-		if e.kind() == std::io::ErrorKind::PermissionDenied {
+		if e.kind() == io::ErrorKind::PermissionDenied {
 			show_permission_denied_error(host, path);
 			return true;
 		}
@@ -370,7 +372,7 @@ mod platform {
 			Err(e) => {
 				// If we can't open the directory for safe traversal,
 				// handle the error appropriately and try to remove if possible
-				if e.kind() == std::io::ErrorKind::PermissionDenied {
+				if e.kind() == io::ErrorKind::PermissionDenied {
 					// Try to remove the directory directly if it's empty
 					if fs::remove_dir(host.resolve(path)).is_ok() {
 						verbose_removed_directory(host, path, options);
@@ -432,7 +434,7 @@ mod platform {
 		// Read directory entries using safe traversal
 		let entries = match dir_fd.read_dir() {
 			Ok(entries) => entries,
-			Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+			Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
 				if !options.force {
 					show_permission_denied_error(host, path);
 				}
@@ -480,7 +482,7 @@ mod platform {
 					Err(e) => {
 						// If we can't open the subdirectory for safe traversal,
 						// try to handle it as best we can with safe operations
-						if e.kind() == std::io::ErrorKind::PermissionDenied {
+						if e.kind() == io::ErrorKind::PermissionDenied {
 							error |= handle_permission_denied(
 								host,
 								dir_fd,
@@ -542,6 +544,8 @@ mod platform {
 }
 #[cfg(all(unix, not(target_os = "redox")))]
 use platform::{safe_remove_dir_recursive, safe_remove_empty_dir, safe_remove_file};
+
+use crate::support::fsutil::path_ends_with_terminator;
 
 #[derive(Debug, Error)]
 enum RmError {
@@ -1114,7 +1118,7 @@ pub fn remove(host: &mut Host, files: &[&OsStr], options: &Options) -> bool {
 		// Check if the path (potentially with trailing slash) resolves to root
 		// This needs to happen before symlink_metadata to catch cases like "rootlink/"
 		// where rootlink is a symlink to root.
-		if crate::support::fsutil::path_ends_with_terminator(file)
+		if path_ends_with_terminator(file)
 			&& options.recursive
 			&& options.preserve_root
 			&& is_root_path(host, file)
@@ -1637,7 +1641,7 @@ fn clean_trailing_slashes(path: &Path) -> &Path {
 			#[cfg(not(unix))]
 			// `os_bytes` returns `None` for non-UTF-8 strings off Unix, so this
 			// byte slice is valid UTF-8.
-			return Path::new(std::str::from_utf8(&path_bytes[0..=idx]).unwrap());
+			return Path::new(str::from_utf8(&path_bytes[0..=idx]).unwrap());
 		}
 	}
 	path
@@ -1664,7 +1668,7 @@ fn is_symlink_dir(metadata: &Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
-	use std::path::Path;
+	use std::{env, fs, path::Path};
 
 	use tempfile::{Builder, tempdir};
 
@@ -1680,7 +1684,7 @@ mod tests {
 	fn empty_operand_does_not_delete_cwd() {
 		let cwd = tempdir().unwrap();
 		let sentinel = cwd.path().join("sentinel");
-		std::fs::write(&sentinel, b"keep me").unwrap();
+		fs::write(&sentinel, b"keep me").unwrap();
 
 		let (code, _) = run_util::<Rm>(&["-rf", ""], "", cwd.path());
 
@@ -1692,14 +1696,14 @@ mod tests {
 	#[test]
 	fn relative_operand_resolves_against_host_cwd() {
 		let cwd = tempdir().unwrap();
-		let process_cwd = std::env::current_dir().unwrap();
+		let process_cwd = env::current_dir().unwrap();
 		let process_file = Builder::new()
 			.prefix("brush-rm-relative-")
 			.tempfile_in(process_cwd)
 			.unwrap();
 		let name = process_file.path().file_name().unwrap().to_str().unwrap();
 		let host_file = cwd.path().join(name);
-		std::fs::write(&host_file, b"remove me").unwrap();
+		fs::write(&host_file, b"remove me").unwrap();
 
 		let (code, capture) = run_util::<Rm>(&[name], "", cwd.path());
 
@@ -1711,8 +1715,8 @@ mod tests {
 	#[test]
 	fn recursively_removes_directory_tree() {
 		let cwd = tempdir().unwrap();
-		std::fs::create_dir_all(cwd.path().join("tree/child")).unwrap();
-		std::fs::write(cwd.path().join("tree/child/file"), b"data").unwrap();
+		fs::create_dir_all(cwd.path().join("tree/child")).unwrap();
+		fs::write(cwd.path().join("tree/child/file"), b"data").unwrap();
 
 		let (code, capture) = run_util::<Rm>(&["-r", "tree"], "", cwd.path());
 
@@ -1723,7 +1727,7 @@ mod tests {
 	#[test]
 	fn interactive_no_keeps_file_and_prompts_on_stderr() {
 		let cwd = tempdir().unwrap();
-		std::fs::write(cwd.path().join("keep"), b"data").unwrap();
+		fs::write(cwd.path().join("keep"), b"data").unwrap();
 
 		let (code, capture) = run_util::<Rm>(&["-i", "keep"], "n\n", cwd.path());
 
@@ -1743,7 +1747,7 @@ mod tests {
 	fn abbreviated_spelling_after_option_terminator_is_an_operand() {
 		let cwd = tempdir().unwrap();
 		let file = cwd.path().join("--no-preserve-roo");
-		std::fs::write(&file, b"data").unwrap();
+		fs::write(&file, b"data").unwrap();
 
 		let (code, capture) = run_util::<Rm>(&["--", "--no-preserve-roo"], "", cwd.path());
 

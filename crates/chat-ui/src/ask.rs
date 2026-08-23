@@ -2,6 +2,7 @@
 
 use std::{
 	future::Future,
+	mem,
 	pin::Pin,
 	sync::{
 		Arc, LazyLock,
@@ -9,6 +10,7 @@ use std::{
 	},
 };
 
+use flume::Receiver;
 use omp_core::{IntoStr, Str, sf};
 use omp_proto::omp::ui::v1::{Dialog, UiRequest, ui_request};
 use omp_tools::ask::{Answer, AskPresenter, Fault, HeadlessPresenter, Presentation, Question};
@@ -54,7 +56,7 @@ impl AskRequest {
 /// Exclusive binding installed by the active terminal host.
 #[must_use]
 pub struct AskBinding {
-	receiver:   flume::Receiver<AskRequest>,
+	receiver:   Receiver<AskRequest>,
 	generation: u64,
 }
 
@@ -228,7 +230,7 @@ impl AskDialog {
 		match event {
 			UiEvent::Cancel => AskDialogEvent::Cancel,
 			UiEvent::Submit if self.question.multi => {
-				AskDialogEvent::Submit(std::mem::take(&mut self.selected))
+				AskDialogEvent::Submit(mem::take(&mut self.selected))
 			},
 			UiEvent::Changed { value, .. } if self.question.multi => {
 				if let Some(at) = self.selected.iter().position(|chosen| chosen == &value) {

@@ -1,11 +1,15 @@
 use std::{collections::HashMap, sync::Arc, thread, time::Duration};
 
 use bytes::Bytes;
+use flume::Receiver;
 use futures::{Stream, stream};
 use omp_core::{Str, sf};
 use omp_env::{EnvClient, frame};
 use omp_proto::{
-	inference::v1::{Invoke, InvokeComplete, InvokeInput, exec_status, invoke_input},
+	env::v1::{client_frame, server_frame},
+	inference::v1::{
+		Invoke, InvokeComplete, InvokeInput, exec_status, invoke_input, invoke_input::chunk,
+	},
 	thread::v1::ToolCall,
 };
 use omp_tool::{
@@ -13,6 +17,7 @@ use omp_tool::{
 	Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
+use tokio::task;
 
 use super::{DuplexError, DuplexManager};
 use crate::{EventBus, InvokeFrame};
@@ -94,7 +99,7 @@ impl Tool for ScriptTool {
 		self.project_inputs.then(|| InvokeInput {
 			invocation_id: invocation_id.to_owned(),
 			payload:       Some(invoke_input::Payload::Chunk(invoke_input::Chunk {
-				channel: invoke_input::chunk::Channel::Progress as i32,
+				channel: chunk::Channel::Progress as i32,
 				data:    Bytes::copy_from_slice(update.as_bytes()),
 			})),
 		})
@@ -103,7 +108,7 @@ impl Tool for ScriptTool {
 
 fn manager_with_projection(
 	project_inputs: bool,
-) -> (DuplexManager, flume::Receiver<frame::ClientFrame>, flume::Sender<frame::ServerFrame>) {
+) -> (DuplexManager, Receiver<frame::ClientFrame>, flume::Sender<frame::ServerFrame>) {
 	let (env, transport) = EnvClient::in_process(0);
 	let (requests, responses) = transport.into_parts();
 	let mut registry = Registry::new();
@@ -132,8 +137,7 @@ fn manager_with_projection(
 	)
 }
 
-fn manager()
--> (DuplexManager, flume::Receiver<frame::ClientFrame>, flume::Sender<frame::ServerFrame>) {
+fn manager() -> (DuplexManager, Receiver<frame::ClientFrame>, flume::Sender<frame::ServerFrame>) {
 	manager_with_projection(false)
 }
 
@@ -152,14 +156,14 @@ fn invoke(invocation_id: &str, call_id: &str, value: u64) -> Invoke {
 	}
 }
 
-fn recv(requests: &flume::Receiver<frame::ClientFrame>) -> frame::ClientFrame {
+fn recv(requests: &Receiver<frame::ClientFrame>) -> frame::ClientFrame {
 	requests.recv_timeout(WAIT).expect("client frame")
 }
 
 fn respond(
 	responses: &flume::Sender<frame::ServerFrame>,
 	request_id: u64,
-	body: frame::server_frame::Body,
+	body: server_frame::Body,
 ) {
 	responses
 		.send(frame::ServerFrame { request_id, body: Some(body), ..Default::default() })
@@ -167,7 +171,7 @@ fn respond(
 }
 
 fn serve_one(
-	requests: flume::Receiver<frame::ClientFrame>,
+	requests: Receiver<frame::ClientFrame>,
 	responses: flume::Sender<frame::ServerFrame>,
 	call_id: &'static str,
 	expected_args: Bytes,
@@ -178,7 +182,7 @@ fn serve_one(
 		let open = recv(&requests);
 		let request_id = open.request_id;
 		match open.body {
-			Some(frame::client_frame::Body::InvokeTool(open)) => {
+			Some(client_frame::Body::InvokeTool(open)) => {
 				assert_eq!(open.invocation_id, call_id);
 				assert_eq!(open.name, "script");
 				assert_eq!(open.rev, "script.1");
@@ -186,14 +190,14 @@ fn serve_one(
 			body => panic!("expected InvokeTool, got {body:?}"),
 		}
 		match recv(&requests).body {
-			Some(frame::client_frame::Body::ArgText(args)) => {
+			Some(client_frame::Body::ArgText(args)) => {
 				assert_eq!(args.invocation_id, call_id);
 				assert_eq!(args.fragment.as_bytes(), expected_args.as_ref());
 			},
 			body => panic!("expected ArgText, got {body:?}"),
 		}
 		match recv(&requests).body {
-			Some(frame::client_frame::Body::ArgsCommitted(args)) => {
+			Some(client_frame::Body::ArgsCommitted(args)) => {
 				assert_eq!(args.invocation_id, call_id);
 				assert_eq!(args.raw, expected_args);
 			},
@@ -202,7 +206,7 @@ fn serve_one(
 		respond(
 			&responses,
 			request_id,
-			frame::server_frame::Body::Verdict(frame::Verdict {
+			server_frame::Body::Verdict(frame::Verdict {
 				invocation_id: call_id.to_owned(),
 				json: verdict,
 				is_error,
@@ -266,11 +270,11 @@ async fn two_invocations_remain_concurrent_and_complete_independently() {
 		while commits < 2 {
 			let frame = recv(&requests);
 			match frame.body {
-				Some(frame::client_frame::Body::InvokeTool(open)) => {
+				Some(client_frame::Body::InvokeTool(open)) => {
 					ids.insert(open.invocation_id, frame.request_id);
 				},
-				Some(frame::client_frame::Body::ArgsCommitted(_)) => commits += 1,
-				Some(frame::client_frame::Body::ArgText(_)) => {},
+				Some(client_frame::Body::ArgsCommitted(_)) => commits += 1,
+				Some(client_frame::Body::ArgText(_)) => {},
 				body => panic!("unexpected concurrent frame: {body:?}"),
 			}
 		}
@@ -280,7 +284,7 @@ async fn two_invocations_remain_concurrent_and_complete_independently() {
 			respond(
 				&responses,
 				ids[call_id],
-				frame::server_frame::Body::Verdict(frame::Verdict {
+				server_frame::Body::Verdict(frame::Verdict {
 					invocation_id: call_id.to_owned(),
 					json: Bytes::from(serde_json::to_vec(&verdict).expect("serialize verdict")),
 					..Default::default()
@@ -304,14 +308,14 @@ async fn cancellation_interrupts_then_structurally_cancels_and_suppresses_comple
 	let server = thread::spawn(move || {
 		let open = recv(&requests);
 		let request_id = open.request_id;
-		assert!(matches!(open.body, Some(frame::client_frame::Body::InvokeTool(_))));
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::ArgText(_))));
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::ArgsCommitted(_))));
+		assert!(matches!(open.body, Some(client_frame::Body::InvokeTool(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::ArgText(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::ArgsCommitted(_))));
 		committed_tx.send(()).expect("notify commit");
 		respond(
 			&responses,
 			request_id,
-			frame::server_frame::Body::Update(frame::Update {
+			server_frame::Body::Update(frame::Update {
 				invocation_id: "call-c".to_owned(),
 				json: Bytes::from_static(br#""late""#),
 				..Default::default()
@@ -319,10 +323,10 @@ async fn cancellation_interrupts_then_structurally_cancels_and_suppresses_comple
 		);
 		let interrupt = recv(&requests);
 		assert_eq!(interrupt.request_id, request_id);
-		assert!(matches!(interrupt.body, Some(frame::client_frame::Body::Interrupt(_))));
+		assert!(matches!(interrupt.body, Some(client_frame::Body::Interrupt(_))));
 		let cancel = recv(&requests);
 		assert_eq!(cancel.request_id, 0);
-		assert!(matches!(cancel.body, Some(frame::client_frame::Body::Cancel(_))));
+		assert!(matches!(cancel.body, Some(client_frame::Body::Cancel(_))));
 		done_tx.send(()).expect("notify cancellation observed");
 		drop(responses);
 	});
@@ -402,10 +406,10 @@ async fn dropping_manager_interrupts_active_tasks_before_sender_destruction() {
 		loop {
 			let frame = recv(&requests);
 			match frame.body {
-				Some(frame::client_frame::Body::InvokeTool(_)) => opened = true,
-				Some(frame::client_frame::Body::ArgText(_)) => relayed = true,
-				Some(frame::client_frame::Body::Cancel(_)) => break,
-				Some(frame::client_frame::Body::ArgsCommitted(_)) => {
+				Some(client_frame::Body::InvokeTool(_)) => opened = true,
+				Some(client_frame::Body::ArgText(_)) => relayed = true,
+				Some(client_frame::Body::Cancel(_)) => break,
+				Some(client_frame::Body::ArgsCommitted(_)) => {
 					panic!("shutdown observed before execution must not commit effects")
 				},
 				body => panic!("unexpected shutdown frame: {body:?}"),
@@ -416,9 +420,9 @@ async fn dropping_manager_interrupts_active_tasks_before_sender_destruction() {
 		drop(responses);
 	});
 	manager.start(invoke("invoke-drop", "call-drop", 4));
-	tokio::task::yield_now().await;
+	task::yield_now().await;
 	drop(manager);
-	tokio::task::spawn_blocking(move || server.join())
+	task::spawn_blocking(move || server.join())
 		.await
 		.expect("join task")
 		.expect("manager drop structurally cancelled invocation");
@@ -430,14 +434,14 @@ async fn typed_updates_are_ordered_before_completion() {
 	let server = thread::spawn(move || {
 		let open = recv(&requests);
 		let request_id = open.request_id;
-		assert!(matches!(open.body, Some(frame::client_frame::Body::InvokeTool(_))));
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::ArgText(_))));
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::ArgsCommitted(_))));
+		assert!(matches!(open.body, Some(client_frame::Body::InvokeTool(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::ArgText(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::ArgsCommitted(_))));
 		for raw in [Bytes::from_static(br#""first""#), Bytes::from_static(br#""second""#)] {
 			respond(
 				&responses,
 				request_id,
-				frame::server_frame::Body::Update(frame::Update {
+				server_frame::Body::Update(frame::Update {
 					invocation_id: "call-stream".to_owned(),
 					json: raw,
 					..Default::default()
@@ -448,7 +452,7 @@ async fn typed_updates_are_ordered_before_completion() {
 		respond(
 			&responses,
 			request_id,
-			frame::server_frame::Body::Verdict(frame::Verdict {
+			server_frame::Body::Verdict(frame::Verdict {
 				invocation_id: "call-stream".to_owned(),
 				json: Bytes::from(serde_json::to_vec(&verdict).expect("serialize verdict")),
 				..Default::default()
@@ -465,7 +469,7 @@ async fn typed_updates_are_ordered_before_completion() {
 		let Some(invoke_input::Payload::Chunk(chunk)) = input.payload else {
 			panic!("expected canonical input chunk");
 		};
-		assert_eq!(chunk.channel, invoke_input::chunk::Channel::Progress as i32);
+		assert_eq!(chunk.channel, chunk::Channel::Progress as i32);
 		assert_eq!(chunk.data.as_ref(), expected);
 	}
 	let (_, terminal) = manager.next().await.expect("terminal completion");
@@ -481,13 +485,13 @@ async fn default_update_projection_yields_only_completion() {
 	let server = thread::spawn(move || {
 		let open = recv(&requests);
 		let request_id = open.request_id;
-		assert!(matches!(open.body, Some(frame::client_frame::Body::InvokeTool(_))));
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::ArgText(_))));
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::ArgsCommitted(_))));
+		assert!(matches!(open.body, Some(client_frame::Body::InvokeTool(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::ArgText(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::ArgsCommitted(_))));
 		respond(
 			&responses,
 			request_id,
-			frame::server_frame::Body::Update(frame::Update {
+			server_frame::Body::Update(frame::Update {
 				invocation_id: "call-default".to_owned(),
 				json: Bytes::from_static(br#""event-only""#),
 				..Default::default()
@@ -497,7 +501,7 @@ async fn default_update_projection_yields_only_completion() {
 		respond(
 			&responses,
 			request_id,
-			frame::server_frame::Body::Verdict(frame::Verdict {
+			server_frame::Body::Verdict(frame::Verdict {
 				invocation_id: "call-default".to_owned(),
 				json: Bytes::from(serde_json::to_vec(&verdict).expect("serialize verdict")),
 				..Default::default()
@@ -517,19 +521,19 @@ async fn malformed_typed_update_returns_projection_error_without_panic() {
 	let server = thread::spawn(move || {
 		let open = recv(&requests);
 		let request_id = open.request_id;
-		assert!(matches!(open.body, Some(frame::client_frame::Body::InvokeTool(_))));
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::ArgText(_))));
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::ArgsCommitted(_))));
+		assert!(matches!(open.body, Some(client_frame::Body::InvokeTool(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::ArgText(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::ArgsCommitted(_))));
 		respond(
 			&responses,
 			request_id,
-			frame::server_frame::Body::Update(frame::Update {
+			server_frame::Body::Update(frame::Update {
 				invocation_id: "call-malformed".to_owned(),
 				json: Bytes::from_static(br#"{"not":"a string"}"#),
 				..Default::default()
 			}),
 		);
-		assert!(matches!(recv(&requests).body, Some(frame::client_frame::Body::Cancel(_))));
+		assert!(matches!(recv(&requests).body, Some(client_frame::Body::Cancel(_))));
 	});
 	manager.start(invoke("invoke-malformed", "call-malformed", 7));
 	let (_, result) = manager.next().await.expect("projection failure");

@@ -5,6 +5,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use async_trait::async_trait;
 use bytes::Bytes;
 use omp_core::{InvocationPhase, LifecyclePhase, Str};
+use omp_proto::toolhost::v1;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,8 +13,9 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::control::{
-	AuditedDirectFilesystemRequest, ControlAuthority, ControlEffect, ControlProtocolError,
-	ControlRequestContext, DirectFilesystemError, DirectFilesystemGrant, admit_direct_filesystem,
+	AuditedDirectFilesystemRequest, ControlAuthority, ControlConnectionIdentity, ControlEffect,
+	ControlProtocolError, ControlRequestContext, DirectFilesystemError, DirectFilesystemGrant,
+	admit_direct_filesystem,
 };
 
 /// Maximum number of simultaneous value pulls for one invocation cursor.
@@ -169,17 +171,14 @@ pub trait ParameterSource: Send + Sync + 'static {
 
 /// Authoritative parameter cursor owner bound to one extension connection.
 pub struct ParameterControlOwner {
-	identity: Arc<super::control::ControlConnectionIdentity>,
+	identity: Arc<ControlConnectionIdentity>,
 	source:   Arc<dyn ParameterSource>,
 	pending:  Arc<Mutex<BTreeSet<Str>>>,
 }
 
 impl ParameterControlOwner {
 	/// Binds cursor requests to the live invocation source.
-	pub fn new(
-		identity: Arc<super::control::ControlConnectionIdentity>,
-		source: Arc<dyn ParameterSource>,
-	) -> Self {
+	pub fn new(identity: Arc<ControlConnectionIdentity>, source: Arc<dyn ParameterSource>) -> Self {
 		Self { identity, source, pending: Arc::new(Mutex::new(BTreeSet::new())) }
 	}
 
@@ -500,7 +499,7 @@ pub trait DirectFilesystemExecutor: Send + Sync + 'static {
 
 /// Audited direct-filesystem CONTROL owner for one trusted connection.
 pub struct DirectFilesystemControlOwner {
-	identity: Arc<super::control::ControlConnectionIdentity>,
+	identity: Arc<ControlConnectionIdentity>,
 	journal:  Arc<dyn DirectFilesystemJournal>,
 	executor: Arc<dyn DirectFilesystemExecutor>,
 }
@@ -508,7 +507,7 @@ pub struct DirectFilesystemControlOwner {
 impl DirectFilesystemControlOwner {
 	/// Binds the exceptional escape to authenticated grant and journal owners.
 	pub fn new(
-		identity: Arc<super::control::ControlConnectionIdentity>,
+		identity: Arc<ControlConnectionIdentity>,
 		journal: Arc<dyn DirectFilesystemJournal>,
 		executor: Arc<dyn DirectFilesystemExecutor>,
 	) -> Self {
@@ -631,7 +630,7 @@ impl DirectFilesystemControlOwner {
 				)));
 			},
 		};
-		let wire = omp_proto::toolhost::v1::DirectFilesystemRequest {
+		let wire = v1::DirectFilesystemRequest {
 			operation,
 			absolute_path,
 			data,

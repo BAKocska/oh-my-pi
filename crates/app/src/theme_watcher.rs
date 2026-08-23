@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
+use flume::Receiver;
 use omp_tui::{Appearance, JsonTheme, Theme};
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -87,7 +88,7 @@ impl ThemeWatcher {
 	}
 
 	/// Subscribes to future successful publications.
-	pub fn subscribe(&self) -> flume::Receiver<ThemeRevision> {
+	pub fn subscribe(&self) -> Receiver<ThemeRevision> {
 		let (tx, rx) = flume::bounded(1);
 		if let Some(active) = self.active.load_full() {
 			let _ = tx.try_send((*active).clone());

@@ -1,6 +1,11 @@
 //! Bank diagnostics and retryable SQLite cleanup.
 
-use std::{path::Path, thread, time::Duration};
+use std::{
+	fs, io,
+	path::{Path, PathBuf},
+	thread,
+	time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +23,7 @@ pub struct BankDiagnostic {
 	/// Bank identifier.
 	pub bank:           String,
 	/// Non-secret database target.
-	pub database:       std::path::PathBuf,
+	pub database:       PathBuf,
 	/// Database byte size.
 	pub database_bytes: u64,
 	/// Durable row counts.
@@ -29,7 +34,7 @@ pub struct BankDiagnostic {
 
 /// Collects complete diagnostics for one bank.
 pub fn inspect(store: &BankStore) -> Result<BankDiagnostic> {
-	let database_bytes = std::fs::metadata(store.path())
+	let database_bytes = fs::metadata(store.path())
 		.map(|value| value.len())
 		.unwrap_or(0);
 	Ok(BankDiagnostic {
@@ -63,7 +68,7 @@ pub fn remove_database_files(path: &Path) -> Result<()> {
 		let target = if suffix.is_empty() {
 			path.to_path_buf()
 		} else {
-			std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+			PathBuf::from(format!("{}{suffix}", path.display()))
 		};
 		remove_with_retry(&target)?;
 	}
@@ -72,9 +77,9 @@ pub fn remove_database_files(path: &Path) -> Result<()> {
 
 fn remove_with_retry(path: &Path) -> Result<()> {
 	for attempt in 0..=REMOVE_RETRIES {
-		match std::fs::remove_file(path) {
+		match fs::remove_file(path) {
 			Ok(()) => return Ok(()),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
 			Err(error)
 				if attempt < REMOVE_RETRIES
 					&& matches!(

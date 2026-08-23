@@ -8,7 +8,7 @@ use omp_core::{Duration, InvocationPhase};
 use serde::Serialize;
 use strum::{Display, EnumString, IntoStaticStr};
 
-use crate::{Authority, CostClass, Durability, OperationSpec};
+use crate::{Authority, CostClass, DEFAULT_INTERRUPT_GRACE, Durability, OperationSpec};
 
 /// Callback calling convention attached to a public runtime symbol.
 #[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq, Serialize)]
@@ -1131,7 +1131,7 @@ pub const fn runtime_symbols() -> &'static [RuntimeSymbolSpec] {
 /// Runtime-duration configuration and telemetry names checked by CI.
 pub static RUNTIME_DURATION_METADATA: &[RuntimeDurationMetadata] = &[RuntimeDurationMetadata {
 	public_name:       "omp.params.interrupt_grace",
-	default_value:     crate::DEFAULT_INTERRUPT_GRACE,
+	default_value:     DEFAULT_INTERRUPT_GRACE,
 	configuration_key: "runtime.interrupt_grace",
 	telemetry_ns:      "omp.runtime.interrupt_grace.ns",
 	telemetry_unit:    "omp.runtime.interrupt_grace.unit",

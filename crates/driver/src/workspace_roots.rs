@@ -213,6 +213,8 @@ fn parse_grant(root: pb::WorkspaceRoot) -> Result<Grant, WorkspaceRootError> {
 
 #[cfg(test)]
 mod tests {
+	use std::{fs, slice};
+
 	use omp_storage::transcript::{Header, SessionId};
 
 	use super::*;
@@ -231,11 +233,11 @@ mod tests {
 		let secondary = directory.path().join("secondary");
 		let ungranted = directory.path().join("ungranted");
 		for path in [&primary, &secondary, &ungranted] {
-			std::fs::create_dir(path).unwrap();
+			fs::create_dir(path).unwrap();
 		}
-		let primary = std::fs::canonicalize(primary).unwrap();
-		let secondary = std::fs::canonicalize(secondary).unwrap();
-		let ungranted = std::fs::canonicalize(ungranted).unwrap();
+		let primary = fs::canonicalize(primary).unwrap();
+		let secondary = fs::canonicalize(secondary).unwrap();
+		let ungranted = fs::canonicalize(ungranted).unwrap();
 		let journal_path = directory.path().join("session.jsonl");
 		let mut journal = Journal::create(&journal_path, &Header {
 			v:       4,
@@ -253,12 +255,12 @@ mod tests {
 		.unwrap();
 		assert!(matches!(
 			guard
-				.add(&mut journal, 2, std::slice::from_ref(&ungranted))
+				.add(&mut journal, 2, slice::from_ref(&ungranted))
 				.await,
 			Err(WorkspaceRootError::NotGranted { .. })
 		));
 		guard
-			.add(&mut journal, 3, std::slice::from_ref(&secondary))
+			.add(&mut journal, 3, slice::from_ref(&secondary))
 			.await
 			.unwrap();
 		assert_eq!(
@@ -271,7 +273,7 @@ mod tests {
 			2
 		);
 		guard
-			.remove(&mut journal, 4, std::slice::from_ref(&secondary))
+			.remove(&mut journal, 4, slice::from_ref(&secondary))
 			.await
 			.unwrap();
 		let snapshot = guard.snapshot(&journal, &primary).unwrap();

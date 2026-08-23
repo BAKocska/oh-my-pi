@@ -44,6 +44,8 @@ mod oklch;
 mod rgb;
 mod space;
 
+use std::f32::consts;
+
 pub use named::SystemColor;
 
 use crate::{context::Theme, frame::Color};
@@ -284,7 +286,7 @@ pub fn hue(token: &str) -> Option<f32> {
 	let (raw, factor) = if let Some(raw) = strip_unit(token, "grad") {
 		(raw, 0.9)
 	} else if let Some(raw) = strip_unit(token, "rad") {
-		(raw, 180.0 / std::f32::consts::PI)
+		(raw, 180.0 / consts::PI)
 	} else if let Some(raw) = strip_unit(token, "deg") {
 		(raw, 1.0)
 	} else if let Some(raw) = strip_unit(token, "turn") {

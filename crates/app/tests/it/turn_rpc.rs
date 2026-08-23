@@ -2,12 +2,15 @@
 
 use std::{
 	collections::BTreeMap,
+	fs,
+	path::Path,
 	sync::Arc,
 	task::{Context, Poll},
 	time::Duration,
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use futures::{StreamExt as _, future::BoxFuture};
 use omp_agent::{
 	Error as TurnError, InvokeFrame, RpcTurnClient, RpcTurnSession, TurnClient, TurnInput,
@@ -36,11 +39,20 @@ use omp_inference::{
 	registry::RouteUnavailable,
 	session::ConversationSessionPlanner,
 };
-use omp_proto::{inference::v1 as pb, prost::Message as _, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1::{
+		self as pb, exec_status,
+		invoke_input::{self, chunk},
+		turn_event, value,
+	},
+	prost::Message as _,
+	thread::v1::{self as thread_pb, item},
+};
 use omp_tool::{
 	Claims, Constraint, Effects, Ev, IncomingParams, LiftedCall, Part, Precedence, Presentation,
 	PromptCaps, RecordedCall, Rev, Tool, ToolSpec,
 };
+use tokio::time;
 use tower::Service;
 
 const fn test_claims() -> Claims {
@@ -124,7 +136,7 @@ fn completion(reason: FinishReason, blocks: u32) -> ChatEvent {
 }
 
 fn scripted_registry(
-	database: &std::path::Path,
+	database: &Path,
 ) -> (Registry, ConversationSessionPlanner, FakeProvider, String) {
 	let mut compiled: CompiledCatalog =
 		serde_json::from_str(include_str!("../../../catalog/data/catalog.normalized.json"))
@@ -245,7 +257,7 @@ fn user_thread() -> thread_pb::Thread {
 
 async fn next_event(session: &mut RpcTurnSession) -> Option<Result<pb::TurnEvent, TurnError>> {
 	let mut events = session.events();
-	tokio::time::timeout(TIMEOUT, events.next())
+	time::timeout(TIMEOUT, events.next())
 		.await
 		.expect("turn event timed out")
 }
@@ -253,7 +265,7 @@ async fn next_event(session: &mut RpcTurnSession) -> Option<Result<pb::TurnEvent
 async fn outcome(session: &mut RpcTurnSession) -> pb::Outcome {
 	loop {
 		match next_event(session).await {
-			Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) })) => {
+			Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) })) => {
 				return outcome;
 			},
 			Some(Ok(_)) => {},
@@ -263,8 +275,8 @@ async fn outcome(session: &mut RpcTurnSession) -> pb::Outcome {
 	}
 }
 
-async fn observed_response(responses: &flume::Receiver<WorkflowResponse>) -> WorkflowResponse {
-	tokio::time::timeout(TIMEOUT, responses.recv_async())
+async fn observed_response(responses: &Receiver<WorkflowResponse>) -> WorkflowResponse {
+	time::timeout(TIMEOUT, responses.recv_async())
 		.await
 		.expect("provider response timed out")
 		.expect("provider response observer closed")
@@ -288,7 +300,7 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 	)
 	.await
 	.expect("test gateway starts");
-	let metadata = std::fs::metadata(&socket).expect("bound UDS metadata");
+	let metadata = fs::metadata(&socket).expect("bound UDS metadata");
 	assert_eq!(metadata.permissions().mode() & 0o077, 0, "UDS must be owner-only");
 
 	let channel = omp_rpc::uds::connect(&socket)
@@ -346,7 +358,7 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 	let prior_result = thread_pb::Item {
 		seq:           0,
 		created_at_ms: 0,
-		kind:          Some(thread_pb::item::Kind::ToolResult(thread_pb::ToolResult {
+		kind:          Some(item::Kind::ToolResult(thread_pb::ToolResult {
 			call_id: "call-1".to_owned(),
 			parts: vec![thread_pb::Part {
 				kind: Some(thread_pb::part::Kind::Text("/work/omp".to_owned())),
@@ -377,7 +389,7 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 	));
 	let invoke = loop {
 		match next_event(&mut delta).await {
-			Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Invoke(invoke)) })) => {
+			Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Invoke(invoke)) })) => {
 				break invoke;
 			},
 			Some(Ok(_)) => {},
@@ -388,8 +400,8 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 	assert_eq!(invoke.name, "exec.shell");
 	let input = pb::InvokeInput {
 		invocation_id: "invoke-2".to_owned(),
-		payload:       Some(pb::invoke_input::Payload::Chunk(pb::invoke_input::Chunk {
-			channel: pb::invoke_input::chunk::Channel::Stdout as i32,
+		payload:       Some(invoke_input::Payload::Chunk(pb::invoke_input::Chunk {
+			channel: chunk::Channel::Stdout as i32,
 			data:    Bytes::from_static(b"live output"),
 		})),
 	};
@@ -403,7 +415,7 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 			..Default::default()
 		}),
 		status: Some(pb::ExecStatus {
-			outcome: pb::exec_status::Outcome::Exited as i32,
+			outcome: exec_status::Outcome::Exited as i32,
 			exit_code: 0,
 			..Default::default()
 		}),
@@ -648,12 +660,12 @@ fn history_registry(with_lift: bool) -> omp_tool::Registry {
 }
 
 fn string_value(value: &str) -> pb::Value {
-	pb::Value { kind: Some(pb::value::Kind::String(value.to_owned())) }
+	pb::Value { kind: Some(value::Kind::String(value.to_owned())) }
 }
 
 fn map_value(fields: impl IntoIterator<Item = (&'static str, pb::Value)>) -> pb::Value {
 	pb::Value {
-		kind: Some(pb::value::Kind::Map(pb::ValueMap {
+		kind: Some(value::Kind::Map(pb::ValueMap {
 			fields: fields
 				.into_iter()
 				.map(|(key, value)| (key.to_owned(), value))
@@ -760,7 +772,7 @@ fn canonical_history_uses_only_live_definitions_and_lifts_deterministically() {
 	);
 	assert_eq!(provider_schema_bytes(&first_request), provider_schema_bytes(&second_request));
 	let lifted_call = match first.items[0].kind.as_ref() {
-		Some(thread_pb::item::Kind::ToolCall(call)) => call,
+		Some(item::Kind::ToolCall(call)) => call,
 		other => panic!("expected lifted ToolCall, got {other:?}"),
 	};
 	assert_eq!(lifted_call.args_json.as_ref(), br#"{"current":"kept"}"#);
@@ -771,7 +783,7 @@ fn canonical_history_uses_only_live_definitions_and_lifts_deterministically() {
 		.and_then(|value| value.kind.as_ref());
 	assert!(matches!(revision, Some(pb::value::Kind::String(value)) if value == "hl.2"));
 	let lifted_result = match first.items[1].kind.as_ref() {
-		Some(thread_pb::item::Kind::ToolResult(result)) => result,
+		Some(item::Kind::ToolResult(result)) => result,
 		other => panic!("expected lifted ToolResult, got {other:?}"),
 	};
 	assert!(lifted_result.is_error, "Ok-to-Fault lift must recompute branch metadata");

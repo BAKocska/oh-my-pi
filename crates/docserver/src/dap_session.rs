@@ -3,7 +3,9 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
-	path::PathBuf,
+	fs, io,
+	path::{Path, PathBuf},
+	process::Stdio,
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -19,9 +21,11 @@ use serde_json::{Map, Value, json};
 use strum::{EnumString, IntoStaticStr};
 use thiserror::Error;
 use tokio::{
-	io::AsyncReadExt,
-	process::Child,
-	sync::{Mutex as AsyncMutex, broadcast},
+	io::{AsyncRead, AsyncReadExt},
+	process::{self, Child},
+	sync::{Mutex as AsyncMutex, broadcast::Receiver},
+	time,
+	time::MissedTickBehavior,
 };
 
 use crate::{
@@ -231,7 +235,7 @@ pub enum DapSessionError {
 	UnsupportedAction(DapAction),
 	/// Adapter process ownership failed.
 	#[error("DAP adapter process failed")]
-	Process(#[from] std::io::Error),
+	Process(#[from] io::Error),
 	/// Parent-child registration would create a cycle.
 	#[error("debug session tree cannot contain a cycle")]
 	SessionTreeCycle,
@@ -435,8 +439,8 @@ impl DapSession {
 	fn spawn_maintenance(session: &Arc<Self>) {
 		let weak = Arc::downgrade(session);
 		tokio::spawn(async move {
-			let mut interval = tokio::time::interval(LIVENESS_INTERVAL);
-			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			let mut interval = time::interval(LIVENESS_INTERVAL);
+			interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 			let mut intervals = 0_u8;
 			loop {
 				interval.tick().await;
@@ -614,7 +618,7 @@ impl DapSession {
 	}
 
 	/// Subscribes to adapter events before starting an action.
-	pub fn subscribe(&self) -> broadcast::Receiver<DapInbound> {
+	pub fn subscribe(&self) -> Receiver<DapInbound> {
 		self.protocol.subscribe()
 	}
 
@@ -985,7 +989,7 @@ impl DapSession {
 		if let Some(path) = &self.cleanup_path {
 			match tokio::fs::remove_file(path).await {
 				Ok(()) => {},
-				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 				Err(error) => return Err(DapSessionError::Process(error)),
 			}
 		}
@@ -996,7 +1000,7 @@ impl DapSession {
 	/// output, and binds its lifetime to this session tree.
 	pub async fn run_in_terminal(
 		self: &Arc<Self>,
-		workspace: &std::path::Path,
+		workspace: &Path,
 		arguments: &Value,
 	) -> Result<Value, DapSessionError> {
 		let argv = arguments
@@ -1012,20 +1016,20 @@ impl DapSession {
 		let cwd = arguments
 			.get("cwd")
 			.and_then(Value::as_str)
-			.map(std::path::PathBuf::from)
+			.map(PathBuf::from)
 			.unwrap_or_else(|| workspace.to_path_buf());
 		let cwd = tokio::fs::canonicalize(cwd).await?;
 		let workspace = tokio::fs::canonicalize(workspace).await?;
 		if !cwd.starts_with(&workspace) {
 			return Err(DapSessionError::InvalidReverseRequest);
 		}
-		let mut command = tokio::process::Command::new(program);
+		let mut command = process::Command::new(program);
 		command
 			.args(rest.iter().map(|value| value.as_str().unwrap_or_default()))
 			.current_dir(cwd)
-			.stdin(std::process::Stdio::null())
-			.stdout(std::process::Stdio::piped())
-			.stderr(std::process::Stdio::piped())
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
 			.kill_on_drop(true)
 			.env("CI", "1")
 			.env("GIT_TERMINAL_PROMPT", "0");
@@ -1042,7 +1046,7 @@ impl DapSession {
 			unsafe {
 				command.pre_exec(|| {
 					if libc::setsid() < 0 {
-						Err(std::io::Error::last_os_error())
+						Err(io::Error::last_os_error())
 					} else {
 						Ok(())
 					}
@@ -1108,7 +1112,7 @@ impl DapSession {
 impl Drop for DapSession {
 	fn drop(&mut self) {
 		if let Some(path) = &self.cleanup_path {
-			let _ = std::fs::remove_file(path);
+			let _ = fs::remove_file(path);
 		}
 	}
 }
@@ -1172,7 +1176,7 @@ fn now_ms() -> u64 {
 
 fn spawn_output_reader<R>(session: Weak<DapSession>, mut reader: R)
 where
-	R: tokio::io::AsyncRead + Unpin + Send + 'static,
+	R: AsyncRead + Unpin + Send + 'static,
 {
 	tokio::spawn(async move {
 		let mut buffer = [0_u8; 4096];
@@ -1200,8 +1204,13 @@ fn same_breakpoint(left: &Value, right: &Value, identity: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
 	use omp_core::sf;
+	use tokio::{io, task::JoinHandle};
 
 	use super::*;
+	use crate::{
+		dap_adapter::DapAdapterSpec,
+		lsp_process::{read_frame, write_frame},
+	};
 
 	#[test]
 	fn policy_tiers_are_environment_data() {
@@ -1216,17 +1225,15 @@ mod tests {
 
 	fn fake_adapter(
 		supports_configuration_done: bool,
-	) -> (DapProtocol, Arc<Mutex<Vec<Str>>>, tokio::task::JoinHandle<()>) {
-		let (client, mut adapter) = tokio::io::duplex(16 * 1024);
-		let (reader, writer) = tokio::io::split(client);
+	) -> (DapProtocol, Arc<Mutex<Vec<Str>>>, JoinHandle<()>) {
+		let (client, mut adapter) = io::duplex(16 * 1024);
+		let (reader, writer) = io::split(client);
 		let protocol = DapProtocol::from_streams(reader, writer);
 		let requests = Arc::new(Mutex::new(Vec::new()));
 		let request_log = Arc::clone(&requests);
 		let task = tokio::spawn(async move {
 			loop {
-				let Ok(body) =
-					crate::lsp_process::read_frame(&mut adapter, 8 * 1024, 16 * 1024 * 1024).await
-				else {
+				let Ok(body) = read_frame(&mut adapter, 8 * 1024, 16 * 1024 * 1024).await else {
 					break;
 				};
 				let request: Value = serde_json::from_slice(&body).unwrap();
@@ -1247,9 +1254,7 @@ mod tests {
 					"body": response_body,
 				});
 				let body = serde_json::to_vec(&response).unwrap();
-				crate::lsp_process::write_frame(&mut adapter, &body)
-					.await
-					.unwrap();
+				write_frame(&mut adapter, &body).await.unwrap();
 				if command == "initialize" && supports_configuration_done {
 					let event = serde_json::to_vec(&json!({
 						"seq": 101,
@@ -1258,9 +1263,7 @@ mod tests {
 						"body": {},
 					}))
 					.unwrap();
-					crate::lsp_process::write_frame(&mut adapter, &event)
-						.await
-						.unwrap();
+					write_frame(&mut adapter, &event).await.unwrap();
 				}
 			}
 		});
@@ -1268,7 +1271,7 @@ mod tests {
 	}
 
 	fn adapter_arguments(skip_attach_request: bool) -> Map<String, Value> {
-		let mut spec = crate::dap_adapter::DapAdapterSpec::new("test", "test").unwrap();
+		let mut spec = DapAdapterSpec::new("test", "test").unwrap();
 		spec
 			.attach_defaults
 			.insert("request".to_owned(), Value::String("attach".to_owned()));
@@ -1280,7 +1283,7 @@ mod tests {
 		spec.merged_arguments(true, &Map::new())
 	}
 
-	async fn stop_fake_adapter(session: &DapSession, task: tokio::task::JoinHandle<()>) {
+	async fn stop_fake_adapter(session: &DapSession, task: JoinHandle<()>) {
 		session.protocol.shutdown();
 		task.abort();
 		let _ = task.await;
@@ -1299,8 +1302,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn output_ring_keeps_only_the_newest_bytes() {
-		let (stream, _) = tokio::io::duplex(64);
-		let (reader, writer) = tokio::io::split(stream);
+		let (stream, _) = io::duplex(64);
+		let (reader, writer) = io::split(stream);
 		let session = DapSession {
 			id: sf!("test"),
 			adapter: sf!("test"),

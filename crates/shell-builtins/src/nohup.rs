@@ -6,7 +6,7 @@
 //! Registration marks it as a transparent background wrapper, allowing brush to
 //! spawn the operand directly with session reparenting.
 
-use std::{future::Future, io::Write};
+use std::{future::Future, io::Write, result};
 
 use clap::Parser;
 use omp_shell_engine::{
@@ -51,7 +51,7 @@ impl NohupCommand {
 impl builtins::Command for NohupCommand {
 	type Error = omp_shell_engine::Error;
 
-	fn new<I>(args: I) -> std::result::Result<Self, clap::Error>
+	fn new<I>(args: I) -> result::Result<Self, clap::Error>
 	where
 		I: IntoIterator<Item = String>,
 	{
@@ -62,8 +62,7 @@ impl builtins::Command for NohupCommand {
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,
 		context: ExecutionContext<'_, SE>,
-	) -> impl Future<Output = std::result::Result<ExecutionResult, omp_shell_engine::Error>> + Send
-	{
+	) -> impl Future<Output = result::Result<ExecutionResult, omp_shell_engine::Error>> + Send {
 		let command = self.command.clone();
 		let (help, version) = (self.help, self.version);
 		async move {

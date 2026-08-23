@@ -1,9 +1,13 @@
 //! Native-device coverage filtering for configured MCP mounts.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	fmt, sync,
+};
 
 use omp_core::{SecretString, Str};
-use omp_inference::id::PrincipalId;
+use omp_inference::{auth, id::PrincipalId};
+use url::Url;
 
 use super::{
 	auth_authority::{AuthAffinity, CombinedAuthAuthority},
@@ -50,8 +54,8 @@ pub struct ExtractedExaKey {
 	pub key:    SecretString,
 }
 
-impl std::fmt::Debug for ExtractedExaKey {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ExtractedExaKey {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("ExtractedExaKey")
 			.field("server", &self.server)
@@ -106,7 +110,7 @@ pub fn filter_native_coverage(
 			continue;
 		}
 		let mut retained = server.clone();
-		retained.config = std::sync::Arc::new(sanitized);
+		retained.config = sync::Arc::new(sanitized);
 		result
 			.mounts
 			.insert(name.clone(), FilteredMount { server: retained, suppressed_tools });
@@ -122,7 +126,7 @@ pub fn import_exa_keys(
 	principal: PrincipalId,
 	keys: Vec<ExtractedExaKey>,
 	now_ms: u64,
-) -> Result<Vec<AuthAffinity>, omp_inference::auth::StoreError> {
+) -> Result<Vec<AuthAffinity>, auth::StoreError> {
 	let mut affinities = Vec::with_capacity(keys.len());
 	for extracted in keys {
 		let affinity =
@@ -138,7 +142,7 @@ fn is_exa_server(name: &str, config: &McpServerConfig) -> bool {
 		return true;
 	}
 	if config.url.as_ref().is_some_and(|value| {
-		url::Url::parse(value)
+		Url::parse(value)
 			.ok()
 			.and_then(|url| {
 				url.host_str()
@@ -187,7 +191,7 @@ fn extract_exa_key(config: &mut McpServerConfig) -> Option<SecretString> {
 		config.env.insert(Str::new_static("EXA_API_KEY"), value);
 	}
 	if let Some(raw) = config.url.as_ref()
-		&& let Ok(mut url) = url::Url::parse(raw)
+		&& let Ok(mut url) = Url::parse(raw)
 		&& let Some(value) = url
 			.query_pairs()
 			.find(|(key, _)| key.eq_ignore_ascii_case(EXA_KEY_QUERY))
@@ -239,7 +243,7 @@ fn requested_exa_tools(config: &McpServerConfig) -> Option<BTreeSet<Str>> {
 		TransportKind::Http | TransportKind::Sse => config
 			.url
 			.as_ref()
-			.and_then(|raw| url::Url::parse(raw).ok())
+			.and_then(|raw| Url::parse(raw).ok())
 			.and_then(|url| {
 				url.query_pairs()
 					.find(|(key, _)| key.eq_ignore_ascii_case("tools"))

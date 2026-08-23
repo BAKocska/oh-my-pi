@@ -1,14 +1,23 @@
 //! Execution support for shell.
 
-use std::{io::Read, path::Path};
+use std::{fs, io, io::Read, iter, path::Path};
 
 use crate::{
-	ExecutionControlFlow, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, SourceInfo,
-	arithmetic::Evaluatable as _, callstack, error, interp::Execute as _, openfiles,
+	ExecutionControlFlow, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, Shell,
+	SourceInfo,
+	arithmetic::Evaluatable as _,
+	callstack, error,
+	extensions::ShellExtensions,
+	interp::Execute as _,
+	openfiles::OpenFile,
+	parser::{
+		ParseError, Parser,
+		ast::{ArithmeticExpr, Program},
+	},
 	trace_categories,
 };
 
-impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+impl<SE: ShellExtensions> Shell<SE> {
 	/// Returns the default execution parameters for this shell.
 	pub fn default_exec_params(&self) -> ExecutionParameters {
 		let mut params = ExecutionParameters::default();
@@ -30,7 +39,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		let path = path.as_ref();
 		if path.exists() {
 			self
-				.source_script(path, std::iter::empty::<String>(), params)
+				.source_script(path, iter::empty::<String>(), params)
 				.await?;
 			Ok(true)
 		} else {
@@ -85,10 +94,10 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		let path = path.as_ref();
 		tracing::debug!("sourcing: {}", path.display());
 
-		let mut options = std::fs::File::options();
+		let mut options = fs::File::options();
 		options.read(true);
 
-		let opened_file: openfiles::OpenFile = self
+		let opened_file: OpenFile = self
 			.open_file(&options, path, params)
 			.map_err(|e| error::ErrorKind::FailedSourcingFile(path.to_owned(), e))?;
 
@@ -96,13 +105,13 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 			return Err(
 				error::ErrorKind::FailedSourcingFile(
 					path.to_owned(),
-					std::io::Error::from(std::io::ErrorKind::IsADirectory),
+					io::Error::from(io::ErrorKind::IsADirectory),
 				)
 				.into(),
 			);
 		}
 
-		let source_info = crate::SourceInfo::from(path.to_owned());
+		let source_info = SourceInfo::from(path.to_owned());
 
 		let mut result = self
 			.source_file(opened_file, &source_info, args, params, call_type)
@@ -130,13 +139,13 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	async fn source_file<F: Read, S: Into<String>, I: Iterator<Item = S>>(
 		&mut self,
 		file: F,
-		source_info: &crate::SourceInfo,
+		source_info: &SourceInfo,
 		args: I,
 		params: &ExecutionParameters,
 		call_type: callstack::ScriptCallType,
 	) -> Result<ExecutionResult, error::Error> {
-		let mut reader = std::io::BufReader::new(file);
-		let mut parser = crate::parser::Parser::new(&mut reader, &self.parser_options());
+		let mut reader = io::BufReader::new(file);
+		let mut parser = Parser::new(&mut reader, &self.parser_options());
 
 		tracing::debug!(target: trace_categories::PARSE, "Parsing sourced file: {}", source_info.source);
 		let parse_result = parser.parse_program();
@@ -167,7 +176,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	pub async fn run_string<S: Into<String>>(
 		&mut self,
 		command: S,
-		source_info: &crate::SourceInfo,
+		source_info: &SourceInfo,
 		params: &ExecutionParameters,
 	) -> Result<ExecutionResult, error::Error> {
 		let parse_result = self.parse_string(command);
@@ -238,8 +247,8 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 
 	pub(crate) async fn run_parsed_result(
 		&mut self,
-		parse_result: Result<crate::parser::ast::Program, crate::parser::ParseError>,
-		source_info: &crate::SourceInfo,
+		parse_result: Result<Program, ParseError>,
+		source_info: &SourceInfo,
 		params: &ExecutionParameters,
 	) -> Result<ExecutionResult, error::Error> {
 		// If parsing succeeded, run the program. If there's a parse error, it's fatal
@@ -275,17 +284,14 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	/// * `params` - Execution parameters.
 	pub async fn run_program(
 		&mut self,
-		program: crate::parser::ast::Program,
+		program: Program,
 		params: &ExecutionParameters,
 	) -> Result<ExecutionResult, error::Error> {
 		program.execute(self, params).await
 	}
 
 	/// Evaluate the given arithmetic expression, returning the result.
-	pub fn eval_arithmetic(
-		&mut self,
-		expr: &crate::parser::ast::ArithmeticExpr,
-	) -> Result<i64, error::Error> {
+	pub fn eval_arithmetic(&mut self, expr: &ArithmeticExpr) -> Result<i64, error::Error> {
 		Ok(expr.eval(self)?)
 	}
 }

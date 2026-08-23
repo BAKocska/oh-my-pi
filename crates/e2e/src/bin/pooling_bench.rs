@@ -7,9 +7,11 @@
 //! based on comparable measurements.
 
 use std::{
+	env,
 	ffi::OsString,
 	fs::File,
 	path::{Path, PathBuf},
+	process,
 	process::Command,
 };
 
@@ -124,7 +126,7 @@ fn help() {
 /// Parses the intentionally small command surface without bringing a CLI
 /// dependency into e2e.
 fn arguments() -> Result<(PathBuf, PathBuf, Option<usize>)> {
-	let mut arguments = std::env::args_os().skip(1);
+	let mut arguments = env::args_os().skip(1);
 	let mut runner = None;
 	let mut output = None;
 	let mut limit = None;
@@ -132,7 +134,7 @@ fn arguments() -> Result<(PathBuf, PathBuf, Option<usize>)> {
 		match argument.to_string_lossy().as_ref() {
 			"--help" | "-h" => {
 				help();
-				std::process::exit(0);
+				process::exit(0);
 			},
 			"--runner" => runner = Some(PathBuf::from(next_value(&mut arguments, "--runner")?)),
 			"--output" => output = Some(PathBuf::from(next_value(&mut arguments, "--output")?)),

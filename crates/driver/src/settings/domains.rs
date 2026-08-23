@@ -53,7 +53,7 @@ const fn default_paste_threshold() -> usize {
 	strum::IntoStaticStr,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum HyperlinkMode {
 	/// Never emit OSC 8 hyperlinks.
 	Off,
@@ -79,7 +79,7 @@ pub enum HyperlinkMode {
 	strum::IntoStaticStr,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum ShimmerMode {
 	/// Soft cosine highlight.
 	#[default]
@@ -88,31 +88,6 @@ pub enum ShimmerMode {
 	Kitt,
 	/// Disable pending-content animation.
 	Disabled,
-}
-/// Native-scrollback policy after a settled in-place width resize.
-#[derive(
-	Clone,
-	Copy,
-	Debug,
-	Default,
-	Eq,
-	PartialEq,
-	Serialize,
-	Deserialize,
-	strum::Display,
-	strum::EnumString,
-	strum::IntoStaticStr,
-)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
-pub enum ResizeScrollbackMode {
-	/// Replay the transcript at the current width below existing history.
-	Append,
-	/// Erase native history and replay one current-width transcript copy.
-	Rebuild,
-	/// Repaint only the viewport, retaining existing native history.
-	#[default]
-	Preserve,
 }
 
 /// TUI-specific rendering and input behavior.
@@ -131,8 +106,6 @@ pub struct TuiSettings {
 	pub max_inline_images: u16,
 	/// Keep prompt chrome stable during IME preedit.
 	pub ime_safe_cursor:   bool,
-	/// Native-scrollback policy after a settled in-place width resize.
-	pub resize_scrollback: ResizeScrollbackMode,
 }
 
 impl Default for TuiSettings {
@@ -144,7 +117,6 @@ impl Default for TuiSettings {
 			tight:             false,
 			max_inline_images: default_max_inline_images(),
 			ime_safe_cursor:   false,
-			resize_scrollback: ResizeScrollbackMode::Append,
 		}
 	}
 }
@@ -187,13 +159,6 @@ impl SettingsDomain for TuiSettings {
 			"Keep prompt chrome stable during IME preedit.",
 			SettingKind::Boolean,
 			60,
-		),
-		field(
-			"tui.resizeScrollback",
-			"Resize Scrollback",
-			"Refresh stale-width pane history by appending, rebuilding, or preserving it.",
-			SettingKind::Enum(&["append", "rebuild", "preserve"]),
-			70,
 		),
 	];
 }
@@ -250,7 +215,7 @@ impl SettingsDomain for RootDisplaySettings {
 	strum::IntoStaticStr,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum NotifyToggle {
 	/// Send the notification.
 	#[default]
@@ -590,7 +555,7 @@ impl SettingsDomain for InteractionSettings {
 	strum::IntoStaticStr,
 )]
 #[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum TtsrContextMode {
 	/// Remove abandoned partial output before replay.
 	#[default]
@@ -614,7 +579,7 @@ pub enum TtsrContextMode {
 	strum::IntoStaticStr,
 )]
 #[serde(rename_all = "kebab-case")]
-#[strum(serialize_all = "kebab-case", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 pub enum TtsrInterruptMode {
 	/// Never interrupt generation.
 	Never,
@@ -736,7 +701,7 @@ impl SettingsDomain for TtsrSettings {
 	strum::IntoStaticStr,
 )]
 #[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum ShareStore {
 	/// Upload directly to the configured encrypted blob endpoint.
 	#[default]

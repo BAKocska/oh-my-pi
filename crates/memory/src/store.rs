@@ -1,8 +1,12 @@
 //! Multiprocess-safe per-bank SQLite store and rebuildable index generations.
 
 use std::{
+	collections::HashMap,
+	fs, io,
 	path::{Path, PathBuf},
+	result,
 	sync::atomic::{AtomicU64, Ordering},
+	time,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -96,6 +100,8 @@ pub enum EditResult {
 	ImmutableFact,
 }
 
+/// Borrowed view of one durable retained transcript window handed to memory
+/// extraction and embedding.
 pub struct RetainedWindow<'a> {
 	/// Session journal identity.
 	pub session_id:                 &'a str,
@@ -165,7 +171,7 @@ impl BankStore {
 	) -> Result<Self> {
 		let store = Self { path: path.into(), bank, identity_root: identity_root.into() };
 		if let Some(parent) = store.path.parent() {
-			std::fs::create_dir_all(parent)?;
+			fs::create_dir_all(parent)?;
 		}
 		let mut connection = store.connection()?;
 		store.migrate(&mut connection)?;
@@ -622,7 +628,7 @@ impl BankStore {
 				.map(|record| RankedCandidate { score: record.importance, record })
 		})?;
 		rows
-			.collect::<std::result::Result<Vec<_>, _>>()
+			.collect::<result::Result<Vec<_>, _>>()
 			.map_err(Into::into)
 	}
 
@@ -634,7 +640,7 @@ impl BankStore {
 			return Ok(Vec::new());
 		}
 		let connection = self.connection()?;
-		let mut scores = std::collections::HashMap::<Str, f64>::new();
+		let mut scores = HashMap::<Str, f64>::new();
 		let mut triple_query = connection.prepare(
 			"SELECT source_memory_id, confidence FROM triples\nWHERE generation = ?1 AND \
 			 (lower(subject) LIKE ?2 OR lower(predicate) LIKE ?2 OR lower(object) LIKE ?2)\nLIMIT 256",
@@ -737,7 +743,7 @@ impl BankStore {
 			row_to_record(row, &self.bank, tier)
 		})?;
 		rows
-			.collect::<std::result::Result<Vec<_>, _>>()
+			.collect::<result::Result<Vec<_>, _>>()
 			.map_err(Into::into)
 	}
 
@@ -866,7 +872,7 @@ impl BankStore {
 			})
 		})?;
 		rows
-			.collect::<std::result::Result<Vec<_>, _>>()
+			.collect::<result::Result<Vec<_>, _>>()
 			.map_err(Into::into)
 	}
 
@@ -875,7 +881,7 @@ impl BankStore {
 			| OpenFlags::SQLITE_OPEN_READ_WRITE
 			| OpenFlags::SQLITE_OPEN_NO_MUTEX;
 		let connection = Connection::open_with_flags(&self.path, flags)?;
-		connection.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+		connection.busy_timeout(time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
 		connection.execute_batch(
 			"PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
 		)?;
@@ -1079,7 +1085,7 @@ fn new_memory_id(bank: &str, session: &str, content: &str) -> Str {
 fn unix_millis() -> Result<u128> {
 	Ok(SystemTime::now()
 		.duration_since(UNIX_EPOCH)
-		.map_err(std::io::Error::other)?
+		.map_err(io::Error::other)?
 		.as_millis())
 }
 

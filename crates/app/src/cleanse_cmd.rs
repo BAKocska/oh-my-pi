@@ -1,6 +1,6 @@
 //! Terminal presentation adapter for the driver-owned cleanse workflow.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{env, future::Future, pin::Pin, sync::Arc};
 
 use miette::IntoDiagnostic as _;
 use omp_core::Str;
@@ -9,6 +9,8 @@ use omp_driver::cleanse::{
 	production::{CleansePresentation, PresentationError, ProductionCleanseHost},
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::pickers;
 
 struct TerminalCleansePresentation;
 
@@ -36,15 +38,14 @@ impl CleansePresentation for TerminalCleansePresentation {
 			if cancel.is_cancelled() {
 				return Ok(None);
 			}
-			crate::pickers::prompt_cleanse_request()
-				.map_err(|error| Box::new(error) as PresentationError)
+			pickers::prompt_cleanse_request().map_err(|error| Box::new(error) as PresentationError)
 		})
 	}
 }
 
 /// Runs the driver-owned cleanse workflow through terminal pickers.
 pub async fn run(args: CleanseArgs) -> miette::Result<()> {
-	let root = std::env::current_dir().into_diagnostic()?;
+	let root = env::current_dir().into_diagnostic()?;
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let host = ProductionCleanseHost::open(root, data_dir, Arc::new(TerminalCleansePresentation))
 		.into_diagnostic()?;

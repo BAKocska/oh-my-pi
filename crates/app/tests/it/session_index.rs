@@ -1,10 +1,13 @@
 //! Session-index integration checks for attached chat journals.
 
-use std::sync::Arc;
+use std::{fs, sync::Arc};
 
 use omp_agent::Journal;
 use omp_core::{Hash32, Str, sf};
-use omp_proto::{inference::v1 as pb, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::{v1 as pb, v1::usage},
+	thread::v1 as thread_pb,
+};
 use omp_storage::{
 	index::{NewSession, SessionFilter, SessionIndex, SessionKind},
 	transcript::{Header, SessionId, TitleSource, TurnInputRecord, TurnOptionsRecord, TurnStart},
@@ -16,8 +19,8 @@ fn attached_chat_journal_publishes_title_and_canonical_usage_to_project_index() 
 	let scratch = tempdir().expect("temporary project state");
 	let root = scratch.path().join("project");
 	let sessions = scratch.path().join("sessions");
-	std::fs::create_dir_all(&root).expect("project root");
-	std::fs::create_dir_all(&sessions).expect("sessions directory");
+	fs::create_dir_all(&root).expect("project root");
+	fs::create_dir_all(&sessions).expect("sessions directory");
 
 	let index = Arc::new(
 		SessionIndex::open(scratch.path().join("sessions.sqlite3"))
@@ -82,7 +85,7 @@ fn attached_chat_journal_publishes_title_and_canonical_usage_to_project_index() 
 				output_tokens: 30,
 				cache_read_tokens: 40,
 				cache_write_tokens: 5,
-				accuracy: pb::usage::Accuracy::Exact as i32,
+				accuracy: usage::Accuracy::Exact as i32,
 				total_tokens: Some(195),
 				context_tokens: Some(8_000),
 				premium_requests: Some(1),

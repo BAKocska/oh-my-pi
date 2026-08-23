@@ -11,6 +11,8 @@ mod pipelines;
 mod redirections;
 mod simple_commands;
 
+use std::io;
+
 use crate::parser::{
 	ast::Program,
 	error::ParseError,
@@ -36,6 +38,6 @@ macro_rules! assert_snapshot_redacted {
 }
 
 fn test_with_snapshot(input: &str) -> Result<Program, ParseError> {
-	let mut parser = Parser::new(std::io::Cursor::new(input), &ParserOptions::default());
+	let mut parser = Parser::new(io::Cursor::new(input), &ParserOptions::default());
 	parser.parse_program()
 }

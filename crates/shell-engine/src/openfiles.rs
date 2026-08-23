@@ -1,6 +1,15 @@
 //! Managing files open within a shell instance.
 
-use std::{collections::HashMap, io::IsTerminal, process::Stdio};
+#[cfg(unix)]
+use std::os::fd;
+use std::{
+	collections::HashMap,
+	fmt::{self, Display},
+	fs, io,
+	io::IsTerminal,
+	iter,
+	process::Stdio,
+};
 
 use crate::{ShellFd, error, ioutils, sys};
 
@@ -9,35 +18,35 @@ use crate::{ShellFd, error, ioutils, sys};
 ///
 /// Types that implement this trait are expected to be cloneable via the
 /// `clone_box` function.
-pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
+pub trait Stream: io::Read + io::Write + Send + Sync {
 	/// Clones the stream into a boxed trait object.
 	fn clone_box(&self) -> Box<dyn Stream>;
 
 	/// Converts the stream into an `OwnedFd`. Returns an error if the operation
 	/// is not supported or if it fails.
 	#[cfg(unix)]
-	fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error>;
+	fn try_clone_to_owned(&self) -> Result<fd::OwnedFd, error::Error>;
 
 	/// Borrows the stream as a `BorrowedFd`. Returns an error if the operation
 	/// is not supported or if it fails.
 	#[cfg(unix)]
-	fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error>;
+	fn try_borrow_as_fd(&self) -> Result<fd::BorrowedFd<'_>, error::Error>;
 }
 
 /// Represents a file open in a shell context.
 pub enum OpenFile {
 	/// The original standard input this process was started with.
-	Stdin(std::io::Stdin),
+	Stdin(io::Stdin),
 	/// The original standard output this process was started with.
-	Stdout(std::io::Stdout),
+	Stdout(io::Stdout),
 	/// The original standard error this process was started with.
-	Stderr(std::io::Stderr),
+	Stderr(io::Stderr),
 	/// A file open for reading or writing.
-	File(std::fs::File),
+	File(fs::File),
 	/// A read end of a pipe.
-	PipeReader(std::io::PipeReader),
+	PipeReader(io::PipeReader),
 	/// A write end of a pipe.
-	PipeWriter(std::io::PipeWriter),
+	PipeWriter(io::PipeWriter),
 	/// A custom stream.
 	Stream(Box<dyn Stream>),
 }
@@ -58,8 +67,8 @@ impl Clone for OpenFile {
 	}
 }
 
-impl std::fmt::Display for OpenFile {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for OpenFile {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Stdin(_) => write!(f, "stdin"),
 			Self::Stdout(_) => write!(f, "stdout"),
@@ -74,11 +83,11 @@ impl std::fmt::Display for OpenFile {
 
 impl OpenFile {
 	/// Tries to duplicate the open file.
-	pub fn try_clone(&self) -> Result<Self, std::io::Error> {
+	pub fn try_clone(&self) -> Result<Self, io::Error> {
 		let result = match self {
-			Self::Stdin(_) => std::io::stdin().into(),
-			Self::Stdout(_) => std::io::stdout().into(),
-			Self::Stderr(_) => std::io::stderr().into(),
+			Self::Stdin(_) => io::stdin().into(),
+			Self::Stdout(_) => io::stdout().into(),
+			Self::Stderr(_) => io::stderr().into(),
 			Self::File(f) => f.try_clone()?.into(),
 			Self::PipeReader(f) => f.try_clone()?.into(),
 			Self::PipeWriter(f) => f.try_clone()?.into(),
@@ -90,7 +99,7 @@ impl OpenFile {
 
 	/// Converts the open file into an `OwnedFd`.
 	#[cfg(unix)]
-	pub(crate) fn try_clone_to_owned(self) -> Result<std::os::fd::OwnedFd, error::Error> {
+	pub(crate) fn try_clone_to_owned(self) -> Result<fd::OwnedFd, error::Error> {
 		use std::os::fd::AsFd as _;
 
 		match self {
@@ -98,8 +107,8 @@ impl OpenFile {
 			Self::Stdout(f) => Ok(f.as_fd().try_clone_to_owned()?),
 			Self::Stderr(f) => Ok(f.as_fd().try_clone_to_owned()?),
 			Self::File(f) => Ok(f.into()),
-			Self::PipeReader(r) => Ok(std::os::fd::OwnedFd::from(r)),
-			Self::PipeWriter(w) => Ok(std::os::fd::OwnedFd::from(w)),
+			Self::PipeReader(r) => Ok(fd::OwnedFd::from(r)),
+			Self::PipeWriter(w) => Ok(fd::OwnedFd::from(w)),
 			Self::Stream(s) => s.try_clone_to_owned(),
 		}
 	}
@@ -111,7 +120,7 @@ impl OpenFile {
 	/// Returns an error if the operation is not supported for the underlying
 	/// file type.
 	#[cfg(unix)]
-	pub fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
+	pub fn try_borrow_as_fd(&self) -> Result<fd::BorrowedFd<'_>, error::Error> {
 		use std::os::fd::AsFd as _;
 
 		match self {
@@ -129,7 +138,7 @@ impl OpenFile {
 		#[cfg(unix)]
 		{
 			let owned_fd = self.try_clone_to_owned()?;
-			Ok(Stdio::from(std::fs::File::from(owned_fd)))
+			Ok(Stdio::from(fs::File::from(owned_fd)))
 		}
 
 		#[cfg(not(unix))]
@@ -167,83 +176,77 @@ impl OpenFile {
 	}
 }
 
-impl From<std::io::Stdin> for OpenFile {
+impl From<io::Stdin> for OpenFile {
 	/// Creates an `OpenFile` from standard input.
-	fn from(stdin: std::io::Stdin) -> Self {
+	fn from(stdin: io::Stdin) -> Self {
 		Self::Stdin(stdin)
 	}
 }
 
-impl From<std::io::Stdout> for OpenFile {
+impl From<io::Stdout> for OpenFile {
 	/// Creates an `OpenFile` from standard output.
-	fn from(stdout: std::io::Stdout) -> Self {
+	fn from(stdout: io::Stdout) -> Self {
 		Self::Stdout(stdout)
 	}
 }
 
-impl From<std::io::Stderr> for OpenFile {
+impl From<io::Stderr> for OpenFile {
 	/// Creates an `OpenFile` from standard error.
-	fn from(stderr: std::io::Stderr) -> Self {
+	fn from(stderr: io::Stderr) -> Self {
 		Self::Stderr(stderr)
 	}
 }
 
-impl From<std::fs::File> for OpenFile {
-	fn from(file: std::fs::File) -> Self {
+impl From<fs::File> for OpenFile {
+	fn from(file: fs::File) -> Self {
 		Self::File(file)
 	}
 }
 
-impl From<std::io::PipeReader> for OpenFile {
-	fn from(reader: std::io::PipeReader) -> Self {
+impl From<io::PipeReader> for OpenFile {
+	fn from(reader: io::PipeReader) -> Self {
 		Self::PipeReader(reader)
 	}
 }
 
-impl From<std::io::PipeWriter> for OpenFile {
-	fn from(writer: std::io::PipeWriter) -> Self {
+impl From<io::PipeWriter> for OpenFile {
+	fn from(writer: io::PipeWriter) -> Self {
 		Self::PipeWriter(writer)
 	}
 }
 
-impl std::io::Read for OpenFile {
-	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl io::Read for OpenFile {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		match self {
 			Self::Stdin(f) => f.read(buf),
-			Self::Stdout(_) => {
-				Err(std::io::Error::other(error::ErrorKind::OpenFileNotReadable("stdout")))
-			},
-			Self::Stderr(_) => {
-				Err(std::io::Error::other(error::ErrorKind::OpenFileNotReadable("stderr")))
-			},
+			Self::Stdout(_) => Err(io::Error::other(error::ErrorKind::OpenFileNotReadable("stdout"))),
+			Self::Stderr(_) => Err(io::Error::other(error::ErrorKind::OpenFileNotReadable("stderr"))),
 			Self::File(f) => f.read(buf),
 			Self::PipeReader(reader) => reader.read(buf),
 			Self::PipeWriter(_) => {
-				Err(std::io::Error::other(error::ErrorKind::OpenFileNotReadable("pipe writer")))
+				Err(io::Error::other(error::ErrorKind::OpenFileNotReadable("pipe writer")))
 			},
 			Self::Stream(s) => s.read(buf),
 		}
 	}
 }
 
-impl std::io::Write for OpenFile {
-	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl io::Write for OpenFile {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
 		match self {
-			Self::Stdin(_) => {
-				Err(std::io::Error::other(error::ErrorKind::OpenFileNotWritable("stdin")))
-			},
+			Self::Stdin(_) => Err(io::Error::other(error::ErrorKind::OpenFileNotWritable("stdin"))),
 			Self::Stdout(f) => f.write(buf),
 			Self::Stderr(f) => f.write(buf),
 			Self::File(f) => f.write(buf),
 			Self::PipeReader(_) => {
-				Err(std::io::Error::other(error::ErrorKind::OpenFileNotWritable("pipe reader")))
+				Err(io::Error::other(error::ErrorKind::OpenFileNotWritable("pipe reader")))
 			},
 			Self::PipeWriter(writer) => writer.write(buf),
 			Self::Stream(s) => s.write(buf),
 		}
 	}
 
-	fn flush(&mut self) -> std::io::Result<()> {
+	fn flush(&mut self) -> io::Result<()> {
 		match self {
 			Self::Stdin(_) => Ok(()),
 			Self::Stdout(f) => f.flush(),
@@ -292,9 +295,9 @@ impl OpenFiles {
 	pub(crate) fn new() -> Self {
 		Self {
 			files: HashMap::from([
-				(Self::STDIN_FD, Some(std::io::stdin().into())),
-				(Self::STDOUT_FD, Some(std::io::stdout().into())),
-				(Self::STDERR_FD, Some(std::io::stderr().into())),
+				(Self::STDIN_FD, Some(io::stdin().into())),
+				(Self::STDOUT_FD, Some(io::stdout().into())),
+				(Self::STDERR_FD, Some(io::stderr().into())),
 			]),
 		}
 	}
@@ -385,7 +388,7 @@ impl OpenFiles {
 	/// Iterates over all file descriptors.
 	pub fn iter_fds(
 		&self,
-	) -> impl Iterator<Item = (ShellFd, &OpenFile)> + Clone + std::iter::FusedIterator + '_ {
+	) -> impl Iterator<Item = (ShellFd, &OpenFile)> + Clone + iter::FusedIterator + '_ {
 		self
 			.files
 			.iter()

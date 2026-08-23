@@ -13,11 +13,26 @@ const MOVE: &str = "*** Move to: ";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForeignPatchFile {
 	/// Create a file from `+`-prefixed lines.
-	Add { path: Str, content: Str },
+	Add {
+		/// Repository-relative destination created by this operation.
+		path:    Str,
+		/// File contents decoded from the add body's `+`-prefixed rows.
+		content: Str,
+	},
 	/// Remove a file.
-	Delete { path: Str },
+	Delete {
+		/// Repository-relative file removed by this operation.
+		path: Str,
+	},
 	/// Apply unified hunks, optionally moving the result.
-	Update { path: Str, move_to: Option<Str>, hunks: Str },
+	Update {
+		/// Repository-relative source file modified by this operation.
+		path:    Str,
+		/// Optional repository-relative destination for the modified file.
+		move_to: Option<Str>,
+		/// Unified-hunk body captured verbatim after newline normalization.
+		hunks:   Str,
+	},
 }
 
 impl ForeignPatchFile {
@@ -40,16 +55,33 @@ pub enum ForeignPatchError {
 	MissingEnd,
 	/// A file marker had no path.
 	#[error("file operation at line {line} has an empty path")]
-	EmptyPath { line: usize },
+	EmptyPath {
+		/// One-based line of the pathless marker within the normalized patch
+		/// envelope.
+		line: usize,
+	},
 	/// Add-file bodies contain only `+` rows.
 	#[error("add-file body at line {line} must contain only '+' rows")]
-	InvalidAddBody { line: usize },
+	InvalidAddBody {
+		/// One-based envelope line containing the invalid add-file body row.
+		line: usize,
+	},
 	/// Update-file bodies must contain a hunk.
 	#[error("update-file hunk for {path} is empty at line {line}")]
-	EmptyUpdate { path: Str, line: usize },
+	EmptyUpdate {
+		/// Repository-relative update target named by the preceding marker.
+		path: Str,
+		/// One-based envelope line where hunk content was expected.
+		line: usize,
+	},
 	/// The next top-level marker was not recognized.
 	#[error("invalid apply_patch file marker at line {line}: {text}")]
-	InvalidMarker { line: usize, text: Str },
+	InvalidMarker {
+		/// One-based envelope line containing the unrecognized top-level text.
+		line: usize,
+		/// Unrecognized top-level text after surrounding whitespace was removed.
+		text: Str,
+	},
 }
 
 /// Parses a complete Codex patch envelope.

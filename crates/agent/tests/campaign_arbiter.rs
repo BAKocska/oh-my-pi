@@ -1,3 +1,6 @@
+//! Exercises deterministic campaign arbitration, slot ownership, revival, and
+//! journal recovery.
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -62,6 +65,9 @@ fn claim_spec(
 	declaration.dwell_ms = dwell_ms;
 	Arc::new(declaration)
 }
+
+use std::{env, fs};
+
 use omp_agent::tool_choice::ToolChoiceQueue;
 
 #[test]
@@ -301,7 +307,7 @@ fn schema_bump_degrades_revived_state_to_exhausted() {
 
 #[test]
 fn journal_kill_and_revive_preserves_ladder_rung() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-agent-campaign-revive-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -310,7 +316,7 @@ fn journal_kill_and_revive_preserves_ladder_rung() {
 		v:       4,
 		id:      SessionId(sf!("campaign-revive")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create journal");
 	let mut declaration = Arc::unwrap_or_clone(spec(
@@ -357,7 +363,7 @@ fn journal_kill_and_revive_preserves_ladder_rung() {
 	assert_eq!(entries[0].ladder_position, 1);
 	assert_eq!(revived.campaigns().slots().holder(&SlotClaim::Mode), Some((engagement.as_str(), 2)),);
 	drop(journal);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }
 
 #[test]
@@ -458,7 +464,7 @@ fn dwell_refuses_non_cut_exit() {
 }
 #[test]
 fn arbiter_fact_keeps_the_model_journal_byte_identical() {
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"omp-agent-arbiter-golden-{}-{}.jsonl",
 		std::process::id(),
 		omp_core::Ulid::generate()
@@ -467,7 +473,7 @@ fn arbiter_fact_keeps_the_model_journal_byte_identical() {
 		v:       4,
 		id:      SessionId(sf!("arbiter-golden")),
 		created: 1,
-		cwd:     std::env::temp_dir(),
+		cwd:     env::temp_dir(),
 	})
 	.expect("create journal");
 	journal
@@ -509,5 +515,5 @@ fn arbiter_fact_keeps_the_model_journal_byte_identical() {
 		.expect("serialize after");
 	assert_eq!(after, before, "arbiter facts must not perturb model-visible journal bytes");
 	drop(journal);
-	std::fs::remove_file(path).expect("remove journal");
+	fs::remove_file(path).expect("remove journal");
 }

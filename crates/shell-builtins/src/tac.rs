@@ -3,8 +3,10 @@
 //! Ported from uutils coreutils 0.8.0.
 
 use std::{
+	ffi,
 	ffi::{OsStr, OsString},
 	fs::File,
+	io,
 	io::{BufWriter, Read, Write},
 };
 
@@ -12,6 +14,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use memchr::memmem;
 use memmap2::Mmap;
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
+use regex::bytes::RegexBuilder;
 use thiserror::Error;
 
 use crate::{
@@ -33,16 +36,16 @@ enum TacError {
 	InvalidRegex(regex::Error),
 	/// An error opening a file for reading.
 	#[error("failed to open {} for reading: {}", .0.quote(), strip_errno(.1))]
-	Open(OsString, std::io::Error),
+	Open(OsString, io::Error),
 	/// An error reading the contents of a file or stdin.
 	#[error("{}: read error: {}", .0.maybe_quote(), strip_errno(.1))]
-	Read(OsString, std::io::Error),
+	Read(OsString, io::Error),
 	/// An error writing the reversed contents of a file or stdin.
 	#[error("failed to write to stdout: {}", strip_errno(.0))]
-	Write(std::io::Error),
+	Write(io::Error),
 }
 
-fn strip_errno(error: &std::io::Error) -> String {
+fn strip_errno(error: &io::Error) -> String {
 	let mut message = error.to_string();
 	if let Some(position) = message.find(" (os error ") {
 		message.truncate(position);
@@ -68,7 +71,7 @@ impl Utility for Tac {
 #[allow(dead_code, reason = "called by the separately feature-gated tail builtin")]
 /// Runs `tac` with `argv` (argv[0] is the command name) against `host`.
 /// Entry point for BSD `tail -r` delegation.
-pub(crate) fn run_argv(argv: Vec<std::ffi::OsString>, host: &mut Host) -> i32 {
+pub(crate) fn run_argv(argv: Vec<ffi::OsString>, host: &mut Host) -> i32 {
 	match <Tac as clap::Parser>::try_parse_from(argv) {
 		Ok(parsed) => parsed.run(host),
 		Err(error) => {
@@ -167,7 +170,7 @@ fn buffer_tac_regex(
 	pattern: &regex::bytes::Regex,
 	before: bool,
 	host: &mut Host,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
 	let mut out = BufWriter::new(&mut host.stdout);
 
 	// As we scan from right to left, this limits each search to bytes before the
@@ -198,12 +201,7 @@ fn buffer_tac_regex(
 }
 
 /// Writes lines from `data` to stdout in reverse.
-fn buffer_tac(
-	data: &[u8],
-	before: bool,
-	separator: &OsStr,
-	host: &mut Host,
-) -> std::io::Result<()> {
+fn buffer_tac(data: &[u8], before: bool, separator: &OsStr, host: &mut Host) -> io::Result<()> {
 	let mut out = BufWriter::new(&mut host.stdout);
 	let separator_len = separator.len();
 	let mut following_line_start = data.len();
@@ -318,7 +316,7 @@ fn tac(
 ) -> Result<(), TacError> {
 	let maybe_pattern = if regex {
 		Some(
-			regex::bytes::RegexBuilder::new(&translate_regex_flavor(separator.as_encoded_bytes()))
+			RegexBuilder::new(&translate_regex_flavor(separator.as_encoded_bytes()))
 				.multi_line(true)
 				.build()
 				.map_err(TacError::InvalidRegex)?,

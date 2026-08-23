@@ -2,6 +2,7 @@
 
 use std::{
 	fmt::Write as _,
+	mem, str,
 	str::FromStr,
 	time::{Duration, Instant},
 };
@@ -344,7 +345,7 @@ impl InputDecoder {
 				// — a late or unowned report is never typed input.
 				0x40..=0x7e => {
 					self.private_csi_partial.push(byte);
-					let sequence = std::mem::take(&mut self.private_csi_partial);
+					let sequence = mem::take(&mut self.private_csi_partial);
 					if let Decoded::Event(event) = decode_frame(&sequence) {
 						out.push(event);
 					}
@@ -454,7 +455,7 @@ impl InputDecoder {
 	}
 
 	fn finish_paste(&mut self, out: &mut Vec<InputEvent>) {
-		let bytes = std::mem::take(&mut self.paste);
+		let bytes = mem::take(&mut self.paste);
 		let decoded = decode_reencoded_paste_controls(&bytes);
 		out.push(InputEvent::Paste(Str::from(sanitize_paste(&decoded))));
 		self.paste_active = false;
@@ -486,7 +487,7 @@ impl InputDecoder {
 		if now.saturating_duration_since(since) < timeout {
 			return;
 		}
-		let buffered = std::mem::take(&mut self.buffer);
+		let buffered = mem::take(&mut self.buffer);
 		self.incomplete_since = None;
 		self.pending_kitty_print = None;
 		if is_private_csi_report_partial(&buffered) {
@@ -949,7 +950,7 @@ fn decode_plain(bytes: &[u8], alt: bool) -> Option<Chord> {
 	let mut chord = if bytes[0] < 0x20 || bytes[0] == 0x7f {
 		decode_control(bytes[0])?
 	} else {
-		let character = std::str::from_utf8(bytes).ok()?.chars().next()?;
+		let character = str::from_utf8(bytes).ok()?.chars().next()?;
 		Chord::plain(character_to_key(character)?)
 	};
 	chord.mods.alt |= alt;
@@ -1034,7 +1035,7 @@ fn parse_modifier(bytes: &[u8]) -> Option<u32> {
 
 fn parse_decimal(bytes: &[u8]) -> Option<u32> {
 	(!bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit))
-		.then(|| std::str::from_utf8(bytes).ok()?.parse().ok())
+		.then(|| str::from_utf8(bytes).ok()?.parse().ok())
 		.flatten()
 }
 
@@ -1092,7 +1093,7 @@ fn parse_hex_component(bytes: &[u8]) -> Option<u16> {
 	if !matches!(bytes.len(), 2 | 4) || !bytes.iter().all(u8::is_ascii_hexdigit) {
 		return None;
 	}
-	let value = u16::from_str_radix(std::str::from_utf8(bytes).ok()?, 16).ok()?;
+	let value = u16::from_str_radix(str::from_utf8(bytes).ok()?, 16).ok()?;
 	Some(if bytes.len() == 2 {
 		value * 0x101
 	} else {
@@ -1796,7 +1797,10 @@ pub fn sanitize_paste(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-	use std::time::{Duration, Instant};
+	use std::{
+		slice,
+		time::{Duration, Instant},
+	};
 
 	use super::{
 		Chord, ChordParseError, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton,
@@ -1826,7 +1830,7 @@ mod tests {
 		let mut events = Vec::new();
 		for (offset, byte) in bytes.iter().enumerate() {
 			decoder.feed(
-				std::slice::from_ref(byte),
+				slice::from_ref(byte),
 				start + Duration::from_millis(u64::try_from(offset).unwrap()),
 				&mut events,
 			);
@@ -2333,7 +2337,7 @@ mod tests {
 			let mut decoder = InputDecoder::new();
 			let mut events = Vec::new();
 			decoder.feed(bytes, start, &mut events);
-			assert_eq!(events.as_slice(), std::slice::from_ref(&expected));
+			assert_eq!(events.as_slice(), slice::from_ref(&expected));
 			assert_eq!(drip(bytes), [expected]);
 		}
 	}

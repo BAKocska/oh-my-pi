@@ -3,13 +3,17 @@
 //! coordination.
 
 use std::{
+	cmp,
 	collections::{HashMap, HashSet, VecDeque},
+	fmt, fs, iter,
 	path::{Path, PathBuf},
+	str,
 	sync::Arc,
 	time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use omp_core::{Hash32, Str};
 use omp_walker::glob::{CompiledPattern, PatternBuilder};
 use parking_lot::Mutex;
@@ -18,6 +22,7 @@ use strum::IntoStaticStr;
 use thiserror::Error;
 use tokio::{
 	sync::{Mutex as AsyncMutex, broadcast},
+	task,
 	task::JoinSet,
 	time::{sleep, timeout},
 };
@@ -25,12 +30,17 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-	DocumentEvent, DocumentHead, DocumentId, DocumentKind, DocumentPresence, DocumentSnapshot,
-	DocumentStore, LanguageId, LeaseId, ReadBody, ReadSelection, Revision, TransactionId,
+	DocumentEvent, DocumentHead, DocumentId, DocumentKind, DocumentLocator, DocumentPresence,
+	DocumentSnapshot, DocumentStore, Error as DocumentError, LanguageId, LeaseId, ReadBody,
+	ReadSelection, Result as DocumentResult, Revision, TransactionId,
+	diagnostics::Diagnostic,
+	diagnostics_ledger::{DiagnosticDelta, DiagnosticsLedger},
+	format_options,
 	lsp::{
 		LspActivity, LspDocument, LspError, LspResponse, LspResponseOutcome, LspServer,
 		LspTransportError, LspWatchedFileChange, LspWatchedFileKind, SyncPolicy,
 	},
+	position::PositionEncoding,
 	transaction::{
 		FormatCoordinator, FormatRequest, FormatResult, PublishedDocument, RevertedDocument,
 	},
@@ -38,6 +48,21 @@ use crate::{
 const PUBLIC_VERSION_LIMIT: usize = 32;
 const LSP_EVENT_BUS_CAPACITY: usize = 256;
 const DOCUMENT_EVENT_FORWARD_CAPACITY: usize = 64;
+mod event_receiver {
+	use tokio::sync::broadcast::Receiver;
+
+	use super::{LspRegistry, LspRegistryEvent};
+
+	impl LspRegistry {
+		/// Subscribes to the bounded registry event stream.
+		///
+		/// Receivers observe lag errors when they fall behind instead of
+		/// silently losing notifications.
+		pub fn subscribe_events(&self) -> Receiver<LspRegistryEvent> {
+			self.inner.events.subscribe()
+		}
+	}
+}
 
 /// Stable process-local identity assigned to an LSP binding.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -80,8 +105,8 @@ pub struct LspSelector {
 	path_matchers: Vec<CompiledPattern>,
 }
 
-impl std::fmt::Debug for LspSelector {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for LspSelector {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("LspSelector")
 			.field("languages", &self.languages)
@@ -488,7 +513,7 @@ pub struct LspDocumentLease {
 	lease_id:    LeaseId,
 	head:        DocumentHead,
 	binding_ids: Vec<LspBindingId>,
-	events:      flume::Receiver<Result<DocumentEvent, DocumentEventStreamError>>,
+	events:      Receiver<Result<DocumentEvent, DocumentEventStreamError>>,
 }
 
 impl LspDocumentLease {
@@ -508,7 +533,7 @@ impl LspDocumentLease {
 	}
 
 	/// Returns this lease's ordered committed-document event stream.
-	pub const fn events(&self) -> &flume::Receiver<Result<DocumentEvent, DocumentEventStreamError>> {
+	pub const fn events(&self) -> &Receiver<Result<DocumentEvent, DocumentEventStreamError>> {
 		&self.events
 	}
 
@@ -520,7 +545,7 @@ impl LspDocumentLease {
 		LeaseId,
 		DocumentHead,
 		Vec<LspBindingId>,
-		flume::Receiver<Result<DocumentEvent, DocumentEventStreamError>>,
+		Receiver<Result<DocumentEvent, DocumentEventStreamError>>,
 	) {
 		(self.lease_id, self.head, self.binding_ids, self.events)
 	}
@@ -581,7 +606,7 @@ struct RegistryState {
 	provisional_leases: HashSet<ProvisionalLeaseKey>,
 	publication_gates:  HashMap<TransactionId, CancellationToken>,
 	diagnostic_events:  HashMap<(LspBindingId, DocumentId), DiagnosticRecord>,
-	diagnostics_ledger: crate::diagnostics_ledger::DiagnosticsLedger,
+	diagnostics_ledger: DiagnosticsLedger,
 }
 
 #[derive(Clone)]
@@ -636,8 +661,8 @@ impl Drop for LspPublicationBarrier {
 	}
 }
 
-impl std::fmt::Debug for LspRegistry {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for LspRegistry {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("LspRegistry")
 			.finish_non_exhaustive()
@@ -660,14 +685,6 @@ impl LspRegistry {
 	/// Returns the project document store used for revision admission.
 	pub fn document_store(&self) -> &DocumentStore {
 		&self.inner.store
-	}
-
-	/// Subscribes to the bounded registry event stream.
-	///
-	/// Receivers observe [`broadcast::error::RecvError::Lagged`] when they fall
-	/// behind instead of silently losing notifications.
-	pub fn subscribe_events(&self) -> broadcast::Receiver<LspRegistryEvent> {
-		self.inner.events.subscribe()
 	}
 
 	/// Concurrently installs selected bindings and publishes bounded startup
@@ -711,9 +728,7 @@ impl LspRegistry {
 				}
 			});
 		}
-		let mut results = std::iter::repeat_with(|| None)
-			.take(count)
-			.collect::<Vec<_>>();
+		let mut results = iter::repeat_with(|| None).take(count).collect::<Vec<_>>();
 		while let Some(joined) = tasks.join_next().await {
 			match joined {
 				Ok((index, result)) => results[index] = Some(result),
@@ -785,7 +800,7 @@ impl LspRegistry {
 		&self,
 		interval: Duration,
 		cancel: CancellationToken,
-	) -> tokio::task::JoinHandle<()> {
+	) -> task::JoinHandle<()> {
 		let registry = self.clone();
 		tokio::spawn(async move {
 			loop {
@@ -1129,7 +1144,7 @@ impl LspRegistry {
 	/// publication.
 	pub async fn open_document(
 		&self,
-		locator: impl Into<crate::DocumentLocator>,
+		locator: impl Into<DocumentLocator>,
 		language_id: Option<LanguageId>,
 		cancel: CancellationToken,
 	) -> Result<LspDocumentLease, LspRegistryError> {
@@ -1698,9 +1713,9 @@ impl LspRegistry {
 	pub fn diagnostic_delta(
 		&self,
 		uri: Str,
-		diagnostics: Vec<crate::diagnostics::Diagnostic>,
+		diagnostics: Vec<Diagnostic>,
 		deduplicate: bool,
-	) -> crate::diagnostics_ledger::DiagnosticDelta {
+	) -> DiagnosticDelta {
 		self
 			.inner
 			.state
@@ -1710,10 +1725,7 @@ impl LspRegistry {
 	}
 
 	/// Returns the negotiated position encoding for a diagnostic event.
-	pub fn diagnostic_position_encoding(
-		&self,
-		event: &TaggedLspEvent,
-	) -> crate::position::PositionEncoding {
+	pub fn diagnostic_position_encoding(&self, event: &TaggedLspEvent) -> PositionEncoding {
 		let state = self.inner.state.lock();
 		let language = state
 			.leases
@@ -2496,8 +2508,8 @@ impl LspRegistry {
 					.format_document(
 						lsp_document(&snapshot, uri, language_id),
 						Bytes::from(
-							serde_json::to_vec(&crate::format_options::resolve(
-								std::str::from_utf8(&content).unwrap_or_default(),
+							serde_json::to_vec(&format_options::resolve(
+								str::from_utf8(&content).unwrap_or_default(),
 								None,
 							))
 							.map_err(|error| LspRegistryError::InvalidInboundJson {
@@ -2528,10 +2540,9 @@ impl LspRegistry {
 				.synchronize(lsp_document(&snapshot, uri, language_id), cancel.child_token())
 				.await?;
 		}
-		let text =
-			std::str::from_utf8(&content).map_err(|_| LspRegistryError::FormattingUnavailable)?;
-		let options = crate::format_options::resolve(text, None);
-		Ok(Bytes::copy_from_slice(crate::format_options::enforce(text, options).as_bytes()))
+		let text = str::from_utf8(&content).map_err(|_| LspRegistryError::FormattingUnavailable)?;
+		let options = format_options::resolve(text, None);
+		Ok(Bytes::copy_from_slice(format_options::enforce(text, options).as_bytes()))
 	}
 
 	async fn publish_committed_inner(
@@ -2595,7 +2606,7 @@ impl FormatCoordinator for LspRegistry {
 		&self,
 		request: FormatRequest,
 		cancel: CancellationToken,
-	) -> crate::Result<FormatResult> {
+	) -> DocumentResult<FormatResult> {
 		let leases = self
 			.acquire_format_leases(&request, cancel.child_token())
 			.await
@@ -2627,7 +2638,7 @@ impl FormatCoordinator for LspRegistry {
 		&self,
 		document: PublishedDocument,
 		cancel: CancellationToken,
-	) -> crate::Result<()> {
+	) -> DocumentResult<()> {
 		let _mutation = self.inner.mutation.lock().await;
 		let refresh_result = if self
 			.inner
@@ -2694,7 +2705,7 @@ impl FormatCoordinator for LspRegistry {
 		&self,
 		document: RevertedDocument,
 		cancel: CancellationToken,
-	) -> crate::Result<()> {
+	) -> DocumentResult<()> {
 		let _mutation = self.inner.mutation.lock().await;
 		let snapshot = document.snapshot();
 		let keys = self
@@ -2785,7 +2796,7 @@ fn format_shadow_uri(request: &FormatRequest) -> Url {
 fn provisional_snapshot(
 	base: &DocumentSnapshot,
 	content: Bytes,
-) -> crate::Result<DocumentSnapshot> {
+) -> DocumentResult<DocumentSnapshot> {
 	provisional_snapshot_for(base.head().document_id(), base, content)
 }
 
@@ -2793,7 +2804,7 @@ fn provisional_snapshot_for(
 	document_id: DocumentId,
 	base: &DocumentSnapshot,
 	content: Bytes,
-) -> crate::Result<DocumentSnapshot> {
+) -> DocumentResult<DocumentSnapshot> {
 	let sequence = base
 		.head()
 		.revision()
@@ -2819,8 +2830,8 @@ const fn language_for_head(head: &DocumentHead) -> Option<&LanguageId> {
 	}
 }
 
-fn registry_protocol_error(error: LspRegistryError) -> crate::Error {
-	crate::Error::Protocol { reason: Str::new(error.to_string()) }
+fn registry_protocol_error(error: LspRegistryError) -> DocumentError {
+	DocumentError::Protocol { reason: Str::new(error.to_string()) }
 }
 
 const fn lsp_document<'a>(
@@ -2861,7 +2872,7 @@ fn root_has_marker(directory: &Path, markers: &[Str]) -> bool {
 		let Ok(pattern) = PatternBuilder::new(marker).literal_separator(true).build() else {
 			return false;
 		};
-		let Ok(entries) = std::fs::read_dir(directory) else {
+		let Ok(entries) = fs::read_dir(directory) else {
 			return false;
 		};
 		entries.filter_map(Result::ok).any(|entry| {
@@ -2873,7 +2884,7 @@ fn root_has_marker(directory: &Path, markers: &[Str]) -> bool {
 	})
 }
 
-fn binding_order(left: &Binding, right: &Binding) -> std::cmp::Ordering {
+fn binding_order(left: &Binding, right: &Binding) -> cmp::Ordering {
 	right
 		.spec
 		.priority
@@ -2883,7 +2894,7 @@ fn binding_order(left: &Binding, right: &Binding) -> std::cmp::Ordering {
 		.then_with(|| left.id.cmp(&right.id))
 }
 
-fn binding_info_order(left: &LspBindingInfo, right: &LspBindingInfo) -> std::cmp::Ordering {
+fn binding_info_order(left: &LspBindingInfo, right: &LspBindingInfo) -> cmp::Ordering {
 	right
 		.spec
 		.priority
@@ -2963,7 +2974,7 @@ pub enum LspRegistryError {
 	#[error("document path cannot be represented as a file URI: {path:?}")]
 	PathCannotBeUri {
 		/// Canonical path.
-		path: std::path::PathBuf,
+		path: PathBuf,
 	},
 	/// Binding identities exhausted their integer representation.
 	#[error("LSP binding identity overflow")]
@@ -2988,14 +2999,14 @@ pub enum LspRegistryError {
 	WarmupTask {
 		/// Join failure.
 		#[source]
-		source: tokio::task::JoinError,
+		source: task::JoinError,
 	},
 	/// A warmup task completed without filling its ordered result slot.
 	#[error("LSP warmup result is missing")]
 	WarmupResultMissing,
 	/// The document store rejected the operation.
 	#[error(transparent)]
-	Store(#[from] crate::Error),
+	Store(#[from] DocumentError),
 	/// The selected LSP lane rejected the operation.
 	#[error(transparent)]
 	Lsp(#[from] LspError),
@@ -3003,7 +3014,10 @@ pub enum LspRegistryError {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	use std::{
+		env, fs, future,
+		sync::atomic::{AtomicBool, AtomicU64, Ordering},
+	};
 
 	use async_trait::async_trait;
 	use omp_core::sf;
@@ -3081,7 +3095,7 @@ mod tests {
 			_: CancellationToken,
 		) -> Result<(), LspTransportError> {
 			if method == "textDocument/didClose" {
-				std::future::pending().await
+				future::pending().await
 			} else {
 				Ok(())
 			}
@@ -3399,12 +3413,12 @@ mod tests {
 	#[tokio::test]
 	async fn inbound_publication_preserves_bytes_and_proven_revision_identity() {
 		static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(20_000);
-		let root = std::env::temp_dir().join(format!(
+		let root = env::temp_dir().join(format!(
 			"omp-lsp-registry-events-{}-{}",
 			std::process::id(),
 			ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
 		));
-		std::fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&root).unwrap();
 		let registry =
 			LspRegistry::new(DocumentStore::new(ServerConfig::new(&root).unwrap()).unwrap());
 		let binding_id = registry
@@ -3449,7 +3463,7 @@ mod tests {
 		assert_eq!(tagged.document_id(), Some(document_id));
 		assert_eq!(tagged.document_uri(), Some(&uri));
 		assert_eq!(events.recv().await.unwrap(), LspRegistryEvent::Inbound(Box::new(tagged)));
-		std::fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]
@@ -3482,9 +3496,9 @@ mod tests {
 	#[test]
 	fn root_markers_walk_ancestors_and_match_one_level_globs() {
 		let root = tempfile::tempdir().unwrap();
-		std::fs::write(root.path().join("workspace.cabal"), b"").unwrap();
+		fs::write(root.path().join("workspace.cabal"), b"").unwrap();
 		let nested = root.path().join("src/nested");
-		std::fs::create_dir_all(&nested).unwrap();
+		fs::create_dir_all(&nested).unwrap();
 		let found =
 			root_marker_ancestor(&nested.join("Main.hs"), &[Str::new_static("*.cabal")]).unwrap();
 		assert_eq!(found, root.path());
@@ -3552,14 +3566,14 @@ mod tests {
 	#[tokio::test]
 	async fn dynamic_registration_completes_while_formatting_is_pending() {
 		static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-		let root = std::env::temp_dir().join(format!(
+		let root = env::temp_dir().join(format!(
 			"omp-lsp-registry-{}-{}",
 			std::process::id(),
 			ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
 		));
-		std::fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&root).unwrap();
 		let path = root.join("file.txt");
-		std::fs::write(&path, b"base").unwrap();
+		fs::write(&path, b"base").unwrap();
 		let store = DocumentStore::new(ServerConfig::new(&root).unwrap()).unwrap();
 		let registry = LspRegistry::new(store);
 		let transport =
@@ -3618,8 +3632,8 @@ mod tests {
 				.open_document(opening_path, None, CancellationToken::new())
 				.await
 		});
-		tokio::time::timeout(
-			std::time::Duration::from_secs(1),
+		timeout(
+			Duration::from_secs(1),
 			registry.register_capabilities(
 				binding_handle,
 				Bytes::from_static(
@@ -3633,7 +3647,7 @@ mod tests {
 		.unwrap();
 		transport.release.notify_one();
 		assert_eq!(formatting.await.unwrap().unwrap().content(), &Bytes::from_static(b"candidate\n"),);
-		let public_lease = tokio::time::timeout(std::time::Duration::from_secs(1), public_open)
+		let public_lease = timeout(Duration::from_secs(1), public_open)
 			.await
 			.unwrap()
 			.unwrap()
@@ -3701,17 +3715,17 @@ mod tests {
 			.await
 			.unwrap();
 		registry.inner.store.close(base_lease).await.unwrap();
-		std::fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(root).unwrap();
 	}
 	#[tokio::test]
 	async fn unopened_unformatted_publication_emits_no_lifecycle() {
 		static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(10_000);
-		let root = std::env::temp_dir().join(format!(
+		let root = env::temp_dir().join(format!(
 			"omp-lsp-registry-publish-{}-{}",
 			std::process::id(),
 			ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
 		));
-		std::fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&root).unwrap();
 		let registry =
 			LspRegistry::new(DocumentStore::new(ServerConfig::new(&root).unwrap()).unwrap());
 		let transport = Arc::new(CountingTransport { messages: AtomicU64::new(0) });
@@ -3753,13 +3767,12 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(transport.messages.load(Ordering::Relaxed), 0);
-		std::fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(root).unwrap();
 	}
 	#[tokio::test]
 	async fn restarted_binding_rejects_old_request_completion() {
-		let registry = LspRegistry::new(
-			DocumentStore::new(ServerConfig::new(std::env::temp_dir()).unwrap()).unwrap(),
-		);
+		let registry =
+			LspRegistry::new(DocumentStore::new(ServerConfig::new(env::temp_dir()).unwrap()).unwrap());
 		let transport =
 			Arc::new(PendingRequestTransport { started: Notify::new(), release: Notify::new() });
 		let binding_id = registry
@@ -3807,14 +3820,14 @@ mod tests {
 	#[tokio::test]
 	async fn opaque_stale_semantic_params_are_not_retried() {
 		static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(30_000);
-		let root = std::env::temp_dir().join(format!(
+		let root = env::temp_dir().join(format!(
 			"omp-lsp-registry-stale-{}-{}",
 			std::process::id(),
 			ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
 		));
-		std::fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&root).unwrap();
 		let path = root.join("file.txt");
-		std::fs::write(&path, b"current").unwrap();
+		fs::write(&path, b"current").unwrap();
 		let registry =
 			LspRegistry::new(DocumentStore::new(ServerConfig::new(&root).unwrap()).unwrap());
 		let transport = Arc::new(RequestCountingTransport { requests: AtomicU64::new(0) });
@@ -3857,20 +3870,20 @@ mod tests {
 			.close_document(lease.lease_id(), CancellationToken::new())
 			.await
 			.unwrap();
-		std::fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
 	async fn refresh_failure_compensates_a_prior_open() {
 		static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(40_000);
-		let root = std::env::temp_dir().join(format!(
+		let root = env::temp_dir().join(format!(
 			"omp-lsp-registry-refresh-{}-{}",
 			std::process::id(),
 			ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
 		));
-		std::fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&root).unwrap();
 		let path = root.join("file.txt");
-		std::fs::write(&path, b"current").unwrap();
+		fs::write(&path, b"current").unwrap();
 		let registry =
 			LspRegistry::new(DocumentStore::new(ServerConfig::new(&root).unwrap()).unwrap());
 		let lease = registry
@@ -3920,22 +3933,22 @@ mod tests {
 			.close_document(lease.lease_id(), CancellationToken::new())
 			.await
 			.unwrap();
-		std::fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
 	async fn failed_restart_keeps_old_binding_and_cleans_staged_leases() {
 		static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(45_000);
-		let root = std::env::temp_dir().join(format!(
+		let root = env::temp_dir().join(format!(
 			"omp-lsp-registry-restart-{}-{}",
 			std::process::id(),
 			ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
 		));
-		std::fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&root).unwrap();
 		let first_path = root.join("first.txt");
 		let second_path = root.join("second.txt");
-		std::fs::write(&first_path, b"first").unwrap();
-		std::fs::write(&second_path, b"second").unwrap();
+		fs::write(&first_path, b"first").unwrap();
+		fs::write(&second_path, b"second").unwrap();
 		let registry =
 			LspRegistry::new(DocumentStore::new(ServerConfig::new(&root).unwrap()).unwrap());
 		let binding_id = registry
@@ -3978,20 +3991,20 @@ mod tests {
 			.close_document(second.lease_id(), CancellationToken::new())
 			.await
 			.unwrap();
-		std::fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
 	async fn formatting_acquisition_failure_closes_shadow_and_preserves_public_mapping() {
 		static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(50_000);
-		let root = std::env::temp_dir().join(format!(
+		let root = env::temp_dir().join(format!(
 			"omp-lsp-registry-format-rollback-{}-{}",
 			std::process::id(),
 			ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
 		));
-		std::fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&root).unwrap();
 		let path = root.join("base.txt");
-		std::fs::write(&path, b"base").unwrap();
+		fs::write(&path, b"base").unwrap();
 		let registry =
 			LspRegistry::new(DocumentStore::new(ServerConfig::new(&root).unwrap()).unwrap());
 		let first_transport = Arc::new(ToggleNotifyTransport {
@@ -4085,13 +4098,13 @@ mod tests {
 			.close_document(lease.lease_id(), CancellationToken::new())
 			.await
 			.unwrap();
-		std::fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(root).unwrap();
 	}
 	#[tokio::test]
 	async fn cancelled_close_abandons_a_transport_that_ignores_cancellation() {
 		let root = tempfile::tempdir().expect("temporary directory");
 		let path = root.path().join("close.txt");
-		std::fs::write(&path, b"content").expect("write fixture");
+		fs::write(&path, b"content").expect("write fixture");
 		let store =
 			DocumentStore::new(ServerConfig::new(root.path()).expect("server config")).expect("store");
 		let registry = LspRegistry::new(store);
@@ -4121,9 +4134,9 @@ mod tests {
 				.close_document(lease_id, close_cancellation)
 				.await
 		});
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 		cancellation.cancel();
-		let result = tokio::time::timeout(std::time::Duration::from_secs(1), close)
+		let result = timeout(Duration::from_secs(1), close)
 			.await
 			.expect("bounded close")
 			.expect("close task");

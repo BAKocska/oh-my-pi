@@ -1,13 +1,18 @@
 //! Terminal utilities.
 
-use std::{io::IsTerminal, os::fd::AsFd, path::PathBuf};
+use std::{io, io::IsTerminal, os::fd::AsFd, path::PathBuf};
 
-use crate::{builtins::terminal, error, openfiles, sys};
+use nix::{
+	sys::termios::{self, OutputFlags, SetArg, Termios},
+	unistd::Pid,
+};
+
+use crate::{builtins::terminal, error, openfiles::OpenFile, sys};
 
 /// Terminal configuration.
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
-	termios: nix::sys::termios::Termios,
+	termios: Termios,
 }
 
 impl Config {
@@ -17,9 +22,9 @@ impl Config {
 	/// # Arguments
 	///
 	/// * `file` - A reference to the open terminal.
-	pub(crate) fn from_term(file: &openfiles::OpenFile) -> Result<Self, error::Error> {
+	pub(crate) fn from_term(file: &OpenFile) -> Result<Self, error::Error> {
 		let fd = file.try_borrow_as_fd()?;
-		let termios = nix::sys::termios::tcgetattr(fd)?;
+		let termios = termios::tcgetattr(fd)?;
 		Ok(Self { termios })
 	}
 
@@ -29,9 +34,9 @@ impl Config {
 	/// # Arguments
 	///
 	/// * `file` - A reference to the open terminal.
-	pub(crate) fn apply_to_term(&self, file: &openfiles::OpenFile) -> Result<(), error::Error> {
+	pub(crate) fn apply_to_term(&self, file: &OpenFile) -> Result<(), error::Error> {
 		let fd = file.try_borrow_as_fd()?;
-		nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &self.termios)?;
+		termios::tcsetattr(fd, SetArg::TCSANOW, &self.termios)?;
 		Ok(())
 	}
 
@@ -45,34 +50,33 @@ impl Config {
 	pub(crate) fn update(&mut self, settings: &terminal::Settings) {
 		if let Some(echo_input) = &settings.echo_input {
 			if *echo_input {
-				self.termios.local_flags |= nix::sys::termios::LocalFlags::ECHO;
+				self.termios.local_flags |= termios::LocalFlags::ECHO;
 			} else {
-				self.termios.local_flags -= nix::sys::termios::LocalFlags::ECHO;
+				self.termios.local_flags -= termios::LocalFlags::ECHO;
 			}
 		}
 
 		if let Some(line_input) = &settings.line_input {
 			if *line_input {
-				self.termios.local_flags |= nix::sys::termios::LocalFlags::ICANON;
+				self.termios.local_flags |= termios::LocalFlags::ICANON;
 			} else {
-				self.termios.local_flags -= nix::sys::termios::LocalFlags::ICANON;
+				self.termios.local_flags -= termios::LocalFlags::ICANON;
 			}
 		}
 
 		if let Some(interrupt_signals) = &settings.interrupt_signals {
 			if *interrupt_signals {
-				self.termios.local_flags |= nix::sys::termios::LocalFlags::ISIG;
+				self.termios.local_flags |= termios::LocalFlags::ISIG;
 			} else {
-				self.termios.local_flags -= nix::sys::termios::LocalFlags::ISIG;
+				self.termios.local_flags -= termios::LocalFlags::ISIG;
 			}
 		}
 
 		if let Some(output_nl_as_nlcr) = &settings.output_nl_as_nlcr {
 			if *output_nl_as_nlcr {
-				self.termios.output_flags |=
-					nix::sys::termios::OutputFlags::OPOST | nix::sys::termios::OutputFlags::ONLCR;
+				self.termios.output_flags |= OutputFlags::OPOST | OutputFlags::ONLCR;
 			} else {
-				self.termios.output_flags -= nix::sys::termios::OutputFlags::ONLCR;
+				self.termios.output_flags -= OutputFlags::ONLCR;
 			}
 		}
 	}
@@ -90,27 +94,27 @@ pub fn get_process_group_id() -> Option<sys::process::ProcessId> {
 
 /// Get the foreground process ID of the attached terminal.
 pub fn get_foreground_pid() -> Option<sys::process::ProcessId> {
-	nix::unistd::tcgetpgrp(std::io::stdin())
+	nix::unistd::tcgetpgrp(io::stdin())
 		.ok()
 		.map(|pgid| pgid.as_raw())
 }
 
 /// Move the specified process to the foreground of the attached terminal.
 pub fn move_to_foreground(pid: sys::process::ProcessId) -> Result<(), error::Error> {
-	nix::unistd::tcsetpgrp(std::io::stdin(), nix::unistd::Pid::from_raw(pid))?;
+	nix::unistd::tcsetpgrp(io::stdin(), Pid::from_raw(pid))?;
 	Ok(())
 }
 
 /// Moves the current process to the foreground of the attached terminal.
 // This function needs to return `std::io::Error` so that the OS error code can
 // be recovered.
-pub fn move_self_to_foreground() -> Result<(), std::io::Error> {
-	if std::io::stdin().is_terminal() {
+pub fn move_self_to_foreground() -> Result<(), io::Error> {
+	if io::stdin().is_terminal() {
 		let pgid = nix::unistd::getpgid(None)?;
 
 		// TODO(jobs): This sometimes fails with ENOTTY even though we checked that
 		// stdin is a terminal. We should investigate why this is happening.
-		let _ = nix::unistd::tcsetpgrp(std::io::stdin(), pgid);
+		let _ = nix::unistd::tcsetpgrp(io::stdin(), pgid);
 	}
 
 	Ok(())
@@ -120,5 +124,5 @@ pub fn move_self_to_foreground() -> Result<(), std::io::Error> {
 /// terminal. Returns `None` if there is no terminal attached or the lookup
 /// failed.
 pub fn try_get_terminal_device_path() -> Option<PathBuf> {
-	nix::unistd::ttyname(std::io::stdin()).ok()
+	nix::unistd::ttyname(io::stdin()).ok()
 }

@@ -13,7 +13,7 @@ use omp_agent::{
 	WorkspaceRootInput, WorkspaceRootsInput, WorkspaceTreeInput,
 };
 use omp_core::Str;
-use omp_proto::thread::v1 as thread;
+use omp_proto::thread::v1::{self as thread, item, part};
 use omp_scribe::canon::canonicalize_prompt;
 
 #[derive(Debug)]
@@ -25,11 +25,10 @@ struct GoldenItem {
 }
 
 fn item_text(item: &thread::Item) -> &str {
-	let Some(thread::item::Kind::Message(message)) = item.kind.as_ref() else {
+	let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
 		panic!("prompt item must be a message");
 	};
-	let Some(thread::part::Kind::Text(text)) =
-		message.parts.first().and_then(|part| part.kind.as_ref())
+	let Some(part::Kind::Text(text)) = message.parts.first().and_then(|part| part.kind.as_ref())
 	else {
 		panic!("prompt message must contain text");
 	};

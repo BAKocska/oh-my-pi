@@ -1,6 +1,6 @@
 //! Phased session task tracking with deterministic state transitions.
 
-use std::{fmt, sync::Arc};
+use std::{error, fmt, fmt::Display, sync::Arc};
 
 use async_stream::stream;
 use futures::Stream;
@@ -151,14 +151,14 @@ pub enum Fault {
 		message: Str,
 	},
 }
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Invalid { message } | Self::Missing { message } => f.write_str(message),
 		}
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// In-memory todo executor. Session hosts may snapshot `Payload::phases` into
 /// their journal.

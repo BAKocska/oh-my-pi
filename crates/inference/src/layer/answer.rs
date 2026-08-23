@@ -14,14 +14,19 @@ use tower::{Layer, Service};
 
 use crate::{
 	answer::{
-		Answer, AnswerBody, AnswerKind, ChatStream, NativeResponse, NativeResponseBody, ResponseMeta,
+		Answer, AnswerBody, AnswerKind, AudioStream, ChatStream, GenerationStream, ImageArtifact,
+		NativeResponse, NativeResponseBody, OutputStream, ResponseMeta, TranscriptStream,
 	},
-	call::{Call, NativeResponseFraming, OperationCall, RawJson},
+	body::ByteStream,
+	call::{Call, NativeRequest, NativeResponseFraming, OperationCall, RawJson},
 	catalog::OperationKind,
-	codec::{HandshakenResponse, ProviderControlEvent, RawEvent},
+	codec::{
+		HandshakeMeta, HandshakenResponse, ProviderControlEvent, RawEvent, RawEventStream,
+		RequestHeader,
+	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{ChatEvent, WorkflowAction, WorkflowResponseKind, WorkflowResume},
-	layer::LayerCall,
+	layer::{ExecutionContext, LayerCall},
 	receipt::ReasonId,
 };
 
@@ -42,7 +47,7 @@ impl<S> Layer<S> for AnswerLayer {
 		AnswerService { inner }
 	}
 }
-struct AbortOnDrop(crate::layer::ExecutionContext, bool);
+struct AbortOnDrop(ExecutionContext, bool);
 impl AbortOnDrop {
 	fn disarm(&mut self) {
 		assert!(mem::replace(&mut self.1, false), "session abort guard disarmed once");
@@ -220,10 +225,10 @@ where
 }
 
 fn chat_stream(
-	mut input: crate::codec::RawEventStream,
+	mut input: RawEventStream,
 	meta: ResponseMeta,
-	context: crate::layer::ExecutionContext,
-) -> crate::answer::OutputStream<ChatEvent> {
+	context: ExecutionContext,
+) -> OutputStream<ChatEvent> {
 	Box::pin(async_stream::stream! {
 		let mut abort = AbortOnDrop(context.clone(), true);
 		if let Err(mut error) = context.checkpoint(ErrorPhase::Streaming) {
@@ -318,9 +323,9 @@ fn chat_stream(
 }
 
 fn image_stream(
-	mut input: crate::codec::RawEventStream,
-	context: crate::layer::ExecutionContext,
-) -> crate::answer::GenerationStream<crate::answer::ImageArtifact> {
+	mut input: RawEventStream,
+	context: ExecutionContext,
+) -> GenerationStream<ImageArtifact> {
 	Box::pin(async_stream::stream! {
 		let mut abort = AbortOnDrop(context.clone(), true);
 		loop {
@@ -349,10 +354,7 @@ fn image_stream(
 	})
 }
 
-fn audio_stream(
-	mut input: crate::codec::RawEventStream,
-	context: crate::layer::ExecutionContext,
-) -> crate::answer::AudioStream {
+fn audio_stream(mut input: RawEventStream, context: ExecutionContext) -> AudioStream {
 	Box::pin(async_stream::stream! {
 		let mut abort = AbortOnDrop(context.clone(), true);
 		loop {
@@ -381,10 +383,7 @@ fn audio_stream(
 	})
 }
 
-fn transcript_stream(
-	mut input: crate::codec::RawEventStream,
-	context: crate::layer::ExecutionContext,
-) -> crate::answer::TranscriptStream {
+fn transcript_stream(mut input: RawEventStream, context: ExecutionContext) -> TranscriptStream {
 	Box::pin(async_stream::stream! {
 		let mut abort = AbortOnDrop(context.clone(), true);
 		loop {
@@ -413,11 +412,7 @@ fn transcript_stream(
 	})
 }
 
-fn native_stream(
-	mut input: crate::codec::RawEventStream,
-	limit: u64,
-	context: crate::layer::ExecutionContext,
-) -> crate::body::ByteStream {
+fn native_stream(mut input: RawEventStream, limit: u64, context: ExecutionContext) -> ByteStream {
 	Box::pin(async_stream::stream! {
 		let mut abort = AbortOnDrop(context.clone(), true);
 		let mut observed = 0_u64;
@@ -442,8 +437,8 @@ fn native_stream(
 }
 
 async fn next_with_deadline(
-	input: &mut crate::codec::RawEventStream,
-	context: &crate::layer::ExecutionContext,
+	input: &mut RawEventStream,
+	context: &ExecutionContext,
 ) -> Result<Option<Result<RawEvent, Error>>, Error> {
 	loop {
 		context.checkpoint(ErrorPhase::Streaming)?;
@@ -463,10 +458,10 @@ async fn next_with_deadline(
 
 async fn unary_body(
 	operation: OperationKind,
-	native: Option<&crate::call::NativeRequest>,
-	handshake: &crate::codec::HandshakeMeta,
-	mut events: crate::codec::RawEventStream,
-	context: &crate::layer::ExecutionContext,
+	native: Option<&NativeRequest>,
+	handshake: &HandshakeMeta,
+	mut events: RawEventStream,
+	context: &ExecutionContext,
 ) -> Result<AnswerBody, Error> {
 	let mut answer = None;
 	let mut native_bytes = BytesMut::new();
@@ -566,20 +561,16 @@ const fn raw_kind(event: &RawEvent) -> AnswerKind {
 		| RawEvent::Failure(_) => AnswerKind::Native,
 	}
 }
-fn finalize_stream_error(mut error: Error, context: &crate::layer::ExecutionContext) -> Error {
+fn finalize_stream_error(mut error: Error, context: &ExecutionContext) -> Error {
 	context.finalize_error(&mut error);
 	let mut error = error.committed(context.is_committed());
 	error.replace_receipt(context.receipt());
 	error
 }
-fn mismatch(
-	expected: OperationKind,
-	actual: AnswerKind,
-	context: &crate::layer::ExecutionContext,
-) -> Error {
+fn mismatch(expected: OperationKind, actual: AnswerKind, context: &ExecutionContext) -> Error {
 	Error::body_variant_mismatch(expected, actual, context.receipt())
 }
-fn invariant(reason: &'static str, context: &crate::layer::ExecutionContext) -> Error {
+fn invariant(reason: &'static str, context: &ExecutionContext) -> Error {
 	Error::new(
 		ErrorKind::ProviderContractMismatch,
 		ErrorPhase::Internal,
@@ -588,7 +579,7 @@ fn invariant(reason: &'static str, context: &crate::layer::ExecutionContext) -> 
 	)
 	.detail(ErrorDetail::protocol(ReasonId::new(reason)))
 }
-fn limit_error(limit: u64, observed: u64, context: &crate::layer::ExecutionContext) -> Error {
+fn limit_error(limit: u64, observed: u64, context: &ExecutionContext) -> Error {
 	Error::new(
 		ErrorKind::PolicyBufferExceeded,
 		ErrorPhase::Streaming,
@@ -598,7 +589,7 @@ fn limit_error(limit: u64, observed: u64, context: &crate::layer::ExecutionConte
 	.committed(context.is_committed())
 	.detail(ErrorDetail::budget(sf!("native_response_bytes"), limit as u128, observed as u128))
 }
-fn content_type(headers: &[crate::codec::RequestHeader]) -> Option<Str> {
+fn content_type(headers: &[RequestHeader]) -> Option<Str> {
 	headers
 		.iter()
 		.find(|header| header.name.as_str().eq_ignore_ascii_case("content-type"))
@@ -609,7 +600,7 @@ fn content_type(headers: &[crate::codec::RequestHeader]) -> Option<Str> {
 mod tests {
 	use std::{
 		sync::Arc,
-		time::{Duration, SystemTime},
+		time::{Duration, Instant, SystemTime},
 	};
 
 	use bytes::Bytes;
@@ -622,9 +613,13 @@ mod tests {
 			Call, CallMeta, ChatRequest, ContextStrategy, NegotiationPolicy, OperationCall, Sampling,
 			SessionRequest, Setting, Target,
 		},
+		codec::RawEventStream,
 		event::{Completion, FinishReason},
 		id::{RequestId, TurnId},
-		layer::session::{SessionAction, SessionPlanner as _},
+		layer::{
+			ExecutionContext,
+			session::{SessionAction, SessionPlanner as _},
+		},
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
 			RuntimeRouteEvidence,
@@ -638,8 +633,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn audio_terminal_commits_only_after_final_chunk() {
-		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
-		let input: crate::codec::RawEventStream =
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let input: RawEventStream =
 			Box::pin(futures::stream::iter([Ok(RawEvent::Audio(AudioChunk {
 				bytes:       bytes::Bytes::from_static(b"audio"),
 				start_ms:    Some(0),
@@ -687,7 +682,7 @@ mod tests {
 			planned_at:          SystemTime::UNIX_EPOCH,
 			catalog_revision:    catalog.revision().clone(),
 			registry_generation: 1,
-			expires_at:          std::time::Instant::now() + Duration::from_secs(60),
+			expires_at:          Instant::now() + Duration::from_secs(60),
 			operation:           OperationKind::Chat,
 			model:               Some(model.key.clone()),
 			provider:            route.provider.clone(),
@@ -756,7 +751,7 @@ mod tests {
 			})),
 		);
 		call.execution = Some(Arc::new(plan));
-		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
+		let context = ExecutionContext::new(ExecutionBudget::default());
 		assert_eq!(
 			planner
 				.prepare(&mut call, &context)
@@ -774,7 +769,7 @@ mod tests {
 			Bytes::from_static(b"request"),
 			|completion| Ok(receipt_bytes(completion)),
 		);
-		let input: crate::codec::RawEventStream =
+		let input: RawEventStream =
 			Box::pin(futures::stream::iter([Ok(RawEvent::Chat(ChatEvent::Completed(Completion {
 				reason:  FinishReason::Stop,
 				blocks:  0,
@@ -806,14 +801,14 @@ mod tests {
 
 	#[tokio::test]
 	async fn audio_failure_after_visible_chunk_is_committed() {
-		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
+		let context = ExecutionContext::new(ExecutionBudget::default());
 		let failure = Error::new(
 			ErrorKind::StreamCorruption,
 			ErrorPhase::Streaming,
 			RetryAction::Never,
 			context.receipt(),
 		);
-		let input: crate::codec::RawEventStream = Box::pin(futures::stream::iter([
+		let input: RawEventStream = Box::pin(futures::stream::iter([
 			Ok(RawEvent::Audio(AudioChunk {
 				bytes:       bytes::Bytes::from_static(b"partial"),
 				start_ms:    Some(0),

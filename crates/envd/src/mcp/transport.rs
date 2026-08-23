@@ -1,12 +1,12 @@
 //! Common cancellation-aware MCP transport contract.
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, io, pin::Pin};
 
 use omp_core::Str;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::json_rpc::RequestId;
+use super::{header_policy::HeaderPolicyError, json_rpc::RequestId};
 
 /// Boxed future at the cold dynamic transport boundary.
 pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -39,9 +39,23 @@ pub struct TransportResponse {
 #[derive(Debug)]
 pub enum IncomingMessage {
 	/// Notification without an ID.
-	Notification { method: Str, params: Value },
+	Notification {
+		/// JSON-RPC method read from child stdout for stdio or the remote event
+		/// stream for HTTP/SSE.
+		method: Str,
+		/// Uncorrelated notification parameters supplied by the server.
+		params: Value,
+	},
 	/// Server-to-client request requiring a response.
-	Request { id: RequestId, method: Str, params: Value },
+	Request {
+		/// Server-assigned identity that must be echoed by the client response.
+		id:     RequestId,
+		/// JSON-RPC method read from child stdout for stdio or the remote event
+		/// stream for HTTP/SSE.
+		method: Str,
+		/// Parameters supplied for the server-initiated request.
+		params: Value,
+	},
 	/// Physical connection ended.
 	Closed,
 }
@@ -139,19 +153,23 @@ pub enum TransportFailure {
 	FrameTooLarge,
 	/// Child process could not be spawned.
 	#[error("MCP stdio child process could not be started")]
-	Spawn(#[source] std::io::Error),
+	Spawn(#[source] io::Error),
 	/// Pipe or socket I/O failed.
 	#[error("MCP transport I/O failed")]
-	Io(#[source] std::io::Error),
+	Io(#[source] io::Error),
 	/// HTTP client failed.
 	#[error("MCP HTTP transport failed")]
 	Http(#[source] wreq::Error),
 	/// HTTP response status is not successful.
 	#[error("MCP HTTP endpoint returned status {status}")]
-	HttpStatus { status: u16 },
+	HttpStatus {
+		/// Non-successful HTTP response status code returned by the configured
+		/// remote endpoint.
+		status: u16,
+	},
 	/// Header policy rejected configuration or redirect behavior.
 	#[error("MCP HTTP header or redirect policy rejected the request")]
-	HeaderPolicy(#[source] super::header_policy::HeaderPolicyError),
+	HeaderPolicy(#[source] HeaderPolicyError),
 	/// JSON frame was malformed.
 	#[error("MCP transport received malformed JSON")]
 	Json(#[source] serde_json::Error),
@@ -160,7 +178,10 @@ pub enum TransportFailure {
 	Correlation,
 	/// Server returned a JSON-RPC error.
 	#[error("MCP server returned JSON-RPC error code {code}")]
-	JsonRpc { code: i64 },
+	JsonRpc {
+		/// Application error code from a correlated JSON-RPC error response.
+		code: i64,
+	},
 	/// SSE stream or endpoint event was malformed.
 	#[error("MCP server-sent-event stream was malformed")]
 	SseProtocol,

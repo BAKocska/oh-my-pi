@@ -1,7 +1,9 @@
 //! Production compression-only sessions and document-authority adapter.
 
 use std::{
+	mem,
 	path::{Path, PathBuf},
+	str,
 	sync::Arc,
 };
 
@@ -10,9 +12,13 @@ use futures::Stream;
 use omp_agent::TurnId;
 use omp_core::{Str, sf};
 use omp_proto::{
-	document::v1 as doc_pb,
-	thread::v1::{Item, Message, Part as ThreadPart, Role, item, part},
+	document::v1::{
+		self as doc_pb, commit_transaction_response, read_document_response, read_selection,
+		text_mutation,
+	},
+	thread::v1::{Item, Message, Part as ThreadPart, Role, item},
 };
+use omp_sdk::Url;
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, Claims, CommitError, Constraint, Effects, Ev, IncomingParams,
 	ParamError, Part, Precedence, Presentation, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
@@ -23,6 +29,12 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::{Action, CompressHost, IsolationPolicy, Loss, Status};
+use crate::{
+	bridges::{AgentGoalControl, InferenceBridge, builtin},
+	chat,
+	headless::{HeadlessSession, HeadlessSessionOptions},
+	settings::current,
+};
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
@@ -45,7 +57,7 @@ pub enum ProductionError {
 		path:   PathBuf,
 		/// Decoding failure.
 		#[source]
-		source: std::str::Utf8Error,
+		source: str::Utf8Error,
 	},
 	/// Whole-document read returned no content body.
 	#[error("document authority omitted whole content for {path:?}")]
@@ -69,7 +81,7 @@ pub enum ProductionError {
 
 /// One compression-only production child.
 pub struct CompressionSession {
-	session: crate::headless::HeadlessSession,
+	session: HeadlessSession,
 	actions: Arc<Mutex<Vec<Action>>>,
 	first:   bool,
 }
@@ -96,17 +108,13 @@ impl ProductionCompressHost {
 		data_dir: PathBuf,
 		progress: Arc<dyn CompressProgress>,
 	) -> Result<Self, ProductionError> {
-		let root = crate::chat::canonical_project(&root).map_err(|_| ProductionError::Session)?;
-		let settings = crate::settings::current(&data_dir).map_err(|_| ProductionError::Session)?;
+		let root = chat::canonical_project(&root).map_err(|_| ProductionError::Session)?;
+		let settings = current(&data_dir).map_err(|_| ProductionError::Session)?;
 		let state_dir = omp_env::project_state::directory(&data_dir, &root)
 			.map_err(|_| ProductionError::Session)?;
-		crate::chat::ensure_state_directory(&state_dir).map_err(|_| ProductionError::Session)?;
-		let bridges = crate::bridges::builtin(
-			&root,
-			Arc::new(crate::bridges::InferenceBridge::default()),
-			crate::bridges::AgentGoalControl::default(),
-			None,
-		);
+		chat::ensure_state_directory(&state_dir).map_err(|_| ProductionError::Session)?;
+		let bridges =
+			builtin(&root, Arc::new(InferenceBridge::default()), AgentGoalControl::default(), None);
 		let environment = omp_envd::ProjectEnvironment::connect_or_start(
 			&root,
 			&state_dir,
@@ -126,7 +134,7 @@ impl ProductionCompressHost {
 		if let Some(model) = requested {
 			return Ok(Str::new(model));
 		}
-		crate::settings::current(&self.data_dir)
+		current(&self.data_dir)
 			.map_err(|_| ProductionError::Session)?
 			.default_model
 			.map(Str::from)
@@ -145,7 +153,7 @@ impl CompressHost for ProductionCompressHost {
 	) -> impl Future<Output = Result<Str, Self::Error>> + Send {
 		let path = path.to_owned();
 		async move {
-			let uri = omp_sdk::Url::from_file_path(&path)
+			let uri = Url::from_file_path(&path)
 				.map_err(|()| ProductionError::MissingContent { path: path.clone() })?;
 			let lease = self
 				.documents
@@ -156,20 +164,18 @@ impl CompressHost for ProductionCompressHost {
 				.read(
 					&lease,
 					doc_pb::ReadSelection {
-						selection: Some(doc_pb::read_selection::Selection::Whole(
-							doc_pb::WholeDocument {},
-						)),
+						selection: Some(read_selection::Selection::Whole(doc_pb::WholeDocument {})),
 					},
 					cancel,
 				)
 				.await?;
 			let content = match response.body {
-				Some(doc_pb::read_document_response::Body::Content(content)) => content,
+				Some(read_document_response::Body::Content(content)) => content,
 				_ => return Err(ProductionError::MissingContent { path }),
 			};
 			self.documents.close(lease, cancel).await?;
-			let text = std::str::from_utf8(&content)
-				.map_err(|source| ProductionError::Utf8 { path, source })?;
+			let text =
+				str::from_utf8(&content).map_err(|source| ProductionError::Utf8 { path, source })?;
 			Ok(Str::new(text))
 		}
 	}
@@ -187,9 +193,9 @@ impl CompressHost for ProductionCompressHost {
 			debug_assert_eq!(policy, super::ISOLATION_POLICY);
 			let actions = Arc::new(Mutex::new(Vec::new()));
 			let registry = compression_registry(Arc::clone(&actions))?;
-			let session = crate::headless::HeadlessSession::open_with_registry(
+			let session = HeadlessSession::open_with_registry(
 				self.data_dir.clone(),
-				crate::headless::HeadlessSessionOptions {
+				HeadlessSessionOptions {
 					project:               self.root.clone(),
 					additional_roots:      Box::new([]),
 					model:                 model?,
@@ -239,7 +245,7 @@ impl CompressHost for ProductionCompressHost {
 				},
 			};
 			result.map_err(|_| ProductionError::Session)?;
-			Ok(std::mem::take(&mut *session.actions.lock()))
+			Ok(mem::take(&mut *session.actions.lock()))
 		}
 	}
 
@@ -262,7 +268,7 @@ impl CompressHost for ProductionCompressHost {
 		let path = path.to_owned();
 		let text = bytes::Bytes::copy_from_slice(text.as_bytes());
 		async move {
-			let uri = omp_sdk::Url::from_file_path(&path)
+			let uri = Url::from_file_path(&path)
 				.map_err(|()| ProductionError::MissingContent { path: path.clone() })?;
 			let mut lease = self
 				.documents
@@ -275,7 +281,7 @@ impl CompressHost for ProductionCompressHost {
 					bytes::Bytes::copy_from_slice(omp_core::Ulid::generate().to_string().as_bytes()),
 					doc_pb::TextMutation {
 						base_revision: None,
-						change:        Some(doc_pb::text_mutation::Change::ProposedContent(text)),
+						change:        Some(text_mutation::Change::ProposedContent(text)),
 						stale_policy:  doc_pb::StalePolicy::Fail as i32,
 						format_policy: doc_pb::FormatPolicy::Disabled as i32,
 					},
@@ -284,11 +290,11 @@ impl CompressHost for ProductionCompressHost {
 				.await?;
 			self.documents.close(lease, cancel).await?;
 			match result.outcome {
-				Some(doc_pb::commit_transaction_response::Outcome::Committed(_)) => Ok(()),
-				Some(doc_pb::commit_transaction_response::Outcome::Rejected(_)) => {
+				Some(commit_transaction_response::Outcome::Committed(_)) => Ok(()),
+				Some(commit_transaction_response::Outcome::Rejected(_)) => {
 					Err(ProductionError::WriteRejected)
 				},
-				Some(doc_pb::commit_transaction_response::Outcome::PartiallyCommitted(_)) => {
+				Some(commit_transaction_response::Outcome::PartiallyCommitted(_)) => {
 					Err(ProductionError::WritePartial)
 				},
 				None => Err(ProductionError::WriteRejected),
@@ -514,7 +520,7 @@ fn message(role: Role, text: &str) -> Item {
 		kind: Some(item::Kind::Message(Message {
 			role: role as i32,
 			parts: vec![ThreadPart {
-				kind: Some(part::Kind::Text(text.to_owned())),
+				kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())),
 				..ThreadPart::default()
 			}],
 			..Message::default()

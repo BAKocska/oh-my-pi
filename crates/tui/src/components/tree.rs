@@ -1,3 +1,5 @@
+use std::slice;
+
 use omp_core::{IntoStr, Str, StrMut};
 use smallvec::SmallVec;
 
@@ -126,7 +128,7 @@ impl Tree {
 
 	/// Appends a root node.
 	pub fn node(mut self, node: TreeNode) -> Self {
-		collect_open(std::slice::from_ref(&node), &mut self.state.open);
+		collect_open(slice::from_ref(&node), &mut self.state.open);
 		self.nodes.push(node);
 		self.rows_dirty = true;
 		self
@@ -491,6 +493,7 @@ mod tests {
 		assert_eq!(tree.rows[1].path, "root/leaf");
 		assert_eq!(tree.key(&mut ec, Key::Down), Flow::Consumed);
 		assert_eq!(tree.key(&mut ec, Key::Enter), Flow::Consumed);
+
 		let mut values = serde_json::Map::new();
 		tree.value(&mut values);
 		assert_eq!(values["tree-id"], serde_json::json!("root/leaf"));

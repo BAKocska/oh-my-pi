@@ -3,7 +3,7 @@ use std::io::Write;
 use clap::Parser;
 
 use crate::{
-	ExecutionExitCode, ExecutionResult, builtins,
+	Error, ExecutionContext, ExecutionExitCode, ExecutionResult, Shell, ShellExtensions, builtins,
 	env::{EnvironmentLookup, EnvironmentScope},
 	int_utils,
 	jobs::{Job, JobSelector},
@@ -32,11 +32,11 @@ pub(crate) struct WaitCommand {
 }
 
 impl builtins::Command for WaitCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		if let Some(variable) = &self.variable_to_receive_id {
 			context.shell.env_mut().unset(variable)?;
@@ -130,10 +130,10 @@ enum WaitSelectorResolution {
 	Failure(ExecutionResult),
 }
 
-fn resolve_wait_selectors<SE: crate::ShellExtensions>(
-	context: &crate::ExecutionContext<'_, SE>,
+fn resolve_wait_selectors<SE: ShellExtensions>(
+	context: &ExecutionContext<'_, SE>,
 	ids: &[String],
-) -> Result<WaitSelectorResolution, crate::Error> {
+) -> Result<WaitSelectorResolution, Error> {
 	let mut selectors = Vec::new();
 	for id in ids {
 		if id.starts_with('%') {
@@ -164,10 +164,10 @@ fn resolve_wait_selectors<SE: crate::ShellExtensions>(
 }
 
 fn assign_wait_variable(
-	shell: &mut crate::Shell<impl crate::ShellExtensions>,
+	shell: &mut Shell<impl ShellExtensions>,
 	name: &str,
 	value: String,
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
 	shell.env_mut().update_or_add(
 		name,
 		ShellValueLiteral::Scalar(value),

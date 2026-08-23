@@ -6,9 +6,10 @@
 //! projection can be rebuilt from journal sequence zero at any time.
 
 use std::{
+	env,
 	error::Error as StdError,
 	ffi::OsStr,
-	fs,
+	fs, io,
 	path::{Path, PathBuf},
 	time::Duration,
 };
@@ -18,7 +19,10 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use super::{
 	helpers::Measurement,
-	types::{DispositionIntent, ExperimentStatus, JournalFact, RunCompletion, SessionConfig},
+	types::{
+		DispositionIntent, ExperimentStatus, JournalFact, MetricDirection, RunCompletion,
+		SessionConfig,
+	},
 };
 
 const SCHEMA_VERSION: i64 = 1;
@@ -130,7 +134,7 @@ pub enum StorageError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// SQLite open, schema, query, or transaction failed.
 	#[error("autoresearch SQLite projection failed")]
@@ -158,22 +162,19 @@ impl StoragePaths {
 	/// `OMP_AUTORESEARCH_DB_DIR` override.
 	pub fn resolve(repository_root: &Path) -> Result<Self, StorageError> {
 		let encoded = encode_project_key(repository_root.as_os_str());
-		if let Some(root) =
-			std::env::var_os("OMP_AUTORESEARCH_DB_DIR").filter(|value| !value.is_empty())
-		{
+		if let Some(root) = env::var_os("OMP_AUTORESEARCH_DB_DIR").filter(|value| !value.is_empty()) {
 			let root = PathBuf::from(root);
 			return Ok(Self {
 				database:    root.join(format!("{encoded}.db")),
 				project_dir: root.join(encoded),
 			});
 		}
-		let root =
-			if let Some(root) = std::env::var_os("OMP_DATA_DIR").filter(|value| !value.is_empty()) {
-				PathBuf::from(root)
-			} else {
-				let home = std::env::var_os("HOME").ok_or(StorageError::MissingDataDirectory)?;
-				PathBuf::from(home).join(".local/share/omp")
-			};
+		let root = if let Some(root) = env::var_os("OMP_DATA_DIR").filter(|value| !value.is_empty()) {
+			PathBuf::from(root)
+		} else {
+			let home = env::var_os("HOME").ok_or(StorageError::MissingDataDirectory)?;
+			PathBuf::from(home).join(".local/share/omp")
+		};
 		let root = root.join("autoresearch");
 		Ok(Self { database: root.join(format!("{encoded}.db")), project_dir: root.join(encoded) })
 	}
@@ -659,19 +660,19 @@ fn project_intent(tx: &Transaction<'_>, intent: &DispositionIntent) -> Result<()
 	Ok(())
 }
 
-fn direction(direction: super::types::MetricDirection) -> &'static str {
+fn direction(direction: MetricDirection) -> &'static str {
 	match direction {
-		super::types::MetricDirection::Lower => "lower",
-		super::types::MetricDirection::Higher => "higher",
+		MetricDirection::Lower => "lower",
+		MetricDirection::Higher => "higher",
 	}
 }
 
-fn status(status: super::types::ExperimentStatus) -> &'static str {
+fn status(status: ExperimentStatus) -> &'static str {
 	match status {
-		super::types::ExperimentStatus::Keep => "keep",
-		super::types::ExperimentStatus::Discard => "discard",
-		super::types::ExperimentStatus::Crash => "crash",
-		super::types::ExperimentStatus::ChecksFailed => "checks_failed",
+		ExperimentStatus::Keep => "keep",
+		ExperimentStatus::Discard => "discard",
+		ExperimentStatus::Crash => "crash",
+		ExperimentStatus::ChecksFailed => "checks_failed",
 	}
 }
 

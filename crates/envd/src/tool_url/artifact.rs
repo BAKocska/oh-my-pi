@@ -1,11 +1,17 @@
 //! Session artifact resolver backed by the authoritative catalog and blob
 //! store.
 
-use std::{ops::Range, sync::Arc};
+use std::{
+	fmt::{self, Display},
+	fs, io,
+	ops::Range,
+	sync::Arc,
+};
 
 use omp_core::{CowBytes, Str};
 use omp_storage::{
 	blob::{BlobRef, BlobStore},
+	gc,
 	gc::{ArtifactCatalog as StorageArtifactCatalog, ArtifactRecord as StorageArtifactRecord},
 	transcript::SessionId,
 };
@@ -66,7 +72,7 @@ impl ArtifactCatalog for CatalogAuthority {
 	async fn by_ordinal(&self, ordinal: u64) -> Result<Option<ArtifactRecord>, Fault> {
 		match self.catalog.lock().stat_ordinal(&self.session, ordinal) {
 			Ok(record) => Ok(Some(project_record(record))),
-			Err(omp_storage::gc::Error::ArtifactNotFound) => Ok(None),
+			Err(gc::Error::ArtifactNotFound) => Ok(None),
 			Err(error) => Err(storage_fault(error)),
 		}
 	}
@@ -75,7 +81,7 @@ impl ArtifactCatalog for CatalogAuthority {
 		let reference = BlobRef::parse_hex(digest, 0).map_err(storage_fault)?;
 		match self.catalog.lock().stat_digest(reference.hash.into_bytes()) {
 			Ok(record) => Ok(Some(project_record(record))),
-			Err(omp_storage::gc::Error::ArtifactNotFound) => Ok(None),
+			Err(gc::Error::ArtifactNotFound) => Ok(None),
 			Err(error) => Err(storage_fault(error)),
 		}
 	}
@@ -90,7 +96,7 @@ impl BlobStoreAuthority {
 	fn reference(&self, digest: &str) -> Result<BlobRef, Fault> {
 		let probe = BlobRef::parse_hex(digest, 0).map_err(storage_fault)?;
 		let path = self.store.path(&probe);
-		let size = std::fs::metadata(path).map_err(io_fault)?.len();
+		let size = fs::metadata(path).map_err(io_fault)?.len();
 		BlobRef::parse_hex(digest, size).map_err(storage_fault)
 	}
 }
@@ -123,14 +129,14 @@ impl BlobAuthority for BlobStoreAuthority {
 }
 
 /// Production artifact resolver with cap guidance, path mode and completion.
-pub(super) struct ArtifactUrlResolver {
+pub(crate) struct ArtifactUrlResolver {
 	inner:   ArtifactResolver<CatalogAuthority, BlobStoreAuthority>,
 	catalog: CatalogAuthority,
 	blobs:   BlobStoreAuthority,
 }
 
 impl ArtifactUrlResolver {
-	pub(super) fn open(store: BlobStore, session: &str) -> Result<Self, omp_storage::gc::Error> {
+	pub(super) fn open(store: BlobStore, session: &str) -> Result<Self, gc::Error> {
 		let catalog = CatalogAuthority {
 			catalog: Arc::new(Mutex::new(StorageArtifactCatalog::open(&store)?)),
 			session: SessionId(Str::new(session)),
@@ -222,8 +228,8 @@ impl Resolve for ArtifactUrlResolver {
 	}
 }
 
-impl std::fmt::Debug for ArtifactUrlResolver {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ArtifactUrlResolver {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("ArtifactUrlResolver(..)")
 	}
 }
@@ -235,10 +241,10 @@ fn project_record(record: StorageArtifactRecord) -> ArtifactRecord {
 	}
 }
 
-fn storage_fault(error: impl std::fmt::Display) -> Fault {
+fn storage_fault(error: impl Display) -> Fault {
 	Fault::Source { message: Str::new(format!("Artifact storage failed: {error}")) }
 }
 
-fn io_fault(source: std::io::Error) -> Fault {
+fn io_fault(source: io::Error) -> Fault {
 	Fault::Source { message: Str::new(format!("Artifact storage I/O failed: {source}")) }
 }

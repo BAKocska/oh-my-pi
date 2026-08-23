@@ -1,10 +1,11 @@
 //! Deterministic pre-chat native subsystem probes.
 
 use std::{
-	fs,
+	env, fs, io,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
+use omp_catalog::snapshot;
 use omp_storage::index::SessionIndex;
 
 /// One named smoke probe result.
@@ -47,7 +48,7 @@ pub async fn run() -> miette::Result<()> {
 }
 
 fn probe_inference() -> ProbeResult {
-	match omp_catalog::snapshot::Catalog::try_embedded() {
+	match snapshot::Catalog::try_embedded() {
 		Ok(catalog) if !catalog.models().is_empty() => passed("inference"),
 		Ok(_) => failed("inference", "embedded catalog contains no models"),
 		Err(error) => failed("inference", &error.to_string()),
@@ -55,7 +56,7 @@ fn probe_inference() -> ProbeResult {
 }
 
 fn probe_process(name: &'static str) -> ProbeResult {
-	match std::env::current_exe().and_then(fs::metadata) {
+	match env::current_exe().and_then(fs::metadata) {
 		Ok(metadata) if metadata.is_file() => passed(name),
 		Ok(_) => failed(name, "current executable is not a regular file"),
 		Err(error) => failed(name, &error.to_string()),
@@ -67,11 +68,11 @@ fn probe_storage() -> ProbeResult {
 		.duration_since(UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_nanos();
-	let root = std::env::temp_dir().join(format!("omp-smoke-{}-{stamp}", std::process::id()));
+	let root = env::temp_dir().join(format!("omp-smoke-{}-{stamp}", std::process::id()));
 	let result = fs::create_dir(&root).and_then(|()| {
 		SessionIndex::open(root.join("sessions.sqlite3"))
 			.map(|_| ())
-			.map_err(std::io::Error::other)
+			.map_err(io::Error::other)
 	});
 	let _ = fs::remove_dir_all(&root);
 	match result {

@@ -13,7 +13,10 @@ use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, future::Either, pin_mut};
 use omp_core::{CowBytes, Str, sf};
-use omp_proto::inference::v1::{InvokeInput, invoke_input};
+use omp_proto::inference::v1::{
+	InvokeInput,
+	invoke_input::{self, chunk},
+};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Effects, Ev, ExecEffects,
 	IncomingParams, Interrupt, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool,
@@ -29,6 +32,8 @@ use crate::{
 		managed_job_terminal, next_background_name,
 	},
 	render::TextProjection,
+	shell_intercept,
+	shell_intercept::{CompiledRule, Rule},
 };
 
 fn omit_schema_format(schema: &mut schemars::Schema) {
@@ -395,7 +400,7 @@ pub struct ShellPromptSnapshot {
 	/// Whether shell-intent interception is enabled.
 	pub interceptor_enabled: bool,
 	/// Ordered configured interception rules.
-	pub interceptor_rules:   Arc<[crate::shell_intercept::Rule]>,
+	pub interceptor_rules:   Arc<[Rule]>,
 	/// Whether capability-gated ACP routing is allowed.
 	pub acp_routing:         bool,
 }
@@ -466,7 +471,7 @@ pub struct ShellTool<E: ShellExec> {
 	auto_background_enabled: bool,
 	auto_background_threshold: Duration,
 	interceptor_enabled: bool,
-	interceptor_rules: Arc<[crate::shell_intercept::CompiledRule]>,
+	interceptor_rules: Arc<[CompiledRule]>,
 	sibling_tools: Arc<[Str]>,
 	spec: ToolSpec,
 }
@@ -525,7 +530,7 @@ pub fn shell_with_snapshot_and_timeout_bounds<E: ShellExec>(
 	tool.spec.description = snapshot.description();
 	tool.interceptor_enabled = snapshot.interceptor_enabled;
 	tool.interceptor_rules =
-		crate::shell_intercept::compile(&snapshot.interceptor_rules, &snapshot.sibling_tools).into();
+		shell_intercept::compile(&snapshot.interceptor_rules, &snapshot.sibling_tools).into();
 	tool.sibling_tools = Arc::clone(&snapshot.sibling_tools);
 	tool
 }
@@ -926,8 +931,8 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 
 	fn invoke_input(&self, update: &Update, invocation_id: &str) -> Option<InvokeInput> {
 		let channel = match update.channel {
-			OutputChannel::Stdout | OutputChannel::Pty => invoke_input::chunk::Channel::Stdout,
-			OutputChannel::Stderr => invoke_input::chunk::Channel::Stderr,
+			OutputChannel::Stdout | OutputChannel::Pty => chunk::Channel::Stdout,
+			OutputChannel::Stderr => chunk::Channel::Stderr,
 		};
 		Some(InvokeInput {
 			invocation_id: invocation_id.to_owned(),

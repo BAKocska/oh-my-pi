@@ -6,6 +6,7 @@ use bytes::{Bytes, BytesMut};
 use omp_catalog::OperationKind;
 use omp_core::{Str, format_rfc3339, parse_rfc3339, sf};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use super::{
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawEvent,
@@ -16,6 +17,7 @@ use crate::{
 	body::BodySource,
 	call::{OperationCall, SearchRecency, SearchRequest},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
+	id::RequestId,
 	receipt::{ExecutionReceipt, ReasonId, Usage, UsageSource},
 	transport::{Frame, FramingProtocol},
 };
@@ -181,7 +183,7 @@ struct ExaDecoder {
 	finished:   bool,
 	provider:   omp_catalog::ProviderId,
 	route:      omp_catalog::RouteId,
-	request_id: crate::id::RequestId,
+	request_id: RequestId,
 }
 
 impl Decoder for ExaDecoder {
@@ -357,7 +359,7 @@ const fn slice_is_empty(slice: &&[Str]) -> bool {
 }
 
 fn search_uri(base: &str) -> Result<Str, Error> {
-	let mut url = url::Url::parse(base).map_err(|_| {
+	let mut url = Url::parse(base).map_err(|_| {
 		protocol_error(ErrorKind::InvalidRequest, ErrorPhase::Encoding, "exa.base_url_invalid")
 	})?;
 	if url.cannot_be_a_base() || url.query().is_some() || url.fragment().is_some() {

@@ -12,13 +12,14 @@ use http::{
 };
 use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use serde_json::Value;
+use tokio::time;
 
 use crate::{
 	answer::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageStatus, UsageUnit, UsageWindow,
 		UsageWindowKind,
 	},
-	auth::{OAuthHttpClient, OAuthHttpRequest},
+	auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse as AuthOAuthHttpResponse},
 	catalog::ProviderId,
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
@@ -110,14 +111,14 @@ async fn execute(
 	http: &dyn OAuthHttpClient,
 	request: OAuthHttpRequest,
 	deadline: Option<Instant>,
-) -> Result<crate::auth::OAuthHttpResponse, UsageFetchError> {
+) -> Result<AuthOAuthHttpResponse, UsageFetchError> {
 	let timeout = deadline
 		.map_or(HTTP_TIMEOUT, |e| e.saturating_duration_since(Instant::now()))
 		.min(HTTP_TIMEOUT);
 	if timeout.is_zero() {
 		return Err(UsageFetchError::Unavailable);
 	}
-	tokio::time::timeout(timeout, http.execute(request))
+	time::timeout(timeout, http.execute(request))
 		.await
 		.map_err(|_| UsageFetchError::Unavailable)?
 		.map_err(|_| UsageFetchError::Unavailable)

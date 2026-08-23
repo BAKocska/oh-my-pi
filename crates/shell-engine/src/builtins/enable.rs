@@ -3,7 +3,7 @@ use std::io::Write;
 use clap::Parser;
 use itertools::Itertools;
 
-use crate::{ExecutionResult, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 /// Enable, disable, or display built-in commands.
 #[derive(Parser)]
@@ -37,11 +37,11 @@ pub(crate) struct EnableCommand {
 }
 
 impl builtins::Command for EnableCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
 		let mut result = ExecutionResult::success();
 

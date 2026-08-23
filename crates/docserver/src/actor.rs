@@ -1,23 +1,39 @@
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::sync::mpsc::{self, Sender};
 use std::{
-	collections::{HashMap, HashSet, VecDeque},
+	collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
+	fmt, mem,
 	path::{Path, PathBuf},
+	str,
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicU64, Ordering},
 	},
+	thread,
 	time::Duration,
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use omp_core::{Str, sf};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 use rand::RngExt as _;
-use tokio::sync::{Mutex as AsyncMutex, broadcast, oneshot};
+use tokio::{
+	runtime,
+	sync::{Mutex, broadcast, oneshot},
+	task,
+	task::JoinError,
+	time::{self, Instant},
+};
+use url::Url;
 
 use crate::{
 	ActiveFileWatch, ByteRange, DocumentHead, DocumentId, DocumentKind, DocumentPresence,
 	DocumentSnapshot, Error, FileFingerprint, FileWatchEvent, FileWatchKind, LeaseId, LineRange,
 	Result, Revision, ServerConfig, TransactionId,
+	environment::WorkspaceLeaseTable,
 	fs::{
 		DiskExpectation, DiskState, FollowSymlinks, LocalFs, PathMetadata, PortablePermissions,
 		PreparedDelete, PreparedMove, PreparedWrite,
@@ -194,35 +210,52 @@ impl DocumentEvent {
 	}
 }
 
-/// An active lease, its initial committed head, and its private event stream.
-#[derive(Debug)]
-pub struct OpenedDocument {
-	lease_id: LeaseId,
-	head:     DocumentHead,
-	events:   broadcast::Receiver<DocumentEvent>,
+mod opened_document {
+	use tokio::sync::broadcast::Receiver;
+
+	use super::{DocumentEvent, DocumentHead, LeaseId};
+
+	/// An active lease, its initial committed head, and its private event
+	/// stream.
+	#[derive(Debug)]
+	pub struct OpenedDocument {
+		lease_id: LeaseId,
+		head:     DocumentHead,
+		events:   Receiver<DocumentEvent>,
+	}
+
+	impl OpenedDocument {
+		pub(super) const fn new(
+			lease_id: LeaseId,
+			head: DocumentHead,
+			events: Receiver<DocumentEvent>,
+		) -> Self {
+			Self { lease_id, head, events }
+		}
+
+		/// Returns the lease that keeps this document active.
+		pub const fn lease_id(&self) -> LeaseId {
+			self.lease_id
+		}
+
+		/// Returns the head installed before this open completed.
+		pub const fn head(&self) -> &DocumentHead {
+			&self.head
+		}
+
+		/// Returns this lease's ordered event subscription.
+		pub const fn events(&mut self) -> &mut Receiver<DocumentEvent> {
+			&mut self.events
+		}
+
+		/// Splits the result into its lease, head, and event subscription.
+		pub fn into_parts(self) -> (LeaseId, DocumentHead, Receiver<DocumentEvent>) {
+			(self.lease_id, self.head, self.events)
+		}
+	}
 }
 
-impl OpenedDocument {
-	/// Returns the lease that keeps this document active.
-	pub const fn lease_id(&self) -> LeaseId {
-		self.lease_id
-	}
-
-	/// Returns the head installed before this open completed.
-	pub const fn head(&self) -> &DocumentHead {
-		&self.head
-	}
-
-	/// Returns this lease's ordered event subscription.
-	pub const fn events(&mut self) -> &mut broadcast::Receiver<DocumentEvent> {
-		&mut self.events
-	}
-
-	/// Splits the result into its lease, head, and event subscription.
-	pub fn into_parts(self) -> (LeaseId, DocumentHead, broadcast::Receiver<DocumentEvent>) {
-		(self.lease_id, self.head, self.events)
-	}
-}
+pub use opened_document::OpenedDocument;
 
 /// Registry and lifecycle owner for all active canonical documents.
 #[derive(Clone)]
@@ -230,8 +263,8 @@ pub struct DocumentStore {
 	inner: Arc<RegistryInner>,
 }
 
-impl std::fmt::Debug for DocumentStore {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for DocumentStore {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("DocumentStore")
 			.finish_non_exhaustive()
@@ -241,13 +274,13 @@ impl std::fmt::Debug for DocumentStore {
 impl DocumentStore {
 	/// Creates an empty document registry rooted at `config`.
 	pub fn new(config: ServerConfig) -> Result<Self> {
-		Self::new_with_workspace_leases(config, crate::environment::WorkspaceLeaseTable::default())
+		Self::new_with_workspace_leases(config, WorkspaceLeaseTable::default())
 	}
 
 	/// Creates a registry sharing the Environment's exclusive workspace leases.
 	pub(crate) fn new_with_workspace_leases(
 		config: ServerConfig,
-		workspace_leases: crate::environment::WorkspaceLeaseTable,
+		workspace_leases: WorkspaceLeaseTable,
 	) -> Result<Self> {
 		let fs = LocalFs::new(&config)?;
 		Ok(Self {
@@ -255,8 +288,8 @@ impl DocumentStore {
 				revision_capacity: config.revision_capacity().get(),
 				config,
 				fs,
-				mutation_gate: Arc::new(AsyncMutex::new(())),
-				maps: Mutex::new(RegistryMaps::default()),
+				mutation_gate: Arc::new(Mutex::new(())),
+				maps: RegistryMapsLock::new(RegistryMaps::default()),
 				workspace_leases,
 			}),
 		})
@@ -347,7 +380,7 @@ impl DocumentStore {
 
 	/// Returns the mutation authority shared by transactions and Environment
 	/// path operations.
-	pub(crate) fn mutation_gate(&self) -> Arc<AsyncMutex<()>> {
+	pub(crate) fn mutation_gate(&self) -> Arc<Mutex<()>> {
 		Arc::clone(&self.inner.mutation_gate)
 	}
 
@@ -376,17 +409,17 @@ impl DocumentStore {
 		self.inner.workspace_leases.check_paths(owner, paths)
 	}
 
-	pub(crate) fn workspace_leases(&self) -> &crate::environment::WorkspaceLeaseTable {
+	pub(crate) fn workspace_leases(&self) -> &WorkspaceLeaseTable {
 		&self.inner.workspace_leases
 	}
 
 	/// Resolves a no-follow destination entry which may be missing.
-	pub(crate) fn resolve_entry_path(&self, uri: &url::Url) -> Result<PathBuf> {
+	pub(crate) fn resolve_entry_path(&self, uri: &Url) -> Result<PathBuf> {
 		self.inner.config.resolve_file_uri(uri)
 	}
 
 	/// Converts a confined canonical entry path into its file URI.
-	pub(crate) fn file_uri(&self, path: &Path) -> Result<url::Url> {
+	pub(crate) fn file_uri(&self, path: &Path) -> Result<Url> {
 		self.inner.config.file_uri(path)
 	}
 
@@ -424,7 +457,7 @@ impl DocumentStore {
 			}
 		}
 		let config = self.inner.config.clone();
-		let canonical = tokio::task::spawn_blocking(move || config.resolve_target(path))
+		let canonical = task::spawn_blocking(move || config.resolve_target(path))
 			.await
 			.map_err(join_error)??;
 
@@ -595,13 +628,37 @@ struct RegistryMaps {
 	rebind_reservations: HashMap<PathBuf, DocumentId>,
 }
 
+mod registry_maps_lock {
+	use parking_lot::{Mutex, MutexGuard};
+
+	use super::RegistryMaps;
+
+	pub(super) struct RegistryMapsLock(Mutex<RegistryMaps>);
+
+	impl RegistryMapsLock {
+		pub(super) fn new(maps: RegistryMaps) -> Self {
+			Self(Mutex::new(maps))
+		}
+
+		pub(super) fn lock(&self) -> MutexGuard<'_, RegistryMaps> {
+			self.0.lock()
+		}
+
+		pub(super) fn get_mut(&mut self) -> &mut RegistryMaps {
+			self.0.get_mut()
+		}
+	}
+}
+
+use registry_maps_lock::RegistryMapsLock;
+
 struct RegistryInner {
 	config:            ServerConfig,
 	fs:                LocalFs,
 	revision_capacity: usize,
-	mutation_gate:     Arc<AsyncMutex<()>>,
-	maps:              Mutex<RegistryMaps>,
-	workspace_leases:  crate::environment::WorkspaceLeaseTable,
+	mutation_gate:     Arc<Mutex<()>>,
+	maps:              RegistryMapsLock,
+	workspace_leases:  WorkspaceLeaseTable,
 }
 
 struct OpenLeaseGuard {
@@ -640,7 +697,7 @@ impl RegistryInner {
 		let mut maps = self.lock_maps();
 		loop {
 			let lease_id = LeaseId::from_bytes(random_id_bytes());
-			if let std::collections::hash_map::Entry::Vacant(entry) = maps.by_lease.entry(lease_id) {
+			if let Entry::Vacant(entry) = maps.by_lease.entry(lease_id) {
 				entry.insert(document_id);
 				return lease_id;
 			}
@@ -855,12 +912,12 @@ impl ActorHandle {
 			Ok(()) | Err(flume::TrySendError::Disconnected(_)) => {},
 			Err(flume::TrySendError::Full(command)) => {
 				let sender = self.sender.clone();
-				if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+				if let Ok(runtime) = runtime::Handle::try_current() {
 					let _worker = runtime.spawn(async move {
 						let _ = sender.send_async(command).await;
 					});
 				} else {
-					let _worker = std::thread::spawn(move || {
+					let _worker = thread::spawn(move || {
 						let _ = sender.send(command);
 					});
 				}
@@ -1178,18 +1235,30 @@ enum TestWorkerKind {
 }
 
 #[cfg(test)]
-struct TestWorkerGate {
-	started: oneshot::Sender<()>,
-	release: std::sync::mpsc::Receiver<()>,
+mod test_worker_gate {
+	use std::sync::mpsc::Receiver;
+
+	use tokio::sync::oneshot;
+
+	pub(super) struct TestWorkerGate {
+		started: oneshot::Sender<()>,
+		release: Receiver<()>,
+	}
+
+	impl TestWorkerGate {
+		pub(super) const fn new(started: oneshot::Sender<()>, release: Receiver<()>) -> Self {
+			Self { started, release }
+		}
+
+		pub(super) fn wait(self) {
+			let _ = self.started.send(());
+			let _ = self.release.recv();
+		}
+	}
 }
 
 #[cfg(test)]
-impl TestWorkerGate {
-	fn wait(self) {
-		let _ = self.started.send(());
-		let _ = self.release.recv();
-	}
-}
+use test_worker_gate::TestWorkerGate;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ReloadCause {
@@ -1217,7 +1286,7 @@ struct DocumentActor {
 	revision_capacity: usize,
 	registry: Weak<RegistryInner>,
 	sender: flume::Sender<Command>,
-	receiver: flume::Receiver<Command>,
+	receiver: Receiver<Command>,
 	watch: Option<ActiveFileWatch>,
 	watch_generation: u64,
 	watch_invalidation_counter: Option<Arc<AtomicU64>>,
@@ -1242,7 +1311,7 @@ struct DocumentActor {
 	generation: ActorGeneration,
 	reservations: HashMap<TransactionId, ActorGeneration>,
 	pending_invalidated_transactions: Vec<TransactionId>,
-	idle_deadline: Option<tokio::time::Instant>,
+	idle_deadline: Option<Instant>,
 	shutdown_requested: bool,
 	shutdown_replies: Vec<oneshot::Sender<()>>,
 	#[cfg(test)]
@@ -1261,7 +1330,7 @@ impl DocumentActor {
 		revision_capacity: usize,
 		registry: Weak<RegistryInner>,
 		sender: flume::Sender<Command>,
-		receiver: flume::Receiver<Command>,
+		receiver: Receiver<Command>,
 	) -> Self {
 		Self {
 			document_id,
@@ -1310,11 +1379,11 @@ impl DocumentActor {
 	async fn run(mut self) {
 		loop {
 			let command = if let Some(deadline) = self.idle_deadline {
-				match tokio::time::timeout_at(deadline, self.receiver.recv_async()).await {
+				match time::timeout_at(deadline, self.receiver.recv_async()).await {
 					Ok(Ok(command)) => command,
 					Ok(Err(_)) => break,
 					Err(_) if self.background_in_flight() => {
-						self.idle_deadline = Some(tokio::time::Instant::now() + IDLE_EVICTION_DELAY);
+						self.idle_deadline = Some(Instant::now() + IDLE_EVICTION_DELAY);
 						continue;
 					},
 					Err(_) => break,
@@ -1459,7 +1528,7 @@ impl DocumentActor {
 			&& self.queued_states.is_empty()
 			&& self.queued_reserves.is_empty()
 		{
-			self.idle_deadline = Some(tokio::time::Instant::now() + IDLE_EVICTION_DELAY);
+			self.idle_deadline = Some(Instant::now() + IDLE_EVICTION_DELAY);
 		}
 	}
 
@@ -1557,7 +1626,7 @@ impl DocumentActor {
 		let completion_epoch = Arc::clone(&observed_epoch);
 		#[cfg(test)]
 		let test_gate = self.test_next_activation_gate.take();
-		let _worker = tokio::task::spawn_blocking(move || {
+		let _worker = task::spawn_blocking(move || {
 			#[cfg(test)]
 			if let Some(gate) = test_gate {
 				gate.wait();
@@ -1586,7 +1655,7 @@ impl DocumentActor {
 				if self.invalidated {
 					self.start_reload();
 				} else if self.install_initial(disk).is_ok() {
-					let pending = std::mem::take(&mut self.pending_opens);
+					let pending = mem::take(&mut self.pending_opens);
 					for (lease_id, reply) in pending {
 						self.complete_open(lease_id, reply);
 					}
@@ -1614,7 +1683,7 @@ impl DocumentActor {
 		for (_, _, reply) in self.queued_reads.drain(..) {
 			let _ = reply.send(Err(Error::ExternalInvalidation { path: path.clone() }));
 		}
-		self.idle_deadline = Some(tokio::time::Instant::now());
+		self.idle_deadline = Some(Instant::now());
 	}
 
 	fn ensure_reload(&mut self) {
@@ -1633,7 +1702,7 @@ impl DocumentActor {
 		let path = self.path.clone();
 		let fs = self.fs.clone();
 		let sender = self.sender.clone();
-		let _worker = tokio::task::spawn_blocking(move || {
+		let _worker = task::spawn_blocking(move || {
 			let result = fs.stable_read(&path);
 			let _ = sender.send(Command::ReloadComplete(ReloadCompletion { epoch, result }));
 		});
@@ -1649,14 +1718,14 @@ impl DocumentActor {
 			return;
 		}
 		if let Ok(disk) = completion.result {
-			let cause = std::mem::take(&mut self.reload_cause);
+			let cause = mem::take(&mut self.reload_cause);
 			self.invalidated = false;
 			if self.head.is_none() {
 				if self.install_initial(disk).is_err() {
 					self.fail_activation();
 					return;
 				}
-				let pending = std::mem::take(&mut self.pending_opens);
+				let pending = mem::take(&mut self.pending_opens);
 				for (lease_id, reply) in pending {
 					self.complete_open(lease_id, reply);
 				}
@@ -1715,7 +1784,7 @@ impl DocumentActor {
 		let sender = self.sender.clone();
 		#[cfg(test)]
 		let test_gate = self.test_next_persist_gate.take();
-		let _worker = tokio::task::spawn_blocking(move || {
+		let _worker = task::spawn_blocking(move || {
 			#[cfg(test)]
 			if let Some(gate) = test_gate {
 				gate.wait();
@@ -1837,7 +1906,7 @@ impl DocumentActor {
 			path: self.path.clone(),
 			previous_revision,
 			transaction_id,
-			invalidated_transaction_ids: std::mem::take(&mut self.pending_invalidated_transactions),
+			invalidated_transaction_ids: mem::take(&mut self.pending_invalidated_transactions),
 			previous_path,
 		};
 		let _ = self.events.send(event);
@@ -1853,7 +1922,7 @@ impl DocumentActor {
 		let receiver = self.events.subscribe();
 		self.leases.insert(lease_id);
 		if reply
-			.send(Ok(OpenedDocument { lease_id, head, events: receiver }))
+			.send(Ok(OpenedDocument::new(lease_id, head, receiver)))
 			.is_ok()
 		{
 			self.idle_deadline = None;
@@ -1871,20 +1940,20 @@ impl DocumentActor {
 			self.fail_queued_reads();
 			return;
 		}
-		let states = std::mem::take(&mut self.queued_states);
+		let states = mem::take(&mut self.queued_states);
 		for reply in states {
 			self.handle_ready_state(reply);
 		}
-		let opens = std::mem::take(&mut self.queued_opens);
+		let opens = mem::take(&mut self.queued_opens);
 		for (lease_id, reply) in opens {
 			self.complete_open(lease_id, reply);
 		}
-		let reads = std::mem::take(&mut self.queued_reads);
+		let reads = mem::take(&mut self.queued_reads);
 		for (revision, selection, reply) in reads {
 			let result = self.read_snapshot(revision, selection);
 			let _ = reply.send(result);
 		}
-		let reserves = std::mem::take(&mut self.queued_reserves);
+		let reserves = mem::take(&mut self.queued_reserves);
 		for (transaction_id, expected, reply) in reserves {
 			self.handle_reserve(transaction_id, expected, reply);
 		}
@@ -2147,7 +2216,7 @@ impl DocumentActor {
 		let fs = self.fs.clone();
 		let sender = self.sender.clone();
 		let transaction_id = reservation.transaction_id;
-		let _worker = tokio::task::spawn_blocking(move || {
+		let _worker = task::spawn_blocking(move || {
 			let result = fs.commit_prepared(prepared);
 			let _ = sender.send(Command::CommitComplete(CommitCompletion {
 				transaction_id,
@@ -2196,7 +2265,7 @@ impl DocumentActor {
 		let fs = self.fs.clone();
 		let sender = self.sender.clone();
 		let transaction_id = reservation.transaction_id;
-		let _worker = tokio::task::spawn_blocking(move || {
+		let _worker = task::spawn_blocking(move || {
 			let result = fs.commit_prepared_delete(prepared);
 			let _ = sender.send(Command::CommitComplete(CommitCompletion {
 				transaction_id,
@@ -2257,8 +2326,8 @@ impl DocumentActor {
 		let sender = self.sender.clone();
 		let transaction_id = reservation.transaction_id;
 		#[cfg(test)]
-		let fail_watch_rebind = std::mem::take(&mut self.test_fail_next_move_watch_rebind);
-		let _worker = tokio::task::spawn_blocking(move || {
+		let fail_watch_rebind = mem::take(&mut self.test_fail_next_move_watch_rebind);
+		let _worker = task::spawn_blocking(move || {
 			let result = fs.commit_prepared_move(prepared).map(|disk| {
 				#[cfg(test)]
 				let watch_error = if fail_watch_rebind {
@@ -2424,7 +2493,7 @@ fn snapshot_from_disk(
 		DiskState::Missing => (Bytes::new(), None, DocumentPresence::Missing),
 	};
 	let kind = kind.unwrap_or_else(|| {
-		if std::str::from_utf8(&content).is_ok() {
+		if str::from_utf8(&content).is_ok() {
 			DocumentKind::Text(None)
 		} else {
 			DocumentKind::Binary
@@ -2518,7 +2587,7 @@ fn random_id_bytes() -> [u8; 16] {
 	rand::rng().random()
 }
 
-const fn join_error(source: tokio::task::JoinError) -> Error {
+const fn join_error(source: JoinError) -> Error {
 	Error::Worker { source }
 }
 
@@ -2531,6 +2600,7 @@ mod tests {
 	use std::{num::NonZeroUsize, time::Duration};
 
 	use tempfile::TempDir;
+	use tokio::sync::oneshot::Receiver;
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
@@ -2556,7 +2626,7 @@ mod tests {
 
 	async fn await_new_revision(opened: &mut OpenedDocument, previous: Revision) -> DocumentEvent {
 		loop {
-			let event = tokio::time::timeout(Duration::from_secs(5), opened.events().recv())
+			let event = time::timeout(Duration::from_secs(5), opened.events().recv())
 				.await
 				.expect("watch event arrives")
 				.expect("event stream remains active");
@@ -2566,20 +2636,20 @@ mod tests {
 		}
 	}
 
-	fn test_worker_gate() -> (TestWorkerGate, oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+	fn test_worker_gate() -> (TestWorkerGate, Receiver<()>, Sender<()>) {
 		let (started, started_receive) = oneshot::channel();
-		let (release, release_receive) = std::sync::mpsc::channel();
-		(TestWorkerGate { started, release: release_receive }, started_receive, release)
+		let (release, release_receive) = mpsc::channel();
+		(TestWorkerGate::new(started, release_receive), started_receive, release)
 	}
 
 	async fn await_actor_settled(actor: &ActorHandle) -> ActorStateSnapshot {
-		tokio::time::timeout(Duration::from_secs(5), async {
+		time::timeout(Duration::from_secs(5), async {
 			loop {
 				let state = actor.state().await.expect("actor remains active");
 				if !state.reloading {
 					return state;
 				}
-				tokio::time::sleep(Duration::from_millis(10)).await;
+				time::sleep(Duration::from_millis(10)).await;
 			}
 		})
 		.await
@@ -2590,7 +2660,7 @@ mod tests {
 	async fn first_open_caches_and_repeat_open_shares_identity() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("note.txt");
-		std::fs::write(&path, b"cached").expect("write fixture");
+		fs::write(&path, b"cached").expect("write fixture");
 		let store = store(&root, 4);
 
 		let first = store.open(path.clone()).await.expect("first open");
@@ -2599,7 +2669,7 @@ mod tests {
 		assert_eq!(first.head().revision(), second.head().revision());
 		assert_ne!(first.lease_id(), second.lease_id());
 
-		std::fs::write(&path, b"changed on disk").expect("change fixture");
+		fs::write(&path, b"changed on disk").expect("change fixture");
 		let retained = store
 			.read(first.head().document_id(), Some(first.head().revision()), ReadSelection::Whole)
 			.await
@@ -2611,12 +2681,12 @@ mod tests {
 	async fn retained_revisions_are_exact_and_expire_explicitly() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("history.txt");
-		std::fs::write(&path, b"one").expect("write fixture");
+		fs::write(&path, b"one").expect("write fixture");
 		let store = store(&root, 1);
 		let mut opened = store.open(path.clone()).await.expect("open");
 		let first = opened.head().revision();
 
-		std::fs::write(&path, b"two").expect("modify fixture");
+		fs::write(&path, b"two").expect("modify fixture");
 		let _ = await_new_revision(&mut opened, first).await;
 		let error = store
 			.read(opened.head().document_id(), Some(first), ReadSelection::Whole)
@@ -2629,7 +2699,7 @@ mod tests {
 	async fn byte_and_line_ranges_are_zero_based_half_open() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("ranges.txt");
-		std::fs::write(&path, b"alpha\nbeta\ngamma").expect("write fixture");
+		fs::write(&path, b"alpha\nbeta\ngamma").expect("write fixture");
 		let store = store(&root, 4);
 		let opened = store.open(path).await.expect("open");
 
@@ -2664,12 +2734,12 @@ mod tests {
 	async fn last_lease_allows_bounded_actor_eviction() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("lease.txt");
-		std::fs::write(&path, b"lease").expect("write fixture");
+		fs::write(&path, b"lease").expect("write fixture");
 		let store = store(&root, 4);
 		let opened = store.open(path).await.expect("open");
 		let document_id = opened.head().document_id();
 		store.close(opened.lease_id()).await.expect("close");
-		tokio::time::sleep(IDLE_EVICTION_DELAY + Duration::from_millis(200)).await;
+		time::sleep(IDLE_EVICTION_DELAY + Duration::from_millis(200)).await;
 
 		let error = store
 			.read(document_id, None, ReadSelection::Whole)
@@ -2682,12 +2752,12 @@ mod tests {
 	async fn watcher_installs_external_revision_before_read_resumes() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("watch.txt");
-		std::fs::write(&path, b"before").expect("write fixture");
+		fs::write(&path, b"before").expect("write fixture");
 		let store = store(&root, 4);
 		let mut opened = store.open(path.clone()).await.expect("open");
 		let previous = opened.head().revision();
 
-		std::fs::write(&path, b"after").expect("modify fixture");
+		fs::write(&path, b"after").expect("modify fixture");
 		let event = await_new_revision(&mut opened, previous).await;
 		let read = store
 			.read(opened.lease_id(), None, ReadSelection::Whole)
@@ -2718,7 +2788,7 @@ mod tests {
 	async fn active_permissions_require_current_revision_and_preserve_head() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("permissions.txt");
-		std::fs::write(&path, b"permissions").expect("write fixture");
+		fs::write(&path, b"permissions").expect("write fixture");
 		let store = store(&root, 4);
 		let opened = store.open(path).await.expect("open");
 		let actor = store.actor_handle(opened.lease_id()).expect("actor");
@@ -2766,8 +2836,8 @@ mod tests {
 		let delete_path = root.path().join("delete.txt");
 		let move_path = root.path().join("move.txt");
 		let destination = root.path().join("destination.txt");
-		std::fs::write(&delete_path, b"delete base").expect("delete fixture");
-		std::fs::write(&move_path, b"move base").expect("move fixture");
+		fs::write(&delete_path, b"delete base").expect("delete fixture");
+		fs::write(&move_path, b"move base").expect("move fixture");
 		let store = store(&root, 4);
 
 		let delete_opened = store.open(delete_path.clone()).await.expect("open delete");
@@ -2783,7 +2853,7 @@ mod tests {
 			.local_fs()
 			.prepare_delete(&delete_reserved.path, delete_reserved.disk_expectation.clone())
 			.expect("prepare delete");
-		std::fs::write(&delete_path, b"external delete replacement").expect("invalidate delete");
+		fs::write(&delete_path, b"external delete replacement").expect("invalidate delete");
 		let delete_error = delete_actor
 			.commit_prepared_delete(delete_reserved.reservation, prepared_delete)
 			.await
@@ -2793,7 +2863,7 @@ mod tests {
 			Error::StaleTransaction { .. } | Error::StaleDiskState { .. }
 		));
 		assert_eq!(
-			std::fs::read(&delete_path).expect("delete path remains"),
+			fs::read(&delete_path).expect("delete path remains"),
 			b"external delete replacement"
 		);
 
@@ -2819,16 +2889,13 @@ mod tests {
 				DiskExpectation::Missing,
 			)
 			.expect("prepare move");
-		std::fs::write(&move_path, b"external move replacement").expect("invalidate move");
+		fs::write(&move_path, b"external move replacement").expect("invalidate move");
 		let move_error = move_actor
 			.commit_prepared_move(move_reserved.reservation, prepared_move, path_claim)
 			.await
 			.expect_err("stale move cannot rename");
 		assert!(matches!(move_error, Error::StaleTransaction { .. } | Error::StaleDiskState { .. }));
-		assert_eq!(
-			std::fs::read(&move_path).expect("move source remains"),
-			b"external move replacement"
-		);
+		assert_eq!(fs::read(&move_path).expect("move source remains"), b"external move replacement");
 		assert!(!destination.exists());
 	}
 
@@ -2836,7 +2903,7 @@ mod tests {
 	async fn slow_document_subscribers_observe_bounded_lag() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("lag.txt");
-		std::fs::write(&path, b"initial").expect("write fixture");
+		fs::write(&path, b"initial").expect("write fixture");
 		let store = store(&root, DOCUMENT_EVENT_CAPACITY + 2);
 		let mut opened = store.open(path).await.expect("open");
 		let document_id = opened.head().document_id();
@@ -2883,7 +2950,7 @@ mod tests {
 				}
 			}
 		};
-		tokio::time::timeout(Duration::from_secs(5), publish)
+		time::timeout(Duration::from_secs(5), publish)
 			.await
 			.expect("commits settle despite native watcher notifications");
 
@@ -2897,7 +2964,7 @@ mod tests {
 	async fn mutation_acquisition_waits_for_pending_watch_reload() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("queued-reserve.txt");
-		std::fs::write(&path, b"base").expect("write fixture");
+		fs::write(&path, b"base").expect("write fixture");
 		let store = store(&root, 4);
 		let opened = store.open(path).await.expect("open");
 		let actor = store.actor_handle(opened.lease_id()).expect("actor");
@@ -2907,7 +2974,7 @@ mod tests {
 			.inject_pending_watch_invalidation()
 			.await
 			.expect("inject state invalidation");
-		let state = tokio::time::timeout(Duration::from_secs(2), actor.ready_state())
+		let state = time::timeout(Duration::from_secs(2), actor.ready_state())
 			.await
 			.expect("ready state waits for reload")
 			.expect("unchanged reload succeeds");
@@ -2918,11 +2985,10 @@ mod tests {
 			.await
 			.expect("inject reservation invalidation");
 		let transaction_id = TransactionId::from_bytes([42; 16]);
-		let reserved =
-			tokio::time::timeout(Duration::from_secs(2), actor.reserve(transaction_id, revision))
-				.await
-				.expect("reservation waits for reload")
-				.expect("unchanged reload preserves reservation base");
+		let reserved = time::timeout(Duration::from_secs(2), actor.reserve(transaction_id, revision))
+			.await
+			.expect("reservation waits for reload")
+			.expect("unchanged reload preserves reservation base");
 		actor
 			.release(reserved.reservation)
 			.await
@@ -2933,7 +2999,7 @@ mod tests {
 	async fn release_rejects_a_reservation_after_a_pending_watch_callback() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("stale-release.txt");
-		std::fs::write(&path, b"base").expect("write fixture");
+		fs::write(&path, b"base").expect("write fixture");
 		let store = store(&root, 4);
 		let opened = store.open(path).await.expect("open");
 		let actor = store.actor_handle(opened.lease_id()).expect("actor");
@@ -2961,7 +3027,7 @@ mod tests {
 	async fn shutdown_waits_for_blocking_persistence_completion_and_reply() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("shutdown-persist.txt");
-		std::fs::write(&path, b"persist").expect("write fixture");
+		fs::write(&path, b"persist").expect("write fixture");
 		let store = store(&root, 4);
 		let opened = store.open(path).await.expect("open");
 		let actor = store.actor_handle(opened.lease_id()).expect("actor");
@@ -2987,7 +3053,7 @@ mod tests {
 		let shutdown_actor = actor.clone();
 		let mut shutdown = tokio::spawn(async move { shutdown_actor.shutdown().await });
 		assert!(
-			tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+			time::timeout(Duration::from_millis(50), &mut shutdown)
 				.await
 				.is_err(),
 			"shutdown must wait for the blocked persistence worker"
@@ -3009,7 +3075,7 @@ mod tests {
 		let root = TempDir::new().expect("temporary directory");
 		let source = root.path().join("move-watch-source.txt");
 		let destination = root.path().join("move-watch-destination.txt");
-		std::fs::write(&source, b"before move").expect("write fixture");
+		fs::write(&source, b"before move").expect("write fixture");
 		let store = store(&root, 4);
 		let mut opened = store.open(source.clone()).await.expect("open source");
 		let actor = store.actor_handle(opened.lease_id()).expect("actor");
@@ -3048,7 +3114,7 @@ mod tests {
 		assert!(!source.exists());
 		assert!(destination.exists());
 
-		std::fs::write(&destination, b"after move").expect("edit destination");
+		fs::write(&destination, b"after move").expect("edit destination");
 		let event = await_new_revision(&mut opened, committed.revision()).await;
 		let read = store
 			.read(opened.lease_id(), Some(event.head().revision()), ReadSelection::Whole)
@@ -3061,7 +3127,7 @@ mod tests {
 	async fn dropped_open_activation_removes_both_registry_and_actor_leases() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("cancelled-open.txt");
-		std::fs::write(&path, b"cancel").expect("write fixture");
+		fs::write(&path, b"cancel").expect("write fixture");
 		let store = store(&root, 4);
 		let gate = store.mutation_gate();
 		let authority = gate.lock().await;
@@ -3084,12 +3150,12 @@ mod tests {
 		assert!(store.inner.lock_maps().by_lease.is_empty(), "cancelled open removes registry lease");
 		release.send(()).expect("release activation worker");
 
-		tokio::time::timeout(Duration::from_secs(5), async {
+		time::timeout(Duration::from_secs(5), async {
 			loop {
 				if actor.state().await.is_err() {
 					break;
 				}
-				tokio::time::sleep(Duration::from_millis(10)).await;
+				time::sleep(Duration::from_millis(10)).await;
 			}
 		})
 		.await
@@ -3102,8 +3168,8 @@ mod tests {
 		let rename_source = root.path().join("rename-race.txt");
 		let rename_destination = root.path().join("renamed-before-open.txt");
 		let remove_path = root.path().join("remove-race.txt");
-		std::fs::write(&rename_source, b"rename").expect("write rename fixture");
-		std::fs::write(&remove_path, b"remove").expect("write remove fixture");
+		fs::write(&rename_source, b"rename").expect("write rename fixture");
+		fs::write(&remove_path, b"remove").expect("write remove fixture");
 		let store = store(&root, 4);
 
 		let gate = store.mutation_gate();
@@ -3112,13 +3178,13 @@ mod tests {
 		let rename_open_path = rename_source.clone();
 		let mut rename_open = tokio::spawn(async move { rename_store.open(rename_open_path).await });
 		assert!(
-			tokio::time::timeout(Duration::from_millis(50), &mut rename_open)
+			time::timeout(Duration::from_millis(50), &mut rename_open)
 				.await
 				.is_err(),
 			"open waits for the rename authority"
 		);
 		assert!(store.actor_handle_for_path(&rename_source).is_none());
-		std::fs::rename(&rename_source, &rename_destination).expect("rename under authority");
+		fs::rename(&rename_source, &rename_destination).expect("rename under authority");
 		drop(authority);
 		let renamed = rename_open
 			.await
@@ -3132,13 +3198,13 @@ mod tests {
 		let remove_open_path = remove_path.clone();
 		let mut remove_open = tokio::spawn(async move { remove_store.open(remove_open_path).await });
 		assert!(
-			tokio::time::timeout(Duration::from_millis(50), &mut remove_open)
+			time::timeout(Duration::from_millis(50), &mut remove_open)
 				.await
 				.is_err(),
 			"open waits for the removal authority"
 		);
 		assert!(store.actor_handle_for_path(&remove_path).is_none());
-		std::fs::remove_file(&remove_path).expect("remove under authority");
+		fs::remove_file(&remove_path).expect("remove under authority");
 		drop(authority);
 		let removed = remove_open
 			.await
@@ -3151,7 +3217,7 @@ mod tests {
 	async fn permission_cas_never_chmods_a_replacement_entry() {
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("permission-replacement.txt");
-		std::fs::write(&path, b"original").expect("write fixture");
+		fs::write(&path, b"original").expect("write fixture");
 		let store = store(&root, 4);
 		let opened = store.open(path.clone()).await.expect("open");
 		let actor = store.actor_handle(opened.lease_id()).expect("actor");
@@ -3175,8 +3241,8 @@ mod tests {
 		started
 			.await
 			.expect("permission worker reaches operation boundary");
-		std::fs::remove_file(&path).expect("remove original entry");
-		std::fs::write(&path, b"replacement").expect("install replacement entry");
+		fs::remove_file(&path).expect("remove original entry");
+		fs::write(&path, b"replacement").expect("install replacement entry");
 		release.send(()).expect("release permission worker");
 
 		let error = permission
@@ -3184,9 +3250,9 @@ mod tests {
 			.expect("permission task joins")
 			.expect_err("replacement fails exact disk expectation");
 		assert!(matches!(error, Error::StaleDiskState { .. }));
-		assert_eq!(std::fs::read(&path).expect("read replacement"), b"replacement");
+		assert_eq!(fs::read(&path).expect("read replacement"), b"replacement");
 		assert!(
-			!std::fs::metadata(&path)
+			!fs::metadata(&path)
 				.expect("replacement metadata")
 				.permissions()
 				.readonly(),

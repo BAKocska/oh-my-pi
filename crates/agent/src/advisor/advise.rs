@@ -1,6 +1,6 @@
 //! Advisor-only `advise` device and escalation-aware delivery queue.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, mem, sync::Arc};
 
 use futures::{Stream, stream};
 use omp_core::{Str, sf};
@@ -71,7 +71,7 @@ impl AdvisorAdviceQueue {
 		let was_mid_turn = state.mid_turn;
 		state.mid_turn = mid_turn;
 		if was_mid_turn && !mid_turn {
-			let deferred = std::mem::take(&mut state.deferred);
+			let deferred = mem::take(&mut state.deferred);
 			state.deferred_index.clear();
 			for queued in deferred {
 				let key = normalize_advice(queued.note.as_str());
@@ -128,7 +128,7 @@ impl AdvisorAdviceQueue {
 
 	/// Drains notes ready for primary-loop delivery.
 	pub fn drain_ready(&self) -> Vec<QueuedAdvice> {
-		std::mem::take(&mut self.state.lock().ready)
+		mem::take(&mut self.state.lock().ready)
 	}
 
 	/// Clears turn and dedupe state when advisor context is re-primed.

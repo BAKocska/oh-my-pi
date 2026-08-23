@@ -1,18 +1,23 @@
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
+	env,
 	future::{self, Future},
-	path::Path,
+	path::{Path, PathBuf},
 	pin::Pin,
 	sync::Arc,
 	time::Duration,
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use omp_core::{CowBytes, Str, encoding::hex, sf};
-use omp_proto::env::v1::{
-	EnvironmentDelta, ExecOutcome as EnvExecOutcome, ExecRequest, OpenSessionRequest,
-	OutputChannel as EnvOutputChannel, ProcessSpec, PtySpec, RestartPolicy, RestartSpec, Script,
-	ShellProfileInput, StartProcess,
+use omp_proto::env::{
+	v1,
+	v1::{
+		EnvironmentDelta, ExecOutcome as EnvExecOutcome, ExecRequest, OpenSessionRequest,
+		OutputChannel as EnvOutputChannel, ProcessSpec, PtySpec, RestartPolicy, RestartSpec, Script,
+		ShellProfileInput, StartProcess,
+	},
 };
 use omp_tool::{BlobRef, JobOwner};
 use omp_tools::{
@@ -25,12 +30,18 @@ use omp_tools::{
 		DetachRequest, ExecOutcome, ExecStatus, Fault, OutputChannel, RunEvent, RunRequest, Session,
 		SessionOptions, ShellExec, ShellRun, Update,
 	},
+	shell_uri::QuoteContext,
 };
+use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use super::{
+	direnv::DirenvDelta,
 	exec::{ExecError, ExecEvent, ExecHost, ExecRun},
 	exec_settings::{DirenvMode, ShellProfile, ShellSettings},
 	tool_url::UrlResolver,
+	tools,
 };
 
 /// Session-scoped ACP terminal execution selected ahead of local shell
@@ -59,9 +70,9 @@ pub struct AcpExecRequest {
 /// contract.
 pub struct AcpExecRun {
 	/// Ordered execution events produced by the editor-owned terminal.
-	pub events: flume::Receiver<Result<RunEvent, Fault>>,
+	pub events: Receiver<Result<RunEvent, Fault>>,
 	/// Cancellation handle for the editor-owned terminal.
-	pub cancel: tokio_util::sync::CancellationToken,
+	pub cancel: CancellationToken,
 }
 
 /// Late-bound ACP backend capability shared with one Environment registry.
@@ -90,7 +101,7 @@ pub struct ShellExecHost {
 	settings:     ShellSettings,
 	acp:          AcpExecSlot,
 	acp_routing:  bool,
-	acp_sessions: Arc<parking_lot::Mutex<BTreeMap<Bytes, AcpSessionOptions>>>,
+	acp_sessions: Arc<Mutex<BTreeMap<Bytes, AcpSessionOptions>>>,
 }
 #[derive(Clone)]
 struct AcpSessionOptions {
@@ -117,12 +128,13 @@ impl ShellExecHost {
 			settings,
 			acp,
 			acp_routing,
-			acp_sessions: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+			acp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
 		}
 	}
 }
 impl ShellExecHost {
 	async fn shell_profile(&self) -> ShellProfileInput {
+		use super::shell_profile::capture;
 		let mut profile = self.settings.profile;
 		let mut executable = self
 			.settings
@@ -131,7 +143,7 @@ impl ShellExecHost {
 			.unwrap_or_default()
 			.to_owned();
 		if profile == ShellProfile::User && executable.is_empty() {
-			executable = std::env::var("SHELL")
+			executable = env::var("SHELL")
 				.ok()
 				.filter(|shell| {
 					let path = Path::new(shell);
@@ -167,9 +179,9 @@ impl ShellExecHost {
 			.collect();
 		let snapshot_prefix =
 			if matches!(profile, ShellProfile::Bash | ShellProfile::Zsh | ShellProfile::User) {
-				let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+				let home = env::var_os("HOME").map(PathBuf::from);
 				match home {
-					Some(home) => super::shell_profile::capture(&executable, &home)
+					Some(home) => capture(&executable, &home)
 						.await
 						.ok()
 						.flatten()
@@ -222,9 +234,7 @@ impl ShellExecHost {
 	async fn expand_internal_uris(&self, input: &str, shell_source: bool) -> Result<Str, Fault> {
 		let mut paths = BTreeMap::new();
 		for occurrence in omp_tools::shell_uri::scan(input) {
-			if occurrence.quote == omp_tools::shell_uri::QuoteContext::Single
-				|| paths.contains_key(&occurrence.uri)
-			{
+			if occurrence.quote == QuoteContext::Single || paths.contains_key(&occurrence.uri) {
 				continue;
 			}
 			let parsed = parse_uri(occurrence.uri.as_str())
@@ -249,7 +259,7 @@ impl ShellExecHost {
 			let Some(path_uri) = resolved.canonical_path_uri else {
 				continue;
 			};
-			let path = url::Url::parse(path_uri.as_str())
+			let path = Url::parse(path_uri.as_str())
 				.ok()
 				.and_then(|uri| uri.to_file_path().ok())
 				.ok_or_else(|| Fault::Resource {
@@ -284,14 +294,14 @@ impl ShellExecHost {
 		} else {
 			None
 		};
-		let root = url::Url::parse(&self.cwd_uri)
+		let root = Url::parse(&self.cwd_uri)
 			.map_err(|error| cwd_fault(format!("workspace root URI is invalid: {error}")))?;
 		let root_path = root
 			.to_file_path()
 			.map_err(|()| cwd_fault("workspace root is not a local file URI"))?;
 		let path = match requested {
 			None => root_path,
-			Some(value) if value.contains("://") => url::Url::parse(value)
+			Some(value) if value.contains("://") => Url::parse(value)
 				.map_err(|error| cwd_fault(format!("working-directory URI is invalid: {error}")))?
 				.to_file_path()
 				.map_err(|()| cwd_fault("working-directory URI is not a local file URI"))?,
@@ -310,7 +320,7 @@ impl ShellExecHost {
 				path.display()
 			)));
 		}
-		let uri = url::Url::from_file_path(path)
+		let uri = Url::from_file_path(path)
 			.map_err(|()| cwd_fault("working directory cannot be represented as a file URI"))?;
 		Ok(Str::from(uri.to_string()))
 	}
@@ -350,16 +360,13 @@ impl ShellExecHost {
 		user: BTreeMap<Str, Str>,
 		pty: bool,
 	) -> EnvironmentDelta {
+		use super::direnv::load;
 		let direnv = if self.settings.direnv == DirenvMode::Auto {
-			url::Url::parse(cwd_uri)
+			Url::parse(cwd_uri)
 				.ok()
 				.and_then(|url| url.to_file_path().ok())
 				.map(|cwd| async move {
-					super::direnv::load(
-						&cwd,
-						Duration::from_millis(self.settings.direnv_load_timeout_ms),
-					)
-					.await
+					load(&cwd, Duration::from_millis(self.settings.direnv_load_timeout_ms)).await
 				})
 		} else {
 			None
@@ -373,9 +380,9 @@ impl ShellExecHost {
 }
 
 fn hardened_environment(
-	user: std::collections::BTreeMap<Str, Str>,
+	user: BTreeMap<Str, Str>,
 	pty: bool,
-	direnv: Option<super::direnv::DirenvDelta>,
+	direnv: Option<DirenvDelta>,
 ) -> EnvironmentDelta {
 	let mut set: BTreeMap<String, String> = [
 		("PAGER", "cat"),
@@ -432,16 +439,13 @@ fn hardened_environment(
 	if !pty {
 		set.insert(String::from("TERM"), String::from("dumb"));
 	}
-	if std::env::var_os("OMP_BASH_NO_CI").is_some_and(|value| {
+	if env::var_os("OMP_BASH_NO_CI").is_some_and(|value| {
 		let value = value.to_string_lossy();
 		!value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
 	}) {
 		set.remove("CI");
 	}
-	let explicit = user
-		.keys()
-		.cloned()
-		.collect::<std::collections::BTreeSet<_>>();
+	let explicit = user.keys().cloned().collect::<BTreeSet<_>>();
 	set.extend(
 		user
 			.into_iter()
@@ -468,7 +472,7 @@ fn valid_env_name(name: &str) -> bool {
 		&& bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
-fn named_process(started: omp_proto::env::v1::ProcessStarted) -> DetachedJob {
+fn named_process(started: v1::ProcessStarted) -> DetachedJob {
 	let id = sf!("{}#{}", started.name, started.generation);
 	DetachedJob {
 		id,
@@ -562,7 +566,7 @@ impl ShellExec for ShellExecHost {
 	type Run = SelectedShellRun;
 
 	async fn open_session(&self, options: SessionOptions) -> Result<Session, Fault> {
-		if options.pty && super::tools::pty_denied() {
+		if options.pty && tools::pty_denied() {
 			return Err(Fault::PtyDenied);
 		}
 		let cwd_uri = self.resolve_cwd(options.cwd.as_deref()).await?;
@@ -571,7 +575,7 @@ impl ShellExec for ShellExecHost {
 			.environment(&cwd_uri, self.expand_environment(options.env).await?, pty)
 			.await;
 		if self.acp_routing && self.acp.backend().is_some() && !pty {
-			let cwd = url::Url::parse(&cwd_uri)
+			let cwd = Url::parse(&cwd_uri)
 				.ok()
 				.and_then(|uri| uri.to_file_path().ok())
 				.map(|path| Str::from(path.to_string_lossy().as_ref()));
@@ -665,7 +669,7 @@ impl ShellExec for ShellExecHost {
 	}
 
 	async fn detach(&self, request: DetachRequest) -> Result<DetachedJob, Fault> {
-		if request.options.pty && super::tools::pty_denied() {
+		if request.options.pty && tools::pty_denied() {
 			return Err(Fault::PtyDenied);
 		}
 		let cwd_uri = self.resolve_cwd(request.options.cwd.as_deref()).await?;
@@ -781,7 +785,7 @@ mod tests {
 	use super::*;
 
 	fn test_host(root: &Path) -> ShellExecHost {
-		let root_uri = url::Url::from_directory_path(root)
+		let root_uri = Url::from_directory_path(root)
 			.expect("workspace URI")
 			.to_string();
 		ShellExecHost::new(
@@ -796,16 +800,17 @@ mod tests {
 
 	#[tokio::test]
 	async fn authenticated_pty_denial_is_invocation_local_and_plain_exec_still_runs() {
+		use super::super::tools::with_invocation_scope;
 		let root = tempfile::tempdir().expect("workspace");
 		let host = test_host(root.path());
 		let denied_host = host.clone();
 		let allowed_host = host.clone();
-		let denied = tokio::spawn(super::super::tools::with_invocation_scope(true, async move {
+		let denied = tokio::spawn(with_invocation_scope(true, async move {
 			denied_host
 				.open_session(SessionOptions { pty: true, ..SessionOptions::default() })
 				.await
 		}));
-		let allowed = tokio::spawn(super::super::tools::with_invocation_scope(false, async move {
+		let allowed = tokio::spawn(with_invocation_scope(false, async move {
 			allowed_host
 				.open_session(SessionOptions { pty: true, ..SessionOptions::default() })
 				.await
@@ -820,12 +825,9 @@ mod tests {
 			.await
 			.expect("close PTY session");
 
-		let plain_session = super::super::tools::with_invocation_scope(
-			true,
-			host.open_session(SessionOptions::default()),
-		)
-		.await
-		.expect("denied scope permits non-PTY session");
+		let plain_session = with_invocation_scope(true, host.open_session(SessionOptions::default()))
+			.await
+			.expect("denied scope permits non-PTY session");
 		let mut run = host
 			.run(&plain_session, RunRequest {
 				command:    sf!("printf scope-ok"),

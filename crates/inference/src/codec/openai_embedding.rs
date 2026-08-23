@@ -6,7 +6,7 @@ use omp_catalog::{
 	ModalityBits, ModelLimits, OperationKind, PolicyModel,
 };
 use omp_core::{Str, sf};
-use serde::{Deserialize, Serialize, ser::SerializeSeq};
+use serde::{Deserialize, Serialize, ser, ser::SerializeSeq};
 
 use crate::{
 	answer::{AnswerBody, Embedding, EmbeddingBatch},
@@ -362,7 +362,7 @@ impl Serialize for WireEmbeddingInputs<'_> {
 				(WireInputKind::Tokens, EmbeddingInput::Tokens(tokens)) => {
 					sequence.serialize_element(tokens.as_ref())?;
 				},
-				_ => return Err(serde::ser::Error::custom("validated embedding input kind changed")),
+				_ => return Err(ser::Error::custom("validated embedding input kind changed")),
 			}
 		}
 		sequence.end()

@@ -2,21 +2,32 @@
 
 use std::{
 	cmp::Ordering,
-	collections::BTreeMap,
+	collections::{BTreeMap, hash_map::DefaultHasher},
+	fmt::Display,
 	hash::{Hash, Hasher},
-	str::FromStr,
-	sync::{Arc, LazyLock, OnceLock},
+	str::{self, FromStr},
+	sync::{Arc, LazyLock, OnceLock, atomic},
 };
 
 use omp_core::{
 	ActivateReason, AgentUrl, ArtifactUrl, ClientPath, Duration, DurationUnit, EnvPath, HistoryUrl,
 	InvocationPhase, LifecyclePhase, Principal, RestartReason, Secret, Str, WorkspaceUri,
+	encoding::hex,
 };
 use omp_env::{
 	BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, DataScope, DocumentLease, ExecEvent,
 	ExecRun, ExtensionEnvClient, LspEvents, LspStreamEvent, ProcessAttachment,
 	ProcessAttachmentEvent, SearchEvent, SearchStream, TransactionOutcome, WalkEvent, WalkStream,
-	blob_frame as blob_pb, document_frame as document_pb, frame as env_pb,
+	blob_frame as blob_pb,
+	document_frame::{
+		self as document_pb, document_mutation, document_summary_segment, document_target,
+		lsp_response, move_mutation::DestinationPrecondition, read_selection,
+		summarize_document_response, text_mutation,
+	},
+	frame::{
+		self as env_pb, OutputChannel, data_request, data_response, document_op, document_result,
+		ready_probe, send_input, stdin_frame,
+	},
 };
 use omp_scribe::{
 	Engine as ScribeEngine, Error as ScribeError, Props as ScribeProps, Value as ScribeValue, canon,
@@ -25,7 +36,9 @@ use omp_storage::state::StateScope;
 use omp_tool::{Authority, CostClass, Durability, OperationSpec};
 use parking_lot::{Mutex, RwLock};
 use pyo3::{
-	Bound, Py, PyAny, PyErr, PyResult, Python, create_exception,
+	Bound, Py, PyAny, PyErr, PyResult, Python,
+	basic::CompareOp,
+	create_exception,
 	exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError},
 	pyclass, pyfunction, pymethods, pymodule,
 	sync::OnceLockExt,
@@ -34,8 +47,9 @@ use pyo3::{
 		PyListMethods, PyString, PyTuple, PyTupleMethods, PyTypeMethods,
 	},
 };
+use tokio::runtime;
 
-use crate::env_types;
+use crate::{env_types, interrupt};
 
 create_exception!(_omp, OmpError, PyException, "Base class for omp runtime failures.");
 create_exception!(_omp, HostDisconnected, OmpError, "The host CONTROL channel disconnected.");
@@ -90,14 +104,14 @@ struct PythonRuntime {
 }
 
 static RUNTIME: LazyLock<PythonRuntime> = LazyLock::new(PythonRuntime::default);
-static ASYNC_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-	tokio::runtime::Builder::new_multi_thread()
+static ASYNC_RUNTIME: LazyLock<runtime::Runtime> = LazyLock::new(|| {
+	runtime::Builder::new_multi_thread()
 		.enable_all()
 		.thread_name("omp-py-data")
 		.build()
 		.expect("omp Python DATA runtime must initialize")
 });
-static PY_TRANSACTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static PY_TRANSACTION_ID: atomic::AtomicU64 = atomic::AtomicU64::new(1);
 
 /// Replaces the live URL resolver snapshot used by `omp.urls.schemes()`.
 pub fn set_scheme_snapshot<I, M, D>(device_hash: [u8; 32], entries: I)
@@ -145,7 +159,7 @@ where
 	state.dropped.extend(dropped);
 }
 
-fn value_error(error: impl std::fmt::Display) -> PyErr {
+fn value_error(error: impl Display) -> PyErr {
 	PyValueError::new_err(error.to_string())
 }
 
@@ -211,19 +225,19 @@ impl PyDuration {
 	}
 
 	fn __hash__(&self) -> isize {
-		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		let mut hasher = DefaultHasher::new();
 		self.0.hash(&mut hasher);
 		hasher.finish() as isize
 	}
 
-	fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
+	fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
 		match op {
-			pyo3::basic::CompareOp::Eq => self.0 == other.0,
-			pyo3::basic::CompareOp::Ne => self.0 != other.0,
-			pyo3::basic::CompareOp::Lt => self.0 < other.0,
-			pyo3::basic::CompareOp::Le => self.0 <= other.0,
-			pyo3::basic::CompareOp::Gt => self.0 > other.0,
-			pyo3::basic::CompareOp::Ge => self.0 >= other.0,
+			CompareOp::Eq => self.0 == other.0,
+			CompareOp::Ne => self.0 != other.0,
+			CompareOp::Lt => self.0 < other.0,
+			CompareOp::Le => self.0 <= other.0,
+			CompareOp::Gt => self.0 > other.0,
+			CompareOp::Ge => self.0 >= other.0,
 		}
 	}
 
@@ -344,7 +358,7 @@ impl PyInvocationPhase {
 		self.0 as isize
 	}
 
-	fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
+	fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
 		compare(self.0.cmp(&other.0), op)
 	}
 }
@@ -389,19 +403,19 @@ impl PyLifecyclePhase {
 		self.0 as isize
 	}
 
-	fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
+	fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
 		compare(self.0.cmp(&other.0), op)
 	}
 }
 
-fn compare(ordering: Ordering, op: pyo3::basic::CompareOp) -> bool {
+fn compare(ordering: Ordering, op: CompareOp) -> bool {
 	match op {
-		pyo3::basic::CompareOp::Eq => ordering == Ordering::Equal,
-		pyo3::basic::CompareOp::Ne => ordering != Ordering::Equal,
-		pyo3::basic::CompareOp::Lt => ordering == Ordering::Less,
-		pyo3::basic::CompareOp::Le => ordering != Ordering::Greater,
-		pyo3::basic::CompareOp::Gt => ordering == Ordering::Greater,
-		pyo3::basic::CompareOp::Ge => ordering != Ordering::Less,
+		CompareOp::Eq => ordering == Ordering::Equal,
+		CompareOp::Ne => ordering != Ordering::Equal,
+		CompareOp::Lt => ordering == Ordering::Less,
+		CompareOp::Le => ordering != Ordering::Greater,
+		CompareOp::Gt => ordering == Ordering::Greater,
+		CompareOp::Ge => ordering != Ordering::Less,
 	}
 }
 
@@ -506,15 +520,15 @@ impl PyOperationSpec {
 	}
 
 	fn __hash__(&self) -> isize {
-		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		let mut hasher = DefaultHasher::new();
 		self.0.hash(&mut hasher);
 		hasher.finish() as isize
 	}
 
-	fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
+	fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
 		match op {
-			pyo3::basic::CompareOp::Eq => self.0 == other.0,
-			pyo3::basic::CompareOp::Ne => self.0 != other.0,
+			CompareOp::Eq => self.0 == other.0,
+			CompareOp::Ne => self.0 != other.0,
 			_ => false,
 		}
 	}
@@ -759,15 +773,15 @@ impl PyEnvPath {
 	}
 
 	fn __hash__(&self) -> isize {
-		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		let mut hasher = DefaultHasher::new();
 		self.0.hash(&mut hasher);
 		hasher.finish() as isize
 	}
 
-	fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
+	fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
 		match op {
-			pyo3::basic::CompareOp::Eq => self.0 == other.0,
-			pyo3::basic::CompareOp::Ne => self.0 != other.0,
+			CompareOp::Eq => self.0 == other.0,
+			CompareOp::Ne => self.0 != other.0,
 			_ => false,
 		}
 	}
@@ -810,15 +824,15 @@ impl PyClientPath {
 	}
 
 	fn __hash__(&self) -> isize {
-		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		let mut hasher = DefaultHasher::new();
 		self.0.hash(&mut hasher);
 		hasher.finish() as isize
 	}
 
-	fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
+	fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
 		match op {
-			pyo3::basic::CompareOp::Eq => self.0 == other.0,
-			pyo3::basic::CompareOp::Ne => self.0 != other.0,
+			CompareOp::Eq => self.0 == other.0,
+			CompareOp::Ne => self.0 != other.0,
 			_ => false,
 		}
 	}
@@ -899,7 +913,7 @@ impl PyBlobRef {
 
 	#[getter]
 	fn hex(&self) -> String {
-		omp_core::encoding::hex::encode(&self.hash).to_string()
+		hex::encode(&self.hash).to_string()
 	}
 
 	fn __repr__(&self) -> String {
@@ -907,15 +921,15 @@ impl PyBlobRef {
 	}
 
 	fn __hash__(&self) -> isize {
-		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		let mut hasher = DefaultHasher::new();
 		self.hash.hash(&mut hasher);
 		hasher.finish() as isize
 	}
 
-	fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
+	fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
 		match op {
-			pyo3::basic::CompareOp::Eq => self.hash == other.hash,
-			pyo3::basic::CompareOp::Ne => self.hash != other.hash,
+			CompareOp::Eq => self.hash == other.hash,
+			CompareOp::Ne => self.hash != other.hash,
 			_ => false,
 		}
 	}
@@ -944,15 +958,15 @@ impl PyPrincipal {
 	}
 
 	fn __hash__(&self) -> isize {
-		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		let mut hasher = DefaultHasher::new();
 		self.0.hash(&mut hasher);
 		hasher.finish() as isize
 	}
 
-	fn __richcmp__(&self, other: &Self, op: pyo3::basic::CompareOp) -> bool {
+	fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
 		match op {
-			pyo3::basic::CompareOp::Eq => self.0 == other.0,
-			pyo3::basic::CompareOp::Ne => self.0 != other.0,
+			CompareOp::Eq => self.0 == other.0,
+			CompareOp::Ne => self.0 != other.0,
 
 			_ => false,
 		}
@@ -992,7 +1006,7 @@ struct PyResourceReceipt {
 #[pyfunction]
 fn resources(py: Python<'_>) -> PyResult<PyResourceReceipt> {
 	let state = RUNTIME.resources.read();
-	let quotas = pyo3::types::PyDict::new(py);
+	let quotas = PyDict::new(py);
 	for (name, status) in &state.quotas {
 		let value = Py::new(py, PyQuotaStatus {
 			limit:  status.limit,
@@ -1001,7 +1015,7 @@ fn resources(py: Python<'_>) -> PyResult<PyResourceReceipt> {
 		})?;
 		quotas.set_item(name.as_str(), value)?;
 	}
-	let dropped = pyo3::types::PyDict::new(py);
+	let dropped = PyDict::new(py);
 	for (name, count) in &state.dropped {
 		dropped.set_item(name.as_str(), count)?;
 	}
@@ -1174,18 +1188,18 @@ fn append_ready_probes(
 	}
 	let timeout_ms = duration_millis(&value.getattr("timeout")?)?;
 	let probe = if value.hasattr("pattern")? {
-		env_pb::ready_probe::Probe::Log(env_pb::ReadyLog {
+		ready_probe::Probe::Log(env_pb::ReadyLog {
 			pattern: value.getattr("pattern")?.extract()?,
 			props:   Default::default(),
 		})
 	} else if value.hasattr("port")? {
-		env_pb::ready_probe::Probe::Tcp(env_pb::ReadyTcp {
+		ready_probe::Probe::Tcp(env_pb::ReadyTcp {
 			host:  value.getattr("host")?.extract()?,
 			port:  value.getattr("port")?.extract()?,
 			props: Default::default(),
 		})
 	} else if value.hasattr("nonce")? {
-		env_pb::ready_probe::Probe::Ping(env_pb::ReadyPing {
+		ready_probe::Probe::Ping(env_pb::ReadyPing {
 			nonce: value.getattr("nonce")?.extract()?,
 			props: Default::default(),
 		})
@@ -1393,10 +1407,10 @@ impl PyEnvironmentStream {
 }
 
 fn output_channel(value: i32) -> &'static str {
-	match env_pb::OutputChannel::try_from(value) {
-		Ok(env_pb::OutputChannel::Stdout) => "stdout",
-		Ok(env_pb::OutputChannel::Stderr) => "stderr",
-		Ok(env_pb::OutputChannel::Pty) => "pty",
+	match OutputChannel::try_from(value) {
+		Ok(OutputChannel::Stdout) => "stdout",
+		Ok(OutputChannel::Stderr) => "stderr",
+		Ok(OutputChannel::Pty) => "pty",
 		_ => "stdout",
 	}
 }
@@ -1422,8 +1436,7 @@ fn lsp_binding(py: Python<'_>, value: document_pb::LspServerBinding) -> PyResult
 	let json = py.import("json")?;
 	result.set_item(
 		"capabilities",
-		json
-			.call_method1("loads", (std::str::from_utf8(&value.capabilities_json).unwrap_or("{}"),))?,
+		json.call_method1("loads", (str::from_utf8(&value.capabilities_json).unwrap_or("{}"),))?,
 	)?;
 	Ok(result.unbind().into_any())
 }
@@ -1538,10 +1551,7 @@ fn native_stream_item(py: Python<'_>, item: NativeStreamItem) -> PyResult<Py<PyA
 			let json = py.import("json")?;
 			result.set_item(
 				"params",
-				json.call_method1(
-					"loads",
-					(std::str::from_utf8(&event.params_json).unwrap_or("null"),),
-				)?,
+				json.call_method1("loads", (str::from_utf8(&event.params_json).unwrap_or("null"),))?,
 			)?;
 			result.set_item("path", event.document.map(|value| value.uri))?;
 			result.set_item("revision", revision_value(py, event.revision.as_ref())?)?;
@@ -1834,13 +1844,13 @@ impl PyEnvironmentBackend {
 
 	fn document_operation(
 		&self,
-		op: env_pb::document_op::Op,
-	) -> Result<env_pb::document_result::Result, ClientError> {
+		op: document_op::Op,
+	) -> Result<document_result::Result, ClientError> {
 		ASYNC_RUNTIME.block_on(async {
 			let response = self
 				.client
 				.request(env_pb::DataRequest {
-					body:  Some(env_pb::data_request::Body::Document(env_pb::DocumentOp {
+					body:  Some(data_request::Body::Document(env_pb::DocumentOp {
 						op:    Some(op),
 						props: Default::default(),
 					})),
@@ -1848,7 +1858,7 @@ impl PyEnvironmentBackend {
 				})
 				.await?;
 			match response.body {
-				Some(env_pb::data_response::Body::Document(result)) => result
+				Some(data_response::Body::Document(result)) => result
 					.result
 					.ok_or(ClientError::UnexpectedResponse { expected: "DocumentResult" }),
 				_ => Err(ClientError::UnexpectedResponse { expected: "DocumentResult" }),
@@ -1903,7 +1913,7 @@ impl PyEnvironmentBackend {
 						&lease,
 						None,
 						Some(document_pb::ReadSelection {
-							selection: Some(document_pb::read_selection::Selection::Bytes(
+							selection: Some(read_selection::Selection::Bytes(
 								document_pb::ByteRangeSelection {
 									ranges: vec![document_pb::ByteRange { start: offset, end }],
 								},
@@ -1940,7 +1950,7 @@ impl PyEnvironmentBackend {
 			.transpose()?
 			.unwrap_or_else(|| {
 				PY_TRANSACTION_ID
-					.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+					.fetch_add(1, atomic::Ordering::Relaxed)
 					.to_be_bytes()
 					.to_vec()
 			});
@@ -1990,17 +2000,13 @@ impl PyEnvironmentBackend {
 				};
 				mutations.push(document_pb::DocumentMutation {
 					document:  Some(document_pb::DocumentTarget {
-						target: Some(document_pb::document_target::Target::Uri(path_uri(
-							path.0.as_str(),
-						)?)),
+						target: Some(document_target::Target::Uri(path_uri(path.0.as_str())?)),
 					}),
-					operation: Some(document_pb::document_mutation::Operation::Create(
-						document_pb::CreateMutation {
-							content:           content.into(),
-							existing_document: document_pb::ExistingDocumentPolicy::FailIfExists as i32,
-							format_policy:     format_policy as i32,
-						},
-					)),
+					operation: Some(document_mutation::Operation::Create(document_pb::CreateMutation {
+						content:           content.into(),
+						existing_document: document_pb::ExistingDocumentPolicy::FailIfExists as i32,
+						format_policy:     format_policy as i32,
+					})),
 				});
 				continue;
 			}
@@ -2021,7 +2027,7 @@ impl PyEnvironmentBackend {
 				.clone()
 				.ok_or_else(|| PyRuntimeError::new_err("document lease has no revision"))?;
 			let target = document_pb::DocumentTarget {
-				target: Some(document_pb::document_target::Target::LeaseId(lease_id.clone().into())),
+				target: Some(document_target::Target::LeaseId(lease_id.clone().into())),
 			};
 			let mutation = match kind.as_str() {
 				"edit" => {
@@ -2038,11 +2044,11 @@ impl PyEnvironmentBackend {
 							})
 						})
 						.collect::<PyResult<Vec<_>>>()?;
-					document_pb::document_mutation::Operation::Text(document_pb::TextMutation {
+					document_mutation::Operation::Text(document_pb::TextMutation {
 						base_revision: Some(revision),
-						change:        Some(document_pb::text_mutation::Change::Edits(
-							document_pb::ByteEdits { edits },
-						)),
+						change:        Some(text_mutation::Change::Edits(document_pb::ByteEdits {
+							edits,
+						})),
 						stale_policy:  document_pb::StalePolicy::Fail as i32,
 						format_policy: format_policy as i32,
 					})
@@ -2056,33 +2062,27 @@ impl PyEnvironmentBackend {
 					} else {
 						content.extract::<String>()?.into_bytes()
 					};
-					document_pb::document_mutation::Operation::Text(document_pb::TextMutation {
+					document_mutation::Operation::Text(document_pb::TextMutation {
 						base_revision: Some(revision),
-						change:        Some(document_pb::text_mutation::Change::ProposedContent(
-							content.into(),
-						)),
+						change:        Some(text_mutation::Change::ProposedContent(content.into())),
 						stale_policy:  document_pb::StalePolicy::Fail as i32,
 						format_policy: format_policy as i32,
 					})
 				},
-				"delete" => {
-					document_pb::document_mutation::Operation::Delete(document_pb::DeleteMutation {
-						base_revision: Some(revision),
-					})
-				},
+				"delete" => document_mutation::Operation::Delete(document_pb::DeleteMutation {
+					base_revision: Some(revision),
+				}),
 				"move" => {
 					let destination = values
 						.get_item("destination")?
 						.ok_or_else(|| PyTypeError::new_err("move destination is required"))?
 						.extract::<PyEnvPath>()?;
-					document_pb::document_mutation::Operation::Move(document_pb::MoveMutation {
+					document_mutation::Operation::Move(document_pb::MoveMutation {
 						base_revision:            Some(revision),
 						destination_uri:          path_uri(destination.0.as_str())?,
-						destination_precondition: Some(
-							document_pb::move_mutation::DestinationPrecondition::DestinationMustNotExist(
-								true,
-							),
-						),
+						destination_precondition: Some(DestinationPrecondition::DestinationMustNotExist(
+							true,
+						)),
 					})
 				},
 				_ => return Err(PyValueError::new_err("invalid transaction operation")),
@@ -2214,17 +2214,15 @@ impl PyEnvironmentBackend {
 						.extract::<PyEnvPath>()?;
 					let request = document_pb::CommitTransactionRequest {
 						transaction_id: PY_TRANSACTION_ID
-							.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+							.fetch_add(1, atomic::Ordering::Relaxed)
 							.to_be_bytes()
 							.to_vec()
 							.into(),
 						operations:     vec![document_pb::DocumentMutation {
 							document:  Some(document_pb::DocumentTarget {
-								target: Some(document_pb::document_target::Target::Uri(path_uri(
-									path.0.as_str(),
-								)?)),
+								target: Some(document_target::Target::Uri(path_uri(path.0.as_str())?)),
 							}),
-							operation: Some(document_pb::document_mutation::Operation::Create(
+							operation: Some(document_mutation::Operation::Create(
 								document_pb::CreateMutation {
 									content:           Default::default(),
 									existing_document: document_pb::ExistingDocumentPolicy::FailIfExists
@@ -2315,7 +2313,7 @@ impl PyEnvironmentBackend {
 						&lease.lock(),
 						argument_revision(arguments, "revision")?,
 						Some(document_pb::ReadSelection {
-							selection: Some(document_pb::read_selection::Selection::Lines(
+							selection: Some(read_selection::Selection::Lines(
 								document_pb::LineRangeSelection {
 									ranges: vec![document_pb::LineRange { start, end }],
 								},
@@ -2328,7 +2326,7 @@ impl PyEnvironmentBackend {
 				})?;
 				let values = PyList::empty(py);
 				for slice in &slices.slices {
-					let text = std::str::from_utf8(&slice.content)
+					let text = str::from_utf8(&slice.content)
 						.map_err(|_| environment_exception(py, "Invalid", "document is not UTF-8"))?;
 					for line in text.lines() {
 						values.append(line)?;
@@ -2366,19 +2364,17 @@ impl PyEnvironmentBackend {
 					Some(document_pb::CodeSummaryOptions::default())
 				};
 				let result = self
-					.document_operation(env_pb::document_op::Op::Summarize(
+					.document_operation(document_op::Op::Summarize(
 						document_pb::SummarizeDocumentRequest {
 							document: Some(document_pb::DocumentTarget {
-								target: Some(document_pb::document_target::Target::LeaseId(
-									lease_id.into(),
-								)),
+								target: Some(document_target::Target::LeaseId(lease_id.into())),
 							}),
 							revision: None,
 							options,
 						},
 					))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::Summarized(summary) = result else {
+				let document_result::Result::Summarized(summary) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2387,7 +2383,7 @@ impl PyEnvironmentBackend {
 				};
 				let value = PyDict::new(py);
 				match summary.outcome {
-					Some(document_pb::summarize_document_response::Outcome::Summary(summary)) => {
+					Some(summarize_document_response::Outcome::Summary(summary)) => {
 						value.set_item("language", summary.language)?;
 						value.set_item("parsed", summary.parsed)?;
 						value.set_item("elided", summary.elided)?;
@@ -2397,7 +2393,7 @@ impl PyEnvironmentBackend {
 							let row = PyDict::new(py);
 							row.set_item(
 								"kept",
-								segment.kind == document_pb::document_summary_segment::Kind::Kept as i32,
+								segment.kind == document_summary_segment::Kind::Kept as i32,
 							)?;
 							row.set_item("start_line", segment.start_line)?;
 							row.set_item("end_line", segment.end_line)?;
@@ -2418,7 +2414,7 @@ impl PyEnvironmentBackend {
 						)?;
 						value.set_item("elided_lines", rendered.elided_lines)?;
 					},
-					Some(document_pb::summarize_document_response::Outcome::Unavailable(value_)) => {
+					Some(summarize_document_response::Outcome::Unavailable(value_)) => {
 						value.set_item(
 							"reason",
 							match document_pb::SummaryUnavailableReason::try_from(value_.reason) {
@@ -2486,7 +2482,7 @@ impl PyEnvironmentBackend {
 							})
 						})
 						.collect::<PyResult<Vec<_>>>()?;
-					document_pb::text_mutation::Change::Edits(document_pb::ByteEdits { edits })
+					text_mutation::Change::Edits(document_pb::ByteEdits { edits })
 				} else if operation.ends_with("write") {
 					let data = arguments
 						.get_item("data")?
@@ -2496,9 +2492,9 @@ impl PyEnvironmentBackend {
 					} else {
 						data.extract::<String>()?.into_bytes()
 					};
-					document_pb::text_mutation::Change::ProposedContent(data.into())
+					text_mutation::Change::ProposedContent(data.into())
 				} else {
-					document_pb::text_mutation::Change::Proposal(document_pb::EditFormatProposal {
+					text_mutation::Change::Proposal(document_pb::EditFormatProposal {
 						format:       "omp.hashline".to_owned(),
 						payload:      arguments
 							.get_item("patch")?
@@ -2511,13 +2507,13 @@ impl PyEnvironmentBackend {
 				};
 				let request = document_pb::CommitTransactionRequest {
 					transaction_id: PY_TRANSACTION_ID
-						.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+						.fetch_add(1, atomic::Ordering::Relaxed)
 						.to_be_bytes()
 						.to_vec()
 						.into(),
 					operations:     vec![document_pb::DocumentMutation {
 						document:  Some(document_pb::DocumentTarget {
-							target: Some(document_pb::document_target::Target::LeaseId(lease_id.into())),
+							target: Some(document_target::Target::LeaseId(lease_id.into())),
 						}),
 						operation: Some(document_pb::document_mutation::Operation::Text(
 							document_pb::TextMutation {
@@ -2623,12 +2619,12 @@ impl PyEnvironmentBackend {
 					document_pb::FollowSymlinks::Yes
 				};
 				let result = self
-					.document_operation(env_pb::document_op::Op::Stat(document_pb::StatPathRequest {
+					.document_operation(document_op::Op::Stat(document_pb::StatPathRequest {
 						uri,
 						follow_symlinks: follow_symlinks as i32,
 					}))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::Stat(result) = result else {
+				let document_result::Result::Stat(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2646,11 +2642,11 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("path is required"))?
 					.extract::<PyEnvPath>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::Canonicalize(
+					.document_operation(document_op::Op::Canonicalize(
 						document_pb::CanonicalizePathRequest { uri: path_uri(path.0.as_str())? },
 					))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::Canonicalized(result) = result else {
+				let document_result::Result::Canonicalized(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2669,7 +2665,7 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("follow is required"))?
 					.extract::<bool>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::ListDirectory(
+					.document_operation(document_op::Op::ListDirectory(
 						document_pb::ListDirectoryRequest {
 							uri:             path_uri(path.0.as_str())?,
 							follow_symlinks: if follow {
@@ -2680,7 +2676,7 @@ impl PyEnvironmentBackend {
 						},
 					))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::Directory(result) = result else {
+				let document_result::Result::Directory(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2705,11 +2701,11 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("path is required"))?
 					.extract::<PyEnvPath>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::ReadLink(
-						document_pb::ReadLinkRequest { uri: path_uri(path.0.as_str())? },
-					))
+					.document_operation(document_op::Op::ReadLink(document_pb::ReadLinkRequest {
+						uri: path_uri(path.0.as_str())?,
+					}))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::Link(result) = result else {
+				let document_result::Result::Link(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2741,7 +2737,7 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("exist_ok is required"))?
 					.extract::<bool>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::CreateDirectory(
+					.document_operation(document_op::Op::CreateDirectory(
 						document_pb::CreateDirectoryRequest {
 							uri:           path_uri(path.0.as_str())?,
 							recursive:     parents,
@@ -2753,7 +2749,7 @@ impl PyEnvironmentBackend {
 						},
 					))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::DirectoryCreated(result) = result else {
+				let document_result::Result::DirectoryCreated(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2775,15 +2771,13 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("recursive is required"))?
 					.extract::<bool>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::Remove(
-						document_pb::RemovePathRequest {
-							uri: path_uri(path.0.as_str())?,
-							recursive,
-							revision: argument_revision(arguments, "revision")?,
-						},
-					))
+					.document_operation(document_op::Op::Remove(document_pb::RemovePathRequest {
+						uri: path_uri(path.0.as_str())?,
+						recursive,
+						revision: argument_revision(arguments, "revision")?,
+					}))
 					.map_err(|error| client_error(py, error))?;
-				if !matches!(result, env_pb::document_result::Result::Removed(_)) {
+				if !matches!(result, document_result::Result::Removed(_)) {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2802,17 +2796,15 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("dest is required"))?
 					.extract::<PyEnvPath>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::Rename(
-						document_pb::RenamePathRequest {
-							source_uri:           path_uri(src.0.as_str())?,
-							destination_uri:      path_uri(dest.0.as_str())?,
-							overwrite:            argument_overwrite(arguments, "overwrite")? as i32,
-							source_revision:      argument_revision(arguments, "src_revision")?,
-							destination_revision: argument_revision(arguments, "dest_revision")?,
-						},
-					))
+					.document_operation(document_op::Op::Rename(document_pb::RenamePathRequest {
+						source_uri:           path_uri(src.0.as_str())?,
+						destination_uri:      path_uri(dest.0.as_str())?,
+						overwrite:            argument_overwrite(arguments, "overwrite")? as i32,
+						source_revision:      argument_revision(arguments, "src_revision")?,
+						destination_revision: argument_revision(arguments, "dest_revision")?,
+					}))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::Renamed(result) = result else {
+				let document_result::Result::Renamed(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2838,7 +2830,7 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("follow is required"))?
 					.extract::<bool>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::Copy(document_pb::CopyPathRequest {
+					.document_operation(document_op::Op::Copy(document_pb::CopyPathRequest {
 						source_uri:             path_uri(src.0.as_str())?,
 						destination_uri:        path_uri(dest.0.as_str())?,
 						follow_source_symlinks: if follow {
@@ -2850,7 +2842,7 @@ impl PyEnvironmentBackend {
 						destination_revision:   argument_revision(arguments, "dest_revision")?,
 					}))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::Copied(result) = result else {
+				let document_result::Result::Copied(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2883,7 +2875,7 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("kind is required"))?
 					.extract::<String>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::CreateSymlink(
+					.document_operation(document_op::Op::CreateSymlink(
 						document_pb::CreateSymlinkRequest {
 							target:      Some(document_pb::SymlinkTarget {
 								uri:  path_uri(target.0.as_str())?,
@@ -2903,7 +2895,7 @@ impl PyEnvironmentBackend {
 						},
 					))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::SymlinkCreated(result) = result else {
+				let document_result::Result::SymlinkCreated(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2929,7 +2921,7 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("follow is required"))?
 					.extract::<bool>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::CreateHardLink(
+					.document_operation(document_op::Op::CreateHardLink(
 						document_pb::CreateHardLinkRequest {
 							source_uri:             path_uri(src.0.as_str())?,
 							link_uri:               path_uri(link.0.as_str())?,
@@ -2942,7 +2934,7 @@ impl PyEnvironmentBackend {
 						},
 					))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::HardLinkCreated(result) = result else {
+				let document_result::Result::HardLinkCreated(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -2977,7 +2969,7 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("follow is required"))?
 					.extract::<bool>()?;
 				let result = self
-					.document_operation(env_pb::document_op::Op::SetPermissions(
+					.document_operation(document_op::Op::SetPermissions(
 						document_pb::SetPermissionsRequest {
 							uri:             path_uri(path.0.as_str())?,
 							permissions:     Some(document_pb::PortablePermissions {
@@ -2993,7 +2985,7 @@ impl PyEnvironmentBackend {
 						},
 					))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::PermissionsSet(result) = result else {
+				let document_result::Result::PermissionsSet(result) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -3015,17 +3007,15 @@ impl PyEnvironmentBackend {
 					.map_err(|error| client_error(py, error))?;
 				let lease_id = lease.id().to_vec();
 				let result = self
-					.document_operation(env_pb::document_op::Op::GetLspBindings(
+					.document_operation(document_op::Op::GetLspBindings(
 						document_pb::GetLspBindingsRequest {
 							document: Some(document_pb::DocumentTarget {
-								target: Some(document_pb::document_target::Target::LeaseId(
-									lease.id().clone(),
-								)),
+								target: Some(document_target::Target::LeaseId(lease.id().clone())),
 							}),
 						},
 					))
 					.map_err(|error| client_error(py, error))?;
-				let env_pb::document_result::Result::LspBindings(bindings) = result else {
+				let document_result::Result::LspBindings(bindings) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -3061,7 +3051,7 @@ impl PyEnvironmentBackend {
 					.into_bytes()
 					.into();
 				let op = if operation.ends_with("notify") {
-					env_pb::document_op::Op::LspNotification(document_pb::LspNotificationRequest {
+					document_op::Op::LspNotification(document_pb::LspNotificationRequest {
 						server_id: server_id.into(),
 						method,
 						params_json,
@@ -3086,7 +3076,7 @@ impl PyEnvironmentBackend {
 						};
 						(
 							Some(document_pb::DocumentTarget {
-								target: Some(document_pb::document_target::Target::LeaseId(lease.into())),
+								target: Some(document_target::Target::LeaseId(lease.into())),
 							}),
 							revision,
 						)
@@ -3098,7 +3088,7 @@ impl PyEnvironmentBackend {
 						.map(|value| value.extract::<String>())
 						.transpose()?
 						.unwrap_or_else(|| "retry_head".to_owned());
-					env_pb::document_op::Op::LspRequest(document_pb::LspRequest {
+					document_op::Op::LspRequest(document_pb::LspRequest {
 						server_id: server_id.into(),
 						method,
 						params_json,
@@ -3115,7 +3105,7 @@ impl PyEnvironmentBackend {
 					.document_operation(op)
 					.map_err(|error| client_error(py, error))?;
 				if operation.ends_with("notify") {
-					if !matches!(result, env_pb::document_result::Result::LspNotified(_)) {
+					if !matches!(result, document_result::Result::LspNotified(_)) {
 						return Err(environment_exception(
 							py,
 							"Io",
@@ -3124,7 +3114,7 @@ impl PyEnvironmentBackend {
 					}
 					return Ok(py.None());
 				}
-				let env_pb::document_result::Result::LspResponse(response) = result else {
+				let document_result::Result::LspResponse(response) = result else {
 					return Err(environment_exception(
 						py,
 						"Io",
@@ -3134,14 +3124,14 @@ impl PyEnvironmentBackend {
 				let value = PyDict::new(py);
 				value.set_item("revision", revision_value(py, response.revision.as_ref())?)?;
 				match response.outcome {
-					Some(document_pb::lsp_response::Outcome::ResultJson(bytes)) => {
+					Some(lsp_response::Outcome::ResultJson(bytes)) => {
 						value.set_item(
 							"result",
 							py.import("json")?
-								.call_method1("loads", (std::str::from_utf8(&bytes).unwrap_or("null"),))?,
+								.call_method1("loads", (str::from_utf8(&bytes).unwrap_or("null"),))?,
 						)?;
 					},
-					Some(document_pb::lsp_response::Outcome::Error(error)) => {
+					Some(lsp_response::Outcome::Error(error)) => {
 						let failure = PyDict::new(py);
 						failure.set_item("code", error.code)?;
 						failure.set_item("message", error.message)?;
@@ -3149,7 +3139,7 @@ impl PyEnvironmentBackend {
 							"data",
 							py.import("json")?.call_method1(
 								"loads",
-								(std::str::from_utf8(&error.data_json).unwrap_or("null"),),
+								(str::from_utf8(&error.data_json).unwrap_or("null"),),
 							)?,
 						)?;
 						value.set_item("error", failure)?;
@@ -3221,9 +3211,9 @@ impl PyEnvironmentBackend {
 				let run = run.lock();
 				if operation.ends_with("stdin") || operation.ends_with("eof") {
 					let input = if operation.ends_with("eof") {
-						env_pb::stdin_frame::Input::Eof(true)
+						stdin_frame::Input::Eof(true)
 					} else {
-						env_pb::stdin_frame::Input::Data(
+						stdin_frame::Input::Data(
 							arguments
 								.get_item("data")?
 								.ok_or_else(|| PyTypeError::new_err("data is required"))?
@@ -3377,13 +3367,13 @@ impl PyEnvironmentBackend {
 					.ok_or_else(|| PyTypeError::new_err("generation is required"))?
 					.extract::<u64>()?;
 				let input = if operation.ends_with("eof") {
-					env_pb::send_input::Input::Eof(true)
+					send_input::Input::Eof(true)
 				} else {
 					let data = arguments
 						.get_item("data")?
 						.ok_or_else(|| PyTypeError::new_err("data is required"))?
 						.extract::<Vec<u8>>()?;
-					env_pb::send_input::Input::Data(data.into())
+					send_input::Input::Data(data.into())
 				};
 				ASYNC_RUNTIME
 					.block_on(self.client.send_process_input(env_pb::SendInput {
@@ -4004,7 +3994,7 @@ fn _open_environment_scope(
 #[pyclass(name = "Cancellation", frozen, module = "_omp")]
 #[derive(Debug, Default)]
 struct PyCancellation {
-	cancelled: std::sync::atomic::AtomicBool,
+	cancelled: atomic::AtomicBool,
 }
 
 #[pymethods]
@@ -4015,21 +4005,19 @@ impl PyCancellation {
 	}
 
 	fn cancel(&self) {
-		self
-			.cancelled
-			.store(true, std::sync::atomic::Ordering::Release);
+		self.cancelled.store(true, atomic::Ordering::Release);
 	}
 
 	#[getter]
 	fn cancelled(&self) -> bool {
-		self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+		self.cancelled.load(atomic::Ordering::Acquire)
 	}
 }
 
 /// Return `CPython`'s identifier for the attached current thread.
 #[pyfunction]
 fn _thread_id() -> u64 {
-	crate::interrupt::current_thread_id()
+	interrupt::current_thread_id()
 }
 /// Builtin-only scribe engine shared by every compiled template.
 ///
@@ -4170,7 +4158,7 @@ fn _scribe_canonicalize(text: &str) -> String {
 /// Deliver a stage-two `KeyboardInterrupt` to a Python thread id.
 #[pyfunction]
 fn _interrupt(py: Python<'_>, thread_id: u64) -> bool {
-	crate::interrupt::interrupt(py, thread_id)
+	interrupt::interrupt(py, thread_id)
 }
 
 /// Registers the native `_omp` module before `CPython` initialization.

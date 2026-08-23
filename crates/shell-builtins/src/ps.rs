@@ -3,19 +3,23 @@
 #[cfg(unix)]
 use std::collections::HashSet;
 #[cfg(unix)]
-use std::fs;
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::{
+	cmp,
 	collections::HashMap,
 	fmt::Write as _,
 	io::{self, Write},
+	process, result,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use std::{fs, mem, ptr};
 
 use clap::Parser;
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 use omp_shell_engine::{ExecutionContext, ExecutionExitCode, ExecutionResult, builtins};
+
+use crate::proc_snapshot::{ProcInfo, sanitize_process_command};
 
 #[derive(Parser)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
@@ -235,18 +239,13 @@ struct PsProcessRow {
 }
 
 impl PsProcessRow {
-	fn from_process(
-		process: crate::proc_snapshot::ProcInfo,
-		now: SystemTime,
-		command_only: bool,
-	) -> Self {
-		let command =
-			crate::proc_snapshot::sanitize_process_command(process.command_name().into_owned());
+	fn from_process(process: ProcInfo, now: SystemTime, command_only: bool) -> Self {
+		let command = sanitize_process_command(process.command_name().into_owned());
 		let argv = process.args();
 		let args = if command_only || argv.is_empty() {
 			command.clone()
 		} else {
-			crate::proc_snapshot::sanitize_process_command(argv.join(" "))
+			sanitize_process_command(argv.join(" "))
 		};
 		let age = process.age();
 		Self {
@@ -299,8 +298,7 @@ impl builtins::Command for PsCommand {
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,
 		context: ExecutionContext<'_, SE>,
-	) -> impl Future<Output = std::result::Result<ExecutionResult, omp_shell_engine::Error>> + Send
-	{
+	) -> impl Future<Output = result::Result<ExecutionResult, omp_shell_engine::Error>> + Send {
 		let argv = self.argv.clone();
 		async move {
 			let options = match parse_ps_args(&argv) {
@@ -322,8 +320,8 @@ impl builtins::Command for PsCommand {
 				return Ok(ExecutionExitCode::Interrupted.into());
 			}
 
-			let mut processes = crate::proc_snapshot::ProcInfo::all();
-			let current_pid = i32::try_from(std::process::id()).ok();
+			let mut processes = ProcInfo::all();
+			let current_pid = i32::try_from(process::id()).ok();
 			let current =
 				current_pid.and_then(|pid| processes.iter().find(|process| process.pid() == pid));
 			let current_user = current.and_then(|process| {
@@ -331,8 +329,8 @@ impl builtins::Command for PsCommand {
 					.effective_user_id()
 					.or_else(|| process.real_user_id())
 			});
-			let current_terminal = current.and_then(crate::proc_snapshot::ProcInfo::terminal_id);
-			let current_session = current.and_then(crate::proc_snapshot::ProcInfo::session_id);
+			let current_terminal = current.and_then(ProcInfo::terminal_id);
+			let current_session = current.and_then(ProcInfo::session_id);
 			processes.retain(|process| {
 				ps_process_selected(
 					process,
@@ -367,7 +365,7 @@ impl builtins::Command for PsCommand {
 	}
 }
 
-fn parse_i32_list(value: &str, target: &mut Vec<i32>) -> std::result::Result<(), (u8, String)> {
+fn parse_i32_list(value: &str, target: &mut Vec<i32>) -> result::Result<(), (u8, String)> {
 	for item in value.split(',') {
 		let parsed = item
 			.parse::<i32>()
@@ -377,14 +375,14 @@ fn parse_i32_list(value: &str, target: &mut Vec<i32>) -> std::result::Result<(),
 	Ok(())
 }
 
-fn parse_user_list(value: &str, target: &mut Vec<u32>) -> std::result::Result<(), (u8, String)> {
+fn parse_user_list(value: &str, target: &mut Vec<u32>) -> result::Result<(), (u8, String)> {
 	for item in value.split(',') {
 		target.push(resolve_user(item).ok_or_else(|| (2, format!("unknown user '{item}'")))?);
 	}
 	Ok(())
 }
 
-fn parse_group_list(value: &str, target: &mut Vec<u32>) -> std::result::Result<(), (u8, String)> {
+fn parse_group_list(value: &str, target: &mut Vec<u32>) -> result::Result<(), (u8, String)> {
 	for item in value.split(',') {
 		target.push(resolve_group(item).ok_or_else(|| (2, format!("unknown group '{item}'")))?);
 	}
@@ -398,8 +396,8 @@ fn resolve_user(value: &str) -> Option<u32> {
 		return Some(id);
 	}
 	let name = CString::new(value).ok()?;
-	let mut record = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-	let mut result = std::ptr::null_mut();
+	let mut record = mem::MaybeUninit::<libc::passwd>::zeroed();
+	let mut result = ptr::null_mut();
 	let mut buffer = vec![0u8; 16 * 1024];
 	// SAFETY: all pointers refer to live, writable storage for this call.
 	let status = unsafe {
@@ -430,8 +428,8 @@ fn resolve_group(value: &str) -> Option<u32> {
 		return Some(id);
 	}
 	let name = CString::new(value).ok()?;
-	let mut record = std::mem::MaybeUninit::<libc::group>::zeroed();
-	let mut result = std::ptr::null_mut();
+	let mut record = mem::MaybeUninit::<libc::group>::zeroed();
+	let mut result = ptr::null_mut();
 	let mut buffer = vec![0u8; 16 * 1024];
 	// SAFETY: all pointers refer to live, writable storage for this call.
 	let status = unsafe {
@@ -458,7 +456,7 @@ fn resolve_group(value: &str) -> Option<u32> {
 fn parse_terminal_list(
 	value: &str,
 	target: &mut Vec<Option<u64>>,
-) -> std::result::Result<(), (u8, String)> {
+) -> result::Result<(), (u8, String)> {
 	for item in value.split(',') {
 		if matches!(item, "?" | "-") {
 			target.push(None);
@@ -492,7 +490,7 @@ fn resolve_terminal(_value: &str) -> Option<u64> {
 	None
 }
 
-fn parse_ps_args(argv: &[String]) -> std::result::Result<ParsePsResult, (u8, String)> {
+fn parse_ps_args(argv: &[String]) -> result::Result<ParsePsResult, (u8, String)> {
 	let mut options = PsOptions::default();
 	let mut index = 0;
 	let mut options_done = false;
@@ -579,7 +577,7 @@ fn take_ps_value(
 	index: &mut usize,
 	inline: Option<&str>,
 	option: &str,
-) -> std::result::Result<String, (u8, String)> {
+) -> result::Result<String, (u8, String)> {
 	if let Some(value) = inline {
 		if value.is_empty() {
 			return Err((1, format!("option '{option}' requires an argument")));
@@ -600,7 +598,7 @@ fn parse_ps_flag_group(
 	argv: &[String],
 	index: &mut usize,
 	options: &mut PsOptions,
-) -> std::result::Result<(), (u8, String)> {
+) -> result::Result<(), (u8, String)> {
 	if bsd {
 		options.bsd_syntax = true;
 	}
@@ -692,10 +690,7 @@ fn parse_ps_flag_group(
 	Ok(())
 }
 
-fn parse_ps_format(
-	value: &str,
-	columns: &mut Vec<PsColumn>,
-) -> std::result::Result<(), (u8, String)> {
+fn parse_ps_format(value: &str, columns: &mut Vec<PsColumn>) -> result::Result<(), (u8, String)> {
 	let start_len = columns.len();
 	for spec in value.split(',').flat_map(str::split_ascii_whitespace) {
 		let (field_spec, header) = spec
@@ -758,7 +753,7 @@ fn parse_ps_format(
 	Ok(())
 }
 
-fn parse_ps_sort(value: &str, sort: &mut Vec<PsSort>) -> std::result::Result<(), (u8, String)> {
+fn parse_ps_sort(value: &str, sort: &mut Vec<PsSort>) -> result::Result<(), (u8, String)> {
 	for spec in value.split(',').flat_map(str::split_ascii_whitespace) {
 		let (descending, name) = if let Some(name) = spec.strip_prefix('-') {
 			(true, name)
@@ -784,7 +779,7 @@ fn parse_ps_sort(value: &str, sort: &mut Vec<PsSort>) -> std::result::Result<(),
 }
 
 fn ps_process_selected(
-	process: &crate::proc_snapshot::ProcInfo,
+	process: &ProcInfo,
 	options: &PsOptions,
 	current_pid: Option<i32>,
 	current_user: Option<u32>,
@@ -961,7 +956,7 @@ fn sort_ps_rows(rows: &mut [PsProcessRow], sort: &[PsSort]) {
 			} else {
 				ordering
 			};
-			if ordering != std::cmp::Ordering::Equal {
+			if ordering != cmp::Ordering::Equal {
 				return ordering;
 			}
 		}
@@ -1266,7 +1261,7 @@ fn ps_total_memory_bytes() -> Option<u64> {
 #[cfg(target_os = "macos")]
 fn ps_total_memory_bytes() -> Option<u64> {
 	let mut value = 0_u64;
-	let mut size = std::mem::size_of::<u64>();
+	let mut size = mem::size_of::<u64>();
 	// SAFETY: the output pointer names a writable u64 and `size` reports its
 	// exact capacity; hw.memsize has no input buffer.
 	let status = unsafe {
@@ -1274,11 +1269,11 @@ fn ps_total_memory_bytes() -> Option<u64> {
 			c"hw.memsize".as_ptr(),
 			(&raw mut value).cast(),
 			&raw mut size,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			0,
 		)
 	};
-	(status == 0 && size == std::mem::size_of::<u64>()).then_some(value)
+	(status == 0 && size == mem::size_of::<u64>()).then_some(value)
 }
 
 #[cfg(target_os = "windows")]
@@ -1289,8 +1284,8 @@ fn ps_total_memory_bytes() -> Option<u64> {
 #[cfg(unix)]
 fn ps_user_name(uid: u32) -> Option<String> {
 	use std::ffi::CStr;
-	let mut record = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-	let mut result = std::ptr::null_mut();
+	let mut record = mem::MaybeUninit::<libc::passwd>::zeroed();
+	let mut result = ptr::null_mut();
 	let mut buffer = vec![0_u8; 16 * 1024];
 	// SAFETY: all pointers refer to live storage for this call; a non-null
 	// result guarantees `record` and its pw_name pointer were initialized.
@@ -1319,8 +1314,8 @@ fn ps_user_name(_uid: u32) -> Option<String> {
 #[cfg(unix)]
 fn ps_group_name(gid: u32) -> Option<String> {
 	use std::ffi::CStr;
-	let mut record = std::mem::MaybeUninit::<libc::group>::zeroed();
-	let mut result = std::ptr::null_mut();
+	let mut record = mem::MaybeUninit::<libc::group>::zeroed();
+	let mut result = ptr::null_mut();
 	let mut buffer = vec![0_u8; 16 * 1024];
 	// SAFETY: all pointers refer to live storage for this call; a non-null
 	// result guarantees `record` and its gr_name pointer were initialized.

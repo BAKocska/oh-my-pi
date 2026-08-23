@@ -1,7 +1,13 @@
 //! Archive-member and SQLite-row mutation contracts shared by the write tool
 //! and the app-owned filesystem adapter.
 
-use std::io::{Read, Seek, Write};
+use std::{
+	fmt::Display,
+	io::{Read, Seek, Write},
+	iter,
+	path::Path,
+	time,
+};
 
 use omp_ar::{Archive, Format, tar::Writer as TarWriter, zip::Writer as ZipWriter};
 use omp_core::{IntoStr, Str};
@@ -10,9 +16,11 @@ use serde_json::{Map, Value};
 
 use super::{WriteDisposition, WriteOperation};
 use crate::read::{
+	archive,
 	archive::{ArchiveFormat, parse_archive_path_candidates},
+	selector,
 	sqlite::{
-		RowLookup, parse_path_candidates, resolve_row_lookup, validate_columns, validate_table,
+		Error, RowLookup, parse_path_candidates, resolve_row_lookup, validate_columns, validate_table,
 	},
 };
 
@@ -106,7 +114,7 @@ pub fn empty_archive_selector_misfire(
 	if !content_is_empty || member_exists {
 		return None;
 	}
-	let split = crate::read::selector::split_path_and_selector(target);
+	let split = selector::split_path_and_selector(target);
 	let selector = split.selector?;
 	Some(Fault::new(format!(
 		"write target '{target}' ends with a read-tool selector ':{selector}' and no such file \
@@ -234,7 +242,7 @@ where
 	destination.add_file(member, content).map_err(archive_error)
 }
 
-fn archive_error(error: impl std::fmt::Display) -> Fault {
+fn archive_error(error: impl Display) -> Fault {
 	Fault::new(error.to_string())
 }
 
@@ -297,7 +305,7 @@ pub fn mutate_sqlite_row(
 	content: &str,
 ) -> Result<SqliteMutation, Fault> {
 	connection
-		.busy_timeout(std::time::Duration::from_millis(3_000))
+		.busy_timeout(time::Duration::from_millis(3_000))
 		.map_err(sqlite_error)?;
 	let transaction = connection.transaction().map_err(sqlite_error)?;
 	let table = validate_table(&transaction, &target.table).map_err(read_sqlite_error)?;
@@ -400,7 +408,7 @@ fn insert_row(
 		.map(|column| quote(column))
 		.collect::<Vec<_>>()
 		.join(", ");
-	let placeholders = std::iter::repeat_n("?", columns.len())
+	let placeholders = iter::repeat_n("?", columns.len())
 		.collect::<Vec<_>>()
 		.join(", ");
 	connection
@@ -490,7 +498,7 @@ fn quote(identifier: &str) -> String {
 	format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn read_sqlite_error(error: crate::read::sqlite::Error) -> Fault {
+fn read_sqlite_error(error: Error) -> Fault {
 	Fault::new(error.to_string())
 }
 
@@ -499,8 +507,8 @@ fn sqlite_error(error: rusqlite::Error) -> Fault {
 }
 
 /// Returns the expected container format for a resolved archive path.
-pub fn format_for_path(path: &std::path::Path) -> ArchiveFormat {
-	crate::read::archive::archive_format_from_path(path).unwrap_or(ArchiveFormat::Tar)
+pub fn format_for_path(path: &Path) -> ArchiveFormat {
+	archive::archive_format_from_path(path).unwrap_or(ArchiveFormat::Tar)
 }
 
 #[cfg(test)]

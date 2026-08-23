@@ -6,6 +6,7 @@
 
 use std::{
 	borrow::Cow,
+	cmp,
 	collections::{BTreeMap, BTreeSet},
 };
 
@@ -606,7 +607,7 @@ fn rank(
 	candidate: &(ProviderId, &ModelSpec),
 	routes: &[RouteDef],
 	mru: &BTreeMap<(ProviderId, ModelKey), u64>,
-) -> (u8, u64, u32, std::cmp::Reverse<ProviderId>, std::cmp::Reverse<ModelKey>) {
+) -> (u8, u64, u32, cmp::Reverse<ProviderId>, cmp::Reverse<ModelKey>) {
 	let availability = u8::from(candidate.1.availability == ModelAvailability::Available);
 	let recent = *mru
 		.get(&(candidate.0.clone(), candidate.1.key.clone()))
@@ -627,8 +628,8 @@ fn rank(
 		availability,
 		recent,
 		priority,
-		std::cmp::Reverse(candidate.0.clone()),
-		std::cmp::Reverse(candidate.1.key.clone()),
+		cmp::Reverse(candidate.0.clone()),
+		cmp::Reverse(candidate.1.key.clone()),
 	)
 }
 
@@ -1024,6 +1025,7 @@ fn is_thinking_level(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::Catalog;
 	#[test]
 	fn selector_grammar_is_table_driven() {
 		for (input, model, upstream, thinking, route) in [
@@ -1074,7 +1076,7 @@ mod tests {
 
 	#[test]
 	fn retry_role_resolution_prefers_live_hint_then_default_for_shared_assignment() {
-		let catalog = crate::Catalog::embedded();
+		let catalog = Catalog::embedded();
 		let mru = BTreeMap::new();
 		let current =
 			pick_default(catalog.models(), catalog.routes(), &mru).expect("default catalog model");
@@ -1119,7 +1121,7 @@ mod tests {
 
 	#[test]
 	fn retry_role_resolution_ignores_stale_and_unowned_role_hints() {
-		let catalog = crate::Catalog::embedded();
+		let catalog = Catalog::embedded();
 		let mru = BTreeMap::new();
 		let current =
 			pick_default(catalog.models(), catalog.routes(), &mru).expect("default catalog model");
@@ -1193,7 +1195,7 @@ mod tests {
 
 	#[test]
 	fn matching_cascade_is_table_driven() {
-		let catalog = crate::Catalog::embedded();
+		let catalog = Catalog::embedded();
 		let models = catalog.models();
 		// Catalog keys are `provider/logical` composites. Pick a model whose
 		// logical id is unambiguous and whose key prefix owns a real route, so
@@ -1265,7 +1267,7 @@ mod tests {
 	}
 	#[test]
 	fn tiny_and_memory_follow_commit_before_smol_without_mutation() {
-		let catalog = crate::Catalog::embedded();
+		let catalog = Catalog::embedded();
 		let selected_model = catalog
 			.models()
 			.iter()

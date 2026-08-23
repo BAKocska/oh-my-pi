@@ -1,6 +1,8 @@
 //! Journal-owner bridge for bounded collaboration snapshot and live
 //! replication.
 
+use std::mem;
+
 use bytes::Bytes;
 use omp_agent::{
 	Journal, JournalError, ReplicationEvent, ReplicationRecord, ReplicationSubscription,
@@ -42,7 +44,7 @@ impl HostJournalBridge {
 					|| encoded_bytes.saturating_add(record_bytes) > SNAPSHOT_CHUNK_SOFT_BYTES)
 			{
 				chunks.push(SnapshotChunk {
-					entries: std::mem::take(&mut entries),
+					entries: mem::take(&mut entries),
 					r#final: false,
 					host_revision_watermark,
 				});

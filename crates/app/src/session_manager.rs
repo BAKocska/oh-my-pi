@@ -20,6 +20,8 @@ pub enum DraftError {
 	#[error("failed to publish session draft")]
 	Atomic(#[from] atomic::Error),
 }
+use std::fs;
+
 pub use omp_driver::chat::{PinError, PinStore};
 /// Private, owner-local unsent composer buffers keyed by session identity.
 pub struct DraftStore {
@@ -31,11 +33,11 @@ impl DraftStore {
 	/// root.
 	pub fn new(data_dir: &Path) -> Result<Self, DraftError> {
 		let directory = data_dir.join("drafts");
-		std::fs::create_dir_all(&directory)?;
+		fs::create_dir_all(&directory)?;
 		#[cfg(unix)]
 		{
 			use std::os::unix::fs::PermissionsExt as _;
-			std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+			fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
 		}
 		Ok(Self { directory })
 	}
@@ -53,7 +55,7 @@ impl DraftStore {
 	pub fn save(&self, session: &SessionId, draft: &str) -> Result<(), DraftError> {
 		let path = self.path(session);
 		if draft.is_empty() {
-			match std::fs::remove_file(path) {
+			match fs::remove_file(path) {
 				Ok(()) => {},
 				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 				Err(error) => return Err(error.into()),
@@ -68,13 +70,13 @@ impl DraftStore {
 	pub fn consume(&self, session: &SessionId) -> Result<Option<String>, DraftError> {
 		let path = self.path(session);
 		let claimed = path.with_extension(format!("claimed-{}", omp_core::Ulid::generate()));
-		match std::fs::rename(&path, &claimed) {
+		match fs::rename(&path, &claimed) {
 			Ok(()) => {},
 			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
 			Err(error) => return Err(error.into()),
 		}
-		let result = std::fs::read_to_string(&claimed);
-		let removal = std::fs::remove_file(&claimed);
+		let result = fs::read_to_string(&claimed);
+		let removal = fs::remove_file(&claimed);
 		match (result, removal) {
 			(Ok(draft), Ok(())) => Ok(Some(draft)),
 			(Err(error), _) | (Ok(_), Err(error)) => Err(error.into()),
@@ -122,7 +124,7 @@ mod tests {
 	#[test]
 	fn corrupt_pin_metadata_does_not_break_session_listing() {
 		let temp = tempdir().expect("tempdir");
-		std::fs::write(temp.path().join("session-pins.json"), b"{broken").expect("corrupt fixture");
+		fs::write(temp.path().join("session-pins.json"), b"{broken").expect("corrupt fixture");
 		assert!(
 			PinStore::new(temp.path())
 				.load()

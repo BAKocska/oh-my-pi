@@ -1,6 +1,6 @@
 //! Bounded transient progress for operator-facing maintenance commands.
 
-use std::{io::IsTerminal as _, time::Duration};
+use std::{io, io::IsTerminal as _, time::Duration};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
@@ -13,7 +13,7 @@ impl ProgressReporter {
 	/// Creates a bounded reporter. Quiet and non-TTY callers receive a hidden
 	/// draw target while retaining the same accounting contract.
 	pub fn bounded(length: u64, message: impl Into<String>, quiet: bool) -> Self {
-		let bar = if quiet || !std::io::stderr().is_terminal() {
+		let bar = if quiet || !io::stderr().is_terminal() {
 			ProgressBar::hidden()
 		} else {
 			ProgressBar::with_draw_target(Some(length), ProgressDrawTarget::stderr_with_hz(12))

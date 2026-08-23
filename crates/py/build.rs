@@ -19,7 +19,9 @@
 
 use std::{
 	collections::BTreeSet,
+	env,
 	fmt::Write,
+	fs,
 	path::{Path, PathBuf},
 	process::Command,
 };
@@ -29,8 +31,8 @@ use std::{
 const TCL_LIBS: [&str; 2] = ["tcl9.0", "tcl9tk9.0"];
 
 fn main() {
-	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-	let target = std::env::var("TARGET").expect("Cargo must provide TARGET to omp-py/build.rs");
+	let manifest = PathBuf::from(std::env!("CARGO_MANIFEST_DIR"));
+	let target = env::var("TARGET").expect("Cargo must provide TARGET to omp-py/build.rs");
 
 	// pyo3-ffi configures itself from PYO3_CONFIG_FILE *before* this script
 	// has any say; if it is unset or points elsewhere, pyo3 silently
@@ -38,7 +40,7 @@ fn main() {
 	// .cargo/config.toml sets it for workspace members; external consumers
 	// must set it themselves (environment or their own `[env]` section).
 	println!("cargo::rerun-if-env-changed=PYO3_CONFIG_FILE");
-	let config_path = std::env::var_os("PYO3_CONFIG_FILE").map(PathBuf::from);
+	let config_path = env::var_os("PYO3_CONFIG_FILE").map(PathBuf::from);
 	let config = config_path
 		.as_ref()
 		.and_then(|p| {
@@ -67,7 +69,7 @@ fn main() {
 	println!("cargo::rerun-if-changed={}", vendor.join("stdlib.bin").display());
 
 	let json: serde_json::Value =
-		serde_json::from_str(&std::fs::read_to_string(vendor.join("PYTHON.json")).unwrap()).unwrap();
+		serde_json::from_str(&fs::read_to_string(vendor.join("PYTHON.json")).unwrap()).unwrap();
 
 	// macOS's `@available` checks require compiler-rt because rustc links with
 	// `-nodefaultlibs`; Linux archives do not ship or reference this Darwin
@@ -116,9 +118,9 @@ fn main() {
 	// spell this flag differently; passing ld64's spelling to an ELF linker is
 	// parsed as `-e xport_dynamic`, producing no valid entry point. Other object
 	// formats have no compatible flag.
-	let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
-	let target_family = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
-	let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+	let target_vendor = env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
+	let target_family = env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
+	let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 	let link_arg = if target_vendor == "apple" {
 		Some("-Wl,-export_dynamic")
 	} else if target_os != "aix" && target_family.split(',').any(|family| family == "unix") {
@@ -155,18 +157,17 @@ fn main() {
 	println!("cargo::rerun-if-changed={}", requirements.display());
 	println!("cargo::rerun-if-changed={}", packer.display());
 	let frozen_metadata =
-		PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("frozen_distributions.rs");
+		PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("frozen_distributions.rs");
 	write_frozen_distributions(&requirements, &frozen_metadata);
 	println!("cargo::rustc-env=OMP_PY_FROZEN_DISTRIBUTIONS={}", frozen_metadata.display());
 
 	let url_vocab = manifest.join("../tools/url-vocab.json");
 	println!("cargo::rerun-if-changed={}", url_vocab.display());
-	let frozen_generated = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("frozen-python");
-	std::fs::create_dir_all(&frozen_generated).expect("create generated frozen-module directory");
-	let vocabulary: serde_json::Value = serde_json::from_str(
-		&std::fs::read_to_string(&url_vocab).expect("read canonical URL vocabulary"),
-	)
-	.expect("parse canonical URL vocabulary");
+	let frozen_generated = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("frozen-python");
+	fs::create_dir_all(&frozen_generated).expect("create generated frozen-module directory");
+	let vocabulary: serde_json::Value =
+		serde_json::from_str(&fs::read_to_string(&url_vocab).expect("read canonical URL vocabulary"))
+			.expect("parse canonical URL vocabulary");
 	let mut vocabulary_module =
 		String::from("\"\"\"Generated canonical URL and selector vocabulary; do not edit.\"\"\"\n");
 	writeln!(
@@ -208,7 +209,7 @@ fn main() {
 		.expect("write URL vocabulary scheme");
 	}
 	vocabulary_module.push_str(")\n");
-	std::fs::write(frozen_generated.join("_omp_url_vocab.py"), vocabulary_module)
+	fs::write(frozen_generated.join("_omp_url_vocab.py"), vocabulary_module)
 		.expect("write generated frozen URL vocabulary");
 
 	let interpreter = ["python3.14td", "python3.14t"]
@@ -217,7 +218,7 @@ fn main() {
 		.find(|p| p.is_file())
 		.expect("vendored interpreter missing — run omp-py's scripts/fetch-python.sh first");
 	let bundled = bundled_packages(&requirements, &vendor);
-	let modules_blob = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("omp_modules.bin");
+	let modules_blob = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("omp_modules.bin");
 	let mut pack = Command::new(interpreter);
 	pack.arg(&packer).arg(&py_src);
 	pack.arg(&frozen_generated);
@@ -244,7 +245,7 @@ fn main() {
 /// tree's stamp matches the manifest text and fails with a pointer to the
 /// fetch script when it is missing or stale.
 fn bundled_packages(requirements: &Path, vendor: &Path) -> Option<PathBuf> {
-	let spec = std::fs::read_to_string(requirements).unwrap_or_default();
+	let spec = fs::read_to_string(requirements).unwrap_or_default();
 	let listed = spec
 		.lines()
 		.map(str::trim)
@@ -270,8 +271,7 @@ fn bundled_packages(requirements: &Path, vendor: &Path) -> Option<PathBuf> {
 /// be exact pins, while one or more `--hash=sha256:` entries may follow the
 /// pin for `uv --require-hashes`.
 fn write_frozen_distributions(requirements: &Path, output: &Path) {
-	let requirements =
-		std::fs::read_to_string(requirements).expect("read frozen Python requirements");
+	let requirements = fs::read_to_string(requirements).expect("read frozen Python requirements");
 	let mut rows = Vec::new();
 	for line in requirements.lines().map(str::trim) {
 		if line.is_empty() || line.starts_with('#') {
@@ -295,5 +295,5 @@ fn write_frozen_distributions(requirements: &Path, output: &Path) {
 		writeln!(&mut source, "\t({name:?}, {version:?}),").expect("write frozen metadata");
 	}
 	source.push_str("];\n");
-	std::fs::write(output, source).expect("write frozen distribution metadata");
+	fs::write(output, source).expect("write frozen distribution metadata");
 }

@@ -2,7 +2,9 @@
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+use std::{os::raw, process};
 
+use tokio::task;
 use tokio_util::sync::CancellationToken;
 
 use crate::{error, processes};
@@ -29,7 +31,7 @@ impl ExecutionResult {
 	/// Returns a new `ExecutionResult` reflecting a process that was stopped.
 	pub fn stopped() -> Self {
 		// TODO(jobs): Decide how to sort this out in a platform-independent way.
-		const SIGTSTP: std::os::raw::c_int = 20;
+		const SIGTSTP: raw::c_int = 20;
 
 		#[expect(
 			clippy::cast_possible_truncation,
@@ -102,8 +104,8 @@ impl From<ExecutionWaitResult> for ExecutionResult {
 	}
 }
 
-impl From<std::process::Output> for ExecutionResult {
-	fn from(output: std::process::Output) -> Self {
+impl From<process::Output> for ExecutionResult {
+	fn from(output: process::Output) -> Self {
 		if let Some(code) = output.status.code() {
 			#[expect(clippy::cast_sign_loss, reason = "mask restricts exit status to a byte")]
 			return Self::new((code & 0xff) as u8);
@@ -236,7 +238,7 @@ pub enum ExecutionSpawnResult {
 	/// Indicates that a process was started and had not yet completed.
 	StartedProcess(processes::ChildProcess),
 	/// Indicates that a task was started to handle the execution asynchronously.
-	StartedTask(tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>),
+	StartedTask(task::JoinHandle<Result<ExecutionResult, error::Error>>),
 }
 
 impl From<ExecutionResult> for ExecutionSpawnResult {

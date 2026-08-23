@@ -1,6 +1,6 @@
 //! Canonical JSON Schema rendering for prompt templates.
 
-use std::fmt::Write as _;
+use std::{collections::BTreeSet, fmt::Write as _};
 
 /// Renders a JSON Schema as compact TypeScript-like definitions and the
 /// terminal yield envelope required by the agent protocol.
@@ -46,7 +46,7 @@ fn render_type(schema: &serde_json::Value) -> String {
 				.into_iter()
 				.flatten()
 				.filter_map(serde_json::Value::as_str)
-				.collect::<std::collections::BTreeSet<_>>();
+				.collect::<BTreeSet<_>>();
 			let mut properties = schema
 				.get("properties")
 				.and_then(serde_json::Value::as_object)

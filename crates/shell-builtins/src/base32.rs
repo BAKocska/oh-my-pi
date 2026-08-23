@@ -4,7 +4,7 @@
 
 use std::{
 	ffi::OsString,
-	fmt,
+	fmt::{self, Display},
 	fs::File,
 	io::{self, BufRead, BufReader, Write},
 };
@@ -54,7 +54,7 @@ impl BaseError {
 	}
 }
 
-impl fmt::Display for BaseError {
+impl Display for BaseError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(&self.0)
 	}
@@ -70,7 +70,10 @@ type BaseResult<T> = Result<T, BaseError>;
 
 use clap::{Arg, ArgAction, Command};
 
-use crate::support::{basenc::Codec, quote::Quotable};
+use crate::{
+	host::format_usage,
+	support::{basenc::Codec, quote::Quotable},
+};
 const BASE_CMD_PARSE_ERROR: i32 = 1;
 
 /// Encoded output will be formatted in lines of this length (the last line can
@@ -140,7 +143,7 @@ pub(crate) fn base_app(name: &'static str, about: &'static str, usage: &'static 
 	Command::new(name)
 		.version("0.8.0")
 		.about(about)
-		.override_usage(crate::host::format_usage(usage))
+		.override_usage(format_usage(usage))
 		.infer_long_args(true)
 		.arg(
 			Arg::new(options::DECODE)
@@ -239,7 +242,7 @@ mod encode {
 		io::{BufRead, Write},
 	};
 
-	use super::{BaseError, BaseResult, WRAP_DEFAULT};
+	use super::{BaseError, BaseResult, WRAP_DEFAULT, format_read_error};
 	use crate::support::basenc::Codec;
 
 	fn write_encoded(
@@ -288,7 +291,7 @@ mod encode {
 		loop {
 			let available = input
 				.fill_buf()
-				.map_err(|error| BaseError::new(super::format_read_error(&error)))?;
+				.map_err(|error| BaseError::new(format_read_error(&error)))?;
 			if available.is_empty() {
 				break;
 			}
@@ -317,7 +320,7 @@ mod encode {
 mod decode {
 	use std::io::{self, BufRead, Write};
 
-	use super::{BaseError, BaseResult};
+	use super::{BaseError, BaseResult, format_read_error};
 	use crate::support::basenc::Codec;
 
 	// Start of helper functions
@@ -406,7 +409,7 @@ mod decode {
 		loop {
 			let read_buffer = input
 				.fill_buf()
-				.map_err(|err| BaseError::new(super::format_read_error(&err)))?;
+				.map_err(|err| BaseError::new(format_read_error(&err)))?;
 			let read_len = read_buffer.len();
 			if read_len == 0 {
 				break;

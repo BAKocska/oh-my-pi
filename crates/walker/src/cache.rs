@@ -2,16 +2,22 @@
 
 use std::{
 	borrow::Cow,
-	fmt,
+	env,
+	fmt::Display,
+	fs, io,
 	path::{Path, PathBuf},
+	str,
 	sync::LazyLock,
-	time::{Duration, Instant},
+	thread,
+	time::{self, Duration, Instant},
 };
 
 use dashmap::DashMap;
 use rayon::{ThreadPool, prelude::*};
 
-use crate::{CollectedEntries, CollectedEntry, FileType, WalkError, WalkOptions};
+use crate::{
+	CollectedEntries, CollectedEntry, FileType, WalkError, WalkOptions, collect_entries_native,
+};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
@@ -51,9 +57,9 @@ static SCAN_CACHE: LazyLock<DashMap<CacheKey, CacheEntry>> = LazyLock::new(DashM
 
 fn env_uint<T>(name: &str, default: T, min: T, max: T) -> T
 where
-	T: Copy + Ord + std::str::FromStr,
+	T: Copy + Ord + str::FromStr,
 {
-	std::env::var(name)
+	env::var(name)
 		.ok()
 		.and_then(|value| value.parse().ok())
 		.unwrap_or(default)
@@ -69,7 +75,7 @@ fn normalize_worker_count_with_available(configured: usize, available: usize) ->
 }
 
 fn available_worker_count() -> usize {
-	std::thread::available_parallelism().map_or(DEFAULT_WALK_WORKERS, usize::from)
+	thread::available_parallelism().map_or(DEFAULT_WALK_WORKERS, usize::from)
 }
 
 fn normalize_worker_count(configured: usize) -> usize {
@@ -121,8 +127,8 @@ pub fn should_parallelize(item_count: usize) -> bool {
 /// Run traversal-adjacent work serially or on the centralized walker pool.
 pub fn parallel_for_each<T, E>(
 	items: &[T],
-	operation: impl Fn(&T) -> std::result::Result<(), E> + Send + Sync,
-) -> std::result::Result<(), E>
+	operation: impl Fn(&T) -> Result<(), E> + Send + Sync,
+) -> Result<(), E>
 where
 	T: Sync,
 	E: Send,
@@ -138,8 +144,8 @@ where
 pub fn parallel_for_each_init<T, S, E>(
 	items: &[T],
 	init: impl Fn() -> S + Send + Sync,
-	operation: impl Fn(&mut S, &T) -> std::result::Result<(), E> + Send + Sync,
-) -> std::result::Result<(), E>
+	operation: impl Fn(&mut S, &T) -> Result<(), E> + Send + Sync,
+) -> Result<(), E>
 where
 	T: Sync,
 	S: Send,
@@ -206,7 +212,7 @@ pub fn should_skip_path(path: &Path, mentions_node_modules: bool) -> bool {
 	false
 }
 
-fn file_type_from_std(file_type: std::fs::FileType) -> Option<FileType> {
+fn file_type_from_std(file_type: fs::FileType) -> Option<FileType> {
 	if file_type.is_symlink() {
 		Some(FileType::Symlink)
 	} else if file_type.is_dir() {
@@ -218,17 +224,17 @@ fn file_type_from_std(file_type: std::fs::FileType) -> Option<FileType> {
 	}
 }
 
-fn mtime_ms(metadata: &std::fs::Metadata) -> Option<f64> {
+fn mtime_ms(metadata: &fs::Metadata) -> Option<f64> {
 	metadata
 		.modified()
 		.ok()
-		.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+		.and_then(|time| time.duration_since(time::UNIX_EPOCH).ok())
 		.map(|duration| duration.as_millis() as f64)
 }
 
 /// Classify an existing filesystem path, skipping unsupported special files.
 pub fn classify_file_type(path: &Path) -> Option<(FileType, Option<f64>, Option<u64>)> {
-	let metadata = std::fs::symlink_metadata(path).ok()?;
+	let metadata = fs::symlink_metadata(path).ok()?;
 	let file_type = file_type_from_std(metadata.file_type())?;
 	let size = if file_type == FileType::File {
 		Some(metadata.len())
@@ -244,13 +250,13 @@ pub fn resolve_search_path(path: &str) -> Result<PathBuf, WalkError<String>> {
 	let root = if candidate.is_absolute() {
 		candidate
 	} else {
-		let cwd = std::env::current_dir().map_err(|err| WalkError::InvalidData {
+		let cwd = env::current_dir().map_err(|err| WalkError::InvalidData {
 			path:    PathBuf::from(path),
 			message: format!("Failed to resolve cwd: {err}"),
 		})?;
 		cwd.join(candidate)
 	};
-	let metadata = std::fs::metadata(&root).map_err(|err| WalkError::InvalidData {
+	let metadata = fs::metadata(&root).map_err(|err| WalkError::InvalidData {
 		path:    root.clone(),
 		message: format!("Path not found: {err}"),
 	})?;
@@ -260,7 +266,7 @@ pub fn resolve_search_path(path: &str) -> Result<PathBuf, WalkError<String>> {
 			message: "Search path must be a directory".to_string(),
 		});
 	}
-	Ok(std::fs::canonicalize(&root).unwrap_or(root))
+	Ok(fs::canonicalize(&root).unwrap_or(root))
 }
 
 fn collect_entries_uncached<H, E>(
@@ -269,11 +275,11 @@ fn collect_entries_uncached<H, E>(
 	heartbeat: &H,
 ) -> Result<CollectedEntries, WalkError<String>>
 where
-	H: Fn() -> std::result::Result<(), E> + Sync,
-	E: fmt::Display,
+	H: Fn() -> Result<(), E> + Sync,
+	E: Display,
 {
 	options.cache = false;
-	crate::collect_entries_native(root, options, || heartbeat().map_err(|err| err.to_string()))
+	collect_entries_native(root, options, || heartbeat().map_err(|err| err.to_string()))
 }
 
 fn get_or_scan<H, E>(
@@ -282,8 +288,8 @@ fn get_or_scan<H, E>(
 	heartbeat: &H,
 ) -> Result<CollectedEntries, WalkError<String>>
 where
-	H: Fn() -> std::result::Result<(), E> + Sync,
-	E: fmt::Display,
+	H: Fn() -> Result<(), E> + Sync,
+	E: Display,
 {
 	let ttl = *CACHE_TTL_MS;
 	if ttl == 0 {
@@ -316,8 +322,8 @@ pub fn collect_entries<H, E>(
 	heartbeat: H,
 ) -> Result<CollectedEntries, WalkError<String>>
 where
-	H: Fn() -> std::result::Result<(), E> + Sync,
-	E: fmt::Display,
+	H: Fn() -> Result<(), E> + Sync,
+	E: Display,
 {
 	if options.cache {
 		get_or_scan(root, options, &heartbeat)
@@ -343,18 +349,18 @@ pub fn invalidate_path_string(path: &str) {
 	let candidate = PathBuf::from(path);
 	let absolute = if candidate.is_absolute() {
 		candidate
-	} else if let Ok(cwd) = std::env::current_dir() {
+	} else if let Ok(cwd) = env::current_dir() {
 		cwd.join(candidate)
 	} else {
 		PathBuf::from(path)
 	};
-	let target = std::fs::canonicalize(&absolute)
+	let target = fs::canonicalize(&absolute)
 		.or_else(|_| {
 			absolute
 				.parent()
-				.and_then(|parent| std::fs::canonicalize(parent).ok())
+				.and_then(|parent| fs::canonicalize(parent).ok())
 				.and_then(|parent| absolute.file_name().map(|name| parent.join(name)))
-				.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+				.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
 		})
 		.unwrap_or(absolute);
 	invalidate_path(&target);
@@ -367,18 +373,22 @@ pub fn invalidate_all() {
 
 #[cfg(test)]
 mod tests {
-	#[cfg(unix)]
-	use std::{ffi::CString, os::unix::ffi::OsStrExt};
 	use std::{
-		fs,
+		env, fs,
 		path::{Path, PathBuf},
 		sync::atomic::{AtomicU64, Ordering},
+		thread,
 		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
+	#[cfg(unix)]
+	use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 	#[cfg(unix)]
 	use super::classify_file_type;
-	use crate::{CollectedEntry, FileType};
+	use super::collect_entries;
+	use crate::{
+		CollectedEntry, DirectoryErrorMode, FileType, FollowLinks, WalkDetail, WalkOptions,
+	};
 
 	static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -391,7 +401,7 @@ mod tests {
 				.expect("system time is after UNIX_EPOCH")
 				.as_nanos();
 			let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-			let path = std::env::temp_dir().join(format!("pi-fs-cache-test-{timestamp}-{counter}"));
+			let path = env::temp_dir().join(format!("pi-fs-cache-test-{timestamp}-{counter}"));
 			fs::create_dir_all(&path).expect("create temp test directory");
 			Self(path)
 		}
@@ -422,7 +432,7 @@ mod tests {
 		clippy::unnecessary_wraps,
 		reason = "test heartbeat helper matches production callback signature"
 	)]
-	fn ok_heartbeat() -> std::result::Result<(), String> {
+	fn ok_heartbeat() -> Result<(), String> {
 		Ok(())
 	}
 
@@ -434,20 +444,16 @@ mod tests {
 		assert_eq!(super::normalize_worker_count_with_available(4, 8), 4);
 	}
 
-	fn scan_options(
-		include_hidden: bool,
-		use_gitignore: bool,
-		detail: crate::WalkDetail,
-	) -> crate::WalkOptions {
-		crate::WalkOptions {
+	fn scan_options(include_hidden: bool, use_gitignore: bool, detail: WalkDetail) -> WalkOptions {
+		WalkOptions {
 			include_hidden,
 			use_gitignore,
 			skip_git: true,
 			skip_node_modules: true,
-			follow_links: crate::FollowLinks::Never,
+			follow_links: FollowLinks::Never,
 			detail,
-			directory_errors: crate::DirectoryErrorMode::SkipSkippable,
-			..crate::WalkOptions::default()
+			directory_errors: DirectoryErrorMode::SkipSkippable,
+			..WalkOptions::default()
 		}
 	}
 
@@ -493,12 +499,9 @@ mod tests {
 		fs::write(root.path().join("node_modules/pkg/index.js"), "nm").unwrap();
 		fs::write(root.path().join("real.txt"), "ok").unwrap();
 
-		let entries = super::collect_entries(
-			root.path(),
-			scan_options(true, false, crate::WalkDetail::Full),
-			ok_heartbeat,
-		)
-		.unwrap();
+		let entries =
+			collect_entries(root.path(), scan_options(true, false, WalkDetail::Full), ok_heartbeat)
+				.unwrap();
 		let entries = entries.entries;
 		let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
 		assert!(
@@ -514,12 +517,15 @@ mod tests {
 		let root = TempDirGuard::new();
 		fs::create_dir_all(root.path().join("target")).unwrap();
 		fs::write(root.path().join("target/linked.txt"), "linked").unwrap();
-		std::os::unix::fs::symlink(root.path().join("target"), root.path().join("link")).unwrap();
+		{
+			use std::os::unix::fs;
+			fs::symlink(root.path().join("target"), root.path().join("link")).unwrap();
+		}
 
-		let mut options = scan_options(true, false, crate::WalkDetail::Minimal);
-		options.follow_links = crate::FollowLinks::Always;
+		let mut options = scan_options(true, false, WalkDetail::Minimal);
+		options.follow_links = FollowLinks::Always;
 
-		let entries = super::collect_entries(root.path(), options, ok_heartbeat).unwrap();
+		let entries = collect_entries(root.path(), options, ok_heartbeat).unwrap();
 		let paths: Vec<&str> = entries
 			.entries
 			.iter()
@@ -539,12 +545,9 @@ mod tests {
 		fs::write(root.path().join("ignored.txt"), "ignored").unwrap();
 		fs::write(root.path().join("kept.txt"), "keep").unwrap();
 
-		let collected = super::collect_entries(
-			root.path(),
-			scan_options(true, true, crate::WalkDetail::Full),
-			ok_heartbeat,
-		)
-		.unwrap();
+		let collected =
+			collect_entries(root.path(), scan_options(true, true, WalkDetail::Full), ok_heartbeat)
+				.unwrap();
 		let collected = collected.entries;
 		assert!(
 			!collected.iter().any(|entry| entry.path == "ignored.txt"),
@@ -562,12 +565,9 @@ mod tests {
 		fs::write(root.path().join(".hidden-file"), "secret").unwrap();
 		fs::write(root.path().join("visible.txt"), "visible").unwrap();
 
-		let entries = super::collect_entries(
-			root.path(),
-			scan_options(false, false, crate::WalkDetail::Full),
-			ok_heartbeat,
-		)
-		.unwrap();
+		let entries =
+			collect_entries(root.path(), scan_options(false, false, WalkDetail::Full), ok_heartbeat)
+				.unwrap();
 		let entries = entries.entries;
 		assert_eq!(
 			entries.len(),
@@ -595,12 +595,9 @@ mod tests {
 		fs::write(root.path().join(".hidden-file"), "secret").unwrap();
 		fs::write(root.path().join(".ignored-hidden"), "ignored").unwrap();
 
-		let entries = super::collect_entries(
-			root.path(),
-			scan_options(true, true, crate::WalkDetail::Full),
-			ok_heartbeat,
-		)
-		.unwrap();
+		let entries =
+			collect_entries(root.path(), scan_options(true, true, WalkDetail::Full), ok_heartbeat)
+				.unwrap();
 		let entries = entries.entries;
 		assert_file_entry(&entries, ".hidden-file", 6.0);
 		assert_dir_entry(&entries, ".hidden-dir");
@@ -617,12 +614,11 @@ mod tests {
 		let root = TempDirGuard::new();
 		fs::write(root.path().join("real.txt"), "ok").unwrap();
 
-		std::thread::sleep(Duration::from_millis(1));
-		let result = super::collect_entries(
-			root.path(),
-			scan_options(true, false, crate::WalkDetail::Minimal),
-			|| Err("Timeout".to_string()),
-		);
+		thread::sleep(Duration::from_millis(1));
+		let result =
+			collect_entries(root.path(), scan_options(true, false, WalkDetail::Minimal), || {
+				Err("Timeout".to_string())
+			});
 
 		let Err(err) = result else {
 			panic!("pre-cancelled scans should fail before returning entries");
@@ -638,12 +634,9 @@ mod tests {
 		let root = TempDirGuard::new();
 		fs::write(root.path().join("real.txt"), "ok").unwrap();
 
-		let minimal = super::collect_entries(
-			root.path(),
-			scan_options(true, false, crate::WalkDetail::Minimal),
-			ok_heartbeat,
-		)
-		.unwrap();
+		let minimal =
+			collect_entries(root.path(), scan_options(true, false, WalkDetail::Minimal), ok_heartbeat)
+				.unwrap();
 		let minimal_file = minimal
 			.entries
 			.iter()
@@ -652,12 +645,9 @@ mod tests {
 		assert_eq!(minimal_file.mtime, None);
 		assert_eq!(minimal_file.size, None);
 
-		let full = super::collect_entries(
-			root.path(),
-			scan_options(true, false, crate::WalkDetail::Full),
-			ok_heartbeat,
-		)
-		.unwrap();
+		let full =
+			collect_entries(root.path(), scan_options(true, false, WalkDetail::Full), ok_heartbeat)
+				.unwrap();
 		let full_file = full
 			.entries
 			.iter()

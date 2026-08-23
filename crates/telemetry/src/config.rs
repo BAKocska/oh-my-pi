@@ -27,6 +27,7 @@
 
 use std::{
 	any::Any,
+	env,
 	panic::{AssertUnwindSafe, catch_unwind},
 	sync::Arc,
 };
@@ -37,6 +38,7 @@ use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
 
 use crate::{
+	attrs::omp_gen_ai,
 	collector::{RunCoverage, RunSummary},
 	content::{self, RequestContent, ResponseContent},
 	redact::redact_sensitive_credentials,
@@ -346,7 +348,7 @@ impl Default for TelemetryConfig {
 			tracer:                  None,
 			tracer_name:             sf!(DEFAULT_TRACER_NAME),
 			capture_message_content: CaptureMode::from_env_value(
-				std::env::var("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
+				env::var("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
 					.ok()
 					.as_deref(),
 			),
@@ -570,7 +572,7 @@ impl TelemetryConfig {
 		}
 		string_attribute(
 			content::request_attributes(CaptureMode::Summary, request),
-			crate::attrs::omp_gen_ai::REQUEST_MESSAGES,
+			omp_gen_ai::REQUEST_MESSAGES,
 		)
 	}
 
@@ -581,7 +583,7 @@ impl TelemetryConfig {
 		}
 		string_attribute(
 			content::response_attributes(CaptureMode::Summary, response),
-			crate::attrs::omp_gen_ai::RESPONSE_TEXT,
+			omp_gen_ai::RESPONSE_TEXT,
 		)
 	}
 
@@ -592,7 +594,7 @@ impl TelemetryConfig {
 		}
 		string_attribute(
 			content::response_attributes(CaptureMode::Summary, response),
-			crate::attrs::omp_gen_ai::RESPONSE_TOOL_CALLS,
+			omp_gen_ai::RESPONSE_TOOL_CALLS,
 		)
 	}
 

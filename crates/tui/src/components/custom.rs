@@ -1,4 +1,4 @@
-use std::mem;
+use std::{mem, slice};
 
 use omp_core::{IntoStr, Str};
 
@@ -89,7 +89,7 @@ impl Component for CustomElement {
 
 	fn children(&self) -> &[Cached] {
 		if let Some(resolved) = &self.resolved {
-			std::slice::from_ref(resolved)
+			slice::from_ref(resolved)
 		} else {
 			&self.children
 		}
@@ -97,7 +97,7 @@ impl Component for CustomElement {
 
 	fn children_mut(&mut self) -> &mut [Cached] {
 		if let Some(resolved) = &mut self.resolved {
-			std::slice::from_mut(resolved)
+			slice::from_mut(resolved)
 		} else {
 			&mut self.children
 		}

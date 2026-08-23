@@ -7,8 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ra_ap_syntax::ast::{self, AstNode, HasName};
-use ra_ap_syntax::{SourceFile, SyntaxKind, SyntaxNode};
+use ra_ap_syntax::{
+	SourceFile, SyntaxKind, SyntaxNode,
+	ast::{self, AstNode, HasName},
+};
 
 use crate::scope::{self, ScopeKey};
 
@@ -19,7 +21,7 @@ const LOCAL_DEF: &str = "<def>";
 /// What each scope of a file binds, plus every bare ident usage.
 pub struct Bindings {
 	by_scope: BTreeMap<ScopeKey, BTreeMap<String, String>>,
-	bare: BTreeSet<String>,
+	bare:     BTreeSet<String>,
 }
 
 impl Bindings {
@@ -34,8 +36,14 @@ impl Bindings {
 				}
 			} else if let Some(path) = ast::Path::cast(node.clone()) {
 				if path.qualifier().is_none()
-					&& path.syntax().parent().is_some_and(|p| p.kind() != SyntaxKind::PATH)
-					&& !path.syntax().ancestors().any(|a| a.kind() == SyntaxKind::USE)
+					&& path
+						.syntax()
+						.parent()
+						.is_some_and(|p| p.kind() != SyntaxKind::PATH)
+					&& !path
+						.syntax()
+						.ancestors()
+						.any(|a| a.kind() == SyntaxKind::USE)
 					&& let Some(name) = path.segment().and_then(|s| s.name_ref())
 				{
 					bare.insert(name.text().to_string());
@@ -94,7 +102,10 @@ fn item_def_name(node: &SyntaxNode) -> Option<String> {
 
 /// Record every leaf of a use tree as `name` → canonical path.
 fn collect_use_tree(tree: &ast::UseTree, prefix: &str, bound: &mut BTreeMap<String, String>) {
-	let path_text = tree.path().map(|p| p.syntax().text().to_string()).unwrap_or_default();
+	let path_text = tree
+		.path()
+		.map(|p| p.syntax().text().to_string())
+		.unwrap_or_default();
 	let full = match (prefix.is_empty(), path_text.is_empty()) {
 		(true, _) => path_text.clone(),
 		(false, true) => prefix.to_string(),
@@ -114,8 +125,15 @@ fn collect_use_tree(tree: &ast::UseTree, prefix: &str, bound: &mut BTreeMap<Stri
 	} else if tree.rename().is_some() {
 		return; // `as _` imports a trait anonymously; it binds no name
 	} else if full.ends_with("::self") || full == "self" {
-		let canonical = full.trim_end_matches("::self").trim_end_matches("self").to_string();
-		let name = canonical.rsplit("::").next().unwrap_or(&canonical).to_string();
+		let canonical = full
+			.trim_end_matches("::self")
+			.trim_end_matches("self")
+			.to_string();
+		let name = canonical
+			.rsplit("::")
+			.next()
+			.unwrap_or(&canonical)
+			.to_string();
 		(name, canonical)
 	} else {
 		(full.rsplit("::").next().unwrap_or(&full).to_string(), full.clone())

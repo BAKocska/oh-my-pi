@@ -4,7 +4,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet, HashSet},
 	fmt::Write as _,
 	path::Path,
-	str::Utf8Error,
+	str::{self, Utf8Error},
 };
 
 use omp_ast::block::{EnclosingBoundaryOptions, LineRange, enclosing_block_boundaries};
@@ -50,8 +50,8 @@ pub fn numbered_diff(
 	current: &[u8],
 	path: Option<&Path>,
 ) -> Result<NumberedDiff, Utf8Error> {
-	let base = normalize_to_lf(strip_bom(std::str::from_utf8(base)?).text);
-	let current = normalize_to_lf(strip_bom(std::str::from_utf8(current)?).text);
+	let base = normalize_to_lf(strip_bom(str::from_utf8(base)?).text);
+	let current = normalize_to_lf(strip_bom(str::from_utf8(current)?).text);
 	let base_lines: Vec<&str> = split_addressable_file_lines(&base).collect();
 	let current_lines: Vec<&str> = split_addressable_file_lines(&current).collect();
 	let mut text = StrMut::with_capacity(base.len().saturating_add(current.len()));

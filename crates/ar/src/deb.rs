@@ -1,6 +1,10 @@
 //! Debian binary package composition over Unix ar and inner tar streams.
 
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::{
+	io,
+	io::{Cursor, Read, Seek, SeekFrom, Write},
+	str,
+};
 
 use flate2::read::MultiGzDecoder;
 use omp_core::sf;
@@ -228,7 +232,7 @@ fn first_member_name(bytes: &[u8]) -> Option<String> {
 	{
 		return None;
 	}
-	let raw = std::str::from_utf8(&header[..end]).ok()?;
+	let raw = str::from_utf8(&header[..end]).ok()?;
 	if let Some(length) = raw.strip_prefix("#1/") {
 		let length: usize = length.parse().ok()?;
 		if length == 0 || AR_SIGNATURE.len() + AR_HEADER_SIZE + length > bytes.len() {
@@ -259,7 +263,7 @@ fn read_exact_at(
 	}
 	source.seek(SeekFrom::Start(offset))?;
 	source.read_exact(bytes).map_err(|error| {
-		if error.kind() == std::io::ErrorKind::UnexpectedEof {
+		if error.kind() == io::ErrorKind::UnexpectedEof {
 			Error::InvalidArchive(message)
 		} else {
 			error.into()

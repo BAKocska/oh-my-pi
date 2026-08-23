@@ -5,7 +5,7 @@ use std::{io, path::Path};
 
 pub use omp_env::windows::OwnerPipeListener;
 use thiserror::Error;
-use tokio::net::windows::named_pipe::NamedPipeClient;
+use tokio::{net::windows::named_pipe::NamedPipeClient, sync::watch, task, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -24,7 +24,7 @@ pub enum WindowsTransportError {
 	Connection(#[from] ConnectionError),
 	/// A spawned connection task failed.
 	#[error(transparent)]
-	Task(#[from] tokio::task::JoinError),
+	Task(#[from] task::JoinError),
 }
 
 /// Connects to a ready, current-user-only document authority pipe.
@@ -49,9 +49,9 @@ pub async fn serve_owner_pipe(
 	mut listener: OwnerPipeListener,
 	config: ConnectionConfig,
 	shutdown: CancellationToken,
-	connection_gauge: Option<tokio::sync::watch::Sender<usize>>,
+	connection_gauge: Option<watch::Sender<usize>>,
 ) -> Result<(), WindowsTransportError> {
-	let mut connections = tokio::task::JoinSet::new();
+	let mut connections = JoinSet::new();
 	if let Some(gauge) = &connection_gauge {
 		gauge.send_replace(0);
 	}
@@ -104,7 +104,7 @@ pub async fn bind_and_serve_owner_pipe(
 	endpoint: impl AsRef<Path>,
 	config: ConnectionConfig,
 	shutdown: CancellationToken,
-	connection_gauge: Option<tokio::sync::watch::Sender<usize>>,
+	connection_gauge: Option<watch::Sender<usize>>,
 ) -> Result<(), WindowsTransportError> {
 	let listener = OwnerPipeListener::bind(endpoint)?;
 	serve_owner_pipe(environment, listener, config, shutdown, connection_gauge).await
@@ -114,7 +114,7 @@ pub async fn bind_and_serve_owner_pipe(
 mod tests {
 	use super::*;
 
-	fn assert_stream_capabilities<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>() {}
+	fn assert_stream_capabilities<T: AsyncRead + AsyncWrite + Unpin>() {}
 
 	#[test]
 	fn named_pipe_client_is_a_document_transport_stream() {
@@ -123,7 +123,7 @@ mod tests {
 
 	#[test]
 	fn listener_type_is_shared_with_environment_data_transport() {
-		fn same_type(_: Option<OwnerPipeListener>) -> Option<omp_env::windows::OwnerPipeListener> {
+		fn same_type(_: Option<OwnerPipeListener>) -> Option<OwnerPipeListener> {
 			None
 		}
 		let _ = same_type(None);

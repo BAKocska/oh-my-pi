@@ -2,8 +2,11 @@
 //! snapshots.
 use std::{
 	collections::HashSet,
-	fmt,
+	error,
+	fmt::{self, Display},
+	fs, io,
 	path::{Path, PathBuf},
+	str,
 	sync::Arc,
 	time::{SystemTime, UNIX_EPOCH},
 };
@@ -27,63 +30,92 @@ const MAX_FILES: usize = 200;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
+/// One ordered ast-grep pattern and replacement-template pair.
 pub struct RewriteOp {
 	#[schemars(with = "String")]
+	/// Structural AST pattern whose metavariables may be reused by the
+	/// replacement.
 	pub pat: Str,
 	#[schemars(with = "String")]
+	/// Replacement template substituted for every match of `pat`.
 	pub out: Str,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Agent-supplied structural rewrite proposal.
 pub struct Params {
+	/// Required non-empty operations applied in order to every compatible
+	/// target.
 	pub ops:   Vec<RewriteOp>,
 	#[schemars(with = "Vec<String>")]
+	/// Required workspace-relative files, directories, or globs selecting at
+	/// most 200 files.
 	pub paths: Vec<Str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Per-file change summary for a staged proposal or finalized application.
 pub struct ChangedFile {
+	/// Workspace-relative path that the proposal would change or has changed.
 	pub path:         Str,
+	/// Number of structural matches replaced in this file.
 	pub replacements: u32,
+	/// Twelve-hex-character prefix of the original content's BLAKE3 digest.
 	pub before_hash:  Str,
+	/// Twelve-hex-character prefix of the proposed content's BLAKE3 digest.
 	pub after_hash:   Str,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Non-fatal reason a targeted file was omitted from the proposal.
 pub struct Advisory {
+	/// Workspace-relative path of the skipped target.
 	pub path:    Str,
+	/// Language-resolution, rule-compilation, or encoding explanation.
 	pub message: Str,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Structural-rewrite result before or after preview finalization.
 pub struct Payload {
+	/// Proposed files while staged, or files written after `resolve` applies the
+	/// proposal.
 	pub files:           Vec<ChangedFile>,
+	/// Per-file skips encountered while constructing the staged proposal.
 	pub advisories:      Vec<Advisory>,
+	/// Recovery-snapshot directory created on apply; `None` while the proposal
+	/// is staged.
 	pub recovery_root:   Option<Str>,
 	/// Uncommitted proposal identity requiring resolve or reject.
 	pub pending_preview: Option<Str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Empty update type because structural rewrites emit only a terminal staged
+/// result.
 pub enum Update {}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Terminal validation, target-discovery, staging, or rewrite failure.
 pub struct Fault {
 	message: Str,
 }
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.message)
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
+/// Workspace-scoped structural-rewrite tool exposed as `ast_edit`.
 pub struct AstEdit {
 	root:     PathBuf,
 	spec:     ToolSpec,
 	previews: PreviewRegistry,
 }
 
+/// Builds an `ast_edit` tool that stages proposals in `previews` for later
+/// resolve or reject.
 pub fn tool(root: PathBuf, previews: PreviewRegistry) -> AstEdit {
 	AstEdit {
 		root,
@@ -162,8 +194,8 @@ impl Tool for AstEdit {
 				let language = match omp_ast::ops::resolve_language(None, &absolute) { Ok(v) => v, Err(e) => { advisories.push(Advisory { path: file.relative_path, message: Str::new(e.to_string()) }); continue; } };
 				let rules_input = params.ops.iter().map(|op| (op.pat.to_string(), op.out.to_string())).collect::<Vec<_>>();
 				let rules = match omp_ast::ops::compile_rewrite_rules(&rules_input, language) { Ok(v) => v, Err((index, e)) => { advisories.push(Advisory { path: file.relative_path, message: sf!("operation {} does not parse for this language: {}", index + 1, e) }); continue; } };
-				let original = match std::fs::read(&absolute) { Ok(v) => v, Err(e) => { yield done(Err(Fault { message: Str::new(e.to_string()) })); return; } };
-				let source = match std::str::from_utf8(&original) { Ok(v) => v, Err(_) => { advisories.push(Advisory { path: file.relative_path, message: sf!("non-UTF-8 file skipped") }); continue; } };
+				let original = match fs::read(&absolute) { Ok(v) => v, Err(e) => { yield done(Err(Fault { message: Str::new(e.to_string()) })); return; } };
+				let source = match str::from_utf8(&original) { Ok(v) => v, Err(_) => { advisories.push(Advisory { path: file.relative_path, message: sf!("non-UTF-8 file skipped") }); continue; } };
 				let (updated, replacements) = match omp_ast::ops::rewrite_source(source, language, &rules) { Ok(v) => v, Err(e) => { yield done(Err(Fault { message: Str::new(e.to_string()) })); return; } };
 				if replacements != 0 { prepared.push(Prepared { absolute, relative: file.relative_path, before: *Hash32::sum(&original).as_bytes(), after: *Hash32::sum(updated.as_bytes()).as_bytes(), original, updated, replacements }); }
 			}
@@ -218,13 +250,13 @@ impl Tool for AstEdit {
 	}
 }
 
-fn snapshot_all(root: &Path, prepared: &[Prepared]) -> std::io::Result<()> {
+fn snapshot_all(root: &Path, prepared: &[Prepared]) -> io::Result<()> {
 	for item in prepared {
 		let target = root.join(item.relative.as_str());
 		if let Some(parent) = target.parent() {
-			std::fs::create_dir_all(parent)?;
+			fs::create_dir_all(parent)?;
 		}
-		std::fs::write(target, &item.original)?;
+		fs::write(target, &item.original)?;
 	}
 	Ok(())
 }
@@ -250,7 +282,7 @@ impl StagedAction for AstEditAction {
 impl AstEditAction {
 	fn apply(&mut self) -> Result<serde_json::Value, PreviewActionError> {
 		for item in &self.prepared {
-			let current = std::fs::read(&item.absolute)
+			let current = fs::read(&item.absolute)
 				.map_err(|source| PreviewActionError::Io { path: item.absolute.clone(), source })?;
 			if Hash32::sum(&current).as_bytes() != &item.before {
 				return Err(PreviewActionError::RevisionChanged { path: item.absolute.clone() });
@@ -270,11 +302,11 @@ impl AstEditAction {
 			let temporary = item
 				.absolute
 				.with_extension(format!("omp-ast-edit-{generation}"));
-			let result = std::fs::write(&temporary, item.updated.as_bytes())
-				.and_then(|()| std::fs::rename(&temporary, &item.absolute));
+			let result = fs::write(&temporary, item.updated.as_bytes())
+				.and_then(|()| fs::rename(&temporary, &item.absolute));
 			if let Err(source) = result {
 				for restore in self.prepared[..committed].iter().rev() {
-					let _ = std::fs::write(&restore.absolute, &restore.original);
+					let _ = fs::write(&restore.absolute, &restore.original);
 				}
 				return Err(PreviewActionError::Io { path: item.absolute.clone(), source });
 			}
@@ -302,7 +334,7 @@ fn short_hash(hash: &[u8; 32]) -> Str {
 	use omp_core::encoding::hex;
 	let mut out = [0_u8; 16];
 	let count = hex::encode_mut(hash, &mut out);
-	Str::new(std::str::from_utf8(&out[..count.min(12)]).expect("hex is UTF-8"))
+	Str::new(str::from_utf8(&out[..count.min(12)]).expect("hex is UTF-8"))
 }
 fn fault(message: &'static str) -> Fault {
 	Fault { message: Str::new_static(message) }
@@ -360,7 +392,7 @@ mod tests {
 		let temp = tempfile::tempdir().expect("temporary workspace");
 		let path = temp.path().join("sample.rs");
 		let original = b"fn old() {}\n";
-		std::fs::write(&path, original).expect("seed source");
+		fs::write(&path, original).expect("seed source");
 
 		let mut rejected = action(temp.path(), &path, original, "fn new() {}\n");
 		rejected
@@ -368,7 +400,7 @@ mod tests {
 				reason: Str::new_static("The rewrite is not desired."),
 			}))
 			.expect("proposal rejected");
-		assert_eq!(std::fs::read(&path).expect("source readable"), original);
+		assert_eq!(fs::read(&path).expect("source readable"), original);
 
 		let mut resolved = action(temp.path(), &path, original, "fn new() {}\n");
 		let payload = resolved
@@ -376,7 +408,7 @@ mod tests {
 				reason: Str::new_static("Apply the reviewed rewrite."),
 			})
 			.expect("proposal resolved");
-		assert_eq!(std::fs::read_to_string(&path).expect("source readable"), "fn new() {}\n");
+		assert_eq!(fs::read_to_string(&path).expect("source readable"), "fn new() {}\n");
 		assert_eq!(payload["files"][0]["path"], "sample.rs");
 		assert!(payload["recovery_root"].as_str().is_some());
 	}

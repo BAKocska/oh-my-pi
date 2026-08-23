@@ -1,3 +1,4 @@
+use omp_collab::link::{CollabLink, RelayEndpoint, WebEndpoint};
 use omp_core::Str;
 use omp_driver::{
 	collab::session::{CollabCommandResult, CollabOwnerCommand, HostOptions},
@@ -55,12 +56,10 @@ pub(crate) fn owner_command(
 				let value = value.expect("start options were validated by the command parser");
 				match flag.as_str() {
 					"--relay" => {
-						relay = omp_collab::link::RelayEndpoint::parse(&value)
-							.map_err(|error| miette::miette!(error))?;
+						relay = RelayEndpoint::parse(&value).map_err(|error| miette::miette!(error))?;
 					},
 					"--web-url" => {
-						web = omp_collab::link::WebEndpoint::parse(&value)
-							.map_err(|error| miette::miette!(error))?;
+						web = WebEndpoint::parse(&value).map_err(|error| miette::miette!(error))?;
 					},
 					_ => unreachable!("start options were validated by the command parser"),
 				}
@@ -74,7 +73,7 @@ pub(crate) fn join_command(
 	link: &str,
 	settings: &CollabSettings,
 ) -> miette::Result<CollabOwnerCommand> {
-	let link = omp_collab::link::CollabLink::parse(link).map_err(|error| miette::miette!(error))?;
+	let link = CollabLink::parse(link).map_err(|error| miette::miette!(error))?;
 	Ok(CollabOwnerCommand::Join { link, display_name: settings.resolved_display_name() })
 }
 

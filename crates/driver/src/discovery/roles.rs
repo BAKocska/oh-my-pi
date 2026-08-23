@@ -1,5 +1,7 @@
 //! Durable project-scoped model-role assignments.
 
+use std::env;
+
 use omp_catalog::{
 	ModelKey, ModelRole, SelectionError, select_model, snapshot::Catalog, upsert_role_assignment,
 };
@@ -35,7 +37,7 @@ pub fn resolve_launch_roles(
 	plan: Option<&str>,
 ) -> Result<LaunchRoles, SelectionError> {
 	let resolve_selected = |cli: Option<&str>, variable: &str| {
-		let environment = std::env::var(variable).ok();
+		let environment = env::var(variable).ok();
 		let Some(selector) = cli.or(environment.as_deref()) else {
 			return Ok(None);
 		};

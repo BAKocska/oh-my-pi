@@ -2,7 +2,8 @@
 
 use std::{
 	cmp::Ordering,
-	fmt,
+	error,
+	fmt::{self, Display},
 	hash::{Hash, Hasher},
 	str::FromStr,
 	time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
@@ -199,7 +200,7 @@ pub enum DurationError {
 	PrecisionLoss,
 }
 
-impl fmt::Display for DurationError {
+impl Display for DurationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(match self {
 			Self::InvalidSyntax => "duration must be an integer followed by ns, us, ms, s, m, or h",
@@ -209,7 +210,7 @@ impl fmt::Display for DurationError {
 	}
 }
 
-impl std::error::Error for DurationError {}
+impl error::Error for DurationError {}
 
 /// A non-negative time span that retains the unit in which it was specified.
 ///
@@ -288,7 +289,7 @@ impl FromStr for Duration {
 	}
 }
 
-impl fmt::Display for Duration {
+impl Display for Duration {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}{}", self.value, self.unit)
 	}

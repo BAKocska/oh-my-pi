@@ -28,7 +28,7 @@ use std::{
 	cmp::Ordering,
 	convert::Infallible,
 	ffi::OsStr,
-	fmt,
+	fmt::{self, Display},
 	hash::{Hash, Hasher},
 	io::{self, BufRead},
 	path::{Path, PathBuf},
@@ -158,7 +158,10 @@ pub enum VisitOrder {
 	ContentsFirst,
 }
 
+use std::{error, fs, marker, mem, time};
+
 pub use glob::CompiledWalkGlob;
+use ignore::gitignore::{self, Gitignore};
 
 /// High-level entry filter applied by collection and streaming APIs.
 #[derive(Clone)]
@@ -726,7 +729,7 @@ impl WalkRequest {
 
 	/// Collect owned entries, then apply high-level filters, limits, and
 	/// empty-cache rechecks.
-	pub fn collect(&self) -> std::result::Result<WalkOutcome, WalkError<String>> {
+	pub fn collect(&self) -> Result<WalkOutcome, WalkError<String>> {
 		self.collect_with_heartbeat(|| Ok::<(), Infallible>(()))
 	}
 
@@ -734,10 +737,10 @@ impl WalkRequest {
 	pub fn collect_with_heartbeat<E, H>(
 		&self,
 		heartbeat: H,
-	) -> std::result::Result<WalkOutcome, WalkError<String>>
+	) -> Result<WalkOutcome, WalkError<String>>
 	where
-		H: Fn() -> std::result::Result<(), E> + Sync,
-		E: fmt::Display,
+		H: Fn() -> Result<(), E> + Sync,
+		E: Display,
 	{
 		self.collect_with_rank_and_limit(None, self.limit, heartbeat)
 	}
@@ -751,7 +754,7 @@ impl WalkRequest {
 		&self,
 		rank: WalkRank,
 		limit: usize,
-	) -> std::result::Result<WalkOutcome, WalkError<String>> {
+	) -> Result<WalkOutcome, WalkError<String>> {
 		self.collect_ranked_with_heartbeat(rank, limit, || Ok::<(), Infallible>(()))
 	}
 
@@ -766,16 +769,16 @@ impl WalkRequest {
 		rank: WalkRank,
 		limit: usize,
 		heartbeat: H,
-	) -> std::result::Result<WalkOutcome, WalkError<String>>
+	) -> Result<WalkOutcome, WalkError<String>>
 	where
-		H: Fn() -> std::result::Result<(), E> + Sync,
-		E: fmt::Display,
+		H: Fn() -> Result<(), E> + Sync,
+		E: Display,
 	{
 		self.collect_with_rank_and_limit(Some(rank), Some(limit), heartbeat)
 	}
 
 	/// Collect regular files accepted by this request.
-	pub fn collect_files(&self) -> std::result::Result<Vec<CollectedEntry>, WalkError<String>> {
+	pub fn collect_files(&self) -> Result<Vec<CollectedEntry>, WalkError<String>> {
 		self.collect_files_with_heartbeat(|| Ok::<(), Infallible>(()))
 	}
 
@@ -784,10 +787,10 @@ impl WalkRequest {
 	pub fn collect_files_with_heartbeat<E, H>(
 		&self,
 		heartbeat: H,
-	) -> std::result::Result<Vec<CollectedEntry>, WalkError<String>>
+	) -> Result<Vec<CollectedEntry>, WalkError<String>>
 	where
-		H: Fn() -> std::result::Result<(), E> + Sync,
-		E: fmt::Display,
+		H: Fn() -> Result<(), E> + Sync,
+		E: Display,
 	{
 		let mut outcome = self.collect_with_heartbeat(heartbeat)?;
 		outcome.entries.retain(CollectedEntry::is_file);
@@ -795,7 +798,7 @@ impl WalkRequest {
 	}
 
 	/// Collect directories accepted by this request.
-	pub fn collect_dirs(&self) -> std::result::Result<Vec<CollectedEntry>, WalkError<String>> {
+	pub fn collect_dirs(&self) -> Result<Vec<CollectedEntry>, WalkError<String>> {
 		self.collect_dirs_with_heartbeat(|| Ok::<(), Infallible>(()))
 	}
 
@@ -804,10 +807,10 @@ impl WalkRequest {
 	pub fn collect_dirs_with_heartbeat<E, H>(
 		&self,
 		heartbeat: H,
-	) -> std::result::Result<Vec<CollectedEntry>, WalkError<String>>
+	) -> Result<Vec<CollectedEntry>, WalkError<String>>
 	where
-		H: Fn() -> std::result::Result<(), E> + Sync,
-		E: fmt::Display,
+		H: Fn() -> Result<(), E> + Sync,
+		E: Display,
 	{
 		let mut outcome = self.collect_with_heartbeat(heartbeat)?;
 		outcome.entries.retain(CollectedEntry::is_dir);
@@ -815,9 +818,7 @@ impl WalkRequest {
 	}
 
 	/// Collect regular-file candidates accepted by this request.
-	pub fn collect_file_candidates(
-		&self,
-	) -> std::result::Result<Vec<FileCandidate>, WalkError<String>> {
+	pub fn collect_file_candidates(&self) -> Result<Vec<FileCandidate>, WalkError<String>> {
 		self.collect_file_candidates_with_heartbeat(|| Ok::<(), Infallible>(()))
 	}
 
@@ -826,10 +827,10 @@ impl WalkRequest {
 	pub fn collect_file_candidates_with_heartbeat<E, H>(
 		&self,
 		heartbeat: H,
-	) -> std::result::Result<Vec<FileCandidate>, WalkError<String>>
+	) -> Result<Vec<FileCandidate>, WalkError<String>>
 	where
-		H: Fn() -> std::result::Result<(), E> + Sync,
-		E: fmt::Display,
+		H: Fn() -> Result<(), E> + Sync,
+		E: Display,
 	{
 		Ok(self
 			.collect_file_candidates_with_stats_with_heartbeat(heartbeat)?
@@ -838,7 +839,7 @@ impl WalkRequest {
 
 	/// Stream entries through `visitor` after applying high-level filters and
 	/// limits.
-	pub fn stream<V>(&self, visitor: &mut V) -> std::result::Result<WalkStatus, WalkError<V::Error>>
+	pub fn stream<V>(&self, visitor: &mut V) -> Result<WalkStatus, WalkError<V::Error>>
 	where
 		V: EntryVisitor,
 	{
@@ -850,10 +851,10 @@ impl WalkRequest {
 		&self,
 		visitor: &mut V,
 		heartbeat: H,
-	) -> std::result::Result<WalkStatus, WalkError<V::Error>>
+	) -> Result<WalkStatus, WalkError<V::Error>>
 	where
 		V: EntryVisitor,
-		H: FnMut() -> std::result::Result<(), V::Error>,
+		H: FnMut() -> Result<(), V::Error>,
 	{
 		self.stream_with_predicate_and_heartbeat(visitor, IncludeAllPredicate, heartbeat)
 	}
@@ -874,9 +875,9 @@ impl WalkRequest {
 	/// [`WalkOptions::directory_errors`] is [`DirectoryErrorMode::Visit`]. Use
 	/// [`WalkRequest::for_each_entry_with_heartbeat`] to observe those errors or
 	/// provide a heartbeat.
-	pub fn for_each_entry<E, V>(&self, visit: V) -> std::result::Result<WalkStatus, WalkError<E>>
+	pub fn for_each_entry<E, V>(&self, visit: V) -> Result<WalkStatus, WalkError<E>>
 	where
-		V: for<'entry> FnMut(EntryMeta<'entry>) -> std::result::Result<WalkDecision, E>,
+		V: for<'entry> FnMut(EntryMeta<'entry>) -> Result<WalkDecision, E>,
 	{
 		self.for_each_entry_with_heartbeat(
 			|| Ok::<(), E>(()),
@@ -903,11 +904,11 @@ impl WalkRequest {
 		heartbeat: H,
 		visit: V,
 		directory_error: D,
-	) -> std::result::Result<WalkStatus, WalkError<E>>
+	) -> Result<WalkStatus, WalkError<E>>
 	where
-		H: FnMut() -> std::result::Result<(), E>,
-		V: for<'entry> FnMut(EntryMeta<'entry>) -> std::result::Result<WalkDecision, E>,
-		D: for<'error> FnMut(DirectoryError<'error>) -> std::result::Result<WalkDecision, E>,
+		H: FnMut() -> Result<(), E>,
+		V: for<'entry> FnMut(EntryMeta<'entry>) -> Result<WalkDecision, E>,
+		D: for<'error> FnMut(DirectoryError<'error>) -> Result<WalkDecision, E>,
 	{
 		let mut visitor = ClosureEntryVisitor { root: &self.root, visit, directory_error };
 		self.stream_with_heartbeat(&mut visitor, heartbeat)
@@ -918,7 +919,7 @@ impl WalkRequest {
 		&self,
 		visitor: &mut V,
 		predicate: P,
-	) -> std::result::Result<WalkStatus, WalkError<V::Error>>
+	) -> Result<WalkStatus, WalkError<V::Error>>
 	where
 		V: EntryVisitor,
 		P: WalkPredicate,
@@ -933,11 +934,11 @@ impl WalkRequest {
 		visitor: &mut V,
 		predicate: P,
 		mut heartbeat: H,
-	) -> std::result::Result<WalkStatus, WalkError<V::Error>>
+	) -> Result<WalkStatus, WalkError<V::Error>>
 	where
 		V: EntryVisitor,
 		P: WalkPredicate,
-		H: FnMut() -> std::result::Result<(), V::Error>,
+		H: FnMut() -> Result<(), V::Error>,
 	{
 		let options = self.effective_options();
 		let mut adapter = RequestVisitor {
@@ -954,10 +955,10 @@ impl WalkRequest {
 	/// Run `operation` for each accepted regular file.
 	pub fn for_each_file<E>(
 		&self,
-		operation: impl Fn(&Path) -> std::result::Result<(), E> + Send + Sync,
-	) -> std::result::Result<WalkStats, WalkError<String>>
+		operation: impl Fn(&Path) -> Result<(), E> + Send + Sync,
+	) -> Result<WalkStats, WalkError<String>>
 	where
-		E: fmt::Display + Send,
+		E: Display + Send,
 	{
 		self.for_each_file_with_heartbeat(operation, || Ok::<(), Infallible>(()))
 	}
@@ -966,13 +967,13 @@ impl WalkRequest {
 	/// heartbeat.
 	pub fn for_each_file_with_heartbeat<E, HE, H>(
 		&self,
-		operation: impl Fn(&Path) -> std::result::Result<(), E> + Send + Sync,
+		operation: impl Fn(&Path) -> Result<(), E> + Send + Sync,
 		heartbeat: H,
-	) -> std::result::Result<WalkStats, WalkError<String>>
+	) -> Result<WalkStats, WalkError<String>>
 	where
-		E: fmt::Display + Send,
-		H: Fn() -> std::result::Result<(), HE> + Sync,
-		HE: fmt::Display,
+		E: Display + Send,
+		H: Fn() -> Result<(), HE> + Sync,
+		HE: Display,
 	{
 		self.for_each_file_candidate_with_heartbeat(|candidate| operation(candidate.path), heartbeat)
 	}
@@ -983,12 +984,10 @@ impl WalkRequest {
 	/// valid only for the duration of the callback.
 	pub fn for_each_file_candidate<E>(
 		&self,
-		operation: impl for<'candidate> Fn(FileCandidateRef<'candidate>) -> std::result::Result<(), E>
-		+ Send
-		+ Sync,
-	) -> std::result::Result<WalkStats, WalkError<String>>
+		operation: impl for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<(), E> + Send + Sync,
+	) -> Result<WalkStats, WalkError<String>>
 	where
-		E: fmt::Display + Send,
+		E: Display + Send,
 	{
 		self.for_each_file_candidate_with_heartbeat(operation, || Ok::<(), Infallible>(()))
 	}
@@ -1000,15 +999,13 @@ impl WalkRequest {
 	/// valid only for the duration of the callback.
 	pub fn for_each_file_candidate_with_heartbeat<E, HE, H>(
 		&self,
-		operation: impl for<'candidate> Fn(FileCandidateRef<'candidate>) -> std::result::Result<(), E>
-		+ Send
-		+ Sync,
+		operation: impl for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<(), E> + Send + Sync,
 		heartbeat: H,
-	) -> std::result::Result<WalkStats, WalkError<String>>
+	) -> Result<WalkStats, WalkError<String>>
 	where
-		E: fmt::Display + Send,
-		H: Fn() -> std::result::Result<(), HE> + Sync,
-		HE: fmt::Display,
+		E: Display + Send,
+		H: Fn() -> Result<(), HE> + Sync,
+		HE: Display,
 	{
 		let mut outcome = self.collect_with_heartbeat(heartbeat)?;
 		outcome.entries.retain(CollectedEntry::is_file);
@@ -1046,13 +1043,11 @@ impl WalkRequest {
 	/// error wins and is returned as [`WalkError::Interrupted`].
 	pub fn for_each_file_candidate_parallel<E>(
 		&self,
-		sink: impl for<'candidate> Fn(
-			FileCandidateRef<'candidate>,
-		) -> std::result::Result<ParallelWalkControl, E>
+		sink: impl for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<ParallelWalkControl, E>
 		+ Send
 		+ Sync,
-		heartbeat: impl Fn() -> std::result::Result<(), E> + Send + Sync,
-	) -> std::result::Result<WalkStatus, WalkError<E>>
+		heartbeat: impl Fn() -> Result<(), E> + Send + Sync,
+	) -> Result<WalkStatus, WalkError<E>>
 	where
 		E: Send,
 	{
@@ -1064,10 +1059,10 @@ impl WalkRequest {
 		rank: Option<WalkRank>,
 		limit: Option<usize>,
 		heartbeat: H,
-	) -> std::result::Result<WalkOutcome, WalkError<String>>
+	) -> Result<WalkOutcome, WalkError<String>>
 	where
-		H: Fn() -> std::result::Result<(), E> + Sync,
-		E: fmt::Display,
+		H: Fn() -> Result<(), E> + Sync,
+		E: Display,
 	{
 		let mut options = self.effective_options();
 		if matches!(rank, Some(WalkRank::MtimeDescPathAsc)) {
@@ -1153,10 +1148,10 @@ impl WalkRequest {
 		&self,
 		options: WalkOptions,
 		heartbeat: &H,
-	) -> std::result::Result<CollectedEntries, WalkError<String>>
+	) -> Result<CollectedEntries, WalkError<String>>
 	where
-		H: Fn() -> std::result::Result<(), E> + Sync,
-		E: fmt::Display,
+		H: Fn() -> Result<(), E> + Sync,
+		E: Display,
 	{
 		collect_entries(&self.root, options, heartbeat)
 	}
@@ -1178,10 +1173,10 @@ impl WalkRequest {
 	fn collect_file_candidates_with_stats_with_heartbeat<E, H>(
 		&self,
 		heartbeat: H,
-	) -> std::result::Result<(Vec<FileCandidate>, WalkStats), WalkError<String>>
+	) -> Result<(Vec<FileCandidate>, WalkStats), WalkError<String>>
 	where
-		H: Fn() -> std::result::Result<(), E> + Sync,
-		E: fmt::Display,
+		H: Fn() -> Result<(), E> + Sync,
+		E: Display,
 	{
 		let outcome = self.collect_with_heartbeat(heartbeat)?;
 		let candidates = outcome
@@ -1197,8 +1192,8 @@ impl WalkRequest {
 /// Execute work for regular-file candidates using the centralized walker pool.
 pub fn execute_candidates<E>(
 	candidates: &[FileCandidate],
-	operation: impl Fn(&FileCandidate) -> std::result::Result<(), E> + Send + Sync,
-) -> std::result::Result<(), E>
+	operation: impl Fn(&FileCandidate) -> Result<(), E> + Send + Sync,
+) -> Result<(), E>
 where
 	E: Send,
 {
@@ -1209,8 +1204,8 @@ where
 pub fn execute_candidates_init<S, E>(
 	candidates: &[FileCandidate],
 	init: impl Fn() -> S + Send + Sync,
-	operation: impl Fn(&mut S, &FileCandidate) -> std::result::Result<(), E> + Send + Sync,
-) -> std::result::Result<(), E>
+	operation: impl Fn(&mut S, &FileCandidate) -> Result<(), E> + Send + Sync,
+) -> Result<(), E>
 where
 	S: Send,
 	E: Send,
@@ -1225,21 +1220,15 @@ struct SerialCandidateVisitor<'a, S> {
 
 impl<E, S> EntryVisitor for SerialCandidateVisitor<'_, S>
 where
-	S: for<'candidate> Fn(
-			FileCandidateRef<'candidate>,
-		) -> std::result::Result<ParallelWalkControl, E>
-		+ Sync,
+	S: for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<ParallelWalkControl, E> + Sync,
 {
 	type Error = E;
 
-	fn visit(&mut self, _entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error> {
+	fn visit(&mut self, _entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 		Ok(WalkControl::Continue)
 	}
 
-	fn visit_pre_decided(
-		&mut self,
-		entry: Entry<'_>,
-	) -> std::result::Result<WalkControl, Self::Error> {
+	fn visit_pre_decided(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 		if entry.file_type != FileType::File {
 			return Ok(WalkControl::Continue);
 		}
@@ -1258,7 +1247,7 @@ where
 	fn decide_pre_descend(
 		&mut self,
 		meta: &EntryMeta<'_>,
-	) -> std::result::Result<PreDescendDecision, Self::Error> {
+	) -> Result<PreDescendDecision, Self::Error> {
 		let is_dir = meta.file_type == FileType::Dir;
 		Ok(match self.filter.stream_decision(meta) {
 			WalkDecision::Include => {
@@ -1328,14 +1317,11 @@ fn run_file_candidate_parallel<E, S, H>(
 	request: &WalkRequest,
 	sink: &S,
 	heartbeat: &H,
-) -> std::result::Result<WalkStatus, WalkError<E>>
+) -> Result<WalkStatus, WalkError<E>>
 where
 	E: Send,
-	S: for<'candidate> Fn(
-			FileCandidateRef<'candidate>,
-		) -> std::result::Result<ParallelWalkControl, E>
-		+ Sync,
-	H: Fn() -> std::result::Result<(), E> + Sync,
+	S: for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<ParallelWalkControl, E> + Sync,
+	H: Fn() -> Result<(), E> + Sync,
 {
 	let mut options = request.effective_options();
 	if options.min_depth > options.max_depth {
@@ -1396,13 +1382,10 @@ fn run_file_candidate_serial<E, S, H>(
 	mut options: WalkOptions,
 	sink: &S,
 	heartbeat: &H,
-) -> std::result::Result<WalkStatus, WalkError<E>>
+) -> Result<WalkStatus, WalkError<E>>
 where
-	S: for<'candidate> Fn(
-			FileCandidateRef<'candidate>,
-		) -> std::result::Result<ParallelWalkControl, E>
-		+ Sync,
-	H: Fn() -> std::result::Result<(), E> + Sync,
+	S: for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<ParallelWalkControl, E> + Sync,
+	H: Fn() -> Result<(), E> + Sync,
 {
 	options.cache = false;
 	options.order = WalkOrder::Unordered;
@@ -1419,11 +1402,8 @@ fn emit_parallel_root_file<E, S, H>(
 	root_entry: &RootEntry,
 ) where
 	E: Send,
-	S: for<'candidate> Fn(
-			FileCandidateRef<'candidate>,
-		) -> std::result::Result<ParallelWalkControl, E>
-		+ Sync,
-	H: Fn() -> std::result::Result<(), E> + Sync,
+	S: for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<ParallelWalkControl, E> + Sync,
+	H: Fn() -> Result<(), E> + Sync,
 {
 	let meta = EntryMeta {
 		root:          &context.root,
@@ -1465,7 +1445,7 @@ fn recycle_parallel_scratch(mut scratch: DirScratch) {
 fn parallel_heartbeat<E, S, H>(shared: &ParallelWalkShared<'_, E, S, H>) -> bool
 where
 	E: Send,
-	H: Fn() -> std::result::Result<(), E> + Sync,
+	H: Fn() -> Result<(), E> + Sync,
 {
 	if shared.should_stop() {
 		return false;
@@ -1498,10 +1478,7 @@ fn emit_parallel_candidate<E, S, H>(
 ) -> bool
 where
 	E: Send,
-	S: for<'candidate> Fn(
-			FileCandidateRef<'candidate>,
-		) -> std::result::Result<ParallelWalkControl, E>
-		+ Sync,
+	S: for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<ParallelWalkControl, E> + Sync,
 {
 	match (shared.sink)(candidate) {
 		Ok(ParallelWalkControl::Continue) => true,
@@ -1527,12 +1504,10 @@ fn walk_parallel_dir<'scope, E, S, H>(
 	derive_ignore_from_entries: bool,
 ) where
 	E: Send + 'scope,
-	S: for<'candidate> Fn(
-			FileCandidateRef<'candidate>,
-		) -> std::result::Result<ParallelWalkControl, E>
+	S: for<'candidate> Fn(FileCandidateRef<'candidate>) -> Result<ParallelWalkControl, E>
 		+ Sync
 		+ 'scope,
-	H: Fn() -> std::result::Result<(), E> + Sync + 'scope,
+	H: Fn() -> Result<(), E> + Sync + 'scope,
 {
 	if shared.should_stop() {
 		return;
@@ -1857,7 +1832,7 @@ fn is_effective_path_on_root_file_system(
 	depth: usize,
 	follow_links: FollowLinks,
 	root_device: Option<u64>,
-	followed_metadata: Option<&std::fs::Metadata>,
+	followed_metadata: Option<&fs::Metadata>,
 ) -> bool {
 	use std::os::unix::fs::MetadataExt;
 
@@ -1877,17 +1852,17 @@ fn is_effective_path_on_root_file_system(
 	_depth: usize,
 	_follow_links: FollowLinks,
 	_root_device: Option<u64>,
-	_followed_metadata: Option<&std::fs::Metadata>,
+	_followed_metadata: Option<&fs::Metadata>,
 ) -> bool {
 	true
 }
 
 #[cfg(unix)]
-fn metadata_for_follow_policy(path: &Path, follow: bool) -> io::Result<std::fs::Metadata> {
+fn metadata_for_follow_policy(path: &Path, follow: bool) -> io::Result<fs::Metadata> {
 	if follow {
-		std::fs::metadata(path)
+		fs::metadata(path)
 	} else {
-		std::fs::symlink_metadata(path)
+		fs::symlink_metadata(path)
 	}
 }
 
@@ -1943,7 +1918,7 @@ enum DirectoryIdentity {
 	#[cfg(unix)]
 	Unix { dev: u64, ino: u64 },
 	#[cfg(not(unix))]
-	Generic(std::path::PathBuf),
+	Generic(PathBuf),
 }
 
 #[derive(Default)]
@@ -1969,12 +1944,12 @@ fn directory_identity(path: &Path) -> io::Result<DirectoryIdentity> {
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::MetadataExt;
-		let metadata = std::fs::metadata(path)?;
+		let metadata = fs::metadata(path)?;
 		Ok(DirectoryIdentity::Unix { dev: metadata.dev(), ino: metadata.ino() })
 	}
 	#[cfg(not(unix))]
 	{
-		let canonical = std::fs::canonicalize(path)?;
+		let canonical = fs::canonicalize(path)?;
 		Ok(DirectoryIdentity::Generic(canonical))
 	}
 }
@@ -1985,13 +1960,13 @@ pub trait EntryVisitor {
 	type Error;
 
 	/// Visit one filesystem entry and choose how traversal continues.
-	fn visit(&mut self, entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error>;
+	fn visit(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error>;
 
 	/// Handle a directory-open error and choose whether traversal continues.
 	fn visit_directory_error(
 		&mut self,
 		_error: DirectoryError<'_>,
-	) -> std::result::Result<WalkControl, Self::Error> {
+	) -> Result<WalkControl, Self::Error> {
 		Ok(WalkControl::Continue)
 	}
 
@@ -1999,15 +1974,12 @@ pub trait EntryVisitor {
 	fn decide_pre_descend(
 		&mut self,
 		_meta: &EntryMeta<'_>,
-	) -> std::result::Result<PreDescendDecision, Self::Error> {
+	) -> Result<PreDescendDecision, Self::Error> {
 		Ok(PreDescendDecision { emit: true, descend: true, stop: false })
 	}
 
 	/// Visit an entry whose filter/predicate decisions have already been made.
-	fn visit_pre_decided(
-		&mut self,
-		entry: Entry<'_>,
-	) -> std::result::Result<WalkControl, Self::Error> {
+	fn visit_pre_decided(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 		self.visit(entry)
 	}
 }
@@ -2027,7 +1999,7 @@ where
 {
 	type Error = V::Error;
 
-	fn visit(&mut self, entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error> {
+	fn visit(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 		if self.limit.is_some_and(|limit| self.emitted >= limit) {
 			return Ok(WalkControl::Quit);
 		}
@@ -2059,14 +2031,11 @@ where
 	fn visit_directory_error(
 		&mut self,
 		error: DirectoryError<'_>,
-	) -> std::result::Result<WalkControl, Self::Error> {
+	) -> Result<WalkControl, Self::Error> {
 		self.visitor.visit_directory_error(error)
 	}
 
-	fn visit_pre_decided(
-		&mut self,
-		entry: Entry<'_>,
-	) -> std::result::Result<WalkControl, Self::Error> {
+	fn visit_pre_decided(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 		if self.limit.is_some_and(|limit| self.emitted >= limit) {
 			return Ok(WalkControl::Quit);
 		}
@@ -2077,7 +2046,7 @@ where
 	fn decide_pre_descend(
 		&mut self,
 		meta: &EntryMeta<'_>,
-	) -> std::result::Result<PreDescendDecision, Self::Error> {
+	) -> Result<PreDescendDecision, Self::Error> {
 		let is_dir = meta.file_type == FileType::Dir;
 
 		match self.filter.stream_decision(meta) {
@@ -2117,12 +2086,12 @@ struct ClosureEntryVisitor<'a, V, D> {
 
 impl<E, V, D> EntryVisitor for ClosureEntryVisitor<'_, V, D>
 where
-	V: for<'entry> FnMut(EntryMeta<'entry>) -> std::result::Result<WalkDecision, E>,
-	D: for<'error> FnMut(DirectoryError<'error>) -> std::result::Result<WalkDecision, E>,
+	V: for<'entry> FnMut(EntryMeta<'entry>) -> Result<WalkDecision, E>,
+	D: for<'error> FnMut(DirectoryError<'error>) -> Result<WalkDecision, E>,
 {
 	type Error = E;
 
-	fn visit(&mut self, entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error> {
+	fn visit(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 		let meta = EntryMeta {
 			root:          self.root,
 			absolute_path: Cow::Borrowed(entry.path),
@@ -2138,7 +2107,7 @@ where
 	fn visit_directory_error(
 		&mut self,
 		error: DirectoryError<'_>,
-	) -> std::result::Result<WalkControl, Self::Error> {
+	) -> Result<WalkControl, Self::Error> {
 		(self.directory_error)(error).map(walk_decision_to_control)
 	}
 }
@@ -2169,7 +2138,7 @@ fn interrupted<E>(error: E) -> WalkError<E> {
 	WalkError::Interrupted(error)
 }
 
-impl<E: fmt::Display> fmt::Display for WalkError<E> {
+impl<E: Display> Display for WalkError<E> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Interrupted(err) => write!(f, "native directory scan interrupted: {err}"),
@@ -2180,11 +2149,11 @@ impl<E: fmt::Display> fmt::Display for WalkError<E> {
 	}
 }
 
-impl<E> std::error::Error for WalkError<E>
+impl<E> error::Error for WalkError<E>
 where
-	E: std::error::Error + 'static,
+	E: error::Error + 'static,
 {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		match self {
 			Self::Interrupted(err) => Some(err),
 			Self::InvalidData { .. } => None,
@@ -2194,19 +2163,19 @@ where
 
 struct CollectVisitor<E> {
 	entries: Vec<CollectedEntry>,
-	_error:  std::marker::PhantomData<fn() -> E>,
+	_error:  marker::PhantomData<fn() -> E>,
 }
 
 impl<E> CollectVisitor<E> {
 	const fn new() -> Self {
-		Self { entries: Vec::new(), _error: std::marker::PhantomData }
+		Self { entries: Vec::new(), _error: marker::PhantomData }
 	}
 }
 
 impl<E> EntryVisitor for CollectVisitor<E> {
 	type Error = E;
 
-	fn visit(&mut self, entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error> {
+	fn visit(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 		self.entries.push(CollectedEntry {
 			path:      entry.relative.to_string(),
 			file_type: entry.file_type,
@@ -2334,7 +2303,7 @@ impl<E> From<io::Error> for ReadDirError<E> {
 	}
 }
 
-fn file_type_from_metadata(metadata: &std::fs::Metadata) -> Option<FileType> {
+fn file_type_from_metadata(metadata: &fs::Metadata) -> Option<FileType> {
 	let file_type = metadata.file_type();
 	if file_type.is_symlink() {
 		Some(FileType::Symlink)
@@ -2357,12 +2326,12 @@ fn root_entry<E>(
 	root: &Path,
 	detail: WalkDetail,
 	follow_links: FollowLinks,
-) -> std::result::Result<Option<RootEntry>, WalkError<E>> {
+) -> Result<Option<RootEntry>, WalkError<E>> {
 	let metadata = if follow_links.follow_at_depth(0) {
-		match std::fs::metadata(root) {
+		match fs::metadata(root) {
 			Ok(metadata) => metadata,
 			Err(err) if is_missing_metadata_error(&err) => {
-				std::fs::symlink_metadata(root).map_err(|err| WalkError::InvalidData {
+				fs::symlink_metadata(root).map_err(|err| WalkError::InvalidData {
 					path:    root.to_path_buf(),
 					message: err.to_string(),
 				})?
@@ -2375,7 +2344,7 @@ fn root_entry<E>(
 			},
 		}
 	} else {
-		std::fs::symlink_metadata(root).map_err(|err| WalkError::InvalidData {
+		fs::symlink_metadata(root).map_err(|err| WalkError::InvalidData {
 			path:    root.to_path_buf(),
 			message: err.to_string(),
 		})?
@@ -2383,7 +2352,7 @@ fn root_entry<E>(
 	Ok(entry_from_metadata(&metadata, detail))
 }
 
-fn entry_from_metadata(metadata: &std::fs::Metadata, detail: WalkDetail) -> Option<RootEntry> {
+fn entry_from_metadata(metadata: &fs::Metadata, detail: WalkDetail) -> Option<RootEntry> {
 	let file_type = file_type_from_metadata(metadata)?;
 	let size = if detail == WalkDetail::Full && file_type == FileType::File {
 		Some(metadata.len() as f64)
@@ -2394,7 +2363,7 @@ fn entry_from_metadata(metadata: &std::fs::Metadata, detail: WalkDetail) -> Opti
 		metadata
 			.modified()
 			.ok()
-			.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+			.and_then(|time| time.duration_since(time::UNIX_EPOCH).ok())
 			.map(|duration| duration.as_millis() as f64)
 	} else {
 		None
@@ -2403,7 +2372,7 @@ fn entry_from_metadata(metadata: &std::fs::Metadata, detail: WalkDetail) -> Opti
 }
 
 fn is_missing_metadata_error(err: &io::Error) -> bool {
-	matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+	matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
 }
 
 /// Scans entries using the shared cache when [`WalkOptions::cache`] is true.
@@ -2413,10 +2382,10 @@ pub fn collect_entries<E, H>(
 	root: &Path,
 	options: WalkOptions,
 	heartbeat: H,
-) -> std::result::Result<CollectedEntries, WalkError<String>>
+) -> Result<CollectedEntries, WalkError<String>>
 where
-	H: Fn() -> std::result::Result<(), E> + Sync,
-	E: fmt::Display,
+	H: Fn() -> Result<(), E> + Sync,
+	E: Display,
 {
 	cache::collect_entries(root, options, heartbeat)
 }
@@ -2425,9 +2394,9 @@ fn collect_entries_native<E, H>(
 	root: &Path,
 	options: WalkOptions,
 	heartbeat: H,
-) -> std::result::Result<CollectedEntries, WalkError<E>>
+) -> Result<CollectedEntries, WalkError<E>>
 where
-	H: FnMut() -> std::result::Result<(), E>,
+	H: FnMut() -> Result<(), E>,
 {
 	let mut collector = CollectVisitor::new();
 	let _status = walk_entries(root, options, &mut collector, heartbeat)?;
@@ -2445,7 +2414,7 @@ where
 pub fn collect_entries_without_heartbeat(
 	root: &Path,
 	options: WalkOptions,
-) -> std::result::Result<CollectedEntries, WalkError<String>> {
+) -> Result<CollectedEntries, WalkError<String>> {
 	collect_entries(root, options, || Ok::<(), Infallible>(()))
 }
 
@@ -2456,10 +2425,10 @@ pub fn walk_entries<V, H>(
 	options: WalkOptions,
 	visitor: &mut V,
 	heartbeat: H,
-) -> std::result::Result<WalkStatus, WalkError<V::Error>>
+) -> Result<WalkStatus, WalkError<V::Error>>
 where
 	V: EntryVisitor,
-	H: FnMut() -> std::result::Result<(), V::Error>,
+	H: FnMut() -> Result<(), V::Error>,
 {
 	if options.min_depth > options.max_depth {
 		return Ok(WalkStatus::Complete);
@@ -2504,10 +2473,10 @@ impl<H> WalkContext<'_, H> {
 		root: &Path,
 		root_ignore: &Arc<IgnoreState>,
 		visitor: &mut V,
-	) -> std::result::Result<WalkStatus, WalkError<V::Error>>
+	) -> Result<WalkStatus, WalkError<V::Error>>
 	where
 		V: EntryVisitor,
-		H: FnMut() -> std::result::Result<(), V::Error>,
+		H: FnMut() -> Result<(), V::Error>,
 	{
 		let root_entry = root_entry(root, self.options.detail, self.options.follow_links)?;
 		let Some(root_entry) = root_entry else {
@@ -2627,10 +2596,10 @@ impl<H> WalkContext<'_, H> {
 		ignore_state: &Arc<IgnoreState>,
 		derive_ignore_from_entries: bool,
 		visitor: &mut V,
-	) -> std::result::Result<bool, WalkError<V::Error>>
+	) -> Result<bool, WalkError<V::Error>>
 	where
 		V: EntryVisitor,
-		H: FnMut() -> std::result::Result<(), V::Error>,
+		H: FnMut() -> Result<(), V::Error>,
 	{
 		if self.options.follow_links == FollowLinks::Always
 			&& let Ok(identity) = directory_identity(&self.absolute_path)
@@ -2650,10 +2619,10 @@ impl<H> WalkContext<'_, H> {
 		ignore_state: &Arc<IgnoreState>,
 		derive_ignore_from_entries: bool,
 		visitor: &mut V,
-	) -> std::result::Result<bool, WalkError<V::Error>>
+	) -> Result<bool, WalkError<V::Error>>
 	where
 		V: EntryVisitor,
-		H: FnMut() -> std::result::Result<(), V::Error>,
+		H: FnMut() -> Result<(), V::Error>,
 	{
 		let mut scratch = self.take_scratch();
 		let ignore_entries = match collect_directory_entries(
@@ -2750,10 +2719,10 @@ impl<H> WalkContext<'_, H> {
 		next_depth: usize,
 		dir_ignore: &Arc<IgnoreState>,
 		visitor: &mut V,
-	) -> std::result::Result<bool, WalkError<V::Error>>
+	) -> Result<bool, WalkError<V::Error>>
 	where
 		V: EntryVisitor,
-		H: FnMut() -> std::result::Result<(), V::Error>,
+		H: FnMut() -> Result<(), V::Error>,
 	{
 		let mut file_type = entry_file_type;
 		let mut mtime = entry_mtime;
@@ -2764,7 +2733,7 @@ impl<H> WalkContext<'_, H> {
 		let followed_metadata = if entry_file_type == FileType::Symlink
 			&& self.options.follow_links == FollowLinks::Always
 		{
-			match std::fs::metadata(&self.absolute_path) {
+			match fs::metadata(&self.absolute_path) {
 				Ok(metadata) => Some(metadata),
 				Err(err) => {
 					if self.options.directory_errors == DirectoryErrorMode::SkipSkippable
@@ -2818,7 +2787,7 @@ impl<H> WalkContext<'_, H> {
 				mtime = target_metadata
 					.modified()
 					.ok()
-					.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+					.and_then(|time| time.duration_since(time::UNIX_EPOCH).ok())
 					.map(|duration| duration.as_millis() as f64);
 			}
 		}
@@ -2968,11 +2937,11 @@ fn collect_directory_entries<E>(
 	scratch: &mut DirScratch,
 	matcher: &FastIgnore,
 	derive_ignore_from_entries: bool,
-) -> std::result::Result<IgnoreEntryNames, ReadDirError<E>> {
+) -> Result<IgnoreEntryNames, ReadDirError<E>> {
 	scratch.clear_listing();
 	let mut ignore_entries = IgnoreEntryNames::default();
 	let track_ignore_entries = derive_ignore_from_entries && matcher.use_gitignore;
-	let mut read_buffer = std::mem::take(&mut scratch.read_buffer);
+	let mut read_buffer = mem::take(&mut scratch.read_buffer);
 	let result = platform::read_dir_entries(dir, detail, &mut read_buffer, |entry| {
 		if track_ignore_entries {
 			ignore_entries.record(entry.name.as_ref(), entry.file_type);
@@ -2992,16 +2961,16 @@ pub const fn supports_cheap_size_hints() -> bool {
 
 struct IgnoreState {
 	parent:              Option<Arc<Self>>,
-	ignore_matcher:      Option<ignore::gitignore::Gitignore>,
-	gitignore_matcher:   Option<ignore::gitignore::Gitignore>,
-	git_exclude_matcher: Option<ignore::gitignore::Gitignore>,
+	ignore_matcher:      Option<Gitignore>,
+	gitignore_matcher:   Option<Gitignore>,
+	git_exclude_matcher: Option<Gitignore>,
 	has_git:             bool,
 	chain_has_matchers:  bool,
 	any_git:             bool,
 }
 
 struct FastIgnore {
-	global:        Option<ignore::gitignore::Gitignore>,
+	global:        Option<Gitignore>,
 	use_gitignore: bool,
 }
 
@@ -3045,7 +3014,7 @@ fn ignore_line_covers_root(
 	line: &str,
 	explicit_root: &Path,
 ) -> bool {
-	let mut builder = ignore::gitignore::GitignoreBuilder::new(matcher_root);
+	let mut builder = gitignore::GitignoreBuilder::new(matcher_root);
 	builder.add_line(Some(source.to_path_buf()), line).is_ok()
 		&& builder.build().is_ok_and(|matcher| {
 			matcher
@@ -3063,11 +3032,11 @@ fn load_gitignore(
 	matcher_root: &Path,
 	file: &Path,
 	explicit_root: Option<&Path>,
-) -> Option<ignore::gitignore::Gitignore> {
+) -> Option<Gitignore> {
 	if !file.is_file() {
 		return None;
 	}
-	let mut builder = ignore::gitignore::GitignoreBuilder::new(matcher_root);
+	let mut builder = gitignore::GitignoreBuilder::new(matcher_root);
 	let _ = builder.add(file);
 	let matcher = builder.build().ok().filter(|matcher| !matcher.is_empty())?;
 	let Some(explicit_root) = explicit_root else {
@@ -3080,8 +3049,8 @@ fn load_gitignore(
 		return Some(matcher);
 	}
 
-	let handle = std::fs::File::open(file).ok()?;
-	let mut filtered = ignore::gitignore::GitignoreBuilder::new(matcher_root);
+	let handle = fs::File::open(file).ok()?;
+	let mut filtered = gitignore::GitignoreBuilder::new(matcher_root);
 	let source = Some(file.to_path_buf());
 	for (index, line) in io::BufReader::new(handle).lines().enumerate() {
 		let Ok(line) = line else {
@@ -3161,9 +3130,9 @@ impl IgnoreState {
 
 	fn new(
 		parent: Option<Arc<Self>>,
-		ignore_matcher: Option<ignore::gitignore::Gitignore>,
-		gitignore_matcher: Option<ignore::gitignore::Gitignore>,
-		git_exclude_matcher: Option<ignore::gitignore::Gitignore>,
+		ignore_matcher: Option<Gitignore>,
+		gitignore_matcher: Option<Gitignore>,
+		git_exclude_matcher: Option<Gitignore>,
 		has_git: bool,
 	) -> Arc<Self> {
 		let parent_has_matchers = parent
@@ -3210,7 +3179,7 @@ impl IgnoreState {
 impl FastIgnore {
 	fn new(use_gitignore: bool) -> Self {
 		let global = if use_gitignore {
-			let (matcher, _err) = ignore::gitignore::Gitignore::global();
+			let (matcher, _err) = Gitignore::global();
 			if matcher.is_empty() {
 				None
 			} else {
@@ -3311,7 +3280,7 @@ fn handle_read_dir_error<V>(
 	err: ReadDirError<V::Error>,
 	options: WalkOptions,
 	visitor: &mut V,
-) -> std::result::Result<bool, WalkError<V::Error>>
+) -> Result<bool, WalkError<V::Error>>
 where
 	V: EntryVisitor,
 {
@@ -3341,7 +3310,9 @@ where
 fn is_skippable_directory_error(err: &io::Error) -> bool {
 	matches!(
 		err.kind(),
-		io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::PermissionDenied
+		std::io::ErrorKind::NotFound
+			| std::io::ErrorKind::NotADirectory
+			| std::io::ErrorKind::PermissionDenied
 	)
 }
 
@@ -3402,10 +3373,11 @@ mod platform {
 	use std::{
 		borrow::Cow,
 		ffi::{CString, OsStr},
-		io,
+		fs, io,
 		mem::size_of,
 		os::{fd::RawFd, unix::ffi::OsStrExt},
 		path::Path,
+		ptr, time,
 	};
 
 	use super::{
@@ -3438,9 +3410,9 @@ mod platform {
 		detail: WalkDetail,
 		buffer: &mut Vec<u8>,
 		mut emit: F,
-	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
+	) -> Result<ReadDirControl, ReadDirError<E>>
 	where
-		F: FnMut(RawDirEntry<'_>) -> std::result::Result<ReadDirControl, WalkError<E>>,
+		F: FnMut(RawDirEntry<'_>) -> Result<ReadDirControl, WalkError<E>>,
 	{
 		let fd = open_dir(path)?;
 		let mut attrs = libc::attrlist {
@@ -3466,7 +3438,7 @@ mod platform {
 			let count = unsafe {
 				libc::getattrlistbulk(
 					fd.0,
-					std::ptr::addr_of_mut!(attrs).cast(),
+					ptr::addr_of_mut!(attrs).cast(),
 					buffer.as_mut_ptr().cast(),
 					buffer.len(),
 					libc::FSOPT_NOFOLLOW as u64,
@@ -3515,11 +3487,11 @@ mod platform {
 		path: &Path,
 		detail: WalkDetail,
 		mut emit: F,
-	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
+	) -> Result<ReadDirControl, ReadDirError<E>>
 	where
-		F: FnMut(RawDirEntry<'_>) -> std::result::Result<ReadDirControl, WalkError<E>>,
+		F: FnMut(RawDirEntry<'_>) -> Result<ReadDirControl, WalkError<E>>,
 	{
-		let read_dir = std::fs::read_dir(path)?;
+		let read_dir = fs::read_dir(path)?;
 		for entry in read_dir {
 			let entry = entry?;
 			let file_type = match entry.file_type() {
@@ -3543,7 +3515,7 @@ mod platform {
 			let mut mtime = None;
 			let mut size = None;
 			if detail == WalkDetail::Full {
-				match std::fs::symlink_metadata(entry.path()) {
+				match fs::symlink_metadata(entry.path()) {
 					Ok(metadata) => {
 						if file_type == FileType::File {
 							size = Some(metadata.len() as f64);
@@ -3551,7 +3523,7 @@ mod platform {
 						mtime = metadata
 							.modified()
 							.ok()
-							.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+							.and_then(|time| time.duration_since(time::UNIX_EPOCH).ok())
 							.map(|duration| duration.as_millis() as f64);
 					},
 					Err(err) if is_skippable_entry_error(&err) => continue,
@@ -3626,7 +3598,7 @@ mod platform {
 		*cursor = end;
 		// SAFETY: Bounds were checked above; `getattrlistbulk` records are byte
 		// packed, so unaligned reads are required and do not outlive `record`.
-		Ok(unsafe { std::ptr::read_unaligned(ptr.cast::<T>()) })
+		Ok(unsafe { ptr::read_unaligned(ptr.cast::<T>()) })
 	}
 
 	fn checked_attr_offset(base: usize, offset: i32) -> io::Result<usize> {
@@ -3657,7 +3629,7 @@ mod platform {
 	}
 
 	fn is_skippable_entry_error(err: &io::Error) -> bool {
-		matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
+		matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied)
 	}
 
 	#[cold]
@@ -3674,6 +3646,7 @@ mod platform {
 		mem::{size_of, zeroed},
 		os::unix::ffi::OsStrExt,
 		path::Path,
+		ptr,
 	};
 
 	use super::{
@@ -3747,9 +3720,9 @@ mod platform {
 		detail: WalkDetail,
 		buffer: &mut Vec<u8>,
 		mut emit: F,
-	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
+	) -> Result<ReadDirControl, ReadDirError<E>>
 	where
-		F: FnMut(RawDirEntry<'_>) -> std::result::Result<ReadDirControl, WalkError<E>>,
+		F: FnMut(RawDirEntry<'_>) -> Result<ReadDirControl, WalkError<E>>,
 	{
 		let fd = open_dir(path)?;
 		if buffer.len() != BUFFER_SIZE {
@@ -3882,7 +3855,7 @@ mod platform {
 				name.as_ptr(),
 				libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
 				mask,
-				std::ptr::addr_of_mut!(statx),
+				ptr::addr_of_mut!(statx),
 			)
 		};
 		if rc != 0 {
@@ -3917,12 +3890,7 @@ mod platform {
 		// SAFETY: `name` is NUL-terminated, `stat` is writable, and `dirfd` is an
 		// open directory descriptor for an AT_* relative metadata query.
 		let rc = unsafe {
-			libc::fstatat(
-				dirfd,
-				name.as_ptr(),
-				std::ptr::addr_of_mut!(stat),
-				libc::AT_SYMLINK_NOFOLLOW,
-			)
+			libc::fstatat(dirfd, name.as_ptr(), ptr::addr_of_mut!(stat), libc::AT_SYMLINK_NOFOLLOW)
 		};
 		if rc != 0 {
 			return Err(io::Error::last_os_error());
@@ -3980,7 +3948,9 @@ mod platform {
 	fn is_skippable_entry_error(err: &io::Error) -> bool {
 		matches!(
 			err.kind(),
-			io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::NotADirectory
+			std::io::ErrorKind::NotFound
+				| std::io::ErrorKind::PermissionDenied
+				| std::io::ErrorKind::NotADirectory
 		)
 	}
 
@@ -3994,9 +3964,10 @@ mod platform {
 mod platform {
 	use std::{
 		ffi::OsString,
-		io,
+		io, mem,
 		os::windows::ffi::{OsStrExt, OsStringExt},
 		path::Path,
+		ptr,
 	};
 
 	use windows_sys::{
@@ -4039,9 +4010,9 @@ mod platform {
 		detail: WalkDetail,
 		buffer: &mut Vec<u8>,
 		mut emit: F,
-	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
+	) -> Result<ReadDirControl, ReadDirError<E>>
 	where
-		F: FnMut(RawDirEntry<'_>) -> std::result::Result<ReadDirControl, WalkError<E>>,
+		F: FnMut(RawDirEntry<'_>) -> Result<ReadDirControl, WalkError<E>>,
 	{
 		let handle = open_dir(path)?;
 		if buffer.len() != BUFFER_SIZE {
@@ -4056,15 +4027,15 @@ mod platform {
 			let status = unsafe {
 				NtQueryDirectoryFile(
 					handle.0,
-					std::ptr::null_mut(),
+					ptr::null_mut(),
 					None,
-					std::ptr::null(),
-					std::ptr::addr_of_mut!(iosb),
+					ptr::null(),
+					ptr::addr_of_mut!(iosb),
 					buffer.as_mut_ptr().cast(),
 					buffer.len() as u32,
 					FileIdFullDirectoryInformation,
 					false,
-					std::ptr::null(),
+					ptr::null(),
 					restart,
 				)
 			};
@@ -4078,19 +4049,19 @@ mod platform {
 
 			let mut offset = 0usize;
 			loop {
-				if offset + std::mem::size_of::<FILE_ID_FULL_DIR_INFORMATION>() > buffer.len() {
+				if offset + mem::size_of::<FILE_ID_FULL_DIR_INFORMATION>() > buffer.len() {
 					return Err(invalid_data("truncated NtQueryDirectoryFile record").into());
 				}
 				let info = unsafe {
 					// SAFETY: Bounds were checked above; records are byte-packed in the
 					// buffer and may not be aligned for Rust references.
-					std::ptr::read_unaligned(
+					ptr::read_unaligned(
 						buffer[offset..]
 							.as_ptr()
 							.cast::<FILE_ID_FULL_DIR_INFORMATION>(),
 					)
 				};
-				let name_offset = offset + std::mem::offset_of!(FILE_ID_FULL_DIR_INFORMATION, FileName);
+				let name_offset = offset + mem::offset_of!(FILE_ID_FULL_DIR_INFORMATION, FileName);
 				let name_len = info.FileNameLength as usize;
 				let name_unit_len = name_len / 2;
 				if name_len % 2 != 0
@@ -4142,10 +4113,10 @@ mod platform {
 				path.as_ptr(),
 				FILE_LIST_DIRECTORY,
 				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-				std::ptr::null(),
+				ptr::null(),
 				OPEN_EXISTING,
 				FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			)
 		};
 		if handle == INVALID_HANDLE_VALUE {
@@ -4180,7 +4151,7 @@ mod platform {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod platform {
-	use std::{borrow::Cow, io, path::Path};
+	use std::{borrow::Cow, fs, io, path::Path, time};
 
 	use super::{FileType, RawDirEntry, ReadDirControl, ReadDirError, WalkDetail, WalkError};
 
@@ -4191,11 +4162,11 @@ mod platform {
 		detail: WalkDetail,
 		_buffer: &mut Vec<u8>,
 		mut emit: F,
-	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
+	) -> Result<ReadDirControl, ReadDirError<E>>
 	where
-		F: FnMut(RawDirEntry<'_>) -> std::result::Result<ReadDirControl, WalkError<E>>,
+		F: FnMut(RawDirEntry<'_>) -> Result<ReadDirControl, WalkError<E>>,
 	{
-		let read_dir = std::fs::read_dir(path)?;
+		let read_dir = fs::read_dir(path)?;
 		for entry in read_dir {
 			let entry = entry?;
 			let file_type_res = entry.file_type();
@@ -4220,7 +4191,7 @@ mod platform {
 			let mut mtime = None;
 			let mut size = None;
 			if detail == WalkDetail::Full {
-				match std::fs::symlink_metadata(entry.path()) {
+				match fs::symlink_metadata(entry.path()) {
 					Ok(metadata) => {
 						if custom_file_type == FileType::File {
 							size = Some(metadata.len() as f64);
@@ -4228,7 +4199,7 @@ mod platform {
 						mtime = metadata
 							.modified()
 							.ok()
-							.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+							.and_then(|time| time.duration_since(time::UNIX_EPOCH).ok())
 							.map(|duration| duration.as_millis() as f64);
 					},
 					Err(err) if is_skippable_entry_error(&err) => continue,
@@ -4251,16 +4222,17 @@ mod platform {
 	}
 
 	fn is_skippable_entry_error(err: &io::Error) -> bool {
-		matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
+		matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied)
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use std::{
-		fs,
+		env, fs,
 		path::PathBuf,
-		time::{Duration, SystemTime, UNIX_EPOCH},
+		thread,
+		time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 	};
 
 	use super::*;
@@ -4286,7 +4258,7 @@ mod tests {
 			.duration_since(UNIX_EPOCH)
 			.expect("system time should be after UNIX_EPOCH")
 			.as_nanos();
-		let root = std::env::temp_dir().join(format!("pi-walker-{name}-{unique}"));
+		let root = env::temp_dir().join(format!("pi-walker-{name}-{unique}"));
 		fs::create_dir_all(&root).expect("temp root should be created");
 		TempTree { root }
 	}
@@ -4309,9 +4281,9 @@ mod tests {
 	}
 
 	fn wait_for_nonzero_cache_age() {
-		let started = std::time::Instant::now();
+		let started = Instant::now();
 		while started.elapsed() < Duration::from_millis(1) {
-			std::thread::yield_now();
+			thread::yield_now();
 		}
 	}
 
@@ -4486,7 +4458,7 @@ mod tests {
 		impl EntryVisitor for RecordingVisitor {
 			type Error = Infallible;
 
-			fn visit(&mut self, entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error> {
+			fn visit(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 				self.paths.push(entry.relative.to_string());
 				Ok(WalkControl::Continue)
 			}
@@ -4825,7 +4797,7 @@ mod tests {
 	impl EntryVisitor for PruneVisitor {
 		type Error = Infallible;
 
-		fn visit(&mut self, entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error> {
+		fn visit(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 			self.seen.push(entry.relative.to_string());
 			if entry.relative == "skip" {
 				Ok(WalkControl::SkipDescend)
@@ -4844,7 +4816,7 @@ mod tests {
 	impl EntryVisitor for PathsVisitor {
 		type Error = Infallible;
 
-		fn visit(&mut self, entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error> {
+		fn visit(&mut self, entry: Entry<'_>) -> Result<WalkControl, Self::Error> {
 			self.seen.push(entry.relative.to_string());
 			Ok(WalkControl::Continue)
 		}
@@ -4888,8 +4860,11 @@ mod tests {
 		fs::create_dir_all(tree.path().join("target")).expect("target dir should be created");
 		fs::write(tree.path().join("target").join("child.txt"), "ok")
 			.expect("target child should be written");
-		std::os::unix::fs::symlink(tree.path().join("target"), tree.path().join("link"))
-			.expect("directory symlink should be created");
+		{
+			use std::os::unix::fs;
+			fs::symlink(tree.path().join("target"), tree.path().join("link"))
+				.expect("directory symlink should be created");
+		}
 
 		let paths = walk_paths(tree.path(), FollowLinks::Always);
 
@@ -4908,13 +4883,18 @@ mod tests {
 		let linked_target = temp_tree("follow-roots-linked-target");
 		fs::write(linked_target.path().join("linked-child.txt"), "linked")
 			.expect("linked child should be written");
-		std::os::unix::fs::symlink(linked_target.path(), target.path().join("descendant-link"))
-			.expect("descendant directory symlink should be created");
+		{
+			use std::os::unix::fs;
+			fs::symlink(linked_target.path(), target.path().join("descendant-link"))
+				.expect("descendant directory symlink should be created");
+		}
 
 		let link_parent = temp_tree("follow-roots-link-parent");
 		let root_link = link_parent.path().join("root-link");
-		std::os::unix::fs::symlink(target.path(), &root_link)
-			.expect("root directory symlink should be created");
+		{
+			use std::os::unix::fs;
+			fs::symlink(target.path(), &root_link).expect("root directory symlink should be created");
+		}
 
 		let paths = walk_paths(&root_link, FollowLinks::Roots);
 
@@ -4938,8 +4918,10 @@ mod tests {
 
 		let link_parent = temp_tree("follow-never-link-parent");
 		let root_link = link_parent.path().join("root-link");
-		std::os::unix::fs::symlink(target.path(), &root_link)
-			.expect("root directory symlink should be created");
+		{
+			use std::os::unix::fs;
+			fs::symlink(target.path(), &root_link).expect("root directory symlink should be created");
+		}
 
 		let paths = walk_paths(&root_link, FollowLinks::Never);
 

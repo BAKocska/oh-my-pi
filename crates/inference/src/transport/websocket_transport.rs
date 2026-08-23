@@ -2,20 +2,22 @@
 
 use std::{
 	future::Future,
+	mem,
 	pin::Pin,
+	str,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	},
 	task::{Context, Poll},
-	time::Instant,
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt as _, StreamExt as _, future::poll_fn};
-use http::{Request, header};
+use http::{HeaderName, HeaderValue, Request, header};
 use omp_core::Str;
 use parking_lot::Mutex;
+use tokio::time::Instant;
 use tokio_tungstenite::{
 	connect_async,
 	tungstenite::{Message, client::IntoClientRequest as _},
@@ -25,7 +27,10 @@ use tower::Service;
 use crate::{
 	answer::{RealtimeEvent, RealtimeInput, RealtimeSession},
 	body::{AttemptBodyEvidence, AttemptEvidenceHandle, BodyOpenError},
-	codec::{HandshakeMeta, HandshakenResponse, RawEvent, RawEventStream, TransportRequest},
+	codec::{
+		Cancellation, HandshakeMeta, HandshakenResponse, RawEvent, RawEventStream, TransportAttempt,
+		TransportRequest,
+	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	receipt::{ExecutionReceipt, ReasonId},
 	transport::{
@@ -119,7 +124,7 @@ impl Service<TransportRequest> for WebSocketTransport {
 	}
 
 	fn call(&mut self, request: TransportRequest) -> Self::Future {
-		let permit = std::mem::take(&mut self.ready_permit);
+		let permit = mem::take(&mut self.ready_permit);
 		let captures = Arc::clone(&self.captures);
 		Box::pin(async move {
 			if !permit {
@@ -141,7 +146,7 @@ async fn execute(
 ) -> Result<HandshakenResponse, Error> {
 	let started = Instant::now();
 	let attempt = request.attempt.clone();
-	let deadline = tokio::time::Instant::now() + attempt.timeout;
+	let deadline = Instant::now() + attempt.timeout;
 	let mut body_attempt = request.encoded.body.begin_attempt();
 	let evidence = body_attempt.evidence_handle();
 	if request.encoded.framing != FramingProtocol::WebSocket
@@ -219,7 +224,7 @@ async fn execute(
 	let (parts, ()) = upgrade.into_parts();
 	let mut upgrade = Request::from_parts(parts, Bytes::new());
 	for item in &request.encoded.headers {
-		let name = http::HeaderName::from_bytes(item.name.as_str().as_bytes()).map_err(|_| {
+		let name = HeaderName::from_bytes(item.name.as_str().as_bytes()).map_err(|_| {
 			failure(
 				simple_error(
 					ErrorKind::Protocol,
@@ -233,7 +238,7 @@ async fn execute(
 				false,
 			)
 		})?;
-		let value = http::HeaderValue::from_str(item.value.as_str()).map_err(|_| {
+		let value = HeaderValue::from_str(item.value.as_str()).map_err(|_| {
 			failure(
 				simple_error(
 					ErrorKind::Protocol,
@@ -252,7 +257,7 @@ async fn execute(
 	upgrade
 		.headers_mut()
 		.entry(header::USER_AGENT)
-		.or_insert(http::HeaderValue::from_static(omp_core::USER_AGENT));
+		.or_insert(HeaderValue::from_static(omp_core::USER_AGENT));
 	if let Some(credentials) = &request.credentials {
 		credentials.finalize_buffered(&mut upgrade).map_err(|_| {
 			failure(
@@ -729,7 +734,7 @@ async fn execute(
 
 fn pump_error(
 	mut error: Error,
-	attempt: &crate::codec::TransportAttempt,
+	attempt: &TransportAttempt,
 	evidence: &AttemptEvidenceHandle,
 	status: u16,
 	provider_request_id: Option<&Str>,
@@ -744,14 +749,14 @@ fn capture_socket_frame(capture: &Arc<Mutex<LiveCapture>>, frame: &Frame) {
 	let mut capture = capture.lock();
 	let ordinal = capture.frames.len() as u64;
 	let mut remaining = capture.remaining;
-	let mut frames = std::mem::take(&mut capture.frames);
+	let mut frames = mem::take(&mut capture.frames);
 	capture_frame(&mut frames, ordinal, frame, &mut remaining);
 	capture.frames = frames;
 	capture.remaining = remaining;
 }
 
 fn wire_message(bytes: Bytes) -> Message {
-	match std::str::from_utf8(&bytes) {
+	match str::from_utf8(&bytes) {
 		Ok(text) => Message::text(text.to_owned()),
 		Err(_) => Message::Binary(bytes),
 	}
@@ -802,7 +807,7 @@ fn simple_error(
 		.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
-struct WebSocketCancelOnDrop(crate::codec::Cancellation);
+struct WebSocketCancelOnDrop(Cancellation);
 
 impl Drop for WebSocketCancelOnDrop {
 	fn drop(&mut self) {

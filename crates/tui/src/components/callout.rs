@@ -2,8 +2,10 @@ use omp_core::{IntoStr, Str};
 
 use super::text::{append, put_clipped, truncate_rich};
 use crate::{
+	UiContext,
 	component::{Component, MemoKey, PaintCtx, Slot, next_slot},
 	frame::{Color, Rect, Style},
+	markdown,
 	markdown::MdTheme,
 	props::{Prop, PropValue, Props},
 	rich::{RichText, cell_width},
@@ -59,7 +61,7 @@ impl Callout {
 			|| self.props.str_of(Prop::Icon).is_some()
 	}
 
-	fn accent(&self, ctx: &crate::UiContext) -> Color {
+	fn accent(&self, ctx: &UiContext) -> Color {
 		let color = self.props.style(&ctx.theme).foreground_color();
 		if matches!(color, Color::Default) {
 			ctx.theme.info
@@ -68,14 +70,14 @@ impl Callout {
 		}
 	}
 
-	fn icon<'a>(&'a self, ctx: &'a crate::UiContext) -> &'a str {
+	fn icon<'a>(&'a self, ctx: &'a UiContext) -> &'a str {
 		self.props.str_of(Prop::Icon).map_or_else(
 			|| ctx.charset.note_icon(),
 			|name| ctx.charset.icon_named(name).unwrap_or(name),
 		)
 	}
 
-	fn header_width(&self, ctx: &crate::UiContext) -> u16 {
+	fn header_width(&self, ctx: &UiContext) -> u16 {
 		if !self.has_header() {
 			return 0;
 		}
@@ -88,7 +90,7 @@ impl Callout {
 		icon.saturating_add(title).saturating_add(badge)
 	}
 
-	fn render(&mut self, ctx: &crate::UiContext, width: u16) {
+	fn render(&mut self, ctx: &UiContext, width: u16) {
 		let width = width.saturating_sub(2).max(1);
 		let key = MemoKey::new(self.version, ctx);
 		if self.cached_width == width && self.cached == Some(key) {
@@ -97,7 +99,7 @@ impl Callout {
 		let style = self.props.style(&ctx.theme);
 		let theme = MdTheme::from_context(ctx).cascade(style);
 		self.rich.clear();
-		crate::markdown::render(&self.text, width, &theme, &mut self.rich);
+		markdown::render(&self.text, width, &theme, &mut self.rich);
 		truncate_rich(&mut self.rich, width, style, self.props.truncate());
 		self.cached_width = width;
 		self.cached = Some(key);
@@ -123,7 +125,7 @@ impl Component for Callout {
 		self.slot
 	}
 
-	fn measure(&mut self, ctx: &crate::UiContext) -> (u16, u16) {
+	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {
 		let body = self
 			.text
 			.lines()
@@ -134,12 +136,12 @@ impl Component for Callout {
 		(14, body.max(self.header_width(ctx)).max(16))
 	}
 
-	fn height(&mut self, ctx: &crate::UiContext, width: u16) -> u16 {
+	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
 		self.render(ctx, width);
 		u16::from(self.has_header()).saturating_add(RichText::rows(&self.rich))
 	}
 
-	fn place(&mut self, ctx: &crate::UiContext, content: Rect) {
+	fn place(&mut self, ctx: &UiContext, content: Rect) {
 		self.render(ctx, content.width);
 	}
 
@@ -183,7 +185,7 @@ impl Component for Callout {
 		}
 	}
 
-	fn set_text(&mut self, _ctx: &crate::UiContext, text: Str) -> bool {
+	fn set_text(&mut self, _ctx: &UiContext, text: Str) -> bool {
 		if self.text == text {
 			return false;
 		}

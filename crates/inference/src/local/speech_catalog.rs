@@ -8,8 +8,8 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 use super::{
 	artifact::{
-		ArtifactCacheState, ArtifactManifest, ArtifactResult, ArtifactShard, ArtifactSpec,
-		ArtifactStore, sha256_digest,
+		ArtifactCacheState, ArtifactError, ArtifactManifest, ArtifactResult, ArtifactShard,
+		ArtifactSpec, ArtifactStore, sha256_digest,
 	},
 	runtime::{LocalCancellation, LocalResult},
 };
@@ -514,7 +514,7 @@ pub enum SpeechCatalogError {
 	Artifact {
 		/// Typed manifest failure.
 		#[source]
-		source: super::artifact::ArtifactError,
+		source: ArtifactError,
 	},
 }
 

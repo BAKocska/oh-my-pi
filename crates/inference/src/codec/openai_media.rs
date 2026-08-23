@@ -6,6 +6,7 @@ use bytes::Bytes;
 use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
 
+use super::openai_chat;
 use crate::{
 	answer::{
 		Artifact, ArtifactBody, AudioChunk, GenerationEvent, GenerationSummary, ImageArtifact,
@@ -636,7 +637,7 @@ fn boundary(request_id: &str) -> String {
 	value
 }
 fn join_uri(base: &str, path: &str) -> Str {
-	super::openai_chat::join_uri(base, path)
+	openai_chat::join_uri(base, path)
 }
 fn capability_error() -> Error {
 	Error::new(

@@ -1,12 +1,14 @@
 use im::HashMap;
 
 use super::*;
-use crate::builtins::{self, builtin, decl_builtin, raw_arg_builtin, simple_builtin};
+use crate::{
+	ShellExtensions,
+	builtins::{self, builtin, decl_builtin, raw_arg_builtin, simple_builtin},
+};
 
 /// Returns the Bash-compatible builtins installed in a new shell.
 #[allow(clippy::too_many_lines, reason = "one registration per builtin")]
-pub fn default_builtins<SE: crate::ShellExtensions>() -> HashMap<String, builtins::Registration<SE>>
-{
+pub fn default_builtins<SE: ShellExtensions>() -> HashMap<String, builtins::Registration<SE>> {
 	let mut builtins = HashMap::new();
 
 	builtins.insert("break".into(), builtin::<break_::BreakCommand, SE>().special());

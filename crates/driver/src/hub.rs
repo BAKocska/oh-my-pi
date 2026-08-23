@@ -2,22 +2,26 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	iter, mem,
 	sync::{Arc, LazyLock},
 	time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use omp_agent::{
-	AgentEvent, Broker, BrokerInbox, CancelOutcome, DeliveryMode, EventBus, JobBoard, JobError,
-	PeerMessage, PeerRelayObservation, TurnClient,
+	AgentEvent, Broker, CancelOutcome, DeliveryMode, EventBus, JobBoard, JobError, PeerMessage,
+	PeerRelayObservation, TurnClient,
 };
 use omp_core::{Duration, DurationUnit, Str, sf};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
 use omp_proto::{
-	env::v1::{
-		AttachOutput, EnvironmentDelta, ListProcesses, ProcessSpec, PtySpec, ReadyLog, ReadyProbe,
-		ReadyTcp, RestartSpec, Script, SendInput, SignalProcess, StartProcess, StopProcess,
-		ready_probe, send_input,
+	env::{
+		v1,
+		v1::{
+			AttachOutput, EnvironmentDelta, ListProcesses, ProcessSpec, PtySpec, ReadyLog, ReadyProbe,
+			ReadyTcp, RestartSpec, Script, SendInput, SignalProcess, StartProcess, StopProcess,
+			ready_probe, send_input,
+		},
 	},
 	inference::v1::{Value, ValueMap, value},
 };
@@ -25,6 +29,9 @@ use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwne
 use omp_tools::hub::{Fault, HubBackend, HubRouter, Op, Params, Request, Response, RestartPolicy};
 use parking_lot::Mutex;
 use serde_json::json;
+use tokio::{sync::broadcast::error::RecvError, task::JoinHandle, time};
+
+use crate::subagent::supervisor::SessionSupervisor;
 
 static ROUTER: LazyLock<HubRouter<ChatHubBackend>> = LazyLock::new(HubRouter::new);
 const DEFAULT_ROUTE: &str = "*";
@@ -60,7 +67,7 @@ impl TerminalRowReplay {
 
 	fn process(&mut self, data: &[u8]) {
 		for character in String::from_utf8_lossy(data).chars() {
-			let state = std::mem::take(&mut self.state);
+			let state = mem::take(&mut self.state);
 			match state {
 				TerminalParseState::Text => self.text(character),
 				TerminalParseState::Escape if character == '[' => {
@@ -197,6 +204,8 @@ pub fn attach_for(owner: Str, backend: Arc<ChatHubBackend>) -> HubAttachment {
 	HubAttachment { owner, previous }
 }
 
+/// Scoped agent-addressed hub attachment that restores the prior route when
+/// dropped.
 #[must_use]
 pub struct HubAttachment {
 	owner:    Str,
@@ -233,27 +242,38 @@ impl HubBackend for ChatHubRoute {
 	}
 }
 
+/// Cancellation authority used by the hub's agent-addressed cancel operation.
 pub trait AgentCancellation: Send + Sync {
+	/// Cancels the live agent identified by its stable hub id.
 	fn cancel(&self, id: &str) -> Result<(), Str>;
 }
 
-impl<C: TurnClient + Clone + Send + 'static> AgentCancellation
-	for crate::subagent::supervisor::SessionSupervisor<C>
-{
+impl<C: TurnClient + Clone + Send + 'static> AgentCancellation for SessionSupervisor<C> {
 	fn cancel(&self, id: &str) -> Result<(), Str> {
-		crate::subagent::supervisor::SessionSupervisor::cancel(self, id)
-			.map_err(|error| Str::from(error.to_string()))
+		SessionSupervisor::cancel(self, id).map_err(|error| Str::from(error.to_string()))
 	}
 }
 
 /// Shared mailbox ownership used by the hub tool and authenticated CONTROL.
-pub type SharedBrokerInbox = Arc<tokio::sync::Mutex<BrokerInbox>>;
+mod shared_inbox {
+	use std::sync::Arc;
 
-/// Promotes the broker's single-consumer inbox into a shared serialized owner.
-pub fn share_inbox(inbox: BrokerInbox) -> SharedBrokerInbox {
-	Arc::new(tokio::sync::Mutex::new(inbox))
+	use omp_agent::BrokerInbox;
+	use tokio::sync::Mutex;
+
+	/// Shared mailbox ownership used by the hub tool and authenticated CONTROL.
+	pub type SharedBrokerInbox = Arc<Mutex<BrokerInbox>>;
+
+	/// Promotes the broker's single-consumer inbox into a shared serialized
+	/// owner.
+	pub fn share_inbox(inbox: BrokerInbox) -> SharedBrokerInbox {
+		Arc::new(Mutex::new(inbox))
+	}
 }
+pub use shared_inbox::{SharedBrokerInbox, share_inbox};
 
+/// Session-scoped hub composition for peer messaging, jobs, and supervised
+/// processes.
 pub struct ChatHubBackend {
 	broker:     Broker,
 	inbox:      SharedBrokerInbox,
@@ -262,11 +282,13 @@ pub struct ChatHubBackend {
 	agent_id:   Str,
 	session:    Str,
 	launches:   Mutex<BTreeMap<Str, Params>>,
-	relay_task: Option<tokio::task::JoinHandle<()>>,
+	relay_task: Option<JoinHandle<()>>,
 	canceller:  Option<Arc<dyn AgentCancellation>>,
 }
 
 impl ChatHubBackend {
+	/// Binds hub operations to one agent identity and optionally relays peer
+	/// events.
 	pub fn new(
 		broker: Broker,
 		inbox: SharedBrokerInbox,
@@ -291,8 +313,8 @@ impl ChatHubBackend {
 								outcome: event.delivery.outcome,
 							})));
 						},
-						Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
-						Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+						Ok(_) | Err(RecvError::Lagged(_)) => {},
+						Err(RecvError::Closed) => return,
 					}
 				}
 			})
@@ -440,7 +462,7 @@ impl ChatHubBackend {
 		let progress_updates = updates.clone();
 		tokio::spawn(async move {
 			loop {
-				tokio::time::sleep(StdDuration::from_millis(500)).await;
+				time::sleep(StdDuration::from_millis(500)).await;
 				let jobs = progress_jobs
 					.snapshot()
 					.into_iter()
@@ -489,7 +511,7 @@ impl ChatHubBackend {
 			}
 		};
 		let (peer, settlement) = if let Some(timeout) = timeout {
-			match tokio::time::timeout(timeout, result).await {
+			match time::timeout(timeout, result).await {
 				Ok(result) => result?,
 				Err(_) => {
 					if params.timeout_ms.is_none() {
@@ -605,9 +627,9 @@ impl ChatHubBackend {
 			probes
 		});
 		let restart = match params.restart.unwrap_or(RestartPolicy::No) {
-			RestartPolicy::No => omp_proto::env::v1::RestartPolicy::Never,
-			RestartPolicy::OnFailure => omp_proto::env::v1::RestartPolicy::OnFailure,
-			RestartPolicy::Always => omp_proto::env::v1::RestartPolicy::Always,
+			RestartPolicy::No => v1::RestartPolicy::Never,
+			RestartPolicy::OnFailure => v1::RestartPolicy::OnFailure,
+			RestartPolicy::Always => v1::RestartPolicy::Always,
 		};
 		let cwd_uri = params.cwd.as_ref().map_or_else(
 			|| {
@@ -757,13 +779,13 @@ impl ChatHubBackend {
 			.await
 			.map_err(|error| fault(error.to_string()))?;
 		let deadline = StdDuration::from_secs_f64(params.timeout.unwrap_or(30.0));
-		let event = tokio::time::timeout(deadline, async {
+		let event = time::timeout(deadline, async {
 			while let Some(event) = attachment.next_event().await.map_err(|error| fault(error.to_string()))? {
 				match event {
 					ProcessAttachmentEvent::Output(output) if params.pattern.as_deref().is_none_or(|pattern| String::from_utf8_lossy(&output.data).contains(pattern)) => return Ok(Some(json!({ "name": output.name, "cursor": output.sequence, "output": String::from_utf8_lossy(&output.data) }))),
 					ProcessAttachmentEvent::State(state) => {
 						let target = params.wait_for.as_deref().unwrap_or("exit");
-						let process_state = omp_proto::env::v1::ProcessState::try_from(
+						let process_state = v1::ProcessState::try_from(
 							state.process.as_ref().map_or(0, |process| process.state),
 						)
 						.ok();
@@ -808,7 +830,7 @@ impl ChatHubBackend {
 			StdDuration::from_millis(20)
 		};
 		loop {
-			match tokio::time::timeout(idle, attachment.next_event()).await {
+			match time::timeout(idle, attachment.next_event()).await {
 				Ok(Ok(Some(ProcessAttachmentEvent::Output(output)))) => {
 					cursor = cursor.max(output.sequence);
 					if params.render_terminal_rows {
@@ -1044,7 +1066,7 @@ const fn wait_timeout(timeout_ms: Option<u64>) -> Option<StdDuration> {
 	}
 }
 
-fn process_json(process: omp_proto::env::v1::ProcessInfo) -> serde_json::Value {
+fn process_json(process: v1::ProcessInfo) -> serde_json::Value {
 	let pid = process.identity.as_ref().map(|identity| identity.pid);
 	let started_at_ms = process
 		.identity
@@ -1166,7 +1188,7 @@ fn deliveries_json(deliveries: &[omp_agent::DeliveryReceipt]) -> Vec<serde_json:
 }
 
 fn command_text(application: &str, args: &[Str]) -> String {
-	std::iter::once(application)
+	iter::once(application)
 		.chain(args.iter().map(Str::as_str))
 		.map(shell_word)
 		.collect::<Vec<_>>()

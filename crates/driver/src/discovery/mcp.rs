@@ -4,7 +4,10 @@
 //! are not product inputs; native OMP manifests arrive as already admitted,
 //! data-only mounts.
 
-use std::path::{Path, PathBuf};
+use std::{
+	io,
+	path::{Path, PathBuf},
+};
 
 use omp_core::Str;
 use omp_envd::mcp::config::{
@@ -179,7 +182,7 @@ async fn read_source(
 ) -> Result<Option<ConfigSource>, McpDiscoveryError> {
 	let bytes = match tokio::fs::read(&path).await {
 		Ok(bytes) => bytes,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
 		Err(source) => return Err(McpDiscoveryError::Read { path, source }),
 	};
 	let file: McpConfigFile = serde_json::from_slice(&bytes)
@@ -201,7 +204,7 @@ pub enum McpDiscoveryError {
 		path:   PathBuf,
 		/// Filesystem failure.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// Source JSON is malformed.
 	#[error("failed to parse MCP configuration `{path}`")]
@@ -228,6 +231,7 @@ mod tests {
 
 	use omp_core::Str;
 	use omp_envd::mcp::config::{McpServerConfig, TransportKind};
+	use tokio::fs;
 
 	use super::*;
 
@@ -260,13 +264,13 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch");
 		let home = scratch.path().join("home");
 		let project = scratch.path().join("project");
-		tokio::fs::create_dir_all(home.join(".omp"))
+		fs::create_dir_all(home.join(".omp"))
 			.await
 			.expect("home dir");
-		tokio::fs::create_dir_all(project.join(".omp"))
+		fs::create_dir_all(project.join(".omp"))
 			.await
 			.expect("project dir");
-		tokio::fs::create_dir_all(project.join(".claude"))
+		fs::create_dir_all(project.join(".claude"))
 			.await
 			.expect("foreign dir");
 		for (path, value) in [
@@ -275,7 +279,7 @@ mod tests {
 			(project.join(".mcp.json"), file("root")),
 			(project.join(".claude/mcp.json"), file("foreign")),
 		] {
-			tokio::fs::write(path, serde_json::to_vec(&value).expect("serialize"))
+			fs::write(path, serde_json::to_vec(&value).expect("serialize"))
 				.await
 				.expect("write");
 		}

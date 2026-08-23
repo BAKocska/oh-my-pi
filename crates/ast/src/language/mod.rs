@@ -9,7 +9,14 @@
 
 mod parsers;
 
-use std::{borrow::Cow, collections::HashMap, fmt, path::Path, sync::LazyLock};
+use std::{
+	borrow::Cow,
+	collections::HashMap,
+	fmt::{self, Display},
+	iter,
+	path::Path,
+	sync::LazyLock,
+};
 
 use ast_grep_core::{
 	Doc, Language, Node,
@@ -67,12 +74,12 @@ fn pre_process_pattern(expando: char, query: &str) -> Cow<'_, str> {
 		}
 		let need_replace = matches!(c, 'A'..='Z' | '_') || dollar_count == 3;
 		let sigil = if need_replace { expando } else { '$' };
-		ret.extend(std::iter::repeat_n(sigil, dollar_count));
+		ret.extend(iter::repeat_n(sigil, dollar_count));
 		dollar_count = 0;
 		ret.push(c);
 	}
 	let sigil = if dollar_count == 3 { expando } else { '$' };
-	ret.extend(std::iter::repeat_n(sigil, dollar_count));
+	ret.extend(iter::repeat_n(sigil, dollar_count));
 	Cow::Owned(ret)
 }
 
@@ -508,7 +515,7 @@ static SORTED_ALIASES: LazyLock<Box<[&'static str]>> = LazyLock::new(|| {
 	aliases
 });
 
-impl fmt::Display for SupportLang {
+impl Display for SupportLang {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "{self:?}")
 	}
@@ -737,27 +744,6 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
 	if name == "Makefile" || name == "makefile" || name == "GNUmakefile" {
 		return Some(SupportLang::Make);
 	}
-	#[cfg(test)]
-	mod language_id_tests {
-		use super::*;
-
-		#[test]
-		fn path_ids_keep_highlight_and_lsp_dialects_separate() {
-			assert_eq!(
-				language_ids_from_path(Path::new("view.tsx")),
-				Some(LanguageIds { highlight: "tsx", lsp: "typescriptreact" })
-			);
-			assert_eq!(
-				language_ids_from_path(Path::new("view.jsx")),
-				Some(LanguageIds { highlight: "javascript", lsp: "javascriptreact" })
-			);
-			assert_eq!(
-				language_ids_from_path(Path::new(".env.production")),
-				Some(LanguageIds { highlight: "env", lsp: "plaintext" })
-			);
-			assert_eq!(lsp_language_id(Path::new("unknown.bin")), "plaintext");
-		}
-	}
 	if name == "Justfile" || name == "justfile" {
 		return Some(SupportLang::Just);
 	}
@@ -807,4 +793,26 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
 		.iter()
 		.copied()
 		.find(|&l| extensions(l).contains(&ext))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn path_ids_keep_highlight_and_lsp_dialects_separate() {
+		assert_eq!(
+			language_ids_from_path(Path::new("view.tsx")),
+			Some(LanguageIds { highlight: "tsx", lsp: "typescriptreact" })
+		);
+		assert_eq!(
+			language_ids_from_path(Path::new("view.jsx")),
+			Some(LanguageIds { highlight: "javascript", lsp: "javascriptreact" })
+		);
+		assert_eq!(
+			language_ids_from_path(Path::new(".env.production")),
+			Some(LanguageIds { highlight: "env", lsp: "plaintext" })
+		);
+		assert_eq!(lsp_language_id(Path::new("unknown.bin")), "plaintext");
+	}
 }

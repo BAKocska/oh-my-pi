@@ -1,3 +1,5 @@
+use std::iter;
+
 use xutf::Text;
 
 use crate::{
@@ -29,7 +31,7 @@ impl InputState {
 				.reserve(self.text.chars().count().saturating_mul('•'.len_utf8()));
 			self
 				.masked
-				.extend(std::iter::repeat_n('•', self.text.chars().count()));
+				.extend(iter::repeat_n('•', self.text.chars().count()));
 		}
 	}
 }

@@ -5,8 +5,10 @@
 //! visibly, but a module does *not* inherit its parent's imports — visibility
 //! chains stop at the first module item list.
 
-use ra_ap_syntax::ast::{self, AstNode};
-use ra_ap_syntax::{SyntaxKind, SyntaxNode};
+use ra_ap_syntax::{
+	SyntaxKind, SyntaxNode,
+	ast::{self, AstNode},
+};
 
 /// Opaque identity of one module or block scope within a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,8 +34,8 @@ pub fn chain(node: &SyntaxNode) -> Vec<ScopeKey> {
 			SyntaxKind::ITEM_LIST => {
 				scopes.push(ScopeKey(a.text_range().start().into()));
 				return scopes;
-			}
-			_ => {}
+			},
+			_ => {},
 		}
 	}
 	scopes.push(ScopeKey::ROOT);
@@ -42,7 +44,8 @@ pub fn chain(node: &SyntaxNode) -> Vec<ScopeKey> {
 
 /// Scope *containing* `item` (skips the item itself).
 pub fn containing(item: &SyntaxNode) -> ScopeKey {
-	item.ancestors()
+	item
+		.ancestors()
 		.skip(1)
 		.find(|a| is_scope(a.kind()))
 		.map_or(ScopeKey::ROOT, |a| ScopeKey(a.text_range().start().into()))
@@ -56,9 +59,17 @@ pub fn use_insertion_offset(node: &SyntaxNode, text: &str) -> usize {
 		.ancestors()
 		.find_map(|a| ast::ItemList::cast(a.clone()).map(|il| il.syntax().clone()))
 		.or_else(|| node.ancestors().last())
-		.map(|scope| scope.children().filter(|c| ast::Item::can_cast(c.kind())).collect())
+		.map(|scope| {
+			scope
+				.children()
+				.filter(|c| ast::Item::can_cast(c.kind()))
+				.collect()
+		})
 		.unwrap_or_default();
-	let last_use = scope_items.iter().rev().find(|c| c.kind() == SyntaxKind::USE);
+	let last_use = scope_items
+		.iter()
+		.rev()
+		.find(|c| c.kind() == SyntaxKind::USE);
 	if let Some(u) = last_use {
 		let end: usize = u.text_range().end().into();
 		// Move to the start of the next line.

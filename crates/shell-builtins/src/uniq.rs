@@ -3,11 +3,15 @@
 //! Ported from uutils coreutils 0.8.0.
 
 use std::{
+	ffi,
 	ffi::OsString,
 	fs::File,
+	io,
 	io::{BufRead, BufReader, BufWriter, Write},
+	mem,
 	num::IntErrorKind,
 	path::PathBuf,
+	str,
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
@@ -70,7 +74,7 @@ struct LineMeta {
 
 type PortResult<T> = Result<T, String>;
 
-fn io_error(context: &str, error: std::io::Error) -> String {
+fn io_error(context: &str, error: io::Error) -> String {
 	let mut message = error.to_string();
 	if let Some(pos) = message.find(" (os error ") {
 		message.truncate(pos);
@@ -117,8 +121,8 @@ impl UniqState {
 				if self.all_repeated {
 					self.write_line(writer, &current_buf, group_count, first_line_printed)?;
 					first_line_printed = true;
-					std::mem::swap(&mut current_buf, &mut next_buf);
-					std::mem::swap(&mut current_meta, &mut next_meta);
+					mem::swap(&mut current_buf, &mut next_buf);
+					mem::swap(&mut current_meta, &mut next_meta);
 				}
 				group_count += 1;
 			} else {
@@ -126,8 +130,8 @@ impl UniqState {
 					self.write_line(writer, &current_buf, group_count, first_line_printed)?;
 					first_line_printed = true;
 				}
-				std::mem::swap(&mut current_buf, &mut next_buf);
-				std::mem::swap(&mut current_meta, &mut next_meta);
+				mem::swap(&mut current_buf, &mut next_buf);
+				mem::swap(&mut current_meta, &mut next_meta);
 				group_count = 1;
 			}
 			next_buf.clear();
@@ -213,7 +217,7 @@ impl UniqState {
 				if self.is_c_locale {
 					// for C or POSIX we count bytes
 					key_start + remainder.len().min(limit)
-				} else if let Ok(valid) = std::str::from_utf8(remainder) {
+				} else if let Ok(valid) = str::from_utf8(remainder) {
 					// for UTF-8 we count characters
 					let prefix_len = Self::char_prefix_len(valid, limit);
 					key_start + prefix_len
@@ -856,7 +860,7 @@ fn run_uniq(matches: &ArgMatches, host: &mut Host) -> PortResult<()> {
 	uniq.write_uniq(reader, writer)
 }
 
-fn operand_path(host: &Host, operand: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+fn operand_path(host: &Host, operand: Option<&ffi::OsStr>) -> Option<PathBuf> {
 	operand
 		.filter(|path| *path != "-")
 		.map(|path| host.resolve(path))

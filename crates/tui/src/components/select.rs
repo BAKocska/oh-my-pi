@@ -9,6 +9,7 @@ use super::{
 	table::TableCell,
 };
 use crate::{
+	Icon,
 	component::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoChildren, PaintCtx, Slot, next_slot,
 	},
@@ -648,7 +649,7 @@ impl Select {
 					pc.frame.put(
 						stem_x,
 						line_y,
-						pc.ctx.charset.icon(crate::Icon::PreviewRail),
+						pc.ctx.charset.icon(Icon::PreviewRail),
 						dim(&pc.ctx.theme),
 					);
 				}
@@ -833,7 +834,7 @@ impl Component for Select {
 				let mut x = pc.frame.put(
 					rect.x,
 					y,
-					pc.ctx.charset.icon(crate::Icon::Search),
+					pc.ctx.charset.icon(Icon::Search),
 					Style::new().fg(pc.ctx.theme.accent),
 				);
 				x = pc.frame.put(x, y, " ", base(&pc.ctx.theme));

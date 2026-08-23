@@ -2,7 +2,14 @@ use std::io::{Read, Write};
 
 use clap::Parser;
 
-use crate::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, env, escape, variables};
+use crate::{
+	Error, ErrorKind, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions,
+	ShellFd, builtins,
+	builtins::terminal::{AutoModeGuard, Settings},
+	env, escape,
+	openfiles::OpenFile,
+	variables,
+};
 
 /// Read lines from standard input into an indexed array variable.
 #[derive(Parser)]
@@ -29,7 +36,7 @@ pub(crate) struct MapFileCommand {
 
 	/// File descriptor to read from (defaults to stdin).
 	#[arg(short = 'u', default_value_t = 0)]
-	fd: crate::ShellFd,
+	fd: ShellFd,
 
 	/// Name of function to call for each group of lines.
 	#[arg(short = 'C')]
@@ -45,12 +52,12 @@ pub(crate) struct MapFileCommand {
 }
 
 impl builtins::Command for MapFileCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		mut context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		mut context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		if let Some(origin) = self.origin {
 			if origin < 0 {
 				writeln!(context.stderr(), "{}: {origin}: invalid array origin", context.command_name)?;
@@ -100,11 +107,11 @@ impl builtins::Command for MapFileCommand {
 }
 
 impl MapFileCommand {
-	async fn read_entries<SE: crate::ShellExtensions>(
+	async fn read_entries<SE: ShellExtensions>(
 		&self,
-		mut input_file: crate::openfiles::OpenFile,
-		context: &mut crate::ExecutionContext<'_, SE>,
-	) -> Result<Option<ExecutionResult>, crate::Error> {
+		mut input_file: OpenFile,
+		context: &mut ExecutionContext<'_, SE>,
+	) -> Result<Option<ExecutionResult>, Error> {
 		let _term_mode = setup_terminal_settings(&input_file)?;
 
 		let mut entry_count = 0usize;
@@ -182,12 +189,12 @@ impl MapFileCommand {
 	}
 }
 
-async fn run_callback<SE: crate::ShellExtensions>(
+async fn run_callback<SE: ShellExtensions>(
 	callback: &str,
 	array_index: i64,
 	line: &str,
-	context: &mut crate::ExecutionContext<'_, SE>,
-) -> Result<ExecutionResult, crate::Error> {
+	context: &mut ExecutionContext<'_, SE>,
+) -> Result<ExecutionResult, Error> {
 	let index_arg = array_index.to_string();
 	let index_arg = escape::quote_if_needed(&index_arg, escape::QuoteMode::SingleQuote);
 	let line_arg = escape::quote_if_needed(line, escape::QuoteMode::SingleQuote);
@@ -206,12 +213,10 @@ async fn run_callback<SE: crate::ShellExtensions>(
 		.await
 }
 
-fn setup_terminal_settings(
-	file: &crate::openfiles::OpenFile,
-) -> Result<Option<crate::builtins::terminal::AutoModeGuard>, crate::Error> {
-	let mode = crate::builtins::terminal::AutoModeGuard::new(file.to_owned()).ok();
+fn setup_terminal_settings(file: &OpenFile) -> Result<Option<AutoModeGuard>, Error> {
+	let mode = AutoModeGuard::new(file.to_owned()).ok();
 	if let Some(mode) = &mode {
-		let config = crate::builtins::terminal::Settings::builder()
+		let config = Settings::builder()
 			.line_input(false)
 			.interrupt_signals(false)
 			.build();

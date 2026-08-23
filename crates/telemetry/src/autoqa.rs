@@ -6,13 +6,15 @@
 
 use serde_json::Value;
 
+use crate::redact;
+
 /// Produces a locally redacted JSON value suitable for issue transport.
 ///
 /// Invalid UTF-8 and non-JSON findings remain useful as a redacted JSON string;
 /// callers never receive or transport the unprojected bytes.
 pub fn project_payload(payload: &[u8]) -> Value {
 	let text = String::from_utf8_lossy(payload);
-	let redacted = crate::redact::redact_sensitive_credentials(&text);
+	let redacted = redact::redact_sensitive_credentials(&text);
 	serde_json::from_str(&redacted).unwrap_or(Value::String(redacted))
 }
 

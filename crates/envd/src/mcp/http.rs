@@ -1,8 +1,16 @@
 //! MCP Streamable HTTP transport with resumable SSE.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+	future::Future,
+	iter, mem,
+	pin::Pin,
+	str,
+	sync::{Arc, atomic},
+	time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
+use flume::Receiver;
 use futures::StreamExt as _;
 use http::{
 	HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
@@ -13,8 +21,10 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use wreq::redirect;
 
 use super::{
+	header_policy,
 	header_policy::{RedirectPolicy, redirect_location},
 	json_rpc::{RequestId, RequestIdAllocator, RequestIdFormat},
 	transport::{
@@ -70,7 +80,7 @@ impl WreqExchange {
 	pub fn new() -> Self {
 		Self {
 			client: wreq::Client::builder()
-				.redirect(wreq::redirect::Policy::none())
+				.redirect(redirect::Policy::none())
 				.build()
 				.expect("build MCP HTTP client"),
 		}
@@ -176,8 +186,8 @@ pub struct StreamableHttpTransport {
 	protocol_version: Mutex<Option<Str>>,
 	resume:           Mutex<ResumeState>,
 	incoming_tx:      flume::Sender<IncomingMessage>,
-	incoming_rx:      flume::Receiver<IncomingMessage>,
-	closed:           std::sync::atomic::AtomicBool,
+	incoming_rx:      Receiver<IncomingMessage>,
+	closed:           atomic::AtomicBool,
 }
 
 impl StreamableHttpTransport {
@@ -186,7 +196,7 @@ impl StreamableHttpTransport {
 		config: StreamableHttpConfig,
 		http: Arc<dyn HttpExchange>,
 	) -> Result<Self, TransportError> {
-		super::header_policy::validate_configured_headers(&config.headers)
+		header_policy::validate_configured_headers(&config.headers)
 			.map_err(|source| TransportError::pre_dispatch(TransportFailure::HeaderPolicy(source)))?;
 		let (incoming_tx, incoming_rx) = flume::bounded(256);
 		Ok(Self {
@@ -198,7 +208,7 @@ impl StreamableHttpTransport {
 			resume: Mutex::new(ResumeState::default()),
 			incoming_tx,
 			incoming_rx,
-			closed: std::sync::atomic::AtomicBool::new(false),
+			closed: atomic::AtomicBool::new(false),
 		})
 	}
 
@@ -299,7 +309,7 @@ impl StreamableHttpTransport {
 		params: Value,
 		cancellation: CancellationToken,
 	) -> Result<TransportResponse, TransportError> {
-		if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+		if self.closed.load(atomic::Ordering::Acquire) {
 			return Err(TransportError::pre_dispatch(TransportFailure::Closed));
 		}
 		let id = self
@@ -556,9 +566,7 @@ impl McpTransport for StreamableHttpTransport {
 
 	fn close(&self) -> TransportFuture<'_, Result<(), TransportError>> {
 		Box::pin(async move {
-			self
-				.closed
-				.store(true, std::sync::atomic::Ordering::Release);
+			self.closed.store(true, atomic::Ordering::Release);
 			if self.session_id.lock().is_some() {
 				let cancellation = CancellationToken::new();
 				let _ = self
@@ -636,13 +644,13 @@ pub(crate) struct SseEvent {
 	pub data:  String,
 }
 pub(crate) fn parse_sse_events(body: &[u8]) -> Result<Vec<SseEvent>, TransportFailure> {
-	let text = std::str::from_utf8(body).map_err(|_| TransportFailure::SseProtocol)?;
+	let text = str::from_utf8(body).map_err(|_| TransportFailure::SseProtocol)?;
 	let mut events = Vec::new();
 	let mut event = None;
 	let mut id = None;
 	let mut retry = None;
 	let mut data = String::new();
-	for line in text.lines().chain(std::iter::once("")) {
+	for line in text.lines().chain(iter::once("")) {
 		if line.is_empty() {
 			if event.is_some() || id.is_some() || !data.is_empty() {
 				if data.ends_with('\n') {
@@ -652,7 +660,7 @@ pub(crate) fn parse_sse_events(body: &[u8]) -> Result<Vec<SseEvent>, TransportFa
 					event: event.take(),
 					id:    id.take(),
 					retry: retry.take(),
-					data:  std::mem::take(&mut data),
+					data:  mem::take(&mut data),
 				});
 			}
 			continue;

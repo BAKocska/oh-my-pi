@@ -1,4 +1,4 @@
-use crate::{ExecutionResult, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
 
 /// No-op command.
 pub(crate) struct ColonCommand {}
@@ -8,7 +8,7 @@ impl builtins::SimpleCommand for ColonCommand {
 		_name: &str,
 		content_type: builtins::ContentType,
 		_options: &builtins::ContentOptions,
-	) -> Result<String, crate::Error> {
+	) -> Result<String, Error> {
 		match content_type {
 			builtins::ContentType::DetailedHelp => Ok("Null command; always returns success.".into()),
 			builtins::ContentType::ShortUsage => Ok(":: :".into()),
@@ -21,10 +21,10 @@ impl builtins::SimpleCommand for ColonCommand {
 		}
 	}
 
-	fn execute<SE: crate::ShellExtensions, I: Iterator<Item = S>, S: AsRef<str>>(
-		_context: crate::ExecutionContext<'_, SE>,
+	fn execute<SE: ShellExtensions, I: Iterator<Item = S>, S: AsRef<str>>(
+		_context: ExecutionContext<'_, SE>,
 		_args: I,
-	) -> Result<ExecutionResult, crate::Error> {
+	) -> Result<ExecutionResult, Error> {
 		Ok(ExecutionResult::success())
 	}
 }

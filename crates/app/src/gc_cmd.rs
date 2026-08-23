@@ -2,9 +2,11 @@
 
 use std::{
 	collections::{HashMap, HashSet},
-	fs::File,
+	fs::{self, File, OpenOptions},
+	io,
 	io::Write as _,
 	path::{Path, PathBuf},
+	time,
 	time::Duration,
 };
 
@@ -32,7 +34,7 @@ struct ArchivePlan {
 
 impl Drop for GcLock {
 	fn drop(&mut self) {
-		let _ = std::fs::remove_file(&self.0);
+		let _ = fs::remove_file(&self.0);
 	}
 }
 
@@ -110,7 +112,7 @@ pub fn run(args: GcArgs) -> miette::Result<()> {
 	}
 	if args.apply && args.archive {
 		for session in &candidates {
-			std::fs::remove_file(sessions_dir.join(format!("{}.jsonl", session.as_str())))
+			fs::remove_file(sessions_dir.join(format!("{}.jsonl", session.as_str())))
 				.into_diagnostic()?;
 		}
 	}
@@ -267,7 +269,7 @@ fn archive_session_files(
 	if !source.is_file() {
 		return Err(miette!("session journal is missing: {}", source.display()));
 	}
-	std::fs::create_dir_all(archive_dir).into_diagnostic()?;
+	fs::create_dir_all(archive_dir).into_diagnostic()?;
 	let destination = archive_dir.join(format!("{}.jsonl.gz", session.as_str()));
 	if destination.exists() {
 		return Err(miette!("archive destination already exists: {}", destination.display()));
@@ -276,15 +278,15 @@ fn archive_session_files(
 	let mut input = File::open(&source).into_diagnostic()?;
 	let mut encoder =
 		GzEncoder::new(File::create(&temporary).into_diagnostic()?, Compression::default());
-	std::io::copy(&mut input, &mut encoder).into_diagnostic()?;
+	io::copy(&mut input, &mut encoder).into_diagnostic()?;
 	let output = encoder.finish().into_diagnostic()?;
 	output.sync_all().into_diagnostic()?;
-	std::fs::rename(&temporary, &destination).into_diagnostic()?;
+	fs::rename(&temporary, &destination).into_diagnostic()?;
 	let artifacts = sessions_dir.join(session.as_str());
 	if artifacts.is_dir() {
-		std::fs::rename(&artifacts, archive_dir.join(session.as_str())).into_diagnostic()?;
+		fs::rename(&artifacts, archive_dir.join(session.as_str())).into_diagnostic()?;
 	}
-	Ok(std::fs::metadata(destination).into_diagnostic()?.len())
+	Ok(fs::metadata(destination).into_diagnostic()?.len())
 }
 
 fn optimize_index(path: &Path) -> miette::Result<()> {
@@ -318,18 +320,13 @@ fn checkpoint_databases(data_dir: &Path, index_path: &Path) -> miette::Result<()
 
 fn acquire_lock(path: &Path) -> miette::Result<GcLock> {
 	if let Some(parent) = path.parent() {
-		std::fs::create_dir_all(parent).into_diagnostic()?;
+		fs::create_dir_all(parent).into_diagnostic()?;
 	}
-	let create = || {
-		std::fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(path)
-	};
+	let create = || OpenOptions::new().write(true).create_new(true).open(path);
 	let mut file = match create() {
 		Ok(file) => file,
-		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && stale_lock(path) => {
-			std::fs::remove_file(path).into_diagnostic()?;
+		Err(error) if error.kind() == io::ErrorKind::AlreadyExists && stale_lock(path) => {
+			fs::remove_file(path).into_diagnostic()?;
 			create().into_diagnostic()?
 		},
 		Err(error) => return Err(error).into_diagnostic(),
@@ -340,7 +337,7 @@ fn acquire_lock(path: &Path) -> miette::Result<GcLock> {
 }
 
 fn stale_lock(path: &Path) -> bool {
-	let Ok(text) = std::fs::read_to_string(path) else {
+	let Ok(text) = fs::read_to_string(path) else {
 		return false;
 	};
 	let Ok(pid) = text.trim().parse::<u32>() else {
@@ -348,7 +345,9 @@ fn stale_lock(path: &Path) -> bool {
 	};
 	#[cfg(unix)]
 	{
-		nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err()
+		use nix::{sys::signal, unistd::Pid};
+
+		signal::kill(Pid::from_raw(pid as i32), None).is_err()
 	}
 	#[cfg(not(unix))]
 	{
@@ -358,7 +357,7 @@ fn stale_lock(path: &Path) -> bool {
 }
 
 fn now_ms() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	time::SystemTime::now()
+		.duration_since(time::UNIX_EPOCH)
 		.map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }

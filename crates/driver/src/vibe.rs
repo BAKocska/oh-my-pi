@@ -2,7 +2,8 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
-	fmt,
+	error,
+	fmt::{self, Display},
 	sync::{
 		Arc, LazyLock, Weak,
 		atomic::{AtomicBool, Ordering},
@@ -16,7 +17,7 @@ use futures::Stream;
 use omp_agent::{AgentStatus, RegistryStatus};
 use omp_core::{Str, sf};
 use omp_envd::eval::ParentSessionHost as _;
-use omp_proto::thread::v1::{Item, Message, Part as ThreadPart, Role, item, part};
+use omp_proto::thread::v1::{Item, Message, Part as ThreadPart, Role, item};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, ArtifactLifetime, CommitError, Constraint, Effects, Ev,
 	ExpectedArtifact, IncomingParams, JobKind, JobMetadata, JobOwner, JobRef, ParamError, Part,
@@ -26,7 +27,7 @@ use parking_lot::{Mutex, RwLock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time, time::MissedTickBehavior};
 
 use crate::{chat::ChatParentHost, modes::CampaignHandle};
 
@@ -392,13 +393,13 @@ impl Fault {
 	}
 }
 
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.message)
 	}
 }
 
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 #[async_trait]
 trait VibeBackend: Send + Sync {
@@ -550,8 +551,8 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 
 	fn start_scheduler(backend: Weak<Self>) {
 		drop(tokio::spawn(async move {
-			let mut tick = tokio::time::interval(Duration::from_secs(1));
-			tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			let mut tick = time::interval(Duration::from_secs(1));
+			tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 			loop {
 				tick.tick().await;
 				let Some(backend) = backend.upgrade() else {
@@ -821,7 +822,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 				.is_some_and(|worker| worker.running);
 			if waiting {
 				if let Some(limit) = timeout_ms {
-					if tokio::time::timeout(Duration::from_millis(limit), notified)
+					if time::timeout(Duration::from_millis(limit), notified)
 						.await
 						.is_err()
 					{
@@ -876,7 +877,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 				self.parent.release_child(id.as_str()).await;
 			}
 		};
-		let _ = tokio::time::timeout(Duration::from_secs(5), release).await;
+		let _ = time::timeout(Duration::from_secs(5), release).await;
 		Ok(json!({ "stopped": ids }))
 	}
 
@@ -919,7 +920,9 @@ fn system_item(text: Str) -> Item {
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(Message {
 			role:  i32::from(Role::System),
-			parts: vec![ThreadPart { kind: Some(part::Kind::Text(text.to_string())) }],
+			parts: vec![ThreadPart {
+				kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_string())),
+			}],
 		})),
 		props:         None,
 	}

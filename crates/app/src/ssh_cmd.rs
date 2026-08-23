@@ -1,6 +1,9 @@
 //! Authoritative scoped native SSH configuration and standalone client.
 
-use std::path::PathBuf;
+use std::{
+	env,
+	path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand, ValueEnum};
 use miette::IntoDiagnostic as _;
@@ -66,11 +69,16 @@ pub enum SshCommand {
 		scope: SshScope,
 	},
 	/// Probe pinned-host-key authentication and SFTP support.
-	Probe { alias: Str },
+	Probe {
+		/// Configured host alias to authenticate and inspect.
+		alias: Str,
+	},
 	/// Execute one bounded remote command.
 	Exec {
+		/// Configured host alias on which to run the command.
 		alias:   Str,
 		#[arg(trailing_var_arg = true, required = true)]
+		/// Executable and arguments passed verbatim to the remote process.
 		command: Vec<Str>,
 	},
 }
@@ -80,7 +88,7 @@ pub async fn run(args: SshArgs) -> miette::Result<()> {
 	let user = omp_core::dirs::data_dir(None)
 		.into_diagnostic()?
 		.join("hosts.toml");
-	let project = std::env::current_dir()
+	let project = env::current_dir()
 		.into_diagnostic()?
 		.join(".omp/hosts.toml");
 	match args.command {
@@ -155,11 +163,7 @@ pub async fn run(args: SshArgs) -> miette::Result<()> {
 	}
 }
 
-pub(crate) fn service(
-	alias: &str,
-	project: &std::path::Path,
-	user: &std::path::Path,
-) -> miette::Result<SshService> {
+pub(crate) fn service(alias: &str, project: &Path, user: &Path) -> miette::Result<SshService> {
 	let project_store = HostStore::load(project).into_diagnostic()?;
 	if project_store.get(alias).is_ok() {
 		Ok(SshService::new(project_store))
@@ -170,11 +174,7 @@ pub(crate) fn service(
 	}
 }
 
-fn scope_path<'a>(
-	scope: SshScope,
-	project: &'a std::path::Path,
-	user: &'a std::path::Path,
-) -> &'a std::path::Path {
+fn scope_path<'a>(scope: SshScope, project: &'a Path, user: &'a Path) -> &'a Path {
 	match scope {
 		SshScope::Project => project,
 		SshScope::User => user,
@@ -183,9 +183,9 @@ fn scope_path<'a>(
 
 fn scoped_paths<'a>(
 	scope: Option<SshScope>,
-	project: &'a std::path::Path,
-	user: &'a std::path::Path,
-) -> Vec<(&'static str, &'a std::path::Path)> {
+	project: &'a Path,
+	user: &'a Path,
+) -> Vec<(&'static str, &'a Path)> {
 	match scope {
 		Some(SshScope::Project) => vec![("project", project)],
 		Some(SshScope::User) => vec![("user", user)],

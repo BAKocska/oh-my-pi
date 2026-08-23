@@ -1,6 +1,6 @@
 //! Deterministic TAR fixtures built independently of `omp_ar`.
 
-use std::io::Write;
+use std::{io::Write, iter};
 
 use flate2::{Compression, GzBuilder};
 
@@ -95,7 +95,7 @@ pub fn old_gnu_sparse_fixture() -> Vec<u8> {
 	const REAL_SIZE: u64 = 9 * BLOCK_SIZE as u64;
 	let mut stored = Vec::with_capacity(4 * CHUNK + 4);
 	for byte in *b"ABCD" {
-		stored.extend(std::iter::repeat_n(byte, CHUNK));
+		stored.extend(iter::repeat_n(byte, CHUNK));
 	}
 	stored.extend_from_slice(b"tail");
 

@@ -2,20 +2,24 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::{ExecutionResult, builtins, timing};
+use crate::{
+	Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins,
+	sys::resource::{get_children_user_and_system_time, get_self_user_and_system_time},
+	timing,
+};
 
 /// Report on usage time.
 #[derive(Parser)]
 pub(crate) struct TimesCommand {}
 
 impl builtins::Command for TimesCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
+		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
-		let (self_user, self_system) = crate::sys::resource::get_self_user_and_system_time()?;
+		let (self_user, self_system) = get_self_user_and_system_time()?;
 		writeln!(
 			context.stdout(),
 			"{} {}",
@@ -23,8 +27,7 @@ impl builtins::Command for TimesCommand {
 			timing::format_duration_non_posixly(&self_system),
 		)?;
 
-		let (children_user, children_system) =
-			crate::sys::resource::get_children_user_and_system_time()?;
+		let (children_user, children_system) = get_children_user_and_system_time()?;
 		writeln!(
 			context.stdout(),
 			"{} {}",

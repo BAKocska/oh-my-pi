@@ -11,20 +11,25 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
+use omp_catalog::snapshot;
 use omp_core::{ExposeSecret as _, SecretString, Str, base64_url, parse_rfc3339, sf};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use serde_json::{Map, Value};
+use tokio::{sync::Mutex, time};
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
+	account::AccountPool,
 	answer::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageResetCredit, UsageResetCredits,
 		UsageStatus, UsageUnit, UsageWindow, UsageWindowKind,
 	},
 	auth::{
-		CredentialNeed, CredentialSource as _, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse,
+		CredentialBroker, CredentialNeed, CredentialSource as _, OAuthHttpClient, OAuthHttpRequest,
+		OAuthHttpResponse,
 	},
-	catalog::ProviderId,
+	catalog::{AuthSpecId, ProviderId},
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
 	},
@@ -84,7 +89,7 @@ pub fn normalize_codex_base_url(base_url: Option<&str>) -> Str {
 	let Some(trimmed) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
 		return sf!(CODEX_BASE_URL);
 	};
-	let Ok(url) = url::Url::parse(trimmed.trim_end_matches('/')) else {
+	let Ok(url) = Url::parse(trimmed.trim_end_matches('/')) else {
 		return sf!(CODEX_BASE_URL);
 	};
 	let Some(host) = url.host_str() else {
@@ -566,12 +571,12 @@ impl Default for CodexRedemptionCoordinator {
 /// access token per attempt, so tokens never escape this crate. The app
 /// adapts this onto the agent's `RedemptionAuthority` boundary.
 pub struct CodexRedemption {
-	auth:        crate::catalog::AuthSpecId,
+	auth:        AuthSpecId,
 	provider:    ProviderId,
-	broker:      crate::auth::CredentialBroker,
-	accounts:    crate::account::AccountPool,
+	broker:      CredentialBroker,
+	accounts:    AccountPool,
 	http:        Arc<dyn OAuthHttpClient>,
-	coordinator: tokio::sync::Mutex<CodexRedemptionCoordinator>,
+	coordinator: Mutex<CodexRedemptionCoordinator>,
 }
 
 impl CodexRedemption {
@@ -580,9 +585,9 @@ impl CodexRedemption {
 	/// Returns `None` when the provider is absent so hosts without Codex skip
 	/// registration entirely.
 	pub fn from_catalog(
-		catalog: &omp_catalog::snapshot::Catalog,
-		broker: crate::auth::CredentialBroker,
-		accounts: crate::account::AccountPool,
+		catalog: &snapshot::Catalog,
+		broker: CredentialBroker,
+		accounts: AccountPool,
 		http: Arc<dyn OAuthHttpClient>,
 	) -> Option<Self> {
 		let provider = ProviderId::from(PROVIDER);
@@ -596,7 +601,7 @@ impl CodexRedemption {
 			broker,
 			accounts,
 			http,
-			coordinator: tokio::sync::Mutex::new(CodexRedemptionCoordinator::default()),
+			coordinator: Mutex::new(CodexRedemptionCoordinator::default()),
 		})
 	}
 
@@ -876,7 +881,7 @@ async fn execute(
 	deadline: Option<Instant>,
 ) -> Result<OAuthHttpResponse, UsageFetchError> {
 	match deadline {
-		Some(deadline) => tokio::time::timeout_at(deadline.into(), http.execute(request))
+		Some(deadline) => time::timeout_at(deadline.into(), http.execute(request))
 			.await
 			.map_err(|_| UsageFetchError::Unavailable)?
 			.map_err(|_| UsageFetchError::Unavailable),

@@ -2,20 +2,27 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	env,
+	env::consts,
 	future::Future,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::{Arc, LazyLock},
+	time,
 };
 
+use omp_agent::control;
 use omp_catalog::{ModelKey, snapshot::Catalog};
 use omp_core::{Duration, Hash32, InvocationPhase, LifecyclePhase, Str, sf};
 use omp_proto::{
-	inference::v1::tool_def,
+	inference::{v1, v1::tool_def},
 	prost::Message as _,
+	thread::v1::Blob,
 	toolhost::v1::{
 		GrammarSyntax as WorkerGrammarSyntax, PreludeParamKind, ToolDecl, tool_constraint,
 	},
 };
+use omp_settings::manager::{SettingsManager, SettingsPaths};
+use omp_storage::{github_cache::GithubCache, telemetry_index::TelemetryIndex};
 use omp_tool::{
 	AvailabilityDelta, Claims, Constraint, GrammarSyntax, LeafOwner, LeafReplacementError,
 	LeafReplacementRegistry, LeafVersion, Precedence, Presentation, Registry, RegistryLeaf, Rev,
@@ -23,15 +30,21 @@ use omp_tool::{
 };
 use omp_tools::{
 	BuiltinRendererIdentities,
+	ask::PresenterSlot,
+	checkpoint,
 	device::{DeviceCatalog, dyn_enabled, dyn_tool, flatten_slots},
-	edit::{EditRevisionCandidates, FormatPolicy, resolve_edit_revision},
+	edit::{EditRevisionCandidates, resolve_edit_revision},
+	eval::{EvalSessionControl, TaskDescriptionSnapshot},
+	goal,
 	read::{
 		Fault as ReadFault,
 		conflicts::ConflictRegistry,
-		resolver::{ResourceCompletion, ResourceList, SchemeEntry},
+		resolver::{ResolverTable, ResourceCompletion, ResourceList, SchemeEntry},
 		selector::ParsedSelector,
 	},
 	register_builtin_renderers,
+	shell::TimeoutBounds,
+	staging::PreviewRegistry,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -39,7 +52,9 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use super::{
 	EnvdError,
 	blobs::BlobHost,
+	computer::ComputerSessionHost,
 	docs::{DocumentHost, ResourceMutationServices},
+	document_cache,
 	eval::{
 		PRELUDE_PYTHON_KEYWORDS, PRELUDE_RESERVED_NAMES, PreludeHelper, PreludeInvoker,
 		PreludeParamStub, PreludeTable, ProcessEvalExec, SessionBridgeHost,
@@ -54,20 +69,29 @@ use super::{
 		},
 		dispatch::{CallbackDispatcher, NestedCallbackDispatcher},
 	},
+	github::GithubService,
+	managed_skills::ManagedSkills,
+	mcp::McpService,
 	media_devices,
+	memory::ReflectionBridgeHost,
 	search_backend::SearchBridgeHost,
+	ssh::{HostStore, SshService},
 	tool_debug::DocumentDebugControl,
 	tool_lsp::DocumentLspControl,
 	tool_read_sources::ReadSourceAdapter,
 	tool_search::WorkspaceSearchAdapter,
 	tool_settings::ToolSettings,
 	tool_shell::{AcpExecSlot, ShellExecHost},
-	tool_url::production_url_resolvers,
+	tool_url::{UrlResolver, production_url_resolvers},
+	vault::VaultService,
 	worker::{
 		ExtHostSupervisor, SealedRegistryEvidence, SealedRegistryEvidenceError,
 		seal_registry_evidence,
 	},
 	workspace::WorkspaceHost,
+};
+use crate::{
+	browser_daemon::BrowserDaemon, github_url::GithubCredentialBridge, host_settings::HostSettings,
 };
 
 tokio::task_local! {
@@ -642,7 +666,7 @@ impl DeviceControlFactory {
 				"omp.devices.call",
 				callback_args,
 				CallbackConcurrency::Serialized,
-				request_timeout(arguments, std::time::Duration::from_secs(30))?,
+				request_timeout(arguments, time::Duration::from_secs(30))?,
 				None,
 				Some(path),
 			)
@@ -758,8 +782,8 @@ fn valid_device_subpath(path: &str) -> bool {
 
 fn request_timeout(
 	arguments: &JsonMap<String, JsonValue>,
-	default: std::time::Duration,
-) -> Result<std::time::Duration, ControlProtocolError> {
+	default: time::Duration,
+) -> Result<time::Duration, ControlProtocolError> {
 	let Some(value) = arguments.get("deadline") else {
 		return Ok(default);
 	};
@@ -904,7 +928,7 @@ pub struct HookEventPolicy {
 	/// Exact payload/decision schema revision.
 	pub revision:    u16,
 	/// Deadline used when a subscription has no narrower timeout.
-	pub timeout:     std::time::Duration,
+	pub timeout:     time::Duration,
 	/// Event-level failure default.
 	pub on_failure:  HookFailurePolicy,
 	/// Decision returned when every subscription defers.
@@ -929,7 +953,7 @@ pub struct HookSubscription {
 	/// Per-subscription failure override.
 	pub on_failure:  Option<HookFailurePolicy>,
 	/// Per-subscription deadline override.
-	pub timeout:     Option<std::time::Duration>,
+	pub timeout:     Option<time::Duration>,
 	/// Declared callback overlap policy.
 	pub concurrency: CallbackConcurrency,
 }
@@ -1257,6 +1281,7 @@ impl ControlAuthority for BoundHookControl {
 	}
 }
 
+/// Active project content used to configure environment-owned tool resolvers.
 #[derive(Default)]
 pub struct ActiveContentInputs {
 	/// Skill names authored outside the managed provider.
@@ -1268,7 +1293,7 @@ pub struct ActiveContentInputs {
 /// Object-safe composition boundary for one active internal-URL resolver.
 ///
 /// This mirrors the cold resolver-table calls because
-/// [`omp_tools::read::resolver::Resolve`] uses return-position `impl Future`
+/// [`read::resolver::Resolve`] uses return-position `impl Future`
 /// and therefore cannot be used as a trait object.
 #[async_trait::async_trait]
 pub trait ContentResolver: Send + Sync + 'static {
@@ -1322,7 +1347,7 @@ pub trait ContentResolver: Send + Sync + 'static {
 
 /// Object-safe campaign authority supplied by composition.
 ///
-/// This exists because [`omp_tools::goal::GoalControl`] requires `Clone` and
+/// This exists because [`goal::GoalControl`] requires `Clone` and
 /// uses return-position `impl Future`, so that tools trait is not
 /// dyn-compatible.
 #[async_trait::async_trait]
@@ -1331,7 +1356,7 @@ pub trait GoalAuthority: Send + Sync + 'static {
 	async fn apply(
 		&self,
 		params: omp_tools::goal::Params,
-	) -> Result<Option<omp_tools::goal::Goal>, omp_tools::goal::Fault>;
+	) -> Result<Option<omp_tools::goal::Goal>, goal::Fault>;
 }
 
 /// Auxiliary inference used by workspace search and media tools.
@@ -1340,19 +1365,19 @@ pub trait SearchInference: Send + Sync + 'static {
 	/// Performs one web-search request.
 	async fn search(
 		&self,
-		request: omp_proto::inference::v1::SearchRequest,
-	) -> Result<omp_proto::inference::v1::SearchResponse, omp_tools::web_search::BackendError>;
+		request: v1::SearchRequest,
+	) -> Result<v1::SearchResponse, omp_tools::web_search::BackendError>;
 
 	/// Generates or edits images and returns the final blobs.
 	async fn generate_image(
 		&self,
-		request: omp_proto::inference::v1::GenerateImageRequest,
-	) -> Result<Vec<omp_proto::thread::v1::Blob>, omp_tools::web_search::BackendError>;
+		request: v1::GenerateImageRequest,
+	) -> Result<Vec<Blob>, omp_tools::web_search::BackendError>;
 
 	/// Synthesizes speech and returns the encoded bytes in wire order.
 	async fn speak(
 		&self,
-		request: omp_proto::inference::v1::SpeakRequest,
+		request: v1::SpeakRequest,
 	) -> Result<Vec<u8>, omp_tools::web_search::BackendError>;
 }
 
@@ -1378,11 +1403,7 @@ pub trait HostResources: Send + Sync + 'static {
 /// Starts background telemetry delivery once the credential bridge exists.
 pub trait TelemetryUpload: Send + Sync + 'static {
 	/// Starts delivery for one Environment telemetry index.
-	fn start(
-		&self,
-		index: Arc<omp_storage::telemetry_index::TelemetryIndex>,
-		credentials: Arc<crate::github_url::GithubCredentialBridge>,
-	);
+	fn start(&self, index: Arc<TelemetryIndex>, credentials: Arc<GithubCredentialBridge>);
 }
 
 /// Runs one native tool stream under its authenticated invocation restrictions.
@@ -1399,16 +1420,14 @@ pub(super) fn pty_denied() -> bool {
 }
 
 fn configured_model_edit_revision(
-	data_dir: &std::path::Path,
-	project_root: &std::path::Path,
+	data_dir: &Path,
+	project_root: &Path,
 ) -> Result<Option<Rev>, EnvdError> {
-	let manager = omp_settings::manager::SettingsManager::open(
-		omp_settings::manager::SettingsPaths::discover(data_dir, Some(project_root)),
-	)
-	.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let snapshot = manager.snapshot();
 	let settings = snapshot
-		.project::<crate::host_settings::HostSettings>()
+		.project::<HostSettings>()
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let Some(selector) = settings.get().default_model.clone() else {
 		return Ok(None);
@@ -1438,13 +1457,13 @@ pub(crate) fn production_registry<
 	documents: &DocumentHost,
 	blobs: &BlobHost,
 	exec: &ExecHost,
-	state_dir: &std::path::Path,
+	state_dir: &Path,
 	session_id: &str,
-	github_cache: Arc<omp_storage::github_cache::GithubCache>,
-	mcp: &Arc<super::mcp::McpService>,
+	github_cache: Arc<GithubCache>,
+	mcp: &Arc<McpService>,
 	workspace: &WorkspaceHost,
 	memory: &Arc<omp_memory::MemoryRuntime>,
-	telemetry: &Arc<omp_storage::telemetry_index::TelemetryIndex>,
+	telemetry: &Arc<TelemetryIndex>,
 	root_uri: &Str,
 	workers: &ExtHostSupervisor,
 	interrupt_grace: Duration,
@@ -1462,14 +1481,14 @@ pub(crate) fn production_registry<
 	(
 		Arc<Registry>,
 		Arc<SessionBridgeHost>,
-		Arc<super::memory::ReflectionBridgeHost>,
-		omp_tools::eval::EvalSessionControl,
+		Arc<ReflectionBridgeHost>,
+		EvalSessionControl,
 		AgentCheckpointControl,
-		omp_tools::staging::PreviewRegistry,
-		Arc<omp_tools::read::resolver::ResolverTable<super::tool_url::UrlResolver>>,
+		PreviewRegistry,
+		Arc<ResolverTable<UrlResolver>>,
 		Arc<SearchBridgeHost>,
-		Arc<super::github_url::GithubCredentialBridge>,
-		omp_tools::ask::PresenterSlot,
+		Arc<GithubCredentialBridge>,
+		PresenterSlot,
 	),
 	EnvdError,
 > {
@@ -1483,8 +1502,8 @@ pub(crate) fn production_registry<
 		ask_presenter,
 		content,
 	} = bridges;
-	let previews = omp_tools::staging::PreviewRegistry::new();
-	let ask_presenter = omp_tools::ask::PresenterSlot::new(
+	let previews = PreviewRegistry::new();
+	let ask_presenter = PresenterSlot::new(
 		ask_presenter.unwrap_or_else(|| Arc::new(omp_tools::ask::HeadlessPresenter)),
 	);
 	registry.protect_core_claims([
@@ -1544,13 +1563,13 @@ pub(crate) fn production_registry<
 		dynamic.register(&mut registry)?;
 	}
 	let search_bridge = Arc::new(SearchBridgeHost::new(search));
-	let browser_daemon = crate::browser_daemon::BrowserDaemon::start(blobs.clone());
+	let browser_daemon = BrowserDaemon::start(blobs.clone());
 	registry.register(
 		omp_tools::browser::tool(browser_daemon),
 		Presentation::Device,
 		builtin_device_claims(),
 	)?;
-	let computer = super::computer::ComputerSessionHost::new(blobs.clone());
+	let computer = ComputerSessionHost::new(blobs.clone());
 	registry.register(
 		omp_tools::computer::tool(computer),
 		Presentation::Device,
@@ -1571,7 +1590,7 @@ pub(crate) fn production_registry<
 		Presentation::Device,
 		builtin_device_claims(),
 	)?;
-	let reflection_bridge = Arc::new(super::memory::ReflectionBridgeHost::new());
+	let reflection_bridge = Arc::new(ReflectionBridgeHost::new());
 	let memory_capabilities = memory.capabilities();
 	if memory_capabilities.writable {
 		registry.register(
@@ -1601,10 +1620,7 @@ pub(crate) fn production_registry<
 	}
 	if autolearn_settings.enabled {
 		if let Some(managed_skills_root) = content.managed_skills_root {
-			let authority = Arc::new(super::managed_skills::ManagedSkills::new(
-				managed_skills_root,
-				content.authored_skills,
-			));
+			let authority = Arc::new(ManagedSkills::new(managed_skills_root, content.authored_skills));
 			registry.register(
 				omp_tools::manage_skill::tool(Arc::clone(&authority)),
 				Presentation::Device,
@@ -1619,8 +1635,8 @@ pub(crate) fn production_registry<
 			}
 		}
 	}
-	let github_credentials = Arc::new(super::github_url::GithubCredentialBridge::new());
-	let github = super::github::GithubService::new(
+	let github_credentials = Arc::new(GithubCredentialBridge::new());
+	let github = GithubService::new(
 		workspace.root().to_path_buf(),
 		state_dir,
 		Arc::clone(&github_credentials),
@@ -1633,11 +1649,11 @@ pub(crate) fn production_registry<
 		Presentation::Device,
 		builtin_device_claims(),
 	)?;
-	let ssh = super::ssh::SshService::new(
-		super::ssh::HostStore::load(&state_dir.join("ssh/hosts.toml"))
+	let ssh = SshService::new(
+		HostStore::load(&state_dir.join("ssh/hosts.toml"))
 			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 	);
-	let vault = super::vault::VaultService::load(&state_dir.join("vaults.toml"))
+	let vault = VaultService::load(&state_dir.join("vaults.toml"))
 		.map_err(|error| EnvdError::State(Str::new(error.to_string())))?;
 	documents.set_resource_mutations(ResourceMutationServices {
 		ssh:   ssh.clone(),
@@ -1646,7 +1662,7 @@ pub(crate) fn production_registry<
 	let read_sources = ReadSourceAdapter::new(
 		documents.clone(),
 		workspace.clone(),
-		super::document_cache::project_document_cache(state_dir),
+		document_cache::project_document_cache(state_dir),
 	);
 	let conflicts = Arc::new(ConflictRegistry::default());
 	let resolvers = production_url_resolvers(
@@ -1663,8 +1679,8 @@ pub(crate) fn production_registry<
 		ssh,
 		vault,
 	);
-	let environment_edit_dialect = std::env::var("OMP_EDIT_DIALECT").ok();
-	let force_hashline = std::env::var_os("OMP_STRICT_EDIT_MODE").is_some();
+	let environment_edit_dialect = env::var("OMP_EDIT_DIALECT").ok();
+	let force_hashline = env::var_os("OMP_STRICT_EDIT_MODE").is_some();
 	let model_edit_revision = configured_model_edit_revision(state_dir, workspace.root())?;
 	let selected_edit = resolve_edit_revision(EditRevisionCandidates {
 		environment: environment_edit_dialect.as_deref(),
@@ -1814,7 +1830,7 @@ pub(crate) fn production_registry<
 		let maximum = tool_settings
 			.max_timeout
 			.and_then(|duration| duration.to_std().ok())
-			.unwrap_or_else(|| std::time::Duration::from_secs(300));
+			.unwrap_or_else(|| time::Duration::from_secs(300));
 		registry.register(
 			omp_tools::lsp::tool(DocumentLspControl::new(documents.clone(), exec.clone()), maximum),
 			Presentation::Slot,
@@ -1825,7 +1841,7 @@ pub(crate) fn production_registry<
 		let maximum = tool_settings
 			.max_timeout
 			.and_then(|duration| duration.to_std().ok())
-			.unwrap_or_else(|| std::time::Duration::from_secs(300));
+			.unwrap_or_else(|| time::Duration::from_secs(300));
 		registry.register(
 			omp_tools::debug::tool(DocumentDebugControl::new(documents.clone()), maximum),
 			Presentation::Slot,
@@ -1871,15 +1887,15 @@ pub(crate) fn production_registry<
 		})
 		.collect::<Vec<_>>();
 	let eval_host = Arc::new(SessionBridgeHost::new());
-	let mut eval_control = omp_tools::eval::EvalSessionControl::default();
+	let mut eval_control = EvalSessionControl::default();
 	let eval_identity = if tool_settings.enabled("eval") {
 		match preflight_python_eval(Arc::clone(&eval_host), interrupt_grace, blobs.clone()) {
 			Ok(eval_exec) => {
 				let (eval_tool, control) = omp_tools::eval::eval_controlled_with_task_snapshot(
 					eval_exec,
-					omp_tools::eval::TaskDescriptionSnapshot {
+					TaskDescriptionSnapshot {
 						helpers: &helper_docs,
-						..omp_tools::eval::TaskDescriptionSnapshot::standard()
+						..TaskDescriptionSnapshot::standard()
 					},
 				);
 				let identity = eval_tool.spec().identity();
@@ -1957,7 +1973,7 @@ pub(crate) fn production_registry<
 			.collect::<Arc<[_]>>();
 		let snapshot = omp_tools::shell::ShellPromptSnapshot {
 			sibling_tools,
-			platform: Str::new(std::env::consts::OS),
+			platform: Str::new(consts::OS),
 			embedded_builtins: shell_settings.embedded_builtins,
 			interceptor_enabled: shell_settings.interceptor.enabled,
 			interceptor_rules: shell_settings
@@ -1989,7 +2005,7 @@ pub(crate) fn production_registry<
 		)
 		.with_auto_background(
 			shell_settings.auto_background.enabled,
-			std::time::Duration::from_millis(shell_settings.auto_background.threshold_ms),
+			time::Duration::from_millis(shell_settings.auto_background.threshold_ms),
 		);
 		let identity = shell.spec().identity();
 		registry.register(shell, Presentation::Slot, core_claims())?;
@@ -2085,8 +2101,7 @@ impl omp_tools::goal::GoalControl for GoalControlAdapter {
 	fn apply(
 		&self,
 		params: omp_tools::goal::Params,
-	) -> impl Future<Output = Result<Option<omp_tools::goal::Goal>, omp_tools::goal::Fault>> + Send + '_
-	{
+	) -> impl Future<Output = Result<Option<omp_tools::goal::Goal>, goal::Fault>> + Send + '_ {
 		async move { self.0.apply(params).await }
 	}
 }
@@ -2125,7 +2140,7 @@ impl AgentCheckpointControl {
 			.as_ref()
 			.map(|binding| binding.sender.clone())
 			.ok_or_else(|| omp_tools::checkpoint::CheckpointFault {
-				code:    omp_tools::checkpoint::FaultCode::Control,
+				code:    checkpoint::FaultCode::Control,
 				message: sf!("active Agent CONTROL is not bound"),
 			})
 	}
@@ -2158,41 +2173,38 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 	}
 }
 
-fn checkpoint_fault(
-	error: omp_agent::control::ControlError,
-) -> omp_tools::checkpoint::CheckpointFault {
+fn checkpoint_fault(error: control::ControlError) -> omp_tools::checkpoint::CheckpointFault {
 	let (code, message) = match error {
-		omp_agent::control::ControlError::CheckpointAlreadyActive => {
-			(omp_tools::checkpoint::FaultCode::AlreadyActive, sf!("checkpoint already active"))
+		control::ControlError::CheckpointAlreadyActive => {
+			(checkpoint::FaultCode::AlreadyActive, sf!("checkpoint already active"))
 		},
-		omp_agent::control::ControlError::NoActiveCheckpoint => (
-			omp_tools::checkpoint::FaultCode::NoActive,
+		control::ControlError::NoActiveCheckpoint => (
+			checkpoint::FaultCode::NoActive,
 			sf!("no active checkpoint; create a checkpoint before calling rewind"),
 		),
-		omp_agent::control::ControlError::CheckpointAlreadyCompleted => (
-			omp_tools::checkpoint::FaultCode::AlreadyCompleted,
+		control::ControlError::CheckpointAlreadyCompleted => (
+			checkpoint::FaultCode::AlreadyCompleted,
 			sf!("checkpoint already completed; continue from the retained rewind report"),
 		),
-		omp_agent::control::ControlError::WrongCheckpointToken => (
-			omp_tools::checkpoint::FaultCode::WrongToken,
+		control::ControlError::WrongCheckpointToken => (
+			checkpoint::FaultCode::WrongToken,
 			sf!("checkpoint token does not belong to the active session"),
 		),
-		omp_agent::control::ControlError::EmptyRewindReport => {
-			(omp_tools::checkpoint::FaultCode::EmptyReport, sf!("rewind report must not be empty"))
+		control::ControlError::EmptyRewindReport => {
+			(checkpoint::FaultCode::EmptyReport, sf!("rewind report must not be empty"))
 		},
-		omp_agent::control::ControlError::RewindAlreadyScheduled => (
-			omp_tools::checkpoint::FaultCode::AlreadyScheduled,
+		control::ControlError::RewindAlreadyScheduled => (
+			checkpoint::FaultCode::AlreadyScheduled,
 			sf!("rewind already scheduled for the active checkpoint"),
 		),
-		omp_agent::control::ControlError::Closed
-		| omp_agent::control::ControlError::Journal(_)
-		| omp_agent::control::ControlError::CampaignEngage(_)
-		| omp_agent::control::ControlError::CampaignDisengage(_)
-		| omp_agent::control::ControlError::CampaignArbiter(_)
-		| omp_agent::control::ControlError::UnknownCoreCampaign { .. } => (
-			omp_tools::checkpoint::FaultCode::Control,
-			sf!("active Agent CONTROL checkpoint operation failed"),
-		),
+		control::ControlError::Closed
+		| control::ControlError::Journal(_)
+		| control::ControlError::CampaignEngage(_)
+		| control::ControlError::CampaignDisengage(_)
+		| control::ControlError::CampaignArbiter(_)
+		| control::ControlError::UnknownCoreCampaign { .. } => {
+			(checkpoint::FaultCode::Control, sf!("active Agent CONTROL checkpoint operation failed"))
+		},
 	};
 	omp_tools::checkpoint::CheckpointFault { code, message }
 }
@@ -2235,8 +2247,8 @@ const fn builtin_device_claims() -> Claims {
 	Claims { precedence: Precedence::ENHANCEMENT, claimant: sf!("omp/core"), replaces: None }
 }
 
-fn shell_timeout_bounds(settings: &ToolSettings) -> omp_tools::shell::TimeoutBounds {
-	let mut bounds = omp_tools::shell::TimeoutBounds::default();
+fn shell_timeout_bounds(settings: &ToolSettings) -> TimeoutBounds {
+	let mut bounds = TimeoutBounds::default();
 	let Some(maximum) = settings.max_timeout else {
 		return bounds;
 	};
@@ -2495,10 +2507,7 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 			})
 			.unwrap_or(false);
 		return Ok(if strict {
-			Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_proto::inference::v1::Fallback::Unspecified,
-			}
+			Constraint::Schema { priority: 100, on_unsupported: v1::Fallback::Unspecified }
 		} else {
 			Constraint::None
 		});
@@ -2506,7 +2515,7 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 	match kind {
 		tool_constraint::Kind::Schema(schema) => Ok(Constraint::Schema {
 			priority:       constraint_priority(schema.priority)?,
-			on_unsupported: omp_proto::inference::v1::Fallback::Unspecified,
+			on_unsupported: v1::Fallback::Unspecified,
 		}),
 		tool_constraint::Kind::Grammar(grammar) => {
 			let syntax = match WorkerGrammarSyntax::try_from(grammar.syntax) {
@@ -2522,7 +2531,7 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 				syntax,
 				definition: Str::from(grammar.definition.as_str()),
 				priority: constraint_priority(grammar.priority)?,
-				on_unsupported: omp_proto::inference::v1::Fallback::Unspecified,
+				on_unsupported: v1::Fallback::Unspecified,
 			})
 		},
 		tool_constraint::Kind::Textual(_) => {
@@ -2545,13 +2554,15 @@ const fn worker_declaration_error(message: &'static str) -> EnvdError {
 
 #[cfg(test)]
 mod tests {
+	use omp_proto::toolhost::v1;
+
 	use super::*;
 	fn prelude_param(
 		name: &str,
 		kind: PreludeParamKind,
 		default_json: Option<&'static [u8]>,
-	) -> omp_proto::toolhost::v1::PreludeParam {
-		omp_proto::toolhost::v1::PreludeParam {
+	) -> v1::PreludeParam {
+		v1::PreludeParam {
 			name:         name.to_owned(),
 			kind:         kind as i32,
 			default_json: default_json.map(bytes::Bytes::from_static),

@@ -1,4 +1,9 @@
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+	future::{self, Future},
+	sync::Arc,
+	thread,
+	time::Duration,
+};
 
 #[derive(Clone)]
 pub(crate) struct Pool {
@@ -9,15 +14,15 @@ impl Pool {
 	pub(crate) fn new(workers: Option<usize>) -> Self {
 		let executor = Arc::new(async_executor::Executor::new());
 		let workers = workers.unwrap_or_else(|| {
-			std::thread::available_parallelism()
+			thread::available_parallelism()
 				.map_or(2, usize::from)
 				.clamp(2, 8)
 		});
 		for index in 0..workers.max(1) {
 			let executor = Arc::clone(&executor);
-			std::thread::Builder::new()
+			thread::Builder::new()
 				.name(format!("omp-core-{index}"))
-				.spawn(move || async_io::block_on(executor.run(std::future::pending::<()>())))
+				.spawn(move || async_io::block_on(executor.run(future::pending::<()>())))
 				.expect("failed to spawn omp core executor worker");
 		}
 		Self { executor }

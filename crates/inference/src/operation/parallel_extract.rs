@@ -4,6 +4,7 @@ use bytes::{Bytes, BytesMut};
 use omp_catalog::OperationKind;
 use omp_core::{Str, sf};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::{
 	answer::AnswerBody,
@@ -11,7 +12,7 @@ use crate::{
 	call::OperationCall,
 	codec::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawEvent,
-		RequestHeader, RequestMethod, SizeBounds,
+		RequestHeader, RequestMethod, SizeBounds, openai_chat,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	receipt::{ExecutionReceipt, ReasonId},
@@ -58,7 +59,7 @@ impl ParallelExtractRequest {
 		if self
 			.urls
 			.iter()
-			.any(|url| url::Url::parse(url.as_str()).is_err())
+			.any(|url| Url::parse(url.as_str()).is_err())
 		{
 			return Err(ParallelExtractError::InvalidUrl);
 		}
@@ -198,10 +199,7 @@ impl Codec for ParallelExtractCodec {
 		Ok(EncodedRequest::new(
 			OperationKind::Extract,
 			RequestMethod::Post,
-			crate::codec::openai_chat::join_uri(
-				context.route.endpoint.base_url.as_str(),
-				EXTRACT_PATH,
-			),
+			openai_chat::join_uri(context.route.endpoint.base_url.as_str(), EXTRACT_PATH),
 			Box::new([
 				RequestHeader { name: sf!("accept"), value: sf!("application/json") },
 				RequestHeader { name: sf!("content-type"), value: sf!("application/json") },

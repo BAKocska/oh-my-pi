@@ -7,7 +7,7 @@ use std::{
 	ffi::{OsStr, OsString},
 	fs::{self, Metadata},
 	io::{self, BufWriter, Write},
-	path::{Path, PathBuf},
+	path::{self, Path, PathBuf},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -16,6 +16,7 @@ use std::{
 };
 
 use clap::{ArgAction, Parser, ValueEnum};
+use ignore::{gitignore, gitignore::Gitignore};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 use omp_walker::{
 	CollectedEntry,
@@ -326,13 +327,13 @@ impl Excludes {
 struct FdIgnoreMatcher {
 	enabled: bool,
 	root:    PathBuf,
-	global:  Vec<ignore::gitignore::Gitignore>,
+	global:  Vec<Gitignore>,
 	states:  HashMap<PathBuf, Arc<FdIgnoreState>>,
 }
 
 struct FdIgnoreState {
 	parent:  Option<Arc<Self>>,
-	matcher: Option<ignore::gitignore::Gitignore>,
+	matcher: Option<Gitignore>,
 }
 
 impl FdIgnoreMatcher {
@@ -351,7 +352,7 @@ impl FdIgnoreMatcher {
 			} else {
 				base_dir.join(ignore_file)
 			};
-			let mut builder = ignore::gitignore::GitignoreBuilder::new(base_dir);
+			let mut builder = gitignore::GitignoreBuilder::new(base_dir);
 			if let Some(err) = builder.add(&path) {
 				return Err(io::Error::other(err.to_string()));
 			}
@@ -434,7 +435,7 @@ fn normalize_fdignore_path(path: &Path) -> PathBuf {
 fn load_fdignore_state(dir: &Path, parent: Option<Arc<FdIgnoreState>>) -> Arc<FdIgnoreState> {
 	let file = dir.join(".fdignore");
 	let matcher = if file.is_file() {
-		let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+		let mut builder = gitignore::GitignoreBuilder::new(dir);
 		let _ = builder.add(&file);
 		builder.build().ok().filter(|ignore| !ignore.is_empty())
 	} else {
@@ -456,11 +457,7 @@ fn fdignore_state_match(state: &Arc<FdIgnoreState>, path: &Path, is_dir: bool) -
 	None
 }
 
-fn fdignore_match(
-	matcher: &ignore::gitignore::Gitignore,
-	path: &Path,
-	is_dir: bool,
-) -> Option<bool> {
+fn fdignore_match(matcher: &Gitignore, path: &Path, is_dir: bool) -> Option<bool> {
 	match matcher.matched(path, is_dir) {
 		ignore::Match::Ignore(_) => Some(true),
 		ignore::Match::Whitelist(_) => Some(false),
@@ -645,7 +642,7 @@ fn search(
 	let separator = cli
 		.path_separator
 		.clone()
-		.unwrap_or_else(|| std::path::MAIN_SEPARATOR.to_string());
+		.unwrap_or_else(|| path::MAIN_SEPARATOR.to_string());
 	let config = SearchConfig {
 		base_dir,
 		absolute_roots,
@@ -1562,7 +1559,7 @@ fn remove_extension(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-	use std::{fs, sync::atomic::AtomicBool};
+	use std::{cell, fs, io, path::Path, sync::atomic::AtomicBool};
 
 	use clap::Parser;
 	use omp_shell_engine::openfiles::OpenFile;
@@ -1591,7 +1588,7 @@ mod tests {
 	/// seeded tree: hidden entries included, gitignore disabled, root emitted.
 	/// Keeping the shape in one place so both walker-level regressions exercise
 	/// what fd actually asks the walker to do.
-	fn walk_request(tree: &std::path::Path) -> omp_walker::WalkRequest {
+	fn walk_request(tree: &Path) -> omp_walker::WalkRequest {
 		omp_walker::WalkRequest::new(tree)
 			.hidden(true)
 			.gitignore(false)
@@ -1634,14 +1631,14 @@ mod tests {
 		// heartbeat, not after entries were already delivered).
 		let tree = seeded_tree("stream");
 		let cancelled = AtomicBool::new(true);
-		let visited = std::cell::Cell::new(0_usize);
+		let visited = cell::Cell::new(0_usize);
 		let result = walk_request(tree.path()).for_each_entry_with_heartbeat(
 			cancel_heartbeat(&cancelled),
 			|_entry| {
 				visited.set(visited.get() + 1);
-				Ok::<_, std::io::Error>(omp_walker::WalkDecision::Include)
+				Ok::<_, io::Error>(omp_walker::WalkDecision::Include)
 			},
-			|_error| Ok::<_, std::io::Error>(omp_walker::WalkDecision::Include),
+			|_error| Ok::<_, io::Error>(omp_walker::WalkDecision::Include),
 		);
 		let err = result.expect_err("streaming walker must surface the cancel flag as an error");
 		assert!(
@@ -1684,7 +1681,7 @@ mod tests {
 		let path = tree.path().to_str().expect("utf8 path");
 		let cli = FdCli::try_parse_from(["fd", "haystack", path]).expect("argv");
 		let (mut host, capture) = Host::for_test("fd", "", tree.path());
-		let (reader, writer) = std::io::pipe().expect("pipe");
+		let (reader, writer) = io::pipe().expect("pipe");
 		drop(reader); // downstream reader (e.g. `head`) already exited
 		host.stdout = OpenFile::from(writer);
 

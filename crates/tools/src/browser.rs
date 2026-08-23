@@ -1,6 +1,10 @@
 //! Stateful browser automation over a harness-owned supervised daemon.
 
-use std::{fmt, sync::Arc};
+use std::{
+	error,
+	fmt::{self, Display},
+	sync::Arc,
+};
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -139,12 +143,12 @@ pub struct Fault {
 	pub message: Str,
 }
 
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(&self.message)
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// Browser has no partial updates.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

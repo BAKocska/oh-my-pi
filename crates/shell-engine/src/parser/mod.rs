@@ -27,5 +27,12 @@ pub use tokenizer::{
 };
 
 #[cfg(test)]
-/// Result type for parser tests that propagate heterogeneous errors.
-pub(crate) type TestResult<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
+mod test_result {
+	use std::{error, result};
+
+	/// Result type for parser tests that propagate heterogeneous errors.
+	pub(crate) type TestResult<T, E = Box<dyn error::Error>> = result::Result<T, E>;
+}
+
+#[cfg(test)]
+pub(crate) use test_result::TestResult;

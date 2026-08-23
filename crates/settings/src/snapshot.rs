@@ -2,11 +2,13 @@
 
 use std::{collections::BTreeMap, marker::PhantomData, path::Path, sync::Arc};
 
+use flume::Receiver;
 use globset::Glob;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use toml::{de, ser};
 
-use crate::{SettingsDomain, ValidationError};
+use crate::{SettingsDomain, ValidationError, schema};
 
 /// Monotonic whole-snapshot revision.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -121,7 +123,7 @@ impl SettingsSnapshot {
 
 	/// Decodes and validates one typed runtime projection.
 	pub fn project<D: SettingsDomain>(&self) -> Result<TypedProjection<D>, SnapshotError> {
-		let value = crate::schema::projection_value::<D>(&self.document);
+		let value = schema::projection_value::<D>(&self.document);
 		let domain = value.try_into::<D>()?;
 		domain.validate()?;
 		Ok(TypedProjection {
@@ -185,7 +187,7 @@ impl SnapshotPublisher {
 pub struct Subscription {
 	domain:   &'static str,
 	current:  DomainRevision,
-	receiver: flume::Receiver<Arc<SettingsSnapshot>>,
+	receiver: Receiver<Arc<SettingsSnapshot>>,
 }
 
 impl Subscription {
@@ -265,10 +267,10 @@ pub enum SnapshotError {
 	RootNotTable,
 	/// TOML serialization failed.
 	#[error(transparent)]
-	Serialize(#[from] toml::ser::Error),
+	Serialize(#[from] ser::Error),
 	/// Typed projection decoding failed.
 	#[error(transparent)]
-	Decode(#[from] toml::de::Error),
+	Decode(#[from] de::Error),
 	/// Domain validation failed.
 	#[error(transparent)]
 	Validation(#[from] ValidationError),
@@ -284,6 +286,7 @@ pub enum SnapshotError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::FieldDescriptor;
 
 	#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 	struct Demo {
@@ -292,7 +295,7 @@ mod tests {
 
 	impl SettingsDomain for Demo {
 		const DOMAIN: &'static str = "demo";
-		const FIELDS: &'static [crate::FieldDescriptor] = &[];
+		const FIELDS: &'static [FieldDescriptor] = &[];
 	}
 
 	#[test]

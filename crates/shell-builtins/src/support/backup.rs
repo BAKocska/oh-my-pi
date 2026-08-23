@@ -1,6 +1,7 @@
 //! GNU backup and update option handling shared by `ln` and `mv`.
 
 use std::{
+	env,
 	ffi::{OsStr, OsString},
 	path::{Path, PathBuf},
 };
@@ -120,7 +121,7 @@ pub(crate) fn determine_backup_suffix(matches: &ArgMatches) -> String {
 	let suffix = matches
 		.get_one::<String>(arguments::OPT_SUFFIX)
 		.cloned()
-		.or_else(|| std::env::var("SIMPLE_BACKUP_SUFFIX").ok())
+		.or_else(|| env::var("SIMPLE_BACKUP_SUFFIX").ok())
 		.unwrap_or_else(|| DEFAULT_BACKUP_SUFFIX.to_owned());
 	if suffix.contains('/') {
 		DEFAULT_BACKUP_SUFFIX.to_owned()
@@ -134,7 +135,7 @@ pub(crate) fn determine_backup_mode(matches: &ArgMatches) -> Result<BackupMode, 
 	if matches.contains_id(arguments::OPT_BACKUP) {
 		if let Some(method) = matches.get_one::<String>(arguments::OPT_BACKUP) {
 			match_method(method, "backup type")
-		} else if let Ok(method) = std::env::var("VERSION_CONTROL") {
+		} else if let Ok(method) = env::var("VERSION_CONTROL") {
 			match_method(&method, "$VERSION_CONTROL")
 		} else {
 			Ok(BackupMode::Existing)
@@ -142,7 +143,7 @@ pub(crate) fn determine_backup_mode(matches: &ArgMatches) -> Result<BackupMode, 
 	} else if matches.get_flag(arguments::OPT_BACKUP_NO_ARG)
 		|| matches.contains_id(arguments::OPT_SUFFIX)
 	{
-		if let Ok(method) = std::env::var("VERSION_CONTROL") {
+		if let Ok(method) = env::var("VERSION_CONTROL") {
 			match_method(&method, "$VERSION_CONTROL")
 		} else {
 			Ok(BackupMode::Existing)
@@ -233,7 +234,10 @@ pub(crate) enum UpdateMode {
 
 /// Reusable clap arguments for update controls.
 pub(crate) mod update_arguments {
-	use clap::{ArgAction, builder::TypedValueParser as _};
+	use clap::{
+		ArgAction,
+		builder::{StringValueParser, TypedValueParser as _},
+	};
 
 	/// Clap identifier for `--update`.
 	pub(crate) static OPT_UPDATE: &str = "update";
@@ -242,7 +246,7 @@ pub(crate) mod update_arguments {
 
 	/// Builds `--update[=CONTROL]`, accepting unambiguous GNU abbreviations.
 	pub(crate) fn update() -> clap::Arg {
-		let parser = clap::builder::StringValueParser::new().try_map(|value: String| {
+		let parser = StringValueParser::new().try_map(|value: String| {
 			let mut matches = ["none", "all", "older", "none-fail"]
 				.into_iter()
 				.filter(|candidate| candidate.starts_with(&value));
@@ -301,6 +305,8 @@ pub(crate) fn determine_update_mode(matches: &ArgMatches) -> UpdateMode {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use clap::Command;
 	use parking_lot::Mutex;
 
@@ -319,7 +325,7 @@ mod tests {
 	fn backup_determination_matrix() {
 		let _guard = ENV_LOCK.lock();
 		// SAFETY: this test serializes every environment mutation in this module.
-		unsafe { std::env::remove_var("VERSION_CONTROL") };
+		unsafe { env::remove_var("VERSION_CONTROL") };
 		for (args, expected) in [
 			(&["test"][..], BackupMode::None),
 			(&["test", "--backup"][..], BackupMode::Existing),
@@ -332,18 +338,18 @@ mod tests {
 			assert_eq!(determine_backup_mode(&matches).unwrap(), expected, "{args:?}");
 		}
 		// SAFETY: guarded as above.
-		unsafe { std::env::set_var("VERSION_CONTROL", "numbered") };
+		unsafe { env::set_var("VERSION_CONTROL", "numbered") };
 		let matches = command().try_get_matches_from(["test", "-b"]).unwrap();
 		assert_eq!(determine_backup_mode(&matches).unwrap(), BackupMode::Numbered);
 		// SAFETY: guarded as above.
-		unsafe { std::env::remove_var("VERSION_CONTROL") };
+		unsafe { env::remove_var("VERSION_CONTROL") };
 	}
 
 	#[test]
 	fn suffix_precedence_and_validation() {
 		let _guard = ENV_LOCK.lock();
 		// SAFETY: this test serializes every environment mutation in this module.
-		unsafe { std::env::set_var("SIMPLE_BACKUP_SUFFIX", ".env") };
+		unsafe { env::set_var("SIMPLE_BACKUP_SUFFIX", ".env") };
 		let matches = command().try_get_matches_from(["test"]).unwrap();
 		assert_eq!(determine_backup_suffix(&matches), ".env");
 		let matches = command()
@@ -355,7 +361,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(determine_backup_suffix(&matches), "~");
 		// SAFETY: guarded as above.
-		unsafe { std::env::remove_var("SIMPLE_BACKUP_SUFFIX") };
+		unsafe { env::remove_var("SIMPLE_BACKUP_SUFFIX") };
 	}
 
 	#[test]
@@ -366,7 +372,7 @@ mod tests {
 			get_backup_path(BackupMode::Existing, &path, "~").unwrap(),
 			directory.path().join("file~")
 		);
-		std::fs::write(directory.path().join("file.~1~"), b"").unwrap();
+		fs::write(directory.path().join("file.~1~"), b"").unwrap();
 		assert_eq!(
 			get_backup_path(BackupMode::Existing, &path, "~").unwrap(),
 			directory.path().join("file.~2~")

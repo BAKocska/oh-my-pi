@@ -4,6 +4,8 @@
 //! TeX Math — by @thatmagicalcat (<https://github.com/thatmagicalcat/txm>,
 //! MIT/Apache-2.0), reimplemented for styled terminal segments.
 
+use std::borrow;
+
 use omp_core::{IntoStr, Str, StrMut};
 use smallvec::SmallVec;
 
@@ -1767,10 +1769,10 @@ pub fn latex_block(expr: &str, base: Style, sink: &mut dyn RichSink) -> bool {
 /// Trims a row and collapses whitespace exactly like pi's global
 /// `[ \t]*\n[ \t]*` → `" "` replacement: each newline (with its surrounding
 /// spaces/tabs) becomes one space, so `a\n\nb` keeps two spaces.
-fn collapse_interior_whitespace(row: &str) -> std::borrow::Cow<'_, str> {
+fn collapse_interior_whitespace(row: &str) -> borrow::Cow<'_, str> {
 	let row = row.trim();
 	if !row.contains('\n') {
-		return std::borrow::Cow::Borrowed(row);
+		return borrow::Cow::Borrowed(row);
 	}
 	let mut collapsed = String::with_capacity(row.len());
 	let mut run_start: Option<usize> = None;
@@ -1792,7 +1794,7 @@ fn collapse_interior_whitespace(row: &str) -> std::borrow::Cow<'_, str> {
 		}
 		collapsed.push(ch);
 	}
-	std::borrow::Cow::Owned(collapsed)
+	borrow::Cow::Owned(collapsed)
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use omp_core::{ExposeSecret as _, SecretString, Str};
 use serde::Deserialize;
+use url::form_urlencoded;
 use zeroize::Zeroizing;
 
 use crate::{OAuthHttpClient, OAuthHttpRequest, OAuthRequestError, OAuthTransportError};
@@ -48,8 +49,8 @@ impl TokenGrant {
 	}
 }
 
-impl std::fmt::Debug for TokenGrant {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for TokenGrant {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str("TokenGrant([REDACTED])")
 	}
 }
@@ -176,7 +177,7 @@ async fn post_form(
 }
 
 fn encode_form(fields: &[(&str, &str)]) -> Zeroizing<String> {
-	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+	let mut serializer = form_urlencoded::Serializer::new(String::new());
 	for (name, value) in fields {
 		serializer.append_pair(name, value);
 	}

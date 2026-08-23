@@ -10,19 +10,27 @@
 #![allow(dead_code, reason = "shared matching paths are selected by separate process builtins")]
 
 use std::{
+	borrow,
 	collections::{HashMap, HashSet},
 	fs,
 	future::Future,
 	io::{self, BufRead, Write},
 	path::{Path, PathBuf},
+	process, result,
 	time::Duration,
 };
+#[cfg(unix)]
+use std::{mem, os::fd, ptr};
 
 #[cfg(unix)]
 use omp_shell_engine::openfiles::OpenFiles;
 use omp_shell_engine::{
 	ExecutionContext, ExecutionExitCode, ExecutionResult, builtins::signal_number,
 };
+use regex::RegexBuilder;
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::proc_snapshot;
@@ -80,7 +88,7 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 	mode: ProcMatchMode,
 	argv: Vec<String>,
 	context: ExecutionContext<'_, SE>,
-) -> impl Future<Output = std::result::Result<ExecutionResult, omp_shell_engine::Error>> + Send {
+) -> impl Future<Output = result::Result<ExecutionResult, omp_shell_engine::Error>> + Send {
 	{
 		let command_name = context.command_name.clone();
 		let cwd = context.shell.working_dir().to_path_buf();
@@ -88,7 +96,7 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 			#[cfg(unix)]
 			let stdin_watcher = context.try_fd(OpenFiles::STDIN_FD).and_then(|stdin| {
 				let fd = stdin.try_borrow_as_fd().ok()?.try_clone_to_owned().ok()?;
-				tokio::io::unix::AsyncFd::new(fd).ok()
+				AsyncFd::new(fd).ok()
 			});
 			let mut stdin = io::BufReader::new(context.stdin());
 			let mut options = match parse_proc_match_args(mode, &argv, &cwd, &mut stdin) {
@@ -256,7 +264,7 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 								},
 							}
 						} else {
-							tokio::time::sleep(Duration::from_millis(50)).await;
+							time::sleep(Duration::from_millis(50)).await;
 						}
 					}
 				},
@@ -270,7 +278,7 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 async fn read_proc_confirmation<R: io::Read>(
 	stdin: &mut io::BufReader<R>,
 	cancel_token: Option<CancellationToken>,
-	watcher: Option<&tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+	watcher: Option<&AsyncFd<fd::OwnedFd>>,
 ) -> io::Result<Option<String>> {
 	if cancel_token
 		.as_ref()
@@ -321,7 +329,7 @@ fn parse_proc_match_args(
 	argv: &[String],
 	cwd: &Path,
 	stdin: &mut impl BufRead,
-) -> std::result::Result<ParseProcResult, (u8, String)> {
+) -> result::Result<ParseProcResult, (u8, String)> {
 	let mut options =
 		ProcMatchOptions { delimiter: "\n".to_string(), signal: 15, ..Default::default() };
 	let mut index = 0;
@@ -630,10 +638,10 @@ fn has_proc_selectors(options: &ProcMatchOptions) -> bool {
 /// table again.
 fn select_processes(
 	options: &mut ProcMatchOptions,
-) -> std::result::Result<(Vec<proc_snapshot::ProcInfo>, proc_snapshot::HostProcesses), String> {
+) -> result::Result<(Vec<proc_snapshot::ProcInfo>, proc_snapshot::HostProcesses), String> {
 	let all = proc_snapshot::ProcInfo::all();
 	let host = proc_snapshot::HostProcesses::resolve_in(&all);
-	let host_pid = std::process::id() as i32;
+	let host_pid = process::id() as i32;
 	let host_group = all
 		.iter()
 		.find(|process| process.pid() == host_pid)
@@ -688,7 +696,7 @@ fn select_processes(
 			.collect::<Vec<_>>()
 			.join("|");
 		Some(
-			regex::RegexBuilder::new(&source)
+			RegexBuilder::new(&source)
 				.case_insensitive(options.ignore_case)
 				.build()
 				.map_err(|err| format!("invalid regular expression: {err}"))?,
@@ -701,7 +709,7 @@ fn select_processes(
 		}
 		let pattern_matches = regex.as_ref().is_none_or(|regex| {
 			let subject = if options.full {
-				std::borrow::Cow::Owned(process.args().join(" "))
+				borrow::Cow::Owned(process.args().join(" "))
 			} else {
 				process.match_name()
 			};
@@ -751,7 +759,7 @@ fn select_processes(
 	Ok((selected, host))
 }
 
-fn parse_i32_list(value: &str, target: &mut Vec<i32>) -> std::result::Result<(), (u8, String)> {
+fn parse_i32_list(value: &str, target: &mut Vec<i32>) -> result::Result<(), (u8, String)> {
 	for item in value.split(',') {
 		let parsed = item
 			.parse::<i32>()
@@ -761,14 +769,14 @@ fn parse_i32_list(value: &str, target: &mut Vec<i32>) -> std::result::Result<(),
 	Ok(())
 }
 
-fn parse_user_list(value: &str, target: &mut Vec<u32>) -> std::result::Result<(), (u8, String)> {
+fn parse_user_list(value: &str, target: &mut Vec<u32>) -> result::Result<(), (u8, String)> {
 	for item in value.split(',') {
 		target.push(resolve_user(item).ok_or_else(|| (2, format!("unknown user '{item}'")))?);
 	}
 	Ok(())
 }
 
-fn parse_group_list(value: &str, target: &mut Vec<u32>) -> std::result::Result<(), (u8, String)> {
+fn parse_group_list(value: &str, target: &mut Vec<u32>) -> result::Result<(), (u8, String)> {
 	for item in value.split(',') {
 		target.push(resolve_group(item).ok_or_else(|| (2, format!("unknown group '{item}'")))?);
 	}
@@ -782,8 +790,8 @@ fn resolve_user(value: &str) -> Option<u32> {
 		return Some(id);
 	}
 	let name = CString::new(value).ok()?;
-	let mut record = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-	let mut result = std::ptr::null_mut();
+	let mut record = mem::MaybeUninit::<libc::passwd>::zeroed();
+	let mut result = ptr::null_mut();
 	let mut buffer = vec![0u8; 16 * 1024];
 	// SAFETY: all pointers refer to live, writable storage for this call.
 	let status = unsafe {
@@ -814,8 +822,8 @@ fn resolve_group(value: &str) -> Option<u32> {
 		return Some(id);
 	}
 	let name = CString::new(value).ok()?;
-	let mut record = std::mem::MaybeUninit::<libc::group>::zeroed();
-	let mut result = std::ptr::null_mut();
+	let mut record = mem::MaybeUninit::<libc::group>::zeroed();
+	let mut result = ptr::null_mut();
 	let mut buffer = vec![0u8; 16 * 1024];
 	// SAFETY: all pointers refer to live, writable storage for this call.
 	let status = unsafe {
@@ -842,7 +850,7 @@ fn resolve_group(value: &str) -> Option<u32> {
 fn parse_terminal_list(
 	value: &str,
 	target: &mut Vec<Option<u64>>,
-) -> std::result::Result<(), (u8, String)> {
+) -> result::Result<(), (u8, String)> {
 	for item in value.split(',') {
 		if matches!(item, "?" | "-") {
 			target.push(None);
@@ -876,7 +884,7 @@ fn resolve_terminal(_value: &str) -> Option<u64> {
 	None
 }
 
-fn parse_states(value: &str, target: &mut HashSet<char>) -> std::result::Result<(), (u8, String)> {
+fn parse_states(value: &str, target: &mut HashSet<char>) -> result::Result<(), (u8, String)> {
 	for state in value.split(',').flat_map(str::chars) {
 		if !state.is_ascii_alphabetic() {
 			return Err((2, format!("invalid process state '{state}'")));
@@ -887,7 +895,9 @@ fn parse_states(value: &str, target: &mut HashSet<char>) -> std::result::Result<
 }
 
 fn resolve_shell_path(cwd: &Path, value: &str) -> PathBuf {
-	let normalized = omp_shell_engine::sys::fs::normalize_shell_path(Path::new(value));
+	use omp_shell_engine::sys::fs;
+
+	let normalized = fs::normalize_shell_path(Path::new(value));
 	if normalized.is_absolute() {
 		normalized.into_owned()
 	} else {

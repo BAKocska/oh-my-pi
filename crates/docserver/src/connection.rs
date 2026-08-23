@@ -2,6 +2,7 @@
 
 use std::{
 	collections::HashMap,
+	mem,
 	num::NonZeroUsize,
 	sync::{
 		Arc,
@@ -11,18 +12,24 @@ use std::{
 };
 
 use bytes::BytesMut;
+#[cfg(test)]
+use omp_proto::document::v1::{document_target, read_selection};
 use omp_proto::{
-	document::v1::{
-		ClientFrame, EventStreamFailure, ProtocolError, ProtocolErrorCode, ServerFrame, client_frame,
-		server_frame,
+	document::{
+		v1,
+		v1::{
+			ClientFrame, EventStreamFailure, ProtocolError, ProtocolErrorCode, ServerFrame,
+			client_frame, server_frame,
+		},
 	},
 	prost::Message,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::{
+	io,
 	io::{AsyncRead, AsyncWrite},
-	sync::Notify,
+	sync::{Notify, broadcast::error},
 	task::{JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
@@ -150,7 +157,7 @@ pub async fn serve_session<S>(
 where
 	S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-	let (reader, writer) = tokio::io::split(stream);
+	let (reader, writer) = io::split(stream);
 	serve_io(session, reader, writer, config).await
 }
 
@@ -249,7 +256,7 @@ where
 						return Ok(());
 					}
 				},
-				Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+				Err(error::RecvError::Lagged(skipped)) => {
 					let _ = event_output
 						.send_async(lsp_event_stream_error_frame(
 							protocol_minor,
@@ -259,7 +266,7 @@ where
 						.await;
 					return Err(ConnectionError::LspEventsLagged(skipped));
 				},
-				Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+				Err(error::RecvError::Closed) => {
 					let _ = event_output
 						.send_async(lsp_event_stream_error_frame(
 							protocol_minor,
@@ -408,7 +415,7 @@ where
 		for cancellation in active.values() {
 			cancellation.cancel();
 		}
-		std::mem::take(&mut *active)
+		mem::take(&mut *active)
 	};
 	finish_connection(&session, active, requests, output).await;
 	match completed_writer {
@@ -460,7 +467,7 @@ async fn accept_handshake(
 	let environment = session.environment();
 	let response = ServerFrame {
 		request_id: 0,
-		body:       Some(server_frame::Body::Hello(omp_proto::document::v1::ServerHello {
+		body:       Some(server_frame::Body::Hello(v1::ServerHello {
 			protocol_major: PROTOCOL_MAJOR,
 			protocol_minor,
 			workspace_id: bytes::Bytes::copy_from_slice(environment.workspace_id()),
@@ -561,11 +568,14 @@ fn writer_result(result: Result<Result<(), WireError>, JoinError>) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use bytes::Bytes;
-	use omp_proto::document::v1 as proto;
+	use omp_proto::document::v1::{self as proto, commit_transaction_response};
 	use tempfile::TempDir;
 	use tokio::{
 		io::{DuplexStream, ReadHalf, WriteHalf},
+		task,
 		time::{Duration, timeout},
 	};
 
@@ -632,7 +642,7 @@ mod tests {
 			transaction_id: Bytes::from_static(transaction_id),
 			operations:     vec![proto::DocumentMutation {
 				document:  Some(proto::DocumentTarget {
-					target: Some(proto::document_target::Target::LeaseId(lease_id)),
+					target: Some(document_target::Target::LeaseId(lease_id)),
 				}),
 				operation: Some(proto::document_mutation::Operation::Text(proto::TextMutation {
 					base_revision: Some(base_revision),
@@ -653,7 +663,7 @@ mod tests {
 
 		let root = TempDir::new().expect("temporary directory");
 		let path = root.path().join("shared.txt");
-		std::fs::write(&path, b"alpha").expect("initial file");
+		fs::write(&path, b"alpha").expect("initial file");
 		let config = ServerConfig::new(root.path()).expect("server config");
 		let uri = config
 			.file_uri(&config.environment_root().join("shared.txt"))
@@ -661,14 +671,14 @@ mod tests {
 			.to_string();
 		let environment = Environment::new(config).expect("environment");
 
-		let (a_client, a_server) = tokio::io::duplex(64 * 1024);
-		let (b_client, b_server) = tokio::io::duplex(64 * 1024);
+		let (a_client, a_server) = io::duplex(64 * 1024);
+		let (b_client, b_server) = io::duplex(64 * 1024);
 		let a_task =
 			tokio::spawn(serve_connection(environment.clone(), a_server, ConnectionConfig::default()));
 		let b_task =
 			tokio::spawn(serve_connection(environment.clone(), b_server, ConnectionConfig::default()));
-		let (mut a_reader, mut a_writer) = tokio::io::split(a_client);
-		let (mut b_reader, mut b_writer) = tokio::io::split(b_client);
+		let (mut a_reader, mut a_writer) = io::split(a_client);
+		let (mut b_reader, mut b_writer) = io::split(b_client);
 		handshake(&mut a_reader, &mut a_writer).await;
 		handshake(&mut b_reader, &mut b_writer).await;
 
@@ -714,7 +724,7 @@ mod tests {
 		};
 		assert!(matches!(
 			committed.outcome,
-			Some(proto::commit_transaction_response::Outcome::Committed(_))
+			Some(commit_transaction_response::Outcome::Committed(_))
 		));
 
 		let observed = timeout(Duration::from_secs(2), async {
@@ -742,8 +752,7 @@ mod tests {
 		let server_frame::Body::TransactionResult(rejected) = response(&mut b_reader, 2).await else {
 			panic!("expected transaction outcome response");
 		};
-		let Some(proto::commit_transaction_response::Outcome::Rejected(rejected)) = rejected.outcome
-		else {
+		let Some(commit_transaction_response::Outcome::Rejected(rejected)) = rejected.outcome else {
 			panic!("stale writer unexpectedly committed");
 		};
 		assert_eq!(rejected.reason, proto::TransactionRejectReason::StaleBase as i32);
@@ -766,7 +775,7 @@ mod tests {
 		let root = TempDir::new().expect("temporary directory");
 		let environment = Environment::new(ServerConfig::new(root.path()).expect("server config"))
 			.expect("environment");
-		let (_client, server) = tokio::io::duplex(1024);
+		let (_client, server) = io::duplex(1024);
 		let config = ConnectionConfig {
 			handshake_timeout: Duration::from_millis(10),
 			..ConnectionConfig::default()
@@ -783,16 +792,16 @@ mod tests {
 		let root = TempDir::new().expect("temporary directory");
 		let server_config = ServerConfig::new(root.path()).expect("server config");
 		let path = server_config.environment_root().join("large.txt");
-		std::fs::write(&path, vec![b'x'; 2048]).expect("large fixture");
+		fs::write(&path, vec![b'x'; 2048]).expect("large fixture");
 		let uri = server_config.file_uri(&path).expect("file URI").to_string();
 		let environment = Environment::new(server_config).expect("environment");
-		let (client, server) = tokio::io::duplex(16 * 1024);
+		let (client, server) = io::duplex(16 * 1024);
 		let config = ConnectionConfig {
-			frame: FrameConfig::new(std::num::NonZeroUsize::new(512).expect("frame limit")),
+			frame: FrameConfig::new(NonZeroUsize::new(512).expect("frame limit")),
 			..ConnectionConfig::default()
 		};
 		let server_task = tokio::spawn(serve_connection(environment.clone(), server, config));
-		let (mut reader, mut writer) = tokio::io::split(client);
+		let (mut reader, mut writer) = io::split(client);
 		handshake(&mut reader, &mut writer).await;
 
 		send(
@@ -813,11 +822,11 @@ mod tests {
 			2,
 			client_frame::Body::ReadDocument(proto::ReadDocumentRequest {
 				document:  Some(proto::DocumentTarget {
-					target: Some(proto::document_target::Target::LeaseId(opened.lease_id)),
+					target: Some(document_target::Target::LeaseId(opened.lease_id)),
 				}),
 				revision:  None,
 				selection: Some(proto::ReadSelection {
-					selection: Some(proto::read_selection::Selection::Whole(proto::WholeDocument {})),
+					selection: Some(read_selection::Selection::Whole(proto::WholeDocument {})),
 				}),
 			}),
 		)
@@ -856,10 +865,10 @@ mod tests {
 			waiter_released.cancel();
 		});
 
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 		assert!(!released.is_cancelled());
 		drop(first);
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 		assert!(!released.is_cancelled());
 		drop(second);
 		timeout(Duration::from_secs(1), waiter)

@@ -1,18 +1,25 @@
+//! Proves provider and campaign backends use sealed generations and enforce
+//! service schemas.
+
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
+use omp_catalog::snapshot;
 use omp_core::{Principal, Str, sf};
 use omp_driver::{
 	chat::{CampaignControlResolver as _, ChatProviderControlBackend, ProviderApplicationOwner},
 	discovery::runtime::{SealedCampaignControlResolver, SealedCampaignDeclaration},
 	model_controls::{
 		ProviderControlBackend as _, ProviderControlError, ProviderControlRequest,
-		ProviderControlResult, ProviderDeclarationDocument,
+		ProviderControlResult, ProviderDeclarationDocument, ProviderModelEvent,
 	},
 };
 use omp_envd::{
 	exthost::{
-		control::{ControlAuthorityFactory as _, ControlConnectionIdentity, ControlRequestContext},
+		control::{
+			ControlAuthorityFactory as _, ControlConnectionIdentity, ControlProtocolError,
+			ControlRequestContext,
+		},
 		services::{
 			ServiceBroker, ServiceControlAuthorityFactory, ServiceDispatch, ServiceDispatchBackend,
 			ServiceKey, ServiceManifest, ServiceMethodSchema, ServiceProviderDeclaration,
@@ -62,7 +69,7 @@ impl ProviderApplicationOwner for RegistryOwner {
 
 #[tokio::test]
 async fn provider_catalog_backend_projects_the_live_registry_generation() {
-	let catalog = Arc::new(omp_catalog::snapshot::Catalog::embedded().clone());
+	let catalog = Arc::new(snapshot::Catalog::embedded().clone());
 	let registry = Registry::builder(catalog).build().expect("registry");
 	let generation = registry.generation();
 	let backend = ChatProviderControlBackend::new(Arc::new(RegistryOwner { registry }));
@@ -71,7 +78,7 @@ async fn provider_catalog_backend_projects_the_live_registry_generation() {
 	let events = backend.watch_models(None).await.expect("catalog snapshot");
 	assert!(events.len() > 1);
 	let cursor_generation = match &events[0] {
-		omp_driver::model_controls::ProviderModelEvent::Reset { cursor } => cursor.generation,
+		ProviderModelEvent::Reset { cursor } => cursor.generation,
 		_ => panic!("catalog snapshot begins with a reset fence"),
 	};
 	assert_eq!(cursor_generation, generation);
@@ -88,7 +95,7 @@ fn campaign_resolver_uses_only_the_sealed_owner_generation() {
 			let mut machine = omp_agent::RegimeMachine;
 			if let Some(state) = state {
 				machine.restore(state).map_err(|_| {
-					omp_envd::exthost::control::ControlProtocolError::new(
+					ControlProtocolError::new(
 						"InvalidCampaignState",
 						"campaign state does not match its sealed codec",
 					)

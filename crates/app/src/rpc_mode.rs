@@ -1,10 +1,12 @@
 //! Stateful Content-Length framed RPC server for headless clients.
 
 use std::{
-	collections::{BTreeMap, HashMap, HashSet, VecDeque},
+	collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry},
+	env,
 	future::Future,
+	io, mem,
 	path::{Path, PathBuf},
-	process::Stdio,
+	process::{self, Stdio},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -17,6 +19,8 @@ use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
 use omp_catalog::{ModelKey, ProviderId};
 use omp_core::{ExposeSecret as _, SecretString, Str, sf};
+use omp_driver::skills::SkillInvocationKind;
+use omp_envd::tool_url::host;
 use omp_inference::{
 	Client, Registry,
 	answer::{AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthPromptKind, AuthSession},
@@ -28,6 +32,7 @@ use omp_inference::{
 	event::ChatEvent,
 	id::{LoginSessionId, RequestId as InferenceRequestId},
 	receipt::ExecutionBudget,
+	router,
 };
 use omp_rpc::{
 	framing::{
@@ -49,13 +54,22 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{
-	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, stdin, stdout},
 	process::Command,
 	sync::oneshot,
+	task::JoinHandle,
+	time,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::{RpcArgs, turn_id};
+use crate::{
+	chat_ui::commands::{
+		CommandFuture, CommandResult, CommandRoster, ConfigCommandHost, ConsumedResult,
+		FlowCommandHost, McpRequest, ModelCommandHost, ParsedFlags, SessionCommandHost,
+		SessionRequest, ShellCommandHost, WorkspaceRequest,
+	},
+	cli::{RpcArgs, turn_id},
+};
 
 const DEFAULT_PAGE_MESSAGES: usize = 100;
 const MAX_PAGE_MESSAGES: usize = 256;
@@ -126,14 +140,14 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	}
 	let negotiated = Arc::new(AtomicU8::new(PROTOCOL_V1));
 	let (output_tx, output_rx) = flume::unbounded();
-	let writer = tokio::spawn(write_frames(tokio::io::stdout(), output_rx, negotiated.clone()));
+	let writer = tokio::spawn(write_frames(stdout(), output_rx, negotiated.clone()));
 	let ready = serde_json::to_value(ReadyFrame::v2_capable(MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES))
 		.into_diagnostic()?;
 	emit(&output_tx, ready)?;
 
 	let host_resources = Arc::new(HostResourceBroker::new(output_tx.clone()));
 	let host_resources_authority: Arc<dyn omp_envd::HostResources> = host_resources.clone();
-	omp_envd::tool_url::host::bind(&host_resources_authority)
+	host::bind(&host_resources_authority)
 		.map_err(|_| miette!("RPC host URI resolver is already bound"))?;
 	let runtime = Arc::new(Runtime {
 		registry,
@@ -156,7 +170,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	runtime.notify_available_commands()?;
 
 	let (input_tx, input_rx) = flume::unbounded();
-	let reader = tokio::spawn(read_frames(tokio::io::stdin(), input_tx));
+	let reader = tokio::spawn(read_frames(stdin(), input_tx));
 	let dispatch_result = dispatch_inputs(runtime.clone(), input_rx).await;
 	{
 		let mut state = runtime.state.lock();
@@ -173,7 +187,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		state.pending_extension_ui.clear();
 	}
 	runtime.host_resources.shutdown("RPC client disconnected")?;
-	omp_envd::tool_url::host::unbind(&host_resources_authority);
+	host::unbind(&host_resources_authority);
 	runtime.shutdown.shutdown().await;
 	let read_result = reader.await.into_diagnostic()?;
 	drop(runtime);
@@ -432,7 +446,7 @@ impl HostResourceBroker {
 					),
 				));
 			}
-			let pending = std::mem::take(&mut state.pending);
+			let pending = mem::take(&mut state.pending);
 			state.generation = generation;
 			state.schemes = schemes;
 			pending
@@ -612,7 +626,7 @@ impl HostResourceBroker {
 		let pending = {
 			let mut state = self.state.lock();
 			state.schemes.clear();
-			std::mem::take(&mut state.pending)
+			mem::take(&mut state.pending)
 		};
 		for (target_id, pending) in pending {
 			self.emit_cancel(pending.generation, target_id)?;
@@ -676,7 +690,7 @@ fn normalize_host_uri_scheme(raw: &str) -> Result<String, CommandError> {
 
 #[derive(Default)]
 struct ShutdownCoordinator {
-	tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+	tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ShutdownCoordinator {
@@ -685,9 +699,9 @@ impl ShutdownCoordinator {
 	}
 
 	async fn shutdown(&self) {
-		let tasks = std::mem::take(&mut *self.tasks.lock());
+		let tasks = mem::take(&mut *self.tasks.lock());
 		for mut task in tasks {
-			if tokio::time::timeout(Duration::from_secs(1), &mut task)
+			if time::timeout(Duration::from_secs(1), &mut task)
 				.await
 				.is_err()
 			{
@@ -701,7 +715,7 @@ impl ShutdownCoordinator {
 struct Runtime {
 	registry:       Registry,
 	auth:           AuthManager,
-	commands:       Mutex<crate::chat_ui::commands::CommandRoster>,
+	commands:       Mutex<CommandRoster>,
 	output:         Sender<Value>,
 	host_resources: Arc<HostResourceBroker>,
 	shutdown:       ShutdownCoordinator,
@@ -1157,7 +1171,7 @@ impl Runtime {
 		let rendered = omp_driver::skills::render_invocation(
 			&skill,
 			invocation.args.as_str(),
-			omp_driver::skills::SkillInvocationKind::User,
+			SkillInvocationKind::User,
 		);
 		self
 			.notify(json!({
@@ -1214,10 +1228,10 @@ impl Runtime {
 		{
 			let mut state = self.state.lock();
 			match state.pending_extension_ui.entry(id.clone()) {
-				std::collections::hash_map::Entry::Vacant(entry) => {
+				Entry::Vacant(entry) => {
 					entry.insert(reply);
 				},
-				std::collections::hash_map::Entry::Occupied(_) => {
+				Entry::Occupied(_) => {
 					return Err(CommandError::new(
 						"extension_ui_duplicate",
 						format!("extension UI request `{id}` is already pending"),
@@ -1314,8 +1328,7 @@ impl Runtime {
 		self
 			.notify(json!({ "type": "agent_start", "sessionId": session_id }))
 			.map_err(CommandError::transport)?;
-		let planner =
-			omp_inference::router::Router::new(self.registry.clone(), Duration::from_secs(30));
+		let planner = router::Router::new(self.registry.clone(), Duration::from_secs(30));
 		let meta = CallMeta {
 			id:       InferenceRequestId::from(turn_id()),
 			target:   Target::Model(ModelKey::from(model)),
@@ -2403,24 +2416,20 @@ impl Runtime {
 
 struct RpcCommandHost {
 	runtime: Arc<Runtime>,
-	roster:  crate::chat_ui::commands::CommandRoster,
+	roster:  CommandRoster,
 }
 
-fn command_status<'a>(status: impl Into<Str>) -> crate::chat_ui::commands::CommandFuture<'a> {
+fn command_status<'a>(status: impl Into<Str>) -> CommandFuture<'a> {
 	let status = status.into();
-	Box::pin(async move {
-		Ok(crate::chat_ui::commands::CommandResult::Consumed(
-			crate::chat_ui::commands::ConsumedResult::status(status),
-		))
-	})
+	Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
 }
 
-fn unavailable_command<'a>(name: &'static str) -> crate::chat_ui::commands::CommandFuture<'a> {
+fn unavailable_command<'a>(name: &'static str) -> CommandFuture<'a> {
 	Box::pin(async move { Err(miette!("command /{name} is unavailable in this RPC session")) })
 }
 
-impl crate::chat_ui::commands::ShellCommandHost for RpcCommandHost {
-	fn help(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+impl ShellCommandHost for RpcCommandHost {
+	fn help(&mut self) -> CommandFuture<'_> {
 		use crate::chat_ui::commands::{CommandCapability, CommandRole, CommandSurface};
 		command_status(self.roster.help_text(
 			CommandSurface::Text,
@@ -2430,63 +2439,57 @@ impl crate::chat_ui::commands::ShellCommandHost for RpcCommandHost {
 		))
 	}
 
-	fn new_session(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn new_session(&mut self) -> CommandFuture<'_> {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
 			runtime
 				.new_session(&Map::new())
 				.map_err(|error| miette!(error.message))?;
-			Ok(crate::chat_ui::commands::CommandResult::Consumed(
-				crate::chat_ui::commands::ConsumedResult::status("Started a new session."),
-			))
+			Ok(CommandResult::Consumed(ConsumedResult::status("Started a new session.")))
 		})
 	}
 
-	fn jobs(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn jobs(&mut self) -> CommandFuture<'_> {
 		unavailable_command("jobs")
 	}
 
-	fn agents(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn agents(&mut self) -> CommandFuture<'_> {
 		unavailable_command("agents")
 	}
 
-	fn pause(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn pause(&mut self) -> CommandFuture<'_> {
 		unavailable_command("pause")
 	}
 
-	fn quit(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
-		Box::pin(async { Ok(crate::chat_ui::commands::CommandResult::Exit) })
+	fn quit(&mut self) -> CommandFuture<'_> {
+		Box::pin(async { Ok(CommandResult::Exit) })
 	}
 }
 
-impl crate::chat_ui::commands::SessionCommandHost for RpcCommandHost {
-	fn clear(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+impl SessionCommandHost for RpcCommandHost {
+	fn clear(&mut self) -> CommandFuture<'_> {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
 			runtime.state.lock().current_mut().messages.clear();
-			Ok(crate::chat_ui::commands::CommandResult::Consumed(
-				crate::chat_ui::commands::ConsumedResult::status("Session context cleared."),
-			))
+			Ok(CommandResult::Consumed(ConsumedResult::status("Session context cleared.")))
 		})
 	}
 
-	fn fresh(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn fresh(&mut self) -> CommandFuture<'_> {
 		self.clear()
 	}
 
-	fn rename(&mut self, title: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn rename(&mut self, title: Str) -> CommandFuture<'_> {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
 			runtime
 				.rename_session(title.as_str())
 				.map_err(|error| miette!(error.message))?;
-			Ok(crate::chat_ui::commands::CommandResult::Consumed(
-				crate::chat_ui::commands::ConsumedResult::status("Session renamed."),
-			))
+			Ok(CommandResult::Consumed(ConsumedResult::status("Session renamed.")))
 		})
 	}
 
-	fn retry(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn retry(&mut self) -> CommandFuture<'_> {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
 			let prompt = runtime
@@ -2499,20 +2502,16 @@ impl crate::chat_ui::commands::SessionCommandHost for RpcCommandHost {
 				.find(|message| message.role == "user")
 				.map(|message| message.content.clone());
 			let Some(prompt) = prompt else {
-				return Ok(crate::chat_ui::commands::CommandResult::Consumed(
-					crate::chat_ui::commands::ConsumedResult::status("Nothing to retry."),
-				));
+				return Ok(CommandResult::Consumed(ConsumedResult::status("Nothing to retry.")));
 			};
 			runtime
 				.submit_prompt(prompt, "prompt")
 				.map_err(|error| miette!(error.message))?;
-			Ok(crate::chat_ui::commands::CommandResult::Consumed(
-				crate::chat_ui::commands::ConsumedResult::agent("Retry started."),
-			))
+			Ok(CommandResult::Consumed(ConsumedResult::agent("Retry started.")))
 		})
 	}
 
-	fn resume(&mut self, selector: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn resume(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
 		let Some(selector) = selector else {
 			return unavailable_command("resume");
 		};
@@ -2521,16 +2520,11 @@ impl crate::chat_ui::commands::SessionCommandHost for RpcCommandHost {
 			runtime
 				.switch_session(selector.as_str())
 				.map_err(|error| miette!(error.message))?;
-			Ok(crate::chat_ui::commands::CommandResult::Consumed(
-				crate::chat_ui::commands::ConsumedResult::status("Session resumed."),
-			))
+			Ok(CommandResult::Consumed(ConsumedResult::status("Session resumed.")))
 		})
 	}
 
-	fn session(
-		&mut self,
-		request: crate::chat_ui::commands::SessionRequest,
-	) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_> {
 		use crate::chat_ui::commands::SessionRequest;
 		if !matches!(request, SessionRequest::Info) {
 			return unavailable_command("session");
@@ -2544,14 +2538,11 @@ impl crate::chat_ui::commands::SessionCommandHost for RpcCommandHost {
 		})
 	}
 
-	fn workspace(
-		&mut self,
-		_request: crate::chat_ui::commands::WorkspaceRequest,
-	) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn workspace(&mut self, _request: WorkspaceRequest) -> CommandFuture<'_> {
 		unavailable_command("workspace")
 	}
 
-	fn handoff(&mut self, instructions: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn handoff(&mut self, instructions: Option<Str>) -> CommandFuture<'_> {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
 			let mut params = Map::new();
@@ -2571,15 +2562,13 @@ impl crate::chat_ui::commands::SessionCommandHost for RpcCommandHost {
 					"generation":0,
 				}));
 			});
-			Ok(crate::chat_ui::commands::CommandResult::Consumed(
-				crate::chat_ui::commands::ConsumedResult::silent(),
-			))
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
 		})
 	}
 }
 
-impl crate::chat_ui::commands::ModelCommandHost for RpcCommandHost {
-	fn model(&mut self, selector: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+impl ModelCommandHost for RpcCommandHost {
+	fn model(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
 		let Some(selector) = selector else {
 			return unavailable_command("model");
 		};
@@ -2592,36 +2581,36 @@ impl crate::chat_ui::commands::ModelCommandHost for RpcCommandHost {
 		})
 	}
 
-	fn switch(&mut self, selector: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn switch(&mut self, selector: Str) -> CommandFuture<'_> {
 		self.model(Some(selector))
 	}
 }
 
-impl crate::chat_ui::commands::ConfigCommandHost for RpcCommandHost {
-	fn settings(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+impl ConfigCommandHost for RpcCommandHost {
+	fn settings(&mut self) -> CommandFuture<'_> {
 		unavailable_command("settings")
 	}
 
-	fn setup(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn setup(&mut self) -> CommandFuture<'_> {
 		unavailable_command("setup")
 	}
 
-	fn providers(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn providers(&mut self) -> CommandFuture<'_> {
 		let providers = oauth_providers_value(&self.runtime.state.lock().providers).to_string();
 		command_status(providers)
 	}
 
-	fn login(&mut self, _provider: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn login(&mut self, _provider: Option<Str>) -> CommandFuture<'_> {
 		unavailable_command("login")
 	}
 
-	fn logout(&mut self, _provider: Option<Str>) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn logout(&mut self, _provider: Option<Str>) -> CommandFuture<'_> {
 		unavailable_command("logout")
 	}
 }
 
-impl crate::chat_ui::commands::FlowCommandHost for RpcCommandHost {
-	fn context(&mut self) -> crate::chat_ui::commands::CommandFuture<'_> {
+impl FlowCommandHost for RpcCommandHost {
+	fn context(&mut self) -> CommandFuture<'_> {
 		let value = self
 			.runtime
 			.last_assistant()
@@ -2629,10 +2618,7 @@ impl crate::chat_ui::commands::FlowCommandHost for RpcCommandHost {
 		command_status(value)
 	}
 
-	fn compact(
-		&mut self,
-		_request: omp_agent::ManualCompactionRequest,
-	) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn compact(&mut self, _request: omp_agent::ManualCompactionRequest) -> CommandFuture<'_> {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
 			runtime.compact().map_err(|error| miette!(error.message))?;
@@ -2640,46 +2626,43 @@ impl crate::chat_ui::commands::FlowCommandHost for RpcCommandHost {
 		})
 	}
 
-	fn shake(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn shake(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("shake")
 	}
 
-	fn usage(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn usage(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("usage")
 	}
 
-	fn stats(
-		&mut self,
-		_flags: crate::chat_ui::commands::ParsedFlags,
-	) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn stats(&mut self, _flags: ParsedFlags) -> CommandFuture<'_> {
 		unavailable_command("stats")
 	}
 
-	fn plan(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn plan(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("plan")
 	}
 
-	fn vibe(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn vibe(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("vibe")
 	}
 
-	fn todo(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn todo(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("todo")
 	}
 
-	fn plan_review(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn plan_review(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("plan-review")
 	}
 
-	fn guided_goal(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn guided_goal(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("guided-goal")
 	}
 
-	fn loop_command(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn loop_command(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("loop")
 	}
 
-	fn queue(&mut self, prompt: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn queue(&mut self, prompt: Str) -> CommandFuture<'_> {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
 			runtime
@@ -2689,11 +2672,11 @@ impl crate::chat_ui::commands::FlowCommandHost for RpcCommandHost {
 		})
 	}
 
-	fn force(&mut self, _tool: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn force(&mut self, _tool: Str) -> CommandFuture<'_> {
 		unavailable_command("force")
 	}
 
-	fn fast(&mut self, args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn fast(&mut self, args: Str) -> CommandFuture<'_> {
 		let enabled = matches!(args.trim().as_str(), "" | "on" | "true");
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
@@ -2709,34 +2692,31 @@ impl crate::chat_ui::commands::FlowCommandHost for RpcCommandHost {
 		})
 	}
 
-	fn prewalk(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn prewalk(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("prewalk")
 	}
 
-	fn btw(&mut self, _prompt: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn btw(&mut self, _prompt: Str) -> CommandFuture<'_> {
 		unavailable_command("btw")
 	}
 
-	fn tan(&mut self, _prompt: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn tan(&mut self, _prompt: Str) -> CommandFuture<'_> {
 		unavailable_command("tan")
 	}
 
-	fn omfg(&mut self, _instruction: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn omfg(&mut self, _instruction: Str) -> CommandFuture<'_> {
 		unavailable_command("omfg")
 	}
 
-	fn live(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn live(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("live")
 	}
 
-	fn mcp(
-		&mut self,
-		_request: crate::chat_ui::commands::McpRequest,
-	) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn mcp(&mut self, _request: McpRequest) -> CommandFuture<'_> {
 		unavailable_command("mcp")
 	}
 
-	fn memory(&mut self, _args: Str) -> crate::chat_ui::commands::CommandFuture<'_> {
+	fn memory(&mut self, _args: Str) -> CommandFuture<'_> {
 		unavailable_command("memory")
 	}
 }
@@ -3125,7 +3105,7 @@ fn message_page(
 	)
 }
 
-fn rpc_command_roster(root: &Path, generation: u64) -> crate::chat_ui::commands::CommandRoster {
+fn rpc_command_roster(root: &Path, generation: u64) -> CommandRoster {
 	use crate::chat_ui::commands::{
 		CommandDeclaration, CommandGeneration, CommandImplementation, CommandProvenance,
 		CommandSourceKind, CommandSurface, ShadowPolicy,
@@ -3159,10 +3139,7 @@ fn rpc_command_roster(root: &Path, generation: u64) -> crate::chat_ui::commands:
 			Some(CommandGeneration { provenance, declarations: Arc::from([declaration]) })
 		})
 		.collect::<Vec<_>>();
-	crate::chat_ui::commands::CommandRoster::with_contributions(
-		generations,
-		&ShadowPolicy::default(),
-	)
+	CommandRoster::with_contributions(generations, &ShadowPolicy::default())
 }
 
 fn contains_orchestrate(input: &str) -> bool {
@@ -3332,7 +3309,7 @@ where
 
 #[cfg(not(windows))]
 fn shell_command(command: &str) -> Command {
-	let shell = std::env::var_os("SHELL")
+	let shell = env::var_os("SHELL")
 		.filter(|value| !value.is_empty())
 		.unwrap_or_else(|| "/bin/sh".into());
 	let mut process = Command::new(shell);
@@ -3420,7 +3397,7 @@ impl CommandError {
 		Self::new("serialization_error", error.to_string())
 	}
 
-	fn io(error: std::io::Error) -> Self {
+	fn io(error: io::Error) -> Self {
 		Self::new("transcript_unavailable", error.to_string())
 	}
 }
@@ -3485,7 +3462,7 @@ fn unix_millis() -> u64 {
 }
 
 fn new_id(prefix: &str) -> String {
-	format!("{prefix}-{}-{}", std::process::id(), turn_id())
+	format!("{prefix}-{}-{}", process::id(), turn_id())
 }
 
 fn escape_html(text: &str) -> String {
@@ -3504,6 +3481,9 @@ fn decode_base64url(input: &str) -> Result<Vec<u8>, CommandError> {
 
 #[cfg(test)]
 mod tests {
+
+	use std::slice;
+
 	use super::*;
 
 	#[test]
@@ -3588,7 +3568,7 @@ mod tests {
 			available:     true,
 			authenticated: false,
 		};
-		let providers = oauth_providers_value(std::slice::from_ref(&provider));
+		let providers = oauth_providers_value(slice::from_ref(&provider));
 		assert_eq!(
 			providers,
 			json!({

@@ -1,6 +1,9 @@
 //! Width-aware Markdown rendering into styled terminal lines.
 
-use std::{fmt, fmt::Write as _};
+use std::{
+	fmt::{self, Write as _},
+	str,
+};
 
 use omp_core::{Str, StrMut};
 use smallvec::SmallVec;
@@ -19,6 +22,8 @@ mod table;
 
 use inline::code_span_len;
 pub(crate) use inline::{math_span, parse_inline};
+
+use crate::{latex, rich};
 
 /// Semantic styles shared by terminal diagram renderers.
 #[derive(Clone, Copy)]
@@ -39,7 +44,7 @@ pub(super) struct MarkerText {
 impl MarkerText {
 	pub(super) fn as_str(&self) -> &str {
 		// SAFETY: `fmt::Write` only appends valid UTF-8 within the fixed buffer.
-		unsafe { std::str::from_utf8_unchecked(&self.bytes[..usize::from(self.len)]) }
+		unsafe { str::from_utf8_unchecked(&self.bytes[..usize::from(self.len)]) }
 	}
 }
 
@@ -98,7 +103,7 @@ pub struct MdTheme {
 
 impl Default for MdTheme {
 	fn default() -> Self {
-		Self::from_theme(&crate::context::Theme::default())
+		Self::from_theme(&Theme::default())
 	}
 }
 
@@ -801,7 +806,7 @@ fn bare_math_end(lines: &[&str], index: usize) -> Option<usize> {
 	let rest = line.strip_prefix("\\begin{")?;
 	let close = rest.find('}')?;
 	let environment = &rest[..close];
-	if !crate::latex::is_bare_math_environment(environment) {
+	if !latex::is_bare_math_environment(environment) {
 		return None;
 	}
 	for (offset, candidate) in lines[index..].iter().enumerate() {
@@ -834,12 +839,12 @@ fn bare_math_with_lhs_end(lines: &[&str], index: usize) -> Option<usize> {
 fn render_math(body: &str, width: u16, theme: &MdTheme, sink: &mut dyn RichSink) {
 	{
 		let mut clipped = (&mut *sink).clip(width, None);
-		if crate::latex::latex_block(body, theme.base, &mut clipped) {
+		if latex::latex_block(body, theme.base, &mut clipped) {
 			return;
 		}
 	}
 	let mut wrap = (&mut *sink).wrap(width);
-	crate::latex::latex_inline(body, theme.base, &mut wrap);
+	latex::latex_inline(body, theme.base, &mut wrap);
 	wrap.finish();
 }
 
@@ -954,8 +959,8 @@ fn list_marker(line: &str) -> Option<ListMarker<'_>> {
 
 fn push_prefix_spaces(prefix: &mut Prefix, style: Style, mut count: usize) {
 	while count > 0 {
-		let take = count.min(crate::rich::SPACES.len());
-		prefix.push(style, &crate::rich::SPACES[..take]);
+		let take = count.min(rich::SPACES.len());
+		prefix.push(style, &rich::SPACES[..take]);
 		count -= take;
 	}
 }
@@ -1209,12 +1214,12 @@ fn render_list_text(
 		{
 			let clipped = (&mut *sink).clip(width, None);
 			let mut prefixed = clipped.prefixed(first, continuation);
-			if crate::latex::latex_block(body, theme.base, &mut prefixed) {
+			if latex::latex_block(body, theme.base, &mut prefixed) {
 				return;
 			}
 		}
 		let mut wrapped = (&mut *sink).wrap_prefixed(width, first, continuation);
-		crate::latex::latex_inline(body, theme.base, &mut wrapped);
+		latex::latex_inline(body, theme.base, &mut wrapped);
 		wrapped.finish();
 		return;
 	}

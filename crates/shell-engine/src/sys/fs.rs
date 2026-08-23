@@ -1,5 +1,7 @@
 //! Filesystem utilities
 
+#[cfg(any(windows, test))]
+use std::str;
 use std::{
 	borrow::Cow,
 	path::{Path, PathBuf},
@@ -87,7 +89,7 @@ fn translate_unix_drive_path(path: &Path) -> Option<PathBuf> {
 
 	// `tail` starts at an ASCII separator boundary in valid UTF-8; translating
 	// per byte would corrupt multibyte path components.
-	let tail = std::str::from_utf8(tail).ok()?;
+	let tail = str::from_utf8(tail).ok()?;
 	let mut native = String::with_capacity(3 + tail.len());
 	native.push(char::from(drive).to_ascii_uppercase());
 	native.push(':');
@@ -124,6 +126,7 @@ fn drive_alias_parts(bytes: &[u8]) -> Option<(u8, &[u8])> {
 }
 
 pub use super::platform::fs::*;
+use crate::error;
 
 /// Extension trait for path-related filesystem operations.
 pub trait PathExt {
@@ -156,7 +159,7 @@ pub trait PathExt {
 	fn exists_and_is_sticky_bit(&self) -> bool;
 
 	/// Returns the device ID and inode number for the path.
-	fn get_device_and_inode(&self) -> Result<(u64, u64), crate::error::Error>;
+	fn get_device_and_inode(&self) -> Result<(u64, u64), error::Error>;
 }
 
 #[cfg(test)]

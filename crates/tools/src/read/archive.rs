@@ -22,6 +22,8 @@ pub const MAX_TAR_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum decoded size of one archive member.
 pub const MAX_ARCHIVE_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 
+use std::{cmp, collections::BTreeSet, io, iter, str};
+
 /// Formats supported by archive reads.
 pub use omp_ar::Format as ArchiveFormat;
 
@@ -177,7 +179,7 @@ pub enum ArchiveError {
 		path:   PathBuf,
 		/// Underlying I/O error.
 		#[source]
-		source: std::io::Error,
+		source: io::Error,
 	},
 	/// Container metadata or compressed data is invalid.
 	#[error("Invalid {} archive: {source}", <&'static str>::from(*.format))]
@@ -282,12 +284,12 @@ pub fn parse_archive_path_candidates(path: &str) -> Vec<ArchivePathCandidate> {
 	let normalized = path.replace('\\', "/");
 	let lower = normalized.to_ascii_lowercase();
 	let mut candidates = Vec::new();
-	let mut seen = std::collections::BTreeSet::new();
+	let mut seen = BTreeSet::new();
 	for (start, byte) in lower.bytes().enumerate() {
 		if byte != b'.' {
 			continue;
 		}
-		for extension in EXTENSIONS.iter().copied().chain(std::iter::once(APK)) {
+		for extension in EXTENSIONS.iter().copied().chain(iter::once(APK)) {
 			if !lower[start..].starts_with(extension) {
 				continue;
 			}
@@ -303,7 +305,7 @@ pub fn parse_archive_path_candidates(path: &str) -> Vec<ArchivePathCandidate> {
 			break;
 		}
 	}
-	candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.archive_path.len()));
+	candidates.sort_by_key(|candidate| cmp::Reverse(candidate.archive_path.len()));
 	candidates
 }
 
@@ -563,7 +565,7 @@ pub fn decode_utf8_text(bytes: &[u8]) -> Option<String> {
 	if bytes.contains(&0) {
 		return None;
 	}
-	std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+	str::from_utf8(bytes).ok().map(ToOwned::to_owned)
 }
 
 /// Exact model-facing notice for a binary archive entry.

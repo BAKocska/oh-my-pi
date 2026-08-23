@@ -9,7 +9,7 @@ use std::sync::{
 	atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use flume::TryRecvError;
+use flume::{Receiver, TryRecvError};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, watch};
 
@@ -28,25 +28,35 @@ const CAPTURE_PERIOD_MS: u32 = 50;
 const CAPTURE_PERIOD_MS: u32 = 20;
 const PLAYBACK_DRAIN_CALLBACKS: usize = 4;
 
-/// A receiver for normalized RMS audio levels in `[0.0, 1.0]`.
-#[derive(Clone, Debug)]
-pub struct AudioLevelStream {
-	receiver: watch::Receiver<f32>,
-}
+mod level {
+	use tokio::sync::watch::Receiver;
 
-impl AudioLevelStream {
-	/// Return the most recently observed RMS level without waiting.
-	pub fn latest(&self) -> f32 {
-		*self.receiver.borrow()
+	/// A receiver for normalized RMS audio levels in `[0.0, 1.0]`.
+	#[derive(Clone, Debug)]
+	pub struct AudioLevelStream {
+		receiver: Receiver<f32>,
 	}
 
-	/// Wait for and return the next level, or `None` after the device closes.
-	pub async fn next(&mut self) -> Option<f32> {
-		self.receiver.changed().await.ok()?;
-		let level = *self.receiver.borrow_and_update();
-		Some(level)
+	impl AudioLevelStream {
+		pub(super) const fn new(receiver: Receiver<f32>) -> Self {
+			Self { receiver }
+		}
+
+		/// Return the most recently observed RMS level without waiting.
+		pub fn latest(&self) -> f32 {
+			*self.receiver.borrow()
+		}
+
+		/// Wait for and return the next level, or `None` after the device closes.
+		pub async fn next(&mut self) -> Option<f32> {
+			self.receiver.changed().await.ok()?;
+			let level = *self.receiver.borrow_and_update();
+			Some(level)
+		}
 	}
 }
+
+pub use level::AudioLevelStream;
 
 /// Shared playback lifecycle state that may be awaited independently of the
 /// device handle.
@@ -209,7 +219,7 @@ impl PlaybackStream {
 			device: Some(device),
 			writer: Some(PlaybackWriter { tx, state: Arc::clone(&state) }),
 			state,
-			levels: AudioLevelStream { receiver: level_rx },
+			levels: AudioLevelStream::new(level_rx),
 		})
 	}
 
@@ -307,7 +317,7 @@ impl CaptureStream {
 			}),
 		)
 		.map_err(|source| unavailable(AudioDirection::Capture, source))?;
-		Ok(Self { device: Some(device), levels: AudioLevelStream { receiver: level_rx } })
+		Ok(Self { device: Some(device), levels: AudioLevelStream::new(level_rx) })
 	}
 
 	/// Subscribe to normalized microphone RMS levels.
@@ -357,7 +367,7 @@ fn rms_level(samples: &[f32]) -> f32 {
 }
 
 fn fill_playback(
-	rx: &flume::Receiver<Vec<f32>>,
+	rx: &Receiver<Vec<f32>>,
 	current: &mut Vec<f32>,
 	cursor: &mut usize,
 	output: &mut [f32],
@@ -420,7 +430,7 @@ mod tests {
 	use super::*;
 
 	fn render(
-		rx: &flume::Receiver<Vec<f32>>,
+		rx: &Receiver<Vec<f32>>,
 		state: &PlaybackState,
 		current: &mut Vec<f32>,
 		cursor: &mut usize,

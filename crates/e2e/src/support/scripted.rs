@@ -1,5 +1,6 @@
 use std::{
 	collections::VecDeque,
+	future,
 	future::Future,
 	pin::Pin,
 	sync::Arc,
@@ -139,7 +140,7 @@ impl TurnSession for ScriptedTurnSession {
 
 	fn submit(&mut self, frame: InvokeFrame) -> impl Future<Output = Result<(), Error>> + Send + '_ {
 		self.submitted.lock().push(frame);
-		std::future::ready(Ok(()))
+		future::ready(Ok(()))
 	}
 }
 

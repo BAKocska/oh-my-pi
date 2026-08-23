@@ -19,9 +19,11 @@ mod win32;
 
 use std::{
 	collections::HashMap,
-	panic::AssertUnwindSafe,
+	iter,
+	panic::{self, AssertUnwindSafe},
 	sync::Arc,
-	thread::{self, JoinHandle},
+	thread,
+	thread::JoinHandle,
 	time::Duration,
 };
 
@@ -30,9 +32,11 @@ use backend::{Backend, DeliveryMode, MouseButton, PointerEvent};
 use bytes::Bytes;
 use error::CoreResult;
 pub use error::{DesktopError, DesktopResult, ErrorCode};
+use flume::Receiver;
 use frame::{FrameGeometry, apply_capture_caps, encode_png};
 use keys::{parse_keys, parse_modifiers};
 use parking_lot::Mutex;
+use tokio::task;
 pub use types::*;
 
 const OPERATION_TIMEOUT: Duration = Duration::from_mins(1);
@@ -469,11 +473,7 @@ impl Worker {
 				let mut attributes = self.ax()?.attributes(&h)?;
 				for (_, value) in &mut attributes {
 					if value.chars().count() > 200 {
-						*value = value
-							.chars()
-							.take(199)
-							.chain(std::iter::once('.'))
-							.collect();
+						*value = value.chars().take(199).chain(iter::once('.')).collect();
 					}
 				}
 				Ok(Response::Attributes(attributes))
@@ -611,7 +611,7 @@ fn create_backend(_: DisplaySelector) -> CoreResult<Box<dyn Backend>> {
 
 struct Lifecycle {
 	tx:     Option<flume::Sender<Request>>,
-	done:   Option<flume::Receiver<()>>,
+	done:   Option<Receiver<()>>,
 	join:   Option<JoinHandle<()>>,
 	closed: bool,
 }
@@ -652,7 +652,7 @@ impl SessionCore {
 				let mut worker = Worker::new(selector, caps);
 				while let Ok(request) = rx.recv() {
 					let close = request.is_close();
-					let result = std::panic::catch_unwind(AssertUnwindSafe(|| worker.process(&request)))
+					let result = panic::catch_unwind(AssertUnwindSafe(|| worker.process(&request)))
 						.unwrap_or_else(|_| {
 							Err(DesktopError::internal("native desktop worker panicked"))
 						});
@@ -1004,7 +1004,7 @@ impl DesktopSession {
 	/// Close the actor and wait for its platform resources to exit.
 	pub async fn close(&self) -> CoreResult<()> {
 		let core = Arc::clone(&self.core);
-		tokio::task::spawn_blocking(move || core.close())
+		task::spawn_blocking(move || core.close())
 			.await
 			.map_err(|error| DesktopError::internal(format!("desktop close task failed: {error}")))?
 	}
@@ -1016,7 +1016,7 @@ impl DesktopSession {
 		D: FnOnce(Response) -> CoreResult<T> + Send + 'static,
 	{
 		let core = Arc::clone(&self.core);
-		tokio::task::spawn_blocking(move || decode(core.call(make)?))
+		task::spawn_blocking(move || decode(core.call(make)?))
 			.await
 			.map_err(|error| {
 				DesktopError::internal(format!("desktop operation task failed: {error}"))

@@ -2,12 +2,15 @@
 //! [`Object`].
 
 use std::{
-	fmt::{self, Write as _},
-	ops, slice,
+	fmt::{self, Display, Write as _},
+	iter, mem, ops, slice, vec,
 };
 
 use omp_core::Str;
-use serde::de::Error as _;
+use serde::de::{
+	Error as _,
+	value::{self, BorrowedStrDeserializer},
+};
 
 /// A parsed JSON value. `Display` serializes back to compact JSON.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -111,7 +114,7 @@ impl Value {
 
 	/// Deserialize a typed view directly from this tree without serializing or
 	/// reparsing it.
-	pub fn deserialize_into<'de, T>(&'de self) -> Result<T, serde::de::value::Error>
+	pub fn deserialize_into<'de, T>(&'de self) -> Result<T, value::Error>
 	where
 		T: serde::Deserialize<'de>,
 	{
@@ -140,7 +143,7 @@ impl ops::Index<usize> for Value {
 	}
 }
 
-impl fmt::Display for Value {
+impl Display for Value {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Null => f.write_str("null"),
@@ -246,7 +249,7 @@ impl Number {
 	}
 }
 
-impl fmt::Display for Number {
+impl Display for Number {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self.0 {
 			N::PosInt(v) => v.fmt(f),
@@ -285,13 +288,13 @@ pub struct Object(Vec<(Str, Value)>);
 /// Borrowed iterator over an [`Object`]'s members in insertion order.
 pub type ObjectIter<'a> = impl DoubleEndedIterator<Item = (&'a Str, &'a Value)>
 	+ ExactSizeIterator
-	+ std::iter::FusedIterator
+	+ iter::FusedIterator
 	+ Clone;
 
 /// Mutable iterator over an [`Object`]'s members in insertion order.
 pub type ObjectIterMut<'a> = impl DoubleEndedIterator<Item = (&'a Str, &'a mut Value)>
 	+ ExactSizeIterator
-	+ std::iter::FusedIterator;
+	+ iter::FusedIterator;
 
 impl Object {
 	/// An empty object.
@@ -322,7 +325,7 @@ impl Object {
 	/// Insert or overwrite `key`, returning the previous value if any.
 	pub fn insert(&mut self, key: Str, value: Value) -> Option<Value> {
 		if let Some(slot) = self.0.iter_mut().find(|(k, _)| *k == key) {
-			Some(std::mem::replace(&mut slot.1, value))
+			Some(mem::replace(&mut slot.1, value))
 		} else {
 			self.0.push((key, value));
 			None
@@ -352,7 +355,7 @@ impl PartialEq for Object {
 	}
 }
 
-impl fmt::Display for Object {
+impl Display for Object {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_char('{')?;
 		for (i, (key, value)) in self.0.iter().enumerate() {
@@ -386,7 +389,7 @@ impl<'a> IntoIterator for &'a mut Object {
 }
 
 impl IntoIterator for Object {
-	type IntoIter = std::vec::IntoIter<(Str, Value)>;
+	type IntoIter = vec::IntoIter<(Str, Value)>;
 	type Item = (Str, Value);
 
 	fn into_iter(self) -> Self::IntoIter {
@@ -613,7 +616,7 @@ struct ValueSeqAccess<'de> {
 }
 
 impl<'de> serde::de::SeqAccess<'de> for ValueSeqAccess<'de> {
-	type Error = serde::de::value::Error;
+	type Error = value::Error;
 
 	fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
 	where
@@ -637,7 +640,7 @@ struct ValueMapAccess<'de> {
 }
 
 impl<'de> serde::de::MapAccess<'de> for ValueMapAccess<'de> {
-	type Error = serde::de::value::Error;
+	type Error = value::Error;
 
 	fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
 	where
@@ -648,7 +651,7 @@ impl<'de> serde::de::MapAccess<'de> for ValueMapAccess<'de> {
 		};
 		self.value = Some(value);
 		seed
-			.deserialize(serde::de::value::BorrowedStrDeserializer::new(key.as_str()))
+			.deserialize(BorrowedStrDeserializer::new(key.as_str()))
 			.map(Some)
 	}
 
@@ -659,7 +662,7 @@ impl<'de> serde::de::MapAccess<'de> for ValueMapAccess<'de> {
 		let value = self
 			.value
 			.take()
-			.ok_or_else(|| serde::de::value::Error::custom("value requested before map key"))?;
+			.ok_or_else(|| value::Error::custom("value requested before map key"))?;
 		seed.deserialize(value)
 	}
 
@@ -674,14 +677,14 @@ struct ValueEnumAccess<'de> {
 }
 
 impl<'de> serde::de::EnumAccess<'de> for ValueEnumAccess<'de> {
-	type Error = serde::de::value::Error;
+	type Error = value::Error;
 	type Variant = ValueVariantAccess<'de>;
 
 	fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
 	where
 		V: serde::de::DeserializeSeed<'de>,
 	{
-		let variant = seed.deserialize(serde::de::value::BorrowedStrDeserializer::new(self.key))?;
+		let variant = seed.deserialize(BorrowedStrDeserializer::new(self.key))?;
 		Ok((variant, ValueVariantAccess { value: self.value }))
 	}
 }
@@ -691,7 +694,7 @@ struct ValueVariantAccess<'de> {
 }
 
 impl<'de> serde::de::VariantAccess<'de> for ValueVariantAccess<'de> {
-	type Error = serde::de::value::Error;
+	type Error = value::Error;
 
 	fn unit_variant(self) -> Result<(), Self::Error> {
 		match self.value {
@@ -707,7 +710,7 @@ impl<'de> serde::de::VariantAccess<'de> for ValueVariantAccess<'de> {
 		seed.deserialize(
 			self
 				.value
-				.ok_or_else(|| serde::de::value::Error::custom("missing enum newtype value"))?,
+				.ok_or_else(|| value::Error::custom("missing enum newtype value"))?,
 		)
 	}
 
@@ -718,7 +721,7 @@ impl<'de> serde::de::VariantAccess<'de> for ValueVariantAccess<'de> {
 		serde::Deserializer::deserialize_seq(
 			self
 				.value
-				.ok_or_else(|| serde::de::value::Error::custom("missing enum tuple value"))?,
+				.ok_or_else(|| value::Error::custom("missing enum tuple value"))?,
 			visitor,
 		)
 	}
@@ -734,14 +737,14 @@ impl<'de> serde::de::VariantAccess<'de> for ValueVariantAccess<'de> {
 		serde::Deserializer::deserialize_map(
 			self
 				.value
-				.ok_or_else(|| serde::de::value::Error::custom("missing enum struct value"))?,
+				.ok_or_else(|| value::Error::custom("missing enum struct value"))?,
 			visitor,
 		)
 	}
 }
 
 impl<'de> serde::Deserializer<'de> for &'de Value {
-	type Error = serde::de::value::Error;
+	type Error = value::Error;
 
 	serde::forward_to_deserialize_any! {
 		bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
@@ -811,7 +814,7 @@ impl<'de> serde::Deserializer<'de> for &'de Value {
 				let (key, value) = object.iter().next().expect("length checked");
 				visitor.visit_enum(ValueEnumAccess { key: key.as_str(), value: Some(value) })
 			},
-			_ => Err(serde::de::value::Error::custom("expected enum string or single-key object")),
+			_ => Err(value::Error::custom("expected enum string or single-key object")),
 		}
 	}
 

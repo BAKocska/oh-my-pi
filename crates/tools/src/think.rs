@@ -1,6 +1,9 @@
 //! Private no-op reasoning scratch tool.
 
-use std::fmt;
+use std::{
+	error,
+	fmt::{self, Display},
+};
 
 use async_stream::stream;
 use futures::Stream;
@@ -38,12 +41,12 @@ pub enum Update {}
 pub struct Fault {
 	message: Str,
 }
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.message)
 	}
 }
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// No-op scratch executor; normal tool journaling is the note's durable truth.
 pub struct Think {

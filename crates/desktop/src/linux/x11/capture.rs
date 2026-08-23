@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use image::{RgbaImage, imageops};
 use x11rb::{
@@ -8,7 +8,8 @@ use x11rb::{
 		ErrorKind,
 		randr::ConnectionExt as _,
 		xproto::{
-			Atom, AtomEnum, ConnectionExt as _, ImageFormat, ImageOrder, MapState, VisualClass, Window,
+			Atom, AtomEnum, ConnectionExt as _, GetPropertyReply, ImageFormat, ImageOrder, MapState,
+			VisualClass, Window,
 		},
 	},
 	rust_connection::RustConnection,
@@ -354,7 +355,7 @@ impl X11Capture {
 		property: Atom,
 		type_: impl Into<Atom>,
 		length: u32,
-	) -> Option<x11rb::protocol::xproto::GetPropertyReply> {
+	) -> Option<GetPropertyReply> {
 		let reply = self
 			.conn
 			.get_property(false, window, property, type_, 0, length)
@@ -407,7 +408,7 @@ impl X11Capture {
 	}
 }
 
-fn request_failed(error: impl std::fmt::Display) -> DesktopError {
+fn request_failed(error: impl Display) -> DesktopError {
 	DesktopError::capture_failed(format!("X11 request failed: {error}"))
 }
 

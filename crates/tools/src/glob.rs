@@ -1,6 +1,11 @@
 //! Pi-compatible workspace path matching with mtime-ranked grouped output.
 
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{
+	collections::HashSet,
+	error,
+	fmt::{self, Display},
+	sync::Arc,
+};
 
 use async_stream::stream;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
@@ -188,7 +193,7 @@ pub enum Fault {
 	},
 }
 
-impl fmt::Display for Fault {
+impl Display for Fault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::InvalidLimit => formatter.write_str("Limit must be a positive number"),
@@ -219,7 +224,7 @@ impl fmt::Display for Fault {
 	}
 }
 
-impl std::error::Error for Fault {}
+impl error::Error for Fault {}
 
 /// Generic `glob@1` executor over environment-owned workspace and blob
 /// resources.

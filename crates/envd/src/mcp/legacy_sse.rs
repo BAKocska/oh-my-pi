@@ -10,8 +10,9 @@ use std::{
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use http::{
-	HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
+	HeaderMap, HeaderValue, Method, StatusCode,
 	header::{ACCEPT, CONTENT_TYPE},
 };
 use omp_core::Str;
@@ -22,7 +23,8 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{
-	header_policy::{RedirectPolicy, redirect_location},
+	header_policy,
+	header_policy::{HeaderPolicyError, RedirectPolicy, redirect_location},
 	http::{
 		HttpExchange, HttpExchangeError, HttpRequest, HttpResponse, RefreshableHeaders,
 		parse_sse_events,
@@ -65,7 +67,7 @@ pub struct LegacySseTransport {
 	ids:         Mutex<RequestIdAllocator>,
 	pending:     Mutex<HashMap<RequestId, oneshot::Sender<PendingResult>>>,
 	incoming_tx: flume::Sender<IncomingMessage>,
-	incoming_rx: flume::Receiver<IncomingMessage>,
+	incoming_rx: Receiver<IncomingMessage>,
 	closed:      AtomicBool,
 }
 
@@ -76,7 +78,7 @@ impl LegacySseTransport {
 		http: Arc<dyn HttpExchange>,
 		cancellation: CancellationToken,
 	) -> Result<Self, TransportError> {
-		super::header_policy::validate_configured_headers(&config.headers)
+		header_policy::validate_configured_headers(&config.headers)
 			.map_err(|source| TransportError::pre_dispatch(TransportFailure::HeaderPolicy(source)))?;
 		let (incoming_tx, incoming_rx) = flume::bounded(256);
 		let transport = Self {
@@ -210,9 +212,9 @@ impl LegacySseTransport {
 				.is_some_and(|name| name.as_str() == "endpoint")
 			{
 				let endpoint = self.config.url.join(event.data.trim()).map_err(|source| {
-					TransportError::pre_dispatch(TransportFailure::HeaderPolicy(
-						super::header_policy::HeaderPolicyError::Url(source),
-					))
+					TransportError::pre_dispatch(TransportFailure::HeaderPolicy(HeaderPolicyError::Url(
+						source,
+					)))
 				})?;
 				if origin(&endpoint) != origin(&self.config.url) {
 					return Err(TransportError::pre_dispatch(TransportFailure::SseProtocol));

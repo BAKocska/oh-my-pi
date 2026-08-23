@@ -3,6 +3,7 @@
 use std::{
 	cmp,
 	io::{self, Read, Seek, SeekFrom, Write},
+	str,
 };
 
 use crc32fast::Hasher;
@@ -647,7 +648,7 @@ fn decode_entry_metadata(raw_name: &[u8], extra: &[u8], utf8: bool) -> Result<(S
 			);
 			if data[0] == 1
 				&& expected_crc == crc32fast::hash(raw_name)
-				&& let Ok(name) = std::str::from_utf8(&data[5..])
+				&& let Ok(name) = str::from_utf8(&data[5..])
 			{
 				unicode_name = Some(name);
 			}

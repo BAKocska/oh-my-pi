@@ -2,7 +2,10 @@
 
 use std::{
 	collections::BTreeMap,
-	fmt,
+	error,
+	fmt::{self, Display},
+	fs::{self, OpenOptions},
+	io,
 	path::{Component, Path, PathBuf},
 	sync::Arc,
 	time::{SystemTime, UNIX_EPOCH},
@@ -12,18 +15,26 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use omp_core::{Str, sf};
-use omp_proto::{inference::v1 as inference_pb, thread::v1 as thread_pb};
+use omp_proto::{
+	inference::v1::{self as inference_pb, generate_image_request, value},
+	thread::v1::{self as thread_pb, blob},
+};
 use omp_storage::telemetry_index::{StoredIssue, TelemetryIndex};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
 	InferenceEffects, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
+use omp_tools::ask;
+use omp_voice::audio::PlaybackStream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::{blobs::BlobHost, search_backend::SearchBridgeHost};
+use super::{
+	blobs::{BlobError, BlobHost},
+	search_backend::SearchBridgeHost,
+};
 
 /// Production ask-dialog vocalizer over the application inference facade.
 pub struct AskVocalizer {
@@ -38,7 +49,7 @@ impl omp_tools::ask::AskVocalizer for AskVocalizer {
 		&self,
 		lines: &[omp_tools::ask::SpokenLine],
 		cancellation: CancellationToken,
-	) -> Result<(), omp_tools::ask::Fault> {
+	) -> Result<(), ask::Fault> {
 		if cancellation.is_cancelled() || lines.is_empty() {
 			return Ok(());
 		}
@@ -72,7 +83,7 @@ impl omp_tools::ask::AskVocalizer for AskVocalizer {
 			})?,
 		};
 		if audio.len() % 2 != 0 {
-			return Err(omp_tools::ask::Fault::Presenter {
+			return Err(ask::Fault::Presenter {
 				message: sf!("ask speech returned malformed PCM16 audio"),
 			});
 		}
@@ -80,15 +91,12 @@ impl omp_tools::ask::AskVocalizer for AskVocalizer {
 			.chunks_exact(2)
 			.map(|sample| f32::from(i16::from_le_bytes([sample[0], sample[1]])) / f32::from(i16::MAX))
 			.collect::<Vec<_>>();
-		let mut playback = omp_voice::audio::PlaybackStream::start(24_000).map_err(|error| {
-			omp_tools::ask::Fault::Presenter { message: Str::from(error.to_string()) }
-		})?;
+		let mut playback = PlaybackStream::start(24_000)
+			.map_err(|error| ask::Fault::Presenter { message: Str::from(error.to_string()) })?;
 		playback
 			.writer()
 			.and_then(|writer| writer.write_owned(samples))
-			.map_err(|error| omp_tools::ask::Fault::Presenter {
-				message: Str::from(error.to_string()),
-			})?;
+			.map_err(|error| ask::Fault::Presenter { message: Str::from(error.to_string()) })?;
 		tokio::select! {
 			biased;
 			() = cancellation.cancelled() => {
@@ -172,12 +180,12 @@ pub struct MediaFault {
 	pub message: Str,
 }
 
-impl fmt::Display for MediaFault {
+impl Display for MediaFault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}: {}", self.code, self.message)
 	}
 }
-impl std::error::Error for MediaFault {}
+impl error::Error for MediaFault {}
 
 /// Media devices do not currently stream previews.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -271,13 +279,13 @@ impl MediaDevice {
 			.input_image
 			.as_ref()
 			.map(|path| {
-				let bytes = std::fs::read(path.as_str()).map_err(media_io_fault)?;
+				let bytes = fs::read(path.as_str()).map_err(media_io_fault)?;
 				Ok(thread_pb::Blob {
 					hash:   bytes::Bytes::copy_from_slice(omp_core::Hash32::sum(&bytes).as_bytes()),
 					mime:   "application/octet-stream".to_owned(),
 					size:   bytes.len() as u64,
 					inline: bytes.into(),
-					detail: thread_pb::blob::Detail::Original as i32,
+					detail: blob::Detail::Original as i32,
 				})
 			})
 			.into_iter()
@@ -288,9 +296,9 @@ impl MediaDevice {
 			n: 1,
 			aspect_ratio: aspect_ratio(params.aspect_ratio.as_deref())?,
 			size: None,
-			quality: inference_pb::generate_image_request::Quality::Medium as i32,
+			quality: generate_image_request::Quality::Medium as i32,
 			format: image_format(params.format.as_deref())?,
-			background: inference_pb::generate_image_request::Background::Unspecified as i32,
+			background: generate_image_request::Background::Unspecified as i32,
 			compression: None,
 			seed: None,
 			input_images,
@@ -341,7 +349,7 @@ impl MediaDevice {
 			clone:          None,
 			props:          params.bit_rate.map(|bit_rate| inference_pb::ValueMap {
 				fields: BTreeMap::from([("audio/bit_rate".to_owned(), inference_pb::Value {
-					kind: Some(inference_pb::value::Kind::Uint(u64::from(bit_rate))),
+					kind: Some(value::Kind::Uint(u64::from(bit_rate))),
 				})]),
 			}),
 		};
@@ -405,18 +413,18 @@ fn write_media_output(root: &Path, authored: &str, bytes: &[u8]) -> Result<Str, 
 		std::process::id(),
 		now_ms()
 	));
-	let write_result = (|| -> std::io::Result<()> {
+	let write_result = (|| -> io::Result<()> {
 		use std::io::Write as _;
-		let mut file = std::fs::OpenOptions::new()
+		let mut file = OpenOptions::new()
 			.write(true)
 			.create_new(true)
 			.open(&temporary)?;
 		file.write_all(bytes)?;
 		file.sync_all()?;
-		std::fs::rename(&temporary, &target)
+		fs::rename(&temporary, &target)
 	})();
 	if let Err(error) = write_result {
-		let _ = std::fs::remove_file(&temporary);
+		let _ = fs::remove_file(&temporary);
 		return Err(media_io_fault(error));
 	}
 	Ok(Str::new(authored))
@@ -506,9 +514,9 @@ fn aspect_ratio(value: Option<&str>) -> Result<i32, MediaFault> {
 
 fn image_format(value: Option<&str>) -> Result<i32, MediaFault> {
 	Ok(match value.unwrap_or("png") {
-		"png" => inference_pb::generate_image_request::Format::Png as i32,
-		"webp" => inference_pb::generate_image_request::Format::Webp as i32,
-		"jpeg" | "jpg" => inference_pb::generate_image_request::Format::Jpeg as i32,
+		"png" => generate_image_request::Format::Png as i32,
+		"webp" => generate_image_request::Format::Webp as i32,
+		"jpeg" | "jpg" => generate_image_request::Format::Jpeg as i32,
 		_ => return Err(media_fault("invalid_image_format", "image", "unsupported image format")),
 	})
 }
@@ -548,7 +556,7 @@ fn media_backend_fault(error: omp_tools::web_search::BackendError) -> MediaFault
 	MediaFault { code: error.code, backend: sf!("inference"), message: error.message }
 }
 
-fn media_blob_fault(error: super::blobs::BlobError) -> MediaFault {
+fn media_blob_fault(error: BlobError) -> MediaFault {
 	MediaFault {
 		code:    sf!("media_artifact_failed"),
 		backend: sf!("blob"),
@@ -556,7 +564,7 @@ fn media_blob_fault(error: super::blobs::BlobError) -> MediaFault {
 	}
 }
 
-fn media_io_fault(error: std::io::Error) -> MediaFault {
+fn media_io_fault(error: io::Error) -> MediaFault {
 	MediaFault {
 		code:    sf!("media_input_failed"),
 		backend: sf!("filesystem"),

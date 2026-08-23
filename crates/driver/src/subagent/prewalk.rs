@@ -1,5 +1,7 @@
 //! Prewalk gating and definition features retained across revival.
 
+use std::collections::BTreeMap;
+
 use omp_agent::{AgentAuxiliary, AgentDefinition};
 use omp_core::Str;
 
@@ -60,7 +62,7 @@ impl PrewalkGate {
 	}
 }
 
-fn setting_override(overrides: &std::collections::BTreeMap<Str, Str>, name: &str) -> Option<Str> {
+fn setting_override(overrides: &BTreeMap<Str, Str>, name: &str) -> Option<Str> {
 	overrides
 		.iter()
 		.find(|(candidate, _)| candidate.as_str().eq_ignore_ascii_case(name))

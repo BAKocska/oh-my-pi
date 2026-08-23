@@ -1,5 +1,6 @@
 //! Deterministic client-side energy endpointer for non-streaming ASR engines.
 
+use std::mem;
 /// Tunable energy-endpointer thresholds. Durations are milliseconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EndpointerConfig {
@@ -114,7 +115,7 @@ impl StreamEndpointer {
 		if samples.is_empty() {
 			return events;
 		}
-		let mut input = std::mem::take(&mut self.leftover);
+		let mut input = mem::take(&mut self.leftover);
 		input.extend_from_slice(samples);
 		let whole = input.len() / self.frame_samples * self.frame_samples;
 		for offset in (0..whole).step_by(self.frame_samples) {
@@ -178,7 +179,7 @@ impl StreamEndpointer {
 		if self.silence_ms >= self.config.end_silence_ms {
 			self.finalize(events);
 		} else if self.segment_ms >= self.config.max_segment_ms {
-			events.push(EndpointerEvent::Segment(std::mem::take(&mut self.segment)));
+			events.push(EndpointerEvent::Segment(mem::take(&mut self.segment)));
 			self.segment_ms = 0;
 			self.silence_ms = 0;
 			self.ms_since_partial = 0;

@@ -1,6 +1,6 @@
 //! Unix document-daemon integration tests.
 
-use std::{future::Future, sync::mpsc, time::Duration};
+use std::{fs, future::Future, sync::mpsc, thread, time::Duration};
 
 use bytes::Bytes;
 use omp_core::{Hash32, Str, sf};
@@ -13,14 +13,21 @@ use omp_envd::{
 	docs::DocumentHost,
 	workspace::{WorkspaceError, WorkspaceHost},
 };
-use omp_proto::{blob::v1 as blob_pb, document::v1 as document_pb};
+use omp_proto::{
+	blob::v1 as blob_pb,
+	document::v1::{
+		self as document_pb, commit_transaction_response, read_document_response, read_selection,
+		summarize_document_response, text_mutation,
+	},
+};
 use tempfile::TempDir;
+use tokio::{io, time};
 use tokio_util::sync::CancellationToken;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
 async fn within<T>(future: impl Future<Output = T>) -> T {
-	tokio::time::timeout(DEADLINE, future)
+	time::timeout(DEADLINE, future)
 		.await
 		.expect("resource operation exceeded its deterministic deadline")
 }
@@ -55,9 +62,7 @@ pub fn label(value: u64) -> String {
 const fn proposed_content(content: &'static [u8]) -> document_pb::TextMutation {
 	document_pb::TextMutation {
 		base_revision: None,
-		change:        Some(document_pb::text_mutation::Change::ProposedContent(Bytes::from_static(
-			content,
-		))),
+		change:        Some(text_mutation::Change::ProposedContent(Bytes::from_static(content))),
 		stale_policy:  document_pb::StalePolicy::Fail as i32,
 		format_policy: document_pb::FormatPolicy::Disabled as i32,
 	}
@@ -68,14 +73,14 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 	let repository = TempDir::new().expect("scratch repository");
 	let config = ServerConfig::new(repository.path()).expect("docserver config");
 	let source = config.environment_root().join("fixture.rs");
-	std::fs::write(&source, rust_fixture()).expect("document fixture");
+	fs::write(&source, rust_fixture()).expect("document fixture");
 	let uri = config.file_uri(&source).expect("document URI").to_string();
 	let expected_root_uri = config
 		.file_uri(config.environment_root())
 		.expect("root URI")
 		.to_string();
 	let environment = Environment::new(config).expect("document authority");
-	let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+	let (client_stream, server_stream) = io::duplex(256 * 1024);
 	let server = tokio::spawn(serve_connection(
 		environment.clone(),
 		server_stream,
@@ -103,19 +108,16 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 	let selected = within(host.read(
 		&writer,
 		document_pb::ReadSelection {
-			selection: Some(document_pb::read_selection::Selection::Bytes(
-				document_pb::ByteRangeSelection {
-					ranges: vec![document_pb::ByteRange { start: 0, end: 18 }],
-				},
-			)),
+			selection: Some(read_selection::Selection::Bytes(document_pb::ByteRangeSelection {
+				ranges: vec![document_pb::ByteRange { start: 0, end: 18 }],
+			})),
 		},
 		&cancel,
 	))
 	.await
 	.expect("pinned range read");
 	assert_eq!(selected.head.as_ref(), Some(writer.head()));
-	let document_pb::read_document_response::Body::Slices(slices) =
-		selected.body.expect("range-read body")
+	let read_document_response::Body::Slices(slices) = selected.body.expect("range-read body")
 	else {
 		panic!("range read returned whole-document content");
 	};
@@ -139,9 +141,7 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 	.await
 	.expect("pinned structural summary");
 	assert_eq!(summarized.head.as_ref(), Some(writer.head()));
-	let Some(document_pb::summarize_document_response::Outcome::Summary(summary)) =
-		summarized.outcome
-	else {
+	let Some(summarize_document_response::Outcome::Summary(summary)) = summarized.outcome else {
 		panic!("fixture must produce a structural summary");
 	};
 	assert!(summary.parsed);
@@ -157,10 +157,7 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 	))
 	.await
 	.expect("committed transaction");
-	assert!(matches!(
-		committed.outcome,
-		Some(document_pb::commit_transaction_response::Outcome::Committed(_))
-	));
+	assert!(matches!(committed.outcome, Some(commit_transaction_response::Outcome::Committed(_))));
 	let advanced_revision = writer.head().revision.as_ref().expect("advanced revision");
 	assert_ne!(advanced_revision, &pinned_revision);
 
@@ -172,9 +169,7 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 	))
 	.await
 	.expect("stale transaction outcome");
-	let Some(document_pb::commit_transaction_response::Outcome::Rejected(rejected)) =
-		rejected.outcome
-	else {
+	let Some(commit_transaction_response::Outcome::Rejected(rejected)) = rejected.outcome else {
 		panic!("stale lease unexpectedly committed");
 	};
 	assert_eq!(rejected.reason, document_pb::TransactionRejectReason::StaleBase as i32);
@@ -187,16 +182,13 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 	let observed = within(host.read(
 		&observer,
 		document_pb::ReadSelection {
-			selection: Some(document_pb::read_selection::Selection::Whole(
-				document_pb::WholeDocument {},
-			)),
+			selection: Some(read_selection::Selection::Whole(document_pb::WholeDocument {})),
 		},
 		&cancel,
 	))
 	.await
 	.expect("advanced revision read");
-	let document_pb::read_document_response::Body::Content(content) =
-		observed.body.expect("whole-document body")
+	let read_document_response::Body::Content(content) = observed.body.expect("whole-document body")
 	else {
 		panic!("whole read returned slices");
 	};
@@ -222,11 +214,10 @@ async fn document_host_round_trips_a_real_revisioned_docserver_session() {
 #[test]
 fn workspace_host_matches_direct_walker_and_cancels_an_active_walk() {
 	let repository = TempDir::new().expect("scratch workspace");
-	std::fs::create_dir(repository.path().join("nested")).expect("nested directory");
-	std::fs::write(repository.path().join("alpha.txt"), b"alpha\n").expect("alpha fixture");
-	std::fs::write(repository.path().join("nested/beta.bin"), [0, 1, 2, 255])
-		.expect("binary fixture");
-	std::fs::write(repository.path().join("nested/gamma.rs"), b"fn gamma() {}\n")
+	fs::create_dir(repository.path().join("nested")).expect("nested directory");
+	fs::write(repository.path().join("alpha.txt"), b"alpha\n").expect("alpha fixture");
+	fs::write(repository.path().join("nested/beta.bin"), [0, 1, 2, 255]).expect("binary fixture");
+	fs::write(repository.path().join("nested/gamma.rs"), b"fn gamma() {}\n")
 		.expect("source fixture");
 
 	let host = WorkspaceHost::open(repository.path()).expect("workspace host");
@@ -252,9 +243,9 @@ fn workspace_host_matches_direct_walker_and_cancels_an_active_walk() {
 	}
 
 	let bulk = repository.path().join("bulk");
-	std::fs::create_dir(&bulk).expect("bulk fixture directory");
+	fs::create_dir(&bulk).expect("bulk fixture directory");
 	for index in 0..12_000 {
-		std::fs::write(bulk.join(format!("entry-{index:05}.txt")), b"x").expect("bulk fixture entry");
+		fs::write(bulk.join(format!("entry-{index:05}.txt")), b"x").expect("bulk fixture entry");
 	}
 	let active_request = host.request().gitignore(false).cache(false);
 	let active_host = host;
@@ -262,7 +253,7 @@ fn workspace_host_matches_direct_walker_and_cancels_an_active_walk() {
 	let worker_cancel = cancel.clone();
 	let (started_tx, started_rx) = mpsc::sync_channel(0);
 	let (result_tx, result_rx) = mpsc::sync_channel(1);
-	let worker = std::thread::spawn(move || {
+	let worker = thread::spawn(move || {
 		started_tx.send(()).expect("announce active walk");
 		let result = active_host.walk(&active_request, &worker_cancel);
 		result_tx.send(result).expect("return cancelled walk");
@@ -270,7 +261,7 @@ fn workspace_host_matches_direct_walker_and_cancels_an_active_walk() {
 	started_rx
 		.recv_timeout(DEADLINE)
 		.expect("active walk did not start before deadline");
-	std::thread::yield_now();
+	thread::yield_now();
 	assert!(result_rx.try_recv().is_err(), "walk completed before cancellation");
 	cancel.cancel();
 	let cancelled = result_rx

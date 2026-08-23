@@ -7,6 +7,8 @@ pub mod store;
 
 use std::{
 	collections::{BTreeMap, HashMap},
+	mem,
+	path::Path,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -32,12 +34,17 @@ pub use store::{
 use crate::{
 	answer::ArtifactBody,
 	call::{
-		CacheRetention, ContextStrategy, Message, OperationCall, PrefixCachePolicy, ServerStatePolicy,
+		CacheRetention, Call, ContextStrategy, Message, OperationCall, PrefixCachePolicy,
+		ServerStatePolicy, SessionRequest,
+	},
+	catalog::{
+		CodecId, ModelKey, ProviderId, RouteId, TrustDomain, capability::CacheRetentionBits,
+		model::ContextStrategy as CatalogContextStrategy, snapshot::Catalog,
 	},
 	codec::ProviderStateEvent,
 	error::{Error, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, Completion},
-	id::{RequestId, Revision},
+	id::{ConversationId, RequestId, Revision, TurnId},
 	layer::{
 		ExecutionContext, SessionAffinity,
 		session::{SessionAction, SessionCompletion, SessionPlanner},
@@ -147,14 +154,14 @@ where
 
 #[derive(Clone)]
 struct PreparedTurn {
-	request:           crate::id::RequestId,
-	session:           crate::call::SessionRequest,
+	request:           RequestId,
+	session:           SessionRequest,
 	input:             Arc<[StoredMessage]>,
-	provider:          crate::catalog::ProviderId,
-	codec:             crate::catalog::CodecId,
-	route:             crate::catalog::RouteId,
-	model:             crate::catalog::ModelKey,
-	trust_domain:      crate::catalog::TrustDomain,
+	provider:          ProviderId,
+	codec:             CodecId,
+	route:             RouteId,
+	model:             ModelKey,
+	trust_domain:      TrustDomain,
 	credential_policy: CredentialGenerationPolicy,
 }
 
@@ -163,7 +170,7 @@ type TurnReplayEncoder =
 
 #[derive(Clone)]
 struct PendingTurnReplay {
-	turn:    crate::id::TurnId,
+	turn:    TurnId,
 	request: Bytes,
 	encode:  Arc<TurnReplayEncoder>,
 }
@@ -179,7 +186,7 @@ enum PlannerDraft {
 	Memory {
 		draft:  TurnDraft<StoredMessage>,
 		store:  Arc<InMemoryConversationStore<StoredMessage>>,
-		replay: Option<(crate::id::TurnId, Bytes, Bytes)>,
+		replay: Option<(TurnId, Bytes, Bytes)>,
 	},
 }
 
@@ -191,7 +198,7 @@ impl PlannerStore {
 		}
 	}
 
-	fn fork(&self, at: &Revision<str>) -> Result<crate::id::ConversationId, ConversationError> {
+	fn fork(&self, at: &Revision<str>) -> Result<ConversationId, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.fork(at),
 			Self::Memory(store) => store.fork(at),
@@ -200,8 +207,8 @@ impl PlannerStore {
 
 	fn committed_turn(
 		&self,
-		conversation: &crate::id::ConversationId<str>,
-		turn: &crate::id::TurnId<str>,
+		conversation: &ConversationId<str>,
+		turn: &TurnId<str>,
 	) -> Result<Option<CommittedRevision<StoredMessage>>, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.committed_turn(conversation, turn),
@@ -209,10 +216,7 @@ impl PlannerStore {
 		}
 	}
 
-	fn turn_replay(
-		&self,
-		turn: &crate::id::TurnId<str>,
-	) -> Result<Option<TurnReplay>, ConversationError> {
+	fn turn_replay(&self, turn: &TurnId<str>) -> Result<Option<TurnReplay>, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.turn_replay(turn),
 			Self::Memory(store) => Ok(store.turn_replay(turn)),
@@ -221,7 +225,7 @@ impl PlannerStore {
 
 	fn commit_turn_replay(
 		&self,
-		turn: crate::id::TurnId,
+		turn: TurnId,
 		request: Bytes,
 		outcome: Bytes,
 	) -> Result<(), ConversationError> {
@@ -233,7 +237,7 @@ impl PlannerStore {
 
 	fn server_state(
 		&self,
-		conversation: &crate::id::ConversationId<str>,
+		conversation: &ConversationId<str>,
 	) -> Result<Option<ServerStateBinding>, ConversationError> {
 		match self {
 			Self::Sqlite(store) => store.server_state(conversation),
@@ -267,9 +271,9 @@ impl PlannerStore {
 
 	fn begin(
 		&self,
-		conversation: &crate::id::ConversationId<str>,
+		conversation: &ConversationId<str>,
 		revision: &Revision<str>,
-		turn: crate::id::TurnId,
+		turn: TurnId,
 		input: Arc<[StoredMessage]>,
 	) -> Result<PlannerDraft, ConversationError> {
 		match self {
@@ -293,7 +297,7 @@ impl PlannerDraft {
 
 	fn capture_turn_replay(
 		&mut self,
-		turn: crate::id::TurnId,
+		turn: TurnId,
 		request: Bytes,
 		outcome: Bytes,
 	) -> Result<(), ConversationError> {
@@ -332,7 +336,7 @@ impl PlannerDraft {
 #[derive(Clone)]
 pub struct ConversationSessionPlanner {
 	store:    PlannerStore,
-	catalog:  Arc<crate::catalog::snapshot::Catalog>,
+	catalog:  Arc<Catalog>,
 	prepared: Arc<Mutex<HashMap<RequestId, PreparedTurn>>>,
 	replays:  Arc<Mutex<HashMap<RequestId, PendingTurnReplay>>>,
 }
@@ -340,10 +344,7 @@ pub struct ConversationSessionPlanner {
 impl ConversationSessionPlanner {
 	/// Creates a planner backed by an explicitly injected durable SQLite store
 	/// and catalog.
-	pub fn new(
-		store: Arc<SqliteConversationStore<StoredMessage>>,
-		catalog: Arc<crate::catalog::snapshot::Catalog>,
-	) -> Self {
+	pub fn new(store: Arc<SqliteConversationStore<StoredMessage>>, catalog: Arc<Catalog>) -> Self {
 		Self {
 			store: PlannerStore::Sqlite(store),
 			catalog,
@@ -356,7 +357,7 @@ impl ConversationSessionPlanner {
 	/// deterministic tests.
 	pub fn with_in_memory(
 		store: Arc<InMemoryConversationStore<StoredMessage>>,
-		catalog: Arc<crate::catalog::snapshot::Catalog>,
+		catalog: Arc<Catalog>,
 	) -> Self {
 		Self {
 			store: PlannerStore::Memory(store),
@@ -367,10 +368,7 @@ impl ConversationSessionPlanner {
 	}
 
 	/// Opens a durable SQLite store at `path` and constructs a planner over it.
-	pub fn open(
-		path: impl AsRef<std::path::Path>,
-		catalog: Arc<crate::catalog::snapshot::Catalog>,
-	) -> Result<Self, ConversationError> {
+	pub fn open(path: impl AsRef<Path>, catalog: Arc<Catalog>) -> Result<Self, ConversationError> {
 		Ok(Self::new(Arc::new(SqliteConversationStore::open(path)?), catalog))
 	}
 
@@ -385,24 +383,21 @@ impl ConversationSessionPlanner {
 	pub fn fork_conversation(
 		&self,
 		at: &Revision<str>,
-	) -> Result<crate::id::ConversationId, ConversationError> {
+	) -> Result<ConversationId, ConversationError> {
 		self.store.fork(at)
 	}
 
 	/// Returns the provider-history commit for one conversation-scoped turn.
 	pub fn committed_turn(
 		&self,
-		conversation: &crate::id::ConversationId<str>,
-		turn: &crate::id::TurnId<str>,
+		conversation: &ConversationId<str>,
+		turn: &TurnId<str>,
 	) -> Result<Option<CommittedRevision<StoredMessage>>, ConversationError> {
 		self.store.committed_turn(conversation, turn)
 	}
 
 	/// Returns an exact terminal RPC response retained for logical-turn replay.
-	pub fn turn_replay(
-		&self,
-		turn: &crate::id::TurnId<str>,
-	) -> Result<Option<TurnReplay>, ConversationError> {
+	pub fn turn_replay(&self, turn: &TurnId<str>) -> Result<Option<TurnReplay>, ConversationError> {
 		self.store.turn_replay(turn)
 	}
 
@@ -412,7 +407,7 @@ impl ConversationSessionPlanner {
 	/// and replay become visible in one transaction.
 	pub fn commit_turn_replay(
 		&self,
-		turn: crate::id::TurnId,
+		turn: TurnId,
 		request: Bytes,
 		outcome: Bytes,
 	) -> Result<(), ConversationError> {
@@ -424,7 +419,7 @@ impl ConversationSessionPlanner {
 	pub fn stage_turn_replay<F>(
 		&self,
 		request: RequestId,
-		turn: crate::id::TurnId,
+		turn: TurnId,
 		request_bytes: Bytes,
 		encode: F,
 	) where
@@ -439,7 +434,7 @@ impl ConversationSessionPlanner {
 
 	fn prepare_inner(
 		&self,
-		call: &mut crate::call::Call,
+		call: &mut Call,
 		context: &ExecutionContext,
 		force_replay: bool,
 		input_override: Option<Arc<[StoredMessage]>>,
@@ -588,7 +583,7 @@ impl ConversationSessionPlanner {
 		}
 		context.set_session_state(selected_binding);
 		let credential_policy = match plan.policy_model.as_ref().map(|model| model.context) {
-			Some(crate::catalog::model::ContextStrategy::ServerState(policy))
+			Some(CatalogContextStrategy::ServerState(policy))
 				if policy.credential_generation_bound =>
 			{
 				CredentialGenerationPolicy::CredentialGenerationBound
@@ -611,15 +606,11 @@ impl ConversationSessionPlanner {
 }
 
 impl SessionPlanner for ConversationSessionPlanner {
-	fn prepare(
-		&self,
-		call: &mut crate::call::Call,
-		context: &ExecutionContext,
-	) -> Result<SessionAction, Error> {
+	fn prepare(&self, call: &mut Call, context: &ExecutionContext) -> Result<SessionAction, Error> {
 		self.prepare_inner(call, context, false, None)
 	}
 
-	fn reseed(&self, call: &mut crate::call::Call, context: &ExecutionContext) -> Result<(), Error> {
+	fn reseed(&self, call: &mut Call, context: &ExecutionContext) -> Result<(), Error> {
 		let input = self
 			.prepared
 			.lock()
@@ -632,7 +623,7 @@ impl SessionPlanner for ConversationSessionPlanner {
 
 	fn completion(
 		&self,
-		call: &crate::call::Call,
+		call: &Call,
 		context: &ExecutionContext,
 	) -> Result<Option<Arc<dyn SessionCompletion>>, Error> {
 		let Some(prepared) = self.prepared.lock().remove(&call.id) else {
@@ -668,7 +659,7 @@ struct DurableCompletion {
 	blocks:         Mutex<BTreeMap<u32, AssistantBlock>>,
 	completion:     Mutex<Option<Completion>>,
 	prepared:       PreparedTurn,
-	prepared_turns: Arc<Mutex<HashMap<crate::id::RequestId, PreparedTurn>>>,
+	prepared_turns: Arc<Mutex<HashMap<RequestId, PreparedTurn>>>,
 	replays:        Arc<Mutex<HashMap<RequestId, PendingTurnReplay>>>,
 }
 
@@ -827,8 +818,10 @@ impl SessionCompletion for DurableCompletion {
 					}
 				},
 				ProviderStateEvent::ToolCallProof { index, value } => {
-					if let Some(AssistantBlock::Tool(StoredContent::ToolCall { proof: slot, .. })) =
-						blocks.get_mut(index)
+					if let Some(&mut AssistantBlock::Tool(StoredContent::ToolCall {
+						proof: ref mut slot,
+						..
+					})) = blocks.get_mut(index)
 					{
 						*slot = Some(proof(value.clone()));
 					}
@@ -836,7 +829,7 @@ impl SessionCompletion for DurableCompletion {
 				_ => {},
 			}
 		}
-		let content = std::mem::take(&mut *blocks)
+		let content = mem::take(&mut *blocks)
 			.into_values()
 			.map(|block| match block {
 				AssistantBlock::Text(text) => {
@@ -932,26 +925,20 @@ impl SessionCompletion for DurableCompletion {
 	}
 }
 
-fn provider_context_strategy(strategy: crate::catalog::model::ContextStrategy) -> ContextStrategy {
+fn provider_context_strategy(strategy: CatalogContextStrategy) -> ContextStrategy {
 	match strategy {
-		crate::catalog::model::ContextStrategy::Replay => ContextStrategy::Replay,
-		crate::catalog::model::ContextStrategy::PrefixCache(policy) => {
-			let retention = if policy
-				.retention
-				.contains(crate::catalog::capability::CacheRetentionBits::LONG)
-			{
+		CatalogContextStrategy::Replay => ContextStrategy::Replay,
+		CatalogContextStrategy::PrefixCache(policy) => {
+			let retention = if policy.retention.contains(CacheRetentionBits::LONG) {
 				CacheRetention::Long
-			} else if policy
-				.retention
-				.contains(crate::catalog::capability::CacheRetentionBits::STANDARD)
-			{
+			} else if policy.retention.contains(CacheRetentionBits::STANDARD) {
 				CacheRetention::Session
 			} else {
 				CacheRetention::Request
 			};
 			ContextStrategy::PrefixCache(PrefixCachePolicy { retention, allow_reseed: true })
 		},
-		crate::catalog::model::ContextStrategy::ServerState(policy) => {
+		CatalogContextStrategy::ServerState(policy) => {
 			ContextStrategy::ServerState(ServerStatePolicy {
 				allow_reseed: true,
 				max_age:      policy.maximum_lifetime_ms.map(Duration::from_millis),
@@ -970,7 +957,7 @@ mod tests {
 		collections::{BTreeMap, HashMap},
 		sync::{Arc, Barrier},
 		thread,
-		time::{Duration, SystemTime},
+		time::{Duration, Instant, SystemTime},
 	};
 
 	use bytes::Bytes;
@@ -981,16 +968,18 @@ mod tests {
 		snapshot::Catalog,
 	};
 	use omp_core::{Str, sf};
+	use parking_lot::Mutex;
 
 	use super::{
-		ContextPlan, ConversationSessionPlanner,
+		ContextPlan, ConversationSessionPlanner, DurableCompletion, PlannerStore, PreparedTurn,
+		StoredMessage, StoredRole,
 		binding::{
 			BindingContext, BindingValidity, CredentialGenerationPolicy, PendingServerStateBinding,
 			ProviderExpiryDecision, ReseedReason, ReseedState,
 		},
 		conversation::MessagePersistenceError,
 		plan_context,
-		store::{ConversationStore, InMemoryConversationStore},
+		store::{ConversationStore, InMemoryConversationStore, SqliteConversationStore},
 	};
 	use crate::{
 		account::AccountChangeEvidence,
@@ -1000,8 +989,11 @@ mod tests {
 			NegotiationPolicy, OperationCall, ProviderProof, Role, Sampling, ServerStatePolicy,
 			SessionRequest, Setting, Target,
 		},
-		id::{AccountId, PrincipalId, RequestId, TurnId},
-		layer::{ExecutionContext, session::SessionAction},
+		id::{AccountId, ConversationId, PrincipalId, RequestId, Revision, TurnId},
+		layer::{
+			ExecutionContext,
+			session::{SessionAction, SessionCompletion},
+		},
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
 			RuntimeRouteEvidence,
@@ -1018,7 +1010,7 @@ mod tests {
 	}
 
 	fn pending(
-		conversation: crate::id::ConversationId,
+		conversation: ConversationId,
 		route: &str,
 		model: &str,
 		principal: &str,
@@ -1039,7 +1031,7 @@ mod tests {
 	}
 
 	fn context<'a>(
-		conversation: &'a crate::id::ConversationId<str>,
+		conversation: &'a ConversationId<str>,
 		route: &'a RouteId<str>,
 		model: &'a ModelKey<str>,
 		principal: &'a PrincipalId<str>,
@@ -1073,9 +1065,9 @@ mod tests {
 			}]),
 			name:    None,
 		};
-		let stored = super::StoredMessage::try_from(&message).unwrap();
+		let stored = StoredMessage::try_from(&message).unwrap();
 		let bytes = postcard::to_allocvec(&stored).unwrap();
-		let decoded: super::StoredMessage = postcard::from_bytes(&bytes).unwrap();
+		let decoded: StoredMessage = postcard::from_bytes(&bytes).unwrap();
 		let restored = Message::try_from(decoded).unwrap();
 		match &restored.content[0] {
 			ContentPart::Text { text, proof: Some(proof) } => {
@@ -1101,23 +1093,20 @@ mod tests {
 			})]),
 			name:    None,
 		};
-		assert_eq!(
-			super::StoredMessage::try_from(&message),
-			Err(MessagePersistenceError::UnstagedBody)
-		);
+		assert_eq!(StoredMessage::try_from(&message), Err(MessagePersistenceError::UnstagedBody));
 	}
 	#[test]
 	fn reseed_abort_reopens_fresh_root_draft_and_commits_binding_to_new_revision() {
 		let store = Arc::new(InMemoryConversationStore::new());
 		let root = store.create().unwrap();
-		let input = Arc::from([super::StoredMessage {
-			role:    super::StoredRole::User,
+		let input = Arc::from([StoredMessage {
+			role:    StoredRole::User,
 			content: Arc::from([]),
 			name:    None,
 		}]);
-		let prepared = super::PreparedTurn {
+		let prepared = PreparedTurn {
 			request:           RequestId::new("request"),
-			session:           crate::call::SessionRequest {
+			session:           SessionRequest {
 				conversation:          root.conversation().to_owned(),
 				revision:              root.revision().to_owned(),
 				turn:                  TurnId::new("turn"),
@@ -1135,7 +1124,7 @@ mod tests {
 			trust_domain:      trust("https://route.test"),
 			credential_policy: CredentialGenerationPolicy::PrincipalBound,
 		};
-		let planner_store = super::PlannerStore::Memory(Arc::clone(&store));
+		let planner_store = PlannerStore::Memory(Arc::clone(&store));
 		let draft = planner_store
 			.begin(
 				&prepared.session.conversation,
@@ -1144,16 +1133,16 @@ mod tests {
 				Arc::clone(&input),
 			)
 			.unwrap();
-		let prepared_turns = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-		let completion = super::DurableCompletion {
-			draft:          parking_lot::Mutex::new(Some(draft)),
-			blocks:         parking_lot::Mutex::new(BTreeMap::new()),
-			completion:     parking_lot::Mutex::new(None),
+		let prepared_turns = Arc::new(Mutex::new(HashMap::new()));
+		let completion = DurableCompletion {
+			draft:          Mutex::new(Some(draft)),
+			blocks:         Mutex::new(BTreeMap::new()),
+			completion:     Mutex::new(None),
 			prepared:       prepared.clone(),
 			prepared_turns: Arc::clone(&prepared_turns),
-			replays:        Arc::new(parking_lot::Mutex::new(HashMap::new())),
+			replays:        Arc::new(Mutex::new(HashMap::new())),
 		};
-		crate::layer::session::SessionCompletion::abort(&completion, true);
+		SessionCompletion::abort(&completion, true);
 		assert_eq!(store.active_drafts(), 0);
 		let restored = prepared_turns.lock().remove(&prepared.request).unwrap();
 		let fresh = planner_store
@@ -1221,7 +1210,7 @@ mod tests {
 			planned_at:          SystemTime::UNIX_EPOCH,
 			catalog_revision:    catalog.revision().clone(),
 			registry_generation: 1,
-			expires_at:          std::time::Instant::now() + Duration::from_secs(60),
+			expires_at:          Instant::now() + Duration::from_secs(60),
 			operation:           OperationKind::Chat,
 			model:               Some(model.key.clone()),
 			provider:            route.provider.clone(),
@@ -1426,15 +1415,10 @@ mod tests {
 	#[test]
 	fn binding_scope_changes_have_deterministic_reseed_reasons() {
 		let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-		let pending = pending(
-			crate::id::ConversationId::new("conversation"),
-			"route",
-			"model",
-			"principal",
-			now,
-		);
-		let binding = pending.commit(crate::id::Revision::new("revision"));
-		let conversation = crate::id::ConversationId::new("conversation");
+		let pending =
+			pending(ConversationId::new("conversation"), "route", "model", "principal", now);
+		let binding = pending.commit(Revision::new("revision"));
+		let conversation = ConversationId::new("conversation");
 		let route = RouteId::new("route");
 		let model = ModelKey::new("model");
 		let principal = PrincipalId::new("principal");
@@ -1487,15 +1471,10 @@ mod tests {
 	#[test]
 	fn ordinary_same_principal_refresh_preserves_principal_bound_state() {
 		let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-		let binding = pending(
-			crate::id::ConversationId::new("conversation"),
-			"route",
-			"model",
-			"principal",
-			now,
-		)
-		.commit(crate::id::Revision::new("revision"));
-		let conversation = crate::id::ConversationId::new("conversation");
+		let binding =
+			pending(ConversationId::new("conversation"), "route", "model", "principal", now)
+				.commit(Revision::new("revision"));
+		let conversation = ConversationId::new("conversation");
 		let route = RouteId::new("route");
 		let model = ModelKey::new("model");
 		let principal = PrincipalId::new("principal");
@@ -1515,16 +1494,11 @@ mod tests {
 	#[test]
 	fn expired_binding_is_classified_before_attempt_as_provider_expiry() {
 		let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-		let mut pending = pending(
-			crate::id::ConversationId::new("conversation"),
-			"route",
-			"model",
-			"principal",
-			created,
-		);
+		let mut pending =
+			pending(ConversationId::new("conversation"), "route", "model", "principal", created);
 		pending.expires_at = Some(created + Duration::from_secs(10));
-		let binding = pending.commit(crate::id::Revision::new("revision"));
-		let conversation = crate::id::ConversationId::new("conversation");
+		let binding = pending.commit(Revision::new("revision"));
+		let conversation = ConversationId::new("conversation");
 		let route = RouteId::new("route");
 		let model = ModelKey::new("model");
 		let principal = PrincipalId::new("principal");
@@ -1633,7 +1607,7 @@ mod tests {
 
 	#[test]
 	fn sqlite_store_obeys_commit_fork_delta_and_idempotency_laws() {
-		let store = super::store::SqliteConversationStore::open_in_memory().unwrap();
+		let store = SqliteConversationStore::open_in_memory().unwrap();
 		let root = store.create().unwrap();
 		let first = store
 			.begin(root.conversation(), root.revision(), TurnId::new("same"), Arc::from([1_i32]))
@@ -1677,7 +1651,7 @@ mod tests {
 		let database = state.path().join("turns.db");
 		let turn = TurnId::new("durable-turn");
 		{
-			let store = super::store::SqliteConversationStore::<i32>::open(&database).unwrap();
+			let store = SqliteConversationStore::<i32>::open(&database).unwrap();
 			store
 				.commit_turn_replay(
 					turn.clone(),
@@ -1686,7 +1660,7 @@ mod tests {
 				)
 				.unwrap();
 		}
-		let reopened = super::store::SqliteConversationStore::<i32>::open(&database).unwrap();
+		let reopened = SqliteConversationStore::<i32>::open(&database).unwrap();
 		assert_eq!(
 			reopened.turn_replay(&turn).unwrap(),
 			Some(super::store::TurnReplay {
@@ -1712,7 +1686,7 @@ mod tests {
 		let conversation;
 		let revision;
 		{
-			let store = super::store::SqliteConversationStore::<i32>::open(&database).unwrap();
+			let store = SqliteConversationStore::<i32>::open(&database).unwrap();
 			let root = store.create().unwrap();
 			conversation = root.conversation().to_owned();
 			revision = root.revision().to_owned();
@@ -1754,7 +1728,7 @@ mod tests {
 			draft.commit().unwrap();
 		}
 
-		let reopened = super::store::SqliteConversationStore::<i32>::open(&database).unwrap();
+		let reopened = SqliteConversationStore::<i32>::open(&database).unwrap();
 		assert_eq!(
 			reopened
 				.committed_turn(&conversation, &turn)

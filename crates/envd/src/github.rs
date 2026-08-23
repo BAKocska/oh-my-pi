@@ -1,6 +1,7 @@
 //! Direct GitHub API and isolated pull-request worktree host.
 
 use std::{
+	fs, io,
 	path::{Path, PathBuf},
 	process::Command,
 	sync::Arc,
@@ -19,8 +20,10 @@ use omp_inference::auth::HeaderPlacement;
 use omp_tools::github::{Fault, GithubHost, Operation, Params, Payload};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::{task, time};
+use wreq::redirect;
 
-use super::github_url::GithubCredentialBridge;
+use super::{github_url, github_url::GithubCredentialBridge};
 
 const API: &str = "https://api.github.com";
 const MAX_BODY: usize = 16 * 1024 * 1024;
@@ -44,7 +47,7 @@ impl GithubService {
 			worktrees: state_dir.join("github-worktrees"),
 			credentials,
 			client: wreq::Client::builder()
-				.redirect(wreq::redirect::Policy::none())
+				.redirect(redirect::Policy::none())
 				.build()
 				.expect("GitHub client"),
 		})
@@ -126,7 +129,7 @@ impl GithubService {
 	fn repo(&self, requested: Option<&str>) -> Result<Str, Fault> {
 		requested.map(Str::new).map_or_else(
 			|| {
-				super::github_url::infer_repo(&self.root).map_err(|error| Fault {
+				github_url::infer_repo(&self.root).map_err(|error| Fault {
 					code:    sf!("github_repo_unresolved"),
 					message: Str::new(error.message().clone()),
 				})
@@ -282,18 +285,18 @@ impl GithubService {
 			let path_for_git = path.clone();
 			let git_clone_url = clone_url.to_owned();
 			let git_head = head.to_owned();
-			tokio::task::spawn_blocking(move || {
+			task::spawn_blocking(move || {
 				checkout_git(&root, &path_for_git, number, &git_clone_url, &git_head)
 			})
 			.await
 			.map_err(|_| fault("github_git_failed", "GitHub checkout worker failed"))??;
-			std::fs::create_dir_all(&path).map_err(io_fault)?;
+			fs::create_dir_all(&path).map_err(io_fault)?;
 			let metadata = CheckoutMetadata {
 				repo:      repo.to_string(),
 				clone_url: clone_url.to_owned(),
 				head:      head.to_owned(),
 			};
-			std::fs::write(
+			fs::write(
 				path.join(".omp-pr-checkout.json"),
 				serde_json::to_vec(&metadata).expect("metadata serializes"),
 			)
@@ -316,14 +319,14 @@ impl GithubService {
 			let number = pr_number(value)?;
 			let path = self.worktrees.join(format!("pr-{number}"));
 			let metadata: CheckoutMetadata = serde_json::from_slice(
-				&std::fs::read(path.join(".omp-pr-checkout.json")).map_err(io_fault)?,
+				&fs::read(path.join(".omp-pr-checkout.json")).map_err(io_fault)?,
 			)
 			.map_err(|_| {
 				fault("github_checkout_missing", "pull request checkout metadata is invalid")
 			})?;
 			let force = params.force_with_lease;
 			let path_for_git = path.clone();
-			tokio::task::spawn_blocking(move || push_git(&path_for_git, &metadata, force))
+			task::spawn_blocking(move || push_git(&path_for_git, &metadata, force))
 				.await
 				.map_err(|_| fault("github_git_failed", "GitHub push worker failed"))??;
 			pushed.push(json!({ "pr": number, "path": path }));
@@ -356,7 +359,7 @@ impl GithubService {
 			if done || attempt == 99 {
 				break;
 			}
-			tokio::time::sleep(Duration::from_secs(if attempt < 20 { 3 } else { 15 })).await;
+			time::sleep(Duration::from_secs(if attempt < 20 { 3 } else { 15 })).await;
 		}
 		receipt.ok_or_else(|| fault("github_actions_missing", "no GitHub Actions runs were returned"))
 	}
@@ -389,7 +392,7 @@ fn checkout_git(
 	let parent = path
 		.parent()
 		.ok_or_else(|| fault("github_git_failed", "invalid worktree path"))?;
-	std::fs::create_dir_all(parent).map_err(io_fault)?;
+	fs::create_dir_all(parent).map_err(io_fault)?;
 	run_git(root, &["fetch", remote, head])?;
 	let branch = format!("pr-{number}");
 	let path = path.to_string_lossy();
@@ -468,6 +471,6 @@ fn fault(code: &'static str, message: &'static str) -> Fault {
 fn http_fault(error: wreq::Error) -> Fault {
 	Fault { code: sf!("github_transport_failed"), message: Str::new(error.to_string()) }
 }
-fn io_fault(error: std::io::Error) -> Fault {
+fn io_fault(error: io::Error) -> Fault {
 	Fault { code: sf!("github_io_failed"), message: Str::new(error.to_string()) }
 }

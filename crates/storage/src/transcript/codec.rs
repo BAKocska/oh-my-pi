@@ -1,6 +1,10 @@
 //! Hand-written JSON line codec preserving raw payload bytes.
 
-use std::{path::PathBuf, str::Utf8Error};
+use std::{
+	io,
+	path::PathBuf,
+	str::{self, Utf8Error},
+};
 
 use bytes::BufMut;
 use omp_core::{Hash32, Principal, Provenance, Str};
@@ -31,7 +35,7 @@ use crate::blob::BlobRef;
 pub enum Error {
 	/// A file-system operation failed.
 	#[error("transcript I/O failed: {0}")]
-	Io(#[from] std::io::Error),
+	Io(#[from] io::Error),
 	/// An append failed after writing bytes and the original file length could
 	/// not be restored.
 	#[error(
@@ -39,9 +43,9 @@ pub enum Error {
 	)]
 	AppendRollback {
 		/// The original append failure.
-		write:    std::io::Error,
+		write:    io::Error,
 		/// The rollback failure that left durability indeterminate.
-		rollback: std::io::Error,
+		rollback: io::Error,
 	},
 	/// A JSON object could not be encoded or decoded.
 	#[error("invalid transcript JSON: {0}")]
@@ -894,7 +898,7 @@ fn undecodable_line(
 	rev: Option<Str>,
 	reason: String,
 ) -> Result<Event, Error> {
-	let source = std::str::from_utf8(line)?.to_owned();
+	let source = str::from_utf8(line)?.to_owned();
 	let raw = RawValue::from_string(source)?;
 	Ok(Event {
 		ts,

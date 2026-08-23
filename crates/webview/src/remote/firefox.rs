@@ -20,6 +20,7 @@
 
 use std::{
 	fmt::Write,
+	fs,
 	path::{Path, PathBuf},
 	process::Stdio,
 	time::{Duration, Instant},
@@ -28,7 +29,10 @@ use std::{
 use bytes::Bytes;
 use omp_core::{IntoStr, Str, encoding::base64, sf};
 use serde_json::{Value, json};
-use tokio::time::timeout;
+use tokio::{
+	process, time,
+	time::{MissedTickBehavior, timeout},
+};
 
 use crate::{
 	Error, Result,
@@ -124,8 +128,8 @@ async fn drive(binary: PathBuf, surface: Surface, ctx: DriverCtx) -> Result<()> 
 		Surface::Frames(config) => f64::from(config.fps_cap.unwrap_or(10.0).clamp(0.2, 30.0)),
 		Surface::Window(_) => 1.0,
 	};
-	let mut ticker = tokio::time::interval(Duration::from_secs_f64(1.0 / fps));
-	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	let mut ticker = time::interval(Duration::from_secs_f64(1.0 / fps));
+	ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
 	// Whether the socket is still up for a polite `browser.close`.
 	let mut graceful = true;
@@ -182,14 +186,14 @@ async fn setup(
 	page: PageOptions,
 	events: flume::Sender<WebViewEvent>,
 	state: SharedState,
-) -> Result<(ProfileDir, tokio::process::Child, WsLink, Driver)> {
+) -> Result<(ProfileDir, process::Child, WsLink, Driver)> {
 	let profile = resolve_profile(&page)?;
 	write_prefs(profile.path(), &page)?;
 	// A persistent profile may hold a stale port file from a previous run.
 	let port_file = profile.path().join("WebDriverBiDiServer.json");
-	let _ = std::fs::remove_file(&port_file);
+	let _ = fs::remove_file(&port_file);
 
-	let mut cmd = tokio::process::Command::new(&binary);
+	let mut cmd = process::Command::new(&binary);
 	cmd.arg("--remote-debugging-port")
 		.arg("0")
 		.arg("-profile")
@@ -340,7 +344,7 @@ fn write_prefs(profile: &Path, page: &PageOptions) -> Result<()> {
 		writeln!(prefs, "user_pref(\"general.useragent.override\", \"{escaped}\");")
 			.expect("writing to a String cannot fail");
 	}
-	std::fs::write(profile.join("user.js"), prefs)?;
+	fs::write(profile.join("user.js"), prefs)?;
 	Ok(())
 }
 
@@ -349,11 +353,12 @@ fn write_prefs(profile: &Path, page: &PageOptions) -> Result<()> {
 /// The file appears once the server listens and holds
 /// `{"ws_host": "...", "ws_port": <port>}`; an early child exit or the
 /// [`ENDPOINT_TIMEOUT`] deadline aborts the wait.
-async fn discover_endpoint(port_file: &Path, child: &mut tokio::process::Child) -> Result<Str> {
-	let deadline = tokio::time::Instant::now() + ENDPOINT_TIMEOUT;
+async fn discover_endpoint(port_file: &Path, child: &mut process::Child) -> Result<Str> {
+	use tokio::time::Instant;
+	let deadline = Instant::now() + ENDPOINT_TIMEOUT;
 	loop {
 		// Tolerate a partially written file: retry until it parses.
-		if let Ok(text) = std::fs::read_to_string(port_file)
+		if let Ok(text) = fs::read_to_string(port_file)
 			&& let Ok(value) = serde_json::from_str::<Value>(&text)
 			&& let Some(port) = value["ws_port"].as_u64()
 			&& port != 0
@@ -364,10 +369,10 @@ async fn discover_endpoint(port_file: &Path, child: &mut tokio::process::Child) 
 		if let Some(status) = child.try_wait()? {
 			return Err(Error::Protocol(sf!("firefox exited during startup: {status}")));
 		}
-		if tokio::time::Instant::now() >= deadline {
+		if Instant::now() >= deadline {
 			return Err(Error::Timeout("waiting for the firefox BiDi endpoint"));
 		}
-		tokio::time::sleep(Duration::from_millis(100)).await;
+		time::sleep(Duration::from_millis(100)).await;
 	}
 }
 
@@ -752,7 +757,7 @@ impl Driver {
 async fn shutdown(
 	driver: &mut Driver,
 	link: &mut WsLink,
-	child: &mut tokio::process::Child,
+	child: &mut process::Child,
 	graceful: bool,
 ) {
 	if graceful {

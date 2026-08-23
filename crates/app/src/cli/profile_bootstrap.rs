@@ -1,9 +1,11 @@
 //! Bootstrap-time extraction of profile and shell-alias flags.
 
-use std::ffi::OsString;
+use std::{env, ffi::OsString};
 
 use omp_core::Str;
 use thiserror::Error;
+
+use super::{is_command, is_launch_command, launch_option};
 
 /// Internal boundary marker preserving optional/string argument ownership.
 pub const PROFILE_BOUNDARY: &str = "--omp-profile-boundary";
@@ -99,14 +101,14 @@ pub fn extract(
 			index += 1;
 			continue;
 		}
-		if super::is_command(argument) && !super::is_launch_command(argument) {
+		if is_command(argument) && !is_launch_command(argument) {
 			strict = true;
 			output.push(argument.clone());
 			index += 1;
 			continue;
 		}
 		output.push(argument.clone());
-		let consumes = super::launch_option(argument) == Some(true)
+		let consumes = launch_option(argument) == Some(true)
 			|| (text.starts_with("--")
 				&& !text.contains('=')
 				&& source
@@ -119,7 +121,7 @@ pub fn extract(
 		index += 1;
 	}
 	let profile = profile.or_else(|| {
-		std::env::var("OMP_PROFILE")
+		env::var("OMP_PROFILE")
 			.ok()
 			.filter(|value| !value.is_empty())
 			.map(Str::from)
@@ -130,8 +132,7 @@ pub fn extract(
 fn needs_boundary(output: &[OsString]) -> bool {
 	output.last().is_some_and(|previous| {
 		matches!(previous.to_string_lossy().as_ref(), "--resume" | "--plan")
-			|| (previous.to_string_lossy().starts_with("--")
-				&& super::launch_option(previous).is_none())
+			|| (previous.to_string_lossy().starts_with("--") && launch_option(previous).is_none())
 	})
 }
 

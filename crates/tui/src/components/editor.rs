@@ -1,8 +1,10 @@
 use std::{
 	cell::RefCell,
-	io,
+	fs, io, mem,
+	path::Path,
 	rc::Rc,
 	sync::Arc,
+	time,
 	time::{Duration, Instant},
 };
 
@@ -13,16 +15,18 @@ use smallvec::SmallVec;
 use strum::{Display, EnumIter, EnumString};
 use xutf::Text;
 
-use super::Img;
+use super::{ContextGaugeMode, Img, StatusPlacement, hr::truncate_to_width};
 use crate::{
-	Completion, EditBuffer, EditOutcome, Editor, EditorOptions, PickerRow, SuggestionDisplay,
+	Completion, EditBuffer, EditOutcome, Editor, EditorOptions, Icon, PickerRow, SuggestionDisplay,
 	component::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoComponent, PaintCtx, Slot, next_slot,
 	},
 	context::{Charset, UiContext},
 	frame::{Color, Frame, Rect, Style},
+	imagefmt::dimensions,
 	input::{Key, Mouse, UiEvent, byte_at_column, sanitize_paste},
 	markup::Border,
+	paste::{dropped_paths, is_image_path},
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
 	syntax::{SyntaxRun, highlight_xml, xml_comment_state},
@@ -83,9 +87,9 @@ pub struct ComposerLayout {
 	/// Status attachment used by the host scene.
 	pub status_attachment: ComposerStatusAttachment,
 	/// Whether the primary status line owns a separate row.
-	pub status_placement:  super::StatusPlacement,
+	pub status_placement:  StatusPlacement,
 	/// Context presentation appropriate for this status placement.
-	pub context_gauge:     super::ContextGaugeMode,
+	pub context_gauge:     ContextGaugeMode,
 	/// Whether a blank row separates the input from standalone status.
 	pub status_gap:        bool,
 }
@@ -113,14 +117,14 @@ impl ComposerStyle {
 			},
 		};
 		let status_placement = if matches!(status_attachment, ComposerStatusAttachment::TopBorder) {
-			super::StatusPlacement::Embedded
+			StatusPlacement::Embedded
 		} else {
-			super::StatusPlacement::Standalone
+			StatusPlacement::Standalone
 		};
 		let context_gauge = if matches!(status_placement, super::StatusPlacement::Embedded) {
-			super::ContextGaugeMode::Bar
+			ContextGaugeMode::Bar
 		} else {
-			super::ContextGaugeMode::Numeric
+			ContextGaugeMode::Numeric
 		};
 		let status_gap = matches!(self, Self::Rule | Self::Field | Self::Rail);
 		ComposerLayout {
@@ -491,7 +495,7 @@ impl EditInput {
 				continue;
 			}
 			if offset >= MAX_ROWS || y.saturating_add(offset) >= pc.clip {
-				let truncated = super::hr::truncate_to_width(description, description_width);
+				let truncated = truncate_to_width(description, description_width);
 				pc.frame.put(description_x, row, truncated.text, style);
 				if truncated.ellipsis {
 					pc.frame.put(
@@ -503,7 +507,7 @@ impl EditInput {
 				}
 				continue;
 			}
-			let continuation = super::hr::truncate_to_width(rest, description_width);
+			let continuation = truncate_to_width(rest, description_width);
 			let continuation_row = y.saturating_add(offset);
 			pc.frame
 				.put(description_x, continuation_row, continuation.text, style);
@@ -636,7 +640,7 @@ impl Component for EditInput {
 			pc.ctx.theme.accent
 		};
 		if keyword_accent {
-			pc.wake(self.slot, pc.now.saturating_add(std::time::Duration::from_millis(40)));
+			pc.wake(self.slot, pc.now.saturating_add(time::Duration::from_millis(40)));
 		}
 		let edge = Style::new().fg(if shell || keyword_accent {
 			active_color
@@ -959,13 +963,14 @@ impl Component for EditInput {
 
 	fn paste(&mut self, ec: &mut EventCtx<'_>, text: &str) -> Flow {
 		if let Some(attachments) = &self.attachments {
-			let paths = crate::paste::dropped_paths(text);
+			let paths = dropped_paths(text);
 			// Requiring real files keeps prose that merely resembles a path out of the
 			// band.
 			if !paths.is_empty()
-				&& paths.iter().all(|path| {
-					crate::paste::is_image_path(path) && std::path::Path::new(path.as_str()).exists()
-				}) {
+				&& paths
+					.iter()
+					.all(|path| is_image_path(path) && Path::new(path.as_str()).exists())
+			{
 				for path in paths {
 					let attachment = attachments.push_image(path.clone());
 					let chip = chip_label(&attachment, ec.ctx.charset);
@@ -1183,8 +1188,8 @@ impl Attachment {
 	/// size caption from `content` once at staging time.
 	pub fn new(content: AttachmentContent, marker: usize, color: Color) -> Self {
 		let icon = match &content {
-			AttachmentContent::Image { .. } => crate::Icon::Image,
-			AttachmentContent::Text { .. } => crate::Icon::TextFile,
+			AttachmentContent::Image { .. } => Icon::Image,
+			AttachmentContent::Text { .. } => Icon::TextFile,
 		};
 		let preview_names = [
 			sf!("{} #{marker}", Charset::Unicode.icon(icon)),
@@ -1326,7 +1331,7 @@ impl Attachments {
 			state.version += 1;
 		}
 		state.counter = 0;
-		std::mem::take(&mut state.staged)
+		mem::take(&mut state.staged)
 			.into_iter()
 			.filter(|staged| !staged.hidden)
 			.map(|staged| staged.attachment)
@@ -1386,8 +1391,8 @@ impl Attachments {
 
 /// Probes `source`'s pixel dimensions from its header bytes.
 fn probe_dimensions(source: &str) -> Option<(u32, u32)> {
-	let bytes = std::fs::read(source).ok()?;
-	let probed = crate::imagefmt::dimensions(&bytes)?;
+	let bytes = fs::read(source).ok()?;
+	let probed = dimensions(&bytes)?;
 	Some((probed.width, probed.height))
 }
 
@@ -1981,7 +1986,7 @@ pub fn parse_external_editor_command(
 			},
 			character if character.is_whitespace() => {
 				if started {
-					words.push(Str::from(std::mem::take(&mut current)));
+					words.push(Str::from(mem::take(&mut current)));
 					started = false;
 				}
 			},
@@ -2043,6 +2048,8 @@ impl<T: ExternalEditorTerminal + ?Sized> Drop for ExternalEditorSuspension<'_, T
 
 #[cfg(test)]
 mod tests {
+	use std::{env, fs, path::PathBuf};
+
 	use super::*;
 	use crate::editcore::Command;
 	#[test]
@@ -2067,17 +2074,17 @@ mod tests {
 		);
 	}
 	use crate::{
-		Color, Icon, Ui,
+		Color, Icon, Renderer, SlashCommands, Ui,
 		components::{ContextGaugeMode, Input, Segment, Status, StatusPlacement},
 		context::{Charset, UiContext},
 		frame::{Frame, Size},
 		test_support::frame_row_text,
 	};
-	fn temp_drop_file(test: &str, name: &str, bytes: &[u8]) -> std::path::PathBuf {
-		let dir = std::env::temp_dir().join(format!("omp-editor-drop-{test}-{}", std::process::id()));
-		std::fs::create_dir_all(&dir).unwrap();
+	fn temp_drop_file(test: &str, name: &str, bytes: &[u8]) -> PathBuf {
+		let dir = env::temp_dir().join(format!("omp-editor-drop-{test}-{}", std::process::id()));
+		fs::create_dir_all(&dir).unwrap();
 		let path = dir.join(name);
-		std::fs::write(&path, bytes).unwrap();
+		fs::write(&path, bytes).unwrap();
 		path
 	}
 
@@ -2402,10 +2409,10 @@ mod tests {
 		let mut ui = Ui::from_root(pane, 40, UiContext::default());
 		ui.focus_first();
 
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		ui.present(&mut renderer, 10, 0).unwrap();
 		let frame_text = (0..ui.height())
-			.map(|y| crate::test_support::frame_row_text(ui.frame(), y))
+			.map(|y| frame_row_text(ui.frame(), y))
 			.collect::<Vec<_>>();
 		assert!(
 			frame_text.iter().any(|r| r.contains("Ask anything")),
@@ -2415,7 +2422,7 @@ mod tests {
 		ui.handle_key(Key::Char('x'));
 		ui.present(&mut renderer, 10, 0).unwrap();
 		let painted = (0..ui.height())
-			.map(|y| crate::test_support::frame_row_text(ui.frame(), y))
+			.map(|y| frame_row_text(ui.frame(), y))
 			.collect::<Vec<_>>();
 		assert!(painted.iter().any(|r| r.contains('x')));
 		assert!(!painted.iter().any(|r| r.contains("Ask anything")));
@@ -2427,8 +2434,8 @@ mod tests {
 			crate::Command::new("help", "Show available commands", &[]),
 			crate::Command::new("models", "Choose a model", &[]),
 		];
-		let pane = EditorPane::new()
-			.completion(Box::new(crate::SlashCommands::new(commands.into_boxed_slice())));
+		let pane =
+			EditorPane::new().completion(Box::new(SlashCommands::new(commands.into_boxed_slice())));
 		let mut ui = Ui::from_root(pane, 40, UiContext::default());
 		let collapsed_height = ui.height();
 
@@ -2466,12 +2473,12 @@ mod tests {
 			.into_iter()
 			.map(|(name, icon)| Command::new(name, "type", &[]).with_icon(icon))
 			.collect::<Vec<_>>();
-			let pane = EditorPane::new()
-				.completion(Box::new(crate::SlashCommands::new(commands.into_boxed_slice())));
+			let pane =
+				EditorPane::new().completion(Box::new(SlashCommands::new(commands.into_boxed_slice())));
 			let mut ui = Ui::from_root(pane, 80, UiContext { charset, ..UiContext::default() });
 			ui.focus_first();
 			ui.handle_key(Key::Char('/'));
-			let mut renderer = crate::Renderer::new(Vec::new());
+			let mut renderer = Renderer::new(Vec::new());
 			ui.present(&mut renderer, 24, 0).unwrap();
 			let rows = (0..ui.height())
 				.map(|row| frame_row_text(ui.frame(), row))
@@ -2507,11 +2514,11 @@ mod tests {
 		                   important tradeoff long past the available popup space.";
 		let command = Command::new("improve-architecture", description, &[]);
 		let pane = EditorPane::new()
-			.completion(Box::new(crate::SlashCommands::new(vec![command].into_boxed_slice())));
+			.completion(Box::new(SlashCommands::new(vec![command].into_boxed_slice())));
 		let mut ui = Ui::from_root(pane, 64, UiContext::default());
 		ui.focus_first();
 		ui.handle_key(Key::Char('/'));
-		let mut renderer = crate::Renderer::new(Vec::new());
+		let mut renderer = Renderer::new(Vec::new());
 		ui.present(&mut renderer, 24, 0).unwrap();
 		let rows = (0..ui.height())
 			.map(|row| frame_row_text(ui.frame(), row))
@@ -2589,13 +2596,13 @@ mod tests {
 
 	#[test]
 	fn attachments_render_framed_previews_with_markers_and_resolution() {
-		let dir = std::env::temp_dir().join(format!("omp-editor-attach-{}", std::process::id()));
-		std::fs::create_dir_all(&dir).unwrap();
+		let dir = env::temp_dir().join(format!("omp-editor-attach-{}", std::process::id()));
+		fs::create_dir_all(&dir).unwrap();
 		let probed = dir.join("shot.png");
 		let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
 		png.extend(528_u32.to_be_bytes());
 		png.extend(200_u32.to_be_bytes());
-		std::fs::write(&probed, png).unwrap();
+		fs::write(&probed, png).unwrap();
 
 		let ctx = UiContext::default();
 		let pane = EditorPane::new()
@@ -2650,7 +2657,7 @@ mod tests {
 		assert_eq!(attachments.take().len(), 2);
 		editor.invalidate();
 		assert_eq!(editor.height(&ctx, 40), base, "taking attachments collapses the band");
-		std::fs::remove_dir_all(&dir).ok();
+		fs::remove_dir_all(&dir).ok();
 	}
 
 	#[test]
@@ -2722,7 +2729,7 @@ mod tests {
 		assert!(!visible.contains(&pasted));
 		assert!(visible.ends_with(' '));
 		assert_eq!(editor_pane(&ui).buffer().expanded_text(), format!("{normalized} "));
-		std::fs::remove_dir_all(path.parent().unwrap()).ok();
+		fs::remove_dir_all(path.parent().unwrap()).ok();
 	}
 
 	#[test]
@@ -2739,7 +2746,7 @@ mod tests {
 
 		assert_eq!(attachments.len(), 1);
 		assert_eq!(editor_pane(&ui).buffer().expanded_text(), format!("{normalized} "));
-		std::fs::remove_dir_all(path.parent().unwrap()).ok();
+		fs::remove_dir_all(path.parent().unwrap()).ok();
 	}
 
 	#[test]
@@ -2761,15 +2768,15 @@ mod tests {
 		let visible = editor_pane(&ui).buffer().text();
 		assert!(visible.find("#1").unwrap() < visible.find("#2").unwrap());
 		assert_eq!(editor_pane(&ui).buffer().expanded_text(), format!("{first_text} {second_text} "));
-		std::fs::remove_dir_all(first.parent().unwrap()).ok();
+		fs::remove_dir_all(first.parent().unwrap()).ok();
 	}
 
 	#[test]
 	fn missing_image_path_drop_remains_plain_text() {
-		let path = std::env::temp_dir()
+		let path = env::temp_dir()
 			.join(format!("omp-editor-drop-missing-{}", std::process::id()))
 			.join("missing image.png");
-		std::fs::remove_file(&path).ok();
+		fs::remove_file(&path).ok();
 		let pasted = format!("'{}'", path.to_str().expect("temp path is UTF-8"));
 		let pane = EditorPane::new().with(Prop::Id, "composer");
 		let attachments = pane.attachments();
@@ -2795,7 +2802,7 @@ mod tests {
 
 		assert!(attachments.is_empty());
 		assert_eq!(editor_pane(&ui).buffer().text(), pasted);
-		std::fs::remove_dir_all(path.parent().unwrap()).ok();
+		fs::remove_dir_all(path.parent().unwrap()).ok();
 	}
 
 	#[test]
@@ -2814,7 +2821,7 @@ mod tests {
 			.downcast_ref::<EditInput>()
 			.expect("UI root is an editor input");
 		assert_eq!(input.buffer().text(), pasted);
-		std::fs::remove_dir_all(path.parent().unwrap()).ok();
+		fs::remove_dir_all(path.parent().unwrap()).ok();
 	}
 
 	#[test]
@@ -2925,10 +2932,10 @@ mod tests {
 
 	#[test]
 	fn raw_paste_bypasses_chips_and_drop_classification() {
-		let dir = std::env::temp_dir().join(format!("omp-tui-raw-paste-{}", std::process::id()));
-		std::fs::create_dir_all(&dir).unwrap();
+		let dir = env::temp_dir().join(format!("omp-tui-raw-paste-{}", std::process::id()));
+		fs::create_dir_all(&dir).unwrap();
 		let path = dir.join("raw.png");
-		std::fs::write(&path, b"\x89PNG\r\n\x1a\n\0\0\0\0").unwrap();
+		fs::write(&path, b"\x89PNG\r\n\x1a\n\0\0\0\0").unwrap();
 
 		let mut ui = Ui::from_root(
 			EditorPane::new()
@@ -2981,6 +2988,6 @@ mod tests {
 			Some(big.as_str()),
 			"the full text stays inline"
 		);
-		std::fs::remove_dir_all(&dir).ok();
+		fs::remove_dir_all(&dir).ok();
 	}
 }

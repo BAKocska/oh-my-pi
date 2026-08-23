@@ -4,6 +4,7 @@
 //! validation, enabling enum keys, bounded integers, and other constrained
 //! index types.
 
+use std::{convert, error};
 /// A trait for types that can be safely converted to and from indices.
 ///
 /// This trait extends [`SparseIndex`] with fallible conversion methods,
@@ -22,7 +23,7 @@
 /// ```
 pub trait TrySparseIndex: Sized {
 	/// The error type returned when index conversion fails.
-	type Error: std::error::Error;
+	type Error: error::Error;
 
 	/// Returns the index for this value.
 	fn index(&self) -> usize;
@@ -78,7 +79,7 @@ fn validate_extremes<T: TrySparseIndex>(
 /// This allows any infallible sparse index type to be used in contexts
 /// requiring [`TrySparseIndex`] without additional boilerplate.
 impl<T: SparseIndex> TrySparseIndex for T {
-	type Error = std::convert::Infallible;
+	type Error = convert::Infallible;
 
 	fn index(&self) -> usize {
 		self.index()

@@ -1,9 +1,11 @@
 //! Turn-boundary automatic lesson capture over the Core mailbox.
 
+use std::mem;
+
 use omp_core::{Str, StrMut, sf};
 use omp_proto::{
 	inference::v1::{Value, ValueMap, value},
-	thread::v1::{self as thread, Item},
+	thread::v1::{self as thread, Item, item},
 };
 
 use crate::{Interrupt, InterruptClass, InterruptSource, PromptNamedInput};
@@ -104,8 +106,8 @@ impl AutolearnController {
 	/// Finishes one primary turn, resetting its counter before every eligibility
 	/// gate.
 	pub fn finish_primary(&mut self, ended_prompt_slot: &str, aborted: bool) -> CaptureDecision {
-		let tool_calls = std::mem::take(&mut self.settled_tool_calls);
-		let started_suppressed = std::mem::take(&mut self.turn_started_suppressed);
+		let tool_calls = mem::take(&mut self.settled_tool_calls);
+		let started_suppressed = mem::take(&mut self.turn_started_suppressed);
 		let eligible = !aborted
 			&& self.settings.enabled
 			&& self.settings.auto_continue
@@ -188,7 +190,7 @@ pub fn capture_interrupt() -> Interrupt {
 		item:   Item {
 			seq:           0,
 			created_at_ms: 0,
-			kind:          Some(thread::item::Kind::Message(thread::Message {
+			kind:          Some(item::Kind::Message(thread::Message {
 				role:  thread::Role::System as i32,
 				parts: vec![thread::Part {
 					kind: Some(thread::part::Kind::Text(CAPTURE_NUDGE.to_owned())),

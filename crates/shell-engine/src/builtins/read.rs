@@ -1,13 +1,22 @@
 use std::{
 	collections::VecDeque,
+	io,
 	io::{Read, Write},
+	mem,
 	time::{Duration, Instant},
 };
 
 use clap::Parser;
 use itertools::Itertools;
 
-use crate::{ErrorKind, builtins, env, error, variables};
+use crate::{
+	Error, ErrorKind, ExecutionContext, ExecutionResult, Shell, ShellExtensions, ShellFd, builtins,
+	builtins::terminal::{AutoModeGuard, Settings},
+	env, error,
+	openfiles::{OpenFile, OpenFiles},
+	sys::poll::poll_for_input,
+	variables,
+};
 
 /// Exit code returned when `read` times out.
 /// This is 128 + SIGALRM (14) = 142, matching bash behavior.
@@ -79,12 +88,12 @@ pub(crate) struct ReadCommand {
 }
 
 impl builtins::Command for ReadCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		// Validate timeout value if provided.
 		if let Some(result) = self.validate_timeout(&context)? {
 			return Ok(result);
@@ -93,7 +102,7 @@ impl builtins::Command for ReadCommand {
 		// Find the input stream to use.
 		let fd_num = self
 			.fd_num_to_read
-			.map_or(crate::openfiles::OpenFiles::STDIN_FD, crate::ShellFd::from);
+			.map_or(OpenFiles::STDIN_FD, ShellFd::from);
 
 		// Retrieve the file.
 		let input_stream = context
@@ -128,17 +137,15 @@ impl builtins::Command for ReadCommand {
 
 		// Extract the input line and determine exit code based on result.
 		let (input_line, result) = match &read_result {
-			ReadResult::Line(line) => (Some(line.clone()), crate::ExecutionResult::success()),
-			ReadResult::Eof(Some(line)) => {
-				(Some(line.clone()), crate::ExecutionResult::general_error())
-			},
+			ReadResult::Line(line) => (Some(line.clone()), ExecutionResult::success()),
+			ReadResult::Eof(Some(line)) => (Some(line.clone()), ExecutionResult::general_error()),
 			ReadResult::Eof(None) | ReadResult::Interrupted | ReadResult::InputNotReady => {
-				(None, crate::ExecutionResult::general_error())
+				(None, ExecutionResult::general_error())
 			},
 			ReadResult::TimedOut(partial) => {
-				(partial.clone(), crate::ExecutionResult::new(TIMEOUT_EXIT_CODE))
+				(partial.clone(), ExecutionResult::new(TIMEOUT_EXIT_CODE))
 			},
-			ReadResult::InputReady => (None, crate::ExecutionResult::success()),
+			ReadResult::InputReady => (None, ExecutionResult::success()),
 		};
 
 		// Assign input to variables based on options.
@@ -163,13 +170,13 @@ impl builtins::Command for ReadCommand {
 ///   remainder to last
 /// - Default (`REPLY`): Assign entire input line to the `REPLY` variable
 fn assign_input_to_variables(
-	shell: &mut crate::Shell<impl crate::ShellExtensions>,
+	shell: &mut Shell<impl ShellExtensions>,
 	input_line: Option<&str>,
 	ifs: &str,
 	skip_ifs_splitting: bool,
 	array_variable: Option<&str>,
 	variable_names: &[String],
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
 	if let Some(array_variable) = array_variable {
 		let literal_fields = build_array_fields(input_line, ifs, skip_ifs_splitting);
 		shell.env_mut().update_or_add(
@@ -199,12 +206,12 @@ fn assign_input_to_variables(
 /// space and assigned to the last variable. If there are more variables than
 /// fields, the extra variables are set to empty strings.
 fn assign_to_named_variables(
-	shell: &mut crate::Shell<impl crate::ShellExtensions>,
+	shell: &mut Shell<impl ShellExtensions>,
 	input_line: Option<&str>,
 	ifs: &str,
 	skip_ifs_splitting: bool,
 	variable_names: &[String],
-) -> Result<(), crate::Error> {
+) -> Result<(), Error> {
 	let mut fields =
 		build_variable_fields(input_line, ifs, skip_ifs_splitting, variable_names.len());
 
@@ -215,7 +222,7 @@ fn assign_to_named_variables(
 			String::new()
 		} else if is_last {
 			// Last variable gets all remaining fields joined by space.
-			std::mem::take(&mut fields).into_iter().join(" ")
+			mem::take(&mut fields).into_iter().join(" ")
 		} else {
 			fields.pop_front().unwrap_or_default()
 		};
@@ -301,7 +308,7 @@ enum ReadResult {
 /// from the higher-level logic of line building and escape processing.
 struct InputReader {
 	/// The input source.
-	input:      crate::openfiles::OpenFile,
+	input:      OpenFile,
 	/// Optional deadline for timeout.
 	deadline:   Option<Instant>,
 	/// Single-byte read buffer.
@@ -319,7 +326,7 @@ struct InputReader {
 	///
 	/// The leading underscore suppresses the "unused field" warning while making
 	/// it explicit this field exists solely for its `Drop` implementation.
-	_term_mode: Option<crate::builtins::terminal::AutoModeGuard>,
+	_term_mode: Option<AutoModeGuard>,
 }
 
 /// Events that can occur when reading input.
@@ -336,7 +343,7 @@ enum InputEvent {
 	CtrlD,
 }
 
-fn ensure_not_cancelled<F>(is_cancelled: &F) -> Result<(), crate::Error>
+fn ensure_not_cancelled<F>(is_cancelled: &F) -> Result<(), Error>
 where
 	F: Fn() -> bool,
 {
@@ -349,11 +356,7 @@ where
 
 impl InputReader {
 	/// Creates a new input reader with optional timeout.
-	fn new(
-		input: crate::openfiles::OpenFile,
-		timeout: Option<Duration>,
-		term_mode: Option<crate::builtins::terminal::AutoModeGuard>,
-	) -> Self {
+	fn new(input: OpenFile, timeout: Option<Duration>, term_mode: Option<AutoModeGuard>) -> Self {
 		Self {
 			input,
 			deadline: timeout.map(|t| Instant::now() + t),
@@ -365,11 +368,11 @@ impl InputReader {
 	/// Checks if input is immediately available (for `-t 0`). Returns `false` if
 	/// an error occurs while checking for available input.
 	fn check_input_available(&self) -> bool {
-		crate::sys::poll::poll_for_input(&self.input, Duration::ZERO).unwrap_or(false)
+		poll_for_input(&self.input, Duration::ZERO).unwrap_or(false)
 	}
 
 	#[cfg(unix)]
-	fn wait_for_input<F>(&self, is_cancelled: &F) -> Result<Option<InputEvent>, crate::Error>
+	fn wait_for_input<F>(&self, is_cancelled: &F) -> Result<Option<InputEvent>, Error>
 	where
 		F: Fn() -> bool,
 	{
@@ -394,7 +397,7 @@ impl InputReader {
 				Duration::from_millis(INPUT_POLL_INTERVAL_MS)
 			};
 
-			match crate::sys::poll::poll_for_input(&self.input, timeout) {
+			match poll_for_input(&self.input, timeout) {
 				Ok(true) => return Ok(None),
 				Ok(false) => continue,
 				Err(e) => return Err(e.into()),
@@ -403,7 +406,7 @@ impl InputReader {
 	}
 
 	#[cfg(not(unix))]
-	fn wait_for_input<F>(&self, is_cancelled: &F) -> Result<Option<InputEvent>, crate::Error>
+	fn wait_for_input<F>(&self, is_cancelled: &F) -> Result<Option<InputEvent>, Error>
 	where
 		F: Fn() -> bool,
 	{
@@ -415,7 +418,7 @@ impl InputReader {
 				return Ok(Some(InputEvent::Timeout));
 			}
 
-			match crate::sys::poll::poll_for_input(&self.input, remaining) {
+			match poll_for_input(&self.input, remaining) {
 				Ok(true) => {},
 				Ok(false) => return Ok(Some(InputEvent::Timeout)),
 				Err(e) => return Err(e.into()),
@@ -426,7 +429,7 @@ impl InputReader {
 	}
 
 	/// Reads the next input event, handling timeout and control characters.
-	fn read_event<F>(&mut self, is_cancelled: &F) -> Result<InputEvent, crate::Error>
+	fn read_event<F>(&mut self, is_cancelled: &F) -> Result<InputEvent, Error>
 	where
 		F: Fn() -> bool,
 	{
@@ -476,7 +479,7 @@ fn read_line_with_reader<F>(
 	reader: &mut InputReader,
 	config: &LineReaderConfig,
 	is_cancelled: &F,
-) -> Result<ReadResult, crate::Error>
+) -> Result<ReadResult, Error>
 where
 	F: Fn() -> bool,
 {
@@ -579,11 +582,11 @@ impl ReadCommand {
 	/// - With `-r`: backslash is treated as a literal character
 	fn read_line<F>(
 		&self,
-		input_file: crate::openfiles::OpenFile,
-		mut stderr_file: impl std::io::Write,
+		input_file: OpenFile,
+		mut stderr_file: impl io::Write,
 		timeout: Option<Duration>,
 		is_cancelled: F,
-	) -> Result<ReadResult, crate::Error>
+	) -> Result<ReadResult, Error>
 	where
 		F: Fn() -> bool,
 	{
@@ -634,13 +637,10 @@ impl ReadCommand {
 		read_line_with_reader(&mut reader, &config, &is_cancelled)
 	}
 
-	fn setup_terminal_settings(
-		&self,
-		file: &crate::openfiles::OpenFile,
-	) -> Result<Option<crate::builtins::terminal::AutoModeGuard>, crate::Error> {
-		let mode = crate::builtins::terminal::AutoModeGuard::new(file.to_owned()).ok();
+	fn setup_terminal_settings(&self, file: &OpenFile) -> Result<Option<AutoModeGuard>, Error> {
+		let mode = AutoModeGuard::new(file.to_owned()).ok();
 		if let Some(mode) = &mode {
-			let config = crate::builtins::terminal::Settings::builder()
+			let config = Settings::builder()
 				.line_input(false)
 				.interrupt_signals(false)
 				.echo_input(!self.silent)
@@ -661,8 +661,8 @@ impl ReadCommand {
 	/// not specified.
 	fn validate_timeout(
 		&self,
-		context: &crate::ExecutionContext<'_, impl crate::ShellExtensions>,
-	) -> Result<Option<crate::ExecutionResult>, crate::Error> {
+		context: &ExecutionContext<'_, impl ShellExtensions>,
+	) -> Result<Option<ExecutionResult>, Error> {
 		if let Some(timeout) = self.timeout_in_seconds {
 			if timeout < 0.0 {
 				writeln!(
@@ -670,7 +670,7 @@ impl ReadCommand {
 					"{}: -t: invalid timeout specification",
 					context.command_name
 				)?;
-				return Ok(Some(crate::ExecutionResult::general_error()));
+				return Ok(Some(ExecutionResult::general_error()));
 			}
 		}
 		Ok(None)
@@ -729,7 +729,7 @@ fn split_line_by_ifs(ifs: &str, line: &str, max_fields: Option<usize>) -> VecDeq
 
 		if !at_field_limit && is_delimiter {
 			// Normal case: delimiter ends current field, start new one.
-			fields.push_back(std::mem::take(&mut current_field));
+			fields.push_back(mem::take(&mut current_field));
 			consuming_whitespace_run = is_ifs_whitespace(c);
 			prev_was_non_ws_delim = !consuming_whitespace_run;
 		} else if at_field_limit && !collecting_remainder && is_delimiter {
@@ -940,8 +940,8 @@ mod tests {
 	#[test]
 	fn test_read_line_returns_interrupted_when_cancelled_before_input() {
 		let command = test_command();
-		let (reader, _writer) = std::io::pipe().expect("pipe creation must succeed");
-		let input_file = crate::openfiles::OpenFile::from(reader);
+		let (reader, _writer) = io::pipe().expect("pipe creation must succeed");
+		let input_file = OpenFile::from(reader);
 
 		let err = command
 			.read_line(input_file, Vec::<u8>::new(), None, || true)

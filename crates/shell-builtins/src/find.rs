@@ -61,6 +61,9 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
+		#[cfg(not(any(unix, windows)))]
+		use std::fs;
+
 		#[cfg(windows)]
 		use omp_shell_engine::sys::fs::PathExt;
 		#[cfg(unix)]
@@ -98,9 +101,10 @@ pub mod matchers {
 				}
 				#[cfg(not(any(unix, windows)))]
 				{
+					use std::fs::OpenOptions;
 					match self {
-						Self::Readable => std::fs::File::open(path).is_ok(),
-						Self::Writable => std::fs::OpenOptions::new().write(true).open(path).is_ok(),
+						Self::Readable => fs::File::open(path).is_ok(),
+						Self::Writable => OpenOptions::new().write(true).open(path).is_ok(),
 						Self::Executable => path.is_file(),
 					}
 				}
@@ -766,6 +770,8 @@ pub mod matchers {
 		use std::{cell::RefCell, io, io::Write, path::Path};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
+		#[cfg(unix)]
+		use crate::support::mounts::read_fs_list;
 
 		/// The latest mapping from dev_id to fs_type, used for saving mount info
 		/// reads
@@ -804,7 +810,7 @@ pub mod matchers {
 				return Ok(cache.fs_type.clone());
 			}
 
-			let fs_list = crate::support::mounts::read_fs_list()?;
+			let fs_list = read_fs_list()?;
 			let result = fs_list
 				.into_iter()
 				.find(|fs| fs.dev_id == dev_id)
@@ -1127,7 +1133,7 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
-		use std::{io::Write, path::PathBuf};
+		use std::{io, io::Write, path::PathBuf};
 
 		use super::{Matcher, MatcherIO, WalkEntry, fnmatch::Pattern};
 
@@ -1137,7 +1143,7 @@ pub mod matchers {
 				Err(err) => {
 					// If it's not a symlink, then it's not an error that should be
 					// shown.
-					if err.kind() != std::io::ErrorKind::InvalidInput {
+					if err.kind() != io::ErrorKind::InvalidInput {
 						writeln!(
 							&mut matcher_io.host().stderr,
 							"Error reading target of {}: {}",
@@ -1225,10 +1231,7 @@ pub mod matchers {
 			}
 
 			fn has_side_effects(&self) -> bool {
-				self
-					.submatchers
-					.iter()
-					.any(super::Matcher::has_side_effects)
+				self.submatchers.iter().any(Matcher::has_side_effects)
 			}
 
 			fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1300,10 +1303,7 @@ pub mod matchers {
 			}
 
 			fn has_side_effects(&self) -> bool {
-				self
-					.submatchers
-					.iter()
-					.any(super::Matcher::has_side_effects)
+				self.submatchers.iter().any(Matcher::has_side_effects)
 			}
 
 			fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1396,10 +1396,7 @@ pub mod matchers {
 			}
 
 			fn has_side_effects(&self) -> bool {
-				self
-					.submatchers
-					.iter()
-					.any(super::Matcher::has_side_effects)
+				self.submatchers.iter().any(Matcher::has_side_effects)
 			}
 
 			fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1543,10 +1540,15 @@ pub mod matchers {
 		use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
+		#[cfg(unix)]
+		use crate::support::{
+			entries::{gid2grp, uid2usr},
+			fsutil::display_permissions_unix,
+		};
 
 		#[cfg(unix)]
 		fn format_permissions(mode: libc::mode_t) -> String {
-			crate::support::fsutil::display_permissions_unix(u32::from(mode), true)
+			display_permissions_unix(u32::from(mode), true)
 		}
 
 		#[cfg(windows)]
@@ -1615,8 +1617,8 @@ pub mod matchers {
 				};
 				let permission = format_permissions(metadata.permissions().mode() as libc::mode_t);
 				let hard_links = metadata.nlink();
-				let user = crate::support::entries::uid2usr(metadata.uid()).unwrap();
-				let group = crate::support::entries::gid2grp(metadata.gid()).unwrap();
+				let user = uid2usr(metadata.uid()).unwrap();
+				let group = gid2grp(metadata.gid()).unwrap();
 				let size = metadata.size();
 				let last_modified = {
 					let system_time = metadata.modified().unwrap();
@@ -1955,7 +1957,11 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
-		use std::{fs::File, io::Write};
+		use std::{
+			fmt::{self, Display},
+			fs::File,
+			io::Write,
+		};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
 
@@ -1964,8 +1970,8 @@ pub mod matchers {
 			Null,
 		}
 
-		impl std::fmt::Display for PrintDelimiter {
-			fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		impl Display for PrintDelimiter {
+			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 				match self {
 					Self::Newline => writeln!(f),
 					Self::Null => write!(f, "\0"),
@@ -2041,6 +2047,7 @@ pub mod matchers {
 		use std::os::unix::prelude::MetadataExt;
 		use std::{
 			borrow::Cow,
+			convert,
 			error::Error,
 			fs::{self, File},
 			io::Write,
@@ -2051,6 +2058,12 @@ pub mod matchers {
 		use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 
 		use super::{FileType, Matcher, MatcherIO, WalkEntry, WalkError};
+		use crate::support::fsutil::display_permissions;
+		#[cfg(unix)]
+		use crate::support::{
+			entries::{gid2grp, uid2usr},
+			mounts::read_fs_list,
+		};
 
 		const STANDARD_BLOCK_SIZE: u64 = 512;
 
@@ -2198,7 +2211,7 @@ pub mod matchers {
 				let first = self.front()?;
 				if first.is_digit(OCTAL_RADIX)
 					&& let Ok(code) = self.peek(OCTAL_LEN).and_then(|octal| {
-						u32::from_str_radix(octal, OCTAL_RADIX).map_err(std::convert::Into::into)
+						u32::from_str_radix(octal, OCTAL_RADIX).map_err(convert::Into::into)
 					}) {
 					// safe to unwrap: .peek() already succeeded above.
 					let octal = self.advance_by(OCTAL_LEN).unwrap();
@@ -2465,8 +2478,7 @@ pub mod matchers {
 				#[cfg(unix)]
 				FormatDirective::Filesystem => {
 					let dev_id = meta()?.dev().to_string();
-					let fs_list = crate::support::mounts::read_fs_list()
-						.expect("Could not find the filesystem info");
+					let fs_list = read_fs_list().expect("Could not find the filesystem info");
 					fs_list
 						.into_iter()
 						.find(|fs| fs.dev_id == dev_id)
@@ -2480,7 +2492,7 @@ pub mod matchers {
 				FormatDirective::Group { as_name } => {
 					let gid = meta()?.gid();
 					if *as_name {
-						crate::support::entries::gid2grp(gid).unwrap_or_else(|_| gid.to_string())
+						gid2grp(gid).unwrap_or_else(|_| gid.to_string())
 					} else {
 						gid.to_string()
 					}
@@ -2512,7 +2524,7 @@ pub mod matchers {
 					.to_string_lossy(),
 
 				FormatDirective::Permissions(PermissionsFormat::Symbolic) => {
-					crate::support::fsutil::display_permissions(meta()?, true).into()
+					display_permissions(meta()?, true).into()
 				},
 				#[cfg(not(unix))]
 				FormatDirective::Permissions(PermissionsFormat::Octal) => "777".into(),
@@ -2578,7 +2590,7 @@ pub mod matchers {
 				FormatDirective::User { as_name } => {
 					let uid = meta()?.uid();
 					if *as_name {
-						crate::support::entries::uid2usr(uid).unwrap_or_else(|_| uid.to_string())
+						uid2usr(uid).unwrap_or_else(|_| uid.to_string())
 					} else {
 						uid.to_string()
 					}
@@ -2709,7 +2721,11 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
-		use std::{error::Error, fmt, str::FromStr};
+		use std::{
+			error::Error,
+			fmt::{self, Display},
+			str::FromStr,
+		};
 
 		use fancy_regex::Regex;
 
@@ -2720,7 +2736,7 @@ pub mod matchers {
 
 		impl Error for ParseRegexTypeError {}
 
-		impl fmt::Display for ParseRegexTypeError {
+		impl Display for ParseRegexTypeError {
 			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 				write!(
 					f,
@@ -2749,7 +2765,7 @@ pub mod matchers {
 				&[Self::Emacs, Self::Grep, Self::PosixBasic, Self::PosixExtended];
 		}
 
-		impl fmt::Display for RegexType {
+		impl Display for RegexType {
 			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 				match self {
 					Self::Emacs => write!(f, "emacs"),
@@ -3031,8 +3047,9 @@ pub mod matchers {
 		use std::{
 			error::Error,
 			fs::{self, Metadata},
+			io,
 			io::Write,
-			time::{SystemTime, UNIX_EPOCH},
+			time::{self, SystemTime, UNIX_EPOCH},
 		};
 
 		use jiff::{Timestamp, tz::TimeZone};
@@ -3133,7 +3150,7 @@ pub mod matchers {
 				}
 			}
 
-			fn get_file_time(self, metadata: &Metadata) -> std::io::Result<SystemTime> {
+			fn get_file_time(self, metadata: &Metadata) -> io::Result<SystemTime> {
 				match self {
 					Self::Accessed => metadata.accessed(),
 					Self::Birthed => metadata.created(),
@@ -3244,18 +3261,18 @@ pub mod matchers {
 		/// doesn't expose it.
 		pub trait ChangeTime {
 			/// Returns the time of the last change to the metadata.
-			fn changed(&self) -> std::io::Result<SystemTime>;
+			fn changed(&self) -> io::Result<SystemTime>;
 		}
 
 		#[cfg(unix)]
 		impl ChangeTime for Metadata {
-			fn changed(&self) -> std::io::Result<SystemTime> {
+			fn changed(&self) -> io::Result<SystemTime> {
 				let ctime_sec = self.ctime();
 				let ctime_nsec = self.ctime_nsec() as u32;
 				let ctime = if ctime_sec >= 0 {
-					UNIX_EPOCH + std::time::Duration::new(ctime_sec as u64, ctime_nsec)
+					UNIX_EPOCH + time::Duration::new(ctime_sec as u64, ctime_nsec)
 				} else {
-					UNIX_EPOCH - std::time::Duration::new(-ctime_sec as u64, ctime_nsec)
+					UNIX_EPOCH - time::Duration::new(-ctime_sec as u64, ctime_nsec)
 				};
 				Ok(ctime)
 			}
@@ -3263,10 +3280,10 @@ pub mod matchers {
 
 		#[cfg(not(unix))]
 		impl ChangeTime for Metadata {
-			fn changed(&self) -> std::io::Result<SystemTime> {
+			fn changed(&self) -> io::Result<SystemTime> {
 				// Rust's stdlib doesn't (yet) expose ChangeTime on Windows
 				// https://github.com/rust-lang/rust/issues/121478
-				Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+				Err(io::Error::from(io::ErrorKind::Unsupported))
 			}
 		}
 
@@ -3278,7 +3295,7 @@ pub mod matchers {
 		}
 
 		impl FileTimeType {
-			fn get_file_time(self, metadata: &Metadata) -> std::io::Result<SystemTime> {
+			fn get_file_time(self, metadata: &Metadata) -> io::Result<SystemTime> {
 				match self {
 					Self::Accessed => metadata.accessed(),
 					Self::Changed => metadata.changed(),
@@ -3612,7 +3629,7 @@ pub mod matchers {
 		fs::{File, Metadata},
 		io::{Read, Write},
 		path::Path,
-		str::FromStr,
+		str::{self, FromStr},
 		time::SystemTime,
 	};
 
@@ -4591,7 +4608,7 @@ pub mod matchers {
 
 		let mut string_segments: Vec<String> = buffer_split
 			.iter()
-			.filter_map(|s| std::str::from_utf8(s).ok())
+			.filter_map(|s| str::from_utf8(s).ok())
 			.map(|s| s.to_string())
 			.collect();
 		// empty starting point checker
@@ -4609,14 +4626,16 @@ pub mod matchers {
 use std::{
 	cell::{Cell, RefCell},
 	error::Error,
+	ffi,
 	io::{self, Write},
 	path::{Path, PathBuf},
 	rc::Rc,
+	sync::atomic,
 	time::SystemTime,
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::OsStringValueParser};
-use matchers::{Follow, WalkEntry};
+use matchers::{Follow, Matcher, WalkEntry};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
 
 use crate::host::{Host, Utility, matches_parser, util};
@@ -4689,7 +4708,7 @@ impl Dependencies for StandardDependencies {
 
 /// The result of parsing the command-line arguments into useful forms.
 struct ParsedInfo {
-	matcher: Box<dyn self::matchers::Matcher>,
+	matcher: Box<dyn Matcher>,
 	paths:   Vec<String>,
 	config:  Config,
 }
@@ -4859,7 +4878,7 @@ fn process_dir_walk_request(
 	let mut walk_stderr = host.stderr_clone();
 	let status = request.for_each_entry_with_heartbeat(
 		move || {
-			if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+			if cancel.load(atomic::Ordering::Relaxed) {
 				Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
 			} else {
 				Ok(())
@@ -5097,7 +5116,7 @@ impl Utility for Find {
 	fn run(self, host: &mut Host) -> i32 {
 		let owned: Vec<String> = self
 			.matches
-			.get_many::<std::ffi::OsString>("args")
+			.get_many::<ffi::OsString>("args")
 			.into_iter()
 			.flatten()
 			.map(|arg| arg.to_string_lossy().into_owned())
@@ -5129,7 +5148,7 @@ mod tests {
 	use std::{fs, path::PathBuf};
 
 	use super::Find;
-	use crate::host::run_util;
+	use crate::host::{Capture, run_util};
 
 	fn fixture() -> (tempfile::TempDir, PathBuf) {
 		let dir = tempfile::tempdir().unwrap();
@@ -5140,7 +5159,7 @@ mod tests {
 		(dir, root)
 	}
 
-	fn run(root: &PathBuf, args: &[String]) -> (i32, crate::host::Capture) {
+	fn run(root: &PathBuf, args: &[String]) -> (i32, Capture) {
 		let args: Vec<&str> = args.iter().map(String::as_str).collect();
 		run_util::<Find>(&args, "", root)
 	}

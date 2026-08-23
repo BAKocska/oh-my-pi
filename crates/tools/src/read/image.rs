@@ -1,6 +1,8 @@
 //! Pure image classification and model-boundary normalization.
 
-use std::{collections::HashMap, fmt, io::Cursor, path::Path, sync::LazyLock};
+use std::{
+	collections::HashMap, env, error, fmt, fmt::Display, io, io::Cursor, path::Path, sync::LazyLock,
+};
 
 use bytes::Bytes;
 use image::{
@@ -11,6 +13,7 @@ use image::{
 		png::PngEncoder,
 		webp::{WebPDecoder, WebPEncoder},
 	},
+	error::DecodingError,
 	imageops::FilterType,
 };
 use omp_core::{Hash32, Str, base64, sf};
@@ -206,13 +209,13 @@ impl ImageFault {
 	}
 }
 
-impl fmt::Display for ImageFault {
+impl Display for ImageFault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(self.message().as_ref())
 	}
 }
 
-impl std::error::Error for ImageFault {}
+impl error::Error for ImageFault {}
 
 /// Returns whether a path has one of pi's supported image extensions.
 ///
@@ -571,9 +574,9 @@ fn decode_image(input: &[u8], kind: ImageKind) -> image::ImageResult<(DynamicIma
 			let decoder = GifDecoder::new(Cursor::new(input))?;
 			let mut frames = decoder.into_frames();
 			let first = frames.next().transpose()?.ok_or_else(|| {
-				image::ImageError::Decoding(image::error::DecodingError::new(
+				image::ImageError::Decoding(DecodingError::new(
 					ImageFormat::Gif.into(),
-					std::io::Error::new(std::io::ErrorKind::InvalidData, "GIF contains no image frames"),
+					io::Error::new(io::ErrorKind::InvalidData, "GIF contains no image frames"),
 				))
 			})?;
 			let animated = frames.next().transpose()?.is_some();
@@ -585,12 +588,9 @@ fn decode_image(input: &[u8], kind: ImageKind) -> image::ImageResult<(DynamicIma
 			if animated {
 				let mut frames = decoder.into_frames();
 				let first = frames.next().transpose()?.ok_or_else(|| {
-					image::ImageError::Decoding(image::error::DecodingError::new(
+					image::ImageError::Decoding(DecodingError::new(
 						ImageFormat::WebP.into(),
-						std::io::Error::new(
-							std::io::ErrorKind::InvalidData,
-							"WebP contains no image frames",
-						),
+						io::Error::new(io::ErrorKind::InvalidData, "WebP contains no image frames"),
 					))
 				})?;
 				Ok((DynamicImage::ImageRgba8(first.into_buffer()), true))
@@ -789,7 +789,7 @@ fn dimension_note(
 }
 
 fn webp_is_excluded() -> bool {
-	std::env::var("OMP_NO_WEBP")
+	env::var("OMP_NO_WEBP")
 		.is_ok_and(|value| value.eq_ignore_ascii_case("1") || value.eq_ignore_ascii_case("true"))
 }
 

@@ -1,7 +1,7 @@
 //! Transport seam contracts for in-process and RPC agent turns.
 
 use std::{
-	collections::VecDeque,
+	collections::{BTreeMap, VecDeque},
 	pin::Pin,
 	sync::{
 		Arc,
@@ -11,19 +11,28 @@ use std::{
 };
 
 use bytes::Bytes;
+use flume::Receiver;
 use futures::{Stream, StreamExt};
 use omp_agent::{
 	Error, InProcTurnClient, RpcTurnSession, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession,
 };
 use omp_proto::{
-	inference::v1::{self as pb, inference_server::Inference},
-	thread::v1::{Item, Revision, Thread},
+	inference::v1::{
+		self as pb, exec_status, inference_server::Inference, invoke_input, invoke_input::chunk,
+		turn_error, turn_event, turn_request, value,
+	},
+	thread::{
+		v1,
+		v1::{Item, Revision, Thread, item},
+	},
 };
+use parking_lot::Mutex;
+use tokio::time;
 use tonic::{Request, Response, Status};
 
 type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-fn flume_stream<T: Send + 'static>(receiver: flume::Receiver<T>) -> impl Stream<Item = T> + Send {
+fn flume_stream<T: Send + 'static>(receiver: Receiver<T>) -> impl Stream<Item = T> + Send {
 	futures::stream::unfold(receiver, |receiver| async move {
 		let item = receiver.recv_async().await.ok()?;
 		Some((item, receiver))
@@ -60,15 +69,15 @@ struct ScriptedInference {
 }
 
 struct ScriptState {
-	exchanges: parking_lot::Mutex<VecDeque<Exchange>>,
+	exchanges: Mutex<VecDeque<Exchange>>,
 	opens:     flume::Sender<pb::TurnRequest>,
 	inputs:    flume::Sender<Vec<pb::TurnFrame>>,
 	calls:     AtomicUsize,
 }
 
 struct Observed {
-	opens:  flume::Receiver<pb::TurnRequest>,
-	inputs: flume::Receiver<Vec<pb::TurnFrame>>,
+	opens:  Receiver<pb::TurnRequest>,
+	inputs: Receiver<Vec<pb::TurnFrame>>,
 	state:  Arc<ScriptState>,
 }
 
@@ -77,7 +86,7 @@ impl ScriptedInference {
 		let (open_sender, opens) = flume::bounded(exchanges.len().max(1));
 		let (input_sender, inputs) = flume::bounded(exchanges.len().max(1));
 		let state = Arc::new(ScriptState {
-			exchanges: parking_lot::Mutex::new(exchanges.into()),
+			exchanges: Mutex::new(exchanges.into()),
 			opens:     open_sender,
 			inputs:    input_sender,
 			calls:     AtomicUsize::new(0),
@@ -225,16 +234,16 @@ impl_scripted_inference! {
 	}
 }
 
-const fn event(event: pb::turn_event::Event) -> pb::TurnEvent {
+const fn event(event: turn_event::Event) -> pb::TurnEvent {
 	pb::TurnEvent { event: Some(event) }
 }
 
 const fn accepted(replay: bool) -> pb::TurnEvent {
-	event(pb::turn_event::Event::Accepted(pb::Accepted { replay }))
+	event(turn_event::Event::Accepted(pb::Accepted { replay }))
 }
 
 fn outcome(provider: &str, revision: Option<Revision>) -> pb::TurnEvent {
-	event(pb::turn_event::Event::Outcome(pb::Outcome {
+	event(turn_event::Event::Outcome(pb::Outcome {
 		provider: provider.to_owned(),
 		revision,
 		..Default::default()
@@ -245,32 +254,30 @@ fn tool_call_item() -> Item {
 	Item {
 		seq:           17,
 		created_at_ms: 23,
-		kind:          Some(omp_proto::thread::v1::item::Kind::ToolCall(
-			omp_proto::thread::v1::ToolCall {
-				id: "call-1".to_owned(),
-				name: "edit".to_owned(),
-				args_json: Bytes::from_static(br#"{"path":"src/lib.rs"}"#),
-				..Default::default()
-			},
-		)),
+		kind:          Some(item::Kind::ToolCall(v1::ToolCall {
+			id: "call-1".to_owned(),
+			name: "edit".to_owned(),
+			args_json: Bytes::from_static(br#"{"path":"src/lib.rs"}"#),
+			..Default::default()
+		})),
 		props:         Some(pb::ValueMap {
-			fields: std::collections::BTreeMap::from([("omp/tool-rev".to_owned(), pb::Value {
-				kind: Some(pb::value::Kind::String("hl.2".to_owned())),
+			fields: BTreeMap::from([("omp/tool-rev".to_owned(), pb::Value {
+				kind: Some(value::Kind::String("hl.2".to_owned())),
 			})]),
 		}),
 	}
 }
 
 fn outcome_with_output(provider: &str, output: Vec<Item>) -> pb::TurnEvent {
-	event(pb::turn_event::Event::Outcome(pb::Outcome {
+	event(turn_event::Event::Outcome(pb::Outcome {
 		provider: provider.to_owned(),
 		output,
 		..Default::default()
 	}))
 }
 
-async fn observe<T>(receiver: &flume::Receiver<T>) -> T {
-	tokio::time::timeout(Duration::from_secs(2), receiver.recv_async())
+async fn observe<T>(receiver: &Receiver<T>) -> T {
+	time::timeout(Duration::from_secs(2), receiver.recv_async())
 		.await
 		.expect("scripted service did not observe the request")
 		.expect("scripted service observation channel closed")
@@ -278,7 +285,7 @@ async fn observe<T>(receiver: &flume::Receiver<T>) -> T {
 
 async fn next_event(session: &mut RpcTurnSession) -> Option<Result<pb::TurnEvent, Error>> {
 	let mut events = session.events();
-	tokio::time::timeout(Duration::from_secs(2), events.next())
+	time::timeout(Duration::from_secs(2), events.next())
 		.await
 		.expect("scripted service did not produce the next event")
 }
@@ -304,11 +311,13 @@ async fn full_then_delta_preserve_the_injected_services_context_revision() {
 	assert!(matches!(
 		next_event(&mut full).await,
 		Some(Ok(pb::TurnEvent {
-			event: Some(pb::turn_event::Event::Accepted(pb::Accepted { replay: false })),
+			event: Some(omp_proto::inference::v1::turn_event::Event::Accepted(pb::Accepted {
+				replay: false,
+			})),
 		}))
 	));
 	let returned_revision = match next_event(&mut full).await {
-		Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) })) => {
+		Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) })) => {
 			assert_eq!(outcome.provider, "injected/full");
 			outcome.revision.expect("stateful outcome revision")
 		},
@@ -319,7 +328,7 @@ async fn full_then_delta_preserve_the_injected_services_context_revision() {
 	let full_open = observe(&observed.opens).await;
 	assert_eq!(full_open.turn_id, "full-turn");
 	match full_open.input {
-		Some(pb::turn_request::Input::Seed(seed)) => {
+		Some(turn_request::Input::Seed(seed)) => {
 			assert_eq!(seed.context_id, "context-from-caller");
 			assert_eq!(seed.thread, Some(thread));
 		},
@@ -343,7 +352,7 @@ async fn full_then_delta_preserve_the_injected_services_context_revision() {
 		.expect("accepted")
 		.expect("accepted event");
 	match next_event(&mut incremental).await {
-		Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) })) => {
+		Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) })) => {
 			assert_eq!(outcome.provider, "injected/delta");
 		},
 		other => panic!("expected delta outcome, got {other:?}"),
@@ -352,7 +361,7 @@ async fn full_then_delta_preserve_the_injected_services_context_revision() {
 	let delta_open = observe(&observed.opens).await;
 	assert_eq!(delta_open.turn_id, "delta-turn");
 	match delta_open.input {
-		Some(pb::turn_request::Input::Incremental(incremental)) => {
+		Some(turn_request::Input::Incremental(incremental)) => {
 			assert_eq!(incremental.context, Some(context));
 			assert_eq!(incremental.delta, Some(delta));
 		},
@@ -364,21 +373,25 @@ async fn full_then_delta_preserve_the_injected_services_context_revision() {
 #[tokio::test]
 async fn conflict_and_need_full_are_typed_terminal_recoveries_without_seam_policy() {
 	let conflict = pb::TurnError {
-		kind: pb::turn_error::Kind::Conflict as i32,
+		kind: turn_error::Kind::Conflict as i32,
 		detail: "stale revision".to_owned(),
 		actual: Some(Revision { head: 12, token: Bytes::from_static(&[12]) }),
 		error_id: Some(41),
 		..Default::default()
 	};
 	let need_full = pb::TurnError {
-		kind: pb::turn_error::Kind::NeedFull as i32,
+		kind: turn_error::Kind::NeedFull as i32,
 		detail: "context evicted".to_owned(),
 		error_id: Some(42),
 		..Default::default()
 	};
 	let (service, observed) = ScriptedInference::new(vec![
-		Exchange::events(vec![event(pb::turn_event::Event::Error(conflict.clone()))]),
-		Exchange::events(vec![event(pb::turn_event::Event::Error(need_full.clone()))]),
+		Exchange::events(vec![event(omp_proto::inference::v1::turn_event::Event::Error(
+			conflict.clone(),
+		))]),
+		Exchange::events(vec![event(omp_proto::inference::v1::turn_event::Event::Error(
+			need_full.clone(),
+		))]),
 	]);
 	let client = InProcTurnClient::new(service)
 		.await
@@ -393,9 +406,9 @@ async fn conflict_and_need_full_are_typed_terminal_recoveries_without_seam_polic
 			.await
 			.expect("terminal error event")
 			.expect_err("error is not exposed as a regular event");
-		match (&error, pb::turn_error::Kind::try_from(expected.kind).expect("known kind")) {
-			(Error::Conflict(actual), pb::turn_error::Kind::Conflict)
-			| (Error::NeedFull(actual), pb::turn_error::Kind::NeedFull) => {
+		match (&error, turn_error::Kind::try_from(expected.kind).expect("known kind")) {
+			(Error::Conflict(actual), turn_error::Kind::Conflict)
+			| (Error::NeedFull(actual), turn_error::Kind::NeedFull) => {
 				assert_eq!(actual.as_ref(), expected);
 				assert!(error.is_recovery());
 				assert_eq!(error.turn_error(), Some(expected));
@@ -424,7 +437,9 @@ async fn replay_acceptance_and_unknown_terminal_errors_pass_through_verbatim() {
 			accepted(true),
 			outcome_with_output("replayed", vec![committed_call.clone()]),
 		]),
-		Exchange::events(vec![event(pb::turn_event::Event::Error(unknown.clone()))]),
+		Exchange::events(vec![event(omp_proto::inference::v1::turn_event::Event::Error(
+			unknown.clone(),
+		))]),
 	]);
 	let client = InProcTurnClient::new(service)
 		.await
@@ -435,13 +450,13 @@ async fn replay_acceptance_and_unknown_terminal_errors_pass_through_verbatim() {
 		.await
 		.expect("replay opens");
 	match next_event(&mut replay).await {
-		Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Accepted(accepted)) })) => {
+		Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Accepted(accepted)) })) => {
 			assert!(accepted.replay);
 		},
 		other => panic!("expected replay acceptance, got {other:?}"),
 	}
 	match next_event(&mut replay).await {
-		Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) })) => {
+		Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) })) => {
 			assert_eq!(outcome.output, vec![committed_call]);
 		},
 		other => panic!("expected replay outcome, got {other:?}"),
@@ -470,7 +485,10 @@ async fn invocation_frames_flow_while_the_response_stream_is_live() {
 		..Default::default()
 	};
 	let (service, observed) = ScriptedInference::new(vec![Exchange::duplex(
-		vec![accepted(false), event(pb::turn_event::Event::Invoke(invoke.clone()))],
+		vec![
+			accepted(false),
+			event(omp_proto::inference::v1::turn_event::Event::Invoke(invoke.clone())),
+		],
 		vec![outcome("after-invocation", None)],
 	)]);
 	let client = InProcTurnClient::new(service)
@@ -490,7 +508,7 @@ async fn invocation_frames_flow_while_the_response_stream_is_live() {
 		.expect("accepted")
 		.expect("accepted event");
 	match next_event(&mut session).await {
-		Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Invoke(actual)) })) => {
+		Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Invoke(actual)) })) => {
 			assert_eq!(actual, invoke);
 		},
 		other => panic!("expected invocation, got {other:?}"),
@@ -498,15 +516,15 @@ async fn invocation_frames_flow_while_the_response_stream_is_live() {
 
 	let input = pb::InvokeInput {
 		invocation_id: "invoke-7".to_owned(),
-		payload:       Some(pb::invoke_input::Payload::Chunk(pb::invoke_input::Chunk {
-			channel: pb::invoke_input::chunk::Channel::Stdout as i32,
+		payload:       Some(invoke_input::Payload::Chunk(pb::invoke_input::Chunk {
+			channel: chunk::Channel::Stdout as i32,
 			data:    Bytes::from_static(b"streamed output"),
 		})),
 	};
 	let complete = pb::InvokeComplete {
 		invocation_id: "invoke-7".to_owned(),
 		status: Some(pb::ExecStatus {
-			outcome: pb::exec_status::Outcome::Exited as i32,
+			outcome: exec_status::Outcome::Exited as i32,
 			exit_code: 0,
 			..Default::default()
 		}),
@@ -526,7 +544,7 @@ async fn invocation_frames_flow_while_the_response_stream_is_live() {
 	assert_eq!(frames[0].frame, Some(pb::turn_frame::Frame::Input(input)));
 	assert_eq!(frames[1].frame, Some(pb::turn_frame::Frame::Complete(complete)));
 	match next_event(&mut session).await {
-		Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) })) => {
+		Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) })) => {
 			assert_eq!(outcome.provider, "after-invocation");
 		},
 		other => panic!("expected post-invocation outcome, got {other:?}"),
@@ -556,7 +574,7 @@ async fn sessions_keep_the_injected_server_alive_and_report_response_channel_shu
 		.expect("accepted after client drop")
 		.expect("accepted");
 	match next_event(&mut session).await {
-		Some(Ok(pb::TurnEvent { event: Some(pb::turn_event::Event::Outcome(outcome)) })) => {
+		Some(Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) })) => {
 			assert_eq!(outcome.provider, "server-owned-by-session");
 		},
 		other => panic!("expected outcome after dropping client, got {other:?}"),

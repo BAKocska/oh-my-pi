@@ -1,14 +1,15 @@
 //! Standalone alternate-screen pickers shared by CLI startup flows.
 
 use std::{
+	fs,
 	io::{self, IsTerminal as _, Write as _},
-	path::PathBuf,
+	path::{Path, PathBuf},
 };
 
 use omp_chat_ui::{ListPicker, ListRow, PickerEvent};
 use omp_core::Str;
 use omp_driver::cleanse::{Checker, TargetChoice};
-use omp_storage::index::{SessionFilter, SessionIndex, SessionInfo};
+use omp_storage::index::{self, SessionFilter, SessionIndex, SessionInfo};
 use omp_tui::{
 	Frame, InputEvent, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, UiContext,
 };
@@ -27,7 +28,7 @@ pub(crate) struct SessionSelection {
 pub(crate) enum PickerError {
 	/// Session metadata could not be read from an authoritative index.
 	#[error(transparent)]
-	Storage(#[from] omp_storage::index::Error),
+	Storage(#[from] index::Error),
 	/// Terminal entry, input, or rendering failed.
 	#[error(transparent)]
 	Terminal(#[from] io::Error),
@@ -89,15 +90,15 @@ pub(crate) fn prompt_cleanse_request() -> Result<Option<Str>, PickerError> {
 /// Lists sessions from every native project index and asks the user to choose
 /// one.
 pub(crate) async fn pick_session(
-	data_dir: &std::path::Path,
-	explicit_session_dir: Option<&std::path::Path>,
+	data_dir: &Path,
+	explicit_session_dir: Option<&Path>,
 ) -> Result<Option<SessionSelection>, PickerError> {
 	let mut sessions = Vec::new();
 	if let Some(directory) = explicit_session_dir {
 		read_index(directory, &directory.join("sessions.sqlite3"), &mut sessions)?;
 	} else {
 		let projects = data_dir.join("projects");
-		match std::fs::read_dir(&projects) {
+		match fs::read_dir(&projects) {
 			Ok(entries) => {
 				for entry in entries.flatten() {
 					let path = entry.path();
@@ -138,8 +139,8 @@ pub(crate) async fn pick_session(
 }
 
 fn read_index(
-	sessions_dir: &std::path::Path,
-	database: &std::path::Path,
+	sessions_dir: &Path,
+	database: &Path,
 	output: &mut Vec<SessionSelection>,
 ) -> Result<(), PickerError> {
 	if !database.is_file() {
@@ -206,6 +207,6 @@ fn paint(
 	viewport: Size,
 ) -> io::Result<()> {
 	let base = Frame::new(Size::new(viewport.width, 1));
-	renderer.preview_overlaid(&base, &[picker.layer(viewport)], viewport.height, "")?;
+	renderer.repaint("", base, viewport.height, &[picker.layer(viewport)])?;
 	Ok(())
 }

@@ -13,7 +13,7 @@ use tower::Service;
 use crate::{
 	answer::{Answer, AnswerBody, EmbeddingBatch},
 	call::{
-		EmbedRequest, EmbeddingInput, EmulationPolicy, MismatchPolicy, OperationCall, Setting,
+		Call, EmbedRequest, EmbeddingInput, EmulationPolicy, MismatchPolicy, OperationCall, Setting,
 		TruncationPolicy, UnknownCapabilityPolicy,
 	},
 	catalog::{
@@ -97,7 +97,7 @@ pub struct EmbeddingPlan {
 	pub adjustments:       Vec<Adjustment>,
 }
 
-impl<S> Service<crate::call::Call> for EmbeddingService<S>
+impl<S> Service<Call> for EmbeddingService<S>
 where
 	S: Service<
 			OperationRequest<EmbedRequest>,
@@ -117,7 +117,7 @@ where
 		self.inner.poll_ready(context)
 	}
 
-	fn call(&mut self, call: crate::call::Call) -> Self::Future {
+	fn call(&mut self, call: Call) -> Self::Future {
 		let plan = match &call.operation {
 			OperationCall::Embed(request) => self
 				.plan(request)
@@ -434,7 +434,7 @@ pub(crate) fn normalize_vector(values: &mut [f32]) -> Result<(), Error> {
 	Ok(())
 }
 
-fn wrong_operation(call: &crate::call::Call) -> Error {
+fn wrong_operation(call: &Call) -> Error {
 	Error::new(
 		ErrorKind::InternalInvariant,
 		ErrorPhase::Internal,

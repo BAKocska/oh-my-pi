@@ -3,11 +3,15 @@
 use std::{
 	borrow::Cow,
 	path::{Path, PathBuf},
+	time,
 };
 
 use im::HashMap;
 
-use crate::{env::ShellEnvironment, jobs, openfiles, options::RuntimeOptions, pathcache};
+use crate::{
+	callstack::CallStack, env::ShellEnvironment, jobs, openfiles, options::RuntimeOptions,
+	pathcache, traps::TrapHandlerConfig,
+};
 
 /// A dyn-safe trait for constrained access to shell state.
 pub trait ShellState {
@@ -15,7 +19,7 @@ pub trait ShellState {
 	fn is_subshell(&self) -> bool;
 
 	/// Returns the last "SECONDS" captured time.
-	fn last_stopwatch_time(&self) -> std::time::SystemTime;
+	fn last_stopwatch_time(&self) -> time::SystemTime;
 
 	/// Returns the last "SECONDS" offset requested.
 	fn last_stopwatch_offset(&self) -> u32;
@@ -45,10 +49,10 @@ pub trait ShellState {
 	fn jobs_mut(&mut self) -> &mut jobs::JobManager;
 
 	/// Returns the shell's trap handler configuration.
-	fn traps(&self) -> &crate::traps::TrapHandlerConfig;
+	fn traps(&self) -> &TrapHandlerConfig;
 
 	/// Returns a mutable reference to the shell's trap handler configuration.
-	fn traps_mut(&mut self) -> &mut crate::traps::TrapHandlerConfig;
+	fn traps_mut(&mut self) -> &mut TrapHandlerConfig;
 
 	/// Returns the shell's directory stack.
 	fn directory_stack(&self) -> &[PathBuf];
@@ -83,7 +87,7 @@ pub trait ShellState {
 	fn depth(&self) -> usize;
 
 	/// Returns the call stack for the shell.
-	fn call_stack(&self) -> &crate::callstack::CallStack;
+	fn call_stack(&self) -> &CallStack;
 
 	/// Returns the shell's official version string (if available).
 	fn version(&self) -> Option<&str>;

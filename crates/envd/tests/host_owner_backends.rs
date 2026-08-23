@@ -1,4 +1,6 @@
-use std::{collections::BTreeSet, sync::Arc};
+//! Proves host-owned sandbox, parameter, worker, and filesystem backends
+//! enforce their fences.
+use std::{collections::BTreeSet, process, sync::Arc};
 
 use omp_core::{InvocationPhase, LifecyclePhase, Principal, Str, sf};
 use omp_envd::{
@@ -129,7 +131,7 @@ async fn worker_authority_reads_generation_fenced_process_state() {
 		generation:      route.generation,
 		state:           sf!("ready"),
 		site:            WorkerSite::default(),
-		pid:             Some(std::process::id()),
+		pid:             Some(process::id()),
 		spawned_at_ms:   1,
 		last_call_at_ms: None,
 		calls:           0,

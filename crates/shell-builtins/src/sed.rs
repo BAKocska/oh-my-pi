@@ -570,9 +570,14 @@ pub mod compiler {
 	// For the full copyright and license information, please view the LICENSE
 	// file that was distributed with this source code.
 
-	use std::{cell::RefCell, mem, path::PathBuf, rc::Rc};
+	use std::{
+		cell::RefCell,
+		mem,
+		path::{Path, PathBuf},
+		rc::Rc,
+	};
 
-	use omp_shell_engine::openfiles::OpenFile;
+	use omp_shell_engine::{openfiles::OpenFile, sys::fs};
 
 	use crate::sed::{
 		command::{
@@ -1299,7 +1304,7 @@ pub mod compiler {
 								let ref_num = c.to_digit(10).unwrap();
 
 								if !literal.is_empty() {
-									parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
+									parts.push(ReplacementPart::Literal(mem::take(&mut literal)));
 								}
 								if ref_num == 0 {
 									parts.push(ReplacementPart::WholeMatch);
@@ -1336,7 +1341,7 @@ pub mod compiler {
 
 					'&' => {
 						if !literal.is_empty() {
-							parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
+							parts.push(ReplacementPart::Literal(mem::take(&mut literal)));
 						}
 						parts.push(ReplacementPart::WholeMatch);
 						line.advance();
@@ -1480,7 +1485,7 @@ pub mod compiler {
 		subst: &mut Substitution,
 		posix: bool,
 		sandbox: bool,
-		cwd: Option<&std::path::Path>,
+		cwd: Option<&Path>,
 	) -> SedResult<()> {
 		let mut seen_g_or_n = false;
 
@@ -1576,7 +1581,7 @@ pub mod compiler {
 					let location = ScriptLocation::at_position(lines, line);
 					let mut path = read_file_path(lines, line)?;
 					if let Some(cwd) = cwd {
-						let normalized = omp_shell_engine::sys::fs::normalize_shell_path(&path);
+						let normalized = fs::normalize_shell_path(&path);
 						path = if normalized.is_absolute() {
 							normalized.into_owned()
 						} else {
@@ -1661,7 +1666,7 @@ pub mod compiler {
 			return compilation_error(lines, line, ERR_SANDBOX);
 		}
 		let mut path = read_file_path(lines, line)?;
-		let normalized = omp_shell_engine::sys::fs::normalize_shell_path(&path);
+		let normalized = fs::normalize_shell_path(&path);
 		path = if normalized.is_absolute() {
 			normalized.into_owned()
 		} else {
@@ -1683,7 +1688,7 @@ pub mod compiler {
 		}
 		let location = ScriptLocation::at_position(lines, line);
 		let mut path = read_file_path(lines, line)?;
-		let normalized = omp_shell_engine::sys::fs::normalize_shell_path(&path);
+		let normalized = fs::normalize_shell_path(&path);
 		path = if normalized.is_absolute() {
 			normalized.into_owned()
 		} else {
@@ -5051,7 +5056,13 @@ pub mod error_handling {
 	// SPDX-License-Identifier: MIT
 	// Copyright (c) 2025 Diomidis Spinellis
 
-	use std::{fmt, io, rc::Rc};
+	use std::{
+		error,
+		fmt::{self, Display},
+		io, num,
+		rc::Rc,
+		str, string,
+	};
 
 	use crate::sed::{
 		command::ProcessingContext, script_char_provider::ScriptCharProvider,
@@ -5082,13 +5093,13 @@ pub mod error_handling {
 		}
 	}
 
-	impl fmt::Display for SedError {
+	impl Display for SedError {
 		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 			f.write_str(&self.message)
 		}
 	}
 
-	impl std::error::Error for SedError {}
+	impl error::Error for SedError {}
 
 	impl From<io::Error> for SedError {
 		fn from(error: io::Error) -> Self {
@@ -5096,20 +5107,20 @@ pub mod error_handling {
 		}
 	}
 
-	impl From<std::str::Utf8Error> for SedError {
-		fn from(error: std::str::Utf8Error) -> Self {
+	impl From<str::Utf8Error> for SedError {
+		fn from(error: str::Utf8Error) -> Self {
 			Self::new(2, error)
 		}
 	}
 
-	impl From<std::string::FromUtf8Error> for SedError {
-		fn from(error: std::string::FromUtf8Error) -> Self {
+	impl From<string::FromUtf8Error> for SedError {
+		fn from(error: string::FromUtf8Error) -> Self {
 			Self::new(2, error)
 		}
 	}
 
-	impl From<std::num::ParseIntError> for SedError {
-		fn from(error: std::num::ParseIntError) -> Self {
+	impl From<num::ParseIntError> for SedError {
+		fn from(error: num::ParseIntError) -> Self {
 			Self::new(1, error)
 		}
 	}
@@ -5240,10 +5251,13 @@ pub mod fast_io {
 
 	#[cfg(not(unix))]
 	use std::marker::PhantomData;
+	#[cfg(unix)]
+	use std::slice;
 	use std::{
 		cell::Cell,
 		fs::File,
 		io::{self, BufRead, BufReader, BufWriter, Read, Write},
+		mem,
 		path::PathBuf,
 		str,
 	};
@@ -5342,7 +5356,7 @@ pub mod fast_io {
 			if has_newline {
 				self.buffer.pop();
 			}
-			let line = std::mem::take(&mut self.buffer);
+			let line = mem::take(&mut self.buffer);
 			Ok(Some((line, has_newline)))
 		}
 
@@ -5461,7 +5475,7 @@ pub mod fast_io {
 			match &self.content {
 				IOChunkContent::Owned { .. } => Ok(()), // already owned
 				#[cfg(unix)]
-				IOChunkContent::MmapInput { content, full_span, .. } => match std::str::from_utf8(content) {
+				IOChunkContent::MmapInput { content, full_span, .. } => match str::from_utf8(content) {
 					Ok(valid_str) => {
 						let has_newline = full_span.last().copied() == Some(b'\n');
 						self.content = IOChunkContent::new_owned(valid_str.to_string(), has_newline);
@@ -5515,7 +5529,7 @@ pub mod fast_io {
 				content,
 				has_newline,
 				// Avoid E0063 missing _phantom initialization errors
-				_phantom: std::marker::PhantomData,
+				_phantom: PhantomData,
 			};
 		}
 
@@ -5524,7 +5538,7 @@ pub mod fast_io {
 			match self {
 				IOChunkContent::MmapInput { content, .. } => {
 					// SAFETY: callers only reach this helper after validating the mapping as UTF-8.
-					unsafe { std::str::from_utf8_unchecked(content) }
+					unsafe { str::from_utf8_unchecked(content) }
 				},
 				IOChunkContent::Owned { content, .. } => content,
 			}
@@ -5555,7 +5569,7 @@ pub mod fast_io {
 		},
 		ReadInput(ReadLineCursor),
 		#[cfg(not(unix))]
-		_Phantom(std::marker::PhantomData<&'a ()>),
+		_Phantom(PhantomData<&'a ()>),
 	}
 
 	/// Return a LineReader that uses the ReadInput method fot the specified
@@ -5589,7 +5603,7 @@ pub mod fast_io {
 					Ok(mapped_file) => {
 						// SAFETY: mmap owns the data and lives in the same variant
 						let slice: &'static [u8] =
-							unsafe { std::slice::from_raw_parts(mapped_file.as_ptr(), mapped_file.len()) };
+							unsafe { slice::from_raw_parts(mapped_file.as_ptr(), mapped_file.len()) };
 						let cursor = MmapLineCursor::new(file, slice);
 						Ok(LineReader::MmapInput { _mapped_file: mapped_file, cursor })
 					},
@@ -5767,8 +5781,7 @@ pub mod fast_io {
 	/// Implementation of the std::io::Write trait
 	impl Write for OutputBuffer {
 		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-			let s =
-				std::str::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+			let s = str::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 			self.write_str(s)?;
 			Ok(buf.len())
 		}
@@ -5864,7 +5877,7 @@ pub mod fast_io {
 					self.low_level_flushes += 1;
 				}
 				// SAFETY: `mmap_chunk` retains this live mapped range until it is flushed.
-				let slice = unsafe { std::slice::from_raw_parts(chunk.out_ptr, chunk.len) };
+				let slice = unsafe { slice::from_raw_parts(chunk.out_ptr, chunk.len) };
 				self.out.write_all(slice)?;
 				let written = slice.len();
 				chunk.len -= written;
@@ -5941,6 +5954,7 @@ pub mod fast_io {
 		use std::{
 			fs,
 			io::{Seek, SeekFrom},
+			iter,
 		};
 
 		use tempfile::{NamedTempFile, tempfile};
@@ -5951,7 +5965,7 @@ pub mod fast_io {
 		#[cfg(unix)]
 		fn make_dot_line_4k() -> Vec<u8> {
 			let mut buf = Vec::with_capacity(4096);
-			buf.extend(std::iter::repeat_n(b'.', 4095));
+			buf.extend(iter::repeat_n(b'.', 4095));
 			buf.push(b'\n');
 			buf
 		}
@@ -6003,7 +6017,7 @@ pub mod fast_io {
 			// Prepare an output temp file and wrap it in our OutputBuffer
 			let output = NamedTempFile::new()?;
 			let output_path = output.path().to_path_buf();
-			let out_file = std::fs::File::create(&output_path)?;
+			let out_file = File::create(&output_path)?;
 			let mut out = OutputBuffer::new(Box::new(Box::new(out_file)));
 
 			// Drain reader → writer
@@ -6221,7 +6235,7 @@ pub mod fast_io {
 		}
 
 		#[test]
-		fn test_stream_read() -> std::io::Result<()> {
+		fn test_stream_read() -> io::Result<()> {
 			// Create temporary file with known contents
 			let mut tmp = NamedTempFile::new()?;
 			write!(tmp, "first line\nsecond line\nlast line\n")?;
@@ -6271,7 +6285,7 @@ pub mod fast_io {
 
 		#[test]
 		#[cfg(unix)]
-		fn test_mmap_read() -> std::io::Result<()> {
+		fn test_mmap_read() -> io::Result<()> {
 			// Create temporary file with known contents
 			let mut tmp = NamedTempFile::new()?;
 			write!(tmp, "first line\nsecond line\nlast line\n")?;
@@ -6503,7 +6517,7 @@ pub mod fast_io {
 		///////////////////////////////
 		// Unit tests for write_chunk()
 		///////////////////////////////
-		fn new_for_test() -> (OutputBuffer, std::fs::File) {
+		fn new_for_test() -> (OutputBuffer, File) {
 			let file = tempfile().unwrap();
 			let buf = OutputBuffer {
 				out: BufWriter::new(Box::new(file.try_clone().unwrap())),
@@ -6532,7 +6546,7 @@ pub mod fast_io {
 					content:                    s.to_string(),
 					has_newline:                has_nl,
 					#[cfg(not(unix))]
-					_phantom:                   std::marker::PhantomData,
+					_phantom:                   PhantomData,
 				},
 			}
 		}
@@ -6693,7 +6707,7 @@ pub mod fast_regex {
 	// For the full copyright and license information, please view the LICENSE
 	// file that was distributed with this source code.
 
-	use std::{error::Error, sync::LazyLock};
+	use std::{error::Error, option, str, sync::LazyLock};
 
 	use fancy_regex::{
 		CaptureMatches as FancyCaptureMatches, Captures as FancyCaptures, Regex as FancyRegex,
@@ -6828,7 +6842,7 @@ pub mod fast_regex {
 		pub fn find<'t>(&self, haystack: &'t [u8]) -> Option<(usize, usize, &'t str)> {
 			self.anchored_find(haystack).and_then(|start| {
 				let end = start + self.needle.len();
-				std::str::from_utf8(&haystack[start..end])
+				str::from_utf8(&haystack[start..end])
 					.ok()
 					.map(|s| (start, end, s))
 			})
@@ -6852,7 +6866,7 @@ pub mod fast_regex {
 
 	#[derive(Clone)]
 	pub enum LiteralMatches<'t> {
-		One(std::option::IntoIter<(usize, usize, &'t str)>),
+		One(option::IntoIter<(usize, usize, &'t str)>),
 		Free { iter: memmem::FindIter<'t, 't>, haystack: &'t [u8], nlen: usize },
 	}
 
@@ -6864,7 +6878,7 @@ pub mod fast_regex {
 				Self::One(iter) => iter.next(),
 				Self::Free { iter, haystack, nlen } => iter.find_map(|start| {
 					let end = start + *nlen;
-					std::str::from_utf8(&haystack[start..end])
+					str::from_utf8(&haystack[start..end])
 						.ok()
 						.map(|text| (start, end, text))
 				}),
@@ -7018,7 +7032,7 @@ pub mod fast_regex {
 					let haystack = chunk.as_bytes();
 					if let Some(m) = re.find(haystack) {
 						// Attempt UTF-8 decode for the match region only
-						let text = std::str::from_utf8(&haystack[m.start()..m.end()])
+						let text = str::from_utf8(&haystack[m.start()..m.end()])
 							.map_err(|e| SedError::new(2, e.to_string()))?;
 						Ok(Some(Match { start: m.start(), end: m.end(), text }))
 					} else {
@@ -7122,7 +7136,7 @@ pub mod fast_regex {
 					Some(m) => Ok(Some(Match {
 						start: m.start(),
 						end:   m.end(),
-						text:  std::str::from_utf8(m.as_bytes())
+						text:  str::from_utf8(m.as_bytes())
 							.map_err(|e| SedError::new(1, e.to_string()))?,
 					})),
 					None => Ok(None),
@@ -7426,6 +7440,8 @@ pub mod in_place {
 	use omp_shell_engine::openfiles::OpenFile;
 	use tempfile::NamedTempFile;
 
+	#[cfg(test)]
+	use crate::host::Host;
 	use crate::{
 		sed::{
 			command::ProcessingContext,
@@ -7466,7 +7482,7 @@ pub mod in_place {
 		/// tests.
 		#[cfg(test)]
 		pub fn new(context: ProcessingContext) -> Self {
-			let (host, _) = crate::host::Host::for_test("sed", "", ".");
+			let (host, _) = Host::for_test("sed", "", ".");
 			Self::new_with_stdout(context, host.stdout_clone())
 		}
 
@@ -7676,12 +7692,13 @@ pub mod in_place {
 		#[cfg(unix)]
 		#[test]
 		fn test_symlink_follow_true() {
+			use std::os::unix::fs;
 			let temp = TempDir::new().unwrap();
 			let real = temp.child("target.txt");
 			let link = temp.child("link.txt");
 
 			write_original(real.path(), "real\n");
-			std::os::unix::fs::symlink(real.path(), link.path()).unwrap();
+			fs::symlink(real.path(), link.path()).unwrap();
 
 			let mut ctx = minimal_context();
 			ctx.in_place = true;
@@ -7699,12 +7716,13 @@ pub mod in_place {
 		#[cfg(unix)]
 		#[test]
 		fn test_symlink_follow_false() {
+			use std::os::unix::fs;
 			let temp = TempDir::new().unwrap();
 			let real = temp.child("target.txt");
 			let link = temp.child("link.txt");
 
 			write_original(real.path(), "real\n");
-			std::os::unix::fs::symlink(real.path(), link.path()).unwrap();
+			fs::symlink(real.path(), link.path()).unwrap();
 
 			let mut ctx = minimal_context();
 			ctx.in_place = true;
@@ -7846,7 +7864,7 @@ pub mod processor {
 	// For the full copyright and license information, please view the LICENSE
 	// file that was distributed with this source code.
 
-	use std::{borrow::Cow, cell::RefCell, path::PathBuf, rc::Rc};
+	use std::{borrow::Cow, cell::RefCell, io, mem, path::PathBuf, process, rc::Rc};
 
 	use crate::{
 		host::Host,
@@ -7998,7 +8016,7 @@ pub mod processor {
 		output: &mut OutputBuffer,
 		context: &ProcessingContext,
 		chunk: &IOChunk,
-	) -> std::io::Result<()> {
+	) -> io::Result<()> {
 		output.write_chunk(chunk)?;
 
 		if context.unbuffered {
@@ -8029,8 +8047,8 @@ pub mod processor {
 	}
 
 	#[cfg(unix)]
-	fn shell_command(cmd: &str, host: &Host) -> std::process::Command {
-		let mut c = std::process::Command::new("/bin/sh");
+	fn shell_command(cmd: &str, host: &Host) -> process::Command {
+		let mut c = process::Command::new("/bin/sh");
 		c.arg("-c").arg(cmd);
 		// run relative to the shell's cwd,
 		// not the host process cwd. `output()` already keeps the child's stdio
@@ -8041,8 +8059,8 @@ pub mod processor {
 	}
 
 	#[cfg(windows)]
-	fn shell_command(cmd: &str, host: &Host) -> std::process::Command {
-		let mut c = std::process::Command::new("cmd.exe");
+	fn shell_command(cmd: &str, host: &Host) -> process::Command {
+		let mut c = process::Command::new("cmd.exe");
 		c.arg("/C").arg(cmd);
 		// see the unix variant above.
 		c.current_dir(host.cwd());
@@ -8052,7 +8070,7 @@ pub mod processor {
 
 	// Fallback if the target OS is neither Windows nor UNIX-like
 	#[cfg(not(any(unix, windows)))]
-	fn shell_command(_cmd: &str, _host: &Host) -> std::process::Command {
+	fn shell_command(_cmd: &str, _host: &Host) -> process::Command {
 		unimplemented!("the 'e' substitute flag requires a platform shell (/bin/sh or cmd.exe)");
 	}
 
@@ -8538,9 +8556,9 @@ pub mod processor {
 
 						// Swap newline if hold space is logically non-empty.
 						if !context.hold.content.is_empty() || context.hold.has_newline {
-							std::mem::swap(pat_has_newline, &mut context.hold.has_newline);
+							mem::swap(pat_has_newline, &mut context.hold.has_newline);
 						}
-						std::mem::swap(pat_content, &mut context.hold.content);
+						mem::swap(pat_content, &mut context.hold.content);
 					},
 					'y' => {
 						let trans = extract_variant!(command, Transliteration);
@@ -8821,11 +8839,12 @@ pub mod script_line_provider {
 	use std::{
 		fmt,
 		fs::File,
+		io,
 		io::{BufRead, BufReader},
 		path::PathBuf,
 	};
 
-	use omp_shell_engine::openfiles::OpenFile;
+	use omp_shell_engine::{openfiles::OpenFile, sys::fs};
 
 	use crate::{
 		sed::error_handling::{IoContext, SedResult},
@@ -8929,7 +8948,7 @@ pub mod script_line_provider {
 
 			match &self.sources[next_index] {
 				ScriptValue::StringVal(s) => {
-					let cursor = std::io::Cursor::new(s.clone());
+					let cursor = io::Cursor::new(s.clone());
 					self.state = State::Active {
 						index:       next_index,
 						reader:      Box::new(BufReader::new(cursor)),
@@ -8950,7 +8969,7 @@ pub mod script_line_provider {
 					} else {
 						// Resolve `-f` script files against the shell working directory,
 						// normalizing drive aliases to native drive paths first.
-						let normalized = omp_shell_engine::sys::fs::normalize_shell_path(p);
+						let normalized = fs::normalize_shell_path(p);
 						let resolved = if normalized.is_absolute() {
 							normalized.into_owned()
 						} else {
@@ -8999,7 +9018,7 @@ pub mod script_line_provider {
 					input_name: input_name.to_string(),
 					line_number,
 					index: 0,
-					reader: Box::new(BufReader::new(std::io::Cursor::new(Vec::<u8>::new()))),
+					reader: Box::new(BufReader::new(io::Cursor::new(Vec::<u8>::new()))),
 				},
 			}
 		}
@@ -9137,7 +9156,12 @@ pub mod script_line_provider {
 	}
 }
 
-use std::{collections::HashMap, ffi::OsString, io::Write, path::PathBuf};
+use std::{
+	collections::HashMap,
+	ffi::OsString,
+	io::Write,
+	path::{Path, PathBuf},
+};
 
 use clap::{Arg, ArgMatches, Command, arg};
 use omp_shell_engine::{ShellExtensions, builtins::Registration};
@@ -9370,7 +9394,7 @@ fn get_scripts_files(matches: &ArgMatches) -> SedResult<(Vec<ScriptValue>, Vec<P
 }
 
 // Parse CLI flag arguments and return a ProcessingContext struct based on them
-fn build_context(matches: &ArgMatches, cwd: &std::path::Path) -> ProcessingContext {
+fn build_context(matches: &ArgMatches, cwd: &Path) -> ProcessingContext {
 	ProcessingContext {
 		all_output_files: matches.get_flag("all-output-files"),
 		debug:            matches.get_flag("debug"),
@@ -9445,7 +9469,10 @@ pub(crate) fn sed_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use super::*; // Allows access to private functions/items in this module
+	use crate::host::run_util;
 
 	// get_scripts_files
 
@@ -9525,7 +9552,7 @@ mod tests {
 			["sed"]
 				.into_iter()
 				.chain(args.iter().copied())
-				.map(std::ffi::OsString::from)
+				.map(OsString::from)
 				.collect(),
 		);
 		uu_app()
@@ -9536,7 +9563,7 @@ mod tests {
 	#[test]
 	fn test_defaults() {
 		let matches = test_matches(&[]);
-		let ctx = build_context(&matches, std::path::Path::new("."));
+		let ctx = build_context(&matches, Path::new("."));
 
 		assert!(!ctx.all_output_files);
 		assert!(!ctx.debug);
@@ -9571,7 +9598,7 @@ mod tests {
 			"-z",
 		]);
 
-		let ctx = build_context(&matches, std::path::Path::new("."));
+		let ctx = build_context(&matches, Path::new("."));
 
 		assert!(ctx.all_output_files);
 		assert!(ctx.debug);
@@ -9591,7 +9618,7 @@ mod tests {
 	#[test]
 	fn test_multiple_same_arguments() {
 		let matches = test_matches(&["-E", "-r"]);
-		let ctx = build_context(&matches, std::path::Path::new("."));
+		let ctx = build_context(&matches, Path::new("."));
 
 		assert!(ctx.regex_extended);
 	}
@@ -9599,7 +9626,7 @@ mod tests {
 	#[test]
 	fn test_in_place_with_suffix() {
 		let matches = test_matches(&["-i.bak"]);
-		let ctx = build_context(&matches, std::path::Path::new("."));
+		let ctx = build_context(&matches, Path::new("."));
 
 		assert!(ctx.in_place);
 		assert_eq!(ctx.in_place_suffix, Some(".bak".to_string()));
@@ -9610,7 +9637,7 @@ mod tests {
 		// clap accepts `-Ei` as `-E -i`, so the BSD empty suffix must be
 		// removed from this valid GNU flag cluster as well.
 		let matches = test_matches(&["-Ei", "", "s/x/y/", "file.txt"]);
-		let ctx = build_context(&matches, std::path::Path::new("."));
+		let ctx = build_context(&matches, Path::new("."));
 
 		assert!(ctx.regex_extended);
 		assert!(ctx.in_place);
@@ -9624,12 +9651,12 @@ mod tests {
 	fn test_nonempty_token_after_in_place_is_not_consumed() {
 		let argv = ["sed", "-i", ".bak", "s/x/y/", "file.txt"]
 			.into_iter()
-			.map(std::ffi::OsString::from)
+			.map(OsString::from)
 			.collect();
 		let actual = normalize_args(argv);
 		let expected = ["sed", "-i", ".bak", "s/x/y/", "file.txt"]
 			.into_iter()
-			.map(std::ffi::OsString::from)
+			.map(OsString::from)
 			.collect::<Vec<_>>();
 
 		assert_eq!(actual, expected);
@@ -9640,8 +9667,8 @@ mod tests {
 		let matches_default = test_matches(&[]);
 		let matches_custom = test_matches(&["-l", "120"]);
 
-		let ctx_default = build_context(&matches_default, std::path::Path::new("."));
-		let ctx_custom = build_context(&matches_custom, std::path::Path::new("."));
+		let ctx_default = build_context(&matches_default, Path::new("."));
+		let ctx_custom = build_context(&matches_custom, Path::new("."));
 
 		assert_eq!(ctx_default.length, 70);
 		assert_eq!(ctx_custom.length, 120);
@@ -9649,7 +9676,7 @@ mod tests {
 
 	#[test]
 	fn builtin_substitutes_stdin() {
-		let (code, capture) = crate::host::run_util::<Sed>(&["s/hello/world/"], "hello\n", "/");
+		let (code, capture) = run_util::<Sed>(&["s/hello/world/"], "hello\n", "/");
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "world\n");
 		assert_eq!(capture.err(), "");
@@ -9657,14 +9684,14 @@ mod tests {
 
 	#[test]
 	fn builtin_propagates_q_status() {
-		let (code, capture) = crate::host::run_util::<Sed>(&["2q42"], "one\ntwo\nthree\n", "/");
+		let (code, capture) = run_util::<Sed>(&["2q42"], "one\ntwo\nthree\n", "/");
 		assert_eq!(code, 42);
 		assert_eq!(capture.out(), "one\ntwo\n");
 	}
 
 	#[test]
 	fn builtin_supports_null_records() {
-		let (code, capture) = crate::host::run_util::<Sed>(&["-z", "s/a/X/"], "a\0b\0", "/");
+		let (code, capture) = run_util::<Sed>(&["-z", "s/a/X/"], "a\0b\0", "/");
 		assert_eq!(code, 0);
 		assert_eq!(capture.stdout(), b"X\0b\0");
 	}
@@ -9672,9 +9699,9 @@ mod tests {
 	#[test]
 	fn builtin_edits_relative_path_in_place() {
 		let dir = tempfile::tempdir().unwrap();
-		std::fs::write(dir.path().join("file.txt"), "x marks\n").unwrap();
+		fs::write(dir.path().join("file.txt"), "x marks\n").unwrap();
 		let (code, capture) =
-			crate::host::run_util::<Sed>(&["-i", "s/x marks/y marks/", "file.txt"], "", dir.path());
+			run_util::<Sed>(&["-i", "s/x marks/y marks/", "file.txt"], "", dir.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(std::fs::read_to_string(dir.path().join("file.txt")).unwrap(), "y marks\n");
 	}
@@ -9682,9 +9709,8 @@ mod tests {
 	#[test]
 	fn builtin_resolves_script_and_write_paths() {
 		let dir = tempfile::tempdir().unwrap();
-		std::fs::write(dir.path().join("script.sed"), "w output.txt\n").unwrap();
-		let (code, capture) =
-			crate::host::run_util::<Sed>(&["-n", "-f", "script.sed"], "saved\n", dir.path());
+		fs::write(dir.path().join("script.sed"), "w output.txt\n").unwrap();
+		let (code, capture) = run_util::<Sed>(&["-n", "-f", "script.sed"], "saved\n", dir.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(std::fs::read(dir.path().join("output.txt")).unwrap(), b"saved\n");
 	}

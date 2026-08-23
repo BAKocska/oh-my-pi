@@ -4,7 +4,7 @@
 //! Buffers are owned across paints — a frame rebuilds instances in place,
 //! never re-allocating the vectors.
 
-use std::time::Duration;
+use std::{f32::consts, mem, time::Duration};
 
 use omp_tui::{
 	Border, Cell, CellContent, Color, DecorFill, DecorKind, Frame, Gradient, Layer, Rect, Size,
@@ -471,7 +471,7 @@ impl Compositor {
 					for fragment in fragments.drain(..) {
 						subtract_rect(fragment, cut, &mut scratch);
 					}
-					std::mem::swap(&mut fragments, &mut scratch);
+					mem::swap(&mut fragments, &mut scratch);
 					if fragments.is_empty() {
 						break;
 					}
@@ -676,7 +676,7 @@ impl Compositor {
 			if distance >= half_width {
 				0.0
 			} else {
-				0.1 * (1.0 + (std::f32::consts::PI * distance / half_width).cos())
+				0.1 * (1.0 + (consts::PI * distance / half_width).cos())
 			}
 		};
 		let width = end - start;

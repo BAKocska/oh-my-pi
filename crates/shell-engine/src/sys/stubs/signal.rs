@@ -1,5 +1,9 @@
 //! Signal processing utilities
 
+use std::io;
+#[cfg(not(windows))]
+use std::iter;
+
 use crate::{error, sys, traps};
 
 /// A stub enum representing system signals on unsupported platforms.
@@ -37,7 +41,7 @@ impl Signal {
 	/// Returns an iterator over all possible signals.
 	#[cfg(not(windows))]
 	pub fn iterator() -> impl Iterator<Item = Self> {
-		std::iter::empty()
+		iter::empty()
 	}
 
 	/// Converts the signal into its corresponding name as a `&'static str`.
@@ -147,7 +151,7 @@ pub(crate) fn chld_signal_listener() -> Result<FakeSignal, error::Error> {
 	Ok(FakeSignal::new())
 }
 
-pub(crate) async fn await_ctrl_c() -> std::io::Result<()> {
+pub(crate) async fn await_ctrl_c() -> io::Result<()> {
 	FakeSignal::new().recv().await;
 	Ok(())
 }

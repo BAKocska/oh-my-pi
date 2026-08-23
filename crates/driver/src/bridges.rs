@@ -2,7 +2,8 @@
 
 use std::{
 	collections::BTreeSet,
-	path::Path,
+	env,
+	path::{Path, PathBuf},
 	sync::{
 		Arc, OnceLock,
 		atomic::{AtomicU64, Ordering},
@@ -11,13 +12,35 @@ use std::{
 };
 
 use futures::StreamExt as _;
+use omp_agent::control;
 use omp_core::{Str, sf};
-use omp_tools::read::{
-	Fault as ReadFault,
-	resolver::{Resolve as _, ResourceCompletion, ResourceList, Scheme, SchemeEntry},
-	selector::ParsedSelector,
+use omp_envd::github_url::GithubCredentialBridge;
+use omp_proto::{
+	inference::{
+		v1,
+		v1::{image_event, speak_event},
+	},
+	thread,
+};
+use omp_storage::telemetry_index::TelemetryIndex;
+use omp_tools::{
+	goal,
+	read::{
+		Fault as ReadFault, resolver,
+		resolver::{ResourceCompletion, ResourceList, Scheme, SchemeEntry},
+		selector::ParsedSelector,
+	},
 };
 use parking_lot::RwLock;
+
+use crate::{
+	discovery,
+	discovery::{managed_skills, native},
+	modes::{CampaignHandle, Goal as DriverGoal, GoalStatus, RegimeError},
+	rulebook::RuleResolver,
+	skills::SkillResolver,
+	telemetry_upload,
+};
 
 /// Late-bound inference facade retained across environment-first composition.
 #[derive(Default)]
@@ -51,8 +74,8 @@ impl InferenceBridge {
 impl omp_envd::SearchInference for InferenceBridge {
 	async fn search(
 		&self,
-		request: omp_proto::inference::v1::SearchRequest,
-	) -> Result<omp_proto::inference::v1::SearchResponse, omp_tools::web_search::BackendError> {
+		request: v1::SearchRequest,
+	) -> Result<v1::SearchResponse, omp_tools::web_search::BackendError> {
 		use omp_proto::inference::v1::inference_server::Inference as _;
 		self
 			.inference()?
@@ -64,8 +87,8 @@ impl omp_envd::SearchInference for InferenceBridge {
 
 	async fn generate_image(
 		&self,
-		request: omp_proto::inference::v1::GenerateImageRequest,
-	) -> Result<Vec<omp_proto::thread::v1::Blob>, omp_tools::web_search::BackendError> {
+		request: v1::GenerateImageRequest,
+	) -> Result<Vec<thread::v1::Blob>, omp_tools::web_search::BackendError> {
 		use omp_proto::inference::v1::inference_server::Inference as _;
 		let mut events = self
 			.inference()?
@@ -75,7 +98,7 @@ impl omp_envd::SearchInference for InferenceBridge {
 			.into_inner();
 		while let Some(event) = events.next().await {
 			let event = event.map_err(rpc_backend_error)?;
-			if let Some(omp_proto::inference::v1::image_event::Event::Done(done)) = event.event {
+			if let Some(image_event::Event::Done(done)) = event.event {
 				return Ok(done.images);
 			}
 		}
@@ -87,7 +110,7 @@ impl omp_envd::SearchInference for InferenceBridge {
 
 	async fn speak(
 		&self,
-		request: omp_proto::inference::v1::SpeakRequest,
+		request: v1::SpeakRequest,
 	) -> Result<Vec<u8>, omp_tools::web_search::BackendError> {
 		use omp_proto::inference::v1::inference_server::Inference as _;
 		let mut events = self
@@ -99,10 +122,10 @@ impl omp_envd::SearchInference for InferenceBridge {
 		let mut audio = Vec::new();
 		while let Some(event) = events.next().await {
 			match event.map_err(rpc_backend_error)?.event {
-				Some(omp_proto::inference::v1::speak_event::Event::Chunk(chunk)) => {
+				Some(speak_event::Event::Chunk(chunk)) => {
 					audio.extend_from_slice(&chunk.audio);
 				},
-				Some(omp_proto::inference::v1::speak_event::Event::Done(done)) => {
+				Some(speak_event::Event::Done(done)) => {
 					if let Some(blob) = done.audio {
 						audio.extend_from_slice(&blob.inline);
 					}
@@ -133,7 +156,7 @@ struct ResolverBridge<R> {
 #[async_trait::async_trait]
 impl<R> omp_envd::ContentResolver for ResolverBridge<R>
 where
-	R: omp_tools::read::resolver::Resolve,
+	R: resolver::Resolve,
 {
 	fn entry(&self) -> SchemeEntry {
 		self.entry.clone()
@@ -181,7 +204,7 @@ where
 #[derive(Clone)]
 struct GoalBinding {
 	id:     u64,
-	modes:  Arc<crate::modes::CampaignHandle>,
+	modes:  Arc<CampaignHandle>,
 	sender: omp_agent::ControlSender,
 }
 
@@ -197,7 +220,7 @@ impl AgentGoalControl {
 	/// returned lease is dropped.
 	pub fn bind(
 		&self,
-		modes: Arc<crate::modes::CampaignHandle>,
+		modes: Arc<CampaignHandle>,
 		sender: omp_agent::ControlSender,
 	) -> AgentGoalBinding {
 		let id = self
@@ -208,12 +231,8 @@ impl AgentGoalControl {
 		AgentGoalBinding { control: self.clone(), id }
 	}
 
-	fn binding(&self) -> Result<GoalBinding, omp_tools::goal::Fault> {
-		self
-			.binding
-			.read()
-			.clone()
-			.ok_or(omp_tools::goal::Fault::Unavailable)
+	fn binding(&self) -> Result<GoalBinding, goal::Fault> {
+		self.binding.read().clone().ok_or(goal::Fault::Unavailable)
 	}
 
 	fn unbind(&self, id: u64) {
@@ -242,7 +261,7 @@ impl omp_envd::GoalAuthority for AgentGoalControl {
 	async fn apply(
 		&self,
 		params: omp_tools::goal::Params,
-	) -> Result<Option<omp_tools::goal::Goal>, omp_tools::goal::Fault> {
+	) -> Result<Option<omp_tools::goal::Goal>, goal::Fault> {
 		let GoalBinding { modes, sender, .. } = self.binding()?;
 		let now = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -251,15 +270,13 @@ impl omp_envd::GoalAuthority for AgentGoalControl {
 			.try_into()
 			.unwrap_or(u64::MAX);
 		let outcome = match params.op {
-			omp_tools::goal::Operation::Create => {
-				let objective = params
-					.objective
-					.ok_or(omp_tools::goal::Fault::ObjectiveRequired)?;
+			goal::Operation::Create => {
+				let objective = params.objective.ok_or(goal::Fault::ObjectiveRequired)?;
 				if objective.trim().is_empty() {
-					return Err(omp_tools::goal::Fault::ObjectiveRequired);
+					return Err(goal::Fault::ObjectiveRequired);
 				}
 				if params.token_budget == Some(0) {
-					return Err(omp_tools::goal::Fault::InvalidBudget);
+					return Err(goal::Fault::InvalidBudget);
 				}
 				let (engagement, newly_engaged) = ensure_goal_campaign(&sender).await?;
 				let goal = match modes.set_goal(objective, params.token_budget, now) {
@@ -278,11 +295,11 @@ impl omp_envd::GoalAuthority for AgentGoalControl {
 				}
 				Some(goal)
 			},
-			omp_tools::goal::Operation::Get => modes.goal(),
-			omp_tools::goal::Operation::Complete => {
+			goal::Operation::Get => modes.goal(),
+			goal::Operation::Complete => {
 				let engagement = active_goal_engagement(&sender)
 					.await?
-					.ok_or(omp_tools::goal::Fault::Unavailable)?;
+					.ok_or(goal::Fault::Unavailable)?;
 				let goal = modes.complete_goal(now).map_err(map_goal_error)?;
 				sender
 					.disengage_campaign(engagement)
@@ -290,7 +307,7 @@ impl omp_envd::GoalAuthority for AgentGoalControl {
 					.map_err(map_goal_campaign_error)?;
 				Some(goal)
 			},
-			omp_tools::goal::Operation::Resume => {
+			goal::Operation::Resume => {
 				let (engagement, newly_engaged) = ensure_goal_campaign(&sender).await?;
 				let goal = match modes.resume_goal(now) {
 					Ok(goal) => goal,
@@ -307,10 +324,10 @@ impl omp_envd::GoalAuthority for AgentGoalControl {
 				}
 				Some(goal)
 			},
-			omp_tools::goal::Operation::Drop => {
+			goal::Operation::Drop => {
 				let engagement = active_goal_engagement(&sender)
 					.await?
-					.ok_or(omp_tools::goal::Fault::Unavailable)?;
+					.ok_or(goal::Fault::Unavailable)?;
 				let goal = modes.drop_goal(now).map_err(map_goal_error)?;
 				sender
 					.disengage_campaign(engagement)
@@ -326,8 +343,8 @@ impl omp_envd::GoalAuthority for AgentGoalControl {
 async fn update_goal_campaign_state(
 	sender: &omp_agent::ControlSender,
 	engagement: &Str,
-	goal: &crate::modes::Goal,
-) -> Result<(), omp_tools::goal::Fault> {
+	goal: &DriverGoal,
+) -> Result<(), goal::Fault> {
 	let state = omp_agent::GoalCampaignState {
 		objective:          goal.objective.clone(),
 		budget_tokens:      goal.token_budget,
@@ -346,7 +363,7 @@ async fn update_goal_campaign_state(
 
 async fn active_goal_engagement(
 	sender: &omp_agent::ControlSender,
-) -> Result<Option<Str>, omp_tools::goal::Fault> {
+) -> Result<Option<Str>, goal::Fault> {
 	Ok(sender
 		.active_campaigns()
 		.await
@@ -360,7 +377,7 @@ async fn active_goal_engagement(
 
 async fn ensure_goal_campaign(
 	sender: &omp_agent::ControlSender,
-) -> Result<(Str, bool), omp_tools::goal::Fault> {
+) -> Result<(Str, bool), goal::Fault> {
 	if let Some(engagement) = active_goal_engagement(sender).await? {
 		return Ok((engagement, false));
 	}
@@ -371,35 +388,37 @@ async fn ensure_goal_campaign(
 	Ok((receipt.engagement, true))
 }
 
-fn map_goal_campaign_error(error: omp_agent::control::ControlError) -> omp_tools::goal::Fault {
+fn map_goal_campaign_error(error: control::ControlError) -> goal::Fault {
 	match error {
-		omp_agent::control::ControlError::CampaignEngage(omp_agent::EngageError::Claim {
+		control::ControlError::CampaignEngage(omp_agent::EngageError::Claim {
 			outcome: omp_agent::ClaimOutcome::Denied { holder, since },
 			..
-		}) => omp_tools::goal::Fault::ClaimDenied { holder, since },
-		_ => omp_tools::goal::Fault::Unavailable,
+		}) => goal::Fault::ClaimDenied { holder, since },
+		_ => goal::Fault::Unavailable,
 	}
 }
 
-fn map_goal_error(error: crate::modes::RegimeError) -> omp_tools::goal::Fault {
+fn map_goal_error(error: RegimeError) -> goal::Fault {
 	match error {
-		crate::modes::RegimeError::NoGoal => omp_tools::goal::Fault::NoGoal,
-		crate::modes::RegimeError::EmptyObjective => omp_tools::goal::Fault::ObjectiveRequired,
-		crate::modes::RegimeError::InvalidBudget => omp_tools::goal::Fault::InvalidBudget,
-		crate::modes::RegimeError::CampaignInactive { .. }
-		| crate::modes::RegimeError::InvalidPlanArtifact => omp_tools::goal::Fault::ModeConflict,
-		crate::modes::RegimeError::InvalidGoalTransition { .. }
-		| crate::modes::RegimeError::GoalExists => omp_tools::goal::Fault::InvalidTransition,
+		RegimeError::NoGoal => goal::Fault::NoGoal,
+		RegimeError::EmptyObjective => goal::Fault::ObjectiveRequired,
+		RegimeError::InvalidBudget => goal::Fault::InvalidBudget,
+		RegimeError::CampaignInactive { .. } | RegimeError::InvalidPlanArtifact => {
+			goal::Fault::ModeConflict
+		},
+		RegimeError::InvalidGoalTransition { .. } | RegimeError::GoalExists => {
+			goal::Fault::InvalidTransition
+		},
 	}
 }
 
-fn project_goal(goal: crate::modes::Goal) -> omp_tools::goal::Goal {
+fn project_goal(goal: DriverGoal) -> omp_tools::goal::Goal {
 	let status = match goal.status {
-		crate::modes::GoalStatus::Active => omp_tools::goal::Status::Active,
-		crate::modes::GoalStatus::Paused => omp_tools::goal::Status::Paused,
-		crate::modes::GoalStatus::BudgetLimited => omp_tools::goal::Status::BudgetLimited,
-		crate::modes::GoalStatus::Complete => omp_tools::goal::Status::Complete,
-		crate::modes::GoalStatus::Dropped => omp_tools::goal::Status::Dropped,
+		GoalStatus::Active => goal::Status::Active,
+		GoalStatus::Paused => goal::Status::Paused,
+		GoalStatus::BudgetLimited => goal::Status::BudgetLimited,
+		GoalStatus::Complete => goal::Status::Complete,
+		GoalStatus::Dropped => goal::Status::Dropped,
 	};
 	omp_tools::goal::Goal {
 		id: goal.id,
@@ -414,12 +433,8 @@ fn project_goal(goal: crate::modes::Goal) -> omp_tools::goal::Goal {
 struct TelemetryBridge;
 
 impl omp_envd::TelemetryUpload for TelemetryBridge {
-	fn start(
-		&self,
-		index: Arc<omp_storage::telemetry_index::TelemetryIndex>,
-		credentials: Arc<omp_envd::github_url::GithubCredentialBridge>,
-	) {
-		crate::telemetry_upload::start(index, credentials);
+	fn start(&self, index: Arc<TelemetryIndex>, credentials: Arc<GithubCredentialBridge>) {
+		telemetry_upload::start(index, credentials);
 	}
 }
 
@@ -430,7 +445,7 @@ pub fn builtin(
 	goal_control: AgentGoalControl,
 	host_resources: Option<Arc<dyn omp_envd::HostResources>>,
 ) -> omp_envd::RegistryBridges {
-	let active = crate::discovery::active_content_snapshots(root);
+	let active = discovery::active_content_snapshots(root);
 	let authored_skills = active
 		.skills
 		.all()
@@ -438,18 +453,16 @@ pub fn builtin(
 		.filter(|skill| skill.source.as_str() != omp_envd::managed_skills_domain::PROVIDER_ID)
 		.map(|skill| skill.name.clone())
 		.collect::<BTreeSet<_>>();
-	let home = std::env::var_os("HOME").map_or_else(|| root.to_path_buf(), std::path::PathBuf::from);
-	let managed_skills_root = Some(crate::discovery::managed_skills::root(
-		&crate::discovery::native::user_config_root(&home),
-	));
+	let home = env::var_os("HOME").map_or_else(|| root.to_path_buf(), PathBuf::from);
+	let managed_skills_root = Some(managed_skills::root(&native::user_config_root(&home)));
 	let skill = ResolverBridge {
-		inner: crate::skills::SkillResolver::new(Arc::clone(&active.skills)),
+		inner: SkillResolver::new(Arc::clone(&active.skills)),
 		entry: SchemeEntry::new(Scheme::Skill, true, false, "skills")
 			.with_capabilities(true, true, true)
 			.with_whole_body(true),
 	};
 	let rule = ResolverBridge {
-		inner: crate::rulebook::RuleResolver::new(Arc::clone(&active.rules)),
+		inner: RuleResolver::new(Arc::clone(&active.rules)),
 		entry: SchemeEntry::new(Scheme::Rule, true, false, "rules")
 			.with_capabilities(true, true, true)
 			.with_whole_body(true),

@@ -1,10 +1,12 @@
 //! Real Apple Foundation Models availability and generation smoke path.
 
+use std::{error, io};
+
 use futures::StreamExt;
 use omp_inference::local::applefm::{AppleFm, AppleFmEvent, AppleFmOptions};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn error::Error>> {
 	let evidence = AppleFm::availability_evidence().await?;
 	println!("Apple Foundation Models availability: {evidence:?}");
 	if !matches!(evidence.state, omp_inference::local::applefm::AppleFmSupportState::Available) {
@@ -34,8 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 	if !finished {
 		return Err(
-			std::io::Error::new(
-				std::io::ErrorKind::UnexpectedEof,
+			io::Error::new(
+				io::ErrorKind::UnexpectedEof,
 				"Apple Foundation Models stream ended before Finished",
 			)
 			.into(),

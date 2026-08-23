@@ -229,11 +229,11 @@ mod tests {
 	use crate::{
 		answer::{
 			AccountState, AccountSummary, Answer, AnswerBody, AuthAnswer, EmbeddingBatch,
-			GenerationSession, NativeResponse, NativeResponseBody, RealtimeSession, ResponseMeta,
-			SearchResults, TokenCount, TokenSequence, TokenizerProvenance, UsageAccountMetadata,
-			UsageReport,
+			GenerationSession, NativeResponse, NativeResponseBody, OutputStream, RealtimeSession,
+			ResponseMeta, SearchResults, TokenCount, TokenSequence, TokenizerProvenance,
+			UsageAccountMetadata, UsageReport,
 		},
-		call::CallMeta,
+		call::{CallMeta, CountAccuracy, Target},
 		catalog::{ModelKey, OperationKind, ProviderId, RouteId},
 		error::{ErrorDetail, ErrorKind},
 		id::{AccountId, GenerationHandle, RequestId},
@@ -255,7 +255,7 @@ mod tests {
 	fn answer(body: AnswerBody) -> Answer {
 		Answer { meta: meta(), receipt: ExecutionReceipt::default(), body }
 	}
-	fn empty_stream<T: Send + 'static>() -> crate::answer::OutputStream<T> {
+	fn empty_stream<T: Send + 'static>() -> OutputStream<T> {
 		Box::pin(stream::empty())
 	}
 
@@ -458,7 +458,7 @@ mod tests {
 		let service = ReadinessService { phase: phase.clone() };
 		let call_meta = CallMeta {
 			id:       RequestId::from("request"),
-			target:   crate::call::Target::Model(ModelKey::from("model")),
+			target:   Target::Model(ModelKey::from("model")),
 			deadline: Some(Instant::now()),
 			budget:   ExecutionBudget::default(),
 			session:  None,
@@ -467,7 +467,7 @@ mod tests {
 		let request = CountTokensRequest {
 			messages: Arc::new([]),
 			tools:    Arc::new([]),
-			accuracy: crate::call::CountAccuracy::Exact,
+			accuracy: CountAccuracy::Exact,
 		};
 		let output = client
 			.dispatch::<CountTokensRequest>(request.to_call(call_meta))
@@ -483,7 +483,7 @@ mod tests {
 		let service = ReadinessService { phase: phase.clone() };
 		let call_meta = CallMeta {
 			id:       RequestId::from("request"),
-			target:   crate::call::Target::Model(ModelKey::from("model")),
+			target:   Target::Model(ModelKey::from("model")),
 			deadline: None,
 			budget:   ExecutionBudget::default(),
 			session:  None,
@@ -492,7 +492,7 @@ mod tests {
 		let request = CountTokensRequest {
 			messages: Arc::new([]),
 			tools:    Arc::new([]),
-			accuracy: crate::call::CountAccuracy::Exact,
+			accuracy: CountAccuracy::Exact,
 		};
 		let Err(error) = client.plan(&request) else {
 			panic!("unsupported operation planned")

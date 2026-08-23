@@ -1,8 +1,11 @@
 //! Typed sleep-prevention settings owned by the power runtime.
 
+use std::{env, path::Path};
+
 use omp_settings::{
 	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
 	SettingsDomain,
+	manager::{SettingsManager, SettingsManagerError, SettingsPaths},
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,17 +65,13 @@ omp_settings::inventory::submit! {
 
 /// Loads the current power projection through the application settings
 /// authority.
-pub fn current(
-	data_dir: &std::path::Path,
-) -> Result<PowerSettings, omp_settings::manager::SettingsManagerError> {
-	let project = std::env::current_dir().ok();
-	let manager = omp_settings::manager::SettingsManager::open(
-		omp_settings::manager::SettingsPaths::discover(data_dir, project.as_deref()),
-	)?;
+pub fn current(data_dir: &Path) -> Result<PowerSettings, SettingsManagerError> {
+	let project = env::current_dir().ok();
+	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, project.as_deref()))?;
 	let projection = manager
 		.snapshot()
 		.project::<PowerSettings>()
-		.map_err(|source| omp_settings::manager::SettingsManagerError::Projection { source })?;
+		.map_err(|source| SettingsManagerError::Projection { source })?;
 	Ok(projection.get().clone())
 }
 

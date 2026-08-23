@@ -4,6 +4,7 @@
 use std::{
 	collections::HashMap,
 	hash::{DefaultHasher, Hash, Hasher},
+	marker,
 	path::Path,
 	sync::Arc,
 };
@@ -307,7 +308,7 @@ impl<I: PartialEq + Send + Sync + 'static> ConversationStore<I> for InMemoryConv
 /// SQLite-backed append-only conversation store suitable for process restarts.
 pub struct SqliteConversationStore<I> {
 	connection: Arc<Mutex<Connection>>,
-	marker:     std::marker::PhantomData<fn() -> I>,
+	marker:     marker::PhantomData<fn() -> I>,
 }
 
 impl<I> SqliteConversationStore<I> {
@@ -340,10 +341,7 @@ impl<I> SqliteConversationStore<I> {
 			);",
 			)
 			.map_err(|_| ConversationError::Persistence)?;
-		Ok(Self {
-			connection: Arc::new(Mutex::new(connection)),
-			marker:     std::marker::PhantomData,
-		})
+		Ok(Self { connection: Arc::new(Mutex::new(connection)), marker: marker::PhantomData })
 	}
 
 	/// Returns the exact terminal response for a globally unique logical turn.

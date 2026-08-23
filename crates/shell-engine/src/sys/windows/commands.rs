@@ -6,9 +6,12 @@
 //! flags, because `CommandExt::creation_flags` replaces rather than ORs and
 //! two writers would silently clobber each other.
 
-use std::ffi::OsStr;
+use std::{ffi::OsStr, process};
 
-use crate::{ShellFd, error, openfiles};
+use crate::{
+	ShellFd, error,
+	openfiles::{self, OpenFile},
+};
 
 /// Extension trait for Windows command extensions.
 pub trait CommandExt {
@@ -29,7 +32,7 @@ pub trait CommandExt {
 	fn process_group(&mut self, pgroup: i32) -> &mut Self;
 }
 
-impl CommandExt for std::process::Command {
+impl CommandExt for process::Command {
 	fn arg0<S>(&mut self, _arg: S) -> &mut Self
 	where
 		S: AsRef<OsStr>,
@@ -51,7 +54,7 @@ pub trait ExitStatusExt {
 	fn signal(&self) -> Option<i32>;
 }
 
-impl ExitStatusExt for std::process::ExitStatus {
+impl ExitStatusExt for process::ExitStatus {
 	fn signal(&self) -> Option<i32> {
 		None
 	}
@@ -66,14 +69,14 @@ pub trait CommandFdInjectionExt {
 	/// * `open_files` - A mapping of child file descriptors to open files.
 	fn inject_fds(
 		&mut self,
-		open_files: impl Iterator<Item = (ShellFd, openfiles::OpenFile)>,
+		open_files: impl Iterator<Item = (ShellFd, OpenFile)>,
 	) -> Result<(), error::Error>;
 }
 
-impl CommandFdInjectionExt for std::process::Command {
+impl CommandFdInjectionExt for process::Command {
 	fn inject_fds(
 		&mut self,
-		mut open_files: impl Iterator<Item = (ShellFd, openfiles::OpenFile)>,
+		mut open_files: impl Iterator<Item = (ShellFd, OpenFile)>,
 	) -> Result<(), error::Error> {
 		if open_files.next().is_some() {
 			return Err(
@@ -96,7 +99,7 @@ pub trait CommandFgControlExt {
 	fn lead_session(&mut self);
 }
 
-impl CommandFgControlExt for std::process::Command {
+impl CommandFgControlExt for process::Command {
 	fn take_foreground(&mut self) {
 		// NOTE: no terminal foregrounding on Windows; group/console flags are
 		// applied uniformly by `sys::process::spawn`.
@@ -121,7 +124,7 @@ pub trait CommandSessionExt {
 	fn detach_session_reparent(&mut self);
 }
 
-impl CommandSessionExt for std::process::Command {
+impl CommandSessionExt for process::Command {
 	fn detach_session(&mut self) {
 		// NOTE: Windows has no setsid; intentionally a no-op.
 	}

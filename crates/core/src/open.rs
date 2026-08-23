@@ -4,7 +4,13 @@
 //! PowerShell on Windows, `wslview`/`xdg-open` on Linux. Callers always keep a
 //! visible copy-URL fallback; launch failures are logged, never surfaced.
 
-use std::process::{Command, Stdio};
+use std::{
+	process::{Command, Stdio},
+	thread,
+};
+
+#[cfg(not(any(target_os = "macos", windows)))]
+use url::Url;
 
 /// Opens `target` (URL or file path) with the platform's registered handler.
 ///
@@ -21,7 +27,7 @@ pub fn open_path(target: &str) {
 		Ok(mut child) => {
 			let target = target.to_owned();
 			// Reap off-thread: no zombies, and delayed failures still get logged.
-			std::thread::spawn(move || match child.wait() {
+			thread::spawn(move || match child.wait() {
 				Ok(status) if !status.success() => {
 					tracing::warn!(%target, %status, "external opener exited with non-zero status");
 				},
@@ -52,13 +58,14 @@ fn opener_command(target: &str) -> Command {
 /// target is a single-quoted literal with embedded quotes doubled.
 #[cfg(windows)]
 fn opener_command(target: &str) -> Command {
-	use std::{os::windows::process::CommandExt, path::PathBuf};
+	use std::{env, os::windows::process::CommandExt, path::PathBuf};
 
 	const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 	// Anchor PowerShell to System32: machine PATHs that dropped System32 are a
 	// real-world occurrence. Bare-name fallback for exotic SystemRoot layouts.
-	let system_root = std::env::var("SystemRoot")
+
+	let system_root = env::var("SystemRoot")
 		.ok()
 		.map(|value| value.trim().to_owned())
 		.filter(|value| !value.is_empty())
@@ -105,21 +112,24 @@ fn opener_command(target: &str) -> Command {
 /// Returns `None` for URLs, missing files, and non-WSL environments.
 #[cfg(not(any(target_os = "macos", windows)))]
 fn wsl_windows_path(target: &str) -> Option<String> {
-	use std::path::PathBuf;
+	use std::{
+		env,
+		path::{self, PathBuf},
+	};
 
-	if std::env::var_os("WSL_DISTRO_NAME").is_none() && std::env::var_os("WSL_INTEROP").is_none() {
+	if env::var_os("WSL_DISTRO_NAME").is_none() && env::var_os("WSL_INTEROP").is_none() {
 		return None;
 	}
 	if !on_path("wslview") {
 		return None;
 	}
 	let local: PathBuf = if target.starts_with("file://") {
-		url::Url::parse(target).ok()?.to_file_path().ok()?
+		Url::parse(target).is_ok()?.to_file_path().ok()?
 	} else if has_url_scheme(target) {
 		// Any non-file scheme (https, vscode, …) belongs to xdg-open.
 		return None;
 	} else {
-		std::path::absolute(target).ok()?
+		path::absolute(target).ok()?
 	};
 	if !local.exists() {
 		return None;
@@ -157,10 +167,10 @@ fn has_url_scheme(target: &str) -> bool {
 /// Reports whether an executable `name` is reachable through `PATH`.
 #[cfg(not(any(target_os = "macos", windows)))]
 fn on_path(name: &str) -> bool {
-	use std::os::unix::fs::PermissionsExt;
+	use std::{env, os::unix::fs::PermissionsExt};
 
-	std::env::var_os("PATH").is_some_and(|path| {
-		std::env::split_paths(&path).any(|dir| {
+	env::var_os("PATH").is_some_and(|path| {
+		env::split_paths(&path).any(|dir| {
 			let candidate = dir.join(name);
 			candidate
 				.metadata()

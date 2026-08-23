@@ -1,3 +1,5 @@
+//! Proves provider service CONTROL uses manifest routes, host generations, and
+//! sealed codecs.
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;

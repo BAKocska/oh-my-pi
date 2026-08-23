@@ -2,6 +2,7 @@
 
 use std::{
 	collections::HashMap,
+	io,
 	io::{Read, Seek, SeekFrom, Write},
 	str,
 };
@@ -81,7 +82,7 @@ pub(crate) fn read_entries_from_buffer(
 	limits: Limits,
 	buffer: u32,
 ) -> Result<Vec<Entry>> {
-	let mut cursor = std::io::Cursor::new(bytes);
+	let mut cursor = io::Cursor::new(bytes);
 	read_entries_impl(&mut cursor, bytes.len() as u64, limits, Some(buffer))
 }
 
@@ -513,7 +514,7 @@ fn read_exact_at(
 	}
 	source.seek(SeekFrom::Start(offset))?;
 	source.read_exact(bytes).map_err(|error| {
-		if error.kind() == std::io::ErrorKind::UnexpectedEof {
+		if error.kind() == io::ErrorKind::UnexpectedEof {
 			Error::InvalidArchive(message)
 		} else {
 			error.into()

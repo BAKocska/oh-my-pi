@@ -9,12 +9,18 @@ use ashpd::desktop::{
 };
 use futures::StreamExt;
 use reis::{
-	ei,
+	ei::{self, button::ButtonState, handshake, keyboard::KeyState},
 	event::{Device, DeviceCapability, EiEvent},
 	tokio::EiConvertEventStream,
 };
+use tokio::{
+	runtime,
+	time::{self, Instant},
+};
 
+use super::super::actor;
 use crate::{
+	CLOSE_TIMEOUT,
 	backend::{Modifiers, MouseButton, PointerEvent},
 	error::{CoreResult, DesktopError},
 	keys::KeyName,
@@ -48,7 +54,7 @@ struct PortalSession {
 }
 
 pub(crate) struct ActorLibei {
-	context:        ei::Context,
+	context:        Context,
 	pointer:        Option<EiDevice>,
 	keyboard:       Option<EiDevice>,
 	sequence:       u32,
@@ -57,13 +63,12 @@ pub(crate) struct ActorLibei {
 
 /// Closes a `RemoteDesktop` portal session, bounded by `CLOSE_TIMEOUT` so an
 /// unresponsive `xdg-desktop-portal` cannot hang teardown indefinitely.
-fn close_session(runtime: &tokio::runtime::Runtime, session: &RemoteDesktopSession) {
-	let _ =
-		runtime.block_on(async { tokio::time::timeout(crate::CLOSE_TIMEOUT, session.close()).await });
+fn close_session(runtime: &runtime::Runtime, session: &RemoteDesktopSession) {
+	let _ = runtime.block_on(async { time::timeout(CLOSE_TIMEOUT, session.close()).await });
 }
 
 impl ActorLibei {
-	pub(crate) fn new(runtime: &tokio::runtime::Runtime) -> CoreResult<Self> {
+	pub(crate) fn new(runtime: &runtime::Runtime) -> CoreResult<Self> {
 		let (context, portal_session, targets) = match ei::Context::connect_to_env() {
 			Ok(Some(context)) => (context, None, DiscoveryTargets::ALL),
 			Ok(None) => {
@@ -78,7 +83,7 @@ impl ActorLibei {
 			.block_on(
 				backend
 					.context
-					.handshake_tokio("omp-computer", ei::handshake::ContextType::Sender),
+					.handshake_tokio("omp-computer", handshake::ContextType::Sender),
 			)
 			.map_err(|err| DesktopError::input_failed(format!("libei handshake: {err}")))?;
 		backend.discover_devices(runtime, &mut events, targets)?;
@@ -91,7 +96,7 @@ impl ActorLibei {
 	}
 
 	fn portal_context(
-		runtime: &tokio::runtime::Runtime,
+		runtime: &runtime::Runtime,
 	) -> CoreResult<(ei::Context, PortalSession, DiscoveryTargets)> {
 		let (fd, session, targets) = runtime
 			.block_on(async {
@@ -133,7 +138,7 @@ impl ActorLibei {
 				match fd {
 					Ok((fd, targets)) => Ok((fd, session, targets)),
 					Err(err) => {
-						let _ = tokio::time::timeout(crate::CLOSE_TIMEOUT, session.close()).await;
+						let _ = time::timeout(CLOSE_TIMEOUT, session.close()).await;
 						Err(err)
 					},
 				}
@@ -149,7 +154,7 @@ impl ActorLibei {
 		Ok((context, PortalSession { session }, targets))
 	}
 
-	pub(crate) fn close(mut self, runtime: &tokio::runtime::Runtime) {
+	pub(crate) fn close(mut self, runtime: &runtime::Runtime) {
 		if let Some(portal) = self.portal_session.take() {
 			close_session(runtime, &portal.session);
 		}
@@ -157,7 +162,7 @@ impl ActorLibei {
 
 	fn discover_devices(
 		&mut self,
-		runtime: &tokio::runtime::Runtime,
+		runtime: &runtime::Runtime,
 		events: &mut EiConvertEventStream,
 		targets: DiscoveryTargets,
 	) -> CoreResult<()> {
@@ -167,7 +172,7 @@ impl ActorLibei {
 			let mut drain_deadline = None;
 			for _ in 0..128 {
 				let event = if let Some(deadline) = drain_deadline {
-					match tokio::time::timeout_at(deadline, events.next()).await {
+					match time::timeout_at(deadline, events.next()).await {
 						Ok(event) => event,
 						Err(_) => break,
 					}
@@ -223,7 +228,7 @@ impl ActorLibei {
 					break;
 				}
 				if drain_deadline.is_none() && (self.pointer.is_some() || self.keyboard.is_some()) {
-					drain_deadline = Some(tokio::time::Instant::now() + DEVICE_DISCOVERY_DRAIN_TIMEOUT);
+					drain_deadline = Some(Instant::now() + DEVICE_DISCOVERY_DRAIN_TIMEOUT);
 				}
 			}
 			Ok(())
@@ -298,9 +303,9 @@ impl ActorLibei {
 		keyboard.key(
 			keycode,
 			if pressed {
-				ei::keyboard::KeyState::Press
+				KeyState::Press
 			} else {
-				ei::keyboard::KeyState::Released
+				KeyState::Released
 			},
 		);
 		device.device.device().frame(device.serial, time);
@@ -333,10 +338,10 @@ impl ActorLibei {
 						MouseButton::Middle => 0x112,
 					};
 					for _ in 0..count.max(1) {
-						button_interface.button(code, ei::button::ButtonState::Press);
+						button_interface.button(code, ButtonState::Press);
 						device.device.device().frame(device.serial, time);
 						time = time.saturating_add(1);
-						button_interface.button(code, ei::button::ButtonState::Released);
+						button_interface.button(code, ButtonState::Released);
 						device.device.device().frame(device.serial, time);
 						time = time.saturating_add(1);
 					}
@@ -363,14 +368,14 @@ impl ActorLibei {
 						MouseButton::Right => 0x111,
 						MouseButton::Middle => 0x112,
 					};
-					button_interface.button(code, ei::button::ButtonState::Press);
+					button_interface.button(code, ButtonState::Press);
 					device.device.device().frame(device.serial, time);
 					time = time.saturating_add(1);
 					for &(x, y) in path.iter().skip(1) {
 						Self::move_absolute(device, x, y, time)?;
 						time = time.saturating_add(1);
 					}
-					button_interface.button(code, ei::button::ButtonState::Released);
+					button_interface.button(code, ButtonState::Released);
 					device.device.device().frame(device.serial, time);
 					time = time.saturating_add(1);
 					if let Some(keyboard) = keyboard {
@@ -459,26 +464,26 @@ pub(super) struct Libei;
 
 impl Libei {
 	pub(crate) fn new() -> CoreResult<Self> {
-		super::super::actor::libei_init()?;
+		actor::libei_init()?;
 		Ok(Self)
 	}
 
 	pub(crate) fn pointer(&mut self, event: PointerEvent) -> CoreResult<()> {
-		super::super::actor::libei_pointer(event)
+		actor::libei_pointer(event)
 	}
 
 	pub(crate) fn key_chord(&mut self, keys: &[KeyName]) -> CoreResult<()> {
-		super::super::actor::libei_key_chord(keys.to_vec())
+		actor::libei_key_chord(keys.to_vec())
 	}
 
 	pub(crate) fn type_text(&mut self, text: &str) -> CoreResult<()> {
-		super::super::actor::libei_type_text(text.to_string())
+		actor::libei_type_text(text.to_string())
 	}
 }
 
 impl Drop for Libei {
 	fn drop(&mut self) {
-		super::super::actor::libei_close();
+		actor::libei_close();
 	}
 }
 

@@ -1,5 +1,6 @@
 use std::{
 	ffi::CString,
+	fs,
 	sync::{
 		Arc,
 		atomic::{AtomicI64, Ordering},
@@ -9,6 +10,7 @@ use std::{
 use async_trait::async_trait;
 use omp_core::sf;
 use omp_tools::eval::idle_timeout::TimeoutHandle;
+use parking_lot::Mutex;
 use pyo3::{
 	prelude::*,
 	types::{PyDict, PyModule},
@@ -17,19 +19,16 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
 
-use super::*;
+use super::{super::tools, *};
 
 struct PreludeHost {
-	calls:             parking_lot::Mutex<Vec<(String, Value)>>,
+	calls:             Mutex<Vec<(String, Value)>>,
 	concurrency_limit: AtomicI64,
 }
 
 impl Default for PreludeHost {
 	fn default() -> Self {
-		Self {
-			calls:             parking_lot::Mutex::new(Vec::new()),
-			concurrency_limit: AtomicI64::new(2),
-		}
+		Self { calls: Mutex::new(Vec::new()), concurrency_limit: AtomicI64::new(2) }
 	}
 }
 
@@ -80,7 +79,7 @@ impl BridgeHost for PreludeHost {
 }
 
 fn python() -> Arc<omp_py::Engine> {
-	super::super::tools::python_engine().expect("initialize embedded Python")
+	tools::python_engine().expect("initialize embedded Python")
 }
 
 fn run(py: Python<'_>, globals: &Bound<'_, PyDict>, source: String) -> PyResult<()> {
@@ -93,12 +92,12 @@ fn complete_prelude_persists_and_bridges_host_helpers() {
 	let root = tempdir().expect("temp root");
 	let artifacts = root.path().join("artifacts");
 	let local = root.path().join("local");
-	std::fs::create_dir_all(&artifacts).expect("artifacts directory");
-	std::fs::create_dir_all(&local).expect("local directory");
-	std::fs::write(artifacts.join("alpha.md"), "one\ntwo\nthree\n").expect("raw output fixture");
-	std::fs::write(artifacts.join("data.md"), r#"{"endpoints":[{"file":"src/a.rs"}]}"#)
+	fs::create_dir_all(&artifacts).expect("artifacts directory");
+	fs::create_dir_all(&local).expect("local directory");
+	fs::write(artifacts.join("alpha.md"), "one\ntwo\nthree\n").expect("raw output fixture");
+	fs::write(artifacts.join("data.md"), r#"{"endpoints":[{"file":"src/a.rs"}]}"#)
 		.expect("json output fixture");
-	std::fs::write(artifacts.join("ansi.md"), "\u{1b}[31mred\u{1b}[0m").expect("ansi fixture");
+	fs::write(artifacts.join("ansi.md"), "\u{1b}[31mred\u{1b}[0m").expect("ansi fixture");
 
 	let runtime = Runtime::new().expect("test runtime");
 	let dispatcher = BridgeDispatcher::new();

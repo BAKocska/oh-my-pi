@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
+	time,
 	time::Instant,
 };
 
@@ -148,7 +149,7 @@ impl Usage {
 		Self { used: 0, dropped: 0, started: now }
 	}
 
-	fn refresh(&mut self, window: Option<std::time::Duration>, now: Instant) {
+	fn refresh(&mut self, window: Option<time::Duration>, now: Instant) {
 		if window.is_some_and(|window| now.saturating_duration_since(self.started) >= window) {
 			self.used = 0;
 			self.started = now;

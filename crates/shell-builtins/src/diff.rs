@@ -8,7 +8,7 @@ use std::{
 	borrow::Cow,
 	collections::BTreeSet,
 	ffi::{OsStr, OsString},
-	fs,
+	fmt, fs, io,
 	io::{Read, Write},
 	ops::Range,
 	path::{Path, PathBuf},
@@ -292,7 +292,7 @@ fn classify(name: &Path, new_file: bool, host: &Host) -> Result<Operand, String>
 	match fs::metadata(&resolved) {
 		Ok(meta) if meta.is_dir() => Ok(Operand::Dir(resolved)),
 		Ok(_) => Ok(Operand::File(resolved)),
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound && new_file => Ok(Operand::Absent),
+		Err(err) if err.kind() == io::ErrorKind::NotFound && new_file => Ok(Operand::Absent),
 		Err(err) => Err(format!("{}: {}", name.display(), io_msg(&err))),
 	}
 }
@@ -417,7 +417,7 @@ fn is_suppressed(
 
 /// Writes one line to the builtin's stdout, mapping I/O failures like the
 /// rest of this module.
-fn wline(host: &mut Host, line: std::fmt::Arguments<'_>) -> Result<(), String> {
+fn wline(host: &mut Host, line: fmt::Arguments<'_>) -> Result<(), String> {
 	writeln!(host.stdout, "{line}").map_err(|e| io_msg(&e))
 }
 
@@ -893,7 +893,7 @@ fn is_binary(bytes: &[u8]) -> bool {
 }
 
 /// Renders an I/O error without Rust's ` (os error N)` suffix.
-fn io_msg(err: &std::io::Error) -> String {
+fn io_msg(err: &io::Error) -> String {
 	let msg = err.to_string();
 	match msg.find(" (os error") {
 		Some(idx) => msg[..idx].to_string(),

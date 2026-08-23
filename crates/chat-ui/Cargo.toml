@@ -32,3 +32,5 @@ strum = { workspace = true }
 thiserror = { workspace = true }
 xutf = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
+[dev-dependencies]
+proptest = { workspace = true }

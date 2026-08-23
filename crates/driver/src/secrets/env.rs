@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, env};
 
 use omp_secrets::rule::{SecretKind, SecretMode, SecretRule};
 
@@ -11,7 +11,7 @@ const CREDENTIAL_TERMS: &[&str] =
 /// Names and values stay in Core memory and are never included in extension
 /// declaration frames.
 pub fn collect_env_secret_rules() -> Vec<SecretRule> {
-	collect_env_secret_rules_from(std::env::vars())
+	collect_env_secret_rules_from(env::vars())
 }
 
 fn collect_env_secret_rules_from(

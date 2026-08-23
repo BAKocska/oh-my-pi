@@ -3,7 +3,10 @@
 mod rar4_decoder;
 mod rar5_decoder;
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{
+	io::{Read, Seek, SeekFrom, Write},
+	str,
+};
 
 use omp_core::Str;
 use xutf::Utf16Le;
@@ -338,7 +341,7 @@ fn parse_rar5_file(
 		return Err(Error::PathTooLong { actual: name_size, limit: limits.path_size });
 	}
 	let name_end = checked_slice_end(*cursor, name_size, extra_start, "RAR5 file name")?;
-	let raw_path = std::str::from_utf8(&header[*cursor..name_end])
+	let raw_path = str::from_utf8(&header[*cursor..name_end])
 		.map_err(|_| Error::InvalidArchive("invalid RAR5 UTF-8 member name"))?;
 	*cursor = name_end;
 	let mut link_target = None;
@@ -387,7 +390,7 @@ fn parse_rar5_file(
 			}
 			let target_end =
 				checked_slice_end(extra_cursor, target_size, record_end, "RAR5 link target")?;
-			let target = std::str::from_utf8(&header[extra_cursor..target_end])
+			let target = str::from_utf8(&header[extra_cursor..target_end])
 				.map_err(|_| Error::InvalidArchive("invalid RAR5 UTF-8 link target"))?;
 			link_target = Some(target.to_owned());
 		}

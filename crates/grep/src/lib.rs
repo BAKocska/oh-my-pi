@@ -7,10 +7,14 @@
 
 use std::{
 	borrow::Cow,
-	fmt,
+	convert, env, error,
+	fmt::{self, Display},
+	fs,
 	fs::File,
 	io::{self, Read},
+	iter,
 	path::{Path, PathBuf},
+	str,
 	sync::LazyLock,
 	time::{Duration, Instant},
 };
@@ -37,7 +41,7 @@ const FILE_CLASSIFICATION_READ_BYTES: u64 = MAX_FILE_BYTES + 1;
 /// `OMP_PCRE2_JIT=0` and `OMP_PCRE2_JIT=false` disable JIT. Any other non-empty
 /// value enables it. When unset, JIT is enabled except on macOS, where PCRE2's
 /// executable allocator is not reliable in every host process.
-static PCRE2_JIT_ENABLED: LazyLock<bool> = LazyLock::new(|| match std::env::var("OMP_PCRE2_JIT") {
+static PCRE2_JIT_ENABLED: LazyLock<bool> = LazyLock::new(|| match env::var("OMP_PCRE2_JIT") {
 	Ok(value) if !value.is_empty() => value != "0" && !value.eq_ignore_ascii_case("false"),
 	_ => !cfg!(target_os = "macos"),
 });
@@ -310,7 +314,7 @@ pub enum GrepStreamError<E> {
 	Sink(E),
 }
 
-impl<E: fmt::Display> fmt::Display for GrepStreamError<E> {
+impl<E: Display> Display for GrepStreamError<E> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Grep(error) => error.fmt(formatter),
@@ -319,11 +323,11 @@ impl<E: fmt::Display> fmt::Display for GrepStreamError<E> {
 	}
 }
 
-impl<E> std::error::Error for GrepStreamError<E>
+impl<E> error::Error for GrepStreamError<E>
 where
-	E: std::error::Error + 'static,
+	E: error::Error + 'static,
 {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		match self {
 			Self::Grep(error) => Some(error),
 			Self::Sink(error) => Some(error),
@@ -386,7 +390,7 @@ impl CompiledGrep {
 				});
 			},
 		}
-		let size_hint = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+		let size_hint = fs::metadata(path).ok().map(|metadata| metadata.len());
 		let mut buffer = Vec::new();
 		let mut skipped_oversized = 0;
 		let mut searched = false;
@@ -627,7 +631,7 @@ enum CompiledMatcherError {
 	Pcre2(grep_pcre2::Error),
 }
 
-impl fmt::Display for CompiledMatcherError {
+impl Display for CompiledMatcherError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Rust(error) => error.fmt(formatter),
@@ -703,7 +707,7 @@ pub fn grep_stream<S: GrepSink>(
 	let deadline = Deadline::new(options.timeout_ms);
 	deadline.check().map_err(GrepStreamError::Grep)?;
 	let target = resolve_search_path(options.path.as_str()).map_err(GrepStreamError::Grep)?;
-	let metadata = std::fs::metadata(&target)
+	let metadata = fs::metadata(&target)
 		.map_err(|_| GrepStreamError::Grep(GrepError::PathNotFound { path: options.path.clone() }))?;
 	let matcher = CompiledGrep::new(options.pattern.as_str(), RegexOptions {
 		ignore_case: options.ignore_case,
@@ -820,7 +824,7 @@ fn resolve_search_path(path: &str) -> Result<PathBuf, GrepError> {
 	if path.is_absolute() {
 		return Ok(path);
 	}
-	std::env::current_dir()
+	env::current_dir()
 		.map(|cwd| cwd.join(path))
 		.map_err(|error| GrepError::Walk { message: Str::from(error.to_string()) })
 }
@@ -872,7 +876,7 @@ fn normalize_recursive_glob(glob: &str) -> String {
 	let opens = pattern.bytes().filter(|byte| *byte == b'{').count();
 	let closes = pattern.bytes().filter(|byte| *byte == b'}').count();
 	if opens > closes {
-		pattern.extend(std::iter::repeat_n('}', opens - closes));
+		pattern.extend(iter::repeat_n('}', opens - closes));
 	}
 	pattern
 }
@@ -1101,7 +1105,7 @@ impl AggregateGrepCollector {
 }
 
 impl GrepSink for AggregateGrepCollector {
-	type Error = std::convert::Infallible;
+	type Error = convert::Infallible;
 
 	fn control(&mut self) -> Result<GrepControl, Self::Error> {
 		if self.max_count == Some(0) {
@@ -1270,7 +1274,7 @@ fn truncate_line(line: Str, max_columns: Option<usize>) -> (Str, bool) {
 }
 
 fn bytes_to_trimmed_str(bytes: &[u8]) -> Str {
-	match std::str::from_utf8(bytes) {
+	match str::from_utf8(bytes) {
 		Ok(text) => Str::new(text.trim_end()),
 		Err(_) => Str::new(String::from_utf8_lossy(bytes).trim_end()),
 	}
@@ -1287,7 +1291,7 @@ const fn clamp_u32(value: u64) -> u32 {
 #[cfg(test)]
 mod tests {
 	use std::{
-		fs,
+		fs, mem,
 		sync::atomic::{AtomicU64, Ordering},
 	};
 
@@ -1302,7 +1306,7 @@ mod tests {
 	impl TempDir {
 		fn new() -> Self {
 			static NEXT: AtomicU64 = AtomicU64::new(0);
-			let path = std::env::temp_dir().join(format!(
+			let path = env::temp_dir().join(format!(
 				"omp-grep-{}-{}",
 				std::process::id(),
 				NEXT.fetch_add(1, Ordering::Relaxed)
@@ -1326,7 +1330,7 @@ mod tests {
 	}
 
 	impl GrepSink for RecordingSink {
-		type Error = std::convert::Infallible;
+		type Error = convert::Infallible;
 
 		fn matched(&mut self, matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
 			self.records.push((
@@ -1347,7 +1351,7 @@ mod tests {
 	}
 
 	impl GrepSink for CountingSink {
-		type Error = std::convert::Infallible;
+		type Error = convert::Infallible;
 
 		fn matched(&mut self, _matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
 			self.matches += 1;
@@ -1506,7 +1510,7 @@ mod tests {
 	fn sink_stop_and_cancellation_are_distinct() {
 		struct StopSink;
 		impl GrepSink for StopSink {
-			type Error = std::convert::Infallible;
+			type Error = convert::Infallible;
 
 			fn matched(&mut self, _matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
 				Ok(GrepControl::Stop)
@@ -1517,7 +1521,7 @@ mod tests {
 			matches:    usize,
 		}
 		impl GrepSink for CancelSink {
-			type Error = std::convert::Infallible;
+			type Error = convert::Infallible;
 
 			fn control(&mut self) -> Result<GrepControl, Self::Error> {
 				self.heartbeats += 1;
@@ -1590,14 +1594,14 @@ mod tests {
 			content.extend_from_slice(b"x\n");
 		}
 		let mut sink = CountingSink::default();
-		let bytes_before = std::mem::size_of_val(&sink);
+		let bytes_before = mem::size_of_val(&sink);
 		let summary = CompiledGrep::new("x", RegexOptions::default())
 			.unwrap()
 			.search_slice("memory", &content, StreamOptions::default(), &mut sink)
 			.unwrap();
 		assert_eq!(sink.matches, 10_000);
 		assert_eq!(summary.matches, 10_000);
-		assert_eq!(std::mem::size_of_val(&sink), bytes_before);
+		assert_eq!(size_of_val(&sink), bytes_before);
 	}
 
 	#[test]

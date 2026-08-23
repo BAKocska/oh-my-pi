@@ -3,7 +3,10 @@ use std::io::Write;
 use clap::Parser;
 use itertools::Itertools;
 
-use crate::{ExecutionExitCode, ExecutionResult, builtins};
+use crate::{
+	Error, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions, builtins,
+	namedoptions::{ShellOptionKind, options},
+};
 
 /// Manage shopt-style options.
 #[derive(Parser)]
@@ -33,13 +36,13 @@ pub(crate) struct ShoptCommand {
 }
 
 impl builtins::Command for ShoptCommand {
-	type Error = crate::Error;
+	type Error = Error;
 
 	#[allow(clippy::too_many_lines, reason = "option handling is intentionally kept together")]
-	async fn execute<SE: crate::ShellExtensions>(
+	async fn execute<SE: ShellExtensions>(
 		&self,
-		context: crate::ExecutionContext<'_, SE>,
-	) -> Result<crate::ExecutionResult, Self::Error> {
+		context: ExecutionContext<'_, SE>,
+	) -> Result<ExecutionResult, Self::Error> {
 		if self.set && self.unset {
 			writeln!(context.stderr(), "cannot set and unset shell options simultaneously")?;
 			return Ok(ExecutionExitCode::InvalidUsage.into());
@@ -52,11 +55,11 @@ impl builtins::Command for ShoptCommand {
 
 			// Enumerate all options of the selected type.
 			let options = if self.set_o_names_only {
-				crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO)
+				options(ShellOptionKind::SetO)
 					.iter()
 					.sorted_by_key(|opt| opt.name)
 			} else {
-				crate::namedoptions::options(crate::namedoptions::ShellOptionKind::Shopt)
+				options(ShellOptionKind::Shopt)
 					.iter()
 					.sorted_by_key(|opt| opt.name)
 			};
@@ -91,11 +94,9 @@ impl builtins::Command for ShoptCommand {
 			// Enumerate only the specified options.
 			for option_name in &self.options {
 				let option_definition = if self.set_o_names_only {
-					crate::namedoptions::options(crate::namedoptions::ShellOptionKind::SetO)
-						.get(option_name.as_str())
+					options(ShellOptionKind::SetO).get(option_name.as_str())
 				} else {
-					crate::namedoptions::options(crate::namedoptions::ShellOptionKind::Shopt)
-						.get(option_name.as_str())
+					options(ShellOptionKind::Shopt).get(option_name.as_str())
 				};
 
 				if let Some(option_definition) = option_definition {

@@ -3,7 +3,8 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	fmt,
+	error,
+	fmt::{self, Display},
 	path::{Path, PathBuf},
 	str::FromStr,
 	sync::Arc,
@@ -19,7 +20,10 @@ use super::{
 	AccountRecord, CooldownReason, QuotaObservation, QuotaProvenance, QuotaState, QuotaWindowId,
 	RateObservation, RateState, RateWindowId,
 };
-use crate::id::{AccountId, PrincipalId};
+use crate::{
+	call::AccountRoutingContext,
+	id::{AccountId, OrganizationId, PrincipalId, ProjectId, RegionId, TenantId},
+};
 
 /// Identifies a durable affinity domain such as a conversation or workload.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -104,7 +108,7 @@ pub enum AccountStateStoreError {
 	IdentityConflict,
 }
 
-impl fmt::Display for AccountStateStoreError {
+impl Display for AccountStateStoreError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Database { .. } => formatter.write_str("account state database operation failed"),
@@ -117,7 +121,7 @@ impl fmt::Display for AccountStateStoreError {
 	}
 }
 
-impl std::error::Error for AccountStateStoreError {}
+impl error::Error for AccountStateStoreError {}
 
 impl From<rusqlite::Error> for AccountStateStoreError {
 	fn from(error: rusqlite::Error) -> Self {
@@ -284,14 +288,14 @@ impl AccountStateStore {
 				enabled,
 				credential_generation: u64::try_from(generation)
 					.map_err(|_| AccountStateStoreError::OutOfRange)?,
-				routing: crate::call::AccountRoutingContext {
+				routing: AccountRoutingContext {
 					account:               None,
 					principal:             None,
 					credential_generation: None,
-					project:               project.map(crate::id::ProjectId::new),
-					tenant:                tenant.map(crate::id::TenantId::new),
-					organization:          organization.map(crate::id::OrganizationId::new),
-					region:                region.map(crate::id::RegionId::new),
+					project:               project.map(ProjectId::new),
+					tenant:                tenant.map(TenantId::new),
+					organization:          organization.map(OrganizationId::new),
+					region:                region.map(RegionId::new),
 				},
 			});
 		}

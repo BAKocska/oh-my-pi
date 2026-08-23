@@ -14,7 +14,7 @@ use omp_agent::{
 	broker_now_ms,
 };
 use omp_core::{Point, PointSet, Str};
-use omp_proto::thread::v1::{self as thread, Item};
+use omp_proto::thread::v1::{self as thread, Item, item, part};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -65,9 +65,17 @@ impl AdvisorFallbackChain {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdvisorRetryDecision {
 	/// Attempt this selector immediately.
-	Attempt { selector: Str, attempt: u32 },
+	Attempt {
+		/// Provider/model selector chosen from the ordered fallback chain.
+		selector: Str,
+		/// One-based attempt number for this selector.
+		attempt:  u32,
+	},
 	/// Wait until the cooldown expires, then ask again.
-	Cooldown { until: Instant },
+	Cooldown {
+		/// Monotonic deadline after which another attempt may be selected.
+		until: Instant,
+	},
 	/// Quota is hard-latched until an explicit reset or credential refresh.
 	QuotaLatched,
 	/// Every retry and fallback candidate was exhausted.
@@ -386,9 +394,9 @@ fn advisor_item(advice: PendingAdvice) -> Item {
 	text.push_str(")]\n");
 	text.push_str(advice.note.as_str());
 	Item {
-		kind: Some(thread::item::Kind::Message(thread::Message {
+		kind: Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::System as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+			parts: vec![thread::Part { kind: Some(part::Kind::Text(text)) }],
 		})),
 		..Item::default()
 	}

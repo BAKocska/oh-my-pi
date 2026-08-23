@@ -41,8 +41,9 @@ pub(crate) fn sanitize_process_command(command: String) -> String {
 #[cfg(target_os = "linux")]
 mod proc_snapshot {
 	use std::{
-		fs,
+		borrow, fs,
 		os::fd::{AsRawFd, FromRawFd, OwnedFd},
+		ptr,
 		time::Duration,
 	};
 
@@ -237,13 +238,13 @@ mod proc_snapshot {
 		}
 
 		/// Returns the name used by `pgrep` and `pkill` matching.
-		pub fn match_name(&self) -> std::borrow::Cow<'_, str> {
-			std::borrow::Cow::Borrowed(&self.stat.comm)
+		pub fn match_name(&self) -> borrow::Cow<'_, str> {
+			borrow::Cow::Borrowed(&self.stat.comm)
 		}
 
 		/// Returns the command name shown by `ps` and `top`.
-		pub fn command_name(&self) -> std::borrow::Cow<'_, str> {
-			std::borrow::Cow::Borrowed(&self.stat.comm)
+		pub fn command_name(&self) -> borrow::Cow<'_, str> {
+			borrow::Cow::Borrowed(&self.stat.comm)
 		}
 
 		/// Reports whether the snapshotted process is still running.
@@ -268,7 +269,7 @@ mod proc_snapshot {
 				return false;
 			}
 			if let Some(value) = queue {
-				let mut value_arg = libc::sigval { sival_ptr: std::ptr::null_mut() };
+				let mut value_arg = libc::sigval { sival_ptr: ptr::null_mut() };
 				// SAFETY: sigval is a C union; writing its integer member initializes
 				// the bytes consumed by sigqueue while the remaining bytes stay zero.
 				unsafe {
@@ -282,7 +283,7 @@ mod proc_snapshot {
 					libc::SYS_pidfd_send_signal,
 					pidfd.as_raw_fd(),
 					signal,
-					std::ptr::null::<libc::siginfo_t>(),
+					ptr::null::<libc::siginfo_t>(),
 					0,
 				) == 0
 			}
@@ -380,8 +381,9 @@ mod proc_snapshot {
 #[cfg(target_os = "macos")]
 mod proc_snapshot {
 	use std::{
+		borrow,
 		ffi::CStr,
-		mem::size_of,
+		mem::{self, size_of},
 		path::Path,
 		ptr,
 		time::{Duration, SystemTime, UNIX_EPOCH},
@@ -556,7 +558,7 @@ mod proc_snapshot {
 		}
 
 		/// Returns the name used by `pgrep` and `pkill` matching.
-		pub fn match_name(&self) -> std::borrow::Cow<'_, str> {
+		pub fn match_name(&self) -> borrow::Cow<'_, str> {
 			self
 				.args
 				.first()
@@ -567,7 +569,7 @@ mod proc_snapshot {
 		}
 
 		/// Returns the command name shown by `ps` and `top`.
-		pub fn command_name(&self) -> std::borrow::Cow<'_, str> {
+		pub fn command_name(&self) -> borrow::Cow<'_, str> {
 			// SAFETY: pbi_comm is a kernel-filled fixed buffer with NUL termination.
 			unsafe { CStr::from_ptr(self.info.pbi_comm.as_ptr()) }.to_string_lossy()
 		}
@@ -621,7 +623,7 @@ mod proc_snapshot {
 			return None;
 		}
 		// SAFETY: proc_bsdinfo is a C integer record valid when zeroed.
-		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+		let mut info = unsafe { mem::zeroed::<libc::proc_bsdinfo>() };
 		// SAFETY: info is writable for the exact supplied size.
 		let actual = unsafe {
 			libc::proc_pidinfo(
@@ -637,7 +639,7 @@ mod proc_snapshot {
 
 	fn read_taskinfo(pid: i32) -> Option<libc::proc_taskinfo> {
 		// SAFETY: proc_taskinfo is a C integer record valid when zeroed.
-		let mut info = unsafe { std::mem::zeroed::<libc::proc_taskinfo>() };
+		let mut info = unsafe { mem::zeroed::<libc::proc_taskinfo>() };
 		// SAFETY: info is writable for the exact supplied size.
 		let actual = unsafe {
 			libc::proc_pidinfo(
@@ -709,7 +711,15 @@ mod proc_snapshot {
 }
 #[cfg(target_os = "windows")]
 mod proc_snapshot {
-	use std::{collections::HashMap, ffi::c_void, mem::size_of, sync::Arc, time::Duration};
+	use std::{
+		borrow,
+		collections::HashMap,
+		ffi::c_void,
+		mem::{self, size_of},
+		ptr, slice,
+		sync::Arc,
+		time::Duration,
+	};
 
 	use super::ProcessStatus;
 
@@ -890,7 +900,7 @@ mod proc_snapshot {
 
 		/// Returns the command-line arguments captured for the process.
 		pub fn args(&self) -> &[String] {
-			std::slice::from_ref(&self.command_line)
+			slice::from_ref(&self.command_line)
 		}
 
 		/// Returns the process group ID when available.
@@ -985,13 +995,13 @@ mod proc_snapshot {
 		}
 
 		/// Returns the name used by `pgrep` and `pkill` matching.
-		pub fn match_name(&self) -> std::borrow::Cow<'_, str> {
-			std::borrow::Cow::Borrowed(&self.name)
+		pub fn match_name(&self) -> borrow::Cow<'_, str> {
+			borrow::Cow::Borrowed(&self.name)
 		}
 
 		/// Returns the command name shown by `ps` and `top`.
-		pub fn command_name(&self) -> std::borrow::Cow<'_, str> {
-			std::borrow::Cow::Borrowed(&self.name)
+		pub fn command_name(&self) -> borrow::Cow<'_, str> {
+			borrow::Cow::Borrowed(&self.name)
 		}
 
 		/// Reports whether the snapshotted process is still running.
@@ -1059,7 +1069,7 @@ mod proc_snapshot {
 		}
 		let snapshot = OwnedHandle(snapshot);
 		// SAFETY: the all-zero entry is initialized with its ABI size below.
-		let mut entry = unsafe { std::mem::zeroed::<ProcessEntry32W>() };
+		let mut entry = unsafe { mem::zeroed::<ProcessEntry32W>() };
 		entry.size = size_of::<ProcessEntry32W>() as u32;
 		let mut result = Vec::new();
 		// SAFETY: snapshot and entry are valid.
@@ -1092,7 +1102,7 @@ mod proc_snapshot {
 			NtQueryInformationProcess(
 				handle,
 				PROCESS_COMMAND_LINE_INFORMATION,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 				0,
 				&raw mut bytes,
 			);
@@ -1129,7 +1139,7 @@ mod proc_snapshot {
 			return None;
 		}
 		// SAFETY: the validated range is aligned for UTF-16 within the query buffer.
-		let units = unsafe { std::slice::from_raw_parts(command.buffer, length / size_of::<u16>()) };
+		let units = unsafe { slice::from_raw_parts(command.buffer, length / size_of::<u16>()) };
 		Some(String::from_utf16_lossy(units)).filter(|command| !command.is_empty())
 	}
 
@@ -1151,7 +1161,7 @@ mod proc_snapshot {
 
 	fn process_memory(handle: Handle) -> Option<ProcessMemoryCounters> {
 		// SAFETY: the C record is valid when zeroed and cb is set before the call.
-		let mut counters = unsafe { std::mem::zeroed::<ProcessMemoryCounters>() };
+		let mut counters = unsafe { mem::zeroed::<ProcessMemoryCounters>() };
 		counters.cb = size_of::<ProcessMemoryCounters>() as u32;
 		// SAFETY: counters is writable for the supplied exact size.
 		let ok = unsafe {
@@ -1164,6 +1174,9 @@ mod proc_snapshot {
 		(ok != 0).then_some(counters)
 	}
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use std::process;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use proc_snapshot::ProcInfo;
@@ -1226,7 +1239,7 @@ impl HostProcesses {
 	/// `pkill` snapshots the table to select its targets; this spares it a
 	/// second.
 	pub fn resolve_in(all: &[ProcInfo]) -> Self {
-		let Ok(self_pid) = i32::try_from(std::process::id()) else {
+		let Ok(self_pid) = i32::try_from(process::id()) else {
 			return Self { pids: smallvec::SmallVec::new(), pgids: smallvec::SmallVec::new() };
 		};
 		Self::walk(self_pid, |pid| {
@@ -1286,6 +1299,8 @@ impl HostProcesses {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod tests {
+	use std::process;
+
 	use super::{ChainNode, HostProcesses, ProcInfo};
 
 	/// Builds a lookup over a synthetic `(pid, ppid, pgid, start)` tree.
@@ -1371,7 +1386,7 @@ mod tests {
 	fn chain_is_a_contiguous_parent_walk_over_observed_processes() {
 		let all = ProcInfo::all();
 		let host = HostProcesses::resolve_in(&all);
-		let self_pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+		let self_pid = i32::try_from(process::id()).expect("pid fits in i32");
 
 		assert_eq!(host.pids.first(), Some(&self_pid), "the chain must start at us");
 		for pair in host.pids.windows(2) {
@@ -1438,7 +1453,7 @@ mod tests {
 	/// free for reuse — is never carried forward.
 	#[test]
 	fn a_departed_parent_leaves_no_stale_pid() {
-		let self_pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+		let self_pid = i32::try_from(process::id()).expect("pid fits in i32");
 		let all = ProcInfo::all();
 		let recorded_parent = all
 			.iter()

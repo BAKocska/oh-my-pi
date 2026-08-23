@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use omp_core::encoding::{base32, base64};
 use thiserror::Error;
 
 /// Errors returned by a binary-to-text codec.
@@ -32,8 +33,8 @@ impl Codec {
 	/// Encodes `input` and appends it to `output`.
 	pub(crate) fn encode_into(self, input: &[u8], output: &mut VecDeque<u8>) {
 		match self {
-			Self::Base32 => output.extend(omp_core::encoding::base32::encode(input).into_vec()),
-			Self::Base64 => output.extend(omp_core::encoding::base64::encode(input).into_vec()),
+			Self::Base32 => output.extend(base32::encode(input).into_vec()),
+			Self::Base64 => output.extend(base64::encode(input).into_vec()),
 		}
 	}
 
@@ -45,7 +46,7 @@ impl Codec {
 	) -> Result<(), EncodingError> {
 		let original_len = output.len();
 		let result = match self {
-			Self::Base32 => omp_core::encoding::base32::decode(input)
+			Self::Base32 => base32::decode(input)
 				.extend_into(output)
 				.map(|_| ())
 				.map_err(|_| EncodingError::InvalidInput),
@@ -108,15 +109,15 @@ fn decode_concatenated_base64(input: &[u8], output: &mut Vec<u8>) -> Result<(), 
 			if segment_len > remaining.len() {
 				return Err(EncodingError::InvalidInput);
 			}
-			omp_core::encoding::base64::decode(&remaining[..segment_len])
+			base64::decode(&remaining[..segment_len])
 				.extend_into(output)
 				.map_err(|_| EncodingError::InvalidInput)?;
 			start += segment_len;
 		} else {
 			let decoder = if remaining.len().is_multiple_of(4) {
-				omp_core::encoding::base64::decode(remaining)
+				base64::decode(remaining)
 			} else {
-				omp_core::encoding::base64::decode_raw(remaining)
+				base64::decode_raw(remaining)
 			};
 			decoder
 				.extend_into(output)

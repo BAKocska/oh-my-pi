@@ -71,12 +71,15 @@ mod remote;
 #[cfg(target_os = "macos")]
 mod wk;
 
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
+use flume::Receiver;
 use omp_core::{IntoStr, Str};
 /// Re-exported so hosts don't need a direct dependency to hand windows over.
 pub use raw_window_handle;
 use raw_window_handle::HasWindowHandle;
+#[cfg(target_os = "macos")]
+use wk::frames::WkFrames;
 #[cfg(target_os = "macos")]
 pub use wk::request_screen_capture;
 
@@ -92,7 +95,7 @@ pub use crate::{
 use crate::{
 	event::SharedState,
 	options::PageOptions,
-	remote::{Command, RemoteView},
+	remote::{Command, RemoteView, chromium, firefox},
 };
 
 /// A concrete engine choice for [`WebViewBuilder::new`].
@@ -154,7 +157,7 @@ impl Engine {
 			#[cfg(not(target_os = "macos"))]
 			return Err(Error::NoEngine(surface));
 		}
-		if let Some(path) = std::env::var_os("OMP_WEBVIEW_BROWSER") {
+		if let Some(path) = env::var_os("OMP_WEBVIEW_BROWSER") {
 			if path == "system" {
 				#[cfg(target_os = "macos")]
 				return Ok(Self::System);
@@ -313,17 +316,17 @@ impl WebViewBuilder {
 	pub fn build_frames(self, config: FrameConfig) -> Result<WebView> {
 		let engine = self.engine.kind();
 		let (view, events, state) = match self.engine {
-			Engine::Chromium { binary } => remote::spawn(self.page, move |ctx| {
-				remote::chromium::drive_frames(binary, config, ctx)
-			})?,
+			Engine::Chromium { binary } => {
+				remote::spawn(self.page, move |ctx| chromium::drive_frames(binary, config, ctx))?
+			},
 			Engine::Firefox { binary } => {
-				remote::spawn(self.page, move |ctx| remote::firefox::drive_frames(binary, config, ctx))?
+				remote::spawn(self.page, move |ctx| firefox::drive_frames(binary, config, ctx))?
 			},
 			#[cfg(target_os = "macos")]
 			Engine::System => {
 				let (events_tx, events) = flume::unbounded();
 				let state = SharedState::default();
-				let view = wk::frames::WkFrames::create(&self.page, config, events_tx, state.clone())?;
+				let view = WkFrames::create(&self.page, config, events_tx, state.clone())?;
 				return Ok(WebView {
 					inner: Inner::WkFrames(view),
 					events,
@@ -351,11 +354,11 @@ impl WebViewBuilder {
 	pub fn build_window(self, config: WindowConfig) -> Result<WebView> {
 		let engine = self.engine.kind();
 		let (view, events, state) = match self.engine {
-			Engine::Chromium { binary } => remote::spawn(self.page, move |ctx| {
-				remote::chromium::drive_window(binary, config, ctx)
-			})?,
+			Engine::Chromium { binary } => {
+				remote::spawn(self.page, move |ctx| chromium::drive_window(binary, config, ctx))?
+			},
 			Engine::Firefox { binary } => {
-				remote::spawn(self.page, move |ctx| remote::firefox::drive_window(binary, config, ctx))?
+				remote::spawn(self.page, move |ctx| firefox::drive_window(binary, config, ctx))?
 			},
 			#[cfg(target_os = "macos")]
 			Engine::System => {
@@ -376,7 +379,7 @@ enum Inner {
 	#[cfg(target_os = "macos")]
 	Wk(wk::WkView),
 	#[cfg(target_os = "macos")]
-	WkFrames(wk::frames::WkFrames),
+	WkFrames(WkFrames),
 	Remote(RemoteView),
 }
 
@@ -390,7 +393,7 @@ enum Inner {
 /// consumed from any thread regardless of engine.
 pub struct WebView {
 	inner:   Inner,
-	events:  flume::Receiver<WebViewEvent>,
+	events:  Receiver<WebViewEvent>,
 	state:   SharedState,
 	engine:  EngineKind,
 	surface: SurfaceKind,
@@ -561,7 +564,7 @@ impl WebView {
 	}
 
 	/// Event stream; clone the receiver to consume from another thread.
-	pub const fn events(&self) -> &flume::Receiver<WebViewEvent> {
+	pub const fn events(&self) -> &Receiver<WebViewEvent> {
 		&self.events
 	}
 

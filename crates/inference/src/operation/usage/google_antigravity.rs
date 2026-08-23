@@ -14,6 +14,7 @@ use http::{
 use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::time;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -21,7 +22,7 @@ use crate::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageStatus, UsageUnit, UsageWindow,
 		UsageWindowKind,
 	},
-	auth::{OAuthHttpClient, OAuthHttpRequest},
+	auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse as AuthOAuthHttpResponse},
 	catalog::ProviderId,
 	codec::google_cca::{
 		DEFAULT_ANTIGRAVITY_ARCH, DEFAULT_ANTIGRAVITY_CL, DEFAULT_ANTIGRAVITY_OS,
@@ -232,9 +233,9 @@ async fn execute(
 	http: &dyn OAuthHttpClient,
 	request: OAuthHttpRequest,
 	deadline: Option<Instant>,
-) -> Option<crate::auth::OAuthHttpResponse> {
+) -> Option<AuthOAuthHttpResponse> {
 	match deadline {
-		Some(deadline) => tokio::time::timeout_at(deadline.into(), http.execute(request))
+		Some(deadline) => time::timeout_at(deadline.into(), http.execute(request))
 			.await
 			.ok()?
 			.ok(),

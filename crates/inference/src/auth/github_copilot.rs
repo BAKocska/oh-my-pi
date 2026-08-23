@@ -24,6 +24,7 @@ use omp_catalog::ProviderId;
 use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use parking_lot::Mutex;
 use serde::Deserialize;
+use tokio::time;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -304,7 +305,7 @@ impl GithubCopilotShaper {
 			let remaining = probe_duration(deadline);
 			return Either::Right(CopilotProbeFuture::new(
 				async move {
-					let discovered = tokio::time::timeout(
+					let discovered = time::timeout(
 						remaining,
 						discover_copilot_api_endpoint(access_token.expose_secret(), self.http.as_ref()),
 					)
@@ -338,13 +339,11 @@ impl GithubCopilotShaper {
 		let remaining = probe_duration(deadline);
 		Either::Right(CopilotProbeFuture::new(
 			async move {
-				let discovered = tokio::time::timeout(
-					remaining,
-					discover_copilot_api_endpoint(token, self.http.as_ref()),
-				)
-				.await
-				.ok()
-				.flatten();
+				let discovered =
+					time::timeout(remaining, discover_copilot_api_endpoint(token, self.http.as_ref()))
+						.await
+						.ok()
+						.flatten();
 				if let Some(endpoint) = &discovered {
 					self.endpoints.lock().insert(hash, endpoint.clone());
 				}

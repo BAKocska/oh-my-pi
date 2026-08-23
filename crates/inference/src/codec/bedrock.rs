@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	str,
 	sync::Arc,
 	time::Duration,
 };
@@ -15,6 +16,7 @@ use omp_catalog::{
 use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, value::RawValue};
+use url::Url;
 
 use crate::{
 	body::BodySource,
@@ -751,7 +753,7 @@ fn proof_text(proof: &ProviderProof, context: &EncodeContext<'_>) -> Result<Str,
 	if proof.provider != context.route.provider || proof.codec != context.route.codec {
 		return Err(encoding_error(ErrorKind::CodecMismatch, "bedrock.proof.scope_mismatch"));
 	}
-	std::str::from_utf8(&proof.value)
+	str::from_utf8(&proof.value)
 		.map(Str::new)
 		.map_err(|_| encoding_error(ErrorKind::InvalidRequest, "bedrock.proof.not_utf8"))
 }
@@ -1118,7 +1120,7 @@ fn bedrock_discovery_endpoint(base: &str, region: &str) -> Result<Str, Error> {
 	let expanded = base
 		.replace(REGION_PLACEHOLDER, region)
 		.replace(LOCATION_PLACEHOLDER, region);
-	let mut uri = url::Url::parse(&expanded).map_err(|_| {
+	let mut uri = Url::parse(&expanded).map_err(|_| {
 		encoding_error(ErrorKind::InvalidRequest, "bedrock.discovery.endpoint_invalid")
 	})?;
 	let host = uri.host_str().ok_or_else(|| {
@@ -1415,7 +1417,7 @@ impl BedrockDecoder {
 	) {
 		let exception = serde_json::from_slice::<WireException>(payload).unwrap_or_default();
 		let payload_message = (!payload.is_empty())
-			.then(|| std::str::from_utf8(payload).ok().map(Str::new))
+			.then(|| str::from_utf8(payload).ok().map(Str::new))
 			.flatten();
 		let message = exception
 			.message

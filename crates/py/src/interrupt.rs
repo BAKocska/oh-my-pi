@@ -1,6 +1,9 @@
 //! `CPython` async interruption shared by embedded Python hosts.
 
-use std::ffi::{c_long, c_ulong};
+use std::{
+	ffi::{c_long, c_ulong},
+	ptr,
+};
 
 use pyo3::{Python, ffi};
 
@@ -29,7 +32,7 @@ pub fn interrupt(_py: Python<'_>, thread_id: u64) -> bool {
 	let changed = unsafe { ffi::PyThreadState_SetAsyncExc(id, ffi::PyExc_KeyboardInterrupt) };
 	if changed > 1 {
 		// SAFETY: clears only the ambiguous exception set directly above.
-		unsafe { ffi::PyThreadState_SetAsyncExc(id, std::ptr::null_mut()) };
+		unsafe { ffi::PyThreadState_SetAsyncExc(id, ptr::null_mut()) };
 	}
 	changed == 1
 }

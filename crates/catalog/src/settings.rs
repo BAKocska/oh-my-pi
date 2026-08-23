@@ -2,7 +2,7 @@
 
 #![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync, time::Duration};
 
 use omp_core::Str;
 use omp_settings::{
@@ -14,7 +14,8 @@ use strum::{Display, EnumString, IntoStaticStr};
 use crate::{
 	capability::{ProviderFamily, ServiceTier, TierAudience},
 	id::WireModelId,
-	thinking::ThinkingEffort,
+	provider::TransportKind,
+	thinking::{ThinkingEffort, ThinkingPolicy},
 };
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
@@ -252,7 +253,7 @@ pub struct ModelSettings {
 }
 
 /// Clone-cheap provider priority sequence.
-pub type ArcStrList = std::sync::Arc<[Str]>;
+pub type ArcStrList = sync::Arc<[Str]>;
 
 impl Default for ModelSettings {
 	fn default() -> Self {
@@ -260,7 +261,7 @@ impl Default for ModelSettings {
 			default_thinking:         ThinkingEffort::Medium,
 			thinking_ceiling:         ThinkingEffort::Max,
 			thinking_budgets:         ThinkingBudgets::default(),
-			provider_order:           std::sync::Arc::from([]),
+			provider_order:           sync::Arc::from([]),
 			tier_openai:              TierSetting::None,
 			tier_anthropic:           TierSetting::None,
 			tier_google:              TierSetting::None,
@@ -282,7 +283,7 @@ impl Default for ModelSettings {
 impl ModelSettings {
 	/// Applies configured effort budgets and the configured default to one model
 	/// policy.
-	pub fn apply_thinking_policy(&self, policy: &mut crate::thinking::ThinkingPolicy) {
+	pub fn apply_thinking_policy(&self, policy: &mut ThinkingPolicy) {
 		policy.default_level = Some(self.default_thinking)
 			.filter(|effort| *effort != ThinkingEffort::Off && policy.efforts.contains(effort));
 		for effort in policy.efforts.iter().copied() {
@@ -343,18 +344,13 @@ impl ModelSettings {
 	}
 
 	/// Reports whether a concrete route satisfies configured wire preferences.
-	pub fn wire_route_allowed(
-		&self,
-		provider: &str,
-		codec: &str,
-		transport: crate::provider::TransportKind,
-	) -> bool {
+	pub fn wire_route_allowed(&self, provider: &str, codec: &str, transport: TransportKind) -> bool {
 		let openai_route = provider.contains("openai") || provider.contains("codex");
 		let websocket_allowed = !openai_route
 			|| match self.openai_websockets {
 				WireToggle::Auto => true,
-				WireToggle::Off => transport != crate::provider::TransportKind::Websocket,
-				WireToggle::On => transport == crate::provider::TransportKind::Websocket,
+				WireToggle::Off => transport != TransportKind::Websocket,
+				WireToggle::On => transport == TransportKind::Websocket,
 			};
 		let kimi_route = provider.contains("kimi") || provider.contains("moonshot");
 		let kimi_allowed = !kimi_route

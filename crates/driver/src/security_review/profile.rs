@@ -1,6 +1,8 @@
 //! Canonical restricted local security-reviewer registration.
 
-use omp_agent::{AgentDefinition, SECURITY_REVIEW_INSTRUCTION_V1, SpawnPolicy};
+use omp_agent::{
+	AgentDefinition, SECURITY_REVIEW_INSTRUCTION_V1, SpawnPolicy, prompt_assets::PromptAssetId,
+};
 use omp_core::Str;
 
 use super::model::strict_result_schema;
@@ -23,9 +25,7 @@ readSummarize: false
 /// after discovery so project, extension, and user declarations cannot widen
 /// its authority.
 pub fn definition() -> AgentDefinition {
-	let role = omp_agent::prompt_assets::prompt_asset(
-		omp_agent::prompt_assets::PromptAssetId::AgentSecurityReviewer,
-	);
+	let role = omp_agent::prompt_assets::prompt_asset(PromptAssetId::AgentSecurityReviewer);
 	let mut markdown = String::with_capacity(
 		FRONTMATTER.len() + SECURITY_REVIEW_INSTRUCTION_V1.len() + role.content.len() + 2,
 	);

@@ -7,7 +7,7 @@
 //! text-to-speech, and live voice; provider transports and model inference
 //! remain outside this crate.
 
-use std::{io, sync::Arc};
+use std::{io, result, sync::Arc};
 
 use strum::{Display, IntoStaticStr};
 use thiserror::Error;
@@ -111,4 +111,4 @@ impl From<String> for VoiceError {
 }
 
 /// Result type for voice audio operations.
-pub type VoiceResult<T> = std::result::Result<T, VoiceError>;
+pub type VoiceResult<T> = result::Result<T, VoiceError>;

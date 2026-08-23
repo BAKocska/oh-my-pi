@@ -6,10 +6,11 @@ use crate::{
 	catalog::OperationKind,
 	codec::{
 		Codec, DecodeContext, DecoderState, EncodeContext, EncodedRequest, RealtimeWireCodecState,
-		openai_chat::OpenAiChatCodec, openai_media::OpenAiMediaCodec,
+		openai_chat::OpenAiChatCodec, openai_media::OpenAiMediaCodec, openai_realtime,
 		openai_realtime::OpenAiRealtimeWireCodec,
 	},
-	error::Error,
+	error::{Error, ErrorKind, ErrorPhase, RetryAction},
+	receipt::ExecutionReceipt,
 };
 
 /// One operation-dispatching codec for routes using the OpenAI-compatible
@@ -31,11 +32,11 @@ impl Codec for OpenAiCodec {
 			OperationCall::GenerateImage(_)
 			| OperationCall::Speak(_)
 			| OperationCall::Transcribe(_) => self.media.encode(context, operation),
-			OperationCall::Realtime(_) => Err(crate::error::Error::new(
-				crate::error::ErrorKind::InternalInvariant,
-				crate::error::ErrorPhase::Encoding,
-				crate::error::RetryAction::Never,
-				crate::receipt::ExecutionReceipt::default(),
+			OperationCall::Realtime(_) => Err(Error::new(
+				ErrorKind::InternalInvariant,
+				ErrorPhase::Encoding,
+				RetryAction::Never,
+				ExecutionReceipt::default(),
 			)),
 			_ => self.chat.encode(context, operation),
 		}
@@ -53,15 +54,15 @@ impl Codec for OpenAiCodec {
 			.target
 			.filter(|_| context.policy_model.is_some())
 			.ok_or_else(|| {
-				crate::error::Error::new(
-					crate::error::ErrorKind::InvalidRequest,
-					crate::error::ErrorPhase::Encoding,
-					crate::error::RetryAction::Never,
-					crate::receipt::ExecutionReceipt::default(),
+				Error::new(
+					ErrorKind::InvalidRequest,
+					ErrorPhase::Encoding,
+					RetryAction::Never,
+					ExecutionReceipt::default(),
 				)
 			})?;
 		let maximum_frame_bytes = self.chat.maximum_frame_bytes(context.policy);
-		crate::codec::openai_realtime::encode_handshake(
+		openai_realtime::encode_handshake(
 			target.endpoint.base_url.as_str(),
 			target.wire_model.as_str(),
 			maximum_frame_bytes,
@@ -74,11 +75,11 @@ impl Codec for OpenAiCodec {
 			OperationKind::GenerateImage | OperationKind::Speak | OperationKind::Transcribe => {
 				self.media.decoder(context)
 			},
-			OperationKind::Realtime => Err(crate::error::Error::new(
-				crate::error::ErrorKind::InternalInvariant,
-				crate::error::ErrorPhase::Encoding,
-				crate::error::RetryAction::Never,
-				crate::receipt::ExecutionReceipt::default(),
+			OperationKind::Realtime => Err(Error::new(
+				ErrorKind::InternalInvariant,
+				ErrorPhase::Encoding,
+				RetryAction::Never,
+				ExecutionReceipt::default(),
 			)),
 			_ => self.chat.decoder(context),
 		}

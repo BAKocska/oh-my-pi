@@ -1,3 +1,6 @@
+//! Proves supervisor ownership, cancellation, admission limits, and
+//! cross-session agent visibility.
+
 use std::{
 	sync::{
 		Arc,
@@ -16,6 +19,7 @@ use omp_driver::subagent::supervisor::{
 	ChildReviver, RevivalFuture, SessionSupervisor, SupervisorError,
 };
 use omp_inference::TurnId;
+use tokio::task;
 
 #[derive(Clone)]
 struct NeverTurnClient;
@@ -141,7 +145,7 @@ async fn limits_are_a_coherent_live_admission_snapshot() {
 		if tree.limits().queued == 1 {
 			break;
 		}
-		tokio::task::yield_now().await;
+		task::yield_now().await;
 	}
 	let limits = tree.limits();
 	assert_eq!(limits.max_depth, 7);
