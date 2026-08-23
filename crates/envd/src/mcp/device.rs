@@ -1,7 +1,11 @@
 //! Deterministic projection of one MCP server beneath a dynamic device
 //! namespace.
 
-use std::{collections::BTreeMap, str, sync::Arc};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	str,
+	sync::Arc,
+};
 
 use bytes::Bytes;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -90,19 +94,21 @@ fn compile_globs(patterns: &[Str]) -> Result<GlobSet, DeviceError> {
 /// One server's live definitions ready for revisioned registry publication.
 pub struct McpDeviceDefinitions {
 	/// Server name used as the dynamic device namespace.
-	pub server:       Str,
+	pub server:           Str,
 	/// Advertised tools in server order.
-	pub tools:        Vec<Value>,
+	pub tools:            Vec<Value>,
 	/// Advertised concrete resources.
-	pub resources:    Vec<ResourceDefinition>,
+	pub resources:        Vec<ResourceDefinition>,
 	/// Advertised resource templates.
-	pub templates:    Vec<ResourceTemplate>,
+	pub templates:        Vec<ResourceTemplate>,
 	/// Advertised prompts.
-	pub prompts:      Vec<PromptDefinition>,
+	pub prompts:          Vec<PromptDefinition>,
 	/// Bounded server instructions used as device documentation.
-	pub instructions: Option<Str>,
+	pub instructions:     Option<Str>,
+	/// Native-covered tool names excluded from the generic MCP device.
+	pub suppressed_tools: BTreeSet<Str>,
 	/// Extension-declared endpoint projection and device policy.
-	pub projection:   Arc<McpDeviceProjection>,
+	pub projection:       Arc<McpDeviceProjection>,
 }
 
 impl McpDeviceDefinitions {
@@ -125,7 +131,7 @@ impl McpDeviceDefinitions {
 				.get("name")
 				.and_then(Value::as_str)
 				.ok_or(DeviceError::MalformedDefinition)?;
-			if !self.projection.includes(name) {
+			if self.suppressed_tools.contains(name) || !self.projection.includes(name) {
 				continue;
 			}
 			let device_name = self

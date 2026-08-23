@@ -158,6 +158,7 @@ impl GitRunner {
 			.await
 	}
 
+	#[cfg(test)]
 	pub(super) async fn run_binary(
 		&self,
 		cwd: &Path,

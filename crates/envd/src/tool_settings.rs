@@ -10,7 +10,9 @@ use omp_tool::Effects;
 use omp_tools::edit::FormatPolicy;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use super::admission::{ApprovalMode, ApprovalPolicy, ResolvedApproval, resolve_approval};
+/// Runtime posture for automatic tool-admission decisions.
+pub use super::admission::ApprovalMode;
+use super::admission::{ApprovalPolicy, ResolvedApproval, resolve_approval};
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 const APPROVAL_MODES: &[&str] = &["always-ask", "write", "yolo"];
@@ -106,6 +108,18 @@ impl Default for ToolSettings {
 }
 
 impl ToolSettings {
+	/// Returns a session-local copy with an explicit approval-mode override.
+	///
+	/// The source settings are unchanged, so callers can apply an invocation
+	/// override without persisting it.
+	#[must_use]
+	pub fn with_approval_mode_override(mut self, approval_mode: Option<ApprovalMode>) -> Self {
+		if let Some(approval_mode) = approval_mode {
+			self.approval_mode = approval_mode;
+		}
+		self
+	}
+
 	/// Whether a named tool is available after applying the default-enabled
 	/// rule.
 	pub fn enabled(&self, name: &str) -> bool {
@@ -381,6 +395,35 @@ mod tests {
 		assert_eq!(decision.tier, ApprovalTier::Exec);
 		assert_eq!(decision.policy, ApprovalPolicy::Deny);
 		assert_eq!(decision.source, ApprovalSource::User);
+	}
+
+	#[test]
+	fn approval_mode_override_is_session_local_and_precedes_persisted_mode() {
+		let persisted =
+			ToolSettings { approval_mode: ApprovalMode::AlwaysAsk, ..ToolSettings::default() };
+		let effects = Effects {
+			exec: Some(ExecEffects { commands: [sf!("*")].into(), network: true }),
+			..Effects::empty()
+		};
+
+		let overridden = persisted
+			.clone()
+			.with_approval_mode_override(Some(ApprovalMode::Yolo));
+		assert_eq!(
+			overridden
+				.approval_for("override", "shell", &effects)
+				.policy,
+			ApprovalPolicy::Allow
+		);
+		assert_eq!(
+			persisted
+				.approval_for("persisted", "shell", &effects)
+				.policy,
+			ApprovalPolicy::Prompt
+		);
+
+		let unchanged = persisted.clone().with_approval_mode_override(None);
+		assert_eq!(unchanged, persisted);
 	}
 
 	#[test]

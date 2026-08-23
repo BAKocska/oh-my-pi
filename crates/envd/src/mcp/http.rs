@@ -479,6 +479,10 @@ impl StreamableHttpTransport {
 }
 
 impl McpTransport for StreamableHttpTransport {
+	fn set_protocol_version(&self, revision: Str) {
+		Self::set_protocol_version(self, revision);
+	}
+
 	fn request<'a>(
 		&'a self,
 		method: &'a str,

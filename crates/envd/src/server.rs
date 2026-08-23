@@ -159,8 +159,7 @@ use crate::{
 	},
 	tools::{
 		DeviceCatalogObserver, DeviceControlFactory, DeviceInvocationAdmission,
-		DynamicDeviceCatalogEntry, HookControlFactory, HookEventPolicy, HookFailurePolicy,
-		RegistryControlFactory,
+		DynamicDeviceCatalogEntry, HookControlFactory, RegistryControlFactory,
 	},
 	worker::AgentsControlAuthorityBinding,
 };
@@ -732,6 +731,7 @@ struct ProductionControlBindings {
 	resources: Arc<sync::OnceLock<Arc<ProductionResolverTable>>>,
 	callbacks: Arc<CallbackDispatcherSlot>,
 	registry:  Arc<RegistryControlFactory>,
+	hooks:     Arc<HookControlFactory>,
 }
 
 struct WeakExtensionCallbackDispatcher {
@@ -1673,21 +1673,9 @@ fn production_control_authorities(
 		Arc::new(ProductionDeviceCatalogObserver),
 		Arc::new(ProductionDeviceInvocationAdmission),
 	);
-	let hook_policies = extensions
-		.iter()
-		.flat_map(|extension| extension.manifest.declarations.hooks())
-		.map(|hook| {
-			(hook.event.clone(), HookEventPolicy {
-				revision:    1,
-				timeout:     Duration::from_secs(30),
-				on_failure:  HookFailurePolicy::Defer,
-				default:     serde_json::Value::Null,
-				composition: BTreeMap::new(),
-			})
-		})
-		.collect();
-	let hooks: Arc<dyn ControlAuthorityFactory> =
-		HookControlFactory::new(Arc::clone(&registry_owner), callbacks.clone(), hook_policies);
+	let hooks =
+		HookControlFactory::new(Arc::clone(&registry_owner), callbacks.clone(), BTreeMap::new());
+	let hooks_factory: Arc<dyn ControlAuthorityFactory> = hooks.clone();
 	let registry_factory: Arc<dyn ControlAuthorityFactory> = registry_owner.clone();
 	let envd: Arc<dyn ControlAuthorityFactory> = Arc::new(ProductionEnvdControlFactory {
 		state_dir:  state_dir.to_path_buf(),
@@ -1699,7 +1687,7 @@ fn production_control_authorities(
 		registry:   Arc::clone(&registry_owner),
 		resources:  Arc::clone(&resources),
 	});
-	let registry = RegistryControlAuthorities::new(registry_factory, devices, hooks);
+	let registry = RegistryControlAuthorities::new(registry_factory, devices, hooks_factory);
 	let provenances = Arc::new(
 		extensions
 			.iter()
@@ -1768,6 +1756,7 @@ fn production_control_authorities(
 		resources,
 		callbacks,
 		registry: registry_owner,
+		hooks,
 	}
 }
 
@@ -1782,7 +1771,7 @@ pub struct EnvServer {
 	http_egress:         HttpEgressHost,
 	workspace:           WorkspaceHost,
 	mcp:                 Arc<McpService>,
-	_mcp_manager:        Arc<McpManager>,
+	mcp_manager:         Arc<McpManager>,
 	host_info:           HostInfoHost,
 	workspace_roots:     WorkspaceRootHost,
 	lsp_settings:        LspSettings,
@@ -2130,7 +2119,7 @@ impl EnvServer {
 			http_egress: HttpEgressHost::new(),
 			workspace,
 			mcp,
-			_mcp_manager: mcp_manager,
+			mcp_manager,
 			host_info,
 			workspace_roots,
 			lsp_settings,
@@ -2244,6 +2233,7 @@ impl EnvServer {
 		);
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
+		ext_host_config.bind_hook_control(Arc::clone(&control_bindings.hooks));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		control_bindings
 			.callbacks
@@ -2350,6 +2340,11 @@ impl EnvServer {
 	}
 
 	/// Opens project resources through the owner-local document authority.
+	///
+	/// Only the daemon composition (`doc_connections` present) owns durable
+	/// process metadata; app compositions keep in-memory process state and
+	/// leave detached-process recovery to the daemon. An approval-mode override
+	/// affects only this composition's in-memory tool settings.
 	#[cfg(any(unix, windows))]
 	pub async fn open_project(
 		root: &Path,
@@ -2358,6 +2353,7 @@ impl EnvServer {
 		registry: Registry,
 		mut ext_host_config: ExtHostConfig,
 		doc_connections: Option<watch::Sender<usize>>,
+		approval_mode: Option<super::tool_settings::ApprovalMode>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
@@ -2381,9 +2377,13 @@ impl EnvServer {
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
-		let exec = ExecHost::new()
-			.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
-			.with_github_cache(Arc::clone(&github_cache));
+		let exec = if doc_connections.is_some() {
+			ExecHost::new()
+				.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
+		} else {
+			ExecHost::new()
+		}
+		.with_github_cache(Arc::clone(&github_cache));
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let telemetry = Arc::new(
 			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
@@ -2417,6 +2417,7 @@ impl EnvServer {
 		);
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
+		ext_host_config.bind_hook_control(Arc::clone(&control_bindings.hooks));
 		let ext_hosts = Arc::new(ExtHostSupervisor::spawn(ext_host_config).await?);
 		control_bindings
 			.callbacks
@@ -2426,8 +2427,11 @@ impl EnvServer {
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
 		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
-		let (host_settings, shell_settings, acp_settings) =
+		let (mut host_settings, shell_settings, acp_settings) =
 			execution_settings(state_dir, workspace.root())?;
+		host_settings.tools = host_settings
+			.tools
+			.with_approval_mode_override(approval_mode);
 		let workspace_ops = WorkspaceOperations::open(
 			workspace.clone(),
 			documents.clone(),
@@ -2629,6 +2633,11 @@ impl EnvServer {
 		identity: &ControlConnectionIdentity,
 	) -> Option<Arc<SealedRegistryEvidence>> {
 		self.ext_hosts.sealed_registry_evidence(identity)
+	}
+
+	/// Returns the session-owned MCP manager for late bridge injection.
+	pub(crate) const fn mcp_manager(&self) -> &Arc<McpManager> {
+		&self.mcp_manager
 	}
 
 	/// Constructs one generation-fenced MCP CONTROL resolver for a host
@@ -9355,6 +9364,7 @@ pub async fn run_with_registry(
 			registry,
 			ext_host_config,
 			Some(doc_connections),
+			None,
 			bridges,
 		)
 		.await?,

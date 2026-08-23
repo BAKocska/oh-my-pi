@@ -101,26 +101,39 @@ tokio::task_local! {
 /// Composition-supplied capabilities the environment host cannot own.
 #[derive(Default)]
 pub struct RegistryBridges {
+	/// Constructs the command-backed credential executor after the environment
+	/// client is available.
+	pub command_credentials: Option<Arc<dyn CommandCredentialExecutorFactory>>,
 	/// Extra device tools registered verbatim by the composition layer.
-	pub dynamic_tools:    Vec<DynamicTool>,
+	pub dynamic_tools:       Vec<DynamicTool>,
 	/// Internal-URL resolvers installed into the read resolver table.
-	pub url_resolvers:    Vec<Arc<dyn ContentResolver>>,
+	pub url_resolvers:       Vec<Arc<dyn ContentResolver>>,
 	/// Campaign/goal authority backing the `goal` tool.
-	pub goal_control:     Option<Arc<dyn GoalAuthority>>,
+	pub goal_control:        Option<Arc<dyn GoalAuthority>>,
 	/// Auxiliary inference used by workspace search and media tools.
-	pub search:           Option<Arc<dyn SearchInference>>,
+	pub search:              Option<Arc<dyn SearchInference>>,
 	/// Host-resource broker used by composition-owned internal resource URLs.
-	pub host_resources:   Option<Arc<dyn HostResources>>,
+	pub host_resources:      Option<Arc<dyn HostResources>>,
 	/// Background telemetry delivery started once credentials exist.
-	pub telemetry_upload: Option<Arc<dyn TelemetryUpload>>,
+	pub telemetry_upload:    Option<Arc<dyn TelemetryUpload>>,
 	/// Fallback presenter for interactive `ask` invocations.
 	///
 	/// The daemon defaults to [`omp_tools::ask::HeadlessPresenter`]; an
 	/// interactive composition supplies its own terminal presenter, and a live
 	/// session may rebind one later through `bind_ask_presenter`.
-	pub ask_presenter:    Option<Arc<dyn omp_tools::ask::AskPresenter>>,
+	pub ask_presenter:       Option<Arc<dyn omp_tools::ask::AskPresenter>>,
 	/// Plain data: active project content and native roots.
-	pub content:          ActiveContentInputs,
+	pub content:             ActiveContentInputs,
+}
+
+/// Builds the command credential executor from the live Environment client.
+pub trait CommandCredentialExecutorFactory: Send + Sync + 'static {
+	/// Creates one executor rooted at the active project workspace.
+	fn make(
+		&self,
+		client: omp_env::EnvClient,
+		cwd: &Path,
+	) -> Arc<dyn omp_inference::auth::command::CommandCredentialExecutor>;
 }
 
 /// One composition-owned device tool and its admission facts.
@@ -923,7 +936,7 @@ pub enum HookFieldComposition {
 }
 
 /// Host-owned behavior for one revisioned hook event.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HookEventPolicy {
 	/// Exact payload/decision schema revision.
 	pub revision:    u16,
@@ -941,28 +954,30 @@ pub struct HookEventPolicy {
 #[derive(Clone)]
 pub struct HookSubscription {
 	/// Authenticated child generation owning the callback.
-	pub identity:    Arc<ControlConnectionIdentity>,
+	pub identity:     Arc<ControlConnectionIdentity>,
 	/// Stable event name.
-	pub event:       Str,
+	pub event:        Str,
 	/// Frozen phase spelling.
-	pub phase:       Str,
+	pub phase:        Str,
 	/// Stable callback name selected inside Python.
-	pub name:        Str,
+	pub name:         Str,
 	/// Deterministic order within a phase.
-	pub order:       i32,
+	pub order:        i32,
 	/// Per-subscription failure override.
-	pub on_failure:  Option<HookFailurePolicy>,
+	pub on_failure:   Option<HookFailurePolicy>,
 	/// Per-subscription deadline override.
-	pub timeout:     Option<time::Duration>,
+	pub timeout:      Option<time::Duration>,
 	/// Declared callback overlap policy.
-	pub concurrency: CallbackConcurrency,
+	pub concurrency:  CallbackConcurrency,
+	/// Event policy frozen with the Python registry declaration.
+	pub event_policy: HookEventPolicy,
 }
 
 #[derive(Clone)]
 pub struct HookControlFactory {
 	registries:    Arc<RegistryControlFactory>,
 	callbacks:     Arc<NestedCallbackDispatcher>,
-	policies:      Arc<BTreeMap<Str, HookEventPolicy>>,
+	policies:      Arc<RwLock<BTreeMap<Str, HookEventPolicy>>>,
 	subscriptions: Arc<RwLock<BTreeMap<ControlConnectionKey, Vec<HookSubscription>>>>,
 }
 
@@ -976,7 +991,7 @@ impl HookControlFactory {
 		Arc::new(Self {
 			registries,
 			callbacks: Arc::new(NestedCallbackDispatcher::new(dispatcher)),
-			policies: Arc::new(policies),
+			policies: Arc::new(RwLock::new(policies)),
 			subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
 		})
 	}
@@ -1005,6 +1020,20 @@ impl HookControlFactory {
 			));
 		}
 		let key = connection_key(&subscription.identity);
+		let mut policies = self.policies.write();
+		match policies.get(&subscription.event) {
+			Some(policy) if policy != &subscription.event_policy => {
+				return Err(ControlProtocolError::new(
+					"HookContractError",
+					"hook registrations disagree on their event policy",
+				));
+			},
+			Some(_) => {},
+			None => {
+				policies.insert(subscription.event.clone(), subscription.event_policy.clone());
+			},
+		}
+		drop(policies);
 		let mut subscriptions = self.subscriptions.write();
 		subscriptions.retain(|candidate, _| {
 			candidate.0 != key.0 || candidate.1 != key.1 || candidate.2 != key.2 || *candidate == key
@@ -1027,7 +1056,7 @@ impl HookControlFactory {
 		require_active_invocation(context)?;
 		let event = required_string(arguments, "event")?;
 		let event_rev = required_u16(arguments, "event_rev")?;
-		let policy = self.policies.get(&event).ok_or_else(|| {
+		let policy = self.policies.read().get(&event).cloned().ok_or_else(|| {
 			ControlProtocolError::new("UnknownEvent", format!("unknown hook event {event}"))
 		})?;
 		if event_rev != policy.revision {
@@ -1077,18 +1106,11 @@ impl HookControlFactory {
 				.await;
 			let result = match result {
 				Ok(result) => result,
-				Err(_error)
-					if row.on_failure.unwrap_or(policy.on_failure) == HookFailurePolicy::Defer =>
-				{
-					continue;
-				},
 				Err(error) => {
-					return Ok(json!({
-						"kind": "deny",
-						"reason": error.message.as_str(),
-						"fatal": false,
-						"code": error.code.as_str(),
-					}));
+					match hook_callback_failure(row.on_failure.unwrap_or(policy.on_failure), error) {
+						None => continue,
+						Some(decision) => return Ok(decision),
+					}
 				},
 			};
 			let decision = result.as_object().ok_or_else(|| {
@@ -1101,7 +1123,7 @@ impl HookControlFactory {
 				Some("deny" | "require_approval") => return Ok(result),
 				Some("allow" | "defer") => {},
 				Some("modify") => {
-					compose_hook_modify(policy, &mut payload, &mut modification, decision)?;
+					compose_hook_modify(&policy, &mut payload, &mut modification, decision)?;
 				},
 				_ => {
 					return Err(ControlProtocolError::new(
@@ -1113,6 +1135,20 @@ impl HookControlFactory {
 		}
 		Ok(modification.map_or_else(|| policy.default.clone(), JsonValue::Object))
 	}
+}
+
+fn hook_callback_failure(
+	policy: HookFailurePolicy,
+	error: ControlProtocolError,
+) -> Option<JsonValue> {
+	(policy == HookFailurePolicy::Deny).then(|| {
+		json!({
+			"kind": "deny",
+			"reason": error.message.as_str(),
+			"fatal": false,
+			"code": error.code.as_str(),
+		})
+	})
 }
 
 fn hook_phase_rank(phase: &str) -> u8 {
@@ -1493,6 +1529,7 @@ pub(crate) fn production_registry<
 	EnvdError,
 > {
 	let RegistryBridges {
+		command_credentials: _,
 		dynamic_tools,
 		url_resolvers,
 		goal_control,
@@ -1945,7 +1982,9 @@ pub(crate) fn production_registry<
 		None
 	};
 	if tool_settings.enabled("yield") {
-		registry.register(omp_tools::yield_tool::tool(), Presentation::Slot, core_claims())?;
+		// Children finalize through `yield`; the top-level agent never
+		// advertises it, so registration is selection-only (`Hidden`).
+		registry.register(omp_tools::yield_tool::tool(), Presentation::Hidden, core_claims())?;
 	}
 	let checkpoint_control = AgentCheckpointControl::default();
 	let (checkpoint, rewind) = omp_tools::checkpoint::tools(checkpoint_control.clone());
@@ -2569,6 +2608,31 @@ mod tests {
 			annotation:   None,
 			props:        None,
 		}
+	}
+
+	#[test]
+	fn hook_deny_policy_fails_closed_on_callback_error() {
+		let decision = hook_callback_failure(
+			HookFailurePolicy::Deny,
+			ControlProtocolError::new("CallbackUnavailable", "extension callback failed"),
+		)
+		.expect("DENY policy must produce a terminal denial");
+		assert_eq!(
+			decision,
+			serde_json::json!({
+				"kind": "deny",
+				"reason": "extension callback failed",
+				"fatal": false,
+				"code": "CallbackUnavailable",
+			})
+		);
+		assert!(
+			hook_callback_failure(
+				HookFailurePolicy::Defer,
+				ControlProtocolError::new("CallbackUnavailable", "extension callback failed"),
+			)
+			.is_none()
+		);
 	}
 
 	#[test]

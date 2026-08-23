@@ -199,6 +199,35 @@ impl McpOAuth {
 		Self { http, authority, browser }
 	}
 
+	/// Creates live authorization headers for a previously persisted OAuth
+	/// grant. A missing lease is intentionally returned to the caller so an
+	/// unauthenticated probe can discover the server's challenge.
+	pub async fn authority_headers(
+		self: &Arc<Self>,
+		profile: &str,
+		server: &str,
+		config: &McpServerConfig,
+	) -> Result<Arc<dyn RefreshableHeaders>, OAuthFlowError> {
+		let auth = config
+			.auth
+			.as_ref()
+			.ok_or(OAuthFlowError::MissingAuthorizationServer)?;
+		let state = OAuthCredentialState {
+			affinity:       CombinedAuthAuthority::mcp_affinity(
+				profile,
+				server,
+				PrincipalId::from(profile),
+			),
+			token_endpoint: auth.token_url.clone().unwrap_or_default(),
+			client_id:      auth.client_id.clone().unwrap_or_default(),
+			client_secret:  None,
+			resource:       auth.resource.clone(),
+			refresh_token:  None,
+			generation:     0,
+		};
+		Ok(AuthorityHeaders::new(Arc::clone(self), state).await?)
+	}
+
 	/// Runs discovery, explicit-client/DCR selection, browser authorization,
 	/// callback validation, token exchange, and encrypted access-token rotation.
 	pub async fn authorize(

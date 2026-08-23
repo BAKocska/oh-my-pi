@@ -97,7 +97,10 @@ use crate::{
 		spawn::spawn,
 	},
 	policy::{AuthorityTable, Grants},
-	tools::RegistryControlFactory,
+	tools::{
+		HookControlFactory, HookEventPolicy, HookFailurePolicy, HookFieldComposition,
+		HookSubscription, RegistryControlFactory,
+	},
 	worker_pool::WorkerUnavailable,
 };
 /// Child argv selector for the dedicated placed-Python worker runtime.
@@ -475,6 +478,7 @@ pub struct ExtHostConfig {
 	/// Complete authority factory for dedicated JSON CONTROL connections.
 	control_authorities:    Option<Arc<HostControlAuthorityFactory>>,
 	registry_control:       Option<Arc<RegistryControlFactory>>,
+	hook_control:           Option<Arc<HookControlFactory>>,
 	/// Driver/app factories retained until the production router is composed.
 	domain_control:         Arc<DomainControlSlot>,
 	/// Late-bound, generation-fenced device availability destination.
@@ -508,6 +512,7 @@ impl ExtHostConfig {
 			journal: None,
 			control_authorities: None,
 			registry_control: None,
+			hook_control: None,
 			domain_control: DomainControlSlot::new(),
 			initial_backoff: Duration::from_secs(1),
 			scheme_snapshot: None,
@@ -541,6 +546,10 @@ impl ExtHostConfig {
 
 	pub(crate) fn bind_registry_control(&mut self, registry: Arc<RegistryControlFactory>) {
 		self.registry_control = Some(registry);
+	}
+
+	pub(crate) fn bind_hook_control(&mut self, hooks: Arc<HookControlFactory>) {
+		self.hook_control = Some(hooks);
 	}
 
 	/// Installs driver/app-owned factories before production CONTROL
@@ -1406,7 +1415,7 @@ pub struct ExtHostSupervisor {
 	domain_control:       Arc<DomainControlSlot>,
 	service_router:       Arc<ServiceRouter>,
 	agents_control:       Arc<AgentsControlSlot>,
-	control_hosts:        Vec<RunningHost>,
+	_control_hosts:       Vec<RunningHost>,
 	control_activations:  Vec<PendingControlActivation>,
 }
 impl ExtHostSupervisor {
@@ -1421,6 +1430,7 @@ impl ExtHostSupervisor {
 	pub async fn spawn(config: ExtHostConfig) -> Result<Self, WorkerError> {
 		let control_authorities = config.control_authorities.clone();
 		let registry_control = config.registry_control.clone();
+		let hook_control = config.hook_control.clone();
 		let domain_control = Arc::clone(&config.domain_control);
 		let agents_control = Arc::new(AgentsControlSlot {
 			session_generation: config.session_generation,
@@ -1479,6 +1489,35 @@ impl ExtHostSupervisor {
 				.start_control((*identity).clone(), authority, &ControlAuthoritySnapshot::default())
 				.await
 				.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+			if let Some(hooks) = &hook_control {
+				let registry = registry_control.as_ref().ok_or_else(|| {
+					WorkerError::Protocol(sf!("hook CONTROL owner requires registry CONTROL owner"))
+				})?;
+				let evidence = registry.evidence(&identity).ok_or_else(|| {
+					WorkerError::Protocol(sf!("CONTROL handshake omitted sealed hook registry evidence"))
+				})?;
+				for hook in evidence.hooks.iter() {
+					hooks
+						.subscribe(HookSubscription {
+							identity:     Arc::clone(&identity),
+							event:        hook.event.clone(),
+							phase:        hook.phase.clone(),
+							name:         hook.name.clone(),
+							order:        hook.order,
+							on_failure:   hook.on_failure,
+							timeout:      hook.timeout,
+							concurrency:  hook.concurrency,
+							event_policy: HookEventPolicy {
+								revision:    hook.event_revision,
+								timeout:     hook.event_timeout,
+								on_failure:  hook.event_on_failure,
+								default:     hook.event_default.clone(),
+								composition: hook.composition.clone(),
+							},
+						})
+						.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+				}
+			}
 			control_activations.push(PendingControlActivation {
 				control: running.control(),
 				identity: Arc::clone(&identity),
@@ -1706,7 +1745,7 @@ impl ExtHostSupervisor {
 			domain_control,
 			service_router,
 			agents_control,
-			control_hosts,
+			_control_hosts: control_hosts,
 			control_activations,
 		})
 	}
@@ -2532,7 +2571,22 @@ struct RegisteredTool {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-struct RegisteredHook(Str, Str);
+struct RegisteredHook {
+	event:            Str,
+	phase:            Str,
+	name:             Str,
+	order:            i32,
+	on_failure:       Option<Str>,
+	timeout:          Option<Str>,
+	concurrency:      usize,
+	threadsafe:       bool,
+	event_rev:        u16,
+	event_on_failure: Str,
+	event_default:    Option<Str>,
+	event_timeout:    Str,
+	#[serde(default)]
+	composition:      BTreeMap<Str, Str>,
+}
 
 #[derive(Deserialize)]
 struct RegisteredRegistrySnapshot {
@@ -2569,9 +2623,29 @@ pub struct SealedToolRegistration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedHookRegistration {
 	/// Stable event name.
-	pub event: Str,
+	pub event:            Str,
 	/// Frozen hook phase.
-	pub phase: Str,
+	pub phase:            Str,
+	/// Stable callback name selected inside Python.
+	pub name:             Str,
+	/// Deterministic callback order.
+	pub order:            i32,
+	/// Optional callback failure override.
+	pub on_failure:       Option<HookFailurePolicy>,
+	/// Optional callback timeout override.
+	pub timeout:          Option<Duration>,
+	/// Declared callback overlap behavior.
+	pub concurrency:      CallbackConcurrency,
+	/// Exact event payload/decision revision.
+	pub event_revision:   u16,
+	/// Event-level callback failure default.
+	pub event_on_failure: HookFailurePolicy,
+	/// Event default decision for an all-deferred composition.
+	pub event_default:    serde_json::Value,
+	/// Event-level callback deadline.
+	pub event_timeout:    Duration,
+	/// Event field composition declarations.
+	pub composition:      BTreeMap<Str, HookFieldComposition>,
 }
 
 /// Exact sealed registry publication accepted from one authenticated child.
@@ -3268,7 +3342,7 @@ pub fn seal_registry_evidence(
 	let runtime_hooks = snapshot
 		.hooks
 		.iter()
-		.map(|hook| (hook.0.as_str(), hook.1.to_string()))
+		.map(|hook| (hook.event.as_str(), hook.phase.to_string()))
 		.collect::<BTreeSet<_>>();
 	if manifest_tools != runtime_tools || manifest_hooks != runtime_hooks {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
@@ -3317,14 +3391,124 @@ pub fn seal_registry_evidence(
 				source_module: tool.source_module,
 			})
 			.collect(),
-		hooks:      snapshot
-			.hooks
-			.into_iter()
-			.map(|hook| SealedHookRegistration { event: hook.0, phase: hook.1 })
-			.collect(),
+		hooks:      Arc::from(
+			snapshot
+				.hooks
+				.into_iter()
+				.map(seal_hook_registration)
+				.collect::<Result<Vec<_>, _>>()?,
+		),
 		providers:  snapshot.providers.into(),
 		campaigns:  snapshot.campaigns.into(),
 	})
+}
+
+fn seal_hook_registration(
+	hook: RegisteredHook,
+) -> Result<SealedHookRegistration, SealedRegistryEvidenceError> {
+	if hook.name.is_empty() || hook.event.is_empty() || hook.phase.is_empty() || hook.event_rev == 0
+	{
+		return Err(SealedRegistryEvidenceError::Malformed(sf!(
+			"hook registration has an empty identity or zero event revision"
+		)));
+	}
+	if hook.concurrency == 0 {
+		return Err(SealedRegistryEvidenceError::Malformed(sf!(
+			"hook {} has zero concurrency",
+			hook.name
+		)));
+	}
+	let concurrency = if hook.threadsafe {
+		CallbackConcurrency::Threadsafe
+	} else if hook.concurrency == 1 {
+		CallbackConcurrency::Serialized
+	} else {
+		CallbackConcurrency::Concurrent { limit: hook.concurrency }
+	};
+	let on_failure = hook
+		.on_failure
+		.as_deref()
+		.map(|value| hook_failure_policy(value, &hook.name))
+		.transpose()?;
+	let timeout = hook
+		.timeout
+		.as_deref()
+		.map(|value| hook_timeout(value, &hook.name))
+		.transpose()?;
+	let event_on_failure = hook_failure_policy(&hook.event_on_failure, &hook.name)?;
+	let event_default = hook_default_decision(hook.event_default.as_deref(), &hook.name)?;
+	let event_timeout = hook_timeout(&hook.event_timeout, &hook.name)?;
+	let composition = hook
+		.composition
+		.into_iter()
+		.map(|(field, value)| hook_composition(field, value, &hook.name))
+		.collect::<Result<_, _>>()?;
+	Ok(SealedHookRegistration {
+		event: hook.event,
+		phase: hook.phase,
+		name: hook.name,
+		order: hook.order,
+		on_failure,
+		timeout,
+		concurrency,
+		event_revision: hook.event_rev,
+		event_on_failure,
+		event_default,
+		event_timeout,
+		composition,
+	})
+}
+
+fn hook_failure_policy(
+	value: &str,
+	name: &str,
+) -> Result<HookFailurePolicy, SealedRegistryEvidenceError> {
+	match value {
+		"defer" => Ok(HookFailurePolicy::Defer),
+		"deny" => Ok(HookFailurePolicy::Deny),
+		_ => Err(SealedRegistryEvidenceError::Malformed(sf!(
+			"hook {name} has an invalid on_failure policy {value}"
+		))),
+	}
+}
+
+fn hook_timeout(value: &str, name: &str) -> Result<Duration, SealedRegistryEvidenceError> {
+	value
+		.parse::<CoreDuration>()
+		.and_then(CoreDuration::to_std)
+		.map_err(|error| {
+			SealedRegistryEvidenceError::Malformed(sf!(
+				"hook {name} has an invalid timeout {value}: {error}"
+			))
+		})
+}
+
+fn hook_composition(
+	field: Str,
+	value: Str,
+	name: &str,
+) -> Result<(Str, HookFieldComposition), SealedRegistryEvidenceError> {
+	match value.as_str() {
+		"replace" => Ok((field, HookFieldComposition::Replace)),
+		"append" => Ok((field, HookFieldComposition::Append)),
+		"intersect" => Ok((field, HookFieldComposition::Intersect)),
+		_ => Err(SealedRegistryEvidenceError::Malformed(sf!(
+			"hook {name} has an invalid composition policy {value}"
+		))),
+	}
+}
+
+fn hook_default_decision(
+	value: Option<&str>,
+	name: &str,
+) -> Result<serde_json::Value, SealedRegistryEvidenceError> {
+	match value {
+		None => Ok(serde_json::Value::Null),
+		Some("allow") => Ok(serde_json::json!({ "kind": "allow" })),
+		Some(value) => Err(SealedRegistryEvidenceError::Malformed(sf!(
+			"hook {name} has an invalid default decision {value}"
+		))),
+	}
 }
 
 fn sealed_document_ids(

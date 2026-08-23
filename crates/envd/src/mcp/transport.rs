@@ -65,6 +65,11 @@ pub enum IncomingMessage {
 /// The boxed future is confined to this dynamic I/O boundary. Concrete stdio
 /// and HTTP internals remain allocation-free per poll.
 pub trait McpTransport: Send + Sync {
+	/// Records the protocol revision negotiated during initialization.
+	/// Transports that carry the Streamable HTTP protocol header override this
+	/// hook.
+	fn set_protocol_version(&self, _revision: Str) {}
+
 	/// Sends one JSON-RPC request and waits for its correlated response.
 	fn request<'a>(
 		&'a self,

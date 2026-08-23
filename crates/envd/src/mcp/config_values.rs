@@ -58,7 +58,7 @@ pub struct ResolvedTransportValues {
 pub async fn resolve_transport_values(
 	config: &McpServerConfig,
 	environment: &BTreeMap<Str, Str>,
-	commands: &CommandCredentialResolver,
+	commands: Option<&CommandCredentialResolver>,
 	cancellation: &CancellationToken,
 ) -> Result<ResolvedTransportValues, ConfigValueError> {
 	let env = if config.env_policy == Some(EnvironmentPolicy::Literal) {
@@ -85,7 +85,7 @@ pub async fn resolve_transport_values(
 async fn resolve_map(
 	values: &BTreeMap<Str, Str>,
 	environment: &BTreeMap<Str, Str>,
-	commands: &CommandCredentialResolver,
+	commands: Option<&CommandCredentialResolver>,
 	cancellation: &CancellationToken,
 ) -> Result<BTreeMap<Str, ResolvedConfigValue>, ConfigValueError> {
 	let mut resolved = BTreeMap::new();
@@ -102,11 +102,12 @@ async fn resolve_map(
 async fn resolve_value(
 	value: &str,
 	environment: &BTreeMap<Str, Str>,
-	commands: &CommandCredentialResolver,
+	commands: Option<&CommandCredentialResolver>,
 	cancellation: &CancellationToken,
 ) -> Result<ResolvedConfigValue, ConfigValueError> {
 	if let Some(command) = value.strip_prefix('!') {
 		return commands
+			.ok_or(ConfigValueError::ExecutorUnavailable)?
 			.resolve(command, cancellation.clone())
 			.await
 			.map(ResolvedConfigValue::Secret)
@@ -123,6 +124,9 @@ async fn resolve_value(
 /// Redaction-safe dynamic configuration failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConfigValueError {
+	/// A dynamic command was configured before composition injected an executor.
+	#[error("MCP command-produced configuration values require an Environment command executor")]
+	ExecutorUnavailable,
 	/// Shared Environment command credential resolution failed.
 	#[error("MCP command-produced configuration value could not be resolved")]
 	Command(#[source] CommandCredentialError),
@@ -189,7 +193,7 @@ mod tests {
 		let values = resolve_transport_values(
 			&config(),
 			&BTreeMap::from([(Str::from("ENV_NAME"), Str::from("public"))]),
-			&resolver,
+			Some(&resolver),
 			&CancellationToken::new(),
 		)
 		.await
@@ -206,10 +210,14 @@ mod tests {
 		let resolver = CommandCredentialResolver::new(executor.clone(), Duration::from_millis(50));
 		let mut config = config();
 		config.env_policy = Some(EnvironmentPolicy::Literal);
-		let values =
-			resolve_transport_values(&config, &BTreeMap::new(), &resolver, &CancellationToken::new())
-				.await
-				.expect("resolve");
+		let values = resolve_transport_values(
+			&config,
+			&BTreeMap::new(),
+			Some(&resolver),
+			&CancellationToken::new(),
+		)
+		.await
+		.expect("resolve");
 		assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
 		assert_eq!(values.env["TOKEN"].with_exposed(str::to_owned), "!credential");
 	}

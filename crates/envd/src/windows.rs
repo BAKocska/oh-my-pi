@@ -169,6 +169,7 @@ pub(crate) async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<()
 			Registry::new(),
 			worker_config,
 			Some(doc_connections),
+			None,
 			bridges,
 		)
 		.await?,

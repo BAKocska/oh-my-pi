@@ -818,6 +818,28 @@ impl ReadSources for ReadSourceAdapter {
 		})())
 	}
 
+	fn commit_document_media(
+		&self,
+		source: &SourceStat,
+		conversion: &mut Conversion,
+	) -> Result<(), Fault> {
+		if conversion.attachments.is_empty() {
+			return Ok(());
+		}
+		let source = Path::new(source.canonical_path.as_str());
+		let parent = source
+			.parent()
+			.ok_or_else(|| Fault::source("document media source has no parent directory"))?;
+		let name = source
+			.file_name()
+			.and_then(|name| name.to_str())
+			.ok_or_else(|| Fault::source("document media source filename is not UTF-8"))?;
+		let sequence = MEDIA_COMMIT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+		let destination = parent.join(format!(".{name}.media-{sequence:016x}"));
+		commit_document_media(&destination, conversion)
+			.map_err(|error| Fault::source(error.to_string()))
+	}
+
 	fn record_snapshot(&self, record: SnapshotRecord) -> Result<Option<Str>, Fault> {
 		if record.bytes.len() > SNAPSHOT_MAX_BYTES {
 			return Ok(None);
@@ -947,7 +969,6 @@ fn source_io(action: &str, path: &str, error: io::Error) -> Fault {
 }
 
 #[cfg(test)]
-#[path = "tool_read_sources_tests.rs"]
 mod tests;
 
 #[cfg(test)]

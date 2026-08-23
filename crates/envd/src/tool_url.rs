@@ -1,22 +1,13 @@
 //! App-owned internal URL resolver composition.
 
-#[path = "tool_url/artifact.rs"]
 mod artifact;
-#[path = "tool_url/attachment.rs"]
 mod attachment;
-#[path = "tool_url/docs.rs"]
 mod docs;
-#[path = "tool_url/host.rs"]
 pub mod host;
-#[path = "tool_url/local.rs"]
 pub(super) mod local;
-#[path = "tool_url/mcp.rs"]
 mod mcp;
-#[path = "tool_url/memory.rs"]
 mod memory;
-#[path = "tool_url/ssh.rs"]
 pub(super) mod ssh;
-#[path = "tool_url/vault.rs"]
 pub(super) mod vault;
 
 use std::{fmt::Display, fs, path::PathBuf, str, sync::Arc};

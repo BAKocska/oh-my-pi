@@ -103,8 +103,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 pub use tools::{
-	ActiveContentInputs, ContentResolver, DynamicTool, GoalAuthority, HostResourceResult,
-	HostResources, RegistryBridges, SearchInference, TelemetryUpload,
+	ActiveContentInputs, CommandCredentialExecutorFactory, ContentResolver, DynamicTool,
+	GoalAuthority, HostResourceResult, HostResources, RegistryBridges, SearchInference,
+	TelemetryUpload,
 };
 #[cfg(windows)]
 use windows::OwnerPipeListener;
@@ -113,6 +114,7 @@ pub use worker::run_py_worker_entry;
 
 use self::{
 	server::ExtensionDataBinding,
+	tool_settings::ApprovalMode,
 	worker::{ExtHostConfig, ExtHostSpec, HostKey, PY_EVAL_MODULE},
 };
 use crate::eval::{BridgeHostError, ParentSessionHost};
@@ -304,8 +306,23 @@ impl Drop for ProjectLifecycle {
 	}
 }
 
+fn bind_command_credentials(
+	server: &EnvServer,
+	factory: Option<Arc<dyn CommandCredentialExecutorFactory>>,
+	client: EnvClient,
+	root: &Path,
+) {
+	if let Some(factory) = factory {
+		server
+			.mcp_manager()
+			.bind_command_executor(factory.make(client, root));
+	}
+}
+
 impl ProjectEnvironment {
 	/// Connects an existing owner environment or starts one for this process.
+	///
+	/// An approval-mode override is retained only by this composition.
 	#[cfg(unix)]
 	pub async fn connect_or_start(
 		root: &Path,
@@ -313,6 +330,7 @@ impl ProjectEnvironment {
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
@@ -347,6 +365,7 @@ impl ProjectEnvironment {
 										socket,
 										docserver_socket,
 										py_eval,
+										approval_mode,
 										trusted_extensions,
 										interrupt_grace,
 										bridges,
@@ -382,6 +401,7 @@ impl ProjectEnvironment {
 					state_dir,
 					docserver_socket,
 					py_eval,
+					approval_mode,
 					trusted_extensions,
 					interrupt_grace,
 					bridges,
@@ -403,6 +423,7 @@ impl ProjectEnvironment {
 							state_dir,
 							docserver_socket,
 							py_eval,
+							approval_mode,
 							trusted_extensions,
 							interrupt_grace,
 							bridges,
@@ -421,6 +442,7 @@ impl ProjectEnvironment {
 							socket,
 							docserver_socket,
 							py_eval,
+							approval_mode,
 							trusted_extensions,
 							interrupt_grace,
 							bridges,
@@ -434,6 +456,8 @@ impl ProjectEnvironment {
 	}
 
 	/// Connects to or starts the owner-scoped Windows project environment.
+	///
+	/// An approval-mode override is retained only by this composition.
 	#[cfg(windows)]
 	pub async fn connect_or_start(
 		root: &Path,
@@ -441,6 +465,7 @@ impl ProjectEnvironment {
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
@@ -467,6 +492,7 @@ impl ProjectEnvironment {
 										socket,
 										docserver_socket,
 										py_eval,
+										approval_mode,
 										trusted_extensions,
 										interrupt_grace,
 										bridges,
@@ -495,6 +521,7 @@ impl ProjectEnvironment {
 					state_dir,
 					docserver_socket,
 					py_eval,
+					approval_mode,
 					trusted_extensions,
 					interrupt_grace,
 					bridges,
@@ -514,6 +541,7 @@ impl ProjectEnvironment {
 							state_dir,
 							docserver_socket,
 							py_eval,
+							approval_mode,
 							trusted_extensions,
 							interrupt_grace,
 							bridges,
@@ -532,6 +560,7 @@ impl ProjectEnvironment {
 							socket,
 							docserver_socket,
 							py_eval,
+							approval_mode,
 							trusted_extensions,
 							interrupt_grace,
 							bridges,
@@ -554,10 +583,12 @@ impl ProjectEnvironment {
 		state_dir: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
+		let command_credentials = bridges.command_credentials.clone();
 		let (worker_config, data_bindings) =
 			worker_config(state_dir, py_eval, trusted_extensions, interrupt_grace)?;
 		let server = EnvServer::open_project(
@@ -567,6 +598,7 @@ impl ProjectEnvironment {
 			Registry::new(),
 			worker_config,
 			None,
+			approval_mode,
 			bridges,
 		)
 		.await?;
@@ -578,6 +610,7 @@ impl ProjectEnvironment {
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
 		let (client, transport) = EnvClient::in_process(64);
+		bind_command_credentials(&server, command_credentials, client.clone(), root);
 		let in_process_server = Arc::clone(&server);
 		let in_process =
 			tokio::spawn(async move { in_process_server.serve_in_process(transport).await });
@@ -605,10 +638,12 @@ impl ProjectEnvironment {
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
+		let command_credentials = bridges.command_credentials.clone();
 		let (worker_config, data_bindings) =
 			worker_config(state_dir, py_eval, trusted_extensions, interrupt_grace)?;
 		let server = EnvServer::open_project(
@@ -618,6 +653,7 @@ impl ProjectEnvironment {
 			Registry::new(),
 			worker_config,
 			None,
+			approval_mode,
 			bridges,
 		)
 		.await?;
@@ -629,6 +665,7 @@ impl ProjectEnvironment {
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
 		let (client, transport) = EnvClient::in_process(64);
+		bind_command_credentials(&server, command_credentials, client.clone(), root);
 		let in_process_server = Arc::clone(&server);
 		let in_process = tokio::spawn(async move {
 			in_process_server.serve_in_process(transport).await;
@@ -671,11 +708,13 @@ impl ProjectEnvironment {
 		socket: &Path,
 		docserver_socket: &Path,
 		py_eval: bool,
+		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let owner_listener = OwnerPipeListener::bind(socket)?;
+		let command_credentials = bridges.command_credentials.clone();
 		let (worker_config, data_bindings) =
 			worker_config(state_dir, py_eval, trusted_extensions, interrupt_grace)?;
 		let server = EnvServer::open_project(
@@ -685,6 +724,7 @@ impl ProjectEnvironment {
 			Registry::new(),
 			worker_config,
 			None,
+			approval_mode,
 			bridges,
 		)
 		.await?;
@@ -696,6 +736,7 @@ impl ProjectEnvironment {
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
 		let (client, transport) = EnvClient::in_process(64);
+		bind_command_credentials(&server, command_credentials, client.clone(), root);
 		let in_process_server = Arc::clone(&server);
 		let in_process = tokio::spawn(async move {
 			in_process_server.serve_in_process(transport).await;
@@ -732,6 +773,7 @@ impl ProjectEnvironment {
 		state_dir: &Path,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
+		let command_credentials = bridges.command_credentials.clone();
 		let (worker_config, data_bindings) =
 			worker_config(state_dir, true, &[], omp_tool::DEFAULT_INTERRUPT_GRACE)?;
 		let server = Arc::new(
@@ -744,6 +786,7 @@ impl ProjectEnvironment {
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
 		let (client, transport) = EnvClient::in_process(64);
+		bind_command_credentials(&server, command_credentials, client.clone(), root);
 		let in_process_server = Arc::clone(&server);
 		let in_process =
 			tokio::spawn(async move { in_process_server.serve_in_process(transport).await });
@@ -767,6 +810,21 @@ impl ProjectEnvironment {
 	/// Returns the typed Environment client for this composition.
 	pub const fn client(&self) -> &EnvClient {
 		&self.client
+	}
+
+	/// Binds the application's shared credential authority and MCP OAuth flow
+	/// after production inference has opened the canonical credential store.
+	pub fn bind_mcp_oauth(
+		&self,
+		authority: Arc<mcp::auth_authority::CombinedAuthAuthority>,
+		oauth: Arc<mcp::oauth::McpOAuth>,
+	) {
+		self
+			.lifecycle
+			.server
+			.mcp_manager()
+			.bind_auth_authority(authority);
+		self.lifecycle.server.mcp_manager().bind_oauth(oauth);
 	}
 
 	/// Returns the immutable production tool registry.

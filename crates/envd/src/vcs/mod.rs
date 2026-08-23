@@ -61,7 +61,8 @@ pub enum SnapshotError {
 	Command(#[from] CommandError),
 }
 
-/// Captures one complete immutable repository snapshot asynchronously.
+/// Captures one complete immutable repository snapshot asynchronously without probing system Git for
+/// ordinary file-ref repositories.
 pub async fn snapshot(
 	root: &Path,
 	runner: &GitRunner,
@@ -77,31 +78,23 @@ pub async fn snapshot(
 			status_counts: StatusCounts::default(),
 		});
 	};
-	let probe = runner
-		.run(
-			&repository.worktree_root,
-			&["--version"],
-			GitRunOptions { read_only: true, parse_sensitive: true, ..Default::default() },
-			cancel,
-		)
-		.await?;
-	if probe.exit_code != 0 || probe.diagnostic == Some(GitDiagnostic::GitMissing) {
-		return Ok(RepositorySnapshot {
-			availability:  RepositoryAvailability::GitUnavailable,
-			worktree_root: Some(repository.worktree_root),
-			primary_root:  Some(repository.primary_root),
-			head:          None,
-			branch:        None,
-			status_counts: StatusCounts::default(),
-		});
+	if refs::is_reftable(&repository).await? && !system_git_available(runner, &repository, cancel).await? {
+		return Ok(git_unavailable_snapshot(&repository));
 	}
 	let head = refs::resolve_head(&repository, runner, cancel).await?;
 	let status_counts = if repository.bare {
 		StatusCounts::default()
 	} else {
-		GitDiff::new(runner.clone())
-			.status_counts(&repository.worktree_root, cancel)
-			.await?
+		match GitDiff::new(runner.clone()).status_counts(&repository.worktree_root, cancel).await {
+			Ok(counts) => counts,
+			Err(error) if system_git_missing_error(&error) => {
+				if !system_git_available(runner, &repository, cancel).await? {
+					return Ok(git_unavailable_snapshot(&repository));
+				}
+				return Err(error.into());
+			}
+			Err(error) => return Err(error.into()),
+		}
 	};
 	Ok(RepositorySnapshot {
 		availability: RepositoryAvailability::Available,
@@ -111,4 +104,35 @@ pub async fn snapshot(
 		branch: head.branch().map(|value| value.to_str()),
 		status_counts,
 	})
+}
+
+fn git_unavailable_snapshot(repository: &repo::Repository) -> RepositorySnapshot {
+	RepositorySnapshot {
+		availability:  RepositoryAvailability::GitUnavailable,
+		worktree_root: Some(repository.worktree_root.clone()),
+		primary_root:  Some(repository.primary_root.clone()),
+		head:          None,
+		branch:        None,
+		status_counts: StatusCounts::default(),
+	}
+}
+
+async fn system_git_available(
+	runner: &GitRunner,
+	repository: &repo::Repository,
+	cancel: &CancellationToken,
+) -> Result<bool, GitRunError> {
+	let probe = runner
+		.run(
+			&repository.worktree_root,
+			&["--version"],
+			GitRunOptions { read_only: true, parse_sensitive: true, ..Default::default() },
+			cancel,
+		)
+		.await?;
+	Ok(probe.exit_code == 0 && probe.diagnostic != Some(GitDiagnostic::GitMissing))
+}
+
+fn system_git_missing_error(error: &CommandError) -> bool {
+	matches!(error, CommandError::Exit { code: 127, .. } | CommandError::Run(_))
 }

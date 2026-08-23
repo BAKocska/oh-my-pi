@@ -27,6 +27,33 @@ use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time};
 
 use super::*;
 
+#[test]
+fn document_media_commit_publishes_files_and_rewrites_placeholders() {
+	let sandbox = tempfile::tempdir().expect("sandbox");
+	let destination = sandbox.path().join("report.docx.media");
+	let mut conversion = Conversion {
+		text:        Str::new("before\n<!-- image -->\nafter"),
+		note:        None,
+		title:       None,
+		attachments: vec![omp_tools::read::markit::Attachment {
+			name:       Str::new("image.png"),
+			media_type: Str::new("image/png"),
+			bytes:      Bytes::from_static(b"png"),
+		}],
+	};
+
+	commit_document_media(&destination, &mut conversion).expect("commit document media");
+
+	assert_eq!(fs::read(destination.join("image.png")).expect("read committed image"), b"png");
+	assert_eq!(
+		conversion.text,
+		Str::from(format!(
+			"before\n![image.png]({})\nafter",
+			destination.join("image.png").display()
+		))
+	);
+}
+
 struct TestServer {
 	base: String,
 	task: JoinHandle<()>,

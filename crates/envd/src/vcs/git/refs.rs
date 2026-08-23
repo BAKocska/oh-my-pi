@@ -216,6 +216,10 @@ pub async fn read_ref(repository: &Repository, reference: &str) -> Result<Option
 	Ok(None)
 }
 
+/// Resolves HEAD through system Git for reftable repositories.
+///
+/// This is a justified subprocess: gitoxide (0.86) has no reftable ref
+/// backend, so the reftable block format cannot be read in-process yet.
 async fn resolve_reftable(
 	repository: &Repository,
 	runner: &GitRunner,

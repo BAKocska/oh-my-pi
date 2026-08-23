@@ -275,14 +275,17 @@ impl EditDocuments for DocumentHost {
 		let (resolved, warnings, display_path) =
 			match resolve_document_for_prepare(self, &request.path, request.allow_missing) {
 				Ok(resolved) => (resolved, Vec::new(), request.path.clone()),
-				Err(error) => {
-					let Some(tag) = request.file_hash.as_deref() else {
-						return Err(edit_invalid(error));
-					};
-					match recover_edit_path(self, &request.path, tag) {
-						Some(recovered) => recovered,
-						None => return Err(edit_invalid(error)),
-					}
+				Err(error) => match recover_workspace_suffix(self, &request.path) {
+					Ok(Some(recovered)) => recovered,
+					Ok(None) | Err(_) => {
+						let Some(tag) = request.file_hash.as_deref() else {
+							return Err(edit_invalid(error));
+						};
+						match recover_edit_path(self, &request.path, tag) {
+							Some(recovered) => recovered,
+							None => return Err(edit_invalid(error)),
+						}
+					},
 				},
 			};
 		let lease = Self::open(self, resolved.uri, None, &CancellationToken::new())
@@ -890,7 +893,28 @@ fn recover_workspace_suffix(
 	let root = root_url
 		.to_file_path()
 		.map_err(|()| "document workspace root is not a local file URI".to_owned())?;
-	let mut pending = vec![root.clone()];
+	let Some(path) = find_unique_workspace_suffix(&root, &suffix)? else {
+		return Ok(None);
+	};
+	let relative = path
+		.strip_prefix(&root)
+		.map_err(|_| "recovered path escaped workspace root".to_owned())?;
+	let display = Str::from(relative.to_string_lossy().replace('\\', "/"));
+	let uri = Url::from_file_path(&path)
+		.map_err(|()| "recovered path cannot be represented as a file URI".to_owned())?;
+	let resolved = resolve_document(host, uri.as_str())?;
+	let warning = sf!(
+		"Path \"{}\" does not exist; uniquely recovered workspace suffix \"{}\" as {}. Future edits \
+		 must use the canonical recovered path.",
+		authored_path,
+		suffix.display(),
+		display
+	);
+	Ok(Some((resolved, vec![warning], display)))
+}
+
+fn find_unique_workspace_suffix(root: &Path, suffix: &Path) -> Result<Option<PathBuf>, String> {
+	let mut pending = vec![root.to_path_buf()];
 	let mut matches = Vec::new();
 	let mut visited = 0_usize;
 	while let Some(directory) = pending.pop() {
@@ -915,43 +939,17 @@ fn recover_workspace_suffix(
 				pending.push(path);
 			} else if kind.is_file()
 				&& path
-					.strip_prefix(&root)
-					.is_ok_and(|relative| relative.ends_with(&suffix))
+					.strip_prefix(root)
+					.is_ok_and(|relative| relative.ends_with(suffix))
 			{
 				matches.push(path);
 				if matches.len() > 1 {
-					break;
+					return Ok(None);
 				}
 			}
 		}
-		if matches.len() > 1 {
-			break;
-		}
 	}
-	match matches.as_slice() {
-		[] => Ok(None),
-		[path] => {
-			let relative = path
-				.strip_prefix(&root)
-				.map_err(|_| "recovered path escaped workspace root".to_owned())?;
-			let display = Str::from(relative.to_string_lossy().replace('\\', "/"));
-			let uri = Url::from_file_path(path)
-				.map_err(|()| "recovered path cannot be represented as a file URI".to_owned())?;
-			let resolved = resolve_document(host, uri.as_str())?;
-			let warning = sf!(
-				"Path \"{}\" does not exist; uniquely recovered workspace suffix \"{}\" as {}. Future \
-				 edits must use the canonical recovered path.",
-				authored_path,
-				suffix.display(),
-				display
-			);
-			Ok(Some((resolved, vec![warning], display)))
-		},
-		_ => Err(format!(
-			"Path \"{authored_path}\" is ambiguous: more than one workspace file ends with \"{}\"",
-			suffix.display()
-		)),
-	}
+	Ok(matches.pop())
 }
 
 fn resolve_move_destination(
@@ -2215,6 +2213,25 @@ mod tests {
 			};
 			assert_eq!(actual, expected);
 		}
+	}
+
+	#[test]
+	fn recovers_unique_workspace_suffix_for_missing_edit_path() {
+		let workspace = tempfile::tempdir().expect("workspace");
+		let nested = workspace.path().join("src").join("replace.txt");
+		std_fs::create_dir_all(nested.parent().expect("nested parent")).expect("create nested");
+		std_fs::write(&nested, b"alpha\nbeta\n").expect("write nested file");
+
+		assert_eq!(
+			find_unique_workspace_suffix(workspace.path(), Path::new("replace.txt"))
+				.expect("scan workspace"),
+			Some(nested)
+		);
+		assert_eq!(
+			find_unique_workspace_suffix(workspace.path(), Path::new("missing.txt"))
+				.expect("scan workspace"),
+			None
+		);
 	}
 
 	#[test]

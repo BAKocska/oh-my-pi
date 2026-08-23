@@ -72,16 +72,20 @@ impl McpClient {
 		if raw.server_info.name.trim().is_empty() || !raw.capabilities.is_object() {
 			return Err(ClientError::MalformedInitialize);
 		}
+		let protocol_version = Str::from(raw.protocol_version);
+		self
+			.transport
+			.set_protocol_version(protocol_version.clone());
 		self
 			.transport
 			.notify("notifications/initialized", json!({}), cancel)
 			.await?;
 		Ok(InitializedServer {
-			protocol_version: Str::from(raw.protocol_version),
-			name:             Str::from(raw.server_info.name),
-			version:          raw.server_info.version.map(Str::from),
-			capabilities:     raw.capabilities,
-			instructions:     raw
+			protocol_version,
+			name: Str::from(raw.server_info.name),
+			version: raw.server_info.version.map(Str::from),
+			capabilities: raw.capabilities,
+			instructions: raw
 				.instructions
 				.filter(|value| !value.is_empty())
 				.map(Str::from),

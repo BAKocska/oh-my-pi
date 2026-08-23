@@ -64,8 +64,8 @@ impl fmt::Debug for ExtractedExaKey {
 	}
 }
 
-/// Coverage-filter result. Unrestricted native-covered servers remain mounted
-/// so post-discovery filtering can retain newly advertised, uncovered leaves.
+/// Coverage-filter result. Fully native-covered Exa and browser servers are
+/// removed before any generic mount can expose duplicate capabilities.
 #[derive(Clone, Debug, Default)]
 pub struct FilterResult {
 	/// Generic mounts still needed for uncovered leaves.
@@ -98,14 +98,14 @@ pub fn filter_native_coverage(
 		} else {
 			BTreeSet::new()
 		};
-		let requested = if is_exa {
-			requested_exa_tools(&sanitized)
-		} else {
-			None
-		};
-		if requested
-			.as_ref()
-			.is_some_and(|tools| tools.iter().all(|tool| suppressed_tools.contains(tool)))
+		if is_browser {
+			continue;
+		}
+		let requested = requested_exa_tools(&sanitized);
+		if is_exa
+			&& requested
+				.as_ref()
+				.is_none_or(|tools| tools.iter().all(|tool| suppressed_tools.contains(tool)))
 		{
 			continue;
 		}
@@ -334,6 +334,16 @@ mod tests {
 			Str::from("exa"),
 			remote("https://mcp.exa.ai/mcp?tools=web_search_exa"),
 		)]);
+		assert!(
+			filter_native_coverage(&servers, &NativeCoverage::default())
+				.mounts
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn drops_unrestricted_exa_mounts() {
+		let servers = BTreeMap::from([(Str::from("exa"), remote("https://mcp.exa.ai/mcp"))]);
 		assert!(
 			filter_native_coverage(&servers, &NativeCoverage::default())
 				.mounts

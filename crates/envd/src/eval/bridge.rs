@@ -218,16 +218,6 @@ impl PreludeTable {
 	pub fn helpers(&self) -> impl DoubleEndedIterator<Item = &PreludeHelper> + ExactSizeIterator {
 		self.helpers.values().map(Arc::as_ref)
 	}
-
-	/// Returns the number of helpers.
-	pub fn len(&self) -> usize {
-		self.helpers.len()
-	}
-
-	/// Returns whether no helpers are declared.
-	pub fn is_empty(&self) -> bool {
-		self.helpers.is_empty()
-	}
 }
 
 /// Serializable helper metadata sent once when an eval child starts.
@@ -639,12 +629,6 @@ pub struct BridgeClient {
 }
 
 impl BridgeClient {
-	pub(crate) async fn call(&self, name: &str, args: Value) -> Result<Value, BridgeCallError> {
-		self
-			.call_with_progress(name, args, &NoopBridgeProgress)
-			.await
-	}
-
 	pub(crate) async fn call_with_progress(
 		&self,
 		name: &str,
@@ -875,9 +859,8 @@ impl Drop for ParentBindingLease {
 }
 
 struct ParentBinding {
-	generation:   Ulid,
-	parent:       Arc<dyn ParentSessionHost>,
-	strict_owner: bool,
+	generation: Ulid,
+	parent:     Arc<dyn ParentSessionHost>,
 }
 
 #[derive(Clone)]
@@ -927,32 +910,15 @@ impl SessionBridgeHost {
 			.map_err(|_| BridgeHostError::message("eval bridge prelude is already bound"))
 	}
 
-	pub(crate) fn bind_parent(
-		&self,
-		owner: Str,
-		parent: Arc<dyn ParentSessionHost>,
-	) -> Result<ParentBindingLease, BridgeHostError> {
-		self.bind_parent_with_scope(owner, parent, false)
-	}
-
-	/// Binds one SDK session without the single-parent compatibility fallback.
+	/// Binds a parent session scoped to its exact SDK owner.
 	///
-	/// Eval runs presenting any other owner id are rejected even while this is
-	/// the only active binding, preventing sequential or concurrent embedders
-	/// from routing cells through the wrong parent.
+	/// Eval runs presenting any other owner id are rejected, preventing
+	/// sequential or concurrent embedders from routing cells through the wrong
+	/// parent.
 	pub(crate) fn bind_sdk_parent(
 		&self,
 		owner: Str,
 		parent: Arc<dyn ParentSessionHost>,
-	) -> Result<ParentBindingLease, BridgeHostError> {
-		self.bind_parent_with_scope(owner, parent, true)
-	}
-
-	fn bind_parent_with_scope(
-		&self,
-		owner: Str,
-		parent: Arc<dyn ParentSessionHost>,
-		strict_owner: bool,
 	) -> Result<ParentBindingLease, BridgeHostError> {
 		if owner.is_empty() {
 			return Err(BridgeHostError::message("eval bridge parent owner is empty"));
@@ -962,7 +928,7 @@ impl SessionBridgeHost {
 		if parents.contains_key(&owner) {
 			return Err(BridgeHostError::message("eval bridge parent owner is already bound"));
 		}
-		parents.insert(owner.clone(), ParentBinding { generation, parent, strict_owner });
+		parents.insert(owner.clone(), ParentBinding { generation, parent });
 		drop(parents);
 		Ok(ParentBindingLease { parents: Arc::clone(&self.parents), owner, generation })
 	}
@@ -974,12 +940,6 @@ impl SessionBridgeHost {
 		let parents = self.parents.lock();
 		if let Some(binding) = parents.get(owner) {
 			return Ok((Str::new(owner), binding.generation, Arc::clone(&binding.parent)));
-		}
-		if parents.len() == 1 {
-			let (binding_owner, binding) = parents.iter().next().expect("one parent exists");
-			if !binding.strict_owner {
-				return Ok((binding_owner.clone(), binding.generation, Arc::clone(&binding.parent)));
-			}
 		}
 		Err(BridgeHostError::message("eval bridge parent session is not bound for this owner"))
 	}
@@ -1710,14 +1670,16 @@ mod tests {
 		let client = registration.client();
 		assert_eq!(
 			client
-				.call("read", json!({ "path": "x" }))
+				.call_with_progress("read", json!({ "path": "x" }), &NoopBridgeProgress)
 				.await
 				.expect("allowed call"),
 			json!({ "name": "read", "args": { "path": "x" } })
 		);
 		assert_eq!(host.calls.load(Ordering::Relaxed), 1);
 		assert_eq!(
-			client.call("write", json!({})).await,
+			client
+				.call_with_progress("write", json!({}), &NoopBridgeProgress)
+				.await,
 			Err(BridgeCallError::CapabilityDenied { name: sf!("write") })
 		);
 		assert_eq!(host.calls.load(Ordering::Relaxed), 1, "denied calls never reach host");
@@ -1739,9 +1701,19 @@ mod tests {
 		let client = registration.client();
 		let mut forged = client.clone();
 		forged.grant.token = SecretString::from("wrong".to_owned());
-		assert_eq!(forged.call("read", json!({})).await, Err(BridgeCallError::AuthenticationFailed));
+		assert_eq!(
+			forged
+				.call_with_progress("read", json!({}), &NoopBridgeProgress)
+				.await,
+			Err(BridgeCallError::AuthenticationFailed)
+		);
 		drop(registration);
-		assert!(client.call("read", json!({})).await.is_ok());
+		assert!(
+			client
+				.call_with_progress("read", json!({}), &NoopBridgeProgress)
+				.await
+				.is_ok()
+		);
 		assert_eq!(dispatcher.inner.registrations.lock().len(), 1);
 		drop(client);
 		drop(forged);
@@ -1804,7 +1776,10 @@ mod tests {
 			)
 			.expect("register bridge");
 		assert_eq!(
-			registration.client().call("read", json!({})).await,
+			registration
+				.client()
+				.call_with_progress("read", json!({}), &NoopBridgeProgress)
+				.await,
 			Err(BridgeCallError::Host { message: sf!("host exploded") })
 		);
 	}
@@ -1814,7 +1789,10 @@ mod tests {
 		let parent = Arc::new(RecordingParent { calls: AtomicUsize::new(0) });
 		let host = SessionBridgeHost::new();
 		let _binding = host
-			.bind_parent(sf!("owner-a"), parent)
+			.bind_sdk_parent(sf!("owner-a"), parent.clone())
+			.expect("bind parent");
+		let _other_binding = host
+			.bind_sdk_parent(sf!("owner-b"), parent)
 			.expect("bind parent");
 		let first = Bytes::from_static(b"eval-a");
 		let second = Bytes::from_static(b"eval-b");
@@ -1840,7 +1818,9 @@ mod tests {
 		host
 			.bind_registry(Arc::new(Registry::new()))
 			.expect("bind registry");
-		let binding = host.bind_parent(sf!("owner"), parent).expect("bind parent");
+		let binding = host
+			.bind_sdk_parent(sf!("owner"), parent)
+			.expect("bind parent");
 		let session = Bytes::from_static(b"eval-a");
 		host
 			.freeze_runtime("owner", &session)
@@ -1860,7 +1840,7 @@ mod tests {
 			.bind_registry(Arc::new(Registry::new()))
 			.expect("bind registry");
 		let _binding = host
-			.bind_parent(sf!("owner"), parent.clone())
+			.bind_sdk_parent(sf!("owner"), parent.clone())
 			.expect("bind parent");
 		let capabilities = host.capabilities().expect("bound capabilities");
 		let registration = dispatcher()
@@ -1875,7 +1855,7 @@ mod tests {
 		] {
 			assert_eq!(
 				client
-					.call(name, json!({ "marker": operation }))
+					.call_with_progress(name, json!({ "marker": operation }), &NoopBridgeProgress)
 					.await
 					.expect("parent call"),
 				json!({ "operation": operation, "args": { "marker": operation } })
@@ -1895,7 +1875,10 @@ mod tests {
 			.register(sf!("owner"), sf!("cell"), capabilities, host, TimeoutHandle::new(None))
 			.expect("register owner");
 		assert_eq!(
-			registration.client().call(COMPLETION, json!({})).await,
+			registration
+				.client()
+				.call_with_progress(COMPLETION, json!({}), &NoopBridgeProgress)
+				.await,
 			Err(BridgeCallError::CapabilityDenied { name: sf!(COMPLETION) })
 		);
 	}

@@ -13,8 +13,13 @@ use bytes::Bytes;
 use futures::{
 	Future, FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered,
 };
-use http::{HeaderMap, HeaderName, HeaderValue};
+use http::{HeaderMap, HeaderName, HeaderValue, header::WWW_AUTHENTICATE};
 use omp_core::Str;
+use omp_inference::{
+	auth::command::{CommandCredentialExecutor, CommandCredentialResolver},
+	id::PrincipalId,
+};
+use omp_oauth::{AuthChallenge, ChallengeKind, discover_auth_challenge};
 use omp_proto::env::v1 as pb;
 use omp_tool::{LeafOwner, LeafVersion};
 use parking_lot::{Mutex, RwLock};
@@ -45,22 +50,29 @@ use control_gate::ControlGate;
 use super::{
 	super::exthost::control::ControlConnectionIdentity,
 	McpLeaf, McpServerBackend, McpService, McpServiceError,
+	auth_authority::CombinedAuthAuthority,
 	client::{ClientError, InitializedServer, McpClient},
 	config::{
-		AuthConfig, AuthKind, EnvironmentPolicy, HeaderPolicy, McpServerConfig,
-		RequestIdFormat as ConfigRequestIdFormat, TransportKind, validate_server,
+		AuthConfig, AuthKind, ConfigSourceKind, EnvironmentPolicy, HeaderPolicy, McpServerConfig,
+		RequestIdFormat as ConfigRequestIdFormat, ResolvedServer, TransportKind, validate_server,
 	},
-	config_values::{ResolvedConfigValue, ResolvedTransportValues},
+	config_values::{
+		ConfigValueError, ResolvedConfigValue, ResolvedTransportValues, resolve_transport_values,
+	},
 	control::{ControlMountResolver, McpControlError},
 	device::{DeviceError, McpDeviceDefinitions, McpDeviceProjection},
+	filter::{NativeCoverage, filter_native_coverage, import_exa_keys},
 	http::{RefreshableHeaders, StreamableHttpConfig, StreamableHttpTransport, WreqExchange},
 	invoke,
 	json_rpc::RequestIdFormat,
 	legacy_sse::{LegacySseConfig, LegacySseTransport},
+	oauth::{AuthorityHeaders, McpOAuth, OAuthAttempt},
 	prompts::{PromptContent, PromptDefinition, PromptError, PromptsClient},
-	resources::{ResourceDefinition, ResourceError, ResourceTemplate, ResourcesClient},
+	resources::{
+		ResourceDefinition, ResourceError, ResourceTemplate, ResourcesClient, best_template,
+	},
 	stdio::{StdioConfig, StdioTransport},
-	transport::{McpTransport, TransportError},
+	transport::{McpTransport, TransportError, TransportFailure},
 };
 
 const STARTUP_RACE: Duration = Duration::from_millis(250);
@@ -79,24 +91,27 @@ const MAX_TOOL_PAGES: usize = 1_024;
 #[derive(Clone)]
 pub struct MountSpec {
 	/// Stable server name.
-	pub name:         Str,
+	pub name:             Str,
 	/// Validated declaration used as the persistent cache identity.
-	pub config:       Arc<McpServerConfig>,
+	pub config:           Arc<McpServerConfig>,
 	/// Canonical original declaration JSON, without resolved credential bytes.
-	pub config_json:  Bytes,
+	pub config_json:      Bytes,
 	/// Secret-typed dynamic values exposed only during transport construction.
-	pub values:       ResolvedTransportValues,
+	pub values:           ResolvedTransportValues,
 	/// Optional live combined-authority header lease for HTTP-like transports.
-	pub auth_headers: Option<Arc<dyn RefreshableHeaders>>,
+	pub auth_headers:     Option<Arc<dyn RefreshableHeaders>>,
+	/// Native tools that this mount must not publish through the generic MCP
+	/// device because an exact native implementation already owns them.
+	pub suppressed_tools: BTreeSet<Str>,
 	/// Full Python endpoint projection and device policy.
-	pub projection:   Arc<McpDeviceProjection>,
+	pub projection:       Arc<McpDeviceProjection>,
 	/// Credential requirement retained without credential bytes.
-	pub auth:         ControlMountAuth,
+	pub auth:             ControlMountAuth,
 	/// Declared child reconnect behavior.
-	pub restart:      McpRestartPolicy,
+	pub restart:          McpRestartPolicy,
 	/// Authenticated extension owner for CONTROL mounts; native mounts have no
 	/// extension owner.
-	pub owner:        Option<Arc<ControlConnectionIdentity>>,
+	pub owner:            Option<Arc<ControlConnectionIdentity>>,
 }
 /// Credential requirement retained from one Python mount declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,7 +192,13 @@ impl ControlMountResolver for ManagerControlMountResolver {
 				.map_err(|_| McpControlError::DeclarationRejected)?;
 			let declaration: ControlMountDeclaration = serde_json::from_value(declaration)
 				.map_err(|_| McpControlError::DeclarationRejected)?;
-			declaration.resolve(Arc::clone(&self.identity), config_json)
+			let mut spec = declaration.resolve(Arc::clone(&self.identity), config_json)?;
+			spec.values = self
+				.manager
+				.resolve_values(&spec.config, &self.cancellation)
+				.await
+				.map_err(McpControlError::Manager)?;
+			Ok(spec)
 		})
 	}
 }
@@ -371,18 +392,7 @@ impl ControlMountDeclaration {
 		if !validate_server(&self.server, &config).is_empty() {
 			return Err(McpControlError::DeclarationRejected);
 		}
-		let values = ResolvedTransportValues {
-			env:     config
-				.env
-				.iter()
-				.map(|(name, value)| (name.clone(), ResolvedConfigValue::Public(value.clone())))
-				.collect(),
-			headers: config
-				.headers
-				.iter()
-				.map(|(name, value)| (name.clone(), ResolvedConfigValue::Public(value.clone())))
-				.collect(),
-		};
+		let values = ResolvedTransportValues::default();
 		let projection = McpDeviceProjection::new(
 			&self.include,
 			&self.exclude,
@@ -399,6 +409,7 @@ impl ControlMountDeclaration {
 			config_json,
 			values,
 			auth_headers: None,
+			suppressed_tools: BTreeSet::new(),
 			projection,
 			auth,
 			restart,
@@ -722,6 +733,10 @@ pub struct McpManager {
 	connector:     Arc<dyn McpConnector>,
 	workspace:     Arc<[Str]>,
 	local_root:    PathBuf,
+	environment:   BTreeMap<Str, Str>,
+	commands:      RwLock<Option<Arc<CommandCredentialResolver>>>,
+	authority:     RwLock<Option<Arc<CombinedAuthAuthority>>>,
+	oauth:         RwLock<Option<Arc<McpOAuth>>>,
 	state:         Mutex<ManagerState>,
 	subscriptions: Mutex<SubscriptionState>,
 	auth:          RwLock<Option<Arc<dyn McpAuthChallengeHandler>>>,
@@ -746,6 +761,12 @@ impl McpManager {
 			connector,
 			workspace,
 			local_root,
+			environment: std::env::vars()
+				.map(|(name, value)| (Str::from(name), Str::from(value)))
+				.collect(),
+			commands: RwLock::new(None),
+			authority: RwLock::new(None),
+			oauth: RwLock::new(None),
 			state: Mutex::new(ManagerState { mounts: BTreeMap::new() }),
 			subscriptions: Mutex::new(SubscriptionState {
 				enabled: false,
@@ -764,6 +785,34 @@ impl McpManager {
 	/// Binds the combined credential authority's reactive challenge hook.
 	pub fn bind_auth_handler(&self, handler: Arc<dyn McpAuthChallengeHandler>) {
 		*self.auth.write() = Some(handler);
+	}
+
+	/// Binds the composition-owned `!command` executor shared with model auth.
+	pub fn bind_command_executor(&self, executor: Arc<dyn CommandCredentialExecutor>) {
+		*self.commands.write() =
+			Some(Arc::new(CommandCredentialResolver::new(executor, Duration::from_secs(1))));
+	}
+
+	/// Binds the shared encrypted authority used to import native Exa keys.
+	pub fn bind_auth_authority(&self, authority: Arc<CombinedAuthAuthority>) {
+		*self.authority.write() = Some(authority);
+	}
+
+	/// Binds the OAuth flow used to attach live token headers and react to
+	/// unauthenticated MCP endpoints.
+	pub fn bind_oauth(&self, oauth: Arc<McpOAuth>) {
+		*self.oauth.write() = Some(oauth);
+	}
+
+	async fn resolve_values(
+		&self,
+		config: &McpServerConfig,
+		cancellation: &CancellationToken,
+	) -> Result<ResolvedTransportValues, ManagerError> {
+		let commands = self.commands.read().clone();
+		resolve_transport_values(config, &self.environment, commands.as_deref(), cancellation)
+			.await
+			.map_err(ManagerError::ConfigValues)
 	}
 
 	/// Starts all declarations in parallel, waits at most 250 ms, and leaves
@@ -837,24 +886,69 @@ impl McpManager {
 			if !config.enabled {
 				continue;
 			}
-			let values = ResolvedTransportValues {
-				env:     config
-					.env
-					.iter()
-					.map(|(name, value)| (name.clone(), ResolvedConfigValue::Public(value.clone())))
-					.collect(),
-				headers: config
-					.headers
-					.iter()
-					.map(|(name, value)| (name.clone(), ResolvedConfigValue::Public(value.clone())))
-					.collect(),
+			let name = Str::from(entry.name.as_str());
+			let filtered = filter_native_coverage(
+				&BTreeMap::from([(name.clone(), ResolvedServer {
+					name:        name.clone(),
+					config:      Arc::new(config),
+					source:      PathBuf::new(),
+					source_kind: ConfigSourceKind::Root,
+					writable:    true,
+				})]),
+				&NativeCoverage::default(),
+			);
+			if !filtered.exa_keys.is_empty()
+				&& let Some(authority) = self.authority.read().clone()
+				&& import_exa_keys(
+					&authority,
+					"default",
+					PrincipalId::from("default"),
+					filtered.exa_keys.clone(),
+					now_ms(),
+				)
+				.is_err()
+			{
+				tracing::warn!(server = %entry.name, "MCP Exa key import failed");
+			}
+			let Some(filtered) = filtered.mounts.get(&name) else {
+				continue;
 			};
+			let config = Arc::clone(&filtered.server.config);
+			let values = match self.resolve_values(&config, &self.shutdown).await {
+				Ok(values) => values,
+				Err(error) => {
+					tracing::warn!(server = %entry.name, %error, "MCP config refresh skipped unresolved values");
+					continue;
+				},
+			};
+			let Ok(config_json) = serde_json::to_vec(config.as_ref()).map(Bytes::from) else {
+				continue;
+			};
+			let auth_headers =
+				if matches!(config.resolved_transport(), TransportKind::Http | TransportKind::Sse)
+					&& config
+						.auth
+						.as_ref()
+						.is_some_and(|auth| auth.kind == AuthKind::Oauth)
+				{
+					let oauth = self.oauth.read().clone();
+					match oauth {
+						Some(oauth) => oauth
+							.authority_headers("default", entry.name.as_str(), &config)
+							.await
+							.ok(),
+						None => None,
+					}
+				} else {
+					None
+				};
 			declarations.insert(Str::from(entry.name.as_str()), MountSpec {
 				name: Str::from(entry.name),
-				config: Arc::new(config),
-				config_json: entry.server_json,
+				config,
+				config_json,
 				values,
-				auth_headers: None,
+				auth_headers,
+				suppressed_tools: filtered.suppressed_tools.clone(),
 				projection: McpDeviceProjection::all(),
 				auth: ControlMountAuth::None,
 				restart: McpRestartPolicy::OnFailure,
@@ -1145,6 +1239,25 @@ impl McpManager {
 			.cloned()
 	}
 
+	/// Accepts advertised concrete resources and the most-specific matching
+	/// RFC 6570 template before an `mcp://` read reaches the remote server.
+	pub(crate) fn routes_resource(&self, name: &str, uri: &str) -> bool {
+		let state = self.state.lock();
+		let Some(connection) = state
+			.mounts
+			.get(name)
+			.and_then(|mount| mount.connection.as_ref())
+		else {
+			return false;
+		};
+		connection
+			.resources
+			.read()
+			.iter()
+			.any(|resource| resource.uri == uri)
+			|| best_template(&connection.templates.read(), uri).is_some()
+	}
+
 	pub(crate) async fn connection(
 		&self,
 		name: &str,
@@ -1184,10 +1297,68 @@ impl McpManager {
 		cancel: CancellationToken,
 	) -> bool {
 		let handler = self.auth.read().clone();
-		match handler {
-			Some(handler) => handler.refresh(name, challenges, cancel).await,
-			None => false,
+		if let Some(handler) = handler
+			&& handler
+				.refresh(name, challenges, cancel.child_token())
+				.await
+		{
+			return true;
 		}
+		self.authorize_challenge(name, challenges, cancel).await
+	}
+
+	async fn authorize_challenge(
+		&self,
+		name: &str,
+		challenges: &[Str],
+		cancel: CancellationToken,
+	) -> bool {
+		let (config, server_url) = {
+			let state = self.state.lock();
+			let Some(mount) = state.mounts.get(name) else {
+				return false;
+			};
+			let Some(server_url) = mount.spec.config.url.clone() else {
+				return false;
+			};
+			(Arc::clone(&mount.spec.config), server_url)
+		};
+		let Some(oauth) = self.oauth.read().clone() else {
+			return false;
+		};
+		let mut headers = HeaderMap::new();
+		for challenge in challenges {
+			let Ok(value) = HeaderValue::from_str(challenge) else {
+				continue;
+			};
+			headers.append(WWW_AUTHENTICATE, value);
+		}
+		let Some(challenge) = discover_auth_challenge(&headers, "") else {
+			return false;
+		};
+		let Ok(state) = oauth
+			.authorize(OAuthAttempt {
+				profile: "default",
+				server: name,
+				server_url: server_url.as_str(),
+				config: &config,
+				challenge: &challenge,
+				listener_uri: "http://127.0.0.1:3000/callback",
+				cancel,
+			})
+			.await
+		else {
+			return false;
+		};
+		let Ok(headers) = AuthorityHeaders::new(oauth, state).await else {
+			return false;
+		};
+		let mut state = self.state.lock();
+		let Some(mount) = state.mounts.get_mut(name) else {
+			return false;
+		};
+		mount.spec.auth_headers = Some(headers);
+		true
 	}
 
 	fn install_mount(self: &Arc<Self>, spec: MountSpec, generation: u64) {
@@ -1263,7 +1434,10 @@ impl McpManager {
 		name: Str,
 		generation: u64,
 	) -> Result<Arc<LiveConnection>, ManagerError> {
-		let result = self.connect_once(&name, generation).await;
+		let mut result = self.connect_once(&name, generation).await;
+		if is_unauthorized(&result) && self.authorize_initial(&name, generation).await {
+			result = self.connect_once(&name, generation).await;
+		}
 		{
 			let mut state = self.state.lock();
 			if let Some(mount) = state.mounts.get_mut(&name)
@@ -1278,6 +1452,62 @@ impl McpManager {
 		}
 		self.changed.notify_waiters();
 		result
+	}
+
+	async fn authorize_initial(&self, name: &str, generation: u64) -> bool {
+		let (config, server_url) = {
+			let state = self.state.lock();
+			let Some(mount) = state.mounts.get(name) else {
+				return false;
+			};
+			if mount.generation != generation || mount.spec.auth_headers.is_some() {
+				return false;
+			}
+			let Some(server_url) = mount.spec.config.url.clone() else {
+				return false;
+			};
+			(Arc::clone(&mount.spec.config), server_url)
+		};
+		let Some(oauth) = self.oauth.read().clone() else {
+			return false;
+		};
+		let challenge = AuthChallenge {
+			kind:                   ChallengeKind::OAuth,
+			authorization_endpoint: None,
+			token_endpoint:         None,
+			registration_endpoint:  None,
+			resource_metadata:      None,
+			auth_server:            None,
+			resource:               None,
+			scopes:                 Box::new([]),
+			client_id:              None,
+		};
+		let Ok(state) = oauth
+			.authorize(OAuthAttempt {
+				profile:      "default",
+				server:       name,
+				server_url:   server_url.as_str(),
+				config:       &config,
+				challenge:    &challenge,
+				listener_uri: "http://127.0.0.1:3000/callback",
+				cancel:       self.shutdown.child_token(),
+			})
+			.await
+		else {
+			return false;
+		};
+		let Ok(headers) = AuthorityHeaders::new(oauth, state).await else {
+			return false;
+		};
+		let mut state = self.state.lock();
+		let Some(mount) = state.mounts.get_mut(name) else {
+			return false;
+		};
+		if mount.generation != generation {
+			return false;
+		}
+		mount.spec.auth_headers = Some(headers);
+		true
 	}
 
 	async fn connect_once(
@@ -1394,7 +1624,7 @@ impl McpManager {
 		prompts: Vec<PromptDefinition>,
 		instructions: Option<Str>,
 	) -> Result<u64, ManagerError> {
-		let (definition_version, protocol_version, projection) = {
+		let (definition_version, protocol_version, suppressed_tools, projection) = {
 			let mut state = self.state.lock();
 			let mount = state
 				.mounts
@@ -1408,7 +1638,12 @@ impl McpManager {
 				.connection
 				.as_ref()
 				.map_or("2025-11-25", |connection| connection.initialized.protocol_version.as_str());
-			(mount.definition_version, Str::from(protocol_version), Arc::clone(&mount.spec.projection))
+			(
+				mount.definition_version,
+				Str::from(protocol_version),
+				mount.spec.suppressed_tools.clone(),
+				Arc::clone(&mount.spec.projection),
+			)
 		};
 		let leaves = McpDeviceDefinitions {
 			server: Str::from(name),
@@ -1417,6 +1652,7 @@ impl McpManager {
 			templates,
 			prompts,
 			instructions,
+			suppressed_tools,
 			projection,
 		}
 		.into_leaves(&protocol_version)?;
@@ -1475,6 +1711,12 @@ impl McpManager {
 			"notifications/tools/list_changed" => Some(RefreshKind::Tools),
 			"notifications/resources/list_changed" => Some(RefreshKind::Resources),
 			"notifications/prompts/list_changed" => Some(RefreshKind::Prompts),
+			"notifications/resources/updated" => {
+				if ResourcesClient::decode_update(params.clone()).is_err() {
+					return;
+				}
+				None
+			},
 			_ => None,
 		};
 		if let Some(refresh) = refresh {
@@ -2010,6 +2252,14 @@ impl McpServerBackend for ManagedBackend {
 							"mimeType": mime_type,
 							"data": omp_core::base64::encode(&bytes),
 						}),
+						PromptContent::Resource(resource) if resource.text => json!({
+							"type": "resource",
+							"resource": {
+								"uri": resource.uri,
+								"mimeType": resource.mime_type,
+								"text": String::from_utf8_lossy(&resource.bytes),
+							}
+						}),
 						PromptContent::Resource(resource) => json!({
 							"type": "resource",
 							"resource": {
@@ -2096,9 +2346,22 @@ fn manager_service_error(error: ManagerError) -> McpServiceError {
 	}
 }
 
+fn is_unauthorized(result: &Result<Arc<LiveConnection>, ManagerError>) -> bool {
+	matches!(
+		result,
+		Err(ManagerError::Client(ClientError::Transport(TransportError {
+			cause: TransportFailure::HttpStatus { status: 401 },
+			..
+		})))
+	)
+}
+
 /// Lifecycle, transport, or definition publication failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ManagerError {
+	/// Dynamic transport values could not be resolved without exposing secrets.
+	#[error(transparent)]
+	ConfigValues(#[from] ConfigValueError),
 	/// Declaration cannot construct the selected transport.
 	#[error("MCP declaration is invalid")]
 	InvalidConfig,

@@ -43,6 +43,11 @@ impl Resolve for McpUrlResolver {
 		_selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
 		let (server, uri) = self.parse(resource)?;
+		if !self.service.routes_resource(server, uri) {
+			return Err(Fault::Source {
+				message: Str::new_static("MCP resource is not advertised by this server."),
+			});
+		}
 		let status = self.service.status(Some(server));
 		let current = status
 			.servers

@@ -16,7 +16,7 @@ use omp_core::Str;
 use omp_tools::manage_skill::{
 	Action, AuthorityError, ManagedSkillAuthority, MutationOutcome, MutationRequest,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use crate::managed_skills_domain::{CandidateError, ManagedSkillCandidate, is_valid_name};
 
@@ -26,7 +26,6 @@ pub struct ManagedSkills {
 	authored_names: BTreeSet<Str>,
 	mutation_locks: Mutex<BTreeMap<Str, Arc<Mutex<()>>>>,
 	revision:       AtomicU64,
-	inventory:      RwLock<Arc<BTreeSet<Str>>>,
 	temp_sequence:  AtomicU64,
 }
 
@@ -39,14 +38,8 @@ impl ManagedSkills {
 			authored_names,
 			mutation_locks: Mutex::new(BTreeMap::new()),
 			revision: AtomicU64::new(0),
-			inventory: RwLock::new(Arc::new(BTreeSet::new())),
 			temp_sequence: AtomicU64::new(0),
 		}
-	}
-
-	/// Returns the latest Environment-refreshed generated-skill inventory.
-	pub fn inventory(&self) -> Arc<BTreeSet<Str>> {
-		Arc::clone(&self.inventory.read())
 	}
 
 	fn serialize_name<'a>(&self, raw: &'a str) -> Result<(Str, NameLock<'_>), AuthorityError> {
@@ -98,7 +91,6 @@ impl ManagedSkills {
 				fs::remove_dir_all(&directory).map_err(map_io)?;
 			},
 		}
-		self.refresh();
 		let revision = self
 			.revision
 			.fetch_add(1, Ordering::AcqRel)
@@ -207,28 +199,6 @@ impl ManagedSkills {
 		handle.set_len(0).map_err(map_io)?;
 		handle.write_all(bytes).map_err(map_io)?;
 		handle.sync_all().map_err(map_io)
-	}
-
-	fn refresh(&self) {
-		let names = fs::read_dir(&self.root)
-			.into_iter()
-			.flatten()
-			.filter_map(Result::ok)
-			.filter_map(|entry| {
-				let file_type = entry.file_type().ok()?;
-				if !file_type.is_dir() {
-					return None;
-				}
-				let name = entry.file_name().into_string().ok()?;
-				if !is_valid_name(&name) {
-					return None;
-				}
-				let skill = fs::symlink_metadata(entry.path().join("SKILL.md")).ok()?;
-				(!skill.file_type().is_symlink() && skill.is_file() && link_count(&skill) == 1)
-					.then(|| Str::new(name))
-			})
-			.collect();
-		*self.inventory.write() = Arc::new(names);
 	}
 }
 
@@ -341,6 +311,5 @@ mod tests {
 			.unwrap();
 		assert_eq!(created.revision, 1);
 		assert!(root.join("new-skill/SKILL.md").is_file());
-		assert!(authority.inventory().contains("new-skill"));
 	}
 }

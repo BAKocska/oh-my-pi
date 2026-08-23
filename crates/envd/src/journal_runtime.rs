@@ -181,6 +181,7 @@ impl ExternalJournalActor {
 	/// # Errors
 	///
 	/// Refuses a second binding rather than transferring session authority.
+	#[cfg(test)]
 	pub(crate) fn bind_agent(&self, id: u64, sender: ControlSender) -> Result<(), EnvdError> {
 		self.bind_agent_with_host(id, sender, None)
 	}
@@ -197,11 +198,6 @@ impl ExternalJournalActor {
 		}
 		*agent = Some(AgentBinding { id, sender, host });
 		Ok(())
-	}
-
-	/// Returns the project-owned durable schedule authority.
-	pub(crate) fn schedules(&self) -> DurableScheduleHandle {
-		self.schedules.clone()
 	}
 
 	/// Installs the host owner that attaches or starts agents for scheduled

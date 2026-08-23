@@ -16,6 +16,7 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
+gix = { workspace = true }
 globset = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
@@ -24,7 +25,7 @@ miette = { workspace = true }
 nix = { workspace = true }
 omp-agent = { workspace = true }
 omp-catalog = { workspace = true }
-omp-core = { workspace = true }
+omp-core = { workspace = true, features = ["schemars"] }
 omp-desktop = { workspace = true }
 omp-docserver = { workspace = true }
 omp-env = { workspace = true }

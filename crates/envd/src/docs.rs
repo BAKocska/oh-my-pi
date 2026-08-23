@@ -321,6 +321,7 @@ pub(super) struct ResourceMutationServices {
 	pub(super) vault: VaultService,
 }
 
+/// Client connection to the project document server.
 #[derive(Clone, Debug)]
 pub struct DocumentHost {
 	inner: Arc<Inner>,

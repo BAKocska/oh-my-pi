@@ -74,7 +74,6 @@ pub async fn sync_session_roots(
 }
 use tokio_util::sync::CancellationToken;
 
-#[path = "workspace_ops.rs"]
 mod operations;
 
 use std::{fs, num, thread};

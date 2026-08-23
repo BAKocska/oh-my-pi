@@ -1,14 +1,19 @@
 //! Complete bounded Git status, numstat, and unified-diff read models.
 
-use std::{path::Path, str};
+use std::{
+	path::Path,
+	str,
+	sync::atomic::{AtomicBool, Ordering},
+};
 
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::{
 	commands::CommandError,
+	native,
 	query::GitPath,
-	runner::{GitRunOptions, GitRunner},
+	runner::{GitRunError, GitRunOptions, GitRunner},
 };
 
 /// Porcelain status counts.
@@ -131,6 +136,9 @@ impl GitDiff {
 	}
 
 	/// Captures a complete raw worktree or cached diff.
+	///
+	/// Stays on system Git because consumers (`git apply`, external parsers)
+	/// require Git's byte-exact patch framing including binary literals.
 	pub async fn raw(
 		&self,
 		cwd: &Path,
@@ -166,6 +174,15 @@ impl GitDiff {
 		cached: bool,
 		cancel: &CancellationToken,
 	) -> Result<Vec<GitPath>, CommandError> {
+		match native::with_repository(cwd, cancel, move |repository, stop| {
+			native_names(repository, stop, cached)
+		})
+		.await
+		{
+			Ok(value) => return Ok(value),
+			Err(error) if error.is_cancelled() => return Err(GitRunError::Cancelled.into()),
+			Err(error) => tracing::debug!(%error, "in-process Git read fell back to system Git"),
+		}
 		let argv = if cached {
 			["diff", "--cached", "--name-only", "-z"]
 		} else {
@@ -182,6 +199,15 @@ impl GitDiff {
 		cached: bool,
 		cancel: &CancellationToken,
 	) -> Result<bool, CommandError> {
+		match native::with_repository(cwd, cancel, move |repository, stop| {
+			native_has(repository, stop, cached)
+		})
+		.await
+		{
+			Ok(value) => return Ok(value),
+			Err(error) if error.is_cancelled() => return Err(GitRunError::Cancelled.into()),
+			Err(error) => tracing::debug!(%error, "in-process Git read fell back to system Git"),
+		}
 		let argv = if cached {
 			["diff", "--cached", "--quiet"]
 		} else {
@@ -204,6 +230,9 @@ impl GitDiff {
 	}
 
 	/// Captures a complete tree-to-tree patch.
+	///
+	/// Stays on system Git because consumers (`git apply`, external parsers)
+	/// require Git's byte-exact patch framing including binary literals.
 	pub async fn tree(
 		&self,
 		cwd: &Path,
@@ -221,6 +250,9 @@ impl GitDiff {
 	}
 
 	/// Runs Git's no-index diff. Exit status one means a valid difference.
+	///
+	/// Stays on system Git because consumers (`git apply`, external parsers)
+	/// require Git's byte-exact patch framing including binary literals.
 	pub async fn no_index(
 		&self,
 		cwd: &Path,
@@ -243,12 +275,170 @@ impl GitDiff {
 		cwd: &Path,
 		cancel: &CancellationToken,
 	) -> Result<StatusCounts, CommandError> {
+		match native::with_repository(cwd, cancel, native_status_counts).await {
+			Ok(value) => return Ok(value),
+			Err(error) if error.is_cancelled() => return Err(GitRunError::Cancelled.into()),
+			Err(error) => tracing::debug!(%error, "in-process Git read fell back to system Git"),
+		}
 		let bytes = self
 			.invoke(cwd, &["status", "--porcelain=v2", "-z", "--untracked-files=all"], false, cancel)
 			.await?;
 		Ok(parse_status(&bytes))
-	}
+		}
 }
+
+	fn native_status_counts(
+		repository: &mut gix::Repository,
+		stop: &AtomicBool,
+	) -> Result<StatusCounts, native::NativeError> {
+		let ignored_staged = index_paths_with_flags(
+			repository,
+			gix::index::entry::Flags::INTENT_TO_ADD | gix::index::entry::Flags::CONFLICTED,
+		)?;
+		let mut counts = StatusCounts::default();
+		let items = status_items(repository, gix::status::UntrackedFiles::Files)?;
+		for item in items {
+			if stop.load(Ordering::Relaxed) {
+				return Err(native::NativeError::Cancelled);
+			}
+			match item.map_err(native::op_error)? {
+				gix::status::Item::TreeIndex(change) => {
+					if !path_in(&ignored_staged, change.location().as_ref()) {
+						counts.staged += 1;
+					}
+				},
+				gix::status::Item::IndexWorktree(item) => match item {
+					entry @ gix::status::index_worktree::Item::DirectoryContents { .. } => {
+						if entry.summary().is_some() {
+							counts.untracked += 1;
+						}
+					},
+					_ => match item.summary() {
+						Some(gix::status::index_worktree::iter::Summary::Conflict) => {
+							counts.staged += 1;
+							counts.unstaged += 1;
+						},
+						Some(_) => counts.unstaged += 1,
+						None => {},
+					},
+				},
+			}
+		}
+		Ok(counts)
+	}
+
+	fn native_names(
+		repository: &mut gix::Repository,
+		stop: &AtomicBool,
+		cached: bool,
+	) -> Result<Vec<GitPath>, native::NativeError> {
+		let ignored_staged = cached
+			.then(|| {
+				index_paths_with_flags(
+					repository,
+								gix::index::entry::Flags::INTENT_TO_ADD,
+				)
+			})
+			.transpose()?
+			.unwrap_or_default();
+		let mut paths = Vec::new();
+		let items = status_items(repository, gix::status::UntrackedFiles::None)?;
+		for item in items {
+			if stop.load(Ordering::Relaxed) {
+				return Err(native::NativeError::Cancelled);
+			}
+			match item.map_err(native::op_error)? {
+				gix::status::Item::TreeIndex(change)
+					if cached && !path_in(&ignored_staged, change.location().as_ref()) =>
+				{
+					paths.push(GitPath::from_bytes(change.location().as_ref()));
+				},
+				gix::status::Item::IndexWorktree(item)
+					if !cached
+						&& !matches!(
+							&item,
+							gix::status::index_worktree::Item::DirectoryContents { .. }
+						) && item.summary().is_some() =>
+				{
+					paths.push(GitPath::from_bytes(item.rela_path().as_ref()));
+				},
+				_ => {},
+			}
+		}
+		paths.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+		Ok(paths)
+	}
+
+	fn native_has(
+		repository: &mut gix::Repository,
+		stop: &AtomicBool,
+		cached: bool,
+	) -> Result<bool, native::NativeError> {
+		let ignored_staged = cached
+			.then(|| {
+				index_paths_with_flags(
+					repository,
+								gix::index::entry::Flags::INTENT_TO_ADD,
+				)
+			})
+			.transpose()?
+			.unwrap_or_default();
+		let items = status_items(repository, gix::status::UntrackedFiles::None)?;
+		for item in items {
+			if stop.load(Ordering::Relaxed) {
+				return Err(native::NativeError::Cancelled);
+			}
+			match item.map_err(native::op_error)? {
+				gix::status::Item::TreeIndex(change)
+					if cached && !path_in(&ignored_staged, change.location().as_ref()) =>
+				{
+					return Ok(true);
+				},
+				gix::status::Item::IndexWorktree(item)
+					if !cached
+						&& !matches!(
+							&item,
+							gix::status::index_worktree::Item::DirectoryContents { .. }
+						) && item.summary().is_some() =>
+				{
+					return Ok(true);
+				},
+				_ => {},
+			}
+		}
+		Ok(false)
+	}
+
+	fn status_items(
+		repository: &gix::Repository,
+		untracked: gix::status::UntrackedFiles,
+	) -> Result<gix::status::Iter, native::NativeError> {
+		repository
+			.status(gix::progress::Discard)
+			.map_err(native::op_error)?
+			.untracked_files(untracked)
+			.tree_index_track_renames(gix::status::tree_index::TrackRenames::AsConfigured)
+			.index_worktree_rewrites(gix::diff::Rewrites::default())
+			.into_iter(Vec::new())
+			.map_err(native::op_error)
+	}
+
+	fn index_paths_with_flags(
+		repository: &gix::Repository,
+		flags: gix::index::entry::Flags,
+	) -> Result<Vec<Vec<u8>>, native::NativeError> {
+		let index = repository.index_or_empty().map_err(native::op_error)?;
+		Ok(index
+			.entries()
+			.iter()
+			.filter(|entry| entry.flags.intersects(flags))
+			.map(|entry| entry.path(&index).to_vec())
+			.collect())
+	}
+
+	fn path_in(paths: &[Vec<u8>], location: &[u8]) -> bool {
+		paths.iter().any(|path| path == location)
+	}
 
 /// Parses porcelain v1 (line or NUL framed) and v2 records into counts.
 pub fn parse_status(bytes: &[u8]) -> StatusCounts {
@@ -467,4 +657,104 @@ fn parse_paths(bytes: Bytes) -> Vec<GitPath> {
 		.filter(|path| !path.is_empty())
 		.map(GitPath::from_bytes)
 		.collect()
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{fs, path::Path, process::Command, sync::atomic::AtomicBool};
+
+	use bytes::Bytes;
+
+	use super::{native_has, native_names, native_status_counts, parse_paths, parse_status};
+
+	fn fixture_git(cwd: &Path, arguments: &[&str]) {
+		let output = Command::new("git")
+			.current_dir(cwd)
+			.args(arguments)
+			.env("GIT_TERMINAL_PROMPT", "0")
+			.output()
+			.expect("fixture git should launch");
+		assert!(
+			output.status.success(),
+			"fixture git {arguments:?} failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+
+	fn fixture_output(cwd: &Path, arguments: &[&str]) -> Vec<u8> {
+		let output = Command::new("git")
+			.current_dir(cwd)
+			.args(arguments)
+			.env("GIT_TERMINAL_PROMPT", "0")
+			.output()
+			.expect("fixture git should launch");
+		assert!(
+			output.status.success(),
+			"fixture git {arguments:?} failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		output.stdout
+	}
+
+	fn fixture() -> tempfile::TempDir {
+		let root = tempfile::tempdir().expect("temporary repository root");
+		fixture_git(root.path(), &["init", "-b", "main"]);
+		fixture_git(root.path(), &["config", "user.name", "OMP Test"]);
+		fixture_git(root.path(), &["config", "user.email", "omp@example.invalid"]);
+		fs::write(root.path().join(".gitignore"), "ignored\n").expect("write ignore");
+		fs::write(root.path().join("tracked.txt"), "before\n").expect("write tracked");
+		fs::write(root.path().join("old.txt"), "rename me\n").expect("write old");
+		fixture_git(root.path(), &["add", "."]);
+		fixture_git(root.path(), &["commit", "-m", "seed"]);
+		fs::write(root.path().join("tracked.txt"), "staged\n").expect("stage tracked");
+		fixture_git(root.path(), &["add", "tracked.txt"]);
+		fixture_git(root.path(), &["mv", "old.txt", "renamed.txt"]);
+		fs::write(root.path().join("tracked.txt"), "staged and unstaged\n").expect("edit tracked");
+		fs::write(root.path().join("untracked.txt"), "new\n").expect("write untracked");
+		fs::write(root.path().join("ignored"), "ignored\n").expect("write ignored");
+		fs::write(root.path().join("intent.txt"), "pending\n").expect("write intent");
+		fixture_git(root.path(), &["add", "-N", "intent.txt"]);
+		root
+	}
+
+	#[test]
+	fn native_status_and_diff_names_match_git_including_intent_to_add() {
+		let fixture = fixture();
+		let mut repository = gix::discover(fixture.path()).expect("discover fixture");
+		let stop = AtomicBool::new(false);
+		let expected_status = parse_status(&fixture_output(fixture.path(), &[
+			"status",
+			"--porcelain=v2",
+			"-z",
+			"--untracked-files=all",
+		]));
+		assert_eq!(
+			native_status_counts(&mut repository, &stop).expect("native status"),
+			expected_status
+		);
+		let expected_cached = parse_paths(Bytes::from(fixture_output(fixture.path(), &[
+			"diff",
+			"--cached",
+			"--name-only",
+			"-z",
+		])));
+		assert!(expected_cached.windows(2).all(|paths| paths[0] <= paths[1]));
+		assert_eq!(
+			native_names(&mut repository, &stop, true).expect("native cached names"),
+			expected_cached
+		);
+		let expected_worktree = parse_paths(Bytes::from(fixture_output(fixture.path(), &[
+			"diff",
+			"--name-only",
+			"-z",
+			"--",
+		])));
+		assert!(expected_worktree.windows(2).all(|paths| paths[0] <= paths[1]));
+		assert_eq!(
+			native_names(&mut repository, &stop, false).expect("native worktree names"),
+			expected_worktree
+		);
+		assert!(native_has(&mut repository, &stop, true).expect("native cached has"));
+		assert!(native_has(&mut repository, &stop, false).expect("native worktree has"));
+	}
 }

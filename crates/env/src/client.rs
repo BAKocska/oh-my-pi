@@ -1,10 +1,10 @@
 use std::{
-	collections::{HashMap, hash_map::Entry},
+	collections::HashMap,
 	fmt::{self, Display},
-	fs, io,
+	io,
 	path::Path,
 	sync::{
-		Arc, LazyLock, Weak,
+		Arc, Weak,
 		atomic::{AtomicU64, Ordering},
 	},
 	thread,
@@ -14,7 +14,7 @@ use bytes::Bytes;
 #[cfg(unix)]
 use bytes::BytesMut;
 use flume::{Receiver, Sender};
-use omp_core::{EnvPath, Hash32, Str, sf};
+use omp_core::{EnvPath, Str, sf};
 #[cfg(unix)]
 use omp_proto::prost::Message as _;
 use omp_proto::{
@@ -219,118 +219,6 @@ pub struct EnvClient {
 	inner: Arc<ClientInner>,
 	grant: InvocationGrant,
 }
-#[derive(Clone)]
-struct SharedClientEntry {
-	client:       EnvClient,
-	token_digest: Hash32,
-}
-
-static SHARED_CLIENTS: LazyLock<Mutex<HashMap<Str, SharedClientEntry>>> =
-	LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Returns the process-shared environment client for one canonical project.
-///
-/// The first caller installs `create()` under the canonical root. Later
-/// callers receive an O(1) clone only when their bearer token authenticates
-/// against the installing token.
-pub fn client_for_project(
-	project_root: &Path,
-	token: &[u8],
-	create: impl FnOnce() -> EnvClient,
-) -> Result<EnvClient, ClientLeaseError> {
-	let canonical = fs::canonicalize(project_root)?;
-	let key = sf!("project:{}", canonical.to_string_lossy());
-	lease_shared_client(key, token, create)
-}
-
-/// Returns a process-shared client for one machine-global service lease.
-///
-/// Global names are profile-independent and intentionally contain no config
-/// root. The token remains mandatory so unrelated callers in the process
-/// cannot adopt a privileged global client by name alone.
-pub fn client_for_global(
-	service: &str,
-	token: &[u8],
-	create: impl FnOnce() -> EnvClient,
-) -> Result<EnvClient, ClientLeaseError> {
-	if service.is_empty()
-		|| service.len() > 64
-		|| !service
-			.bytes()
-			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-	{
-		return Err(ClientLeaseError::InvalidGlobalService);
-	}
-	let key = sf!("global:{service}");
-	lease_shared_client(key, token, create)
-}
-
-fn lease_shared_client(
-	key: Str,
-	token: &[u8],
-	create: impl FnOnce() -> EnvClient,
-) -> Result<EnvClient, ClientLeaseError> {
-	if token.len() < 32 {
-		return Err(ClientLeaseError::TokenTooShort);
-	}
-	let candidate = Hash32::sum(token);
-	if let Some(entry) = SHARED_CLIENTS.lock().get(&key).cloned() {
-		if !constant_time_digest_eq(&entry.token_digest, &candidate) {
-			return Err(ClientLeaseError::AuthenticationFailed);
-		}
-		return Ok(entry.client);
-	}
-	let client = create();
-	let mut clients = SHARED_CLIENTS.lock();
-	match clients.entry(key) {
-		Entry::Vacant(entry) => {
-			entry.insert(SharedClientEntry { client: client.clone(), token_digest: candidate });
-			Ok(client)
-		},
-		Entry::Occupied(entry) => {
-			if constant_time_digest_eq(&entry.get().token_digest, &candidate) {
-				Ok(entry.get().client.clone())
-			} else {
-				Err(ClientLeaseError::AuthenticationFailed)
-			}
-		},
-	}
-}
-
-fn constant_time_digest_eq(left: &Hash32, right: &Hash32) -> bool {
-	let difference = left
-		.as_bytes()
-		.iter()
-		.zip(right.as_bytes())
-		.fold(0_u8, |difference, (left, right)| difference | (left ^ right));
-	difference == 0
-}
-
-/// Clears process-shared project and global client leases.
-///
-/// Production uses this during orderly process shutdown. Dropping the cached
-/// clones never shuts down independently owned servers.
-pub fn close_shared_clients() {
-	SHARED_CLIENTS.lock().clear();
-}
-
-/// Shared client lease or authentication failure.
-#[derive(Debug, Error)]
-pub enum ClientLeaseError {
-	/// Canonical project-root resolution failed.
-	#[error(transparent)]
-	Canonicalize(#[from] io::Error),
-	/// Broker tokens carry at least 256 bits of entropy.
-	#[error("environment client token must contain at least 32 bytes")]
-	TokenTooShort,
-	/// A cached scope was requested with a different token.
-	#[error("environment client token authentication failed")]
-	AuthenticationFailed,
-	/// Machine-global service names are bounded portable identifiers.
-	#[error("invalid machine-global environment service name")]
-	InvalidGlobalService,
-}
-
 /// Cloneable out-of-band control for one active environment execution.
 ///
 /// Unlike [`ExecRun`], this handle does not own the execution stream or its

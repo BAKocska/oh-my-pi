@@ -18,7 +18,7 @@ pub(crate) mod invoke;
 pub mod json_rpc;
 pub(crate) mod legacy_sse;
 pub mod manager;
-pub(crate) mod oauth;
+pub mod oauth;
 pub(crate) mod prompts;
 pub(crate) mod resources;
 pub(crate) mod settings;
@@ -217,6 +217,17 @@ impl McpService {
 	/// mutations.
 	pub fn bind_manager(&self, manager: &Arc<manager::McpManager>) {
 		*self.manager.write() = Some(Arc::downgrade(manager));
+	}
+
+	/// Checks whether an advertised concrete resource or URI template routes the
+	/// requested `mcp://` path before proxying a remote read.
+	pub(crate) fn routes_resource(&self, server: &str, uri: &str) -> bool {
+		self
+			.manager
+			.read()
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.is_some_and(|manager| manager.routes_resource(server, uri))
 	}
 
 	/// Builds one extension-scoped MCP CONTROL projection over the live manager.
