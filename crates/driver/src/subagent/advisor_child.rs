@@ -5,13 +5,12 @@ use std::{collections::BTreeMap, fs, io, mem, path::PathBuf, sync::Arc};
 use omp_agent::{
 	Agent, AgentEvent, AgentKind, AgentState, AgentStatus, AgentTree, Budget, EventSubscription,
 	PromptError, PromptSource, SpawnRefusal, TurnClient, TurnId,
-	advisor::{AdvisorAdviceQueue, advise_tool},
 };
 use omp_catalog::GrammarBits;
 use omp_core::{Str, sf};
 use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
 use omp_storage::index::{SessionIndex, SessionKind};
-use omp_tool::{Claims, LoweringCaps, Precedence, Presentation, RegistryError};
+use omp_tool::{LoweringCaps, RegistryError};
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
@@ -34,8 +33,6 @@ pub struct AdvisorChildSpec {
 	pub tools:         Vec<Str>,
 	/// Complete advisor system prompt.
 	pub system_prompt: Str,
-	/// Clone-shared queue bound to this child's `advise@1` tool.
-	pub advice_queue:  AdvisorAdviceQueue,
 }
 
 /// Result of one persistent advisor prompt batch.
@@ -88,15 +85,6 @@ pub enum AdvisorChildError {
 		/// Filesystem failure.
 		#[source]
 		source: io::Error,
-	},
-	/// Advisor-local environment composition failed.
-	#[error("failed to compose environment for advisor {id}")]
-	Environment {
-		/// Advisor identity.
-		id:     Str,
-		/// Environment failure.
-		#[source]
-		source: omp_envd::EnvdError,
 	},
 	/// Advisor tool advertisement failed.
 	#[error("failed to lower tools for advisor {id}")]
@@ -175,6 +163,7 @@ pub(crate) struct AdvisorChildren {
 /// Borrow-free parent facts captured once for advisor composition.
 pub(crate) struct AdvisorSpawnContext<C: TurnClient + Clone + Send + 'static> {
 	pub(crate) client:        C,
+	pub(crate) env:           omp_env::EnvClient,
 	pub(crate) broker:        omp_agent::Broker,
 	pub(crate) supervisor:    Arc<SessionSupervisor<C>>,
 	pub(crate) state:         AgentState,
@@ -220,20 +209,10 @@ pub(crate) async fn spawn<C: TurnClient + Clone + Send + 'static>(
 		path: directory.clone(),
 		source,
 	})?;
-	let environment_state = directory.join(format!("{id}-env"));
-	let bridges = omp_envd::RegistryBridges {
-		dynamic_tools: vec![omp_envd::DynamicTool::new(
-			advise_tool(spec.advice_queue),
-			Presentation::Slot,
-			Claims { precedence: Precedence::CORE, claimant: sf!("omp/advisor"), replaces: None },
-		)],
-		..omp_envd::RegistryBridges::default()
-	};
-	let environment =
-		omp_envd::ProjectEnvironment::isolated(&context.root, &environment_state, bridges)
-			.await
-			.map_err(|source| AdvisorChildError::Environment { id: id.clone(), source })?;
-	let registry = environment.registry();
+	let registry = Arc::clone(&context.state.snapshot().registry);
+	if registry.live_identity("advise").is_none() {
+		return Err(AdvisorChildError::ToolUnavailable { id, tool: sf!("advise") });
+	}
 	let mut enabled = Vec::with_capacity(spec.tools.len().saturating_add(1));
 	for tool in spec.tools {
 		if enabled.iter().any(|enabled| enabled == &tool) {
@@ -307,16 +286,12 @@ pub(crate) async fn spawn<C: TurnClient + Clone + Send + 'static>(
 		.map_err(|source| AdvisorChildError::Admission { id: id.clone(), source })?;
 	let child = Agent::new(
 		context.client,
-		environment.client().clone(),
+		context.env.clone(),
 		AgentState::new(snapshot),
 		journal,
 		CHAT_CAPS_BASE,
 	);
 	let events = child.events().subscribe_lossless();
-	let control_binding = environment
-		.bind_agent_control(child.control())
-		.map_err(|source| AdvisorChildError::Environment { id: id.clone(), source })?;
-	environment.bind_device_availability(child.mailbox());
 	context
 		.broker
 		.register(&node, child.mailbox())
@@ -328,9 +303,7 @@ pub(crate) async fn spawn<C: TurnClient + Clone + Send + 'static>(
 		Some(sf!("Advisor: {}", spec.display_name)),
 		omp_agent::AgentHistory::default(),
 	);
-	let mut runtime = SupervisedRuntime::new(child);
-	runtime.retain(control_binding);
-	runtime.retain(environment);
+	let runtime = SupervisedRuntime::new(child);
 	if let Err(source) = context
 		.supervisor
 		.register(Arc::clone(&node), runtime, None)

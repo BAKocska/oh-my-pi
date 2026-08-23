@@ -99,6 +99,7 @@ pub struct HeadlessSessionOptions {
 pub struct HeadlessSession {
 	session:             SessionHandle,
 	advisor_parent:      Arc<chat::ChatParentHost<InProcTurnClient>>,
+	advise_queue:        omp_agent::advisor::AdvisorAdviceQueue,
 	state:               AgentState,
 	control:             omp_agent::ControlSender,
 	env:                 omp_env::EnvClient,
@@ -154,7 +155,9 @@ impl HeadlessSession {
 		chat::ensure_state_directory(&sessions_dir).map_err(composition)?;
 		let search = Arc::new(InferenceBridge::default());
 		let goal_control = AgentGoalControl::default();
-		let bridges = builtin(&root, Arc::clone(&search), goal_control.clone(), None);
+		let advise_queue = omp_agent::advisor::AdvisorAdviceQueue::default();
+		let bridges =
+			builtin(&root, Arc::clone(&search), goal_control.clone(), None, advise_queue.clone());
 		let environment = omp_envd::ProjectEnvironment::connect_or_start(
 			&root,
 			&state_dir,
@@ -348,6 +351,7 @@ impl HeadlessSession {
 		Ok(Self {
 			session: session_handle,
 			advisor_parent,
+			advise_queue,
 			state,
 			control,
 			env,
@@ -402,6 +406,11 @@ impl HeadlessSession {
 	/// children.
 	pub fn advisor_parent(&self) -> Arc<chat::ChatParentHost<InProcTurnClient>> {
 		Arc::clone(&self.advisor_parent)
+	}
+
+	/// Clone-shared session queue backing the environment's `advise@1` device.
+	pub fn advise_queue(&self) -> omp_agent::advisor::AdvisorAdviceQueue {
+		self.advise_queue.clone()
 	}
 
 	/// Lists model-callable environment tools available to advisor grant

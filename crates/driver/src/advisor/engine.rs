@@ -87,6 +87,8 @@ pub struct AdvisorEngineOptions {
 	pub immune_turns:    u32,
 	/// Session tools against which advisor grants are evaluated.
 	pub available_tools: Vec<Str>,
+	/// Clone-shared session queue backing the environment's `advise@1` device.
+	pub advice_queue:    AdvisorAdviceQueue,
 }
 
 /// One pending advisor prompt generated at a primary turn boundary.
@@ -203,7 +205,7 @@ impl AdvisorEngine {
 						delta: AdvisorDeltaSync::new(DELTA_MAINTENANCE_INTERVAL, None),
 						guard: AdvisorEmissionGuard::default(),
 						immunity: ImmuneTurnAccount::new(options.immune_turns),
-						queue: AdvisorAdviceQueue::default(),
+						queue: options.advice_queue.clone(),
 						runtime: AdvisorRuntimeState {
 							id,
 							parent_id: options.primary_session.clone(),
@@ -537,6 +539,7 @@ mod tests {
 				Str::new_static("grep"),
 				Str::new_static("glob"),
 			],
+			advice_queue: AdvisorAdviceQueue::default(),
 		}
 	}
 

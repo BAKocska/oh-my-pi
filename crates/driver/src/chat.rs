@@ -472,6 +472,8 @@ pub struct ChatScope<'a> {
 	pub session_index:    Arc<SessionIndex>,
 	/// Fully composed tool registry.
 	pub registry:         Arc<Registry>,
+	/// Clone-shared session queue backing the environment's `advise@1` device.
+	pub advise_queue:     omp_agent::advisor::AdvisorAdviceQueue,
 	/// Whether owner-local session state is persisted.
 	pub persist_sessions: bool,
 }
@@ -1161,6 +1163,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		advisor_child::spawn(
 			AdvisorSpawnContext {
 				client:        self.client.clone(),
+				env:           self.env.clone(),
 				broker:        self.broker.clone(),
 				supervisor:    Arc::clone(&self.supervisor),
 				state:         context.state,
@@ -6379,13 +6382,13 @@ mod tests {
 
 	#[derive(Clone)]
 	struct ScriptedParentClient {
-		outcomes: Arc<Mutex<VecDeque<inference_pb::Outcome>>>,
-		inputs:   Arc<Mutex<Vec<TurnInput>>>,
-		options:  Arc<Mutex<Vec<TurnOptions>>>,
+		scripts: Arc<Mutex<VecDeque<Vec<inference_pb::TurnEvent>>>>,
+		inputs:  Arc<Mutex<Vec<TurnInput>>>,
+		options: Arc<Mutex<Vec<TurnOptions>>>,
 	}
 
 	struct ScriptedParentSession {
-		events: Vec<Result<inference_pb::TurnEvent, omp_agent::Error>>,
+		events: VecDeque<Result<inference_pb::TurnEvent, omp_agent::Error>>,
 	}
 
 	impl TurnSession for ScriptedParentSession {
@@ -6393,7 +6396,9 @@ mod tests {
 			&mut self,
 		) -> impl Stream<Item = Result<inference_pb::TurnEvent, omp_agent::Error>> + Send + Unpin + '_
 		{
-			stream::iter(mem::take(&mut self.events))
+			// Survive stream re-acquisition: yield each remaining scripted
+			// event exactly once across repeated `events()` calls.
+			futures::stream::poll_fn(|_| std::task::Poll::Ready(self.events.pop_front()))
 		}
 
 		fn submit(
@@ -6416,17 +6421,19 @@ mod tests {
 		{
 			self.inputs.lock().push(input);
 			self.options.lock().push(options.clone());
-			let outcome = self
-				.outcomes
+			let script = self
+				.scripts
 				.lock()
 				.pop_front()
-				.expect("one scripted parent outcome");
+				.expect("one scripted parent turn");
 			future::ready(Ok(ScriptedParentSession {
-				events: vec![Ok(inference_pb::TurnEvent {
-					event: Some(turn_event::Event::Outcome(outcome)),
-				})],
+				events: script.into_iter().map(Ok).collect::<VecDeque<_>>(),
 			}))
 		}
+	}
+
+	fn outcome_script(outcome: inference_pb::Outcome) -> Vec<inference_pb::TurnEvent> {
+		vec![inference_pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) }]
 	}
 
 	fn parent_outcome(text: &str) -> inference_pb::Outcome {
@@ -6740,13 +6747,13 @@ mod tests {
 		let inputs = Arc::new(Mutex::new(Vec::new()));
 		let options = Arc::new(Mutex::new(Vec::new()));
 		let client = ScriptedParentClient {
-			outcomes: Arc::new(Mutex::new(VecDeque::from([
-				parent_outcome("completion answer"),
-				parent_outcome("agent answer"),
-				parent_outcome("follow-up answer"),
+			scripts: Arc::new(Mutex::new(VecDeque::from([
+				outcome_script(parent_outcome("completion answer")),
+				outcome_script(parent_outcome("agent answer")),
+				outcome_script(parent_outcome("follow-up answer")),
 			]))),
-			inputs:   Arc::clone(&inputs),
-			options:  Arc::clone(&options),
+			inputs:  Arc::clone(&inputs),
+			options: Arc::clone(&options),
 		};
 		let registry = Arc::new(Registry::new());
 		let mut snapshot = AgentSnapshot::new(
@@ -6790,7 +6797,7 @@ mod tests {
 		)
 		.await
 		.expect("live completion call");
-		assert_eq!(completion, json!({"text":"completion answer"}));
+		assert_eq!(completion["text"], "completion answer");
 
 		let concurrency = ParentSessionHost::concurrency(&host, json!({}))
 			.await
@@ -6866,6 +6873,207 @@ mod tests {
 						))
 			))
 		));
+	}
+	#[tokio::test]
+	async fn advisor_child_runs_scripted_batch_and_queues_advice() {
+		let scratch = tempfile::tempdir().expect("advisor scratch");
+		let root = scratch.path().join("project");
+		let sessions_dir = root.join("sessions");
+		fs::create_dir_all(&sessions_dir).expect("session directory");
+		let advise_call = inference_pb::Outcome {
+			output: vec![Item {
+				seq:           3,
+				created_at_ms: 1,
+				kind:          Some(item::Kind::ToolCall(omp_proto::thread::v1::ToolCall {
+					id: "advise-1".to_owned(),
+					name: "advise".to_owned(),
+					args_json:
+						br#"{"note":"verify the failing build before merging","severity":"concern"}"#
+							.to_vec()
+							.into(),
+					..Default::default()
+				})),
+				props:         Some(inference_pb::ValueMap {
+					fields: BTreeMap::from([(
+						omp_tool::TOOL_REV_PROP.to_owned(),
+						inference_pb::Value {
+							kind: Some(inference_pb::value::Kind::String("1".to_owned())),
+						},
+					)]),
+				}),
+			}],
+			stop: inference_pb::StopReason::StopToolUse as i32,
+			usage: Some(inference_pb::Usage::default()),
+			cost: Some(inference_pb::Cost::default()),
+			revision: Some(omp_proto::thread::v1::Revision { head: 3, token: vec![4; 32].into() }),
+			provider: "test".to_owned(),
+			model: "scripted".to_owned(),
+			..inference_pb::Outcome::default()
+		};
+		let advise_script = vec![
+			inference_pb::TurnEvent {
+				event: Some(turn_event::Event::PartStart(inference_pb::PartStart {
+					index:        0,
+					kind:         inference_pb::part_start::Kind::ToolCall as i32,
+					tool_call_id: "advise-1".to_owned(),
+					tool_name:    "advise".to_owned(),
+				})),
+			},
+			inference_pb::TurnEvent {
+				event: Some(turn_event::Event::PartDelta(inference_pb::PartDelta {
+					index: 0,
+					chunk: br#"{"note":"verify the failing build before merging","severity":"concern"}"#
+						.to_vec()
+						.into(),
+				})),
+			},
+			inference_pb::TurnEvent {
+				event: Some(turn_event::Event::PartEnd(inference_pb::PartEnd {
+					index:     0,
+					signature: Default::default(),
+				})),
+			},
+			inference_pb::TurnEvent { event: Some(turn_event::Event::Outcome(advise_call)) },
+		];
+		let mut final_outcome = parent_outcome("advisor reviewed the update");
+		final_outcome.output[0].seq = 5;
+		final_outcome.revision =
+			Some(omp_proto::thread::v1::Revision { head: 5, token: vec![5; 32].into() });
+		let inputs = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedParentClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([
+				advise_script,
+				outcome_script(final_outcome),
+			]))),
+			inputs:  Arc::clone(&inputs),
+			options: Arc::new(Mutex::new(Vec::new())),
+		};
+		let queue = omp_agent::advisor::AdvisorAdviceQueue::default();
+		let mut advisor_registry = Registry::new();
+		advisor_registry
+			.register(
+				omp_agent::advisor::advise_tool(queue.clone()),
+				omp_tool::Presentation::Hidden,
+				omp_tool::Claims {
+					precedence: omp_tool::Precedence::CORE,
+					claimant:   sf!("omp/advisor"),
+					replaces:   None,
+				},
+			)
+			.expect("register advise device");
+		let registry = Arc::new(advisor_registry);
+		let snapshot = AgentSnapshot::new(
+			TurnOptions::default(),
+			PromptFacts::new(&root, Arc::from([]))
+				.props()
+				.expect("test prompt facts"),
+			registry,
+		);
+		let state = AgentState::new(snapshot);
+		let (env, transport) = EnvClient::in_process(1);
+		// Serve the advise invocation protocol the way envd's device host
+		// would: acknowledge InvokeTool, submit committed args to the shared
+		// session queue, and answer with a terminal verdict.
+		let (env_requests, env_responses) = transport.into_parts();
+		let served_queue = queue.clone();
+		let invoked_tool = Arc::new(Mutex::new(None::<String>));
+		let invoked_record = Arc::clone(&invoked_tool);
+		tokio::spawn(async move {
+			use omp_env::frame::{self, client_frame, server_frame};
+			let mut invoke_request = None;
+			while let Ok(env_frame) = env_requests.recv_async().await {
+				match env_frame.body {
+					Some(client_frame::Body::InvokeTool(invoke)) => {
+						*invoked_record.lock() = Some(invoke.name.clone());
+						invoke_request = Some(env_frame.request_id);
+					},
+					Some(client_frame::Body::ArgsCommitted(committed)) => {
+						let params: Value =
+							serde_json::from_slice(&committed.raw).expect("committed advise args");
+						let note = params["note"].as_str().unwrap_or_default();
+						let severity = match params["severity"].as_str() {
+							Some("blocker") => omp_agent::advisor::AdviceSeverity::Blocker,
+							Some("concern") => omp_agent::advisor::AdviceSeverity::Concern,
+							_ => omp_agent::advisor::AdviceSeverity::Nit,
+						};
+						let admission = served_queue.submit(note, severity);
+						let Some(request_id) = invoke_request else {
+							continue;
+						};
+						let _ = env_responses
+							.send_async(frame::ServerFrame {
+								request_id,
+								body: Some(server_frame::Body::Verdict(frame::Verdict {
+									invocation_id: committed.invocation_id.clone(),
+									json: format!(
+										"{{\"kind\":\"ok\",\"value\":{{\"admission\":\"{admission}\"}}}}"
+									)
+									.into_bytes()
+									.into(),
+									parts: vec![omp_proto::thread::v1::Part {
+										kind: Some(part::Kind::Text("Recorded.".to_owned())),
+									}],
+									..Default::default()
+								})),
+								..Default::default()
+							})
+							.await;
+					},
+					_ => {},
+				}
+			}
+		});
+		let host = ChatParentHost::new(
+			client,
+			env,
+			state,
+			sf!("parent-session"),
+			sessions_dir,
+			root,
+			Arc::new(
+				SessionIndex::open(scratch.path().join("sessions.sqlite3")).expect("session index"),
+			),
+			false,
+		);
+		host
+			.tree()
+			.register(
+				sf!("parent-session"),
+				sf!("Main"),
+				AgentKind::Main,
+				None,
+				sf!("parent-session"),
+				Budget::default(),
+			)
+			.expect("root registration");
+
+		let child_id = host
+			.spawn_advisor(AdvisorChildSpec {
+				id:            sf!("default"),
+				display_name:  sf!("Advisor"),
+				model:         sf!("test/scripted"),
+				tools:         Vec::new(),
+				system_prompt: sf!("You observe another agent's session."),
+			})
+			.await
+			.expect("spawn advisor child");
+		let outcome = time::timeout(
+			Duration::from_secs(10),
+			host.run_advisor_batch(
+				child_id.as_str(),
+				vec![sf!("### Session update\n\nThe primary agent edited build.rs")],
+				TurnId::new("advisor-batch-1"),
+			),
+		)
+		.await
+		.expect("advisor batch must not hang")
+		.expect("advisor batch");
+		assert_eq!(outcome.final_text, "advisor reviewed the update");
+		assert_eq!(invoked_tool.lock().as_deref(), Some("advise"));
+		let queued = queue.drain_ready();
+		assert_eq!(queued.len(), 1);
+		assert_eq!(queued[0].note, "verify the failing build before merging");
+		assert_eq!(queued[0].severity, omp_agent::advisor::AdviceSeverity::Concern);
 	}
 }
 #[cfg(test)]

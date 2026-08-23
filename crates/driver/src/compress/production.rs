@@ -113,8 +113,13 @@ impl ProductionCompressHost {
 		let state_dir = omp_env::project_state::directory(&data_dir, &root)
 			.map_err(|_| ProductionError::Session)?;
 		chat::ensure_state_directory(&state_dir).map_err(|_| ProductionError::Session)?;
-		let bridges =
-			builtin(&root, Arc::new(InferenceBridge::default()), AgentGoalControl::default(), None);
+		let bridges = builtin(
+			&root,
+			Arc::new(InferenceBridge::default()),
+			AgentGoalControl::default(),
+			None,
+			omp_agent::advisor::AdvisorAdviceQueue::default(),
+		);
 		let environment = omp_envd::ProjectEnvironment::connect_or_start(
 			&root,
 			&state_dir,

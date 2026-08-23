@@ -467,6 +467,7 @@ pub fn builtin(
 	search: Arc<InferenceBridge>,
 	goal_control: AgentGoalControl,
 	host_resources: Option<Arc<dyn omp_envd::HostResources>>,
+	advise_queue: omp_agent::advisor::AdvisorAdviceQueue,
 ) -> omp_envd::RegistryBridges {
 	let active = discovery::active_content_snapshots(root);
 	let authored_skills = active
@@ -509,6 +510,15 @@ pub fn builtin(
 				device_claims,
 			),
 			omp_envd::DynamicTool::new(crate::hub::tool(), omp_tool::Presentation::Slot, core_claims),
+			omp_envd::DynamicTool::new(
+				omp_agent::advisor::advise_tool(advise_queue),
+				omp_tool::Presentation::Hidden,
+				omp_tool::Claims {
+					precedence: omp_tool::Precedence::CORE,
+					claimant:   sf!("omp/advisor"),
+					replaces:   None,
+				},
+			),
 		],
 		url_resolvers: vec![Arc::new(skill), Arc::new(rule)],
 		goal_control: Some(Arc::new(goal_control)),
