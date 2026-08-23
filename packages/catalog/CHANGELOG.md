@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenRouter auxiliary requests failing with HTTP 400 for mandatory-reasoning models such as `stealth/ox-alpha` by honoring live discovery metadata ([#9415](https://github.com/can1357/oh-my-pi/issues/9415)).
+
 ## [18.0.1] - 2026-08-23
 
 ### Added

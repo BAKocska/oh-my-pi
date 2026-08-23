@@ -789,7 +789,7 @@ describe("OpenRouter model discovery", () => {
 		}
 	});
 
-	it("maps OpenRouter's advertised reasoning effort ladder and default", async () => {
+	it("maps OpenRouter's advertised reasoning effort ladder, default, and mandatory state", async () => {
 		const options = openrouterModelManagerOptions({
 			fetch: async () =>
 				Response.json({
@@ -799,6 +799,7 @@ describe("OpenRouter model discovery", () => {
 							name: "DeepSeek V4 Flash 0731",
 							supported_parameters: ["tools", "reasoning", "reasoning_effort"],
 							reasoning: {
+								mandatory: true,
 								supported_efforts: ["max", "high", "low"],
 								default_effort: "high",
 							},
@@ -814,6 +815,7 @@ describe("OpenRouter model discovery", () => {
 			mode: "effort",
 			efforts: [Effort.Low, Effort.High, Effort.Max],
 			defaultLevel: Effort.High,
+			requiresEffort: true,
 		});
 	});
 
