@@ -124,7 +124,7 @@ fn wsl_windows_path(target: &str) -> Option<String> {
 		return None;
 	}
 	let local: PathBuf = if target.starts_with("file://") {
-		Url::parse(target).is_ok()?.to_file_path().ok()?
+		Url::parse(target).ok()?.to_file_path().ok()?
 	} else if has_url_scheme(target) {
 		// Any non-file scheme (https, vscode, …) belongs to xdg-open.
 		return None;
