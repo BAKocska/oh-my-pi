@@ -2109,10 +2109,13 @@ fn tool_definition(tool: &pb::ToolDef) -> Result<ToolDefinition, Status> {
 					));
 				},
 			};
-			ToolInputConstraint::Grammar(ToolGrammar {
-				syntax,
-				definition: grammar.definition.as_str().into(),
-			})
+			ToolInputConstraint::Grammar {
+				grammar:  ToolGrammar { syntax, definition: grammar.definition.as_str().into() },
+				fallback: opaque_json(
+					&grammar.fallback_schema_json,
+					"ToolDef.grammar.fallback_schema_json",
+				)?,
+			}
 		},
 		None => return Err(Status::invalid_argument("ToolDef.input is required")),
 	};
@@ -3641,8 +3644,9 @@ mod tests {
 			name:        name.to_owned(),
 			description: String::new(),
 			input:       Some(tool_def::Input::Grammar(pb::tool_def::Grammar {
-				syntax:     syntax as i32,
-				definition: definition.to_owned(),
+				syntax:               syntax as i32,
+				definition:           definition.to_owned(),
+				fallback_schema_json: Bytes::from_static(br#"{"type":"object"}"#),
 			})),
 		}
 	}
@@ -3683,11 +3687,12 @@ mod tests {
 		let [tool] = request.tools.as_ref() else {
 			panic!("one live tool");
 		};
-		let ToolInputConstraint::Grammar(grammar) = &tool.input else {
+		let ToolInputConstraint::Grammar { grammar, fallback } = &tool.input else {
 			panic!("edit must remain a native grammar tool");
 		};
 		assert_eq!(grammar.syntax, ToolGrammarSyntax::Lark);
 		assert_eq!(grammar.definition, LIVE_EDIT_GRAMMAR);
+		assert_eq!(fallback.as_value(), &serde_json::json!({"type": "object"}));
 	}
 
 	#[test]
@@ -3700,7 +3705,7 @@ mod tests {
 		for (wire_syntax, expected_syntax, definition) in cases {
 			let projected = tool_definition(&grammar_tool("constrained", wire_syntax, definition))
 				.expect("valid grammar");
-			let ToolInputConstraint::Grammar(grammar) = projected.input else {
+			let ToolInputConstraint::Grammar { grammar, .. } = projected.input else {
 				panic!("grammar input must remain freeform");
 			};
 			assert_eq!(grammar.syntax, expected_syntax);
