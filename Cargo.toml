@@ -43,6 +43,7 @@ cap-std = "4"
 cfb = "0.14"
 candle-core = "0.11"
 candle-nn = "0.11"
+candle-transformers = "0.11"
 cfg-if = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 clap_complete = "4"
@@ -65,6 +66,7 @@ fontdb = "0.24"
 fontdue = "0.9"
 futures = "0.3"
 futures-lite = "2"
+gix = { version = "0.86", default-features = false, features = ["max-performance-safe", "comfort", "sha1", "status", "revision"] }
 globset = "0.4"
 grep-cli = "0.1"
 grep-matcher = "0.1"
@@ -211,7 +213,6 @@ serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
 serde_yaml = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
-sherpa-onnx = "1.13.5"
 sha3 = "0.10"
 similar = "3"
 smallvec = { version = "2.0.0-alpha.12", features = ["serde"] }
@@ -290,11 +291,11 @@ tree-sitter-vue = { version = "0.1.0", package = "tree-sitter-vue-next" }
 tree-sitter-xml = "0.7"
 tree-sitter-yaml = "0.7"
 tree-sitter-zig = "1.1"
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
 uiautomation = "=0.25.0"
 url = "2.5"
 voice-g2p = "0.2.2"
 webrtc = "0.17.2"
-whisper-rs = { version = "0.16", default-features = false }
 wgpu = "30"
 winit = "0.30"
 windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Media_Multimedia", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
@@ -440,22 +441,16 @@ missing_panics_doc = "allow" # Not every panic needs docs, especially assert!
 too_many_arguments = "allow" # Argument count is rarely the real complexity signal
 too_many_lines = "allow"     # Arbitrary limits don't account for necessary complexity
 
-# Dev links statically embed CPython (652 MB images, 39 test binaries); full
-# debuginfo made every relink the bottleneck. Workspace crates keep line
-# tables for backtraces; external dependencies carry none.
+# No debuginfo in dev builds. With Mach-O split debug maps, file:line
+# backtraces require retaining every .rcgu.o — ~1 GB per linked test binary
+# (static CPython), >100 GB target dirs. Panic locations survive via
+# #[track_caller] and symbol names via the symbol table; use the
+# `release-profiling` profile when line-level debug info is actually needed.
+# Mirrored in .cargo/config.toml so user-global [profile.dev] config cannot
+# override it.
 [profile.dev]
-debug = "line-tables-only"
-# Mach-O keeps DWARF in the .o files and points at them from the executable's
-# debug map (N_OSO); `unpacked` is what retains those .o files. Do NOT "save
-# space" by setting this to "off": ld64 never merges DWARF into the binary, so
-# `off` drops the objects and every backtrace frame in our own crates loses
-# file:line. The `panicked at foo.rs:3` header survives via #[track_caller],
-# which makes the loss easy to miss. On Linux this selects split DWARF (.dwo)
-# instead of packing debuginfo into each rlib; on Windows (PDB) it is a no-op.
-split-debuginfo = "unpacked"
-
-[profile.dev.package."*"]
 debug = false
+split-debuginfo = "off"
 
 # Content-addressed storage and document hashing remain hot in debug builds.
 [profile.dev.package.blake3]

@@ -32,12 +32,6 @@ accepted = ["MPL-2.0"]
 [terminfo]
 accepted = ["WTFPL"]
 
-[whisper-rs]
-accepted = ["Unlicense"]
-
-[whisper-rs-sys]
-accepted = ["Unlicense"]
-
 [tree-sitter-graphql.clarify]
 license = "MIT"
 
