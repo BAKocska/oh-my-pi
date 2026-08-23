@@ -1691,7 +1691,35 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
             }
             for tool in tools
         ],
-        "hooks": [list(key) for key in sorted(snapshot.hooks)],
+        "hooks": [
+            {
+                "event": declaration.event,
+                "phase": str(getattr(declaration.phase, "value", declaration.phase)),
+                "name": declaration.name,
+                "order": declaration.order,
+                "on_failure": (
+                    None
+                    if declaration.on_failure is None
+                    else declaration.on_failure.value
+                ),
+                "timeout": _worker_wire_value(declaration.timeout),
+                "concurrency": declaration.concurrency,
+                "threadsafe": declaration.threadsafe,
+                "event_rev": _hook_catalog(declaration.event).rev,
+                "event_on_failure": _hook_catalog(declaration.event).on_failure.value,
+                "event_default": (
+                    "allow" if _hook_catalog(declaration.event).gateable else None
+                ),
+                "event_timeout": _worker_wire_value(
+                    _hook_catalog(declaration.event).default_timeout
+                ),
+                "composition": {
+                    name: value.value
+                    for name, value in _hook_catalog(declaration.event).fields.items()
+                },
+            }
+            for declaration in snapshot.hook_definitions
+        ],
         "services": [
             {
                 "name": definition.name,
@@ -1723,6 +1751,14 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
         ],
     }
     return tools, json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+
+
+def _hook_catalog(event: str) -> object:
+    """Return the frozen event policy paired with a hook declaration."""
+
+    from .events import spec
+
+    return spec(event)
 
 
 def _worker_wire_value(value: object) -> object:

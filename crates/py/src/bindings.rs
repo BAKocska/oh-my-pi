@@ -1667,6 +1667,27 @@ fn walk_request(arguments: &Bound<'_, PyDict>) -> PyResult<env_pb::WalkRequest> 
 		..Default::default()
 	})
 }
+fn search_request(arguments: &Bound<'_, PyDict>) -> PyResult<env_pb::SearchRequest> {
+	let pattern = arguments
+		.get_item("pattern")?
+		.ok_or_else(|| PyTypeError::new_err("pattern is required"))?;
+	let pattern = if let Ok(value) = pattern.extract::<Vec<u8>>() {
+		value
+	} else {
+		pattern.extract::<String>()?.into_bytes()
+	};
+	Ok(env_pb::SearchRequest {
+		walk:           Some(walk_request(arguments)?),
+		pattern:        pattern.into(),
+		case_sensitive: optional_bool(arguments, "case_sensitive", true)?,
+		limit:          arguments
+			.get_item("limit")?
+			.filter(|value| !value.is_none())
+			.map(|value| value.extract::<u64>())
+			.transpose()?,
+		props:          Default::default(),
+	})
+}
 #[pyclass(frozen, module = "_omp")]
 #[derive(Debug)]
 struct PyBlobUpload {
@@ -3622,28 +3643,8 @@ impl PyEnvironmentBackend {
 						})
 						.map_err(|error| client_error(py, error))?
 				} else {
-					let pattern = arguments
-						.get_item("pattern")?
-						.ok_or_else(|| PyTypeError::new_err("pattern is required"))?;
-					let pattern = if let Ok(value) = pattern.extract::<Vec<u8>>() {
-						value
-					} else {
-						pattern.extract::<String>()?.into_bytes()
-					};
 					let mut stream = ASYNC_RUNTIME
-						.block_on(
-							self.client.search(&root, env_pb::SearchRequest {
-								walk:           Some(walk_request(arguments)?),
-								pattern:        pattern.into(),
-								case_sensitive: optional_bool(arguments, "case_sensitive", true)?,
-								limit:          arguments
-									.get_item("limit")?
-									.filter(|value| !value.is_none())
-									.map(|value| value.extract::<u64>())
-									.transpose()?,
-								props:          Default::default(),
-							}),
-						)
+						.block_on(self.client.search(&root, search_request(arguments)?))
 						.map_err(|error| client_error(py, error))?;
 					ASYNC_RUNTIME
 						.block_on(async {
@@ -3889,6 +3890,19 @@ impl PyEnvironmentBackend {
 					.block_on(self.client.walk(&root, walk_request(arguments)?))
 					.map_err(|error| client_error(py, error))?;
 				NativeStream::Walk(walk)
+			},
+			"omp.env.find.search" => {
+				let root = arguments
+					.get_item("root")?
+					.filter(|value| !value.is_none())
+					.map_or_else(
+						|| Ok::<_, PyErr>(self.root.clone()),
+						|value| Ok(value.extract::<PyEnvPath>()?.0.clone()),
+					)?;
+				let search = ASYNC_RUNTIME
+					.block_on(self.client.search(&root, search_request(arguments)?))
+					.map_err(|error| client_error(py, error))?;
+				NativeStream::Search(search)
 			},
 			_ => {
 				return Err(environment_exception(

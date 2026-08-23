@@ -2141,6 +2141,13 @@ class _Find:
             options["root"] = _env_path(root, "root")
         return _stream("find_walk", **options)
 
+    def search(self, pattern: str | bytes, **options: Any) -> AsyncIterator[Match]:
+        """Stream workspace content matches lazily."""
+        root = options.get("root")
+        if root is not None:
+            options["root"] = _env_path(root, "root")
+        return _stream("find_search", pattern=pattern, **options)
+
     async def grep(self, pattern: str | bytes, **options: Any) -> list[Match]:
         """Search workspace contents under the server-side walker."""
         root = options.get("root")

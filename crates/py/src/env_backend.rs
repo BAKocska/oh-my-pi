@@ -87,6 +87,7 @@ backend_request_method!(proc_adopt, "omp.env.proc.adopt", ["name"]);
 backend_request_method!(find_files, "omp.env.find.files", ["root"]);
 backend_request_method!(find_grep, "omp.env.find.grep", ["pattern", "root"]);
 backend_stream_method!(find_walk, "omp.env.find.walk", ["root"]);
+backend_stream_method!(find_search, "omp.env.find.search", ["pattern", "root"]);
 backend_request_method!(blobs_put_bytes, "omp.env.blobs.put", ["data"]);
 backend_request_method!(blobs_put_path, "omp.env.blobs.put", ["data"]);
 backend_request_method!(blobs_get, "omp.env.blobs.get", ["ref", "offset", "length"]);
