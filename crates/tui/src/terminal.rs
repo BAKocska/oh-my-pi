@@ -1663,6 +1663,11 @@ impl Terminal {
 		self.cell_pixel_size
 	}
 
+	/// Returns whether the terminal session is running inside a multiplexer.
+	pub const fn inside_multiplexer(&self) -> bool {
+		self.inside_multiplexer
+	}
+
 	/// Consumes a SIGWINCH-backed resize notification.
 	///
 	/// Multiplexers often deliver a burst of intermediate sizes; there this

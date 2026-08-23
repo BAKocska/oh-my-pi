@@ -848,9 +848,10 @@ use omp_tui::{AppEvent, AppOptions, Key, Ui};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let executor = omp_executor::Executor::new(None);
     let mut app = AppOptions::new()
         .quit([Key::Ctrl('c'), Key::Ctrl('q')])
-        .start(|env| {
+        .start(executor, |env| {
             Ui::from_markup(
                 r#"<scroll id="pane" h=12><text>Hello</text></scroll>"#,
                 env.viewport.width,

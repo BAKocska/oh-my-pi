@@ -11,7 +11,7 @@ use crate::{
 	component::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoComponent, PaintCtx, Slot, Wake,
 	},
-	components::{Img, ImgState, Row, Scroll, Tabs, Wizard},
+	components::{EditorPane, Img, ImgState, Row, Scroll, Tabs, Wizard},
 	context::UiContext,
 	frame::{Color, Frame, Rect, Size, Style},
 	input::{Key, Mouse, UiEvent},
@@ -1939,6 +1939,7 @@ fn collect_path(
 		fixed:       cached.comp().props().h().is_some(),
 		paint_owner: cached.comp().is::<Scroll>()
 			|| cached.comp().is::<Tabs>()
+			|| cached.comp().is::<EditorPane>()
 			|| cached.comp().is::<Wizard>(),
 		row:         cached.comp().is::<Row>(),
 	});
