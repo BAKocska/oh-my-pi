@@ -56,6 +56,8 @@ impl McpConnector for Connector {
 					protocol_version: Str::new_static("2025-11-25"),
 					name:             Str::new_static("fixture"),
 					version:          None,
+					title:            None,
+					description:      None,
 					capabilities:     json!({}),
 					instructions:     Some(Str::new_static("server docs")),
 				},

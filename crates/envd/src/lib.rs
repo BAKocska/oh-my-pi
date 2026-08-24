@@ -288,6 +288,18 @@ pub struct ProjectEnvironment {
 	github_credentials:  Arc<GithubCredentialBridge>,
 	lifecycle:           ProjectLifecycle,
 }
+/// Cloneable read authority for retained MCP inspector snapshots.
+#[derive(Clone)]
+pub struct McpInspectorHandle {
+	manager: Arc<mcp::manager::McpManager>,
+}
+
+impl McpInspectorHandle {
+	/// Captures every live MCP catalog once at the current manager generation.
+	pub fn snapshots(&self) -> Vec<mcp::manager::McpInspectorSnapshot> {
+		self.manager.inspector_snapshots()
+	}
+}
 
 struct ProjectLifecycle {
 	shutdown: Option<CancellationToken>,
@@ -923,6 +935,10 @@ impl ProjectEnvironment {
 	pub fn extension_callback_dispatcher(&self) -> Arc<dyn CallbackDispatcher> {
 		self.lifecycle.server.extension_callback_dispatcher()
 	}
+	/// Returns the shared extension and built-in provider usage registry.
+	pub fn usage_fetchers(&self) -> omp_inference::operation::usage::UsageFetcherRegistry {
+		self.lifecycle.server.usage_fetchers()
+	}
 
 	/// Returns the sealed deployment manifest only when every authenticated
 	/// connection and generation fact exactly matches the live activation.
@@ -950,6 +966,11 @@ impl ProjectEnvironment {
 		worker::ExtensionCampaignResolver::new(callbacks, move |identity| {
 			server.extension_registry_evidence(identity)
 		})
+	}
+
+	/// Returns a cloneable read authority for retained MCP inspection.
+	pub fn mcp_inspector(&self) -> McpInspectorHandle {
+		McpInspectorHandle { manager: Arc::clone(self.lifecycle.server.mcp_manager()) }
 	}
 
 	/// Constructs extension-scoped MCP CONTROL over this active Environment.

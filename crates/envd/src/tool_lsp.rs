@@ -206,6 +206,13 @@ fn rewrite_uri(uri: &str, renamed: Option<(&str, &str)>) -> String {
 		.filter(|(source, _)| *source == uri)
 		.map_or_else(|| uri.to_owned(), |(_, destination)| destination.to_owned())
 }
+fn reload_notification(binding: &pb::LspServerBinding) -> pb::LspNotificationRequest {
+	pb::LspNotificationRequest {
+		server_id:   binding.server_id.clone(),
+		method:      "workspace/didChangeConfiguration".into(),
+		params_json: binding.settings_json.clone(),
+	}
+}
 
 /// Environment-owned implementation of the revisioned LSP tool.
 #[derive(Clone)]
@@ -447,18 +454,10 @@ impl LspControl for DocumentLspControl {
 				.map(|binding| Str::from(binding.name.as_str()))
 				.collect::<Vec<_>>();
 			if params.action == Action::Reload {
-				let notification = Bytes::from_static(br#"{"settings":{}}"#);
 				for binding in &selected {
 					self
 						.documents
-						.lsp_notification(
-							pb::LspNotificationRequest {
-								server_id:   binding.server_id.clone(),
-								method:      "workspace/didChangeConfiguration".into(),
-								params_json: notification.clone(),
-							},
-							&cancel,
-						)
+						.lsp_notification(reload_notification(binding), &cancel)
 						.await
 						.map_err(|_| Fault::Server)?;
 					if binding.name.contains("rust-analyzer") {
@@ -862,6 +861,28 @@ impl LspControl for DocumentLspControl {
 				_ => render::structured(&data, 200),
 			};
 			Ok(Payload { action: params.action, servers, output, data })
+		}
+	}
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn reload_notification_preserves_configured_and_empty_settings() {
+		for settings_json in [
+			Bytes::from_static(br#"{"settings":{"rust-analyzer":{"cargo":{"features":"all"}}}}"#),
+			Bytes::from_static(br#"{"settings":{}}"#),
+		] {
+			let binding = pb::LspServerBinding {
+				server_id: Bytes::from_static(b"active-server"),
+				settings_json: settings_json.clone(),
+				..Default::default()
+			};
+			let notification = reload_notification(&binding);
+			assert_eq!(notification.server_id, binding.server_id);
+			assert_eq!(notification.method, "workspace/didChangeConfiguration");
+			assert_eq!(notification.params_json, settings_json);
 		}
 	}
 }

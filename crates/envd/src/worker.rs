@@ -1507,6 +1507,7 @@ impl ExtHostSupervisor {
 							on_failure:   hook.on_failure,
 							timeout:      hook.timeout,
 							concurrency:  hook.concurrency,
+							providers:    hook.providers.clone(),
 							event_policy: HookEventPolicy {
 								revision:    hook.event_revision,
 								timeout:     hook.event_timeout,
@@ -2580,12 +2581,20 @@ struct RegisteredHook {
 	timeout:          Option<Str>,
 	concurrency:      usize,
 	threadsafe:       bool,
+	#[serde(default)]
+	when:             Option<RegisteredHookWhen>,
 	event_rev:        u16,
 	event_on_failure: Str,
 	event_default:    Option<Str>,
 	event_timeout:    Str,
 	#[serde(default)]
 	composition:      BTreeMap<Str, Str>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+struct RegisteredHookWhen {
+	#[serde(default)]
+	provider: Option<Vec<Str>>,
 }
 
 #[derive(Deserialize)]
@@ -2636,6 +2645,8 @@ pub struct SealedHookRegistration {
 	pub timeout:          Option<Duration>,
 	/// Declared callback overlap behavior.
 	pub concurrency:      CallbackConcurrency,
+	/// Provider ids admitted by this callback, when provider-scoped.
+	pub providers:        Option<Box<[Str]>>,
 	/// Exact event payload/decision revision.
 	pub event_revision:   u16,
 	/// Event-level callback failure default.
@@ -3425,6 +3436,11 @@ fn seal_hook_registration(
 	} else {
 		CallbackConcurrency::Concurrent { limit: hook.concurrency }
 	};
+	let providers = hook
+		.when
+		.as_ref()
+		.and_then(|when| when.provider.as_ref())
+		.map(|providers| providers.clone().into_boxed_slice());
 	let on_failure = hook
 		.on_failure
 		.as_deref()
@@ -3451,6 +3467,7 @@ fn seal_hook_registration(
 		on_failure,
 		timeout,
 		concurrency,
+		providers,
 		event_revision: hook.event_rev,
 		event_on_failure,
 		event_default,

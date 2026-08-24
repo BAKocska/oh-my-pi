@@ -24,6 +24,10 @@ pub struct InitializedServer {
 	pub name:             Str,
 	/// Optional server implementation version.
 	pub version:          Option<Str>,
+	/// Optional server display title.
+	pub title:            Option<Str>,
+	/// Optional server description.
+	pub description:      Option<Str>,
 	/// Advertised capabilities retained for feature gating.
 	pub capabilities:     Value,
 	/// Bounded device documentation supplied by the server.
@@ -84,6 +88,12 @@ impl McpClient {
 			protocol_version,
 			name: Str::from(raw.server_info.name),
 			version: raw.server_info.version.map(Str::from),
+			title: raw.server_info.title.filter(|value| !value.is_empty()).map(Str::from),
+			description: raw
+				.server_info
+				.description
+				.filter(|value| !value.is_empty())
+				.map(Str::from),
 			capabilities: raw.capabilities,
 			instructions: raw
 				.instructions
@@ -138,9 +148,12 @@ struct InitializeResult {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ServerInfo {
-	name:    String,
-	version: Option<String>,
+	name:        String,
+	version:     Option<String>,
+	title:       Option<String>,
+	description: Option<String>,
 }
 
 /// MCP initialization or message-loop failure.

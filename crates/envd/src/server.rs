@@ -1789,6 +1789,7 @@ pub struct EnvServer {
 	eval_control:        EvalSessionControl,
 	search_bridge:       Arc<SearchBridgeHost>,
 	github_credentials:  Arc<GithubCredentialBridge>,
+	usage_fetchers:      omp_inference::operation::usage::UsageFetcherRegistry,
 	checkpoint_control:  AgentCheckpointControl,
 	previews:            PreviewRegistry,
 	sessions_index:      Arc<SessionIndex>,
@@ -2098,6 +2099,7 @@ impl EnvServer {
 		eval_control: EvalSessionControl,
 		search_bridge: Arc<SearchBridgeHost>,
 		github_credentials: Arc<GithubCredentialBridge>,
+		usage_fetchers: omp_inference::operation::usage::UsageFetcherRegistry,
 		checkpoint_control: AgentCheckpointControl,
 		previews: PreviewRegistry,
 		sessions_index: Arc<SessionIndex>,
@@ -2137,6 +2139,7 @@ impl EnvServer {
 			eval_control,
 			search_bridge,
 			github_credentials,
+			usage_fetchers,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2306,6 +2309,7 @@ impl EnvServer {
 			server_version: Str::from(env!("CARGO_PKG_VERSION")),
 			server_build:   Str::from(omp_env::build_id::current()),
 		};
+		let usage_fetchers = control_bindings.hooks.usage_fetchers();
 		Ok(Self::new(
 			identity,
 			documents,
@@ -2330,6 +2334,7 @@ impl EnvServer {
 			eval_control,
 			search_bridge,
 			github_credentials,
+			usage_fetchers,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2493,6 +2498,7 @@ impl EnvServer {
 			server_version: Str::from(env!("CARGO_PKG_VERSION")),
 			server_build:   Str::from(omp_env::build_id::current()),
 		};
+		let usage_fetchers = control_bindings.hooks.usage_fetchers();
 		Ok(Self::new(
 			identity,
 			documents,
@@ -2517,6 +2523,7 @@ impl EnvServer {
 			eval_control,
 			search_bridge,
 			github_credentials,
+			usage_fetchers,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2615,6 +2622,10 @@ impl EnvServer {
 	/// campaign, presentation, and verdict backends.
 	pub fn extension_callback_dispatcher(&self) -> Arc<dyn CallbackDispatcher> {
 		Arc::new(WeakExtensionCallbackDispatcher { supervisor: Arc::downgrade(&self.ext_hosts) })
+	}
+	/// Returns the shared extension and built-in provider usage registry.
+	pub fn usage_fetchers(&self) -> omp_inference::operation::usage::UsageFetcherRegistry {
+		self.usage_fetchers.clone()
 	}
 
 	/// Returns the sealed deployment manifest for an exact live CONTROL

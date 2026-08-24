@@ -1,6 +1,6 @@
 //! Typed settings owned by production tool admission and registry composition.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use omp_core::{Duration, Str};
 use omp_settings::{
@@ -30,6 +30,14 @@ pub struct ToolSettings {
 	/// Optional pinned edit revision (`rep.1` or `hl.1`) for this client.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub edit_dialect:         Option<Str>,
+	/// Optional JSONL destination for edit black-box diagnostics.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub edit_blackbox_path:   Option<PathBuf>,
+	/// Repair newly introduced syntax parse errors before commit after validated
+	/// reparse and non-revert checks.
+	pub edit_auto_repair:     bool,
+	/// Abort a streaming turn as soon as the edit guard proves it invalid.
+	pub edit_streaming_abort: bool,
 	/// Permit HTTP(S) URL dispatch from read.
 	pub fetch_enabled:        bool,
 	/// Convert supported documents to Markdown.
@@ -82,6 +90,9 @@ impl Default for ToolSettings {
 			enabled:              BTreeMap::new(),
 			max_timeout:          None,
 			edit_dialect:         None,
+			edit_blackbox_path:   None,
+			edit_auto_repair:     false,
+			edit_streaming_abort: false,
 			fetch_enabled:        true,
 			render_markdown:      true,
 			auto_resize_images:   true,
@@ -180,6 +191,28 @@ impl SettingsDomain for ToolSettings {
 			condition:   None,
 			secret:      false,
 		},
+		field(
+			"tools.edit_blackbox_path",
+			"Edit Black-box Path",
+			"Optional JSONL destination for edit black-box diagnostics.",
+			SettingKind::Path,
+			31,
+		),
+		field(
+			"tools.edit_auto_repair",
+			"Edit Auto-repair",
+			"Repair newly introduced syntax parse errors before commit after validated reparse and \
+			 non-revert checks (up to two attempts).",
+			SettingKind::Boolean,
+			32,
+		),
+		field(
+			"tools.edit_streaming_abort",
+			"Streaming Edit Abort",
+			"Abort a turn as soon as streamed edit validation fails.",
+			SettingKind::Boolean,
+			33,
+		),
 		FieldDescriptor {
 			path:        "tools.approval_mode",
 			label:       "Tool approval",

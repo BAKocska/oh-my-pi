@@ -7,12 +7,23 @@ use std::{
 	future::Future,
 	path::{Path, PathBuf},
 	sync::{Arc, LazyLock},
+	sync::atomic::{AtomicU64, Ordering},
 	time,
 };
 
 use omp_agent::control;
-use omp_catalog::{ModelKey, snapshot::Catalog};
-use omp_core::{Duration, Hash32, InvocationPhase, LifecyclePhase, Str, sf};
+use omp_catalog::{ModelKey, ProviderId, snapshot::Catalog};
+use omp_core::{Duration, ExposeSecret as _, Hash32, InvocationPhase, LifecyclePhase, Str, sf};
+use omp_inference::{
+	answer::{
+		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageUnit, UsageWindow, UsageWindowKind,
+	},
+	operation::usage::{
+		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
+		UsageFetcherRegistry,
+	},
+	receipt::UsageSource,
+};
 use omp_proto::{
 	inference::{v1, v1::tool_def},
 	prost::Message as _,
@@ -65,9 +76,9 @@ use super::{
 		CallbackConcurrency, ExtensionManifest,
 		control::{
 			ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
-			ControlConnectionIdentity, ControlEffect, ControlProtocolError, ControlRequestContext,
+			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
 		},
-		dispatch::{CallbackDispatcher, NestedCallbackDispatcher},
+		dispatch::{CallbackDispatcher, EventDeadline, NestedCallbackDispatcher},
 	},
 	github::GithubService,
 	managed_skills::ManagedSkills,
@@ -112,6 +123,10 @@ pub struct RegistryBridges {
 	pub goal_control:        Option<Arc<dyn GoalAuthority>>,
 	/// Auxiliary inference used by workspace search and media tools.
 	pub search:              Option<Arc<dyn SearchInference>>,
+	/// Active model identity captured by edit regression observation.
+	pub edit_model:          Option<Str>,
+	/// Typed small-model completion bridge for validated edit auto-repair.
+	pub edit_repair:         Option<omp_tools::edit::observer::EditRepairClient>,
 	/// Host-resource broker used by composition-owned internal resource URLs.
 	pub host_resources:      Option<Arc<dyn HostResources>>,
 	/// Background telemetry delivery started once credentials exist.
@@ -969,16 +984,190 @@ pub struct HookSubscription {
 	pub timeout:      Option<time::Duration>,
 	/// Declared callback overlap policy.
 	pub concurrency:  CallbackConcurrency,
+	/// Provider ids admitted by this callback, when provider-scoped.
+	pub providers:    Option<Box<[Str]>>,
 	/// Event policy frozen with the Python registry declaration.
 	pub event_policy: HookEventPolicy,
+}
+#[derive(Clone)]
+struct ExtensionUsageFetcher {
+	provider:    ProviderId,
+	identity:    Arc<ControlConnectionIdentity>,
+	session:     Str,
+	dispatcher:  Arc<dyn CallbackDispatcher>,
+	callback:    Str,
+	concurrency: CallbackConcurrency,
+	timeout:     time::Duration,
+	next_id:     Arc<AtomicU64>,
+}
+
+impl ConsoleUsageFetcher for ExtensionUsageFetcher {
+	fn provider(&self) -> &ProviderId<str> {
+		&self.provider
+	}
+
+	fn credential_requirement(&self) -> UsageCredentialRequirement {
+		UsageCredentialRequirement::Optional
+	}
+
+	fn fetch<'a>(
+		&'a self,
+		credential: Option<&'a omp_core::SecretString>,
+		now: time::SystemTime,
+		deadline: Option<time::Instant>,
+	) -> futures::future::BoxFuture<'a, Result<ConsoleUsageObservation, UsageFetchError>> {
+		Box::pin(async move {
+			let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
+			let mut payload = JsonMap::new();
+			payload.insert("provider".to_owned(), JsonValue::String(self.provider.to_string()));
+			payload.insert("identity".to_owned(), JsonValue::Null);
+			payload.insert("scope".to_owned(), JsonValue::String("all".to_owned()));
+			payload.insert("allow_stale".to_owned(), JsonValue::Bool(true));
+			if let Some(credential) = credential {
+				payload.insert(
+					"api_key".to_owned(),
+					json!({"$bytes": omp_core::base64::encode(credential.expose_secret().as_bytes())}),
+				);
+			}
+			let mut arguments = JsonMap::new();
+			arguments.insert("event".to_owned(), JsonValue::String("provider_usage".to_owned()));
+			arguments.insert("phase".to_owned(), JsonValue::String("domain".to_owned()));
+			arguments.insert("name".to_owned(), JsonValue::String(self.callback.to_string()));
+			arguments.insert("payload".to_owned(), JsonValue::Object(payload));
+			let timeout_at = deadline.unwrap_or_else(|| time::Instant::now() + self.timeout);
+			let result = self
+				.dispatcher
+				.dispatch(Arc::clone(&self.identity), ControlDispatch {
+					operation: sf!("omp.hooks.dispatch"),
+					arguments,
+					authority: ControlInvocationAuthority {
+						invocation: sf!("provider-usage:{}:{id}", self.identity.host_generation),
+						phase: InvocationPhase::EffectsAuthorized,
+						session: self.session.clone(),
+						turn: None,
+						event: Some(sf!("provider_usage")),
+						call: None,
+						device: None,
+						effects: Box::new([]),
+						place_kind: sf!("host"),
+						lifecycle: LifecyclePhase::Active,
+						roots: Box::new([]),
+						remote: false,
+						has_ui: false,
+						headless: true,
+						settings: JsonMap::new(),
+						secret_settings: Box::new([]),
+						data: None,
+						direct_filesystem: None,
+					},
+					policy: self.concurrency,
+					deadline: EventDeadline { at: timeout_at },
+				})
+				.await
+				.map_err(|error| {
+					if error.code.as_str().contains("Auth") {
+						UsageFetchError::AuthRejected
+					} else {
+						UsageFetchError::Unavailable
+					}
+				})?;
+			decode_extension_usage(result, now)
+		})
+	}
+}
+
+fn decode_extension_usage(
+	value: JsonValue,
+	observed_at: time::SystemTime,
+) -> Result<ConsoleUsageObservation, UsageFetchError> {
+	let report = value.as_object().ok_or(UsageFetchError::Protocol)?;
+	let windows = report
+		.get("windows")
+		.and_then(JsonValue::as_array)
+		.ok_or(UsageFetchError::Protocol)?
+		.iter()
+		.map(|window| decode_extension_usage_window(window, observed_at))
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(ConsoleUsageObservation {
+		account_meta: UsageAccountMetadata::default(),
+		plan: report.get("plan").and_then(JsonValue::as_str).map(Str::from),
+		source_label: Some(sf!("extension")),
+		notes: Box::new([]),
+		reset_credits: None,
+		windows,
+	})
+}
+
+fn decode_extension_usage_window(
+	value: &JsonValue,
+	observed_at: time::SystemTime,
+) -> Result<UsageWindow, UsageFetchError> {
+	let window = value.as_object().ok_or(UsageFetchError::Protocol)?;
+	let unit = match window.get("unit").and_then(JsonValue::as_str) {
+		Some("requests") => UsageUnit::Requests,
+		Some("tokens") => UsageUnit::Tokens,
+		Some("premium_units") => UsageUnit::Unknown,
+		Some("nanos_usd") => UsageUnit::Usd,
+		_ => return Err(UsageFetchError::Protocol),
+	};
+	let exponent = u8::from(unit == UsageUnit::Usd) * 9;
+	let consumed = window
+		.get("used")
+		.and_then(JsonValue::as_u64)
+		.map(|units| UsageQuantity::new(units, exponent));
+	let limit = window
+		.get("limit")
+		.and_then(JsonValue::as_u64)
+		.map(|units| UsageQuantity::new(units, exponent));
+	let remaining = match (consumed, limit) {
+		(Some(consumed), Some(limit)) => {
+			Some(UsageQuantity::new(limit.units.saturating_sub(consumed.units), exponent))
+		},
+		_ => None,
+	};
+	let resets_at = window
+		.get("resets_at_ms")
+		.and_then(JsonValue::as_u64)
+		.map(|millis| time::UNIX_EPOCH + time::Duration::from_millis(millis));
+	Ok(UsageWindow {
+		id: window
+			.get("id")
+			.and_then(JsonValue::as_str)
+			.map(Str::from)
+			.ok_or(UsageFetchError::Protocol)?,
+		kind: UsageWindowKind::Quota,
+		dimension: Str::from(window.get("unit").and_then(JsonValue::as_str).unwrap_or("usage")),
+		label: None,
+		scope: None,
+		amount: UsageAmount { unit, consumed, remaining, limit },
+		status: None,
+		duration: None,
+		resets_at,
+		reset_label: None,
+		notes: Box::new([]),
+		source: UsageSource::Provider,
+		observed_at,
+	})
+}
+
+fn usage_registration_id(subscription: &HookSubscription) -> Str {
+	sf!(
+		"{}:{}:{}:{}",
+		subscription.identity.extension,
+		subscription.identity.host_generation,
+		subscription.identity.session_generation,
+		subscription.name
+	)
 }
 
 #[derive(Clone)]
 pub struct HookControlFactory {
 	registries:    Arc<RegistryControlFactory>,
+	dispatcher:    Arc<dyn CallbackDispatcher>,
 	callbacks:     Arc<NestedCallbackDispatcher>,
 	policies:      Arc<RwLock<BTreeMap<Str, HookEventPolicy>>>,
 	subscriptions: Arc<RwLock<BTreeMap<ControlConnectionKey, Vec<HookSubscription>>>>,
+	usage_fetchers: UsageFetcherRegistry,
 }
 
 impl HookControlFactory {
@@ -990,10 +1179,16 @@ impl HookControlFactory {
 	) -> Arc<Self> {
 		Arc::new(Self {
 			registries,
+			dispatcher: Arc::clone(&dispatcher),
 			callbacks: Arc::new(NestedCallbackDispatcher::new(dispatcher)),
 			policies: Arc::new(RwLock::new(policies)),
 			subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
+			usage_fetchers: UsageFetcherRegistry::default(),
 		})
+	}
+	/// Returns the shared runtime provider usage registry.
+	pub fn usage_fetchers(&self) -> UsageFetcherRegistry {
+		self.usage_fetchers.clone()
 	}
 
 	/// Installs callback details only for a key proven by the sealed registry
@@ -1035,6 +1230,23 @@ impl HookControlFactory {
 		}
 		drop(policies);
 		let mut subscriptions = self.subscriptions.write();
+		let fetchers = self.usage_fetchers.clone();
+		{
+			for (candidate, rows) in subscriptions.iter() {
+				if candidate.0 == key.0
+					&& candidate.1 == key.1
+					&& candidate.2 == key.2
+					&& *candidate != key
+				{
+					for row in rows.iter().filter(|row| row.event == "provider_usage") {
+						for provider in row.providers.as_deref().unwrap_or_default() {
+							let provider = ProviderId::from(provider.clone());
+							fetchers.unregister_runtime(&provider, usage_registration_id(row).as_str());
+						}
+					}
+				}
+			}
+		}
 		subscriptions.retain(|candidate, _| {
 			candidate.0 != key.0 || candidate.1 != key.1 || candidate.2 != key.2 || *candidate == key
 		});
@@ -1045,6 +1257,29 @@ impl HookControlFactory {
 				|| row.name != subscription.name
 		});
 		rows.push(subscription);
+		if rows.last().is_some_and(|row| row.event == "provider_usage") {
+			let fetchers = self.usage_fetchers.clone();
+			let row = rows.last().expect("subscription was just inserted");
+			let session = evidence
+				.session
+				.clone()
+				.unwrap_or_else(|| row.identity.extension.clone());
+			for provider in row.providers.as_deref().unwrap_or_default() {
+				fetchers.register_runtime(
+					usage_registration_id(row),
+					Arc::new(ExtensionUsageFetcher {
+						provider: ProviderId::from(provider.clone()),
+						identity: Arc::clone(&row.identity),
+						session: session.clone(),
+						dispatcher: Arc::clone(&self.dispatcher),
+						callback: row.name.clone(),
+						concurrency: row.concurrency,
+						timeout: row.timeout.unwrap_or(row.event_policy.timeout),
+						next_id: Arc::new(AtomicU64::new(1)),
+					}),
+				);
+			}
+		}
 		Ok(())
 	}
 
@@ -1481,6 +1716,19 @@ fn configured_model_edit_revision(
 		.map_err(|error| EnvdError::EditDialect(error.to_string().into()))
 }
 
+fn configured_model_identity(
+	data_dir: &Path,
+	project_root: &Path,
+) -> Result<Option<Str>, EnvdError> {
+	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let snapshot = manager.snapshot();
+	let settings = snapshot
+		.project::<HostSettings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	Ok(settings.get().default_model.as_deref().map(Str::new))
+}
+
 /// Builds the complete registry shared by environment dispatch and the agent.
 ///
 /// Resource adapters are cloned into their typed executors. Worker declarations
@@ -1534,6 +1782,8 @@ pub(crate) fn production_registry<
 		url_resolvers,
 		goal_control,
 		search,
+		edit_model,
+		edit_repair,
 		host_resources,
 		telemetry_upload,
 		ask_presenter,
@@ -1757,19 +2007,48 @@ pub(crate) fn production_registry<
 		None
 	};
 
-	let mut hashline_edit = Some(omp_tools::edit::tool_with_snapshots(
+	let edit_observer = omp_tools::edit::observer::EditObserver::new(
+		omp_tools::edit::observer::EditBlackboxConfig {
+			path: tool_settings.edit_blackbox_path.as_ref().map(|path| {
+				if path.is_absolute() {
+					path.clone()
+				} else {
+					workspace.root().join(path)
+				}
+			}),
+			model: edit_model
+				.or(configured_model_identity(state_dir, workspace.root())?)
+				.unwrap_or_else(|| sf!("unknown")),
+			..omp_tools::edit::observer::EditBlackboxConfig::default()
+		},
+		tool_settings.edit_auto_repair.then_some(edit_repair).flatten(),
+	);
+	let mut hashline_edit = Some(omp_tools::edit::tool_with_observer(
 		documents.clone(),
 		blobs.clone(),
 		tool_settings.format_policy,
+		edit_observer.clone(),
 	));
-	let mut replace_edit =
-		Some(omp_tools::edit::replace_tool(documents.clone(), tool_settings.format_policy));
-	let mut patch_edit =
-		Some(omp_tools::edit::patch_tool(documents.clone(), tool_settings.format_policy));
-	let mut apply_patch_edit =
-		Some(omp_tools::edit::apply_patch_tool(documents.clone(), tool_settings.format_policy));
-	let mut sloppy_edit =
-		Some(omp_tools::edit::sloppy_tool(documents.clone(), tool_settings.format_policy));
+	let mut replace_edit = Some(omp_tools::edit::replace_tool_with_observer(
+		documents.clone(),
+		tool_settings.format_policy,
+		edit_observer.clone(),
+	));
+	let mut patch_edit = Some(omp_tools::edit::patch_tool_with_observer(
+		documents.clone(),
+		tool_settings.format_policy,
+		edit_observer.clone(),
+	));
+	let mut apply_patch_edit = Some(omp_tools::edit::apply_patch_tool_with_observer(
+		documents.clone(),
+		tool_settings.format_policy,
+		edit_observer.clone(),
+	));
+	let mut sloppy_edit = Some(omp_tools::edit::sloppy_tool_with_observer(
+		documents.clone(),
+		tool_settings.format_policy,
+		edit_observer,
+	));
 	let edit_identity = [
 		hashline_edit
 			.as_ref()
@@ -1928,13 +2207,15 @@ pub(crate) fn production_registry<
 	let eval_identity = if tool_settings.enabled("eval") {
 		match preflight_python_eval(Arc::clone(&eval_host), interrupt_grace, blobs.clone()) {
 			Ok(eval_exec) => {
-				let (eval_tool, control) = omp_tools::eval::eval_controlled_with_task_snapshot(
-					eval_exec,
-					TaskDescriptionSnapshot {
-						helpers: &helper_docs,
-						..TaskDescriptionSnapshot::standard()
-					},
-				);
+				let mut task_snapshot = TaskDescriptionSnapshot {
+					helpers: &helper_docs,
+					..TaskDescriptionSnapshot::standard()
+				};
+				if !tool_settings.enabled("task") {
+					task_snapshot.agents = &[];
+				}
+				let (eval_tool, control) =
+					omp_tools::eval::eval_controlled_with_task_snapshot(eval_exec, task_snapshot);
 				let identity = eval_tool.spec().identity();
 				registry.register(eval_tool, Presentation::Slot, core_claims())?;
 				eval_control = control;
@@ -1967,9 +2248,7 @@ pub(crate) fn production_registry<
 	if tool_settings.enabled("think") {
 		registry.register(omp_tools::think::tool(), Presentation::Slot, core_claims())?;
 	}
-	if tool_settings.enabled("goal")
-		&& let Some(goal_control) = goal_control
-	{
+	if let Some(goal_control) = goal_control {
 		registry.register(
 			omp_tools::goal::tool(GoalControlAdapter(goal_control)),
 			Presentation::Hidden,
@@ -2633,6 +2912,31 @@ mod tests {
 			)
 			.is_none()
 		);
+	}
+	#[test]
+	fn extension_usage_projection_is_typed_and_rejects_malformed_reports() {
+		let observed = time::UNIX_EPOCH + time::Duration::from_secs(10);
+		let report = decode_extension_usage(
+			json!({
+				"plan": "extension",
+				"windows": [{
+					"id": "requests",
+					"used": 2,
+					"limit": 10,
+					"unit": "requests",
+					"resets_at_ms": 20_000,
+				}],
+			}),
+			observed,
+		)
+		.expect("typed extension usage report");
+		assert_eq!(report.plan.as_deref(), Some("extension"));
+		assert_eq!(report.windows[0].amount.consumed.map(|value| value.units), Some(2));
+		assert_eq!(report.windows[0].amount.remaining.map(|value| value.units), Some(8));
+		assert!(matches!(
+			decode_extension_usage(json!({"windows": [{"id": "bad", "unit": "secret"}]}), observed),
+			Err(UsageFetchError::Protocol),
+		));
 	}
 
 	#[test]

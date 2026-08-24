@@ -129,7 +129,7 @@ pub struct AutoBackgroundSettings {
 
 impl Default for AutoBackgroundSettings {
 	fn default() -> Self {
-		Self { enabled: false, threshold_ms: 60_000 }
+		Self { enabled: true, threshold_ms: 60_000 }
 	}
 }
 
@@ -472,6 +472,13 @@ mod tests {
 	use omp_settings::{SettingsSnapshot, registered_domains};
 
 	use super::*;
+
+	#[test]
+	fn shell_auto_background_is_enabled_by_default() {
+		let settings = AutoBackgroundSettings::default();
+		assert!(settings.enabled);
+		assert_eq!(settings.threshold_ms, 60_000);
+	}
 
 	#[test]
 	fn shell_projection_round_trips_and_is_registered() {

@@ -696,6 +696,48 @@ fn parse_url(config: &McpServerConfig) -> Result<Url, ManagerError> {
 	Url::parse(raw).map_err(|_| ManagerError::InvalidConfig)
 }
 
+/// Read-only lifecycle state projected for the `/extensions` inspector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpInspectorHealth {
+	/// Initial connection or reconnect is in progress.
+	Connecting,
+	/// A live connection owns the current catalogs.
+	Connected,
+	/// No live connection currently exists.
+	Disconnected,
+	/// Automatic reconnects stopped after terminal failure.
+	Failed,
+}
+
+/// One immutable MCP server/catalog snapshot for presentation.
+#[derive(Clone, Debug)]
+pub struct McpInspectorSnapshot {
+	/// Declared server name.
+	pub server:           Str,
+	/// Current lifecycle state.
+	pub health:           McpInspectorHealth,
+	/// Mount generation.
+	pub generation:       u64,
+	/// Shared definition catalog epoch.
+	pub definition_epoch: u64,
+	/// Negotiated server implementation name.
+	pub implementation:   Option<Str>,
+	/// Negotiated server implementation version.
+	pub version:          Option<Str>,
+	/// Server-provided display title.
+	pub title:            Option<Str>,
+	/// Server-provided description.
+	pub description:      Option<Str>,
+	/// Initialize instructions.
+	pub instructions:     Option<Str>,
+	/// Raw MCP tool definitions.
+	pub tools:            Arc<[Value]>,
+	/// Concrete resource definitions.
+	pub resources:        Arc<[ResourceDefinition]>,
+	/// Prompt definitions.
+	pub prompts:          Arc<[PromptDefinition]>,
+}
+
 pub(crate) struct LiveConnection {
 	pub(crate) client:      Arc<McpClient>,
 	pub(crate) initialized: InitializedServer,
@@ -1054,6 +1096,50 @@ impl McpManager {
 	/// registry epoch consumers.
 	pub fn catalog_snapshot(&self) -> omp_tool::LeafCatalogSnapshot<McpLeaf> {
 		self.service.leaf_snapshot()
+	}
+
+	/// Captures every live MCP catalog once for UI inspection.
+	pub fn inspector_snapshots(&self) -> Vec<McpInspectorSnapshot> {
+		let state = self.state.lock();
+		let definition_epoch = self.service.definition_epoch();
+		state
+			.mounts
+			.iter()
+			.map(|(name, mount)| {
+				let connection = mount.connection.as_ref();
+				let health = if mount.terminal_failure {
+					McpInspectorHealth::Failed
+				} else if mount.connecting || mount.reconnecting {
+					McpInspectorHealth::Connecting
+				} else if connection.is_some() {
+					McpInspectorHealth::Connected
+				} else {
+					McpInspectorHealth::Disconnected
+				};
+				McpInspectorSnapshot {
+					server: name.clone(),
+					health,
+					generation: mount.generation,
+					definition_epoch,
+					implementation: connection.map(|live| live.initialized.name.clone()),
+					version: connection.and_then(|live| live.initialized.version.clone()),
+					title: connection.and_then(|live| live.initialized.title.clone()),
+					description: connection.and_then(|live| live.initialized.description.clone()),
+					instructions: connection.and_then(|live| {
+						bounded_instructions(live.initialized.instructions.as_ref())
+					}),
+					tools: connection
+						.map(|live| live.tools.read().clone())
+						.unwrap_or_else(|| Arc::from([])),
+					resources: connection
+						.map(|live| live.resources.read().clone())
+						.unwrap_or_else(|| Arc::from([])),
+					prompts: connection
+						.map(|live| live.prompts.read().clone())
+						.unwrap_or_else(|| Arc::from([])),
+				}
+			})
+			.collect()
 	}
 
 	/// Mounts one declaration only when its stamped owner is the authenticated
