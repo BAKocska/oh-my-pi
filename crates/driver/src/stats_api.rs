@@ -411,8 +411,8 @@ pub mod telemetry_backend {
 	}
 }
 
-/// Host-owned verdict projection and detached-job authority.
-pub mod verdict_authority {
+/// Host-owned prompt projection and detached-job authority.
+pub mod job_authority {
 	use std::{
 		collections::BTreeSet,
 		sync::Arc,
@@ -441,9 +441,9 @@ pub mod verdict_authority {
 	/// Maximum wall time allowed for a pure prompt projection callback.
 	pub const PROMPT_PROJECTION_DEADLINE: Duration = Duration::from_millis(50);
 
-	/// Authenticated extension incarnation allowed to use one verdict owner.
+	/// Authenticated extension incarnation allowed to use one job owner.
 	#[derive(Clone, Debug, Eq, PartialEq)]
-	pub struct VerdictAuthorityIdentity {
+	pub struct JobAuthorityIdentity {
 		/// Stable authenticated principal spelling.
 		pub principal:          Str,
 		/// Declaring extension identifier.
@@ -460,11 +460,11 @@ pub mod verdict_authority {
 		pub capabilities:       Arc<BTreeSet<Str>>,
 	}
 
-	/// Core-authored authority for one verdict operation.
+	/// Core-authored authority for one job operation.
 	#[derive(Clone, Copy, Debug)]
-	pub struct VerdictCallContext<'a> {
+	pub struct JobCallContext<'a> {
 		/// Authenticated connection identity.
-		pub identity:   &'a VerdictAuthorityIdentity,
+		pub identity:   &'a JobAuthorityIdentity,
 		/// Current invocation phase.
 		pub phase:      InvocationPhase,
 		/// Whether cancellation has already won.
@@ -474,17 +474,17 @@ pub mod verdict_authority {
 		pub invocation: Option<&'a ControlInvocationAuthority>,
 	}
 
-	/// Structured verdict owner failure.
+	/// Structured job-owner failure.
 	#[derive(Clone, Debug, Error, Eq, PartialEq)]
-	pub enum VerdictAuthorityError {
+	pub enum JobAuthorityError {
 		/// The request belongs to a stale or foreign connection.
-		#[error("verdict request belongs to a stale or foreign connection")]
+		#[error("job request belongs to a stale or foreign connection")]
 		Identity,
 		/// The owning invocation was cancelled or settled.
-		#[error("verdict request was cancelled")]
+		#[error("job request was cancelled")]
 		Cancelled,
 		/// The operation is illegal in the current invocation phase.
-		#[error("verdict request is not legal in the current invocation phase")]
+		#[error("job request is not legal in the current invocation phase")]
 		Phase,
 		/// The descriptor is not backed by a scoped Environment resource.
 		#[error("invalid detached job: {0}")]
@@ -524,9 +524,9 @@ pub mod verdict_authority {
 	}
 
 	impl JobRegistration {
-		fn into_job(self, session: Str) -> Result<JobRef, VerdictAuthorityError> {
+		fn into_job(self, session: Str) -> Result<JobRef, JobAuthorityError> {
 			if self.id.is_empty() || self.owner_name.is_empty() || self.owner_generation == 0 {
-				return Err(VerdictAuthorityError::InvalidJob(Str::new_static(
+				return Err(JobAuthorityError::InvalidJob(Str::new_static(
 					"id, owner name, and owner generation must be present",
 				)));
 			}
@@ -555,7 +555,7 @@ pub mod verdict_authority {
 	#[async_trait]
 	pub trait DurableJobRegistrar: Send + Sync + 'static {
 		/// Persists and installs one exact descriptor idempotently.
-		async fn register(&self, job: JobRef) -> Result<JobRef, VerdictAuthorityError>;
+		async fn register(&self, job: JobRef) -> Result<JobRef, JobAuthorityError>;
 	}
 
 	/// Production registrar routed to the sole mutable Agent/journal owner.
@@ -573,16 +573,16 @@ pub mod verdict_authority {
 
 	#[async_trait]
 	impl DurableJobRegistrar for AgentDurableJobRegistrar {
-		async fn register(&self, job: JobRef) -> Result<JobRef, VerdictAuthorityError> {
+		async fn register(&self, job: JobRef) -> Result<JobRef, JobAuthorityError> {
 			let value = serde_json::to_value(&job)
-				.map_err(|error| VerdictAuthorityError::JobAdmission(Str::new(error.to_string())))?;
+				.map_err(|error| JobAuthorityError::JobAdmission(Str::new(error.to_string())))?;
 			let result = self
 				.control
 				.request("omp.jobs.register", serde_json::Map::from_iter([("job".to_owned(), value)]))
 				.await
-				.map_err(VerdictAuthorityError::JobAdmission)?;
+				.map_err(JobAuthorityError::JobAdmission)?;
 			serde_json::from_value(result)
-				.map_err(|error| VerdictAuthorityError::JobAdmission(Str::new(error.to_string())))
+				.map_err(|error| JobAuthorityError::JobAdmission(Str::new(error.to_string())))
 		}
 	}
 
@@ -607,10 +607,10 @@ pub mod verdict_authority {
 		/// Dispatches to the exact authenticated worker generation.
 		async fn project(
 			&self,
-			identity: Arc<VerdictAuthorityIdentity>,
+			identity: Arc<JobAuthorityIdentity>,
 			invocation: ControlInvocationAuthority,
 			request: PromptProjectionRequest,
-		) -> Result<Value, VerdictAuthorityError>;
+		) -> Result<Value, JobAuthorityError>;
 	}
 
 	/// CONTROL-backed projection dispatcher for the exact authenticated worker.
@@ -634,29 +634,29 @@ pub mod verdict_authority {
 	impl PromptProjectionDispatcher for ControlPromptProjectionDispatcher {
 		async fn project(
 			&self,
-			identity: Arc<VerdictAuthorityIdentity>,
+			identity: Arc<JobAuthorityIdentity>,
 			invocation: ControlInvocationAuthority,
 			request: PromptProjectionRequest,
-		) -> Result<Value, VerdictAuthorityError> {
+		) -> Result<Value, JobAuthorityError> {
 			if self.target.principal.id() != identity.principal.as_str()
 				|| self.target.extension != identity.extension
 				|| self.target.artifact_digest != identity.artifact_digest
 				|| self.target.host_generation != identity.host_generation
 				|| self.target.session_generation != identity.session_generation
 			{
-				return Err(VerdictAuthorityError::Identity);
+				return Err(JobAuthorityError::Identity);
 			}
 			let Value::Object(arguments) = serde_json::to_value(request)
-				.map_err(|error| VerdictAuthorityError::Projection(Str::new(error.to_string())))?
+				.map_err(|error| JobAuthorityError::Projection(Str::new(error.to_string())))?
 			else {
-				return Err(VerdictAuthorityError::Projection(Str::new_static(
+				return Err(JobAuthorityError::Projection(Str::new_static(
 					"projection request did not serialize as an object",
 				)));
 			};
 			self
 				.dispatcher
 				.dispatch(self.target.clone(), ControlDispatch {
-					operation: Str::new_static("omp.verdicts.project"),
+					operation: Str::new_static("omp.jobs.project"),
 					arguments,
 					authority: invocation,
 					policy: CallbackConcurrency::Serialized,
@@ -665,22 +665,22 @@ pub mod verdict_authority {
 					},
 				})
 				.await
-				.map_err(|error| VerdictAuthorityError::Projection(Str::new(error.to_string())))
+				.map_err(|error| JobAuthorityError::Projection(Str::new(error.to_string())))
 		}
 	}
 
 	/// Identity-fenced owner for durable detached jobs and prompt projections.
-	pub struct VerdictAuthority {
-		identity:   Arc<VerdictAuthorityIdentity>,
+	pub struct JobAuthority {
+		identity:   Arc<JobAuthorityIdentity>,
 		jobs:       JobBoard,
 		registrar:  Arc<dyn DurableJobRegistrar>,
 		dispatcher: Arc<dyn PromptProjectionDispatcher>,
 	}
 
-	impl VerdictAuthority {
+	impl JobAuthority {
 		/// Binds one authority to an authenticated connection and session board.
 		pub fn new(
-			identity: Arc<VerdictAuthorityIdentity>,
+			identity: Arc<JobAuthorityIdentity>,
 			jobs: JobBoard,
 			registrar: Arc<dyn DurableJobRegistrar>,
 			dispatcher: Arc<dyn PromptProjectionDispatcher>,
@@ -688,18 +688,18 @@ pub mod verdict_authority {
 			Self { identity, jobs, registrar, dispatcher }
 		}
 
-		fn authorize(&self, context: VerdictCallContext<'_>) -> Result<(), VerdictAuthorityError> {
+		fn authorize(&self, context: JobCallContext<'_>) -> Result<(), JobAuthorityError> {
 			if context.identity != self.identity.as_ref() {
-				return Err(VerdictAuthorityError::Identity);
+				return Err(JobAuthorityError::Identity);
 			}
 			if context.cancelled || context.phase.is_terminal() {
-				return Err(VerdictAuthorityError::Cancelled);
+				return Err(JobAuthorityError::Cancelled);
 			}
 			if !context
 				.phase
 				.allows_operation(InvocationPhase::EffectsAuthorized)
 			{
-				return Err(VerdictAuthorityError::Phase);
+				return Err(JobAuthorityError::Phase);
 			}
 			Ok(())
 		}
@@ -708,9 +708,9 @@ pub mod verdict_authority {
 		/// authoritative session job board.
 		pub async fn register_job(
 			&self,
-			context: VerdictCallContext<'_>,
+			context: JobCallContext<'_>,
 			registration: JobRegistration,
-		) -> Result<JobRef, VerdictAuthorityError> {
+		) -> Result<JobRef, JobAuthorityError> {
 			self.authorize(context)?;
 			let job = registration.into_job(self.identity.session.clone())?;
 			if let Some(existing) = self
@@ -722,7 +722,7 @@ pub mod verdict_authority {
 				return if same_registration(&existing, &job) {
 					Ok(existing)
 				} else {
-					Err(VerdictAuthorityError::JobConflict(job.id))
+					Err(JobAuthorityError::JobConflict(job.id))
 				};
 			}
 			self.registrar.register(job).await
@@ -732,27 +732,27 @@ pub mod verdict_authority {
 		/// deadline.
 		pub async fn project_prompt(
 			&self,
-			context: VerdictCallContext<'_>,
+			context: JobCallContext<'_>,
 			request: PromptProjectionRequest,
-		) -> Result<Value, VerdictAuthorityError> {
+		) -> Result<Value, JobAuthorityError> {
 			if context.identity != self.identity.as_ref() {
-				return Err(VerdictAuthorityError::Identity);
+				return Err(JobAuthorityError::Identity);
 			}
 			if context.cancelled {
-				return Err(VerdictAuthorityError::Cancelled);
+				return Err(JobAuthorityError::Cancelled);
 			}
 			if context.phase != InvocationPhase::Settled {
-				return Err(VerdictAuthorityError::Phase);
+				return Err(JobAuthorityError::Phase);
 			}
 			if request.name.is_empty() {
-				return Err(VerdictAuthorityError::Projection(Str::new_static(
+				return Err(JobAuthorityError::Projection(Str::new_static(
 					"projection requires an exact device wire name",
 				)));
 			}
 			let invocation = context
 				.invocation
 				.cloned()
-				.ok_or(VerdictAuthorityError::Phase)?;
+				.ok_or(JobAuthorityError::Phase)?;
 			time::timeout(
 				PROMPT_PROJECTION_DEADLINE,
 				self
@@ -760,12 +760,12 @@ pub mod verdict_authority {
 					.project(self.identity.clone(), invocation, request),
 			)
 			.await
-			.map_err(|_| VerdictAuthorityError::ProjectionTimeout)?
+			.map_err(|_| JobAuthorityError::ProjectionTimeout)?
 		}
 	}
 
 	#[async_trait]
-	impl omp_envd::exthost::VerdictControlOwner for VerdictAuthority {
+	impl omp_envd::exthost::JobsControlOwner for JobAuthority {
 		async fn register_job(
 			&self,
 			context: control::ControlRequestContext,
@@ -841,13 +841,13 @@ pub mod verdict_authority {
 						"job registration requires a live invocation",
 					)
 				})?;
-			let call = VerdictCallContext {
+			let call = JobCallContext {
 				identity: self.identity.as_ref(),
 				phase,
 				cancelled: phase.is_terminal(),
 				invocation: context.invocation.as_ref(),
 			};
-			let job = VerdictAuthority::register_job(self, call, registration)
+			let job = JobAuthority::register_job(self, call, registration)
 				.await
 				.map_err(control_error)?;
 			let (owner_name, owner_generation) = match &job.owner {
@@ -871,16 +871,16 @@ pub mod verdict_authority {
 		}
 	}
 
-	fn control_error(error: VerdictAuthorityError) -> ControlProtocolError {
+	fn control_error(error: JobAuthorityError) -> ControlProtocolError {
 		let code = match &error {
-			VerdictAuthorityError::Identity => "StaleGeneration",
-			VerdictAuthorityError::Cancelled => "Cancelled",
-			VerdictAuthorityError::Phase => "InvalidPhase",
-			VerdictAuthorityError::InvalidJob(_) => "InvalidJob",
-			VerdictAuthorityError::JobConflict(_) => "JobConflict",
-			VerdictAuthorityError::JobAdmission(_) => "JobAdmissionDenied",
-			VerdictAuthorityError::ProjectionTimeout => "ProjectionTimeout",
-			VerdictAuthorityError::Projection(_) => "ProjectionFailed",
+			JobAuthorityError::Identity => "StaleGeneration",
+			JobAuthorityError::Cancelled => "Cancelled",
+			JobAuthorityError::Phase => "InvalidPhase",
+			JobAuthorityError::InvalidJob(_) => "InvalidJob",
+			JobAuthorityError::JobConflict(_) => "JobConflict",
+			JobAuthorityError::JobAdmission(_) => "JobAdmissionDenied",
+			JobAuthorityError::ProjectionTimeout => "ProjectionTimeout",
+			JobAuthorityError::Projection(_) => "ProjectionFailed",
 		};
 		ControlProtocolError::new(code, error.to_string())
 	}

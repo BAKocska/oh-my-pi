@@ -1056,7 +1056,12 @@ fn classify_http_error(status: u16, body: &[u8]) -> Error {
 
 fn provider_error_facts(body: &[u8]) -> (Option<Str>, Option<Str>) {
 	let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-		return (None, str::from_utf8(body).ok().and_then(sanitize_provider_message));
+		return (
+			None,
+			str::from_utf8(body)
+				.ok()
+				.and_then(sanitize_provider_message),
+		);
 	};
 	let facts = value.get("error").unwrap_or(&value);
 	let code = ["code", "type", "status"]

@@ -114,7 +114,7 @@ impl Default for BedrockOptions {
 /// Sans-I/O Amazon Bedrock `ConverseStream` codec.
 #[derive(Clone, Debug, Default)]
 pub struct BedrockConverseCodec {
-	options: Arc<BedrockOptions>,
+	options:        Arc<BedrockOptions>,
 	ambient_region: Option<Str>,
 }
 
@@ -123,6 +123,7 @@ impl BedrockConverseCodec {
 	pub fn new(options: BedrockOptions) -> Self {
 		Self { options: Arc::new(options), ambient_region: None }
 	}
+
 	/// Installs the ambient AWS region resolved during route construction.
 	pub fn with_ambient_region(mut self, region: Option<Str>) -> Self {
 		self.ambient_region = region;
@@ -1154,8 +1155,7 @@ fn resolve_bedrock_region(
 	if let Some(region) = guardrail_region {
 		return Str::new(region);
 	}
-	super::anthropic::endpoint_region(base_url)
-		.map_or_else(|| sf!("us-east-1"), Str::new)
+	super::anthropic::endpoint_region(base_url).map_or_else(|| sf!("us-east-1"), Str::new)
 }
 
 /// Extracts a region only from a Bedrock Guardrail ARN.
@@ -1194,7 +1194,10 @@ fn bedrock_runtime_endpoint(base: &str, region: &str) -> String {
 	} else {
 		"amazonaws.com"
 	};
-	if uri.set_host(Some(&format!("{prefix}.{region}.{suffix}"))).is_err() {
+	if uri
+		.set_host(Some(&format!("{prefix}.{region}.{suffix}")))
+		.is_err()
+	{
 		return expanded;
 	}
 	uri.to_string()
@@ -1228,7 +1231,8 @@ fn bedrock_discovery_uri(
 	ambient_region: Option<&str>,
 ) -> Result<Str, Error> {
 	let base = context.route.endpoint.base_url.as_str();
-	let region = resolve_bedrock_runtime_region(context, "", options.guardrail.as_ref(), ambient_region);
+	let region =
+		resolve_bedrock_runtime_region(context, "", options.guardrail.as_ref(), ambient_region);
 	bedrock_discovery_endpoint(base, region.as_str())
 }
 
@@ -2632,9 +2636,7 @@ mod tests {
 			stream_mode: GuardrailStreamMode::Sync,
 		};
 		assert_eq!(
-			guardrail_arn_region(
-				"arn:aws:bedrock:eu-west-2:123456789012:foundation-model/example"
-			),
+			guardrail_arn_region("arn:aws:bedrock:eu-west-2:123456789012:foundation-model/example"),
 			None,
 		);
 		assert_eq!(
@@ -2678,10 +2680,7 @@ mod tests {
 			"eu-central-1",
 		);
 		assert_eq!(
-			bedrock_runtime_endpoint(
-				"https://bedrock-runtime.us-east-1.amazonaws.com",
-				"eu-west-2",
-			),
+			bedrock_runtime_endpoint("https://bedrock-runtime.us-east-1.amazonaws.com", "eu-west-2",),
 			"https://bedrock-runtime.eu-west-2.amazonaws.com/",
 		);
 	}

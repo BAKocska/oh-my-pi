@@ -1,5 +1,5 @@
-//! Proves telemetry queries enforce installation floors and verdict jobs remain
-//! idempotent.
+//! Proves telemetry queries enforce installation floors and detached jobs
+//! remain idempotent.
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -7,11 +7,11 @@ use async_trait::async_trait;
 use omp_agent::{JobBoard, Mailbox};
 use omp_core::{InvocationPhase, Str};
 use omp_driver::stats_api::{
-	telemetry_backend::TelemetryIndexQuery,
-	verdict_authority::{
-		DurableJobRegistrar, JobRegistration, PromptProjectionDispatcher, PromptProjectionRequest,
-		VerdictAuthority, VerdictAuthorityError, VerdictAuthorityIdentity, VerdictCallContext,
+	job_authority::{
+		DurableJobRegistrar, JobAuthority, JobAuthorityError, JobAuthorityIdentity, JobCallContext,
+		JobRegistration, PromptProjectionDispatcher, PromptProjectionRequest,
 	},
+	telemetry_backend::TelemetryIndexQuery,
 };
 use omp_env::EnvClient;
 use omp_envd::exthost::control::ControlInvocationAuthority;
@@ -92,14 +92,11 @@ struct BoardRegistrar(JobBoard);
 
 #[async_trait]
 impl DurableJobRegistrar for BoardRegistrar {
-	async fn register(
-		&self,
-		job: omp_tool::JobRef,
-	) -> Result<omp_tool::JobRef, VerdictAuthorityError> {
+	async fn register(&self, job: omp_tool::JobRef) -> Result<omp_tool::JobRef, JobAuthorityError> {
 		self
 			.0
 			.reattach(job.clone())
-			.map_err(|error| VerdictAuthorityError::JobAdmission(Str::new(error.to_string())))?;
+			.map_err(|error| JobAuthorityError::JobAdmission(Str::new(error.to_string())))?;
 		Ok(job)
 	}
 }
@@ -108,18 +105,18 @@ impl DurableJobRegistrar for BoardRegistrar {
 impl PromptProjectionDispatcher for UnusedProjection {
 	async fn project(
 		&self,
-		_identity: Arc<VerdictAuthorityIdentity>,
+		_identity: Arc<JobAuthorityIdentity>,
 		_invocation: ControlInvocationAuthority,
 		_request: PromptProjectionRequest,
-	) -> Result<Value, VerdictAuthorityError> {
+	) -> Result<Value, JobAuthorityError> {
 		Ok(Value::Null)
 	}
 }
 
-fn verdict_identity() -> Arc<VerdictAuthorityIdentity> {
-	Arc::new(VerdictAuthorityIdentity {
+fn job_identity() -> Arc<JobAuthorityIdentity> {
+	Arc::new(JobAuthorityIdentity {
 		principal:          Str::new_static("principal"),
-		extension:          Str::new_static("verdicts"),
+		extension:          Str::new_static("jobs"),
 		artifact_digest:    Str::new_static("digest"),
 		host_generation:    1,
 		session_generation: 1,
@@ -140,18 +137,18 @@ fn registration(description: &'static str) -> JobRegistration {
 }
 
 #[tokio::test]
-async fn verdict_registration_is_idempotent_across_authority_reconstruction() {
+async fn job_registration_is_idempotent_across_authority_reconstruction() {
 	let mailbox = Mailbox::new();
 	let (env, _transport) = EnvClient::in_process(0);
 	let board = JobBoard::new(env, mailbox.sender());
-	let identity = verdict_identity();
-	let context = VerdictCallContext {
+	let identity = job_identity();
+	let context = JobCallContext {
 		identity:   identity.as_ref(),
 		phase:      InvocationPhase::EffectsAuthorized,
 		cancelled:  false,
 		invocation: None,
 	};
-	let first = VerdictAuthority::new(
+	let first = JobAuthority::new(
 		identity.clone(),
 		board.clone(),
 		Arc::new(BoardRegistrar(board.clone())),
@@ -162,7 +159,7 @@ async fn verdict_registration_is_idempotent_across_authority_reconstruction() {
 		.await
 		.unwrap();
 
-	let reconstructed = VerdictAuthority::new(
+	let reconstructed = JobAuthority::new(
 		identity.clone(),
 		board.clone(),
 		Arc::new(BoardRegistrar(board.clone())),
@@ -178,6 +175,6 @@ async fn verdict_registration_is_idempotent_across_authority_reconstruction() {
 		reconstructed
 			.register_job(context, registration("different"))
 			.await,
-		Err(VerdictAuthorityError::JobConflict(Str::new_static("durable-job")))
+		Err(JobAuthorityError::JobConflict(Str::new_static("durable-job")))
 	);
 }

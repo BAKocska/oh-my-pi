@@ -16,7 +16,7 @@ pub mod umans;
 pub mod xai_oauth;
 pub mod zai;
 use std::{
-		future::Future,
+	future::Future,
 	sync::Arc,
 	task::{Context, Poll},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -56,7 +56,8 @@ pub enum UsageCredentialRequirement {
 /// Typed, secret-free usage-fetch failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum UsageFetchError {
-	/// The provider is temporarily unavailable; callers may retain last-good data.
+	/// The provider is temporarily unavailable; callers may retain last-good
+	/// data.
 	#[error("usage endpoint is temporarily unavailable")]
 	Unavailable,
 	/// The provider rejected the credential and account health must be updated.
@@ -136,7 +137,10 @@ impl UsageFetcherRegistry {
 		fetchers: impl IntoIterator<Item = Arc<dyn ConsoleUsageFetcher>>,
 	) {
 		for fetcher in fetchers {
-			self.state.builtins.insert(fetcher.provider().to_owned(), fetcher);
+			self
+				.state
+				.builtins
+				.insert(fetcher.provider().to_owned(), fetcher);
 		}
 	}
 
@@ -162,11 +166,7 @@ impl UsageFetcherRegistry {
 	/// Removes one exact runtime registration and restores its predecessor.
 	///
 	/// Returns the new cache generation when a registration was removed.
-	pub fn unregister_runtime(
-		&self,
-		provider: &ProviderId<str>,
-		registration: &str,
-	) -> Option<u64> {
+	pub fn unregister_runtime(&self, provider: &ProviderId<str>, registration: &str) -> Option<u64> {
 		let mut entries = self.state.overrides.get_mut(provider)?;
 		let before = entries.len();
 		entries.retain(|entry| entry.registration != registration);
@@ -186,7 +186,12 @@ impl UsageFetcherRegistry {
 	/// Every effective registration or unregistration increments this value,
 	/// invalidating snapshots fetched through an earlier implementation.
 	pub fn cache_generation(&self, provider: &ProviderId<str>) -> u64 {
-		self.state.generations.get(provider).map(|generation| *generation).unwrap_or_default()
+		self
+			.state
+			.generations
+			.get(provider)
+			.map(|generation| *generation)
+			.unwrap_or_default()
 	}
 
 	fn get(&self, provider: &ProviderId<str>) -> Option<Arc<dyn ConsoleUsageFetcher>> {
@@ -195,7 +200,13 @@ impl UsageFetcherRegistry {
 			.overrides
 			.get(provider)
 			.and_then(|entries| entries.last().map(|entry| Arc::clone(&entry.fetcher)))
-			.or_else(|| self.state.builtins.get(provider).map(|fetcher| Arc::clone(&*fetcher)))
+			.or_else(|| {
+				self
+					.state
+					.builtins
+					.get(provider)
+					.map(|fetcher| Arc::clone(&*fetcher))
+			})
 	}
 }
 
@@ -231,6 +242,7 @@ impl ConsoleUsageManager {
 	) -> Self {
 		Self { catalog, credentials, accounts, fetchers }
 	}
+
 	/// Returns the shared registry used for runtime usage-provider overlays.
 	pub fn fetchers(&self) -> UsageFetcherRegistry {
 		self.fetchers.clone()
@@ -285,8 +297,7 @@ impl ConsoleUsageManager {
 						.ok(),
 					None => None,
 				};
-				if credential_requirement == UsageCredentialRequirement::Required
-					&& acquired.is_none()
+				if credential_requirement == UsageCredentialRequirement::Required && acquired.is_none()
 				{
 					return Err(usage_error("console_usage_credential_unavailable"));
 				}
@@ -988,11 +999,11 @@ mod tests {
 		let registry = UsageFetcherRegistry::new([
 			Arc::new(CountingFetcher {
 				provider: provider.clone(),
-				calls: Arc::clone(&builtin_calls),
+				calls:    Arc::clone(&builtin_calls),
 			}) as Arc<dyn ConsoleUsageFetcher>,
 			Arc::new(CountingFetcher {
 				provider: other.clone(),
-				calls: Arc::new(AtomicUsize::new(0)),
+				calls:    Arc::new(AtomicUsize::new(0)),
 			}),
 		]);
 		assert_eq!(registry.cache_generation(&provider), 0);
@@ -1000,26 +1011,38 @@ mod tests {
 			"extension-a",
 			Arc::new(CountingFetcher {
 				provider: provider.clone(),
-				calls: Arc::clone(&first_calls),
+				calls:    Arc::clone(&first_calls),
 			}),
 		);
 		let second_generation = registry.register_runtime(
 			"extension-b",
 			Arc::new(CountingFetcher {
 				provider: provider.clone(),
-				calls: Arc::clone(&second_calls),
+				calls:    Arc::clone(&second_calls),
 			}),
 		);
 		assert_eq!(first_generation, 1);
 		assert_eq!(second_generation, 2);
 		assert_eq!(registry.cache_generation(&other), 0);
-		let _ = registry.get(&provider).expect("latest override").fetch(None, now(), None).await;
+		let _ = registry
+			.get(&provider)
+			.expect("latest override")
+			.fetch(None, now(), None)
+			.await;
 		assert_eq!(second_calls.load(Ordering::Relaxed), 1);
 		assert_eq!(registry.unregister_runtime(&provider, "extension-b"), Some(3));
-		let _ = registry.get(&provider).expect("previous override").fetch(None, now(), None).await;
+		let _ = registry
+			.get(&provider)
+			.expect("previous override")
+			.fetch(None, now(), None)
+			.await;
 		assert_eq!(first_calls.load(Ordering::Relaxed), 1);
 		assert_eq!(registry.unregister_runtime(&provider, "extension-a"), Some(4));
-		let _ = registry.get(&provider).expect("restored builtin").fetch(None, now(), None).await;
+		let _ = registry
+			.get(&provider)
+			.expect("restored builtin")
+			.fetch(None, now(), None)
+			.await;
 		assert_eq!(builtin_calls.load(Ordering::Relaxed), 1);
 		assert_eq!(registry.unregister_runtime(&provider, "missing"), None);
 	}

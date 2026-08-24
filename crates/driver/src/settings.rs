@@ -1071,10 +1071,7 @@ mod tests {
 	#[test]
 	fn unexpected_stop_and_spelling_defaults_are_explicit() {
 		let defaults: Settings = toml::from_str("").expect("defaults parse");
-		assert_eq!(
-			defaults.interaction.unexpected_stop_detection,
-			UnexpectedStopMode::Mechanical,
-		);
+		assert_eq!(defaults.interaction.unexpected_stop_detection, UnexpectedStopMode::Mechanical,);
 		assert!(defaults.spelling.typo_detection);
 		assert!(defaults.spelling.autocomplete);
 		assert!(!defaults.spelling.autocorrect);
@@ -1084,10 +1081,7 @@ mod tests {
 			 false\nautocomplete = false\nautocorrect = true",
 		)
 		.expect("unexpected-stop and spelling settings parse");
-		assert_eq!(
-			configured.interaction.unexpected_stop_detection,
-			UnexpectedStopMode::Smart,
-		);
+		assert_eq!(configured.interaction.unexpected_stop_detection, UnexpectedStopMode::Smart,);
 		assert!(!configured.spelling.typo_detection);
 		assert!(!configured.spelling.autocomplete);
 		assert!(configured.spelling.autocorrect);

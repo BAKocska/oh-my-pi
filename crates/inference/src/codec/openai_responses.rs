@@ -1386,6 +1386,7 @@ impl OpenAiResponsesDecoder {
 			)
 		})
 	}
+
 	fn has_reasoning_only_output(&self) -> bool {
 		let mut saw_reasoning = false;
 		for slot in self.outputs.values() {
@@ -3111,10 +3112,10 @@ struct ContinuationCheckpoint<'a> {
 }
 
 struct ResponsesDecoderAdapter {
-	inner:      OpenAiResponsesDecoder,
+	inner: OpenAiResponsesDecoder,
 	request_id: RequestId,
-	provider:   ProviderId,
-	route:      RouteId,
+	provider: ProviderId,
+	route: RouteId,
 	wire_model: Option<Str>,
 	thinking_close_max_retries: Option<u32>,
 }
@@ -3202,10 +3203,7 @@ impl ResponsesDecoderAdapter {
 			.thinking_close_max_retries
 			.filter(|_| bounded_thinking_close)
 		{
-			(ErrorKind::Protocol, RetryAction::SameRouteLimited {
-				after: Duration::ZERO,
-				max_retries,
-			})
+			(ErrorKind::Protocol, RetryAction::SameRouteLimited { after: Duration::ZERO, max_retries })
 		} else {
 			match evidence.continuation {
 				ResponsesContinuationFailure::StalePreviousResponse
@@ -3368,10 +3366,10 @@ impl Codec for OpenAiResponsesCodec {
 			return Err(encoding_error("responses_decode_operation_mismatch"));
 		}
 		Ok(Box::new(ResponsesDecoderAdapter {
-			inner:      OpenAiResponsesDecoder::default(),
+			inner: OpenAiResponsesDecoder::default(),
 			request_id: context.request_id.clone(),
-			provider:   context.provider.clone(),
-			route:      context.route.clone(),
+			provider: context.provider.clone(),
+			route: context.route.clone(),
 			wire_model: context
 				.target
 				.map(|target| Str::new(target.wire_model.as_str())),
@@ -4134,10 +4132,10 @@ mod tests {
 	fn codex_model_denial_classifies_as_account_rotation() {
 		use crate::error::{ErrorKind, RetryAction};
 		let adapter = ResponsesDecoderAdapter {
-			inner:      OpenAiResponsesDecoder::default(),
+			inner: OpenAiResponsesDecoder::default(),
 			request_id: RequestId::new("request"),
-			provider:   ProviderId::from("openai-codex"),
-			route:      RouteId::from("openai-codex/primary"),
+			provider: ProviderId::from("openai-codex"),
+			route: RouteId::from("openai-codex/primary"),
 			wire_model: Some(sf!("gpt-daybreak-blue-latest")),
 			thinking_close_max_retries: None,
 		};
@@ -4182,15 +4180,15 @@ mod tests {
 			br#"{"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":0,"delta":"thinking"}"#,
 		);
 		let error = adapter.error_from_evidence(ResponsesErrorEvidence {
-			code: Some(sf!("premature_end")),
-			message: sf!("Responses stream ended before an authoritative terminal event"),
+			code:         Some(sf!("premature_end")),
+			message:      sf!("Responses stream ended before an authoritative terminal event"),
 			continuation: ResponsesContinuationFailure::NotStale,
 		});
 		assert_eq!(error.kind, ErrorKind::Protocol);
-		assert_eq!(
-			error.action,
-			RetryAction::SameRouteLimited { after: Duration::ZERO, max_retries: 1 },
-		);
+		assert_eq!(error.action, RetryAction::SameRouteLimited {
+			after:       Duration::ZERO,
+			max_retries: 1,
+		},);
 		assert!(!error.committed);
 	}
 

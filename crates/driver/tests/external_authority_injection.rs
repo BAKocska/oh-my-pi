@@ -95,9 +95,9 @@ fn factories(generation: &'static str) -> ExternalDomainControlFactories {
 		prompts:           Some(factory("omp.prompts.invalidate", generation)),
 		ui:                Some(factory("omp.ui.presentation", generation)),
 		telemetry:         Some(factory("omp.telemetry.query", generation)),
-		verdicts:          Some(factory("omp.jobs.register", generation)),
+		jobs:              Some(factory("omp.jobs.register", generation)),
 		provider:          Some(factory("omp.provider.models", generation)),
-		campaigns:         Some(factory("omp.campaigns.active", generation)),
+		regimes:           Some(factory("omp.regimes.active", generation)),
 		// Envd replaces this sentinel with its own sole live service broker/router.
 		services:          Some(factory("omp.services.connect", "must-be-overridden-by-envd")),
 	}
@@ -180,7 +180,7 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		"omp.telemetry.query",
 		"omp.jobs.register",
 		"omp.provider.models",
-		"omp.campaigns.active",
+		"omp.regimes.active",
 	] {
 		let value = authority
 			.request(context.clone(), Str::new(operation), serde_json::Map::new())

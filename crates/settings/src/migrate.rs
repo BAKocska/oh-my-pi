@@ -228,14 +228,8 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 		let mode = match legacy {
 			toml::Value::Boolean(true) => Some("smart"),
 			toml::Value::Boolean(false) => Some("none"),
-			toml::Value::String(mode)
-				if matches!(mode.as_str(), "none" | "mechanical" | "smart") =>
-			{
-				set_dotted(
-					document,
-					"interaction.unexpectedStopDetection",
-					toml::Value::String(mode),
-				);
+			toml::Value::String(mode) if matches!(mode.as_str(), "none" | "mechanical" | "smart") => {
+				set_dotted(document, "interaction.unexpectedStopDetection", toml::Value::String(mode));
 				converted(
 					record,
 					"features.unexpectedStopDetection",
@@ -244,11 +238,7 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 				None
 			},
 			_ => {
-				dropped(
-					record,
-					"features.unexpectedStopDetection",
-					"unexpected-stop mode was invalid",
-				);
+				dropped(record, "features.unexpectedStopDetection", "unexpected-stop mode was invalid");
 				None
 			},
 		};

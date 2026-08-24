@@ -12,6 +12,7 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use omp_core::{IntoStr, Str, encoding::base64, sf};
 use prost::Message as _;
 use prost_types::FileDescriptorSet;
+
 use crate::{
 	auth::CredentialApplyError,
 	body::BodySource,
@@ -22,9 +23,8 @@ use crate::{
 	codec::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawCompletion,
 		RawEvent, RequestHeader, RequestMethod, SealedBodyTemplate, SizeBounds, ToolInputKind,
-		UnvalidatedToolCall,
+		UnvalidatedToolCall, connect::parse_connect_end_stream,
 	},
-	codec::connect::parse_connect_end_stream,
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
 	id::ToolCallId,
@@ -1321,7 +1321,10 @@ mod tests {
 		let Some(ErrorDetail::Provider { sanitized_message }) = error.detail_ref() else {
 			panic!("bounded diagnostic must remain supplemental provider evidence");
 		};
-		assert_eq!(sanitized_message.chars().count(), crate::codec::connect::MAX_CONNECT_DIAGNOSTIC_CHARS);
+		assert_eq!(
+			sanitized_message.chars().count(),
+			crate::codec::connect::MAX_CONNECT_DIAGNOSTIC_CHARS
+		);
 		assert!(sanitized_message.ends_with('…'));
 	}
 

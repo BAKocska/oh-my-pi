@@ -1404,8 +1404,8 @@ mod tests {
 	use super::*;
 	use crate::{
 		call::{
-			NegotiationPolicy, OpaqueJson, Sampling, ToolDefinition, ToolGrammar,
-			ToolGrammarSyntax, ToolInputConstraint,
+			NegotiationPolicy, OpaqueJson, Sampling, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
+			ToolInputConstraint,
 		},
 		id::RequestId,
 	};
@@ -1933,11 +1933,8 @@ mod tests {
 			negotiation:       NegotiationPolicy::default(),
 		};
 		let error =
-			match build_start_request(
-				&request,
-				&context,
-				WorkflowSession::new("workflow", "session"),
-			) {
+			match build_start_request(&request, &context, WorkflowSession::new("workflow", "session"))
+			{
 				Err(error) => error,
 				Ok(_) => panic!("workflow does not represent grammar-constrained tool input"),
 			};

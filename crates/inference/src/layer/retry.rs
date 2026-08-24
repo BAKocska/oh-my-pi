@@ -322,10 +322,7 @@ mod tests {
 			ready(Err(Error::new(
 				ErrorKind::Protocol,
 				ErrorPhase::Streaming,
-				RetryAction::SameRouteLimited {
-					after: Duration::ZERO,
-					max_retries: self.limit,
-				},
+				RetryAction::SameRouteLimited { after: Duration::ZERO, max_retries: self.limit },
 				receipt,
 			)))
 		}
@@ -356,9 +353,9 @@ mod tests {
 		};
 		let calls = Arc::new(AtomicUsize::new(0));
 		let mut limited = TransportRetryService {
-			inner: LimitedFailing { calls: calls.clone(), body: replayable, limit: 1 },
+			inner:       LimitedFailing { calls: calls.clone(), body: replayable, limit: 1 },
 			max_retries: 10,
-			backoff: RetryBackoff::ZERO,
+			backoff:     RetryBackoff::ZERO,
 		};
 		futures::future::poll_fn(|cx| limited.poll_ready(cx))
 			.await

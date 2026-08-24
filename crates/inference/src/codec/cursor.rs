@@ -6,7 +6,13 @@
 //! stream even though the pinned descriptor declares the method unary;
 //! descriptor tests make that observed drift explicit.
 
-use std::{collections::{BTreeMap, BTreeSet}, error, fmt, fmt::Display, sync::Arc, time::Duration};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	error, fmt,
+	fmt::Display,
+	sync::Arc,
+	time::Duration,
+};
 
 use bytes::{BufMut as _, Bytes, BytesMut};
 use omp_catalog::{
@@ -30,10 +36,10 @@ use self::wire::{
 	web_search_request_response,
 };
 use super::{
-	connect::{ConnectErrorDiagnostic, parse_connect_end_stream},
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
 	ProviderControlEvent, ProviderStateEvent, RawCompletion, RawEvent, RequestHeader, RequestMethod,
 	SizeBounds, ToolInputKind, UnvalidatedToolCall,
+	connect::{ConnectErrorDiagnostic, parse_connect_end_stream},
 };
 use crate::{
 	body::BodySource,
@@ -137,7 +143,7 @@ pub struct CursorProtocolError {
 	/// Whether an ordinary canonical event had already been emitted.
 	pub committed: bool,
 	/// Typed Connect evidence retained separately from classification.
-	diagnostic: Option<ConnectErrorDiagnostic>,
+	diagnostic:    Option<ConnectErrorDiagnostic>,
 }
 
 impl CursorProtocolError {
@@ -367,9 +373,8 @@ fn encode_run_request_for_wire_mode(
 		.collect();
 	let wire_model = match wire_mode {
 		CursorWireMode::Normalized => resolve_cursor_wire_model(request.model_id.as_str()),
-		CursorWireMode::Discovered => CursorWireModel {
-			model_id:  request.model_id.clone(),
-			reasoning: None,
+		CursorWireMode::Discovered => {
+			CursorWireModel { model_id: request.model_id.clone(), reasoning: None }
 		},
 	};
 	let model = wire::ModelDetails {
@@ -514,7 +519,7 @@ fn serialized_fallback_wire_model(
 		&& details.model_id == expected.model_id
 		&& parameter.id == "reasoning"
 		&& parameter.value == effort.as_str())
-		.then(|| request.model_id.clone())
+	.then(|| request.model_id.clone())
 }
 
 /// Encodes the request body for `RunSSE` reconnect.
@@ -1055,15 +1060,15 @@ enum OpenKind {
 
 #[derive(Debug)]
 struct OpenBlock {
-	index:         u32,
-	kind:          OpenKind,
-	tool_id:       ToolCallId,
-	tool_name:     Str,
-	arguments:     BytesMut,
+	index:               u32,
+	kind:                OpenKind,
+	tool_id:             ToolCallId,
+	tool_name:           Str,
+	arguments:           BytesMut,
 	announced_arguments: Option<Bytes>,
-	edit_path:     Option<Str>,
-	edit_text:     String,
-	edit_inner_id: ToolCallId,
+	edit_path:           Option<Str>,
+	edit_text:           String,
+	edit_inner_id:       ToolCallId,
 }
 
 /// Stateful protobuf projector for one Cursor Agent attempt.
@@ -1200,9 +1205,11 @@ impl CursorDecoder {
 	const fn saw_token_delta(&self) -> bool {
 		self.saw_usage
 	}
+
 	const fn saw_server_progress(&self) -> bool {
 		self.progress
 	}
+
 	const fn completed_turn(&self) -> bool {
 		self.turn_ended
 	}
@@ -1480,9 +1487,9 @@ impl CursorDecoder {
 	fn flush_open_tool_call(&mut self) -> Option<CursorEvent> {
 		let open = self.open.take()?;
 		(open.kind == OpenKind::Tool).then(|| CursorEvent::ToolCallComplete {
-			index: open.index,
-			id: open.tool_id.clone(),
-			name: open.tool_name.clone(),
+			index:     open.index,
+			id:        open.tool_id.clone(),
+			name:      open.tool_name.clone(),
 			arguments: open_tool_arguments(open, None),
 		})
 	}
@@ -1528,8 +1535,7 @@ fn cursor_plan_gate_evidence(evidence: &serde_json::Value) -> bool {
 					.as_str()
 					.is_some_and(|value| value.eq_ignore_ascii_case("ERROR_RATE_LIMITED_CHANGEABLE"));
 			}
-			matches!(value, serde_json::Value::Object(_))
-				&& has_marker(value)
+			matches!(value, serde_json::Value::Object(_)) && has_marker(value)
 				|| matches!(value, serde_json::Value::Array(_))
 					&& value
 						.as_array()
@@ -1545,16 +1551,11 @@ fn cursor_plan_gate_evidence(evidence: &serde_json::Value) -> bool {
 			if matches!(name.as_str(), "title" | "detail")
 				&& let Some(text) = value.as_str()
 			{
-				return [
-					"Named models unavailable",
-					"Model unavailable on",
-					"Free plans can only use",
-				]
-				.iter()
-				.any(|prefix| starts_with_ascii_case_insensitive(text, prefix));
+				return ["Named models unavailable", "Model unavailable on", "Free plans can only use"]
+					.iter()
+					.any(|prefix| starts_with_ascii_case_insensitive(text, prefix));
 			}
-			matches!(value, serde_json::Value::Object(_))
-				&& has_plan_scope(value)
+			matches!(value, serde_json::Value::Object(_)) && has_plan_scope(value)
 				|| matches!(value, serde_json::Value::Array(_))
 					&& value
 						.as_array()
@@ -2196,9 +2197,10 @@ fn encode_chat_call(
 		|| Str::new(context.request_id.as_str()),
 		|session| Str::new(session.conversation.as_str()),
 	);
-	let (wire_conversation, wire_mode) = conversations
-		.lock()
-		.begin(context.request_id, &base_conversation, &discovered_model);
+	let (wire_conversation, wire_mode) =
+		conversations
+			.lock()
+			.begin(context.request_id, &base_conversation, &discovered_model);
 	let run = CursorRunRequest {
 		model_id: discovered_model,
 		max_mode,
@@ -2577,15 +2579,12 @@ fn inference_error(error: CursorProtocolError) -> Error {
 		CursorErrorKind::ContextOverflow => (ErrorKind::ContextOverflow, RetryAction::Never),
 		CursorErrorKind::Unsupported => (ErrorKind::CapabilityMismatch, RetryAction::Never),
 	};
-	let inference =
-		Error::new(kind, ErrorPhase::Streaming, action, ExecutionReceipt::default())
+	let inference = Error::new(kind, ErrorPhase::Streaming, action, ExecutionReceipt::default())
 		.status(error.status)
 		.code(error.reason.clone())
 		.committed(error.committed);
 	if let Some(diagnostic) = error.diagnostic {
-		inference.detail(ErrorDetail::Provider {
-			sanitized_message: diagnostic.display_message(),
-		})
+		inference.detail(ErrorDetail::Provider { sanitized_message: diagnostic.display_message() })
 	} else {
 		inference.detail(ErrorDetail::protocol(ReasonId(error.reason)))
 	}
@@ -2716,17 +2715,15 @@ mod tests {
 				text:       sf!("hello"),
 			},
 		};
-		let normalized =
-			encode_run_request_for_wire_mode(&request, CursorWireMode::Normalized)
-				.expect("normalized request");
+		let normalized = encode_run_request_for_wire_mode(&request, CursorWireMode::Normalized)
+			.expect("normalized request");
 		assert_eq!(
 			serialized_fallback_wire_model(&request, CursorWireMode::Normalized, &normalized),
 			Some(sf!("gpt-5.6-sol-medium"))
 		);
 
-		let discovered =
-			encode_run_request_for_wire_mode(&request, CursorWireMode::Discovered)
-				.expect("discovered request");
+		let discovered = encode_run_request_for_wire_mode(&request, CursorWireMode::Discovered)
+			.expect("discovered request");
 		assert_eq!(
 			serialized_fallback_wire_model(&request, CursorWireMode::Discovered, &discovered),
 			None
@@ -2742,7 +2739,10 @@ mod tests {
 		assert_eq!(requested.model_id, "gpt-5.6-sol-medium");
 		assert!(requested.parameters.is_empty());
 		assert_eq!(
-			discovered_run.model_details.expect("model details").model_id,
+			discovered_run
+				.model_details
+				.expect("model details")
+				.model_id,
 			"gpt-5.6-sol-medium"
 		);
 
@@ -2751,8 +2751,10 @@ mod tests {
 		let Some(agent_client_message::Message::RunRequest(run)) = changed.message.as_mut() else {
 			panic!("run request")
 		};
-		run.requested_model.as_mut().expect("requested model").model_id =
-			"hook-selected-model".to_owned();
+		run.requested_model
+			.as_mut()
+			.expect("requested model")
+			.model_id = "hook-selected-model".to_owned();
 		let changed = connect_message(&changed);
 		assert_eq!(
 			serialized_fallback_wire_model(&request, CursorWireMode::Normalized, &changed),
@@ -2808,8 +2810,8 @@ mod tests {
 
 		fn message(payload: Bytes) -> Frame {
 			Frame::Connect(TransportConnectEnvelope {
-				flags:   0,
-				kind:    ConnectEnvelopeKind::Message,
+				flags: 0,
+				kind: ConnectEnvelopeKind::Message,
 				payload,
 			})
 		}
@@ -2834,9 +2836,7 @@ mod tests {
 		let mut heartbeat_only = decoder(&conversations, "heartbeat");
 		heartbeat_only
 			.push(
-				message(update(interaction_update::Message::Heartbeat(
-					wire::HeartbeatUpdate {},
-				))),
+				message(update(interaction_update::Message::Heartbeat(wire::HeartbeatUpdate {}))),
 				&mut sink,
 			)
 			.expect("heartbeat is ignorable");
@@ -2847,11 +2847,15 @@ mod tests {
 		assert_eq!(retry.action, RetryAction::SameRoute { after: Duration::ZERO });
 		assert!(!retry.committed);
 		let request = RequestId::from("heartbeat");
-		let (_, mode) = conversations
-			.lock()
-			.begin(&request, &sf!("conversation"), &sf!("gpt-5.6-sol-medium"));
+		let (_, mode) =
+			conversations
+				.lock()
+				.begin(&request, &sf!("conversation"), &sf!("gpt-5.6-sol-medium"));
 		assert_eq!(mode, CursorWireMode::Discovered);
-		let fallback = conversations.lock().take(&request).expect("fallback attempt");
+		let fallback = conversations
+			.lock()
+			.take(&request)
+			.expect("fallback attempt");
 		assert!(
 			!conversations.lock().schedule_fallback(&fallback),
 			"discovered id is attempted at most once"
@@ -2861,9 +2865,9 @@ mod tests {
 		let mut progressed = decoder(&progress, "progress");
 		progressed
 			.push(
-				message(update(interaction_update::Message::TextDelta(
-					wire::TextDeltaUpdate { text: "partial".to_owned() },
-				))),
+				message(update(interaction_update::Message::TextDelta(wire::TextDeltaUpdate {
+					text: "partial".to_owned(),
+				}))),
 				&mut sink,
 			)
 			.expect("text progress");
@@ -2876,19 +2880,18 @@ mod tests {
 		let side_effects = Arc::new(Mutex::new(CursorConversationRotations::default()));
 		let mut busy = decoder(&side_effects, "busy");
 		let exec = wire::AgentServerMessage {
-			message: Some(agent_server_message::Message::ExecServerMessage(
-				wire::ExecServerMessage {
-					id:      1,
-					message: Some(exec_server_message::Message::ShellArgs(wire::ShellArgs {
-						command: "printf busy".to_owned(),
-						tool_call_id: "call-shell".to_owned(),
-						..Default::default()
-					})),
+			message: Some(agent_server_message::Message::ExecServerMessage(wire::ExecServerMessage {
+				id: 1,
+				message: Some(exec_server_message::Message::ShellArgs(wire::ShellArgs {
+					command: "printf busy".to_owned(),
+					tool_call_id: "call-shell".to_owned(),
 					..Default::default()
-				},
-			)),
+				})),
+				..Default::default()
+			})),
 		};
-		busy.push(message(Bytes::from(exec.encode_to_vec())), &mut sink)
+		busy
+			.push(message(Bytes::from(exec.encode_to_vec())), &mut sink)
 			.expect("local workflow request marks the stream busy");
 		let error = busy
 			.push(not_found(), &mut sink)
@@ -3068,22 +3071,19 @@ mod tests {
 		}
 		args.insert(
 			"json_number".to_owned(),
-			encode_json_value(&serde_json::json!(57_785_654))
-				.expect("encoded protobuf number"),
+			encode_json_value(&serde_json::json!(57_785_654)).expect("encoded protobuf number"),
 		);
 		args.insert(
 			"invalid_number".to_owned(),
-			Bytes::from(ProtoValue {
-				kind: Some(ProtoValueKind::NumberValue(f64::NAN)),
-			}
-			.encode_to_vec()),
+			Bytes::from(
+				ProtoValue { kind: Some(ProtoValueKind::NumberValue(f64::NAN)) }.encode_to_vec(),
+			),
 		);
 		args.insert(
 			"infinite_number".to_owned(),
-			Bytes::from(ProtoValue {
-				kind: Some(ProtoValueKind::NumberValue(f64::INFINITY)),
-			}
-			.encode_to_vec()),
+			Bytes::from(
+				ProtoValue { kind: Some(ProtoValueKind::NumberValue(f64::INFINITY)) }.encode_to_vec(),
+			),
 		);
 		args.insert("invalid_raw".to_owned(), Bytes::from_static(b"\xff"));
 		let tool = wire::ToolCall {
@@ -3121,8 +3121,7 @@ mod tests {
 			let mut args = BTreeMap::new();
 			args.insert(
 				"city".to_owned(),
-				encode_json_value(&serde_json::Value::String(city.to_owned()))
-					.expect("encoded city"),
+				encode_json_value(&serde_json::Value::String(city.to_owned())).expect("encoded city"),
 			);
 			wire::ToolCall {
 				tool_call_id: Some("call-weather".to_owned()),
@@ -3226,7 +3225,9 @@ mod tests {
 				},
 			)))
 			.expect("started abruptly truncated MCP call");
-		let abrupt = abrupt.flush_open_tool_call().expect("flushes abrupt MCP call");
+		let abrupt = abrupt
+			.flush_open_tool_call()
+			.expect("flushes abrupt MCP call");
 		assert_eq!(complete_arguments(vec![abrupt]), Bytes::from_static(br#"{"city":"Paris"}"#));
 	}
 
@@ -3660,10 +3661,9 @@ mod tests {
 			base: &Str,
 		) -> (CursorWireDecoder, Str) {
 			let request = RequestId::from(request);
-			let (wire_id, _) =
-				conversations
-					.lock()
-					.begin(&request, base, &sf!("cursor-composer-2.5"));
+			let (wire_id, _) = conversations
+				.lock()
+				.begin(&request, base, &sf!("cursor-composer-2.5"));
 			let conversation = conversations.lock().take(&request);
 			(
 				CursorWireDecoder {
@@ -3689,8 +3689,8 @@ mod tests {
 
 		fn message(payload: Bytes) -> Frame {
 			Frame::Connect(TransportConnectEnvelope {
-				flags:   0,
-				kind:    ConnectEnvelopeKind::Message,
+				flags: 0,
+				kind: ConnectEnvelopeKind::Message,
 				payload,
 			})
 		}
@@ -3738,21 +3738,16 @@ mod tests {
 		else {
 			panic!("rotated resume retry must replay the last user turn")
 		};
-		assert_eq!(
-			action.user_message.expect("replayed user message").text,
-			"Use the read tool."
-		);
+		assert_eq!(action.user_message.expect("replayed user message").text, "Use the read tool.");
 
-		let (mut failed_rotation, wire_id) =
-			wire_decoder(&conversations, "request-2", &base);
+		let (mut failed_rotation, wire_id) = wire_decoder(&conversations, "request-2", &base);
 		assert_eq!(wire_id, rotated);
 		failed_rotation
 			.push(end_stream(POISONED), &mut sink)
 			.expect_err("failed rotated turn remains terminal");
 		assert_eq!(conversations.lock().resolve(&base), rotated);
 
-		let (mut clean_rotation, wire_id) =
-			wire_decoder(&conversations, "request-3", &base);
+		let (mut clean_rotation, wire_id) = wire_decoder(&conversations, "request-3", &base);
 		assert_eq!(wire_id, rotated);
 		clean_rotation
 			.push(
@@ -3765,11 +3760,12 @@ mod tests {
 		clean_rotation
 			.push(end_stream(br#"{}"#), &mut sink)
 			.expect("clean Connect end-stream");
-		clean_rotation.finish(&mut sink).expect("clean rotated completion");
+		clean_rotation
+			.finish(&mut sink)
+			.expect("clean rotated completion");
 		assert!(conversations.lock().rotation_reusable(&base));
 
-		let (mut poisoned_again, wire_id) =
-			wire_decoder(&conversations, "request-4", &base);
+		let (mut poisoned_again, wire_id) = wire_decoder(&conversations, "request-4", &base);
 		assert_eq!(wire_id, rotated);
 		poisoned_again
 			.push(end_stream(POISONED), &mut sink)
@@ -3777,8 +3773,7 @@ mod tests {
 		let rerotated = conversations.lock().resolve(&base);
 		assert_ne!(rerotated, rotated);
 
-		let (mut trailer_rejected, wire_id) =
-			wire_decoder(&conversations, "request-5", &base);
+		let (mut trailer_rejected, wire_id) = wire_decoder(&conversations, "request-5", &base);
 		assert_eq!(wire_id, rerotated);
 		trailer_rejected
 			.push(
@@ -3797,9 +3792,9 @@ mod tests {
 		let (mut decoder, _) = wire_decoder(&conversations, "request-6", &billed);
 		decoder
 			.push(
-				message(update(interaction_update::Message::TokenDelta(
-					wire::TokenDeltaUpdate { tokens: 3 },
-				))),
+				message(update(interaction_update::Message::TokenDelta(wire::TokenDeltaUpdate {
+					tokens: 3,
+				}))),
 				&mut sink,
 			)
 			.expect("token delta projects");
@@ -4131,20 +4126,20 @@ mod tests {
 	fn cursor_model_plan_gate_is_structured_and_codec_scoped() {
 		fn classify(payload: &'static [u8]) -> Error {
 			let mut decoder = CursorWireDecoder {
-				operation: OperationKind::Chat,
-				provider: omp_catalog::ProviderId::from("cursor"),
-				route: omp_catalog::RouteId::from("route"),
-				agent: CursorDecoder::default(),
+				operation:      OperationKind::Chat,
+				provider:       omp_catalog::ProviderId::from("cursor"),
+				route:          omp_catalog::RouteId::from("route"),
+				agent:          CursorDecoder::default(),
 				discovery_done: false,
-				conversations: Arc::new(Mutex::new(CursorConversationRotations::default())),
-				conversation: None,
+				conversations:  Arc::new(Mutex::new(CursorConversationRotations::default())),
+				conversation:   None,
 			};
 			let mut sink = |_event: RawEvent| {};
 			decoder
 				.push(
 					Frame::Connect(TransportConnectEnvelope {
-						flags: CONNECT_END_STREAM,
-						kind: ConnectEnvelopeKind::EndStream,
+						flags:   CONNECT_END_STREAM,
+						kind:    ConnectEnvelopeKind::EndStream,
 						payload: Bytes::from_static(payload),
 					}),
 					&mut sink,

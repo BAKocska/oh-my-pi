@@ -1503,32 +1503,27 @@ fn lower_reasoning(
 		ReasoningWireFormat::OpenAiEffort if reasoning.max_tokens.is_some() => {
 			return Err(capability_error());
 		},
-		ReasoningWireFormat::OpenAiEffort => ReasoningFields {
-			effort,
-			openrouter: None,
-			zai: None,
-			qwen: None,
-			nvidia: None,
-			venice,
+		ReasoningWireFormat::OpenAiEffort => {
+			ReasoningFields { effort, openrouter: None, zai: None, qwen: None, nvidia: None, venice }
 		},
 		ReasoningWireFormat::OpenRouter => ReasoningFields {
-			effort:     None,
+			effort: None,
 			openrouter: Some(OpenRouterReasoning {
 				effort,
 				exclude: reasoning.visibility == ReasoningVisibility::Hidden,
 				max_tokens: reasoning.max_tokens,
 			}),
-			zai:        None,
-			qwen:       None,
-			nvidia:     None,
+			zai: None,
+			qwen: None,
+			nvidia: None,
 			venice,
 		},
 		ReasoningWireFormat::Zai => ReasoningFields {
-			effort:     None,
+			effort: None,
 			openrouter: None,
-			zai:        Some(ZaiThinking { r#type: ThinkingType::Enabled, effort }),
-			qwen:       None,
-			nvidia:     None,
+			zai: Some(ZaiThinking { r#type: ThinkingType::Enabled, effort }),
+			qwen: None,
+			nvidia: None,
 			venice,
 		},
 		ReasoningWireFormat::Qwen => {
@@ -1537,11 +1532,11 @@ fn lower_reasoning(
 				.then_some(effort)
 				.flatten();
 			ReasoningFields {
-				effort:     template_effort,
+				effort: template_effort,
 				openrouter: None,
-				zai:        None,
-				qwen:       Some(true),
-				nvidia:     (!profile.template_effort_top_level_only)
+				zai: None,
+				qwen: Some(true),
+				nvidia: (!profile.template_effort_top_level_only)
 					.then_some(template_effort)
 					.flatten()
 					.map(|effort| ChatTemplateKwargs {
@@ -1552,25 +1547,22 @@ fn lower_reasoning(
 			}
 		},
 		ReasoningWireFormat::Nvidia if profile.template_effort_top_level_only => ReasoningFields {
-			effort:     profile
+			effort: profile
 				.template_reasoning_effort
 				.then_some(effort)
 				.flatten(),
 			openrouter: None,
-			zai:        None,
-			qwen:       None,
-			nvidia:     Some(ChatTemplateKwargs {
-				enable_thinking:  Some(true),
-				reasoning_effort: None,
-			}),
+			zai: None,
+			qwen: None,
+			nvidia: Some(ChatTemplateKwargs { enable_thinking: Some(true), reasoning_effort: None }),
 			venice,
 		},
 		ReasoningWireFormat::Nvidia => ReasoningFields {
-			effort:     None,
+			effort: None,
 			openrouter: None,
-			zai:        None,
-			qwen:       None,
-			nvidia:     Some(ChatTemplateKwargs {
+			zai: None,
+			qwen: None,
+			nvidia: Some(ChatTemplateKwargs {
 				enable_thinking:  Some(true),
 				reasoning_effort: profile
 					.template_reasoning_effort
@@ -2220,8 +2212,8 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 	// in the attempt receipt.
 	let template_effort_rejection = template_kwarg_effort_rejection(&error, message);
 	let rejection_kind = classify_provider_rejection(status, Some(message), None, None);
-	let generation_fault = matches!(status, Some(400))
-		|| matches!(code_text, "400" | "invalid_request_error");
+	let generation_fault =
+		matches!(status, Some(400)) || matches!(code_text, "400" | "invalid_request_error");
 	let generation_fault = generation_fault && is_transient_generation_fault(message);
 	let (kind, action) = if let Some(kind) = rejection_kind {
 		(kind, RetryAction::Never)
@@ -3010,10 +3002,7 @@ mod tests {
 			"Floating point NaN (not-a-number) is detected in generation",
 		);
 		assert_eq!(generation_nan.kind, ErrorKind::ResourceExhausted);
-		assert_eq!(
-			generation_nan.action,
-			RetryAction::SameRoute { after: Duration::ZERO },
-		);
+		assert_eq!(generation_nan.action, RetryAction::SameRoute { after: Duration::ZERO },);
 
 		// llama.cpp deterministic tool-call parse failures arrive as HTTP 500
 		// but replay identically: never transient.
@@ -3126,10 +3115,10 @@ mod tests {
 		let classify = |code: ErrorCode, message: Option<&str>| {
 			classify_error(
 				WireError {
-					code: Some(code),
-					message: message.map(Into::into),
-					param: None,
-					metadata: None,
+					code:            Some(code),
+					message:         message.map(Into::into),
+					param:           None,
+					metadata:        None,
 					rate_limit_type: None,
 				},
 				false,
@@ -3146,10 +3135,7 @@ mod tests {
 		assert_eq!(wrapped.kind, ErrorKind::PayloadRejected);
 		assert_eq!(wrapped.action, RetryAction::Never);
 
-		let token = classify(
-			ErrorCode::Number(413),
-			Some("maximum context length is 128000 tokens"),
-		);
+		let token = classify(ErrorCode::Number(413), Some("maximum context length is 128000 tokens"));
 		assert_eq!(token.kind, ErrorKind::ContextOverflow);
 		assert_eq!(token.action, RetryAction::Never);
 	}
@@ -3315,15 +3301,15 @@ mod tests {
 	#[test]
 	fn text_only_history_replaces_images_while_ocr_preserves_them() {
 		let message = Message {
-			role: Role::User,
+			role:    Role::User,
 			content: Arc::from([
 				ContentPart::Text { text: "Read this".into(), proof: None },
 				ContentPart::Image(MediaInput::Bytes {
 					media_type: "image/png".into(),
-					data: Bytes::from_static(b"png"),
+					data:       Bytes::from_static(b"png"),
 				}),
 			]),
-			name: None,
+			name:    None,
 		};
 		let chat = request(Arc::from([message]));
 
@@ -3362,13 +3348,12 @@ mod tests {
 	fn venice_thinking_off_merges_disable_with_configured_parameters() {
 		let mut profile = OpenAiChatProfile::default();
 		let mut compat = policy::WirePolicy::baseline();
-		compat.reasoning.disable_mode =
-			Some(policy::ReasoningDisableMode::VeniceDisableThinking);
+		compat.reasoning.disable_mode = Some(policy::ReasoningDisableMode::VeniceDisableThinking);
 		compat.reasoning.extra_body = Some(policy::ReasoningBodyOverride {
-			thinking: None,
-			enable_thinking: None,
+			thinking:          None,
+			enable_thinking:   None,
 			venice_parameters: Some(policy::VeniceParameters {
-				disable_thinking: Some(false),
+				disable_thinking:             Some(false),
 				include_venice_system_prompt: Some(false),
 			}),
 		});

@@ -1,4 +1,4 @@
-//! Proves provider and campaign backends use sealed generations and enforce
+//! Proves provider and regime backends use sealed generations and enforce
 //! service schemas.
 
 use std::{collections::BTreeSet, sync::Arc};
@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use omp_catalog::snapshot;
 use omp_core::{Principal, Str, sf};
 use omp_driver::{
-	chat::{CampaignControlResolver as _, ChatProviderControlBackend, ProviderApplicationOwner},
-	discovery::runtime::{SealedCampaignControlResolver, SealedCampaignDeclaration},
+	chat::{ChatProviderControlBackend, ProviderApplicationOwner, RegimeControlResolver as _},
+	discovery::runtime::{SealedRegimeControlResolver, SealedRegimeDeclaration},
 	model_controls::{
 		ProviderControlBackend as _, ProviderControlError, ProviderControlRequest,
 		ProviderControlResult, ProviderDeclarationDocument, ProviderModelEvent,
@@ -85,36 +85,34 @@ async fn provider_catalog_backend_projects_the_live_registry_generation() {
 }
 
 #[test]
-fn campaign_resolver_uses_only_the_sealed_owner_generation() {
-	use omp_agent::CampaignMachine as _;
-
+fn regime_resolver_uses_only_the_sealed_owner_generation() {
 	let mut spec = omp_agent::plan_regime_spec();
-	spec.id = sf!("dev.example.campaign");
+	spec.id = sf!("dev.example.regime");
 	let declaration =
-		SealedCampaignDeclaration::new("consumer.extension", 7, 11, Arc::new(spec), |state| {
-			let mut machine = omp_agent::RegimeMachine;
+		SealedRegimeDeclaration::new("consumer.extension", 7, 11, Arc::new(spec), |state| {
+			let (_, mut regime) = omp_agent::core_regime("plan").expect("core plan regime");
 			if let Some(state) = state {
-				machine.restore(state).map_err(|_| {
+				regime.restore(state).map_err(|_| {
 					ControlProtocolError::new(
-						"InvalidCampaignState",
-						"campaign state does not match its sealed codec",
+						"InvalidRegimeState",
+						"regime state does not match its sealed codec",
 					)
 				})?;
 			}
-			Ok(Box::new(machine) as Box<dyn omp_agent::CampaignMachine>)
+			Ok(regime)
 		});
-	let resolver = SealedCampaignControlResolver::new([declaration]).expect("sealed resolver");
+	let resolver = SealedRegimeControlResolver::new([declaration]).expect("sealed resolver");
 	let identity = identity();
-	let (resolved, machine) = resolver
-		.resolve(&identity, "dev.example.campaign", Some("{}"))
+	let (resolved, regime) = resolver
+		.resolve(&identity, "dev.example.regime", Some("{}"))
 		.expect("owned generation resolves");
-	assert_eq!(resolved.id, "dev.example.campaign");
-	assert_eq!(machine.state(), "{}");
+	assert_eq!(resolved.id, "dev.example.regime");
+	assert_eq!(regime.state(), "{}");
 
 	let mut stale = (*identity).clone();
 	stale.host_generation += 1;
 	let error = resolver
-		.resolve(&stale, "dev.example.campaign", None)
+		.resolve(&stale, "dev.example.regime", None)
 		.err()
 		.expect("old declaration cannot bind a replacement generation");
 	assert_eq!(error.code, "StaleGeneration");

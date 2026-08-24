@@ -40,11 +40,13 @@ impl ConnectDetailSource {
 pub(crate) struct ConnectErrorDetail {
 	/// Typed detail source.
 	pub(crate) source:   ConnectDetailSource,
-	/// Structured detail evidence, preferring `debug` and falling back to `value`.
+	/// Structured detail evidence, preferring `debug` and falling back to
+	/// `value`.
 	pub(crate) evidence: Value,
 }
 
-/// Parsed Connect end-stream status with classification and display evidence separated.
+/// Parsed Connect end-stream status with classification and display evidence
+/// separated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConnectErrorDiagnostic {
 	/// Stable Connect status code.
@@ -53,20 +55,30 @@ pub(crate) struct ConnectErrorDiagnostic {
 	pub(crate) message:  Str,
 	/// Structured detail entries in provider order.
 	pub(crate) details:  SmallVec<ConnectErrorDetail, 2>,
-	/// Unstructured trailer evidence retained only when structured details are unavailable.
+	/// Unstructured trailer evidence retained only when structured details are
+	/// unavailable.
 	pub(crate) fallback: Option<Value>,
 }
 
 impl ConnectErrorDiagnostic {
-	/// Returns a bounded diagnostic with structured or fallback trailer evidence.
+	/// Returns a bounded diagnostic with structured or fallback trailer
+	/// evidence.
 	pub(crate) fn display_message(&self) -> Str {
 		self.display_message_with_prefix("Connect error")
 	}
 
 	/// Returns a bounded diagnostic using a provider-specific display prefix.
 	pub(crate) fn display_message_with_prefix(&self, prefix: &str) -> Str {
-		let code = if self.code.is_empty() { "unknown" } else { self.code.as_str() };
-		let message = if self.message.is_empty() { "Unknown error" } else { self.message.as_str() };
+		let code = if self.code.is_empty() {
+			"unknown"
+		} else {
+			self.code.as_str()
+		};
+		let message = if self.message.is_empty() {
+			"Unknown error"
+		} else {
+			self.message.as_str()
+		};
 		let mut rendered = format!("{prefix} {code}: {message}");
 		if !self.details.is_empty() {
 			rendered.push_str(" [details: ");
@@ -77,7 +89,7 @@ impl ConnectErrorDiagnostic {
 				let source = detail.source.as_str();
 				if !source.is_empty() {
 					rendered.push_str(source);
-										if !detail.evidence.is_null() {
+					if !detail.evidence.is_null() {
 						rendered.push_str(": ");
 					}
 				}
@@ -113,7 +125,8 @@ struct WireConnectStatus {
 	extra:   BTreeMap<Str, Value>,
 }
 
-/// Parses one Connect end-stream envelope without conflating diagnostics with classification.
+/// Parses one Connect end-stream envelope without conflating diagnostics with
+/// classification.
 pub(crate) fn parse_connect_end_stream(
 	payload: &[u8],
 ) -> Result<Option<ConnectErrorDiagnostic>, serde_json::Error> {
@@ -126,10 +139,10 @@ pub(crate) fn parse_connect_end_stream(
 	let mut details = SmallVec::<ConnectErrorDetail, 2>::new();
 	let mut fallback = None;
 	if let Some(value) = status.details {
-				if let Value::Array(entries) = value {
+		if let Value::Array(entries) = value {
 			let mut unstructured = Vec::new();
 			for entry in entries {
-								let Value::Object(mut record) = entry else {
+				let Value::Object(mut record) = entry else {
 					unstructured.push(entry);
 					continue;
 				};
@@ -137,22 +150,19 @@ pub(crate) fn parse_connect_end_stream(
 					.remove("type")
 					.or_else(|| record.remove("@type"))
 					.and_then(|value| value.as_str().map(Str::new));
-								let evidence = record.remove("debug").or_else(|| record.remove("value"));
+				let evidence = record.remove("debug").or_else(|| record.remove("value"));
 				if type_name.is_none() && evidence.is_none() {
 					unstructured.push(Value::Object(record));
 					continue;
-								}
+				}
 				let source = match type_name.as_deref() {
 					Some("google.rpc.ErrorInfo") => ConnectDetailSource::ErrorInfo,
 					Some("google.rpc.DebugInfo") => ConnectDetailSource::DebugInfo,
 					Some(other) => ConnectDetailSource::Other(Str::new(other)),
 					None => ConnectDetailSource::Unspecified,
 				};
-								details.push(ConnectErrorDetail {
-					source,
-					evidence: evidence.unwrap_or(Value::Null),
-				});
-						}
+				details.push(ConnectErrorDetail { source, evidence: evidence.unwrap_or(Value::Null) });
+			}
 			if details.is_empty() && !unstructured.is_empty() {
 				fallback = Some(Value::Array(unstructured));
 			}
@@ -169,12 +179,7 @@ pub(crate) fn parse_connect_end_stream(
 				.collect(),
 		));
 	}
-	Ok(Some(ConnectErrorDiagnostic {
-		code,
-		message,
-		details: details,
-		fallback,
-	}))
+	Ok(Some(ConnectErrorDiagnostic { code, message, details, fallback }))
 }
 
 fn push_json_value(output: &mut String, value: &Value) {
@@ -192,7 +197,10 @@ fn truncate_diagnostic(rendered: String) -> Str {
 	if rendered.chars().count() <= MAX_CONNECT_DIAGNOSTIC_CHARS {
 		return Str::new(rendered);
 	}
-	let mut bounded = rendered.chars().take(MAX_CONNECT_DIAGNOSTIC_CHARS - 1).collect::<String>();
+	let mut bounded = rendered
+		.chars()
+		.take(MAX_CONNECT_DIAGNOSTIC_CHARS - 1)
+		.collect::<String>();
 	bounded.push('…');
 	Str::new(bounded)
 }

@@ -599,6 +599,7 @@ impl Error {
 		self.committed = committed;
 		self
 	}
+
 	/// Refines status-only payload inference with later provider body text.
 	pub fn refine_provider_rejection(&mut self, message: &str) {
 		if let Some(kind) =
@@ -810,7 +811,12 @@ mod tests {
 		let nested = io::Error::other("maximum context length is 128000 tokens");
 		let wrapper = io::Error::new(io::ErrorKind::Other, nested);
 		assert_eq!(
-			classify_provider_rejection(Some(413), Some("Provider returned error"), Some(&wrapper), None),
+			classify_provider_rejection(
+				Some(413),
+				Some("Provider returned error"),
+				Some(&wrapper),
+				None
+			),
 			Some(ErrorKind::ContextOverflow),
 		);
 	}

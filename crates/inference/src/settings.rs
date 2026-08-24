@@ -443,7 +443,7 @@ impl Default for ProviderRuntimeSettings {
 			max_queued:           64,
 			timeout_seconds:      300,
 			call_timeout_seconds: 0,
-			bedrock_guardrails: BTreeMap::new(),
+			bedrock_guardrails:   BTreeMap::new(),
 		}
 	}
 }
@@ -497,8 +497,7 @@ impl SettingsDomain for ProviderRuntimeSettings {
 				!provider.trim().is_empty()
 					&& !guardrail.identifier.trim().is_empty()
 					&& !guardrail.version.trim().is_empty()
-			})
-		{
+			}) {
 			Ok(())
 		} else {
 			Err(ValidationError::DomainInvariant { domain: Self::DOMAIN })

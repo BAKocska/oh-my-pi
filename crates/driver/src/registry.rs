@@ -373,13 +373,8 @@ pub async fn production_inference_for_session(
 		},
 	};
 	let (registry, sessions, authority, mcp_authority, auth_manager, usage_manager, builtins) =
-		production_assembly_for_session(
-			data_dir,
-			credential_store,
-			invocation_key,
-			usage_fetchers,
-		)
-		.await?;
+		production_assembly_for_session(data_dir, credential_store, invocation_key, usage_fetchers)
+			.await?;
 	let usage_fetchers = usage_manager.fetchers();
 	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, project_root))?;
 	let search_settings = settings
