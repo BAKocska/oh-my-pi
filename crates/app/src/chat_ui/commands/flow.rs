@@ -6,11 +6,11 @@ command!(compact, 410, "compact", [], "Compact conversation context", [Context, 
 command!(shake, 420, "shake", [], "Reclaim replaceable context", [Context, Execution], false, raw("[elide|drop-media|thinking]", ["elide", "drop-media", "thinking"]) => |host, args| host.shake(args));
 command!(usage, 430, "usage", [], "Show or reset durable usage", [Context], false, raw("[show|reset]", ["show", "reset"]) => |host, args| host.usage(args));
 command!(stats, 440, "stats", [], "Open the local usage dashboard", [Context], false, flags("[--host HOST] [--port PORT]", ["--host", "--port"]) => |host, flags| host.stats(flags));
-command!(plan, 450, "plan", [], "Control planning mode", [Execution], false, raw("[args]", []) => |host, args| host.plan(args));
-command!(vibe, 451, "vibe", [], "Control director/worker mode", [Execution], false, raw("[on|off|status]", ["on", "off", "status"]) => |host, args| host.vibe(args));
+command!(plan, 450, "plan", [], "Control planning mode", [Execution], false, raw("[on|yolo|off|status|stop <activation>]", ["on", "yolo", "off", "status", "stop"]) => |host, args| host.plan(args));
+command!(vibe, 451, "vibe", [], "Control director/worker mode", [Execution], false, raw("[on|off|status|stop <activation>]", ["on", "off", "status", "stop"]) => |host, args| host.vibe(args));
 command!(todo, 452, "todo", [], "Inspect or update session tasks", [Session], false, raw("[subcommand]", ["show", "edit", "copy", "expand", "collapse", "export", "import", "append", "start", "done", "drop", "rm", "help"]) => |host, args| host.todo(args));
 command!(plan_review, 460, "plan-review", [], "Review the current plan", [Execution], false, raw("[args]", []) => |host, args| host.plan_review(args));
-command!(goal, 470, "goal", ["guided-goal"], "Start or control a guided goal", [Execution], false, raw("[goal]", []) => |host, args| host.guided_goal(args));
+command!(goal, 470, "goal", ["guided-goal"], "Start or control a guided goal", [Execution], false, raw("[set|pause|resume|complete|drop|budget|status|stop]", ["set", "pause", "resume", "complete", "drop", "budget", "status", "stop"]) => |host, args| host.guided_goal(args));
 command!(loop_command, 480, "loop", [], "Configure bounded continuation", [Execution], false, raw("[args]", []) => |host, args| host.loop_command(args));
 command!(queue, 490, "queue", [], "Queue work at the next turn boundary", [Execution], false, required("<prompt>") => |host, prompt| host.queue(prompt));
 command!(force, 500, "force", [], "Force the next turn's tool choice", [Execution], false, required("<tool>") => |host, tool| host.force(tool));

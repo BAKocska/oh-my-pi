@@ -14,11 +14,12 @@ use omp_driver::subagent::{
 use omp_proto::thread::v1::{item, part};
 use serde_json::json;
 
-const SUBAGENT_VALIDATION_GUIDANCE: &str = "Project-wide validation is the main agent's job, run \
-	once after all subagents land. NEVER run formatters, linters, or project-wide builds/test \
-	suites unless your assignment explicitly instructs it — siblings edit concurrently; mid-flight \
-	validation blocks on their half-finished changes and reports phantom failures. Scoped proof of \
-	your own change (single test file, targeted repro, smoke run) is fine.";
+const SUBAGENT_VALIDATION_GUIDANCE: &str =
+	"Project-wide validation is the main agent's job, run once after all subagents land. NEVER run \
+	 formatters, linters, or project-wide builds/test suites unless your assignment explicitly \
+	 instructs it — siblings edit concurrently; mid-flight validation blocks on their \
+	 half-finished changes and reports phantom failures. Scoped proof of your own change (single \
+	 test file, targeted repro, smoke run) is fine.";
 
 fn without_new_validation_guidance(prompt: &str) -> String {
 	assert!(prompt.contains(SUBAGENT_VALIDATION_GUIDANCE));

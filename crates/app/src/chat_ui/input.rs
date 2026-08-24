@@ -89,6 +89,11 @@ const PLAN_SUBCOMMANDS: &[SubcommandSpec] = &[
 		usage:       "",
 	},
 	SubcommandSpec { name: "off", description: "Exit planning", usage: "" },
+	SubcommandSpec {
+		name:        "stop",
+		description: "Stop a queued or active plan activation",
+		usage:       "<activation>",
+	},
 	SubcommandSpec { name: "status", description: "Show active mode", usage: "" },
 ];
 const GOAL_SUBCOMMANDS: &[SubcommandSpec] = &[
@@ -119,10 +124,20 @@ const GOAL_SUBCOMMANDS: &[SubcommandSpec] = &[
 		description: "Show goal status and spend",
 		usage:       "",
 	},
+	SubcommandSpec {
+		name:        "stop",
+		description: "Stop a queued or active goal activation",
+		usage:       "<activation>",
+	},
 ];
 const VIBE_SUBCOMMANDS: &[SubcommandSpec] = &[
 	SubcommandSpec { name: "on", description: "Enter director/worker mode", usage: "" },
 	SubcommandSpec { name: "off", description: "Exit director/worker mode", usage: "" },
+	SubcommandSpec {
+		name:        "stop",
+		description: "Stop a queued or active vibe activation",
+		usage:       "<activation>",
+	},
 	SubcommandSpec { name: "status", description: "Show active mode", usage: "" },
 ];
 const PREWALK_SUBCOMMANDS: &[SubcommandSpec] = &[
@@ -214,21 +229,21 @@ pub const COMMANDS: &[CommandSpec] = &[
 		name:        "plan",
 		aliases:     &[],
 		description: "Control read-only plan mode",
-		usage:       "[on|yolo|off|status]",
+		usage:       "[on|yolo|off|status|stop <activation>]",
 		subcommands: PLAN_SUBCOMMANDS,
 	},
 	CommandSpec {
 		name:        "goal",
 		aliases:     &[],
 		description: "Control an autonomous objective",
-		usage:       "[set|pause|resume|complete|drop|budget|status]",
+		usage:       "[set|pause|resume|complete|drop|budget|status|stop <activation>]",
 		subcommands: GOAL_SUBCOMMANDS,
 	},
 	CommandSpec {
 		name:        "vibe",
 		aliases:     &[],
 		description: "Control director/worker vibe mode",
-		usage:       "[on|off|status]",
+		usage:       "[on|off|status|stop <activation>]",
 		subcommands: VIBE_SUBCOMMANDS,
 	},
 	CommandSpec {
@@ -1081,10 +1096,22 @@ mod tests {
 		let commands = builtins();
 		assert_eq!(commands.parse_input("/plan yolo"), Ok(ChatCommand::Plan(sf!("yolo"))));
 		assert_eq!(
+			commands.parse_input("/plan stop activation-1"),
+			Ok(ChatCommand::Plan(sf!("stop activation-1")))
+		);
+		assert_eq!(
 			commands.parse_input("/goal set finish migration 12000"),
 			Ok(ChatCommand::Goal(sf!("set finish migration 12000")))
 		);
 		assert_eq!(commands.parse_input("/vibe on"), Ok(ChatCommand::Vibe(sf!("on"))));
+		assert_eq!(
+			commands.parse_input("/goal stop activation-2"),
+			Ok(ChatCommand::Goal(sf!("stop activation-2")))
+		);
+		assert_eq!(
+			commands.parse_input("/vibe stop activation-3"),
+			Ok(ChatCommand::Vibe(sf!("stop activation-3")))
+		);
 		assert_eq!(commands.parse_input("/prewalk status"), Ok(ChatCommand::Prewalk(sf!("status"))));
 	}
 	#[test]

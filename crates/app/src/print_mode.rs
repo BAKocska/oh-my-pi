@@ -146,7 +146,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		project: env::current_dir().into_diagnostic()?,
 		additional_roots: args.add_dir.clone().into_boxed_slice(),
 		model,
-		initial_campaign: args.plan_yolo.then_some("plan"),
+		initial_regime: args.plan_yolo.then_some("plan"),
 		initial_prompt_slot: args.plan_yolo.then_some("plan-yolo"),
 		plan_handoff,
 		resume: None,

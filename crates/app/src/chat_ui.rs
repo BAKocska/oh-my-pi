@@ -32,7 +32,7 @@ use omp_chat_ui::{
 	ActivityWaveform, AgentRow, ApprovalAction, ApprovalTicketView, Attachment, BackendEvent, Chat,
 	Intent, ModelRow, RewindTargetRow, SessionRow, StatusFacts, StatusLayout, StatusSeparator,
 	SubmitMode, ThinkingLevel as StatusThinkingLevel, TranscriptFrame, TranscriptFrameKind,
-	VisibleSlotFacts,
+	VisibleResourceFacts,
 	completion::{
 		CompletionChain, CompletionQuery, CompletionSource, CompletionTrigger, DeferredCompletion,
 	},
@@ -45,7 +45,7 @@ pub use omp_driver::auth_flow::{
 };
 use omp_driver::{
 	advisor::engine::{AdvisorEngine, AdvisorEngineStatus, AdvisorRunState},
-	modes::{CampaignHandle, Goal, GoalStatus, GoalUsage},
+	modes::{Goal, GoalStatus, GoalUsage, RegimeHandle},
 	settings::{self, Settings},
 	subagent::settings::TaskSettings,
 };
@@ -80,6 +80,9 @@ use omp_tui::{
 	components::{AttachmentContent, KeywordAccent},
 	detect,
 };
+pub(crate) fn terminal_ui_context(caps: &omp_tui::TerminalCaps) -> UiContext {
+	UiContext::default().with_terminal_caps(caps)
+}
 use parking_lot::Mutex;
 use serde_json::Value;
 
@@ -122,10 +125,11 @@ use omp_settings::{
 use omp_tools::debug;
 use omp_tui::components;
 use tokio::{runtime, sync::watch::Receiver};
-use tokio_util::context::TokioContext;
+use tokio_util::{context::TokioContext, sync::CancellationToken};
 
 use crate::{
-	chat_cmd::ChatPresentation, gui, session_manager::PinStore, theme_watcher::ThemeWatcher,
+	chat_cmd::ChatPresentation, git_tui::GitSession, gui, session_manager::PinStore,
+	theme_watcher::ThemeWatcher,
 };
 
 pub mod presentation_authority {
@@ -751,23 +755,23 @@ enum UiCmd {
 	Shake {
 		mode: omp_agent::ManualShakeMode,
 	},
-	Campaign {
-		operation: CampaignOperation,
-		reply:     flume::Sender<Result<CampaignMutation, omp_agent::AgentError>>,
+	Regime {
+		operation: RegimeOperation,
+		reply:     flume::Sender<Result<RegimeMutation, omp_agent::AgentError>>,
 	},
 }
 enum MaintenanceEvent {
 	Compact(Result<omp_agent::ManualCompactionOutcome, omp_agent::AgentError>),
 	Shake(Result<(omp_agent::ManualShakeOutcome, Vec<Item>), omp_agent::AgentError>),
 }
-enum CampaignOperation {
-	Engage { spec: &'static str, queue: bool, prompt_slot: Option<&'static str> },
-	Disengage { engagement: Str },
+enum RegimeOperation {
+	Start { id: &'static str, queue: bool, prompt_slot: Option<&'static str> },
+	Stop { activation: Str },
 }
 
-enum CampaignMutation {
-	Engaged(omp_agent::EngageReceipt),
-	Disengaged(bool),
+enum RegimeMutation {
+	Started(omp_agent::StartReceipt),
+	Stopped(bool),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -945,13 +949,14 @@ fn inspect_image_enabled(state: &BridgeState) -> bool {
 
 struct BridgeState {
 	model: String,
+	git: Option<GitWorkbenchBackend>,
 	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
 	session_id: Str,
 	title: SessionTitleState,
 	title_replan_refresh_pending: bool,
 	local_root: PathBuf,
-	campaigns: CampaignHandle,
-	campaign_revision: u64,
+	regimes: RegimeHandle,
+	regime_revision: u64,
 	collab: Option<CollabCommandHandle>,
 	environment: omp_env::EnvClient,
 	memory: Option<Arc<omp_driver::memory::ChatMemory>>,
@@ -996,6 +1001,15 @@ struct BridgeState {
 	extension_mcp: Option<omp_env::McpSubscription>,
 	extension_live_mcp: HashMap<Str, omp_chat_ui::McpLiveSnapshot>,
 	approvals: HashMap<Str, ApprovalRequest>,
+}
+struct GitWorkbenchBackend {
+	session: GitSession,
+	cancel:  CancellationToken,
+}
+impl Drop for GitWorkbenchBackend {
+	fn drop(&mut self) {
+		self.cancel.cancel();
+	}
 }
 
 async fn next_extension_mcp_event(
@@ -1244,7 +1258,7 @@ pub async fn run<C, R>(
 	tree: Arc<AgentTree>,
 	parent: Arc<ChatParentHost<C>>,
 	collab: Option<CollabCommandHandle>,
-	modes: Arc<CampaignHandle>,
+	modes: Arc<RegimeHandle>,
 	auth: Option<ChatAuth>,
 	data_dir: PathBuf,
 	settings_manager: Arc<SettingsManager>,
@@ -1331,10 +1345,10 @@ where
 		agent.journal().pending_turn().is_some(),
 		agent.journal().pending_input_submission().is_some(),
 	);
-	modes.sync_campaigns(agent.arbiter().campaigns());
+	modes.sync_regimes(agent.arbiter().regimes());
 
 	let submission_state = agent.state().clone();
-	let campaign_projection = modes.clone();
+	let regime_projection = modes.clone();
 	let (ui_tx, ui_rx) = flume::bounded::<UiCmd>(1);
 	let (error_tx, error_rx) = flume::unbounded::<String>();
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
@@ -1414,29 +1428,29 @@ where
 					});
 					let _ = maintenance_tx.send(MaintenanceEvent::Shake(result));
 				},
-				UiCmd::Campaign { operation, reply } => {
+				UiCmd::Regime { operation, reply } => {
 					let result = match operation {
-						CampaignOperation::Engage { spec, queue, prompt_slot } => {
-							let (mut spec, machine) = omp_agent::core_regime(spec)
+						RegimeOperation::Start { id, queue, prompt_slot } => {
+							let (mut spec, machine) = omp_agent::core_regime(id)
 								.expect("built-in slash command names a core regime");
 							if let Some(prompt_slot) = prompt_slot {
-								Arc::make_mut(&mut spec).binds = Arc::from([omp_agent::ScopedBinding {
-									slot:  omp_agent::BindSlot::PromptSlot,
+								Arc::make_mut(&mut spec).sets = Arc::from([omp_agent::ScopedSetting {
+									slot:  omp_agent::SettingSlot::PromptSlot,
 									value: Str::new_static(prompt_slot),
 								}]);
 							}
 							agent
-								.engage_campaign(spec, machine, omp_agent::EngageOptions {
+								.start_regime(spec, machine, omp_agent::StartOptions {
 									now_ms: now_ms(),
 									queue,
 								})
-								.map(CampaignMutation::Engaged)
+								.map(RegimeMutation::Started)
 						},
-						CampaignOperation::Disengage { engagement } => agent
-							.disengage_campaign(engagement.as_str(), now_ms())
-							.map(CampaignMutation::Disengaged),
+						RegimeOperation::Stop { activation } => agent
+							.stop_regime(activation.as_str(), now_ms())
+							.map(RegimeMutation::Stopped),
 					};
-					campaign_projection.sync_campaigns(agent.arbiter().campaigns());
+					regime_projection.sync_regimes(agent.arbiter().regimes());
 					let _ = reply.send(result);
 				},
 			}
@@ -1445,7 +1459,7 @@ where
 	let mut agent_task = executor.spawn(TokioContext::new(agent_future, runtime::Handle::current()));
 
 	let caps = detect();
-	let ctx = UiContext::default().with_terminal_caps(&caps);
+	let ctx = terminal_ui_context(&caps);
 	let typed_commands = structural_roster(&command_sources, security_enabled);
 	let chat_commands = typed_commands.clone();
 	let commands = CommandRoster::new(command_sources);
@@ -1465,13 +1479,14 @@ where
 	drop(snapshot);
 	let mut state = BridgeState {
 		model,
+		git: None,
 		advisor,
 		session_id: session_id.clone(),
 		title: session.title,
 		title_replan_refresh_pending: false,
 		local_root,
-		campaigns: modes.as_ref().clone(),
-		campaign_revision: modes.revision(),
+		regimes: modes.as_ref().clone(),
+		regime_revision: modes.revision(),
 		collab,
 		environment,
 		memory: omp_driver::memory::chat_memory(&session_id),
@@ -1526,8 +1541,8 @@ where
 		composer_style: presentation_composer_style(state.settings.composer.shape),
 		spelling: omp_tui::SpellingFeatures {
 			typo_detection: state.settings.spelling.typo_detection,
-			autocomplete: state.settings.spelling.autocomplete,
-			autocorrect: state.settings.spelling.autocorrect,
+			autocomplete:   state.settings.spelling.autocomplete,
+			autocorrect:    state.settings.spelling.autocorrect,
 		},
 		hide_thinking,
 	};
@@ -1835,13 +1850,12 @@ where
 										generation: tree.roster_generation(),
 									});
 								}
-								let campaign_revision = state.campaigns.revision();
-								let campaign_changed =
-									campaign_revision != state.campaign_revision;
-								if campaign_changed {
-									state.campaign_revision = campaign_revision;
+								let regime_revision = state.regimes.revision();
+								let regime_changed = regime_revision != state.regime_revision;
+								if regime_changed {
+									state.regime_revision = regime_revision;
 								}
-								if campaign_changed || drain_live_activity(&live_events, &mut state) {
+								if regime_changed || drain_live_activity(&live_events, &mut state) {
 									send_status(&backend_tx, &state, &bus, 0);
 								}
 							},
@@ -1916,7 +1930,7 @@ pub async fn run_guest(
 	initial_draft: Str,
 ) -> miette::Result<omp_chat_ui::host::HostOutcome> {
 	let caps = detect();
-	let ctx = UiContext::default().with_terminal_caps(&caps);
+	let ctx = terminal_ui_context(&caps);
 	let chat = Chat::new(&ctx);
 	let (backend_tx, backend_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
@@ -2131,69 +2145,68 @@ fn guest_status(collab: &CollabCommandHandle) -> StatusFacts {
 	}
 }
 
-fn campaign_status(modes: &CampaignHandle) -> Str {
-	modes.mode_holder().map_or_else(
-		|| sf!("No campaign holds the mode slot."),
-		|holder| sf!("Mode campaign: **{holder}**"),
-	)
+fn mode_status(modes: &RegimeHandle) -> Str {
+	modes
+		.mode_holder()
+		.map_or_else(|| sf!("No regime owns the mode resource."), |holder| sf!("Mode: **{holder}**"))
 }
 
-async fn campaign_request(
+async fn regime_request(
 	backend: &flume::Sender<BackendEvent>,
 	commands: &flume::Sender<UiCmd>,
-	operation: CampaignOperation,
-) -> Option<Result<CampaignMutation, omp_agent::AgentError>> {
+	operation: RegimeOperation,
+) -> Option<Result<RegimeMutation, omp_agent::AgentError>> {
 	let (reply, response) = flume::bounded(1);
 	if commands
-		.send_async(UiCmd::Campaign { operation, reply })
+		.send_async(UiCmd::Regime { operation, reply })
 		.await
 		.is_err()
 	{
-		send_backend(backend, BackendEvent::Error(sf!("Campaign control is unavailable.")));
+		send_backend(backend, BackendEvent::Error(sf!("Regime control is unavailable.")));
 		return None;
 	}
 	match response.recv_async().await {
 		Ok(result) => Some(result),
 		Err(_) => {
-			send_backend(backend, BackendEvent::Error(sf!("Campaign control stopped.")));
+			send_backend(backend, BackendEvent::Error(sf!("Regime control stopped.")));
 			None
 		},
 	}
 }
 
-fn report_campaign_engagement(
+fn report_regime_start(
 	backend: &flume::Sender<BackendEvent>,
-	modes: &CampaignHandle,
-	spec: &str,
-	result: Result<CampaignMutation, omp_agent::AgentError>,
-) -> Option<omp_agent::EngageReceipt> {
+	modes: &RegimeHandle,
+	id: &str,
+	result: Result<RegimeMutation, omp_agent::AgentError>,
+) -> Option<omp_agent::StartReceipt> {
 	match result {
-		Ok(CampaignMutation::Engaged(receipt)) => {
+		Ok(RegimeMutation::Started(receipt)) => {
 			match &receipt.outcome {
-				omp_agent::ClaimOutcome::Granted => {
-					send_backend(backend, BackendEvent::Notice(sf!("Mode campaign: **{spec}**")))
+				omp_agent::AcquireOutcome::Granted => {
+					send_backend(backend, BackendEvent::Notice(sf!("Mode: **{id}**")))
 				},
-				omp_agent::ClaimOutcome::Queued { holder, since } => {
+				omp_agent::AcquireOutcome::Queued { holder, since } => {
 					let holder_name = modes.mode_holder().unwrap_or_else(|| holder.clone());
 					send_backend(
 						backend,
 						BackendEvent::Notice(sf!(
-							"Queued {spec} ticket `{}` behind {holder_name} (holder {holder}, since \
-							 {since}). Cancel with `/{spec} cancel {}`.",
-							receipt.engagement,
-							receipt.engagement,
+							"Queued {id} activation `{}` behind mode owner {holder_name} (activation \
+							 {holder}, since {since}). Stop with `/{id} stop {}`.",
+							receipt.activation,
+							receipt.activation,
 						)),
 					);
 				},
-				omp_agent::ClaimOutcome::Denied { .. } => {
-					unreachable!("denied campaign engagement is returned as an error")
+				omp_agent::AcquireOutcome::Denied { .. } => {
+					unreachable!("denied resource acquisition is returned as a start error")
 				},
 			}
 			Some(receipt)
 		},
-		Err(omp_agent::AgentError::Arbiter(omp_agent::ArbiterError::Engage(
-			omp_agent::EngageError::Claim {
-				outcome: omp_agent::ClaimOutcome::Denied { holder, since },
+		Err(omp_agent::AgentError::Arbiter(omp_agent::ArbiterError::Start(
+			omp_agent::StartError::Acquire {
+				outcome: omp_agent::AcquireOutcome::Denied { holder, since },
 				..
 			},
 		))) => {
@@ -2201,12 +2214,13 @@ fn report_campaign_engagement(
 			send_backend(
 				backend,
 				BackendEvent::Error(sf!(
-					"Cannot engage {spec}: exit {holder_name} first (holder {holder}, since {since})."
+					"Cannot start {id}: stop {holder_name} first (mode owner activation {holder}, \
+					 since {since})."
 				)),
 			);
 			None
 		},
-		Ok(CampaignMutation::Disengaged(_)) => unreachable!("engage returned disengage result"),
+		Ok(RegimeMutation::Stopped(_)) => unreachable!("start returned stop result"),
 		Err(error) => {
 			send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
 			None
@@ -2214,46 +2228,47 @@ fn report_campaign_engagement(
 	}
 }
 
-async fn engage_campaign(
+async fn start_mode_regime(
 	backend: &flume::Sender<BackendEvent>,
 	commands: &flume::Sender<UiCmd>,
-	modes: &CampaignHandle,
-	spec: &'static str,
+	modes: &RegimeHandle,
+	id: &'static str,
 	queue: bool,
 	prompt_slot: Option<&'static str>,
-) -> Option<omp_agent::EngageReceipt> {
+) -> Option<omp_agent::StartReceipt> {
 	let result =
-		campaign_request(backend, commands, CampaignOperation::Engage { spec, queue, prompt_slot })
-			.await?;
-	report_campaign_engagement(backend, modes, spec, result)
+		regime_request(backend, commands, RegimeOperation::Start { id, queue, prompt_slot }).await?;
+	report_regime_start(backend, modes, id, result)
 }
 
-async fn disengage_campaign(
+async fn stop_mode_regime(
 	backend: &flume::Sender<BackendEvent>,
 	commands: &flume::Sender<UiCmd>,
-	spec: &str,
-	engagement: Str,
+	id: &str,
+	activation: Str,
 ) -> bool {
-	let Some(result) = campaign_request(backend, commands, CampaignOperation::Disengage {
-		engagement: engagement.clone(),
-	})
-	.await
+	let Some(result) =
+		regime_request(backend, commands, RegimeOperation::Stop { activation: activation.clone() })
+			.await
 	else {
 		return false;
 	};
 	match result {
-		Ok(CampaignMutation::Disengaged(true)) => {
-			send_backend(backend, BackendEvent::Notice(sf!("Exited {spec} campaign `{engagement}`.")));
-			true
-		},
-		Ok(CampaignMutation::Disengaged(false)) => {
+		Ok(RegimeMutation::Stopped(true)) => {
 			send_backend(
 				backend,
-				BackendEvent::Error(sf!("Campaign ticket `{engagement}` is not active.")),
+				BackendEvent::Notice(sf!("Stopped {id} activation `{activation}`.")),
+			);
+			true
+		},
+		Ok(RegimeMutation::Stopped(false)) => {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!("Regime activation `{activation}` is not active.")),
 			);
 			false
 		},
-		Ok(CampaignMutation::Engaged(_)) => unreachable!("disengage returned engage result"),
+		Ok(RegimeMutation::Started(_)) => unreachable!("stop returned start result"),
 		Err(error) => {
 			send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
 			false
@@ -2270,32 +2285,34 @@ fn queued_flag(args: &str) -> (&str, bool) {
 async fn handle_plan_command(
 	backend: &flume::Sender<BackendEvent>,
 	commands: &flume::Sender<UiCmd>,
-	modes: &CampaignHandle,
+	modes: &RegimeHandle,
 	args: &str,
 ) {
 	let (args, queue) = queued_flag(args.trim());
 	match args {
-		"" | "status" => send_backend(backend, BackendEvent::Notice(campaign_status(modes))),
+		"" | "status" => send_backend(backend, BackendEvent::Notice(mode_status(modes))),
 		"on" | "yolo" => {
 			let prompt_slot = (args == "yolo").then_some("plan-yolo");
-			let _ = engage_campaign(backend, commands, modes, "plan", queue, prompt_slot).await;
+			let _ = start_mode_regime(backend, commands, modes, "plan", queue, prompt_slot).await;
 		},
 		"off" => {
 			if modes.mode_holder().as_deref() != Some("plan") {
-				send_backend(backend, BackendEvent::Notice(campaign_status(modes)));
+				send_backend(backend, BackendEvent::Notice(mode_status(modes)));
 				return;
 			}
-			if let Some(engagement) = modes.mode_engagement() {
-				let _ = disengage_campaign(backend, commands, "plan", engagement).await;
+			if let Some(activation) = modes.mode_activation() {
+				let _ = stop_mode_regime(backend, commands, "plan", activation).await;
 			}
 		},
-		_ if args.starts_with("cancel ") => {
-			let ticket = Str::new(args.trim_start_matches("cancel ").trim());
-			let _ = disengage_campaign(backend, commands, "plan", ticket).await;
+		_ if args.starts_with("stop ") => {
+			let activation = Str::new(args.trim_start_matches("stop ").trim());
+			let _ = stop_mode_regime(backend, commands, "plan", activation).await;
 		},
 		_ => send_backend(
 			backend,
-			BackendEvent::Error(sf!("Usage: /plan [on|yolo|off|status|cancel <ticket>] [queue=true]")),
+			BackendEvent::Error(sf!(
+				"Usage: /plan [on|yolo|off|status|stop <activation>] [queue=true]"
+			)),
 		),
 	}
 }
@@ -2303,31 +2320,31 @@ async fn handle_plan_command(
 async fn handle_vibe_command(
 	backend: &flume::Sender<BackendEvent>,
 	commands: &flume::Sender<UiCmd>,
-	modes: &CampaignHandle,
+	modes: &RegimeHandle,
 	args: &str,
 ) {
 	let (args, queue) = queued_flag(args.trim());
 	match args {
-		"" | "status" => send_backend(backend, BackendEvent::Notice(campaign_status(modes))),
+		"" | "status" => send_backend(backend, BackendEvent::Notice(mode_status(modes))),
 		"on" => {
-			let _ = engage_campaign(backend, commands, modes, "vibe", queue, None).await;
+			let _ = start_mode_regime(backend, commands, modes, "vibe", queue, None).await;
 		},
 		"off" => {
 			if modes.mode_holder().as_deref() != Some("vibe") {
-				send_backend(backend, BackendEvent::Notice(campaign_status(modes)));
+				send_backend(backend, BackendEvent::Notice(mode_status(modes)));
 				return;
 			}
-			if let Some(engagement) = modes.mode_engagement() {
-				let _ = disengage_campaign(backend, commands, "vibe", engagement).await;
+			if let Some(activation) = modes.mode_activation() {
+				let _ = stop_mode_regime(backend, commands, "vibe", activation).await;
 			}
 		},
-		_ if args.starts_with("cancel ") => {
-			let ticket = Str::new(args.trim_start_matches("cancel ").trim());
-			let _ = disengage_campaign(backend, commands, "vibe", ticket).await;
+		_ if args.starts_with("stop ") => {
+			let activation = Str::new(args.trim_start_matches("stop ").trim());
+			let _ = stop_mode_regime(backend, commands, "vibe", activation).await;
 		},
 		_ => send_backend(
 			backend,
-			BackendEvent::Error(sf!("Usage: /vibe [on|off|status|cancel <ticket>] [queue=true]")),
+			BackendEvent::Error(sf!("Usage: /vibe [on|off|status|stop <activation>] [queue=true]")),
 		),
 	}
 }
@@ -2335,7 +2352,7 @@ async fn handle_vibe_command(
 async fn handle_goal_command(
 	backend: &flume::Sender<BackendEvent>,
 	commands: &flume::Sender<UiCmd>,
-	modes: &CampaignHandle,
+	modes: &RegimeHandle,
 	args: &str,
 ) {
 	let args = args.trim();
@@ -2357,14 +2374,15 @@ async fn handle_goal_command(
 							.ok()
 							.map_or((rest, None), |budget| (objective.trim(), Some(budget)))
 					});
-			if let Some(receipt) = engage_campaign(backend, commands, modes, "goal", queue, None).await
+			if let Some(receipt) =
+				start_mode_regime(backend, commands, modes, "goal", queue, None).await
 			{
 				match modes.set_goal(objective, budget, now_ms()) {
 					Ok(goal) => {
 						send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
 					},
 					Err(error) => {
-						let _ = disengage_campaign(backend, commands, "goal", receipt.engagement).await;
+						let _ = stop_mode_regime(backend, commands, "goal", receipt.activation).await;
 						send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
 					},
 				}
@@ -2380,9 +2398,9 @@ async fn handle_goal_command(
 			match result {
 				Ok(goal) => {
 					if modes.mode_holder().as_deref() == Some("goal")
-						&& let Some(engagement) = modes.mode_engagement()
+						&& let Some(activation) = modes.mode_activation()
 					{
-						let _ = disengage_campaign(backend, commands, "goal", engagement).await;
+						let _ = stop_mode_regime(backend, commands, "goal", activation).await;
 					}
 					send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
 				},
@@ -2393,14 +2411,15 @@ async fn handle_goal_command(
 		},
 		"resume" => {
 			let (_, queue) = queued_flag(rest);
-			if let Some(receipt) = engage_campaign(backend, commands, modes, "goal", queue, None).await
+			if let Some(receipt) =
+				start_mode_regime(backend, commands, modes, "goal", queue, None).await
 			{
 				match modes.resume_goal(now_ms()) {
 					Ok(goal) => {
 						send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
 					},
 					Err(error) => {
-						let _ = disengage_campaign(backend, commands, "goal", receipt.engagement).await;
+						let _ = stop_mode_regime(backend, commands, "goal", receipt.activation).await;
 						send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
 					},
 				}
@@ -2411,9 +2430,9 @@ async fn handle_goal_command(
 				Ok(goal) => {
 					if goal.status == GoalStatus::BudgetLimited
 						&& modes.mode_holder().as_deref() == Some("goal")
-						&& let Some(engagement) = modes.mode_engagement()
+						&& let Some(activation) = modes.mode_activation()
 					{
-						let _ = disengage_campaign(backend, commands, "goal", engagement).await;
+						let _ = stop_mode_regime(backend, commands, "goal", activation).await;
 					}
 					send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
 				},
@@ -2425,14 +2444,14 @@ async fn handle_goal_command(
 				send_backend(backend, BackendEvent::Error(sf!("Usage: /goal budget <positive-tokens>")))
 			},
 		},
-		"cancel" => {
-			let ticket = Str::new(rest);
-			let _ = disengage_campaign(backend, commands, "goal", ticket).await;
+		"stop" => {
+			let activation = Str::new(rest);
+			let _ = stop_mode_regime(backend, commands, "goal", activation).await;
 		},
 		_ => send_backend(
 			backend,
 			BackendEvent::Error(sf!(
-				"Usage: /goal [set|pause|resume|complete|drop|budget|status|cancel]"
+				"Usage: /goal [set|pause|resume|complete|drop|budget|status|stop]"
 			)),
 		),
 	}
@@ -2500,14 +2519,14 @@ fn shake_notice(outcome: &omp_agent::ManualShakeOutcome) -> Str {
 }
 
 struct LiveCommandHost<'a, R> {
-	mcp_inspector:  &'a omp_envd::McpInspectorHandle,
+	mcp_inspector: &'a omp_envd::McpInspectorHandle,
 	executor:      &'a Executor,
 	backend:       &'a flume::Sender<BackendEvent>,
 	commands_tx:   &'a flume::Sender<UiCmd>,
 	abort:         &'a omp_agent::AbortHandle,
 	control:       &'a omp_agent::ControlSender,
 	agent_state:   &'a AgentState,
-	modes:         &'a CampaignHandle,
+	modes:         &'a RegimeHandle,
 	auth:          Option<&'a ChatAuth>,
 	data_dir:      &'a Path,
 	list_sessions: &'a mut R,
@@ -2654,6 +2673,67 @@ where
 			self.state.context_tokens = 0;
 			self.state.context_snapshot = None;
 			send_backend(self.backend, BackendEvent::HistoryCleared);
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
+	}
+
+	fn git(&mut self, revision: Option<Str>) -> CommandFuture<'_> {
+		let backend = self.backend.clone();
+		let cwd = self.state.local_root.clone();
+		Box::pin(async move {
+			if let Some(open) = self.state.git.take() {
+				let _ = open
+					.session
+					.handle(omp_chat_ui::git::GitIntent::Close)
+					.await;
+			}
+			let cancel = CancellationToken::new();
+			let session = match GitSession::open(&cwd, revision.as_deref(), cancel.clone()).await {
+				Ok(session) => session,
+				Err(error) => {
+					send_backend(
+						&backend,
+						BackendEvent::Notice(crate::git_cmd::git_open_error(&error).into()),
+					);
+					return Ok(CommandResult::Consumed(ConsumedResult::silent()));
+				},
+			};
+			let snapshot = match session.initial_snapshot().await {
+				Ok(snapshot) => snapshot,
+				Err(error) => {
+					send_backend(
+						&backend,
+						BackendEvent::Notice(crate::git_cmd::git_open_error(&error).into()),
+					);
+					return Ok(CommandResult::Consumed(ConsumedResult::silent()));
+				},
+			};
+			send_backend(&backend, BackendEvent::OpenGitWorkbench(snapshot));
+			self.state.git =
+				Some(GitWorkbenchBackend { session: session.clone(), cancel: cancel.clone() });
+			drop(tokio::spawn(async move {
+				let mut interval = tokio::time::interval(Duration::from_secs(2));
+				interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				interval.tick().await;
+				loop {
+					tokio::select! {
+						_ = cancel.cancelled() => break,
+						_ = interval.tick() => {
+							match session.poll_refresh().await {
+								Ok(Some(snapshot)) => {
+									send_backend(&backend, BackendEvent::Git(
+										omp_chat_ui::git::GitUpdate::Snapshot(snapshot),
+									));
+								},
+								Ok(None) => {},
+								Err(error) => {
+									tracing::debug!(%error, "Git workbench refresh failed");
+								},
+							}
+						},
+					}
+				}
+			}));
 			Ok(CommandResult::Consumed(ConsumedResult::silent()))
 		})
 	}
@@ -3108,8 +3188,7 @@ async fn invoke_plan_write(
 	invocation
 		.commit_args(
 			Bytes::from(
-				serde_json::to_vec(&omp_tools::write::Params { path, content })
-					.into_diagnostic()?,
+				serde_json::to_vec(&omp_tools::write::Params { path, content }).into_diagnostic()?,
 			),
 			Bytes::from_static(b"plan-save"),
 			now_ms(),
@@ -3123,10 +3202,9 @@ async fn invoke_plan_write(
 				if verdict.is_error {
 					return Err(miette::miette!("plan write failed in the Environment"));
 				}
-				let outcome = serde_json::from_slice::<omp_tool::CallOutcome<
-					omp_tools::write::Payload,
-					omp_tools::write::Fault,
-				>>(&verdict.json)
+				let outcome = serde_json::from_slice::<
+					omp_tool::CallOutcome<omp_tools::write::Payload, omp_tools::write::Fault>,
+				>(&verdict.json)
 				.into_diagnostic()?;
 				return match outcome {
 					omp_tool::CallOutcome::Ok(_) => Ok(()),
@@ -3153,7 +3231,7 @@ async fn invoke_plan_write(
 
 fn todo_hud(payload: &todo::Payload) -> omp_chat_ui::TodoHud {
 	omp_chat_ui::TodoHud {
-		lines: payload.rendered.lines().map(Str::from).collect(),
+		lines:       payload.rendered.lines().map(Str::from).collect(),
 		total_tasks: payload.phases.iter().map(|phase| phase.items.len()).sum(),
 	}
 }
@@ -3519,7 +3597,7 @@ where
 	}
 
 	fn prewalk(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Prewalk is not a user-visible mode campaign.")
+		self.unavailable("Prewalk does not own the visible mode resource.")
 	}
 
 	fn btw(&mut self, _: Str) -> CommandFuture<'_> {
@@ -3748,15 +3826,13 @@ where
 		match request {
 			commands::ExtensionRequest::Inspect => {
 				let live_tools = extension_live_tools(self.registry);
-				let live_mcp =
-					commands::snapshot_live_mcp(self.mcp_inspector);
-				let snapshot =
-					commands::build_inspector_snapshot_from_declarations(
-						&self.state.extension_declarations,
-						&live_tools,
-						&live_mcp,
-						self.state.extension_generation,
-					);
+				let live_mcp = commands::snapshot_live_mcp(self.mcp_inspector);
+				let snapshot = commands::build_inspector_snapshot_from_declarations(
+					&self.state.extension_declarations,
+					&live_tools,
+					&live_mcp,
+					self.state.extension_generation,
+				);
 				self.state.extension_live_mcp = live_mcp
 					.into_iter()
 					.map(|snapshot| (snapshot.server.clone(), snapshot))
@@ -3767,9 +3843,9 @@ where
 					state.extension_mcp = state
 						.environment
 						.mcp_subscribe(McpSubscribeRequest {
-							name: None,
+							name:           None,
 							after_sequence: 0,
-							wire_revision: omp_proto::SCHEMA_REV,
+							wire_revision:  omp_proto::SCHEMA_REV,
 						})
 						.await
 						.ok();
@@ -4092,7 +4168,7 @@ async fn handle_intent<C, R>(
 	abort: &omp_agent::AbortHandle,
 	control: &omp_agent::ControlSender,
 	agent_state: &AgentState,
-	modes: &CampaignHandle,
+	modes: &RegimeHandle,
 	parent: &ChatParentHost<C>,
 	auth: Option<&ChatAuth>,
 	data_dir: &Path,
@@ -4483,7 +4559,7 @@ where
 				},
 				Ok(ChatCommand::Prewalk(_)) => send_backend(
 					backend,
-					BackendEvent::Error(sf!("Prewalk is not a user-visible mode campaign.")),
+					BackendEvent::Error(sf!("Prewalk does not own the visible mode resource.")),
 				),
 				Ok(ChatCommand::Skill { name, args, budget }) => {
 					let Some(skill) = state.skills.get(name.as_str()) else {
@@ -4659,8 +4735,8 @@ where
 			if chat_active(state.submit_pending, bus.phase()) {
 				abort.abort();
 				if let Ok(Some(goal)) = modes.interrupt_goal(now_ms(), true) {
-					if let Some(engagement) = modes.mode_engagement() {
-						let _ = disengage_campaign(backend, commands_tx, "goal", engagement).await;
+					if let Some(activation) = modes.mode_activation() {
+						let _ = stop_mode_regime(backend, commands_tx, "goal", activation).await;
 					}
 					send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
 				}
@@ -4668,10 +4744,7 @@ where
 		},
 		Intent::PlanSavePathRequest { content } => {
 			let suggested_path = plan_save_suggested_path(parent, content.as_str()).await;
-			send_backend(
-				backend,
-				BackendEvent::OpenPlanSavePrompt { content, suggested_path },
-			);
+			send_backend(backend, BackendEvent::OpenPlanSavePrompt { content, suggested_path });
 		},
 		Intent::SavePlanAndQuit { path, content } => {
 			let path = Str::new(path.trim());
@@ -4679,9 +4752,7 @@ where
 				send_backend(backend, BackendEvent::Error(sf!("Plan save path cannot be empty.")));
 				return Ok(false);
 			}
-			if let Err(error) =
-				invoke_plan_write(&state.environment, path.clone(), content).await
-			{
+			if let Err(error) = invoke_plan_write(&state.environment, path.clone(), content).await {
 				send_backend(
 					backend,
 					BackendEvent::Error(sf!("Failed to save plan to `{path}`: {error}")),
@@ -4689,14 +4760,12 @@ where
 				return Ok(false);
 			}
 			if modes.mode_holder().as_deref() == Some("plan")
-				&& let Some(engagement) = modes.mode_engagement()
-				&& !disengage_campaign(backend, commands_tx, "plan", engagement).await
+				&& let Some(activation) = modes.mode_activation()
+				&& !stop_mode_regime(backend, commands_tx, "plan", activation).await
 			{
 				send_backend(
 					backend,
-					BackendEvent::Error(sf!(
-						"Saved plan to `{path}`, but could not exit plan mode.",
-					)),
+					BackendEvent::Error(sf!("Saved plan to `{path}`, but could not exit plan mode.",)),
 				);
 				return Ok(false);
 			}
@@ -4705,15 +4774,14 @@ where
 		},
 		Intent::SetGoal { objective, token_budget } => {
 			if let Some(receipt) =
-				engage_campaign(backend, commands_tx, modes, "goal", false, None).await
+				start_mode_regime(backend, commands_tx, modes, "goal", false, None).await
 			{
 				match modes.set_goal(objective, token_budget, now_ms()) {
 					Ok(goal) => {
 						send_backend(backend, BackendEvent::Notice(goal_status(Some(goal))));
 					},
 					Err(error) => {
-						let _ =
-							disengage_campaign(backend, commands_tx, "goal", receipt.engagement).await;
+						let _ = stop_mode_regime(backend, commands_tx, "goal", receipt.activation).await;
 						send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
 					},
 				}
@@ -4798,6 +4866,21 @@ where
 				)),
 			);
 		},
+		Intent::Git(intent) => {
+			if matches!(intent, omp_chat_ui::git::GitIntent::Close) {
+				if let Some(git) = state.git.take() {
+					let _ = git.session.handle(intent).await;
+				}
+			} else if let Some(session) = state.git.as_ref().map(|git| git.session.clone()) {
+				let backend = backend.clone();
+				drop(tokio::spawn(async move {
+					let result = session.handle(intent).await;
+					for update in result.updates {
+						send_backend(&backend, BackendEvent::Git(update));
+					}
+				}));
+			}
+		},
 		Intent::TogglePlan => {
 			let operation = if modes.mode_holder().as_deref() == Some("plan") {
 				"off"
@@ -4839,8 +4922,8 @@ where
 					backend,
 					BackendEvent::SpellingFeaturesChanged(omp_tui::SpellingFeatures {
 						typo_detection: state.settings.spelling.typo_detection,
-						autocomplete: state.settings.spelling.autocomplete,
-						autocorrect: state.settings.spelling.autocorrect,
+						autocomplete:   state.settings.spelling.autocomplete,
+						autocorrect:    state.settings.spelling.autocorrect,
 					}),
 				);
 			}
@@ -5502,7 +5585,7 @@ fn handle_agent_event(
 	backend: &flume::Sender<BackendEvent>,
 	state: &mut BridgeState,
 	event: &AgentEvent,
-	modes: &CampaignHandle,
+	modes: &RegimeHandle,
 	registry: &Registry,
 	bus: &omp_agent::EventBus,
 	dropped: u64,
@@ -6672,13 +6755,13 @@ fn send_status(
 			cost_nanos: state.cost_nanos,
 			advisor_cost_nanos,
 			queued: state.queued,
-			visible_slots: state
-				.campaigns
-				.visible_slots()
+			visible_resources: state
+				.regimes
+				.visible_resources()
 				.iter()
-				.map(|facts| VisibleSlotFacts {
-					slot:        facts.slot.clone(),
-					holder:      facts.holder.clone(),
+				.map(|facts| VisibleResourceFacts {
+					resource:    facts.resource.clone(),
+					owner:       facts.owner.clone(),
 					queue_depth: facts.queue_depth,
 				})
 				.collect(),
@@ -7087,30 +7170,30 @@ mod tests {
 	}
 
 	#[test]
-	fn campaign_denial_renders_holder_identity_and_since() {
-		let mut stack = omp_agent::CampaignStack::new();
+	fn regime_denial_renders_mode_owner_activation_and_since() {
+		let mut regimes = omp_agent::RegimeSet::new();
 		let (plan, machine) = omp_agent::core_regime("plan").expect("plan regime");
-		let granted = stack
-			.engage(plan, machine, omp_agent::EngageOptions { now_ms: 41, queue: false })
-			.expect("plan grant");
-		let modes = CampaignHandle::new();
-		modes.sync_campaigns(&stack);
+		let granted = regimes
+			.start(plan, machine, omp_agent::StartOptions { now_ms: 41, queue: false })
+			.expect("plan start");
+		let modes = RegimeHandle::new();
+		modes.sync_regimes(&regimes);
 		let (backend, events) = flume::unbounded();
-		let result = Err(omp_agent::AgentError::Arbiter(omp_agent::ArbiterError::Engage(
-			omp_agent::EngageError::Claim {
-				slot:    omp_agent::SlotClaim::Mode,
-				outcome: omp_agent::ClaimOutcome::Denied {
-					holder: granted.engagement.clone(),
+		let result = Err(omp_agent::AgentError::Arbiter(omp_agent::ArbiterError::Start(
+			omp_agent::StartError::Acquire {
+				resource: omp_agent::Resource::Mode,
+				outcome:  omp_agent::AcquireOutcome::Denied {
+					holder: granted.activation.clone(),
 					since:  41,
 				},
 			},
 		)));
-		assert!(report_campaign_engagement(&backend, &modes, "goal", result).is_none());
+		assert!(report_regime_start(&backend, &modes, "goal", result).is_none());
 		let BackendEvent::Error(message) = events.recv().expect("denial event") else {
 			panic!("denial must render as an error")
 		};
-		assert!(message.contains("exit plan first"));
-		assert!(message.contains(granted.engagement.as_str()));
+		assert!(message.contains("stop plan first"));
+		assert!(message.contains(granted.activation.as_str()));
 		assert!(message.contains("since 41"));
 	}
 	#[test]
@@ -7171,14 +7254,15 @@ mod tests {
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
 			model: "test/model".to_owned(),
+			git: None,
 			advisor: None,
 			title: SessionTitleState::default(),
 			title_replan_refresh_pending: false,
 			environment,
 			local_root: env::temp_dir(),
 			session_id: sf!("test-session"),
-			campaigns: CampaignHandle::new(),
-			campaign_revision: 0,
+			regimes: RegimeHandle::new(),
+			regime_revision: 0,
 			collab: None,
 			memory: None,
 			workspace_root: sf!("/workspace"),
@@ -7217,6 +7301,10 @@ mod tests {
 			command_usage,
 			typed_commands: commands::CommandRoster::builtins(),
 			skills: Default::default(),
+			extension_declarations: Arc::from([]),
+			extension_generation: 0,
+			extension_mcp: None,
+			extension_live_mcp: HashMap::new(),
 			approvals: HashMap::new(),
 		}
 	}
@@ -7236,7 +7324,7 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let (tx, rx) = flume::unbounded();
 		let mut state = test_bridge_state(scratch.path());
-		let modes = CampaignHandle::new();
+		let modes = RegimeHandle::new();
 		let registry = Registry::new();
 		let bus = omp_agent::EventBus::new();
 		for event in [

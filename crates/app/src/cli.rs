@@ -72,7 +72,9 @@ use crate::{
 	ext_cli::ExtArgs,
 	gallery_cmd,
 	gallery_cmd::GalleryArgs,
-	gc_cmd, grep_cmd, grievances_cmd, join_cmd, models_cmd, print_mode, profile_alias, render_cmd,
+	gc_cmd, git_cmd,
+	git_cmd::GitArgs,
+	grep_cmd, grievances_cmd, join_cmd, models_cmd, print_mode, profile_alias, render_cmd,
 	render_cmd::RenderArgs,
 	rpc_mode, say_cmd, setup_cmd, share_cmd, smoke_test, ssh_cmd,
 	ssh_cmd::SshArgs,
@@ -537,7 +539,8 @@ pub struct BenchArgs {
 	/// Override the profile data directory containing credentials.
 	#[arg(long, value_name = "PATH")]
 	pub data_dir:      Option<PathBuf>,
-	/// Number of measured requests (defaults: mix 9, chat 10, prefill/generation 5).
+	/// Number of measured requests (defaults: mix 9, chat 10, prefill/generation
+	/// 5).
 	#[arg(long)]
 	pub runs:          Option<u32>,
 	/// Override the workload-specific maximum output tokens.
@@ -554,10 +557,10 @@ pub struct BenchArgs {
 	pub prefill_bytes: Option<usize>,
 	/// Maximum concurrent requests.
 	#[arg(long, default_value_t = 4)]
-	pub par:        usize,
+	pub par:           usize,
 	/// Emit machine-readable JSON.
 	#[arg(long)]
-	pub json:       bool,
+	pub json:          bool,
 }
 
 /// Deterministic OAuth account-pool simulation options.
@@ -1007,9 +1010,15 @@ pub enum Command {
 	Gc(GcArgs),
 	/// Render native tool lifecycle cards to text or PNG fixtures.
 	Gallery(GalleryArgs),
+	/// Open the fullscreen Git workbench.
+	#[command(
+		after_long_help = "Examples:\n  omp git\n  omp git HEAD~2\n  omp git -C ~/projects/app"
+	)]
+	Git(GitArgs),
 	/// Inspect or invalidate durable provider quota observations.
 	Usage(UsageArgs),
-	/// Benchmark model chat, prefill, and generation TTFT/decode/cache performance.
+	/// Benchmark model chat, prefill, and generation TTFT/decode/cache
+	/// performance.
 	Bench(BenchArgs),
 	/// Simulate account selection and optionally run a live balance benchmark.
 	#[command(name = "dry-balance")]
@@ -1149,6 +1158,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "stats", aliases: &[] },
 	CommandSpec { name: "gc", aliases: &[] },
 	CommandSpec { name: "gallery", aliases: &[] },
+	CommandSpec { name: "git", aliases: &[] },
 	CommandSpec { name: "usage", aliases: &[] },
 	CommandSpec { name: "bench", aliases: &[] },
 	CommandSpec { name: "dry-balance", aliases: &[] },
@@ -2133,6 +2143,7 @@ enum DispatchTarget {
 	Stats,
 	Gc,
 	Gallery,
+	Git,
 	Usage,
 	Bench,
 	DryBalance,
@@ -2179,6 +2190,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Stats(_)) => DispatchTarget::Stats,
 		Some(Command::Gc(_)) => DispatchTarget::Gc,
 		Some(Command::Gallery(_)) => DispatchTarget::Gallery,
+		Some(Command::Git(_)) => DispatchTarget::Git,
 		Some(Command::Usage(_)) => DispatchTarget::Usage,
 		Some(Command::Bench(_)) => DispatchTarget::Bench,
 		Some(Command::DryBalance(_)) => DispatchTarget::DryBalance,
@@ -2341,6 +2353,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Stats(args) => stats_cmd::run(args).await,
 		Command::Gc(args) => gc_cmd::run(args),
 		Command::Gallery(args) => gallery_cmd::run(args),
+		Command::Git(args) => git_cmd::run(args).await,
 		Command::Usage(args) => usage_cmd::run(args).await,
 		Command::Bench(args) => bench_cmd::run(args).await,
 		Command::DryBalance(args) => dry_balance_cmd::run(args).await,
@@ -2954,15 +2967,9 @@ mod tests {
 		};
 		assert_eq!(args.prefill_bytes, Some(4096));
 		assert_eq!(
-			OmpCli::try_parse_from([
-				"omp",
-				"bench",
-				"provider/model",
-				"--profile",
-				"throughput",
-			])
-			.expect_err("unknown benchmark profile")
-			.kind(),
+			OmpCli::try_parse_from(["omp", "bench", "provider/model", "--profile", "throughput",])
+				.expect_err("unknown benchmark profile")
+				.kind(),
 			ErrorKind::InvalidValue
 		);
 	}

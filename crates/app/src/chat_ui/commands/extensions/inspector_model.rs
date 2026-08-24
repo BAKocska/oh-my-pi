@@ -2,10 +2,9 @@ use omp_chat_ui::{
 	ExtensionDetail, ExtensionDisposition, ExtensionKind, ExtensionOrigin, ExtensionRow,
 	ExtensionSnapshot, LiveToolView, McpCatalogEntry, McpHealth, McpLiveSnapshot, McpToolView,
 };
-
 use omp_core::{Str, sf};
-use omp_driver::discovery::{
-	manifest::{CapabilityPayload, DiscoveredCapability, McpTransport, SourceScope},
+use omp_driver::discovery::manifest::{
+	CapabilityPayload, DiscoveredCapability, McpTransport, SourceScope,
 };
 
 pub(crate) fn snapshot_live_mcp(
@@ -15,21 +14,21 @@ pub(crate) fn snapshot_live_mcp(
 		.snapshots()
 		.into_iter()
 		.map(|snapshot| McpLiveSnapshot {
-			server: snapshot.server,
-			health: match snapshot.health {
+			server:           snapshot.server,
+			health:           match snapshot.health {
 				omp_envd::mcp::manager::McpInspectorHealth::Connecting => McpHealth::Connecting,
 				omp_envd::mcp::manager::McpInspectorHealth::Connected => McpHealth::Connected,
 				omp_envd::mcp::manager::McpInspectorHealth::Disconnected => McpHealth::Disconnected,
 				omp_envd::mcp::manager::McpInspectorHealth::Failed => McpHealth::Failed,
 			},
-			generation: snapshot.generation,
+			generation:       snapshot.generation,
 			definition_epoch: snapshot.definition_epoch,
-			implementation: snapshot.implementation,
-			version: snapshot.version,
-			title: snapshot.title,
-			description: snapshot.description,
-			instructions: snapshot.instructions,
-			tools: snapshot
+			implementation:   snapshot.implementation,
+			version:          snapshot.version,
+			title:            snapshot.title,
+			description:      snapshot.description,
+			instructions:     snapshot.instructions,
+			tools:            snapshot
 				.tools
 				.iter()
 				.filter_map(|tool| {
@@ -38,7 +37,8 @@ pub(crate) fn snapshot_live_mcp(
 						.get("title")
 						.and_then(serde_json::Value::as_str)
 						.or_else(|| {
-							tool.get("annotations")
+							tool
+								.get("annotations")
 								.and_then(|value| value.get("title"))
 								.and_then(serde_json::Value::as_str)
 						})
@@ -50,27 +50,28 @@ pub(crate) fn snapshot_live_mcp(
 							.get("description")
 							.and_then(serde_json::Value::as_str)
 							.map(Str::new),
-						input_schema: tool.get("inputSchema").cloned().unwrap_or_else(|| {
-							serde_json::json!({"type":"object","properties":{}})
-						}),
+						input_schema: tool
+							.get("inputSchema")
+							.cloned()
+							.unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
 					})
 				})
 				.collect(),
-			resources: snapshot
+			resources:        snapshot
 				.resources
 				.iter()
 				.map(|resource| McpCatalogEntry {
-					name: resource.name.clone(),
-					title: None,
+					name:        resource.name.clone(),
+					title:       None,
 					description: resource.description.clone(),
 				})
 				.collect(),
-			prompts: snapshot
+			prompts:          snapshot
 				.prompts
 				.iter()
 				.map(|prompt| McpCatalogEntry {
-					name: prompt.name.clone(),
-					title: None,
+					name:        prompt.name.clone(),
+					title:       None,
 					description: prompt.description.clone(),
 				})
 				.collect(),
@@ -108,9 +109,7 @@ pub(crate) fn build_inspector_snapshot_from_declarations(
 		} else if declaration.enabled {
 			ExtensionDisposition::Winner
 		} else {
-			ExtensionDisposition::Disabled {
-				reason: Str::new_static("disabled by source policy"),
-			}
+			ExtensionDisposition::Disabled { reason: Str::new_static("disabled by source policy") }
 		};
 		snapshot.rows.push(ExtensionRow {
 			id: sf!("{kind}:{name}:{}", path),
@@ -153,7 +152,7 @@ fn payload_view(
 			value.name.clone(),
 			Some(value.description.clone()),
 			ExtensionDetail::Tool {
-				description: Some(value.description.clone()),
+				description:  Some(value.description.clone()),
 				input_schema: value.input_schema.clone(),
 			},
 		)),
@@ -163,25 +162,25 @@ fn payload_view(
 				|| connection.url.clone(),
 				|command| Some(Str::from(command.to_string_lossy().as_ref())),
 			);
-			Some((
-				ExtensionKind::Mcp,
-				value.name.clone(),
-				None,
-				ExtensionDetail::Mcp {
-					transport: Str::from(
-						connection
-							.transport
-							.map_or_else(|| if connection.command.is_some() { "stdio" } else { "http" }, |value| match value {
-								McpTransport::Stdio => "stdio",
-								McpTransport::Sse => "sse",
-								McpTransport::Http => "http",
-							}),
-					),
-					endpoint,
-					args: connection.args.clone(),
-					env_count: connection.env.len(),
-				},
-			))
+			Some((ExtensionKind::Mcp, value.name.clone(), None, ExtensionDetail::Mcp {
+				transport: Str::from(connection.transport.map_or_else(
+					|| {
+						if connection.command.is_some() {
+							"stdio"
+						} else {
+							"http"
+						}
+					},
+					|value| match value {
+						McpTransport::Stdio => "stdio",
+						McpTransport::Sse => "sse",
+						McpTransport::Http => "http",
+					},
+				)),
+				endpoint,
+				args: connection.args.clone(),
+				env_count: connection.env.len(),
+			}))
 		},
 		CapabilityPayload::Skills(value) => {
 			let mut facts = Vec::new();
@@ -239,30 +238,24 @@ fn payload_view(
 			value.name.clone(),
 			Some(value.description.clone()),
 			ExtensionDetail::SlashCommand {
-				description: Some(value.description.clone()),
+				description:   Some(value.description.clone()),
 				argument_hint: value.argument_hint.clone(),
-				body: value.content.clone(),
+				body:          value.content.clone(),
 			},
 		)),
-		CapabilityPayload::Hooks(value) => Some((
-			ExtensionKind::Hook,
-			value.name.clone(),
-			None,
-			ExtensionDetail::Hook {
+		CapabilityPayload::Hooks(value) => {
+			Some((ExtensionKind::Hook, value.name.clone(), None, ExtensionDetail::Hook {
 				phase: Str::from(value.phase.to_string()),
-				tool: value.tool.clone(),
-			},
-		)),
-		CapabilityPayload::Prompts(value) => Some((
-			ExtensionKind::Prompt,
-			value.name.clone(),
-			None,
-			ExtensionDetail::Document {
+				tool:  value.tool.clone(),
+			}))
+		},
+		CapabilityPayload::Prompts(value) => {
+			Some((ExtensionKind::Prompt, value.name.clone(), None, ExtensionDetail::Document {
 				heading: Str::new_static("Prompt"),
-				body: value.content.clone(),
-				facts: Vec::new(),
-			},
-		)),
+				body:    value.content.clone(),
+				facts:   Vec::new(),
+			}))
+		},
 		CapabilityPayload::ContextFiles(value) => Some((
 			ExtensionKind::ContextFile,
 			Str::from(
@@ -275,8 +268,8 @@ fn payload_view(
 			None,
 			ExtensionDetail::Document {
 				heading: Str::new_static("Preview"),
-				body: value.content.clone(),
-				facts: Vec::new(),
+				body:    value.content.clone(),
+				facts:   Vec::new(),
 			},
 		)),
 		CapabilityPayload::Instructions(value) => {
@@ -285,16 +278,11 @@ fn payload_view(
 				.as_ref()
 				.map(|apply| vec![(Str::new_static("files"), apply.clone())])
 				.unwrap_or_default();
-			Some((
-				ExtensionKind::Instruction,
-				value.name.clone(),
-				None,
-				ExtensionDetail::Document {
-					heading: Str::new_static("Instruction"),
-					body: value.content.clone(),
-					facts,
-				},
-			))
+			Some((ExtensionKind::Instruction, value.name.clone(), None, ExtensionDetail::Document {
+				heading: Str::new_static("Instruction"),
+				body: value.content.clone(),
+				facts,
+			}))
 		},
 		CapabilityPayload::Settings(_)
 		| CapabilityPayload::Ssh(_)
@@ -304,7 +292,13 @@ fn payload_view(
 }
 
 fn join(values: &[Str]) -> Str {
-	Str::from(values.iter().map(Str::as_str).collect::<Vec<_>>().join(", "))
+	Str::from(
+		values
+			.iter()
+			.map(Str::as_str)
+			.collect::<Vec<_>>()
+			.join(", "),
+	)
 }
 
 fn project_label(path: &str, scope: SourceScope) -> Option<Str> {
@@ -312,7 +306,13 @@ fn project_label(path: &str, scope: SourceScope) -> Option<Str> {
 		return None;
 	}
 	let normalized = path.replace('\\', "/");
-	let parts = normalized.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+	let parts = normalized
+		.split('/')
+		.filter(|part| !part.is_empty())
+		.collect::<Vec<_>>();
 	let index = parts.iter().rposition(|part| *part == ".omp")?;
-	index.checked_sub(1).and_then(|index| parts.get(index)).map(|part| Str::new(*part))
+	index
+		.checked_sub(1)
+		.and_then(|index| parts.get(index))
+		.map(|part| Str::new(*part))
 }

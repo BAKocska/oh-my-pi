@@ -1,6 +1,9 @@
 //! Model benchmark command over the normal inference registry and receipts.
 
-use std::{fmt::Write as _, time::{Duration, Instant}};
+use std::{
+	fmt::Write as _,
+	time::{Duration, Instant},
+};
 
 use futures::{StreamExt as _, stream};
 use miette::{IntoDiagnostic as _, miette};
@@ -22,10 +25,10 @@ use crate::{
 };
 
 const DEFAULT_PREFILL_BYTES: usize = 32_768;
-const PREFILL_CHUNK: &str =
-	"Deterministic benchmark filler measures prompt ingestion without carrying semantic instructions. ";
-const PREFILL_INSTRUCTION: &str =
-	"The text above is benchmark filler. Ignore its content entirely and reply with the single word: OK";
+const PREFILL_CHUNK: &str = "Deterministic benchmark filler measures prompt ingestion without \
+                             carrying semantic instructions. ";
+const PREFILL_INSTRUCTION: &str = "The text above is benchmark filler. Ignore its content \
+                                   entirely and reply with the single word: OK";
 const CHAT_TOPICS: &[&str] = &[
 	"how a web browser turns an HTML payload into pixels on screen",
 	"how a garbage collector reclaims memory in a managed runtime",
@@ -49,16 +52,7 @@ const GENERATION_TOPICS: &[&str] = &[
 	"the history of shipbuilding",
 ];
 
-#[derive(
-	Clone,
-	Copy,
-	Debug,
-	Eq,
-	PartialEq,
-	Serialize,
-	strum::Display,
-	strum::IntoStaticStr,
-)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, strum::Display, strum::IntoStaticStr)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 enum BenchWorkload {
@@ -67,11 +61,8 @@ enum BenchWorkload {
 	Generation,
 }
 
-const WORKLOADS: [BenchWorkload; 3] = [
-	BenchWorkload::Chat,
-	BenchWorkload::Prefill,
-	BenchWorkload::Generation,
-];
+const WORKLOADS: [BenchWorkload; 3] =
+	[BenchWorkload::Chat, BenchWorkload::Prefill, BenchWorkload::Generation];
 
 #[derive(Clone, Debug)]
 struct BenchConfig {
@@ -151,16 +142,19 @@ impl BenchConfig {
 			BenchWorkload::Chat => self.prompt_override.clone().unwrap_or_else(|| {
 				let topic = CHAT_TOPICS[topic_index(nonce, run, CHAT_TOPICS.len())];
 				Str::from(format!(
-					"Write detailed four-paragraph explanation of {topic}.\n\nForm: plain paragraphs only; no headings, lists, code fences, preamble. Do not summarize early; explain until token limit. Output explanation only."
+					"Write detailed four-paragraph explanation of {topic}.\n\nForm: plain paragraphs \
+					 only; no headings, lists, code fences, preamble. Do not summarize early; explain \
+					 until token limit. Output explanation only."
 				))
 			}),
-			BenchWorkload::Prefill => {
-				Str::from(prefill_payload(nonce, run, self.prefill_bytes))
-			},
+			BenchWorkload::Prefill => Str::from(prefill_payload(nonce, run, self.prefill_bytes)),
 			BenchWorkload::Generation => self.prompt_override.clone().unwrap_or_else(|| {
 				let topic = GENERATION_TOPICS[topic_index(nonce, run, GENERATION_TOPICS.len())];
 				Str::from(format!(
-					"Write an uninterrupted stream of plain prose recounting {topic}, decade by decade, in chronological order. No headings, lists, code fences, or preamble. Do not summarize or conclude early; keep adding new detail until the token limit cuts you off. Output the prose only."
+					"Write an uninterrupted stream of plain prose recounting {topic}, decade by \
+					 decade, in chronological order. No headings, lists, code fences, or preamble. Do \
+					 not summarize or conclude early; keep adding new detail until the token limit \
+					 cuts you off. Output the prose only."
 				))
 			}),
 		};
@@ -178,18 +172,18 @@ struct Challenge {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Sample {
-	run:                      u32,
-	workload:                 BenchWorkload,
-	cache_phase:              &'static str,
-	ttft_ms:                  u64,
-	decode_ms:                u64,
-	elapsed_ms:               u64,
-	input_tokens:              u64,
-	output_tokens:             u64,
-	cache_read_tokens:         u64,
-	cache_write_tokens:        u64,
-	tokens_per_second:         f64,
-	decode_tokens_per_second:  f64,
+	run: u32,
+	workload: BenchWorkload,
+	cache_phase: &'static str,
+	ttft_ms: u64,
+	decode_ms: u64,
+	elapsed_ms: u64,
+	input_tokens: u64,
+	output_tokens: u64,
+	cache_read_tokens: u64,
+	cache_write_tokens: u64,
+	tokens_per_second: f64,
+	decode_tokens_per_second: f64,
 	prefill_tokens_per_second: f64,
 }
 
@@ -222,29 +216,29 @@ impl MetricStats {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkloadSummary {
-	workload:                  BenchWorkload,
-	runs:                      usize,
-	ttft_ms:                   MetricStats,
-	decode_ms:                 MetricStats,
-	elapsed_ms:                MetricStats,
-	tokens_per_second:         MetricStats,
-	decode_tokens_per_second:  MetricStats,
+	workload: BenchWorkload,
+	runs: usize,
+	ttft_ms: MetricStats,
+	decode_ms: MetricStats,
+	elapsed_ms: MetricStats,
+	tokens_per_second: MetricStats,
+	decode_tokens_per_second: MetricStats,
 	prefill_tokens_per_second: MetricStats,
-	mean_input_tokens:         f64,
-	mean_output_tokens:        f64,
-	mean_cache_read_tokens:    f64,
-	mean_cache_write_tokens:   f64,
+	mean_input_tokens: f64,
+	mean_output_tokens: f64,
+	mean_cache_read_tokens: f64,
+	mean_cache_write_tokens: f64,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BenchReport {
-	profile: BenchProfile,
-	runs: u32,
+	profile:    BenchProfile,
+	runs:       u32,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	max_tokens: Option<u64>,
-	samples: Vec<Sample>,
-	summaries: Vec<WorkloadSummary>,
+	samples:    Vec<Sample>,
+	summaries:  Vec<WorkloadSummary>,
 }
 
 /// Executes one bounded benchmark runner through production credentials,
@@ -288,7 +282,8 @@ pub async fn run(args: BenchArgs) -> miette::Result<()> {
 	}
 	for sample in &report.samples {
 		println!(
-			"run {:>3} {:>10} {:>4}: TTFT {:>6} ms, decode {:>6} ms, {:>8.2} total tok/s, {:>8.2} decode tok/s, {} input, {} output, {} cache-read, {} cache-write token(s)",
+			"run {:>3} {:>10} {:>4}: TTFT {:>6} ms, decode {:>6} ms, {:>8.2} total tok/s, {:>8.2} \
+			 decode tok/s, {} input, {} output, {} cache-read, {} cache-write token(s)",
 			sample.run + 1,
 			sample.workload,
 			sample.cache_phase,
@@ -304,7 +299,9 @@ pub async fn run(args: BenchArgs) -> miette::Result<()> {
 	}
 	for summary in &report.summaries {
 		println!(
-			"{} summary ({} run(s)): TTFT p50/p95 {:.0}/{:.0} ms, decode p50/p95 {:.0}/{:.0} ms, total tok/s p50/p95 {:.2}/{:.2}, decode tok/s p50/p95 {:.2}/{:.2}, prefill tok/s p50/p95 {:.2}/{:.2}, cache-write mean {:.1}",
+			"{} summary ({} run(s)): TTFT p50/p95 {:.0}/{:.0} ms, decode p50/p95 {:.0}/{:.0} ms, \
+			 total tok/s p50/p95 {:.2}/{:.2}, decode tok/s p50/p95 {:.2}/{:.2}, prefill tok/s \
+			 p50/p95 {:.2}/{:.2}, cache-write mean {:.1}",
 			summary.workload,
 			summary.runs,
 			summary.ttft_ms.p50,
@@ -409,7 +406,10 @@ fn summarize(samples: &[Sample]) -> Vec<WorkloadSummary> {
 				return None;
 			}
 			let mean = |value: fn(&Sample) -> u64| -> f64 {
-				samples.iter().map(|sample| value(sample) as f64).sum::<f64>()
+				samples
+					.iter()
+					.map(|sample| value(sample) as f64)
+					.sum::<f64>()
 					/ samples.len() as f64
 			};
 			Some(WorkloadSummary {
@@ -429,7 +429,9 @@ fn summarize(samples: &[Sample]) -> Vec<WorkloadSummary> {
 					samples.iter().map(|sample| sample.decode_tokens_per_second),
 				),
 				prefill_tokens_per_second: MetricStats::from_values(
-					samples.iter().map(|sample| sample.prefill_tokens_per_second),
+					samples
+						.iter()
+						.map(|sample| sample.prefill_tokens_per_second),
 				),
 				mean_input_tokens: mean(|sample| sample.input_tokens),
 				mean_output_tokens: mean(|sample| sample.output_tokens),
@@ -446,18 +448,16 @@ fn nearest_rank(sorted: &[f64], percentile: usize) -> f64 {
 }
 
 fn topic_index(nonce: &str, run: u32, topic_count: usize) -> usize {
-	let hash = nonce
-		.bytes()
-		.fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-			hash.wrapping_mul(0x100_0000_01b3) ^ u64::from(byte)
-		})
-		^ u64::from(run);
+	let hash = nonce.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+		hash.wrapping_mul(0x100_0000_01b3) ^ u64::from(byte)
+	}) ^ u64::from(run);
 	usize::try_from(hash % topic_count as u64).unwrap_or(0)
 }
 
 fn prefill_payload(nonce: &str, run: u32, bytes: usize) -> String {
 	let filler = prefill_filler(bytes);
-	let mut payload = String::with_capacity(nonce.len() + filler.len() + PREFILL_INSTRUCTION.len() + 32);
+	let mut payload =
+		String::with_capacity(nonce.len() + filler.len() + PREFILL_INSTRUCTION.len() + 32);
 	payload.push_str("Benchmark run ");
 	payload.push_str(nonce);
 	payload.push('-');
@@ -480,7 +480,11 @@ fn prefill_filler(bytes: usize) -> String {
 
 fn rate(tokens: u64, duration: Duration) -> f64 {
 	let seconds = duration.as_secs_f64();
-	if seconds > 0.0 { tokens as f64 / seconds } else { 0.0 }
+	if seconds > 0.0 {
+		tokens as f64 / seconds
+	} else {
+		0.0
+	}
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -512,9 +516,24 @@ mod tests {
 		assert_eq!(mix.max_tokens(BenchWorkload::Chat), 512);
 		assert_eq!(mix.max_tokens(BenchWorkload::Prefill), 64);
 		assert_eq!(mix.max_tokens(BenchWorkload::Generation), 2_048);
-		assert_eq!(BenchConfig::resolve(&args(BenchProfile::Chat)).unwrap().runs, 10);
-		assert_eq!(BenchConfig::resolve(&args(BenchProfile::Prefill)).unwrap().runs, 5);
-		assert_eq!(BenchConfig::resolve(&args(BenchProfile::Generation)).unwrap().runs, 5);
+		assert_eq!(
+			BenchConfig::resolve(&args(BenchProfile::Chat))
+				.unwrap()
+				.runs,
+			10
+		);
+		assert_eq!(
+			BenchConfig::resolve(&args(BenchProfile::Prefill))
+				.unwrap()
+				.runs,
+			5
+		);
+		assert_eq!(
+			BenchConfig::resolve(&args(BenchProfile::Generation))
+				.unwrap()
+				.runs,
+			5
+		);
 		for (profile, workload) in [
 			(BenchProfile::Chat, BenchWorkload::Chat),
 			(BenchProfile::Prefill, BenchWorkload::Prefill),
@@ -544,7 +563,8 @@ mod tests {
 
 	#[test]
 	fn prefill_filler_honors_byte_boundaries() {
-		for bytes in [1, PREFILL_CHUNK.len() - 1, PREFILL_CHUNK.len(), PREFILL_CHUNK.len() + 1, 4096] {
+		for bytes in [1, PREFILL_CHUNK.len() - 1, PREFILL_CHUNK.len(), PREFILL_CHUNK.len() + 1, 4096]
+		{
 			assert_eq!(prefill_filler(bytes).as_bytes().len(), bytes);
 		}
 		let first = prefill_payload("nonce", 0, 8);
@@ -556,7 +576,12 @@ mod tests {
 	fn invalid_profile_flag_combinations_are_rejected() {
 		let mut mixed_prompt = args(BenchProfile::Mix);
 		mixed_prompt.prompt = Some(Str::new_static("custom"));
-		assert!(BenchConfig::resolve(&mixed_prompt).unwrap_err().to_string().contains("--prompt"));
+		assert!(
+			BenchConfig::resolve(&mixed_prompt)
+				.unwrap_err()
+				.to_string()
+				.contains("--prompt")
+		);
 
 		let mut chat_prefill = args(BenchProfile::Chat);
 		chat_prefill.prefill_bytes = Some(1024);
@@ -633,6 +658,12 @@ mod tests {
 			.collect::<Vec<_>>();
 		let summaries = summarize(&samples);
 		assert_eq!(summaries.len(), 3);
-		assert_eq!(summaries.iter().map(|summary| summary.workload).collect::<Vec<_>>(), WORKLOADS);
+		assert_eq!(
+			summaries
+				.iter()
+				.map(|summary| summary.workload)
+				.collect::<Vec<_>>(),
+			WORKLOADS
+		);
 	}
 }

@@ -31,6 +31,8 @@ pub mod ext_cli;
 pub mod gallery_cmd;
 pub mod gateway_rpc;
 pub mod gc_cmd;
+pub mod git_cmd;
+pub mod git_tui;
 pub mod grep_cmd;
 pub mod grievances_cmd;
 mod gui;

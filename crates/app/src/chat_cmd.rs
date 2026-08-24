@@ -18,20 +18,20 @@ use omp_core::{Str, sf};
 use omp_driver::{
 	advisor::{
 		engine::{AdviceOutcome, AdvisorEngine, AdvisorEngineOptions, AdvisorPromptJob},
-		runtime::{ActiveAdvisorCampaign, AdvisorFailureClass},
+		runtime::{ActiveAdvisorRegime, AdvisorFailureClass},
 		transcript::{AdvisorTranscriptRecord, AdvisorUsageTotals},
 	},
-	autolearn::AutolearnCampaign,
+	autolearn::AutolearnRegime,
 	bridges::{AgentGoalControl, InferenceBridge},
 	chat::{
-		AdvisorChildSpec, AgentCampaignControlBackend, AgentsControlAuthority, CHAT_CAPS_BASE,
-		CampaignControlAuthorityFactory, ChatAuthWorker, ChatError as DriverChatError,
-		ChatParentHost, ChatProviderControlBackend, ChatScope, EphemeralSessions,
-		LaunchToolSelection, Session, SessionOpen, agent_snapshot, apply_launch_tool_selection,
-		canonical_project, ensure_state_directory, fallback_model_selector,
-		interrupted_reasoning_dialect, model_context_window, model_selector_is_selectable, now_ms,
-		open_session, resolve_model_provider, resolve_model_selector, resume_choices,
-		session_blueprint, strict_session_id, thinking_effort,
+		AdvisorChildSpec, AgentRegimeControlBackend, AgentsControlAuthority, CHAT_CAPS_BASE,
+		ChatAuthWorker, ChatError as DriverChatError, ChatParentHost, ChatProviderControlBackend,
+		ChatScope, EphemeralSessions, LaunchToolSelection, RegimeControlAuthorityFactory, Session,
+		SessionOpen, agent_snapshot, apply_launch_tool_selection, canonical_project,
+		ensure_state_directory, fallback_model_selector, interrupted_reasoning_dialect,
+		model_context_window, model_selector_is_selectable, now_ms, open_session,
+		resolve_model_provider, resolve_model_selector, resume_choices, session_blueprint,
+		strict_session_id, thinking_effort,
 	},
 	collab::session::{self, CollabSessionAuthority},
 	discovery::{
@@ -41,7 +41,7 @@ use omp_driver::{
 	hub as hub_backend,
 	memory::{InferenceExtractionLane, RuntimePromptMemorySource},
 	model_controls::{ProductionProviderApplicationOwner, ProviderControlAuthorityFactory},
-	modes::CampaignHandle,
+	modes::RegimeHandle,
 	plan::ModelSelection,
 	power::PowerActivity,
 	prompt_head::ProductionPromptHead,
@@ -51,16 +51,16 @@ use omp_driver::{
 	session_state::TerminalBreadcrumbs,
 	session_title::SessionTitleState,
 	stats_api::{
-		telemetry_backend::TelemetryIndexQuery,
-		verdict_authority::{
-			AgentDurableJobRegistrar, ControlPromptProjectionDispatcher, VerdictAuthority,
-			VerdictAuthorityIdentity,
+		job_authority::{
+			AgentDurableJobRegistrar, ControlPromptProjectionDispatcher, JobAuthority,
+			JobAuthorityIdentity,
 		},
+		telemetry_backend::TelemetryIndexQuery,
 	},
 	task::prompt_policy,
 };
 use omp_envd::exthost::{
-	TelemetryControlAuthority, UiControlAuthority, VerdictControlAuthority,
+	JobsControlAuthority, TelemetryControlAuthority, UiControlAuthority,
 	backends::EnvdHostOwnerBackends,
 	control::{
 		ControlAuthority, ControlAuthorityFactory, ControlConnectionIdentity, ControlProtocolError,
@@ -126,12 +126,12 @@ pub struct SessionControlFactories {
 	pub ui:                Arc<dyn ControlAuthorityFactory>,
 	/// Durable telemetry query and export.
 	pub telemetry:         Arc<dyn ControlAuthorityFactory>,
-	/// Verdict projection and durable job registration.
-	pub verdicts:          Arc<dyn ControlAuthorityFactory>,
+	/// Prompt projection and durable job registration.
+	pub jobs:              Arc<dyn ControlAuthorityFactory>,
 	/// Inference provider declaration and request ownership.
 	pub provider:          Arc<dyn ControlAuthorityFactory>,
-	/// Session and turn campaign ownership.
-	pub campaigns:         Arc<dyn ControlAuthorityFactory>,
+	/// Session and turn regime ownership.
+	pub regimes:           Arc<dyn ControlAuthorityFactory>,
 }
 
 impl SessionControlFactories {
@@ -153,9 +153,9 @@ impl SessionControlFactories {
 				prompts:           Some(self.prompts),
 				ui:                Some(self.ui),
 				telemetry:         Some(self.telemetry),
-				verdicts:          Some(self.verdicts),
+				jobs:              Some(self.jobs),
 				provider:          Some(self.provider),
-				campaigns:         Some(self.campaigns),
+				regimes:           Some(self.regimes),
 				services:          None,
 			},
 		)
@@ -208,14 +208,14 @@ fn prompt_control_factory(
 	})
 }
 
-fn verdict_control_factory(
+fn job_control_factory(
 	session: Str,
 	jobs: omp_agent::JobBoard,
 	control: omp_agent::AgentHostControl,
 	dispatcher: Arc<dyn CallbackDispatcher>,
 ) -> Arc<dyn ControlAuthorityFactory> {
 	Arc::new(move |identity: Arc<ControlConnectionIdentity>| {
-		let verdict_identity = Arc::new(VerdictAuthorityIdentity {
+		let job_identity = Arc::new(JobAuthorityIdentity {
 			principal:          Str::new(identity.principal.id()),
 			extension:          identity.extension.clone(),
 			artifact_digest:    identity.artifact_digest.clone(),
@@ -229,9 +229,8 @@ fn verdict_control_factory(
 			Arc::clone(&identity),
 			Arc::clone(&dispatcher),
 		));
-		let owner =
-			Arc::new(VerdictAuthority::new(verdict_identity, jobs.clone(), registrar, projection));
-		Ok(Arc::new(VerdictControlAuthority::new(identity, owner)) as Arc<dyn ControlAuthority>)
+		let owner = Arc::new(JobAuthority::new(job_identity, jobs.clone(), registrar, projection));
+		Ok(Arc::new(JobsControlAuthority::new(identity, owner)) as Arc<dyn ControlAuthority>)
 	})
 }
 
@@ -245,35 +244,30 @@ fn provider_control_factory(
 	Arc::new(ProviderControlAuthorityFactory::new(backend))
 }
 
-struct SessionCampaignResolver(Arc<omp_envd::worker::ExtensionCampaignResolver>);
+struct SessionRegimeResolver(Arc<omp_envd::worker::ExtensionRegimeResolver>);
 
-impl omp_driver::chat::CampaignControlResolver for SessionCampaignResolver {
+impl omp_driver::chat::RegimeControlResolver for SessionRegimeResolver {
 	fn resolve(
 		&self,
 		identity: &ControlConnectionIdentity,
-		campaign: &str,
+		regime: &str,
 		state: Option<&str>,
-	) -> Result<
-		(Arc<omp_agent::CampaignSpec>, Box<dyn omp_agent::CampaignMachine>),
-		ControlProtocolError,
-	> {
-		self.0.resolve(identity, campaign, state)
+	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError> {
+		self.0.resolve(identity, regime, state)
 	}
 
-	fn owner(&self, campaign: &str) -> Option<Str> {
-		self.0.owner(campaign)
+	fn owner(&self, regime: &str) -> Option<Str> {
+		self.0.owner(regime)
 	}
 }
 
-fn campaign_control_factory(
+fn regime_control_factory(
 	control: omp_agent::ControlSender,
-	resolver: Arc<omp_envd::worker::ExtensionCampaignResolver>,
+	resolver: Arc<omp_envd::worker::ExtensionRegimeResolver>,
 ) -> Arc<dyn ControlAuthorityFactory> {
-	let backend = Arc::new(AgentCampaignControlBackend::new(
-		control,
-		Arc::new(SessionCampaignResolver(resolver)),
-	));
-	Arc::new(CampaignControlAuthorityFactory::new(backend))
+	let backend =
+		Arc::new(AgentRegimeControlBackend::new(control, Arc::new(SessionRegimeResolver(resolver))));
+	Arc::new(RegimeControlAuthorityFactory::new(backend))
 }
 
 fn replace_model_props(mut props: omp_scribe::Props, model: &str) -> omp_scribe::Props {
@@ -322,9 +316,9 @@ enum ChatError {
 	/// Durable session telemetry index failed.
 	#[error(transparent)]
 	Telemetry(#[from] omp_storage::telemetry_index::QueryError),
-	/// Campaign lifecycle mutation failed.
+	/// Regime lifecycle mutation failed.
 	#[error(transparent)]
-	Campaign(#[from] omp_agent::AgentError),
+	Regime(#[from] omp_agent::AgentError),
 	/// Environment authority binding failed.
 	#[error(transparent)]
 	Environment(#[from] omp_envd::EnvdError),
@@ -973,7 +967,7 @@ pub(crate) async fn run(
 		.props()
 		.map_err(|error| miette::miette!(error))?;
 	let state = AgentState::new(snapshot);
-	let initial_campaign = (args.plan_mode || args.plan_yolo).then_some("plan");
+	let initial_regime = (args.plan_mode || args.plan_yolo).then_some("plan");
 	let initial_prompt_slot = args.plan_yolo.then_some("plan-yolo");
 	let initial_session = session.id.clone();
 
@@ -1016,7 +1010,7 @@ pub(crate) async fn run(
 			Arc::clone(&settings_manager),
 			state_dir.clone(),
 			power_mode,
-			initial_campaign,
+			initial_regime,
 			initial_prompt_slot,
 			plan_selection,
 			plan_handoff.clone(),
@@ -1095,7 +1089,7 @@ pub(crate) async fn run(
 			settings_manager,
 			state_dir,
 			power_mode,
-			initial_campaign,
+			initial_regime,
 			initial_prompt_slot,
 			plan_selection,
 			plan_handoff,
@@ -1157,7 +1151,7 @@ pub(crate) async fn run(
 	Err(DriverChatError::UnsupportedPlatform).into_diagnostic()
 }
 
-fn bind_goal_todo_context(events: omp_agent::EventSubscription, modes: sync::Weak<CampaignHandle>) {
+fn bind_goal_todo_context(events: omp_agent::EventSubscription, modes: sync::Weak<RegimeHandle>) {
 	drop(tokio::spawn(async move {
 		while let Ok(event) = events.recv().await {
 			let omp_agent::AgentEvent::ToolFinished { item, .. } = event.as_ref() else {
@@ -1198,19 +1192,19 @@ pub(crate) struct AppAdvisorRuntime<C: TurnClient + Clone + Send + Sync + 'stati
 	headless: bool,
 }
 
-/// Lazily created advisor children and delivery campaigns.
+/// Lazily created advisor children and delivery regimes.
 ///
 /// Held behind a `tokio::sync::Mutex` because the guard genuinely spans the
 /// child spawn and batch-run awaits, serializing advisor turns.
 #[derive(Default)]
 struct AdvisorLinks {
-	control:   Option<omp_agent::ControlSender>,
-	children:  BTreeMap<Str, Str>,
-	campaigns: BTreeMap<Str, ActiveAdvisorCampaign>,
+	control:  Option<omp_agent::ControlSender>,
+	children: BTreeMap<Str, Str>,
+	regimes:  BTreeMap<Str, ActiveAdvisorRegime>,
 }
 
 impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
-	/// Composes engine workers; children and campaigns attach lazily on the
+	/// Composes engine workers; children and regimes attach lazily on the
 	/// first dispatched batch, so disabled sessions never spawn a child.
 	pub(crate) fn compose(
 		parent: Arc<ChatParentHost<C>>,
@@ -1244,7 +1238,7 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
 		Arc::clone(&self.engine)
 	}
 
-	/// Attaches the persistent child and delivery campaign for one advisor.
+	/// Attaches the persistent child and delivery regime for one advisor.
 	///
 	/// Returns the supervised child id, or `None` when composition failed and
 	/// the batch must be skipped; failures are recorded on the engine.
@@ -1278,14 +1272,14 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
 				},
 			}
 		}
-		if !links.campaigns.contains_key(advisor_id) {
+		if !links.regimes.contains_key(advisor_id) {
 			if let Some(control) = links.control.clone() {
-				match ActiveAdvisorCampaign::engage(control, advisor_id, Duration::ZERO, 2).await {
-					Ok(campaign) => {
-						links.campaigns.insert(Str::from(advisor_id), campaign);
+				match ActiveAdvisorRegime::start(control, advisor_id, Duration::ZERO, 2).await {
+					Ok(regime) => {
+						links.regimes.insert(Str::from(advisor_id), regime);
 					},
 					Err(error) => {
-						tracing::warn!(advisor = %advisor_id, %error, "advisor delivery campaign could not be engaged");
+						tracing::warn!(advisor = %advisor_id, %error, "advisor delivery regime could not be started");
 					},
 				}
 			}
@@ -1448,13 +1442,13 @@ impl<C: TurnClient + Clone + Send + Sync + 'static> AppAdvisorRuntime<C> {
 						)));
 					},
 					AdviceOutcome::Deliver { advice, .. } => {
-						if let Some(campaign) = links.campaigns.get(advice.advisor_id.as_str()) {
-							let _ = campaign.handle().submit(advice, context);
+						if let Some(regime) = links.regimes.get(advice.advisor_id.as_str()) {
+							let _ = regime.handle().submit(advice, context);
 						}
 					},
 					AdviceOutcome::Quarantined(reason) => {
-						if let Some(campaign) = links.campaigns.get(job.advisor_id.as_str()) {
-							let _ = campaign.record_quarantine(reason.to_string()).await;
+						if let Some(regime) = links.regimes.get(job.advisor_id.as_str()) {
+							let _ = regime.record_quarantine(reason.to_string()).await;
 						}
 					},
 					AdviceOutcome::Suppressed(_) => {},
@@ -1525,7 +1519,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	settings_manager: Arc<SettingsManager>,
 	state_dir: PathBuf,
 	power_mode: omp_driver::power::SleepPrevention,
-	initial_campaign: Option<&'static str>,
+	initial_regime: Option<&'static str>,
 	initial_prompt_slot: Option<&'static str>,
 	plan_selection: Option<ModelSelection>,
 	plan_handoff: Option<ModelSelection>,
@@ -1693,7 +1687,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		let telemetry_query =
 			Arc::new(TelemetryIndexQuery::new(Arc::clone(&telemetry_index), id.clone()));
 		let telemetry_factory = telemetry_control_factory(telemetry_query);
-		let verdict_factory = verdict_control_factory(
+		let job_factory = job_control_factory(
 			id.clone(),
 			agent.jobs().as_ref().clone(),
 			agent.host_control(),
@@ -1732,42 +1726,39 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			}
 		});
 		agent.set_run_activity(PowerActivity::new(power_mode));
-		let autolearn_campaign = autolearn.enabled.then(|| AutolearnCampaign::new(autolearn));
+		let autolearn_regime = autolearn.enabled.then(|| AutolearnRegime::new(autolearn));
 		let mut recovered_autolearn = false;
-		agent.recover_campaigns(
+		agent.recover_regimes(
 			|spec_id| {
 				if let Some(core) = omp_agent::core_regime(spec_id) {
 					return Some(core);
 				}
-				let Some((spec, machine, _)) = autolearn_campaign.as_ref() else {
+				let Some((spec, machine, _)) = autolearn_regime.as_ref() else {
 					return None;
 				};
-				if spec_id != omp_driver::autolearn::AUTOLEARN_CAMPAIGN_ID || recovered_autolearn {
+				if spec_id != omp_driver::autolearn::AUTOLEARN_REGIME_ID || recovered_autolearn {
 					return None;
 				}
 				recovered_autolearn = true;
-				Some((
-					Arc::clone(spec),
-					Box::new(machine.clone()) as Box<dyn omp_agent::CampaignMachine>,
-				))
+				Some((Arc::clone(spec), Box::new(machine.clone()) as Box<dyn omp_agent::Regime>))
 			},
 			now_ms(),
 		)?;
-		if let Some((spec, machine, _)) = autolearn_campaign.as_ref()
+		if let Some((spec, machine, _)) = autolearn_regime.as_ref()
 			&& !agent
 				.arbiter()
-				.campaigns()
-				.entries()
+				.regimes()
+				.records()
 				.iter()
-				.any(|entry| entry.spec_id == omp_driver::autolearn::AUTOLEARN_CAMPAIGN_ID)
+				.any(|record| record.spec_id == omp_driver::autolearn::AUTOLEARN_REGIME_ID)
 		{
-			let _ = agent.engage_campaign(
+			let _ = agent.start_regime(
 				Arc::clone(spec),
 				Box::new(machine.clone()),
-				omp_agent::EngageOptions { now_ms: now_ms(), queue: false },
+				omp_agent::StartOptions { now_ms: now_ms(), queue: false },
 			)?;
 		}
-		let autolearn_task = autolearn_campaign.as_ref().map(|(_, _, handle)| {
+		let autolearn_task = autolearn_regime.as_ref().map(|(_, _, handle)| {
 			let events = agent.events().subscribe_lossless();
 			let handle = handle.clone();
 			tokio::spawn(async move {
@@ -1776,42 +1767,42 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				}
 			})
 		});
-		if let Some(spec_id) = initial_campaign
+		if let Some(spec_id) = initial_regime
 			&& agent
 				.arbiter()
-				.campaigns()
-				.slots()
-				.owner(&omp_agent::SlotClaim::Mode)
+				.regimes()
+				.resources()
+				.owner(&omp_agent::Resource::Mode)
 				.is_none()
 		{
 			let (mut spec, machine) =
 				omp_agent::core_regime(spec_id).expect("startup names a built-in regime");
 			if let Some(prompt_slot) = initial_prompt_slot {
-				Arc::make_mut(&mut spec).binds = Arc::from([omp_agent::ScopedBinding {
-					slot:  omp_agent::BindSlot::PromptSlot,
+				Arc::make_mut(&mut spec).sets = Arc::from([omp_agent::ScopedSetting {
+					slot:  omp_agent::SettingSlot::PromptSlot,
 					value: Str::new_static(prompt_slot),
 				}]);
 			}
-			let _ = agent.engage_campaign(spec, machine, omp_agent::EngageOptions {
+			let _ = agent.start_regime(spec, machine, omp_agent::StartOptions {
 				now_ms: now_ms(),
 				queue:  false,
 			})?;
 		}
-		let modes = Arc::new(CampaignHandle::new());
-		modes.sync_campaigns(agent.arbiter().campaigns());
+		let modes = Arc::new(RegimeHandle::new());
+		modes.sync_regimes(agent.arbiter().regimes());
 		bind_goal_todo_context(agent.events().subscribe_lossless(), Arc::downgrade(&modes));
 		modes.bind_plan_selection(state.clone(), plan_selection.clone());
 		if let Some(handoff) = plan_handoff.clone() {
 			modes.bind_plan_handoff(handoff);
 		}
-		parent.bind_campaigns(Arc::clone(&modes));
+		parent.bind_regimes(Arc::clone(&modes));
 		let _goal_binding = goal_control.bind(Arc::clone(&modes), agent.control());
 		state.update(|snapshot| {
 			snapshot.prompt_source = modes.prompt_source(Arc::clone(&snapshot.prompt_source));
 		});
 		agent.set_continuation_source(modes.clone());
-		let campaign_factory =
-			campaign_control_factory(agent.control(), environment.extension_campaign_resolver());
+		let regime_factory =
+			regime_control_factory(agent.control(), environment.extension_regime_resolver());
 		let provider_factory = provider_factory.ok_or(ChatError::MissingAuthority("provider"))?;
 		_external_control_binding = Some(
 			SessionControlFactories {
@@ -1823,9 +1814,9 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				prompts:           prompt_factory,
 				ui:                presentation_factory,
 				telemetry:         telemetry_factory,
-				verdicts:          verdict_factory,
+				jobs:              job_factory,
 				provider:          provider_factory,
-				campaigns:         campaign_factory,
+				regimes:           regime_factory,
 			}
 			.bind(environment, AgentsControlAuthority::factory(Arc::clone(&parent))),
 		);
@@ -1915,12 +1906,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			executor.clone(),
 			agent,
 			environment,
-			ChatUiSession {
-				session_id: id,
-				initial_items,
-				context_window,
-				title,
-			},
+			ChatUiSession { session_id: id, initial_items, context_window, title },
 			Some(advisor_engine),
 			advisor_notices,
 			Arc::clone(&scope.registry),

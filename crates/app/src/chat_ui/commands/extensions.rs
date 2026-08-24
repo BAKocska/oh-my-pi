@@ -2,9 +2,7 @@ use omp_core::Str;
 
 mod inspector_model;
 
-pub(crate) use inspector_model::{
-	build_inspector_snapshot_from_declarations, snapshot_live_mcp,
-};
+pub(crate) use inspector_model::{build_inspector_snapshot_from_declarations, snapshot_live_mcp};
 
 use super::{ConfigScope, ExtensionRequest, MarketplaceRequest, PluginRequest, command};
 

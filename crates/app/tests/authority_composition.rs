@@ -97,9 +97,9 @@ fn factories(generation: &'static str) -> SessionControlFactories {
 		prompts:           factory("omp.prompts.invalidate", generation),
 		ui:                factory("omp.ui.presentation", generation),
 		telemetry:         factory("omp.telemetry.query", generation),
-		verdicts:          factory("omp.jobs.register", generation),
+		jobs:              factory("omp.jobs.register", generation),
 		provider:          factory("omp.provider.models", generation),
-		campaigns:         factory("omp.campaigns.active", generation),
+		regimes:           factory("omp.regimes.active", generation),
 	}
 }
 
@@ -189,7 +189,7 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 		"omp.telemetry.query",
 		"omp.jobs.register",
 		"omp.provider.models",
-		"omp.campaigns.active",
+		"omp.regimes.active",
 	] {
 		assert_eq!(
 			request(&stale_authority, &connection, 1, operation)

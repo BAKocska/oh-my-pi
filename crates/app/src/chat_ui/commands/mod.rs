@@ -6,10 +6,9 @@ mod config;
 pub mod context;
 mod export;
 mod extensions;
-pub(crate) use extensions::{
-	build_inspector_snapshot_from_declarations, snapshot_live_mcp,
-};
+pub(crate) use extensions::{build_inspector_snapshot_from_declarations, snapshot_live_mcp};
 mod flow;
+mod git;
 mod green;
 mod mcp;
 mod memory;
@@ -210,6 +209,8 @@ pub trait SessionCommandHost {
 	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_>;
 	/// Execute a structured workspace operation.
 	fn workspace(&mut self, request: WorkspaceRequest) -> CommandFuture<'_>;
+	/// Open the interactive Git workbench, optionally pinned to a revision.
+	fn git(&mut self, revision: Option<Str>) -> CommandFuture<'_>;
 	/// Summarize the session into a handoff document and compact it in place.
 	fn handoff(&mut self, instructions: Option<Str>) -> CommandFuture<'_> {
 		let _ = instructions;

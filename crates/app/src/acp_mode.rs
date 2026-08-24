@@ -1208,7 +1208,7 @@ impl Runtime {
 			project: root.clone(),
 			additional_roots: Box::default(),
 			model: Str::from(model),
-			initial_campaign: (mode == "plan").then_some("plan"),
+			initial_regime: (mode == "plan").then_some("plan"),
 			initial_prompt_slot: None,
 			plan_handoff: None,
 			resume,
@@ -1693,7 +1693,7 @@ impl Runtime {
 			.headless
 			.lock()
 			.await
-			.campaigns()
+			.regimes()
 			.plan()
 			.filter(|state| state.enabled)
 			.ok_or_else(|| miette!("plan mode is not active"))?;
@@ -1719,12 +1719,12 @@ impl Runtime {
 		{
 			let headless = session.asynchronous.headless.lock().await;
 			headless
-				.campaigns()
+				.regimes()
 				.set_plan_artifact(artifact.url.clone())
 				.map_err(|error| miette!("{error}"))?;
-			if execute && let Some(engagement) = headless.campaigns().mode_engagement() {
+			if execute && let Some(activation) = headless.regimes().mode_activation() {
 				headless
-					.disengage_campaign(engagement)
+					.stop_regime(activation)
 					.await
 					.map_err(|error| miette!("{error}"))?;
 			}
@@ -1781,25 +1781,25 @@ impl Runtime {
 		let generation = session.meta.lock().session_generation;
 		{
 			let headless = session.asynchronous.headless.lock().await;
-			let from = if headless.campaigns().holds_mode("plan") {
+			let from = if headless.regimes().holds_mode("plan") {
 				PlanState::Active
 			} else {
 				PlanState::Inactive
 			};
 			let to = if mode == "plan" {
-				if !headless.campaigns().holds_mode("plan") {
+				if !headless.regimes().holds_mode("plan") {
 					headless
-						.engage_regime("plan", false)
+						.start_regime("plan", false)
 						.await
 						.map_err(|error| miette!("{error}"))?;
 				}
 				PlanState::Active
 			} else {
-				if headless.campaigns().holds_mode("plan")
-					&& let Some(engagement) = headless.campaigns().mode_engagement()
+				if headless.regimes().holds_mode("plan")
+					&& let Some(activation) = headless.regimes().mode_activation()
 				{
 					headless
-						.disengage_campaign(engagement)
+						.stop_regime(activation)
 						.await
 						.map_err(|error| miette!("{error}"))?;
 				}

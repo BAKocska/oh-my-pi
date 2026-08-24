@@ -2475,6 +2475,10 @@ impl SessionCommandHost for RpcCommandHost {
 		})
 	}
 
+	fn git(&mut self, _revision: Option<Str>) -> CommandFuture<'_> {
+		unavailable_command("git")
+	}
+
 	fn fresh(&mut self) -> CommandFuture<'_> {
 		self.clear()
 	}

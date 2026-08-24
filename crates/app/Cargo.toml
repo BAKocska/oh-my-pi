@@ -45,6 +45,7 @@ smallvec.workspace = true
 flate2.workspace = true
 libc.workspace = true
 image.workspace = true
+md-5.workspace = true
 indicatif.workspace = true
 inventory.workspace = true
 miette = { workspace = true }
