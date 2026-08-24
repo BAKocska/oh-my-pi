@@ -547,4 +547,69 @@ describe("openai-completions convertMessages", () => {
 			},
 		]);
 	});
+	it("preserves image_url for the bundled DeepSeek V4 Flash Vision model", () => {
+		// Regression for #9595: the text-only DeepSeek guard must not strip images
+		// from a genuinely multimodal DeepSeek SKU declaring `input: [text, image]`.
+		const model = getBundledModel("deepseek", "deepseek-v4-flash-vision-exp") as Model<"openai-completions">;
+		expect(model.input).toContain("image");
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "Describe this screenshot" },
+						{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+					],
+					timestamp: Date.now(),
+				},
+			],
+		};
+
+		const messages = convertMessages(model, context, compat);
+
+		expect(messages).toHaveLength(1);
+		expect(messages[0].content).toEqual([
+			{ type: "text", text: "Describe this screenshot" },
+			{
+				type: "image_url",
+				image_url: { url: "data:image/png;base64,ZmFrZQ==" },
+			},
+		]);
+	});
+	it("preserves image_url for DeepSeek vision SKUs with attached version digits", () => {
+		// Regression for the #9596 review: the vision-marker exemption must cover
+		// attached-suffix aliases (`deepseek-ocr2`, `deepseek-vl2`) the old
+		// `includes("deepseek-ocr")` check matched, not just hyphenated variants.
+		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+		for (const id of ["deepseek-ocr2", "deepseek-vl2"]) {
+			const model: Model<"openai-completions"> = {
+				...baseModel,
+				id,
+				name: id,
+				provider: "deepseek",
+				baseUrl: "https://api.deepseek.com",
+				api: "openai-completions",
+				input: ["text", "image"],
+			};
+			const context: Context = {
+				messages: [
+					{
+						role: "user",
+						content: [
+							{ type: "text", text: "Read this document" },
+							{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+						],
+						timestamp: Date.now(),
+					},
+				],
+			};
+
+			const messages = convertMessages(model, context, compat);
+
+			expect(messages[0].content).toEqual([
+				{ type: "text", text: "Read this document" },
+				{ type: "image_url", image_url: { url: "data:image/png;base64,ZmFrZQ==" } },
+			]);
+		}
+	});
 });

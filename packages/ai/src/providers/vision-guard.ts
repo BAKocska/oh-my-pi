@@ -66,6 +66,16 @@ export function isDashscopeCompatibleModeTextOnlyQwen(model: Model<"openai-compl
 }
 
 /**
+ * Vision markers in a DeepSeek model id/name that indicate a genuinely
+ * multimodal SKU (`deepseek-ocr`/`deepseek-ocr2`, `deepseek-vl`/`deepseek-vl2`,
+ * `deepseek-v4-flash-vision-exp`). Trailing version digits are allowed on the
+ * `ocr`/`vl` markers so attached-suffix aliases still match; the tokens are
+ * bounded so text-only SKUs (`deepseek-chat`, `deepseek-reasoner`,
+ * `deepseek-v4-flash`) never match.
+ */
+const DEEPSEEK_VISION_MARKER = /\b(?:ocr\d*|vision|vl\d*)\b/;
+
+/**
  * Detect known text-only DeepSeek models served via OpenAI-compatible Chat
  * Completions endpoints whose server-side deserializers reject `image_url`
  * content parts with HTTP 400 (`unknown variant \`image_url\`, expected \`text\``).
@@ -77,8 +87,12 @@ export function isDashscopeCompatibleModeTextOnlyQwen(model: Model<"openai-compl
 export function isTextOnlyDeepSeek(model: Model<"openai-completions">): boolean {
 	const id = model.id.toLowerCase();
 	const name = (model.name ?? "").toLowerCase();
-	// DeepSeek OCR is a genuinely multimodal model served by Novita.
-	if (id.includes("deepseek-ocr") || name.includes("deepseek-ocr")) return false;
+	// Genuinely multimodal DeepSeek SKUs accept `image_url` and must keep their
+	// images: DeepSeek-OCR (Novita), DeepSeek-VL, and DeepSeek V4 Flash Vision
+	// (issue #9595). Detect them by the vision marker in the id/name rather than
+	// the model's own `input`, because a misconfigured text-only DeepSeek carries
+	// the same `input: [text, image]` this override exists to defend against.
+	if (DEEPSEEK_VISION_MARKER.test(id) || DEEPSEEK_VISION_MARKER.test(name)) return false;
 	return (
 		modelMatchesHost(model, "deepseekFamily") ||
 		isDeepseekModelIdOrName(model.id) ||

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the text-only DeepSeek guard stripping images (`[image omitted: model does not support vision]`) from genuinely multimodal DeepSeek models such as `deepseek-v4-flash-vision-exp`; the override now exempts vision SKUs (`ocr`/`vision`/`vl`) instead of every DeepSeek model ([#9595](https://github.com/can1357/oh-my-pi/issues/9595)).
+
 ## [18.0.4] - 2026-08-24
 
 ### Fixed
