@@ -841,6 +841,16 @@ export class RelayBridge {
 		conn.sessions.delete(sessionId);
 		const targetId = ref.kind === "tab" ? tabTargetId(ref.tabId) : pageTargetId(ref.tabId);
 		this.#emit(conn, "Target.detachedFromTarget", { sessionId, targetId }, parentSessionId);
+		// Same zero-holders rule cdpClosed() applies: once the final holder
+		// releases its last session, drop the debugger (and its infobar) from a
+		// tab nobody drives anymore. Inert while the long-lived registry
+		// connection still holds a session on the tab.
+		if (this.#sessionHolders(ref.tabId).length > 0) return;
+		const tab = this.#tabs.get(ref.tabId);
+		if (tab?.attached) {
+			tab.attached = false;
+			void this.#rpc({ op: "detach", tabId: ref.tabId }).catch(() => {});
+		}
 	}
 
 	/** Connections currently holding any session on a tab. */

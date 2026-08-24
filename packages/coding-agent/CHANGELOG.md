@@ -23,6 +23,7 @@
 - Fixed resize and display replays, ensuring stable rendering and full transcript flushing on agent shutdown
 - Fixed fast tool completions leaving a permanent running summary that blocked transcript retirement and squeezed later tool output.
 - Fixed `omp git` hunk navigation (`alt+↓`/`alt+↑`) appearing to do nothing while the file sidebar had focus: the diff cursor band now stays visible (dimmed) when the pane is unfocused.
+- Fixed the browser relay leaving a tab's `chrome.debugger` attachment (and its "started debugging this browser" infobar) orphaned when a client released its last session with `Target.detachFromTarget` before disconnecting ([#9613](https://github.com/can1357/oh-my-pi/issues/9613))
 
 ## [18.0.4] - 2026-08-24
 

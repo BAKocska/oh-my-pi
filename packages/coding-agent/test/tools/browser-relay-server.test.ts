@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import type {
+	ExtToRelayMessage,
+	RelayRpcRequest,
+	RelayToExtMessage,
+	TabSnapshot,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
 
 const EXTENSION_HELLO = {
@@ -144,5 +150,137 @@ describe("browser relay discovery endpoint", () => {
 		relay = startRelayServer({ port });
 		const response = await fetch(`http://127.0.0.1:${port}/json/version`);
 		expect(response.status).toBe(503);
+	});
+});
+
+interface ScriptedExtension {
+	ws: WebSocket;
+	/** Every RPC the relay drove the extension with, in arrival order. */
+	rpcs: RelayRpcRequest[];
+}
+
+/** Extension that acknowledges every RPC and records it, so tests can assert relay-driven upstream traffic. */
+async function connectScriptedExtension(port: number, tabs: TabSnapshot[]): Promise<ScriptedExtension> {
+	const rpcs: RelayRpcRequest[] = [];
+	const opened = Promise.withResolvers<void>();
+	const ws = new WebSocket(`ws://127.0.0.1:${port}/ext`);
+	ws.addEventListener("open", () => opened.resolve(), { once: true });
+	ws.addEventListener("error", () => opened.reject(new Error("Extension socket failed to connect")), { once: true });
+	ws.addEventListener("message", event => {
+		const msg = JSON.parse(String(event.data)) as RelayToExtMessage;
+		if (msg.t !== "rpc") return;
+		const { id, t: _t, ...rpc } = msg;
+		rpcs.push(rpc);
+		ws.send(JSON.stringify({ t: "rpcResult", id, ok: true, result: {} } satisfies ExtToRelayMessage));
+	});
+	await opened.promise;
+	ws.send(
+		JSON.stringify({
+			t: "hello",
+			userAgent: "test",
+			browserVersion: "Chrome/150.0.0.0",
+			tabs,
+			attachedTabIds: [],
+		} satisfies ExtToRelayMessage),
+	);
+	return { ws, rpcs };
+}
+
+interface CdpResponse {
+	id: number;
+	result?: Record<string, unknown>;
+	error?: unknown;
+}
+
+interface CdpClient {
+	ws: WebSocket;
+	send(method: string, params?: Record<string, unknown>): Promise<CdpResponse>;
+}
+
+/** Minimal downstream CDP client: numbered request/response over the /cdp socket. */
+async function connectCdpClient(port: number): Promise<CdpClient> {
+	const opened = Promise.withResolvers<void>();
+	const ws = new WebSocket(`ws://127.0.0.1:${port}/cdp`);
+	ws.addEventListener("open", () => opened.resolve(), { once: true });
+	ws.addEventListener("error", () => opened.reject(new Error("CDP socket failed to connect")), { once: true });
+	await opened.promise;
+	let nextId = 0;
+	const pending = new Map<number, (msg: CdpResponse) => void>();
+	ws.addEventListener("message", event => {
+		const msg = JSON.parse(String(event.data)) as CdpResponse;
+		if (typeof msg.id === "number") pending.get(msg.id)?.(msg);
+	});
+	const send = (method: string, params: Record<string, unknown> = {}): Promise<CdpResponse> => {
+		const id = ++nextId;
+		const { promise, resolve } = Promise.withResolvers<CdpResponse>();
+		pending.set(id, resolve);
+		ws.send(JSON.stringify({ id, method, params }));
+		return promise;
+	};
+	return { ws, send };
+}
+
+function fakeTab(tabId: number, url: string): TabSnapshot {
+	return { tabId, url, title: url, active: tabId === 1, windowId: 1, pinned: false, groupId: -1 };
+}
+
+describe("browser relay session detach", () => {
+	let relay: RelayServer | undefined;
+	let extension: WebSocket | undefined;
+	const clients: WebSocket[] = [];
+
+	afterEach(() => {
+		for (const ws of clients) ws.close();
+		clients.length = 0;
+		extension?.close();
+		relay?.stop();
+		extension = undefined;
+		relay = undefined;
+	});
+
+	// Two tabs so a later attach on tab 2 can serve as a deterministic marker:
+	// the ext socket is FIFO, so once the tab-2 attach round-trips, any upstream
+	// detach the tab-1 release dispatched is already recorded.
+	async function startReadyRelay(): Promise<{ port: number; rpcs: RelayRpcRequest[] }> {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port });
+		const ext = await connectScriptedExtension(port, [
+			fakeTab(1, "https://one.example/"),
+			fakeTab(2, "https://two.example/"),
+		]);
+		extension = ext.ws;
+		await waitForDiscovery(port);
+		return { port, rpcs: ext.rpcs };
+	}
+
+	async function openClient(port: number): Promise<CdpClient> {
+		const client = await connectCdpClient(port);
+		clients.push(client.ws);
+		return client;
+	}
+
+	it("detaches the tab upstream when the last session is released via Target.detachFromTarget", async () => {
+		const { port, rpcs } = await startReadyRelay();
+		const client = await openClient(port);
+		const attached = await client.send("Target.attachToTarget", { targetId: "PAGE1", flatten: true });
+		expect(typeof attached.result?.sessionId).toBe("string");
+
+		await client.send("Target.detachFromTarget", { sessionId: attached.result?.sessionId });
+		// Marker attach on tab 2 — once it resolves the tab-1 detach (if any) is recorded.
+		await client.send("Target.attachToTarget", { targetId: "PAGE2", flatten: true });
+		expect(rpcs.filter(rpc => rpc.op === "detach" && rpc.tabId === 1)).toHaveLength(1);
+	});
+
+	it("keeps the tab attached while another connection still holds a session", async () => {
+		const { port, rpcs } = await startReadyRelay();
+		const a = await openClient(port);
+		const b = await openClient(port);
+		const attachedA = await a.send("Target.attachToTarget", { targetId: "PAGE1", flatten: true });
+		await b.send("Target.attachToTarget", { targetId: "PAGE1", flatten: true });
+
+		await a.send("Target.detachFromTarget", { sessionId: attachedA.result?.sessionId });
+		// Marker attach on tab 2 through the surviving holder flushes the ext socket.
+		await b.send("Target.attachToTarget", { targetId: "PAGE2", flatten: true });
+		expect(rpcs.filter(rpc => rpc.op === "detach" && rpc.tabId === 1)).toHaveLength(0);
 	});
 });
