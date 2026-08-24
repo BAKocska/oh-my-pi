@@ -7,6 +7,7 @@ use std::{
 	path::Path,
 	sync::{
 		Arc,
+		Mutex as StdMutex,
 		atomic::{AtomicBool, Ordering},
 	},
 };
@@ -37,6 +38,7 @@ pub struct GitSession {
 	avatar: Option<AvatarLoader>,
 	busy:   Arc<AtomicBool>,
 	cancel: CancellationToken,
+	load_cancel: Arc<StdMutex<CancellationToken>>,
 }
 
 impl GitSession {
@@ -51,6 +53,7 @@ impl GitSession {
 			model: Arc::new(Mutex::new(model)),
 			avatar: AvatarLoader::new(),
 			busy: Arc::new(AtomicBool::new(false)),
+			load_cancel: Arc::new(StdMutex::new(cancel.child_token())),
 			cancel,
 		})
 	}
@@ -82,6 +85,15 @@ impl GitSession {
 
 	/// Applies one UI intent through the same path used by both workbench hosts.
 	pub async fn handle(&self, intent: GitIntent) -> GitIntentResult {
+		self.handle_with_progress(intent, |_| {}).await
+	}
+
+	/// Applies an intent while forwarding progressive file-content chunks.
+	pub async fn handle_with_progress(
+		&self,
+		intent: GitIntent,
+		mut on_update: impl FnMut(GitUpdate) + Send,
+	) -> GitIntentResult {
 		match intent {
 			GitIntent::Close => {
 				self.cancel.cancel();
@@ -92,12 +104,32 @@ impl GitSession {
 				Err(error) => failed(error),
 			},
 			GitIntent::Load { area, path, orig_path, seq } => {
+				let load_cancel = self.cancel.child_token();
+				{
+					let mut active = self
+						.load_cancel
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner);
+					active.cancel();
+					*active = load_cancel.clone();
+				}
 				let result = self
 					.model
 					.lock()
 					.await
-					.contents(area, path.as_str(), orig_path.as_deref(), &self.cancel)
+					.contents_stream(
+						area,
+						path.as_str(),
+						orig_path.as_deref(),
+						&load_cancel,
+						|old_lines, new_lines| {
+							on_update(GitUpdate::ContentsChunk { seq, old_lines, new_lines });
+						},
+					)
 					.await;
+				if load_cancel.is_cancelled() {
+					return GitIntentResult::default();
+				}
 				match result {
 					Ok(contents) => one(GitUpdate::Contents { seq, contents }),
 					Err(error) => failed(error),
@@ -181,4 +213,72 @@ fn failed(error: GitModelError) -> GitIntentResult {
 
 fn render_error(error: &GitModelError) -> Str {
 	error.to_string().to_str()
+}
+#[cfg(test)]
+mod tests {
+	use std::{fs, process::Command};
+
+	use omp_chat_ui::git::{GitArea, GitIntent, GitUpdate};
+
+	use super::*;
+
+	fn fixture_git(cwd: &Path, arguments: &[&str]) {
+		let output = Command::new("git")
+			.current_dir(cwd)
+			.args(arguments)
+			.output()
+			.expect("fixture git should launch");
+		assert!(output.status.success(), "fixture git {arguments:?} failed");
+	}
+
+	#[tokio::test]
+	async fn newer_load_cancels_stale_sequence_before_terminal_delivery() {
+		let fixture = tempfile::tempdir().expect("temporary repository");
+		fixture_git(fixture.path(), &["init", "-b", "main"]);
+		fixture_git(fixture.path(), &["config", "user.name", "OMP Test"]);
+		fixture_git(fixture.path(), &["config", "user.email", "omp@example.invalid"]);
+		fs::write(fixture.path().join("large.txt"), "seed\n").expect("seed file");
+		fixture_git(fixture.path(), &["add", "large.txt"]);
+		fixture_git(fixture.path(), &["commit", "-m", "seed"]);
+		let changed = (0..70_000)
+			.map(|line| format!("{line:05} {}\n", "stale-stream".repeat(3)))
+			.collect::<String>();
+		assert!(changed.len() < model::MAX_FILE_BYTES as usize);
+		fs::write(fixture.path().join("large.txt"), changed).expect("changed file");
+
+		let session = GitSession::open(fixture.path(), None, CancellationToken::new())
+			.await
+			.unwrap();
+		let first_session = session.clone();
+		let (progress_tx, progress_rx) = flume::bounded(1);
+		let first = tokio::spawn(async move {
+			first_session
+				.handle_with_progress(
+					GitIntent::Load {
+						area:      GitArea::Unstaged,
+						path:      Str::new_static("large.txt"),
+						orig_path: None,
+						seq:       1,
+					},
+					|_| {
+						let _ = progress_tx.try_send(());
+					},
+				)
+				.await
+		});
+		progress_rx.recv_async().await.expect("first load streamed");
+		let second = session
+			.handle(GitIntent::Load {
+				area:      GitArea::Unstaged,
+				path:      Str::new_static("large.txt"),
+				orig_path: None,
+				seq:       2,
+			})
+			.await;
+		assert!(first.await.unwrap().updates.is_empty());
+		assert!(matches!(
+			second.updates.as_slice(),
+			[GitUpdate::Contents { seq: 2, .. }]
+		));
+	}
 }

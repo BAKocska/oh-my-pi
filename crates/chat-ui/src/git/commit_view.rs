@@ -5,25 +5,19 @@ use md5::{Digest as _, Md5};
 use omp_core::{IntoStr, Str, sf};
 use omp_tui::{
 	Color, Prop, UiContext,
-	components::{Col, Img},
+	components::{Col, Img, Tree},
 	dom,
 };
 
-use super::{
-	GitCommitInfo, short_sha,
-	sidebar::{SidebarRow, fit_sidebar_path},
-};
+use super::{GitCommitInfo, short_sha};
 
 pub(super) fn component(
 	head: Option<&GitCommitInfo>,
 	avatar: Option<bytes::Bytes>,
 	ctx: &UiContext,
-	rows: &[SidebarRow],
-	selected: usize,
-	selection_bg: Color,
+	file_tree: Tree,
 	tree: bool,
 	width: u16,
-	row_start: usize,
 ) -> Col {
 	let Some(head) = head else {
 		return dom! { <col w={width} justify=center align=center><text dim>{"No commits yet"}</text></col> };
@@ -62,11 +56,6 @@ pub(super) fn component(
 			.with(Prop::W, 10_u16)
 			.with(Prop::H, 3_u16)
 	});
-	let rendered_rows = rows.iter().enumerate().map(|(offset, row)| {
-		let index = row_start + offset;
-		let (directory, basename) = fit_sidebar_path(row, width);
-		(index, row, directory, basename)
-	});
 	let view = if tree { "tree" } else { "path" };
 	dom! {
 		<col w={width}>
@@ -99,25 +88,7 @@ pub(super) fn component(
 					<option value="tree" icon="view-tree" label="Tree"/>
 				</segmented>
 			</row>
-			<col grow>
-				for (index, row, directory, basename) in rendered_rows {
-					<row w={width} h=1 bg={if index == selected { selection_bg } else { Color::Default }}>
-						<text fg=accent>{if index == selected { "▎" } else { " " }}</text>
-						<text>{" ".repeat(row.target.depth().unwrap_or(0))}</text>
-						if let Some(status) = &row.status { <text fg={row.status_color}>{status}</text> }
-						if matches!(row.target, super::sidebar::SidebarTarget::Directory { .. }) {
-							<text fg=muted>{if row.collapsed { "▸" } else { "▾" }}</text>
-						}
-						<text dim>{directory}</text>
-						<button id={sf!("git-sidebar-row-{index}")} variant=ghost grow>
-							{basename}
-						</button>
-						<spacer grow/>
-						if let Some(additions) = row.additions { <text fg=ok>{sf!("+{additions}")}</text> }
-						if let Some(deletions) = row.deletions { <text fg=err>{sf!("−{deletions}")}</text> }
-					</row>
-				}
-			</col>
+			{file_tree}
 		</col>
 	}
 }

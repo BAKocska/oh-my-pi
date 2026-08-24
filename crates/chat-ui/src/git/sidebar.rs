@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use omp_core::{IntoStr, Str, sf};
 use omp_tui::{
-	Color, Prop, UiContext,
-	components::{Col, EditInput, EditorPane},
+	Color, Prop, UiContext, cell_width,
+	components::{Col, EditInput, EditorPane, Tree, TreeAnnotation, TreeNode},
 	dom,
 };
-use xutf::Text as _;
 
 use super::{GitArea, GitChangeKind, GitFileRow, GitSnapshot, GitWorkbench, split_path};
 
+pub(super) const SIDEBAR_ID: &str = "git-sidebar";
 pub(super) const SUMMARY_ID: &str = "git-commit-summary";
 pub(super) const DESCRIPTION_ID: &str = "git-commit-description";
 // Keep the shell lookup separate from its focusable, value-owning editor leaf.
@@ -22,6 +22,7 @@ pub(super) const VIEW_STYLE_ID: &str = "git-sidebar-view";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SidebarTarget {
+	ViewStyle,
 	StageAll,
 	UnstageAll,
 	Directory { area: GitArea, path: Str, depth: usize },
@@ -41,20 +42,20 @@ pub(super) struct SidebarRow {
 	pub basename:     Str,
 	pub additions:    Option<u64>,
 	pub deletions:    Option<u64>,
-	pub collapsed:    bool,
 }
 
 #[derive(Default)]
-struct TreeNode {
+struct FileTreeNode {
 	files:    Vec<(GitArea, GitFileRow)>,
-	children: BTreeMap<Str, TreeNode>,
+	children: BTreeMap<Str, FileTreeNode>,
 }
 
 impl SidebarTarget {
 	pub(super) fn key(&self) -> Str {
 		match self {
-			Self::StageAll => Str::new_static("stage-all"),
-			Self::UnstageAll => Str::new_static("unstage-all"),
+			Self::ViewStyle => Str::new_static("sidebar-view"),
+			Self::StageAll => Str::new_static("unstaged-section"),
+			Self::UnstageAll => Str::new_static("staged-section"),
 			Self::Directory { area, path, .. } => sf!("dir:{area:?}:{path}"),
 			Self::File { area, path, .. } => sf!("file:{area:?}:{path}"),
 			Self::Amend => Str::new_static("amend"),
@@ -62,6 +63,13 @@ impl SidebarTarget {
 			Self::Description => Str::new_static("description"),
 			Self::Commit => Str::new_static("commit"),
 		}
+	}
+
+	pub(super) const fn is_tree_node(&self) -> bool {
+		matches!(
+			self,
+			Self::StageAll | Self::UnstageAll | Self::Directory { .. } | Self::File { .. }
+		)
 	}
 
 	pub(super) const fn is_file_or_directory(&self) -> bool {
@@ -78,29 +86,53 @@ impl SidebarTarget {
 
 impl GitWorkbench {
 	pub(super) fn rebuild_sidebar_rows(&mut self) {
-		self.sidebar_rows = sidebar_rows(&self.snapshot, self.tree, &self.collapsed, &self.ctx);
+		self.sidebar_rows = sidebar_rows(&self.snapshot, self.tree, &self.ctx);
 	}
 
-	pub(super) fn sidebar_component(&self, width: u16, summary: &str, description: &str) -> Col {
-		let selected = self.sidebar_selected;
-		let selection_bg = self.ctx.theme.selection_bg(false);
-		let visible = self.sidebar_visible_rows(description);
-		let start = self.sidebar_scroll_top;
-		let end = start
-			.saturating_add(visible)
-			.min(self.sidebar_file_row_count());
-		let rows = &self.sidebar_rows[start..end];
+	pub(super) fn sidebar_component(
+		&self,
+		width: u16,
+		summary: &str,
+		description: &str,
+		selected_key: Option<&str>,
+		scroll_top: usize,
+	) -> Col {
+		let mut tree = sidebar_tree(&self.sidebar_rows, &self.collapsed);
+		let content_rows = self.height.saturating_sub(2).max(1);
+		let tree_rows = if self.is_commit_view() {
+			self.snapshot.head.as_ref().map_or(1, |head| {
+				let text_rows = |text: &str| cell_width(text).div_ceil(width.max(1)).max(1);
+				let body_rows = head
+					.body
+					.lines()
+					.take(8)
+					.fold(0_u16, |rows, line| rows.saturating_add(text_rows(line)));
+				let metadata_rows = text_rows(head.subject.as_str())
+					.saturating_add(9)
+					.saturating_add(u16::from(body_rows > 0).saturating_add(body_rows))
+					.saturating_add(u16::from(!head.parents.is_empty()));
+				content_rows.saturating_sub(metadata_rows).max(1)
+			})
+		} else {
+			let description_rows =
+				u16::try_from(description.lines().count().clamp(1, 5)).unwrap_or(5);
+			content_rows
+				.saturating_sub(7_u16.saturating_add(description_rows))
+				.max(1)
+		};
+		tree = tree.with(Prop::H, tree_rows);
+		if let Some(key) = selected_key {
+			let _ = tree.select_key(key);
+		}
+		tree.set_scroll_top(scroll_top);
 		if self.is_commit_view() {
 			return super::commit_view::component(
 				self.snapshot.head.as_ref(),
 				self.avatar.as_ref().map(|(_, bytes)| bytes.clone()),
 				&self.ctx,
-				rows,
-				selected,
-				selection_bg,
+				tree,
 				self.tree,
 				width,
-				start,
 			);
 		}
 		let file_count = self.snapshot.unstaged.len() + self.snapshot.staged.len();
@@ -122,11 +154,6 @@ impl GitWorkbench {
 					.with(Prop::Placeholder, "Description")
 					.with(Prop::MaxRows, 5_u16),
 			);
-		let rendered_rows = rows.iter().enumerate().map(|(offset, row)| {
-			let index = start + offset;
-			let (directory, basename) = fit_sidebar_path(row, width);
-			(index, row, directory, basename)
-		});
 		dom! {
 			<col w={width}>
 				<row h=1 gap=1>
@@ -140,37 +167,7 @@ impl GitWorkbench {
 					</segmented>
 				</row>
 				<hr fg=border/>
-				<col h={u16::try_from(visible).unwrap_or(u16::MAX)}>
-					for (index, row, directory, basename) in rendered_rows {
-						if matches!(row.target, SidebarTarget::StageAll) {
-							<row w={width} h=1 bg={if index == selected { selection_bg } else { Color::Default }}>
-								<text bold truncate grow>{sf!("▾ Unstaged Files ({})", self.snapshot.unstaged.len())}</text>
-								<button id="git-stage-all" variant=soft active>{"Stage All"}</button>
-							</row>
-						} else if matches!(row.target, SidebarTarget::UnstageAll) {
-							<row w={width} h=1 bg={if index == selected { selection_bg } else { Color::Default }}>
-								<text bold truncate grow>{sf!("▾ Staged Files ({})", self.snapshot.staged.len())}</text>
-								<button id="git-unstage-all" variant=soft active>{"Unstage All"}</button>
-							</row>
-						} else if row.target.is_file_or_directory() {
-							<row w={width} h=1 bg={if index == selected { selection_bg } else { Color::Default }}>
-								<pre fg=accent>{if index == selected { "▎" } else { " " }}</pre>
-								<pre>{" ".repeat(row.target.depth().unwrap_or(0))}</pre>
-								if let Some(status) = &row.status { <text fg={row.status_color}>{status}</text> }
-								if matches!(row.target, SidebarTarget::Directory { .. }) {
-									<text fg=muted>{if row.collapsed { "▸" } else { "▾" }}</text>
-								}
-								<text dim>{directory}</text>
-								<button id={sf!("git-sidebar-row-{index}")} variant=ghost grow>
-									{basename}
-								</button>
-								<spacer grow/>
-								if let Some(additions) = row.additions { <text fg=ok>{sf!("+{additions}")}</text> }
-								if let Some(deletions) = row.deletions { <text fg=err>{sf!("−{deletions}")}</text> }
-							</row>
-						}
-					}
-				</col>
+				{tree}
 				<hr fg=border/>
 				<checkbox id={AMEND_ID} checked={amend} label="Amend previous commit"/>
 				<input id={SUMMARY_ID} value={summary} limit=72 rail placeholder="Commit summary"/>
@@ -183,96 +180,7 @@ impl GitWorkbench {
 	}
 }
 
-pub(super) fn fit_sidebar_path(row: &SidebarRow, width: u16) -> (Str, Str) {
-	let depth = u16::try_from(row.target.depth().unwrap_or(0)).unwrap_or(u16::MAX);
-	let status = u16::from(row.status.is_some());
-	let chevron = u16::from(matches!(row.target, SidebarTarget::Directory { .. }));
-	let counts = row
-		.additions
-		.map_or(0, |count| decimal_width(count).saturating_add(1))
-		.saturating_add(
-			row
-				.deletions
-				.map_or(0, |count| decimal_width(count).saturating_add(1)),
-		);
-	let budget = width
-		.saturating_sub(1)
-		.saturating_sub(depth)
-		.saturating_sub(status)
-		.saturating_sub(chevron)
-		.saturating_sub(counts);
-	let basename_width = cell_width(row.basename.as_str());
-	if row.directory.is_empty() || basename_width >= budget {
-		return (Str::default(), truncate_end(row.basename.as_str(), budget));
-	}
-	let directory_budget = budget.saturating_sub(basename_width);
-	(
-		truncate_start(row.directory.as_str(), directory_budget),
-		row.basename.clone(),
-	)
-}
-
-fn truncate_start(text: &str, width: u16) -> Str {
-	if cell_width(text) <= width {
-		return text.to_str();
-	}
-	if width == 0 {
-		return Str::default();
-	}
-	let budget = usize::from(width - 1);
-	let mut used = 0_usize;
-	let mut start = text.len();
-	for (offset, grapheme) in text.grapheme_indices().rev() {
-		let next = used.saturating_add(grapheme.visible_width());
-		if next > budget {
-			break;
-		}
-		used = next;
-		start = offset;
-	}
-	sf!("…{}", &text[start..])
-}
-
-fn truncate_end(text: &str, width: u16) -> Str {
-	if cell_width(text) <= width {
-		return text.to_str();
-	}
-	if width == 0 {
-		return Str::default();
-	}
-	let budget = usize::from(width - 1);
-	let mut used = 0_usize;
-	let mut end = 0;
-	for (offset, grapheme) in text.grapheme_indices() {
-		let next = used.saturating_add(grapheme.visible_width());
-		if next > budget {
-			break;
-		}
-		used = next;
-		end = offset + grapheme.len();
-	}
-	sf!("{}…", &text[..end])
-}
-
-fn cell_width(text: &str) -> u16 {
-	u16::try_from(text.visible_width()).unwrap_or(u16::MAX)
-}
-
-const fn decimal_width(mut value: u64) -> u16 {
-	let mut width = 1;
-	while value >= 10 {
-		value /= 10;
-		width += 1;
-	}
-	width
-}
-
-pub(super) fn sidebar_rows(
-	snapshot: &GitSnapshot,
-	tree: bool,
-	collapsed: &BTreeSet<Str>,
-	ctx: &UiContext,
-) -> Vec<SidebarRow> {
+pub(super) fn sidebar_rows(snapshot: &GitSnapshot, tree: bool, ctx: &UiContext) -> Vec<SidebarRow> {
 	let mut rows = Vec::new();
 	if snapshot.pinned || (snapshot.unstaged.is_empty() && snapshot.staged.is_empty()) {
 		if let Some(head) = &snapshot.head {
@@ -282,43 +190,50 @@ pub(super) fn sidebar_rows(
 				.cloned()
 				.map(|file| (GitArea::Commit, file))
 				.collect::<Vec<_>>();
-			append_files(&mut rows, &files, tree, collapsed, ctx);
+			append_files(&mut rows, &files, tree, ctx);
 		}
+		rows.push(action_row(SidebarTarget::ViewStyle, Str::default()));
 		return rows;
 	}
-	rows.push(action_row(SidebarTarget::StageAll));
+	rows.push(action_row(
+		SidebarTarget::StageAll,
+		sf!("Unstaged Files ({})", snapshot.unstaged.len()),
+	));
 	let unstaged = snapshot
 		.unstaged
 		.iter()
 		.cloned()
 		.map(|file| (GitArea::Unstaged, file))
 		.collect::<Vec<_>>();
-	append_files(&mut rows, &unstaged, tree, collapsed, ctx);
-	rows.push(action_row(SidebarTarget::UnstageAll));
+	append_files(&mut rows, &unstaged, tree, ctx);
+	rows.push(action_row(
+		SidebarTarget::UnstageAll,
+		sf!("Staged Files ({})", snapshot.staged.len()),
+	));
 	let staged = snapshot
 		.staged
 		.iter()
 		.cloned()
 		.map(|file| (GitArea::Staged, file))
 		.collect::<Vec<_>>();
-	append_files(&mut rows, &staged, tree, collapsed, ctx);
-	rows.push(action_row(SidebarTarget::Amend));
-	rows.push(action_row(SidebarTarget::Summary));
-	rows.push(action_row(SidebarTarget::Description));
-	rows.push(action_row(SidebarTarget::Commit));
+	append_files(&mut rows, &staged, tree, ctx);
+	rows.push(action_row(SidebarTarget::ViewStyle, Str::default()));
+	rows.push(action_row(SidebarTarget::Amend, Str::default()));
+	rows.push(action_row(SidebarTarget::Summary, Str::default()));
+	rows.push(action_row(SidebarTarget::Description, Str::default()));
+	rows.push(action_row(SidebarTarget::Commit, Str::default()));
 	rows
 }
 
-fn action_row(target: SidebarTarget) -> SidebarRow {
+fn action_row(target: SidebarTarget, basename: Str) -> SidebarRow {
 	SidebarRow {
 		target,
 		status: None,
 		status_color: Color::Default,
 		directory: Str::default(),
-		basename: Str::default(),
+		basename,
 		additions: None,
 		deletions: None,
-		collapsed: false,
 	}
 }
 
@@ -326,7 +241,6 @@ fn append_files(
 	rows: &mut Vec<SidebarRow>,
 	files: &[(GitArea, GitFileRow)],
 	tree: bool,
-	collapsed: &BTreeSet<Str>,
 	ctx: &UiContext,
 ) {
 	if !tree {
@@ -335,7 +249,7 @@ fn append_files(
 		}
 		return;
 	}
-	let mut root = TreeNode::default();
+	let mut root = FileTreeNode::default();
 	for (area, file) in files {
 		let mut node = &mut root;
 		let mut parts = file.path.as_str().split('/').peekable();
@@ -347,15 +261,14 @@ fn append_files(
 			}
 		}
 	}
-	append_tree(rows, &root, "", 0, collapsed, ctx);
+	append_tree(rows, &root, "", 0, ctx);
 }
 
 fn append_tree(
 	rows: &mut Vec<SidebarRow>,
-	node: &TreeNode,
+	node: &FileTreeNode,
 	prefix: &str,
 	depth: usize,
-	collapsed: &BTreeSet<Str>,
 	ctx: &UiContext,
 ) {
 	for (name, child) in &node.children {
@@ -376,27 +289,23 @@ fn append_tree(
 			.files
 			.first()
 			.map_or_else(|| subtree_area(current).unwrap_or(GitArea::Unstaged), |(area, _)| *area);
-		let closed = collapsed.contains(&directory_key(area, path.as_str()));
 		rows.push(SidebarRow {
-			target:       SidebarTarget::Directory { area, path: path.clone(), depth },
-			status:       None,
+			target: SidebarTarget::Directory { area, path: path.clone(), depth },
+			status: None,
 			status_color: ctx.theme.muted,
-			directory:    Str::default(),
-			basename:     sf!("{compressed}/"),
-			additions:    None,
-			deletions:    None,
-			collapsed:    closed,
+			directory: Str::default(),
+			basename: sf!("{compressed}/"),
+			additions: None,
+			deletions: None,
 		});
-		if !closed {
-			append_tree(rows, current, path.as_str(), depth + 1, collapsed, ctx);
-			}
+		append_tree(rows, current, path.as_str(), depth + 1, ctx);
 	}
 	for (area, file) in &node.files {
 		rows.push(file_sidebar_row(*area, file, depth, true, ctx));
 	}
 }
 
-fn subtree_area(node: &TreeNode) -> Option<GitArea> {
+fn subtree_area(node: &FileTreeNode) -> Option<GitArea> {
 	node
 		.files
 		.first()
@@ -424,18 +333,107 @@ fn file_sidebar_row(
 		target: SidebarTarget::File { area, path: file.path.clone(), depth },
 		status: Some(status.to_str()),
 		status_color,
-		directory: if tree {
-			Str::default()
-		} else {
-			directory.to_str()
-		},
+		directory: if tree { Str::default() } else { directory.to_str() },
 		basename: basename.to_str(),
 		additions: file.additions.filter(|count| *count != 0),
 		deletions: file.deletions.filter(|count| *count != 0),
-		collapsed: false,
 	}
 }
 
-pub(super) fn directory_key(area: GitArea, path: &str) -> Str {
-	sf!("{area:?}:{path}")
+fn sidebar_tree(rows: &[SidebarRow], collapsed: &BTreeSet<Str>) -> Tree {
+	let mut tree = Tree::new()
+		.with(Prop::Id, SIDEBAR_ID)
+		.with(Prop::Grow, true);
+	let mut index = 0;
+	while index < rows.len() {
+		match rows[index].target {
+			SidebarTarget::StageAll | SidebarTarget::UnstageAll => {
+				let section = &rows[index];
+				index += 1;
+				let children = tree_level(rows, &mut index, 0, collapsed);
+				let mut node = row_node(section, collapsed).with(
+					Prop::Action,
+					if matches!(section.target, SidebarTarget::StageAll) {
+						"Stage All"
+					} else {
+						"Unstage All"
+					},
+				);
+				for child in children {
+					node = node.node(child);
+				}
+				tree = tree.node(node);
+			},
+			SidebarTarget::Directory { depth: 0, .. } | SidebarTarget::File { depth: 0, .. } => {
+				for node in tree_level(rows, &mut index, 0, collapsed) {
+					tree = tree.node(node);
+				}
+			},
+			_ => index += 1,
+		}
+	}
+	tree
+}
+
+fn tree_level(
+	rows: &[SidebarRow],
+	index: &mut usize,
+	depth: usize,
+	collapsed: &BTreeSet<Str>,
+) -> Vec<TreeNode> {
+	let mut nodes = Vec::new();
+	while let Some(row) = rows.get(*index) {
+		let Some(row_depth) = row.target.depth() else {
+			break;
+		};
+		if row_depth < depth {
+			break;
+		}
+		if row_depth > depth {
+			break;
+		}
+		*index += 1;
+		let mut node = row_node(row, collapsed);
+		if matches!(row.target, SidebarTarget::Directory { .. }) {
+			for child in tree_level(rows, index, depth + 1, collapsed) {
+				node = node.node(child);
+			}
+		}
+		nodes.push(node);
+	}
+	nodes
+}
+
+fn row_node(row: &SidebarRow, collapsed: &BTreeSet<Str>) -> TreeNode {
+	let key = row.target.key();
+	let mut node = TreeNode::new().key(key.clone()).label(row.basename.clone());
+	match row.target {
+		SidebarTarget::StageAll | SidebarTarget::UnstageAll => {
+			node = node
+				.with(Prop::Open, !collapsed.contains(&key))
+				.with(Prop::Bold, true)
+				.with(Prop::ActionColor, "accent");
+		},
+		SidebarTarget::Directory { .. } => {
+			node = node
+				.with(Prop::Open, !collapsed.contains(&key))
+				.with(Prop::Dim, true);
+		},
+		SidebarTarget::File { .. } => {
+			if let Some(status) = &row.status {
+				node = node.badge(status.clone()).with(Prop::Color, row.status_color);
+			}
+			if !row.directory.is_empty() {
+				node = node.prefix(row.directory.clone());
+			}
+			if let Some(additions) = row.additions {
+				node = node.annotate(TreeAnnotation::new(sf!("+{additions}")).color("ok"));
+			}
+			if let Some(deletions) = row.deletions {
+				node = node.annotate(TreeAnnotation::new(sf!("−{deletions}")).color("err"));
+			}
+		},
+		_ => {},
+	}
+	node
 }

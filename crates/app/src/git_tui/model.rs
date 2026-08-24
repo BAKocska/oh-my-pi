@@ -3,10 +3,9 @@
 use std::{
 	collections::HashMap,
 	path::{Path, PathBuf},
-	str,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use omp_chat_ui::git::{
 	GitArea, GitChangeKind, GitCommitInfo, GitFileContents, GitFileRow, GitPatchOp, GitSnapshot,
 };
@@ -28,10 +27,13 @@ use omp_envd::{
 };
 use tokio::io::AsyncReadExt as _;
 use tokio_util::sync::CancellationToken;
+use xutf::TextBuf as _;
 
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 512;
+const STREAM_BUFFER_BYTES: usize = 256 * 1024;
+const STREAM_READ_BYTES: usize = 64 * 1024;
 const LFS_POINTER_MAX_BYTES: usize = 1024;
 const LFS_VERSION: &str = "version https://git-lfs.github.com/spec/v1";
 
@@ -278,39 +280,82 @@ impl GitModel {
 		orig_path: Option<&str>,
 		cancel: &CancellationToken,
 	) -> Result<GitFileContents, GitModelError> {
-		let (old, new, too_large) = match area {
+		self
+			.contents_stream(area, path, orig_path, cancel, |_, _| {})
+			.await
+	}
+
+	/// Resolves both sides while delivering batches of newly complete text
+	/// lines after the bounded fast-path buffer is exceeded.
+	pub async fn contents_stream(
+		&self,
+		area: GitArea,
+		path: &str,
+		orig_path: Option<&str>,
+		cancel: &CancellationToken,
+		mut on_chunk: impl FnMut(Vec<Str>, Vec<Str>) + Send,
+	) -> Result<GitFileContents, GitModelError> {
+		let (events_tx, events_rx) = flume::unbounded();
+		let old_spec;
+		let new_spec;
+		let old_source = match area {
 			GitArea::Unstaged => {
-				let old = self.show_or_empty(&format!(":0:{path}"), cancel).await?;
-				let (new, too_large) = self.read_worktree(path).await?;
-				(old, new, too_large)
+				old_spec = format!(":0:{path}");
+				StreamSource::Git(old_spec.as_str())
 			},
 			GitArea::Staged => {
-				let old = self
-					.show_or_empty(&format!("HEAD:{}", orig_path.unwrap_or(path)), cancel)
-					.await?;
-				let new = self.show_or_empty(&format!(":0:{path}"), cancel).await?;
-				(old, new, false)
+				old_spec = format!("HEAD:{}", orig_path.unwrap_or(path));
+				StreamSource::Git(old_spec.as_str())
 			},
 			GitArea::Commit => {
-				let Some(head) = self.head.as_ref() else {
-					return Ok(empty_contents());
-				};
-				let old = match head.parents.first() {
-					Some(parent) => {
-						self
-							.show_or_empty(&format!("{}:{}", parent, orig_path.unwrap_or(path)), cancel)
-							.await?
-					},
-					None => Bytes::new(),
-				};
-				let new = self
-					.show_or_empty(&format!("{}:{path}", head.sha), cancel)
-					.await?;
-				(old, new, false)
+				old_spec = self
+					.head
+					.as_ref()
+					.and_then(|head| head.parents.first())
+					.map(|parent| format!("{}:{}", parent, orig_path.unwrap_or(path)))
+					.unwrap_or_default();
+				if old_spec.is_empty() {
+					StreamSource::Empty
+				} else {
+					StreamSource::Git(old_spec.as_str())
+				}
 			},
 		};
-		let old = self.resolve_lfs(old).await?;
-		let new = self.resolve_lfs(new).await?;
+		let new_source = match area {
+			GitArea::Unstaged => StreamSource::Worktree(path),
+			GitArea::Staged => {
+				new_spec = format!(":0:{path}");
+				StreamSource::Git(new_spec.as_str())
+			},
+			GitArea::Commit => {
+				new_spec = self
+					.head
+					.as_ref()
+					.map(|head| format!("{}:{path}", head.sha))
+					.unwrap_or_default();
+				if new_spec.is_empty() {
+					StreamSource::Empty
+				} else {
+					StreamSource::Git(new_spec.as_str())
+				}
+			},
+		};
+		let old = self.stream_side(DiffSide::Old, old_source, cancel, events_tx.clone());
+		let new = self.stream_side(DiffSide::New, new_source, cancel, events_tx);
+		let collect = collect_stream_events(path, events_rx, &mut on_chunk);
+		let (old, new, ()) = tokio::try_join!(old, new, collect)?;
+		self.finish_contents(path, old, new).await
+	}
+
+	async fn finish_contents(
+		&self,
+		path: &str,
+		old: StreamedSide,
+		new: StreamedSide,
+	) -> Result<GitFileContents, GitModelError> {
+		let too_large = old.too_large || new.too_large;
+		let old = self.resolve_lfs(old.bytes).await?;
+		let new = self.resolve_lfs(new.bytes).await?;
 		let media = media_format(path, &old, &new);
 		let binary = is_binary(&old.bytes) || is_binary(&new.bytes);
 		let (old_text, new_text, old_bytes, new_bytes) = if media.is_some() {
@@ -324,13 +369,122 @@ impl GitModel {
 			(Str::new_static(""), Str::new_static(""), None, None)
 		} else {
 			(
-				String::from_utf8_lossy(&old.bytes).as_ref().to_str(),
-				String::from_utf8_lossy(&new.bytes).as_ref().to_str(),
+				decode_utf8(&old.bytes).to_str(),
+				decode_utf8(&new.bytes).to_str(),
 				None,
 				None,
 			)
 		};
 		Ok(GitFileContents { old_text, new_text, binary, too_large, old_bytes, new_bytes, media })
+	}
+
+	async fn stream_side(
+		&self,
+		side: DiffSide,
+		source: StreamSource<'_>,
+		cancel: &CancellationToken,
+		events: flume::Sender<StreamEvent>,
+	) -> Result<StreamedSide, GitModelError> {
+		let result = match source {
+			StreamSource::Empty => Ok(StreamedSide::default()),
+			StreamSource::Git(spec) => self.stream_git_side(side, spec, cancel, &events).await,
+			StreamSource::Worktree(path) => {
+				self.stream_worktree_side(side, path, cancel, &events).await
+			},
+		};
+		let _ = events.send(StreamEvent::Finished(side));
+		result
+	}
+
+	async fn stream_git_side(
+		&self,
+		side: DiffSide,
+		spec: &str,
+		cancel: &CancellationToken,
+		events: &flume::Sender<StreamEvent>,
+	) -> Result<StreamedSide, GitModelError> {
+		let mut streamed = 0_usize;
+		let mut emit = |bytes: Bytes| {
+			let remaining = (MAX_FILE_BYTES as usize + 1).saturating_sub(streamed);
+			let take = remaining.min(bytes.len());
+			if take > 0 {
+				streamed += take;
+				let _ = events.send(StreamEvent::Chunk(side, bytes.slice(..take)));
+			}
+		};
+		match self
+			.query
+			.show_path_stream(&self.cwd, spec, cancel, &mut emit)
+			.await
+		{
+			Ok(bytes) if bytes.len() > MAX_FILE_BYTES as usize => {
+				Ok(StreamedSide { bytes: Bytes::new(), too_large: true })
+			},
+			Ok(bytes) => Ok(StreamedSide { bytes, too_large: false }),
+			Err(CommandError::Exit { .. }) => Ok(StreamedSide::default()),
+			Err(CommandError::Run(GitRunError::Incomplete { stdout: true, .. })) => {
+				Ok(StreamedSide { bytes: Bytes::new(), too_large: true })
+			},
+			Err(error) => Err(error.into()),
+		}
+	}
+
+	async fn stream_worktree_side(
+		&self,
+		side: DiffSide,
+		path: &str,
+		cancel: &CancellationToken,
+		events: &flume::Sender<StreamEvent>,
+	) -> Result<StreamedSide, GitModelError> {
+		let full_path = self.cwd.join(path);
+		let mut file = match tokio::fs::File::open(&full_path).await {
+			Ok(file) => file,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				return Ok(StreamedSide::default());
+			},
+			Err(source) => return Err(GitModelError::WorktreeIo { path: full_path, source }),
+		};
+		let length = file
+			.metadata()
+			.await
+			.map_err(|source| GitModelError::WorktreeIo {
+				path: full_path.clone(),
+				source,
+			})?
+			.len();
+		if length > MAX_FILE_BYTES {
+			return Ok(StreamedSide { bytes: Bytes::new(), too_large: true });
+		}
+		let mut chunks = Vec::new();
+		let mut buffer = vec![0_u8; STREAM_READ_BYTES];
+		let mut total = 0;
+		loop {
+			if cancel.is_cancelled() {
+				return Err(GitRunError::Cancelled.into());
+			}
+			let read = file
+				.read(&mut buffer)
+				.await
+				.map_err(|source| GitModelError::WorktreeIo {
+					path: full_path.clone(),
+					source,
+				})?;
+			if read == 0 {
+				break;
+			}
+			total += read;
+			if total > MAX_FILE_BYTES as usize {
+				return Ok(StreamedSide { bytes: Bytes::new(), too_large: true });
+			}
+			let chunk = Bytes::copy_from_slice(&buffer[..read]);
+			let _ = events.send(StreamEvent::Chunk(side, chunk.clone()));
+			chunks.push(chunk);
+		}
+		let mut bytes = BytesMut::with_capacity(total);
+		for chunk in chunks {
+			bytes.extend_from_slice(&chunk);
+		}
+		Ok(StreamedSide { bytes: bytes.freeze(), too_large: false })
 	}
 
 	/// Stages one file, or every change when no path is supplied.
@@ -478,39 +632,6 @@ impl GitModel {
 		})
 	}
 
-	async fn show_or_empty(
-		&self,
-		spec: &str,
-		cancel: &CancellationToken,
-	) -> Result<Bytes, GitModelError> {
-		match self.query.show_path(&self.cwd, spec, cancel).await {
-			Ok(bytes) => Ok(bytes),
-			Err(CommandError::Exit { .. }) => Ok(Bytes::new()),
-			Err(error) => Err(error.into()),
-		}
-	}
-
-	async fn read_worktree(&self, path: &str) -> Result<(Bytes, bool), GitModelError> {
-		let full_path = self.cwd.join(path);
-		let mut file = match tokio::fs::File::open(&full_path).await {
-			Ok(file) => file,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-				return Ok((Bytes::new(), false));
-			},
-			Err(source) => return Err(GitModelError::WorktreeIo { path: full_path, source }),
-		};
-		let mut bytes = Vec::with_capacity(usize::try_from(MAX_FILE_BYTES).unwrap_or_default());
-		let mut limited = (&mut file).take(MAX_FILE_BYTES + 1);
-		limited
-			.read_to_end(&mut bytes)
-			.await
-			.map_err(|source| GitModelError::WorktreeIo { path: full_path, source })?;
-		if bytes.len() > usize::try_from(MAX_FILE_BYTES).unwrap_or(usize::MAX) {
-			return Ok((Bytes::new(), true));
-		}
-		Ok((Bytes::from(bytes), false))
-	}
-
 	async fn resolve_lfs(&self, bytes: Bytes) -> Result<LoadedSide, GitModelError> {
 		let Some(pointer) = parse_lfs_pointer(&bytes) else {
 			return Ok(LoadedSide { bytes, lfs_missing: false });
@@ -540,6 +661,181 @@ impl GitModel {
 	}
 }
 
+#[derive(Clone, Copy)]
+enum DiffSide {
+	Old,
+	New,
+}
+
+enum StreamSource<'a> {
+	Empty,
+	Git(&'a str),
+	Worktree(&'a str),
+}
+
+#[derive(Default)]
+struct StreamedSide {
+	bytes:     Bytes,
+	too_large: bool,
+}
+
+enum StreamEvent {
+	Chunk(DiffSide, Bytes),
+	Finished(DiffSide),
+}
+
+#[derive(Default)]
+struct CompleteLineSplitter {
+	pending: BytesMut,
+}
+
+impl CompleteLineSplitter {
+	fn push(&mut self, bytes: &[u8]) -> Vec<Str> {
+		self.pending.extend_from_slice(bytes);
+		let mut lines = Vec::new();
+		let mut start = 0;
+		while let Some(relative) = self.pending[start..].iter().position(|byte| *byte == b'\n') {
+			let end = start + relative;
+			lines.push(decode_utf8(&self.pending[start..end]).to_str());
+			start = end + 1;
+		}
+		if start > 0 {
+			let _ = self.pending.split_to(start);
+		}
+		lines
+	}
+
+	fn finish(&mut self) -> Vec<Str> {
+		if self.pending.is_empty() {
+			Vec::new()
+		} else {
+			vec![decode_utf8(&self.pending.split().freeze()).to_str()]
+		}
+	}
+}
+
+#[derive(Default)]
+struct SideStream {
+	splitter:  CompleteLineSplitter,
+	undecided: BytesMut,
+	lines:     Vec<Str>,
+	bytes:     usize,
+	text:      Option<bool>,
+}
+
+impl SideStream {
+	fn push(&mut self, path: &str, bytes: &[u8]) {
+		self.bytes = self.bytes.saturating_add(bytes.len());
+		match self.text {
+			Some(true) => self.lines.extend(self.splitter.push(bytes)),
+			Some(false) => {},
+			None => {
+				self.undecided.extend_from_slice(bytes);
+				if self.undecided.len() >= BINARY_SNIFF_BYTES {
+					self.classify(path);
+				}
+			},
+		}
+	}
+
+	fn finish(&mut self, path: &str) {
+		if self.text.is_none() {
+			self.classify(path);
+		}
+		if self.text == Some(true) {
+			self.lines.extend(self.splitter.finish());
+		}
+	}
+
+	fn classify(&mut self, path: &str) {
+		let header = &self.undecided[..self.undecided.len().min(BINARY_SNIFF_BYTES)];
+		let text = self.undecided.is_empty()
+			|| (!path_looks_like_media(path)
+			&& !could_be_lfs_pointer(header)
+			&& !looks_like_svg(header)
+			&& !is_binary(header));
+		self.text = Some(text);
+		if text {
+			self.lines.extend(self.splitter.push(&self.undecided));
+		}
+		self.undecided.clear();
+	}
+
+	fn take_lines(&mut self) -> Vec<Str> {
+		std::mem::take(&mut self.lines)
+	}
+}
+
+async fn collect_stream_events(
+	path: &str,
+	events: flume::Receiver<StreamEvent>,
+	on_chunk: &mut (impl FnMut(Vec<Str>, Vec<Str>) + Send),
+) -> Result<(), GitModelError> {
+	let mut old = SideStream::default();
+	let mut new = SideStream::default();
+	let mut finished = 0_u8;
+	let mut streaming = false;
+	while finished < 2 {
+		let Ok(event) = events.recv_async().await else {
+			break;
+		};
+		match event {
+			StreamEvent::Chunk(DiffSide::Old, bytes) => old.push(path, &bytes),
+			StreamEvent::Chunk(DiffSide::New, bytes) => new.push(path, &bytes),
+			StreamEvent::Finished(DiffSide::Old) => {
+				old.finish(path);
+				finished += 1;
+			},
+			StreamEvent::Finished(DiffSide::New) => {
+				new.finish(path);
+				finished += 1;
+			},
+		}
+		let classified = old.text.is_some() && new.text.is_some();
+		let streamable = old.text != Some(false) && new.text != Some(false);
+		if !streaming
+			&& classified
+			&& streamable
+			&& (old.bytes > STREAM_BUFFER_BYTES || new.bytes > STREAM_BUFFER_BYTES)
+		{
+			streaming = true;
+		}
+		if streaming {
+			let old_lines = old.take_lines();
+			let new_lines = new.take_lines();
+			if !old_lines.is_empty() || !new_lines.is_empty() {
+				on_chunk(old_lines, new_lines);
+			}
+		}
+	}
+	Ok(())
+}
+
+fn decode_utf8(bytes: &[u8]) -> String {
+	String::from_units(xutf::transcode::<xutf::Utf8, xutf::Utf8>(bytes))
+}
+
+fn path_looks_like_media(path: &str) -> bool {
+	Path::new(path)
+		.extension()
+		.and_then(|extension| extension.to_str())
+		.is_some_and(|extension| {
+			matches!(
+				extension.to_ascii_lowercase().as_str(),
+				"svg" | "svgz" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+			)
+		})
+}
+
+fn could_be_lfs_pointer(bytes: &[u8]) -> bool {
+	if bytes.len() > LFS_POINTER_MAX_BYTES {
+		return false;
+	}
+	let prefix = LFS_VERSION.as_bytes();
+	let compared = bytes.len().min(prefix.len());
+	bytes[..compared] == prefix[..compared]
+}
+
 struct LoadedSide {
 	bytes:       Bytes,
 	lfs_missing: bool,
@@ -555,7 +851,7 @@ fn parse_lfs_pointer(bytes: &[u8]) -> Option<LfsPointer> {
 	if bytes.len() > LFS_POINTER_MAX_BYTES {
 		return None;
 	}
-	let text = str::from_utf8(bytes).ok()?;
+	let text = xutf::to_string::<xutf::Utf8>(bytes).ok()?;
 	let mut lines = text.lines();
 	if lines.next()? != LFS_VERSION {
 		return None;
@@ -608,7 +904,7 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
 	if is_binary(header) {
 		return false;
 	}
-	let Ok(text) = str::from_utf8(header) else {
+	let Ok(text) = xutf::to_string::<xutf::Utf8>(header) else {
 		return false;
 	};
 	let lowercase = text.to_ascii_lowercase();
@@ -625,7 +921,6 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
 
 fn is_binary(bytes: &[u8]) -> bool {
 	omp_tools::read::is_probably_binary_header(&bytes[..bytes.len().min(BINARY_SNIFF_BYTES)])
-		|| str::from_utf8(bytes).is_err()
 }
 
 fn fingerprint(head: &[u8], status: &[u8]) -> [u8; 32] {
@@ -638,18 +933,6 @@ fn fingerprint(head: &[u8], status: &[u8]) -> [u8; 32] {
 
 fn line_range((start, end): (u32, u32)) -> Option<LineRange> {
 	(start != 0 || end != 0).then(|| LineRange::new(u64::from(start), u64::from(end)))
-}
-
-fn empty_contents() -> GitFileContents {
-	GitFileContents {
-		old_text:  Str::new_static(""),
-		new_text:  Str::new_static(""),
-		binary:    false,
-		too_large: false,
-		old_bytes: None,
-		new_bytes: None,
-		media:     None,
-	}
 }
 
 fn rows_from_status(
@@ -758,7 +1041,7 @@ fn change_kind(kind: ChangeKind) -> GitChangeKind {
 }
 
 fn lossy(bytes: &[u8]) -> Str {
-	String::from_utf8_lossy(bytes).as_ref().to_str()
+	decode_utf8(bytes).to_str()
 }
 
 #[cfg(test)]
@@ -797,7 +1080,7 @@ mod tests {
 		assert!(
 			output.status.success(),
 			"fixture git {arguments:?} failed: {}",
-			String::from_utf8_lossy(&output.stderr)
+			decode_utf8(&output.stderr)
 		);
 	}
 
@@ -922,6 +1205,83 @@ mod tests {
 		assert_eq!(media_format("notes.txt", &empty(), &side(b"plain text")), None);
 		assert!(is_binary(b"plain\0binary"));
 		assert!(!is_binary(b"plain UTF-8 text"));
+	}
+
+	#[test]
+	fn complete_line_splitter_preserves_boundaries_crlf_and_lossy_utf8() {
+		let mut splitter = CompleteLineSplitter::default();
+		assert!(splitter.push(b"prefix \xf0\x9f").is_empty());
+		assert_eq!(
+			splitter.push(b"\x98\x80\r\nnext\n"),
+			vec![Str::new_static("prefix 😀\r"), Str::new_static("next")]
+		);
+		assert!(splitter.push(b"trail").is_empty());
+		assert_eq!(splitter.finish(), vec![Str::new_static("trail")]);
+
+		let mut invalid = CompleteLineSplitter::default();
+		assert_eq!(invalid.push(b"bad \xff\n"), vec![Str::new_static("bad �")]);
+	}
+
+	#[tokio::test]
+	async fn small_contents_use_terminal_only_fast_path() {
+		let fixture = tempfile::tempdir().expect("temporary repository");
+		fixture_git(fixture.path(), &["init", "-b", "main"]);
+		fixture_git(fixture.path(), &["config", "user.name", "OMP Test"]);
+		fixture_git(fixture.path(), &["config", "user.email", "omp@example.invalid"]);
+		fs::write(fixture.path().join("small.txt"), "old\n").expect("seed file");
+		fixture_git(fixture.path(), &["add", "small.txt"]);
+		fixture_git(fixture.path(), &["commit", "-m", "seed"]);
+		fs::write(fixture.path().join("small.txt"), "old\nnew\n").expect("changed file");
+
+		let cancel = CancellationToken::new();
+		let model = GitModel::open(fixture.path(), None, &cancel).await.unwrap();
+		let mut chunks = Vec::new();
+		let contents = model
+			.contents_stream(GitArea::Unstaged, "small.txt", None, &cancel, |old, new| {
+				chunks.push((old, new));
+			})
+			.await
+			.unwrap();
+		assert!(chunks.is_empty());
+		assert_eq!(contents.old_text.as_str(), "old\n");
+		assert_eq!(contents.new_text.as_str(), "old\nnew\n");
+	}
+
+	#[tokio::test]
+	async fn large_contents_stream_complete_lines_before_terminal_contents() {
+		let fixture = tempfile::tempdir().expect("temporary repository");
+		fixture_git(fixture.path(), &["init", "-b", "main"]);
+		fixture_git(fixture.path(), &["config", "user.name", "OMP Test"]);
+		fixture_git(fixture.path(), &["config", "user.email", "omp@example.invalid"]);
+		fs::write(fixture.path().join("large.txt"), "seed\n").expect("seed file");
+		fixture_git(fixture.path(), &["add", "large.txt"]);
+		fixture_git(fixture.path(), &["commit", "-m", "seed"]);
+		let changed = (0..8_000)
+			.map(|line| format!("{line:05} {}\n", "streaming-content".repeat(3)))
+			.collect::<String>();
+		assert!(changed.len() > STREAM_BUFFER_BYTES);
+		fs::write(fixture.path().join("large.txt"), &changed).expect("changed file");
+
+		let cancel = CancellationToken::new();
+		let model = GitModel::open(fixture.path(), None, &cancel).await.unwrap();
+		let mut chunks = Vec::new();
+		let contents = model
+			.contents_stream(GitArea::Unstaged, "large.txt", None, &cancel, |old, new| {
+				chunks.push((old, new));
+			})
+			.await
+			.unwrap();
+		assert!(!chunks.is_empty());
+		assert_eq!(contents.new_text.as_str(), changed);
+		let streamed_new = chunks.iter().map(|(_, new)| new.len()).sum::<usize>();
+		assert_eq!(streamed_new, changed.lines().count());
+		assert_eq!(
+			chunks
+				.iter()
+				.flat_map(|(_, new)| new.iter().map(Str::as_str))
+				.collect::<Vec<_>>(),
+			changed.lines().collect::<Vec<_>>()
+		);
 	}
 
 	#[test]

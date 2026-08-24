@@ -15,12 +15,12 @@ use strum::EnumProperty as _;
 use omp_tui::{
 	DiffActionKind, DiffBuildOptions, DiffDocument, DiffPane, DiffPaneState, DiffPatchTarget,
 	DiffTarget, DiffWhitespaceMode, Dim, Key, Layer, Mouse, OverlayOptions, Prop, Size, Ui,
-	UiContext, UiEvent, ViewMode, cell_width,
-	components::{Col, EditorPane},
+	UiContext, UiEvent, ViewMode,
+	components::{Col, EditorPane, Tree},
 };
 use sidebar::{
-	AMEND_ID, COMMIT_ID, DESCRIPTION_ID, DESCRIPTION_PANE_ID, SUMMARY_ID, SidebarRow,
-	SidebarTarget, VIEW_STYLE_ID, directory_key, sidebar_rows,
+	AMEND_ID, COMMIT_ID, DESCRIPTION_ID, DESCRIPTION_PANE_ID, SIDEBAR_ID, SUMMARY_ID, SidebarRow,
+	SidebarTarget, VIEW_STYLE_ID, sidebar_rows,
 };
 
 /// Kind of change reported for one Git path.
@@ -194,6 +194,15 @@ pub enum GitIntent {
 pub enum GitUpdate {
 	/// Replace repository and commit state.
 	Snapshot(GitSnapshot),
+	/// Progressive line delivery for one GitIntent::Load while sides stream in.
+	ContentsChunk {
+		/// Sequence from the corresponding [`GitIntent::Load`].
+		seq:       u64,
+		/// Complete old-side lines appended since the previous chunk.
+		old_lines: Vec<Str>,
+		/// Complete new-side lines appended since the previous chunk.
+		new_lines: Vec<Str>,
+	},
 	/// Supply loaded file contents for one request sequence.
 	Contents {
 		/// Sequence from the corresponding [`GitIntent::Load`].
@@ -264,12 +273,13 @@ pub struct GitWorkbench {
 	pub(super) selected: Option<(GitArea, Str)>,
 	pub(in crate::git) sidebar_rows: Vec<SidebarRow>,
 	pub(super) sidebar_selected: usize,
-	pub(super) sidebar_scroll_top: usize,
 	pub(super) focus: Focus,
 	pub(super) tree: bool,
 	pub(super) collapsed: BTreeSet<Str>,
 	pub(super) contents: Option<GitFileContents>,
 	load_seq: u64,
+	streaming: bool,
+	load_finished: bool,
 	pub(super) whitespace: DiffWhitespaceMode,
 	pub(super) view_mode: ViewMode,
 	pub(super) wrap: bool,
@@ -296,12 +306,13 @@ impl GitWorkbench {
 			selected,
 			sidebar_rows: Vec::new(),
 			sidebar_selected: 0,
-			sidebar_scroll_top: 0,
 			focus: Focus::Sidebar,
 			tree: true,
 			collapsed: BTreeSet::new(),
 			contents: None,
 			load_seq: 0,
+			streaming: false,
+			load_finished: false,
 			whitespace: DiffWhitespaceMode::Off,
 			view_mode: ViewMode::Split,
 			wrap: false,
@@ -331,12 +342,26 @@ impl GitWorkbench {
 	pub fn apply(&mut self, update: GitUpdate) -> Option<GitIntent> {
 		match update {
 			GitUpdate::Snapshot(snapshot) => self.apply_snapshot(snapshot),
+			GitUpdate::ContentsChunk { seq, old_lines, new_lines } => {
+				if seq != self.load_seq || self.load_finished {
+					return None;
+				}
+				if !self.streaming {
+					self.streaming = true;
+					self.begin_stream();
+				}
+				self.with_pane(|pane| pane.push_stream(&old_lines, &new_lines));
+				None
+			},
 			GitUpdate::Contents { seq, contents } => {
 				if seq != self.load_seq {
 					return None;
 				}
 				self.contents = Some(contents);
-				self.install_document();
+				self.finish_document();
+				self.streaming = false;
+				self.load_finished = true;
+				self.sync_patch_target();
 				self.request_avatar()
 			},
 			GitUpdate::ActionDone { message } => {
@@ -463,18 +488,17 @@ impl GitWorkbench {
 		let in_content = row >= 2;
 		let in_sidebar =
 			in_content && col >= viewport.width.saturating_sub(sidebar_width);
-		if in_sidebar && matches!(kind, Mouse::WheelUp | Mouse::WheelDown) {
-			let delta = if kind == Mouse::WheelUp { -3 } else { 3 };
-			self.pending_discard = None;
-			self.scroll_sidebar(delta);
-			return GitWorkbenchEvent::Consumed;
-		}
 		if in_content && matches!(kind, Mouse::Click | Mouse::RightClick) {
 			self.focus = if in_sidebar { Focus::Sidebar } else { Focus::Diff };
 			if self.focus == Focus::Sidebar && kind == Mouse::Click {
 				self.select_sidebar_form_at(row.saturating_sub(2), viewport.height.saturating_sub(2));
 			}
-			self.focus_current();
+			let color = if self.focus == Focus::Sidebar {
+				self.ctx.theme.accent
+			} else {
+				self.ctx.theme.border
+			};
+			let _ = self.ui.set_prop("git-separator", Prop::Fg, color);
 		}
 		let routed = self
 			.ui
@@ -515,7 +539,7 @@ impl GitWorkbench {
 		let previous_target = self.current_sidebar_target().cloned();
 		let previous_selected = self.selected.clone();
 		self.snapshot = snapshot;
-		self.sidebar_rows = sidebar_rows(&self.snapshot, self.tree, &self.collapsed, &self.ctx);
+		self.sidebar_rows = sidebar_rows(&self.snapshot, self.tree, &self.ctx);
 		if let Some(target) = previous_target {
 			let key = target.key();
 			if let Some(index) = self
@@ -524,8 +548,8 @@ impl GitWorkbench {
 				.position(|row| row.target.key() == key)
 			{
 				self.sidebar_selected = index;
-			} else if let Some(index) = nearest_survivor(&previous_rows, &self.sidebar_rows, &key) {
-				self.sidebar_selected = index;
+			} else if let Some(survivor) = nearest_survivor(&previous_rows, &self.sidebar_rows, &key) {
+				self.set_sidebar_index_for_key(survivor.as_str());
 			}
 		}
 		self.selected = previous_selected
@@ -543,6 +567,8 @@ impl GitWorkbench {
 		let changed = self.selected != previous_selected;
 		if changed {
 			self.contents = None;
+			self.streaming = false;
+			self.load_finished = true;
 			self.install_document();
 		}
 		self.rebuild();
@@ -585,28 +611,43 @@ impl GitWorkbench {
 		if self.editing() {
 			return self.handle_editor_key(key);
 		}
-		match key {
-			Key::Up | Key::Char('k') => self.move_sidebar_event(-1),
-			Key::Down | Key::Char('j') => self.move_sidebar_event(1),
-			Key::PageUp => self.move_sidebar_event(-(isize::try_from(self.height.saturating_sub(6).max(1)).unwrap_or(isize::MAX))),
-			Key::PageDown => {
-				self.move_sidebar_event(isize::try_from(self.height.saturating_sub(6).max(1)).unwrap_or(isize::MAX))
-			},
-			Key::Home | Key::Char('g') => self.move_sidebar_to(0),
-			Key::End | Key::Char('G') => {
-				self.move_sidebar_to(self.sidebar_rows.len().saturating_sub(1))
-			},
-			Key::Left | Key::Char('h') => self.collapse_or_parent(),
-			Key::Right | Key::Char('l') => self.expand_or_open(),
-			Key::Char('t') => {
+		if matches!(key, Key::Space | Key::Char('s') | Key::Char('u'))
+			&& self.current_sidebar_target().is_some_and(SidebarTarget::is_tree_node)
+			&& let Some(selected) = self.tree_selected_key()
+		{
+			self.set_sidebar_index_for_key(selected.as_str());
+		}
+		let target = self.current_sidebar_target().cloned();
+		match (target, key) {
+			(_, Key::Char('t')) => {
 				self.tree = !self.tree;
 				self.rebuild();
 				GitWorkbenchEvent::Consumed
 			},
-			Key::Enter => self.activate_sidebar(false),
-			Key::Space => self.activate_sidebar(true),
-			Key::Char('s') => self.explicit_sidebar_stage(true),
-			Key::Char('u') => self.explicit_sidebar_stage(false),
+			(Some(SidebarTarget::Amend), Key::Up | Key::Char('k')) => self.focus_tree(),
+			(Some(SidebarTarget::Amend), Key::Down | Key::Char('j')) => {
+				self.select_target_kind(SidebarTarget::Summary);
+				GitWorkbenchEvent::Consumed
+			},
+			(Some(SidebarTarget::Amend), Key::Enter | Key::Space) => self.toggle_amend(),
+			(Some(SidebarTarget::Commit), Key::Up | Key::Char('k')) => {
+				self.select_target_kind(SidebarTarget::Description);
+				GitWorkbenchEvent::Consumed
+			},
+			(Some(SidebarTarget::Commit), Key::Enter | Key::Space) => self.submit_commit(),
+			(Some(SidebarTarget::ViewStyle), _) => self.route_sidebar_tree_key(key),
+			(Some(target), Key::Space)
+				if matches!(target, SidebarTarget::File { .. } | SidebarTarget::Directory { .. }) =>
+			{
+				self.activate_sidebar(true)
+			},
+			(Some(target), Key::Char('s')) if target.is_tree_node() => {
+				self.explicit_sidebar_stage(true)
+			},
+			(Some(target), Key::Char('u')) if target.is_tree_node() => {
+				self.explicit_sidebar_stage(false)
+			},
+			(Some(target), _) if target.is_tree_node() => self.route_sidebar_tree_key(key),
 			_ => {
 				let event = self.ui.handle_key(key);
 				self.sync_control_values();
@@ -617,15 +658,21 @@ impl GitWorkbench {
 
 	fn handle_editor_key(&mut self, key: Key) -> GitWorkbenchEvent {
 		match (self.current_sidebar_target().cloned(), key) {
-			(Some(SidebarTarget::Summary), Key::Up) => return self.move_sidebar_event(-1),
+			(Some(SidebarTarget::Summary), Key::Up) => {
+				self.select_target_kind(SidebarTarget::Amend);
+				return GitWorkbenchEvent::Consumed;
+			},
 			(Some(SidebarTarget::Summary), Key::Down | Key::Enter) => {
-				return self.move_sidebar_event(1);
+				self.select_target_kind(SidebarTarget::Description);
+				return GitWorkbenchEvent::Consumed;
 			},
 			(Some(SidebarTarget::Description), Key::Up) if self.editor_on_first_line() => {
-				return self.move_sidebar_event(-1);
+				self.select_target_kind(SidebarTarget::Summary);
+				return GitWorkbenchEvent::Consumed;
 			},
 			(Some(SidebarTarget::Description), Key::Down) if self.editor_on_last_line() => {
-				return self.move_sidebar_event(1);
+				self.select_target_kind(SidebarTarget::Commit);
+				return GitWorkbenchEvent::Consumed;
 			},
 			_ => {},
 		}
@@ -639,21 +686,15 @@ impl GitWorkbench {
 			return GitWorkbenchEvent::Consumed;
 		};
 		match target {
-			SidebarTarget::StageAll => GitWorkbenchEvent::Intent(GitIntent::StageFile(None)),
-			SidebarTarget::UnstageAll => GitWorkbenchEvent::Intent(GitIntent::UnstageFile(None)),
 			SidebarTarget::Directory { area, path, .. } if stage => self.stage_target(area, path),
-			SidebarTarget::Directory { area, path, .. } => {
-				let key = directory_key(area, path.as_str());
-				if !self.collapsed.remove(&key) {
-					self.collapsed.insert(key);
-				}
-				self.rebuild();
-				GitWorkbenchEvent::Consumed
-			},
+			SidebarTarget::Directory { .. } => GitWorkbenchEvent::Consumed,
 			SidebarTarget::File { area, path, .. } if stage => self.stage_target(area, path),
 			SidebarTarget::File { .. } => {
 				self.focus = Focus::Diff;
 				self.focus_current();
+				GitWorkbenchEvent::Consumed
+			},
+			SidebarTarget::ViewStyle | SidebarTarget::StageAll | SidebarTarget::UnstageAll => {
 				GitWorkbenchEvent::Consumed
 			},
 			SidebarTarget::Amend => self.toggle_amend(),
@@ -742,6 +783,9 @@ impl GitWorkbench {
 	}
 
 	fn confirm_discard(&mut self, target: DiffTarget) -> GitWorkbenchEvent {
+		if self.streaming {
+			return GitWorkbenchEvent::Consumed;
+		}
 		if target == DiffTarget::File {
 			return GitWorkbenchEvent::Consumed;
 		}
@@ -769,6 +813,35 @@ impl GitWorkbench {
 
 	fn route_ui(&mut self, event: UiEvent) -> GitWorkbenchEvent {
 		match event {
+			UiEvent::TreeActivated { id, key } if id.as_str() == SIDEBAR_ID => {
+				let selected = self.select_tree_key(key.as_str());
+				if matches!(self.current_sidebar_target(), Some(SidebarTarget::File { .. })) {
+					self.focus = Focus::Diff;
+					self.focus_current();
+				}
+				selected
+			},
+			UiEvent::TreeToggled { id, key, expanded } if id.as_str() == SIDEBAR_ID => {
+				self.set_sidebar_index_for_key(key.as_str());
+				if let Some(expanded) = expanded {
+					if expanded {
+						self.collapsed.remove(&key);
+					} else {
+						self.collapsed.insert(key);
+					}
+					GitWorkbenchEvent::Consumed
+				} else {
+					self.activate_sidebar(true)
+				}
+			},
+			UiEvent::TreeAction { id, key, action } if id.as_str() == SIDEBAR_ID => {
+				self.set_sidebar_index_for_key(key.as_str());
+				match action.as_str() {
+					"Stage All" => GitWorkbenchEvent::Intent(GitIntent::StageFile(None)),
+					"Unstage All" => GitWorkbenchEvent::Intent(GitIntent::UnstageFile(None)),
+					_ => GitWorkbenchEvent::Consumed,
+				}
+			},
 			UiEvent::DiffAction { action: DiffActionKind::Discard, target, .. } => {
 				self.confirm_discard(target)
 			},
@@ -799,6 +872,9 @@ impl GitWorkbench {
 	}
 
 	fn map_diff_action(&mut self, action: DiffActionKind, target: DiffTarget) -> GitWorkbenchEvent {
+		if self.streaming && target != DiffTarget::File {
+			return GitWorkbenchEvent::Consumed;
+		}
 		let Some((area, path)) = self.selected.clone() else {
 			return GitWorkbenchEvent::Consumed;
 		};
@@ -844,30 +920,8 @@ impl GitWorkbench {
 	}
 
 	fn activate_chrome(&mut self, id: &str) -> GitWorkbenchEvent {
-		if let Some(index) = id
-			.strip_prefix("git-sidebar-row-")
-			.and_then(|index| index.parse::<usize>().ok())
-		{
-			let was_selected = index == self.sidebar_selected;
-			if let Some(intent) = self.select_sidebar(index) {
-				return GitWorkbenchEvent::Intent(intent);
-			}
-			return if was_selected
-				&& matches!(self.current_sidebar_target(), Some(SidebarTarget::File { .. }))
-			{
-				self.activate_sidebar(true)
-			} else if matches!(self.current_sidebar_target(), Some(SidebarTarget::Directory { .. })) {
-				self.activate_sidebar(false)
-			} else if was_selected {
-				self.activate_sidebar(false)
-			} else {
-				GitWorkbenchEvent::Consumed
-			};
-		}
 		match id {
 			"git-close" => GitWorkbenchEvent::Close,
-			"git-stage-all" => GitWorkbenchEvent::Intent(GitIntent::StageFile(None)),
-			"git-unstage-all" => GitWorkbenchEvent::Intent(GitIntent::UnstageFile(None)),
 			"git-stage-file" => self
 				.selected
 				.as_ref()
@@ -909,7 +963,9 @@ impl GitWorkbench {
 		};
 		self.status =
 			Some((Str::new_static("Whitespace mode changed"), self.ctx.theme.muted, Instant::now()));
-		self.install_document();
+		if !self.streaming {
+			self.install_document();
+		}
 		self.rebuild();
 		GitWorkbenchEvent::Consumed
 	}
@@ -948,66 +1004,17 @@ impl GitWorkbench {
 		GitWorkbenchEvent::Consumed
 	}
 
-	fn collapse_or_parent(&mut self) -> GitWorkbenchEvent {
-		let Some(target) = self.current_sidebar_target().cloned() else {
-			return GitWorkbenchEvent::Consumed;
-		};
-		let is_directory = matches!(&target, SidebarTarget::Directory { .. });
-		let (area, path, depth) = match target {
-			SidebarTarget::Directory { area, path, depth } => (area, path, depth),
-			SidebarTarget::File { area, path, depth } => (area, path, depth),
-			_ => return GitWorkbenchEvent::Consumed,
-		};
-		if is_directory {
-			let key = directory_key(area, path.as_str());
-			if !self.collapsed.contains(&key) {
-				self.collapsed.insert(key);
-				self.rebuild();
-				return GitWorkbenchEvent::Consumed;
-			}
-		}
-		for index in (0..self.sidebar_selected).rev() {
-			let candidate = &self.sidebar_rows[index].target;
-			if !candidate.is_file_or_directory() {
-				break;
-			}
-			if matches!(candidate, SidebarTarget::Directory { area: candidate_area, .. } if *candidate_area == area)
-				&& candidate
-					.depth()
-					.is_some_and(|candidate_depth| candidate_depth < depth)
-			{
-				return self.move_sidebar_to(index);
-			}
-		}
-		GitWorkbenchEvent::Consumed
-	}
-
-	fn expand_or_open(&mut self) -> GitWorkbenchEvent {
-		let Some(target) = self.current_sidebar_target().cloned() else {
-			return GitWorkbenchEvent::Consumed;
-		};
-		match target {
-			SidebarTarget::Directory { area, path, .. } => {
-				let key = directory_key(area, path.as_str());
-				if self.collapsed.remove(&key) {
-					self.rebuild();
-					GitWorkbenchEvent::Consumed
-				} else {
-					self.move_sidebar_event(1)
-				}
-			},
-			SidebarTarget::File { .. } => {
-				self.focus = Focus::Diff;
-				self.focus_current();
-				GitWorkbenchEvent::Consumed
-			},
-			_ => GitWorkbenchEvent::Consumed,
-		}
-	}
-
 	fn select_sidebar(&mut self, index: usize) -> Option<GitIntent> {
 		self.sidebar_selected = index.min(self.sidebar_rows.len().saturating_sub(1));
-		self.keep_sidebar_selection_visible();
+		if let Some(key) = self
+			.current_sidebar_target()
+			.filter(|target| target.is_tree_node())
+			.map(SidebarTarget::key)
+		{
+			let _ = self
+				.ui
+				.with_component_mut::<Tree, _>(SIDEBAR_ID, |tree| tree.select_key(key.as_str()));
+		}
 		let next = self
 			.current_sidebar_target()
 			.and_then(|target| match target {
@@ -1027,21 +1034,81 @@ impl GitWorkbench {
 		None
 	}
 
-	fn move_sidebar_event(&mut self, delta: isize) -> GitWorkbenchEvent {
-		let index = self
-			.sidebar_selected
-			.saturating_add_signed(delta)
-			.min(self.sidebar_rows.len().saturating_sub(1));
-		self.move_sidebar_to(index)
+	fn set_sidebar_index_for_key(&mut self, key: &str) -> bool {
+		let Some(index) = self
+			.sidebar_rows
+			.iter()
+			.position(|row| row.target.key().as_str() == key)
+		else {
+			return false;
+		};
+		self.sidebar_selected = index;
+		true
 	}
 
-	fn move_sidebar_to(&mut self, index: usize) -> GitWorkbenchEvent {
-		let previous = self.sidebar_selected;
-		if let Some(intent) = self.select_sidebar(index) {
-			return GitWorkbenchEvent::Intent(intent);
+	fn select_tree_key(&mut self, key: &str) -> GitWorkbenchEvent {
+		if !self.set_sidebar_index_for_key(key) {
+			return GitWorkbenchEvent::Consumed;
 		}
-		if self.sidebar_selected != previous {
-			self.rebuild();
+		self
+			.select_sidebar(self.sidebar_selected)
+			.map_or(GitWorkbenchEvent::Consumed, GitWorkbenchEvent::Intent)
+	}
+
+	fn tree_selected_key(&self) -> Option<Str> {
+		self
+			.ui
+			.values()
+			.get(SIDEBAR_ID)
+			.and_then(serde_json::Value::as_str)
+			.map(Str::new)
+	}
+
+	fn route_sidebar_tree_key(&mut self, key: Key) -> GitWorkbenchEvent {
+		let before = self.tree_selected_key();
+		let previous = self.current_sidebar_target().cloned();
+		let event = self.ui.handle_key(key);
+		let tree_event = matches!(
+			event,
+			UiEvent::TreeActivated { .. }
+				| UiEvent::TreeToggled { .. }
+				| UiEvent::TreeAction { .. }
+		);
+		self.sync_control_values();
+		let routed = self.route_ui(event);
+		if tree_event || !matches!(routed, GitWorkbenchEvent::Consumed) {
+			return routed;
+		}
+		let after = self.tree_selected_key();
+		if after != before {
+			return after.as_deref().map_or(GitWorkbenchEvent::Consumed, |selected| {
+				self.select_tree_key(selected)
+			});
+		}
+		match (previous, key) {
+			(Some(SidebarTarget::ViewStyle), Key::Down) => self.focus_tree(),
+			(Some(target), Key::Up) if target.is_tree_node() => {
+				self.select_target_kind(SidebarTarget::ViewStyle);
+				GitWorkbenchEvent::Consumed
+			},
+			(Some(target), Key::Down) if target.is_tree_node() && !self.is_commit_view() => {
+				self.select_target_kind(SidebarTarget::Amend);
+				GitWorkbenchEvent::Consumed
+			},
+			_ => routed,
+		}
+	}
+
+	fn focus_tree(&mut self) -> GitWorkbenchEvent {
+		let selected = self.tree_selected_key();
+		if let Some(key) = &selected {
+			self.set_sidebar_index_for_key(key.as_str());
+		}
+		let _ = self.ui.focus_id(SIDEBAR_ID);
+		if let Some(key) = selected {
+			let _ = self
+				.ui
+				.with_component_mut::<Tree, _>(SIDEBAR_ID, |tree| tree.select_key(key.as_str()));
 		}
 		GitWorkbenchEvent::Consumed
 	}
@@ -1061,7 +1128,6 @@ impl GitWorkbench {
 		{
 			self.sidebar_selected = index;
 		}
-		self.keep_sidebar_selection_visible();
 		self.focus_current();
 	}
 
@@ -1073,19 +1139,30 @@ impl GitWorkbench {
 	}
 
 	fn focus_current(&mut self) {
+		let selected_tree_key = self
+			.current_sidebar_target()
+			.filter(|target| target.is_tree_node())
+			.map(SidebarTarget::key);
 		let id = match self.focus {
 			Focus::Diff => DIFF_ID.to_str(),
 			Focus::Sidebar => match self.current_sidebar_target() {
-				Some(SidebarTarget::StageAll) => "git-stage-all".to_str(),
-				Some(SidebarTarget::UnstageAll) => "git-unstage-all".to_str(),
+				Some(SidebarTarget::ViewStyle) => VIEW_STYLE_ID.to_str(),
+				Some(SidebarTarget::StageAll | SidebarTarget::UnstageAll) => SIDEBAR_ID.to_str(),
 				Some(SidebarTarget::Amend) => AMEND_ID.to_str(),
 				Some(SidebarTarget::Summary) => SUMMARY_ID.to_str(),
 				Some(SidebarTarget::Description) => DESCRIPTION_ID.to_str(),
 				Some(SidebarTarget::Commit) => COMMIT_ID.to_str(),
-				_ => sf!("git-sidebar-row-{}", self.sidebar_selected),
+				_ => SIDEBAR_ID.to_str(),
 			},
 		};
 		let _ = self.ui.focus_id(id.as_str());
+		if self.focus == Focus::Sidebar
+			&& let Some(key) = selected_tree_key
+		{
+			let _ = self
+				.ui
+				.with_component_mut::<Tree, _>(SIDEBAR_ID, |tree| tree.select_key(key.as_str()));
+		}
 		let color = if self.focus == Focus::Sidebar {
 			self.ctx.theme.accent
 		} else {
@@ -1147,74 +1224,6 @@ impl GitWorkbench {
 			self.select_target_kind(target);
 		}
 	}
-	fn sidebar_visible_rows(&self, description: &str) -> usize {
-		let content_rows = self.height.saturating_sub(2).max(1);
-		if self.is_commit_view() {
-			let sidebar_width = (self.width * 3 / 10).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-			let Some(head) = &self.snapshot.head else {
-				return 1;
-			};
-			let text_rows = |text: &str| {
-				cell_width(text)
-					.div_ceil(sidebar_width.max(1))
-					.max(1)
-			};
-			let body_rows = head
-				.body
-				.lines()
-				.take(8)
-				.fold(0_u16, |rows, line| rows.saturating_add(text_rows(line)));
-			let metadata_rows = text_rows(head.subject.as_str())
-				.saturating_add(9)
-				.saturating_add(u16::from(body_rows > 0).saturating_add(body_rows))
-				.saturating_add(u16::from(!head.parents.is_empty()));
-			return usize::from(content_rows.saturating_sub(metadata_rows).max(1));
-		}
-		let description_rows =
-			u16::try_from(description.lines().count().clamp(1, 5)).unwrap_or(5);
-		usize::from(content_rows.saturating_sub(7 + description_rows).max(1))
-	}
-
-	fn clamp_sidebar_scroll(&mut self, visible: usize) {
-		self.sidebar_scroll_top =
-			clamp_sidebar_scroll(self.sidebar_scroll_top, self.sidebar_file_row_count(), visible);
-	}
-
-	fn sidebar_file_row_count(&self) -> usize {
-		if self.is_commit_view() {
-			self.sidebar_rows.len()
-		} else {
-			self.sidebar_rows.len().saturating_sub(4)
-		}
-	}
-
-	fn keep_sidebar_selection_visible(&mut self) {
-		let file_rows = self.sidebar_file_row_count();
-		if self.sidebar_selected >= file_rows {
-			return;
-		}
-		let (_, description) = self.form_values();
-		let visible = self.sidebar_visible_rows(description.as_str());
-		self.sidebar_scroll_top = chase_sidebar_selection(
-			self.sidebar_scroll_top,
-			self.sidebar_selected,
-			file_rows,
-			visible,
-		);
-	}
-
-	fn scroll_sidebar(&mut self, delta: isize) {
-		let (_, description) = self.form_values();
-		let visible = self.sidebar_visible_rows(description.as_str());
-		let previous = self.sidebar_scroll_top;
-		self.sidebar_scroll_top = self.sidebar_scroll_top.saturating_add_signed(delta);
-		self.clamp_sidebar_scroll(visible);
-		if self.sidebar_scroll_top == previous {
-			return;
-		}
-		self.rebuild_window();
-	}
-
 	fn clear_diff_selection(&mut self) -> bool {
 		self
 			.ui
@@ -1290,7 +1299,7 @@ impl GitWorkbench {
 	}
 
 	fn sync_view_value(&mut self) {
-		self.rebuild_window();
+		self.rebuild();
 	}
 
 	fn sync_toggle_props(&mut self) {
@@ -1310,12 +1319,26 @@ impl GitWorkbench {
 		let _ = self.ui.with_component_mut::<DiffPane, _>(DIFF_ID, action);
 	}
 
+	fn begin_stream(&mut self) {
+		let Some((_, path)) = self.selected.clone() else {
+			return;
+		};
+		let options = DiffBuildOptions { whitespace: self.whitespace, language: None };
+		self.with_pane(|pane| {
+			pane.set_patch_target(None);
+			pane.begin_stream(path, &options);
+		});
+	}
+
 	fn request_selected_load(&mut self) -> Option<GitIntent> {
 		let (area, path) = self.selected.clone()?;
 		let orig_path = find_file(&self.snapshot, area, path.as_str())?
 			.orig_path
 			.clone();
 		self.load_seq = self.load_seq.wrapping_add(1);
+		self.streaming = false;
+		self.load_finished = false;
+		self.contents = None;
 		self.install_document();
 		Some(GitIntent::Load { area, path, orig_path, seq: self.load_seq })
 	}
@@ -1338,6 +1361,14 @@ impl GitWorkbench {
 	}
 
 	fn install_document(&mut self) {
+		self.install_document_inner(false);
+	}
+
+	fn finish_document(&mut self) {
+		self.install_document_inner(true);
+	}
+
+	fn install_document_inner(&mut self, finish_stream: bool) {
 		let contents = self.contents.clone();
 		let loaded = contents.is_some();
 		let selected = self.selected.clone();
@@ -1372,7 +1403,11 @@ impl GitWorkbench {
 						path.as_str(),
 						&options,
 					);
-					pane.set_document(Some(document), DiffPaneState::Ready);
+					if finish_stream {
+						pane.finish_stream(document);
+					} else {
+						pane.set_document(Some(document), DiffPaneState::Ready);
+					}
 					if pending_last {
 						while pane.jump_hunk(1) {}
 					}
@@ -1390,41 +1425,47 @@ impl GitWorkbench {
 	}
 
 	fn rebuild_with_form(&mut self, summary: &str, description: &str) {
+		let previous_rows = self.sidebar_rows.clone();
 		let previous_target = self.current_sidebar_target().cloned();
 		self.rebuild_sidebar_rows();
 		if let Some(target) = previous_target {
+			let key = target.key();
 			if let Some(index) = self
 				.sidebar_rows
 				.iter()
-				.position(|row| row.target.key() == target.key())
+				.position(|row| row.target.key() == key)
 			{
 				self.sidebar_selected = index;
+			} else if let Some(survivor) = nearest_survivor(&previous_rows, &self.sidebar_rows, &key) {
+				self.set_sidebar_index_for_key(survivor.as_str());
 			}
 		}
 		self.sidebar_selected = self
 			.sidebar_selected
 			.min(self.sidebar_rows.len().saturating_sub(1));
-		let file_rows = self.sidebar_file_row_count();
-		if self.sidebar_selected < file_rows {
-			self.sidebar_scroll_top = chase_sidebar_selection(
-				self.sidebar_scroll_top,
-				self.sidebar_selected,
-				file_rows,
-				self.sidebar_visible_rows(description),
-			);
-		}
 		self.rebuild_retained(summary, description);
-	}
-
-	fn rebuild_window(&mut self) {
-		let (summary, description) = self.form_values();
-		self.rebuild_retained(summary.as_str(), description.as_str());
 	}
 
 	fn rebuild_retained(&mut self, summary: &str, description: &str) {
 		let old_mode = self.view_mode;
 		let old_wrap = self.wrap;
-		self.clamp_sidebar_scroll(self.sidebar_visible_rows(description));
+		let (tree_selected, tree_scroll_top) = self
+			.ui
+			.with_component_mut::<Tree, _>(SIDEBAR_ID, |tree| {
+				(tree.selected_key().map(Str::new), tree.scroll_top())
+			})
+			.unwrap_or_default();
+		let fallback = self
+			.current_sidebar_target()
+			.filter(|target| target.is_tree_node())
+			.map(SidebarTarget::key);
+		let tree_selected = fallback.or_else(|| {
+			tree_selected.filter(|key| {
+				self.sidebar_rows
+					.iter()
+					.any(|row| row.target.key() == *key)
+			})
+		});
 		let content_rows = self.height.saturating_sub(2).max(1);
 		let sidebar_width = (self.width * 3 / 10).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
 		let retained = self
@@ -1441,7 +1482,13 @@ impl GitWorkbench {
 			pane.toggle_wrap();
 		}
 		pane.set_patch_target(self.patch_target());
-		let sidebar = self.sidebar_component(sidebar_width, summary, description);
+		let sidebar = self.sidebar_component(
+			sidebar_width,
+			summary,
+			description,
+			tree_selected.as_deref(),
+			tree_scroll_top,
+		);
 		let root = self.root_component(pane, sidebar, sidebar_width, content_rows);
 		self.ui = Ui::from_root(root, self.width.max(1), self.ctx.clone());
 		self.focus_current();
@@ -1451,6 +1498,9 @@ impl GitWorkbench {
 	}
 
 	fn patch_target(&self) -> Option<DiffPatchTarget> {
+		if self.streaming {
+			return None;
+		}
 		let (area, path) = self.selected.as_ref()?;
 		let file = find_file(&self.snapshot, *area, path.as_str())?;
 		match area {
@@ -1462,6 +1512,11 @@ impl GitWorkbench {
 			GitArea::Staged => Some(DiffPatchTarget::Unstage),
 			GitArea::Unstaged | GitArea::Commit => None,
 		}
+	}
+
+	fn sync_patch_target(&mut self) {
+		let target = self.patch_target();
+		self.with_pane(|pane| pane.set_patch_target(target));
 	}
 
 	pub(super) fn current_counts(&self) -> (u64, u64) {
@@ -1506,51 +1561,34 @@ fn nearest_survivor(
 	previous: &[SidebarRow],
 	current: &[SidebarRow],
 	missing: &Str,
-) -> Option<usize> {
+) -> Option<Str> {
 	let index = previous
 		.iter()
 		.position(|row| row.target.key() == *missing)?;
-	let current_index = |target: &SidebarTarget| {
+	let current_key = |target: &SidebarTarget| {
 		if !target.is_file_or_directory() {
 			return None;
 		}
 		let key = target.key();
-		current.iter().position(|row| row.target.key() == key)
+		current
+			.iter()
+			.any(|row| row.target.key() == key)
+			.then_some(key)
 	};
 	for row in &previous[index + 1..] {
-		if let Some(index) = current_index(&row.target) {
-			return Some(index);
+		if let Some(key) = current_key(&row.target) {
+			return Some(key);
 		}
 	}
 	for row in previous[..index].iter().rev() {
-		if let Some(index) = current_index(&row.target) {
-			return Some(index);
+		if let Some(key) = current_key(&row.target) {
+			return Some(key);
 		}
 	}
 	current
 		.iter()
-		.position(|row| matches!(row.target, SidebarTarget::File { .. }))
-}
-
-fn clamp_sidebar_scroll(top: usize, len: usize, visible: usize) -> usize {
-	top.min(len.saturating_sub(visible.max(1)))
-}
-
-fn chase_sidebar_selection(
-	top: usize,
-	selected: usize,
-	len: usize,
-	visible: usize,
-) -> usize {
-	let visible = visible.max(1);
-	let chased = if selected < top {
-		selected
-	} else if selected >= top.saturating_add(visible) {
-		selected.saturating_sub(visible - 1)
-	} else {
-		top
-	};
-	clamp_sidebar_scroll(chased, len, visible)
+		.find(|row| matches!(row.target, SidebarTarget::File { .. }))
+		.map(|row| row.target.key())
 }
 
 fn first_file(snapshot: &GitSnapshot) -> Option<&GitFileRow> {
@@ -1597,17 +1635,17 @@ pub(super) fn short_sha(sha: &Str) -> Str {
 #[cfg(test)]
 mod tests {
 	use omp_core::{Str, sf};
-	use omp_tui::{DiffActionKind, DiffTarget, Key, Mouse, Size, UiContext, ViewMode, cell_width};
+	use omp_tui::{
+		Component as _, DiffActionKind, DiffTarget, Key, Mouse, Size, UiContext, ViewMode,
+		components::Tree,
+		test_support::frame_row_text,
+	};
 
 	use super::{
 		Focus, GitArea, GitChangeKind, GitCommitInfo, GitFileContents, GitFileRow, GitIntent,
 		GitPatchOp, GitSnapshot, GitUpdate, GitWorkbench, GitWorkbenchEvent, SidebarTarget,
-		chase_sidebar_selection, clamp_sidebar_scroll,
 	};
-	use super::{
-		commit_view::identicon_lines,
-		sidebar::{fit_sidebar_path, sidebar_rows},
-	};
+	use super::commit_view::identicon_lines;
 
 	fn file(path: &'static str, area: GitArea) -> GitFileRow {
 		GitFileRow {
@@ -1659,11 +1697,111 @@ mod tests {
 		}
 	}
 
+	fn pane_document(workbench: &mut GitWorkbench) -> omp_tui::DiffDocument {
+		workbench
+			.ui
+			.with_component_mut::<omp_tui::DiffPane, _>(super::diff::DIFF_ID, |pane| {
+				pane.document().cloned()
+			})
+			.flatten()
+			.expect("diff document")
+	}
+
+	#[test]
+	fn streamed_chunks_finish_as_the_one_shot_document() {
+		let final_contents = contents("same\nold\n", "same\nnew\n");
+		let mut streamed = GitWorkbench::open(dirty(), &UiContext::default());
+		let GitIntent::Load { seq, .. } = streamed.initial_intent().expect("load") else {
+			panic!("load")
+		};
+		assert_eq!(
+			streamed.apply(GitUpdate::ContentsChunk {
+				seq,
+				old_lines: vec![Str::new_static("same"), Str::new_static("old")],
+				new_lines: vec![Str::new_static("same")],
+			}),
+			None
+		);
+		assert!(streamed.streaming);
+		assert_eq!(
+			streamed.apply(GitUpdate::ContentsChunk {
+				seq,
+				old_lines: Vec::new(),
+				new_lines: vec![Str::new_static("new")],
+			}),
+			None
+		);
+		let _ = streamed.apply(GitUpdate::Contents {
+			seq,
+			contents: final_contents.clone(),
+		});
+		assert!(!streamed.streaming);
+		let streamed_document = pane_document(&mut streamed);
+
+		let _ = streamed.apply(GitUpdate::ContentsChunk {
+			seq,
+			old_lines: vec![Str::new_static("late")],
+			new_lines: vec![Str::new_static("late")],
+		});
+		assert_eq!(streamed_document, pane_document(&mut streamed));
+
+		let mut one_shot = GitWorkbench::open(dirty(), &UiContext::default());
+		let GitIntent::Load { seq, .. } = one_shot.initial_intent().expect("load") else {
+			panic!("load")
+		};
+		let _ = one_shot.apply(GitUpdate::Contents { seq, contents: final_contents });
+		assert_eq!(streamed_document, pane_document(&mut one_shot));
+	}
+
+	#[test]
+	fn stale_stream_chunk_is_ignored() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		let GitIntent::Load { seq, .. } = workbench.initial_intent().expect("load") else {
+			panic!("load")
+		};
+		assert_eq!(
+			workbench.apply(GitUpdate::ContentsChunk {
+				seq: seq.wrapping_add(1),
+				old_lines: vec![Str::new_static("stale")],
+				new_lines: vec![Str::new_static("stale")],
+			}),
+			None
+		);
+		assert!(!workbench.streaming);
+		assert!(workbench.contents.is_none());
+	}
+
+	#[test]
+	fn streamed_document_gates_line_patch_actions_until_finish() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		let GitIntent::Load { seq, .. } = workbench.initial_intent().expect("load") else {
+			panic!("load")
+		};
+		let _ = workbench.apply(GitUpdate::ContentsChunk {
+			seq,
+			old_lines: vec![Str::new_static("old")],
+			new_lines: vec![Str::new_static("new")],
+		});
+		workbench.focus = Focus::Diff;
+		let _ = workbench.route_diff_navigation(Key::SelectDown);
+		assert_eq!(workbench.handle_key(Key::Char('s')), GitWorkbenchEvent::Consumed);
+		let _ = workbench.apply(GitUpdate::Contents {
+			seq,
+			contents: contents("old\n", "new\n"),
+		});
+		let _ = workbench.route_diff_navigation(Key::SelectDown);
+		assert!(matches!(
+			workbench.handle_key(Key::Char('s')),
+			GitWorkbenchEvent::Intent(GitIntent::ApplyLines { op: GitPatchOp::Stage, .. })
+		));
+	}
+
 	#[test]
 	fn starts_in_sidebar_and_enter_opens_while_space_stages() {
 		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
 		assert_eq!(workbench.focus, Focus::Sidebar);
-		workbench.sidebar_selected = workbench.first_file_target().unwrap();
+		let file = workbench.first_file_target().unwrap();
+		let _ = workbench.select_sidebar(file);
 		assert_eq!(workbench.handle_key(Key::Enter), GitWorkbenchEvent::Consumed);
 		assert_eq!(workbench.focus, Focus::Diff);
 		workbench.focus = Focus::Sidebar;
@@ -1691,7 +1829,8 @@ mod tests {
 	#[test]
 	fn discard_is_scoped_and_identity_confirmed() {
 		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
-		workbench.sidebar_selected = workbench.first_file_target().unwrap();
+		let file = workbench.first_file_target().unwrap();
+		let _ = workbench.select_sidebar(file);
 		assert_eq!(workbench.handle_key(Key::Enter), GitWorkbenchEvent::Consumed);
 		let GitIntent::Load { seq, .. } = workbench.initial_intent().unwrap() else {
 			panic!("load")
@@ -1726,7 +1865,7 @@ mod tests {
 				|row| matches!(&row.target, SidebarTarget::File { path, .. } if path.as_str() == "a/one.rs"),
 			)
 			.unwrap();
-		workbench.sidebar_selected = first;
+		let _ = workbench.select_sidebar(first);
 		workbench.selected = Some((GitArea::Unstaged, Str::new_static("a/one.rs")));
 		let mut next = dirty();
 		next.unstaged.remove(0);
@@ -1734,16 +1873,42 @@ mod tests {
 		assert!(
 			matches!(workbench.current_sidebar_target(), Some(SidebarTarget::File { path, .. }) if path.as_str() == "a/two.rs")
 		);
+		assert!(
+			workbench
+				.tree_selected_key()
+				.is_some_and(|key| key.as_str() == "file:Unstaged:a/two.rs")
+		);
 	}
 
 	#[test]
-	fn sidebar_window_chases_selection_and_clamps_at_both_ends() {
-		assert_eq!(chase_sidebar_selection(10, 5, 100, 8), 5);
-		assert_eq!(chase_sidebar_selection(5, 12, 100, 8), 5);
-		assert_eq!(chase_sidebar_selection(5, 13, 100, 8), 6);
-		assert_eq!(chase_sidebar_selection(0, 99, 100, 8), 92);
-		assert_eq!(clamp_sidebar_scroll(90, 10, 8), 2);
-		assert_eq!(clamp_sidebar_scroll(3, 4, 8), 0);
+	fn sidebar_tree_chases_selection_inside_its_visible_window() {
+		let mut snapshot = dirty();
+		snapshot.unstaged.extend((0..40).map(|index| GitFileRow {
+			path:       sf!("bulk/file-{index:02}.rs"),
+			orig_path:  None,
+			kind:       GitChangeKind::Modified,
+			area:       GitArea::Unstaged,
+			additions:  Some(2),
+			deletions:  Some(1),
+		}));
+		let mut workbench = GitWorkbench::open(snapshot, &UiContext::default());
+		let _ = workbench.layer(Size::new(80, 12));
+		assert!(matches!(
+			workbench.handle_key(Key::End),
+			GitWorkbenchEvent::Intent(GitIntent::Load { .. })
+		));
+		let (selected, scroll_top) = workbench
+			.ui
+			.with_component_mut::<Tree, _>(super::sidebar::SIDEBAR_ID, |tree| {
+				(tree.selected_key().map(str::to_owned), tree.scroll_top())
+			})
+			.expect("tree");
+		assert!(selected.is_some());
+		assert!(scroll_top > 0);
+		assert_eq!(workbench.handle_key(Key::Down), GitWorkbenchEvent::Consumed);
+		assert!(matches!(workbench.current_sidebar_target(), Some(SidebarTarget::Amend)));
+		assert_eq!(workbench.handle_key(Key::Up), GitWorkbenchEvent::Consumed);
+		assert!(workbench.current_sidebar_target().is_some_and(SidebarTarget::is_tree_node));
 	}
 
 	#[test]
@@ -1760,20 +1925,27 @@ mod tests {
 		let mut workbench = GitWorkbench::open(snapshot, &UiContext::default());
 		let viewport = Size::new(80, 12);
 		let _ = workbench.layer(viewport);
+		let slot = workbench
+			.ui
+			.with_component_mut::<Tree, _>(super::sidebar::SIDEBAR_ID, |tree| tree.slot())
+			.expect("tree");
 		workbench.focus = Focus::Diff;
 		workbench.focus_current();
-		assert_eq!(
-			workbench.handle_mouse(79, 4, Mouse::WheelDown, viewport),
-			GitWorkbenchEvent::Consumed
-		);
+		for _ in 0..30 {
+			assert_eq!(
+				workbench.handle_mouse(79, 6, Mouse::WheelDown, viewport),
+				GitWorkbenchEvent::Consumed
+			);
+		}
 		assert_eq!(workbench.focus, Focus::Diff);
-		assert_eq!(workbench.sidebar_scroll_top, 3);
-		assert!(
-			workbench
-				.sidebar_scroll_top
-				.saturating_add(workbench.sidebar_visible_rows(""))
-				<= workbench.sidebar_file_row_count()
-		);
+		let (after_slot, scroll_top) = workbench
+			.ui
+			.with_component_mut::<Tree, _>(super::sidebar::SIDEBAR_ID, |tree| {
+				(tree.slot(), tree.scroll_top())
+			})
+			.expect("tree");
+		assert_eq!(after_slot, slot, "wheel input must not rebuild the workbench");
+		assert!(scroll_top > 0);
 	}
 
 	#[test]
@@ -1789,22 +1961,18 @@ mod tests {
 			head:     Some(head()),
 			pinned:   false,
 		};
-		let rows = sidebar_rows(&snapshot, false, &Default::default(), &ctx);
-		let row = rows
-			.iter()
-			.find(|row| matches!(row.target, SidebarTarget::File { .. }))
-			.unwrap();
-		let width = 20;
-		let (directory, basename) = fit_sidebar_path(row, width);
-		assert!(directory.starts_with('…'));
-		assert_eq!(basename.as_str(), "important.rs");
-		let rendered_width = 1_u16
-			.saturating_add(1)
-			.saturating_add(cell_width(directory.as_str()))
-			.saturating_add(cell_width(basename.as_str()))
-			.saturating_add(2)
-			.saturating_add(2);
-		assert!(rendered_width <= width);
+		let mut workbench = GitWorkbench::open(snapshot, &ctx);
+		workbench.tree = false;
+		workbench.rebuild();
+		let viewport = Size::new(80, 18);
+		let frame = workbench.layer(viewport).frame;
+		let rendered = (0..frame.size().height)
+			.map(|row| frame_row_text(frame, row))
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(rendered.contains('…'), "{rendered}");
+		assert!(rendered.contains("important.rs"), "{rendered}");
+		assert!(rendered.contains("+2 −1"), "{rendered}");
 	}
 
 	#[test]
@@ -1922,7 +2090,7 @@ mod tests {
 	fn directory_space_batches_path_and_explicit_wrong_area_is_noop() {
 		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
 		let directory = workbench.sidebar_rows.iter().position(|row| matches!(&row.target, SidebarTarget::Directory { area: GitArea::Unstaged, path, .. } if path.as_str() == "a")).unwrap();
-		workbench.sidebar_selected = directory;
+		let _ = workbench.select_sidebar(directory);
 		assert!(
 			matches!(workbench.handle_key(Key::Space), GitWorkbenchEvent::Intent(GitIntent::StageFile(Some(path))) if path.as_str() == "a")
 		);

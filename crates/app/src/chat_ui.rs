@@ -4889,7 +4889,11 @@ where
 			} else if let Some(session) = state.git.as_ref().map(|git| git.session.clone()) {
 				let backend = backend.clone();
 				drop(tokio::spawn(async move {
-					let result = session.handle(intent).await;
+					let result = session
+						.handle_with_progress(intent, |update| {
+							send_backend(&backend, BackendEvent::Git(update));
+						})
+						.await;
 					let mut snapshot_delivered = false;
 					for update in result.updates {
 						snapshot_delivered |= matches!(&update, omp_chat_ui::git::GitUpdate::Snapshot(_));
