@@ -1,7 +1,27 @@
-# Durable campaign retry
+# Durable regime retry
 
-This extension declares a Session-scoped campaign that persists a typed `RetryState`, continues two settled turns, then emits `Force("write")` on turn three.
+This extension declares a session-scoped `@omp.regime` with typed `RetryState`. It retries two settled turns, then requires the `write` tool on the third.
 
-The declaration is sealed during FREEZE. Its state envelope is `examples.campaign-retry.state@1`, so replacing the extension-host process restores the same rung and turn count from the journal. If the schema revision changes, Core exhausts the old engagement instead of loading incompatible state.
+Core seals the declaration during FREEZE. Its state envelope is `examples.regime-retry.state@1`, so replacing the extension-host process restores the same step and turn count from the journal. An incompatible revision fails the active regime instead of loading stale state.
 
-Run it in a session, engage it with `await omp.campaigns.engage("three-turn-retry", state=RetryState())`, and settle three turns. A simultaneous core-native force is serialized through the `tool_choice` claim queue; the losing force remains queued without consuming its ladder rung.
+The handler stages effects on `ctx` and selects control through `next_`:
+
+```python
+def three_turn_retry(ctx, next_):
+    if ctx.state.value.turn < 3:
+        ctx.state.replace(ctx.state.value.incremented())
+        return next_.retry()
+
+    ctx.tool.require("write")
+    return next_.complete()
+```
+
+Start it with:
+
+```python
+await omp.regimes.start("three-turn-retry", state=RetryState())
+```
+
+A simultaneous core tool requirement is serialized through the `tool_choice` resource queue. A queued requirement does not consume a bound step until its effect commits.
+
+See [`docs/py/15-regimes.md`](../../docs/py/15-regimes.md) for middleware isolation and durability.

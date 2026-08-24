@@ -7,7 +7,7 @@ how the omp shape differs, and — load-bearing — a **Gaps** section listing e
 `omp.*` symbol the port needs that the frozen layer does not export yet.
 
 Symbols the frozen layer exports are used as-is. Symbols specified in
-`docs/py/00`–`14` but not yet frozen are imported anyway and marked with a
+`docs/py/00`–`17` but not yet frozen are imported anyway and marked with a
 `# GAP:` comment at the import site; the exercise exists to measure that
 distance.
 
@@ -16,7 +16,7 @@ distance.
 | `bash-timeout/` | `@mrclrchtr/supi-bash-timeout` | TRANSFORM hook, args mutation | `docs/py/03 §4` |
 | `permission-rules/` | `@gotgenes/pi-permission-system` | BashIR rulebook, PRECHECK/APPROVAL, durable tickets | `docs/py/05 §4.1`, `docs/py/06` |
 | `bash-guard/` | `@shinynito/pi-menshen` | BashIR REVIEW, classifier ladder, circuit breaker | `docs/py/05 §4.4`, `docs/py/06` |
-| `goal-loop/` | `@narumitw/pi-goal` | Session `@omp.campaign` at SETTLE: `Continue`/`Pass`/`Done`, journaled state, tool-driven engage | `docs/py/15 §4`, `docs/py/12` |
+| `goal-loop/` | `@narumitw/pi-goal` | Session `@omp.regime` at SETTLE: `ctx` effects + `next_` control, typed state, explicit start | `docs/py/15`, `docs/py/12` |
 | `mcp-devices/` | `pi-mcp-adapter` | MCP servers mounted as `dyn` devices | `docs/py/01` |
 | `edit-dialect/` | `pi-hashline-edit-pro` | second edit dialect `family@rev`, `lift()` | `docs/py/01`, `docs/py/02 §3` |
 | `web-fetch/` | `@mrclrchtr/supi-web` | fetch device, spill → `BlobRef` | `docs/py/02 §1` |
@@ -29,7 +29,7 @@ distance.
 | `todo-journal/` | `@xaccefy/pi-xtodo` | typed entry kinds, journal as the only truth | `docs/py/09 §2` |
 | `cache-monitor/` | `@mrclrchtr/supi-cache` | telemetry subscription, `PromptFingerprint` | `docs/py/09 §3`, `docs/py/10 §2` |
 | `schedules/` | `pi-schedule-prompt` | durable scheduler, owner principal, missed-run policy | `docs/py/12` |
-| `plan-mode/` | `@dreki-gg/pi-plan-mode` | Session regime campaign (`claims`/`binds`, ADMISSION `Deny`) + bounded decision-gate campaign | `docs/py/15 §7`, `docs/py/15 §6` |
+| `plan-mode/` | `@dreki-gg/pi-plan-mode` | Session mode regime (`owns`/`sets`, ADMISSION `reject()`) with a bounded settlement child | `docs/py/15` |
 | `rewind/` | `@ayulab/pi-rewind` | workspace snapshots, `omp.agents.rewind`, undo-snapshot invariant | `docs/py/12` |
 | `subagents/` | `pi-subagents` family (17 pkgs) | `spawn_all` waves, hard `Budget`, steer, `AgentGone`, `subtree_usage` | `docs/py/12` |
 | `usage-report/` | `@tmustier/pi-usage-extension` | `omp.sessions` usage query, statusline spend segment | `docs/py/09 §1`, `docs/py/10 §3` |
@@ -81,7 +81,7 @@ distance.
 | `side-chat/` | `pi-btw` | background side-thread agents, overlay transcript, real journals | `docs/py/12`, `docs/py/07` |
 | `fzf-actions/` | `pi-fzf` | config-driven pickers: env exec candidates, overlay select, quote-safe actions | `docs/py/07`, `docs/py/11` |
 | `esc-steer/` | `pi-esc-steer` | shortcut abort + queued-steer injection, no invented interrupts | `docs/py/03` |
-| `task-queue/` | `pi-true-queue` | hidden work queue drained by a SETTLE campaign (`Ladder`, journaled hand-out state) | `docs/py/15 §4`, `docs/py/09` |
+| `task-queue/` | `pi-true-queue` | hidden work queue drained by a bounded SETTLE regime with journaled hand-out state | `docs/py/15`, `docs/py/09` |
 | `git-changes/` | `@joyanhui/pi-ext-git-changes` | first `<diff>` markup, porcelain -z parsing, zero polling | `docs/py/07` |
 | `pulse/` | `pi-pulse` | TPS/TTFT from event fields, EMA footer, DropStats | `docs/py/10` |
 | `vision-describe/` | `@smoose/pi-vision` | vision-role completion with image parts, digest cache | `docs/py/12`, `docs/py/02` |

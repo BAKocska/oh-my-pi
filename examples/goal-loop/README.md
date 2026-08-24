@@ -1,14 +1,25 @@
+# Goal loop
+
 ## What the pi original did
 
-`@narumitw/pi-goal` registered an objective, watched turn lifecycle events, and injected follow-up messages until it considered the goal complete. It also implemented its own progress and repetition bookkeeping, which could race other continuation extensions and relied on interpreting message text.
+`@narumitw/pi-goal` registered an objective, watched turn lifecycle events, and injected follow-up messages until it considered the goal complete. It implemented private progress and repetition bookkeeping that could race other continuation extensions.
 
 ## The omp shape
 
-The soft `goal` device keeps the original `goal_set`, `goal_status`, and `goal_complete` operations and its typed Session snapshots. `goal_set` now engages the Session-scoped `goal-loop` campaign with journaled `GoalCampaignState`; `goal_complete` records completion and disengages that campaign.
+The soft `goal` device keeps `goal_set`, `goal_status`, and `goal_complete` plus typed session snapshots. `goal_set` starts the session-scoped `goal-loop` regime with journaled `GoalState`; `goal_complete` records completion and stops that regime.
 
-At `SETTLE`, the campaign vetoes stopping with `Continue(inject=...)` while the objective is unmet, returns `Pass()` to accept a transient stall without ending the Session engagement, and returns `Done()` only when the goal is complete or replaced. This is the first-class veto-the-stop skeleton from docs/py/15-campaigns.md §1, follows the `Continue` law in §2.2 and empty-fold `SETTLE` behavior in §3.3, and is the §6 `session_stop hook` porting shape. The old `agent_settled` hook, local loop return types, and manifest hook row are gone. Core's continuation ledger remains the global backstop rather than campaign-private retry bookkeeping.
+At `SETTLE`, unmet work stages context and selects retry:
 
-## Gaps
+```python
+def goal_loop(ctx, next_):
+    state = ctx.state.value
+    if state.complete:
+        return next_.complete()
 
-- The standing `Until`-bounded policy and `Interlock` described in docs/py/15-campaigns.md are not in the frozen v1 surface. This example instead keeps one Session engagement active, emits the available `Continue` verdict while work remains, accepts a transient stall with `Pass`, and terminates the engagement with the available `Done` verdict only on completion or replacement.
-- The `SETTLE` consumer currently substitutes `AutoContinue` and does not yet deliver the `Continue.inject` payload; this is a recorded agent-side gap.
+    ctx.context.append(omp.user_text(f"Continue toward: {state.objective}"))
+    return next_.retry()
+```
+
+A transient stall may return normally without ending the active regime. Core's continuation ledger remains the global backstop rather than regime-private retry bookkeeping.
+
+See [`docs/py/15-regimes.md`](../../docs/py/15-regimes.md) for fixed events, transactional effects, and durable state.
