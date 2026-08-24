@@ -2264,12 +2264,13 @@ class UsageUnit(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class UsageQuery:
-    """Request provider usage for one credential identity."""
+    """Request provider usage with one callback-scoped, redacting API key."""
 
     provider: str
     identity: str | None
     scope: UsageScope
     allow_stale: bool
+    api_key: Secret | None = None
 
 
 @dataclass(frozen=True, slots=True)

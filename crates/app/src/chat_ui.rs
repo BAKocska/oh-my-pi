@@ -22,6 +22,7 @@ use omp_agent::{
 	ApprovalRequest, ApprovalSource, DeferredCommand, DeferredCommandKind, DeferredCommands,
 	DeferredContext, DeliveryMode, Interrupt, InterruptClass, InterruptSource, PeerMessage,
 	RewindTarget, TurnClient,
+	prompt_assets::{PromptAssetId, prompt_asset},
 };
 use omp_catalog::{
 	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId, provider::AuthSpecKind,
@@ -54,7 +55,7 @@ use omp_proto::{
 	env::v1::{
 		CloseSessionRequest, ExecControlKind, ExecOutcome, ExecRequest, McpConfigAction,
 		McpConfigRequest, McpConfigScope, McpLifecycleState, McpResetRequest, McpServerRef,
-		McpStatusRequest, OpenSessionRequest, OutputChannel, Script,
+		McpStatusRequest, McpSubscribeRequest, OpenSessionRequest, OutputChannel, Script,
 	},
 	inference::v1::{part_start, turn_event::Event, value},
 	omp::ui::v1::{
@@ -107,7 +108,7 @@ use omp_driver::{
 	export::{HtmlThemePalette, SessionTree},
 	plan::PlanArtifactStore,
 	secrets::session::SecretSessionSnapshot,
-	session_title::SessionTitleState,
+	session_title::{SessionTitleState, generate_online_title},
 	settings::ShareStore,
 	share::{DirectShareStore, ShareProjection, ShareStoreKind},
 	skills::SkillInvocationKind,
@@ -990,8 +991,22 @@ struct BridgeState {
 	command_usage: Arc<CommandUsage>,
 	typed_commands: commands::CommandRoster,
 	skills: Arc<omp_driver::skills::SkillSnapshot>,
+	extension_declarations: Arc<[omp_driver::discovery::manifest::DiscoveredCapability]>,
+	extension_generation: u64,
+	extension_mcp: Option<omp_env::McpSubscription>,
+	extension_live_mcp: HashMap<Str, omp_chat_ui::McpLiveSnapshot>,
 	approvals: HashMap<Str, ApprovalRequest>,
 }
+
+async fn next_extension_mcp_event(
+	subscription: &mut Option<omp_env::McpSubscription>,
+) -> Option<omp_env::McpSubscriptionEvent> {
+	if let Some(subscription) = subscription.as_mut() {
+		return subscription.next_event().await.ok().flatten();
+	}
+	pending().await
+}
+
 async fn next_presentation_dispatch(
 	endpoint: &mut Option<presentation::PresentationEndpoint>,
 ) -> presentation::PresentationDispatch {
@@ -1182,6 +1197,7 @@ struct ChatSceneSeed {
 	role:           CommandRole,
 	workspace_root: PathBuf,
 	composer_style: components::ComposerStyle,
+	spelling:       omp_tui::SpellingFeatures,
 	hide_thinking:  bool,
 }
 
@@ -1212,6 +1228,7 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 		)));
 	chat.set_completion(Box::new(completion));
 	chat.set_composer_style(seed.composer_style);
+	chat.set_spelling_features(seed.spelling);
 	chat.set_hide_thinking(seed.hide_thinking);
 	chat
 }
@@ -1219,6 +1236,7 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 pub async fn run<C, R>(
 	executor: Executor,
 	mut agent: Agent<C>,
+	environment_host: &omp_envd::ProjectEnvironment,
 	session: ChatUiSession,
 	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
 	advisor_notices: flume::Receiver<Option<Str>>,
@@ -1239,6 +1257,7 @@ pub async fn run<C, R>(
 	resize_scrollback: omp_chat_ui::host::ResizeScrollback,
 	command_sources: Vec<Vec<CommandContribution>>,
 	skills: Arc<omp_driver::skills::SkillSnapshot>,
+	extension_declarations: Arc<[omp_driver::discovery::manifest::DiscoveredCapability]>,
 	mut approval_inbox: Option<ApprovalInbox>,
 	hide_thinking: bool,
 	mut list_sessions: R,
@@ -1492,6 +1511,10 @@ where
 		command_usage: Arc::clone(&command_usage),
 		typed_commands,
 		skills: Arc::clone(&skills),
+		extension_declarations,
+		extension_generation: 1,
+		extension_mcp: None,
+		extension_live_mcp: HashMap::new(),
 		approvals: HashMap::new(),
 	};
 	let chat_seed = ChatSceneSeed {
@@ -1501,6 +1524,11 @@ where
 		role: initial_command_role,
 		workspace_root,
 		composer_style: presentation_composer_style(state.settings.composer.shape),
+		spelling: omp_tui::SpellingFeatures {
+			typo_detection: state.settings.spelling.typo_detection,
+			autocomplete: state.settings.spelling.autocomplete,
+			autocorrect: state.settings.spelling.autocorrect,
+		},
 		hide_thinking,
 	};
 
@@ -1528,10 +1556,45 @@ where
 	send_backend(&backend_tx, BackendEvent::AgentRoster(last_roster.clone()));
 
 	let bridge_executor = executor.clone();
+	let mcp_inspector = environment_host.mcp_inspector();
 	let bridge = async move {
 		let mut presentation_endpoint = presentation_endpoint;
 		loop {
 			tokio::select! {
+							Some(_event) = next_extension_mcp_event(&mut state.extension_mcp) => {
+								let live =
+									commands::snapshot_live_mcp(&mcp_inspector);
+								let next = live
+									.iter()
+									.cloned()
+									.map(|snapshot| (snapshot.server.clone(), snapshot))
+									.collect::<HashMap<_, _>>();
+								for (server, previous) in &state.extension_live_mcp {
+									if !next.contains_key(server) {
+										let mut removed = previous.clone();
+										removed.health = omp_chat_ui::McpHealth::Inactive;
+										removed.implementation = None;
+										removed.version = None;
+										removed.title = None;
+										removed.description = None;
+										removed.instructions = None;
+										removed.tools.clear();
+										removed.resources.clear();
+										removed.prompts.clear();
+										send_backend(
+											&backend_tx,
+											BackendEvent::ExtensionMcpUpdated(removed),
+										);
+									}
+								}
+								state.extension_live_mcp = next;
+								for snapshot in live {
+									send_backend(
+										&backend_tx,
+										BackendEvent::ExtensionMcpUpdated(snapshot),
+									);
+								}
+							},
 							dispatch = next_presentation_dispatch(&mut presentation_endpoint) => {
 								handle_presentation_dispatch(
 									presentation_endpoint.as_ref().expect("dispatch requires endpoint"),
@@ -1562,6 +1625,7 @@ where
 								}
 								if handle_intent(
 									&bridge_executor,
+									&mcp_inspector,
 									intent,
 									&backend_tx,
 									&ui_tx,
@@ -2436,6 +2500,7 @@ fn shake_notice(outcome: &omp_agent::ManualShakeOutcome) -> Str {
 }
 
 struct LiveCommandHost<'a, R> {
+	mcp_inspector:  &'a omp_envd::McpInspectorHandle,
 	executor:      &'a Executor,
 	backend:       &'a flume::Sender<BackendEvent>,
 	commands_tx:   &'a flume::Sender<UiCmd>,
@@ -2941,6 +3006,158 @@ async fn mutate_mcp(
 	Ok(sf!("MCP server `{name}` updated."))
 }
 
+const PLAN_SAVE_STEM_MAX_LENGTH: usize = 32;
+const PLAN_SAVE_TITLE_LINE_LIMIT: usize = 6;
+
+/// Builds a safe suggested destination for approved plan Markdown.
+pub fn plan_save_file_name(title: &str) -> Str {
+	let mut stem = title
+		.split(|character: char| !character.is_alphanumeric())
+		.filter(|word| !word.is_empty())
+		.map(str::to_uppercase)
+		.collect::<Vec<_>>()
+		.join("_");
+	if stem.len() > PLAN_SAVE_STEM_MAX_LENGTH {
+		let boundary = stem
+			.char_indices()
+			.take_while(|(index, _)| *index <= PLAN_SAVE_STEM_MAX_LENGTH)
+			.map(|(index, _)| index)
+			.last()
+			.unwrap_or(0);
+		let boundary = stem[..boundary]
+			.rfind('_')
+			.filter(|boundary| *boundary > 0)
+			.unwrap_or(boundary);
+		stem.truncate(boundary);
+	}
+	if stem.is_empty() || stem == "PLAN" {
+		return Str::new_static("PLAN.md");
+	}
+	if !stem.ends_with("_PLAN") {
+		stem.push_str("_PLAN");
+	}
+	stem.push_str(".md");
+	Str::from(stem)
+}
+
+fn plan_save_excerpt(content: &str) -> String {
+	content
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty())
+		.take(PLAN_SAVE_TITLE_LINE_LIMIT)
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+fn plan_save_fallback_title(content: &str) -> &str {
+	content
+		.lines()
+		.map(str::trim)
+		.find(|line| !line.is_empty())
+		.map(|line| line.trim_start_matches('#').trim())
+		.filter(|line| !line.is_empty())
+		.unwrap_or("PLAN")
+}
+
+async fn plan_save_suggested_path<C>(parent: &ChatParentHost<C>, content: &str) -> Str
+where
+	C: TurnClient + Clone + Send + 'static,
+{
+	let excerpt = plan_save_excerpt(content);
+	let generated = if excerpt.is_empty() {
+		None
+	} else {
+		generate_online_title(
+			parent,
+			excerpt.as_str(),
+			prompt_asset(PromptAssetId::PlanFilename).content,
+		)
+		.await
+	};
+	plan_save_file_name(
+		generated
+			.as_deref()
+			.unwrap_or_else(|| plan_save_fallback_title(content)),
+	)
+}
+
+async fn invoke_plan_write(
+	environment: &omp_env::EnvClient,
+	path: Str,
+	content: Str,
+) -> miette::Result<()> {
+	use omp_proto::env::v1;
+
+	let id = sf!("plan-save-{}", omp_core::Ulid::generate());
+	let mut invocation = environment
+		.invoke(v1::InvokeTool {
+			invocation_id: id.to_string(),
+			name: "write".to_owned(),
+			rev: "1".to_owned(),
+			..Default::default()
+		})
+		.await
+		.into_diagnostic()?;
+	if !matches!(
+		invocation.next_event().await.into_diagnostic()?,
+		Some(omp_env::InvocationEvent::Accepted(_))
+	) {
+		return Err(miette::miette!("plan write invocation was not accepted"));
+	}
+	invocation
+		.commit_args(
+			Bytes::from(
+				serde_json::to_vec(&omp_tools::write::Params { path, content })
+					.into_diagnostic()?,
+			),
+			Bytes::from_static(b"plan-save"),
+			now_ms(),
+			None,
+		)
+		.await
+		.into_diagnostic()?;
+	loop {
+		match invocation.next_event().await.into_diagnostic()? {
+			Some(omp_env::InvocationEvent::Verdict(verdict)) => {
+				if verdict.is_error {
+					return Err(miette::miette!("plan write failed in the Environment"));
+				}
+				let outcome = serde_json::from_slice::<omp_tool::CallOutcome<
+					omp_tools::write::Payload,
+					omp_tools::write::Fault,
+				>>(&verdict.json)
+				.into_diagnostic()?;
+				return match outcome {
+					omp_tool::CallOutcome::Ok(_) => Ok(()),
+					omp_tool::CallOutcome::Faulted(fault) => Err(miette::miette!("{fault}")),
+					omp_tool::CallOutcome::ArgsRejected(_) => {
+						Err(miette::miette!("plan save path or content was rejected"))
+					},
+					omp_tool::CallOutcome::Aborted { .. } => {
+						Err(miette::miette!("plan save was aborted"))
+					},
+				};
+			},
+			Some(omp_env::InvocationEvent::Update(_)) => {},
+			Some(omp_env::InvocationEvent::Admission(_)) => {
+				return Err(miette::miette!("plan save unexpectedly requires admission"));
+			},
+			Some(omp_env::InvocationEvent::Accepted(_)) => {
+				return Err(miette::miette!("plan write invocation was accepted twice"));
+			},
+			None => return Err(miette::miette!("plan write ended without a verdict")),
+		}
+	}
+}
+
+fn todo_hud(payload: &todo::Payload) -> omp_chat_ui::TodoHud {
+	omp_chat_ui::TodoHud {
+		lines: payload.rendered.lines().map(Str::from).collect(),
+		total_tasks: payload.phases.iter().map(|phase| phase.items.len()).sum(),
+	}
+}
+
 async fn invoke_todo(
 	environment: &omp_env::EnvClient,
 	params: &omp_tools::todo::Params,
@@ -3082,6 +3299,28 @@ fn todo_params(
 	}
 }
 
+fn extension_live_tools(registry: &Registry) -> Vec<omp_chat_ui::LiveToolView> {
+	registry
+		.devices()
+		.filter_map(|device| {
+			let input_schema = serde_json::from_slice(device.schema).ok()?;
+			Some(omp_chat_ui::LiveToolView {
+				name: device.name.clone(),
+				label: None,
+				description: Some(device.summary.clone()),
+				input_schema,
+				source_path: None,
+				hidden: false,
+				source: Str::new_static(if device.claimant.starts_with("omp/") {
+					"builtin"
+				} else {
+					"extension"
+				}),
+			})
+		})
+		.collect()
+}
+
 fn advisor_status(status: &AdvisorEngineStatus) -> Str {
 	use std::fmt::Write as _;
 
@@ -3184,8 +3423,19 @@ where
 			if matches!(args.trim().as_str(), "help" | "?") {
 				return Ok(CommandResult::Consumed(ConsumedResult::status(
 					"`/todo`; `/todo append [phase] <task>`; `/todo start <task>`; `/todo done|drop|rm \
-					 [task|phase]`; `/todo copy`",
+					 [task|phase]`; `/todo copy`; `/todo expand`; `/todo collapse`",
 				)));
+			}
+			match args.trim().as_str() {
+				"expand" => {
+					send_backend(self.backend, BackendEvent::TodoExpanded(true));
+					return Ok(CommandResult::Consumed(ConsumedResult::silent()));
+				},
+				"collapse" => {
+					send_backend(self.backend, BackendEvent::TodoExpanded(false));
+					return Ok(CommandResult::Consumed(ConsumedResult::silent()));
+				},
+				_ => {},
 			}
 			let view = invoke_todo(&self.state.environment, &omp_tools::todo::Params {
 				op:     todo::Op::View,
@@ -3218,6 +3468,7 @@ where
 			} else {
 				invoke_todo(&self.state.environment, &params).await?
 			};
+			send_backend(self.backend, BackendEvent::TodoHud(todo_hud(&payload)));
 			let rendered = if payload.phases.is_empty() {
 				sf!("No todos. Use `/todo append <task>` to start one.")
 			} else {
@@ -3491,6 +3742,47 @@ where
 				},
 			}
 		})
+	}
+
+	fn extensions(&mut self, request: commands::ExtensionRequest) -> CommandFuture<'_> {
+		match request {
+			commands::ExtensionRequest::Inspect => {
+				let live_tools = extension_live_tools(self.registry);
+				let live_mcp =
+					commands::snapshot_live_mcp(self.mcp_inspector);
+				let snapshot =
+					commands::build_inspector_snapshot_from_declarations(
+						&self.state.extension_declarations,
+						&live_tools,
+						&live_mcp,
+						self.state.extension_generation,
+					);
+				self.state.extension_live_mcp = live_mcp
+					.into_iter()
+					.map(|snapshot| (snapshot.server.clone(), snapshot))
+					.collect();
+				let backend = self.backend;
+				let state = &mut *self.state;
+				Box::pin(async move {
+					state.extension_mcp = state
+						.environment
+						.mcp_subscribe(McpSubscribeRequest {
+							name: None,
+							after_sequence: 0,
+							wire_revision: omp_proto::SCHEMA_REV,
+						})
+						.await
+						.ok();
+					send_backend(backend, BackendEvent::OpenExtensionInspector(snapshot));
+					Ok(CommandResult::Consumed(ConsumedResult::silent()))
+				})
+			},
+			commands::ExtensionRequest::Marketplace(_)
+			| commands::ExtensionRequest::Plugins(_)
+			| commands::ExtensionRequest::Reload => {
+				self.unavailable("Extension mutation requires the discovery configuration owner.")
+			},
+		}
 	}
 
 	fn share(&mut self, args: Str) -> CommandFuture<'_> {
@@ -3792,6 +4084,7 @@ async fn maybe_generate_session_title<C>(
 
 async fn handle_intent<C, R>(
 	executor: &Executor,
+	mcp_inspector: &omp_envd::McpInspectorHandle,
 	intent: Intent,
 	backend: &flume::Sender<BackendEvent>,
 	commands_tx: &flume::Sender<UiCmd>,
@@ -3955,6 +4248,7 @@ where
 				let _ = state.command_usage.record(name.as_str(), now_ms());
 			}
 			let mut command_host = LiveCommandHost {
+				mcp_inspector,
 				executor,
 				backend,
 				commands_tx,
@@ -4372,6 +4666,43 @@ where
 				}
 			}
 		},
+		Intent::PlanSavePathRequest { content } => {
+			let suggested_path = plan_save_suggested_path(parent, content.as_str()).await;
+			send_backend(
+				backend,
+				BackendEvent::OpenPlanSavePrompt { content, suggested_path },
+			);
+		},
+		Intent::SavePlanAndQuit { path, content } => {
+			let path = Str::new(path.trim());
+			if path.is_empty() {
+				send_backend(backend, BackendEvent::Error(sf!("Plan save path cannot be empty.")));
+				return Ok(false);
+			}
+			if let Err(error) =
+				invoke_plan_write(&state.environment, path.clone(), content).await
+			{
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!("Failed to save plan to `{path}`: {error}")),
+				);
+				return Ok(false);
+			}
+			if modes.mode_holder().as_deref() == Some("plan")
+				&& let Some(engagement) = modes.mode_engagement()
+				&& !disengage_campaign(backend, commands_tx, "plan", engagement).await
+			{
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!(
+						"Saved plan to `{path}`, but could not exit plan mode.",
+					)),
+				);
+				return Ok(false);
+			}
+			send_backend(backend, BackendEvent::Notice(sf!("Saved plan to `{path}`.")));
+			send_backend(backend, BackendEvent::NewSessionRequested);
+		},
 		Intent::SetGoal { objective, token_budget } => {
 			if let Some(receipt) =
 				engage_campaign(backend, commands_tx, modes, "goal", false, None).await
@@ -4452,6 +4783,21 @@ where
 			set_interactive_thinking(agent_state, state, true);
 			send_status(backend, state, bus, dropped);
 		},
+		Intent::CloseExtensionInspector => {
+			if let Some(subscription) = state.extension_mcp.take() {
+				subscription.cancel();
+			}
+			state.extension_live_mcp.clear();
+		},
+		Intent::ToggleExtension { id, enabled } => {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!(
+					"Extension `{id}` cannot be {} without an attached discovery configuration owner.",
+					if enabled { "enabled" } else { "disabled" },
+				)),
+			);
+		},
 		Intent::TogglePlan => {
 			let operation = if modes.mode_holder().as_deref() == Some("plan") {
 				"off"
@@ -4478,6 +4824,7 @@ where
 		Intent::Suspend | Intent::ResetDisplay | Intent::InspectHistory => {},
 		Intent::ApplySettings { changes, commit } => {
 			let composer_style = state.settings.composer.shape;
+			let spelling = state.settings.spelling;
 			apply_setting_changes(&mut state.settings, &changes)?;
 			if state.settings.composer.shape != composer_style {
 				send_backend(
@@ -4485,6 +4832,16 @@ where
 					BackendEvent::ComposerStyleChanged(presentation_composer_style(
 						state.settings.composer.shape,
 					)),
+				);
+			}
+			if state.settings.spelling != spelling {
+				send_backend(
+					backend,
+					BackendEvent::SpellingFeaturesChanged(omp_tui::SpellingFeatures {
+						typo_detection: state.settings.spelling.typo_detection,
+						autocomplete: state.settings.spelling.autocomplete,
+						autocorrect: state.settings.spelling.autocorrect,
+					}),
 				);
 			}
 			if commit {
@@ -5413,11 +5770,17 @@ fn handle_agent_event(
 					id:    call_id.clone(),
 					name:  identity.name.clone(),
 					rev:   Str::from(identity.rev.to_string()),
-					title: identity.name,
+					title: identity.name.clone(),
 				});
 			}
 			send_tool_result_images(backend, call_id, item);
 			send_backend(backend, BackendEvent::ToolFinished { id: call_id.clone(), ok, view });
+			if ok
+				&& identity.name == "todo"
+				&& let Some(payload) = completed_todo_payload(item)
+			{
+				send_backend(backend, BackendEvent::TodoHud(todo_hud(&payload)));
+			}
 			if ok
 				&& is_report_issue
 				&& let Some(request) = autoqa_consent_request(item)
@@ -5768,6 +6131,19 @@ fn missing_tool_identity(item: &Item) -> ToolIdentity {
 		_ => "tool",
 	};
 	missing_identity(name)
+}
+
+fn completed_todo_payload(item: &Item) -> Option<todo::Payload> {
+	match serde_json::from_slice::<omp_tool::CallOutcome<todo::Payload, todo::Fault>>(
+		&durable_tool_outcome(item)?,
+	)
+	.ok()?
+	{
+		omp_tool::CallOutcome::Ok(payload) => Some(payload),
+		omp_tool::CallOutcome::Faulted(_)
+		| omp_tool::CallOutcome::ArgsRejected(_)
+		| omp_tool::CallOutcome::Aborted { .. } => None,
+	}
 }
 
 fn durable_tool_outcome(item: &Item) -> Option<Bytes> {
@@ -6554,6 +6930,19 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
 	use std::future;
+
+	#[test]
+	fn plan_save_filename_is_safe_and_word_bounded() {
+		assert_eq!(plan_save_file_name("PyO3 types"), "PYO3_TYPES_PLAN.md");
+		assert_eq!(plan_save_file_name("Auth storage plan"), "AUTH_STORAGE_PLAN.md");
+		assert_eq!(
+			plan_save_file_name("Split PyEnvironmentBackend request into PyO3 methods"),
+			"SPLIT_PYENVIRONMENTBACKEND_PLAN.md",
+		);
+		assert_eq!(plan_save_file_name("  "), "PLAN.md");
+		assert_eq!(plan_save_file_name("Plan"), "PLAN.md");
+		assert_eq!(plan_save_file_name("../../unsafe destination"), "UNSAFE_DESTINATION_PLAN.md");
+	}
 
 	use futures::executor::block_on;
 	use omp_agent::{AgentKind, AgentStatus, Budget};

@@ -1,13 +1,13 @@
 //! Granted-root context-file discovery and immutable prompt projection.
 
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::BTreeSet,
 	fs,
 	path::PathBuf,
 	sync::Arc,
 };
 
-use omp_agent::ContextFile;
+use omp_agent::{ContextFile, dedupe_context_file_indices};
 use omp_core::Str;
 
 use super::{
@@ -70,8 +70,8 @@ pub struct ContextItem {
 /// Immutable discovered context snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContextSnapshot {
-	/// Deterministically merged sources, ancestors before descendants for each
-	/// root, with exact-byte duplicates removed in favor of the closest source.
+	/// Deterministically merged sources ordered from least to most authoritative,
+	/// with normalized paragraph-contained sources removed.
 	pub items:       Arc<[ContextItem]>,
 	/// Bounded non-fatal diagnostics.
 	pub diagnostics: Arc<[ContextDiagnostic]>,
@@ -90,8 +90,8 @@ pub enum ContextDiagnostic {
 
 /// Discovers context only beneath explicit grant boundaries. Paths are
 /// ancestor-walked, `@path` expansion reuses the canonical context importer,
-/// exact bytes deduplicate in favor of the closest source, and roots retain
-/// Environment order.
+/// and normalized paragraph containment favors sources closest to the workspace
+/// directory.
 pub fn discover(
 	roots: &[GrantedContextRoot],
 	options: &ContextDiscoveryOptions,
@@ -146,33 +146,17 @@ pub fn discover(
 		}
 	}
 
-	// The closest occurrence owns exact-byte content. Root order breaks equal
-	// depth ties deterministically, while every retained root renders ancestors
-	// before descendants.
-	let mut closest = BTreeMap::<Str, (u16, usize, PathBuf)>::new();
-	for item in &candidates {
-		let replace = closest
-			.get(&item.content)
-			.is_none_or(|(depth, root, path)| {
-				item.depth < *depth
-					|| (item.depth == *depth && (item.root_index, &item.path) < (*root, path))
-			});
-		if replace {
-			closest.insert(item.content.clone(), (item.depth, item.root_index, item.path.clone()));
-		}
-	}
-	candidates.retain(|item| {
-		closest
-			.get(&item.content)
-			.is_some_and(|entry| entry == &(item.depth, item.root_index, item.path.clone()))
-	});
-	candidates.sort_by(|left, right| {
-		left
-			.root_index
-			.cmp(&right.root_index)
-			.then_with(|| right.depth.cmp(&left.depth))
-			.then_with(|| left.path.cmp(&right.path))
-	});
+	let comparable = candidates
+		.iter()
+		.map(|item| {
+			ContextFile::new(item.path.clone(), item.content.as_bytes().to_vec())
+				.with_depth(item.depth)
+		})
+		.collect::<Vec<_>>();
+	candidates = dedupe_context_file_indices(&comparable)
+		.into_iter()
+		.map(|index| candidates[index].clone())
+		.collect();
 	ContextSnapshot { items: candidates.into(), diagnostics: diagnostics.into() }
 }
 
@@ -185,6 +169,7 @@ pub fn prompt_files(snapshot: &ContextSnapshot) -> Arc<[ContextFile]> {
 		.map(|item| {
 			ContextFile::new(item.path.clone(), item.content.as_bytes().to_vec())
 				.with_origin(Str::from(item.path.to_string_lossy().as_ref()))
+				.with_depth(item.depth)
 		})
 		.collect::<Vec<_>>()
 		.into()
@@ -217,13 +202,13 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn granted_walk_is_depth_sorted_and_keeps_closest_duplicate() {
+	fn granted_walk_is_depth_sorted_and_dedupes_contained_context() {
 		let tree = tempfile::tempdir().unwrap();
 		let root = tree.path().join("repo");
 		let nested = root.join("a/b");
 		fs::create_dir_all(&nested).unwrap();
-		fs::write(root.join("AGENTS.md"), "same").unwrap();
-		fs::write(root.join("a/CLAUDE.md"), "same").unwrap();
+		fs::write(root.join("AGENTS.md"), "shared").unwrap();
+		fs::write(root.join("a/CLAUDE.md"), "shared\n\nnear-only").unwrap();
 		fs::write(nested.join(".cursorrules"), "closest").unwrap();
 		let snapshot = discover(
 			&[GrantedContextRoot { root, start: nested }],

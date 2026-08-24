@@ -5,14 +5,16 @@ use std::{
 	io,
 	path::{Path, PathBuf},
 	pin::Pin,
+	process::Stdio,
 	sync::Arc,
 	time,
+	time::Duration,
 };
 
-use futures::{StreamExt as _, stream};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 use omp_agent::{
-	EntryKindDecl, Journal, JournalAuthor, JournalOperation, JournalRequest, JournalRequestStamp,
-	PendingCustomEntry, TurnId,
+	AgentRunSummary, EntryKindDecl, Journal, JournalAuthor, JournalOperation, JournalRequest,
+	JournalRequestStamp, PendingCustomEntry, TurnId,
 };
 use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
@@ -218,6 +220,106 @@ impl ProductionCleanseHost {
 		session.dispose().await;
 		Ok(outcome)
 	}
+
+	async fn repair_session(
+		&self,
+		name: &str,
+		model: &str,
+		prompt: Str,
+		followups: flume::Receiver<Vec<super::Diagnostic>>,
+		cancel: &CancellationToken,
+	) -> Result<RepairOutcome, ProductionError> {
+		let mut session = HeadlessSession::open(self.data_dir.clone(), HeadlessSessionOptions {
+			project:               self.root.clone(),
+			additional_roots:      Box::new([]),
+			model:                 Str::new(model),
+			initial_campaign:      None,
+			initial_prompt_slot:   None,
+			plan_handoff:          None,
+			resume:                None,
+			fork:                  None,
+			py_eval:               false,
+			approval_mode:         None,
+			pty_denied:            false,
+			credential_provider:   None,
+			api_key:               None,
+			prompt_cache_affinity: None,
+			session_generation:    1,
+		})
+		.await
+		.map_err(|_| ProductionError::Session)?;
+		session.set_response_schema("cleanse_repair", repair_schema())?;
+		session
+			.set_title(Str::new(name))
+			.await
+			.map_err(|_| ProductionError::Session)?;
+		let mut items = vec![
+			message(
+				Role::System,
+				"You are a bounded cleanse worker. Obey the assignment exactly and return only the required JSON.",
+			),
+			message(Role::User, prompt.as_str()),
+		];
+		let mut final_output = sf!("");
+		let mut success = true;
+		loop {
+			let Some((summary, mut pending)) =
+				submit_repair_turn(&mut session, items, &followups, cancel).await?
+			else {
+				success = false;
+				final_output = sf!("cancelled");
+				break;
+			};
+			success &= !summary.interrupted && summary.final_assistant().is_some();
+			if let Some(output) = summary.final_assistant() {
+				final_output = Str::new(output);
+			}
+			pending.extend(followups.try_iter().flatten());
+			if pending.is_empty() {
+				break;
+			}
+			items = vec![message(Role::User, followup_prompt(&pending).as_str())];
+		}
+		drop(followups);
+		session.dispose().await;
+		Ok(RepairOutcome { name: Str::new(name), success, output: final_output })
+	}
+}
+
+async fn submit_repair_turn(
+	session: &mut HeadlessSession,
+	items: Vec<Item>,
+	followups: &flume::Receiver<Vec<super::Diagnostic>>,
+	cancel: &CancellationToken,
+) -> Result<Option<(AgentRunSummary, Vec<super::Diagnostic>)>, ProductionError> {
+	let interrupt = session.interrupt_handle();
+	let submitted = session.submit(
+		items,
+		TurnId::new(format!("cleanse-{}", omp_core::Ulid::generate())),
+	);
+	tokio::pin!(submitted);
+	let mut pending = Vec::new();
+	let mut receiver_open = true;
+	let summary = loop {
+		tokio::select! {
+			result = &mut submitted => break Some(result),
+			batch = followups.recv_async(), if receiver_open => {
+				match batch {
+					Ok(batch) => pending.extend(batch),
+					Err(_) => receiver_open = false,
+				}
+			},
+			() = cancel.cancelled() => {
+				interrupt.interrupt();
+				break None;
+			},
+		}
+	};
+	match summary {
+		Some(Ok(summary)) => Ok(Some((summary, pending))),
+		Some(Err(_)) => Err(ProductionError::Session),
+		None => Ok(None),
+	}
 }
 
 impl BinaryResolver for ProductionCleanseHost {
@@ -233,29 +335,134 @@ impl CheckerRunner for ProductionCleanseHost {
 		&self,
 		checker: &Checker,
 		cancel: &CancellationToken,
+		partials: Option<flume::Sender<ProcessOutput>>,
 	) -> impl Future<Output = Result<ProcessOutput, Self::Error>> + Send {
 		let checker = checker.clone();
 		let cancel = cancel.clone();
-		async move { run_checker_process(&checker, &cancel).await }
+		async move { run_checker_process(&checker, &cancel, partials).await }
 	}
 }
 
 async fn run_checker_process(
 	checker: &Checker,
 	cancel: &CancellationToken,
+	partials: Option<flume::Sender<ProcessOutput>>,
 ) -> Result<ProcessOutput, ProductionError> {
 	let mut command = Command::new(&checker.binary);
 	command.args(checker.args.iter().map(Str::as_str));
-	command.current_dir(&checker.cwd).kill_on_drop(true);
-	let output = tokio::select! {
-		result = command.output() => result.map_err(|source| ProductionError::Checker { binary: checker.binary.clone(), source })?,
-		() = cancel.cancelled() => return Ok(ProcessOutput { exit_code: None, stdout: sf!(""), stderr: sf!("cancelled") }),
-	};
+	command
+		.current_dir(&checker.cwd)
+		.kill_on_drop(true)
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped());
+	let mut child = command
+		.spawn()
+		.map_err(|source| ProductionError::Checker { binary: checker.binary.clone(), source })?;
+	let stdout = child.stdout.take().expect("piped checker stdout");
+	let stderr = child.stderr.take().expect("piped checker stderr");
+	let (stream_tx, stream_rx) = flume::unbounded();
+	let stdout_task = tokio::spawn(pump_checker_stream(stdout, true, stream_tx.clone()));
+	let stderr_task = tokio::spawn(pump_checker_stream(stderr, false, stream_tx));
+	let mut stdout = Vec::new();
+	let mut stderr = Vec::new();
+	let mut streams = 2_u8;
+	let mut status = None;
+	let mut interval = tokio::time::interval(Duration::from_secs(5));
+	interval.tick().await;
+	while status.is_none() || streams > 0 {
+		tokio::select! {
+			() = cancel.cancelled(), if status.is_none() => {
+				let _ = child.kill().await;
+				status = Some(None);
+			},
+			result = child.wait(), if status.is_none() => {
+				status = Some(
+					result
+						.map_err(|source| ProductionError::Checker {
+							binary: checker.binary.clone(),
+							source,
+						})?
+						.code(),
+				);
+			},
+			event = stream_rx.recv_async(), if streams > 0 => {
+				match event {
+					Ok(CheckerStream::Stdout(bytes)) => stdout.extend(bytes),
+					Ok(CheckerStream::Stderr(bytes)) => stderr.extend(bytes),
+					Ok(CheckerStream::Done) => streams = streams.saturating_sub(1),
+					Ok(CheckerStream::Error(source)) => {
+						return Err(ProductionError::Checker {
+							binary: checker.binary.clone(),
+							source,
+						});
+					},
+					Err(_) => streams = 0,
+				}
+			},
+			_ = interval.tick(), if partials.is_some() && status.is_none() => {
+				if let Some(sender) = partials.as_ref() {
+					let _ = sender.send(ProcessOutput {
+						exit_code: None,
+						stdout: complete_lines(&stdout),
+						stderr: complete_lines(&stderr),
+					});
+				}
+			},
+		}
+	}
+	let _ = stdout_task.await;
+	let _ = stderr_task.await;
+	if cancel.is_cancelled() {
+		return Ok(ProcessOutput { exit_code: None, stdout: sf!(""), stderr: sf!("cancelled") });
+	}
 	Ok(ProcessOutput {
-		exit_code: output.status.code(),
-		stdout:    Str::from(String::from_utf8_lossy(&output.stdout).as_ref()),
-		stderr:    Str::from(String::from_utf8_lossy(&output.stderr).as_ref()),
+		exit_code: status.flatten(),
+		stdout: Str::from(String::from_utf8_lossy(&stdout).as_ref()),
+		stderr: Str::from(String::from_utf8_lossy(&stderr).as_ref()),
 	})
+}
+
+enum CheckerStream {
+	Stdout(Vec<u8>),
+	Stderr(Vec<u8>),
+	Error(io::Error),
+	Done,
+}
+
+async fn pump_checker_stream(
+	mut stream: impl AsyncRead + Unpin + Send + 'static,
+	stdout: bool,
+	sender: flume::Sender<CheckerStream>,
+) {
+	let mut buffer = [0_u8; 8_192];
+	loop {
+		match stream.read(&mut buffer).await {
+			Ok(0) => break,
+			Err(error) => {
+				let _ = sender.send_async(CheckerStream::Error(error)).await;
+				return;
+			},
+			Ok(read) => {
+				let bytes = buffer[..read].to_vec();
+				let event = if stdout {
+					CheckerStream::Stdout(bytes)
+				} else {
+					CheckerStream::Stderr(bytes)
+				};
+				if sender.send_async(event).await.is_err() {
+					return;
+				}
+			},
+		}
+	}
+	let _ = sender.send_async(CheckerStream::Done).await;
+}
+
+fn complete_lines(bytes: &[u8]) -> Str {
+	let Some(cut) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+		return sf!("");
+	};
+	Str::from(String::from_utf8_lossy(&bytes[..=cut]).as_ref())
 }
 
 impl CleanseHost for ProductionCleanseHost {
@@ -325,43 +532,22 @@ impl CleanseHost for ProductionCleanseHost {
 		}
 	}
 
-	fn repair(
+	fn repair_worker(
 		&self,
-		assignments: &[Assignment],
+		assignment: Assignment,
+		worker: usize,
+		peers: Vec<Assignment>,
 		model: &str,
+		followups: flume::Receiver<Vec<super::Diagnostic>>,
 		cancel: &CancellationToken,
-	) -> impl Future<Output = Result<Vec<RepairOutcome>, Self::Error>> + Send {
-		let assignments = assignments.to_vec();
+	) -> impl Future<Output = Result<RepairOutcome, Self::Error>> + Send {
 		let model = Str::new(model);
 		async move {
-			let count = assignments.len();
-			stream::iter(
-				assignments
-					.into_iter()
-					.enumerate()
-					.map(|(index, assignment)| {
-						let model = model.clone();
-						async move {
-							let name = format!("CleanseW1A{}", index + 1);
-							let prompt = assignment_prompt(&assignment, &Report::default());
-							self
-								.child_session(
-									&name,
-									model.as_str(),
-									"cleanse_repair",
-									repair_schema(),
-									prompt,
-									cancel,
-								)
-								.await
-						}
-					}),
-			)
-			.buffered(count.max(1))
-			.collect::<Vec<_>>()
-			.await
-			.into_iter()
-			.collect()
+			let name = format!("CleanseA{worker}");
+			let prompt = assignment_prompt(&assignment, worker, &peers);
+			self
+				.repair_session(&name, model.as_str(), prompt, followups, cancel)
+				.await
 		}
 	}
 
@@ -407,6 +593,25 @@ impl CleanseHost for ProductionCleanseHost {
 		})?;
 		Ok(())
 	}
+}
+
+fn followup_prompt(diagnostics: &[super::Diagnostic]) -> Str {
+	let mut text = String::from(
+		"Additional diagnostics were reported for files you own. Fix these too before finishing:\n",
+	);
+	for diagnostic in diagnostics {
+		use std::fmt::Write as _;
+		let _ = writeln!(
+			text,
+			"- {}:{}:{} {:?}: {}",
+			diagnostic.file.as_deref().unwrap_or("<project>"),
+			diagnostic.line.unwrap_or(0),
+			diagnostic.column.unwrap_or(0),
+			diagnostic.severity,
+			diagnostic.message,
+		);
+	}
+	Str::from(text)
 }
 
 fn repair_schema() -> serde_json::Value {
@@ -461,7 +666,7 @@ mod tests {
 			effect:   CheckerEffect::ReadOnly,
 			test:     false,
 		};
-		let output = run_checker_process(&checker, &CancellationToken::new())
+		let output = run_checker_process(&checker, &CancellationToken::new(), None)
 			.await
 			.expect("checker process");
 		assert_eq!(output.exit_code, Some(0));

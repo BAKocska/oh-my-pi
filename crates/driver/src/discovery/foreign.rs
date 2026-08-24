@@ -1,7 +1,7 @@
 //! Read-only repository-surface foreign content imports.
 //!
-//! This provider deliberately has no code path for foreign commands, agents,
-//! plugins, MCP, settings, or user-home roots.
+//! Slash commands are imported as inert Markdown templates; executable agents,
+//! plugins, MCP, settings, and user-home roots remain outside this provider.
 
 use std::{collections::BTreeSet, fs, path::Path};
 
@@ -15,6 +15,7 @@ use super::{
 	},
 	rules::{self, RuleSource},
 	skills::{self, SkillDiscoverySettings, SkillSource},
+	slash_commands,
 };
 
 /// Native settings projection for repo-surface foreign content families.
@@ -43,6 +44,8 @@ pub struct ForeignContentDiscovery {
 	pub prompts:      Vec<DiscoveredCapability>,
 	/// File-targeted instruction declarations.
 	pub instructions: Vec<DiscoveredCapability>,
+	/// Inert slash-command template declarations.
+	pub commands:     Vec<DiscoveredCapability>,
 	/// Non-fatal diagnostics.
 	pub warnings:     Vec<Str>,
 }
@@ -196,8 +199,78 @@ pub fn discover(
 				.instructions
 				.extend(load_markdown(repository_root, relative, family.id, false));
 		}
+		for relative in command_dirs(family.id) {
+			output
+				.commands
+				.extend(load_commands(repository_root, relative, family.id));
+		}
 	}
 	output
+}
+
+fn command_dirs(family: &str) -> &'static [&'static str] {
+	match family {
+		"claude" => &[".claude/commands"],
+		"codex" => &[".codex/commands"],
+		"opencode" => &[".opencode/commands"],
+		_ => &[],
+	}
+}
+
+fn load_commands(root: &Path, relative: &str, family: &str) -> Vec<DiscoveredCapability> {
+	let directory = root.join(relative);
+	let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+	let canonical_directory = fs::canonicalize(&directory).unwrap_or_else(|_| directory.clone());
+	let mut files = WalkRequest::new(&directory)
+		.hidden(false)
+		.gitignore(true)
+		.skip_git(true)
+		.depth(1, 8)
+		.collect_files()
+		.unwrap_or_default()
+		.into_iter()
+		.map(|entry| entry.absolute_path(&directory))
+		.filter(|file| file.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md")))
+		.collect::<Vec<_>>();
+	files.sort();
+	files
+		.into_iter()
+		.filter_map(|path| {
+			let canonical = fs::canonicalize(&path).ok()?;
+			if !canonical.starts_with(&canonical_root) {
+				return None;
+			}
+			let content = fs::read_to_string(&canonical).ok()?;
+			let relative = canonical.strip_prefix(&canonical_directory).ok()?;
+			let mut name = String::new();
+			for component in relative.components() {
+				let mut component = component.as_os_str().to_str()?.to_owned();
+				if component.ends_with(".md") {
+					component.truncate(component.len().saturating_sub(3));
+				}
+				if component.is_empty() {
+					return None;
+				}
+				if !name.is_empty() {
+					name.push(':');
+				}
+				name.push_str(&component);
+			}
+			let payload =
+				slash_commands::parse_markdown(Str::from(name.clone()), canonical.clone(), &content).ok()?;
+			let mut source = SourceProvenance::native(
+				format!("foreign-{family}"),
+				canonical,
+				SourceScope::Project,
+			);
+			source.read_only = true;
+			Some(DiscoveredCapability::keyed(
+				name,
+				CapabilityPayload::SlashCommands(payload),
+				source,
+			))
+		})
+		.collect()
 }
 
 fn load_markdown(
@@ -267,7 +340,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn imports_content_but_never_foreign_executable_surfaces() {
+	fn imports_inert_commands_but_never_foreign_executable_surfaces() {
 		let tree = tempfile::tempdir().unwrap();
 		fs::create_dir_all(tree.path().join(".claude/skills/review")).unwrap();
 		fs::create_dir_all(tree.path().join(".claude/commands")).unwrap();
@@ -280,8 +353,34 @@ mod tests {
 		fs::write(tree.path().join(".claude/mcp.json"), "{}").unwrap();
 		let result = discover(tree.path(), &ForeignContentSettings::default());
 		assert_eq!(result.skills.len(), 1);
+		assert_eq!(result.commands.len(), 1);
 		assert!(result.prompts.is_empty());
 		assert!(result.instructions.is_empty());
 		assert!(result.skills[0].source.read_only);
+		assert!(result.commands[0].source.read_only);
+	}
+
+	#[test]
+	fn codex_and_opencode_commands_keep_frontmatter_and_empty_bodies() {
+		let tree = tempfile::tempdir().unwrap();
+		for family in ["codex", "opencode"] {
+			let directory = tree.path().join(format!(".{family}/commands"));
+			fs::create_dir_all(&directory).unwrap();
+			fs::write(
+				directory.join("deploy.md"),
+				"---\ndescription: Deploy a service\nargumentHint: <service>\n---\n",
+			)
+			.unwrap();
+		}
+		let result = discover(tree.path(), &ForeignContentSettings::default());
+		assert_eq!(result.commands.len(), 2);
+		for declaration in result.commands {
+			let CapabilityPayload::SlashCommands(command) = declaration.payload else {
+				panic!("command payload");
+			};
+			assert_eq!(command.description, "Deploy a service");
+			assert_eq!(command.argument_hint.as_deref(), Some("<service>"));
+			assert!(command.content.is_empty());
+		}
 	}
 }

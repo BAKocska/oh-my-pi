@@ -21,6 +21,16 @@ use miette::{IntoDiagnostic as _, miette};
 use omp_core::{SecretString, Str, encoding::hex};
 use omp_driver::{cleanse::CleanseArgs, compress::CompressArgs};
 use omp_envd::{site::TrustedModule, worker::ExtHostSpec};
+const ROOT_LICENSE: &str = include_str!("../../../LICENSE");
+const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD-PARTY-NOTICES.txt");
+
+fn write_license_output(mut output: impl io::Write) -> io::Result<()> {
+	writeln!(output, "OMP License and Third-Party Notices")?;
+	writeln!(output)?;
+	writeln!(output, "{}", ROOT_LICENSE.trim_end())?;
+	writeln!(output)?;
+	writeln!(output, "{}", THIRD_PARTY_NOTICES.trim_end())
+}
 
 fn parse_cli_secret(value: &str) -> Result<SecretString, convert::Infallible> {
 	Ok(SecretString::from(value))
@@ -371,6 +381,9 @@ pub struct OmpCli {
 	/// Render interactive chat in a native GPU window.
 	#[arg(long, global = true)]
 	pub gui:               bool,
+	/// Print the embedded OMP license and tracked third-party notices.
+	#[arg(long, global = true, exclusive = true)]
+	pub license:           bool,
 	/// Select a named profile before settings and extensions are loaded.
 	#[arg(skip)]
 	pub profile:           Option<Str>,
@@ -489,23 +502,56 @@ pub struct UsageArgs {
 	pub json:       bool,
 }
 
+/// Benchmark workload selection.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	ValueEnum,
+	serde::Serialize,
+	strum::Display,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum BenchProfile {
+	/// Rotate deterministically through chat, prefill, and generation workloads.
+	#[default]
+	Mix,
+	/// Balanced conversational latency and throughput.
+	Chat,
+	/// Large cache-busted input with a short response.
+	Prefill,
+	/// Small input with sustained output generation.
+	Generation,
+}
+
 /// Normal inference benchmark options.
 #[derive(Clone, Debug, Args)]
 pub struct BenchArgs {
 	/// Model key routed through the production inference registry.
-	pub model:      Str,
+	pub model:         Str,
 	/// Override the profile data directory containing credentials.
 	#[arg(long, value_name = "PATH")]
-	pub data_dir:   Option<PathBuf>,
-	/// Number of measured requests.
-	#[arg(long, default_value_t = 10)]
-	pub runs:       u32,
-	/// Maximum output tokens per request.
-	#[arg(long, default_value_t = 512)]
-	pub max_tokens: u64,
-	/// Benchmark prompt.
-	#[arg(long, default_value = "Reply with one concise sentence about deterministic systems.")]
-	pub prompt:     Str,
+	pub data_dir:      Option<PathBuf>,
+	/// Number of measured requests (defaults: mix 9, chat 10, prefill/generation 5).
+	#[arg(long)]
+	pub runs:          Option<u32>,
+	/// Override the workload-specific maximum output tokens.
+	#[arg(long)]
+	pub max_tokens:    Option<u64>,
+	/// Override the bundled chat or generation prompt.
+	#[arg(long)]
+	pub prompt:        Option<Str>,
+	/// Benchmark workload.
+	#[arg(long, value_enum, default_value_t)]
+	pub profile:       BenchProfile,
+	/// Synthetic filler bytes for prefill workloads (default: 32768).
+	#[arg(long)]
+	pub prefill_bytes: Option<usize>,
 	/// Maximum concurrent requests.
 	#[arg(long, default_value_t = 4)]
 	pub par:        usize,
@@ -963,7 +1009,7 @@ pub enum Command {
 	Gallery(GalleryArgs),
 	/// Inspect or invalidate durable provider quota observations.
 	Usage(UsageArgs),
-	/// Benchmark model TTFT, throughput, concurrency, and cold/warm cache pairs.
+	/// Benchmark model chat, prefill, and generation TTFT/decode/cache performance.
 	Bench(BenchArgs),
 	/// Simulate account selection and optionally run a live balance benchmark.
 	#[command(name = "dry-balance")]
@@ -2163,7 +2209,12 @@ fn chat_start(args: &mut ChatArgs) -> ChatStart {
 
 /// Parses the process arguments and dispatches the selected operation.
 pub async fn run() -> miette::Result<()> {
-	let cli = parse_from_os(env::args_os()).into_diagnostic()?;
+	let arguments = env::args_os().collect::<Vec<_>>();
+	if arguments.len() == 2 && arguments[1] == "--license" {
+		write_license_output(io::stdout().lock()).into_diagnostic()?;
+		return Ok(());
+	}
+	let cli = parse_from_os(arguments).into_diagnostic()?;
 	dispatch(cli).await
 }
 
@@ -2175,6 +2226,10 @@ pub async fn run() -> miette::Result<()> {
 pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 	let executor = omp_executor::Executor::new(None);
 	startup_notice::stop_watchdog();
+	if cli.license {
+		write_license_output(io::stdout().lock()).into_diagnostic()?;
+		return Ok(());
+	}
 	if let Some(journal) = cli.export.as_deref() {
 		let output = journal.with_extension("html");
 		let exported = omp_driver::export::export_session(journal, &output).into_diagnostic()?;
@@ -2355,8 +2410,10 @@ fn parse_with_terminal(
 	if !interactive
 		&& first_positional(&arguments).is_none()
 		&& !arguments.iter().skip(1).any(|argument| {
-			matches!(argument.to_string_lossy().as_ref(), "--help" | "-h" | "--version" | "-V")
-				|| argument == "--gui"
+			matches!(
+				argument.to_string_lossy().as_ref(),
+				"--help" | "-h" | "--version" | "-V" | "--license"
+			) || argument == "--gui"
 		}) {
 		arguments.push(OsString::from("print"));
 	}
@@ -2394,6 +2451,7 @@ fn builtin_contribution_names() -> impl Iterator<Item = Str> {
 		"ext",
 		"ext-only",
 		"gui",
+		"license",
 		"model",
 		"models",
 		"no-ext",
@@ -2835,6 +2893,78 @@ mod tests {
 
 	fn parse(arguments: &[&str]) -> OmpCli {
 		OmpCli::try_parse_from(arguments).expect("valid command")
+	}
+
+	#[test]
+	fn parses_exclusive_embedded_license_flag() {
+		let cli = parse(&["omp", "--license"]);
+		assert!(cli.license);
+		assert!(cli.command.is_none());
+		let normalized =
+			parse_with_terminal(["omp", "--license"].map(OsString::from), false).expect("license");
+		assert!(normalized.license);
+		assert!(normalized.command.is_none());
+		assert_eq!(
+			OmpCli::try_parse_from(["omp", "--license", "bench", "provider/model"])
+				.expect_err("license must be exclusive")
+				.kind(),
+			ErrorKind::ArgumentConflict
+		);
+	}
+
+	#[test]
+	fn license_output_contains_the_exact_embedded_assets() {
+		let mut output = Vec::new();
+		write_license_output(&mut output).expect("in-memory output");
+		assert_eq!(
+			String::from_utf8(output).expect("license output is UTF-8"),
+			format!(
+				"OMP License and Third-Party Notices\n\n{}\n\n{}\n",
+				ROOT_LICENSE.trim_end(),
+				THIRD_PARTY_NOTICES.trim_end()
+			)
+		);
+	}
+
+	#[test]
+	fn parses_every_benchmark_profile_and_prefill_size() {
+		for (name, expected) in [
+			("mix", BenchProfile::Mix),
+			("chat", BenchProfile::Chat),
+			("prefill", BenchProfile::Prefill),
+			("generation", BenchProfile::Generation),
+		] {
+			let cli = parse(&["omp", "bench", "provider/model", "--profile", name]);
+			let Some(Command::Bench(args)) = cli.command else {
+				panic!("bench command was not parsed");
+			};
+			assert_eq!(args.profile, expected);
+		}
+		let cli = parse(&[
+			"omp",
+			"bench",
+			"provider/model",
+			"--profile",
+			"prefill",
+			"--prefill-bytes",
+			"4096",
+		]);
+		let Some(Command::Bench(args)) = cli.command else {
+			panic!("bench command was not parsed");
+		};
+		assert_eq!(args.prefill_bytes, Some(4096));
+		assert_eq!(
+			OmpCli::try_parse_from([
+				"omp",
+				"bench",
+				"provider/model",
+				"--profile",
+				"throughput",
+			])
+			.expect_err("unknown benchmark profile")
+			.kind(),
+			ErrorKind::InvalidValue
+		);
 	}
 
 	#[cfg(unix)]

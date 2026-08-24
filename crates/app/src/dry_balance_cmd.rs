@@ -108,9 +108,11 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 		bench_cmd::run(BenchArgs {
 			model:      model.key.as_str().into(),
 			data_dir:   args.data_dir,
-			runs:       args.count,
-			max_tokens: 512,
-			prompt:     Str::new_static("Reply with the word ready."),
+			runs:       Some(args.count),
+			max_tokens: Some(512),
+			prompt:     Some(Str::new_static("Reply with the word ready.")),
+			profile:    crate::cli::BenchProfile::Chat,
+			prefill_bytes: None,
 			par:        args.concurrency,
 			json:       args.json,
 		})

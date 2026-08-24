@@ -1,7 +1,7 @@
 //! Multi-language checker discovery and effect-aware execution.
 
 use std::{
-	collections::BTreeSet,
+	collections::{BTreeSet, HashSet},
 	env,
 	error::Error as StdError,
 	fs,
@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
 	parsers::{ParserInput, ParserKind, parse},
-	types::{CheckResult, Checker, CheckerEffect, Report, SkippedCheck},
+	types::{CheckResult, Checker, CheckerEffect, Diagnostic, Report, Severity, SkippedCheck},
 };
 
 /// Binary resolution authority used during discovery.
@@ -111,7 +111,8 @@ pub fn scan_project_files(project_root: &Path) -> Result<Vec<PathBuf>, io::Error
 	Ok(files)
 }
 
-/// Checker process result.
+/// Captured checker process output, complete on return and complete-line-only
+/// when delivered through the partial-output channel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessOutput {
 	/// Exit status.
@@ -127,11 +128,13 @@ pub trait CheckerRunner {
 	/// Typed process failure.
 	type Error: StdError + Send + Sync + 'static;
 
-	/// Executes an argv without shell parsing.
+	/// Executes an argv without shell parsing and optionally publishes
+	/// accumulated complete-line output while the process remains active.
 	fn run_checker(
 		&self,
 		checker: &Checker,
 		cancel: &CancellationToken,
+		partials: Option<flume::Sender<ProcessOutput>>,
 	) -> impl Future<Output = Result<ProcessOutput, Self::Error>> + Send;
 }
 
@@ -821,52 +824,171 @@ pub fn custom_suite(
 	suite
 }
 
-/// Runs read-only checkers concurrently and mutating checkers serially.
+/// Runs a suite and optionally streams each diagnostic exactly once.
+///
+/// Mutating checkers run first and withhold diagnostics until every mutator has
+/// exited, preventing repair workers from racing formatter writes. Read-only
+/// checkers then run concurrently and may emit diagnostics from partial output.
+pub async fn run_suite_streaming<R: CheckerRunner>(
+	project_root: &Path,
+	suite: &Suite,
+	runner: &R,
+	cancel: &CancellationToken,
+	diagnostics: Option<flume::Sender<Vec<Diagnostic>>>,
+) -> Result<Report, R::Error> {
+	let mut checks = Vec::with_capacity(suite.checkers.len());
+	for checker in suite
+		.checkers
+		.iter()
+		.filter(|checker| checker.effect == CheckerEffect::Mutating)
+	{
+		let process = runner.run_checker(checker, cancel, None).await?;
+		checks.push(normalize_result(project_root, checker, process));
+	}
+	if let Some(sender) = diagnostics.as_ref() {
+		for check in &checks {
+			if !check.diagnostics.is_empty() {
+				let _ = sender.send(check.diagnostics.clone());
+			}
+		}
+	}
+	let read_only = suite
+		.checkers
+		.iter()
+		.filter(|checker| checker.effect == CheckerEffect::ReadOnly);
+	let mut read_only_checks = stream::iter(read_only.map(|checker| {
+		run_checker_streaming(project_root, checker, runner, cancel, diagnostics.clone())
+	}))
+	.buffer_unordered(suite.checkers.len().max(1))
+	.collect::<Vec<_>>()
+	.await
+	.into_iter()
+	.collect::<Result<Vec<_>, R::Error>>()?;
+	checks.append(&mut read_only_checks);
+	let order = suite
+		.checkers
+		.iter()
+		.enumerate()
+		.map(|(index, checker)| (checker.id.clone(), index))
+		.collect::<std::collections::HashMap<_, _>>();
+	checks.sort_by_key(|check| order.get(&check.checker.id).copied().unwrap_or(usize::MAX));
+	let diagnostics = checks
+		.iter()
+		.flat_map(|check| check.diagnostics.iter().cloned())
+		.collect();
+	Ok(Report { checks, diagnostics, skipped: suite.skipped.clone() })
+}
+
+/// Runs a suite without diagnostic streaming.
 pub async fn run_suite<R: CheckerRunner>(
 	project_root: &Path,
 	suite: &Suite,
 	runner: &R,
 	cancel: &CancellationToken,
 ) -> Result<Report, R::Error> {
-	let read_only = suite
-		.checkers
-		.iter()
-		.filter(|checker| checker.effect == CheckerEffect::ReadOnly);
-	let mut results = stream::iter(read_only.map(|checker| async move {
-		let process = runner.run_checker(checker, cancel).await?;
-		Ok::<_, R::Error>(normalize_result(project_root, checker, process))
-	}))
-	.buffer_unordered(suite.checkers.len().max(1))
-	.collect::<Vec<_>>()
-	.await;
-	for checker in suite
-		.checkers
-		.iter()
-		.filter(|checker| checker.effect == CheckerEffect::Mutating)
-	{
-		let process = runner.run_checker(checker, cancel).await?;
-		results.push(Ok(normalize_result(project_root, checker, process)));
-	}
-	let mut report = Report {
-		checks:      results.into_iter().collect::<Result<_, _>>()?,
-		diagnostics: Vec::new(),
-		skipped:     suite.skipped.clone(),
+	run_suite_streaming(project_root, suite, runner, cancel, None).await
+}
+
+async fn run_checker_streaming<R: CheckerRunner>(
+	project_root: &Path,
+	checker: &Checker,
+	runner: &R,
+	cancel: &CancellationToken,
+	diagnostics: Option<flume::Sender<Vec<Diagnostic>>>,
+) -> Result<CheckResult, R::Error> {
+	let (partial_tx, partial_rx) = flume::unbounded();
+	let process = runner.run_checker(
+		checker,
+		cancel,
+		diagnostics.as_ref().map(|_| partial_tx),
+	);
+	tokio::pin!(process);
+	let mut emitted = HashSet::new();
+	let mut partials_open = diagnostics.is_some();
+	let output = loop {
+		tokio::select! {
+			result = &mut process => break result?,
+			partial = partial_rx.recv_async(), if partials_open => {
+				let Ok(partial) = partial else {
+					partials_open = false;
+					continue;
+				};
+				emit_fresh(
+					normalize_result(project_root, checker, partial).diagnostics,
+					&mut emitted,
+					diagnostics.as_ref(),
+				);
+			},
+		}
 	};
-	for result in &report.checks {
-		report
-			.diagnostics
-			.extend(result.diagnostics.iter().cloned());
+	let check = normalize_result(project_root, checker, output);
+	emit_fresh(check.diagnostics.clone(), &mut emitted, diagnostics.as_ref());
+	Ok(check)
+}
+
+fn emit_fresh(
+	diagnostics: Vec<Diagnostic>,
+	emitted: &mut HashSet<Str>,
+	sender: Option<&flume::Sender<Vec<Diagnostic>>>,
+) {
+	let fresh = diagnostics
+		.into_iter()
+		.filter(|diagnostic| emitted.insert(diagnostic_key(diagnostic)))
+		.collect::<Vec<_>>();
+	if !fresh.is_empty()
+		&& let Some(sender) = sender
+	{
+		let _ = sender.send(fresh);
 	}
-	Ok(report)
+}
+
+/// Stable identity used for exactly-once checker delivery and dispatch.
+pub fn diagnostic_key(diagnostic: &Diagnostic) -> Str {
+	Str::from(format!(
+		"{}\0{}\0{}\0{}\0{}",
+		diagnostic.file.as_deref().unwrap_or_default(),
+		diagnostic.line.map_or_else(String::new, |value| value.to_string()),
+		diagnostic.column.map_or_else(String::new, |value| value.to_string()),
+		diagnostic.code.as_deref().unwrap_or_default(),
+		diagnostic.message,
+	))
 }
 
 fn normalize_result(project_root: &Path, checker: &Checker, process: ProcessOutput) -> CheckResult {
-	let diagnostics = parse(checker.parser, &ParserInput {
+	let mut diagnostics = parse(checker.parser, &ParserInput {
 		checker: checker.id.as_str(),
 		checker_root: &checker.cwd,
 		project_root,
 		stdout: process.stdout.as_str(),
 		stderr: process.stderr.as_str(),
 	});
+	if process.exit_code.is_some_and(|code| code != 0) && diagnostics.is_empty() {
+		let output = if process.stderr.is_empty() {
+			process.stdout.as_str()
+		} else {
+			process.stderr.as_str()
+		};
+		let output = output
+			.char_indices()
+			.nth(12_000)
+			.map_or(output, |(cut, _)| &output[..cut]);
+		diagnostics.push(Diagnostic {
+			checker: checker.id.clone(),
+			file: None,
+			line: None,
+			column: None,
+			end_line: None,
+			end_column: None,
+			code: Some(sf!("checker-failed")),
+			severity: Severity::Error,
+			message: Str::from(format!(
+				"Checker exited with status {}{}{}",
+				process.exit_code.unwrap_or_default(),
+				if output.trim().is_empty() { "" } else { ": " },
+				output.trim(),
+			)),
+			suggestion: None,
+		});
+	}
 	CheckResult { checker: checker.clone(), exit_code: process.exit_code, diagnostics }
 }

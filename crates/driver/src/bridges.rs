@@ -523,6 +523,8 @@ pub fn builtin(
 		url_resolvers: vec![Arc::new(skill), Arc::new(rule)],
 		goal_control: Some(Arc::new(goal_control)),
 		search: Some(search),
+		edit_model: None,
+		edit_repair: None,
 		host_resources,
 		telemetry_upload: Some(Arc::new(TelemetryBridge)),
 		ask_presenter: None,

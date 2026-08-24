@@ -1705,6 +1705,7 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
                 "timeout": _worker_wire_value(declaration.timeout),
                 "concurrency": declaration.concurrency,
                 "threadsafe": declaration.threadsafe,
+                "when": _worker_wire_value(declaration.when),
                 "event_rev": _hook_catalog(declaration.event).rev,
                 "event_on_failure": _hook_catalog(declaration.event).on_failure.value,
                 "event_default": (

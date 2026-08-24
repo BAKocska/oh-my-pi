@@ -306,6 +306,8 @@ pub struct InferenceSessionOverrides {
 	pub api_key:               Option<SecretString>,
 	/// Opaque prompt-cache identity lowered by compatible codecs.
 	pub prompt_cache_affinity: Option<Str>,
+	/// Shared extension-host usage registry allocated before inference assembly.
+	pub usage_fetchers:        Option<UsageFetcherRegistry>,
 }
 
 /// Session-owned production inference authorities assembled from one credential
@@ -330,6 +332,8 @@ pub struct ProductionInference {
 	pub auth_manager:         AuthManager,
 	/// Lifecycle CONTROL view of that exact authentication owner.
 	pub auth_control:         AuthControlHandle,
+	/// Shared provider usage registry accepting extension-scoped overlays.
+	pub usage_fetchers:       UsageFetcherRegistry,
 }
 
 /// Builds the production inference RPC authority used by the gateway and chat.
@@ -356,6 +360,7 @@ pub async fn production_inference_for_session(
 ) -> Result<ProductionInference, RegistryError> {
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	let provider = overrides.provider.clone();
+	let usage_fetchers = overrides.usage_fetchers.unwrap_or_default();
 	let invocation_key = match (provider.as_ref(), overrides.api_key) {
 		(Some(provider), Some(secret)) => Some((provider.clone(), secret)),
 		(None, None) => None,
@@ -367,8 +372,15 @@ pub async fn production_inference_for_session(
 			))));
 		},
 	};
-	let (registry, sessions, authority, mcp_authority, auth_manager, _, builtins) =
-		production_assembly_for_session(data_dir, credential_store, invocation_key).await?;
+	let (registry, sessions, authority, mcp_authority, auth_manager, usage_manager, builtins) =
+		production_assembly_for_session(
+			data_dir,
+			credential_store,
+			invocation_key,
+			usage_fetchers,
+		)
+		.await?;
+	let usage_fetchers = usage_manager.fetchers();
 	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, project_root))?;
 	let search_settings = settings
 		.snapshot()
@@ -393,6 +405,7 @@ pub async fn production_inference_for_session(
 		mcp_oauth,
 		auth_manager,
 		auth_control,
+		usage_fetchers,
 	})
 }
 
@@ -411,13 +424,20 @@ async fn production_assembly(
 	),
 	RegistryError,
 > {
-	production_assembly_for_session(data_dir, credential_store, None).await
+	production_assembly_for_session(
+		data_dir,
+		credential_store,
+		None,
+		UsageFetcherRegistry::default(),
+	)
+	.await
 }
 
 async fn production_assembly_for_session(
 	data_dir: &Path,
 	credential_store: Arc<CredentialStore>,
 	invocation_key: Option<(omp_catalog::ProviderId, SecretString)>,
+	usage_fetchers: UsageFetcherRegistry,
 ) -> Result<
 	(
 		Registry,
@@ -558,7 +578,7 @@ async fn production_assembly_for_session(
 		*blake3::hash(placeholder_affinity_key().as_bytes()).as_bytes(),
 	));
 	let exposed_auth_manager = auth_manager.clone();
-	let usage_fetchers = UsageFetcherRegistry::new([
+	usage_fetchers.install_builtins([
 		Arc::new(AlibabaTokenPlanUsageFetcher::new(oauth_http.clone()))
 			as Arc<dyn ConsoleUsageFetcher>,
 		Arc::new(ClaudeUsageFetcher::new(oauth_http.clone())),

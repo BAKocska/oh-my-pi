@@ -14,6 +14,22 @@ use omp_driver::subagent::{
 use omp_proto::thread::v1::{item, part};
 use serde_json::json;
 
+const SUBAGENT_VALIDATION_GUIDANCE: &str = "Project-wide validation is the main agent's job, run \
+	once after all subagents land. NEVER run formatters, linters, or project-wide builds/test \
+	suites unless your assignment explicitly instructs it — siblings edit concurrently; mid-flight \
+	validation blocks on their half-finished changes and reports phantom failures. Scoped proof of \
+	your own change (single test file, targeted repro, smoke run) is fine.";
+
+fn without_new_validation_guidance(prompt: &str) -> String {
+	assert!(prompt.contains(SUBAGENT_VALIDATION_GUIDANCE));
+	let start = prompt.find("# Validation\n").expect("validation heading");
+	let end = prompt[start..]
+		.find("# Runtime\n")
+		.map(|offset| start + offset)
+		.expect("runtime heading");
+	format!("{}{}", &prompt[..start], &prompt[end..])
+}
+
 fn definition() -> AgentDefinition {
 	AgentDefinition::parse_markdown(
 		"golden",
@@ -45,7 +61,7 @@ fn subagent_minimal_prompt() {
 		},
 		&Props::new(),
 	);
-	insta::assert_snapshot!("subagent_minimal", prompt);
+	insta::assert_snapshot!("subagent_minimal", without_new_validation_guidance(&prompt));
 }
 
 #[test]
@@ -135,7 +151,7 @@ fn subagent_full_matrix() {
 						let name = format!(
 							"subagent_full_codex_{codex_style}_parallel_{parallel_tool_calls}_yield_{structured_yield}_plan_{plan_mode}_eager_{eager}"
 						);
-						insta::assert_snapshot!(name, prompt);
+						insta::assert_snapshot!(name, without_new_validation_guidance(&prompt));
 					}
 				}
 			}

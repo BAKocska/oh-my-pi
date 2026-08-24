@@ -208,6 +208,7 @@ pub struct LspBindingSpec {
 	root_markers:      Vec<Str>,
 	idle_timeout:      Option<Duration>,
 	readiness_timeout: Duration,
+	settings_json:     Bytes,
 }
 
 impl LspBindingSpec {
@@ -229,6 +230,7 @@ impl LspBindingSpec {
 			root_markers: Vec::new(),
 			idle_timeout: None,
 			readiness_timeout: Duration::from_secs(5),
+			settings_json: Bytes::from_static(br#"{"settings":{}}"#),
 		})
 	}
 
@@ -270,6 +272,12 @@ impl LspBindingSpec {
 		self
 	}
 
+	/// Retains the exact configuration notification used by this binding.
+	pub fn with_settings_json(mut self, settings_json: Bytes) -> Self {
+		self.settings_json = settings_json;
+		self
+	}
+
 	/// Returns whether this is a linter/checker binding.
 	pub const fn is_linter(&self) -> bool {
 		self.is_linter
@@ -278,6 +286,10 @@ impl LspBindingSpec {
 	/// Returns configured ancestor root markers.
 	pub fn root_markers(&self) -> &[Str] {
 		&self.root_markers
+	}
+	/// Returns the exact active `workspace/didChangeConfiguration` parameters.
+	pub const fn settings_json(&self) -> &Bytes {
+		&self.settings_json
 	}
 
 	fn matches(&self, uri: &Url, language: Option<&LanguageId>) -> bool {
@@ -837,12 +849,11 @@ impl LspRegistry {
 		Ok(inactive)
 	}
 
-	/// Performs protocol reload notifications before optionally replacing the
-	/// native binding lane. Callers evict config and pool caches before calling.
+	/// Re-emits the active binding configuration before optionally replacing
+	/// the native binding lane. Callers evict config and pool caches before calling.
 	pub async fn reload_binding(
 		&self,
 		binding_id: LspBindingId,
-		settings_json: Bytes,
 		replacement: Option<LspServer>,
 		cancel: CancellationToken,
 	) -> Result<(), LspRegistryError> {
@@ -860,7 +871,11 @@ impl LspRegistry {
 		}
 		binding
 			.server
-			.notification("workspace/didChangeConfiguration", settings_json, cancel.child_token())
+			.notification(
+				"workspace/didChangeConfiguration",
+				binding.spec.settings_json().clone(),
+				cancel.child_token(),
+			)
 			.await?;
 		if let Some(replacement) = replacement {
 			self
@@ -3407,6 +3422,46 @@ mod tests {
 			spec:       LspBindingSpec::new(name, priority, LspSelector::all()).unwrap(),
 			server:     server(),
 			generation: 0,
+		}
+	}
+	#[tokio::test]
+	async fn reload_emits_exact_active_settings_without_restarting() {
+		let root = tempfile::tempdir().unwrap();
+		let registry =
+			LspRegistry::new(DocumentStore::new(ServerConfig::new(root.path()).unwrap()).unwrap());
+		let configured = Bytes::from_static(
+			br#"{"settings":{"rust-analyzer":{"cargo":{"features":["all"]}}}}"#,
+		);
+		let empty = Bytes::from_static(br#"{"settings":{}}"#);
+
+		for (name, settings_json) in [("configured", configured), ("empty", empty)] {
+			let transport = Arc::new(ToggleNotifyTransport {
+				fail: AtomicBool::new(false),
+				params: Mutex::new(Vec::new()),
+			});
+			let server = LspServer::new(
+				transport.clone(),
+				Bytes::from_static(br#"{"textDocumentSync":{"openClose":true,"change":1}}"#),
+			)
+			.unwrap();
+			let binding_id = registry
+				.add_binding(
+					LspBindingSpec::new(name, 0, LspSelector::all())
+						.unwrap()
+						.with_settings_json(settings_json.clone()),
+					server,
+					CancellationToken::new(),
+				)
+				.await
+				.unwrap();
+
+			registry
+				.reload_binding(binding_id, None, CancellationToken::new())
+				.await
+				.unwrap();
+
+			assert_eq!(transport.params.lock().as_slice(), &[settings_json]);
+			assert_eq!(registry.binding(binding_id).unwrap().generation, 0);
 		}
 	}
 

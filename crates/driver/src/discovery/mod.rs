@@ -40,7 +40,9 @@ use omp_core::Str;
 
 use self::{
 	foreign::ForeignContentSettings,
-	manifest::{CapabilityKind, CapabilityPayload, CapabilityRecord, SourceScope},
+	manifest::{
+		CapabilityKind, CapabilityPayload, CapabilityRecord, DiscoveredCapability, SourceScope,
+	},
 	native::NativeDiscoveryOptions,
 	registry::{CAPABILITY_KINDS, CapabilityResult, DiscoveryRegistry, LoadContext, LoadOptions},
 	skills::SkillDiscoverySettings,
@@ -99,6 +101,8 @@ pub struct ActiveContentSnapshots {
 	pub commands: Arc<[CommandContribution]>,
 	/// Bounded non-fatal diagnostics emitted while loading static content.
 	pub warnings: Arc<[Str]>,
+	/// Frozen declarations from the same startup discovery pass.
+	pub declarations: Arc<[DiscoveredCapability]>,
 }
 
 /// Discovers native repository/user content once and freezes the skill/rule
@@ -110,6 +114,9 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 	let foreign = foreign::discover(root, &ForeignContentSettings::default());
 	discovered.declarations.extend(foreign.skills);
 	discovered.declarations.extend(foreign.rules);
+	discovered.declarations.extend(foreign.prompts);
+	discovered.declarations.extend(foreign.instructions);
+	discovered.declarations.extend(foreign.commands);
 	discovered.warnings.extend(foreign.warnings);
 	let managed = managed_skills::discover_dead_last(
 		&native::user_config_root(&home),
@@ -135,7 +142,10 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 				name:        command.name.clone(),
 				aliases:     Vec::new(),
 				description: command.description.clone(),
-				hint:        Some(Str::new_static("[arguments]")),
+				hint:        command
+					.argument_hint
+					.clone()
+					.or_else(|| Some(Str::new_static("[arguments]"))),
 				origin:      Str::new_static(origin),
 				template:    Some(command.content.clone()),
 			})
@@ -153,8 +163,9 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 			&discovered.declarations,
 			&RulebookSettings::default(),
 		)),
-		commands: commands.into(),
-		warnings: discovered.warnings.into(),
+		commands:     commands.into(),
+		warnings:     discovered.warnings.into(),
+		declarations: discovered.declarations.into(),
 	}
 }
 

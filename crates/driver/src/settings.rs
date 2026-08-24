@@ -10,7 +10,7 @@ pub use domains::{
 	AppearanceSettings, CompletionSettings, DisplaySettings, ErrorNotificationSettings,
 	HyperlinkMode, InteractionSettings, LifecycleSettings, NotifyToggle, ResizeScrollbackMode,
 	RootDisplaySettings, ShareSettings, ShareStore, ShimmerMode, TitleSettings, TtsrContextMode,
-	TtsrInterruptMode, TtsrSettings, TuiSettings,
+	TtsrInterruptMode, TtsrSettings, TuiSettings, UnexpectedStopMode,
 };
 pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
 impl PromptSettings {
@@ -317,6 +317,39 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		secret:      false,
 	},
 	omp_settings::FieldDescriptor {
+		path:        "spelling.typo_detection",
+		label:       "Typo detection",
+		description: "Underline spelling mistakes in the composer.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       71,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "spelling.autocomplete",
+		label:       "Spelling autocomplete",
+		description: "Offer platform spelling completions.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       72,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "spelling.autocorrect",
+		label:       "Spelling autocorrect",
+		description: "Apply platform spelling corrections automatically.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       73,
+		options:     None,
+		condition:   None,
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
 		path:        "extensions",
 		label:       "Extensions",
 		description: "Client-scope extension overlay.",
@@ -578,6 +611,25 @@ pub struct ComposerSettings {
 	#[serde(default)]
 	pub shape: ComposerStyle,
 }
+/// Platform spelling assistance for the interactive composer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpellingSettings {
+	/// Whether misspellings are detected and underlined.
+	#[serde(default = "default_true")]
+	pub typo_detection: bool,
+	/// Whether platform spelling completions are offered.
+	#[serde(default = "default_true")]
+	pub autocomplete:   bool,
+	/// Whether platform spelling corrections are applied automatically.
+	#[serde(default)]
+	pub autocorrect:    bool,
+}
+
+impl Default for SpellingSettings {
+	fn default() -> Self {
+		Self { typo_detection: true, autocomplete: true, autocorrect: false }
+	}
+}
 
 /// Prompt image attachment policy.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -782,6 +834,9 @@ pub struct Settings {
 	/// Interactive composer appearance.
 	#[serde(default)]
 	pub composer:      ComposerSettings,
+	/// Platform spelling assistance for the interactive composer.
+	#[serde(default)]
+	pub spelling:      SpellingSettings,
 	/// Terminal display and rendering behavior.
 	#[serde(default)]
 	pub display:       DisplaySettings,
@@ -1012,6 +1067,30 @@ mod tests {
 		let encoded = toml::to_string(&settings).expect("composer settings serialize");
 		assert!(encoded.contains("[composer]"));
 		assert!(encoded.contains("shape = \"rail\""));
+	}
+	#[test]
+	fn unexpected_stop_and_spelling_defaults_are_explicit() {
+		let defaults: Settings = toml::from_str("").expect("defaults parse");
+		assert_eq!(
+			defaults.interaction.unexpected_stop_detection,
+			UnexpectedStopMode::Mechanical,
+		);
+		assert!(defaults.spelling.typo_detection);
+		assert!(defaults.spelling.autocomplete);
+		assert!(!defaults.spelling.autocorrect);
+
+		let configured: Settings = toml::from_str(
+			"[interaction]\nunexpectedStopDetection = \"smart\"\n[spelling]\ntypo_detection = \
+			 false\nautocomplete = false\nautocorrect = true",
+		)
+		.expect("unexpected-stop and spelling settings parse");
+		assert_eq!(
+			configured.interaction.unexpected_stop_detection,
+			UnexpectedStopMode::Smart,
+		);
+		assert!(!configured.spelling.typo_detection);
+		assert!(!configured.spelling.autocomplete);
+		assert!(configured.spelling.autocorrect);
 	}
 
 	#[test]

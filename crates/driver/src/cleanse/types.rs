@@ -123,7 +123,7 @@ pub struct FileIssues {
 	pub weight:      u64,
 }
 
-/// File-disjoint LPT assignment for one repair child.
+/// File-disjoint assignment for one continuously scheduled repair child.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Assignment {
 	/// Stable zero-based assignment index.

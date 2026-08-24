@@ -226,13 +226,19 @@ impl LspProcessConfig {
 			self.selector.schemes.clone(),
 			self.selector.path_patterns.clone(),
 		)?;
+		let settings_json = serde_json::to_vec(&serde_json::json!({
+			"settings": self.settings.as_ref().cloned().unwrap_or_else(|| serde_json::json!({})),
+		}))
+		.map(Bytes::from)
+		.map_err(|source| LspProcessError::SerializeConfig { source })?;
 		Ok(LspBindingSpec::new(self.name.as_str(), self.priority, selector)?
 			.with_linter(self.is_linter)
 			.with_root_markers(self.root_markers.clone())
 			.with_lifecycle(
 				self.idle_timeout_ms.map(Duration::from_millis),
 				Duration::from_millis(self.readiness_timeout_ms),
-			))
+			)
+			.with_settings_json(settings_json))
 	}
 }
 
@@ -429,6 +435,7 @@ impl LspProcess {
 
 			let capabilities = extract_capabilities(&result)?;
 			let server = LspServer::new(transport.clone(), capabilities)?;
+			let settings_json = spec.settings_json().clone();
 			let binding_id = environment
 				.lsp()
 				.add_binding(spec, server, cancel.child_token())
@@ -462,18 +469,16 @@ impl LspProcess {
 					.await;
 				return Err(error.into());
 			}
-			if let Some(settings) = config.settings {
-				let settings_result = serde_json::to_vec(&serde_json::json!({ "settings": settings }))
-					.map(Bytes::from)
-					.map_err(|source| LspProcessError::SerializeConfig { source });
-				let settings_result = match settings_result {
-					Ok(params) => transport
-						.notify("workspace/didChangeConfiguration", params, cancel.child_token())
-						.await
-						.map_err(LspProcessError::from),
-					Err(error) => Err(error),
-				};
-				if let Err(error) = settings_result {
+			if config.settings.is_some() {
+				if let Err(error) = transport
+					.notify(
+						"workspace/didChangeConfiguration",
+						settings_json,
+						cancel.child_token(),
+					)
+					.await
+					.map_err(LspProcessError::from)
+				{
 					let _ = environment
 						.lsp()
 						.remove_binding(binding_id, CancellationToken::new())

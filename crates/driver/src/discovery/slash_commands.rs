@@ -36,6 +36,8 @@ pub struct SlashCommand {
 	pub name:        Str,
 	/// Display description.
 	pub description: Str,
+	/// Parsed argument hint from file frontmatter.
+	pub argument_hint: Option<Str>,
 	/// Prompt template.
 	pub content:     Str,
 	/// Canonical source path for file declarations.
@@ -61,6 +63,8 @@ pub enum SlashCommandError {
 #[derive(Default, Deserialize)]
 struct Frontmatter {
 	description: Option<Str>,
+	#[serde(alias = "argumentHint", alias = "argument-hint")]
+	argument_hint: Option<Str>,
 }
 
 /// Parses optional YAML frontmatter and derives a description from the first
@@ -81,8 +85,11 @@ pub fn parse_markdown(
 	} else {
 		(None, markdown)
 	};
-	let description = frontmatter
-		.and_then(|frontmatter| frontmatter.description)
+	let (frontmatter_description, frontmatter_argument_hint) = frontmatter.map_or(
+		(None, None),
+		|frontmatter| (frontmatter.description, frontmatter.argument_hint),
+	);
+	let description = frontmatter_description
 		.or_else(|| {
 			body
 				.lines()
@@ -93,7 +100,10 @@ pub fn parse_markdown(
 		.filter(|description| !description.as_str().is_empty())
 		.ok_or(SlashCommandError::MissingDescription)?;
 	let description = bounded_description(description.as_str());
-	Ok(CommandPayload { name, path, description, content: Str::new(body) })
+	let argument_hint = frontmatter_argument_hint
+		.map(|hint| Str::new(hint.trim()))
+		.filter(|hint| !hint.is_empty());
+	Ok(CommandPayload { name, path, description, argument_hint, content: Str::new(body) })
 }
 
 fn bounded_description(description: &str) -> Str {
@@ -119,23 +129,54 @@ pub fn merge(
 		commands
 			.entry(file.name.clone())
 			.or_insert_with(|| SlashCommand {
-				name:        file.name,
-				description: file.description,
-				content:     file.content,
-				path:        Some(file.path),
-				source:      CommandSource::File,
+				name:          file.name,
+				description:   file.description,
+				argument_hint: file.argument_hint,
+				content:       file.content,
+				path:          Some(file.path),
+				source:        CommandSource::File,
 			});
 	}
 	for embedded in embedded {
 		commands
 			.entry(embedded.name.clone())
 			.or_insert_with(|| SlashCommand {
-				name:        embedded.name,
-				description: embedded.description,
-				content:     embedded.content,
-				path:        None,
-				source:      CommandSource::Embedded,
+				name:          embedded.name,
+				description:   embedded.description,
+				argument_hint: None,
+				content:       embedded.content,
+				path:          None,
+				source:        CommandSource::Embedded,
 			});
 	}
 	commands
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn preserves_frontmatter_fields_and_an_empty_body() {
+		let parsed = parse_markdown(
+			Str::new_static("deploy"),
+			PathBuf::from("/repo/.omp/commands/deploy.md"),
+			"---\ndescription: Deploy a service\nargument-hint: <service>\n---\n",
+		)
+		.expect("frontmatter-only command");
+		assert_eq!(parsed.description, "Deploy a service");
+		assert_eq!(parsed.argument_hint.as_deref(), Some("<service>"));
+		assert!(parsed.content.is_empty());
+	}
+
+	#[test]
+	fn accepts_camel_case_argument_hint_and_keeps_body_arguments_separate() {
+		let parsed = parse_markdown(
+			Str::new_static("deploy"),
+			PathBuf::from("/repo/.omp/commands/deploy.md"),
+			"---\ndescription: Deploy\nargumentHint: <service>\n---\nDeploy $ARGUMENTS\n",
+		)
+		.expect("command");
+		assert_eq!(parsed.argument_hint.as_deref(), Some("<service>"));
+		assert_eq!(parsed.content, "Deploy $ARGUMENTS\n");
+	}
 }

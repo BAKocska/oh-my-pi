@@ -116,6 +116,7 @@ pub struct HeadlessSession {
 	session_id:          Str,
 	initial_items:       Vec<Item>,
 	_inference_registry: InferenceRegistry,
+	_edit_repair_task:   Option<tokio::task::JoinHandle<()>>,
 	_environment:        omp_envd::ProjectEnvironment,
 }
 
@@ -156,8 +157,12 @@ impl HeadlessSession {
 		let search = Arc::new(InferenceBridge::default());
 		let goal_control = AgentGoalControl::default();
 		let advise_queue = omp_agent::advisor::AdvisorAdviceQueue::default();
-		let bridges =
+		let (edit_repair, edit_repair_requests) =
+			omp_tools::edit::observer::EditRepairClient::channel();
+		let mut bridges =
 			builtin(&root, Arc::clone(&search), goal_control.clone(), None, advise_queue.clone());
+		bridges.edit_model = Some(model.clone());
+		bridges.edit_repair = settings.tools.edit_auto_repair.then_some(edit_repair);
 		let environment = omp_envd::ProjectEnvironment::connect_or_start(
 			&root,
 			&state_dir,
@@ -218,6 +223,8 @@ impl HeadlessSession {
 					format!("{}/{}", model.model.provider.0, model.model.model.0);
 			}
 		}
+		snapshot.compaction = settings.compaction.method_order();
+		snapshot.unexpected_stop = settings.interaction.unexpected_stop_detection;
 		let autolearn = omp_agent::AutolearnSettings {
 			enabled:        settings.autolearn.enabled
 				&& registry
@@ -242,6 +249,7 @@ impl HeadlessSession {
 				provider:              options.credential_provider,
 				api_key:               options.api_key,
 				prompt_cache_affinity: options.prompt_cache_affinity,
+				usage_fetchers:        Some(environment.usage_fetchers()),
 			},
 		)
 		.await
@@ -264,6 +272,9 @@ impl HeadlessSession {
 			settings.security.enabled,
 			Arc::clone(&tree),
 		));
+		let edit_repair_task = settings.tools.edit_auto_repair.then(|| {
+			chat::spawn_edit_repair_service(Arc::clone(&advisor_parent), edit_repair_requests)
+		});
 		let journal_path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
 		let content = discovery::active_content_snapshots(&root);
 		let (ttsr, ttsr_diagnostics) = rulebook::ttsr_registry(content.rules.as_ref());
@@ -272,6 +283,8 @@ impl HeadlessSession {
 		}
 		let mut agent =
 			Agent::new(client, env.clone(), state.clone(), session.journal, chat::CHAT_CAPS_BASE);
+		agent.configure_streaming_edit_guard(root.clone(), settings.tools.edit_streaming_abort);
+		agent.set_unexpected_stop_classifier(advisor_parent.clone());
 		agent.set_autolearn(autolearn);
 		blueprint.configure_agent(&mut agent);
 		match production_redemption_authority(&state_dir) {
@@ -368,6 +381,7 @@ impl HeadlessSession {
 			session_id: session.id,
 			initial_items: session.initial_items,
 			_inference_registry: inference_registry,
+			_edit_repair_task: edit_repair_task,
 			_environment: environment,
 		})
 	}

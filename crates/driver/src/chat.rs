@@ -26,7 +26,7 @@ use omp_agent::{
 	ChildKind, CompletionError, CompletionRequest, Journal, MAX_YIELD_SCHEMA_RETRIES, PromptFacts,
 	RegistryStatus, SubagentDisposition, SubagentLifecycle, SubagentProgressSnapshot,
 	SubagentRunState, SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId, TurnInput,
-	TurnOptions, TurnSession as _, WorkspaceRootInput, WorkspaceRootsInput, YieldPayloadValidator,
+	TurnOptions, TurnSession as _, UnexpectedStopClassifier, WorkspaceRootInput, WorkspaceRootsInput, YieldPayloadValidator,
 	project_journal, resolve_completion, scheduler::BudgetReservation,
 };
 use omp_catalog::{AuthSpecKind, GrammarBits, model::ProvenanceKind, snapshot};
@@ -72,7 +72,6 @@ use omp_storage::{
 };
 use omp_telemetry::firehose::Firehose;
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry};
-use omp_tools::memory::{ReflectionHost, ReflectionHostError};
 use parking_lot::Mutex;
 use prost::Message as _;
 use serde_json::{Value, json, value::RawValue};
@@ -88,7 +87,6 @@ use crate::{
 	auth_flow::{AuthPromptKind, ChatAuth, ChatAuthCommand, ChatAuthEvent},
 	discovery,
 	hub::{self as hub_backend},
-	memory::InferenceExtractionLane,
 	model_controls::{
 		ProviderCatalogCursor, ProviderControlBackend, ProviderControlError, ProviderControlRequest,
 		ProviderControlResult, ProviderDeclarationDocument, ProviderModelCard, ProviderModelEvent,
@@ -3810,6 +3808,14 @@ fn bridge_outcome_text(outcome: &inference_pb::Outcome) -> String {
 	}
 	text
 }
+fn suppress_eval_spawn_guidance(params: &mut inference_pb::ChatParams) {
+	let mut snapshot = omp_tools::eval::TaskDescriptionSnapshot::standard();
+	snapshot.agents = &[];
+	let description = omp_tools::eval::task_description(snapshot);
+	if let Some(tool) = params.tools.iter_mut().find(|tool| tool.name == "eval") {
+		tool.description = description.to_string();
+	}
+}
 
 fn completion_usage(outcome: &inference_pb::Outcome, wall: Duration) -> Value {
 	let usage = outcome.usage.as_ref();
@@ -3847,15 +3853,50 @@ fn retain_security_review_result(
 	Ok(Some((data, validated.report, validated.artifact_uri)))
 }
 
-#[async_trait]
-impl<C: TurnClient + Clone + Send + 'static> ReflectionHost for ChatParentHost<C> {
-	async fn reflect(
+impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
+	async fn complete_auxiliary_text(
 		&self,
-		request: omp_tools::memory::ReflectionRequest,
-	) -> Result<Str, ReflectionHostError> {
-		let params = self.context.lock().state.snapshot().turn.params.clone();
-		let lane = InferenceExtractionLane::with_selector(self.client.clone(), params, "@memory");
-		ReflectionHost::reflect(&lane, request).await
+		role: &str,
+		system_prompt: &str,
+		input: &str,
+	) -> Result<Option<Str>, Str> {
+		let context = self.context.lock().clone();
+		let mut params = context.state.snapshot().turn.params.clone();
+		params.tools.clear();
+		params.tool_choice = None;
+		params.response_format = None;
+		params.model = format!("@{role}");
+		let options = TurnOptions {
+			context_id: None,
+			params,
+			executor: None,
+			props: None,
+			provider_reset: false,
+			stream_watchdog: omp_agent::StreamWatchdog::default(),
+		};
+		let items =
+			vec![bridge_message(Role::System, system_prompt), bridge_message(Role::User, input)];
+		let mut turn = self
+			.client
+			.turn(
+				TurnId::new(format!("auxiliary-{}", omp_core::Ulid::generate())),
+				TurnInput::Full(Thread { items }),
+				&options,
+			)
+			.await
+			.map_err(|error| Str::from(error.to_string()))?;
+		let mut events = turn.events();
+		while let Some(event) = events.next().await {
+			let event = event.map_err(|error| Str::from(error.to_string()))?;
+			match event.event {
+				Some(turn_event::Event::Outcome(outcome)) => {
+					return Ok(Some(Str::from(bridge_outcome_text(&outcome))));
+				},
+				Some(turn_event::Event::Error(error)) => return Err(Str::from(error.detail)),
+				_ => {},
+			}
+		}
+		Ok(None)
 	}
 }
 
@@ -3866,49 +3907,58 @@ impl<C: TurnClient + Clone + Send + 'static> OnlineTitleCompletion for ChatParen
 		system_prompt: &'a str,
 		input: &'a str,
 	) -> Pin<Box<dyn Future<Output = Result<Option<Str>, Str>> + Send + 'a>> {
+		let role = roles.first().copied().unwrap_or("tiny");
+		Box::pin(self.complete_auxiliary_text(role, system_prompt, input))
+	}
+}
+
+impl<C: TurnClient + Clone + Send + 'static> UnexpectedStopClassifier for ChatParentHost<C> {
+	fn should_continue<'a>(
+		&'a self,
+		text: &'a str,
+	) -> Pin<Box<dyn Future<Output = Result<bool, Str>> + Send + 'a>> {
+		const PROMPT: &str = "Classify whether the assistant stopped while promising or starting \
+		                      unfinished work. Return exactly CONTINUE when another turn is needed, \
+		                      otherwise return exactly STOP.";
 		Box::pin(async move {
-			let context = self.context.lock().clone();
-			let mut params = context.state.snapshot().turn.params.clone();
-			params.tools.clear();
-			params.tool_choice = None;
-			params.response_format = None;
-			let role = roles.first().copied().unwrap_or("tiny");
-			params.model = format!("@{role}");
-			let options = TurnOptions {
-				context_id: None,
-				params,
-				executor: None,
-				props: None,
-				provider_reset: false,
-				stream_watchdog: omp_agent::StreamWatchdog::default(),
-			};
-			let items =
-				vec![bridge_message(Role::System, system_prompt), bridge_message(Role::User, input)];
-			let mut turn = self
-				.client
-				.turn(
-					TurnId::new(format!("session-title-{}", omp_core::Ulid::generate())),
-					TurnInput::Full(Thread { items }),
-					&options,
-				)
-				.await
-				.map_err(|error| Str::from(error.to_string()))?;
-			let mut events = turn.events();
-			while let Some(event) = events.next().await {
-				let event = event.map_err(|error| Str::from(error.to_string()))?;
-				match event.event {
-					Some(turn_event::Event::Outcome(outcome)) => {
-						return Ok(Some(Str::from(bridge_outcome_text(&outcome))));
-					},
-					Some(turn_event::Event::Error(error)) => {
-						return Err(Str::from(error.detail));
-					},
-					_ => {},
-				}
-			}
-			Ok(None)
+			Ok(self
+				.complete_auxiliary_text("tiny", PROMPT, text)
+				.await?
+				.is_some_and(|answer| answer.trim().eq_ignore_ascii_case("CONTINUE")))
 		})
 	}
+}
+/// Starts the typed edit auto-repair consumer on the smol role.
+pub fn spawn_edit_repair_service<C>(
+	parent: Arc<ChatParentHost<C>>,
+	requests: flume::Receiver<omp_tools::edit::observer::EditRepairRequest>,
+) -> JoinHandle<()>
+where
+	C: TurnClient + Clone + Send + 'static,
+{
+	tokio::spawn(async move {
+		while let Ok(request) = requests.recv_async().await {
+			let input = request.prompt.render();
+			let result = parent
+				.complete_auxiliary_text(
+					"smol",
+					"Follow the repair request exactly and return code only.",
+					input.as_str(),
+				)
+				.await
+				.map_err(|message| omp_tools::edit::observer::EditRepairError::Completion {
+					message,
+				})
+				.and_then(|answer| {
+					answer.ok_or_else(|| {
+						omp_tools::edit::observer::EditRepairError::Completion {
+							message: sf!("edit repair model returned no source"),
+						}
+					})
+				});
+			let _ = request.reply.send_async(result).await;
+		}
+	})
 }
 
 #[async_trait]
@@ -4442,6 +4492,11 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			enable_lsp: request.enable_lsp,
 			prewalk_gate: prewalk.armed(),
 		});
+		let child_can_spawn = child_settings.max_recursion_depth == -1
+			|| i32::from(node.depth) < i32::from(child_settings.max_recursion_depth);
+		if !child_can_spawn {
+			suppress_eval_spawn_guidance(&mut child_snapshot.turn.params);
+		}
 		let child_env = isolated_environment
 			.as_ref()
 			.map_or_else(|| self.env.clone(), |environment| environment.client().clone());
@@ -4479,8 +4534,7 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			output_schema:     request.output_schema.as_ref(),
 			self_name:         node.name.as_str(),
 			self_role:         definition.name.as_str(),
-			irc_enabled:       child_settings.max_recursion_depth == -1
-				|| i32::from(node.depth) < i32::from(child_settings.max_recursion_depth),
+			irc_enabled:       child_can_spawn,
 			roster_generation: context.tree.roster_generation(),
 			peers:             &peers,
 			capabilities:      ModelFamilyCapabilities {

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+pub use omp_agent::UnexpectedStopMode;
 use omp_core::Str;
 use omp_settings::{
 	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain,
@@ -472,6 +473,8 @@ pub struct InteractionSettings {
 	pub voice:               Option<Str>,
 	/// Automatic agent loop mode.
 	pub loop_mode:           bool,
+	/// Unexpected assistant-stop recovery policy.
+	pub unexpected_stop_detection: UnexpectedStopMode,
 	/// Line threshold above which the large-paste menu is offered.
 	pub paste_threshold:     usize,
 	/// User-defined composer keyword expansions.
@@ -492,6 +495,7 @@ impl Default for InteractionSettings {
 			live_voice_enabled:  false,
 			voice:               None,
 			loop_mode:           false,
+			unexpected_stop_detection: UnexpectedStopMode::Mechanical,
 			paste_threshold:     default_paste_threshold(),
 			magic_keywords:      BTreeMap::new(),
 			queue_follow_ups:    true,
@@ -545,6 +549,13 @@ impl SettingsDomain for InteractionSettings {
 			"Continue autonomous turns when supported.",
 			SettingKind::Boolean,
 			70,
+		),
+		field(
+			"interaction.unexpectedStopDetection",
+			"Unexpected Stops",
+			"Recover no-message stops mechanically or classify text-only stops with a small model.",
+			SettingKind::Enum(&["none", "mechanical", "smart"]),
+			71,
 		),
 		field(
 			"interaction.pasteThreshold",

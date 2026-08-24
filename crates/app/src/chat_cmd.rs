@@ -39,7 +39,7 @@ use omp_driver::{
 		roles, runtime,
 	},
 	hub as hub_backend,
-	memory::RuntimePromptMemorySource,
+	memory::{InferenceExtractionLane, RuntimePromptMemorySource},
 	model_controls::{ProductionProviderApplicationOwner, ProviderControlAuthorityFactory},
 	modes::CampaignHandle,
 	plan::ModelSelection,
@@ -355,6 +355,74 @@ pub enum ChatPresentation {
 	/// Render through the native GPU window host.
 	Gui,
 }
+fn shell_argument(value: &str) -> String {
+	if !value.is_empty()
+		&& value
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+	{
+		return value.to_owned();
+	}
+	let mut quoted = String::with_capacity(value.len() + 2);
+	quoted.push('\'');
+	for (index, fragment) in value.split('\'').enumerate() {
+		if index > 0 {
+			quoted.push_str("'\"'\"'");
+		}
+		quoted.push_str(fragment);
+	}
+	quoted.push('\'');
+	quoted
+}
+
+fn resume_command(profile: Option<&str>, session_id: &str) -> String {
+	let mut command = String::from("omp");
+	if let Some(profile) = profile {
+		if profile.starts_with('-') {
+			command.push_str(" --profile=");
+		} else {
+			command.push_str(" --profile ");
+		}
+		command.push_str(&shell_argument(profile));
+	}
+	if session_id.starts_with('-') {
+		command.push_str(" --resume=");
+	} else {
+		command.push_str(" --resume ");
+	}
+	command.push_str(&shell_argument(session_id));
+	command
+}
+
+#[cfg(test)]
+mod resume_hint_tests {
+	use super::*;
+
+	#[test]
+	fn resume_hint_omits_the_default_profile() {
+		assert_eq!(resume_command(None, "abc123"), "omp --resume abc123");
+	}
+
+	#[test]
+	fn resume_hint_includes_a_named_profile() {
+		assert_eq!(
+			resume_command(Some("personal"), "abc123"),
+			"omp --profile personal --resume abc123"
+		);
+	}
+
+	#[test]
+	fn resume_hint_quotes_shell_metacharacters() {
+		assert_eq!(
+			resume_command(Some("team's profile"), "session;rm"),
+			"omp --profile 'team'\"'\"'s profile' --resume 'session;rm'"
+		);
+		assert_eq!(
+			resume_command(Some("-isolated"), "abc123"),
+			"omp --profile=-isolated --resume abc123"
+		);
+	}
+}
 
 /// Runs one interactive durable project-chat session.
 #[cfg(any(unix, windows))]
@@ -604,6 +672,14 @@ pub(crate) async fn run(
 	let search_bridge = Arc::new(InferenceBridge::default());
 	let goal_control = AgentGoalControl::default();
 	let advise_queue = omp_agent::advisor::AdvisorAdviceQueue::default();
+	let mut edit_repair_requests = None;
+	let edit_repair = if settings.tools.edit_auto_repair {
+		let (client, requests) = omp_tools::edit::observer::EditRepairClient::channel();
+		edit_repair_requests = Some(requests);
+		Some(client)
+	} else {
+		None
+	};
 	let bridges = omp_driver::bridges::builtin(
 		&root,
 		Arc::clone(&search_bridge),
@@ -613,6 +689,8 @@ pub(crate) async fn run(
 	);
 	let bridges = omp_envd::RegistryBridges {
 		ask_presenter: Some(omp_chat_ui::ask::presenter()),
+		edit_model: Some(model.clone()),
+		edit_repair,
 		// A remote gateway serves search/media itself; leave the host
 		// bridge unbound so `bind_remote` can install the gateway client
 		// instead of colliding with the pre-seeded local facade.
@@ -808,6 +886,8 @@ pub(crate) async fn run(
 			);
 		}
 	}
+	snapshot.compaction = settings.compaction.method_order();
+	snapshot.unexpected_stop = settings.interaction.unexpected_stop_detection;
 	snapshot.reasoning_dialect = interrupted_reasoning_dialect(catalog, &snapshot.turn.params.model);
 	prompt_facts.model.identifier = Str::new(&snapshot.turn.params.model);
 	prompt_facts.model.codex_task_policy =
@@ -895,8 +975,9 @@ pub(crate) async fn run(
 	let state = AgentState::new(snapshot);
 	let initial_campaign = (args.plan_mode || args.plan_yolo).then_some("plan");
 	let initial_prompt_slot = args.plan_yolo.then_some("plan-yolo");
+	let initial_session = session.id.clone();
 
-	if let Some(endpoint) = args.gateway {
+	let final_session = if let Some(endpoint) = args.gateway {
 		if args.api_key.is_some() || args.prompt_cache_key.is_some() {
 			return Err(miette::miette!(
 				"--api-key and --prompt-cache-key require in-process inference"
@@ -922,6 +1003,7 @@ pub(crate) async fn run(
 			session,
 			blueprint,
 			eval_control.clone(),
+			edit_repair_requests,
 			None,
 			goal_control.clone(),
 			None,
@@ -956,7 +1038,7 @@ pub(crate) async fn run(
 			presentation,
 		))
 		.await
-		.into_diagnostic()?;
+		.into_diagnostic()
 	} else {
 		let omp_driver::registry::ProductionInference {
 			registry: inference_registry,
@@ -973,6 +1055,7 @@ pub(crate) async fn run(
 				provider:              credential_provider,
 				api_key:               args.api_key.clone(),
 				prompt_cache_affinity: args.prompt_cache_key.clone(),
+				usage_fetchers:        Some(environment.usage_fetchers()),
 			},
 		)
 		.await
@@ -999,6 +1082,7 @@ pub(crate) async fn run(
 			session,
 			blueprint,
 			eval_control,
+			edit_repair_requests,
 			Some(inference_registry),
 			goal_control,
 			Some(auth_control),
@@ -1033,7 +1117,25 @@ pub(crate) async fn run(
 			presentation,
 		))
 		.await
-		.into_diagnostic()?;
+		.into_diagnostic()
+	};
+	let final_session = match final_session {
+		Ok(session) => session,
+		Err(error) => {
+			if !args.no_session {
+				eprintln!(
+					"\nResume this session with {}",
+					resume_command(omp_core::dirs::selected_profile(), initial_session.as_str())
+				);
+			}
+			return Err(error);
+		},
+	};
+	if !args.no_session {
+		eprintln!(
+			"\nResume this session with {}",
+			resume_command(omp_core::dirs::selected_profile(), final_session.as_str())
+		);
 	}
 
 	// `environment` is deliberately retained until the agent and UI have been
@@ -1410,6 +1512,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	mut session: Session,
 	mut blueprint: SessionBlueprint,
 	eval_control: EvalSessionControl,
+	edit_repair_requests: Option<flume::Receiver<omp_tools::edit::observer::EditRepairRequest>>,
 	auth_registry: Option<InferenceRegistry>,
 	goal_control: AgentGoalControl,
 	auth_control: Option<omp_inference::auth::AuthControlHandle>,
@@ -1434,7 +1537,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	scope: ChatScope<'_>,
 	mut start: ChatStart,
 	presentation: ChatPresentation,
-) -> Result<(), ChatError> {
+) -> Result<Str, ChatError> {
 	let memory_source =
 		Arc::new(RuntimePromptMemorySource::new(environment.memory_runtime(), usize::MAX));
 	let memory_prompt = omp_driver::memory::prompt_snapshot(
@@ -1465,6 +1568,8 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		Arc::clone(&scope.session_index),
 		security_enabled,
 	));
+	let edit_repair_service = edit_repair_requests
+		.map(|requests| omp_driver::chat::spawn_edit_repair_service(parent.clone(), requests));
 	environment
 		.bind_schedule_delivery(parent.schedule_delivery_backend())
 		.await?;
@@ -1476,7 +1581,11 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
 	environment
 		.reflection_bridge()
-		.bind(parent.clone())
+		.bind(Arc::new(InferenceExtractionLane::with_selector(
+			client.clone(),
+			state.snapshot().turn.params.clone(),
+			"@smol",
+		)))
 		.map_err(DriverChatError::from)?;
 	let cold_agents = scope.sessions_dir.join("eval-agents");
 	if cold_agents.is_dir() {
@@ -1489,7 +1598,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	let drafts = DraftStore::new(&data_dir)?;
 	let breadcrumbs = TerminalBreadcrumbs::new(&data_dir)?;
 	let terminal_id = omp_tui::ttyid::terminal_id();
-	loop {
+	let final_id = loop {
 		if scope.persist_sessions {
 			breadcrumbs.restamp(terminal_id.as_str(), &SessionId(session.id.clone()))?;
 		}
@@ -1524,13 +1633,19 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		let mut agent =
 			Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
 		parent.bind_host_control(id.clone(), agent.host_control());
+		agent.set_unexpected_stop_classifier(parent.clone());
+		let runtime_settings = omp_driver::settings::current(&data_dir)?;
+		agent.configure_streaming_edit_guard(
+			scope.root.to_path_buf(),
+			runtime_settings.tools.edit_streaming_abort,
+		);
 		let secrets = SecretSessionSnapshot::build(
 			0,
 			&data_dir.join("secrets.toml"),
 			&scope.root.join(".omp/secrets.toml"),
 			iter::empty(),
 		)?;
-		if omp_driver::settings::current(&data_dir)?.secrets.enabled {
+		if runtime_settings.secrets.enabled {
 			agent.set_secret_obfuscator(secrets.transform_handle());
 		}
 		agent.set_autolearn(omp_agent::AutolearnSettings {
@@ -1799,7 +1914,13 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		let outcome = chat_ui::run(
 			executor.clone(),
 			agent,
-			ChatUiSession { session_id: id, initial_items, context_window, title },
+			environment,
+			ChatUiSession {
+				session_id: id,
+				initial_items,
+				context_window,
+				title,
+			},
 			Some(advisor_engine),
 			advisor_notices,
 			Arc::clone(&scope.registry),
@@ -1826,6 +1947,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 					.collect(),
 			],
 			content.skills,
+			content.declarations,
 			Some(approval_inbox),
 			hide_thinking,
 			{
@@ -1872,7 +1994,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		}
 		start = ChatStart::Session;
 		match outcome.exit {
-			host::HostExit::Quit => break,
+			host::HostExit::Quit => break current_id,
 			host::HostExit::Suspend => {
 				#[cfg(unix)]
 				if let Err(error) = signal::kill(Pid::from_raw(0), signal::Signal::SIGSTOP) {
@@ -1978,9 +2100,12 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				state = AgentState::new(next);
 			},
 		}
-	}
+	};
 	if let Some(auth) = auth {
 		auth.shutdown().await;
 	}
-	Ok(())
+	if let Some(service) = edit_repair_service {
+		service.abort();
+	}
+	Ok(final_id)
 }

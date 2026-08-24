@@ -304,6 +304,7 @@ pub async fn registry_event_frame(
 						name:              binding.spec().name().to_owned(),
 						sync_policy:       None,
 						capabilities_json: Bytes::new(),
+						settings_json:     binding.spec().settings_json().clone(),
 					})
 			}
 			.or_else(|| {
@@ -312,6 +313,7 @@ pub async fn registry_event_frame(
 					name:              String::new(),
 					sync_policy:       None,
 					capabilities_json: Bytes::new(),
+					settings_json:     Bytes::new(),
 				})
 			});
 			let document = match document_id {
@@ -2577,6 +2579,7 @@ fn binding_to_proto(binding: &LspLeaseBinding) -> proto::LspServerBinding {
 			position_encoding:    policy.position_encoding.as_lsp_name().to_owned(),
 		}),
 		capabilities_json: binding.capabilities_json().clone(),
+		settings_json:     binding.info().spec().settings_json().clone(),
 	}
 }
 
@@ -3045,6 +3048,23 @@ mod tests {
 		let id = parse_binding_id(&encoded).unwrap();
 		assert_eq!(id.get(), 0x0123_4567_89ab_cdef);
 		assert_eq!(binding_id_bytes(id), encoded);
+	}
+	#[test]
+	fn lsp_binding_protocol_round_trip_preserves_settings_json() {
+		for settings_json in [
+			Bytes::from_static(br#"{"settings":{"typescript":{"inlayHints":true}}}"#),
+			Bytes::from_static(br#"{"settings":{}}"#),
+		] {
+			let binding = proto::LspServerBinding {
+				server_id: Bytes::from_static(b"12345678"),
+				name: "server".to_owned(),
+				settings_json: settings_json.clone(),
+				..Default::default()
+			};
+			let decoded =
+				proto::LspServerBinding::decode(binding.encode_to_vec().as_slice()).unwrap();
+			assert_eq!(decoded.settings_json, settings_json);
+		}
 	}
 
 	#[test]

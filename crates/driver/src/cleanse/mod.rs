@@ -1,7 +1,8 @@
-//! Bounded multi-checker repair command.
+//! Continuous bounded multi-checker repair command.
 
 pub mod balance;
 pub mod checkers;
+mod continuous;
 pub mod parsers;
 pub mod production;
 pub mod types;
@@ -12,7 +13,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use balance::{group_by_file, pack};
+use balance::group_by_file;
 pub use checkers::{
 	BinaryResolver, CheckerRunner, CustomCheckerSpec, FilesystemResolver, ProcessOutput, Suite,
 	custom_suite, discover, parse_custom_specs, run_suite, scan_project_files,
@@ -59,14 +60,17 @@ pub trait CleanseHost: BinaryResolver + CheckerRunner {
 		model: &str,
 		cancel: &CancellationToken,
 	) -> impl Future<Output = Result<Str, <Self as CheckerRunner>::Error>> + Send;
-	/// Dispatches one file-disjoint repair wave with explicit LSP and IRC
-	/// grants.
-	fn repair(
+	/// Runs one file-owned repair worker; `followups` carries diagnostics that
+	/// arrive while the same files remain owned by this worker.
+	fn repair_worker(
 		&self,
-		assignments: &[Assignment],
+		assignment: Assignment,
+		worker: usize,
+		peers: Vec<Assignment>,
 		model: &str,
+		followups: flume::Receiver<Vec<Diagnostic>>,
 		cancel: &CancellationToken,
-	) -> impl Future<Output = Result<Vec<RepairOutcome>, <Self as CheckerRunner>::Error>> + Send;
+	) -> impl Future<Output = Result<RepairOutcome, <Self as CheckerRunner>::Error>> + Send;
 	/// Appends the verification remainder as a cleanse custom journal fact.
 	fn journal_remainder(&self, report: &Report) -> Result<(), <Self as CheckerRunner>::Error>;
 }
@@ -85,8 +89,8 @@ pub enum Error<E: StdError + 'static> {
 	Host(#[source] E),
 }
 
-/// Detects, repairs once, verifies, journals the remainder, and returns exactly
-/// exit 0, 1, or 130.
+/// Streams diagnostics into continuously scheduled repairs, verifies once,
+/// journals the remainder, and returns exactly exit 0, 1, or 130.
 pub async fn run<H: CleanseHost>(
 	args: &CleanseArgs,
 	host: &H,
@@ -132,35 +136,42 @@ pub async fn run<H: CleanseHost>(
 			omitted_files: 0,
 		});
 	}
-	let initial = match run_suite(host.project_root(), &suite, host, cancel).await {
-		Ok(report) => report,
+	let dispatched = match continuous::dispatch(
+		host,
+		&suite,
+		args.model.as_str(),
+		args.agents,
+		cancel,
+	)
+	.await
+	{
+		Ok(result) => result,
 		Err(_) if cancel.is_cancelled() => return Ok(cancelled()),
 		Err(error) => return Err(Error::Host(error)),
 	};
-	if initial.diagnostics.is_empty() {
-		host.journal_remainder(&initial).map_err(Error::Host)?;
+	if dispatched.cancelled || cancel.is_cancelled() {
+		return Ok(cancelled_with(dispatched.report));
+	}
+	if dispatched.workers == 0 {
+		host
+			.journal_remainder(&dispatched.report)
+			.map_err(Error::Host)?;
 		return Ok(CleanseExit {
 			code:          0,
 			status:        CleanseStatus::Clean,
-			report:        initial,
+			report:        dispatched.report,
 			remainder:     Vec::new(),
 			omitted_files: 0,
 		});
-	}
-	let assignments = pack(group_by_file(&initial.diagnostics), args.agents);
-	match host.repair(&assignments, args.model.as_str(), cancel).await {
-		Ok(_) => {},
-		Err(_) if cancel.is_cancelled() => return Ok(cancelled()),
-		Err(error) => return Err(Error::Host(error)),
-	}
-	if cancel.is_cancelled() {
-		return Ok(cancelled());
 	}
 	let verified = match run_suite(host.project_root(), &suite, host, cancel).await {
 		Ok(report) => report,
 		Err(_) if cancel.is_cancelled() => return Ok(cancelled()),
 		Err(error) => return Err(Error::Host(error)),
 	};
+	if cancel.is_cancelled() {
+		return Ok(cancelled_with(verified));
+	}
 	host.journal_remainder(&verified).map_err(Error::Host)?;
 	let groups = group_by_file(&verified.diagnostics);
 	let omitted_files = groups.len().saturating_sub(50);
@@ -193,21 +204,31 @@ async fn discover_requested<H: CleanseHost>(
 }
 
 fn cancelled() -> CleanseExit {
+	cancelled_with(Report::default())
+}
+
+fn cancelled_with(report: Report) -> CleanseExit {
 	CleanseExit {
-		code:          130,
-		status:        CleanseStatus::Cancelled,
-		report:        Report::default(),
-		remainder:     Vec::new(),
+		code: 130,
+		status: CleanseStatus::Cancelled,
+		report,
+		remainder: Vec::new(),
 		omitted_files: 0,
 	}
 }
 
-/// Assignment brief installed in each bounded repair child.
-pub fn assignment_prompt(assignment: &Assignment, report: &Report) -> Str {
-	let mut text = String::from(
-		"Fix only the assigned whole-file diagnostics. Use LSP only when granted; coordinate \
-		 overlapping dependencies through IRC. Do not run project-wide tests or edit files outside \
-		 the assignment. Preserve user work.\n\nAssigned files:\n",
+/// Assignment brief installed in one continuously scheduled repair child.
+pub fn assignment_prompt(
+	assignment: &Assignment,
+	worker: usize,
+	peers: &[Assignment],
+) -> Str {
+	let mut text = format!(
+		"Repair worker {worker}. Further diagnostics for your files may arrive as follow-up user \
+		 messages while you work; fix those too before finishing. Fix only the assigned whole-file \
+		 diagnostics. Use LSP only when granted; coordinate overlapping dependencies through IRC. \
+		 Do not run project-wide tests or edit files outside the assignment. Preserve user \
+		 work.\n\nAssigned files:\n",
 	);
 	for group in &assignment.groups {
 		use std::fmt::Write as _;
@@ -228,12 +249,20 @@ pub fn assignment_prompt(assignment: &Assignment, report: &Report) -> Str {
 			);
 		}
 	}
-	use std::fmt::Write as _;
-	let _ = writeln!(
-		text,
-		"\nChecker count: {}. Reverification belongs to the parent.",
-		report.checks.len()
-	);
+	if !peers.is_empty() {
+		text.push_str("\nOther in-flight ownership (do not edit):\n");
+		for peer in peers {
+			use std::fmt::Write as _;
+			let files = peer
+				.groups
+				.iter()
+				.map(|group| group.file.as_deref().unwrap_or("<project>"))
+				.collect::<Vec<_>>()
+				.join(", ");
+			let _ = writeln!(text, "- Worker {}: {files}", peer.index + 1);
+		}
+	}
+	text.push_str("\nReverification belongs to the parent.");
 	Str::from(text)
 }
 

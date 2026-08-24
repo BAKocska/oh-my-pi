@@ -1200,6 +1200,17 @@ assert all(
 )
 usage_window = provider_module.UsageWindow(id="w")
 assert provider_module.UsageReport(windows=(usage_window,)).windows == (usage_window,)
+usage_secret = omp.Secret(b"extension-usage-secret")
+usage_query = provider_module.UsageQuery(
+    provider="x",
+    identity="account",
+    scope=provider_module.UsageScope.ALL,
+    allow_stale=False,
+    api_key=usage_secret,
+)
+assert usage_query.api_key is usage_secret
+assert "extension-usage-secret" not in str(usage_secret)
+assert "extension-usage-secret" not in repr(usage_secret)
 search_query = provider_module.SearchQuery(provider="x", query="omp", count=5)
 search_result = provider_module.SearchResult("OMP", "https://example.test", "snippet", 1)
 assert provider_module.SearchPage((search_result,)).results == (search_result,)

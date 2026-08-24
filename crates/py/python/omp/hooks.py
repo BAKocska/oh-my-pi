@@ -20,7 +20,7 @@ from typing import (
     get_type_hints,
 )
 
-from _omp import Duration, OmpError
+from _omp import Duration, OmpError, Secret
 
 from ._errors import NotWiredError
 from ._registry import registry
@@ -877,6 +877,10 @@ def _value_from_wire(annotation: object, value: object) -> object:
         return annotation(value)
     if annotation is Duration:
         return Duration(str(value))
+    if annotation is Secret:
+        if not isinstance(value, bytes):
+            raise HookContractError("hook secret field must use the sealed bytes envelope")
+        return Secret(value)
     if isinstance(annotation, type) and is_dataclass(annotation):
         if not isinstance(value, Mapping):
             raise HookContractError(

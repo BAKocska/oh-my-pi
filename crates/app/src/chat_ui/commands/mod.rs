@@ -6,6 +6,9 @@ mod config;
 pub mod context;
 mod export;
 mod extensions;
+pub(crate) use extensions::{
+	build_inspector_snapshot_from_declarations, snapshot_live_mcp,
+};
 mod flow;
 mod green;
 mod mcp;
@@ -324,6 +327,8 @@ pub enum ExportRequest {
 /// Parsed extension marketplace or plugin operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtensionRequest {
+	/// Open the retained extension inspector.
+	Inspect,
 	/// Operate on signed extension indexes and installations.
 	Marketplace(MarketplaceRequest),
 	/// List or change installed extension enablement.

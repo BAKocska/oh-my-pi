@@ -572,6 +572,9 @@ pub struct CommandPayload {
 	/// Frontmatter description or first non-empty body line.
 	#[serde(default)]
 	pub description: Str,
+	/// Parsed `argumentHint` / `argument-hint` frontmatter.
+	#[serde(default)]
+	pub argument_hint: Option<Str>,
 	/// Markdown template body with frontmatter removed.
 	pub content:     Str,
 }

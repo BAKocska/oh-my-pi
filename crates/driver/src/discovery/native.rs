@@ -3,6 +3,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	env, fs,
+	io::Read,
 	path::{Path, PathBuf},
 };
 
@@ -604,6 +605,33 @@ struct ToolHeader {
 	input_schema: Option<serde_json::Value>,
 }
 
+fn script_tool_header(path: &Path) -> ToolHeader {
+	const HEADER_BYTES: u64 = 4096;
+	let mut source = String::new();
+	let Some(mut file) = fs::File::open(path).ok().map(|file| file.take(HEADER_BYTES)) else {
+		return ToolHeader::default();
+	};
+	if file.read_to_string(&mut source).is_err() {
+		return ToolHeader::default();
+	}
+	let Some(start) = source.find("/**").map(|start| start.saturating_add(3)) else {
+		return ToolHeader::default();
+	};
+	let Some(end) = source[start..].find("*/").map(|end| end.saturating_add(start)) else {
+		return ToolHeader::default();
+	};
+	let description = source[start..end]
+		.lines()
+		.map(|line| line.trim().trim_start_matches('*').trim())
+		.filter(|line| !line.is_empty() && !line.to_ascii_lowercase().starts_with("symlink:"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	ToolHeader {
+		description: (!description.is_empty()).then_some(description),
+		..ToolHeader::default()
+	}
+}
+
 fn load_tools(root: &Path, source_id: Str, scope: SourceScope, output: &mut NativeDiscovery) {
 	for path in scan_capability_dir(&root.join("tools")) {
 		let extension = path
@@ -631,7 +659,7 @@ fn load_tools(root: &Path, source_id: Str, scope: SourceScope, output: &mut Nati
 					serde_yaml::from_str::<ToolHeader>(header).ok()
 				})
 				.unwrap_or_default(),
-			_ => ToolHeader::default(),
+			_ => script_tool_header(&path),
 		};
 		let name = header
 			.name
@@ -791,5 +819,17 @@ mod tests {
 				.iter()
 				.any(|warning| warning.contains("/broken"))
 		);
+	}
+	#[test]
+	fn script_tool_header_keeps_jsdoc_and_drops_symlink_footnotes() {
+		let tree = tempfile::tempdir().expect("tree");
+		let path = tree.path().join("bundle.ts");
+		fs::write(
+			&path,
+			"/**\n * Inspect and control system services.\n *\n * Symlink: ~/.omp/tools/bundle.ts\n */\nexport default {};\n",
+		)
+		.expect("tool");
+		let header = script_tool_header(&path);
+		assert_eq!(header.description.as_deref(), Some("Inspect and control system services."));
 	}
 }
