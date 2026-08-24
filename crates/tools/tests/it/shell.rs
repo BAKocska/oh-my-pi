@@ -267,6 +267,16 @@ fn constructed_tool_spec_preserves_the_shell_schema_contract() {
 		assert!(properties.contains_key(key), "shell schema must expose {key}");
 	}
 	assert_eq!(actual["properties"]["timeout_ms"]["minimum"], 0);
+	assert_eq!(
+		actual["properties"]["timeout_ms"]["description"],
+		"Host-enforced execution timeout in milliseconds; zero disables the deadline; nonzero \
+		 values do not extend the foreground auto-background threshold."
+	);
+	assert!(
+		tool.spec()
+			.description
+			.contains("`timeout_ms` sets it without extending foreground waiting")
+	);
 	assert!(
 		serde_json::from_value::<shell::Params>(serde_json::json!({
 			"command": "echo ok",

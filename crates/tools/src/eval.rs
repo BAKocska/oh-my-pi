@@ -49,10 +49,12 @@ pub mod idle_timeout;
 /// Embedded CPython implementation of the eval resource boundary.
 pub mod kernel;
 
-const EVAL_DESCRIPTION: &str = r#"Run one step of code in a persistent Python kernel. State persists across calls and subagents.
+const EVAL_DESCRIPTION: &str = r#"Run one step of code in a persistent Python kernel. State persists across calls.
+__OMP_EVAL_AGENT_ISOLATION__
 
 Work incrementally: imports → define → test → use, each its own cell. Re-run setup ONLY after `reset`, kernel crash.
-Cells exceeding the foreground wait threshold continue as managed jobs; their results are delivered automatically.
+Cells exceeding the configured foreground wait threshold continue as managed jobs; their results are delivered automatically.
+`timeout: 0` disables the cell deadline; otherwise `timeout` sets it without extending foreground waiting.
 Parallelize *within* a cell with `parallel(thunks)`, not by batching.
 
 Top-level `await` works; `asyncio.run(…)` raises error.
@@ -71,25 +73,28 @@ tool.<name>(args) → unknown
     Invoke any session tool; `args` = its parameter object.
 completion(prompt, model?="default"|"smol"|"slow", system=None, schema=None) → str | dict
     Oneshot, stateless (no history/tools). `model`: "smol" fast | "default" session | "slow" most capable. `schema` (JSON-Schema) → parsed object.
-agent(prompt, agent?="task", name=None, outputSchema=None, schemaMode?="permissive", isolated=None, apply=None, merge=None, handle=False) → str | dict
-    Run a subagent → final output. `agent` selects a discovered agent; omit it to use `task`. `outputSchema` overrides agent/session schemas; `schemaMode`/`schemaMode`: "permissive" | "strict". Effective schemas return parsed data. `isolated` requests a worktree; `apply`/`merge` control its changes. Background via `local://` files named in the prompt. `handle` → { text, output, handle: "agent://<id>", id, agent }, parsed `data` when structured.
+__OMP_EVAL_AGENT_HELPER__
 parallel(thunks) → list     pipeline(items, ...stages) → list
 log(message) → None         phase(title) → None
 budget → `budget.total` (ceiling or None), `budget.spent()`, `budget.remaining()`; ceiling `+Nk` advisory, `+Nk!` hard.
 ```
 </prelude>
-<dag>
+__OMP_EVAL_AGENT_DAG__
+
+<critical>
+Prior top-level names survive into the next cell — reuse; NEVER re-import/re-declare. Re-read only if file changed since last read.
+</critical>"#;
+const EVAL_AGENT_ISOLATION: &str = "Eval `agent()` children use independent kernels.";
+const EVAL_AGENT_HELPER: &str = r#"agent(prompt, agent?="task", name=None, outputSchema=None, schemaMode?="permissive", isolated=None, apply=None, merge=None, handle=False) → str | dict
+    Run a subagent → final output. `agent` selects a discovered agent; omit it to use `task`. `outputSchema` overrides agent/session schemas; `schemaMode`/`schemaMode`: "permissive" | "strict". Effective schemas return parsed data. `isolated` requests a worktree; `apply`/`merge` control its changes. Background via `local://` files named in the prompt. `handle` → { text, output, handle: "agent://<id>", id, agent }, parsed `data` when structured."#;
+const EVAL_AGENT_DAG: &str = r#"<dag>
 Acyclic waves via `agent(…, handle=true)` + `pipeline`/`parallel`:
 - **Name nodes.** Capture agent result → `handle` (`agent://<id>`) + `output`.
 - **Wire edges.** Put upstream `handle`/`output` in downstream prompt. Bulk: `write("local://<name>.md", …)`.
 - **`pipeline`** = staged waves, barrier between stages. **`parallel`** = one wave.
 - **Isolate failure.** Wrap risky nodes in try/except; a failure degrades only its subtree.
 - **Acyclic only.** No node waits on its own descendant.
-</dag>
-
-<critical>
-Prior top-level names survive into the next cell — reuse; NEVER re-import/re-declare. Re-read only if file changed since last read.
-</critical>"#;
+</dag>"#;
 
 /// One live discovered agent projected into eval task guidance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,7 +122,8 @@ pub struct PreludeHelperDescription<'a> {
 pub struct TaskDescriptionSnapshot<'a> {
 	/// Effective default definition.
 	pub default_agent:   &'a str,
-	/// Effective discovered roster after disablement.
+	/// Effective discovered roster after disablement; empty means subagent
+	/// spawning is unavailable and suppresses child-agent guidance.
 	pub agents:          &'a [TaskAgentDescription<'a>],
 	/// Extension-provided prelude helpers available in this session.
 	pub helpers:         &'a [PreludeHelperDescription<'a>],
@@ -137,56 +143,84 @@ pub struct TaskDescriptionSnapshot<'a> {
 
 /// Builds the task portion of the eval description from one session snapshot.
 pub fn task_description(snapshot: TaskDescriptionSnapshot<'_>) -> Str {
-	let mut output = String::with_capacity(EVAL_DESCRIPTION.len() + 2_048);
-	output.push_str(EVAL_DESCRIPTION);
-	output.push_str("\n\n<task-runtime>\n");
-	let _ = writeln!(output, "Default agent: `{}`.", snapshot.default_agent);
-	let _ = writeln!(
-		output,
-		"Execution: {}; batches: {}; isolation: {}; IRC: {}; effort: {}; concurrency: {}.",
-		if snapshot.asynchronous {
-			"async jobs"
-		} else {
-			"blocking"
-		},
-		if snapshot.batch {
-			"enabled"
-		} else {
-			"disabled"
-		},
-		if snapshot.isolation {
-			"enabled"
-		} else {
-			"disabled"
-		},
-		if snapshot.irc { "enabled" } else { "disabled" },
-		if snapshot.effort {
-			"enabled"
-		} else {
-			"disabled"
-		},
-		if snapshot.max_concurrency == 0 {
-			"unlimited".to_owned()
-		} else {
-			snapshot.max_concurrency.to_string()
-		},
-	);
-	output.push_str("Available agents:\n");
-	for agent in snapshot.agents {
+	let subagents_available = !snapshot.agents.is_empty();
+	let base = EVAL_DESCRIPTION
+		.replace(
+			"__OMP_EVAL_AGENT_ISOLATION__",
+			if subagents_available {
+				EVAL_AGENT_ISOLATION
+			} else {
+				""
+			},
+		)
+		.replace(
+			"__OMP_EVAL_AGENT_HELPER__",
+			if subagents_available {
+				EVAL_AGENT_HELPER
+			} else {
+				""
+			},
+		)
+		.replace(
+			"__OMP_EVAL_AGENT_DAG__",
+			if subagents_available {
+				EVAL_AGENT_DAG
+			} else {
+				""
+			},
+		);
+	let mut output = String::with_capacity(base.len() + 2_048);
+	output.push_str(&base);
+	if subagents_available {
+		output.push_str("\n\n<task-runtime>\n");
+		let _ = writeln!(output, "Default agent: `{}`.", snapshot.default_agent);
 		let _ = writeln!(
 			output,
-			"- `{}`{}{}: {}",
-			agent.name,
-			if agent.read_only { " (READ-ONLY)" } else { "" },
-			if agent.blocking { " (BLOCKING)" } else { "" },
-			agent.description,
+			"Execution: {}; batches: {}; isolation: {}; IRC: {}; effort: {}; concurrency: {}.",
+			if snapshot.asynchronous {
+				"async jobs"
+			} else {
+				"blocking"
+			},
+			if snapshot.batch {
+				"enabled"
+			} else {
+				"disabled"
+			},
+			if snapshot.isolation {
+				"enabled"
+			} else {
+				"disabled"
+			},
+			if snapshot.irc { "enabled" } else { "disabled" },
+			if snapshot.effort {
+				"enabled"
+			} else {
+				"disabled"
+			},
+			if snapshot.max_concurrency == 0 {
+				"unlimited".to_owned()
+			} else {
+				snapshot.max_concurrency.to_string()
+			},
+		);
+		output.push_str("Available agents:\n");
+		for agent in snapshot.agents {
+			let _ = writeln!(
+				output,
+				"- `{}`{}{}: {}",
+				agent.name,
+				if agent.read_only { " (READ-ONLY)" } else { "" },
+				if agent.blocking { " (BLOCKING)" } else { "" },
+				agent.description,
+			);
+		}
+		output.push_str(
+			"Choose the most specific specialist; omit `agent` only when the default fits. Use \
+			 read-only agents only for investigation. For concurrent siblings, assign disjoint \
+			 ownership and coordinate shared files over IRC before editing.\n</task-runtime>",
 		);
 	}
-	output.push_str(
-		"Choose the most specific specialist; omit `agent` only when the default fits. Use \
-		 read-only agents only for investigation. For concurrent siblings, assign disjoint \
-		 ownership and coordinate shared files over IRC before editing.\n</task-runtime>",
-	);
 	if !snapshot.helpers.is_empty() {
 		output.push_str(
 			"\n\n<extension-helpers>\nExtension-provided prelude functions (call like any prelude \
@@ -1394,6 +1428,26 @@ mod tests {
 		assert_eq!(description, task_description(TaskDescriptionSnapshot::standard()));
 		assert!(!description.contains("<extension-helpers>"));
 		assert!(description.ends_with("</task-runtime>"));
+	}
+
+	#[test]
+	fn eval_guidance_tracks_subagent_availability_and_timeout_precedence() {
+		let available = task_description(TaskDescriptionSnapshot::standard());
+		assert!(available.contains("Eval `agent()` children use independent kernels."));
+		assert!(available.contains("agent(prompt"));
+		assert!(available.contains(
+			"`timeout: 0` disables the cell deadline; otherwise `timeout` sets it without extending \
+			 foreground waiting."
+		));
+
+		let unavailable = task_description(TaskDescriptionSnapshot {
+			agents: &[],
+			..TaskDescriptionSnapshot::standard()
+		});
+		assert!(!unavailable.contains("agent(prompt"));
+		assert!(!unavailable.contains("agent()"));
+		assert!(!unavailable.contains("<dag>"));
+		assert!(!unavailable.contains("<task-runtime>"));
 	}
 
 	#[test]

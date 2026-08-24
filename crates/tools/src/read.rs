@@ -1,6 +1,14 @@
 //! Pi-compatible reads of local and special resources.
 
-use std::{borrow::Cow, future::Future, path::Path, str, sync::Arc};
+use std::{
+	borrow::Cow,
+	collections::{HashMap, hash_map::DefaultHasher},
+	future::Future,
+	hash::Hasher as _,
+	path::Path,
+	str,
+	sync::Arc,
+};
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -10,6 +18,7 @@ use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
 	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
+use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -66,12 +75,16 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 - Documents → extracted text. Notebooks → editable cells. Images → decoded inline. `:raw` bypasses converters.
 - URLs → reader-mode clean text/markdown; `:raw` → untouched HTML. Bare `host:port` needs trailing slash.
 - Internal resources enforce owner byte/entry ceilings; path-only resolution returns metadata without content. Binary/oversized resources return selector or materialized-path guidance rather than inline bytes.
-- Literal `:`, `?`, `#` in URI-like member paths → percent-encode (`%3A`/`%3F`/`%23`).
+- `ssh://host/<path>` reads remote files/directories; bare `ssh://` lists hosts; specific remote files are searchable with `grep`.
+  Literal `:`, `?`, `#` → percent-encode (`%3A`/`%3F`/`%23`). For remote operations unsupported by `ssh://`, use `bash` with a remote SSH command or mount with `sshfs`.
+- Literal `:`, `?`, `#` in other URI-like member paths → percent-encode (`%3A`/`%3F`/`%23`).
 
 <critical>
 Summary footer names elided ranges? Re-issue ONLY those ranges. NEVER guess `..`/`…` content.
 </critical>";
 const MAX_SUMMARY_BYTES: u64 = 2 * 1024 * 1024;
+const REPEAT_READ_HINT_THRESHOLD: u32 = 3;
+const REPEAT_READ_TRACKER_CAP: usize = 64;
 const MIN_SUMMARY_LINES: usize = 100;
 const MAX_SUMMARY_LINES: usize = 20_000;
 /// Maximum editable whole-file snapshot retained across read and write.
@@ -379,7 +392,86 @@ pub struct ReadTool<S, B, R = resolver::NoResolver> {
 	resolvers: Arc<ResolverTable<R>>,
 	conflicts: Arc<conflicts::ConflictRegistry>,
 	policy:    ReadPolicy,
+	repeat_reads: Mutex<RepeatReadTracker>,
 	spec:      ToolSpec,
+}
+#[derive(Clone, Copy)]
+struct RepeatedRead {
+	hash:  u64,
+	count: u32,
+}
+
+#[derive(Default)]
+struct RepeatReadTracker {
+	reads: HashMap<Str, RepeatedRead>,
+}
+
+impl RepeatReadTracker {
+	fn observe(&mut self, path: &str, text: &str) -> Option<u32> {
+		let mut hasher = DefaultHasher::new();
+		hasher.write(text.as_bytes());
+		let hash = hasher.finish();
+		if let Some(read) = self.reads.get_mut(path) {
+			if read.hash != hash {
+				*read = RepeatedRead { hash, count: 1 };
+				return None;
+			}
+			read.count = read.count.saturating_add(1);
+			return (read.count >= REPEAT_READ_HINT_THRESHOLD).then_some(read.count);
+		}
+		if self.reads.len() >= REPEAT_READ_TRACKER_CAP {
+			self.reads.clear();
+		}
+		self.reads.insert(Str::new(path), RepeatedRead { hash, count: 1 });
+		None
+	}
+}
+
+#[cfg(test)]
+mod repeat_read_tests {
+	use super::*;
+
+	#[test]
+	fn warns_on_third_identical_read_and_resets_when_output_changes() {
+		let mut tracker = RepeatReadTracker::default();
+		assert_eq!(tracker.observe("src/lib.rs", "one"), None);
+		assert_eq!(tracker.observe("src/lib.rs", "one"), None);
+		assert_eq!(tracker.observe("src/lib.rs", "one"), Some(3));
+		assert_eq!(tracker.observe("src/lib.rs", "two"), None);
+		assert_eq!(tracker.observe("src/lib.rs", "two"), None);
+		assert_eq!(tracker.observe("src/lib.rs", "two"), Some(3));
+	}
+
+	#[test]
+	fn paged_reads_are_tracked_by_their_exact_selector() {
+		let mut tracker = RepeatReadTracker::default();
+		for path in ["src/lib.rs:1-100", "src/lib.rs:101-200"] {
+			assert_eq!(tracker.observe(path, "page"), None);
+			assert_eq!(tracker.observe(path, "page"), None);
+		}
+		assert_eq!(tracker.observe("src/lib.rs:1-100", "page"), Some(3));
+		assert_eq!(tracker.observe("src/lib.rs:101-200", "page"), Some(3));
+	}
+
+	#[test]
+	fn tracker_discards_old_keys_at_the_session_cap() {
+		let mut tracker = RepeatReadTracker::default();
+		for index in 0..REPEAT_READ_TRACKER_CAP {
+			assert_eq!(tracker.observe(&format!("file-{index}"), "same"), None);
+		}
+		assert_eq!(tracker.reads.len(), REPEAT_READ_TRACKER_CAP);
+		assert_eq!(tracker.observe("overflow", "same"), None);
+		assert_eq!(tracker.reads.len(), 1);
+	}
+
+	#[test]
+	fn ssh_guidance_names_the_live_tools_and_fallbacks() {
+		assert!(DESCRIPTION.contains("searchable with `grep`"));
+		assert!(DESCRIPTION.contains("use `bash` with a remote SSH command"));
+		assert!(DESCRIPTION.contains("mount with `sshfs`"));
+		assert!(!DESCRIPTION.contains("`search`"));
+		assert!(!DESCRIPTION.contains("`ssh` tool"));
+	}
 }
 
 struct InterruptSqliteOnDrop(Option<Arc<sqlite::QueryInterrupt>>);
@@ -461,6 +553,7 @@ pub fn tool_with_policy<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 		resolvers,
 		conflicts,
 		policy,
+		repeat_reads: Mutex::default(),
 		spec: ToolSpec {
 			name: sf!("read"),
 			rev: Rev { family: Default::default(), n: 1 },
@@ -521,7 +614,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 				Err(CommitError::Interrupted(interrupt)) => { yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason }); return; },
 				Err(CommitError::Protocol(reason)) => { yield Ev::Args(protocol_issue(reason)); return; },
 			}
-			let work = self.execute(params.path).fuse();
+			let path = params.path;
+			let work = self.execute(path.clone()).fuse();
 			let cancel = incoming.next_interrupt().fuse();
 			pin_mut!(work, cancel);
 			let result = select_biased! {
@@ -532,6 +626,10 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 				},
 				value = work => value,
 			};
+			let result = result.map(|mut payload| {
+				self.append_repeat_read_hint(&path, &mut payload);
+				payload
+			});
 			yield done(result);
 		}
 	}
@@ -585,6 +683,25 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 }
 
 impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
+	fn append_repeat_read_hint(&self, path: &str, payload: &mut Payload) {
+		let Some(PayloadPart::Text { text }) = payload
+			.parts
+			.iter_mut()
+			.find(|part| matches!(part, PayloadPart::Text { text } if !text.is_empty()))
+		else {
+			return;
+		};
+		let Some(count) = self.repeat_reads.lock().observe(path, text) else {
+			return;
+		};
+		*text = sf!(
+			"{}\n\n[You have received this identical output {count} times. Re-reading '{}' will \
+			 not change it — use a narrower selector (path:A-B), or proceed with the edit.]",
+			text,
+			path
+		);
+	}
+
 	async fn execute(&self, authored: Str) -> Result<Payload, Fault> {
 		let targets = self.split_targets(&authored).await?;
 		let multiple = targets.len() > 1;

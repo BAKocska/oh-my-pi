@@ -2,12 +2,14 @@
 //! transaction.
 
 pub mod apply_patch;
+pub mod observer;
 pub mod projection;
 pub mod replace;
 use std::{fmt::Write as _, future, future::Future, ops, path::Path};
 
 pub use apply_patch::{
-	FreeformEditParams, FreeformEditTool, apply_patch_tool, patch_tool, sloppy_tool,
+	FreeformEditParams, FreeformEditTool, apply_patch_tool, apply_patch_tool_with_observer,
+	patch_tool, patch_tool_with_observer, sloppy_tool, sloppy_tool_with_observer,
 };
 use async_stream::stream;
 use bytes::Bytes;
@@ -25,7 +27,7 @@ use omp_tool::{
 	DocEffects, Effects, Ev, IncomingParams, InterruptWaitError, LiftedCall, ParamError, Part,
 	PromptCaps, RecordedCall, Rev, Tool, ToolSpec, ToolTerminal,
 };
-pub use replace::{ReplaceParams, ReplaceTool, replace_tool};
+pub use replace::{ReplaceParams, ReplaceTool, replace_tool, replace_tool_with_observer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +35,7 @@ use crate::{
 	path::{HostPaths, normalize_target},
 	render::TextProjection,
 };
+use observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox};
 
 /// One registered edit argument dialect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -614,6 +617,7 @@ pub struct EditTool<D, S = NoSnapshotStore> {
 	documents:     D,
 	snapshots:     S,
 	format_policy: FormatPolicy,
+	observer:      EditObserver,
 	spec:          ToolSpec,
 }
 
@@ -631,10 +635,21 @@ pub fn tool_with_snapshots<D: EditDocuments, S: EditSnapshotStore>(
 	snapshots: S,
 	format_policy: FormatPolicy,
 ) -> EditTool<D, S> {
+	tool_with_observer(documents, snapshots, format_policy, EditObserver::default())
+}
+
+/// Constructs hashline edit with snapshot storage and syntax observation.
+pub fn tool_with_observer<D: EditDocuments, S: EditSnapshotStore>(
+	documents: D,
+	snapshots: S,
+	format_policy: FormatPolicy,
+	observer: EditObserver,
+) -> EditTool<D, S> {
 	EditTool {
 		documents,
 		snapshots,
 		format_policy,
+		observer,
 		spec: ToolSpec {
 			name:            sf!("edit"),
 			rev:             Rev { family: sf!("hl"), n: 1 },
@@ -762,6 +777,9 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 					let mut clipboard = self.documents.start_clipboard_batch();
 					let mut proposals = Vec::with_capacity(parsed_sections.len());
 					let mut projections = Vec::with_capacity(parsed_sections.len());
+					let mut pending_blackbox = Vec::<PendingBlackbox>::new();
+					let observer_args =
+						serde_json::to_value(Params { input: input.clone() }).unwrap_or_default();
 					for work in &parsed_sections {
 						let applied = match apply_parsed_patch(
 							work.prepared.authored_bytes().clone(), &work.parsed, &mut clipboard,
@@ -771,7 +789,7 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 							Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
 						};
 
-						let after = if work.prepared.authored_bytes() == work.prepared.base_bytes() {
+						let mut after = if work.prepared.authored_bytes() == work.prepared.base_bytes() {
 							applied.bytes.clone()
 						} else if applied.edits.is_empty() {
 							let message = stale_message(work, true);
@@ -788,6 +806,29 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 									  }
 						};
 
+						let mut warnings = work.canonical_recovery.iter().cloned()
+							.chain(work.prepared.warnings().iter().cloned())
+							.chain(work.parsed.diagnostics.iter().map(|warning| warning.message.clone()))
+							.chain(applied.warnings.iter().map(|warning| Str::from(warning.to_string())))
+							.collect::<Vec<_>>();
+						if !matches!(work.parsed.file_op, Some(FileOp::Rem)) {
+							let target = match &work.parsed.file_op {
+								Some(FileOp::Move { dest }) => dest.clone(),
+								Some(FileOp::Rem) | None => work.prepared.path().clone(),
+							};
+							let inspected = self.observer.inspect(
+								AppliedEditSnapshot {
+									path: target,
+									before: work.prepared.base_bytes().clone(),
+									after: after.clone(),
+								},
+								"hashline",
+								&observer_args,
+							).await;
+							after = inspected.content;
+							warnings.extend(inspected.notice);
+							pending_blackbox.extend(inspected.pending);
+						}
 						let action = match &work.parsed.file_op {
 							Some(FileOp::Rem) => EditAction::Delete,
 							Some(FileOp::Move { dest }) => EditAction::Move {
@@ -807,10 +848,7 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 								anchor_line: resolution.anchor_line, start: resolution.start, end: resolution.end,
 								operation: Str::new_static(resolution.mode.into()),
 							}).collect(),
-							warnings: work.canonical_recovery.iter().cloned()
-								.chain(work.prepared.warnings().iter().cloned())
-								.chain(work.parsed.diagnostics.iter().map(|warning| warning.message.clone()))
-								.chain(applied.warnings.iter().map(|warning| Str::from(warning.to_string()))).collect(),
+							warnings,
 						});
 					}
 
@@ -926,6 +964,9 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 									return;
 								},
 							};
+							for pending in pending_blackbox {
+								self.observer.record_committed(pending).await;
+							}
 							yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: false });
 						},
 						Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),

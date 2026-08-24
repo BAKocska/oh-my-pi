@@ -25,6 +25,7 @@ use super::{
 	RejectionReason, ResolvedEdit, SectionOp, SectionPayload, StalePolicy, commit_event, done_fault,
 	param_event, recovery_edits,
 };
+use super::observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox};
 use crate::render::TextProjection;
 
 const DESCRIPTION: &str = "Replace exact or uniquely recoverable text in a file. The matcher \
@@ -68,14 +69,25 @@ const fn default_allow_fuzzy() -> bool {
 pub struct ReplaceTool<D> {
 	documents:     D,
 	format_policy: FormatPolicy,
+	observer:      EditObserver,
 	spec:          ToolSpec,
 }
 
 /// Constructs the old-text/new-text replacement dialect.
 pub fn replace_tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> ReplaceTool<D> {
+	replace_tool_with_observer(documents, format_policy, EditObserver::default())
+}
+
+/// Constructs the replacement dialect with syntax observation.
+pub fn replace_tool_with_observer<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+	observer: EditObserver,
+) -> ReplaceTool<D> {
 	ReplaceTool {
 		documents,
 		format_policy,
+		observer,
 		spec: ToolSpec {
 			name:            sf!("edit"),
 			rev:             Rev { family: sf!("rep"), n: 1 },
@@ -113,6 +125,7 @@ struct Work<P> {
 struct Projection {
 	after:    Bytes,
 	resolved: Vec<ResolvedEdit>,
+	warnings: Vec<Str>,
 }
 
 impl<D: EditDocuments> Tool for ReplaceTool<D> {
@@ -138,6 +151,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 						yield done_fault(Fault::invalid("No replacement operations found in edits."));
 						return;
 					}
+					let observer_args = serde_json::to_value(&replace_params).unwrap_or_default();
 					let journal_input = if let Ok(input) = serde_json::to_vec(&replace_params) { Bytes::from(input) } else { yield done_fault(Fault::invalid("Replacement arguments could not be journaled.")); return; };
 					let mut works = Vec::with_capacity(replace_params.edits.len());
 					for op in replace_params.edits {
@@ -160,6 +174,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 
 					let mut proposals = Vec::with_capacity(works.len());
 					let mut projections = Vec::with_capacity(works.len());
+					let mut pending_blackbox = Vec::<PendingBlackbox>::new();
 					for work in &works {
 						let result = apply_replace(work.prepared.authored_bytes(), &work.op.old, &work.op.new, ReplaceOptions {
 							replace_all: work.op.replace_all,
@@ -199,13 +214,25 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 							yield done_fault(Fault::stale("The source snapshot changed before this replacement could be applied; re-read the document."));
 							return;
 						} else if let Ok(recovered) = recover_exact(work.prepared.authored_bytes(), work.prepared.base_bytes(), &recovery_edits) { recovered.content().clone() } else { yield done_fault(Fault::stale("The source snapshot changed and the replacement overlaps intervening edits; re-read the document.")); return; };
+						let inspected = self.observer.inspect(
+							AppliedEditSnapshot {
+								path: work.prepared.path().clone(),
+								before: work.prepared.base_bytes().clone(),
+								after,
+							},
+							"replace",
+							&observer_args,
+						).await;
+						let after = inspected.content;
+						let warnings = inspected.notice.into_iter().collect();
+						pending_blackbox.extend(inspected.pending);
 						proposals.push(EditProposal {
 							action: EditAction::Write { content: after.clone() },
 							base_revision: work.prepared.base_revision().clone(),
 							stale_policy: StalePolicy::RebaseNonOverlapping,
 							format_policy: self.format_policy,
 						});
-						projections.push(Projection { after, resolved });
+						projections.push(Projection { after, resolved, warnings });
 					}
 
 					let mut preview = String::new();
@@ -251,6 +278,9 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 					match result {
 						Ok(result) if result.sections.len() == works.len() => {
 							for work in &works { self.documents.reset_noop(work.prepared.path()); }
+							for pending in pending_blackbox {
+								self.observer.record_committed(pending).await;
+							}
 							yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, Some(&result.sections))), useless: false });
 						},
 						Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
@@ -350,7 +380,7 @@ fn payload<P: EditPrepared>(
 					preview,
 					first_changed_line: projection.resolved.first().map(|edit| edit.start),
 					block_resolutions: Vec::new(),
-					warnings: Vec::new(),
+					warnings: projection.warnings.clone(),
 					diagnostics: committed.map_or_else(Vec::new, |section| section.diagnostics.clone()),
 					diagnostics_complete: committed.is_none_or(|section| section.diagnostics_complete),
 				}

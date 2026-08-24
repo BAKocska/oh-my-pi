@@ -153,6 +153,10 @@ mod tests {
 			Duration::from_millis(500),
 		);
 		assert_eq!(
+			resolve_auto_background_wait(Duration::from_secs(60), Some(Duration::from_secs(120))),
+			Duration::from_secs(60),
+		);
+		assert_eq!(
 			resolve_auto_background_wait(Duration::from_secs(60), None),
 			Duration::from_secs(60),
 		);

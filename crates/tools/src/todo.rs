@@ -19,17 +19,21 @@ use serde::{Deserialize, Serialize};
 pub struct Params {
 	/// State transition to perform.
 	pub op:     Op,
-	/// Complete phased list, required by `init`.
+	/// Complete phased list for multi-phase `init`.
 	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub list:   Option<Vec<Phase>>,
-	/// Phase name for item operations and `append`.
+	/// Phase name for item operations, `append`, and single-phase `init`.
 	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub phase:  Option<Str>,
 	/// Item text for single-item operations.
 	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub item:   Option<Str>,
-	/// Items appended to `phase`.
-	#[schemars(default, skip_serializing_if = "Option::is_none")]
+	/// Tasks for single-phase `init` or `append`.
+	#[schemars(
+		default,
+		skip_serializing_if = "Option::is_none",
+		description = "tasks for single-phase init or append"
+	)]
 	pub items:  Option<Vec<Str>>,
 	/// Required explanation when blocking an item.
 	#[schemars(default, skip_serializing_if = "Option::is_none")]
@@ -172,8 +176,11 @@ pub fn tool() -> Todo {
 			name:            sf!("todo"),
 			rev:             Rev { family: Str::new(""), n: 1 },
 			description:     sf!(
-				"Tracks a phased task list. Use `init` once, then `start`, `done`, `drop`, `block`, \
-				 `append`, or `view` as work changes.",
+				"Tracks a phased task list. `items` supplies tasks for single-phase `init` or \
+				 `append`. After each successful state-changing op, if nothing is `in_progress`, \
+				 the earliest `pending` task in phase order auto-promotes; if several are \
+				 `in_progress`, only the earliest stays. Blocked tasks never auto-promote: \
+				 `unblock` first. Read-only `view` and failed operations never normalize state.",
 			),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
@@ -225,11 +232,38 @@ impl Tool for Todo {
 
 /// Applies a transition to a phased list.
 pub fn apply(phases: &mut Vec<Phase>, params: Params) -> Result<Vec<Phase>, Fault> {
+	let state_changing = params.op != Op::View;
+	apply_mut(phases, params)?;
+	if state_changing {
+		normalize_in_progress(phases);
+	}
+	Ok(phases.clone())
+}
+
+fn apply_mut(phases: &mut Vec<Phase>, params: Params) -> Result<(), Fault> {
 	match params.op {
 		Op::Init => {
-			*phases = params
-				.list
-				.ok_or_else(|| invalid("`list` is required for init"))?;
+			*phases = if let Some(list) = params.list {
+				list
+			} else {
+				let items = params
+					.items
+					.ok_or_else(|| invalid("`list` or `items` is required for init"))?;
+				if items.is_empty() {
+					return Err(invalid("`items` must not be empty for init"));
+				}
+				vec![Phase {
+					phase: params.phase.map_or_else(|| sf!("Todos"), |phase| title_case(&phase)),
+					items: items
+						.into_iter()
+						.map(|text| Item {
+							text,
+							status: Status::Pending,
+							reason: None,
+						})
+						.collect(),
+				}]
+			};
 		},
 		Op::View => {},
 		Op::Append => {
@@ -237,6 +271,9 @@ pub fn apply(phases: &mut Vec<Phase>, params: Params) -> Result<Vec<Phase>, Faul
 			let items = params
 				.items
 				.ok_or_else(|| invalid("`items` is required for append"))?;
+			if items.is_empty() {
+				return Err(invalid("`items` must not be empty for append"));
+			}
 			let target = match resolve_phase_index(phases, &phase) {
 				Some(index) => &mut phases[index],
 				None => {
@@ -261,7 +298,7 @@ pub fn apply(phases: &mut Vec<Phase>, params: Params) -> Result<Vec<Phase>, Faul
 				} else {
 					return Err(invalid("this operation requires an item"));
 				}
-				return Ok(phases.clone());
+				return Ok(());
 			}
 			let phase_index = match params.phase.as_ref() {
 				Some(phase) => {
@@ -281,19 +318,53 @@ pub fn apply(phases: &mut Vec<Phase>, params: Params) -> Result<Vec<Phase>, Faul
 				} else {
 					return Err(invalid("this operation requires an item"));
 				}
-				return Ok(phases.clone());
+				return Ok(());
 			}
 			let item = params.item.as_ref().expect("item presence checked");
 			let item_index = resolve_item_in_phase(&phases[phase_index].items, item)
 				.ok_or_else(|| missing("item", item))?;
 			if op == Op::Rm {
 				phases[phase_index].items.remove(item_index);
-				return Ok(phases.clone());
+				return Ok(());
+			}
+			if op == Op::Block && params.reason.is_none() {
+				return Err(invalid("`reason` is required for block"));
+			}
+			if op == Op::Start {
+				for candidate in phases.iter_mut().flat_map(|phase| &mut phase.items) {
+					if candidate.status == Status::InProgress {
+						candidate.status = Status::Pending;
+					}
+				}
 			}
 			set_status(&mut phases[phase_index].items[item_index], op, params.reason.as_ref())?;
 		},
 	}
-	Ok(phases.clone())
+	Ok(())
+}
+
+fn normalize_in_progress(phases: &mut [Phase]) {
+	let mut found_active = false;
+	for item in phases.iter_mut().flat_map(|phase| &mut phase.items) {
+		if item.status != Status::InProgress {
+			continue;
+		}
+		if found_active {
+			item.status = Status::Pending;
+		} else {
+			found_active = true;
+		}
+	}
+	if found_active {
+		return;
+	}
+	if let Some(item) = phases
+		.iter_mut()
+		.flat_map(|phase| &mut phase.items)
+		.find(|item| item.status == Status::Pending)
+	{
+		item.status = Status::InProgress;
+	}
 }
 
 fn set_status(item: &mut Item, op: Op, reason: Option<&Str>) -> Result<(), Fault> {
@@ -645,7 +716,7 @@ mod tests {
 		assert_eq!(phases[0].items[1].text, "test");
 	}
 	#[test]
-	fn block_requires_reason_and_unblock_returns_pending() {
+	fn block_requires_reason_and_unblock_promotes_the_item() {
 		let mut phases = init();
 		assert!(
 			apply(&mut phases, Params {
@@ -676,7 +747,113 @@ mod tests {
 			reason: None,
 		})
 		.unwrap();
-		assert_eq!(phases[0].items[0].status, Status::Pending);
+		assert_eq!(phases[0].items[0].status, Status::InProgress);
+	}
+
+	#[test]
+	fn single_phase_init_promotes_only_the_earliest_pending_item() {
+		let mut phases = Vec::new();
+		apply(&mut phases, Params {
+			op:     Op::Init,
+			list:   None,
+			phase:  Some(sf!("release")),
+			item:   None,
+			items:  Some(vec![sf!("build"), sf!("ship")]),
+			reason: None,
+		})
+		.expect("single-phase init");
+		assert_eq!(phases[0].phase, "Release");
+		assert_eq!(
+			phases[0]
+				.items
+				.iter()
+				.map(|item| item.status)
+				.collect::<Vec<_>>(),
+			vec![Status::InProgress, Status::Pending]
+		);
+	}
+
+	#[test]
+	fn normalization_is_pending_only_and_runs_only_after_successful_mutations() {
+		let mut phases = vec![Phase {
+			phase: sf!("Work"),
+			items: vec![
+				Item { text: sf!("first"), status: Status::InProgress, reason: None },
+				Item { text: sf!("second"), status: Status::InProgress, reason: None },
+				Item {
+					text: sf!("blocked"),
+					status: Status::Blocked,
+					reason: Some(sf!("waiting")),
+				},
+			],
+		}];
+		let original = phases.clone();
+		apply(&mut phases, Params {
+			op:     Op::View,
+			list:   None,
+			phase:  None,
+			item:   None,
+			items:  None,
+			reason: None,
+		})
+		.expect("view");
+		assert_eq!(phases, original);
+		assert!(
+			apply(&mut phases, Params {
+				op:     Op::Block,
+				list:   None,
+				phase:  Some(sf!("Work")),
+				item:   Some(sf!("first")),
+				items:  None,
+				reason: None,
+			})
+			.is_err()
+		);
+		assert_eq!(phases, original);
+
+		apply(&mut phases, Params {
+			op:     Op::Append,
+			list:   None,
+			phase:  Some(sf!("Work")),
+			item:   None,
+			items:  Some(vec![sf!("later")]),
+			reason: None,
+		})
+		.expect("successful mutation normalizes duplicate active items");
+		assert_eq!(phases[0].items[0].status, Status::InProgress);
+		assert_eq!(phases[0].items[1].status, Status::Pending);
+		assert_eq!(phases[0].items[2].status, Status::Blocked);
+
+		apply(&mut phases, Params {
+			op:     Op::Done,
+			list:   None,
+			phase:  Some(sf!("Work")),
+			item:   Some(sf!("first")),
+			items:  None,
+			reason: None,
+		})
+		.expect("state-changing operation");
+		assert_eq!(phases[0].items[0].status, Status::Completed);
+		assert_eq!(phases[0].items[1].status, Status::InProgress);
+		assert_eq!(phases[0].items[2].status, Status::Blocked);
+	}
+
+	#[test]
+	fn schema_and_guidance_describe_single_phase_items_and_normalization_scope() {
+		let todo = tool();
+		let schema = String::from_utf8(todo.spec().schema.to_vec()).expect("UTF-8 schema");
+		assert!(schema.contains("tasks for single-phase init or append"));
+		assert!(
+			todo.spec()
+				.description
+				.contains("After each successful state-changing op")
+		);
+		assert!(todo.spec().description.contains("Blocked tasks never auto-promote"));
+		assert!(
+			todo.spec()
+				.description
+				.contains("Read-only `view` and failed operations never normalize state")
+		);
 	}
 	#[test]
 	fn fuzzy_resolution_prefers_exact_and_unique_actionable_matches() {

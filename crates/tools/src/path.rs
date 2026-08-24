@@ -29,6 +29,53 @@ impl HostPaths {
 	}
 }
 
+/// Aggregate approval tier for a document mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileWriteApproval {
+	/// Every target is a read-tier internal resource.
+	Read,
+	/// At least one target mutates workspace or writable internal state.
+	Write,
+}
+
+/// Resolves one multi-target write without trusting the first authored path.
+///
+/// `writable_internal` is supplied by the resource router so schemes such as
+/// `vault://` retain write approval while read-only session URLs remain read
+/// tier. An empty target set fails closed as write.
+pub fn aggregate_file_write_approval<'a>(
+	targets: impl IntoIterator<Item = &'a str>,
+	writable_internal: impl Fn(&str) -> bool,
+) -> FileWriteApproval {
+	let mut any = false;
+	for target in targets {
+		any = true;
+		if !is_internal_resource(target) || writable_internal(target) {
+			return FileWriteApproval::Write;
+		}
+	}
+	if any { FileWriteApproval::Read } else { FileWriteApproval::Write }
+}
+
+fn is_internal_resource(target: &str) -> bool {
+	let Some((scheme, _)) = target.trim().split_once("://") else { return false };
+	matches!(
+		scheme.to_ascii_lowercase().as_str(),
+		"agent"
+			| "artifact"
+			| "history"
+			| "issue"
+			| "local"
+			| "mcp"
+			| "memory"
+			| "pr"
+			| "rule"
+			| "security"
+			| "skill"
+			| "vault"
+	)
+}
+
 /// One model-authored target after the shared lexical recovery pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedTarget {
@@ -374,6 +421,27 @@ mod tests {
 			path:     sf!("C:\\repo\\a.rs"),
 			selector: Some(sf!("4-8")),
 		});
+	}
+	#[test]
+	fn aggregates_every_write_target_and_preserves_writable_internal_tier() {
+		assert_eq!(
+			aggregate_file_write_approval(
+				["local://notes", "src/config.rs"],
+				|_| false
+			),
+			FileWriteApproval::Write
+		);
+		assert_eq!(
+			aggregate_file_write_approval(
+				["local://notes", "artifact://result"],
+				|_| false
+			),
+			FileWriteApproval::Read
+		);
+		assert_eq!(
+			aggregate_file_write_approval(["vault://notes/item"], |path| path.starts_with("vault://")),
+			FileWriteApproval::Write
+		);
 	}
 	#[test]
 	fn normalizes_pi_parity_path_table() {

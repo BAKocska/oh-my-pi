@@ -68,14 +68,14 @@ pub struct Params {
 	#[schemars(length(min = 1), description = "Shell script to execute.")]
 	pub command:      Str,
 	/// Host-enforced execution timeout in milliseconds; zero disables the
-	/// deadline.
+	/// deadline without changing the foreground auto-background threshold.
 	#[schemars(
 		default,
 		skip_serializing_if = "Option::is_none",
 		with = "u64",
 		range(min = 0),
 		transform = omit_schema_format,
-		description = "Host-enforced execution timeout in milliseconds; zero disables the deadline."
+		description = "Host-enforced execution timeout in milliseconds; zero disables the deadline; nonzero values do not extend the foreground auto-background threshold."
 	)]
 	pub timeout_ms:   Option<u64>,
 	/// Environment additions scoped to this command.
@@ -408,7 +408,10 @@ pub struct ShellPromptSnapshot {
 impl ShellPromptSnapshot {
 	fn description(&self) -> Str {
 		let mut description = String::from(
-			"Execute a shell script in a persistent session, or start a named asynchronous job.",
+			"Execute a shell script in a persistent session, or start a named asynchronous job. \
+			 Eligible long-running calls may auto-background at the configured foreground \
+			 threshold and deliver later. `timeout_ms: 0` disables the command deadline; otherwise \
+			 `timeout_ms` sets it without extending foreground waiting.",
 		);
 		let _ = write!(
 			description,
@@ -484,7 +487,7 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 		persistent_run_active: AtomicBool::new(false),
 		next_background_name: AtomicU64::new(1),
 		timeout_bounds: TimeoutBounds::default(),
-		auto_background_enabled: false,
+		auto_background_enabled: true,
 		auto_background_threshold: DEFAULT_AUTO_BACKGROUND_THRESHOLD,
 		interceptor_enabled: false,
 		interceptor_rules: Arc::default(),
@@ -493,7 +496,10 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 			name:            sf!("shell"),
 			rev:             Rev { family: Str::default(), n: 1 },
 			description:     sf!(
-				"Execute a shell script in a persistent session, or start a named asynchronous job.",
+				"Execute a shell script in a persistent session, or start a named asynchronous job. \
+				 Eligible long-running calls may auto-background at the configured foreground \
+				 threshold and deliver later. `timeout_ms: 0` disables the command deadline; \
+				 otherwise `timeout_ms` sets it without extending foreground waiting.",
 			),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {

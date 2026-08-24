@@ -9,7 +9,7 @@ use omp_core::{Str, sf};
 use omp_hashline::{
 	diff_preview::CompactDiffOptions,
 	foreign_patch::{ForeignPatchFile, parse_foreign_patch},
-	sloppy::{apply_sloppy, split_sloppy_sections},
+	sloppy::{apply_sloppy_detailed, split_sloppy_sections},
 	unified_hunk::apply_file_operation,
 };
 use omp_tool::{
@@ -24,6 +24,7 @@ use super::{
 	EditProposal, EditUpdate, Fault, FormatPolicy, Payload, PrepareRequest, ResolvedEdit, SectionOp,
 	SectionPayload, StalePolicy, commit_event, done_fault, param_event, rejection_text,
 };
+use super::observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox};
 use crate::{
 	path::{HostPaths, normalize_target},
 	render::TextProjection,
@@ -80,6 +81,7 @@ pub struct FreeformEditTool<D> {
 	documents:     D,
 	format_policy: FormatPolicy,
 	kind:          FreeformKind,
+	observer:      EditObserver,
 	spec:          ToolSpec,
 }
 
@@ -88,7 +90,16 @@ pub fn patch_tool<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
 ) -> FreeformEditTool<D> {
-	new_tool(documents, format_policy, FreeformKind::Patch)
+	patch_tool_with_observer(documents, format_policy, EditObserver::default())
+}
+
+/// Constructs `edit@patch.1` with syntax observation.
+pub fn patch_tool_with_observer<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+	observer: EditObserver,
+) -> FreeformEditTool<D> {
+	new_tool(documents, format_policy, FreeformKind::Patch, observer)
 }
 
 /// Constructs `edit@apply_patch.1`.
@@ -96,7 +107,16 @@ pub fn apply_patch_tool<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
 ) -> FreeformEditTool<D> {
-	new_tool(documents, format_policy, FreeformKind::ApplyPatch)
+	apply_patch_tool_with_observer(documents, format_policy, EditObserver::default())
+}
+
+/// Constructs `edit@apply_patch.1` with syntax observation.
+pub fn apply_patch_tool_with_observer<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+	observer: EditObserver,
+) -> FreeformEditTool<D> {
+	new_tool(documents, format_policy, FreeformKind::ApplyPatch, observer)
 }
 
 /// Constructs `edit@sloppy.1`.
@@ -104,18 +124,29 @@ pub fn sloppy_tool<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
 ) -> FreeformEditTool<D> {
-	new_tool(documents, format_policy, FreeformKind::Sloppy)
+	sloppy_tool_with_observer(documents, format_policy, EditObserver::default())
+}
+
+/// Constructs `edit@sloppy.1` with syntax observation.
+pub fn sloppy_tool_with_observer<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+	observer: EditObserver,
+) -> FreeformEditTool<D> {
+	new_tool(documents, format_policy, FreeformKind::Sloppy, observer)
 }
 
 fn new_tool<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
 	kind: FreeformKind,
+	observer: EditObserver,
 ) -> FreeformEditTool<D> {
 	FreeformEditTool {
 		documents,
 		format_policy,
 		kind,
+		observer,
 		spec: ToolSpec {
 			name:            sf!("edit"),
 			rev:             Rev { family: Str::new_static(kind.family()), n: 1 },
@@ -176,6 +207,7 @@ struct Projection {
 	operation: SectionOp,
 	move_dest: Option<Str>,
 	resolved:  Vec<ResolvedEdit>,
+	warnings:  Vec<Str>,
 }
 
 impl<D: EditDocuments> Tool for FreeformEditTool<D> {
@@ -233,15 +265,25 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 
 					let mut proposals = Vec::with_capacity(works.len());
 					let mut projections = Vec::with_capacity(works.len());
+					let mut pending_blackbox = Vec::<Option<PendingBlackbox>>::with_capacity(works.len());
+					let observer_args = serde_json::to_value(FreeformEditParams { input: input.clone() })
+						.unwrap_or_default();
 					for work in &works {
 						let source = match std::str::from_utf8(work.prepared.authored_bytes()) {
 							Ok(source) => source,
 							Err(_) => { yield done_fault(Fault::invalid("edit dialect requires UTF-8 text")); return; },
 						};
-						let (after, operation, move_dest) = match &work.op {
-							AuthoredOperation::Sloppy { input, .. } => match apply_sloppy(source, input) {
-								Ok(after) => (Some(Bytes::from(after)), SectionOp::Update, None),
-								Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+						let (mut after, operation, move_dest, mut warnings) = match &work.op {
+							AuthoredOperation::Sloppy { input, path } => {
+								match apply_sloppy_detailed(source, input, Some(path)) {
+									Ok(applied) => (
+										Some(Bytes::from(applied.content)),
+										SectionOp::Update,
+										None,
+										applied.notes,
+									),
+									Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
+								}
 							},
 							AuthoredOperation::Foreign(operation) => match apply_file_operation(
 								work.prepared.exists().then_some(source),
@@ -254,12 +296,34 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 										ForeignPatchFile::Update { move_to: Some(_), .. } => SectionOp::Move,
 										ForeignPatchFile::Add { .. } | ForeignPatchFile::Update { .. } => SectionOp::Update,
 									};
-									let move_dest = match operation { ForeignPatchFile::Update { move_to, .. } => move_to.clone(), _ => None };
-									(after.map(Bytes::from), section_op, move_dest)
+									let move_dest = match operation {
+										ForeignPatchFile::Update { move_to, .. } => move_to.clone(),
+										_ => None,
+									};
+									(after.map(Bytes::from), section_op, move_dest, Vec::new())
 								},
 								Err(error) => { yield done_fault(Fault::invalid(error.to_string())); return; },
 							},
 						};
+						let mut pending = None;
+						if work.prepared.exists() && operation != SectionOp::Delete
+							&& let Some(content) = after.take()
+						{
+							let target = move_dest.clone().unwrap_or_else(|| work.prepared.path().clone());
+							let inspected = self.observer.inspect(
+								AppliedEditSnapshot {
+									path: target,
+									before: work.prepared.base_bytes().clone(),
+									after: content,
+								},
+								self.kind.family(),
+								&observer_args,
+							).await;
+							after = Some(inspected.content);
+							warnings.extend(inspected.notice);
+							pending = inspected.pending;
+						}
+						pending_blackbox.push(pending);
 						let action = match (operation, after.clone(), move_dest.clone()) {
 							(SectionOp::Delete, _, _) => EditAction::Delete,
 							(SectionOp::Move, Some(content), Some(destination)) => EditAction::Move { destination, content },
@@ -277,7 +341,7 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 							end: source.lines().count().max(1),
 							body: String::from_utf8_lossy(after).lines().map(Str::new).collect(),
 						}]);
-						projections.push(Projection { after,  operation, move_dest, resolved });
+						projections.push(Projection { after, operation, move_dest, resolved, warnings });
 					}
 
 					let (preview, added_lines, removed_lines) = preview(&works, &projections);
@@ -322,6 +386,9 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 							let Some(result) = result else { return; };
 							match result {
 								Ok(mut result) if result.sections.len() == 1 => {
+									if let Some(pending) = pending_blackbox[index].take() {
+										self.observer.record_committed(pending).await;
+									}
 									committed.push(result.sections.remove(0));
 								},
 								Ok(_) => {
@@ -382,6 +449,9 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 					match result {
 						Ok(result) if result.sections.len() == works.len() => {
 							for work in &works { self.documents.reset_noop(work.prepared.path()); }
+							for pending in pending_blackbox.into_iter().flatten() {
+								self.observer.record_committed(pending).await;
+							}
 							yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, &result.sections)), useless: false });
 						},
 						Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
@@ -541,7 +611,13 @@ fn payload<P: EditPrepared>(
 						.map_or_else(Str::default, |compact| compact.preview.clone()),
 					first_changed_line: Some(1),
 					block_resolutions: Vec::new(),
-					warnings: work.prepared.warnings().to_vec(),
+					warnings: work
+						.prepared
+						.warnings()
+						.iter()
+						.cloned()
+						.chain(projection.warnings.iter().cloned())
+						.collect(),
 					diagnostics: committed.diagnostics.clone(),
 					diagnostics_complete: committed.diagnostics_complete,
 				}
