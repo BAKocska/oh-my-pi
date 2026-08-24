@@ -4,9 +4,9 @@ use std::{error, future::Future, path::PathBuf, pin::Pin, sync, sync::Arc, time,
 
 use flume::Receiver;
 use omp_agent::{
-	AbortHandle, Agent, AgentError, AgentEvent, AgentRunSummary, CampaignEntry, CampaignMachine,
-	CampaignSpec, EngageOptions, EngageReceipt, EventSubscription, ManualCompactionOutcome,
-	ManualCompactionRequest, TurnClient, TurnId,
+	AbortHandle, ActivationId, Agent, AgentError, AgentEvent, AgentRunSummary, EventSubscription,
+	ManualCompactionOutcome, ManualCompactionRequest, Regime, RegimeRecord, RegimeSpec,
+	StartOptions, StartReceipt, TurnClient, TurnId,
 };
 use omp_core::Str;
 use omp_proto::thread::v1::Item;
@@ -154,23 +154,25 @@ type RetryFuture<'a> = Pin<
 >;
 type CompactFuture<'a> =
 	Pin<Box<dyn Future<Output = Result<ManualCompactionOutcome, AgentError>> + Send + 'a>>;
-type EngageFuture<'a> = Pin<
-	Box<dyn Future<Output = Result<(EngageReceipt, Vec<CampaignEntry>), AgentError>> + Send + 'a>,
->;
-type DisengageFuture<'a> =
-	Pin<Box<dyn Future<Output = Result<(bool, Vec<CampaignEntry>), AgentError>> + Send + 'a>>;
+type StartRegimeFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<(StartReceipt, Vec<RegimeRecord>), AgentError>> + Send + 'a>>;
+type ActiveRegimesFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<Vec<RegimeRecord>, AgentError>> + Send + 'a>>;
+type StopRegimeFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<(bool, Vec<RegimeRecord>), AgentError>> + Send + 'a>>;
 
 trait RuntimeDriver: Send {
 	fn submit<'a>(&'a mut self, items: Vec<Item>, turn_id: TurnId) -> SubmitFuture<'a>;
 	fn retry<'a>(&'a mut self, turn_id: TurnId) -> RetryFuture<'a>;
 	fn compact<'a>(&'a mut self, request: ManualCompactionRequest) -> CompactFuture<'a>;
-	fn engage<'a>(
+	fn start_regime<'a>(
 		&'a mut self,
-		spec: Arc<CampaignSpec>,
-		machine: Box<dyn CampaignMachine>,
-		options: EngageOptions,
-	) -> EngageFuture<'a>;
-	fn disengage<'a>(&'a mut self, engagement: Str, now_ms: u64) -> DisengageFuture<'a>;
+		spec: Arc<RegimeSpec>,
+		regime: Box<dyn Regime>,
+		options: StartOptions,
+	) -> StartRegimeFuture<'a>;
+	fn active_regimes(&mut self) -> ActiveRegimesFuture<'_>;
+	fn stop_regime<'a>(&'a mut self, activation: ActivationId, now_ms: u64) -> StopRegimeFuture<'a>;
 }
 
 struct AgentRuntime<C: TurnClient + Clone + Send + 'static> {
@@ -190,24 +192,28 @@ impl<C: TurnClient + Clone + Send + 'static> RuntimeDriver for AgentRuntime<C> {
 		Box::pin(self.agent.compact_manual(request))
 	}
 
-	fn engage<'a>(
+	fn start_regime<'a>(
 		&'a mut self,
-		spec: Arc<CampaignSpec>,
-		machine: Box<dyn CampaignMachine>,
-		options: EngageOptions,
-	) -> EngageFuture<'a> {
+		spec: Arc<RegimeSpec>,
+		regime: Box<dyn Regime>,
+		options: StartOptions,
+	) -> StartRegimeFuture<'a> {
 		Box::pin(async move {
-			let receipt = self.agent.engage_campaign(spec, machine, options)?;
-			let entries = self.agent.arbiter().campaigns().entries();
-			Ok((receipt, entries))
+			let receipt = self.agent.start_regime(spec, regime, options)?;
+			let records = self.agent.arbiter().regimes().records();
+			Ok((receipt, records))
 		})
 	}
 
-	fn disengage<'a>(&'a mut self, engagement: Str, now_ms: u64) -> DisengageFuture<'a> {
+	fn active_regimes(&mut self) -> ActiveRegimesFuture<'_> {
+		Box::pin(async move { Ok(self.agent.arbiter().regimes().records()) })
+	}
+
+	fn stop_regime<'a>(&'a mut self, activation: ActivationId, now_ms: u64) -> StopRegimeFuture<'a> {
 		Box::pin(async move {
-			let removed = self.agent.disengage_campaign(engagement.as_str(), now_ms)?;
-			let entries = self.agent.arbiter().campaigns().entries();
-			Ok((removed, entries))
+			let stopped = self.agent.stop_regime(activation.as_str(), now_ms)?;
+			let records = self.agent.arbiter().regimes().records();
+			Ok((stopped, records))
 		})
 	}
 }
@@ -264,16 +270,19 @@ enum Command {
 		request: ManualCompactionRequest,
 		reply:   flume::Sender<Result<ManualCompactionOutcome, SessionHandleError>>,
 	},
-	EngageCampaign {
-		spec:    Arc<CampaignSpec>,
-		machine: Box<dyn CampaignMachine>,
-		options: EngageOptions,
-		reply:   flume::Sender<Result<(EngageReceipt, Vec<CampaignEntry>), SessionHandleError>>,
+	StartRegime {
+		spec:    Arc<RegimeSpec>,
+		regime:  Box<dyn Regime>,
+		options: StartOptions,
+		reply:   flume::Sender<Result<(StartReceipt, Vec<RegimeRecord>), SessionHandleError>>,
 	},
-	DisengageCampaign {
-		engagement: Str,
+	ActiveRegimes {
+		reply: flume::Sender<Result<Vec<RegimeRecord>, SessionHandleError>>,
+	},
+	StopRegime {
+		activation: ActivationId,
 		now_ms:     u64,
-		reply:      flume::Sender<Result<(bool, Vec<CampaignEntry>), SessionHandleError>>,
+		reply:      flume::Sender<Result<(bool, Vec<RegimeRecord>), SessionHandleError>>,
 	},
 	Dispose {
 		reply: flume::Sender<()>,
@@ -432,18 +441,19 @@ impl SessionHandle {
 			.map_err(|_| SessionHandleError::Closed)?
 	}
 
-	/// Engages and journals a campaign on the actor-owned agent loop.
-	pub async fn engage_campaign(
+	/// Starts and journals a regime on the actor-owned agent loop, returning its
+	/// receipt and the complete active-regime projection.
+	pub async fn start_regime(
 		&self,
-		spec: Arc<CampaignSpec>,
-		machine: Box<dyn CampaignMachine>,
-		options: EngageOptions,
-	) -> Result<(EngageReceipt, Vec<CampaignEntry>), SessionHandleError> {
+		spec: Arc<RegimeSpec>,
+		regime: Box<dyn Regime>,
+		options: StartOptions,
+	) -> Result<(StartReceipt, Vec<RegimeRecord>), SessionHandleError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.inner
 			.commands
-			.send_async(Command::EngageCampaign { spec, machine, options, reply })
+			.send_async(Command::StartRegime { spec, regime, options, reply })
 			.await
 			.map_err(|_| SessionHandleError::Closed)?;
 		response
@@ -452,18 +462,33 @@ impl SessionHandle {
 			.map_err(|_| SessionHandleError::Closed)?
 	}
 
-	/// Disengages a campaign and returns the resulting complete campaign
-	/// projection.
-	pub async fn disengage_campaign(
-		&self,
-		engagement: Str,
-		now_ms: u64,
-	) -> Result<(bool, Vec<CampaignEntry>), SessionHandleError> {
+	/// Returns the complete active-regime projection from the actor-owned loop.
+	pub async fn active_regimes(&self) -> Result<Vec<RegimeRecord>, SessionHandleError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.inner
 			.commands
-			.send_async(Command::DisengageCampaign { engagement, now_ms, reply })
+			.send_async(Command::ActiveRegimes { reply })
+			.await
+			.map_err(|_| SessionHandleError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| SessionHandleError::Closed)?
+	}
+
+	/// Stops one activation and returns whether it was stopped together with
+	/// the resulting complete active-regime projection.
+	pub async fn stop_regime(
+		&self,
+		activation: ActivationId,
+		now_ms: u64,
+	) -> Result<(bool, Vec<RegimeRecord>), SessionHandleError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.inner
+			.commands
+			.send_async(Command::StopRegime { activation, now_ms, reply })
 			.await
 			.map_err(|_| SessionHandleError::Closed)?;
 		response
@@ -515,26 +540,38 @@ async fn run_handle_actor(
 				let _ = reply.send(());
 				continue;
 			},
-			Command::EngageCampaign { spec, machine, options, reply } => {
+			Command::StartRegime { spec, regime, options, reply } => {
 				let Some(live) = runtime.as_mut() else {
 					let _ = reply.send(Err(SessionHandleError::NotRevivable));
 					continue;
 				};
 				let result = live
 					.driver
-					.engage(spec, machine, options)
+					.start_regime(spec, regime, options)
 					.await
 					.map_err(SessionHandleError::from);
 				let _ = reply.send(result);
 			},
-			Command::DisengageCampaign { engagement, now_ms, reply } => {
+			Command::ActiveRegimes { reply } => {
 				let Some(live) = runtime.as_mut() else {
 					let _ = reply.send(Err(SessionHandleError::NotRevivable));
 					continue;
 				};
 				let result = live
 					.driver
-					.disengage(engagement, now_ms)
+					.active_regimes()
+					.await
+					.map_err(SessionHandleError::from);
+				let _ = reply.send(result);
+			},
+			Command::StopRegime { activation, now_ms, reply } => {
+				let Some(live) = runtime.as_mut() else {
+					let _ = reply.send(Err(SessionHandleError::NotRevivable));
+					continue;
+				};
+				let result = live
+					.driver
+					.stop_regime(activation, now_ms)
 					.await
 					.map_err(SessionHandleError::from);
 				let _ = reply.send(result);
