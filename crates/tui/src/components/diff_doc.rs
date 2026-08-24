@@ -8,14 +8,8 @@ use smallvec::SmallVec;
 use strum::{EnumString, IntoStaticStr};
 use xutf::{Text, width_char};
 
-use crate::{
-	Theme,
-	frame::Style,
-	markdown::highlight::{self, HighlightStyles},
-	rich::RichText,
-};
+use crate::frame::Style;
 
-const HIGHLIGHT_LIMIT_BYTES: usize = 512 * 1024;
 const INTRALINE_PAIR_LIMIT: usize = 1_500;
 const HUNK_CONTEXT: usize = 3;
 
@@ -148,6 +142,12 @@ pub struct DiffDocument {
 	/// Global aligned row for each one-based new-side line; index zero is
 	/// unused.
 	pub row_by_new_line: Vec<Option<usize>>,
+	/// Tab-expanded old-side source retained for progressive highlighting.
+	pub(crate) old_lines: Vec<Str>,
+	/// Tab-expanded new-side source retained for progressive highlighting.
+	pub(crate) new_lines: Vec<Str>,
+	/// Resolved syntax token for progressive highlighting.
+	pub(crate) language:  Option<Str>,
 }
 
 impl DiffDocument {
@@ -169,23 +169,7 @@ impl DiffDocument {
 		};
 		let line_max = old_raw.len().max(new_raw.len()).max(1);
 		let gutter_width = decimal_width(line_max).max(3) as u16;
-		let language = options.language.as_deref().or_else(|| {
-			Path::new(path)
-				.extension()
-				.and_then(|extension| extension.to_str())
-		});
-		let highlightable = old.len().saturating_add(new.len()) <= HIGHLIGHT_LIMIT_BYTES;
-		let old_styles = if highlightable {
-			language.and_then(|language| syntax_runs(&old_display, language))
-		} else {
-			None
-		};
-		let new_styles = if highlightable {
-			language.and_then(|language| syntax_runs(&new_display, language))
-		} else {
-			None
-		};
-
+		let language = resolved_language(path, options);
 		let mut rows = Vec::new();
 		let mut intraline_pairs = 0usize;
 		for operation in capture_diff_slices(Algorithm::Myers, &old_basis, &new_basis) {
@@ -197,13 +181,13 @@ impl DiffDocument {
 							Some(side(
 								old_index + offset,
 								&old_display,
-								old_styles.as_deref(),
+								None,
 								gutter_width,
 							)),
 							Some(side(
 								new_index + offset,
 								&new_display,
-								new_styles.as_deref(),
+								None,
 								gutter_width,
 							)),
 						));
@@ -216,7 +200,7 @@ impl DiffDocument {
 							Some(side(
 								old_index + offset,
 								&old_display,
-								old_styles.as_deref(),
+								None,
 								gutter_width,
 							)),
 							None,
@@ -231,7 +215,7 @@ impl DiffDocument {
 							Some(side(
 								new_index + offset,
 								&new_display,
-								new_styles.as_deref(),
+								None,
 								gutter_width,
 							)),
 						));
@@ -240,10 +224,8 @@ impl DiffDocument {
 				DiffOp::Replace { old_index, old_len, new_index, new_len } => {
 					let paired = old_len.min(new_len);
 					for offset in 0..paired {
-						let mut old_side =
-							side(old_index + offset, &old_display, old_styles.as_deref(), gutter_width);
-						let mut new_side =
-							side(new_index + offset, &new_display, new_styles.as_deref(), gutter_width);
+						let mut old_side = side(old_index + offset, &old_display, None, gutter_width);
+						let mut new_side = side(new_index + offset, &new_display, None, gutter_width);
 						if intraline_pairs < INTRALINE_PAIR_LIMIT {
 							let (old_marks, new_marks) = intraline_marks(&old_side.text, &new_side.text);
 							old_side.marks = old_marks;
@@ -258,7 +240,7 @@ impl DiffDocument {
 							Some(side(
 								old_index + offset,
 								&old_display,
-								old_styles.as_deref(),
+								None,
 								gutter_width,
 							)),
 							None,
@@ -271,7 +253,7 @@ impl DiffDocument {
 							Some(side(
 								new_index + offset,
 								&new_display,
-								new_styles.as_deref(),
+								None,
 								gutter_width,
 							)),
 						));
@@ -281,7 +263,7 @@ impl DiffDocument {
 		}
 
 		if options.whitespace == DiffWhitespaceMode::Formatting {
-			demote_formatting_blocks(&mut rows, language);
+			demote_formatting_blocks(&mut rows, language.as_deref());
 		}
 		let additions = rows
 			.iter()
@@ -301,17 +283,14 @@ impl DiffDocument {
 			}
 		}
 		let file_lines = new_display
-			.into_iter()
+			.iter()
+			.cloned()
 			.enumerate()
 			.map(|(index, text)| DiffFileLine {
 				number: (index + 1) as u32,
 				width: cell_width(&text),
 				gutter: gutter_label(index + 1, gutter_width),
-				styles: new_styles
-					.as_deref()
-					.and_then(|lines| lines.get(index))
-					.cloned()
-					.unwrap_or_default(),
+				styles: Box::default(),
 				text,
 			})
 			.collect();
@@ -332,8 +311,140 @@ impl DiffDocument {
 			gutter_width,
 			max_line_width,
 			row_by_new_line,
+			old_lines: old_display,
+			new_lines: new_display,
+			language,
 		}
 	}
+
+	/// Creates an empty provisional document for append-only line delivery.
+	pub(crate) fn begin_stream(path: Str, options: &DiffBuildOptions) -> Self {
+		let language = resolved_language(&path, options);
+		Self {
+			path,
+			rows: Vec::new(),
+			hunks: Vec::new(),
+			file_lines: Vec::new(),
+			additions: 0,
+			deletions: 0,
+			gutter_width: 3,
+			max_line_width: 0,
+			row_by_new_line: vec![None],
+			old_lines: Vec::new(),
+			new_lines: Vec::new(),
+			language,
+		}
+	}
+
+	/// Appends complete source lines and returns the first rebuilt row and new
+	/// file line.
+	pub(crate) fn push_stream(
+		&mut self,
+		old_lines: &[Str],
+		new_lines: &[Str],
+	) -> (usize, usize) {
+		let old_start = self.old_lines.len();
+		let new_start = self.new_lines.len();
+		let stable = old_start.min(new_start);
+		self
+			.old_lines
+			.extend(old_lines.iter().map(|line| expand_tabs(line.as_str().strip_suffix('\r').unwrap_or(line))));
+		self
+			.new_lines
+			.extend(new_lines.iter().map(|line| expand_tabs(line.as_str().strip_suffix('\r').unwrap_or(line))));
+
+		for row in &self.rows[stable..] {
+			self.additions = self
+				.additions
+				.saturating_sub(u32::from(matches!(row.kind, DiffRowKind::Add | DiffRowKind::Change)));
+			self.deletions = self
+				.deletions
+				.saturating_sub(u32::from(matches!(row.kind, DiffRowKind::Del | DiffRowKind::Change)));
+		}
+		self.rows.truncate(stable);
+
+		let line_max = self.old_lines.len().max(self.new_lines.len()).max(1);
+		let next_gutter = decimal_width(line_max).max(3) as u16;
+		if next_gutter != self.gutter_width {
+			self.gutter_width = next_gutter;
+			for row in &mut self.rows {
+				if let Some(side) = &mut row.old {
+					side.gutter = gutter_label(side.number as usize, next_gutter);
+				}
+				if let Some(side) = &mut row.new {
+					side.gutter = gutter_label(side.number as usize, next_gutter);
+				}
+			}
+			for line in &mut self.file_lines {
+				line.gutter = gutter_label(line.number as usize, next_gutter);
+			}
+		}
+
+		for index in stable..line_max {
+			let old = self
+				.old_lines
+				.get(index)
+				.map(|_| side(index, &self.old_lines, None, self.gutter_width));
+			let new = self
+				.new_lines
+				.get(index)
+				.map(|_| side(index, &self.new_lines, None, self.gutter_width));
+			let kind = match (&old, &new) {
+				(Some(old), Some(new)) if old.text == new.text => DiffRowKind::Context,
+				(Some(_), Some(_)) => DiffRowKind::Change,
+				(Some(_), None) => DiffRowKind::Del,
+				(None, Some(_)) => DiffRowKind::Add,
+				(None, None) => continue,
+			};
+			let mut row = make_row(kind, old, new);
+			if kind == DiffRowKind::Change
+				&& index < INTRALINE_PAIR_LIMIT
+				&& let (Some(old), Some(new)) = (&mut row.old, &mut row.new)
+			{
+				(old.marks, new.marks) = intraline_marks(&old.text, &new.text);
+			}
+			self.additions = self
+				.additions
+				.saturating_add(u32::from(matches!(kind, DiffRowKind::Add | DiffRowKind::Change)));
+			self.deletions = self
+				.deletions
+				.saturating_add(u32::from(matches!(kind, DiffRowKind::Del | DiffRowKind::Change)));
+			self.rows.push(row);
+		}
+
+		for (index, text) in self.new_lines.iter().enumerate().skip(new_start) {
+			let width = cell_width(text);
+			self.max_line_width = self.max_line_width.max(width);
+			self.file_lines.push(DiffFileLine {
+				number: (index + 1) as u32,
+				text: text.clone(),
+				width,
+				gutter: gutter_label(index + 1, self.gutter_width),
+				styles: Box::default(),
+			});
+		}
+		for text in self.old_lines.iter().skip(old_start) {
+			self.max_line_width = self.max_line_width.max(cell_width(text));
+		}
+
+		self.row_by_new_line.truncate(self.new_lines.len().saturating_add(1));
+		self
+			.row_by_new_line
+			.resize(self.new_lines.len().saturating_add(1), None);
+		for index in stable..self.new_lines.len() {
+			self.row_by_new_line[index + 1] = Some(index);
+		}
+		(stable, new_start)
+	}
+}
+
+fn resolved_language(path: &str, options: &DiffBuildOptions) -> Option<Str> {
+	options.language.clone().or_else(|| {
+		Path::new(path)
+			.extension()
+			.and_then(|extension| extension.to_str())
+			.map(Str::new)
+	})
 }
 
 fn source_lines(source: &str) -> Vec<&str> {
@@ -505,39 +616,6 @@ fn push_token_range(
 	} else if end > first.start {
 		ranges.push(first.start..end);
 	}
-}
-
-fn syntax_runs(lines: &[Str], language: &str) -> Option<Vec<Box<[DiffStyleRun]>>> {
-	if !highlight::supports_language(language) {
-		return None;
-	}
-	let mut source = StrMut::new("");
-	for (index, line) in lines.iter().enumerate() {
-		if index > 0 {
-			source.push('\n');
-		}
-		source.push_str(line);
-	}
-	let source = source.freeze();
-	let mut rich = RichText::default();
-	let styles = HighlightStyles::from_theme(&Theme::default());
-	if !highlight::render(&source, language, lines.len(), &styles, &mut rich) {
-		return None;
-	}
-	let mut output = Vec::with_capacity(lines.len());
-	for row in 0..lines.len() {
-		let mut column = 0u16;
-		let mut runs: SmallVec<DiffStyleRun, 8> = SmallVec::new();
-		for (style, text) in rich.row_runs(row as u16) {
-			let end = column.saturating_add(cell_width(text));
-			if end > column {
-				runs.push(DiffStyleRun { start: column, end, style });
-			}
-			column = end;
-		}
-		output.push(runs.into_vec().into_boxed_slice());
-	}
-	Some(output)
 }
 
 #[derive(Clone, Copy)]

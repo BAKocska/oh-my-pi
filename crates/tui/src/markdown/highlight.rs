@@ -136,7 +136,69 @@ pub(crate) fn supports_language(language: &str) -> bool {
 	!language.is_empty() && find_syntax(syntaxes(), language).is_some()
 }
 
-/// Highlights a complete code block while preserving parser state across lines.
+/// Stateful syntax parser used by paint-budgeted highlighting.
+///
+/// One instance must be retained for the whole source side so scope state
+/// survives batch boundaries.
+pub(crate) struct HighlightStream {
+	parse_state: ParseState,
+	scope_stack: ScopeStack,
+}
+
+impl HighlightStream {
+	/// Starts a stream for one bundled language.
+	pub(crate) fn new(language: &str) -> Option<Self> {
+		let syntax = find_syntax(syntaxes(), language)?;
+		Some(Self { parse_state: ParseState::new(syntax), scope_stack: ScopeStack::new() })
+	}
+
+	/// Appends one or more complete source lines to this parser.
+	pub(crate) fn render(
+		&mut self,
+		source: &str,
+		line_count: usize,
+		styles: &HighlightStyles,
+		out: &mut RichText,
+	) {
+		let mut emitted = 0;
+		for raw_line in LinesWithEndings::from(source) {
+			let content_len = raw_line.strip_suffix('\n').map_or(raw_line.len(), str::len);
+			let Ok(operations) = self.parse_state.parse_line(raw_line, syntaxes()) else {
+				out.run(styles.base, &raw_line[..content_len]);
+				out.newline();
+				emitted += 1;
+				continue;
+			};
+
+			let mut previous = 0;
+			for (offset, operation) in operations {
+				let end = offset.min(content_len);
+				if end > previous {
+					out.run(
+						styles.at(scope_color_index(&self.scope_stack)),
+						&raw_line[previous..end],
+					);
+				}
+				previous = end;
+				apply_scope_op(&mut self.scope_stack, operation);
+			}
+			if previous < content_len {
+				out.run(
+					styles.at(scope_color_index(&self.scope_stack)),
+					&raw_line[previous..content_len],
+				);
+			}
+			out.newline();
+			emitted += 1;
+		}
+
+		while emitted < line_count {
+			out.newline();
+			emitted += 1;
+		}
+	}
+}
+
 pub(crate) fn render(
 	source: &str,
 	language: &str,
@@ -144,43 +206,10 @@ pub(crate) fn render(
 	styles: &HighlightStyles,
 	out: &mut RichText,
 ) -> bool {
-	let syntaxes = syntaxes();
-	let Some(syntax) = find_syntax(syntaxes, language) else {
+	let Some(mut stream) = HighlightStream::new(language) else {
 		return false;
 	};
-	let mut parse_state = ParseState::new(syntax);
-	let mut scope_stack = ScopeStack::new();
-	let mut emitted = 0;
-
-	for raw_line in LinesWithEndings::from(source) {
-		let content_len = raw_line.strip_suffix('\n').map_or(raw_line.len(), str::len);
-		let Ok(operations) = parse_state.parse_line(raw_line, syntaxes) else {
-			out.run(styles.base, &raw_line[..content_len]);
-			out.newline();
-			emitted += 1;
-			continue;
-		};
-
-		let mut previous = 0;
-		for (offset, operation) in operations {
-			let end = offset.min(content_len);
-			if end > previous {
-				out.run(styles.at(scope_color_index(&scope_stack)), &raw_line[previous..end]);
-			}
-			previous = end;
-			apply_scope_op(&mut scope_stack, operation);
-		}
-		if previous < content_len {
-			out.run(styles.at(scope_color_index(&scope_stack)), &raw_line[previous..content_len]);
-		}
-		out.newline();
-		emitted += 1;
-	}
-
-	while emitted < line_count {
-		out.newline();
-		emitted += 1;
-	}
+	stream.render(source, line_count, styles, out);
 	true
 }
 

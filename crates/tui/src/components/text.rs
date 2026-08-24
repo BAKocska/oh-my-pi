@@ -135,6 +135,16 @@ impl TextLeaf {
 					}
 				}
 			},
+			None if self.props.text_wrap() == TextWrap::Pre => {
+				for (index, line) in visible.split('\n').enumerate() {
+					if index > 0 {
+						self.rich.newline();
+					}
+					if !line.is_empty() {
+						self.rich.run(style, line);
+					}
+				}
+			},
 			None => {
 				let mut wrap = (&mut self.rich).wrap(width);
 				// text is escape-free by contract: ANSI is parsed only at the
@@ -177,6 +187,10 @@ impl Component for TextLeaf {
 	}
 
 	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
+		if self.props.text_wrap() == TextWrap::Pre {
+			let natural = self.text.as_str().split('\n').map(cell_width).max().unwrap_or(0);
+			return (natural, natural);
+		}
 		let mut widest_word = 0;
 		let mut total = 0u16;
 		for word in self.text.split_whitespace() {
@@ -705,6 +719,17 @@ mod tests {
 		assert_eq!(frame_row_text(&frame, 0), "ab cdefg");
 		assert_eq!(frame_row_text(&frame, 1), "h x");
 		assert!(frame.soft_wrap(0));
+	}
+	#[test]
+	fn pre_wrap_preserves_spaces_and_never_soft_wraps() {
+		let ctx = UiContext::default();
+		let mut text = TextLeaf::new().with(Prop::Wrap, "pre").text("a  b\n  x");
+		assert_eq!(text.measure(&ctx), (4, 4));
+		assert_eq!(text.height(&ctx, 2), 2, "narrow widths do not add rows");
+		let frame = paint(&mut text, 8, 2);
+		assert_eq!(frame_row_text(&frame, 0), "a  b");
+		assert_eq!(frame_row_text(&frame, 1), "  x");
+		assert!(!frame.soft_wrap(0));
 	}
 
 	#[test]

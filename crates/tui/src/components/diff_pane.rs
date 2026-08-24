@@ -8,8 +8,12 @@ use smallvec::SmallVec;
 use strum::{EnumString, IntoStaticStr};
 use xutf::Text;
 
+const HIGHLIGHT_BATCH_LINES: usize = 32;
+
 use super::{
-	diff_doc::{DiffDocument, DiffMark, DiffRow, DiffRowKind, DiffSide, DiffStyleRun},
+	diff_doc::{
+		DiffBuildOptions, DiffDocument, DiffMark, DiffRow, DiffRowKind, DiffSide, DiffStyleRun,
+	},
 	img::Img,
 	radio::pill,
 };
@@ -19,6 +23,8 @@ use crate::{
 	context::UiContext,
 	frame::{Color, Rect, Style},
 	imagefmt::ImageDimensions,
+	markdown::highlight::{HighlightStream, HighlightStyles},
+	rich::RichText,
 	input::{Key, Mouse, UiEvent},
 	props::{Prop, PropValue, Props},
 };
@@ -120,6 +126,7 @@ enum Visual {
 	File { line: usize, row: Option<usize>, segment: u16 },
 	Header { hunk: usize },
 	Blank,
+	Loading,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,12 +186,73 @@ struct AssetPreview {
 	new: Option<AssetSide>,
 }
 
+struct HighlightSide {
+	runs:    Vec<Option<Box<[DiffStyleRun]>>>,
+	offset:  usize,
+	stream:  Option<HighlightStream>,
+	scratch: StrMut,
+	rich:    RichText,
+}
+
+struct SyntaxHighlights {
+	old:         HighlightSide,
+	new:         HighlightSide,
+	language:    Str,
+	initialized: bool,
+}
+
+impl SyntaxHighlights {
+	fn new(document: &DiffDocument) -> Option<Self> {
+		let language = document.language.clone()?;
+		Some(Self {
+			old: HighlightSide {
+				runs: vec![None; document.old_lines.len()],
+				offset: 0,
+				stream: None,
+				scratch: StrMut::new(""),
+				rich: RichText::default(),
+			},
+			new: HighlightSide {
+				runs: vec![None; document.new_lines.len()],
+				offset: 0,
+				stream: None,
+				scratch: StrMut::new(""),
+				rich: RichText::default(),
+			},
+			language,
+			initialized: false,
+		})
+	}
+
+	fn initialize(&mut self) {
+		if self.initialized {
+			return;
+		}
+		self.old.stream = HighlightStream::new(&self.language);
+		self.new.stream = HighlightStream::new(&self.language);
+		self.initialized = true;
+	}
+
+	fn extend(&mut self, document: &DiffDocument) {
+		self.old.runs.resize_with(document.old_lines.len(), || None);
+		self.new.runs.resize_with(document.new_lines.len(), || None);
+	}
+
+	fn pending(&self, document: &DiffDocument) -> bool {
+		(self.old.stream.is_some() && self.old.offset < document.old_lines.len())
+			|| (self.new.stream.is_some() && self.new.offset < document.new_lines.len())
+	}
+}
+
 /// General-purpose interactive old/new text diff viewer.
 pub struct DiffPane {
 	props:         Props,
 	slot:          Slot,
 	document:      Option<DiffDocument>,
 	asset:         Option<AssetPreview>,
+	highlights:    Option<SyntaxHighlights>,
+	streaming:     bool,
+	stream_status: Str,
 	state:         DiffPaneState,
 	empty_message: Str,
 	mode:          ViewMode,
@@ -209,6 +277,9 @@ impl DiffPane {
 			slot:          next_slot(),
 			document:      None,
 			asset:         None,
+			highlights:    None,
+			streaming:     false,
+			stream_status: Str::new_static("Loading lines…"),
 			state:         DiffPaneState::Empty,
 			empty_message: Str::new_static("No changes"),
 			mode:          ViewMode::Split,
@@ -245,8 +316,10 @@ impl DiffPane {
 	/// Replaces the document and state, resetting navigation to the first
 	/// change.
 	pub fn set_document(&mut self, document: Option<DiffDocument>, state: DiffPaneState) {
+		self.highlights = document.as_ref().and_then(SyntaxHighlights::new);
 		self.document = document;
 		self.asset = None;
+		self.streaming = false;
 		self.state = state;
 		self.version = self.version.wrapping_add(1);
 		self.scroll_top = 0;
@@ -263,6 +336,62 @@ impl DiffPane {
 			}) {
 			self.focus_change(first);
 		}
+	}
+
+	/// Starts append-only old/new text delivery for `path`.
+	pub fn begin_stream(&mut self, path: impl IntoStr, options: &DiffBuildOptions) {
+		let document = DiffDocument::begin_stream(path.into_str(), options);
+		self.set_document(Some(document), DiffPaneState::Ready);
+		self.streaming = true;
+		self.version = self.version.wrapping_add(1);
+		self.rebuild_layout(self.last_width);
+	}
+
+	/// Appends complete logical lines to each side of the streaming document.
+	///
+	/// Lines exclude their newline terminators.
+	pub fn push_stream(&mut self, old_lines: &[Str], new_lines: &[Str]) {
+		if !self.streaming {
+			return;
+		}
+		let previous_version = self.version;
+		let (first_row, first_new_line) = {
+			let Some(document) = &mut self.document else {
+				return;
+			};
+			document.push_stream(old_lines, new_lines)
+		};
+		if let (Some(highlights), Some(document)) = (&mut self.highlights, &self.document) {
+			highlights.extend(document);
+		}
+		let total = self
+			.document
+			.as_ref()
+			.map_or(0, |document| document.old_lines.len().max(document.new_lines.len()));
+		let mut status = StrMut::with_capacity(32);
+		let _ = write!(status, "Loading {total} lines…");
+		self.stream_status = status.freeze();
+		self.version = self.version.wrapping_add(1);
+		self.extend_stream_layout(previous_version, first_row, first_new_line);
+	}
+
+	/// Finalizes streaming by installing the authoritative complete document.
+	///
+	/// This is also safe without a preceding [`Self::begin_stream`].
+	pub fn finish_stream(&mut self, document: DiffDocument) {
+		let same_lines = self.streaming
+			&& self.document.as_ref().is_some_and(|streamed| {
+				streamed.old_lines == document.old_lines && streamed.new_lines == document.new_lines
+			});
+		if !same_lines {
+			self.set_document(Some(document), DiffPaneState::Ready);
+			return;
+		}
+		self.document = Some(document);
+		self.streaming = false;
+		self.state = DiffPaneState::Ready;
+		self.version = self.version.wrapping_add(1);
+		self.rebuild_layout(self.last_width);
 	}
 
 	/// Replaces the pane contents with old/new encoded image bytes.
@@ -577,10 +706,108 @@ impl DiffPane {
 				}
 			},
 		}
+		if self.streaming {
+			self.layout.visuals.push(Visual::Loading);
+		}
 		self.layout.version = self.version;
 		self.layout.mode = self.mode;
 		self.layout.wrap = self.wrap;
 		self.layout.width = width;
+		self.clamp_scroll();
+	}
+
+	fn extend_stream_layout(
+		&mut self,
+		previous_version: u64,
+		first_row: usize,
+		first_new_line: usize,
+	) {
+		let width = self.last_width;
+		if self.layout.version != previous_version
+			|| self.layout.mode != self.mode
+			|| self.layout.wrap != self.wrap
+			|| self.layout.width != width
+		{
+			self.rebuild_layout(width);
+			return;
+		}
+		let Some(document) = &self.document else {
+			self.rebuild_layout(width);
+			return;
+		};
+		if matches!(self.layout.visuals.last(), Some(Visual::Loading)) {
+			self.layout.visuals.pop();
+		}
+		match self.mode {
+			ViewMode::Split => {
+				let keep = self
+					.layout
+					.visuals
+					.iter()
+					.position(|visual| {
+						matches!(visual, Visual::Split { row, .. } if *row >= first_row)
+					})
+					.unwrap_or(self.layout.visuals.len());
+				self.layout.visuals.truncate(keep);
+				let text_width = self.split_text_width(width);
+				for (row_index, row) in document.rows.iter().enumerate().skip(first_row) {
+					let content = row
+						.old
+						.as_ref()
+						.map_or(0, |side| side.width)
+						.max(row.new.as_ref().map_or(0, |side| side.width));
+					for segment in 0..self.segments(text_width, content) {
+						self
+							.layout
+							.visuals
+							.push(Visual::Split { row: row_index, segment });
+					}
+				}
+			},
+			ViewMode::Inline => {
+				let text_width = self.line_text_width(width);
+				let keep = self
+					.layout
+					.visuals
+					.iter()
+					.position(|visual| {
+						matches!(visual, Visual::Line { row, .. } if *row >= first_row)
+					})
+					.unwrap_or(self.layout.visuals.len());
+				self.layout.visuals.truncate(keep);
+				Self::push_inline_rows(
+					document,
+					&mut self.layout.visuals,
+					first_row..document.rows.len(),
+					text_width,
+					self.wrap,
+				);
+			},
+			ViewMode::Hunk => self.layout.visuals.clear(),
+			ViewMode::File => {
+				let keep = self
+					.layout
+					.visuals
+					.iter()
+					.position(|visual| {
+						matches!(visual, Visual::File { line, .. } if *line >= first_new_line)
+					})
+					.unwrap_or(self.layout.visuals.len());
+				self.layout.visuals.truncate(keep);
+				let text_width = self.file_text_width(width);
+				for (line, source) in document.file_lines.iter().enumerate().skip(first_new_line) {
+					let row = document.row_by_new_line.get(line + 1).copied().flatten();
+					for segment in 0..self.segments(text_width, source.width) {
+						self
+							.layout
+							.visuals
+							.push(Visual::File { line, row, segment });
+					}
+				}
+			},
+		}
+		self.layout.visuals.push(Visual::Loading);
+		self.layout.version = self.version;
 		self.clamp_scroll();
 	}
 
@@ -743,7 +970,7 @@ impl DiffPane {
 					.map_or(MapKind::Context, |row| row_map_kind(row.kind)),
 			),
 			Visual::Header { .. } => Some(MapKind::Hunk),
-			Visual::Blank => None,
+			Visual::Blank | Visual::Loading => None,
 		}
 	}
 
@@ -820,6 +1047,38 @@ impl DiffPane {
 			.put_clipped(x, y, rect.x.saturating_add(rect.width).saturating_sub(x), text, style);
 	}
 
+	fn advance_highlights(&mut self, pc: &mut PaintCtx<'_>) {
+		let Some(document) = &self.document else {
+			return;
+		};
+		let Some(highlights) = &mut self.highlights else {
+			return;
+		};
+		highlights.initialize();
+		let styles = HighlightStyles::from_theme(&Theme::default());
+		highlight_side(&mut highlights.old, &document.old_lines, &styles);
+		highlight_side(&mut highlights.new, &document.new_lines, &styles);
+		if highlights.pending(document) {
+			pc.wake(self.slot, pc.now);
+		}
+	}
+
+	fn syntax_styles<'a>(
+		&'a self,
+		old: bool,
+		number: u32,
+		fallback: &'a [DiffStyleRun],
+	) -> &'a [DiffStyleRun] {
+		let side = self
+			.highlights
+			.as_ref()
+			.map(|highlights| if old { &highlights.old } else { &highlights.new });
+		side
+			.and_then(|side| side.runs.get(number.saturating_sub(1) as usize))
+			.and_then(Option::as_deref)
+			.unwrap_or(fallback)
+	}
+
 	fn paint_placeholder(&self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		let message = match self.state {
 			DiffPaneState::Empty | DiffPaneState::Ready => self.empty_message.as_str(),
@@ -852,6 +1111,15 @@ impl DiffPane {
 		let document = self.document.as_ref().expect("ready pane has a document");
 		match visual {
 			Visual::Blank => {},
+			Visual::Loading => {
+				pc.frame.put_clipped(
+					rect.x,
+					y,
+					self.body_width(rect.width),
+					&self.stream_status,
+					Style::new().fg(pc.ctx.theme.muted),
+				);
+			},
 			Visual::Header { hunk } => self.paint_header(pc, rect, y, hunk, selected),
 			Visual::Split { row, segment } => {
 				let row = &document.rows[row];
@@ -926,7 +1194,7 @@ impl DiffPane {
 					y,
 					text_width,
 					&source.text,
-					&source.styles,
+					self.syntax_styles(false, source.number, &source.styles),
 					&[],
 					start,
 					bg,
@@ -999,7 +1267,7 @@ impl DiffPane {
 				y,
 				text_width,
 				&side.text,
-				&side.styles,
+				self.syntax_styles(old, side.number, &side.styles),
 				&side.marks,
 				start,
 				bg,
@@ -1034,10 +1302,13 @@ impl DiffPane {
 		let document = self.document.as_ref().expect("document");
 		let gutter = document.gutter_width;
 		let text_width = self.line_text_width(self.last_width);
-		let side = match side_kind {
-			SideKind::Old => row.old.as_ref(),
-			SideKind::New => row.new.as_ref(),
-			SideKind::Both => row.new.as_ref().or(row.old.as_ref()),
+		let (side, syntax_old) = match side_kind {
+			SideKind::Old => (row.old.as_ref(), true),
+			SideKind::New => (row.new.as_ref(), false),
+			SideKind::Both => match row.new.as_ref() {
+				Some(new) => (Some(new), false),
+				None => (row.old.as_ref(), true),
+			},
 		};
 		let is_del = side_kind == SideKind::Old && row.kind != DiffRowKind::Context;
 		let is_add = side_kind == SideKind::New && row.kind != DiffRowKind::Context;
@@ -1106,7 +1377,7 @@ impl DiffPane {
 				y,
 				text_width,
 				&side.text,
-				&side.styles,
+				self.syntax_styles(syntax_old, side.number, &side.styles),
 				&side.marks,
 				start,
 				bg,
@@ -1298,6 +1569,7 @@ impl Component for DiffPane {
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		self.last_width = rect.width;
 		self.last_height = rect.height.max(1);
+		self.advance_highlights(pc);
 		self.rebuild_layout(rect.width);
 		pc.hits
 			.push(Hit { rect, slot: self.slot, tag: HitTag::Wheel });
@@ -1435,6 +1707,47 @@ impl Component for DiffPane {
 	}
 }
 
+fn highlight_side(side: &mut HighlightSide, lines: &[Str], styles: &HighlightStyles) {
+	let Some(stream) = &mut side.stream else {
+		return;
+	};
+	if side.offset >= lines.len() {
+		return;
+	}
+	let end = side
+		.offset
+		.saturating_add(HIGHLIGHT_BATCH_LINES)
+		.min(lines.len());
+	side.scratch.truncate(0);
+	side.scratch.reserve(
+		lines[side.offset..end]
+			.iter()
+			.map(|line| line.len().saturating_add(1))
+			.sum(),
+	);
+	for line in &lines[side.offset..end] {
+		side.scratch.push_str(line);
+		side.scratch.push('\n');
+	}
+	side.rich.clear();
+	stream.render(side.scratch.as_str(), end - side.offset, styles, &mut side.rich);
+	for (row, slot) in side.runs[side.offset..end].iter_mut().enumerate() {
+		let mut column = 0u16;
+		let mut runs: SmallVec<DiffStyleRun, 8> = SmallVec::new();
+		for (style, text) in side.rich.row_runs(row as u16) {
+			let end = column.saturating_add(
+				u16::try_from(text.visible_width()).unwrap_or(u16::MAX),
+			);
+			if end > column {
+				runs.push(DiffStyleRun { start: column, end, style });
+			}
+			column = end;
+		}
+		*slot = Some(runs.into_vec().into_boxed_slice());
+	}
+	side.offset = end;
+}
+
 fn asset_side(bytes: Bytes, format: &str) -> AssetSide {
 	let byte_len = bytes.len();
 	let image = Img::from_bytes(bytes);
@@ -1519,7 +1832,7 @@ fn visual_row(visual: Visual) -> Option<usize> {
 	match visual {
 		Visual::Split { row, .. } | Visual::Line { row, .. } => Some(row),
 		Visual::File { row, .. } => row,
-		Visual::Header { .. } | Visual::Blank => None,
+		Visual::Header { .. } | Visual::Blank | Visual::Loading => None,
 	}
 }
 
@@ -1830,6 +2143,138 @@ mod tests {
 		assert_ne!(base, mark);
 		assert!(text_width > 0);
 	}
+	#[test]
+	fn progressive_highlighting_advances_in_bounded_batches_and_keeps_input_live() {
+		let mut source = String::new();
+		for index in 0..31 {
+			let _ = writeln!(source, "let value_{index} = {index};");
+		}
+		source.push_str("/* opening comment\n");
+		source.push_str("still in the comment\n");
+		source.push_str("closing */\n");
+		for index in 34..70 {
+			let _ = writeln!(source, "let value_{index} = {index};");
+		}
+		let document = DiffDocument::build(&source, &source, "large.rs", &Default::default());
+		let mut pane = DiffPane::new();
+		pane.set_document(Some(document), DiffPaneState::Ready);
+
+		assert_eq!(pane.highlights.as_ref().unwrap().old.offset, 0);
+		paint(&mut pane, 80, 4);
+		assert_eq!(pane.highlights.as_ref().unwrap().old.offset, HIGHLIGHT_BATCH_LINES);
+
+		let ctx = UiContext::default();
+		let mut ec = EventCtx::new(&ctx, 80, 4);
+		let before = pane.cursor;
+		assert!(matches!(pane.key(&mut ec, Key::Down), Flow::Consumed));
+		assert_eq!(pane.cursor, before + 1);
+
+		paint(&mut pane, 80, 4);
+		let highlights = pane.highlights.as_ref().unwrap();
+		assert_eq!(highlights.old.offset, HIGHLIGHT_BATCH_LINES * 2);
+		let comment = highlights.old.runs[32].as_deref().unwrap();
+		assert_eq!(
+			comment.first().unwrap().style.foreground_color(),
+			Theme::default().muted
+		);
+		paint(&mut pane, 80, 4);
+		let highlights = pane.highlights.as_ref().unwrap();
+		assert_eq!(highlights.old.offset, 70);
+		assert!(highlights.old.runs.iter().all(Option::is_some));
+		assert!(highlights.new.runs.iter().all(Option::is_some));
+	}
+
+	#[test]
+	fn document_replace_cancels_and_restarts_progressive_highlighting() {
+		let source = "fn old() {}\n".repeat(HIGHLIGHT_BATCH_LINES + 8);
+		let mut pane = DiffPane::new();
+		pane.set_document(
+			Some(DiffDocument::build(&source, &source, "old.rs", &Default::default())),
+			DiffPaneState::Ready,
+		);
+		paint(&mut pane, 60, 3);
+		assert_eq!(pane.highlights.as_ref().unwrap().old.offset, HIGHLIGHT_BATCH_LINES);
+
+		pane.set_document(
+			Some(DiffDocument::build("fn next() {}", "fn next() {}", "next.rs", &Default::default())),
+			DiffPaneState::Ready,
+		);
+		let highlights = pane.highlights.as_ref().unwrap();
+		assert_eq!(highlights.old.offset, 0);
+		assert_eq!(highlights.old.runs.len(), 1);
+		paint(&mut pane, 60, 3);
+		assert_eq!(pane.highlights.as_ref().unwrap().old.offset, 1);
+	}
+
+	#[test]
+	fn streaming_rows_grow_incrementally_without_yanking_viewport() {
+		let mut pane = DiffPane::new();
+		pane.begin_stream("stream.rs", &Default::default());
+		let initial = paint(&mut pane, 60, 2).0;
+		assert!(frame_row_text(&initial, 0).contains("Loading"));
+
+		pane.push_stream(
+			&[Str::new("a"), Str::new("b"), Str::new("c"), Str::new("d"), Str::new("e")],
+			&[Str::new("a"), Str::new("B"), Str::new("c"), Str::new("d"), Str::new("e")],
+		);
+		paint(&mut pane, 60, 2);
+		assert_eq!(pane.document.as_ref().unwrap().rows.len(), 5);
+		pane.scroll_top = 2;
+		pane.cursor = 2;
+		pane.anchor = Some(2);
+
+		pane.push_stream(
+			&[Str::new("f"), Str::new("g")],
+			&[Str::new("f"), Str::new("G")],
+		);
+		assert_eq!(pane.document.as_ref().unwrap().rows.len(), 7);
+		assert_eq!(pane.scroll_top, 2);
+		assert_eq!(pane.cursor, 2);
+		assert_eq!(pane.anchor, Some(2));
+		assert!(matches!(pane.layout.visuals.last(), Some(Visual::Loading)));
+	}
+
+	#[test]
+	fn streaming_tail_realigns_and_matching_finish_preserves_navigation() {
+		let mut pane = DiffPane::new();
+		pane.begin_stream("stream.txt", &Default::default());
+		pane.push_stream(&[Str::new("a"), Str::new("b")], &[Str::new("a")]);
+		assert_eq!(pane.document.as_ref().unwrap().rows[1].kind, DiffRowKind::Del);
+		pane.push_stream(&[], &[Str::new("B")]);
+		assert_eq!(pane.document.as_ref().unwrap().rows[1].kind, DiffRowKind::Change);
+		pane.scroll_top = 1;
+		pane.cursor = 1;
+		pane.anchor = Some(1);
+
+		let final_document =
+			DiffDocument::build("a\nb", "a\nB", "stream.txt", &Default::default());
+		pane.finish_stream(final_document);
+		assert!(!pane.streaming);
+		assert_eq!(pane.scroll_top, 1);
+		assert_eq!(pane.cursor, 1);
+		assert_eq!(pane.anchor, Some(1));
+		assert_eq!(pane.document.as_ref().unwrap().rows[1].kind, DiffRowKind::Change);
+		assert!(!matches!(pane.layout.visuals.last(), Some(Visual::Loading)));
+	}
+
+	#[test]
+	fn differing_finish_swaps_document_and_resets_navigation() {
+		let mut pane = DiffPane::new();
+		pane.begin_stream("stream.txt", &Default::default());
+		pane.push_stream(&[Str::new("old")], &[Str::new("old")]);
+		pane.cursor = 1;
+		pane.anchor = Some(0);
+		pane.finish_stream(DiffDocument::build(
+			"authoritative",
+			"authoritative",
+			"stream.txt",
+			&Default::default(),
+		));
+		assert_eq!(pane.document.as_ref().unwrap().new_lines, [Str::new("authoritative")]);
+		assert_eq!(pane.cursor, 0);
+		assert_eq!(pane.anchor, None);
+	}
+
 	#[test]
 	fn syntax_runs_follow_the_active_theme() {
 		let document =

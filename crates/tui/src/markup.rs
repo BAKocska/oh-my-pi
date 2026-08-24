@@ -174,6 +174,9 @@ pub enum TextWrap {
 	/// is a byte-preserving soft wrap the renderer re-joins for native
 	/// copy.
 	Char,
+	/// Preserve authored whitespace and newlines verbatim without soft
+	/// wrapping, matching CSS `white-space: pre`.
+	Pre,
 }
 
 /// How a container distributes leftover vertical space among its children.
