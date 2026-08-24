@@ -39,6 +39,7 @@ export interface TripleStoreLike {
 export interface BeamCaches {
 	timestampParse: Map<string, Date>;
 	polyphonicEngine?: unknown;
+	queryCache?: unknown;
 	extractionClient?: unknown;
 	extractionBuffer: unknown[];
 	[key: string]: unknown;

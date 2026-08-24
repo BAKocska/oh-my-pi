@@ -101,17 +101,176 @@ describe("PolyphonicRecallEngine", () => {
 		expect(polyphonicRecallIsEnabled()).toBe(true);
 	});
 
-	it("fuses the four voices with RRF and preserves voice attribution order", () => {
+	it("fuses the four voices with RRF and attributes voice scores per memory", () => {
 		const beam = makeBeam();
 		try {
 			const engine = seedPolyphonicFixture(beam);
 			const results = engine.recall("Alice recent", [1, 0], 10);
-			expect(results.map(result => result.id)).toEqual(["m2", "m1", "m3"]);
-			expect(results[0]?.voice_scores).toEqual({ vector: 1 / 61, graph: 1 / 61 });
-			expect(results[1]?.voice_scores).toEqual({ vector: 1 / 62, fact: 1 / 61 });
-			expect(results[2]?.voice_scores).toEqual({ temporal: 1 / 61 });
-			expect(results[0]?.score).toBeGreaterThan(results[1]?.score ?? 0);
-			expect(results[0]?.content).toContain("graph traversal");
+			// Final ordering is diversity-aware (MMR over content), so the contract is the
+			// selected SET plus per-memory voice attribution, not a pure score ordering.
+			expect(results.map(result => result.id).sort()).toEqual(["m1", "m2", "m3"]);
+			const byId = new Map(results.map(result => [result.id, result]));
+			// Weighted RRF: contribution is voiceWeights[voice] / (RRF_K + rank).
+			expect(byId.get("m2")?.voice_scores).toEqual({ vector: 0.15 / 61, graph: 0.55 / 61 });
+			expect(byId.get("m1")?.voice_scores).toEqual({ vector: 0.15 / 62, fact: 0.2 / 61 });
+			expect(byId.get("m3")?.voice_scores).toEqual({ temporal: 0.1 / 61 });
+			// MMR seeds from the highest-RRF candidate, so the top-scored memory still leads.
+			expect(results[0]?.id).toBe("m2");
+			expect(byId.get("m2")?.score).toBeGreaterThan(byId.get("m1")?.score ?? 0);
+			expect(byId.get("m2")?.content).toContain("graph traversal");
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
+	it("returns a full topK when a single voice nominates every candidate", () => {
+		const beam = makeBeam();
+		try {
+			const engine = new PolyphonicRecallEngine({
+				db: beam.db,
+				sessionId: beam.sessionId,
+				channelId: beam.channelId,
+			});
+			// Twelve distinct memories reachable only through the vector voice. Diversity is
+			// judged on content, so these must not be treated as duplicates of one another.
+			// The previous rule compared voice-MEMBERSHIP sets, giving every pair a Jaccard of
+			// 1.0 and collapsing the whole result set to a single row.
+			for (let index = 0; index < 12; index++) {
+				const id = `v${index}`;
+				insertWorking(beam, id, `Distinct subject ${index} with its own unrelated wording ${index}`);
+				beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, 'test')", [
+					id,
+					JSON.stringify([1, index / 100]),
+				]);
+			}
+			const results = engine.recall("unrelated wording", [1, 0], 8);
+			expect(results).toHaveLength(8);
+			expect(new Set(results.map(result => result.id)).size).toBe(8);
+			for (const result of results) {
+				expect(result.voice_scores).toHaveProperty("vector");
+			}
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
+	it("builds a subject dictionary that excludes writer placeholders", () => {
+		const beam = makeBeam();
+		try {
+			const engine = new PolyphonicRecallEngine({
+				db: beam.db,
+				sessionId: beam.sessionId,
+				channelId: beam.channelId,
+			});
+			const now = new Date().toISOString();
+			insertWorking(beam, "dm1", "Bash tool notes");
+			for (const [factId, subject, object] of [
+				["f_placeholder", "fact", "a flat statement stored with a placeholder subject"],
+				["f_version", "version", "1.2.3"],
+				["f_real", "Bash tool", "only affects that subprocess"],
+				["f_caps", "CLI", "manages banks"],
+			]) {
+				beam.db.run(
+					`INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence)
+						VALUES (?, ?, ?, 'is', ?, ?, 'dm1', 0.8)`,
+					[factId ?? "", beam.sessionId, subject ?? "", object ?? "", now],
+				);
+			}
+			const dictionary = engine.subjectDictionary().map(entry => entry.toLowerCase());
+			// `fact`/`version` are field labels from the writer, not entities. Admitting `fact`
+			// would let any query containing that common word seed every flat row.
+			expect(dictionary).not.toContain("fact");
+			expect(dictionary).not.toContain("version");
+			expect(dictionary).toContain("bash tool");
+			expect(dictionary).toContain("cli");
+			// Both of these are unreachable for a proper-case-run regex: `Bash tool` has a
+			// lowercase second word and `CLI` has no lowercase letters at all.
+			expect(engine.matchStoredSubjects("what does the Bash tool do in the CLI?").sort()).toEqual([
+				"Bash tool",
+				"CLI",
+			]);
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
+	it("recalls flat placeholder facts through object text", () => {
+		const beam = makeBeam();
+		try {
+			const engine = new PolyphonicRecallEngine({
+				db: beam.db,
+				sessionId: beam.sessionId,
+				channelId: beam.channelId,
+			});
+			insertWorking(beam, "om1", "Full-page screenshots are required for visual QA");
+			beam.db.run(
+				`INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence)
+					VALUES ('f_flat', ?, 'fact', 'entity', 'capture a full-page screenshot rather than a fixed viewport', ?, 'om1', 0.7)`,
+				[beam.sessionId, new Date().toISOString()],
+			);
+			const results = engine.factVoice("which screenshot should I capture?");
+			expect(results.map(result => result.memoryId)).toContain("om1");
+			expect(results.every(result => result.voice === "fact")).toBe(true);
+			// A silent SQL failure here would be indistinguishable from "no matches".
+			expect(engine.getStats().fact_object_error).toBeNull();
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
+	it("seeds the graph voice from a fact's source memory, not its fact id", () => {
+		const beam = makeBeam();
+		try {
+			const engine = new PolyphonicRecallEngine({
+				db: beam.db,
+				sessionId: beam.sessionId,
+				channelId: beam.channelId,
+			});
+			insertWorking(beam, "fm1", "Alice maintains the release runbook");
+			// Real stored fact ids look like `fact_<memoryId>_<index>`; the memory id lives in
+			// `source_msg_id`. Taking the last underscore segment yields the index ("0").
+			beam.db.run(
+				`INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence)
+					VALUES ('fact_fm1_0', ?, 'Alice', 'maintains', 'release runbook', ?, 'fm1', 0.9)`,
+				[beam.sessionId, new Date().toISOString()],
+			);
+			const candidates = engine.graphVoice("Alice");
+			expect(candidates.map(candidate => candidate.memoryId)).toContain("fm1");
+			expect(candidates.map(candidate => candidate.memoryId)).not.toContain("0");
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
+	it("normalizes gist nodes reached by ctx traversal to their memory id", () => {
+		const beam = makeBeam();
+		try {
+			const engine = new PolyphonicRecallEngine({
+				db: beam.db,
+				sessionId: beam.sessionId,
+				channelId: beam.channelId,
+			});
+			insertWorking(beam, "gm1", "Alice opened the incident review");
+			insertWorking(beam, "gm2", "Follow-up actions from the incident review");
+			const timestamp = new Date().toISOString();
+			beam.db.run(
+				`INSERT INTO gists (id, text, timestamp, participants_json, memory_id)
+					VALUES ('gist_gm1', 'Alice incident gist', ?, ?, 'gm1')`,
+				[timestamp, JSON.stringify(["Alice"])],
+			);
+			// `ctx` edges hop through the gist node, so a depth-2 walk surfaces `gist_gm1`.
+			for (const [source, target] of [
+				["gm1", "gist_gm1"],
+				["gist_gm1", "gm2"],
+			]) {
+				beam.db.run(
+					"INSERT INTO graph_edges (source, target, edge_type, weight, timestamp) VALUES (?, ?, 'ctx', 1.0, ?)",
+					[source ?? "", target ?? "", timestamp],
+				);
+			}
+			const ids = engine.graphVoice("Alice").map(candidate => candidate.memoryId);
+			expect(ids).toContain("gm2");
+			expect(ids.some(id => id.startsWith("gist_"))).toBe(false);
 		} finally {
 			closeQuietly(beam.db);
 		}
@@ -126,7 +285,7 @@ describe("PolyphonicRecallEngine", () => {
 			process.env.MNEMOPI_VOICE_TEMPORAL = "0";
 			const results = engine.recall("Alice recent", [1, 0], 10);
 			expect(results.map(result => result.id)).toEqual(["m1"]);
-			expect(results[0]?.voice_scores).toEqual({ fact: 1 / 61 });
+			expect(results[0]?.voice_scores).toEqual({ fact: 0.2 / 61 });
 		} finally {
 			closeQuietly(beam.db);
 		}

@@ -49,6 +49,13 @@ type FactRecallResult = RecallResult & {
 	fact_id?: string;
 	subject?: string;
 	predicate?: string;
+	/**
+	 * Memory this fact was extracted from (`memoria_facts.source_memory_id`).
+	 * Only populated for facts recalled through the memoria FTS index —
+	 * legacy `facts`-table hits have no memory reference and leave this
+	 * unset.
+	 */
+	source_memory_id?: string | null;
 };
 
 type RecallMmrItem = {
@@ -98,7 +105,15 @@ export function clipRecallContent(
 }
 
 const DEFAULT_LIMIT = 500;
-const STOP_WORDS = new Set([
+/**
+ * Grammatical stop words for query tokenisation. Exported so the polyphonic engine's
+ * full-text fact matching uses the SAME notion of "unsearchable word" as this linear path.
+ * Do NOT confuse this with `ENTITY_EXTRACTION_STOP_WORDS` in `../entities`, which is an
+ * extraction-side junk-ENTITY list containing domain nouns (`memory`, `system`, `data`,
+ * `user`, …); filtering search terms through that list makes ordinary domain questions
+ * unsearchable.
+ */
+export const STOP_WORDS = new Set([
 	"a",
 	"an",
 	"and",
@@ -1121,7 +1136,7 @@ export function formatContext(beam: BeamMemoryState, results: readonly RecallRes
 	return lines.join("\n");
 }
 
-export function factRecall(beam: BeamMemoryState, query: string, topK = 30): FactRecallResult[] {
+function factRecallFromFacts(beam: BeamMemoryState, query: string, topK: number): FactRecallResult[] {
 	if (topK <= 0 || !tableExists(beam, "facts")) return [];
 	let matched: Row[] = [];
 	if (tableExists(beam, "fts_facts")) {
@@ -1218,4 +1233,97 @@ export function factRecall(beam: BeamMemoryState, query: string, topK = 30): Fac
 		.filter(result => (result.score ?? 0) > 0)
 		.sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
 		.slice(0, topK);
+}
+
+/**
+ * Flat extracted statements (`storeFactStrings`) now live only in
+ * `memoria_facts` — they never got a real subject/predicate, so they are no
+ * longer projected into `facts` (see `insertFactRows`'s `projectToFacts`
+ * option). This searches the `fts_memoria_facts` index over `value` instead,
+ * mapping each hit's `source_memory_id` onto {@link FactRecallResult.source_memory_id}
+ * (not `id` — a single source memory routinely yields several distinct flat
+ * facts, e.g. `storeFactStrings` called with a whole batch, and those must
+ * stay independently recallable rather than collapse onto one shared id).
+ * `id` instead identifies the individual `memoria_facts` row, which is
+ * already unique per fact.
+ */
+function factRecallFromMemoriaFacts(beam: BeamMemoryState, query: string, topK: number): FactRecallResult[] {
+	if (topK <= 0 || !tableExists(beam, "fts_memoria_facts")) return [];
+	let rows: Row[] = [];
+	try {
+		rows = queryAll(
+			beam,
+			`SELECT memoria_facts.id AS id,
+			        memoria_facts.value AS value,
+			        memoria_facts.source_memory_id AS source_memory_id,
+			        memoria_facts.importance AS importance,
+			        memoria_facts.timestamp AS timestamp,
+			        fts_memoria_facts.rank AS rank
+			 FROM fts_memoria_facts
+			 JOIN memoria_facts ON memoria_facts.id = fts_memoria_facts.rowid
+			 WHERE fts_memoria_facts MATCH ?
+			   AND memoria_facts.session_id = ?
+			   AND memoria_facts.source_memory_id IS NOT NULL
+			 ORDER BY fts_memoria_facts.rank, fts_memoria_facts.rowid
+			 LIMIT ?`,
+			[ftsQuery(query), beam.sessionId, topK * 3],
+		);
+	} catch {
+		rows = [];
+	}
+	// Blend BM25 relevance into the score. Previously this was `round4(importance)` alone,
+	// which is a CONSTANT for flat facts (measured: all 164 memoria facts on a real bank scored
+	// exactly 0.7000), so the `rank` captured just below into `fts_score` was never used and a
+	// perfect text match ranked identically to a weak one. Downstream that matters twice: the
+	// merge in `factRecall` resolves ties arbitrarily, and `recallEnhanced`'s MMR rerank treats
+	// every flat fact as equally relevant.
+	//
+	// Shape mirrors the legacy branch above (relevance scales a confidence-weighted base), with
+	// importance as a floor so the worst-ranked hit cannot fall to 0 and be dropped by the
+	// `score > 0` filter — `normalizeRanks` maps the worst row in a set to exactly 0. The best
+	// hit keeps its previous score, so this only ever demotes weaker matches.
+	const ranks = normalizeRanks(rows, "id");
+	return rows
+		.map(row => {
+			const importance = asNumber(row.importance, 0.5);
+			const rank = asNumber(row.rank, 0);
+			const relevance = ranks.get(asNumber(row.id)) ?? 1;
+			const result: FactRecallResult = {
+				id: `memoria:${asNumber(row.id)}`,
+				content: asString(row.value),
+				score: round4(importance * (0.8 + relevance * 0.2)),
+				source_memory_id: asNullableString(row.source_memory_id),
+				timestamp: asNullableString(row.timestamp),
+				tier_label: "fact",
+				tier: "fact",
+				source: "memoria_facts",
+				importance_score: round4(importance),
+				fts_score: round4(rank),
+				explanation: `memoria fact importance=${round4(importance)} relevance=${round4(relevance)}`,
+				voice_scores: {
+					importance: round4(importance),
+					fts: round4(rank),
+					keyword: round4(relevance),
+				},
+			};
+			return result;
+		})
+		.filter(result => (result.score ?? 0) > 0)
+		.sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
+		.slice(0, topK);
+}
+
+export function factRecall(beam: BeamMemoryState, query: string, topK = 30): FactRecallResult[] {
+	if (topK <= 0) return [];
+	const legacyResults = factRecallFromFacts(beam, query, topK);
+	const memoriaResults = factRecallFromMemoriaFacts(beam, query, topK);
+	if (legacyResults.length === 0 && memoriaResults.length === 0) return [];
+	const byId = new Map<string, FactRecallResult>();
+	for (const result of [...legacyResults, ...memoriaResults]) {
+		const existing = byId.get(result.id);
+		if (existing === undefined || (result.score ?? 0) > (existing.score ?? 0)) {
+			byId.set(result.id, result);
+		}
+	}
+	return [...byId.values()].sort((left, right) => (right.score ?? 0) - (left.score ?? 0)).slice(0, topK);
 }
