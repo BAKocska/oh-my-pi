@@ -14,6 +14,9 @@
 failure-output = "immediate-final"
 # Report every failing test in one pass instead of stopping at the first.
 fail-fast = false
+# Nothing in the unit/integration tier should take a minute; warn at 60s and
+# kill at 4 minutes so one deadlocked test cannot wedge a whole local sweep.
+slow-timeout = { period = "60s", terminate-after = 4 }
 
 [profile.ci]
 failure-output = "immediate-final"
@@ -30,6 +33,8 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = 'package(omp-e2e)'
 threads-required = "num-cpus"
+# Real PTYs and daemon startup are legitimately slow; kill only after 10 min.
+slow-timeout = { period = "120s", terminate-after = 5 }
 
 [[profile.ci.overrides]]
 filter = 'package(omp-e2e)'
