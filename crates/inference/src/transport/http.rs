@@ -47,7 +47,10 @@ use crate::{
 		Cancellation, DecoderState, HandshakeMeta, HandshakenResponse, RawEvent, RawEventStream,
 		RequestHeader, RequestMethod, TransportAttempt, TransportRequest,
 	},
-	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
+	error::{
+		Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction, classify_provider_rejection,
+		is_transient_generation_fault,
+	},
 	receipt::{
 		AttemptOutcome, AttemptReceipt, Cost, ExecutionReceipt, ProviderEvidence, ReasonId, Usage,
 	},
@@ -1014,21 +1017,35 @@ async fn collect_error_response_body(
 }
 
 fn classify_http_error(status: u16, body: &[u8]) -> Error {
-	let (kind, action) = match status {
-		401 | 403 => (ErrorKind::Authentication, RetryAction::Never),
-		408 => (ErrorKind::DeadlineExceeded, RetryAction::SameRoute { after: time::Duration::ZERO }),
-		429 => {
-			(ErrorKind::RateLimited, RetryAction::SameRoute { after: time::Duration::from_secs(30) })
-		},
-		400 | 404 | 405 | 413 | 422 => (ErrorKind::InvalidRequest, RetryAction::Never),
-		402 => (ErrorKind::PaymentRequired, RetryAction::Never),
-		409 => (ErrorKind::SessionConflict, RetryAction::Never),
-		500..=599 => (ErrorKind::ResourceExhausted, RetryAction::SameRoute {
-			after: time::Duration::from_millis(500),
-		}),
-		_ => (ErrorKind::ProviderContractMismatch, RetryAction::Never),
-	};
 	let (code, message) = provider_error_facts(body);
+	let classified_rejection =
+		classify_provider_rejection(Some(status), message.as_deref(), None, None);
+	let transient_generation_fault = status == 400
+		&& message
+			.as_deref()
+			.is_some_and(is_transient_generation_fault);
+	let (kind, action) = if let Some(kind) = classified_rejection {
+		(kind, RetryAction::Never)
+	} else if transient_generation_fault {
+		(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: time::Duration::ZERO })
+	} else {
+		match status {
+			401 | 403 => (ErrorKind::Authentication, RetryAction::Never),
+			408 => {
+				(ErrorKind::DeadlineExceeded, RetryAction::SameRoute { after: time::Duration::ZERO })
+			},
+			429 => (ErrorKind::RateLimited, RetryAction::SameRoute {
+				after: time::Duration::from_secs(30),
+			}),
+			400 | 404 | 405 | 422 => (ErrorKind::InvalidRequest, RetryAction::Never),
+			402 => (ErrorKind::PaymentRequired, RetryAction::Never),
+			409 => (ErrorKind::SessionConflict, RetryAction::Never),
+			500..=599 => (ErrorKind::ResourceExhausted, RetryAction::SameRoute {
+				after: time::Duration::from_millis(500),
+			}),
+			_ => (ErrorKind::ProviderContractMismatch, RetryAction::Never),
+		}
+	};
 	Error::new(kind, ErrorPhase::Handshake, action, ExecutionReceipt::default())
 		.status(Some(status))
 		.optional_code(code)
@@ -1039,7 +1056,7 @@ fn classify_http_error(status: u16, body: &[u8]) -> Error {
 
 fn provider_error_facts(body: &[u8]) -> (Option<Str>, Option<Str>) {
 	let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-		return (None, None);
+		return (None, str::from_utf8(body).ok().and_then(sanitize_provider_message));
 	};
 	let facts = value.get("error").unwrap_or(&value);
 	let code = ["code", "type", "status"]
@@ -1694,6 +1711,7 @@ mod tests {
 			(403, ErrorKind::Authentication, false),
 			(404, ErrorKind::InvalidRequest, false),
 			(408, ErrorKind::DeadlineExceeded, true),
+			(413, ErrorKind::PayloadRejected, false),
 			(422, ErrorKind::InvalidRequest, false),
 			(429, ErrorKind::RateLimited, true),
 			(500, ErrorKind::ResourceExhausted, true),
@@ -1714,6 +1732,34 @@ mod tests {
 
 	#[test]
 	fn provider_error_facts_are_bounded_and_secret_free() {
+		let token_overflow = classify_http_error(
+			413,
+			br#"{"error":{"message":"maximum context length is 128000 tokens"}}"#,
+		);
+		assert_eq!(token_overflow.kind, ErrorKind::ContextOverflow);
+		assert_eq!(token_overflow.action, RetryAction::Never);
+
+		let media_limit = classify_http_error(
+			413,
+			br#"{"error":{"message":"image count exceeds the limit of 20"}}"#,
+		);
+		assert_eq!(media_limit.kind, ErrorKind::PayloadRejected);
+		assert_eq!(media_limit.action, RetryAction::Never);
+
+		let wrapped = classify_http_error(
+			413,
+			br#"{"error":{"message":"Provider returned error: 413 Payload Too Large"}}"#,
+		);
+		assert_eq!(wrapped.kind, ErrorKind::PayloadRejected);
+		assert_eq!(wrapped.action, RetryAction::Never);
+
+		let generation_nan = classify_http_error(
+			400,
+			br#"{"error":{"type":"invalid_request_error","message":"Floating point NaN (not-a-number) is detected in generation"}}"#,
+		);
+		assert_eq!(generation_nan.kind, ErrorKind::ResourceExhausted);
+		assert!(matches!(generation_nan.action, RetryAction::SameRoute { .. }));
+
 		let error = classify_http_error(
 			404,
 			br#"{"error":{"code":"model_not_found","message":"Model zai-glm-4.7 was retired"}}"#,

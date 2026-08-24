@@ -115,9 +115,25 @@ where
 				if let Some(attempt) = error.receipt().attempts.last() {
 					request.context.set_body_evidence(attempt.body);
 				}
+				let limited_exhausted = match &error.action {
+					RetryAction::SameRouteLimited { max_retries: failure_limit, .. } => {
+						retry_index >= max_retries.min(*failure_limit)
+					},
+					_ => false,
+				};
+				if limited_exhausted {
+					error.action = RetryAction::Never;
+					request.context.finalize_error(&mut error);
+					return Err(error);
+				}
 				let retry_after = match &error.action {
 					RetryAction::SameRoute { after }
 						if !error.committed && retry_index < max_retries =>
+					{
+						*after
+					},
+					RetryAction::SameRouteLimited { after, max_retries: failure_limit }
+						if !error.committed && retry_index < max_retries.min(*failure_limit) =>
 					{
 						*after
 					},
@@ -270,6 +286,50 @@ mod tests {
 			)))
 		}
 	}
+	#[derive(Clone)]
+	struct LimitedFailing {
+		calls: Arc<AtomicUsize>,
+		body:  AttemptBodyEvidence,
+		limit: u32,
+	}
+
+	impl Service<LayerCall<()>> for LimitedFailing {
+		type Error = Error;
+		type Future = Ready<Result<(), Error>>;
+		type Response = ();
+
+		fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn call(&mut self, _: LayerCall<()>) -> Self::Future {
+			let index = self.calls.fetch_add(1, Ordering::SeqCst) as u32;
+			let mut receipt = ExecutionReceipt::default();
+			receipt.record_attempt(AttemptReceipt {
+				index,
+				hidden: false,
+				provider: None,
+				route: None,
+				account: None,
+				principal: None,
+				body: self.body,
+				outcome: AttemptOutcome::FailedPreCommit,
+				usage: Usage::default(),
+				cost: Cost::default(),
+				provider_evidence: ProviderEvidence::default(),
+				elapsed: Duration::ZERO,
+			});
+			ready(Err(Error::new(
+				ErrorKind::Protocol,
+				ErrorPhase::Streaming,
+				RetryAction::SameRouteLimited {
+					after: Duration::ZERO,
+					max_retries: self.limit,
+				},
+				receipt,
+			)))
+		}
+	}
 
 	#[test]
 	fn full_jitter_is_bounded_and_retry_after_can_be_a_floor() {
@@ -283,6 +343,32 @@ mod tests {
 
 	fn context() -> ExecutionContext {
 		ExecutionContext::new(ExecutionBudget { max_attempts: 3, ..ExecutionBudget::default() })
+	}
+
+	#[tokio::test]
+	async fn failure_specific_retry_cap_overrides_global_limit() {
+		let replayable = AttemptBodyEvidence {
+			opened:         true,
+			consumed:       true,
+			replayability:  Replayability::Replayable,
+			retry_decision: RetryDecision::Allow,
+			reason:         RetryDecisionReason::ReplayableSource,
+		};
+		let calls = Arc::new(AtomicUsize::new(0));
+		let mut limited = TransportRetryService {
+			inner: LimitedFailing { calls: calls.clone(), body: replayable, limit: 1 },
+			max_retries: 10,
+			backoff: RetryBackoff::ZERO,
+		};
+		futures::future::poll_fn(|cx| limited.poll_ready(cx))
+			.await
+			.unwrap();
+		let error = limited
+			.call(LayerCall { payload: (), context: context() })
+			.await
+			.unwrap_err();
+		assert_eq!(error.action, RetryAction::Never);
+		assert_eq!(calls.load(Ordering::SeqCst), 2);
 	}
 
 	#[tokio::test]

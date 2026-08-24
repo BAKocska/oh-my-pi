@@ -10,9 +10,10 @@ use bytes::{Bytes, BytesMut};
 use omp_catalog::{
 	OperationKind, ReasoningEffort, ServiceTier, ThinkingEffort,
 	policy::{
-		self, MaxTokensField as CatalogMaxTokensField,
+		self, ImageEncodingFormat, MaxTokensField as CatalogMaxTokensField,
+		ReasoningDisableMode as CatalogReasoningDisableMode,
 		ReasoningWireFormat as CatalogReasoningWireFormat, ThinkingToolChoiceConflict,
-		ToolCallIdProfile as CatalogToolCallIdProfile, ToolStrictMode,
+		ToolCallIdProfile as CatalogToolCallIdProfile, ToolStrictMode, VeniceParameters,
 	},
 };
 use omp_core::{IntoStr, Str, encoding::base64, sf};
@@ -31,7 +32,10 @@ use crate::{
 		ProviderStateEvent, RawCompletion, RawEvent, RequestHeader, RequestMethod, SizeBounds,
 		ToolInputKind, UnvalidatedToolCall,
 	},
-	error::{Error, ErrorKind, ErrorPhase, RetryAction},
+	error::{
+		Error, ErrorKind, ErrorPhase, RetryAction, classify_provider_rejection,
+		is_transient_generation_fault,
+	},
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
 	id::ToolCallId,
 	receipt::{ExecutionReceipt, Usage, UsageSource},
@@ -154,6 +158,12 @@ pub struct OpenAiChatProfile {
 	pub tool_id: ToolIdWireProfile,
 	/// Reasoning request shape.
 	pub reasoning: ReasoningWireFormat,
+	/// Explicit reasoning-off operation.
+	pub reasoning_disable: Option<CatalogReasoningDisableMode>,
+	/// Static Venice request controls merged with turn-specific controls.
+	pub venice_parameters: Option<VeniceParameters>,
+	/// Whether canonical image parts may be emitted as `image_url`.
+	pub supports_images: bool,
 	/// Whether Qwen-style template dialects route the selected effort onto the
 	/// chat template's `reasoning_effort` kwarg.
 	pub template_reasoning_effort: bool,
@@ -198,6 +208,9 @@ impl Default for OpenAiChatProfile {
 			flatten_root_unions: false,
 			tool_id: ToolIdWireProfile::Preserve,
 			reasoning: ReasoningWireFormat::OpenAiEffort,
+			reasoning_disable: None,
+			venice_parameters: None,
+			supports_images: true,
 			template_reasoning_effort: false,
 			template_effort_top_level_only: false,
 			reasoning_history: ReasoningHistoryField::ReasoningContent,
@@ -284,6 +297,14 @@ impl OpenAiChatProfile {
 				CatalogReasoningWireFormat::NvidiaChatTemplateKwargs => ReasoningWireFormat::Nvidia,
 				_ => ReasoningWireFormat::Unsupported,
 			};
+		}
+		self.reasoning_disable = policy.reasoning.disable_mode;
+		self.venice_parameters = match policy.reasoning.extra_body {
+			Some(body) => body.venice_parameters,
+			None => None,
+		};
+		if let Some(encoding) = policy.image.encoding {
+			self.supports_images = !matches!(encoding, ImageEncodingFormat::None);
 		}
 		if let Some(value) = policy.reasoning.template_reasoning_effort {
 			self.template_reasoning_effort = value;
@@ -471,6 +492,7 @@ impl OpenAiChatCodec {
 			thinking: reasoning.zai,
 			enable_thinking: reasoning.qwen,
 			chat_template_kwargs: reasoning.nvidia,
+			venice_parameters: reasoning.venice,
 			service_tier,
 			prompt_cache_key,
 			prompt_cache_options,
@@ -627,6 +649,8 @@ struct WireRequest {
 	enable_thinking:       Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	chat_template_kwargs:  Option<ChatTemplateKwargs>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	venice_parameters:     Option<WireVeniceParameters>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	service_tier:          Option<Str>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -838,6 +862,13 @@ struct ChatTemplateKwargs {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	reasoning_effort: Option<WireEffort>,
 }
+#[derive(Clone, Copy, Serialize)]
+struct WireVeniceParameters {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	disable_thinking:             Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	include_venice_system_prompt: Option<bool>,
+}
 
 #[derive(Serialize)]
 struct PromptCacheOptions {
@@ -867,6 +898,7 @@ struct ReasoningFields {
 	zai:        Option<ZaiThinking>,
 	qwen:       Option<bool>,
 	nvidia:     Option<ChatTemplateKwargs>,
+	venice:     Option<WireVeniceParameters>,
 }
 
 fn lower_messages(
@@ -890,7 +922,10 @@ fn lower_messages(
 				};
 				lowered.push(WireMessage {
 					role,
-					content: Some(NullableContent::Text(lower_tool_result_content(content)?)),
+					content: Some(NullableContent::Text(lower_tool_result_content(
+						content,
+						profile.supports_images,
+					)?)),
 					name: name.clone().or_else(|| message.name.clone()),
 					tool_call_id: Some(project_call_id(profile.tool_id, call.as_str())),
 					tool_calls: None,
@@ -951,7 +986,7 @@ fn lower_messages(
 				other => ordinary.push(other.clone()),
 			}
 		}
-		let content = lower_content(&ordinary)?;
+		let content = lower_content(&ordinary, profile.supports_images)?;
 		let (reasoning_content, reasoning_text) = if reasoning.is_empty() {
 			(None, None)
 		} else {
@@ -978,7 +1013,7 @@ fn lower_messages(
 	Ok(lowered)
 }
 
-fn lower_content(parts: &[ContentPart]) -> Result<NullableContent, Error> {
+fn lower_content(parts: &[ContentPart], supports_images: bool) -> Result<NullableContent, Error> {
 	if let [ContentPart::Text { text, .. }] = parts {
 		return Ok(NullableContent::Text(text.clone()));
 	}
@@ -986,9 +1021,11 @@ fn lower_content(parts: &[ContentPart]) -> Result<NullableContent, Error> {
 		return Ok(NullableContent::Null(()));
 	}
 	let mut wire = Vec::with_capacity(parts.len());
+	let mut omitted_image = false;
 	for part in parts {
 		match part {
 			ContentPart::Text { text, .. } => wire.push(WireContentPart::Text { text: text.clone() }),
+			ContentPart::Image(_) if !supports_images => omitted_image = true,
 			ContentPart::Image(MediaInput::Bytes { media_type, data }) => {
 				let encoded = base64::encode(data).into_string();
 				let mut url = String::with_capacity(media_type.len() + encoded.len() + 13);
@@ -1010,25 +1047,48 @@ fn lower_content(parts: &[ContentPart]) -> Result<NullableContent, Error> {
 			| ContentPart::CachePoint(_) => return Err(capability_error()),
 		}
 	}
+	if omitted_image {
+		wire.push(WireContentPart::Text {
+			text: Str::new_static("[image omitted: model does not support vision]"),
+		});
+	}
 	Ok(NullableContent::Parts(wire))
 }
 
-fn lower_tool_result_content(content: &[ToolResultContent]) -> Result<Str, Error> {
+fn lower_tool_result_content(
+	content: &[ToolResultContent],
+	supports_images: bool,
+) -> Result<Str, Error> {
 	let mut output = String::new();
-	for (index, part) in content.iter().enumerate() {
-		if index != 0 {
-			output.push('\n');
-		}
+	let mut omitted_image = false;
+	for part in content {
 		match part {
-			ToolResultContent::Text(text) => output.push_str(text.as_str()),
-			ToolResultContent::Json(value) => output.push_str(
-				&serde_json::to_string(value.as_value())
-					.map_err(|_| encoding_error(ErrorKind::InvalidRequest))?,
-			),
+			ToolResultContent::Text(text) => {
+				if !output.is_empty() {
+					output.push('\n');
+				}
+				output.push_str(text.as_str());
+			},
+			ToolResultContent::Json(value) => {
+				if !output.is_empty() {
+					output.push('\n');
+				}
+				output.push_str(
+					&serde_json::to_string(value.as_value())
+						.map_err(|_| encoding_error(ErrorKind::InvalidRequest))?,
+				);
+			},
+			ToolResultContent::Image(_) if !supports_images => omitted_image = true,
 			ToolResultContent::Image(_) | ToolResultContent::Document(_) => {
 				return Err(capability_error());
 			},
 		}
+	}
+	if omitted_image {
+		if !output.is_empty() {
+			output.push('\n');
+		}
+		output.push_str("[image omitted: model does not support vision]");
 	}
 	Ok(Str::new(output))
 }
@@ -1420,17 +1480,36 @@ fn lower_reasoning(
 				zai:        None,
 				qwen:       None,
 				nvidia:     None,
+				venice:     lower_venice_parameters(profile, false),
 			});
 		},
 		Setting::Require(value) | Setting::Prefer(value) => value,
 	};
+	let explicit_venice_off = reasoning.effort == Some(ReasoningEffort::Off)
+		&& profile.reasoning_disable == Some(CatalogReasoningDisableMode::VeniceDisableThinking);
+	if explicit_venice_off {
+		return Ok(ReasoningFields {
+			effort:     None,
+			openrouter: None,
+			zai:        None,
+			qwen:       None,
+			nvidia:     None,
+			venice:     lower_venice_parameters(profile, true),
+		});
+	}
 	let effort = reasoning.effort.map(lower_effort);
+	let venice = lower_venice_parameters(profile, false);
 	let fields = match profile.reasoning {
 		ReasoningWireFormat::OpenAiEffort if reasoning.max_tokens.is_some() => {
 			return Err(capability_error());
 		},
-		ReasoningWireFormat::OpenAiEffort => {
-			ReasoningFields { effort, openrouter: None, zai: None, qwen: None, nvidia: None }
+		ReasoningWireFormat::OpenAiEffort => ReasoningFields {
+			effort,
+			openrouter: None,
+			zai: None,
+			qwen: None,
+			nvidia: None,
+			venice,
 		},
 		ReasoningWireFormat::OpenRouter => ReasoningFields {
 			effort:     None,
@@ -1442,6 +1521,7 @@ fn lower_reasoning(
 			zai:        None,
 			qwen:       None,
 			nvidia:     None,
+			venice,
 		},
 		ReasoningWireFormat::Zai => ReasoningFields {
 			effort:     None,
@@ -1449,13 +1529,9 @@ fn lower_reasoning(
 			zai:        Some(ZaiThinking { r#type: ThinkingType::Enabled, effort }),
 			qwen:       None,
 			nvidia:     None,
+			venice,
 		},
 		ReasoningWireFormat::Qwen => {
-			// Twin emission for Qwen 3.8+ templates (pi bf490ae024): newer
-			// llama.cpp builds map the top-level `reasoning_effort` into the
-			// template, older builds read only the kwargs copy. Older Qwen
-			// templates have no `reasoning_effort` kwarg, so the policy flag
-			// gates the emission entirely.
 			let template_effort = profile
 				.template_reasoning_effort
 				.then_some(effort)
@@ -1465,8 +1541,6 @@ fn lower_reasoning(
 				openrouter: None,
 				zai:        None,
 				qwen:       Some(true),
-				// After a classified kwargs rejection the top-level twin alone
-				// keeps the effort selection alive.
 				nvidia:     (!profile.template_effort_top_level_only)
 					.then_some(template_effort)
 					.flatten()
@@ -1474,13 +1548,10 @@ fn lower_reasoning(
 						enable_thinking:  None,
 						reasoning_effort: Some(effort),
 					}),
+				venice,
 			}
 		},
 		ReasoningWireFormat::Nvidia if profile.template_effort_top_level_only => ReasoningFields {
-			// The kwargs-only dialect hoists the effort onto the top-level
-			// field after the endpoint rejected the kwargs spelling; servers
-			// that reject the kwarg accept the standard OpenAI field, and
-			// kwargs-reading renderers ignore it.
 			effort:     profile
 				.template_reasoning_effort
 				.then_some(effort)
@@ -1492,14 +1563,13 @@ fn lower_reasoning(
 				enable_thinking:  Some(true),
 				reasoning_effort: None,
 			}),
+			venice,
 		},
 		ReasoningWireFormat::Nvidia => ReasoningFields {
 			effort:     None,
 			openrouter: None,
 			zai:        None,
 			qwen:       None,
-			// NIM-style request schemas reject unknown top-level fields, so
-			// the effort rides `chat_template_kwargs` alone on this dialect.
 			nvidia:     Some(ChatTemplateKwargs {
 				enable_thinking:  Some(true),
 				reasoning_effort: profile
@@ -1507,10 +1577,35 @@ fn lower_reasoning(
 					.then_some(effort)
 					.flatten(),
 			}),
+			venice,
 		},
 		ReasoningWireFormat::Unsupported => return Err(capability_error()),
 	};
 	Ok(fields)
+}
+
+const fn lower_venice_parameters(
+	profile: &OpenAiChatProfile,
+	disable_thinking: bool,
+) -> Option<WireVeniceParameters> {
+	let configured = profile.venice_parameters;
+	let disable_thinking = if disable_thinking {
+		Some(true)
+	} else {
+		match configured {
+			Some(parameters) => parameters.disable_thinking,
+			None => None,
+		}
+	};
+	let include_venice_system_prompt = match configured {
+		Some(parameters) => parameters.include_venice_system_prompt,
+		None => None,
+	};
+	if disable_thinking.is_none() && include_venice_system_prompt.is_none() {
+		None
+	} else {
+		Some(WireVeniceParameters { disable_thinking, include_venice_system_prompt })
+	}
 }
 
 const fn lower_effort(effort: ReasoningEffort) -> WireEffort {
@@ -2070,7 +2165,8 @@ struct ErrorMetadata {
 fn classify_error(error: WireError, committed: bool) -> Error {
 	let status = match error.code.as_ref() {
 		Some(ErrorCode::Number(value)) => u16::try_from(*value).ok(),
-		_ => None,
+		Some(ErrorCode::Text(value)) => value.as_str().parse().ok(),
+		None => None,
 	};
 	let code = error.code.as_ref().map(ErrorCode::text);
 	let code_text = code.as_ref().map(Str::as_str).unwrap_or_default();
@@ -2123,7 +2219,15 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 	// `EncodeAttempt`), keyed off this classification's canonical error code
 	// in the attempt receipt.
 	let template_effort_rejection = template_kwarg_effort_rejection(&error, message);
-	let (kind, action) = if matches!(code_text, "invalid_api_key" | "authentication_error" | "401") {
+	let rejection_kind = classify_provider_rejection(status, Some(message), None, None);
+	let generation_fault = matches!(status, Some(400))
+		|| matches!(code_text, "400" | "invalid_request_error");
+	let generation_fault = generation_fault && is_transient_generation_fault(message);
+	let (kind, action) = if let Some(kind) = rejection_kind {
+		(kind, RetryAction::Never)
+	} else if generation_fault {
+		(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: Duration::ZERO })
+	} else if matches!(code_text, "invalid_api_key" | "authentication_error" | "401") {
 		(ErrorKind::Authentication, RetryAction::Never)
 	} else if matches!(code_text, "permission_denied" | "403") {
 		(ErrorKind::Authorization, RetryAction::Never)
@@ -2337,9 +2441,9 @@ mod tests {
 	};
 	use crate::{
 		call::{
-			ChatRequest, ContentPart, Message, NegotiationPolicy, OpaqueJson, ReasoningRequest,
-			ReasoningVisibility, Role, Sampling, Setting, ToolChoice, ToolDefinition,
-			ToolInputConstraint, ToolResultContent,
+			ChatRequest, ContentPart, MediaInput, Message, NegotiationPolicy, OpaqueJson,
+			ReasoningRequest, ReasoningVisibility, Role, Sampling, Setting, ToolChoice,
+			ToolDefinition, ToolInputConstraint, ToolResultContent,
 		},
 		catalog::ReasoningEffort,
 		codec::{Decoder, RawEvent},
@@ -2901,6 +3005,16 @@ mod tests {
 			assert_eq!(error.kind, kind, "{code}");
 			assert_eq!(error.action, RetryAction::Never, "{code}");
 		}
+		let generation_nan = classify(
+			"invalid_request_error",
+			"Floating point NaN (not-a-number) is detected in generation",
+		);
+		assert_eq!(generation_nan.kind, ErrorKind::ResourceExhausted);
+		assert_eq!(
+			generation_nan.action,
+			RetryAction::SameRoute { after: Duration::ZERO },
+		);
+
 		// llama.cpp deterministic tool-call parse failures arrive as HTTP 500
 		// but replay identically: never transient.
 		let parse_failure = classify(
@@ -3006,6 +3120,38 @@ mod tests {
 		);
 		assert_eq!(textual.kind, ErrorKind::ContextOverflow);
 		assert_eq!(textual.action, RetryAction::Never);
+	}
+	#[test]
+	fn payload_rejections_never_same_route_retry_and_token_evidence_wins() {
+		let classify = |code: ErrorCode, message: Option<&str>| {
+			classify_error(
+				WireError {
+					code: Some(code),
+					message: message.map(Into::into),
+					param: None,
+					metadata: None,
+					rate_limit_type: None,
+				},
+				false,
+			)
+		};
+		let bare = classify(ErrorCode::Number(413), None);
+		assert_eq!(bare.kind, ErrorKind::PayloadRejected);
+		assert_eq!(bare.action, RetryAction::Never);
+
+		let wrapped = classify(
+			ErrorCode::Text("server_error".into()),
+			Some("Provider returned error: 413 Payload Too Large"),
+		);
+		assert_eq!(wrapped.kind, ErrorKind::PayloadRejected);
+		assert_eq!(wrapped.action, RetryAction::Never);
+
+		let token = classify(
+			ErrorCode::Number(413),
+			Some("maximum context length is 128000 tokens"),
+		);
+		assert_eq!(token.kind, ErrorKind::ContextOverflow);
+		assert_eq!(token.action, RetryAction::Never);
 	}
 
 	#[test]
@@ -3164,6 +3310,76 @@ mod tests {
 			preserve_signatures: false,
 		});
 		request
+	}
+
+	#[test]
+	fn text_only_history_replaces_images_while_ocr_preserves_them() {
+		let message = Message {
+			role: Role::User,
+			content: Arc::from([
+				ContentPart::Text { text: "Read this".into(), proof: None },
+				ContentPart::Image(MediaInput::Bytes {
+					media_type: "image/png".into(),
+					data: Bytes::from_static(b"png"),
+				}),
+			]),
+			name: None,
+		};
+		let chat = request(Arc::from([message]));
+
+		let mut text_only_policy = policy::WirePolicy::baseline();
+		text_only_policy.image.encoding = Some(policy::ImageEncodingFormat::None);
+		let mut text_only_profile = OpenAiChatProfile::default();
+		text_only_profile.apply_policy(&text_only_policy);
+		let body = OpenAiChatCodec::new(text_only_profile, None)
+			.encode_chat("deepseek-v4-flash", &chat)
+			.expect("text-only history encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
+		assert_eq!(
+			wire["messages"][0]["content"][1]["text"],
+			"[image omitted: model does not support vision]",
+		);
+		assert!(
+			wire["messages"][0]["content"]
+				.as_array()
+				.expect("content parts")
+				.iter()
+				.all(|part| part["type"] != "image_url"),
+		);
+
+		let mut ocr_policy = policy::WirePolicy::baseline();
+		ocr_policy.image.encoding = Some(policy::ImageEncodingFormat::OpenAiUrl);
+		let mut ocr_profile = OpenAiChatProfile::default();
+		ocr_profile.apply_policy(&ocr_policy);
+		let body = OpenAiChatCodec::new(ocr_profile, None)
+			.encode_chat("deepseek/deepseek-ocr-2", &chat)
+			.expect("OCR history encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
+		assert_eq!(wire["messages"][0]["content"][1]["type"], "image_url");
+	}
+
+	#[test]
+	fn venice_thinking_off_merges_disable_with_configured_parameters() {
+		let mut profile = OpenAiChatProfile::default();
+		let mut compat = policy::WirePolicy::baseline();
+		compat.reasoning.disable_mode =
+			Some(policy::ReasoningDisableMode::VeniceDisableThinking);
+		compat.reasoning.extra_body = Some(policy::ReasoningBodyOverride {
+			thinking: None,
+			enable_thinking: None,
+			venice_parameters: Some(policy::VeniceParameters {
+				disable_thinking: Some(false),
+				include_venice_system_prompt: Some(false),
+			}),
+		});
+		profile.apply_policy(&compat);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("qwen3-235b", &thinking_request(ReasoningEffort::Off))
+			.expect("Venice thinking-off request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
+		assert!(wire.get("reasoning_effort").is_none());
+		assert_eq!(wire["venice_parameters"]["disable_thinking"], true);
+		assert_eq!(wire["venice_parameters"]["include_venice_system_prompt"], false);
 	}
 
 	#[test]

@@ -101,6 +101,7 @@ where
 					},
 					RetryAction::RotateAccount => AttemptAction::RotateAccount { previous_account },
 					RetryAction::SameRoute { .. }
+					| RetryAction::SameRouteLimited { .. }
 					| RetryAction::ReselectRoute
 					| RetryAction::ReseedSession
 					| RetryAction::SemanticRetry

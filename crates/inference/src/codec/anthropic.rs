@@ -1533,7 +1533,8 @@ impl Decoder for CountTokensDecoder {
 	}
 }
 
-fn arn_region(model: &str) -> Option<&str> {
+/// Extracts the signing region from a Bedrock ARN.
+pub(crate) fn arn_region(model: &str) -> Option<&str> {
 	let mut fields = model.split(':');
 	(fields.next()? == "arn").then_some(())?;
 	let partition = fields.next()?;
@@ -1544,7 +1545,8 @@ fn arn_region(model: &str) -> Option<&str> {
 	(!region.is_empty()).then_some(region)
 }
 
-fn inference_profile_geo(model: &str) -> Option<(&str, &'static str)> {
+/// Returns a cross-region inference profile's geo and canonical fallback.
+pub(crate) fn inference_profile_geo(model: &str) -> Option<(&str, &'static str)> {
 	let (prefix, _) = model.split_once('.')?;
 	match prefix {
 		"us" => Some(("us", "us-east-1")),
@@ -1557,7 +1559,8 @@ fn inference_profile_geo(model: &str) -> Option<(&str, &'static str)> {
 	}
 }
 
-fn region_serves_geo(region: &str, geo: &str) -> bool {
+/// Reports whether an AWS region serves a Bedrock inference-profile geo.
+pub(crate) fn region_serves_geo(region: &str, geo: &str) -> bool {
 	match geo {
 		"us-gov" => region.starts_with("us-gov-"),
 		"us" => region.starts_with("us-") && !region.starts_with("us-gov-"),
@@ -1569,7 +1572,8 @@ fn region_serves_geo(region: &str, geo: &str) -> bool {
 	}
 }
 
-fn endpoint_region(base_url: &str) -> Option<&str> {
+/// Extracts a concrete region from a Bedrock runtime endpoint.
+pub(crate) fn endpoint_region(base_url: &str) -> Option<&str> {
 	let host = base_url
 		.strip_prefix("https://")
 		.or_else(|| base_url.strip_prefix("http://"))?

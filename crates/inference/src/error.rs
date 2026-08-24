@@ -76,6 +76,8 @@ pub enum ErrorKind {
 	ProviderContractMismatch,
 	/// Canonical context exceeds an applicable model or wire limit.
 	ContextOverflow,
+	/// Fixed request bytes or provider media budgets were rejected.
+	PayloadRejected,
 	/// Provider content filtering stopped output.
 	ContentFilter,
 	/// Provider emitted a safety refusal.
@@ -107,6 +109,115 @@ pub enum ErrorKind {
 	NativeRequestRejected,
 	/// An internal invariant was violated.
 	InternalInvariant,
+}
+
+/// Classifies token-context versus fixed-payload rejection evidence.
+///
+/// Token evidence on any source-chain link or a prior typed overflow wins over
+/// HTTP 413's payload fallback. This permits late response-body finalization to
+/// replace a status-only payload inference without losing cause-chain evidence.
+pub fn classify_provider_rejection(
+	status: Option<u16>,
+	message: Option<&str>,
+	source: Option<&(dyn error::Error + 'static)>,
+	prior: Option<ErrorKind>,
+) -> Option<ErrorKind> {
+	let source_has_token_evidence = source.is_some_and(|root| {
+		let mut link = Some(root);
+		while let Some(cause) = link {
+			if cause
+				.downcast_ref::<Error>()
+				.is_some_and(|error| error.kind == ErrorKind::ContextOverflow)
+				|| has_token_context_evidence(&cause.to_string())
+			{
+				return true;
+			}
+			link = cause.source();
+		}
+		false
+	});
+	if prior == Some(ErrorKind::ContextOverflow)
+		|| message.is_some_and(has_token_context_evidence)
+		|| source_has_token_evidence
+	{
+		return Some(ErrorKind::ContextOverflow);
+	}
+	if status == Some(413) || message.is_some_and(has_payload_rejection_evidence) {
+		return Some(ErrorKind::PayloadRejected);
+	}
+	None
+}
+
+fn has_token_context_evidence(text: &str) -> bool {
+	const DIRECT: &[&str] = &[
+		"prompt is too long",
+		"input is too long for requested model",
+		"exceeds the context window",
+		"maximum context length",
+		"maximum prompt length",
+		"reduce the length of the messages",
+		"exceeds the available context size",
+		"context window exceeded",
+		"context window overflow",
+		"context window too small",
+		"context length exceeded",
+		"context length overflow",
+		"context length too small",
+		"context size exceeded",
+		"context size overflow",
+		"context size too small",
+		"too many tokens",
+		"token limit exceeded",
+		"model_context_window_exceeded",
+		"prompt filled the context window",
+	];
+	DIRECT
+		.iter()
+		.any(|needle| contains_ascii_case_insensitive(text.as_bytes(), needle.as_bytes()))
+		|| (contains_ascii_case_insensitive(text.as_bytes(), b"request_too_large")
+			&& contains_ascii_case_insensitive(text.as_bytes(), b"token"))
+		|| (contains_ascii_case_insensitive(text.as_bytes(), b"requested token")
+			&& (contains_ascii_case_insensitive(text.as_bytes(), b"exceed")
+				|| contains_ascii_case_insensitive(text.as_bytes(), b"maximum")))
+		|| (contains_ascii_case_insensitive(text.as_bytes(), b"exceeds the limit of")
+			&& contains_ascii_case_insensitive(text.as_bytes(), b"token"))
+}
+
+fn has_payload_rejection_evidence(text: &str) -> bool {
+	const PATTERNS: &[&str] = &[
+		"payload too large",
+		"content too large",
+		"request entity too large",
+		"request body too large",
+		"request body exceeds",
+		"maximum request size",
+		"request_too_large",
+		"image count exceeds",
+		"image limit",
+		"media limit",
+		"413 (no body)",
+	];
+	PATTERNS
+		.iter()
+		.any(|needle| contains_ascii_case_insensitive(text.as_bytes(), needle.as_bytes()))
+}
+/// Returns whether provider text identifies a replay-safe generation fault.
+pub fn is_transient_generation_fault(text: &str) -> bool {
+	let bytes = text.as_bytes();
+	(contains_ascii_case_insensitive(bytes, b"floating point nan")
+		|| contains_ascii_case_insensitive(bytes, b"floating-point nan")
+		|| contains_ascii_case_insensitive(bytes, b"floating_point nan"))
+		&& contains_ascii_case_insensitive(bytes, b"detected in generation")
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+	needle.is_empty()
+		|| haystack.windows(needle.len()).any(|window| {
+			window
+				.iter()
+				.zip(needle)
+				.all(|(left, right)| left.eq_ignore_ascii_case(right))
+		})
 }
 
 /// Execution phase in which a failure was classified.
@@ -151,6 +262,13 @@ pub enum RetryAction {
 	SameRoute {
 		/// Minimum delay before retrying.
 		after: Duration,
+	},
+	/// Retry the same route up to a failure-specific bound.
+	SameRouteLimited {
+		/// Minimum delay before retrying.
+		after:       Duration,
+		/// Maximum retries after the first attempt.
+		max_retries: u32,
 	},
 	/// Refresh credentials for the same account and principal.
 	RefreshCredential,
@@ -396,6 +514,11 @@ impl Error {
 		action: RetryAction,
 		receipt: ExecutionReceipt,
 	) -> Self {
+		let action = if kind == ErrorKind::PayloadRejected {
+			RetryAction::Never
+		} else {
+			action
+		};
 		Self {
 			kind,
 			phase,
@@ -475,6 +598,17 @@ impl Error {
 	pub const fn committed(mut self, committed: bool) -> Self {
 		self.committed = committed;
 		self
+	}
+	/// Refines status-only payload inference with later provider body text.
+	pub fn refine_provider_rejection(&mut self, message: &str) {
+		if let Some(kind) =
+			classify_provider_rejection(self.status, Some(message), None, Some(self.kind))
+		{
+			self.kind = kind;
+			if matches!(kind, ErrorKind::ContextOverflow | ErrorKind::PayloadRejected) {
+				self.action = RetryAction::Never;
+			}
+		}
 	}
 
 	/// Attaches typed supplemental evidence.
@@ -601,11 +735,14 @@ pub fn aggregate_search_failures(mut failures: Vec<Error>) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use std::mem::size_of;
+	use std::{io, mem::size_of, time::Duration};
 
 	use omp_core::sf;
 
-	use super::{Error, ErrorDetail as SuperErrorDetail, ErrorKind, ErrorPhase, RetryAction};
+	use super::{
+		Error, ErrorDetail as SuperErrorDetail, ErrorKind, ErrorPhase, RetryAction,
+		classify_provider_rejection,
+	};
 	use crate::receipt::ExecutionReceipt;
 
 	#[test]
@@ -643,5 +780,60 @@ mod tests {
 		assert!(rendered.contains("(model_archived)"));
 		assert!(rendered.contains("[http 404]"));
 		assert!(rendered.contains("model does not exist"));
+	}
+
+	#[test]
+	fn provider_rejection_arbitrates_status_body_and_cause_evidence() {
+		assert_eq!(
+			classify_provider_rejection(Some(413), None, None, None),
+			Some(ErrorKind::PayloadRejected),
+		);
+		assert_eq!(
+			classify_provider_rejection(
+				Some(413),
+				Some("image count exceeds the limit of 20"),
+				None,
+				None,
+			),
+			Some(ErrorKind::PayloadRejected),
+		);
+		assert_eq!(
+			classify_provider_rejection(
+				Some(413),
+				Some("maximum context length is 128000 tokens"),
+				None,
+				None,
+			),
+			Some(ErrorKind::ContextOverflow),
+		);
+
+		let nested = io::Error::other("maximum context length is 128000 tokens");
+		let wrapper = io::Error::new(io::ErrorKind::Other, nested);
+		assert_eq!(
+			classify_provider_rejection(Some(413), Some("Provider returned error"), Some(&wrapper), None),
+			Some(ErrorKind::ContextOverflow),
+		);
+	}
+
+	#[test]
+	fn late_body_refinement_clears_status_only_payload_inference() {
+		let forced_retry = Error::new(
+			ErrorKind::PayloadRejected,
+			ErrorPhase::Handshake,
+			RetryAction::SameRoute { after: Duration::ZERO },
+			ExecutionReceipt::default(),
+		);
+		assert_eq!(forced_retry.action, RetryAction::Never);
+
+		let mut error = Error::new(
+			ErrorKind::PayloadRejected,
+			ErrorPhase::Handshake,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		)
+		.status(Some(413));
+		error.refine_provider_rejection("maximum context length is 128000 tokens");
+		assert_eq!(error.kind, ErrorKind::ContextOverflow);
+		assert_eq!(error.action, RetryAction::Never);
 	}
 }

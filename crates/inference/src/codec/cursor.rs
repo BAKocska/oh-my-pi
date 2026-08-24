@@ -6,7 +6,7 @@
 //! stream even though the pinned descriptor declares the method unary;
 //! descriptor tests make that observed drift explicit.
 
-use std::{collections::BTreeMap, error, fmt, fmt::Display, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, error, fmt, fmt::Display, sync::Arc, time::Duration};
 
 use bytes::{BufMut as _, Bytes, BytesMut};
 use omp_catalog::{
@@ -30,6 +30,7 @@ use self::wire::{
 	web_search_request_response,
 };
 use super::{
+	connect::{ConnectErrorDiagnostic, parse_connect_end_stream},
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
 	ProviderControlEvent, ProviderStateEvent, RawCompletion, RawEvent, RequestHeader, RequestMethod,
 	SizeBounds, ToolInputKind, UnvalidatedToolCall,
@@ -112,6 +113,10 @@ pub enum CursorErrorKind {
 	Authentication,
 	/// Cursor returned a non-success status.
 	Upstream,
+	/// Cursor could not resolve the normalized model id.
+	ModelNotFound,
+	/// Cursor rejected the selected model under the account's plan.
+	PlanGate,
 	/// Cursor rejected a poisoned conversation before producing tokens.
 	ResourceExhausted,
 	/// Cursor reported a context-window overflow.
@@ -131,11 +136,13 @@ pub struct CursorProtocolError {
 	pub status:    Option<u16>,
 	/// Whether an ordinary canonical event had already been emitted.
 	pub committed: bool,
+	/// Typed Connect evidence retained separately from classification.
+	diagnostic: Option<ConnectErrorDiagnostic>,
 }
 
 impl CursorProtocolError {
 	const fn new(kind: CursorErrorKind, reason: &'static str, committed: bool) -> Self {
-		Self { kind, reason: sf!(reason), committed, status: None }
+		Self { kind, reason: sf!(reason), committed, status: None, diagnostic: None }
 	}
 }
 
@@ -286,12 +293,25 @@ pub struct CursorReconnectRequest {
 	pub request_id: Str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorWireMode {
+	Normalized,
+	Discovered,
+}
+
 /// Encodes the Connect-framed body for Cursor's streaming `Run` method.
 ///
 /// # Errors
 /// Returns [`CursorProtocolError`] when the request state cannot be lowered
 /// onto the wire schema.
 pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorProtocolError> {
+	encode_run_request_for_wire_mode(request, CursorWireMode::Normalized)
+}
+
+fn encode_run_request_for_wire_mode(
+	request: &CursorRunRequest,
+	wire_mode: CursorWireMode,
+) -> Result<Bytes, CursorProtocolError> {
 	let state = request
 		.checkpoint
 		.as_ref()
@@ -345,7 +365,13 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 			input_schema_json:   None,
 		})
 		.collect();
-	let wire_model = resolve_cursor_wire_model(request.model_id.as_str());
+	let wire_model = match wire_mode {
+		CursorWireMode::Normalized => resolve_cursor_wire_model(request.model_id.as_str()),
+		CursorWireMode::Discovered => CursorWireModel {
+			model_id:  request.model_id.clone(),
+			reasoning: None,
+		},
+	};
 	let model = wire::ModelDetails {
 		model_id: wire_model.model_id.as_str().to_owned(),
 		display_model_id: wire_model.model_id.as_str().to_owned(),
@@ -383,6 +409,7 @@ pub fn encode_run_request(request: &CursorRunRequest) -> Result<Bytes, CursorPro
 		message: Some(agent_client_message::Message::RunRequest(run)),
 	}))
 }
+
 /// Projects ordered system/developer prompts as global `requestContext.rules`
 /// so Cursor's AgentService retains always-apply rules when it reconstructs
 /// prompts server-side (pi #8997).
@@ -459,6 +486,35 @@ fn is_openai_family(base: &str) -> bool {
 			.next()
 			.is_some_and(|byte| byte.is_ascii_digit())
 	})
+}
+
+fn serialized_fallback_wire_model(
+	request: &CursorRunRequest,
+	wire_mode: CursorWireMode,
+	body: &Bytes,
+) -> Option<Str> {
+	if wire_mode != CursorWireMode::Normalized {
+		return None;
+	}
+	let expected = resolve_cursor_wire_model(request.model_id.as_str());
+	let effort = expected.reasoning.as_ref()?;
+	if expected.model_id == request.model_id {
+		return None;
+	}
+	let message = wire::AgentClientMessage::decode(body.slice(5..)).ok()?;
+	let agent_client_message::Message::RunRequest(run) = message.message? else {
+		return None;
+	};
+	let requested = run.requested_model?;
+	let details = run.model_details?;
+	let [parameter] = requested.parameters.as_slice() else {
+		return None;
+	};
+	(requested.model_id == expected.model_id
+		&& details.model_id == expected.model_id
+		&& parameter.id == "reasoning"
+		&& parameter.value == effort.as_str())
+		.then(|| request.model_id.clone())
 }
 
 /// Encodes the request body for `RunSSE` reconnect.
@@ -551,7 +607,9 @@ fn protobuf_to_json(value: ProtoValue) -> Option<serde_json::Value> {
 			// arguments distinguish 12 from 12.0, so whole in-range doubles
 			// decode as integers (matching the JS decoder's output).
 			const SAFE: f64 = 9_007_199_254_740_992.0; // 2^53
-			if value.fract() == 0.0 && value.abs() <= SAFE {
+			if !value.is_finite() {
+				serde_json::Value::Null
+			} else if value.fract() == 0.0 && value.abs() <= SAFE {
 				serde_json::Value::Number(serde_json::Number::from(value as i64))
 			} else {
 				serde_json::Value::Number(serde_json::Number::from_f64(value)?)
@@ -1002,6 +1060,7 @@ struct OpenBlock {
 	tool_id:       ToolCallId,
 	tool_name:     Str,
 	arguments:     BytesMut,
+	announced_arguments: Option<Bytes>,
 	edit_path:     Option<Str>,
 	edit_text:     String,
 	edit_inner_id: ToolCallId,
@@ -1017,7 +1076,9 @@ pub struct CursorDecoder {
 	saw_usage:  bool,
 	saw_tool:   bool,
 	committed:  bool,
+	progress:   bool,
 	terminal:   bool,
+	turn_ended: bool,
 	cancelled:  bool,
 }
 
@@ -1052,6 +1113,15 @@ impl CursorDecoder {
 				self.committed,
 			)
 		})?;
+		let heartbeat = matches!(
+			message.message.as_ref(),
+			Some(agent_server_message::Message::InteractionUpdate(update))
+				if matches!(
+					update.message.as_ref(),
+					Some(interaction_update::Message::Heartbeat(_))
+				)
+		);
+		self.progress |= !heartbeat;
 		self.project(message, &payload)
 	}
 
@@ -1067,42 +1137,42 @@ impl CursorDecoder {
 				self.committed,
 			));
 		}
-		#[derive(serde::Deserialize)]
-		struct EndStream<'a> {
-			#[serde(borrow)]
-			error: Option<EndError<'a>>,
-		}
-		#[derive(serde::Deserialize)]
-		struct EndError<'a> {
-			#[serde(default, borrow)]
-			code: Option<&'a str>,
-		}
-		let trailer = serde_json::from_slice::<EndStream<'_>>(payload).map_err(|_| {
+		let diagnostic = parse_connect_end_stream(payload).map_err(|_| {
 			CursorProtocolError::new(
 				CursorErrorKind::Malformed,
 				"malformed Cursor Connect end-stream payload",
 				self.committed,
 			)
 		})?;
-		if let Some(error) = trailer.error {
-			let kind = match error.code {
-				Some("context_length_exceeded" | "context_overflow") => {
-					CursorErrorKind::ContextOverflow
-				},
-				Some(code)
-					if code.eq_ignore_ascii_case("resource_exhausted")
-						|| code.eq_ignore_ascii_case("resource-exhausted")
-						|| code.eq_ignore_ascii_case("resource exhausted") =>
-				{
-					CursorErrorKind::ResourceExhausted
-				},
-				_ => CursorErrorKind::Upstream,
+		if let Some(diagnostic) = diagnostic {
+			let code = diagnostic.code.as_str();
+			let resource_exhausted = code.eq_ignore_ascii_case("resource_exhausted")
+				|| code.eq_ignore_ascii_case("resource-exhausted")
+				|| code.eq_ignore_ascii_case("resource exhausted")
+				|| code == "8";
+			let kind = if matches!(code, "context_length_exceeded" | "context_overflow") {
+				CursorErrorKind::ContextOverflow
+			} else if code.eq_ignore_ascii_case("not_found")
+				|| code.eq_ignore_ascii_case("not-found")
+				|| code.eq_ignore_ascii_case("not found")
+				|| code == "5"
+			{
+				CursorErrorKind::ModelNotFound
+			} else if resource_exhausted && is_cursor_plan_gate(&diagnostic) {
+				CursorErrorKind::PlanGate
+			} else if resource_exhausted {
+				CursorErrorKind::ResourceExhausted
+			} else {
+				CursorErrorKind::Upstream
 			};
-			return Err(CursorProtocolError::new(
-				kind,
-				"Cursor Connect end-stream error",
-				self.committed,
-			));
+			let reason = match kind {
+				CursorErrorKind::ModelNotFound => "cursor_model_not_found",
+				CursorErrorKind::PlanGate => "cursor_plan_gate",
+				_ => "cursor_connect_end_stream_error",
+			};
+			let mut error = CursorProtocolError::new(kind, reason, self.committed);
+			error.diagnostic = Some(diagnostic);
+			return Err(error);
 		}
 		self.terminal = true;
 		Ok(Vec::new())
@@ -1130,6 +1200,12 @@ impl CursorDecoder {
 	const fn saw_token_delta(&self) -> bool {
 		self.saw_usage
 	}
+	const fn saw_server_progress(&self) -> bool {
+		self.progress
+	}
+	const fn completed_turn(&self) -> bool {
+		self.turn_ended
+	}
 
 	fn project(
 		&mut self,
@@ -1140,18 +1216,26 @@ impl CursorDecoder {
 			Some(agent_server_message::Message::InteractionUpdate(update)) => {
 				self.project_interaction(update)
 			},
-			Some(agent_server_message::Message::ExecServerMessage(exec)) => self.project_exec(exec),
+			Some(agent_server_message::Message::ExecServerMessage(exec)) => {
+				let events = self.project_exec(exec)?;
+				self.committed |= !events.is_empty();
+				Ok(events)
+			},
 			Some(agent_server_message::Message::ExecServerControlMessage(control)) => {
 				let Some(exec_server_control_message::Message::Abort(abort)) = control.message else {
 					return Ok(Vec::new());
 				};
+				self.committed = true;
 				Ok(vec![CursorEvent::InvokeCancel { id: abort.id }])
 			},
 			Some(agent_server_message::Message::ConversationCheckpointUpdate(checkpoint)) => {
+				self.committed = true;
 				Ok(vec![CursorEvent::Checkpoint { data: Bytes::from(checkpoint.encode_to_vec()) }])
 			},
 			Some(agent_server_message::Message::InteractionQuery(query)) => {
-				Ok(project_interaction_query(query, payload))
+				let events = project_interaction_query(query, payload);
+				self.committed |= !events.is_empty();
+				Ok(events)
 			},
 			Some(agent_server_message::Message::KvServerMessage(_)) | None => Ok(Vec::new()),
 		}
@@ -1216,20 +1300,11 @@ impl CursorDecoder {
 							self.committed,
 						));
 					}
-					let arguments = match completion_arguments {
-						Some(completion) if open.edit_path.is_none() => {
-							merge_mcp_arguments(&open.arguments, completion)
-						},
-						Some(completion) => completion,
-						None if open.edit_path.is_some() => edit_open_arguments(&open),
-						None => open.arguments.freeze(),
-					};
-					events.push(CursorEvent::ToolCallComplete {
-						index: open.index,
-						id: open.tool_id,
-						name: open.tool_name,
-						arguments,
-					});
+					let index = open.index;
+					let id = open.tool_id.clone();
+					let name = open.tool_name.clone();
+					let arguments = open_tool_arguments(open, completion_arguments);
+					events.push(CursorEvent::ToolCallComplete { index, id, name, arguments });
 				}
 			},
 			Some(interaction_update::Message::TokenDelta(delta)) => {
@@ -1241,7 +1316,9 @@ impl CursorDecoder {
 				self.saw_usage = true;
 			},
 			Some(interaction_update::Message::TurnEnded(_)) => {
-				self.open = None;
+				if let Some(event) = self.flush_open_tool_call() {
+					events.push(event);
+				}
 				if self.saw_usage {
 					events.push(CursorEvent::Chat(Box::new(ChatEvent::Usage(UsageUpdate {
 						usage:        self.usage,
@@ -1259,6 +1336,7 @@ impl CursorDecoder {
 				});
 				self.committed = true;
 				self.terminal = true;
+				self.turn_ended = true;
 			},
 			Some(
 				interaction_update::Message::ThinkingCompleted(_)
@@ -1376,6 +1454,7 @@ impl CursorDecoder {
 	) {
 		let id = call_id(call_id_text, tool);
 		let name = tool_name(tool);
+		let announced_arguments = mcp_tool_arguments(tool);
 		let (edit_path, edit_text) = edit_tool_state(tool);
 		let edit_inner_id = ToolCallId::from(
 			tool
@@ -1384,6 +1463,7 @@ impl CursorDecoder {
 		);
 		let index = self.start_block(OpenKind::Tool, id.clone(), name.clone());
 		if let Some(open) = self.open.as_mut() {
+			open.announced_arguments = announced_arguments;
 			open.edit_path = edit_path;
 			open.edit_text = edit_text;
 			open.edit_inner_id = edit_inner_id;
@@ -1397,6 +1477,16 @@ impl CursorDecoder {
 		self.committed = true;
 	}
 
+	fn flush_open_tool_call(&mut self) -> Option<CursorEvent> {
+		let open = self.open.take()?;
+		(open.kind == OpenKind::Tool).then(|| CursorEvent::ToolCallComplete {
+			index: open.index,
+			id: open.tool_id.clone(),
+			name: open.tool_name.clone(),
+			arguments: open_tool_arguments(open, None),
+		})
+	}
+
 	fn start_block(&mut self, kind: OpenKind, tool_id: ToolCallId, tool_name: Str) -> u32 {
 		let index = self.next_index;
 		self.next_index = self.next_index.saturating_add(1);
@@ -1407,12 +1497,78 @@ impl CursorDecoder {
 			tool_id,
 			tool_name,
 			arguments: BytesMut::new(),
+			announced_arguments: None,
 			edit_path: None,
 			edit_text: String::new(),
 			edit_inner_id: ToolCallId::default(),
 		});
 		index
 	}
+}
+
+fn is_cursor_plan_gate(diagnostic: &ConnectErrorDiagnostic) -> bool {
+	diagnostic
+		.details
+		.iter()
+		.any(|detail| cursor_plan_gate_evidence(&detail.evidence))
+		|| diagnostic
+			.fallback
+			.as_ref()
+			.is_some_and(cursor_plan_gate_evidence)
+}
+
+fn cursor_plan_gate_evidence(evidence: &serde_json::Value) -> bool {
+	fn has_marker(value: &serde_json::Value) -> bool {
+		let Some(object) = value.as_object() else {
+			return false;
+		};
+		object.iter().any(|(name, value)| {
+			if matches!(name.as_str(), "error" | "reason") {
+				return value
+					.as_str()
+					.is_some_and(|value| value.eq_ignore_ascii_case("ERROR_RATE_LIMITED_CHANGEABLE"));
+			}
+			matches!(value, serde_json::Value::Object(_))
+				&& has_marker(value)
+				|| matches!(value, serde_json::Value::Array(_))
+					&& value
+						.as_array()
+						.is_some_and(|values| values.iter().any(has_marker))
+		})
+	}
+
+	fn has_plan_scope(value: &serde_json::Value) -> bool {
+		let Some(object) = value.as_object() else {
+			return false;
+		};
+		object.iter().any(|(name, value)| {
+			if matches!(name.as_str(), "title" | "detail")
+				&& let Some(text) = value.as_str()
+			{
+				return [
+					"Named models unavailable",
+					"Model unavailable on",
+					"Free plans can only use",
+				]
+				.iter()
+				.any(|prefix| starts_with_ascii_case_insensitive(text, prefix));
+			}
+			matches!(value, serde_json::Value::Object(_))
+				&& has_plan_scope(value)
+				|| matches!(value, serde_json::Value::Array(_))
+					&& value
+						.as_array()
+						.is_some_and(|values| values.iter().any(has_plan_scope))
+		})
+	}
+
+	has_marker(evidence) && has_plan_scope(evidence)
+}
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+	value
+		.get(..prefix.len())
+		.is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
 fn shell_invocation(
@@ -1526,6 +1682,21 @@ fn edit_arguments(path: &str, stream_content: &str) -> Bytes {
 	)
 }
 
+fn open_tool_arguments(open: OpenBlock, completion: Option<Bytes>) -> Bytes {
+	if open.edit_path.is_some() {
+		return completion.unwrap_or_else(|| edit_open_arguments(&open));
+	}
+	if !open.arguments.is_empty() {
+		if let Some(completion) = completion {
+			return merge_mcp_arguments(&open.arguments, completion);
+		}
+		return open.arguments.freeze();
+	}
+	completion
+		.or(open.announced_arguments)
+		.unwrap_or_else(|| Bytes::from_static(b"{}"))
+}
+
 fn merge_mcp_arguments(streamed: &[u8], completion: Bytes) -> Bytes {
 	let Ok(serde_json::Value::Object(mut merged)) =
 		serde_json::from_slice::<serde_json::Value>(streamed)
@@ -1558,7 +1729,12 @@ fn decode_mcp_arg_value(value: &[u8]) -> serde_json::Value {
 		.or_else(|| serde_json::from_slice(value).ok())
 		.unwrap_or_else(|| serde_json::Value::String(String::from_utf8_lossy(value).into_owned()));
 	if let serde_json::Value::String(text) = value {
-		serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+		match text.trim_start().as_bytes().first() {
+			Some(b'{' | b'[' | b'"') => {
+				serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+			},
+			_ => serde_json::Value::String(text),
+		}
 	} else {
 		value
 	}
@@ -1805,7 +1981,8 @@ fn first_unknown_query_field(mut buf: &[u8]) -> Option<u32> {
 }
 
 /// Sans-I/O Cursor Agent codec registered under the catalog codec id `cursor`,
-/// carrying shared poisoned-conversation rotation state across attempts.
+/// carrying discovered-model fallback and poisoned-conversation recovery state
+/// across attempts.
 #[derive(Clone, Debug, Default)]
 pub struct CursorCodec {
 	conversations: Arc<Mutex<CursorConversationRotations>>,
@@ -1813,14 +1990,21 @@ pub struct CursorCodec {
 
 #[derive(Clone, Debug)]
 struct CursorConversationAttempt {
-	base: Str,
-	seed: Str,
+	base:                Str,
+	wire:                Str,
+	seed:                Str,
+	fallback_wire_model: Option<Str>,
 }
 
 #[derive(Debug, Default)]
 struct CursorConversationRotations {
-	rotated: BTreeMap<Str, Str>,
-	pending: BTreeMap<RequestId, CursorConversationAttempt>,
+	// Deliberately retain only recovery routing facts. Provider checkpoints are
+	// never migrated to a rotated id; the next encode rebuilds from the canonical
+	// request and sends a user-message action.
+	rotated:              BTreeMap<Str, Str>,
+	successful_rotations: BTreeSet<Str>,
+	pending:              BTreeMap<RequestId, CursorConversationAttempt>,
+	fallbacks:            BTreeMap<Str, Str>,
 }
 
 impl CursorConversationRotations {
@@ -1832,29 +2016,76 @@ impl CursorConversationRotations {
 			.unwrap_or_else(|| base.clone())
 	}
 
-	fn begin(&mut self, request: &RequestId<str>, base: &Str) -> Str {
+	fn begin(
+		&mut self,
+		request: &RequestId<str>,
+		base: &Str,
+		discovered_model: &Str,
+	) -> (Str, CursorWireMode) {
 		let wire = self.resolve(base);
+		let request_key = Str::new(request.as_str());
+		let wire_mode = match self.fallbacks.remove(&request_key) {
+			Some(model) if model == *discovered_model => CursorWireMode::Discovered,
+			_ => CursorWireMode::Normalized,
+		};
 		self
 			.pending
 			.insert(RequestId::from(request), CursorConversationAttempt {
-				base: base.clone(),
-				seed: Str::new(request.as_str()),
+				base:                base.clone(),
+				wire:                wire.clone(),
+				seed:                request_key,
+				fallback_wire_model: None,
 			});
-		wire
+		(wire, wire_mode)
+	}
+
+	fn set_fallback_wire_model(&mut self, request: &RequestId<str>, model: Option<Str>) {
+		if let Some(attempt) = self.pending.get_mut(request) {
+			attempt.fallback_wire_model = model;
+		}
 	}
 
 	fn take(&mut self, request: &RequestId<str>) -> Option<CursorConversationAttempt> {
 		self.pending.remove(request)
 	}
 
-	fn rotate_once(&mut self, base: &Str, seed: &str) -> bool {
-		if self.rotated.contains_key(base) {
+	fn schedule_fallback(&mut self, attempt: &CursorConversationAttempt) -> bool {
+		let Some(model) = attempt.fallback_wire_model.as_ref() else {
+			return false;
+		};
+		self.fallbacks.insert(attempt.seed.clone(), model.clone());
+		true
+	}
+
+	fn rotate(&mut self, base: &Str, seed: &str) -> bool {
+		if self.rotated.contains_key(base) && !self.rotation_reusable(base) {
 			return false;
 		}
-		self
-			.rotated
-			.insert(base.clone(), sf!("cursor-rotated-{seed}"));
+		if let Some(current) = self.rotated.get(base) {
+			self.successful_rotations.remove(current);
+		}
+		let rotated = sf!("cursor-rotated-{seed}");
+		if self.rotated.get(base) == Some(&rotated) {
+			return false;
+		}
+		self.rotated.insert(base.clone(), rotated);
 		true
+	}
+
+	fn mark_clean(&mut self, attempt: &CursorConversationAttempt) {
+		if attempt.wire == attempt.base {
+			return;
+		}
+		if self.rotated.get(&attempt.base) == Some(&attempt.wire) {
+			self.successful_rotations.insert(attempt.wire.clone());
+		}
+	}
+
+	fn rotation_reusable(&self, base: &Str) -> bool {
+		let Some(wire) = self.rotated.get(base) else {
+			return false;
+		};
+		self.successful_rotations.contains(wire)
 	}
 }
 
@@ -1960,14 +2191,18 @@ fn encode_chat_call(
 		Some(ExtendedContextMode::Extended) => true,
 		None => return Err(encoding_error("cursor_extended_context_mode_unknown")),
 	};
+	let discovered_model = Str::new(target.wire_model.as_str());
+	let base_conversation = context.session.map_or_else(
+		|| Str::new(context.request_id.as_str()),
+		|session| Str::new(session.conversation.as_str()),
+	);
+	let (wire_conversation, wire_mode) = conversations
+		.lock()
+		.begin(context.request_id, &base_conversation, &discovered_model);
 	let run = CursorRunRequest {
-		model_id: Str::new(target.wire_model.as_str()),
+		model_id: discovered_model,
 		max_mode,
-		conversation_id: context.session.map(|session| {
-			conversations
-				.lock()
-				.begin(context.request_id, &Str::new(session.conversation.as_str()))
-		}),
+		conversation_id: Some(wire_conversation),
 		checkpoint: None,
 		root_prompts: roots.into_boxed_slice(),
 		tools: tools.into_boxed_slice(),
@@ -1976,6 +2211,11 @@ fn encode_chat_call(
 			text:       user,
 		},
 	};
+	let body = encode_run_request_for_wire_mode(&run, wire_mode).map_err(inference_error)?;
+	let fallback_wire_model = serialized_fallback_wire_model(&run, wire_mode, &body);
+	conversations
+		.lock()
+		.set_fallback_wire_model(context.request_id, fallback_wire_model);
 	let mut headers = Vec::with_capacity(6);
 	for_each_public_header(CursorHeaderProfile::Run, |name, value| {
 		headers.push(RequestHeader { name: sf!(name), value: sf!(value) });
@@ -1985,7 +2225,7 @@ fn encode_chat_call(
 		RequestMethod::Post,
 		endpoint_uri(context.route.endpoint.base_url.as_str(), RUN_PATH),
 		headers.into_boxed_slice(),
-		BodySource::bytes(encode_run_request(&run).map_err(inference_error)?),
+		BodySource::bytes(body),
 		FramingProtocol::Connect,
 		cursor_bounds(),
 	))
@@ -2090,8 +2330,16 @@ impl Decoder for CursorWireDecoder {
 				let events = match result {
 					Ok(events) => events,
 					Err(error) => {
+						if let Some(event) = self.agent.flush_open_tool_call() {
+							emit(cursor_raw_event(event));
+						}
+						let fallback = self.schedule_discovered_fallback(&error);
 						self.rotate_poisoned_conversation(&error);
-						return Err(self.attach(inference_error(error)));
+						let mut error = inference_error(error);
+						if fallback {
+							error.action = RetryAction::SameRoute { after: Duration::ZERO };
+						}
+						return Err(self.attach(error));
 					},
 				};
 				for event in events {
@@ -2147,12 +2395,23 @@ impl Decoder for CursorWireDecoder {
 		}
 	}
 
-	fn finish(&mut self, _emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+	fn finish(&mut self, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
 		match self.operation {
-			OperationKind::Chat => self
-				.agent
-				.finish()
-				.map_err(|error| self.attach(inference_error(error))),
+			OperationKind::Chat => {
+				let result = self.agent.finish();
+				if result.is_err()
+					&& let Some(event) = self.agent.flush_open_tool_call()
+				{
+					emit(cursor_raw_event(event));
+				}
+				result.map_err(|error| self.attach(inference_error(error)))?;
+				if self.agent.completed_turn()
+					&& let Some(attempt) = self.conversation.take()
+				{
+					self.conversations.lock().mark_clean(&attempt);
+				}
+				Ok(())
+			},
 			OperationKind::DiscoverModels if self.discovery_done => Ok(()),
 			OperationKind::DiscoverModels => {
 				Err(self.attach(encoding_error("cursor_discovery_response_missing")))
@@ -2161,6 +2420,7 @@ impl Decoder for CursorWireDecoder {
 		}
 	}
 }
+
 fn discovered_capabilities(reasoning: bool) -> ModelCapabilities {
 	ModelCapabilities {
 		operations:    OperationBits::for_kind(OperationKind::Chat),
@@ -2214,6 +2474,19 @@ impl CursorWireDecoder {
 			.route(self.route.clone())
 	}
 
+	fn schedule_discovered_fallback(&mut self, error: &CursorProtocolError) -> bool {
+		if error.kind != CursorErrorKind::ModelNotFound
+			|| error.committed
+			|| self.agent.saw_server_progress()
+		{
+			return false;
+		}
+		let Some(attempt) = self.conversation.take() else {
+			return false;
+		};
+		self.conversations.lock().schedule_fallback(&attempt)
+	}
+
 	fn rotate_poisoned_conversation(&mut self, error: &CursorProtocolError) {
 		if error.kind != CursorErrorKind::ResourceExhausted || self.agent.saw_token_delta() {
 			return;
@@ -2224,7 +2497,7 @@ impl CursorWireDecoder {
 		self
 			.conversations
 			.lock()
-			.rotate_once(&attempt.base, attempt.seed.as_str());
+			.rotate(&attempt.base, attempt.seed.as_str());
 	}
 }
 
@@ -2296,17 +2569,26 @@ fn inference_error(error: CursorProtocolError) -> Error {
 		CursorErrorKind::Cancelled => (ErrorKind::Cancelled, RetryAction::Never),
 		CursorErrorKind::Authentication => (ErrorKind::Authentication, RetryAction::Never),
 		CursorErrorKind::Upstream => (ErrorKind::Protocol, RetryAction::Never),
+		CursorErrorKind::ModelNotFound => (ErrorKind::TargetNotFound, RetryAction::Never),
+		CursorErrorKind::PlanGate => (ErrorKind::Authorization, RetryAction::RotateAccount),
 		CursorErrorKind::ResourceExhausted => {
 			(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: Duration::from_secs(1) })
 		},
 		CursorErrorKind::ContextOverflow => (ErrorKind::ContextOverflow, RetryAction::Never),
 		CursorErrorKind::Unsupported => (ErrorKind::CapabilityMismatch, RetryAction::Never),
 	};
-	Error::new(kind, ErrorPhase::Streaming, action, ExecutionReceipt::default())
+	let inference =
+		Error::new(kind, ErrorPhase::Streaming, action, ExecutionReceipt::default())
 		.status(error.status)
 		.code(error.reason.clone())
-		.committed(error.committed)
-		.detail(ErrorDetail::protocol(ReasonId(error.reason)))
+		.committed(error.committed);
+	if let Some(diagnostic) = error.diagnostic {
+		inference.detail(ErrorDetail::Provider {
+			sanitized_message: diagnostic.display_message(),
+		})
+	} else {
+		inference.detail(ErrorDetail::protocol(ReasonId(error.reason)))
+	}
 }
 
 fn encoding_error(reason: &'static str) -> Error {
@@ -2418,6 +2700,210 @@ mod tests {
 		let requested = off.requested_model.expect("requested model");
 		assert_eq!(requested.model_id, "gpt-5.6-sol-none");
 		assert!(requested.parameters.is_empty());
+	}
+
+	#[test]
+	fn discovered_effort_fallback_requires_the_exact_serialized_payload() {
+		let request = CursorRunRequest {
+			model_id:        sf!("gpt-5.6-sol-medium"),
+			max_mode:        false,
+			conversation_id: Some(sf!("conversation")),
+			checkpoint:      None,
+			root_prompts:    Box::new([]),
+			tools:           Box::new([]),
+			action:          CursorRunAction::UserMessage {
+				message_id: sf!("request"),
+				text:       sf!("hello"),
+			},
+		};
+		let normalized =
+			encode_run_request_for_wire_mode(&request, CursorWireMode::Normalized)
+				.expect("normalized request");
+		assert_eq!(
+			serialized_fallback_wire_model(&request, CursorWireMode::Normalized, &normalized),
+			Some(sf!("gpt-5.6-sol-medium"))
+		);
+
+		let discovered =
+			encode_run_request_for_wire_mode(&request, CursorWireMode::Discovered)
+				.expect("discovered request");
+		assert_eq!(
+			serialized_fallback_wire_model(&request, CursorWireMode::Discovered, &discovered),
+			None
+		);
+		let discovered_message =
+			wire::AgentClientMessage::decode(discovered.slice(5..)).expect("discovered payload");
+		let Some(agent_client_message::Message::RunRequest(discovered_run)) =
+			discovered_message.message
+		else {
+			panic!("run request")
+		};
+		let requested = discovered_run.requested_model.expect("requested model");
+		assert_eq!(requested.model_id, "gpt-5.6-sol-medium");
+		assert!(requested.parameters.is_empty());
+		assert_eq!(
+			discovered_run.model_details.expect("model details").model_id,
+			"gpt-5.6-sol-medium"
+		);
+
+		let mut changed =
+			wire::AgentClientMessage::decode(normalized.slice(5..)).expect("normalized payload");
+		let Some(agent_client_message::Message::RunRequest(run)) = changed.message.as_mut() else {
+			panic!("run request")
+		};
+		run.requested_model.as_mut().expect("requested model").model_id =
+			"hook-selected-model".to_owned();
+		let changed = connect_message(&changed);
+		assert_eq!(
+			serialized_fallback_wire_model(&request, CursorWireMode::Normalized, &changed),
+			None,
+			"fallback eligibility follows the final serialized model payload"
+		);
+		let mut changed =
+			wire::AgentClientMessage::decode(normalized.slice(5..)).expect("normalized payload");
+		let Some(agent_client_message::Message::RunRequest(run)) = changed.message.as_mut() else {
+			panic!("run request")
+		};
+		run.requested_model
+			.as_mut()
+			.expect("requested model")
+			.parameters[0]
+			.value = "high".to_owned();
+		assert_eq!(
+			serialized_fallback_wire_model(
+				&request,
+				CursorWireMode::Normalized,
+				&connect_message(&changed),
+			),
+			None,
+			"fallback eligibility follows the final serialized reasoning parameters"
+		);
+	}
+
+	#[test]
+	fn discovered_effort_retry_gates_ignore_heartbeat_but_block_progress_side_effects_and_cancel() {
+		fn decoder(
+			conversations: &Arc<Mutex<CursorConversationRotations>>,
+			request: &str,
+		) -> CursorWireDecoder {
+			let request = RequestId::from(request);
+			let base = sf!("conversation");
+			let model = sf!("gpt-5.6-sol-medium");
+			let (_, mode) = conversations.lock().begin(&request, &base, &model);
+			assert_eq!(mode, CursorWireMode::Normalized);
+			conversations
+				.lock()
+				.set_fallback_wire_model(&request, Some(model));
+			let conversation = conversations.lock().take(&request);
+			CursorWireDecoder {
+				operation: OperationKind::Chat,
+				provider: omp_catalog::ProviderId::from("cursor"),
+				route: omp_catalog::RouteId::from("cursor/primary"),
+				agent: CursorDecoder::default(),
+				discovery_done: false,
+				conversations: Arc::clone(conversations),
+				conversation,
+			}
+		}
+
+		fn message(payload: Bytes) -> Frame {
+			Frame::Connect(TransportConnectEnvelope {
+				flags:   0,
+				kind:    ConnectEnvelopeKind::Message,
+				payload,
+			})
+		}
+
+		fn not_found() -> Frame {
+			Frame::Connect(TransportConnectEnvelope {
+				flags:   CONNECT_END_STREAM,
+				kind:    ConnectEnvelopeKind::EndStream,
+				payload: Bytes::from_static(br#"{"error":{"code":"not_found","message":"missing"}}"#),
+			})
+		}
+
+		let conversations = Arc::new(Mutex::new(CursorConversationRotations::default()));
+		let mut sink = |_event: RawEvent| {};
+		assert_eq!(
+			CursorDecoder::default()
+				.push_end_stream(br#"{"error":{"code":"5","message":"missing"}}"#)
+				.expect_err("gRPC status 5 is not_found")
+				.kind,
+			CursorErrorKind::ModelNotFound
+		);
+		let mut heartbeat_only = decoder(&conversations, "heartbeat");
+		heartbeat_only
+			.push(
+				message(update(interaction_update::Message::Heartbeat(
+					wire::HeartbeatUpdate {},
+				))),
+				&mut sink,
+			)
+			.expect("heartbeat is ignorable");
+		let retry = heartbeat_only
+			.push(not_found(), &mut sink)
+			.expect_err("not_found schedules discovered fallback");
+		assert_eq!(retry.kind, ErrorKind::TargetNotFound);
+		assert_eq!(retry.action, RetryAction::SameRoute { after: Duration::ZERO });
+		assert!(!retry.committed);
+		let request = RequestId::from("heartbeat");
+		let (_, mode) = conversations
+			.lock()
+			.begin(&request, &sf!("conversation"), &sf!("gpt-5.6-sol-medium"));
+		assert_eq!(mode, CursorWireMode::Discovered);
+		let fallback = conversations.lock().take(&request).expect("fallback attempt");
+		assert!(
+			!conversations.lock().schedule_fallback(&fallback),
+			"discovered id is attempted at most once"
+		);
+
+		let progress = Arc::new(Mutex::new(CursorConversationRotations::default()));
+		let mut progressed = decoder(&progress, "progress");
+		progressed
+			.push(
+				message(update(interaction_update::Message::TextDelta(
+					wire::TextDeltaUpdate { text: "partial".to_owned() },
+				))),
+				&mut sink,
+			)
+			.expect("text progress");
+		let error = progressed
+			.push(not_found(), &mut sink)
+			.expect_err("late not_found remains terminal");
+		assert_eq!(error.action, RetryAction::Never);
+		assert!(error.committed);
+
+		let side_effects = Arc::new(Mutex::new(CursorConversationRotations::default()));
+		let mut busy = decoder(&side_effects, "busy");
+		let exec = wire::AgentServerMessage {
+			message: Some(agent_server_message::Message::ExecServerMessage(
+				wire::ExecServerMessage {
+					id:      1,
+					message: Some(exec_server_message::Message::ShellArgs(wire::ShellArgs {
+						command: "printf busy".to_owned(),
+						tool_call_id: "call-shell".to_owned(),
+						..Default::default()
+					})),
+					..Default::default()
+				},
+			)),
+		};
+		busy.push(message(Bytes::from(exec.encode_to_vec())), &mut sink)
+			.expect("local workflow request marks the stream busy");
+		let error = busy
+			.push(not_found(), &mut sink)
+			.expect_err("side effects forbid fallback");
+		assert_eq!(error.action, RetryAction::Never);
+		assert!(error.committed);
+
+		let cancelled = Arc::new(Mutex::new(CursorConversationRotations::default()));
+		let mut decoder = decoder(&cancelled, "cancelled");
+		decoder.agent.cancel();
+		let error = decoder
+			.push(not_found(), &mut sink)
+			.expect_err("cancel remains terminal");
+		assert_eq!(error.kind, ErrorKind::Cancelled);
+		assert_eq!(error.action, RetryAction::Never);
 	}
 
 	#[test]
@@ -2533,7 +3019,17 @@ mod tests {
 			"path": "src/lib.rs",
 			"range": { "start": 4, "end": 12 },
 			"strict": true,
-			"encoded": { "depth": 2 }
+			"encoded": { "depth": 2 },
+			"encoded_array": [1, 2],
+			"quoted": "label",
+			"numeric_string": "57785654",
+			"exponent_string": "1e234567",
+			"boolean_string": "true",
+			"null_string": "null",
+			"json_number": 57785654,
+			"invalid_number": null,
+			"infinite_number": null,
+			"invalid_raw": "�"
 		});
 		let mut args: BTreeMap<String, Bytes> = expected
 			.as_object()
@@ -2548,6 +3044,48 @@ mod tests {
 			encode_json_value(&serde_json::json!(r#"{"depth":2}"#))
 				.expect("encoded protobuf JSON string"),
 		);
+		args.insert(
+			"encoded_array".to_owned(),
+			encode_json_value(&serde_json::json!("[1,2]"))
+				.expect("encoded protobuf JSON array string"),
+		);
+		args.insert(
+			"quoted".to_owned(),
+			encode_json_value(&serde_json::json!(r#""label""#))
+				.expect("encoded quoted protobuf JSON string"),
+		);
+		for (name, text) in [
+			("numeric_string", "57785654"),
+			("exponent_string", "1e234567"),
+			("boolean_string", "true"),
+			("null_string", "null"),
+		] {
+			args.insert(
+				name.to_owned(),
+				encode_json_value(&serde_json::Value::String(text.to_owned()))
+					.expect("encoded opaque protobuf string"),
+			);
+		}
+		args.insert(
+			"json_number".to_owned(),
+			encode_json_value(&serde_json::json!(57_785_654))
+				.expect("encoded protobuf number"),
+		);
+		args.insert(
+			"invalid_number".to_owned(),
+			Bytes::from(ProtoValue {
+				kind: Some(ProtoValueKind::NumberValue(f64::NAN)),
+			}
+			.encode_to_vec()),
+		);
+		args.insert(
+			"infinite_number".to_owned(),
+			Bytes::from(ProtoValue {
+				kind: Some(ProtoValueKind::NumberValue(f64::INFINITY)),
+			}
+			.encode_to_vec()),
+		);
+		args.insert("invalid_raw".to_owned(), Bytes::from_static(b"\xff"));
 		let tool = wire::ToolCall {
 			tool: Some(tool_call::Tool::McpToolCall(wire::McpToolCall {
 				args: Some(wire::McpArgs { args, ..wire::McpArgs::default() }),
@@ -2576,6 +3114,120 @@ mod tests {
 				"completion": 12
 			})
 		);
+	}
+	#[test]
+	fn mcp_initial_delta_and_flush_arguments_are_preserved() {
+		fn mcp_tool(city: &str) -> wire::ToolCall {
+			let mut args = BTreeMap::new();
+			args.insert(
+				"city".to_owned(),
+				encode_json_value(&serde_json::Value::String(city.to_owned()))
+					.expect("encoded city"),
+			);
+			wire::ToolCall {
+				tool_call_id: Some("call-weather".to_owned()),
+				tool:         Some(tool_call::Tool::McpToolCall(wire::McpToolCall {
+					args: Some(wire::McpArgs {
+						name: "get_weather".to_owned(),
+						tool_call_id: "call-weather".to_owned(),
+						tool_name: "get_weather".to_owned(),
+						args,
+						..Default::default()
+					}),
+					..Default::default()
+				})),
+			}
+		}
+
+		fn complete_arguments(events: Vec<CursorEvent>) -> Bytes {
+			events
+				.into_iter()
+				.find_map(|event| match event {
+					CursorEvent::ToolCallComplete { arguments, .. } => Some(arguments),
+					_ => None,
+				})
+				.expect("completed MCP arguments")
+		}
+
+		let mut announced = CursorDecoder::default();
+		announced
+			.push_payload(update(interaction_update::Message::ToolCallStarted(
+				wire::ToolCallStartedUpdate {
+					call_id: "call-weather".to_owned(),
+					tool_call: Some(mcp_tool("Paris")),
+					..Default::default()
+				},
+			)))
+			.expect("announced MCP call");
+		let completed = announced
+			.push_payload(update(interaction_update::Message::ToolCallCompleted(
+				wire::ToolCallCompletedUpdate {
+					call_id: "call-weather".to_owned(),
+					tool_call: None,
+					..Default::default()
+				},
+			)))
+			.expect("completed announced MCP call");
+		assert_eq!(complete_arguments(completed), Bytes::from_static(br#"{"city":"Paris"}"#));
+
+		let mut streamed = CursorDecoder::default();
+		streamed
+			.push_payload(update(interaction_update::Message::ToolCallStarted(
+				wire::ToolCallStartedUpdate {
+					call_id: "call-weather".to_owned(),
+					tool_call: Some(mcp_tool("Paris")),
+					..Default::default()
+				},
+			)))
+			.expect("started streamed MCP call");
+		streamed
+			.push_payload(update(interaction_update::Message::PartialToolCall(
+				wire::PartialToolCallUpdate {
+					call_id: "call-weather".to_owned(),
+					args_text_delta: r#"{"city":"Berlin"}"#.to_owned(),
+					..Default::default()
+				},
+			)))
+			.expect("streamed exact argument snapshot");
+		let completed = streamed
+			.push_payload(update(interaction_update::Message::ToolCallCompleted(
+				wire::ToolCallCompletedUpdate {
+					call_id: "call-weather".to_owned(),
+					tool_call: None,
+					..Default::default()
+				},
+			)))
+			.expect("completed streamed MCP call");
+		assert_eq!(complete_arguments(completed), Bytes::from_static(br#"{"city":"Berlin"}"#));
+
+		let mut flushed = CursorDecoder::default();
+		flushed
+			.push_payload(update(interaction_update::Message::ToolCallStarted(
+				wire::ToolCallStartedUpdate {
+					call_id: "call-weather".to_owned(),
+					tool_call: Some(mcp_tool("Paris")),
+					..Default::default()
+				},
+			)))
+			.expect("started truncated MCP call");
+		let flushed = flushed
+			.push_payload(update(interaction_update::Message::TurnEnded(
+				wire::TurnEndedUpdate::default(),
+			)))
+			.expect("terminal update flushes open MCP call");
+		assert_eq!(complete_arguments(flushed), Bytes::from_static(br#"{"city":"Paris"}"#));
+		let mut abrupt = CursorDecoder::default();
+		abrupt
+			.push_payload(update(interaction_update::Message::ToolCallStarted(
+				wire::ToolCallStartedUpdate {
+					call_id: "call-weather".to_owned(),
+					tool_call: Some(mcp_tool("Paris")),
+					..Default::default()
+				},
+			)))
+			.expect("started abruptly truncated MCP call");
+		let abrupt = abrupt.flush_open_tool_call().expect("flushes abrupt MCP call");
+		assert_eq!(complete_arguments(vec![abrupt]), Bytes::from_static(br#"{"city":"Paris"}"#));
 	}
 
 	#[test]
@@ -3001,14 +3653,17 @@ mod tests {
 	}
 
 	#[test]
-	fn poisoned_conversation_rotates_the_wire_id_once_and_never_after_tokens() {
+	fn poisoned_conversation_rerotates_only_after_a_clean_rotated_turn() {
 		fn wire_decoder(
 			conversations: &Arc<Mutex<CursorConversationRotations>>,
 			request: &str,
 			base: &Str,
 		) -> (CursorWireDecoder, Str) {
 			let request = RequestId::from(request);
-			let wire_id = conversations.lock().begin(&request, base);
+			let (wire_id, _) =
+				conversations
+					.lock()
+					.begin(&request, base, &sf!("cursor-composer-2.5"));
 			let conversation = conversations.lock().take(&request);
 			(
 				CursorWireDecoder {
@@ -3034,8 +3689,8 @@ mod tests {
 
 		fn message(payload: Bytes) -> Frame {
 			Frame::Connect(TransportConnectEnvelope {
-				flags: 0,
-				kind: ConnectEnvelopeKind::Message,
+				flags:   0,
+				kind:    ConnectEnvelopeKind::Message,
 				payload,
 			})
 		}
@@ -3043,50 +3698,115 @@ mod tests {
 		const POISONED: &[u8] = br#"{"error":{"code":"resource_exhausted"}}"#;
 		let conversations = Arc::new(Mutex::new(CursorConversationRotations::default()));
 		let mut sink = |_event: RawEvent| {};
-
-		// A bare resource_exhausted end-stream with zero generated tokens is a
-		// poisoned conversation: the wire id rotates so the caller's retry
-		// starts a fresh conversation, exactly like /fork.
 		let base = sf!("conversation-poisoned");
-		let (mut decoder, wire_id) = wire_decoder(&conversations, "request-1", &base);
-		assert_eq!(wire_id, base, "first attempt sends the caller's conversation id");
-		let error = decoder
+
+		let (mut first, wire_id) = wire_decoder(&conversations, "request-1", &base);
+		assert_eq!(wire_id, base);
+		let error = first
 			.push(end_stream(POISONED), &mut sink)
-			.expect_err("poisoned conversation fails the attempt");
+			.expect_err("poisoned conversation fails");
 		assert_eq!(error.kind, ErrorKind::ResourceExhausted);
 		let rotated = conversations.lock().resolve(&base);
-		assert_ne!(rotated, base, "retry must not reuse the poisoned wire id");
+		assert_ne!(rotated, base);
+		let rebuilt = encode_run_request(&CursorRunRequest {
+			model_id:        sf!("cursor-composer-2.5"),
+			max_mode:        false,
+			conversation_id: Some(rotated.clone()),
+			checkpoint:      None,
+			root_prompts:    Box::new([]),
+			tools:           Box::new([]),
+			action:          CursorRunAction::UserMessage {
+				message_id: sf!("resume-replay"),
+				text:       sf!("Use the read tool."),
+			},
+		})
+		.expect("fresh rotated retry");
+		let rebuilt =
+			wire::AgentClientMessage::decode(rebuilt.slice(5..)).expect("rotated run request");
+		let Some(agent_client_message::Message::RunRequest(rebuilt)) = rebuilt.message else {
+			panic!("run request")
+		};
+		assert!(
+			rebuilt
+				.conversation_state
+				.as_ref()
+				.is_some_and(|state| state.pending_tool_calls.is_empty()),
+			"rotated retry never migrates poisoned pending tool checkpoints"
+		);
+		let Some(conversation_action::Action::UserMessageAction(action)) =
+			rebuilt.action.and_then(|action| action.action)
+		else {
+			panic!("rotated resume retry must replay the last user turn")
+		};
+		assert_eq!(
+			action.user_message.expect("replayed user message").text,
+			"Use the read tool."
+		);
 
-		// The retry encodes the rotated id, and a repeated failure keeps it:
-		// rotation happens exactly once so genuine account-level exhaustion is
-		// not hidden behind an endless stream of fresh conversations.
-		let (mut decoder, wire_id) = wire_decoder(&conversations, "request-2", &base);
+		let (mut failed_rotation, wire_id) =
+			wire_decoder(&conversations, "request-2", &base);
 		assert_eq!(wire_id, rotated);
-		decoder
+		failed_rotation
 			.push(end_stream(POISONED), &mut sink)
-			.expect_err("repeated exhaustion still fails");
-		assert_eq!(conversations.lock().resolve(&base), rotated, "rotation happens exactly once");
+			.expect_err("failed rotated turn remains terminal");
+		assert_eq!(conversations.lock().resolve(&base), rotated);
 
-		// A conversation that already produced tokens is exhausted, not
-		// poisoned: its id is preserved.
+		let (mut clean_rotation, wire_id) =
+			wire_decoder(&conversations, "request-3", &base);
+		assert_eq!(wire_id, rotated);
+		clean_rotation
+			.push(
+				message(update(interaction_update::Message::TurnEnded(
+					wire::TurnEndedUpdate::default(),
+				))),
+				&mut sink,
+			)
+			.expect("rotated turn ended");
+		clean_rotation
+			.push(end_stream(br#"{}"#), &mut sink)
+			.expect("clean Connect end-stream");
+		clean_rotation.finish(&mut sink).expect("clean rotated completion");
+		assert!(conversations.lock().rotation_reusable(&base));
+
+		let (mut poisoned_again, wire_id) =
+			wire_decoder(&conversations, "request-4", &base);
+		assert_eq!(wire_id, rotated);
+		poisoned_again
+			.push(end_stream(POISONED), &mut sink)
+			.expect_err("successful rotation may later become poisoned");
+		let rerotated = conversations.lock().resolve(&base);
+		assert_ne!(rerotated, rotated);
+
+		let (mut trailer_rejected, wire_id) =
+			wire_decoder(&conversations, "request-5", &base);
+		assert_eq!(wire_id, rerotated);
+		trailer_rejected
+			.push(
+				message(update(interaction_update::Message::TurnEnded(
+					wire::TurnEndedUpdate::default(),
+				))),
+				&mut sink,
+			)
+			.expect("application turn ended");
+		trailer_rejected
+			.push(end_stream(POISONED), &mut sink)
+			.expect_err("rejecting trailer invalidates application completion");
+		assert_eq!(conversations.lock().resolve(&base), rerotated);
+
 		let billed = sf!("conversation-billed");
-		let (mut decoder, _) = wire_decoder(&conversations, "request-3", &billed);
+		let (mut decoder, _) = wire_decoder(&conversations, "request-6", &billed);
 		decoder
 			.push(
-				message(update(interaction_update::Message::TokenDelta(wire::TokenDeltaUpdate {
-					tokens: 3,
-				}))),
+				message(update(interaction_update::Message::TokenDelta(
+					wire::TokenDeltaUpdate { tokens: 3 },
+				))),
 				&mut sink,
 			)
 			.expect("token delta projects");
 		decoder
 			.push(end_stream(POISONED), &mut sink)
 			.expect_err("exhaustion after tokens still fails");
-		assert_eq!(
-			conversations.lock().resolve(&billed),
-			billed,
-			"a billed conversation is never rotated"
-		);
+		assert_eq!(conversations.lock().resolve(&billed), billed);
 	}
 
 	#[test]
@@ -3388,10 +4108,10 @@ mod tests {
 		let mut rotations = CursorConversationRotations::default();
 		let base = sf!("session-poisoned");
 		assert_eq!(rotations.resolve(&base), base);
-		assert!(rotations.rotate_once(&base, "request-one"));
+		assert!(rotations.rotate(&base, "request-one"));
 		let rotated = rotations.resolve(&base);
 		assert_ne!(rotated, base);
-		assert!(!rotations.rotate_once(&base, "request-two"));
+		assert!(!rotations.rotate(&base, "request-two"));
 		assert_eq!(rotations.resolve(&base), rotated);
 
 		let mut terminal = CursorDecoder::default();
@@ -3405,6 +4125,59 @@ mod tests {
 				.kind,
 			CursorErrorKind::AfterTerminal
 		);
+	}
+
+	#[test]
+	fn cursor_model_plan_gate_is_structured_and_codec_scoped() {
+		fn classify(payload: &'static [u8]) -> Error {
+			let mut decoder = CursorWireDecoder {
+				operation: OperationKind::Chat,
+				provider: omp_catalog::ProviderId::from("cursor"),
+				route: omp_catalog::RouteId::from("route"),
+				agent: CursorDecoder::default(),
+				discovery_done: false,
+				conversations: Arc::new(Mutex::new(CursorConversationRotations::default())),
+				conversation: None,
+			};
+			let mut sink = |_event: RawEvent| {};
+			decoder
+				.push(
+					Frame::Connect(TransportConnectEnvelope {
+						flags: CONNECT_END_STREAM,
+						kind: ConnectEnvelopeKind::EndStream,
+						payload: Bytes::from_static(payload),
+					}),
+					&mut sink,
+				)
+				.expect_err("plan gate rejects the attempt")
+		}
+
+		const PLAN_GATE: &[u8] = br#"{"error":{"code":"resource_exhausted","message":"Error","details":[{"type":"google.rpc.ErrorInfo","value":{"error":"ERROR_RATE_LIMITED_CHANGEABLE","details":{"title":"Named models unavailable","detail":"Free plans can only use Auto."}}}]}}"#;
+		let cursor = classify(PLAN_GATE);
+		assert_eq!(cursor.kind, ErrorKind::Authorization);
+		assert_eq!(cursor.action, RetryAction::RotateAccount);
+		assert_eq!(cursor.code.as_deref(), Some("cursor_plan_gate"));
+		for payload in [
+			br#"{"error":{"code":"resource_exhausted","details":[{"value":{"error":"ERROR_RATE_LIMITED_CHANGEABLE","details":{"title":"Model unavailable on Start"}}}]}}"#
+				.as_slice(),
+			br#"{"error":{"code":"resource_exhausted","details":[{"value":{"reason":"ERROR_RATE_LIMITED_CHANGEABLE","details":{"detail":"Free plans can only use Auto."}}}]}}"#
+				.as_slice(),
+		] {
+			assert_eq!(classify(payload).code.as_deref(), Some("cursor_plan_gate"));
+		}
+
+		for payload in [
+			br#"{"error":{"code":"resource_exhausted","message":"ERROR_RATE_LIMITED_CHANGEABLE: Named models unavailable"}}"#
+				.as_slice(),
+			br#"{"error":{"code":"resource_exhausted","details":[{"value":"{\"error\":\"ERROR_RATE_LIMITED_CHANGEABLE\",\"details\":{\"title\":\"Named models unavailable\"}}"}]}}"#
+				.as_slice(),
+			br#"{"error":{"code":"resource_exhausted","details":[{"value":{"error":"ERROR_RATE_LIMITED_CHANGEABLE","details":{"title":"Temporary capacity unavailable"}}}]}}"#
+				.as_slice(),
+		] {
+			let error = classify(payload);
+			assert_eq!(error.kind, ErrorKind::ResourceExhausted);
+			assert_ne!(error.code.as_deref(), Some("cursor_plan_gate"));
+		}
 	}
 
 	#[test]

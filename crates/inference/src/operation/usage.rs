@@ -15,15 +15,14 @@ pub mod synthetic;
 pub mod umans;
 pub mod xai_oauth;
 pub mod zai;
-
 use std::{
-	collections::HashMap,
-	future::Future,
+		future::Future,
 	sync::Arc,
 	task::{Context, Poll},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use dashmap::DashMap;
 use omp_core::{SecretString, Str, sf};
 use tower::Service;
 
@@ -47,6 +46,9 @@ use crate::{
 pub enum UsageCredentialRequirement {
 	/// A fresh scalar credential lease is required.
 	Required,
+	/// A scalar lease is forwarded when the provider has one, but anonymous
+	/// callbacks remain valid.
+	Optional,
 	/// The provider exposes usage without credentials or network authentication.
 	None,
 }
@@ -54,8 +56,7 @@ pub enum UsageCredentialRequirement {
 /// Typed, secret-free usage-fetch failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum UsageFetchError {
-	/// The provider is temporarily unavailable; callers may retain last-good
-	/// data.
+	/// The provider is temporarily unavailable; callers may retain last-good data.
 	#[error("usage endpoint is temporarily unavailable")]
 	Unavailable,
 	/// The provider rejected the credential and account health must be updated.
@@ -67,17 +68,11 @@ pub enum UsageFetchError {
 }
 
 /// Secret-bearing provider usage boundary installed by the application.
-///
-/// Implementations own their HTTP transport and return only normalized,
-/// secret-free observations. `fetch` receives `None` exactly when
-/// `credential_requirement` returns [`UsageCredentialRequirement::None`].
 pub trait ConsoleUsageFetcher: Send + Sync {
 	/// Provider whose credential envelopes this fetcher understands.
 	fn provider(&self) -> &ProviderId<str>;
-
 	/// Declares whether the manager must acquire a credential lease.
 	fn credential_requirement(&self) -> UsageCredentialRequirement;
-
 	/// Fetches usage under the supplied deadline.
 	fn fetch<'a>(
 		&'a self,
@@ -94,7 +89,7 @@ pub struct ConsoleUsageObservation {
 	pub account_meta:  UsageAccountMetadata,
 	/// Provider plan or tier display name.
 	pub plan:          Option<Str>,
-	/// Provider-defined source label such as `bailian-console`.
+	/// Provider-defined source label.
 	pub source_label:  Option<Str>,
 	/// Provider-wide advisory notes.
 	pub notes:         Box<[Str]>,
@@ -104,26 +99,110 @@ pub struct ConsoleUsageObservation {
 	pub windows:       Vec<UsageWindow>,
 }
 
-/// Immutable provider-id registry for console usage fetchers.
+#[derive(Clone)]
+struct RuntimeUsageFetcher {
+	registration: Str,
+	fetcher:      Arc<dyn ConsoleUsageFetcher>,
+}
+
+#[derive(Default)]
+struct UsageFetcherState {
+	builtins:    DashMap<ProviderId, Arc<dyn ConsoleUsageFetcher>>,
+	overrides:   DashMap<ProviderId, Vec<RuntimeUsageFetcher>>,
+	generations: DashMap<ProviderId, u64>,
+}
+
+/// Clone-cheap provider-id registry for built-in and runtime usage fetchers.
+///
+/// Runtime registrations are scoped by an opaque registration id. The newest
+/// registration for a provider wins; removing it restores the previous
+/// registration or built-in without disturbing other providers.
 #[derive(Clone, Default)]
 pub struct UsageFetcherRegistry {
-	fetchers: Arc<HashMap<ProviderId, Arc<dyn ConsoleUsageFetcher>>>,
+	state: Arc<UsageFetcherState>,
 }
 
 impl UsageFetcherRegistry {
-	/// Builds one immutable registry, retaining the last fetcher for duplicate
-	/// provider ids.
+	/// Builds one registry and installs its built-in fetchers.
 	pub fn new(fetchers: impl IntoIterator<Item = Arc<dyn ConsoleUsageFetcher>>) -> Self {
-		let fetchers = fetchers
-			.into_iter()
-			.map(|fetcher| (fetcher.provider().to_owned(), fetcher))
-			.collect();
-		Self { fetchers: Arc::new(fetchers) }
+		let registry = Self::default();
+		registry.install_builtins(fetchers);
+		registry
 	}
 
-	fn get(&self, provider: &ProviderId<str>) -> Option<&Arc<dyn ConsoleUsageFetcher>> {
-		self.fetchers.get(provider)
+	/// Installs built-in fetchers into a shared preallocated registry handle.
+	pub fn install_builtins(
+		&self,
+		fetchers: impl IntoIterator<Item = Arc<dyn ConsoleUsageFetcher>>,
+	) {
+		for fetcher in fetchers {
+			self.state.builtins.insert(fetcher.provider().to_owned(), fetcher);
+		}
 	}
+
+	/// Installs or replaces one registration-scoped runtime override.
+	///
+	/// Re-registering the same id replaces its callback and moves it to the
+	/// front of precedence. The returned generation is suitable for inclusion
+	/// in a caller's provider-report cache key.
+	pub fn register_runtime(
+		&self,
+		registration: impl Into<Str>,
+		fetcher: Arc<dyn ConsoleUsageFetcher>,
+	) -> u64 {
+		let registration = registration.into();
+		let provider = fetcher.provider().to_owned();
+		let mut entries = self.state.overrides.entry(provider.clone()).or_default();
+		entries.retain(|entry| entry.registration != registration);
+		entries.push(RuntimeUsageFetcher { registration, fetcher });
+		drop(entries);
+		bump_usage_generation(&self.state, &provider)
+	}
+
+	/// Removes one exact runtime registration and restores its predecessor.
+	///
+	/// Returns the new cache generation when a registration was removed.
+	pub fn unregister_runtime(
+		&self,
+		provider: &ProviderId<str>,
+		registration: &str,
+	) -> Option<u64> {
+		let mut entries = self.state.overrides.get_mut(provider)?;
+		let before = entries.len();
+		entries.retain(|entry| entry.registration != registration);
+		if entries.len() == before {
+			return None;
+		}
+		let empty = entries.is_empty();
+		drop(entries);
+		if empty {
+			self.state.overrides.remove(provider);
+		}
+		Some(bump_usage_generation(&self.state, provider))
+	}
+
+	/// Returns the provider-scoped cache generation.
+	///
+	/// Every effective registration or unregistration increments this value,
+	/// invalidating snapshots fetched through an earlier implementation.
+	pub fn cache_generation(&self, provider: &ProviderId<str>) -> u64 {
+		self.state.generations.get(provider).map(|generation| *generation).unwrap_or_default()
+	}
+
+	fn get(&self, provider: &ProviderId<str>) -> Option<Arc<dyn ConsoleUsageFetcher>> {
+		self
+			.state
+			.overrides
+			.get(provider)
+			.and_then(|entries| entries.last().map(|entry| Arc::clone(&entry.fetcher)))
+			.or_else(|| self.state.builtins.get(provider).map(|fetcher| Arc::clone(&*fetcher)))
+	}
+}
+
+fn bump_usage_generation(state: &UsageFetcherState, provider: &ProviderId<str>) -> u64 {
+	let mut generation = state.generations.entry(provider.to_owned()).or_default();
+	*generation = generation.saturating_add(1);
+	*generation
 }
 
 /// Route-independent provider console usage dispatcher.
@@ -151,6 +230,10 @@ impl ConsoleUsageManager {
 		fetchers: UsageFetcherRegistry,
 	) -> Self {
 		Self { catalog, credentials, accounts, fetchers }
+	}
+	/// Returns the shared registry used for runtime usage-provider overlays.
+	pub fn fetchers(&self) -> UsageFetcherRegistry {
+		self.fetchers.clone()
 	}
 
 	/// Fetches and normalizes usage for one planned provider route.
@@ -182,15 +265,15 @@ impl ConsoleUsageManager {
 			},
 			None => return Err(usage_error("console_usage_account_missing")),
 		};
-		let lease = match fetcher.credential_requirement() {
-			UsageCredentialRequirement::Required => {
-				let route_def = self
+		let credential_requirement = fetcher.credential_requirement();
+		let lease = match credential_requirement {
+			UsageCredentialRequirement::Required | UsageCredentialRequirement::Optional => {
+				let acquired = match self
 					.catalog
 					.route(route)
 					.filter(|definition| &definition.provider == provider)
-					.ok_or_else(|| usage_error("console_usage_route_missing"))?;
-				Some(
-					self
+				{
+					Some(route_def) => self
 						.credentials
 						.lease(CredentialNeed {
 							spec:        route_def.auth.clone(),
@@ -199,19 +282,22 @@ impl ConsoleUsageManager {
 							valid_after: SystemTime::now(),
 						})
 						.await
-						.map_err(|_| usage_error("console_usage_credential_unavailable"))?,
-				)
+						.ok(),
+					None => None,
+				};
+				if credential_requirement == UsageCredentialRequirement::Required
+					&& acquired.is_none()
+				{
+					return Err(usage_error("console_usage_credential_unavailable"));
+				}
+				acquired
 			},
 			UsageCredentialRequirement::None => None,
 		};
-		let credential = match lease.as_ref() {
-			Some(lease) => Some(
-				lease
-					.scalar_secret()
-					.ok_or_else(|| usage_error("console_usage_credential_kind_unsupported"))?,
-			),
-			None => None,
-		};
+		let credential = lease.as_ref().and_then(|lease| lease.scalar_secret());
+		if credential_requirement == UsageCredentialRequirement::Required && credential.is_none() {
+			return Err(usage_error("console_usage_credential_kind_unsupported"));
+		}
 		let observed_at = SystemTime::now();
 		let fetched = match fetcher.fetch(credential, observed_at, deadline).await {
 			Ok(fetched) => fetched,
@@ -672,11 +758,20 @@ fn protocol_error(reason: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use std::time::{self, Duration, UNIX_EPOCH};
+	use std::{
+		sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		},
+		time::{self, Duration, UNIX_EPOCH},
+	};
 
 	use omp_core::sf;
 
-	use super::{UsageServiceConfig, normalize_report, report_from_account_state};
+	use super::{
+		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
+		UsageFetcherRegistry, UsageServiceConfig, normalize_report, report_from_account_state,
+	};
 	use crate::{
 		account::{QuotaObservation, QuotaProvenance, QuotaState, QuotaWindowId, RateState},
 		answer::{UsageQuantity, UsageUnit, UsageWindowKind},
@@ -690,6 +785,30 @@ mod tests {
 	}
 	fn late() -> time::SystemTime {
 		UNIX_EPOCH + Duration::from_secs(300)
+	}
+	struct CountingFetcher {
+		provider: ProviderId,
+		calls:    Arc<AtomicUsize>,
+	}
+
+	impl ConsoleUsageFetcher for CountingFetcher {
+		fn provider(&self) -> &ProviderId<str> {
+			&self.provider
+		}
+
+		fn credential_requirement(&self) -> UsageCredentialRequirement {
+			UsageCredentialRequirement::None
+		}
+
+		fn fetch<'a>(
+			&'a self,
+			_credential: Option<&'a omp_core::SecretString>,
+			_now: time::SystemTime,
+			_deadline: Option<time::Instant>,
+		) -> futures::future::BoxFuture<'a, Result<ConsoleUsageObservation, UsageFetchError>> {
+			self.calls.fetch_add(1, Ordering::Relaxed);
+			Box::pin(async { Err(UsageFetchError::Unavailable) })
+		}
 	}
 
 	#[test]
@@ -858,5 +977,50 @@ mod tests {
 			},)
 			.is_err()
 		);
+	}
+	#[tokio::test]
+	async fn runtime_usage_overrides_restore_and_invalidate_per_provider() {
+		let provider = ProviderId::from("extension");
+		let other = ProviderId::from("other");
+		let builtin_calls = Arc::new(AtomicUsize::new(0));
+		let first_calls = Arc::new(AtomicUsize::new(0));
+		let second_calls = Arc::new(AtomicUsize::new(0));
+		let registry = UsageFetcherRegistry::new([
+			Arc::new(CountingFetcher {
+				provider: provider.clone(),
+				calls: Arc::clone(&builtin_calls),
+			}) as Arc<dyn ConsoleUsageFetcher>,
+			Arc::new(CountingFetcher {
+				provider: other.clone(),
+				calls: Arc::new(AtomicUsize::new(0)),
+			}),
+		]);
+		assert_eq!(registry.cache_generation(&provider), 0);
+		let first_generation = registry.register_runtime(
+			"extension-a",
+			Arc::new(CountingFetcher {
+				provider: provider.clone(),
+				calls: Arc::clone(&first_calls),
+			}),
+		);
+		let second_generation = registry.register_runtime(
+			"extension-b",
+			Arc::new(CountingFetcher {
+				provider: provider.clone(),
+				calls: Arc::clone(&second_calls),
+			}),
+		);
+		assert_eq!(first_generation, 1);
+		assert_eq!(second_generation, 2);
+		assert_eq!(registry.cache_generation(&other), 0);
+		let _ = registry.get(&provider).expect("latest override").fetch(None, now(), None).await;
+		assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+		assert_eq!(registry.unregister_runtime(&provider, "extension-b"), Some(3));
+		let _ = registry.get(&provider).expect("previous override").fetch(None, now(), None).await;
+		assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+		assert_eq!(registry.unregister_runtime(&provider, "extension-a"), Some(4));
+		let _ = registry.get(&provider).expect("restored builtin").fetch(None, now(), None).await;
+		assert_eq!(builtin_calls.load(Ordering::Relaxed), 1);
+		assert_eq!(registry.unregister_runtime(&provider, "missing"), None);
 	}
 }

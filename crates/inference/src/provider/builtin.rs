@@ -36,7 +36,7 @@ use crate::{
 		EncodedRequest, HandshakenResponse, NativeResponseFormat, RealtimeWireCodecState,
 		RequestHeader, TransportAttempt, TransportRequest,
 		anthropic::AnthropicCodec,
-		bedrock::BedrockConverseCodec,
+		bedrock::{BedrockConverseCodec, BedrockGuardrail, BedrockOptions, guardrail_arn_region},
 		cursor::CursorCodec,
 		devin::DevinCodec,
 		discovery::{
@@ -309,6 +309,12 @@ impl RouteComposer for ProductionRouteComposer {
 		catalog: &Catalog,
 		route: &RouteDef,
 	) -> Result<RouteProviderService, RouteUnavailable> {
+		let bedrock_guardrail = configured_bedrock_guardrail(&self.dependencies.settings, route);
+		let bedrock_ambient_region = self
+			.dependencies
+			.auth_application
+			.signing_regions
+			.get(&route.id);
 		let (mut binding, wire, framework_timeout) = match route.transport {
 			TransportKind::Local => {
 				let backend = self
@@ -346,6 +352,8 @@ impl RouteComposer for ProductionRouteComposer {
 					route,
 					&self.dependencies.google_cca,
 					self.dependencies.settings.retry.server_side_fallback,
+					bedrock_guardrail,
+					bedrock_ambient_region,
 				)?,
 				WireService::new(self.dependencies.http.clone()),
 				self.dependencies.transport_timeout,
@@ -355,6 +363,8 @@ impl RouteComposer for ProductionRouteComposer {
 					route,
 					&self.dependencies.google_cca,
 					self.dependencies.settings.retry.server_side_fallback,
+					bedrock_guardrail,
+					bedrock_ambient_region,
 				)?,
 				WireService::new(self.dependencies.websocket.clone()),
 				self.dependencies.transport_timeout,
@@ -390,13 +400,32 @@ impl RouteComposer for ProductionRouteComposer {
 			.ok_or_else(|| unavailable(route, "catalog-auth-spec-missing"))?;
 		let authenticated = auth.kind != AuthSpecKind::None;
 		let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
-		let signing_region = self
-			.dependencies
-			.auth_application
-			.signing_regions
-			.get(&route.id)
-			.cloned()
-			.or_else(|| route.endpoint.region.clone());
+		let signing_region = route
+			.endpoint
+			.region
+			.clone()
+			.or_else(|| {
+				self
+					.dependencies
+					.auth_application
+					.signing_regions
+					.get(&route.id)
+					.cloned()
+			})
+			.or_else(|| {
+				bedrock_guardrail
+					.and_then(|guardrail| guardrail_arn_region(guardrail.identifier.as_str()))
+					.map(Str::new)
+			})
+			.or_else(|| {
+				(route.codec.as_str() == "bedrock-converse")
+					.then(|| {
+						crate::codec::anthropic::endpoint_region(
+							route.endpoint.base_url.as_str(),
+						)
+						.map_or_else(|| sf!("us-east-1"), Str::new)
+					})
+			});
 		let runtime_auth = AuthSpec::from_catalog(auth, oauth, signing_region.clone())
 			.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
 		let mut auth_specs = vec![(route.auth.clone(), runtime_auth)];
@@ -502,6 +531,14 @@ struct CodecBinding {
 	embedding:                 Option<EmbeddingRoutePolicy>,
 	openai_embedding_override: bool,
 }
+fn configured_bedrock_guardrail<'a>(
+	settings: &'a InferenceSettings,
+	route: &RouteDef,
+) -> Option<&'a BedrockGuardrail> {
+	(route.codec.as_str() == "bedrock-converse")
+		.then(|| settings.providers.bedrock_guardrails.get(route.provider.as_str()))
+		.flatten()
+}
 
 fn operation_bits(kinds: &[OperationKind]) -> OperationBits {
 	let mut bits = OperationBits::empty();
@@ -545,6 +582,8 @@ fn codec_binding(
 	route: &RouteDef,
 	cca: &GoogleCcaConfig,
 	server_side_fallback: bool,
+	bedrock_guardrail: Option<&BedrockGuardrail>,
+	bedrock_ambient_region: Option<&Str>,
 ) -> Result<CodecBinding, RouteUnavailable> {
 	let (primary, supported, embedding, openai_embedding_override): (
 		Arc<dyn Codec>,
@@ -561,7 +600,11 @@ fn codec_binding(
 			false,
 		),
 		("bedrock-converse", CodecProfile::Standard) => (
-			Arc::new(BedrockConverseCodec::default()),
+			Arc::new(BedrockConverseCodec::new(BedrockOptions {
+				guardrail: bedrock_guardrail.cloned(),
+				..BedrockOptions::default()
+			})
+			.with_ambient_region(bedrock_ambient_region.cloned())),
 			operation_bits(&[OperationKind::Chat, OperationKind::DiscoverModels]),
 			None,
 			false,
@@ -1365,8 +1408,20 @@ impl CredentialApplier<RouteAccount, Option<CredentialLease>> for RouteCredentia
 			(None, _) => Err(authentication_error(context, "credential-auth-spec-missing")),
 			(_, None) => Err(authentication_error(context, "credential-lease-missing")),
 			(_, Some(lease)) => {
+				let signing_region = crate::codec::anthropic::endpoint_region(
+					request.encoded.uri.as_str(),
+				)
+				.map(Str::new);
 				for auth in &self.auth {
-					match lease.prepare(auth, SystemTime::now()) {
+					let prepared = match (auth, signing_region.as_ref()) {
+						(AuthSpec::AwsSigV4(spec), Some(region)) if &spec.region != region => {
+							let mut resolved = spec.clone();
+							resolved.region = region.clone();
+							lease.prepare(&AuthSpec::AwsSigV4(resolved), SystemTime::now())
+						},
+						_ => lease.prepare(auth, SystemTime::now()),
+					};
+					match prepared {
 						Ok(credentials) => {
 							request.credentials = Some(credentials);
 							return Ok(());
@@ -1548,6 +1603,47 @@ mod tests {
 			SecretString::from(secret.to_owned()),
 		)
 	}
+	#[test]
+	fn static_and_runtime_bedrock_routes_inherit_provider_guardrails() {
+		let catalog = Catalog::embedded();
+		let static_route = catalog
+			.routes()
+			.iter()
+			.find(|route| {
+				route.provider.as_str() == "amazon-bedrock"
+					&& route.codec.as_str() == "bedrock-converse"
+			})
+			.expect("static Bedrock route");
+		let mut runtime_route = static_route.clone();
+		runtime_route.provider = ProviderId::new("runtime-bedrock");
+		let static_guardrail = BedrockGuardrail {
+			identifier:  sf!("arn:aws:bedrock:eu-west-1:123456789012:guardrail/static"),
+			version:     sf!("7"),
+			trace:       crate::codec::bedrock::GuardrailTraceMode::EnabledFull,
+			stream_mode: crate::codec::bedrock::GuardrailStreamMode::Sync,
+		};
+		let runtime_guardrail = BedrockGuardrail {
+			identifier: sf!("runtime-guardrail"),
+			..static_guardrail.clone()
+		};
+		let mut settings = InferenceSettings::default();
+		settings
+			.providers
+			.bedrock_guardrails
+			.insert(sf!("amazon-bedrock"), static_guardrail.clone());
+		settings
+			.providers
+			.bedrock_guardrails
+			.insert(sf!("runtime-bedrock"), runtime_guardrail.clone());
+		assert_eq!(
+			configured_bedrock_guardrail(&settings, static_route),
+			Some(&static_guardrail),
+		);
+		assert_eq!(
+			configured_bedrock_guardrail(&settings, &runtime_route),
+			Some(&runtime_guardrail),
+		);
+	}
 
 	fn discovery_fixture() -> (RouteEncoder, Call, RouteAccount, AuthSpec, ProviderId, Str) {
 		let catalog = Catalog::try_embedded().expect("embedded catalog");
@@ -1568,7 +1664,7 @@ mod tests {
 			),
 			antigravity_policy:  AntigravityPolicy::default(),
 		};
-		let binding = codec_binding(&route, &cca, false).expect("route codec binding");
+		let binding = codec_binding(&route, &cca, false, None, None).expect("route codec binding");
 		let codec = discovery_codec(catalog, &route, &binding)
 			.expect("discovery codec")
 			.expect("route supports discovery");
@@ -1724,6 +1820,59 @@ mod tests {
 		);
 		assert_applied_bearer(transport, &account, auth, raw, &context, "Bearer raw");
 	}
+	#[test]
+	fn bedrock_endpoint_region_overrides_the_sigv4_scope() {
+		let (encoder, call, account, _, provider, _) = discovery_fixture();
+		let context = ExecutionContext::new(call.budget.clone());
+		let mut transport = encoder
+			.encode(
+				&call,
+				&Some(lease(&provider, "unused")),
+				&context,
+				0,
+				false,
+				Cancellation::default(),
+			)
+			.expect("encode request");
+		transport.encoded.uri =
+			sf!("https://bedrock-runtime.eu-west-2.amazonaws.com/model/test/converse-stream");
+		let auth = AuthSpec::AwsSigV4(crate::auth::SigV4Spec {
+			service:          sf!("bedrock"),
+			region:           sf!("us-east-1"),
+			unsigned_headers: Vec::new(),
+		});
+		let aws = CredentialLease::aws_sigv4(
+			LeaseMeta {
+				account:    AccountId::new("aws"),
+				principal:  PrincipalId::new("amazon-bedrock"),
+				generation: 1,
+				expires_at: None,
+			},
+			SecretString::from("AKIDEXAMPLE".to_owned()),
+			SecretString::from("secret".to_owned()),
+			None,
+		);
+		RouteCredentialApplier { auth: Box::new([auth]) }
+			.apply(&account, Some(aws), &mut transport, &context)
+			.expect("prepare SigV4 credentials");
+		let credentials = transport.credentials.take().expect("prepared credentials");
+		let mut request = Request::builder()
+			.method("POST")
+			.uri(transport.encoded.uri.as_str())
+			.body(Bytes::new())
+			.expect("HTTP request");
+		credentials
+			.finalize_buffered(&mut request)
+			.expect("apply SigV4 credentials");
+		let authorization = request
+			.headers()
+			.get(AUTHORIZATION)
+			.expect("authorization")
+			.to_str()
+			.expect("ASCII authorization");
+		assert!(authorization.contains("/eu-west-2/bedrock/aws4_request"));
+		assert!(!authorization.contains("/us-east-1/bedrock/aws4_request"));
+	}
 
 	#[test]
 	fn dynamic_endpoint_reseeds_state_bound_to_the_catalog_origin() {
@@ -1799,7 +1948,7 @@ mod tests {
 			),
 			antigravity_policy:  AntigravityPolicy::default(),
 		};
-		let binding = codec_binding(&route, &cca, false).expect("route codec binding");
+		let binding = codec_binding(&route, &cca, false, None, None).expect("route codec binding");
 		let codec = RouteCodecSet::for_route(
 			&route,
 			OperationBits::for_kind(OperationKind::Realtime),

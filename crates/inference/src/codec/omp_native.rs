@@ -426,6 +426,12 @@ impl OmpNativeDecoder {
 				(ErrorKind::DeadlineExceeded, "omp_turn_invoke_timeout")
 			},
 			turn_error::Kind::EmptyOutput => (ErrorKind::EmptyOutput, "omp_turn_empty_output"),
+			turn_error::Kind::ContextOverflow => {
+				(ErrorKind::ContextOverflow, "omp_turn_context_overflow")
+			},
+			turn_error::Kind::PayloadRejected => {
+				(ErrorKind::PayloadRejected, "omp_turn_payload_rejected")
+			},
 			turn_error::Kind::Upstream | turn_error::Kind::Unspecified => {
 				(ErrorKind::Protocol, "omp_turn_upstream")
 			},

@@ -432,6 +432,8 @@ pub struct ProviderRuntimeSettings {
 	/// Overall logical-call timeout in seconds; zero leaves caller deadlines
 	/// authoritative.
 	pub call_timeout_seconds: u64,
+	/// Bedrock guardrail policy keyed by provider id.
+	pub bedrock_guardrails:   BTreeMap<Str, crate::codec::bedrock::BedrockGuardrail>,
 }
 
 impl Default for ProviderRuntimeSettings {
@@ -441,6 +443,7 @@ impl Default for ProviderRuntimeSettings {
 			max_queued:           64,
 			timeout_seconds:      300,
 			call_timeout_seconds: 0,
+			bedrock_guardrails: BTreeMap::new(),
 		}
 	}
 }
@@ -478,6 +481,7 @@ impl SettingsDomain for ProviderRuntimeSettings {
 		field("provider_runtime.max_queued", "Maximum Queued Requests", SettingKind::Integer, 20),
 		field("provider_runtime.timeout_seconds", "Transport Timeout", SettingKind::Integer, 30),
 		field("provider_runtime.call_timeout_seconds", "Call Timeout", SettingKind::Integer, 40),
+		field("provider_runtime.bedrock_guardrails", "Bedrock Guardrails", SettingKind::Table, 50),
 	];
 
 	fn validate(&self) -> Result<(), ValidationError> {
@@ -489,6 +493,11 @@ impl SettingsDomain for ProviderRuntimeSettings {
 				.max_in_flight
 				.iter()
 				.all(|(provider, limit)| !provider.is_empty() && *limit <= 100_000)
+			&& self.bedrock_guardrails.iter().all(|(provider, guardrail)| {
+				!provider.trim().is_empty()
+					&& !guardrail.identifier.trim().is_empty()
+					&& !guardrail.version.trim().is_empty()
+			})
 		{
 			Ok(())
 		} else {

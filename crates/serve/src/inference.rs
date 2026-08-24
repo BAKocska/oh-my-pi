@@ -1787,6 +1787,7 @@ fn inference_status(error: Error) -> Status {
 		ErrorKind::Cancelled => Status::cancelled(message),
 		ErrorKind::DeadlineExceeded => Status::deadline_exceeded(message),
 		ErrorKind::InvalidRequest
+		| ErrorKind::PayloadRejected
 		| ErrorKind::CodecMismatch
 		| ErrorKind::CapabilityMismatch
 		| ErrorKind::NativeRequestRejected => Status::invalid_argument(message),
@@ -1817,6 +1818,8 @@ fn inference_turn_error(error: Error) -> pb::TurnEvent {
 		ErrorKind::RateLimited | ErrorKind::QuotaExhausted => turn_error::Kind::RateLimited,
 		ErrorKind::BudgetExhausted | ErrorKind::ResourceExhausted => turn_error::Kind::Overloaded,
 		ErrorKind::EmptyOutput | ErrorKind::EmptyCompletion => turn_error::Kind::EmptyOutput,
+		ErrorKind::ContextOverflow => turn_error::Kind::ContextOverflow,
+		ErrorKind::PayloadRejected => turn_error::Kind::PayloadRejected,
 		_ => turn_error::Kind::Upstream,
 	};
 	let detail = if error.kind == ErrorKind::Authentication {
@@ -1855,7 +1858,9 @@ fn inference_turn_error(error: Error) -> pb::TurnEvent {
 		detail
 	};
 	let retry_after_ms = match error.action {
-		RetryAction::SameRoute { after } => after.as_millis().try_into().unwrap_or(u64::MAX),
+		RetryAction::SameRoute { after } | RetryAction::SameRouteLimited { after, .. } => {
+			after.as_millis().try_into().unwrap_or(u64::MAX)
+		},
 		_ => 0,
 	};
 	let diagnostics = if kind == turn_error::Kind::EmptyOutput {

@@ -12,8 +12,6 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use omp_core::{IntoStr, Str, encoding::base64, sf};
 use prost::Message as _;
 use prost_types::FileDescriptorSet;
-use serde::Deserialize;
-
 use crate::{
 	auth::CredentialApplyError,
 	body::BodySource,
@@ -26,6 +24,7 @@ use crate::{
 		RawEvent, RequestHeader, RequestMethod, SealedBodyTemplate, SizeBounds, ToolInputKind,
 		UnvalidatedToolCall,
 	},
+	codec::connect::parse_connect_end_stream,
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
 	id::ToolCallId,
@@ -945,29 +944,19 @@ impl CascadeDecoder {
 		if payload.is_empty() {
 			return Ok(());
 		}
-		let trailer: ConnectEndStream = serde_json::from_slice(payload)
+		let diagnostic = parse_connect_end_stream(payload)
 			.map_err(|_| protocol_error(ErrorPhase::Streaming, "devin.connect.end_stream"))?;
-		if let Some(error) = trailer.error {
+		if let Some(diagnostic) = diagnostic {
 			let failure = protocol_error(ErrorPhase::Streaming, "devin.connect.provider_status")
-				.code(error.code)
+				.code(diagnostic.code.clone())
+				.detail(ErrorDetail::provider(
+					diagnostic.display_message_with_prefix("Devin stream error"),
+				))
 				.committed(self.next_index != 0);
 			emit(RawEvent::Failure(failure));
 		}
 		Ok(())
 	}
-}
-
-#[derive(Deserialize)]
-struct ConnectEndStream {
-	#[serde(default)]
-	error: Option<ConnectStatus>,
-}
-
-#[derive(Deserialize)]
-struct ConnectStatus {
-	code:     Str,
-	#[serde(rename = "message")]
-	_message: Str,
 }
 
 /// Classifies a Connect status with explicit request evidence rather than
@@ -1270,6 +1259,70 @@ mod tests {
 		});
 		assert_eq!(with.kind, ErrorKind::ContextOverflow);
 		assert_eq!(with.action, RetryAction::Never);
+	}
+	fn decode_trailer_failure(payload: &[u8]) -> Error {
+		let decoder = CascadeDecoder::default();
+		let mut events = Vec::new();
+		decoder
+			.push_end_stream(payload, &mut |event| events.push(event))
+			.expect("trailer decodes");
+		let Some(RawEvent::Failure(error)) = events.pop() else {
+			panic!("error trailer must emit one failure");
+		};
+		error
+	}
+
+	#[test]
+	fn connect_trailer_preserves_structured_error_and_debug_info() {
+		let error = decode_trailer_failure(
+			br#"{"error":{"code":"invalid_argument","message":"Error","details":[{"type":"google.rpc.ErrorInfo","value":{"reason":"MODEL_UNAVAILABLE","domain":"devin"}},{"type":"google.rpc.DebugInfo","debug":{"detail":"field X rejected"}}]}}"#,
+		);
+		assert_eq!(error.kind, ErrorKind::Protocol);
+		assert_eq!(error.action, RetryAction::Never);
+		assert_eq!(error.code.as_deref(), Some("invalid_argument"));
+		let Some(ErrorDetail::Provider { sanitized_message }) = error.detail_ref() else {
+			panic!("display diagnostic must remain supplemental provider evidence");
+		};
+		assert!(sanitized_message.starts_with("Devin stream error invalid_argument: Error"));
+		assert!(sanitized_message.contains("google.rpc.ErrorInfo"));
+		assert!(sanitized_message.contains("MODEL_UNAVAILABLE"));
+		assert!(sanitized_message.contains("google.rpc.DebugInfo"));
+		assert!(sanitized_message.contains("field X rejected"));
+	}
+
+	#[test]
+	fn connect_trailer_uses_fallback_detail_without_changing_classification() {
+		let error = decode_trailer_failure(
+			br#"{"error":{"code":"invalid_argument","message":"Error","details":{"opaque":"fallback evidence"}}}"#,
+		);
+		assert_eq!(error.kind, ErrorKind::Protocol);
+		assert_eq!(error.action, RetryAction::Never);
+		assert_eq!(error.code.as_deref(), Some("invalid_argument"));
+		let Some(ErrorDetail::Provider { sanitized_message }) = error.detail_ref() else {
+			panic!("fallback diagnostic must remain supplemental provider evidence");
+		};
+		assert!(sanitized_message.contains("fallback evidence"));
+	}
+
+	#[test]
+	fn connect_trailer_diagnostic_cap_is_exact_and_does_not_reclassify() {
+		let payload = serde_json::to_vec(&serde_json::json!({
+			"error": {
+				"code": "invalid_argument",
+				"message": "Error",
+				"details": [{"type": "google.rpc.DebugInfo", "debug": "x".repeat(4_000)}]
+			}
+		}))
+		.expect("payload");
+		let error = decode_trailer_failure(&payload);
+		assert_eq!(error.kind, ErrorKind::Protocol);
+		assert_eq!(error.action, RetryAction::Never);
+		assert_eq!(error.code.as_deref(), Some("invalid_argument"));
+		let Some(ErrorDetail::Provider { sanitized_message }) = error.detail_ref() else {
+			panic!("bounded diagnostic must remain supplemental provider evidence");
+		};
+		assert_eq!(sanitized_message.chars().count(), crate::codec::connect::MAX_CONNECT_DIAGNOSTIC_CHARS);
+		assert!(sanitized_message.ends_with('…'));
 	}
 
 	#[test]

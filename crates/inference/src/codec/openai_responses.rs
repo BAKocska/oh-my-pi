@@ -3,6 +3,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	mem,
+	time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -1384,6 +1385,20 @@ impl OpenAiResponsesDecoder {
 					| OutputSlot::Computer { .. }
 			)
 		})
+	}
+	fn has_reasoning_only_output(&self) -> bool {
+		let mut saw_reasoning = false;
+		for slot in self.outputs.values() {
+			match slot {
+				OutputSlot::Thinking { .. } => saw_reasoning = true,
+				OutputSlot::Text { .. }
+				| OutputSlot::Tool { .. }
+				| OutputSlot::Computer { .. }
+				| OutputSlot::Hosted { .. }
+				| OutputSlot::Image { .. } => return false,
+			}
+		}
+		saw_reasoning && !self.saw_visible_output && !self.saw_completed_hosted_tool
 	}
 
 	/// Returns whether an authoritative terminal event was received.
@@ -3101,6 +3116,7 @@ struct ResponsesDecoderAdapter {
 	provider:   ProviderId,
 	route:      RouteId,
 	wire_model: Option<Str>,
+	thinking_close_max_retries: Option<u32>,
 }
 
 impl ResponsesDecoderAdapter {
@@ -3177,8 +3193,19 @@ impl ResponsesDecoderAdapter {
 				self.wire_model.as_deref(),
 				evidence.message.as_str(),
 			);
+		let bounded_thinking_close = evidence.code.as_deref() == Some("premature_end")
+			&& self.thinking_close_max_retries.is_some()
+			&& self.inner.has_reasoning_only_output();
 		let (kind, action) = if model_policy_denial {
 			(ErrorKind::Authorization, RetryAction::RotateAccount)
+		} else if let Some(max_retries) = self
+			.thinking_close_max_retries
+			.filter(|_| bounded_thinking_close)
+		{
+			(ErrorKind::Protocol, RetryAction::SameRouteLimited {
+				after: Duration::ZERO,
+				max_retries,
+			})
 		} else {
 			match evidence.continuation {
 				ResponsesContinuationFailure::StalePreviousResponse
@@ -3196,12 +3223,13 @@ impl ResponsesDecoderAdapter {
 		} else {
 			evidence.code
 		};
+		let committed = !bounded_thinking_close && self.inner.committed_output();
 		Error::new(kind, ErrorPhase::Streaming, action, ExecutionReceipt::default())
 			.provider(self.provider.clone())
 			.route(self.route.clone())
 			.request_id(self.request_id.clone())
 			.optional_code(code)
-			.committed(self.inner.committed_output())
+			.committed(committed)
 	}
 }
 
@@ -3347,13 +3375,14 @@ impl Codec for OpenAiResponsesCodec {
 			wire_model: context
 				.target
 				.map(|target| Str::new(target.wire_model.as_str())),
+			thinking_close_max_retries: context.policy.streaming.thinking_close_max_retries,
 		}))
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use std::{sync::Arc, time::Duration};
 
 	use omp_catalog::{Catalog, ReasoningEffort, RouteDef, ThinkingEffort, WireTarget, policy};
 	use omp_core::{Str, sf};
@@ -4110,6 +4139,7 @@ mod tests {
 			provider:   ProviderId::from("openai-codex"),
 			route:      RouteId::from("openai-codex/primary"),
 			wire_model: Some(sf!("gpt-daybreak-blue-latest")),
+			thinking_close_max_retries: None,
 		};
 		let denial = adapter.error_from_evidence(ResponsesErrorEvidence {
 			code:         None,
@@ -4132,6 +4162,36 @@ mod tests {
 		});
 		assert_eq!(unrelated.kind, ErrorKind::Protocol);
 		assert_eq!(unrelated.action, RetryAction::Never);
+	}
+	#[test]
+	fn reasoning_only_premature_close_uses_catalog_retry_cap() {
+		use crate::error::{ErrorKind, RetryAction};
+
+		let mut adapter = ResponsesDecoderAdapter {
+			inner: OpenAiResponsesDecoder::default(),
+			request_id: RequestId::new("request"),
+			provider: ProviderId::from("github-copilot"),
+			route: RouteId::from("github-copilot/responses"),
+			wire_model: Some(sf!("grok-4.6")),
+			thinking_close_max_retries: Some(1),
+		};
+		adapter.inner.push_json(
+			br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+		);
+		adapter.inner.push_json(
+			br#"{"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":0,"delta":"thinking"}"#,
+		);
+		let error = adapter.error_from_evidence(ResponsesErrorEvidence {
+			code: Some(sf!("premature_end")),
+			message: sf!("Responses stream ended before an authoritative terminal event"),
+			continuation: ResponsesContinuationFailure::NotStale,
+		});
+		assert_eq!(error.kind, ErrorKind::Protocol);
+		assert_eq!(
+			error.action,
+			RetryAction::SameRouteLimited { after: Duration::ZERO, max_retries: 1 },
+		);
+		assert!(!error.committed);
 	}
 
 	#[test]

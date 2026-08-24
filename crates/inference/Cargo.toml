@@ -36,6 +36,7 @@ local-tts = [
 ]
 
 [dependencies]
+dashmap.workspace = true
 arc-swap = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }

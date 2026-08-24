@@ -42,7 +42,7 @@ use crate::{
 pub const NO_TOOLS_SENTINEL_NAME: &str = "__no_tools__";
 
 /// Bedrock Guardrail stream trace level.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailTraceMode {
 	/// Do not request trace details.
@@ -55,7 +55,7 @@ pub enum GuardrailTraceMode {
 }
 
 /// Bedrock Guardrail streaming assessment mode.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailStreamMode {
 	/// Assess each stream segment synchronously.
@@ -67,16 +67,23 @@ pub enum GuardrailStreamMode {
 
 /// Typed Bedrock Guardrail configuration applied before `SigV4` credential
 /// middleware.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct BedrockGuardrail {
 	/// Guardrail identifier or ARN.
+	#[serde(alias = "guardrailIdentifier")]
 	pub identifier:  Str,
 	/// Immutable or named guardrail version.
+	#[serde(default = "draft_guardrail_version", alias = "guardrailVersion")]
 	pub version:     Str,
 	/// Requested trace detail.
+	#[serde(default, alias = "guardrailTrace")]
 	pub trace:       GuardrailTraceMode,
 	/// Streaming assessment mode.
+	#[serde(default)]
 	pub stream_mode: GuardrailStreamMode,
+}
+fn draft_guardrail_version() -> Str {
+	sf!("DRAFT")
 }
 
 /// Bedrock-specific lowering options supplied by registry construction, never
@@ -108,12 +115,18 @@ impl Default for BedrockOptions {
 #[derive(Clone, Debug, Default)]
 pub struct BedrockConverseCodec {
 	options: Arc<BedrockOptions>,
+	ambient_region: Option<Str>,
 }
 
 impl BedrockConverseCodec {
 	/// Constructs a codec with typed route/model policy options.
 	pub fn new(options: BedrockOptions) -> Self {
-		Self { options: Arc::new(options) }
+		Self { options: Arc::new(options), ambient_region: None }
+	}
+	/// Installs the ambient AWS region resolved during route construction.
+	pub fn with_ambient_region(mut self, region: Option<Str>) -> Self {
+		self.ambient_region = region;
+		self
 	}
 
 	/// Borrows the immutable lowering options.
@@ -134,8 +147,17 @@ impl Codec for BedrockConverseCodec {
 				let target = context.target.ok_or_else(|| {
 					encoding_error(ErrorKind::ProviderContractMismatch, "bedrock.target.missing")
 				})?;
-				let uri =
-					converse_stream_uri(target.endpoint.base_url.as_str(), target.wire_model.as_str());
+				let region = resolve_bedrock_runtime_region(
+					context,
+					target.wire_model.as_str(),
+					self.options.guardrail.as_ref(),
+					self.ambient_region.as_deref(),
+				);
+				let uri = converse_stream_uri(
+					target.endpoint.base_url.as_str(),
+					target.wire_model.as_str(),
+					region.as_str(),
+				);
 				Ok(EncodedRequest::new(
 					OperationKind::Chat,
 					RequestMethod::Post,
@@ -167,7 +189,7 @@ impl Codec for BedrockConverseCodec {
 				Ok(EncodedRequest::new(
 					OperationKind::DiscoverModels,
 					RequestMethod::Get,
-					bedrock_discovery_uri(context)?,
+					bedrock_discovery_uri(context, &self.options, self.ambient_region.as_deref())?,
 					vec![RequestHeader { name: sf!("accept"), value: sf!("application/json") }]
 						.into_boxed_slice(),
 					BodySource::Bytes(Bytes::new()),
@@ -1078,7 +1100,108 @@ const fn setting_value<T>(setting: &Setting<T>) -> Option<&T> {
 	}
 }
 
-fn converse_stream_uri(base: &str, model: &str) -> String {
+fn resolve_bedrock_runtime_region(
+	context: &EncodeContext<'_>,
+	model: &str,
+	guardrail: Option<&BedrockGuardrail>,
+	configured_ambient: Option<&str>,
+) -> Str {
+	let ambient = context
+		.account
+		.and_then(|account| account.region.as_ref())
+		.map(|region| region.as_str())
+		.or(configured_ambient);
+	resolve_bedrock_region(
+		context.route.endpoint.region.as_deref(),
+		ambient,
+		context.route.endpoint.base_url.as_str(),
+		model,
+		guardrail,
+	)
+}
+
+fn resolve_bedrock_region(
+	explicit: Option<&str>,
+	ambient: Option<&str>,
+	base_url: &str,
+	model: &str,
+	guardrail: Option<&BedrockGuardrail>,
+) -> Str {
+	if let Some(region) = explicit {
+		return Str::new(region);
+	}
+	if let Some(region) = super::anthropic::arn_region(model) {
+		return Str::new(region);
+	}
+	let guardrail_region =
+		guardrail.and_then(|guardrail| guardrail_arn_region(guardrail.identifier.as_str()));
+	if let Some((geo, fallback)) = super::anthropic::inference_profile_geo(model) {
+		if let Some(region) = ambient
+			&& super::anthropic::region_serves_geo(region, geo)
+		{
+			return Str::new(region);
+		}
+		if let Some(region) = guardrail_region
+			&& super::anthropic::region_serves_geo(region, geo)
+		{
+			return Str::new(region);
+		}
+		return sf!(fallback);
+	}
+	if let Some(region) = ambient {
+		return Str::new(region);
+	}
+	if let Some(region) = guardrail_region {
+		return Str::new(region);
+	}
+	super::anthropic::endpoint_region(base_url)
+		.map_or_else(|| sf!("us-east-1"), Str::new)
+}
+
+/// Extracts a region only from a Bedrock Guardrail ARN.
+pub(crate) fn guardrail_arn_region(identifier: &str) -> Option<&str> {
+	let region = super::anthropic::arn_region(identifier)?;
+	identifier
+		.splitn(6, ':')
+		.nth(5)?
+		.starts_with("guardrail/")
+		.then_some(region)
+}
+
+fn bedrock_runtime_endpoint(base: &str, region: &str) -> String {
+	let expanded = base
+		.replace(REGION_PLACEHOLDER, region)
+		.replace(LOCATION_PLACEHOLDER, region);
+	let Ok(mut uri) = Url::parse(&expanded) else {
+		return expanded;
+	};
+	let Some(host) = uri.host_str() else {
+		return expanded;
+	};
+	let Some((prefix, _)) = host
+		.strip_prefix("bedrock-runtime.")
+		.map(|tail| ("bedrock-runtime", tail))
+		.or_else(|| {
+			host
+				.strip_prefix("bedrock-runtime-fips.")
+				.map(|tail| ("bedrock-runtime-fips", tail))
+		})
+	else {
+		return expanded;
+	};
+	let suffix = if region.starts_with("cn-") {
+		"amazonaws.com.cn"
+	} else {
+		"amazonaws.com"
+	};
+	if uri.set_host(Some(&format!("{prefix}.{region}.{suffix}"))).is_err() {
+		return expanded;
+	}
+	uri.to_string()
+}
+
+fn converse_stream_uri(base: &str, model: &str, region: &str) -> String {
+	let base = bedrock_runtime_endpoint(base, region);
 	let mut uri = String::with_capacity(base.len() + model.len() + 32);
 	uri.push_str(base.trim_end_matches('/'));
 	uri.push_str("/model/");
@@ -1099,22 +1222,18 @@ fn converse_stream_uri(base: &str, model: &str) -> String {
 const REGION_PLACEHOLDER: &str = "{region}";
 const LOCATION_PLACEHOLDER: &str = "{location}";
 
-fn bedrock_discovery_uri(context: &EncodeContext<'_>) -> Result<Str, Error> {
+fn bedrock_discovery_uri(
+	context: &EncodeContext<'_>,
+	options: &BedrockOptions,
+	ambient_region: Option<&str>,
+) -> Result<Str, Error> {
 	let base = context.route.endpoint.base_url.as_str();
-	let region = context
-		.account
-		.and_then(|account| account.region.as_ref())
-		.map(|region| region.as_str())
-		.or(context.route.endpoint.region.as_deref())
-		.or_else(|| bedrock_endpoint_region(base))
-		.unwrap_or("us-east-1");
-	bedrock_discovery_endpoint(base, region)
+	let region = resolve_bedrock_runtime_region(context, "", options.guardrail.as_ref(), ambient_region);
+	bedrock_discovery_endpoint(base, region.as_str())
 }
 
 fn bedrock_discovery_endpoint(base: &str, region: &str) -> Result<Str, Error> {
-	let expanded = base
-		.replace(REGION_PLACEHOLDER, region)
-		.replace(LOCATION_PLACEHOLDER, region);
+	let expanded = bedrock_runtime_endpoint(base, region);
 	let mut uri = Url::parse(&expanded).map_err(|_| {
 		encoding_error(ErrorKind::InvalidRequest, "bedrock.discovery.endpoint_invalid")
 	})?;
@@ -1131,19 +1250,6 @@ fn bedrock_discovery_endpoint(base: &str, region: &str) -> Result<Str, Error> {
 	uri.set_query(None);
 	uri.set_fragment(None);
 	Ok(Str::new(&uri))
-}
-
-fn bedrock_endpoint_region(base: &str) -> Option<&str> {
-	let host = base
-		.split_once("://")
-		.map_or(base, |(_, rest)| rest)
-		.split(['/', ':'])
-		.next()?;
-	let region = host
-		.split('.')
-		.nth(1)
-		.filter(|region| !region.is_empty() && !region.contains('{'))?;
-	host.starts_with("bedrock").then_some(region)
 }
 
 struct BedrockDiscoveryDecoder {
@@ -2505,6 +2611,79 @@ mod tests {
 				&& findings[0].strength == Some(SafetyStrength::Medium)
 				&& *latency == Duration::from_millis(7)
 		));
+	}
+	#[test]
+	fn guardrail_settings_default_only_derivable_fields() {
+		let guardrail: BedrockGuardrail = serde_json::from_str(
+			r#"{"identifier":"arn:aws:bedrock:eu-west-2:123456789012:guardrail/example"}"#,
+		)
+		.expect("typed guardrail settings");
+		assert_eq!(guardrail.version, "DRAFT");
+		assert_eq!(guardrail.trace, GuardrailTraceMode::Disabled);
+		assert_eq!(guardrail.stream_mode, GuardrailStreamMode::Sync);
+	}
+
+	#[test]
+	fn guardrail_arn_region_obeys_explicit_and_geo_precedence() {
+		let guardrail = BedrockGuardrail {
+			identifier:  sf!("arn:aws:bedrock:eu-west-2:123456789012:guardrail/example"),
+			version:     sf!("7"),
+			trace:       GuardrailTraceMode::Enabled,
+			stream_mode: GuardrailStreamMode::Sync,
+		};
+		assert_eq!(
+			guardrail_arn_region(
+				"arn:aws:bedrock:eu-west-2:123456789012:foundation-model/example"
+			),
+			None,
+		);
+		assert_eq!(
+			resolve_bedrock_region(
+				None,
+				None,
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"openai.gpt-oss-20b-1:0",
+				Some(&guardrail),
+			),
+			"eu-west-2",
+		);
+		assert_eq!(
+			resolve_bedrock_region(
+				Some("us-west-2"),
+				None,
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"openai.gpt-oss-20b-1:0",
+				Some(&guardrail),
+			),
+			"us-west-2",
+		);
+		assert_eq!(
+			resolve_bedrock_region(
+				None,
+				Some("us-east-1"),
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"eu.anthropic.claude-opus-4-8",
+				Some(&guardrail),
+			),
+			"eu-west-2",
+		);
+		assert_eq!(
+			resolve_bedrock_region(
+				None,
+				Some("eu-central-1"),
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"eu.anthropic.claude-opus-4-8",
+				Some(&guardrail),
+			),
+			"eu-central-1",
+		);
+		assert_eq!(
+			bedrock_runtime_endpoint(
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"eu-west-2",
+			),
+			"https://bedrock-runtime.eu-west-2.amazonaws.com/",
+		);
 	}
 
 	fn replay(bytes: &'static [u8], fragmented: bool) -> Vec<RawEvent> {

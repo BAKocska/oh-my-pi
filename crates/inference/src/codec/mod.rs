@@ -39,6 +39,7 @@ use crate::{
 };
 
 pub mod anthropic;
+pub(crate) mod connect;
 pub mod cursor;
 pub mod discovery;
 pub mod gemini;

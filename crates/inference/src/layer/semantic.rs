@@ -221,9 +221,19 @@ where
 					.context
 					.body_evidence()
 					.is_some_and(|evidence| evidence.retry_decision == RetryDecision::Allow);
-				let retryable_action =
-					matches!(&error.action, RetryAction::SemanticRetry | RetryAction::SameRoute { .. });
-				let retries_exhausted = semantic_retry >= max_retries;
+				let retryable_action = matches!(
+					&error.action,
+					RetryAction::SemanticRetry
+						| RetryAction::SameRoute { .. }
+						| RetryAction::SameRouteLimited { .. }
+				);
+				let action_limit = match &error.action {
+					RetryAction::SameRouteLimited { max_retries: failure_limit, .. } => {
+						max_retries.min(*failure_limit)
+					},
+					_ => max_retries,
+				};
+				let retries_exhausted = semantic_retry >= action_limit;
 				if retries_exhausted || !replay_safe || !retryable_action {
 					error.action =
 						exhausted_action(&error, retries_exhausted, replay_safe, retryable_action);

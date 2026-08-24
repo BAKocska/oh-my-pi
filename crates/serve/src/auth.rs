@@ -944,6 +944,7 @@ fn error_class(error: &InferenceError) -> credential_health::ErrorClass {
 		| ErrorKind::StreamCorruption => credential_health::ErrorClass::Connectivity,
 		ErrorKind::Cancelled | ErrorKind::DeadlineExceeded => credential_health::ErrorClass::Timeout,
 		ErrorKind::InvalidRequest
+		| ErrorKind::PayloadRejected
 		| ErrorKind::TargetNotFound
 		| ErrorKind::CapabilityUnknown
 		| ErrorKind::CodecMismatch
